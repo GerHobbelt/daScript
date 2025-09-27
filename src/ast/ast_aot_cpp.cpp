@@ -3011,7 +3011,7 @@ namespace das {
                 ss << call->name << "(";
             }
         }
-        virtual bool canVisitLooksLikeCallArg ( ExprLooksLikeCall * call, Expression * arg, bool last ) override {
+        virtual bool canVisitLooksLikeCallArg ( ExprLooksLikeCall * call, Expression * arg, bool ) override {
             if ( call->arguments.size()>=1 && call->arguments[0].get()==arg &&  call->rtti_isInvoke() ) {
                 auto * inv = (ExprInvoke *) call;
                 if ( inv->isInvokeMethod ) return false;
@@ -3566,7 +3566,6 @@ namespace das {
     }
 
     static void writeStandaloneCtor(const StandaloneContextCfg & cfg, string initFunctions, TextWriter &tw, Program &program) {
-        auto disableInit = program.options.getBoolOption("no_init", program.policies.no_init);
         vector<VariablePtr> lookupVariableTable;
         if ( program.totalVariables ) {
             for (const auto & pm : program.library.getModules() ) {
@@ -3626,7 +3625,7 @@ namespace das {
 
 
         tw << "     // start totalFunctions\n";
-        tw << move(initFunctions);
+        tw << das::move(initFunctions);
         tw << "    // end totalFunctions\n";
 
         tw << "    context.tabGMnLookup = make_shared<das_hash_map<uint64_t,uint32_t>>();\n";
@@ -3679,7 +3678,7 @@ namespace das {
         }
 
         writeStandaloneContextMethods(program, source, cfg.class_name + "::", false);
-        writeStandaloneCtor(cfg, move(initFunctions), source, *program);
+        writeStandaloneCtor(cfg, das::move(initFunctions), source, *program);
 
         source << "#ifdef STANDALONE_CONTEXT_TESTS\n";
         source << "static Context * registerStandaloneTest ( ) {\n";
@@ -3756,29 +3755,27 @@ namespace das {
         {
             NamespaceGuard guard1(header, cfg.context_name);
             NamespaceGuard guard2(source, cfg.context_name);
-            writeStandaloneContext(program, move(initFunctions), header, source, cfg);
+            writeStandaloneContext(program, das::move(initFunctions), header, source, cfg);
         }
     }
 
-    static void writeRequiredModulesFor ( TextWriter &ss, Module * mod ) {
+    static void writeRequiredModulesFor ( TextWriter &ss, ProgramPtr program ) {
         // lets comment on required modules
-        auto ptr_cmp = [](const Module* lhs, const Module* rhs) {
-            return lhs->name < rhs->name;
-        };
-        for ( auto [req, pub] : ordered(mod->requireModule, ptr_cmp) ) {
-            if ( req->name.empty() ) {
+        program->library.foreach_in_order([&](Module * mod){
+            if ( mod->name=="" ) {
                 // nothing, its main program module. i.e ::
             } else {
-                if ( req->name=="$" ) {
+                if ( mod->name=="$" ) {
                     ss << " // require builtin\n";
                 } else {
-                    ss << " // require " << req->name << "\n";
+                    ss << " // require " << mod->name << "\n";
                 }
-                if ( req->aotRequire(ss)==ModuleAotType::no_aot ) {
-                    ss << "  // no_aot ignored in standalone context\n";
+                if ( mod->aotRequire(ss)==ModuleAotType::no_aot ) {
+                    ss << "  // AOT disabled due to this module\n";
                 }
             }
-        }
+            return true;
+        }, program->getThisModule());
     }
 
 
@@ -3855,7 +3852,7 @@ namespace das {
      * Adds debug info to AotDebugInfoHelper
      * @return String with initialization of all functions
      */
-    string addFunctionInfo(bool disableInit, bool rtti, const vector<Function *> &fnn, AotDebugInfoHelper& helper) {
+    string addFunctionInfo(bool /*disableInit*/, bool rtti, const vector<Function *> &fnn, AotDebugInfoHelper& helper) {
         helper.rtti = rtti;
         vector<pair<FunctionPtr, FuncInfo*>> lookupFunctionTable;
         for (auto& pfun : fnn) {
@@ -3899,7 +3896,7 @@ namespace das {
             return;
         }
         Context & context = *pctx;
-        daScriptEnvironment::bound->g_Program = program;    // setting it for the AOT macros
+        (*daScriptEnvironment::bound)->g_Program = program;    // setting it for the AOT macros
 
         // mark prologue
         PrologueMarker pmarker;
@@ -3931,7 +3928,7 @@ namespace das {
         }
 
         source << "#include \"daScript/simulate/standalone_ctx_utils.h\"\n";
-        writeRequiredModulesFor(source, mod);
+        writeRequiredModulesFor(source, program);
         source << "#include \"" << (mod->name.empty() ? cfg.context_name : mod->name) << ".das.h\"\n";
         source << AOT_HEADERS;
         {
@@ -3956,7 +3953,7 @@ namespace das {
                             ext_namespaces.emplace(pfun->module->getNamespace());
                         }
                     }
-                    for (const auto namesp: ext_namespaces) {
+                    for (const auto namesp: ordered(ext_namespaces)) {
                         source << "using namespace " << namesp << ";\n";
                     }
                 }
@@ -3969,7 +3966,7 @@ namespace das {
                 source << gen.str();
                 gen.clear();
             }
-            writeRegistration(header, source, move(initFunctions), program, cfg, context);
+            writeRegistration(header, source, das::move(initFunctions), program, cfg, context);
         }
         source << AOT_FOOTER;
 
@@ -3981,15 +3978,15 @@ namespace das {
         auto logger = TextPrinter();
         for ( const auto & [nm, out] : nameToOutput ) {
             const auto &[header_content, source_content] = out;
-            auto mod = nm.empty() ? cfg.context_name : nm;
-            const auto outputFile = cppOutputDir + '/' + mod + ".das";
+            auto modd = nm.empty() ? cfg.context_name : nm;
+            const auto outputFile = cppOutputDir + '/' + modd + ".das";
             if (nm.empty()) {
                 saveToFile(logger, outputFile + ".h", header_content);
             }
             saveToFile(logger, outputFile + ".cpp", source_content);
         }
 
-        daScriptEnvironment::bound->g_Program.reset();
+        (*daScriptEnvironment::bound)->g_Program.reset();
     }
 
     void Program::aotCpp ( Context & context, TextWriter & logs ) {

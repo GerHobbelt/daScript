@@ -2899,7 +2899,7 @@ namespace das
 
     int TypeDecl::findArgumentIndex( const string & name ) const {
         for (size_t index=0, indexs=argNames.size(); index!=indexs; ++index) {
-            if (argNames[index] == name) return index;
+            if (argNames[index] == name) return int(index);
         }
         return -1;
     }
@@ -3194,7 +3194,7 @@ namespace das
         return vT->findArgumentIndex(name);
     }
 
-    uint64_t TypeDecl::getMangledNameHash() const { return Variable::getMangledNameHash(getMangledName()); }
+    uint64_t TypeDecl::getMangledNameHash() const { return hash_blockz64((uint8_t *)getMangledName().c_str()); }
 
     // Mangled name parser
 

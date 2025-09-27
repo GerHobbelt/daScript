@@ -330,7 +330,7 @@ namespace das
         Context(const Context &) = delete;
         Context & operator = (const Context &) = delete;
         virtual ~Context();
-        void setup(size_t totalVars, size_t globalStringHeapSize, CodeOfPolicies policies, AnnotationArgumentList options);
+        void setup(int totalVars, uint32_t globalStringHeapSize, CodeOfPolicies policies, AnnotationArgumentList options);
         void strip();
         void logMemInfo(TextWriter & tw);
 
@@ -898,19 +898,19 @@ namespace das
 
     class SharedStackGuard {
     public:
-        static DAS_THREAD_LOCAL(StackAllocator *) lastContextStack;
+        inline static DAS_THREAD_LOCAL(StackAllocator *) lastContextStack;
         SharedStackGuard() = delete;
         SharedStackGuard(const SharedStackGuard &) = delete;
         SharedStackGuard & operator = (const SharedStackGuard &) = delete;
         __forceinline SharedStackGuard(Context & currentContext, StackAllocator & shared_stack) : savedStack(0) {
             savedStack.copy(currentContext.stack);
-            currentContext.stack.copy(lastContextStack ? *lastContextStack : shared_stack);
-            saveLastContextStack = lastContextStack;
-            lastContextStack = &currentContext.stack;
+            currentContext.stack.copy(*lastContextStack ? **lastContextStack : shared_stack);
+            saveLastContextStack = *lastContextStack;
+            *lastContextStack = &currentContext.stack;
         }
         __forceinline ~SharedStackGuard() {
-            lastContextStack->copy(savedStack);
-            lastContextStack = saveLastContextStack;
+            (*lastContextStack)->copy(savedStack);
+            *lastContextStack = saveLastContextStack;
             savedStack.letGo();
         }
     protected:

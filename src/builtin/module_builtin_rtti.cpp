@@ -29,6 +29,7 @@ IMPLEMENT_EXTERNAL_TYPE_FACTORY(AnnotationArguments,AnnotationArguments)
 IMPLEMENT_EXTERNAL_TYPE_FACTORY(AnnotationArgumentList,AnnotationArgumentList)
 IMPLEMENT_EXTERNAL_TYPE_FACTORY(AnnotationDeclaration,AnnotationDeclaration)
 IMPLEMENT_EXTERNAL_TYPE_FACTORY(AnnotationList,AnnotationList)
+IMPLEMENT_EXTERNAL_TYPE_FACTORY(DebugInfoHelper,DebugInfoHelper)
 IMPLEMENT_EXTERNAL_TYPE_FACTORY(Program,Program)
 IMPLEMENT_EXTERNAL_TYPE_FACTORY(Module,Module)
 IMPLEMENT_EXTERNAL_TYPE_FACTORY(Error,Error)
@@ -289,6 +290,8 @@ namespace das {
             addField<DAS_BIND_MANAGED_FIELD(last_exception)>("last_exception");
             addField<DAS_BIND_MANAGED_FIELD(exceptionAt)>("exceptionAt");
             addField<DAS_BIND_MANAGED_FIELD(contextMutex)>("contextMutex");
+            addProperty<DAS_BIND_MANAGED_PROP(getInitSemanticHash)>("getInitSemanticHash",
+                                                                  "getInitSemanticHash");
             addProperty<DAS_BIND_MANAGED_PROP(getTotalFunctions)>("totalFunctions",
                 "getTotalFunctions");
             addProperty<DAS_BIND_MANAGED_PROP(getTotalVariables)>("totalVariables",
@@ -352,9 +355,17 @@ namespace das {
     struct ProgramAnnotation : ManagedStructureAnnotation <Program,false,true> {
         ProgramAnnotation(ModuleLibrary & ml) : ManagedStructureAnnotation ("Program", ml) {
             addField<DAS_BIND_MANAGED_FIELD(thisModuleName)>("thisModuleName");
+            addField<DAS_BIND_MANAGED_FIELD(thisNamespace)>("thisNamespace");
+            addField<DAS_BIND_MANAGED_FIELD(totalFunctions)>("totalFunctions");
+            addField<DAS_BIND_MANAGED_FIELD(totalVariables)>("totalVariables");
+            addField<DAS_BIND_MANAGED_FIELD(globalStringHeapSize)>("globalStringHeapSize");
+            addField<DAS_BIND_MANAGED_FIELD(initSemanticHashWithDep)>("initSemanticHashWithDep");
             addFieldEx ( "flags", "flags", offsetof(Program, flags), makeProgramFlags() );
+            addProperty<DAS_BIND_MANAGED_PROP(getThisModule)>("getThisModule");
+            addProperty<DAS_BIND_MANAGED_PROP(getDebugger)>("getDebugger");
             addField<DAS_BIND_MANAGED_FIELD(errors)>("errors");
             addField<DAS_BIND_MANAGED_FIELD(options)>("_options","options");
+            addField<DAS_BIND_MANAGED_FIELD(policies)>("policies","policies");
         }
     };
 
@@ -630,6 +641,9 @@ namespace das {
 
     struct TypeInfoAnnotation : ManagedTypeInfoAnnotation <TypeInfo> {
         TypeInfoAnnotation(ModuleLibrary & ml) : ManagedTypeInfoAnnotation ("TypeInfo", ml) {
+            addField<DAS_BIND_MANAGED_FIELD(type)>("_type","type");
+            addField<DAS_BIND_MANAGED_FIELD(dim)>("dim");
+            addField<DAS_BIND_MANAGED_FIELD(annotation_or_name)>("annotation_or_name");
         }
     };
 
@@ -670,14 +684,15 @@ namespace das {
         FuncInfoAnnotation(ModuleLibrary & ml) : DebugInfoAnnotation ("FuncInfo", ml) {
             addField<DAS_BIND_MANAGED_FIELD(name)>("name");
             addField<DAS_BIND_MANAGED_FIELD(cppName)>("cppName");
+            addField<DAS_BIND_MANAGED_FIELD(fields)>("fields");
             addField<DAS_BIND_MANAGED_FIELD(stackSize)>("stackSize");
             addField<DAS_BIND_MANAGED_FIELD(result)>("result");
             addField<DAS_BIND_MANAGED_FIELD(locals)>("locals");
-            addField<DAS_BIND_MANAGED_FIELD(localCount)>("localCount");
             addField<DAS_BIND_MANAGED_FIELD(globals)>("globals");
-            addField<DAS_BIND_MANAGED_FIELD(globalCount)>("globalCount");
             addField<DAS_BIND_MANAGED_FIELD(hash)>("hash");
             addField<DAS_BIND_MANAGED_FIELD(flags)>("flags");
+            addField<DAS_BIND_MANAGED_FIELD(localCount)>("localCount");
+            addField<DAS_BIND_MANAGED_FIELD(globalCount)>("globalCount");
             fieldType = makeType<VarInfo>(*mlib);
             fieldType->ref = true;
         }
@@ -736,7 +751,6 @@ namespace das {
             addField<DAS_BIND_MANAGED_FIELD(aot_order_side_effects)>("aot_order_side_effects");
             addField<DAS_BIND_MANAGED_FIELD(no_unused_function_arguments)>("no_unused_function_arguments");
             addField<DAS_BIND_MANAGED_FIELD(no_unused_block_arguments)>("no_unused_block_arguments");
-            addField<DAS_BIND_MANAGED_FIELD(smart_pointer_by_value_unsafe)>("smart_pointer_by_value_unsafe");
             addField<DAS_BIND_MANAGED_FIELD(allow_block_variable_shadowing)>("allow_block_variable_shadowing");
             addField<DAS_BIND_MANAGED_FIELD(allow_local_variable_shadowing)>("allow_local_variable_shadowing");
             addField<DAS_BIND_MANAGED_FIELD(allow_shared_lambda)>("allow_shared_lambda");
@@ -772,6 +786,14 @@ namespace das {
             addField<DAS_BIND_MANAGED_FIELD(threadlock_context)>("threadlock_context");
         }
         virtual bool isLocal() const override { return true; }
+    };
+
+
+    struct DebugInfoHelperAnnotation : ManagedStructureAnnotation<DebugInfoHelper> {
+        DebugInfoHelperAnnotation(ModuleLibrary & ml)
+            : ManagedStructureAnnotation<DebugInfoHelper> ("DebugInfoHelper", ml) {
+            addField<DAS_BIND_MANAGED_FIELD(rtti)>("rtti");
+        }
     };
 
     template <typename TT>
@@ -1107,7 +1129,9 @@ namespace das {
                     cast<smart_ptr<Program>>::from(program),
                     cast<string *>::from(&istr)
                 };
+                (*daScriptEnvironment::bound)->g_Program = program;
                 context->invoke(block, args, nullptr, at);
+                (*daScriptEnvironment::bound)->g_Program.reset();
             }
         } else {
             context->throw_error_at(at, "rtti_compile internal error, something went wrong");
@@ -1372,6 +1396,9 @@ namespace das {
             addAlias(makeStructInfoFlags());
             addAlias(makeModuleFlags());
             addAlias(makeAnnotationDeclarationFlags());
+            // CodeOfPolicies
+            addAnnotation(make_smart<CodeOfPoliciesAnnotation>(lib));
+            addCtorAndUsing<CodeOfPolicies>(*this,lib,"CodeOfPolicies","CodeOfPolicies");
             // enums
             addEnumeration(make_smart<EnumerationCompilationError>());
             // type annotations
@@ -1409,9 +1436,8 @@ namespace das {
             initRecAnnotation(sia, lib);
             addAnnotation(make_smart<FuncInfoAnnotation>(lib));
             addAnnotation(make_smart<SimFunctionAnnotation>(lib));
-            // CodeOfPolicies
-            addAnnotation(make_smart<CodeOfPoliciesAnnotation>(lib));
-            addCtorAndUsing<CodeOfPolicies>(*this,lib,"CodeOfPolicies","CodeOfPolicies");
+            // DebugInfoHelper
+            addAnnotation(make_smart<DebugInfoHelperAnnotation>(lib));
             // RttiValue
             addAlias(typeFactory<RttiValue>::make(lib));
             // func info flags

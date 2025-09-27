@@ -57,7 +57,7 @@ bool compile ( const string & fn, const string & cppFn, bool dryRun ) {
             // header
             tw << AOT_INCLUDES;
             // lets comment on required modules
-            program->library.foreach([&](Module * mod){
+            program->library.foreach_in_order([&](Module * mod){
                 if ( mod->name=="" ) {
                     // nothing, its main program module. i.e ::
                 } else {
@@ -72,7 +72,7 @@ bool compile ( const string & fn, const string & cppFn, bool dryRun ) {
                     }
                 }
                 return true;
-            },"*");
+            }, program->getThisModule());
             if ( program->options.getBoolOption("no_aot",false) ) {
                 TextWriter noTw;
                 if (!noAotModule)
@@ -93,9 +93,9 @@ bool compile ( const string & fn, const string & cppFn, bool dryRun ) {
                     NamespaceGuard das_guard(tw, "das");
                     {
                         NamespaceGuard anon_guard(tw, program->thisNamespace); // anonymous
-                        daScriptEnvironment::bound->g_Program = program;    // setting it for the AOT macros
+                        (*daScriptEnvironment::bound)->g_Program = program;    // setting it for the AOT macros
                         program->aotCpp(*pctx, tw);
-                        daScriptEnvironment::bound->g_Program.reset();
+                        (*daScriptEnvironment::bound)->g_Program.reset();
                         // list STUFF
                         tw << "\nstatic void registerAotFunctions ( AotLibrary & aotLib ) {\n";
                         program->registerAotCpp(tw, *pctx, false);
@@ -131,6 +131,7 @@ bool compileStandalone ( const string & inputFile, const string & outDir, const 
     policies.fail_on_lack_of_aot_export = true;
     policies.version_2_syntax = version2syntax;
     policies.gen2_make_syntax = gen2MakeSyntax;
+    policies.ignore_shared_modules = true;
     if ( auto program = compileDaScript(inputFile,access,tout,dummyGroup,policies) ) {
         if ( program->failed() ) {
             tout << "failed to compile\n";
@@ -250,7 +251,7 @@ int das_aot_main ( int argc, char * argv[] ) {
     require_project_specific_modules();
     #include "modules/external_need.inc"
     Module::Initialize();
-    daScriptEnvironment::bound->g_isInAot = true;
+    (*daScriptEnvironment::bound)->g_isInAot = true;
     bool compiled = false;
     if ( standaloneContext ) {
         StandaloneContextCfg cfg = {standaloneContextName, standaloneClassName ? standaloneClassName : "StandaloneContext"};
@@ -355,7 +356,7 @@ void print_help() {
         << "    -v2makeSyntax enable version 1 syntax with version 2 constructors syntax (for arrays/structures)\n"
         << "    -jit        enable Just-In-Time compilation\n"
         << "    -project <path.das_project> path to project file\n"
-        << "    -run-fmt    <inplace/dry> <v2/v1> run formatter, requires 2 arguments\n"
+        << "    -run-fmt    <inplace/dry> <v2/v1> <semicolon> run formatter, requires 2 or more arguments\n"
         << "    -log        output program code\n"
         << "    -pause      pause after errors and pause again before exiting program\n"
         << "    -dry-run    compile and simulate script without execution\n"
@@ -468,6 +469,13 @@ int MAIN_FUNC_NAME ( int argc, char * argv[] ) {
                     return -1;
                 }
                 i++;
+
+                if (i + 1 < argc)  {
+                    if (string(argv[i + 1]) == "--semicolon") {
+                        formatter->insert(format::FormatOpt::SemicolonEOL);
+                        ++i;
+                    }
+                }
             } else if ( cmd=="args" ) {
                 break;
             } else if ( cmd=="pause" ) {

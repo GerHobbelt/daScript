@@ -26,6 +26,7 @@ IMPLEMENT_EXTERNAL_TYPE_FACTORY(EnumEntry,Enumeration::EnumEntry)
 IMPLEMENT_EXTERNAL_TYPE_FACTORY(Enumeration,Enumeration)
 IMPLEMENT_EXTERNAL_TYPE_FACTORY(Expression,Expression)
 IMPLEMENT_EXTERNAL_TYPE_FACTORY(Function,Function)
+IMPLEMENT_EXTERNAL_TYPE_FACTORY(BuiltInFunction,BuiltInFunction)
 IMPLEMENT_EXTERNAL_TYPE_FACTORY(InferHistory, InferHistory)
 IMPLEMENT_EXTERNAL_TYPE_FACTORY(Variable,Variable)
 IMPLEMENT_EXTERNAL_TYPE_FACTORY(VisitorAdapter,VisitorAdapter)
@@ -235,7 +236,7 @@ namespace das {
         }
         virtual SimNode * simluate ( Context * context, const ExpressionPtr & expr, string & error ) override {
 
-            if ( !context->thisProgram->isCompilingMacros && !context->thisProgram->folding && !daScriptEnvironment::bound->g_isInAot ) {
+            if ( !context->thisProgram->isCompilingMacros && !context->thisProgram->folding && !(*daScriptEnvironment::bound)->g_isInAot ) {
                 if ( !context->thisProgram->options.getBoolOption("rtti",context->thisProgram->policies.rtti) ) {
                     error = "ast_typedecl requires `options rtti` or rtti to be enabled in policies";
                     return nullptr;

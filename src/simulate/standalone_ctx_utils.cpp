@@ -5,7 +5,7 @@ namespace das {
         auto MNH = hash_blockz64((uint8_t *)info.mangledName.c_str());
         gfun->name = ctx.code->allocateName(info.name);
         gfun->mangledName = ctx.code->allocateName(info.mangledName);
-        gfun->stackSize = info.stackSize;
+        gfun->stackSize = uint32_t(info.stackSize);
         gfun->mangledNameHash = MNH;
         gfun->aotFunction = nullptr;
         gfun->flags = 0;
@@ -35,7 +35,7 @@ namespace das {
     }
 
     void InitGlobalVar(Context &ctx, GlobalVariable *gvar, GlobalVarInfo info) {
-        auto sizeDiff = InitGlobalVariable(ctx, gvar, move(info));
+        auto sizeDiff = InitGlobalVariable(ctx, gvar, das::move(info));
         ctx.updateSharedGlobalSize(sizeDiff.sharedSizeDiff, sizeDiff.globalsSizeDiff);
     }
 
@@ -49,7 +49,7 @@ namespace das {
                 fn->aotFunction = fcb->aotFunction;
             } else {
                 // Can't fill noAot functions.
-                assert(false);
+                DAS_ASSERT(false);
             }
         }
     }

@@ -11,7 +11,8 @@ namespace das {
     using MangledNameHash = uint64_t;
 
     struct FunctionInfo {
-        FunctionInfo(string name, string mangledName, size_t stackSize,
+        FunctionInfo() = delete;
+        FunctionInfo(string name, string mangledName, uint32_t stackSize,
                      bool unsafeOperation, bool fastCall, bool builtin,
                      bool promoted, bool isResRef, bool pinvoke)
             : name(name)
@@ -25,7 +26,7 @@ namespace das {
             , pinvoke(pinvoke) {}
         string name;
         string mangledName;
-        size_t stackSize;
+        uint32_t stackSize;
         bool unsafeOperation;
         bool fastCall;
         bool builtin;
@@ -35,15 +36,16 @@ namespace das {
     };
 
     struct GlobalVarInfo {
-        GlobalVarInfo(string name, const string &mangledName, size_t typeSize, bool globalShared)
-            : name(move(name))
-            , mangledNameHash(Variable::getMangledNameHash(mangledName))
+        GlobalVarInfo() = delete;
+        GlobalVarInfo(string name, const string &mangledName, uint32_t typeSize, bool globalShared)
+            : name(das::move(name))
+            , mangledNameHash(Variable::getMNHash(mangledName))
             , typeSize(typeSize)
             , globalShared(globalShared) {}
 
         string name;
         uint64_t mangledNameHash;
-        size_t typeSize;
+        uint32_t typeSize;
         bool globalShared;
     };
     struct SizeDiff {

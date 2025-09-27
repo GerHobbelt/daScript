@@ -321,7 +321,7 @@ namespace das
         VariablePtr clone() const;
         string getMangledName() const;
         uint64_t getMangledNameHash() const;
-        static uint64_t getMangledNameHash(const string &mangledName);
+        static uint64_t getMNHash(const string &mangledName);
         bool isAccessUnused() const;
         bool isCtorInitialized() const;
         void serialize ( AstSerializer & ser );
@@ -1292,7 +1292,6 @@ namespace das
         TypeDeclPtr makeEnumType ( const string & name ) const;
         Module* front() const { return modules.front(); }
         vector<Module *> & getModules() { return modules; }
-        const vector<Module *> & getModules() const { return modules; }
         Module* getThisModule() const { return thisModule; }
         void reset();
         void renameModule ( Module * module, const string & newName );
@@ -1387,7 +1386,7 @@ namespace das
         string name;
     };
 
-    class DebugInfoHelper : ptr_ref_count {
+    class DebugInfoHelper : public ptr_ref_count {
     public:
         DebugInfoHelper () { debugInfo = make_shared<DebugInfoAllocator>(); }
         DebugInfoHelper ( const shared_ptr<DebugInfoAllocator> & di ) : debugInfo(di) {}
@@ -1405,7 +1404,7 @@ namespace das
     public:
         shared_ptr<DebugInfoAllocator>  debugInfo;
         bool                            rtti = false;
-    protected:
+    public:
         das_hash_map<string,StructInfo *>        smn2s;
         das_hash_map<string,TypeInfo *>          tmn2t;
         das_hash_map<string,VarInfo *>           vmn2v;
@@ -1457,7 +1456,6 @@ namespace das
         bool aot_order_side_effects = false;
         bool no_unused_function_arguments = false;
         bool no_unused_block_arguments = false;
-        bool smart_pointer_by_value_unsafe = false;     // is passing smart_ptr by value unsafe?
         bool allow_block_variable_shadowing = false;
         bool allow_local_variable_shadowing = false;
         bool allow_shared_lambda = false;
@@ -1616,6 +1614,7 @@ namespace das
         bool getOptimize() const;
         bool getDebugger() const;
         bool getProfiler() const;
+        Module *getThisModule() const { return thisModule.get(); }
         void makeMacroModule( TextWriter & logs );
         vector<ReaderMacroPtr> getReaderMacro ( const string & markup ) const;
         void serialize ( AstSerializer & ser );
@@ -1757,8 +1756,8 @@ namespace das
         AstSerializer * serializer_write = nullptr;
         DebugAgentInstance g_threadLocalDebugAgent;
         uint64_t        dataWalkerStringLimit = 0;
-        static DAS_THREAD_LOCAL(daScriptEnvironment *) bound;
-        static DAS_THREAD_LOCAL(daScriptEnvironment *) owned;
+        inline static DAS_THREAD_LOCAL(daScriptEnvironment *) bound;
+        inline static DAS_THREAD_LOCAL(daScriptEnvironment *) owned;
         static void ensure();
     };
 
@@ -1767,15 +1766,15 @@ namespace das
         das::daScriptEnvironment *initialOwned;
 
         daScriptEnvironmentGuard(das::daScriptEnvironment *bound = nullptr, das::daScriptEnvironment *owned = nullptr) {
-            initialBound = das::daScriptEnvironment::bound;
-            initialOwned = das::daScriptEnvironment::owned;
-            das::daScriptEnvironment::bound = bound;
-            das::daScriptEnvironment::owned = owned;
+            initialBound = *das::daScriptEnvironment::bound;
+            initialOwned = *das::daScriptEnvironment::owned;
+            *das::daScriptEnvironment::bound = bound;
+            *das::daScriptEnvironment::owned = owned;
         }
 
         ~daScriptEnvironmentGuard() {
-            das::daScriptEnvironment::bound = initialBound;
-            das::daScriptEnvironment::owned = initialOwned;
+            *das::daScriptEnvironment::bound = initialBound;
+            *das::daScriptEnvironment::owned = initialOwned;
         }
     };
 }

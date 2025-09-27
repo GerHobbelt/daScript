@@ -7,7 +7,7 @@
 
 namespace das::format {
 
-    static inline constexpr size_t npos = -1;
+    static inline constexpr size_t npos = size_t(-1);
 
     template <typename T>
     string convert_to_string(const vector<T> &vec, string sep = ",", string prev_sep = ",") {
@@ -53,6 +53,8 @@ namespace das::format {
     void replace_with(bool v2_only, Pos start, const string &internal, Pos end, const string &open, const string &close);
 
     void replace_with(bool v2_only, Pos start, LineInfo internal, Pos end, const string &open, const string &close);
+
+    bool skip_token(bool v2_only, LineInfo token);
 
     void wrap_par_expr(LineInfo real_expr, LineInfo info_expr);
     // wrap with parenthesis only if it is mult line expression

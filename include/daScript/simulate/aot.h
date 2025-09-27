@@ -1,6 +1,7 @@
 #pragma once
 
 #include "daScript/misc/callable.h"
+#include "daScript/misc/macro.h"
 #include "daScript/simulate/runtime_profile.h"
 #include "daScript/simulate/debug_print.h"
 #include "daScript/simulate/sim_policy.h"
@@ -30,13 +31,6 @@ namespace das {
     #define DAS_SETBOOLXOR(a,b) (([&]()->bool{ bool & A=((a)); A=A^((b)); return A; })())
 
     #define DAS_MAKE_ANNOTATION(name)   ((TypeAnnotation*)(intptr_t(name)|1))
-
-    #define DAS_COMMENT(...)
-
-    #define DAS_STRINGIFY(x) #x
-    #define DAS_TOSTRING(x) DAS_STRINGIFY(x)
-    #define DAS_FILE_LINE_NAME(a,b) a " at line " DAS_TOSTRING(b)
-    #define DAS_FILE_LINE   DAS_FILE_LINE_NAME(__FILE__,__LINE__)
 
     void das_debug ( Context * context, TypeInfo * typeInfo, const char * FILE, int LINE, vec4f res, const char * message = nullptr );
 
@@ -2786,6 +2780,11 @@ namespace das {
     template <typename TT>
     __forceinline int32_t das_vector_length ( const TT & vec ) {
         return int32_t(vec.size());
+    }
+
+    template <typename TT>
+    __forceinline bool das_vector_empty ( const TT & vec ) {
+        return vec.empty();
     }
 
     template <typename TT>

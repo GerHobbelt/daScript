@@ -6963,7 +6963,7 @@ namespace das {
                                     res[outI++] = src[f];
                                 }
                             }
-                            auto vecType = swz->type->getVectorType(baseType, fields.size());
+                            auto vecType = swz->type->getVectorType(baseType, int(fields.size()));
                             return program->makeConst(expr->at, make_smart<TypeDecl>(vecType), resData);
                         }
                     }
@@ -7284,7 +7284,7 @@ namespace das {
                 }
                 local.push_back(pVar);
                 expr->iteratorVariables.push_back(pVar);
-                if ( !expr->iteratorsTupleExpansion.empty() && expr->iteratorsTupleExpansion[idx] ) {
+                if ( expr->iteratorsTupleExpansion.size() > idx && expr->iteratorsTupleExpansion[idx] ) {
                     if ( pVar->type && !pVar->type->isTuple() ) {
                         error("for loop iterator variable " + pVar->name + " is not a tuple", "", "",
                             expr->at, CompilationError::invalid_iteration_source);
