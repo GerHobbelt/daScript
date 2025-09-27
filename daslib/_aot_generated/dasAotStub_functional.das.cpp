@@ -42,7 +42,7 @@
 #endif
 
 namespace das {
-namespace _anon_8252626653407105698 {
+namespace _anon_8145574235532970620 {
 
 
 
@@ -61,11 +61,11 @@ void __init_script ( Context * __context__, bool __init_shared )
 }
 
 static void registerAotFunctions ( AotLibrary & aotLib ) {
-	resolveTypeInfoAnnotations();
+    resolveTypeInfoAnnotations();
 }
 
-} // namespace _anon_8252626653407105698
-AotListBase impl_aot_functional(_anon_8252626653407105698::registerAotFunctions);
+} // namespace _anon_8145574235532970620
+AotListBase impl_aot_functional(_anon_8145574235532970620::registerAotFunctions);
 } // namespace das
 
 #if defined(_MSC_VER)

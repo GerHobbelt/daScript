@@ -64,7 +64,7 @@
 #endif
 
 namespace das {
-namespace _anon_18102391445637275008 {
+namespace _anon_13893283629425188690 {
 
 namespace interfaces { struct InterfaceMacro; };
 namespace interfaces { struct ImplementsMacro; };
@@ -380,11 +380,11 @@ static void registerAotFunctions ( AotLibrary & aotLib ) {
     aotLib[0xa39055b3b50905a9] = +[](Context & ctx) -> SimNode* {
         return ctx.code->makeNode<AutoSimNode_Aot<&clone_7cec36cff492af46>>();
     };
-	resolveTypeInfoAnnotations();
+    resolveTypeInfoAnnotations();
 }
 
-} // namespace _anon_18102391445637275008
-AotListBase impl_aot_interfaces(_anon_18102391445637275008::registerAotFunctions);
+} // namespace _anon_13893283629425188690
+AotListBase impl_aot_interfaces(_anon_13893283629425188690::registerAotFunctions);
 } // namespace das
 
 #if defined(_MSC_VER)

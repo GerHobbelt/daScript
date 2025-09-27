@@ -61,7 +61,7 @@
 #endif
 
 namespace das {
-namespace _anon_9136052639975051342 {
+namespace _anon_17937824475781884552 {
 
 namespace unroll { struct UnrollMacro; };
 namespace ast { struct AstFunctionAnnotation; };
@@ -299,7 +299,7 @@ inline smart_ptr_raw<FunctionAnnotation> _FuncastTickmake_function_annotationTic
 
 inline void _Funcast_boostTicksetup_tag_annotationTick4095297895764883997_c434f5f8ba663c3b ( Context * __context__, char * const  __name_rename_at_273_6, char * const  __tag_rename_at_273_7, unroll::UnrollMacro * __classPtr_rename_at_273_8 )
 {
-    smart_ptr_raw<FunctionAnnotation> __ann_rename_at_274_9; memset(&__ann_rename_at_274_9,0,sizeof(__ann_rename_at_274_9));
+    smart_ptr_raw<FunctionAnnotation> __ann_rename_at_274_9; memset((void*)&__ann_rename_at_274_9,0,sizeof(__ann_rename_at_274_9));
     /* finally */ auto __finally_273= das_finally([&](){
     das_delete_handle<smart_ptr_raw<FunctionAnnotation>>::clear(__context__,__ann_rename_at_274_9);
     /* end finally */ });
@@ -334,11 +334,11 @@ static void registerAotFunctions ( AotLibrary & aotLib ) {
         ctx.aotInitScript = ctx.code->makeNode<AutoSimNode_Aot<&__init_script>>();
         return ctx.aotInitScript;
     };
-	resolveTypeInfoAnnotations();
+    resolveTypeInfoAnnotations();
 }
 
-} // namespace _anon_9136052639975051342
-AotListBase impl_aot_unroll(_anon_9136052639975051342::registerAotFunctions);
+} // namespace _anon_17937824475781884552
+AotListBase impl_aot_unroll(_anon_17937824475781884552::registerAotFunctions);
 } // namespace das
 
 #if defined(_MSC_VER)

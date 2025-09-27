@@ -245,13 +245,14 @@ namespace das {
             d_module ? TypeDecl::DescribeModule::yes : TypeDecl::DescribeModule::no),at);
     }
 
-    char * ast_describe_typedecl_cpp ( smart_ptr_raw<TypeDecl> t, bool d_substitureRef, bool d_skipRef, bool d_skipConst, bool d_redundantConst, Context * context, LineInfoArg * at ) {
+    char * ast_describe_typedecl_cpp ( smart_ptr_raw<TypeDecl> t, bool d_substitureRef, bool d_skipRef, bool d_skipConst, bool d_redundantConst, bool d_ChooseSmartPtr, Context * context, LineInfoArg * at ) {
         if ( !t ) context->throw_error_at(at, "expecting type, not null");
         return context->allocateString(describeCppType(t,
             d_substitureRef ? CpptSubstitureRef::yes : CpptSubstitureRef::no,
             d_skipRef ? CpptSkipRef::yes : CpptSkipRef::no,
             d_skipConst ? CpptSkipConst::yes : CpptSkipConst::no,
-            d_redundantConst ? CpptRedundantConst::yes : CpptRedundantConst::no),at);
+            d_redundantConst ? CpptRedundantConst::yes : CpptRedundantConst::no,
+            d_ChooseSmartPtr ? ChooseSmartPtr::yes : ChooseSmartPtr::no),at);
     }
 
     char * ast_describe_expression ( smart_ptr_raw<Expression> t, Context * context, LineInfoArg * at ) {
@@ -352,7 +353,7 @@ namespace das {
 
     void for_each_typedef ( Module * mod, const TBlock<void,TTemporary<char *>,smart_ptr_raw<TypeDecl>> & block, Context * context, LineInfoArg * at ) {
         mod->aliasTypes.foreach([&](auto aliasType){
-            das_invoke<void>::invoke<const char *,TypeDeclPtr>(context,at,block,aliasType->alias.c_str(),aliasType);
+            das_invoke<void>::invoke<const char *,smart_ptr_raw<TypeDecl>>(context,at,block,aliasType->alias.c_str(),aliasType);
         });
     }
 
@@ -362,25 +363,25 @@ namespace das {
             enums.emplace(penum->name, penum);
         });
         for (auto [k, penum]: ordered(enums)) {
-            das_invoke<void>::invoke<EnumerationPtr>(context,at,block,penum);
+            das_invoke<void>::invoke<smart_ptr_raw<Enumeration>>(context,at,block,penum);
         }
     }
 
     void for_each_structure ( Module * mod, const TBlock<void,smart_ptr_raw<Structure>> & block, Context * context, LineInfoArg * at ) {
         mod->structures.foreach([&](auto pst){
-            das_invoke<void>::invoke<StructurePtr>(context,at,block,pst);
+            das_invoke<void>::invoke<smart_ptr_raw<Structure>>(context,at,block,pst);
         });
     }
 
     void for_each_generic ( Module * mod, const TBlock<void,smart_ptr_raw<Function>> & block, Context * context, LineInfoArg * at ) {
         mod->generics.foreach([&](auto fn){
-            das_invoke<void>::invoke<FunctionPtr>(context,at,block,fn);
+            das_invoke<void>::invoke<smart_ptr_raw<Function>>(context,at,block,fn);
         });
     }
 
     void for_each_global ( Module * mod, const TBlock<void,smart_ptr_raw<Variable>> & block, Context * context, LineInfoArg * at ) {
         mod->globals.foreach([&](auto var){
-            das_invoke<void>::invoke<VariablePtr>(context,at,block,var);
+            das_invoke<void>::invoke<smart_ptr_raw<Variable>>(context,at,block,var);
         });
     }
 
@@ -872,10 +873,6 @@ namespace das {
         return mod->aotRequire(*ss) != ModuleAotType::no_aot;
     }
 
-    const char *modGetNamespace(Module *mod, Context * context, LineInfoArg * at) {
-        return context->allocateString(mod->getNamespace(), at);
-    }
-
     #include "ast.das.inc"
 
     Module_Ast::Module_Ast() : Module("ast") {
@@ -983,7 +980,7 @@ namespace das {
                 ->args({"type","extra","contracts","module","context","lineinfo"});
         addExtern<DAS_BIND_FUN(ast_describe_typedecl_cpp)>(*this, lib,  "describe_typedecl_cpp",
             SideEffects::none, "ast_describe_typedecl_cpp")
-                ->args({"type","substitueRef","skipRef","skipConst","redundantConst","context","lineinfo"});
+                ->args({"type","substitueRef","skipRef","skipConst","redundantConst", "choose_smart_ptr","context","lineinfo"});
         addExtern<DAS_BIND_FUN(ast_describe_expression)>(*this, lib,  "describe_expression",
             SideEffects::none, "ast_describe_expression")
                 ->args({"expression","context","lineinfo"});
@@ -1248,9 +1245,6 @@ namespace das {
         addExtern<DAS_BIND_FUN(modAotRequire)>(*this, lib,  "aot_require",
                                                           SideEffects::modifyExternal, "modAotRequire")
             ->args({"mod", "ss", "context", "at"});
-        addExtern<DAS_BIND_FUN(modGetNamespace)>(*this, lib,  "mod_get_namespace",
-                                                          SideEffects::modifyExternal, "modGetNamespace")
-            ->args({"mod", "context", "at"});
         // ast_aot_helpers)
         addExtern<DAS_BIND_FUN(findFieldParent)>(*this, lib,  "find_struct_field_parent",
                                                   SideEffects::modifyExternal, "findFieldParent")

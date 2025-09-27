@@ -221,13 +221,19 @@ namespace das {
                 ss << ")";
             }
         }
-        virtual void beforeHandle ( char * ps, TypeInfo * ti ) override {
+        virtual void beforeHandle ( char *, TypeInfo * ti ) override {
             if ( int(flags) & int(PrintFlags::namesAndDimensions) ) {
                 ss << "[[" << debug_type(ti) << " ";
             }
             br();
         }
         virtual void afterHandle ( char *, TypeInfo * ) override {
+            if ( int(flags) & int(PrintFlags::namesAndDimensions) ) {
+                ss << "]]";
+            }
+            br();
+        }
+        virtual void afterHandleCancel ( char *, TypeInfo * ) override {
             if ( int(flags) & int(PrintFlags::namesAndDimensions) ) {
                 ss << "]]";
             }

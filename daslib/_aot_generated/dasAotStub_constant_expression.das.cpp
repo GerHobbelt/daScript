@@ -62,7 +62,7 @@
 #endif
 
 namespace das {
-namespace _anon_18385579166898440736 {
+namespace _anon_15423984470009869090 {
 
 namespace constant_expression { struct ConstExprAnnotation; };
 namespace constant_expression { struct ConstantExpressionMacro; };
@@ -392,7 +392,7 @@ inline void _FuncbuiltinTicksortTick14088969635007481283_51f885be6d8d83c8 ( Cont
 inline TArray<int32_t> _FuncalgorithmTickuniqueTick8642070526899511001_cca562fdff243dd3 ( Context * __context__, TArray<int32_t> &  __a_rename_at_11_11 )
 {
     int32_t __pidx_rename_at_13_12 = -1;
-    TArray<int32_t> __b_rename_at_14_13; das_zero(__b_rename_at_14_13);
+    TArray<int32_t> __b_rename_at_14_13;das_zero(__b_rename_at_14_13);
     {
         bool __need_loop_15 = true;
         // e: int aka TT&
@@ -541,11 +541,11 @@ static void registerAotFunctions ( AotLibrary & aotLib ) {
     aotLib[0xda5779b4a6f3d795] = +[](Context & ctx) -> SimNode* {
         return ctx.code->makeNode<AutoSimNode_Aot<&_FuncastTickclone_functionTick17084718524013848691_8f065c03257702c5>>();
     };
-	resolveTypeInfoAnnotations();
+    resolveTypeInfoAnnotations();
 }
 
-} // namespace _anon_18385579166898440736
-AotListBase impl_aot_constant_expression(_anon_18385579166898440736::registerAotFunctions);
+} // namespace _anon_15423984470009869090
+AotListBase impl_aot_constant_expression(_anon_15423984470009869090::registerAotFunctions);
 } // namespace das
 
 #if defined(_MSC_VER)

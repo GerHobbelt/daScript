@@ -2895,7 +2895,7 @@ namespace das {
             if ( !expr->subexpr->type ) return Visitor::visit(expr);
             // infer
             if ( !expr->subexpr->type->isRef() ) {
-                error("can only make a pointer of of a reference",  "", "",
+                error("can only make a pointer of a reference",  "", "",
                     expr->at, CompilationError::cant_dereference);
             } else {
                 if ( !safeExpression(expr) ) {
@@ -3422,6 +3422,23 @@ namespace das {
                                 value = eField->value;
                                 valueType = eField->value->type;
                                 methodName = eField->name;
+                            } else if ( func && func->isClassMethod && eField->value->rtti_isVar() ) {
+                                auto eVar = static_pointer_cast<ExprVar>(eField->value);
+                                if ( eVar->name=="super" ) {
+                                    if ( auto baseClass = func->classParent->parent ) {
+                                        reportAstChanged();
+                                        auto callName = "_::" + baseClass->name + "`" + eField->name;
+                                        auto newCall = make_smart<ExprCall>(expr->at, callName);
+                                        newCall->arguments.push_back(make_smart<ExprVar>(expr->at, "self"));
+                                        for ( size_t i=2; i!=expr->arguments.size(); ++i ) {
+                                            newCall->arguments.push_back(expr->arguments[i]);
+                                        }
+                                        return newCall;
+                                    } else {
+                                        error("call to super in " + func->name + " is not allowed, no base class for " + func->classParent->name, "", "",
+                                            expr->at, CompilationError::function_not_found);
+                                    }
+                                }
                             }
                         } else if ( expr->arguments[0]->rtti_isSwizzle() ) {
                             auto eSwizzle = static_pointer_cast<ExprSwizzle>(expr->arguments[0]);
@@ -8087,6 +8104,16 @@ namespace das {
                 error("call to " + call->name + " result is discarded, which is unsafe",
                     "use let _ = " + call->name + "(...)", "",
                         call->at, CompilationError::result_discarded);
+            }
+            if ( func && func->isClassMethod && func->classParent && call->name=="super" ) {
+                if ( auto baseClass = func->classParent->parent ) {
+                    call->name = baseClass->name + "`" + baseClass->name;
+                    call->arguments.insert(call->arguments.begin(), make_smart<ExprVar>(call->at, "self"));
+                    reportAstChanged();
+                } else {
+                    error("call to super in " + func->name + " is not allowed, no base class for " + func->classParent->name, "", "",
+                        call->at, CompilationError::function_not_found);
+                }
             }
         }
         virtual void preVisitCallArg ( ExprCall * call, Expression * arg, bool last ) override {
