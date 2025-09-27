@@ -2713,6 +2713,22 @@ namespace das {
     // ExprRef2Value
         virtual ExpressionPtr visit ( ExprRef2Value * expr ) override {
             if ( !expr->subexpr->type ) return Visitor::visit(expr);
+            // infer r2v(type<Foo...>)
+            if ( expr->subexpr->rtti_isTypeDecl() ) {
+                reportAstChanged();
+                if ( expr->subexpr->type->isWorkhorseType() ) {
+                    auto ewsType = make_smart<TypeDecl>(*(expr->subexpr->type));
+                    ewsType->ref = false;
+                    auto ews = Program::makeConst(expr->at, ewsType, v_zero());
+                    ews->type = ewsType;
+                    return ews;
+                } else {
+                    auto mks = make_smart<ExprMakeStruct>(expr->at);
+                    mks->makeType = expr->subexpr->type;
+                    mks->useInitializer = false;
+                    return mks;
+                }
+            }
             // infer
             if ( !expr->subexpr->type->isRef() ) {
                 if ( expr->subexpr->rtti_isConstant() ) {
@@ -3030,6 +3046,40 @@ namespace das {
                 error("static assert comment must be string constant",  "", "",
                     expr->at, CompilationError::invalid_argument_type);
             }
+
+            // check if we can give more info this early (buy only if we are already reporting errors)
+            if ( verbose && expr->arguments[0]->rtti_isConstant() ) {
+                bool pass = ((ExprConstBool *)(expr->arguments[0].get()))->getValue();
+                if ( !pass ) {
+                    bool iscf = expr->name=="concept_assert";
+                    string message;
+                    if ( expr->arguments.size()==2 && expr->arguments[1]->rtti_isConstant() ) {
+                        message = ((ExprConstString *)(expr->arguments[1].get()))->getValue();
+                        if ( message.empty() ) {
+                            message = iscf ? "concept assert failed" : "static assert failed";
+                        }
+                    } else {
+                        message = iscf ? "static assert failed" : "concept failed";
+                    }
+                    if ( iscf ) {
+                        LineInfo atC = expr->at;
+                        string extra;
+                        if ( func ) {
+                            extra = "\nconcept_assert at " + expr->at.describe();
+                            extra += func->getLocationExtra();
+                            atC = func->getConceptLocation(atC);
+                        }
+                        program->error(message, extra,"",atC, CompilationError::concept_failed);
+                    } else {
+                        string extra;
+                        if ( func ) {
+                            extra = func->getLocationExtra();
+                        }
+                        program->error(message, extra,"",expr->at, CompilationError::static_assert_failed);
+                    }
+                }
+            }
+
             expr->type = make_smart<TypeDecl>(Type::tVoid);
             return Visitor::visit(expr);
         }
