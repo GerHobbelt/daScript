@@ -540,9 +540,7 @@ namespace das
         // simulate
         virtual SimNode * simulateDelete ( Context &, const LineInfo &, SimNode *, uint32_t ) const { return nullptr; }
         virtual SimNode * simulateDeletePtr ( Context &, const LineInfo &, SimNode *, uint32_t ) const { return nullptr; }
-        virtual SimNode * simulateCopy ( Context &, const LineInfo &, SimNode *, SimNode * ) const { return nullptr; }
         virtual SimNode * simulateClone ( Context &, const LineInfo &, SimNode *, SimNode * ) const { return nullptr; }
-        virtual SimNode * simulateRef2Value ( Context &, const LineInfo &, SimNode * ) const { return nullptr; }
         virtual SimNode * simulateNullCoalescing ( Context &, const LineInfo &, SimNode *, SimNode * ) const { return nullptr; }
         virtual SimNode * simulateGetNew ( Context &, const LineInfo & ) const { return nullptr; }
         virtual SimNode * simulateGetAt ( Context &, const LineInfo &, const TypeDeclPtr &,
@@ -1130,6 +1128,7 @@ namespace das
         ExprCallFactory * findCall ( const string & name ) const;
         __forceinline bool isVisibleDirectly ( Module * objModule ) const {
             if ( objModule==this ) return true;
+            if ( objModule->visibleEverywhere ) return true;
             return requireModule.find(objModule) != requireModule.end();
         }
         bool compileBuiltinModule ( const string & name, unsigned char * str, unsigned int str_len );//will replace last symbol to 0
@@ -1219,6 +1218,7 @@ namespace das
                 bool    isSolidContext : 1;
                 bool    doNotAllowUnsafe : 1;
                 bool    wasParsedNameless : 1;
+                bool    visibleEverywhere : 1;
             };
             uint32_t        moduleFlags = 0;
         };
@@ -1486,6 +1486,7 @@ namespace das
         bool log_compile_time = false;                  // if true, then compile time will be printed at the end of the compilation
         bool log_total_compile_time = false;            // if true, then detailed compile time will be printed at the end of the compilation
         bool no_fast_call = false;                      // disable fastcall
+        bool scoped_stack_allocator = true;             // reuse stack memory after variables out of scope
     // debugger
         //  when enabled
         //      1. disables [fastcall]
