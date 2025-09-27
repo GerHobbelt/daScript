@@ -1409,6 +1409,9 @@ namespace das
         das_hash_map<string,VarInfo *>           vmn2v;
         das_hash_map<string,FuncInfo *>          fmn2f;
         das_hash_map<string,EnumInfo *>          emn2e;
+
+        das_hash_map<TypeInfo *,string>          t2cppTypeName;
+        das_hash_map<StructInfo *,string>        s2cppTypeName;
     };
 
     struct CodeOfPolicies {
@@ -1759,7 +1762,7 @@ namespace das
         int64_t         macroTimeTicks = 0;
         AstSerializer * serializer_read = nullptr;
         AstSerializer * serializer_write = nullptr;
-        DebugAgentInstance g_threadLocalDebugAgent;
+        inline static DAS_THREAD_LOCAL(DebugAgentInstance *) g_threadLocalDebugAgent;
         uint64_t        dataWalkerStringLimit = 0;
         inline static DAS_THREAD_LOCAL(daScriptEnvironment *) bound;
         inline static DAS_THREAD_LOCAL(daScriptEnvironment *) owned;

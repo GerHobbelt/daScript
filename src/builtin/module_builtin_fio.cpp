@@ -14,10 +14,6 @@
 
 #include <sstream>
 
-#if !DAS_NO_FILEIO
-#include <filesystem>
-#endif
-
 MAKE_TYPE_FACTORY(clock, das::Time)// use MAKE_TYPE_FACTORY out of namespace. Some compilers not happy otherwise
 
 #if _WIN32
@@ -115,11 +111,6 @@ namespace das {
 #if DAS_NO_FILEIO
 
 namespace das {
-
-    string builtin_proximate(const char *path, const char *) {
-        return path;
-    }
-
     #define GENERATE_IO_STUB { context->throw_error_at(at, "%s is not implemented (because DAS_NO_FILEIO is enabled)", __FUNCTION__); }
     void builtin_fprint(const FILE *f, const char *text, Context *context, LineInfoArg *at) GENERATE_IO_STUB
     void builtin_fclose ( const FILE * f, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
@@ -139,7 +130,7 @@ namespace das {
     int builtin_popen_binary ( const char * cmd, const TBlock<void,const FILE *> & blk, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     int builtin_popen ( const char * cmd, const TBlock<void,const FILE *> & blk, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     char * get_full_file_name ( const char * path, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
-    bool has_env_variable ( const char * var ) GENERATE_IO_STUB
+    bool has_env_variable ( const char * var, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     char * get_env_variable ( const char * var, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     char * sanitize_command_line ( const char * cmd, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
 #undef GENERATE_IO_STUB
@@ -207,10 +198,6 @@ namespace das {
         virtual bool isLocal() const override { return true; }
     };
 
-
-    string builtin_proximate(const char *path, const char *base) {
-        return std::filesystem::proximate(path, base).string().c_str();
-    }
 
     void builtin_fprint ( const FILE * f, const char * text, Context * context, LineInfoArg * at ) {
         if ( !f ) context->throw_error_at(at, "can't fprint NULL");
@@ -576,7 +563,7 @@ namespace das {
         return rename(old_path, new_path) == 0;
     }
 
-    bool has_env_variable ( const char * var ) {
+    bool has_env_variable ( const char * var, Context * , LineInfoArg * ) {
         if ( !var ) return false;
         auto res = getenv(var);
         return res != nullptr;
@@ -727,7 +714,7 @@ namespace das {
                     ->args({"var","context","at"});
             addExtern<DAS_BIND_FUN(has_env_variable)>(*this, lib, "has_env_variable",
                 SideEffects::accessExternal, "has_env_variable")
-                    ->arg("var");
+                    ->args({"var","context","at"});
             addExtern<DAS_BIND_FUN(sanitize_command_line)>(*this, lib, "sanitize_command_line",
                 SideEffects::none, "sanitize_command_line")
                     ->args({"var","context","at"});
