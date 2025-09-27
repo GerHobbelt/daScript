@@ -22,7 +22,8 @@ require ast_aot_cpp
 struct StandaloneContextCfg {
     context_name : string;
     class_name : string;
-    cpp_output_dir : string
+    cpp_output_dir : string;
+    cross_platform : bool
 };
 
 
@@ -43,7 +44,7 @@ def getInitSemanticHash(ctx : Context) {
     */
 }
 
-def writeStandaloneContextMethods(var prog : ProgramPtr; var logs : StringBuilderWriter; prefix : string; declare_only : bool) {
+def writeStandaloneContextMethods(var prog : ProgramPtr; var logs : StringBuilderWriter; prefix : string; declare_only : bool; cfg : StandaloneContextCfg) {
     let fnn = collectProgramUsedFunctions(prog);
 
     var coll = new BlockVariableCollector();
@@ -60,16 +61,16 @@ def writeStandaloneContextMethods(var prog : ProgramPtr; var logs : StringBuilde
         for (variable in fn.arguments) {
             let type_str = build_string() <| $(var wr) {
                 if (isLocalVec(variable._type)) {
-                    describeLocalCppType(unsafe(addr(wr)), variable._type);
+                    describeLocalCppType(unsafe(addr(wr)), variable._type, cfg.cross_platform);
                 } else {
-                    write(wr, describeCppType(variable._type));
+                    write(wr, describeCppType(variable._type, DescribeConfig(cross_platform = cfg.cross_platform)));
                 }
             }
             vars.push("{type_str} {variable._type.isRefType ? "& " : ""}{coll.getVarName(variable)}")
         }
         let vars_str = join(vars, ", ");
         write(logs, "{vars_str}{!fn.arguments.empty() ? " " : ""}) -> ")
-        describeLocalCppType(unsafe(addr(logs)), fn.result, CpptSubstitureRef.no, CpptSkipConst.yes);
+        describeLocalCppType(unsafe(addr(logs)), fn.result, cfg.cross_platform, CpptSubstitureRef.no, CpptSkipConst.yes);
         if (declare_only) {
             write(logs, ";\n");
         } else {
@@ -118,9 +119,7 @@ def writeStandaloneCtor(cfg : StandaloneContextCfg; initFunctions : string; var 
         write(tw, "{pvar.name}\", \"{pvar |> get_mangled_name()}\", {pvar._type.sizeOf}, {pvar.flags.global_shared}));\n");
     }
     write(tw, "     // end totalVariables\n\n");
-    write(tw, "    context.globals = (char *) das_aligned_alloc16(context.globalsSize);\n");
-    write(tw, "    context.shared = (char *) das_aligned_alloc16(context.sharedSize);\n");
-    write(tw, "    context.sharedOwner = true;\n");
+    write(tw, "    context.allocateGlobalsAndShared();\n");
     write(tw, "    context.totalVariables = {program.totalVariables}/*totalVariables*/;\n");
     write(tw, "    context.functions = (SimFunction *) context.code->allocate( {program.totalFunctions}/*totalFunctions*/*sizeof(SimFunction) );\n");
     write(tw, "    context.totalFunctions = {program.totalFunctions}/*totalFunctions*/;\n");
@@ -133,8 +132,20 @@ def writeStandaloneCtor(cfg : StandaloneContextCfg; initFunctions : string; var 
     write(tw, "    context.tabMnLookup = make_shared<das_hash_map<uint64_t,SimFunction *>>();\n");
     write(tw, "    context.tabMnLookup->clear();\n");
     write(tw, "     // start totalFunctions\n");
+    write(tw, "    initializer_list<tuple<int, FunctionInfo, FuncInfo*>> initFunctions = \{\n");
     write(tw, "{initFunctions}");
+    write(tw, "    \};\n");
     write(tw, "    // end totalFunctions\n");
+
+    write(tw, " vector<pair<uint64_t, SimFunction*>> id_to_funcs;\n");
+    write(tw, "    for (const auto& [index, func_info, debug_info]: initFunctions) \{\n");
+    write(tw, "        InitAotFunction(context, &context.functions[index], func_info);\n");
+    write(tw, "        context.functions[index].debugInfo = debug_info;\n");
+    write(tw, "        (*context.tabMnLookup)[func_info.mnh] = context.functions + index;\n");
+    write(tw, "        id_to_funcs.emplace_back(func_info.aotHash, &context.functions[index]);\n");
+    write(tw, "        anyPInvoke |= func_info.pinvoke;\n");
+    write(tw, "    \}\n");
+
     write(tw, "    context.tabGMnLookup = make_shared<das_hash_map<uint64_t,uint32_t>>();\n");
     write(tw, "    context.tabGMnLookup->clear();\n");
     write(tw, "    for ( int i=0, is=context.totalVariables; i!=is; ++i ) \{\n");
@@ -149,16 +160,6 @@ def writeStandaloneCtor(cfg : StandaloneContextCfg; initFunctions : string; var 
     });
     let fnn = collectProgramUsedFunctions(program, true);
 
-    write(tw, "    FillFunction(context, getGlobalAotLibrary(), \{\n        ");
-    for (fn in fnn) {
-        write(tw, "make_pair(0x{fn.aotHash:x}, &context.functions[{fn.index}/*fni*/])");
-        if (fn != fnn.back()) {
-            write(tw, ",\n        ");
-        } else {
-            write(tw, "\n    ");
-        }
-    }
-    write(tw, "});\n");
     // aot init
     if (program.initSemanticHashWithDep != uint64(0)) {
         write(tw, "    \{\n");
@@ -169,6 +170,7 @@ def writeStandaloneCtor(cfg : StandaloneContextCfg; initFunctions : string; var 
         write(tw, "    \}\n");
     }
 
+    write(tw, " FillFunction(context, getGlobalAotLibrary(), das::move(id_to_funcs));\n");
     write(tw, "    context.runInitScript();\n");
     write(tw, "\}\n");
 }
@@ -179,10 +181,10 @@ def writeStandaloneContext(var program : ProgramPtr, initFunctions : string, var
     write(header, "class {cfg.class_name} : public Context \{\n");
     write(header, "public:\n");
     write(header, "    {cfg.class_name}();\n");
-    writeStandaloneContextMethods(program, header, "", true);
+    writeStandaloneContextMethods(program, header, "", true, cfg);
     write(header, "\};\n");
 
-    writeStandaloneContextMethods(program, source, "{cfg.class_name}::", false);
+    writeStandaloneContextMethods(program, source, "{cfg.class_name}::", false, cfg);
     writeStandaloneCtor(cfg, initFunctions, source, program);
 
     write(source, "#ifdef STANDALONE_CONTEXT_TESTS\n");
@@ -196,13 +198,14 @@ def writeStandaloneContext(var program : ProgramPtr, initFunctions : string, var
 
 class StandaloneContextGen : CppAot {
 
-    def StandaloneContextGen(var program_ : ProgramPtr; var ss_ : StringBuilderWriter?, var coll : BlockVariableCollector ?) {
+    def StandaloneContextGen(var program_ : ProgramPtr; var ss_ : StringBuilderWriter?, var coll : BlockVariableCollector ?, cross_platform : bool) {
         ss <- ss_;
         collector <- coll;
         program <- program_;
         prologue = program._options |> find_arg("aot_prologue") ?as tBool ?? false;
         solidContext = program.policies.solid_context || (program._options |> find_arg("solid_context") ?as tBool ?? false);
         helper.helper.rtti = program._options  |> find_arg("rtti") ?as tBool ?? false;
+        helper.cross_platform = cross_platform;
     }
 
     used_functions : table<string>;
@@ -264,7 +267,7 @@ def writeRegistration(var header : StringBuilderWriter;
                       cfg : StandaloneContextCfg;
                       var context : Context) {
     write(source, "using namespace {program.thisNamespace};\n");
-    dumpRegisterAot(unsafe(addr(source)), program, context, true);
+    dumpRegisterAot(unsafe(addr(source)), program, context, cfg.cross_platform, true);
     write(header, "namespace {cfg.context_name} \{\n");
     write(source, "namespace {cfg.context_name} \{\n");
     writeStandaloneContext(program, initFunctions, header, source, cfg);
@@ -276,6 +279,23 @@ def writeRegistration(var header : StringBuilderWriter;
  * Adds debug info to AotDebugInfoHelper
  * @return String with initialization of all functions
  */
+def GetFunctionInfo(pfun : Function?, info : string) {
+    return build_string() <| $(tw) {
+        let args = ["\"{pfun.name}\"",
+                    "\"{pfun |> get_mangled_name()}\"",
+                    "0x{pfun.getMangledNameHash:x}",
+                    "0x{pfun.aotHash:x}",
+                    "{pfun.totalStackSize:d}",
+                    "{pfun.flags.unsafeOperation}",
+                    "{pfun.flags.fastCall}",
+                    "{pfun._module.moduleFlags.builtIn}",
+                    "{pfun._module.moduleFlags.promoted}",
+                    "{pfun.result.isRefType && !pfun.result.flags.ref}",
+                    "{pfun.moreFlags.pinvoke}"]
+        write(tw, "        std::make_tuple({pfun.index}, FunctionInfo({args|>join(", ")})), &{info}),\n");
+    }
+}
+
 def addFunctionInfo(disableInit : bool; rtti : bool, fnn : array<Function?>, var helper : AotDebugInfoHelper ?) {
     helper.helper.rtti = rtti;
     var lookupFunctionTable : array<tuple<Function?, FuncInfo?>>;
@@ -285,30 +305,8 @@ def addFunctionInfo(disableInit : bool; rtti : bool, fnn : array<Function?>, var
     }
 
     return build_string() <| $(tw) {
-        for (fun_info in lookupFunctionTable) {
-            let (pfun, info) = fun_info
-            let args = ["\"{pfun.name}\"",
-                        "\"{pfun |> get_mangled_name()}\"",
-                        "{pfun.totalStackSize:d}",
-                        "{pfun.flags.unsafeOperation}",
-                        "{pfun.flags.fastCall}",
-                        "{pfun._module.moduleFlags.builtIn}",
-                        "{pfun._module.moduleFlags.promoted}",
-                        "{pfun.result.isRefType && !pfun.result.flags.ref}",
-                        "{pfun.moreFlags.pinvoke}"]
-            write(tw, "    InitAotFunction(context, &context.functions[{pfun.index}/*pfun->index*/], FunctionInfo({args|>join(", ")}));\n");
-            write(tw, "    context.functions[{pfun.index}/*pfun->index*/].debugInfo = &{funcInfoName(info)};\n");
-            if (pfun.moreFlags.pinvoke) {
-                write(tw, "    anyPInvoke = true;\n\n");
-            }
-        }
-
-        for (fun_info in lookupFunctionTable) {
-            let (pfun, info) = fun_info
-            let mnh = pfun.getMangledNameHash;
-
-            write(tw, "    // {pfun |> get_mangled_name()}\n");
-            write(tw, "    (*context.tabMnLookup)[0x{mnh:x}/*mnh*/] = context.functions + {pfun.index}/*fn->index*/;\n");
+        for ((fun_info, info) in lookupFunctionTable) {
+            write(tw, GetFunctionInfo(fun_info, funcInfoName(info)));
         }
     }
 }
@@ -332,7 +330,7 @@ def genStandaloneSrc(var program : ProgramPtr;
     var initFunctions : string;
     let ctx_generated = build_string() <| $(tw) {
         build_string() <| $(tmp_writer) {
-            var gen = new StandaloneContextGen(program, unsafe(addr(tmp_writer)), coll);
+            var gen = new StandaloneContextGen(program, unsafe(addr(tmp_writer)), coll, cfg.cross_platform);
             var inscope adapter <- make_visitor(*gen)
             gen.adapter := adapter
             program |> visit_module(adapter, program.getThisModule);

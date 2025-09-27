@@ -2841,7 +2841,25 @@ namespace das {
                     expr->at, CompilationError::function_not_found);
             }
             if (expr->func && expr->func->builtIn) {
-                error("can't get address of builtin function " + describeFunction(expr->func),  "", "",
+                TextWriter tw;
+                if ( verbose ) {
+                    tw << "@@ ( ";
+                    for ( size_t i=0; i<expr->type->argTypes.size(); ++i ) {
+                        if ( i ) tw << ", ";
+                        tw << "arg" << i << " : " << describeType(expr->type->argTypes[i]);
+                    }
+                    tw << " ) : " << describeType(expr->type->firstType) << " { ";
+                    if ( !expr->func->result->isVoid() ) {
+                        tw << "return ";
+                    }
+                    tw << expr->func->name << "(";
+                    for ( size_t i=0; i<expr->func->arguments.size(); ++i ) {
+                        if ( i ) tw << ",";
+                        tw << "arg" << i;
+                    }
+                    tw << "); }";
+                }
+                error("can't get address of builtin function " + describeFunction(expr->func), "wrap local function instead", tw.str(),
                     expr->at, CompilationError::type_not_found);
                 return Visitor::visit(expr);
             }
@@ -5576,15 +5594,20 @@ namespace das {
                         // note - we only report this error if verbose, i.e. if we are reporting FINAL error
                         // this is an error only if things failed to compile
                         TextWriter tw;
-                        tw << "possible candidates:\n";
-                        for ( auto en : possibleEnums ) {
-                            tw << "\tenum " << en->name << " in " << (en->module->name.empty() ? "this module" : en->module->name) << "\n";
+                        if ( possibleEnums.size() || possibleBitfields.size() ) {
+                            tw << "possible candidates:\n";
+                            for ( auto en : possibleEnums ) {
+                                tw << "\tenum " << en->name << " in " << (en->module->name.empty() ? "this module" : en->module->name) << "\n";
+                            }
+                            for ( auto bf : possibleBitfields ) {
+                                tw << "\tbitfield " << bf->alias << " in " << (bf->alias.empty() ? "this module" : bf->alias) << "\n";
+                            }
+                            error("'" + var->name + "' is ambiguous", tw.str(), "",
+                                expr->at, CompilationError::cant_get_field);
+                        } else {
+                            error("Don't know what '" + var->name + "' is", "", "",
+                                expr->at, CompilationError::cant_get_field);
                         }
-                        for ( auto bf : possibleBitfields ) {
-                            tw << "\tbitfield " << bf->alias << " in " << (bf->alias.empty() ? "this module" : bf->alias) << "\n";
-                        }
-                        error("'" + var->name + "' is ambiguous", tw.str(), "",
-                            expr->at, CompilationError::cant_get_field);
                     }
                 }
             }
@@ -6849,18 +6872,20 @@ namespace das {
             }
             if ( expr->moveSemantics && expr->subexpr && expr->subexpr->type && expr->subexpr->type->lockCheck() ) {
                 if ( !(expr->at.fileInfo && expr->at.fileInfo->name=="builtin.das") ) {
-                    bool checkIt = true;
-                    if ( expr->subexpr->rtti_isCall() ) {
-                        auto ccall = static_pointer_cast<ExprCall>(expr->subexpr);
-                        if ( ccall->name=="_return_with_lockcheck" || starts_with(ccall->name,"__::builtin`_return_with_lockcheck`") ) checkIt = false;
-                    }
-                    if ( checkIt && !expr->skipLockCheck && !(func && func->skipLockCheck) && !skipModuleLockChecks ) {
-                        reportAstChanged();
-                        auto pCall = make_smart<ExprCall>(expr->at,"_return_with_lockcheck");
-                        pCall->arguments.push_back(expr->subexpr->clone());
-                        auto pRet = expr->clone();
-                        static_pointer_cast<ExprReturn>(pRet)->subexpr = pCall;
-                        return pRet;
+                    if ( !expr->skipLockCheck && !(func && func->skipLockCheck) && !skipModuleLockChecks ) {
+                        bool checkIt = true;
+                        if ( expr->subexpr->rtti_isCall() ) {
+                            auto ccall = static_pointer_cast<ExprCall>(expr->subexpr);
+                            if ( ccall->name=="_return_with_lockcheck" || starts_with(ccall->name,"__::builtin`_return_with_lockcheck`") ) checkIt = false;
+                        }
+                        if ( checkIt ) {
+                            reportAstChanged();
+                            auto pCall = make_smart<ExprCall>(expr->at,"_return_with_lockcheck");
+                            pCall->arguments.push_back(expr->subexpr->clone());
+                            auto pRet = expr->clone();
+                            static_pointer_cast<ExprReturn>(pRet)->subexpr = pCall;
+                            return pRet;
+                        }
                     }
                 }
             }
@@ -7250,6 +7275,12 @@ namespace das {
                 pVar->type->temporary |= src->type->isTemp();
                 pVar->source = src;
                 pVar->can_shadow = expr->canShadow;
+                for ( auto & al : assume ) {
+                    if ( al->alias==pVar->name ) {
+                        error("can't make loop variable `" + pVar->name + "`, name already taken by alias", "", "",
+                            pVar->at, CompilationError::variable_not_found);
+                    }
+                }
                 if ( !pVar->can_shadow && !program->policies.allow_local_variable_shadowing ) {
                     if ( func ) {
                         for ( auto & fna : func->arguments ) {
@@ -7399,6 +7430,12 @@ namespace das {
             if ( var->type->isAuto() && !var->init) {
                 error("local variable type can't be inferred, it needs an initializer", "", "",
                       var->at, CompilationError::cant_infer_missing_initializer );
+            }
+            for ( auto & al : assume ) {
+                if ( al->alias==var->name ) {
+                    error("can't make local variable `" + var->name + "`, name already taken by alias", "", "",
+                        var->at, CompilationError::variable_not_found);
+                }
             }
             if ( !var->can_shadow && !program->policies.allow_local_variable_shadowing ) {
                 if ( func ) {

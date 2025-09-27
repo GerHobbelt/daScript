@@ -1,3 +1,4 @@
+#include <optional>
 #include "daScript/misc/platform.h"
 
 #include "daScript/ast/ast.h"
@@ -201,12 +202,15 @@ namespace das {
         return aotSuffixNameEx(st->name,"");
     }
 
+    static bool crossPlatform = false; // It'll be better to forward this flag everywhere in describeTypeEx
+
     string describeCppTypeEx ( const TypeDeclPtr & type,
                             CpptSubstitureRef substituteRef,
                             CpptSkipRef skipRef,
                             CpptSkipConst skipConst,
                             CpptRedundantConst redundantConst,
-                            CpptUseAlias useAlias ) {
+                            CpptUseAlias useAlias,
+                            bool useSmartPtr ) {
 
         TextWriter stream;
         auto baseType = type->baseType;
@@ -242,27 +246,41 @@ namespace das {
             }
         } else if ( baseType==Type::tArray ) {
             if ( type->firstType ) {
-                stream << "TArray<" << describeCppTypeEx(type->firstType,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no,CpptRedundantConst::yes,useAlias) << ">";
+                stream << "TArray<" << describeCppTypeEx(type->firstType,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no,CpptRedundantConst::yes,useAlias, useSmartPtr) << ">";
             } else {
                 stream << "Array";
             }
         } else if ( baseType==Type::tTable ) {
             if ( type->firstType && type->secondType ) {
-                stream << "TTable<" << describeCppTypeEx(type->firstType,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no,CpptRedundantConst::yes,useAlias)
-                << "," << describeCppTypeEx(type->secondType,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no,CpptRedundantConst::yes,useAlias) << ">";
+                stream << "TTable<" << describeCppTypeEx(type->firstType,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no,CpptRedundantConst::yes,useAlias, useSmartPtr)
+                << "," << describeCppTypeEx(type->secondType,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no,CpptRedundantConst::yes,useAlias, useSmartPtr) << ">";
             } else {
                 stream << "Table";
             }
         } else if ( baseType==Type::tTuple ) {
-            stream << "TTuple<" << int(type->getTupleSize());
+            if (crossPlatform) {
+                stream << "AutoTuple<";
+            } else {
+                stream << "TTuple<" << int(type->getTupleSize());
+            }
             for ( const auto & arg : type->argTypes ) {
-                stream << "," << describeCppTypeEx(arg,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no,CpptRedundantConst::yes,useAlias);
+                if (!crossPlatform || arg != type->argTypes.front()) {
+                    stream << ",";
+                }
+                stream << describeCppTypeEx(arg,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no,CpptRedundantConst::yes,useAlias, useSmartPtr);
             }
             stream << ">";
         } else if ( baseType==Type::tVariant ) {
-            stream << "TVariant<" << int(type->getVariantSize()) << "," << int(type->getVariantAlign());
+            if (crossPlatform) {
+                stream << "AutoVariant<";
+            } else {
+                stream << "TVariant<" << int(type->getVariantSize()) << "," << int(type->getVariantAlign());
+            }
             for ( const auto & arg : type->argTypes ) {
-                stream << "," << describeCppTypeEx(arg,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no,CpptRedundantConst::yes,useAlias);
+                if (!crossPlatform || arg != type->argTypes.front()) {
+                    stream << ",";
+                }
+                stream << describeCppTypeEx(arg,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no,CpptRedundantConst::yes,useAlias, useSmartPtr);
             }
             stream << ">";
         } else if ( baseType==Type::tStructure ) {
@@ -278,17 +296,17 @@ namespace das {
         } else if ( baseType==Type::tPointer ) {
             if ( !type->smartPtr ) {
                 if ( type->firstType ) {
-                    stream << describeCppTypeEx(type->firstType,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no,CpptRedundantConst::no,useAlias) << " *";
+                    stream << describeCppTypeEx(type->firstType,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no,CpptRedundantConst::no,useAlias, useSmartPtr) << " *";
                 } else {
                     stream << "void *";
                 }
             } else {
                 if ( type->firstType ) {
-                    stream  << (type->smartPtrNative ? "smart_ptr<" : "smart_ptr_raw<")
-                            <<  describeCppTypeEx(type->firstType,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no,CpptRedundantConst::no,useAlias)
+                    stream  << (type->smartPtrNative && useSmartPtr ? "smart_ptr<" : "smart_ptr_raw<")
+                            <<  describeCppTypeEx(type->firstType,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no,CpptRedundantConst::no,useAlias, useSmartPtr)
                             << ">";
                 } else {
-                    stream  << (type->smartPtrNative ? "smart_ptr<" : "smart_ptr_raw<") << "void>";
+                    stream  << (type->smartPtrNative && useSmartPtr ? "smart_ptr<" : "smart_ptr_raw<") << "void>";
                 }
             }
         } else if ( type->isEnumT() ) {
@@ -305,7 +323,7 @@ namespace das {
             }
         } else if ( baseType==Type::tIterator ) {
             if ( type->firstType ) {
-                stream << "Sequence DAS_COMMENT((" << describeCppTypeEx(type->firstType,substituteRef,skipRef,skipConst,CpptRedundantConst::yes,useAlias) << "))";
+                stream << "Sequence DAS_COMMENT((" << describeCppTypeEx(type->firstType,substituteRef,skipRef,skipConst,CpptRedundantConst::yes,useAlias, useSmartPtr) << "))";
             } else {
                 stream << "Sequence";
             }
@@ -315,13 +333,13 @@ namespace das {
             }
             stream << das_to_cppString(baseType) << " DAS_COMMENT((";
             if ( type->firstType ) {
-                stream << describeCppTypeEx(type->firstType,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no,CpptRedundantConst::yes,useAlias);
+                stream << describeCppTypeEx(type->firstType,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no,CpptRedundantConst::yes,useAlias, useSmartPtr);
             } else {
                 stream << "void";
             }
             if ( type->argTypes.size() ) {
                 for ( const auto & arg : type->argTypes ) {
-                    stream << "," << describeCppTypeEx(arg,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no,CpptRedundantConst::yes,useAlias);
+                    stream << "," << describeCppTypeEx(arg,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no,CpptRedundantConst::yes,useAlias, useSmartPtr);
                 }
             }
             stream << "))";
@@ -352,8 +370,9 @@ namespace das {
                             CpptSubstitureRef substituteRef,
                             CpptSkipRef skipRef,
                             CpptSkipConst skipConst,
-                            CpptRedundantConst redundantConst ) {
-        return describeCppTypeEx(type, substituteRef, skipRef, skipConst, redundantConst, CpptUseAlias::no);
+                            CpptRedundantConst redundantConst,
+                            bool useSmartPtr ) {
+        return describeCppTypeEx(type, substituteRef, skipRef, skipConst, redundantConst, CpptUseAlias::no, useSmartPtr);
     }
 
 
@@ -585,11 +604,22 @@ namespace das {
             return ss.str();
         }
     protected:
-        void describeCppVarInfo ( TextWriter & ss, VarInfo * info, const string & suffix ) const {
+        void describeCppVarInfo ( TextWriter & ss, string_view structName, VarInfo * info, const string & suffix ) const {
             describeCppTypeInfo(ss, info, suffix);
             ss << ", \"" << info->name << "\", ";
-            ss << info->offset << ", " << info->nextGcField;
-
+            if (crossPlatform) {
+                ss << "offsetof(";
+                ss << structName.data() << "," << info->name << ")";
+            } else {
+                ss << info->offset;
+            }
+            ss << ", " << info->nextGcField;
+        }
+        void describeCppVarFuncInfo ( TextWriter & ss, string_view structName, VarInfo * info, const string & suffix ) const {
+            describeCppTypeInfo(ss, info, suffix);
+            // Note: info offset is platform dependant, however for functions it's not done yet and always zero.
+            DAS_ASSERT(info->offset == 0);
+            ss << ", \"" << info->name << "\", " << 0 << ", " << info->nextGcField;
         }
         void describeCppStructInfoFields ( TextWriter & ss, StructInfo * info ) const {
             if ( !info->fields ) return;
@@ -599,7 +629,8 @@ namespace das {
                 writeArgTypes(ss, info->fields[fi], suffix);
                 writeArgNames(ss, info->fields[fi], suffix);
                 ss << "VarInfo " << structInfoName(info) << "_field_" << fi << " =  { ";
-                describeCppVarInfo(ss, info->fields[fi],suffix);
+                auto prefix = info->module_name != nullptr ? string(info->module_name) + "::" : "";
+                describeCppVarInfo(ss, (prefix + info->name), info->fields[fi],suffix);
                 ss << " };\n";
             }
             ss << "VarInfo * " << structInfoName(info) << "_fields[" << info->count << "] =  { ";
@@ -631,7 +662,7 @@ namespace das {
                 writeArgTypes(ss, info->fields[fi], suffix);
                 writeArgNames(ss, info->fields[fi], suffix);
                 ss << "VarInfo " << funcInfoName(info) << "_field_" << fi << " =  { ";
-                describeCppVarInfo(ss, info->fields[fi],suffix);
+                describeCppVarFuncInfo(ss, info->name, info->fields[fi],suffix);
                 ss << " };\n";
             }
             ss << "VarInfo * " << funcInfoName(info) << "_fields[" << info->count << "] =  { ";
@@ -953,14 +984,15 @@ namespace das {
 
     class CppAot : public Visitor {
     public:
-        CppAot ( const ProgramPtr & prog, BlockVariableCollector & cl ) : program(prog), collector(cl) {
+        CppAot ( const ProgramPtr & prog, BlockVariableCollector & cl, bool cross_platform )
+            : program(prog), collector(cl), cross_platform(cross_platform) {
             helper.rtti = program->options.getBoolOption("rtti",false);
             prologue = program->options.getBoolOption("aot_prologue",false) ||
                 program->getDebugger();
             solidContext = program->policies.solid_context || program->options.getBoolOption("solid_context",false);
         }
         string str() const {
-            return "\n" + helper.str() + sti.str()  + stg.str() + ss.str();
+            return "\n" + declarations + helper.str() + sti.str() + stg.str() + ss.str();
         }
 
         void clear() {
@@ -970,6 +1002,7 @@ namespace das {
         }
     public:
         TextWriter                  ss, sti, stg;
+        string                      declarations;
     protected:
         uint64_t                    lastNewLine = -1ul;
         int                         tab = 0;
@@ -977,10 +1010,11 @@ namespace das {
         AotDebugInfoHelper          helper;
         ProgramPtr                  program;
         BlockVariableCollector &    collector;
-        das_set<string>       aotPrefix;
+        das_set<string>             aotPrefix;
         vector<ExprBlock *>         scopes;
         bool                        prologue = false;
         bool                        solidContext = false;
+        bool                        cross_platform = true;
     protected:
         void newLine () {
             auto nlPos = ss.tellp();
@@ -1085,7 +1119,7 @@ namespace das {
         }
         virtual StructurePtr visit ( Structure * that ) override {
             ss << "};\n";   // structure
-            if ( that->fields.size() ) {
+            if ( !cross_platform && that->fields.size() ) {
                 ss << "static_assert(sizeof(" << aotStructName(that) << ")==" << that->getSizeOf() << ",\"structure size mismatch with DAS\");\n";
                 for ( auto & tf : that->fields ) {
                     ss << "static_assert(offsetof(" << aotStructName(that) << "," << tf.name << ")=="
@@ -1106,6 +1140,8 @@ namespace das {
     // program body
         virtual void preVisitProgramBody ( Program * prog, Module * ) override {
             // functions
+            declarations = ss.str();
+            ss.clear();
             ss << "\n";
             prog->thisModule->functions.foreach([&](auto fn){
                 if ( !fn->builtIn && !fn->noAot ) {
@@ -1245,10 +1281,10 @@ namespace das {
                 ss << tabs();
                 describeVarLocalCppType(ss, var->type);
                 auto vname = collector.getVarName(var);
-                ss  << " " << vname;
                 if ( var->type->constant && var->type->isRefType() && !var->type->ref ) {
-                    ss << "_ConstRef";
+                    vname += "_ConstRef";
                 }
+                ss  << " " << vname;
                 ss << "; " << "memset(&" << vname << ",0,sizeof(" << vname << "));"
                     << "\n";
             }
@@ -1375,7 +1411,7 @@ namespace das {
             if ( !expr->type->isPointer() && !var->type->ref && expr->type->isAotAlias() && !var->type->isAotAlias() ) {
                 if ( expr->type->alias.empty() ) {
                     ss << "das_reinterpret<"
-                    << describeCppTypeEx(expr->type,CpptSubstitureRef::no,CpptSkipRef::yes,CpptSkipConst::no,CpptRedundantConst::yes,CpptUseAlias::yes) << ">::pass(";
+                    << describeCppTypeEx(expr->type,CpptSubstitureRef::no,CpptSkipRef::yes,CpptSkipConst::no,CpptRedundantConst::yes,CpptUseAlias::yes, false) << ">::pass(";
                 } else {
                     ss << "das_alias<" << expr->type->alias << ">::from(";
                 }
@@ -1790,16 +1826,32 @@ namespace das {
             }
             return Visitor::visit(nc);
         }
+
+        void dumpVariadicTypes(const vector<TypeDeclPtr>& types) {
+            for ( const auto & arg : types ) {
+                ss << "," << describeCppTypeEx(arg,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no,CpptRedundantConst::yes,CpptUseAlias::no, false);
+            }
+        }
+
     // is variant
         virtual void preVisit(ExprIsVariant * field) override {
             Visitor::preVisit(field);
-            ss << "das_get_variant_field<"
-                << describeCppType(field->value->type->argTypes[field->fieldIndex])
-                << ","
-                << field->value->type->getVariantFieldOffset(field->fieldIndex)
-                << ","
-                << field->fieldIndex
-                << ">::is(";
+            if (cross_platform) {
+                ss << "das_get_auto_variant_field<"
+                   << describeCppType(field->value->type->argTypes[field->fieldIndex])
+                   << ","
+                   << field->fieldIndex;
+                dumpVariadicTypes(field->value->type->argTypes);
+                ss << ">::is(";
+            } else {
+                ss << "das_get_variant_field<"
+                   << describeCppType(field->value->type->argTypes[field->fieldIndex])
+                   << ","
+                   << field->value->type->getVariantFieldOffset(field->fieldIndex)
+                   << ","
+                   << field->fieldIndex
+                   << ">::is(";
+            }
         }
         virtual ExpressionPtr visit ( ExprIsVariant * field ) override {
             ss << ")";
@@ -1811,13 +1863,21 @@ namespace das {
             if ( field->type->aotAlias ) {
                 ss << "das_alias<" << field->type->alias << ">::from(";
             }
-            ss << "das_get_variant_field<"
-                << describeCppType(field->value->type->argTypes[field->fieldIndex])
-                << ","
-                << field->value->type->getVariantFieldOffset(field->fieldIndex)
-                << ","
-                << field->fieldIndex
-                << ">::as(";
+            if (cross_platform) {
+                ss << "das_get_auto_variant_field<"
+                   << describeCppType(field->value->type->argTypes[field->fieldIndex])
+                   << ","
+                   << field->fieldIndex;
+                dumpVariadicTypes(field->value->type->argTypes);
+            } else {
+                ss << "das_get_variant_field<"
+                   << describeCppType(field->value->type->argTypes[field->fieldIndex])
+                   << ","
+                   << field->value->type->getVariantFieldOffset(field->fieldIndex)
+                   << ","
+                   << field->fieldIndex;
+            }
+            ss << ">::as(";
         }
         virtual ExpressionPtr visit ( ExprAsVariant * field ) override {
             ss << ",__context__)";
@@ -1833,15 +1893,23 @@ namespace das {
             if ( fieldT->aotAlias ) {
                 ss << "das_alias<" << fieldT->alias << ">::from(";
             }
-            ss << "das_get_variant_field<"
-                << describeCppType(fieldT->argTypes[field->fieldIndex])
-                << ","
-                << fieldT->getVariantFieldOffset(field->fieldIndex)
-                << ","
-                << field->fieldIndex
-                << ">::safe_as"
-                << (field->skipQQ ? "_ptr" : "")
-                << "(";
+            if (cross_platform) {
+                ss << "das_get_auto_variant_field<"
+                   << describeCppType(fieldT->argTypes[field->fieldIndex])
+                   << ","
+                   << field->fieldIndex;
+                dumpVariadicTypes( field->value->type->argTypes );
+            } else {
+                ss << "das_get_variant_field<"
+                   << describeCppType(fieldT->argTypes[field->fieldIndex])
+                   << ","
+                   << fieldT->getVariantFieldOffset(field->fieldIndex)
+                   << ","
+                   << field->fieldIndex;
+            }
+            ss << ">::safe_as"
+               << (field->skipQQ ? "_ptr" : "")
+               << "(";
         }
         virtual ExpressionPtr visit ( ExprSafeAsVariant * field ) override {
             ss << ")";
@@ -1874,9 +1942,15 @@ namespace das {
             if ( vtype->isHandle() ) {
                 ss  << ">::get(";
             } else if ( vtype->isGoodTupleType() ) {
+                if (cross_platform) {
+                    DAS_FATAL_ERROR("Platform independent code enabled. But field %s is tuple", field->name.c_str());
+                }
                 ss  << ", " << vtype->getTupleFieldOffset(field->fieldIndex)
                     << ">::get(";
             } else if ( vtype->isGoodVariantType() ) {
+                if (cross_platform) {
+                    DAS_FATAL_ERROR("Platform independent code enabled. But field %s is variant", field->name.c_str());
+                }
                 ss  << ", " << vtype->getVariantFieldOffset(field->fieldIndex)
                     << ", " << field->fieldIndex
                     <<  ">::get(";
@@ -1912,19 +1986,35 @@ namespace das {
             if ( field->value->type->isBitfield() ) {
                 ss << "das_get_bitfield(";
             } else if ( field->value->type->isTuple() ) {
-                ss << "das_get_tuple_field<"
-                    << describeCppType(field->value->type->argTypes[field->fieldIndex])
-                    << ","
-                    << field->value->type->getTupleFieldOffset(field->fieldIndex)
-                    << ">::get(";
+                if (cross_platform) {
+                    ss << "das_get_auto_tuple_field<"
+                       << describeCppType(field->value->type->argTypes[field->fieldIndex])
+                       << ","
+                       << field->fieldIndex;
+                    dumpVariadicTypes( field->value->type->argTypes );
+                } else {
+                    ss << "das_get_tuple_field<"
+                       << describeCppType(field->value->type->argTypes[field->fieldIndex])
+                       << ","
+                       << field->value->type->getTupleFieldOffset(field->fieldIndex);
+                }
+                ss << ">::get(";
             } else if ( field->value->type->isVariant() ) {
-                ss << "das_get_variant_field<"
-                    << describeCppType(field->value->type->argTypes[field->fieldIndex])
-                    << ","
-                    << field->value->type->getVariantFieldOffset(field->fieldIndex)
-                    << ","
-                    << field->fieldIndex
-                    << ">::get(";
+                if (cross_platform) {
+                    ss << "das_get_auto_variant_field<"
+                       << describeCppType(field->value->type->argTypes[field->fieldIndex])
+                       << ","
+                       << field->fieldIndex;
+                    dumpVariadicTypes( field->value->type->argTypes );
+                } else {
+                    ss << "das_get_variant_field<"
+                       << describeCppType(field->value->type->argTypes[field->fieldIndex])
+                       << ","
+                       << field->value->type->getVariantFieldOffset(field->fieldIndex)
+                       << ","
+                       << field->fieldIndex;
+                }
+                ss << ">::get(";
             } else if ( field->value->type->isHandle() ) {
                 if (field->type->isString()) {
                     ss << "((" << describeCppType(field->type) << ")(";  // c-cast const char * etc string casts to char * or char * const
@@ -1934,19 +2024,36 @@ namespace das {
                 if ( field->value->type->firstType->isHandle() ) {
                     field->value->type->firstType->annotation->aotPreVisitGetFieldPtr(ss, field->name);
                 } else if ( field->value->type->firstType->isTuple() ) {
-                    ss << "das_get_tuple_field_ptr<"
-                        << describeCppType(field->value->type->firstType->argTypes[field->fieldIndex])
-                        << ","
-                        << field->value->type->firstType->getTupleFieldOffset(field->fieldIndex)
-                        << ">::get(";
+                    auto baseType = field->value->type->firstType;
+                    if (cross_platform) {
+                        ss << "das_get_auto_tuple_field_ptr<"
+                           << describeCppType(baseType->argTypes[field->fieldIndex])
+                           << ","
+                           << field->fieldIndex;
+                        dumpVariadicTypes( baseType->argTypes );
+                    } else {
+                        ss << "das_get_tuple_field_ptr<"
+                           << describeCppType(baseType->argTypes[field->fieldIndex])
+                           << ","
+                           << baseType->getTupleFieldOffset(field->fieldIndex);
+                    }
+                    ss << ">::get(";
                 } else if ( field->value->type->firstType->isVariant() ) {
-                    ss << "das_get_variant_field_ptr<"
-                        << describeCppType(field->value->type->firstType->argTypes[field->fieldIndex])
-                        << ","
-                        << field->value->type->firstType->getVariantFieldOffset(field->fieldIndex)
-                        << ","
-                        << field->fieldIndex
-                        << ">::get(";
+                    if (cross_platform) {
+                        ss << "das_get_auto_variant_field_ptr<"
+                           << describeCppType(field->value->type->argTypes[field->fieldIndex])
+                           << ","
+                           << field->fieldIndex;
+                        dumpVariadicTypes( field->value->type->argTypes );
+                    } else {
+                        ss << "das_get_variant_field_ptr<"
+                           << describeCppType(field->value->type->firstType->argTypes[field->fieldIndex])
+                           << ","
+                           << field->value->type->firstType->getVariantFieldOffset(field->fieldIndex)
+                           << ","
+                           << field->fieldIndex;
+                    }
+                    ss << ">::get(";
                 }
             }
         }
@@ -2480,11 +2587,17 @@ namespace das {
             return Visitor::visit(ref2ptr);
         }
     // addr
+        string queryByMNH(string_view name, uint64_t hash) {
+            TextWriter tw;
+            tw << "Func(__context__->fnByMangledName(/*" << name.data() << "*/ 0x" << HEX << hash << DEC << "))";
+            return tw.str();
+        }
+
         virtual void preVisit ( ExprAddr * expr ) override {
             if (expr->func) {
                 auto mangledName = expr->func->getMangledName();
                 uint64_t hash = expr->func->getMangledNameHash();
-                ss << "Func(__context__->fnByMangledName(/*" << mangledName << "*/ " << hash << "u))";
+                ss << queryByMNH(mangledName, hash);
             } else {
                 ss << "Func(0 /*nullptr*/)";
             }
@@ -2667,13 +2780,22 @@ namespace das {
             Visitor::preVisitMakeVariantField(expr,index,decl,last);
             auto variantIndex = expr->type->findArgumentIndex(decl->name);
             DAS_ASSERT(variantIndex != -1 && "should not infer otherwise");
-            ss  << tabs() << "das_get_variant_field<"
-                << describeCppType(expr->type->argTypes[variantIndex])
-                << ","
-                << expr->type->getVariantFieldOffset(variantIndex)
-                << ","
-                << variantIndex
-                << ">::set(";
+            ss  << tabs();
+            if (cross_platform) {
+                ss << "das_get_auto_variant_field<"
+                   << describeCppType(expr->type->argTypes[variantIndex])
+                   << ","
+                   << variantIndex;
+                dumpVariadicTypes(expr->type->argTypes);
+            } else {
+                ss  << "das_get_variant_field<"
+                    << describeCppType(expr->type->argTypes[variantIndex])
+                    << ","
+                    << expr->type->getVariantFieldOffset(variantIndex)
+                    << ","
+                    << variantIndex;
+            }
+            ss << ">::set(";
             ss << mkvName(expr);
             if ( expr->variants.size()!=1 ) ss << "(" << index << ",__context__)";
             ss <<  ") = ";
@@ -2721,7 +2843,7 @@ namespace das {
                             auto mangledName = call_func->getMangledName();
                             uint64_t hash = call_func->getMangledNameHash();
                             ss << "(__context__,nullptr,";
-                            ss << "Func(__context__->fnByMangledName(/*" << mangledName << "*/ " << hash << "u))";
+                            ss << queryByMNH(mangledName, hash);
                             ss << ");\n";
                         } else {
                             ss << aotFuncName(call_func) << "(__context__);\n";
@@ -2736,7 +2858,7 @@ namespace das {
                             auto mangledName = call_func->getMangledName();
                             uint64_t hash = call_func->getMangledNameHash();
                             ss << "(__context__,nullptr,";
-                            ss << "Func(__context__->fnByMangledName(/*" << mangledName << "*/ " << hash << "u))";
+                            ss << queryByMNH(mangledName, hash);
                             ss << ");\n";
                         } else {
                             ss << aotFuncName(call_func) << "(__context__);\n";
@@ -2847,11 +2969,20 @@ namespace das {
         }
         virtual void preVisitMakeTupleIndex ( ExprMakeTuple * expr, int index, Expression * init, bool lastField ) override {
             Visitor::preVisitMakeTupleIndex(expr, index, init, lastField);
-            ss << tabs() << "das_get_tuple_field<"
-                << describeCppType(expr->makeType->argTypes[index])
-                << ","
-                << expr->makeType->getTupleFieldOffset(index)
-                << ">::get(" << mktName(expr) << ") = ";
+            ss << tabs();
+            if (cross_platform) {
+                ss << "das_get_auto_tuple_field<"
+                   << describeCppType(expr->makeType->argTypes[index])
+                   << ","
+                   << index;
+                dumpVariadicTypes( expr->makeType->argTypes );
+            } else {
+                ss << "das_get_tuple_field<"
+                   << describeCppType(expr->makeType->argTypes[index])
+                   << ","
+                   << expr->makeType->getTupleFieldOffset(index);
+            }
+            ss << ">::get(" << mktName(expr) << ") = ";
         }
         virtual ExpressionPtr visitMakeTupleIndex ( ExprMakeTuple * expr, int index, Expression * init, bool lastField ) override {
             ss << ";\n";
@@ -2959,9 +3090,10 @@ namespace das {
             } else if (call->name == "values") {
                 ss << "__builtin_table_values(__context__,";
             } else if ( call->name=="invoke" || call->rtti_isInvoke() ) {
-                auto bt = call->arguments[0]->type->baseType;
+                const auto argType = call->arguments[0]->type;
+                auto bt = argType->baseType;
                 int methodOffset = -1;
-                string methodName;
+                std::optional<string> methodName;
                 if ( bt==Type::tFunction ) {
                     auto einv = static_cast<ExprInvoke *>(call);
                     if ( einv->isInvokeMethod ) {
@@ -2976,14 +3108,21 @@ namespace das {
                 }
                 if (bt == Type::tBlock) ss << "das_invoke";
                 else if (bt == Type::tLambda) ss << "das_invoke_lambda";
-                else if (bt == Type::tFunction && methodOffset!=-1) ss << "das_invoke_method";
+                else if (bt == Type::tFunction && methodName) ss << "das_invoke_method";
                 else if (bt == Type::tFunction) ss << "das_invoke_function";
                 else if (bt == Type::tString) ss << "das_invoke_function_by_name";
                 else ss << "das_invoke /*unknown*/";
                 ExprInvoke * einv = static_cast<ExprInvoke *>(call);
                 ss << "<" << describeCppType(call->type);
-                if ( methodOffset!=-1 ) {
-                    ss << "," << methodOffset << "/*" << methodName << "*/";
+                if ( methodName ) {
+                    if (crossPlatform) {
+                        ss << ",offsetof(" << describeCppType(argType->argTypes.at(0),
+                                                              CpptSubstitureRef::no,
+                                                              CpptSkipRef::yes,
+                                                              CpptSkipConst::yes) << "," << methodName.value() << ")";
+                    } else {
+                        ss << "," << methodOffset << "/*" << methodName.value() << "*/";
+                    }
                 }
                 ss << ">::invoke";
                 if ( einv->isCopyOrMove() ) ss << "_cmres";
@@ -3051,7 +3190,13 @@ namespace das {
             if ( call->name=="assert" || call->name=="verify" || call->name=="debug" ) {
                 ss << "))";
             } else if ( call->name=="memzero" ) {
-                ss << "), 0, " << call->arguments[0]->type->getSizeOf() << ")";
+                const auto type = call->arguments[0]->type;
+                if (cross_platform) {
+                    auto typeName = describeCppType(type,CpptSubstitureRef::no,CpptSkipRef::yes);
+                    ss << "), 0, TypeSize<" << typeName << ">::size)";
+                } else {
+                    ss << "), 0, " << type->getSizeOf() << ")";
+                }
             } else {
                 ss << ")";
             }
@@ -3212,10 +3357,10 @@ namespace das {
                             }
                         }
                         ss << ">(__context__,nullptr,";
-                        ss << "Func(__context__->fnByMangledName(/*" << mangledName << "*/ " << hash << "u)),";
+                        ss << queryByMNH(mangledName, hash) << ",";
                     } else {
                         ss << "(__context__,nullptr,";
-                        ss << "Func(__context__->fnByMangledName(/*" << mangledName << "*/ " << hash << "u))";
+                        ss << queryByMNH(mangledName, hash);
                     }
                 } else {
                     ss << aotFuncName(call->func) << "(__context__";
@@ -3251,7 +3396,7 @@ namespace das {
             if ( funArgType->isAotAlias() ) {
                 if ( funArgType->alias.empty() ) {
                     ss << "das_reinterpret<"
-                    << describeCppTypeEx(funArgType,CpptSubstitureRef::no,CpptSkipRef::yes,CpptSkipConst::no,CpptRedundantConst::yes,CpptUseAlias::yes) << ">::pass(";
+                    << describeCppTypeEx(funArgType,CpptSubstitureRef::no,CpptSkipRef::yes,CpptSkipConst::no,CpptRedundantConst::yes,CpptUseAlias::yes, false) << ">::pass(";
                 } else {
                     ss << "das_alias<" << funArgType->alias << ">::to(";
                 }
@@ -3543,20 +3688,19 @@ namespace das {
                 funInit = true;
             }
             uint64_t semH = fn->aotHash;
-            logs << "    aotLib[0x" << HEX << semH << DEC << "] = +[](Context & ctx) -> SimNode* { // " << aotFuncName(fn) << "\n";
-            logs << "        return ctx.code->makeNode<SimNode_Aot";
+            logs << "    aotLib[0x" << HEX << semH << DEC << "] = +[](Context & ctx) -> SimNode* {\n";
+            logs << "        return ctx.code->makeNode<AutoSimNode_Aot";
             if ( fn->copyOnReturn || fn->moveOnReturn ) {
                 logs << "CMRES";
             }
-            logs << "<" << describeCppFunc(fn,nullptr,false,false) << ",";
-            logs << "&" << aotFuncName(fn) << ">>();\n    };\n";
+            logs << "<&" << aotFuncName(fn) << ">>();\n    };\n";
         }
         if ( context.totalVariables || funInit ) {
             uint64_t semH = context.getInitSemanticHash();
             semH = getInitSemanticHashWithDep(semH);
             logs << "    // [[ init script ]]\n";
             logs << "    aotLib[0x" << HEX << semH << DEC << "] = +[](Context & ctx) -> SimNode* {\n";
-            logs << "        ctx.aotInitScript = ctx.code->makeNode<SimNode_Aot<void (*)(Context *, bool),&__init_script>>();\n";
+            logs << "        ctx.aotInitScript = ctx.code->makeNode<AutoSimNode_Aot<&__init_script>>();\n";
             logs << "        return ctx.aotInitScript;\n";
             logs << "    };\n";
         }
@@ -3567,6 +3711,9 @@ namespace das {
 
     static void writeStandaloneCtor(const StandaloneContextCfg & cfg, string initFunctions, TextWriter &tw, Program &program) {
         vector<VariablePtr> lookupVariableTable;
+        if ( program.totalVariables && cfg.cross_platform ) {
+            DAS_FATAL_ERROR("Global variables is not supported yet in platform independent code");
+        }
         if ( program.totalVariables ) {
             for (const auto & pm : program.library.getModules() ) {
                 pm->globals.foreach([&](auto pvar) {
@@ -3607,9 +3754,7 @@ namespace das {
                << ");\n";
         }
         tw << "     // end totalVariables\n\n";
-        tw << "    context.globals = (char *) das_aligned_alloc16(context.globalsSize);\n";
-        tw << "    context.shared = (char *) das_aligned_alloc16(context.sharedSize);\n";
-        tw << "    context.sharedOwner = true;\n";
+        tw << "    context.allocateGlobalsAndShared();\n";
         tw << "    context.totalVariables = " << program.totalVariables << "/*totalVariables*/;\n";
         tw << "    context.functions = (SimFunction *) context.code->allocate( " << program.totalFunctions << "/*totalFunctions*/*sizeof(SimFunction) );\n";
         tw << "    context.totalFunctions = " << program.totalFunctions << "/*totalFunctions*/;\n";
@@ -3625,8 +3770,19 @@ namespace das {
 
 
         tw << "     // start totalFunctions\n";
+        tw << "    initializer_list<tuple<int, FunctionInfo, FuncInfo*>> initFunctions = {\n";
         tw << das::move(initFunctions);
+        tw << "    };\n";
         tw << "    // end totalFunctions\n";
+
+        tw << "    vector<pair<uint64_t, SimFunction*>> id_to_funcs;\n";
+        tw << "    for (const auto& [index, func_info, debug_info]: initFunctions) {\n";
+        tw << "        InitAotFunction(context, &context.functions[index], func_info);\n";
+        tw << "        context.functions[index].debugInfo = debug_info;\n";
+        tw << "        (*context.tabMnLookup)[func_info.mnh] = context.functions + index;\n";
+        tw << "        id_to_funcs.emplace_back(func_info.aotHash, &context.functions[index]);\n";
+        tw << "        anyPInvoke |= func_info.pinvoke;\n";
+        tw << "    }\n";
 
         tw << "    context.tabGMnLookup = make_shared<das_hash_map<uint64_t,uint32_t>>();\n";
         tw << "    context.tabGMnLookup->clear();\n";
@@ -3643,16 +3799,6 @@ namespace das {
 
         const auto fnn = collectUsedFunctions(program.library.getModules(), program.totalFunctions, true);
 
-        tw << "    FillFunction(context, getGlobalAotLibrary(), {\n        ";
-        for ( const auto fn: fnn) {
-            tw << "make_pair(0x" << HEX << fn->aotHash << DEC << ", &context.functions[" << fn->index << "/*fni*/])";
-            if (fn != fnn.back()) {
-                tw << ",\n        ";
-            } else {
-                tw << "\n    ";
-            }
-        }
-        tw << "});\n";
         // aot init
         if ( program.initSemanticHashWithDep ) {
             tw << "    {\n";
@@ -3663,6 +3809,7 @@ namespace das {
             tw << "    }\n";
         }
 
+        tw << "    FillFunction(context, getGlobalAotLibrary(), das::move(id_to_funcs));\n";
         tw << "    context.runInitScript();\n";
         tw << "}\n";
     }
@@ -3691,10 +3838,8 @@ namespace das {
 
     class StandaloneContextGen : public CppAot {
     public:
-      StandaloneContextGen(ProgramPtr prog, BlockVariableCollector &coll,
-                           string cppOutD, string standaloneContextName)
-          : CppAot(prog, coll), contextNameSuffix(standaloneContextName) {
-            cppOutputDir = cppOutD;
+      StandaloneContextGen(ProgramPtr prog, BlockVariableCollector &coll, bool cross_platform)
+          : CppAot(prog, coll, cross_platform) {
       }
 
     public:
@@ -3730,6 +3875,8 @@ namespace das {
         }
         virtual void preVisitProgramBody ( Program * prog, Module * that ) override {
             // functions
+            declarations = ss.str();
+            ss.clear();
             ss << "\n";
             // print forward declarations
             const auto fnn = collectUsedFunctions(prog->library.getModules(), prog->totalFunctions);
@@ -3744,17 +3891,15 @@ namespace das {
         }
     private:
         TextWriter                  tw;
-        string                      cppOutputDir;
-        const string                contextNameSuffix;
     };
 
 
     static void writeRegistration ( TextWriter &header, TextWriter &source, string initFunctions, ProgramPtr program, const StandaloneContextCfg cfg, Context & context ) {
         source << "using namespace " << program->thisNamespace << ";\n";
-        dumpRegisterAot(source, program, context, true);
         {
             NamespaceGuard guard1(header, cfg.context_name);
             NamespaceGuard guard2(source, cfg.context_name);
+            dumpRegisterAot(source, program, context, true);
             writeStandaloneContext(program, das::move(initFunctions), header, source, cfg);
         }
     }
@@ -3852,6 +3997,28 @@ namespace das {
      * Adds debug info to AotDebugInfoHelper
      * @return String with initialization of all functions
      */
+    string GetFunctionInfo(FunctionPtr pfun, std::optional<string> info = std::nullopt) {
+        TextWriter tw;
+        tw << "        std::make_tuple(" << pfun->index << ", "
+           << "FunctionInfo(\"" << pfun->name << "\", \""
+           << pfun->getMangledName() << "\", "
+           << "0x" << HEX << pfun->getMangledNameHash() << DEC << ", "
+           << "0x" << HEX << pfun->aotHash << DEC << ", "
+           << pfun->totalStackSize << ", "
+           << pfun->unsafeOperation << ", "
+           << pfun->fastCall << ", "
+           << pfun->module->builtIn << ", "
+           << pfun->module->promoted << ", "
+           << (pfun->result->isRefType() && !pfun->result->ref) << ", "
+           << pfun->pinvoke
+           << ")";
+        if (info) {
+            tw << ", &" << info.value();
+        }
+        tw << "),\n";
+        return tw.str();
+    }
+
     string addFunctionInfo(bool /*disableInit*/, bool rtti, const vector<Function *> &fnn, AotDebugInfoHelper& helper) {
         helper.rtti = rtti;
         vector<pair<FunctionPtr, FuncInfo*>> lookupFunctionTable;
@@ -3862,34 +4029,14 @@ namespace das {
 
         TextWriter tw;
         for (auto &[pfun, info]: lookupFunctionTable) {
-            tw << "    InitAotFunction(context, &context.functions[" << pfun->index << "/*pfun->index*/], "
-               << "FunctionInfo(\"" << pfun->name << "\", \""
-               << pfun->getMangledName() << "\", "
-               << pfun->totalStackSize << ", "
-               << pfun->unsafeOperation << ", "
-               << pfun->fastCall << ", "
-               << pfun->module->builtIn << ", "
-               << pfun->module->promoted << ", "
-               << (pfun->result->isRefType() && !pfun->result->ref) << ", "
-               << pfun->pinvoke
-               << ")" << ");\n";
-            tw << "    context.functions[" << pfun->index << "/*pfun->index*/].debugInfo = &" << helper.funcInfoName(info) << ";\n";
-            if (pfun->pinvoke) {
-                tw << "    anyPInvoke = true;\n\n";
-            }
-        }
-
-        for ( const auto &[fn, info] : lookupFunctionTable ) {
-            auto mnh = fn->getMangledNameHash();
-
-            tw << "    // " << fn->getMangledName() << "\n";
-            tw << "    (*context.tabMnLookup)[0x"<< HEX << mnh << DEC <<"/*mnh*/] = context.functions + " << fn->index << "/*fn->index*/;\n";
+            tw << GetFunctionInfo(pfun, helper.funcInfoName(info));
         }
 
         return tw.str();
     }
 
     void runStandaloneVisitor(ProgramPtr program, const string& cppOutputDir, const StandaloneContextCfg &cfg) {
+        crossPlatform = cfg.cross_platform;
         auto printer = TextPrinter();
         auto pctx = SimulateWithErrReport(program, printer);
         if (!pctx) {
@@ -3909,7 +4056,7 @@ namespace das {
         BlockVariableCollector coll;
         program->visit(coll);
 
-        CppAot aotVisitor(program,coll);
+        CppAot aotVisitor(program,coll, cfg.cross_platform);
         dumpDependencies(program, aotVisitor);
 
         auto mod = program->thisModule.get();
@@ -3941,11 +4088,11 @@ namespace das {
                     NamespaceGuard anon_guard(source, program->thisNamespace); // anonymous
                     source << aotVisitor.ss.str();
                 }
-                StandaloneContextGen gen(program, coll, cppOutputDir, cfg.context_name);
+                StandaloneContextGen gen(program, coll, cfg.cross_platform);
                 program->visitModule(gen, mod);
                 {
                     das_set<string> ext_namespaces;
-                    for (const auto pfun: functions) {
+                    for (das::Function *pfun: functions) {
                         auto needInline = program->thisModule.get() == pfun->module;
                         if (!needInline && gen.used_functions.count(aotFuncName(pfun)) == 0) {
                             NamespaceGuard anon_guard(source, pfun->module->getNamespace()); // anonymous
@@ -3953,7 +4100,7 @@ namespace das {
                             ext_namespaces.emplace(pfun->module->getNamespace());
                         }
                     }
-                    for (const auto namesp: ordered(ext_namespaces)) {
+                    for (const string &namesp: ordered(ext_namespaces)) {
                         source << "using namespace " << namesp << ";\n";
                     }
                 }
@@ -3989,8 +4136,9 @@ namespace das {
         (*daScriptEnvironment::bound)->g_Program.reset();
     }
 
-    void Program::aotCpp ( Context & context, TextWriter & logs ) {
+    void Program::aotCpp ( Context & context, TextWriter & logs, bool cross_platform ) {
         // run no-aot marker
+        crossPlatform = cross_platform;
         NoAotMarker marker;
         visit(marker);
         // mark prologue
@@ -4001,7 +4149,7 @@ namespace das {
         // now, for that AOT
         setPrintFlags();
         BlockVariableCollector collector;
-        CppAot aotVisitor(this,collector);
+        CppAot aotVisitor(this,collector,cross_platform);
         visit(collector);
         dumpDependencies(this, aotVisitor);
         // now to the main body

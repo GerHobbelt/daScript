@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm> // constexpr std::max
+
 #include "daScript/misc/callable.h"
 #include "daScript/misc/macro.h"
 #include "daScript/simulate/runtime_profile.h"
@@ -993,8 +995,85 @@ namespace das {
         }
     };
 
+    template <int tupleSize, typename... TA>
+    struct TTuple;
+
+    template <int tupleSize, int align, typename... TA>
+    struct TVariant;
+
+    template <typename T>
+    struct TypeAlign {
+        static constexpr int align = alignof(T);
+    };
+
+    template <typename... TA>
+    constexpr int max_alignof() { return std::max({TypeAlign<TA>::align...}); }
+
+    template <typename... TA>
+    constexpr int variant_align() {
+        return max_alignof<int, TA...>();
+    }
+
+
+    template <typename... TA>
+    constexpr int tuple_align() {
+        return max_alignof<TA...>();
+    }
+
+    template <int tupleSize, typename... TA>
+    struct TypeAlign<TTuple<tupleSize, TA...>> {
+        static constexpr int align = tuple_align<TA...>();
+    };
+
+    template <int tupleSize, int alignment, typename... TA>
+    struct TypeAlign<TVariant<tupleSize, alignment, TA...>> {
+        static constexpr int align = alignment;
+    };
+
+    /**
+     * x =  ⌈x / align⌉ * align
+     */
+    constexpr int round_up(int x, int align) { return (x + align - 1) & (~(align - 1)); }
+
+    template <typename T>
+    struct TypeSize {
+        static constexpr int size = sizeof(T);
+    };
+
+    template <int tupleSize, typename... TA>
+    struct TypeSize<TTuple<tupleSize, TA...>> {
+        static constexpr int size = tupleSize;
+    };
+
+    template <typename... TA>
+    constexpr int tuple_size() {
+        int ma = 0;
+        (..., (ma = round_up(ma, TypeAlign<TA>::align) + TypeSize<TA>::size));
+        return round_up(ma, tuple_align<TA...>());
+    }
+
+    template <typename... TA>
+    constexpr int variant_sizeof() {
+        constexpr auto align = variant_align<TA...>();
+        int ma = 0;
+        ((ma = std::max(round_up(TypeSize<int>::size, align) + round_up(TypeSize<TA>::size, align), ma)), ...);
+        return ma;
+    }
+
+    template <int id, typename... TA>
+    constexpr int tuple_offset() {
+        int cur_id = 0;
+        int offset = 0;
+        (..., ((cur_id++) < id ? offset = round_up(offset, TypeAlign<TA>::align) + TypeSize<TA>::size : 0));
+        using OurT = std::tuple_element_t<id, std::tuple<TA...>>;
+        return round_up(offset, TypeAlign<OurT>::align);
+    }
+
+
     template <int tupleSize, typename ...TA>
     struct TTuple : Tuple {
+        static_assert(tupleSize == tuple_size<TA...>());
+
         TTuple() {}
         TTuple(const TTuple & arr) { moveT(arr); }
         TTuple(TTuple && arr ) { moveT(arr); }
@@ -1006,6 +1085,9 @@ namespace das {
         char data[tupleSize];
     };
 
+    template <typename ...TA>
+    using AutoTuple = TTuple<tuple_size<TA...>(), TA...>;
+
     template <typename TT, int offset>
     struct das_get_tuple_field {
         static __forceinline TT & get ( const Tuple & t ) {
@@ -1014,6 +1096,9 @@ namespace das {
         }
     };
 
+    template <typename TT, int idx, typename ...Types>
+    using das_get_auto_tuple_field = das_get_tuple_field<TT, tuple_offset<idx, Types...>()>;
+
     template <typename TT, int offset>
     struct das_get_tuple_field_ptr {
         static __forceinline TT & get ( const Tuple * t ) {
@@ -1021,6 +1106,9 @@ namespace das {
             return *(TT *)(data + offset);
         }
     };
+
+    template <typename TT, int idx, typename ...Types>
+    using das_get_auto_tuple_field_ptr = das_get_tuple_field_ptr<TT, tuple_offset<idx, Types...>()>;
 
     template <typename RR, int offset>
     struct das_safe_navigation_tuple {
@@ -1036,6 +1124,9 @@ namespace das {
 
     template <int variantSize, int variantAlign, typename ...TA>
     struct alignas(variantAlign) TVariant : Variant {
+        static_assert(variantSize == variant_sizeof<TA...>());
+        static_assert(variantAlign == variant_align<TA...>());
+
         template<int N> using NthType =
             typename std::tuple_element<N, std::tuple<TA...>>::type;
 
@@ -1066,6 +1157,9 @@ namespace das {
         }
         TData data;
     };
+
+    template <typename ...TA>
+    using AutoVariant = TVariant<variant_sizeof<TA...>(), variant_align<TA...>(), TA...>;
 
     template <typename TT, int offset, int variant>
     struct das_get_variant_field {
@@ -1113,6 +1207,9 @@ namespace das {
         }
     };
 
+    template <typename TT, int idx, typename ...Types>
+    using das_get_auto_variant_field = das_get_variant_field<TT, TypeSize<int>::size, idx>;
+
     template <typename TT, int offset, int variant>
     struct das_get_variant_field_ptr {
         static __forceinline TT & get ( const Variant * t ) {
@@ -1120,6 +1217,9 @@ namespace das {
             return *(TT *)(data + offset);
         }
     };
+
+    template <typename TT, int idx, typename ...Types>
+    using das_get_auto_variant_field_ptr = das_get_variant_field_ptr<TT, TypeSize<int>::size, idx>;
 
     template <typename RR, int offset, int variant>
     struct das_safe_navigation_variant {
@@ -1777,6 +1877,9 @@ namespace das {
         }
     };
 
+    template <auto fn>
+    using AutoSimNode_Aot = SimNode_Aot<decltype(fn), fn>;
+
     template <typename FuncT, FuncT fn>
     struct SimNode_AotCMRES : SimNode_CallBase {
         __forceinline SimNode_AotCMRES ( ) : SimNode_CallBase(LineInfo(),"") {}
@@ -1791,6 +1894,9 @@ namespace das {
             return context.abiResult();
         }
     };
+
+    template <auto fn>
+    using AutoSimNode_AotCMRES = SimNode_AotCMRES<decltype(fn), fn>;
 
 #ifdef _MSC_VER
 #pragma warning(push)
