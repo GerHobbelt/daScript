@@ -3458,10 +3458,17 @@ namespace das {
                         }
                         if ( valueType ) {
                             bool allOtherInferred = true;   // we check, if all other arguments inferred
-                            for ( size_t i=2; i!=expr->arguments.size(); ++i ) {
-                                if ( !expr->arguments[i]->type ) {
-                                    allOtherInferred = false;
-                                    break;
+                            if ( !value->type || value->type->isAliasOrExpr() ) {
+                                allOtherInferred = false;
+                            } else {
+                                for ( size_t i=2; i!=expr->arguments.size(); ++i ) {
+                                    if ( !expr->arguments[i]->type ) {
+                                        allOtherInferred = false;
+                                        break;
+                                    } else if ( expr->arguments[i]->type->isAliasOrExpr() ) {
+                                        allOtherInferred = false;
+                                        break;
+                                    }
                                 }
                             }
                             if ( allOtherInferred ) {
@@ -3926,6 +3933,29 @@ namespace das {
                         return make_smart<ExprConstInt>(expr->at, expr->typeexpr->dim[0]);
                     } else {
                         error("typeinfo(dim non_array) is prohibited, " + describeType(expr->typeexpr), "", "",
+                              expr->at,CompilationError::typeinfo_dim);
+                    }
+                } else if ( expr->trait=="dim_table_value" ) {
+                    if ( !expr->typeexpr->isGoodTableType() ) {
+                        error("typeinfo(dim_table_value " + describeType(expr->typeexpr) + ") is not a table type", "", "",
+                            expr->at, CompilationError::type_not_found);
+                        return Visitor::visit(expr);
+                    }
+                    if ( !expr->typeexpr->secondType ) {
+                        error("typeinfo(dim_table_value " + describeType(expr->typeexpr) + ") is not a table type with value", "", "",
+                            expr->at, CompilationError::type_not_found);
+                        return Visitor::visit(expr);
+                    }
+                    if ( expr->typeexpr->secondType->isExprTypeAnywhere() ) {
+                        error("typeinfo(dim_table_value " + describeType(expr->typeexpr->secondType) + ") is not fully inferred, expecting resolved dim",  "", "",
+                            expr->at, CompilationError::type_not_found);
+                        return Visitor::visit(expr);
+                    }
+                    if ( expr->typeexpr->secondType->dim.size() ) {
+                        reportAstChanged();
+                        return make_smart<ExprConstInt>(expr->at, expr->typeexpr->secondType->dim[0]);
+                    } else {
+                        error("typeinfo(dim_table_value table<...,non_array>) is prohibited, " + describeType(expr->typeexpr), "", "",
                               expr->at,CompilationError::typeinfo_dim);
                     }
                 } else if ( expr->trait=="is_any_vector" ) {
@@ -6583,6 +6613,26 @@ namespace das {
                         expr->left = propGet;
                         return expr;
                     }
+                    if ( expr->right->type->isBool() && efield->value->type && efield->value->type->isBitfield() ) { // bitfield.field = bool
+                        auto value = efield->value;
+                        if ( value->rtti_isR2V() ) {
+                            value = static_pointer_cast<ExprRef2Value>(value)->subexpr;
+                        }
+                        if ( value->type->ref ) {
+                            // lets find the right field
+                            auto fidx = efield->value->type->bitFieldIndex(efield->name);
+                            if ( fidx != -1 ) {
+                                reportAstChanged();
+                                auto mask = make_smart<ExprConstBitfield>(efield->at,1u<<fidx);
+                                mask->bitfieldType = make_smart<TypeDecl>(*efield->value->type);
+                                auto call = make_smart<ExprCall>(efield->at, "__bit_set");
+                                call->arguments.push_back(value->clone());
+                                call->arguments.push_back(mask);
+                                call->arguments.push_back(expr->right->clone());
+                                return call;
+                            }
+                        }
+                    }
                 }
             }
             return nullptr;
@@ -6594,6 +6644,9 @@ namespace das {
             }
             if ( !expr->left->type || !expr->right->type ) {
                 return Visitor::visit(expr);
+            }
+            if ( expr->left->type->isAliasOrExpr() || expr->right->type->isAliasOrExpr() ) {
+                return Visitor::visit(expr);    // failed to infer
             }
             // lets infer clone call (and instance generic if need be)
             auto opName = "_::clone";
@@ -8831,6 +8884,18 @@ namespace das {
             return nullptr;
         }
 
+        bool isCloneArrayExpression ( ExprCall * expr ) const {
+            if ( !expr->func ) return false;
+            if ( expr->arguments.size() != 2 ) return false;
+            if ( !(expr->func->name=="clone" || (expr->func->fromGeneric && expr->func->fromGeneric->name=="clone"))  ) return false;
+            if ( !expr->arguments[1]->rtti_isCall() ) return false;
+            auto call = (ExprCall *)(expr->arguments[1].get());
+            if ( !call->func ) return false;
+            if ( !call->func->fromGeneric ) return false;
+            if ( !(call->func->fromGeneric->name=="to_array_move" && call->func->fromGeneric->module->name=="$") ) return false;
+            return true;
+        }
+
         virtual ExpressionPtr visit ( ExprCall * expr ) override {
             if (expr->argumentsFailedToInfer) return Visitor::visit(expr);
             expr->func = inferFunctionCall(expr, InferCallError::functionOrGeneric, expr->genericFunction ? expr->func : nullptr).get();
@@ -8948,6 +9013,9 @@ namespace das {
                     expr->at, CompilationError::unsafe);
             } else if ( expr->func && expr->func->unsafeOutsideOfFor && !(expr->isForLoopSource || safeExpression(expr)) ) {
                 error("'" + expr->name + "' is unsafe, when not source of the for-loop; must be inside the 'unsafe' block", "", "",
+                    expr->at, CompilationError::unsafe);
+            } else if ( expr->func && expr->func->unsafeWhenNotCloneArray && !(safeExpression(expr) || isCloneArrayExpression(expr))) {
+                error("'" + expr->name + "' is unsafe, when not clone array; must be inside the 'unsafe' block", "", "",
                     expr->at, CompilationError::unsafe);
             } else if (enableInferTimeFolding && expr->func && isConstExprFunc(expr->func)) {
                 vector<ExpressionPtr> cargs; cargs.reserve(expr->arguments.size());
@@ -9231,6 +9299,10 @@ namespace das {
                     } else if (decl->moveSemantics && decl->value->type->isConst()) {
                         error("can't move from a constant value " + describeType(decl->value->type), "", "",
                             decl->value->at, CompilationError::cant_move);
+                    }
+                    if ( field->privateField && !expr->nativeClassInitializer ) {
+                        error("field " + decl->name + " is private, can't be initialized", "", "",
+                            decl->at, CompilationError::cant_get_field);
                     }
                     if ( !decl->moveSemantics && !field->type->ref ) {
                         decl->value = Expression::autoDereference(decl->value);
