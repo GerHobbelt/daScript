@@ -14,7 +14,9 @@ Transform operations
     - _select(it, expr)        => select(it, $(_) => expr)
 Aggregation operations
     - _min_by(it, expr)         => min_by(it, $(_) => expr)
-    - _max_by(it, expr)         => max_by(it, $(_) => expr
+    - _max_by(it, expr)         => max_by(it, $(_) => expr)
+    - _min_max_by(it, expr)     => min_max_by(it, $(_) => expr)
+    - _min_max_average_by(it, expr) => min_max_average_by(it, $(_) => expr)
 Comparators and keys
     - _sequence_equal_by(it1, it2, expr) => sequence_equal_by(it1, it2, $(_) => expr)
 Partitioning data
@@ -105,6 +107,16 @@ class private LinqMinBy : AstCallMacro_LinqPred2 {
 [call_macro(name="_max_by")]
 class private LinqMaxBy : AstCallMacro_LinqPred2 {
     override predName = "max_by"
+}
+
+[call_macro(name="_min_max_by")]
+class private LinqMinMaxBy : AstCallMacro_LinqPred2 {
+    override predName = "min_max_by"
+}
+
+[call_macro(name="_min_max_average_by")]
+class private LinqMinMaxAverageBy : AstCallMacro_LinqPred2 {
+    override predName = "min_max_average_by"
 }
 
 [call_macro(name="_skip_while")]
@@ -222,6 +234,8 @@ struct private LinqCall {
     name : string
     moduleName : string = "linq"
     skip : bool = false             // if specified, expression is skipped in folding
+    inplace : bool = false          // if specified, expression is inplace and does not create new variable
+    recursive : array<int>          // indices of arguments to apply fold_linq_default on
 }
 
 var private linqCalls = {
@@ -234,25 +248,62 @@ var private linqCalls = {
     "select_to_array" => LinqCall(name = "select"),
     "select_to_sequence" => LinqCall(name = "select"),
 // reverse
-    "reverse" => LinqCall(name = "reverse"),
-    "reverse_to_array" => LinqCall(name = "reverse"),
-    "reverse_to_sequence" => LinqCall(name = "reverse"),
+    "reverse" => LinqCall(name = "reverse", inplace = true),
+    "reverse_to_array" => LinqCall(name = "reverse", inplace = true),
+    "reverse_to_sequence" => LinqCall(name = "reverse", inplace = true),
 // order
-    "order" => LinqCall(name = "order"),
-    "order_to_array" => LinqCall(name = "order"),
-    "order_to_sequence" => LinqCall(name = "order"),
+    "order" => LinqCall(name = "order", inplace = true),
+    "order_to_array" => LinqCall(name = "order", inplace = true),
+    "order_to_sequence" => LinqCall(name = "order", inplace = true),
 // order_descending
-    "order_descending" => LinqCall(name = "order_descending"),
-    "order_descending_to_array" => LinqCall(name = "order_descending"),
-    "order_descending_to_sequence" => LinqCall(name = "order_descending"),
+    "order_descending" => LinqCall(name = "order_descending", inplace = true),
+    "order_descending_to_array" => LinqCall(name = "order_descending", inplace = true),
+    "order_descending_to_sequence" => LinqCall(name = "order_descending", inplace = true),
 // order_by
-    "order_by" => LinqCall(name = "order_by"),
-    "order_by_to_array" => LinqCall(name = "order_by"),
-    "order_by_to_sequence" => LinqCall(name = "order_by"),
+    "order_by" => LinqCall(name = "order_by", inplace = true),
+    "order_by_to_array" => LinqCall(name = "order_by", inplace = true),
+    "order_by_to_sequence" => LinqCall(name = "order_by", inplace = true),
 // order_by_descending
-    "order_by_descending" => LinqCall(name = "order_by_descending"),
-    "order_by_descending_to_array" => LinqCall(name = "order_by_descending"),
-    "order_by_descending_to_sequence" => LinqCall(name = "order_by_descending"),
+    "order_by_descending" => LinqCall(name = "order_by_descending", inplace = true),
+    "order_by_descending_to_array" => LinqCall(name = "order_by_descending", inplace = true),
+    "order_by_descending_to_sequence" => LinqCall(name = "order_by_descending", inplace = true),
+// aggregate
+    "count" => LinqCall(name = "count"),
+    "long_count" => LinqCall(name = "long_count"),
+    "average" => LinqCall(name = "average"),
+    "min" => LinqCall(name = "min"),
+    "min_by" => LinqCall(name = "min_by"),
+    "max" => LinqCall(name = "max"),
+    "max_by" => LinqCall(name = "max_by"),
+    "min_max" => LinqCall(name = "min_max"),
+    "min_max_by" => LinqCall(name = "min_max_by"),
+    "min_max_average" => LinqCall(name = "min_max_average"),
+    "min_max_average_by" => LinqCall(name = "min_max_average_by"),
+    "aggregate" => LinqCall(name = "aggregate"),
+    "sum" => LinqCall(name = "sum"),
+// ranges
+    "skip" => LinqCall(name = "skip", inplace = true),
+    "skip_to_array" => LinqCall(name = "skip", inplace = true),
+    "skip_to_sequence" => LinqCall(name = "skip", inplace = true),
+    "skip_while" => LinqCall(name = "skip_while"),
+    "skip_while_to_array" => LinqCall(name = "skip_while"),
+    "skip_while_to_sequence" => LinqCall(name = "skip_while"),
+    "take" => LinqCall(name = "take", inplace = true),
+    "take_to_array" => LinqCall(name = "take", inplace = true),
+    "take_to_sequence" => LinqCall(name = "take", inplace = true),
+    "take_while" => LinqCall(name = "take_while"),
+    "take_while_to_array" => LinqCall(name = "take_while"),
+    "take_while_to_sequence" => LinqCall(name = "take_while"),
+// concatenation operations
+    "concat" => LinqCall(name = "concat", recursive = [1], inplace = true),
+    "concat_to_array" => LinqCall(name = "concat", recursive = [1], inplace = true),
+    "concat_to_sequence" => LinqCall(name = "concat", recursive = [1], inplace = true),
+    "prepend" => LinqCall(name = "prepend", inplace = true),
+    "prepend_to_array" => LinqCall(name = "prepend", inplace = true),
+    "prepend_to_sequence" => LinqCall(name = "prepend", inplace = true),
+    "append" => LinqCall(name = "append", inplace = true),
+    "append_to_array" => LinqCall(name = "append", inplace = true),
+    "append_to_sequence" => LinqCall(name = "append", inplace = true),
 // skippables
     "to_array" => LinqCall(name = "to_array", moduleName = "$", skip = true),
     "to_sequence" => LinqCall(name = "to_sequence", skip = true),
@@ -268,7 +319,7 @@ def private is_linq_call(var expr : Expression?) : bool {
             funcName = string(call.func.name)
         }
         if (linqCalls.key_exists(funcName)) {
-            let linqCall = linqCalls.get_value(funcName)
+            let linqCall & = unsafe(linqCalls?[funcName] ?? default<LinqCall>)
             if (linqCall.moduleName == string(call.func._module.name)) {
                 return true
             }
@@ -280,7 +331,7 @@ def private is_linq_call(var expr : Expression?) : bool {
 [macro_function]
 def private flatten_linq(var expr : ExpressionPtr)  {
     var top = get_ptr(expr)
-    var calls : array<tuple<ExprCall?; LinqCall>>
+    var calls : array<tuple<ExprCall?; LinqCall const?>>
     while (top != null) {
         if (top is ExprCall) {
             var topCall = top as ExprCall
@@ -292,12 +343,12 @@ def private flatten_linq(var expr : ExpressionPtr)  {
             if (!linqCalls.key_exists(funcName)) {
                 break
             }
-            let linqCall = linqCalls.get_value(funcName)
+            let linqCall & = unsafe(linqCalls?[funcName] ?? default<LinqCall>)
             if (linqCall.moduleName != string(topFunc._module.name)) {
                 break
             }
             if (!linqCall.skip) {
-                calls.push((topCall, linqCall))
+                calls.push((topCall, unsafe(addr(linqCall))))
             }
             top = topCall.arguments[0].get_ptr()
         } else {
@@ -318,48 +369,68 @@ def private fold_linq_default(var expr : ExpressionPtr) : ExpressionPtr {
     //!      ...
     //!      return <- pass_N // or pass_N.to_sequence() if expr is iterator
     //!   } )
+    //!   skip var if call is inplace
+    //!   skip delete if call is not first
+    //!   if call is first and source is iterator, then call is call_to_array
+    //!   if call is last and expr is iterator, then return is pass_N.to_sequence()
+    //!   if expr is not linq call, return null
     var inscope blk <- new ExprBlock(at = expr.at)
-
     var (top, calls) = flatten_linq(expr)
-
+    if (calls |> length == 0) {
+        return <- default<ExpressionPtr>
+    }
     var inscope topExpr <- clone_expression(unsafe(reinterpret<ExpressionPtr>(top)))
     var inscope topExprType <- clone_type(top._type)
-
     var inscope topValue = qmacro(source)
-
     let lastCallIndex = calls |> length - 1
-
     for (cll, argIndex in calls, count()) {
         if (true) {
             let newArgName = "pass_{argIndex}"
             var callName = cll._1.name
+            var inplace = false
             if (argIndex == 0 && top._type.isIterator) {
                 callName = "{callName}_to_array"
             } elif (argIndex == lastCallIndex && expr._type.isIterator) {
                 callName = "{callName}_to_sequence"
+            } elif (argIndex != 0 && cll._1.inplace) {
+                callName = "{callName}_inplace"
+                inplace = true
+            }
+            for (i in cll._1.recursive) {   // this is where we make recursion
+                if (i >= 1 && i < cll._0.arguments |> length) {
+                    var inscope argExpr <- make_call(cll._0.at, "_fold")
+                    (argExpr as ExprCallMacro).arguments |> emplace <| cll._0.arguments[i]
+                    cll._0.arguments[i] |> move <| argExpr
+                }
             }
             var inscope newCall = qmacro($c(callName)($e(topValue)))
             let numArgs = cll._0.arguments |> length
             for (i in 1..numArgs) {
                 (newCall as ExprCall).arguments |> emplace_new <| clone_expression(cll._0.arguments[i])
             }
-            blk.list |> emplace_new <| qmacro_expr() {
-                var $i(newArgName) <- $e(newCall)
-            }
-            if (argIndex != 0) {
+            if (inplace) {
+                blk.list |> emplace(newCall)
+            } else {
                 blk.list |> emplace_new <| qmacro_expr() {
-                    delete $e(topValue)
+                    var $i(newArgName) = $e(newCall)
                 }
+                (blk.list.back() as ExprLet).variables[0].flags |= VariableFlags.can_shadow
+                if (argIndex != 0) {
+                    blk.list |> emplace_new <| qmacro_expr() {
+                        delete $e(topValue)
+                    }
+                }
+                topValue |> move_new <| qmacro($i(newArgName))
             }
-            topValue |> move_new <| qmacro($i(newArgName))
         }
     }
-
     blk.list |> emplace_new <| qmacro_expr() {
         return <- $e(topValue)
     }
-
-    return <- qmacro(invoke($(source : $t(topExprType)) { $e(blk); }, $e(topExpr)))
+    var inscope res <- qmacro(invoke($(source : $t(topExprType)) { $e(blk); }, $e(topExpr)))
+    (((res as ExprInvoke).arguments[0] as ExprMakeBlock)._block as ExprBlock).arguments[0].flags |= VariableFlags.can_shadow
+    res.force_generated(true)
+    return <- res
 }
 
 [macro_function]
@@ -382,7 +453,7 @@ def private fold_linq_where_expr(var expr : ExpressionPtr) : ExpressionPtr {
     top = e_where != null ? e_where.arguments[0].get_ptr() : top
     // source is iterable
     return <- res if (top._type == null || !(top._type.isIterator || top._type.isGoodArrayType))
-    return <- res if (is_linq_call(top))
+    return <- res if (is_linq_call(top))    // if  its just begining of the linq chain, bail out
     var inscope iterType <- clone_type(top._type.firstType)
     // now, let's check for to_sequence(foo), and skip
     var e_to_sequence = top.is_call_or_generic_arg0("to_sequence", "linq")

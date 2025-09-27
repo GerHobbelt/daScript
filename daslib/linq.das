@@ -13,10 +13,10 @@ requirement:
 OPERATIONS
 Sorting data
      reverse, reverse_inplace, reverse_to_array, reverse_to_sequence - Reverses the order of elements in an iterable
-     order, order_to_array, order_to_sequence - Sorts the elements of an iterable
-     order_descending, order_descending_to_array, order_descending_to_sequence - Sorts the elements of an iterable in descending order
-     order_by, order_by_to_array, order_by_to_sequence - Sorts the elements of an iterable
-     order_by_descending, order_by_descending_to_array, order_by_descending_to_sequence - Sorts the elements of an iterable in descending order
+     order, order_inplace, order_to_array, order_to_sequence - Sorts the elements of an iterable
+     order_descending,  order_descending_inplace, order_descending_to_array, order_descending_to_sequence - Sorts the elements of an iterable in descending order
+     order_by, order_by_inplace, order_by_to_array, order_by_to_sequence - Sorts the elements of an iterable
+     order_by_descending,  order_by_descending_inplace, order_by_descending_to_array, order_by_descending_to_sequence - Sorts the elements of an iterable in descending order
 Set operations
      distinct - Returns distinct elements from an iterable
      distinct_by - Returns distinct elements from an iterable by key
@@ -27,9 +27,9 @@ Set operations
      intersect - Returns elements that are present in both iterables
      intersect_by - Returns elements that are present in both iterables by key
 Concatenation operations
-     append - Appends an element to the end of an iterable
-     prepend - Prepends an element to the beginning of an iterable
-     concat - Concatenates two iterables
+     append, append_to_array, append_to_sequence, append_inplace - Appends an element to the end of an iterable
+     prepend, prepend_to_array, prepend_to_sequence, prepend_inplace - Prepends an element to the beginning of an iterable
+     concat, concat_to_array, concat_to_sequence, concat_inplace - Concatenates two iterables
 Generation operations
      empty - Returns an empty iterable of a default type
      default_empty - Returns the elements of the iterable, or a default value if the iterable is empty
@@ -38,21 +38,20 @@ Generation operations
 Aggregation operations
      count - Counts elements in an iterable
      long_count - Counts elements in an iterable, using a long integer
-     min - Finds the minimum element in an iterable
-     min_by - Finds the minimum element in an iterable by a key
-     max - Finds the maximum element in an iterable
-     max_by - Finds the maximum element in an iterable by a key
+     min, min_by - Finds the minimum element in an iterable
+     max, max_by - Finds the maximum element in an iterable
+     min_max, min_max_by - Finds both the minimum and maximum elements in an iterable
+     min_max_average, min_max_average_by - Finds the minimum, maximum, and average elements in an iterable
      sum - Sums the elements in an iterable
-     sum_by - Sums the elements in an iterable by a key
      average - Averages the elements in an iterable
      aggregate - Aggregates the elements in an iterable
 Filtering data
      where_, where_to_array, where_to_sequence - Filters elements in an iterable
 Partitioning data
-     skip - Skips the first `n` elements of an iterable
-     skip_while - Skips all elements of an iterable while the predicate is true
-     take - Takes the first `n` elements of an iterable or range of elements in the iterable
-     take_while - Takes elements from an iterable while the predicate is true
+     skip, skip_to_array, skip_to_sequence, skip_inplace - Skips the first `n` elements of an iterable
+     skip_while, skip_while_to_array, skip_while_to_sequence - Skips all elements of an iterable while the predicate is true
+     take, take_to_array, take_to_sequence, take_inplace - Takes the first `n` elements of an iterable or range of elements in the iterable
+     take_while, take_while_to_array, take_while_to_sequence - Takes elements from an iterable while the predicate is true
      chunk - Splits an iterable into chunks of a specified size
 Join operations
      join - Joins two iterables based on a key (inner join)
@@ -114,13 +113,47 @@ def to_table(var a : iterator<auto(TT)>; key; elementSelector) : table<typedecl(
     var result : table<typedecl(unique_key(type<TT>)) -const -&, typedecl(elementSelector(type<TT>)) -const -&>
     for (it in a) {
         let k = key(it)
-        static_if (typeinfo can_copy(it)) {
-            unsafe(result[unique_key(k)]) = elementSelector(it)
-        } else {
-            unsafe(result[unique_key(k)]) <- clone_to_move(elementSelector(it))
-        }
+        unsafe(result[unique_key(k)]) := elementSelector(it)
     }
     return <- result
+}
+
+[skip_lock_check, unused_argument(tt)]
+def private concat_impl(var a; var b; tt : auto(TT); reserveSize : int) : array<TT -const -&> {
+    //! Concatenates two arrays or iterators
+    var c : array<TT -const -&>
+    static_if (typeinfo need_lock_check(c)) {
+        unsafe(set_verify_array_locks(c, false))
+    }
+    if (reserveSize > 0) {
+        c.reserve(reserveSize)
+    }
+    for (it in a) {
+        c.push_clone(it)
+    }
+    for (it in b) {
+        c.push_clone(it)
+    }
+    static_if (typeinfo need_lock_check(c)) {
+        unsafe(set_verify_array_locks(c, true))
+    }
+    return <- c
+
+}
+
+[skip_lock_check]
+def concat(var a, b : array<auto(TT)>) : array<TT -const -&> {
+    return <- concat_impl(a, b, type<TT -const -&>, length(a) + length(b))
+}
+
+[skip_lock_check]
+def concat_to_array(var a, b : iterator<auto(TT)>) : array<TT -const -&> {
+    return <- concat_impl(a, b, type<TT -const -&>, 0)
+}
+
+[skip_lock_check]
+def concat_to_sequence(var a, b : array<auto(TT)>) : iterator<TT -const -&> {
+    return <- concat_impl(a, b, type<TT -const -&>, length(a) + length(b)).move_to_sequence()
 }
 
 [skip_lock_check]
@@ -142,6 +175,15 @@ def concat(var a, b : iterator<auto(TT)>) : iterator<TT -const -&> {
             }
         }
         return false
+    }
+}
+
+[skip_lock_check]
+def concat_inplace(var a : array<auto(TT)>, b : array<auto(TT)>) {
+    //! Concatenates two arrays in place
+    a.reserve(length(a) + length(b))
+    for (it in b) {
+        a.push_clone(it)
     }
 }
 
@@ -220,6 +262,12 @@ def reverse_to_sequence(var a : array<auto(TT)>) : iterator<TT -const -&> {
 }
 
 [skip_lock_check]
+def order_inplace(var buffer : array<auto(TT)>; fun : block<(v1 : TT -&, v2 : TT -&) : bool>) {
+    //! Sorts an array in place
+    sort(buffer, fun)
+}
+
+[skip_lock_check]
 def order(var a : iterator<auto(TT)>; fun : block<(v1 : TT -&, v2 : TT -&) : bool>) : iterator<TT -const -&> {
     //! Sorts an iterator
     var arr <- to_array(a)
@@ -249,6 +297,12 @@ def order_to_sequence(var a : array<auto(TT)>; fun : block<(v1 : TT -&, v2 : TT 
     var b := a
     sort(b, fun)
     return move_to_sequence(b)
+}
+
+[skip_lock_check]
+def order_descending_inplace(var buffer : array<auto(TT)>; fun : block<(v1 : TT -&, v2 : TT -&) : bool>) {
+    //! Sorts an array in descending order in place
+    sort(buffer, $(v1, v2) => fun(v2, v1))
 }
 
 [skip_lock_check]
@@ -316,6 +370,12 @@ def less(a, b : tuple<auto(TT), auto(UU), auto(VV), auto(WW)>) : bool {
 }
 
 [skip_lock_check]
+def order_by_inplace(var buffer : array<auto(TT)>; key) {
+    //! Sorts an array in place
+    sort(buffer, $(v1, v2) => _::less(key(v1), key(v2)))
+}
+
+[skip_lock_check]
 def order_by(var a : iterator<auto(TT)>; key) : iterator<TT -const -&> {
     //! Sorts an iterator
     var arr <- to_array(a)
@@ -345,6 +405,12 @@ def order_by_to_sequence(var a : array<auto(TT)>; key) : iterator<TT -const -&> 
     var b := a
     sort(b, $(v1, v2) => _::less(key(v1), key(v2)))
     return move_to_sequence(b)
+}
+
+[skip_lock_check]
+def order_by_descending_inplace(var buffer : array<auto(TT)>; key) {
+    //! Sorts an array in descending order in place
+    sort(buffer, $(v1, v2) => _::less(key(v2), key(v1)))
 }
 
 [skip_lock_check]
@@ -442,6 +508,12 @@ def count(var a : iterator<auto(TT)>) : int {
 }
 
 [skip_lock_check]
+def count(var a : array<auto(TT)>) : int {
+    //! Counts elements in an array
+    return length(a)
+}
+
+[skip_lock_check]
 def long_count(var a : iterator<auto(TT)>) : int64 {
     //! Counts elements in an iterator, using a long integer
     var count = 0l
@@ -449,6 +521,12 @@ def long_count(var a : iterator<auto(TT)>) : int64 {
         count ++
     }
     return count
+}
+
+[skip_lock_check]
+def long_count(var a : array<auto(TT)>) : int64 {
+    //! Counts elements in an array, using a long integer
+    return int64(length(a))
 }
 
 [skip_lock_check, unused_argument(tt)]
@@ -495,9 +573,35 @@ def where_to_sequence(var src : array<auto(TT)>; predicate : block<(arg : TT -&)
 }
 
 [skip_lock_check]
-def skip(var src : iterator<auto(TT)>; var total : int) {
+def skip(var arr : array<auto(TT)>; var total : int) : array<TT -& -const> {
     //! Yields all but the first `total` elements
-    return <- generator<TT -&> capture(<- src) () <| $() {
+    let len = length(arr)
+    let remaining = len - total
+    if (remaining <= 0) {
+        return <- default<array<TT -& -const>>
+    }
+    return <- subarray(arr, total..len)
+}
+
+[skip_lock_check]
+def skip_inplace(var arr : array<auto(TT)>; var total : int) {
+    //! Removes the first `total` elements from an array in place
+    let len = length(arr)
+    let remaining = len - total
+    if (remaining <= 0) {
+        arr.clear()
+        return
+    }
+    for (i in 0..remaining) {
+        arr[i] <- arr[i + total]
+    }
+    arr.resize(remaining)
+}
+
+[skip_lock_check, unused_argument(tt)]
+def private skip_to_sequence(var src; tt : auto(TT); var total : int) : iterator<TT -& -const> {
+    //! Yields all but the first `total` elements
+    return <- generator<TT -& -const> capture(<- src) () <| $() {
         for (x in src) {
             if (total > 0) {
                 total --
@@ -513,10 +617,42 @@ def skip(var src : iterator<auto(TT)>; var total : int) {
     }
 }
 
+
 [skip_lock_check]
-def skip_while(var src : iterator<auto(TT)>; predicate : block<(arg : TT -&) : bool>) {
+def skip(var src : iterator<auto(TT)>; var total : int) : iterator<TT -& -const> {
+    //! Yields all but the first `total` elements
+    return skip_to_sequence(src, type<TT -& -const>, total)
+}
+
+[skip_lock_check]
+def skip_to_sequence(var src : array<auto(TT)>; var total : int) : iterator<TT -& -const> {
+    //! Yields all but the first `total` elements and returns an iterator
+    return skip_to_sequence(src, type<TT -& -const>, total)
+}
+
+[skip_lock_check]
+def skip_to_array(var src : iterator<auto(TT)>; var total : int) : array<TT -& -const> {
+    //! Yields all but the first `total` elements and returns an array
+    var buffer : array<TT -& -const>
+    static_if (typeinfo need_lock_check(buffer)) {
+        unsafe(set_verify_array_locks(buffer, false))
+    }
+    for (x in src) {
+        if (total > 0) {
+            total --
+            continue
+        }
+        buffer.push_clone(x)
+    }
+    static_if (typeinfo need_lock_check(buffer)) {
+        unsafe(set_verify_array_locks(buffer, true))
+    }
+    return <- buffer
+}
+
+[skip_lock_check, unused_argument(tt)]
+def private skip_while_impl(var src; tt : auto(TT); predicate : block<(arg : TT -&) : bool>) : array<TT -& -const> {
     //! Skips all elements of an iterator while the predicate is true
-    // TODO: specialize with const value vs var value of predicate, which can be captured.
     var buffer : array<TT -& -const>
     static_if (typeinfo need_lock_check(buffer)) {
         unsafe(set_verify_array_locks(buffer, false))
@@ -535,13 +671,54 @@ def skip_while(var src : iterator<auto(TT)>; predicate : block<(arg : TT -&) : b
     static_if (typeinfo need_lock_check(buffer)) {
         unsafe(set_verify_array_locks(buffer, true))
     }
-    return buffer.move_to_sequence()
+    return <- buffer
 }
 
 [skip_lock_check]
-def take(var src : iterator<auto(TT)>; var total : int) {
+def skip_while(var src : iterator<auto(TT)>; predicate : block<(arg : TT -&) : bool>) : iterator<TT -& -const> {
+    //! Skips all elements of an iterator while the predicate is true
+    // TODO: specialize with const value vs var value of predicate, which can be captured.
+    return <- skip_while_impl(src, type<TT -& -const>, predicate).move_to_sequence()
+}
+
+[skip_lock_check]
+def skip_while(var src : array<auto(TT)>; predicate : block<(arg : TT -&) : bool>) : array<TT -& -const> {
+    //! Skips all elements of an array while the predicate is true
+    return <- skip_while_impl(src, type<TT -& -const>, predicate)
+}
+
+[skip_lock_check]
+def skip_while_to_array(var src : iterator<auto(TT)>; predicate : block<(arg : TT -&) : bool>) : array<TT -& -const> {
+    //! Skips all elements of an iterator while the predicate is true and returns an array
+    return <- skip_while_impl(src, type<TT -& -const>, predicate)
+}
+
+[skip_lock_check]
+def skip_while_to_sequence(var src : array<auto(TT)>; predicate : block<(arg : TT -&) : bool>) : iterator<TT -& -const> {
+    //! Skips all elements of an array while the predicate is true and returns an iterator
+    return <- skip_while_impl(src, type<TT -& -const>, predicate).move_to_sequence()
+}
+
+[skip_lock_check]
+def take(var arr : array<auto(TT)>; var total : int) : array<TT -& -const> {
     //! Yields only the first `total` elements
-    return <- generator<TT -&> capture(<- src) () <| $() {
+    let len = length(arr)
+    let taking = (total < len)  ? total : len
+    return <- subarray(arr, 0..taking)
+}
+
+[skip_lock_check]
+def take_inplace(var arr : array<auto(TT)>; var total : int) {
+    //! Keeps only the first `total` elements in an array in place
+    let len = length(arr)
+    let taking = (total < len)  ? total : len
+    arr.resize(taking)
+}
+
+[skip_lock_check, unused_argument(tt)]
+def private take_to_sequence(var src; tt : auto(TT); var total : int) : iterator<TT -& -const> {
+    //! Yields only the first `total` elements
+    return <- generator<TT -& -const> capture(<- src) () <| $() {
         for (x in src) {
             if (total <= 0) {
                 break
@@ -558,24 +735,124 @@ def take(var src : iterator<auto(TT)>; var total : int) {
 }
 
 [skip_lock_check]
-def take(var src : iterator<auto(TT)>; interval : range) {
-    //! Yields only the elements of an iterator within a specified range
-    return <- generator<TT -&> capture(<- src) () <| $() {
-        var count = 0
+def take(var src : iterator<auto(TT)>; var total : int) : iterator<TT -& -const> {
+    //! Yields only the first `total` elements
+    return take_to_sequence(src, type<TT -& -const>, total)
+}
+
+[skip_lock_check]
+def take_to_sequence(var src : array<auto(TT)>; var total : int) : iterator<TT -& -const> {
+    //! Yields only the first `total` elements and returns an iterator
+    return take_to_sequence(src, type<TT -& -const>, total)
+}
+
+[skip_lock_check]
+def take_to_array(var src : iterator<auto(TT)>; var total : int) : array<TT -& -const> {
+    //! Yields only the first `total` elements and returns an array
+    var buffer : array<TT -& -const>
+    static_if (typeinfo need_lock_check(buffer)) {
+        unsafe(set_verify_array_locks(buffer, false))
+    }
+    for (x in src) {
+        if (total <= 0) {
+            break
+        }
+        total --
+        buffer.push_clone(x)
+    }
+    static_if (typeinfo need_lock_check(buffer)) {
+        unsafe(set_verify_array_locks(buffer, true))
+    }
+    return <- buffer
+}
+
+[skip_lock_check]
+def take(var src : iterator<auto(TT)>; from : range) : iterator<TT -& -const> {
+    //! Yields a range of elements from an iterator
+    return <- generator<TT -& -const> capture(<- src) () <| $() {
+        var index = 0
         for (x in src) {
-            if (count >= interval.x && count < interval.y) {
-                yield x
-            } elif (count >= interval.y) {
-                break
+            if (index >= from.x) {
+                if (index >= from.y) {
+                    break
+                }
+                static_if (typeinfo can_copy(x)) {
+                    yield x
+                } else {
+                    yield <- clone_to_move(x)
+                }
             }
-            count ++
+            index ++
         }
         return false
     }
 }
 
 [skip_lock_check]
-def take_while(var src : iterator<auto(TT)>; predicate : block<(arg : TT -&) : bool>) {
+def take(var src : array<auto(TT)>; from : range) : array<TT -& -const> {
+    //! Yields a range of elements from an array
+    let len = length(src)
+    let start = (from.x < 0) ? 0 : ((from.x > len) ? len : from.x)
+    var end = (from.y < 0) ? 0 : ((from.y > len) ? len : from.y)
+    if (end < start) {
+        end = start
+    }
+    return <- subarray(src, start..end)
+}
+
+[skip_lock_check]
+def take_to_array(var src : iterator<auto(TT)>; from : range) : array<TT -& -const> {
+    //! Yields a range of elements from an iterator and returns an array
+    var buffer : array<TT -& -const>
+    static_if (typeinfo need_lock_check(buffer)) {
+        unsafe(set_verify_array_locks(buffer, false))
+    }
+    var index = 0
+    for (x in src) {
+        if (index >= from.x) {
+            if (index >= from.y) {
+                break
+            }
+            buffer.push_clone(x)
+        }
+        index ++
+    }
+    static_if (typeinfo need_lock_check(buffer)) {
+        unsafe(set_verify_array_locks(buffer, true))
+    }
+    return <- buffer
+}
+
+[skip_lock_check]
+def take_to_sequence(var src : array<auto(TT)>; from : range) : iterator<TT -& -const> {
+    //! Yields a range of elements from an array and returns an iterator
+    let len = length(src)
+    let start = (from.x < 0) ? 0 : ((from.x > len) ? len : from.x)
+    var end = (from.y < 0) ? 0 : ((from.y > len) ? len : from.y)
+    if (end < start) {
+        end = start
+    }
+    return <- subarray(src, start..end).move_to_sequence()
+}
+
+[skip_lock_check]
+def take_inplace(var arr : array<auto(TT)>; from : range) {
+    //! Keeps only a range of elements in an array in place
+    let len = length(arr)
+    let start = (from.x < 0) ? 0 : ((from.x > len) ? len : from.x)
+    var end = (from.y < 0) ? 0 : ((from.y > len) ? len : from.y)
+    if (end < start) {
+        end = start
+    }
+    let taking = end - start
+    for (i in 0..taking) {
+        arr[i] <- arr[start + i]
+    }
+    arr.resize(taking)
+}
+
+[skip_lock_check, unused_argument(tt)]
+def private take_while_impl(var src; tt : auto(TT); predicate : block<(arg : TT -&) : bool>) : array<TT -& -const> {
     //! Yields only the elements of an iterator while the predicate is true
     var buffer : array<TT -& -const>
     static_if (typeinfo need_lock_check(buffer)) {
@@ -594,20 +871,78 @@ def take_while(var src : iterator<auto(TT)>; predicate : block<(arg : TT -&) : b
     static_if (typeinfo need_lock_check(buffer)) {
         unsafe(set_verify_array_locks(buffer, true))
     }
-    return buffer.move_to_sequence()
+    return <- buffer
+}
+
+[skip_lock_check]
+def take_while(var src : iterator<auto(TT)>; predicate : block<(arg : TT -&) : bool>) {
+    //! Yields only the elements of an iterator while the predicate is true
+    return <- take_while_impl(src, type<TT -& -const>, predicate).move_to_sequence()
+}
+
+[skip_lock_check]
+def take_while(var src : array<auto(TT)>; predicate : block<(arg : TT -&) : bool>) : array<TT -& -const> {
+    //! Yields only the elements of an array while the predicate is true
+    return <- take_while_impl(src, type<TT -& -const>, predicate)
+}
+
+[skip_lock_check]
+def take_while_to_array(var src : iterator<auto(TT)>; predicate : block<(arg : TT -&) : bool>) : array<TT -& -const> {
+    //! Yields only the elements of an iterator while the predicate is true and returns an array
+    return <- take_while_impl(src, type<TT -& -const>, predicate)
+}
+
+[skip_lock_check]
+def take_while_to_sequence(var src : array<auto(TT)>; predicate : block<(arg : TT -&) : bool>) : iterator<TT -& -const> {
+    //! Yields only the elements of an array while the predicate is true and returns an iterator
+    return <- take_while_impl(src, type<TT -& -const>, predicate).move_to_sequence()
+}
+
+[skip_lock_check, unused_argument(tt)]
+def private min_impl(var src; tt : auto(TT)) : TT -& -const {
+    var minn : TT -& -const
+    var first : bool = true
+    for (x in src) {
+        if (first) {
+            minn := x
+            first = false
+        } elif (_::less(x, minn)) {
+            minn := x
+        }
+    }
+    return <- minn
 }
 
 [skip_lock_check]
 def min(var src : iterator<auto(TT)>) : TT -& -const {
     //! Finds the minimum element in an iterator
+    static_if (typeinfo is_workhorse(type<TT>)) {
+        return min_impl(src, type<TT -const -&>)
+    } else {
+        return <- min_impl(src, type<TT -const -&>)
+    }
+}
+
+[skip_lock_check]
+def min(var src : array<auto(TT)>) : TT -& -const {
+    //! Finds the minimum element in an array
+    static_if (typeinfo is_workhorse(type<TT>)) {
+        return min_impl(src, type<TT -const -&>)
+    } else {
+        return <- min_impl(src, type<TT -const -&>)
+    }
+}
+
+[skip_lock_check, unused_argument(tt)]
+def private min_by_impl(var src; tt : auto(TT); key) : TT -& -const {
     var minn : TT -& -const
     var first : bool = true
     for (x in src) {
         if (first) {
-            minn = x
+            minn := x
             first = false
-        } elif (_::less(x, minn)) {
-            minn = x
+        } elif (_::less(key(x), key(minn))) {
+            minn := x
         }
     }
     return <- minn
@@ -616,46 +951,68 @@ def min(var src : iterator<auto(TT)>) : TT -& -const {
 [skip_lock_check]
 def min_by(var src : iterator<auto(TT)>; key) : TT -& -const {
     //! Finds the minimum element in an iterator by key
-    var minn : TT -& -const
+    static_if (typeinfo is_workhorse(type<TT>)) {
+        return min_by_impl(src, type<TT -const -&>, key)
+    } else {
+        return <- min_by_impl(src, type<TT -const -&>, key)
+    }
+}
+
+[skip_lock_check]
+def min_by(var src : array<auto(TT)>; key) : TT -& -const {
+    //! Finds the minimum element in an array by key
+    static_if (typeinfo is_workhorse(type<TT>)) {
+        return min_by_impl(src, type<TT -const -&>, key)
+    } else {
+        return <- min_by_impl(src, type<TT -const -&>, key)
+    }
+}
+
+[skip_lock_check, unused_argument(tt)]
+def private max_impl(var src; tt : auto(TT)) : TT -& -const {
+    var maxx : TT -& -const
     var first : bool = true
     for (x in src) {
         if (first) {
-            static_if (typeinfo can_copy(x)) {
-                minn = x
-            } else {
-                minn <- clone_to_move(x)
-            }
+            maxx := x
             first = false
-        } elif (_::less(key(x), key(minn))) {
-            static_if (typeinfo can_copy(x)) {
-                minn = x
-            } else {
-                minn <- clone_to_move(x)
-            }
+        } elif (_::less(maxx, x)) {
+            maxx := x
         }
     }
-    return <- minn
+    return <- maxx
 }
 
 [skip_lock_check]
 def max(var src : iterator<auto(TT)>) : TT -& -const {
     //! Finds the maximum element in an iterator
+    static_if (typeinfo is_workhorse(type<TT>)) {
+        return max_impl(src, type<TT -const -&>)
+    } else {
+        return <- max_impl(src, type<TT -const -&>)
+    }
+}
+
+[skip_lock_check]
+def max(var src : array<auto(TT)>) : TT -& -const {
+    //! Finds the maximum element in an array
+    static_if (typeinfo is_workhorse(type<TT>)) {
+        return max_impl(src, type<TT -const -&>)
+    } else {
+        return <- max_impl(src, type<TT -const -&>)
+    }
+}
+
+[skip_lock_check, unused_argument(tt)]
+def private max_by_impl(var src; tt : auto(TT); key) : TT -& -const {
     var maxx : TT -& -const
     var first : bool = true
     for (x in src) {
         if (first) {
-            static_if (typeinfo can_copy(x)) {
-                maxx = x
-            } else {
-                maxx <- clone_to_move(x)
-            }
+            maxx := x
             first = false
-        } elif (_::less(maxx, x)) {
-            static_if (typeinfo can_copy(x)) {
-                maxx = x
-            } else {
-                maxx <- clone_to_move(x)
-            }
+        } elif (_::less(key(maxx), key(x))) {
+            maxx := x
         }
     }
     return <- maxx
@@ -664,49 +1021,124 @@ def max(var src : iterator<auto(TT)>) : TT -& -const {
 [skip_lock_check]
 def max_by(var src : iterator<auto(TT)>; key) : TT -& -const {
     //! Finds the maximum element in an iterator by key
+    static_if (typeinfo is_workhorse(type<TT>)) {
+        return max_by_impl(src, type<TT -const -&>, key)
+    } else {
+        return <- max_by_impl(src, type<TT -const -&>, key)
+    }
+}
+
+[skip_lock_check]
+def max_by(var src : array<auto(TT)>; key) : TT -& -const {
+    //! Finds the maximum element in an array by key
+    static_if (typeinfo is_workhorse(type<TT>)) {
+        return max_by_impl(src, type<TT -const -&>, key)
+    } else {
+        return <- max_by_impl(src, type<TT -const -&>, key)
+    }
+}
+
+[skip_lock_check, unused_argument(tt)]
+def private min_max_impl(var src; tt : auto(TT)) : tuple<TT -& -const, TT -& -const> {
+    var minn : TT -& -const
     var maxx : TT -& -const
     var first : bool = true
     for (x in src) {
         if (first) {
-            static_if (typeinfo can_copy(x)) {
-                maxx = x
-            } else {
-                maxx <- clone_to_move(x)
-            }
+            minn := x
+            maxx := x
             first = false
-        } elif (_::less(key(maxx), key(x))) {
-            static_if (typeinfo can_copy(x)) {
-                maxx = x
-            } else {
-                maxx <- clone_to_move(x)
+        } else {
+            if (_::less(x, minn)) {
+                minn := x
+            } elif (_::less(maxx, x)) {
+                maxx := x
             }
         }
     }
-    return <- maxx
+    return <- (minn, maxx)
 }
 
 [skip_lock_check]
-def aggregate(var src : iterator<auto(TT)>; seed : TT -&; func : block<(acc : TT -&, x : TT -&) : TT -&>) : TT -const -& {
-    //! Aggregates elements in an iterator using a seed and a function
-    var acc : TT -& -const
-    static_if (typeinfo can_copy(seed)) {
-        acc = seed
-    } else {
-        acc <- clone_to_move(seed)
+def min_max(var src : iterator<auto(TT)>) : tuple<TT -& -const, TT -& -const> {
+    //! Finds the minimum and maximum elements in an iterator
+    return <- min_max_impl(src, type<TT -const -&>)
+}
+
+[skip_lock_check]
+def min_max(var src : array<auto(TT)>) : tuple<TT -& -const, TT -& -const> {
+    //! Finds the minimum and maximum elements in an array
+    return <- min_max_impl(src, type<TT -const -&>)
+}
+
+[skip_lock_check, unused_argument(tt)]
+def private min_max_by_impl(var src; tt : auto(TT); key) : tuple<TT -& -const, TT -& -const> {
+    var minn : TT -& -const
+    var maxx : TT -& -const
+    var first : bool = true
+    for (x in src) {
+        if (first) {
+            minn := x
+            maxx := x
+            first = false
+        } else {
+            if (_::less(key(x), key(minn))) {
+                minn := x
+            } elif (_::less(key(maxx), key(x))) {
+                maxx := x
+            }
+        }
     }
+    return <- (minn, maxx)
+}
+
+[skip_lock_check]
+def min_max_by(var src : iterator<auto(TT)>; key) : tuple<TT -& -const, TT -& -const> {
+    //! Finds the minimum and maximum elements in an iterator by key
+    return <- min_max_by_impl(src, type<TT -const -&>, key)
+}
+
+[skip_lock_check]
+def min_max_by(var src : array<auto(TT)>; key) : tuple<TT -& -const, TT -& -const> {
+    //! Finds the minimum and maximum elements in an array by key
+    return <- min_max_by_impl(src, type<TT -const -&>, key)
+}
+
+[skip_lock_check, unused_argument(tt)]
+def private aggregate_impl(var src; tt : auto(TT); seed : auto(AGG); func : block<(acc : AGG -&, x : TT -&) : AGG -&>) : AGG -& -const {
+    var acc : AGG -& := seed
     for (x in src) {
         static_if (typeinfo can_copy(x)) {
             acc = func(acc, x)
         } else {
-            acc <- func(acc, clone_to_move(x))
+            acc <- func(acc, x)
         }
     }
     return <- acc
 }
 
 [skip_lock_check]
-def sum(var src : iterator<auto(TT)>) : TT -const -& {
-    //! Sums elements in an iterator
+def aggregate(var src : iterator<auto(TT)>; seed : auto(AGG); func : block<(acc : AGG -&, x : TT -&) : AGG -&>) : AGG -& -const {
+    //! Aggregates elements in an iterator using a seed and a function
+    static_if (typeinfo is_workhorse(seed)) {
+        return aggregate_impl(src, type<TT -const -&>, seed, func)
+    } else {
+        return <- aggregate_impl(src, type<TT -const -&>, seed, func)
+    }
+}
+
+[skip_lock_check]
+def aggregate(var src : array<auto(TT)>; seed : auto(AGG); func : block<(acc : AGG -&, x : TT -&) : AGG -&>) : AGG -& -const {
+    //! Aggregates elements in an array using a seed and a function
+    static_if (typeinfo is_workhorse(seed)) {
+        return aggregate_impl(src, type<TT -const -&>, seed, func)
+    } else {
+        return <- aggregate_impl(src, type<TT -const -&>, seed, func)
+    }
+}
+
+[skip_lock_check, unused_argument(tt)]
+def private sum_impl(var src; tt : auto(TT)) : TT -const -& {
     var total : TT -const -&
     for (x in src) {
         total += x
@@ -715,8 +1147,27 @@ def sum(var src : iterator<auto(TT)>) : TT -const -& {
 }
 
 [skip_lock_check]
-def average(var src : iterator<auto(TT)>) : TT -const -& {
-    //! Averages elements in an iterator
+def sum(var src : iterator<auto(TT)>) : TT -const -& {
+    //! Sums elements in an iterator
+    static_if (typeinfo is_workhorse(type<TT>)) {
+        return sum_impl(src, type<TT -const -&>)
+    } else {
+        return <- sum_impl(src, type<TT -const -&>)
+    }
+}
+
+[skip_lock_check]
+def sum(var src : array<auto(TT)>) : TT -const -& {
+    //! Sums elements in an array
+    static_if (typeinfo is_workhorse(type<TT>)) {
+        return sum_impl(src, type<TT -const -&>)
+    } else {
+        return <- sum_impl(src, type<TT -const -&>)
+    }
+}
+
+[skip_lock_check, unused_argument(tt)]
+def average_impl(var src; tt : auto(TT)) : TT -const -& {
     var total : TT -const -&
     var count : uint64
     for (x in src) {
@@ -731,6 +1182,116 @@ def average(var src : iterator<auto(TT)>) : TT -const -& {
         }
     }
     return <- total
+}
+
+[skip_lock_check]
+def average(var src : iterator<auto(TT)>) : TT -const -& {
+    //! Averages elements in an iterator
+    static_if (typeinfo is_workhorse(type<TT>)) {
+        return average_impl(src, type<TT -const -&>)
+    } else {
+        return <- average_impl(src, type<TT -const -&>)
+    }
+}
+
+[skip_lock_check]
+def average(var src : array<auto(TT)>) : TT -const -& {
+    //! Averages elements in an array
+    static_if (typeinfo is_workhorse(type<TT>)) {
+        return average_impl(src, type<TT -const -&>)
+    } else {
+        return <- average_impl(src, type<TT -const -&>)
+    }
+}
+
+[skip_lock_check, unused_argument(tt)]
+def private min_max_average_impl(var src; tt : auto(TT)) : tuple<TT -const -&, TT -const -&, TT -const -&> {
+    var minn : TT -const -&
+    var maxx : TT -const -&
+    var total : TT -const -&
+    var count : uint64
+    var first : bool = true
+    for (x in src) {
+        if (first) {
+            minn := x
+            maxx := x
+            total := x
+            first = false
+        } else {
+            if (_::less(x, minn)) {
+                minn := x
+            } elif (_::less(maxx, x)) {
+                maxx := x
+            }
+            total += x
+        }
+        count ++
+    }
+    if (count != 0ul) {
+        static_if (typeinfo is_workhorse(type<TT>)) {
+            total /= TT(count)
+        } else {
+            total /= count
+        }
+    }
+    return <- (minn, maxx, total)
+}
+
+[skip_lock_check]
+def min_max_average(var src : iterator<auto(TT)>) : tuple<TT -const -&, TT -const -&, TT -const -&> {
+    //! Finds the minimum, maximum, and average elements in an iterator
+    return <- min_max_average_impl(src, type<TT -const -&>)
+}
+
+[skip_lock_check]
+def min_max_average(var src : array<auto(TT)>) : tuple<TT -const -&, TT -const -&, TT -const -&> {
+    //! Finds the minimum, maximum, and average elements in an array
+    return <- min_max_average_impl(src, type<TT -const -&>)
+}
+
+[skip_lock_check, unused_argument(tt)]
+def private min_max_average_by_impl(var src; tt : auto(TT); key) : tuple<TT -const -&, TT -const -&, TT -const -&> {
+    var minn : TT -const -&
+    var maxx : TT -const -&
+    var total : TT -const -&
+    var count : uint64
+    var first : bool = true
+    for (x in src) {
+        if (first) {
+            minn := x
+            maxx := x
+            total := x
+            first = false
+        } else {
+            if (_::less(key(x), key(minn))) {
+                minn := x
+            } elif (_::less(key(maxx), key(x))) {
+                maxx := x
+            }
+            total += x
+        }
+        count ++
+    }
+    if (count != 0ul) {
+        static_if (typeinfo is_workhorse(type<TT>)) {
+            total /= TT(count)
+        } else {
+            total /= count
+        }
+    }
+    return <- (minn, maxx, total)
+}
+
+[skip_lock_check]
+def min_max_average_by(var src : iterator<auto(TT)>; key) : tuple<TT -const -&, TT -const -&, TT -const -&> {
+    //! Finds the minimum, maximum, and average elements in an iterator by key
+    return <- min_max_average_by_impl(src, type<TT -const -&>, key)
+}
+
+[skip_lock_check]
+def min_max_average_by(var src : array<auto(TT)>; key) : tuple<TT -const -&, TT -const -&, TT -const -&> {
+    //! Finds the minimum, maximum, and average elements in an array by key
+    return <- min_max_average_by_impl(src, type<TT -const -&>, key)
 }
 
 [skip_lock_check]
@@ -1145,11 +1706,7 @@ def last(var src : iterator<auto(TT)>) : TT -const -& {
     var last : TT -const -&
     for (it in src) {
         found = true
-        static_if (typeinfo can_copy(it)) {
-            last = it
-        } else {
-            last <- clone_to_move(it)
-        }
+        last := it
     }
     if (!found) {
         panic("sequence contains no elements")
@@ -1164,11 +1721,7 @@ def last_or_default(var src : iterator<auto(TT)>; defaultValue : TT -&) : TT -co
     var last : TT -const -&
     for (it in src) {
         found = true
-        static_if (typeinfo can_copy(it)) {
-            last = it
-        } else {
-            last <- clone_to_move(it)
-        }
+        last := it
     }
     if (!found) {
         static_if (typeinfo can_copy(defaultValue)) {
@@ -1190,11 +1743,7 @@ def single(var src : iterator<auto(TT)>) : TT -const -& {
             panic("sequence contains more than one element")
         }
         found = true
-        static_if (typeinfo can_copy(it)) {
-            single = it
-        } else {
-            single <- clone_to_move(it)
-        }
+        single := it
     }
     if (!found) {
         panic("sequence contains no elements")
@@ -1216,11 +1765,7 @@ def single_or_default(var src : iterator<auto(TT)>; defaultValue : TT -&) : TT -
             }
         }
         found = true
-        static_if (typeinfo can_copy(it)) {
-            single = it
-        } else {
-            single <- clone_to_move(it)
-        }
+        single := it
     }
     if (!found) {
         static_if (typeinfo can_copy(defaultValue)) {
@@ -1230,6 +1775,44 @@ def single_or_default(var src : iterator<auto(TT)>; defaultValue : TT -&) : TT -
         }
     }
     return <- single
+}
+
+[skip_lock_check]
+def private prepend_impl(var arr; tt : auto(TT); reserveSize : int; value : TT -&) : array<TT -const -&> {
+    //! Prepends a value to the beginning of an array
+    var buffer : array<TT -const -&>
+    static_if (typeinfo need_lock_check(buffer)) {
+        unsafe(set_verify_array_locks(buffer, false))
+    }
+    if (reserveSize > 0) {
+        buffer.reserve(reserveSize)
+    }
+    buffer.push_clone(value)
+    for (x in arr) {
+        buffer.push_clone(x)
+    }
+    static_if (typeinfo need_lock_check(buffer)) {
+        unsafe(set_verify_array_locks(buffer, true))
+    }
+    return <- buffer
+}
+
+[skip_lock_check]
+def prepend(var arr : array<auto(TT)>; value : TT -&) : array<TT -const -&> {
+    //! Prepends a value to the beginning of an array
+    return <- prepend_impl(arr, type<TT -const -&>, length(arr) + 1, value)
+}
+
+[skip_lock_check]
+def prepend_to_array(var it : iterator<auto(TT)>; value : TT -&) : array<TT -const -&> {
+    //! Prepends a value to the beginning of an iterator and returns an array
+    return <- prepend_impl(it, type<TT -const -&>, 0, value)
+}
+
+[skip_lock_check]
+def prepend_to_sequence(var arr : array<auto(TT)>; value : TT -&) : iterator<TT -const -&> {
+    //! Prepends a value to the beginning of an array and returns an iterator
+    return <- prepend_impl(arr, type<TT -const -&>, length(arr) + 1, value).move_to_sequence()
 }
 
 [skip_lock_check]
@@ -1253,6 +1836,50 @@ def prepend(var it : iterator<auto(TT)>; value : TT -&) : iterator<TT -const -&>
 }
 
 [skip_lock_check]
+def prepend_inplace(var arr : array<auto(TT)>; value : TT -&) {
+    //! Prepends a value to the beginning of an array in place
+    arr.push_clone(value, 0)
+}
+
+[skip_lock_check, unused_argument(tt)]
+def private append_impl(var arr; tt : auto(TT); reserveSize : int; value : TT -&) : array<TT -const -&> {
+    //! Appends a value to the end of an array
+    var buffer : array<TT -const -&>
+    static_if (typeinfo need_lock_check(buffer)) {
+        unsafe(set_verify_array_locks(buffer, false))
+    }
+    if (reserveSize > 0) {
+        buffer.reserve(reserveSize)
+    }
+    for (x in arr) {
+        buffer.push_clone(x)
+    }
+    buffer.push_clone(value)
+    static_if (typeinfo need_lock_check(buffer)) {
+        unsafe(set_verify_array_locks(buffer, true))
+    }
+    return <- buffer
+}
+
+[skip_lock_check]
+def append(var arr : array<auto(TT)>; value : TT -&) : array<TT -const -&> {
+    //! Appends a value to the end of an array
+    return <- append_impl(arr, type<TT -const -&>, length(arr) + 1, value)
+}
+
+[skip_lock_check]
+def append_to_array(var it : iterator<auto(TT)>; value : TT -&) : array<TT -const -&> {
+    //! Appends a value to the end of an iterator and returns an array
+    return <- append_impl(it, type<TT -const -&>, 0, value)
+}
+
+[skip_lock_check]
+def append_to_sequence(var arr : array<auto(TT)>; value : TT -&) : iterator<TT -const -&> {
+    //! Appends a value to the end of an array and returns an iterator
+    return <- append_impl(arr, type<TT -const -&>, length(arr) + 1, value).move_to_sequence()
+}
+
+[skip_lock_check]
 def append(var it : iterator<auto(TT)>; value : TT -&) : iterator<TT -const -&> {
     //! Appends a value to the end of an iterator
     return generator<TT -const -&> capture(<- it, := value) () <| $ {
@@ -1270,6 +1897,12 @@ def append(var it : iterator<auto(TT)>; value : TT -&) : iterator<TT -const -&> 
         }
         return false
     }
+}
+
+[skip_lock_check]
+def append_inplace(var arr : array<auto(TT)>; value : TT -&) {
+    //! Appends a value to the end of an array in place
+    arr.push_clone(value)
 }
 
 [skip_lock_check, unused_argument(tt)]
