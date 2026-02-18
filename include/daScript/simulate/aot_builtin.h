@@ -89,6 +89,9 @@ namespace das {
     DAS_API void builtin_make_good_array_iterator ( Sequence & result, const Array & arr, int stride, Context * context, LineInfoArg * at );
     DAS_API void builtin_make_fixed_array_iterator ( Sequence & result, void * data, int size, int stride, Context * context, LineInfoArg * at );
     DAS_API void builtin_make_range_iterator ( Sequence & result, range rng, Context * context, LineInfoArg * at );
+    DAS_API void builtin_make_urange_iterator ( Sequence & result, urange rng, Context * context, LineInfoArg * at );
+    DAS_API void builtin_make_range64_iterator ( Sequence & result, range64 rng, Context * context, LineInfoArg * at );
+    DAS_API void builtin_make_urange64_iterator ( Sequence & result, urange64 rng, Context * context, LineInfoArg * at );
     DAS_API void builtin_make_lambda_iterator ( Sequence & result, const Lambda lambda, int stride, Context * context, LineInfoArg * at );
     DAS_API void builtin_make_nil_iterator ( Sequence & result, Context * context, LineInfoArg * at );
     DAS_API vec4f builtin_make_enum_iterator ( Context & context, SimNode_CallBase * call, vec4f * );
@@ -129,6 +132,8 @@ namespace das {
     void * gc0_restore_ptr ( char * name, Context * context );
     smart_ptr_raw<void> gc0_restore_smart_ptr ( char * name, Context * context );
     void gc0_reset();
+
+    void *builtin_das_aligned_alloc16(uint64_t size);
 
     __forceinline void array_grow ( Context & context, Array & arr, uint32_t stride, LineInfo * at ) {
         if ( arr.isLocked() ) context.throw_error_at(at, "can't resize locked array");
@@ -182,4 +187,15 @@ namespace das {
 
     const char * das_get_platform_name();
     const char * das_get_architecture_name();
+
+    DAS_API char * fmt_i8 ( const char * fmt, int8_t value, Context * context, LineInfoArg * at );
+    DAS_API char * fmt_u8 ( const char * fmt, uint8_t value, Context * context, LineInfoArg * at );
+    DAS_API char * fmt_i16 ( const char * fmt, int16_t value, Context * context, LineInfoArg * at );
+    DAS_API char * fmt_u16 ( const char * fmt, uint16_t value, Context * context, LineInfoArg * at );
+    DAS_API char * fmt_i32 ( const char * fmt, int32_t value, Context * context, LineInfoArg * at );
+    DAS_API char * fmt_u32 ( const char * fmt, uint32_t value, Context * context, LineInfoArg * at );
+    DAS_API char * fmt_i64 ( const char * fmt, int64_t value, Context * context, LineInfoArg * at );
+    DAS_API char * fmt_u64 ( const char * fmt, uint64_t value, Context * context, LineInfoArg * at );
+    DAS_API char * fmt_f ( const char * fmt, float value, Context * context, LineInfoArg * at );
+    DAS_API char * fmt_d ( const char * fmt, double value, Context * context, LineInfoArg * at );
 }

@@ -34,6 +34,9 @@ namespace das {
         {   Type::tEnumeration16, "tEnumeration16" },
         {   Type::tEnumeration64, "tEnumeration64" },
         {   Type::tBitfield,    "tBitfield" },
+        {   Type::tBitfield8,    "tBitfield8" },
+        {   Type::tBitfield16,    "tBitfield16" },
+        {   Type::tBitfield64,    "tBitfield64" },
         {   Type::tIterator,    "tIterator" },
         {   Type::tArray,       "tArray" },
         {   Type::tTable,       "tTable" },
@@ -461,6 +464,12 @@ namespace das {
         virtual void preVisit ( TypeDecl * type ) override {
             Visitor::preVisit(type);
         }
+
+        // function
+        bool canVisitFunction(Function *f) override {
+            return !f->noAot;
+        }
+
         virtual void preVisitExpression ( Expression * expr ) override {
             Visitor::preVisitExpression(expr);
             mark(expr->type.get());
@@ -3858,12 +3867,6 @@ namespace das {
                 funInit = true;
             }
         }
-        if ( context.totalVariables || funInit ) {
-            logs << "static vec4f __wrap___init_script ( Context * __context__ ) {\n";
-            logs << "    __init_script(__context__, cast_aot_arg<bool>::to(*__context__,__context__->abiArguments()[0]));\n";
-            logs << "    return v_zero();\n";
-            logs << "};\n";
-        }
 
         if (!fnn.empty()) {
             logs << "\n#pragma optimize(\"\", off)\n"; // Let's disable any optimizations. It helps on MSVC to compile faster
@@ -3887,12 +3890,6 @@ namespace das {
             logs << "    for (const auto &[hash, cmres, fn1, fn2] : functions) {\n";
             logs << "        aotLib.emplace(hash, AotFactory(cmres, fn1, fn2));\n";
             logs << "    }\n";
-        }
-        if ( context.totalVariables || funInit ) {
-            uint64_t semH = context.getInitSemanticHash();
-            semH = getInitSemanticHashWithDep(semH);
-            logs << "    // [[ init script ]]\n";
-            logs << "    aotLib.emplace(0x" << HEX << semH << DEC << ", AotFactory(false, (void*)&__init_script, &__wrap___init_script));\n";
         }
         if ( headers ) {
             logs << "}\n";
@@ -4159,11 +4156,6 @@ namespace das {
         for ( auto & pm : program->library.getModules() ) {
             pm->structures.foreach([&](auto ps){
                 aotVisitor.ss << "namespace " << aotModuleName(ps->module) << " { struct " << aotStructName(ps.get()) << "; };\n";
-            });
-            pm->functions.foreach([&](auto fn){
-                if (fn->index < 0 || !fn->used || fn->isTemplate)
-                    return;
-                fn->visit(utm);
             });
         }
         for ( auto & pm : program->library.getModules() ) {

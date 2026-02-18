@@ -1,4 +1,4 @@
-module printer_flags_visitor
+module ast_print_flags
 
 options gen2
 

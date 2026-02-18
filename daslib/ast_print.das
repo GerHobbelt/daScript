@@ -13,7 +13,7 @@ require daslib/ast_boost
 require daslib/strings_boost
 
 
-require printer_flags_visitor
+require daslib/ast_print_flags
 
 //////////
 // example

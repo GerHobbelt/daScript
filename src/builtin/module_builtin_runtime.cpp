@@ -766,14 +766,12 @@ namespace das
 
     TSequence<int32_t> builtin_count ( int32_t start, int32_t step, Context * context, LineInfoArg * at ) {
         char * iter = context->allocateIterator(sizeof(CountIterator), "count iterator", at);
-        if ( !iter ) context->throw_out_of_memory(false, sizeof(CountIterator)+16, at);
         new (iter) CountIterator(start, step, at);
         return TSequence<int>((Iterator *)iter);
     }
 
     TSequence<uint32_t> builtin_ucount ( uint32_t start, uint32_t step, Context * context, LineInfoArg * at ) {
         char * iter = context->allocateIterator(sizeof(CountIterator), "ucount iterator", at);
-        if ( !iter ) context->throw_out_of_memory(false, sizeof(CountIterator)+16, at);
         new (iter) CountIterator(start, step, at);
         return TSequence<int>((Iterator *)iter);
     }
@@ -979,22 +977,37 @@ namespace das
 
     void builtin_make_good_array_iterator ( Sequence & result, const Array & arr, int stride, Context * context, LineInfoArg * at ) {
         char * iter = context->allocateIterator(sizeof(GoodArrayIterator), "array<> iterator", at);
-        if ( !iter ) context->throw_out_of_memory(false, sizeof(GoodArrayIterator)+16, at);
         new (iter) GoodArrayIterator((Array *)&arr, stride, at);
         result = { (Iterator *) iter };
     }
 
     void builtin_make_fixed_array_iterator ( Sequence & result, void * data, int size, int stride, Context * context, LineInfoArg * at ) {
         char * iter = context->allocateIterator(sizeof(FixedArrayIterator), "fixed array iterator", at);
-        if ( !iter ) context->throw_out_of_memory(false, sizeof(FixedArrayIterator)+16, at);
         new (iter) FixedArrayIterator((char *)data, size, stride, at);
         result = { (Iterator *) iter };
     }
 
     void builtin_make_range_iterator ( Sequence & result, range rng, Context * context, LineInfoArg * at ) {
         char * iter = context->allocateIterator(sizeof(RangeIterator<range>), "range iterator", at);
-        if ( !iter ) context->throw_out_of_memory(false, sizeof(RangeIterator<range>)+16, at);
         new (iter) RangeIterator<range>(rng, at);
+        result = { (Iterator *) iter };
+    }
+
+    void builtin_make_urange_iterator ( Sequence & result, urange rng, Context * context, LineInfoArg * at ) {
+        char * iter = context->allocateIterator(sizeof(RangeIterator<urange>), "range iterator", at);
+        new (iter) RangeIterator<urange>(rng, at);
+        result = { (Iterator *) iter };
+    }
+
+    void builtin_make_range64_iterator ( Sequence & result, range64 rng, Context * context, LineInfoArg * at ) {
+        char * iter = context->allocateIterator(sizeof(RangeIterator<range64>), "range64 iterator", at);
+        new (iter) RangeIterator<range64>(rng, at);
+        result = { (Iterator *) iter };
+    }
+
+    void builtin_make_urange64_iterator ( Sequence & result, urange64 rng, Context * context, LineInfoArg * at ) {
+        char * iter = context->allocateIterator(sizeof(RangeIterator<urange64>), "urange64 iterator", at);
+        new (iter) RangeIterator<urange64>(rng, at);
         result = { (Iterator *) iter };
     }
 
@@ -1014,22 +1027,18 @@ namespace das
         switch ( tinfo->type ) {
         case Type::tEnumeration:
             iter = context.allocateIterator(sizeof(EnumIterator<int32_t>), "enum iterator", &call->debugInfo);
-            if ( !iter ) context.throw_out_of_memory(false, sizeof(EnumIterator<int32_t>)+16, &call->debugInfo);
             new (iter) EnumIterator<int32_t>(einfo, &call->debugInfo);
             break;
         case Type::tEnumeration8:
             iter = context.allocateIterator(sizeof(EnumIterator<int8_t>), "enum8 iterator", &call->debugInfo);
-            if ( !iter ) context.throw_out_of_memory(false, sizeof(EnumIterator<int8_t>)+16, &call->debugInfo);
             new (iter) EnumIterator<int8_t>(einfo, &call->debugInfo);
             break;
         case Type::tEnumeration16:
             iter = context.allocateIterator(sizeof(EnumIterator<int16_t>), "enum16 iterator", &call->debugInfo);
-            if ( !iter ) context.throw_out_of_memory(false, sizeof(EnumIterator<int16_t>)+16, &call->debugInfo);
             new (iter) EnumIterator<int16_t>(einfo, &call->debugInfo);
             break;
         case Type::tEnumeration64:
             iter = context.allocateIterator(sizeof(EnumIterator<int64_t>), "enum64 iterator", &call->debugInfo);
-            if ( !iter ) context.throw_out_of_memory(false, sizeof(EnumIterator<int64_t>)+16, &call->debugInfo);
             new (iter) EnumIterator<int64_t>(einfo, &call->debugInfo);
             break;
         default:
@@ -1042,7 +1051,6 @@ namespace das
 
     void builtin_make_string_iterator ( Sequence & result, char * str, Context * context, LineInfoArg * at ) {
         char * iter = context->allocateIterator(sizeof(StringIterator), "string iterator", at);
-        if ( !iter ) context->throw_out_of_memory(false, sizeof(StringIterator)+16, at);
         new (iter) StringIterator(str, at);
         result = { (Iterator *) iter };
     }
@@ -1058,7 +1066,6 @@ namespace das
 
     void builtin_make_nil_iterator ( Sequence & result, Context * context, LineInfoArg * at ) {
         char * iter = context->allocateIterator(sizeof(NilIterator), "nil iterator", at);
-        if ( !iter ) context->throw_out_of_memory(false, sizeof(NilIterator)+16);
         new (iter) NilIterator(at);
         result = { (Iterator *) iter };
     }
@@ -1118,7 +1125,6 @@ namespace das
 
     void builtin_make_lambda_iterator ( Sequence & result, const Lambda lambda, int stride, Context * context, LineInfoArg * at ) {
         char * iter = context->allocateIterator(sizeof(LambdaIterator), "lambda iterator", at);
-        if ( !iter ) context->throw_out_of_memory(false, sizeof(LambdaIterator)+16);
         new (iter) LambdaIterator(*context, lambda, stride, at);
         result = { (Iterator *) iter };
     }
@@ -1358,6 +1364,10 @@ namespace das
     __forceinline void i_das_ptr_set_add_uint64 ( void * & ptr, uint64_t value, int32_t stride ) { ptr = (char*) ptr + value * stride; }
     __forceinline void i_das_ptr_set_sub_uint64 ( void * & ptr, uint64_t value, int32_t stride ) { ptr = (char*) ptr - value * stride; }
 
+    void* builtin_das_aligned_alloc16(uint64_t size) {
+        return das_aligned_alloc16((size_t)size);
+    }
+
     Module_BuiltIn::~Module_BuiltIn() {
         gc0_reset();
     }
@@ -1595,7 +1605,7 @@ namespace das
     }
 
     bool das_aot_enabled ( Context * context, LineInfoArg * at ) {
-        if ( !context->thisProgram ) context->throw_error_at(at, "can only query for jit during compilation");
+        if ( !context->thisProgram ) context->throw_error_at(at, "can only query for aot during compilation");
         return context->thisProgram->policies.aot;
     }
 
@@ -1759,6 +1769,15 @@ namespace das
                 ->args({"iterator","data","size","stride","context","at"});
         addExtern<DAS_BIND_FUN(builtin_make_range_iterator)>(*this, lib,  "_builtin_make_range_iterator",
             SideEffects::modifyArgumentAndExternal, "builtin_make_range_iterator")
+                ->args({"iterator","range","context","at"});
+        addExtern<DAS_BIND_FUN(builtin_make_urange_iterator)>(*this, lib,  "_builtin_make_urange_iterator",
+            SideEffects::modifyArgumentAndExternal, "builtin_make_urange_iterator")
+                ->args({"iterator","range","context","at"});
+        addExtern<DAS_BIND_FUN(builtin_make_range64_iterator)>(*this, lib,  "_builtin_make_range64_iterator",
+            SideEffects::modifyArgumentAndExternal, "builtin_make_range64_iterator")
+                ->args({"iterator","range","context","at"});
+        addExtern<DAS_BIND_FUN(builtin_make_urange64_iterator)>(*this, lib,  "_builtin_make_urange64_iterator",
+            SideEffects::modifyArgumentAndExternal, "builtin_make_urange64_iterator")
                 ->args({"iterator","range","context","at"});
         addExtern<DAS_BIND_FUN(builtin_make_string_iterator)>(*this, lib,  "_builtin_make_string_iterator",
             SideEffects::modifyArgumentAndExternal, "builtin_make_string_iterator")
@@ -2009,8 +2028,8 @@ namespace das
         addExternEx<void(*)(void *,uint4,int32_t),DAS_BIND_FUN(das_memset128u)>(*this, lib, "memset128",
             SideEffects::modifyArgumentAndExternal, "das_memset128u")
                 ->args({"left","value","count"})->unsafeOperation = true;
-        addExtern<DAS_BIND_FUN(das_aligned_alloc16)> (*this, lib, "malloc",
-            SideEffects::modifyExternal, "das_aligned_alloc16")
+        addExtern<DAS_BIND_FUN(builtin_das_aligned_alloc16)> (*this, lib, "malloc",
+            SideEffects::modifyExternal, "builtin_das_aligned_alloc16")
                 ->args({"size"})->unsafeOperation = true;
         addExtern<DAS_BIND_FUN(das_aligned_free16)> (*this, lib, "free",
             SideEffects::modifyExternal, "das_aligned_free16")
@@ -2179,5 +2198,26 @@ namespace das
             SideEffects::none, "das_get_platform_name");
         addExtern<DAS_BIND_FUN(das_get_architecture_name)>(*this, lib, "get_architecture_name",
             SideEffects::none, "das_get_architecture_name");
+        // fmt
+        addExtern<DAS_BIND_FUN(fmt_i8)>(*this, lib, "fmt",
+            SideEffects::none, "fmt_i8")->args({"format","value","context","at"});
+        addExtern<DAS_BIND_FUN(fmt_u8)>(*this, lib, "fmt",
+            SideEffects::none, "fmt_u8")->args({"format","value","context","at"});
+        addExtern<DAS_BIND_FUN(fmt_i16)>(*this, lib, "fmt",
+            SideEffects::none, "fmt_i16")->args({"format","value","context","at"});
+        addExtern<DAS_BIND_FUN(fmt_u16)>(*this, lib, "fmt",
+            SideEffects::none, "fmt_u16")->args({"format","value","context","at"});
+        addExtern<DAS_BIND_FUN(fmt_i32)>(*this, lib, "fmt",
+            SideEffects::none, "fmt_i32")->args({"format","value","context","at"});
+        addExtern<DAS_BIND_FUN(fmt_u32)>(*this, lib, "fmt",
+            SideEffects::none, "fmt_u32")->args({"format","value","context","at"});
+        addExtern<DAS_BIND_FUN(fmt_i64)>(*this, lib, "fmt",
+            SideEffects::none, "fmt_i64")->args({"format","value","context","at"});
+        addExtern<DAS_BIND_FUN(fmt_u64)>(*this, lib, "fmt",
+            SideEffects::none, "fmt_u64")->args({"format","value","context","at"});
+        addExtern<DAS_BIND_FUN(fmt_f)>(*this, lib, "fmt",
+            SideEffects::none, "fmt_f")->args({"format","value","context","at"});
+        addExtern<DAS_BIND_FUN(fmt_d)>(*this, lib, "fmt",
+            SideEffects::none, "fmt_d")->args({"format","value","context","at"});
     }
 }

@@ -15,22 +15,28 @@ das::FileAccessPtr get_file_access( char * pak );//link time resolved dependenci
 TextPrinter tout;
 
 static string projectFile;
+// aot config
 static bool aotMacros = false;
+static bool aotEnabled = false;
+static bool isAotLib = false;
+static string aotResult = "";
+// aot config end
+static bool paranoid_validation = false;
 static bool profilerRequired = false;
 static bool debuggerRequired = false;
 static bool scopedStackAllocator = true;
 static bool pauseAfterErrors = false;
 static bool quiet = false;
-static bool paranoid_validation = false;
 static bool jitEnabled = false;
-static bool isAotLib = false;
+
 static bool version2syntax = true;
 static bool gen2MakeSyntax = false;
 
 static CodeOfPolicies getPolicies() {
     CodeOfPolicies policies;
-    policies.aot = false;
+    policies.aot = aotEnabled;
     policies.aot_module = true;
+    policies.aot_module_path = "";
     if (aotMacros) {
         policies.aot_macros = true;
         policies.export_all = true; // need it for aot to export macros
@@ -270,7 +276,37 @@ int das_aot_main ( int argc, char * argv[] ) {
         cfg.cross_platform = cross_platform;
         compiled = compileStandalone(argv[2], argv[3], cfg);
     } else {
-        compiled = compile(argv[2], argv[3], dryRun, cross_platform);
+        if (argv[2] == string("aot_das_mode")) {
+            auto f = get_file_access(nullptr);
+            const char *src;
+            uint32_t len;
+            f->getFileInfo(argv[3])->getSourceAndLength(src, len);
+            string_view content(src, len);
+            size_t pos = 0;
+            while (pos < content.length()) {
+                size_t end = content.find('\n', pos);
+                string_view line = content.substr(pos, end - pos);
+                pos = (end == string_view::npos) ? content.length() : end + 1;
+
+                if (line.empty()) continue;
+
+                auto mode_end = line.find(' ');
+                auto in_file_end = line.find(' ', mode_end + 1);
+
+                // No need to support contexts. This is temporary.
+                if (line.substr(0, mode_end) != "aot") {
+                    tout << "Uknown mode on line `" << string(line) << "`, skipping.\n";
+                    continue;
+                }
+
+                string in_file(line.substr(mode_end + 1, in_file_end - mode_end - 1));
+                string out_file(line.substr(in_file_end + 1));
+
+                compiled = compile(in_file, out_file, dryRun, cross_platform);
+            }
+        } else {
+            compiled = compile(argv[2], argv[3], dryRun, cross_platform);
+        }
     }
     Module::Shutdown();
     return compiled ? 0 : -1;
@@ -295,6 +331,12 @@ bool compile_and_run ( const string & fn, const string & mainFnName, bool output
         policies.jit_enabled = true;
         policies.jit_module = getDasRoot() + "/daslib/just_in_time.das";
         policies.dll_search_paths.emplace_back(getDasRoot() + "/lib");
+    } else if (aotEnabled) {
+        policies.aot = false;
+        policies.aot_module = true;
+        policies.aot_module_path = getDasRoot() + "/daslib/aot_macro.das";
+        policies.aot_result = aotResult;
+        daScriptEnvironment::getBound()->g_isInAot = true;
     }
     policies.fail_on_no_aot = false;
     policies.fail_on_lack_of_aot_export = false;
@@ -466,6 +508,21 @@ int MAIN_FUNC_NAME ( int argc, char * argv[] ) {
                 gen2MakeSyntax = true;
             } else if ( cmd=="jit") {
                 jitEnabled = true;
+            } else if ( cmd=="aot2") {
+                dryRun = true;
+                aotEnabled = true;
+                if ( i+3 > argc ) {
+                    printf("daslang -aot2 <in_script.das> <out_script.das.cpp>\n");
+                    print_help();
+                    return -1;
+                }
+                files.emplace_back(argv[i + 1]);
+                aotResult = argv[i + 2];
+                i += 2;
+            } else if ( cmd=="aot_lib") {
+                dryRun = true;
+                aotEnabled = true;
+                isAotLib = true;
             } else if ( cmd=="log" ) {
                 outputProgramCode = true;
             } else if ( cmd=="dry-run" ) {
@@ -606,6 +663,11 @@ int MAIN_FUNC_NAME ( int argc, char * argv[] ) {
     }
     // compile and run
     int failedFiles = 0;
+    if (!aotResult.empty() && files.size() > 1) {
+        printf("Aotting more than 1 file is not supported yet.\n");
+        return -1;
+    }
+
     for ( auto & fn : files ) {
         replace(fn, "_dasroot_", getDasRoot());
         if (!compile_and_run(fn, mainName, outputProgramCode, dryRun)) {
