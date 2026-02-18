@@ -314,8 +314,13 @@ namespace das
 
     struct FinalizeFunctionAnnotation : MarkFunctionAnnotation {
         FinalizeFunctionAnnotation() : MarkFunctionAnnotation("finalize") { }
-        virtual bool apply(const FunctionPtr & func, ModuleGroup &, const AnnotationArgumentList &, string &) override {
+        virtual bool apply(const FunctionPtr & func, ModuleGroup &, const AnnotationArgumentList & args, string &) override {
             func->shutdown = true;
+            for ( auto & arg : args ) {
+                if ( arg.name=="late" && arg.type == Type::tBool ) {
+                    func->lateShutdown = arg.bValue;
+                }
+            }
             return true;
         };
         virtual bool finalize(const FunctionPtr & func, ModuleGroup &, const AnnotationArgumentList &, const AnnotationArgumentList &, string & errors) override {
@@ -1258,6 +1263,10 @@ namespace das
 
     }
 
+    DAS_API uint64_t get_context_share_counter ( Context * context ) {
+        return (uint64_t) context->code.use_count();
+    }
+
     bool is_compiling_macros ( ) {
         if ( daScriptEnvironment::getBound() && daScriptEnvironment::getBound()->g_Program ) {
             return daScriptEnvironment::getBound()->g_Program->isCompilingMacros;
@@ -1568,7 +1577,7 @@ namespace das
 
     bool das_jit_enabled ( Context * context, LineInfoArg * at ) {
         if ( !context->thisProgram ) context->throw_error_at(at, "can only query for jit during compilation");
-        return context->thisProgram->policies.jit;
+        return context->thisProgram->policies.jit_enabled;
     }
 
     bool das_aot_enabled ( Context * context, LineInfoArg * at ) {
@@ -1662,6 +1671,9 @@ namespace das
                 ->args({"name"});
         addExtern<DAS_BIND_FUN(is_reporting_compilation_errors)>(*this, lib, "is_reporting_compilation_errors",
             SideEffects::accessExternal, "is_reporting_compilation_errors");
+        addExtern<DAS_BIND_FUN(get_context_share_counter)>(*this, lib, "get_context_share_counter",
+            SideEffects::accessExternal, "get_context_share_counter")
+                ->arg("context");
         // iterator functions
         addExtern<DAS_BIND_FUN(builtin_iterator_first)>(*this, lib, "_builtin_iterator_first",
             SideEffects::modifyArgumentAndExternal, "builtin_iterator_first")

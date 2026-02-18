@@ -48,14 +48,16 @@ namespace das {
         }
     }
 
-    bool das_instrument_jit ( void * pfun, const Func func, Context & context ) {
+    bool das_instrument_jit ( void * pfun, const Func func, const LineInfo & lineInfo, Context & context ) {
+
         auto simfn = func.PTR;
         if ( !simfn ) return false;
         if ( simfn->code && simfn->code->rtti_node_isJit() ) {
             auto jitNode = static_cast<SimNode_Jit *>(simfn->code);
             jitNode->func = (JitFunction) pfun;
+            jitNode->debugInfo = lineInfo;
         } else {
-            auto node = context.code->makeNode<SimNode_Jit>(LineInfo(), (JitFunction)pfun);
+            auto node = context.code->makeNode<SimNode_Jit>(lineInfo, (JitFunction)pfun);
             node->saved_code = simfn->code;
             node->saved_aot = simfn->aot;
             node->saved_aot_function = simfn->aotFunction;
@@ -133,7 +135,8 @@ extern "C" {
         return ptr;
     }
 
-    DAS_API void * jit_alloc_persistent ( uint32_t bytes, Context * ) {
+    DAS_API void * jit_alloc_persistent ( uint32_t bytes, Context * context ) {
+        if ( !bytes ) context->throw_out_of_memory(false, bytes);
         return das_aligned_alloc16(bytes);
     }
 
@@ -282,6 +285,10 @@ extern "C" {
         fileInfoPtr->name = filename;
     }
 
+    DAS_API void jit_free_fileinfo ( void * dummy ) {
+        reinterpret_cast<FileInfo*>(dummy)->~FileInfo();
+    }
+
     DAS_API void * jit_ast_typedecl ( uint64_t hash, Context * context, LineInfoArg * at ) {
         if ( !context->thisProgram ) context->throw_error_at(at, "can't get ast_typeinfo, no program. is 'options rtti' missing?");
         auto ti = context->thisProgram->astTypeInfo.find(hash);
@@ -324,6 +331,7 @@ extern "C" {
     void *das_get_jit_debug_exit() { return (void *)&jit_debug_exit; }
     void *das_get_jit_debug_line() { return (void *)&jit_debug_line; }
     void *das_get_jit_initialize_fileinfo () { return (void*)&jit_initialize_fileinfo; }
+    void *das_get_jit_free_fileinfo () { return (void*)&jit_free_fileinfo; }
     void *das_get_jit_ast_typedecl () { return (void*)&jit_ast_typedecl; }
 
     template <typename KeyType>
@@ -394,12 +402,45 @@ extern "C" {
     }
 
 #if (defined(_MSC_VER) || defined(__linux__) || defined(__APPLE__)) && !defined(_GAMING_XBOX) && !defined(_DURANGO)
-    void create_shared_library ( const char * objFilePath, const char * libraryName, [[maybe_unused]] const char * jitModuleObj ) {
+    void create_shared_library ( const char * objFilePath, const char * libraryName, [[maybe_unused]] const char * dasSharedLibrary, const char * customLinker ) {
         char cmd[1024];
+        string linker;
+        string dasLibrary;
+        const bool isLinkerMissing = customLinker == nullptr || strlen(customLinker) == 0;
+        const bool isLibraryMissing = dasSharedLibrary == nullptr || strlen(dasSharedLibrary) == 0;
+        if (isLinkerMissing || isLibraryMissing) {
+            #if defined(_WIN32) || defined(_WIN64)
+                const auto path = get_prefix(getExecutableFileName());
+                const auto winCfg = path.substr(path.find_last_of("\\/"));
+                const auto windowsConfig = (winCfg == "bin" ? "" : (winCfg + "/"));
+                if (isLinkerMissing) {
+                    linker = getDasRoot() + "/bin/" + windowsConfig + "clang-cl.exe";
+                }
+                if (isLibraryMissing) {
+                    dasLibrary = getDasRoot() + "/lib/" + windowsConfig + "libDaScript.lib";
+                }
+            #else
+                if (isLinkerMissing) {
+                    linker = "cc";
+                }
+                #if defined(__APPLE__)
+                if (isLibraryMissing) {
+                    dasLibrary = getDasRoot() + "/lib/liblibDaScript.dylib";
+                }
+                #else
+                if (isLibraryMissing) {
+                    dasLibrary = getDasRoot() + "/lib/liblibDaScript.lib";
+                }
+                #endif
+            #endif
+        } else {
+            linker = customLinker;
+            dasLibrary = dasSharedLibrary;
+        }
 
-        #if defined(_WIN32) || defined(_WIN64)
-        if (!check_file_present(jitModuleObj)) {
-            LOG(LogLevel::error) << "File '" << jitModuleObj << "' , containing daScript library, does not exist\n";
+        #if defined(_WIN32) || defined(_WIN64) || defined(__APPLE__)
+        if (!check_file_present(dasLibrary.c_str())) {
+            LOG(LogLevel::error) << "File '" << dasLibrary << "' , containing daScript library, does not exist\n";
             return;
         }
         #endif
@@ -409,11 +450,11 @@ extern "C" {
         }
 
         #if defined(_WIN32) || defined(_WIN64)
-            auto result = fmt::format_to(cmd, FMT_STRING("clang-cl {} {} msvcrt.lib -link -DLL -OUT:{} 2>&1"), objFilePath, jitModuleObj, libraryName);
+            auto result = fmt::format_to(cmd, FMT_STRING("{} {} {} msvcrt.lib -link -DLL -OUT:{} 2>&1"), linker, objFilePath, dasLibrary, libraryName);
         #elif defined(__APPLE__)
-            auto result = fmt::format_to(cmd, FMT_STRING("clang -shared -o {} {} 2>&1"), libraryName, objFilePath);
+            auto result = fmt::format_to(cmd, FMT_STRING("{} -shared -o {} {} {} 2>&1"), linker, libraryName, dasLibrary, objFilePath);
         #else
-            auto result = fmt::format_to(cmd, FMT_STRING("gcc -shared -o {} {} 2>&1"), libraryName, objFilePath);
+            auto result = fmt::format_to(cmd, FMT_STRING("{} -shared -o {} {} 2>&1"), linker, libraryName, objFilePath);
         #endif
             *result = '\0';
 
@@ -455,7 +496,7 @@ extern "C" {
         }
     }
 #else
-    void create_shared_library ( const char * , const char * , const char *  ) { }
+    void create_shared_library ( const char * , const char * , const char *, const char * ) { }
 #endif
 
     class Module_Jit : public Module {
@@ -471,7 +512,7 @@ extern "C" {
                     ->args({"code","arguments","cmres","context"})->unsafeOperation = true;
             addExtern<DAS_BIND_FUN(das_instrument_jit)>(*this, lib, "instrument_jit",
                 SideEffects::worstDefault, "das_instrument_jit")
-                    ->args({"code","function","context"})->unsafeOperation = true;
+                    ->args({"code","function","at", "context"})->unsafeOperation = true;
             addExtern<DAS_BIND_FUN(das_remove_jit)>(*this, lib, "remove_jit",
                 SideEffects::worstDefault, "das_remove_jit")
                     ->args({"function"})->unsafeOperation = true;
@@ -564,6 +605,8 @@ extern "C" {
                 SideEffects::none, "das_get_jit_debug_line");
             addExtern<DAS_BIND_FUN(das_get_jit_initialize_fileinfo)>(*this, lib,  "get_jit_initialize_fileinfo",
                 SideEffects::none, "das_get_jit_initialize_fileinfo");
+            addExtern<DAS_BIND_FUN(das_get_jit_free_fileinfo)>(*this, lib,  "get_jit_free_fileinfo",
+                SideEffects::none, "das_get_jit_free_fileinfo");
             addExtern<DAS_BIND_FUN(das_recreate_fileinfo_name)>(*this, lib,  "recreate_fileinfo_name",
                 SideEffects::worstDefault, "das_recreate_fileinfo_name");
             addExtern<DAS_BIND_FUN(loadDynamicLibrary)>(*this, lib,  "load_dynamic_library",
@@ -577,9 +620,7 @@ extern "C" {
                     ->args({"library"});
             addExtern<DAS_BIND_FUN(create_shared_library)>(*this, lib,  "create_shared_library",
                 SideEffects::worstDefault, "create_shared_library")
-                    ->args({"objFilePath","libraryName","jitModuleObj"});
-            addExtern<DAS_BIND_FUN(jit_initialize_fileinfo)>(*this, lib,  "jit_initialize_fileinfo",
-                SideEffects::worstDefault, "jit_initialize_fileinfo");
+                    ->args({"objFilePath","libraryName","dasSharedLibrary","customLinker"});
             addConstant<uint32_t>(*this, "SIZE_OF_PROLOGUE", uint32_t(sizeof(Prologue)));
             addConstant<uint32_t>(*this, "CONTEXT_OFFSET_OF_EVAL_TOP", uint32_t(uint32_t(offsetof(Context, stack) + offsetof(StackAllocator, evalTop))));
             addConstant<uint32_t>(*this, "CONTEXT_OFFSET_OF_GLOBALS", uint32_t(uint32_t(offsetof(Context, globals))));

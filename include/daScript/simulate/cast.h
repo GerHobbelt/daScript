@@ -3,7 +3,7 @@
 #include "daScript/misc/vectypes.h"
 #include "daScript/misc/arraytype.h"
 #include "daScript/misc/rangetype.h"
-#include <limits.h> // ULLONG_MAX
+#include <limits.h> // ULONG_MAX
 
 namespace das
 {
@@ -13,16 +13,17 @@ namespace das
     template <typename TT> struct WrapRetType { typedef TT type; };
 
     // gcc fails to deduce auto field type. We should manually add it
+    // NO_ASAN_INLINE should be removed once vecmath adds it to the vec3->vec4 conversions.
     template <typename T, typename Element, Element T::*BaseField = &T::x>
     struct WrapVec2Arg : T {
         WrapVec2Arg(vec4f t) : T(vec_extract<Element>::x(t), vec_extract<Element>::y(t)) {}
-        operator vec4f() const { return das::vec_loadu(&(this->*BaseField)); }
+        NO_ASAN_INLINE operator vec4f() const { return das::vec_loadu(&(this->*BaseField)); }
     };
 
     template <typename T, typename Element, Element T::*BaseField = &T::x>
     struct WrapVec3Arg : T {
         WrapVec3Arg(vec4f t) : T(vec_extract<Element>::x(t), vec_extract<Element>::y(t), vec_extract<Element>::z(t)) {}
-        operator vec4f() const { return das::vec_loadu(&(this->*BaseField)); }
+        NO_ASAN_INLINE operator vec4f() const { return das::vec_loadu(&(this->*BaseField)); }
     };
 
     template <typename T, typename Element, Element T::*BaseField = &T::x>
@@ -338,7 +339,7 @@ namespace das
         static __forceinline vec4f from ( uint64_t x )         { return v_cast_vec4f(v_ldui_half(&x)); }
     };
 
-#if !defined(_MSC_VER) && !defined(__APPLE__) && !defined(_EMSCRIPTEN_VER) && defined(ULLONG_MAX) && ULLONG_MAX == 0xffffffffffffffffULL
+#if !defined(_MSC_VER) && !defined(__APPLE__) && !defined(_EMSCRIPTEN_VER) && defined(ULONG_MAX) && ULONG_MAX == UINT64_MAX
     template <>
     struct cast <long long int> {
         static __forceinline long long int to ( vec4f x )            { return v_extract_xi64(v_cast_vec4i(x)); }

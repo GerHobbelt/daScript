@@ -1153,7 +1153,7 @@ namespace das
     void Context::allocateGlobalsAndShared() {
         freeGlobalsAndShared();
         globals = globalsSize ? (char *) das_aligned_alloc16(globalsSize) : nullptr;
-        shared = sharedOwner ? (char *) das_aligned_alloc16(sharedSize) : nullptr;
+        shared = (sharedOwner && sharedSize) ? (char *) das_aligned_alloc16(sharedSize) : nullptr;
         globalsOwner = true;
         sharedOwner = true;
     }
@@ -1213,7 +1213,7 @@ namespace das
         globalVariables = ctx.globalVariables;
         totalVariables = ctx.totalVariables;
         if ( ctx.globals ) {
-            globals = (char *) das_aligned_alloc16(globalsSize);
+            globals = (char *) (globalsSize ? das_aligned_alloc16(globalsSize) : nullptr);
         }
         // shared
         sharedSize = ctx.sharedSize;
@@ -1470,11 +1470,22 @@ namespace das
         StackAllocator init_stack(ssz);
         SharedStackGuard guard(*this, init_stack);
         return runWithCatch([&](){
+            vector<SimFunction *> lateShutdown;
             for ( int j=0, js=totalFunctions; j!=js && !stopFlags; ++j ) {
                 auto & pf = functions[j];
                 DAS_ASSERTF(pf.debugInfo, "Missing debug info for %s", pf.name);
                 if ( pf.debugInfo->flags & FuncInfo::flag_shutdown ) {
-                    callOrFastcall(&pf, nullptr, 0);
+                    if ( pf.debugInfo->flags & FuncInfo::flag_late_shutdown ) {
+                        lateShutdown.push_back(&pf);
+                    } else {
+                        callOrFastcall(&pf, nullptr, 0);
+                    }
+                }
+            }
+            if ( !stopFlags && !lateShutdown.empty() ) {
+                for ( auto pf : lateShutdown ) {
+                    callOrFastcall(pf, nullptr, 0);
+                    if ( stopFlags ) break;
                 }
             }
         });
