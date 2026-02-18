@@ -8,6 +8,7 @@
 namespace das
 {
     template <typename TT> struct WrapType { enum { value = false }; typedef TT type; typedef TT rettype; };
+    template <typename TT> struct JitConstRefByValue { enum { value = false }; };
     template <typename TT> struct WrapArgType { typedef TT type; };
     template <typename TT> struct WrapRetType { typedef TT type; };
 
@@ -250,6 +251,24 @@ namespace das
         static __forceinline vec4f from ( Bitfield x )         { return v_cast_vec4f(v_seti_x(x.value)); }
     };
 
+
+    template <>
+    struct cast <Bitfield8> {
+        static __forceinline Bitfield8 to ( vec4f x )           { return v_extract_xi(v_cast_vec4i(x)); }
+        static __forceinline vec4f from ( Bitfield8 x )         { return v_cast_vec4f(v_seti_x(x.value)); }
+    };
+
+    template <>
+    struct cast <Bitfield16> {
+        static __forceinline Bitfield16 to ( vec4f x )           { return v_extract_xi(v_cast_vec4i(x)); }
+        static __forceinline vec4f from ( Bitfield16 x )         { return v_cast_vec4f(v_seti_x(x.value)); }
+    };
+
+    template <>
+    struct cast <Bitfield64> {
+        static __forceinline Bitfield64 to ( vec4f x )           { return v_extract_xi64(v_cast_vec4i(x)); }
+        static __forceinline vec4f from ( Bitfield64 x )         { return v_cast_vec4f(v_ldui_half(&x)); }
+    };
 
     template <>
     struct cast <int64_t> {

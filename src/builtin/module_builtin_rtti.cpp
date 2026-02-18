@@ -995,6 +995,7 @@ namespace das {
             case Type::tBitfield:
             case Type::tUInt:   def.index = RttiUint32; break;
             case Type::tInt64:  def.index = RttiInt64; break;
+            case Type::tBitfield64:
             case Type::tUInt64: def.index = RttiUint64; break;
             case Type::tFloat:  def.index = RttiFloat; break;
             case Type::tDouble: def.index = RttiDouble; break;
@@ -1021,6 +1022,7 @@ namespace das {
         DebugInfoHelper helper;
         helper.rtti = true;
         module->structures.foreach([&](auto structPtr){
+            if ( structPtr->isTemplate ) return;
             StructInfo * info = helper.makeStructureDebugInfo(*structPtr);
             vec4f args[1] = {
                 cast<StructInfo *>::from(info)
@@ -1046,6 +1048,7 @@ namespace das {
         DebugInfoHelper helper;
         helper.rtti = true;
         module->functions.foreach([&](auto funcPtr){
+            if ( funcPtr->isTemplate ) return;
             FuncInfo * info = helper.makeFunctionDebugInfo(*funcPtr);
             vec4f args[1] = {
                 cast<FuncInfo *>::from(info)
@@ -1380,6 +1383,9 @@ namespace das {
             case Type::tEnumeration16:  return tableFindValue<int16_t>     (tab,key,valueTypeSize,context);
             case Type::tEnumeration64:  return tableFindValue<int64_t>     (tab,key,valueTypeSize,context);
             case Type::tBitfield:       return tableFindValue<Bitfield>    (tab,key,valueTypeSize,context);
+            case Type::tBitfield8:      return tableFindValue<uint8_t>     (tab,key,valueTypeSize,context);
+            case Type::tBitfield16:     return tableFindValue<uint16_t>    (tab,key,valueTypeSize,context);
+            case Type::tBitfield64:     return tableFindValue<uint64_t>    (tab,key,valueTypeSize,context);
             case Type::tInt:            return tableFindValue<int32_t>     (tab,key,valueTypeSize,context);
             case Type::tInt2:           return tableFindValue<int2>        (tab,key,valueTypeSize,context);
             case Type::tInt3:           return tableFindValue<int3>        (tab,key,valueTypeSize,context);

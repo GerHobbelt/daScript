@@ -1,14 +1,30 @@
-require daslib/linq_boost
+options gen2
 
-[export]
-def main() {
-    let arr = [1, 2, 3, 4, 5]
-    var qarray = to_table(
-        arr,
-        $(x : int) => x,
-        $(x : int) => x * 10
-    )
+require t_counter
 
+[unused_argument(dummy)]
+def take_counter(foo : $counter(type<auto(TT)>); dummy : TT = type<TT>)  {
+    /// this one uses dummy variable to force TT to be deduced
+    print("counter TT is {typeinfo typename(type<TT>)}\n")
 }
 
-options log
+def take_another_counter(foo : $counter(type<auto(TT)>)) : TT {
+    // this one uses result to force TT to be deduced
+    print("another counter TT is {typeinfo typename(type<TT>)}\n")
+    return default<TT>
+}
+
+typedef IntCounter = $counter(type<int>)
+
+def take_int_counter(var foo : IntCounter) {
+    foo.next()
+    print("int counter value is {foo.value()}\n")
+}
+
+[export]
+def main {
+    var foo = IntCounter()
+    take_int_counter(foo)
+    take_counter(foo)
+    take_another_counter(default< $counter(type<float>) >)
+}

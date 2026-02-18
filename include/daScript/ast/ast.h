@@ -334,6 +334,7 @@ namespace das
         uint64_t getMangledNameHash() const;
         static uint64_t getMNHash(const string &mangledName);
         bool isAccessUnused() const;
+        bool isAccessDummy() const;
         bool isCtorInitialized() const;
         void serialize ( AstSerializer & ser );
         string          name;
@@ -369,6 +370,7 @@ namespace das
                 bool    early_out : 1;              // this variable is potentially uninitialized in the finally section
                 bool    used_in_finally : 1;        // this variable is used in the finally section
                 bool    static_class_member : 1;    // this is a static class member
+                bool    bitfield_constant : 1;      // this is a bitfield constant
             };
             uint32_t flags = 0;
         };
@@ -1742,7 +1744,8 @@ namespace das
                           TextWriter * log,
                           int tab,
                           bool allowPromoted,
-                          int32_t line = 0 );
+                          const string & reqNameHint = "",
+                          int32_t reqLineHint = 0 );
 
     void getAllRequireReq ( FileInfo * fi, const FileAccessPtr & access, das::string &modName, vector<RequireRecord> & req, vector<FileInfo *> & chain, das_set<FileInfo *> & collected );
 

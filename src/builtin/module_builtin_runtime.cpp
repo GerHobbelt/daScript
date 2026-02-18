@@ -1067,6 +1067,8 @@ namespace das
             if (!simFunc) context.throw_error("invoke null function");
             aotFunc = (lambdaFunc) simFunc->aotFunction;
         }
+
+        DAS_SUPPRESS_UB
         __forceinline bool InvokeLambda ( Context & context, char * ptr ) {
             if ( aotFunc ) {
                 return (*aotFunc) ( &context, lambda.capture, ptr );
@@ -2095,6 +2097,15 @@ namespace das
         // bitfield
         addExtern<DAS_BIND_FUN(__bit_set)>(*this, lib, "__bit_set",
             SideEffects::modifyArgument, "__bit_set")
+                ->args({"value","mask","on"});
+        addExtern<DAS_BIND_FUN(__bit_set8)>(*this, lib, "__bit_set",
+            SideEffects::modifyArgument, "__bit_set8")
+                ->args({"value","mask","on"});
+        addExtern<DAS_BIND_FUN(__bit_set16)>(*this, lib, "__bit_set",
+            SideEffects::modifyArgument, "__bit_set16")
+                ->args({"value","mask","on"});
+        addExtern<DAS_BIND_FUN(__bit_set64)>(*this, lib, "__bit_set",
+            SideEffects::modifyArgument, "__bit_set64")
                 ->args({"value","mask","on"});
     }
 }

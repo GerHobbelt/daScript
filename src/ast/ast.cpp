@@ -580,6 +580,10 @@ namespace das {
         return !(access_get || access_init || access_pass || access_ref);
     }
 
+    bool Variable::isAccessDummy() const {
+        return !(access_get || access_pass || access_ref);
+    }
+
     bool Variable::isCtorInitialized() const {
         if ( !init ) {
             return false;
@@ -1190,7 +1194,7 @@ namespace das {
 
     ExpressionPtr ExprConstBitfield::clone( const ExpressionPtr & expr ) const {
         auto cexpr = clonePtr<ExprConstBitfield>(expr);
-        ExprConstT<uint32_t,ExprConstBitfield>::clone(cexpr);
+        ExprConstT<uint64_t,ExprConstBitfield>::clone(cexpr);
         if ( bitfieldType ) {
             cexpr->bitfieldType = make_smart<TypeDecl>(*bitfieldType);
         }
@@ -3075,6 +3079,9 @@ namespace das {
         case Type::tInt:        return static_pointer_cast<ExprConstInt>(expr)->getValue();
         case Type::tUInt:       return static_pointer_cast<ExprConstUInt>(expr)->getValue();
         case Type::tBitfield:   return static_pointer_cast<ExprConstBitfield>(expr)->getValue();
+        case Type::tBitfield8:  return static_pointer_cast<ExprConstBitfield>(expr)->getValue();
+        case Type::tBitfield16: return static_pointer_cast<ExprConstBitfield>(expr)->getValue();
+        case Type::tBitfield64: return static_pointer_cast<ExprConstBitfield>(expr)->getValue();
         case Type::tInt64:      return static_pointer_cast<ExprConstInt64>(expr)->getValue();
         case Type::tUInt64:     return static_pointer_cast<ExprConstUInt64>(expr)->getValue();
         default:
@@ -3101,6 +3108,9 @@ namespace das {
             case Type::tUInt64:         return make_smart<ExprConstUInt64>(at, cast<uint64_t>::to(value));
             case Type::tUInt:           return make_smart<ExprConstUInt>(at, cast<uint32_t>::to(value));
             case Type::tBitfield:       return make_smart<ExprConstBitfield>(at, cast<uint32_t>::to(value));
+            case Type::tBitfield8:      return make_smart<ExprConstBitfield>(at, cast<uint8_t>::to(value));
+            case Type::tBitfield16:     return make_smart<ExprConstBitfield>(at, cast<uint16_t>::to(value));
+            case Type::tBitfield64:     return make_smart<ExprConstBitfield>(at, cast<uint64_t>::to(value));
             case Type::tUInt2:          return make_smart<ExprConstUInt2>(at, cast<uint2>::to(value));
             case Type::tUInt3:          return make_smart<ExprConstUInt3>(at, cast<uint3>::to(value));
             case Type::tUInt4:          return make_smart<ExprConstUInt4>(at, cast<uint4>::to(value));
@@ -3200,7 +3210,7 @@ namespace das {
             vis.preVisit(alsv.get());
             auto alssv = alsv->visit(vis);
             if ( alssv ) alssv = vis.visit(alssv.get());
-            if ( alssv ) alsv = vis.visitAlias(alssv.get(), alssv->alias);
+            if ( alssv ) alssv = vis.visitAlias(alssv.get(), alssv->alias);
             if ( alssv!=alsv ) {
                 thatModule->aliasTypes.replace(alssv->alias, alssv);
                 alsv = alssv;

@@ -93,6 +93,16 @@ namespace das {
         return pCall;
     }
 
+    void deleteNameExprList ( vector<tuple<string,Expression *>> * list ) {
+        if ( !list ) return;
+        for ( auto & p : *list ) {
+            if ( get<1>(p) ) {
+                delete get<1>(p);
+            }
+        }
+        delete list;
+    }
+
     void deleteTypeDeclarationList ( vector<Expression *> * list ) {
         if ( !list ) return;
         for ( auto pD : *list )
@@ -518,6 +528,20 @@ namespace das {
         deleteVariableDeclarationList(list);
     }
 
+    void ast_globalBitfieldConst ( yyscan_t scanner, const TypeDeclPtr & bType, bool pub_var, const string & name, Expression * expr ) {
+        auto pVar = make_smart<Variable>();
+        pVar->name = "`" + bType->alias + "`" + name;
+        pVar->type = make_smart<TypeDecl>(*bType);
+        pVar->type->constant = true;
+        pVar->init = expr;
+        pVar->private_variable = !pub_var;
+        pVar->bitfield_constant = true;
+        if ( !yyextra->g_Program->addVariable(pVar) ) {
+            das_yyerror(scanner,"global bitfield constant is already declared " + name,expr->at,
+                CompilationError::global_variable_already_declared);
+        }
+    }
+
     void ast_globalLet ( yyscan_t scanner, bool kwd_let, bool glob_shar, bool pub_var,
         AnnotationArgumentList * ann, VariableDeclaration * decl ) {
         auto pDecl = decl;
@@ -779,7 +803,7 @@ namespace das {
                 if ( bit!=-1 ) {
                     auto td = make_smart<TypeDecl>(*alias);
                     td->ref = false;
-                    auto bitConst = new ExprConstBitfield(eniAt, 1u << bit);
+                    auto bitConst = new ExprConstBitfield(eniAt, 1ull << uint64_t(bit));
                     bitConst->bitfieldType = make_smart<TypeDecl>(*alias);
                     resConst = bitConst;
                 } else {

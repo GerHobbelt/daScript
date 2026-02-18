@@ -621,7 +621,7 @@ namespace das {
                     resT->explicitConst = (resT->explicitConst || decl->explicitConst);
                     resT->dim = decl->dim;
                     resT->aotAlias = false;
-                    resT->alias.clear();
+                    // resT->alias.clear(); // this may speed things up, but it breaks typemacro-based aliases
                     return resT;
                 } else {
                     return decl;
@@ -838,6 +838,7 @@ namespace das {
             getSearchModule(moduleName);
             program->library.foreach([&](Module * mod) -> bool {
                 mod->functions.foreach([&](const FunctionPtr & fn) -> bool {
+                    if ( fn->isTemplate ) return true;
                     if ( isCloseEnoughName(fn->name,funcName,identicalName) ) {
                         isCloseEnoughName(fn->name,funcName,identicalName);
                         result.push_back(fn.get());
@@ -2018,6 +2019,9 @@ namespace das {
             case Type::tInt:        nextV = cast<int32_t> ::from(int32_t (nextInt)); break;
             case Type::tUInt:       nextV = cast<uint32_t>::from(uint32_t(nextInt)); break;
             case Type::tBitfield:   nextV = cast<uint32_t>::from(uint32_t(nextInt)); break;
+            case Type::tBitfield8:  nextV = cast<uint8_t>::from(uint8_t(nextInt)); break;
+            case Type::tBitfield16: nextV = cast<uint16_t>::from(uint16_t(nextInt)); break;
+            case Type::tBitfield64: nextV = cast<uint64_t>::from(uint64_t(nextInt)); break;
             case Type::tInt64:      nextV = cast<int64_t> ::from(int64_t (nextInt)); break;
             case Type::tUInt64:     nextV = cast<uint64_t>::from(uint64_t(nextInt)); break;
             default: DAS_ASSERTF(0,"we should not be here. unsupported enum type");
@@ -2649,13 +2653,14 @@ namespace das {
                         c->at, CompilationError::invalid_enumeration);
                     c->type.reset();
                 }
-            } else if ( c->baseType==Type::tBitfield ) {
+            } else if ( c->baseType==Type::tBitfield || c->baseType==Type::tBitfield8 ||
+                        c->baseType==Type::tBitfield16 || c->baseType==Type::tBitfield64 ) {
                 auto cB = static_cast<ExprConstBitfield *>(c);
                 if ( cB->bitfieldType ) {
                     TypeDecl::clone(c->type,cB->bitfieldType);
                     c->type->ref = false;
                 } else {
-                    c->type = make_smart<TypeDecl>(Type::tBitfield);
+                    c->type = make_smart<TypeDecl>(c->baseType);
                 }
                 c->type->constant = isConstantType(c);
             } else if ( c->baseType==Type::tPointer ) {
@@ -4050,7 +4055,7 @@ namespace das {
                 allowMissingTypeExpr = true;
             }
             bool allowMissingType = false;
-            if ( expr->trait=="builtin_annotation_exists" ) {
+            if ( expr->trait=="builtin_annotation_exists" || expr->trait=="ast_typedecl" ) {
                 allowMissingType = true;
             }
             //
@@ -5092,7 +5097,11 @@ namespace das {
                         expr->initializer = false;
                         reportAstChanged();
                     }
-                    error("'" + describeType(expr->type->firstType) + "' does not have default initializer", "", "",
+                    string extraError;
+                    if ( func ) {
+                        extraError = "while compiling function " + func->describe();
+                    }
+                    error("'" + describeType(expr->type->firstType) + "' does not have default initializer", extraError, "",
                         expr->at, CompilationError::invalid_new_type);
                 }
             }
@@ -5835,6 +5844,7 @@ namespace das {
                     return Visitor::visit(expr);
                 }
                 if ( possibleEnums.size()==1 ) {
+                    reportAstChanged();
                     auto td = make_smart<TypeDecl>(possibleEnums.back());
                     td->constant = true;
                     auto res = make_smart<ExprConstEnumeration>(expr->at, expr->name, td);
@@ -5846,16 +5856,58 @@ namespace das {
                     auto alias = possibleBitfields.back();
                     int bit = alias->findArgumentIndex(expr->name);
                     if ( bit!=-1 ) {
+                        reportAstChanged();
                         auto td = make_smart<TypeDecl>(*alias);
                         td->ref = false;
-                        auto bitConst = new ExprConstBitfield(expr->at, 1u << bit);
+                        auto bitConst = new ExprConstBitfield(expr->at, 1ull << uint64_t(bit));
                         bitConst->bitfieldType = make_smart<TypeDecl>(*alias);
                         bitConst->type = td;
                         return bitConst;
                     } else {
-                        error("bitfield '" + expr->name + "' not found in " + describeType(alias), "", "",
-                            expr->at, CompilationError::cant_get_field);
-                        return Visitor::visit(expr);
+                        auto varName = "`"+enumName+"`"+expr->name;
+                        auto vars = findMatchingVar(varName, false);
+                        if ( vars.size() ) {
+                            Variable * found = nullptr;
+                            int foundCount = 0;
+                            for ( auto v : vars ) {
+                                if ( v->bitfield_constant ) {
+                                    found = v.get();
+                                    foundCount++;
+                                }
+                            }
+                            if ( foundCount == 1 ) {
+                                if ( !found->init ) {
+                                    error("bitfield constant '" + expr->name + "' of type " + describeType(alias)
+                                        + " is not initialized", "", "",
+                                        expr->at, CompilationError::cant_get_field);
+                                } else if ( !found->init->type || !found->init->type->constant || !found->init->type->isBitfield() ) {
+                                    error("not a valid bitfield constant " + expr->name + " of type " + describeType(found->type), "", "",
+                                        expr->at, CompilationError::cant_get_field);
+                                    return Visitor::visit(expr);
+                                }
+                                reportAstChanged();
+                                return found->init->clone();
+                            } else {
+                                TextWriter tw;
+                                if ( verbose ) {
+                                    tw << "possible bitfield constants:\n";
+                                    for ( auto v : vars ) {
+                                        if ( v->bitfield_constant ) {
+                                            tw << "\t" << (v->module->name.empty() ? "_" : v->module->name) << "::" << v->name << "\n";
+                                        }
+                                    }
+                                }
+                                error("bitfield constant '" + expr->name + "' of type " + describeType(alias)
+                                    + " is ambiguous", tw.str(), "",
+                                    expr->at, CompilationError::cant_get_field);
+                                return Visitor::visit(expr);
+                            }
+
+                        } else {
+                            error("bitfield '" + expr->name + "' not found in " + describeType(alias), "", "",
+                                expr->at, CompilationError::cant_get_field);
+                            return Visitor::visit(expr);
+                        }
                     }
                 } else {
                     if ( verbose ) {
@@ -6264,7 +6316,6 @@ namespace das {
                 TypeDecl::clone(expr->type,var->type);
                 expr->type->ref = true;
                 return Visitor::visit(expr);
-
             } else if ( vars.size()==0 ) {
                 if ( verbose ) {
                     vars = findMatchingVar(expr->name, true);
@@ -6848,7 +6899,7 @@ namespace das {
                             auto fidx = efield->value->type->bitFieldIndex(efield->name);
                             if ( fidx != -1 ) {
                                 reportAstChanged();
-                                auto mask = make_smart<ExprConstBitfield>(efield->at,1u<<fidx);
+                                auto mask = make_smart<ExprConstBitfield>(efield->at,1ul<<fidx);
                                 mask->bitfieldType = make_smart<TypeDecl>(*efield->value->type);
                                 auto call = make_smart<ExprCall>(efield->at, "__bit_set");
                                 call->arguments.push_back(value->clone());
@@ -7856,6 +7907,11 @@ namespace das {
                                     return Visitor::visitLet(expr,var,last);
                                 }
 
+                            } else if ( scopes.back()->isLambdaBlock ) {
+                                var->inScope = false;
+                                error("internal error. in-scope variable in lambda gets converted as part of the lambda function", "", "",
+                                    var->at, CompilationError::invalid_variable_type);
+                                return Visitor::visitLet(expr,var,last);
                             } else {
                                 scopes.back()->finalList.insert(scopes.back()->finalList.begin(), exprDel);
                             }
@@ -8912,9 +8968,11 @@ namespace das {
                         }
                         // we build alias map for the generic
                         AliasMap aliases;
+                        bool aliasMapUpdated = false;
                         program->updateAliasMapCallback = [&](const TypeDeclPtr & argType, const TypeDeclPtr & passType) {
                             OptionsMap options;
                             TypeDecl::updateAliasMap(argType, passType, aliases, options);
+                            aliasMapUpdated = true;
                         };
                         vector<bool> defaultRef(types.size());
                         for (;; ) {
@@ -8989,6 +9047,17 @@ namespace das {
                         }
                         // clear callback
                         program->updateAliasMapCallback = nullptr;
+                        // if we updated alias map (via typemacro), we need to reapply it to the result
+                        if ( aliasMapUpdated ) {
+                            for ( auto & arg : clone->arguments ) {
+                                if ( arg->type->isAlias() ) {
+                                    arg->type = inferPartialAliases(arg->type, arg->type, clone, &aliases);
+                                }
+                            }
+                            if ( clone->result && clone->result->isAlias() ) {
+                                clone->result = inferPartialAliases(clone->result, clone->result, clone, &aliases);
+                            }
+                        }
                         // now we verify if tail end can indeed be fully inferred
                         if (!program->addFunction(clone)) {
                             clone->module = thisModule;
@@ -9028,7 +9097,8 @@ namespace das {
                     if ( auto aliasT = findAlias(expr->name) ) {
                         if ( aliasT->isCtorType() ) {
                             expr->name = das_to_string(aliasT->baseType);
-                            if ( aliasT->baseType==Type::tBitfield ) {
+                            if ( aliasT->baseType==Type::tBitfield || aliasT->baseType==Type::tBitfield8 ||
+                                 aliasT->baseType==Type::tBitfield16 || aliasT->baseType==Type::tBitfield64 ) {
                                 expr->aliasSubstitution = aliasT;
                             }
                             reportAstChanged();
@@ -9178,7 +9248,7 @@ namespace das {
                         expr->at, CompilationError::invalid_cast);
                     return Visitor::visit(expr);
                 }
-                auto ecast = make_smart<ExprCast>(expr->at, expr->arguments[0]->clone(), expr->aliasSubstitution );
+                auto ecast = make_smart<ExprCast>(expr->at, expr->clone(), expr->aliasSubstitution );
                 ecast->reinterpret = true;
                 ecast->alwaysSafe = true;
                 expr->aliasSubstitution.reset();

@@ -223,7 +223,7 @@ namespace das {
         int variantFieldIndex( const string & name ) const;
         __forceinline int bitFieldIndex( const string & name ) const;
         void addVariant(const string & name, const TypeDeclPtr & tt);
-        string findBitfieldName ( uint32_t value ) const;
+        string findBitfieldName ( uint64_t value ) const;
         void collectAliasing ( TypeAliasMap & aliases, das_set<Structure *> & dep, bool viaPointer ) const;
         void collectContainerAliasing ( TypeAliasMap & aliases, das_set<Structure *> & dep, bool viaPointer ) const;
         void serialize ( AstSerializer & ser );
@@ -236,6 +236,7 @@ namespace das {
         void getLookupHash(uint64_t & hash) const;
         static void clone ( TypeDeclPtr & dest, const TypeDeclPtr & src );
         Type getR2VType() const;
+        int maxBitfieldBits() const;
     public:
         Type                    baseType = Type::tVoid;
         Structure *             structType = nullptr;
@@ -296,6 +297,9 @@ namespace das {
     };
 
     template<> struct ToBasicType<Bitfield>     { enum { type = Type::tBitfield }; };
+    template<> struct ToBasicType<Bitfield8>    { enum { type = Type::tBitfield8 }; };
+    template<> struct ToBasicType<Bitfield16>   { enum { type = Type::tBitfield16 }; };
+    template<> struct ToBasicType<Bitfield64>   { enum { type = Type::tBitfield64 }; };
     template<> struct ToBasicType<EnumStub>     { enum { type = Type::tEnumeration }; };
     template<> struct ToBasicType<EnumStub8>    { enum { type = Type::tEnumeration8 }; };
     template<> struct ToBasicType<EnumStub16>   { enum { type = Type::tEnumeration16 }; };
@@ -648,16 +652,6 @@ namespace das {
     template <typename TT>
     ___noinline TypeDeclPtr makeArgumentType(const ModuleLibrary & ctx) {
         auto tt = typeFactory<TT>::make(ctx);
-        if (tt->isVectorType()) {
-            bool is_same_type = is_same_v<typename WrapType<remove_cv_t<remove_reference_t<TT>>>::type, vec4f>;
-            bool is_same_rettype = is_same_v<typename WrapType<remove_cv_t<remove_reference_t<TT>>>::type, vec4f>;
-            DAS_VERIFYF(is_same_type, "To make c++-jit interop work vec-types should be provided with WrapType::type "
-                                      "and optionally WrapArgType, WrapRetType (if vec4f conversion is not implemented "
-                                      "in type itself). Failed TT: %s", debug_type_name<TT>());
-            DAS_VERIFYF(is_same_rettype, "To make c++-jit interop work vec-types should be provided with WrapType::rettype "
-                                         "and optionally WrapArgType, WrapRetType (if vec4f conversion is not implemented "
-                                         "in type itself). Failed TT: %s", debug_type_name<TT>());
-        }
         if (tt->isRefType()) {
             tt->ref = false;
         } else if (!tt->isRef() && !tt->isAnyType()) {
@@ -811,7 +805,9 @@ namespace das {
     }
 
     __forceinline bool TypeDecl::isBitfield() const {
-        return (baseType==Type::tBitfield) && (dim.size()==0);
+        return ((baseType==Type::tBitfield) || (baseType==Type::tBitfield8) ||
+                (baseType==Type::tBitfield16) || (baseType==Type::tBitfield64))
+            && (dim.size()==0);
     }
 
     __forceinline bool TypeDecl::isIterator() const {

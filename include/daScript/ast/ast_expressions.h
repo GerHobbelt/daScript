@@ -212,6 +212,7 @@ namespace das
                 bool            hasEarlyOut : 1;            // this block has return, or other blocks with return
                 bool            forLoop : 1;                // this block is a for loop
                 bool            hasExitByLabel : 1;         // whether we have goto outside of block
+                bool            isLambdaBlock : 1;           // this block is a lambda block
             };
             uint32_t            blockFlags = 0;
         };
@@ -701,10 +702,10 @@ namespace das
         auto getValue() const { return ExprConstT::getValue(); };
     };
 
-    struct ExprConstBitfield : ExprConstT<uint32_t,ExprConstBitfield> {
-        ExprConstBitfield(uint32_t i = 0)
+    struct ExprConstBitfield : ExprConstT<uint64_t,ExprConstBitfield> {
+        ExprConstBitfield(uint64_t i = 0)
             : ExprConstT(i,Type::tBitfield) { __rtti = "ExprConstBitfield"; }
-        ExprConstBitfield(const LineInfo & a, uint32_t i = 0)
+        ExprConstBitfield(const LineInfo & a, uint64_t i = 0)
             : ExprConstT(a,i,Type::tBitfield) { __rtti = "ExprConstBitfield"; }
         virtual ExpressionPtr clone( const ExpressionPtr & expr ) const override;
         auto getValue() const { return ExprConstT::getValue(); };
@@ -1041,7 +1042,9 @@ namespace das
             b->at = a;
             isLambda = isl;
             isLocalFunction = islf;
-            static_pointer_cast<ExprBlock>(b)->isClosure = true;
+            auto blk = (ExprBlock *)b.get();
+            blk->isClosure = true;
+            blk->isLambdaBlock = isl;
         }
         virtual SimNode * simulate (Context & context) const override;
         virtual ExpressionPtr visit(Visitor & vis) override;
