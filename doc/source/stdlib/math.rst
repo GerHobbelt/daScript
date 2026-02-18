@@ -3621,49 +3621,41 @@ Packing and unpacking
 Uncategorized
 +++++++++++++
 
-.. _function-math__float4x4_implicit__eq__eq_const_int:
+.. _function-math__dot__float4x4_implicit__eq__eq_const_int:
 
-.. das:function:: float4x4 implicit ==const[](m: float4x4 implicit ==const; i: int) : float4&
+.. das:function:: float4x4 implicit ==const.[](m: float4x4 implicit ==const; i: int) : float4&
 
-Returns the i-th row of a float4x4 matrix.
-
-
+Returns the element of the 4x4 matrix at the specified index.
 
 :Arguments: * **m** :  :ref:`float4x4 <handle-math-float4x4>`  implicit!
 
             * **i** : int
 
-.. _function-math__float4x4_const_implicit__eq__eq_const_int:
+.. _function-math__dot__float4x4_const_implicit__eq__eq_const_int:
 
-.. das:function:: float4x4 const implicit ==const[](m: float4x4 const implicit ==const; i: int) : float4
+.. das:function:: float4x4 const implicit ==const.[](m: float4x4 const implicit ==const; i: int) : float4
 
-Returns the i-th row of a float4x4 matrix.
-
-
+Returns the element of the 4x4 matrix at the specified index.
 
 :Arguments: * **m** :  :ref:`float4x4 <handle-math-float4x4>`  implicit!
 
             * **i** : int
 
-.. _function-math__float4x4_implicit__eq__eq_const_uint:
+.. _function-math__dot__float4x4_implicit__eq__eq_const_uint:
 
-.. das:function:: float4x4 implicit ==const[](m: float4x4 implicit ==const; i: uint) : float4&
+.. das:function:: float4x4 implicit ==const.[](m: float4x4 implicit ==const; i: uint) : float4&
 
-Returns the i-th row of a float4x4 matrix.
-
-
+Returns the element of the 4x4 matrix at the specified index.
 
 :Arguments: * **m** :  :ref:`float4x4 <handle-math-float4x4>`  implicit!
 
             * **i** : uint
 
-.. _function-math__float4x4_const_implicit__eq__eq_const_uint:
+.. _function-math__dot__float4x4_const_implicit__eq__eq_const_uint:
 
-.. das:function:: float4x4 const implicit ==const[](m: float4x4 const implicit ==const; i: uint) : float4
+.. das:function:: float4x4 const implicit ==const.[](m: float4x4 const implicit ==const; i: uint) : float4
 
-Returns the i-th row of a float4x4 matrix.
-
-
+Returns the element of the 4x4 matrix at the specified index.
 
 :Arguments: * **m** :  :ref:`float4x4 <handle-math-float4x4>`  implicit!
 
@@ -3685,49 +3677,42 @@ Returns the i-th row of a float4x4 matrix.
 
 :Arguments: * **x** :  :ref:`float3x4 <handle-math-float3x4>`  implicit
 
-.. _function-math__float3x4_implicit__eq__eq_const_int:
+.. _function-math__dot__float3x4_implicit__eq__eq_const_int:
 
-.. das:function:: float3x4 implicit ==const[](m: float3x4 implicit ==const; i: int) : float3&
+.. das:function:: float3x4 implicit ==const.[](m: float3x4 implicit ==const; i: int) : float3&
 
-Returns the i-th row of a float3x4 matrix.
-
-
+Returns the element of the 3x4 matrix at the specified index.
 
 :Arguments: * **m** :  :ref:`float3x4 <handle-math-float3x4>`  implicit!
 
             * **i** : int
 
-.. _function-math__float3x4_const_implicit__eq__eq_const_int:
+.. _function-math__dot__float3x4_const_implicit__eq__eq_const_int:
 
-.. das:function:: float3x4 const implicit ==const[](m: float3x4 const implicit ==const; i: int) : float3
+.. das:function:: float3x4 const implicit ==const.[](m: float3x4 const implicit ==const; i: int) : float3
 
-Returns the i-th row of a float3x4 matrix.
-
-
+Returns the element of the 3x4 matrix at the specified index.
 
 :Arguments: * **m** :  :ref:`float3x4 <handle-math-float3x4>`  implicit!
 
             * **i** : int
 
-.. _function-math__float3x4_implicit__eq__eq_const_uint:
+.. _function-math__dot__float3x4_implicit__eq__eq_const_uint:
 
-.. das:function:: float3x4 implicit ==const[](m: float3x4 implicit ==const; i: uint) : float3&
+.. das:function:: float3x4 implicit ==const.[](m: float3x4 implicit ==const; i: uint) : float3&
 
-Returns the i-th row of a float3x4 matrix.
-
+Returns the element of the 3x4 matrix at the specified index.
 
 
 :Arguments: * **m** :  :ref:`float3x4 <handle-math-float3x4>`  implicit!
 
             * **i** : uint
 
-.. _function-math__float3x4_const_implicit__eq__eq_const_uint:
+.. _function-math__dot__float3x4_const_implicit__eq__eq_const_uint:
 
-.. das:function:: float3x4 const implicit ==const[](m: float3x4 const implicit ==const; i: uint) : float3
+.. das:function:: float3x4 const implicit ==const.[](m: float3x4 const implicit ==const; i: uint) : float3
 
-Returns the i-th row of a float3x4 matrix.
-
-
+Returns element of 3x4 matrix at specified index.
 
 :Arguments: * **m** :  :ref:`float3x4 <handle-math-float3x4>`  implicit!
 
@@ -3805,49 +3790,41 @@ Returns the i-th row of a float3x4 matrix.
 
 :Arguments: * **x** :  :ref:`float3x3 <handle-math-float3x3>`  implicit
 
-.. _function-math__float3x3_implicit__eq__eq_const_int:
+.. _function-math__dot__float3x3_implicit__eq__eq_const_int:
 
-.. das:function:: float3x3 implicit ==const[](m: float3x3 implicit ==const; i: int) : float3&
+.. das:function:: float3x3 implicit ==const.[](m: float3x3 implicit ==const; i: int) : float3&
 
-Returns the i-th row of a float3x3 matrix.
-
-
+Returns the element of the 3x3 matrix at the specified index.
 
 :Arguments: * **m** :  :ref:`float3x3 <handle-math-float3x3>`  implicit!
 
             * **i** : int
 
-.. _function-math__float3x3_const_implicit__eq__eq_const_int:
+.. _function-math__dot__float3x3_const_implicit__eq__eq_const_int:
 
-.. das:function:: float3x3 const implicit ==const[](m: float3x3 const implicit ==const; i: int) : float3
+.. das:function:: float3x3 const implicit ==const.[](m: float3x3 const implicit ==const; i: int) : float3
 
-Returns the i-th row of a float3x3 matrix.
-
-
+Returns the element of the 3x3 matrix at the specified index.
 
 :Arguments: * **m** :  :ref:`float3x3 <handle-math-float3x3>`  implicit!
 
             * **i** : int
 
-.. _function-math__float3x3_implicit__eq__eq_const_uint:
+.. _function-math__dot__float3x3_implicit__eq__eq_const_uint:
 
-.. das:function:: float3x3 implicit ==const[](m: float3x3 implicit ==const; i: uint) : float3&
+.. das:function:: float3x3 implicit ==const.[](m: float3x3 implicit ==const; i: uint) : float3&
 
-Returns the i-th row of a float3x3 matrix.
-
-
+Returns the element of the 3x3 matrix at the specified index.
 
 :Arguments: * **m** :  :ref:`float3x3 <handle-math-float3x3>`  implicit!
 
             * **i** : uint
 
-.. _function-math__float3x3_const_implicit__eq__eq_const_uint:
+.. _function-math__dot__float3x3_const_implicit__eq__eq_const_uint:
 
-.. das:function:: float3x3 const implicit ==const[](m: float3x3 const implicit ==const; i: uint) : float3
+.. das:function:: float3x3 const implicit ==const.[](m: float3x3 const implicit ==const; i: uint) : float3
 
-Returns the i-th row of a float4x4 matrix.
-
-
+Returns the element of the 3x3 matrix at the specified index.
 
 :Arguments: * **m** :  :ref:`float3x3 <handle-math-float3x3>`  implicit!
 

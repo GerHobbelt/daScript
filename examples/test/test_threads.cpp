@@ -100,7 +100,9 @@ bool run_tests( const string & path, bool (*test_fn)(const string &, bool useAot
 }
 
 
-void require_project_specific_modules();
+#ifdef DAS_ENABLE_DYN_INCLUDES
+bool require_dynamic_modules(const string &, const string &, TextWriter&);
+#endif
 
 void test_thread(bool useAot) {
     ReuseCacheGuard guard;
@@ -123,8 +125,15 @@ void test_thread(bool useAot) {
     NEED_MODULE(Module_JobQue);
     NEED_MODULE(Module_FIO);
     NEED_MODULE(Module_DASBIND);
-    require_project_specific_modules();
+    #if !defined(DAS_ENABLE_DLL) || !defined(DAS_ENABLE_DYN_INCLUDES)
+    // Otherwises search for static modules.
     #include "modules/external_need.inc"
+    #endif
+    #ifdef DAS_ENABLE_DYN_INCLUDES
+    // Search for external modules and init them. Only if flag is enabled.
+    daScriptEnvironment::ensure();
+    require_dynamic_modules(getDasRoot(), getDasRoot(), tout);
+    #endif
     if ( VerboseTests )
         tout << "Module::Initialize (" << this_thread_id() << ")\n";
     Module::Initialize();

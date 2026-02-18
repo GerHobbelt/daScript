@@ -580,7 +580,7 @@ Containers
   *  :ref:`get (Tab: table\<auto(keyT), void\>; at: keyT|keyT#; blk: block\<(var p:void?):void\>) : auto <function-builtin_get_table_ls_autokeyT,_void_gr__keyTkeyT_hh__block_ls_var_p_c_void_q__c_void_gr_>` 
   *  :ref:`get_value (Tab: table\<auto(keyT), auto(valT)\>; at: keyT|keyT#) : valT <function-builtin_get_value_table_ls_autokeyT,_autovalT_gr__keyTkeyT_hh_>` 
   *  :ref:`get_value (var Tab: table\<auto(keyT), smart_ptr\<auto(valT)\>\>; at: keyT|keyT#) : smart_ptr\<valT\> <function-builtin_get_value_table_ls_autokeyT,_smart_ptr_ls_autovalT_gr__gr__keyTkeyT_hh_>` 
-  *  :ref:`get_value (var Tab: table\<auto(keyT), auto(valT)\>; at: keyT|keyT#) : valT <function-builtin_get_value_table_ls_autokeyT,_autovalT_gr__keyTkeyT_hh_>` 
+  *  :ref:`get_value (var Tab: table\<auto(keyT), auto(valT)\>; at: keyT|keyT#) : valT <function-builtin_get_value__table_ls_autokeyT,_autovalT_gr__keyTkeyT_hh_>` 
   *  :ref:`get_value (var Tab: table\<auto(keyT), auto(valT)[]\>; at: keyT|keyT#) : valT[-2] <function-builtin_get_value_table_ls_autokeyT,_autovalT_gr__keyTkeyT_hh_>` 
   *  :ref:`erase (var Tab: table\<auto(keyT), auto(valT)\>; at: string#) : bool <function-builtin_erase_table_ls_autokeyT,_autovalT_gr__string_hh_>` 
   *  :ref:`erase (var Tab: table\<auto(keyT), auto(valT)\>; at: keyT|keyT#) : bool <function-builtin_erase_table_ls_autokeyT,_autovalT_gr__keyTkeyT_hh_>` 
@@ -622,6 +622,9 @@ Containers
   *  :ref:`lock_forever (var Tab: table\<auto(keyT);auto(valT)\>|table\<auto(keyT);auto(valT)\>#) : table\<keyT, valT\># <function-builtin_lock_forever_table_ls_autokeyT;autovalT_gr_table_ls_autokeyT;autovalT_gr__hh_>` 
   *  :ref:`next (var it: iterator\<auto(TT)\>; var value: TT&) : bool <function-builtin_next_iterator_ls_autoTT_gr__TT>` 
   *  :ref:`each (rng: range) : iterator\<int\> <function-builtin_each_range>` 
+  *  :ref:`each (rng: urange) : iterator\<uint\> <function-builtin_each_urange>` 
+  *  :ref:`each (rng: range64) : iterator\<int64\> <function-builtin_each_range64>` 
+  *  :ref:`each (rng: urange64) : iterator\<uint64\> <function-builtin_each_urange64>` 
   *  :ref:`each (str: string) : iterator\<int\> <function-builtin_each_string>` 
   *  :ref:`each (a: auto(TT)[]) : iterator\<TT&\> <function-builtin_each_autoTT>` 
   *  :ref:`each (a: array\<auto(TT)\>) : iterator\<TT&\> <function-builtin_each_array_ls_autoTT_gr_>` 
@@ -1271,13 +1274,13 @@ Containers
 
             * **at** : option<keyT|keyT#>
 
-.. _function-builtin_get_value_table_ls_autokeyT,_autovalT_gr__keyTkeyT_hh_:
+.. _function-builtin_get_value__table_ls_autokeyT,_autovalT_gr__keyTkeyT_hh_:
 
 .. das:function:: get_value(Tab: table<auto(keyT), auto(valT)>; at: keyT|keyT#) : valT
 
  gets the value from the table.
 
-:Arguments: * **Tab** : table<auto(keyT);auto(valT)>
+:Arguments: * **Tab** : table<auto(keyT);auto(valT)>!
 
             * **at** : option<keyT|keyT#>
 
@@ -1701,6 +1704,30 @@ Containers
 
 :Arguments: * **rng** : range
 
+.. _function-builtin_each_urange:
+
+.. das:function:: each(rng: urange) : iterator<uint>
+
+Returns an iterator over the given range.
+
+:Arguments: * **rng** : urange
+
+.. _function-builtin_each_range64:
+
+.. das:function:: each(rng: range64) : iterator<int64>
+
+Returns an iterator over the given range.
+
+:Arguments: * **rng** : range64
+
+.. _function-builtin_each_urange64:
+
+.. das:function:: each(rng: urange64) : iterator<uint64>
+
+Returns iterator over the given range.
+
+:Arguments: * **rng** : urange64
+
 .. _function-builtin_each_string:
 
 .. das:function:: each(str: string) : iterator<int>
@@ -1752,6 +1779,9 @@ Containers
 .. _function-builtin_each_enum_autoTT:
 
 .. das:function:: each_enum(tt: auto(TT)) : iterator<TT>
+
+.. warning:: 
+  This function is deprecated.
 
  iterates over each element in the enumeration
 
@@ -3438,5 +3468,144 @@ Compilation and AOT
 .. das:function:: compiling_module_name() : string
 
  returns name of the module currently being compiled.
+
++++++++++++++
+Uncategorized
++++++++++++++
+
+.. _function-builtin_get_context_share_counter:
+
+.. das:function:: get_context_share_counter() : uint64
+
+Returns use count for the shared context, which is incremented by each thread that accesses it.
+
+.. _function-builtin_das_is_dll_build:
+
+.. das:function:: das_is_dll_build() : bool
+
+Returns true if the current build is a DLL build, false otherwise.
+This determines if daslib symbols are available for the JIT.
+
+.. _function-builtin_get_platform_name:
+
+.. das:function:: get_platform_name() : string
+
+Returns name of the platform (operating system) that the program is running on, such as "windows", "linux", "darwin" (for macOS), "emscripten" (for WebAssembly), or "unknown" if it cannot be determined.
+
+.. _function-builtin_get_architecture_name:
+
+.. das:function:: get_architecture_name() : string
+
+Returns the name of the architecture the program is running on, such as "x86_64", "x86", "arm64", "arm", "wasm32", or "unknown".
+
+.. _function-builtin_fmt_string_implicit_int8:
+
+.. das:function:: fmt(format: string implicit; value: int8) : string
+
+Converts value to string given specified format (that of libfmt or C++20 std::format).
+
+:Arguments: * **format** : string implicit
+
+            * **value** : int8
+
+.. _function-builtin_fmt_string_implicit_uint8:
+
+.. das:function:: fmt(format: string implicit; value: uint8) : string
+
+Converts value to string given specified format (that of libfmt or C++20 std::format).
+
+:Arguments: * **format** : string implicit
+
+            * **value** : uint8
+
+.. _function-builtin_fmt_string_implicit_int16:
+
+.. das:function:: fmt(format: string implicit; value: int16) : string
+
+Converts value to string given specified format (that of libfmt or C++20 std::format).
+
+:Arguments: * **format** : string implicit
+
+            * **value** : int16
+
+.. _function-builtin_fmt_string_implicit_uint16:
+
+.. das:function:: fmt(format: string implicit; value: uint16) : string
+
+Converts value to string given specified format (that of libfmt or C++20 std::format).
+
+:Arguments: * **format** : string implicit
+
+            * **value** : uint16
+
+.. _function-builtin_fmt_string_implicit_int:
+
+.. das:function:: fmt(format: string implicit; value: int) : string
+
+Converts value to string given specified format (that of libfmt or C++20 std::format).
+
+:Arguments: * **format** : string implicit
+
+            * **value** : int
+
+.. _function-builtin_fmt_string_implicit_uint:
+
+.. das:function:: fmt(format: string implicit; value: uint) : string
+
+Converts value to string given specified format (that of libfmt or C++20 std::format).
+
+:Arguments: * **format** : string implicit
+
+            * **value** : uint
+
+.. _function-builtin_fmt_string_implicit_int64:
+
+.. das:function:: fmt(format: string implicit; value: int64) : string
+
+Converts value to string given specified format (that of libfmt or C++20 std::format).
+
+:Arguments: * **format** : string implicit
+
+            * **value** : int64
+
+.. _function-builtin_fmt_string_implicit_uint64:
+
+.. das:function:: fmt(format: string implicit; value: uint64) : string
+
+Converts value to string given specified format (that of libfmt or C++20 std::format).
+
+:Arguments: * **format** : string implicit
+
+            * **value** : uint64
+
+.. _function-builtin_fmt_string_implicit_float:
+
+.. das:function:: fmt(format: string implicit; value: float) : string
+
+Converts value to string given specified format (that of libfmt or C++20 std::format).
+
+:Arguments: * **format** : string implicit
+
+            * **value** : float
+
+.. _function-builtin_fmt_string_implicit_double:
+
+.. das:function:: fmt(format: string implicit; value: double) : string
+
+Converts value to string given specified format (that of libfmt or C++20 std::format).
+
+:Arguments: * **format** : string implicit
+
+            * **value** : double
+
+.. _function-builtin_consume_argument_autoTT:
+
+.. das:function:: consume_argument(a: auto(TT)&) : TT&
+
+Notifies compiler that the argument is consumed, i.e. it will not be used after this call.
+This allows to avoid unnecessary clones and moves in some cases, for example when the argument is returned from the function.
+Alternative syntax is foo ( <-arg ) instead of foo ( consume_argument(arg) ).
+
+:Arguments: * **a** : auto(TT)&
 
 

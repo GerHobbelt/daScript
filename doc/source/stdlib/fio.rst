@@ -606,4 +606,16 @@ OS specific routines
 
 :Arguments: * **var** : string implicit
 
++++++++++++++
+Uncategorized
++++++++++++++
+
+.. _function-fio_mkdir_rec_string:
+
+.. das:function:: mkdir_rec(path: string) : bool
+
+Recursively creates directory and all its parents if they do not exist. Returns true if the directory already exists or was created successfully, false otherwise.
+
+:Arguments: * **path** : string
+
 

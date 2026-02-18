@@ -1,6 +1,7 @@
 #include "daScript/ast/aot_templates.h"
 #include "daScript/daScript.h"
 #include "daScript/das_common.h"
+#include "daScript/misc/sysos.h" // normalizeFileName
 #include "daScript/simulate/fs_file_info.h"
 #include "../dasFormatter/fmt.h"
 #include "daScript/ast/ast_aot_cpp.h"
@@ -11,6 +12,10 @@ void use_utf8();
 
 void require_project_specific_modules();//link time resolved dependencies
 das::FileAccessPtr get_file_access( char * pak );//link time resolved dependencies
+
+#ifdef DAS_ENABLE_DYN_INCLUDES
+bool require_dynamic_modules(const das::string &, const das::string &, TextWriter&);//link time resolved dependencies
+#endif
 
 TextPrinter tout;
 
@@ -176,10 +181,19 @@ int das_aot_main ( int argc, char * argv[] ) {
     bool das_mode = false;
     char * standaloneContextName = nullptr;
     char * standaloneClassName = nullptr;
+    vector<pair<string, string>> aot_files;
+    string project_root;
     if ( argc>3  ) {
-        for (int ai = 4; ai != argc; ++ai) {
+        for (int ai = 1; ai != argc; ++ai) {
             if ( strcmp(argv[ai],"-q")==0 ) {
                 quiet = true;
+            } else if ( strcmp(argv[ai],"-aot")==0 ) {
+                if (ai + 2 >= argc) {
+                    tout << "-aot requires 2 arguments <in> <out>.";
+                    return -1;
+                }
+                aot_files.emplace_back(argv[ai + 1], argv[ai + 2]);
+                ai += 2;
             } else if ( strcmp(argv[ai],"-p")==0 ) {
                 paranoid_validation = true;
             } else if ( strcmp(argv[ai],"-dry-run")==0 ) {
@@ -211,6 +225,9 @@ int das_aot_main ( int argc, char * argv[] ) {
                 }
                 setDasRoot(argv[ai+1]);
                 ai += 1;
+            } else if ( strcmp(argv[ai],"-project-root")==0 ) {
+                project_root = argv[ai + 1];
+                ai++;
             } else if ( strcmp(argv[ai],"-v2syntax")==0 ) {
                 version2syntax = true;
             } else if ( strcmp(argv[ai],"-v1syntax")==0 ) {
@@ -267,7 +284,14 @@ int das_aot_main ( int argc, char * argv[] ) {
         NEED_MODULE(Module_DASBIND);
     }
     require_project_specific_modules();
+    #if !defined(DAS_ENABLE_DLL) || !defined(DAS_ENABLE_DYN_INCLUDES)
+    // Otherwises search for static modules.
     #include "modules/external_need.inc"
+    #endif
+    #ifdef DAS_ENABLE_DYN_INCLUDES
+    daScriptEnvironment::ensure();
+    require_dynamic_modules(getDasRoot(), project_root, tout);
+    #endif
     Module::Initialize();
     daScriptEnvironment::getBound()->g_isInAot = true;
     bool compiled = false;
@@ -276,18 +300,22 @@ int das_aot_main ( int argc, char * argv[] ) {
         cfg.cross_platform = cross_platform;
         compiled = compileStandalone(argv[2], argv[3], cfg);
     } else {
-        if (argv[2] == string("aot_das_mode")) {
+        if (argv[2] == string("aot_file_mode")) {
             auto f = get_file_access(nullptr);
             const char *src;
             uint32_t len;
             f->getFileInfo(argv[3])->getSourceAndLength(src, len);
             string_view content(src, len);
             size_t pos = 0;
+            // Old MAC uses `\r`. Windows uses `\r\n`. Linux uses `\n`.
+            // Solution below is not optimal, but simplest.
+            // We will remove it, once switched to the das aot completely.
             while (pos < content.length()) {
-                size_t end = content.find('\n', pos);
+                size_t end1 = content.find('\n', pos);
+                size_t end2 = content.find('\r', pos);
+                size_t end = das::min(end1, end2);
                 string_view line = content.substr(pos, end - pos);
                 pos = (end == string_view::npos) ? content.length() : end + 1;
-
                 if (line.empty()) continue;
 
                 auto mode_end = line.find(' ');
@@ -295,17 +323,33 @@ int das_aot_main ( int argc, char * argv[] ) {
 
                 // No need to support contexts. This is temporary.
                 if (line.substr(0, mode_end) != "aot") {
-                    tout << "Uknown mode on line `" << string(line) << "`, skipping.\n";
+                    if (!quiet) {
+                        tout << "Uknown mode on line `" << string(line) << "`, skipping.\n";
+                    }
                     continue;
                 }
 
                 string in_file(line.substr(mode_end + 1, in_file_end - mode_end - 1));
                 string out_file(line.substr(in_file_end + 1));
 
-                compiled = compile(in_file, out_file, dryRun, cross_platform);
+                // Use `or` here, to return `true` if at least one file compiled successfully.
+                auto is_ok = compile(in_file, out_file, dryRun, cross_platform);
+                if (!is_ok && !quiet) {
+                    tout << "Failed to compile `" << string(in_file) << "` in aot.\n";
+                }
+                compiled |= is_ok;
             }
         } else {
-            compiled = compile(argv[2], argv[3], dryRun, cross_platform);
+            size_t id = 2;
+            for (const auto &[in, out] : aot_files) {
+                // Use `or` here, to return `true` if at least one file compiled successfully.
+                auto is_ok = compile(in, out, dryRun, cross_platform);
+                if (!is_ok && !quiet) {
+                    tout << "Failed to compile `" << out << "` in aot.\n";
+                }
+                compiled |= is_ok;
+                id += 2;
+            }
         }
     }
     Module::Shutdown();
@@ -397,6 +441,37 @@ bool compile_and_run ( const string & fn, const string & mainFnName, bool output
     return success;
 }
 
+// Deduces project_root for dyn modules.
+// First attempt: from command line arguments
+// Second try: project file
+// Third try: path from compiled file
+// Default: empty
+static string deduce_project_root(string maybe_project_root, string compile_file) {
+    if (!maybe_project_root.empty()) {
+        return maybe_project_root;
+    }
+    if (!projectFile.empty()) {
+        auto access = get_file_access((char*)(projectFile.empty() ? nullptr : projectFile.c_str()));
+        auto maybe_result = access->getDynModulesFolder();
+        if (!maybe_result.empty()) {
+            return maybe_result;
+        }
+    }
+    if (!compile_file.empty()) {
+        auto filename_start = compile_file.find_last_of("\\/");
+        string project_root;
+        if (filename_start != string::npos) {
+            // Try from directory where first script located
+            project_root = compile_file.substr(0, filename_start);
+        } else {
+            // Try from current directory.
+            project_root = "./";
+        }
+        return project_root;
+    }
+    return "";
+}
+
 void replace( string& str, const string& from, const string& to ) {
     size_t it = str.find(from);
     if( it != string::npos ) {
@@ -413,6 +488,7 @@ void print_help() {
         << "    -v2makeSyntax enable version 1 syntax with version 2 constructors syntax (for arrays/structures)\n"
         << "    -jit        enable Just-In-Time compilation\n"
         << "    -project <path.das_project> path to project file\n"
+        << "    -project_root optional path to root directory of the project (used for dyn modules)\n"
         << "    -run-fmt    <inplace/dry> <v2/v1> <semicolon> run formatter, requires 2 or more arguments\n"
         << "    -log        output program code\n"
         << "    -pause      pause after errors and pause again before exiting program\n"
@@ -476,6 +552,7 @@ int MAIN_FUNC_NAME ( int argc, char * argv[] ) {
     bool outputProgramCode = false;
     bool pauseAfterDone = false;
     bool dryRun = false;
+    string project_root;
     optional<format::FormatOptions> formatter;
     for ( int i=1; i < argc; ++i ) {
         if ( argv[i][0]=='-' ) {
@@ -527,6 +604,9 @@ int MAIN_FUNC_NAME ( int argc, char * argv[] ) {
                 outputProgramCode = true;
             } else if ( cmd=="dry-run" ) {
                 dryRun = true;
+            } else if ( cmd=="project-root" ) {
+                project_root = argv[i + 1];
+                i++;
             } else if ( cmd=="run-fmt" ) {
                 formatter.emplace();
                 if ( i+2 > argc ) {
@@ -654,8 +734,18 @@ int MAIN_FUNC_NAME ( int argc, char * argv[] ) {
     NEED_MODULE(Module_JobQue);
     NEED_MODULE(Module_FIO);
     NEED_MODULE(Module_DASBIND);
+
     require_project_specific_modules();
+    #if !defined(DAS_ENABLE_DLL) || !defined(DAS_ENABLE_DYN_INCLUDES)
+    // Otherwises search for static modules.
     #include "modules/external_need.inc"
+    #endif
+    #ifdef DAS_ENABLE_DYN_INCLUDES
+    // Search for external modules and init them. Only if flag is enabled.
+    daScriptEnvironment::ensure();
+    project_root = deduce_project_root(project_root, files.front());
+    require_dynamic_modules(getDasRoot(), project_root, tout);
+    #endif
     Module::Initialize();
 
     if (formatter) {
