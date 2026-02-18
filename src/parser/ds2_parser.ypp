@@ -26,7 +26,8 @@
     #include "parser_state.h"
 
 #if defined(_MSC_VER) && !defined(__clang__)
-    #if defined(DAS_RELWITHDEBINFO)
+    #if !defined(_DEBUG)
+        #pragma optimize( "", off )
         #pragma optimize( "s", on )
     #endif
 #endif
@@ -458,6 +459,7 @@
 %type <pExpression>         expr_assign
 %type <pExpression>         expr_list
 %type <pExpression>         optional_expr_list
+%type <pExpression>         optional_expr_list_in_braces
 %type <pExpression>         optional_expr_map_tuple_list
 %type <pExpression>         expr_map_tuple_list
 %type <pExpression>         expression_label
@@ -2383,7 +2385,6 @@ tuple_alias_type_list
     | tuple_alias_type_list[list] semis tuple_type[decl] {
         $$ = $list; $list->push_back($decl);
         if ( !yyextra->g_CommentReaders.empty() ) {
-            auto tokName = tokAt(scanner,@decl);
             for ( auto & crd : yyextra->g_CommentReaders ) {
                 for ( const auto & nl : *($decl->pNameList) ) {
                     crd->afterTupleEntry(nl.name.c_str(), nl.at);
@@ -2418,7 +2419,6 @@ variant_alias_type_list
     |   variant_alias_type_list[list] semis variant_type[decl] {
         $$ = $list; $list->push_back($decl);
         if ( !yyextra->g_CommentReaders.empty() ) {
-            auto tokName = tokAt(scanner,@decl);
             for ( auto & crd : yyextra->g_CommentReaders ) {
                 for ( const auto & nl : *($decl->pNameList) ) {
                     crd->afterVariantEntry(nl.name.c_str(), nl.at);
@@ -3051,7 +3051,11 @@ bitfield_basic_type_declaration
     ;
 
 bitfield_type_declaration
-    :   DAS_TBITFIELD bitfield_basic_type_declaration[basicType] '<' { yyextra->das_arrow_depth ++; } bitfield_bits[nl] '>' { yyextra->das_arrow_depth --; } {
+    :   DAS_TBITFIELD bitfield_basic_type_declaration[basicType] '<' '>'  {
+            $$ = new TypeDecl($basicType);
+            $$->at = tokAt(scanner,@basicType);
+    }
+    |   DAS_TBITFIELD bitfield_basic_type_declaration[basicType] '<' { yyextra->das_arrow_depth ++; } bitfield_bits[nl] '>' { yyextra->das_arrow_depth --; } {
             $$ = new TypeDecl($basicType);
             $$->argNames = *$nl;
             auto maxBits = $$->maxBitfieldBits();
@@ -3120,6 +3124,12 @@ type_declaration_no_options
     }
     ;
 
+
+optional_expr_list_in_braces
+    :       { $$ = nullptr; }
+    |   '(' expr_list[exprL] optional_comma ')' { $$ = $exprL; }
+    ;
+
 type_declaration_no_options_no_dim
     :   basic_type_declaration[basicType]                   { $$ = new TypeDecl($basicType); $$->at = tokAt(scanner,@basicType); }
     |   auto_type_declaration[typeDecl]                     { $$ = $typeDecl; }
@@ -3134,14 +3144,28 @@ type_declaration_no_options_no_dim
         $$->at = tokRangeAt(scanner,@td,@subexpr);
         $$->dimExpr.push_back($subexpr);
     }
-    |   '$' name_in_namespace[name] '(' optional_expr_list[arguments] ')' {
+    |   name_in_namespace[name] '(' optional_expr_list[arguments] ')' {
         $$ = new TypeDecl(Type::typeMacro);
         $$->at = tokRangeAt(scanner,@name, @arguments);
         $$->dimExpr = sequenceToList($arguments);
         $$->dimExpr.insert($$->dimExpr.begin(), new ExprConstString(tokAt(scanner,@name), *$name));
         delete $name;
     }
-    |   '$' name_in_namespace[name] '<' { yyextra->das_arrow_depth ++; } type_declaration_no_options_list[declL] '>' '(' optional_expr_list[arguments] ')' {
+    |   '$' name_in_namespace[name] optional_expr_list_in_braces[arguments] {
+        $$ = new TypeDecl(Type::typeMacro);
+        $$->at = tokRangeAt(scanner,@name, @arguments);
+        $$->dimExpr = sequenceToList($arguments);
+        $$->dimExpr.insert($$->dimExpr.begin(), new ExprConstString(tokAt(scanner,@name), *$name));
+        delete $name;
+    }
+    |   name_in_namespace[name] '<' { yyextra->das_arrow_depth ++; } type_declaration_no_options_list[declL] '>' optional_expr_list_in_braces[arguments] {
+        $$ = new TypeDecl(Type::typeMacro);
+        $$->at = tokRangeAt(scanner,@name, @arguments);
+        $$->dimExpr = typesAndSequenceToList($declL,$arguments);
+        $$->dimExpr.insert($$->dimExpr.begin(), new ExprConstString(tokAt(scanner,@name), *$name));
+        delete $name;
+    }
+    |   '$' name_in_namespace[name] '<' { yyextra->das_arrow_depth ++; } type_declaration_no_options_list[declL] '>' optional_expr_list_in_braces[arguments] {
         $$ = new TypeDecl(Type::typeMacro);
         $$->at = tokRangeAt(scanner,@name, @arguments);
         $$->dimExpr = typesAndSequenceToList($declL,$arguments);

@@ -7757,7 +7757,7 @@ namespace das {
             markNoDiscard(that);
         }
         virtual ExpressionPtr visitForSource ( ExprFor * expr, Expression * that , bool last ) override {
-            if ( jitEnabled() & that->type && (
+            if ( jitEnabled() && that->type && (
                     (that->type->isHandle() && that->type->annotation->isIterable()) ||
                     (that->type->isString())
              )) {
@@ -9122,6 +9122,27 @@ namespace das {
                             }
                             if ( clone->result && clone->result->isAlias() ) {
                                 clone->result = inferPartialAliases(clone->result, clone->result, clone, &aliases);
+                            }
+                            // now, we go through alias map - and see, which ones are 'lost' ie no longer part of argument or results
+                            for ( auto it : aliases ) {
+                                bool found = false;
+                                for ( auto & arg : clone->arguments ) {
+                                    if ( arg->type->findAlias(it.first) ) {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                if ( !found && clone->result ) {
+                                    if ( clone->result->findAlias(it.first) ) {
+                                        found = true;
+                                    }
+                                }
+                                if ( !found ) {
+                                    auto localAlias = make_smart<ExprAssume>(expr->at,it.first,it.second);
+                                    DAS_ASSERT(clone->body->rtti_isBlock());
+                                    auto blk = (ExprBlock *)clone->body.get();
+                                    blk->list.insert(blk->list.begin(), localAlias);
+                                }
                             }
                         }
                         // now we verify if tail end can indeed be fully inferred
