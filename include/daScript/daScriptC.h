@@ -78,6 +78,8 @@ typedef struct dasStructure das_structure;
 typedef struct dasEnumeration das_enumeration;
 typedef struct dasLambda das_lambda;
 typedef struct dasBlock das_block;
+typedef struct dasPolicies das_policies;
+typedef struct dasSerializedData das_serialized_data;
 
 typedef struct {
     float x, y, z, w;
@@ -106,154 +108,245 @@ typedef vec4f (das_interop_function) ( das_context * ctx, das_node * node, vec4f
 
 typedef void (das_interop_function_unaligned) ( das_context * ctx, das_node * node, vec4f_unaligned * arguments, vec4f_unaligned * result );
 
-// initialize all default modules and internal structures. this is required before any other call to daScriptC API
+// --- Lifecycle ---
+
+// Initialize all built-in modules and internal structures.
+// Must be called once before any other daslang C API call.
 DAS_API void das_initialize();
-// shutdown daScriptC. this is required to free all internal structures and memory allocated by daScriptC API
+// Shut down the daslang runtime and free all internal structures and memory.
+// Must be called once when the host application is done with daslang.
 DAS_API void das_shutdown();
 
-// make a text writer which also prints to stdout. for stringstream use TextWriter
+// --- Text output ---
+
+// Create a text writer that prints to stdout.
+// Use das_text_make_writer() instead if you need to capture output as a string.
 DAS_API das_text_writer * das_text_make_printer();
-// make a text writer which writes to stringstream. for stdout use TextPrinter
+// Create a text writer that accumulates output in an internal string buffer.
+// Use das_text_make_printer() instead if you just want stdout output.
 DAS_API das_text_writer * das_text_make_writer();
-// release text writer
+// Release a text writer created by das_text_make_printer() or das_text_make_writer().
 DAS_API void das_text_release ( das_text_writer * output );
-// write text to text writer
+// Write a null-terminated string to a text writer.
 DAS_API void das_text_output ( das_text_writer * output, char * text );
 
-// make a module group
+// --- Module groups ---
+
+// Create a module group. A module group holds references to modules
+// that the compiler should use when resolving `require` statements.
 DAS_API das_module_group * das_modulegroup_make ();
-// add module to module group
+// Add a module to a module group so that compiled scripts can `require` it.
 DAS_API void das_modulegroup_add_module ( das_module_group* lib, das_module* mod );
-// release module group
+// Release a module group created by das_modulegroup_make().
 DAS_API void das_modulegroup_release ( das_module_group * group );
 
-// Looks for <path>/modules/<module_name>/.das_module files and call
-// `initialize` on them.
+// --- Dynamic modules ---
+
+// Scan <project_root>/modules/ for .das_module descriptor files and
+// call `initialize` on each one.
 //
-// If tout == nullptr prints logs to stdout.
+// If tout is NULL, diagnostic output goes to stdout.
 //
 // Returns 0 on success.
 DAS_API int das_register_dynamic_modules(das_file_access *file_access,
                                          const char *project_root,
                                          das_text_writer *tout);
 
-// make default file access
-DAS_API das_file_access * das_fileaccess_make_default (  );
-// make file access from a project file. project file is a .das_project script which specifies access, module lookup paths, permissions, etc.
-DAS_API das_file_access * das_fileaccess_make_project ( const char * project_file  );
-// release file access
-DAS_API void das_fileaccess_release ( das_file_access * access );
-// introduce file content to file access. this is used to provide content of a file without actually having it on disk. this is useful for testing and for providing virtual files.
-DAS_API void das_fileaccess_introduce_file ( das_file_access * access, const char * file_name, const char * file_content );
+// --- File access ---
 
-// get root path to daScript. this is used to find modules, libraries, etc.
+// Create a default file access that reads directly from the filesystem.
+DAS_API das_file_access * das_fileaccess_make_default (  );
+// Create a file access backed by a .das_project file.
+// The project file is a daslang program that exports callback functions
+// controlling module resolution, permissions, and compilation policies.
+// See tutorial 06 (sandbox) for a complete example.
+DAS_API das_file_access * das_fileaccess_make_project ( const char * project_file  );
+// Release a file access created by das_fileaccess_make_default() or das_fileaccess_make_project().
+DAS_API void das_fileaccess_release ( das_file_access * access );
+// Register a virtual file from a C string.
+// The file appears at 'file_name' during compilation even though it does not exist on disk.
+// If 'owns' is non-zero, the content is copied internally and the caller may free file_content.
+// If 'owns' is zero, the content is borrowed and the caller must keep file_content alive
+// for the lifetime of the file access.
+DAS_API void das_fileaccess_introduce_file ( das_file_access * access, const char * file_name, const char * file_content, int owns );
+
+// Read a file from disk at 'disk_path' and cache it under the virtual path 'name'.
+// 'name' is what module resolution returns (e.g. "daslib/strings.das");
+// 'disk_path' is the actual location on the filesystem.
+DAS_API void das_fileaccess_introduce_file_from_disk ( das_file_access * access, const char * name, const char * disk_path );
+// Pre-load all standard library modules from getDasRoot()/daslib/ into the file access cache.
+// Typically called before das_fileaccess_lock() when setting up a sandbox.
+DAS_API void das_fileaccess_introduce_daslib ( das_file_access * access );
+// Pre-load all native plugin modules listed in external_resolve.inc into the file access cache.
+// Modules not present on disk are silently skipped.
+DAS_API void das_fileaccess_introduce_native_modules ( das_file_access * access );
+// Pre-load a single native module by its require-style path (e.g. "opengl/opengl_boost").
+// Returns 1 if the module file was found and cached, 0 otherwise.
+DAS_API int das_fileaccess_introduce_native_module ( das_file_access * access, const char * req );
+
+// Lock the file access. While locked, getNewFileInfo() returns NULL for all
+// files not already in the cache, so only pre-introduced files can be accessed.
+DAS_API void das_fileaccess_lock ( das_file_access * access );
+// Unlock the file access, re-enabling filesystem reads and further introduce calls.
+DAS_API void das_fileaccess_unlock ( das_file_access * access );
+// Return 1 if the file access is locked, 0 otherwise.
+DAS_API int das_fileaccess_is_locked ( das_file_access * access );
+
+// Copy the daslang root path into 'root'. At most 'maxbuf' bytes are written
+// (including the null terminator). The root path is used to locate daslib/ and other resources.
 DAS_API void das_get_root ( char * root, int maxbuf );
 
-// compile daScript program from file. return compiled program (regardless is it failed). compiler messages are written to text writer.
+// --- Compilation ---
+
+// Compile a daslang program from the file at 'program_file'.
+// Compiler diagnostics are written to 'tout'. The returned program is always
+// non-NULL; check das_program_err_count() to determine if compilation succeeded.
 DAS_API das_program * das_program_compile ( char * program_file, das_file_access * access, das_text_writer * tout, das_module_group * libgroup );
-// release compiled program
+// Release a compiled program.
 DAS_API void das_program_release ( das_program * program );
-// get number of errors in compiled program
+// Return the number of compilation errors. Zero means the program compiled successfully.
 DAS_API int das_program_err_count ( das_program * program );
-// get size of context stack required to simulate compiled program. this is used to allocate context with sufficient stack size.
+// Return the minimum context stack size (in bytes) needed to simulate this program.
+// Pass this value to das_context_make().
 DAS_API int das_program_context_stack_size ( das_program * program );
-// simulate compiled program with provided context and text writer for output. return 1 if simulation succeeded, 0 if it failed. in case of failure, error details can be obtained with das_program_get_error.
+// Simulate (link) a compiled program into a context.
+// Returns 1 on success, 0 on failure. On failure, error details can be retrieved
+// with das_program_get_error(). The text writer 'tout' receives diagnostic output.
 DAS_API int das_program_simulate ( das_program * program, das_context * ctx, das_text_writer * tout );
-// get error details from compiled program by index. index should be in range [0, das_program_err_count(program)). return nullptr if index is out of range.
+// Return the i-th compilation or simulation error, or NULL if index is out of range.
+// Valid indices are [0, das_program_err_count(program)).
 DAS_API das_error * das_program_get_error ( das_program * program, int index );
 
-// report error details to text writer
+// --- Errors ---
+
+// Write a human-readable error description to a text writer.
 DAS_API void das_error_output ( das_error * error, das_text_writer * tout );
-// report error details to text buffer. text buffer should have at least maxLength bytes allocated. if error message is longer than maxLength, it will be truncated.
+// Write a human-readable error description into 'text' (at most 'maxLength' bytes,
+// including the null terminator). Truncated if the message exceeds maxLength.
 DAS_API void das_error_report ( das_error * error, char * text, int maxLength );
 
-// create daScript context with specified stack size. stack size should be at least das_program_context_stack_size(program) to simulate compiled program.
+// --- Context ---
+
+// Create an execution context with the given stack size (in bytes).
+// stackSize must be >= das_program_context_stack_size(program) for the program
+// you intend to simulate.
 DAS_API das_context * das_context_make ( int stackSize );
-// release daScript context
+// Release an execution context.
 DAS_API void das_context_release ( das_context * context );
-// find function in daScript context by name. return nullptr if function is not found.
+// Find an exported function by name in a simulated context.
+// Returns NULL if no function with that name exists.
 DAS_API das_function * das_context_find_function ( das_context * context, char * name );
 
-// evaluate function in daScript context with provided arguments. arguments should be in format of vec4f array, where each argument is represented as vec4f.
-// return value is also represented as vec4f. if evaluation throws an exception, it can be obtained with das_context_get_exception.
+// --- Function evaluation (aligned, vec4f) ---
+// All arguments and return values are passed as vec4f (16-byte aligned SIMD registers).
+// Use the das_argument_* helpers to pack arguments and das_result_* to unpack results.
+// If the function throws an exception, retrieve it with das_context_get_exception().
+
+// Call a function. Returns the result as vec4f.
 DAS_API vec4f das_context_eval_with_catch ( das_context * context, das_function * fun, vec4f * arguments );
-// evaluate function in daScript context with provided arguments. arguments should be in format of vec4f_unaligned array, where each argument is represented as vec4f_unaligned.
-// this is used when arguments are not guaranteed to be 16-byte aligned. result is also represented as vec4f_unaligned. if evaluation throws an exception, it can be obtained with das_context_get_exception.
+
+// --- Function evaluation (unaligned, vec4f_unaligned) ---
+// Same semantics as above, but arguments and result use vec4f_unaligned (no alignment requirement).
+// Prefer these when calling from plain C code that cannot guarantee 16-byte alignment.
+// 'narguments' is the number of elements in the arguments array.
+
+// Call a function with unaligned arguments. Result is written into *result.
 DAS_API void das_context_eval_with_catch_unaligned ( das_context * context, das_function * fun, vec4f_unaligned * arguments, int narguments, vec4f_unaligned * result );
-// evaluate function in daScript context with provided arguments. arguments should be in format of vec4f array, where each argument is represented as vec4f.
-// this is used when function returns complex result (structure, tuple, etc which is not passed by value).
-// complex result is returned via cmres pointer, which should point to memory allocated by caller with sufficient size to hold the result.
-// if evaluation throws an exception, it can be obtained with das_context_get_exception.
+
+// --- Function evaluation returning complex results (cmres) ---
+// Functions that return structures, tuples, or other types that do not fit in a single
+// register use a caller-allocated buffer (cmres). The caller must allocate enough memory
+// for the return type and pass it via the 'cmres' pointer.
+
+// Call a function that returns a complex result (aligned arguments).
 DAS_API void das_context_eval_with_catch_cmres ( das_context * context, das_function * fun, vec4f * arguments, void * cmres );
-// evaluate function in daScript context with provided arguments. arguments should be in format of vec4f_unaligned array, where each argument is represented as vec4f_unaligned.
-// this is used when function returns complex result (structure, tuple, etc which is not passed by value) and arguments are not guaranteed to be 16-byte aligned.
-// complex result is returned via cmres pointer, which should point to memory allocated by caller with sufficient size to hold the result.
-// if evaluation throws an exception, it can be obtained with das_context_get_exception.
+// Call a function that returns a complex result (unaligned arguments).
 DAS_API void das_context_eval_with_catch_cmres_unaligned ( das_context * context, das_function * fun, vec4f_unaligned * arguments, int narguments, void * cmres );
-// get exception message from daScript context. return nullptr if there is no exception.
+// Return the current exception message, or NULL if no exception occurred.
 DAS_API char * das_context_get_exception ( das_context * context );
 
-// evaluate lambda in daScript context with provided arguments. arguments should be in format of vec4f array, where each argument is represented as vec4f.
-// return value is also represented as vec4f.
+// --- Lambda evaluation ---
+// Lambdas are heap-allocated closures. The same aligned / unaligned / cmres
+// variants apply as for function evaluation above.
+
+// Call a lambda (aligned). Returns result as vec4f.
 DAS_API vec4f das_context_eval_lambda ( das_context * context, das_lambda * lambda, vec4f * arguments );
-// evaluate lambda in daScript context with provided arguments. arguments should be in format of vec4f_unaligned array, where each argument is represented as vec4f_unaligned.
-// this is used when arguments are not guaranteed to be 16-byte aligned. result is also represented as vec4f_unaligned.
+// Call a lambda (unaligned). Result written into *result.
 DAS_API void das_context_eval_lambda_unaligned ( das_context * context, das_lambda * lambda, vec4f_unaligned * arguments, int narguments, vec4f_unaligned * result );
-// evaluate lambda in daScript context with provided arguments. arguments should be in format of vec4f array, where each argument is represented as vec4f.
-// this is used when lambda returns complex result (structure, tuple, etc which is not passed by value).
-// complex result is returned via cmres pointer, which should point to memory allocated by caller with sufficient size to hold the result.
+// Call a lambda returning a complex result (aligned).
 DAS_API void das_context_eval_lambda_cmres ( das_context * context, das_lambda * lambda, vec4f * arguments, void * cmres );
-// evaluate lambda in daScript context with provided arguments. arguments should be in format of vec4f_unaligned array, where each argument is represented as vec4f_unaligned.
-// this is used when lambda returns complex result (structure, tuple, etc which is not passed by value) and arguments are not guaranteed to be 16-byte aligned.
-// complex result is returned via cmres pointer, which should point to memory allocated by caller with sufficient size to hold the result.
+// Call a lambda returning a complex result (unaligned).
 DAS_API void das_context_eval_lambda_cmres_unaligned ( das_context * context, das_lambda * lambda, vec4f_unaligned * arguments, int narguments, void * cmres );
 
-// evaluate block in daScript context with provided arguments. arguments should be in format of vec4f array, where each argument is represented as vec4f.
-// return value is also represented as vec4f.
+// --- Block evaluation ---
+// Blocks are stack-allocated closures. The same aligned / unaligned / cmres
+// variants apply as for function evaluation above.
+
+// Call a block (aligned). Returns result as vec4f.
 DAS_API vec4f das_context_eval_block ( das_context * context, das_block * block, vec4f * arguments );
-// evaluate block in daScript context with provided arguments. arguments should be in format of vec4f_unaligned array, where each argument is represented as vec4f_unaligned.
-// this is used when arguments are not guaranteed to be 16-byte aligned. result is also represented as vec4f_unaligned.
+// Call a block (unaligned). Result written into *result.
 DAS_API void das_context_eval_block_unaligned ( das_context * context, das_block * block, vec4f_unaligned * arguments, int narguments, vec4f_unaligned * result );
-// evaluate block in daScript context with provided arguments. arguments should be in format of vec4f array, where each argument is represented as vec4f.
-// this is used when block returns complex result (structure, tuple, etc which is not passed by value).
-// complex result is returned via cmres pointer, which should point to memory allocated by caller with sufficient size to hold the result.
+// Call a block returning a complex result (aligned).
 DAS_API void das_context_eval_block_cmres ( das_context * context, das_block * block, vec4f * arguments, void * cmres );
-// evaluate block in daScript context with provided arguments. arguments should be in format of vec4f_unaligned array, where each argument is represented as vec4f_unaligned.
-// this is used when block returns complex result (structure, tuple, etc which is not passed by value) and arguments are not guaranteed to be 16-byte aligned.
-// complex result is returned via cmres pointer, which should point to memory allocated by caller with sufficient size to hold the result.
+// Call a block returning a complex result (unaligned).
 DAS_API void das_context_eval_block_cmres_unaligned ( das_context * context, das_block * block, vec4f_unaligned * arguments, int narguments, void * cmres );
 
-// introduce handled type for C structure. this is used to bind C structures to daScript.
-// once structure is introduced, it can be used in daScript as a regular structure, and its fields can be accessed from daScript.
+// --- Type binding: structures ---
+
+// Create a handled structure type that mirrors a C struct.
+// 'name' is the daslang name, 'cppname' is the C/C++ type name used for mangling,
+// 'sz' and 'al' are sizeof() and alignof() of the C struct.
+// The returned handle must be populated with das_structure_add_field() and then
+// registered into a module with das_module_bind_structure().
 DAS_API das_structure * das_structure_make ( das_module_group * lib, const char * name, const char * cppname, int sz, int al );
-// add field to introduced structure. this is used to define fields of C structure introduced with das_structure_make.
-// offset is offset of the field in the structure. tname is type of the field in mangled name format
-// see parseTypeFromMangledName from ast_typedecl.cpp for details on mangled name format
+// Add a field to a structure created by das_structure_make().
+// 'offset' is offsetof() of the field in the C struct.
+// 'tname' is the field type in mangled-name format (see type_mangling.rst).
 DAS_API void das_structure_add_field ( das_structure * st, das_module * mod, das_module_group * lib,  const char * name, const char * cppname, int offset, const char * tname );
 
-// introduce handled type for C enumeration. this is used to bind C enumerations to daScript.
-// once enumeration is introduced, it can be used in daScript as a regular enumeration, and its values can be accessed from daScript.
+// --- Type binding: enumerations ---
+
+// Create an enumeration type.
+// 'name' is the daslang name, 'cppname' is the C/C++ type name.
+// 'ext' is non-zero if the enum's underlying storage is int64 (otherwise int).
+// Populate with das_enumeration_add_value(), then register with das_module_bind_enumeration().
 DAS_API das_enumeration * das_enumeration_make ( const char * name, const char * cppname, int ext );
-// add value to introduced enumeration. this is used to define values of C enumeration introduced with das_enumeration_make.
+// Add a named value to an enumeration created by das_enumeration_make().
 DAS_API void das_enumeration_add_value ( das_enumeration * enu, const char * name, const char * cppName, int value );
 
-// create module given name
+// --- Modules ---
+
+// Create a new module with the given name.
+// After populating it with bindings, add it to a module group with das_modulegroup_add_module().
 DAS_API das_module * das_module_create ( char * name );
-// bind interop function to module. this is used to bind C functions to daScript. once function is bound, it can be called from daScript.
+// Bind a C interop function (aligned, vec4f calling convention) to a module.
+// 'name' is the daslang function name, 'cppName' is the C symbol name.
+// 'sideffects' is a combination of SIDEEFFECTS_* flags.
+// 'args' is a mangled signature string describing argument and return types
+// (see type_mangling.rst).
 DAS_API void das_module_bind_interop_function ( das_module * mod, das_module_group * lib, das_interop_function * fun, char * name, char * cppName, uint32_t sideffects, char* args );
-// bind interop function with unaligned arguments to module. this is used to bind C functions to daScript when arguments are not guaranteed to be 16-byte aligned. once function is bound, it can be called from daScript.
+// Bind a C interop function (unaligned, vec4f_unaligned calling convention) to a module.
+// Same parameters as das_module_bind_interop_function(); use this variant when the
+// interop function uses vec4f_unaligned arguments and result.
 DAS_API void das_module_bind_interop_function_unaligned ( das_module * mod, das_module_group * lib, das_interop_function_unaligned * fun, char * name, char * cppName, uint32_t sideffects, char* args );
-// bind alias to module. this is used to bind C type aliases to daScript. once alias is bound, it can be used in daScript as a regular type.
+// Bind a type alias to a module. 'aname' is the alias name visible in daslang,
+// 'tname' is the target type in mangled-name format.
 DAS_API void das_module_bind_alias ( das_module * mod, das_module_group * lib, char * aname, char * tname );
-// bind structure to module. this is used to bind C structures introduced with das_structure_make to daScript. once structure is bound, it can be used in daScript as a regular structure.
+// Register a structure (from das_structure_make()) into a module.
 DAS_API void das_module_bind_structure ( das_module * mod, das_structure * st );
-// bind enumeration to module. this is used to bind C enumerations introduced with das_enumeration_make to daScript. once enumeration is bound, it can be used in daScript as a regular enumeration.
+// Register an enumeration (from das_enumeration_make()) into a module.
 DAS_API void das_module_bind_enumeration ( das_module * mod, das_enumeration * en );
 
-// allocate string in daScript context. this is used to return strings from interop functions to daScript. string should be allocated in daScript context to ensure its lifetime is managed correctly.
+// --- String allocation ---
+
+// Allocate a copy of 'str' on the daslang string heap.
+// Use this to return strings from interop functions; the returned pointer
+// is managed by the context and must not be freed by the caller.
 char * das_allocate_string ( das_context * context, char * str );
 
-// argument getters. these are used to convert arguments from vec4f format to C types in interop functions.
+// --- Argument getters (aligned) ---
+// Extract a C value from a vec4f argument inside an interop function.
+
 DAS_API int    das_argument_int ( vec4f arg );
 DAS_API unsigned int   das_argument_uint ( vec4f arg );
 DAS_API long long das_argument_int64 ( vec4f arg );
@@ -267,7 +360,10 @@ DAS_API das_function * das_argument_function ( vec4f arg );
 DAS_API das_lambda * das_argument_lambda ( vec4f arg );
 DAS_API das_block * das_argument_block ( vec4f arg );
 
-// argument getters for unaligned arguments. these are used to convert arguments from vec4f_unaligned format to C types in interop functions when arguments are not guaranteed to be 16-byte aligned.
+// --- Argument getters (unaligned) ---
+// Extract a C value from a vec4f_unaligned argument pointer.
+// Use these in unaligned interop functions.
+
 DAS_API int das_argument_bool_unaligned ( vec4f_unaligned * arg );
 DAS_API int das_argument_int_unaligned ( vec4f_unaligned * arg );
 DAS_API unsigned int das_argument_uint_unaligned ( vec4f_unaligned * arg );
@@ -281,7 +377,9 @@ DAS_API das_function * das_argument_function_unaligned ( vec4f_unaligned * arg )
 DAS_API das_lambda * das_argument_lambda_unaligned ( vec4f_unaligned * arg );
 DAS_API das_block * das_argument_block_unaligned ( vec4f_unaligned * arg );
 
-// result setters. these are used to convert C types to vec4f format in interop functions when returning values to daScript.
+// --- Result setters (aligned) ---
+// Pack a C value into vec4f for returning from an aligned interop function.
+
 DAS_API vec4f das_result_void ();
 DAS_API vec4f das_result_int ( int r );
 DAS_API vec4f das_result_uint ( unsigned int r );
@@ -296,7 +394,10 @@ DAS_API vec4f das_result_function ( das_function * r );
 DAS_API vec4f das_result_lambda ( das_lambda * r );
 DAS_API vec4f das_result_block ( das_block * r );
 
-// result setters for unaligned results. these are used to convert C types to vec4f_unaligned format in interop functions when returning values to daScript and result is not guaranteed to be 16-byte aligned.
+// --- Result setters (unaligned) ---
+// Write a C value into a vec4f_unaligned result pointer.
+// Use these in unaligned interop functions.
+
 DAS_API void das_result_void_unaligned ( vec4f_unaligned * result );
 DAS_API void das_result_int_unaligned ( vec4f_unaligned * result, int r );
 DAS_API void das_result_uint_unaligned ( vec4f_unaligned * result, unsigned int r );
@@ -310,6 +411,87 @@ DAS_API void das_result_ptr_unaligned ( vec4f_unaligned * result, void * r );
 DAS_API void das_result_function_unaligned ( vec4f_unaligned * result, das_function * r );
 DAS_API void das_result_lambda_unaligned ( vec4f_unaligned * result, das_lambda * r );
 DAS_API void das_result_block_unaligned ( vec4f_unaligned * result, das_block * r );
+
+// --- Compilation policies ---
+// CodeOfPolicies controls compiler and runtime behavior: AOT, safety,
+// memory limits, and more.  Create a policies object, set individual
+// fields, then pass it to das_program_compile_policies().
+
+// Boolean policy flags (on / off).
+typedef enum das_bool_policy {
+    DAS_POLICY_AOT = 1,                         // Enable ahead-of-time compilation linking
+    DAS_POLICY_NO_UNSAFE,                        // Forbid unsafe blocks
+    DAS_POLICY_NO_GLOBAL_VARIABLES,              // Forbid module-level var declarations
+    DAS_POLICY_NO_GLOBAL_HEAP,                   // Forbid heap allocations for globals
+    DAS_POLICY_NO_INIT,                          // Forbid [init] functions
+    DAS_POLICY_FAIL_ON_NO_AOT,                   // Treat missing AOT as error
+    DAS_POLICY_THREADLOCK_CONTEXT,               // Enable context mutex for threading
+    DAS_POLICY_INTERN_STRINGS,                   // Use string interning for the string heap
+    DAS_POLICY_PERSISTENT_HEAP,                  // Persistent heap (no GC between calls)
+    DAS_POLICY_MULTIPLE_CONTEXTS,                // Enable context-safe code generation
+    DAS_POLICY_STRICT_SMART_POINTERS,            // Strict smart pointer rules (var inscope, etc.)
+    DAS_POLICY_RTTI,                             // Generate extended RTTI
+    DAS_POLICY_NO_OPTIMIZATIONS                  // Disable all optimizations
+} das_bool_policy;
+
+// Integer policy fields (stack size, heap limits).
+typedef enum das_int_policy {
+    DAS_POLICY_STACK = 1,                        // Context stack size in bytes (uint32)
+    DAS_POLICY_MAX_HEAP_ALLOCATED,               // Max heap allocated in bytes (uint64, 0 = unlimited)
+    DAS_POLICY_MAX_STRING_HEAP_ALLOCATED,         // Max string heap allocated in bytes (uint64, 0 = unlimited)
+    DAS_POLICY_HEAP_SIZE_HINT,                   // Initial heap size hint in bytes (uint32)
+    DAS_POLICY_STRING_HEAP_SIZE_HINT             // Initial string heap size hint in bytes (uint32)
+} das_int_policy;
+
+// Create a new policies object with default values.
+DAS_API das_policies * das_policies_make();
+// Release a policies object.
+DAS_API void das_policies_release ( das_policies * policies );
+// Set a boolean policy flag. Returns 1 on success, 0 if the flag is unknown.
+DAS_API int das_policies_set_bool ( das_policies * policies, das_bool_policy flag, int value );
+// Set an integer policy field. Returns 1 on success, 0 if the field is unknown.
+DAS_API int das_policies_set_int ( das_policies * policies, das_int_policy field, int64_t value );
+
+// Compile a daslang program with custom compilation policies.
+// Same as das_program_compile() but applies the given CodeOfPolicies.
+DAS_API das_program * das_program_compile_policies ( char * program_file, das_file_access * access, das_text_writer * tout, das_module_group * libgroup, das_policies * policies );
+
+// --- Context variables ---
+// After simulation, global variables declared in daslang are accessible
+// by name or by index. findVariable returns -1 if not found.
+
+// Look up a global variable by name. Returns its index, or -1 if not found.
+DAS_API int das_context_find_variable ( das_context * context, const char * name );
+// Get a raw pointer to the storage of a global variable at index 'idx'.
+// Cast to the appropriate C type (e.g. int32_t*, float*, char**).
+DAS_API void * das_context_get_variable ( das_context * context, int idx );
+// Return the total number of global variables in the context.
+DAS_API int das_context_get_total_variables ( das_context * context );
+// Return the name of the global variable at index 'idx', or NULL if out of range.
+DAS_API const char * das_context_get_variable_name ( das_context * context, int idx );
+// Return the size (in bytes) of the global variable at index 'idx', or 0 if out of range.
+DAS_API int das_context_get_variable_size ( das_context * context, int idx );
+
+// --- Serialization ---
+// Serialize a compiled+simulated program to a binary blob and deserialize
+// it back. Deserialized programs skip parsing and type inference.
+
+// Serialize a compiled program to an opaque binary blob.
+// The program must have been simulated at least once before serialization.
+// Returns a handle to the serialized data; use das_serialized_data_release() to free it.
+// 'out_data' receives a pointer to the raw bytes, 'out_size' receives the byte count.
+DAS_API das_serialized_data * das_program_serialize ( das_program * program, const void ** out_data, int64_t * out_size );
+// Deserialize a program from a raw byte buffer.
+// Returns a new program handle that must be released with das_program_release().
+DAS_API das_program * das_program_deserialize ( const void * data, int64_t size );
+// Release serialized data returned by das_program_serialize().
+DAS_API void das_serialized_data_release ( das_serialized_data * blob );
+
+// --- Function info ---
+
+// Return 1 if the function has been AOT-linked, 0 otherwise.
+// Use this after simulation to check whether functions execute as native code.
+DAS_API int das_function_is_aot ( das_function * func );
 
 #ifdef __cplusplus
 }

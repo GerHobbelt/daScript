@@ -4,7 +4,7 @@
   Tutorials
 *****************************
 
-This section provides a series of hands-on tutorials that introduce daScript's
+This section provides a series of hands-on tutorials that introduce daslang's
 core features step by step. Each tutorial comes with a companion ``.das`` file
 in the ``tutorials/language/`` directory that you can run directly::
 
@@ -46,3 +46,58 @@ introduced in earlier tutorials.
    tutorials/29_functional.rst
    tutorials/30_json.rst
    tutorials/31_regex.rst
+   tutorials/32_operator_overloading.rst
+   tutorials/33_algorithm.rst
+   tutorials/34_decs.rst
+   tutorials/35_jobque.rst
+
+C Integration Tutorials
+-----------------------
+
+These tutorials show how to embed daslang in a C application using the
+``daScriptC.h`` API.  Each tutorial comes with a ``.c`` source file and a
+companion ``.das`` script in ``tutorials/integration/c/``.
+
+.. toctree::
+   :maxdepth: 1
+
+   tutorials/integration_c_01_hello_world.rst
+   tutorials/integration_c_02_calling_functions.rst
+   tutorials/integration_c_03_binding_types.rst
+   tutorials/integration_c_04_callbacks.rst
+   tutorials/integration_c_05_unaligned_advanced.rst
+   tutorials/integration_c_06_sandbox.rst
+   tutorials/integration_c_07_context_variables.rst
+   tutorials/integration_c_08_serialization.rst
+   tutorials/integration_c_09_aot.rst
+
+C++ Integration Tutorials
+--------------------------
+
+These tutorials show how to embed daslang in a C++ application using the
+native ``daScript.h`` API.  Each tutorial comes with a ``.cpp`` source file
+and a companion ``.das`` script in ``tutorials/integration/cpp/``.
+
+.. toctree::
+   :maxdepth: 1
+
+   tutorials/integration_cpp_01_hello_world.rst
+   tutorials/integration_cpp_02_calling_functions.rst
+   tutorials/integration_cpp_03_binding_functions.rst
+   tutorials/integration_cpp_04_binding_types.rst
+   tutorials/integration_cpp_05_binding_enums.rst
+   tutorials/integration_cpp_06_interop.rst
+   tutorials/integration_cpp_07_callbacks.rst
+   tutorials/integration_cpp_08_methods.rst
+   tutorials/integration_cpp_09_operators_and_properties.rst
+   tutorials/integration_cpp_10_custom_modules.rst
+   tutorials/integration_cpp_11_context_variables.rst
+   tutorials/integration_cpp_12_smart_pointers.rst
+   tutorials/integration_cpp_13_aot.rst
+   tutorials/integration_cpp_14_serialization.rst
+   tutorials/integration_cpp_15_custom_annotations.rst
+   tutorials/integration_cpp_16_sandbox.rst
+   tutorials/integration_cpp_17_coroutines.rst
+   tutorials/integration_cpp_18_dynamic_scripts.rst
+   tutorials/integration_cpp_19_class_adapters.rst
+   tutorials/integration_cpp_20_standalone_contexts.rst

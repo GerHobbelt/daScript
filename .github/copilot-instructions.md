@@ -1,8 +1,10 @@
-# daScript Project Instructions
+# daslang Project Instructions
+
+> **Keep in sync:** This file and `CLAUDE.md` (repo root) share identical content. When updating one, copy the changes to the other so both GitHub Copilot and Claude Code see the same project instructions.
 
 ## Project Overview
 
-This is the [daScript](https://dascript.org/) programming language repository (GaijinEntertainment/daScript). daScript is a high-performance statically-typed scripting language designed for games and real-time applications.
+This is the [daslang](https://dascript.org/) programming language repository (GaijinEntertainment/daScript). daslang (formerly daScript) is a high-performance statically-typed scripting language designed for games and real-time applications. The language has been renamed to **daslang**, but the repository and many C++ API names still use the old "daScript" spelling.
 
 ## Build & Run
 
@@ -13,7 +15,32 @@ This is the [daScript](https://dascript.org/) programming language repository (G
 - **Run a script:** `bin/Release/daslang.exe path/to/script.das`
 - **Run tests:** `bin/Release/daslang.exe dastest/dastest.das -- --test path/to/test.das`
 
-## daScript Language — Gen2 Syntax (REQUIRED)
+## Code Formatting (REQUIRED)
+
+After creating or modifying any `.das` file that is part of the project (daslib modules, tutorials, tests, etc.), run the source formatter on it. Do NOT format temporary/scratch files that will be deleted.
+
+**Formatter tool:** `utils/dasCodeFormatter/main.das`
+
+**Procedure:**
+
+1. **Back up** the file before formatting: copy it to `<filename>.das.bak`
+2. **Run the formatter:** `bin/Release/daslang.exe utils/dasCodeFormatter/main.das -- path/to/file.das`
+3. **Verify** the formatted file still compiles: `bin/Release/daslang.exe path/to/file.das`
+   - For test files (no `main`), compile-check with: `bin/Release/daslang.exe dastest/dastest.das -- --test path/to/test.das`
+   - For module files (no `main`), verify by running a file that requires them
+4. **Remove the backup** if formatting succeeded: delete `<filename>.das.bak`
+5. **Restore from backup** if formatting broke the file: copy `.das.bak` back over the `.das` file, delete the backup, and report the issue
+
+**When to format:**
+- New `.das` files: tutorials, tests, daslib modules, utilities
+- Modified `.das` files: after any edits to existing project files
+
+**When NOT to format:**
+- Temporary/scratch files that will be deleted immediately
+- Files you are only reading, not modifying
+- C++ source files, RST docs, Python scripts, etc. (only `.das` files)
+
+## daslang Language — Gen2 Syntax (REQUIRED)
 
 All code examples and documentation MUST use gen2 syntax (add `options gen2` at the top of every file). Key rules:
 
@@ -46,7 +73,7 @@ All code examples and documentation MUST use gen2 syntax (add `options gen2` at 
 
 ### Memory management
 
-- daScript has garbage collection — `delete` is not required in most code
+- daslang has garbage collection — `delete` is not required in most code
 - `delete` is available for explicit cleanup but requires `unsafe` for heap pointers
 - `var inscope` declares automatic cleanup in a `finally` block
 - Prefer omitting `delete` in tutorials and examples unless the topic is memory management
@@ -94,12 +121,13 @@ All code examples and documentation MUST use gen2 syntax (add `options gen2` at 
 - `doc/source/reference/language/` — RST language documentation (36 files)
 - `doc/source/stdlib/` — RST standard library documentation (auto-generated + handmade)
 - `doc/reflections/` — Documentation generation tools (das2rst.das, rst.das, gen_module_examples.py)
-- `tutorials/language/` — Language tutorial `.das` files (29 progressive tutorials)
+- `tutorials/language/` — Language tutorial `.das` files (32 progressive tutorials)
+- `tutorials/integration/cpp/` — C++ integration tutorials (embedding daslang in C++ host applications)
 - `doc/source/reference/tutorials/` — RST companion pages for each tutorial
 - `tests/linq/` — LINQ module tests (15 test files, ~500 tests)
 - `tests/functional/` — Functional module tests
 - `tests/json/` — JSON module tests (4 test files, ~148 tests)
-- `tests/regex/` — Regex module tests (5 test files, 162 tests)
+- `tests/regex/` — Regex module tests (8 test files, 278 tests)
 - `modules/` — External plugin modules
 
 ## Standard Library Documentation
@@ -159,11 +187,263 @@ Tutorial RST files live in `doc/source/reference/tutorials/` with companion `.da
   - Next tutorial link (except last): `Next tutorial: :ref:\`tutorial_next_name\``
   - Related language reference links via `:ref:`
 - Toctree is in `doc/source/reference/tutorials.rst` — add new tutorials there
-- Tutorial labels for cross-references: `tutorial_hello_world`, `tutorial_variables`, `tutorial_operators`, `tutorial_control_flow`, `tutorial_functions`, `tutorial_arrays`, `tutorial_strings`, `tutorial_structs`, `tutorial_enumerations`, `tutorial_tables`, `tutorial_tuples_and_variants`, `tutorial_function_pointers`, `tutorial_blocks`, `tutorial_lambdas`, `tutorial_iterators_and_generators`, `tutorial_modules`, `tutorial_move_copy_clone`, `tutorial_classes`, `tutorial_generics`, `tutorial_lifetime`, `tutorial_error_handling`, `tutorial_unsafe`, `tutorial_string_format`, `tutorial_pattern_matching`, `tutorial_annotations`, `tutorial_contracts`, `tutorial_testing`, `tutorial_linq`, `tutorial_functional`, `tutorial_json`, `tutorial_regex`
+
+### C++ integration tutorial RST conventions
+
+C++ integration tutorial RST files live in `doc/source/reference/tutorials/` with `.cpp` and `.das` files in `tutorials/integration/cpp/`.
+
+- Label pattern: `.. _tutorial_integration_cpp_<topic>:` (e.g., `.. _tutorial_integration_cpp_binding_types:`)
+- Index entries: `single: Tutorial; C++ Integration; <Topic>`
+- Code blocks: `.. code-block:: cpp` for C++ code, `.. code-block:: das` for daslang code
+- Build & run section with `cmake --build` command and expected output
+- End with `.. seealso::` containing:
+  - `:download:` links for both `.cpp` and `.das` source files
+  - Previous/Next tutorial links via `:ref:`
+- Each tutorial is one self-contained `.cpp` file with embedded `main()` — no separate build infrastructure needed beyond CMake target
+- Tutorial CMake targets: `integration_cpp_01` through `integration_cpp_NN` (defined in `tutorials/integration/cpp/CMakeLists.txt`)
+
+- Tutorial labels for cross-references: `tutorial_hello_world`, `tutorial_variables`, `tutorial_operators`, `tutorial_control_flow`, `tutorial_functions`, `tutorial_arrays`, `tutorial_strings`, `tutorial_structs`, `tutorial_enumerations`, `tutorial_tables`, `tutorial_tuples_and_variants`, `tutorial_function_pointers`, `tutorial_blocks`, `tutorial_lambdas`, `tutorial_iterators_and_generators`, `tutorial_modules`, `tutorial_move_copy_clone`, `tutorial_classes`, `tutorial_generics`, `tutorial_lifetime`, `tutorial_error_handling`, `tutorial_unsafe`, `tutorial_string_format`, `tutorial_pattern_matching`, `tutorial_annotations`, `tutorial_contracts`, `tutorial_testing`, `tutorial_linq`, `tutorial_functional`, `tutorial_json`, `tutorial_regex`, `tutorial_operator_overloading`
+- C++ integration tutorial labels: `tutorial_integration_cpp_hello_world`, `tutorial_integration_cpp_calling_functions`, `tutorial_integration_cpp_binding_functions`, `tutorial_integration_cpp_binding_types`, `tutorial_integration_cpp_binding_enums`, `tutorial_integration_cpp_interop`, `tutorial_integration_cpp_callbacks`, `tutorial_integration_cpp_methods`, `tutorial_integration_cpp_operators_and_properties`
+- C++ integration tutorial plan (remaining): 10 Custom Modules, 11 Context Variables, 12 Smart Pointers & GC, 13 AOT, 14 Serialization, 15 Custom Annotations, 16 Sandbox
+
+## C++ Integration Patterns
+
+These patterns are used in C++ host applications that embed daslang.
+
+### Host program boilerplate
+
+Every C++ host that runs daslang scripts follows this pattern:
+
+```cpp
+#include "daScript/daScript.h"
+using namespace das;
+
+void run_script() {
+    TextPrinter tout;
+    ModuleGroup dummyLibGroup;
+    auto fAccess = make_smart<FsFileAccess>();
+    auto program = compileDaScript(getDasRoot() + "/path/to/script.das",
+                                   fAccess, tout, dummyLibGroup);
+    if (program->failed()) { /* report errors */ return; }
+    Context ctx(program->getContextStackSize());
+    if (!program->simulate(ctx, tout)) { /* report errors */ return; }
+    auto fn = ctx.findFunction("test");
+    ctx.evalWithCatch(fn, nullptr);
+}
+
+int main(int, char * []) {
+    NEED_ALL_DEFAULT_MODULES;
+    NEED_MODULE(Module_MyModule);  // custom modules
+    Module::Initialize();
+    run_script();
+    Module::Shutdown();
+    return 0;
+}
+```
+
+### Creating a module
+
+Derive from `Module`, register types/functions/enums in the constructor, then use `REGISTER_MODULE`:
+
+```cpp
+class Module_MyMod : public Module {
+public:
+    Module_MyMod() : Module("my_module_name") {
+        ModuleLibrary lib(this);
+        lib.addBuiltInModule();
+        // addAnnotation, addExtern, addEnumeration, addConstant ...
+    }
+};
+REGISTER_MODULE(Module_MyMod);
+```
+
+The host uses `NEED_MODULE(Module_MyMod)` before `Module::Initialize()`.  Scripts access it via `require my_module_name`.
+
+### Callbacks — `TBlock<>`, `TFunc<>`, `TLambda<>`, `das_invoke*`
+
+Three closure types exist, each with a typed template and an invocation helper:
+
+| Type | Template | Invocation | Lifetime |
+|------|----------|------------|----------|
+| Block | `TBlock<Ret, Args...>` | `das_invoke<Ret>::invoke(ctx, at, blk, args...)` | Stack-bound — valid only during the call |
+| Func | `TFunc<Ret, Args...>` (or untyped `Func`) | `das_invoke_function<Ret>::invoke(ctx, at, fn, args...)` | Context-bound — storable |
+| Lambda | `TLambda<Ret, Args...>` (or untyped `Lambda`) | `das_invoke_lambda<Ret>::invoke(ctx, at, lmb, args...)` | Heap-allocated — captures variables |
+
+**Typed vs untyped**: `TBlock<int,int>` maps to `block<(arg:int):int>` in daslang — the compiler checks signatures. Untyped `Lambda` maps to `lambda<>` and will **not** match typed lambdas like `lambda<(x:int):int>`. Prefer typed templates.
+
+**Block callback example**:
+
+```cpp
+void with_values(int32_t a, int32_t b,
+                 const TBlock<void, int32_t, int32_t> & blk,
+                 Context * context, LineInfoArg * at) {
+    das_invoke<void>::invoke(context, at, blk, a, b);
+}
+
+addExtern<DAS_BIND_FUN(with_values)>(*this, lib, "with_values",
+    SideEffects::invoke, "with_values")
+        ->args({"a", "b", "blk", "context", "at"});
+```
+
+Use `SideEffects::invoke` for any function that invokes script callbacks.
+
+In daslang: blocks use `<|` with `$()` prefix, function pointers use `@@func_name`, lambdas use `@(args) { body }`.
+
+### Calling daslang functions from C++ — `das_invoke_function`
+
+The high-level `das_invoke_function<ReturnType>::invoke(ctx, at, fnPtr, arg1, arg2, ...)` handles argument marshalling automatically.  Preferred over raw `cast<>` + `evalWithCatch`.
+
+### Binding C++ functions — `addExtern` + `DAS_BIND_FUN`
+
+```cpp
+addExtern<DAS_BIND_FUN(cpp_function)>(*this, lib, "das_name",
+    SideEffects::none, "cpp_function")
+        ->args({"param1", "param2"});
+```
+
+`SideEffects` flags: `none` (pure), `modifyExternal` (stdout/files), `modifyArgument` (mutates ref params), `accessGlobal` (reads shared state), `invoke` (calls daslang), `worstDefault` (safe fallback).
+
+### Binding C++ types — `MAKE_TYPE_FACTORY` + `ManagedStructureAnnotation`
+
+1. **`MAKE_TYPE_FACTORY(DasName, CppType)`** at file scope — creates `typeFactory<CppType>` + `typeName<CppType>`
+2. **`ManagedStructureAnnotation<T, canNew, canDelete>`** — describe fields with `addField<DAS_BIND_MANAGED_FIELD(member)>("name", "name")`
+3. **`addAnnotation(make_smart<MyAnnotation>(lib))`** in the module — order matters: if type B contains type A, register A first
+4. Functions returning bound types by value require **`SimNode_ExtFuncCallAndCopyOrMove`** template parameter in `addExtern`
+
+**Handled types are reference types** — important consequences for scripts:
+- Mutable local variables (`var`) of handled types require `unsafe` blocks
+- Immutable locals (`let`) returned from factory functions work without `unsafe`
+- **Factory function pattern**: provide `make_xxx()` functions returning by value so scripts can create instances ergonomically with `let x = make_xxx(...)` — no `unsafe` needed
+- POD structs (no default member initializers, no virtual functions) work best with `ManagedStructureAnnotation`
+
+### Binding C++ methods — `DAS_CALL_MEMBER` + `DAS_CALL_METHOD`
+
+daslang has no member functions — "methods" are free functions where the first argument is `self`. Pipe syntax (`obj |> method()`) provides method-call ergonomics.
+
+```cpp
+// Step 1: Create wrapper aliases
+using method_increment = DAS_CALL_MEMBER(Counter::increment);
+using method_get       = DAS_CALL_MEMBER(Counter::get);
+
+// Step 2: Register with addExtern
+addExtern<DAS_CALL_METHOD(method_increment)>(*this, lib, "increment",
+    SideEffects::modifyArgument,
+    DAS_CALL_MEMBER_CPP(Counter::increment))
+        ->args({"self"});
+
+addExtern<DAS_CALL_METHOD(method_get)>(*this, lib, "get",
+    SideEffects::none,
+    DAS_CALL_MEMBER_CPP(Counter::get))
+        ->args({"self"});
+```
+
+- **Non-const methods**: `SideEffects::modifyArgument` (they mutate the object)
+- **Const methods**: `SideEffects::none`
+- `DAS_CALL_MEMBER_CPP(Class::method)` provides the AOT-compatible name string
+
+### Binding operators and properties
+
+**Operators**: register functions with the operator symbol as the daslang name:
+
+```cpp
+addExtern<DAS_BIND_FUN(vec3_add), SimNode_ExtFuncCallAndCopyOrMove>(
+    *this, lib, "+", SideEffects::none, "vec3_add")->args({"a", "b"});
+// Unary: addExtern<...>(*this, lib, "-", ...)->args({"a"});
+```
+
+Available operator names: `+`, `-`, `*`, `/`, `%`, `<<`, `>>`, `<`, `>`, `<=`, `>=`, `&`, `|`, `^`.
+
+**Equality**: `addEquNeq<T>(*this, lib)` binds both `==` and `!=` (requires `operator==` and `operator!=` on T).
+
+**Properties**: method calls disguised as field access in `ManagedStructureAnnotation`:
+
+```cpp
+addProperty<DAS_BIND_MANAGED_PROP(length)>("length", "length");
+```
+
+In daslang, `v.length` calls `Vec3::length()` — looks like a field, calls a method.
+
+### Binding C++ enums — `DAS_BASE_BIND_ENUM`
+
+```cpp
+// MUST come BEFORE `using namespace das` to avoid name collisions
+DAS_BASE_BIND_ENUM(CppEnum, DasName, Value1, Value2, Value3)
+
+using namespace das;
+
+// In module constructor:
+addEnumeration(make_smart<EnumerationDasName>());
+```
+
+- `DAS_BASE_BIND_ENUM` creates class `EnumerationDasName` + `typeFactory<CppEnum>`
+- `DAS_BIND_ENUM_CAST(CppEnum)` — explicit `cast<>` specialization (often not needed, SFINAE default suffices)
+- `DAS_BASE_BIND_ENUM_98` — for unscoped (C-style) enums
+- **Critical**: place enum macros BEFORE `using namespace das` — the macros define names inside `namespace das` that collide with global enum names
+- **Name collision pitfall**: `das::LogLevel` is defined internally in `include/daScript/misc/string_writer.h` — do NOT name your enum `LogLevel` when `using namespace das`
+- Manual construction alternative: `make_smart<Enumeration>("Name")` + `pEnum->addIEx("Value", "CppEnum::Value", intValue, LineInfo())`
+
+### Low-level interop — `addInterop`
+
+`addInterop` binds a C++ function that receives raw simulation-level arguments (`vec4f *`), the call node (`SimNode_CallBase *`), and the context. Unlike `addExtern`, it supports **"any type" arguments** — when a template parameter is `vec4f`, it means the argument can be any daslang type. The function inspects `call->types[i]` (`TypeInfo *`) at runtime to determine what was actually passed.
+
+**Signature**: the C++ function must match `InteropFunction`:
+
+```cpp
+// typedef vec4f (*InteropFunction)(Context &, SimNode_CallBase *, vec4f *);
+vec4f my_interop(Context & context, SimNode_CallBase * call, vec4f * args) {
+    TypeInfo * ti = call->types[0];   // type info for first argument
+    // ... inspect ti->type, ti->structType, etc.
+    return v_zero();
+}
+```
+
+**Registration**:
+
+```cpp
+addInterop<my_interop, ReturnType, ArgType1, ArgType2>(
+    *this, lib, "das_name", SideEffects::none, "my_interop");
+```
+
+Where `vec4f` as an `ArgType` means "any type" — the argument accepts any daslang value. Concrete types (e.g. `int32_t`, `const char *`, `const Block &`) are also valid and work like `addExtern`.
+
+**Key capabilities** (vs `addExtern`):
+- Access to `call->types[]` — per-argument `TypeInfo` with full type metadata
+- Access to `call->debugInfo` — source location of the call site
+- `vec4f` argument type = "any" — accept arguments of any daslang type
+- Used internally for `sprint`, `hash`, `write`, `binary_save/load`, `invoke_in_context`
+
+**TypeInfo union warning**: `TypeInfo` has a union — `structType`, `enumType`, and `annotation_or_name` share the same memory. Which member is valid depends on `ti->type`:
+- `tStructure` → `ti->structType` (StructInfo *)
+- `tEnumeration` / `tEnumeration8` / `tEnumeration16` → `ti->enumType` (EnumInfo *)
+- `tHandle` → use `ti->getAnnotation()` (resolves tagged pointer safely)
+
+Accessing the wrong union member is **undefined behavior**. `das_to_string(Type::tHandle)` returns an empty string — use `ti->getAnnotation()->name` for handled type names.
+
+**Example** — `new_and_init` allocates and initializes any struct:
+
+```cpp
+vec4f new_and_init(Context & context, SimNode_CallBase * call, vec4f * args) {
+    TypeInfo * typeInfo = call->types[0];
+    if (typeInfo->type != Type::tStructure)
+        context.throw_error_at(call->debugInfo, "expected struct");
+    auto size = getTypeSize(typeInfo);
+    auto data = context.allocate(size, &call->debugInfo);
+    if (typeInfo->structType && typeInfo->structType->init_mnh) {
+        auto fn = context.fnByMangledName(typeInfo->structType->init_mnh);
+        context.callWithCopyOnReturn(fn, nullptr, data, 0);
+    } else {
+        memset(data, 0, size);
+    }
+    return cast<char *>::from(data);
+}
+
+addInterop<new_and_init, void *, vec4f>(*this, lib, "new_and_init",
+    SideEffects::none, "new_and_init");
+```
 
 ## C++ Codebase Notes
 
-- Main type inference: `src/ast/ast_infer_type.cpp` (very large file)
+- Main type inference: `src/ast/ast_infer_type.cpp` (implementation) + `include/daScript/ast/ast_infer_type.h` (class declarations for `CaptureLambda` and `InferTypes`)
 - Builtin runtime functions: `src/builtin/module_builtin_runtime.cpp`
 - Smart pointer builtins: `move`, `move_new`, `smart_ptr_clone`, `smart_ptr_use_count`
 - Compilation errors: `include/daScript/ast/compilation_errors.h` (error codes 10001–40214)
@@ -260,7 +540,8 @@ Many daslib functions follow this convention for iterator-based operations:
 - `daslib/functional.das` — lazy iterator adapters and higher-order function utilities (filter, map, reduce, fold, scan, enumerate, chain, pairwise, iterate, find, find_index, partition, tap, for_each, flat_map, sorted, repeat, cycle, islice, echo, sum, any, all). Uses lambdas/functions for generator-returning functions (blocks cannot be captured into generators). Non-generator functions (reduce, fold, for_each, find, find_index, partition) also accept blocks.
 - `daslib/strings_boost.das` — string manipulation helpers
 - `daslib/json.das` / `daslib/json_boost.das` — JSON parsing/generation. Core: `JsValue` variant (7 types: `_object`, `_array`, `_string`, `_number`, `_longint`, `_bool`, `_null`), `JsonValue` struct wrapper, `read_json`, `write_json`, `JV()` constructors, `JVNull()`. Boost: safe access (`?.`, `?[]`, `??`), `from_JV`/`JV` generic struct↔JSON conversion, `%json~...%%` reader macro, `BetterJsonMacro` (`is`/`as` on `JsonValue?`). Settings: `set_no_trailing_zeros`, `set_no_empty_arrays`, `set_allow_duplicate_keys`. `try_fixing_broken_json` repairs LLM output. Key gotcha: `js?.value` accesses `JsonValue.value` field (returns `JsValue`), not a JSON key named "value" — use `js?["value"]` for that.
-- `daslib/regex.das` / `daslib/regex_boost.das` — regular expressions. Re-exports `strings` publicly (`require strings public`), so `require daslib/regex` makes `slice`, `starts_with`, etc. available. Core: recursive-descent parser building `ReNode` AST, function-pointer-driven backtracking matcher. `Regex` struct, `regex_compile(pattern)`, `regex_match(re, str, offset=0)` → end position or -1, `regex_search(re, str, offset=0)` → `int2(start, end)` or `int2(-1,-1)` (finds first match anywhere), `regex_group(re, group_num, str)` → captured substring, `regex_group_by_name(re, name, str)` → named group substring, `re[index]` → `range` for group by int index (1-based), `re["name"]` → `range` for named group (returns `range(0,0)` if not found), `regex_foreach(re, str, block)` iterates all matches passing `range` values, `regex_replace(re, str, block)` replaces matches, `regex_split(re, str)` → `array<string>` of substrings between matches, `regex_match_all(re, str)` → `array<range>` of all match ranges, `is_valid(re)` checks compilation. Supports: `.` (any), `^` (BOL), `$` (EOL), `+` `*` `?` quantifiers (greedy), `+?` `*?` `??` quantifiers (lazy), `{n}` `{n,}` `{n,m}` counted quantifiers (greedy), `{n}?` `{n,}?` `{n,m}?` counted quantifiers (lazy), `(...)` capturing groups, `(?:...)` non-capturing groups, `(?P<name>...)` named capturing groups, `|` alternation, `[abc]` `[a-z]` `[^...]` character sets, `\w` `\W` `\d` `\D` `\s` `\S` classes, `\b` `\B` word boundaries, `\t` `\n` `\r` `\f` `\v` escapes, `\xHH` hex escapes. ASCII only (256-bit CharSet). Boost: `%regex~pattern%%` reader macro (compile-time, no double-escaping). Key gotchas: `{` must be escaped as `\{` in daScript strings for counted quantifiers (`"\\d\{3}"`), but reader macro takes literal text (`%regex~\d{3}%%`). `regex_match` always matches from position 0 (or offset) — it does NOT search for the pattern; use `regex_search` for first occurrence or `regex_foreach`/`regex_match_all` to find all occurrences. Nested groups have limited support — prefer sequential groups. `-` is only special inside `[...]` character sets.
+- `daslib/regex.das` / `daslib/regex_boost.das` — regular expressions. Re-exports `strings` publicly (`require strings public`), so `require daslib/regex` makes `slice`, `starts_with`, etc. available. Core: recursive-descent parser building `ReNode` AST, function-pointer-driven backtracking matcher. `Regex` struct, `regex_compile(pattern, case_insensitive=false, dot_all=false)`, `regex_match(re, str, offset=0)` → end position or -1, `regex_search(re, str, offset=0)` → `int2(start, end)` or `int2(-1,-1)` (finds first match anywhere), `regex_group(re, group_num, str)` → captured substring, `regex_group_by_name(re, name, str)` → named group substring, `re[index]` → `range` for group by int index (1-based), `re["name"]` → `range` for named group (returns `range(0,0)` if not found), `regex_foreach(re, str, block)` iterates all matches passing `range` values, `regex_replace(re, str, block)` replaces matches via block, `regex_replace(re, str, replacement)` replaces matches with template string (`$0`/`$&` for whole match, `$1`-`$9` for numbered groups, `${name}` for named groups, `$$` for literal `$`), `regex_split(re, str)` → `array<string>` of substrings between matches, `regex_match_all(re, str)` → `array<range>` of all match ranges, `is_valid(re)` checks compilation. Supports: `.` (any char except newline — use `dot_all=true` to also match `\n`), `^` (BOL), `$` (EOL), `+` `*` `?` quantifiers (greedy), `+?` `*?` `??` quantifiers (lazy), `{n}` `{n,}` `{n,m}` counted quantifiers (greedy), `{n}?` `{n,}?` `{n,m}?` counted quantifiers (lazy), `(...)` capturing groups, `(?:...)` non-capturing groups, `(?P<name>...)` named capturing groups, `(?=...)` positive lookahead, `(?!...)` negative lookahead, `|` alternation, `[abc]` `[a-z]` `[^...]` character sets, `\w` `\W` `\d` `\D` `\s` `\S` classes, `\b` `\B` word boundaries, `\t` `\n` `\r` `\f` `\v` escapes, `\xHH` hex escapes. ASCII only (256-bit CharSet). Flags: `case_insensitive=true` for case-insensitive matching (ASCII only), `dot_all=true` for dot matching newline. Boost: `%regex~pattern%%` reader macro (compile-time, no double-escaping); flags via `%regex~pattern~flags%%` where `i`=case-insensitive, `s`=dotAll. Key gotchas: `{` must be escaped as `\{` in daslang strings for counted quantifiers (`"\\d\{3}"`), but reader macro takes literal text (`%regex~\d{3}%%`). `regex_match` always matches from position 0 (or offset) — it does NOT search for the pattern; use `regex_search` for first occurrence or `regex_foreach`/`regex_match_all` to find all occurrences. Nested groups have limited support — prefer sequential groups. `-` is only special inside `[...]` character sets. Quantifiers on lookaheads are not allowed.
+- `daslib/flat_hash_table.das` — template-based open-addressing hash table (`TFlatHashTable`) with methods: `empty`, `length`, `clear`, `grow`, `rehash`, `reserve`, `key_index`, `key_exists`, `get`, `erase`, `foreach`, `keys`, `values`, `operator[]`, `operator?[]`
 - `daslib/builtin.das` — core builtins like `to_array`, `to_table`
 
 ## Keywords Reference

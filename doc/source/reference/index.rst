@@ -1,7 +1,7 @@
 .. _reference:
 
 #################################
-  Daslang 0.5 Reference Manual
+  Daslang 0.6 Reference Manual
 #################################
 
 Copyright (c) 2018-2024 Gaijin Entertainment
@@ -22,6 +22,6 @@ THE SOFTWARE.
    :numbered:
 
    introduction.rst
-   tutorials.rst
    language.rst
    embedding.rst
+   tutorials.rst

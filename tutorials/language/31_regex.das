@@ -21,6 +21,11 @@
 //   - Non-capturing groups (?:...)
 //   - Named groups (?P<name>...) and regex_group_by_name
 //   - Lazy quantifiers: *? +? ?? {n,m}?
+//   - Case-insensitive matching
+//   - Dot/newline behavior and dot_all mode
+//   - Lookahead assertions (?=...) (?!...)
+//   - Template-string regex_replace with $1/${name}
+//   - Reader macro flags (~i, ~s)
 //
 // requires:  daslib/regex, daslib/regex_boost
 // Run: daslang.exe tutorials/language/31_regex.das
@@ -30,9 +35,7 @@ options persistent_heap
 
 require daslib/regex_boost
 
-// ===========================
-//  Compiling and Matching
-// ===========================
+// === Compiling and Matching ===
 // regex_compile creates a Regex from a pattern string.
 // regex_match returns the end position of the match from position 0, or -1.
 
@@ -59,9 +62,7 @@ def compiling_and_matching() {
     // output: match 'world' at offset 6: 11
 }
 
-// ===========================
-//  Character Classes
-// ===========================
+// === Character Classes ===
 // \w = word chars [a-zA-Z0-9_]   \W = non-word chars
 // \d = digits [0-9]               \D = non-digits
 // \s = whitespace (space, \t, \n, \r, \f, \v)  \S = non-whitespace
@@ -90,9 +91,7 @@ def character_classes() {
     // output: non-space: 3
 }
 
-// ===========================
-//  Anchors
-// ===========================
+// === Anchors ===
 // ^ anchors to the beginning of the string
 // $ anchors to the end of the string
 
@@ -121,9 +120,7 @@ def anchors() {
     // output: ^abc$ on 'abcd': -1
 }
 
-// ===========================
-//  Quantifiers
-// ===========================
+// === Quantifiers ===
 // +  one or more (greedy)
 // *  zero or more (greedy)
 // ?  zero or one
@@ -168,9 +165,7 @@ def quantifiers() {
     // output: x 2+ on 'xxxxx': 5
 }
 
-// ===========================
-//  Groups and Alternation
-// ===========================
+// === Groups and Alternation ===
 // (...) creates a capturing group
 // a|b alternation — matches either a or b
 
@@ -196,9 +191,7 @@ def groups_and_alternation() {
     // output: group 2: host
 }
 
-// ===========================
-//  Character Sets
-// ===========================
+// === Character Sets ===
 // [abc]   matches any of a, b, c
 // [a-z]   matches range a through z
 // [^abc]  matches any char NOT in the set
@@ -224,9 +217,7 @@ def character_sets() {
     // output: digits or underscore: 5
 }
 
-// ===========================
-//  Word Boundaries
-// ===========================
+// === Word Boundaries ===
 // \b matches at a word boundary (between \w and \W or start/end)
 // \B matches at a non-word boundary
 
@@ -254,9 +245,7 @@ def word_boundaries() {
     // output: interior: 4
 }
 
-// ===========================
-//  Foreach and Replace
-// ===========================
+// === Foreach and Replace ===
 // regex_foreach iterates all matches, calling a block with the range
 // regex_replace replaces all matches using a block
 
@@ -282,9 +271,7 @@ def foreach_and_replace() {
     // output: replaced: aXbXcX
 }
 
-// ===========================
-//  Escaped Metacharacters
-// ===========================
+// === Escaped Metacharacters ===
 // Use backslash to match literal metacharacters: \. \+ \* \( \) etc.
 
 def escaped_meta() {
@@ -299,9 +286,7 @@ def escaped_meta() {
     // output: parens: 7
 }
 
-// ===========================
-//  Reader Macro
-// ===========================
+// === Reader Macro ===
 // %regex~pattern%% compiles a regex at compile time
 // No double-escaping needed — backslashes are literal
 
@@ -317,9 +302,7 @@ def reader_macro() {
     // output: reader macro lower: 5
 }
 
-// ===========================
-//  Search, Split, Match All
-// ===========================
+// === Search, Split, Match All ===
 // regex_search finds the first match anywhere (unlike regex_match which only matches at offset 0).
 // regex_split splits a string by regex matches.
 // regex_match_all collects all match ranges.
@@ -350,9 +333,7 @@ def search_split_matchall() {
     // output: match_all count: 3
 }
 
-// ===========================
-//  Non-Capturing Groups
-// ===========================
+// === Non-Capturing Groups ===
 // (?:...) groups without capturing — useful for alternation/quantifiers
 // without adding to the group count.
 
@@ -374,9 +355,7 @@ def non_capturing_groups() {
     // output: ababab: 6
 }
 
-// ===========================
-//  Named Groups
-// ===========================
+// === Named Groups ===
 // (?P<name>...) — capturing group accessible by name via regex_group_by_name.
 
 def named_groups() {
@@ -396,9 +375,7 @@ def named_groups() {
     }
 }
 
-// ===========================
-//  Lazy Quantifiers
-// ===========================
+// === Lazy Quantifiers ===
 // Greedy quantifiers (+, *, ?, {n,m}) match as much as possible.
 // Lazy quantifiers (+?, *?, ??, {n,m}?) match as little as possible.
 
@@ -438,9 +415,7 @@ def lazy_quantifiers() {
     // output: lazy   a{2,5}?: 2
 }
 
-// ===========================
-//  Practical Examples
-// ===========================
+// === Practical Examples ===
 
 def practical_examples() {
     print("\n=== Practical examples ===\n")
@@ -477,6 +452,157 @@ def practical_examples() {
     // output: IP match: 11
 }
 
+// === Case-Insensitive Matching ===
+// Pass case_insensitive=true to regex_compile for ASCII case-insensitive matching.
+
+def case_insensitive_matching() {
+    print("\n=== Case-insensitive matching ===\n")
+
+    // by default, matching is case-sensitive
+    var re <- regex_compile("hello")
+    print("sensitive 'HELLO': {regex_match(re, "HELLO")}\n")
+    // output: sensitive 'HELLO': -1
+
+    // case-insensitive matching
+    var re_ci <- regex_compile("hello", [case_insensitive=true])
+    print("insensitive 'HELLO': {regex_match(re_ci, "HELLO")}\n")
+    // output: insensitive 'HELLO': 5
+    print("insensitive 'HeLLo': {regex_match(re_ci, "HeLLo")}\n")
+    // output: insensitive 'HeLLo': 5
+
+    // character classes are also case-insensitive
+    var re_set <- regex_compile("[a-z]+", [case_insensitive=true])
+    print("insensitive [a-z]+: {regex_match(re_set, "AbCdE")}\n")
+    // output: insensitive [a-z]+: 5
+
+    // search is also case-insensitive
+    var re_search <- regex_compile("world", [case_insensitive=true])
+    let pos = regex_search(re_search, "Hello WORLD!")
+    print("search WORLD: [{pos.x},{pos.y}]\n")
+    // output: search WORLD: [6,11]
+}
+
+// === Dot and Newline Behavior ===
+// By default, '.' matches any character EXCEPT newline (\n).
+// Pass dot_all=true to regex_compile to make '.' match newlines too.
+
+def dot_and_newline() {
+    print("\n=== Dot and newline ===\n")
+
+    // default: '.' does NOT match newline
+    var re <- regex_compile(".+")
+    print("default dot on 'ab\\nc': {regex_match(re, "ab\nc")}\n")
+    // output: default dot on 'ab\nc': 2
+
+    // dot_all=true: '.' also matches newline
+    var re_all <- regex_compile(".+", [dot_all=true])
+    print("dot_all on 'ab\\nc': {regex_match(re_all, "ab\nc")}\n")
+    // output: dot_all on 'ab\nc': 4
+
+    // useful for multi-line content extraction
+    var re_multi <- regex_compile("START(.+?)END", [dot_all=true])
+    let text = "START\nhello\nEND"
+    let m = regex_match(re_multi, text)
+    if (m != -1) {
+        print("multi-line capture: '{regex_group(re_multi, 1, text)}'\n")
+        // output: multi-line capture: '\nhello\n'
+    }
+}
+
+// === Lookahead Assertions ===
+// (?=...) positive lookahead — matches if ... follows, without consuming it
+// (?!...) negative lookahead — matches if ... does NOT follow
+
+def lookahead_assertions() {
+    print("\n=== Lookahead assertions ===\n")
+
+    // positive lookahead: match "foo" only if followed by "bar"
+    var re_pos <- regex_compile("foo(?=bar)")
+    print("foo(?=bar) on 'foobar': {regex_match(re_pos, "foobar")}\n")
+    // output: foo(?=bar) on 'foobar': 3
+    print("foo(?=bar) on 'foobaz': {regex_match(re_pos, "foobaz")}\n")
+    // output: foo(?=bar) on 'foobaz': -1
+
+    // the lookahead doesn't consume input — the match stops at "foo"
+    var re_pos2 <- regex_compile("\\d+(?= dollars)")
+    let text = "100 dollars"
+    let pos = regex_search(re_pos2, text)
+    print("amount: '{slice(text, pos.x, pos.y)}'\n")
+    // output: amount: '100'
+
+    // negative lookahead: match "foo" only if NOT followed by "bar"
+    var re_neg <- regex_compile("foo(?!bar)")
+    print("foo(?!bar) on 'foobar': {regex_match(re_neg, "foobar")}\n")
+    // output: foo(?!bar) on 'foobar': -1
+    print("foo(?!bar) on 'foobaz': {regex_match(re_neg, "foobaz")}\n")
+    // output: foo(?!bar) on 'foobaz': 3
+
+    // practical: match a word only if NOT followed by an exclamation mark
+    var re_calm <- regex_compile("\\w(?!!)")
+    print("calm on 'a!': {regex_match(re_calm, "a!")}\n")
+    // output: calm on 'a!': -1
+    print("calm on 'a.': {regex_match(re_calm, "a.")}\n")
+    // output: calm on 'a.': 1
+}
+
+// === Template-String Replace ===
+// regex_replace(re, str, replacement) replaces matches with a template string.
+// $0 or $& = whole match, $1-$9 = numbered groups,
+// ${name} = named groups, $$ = literal $
+
+def template_replace() {
+    print("\n=== Template-string replace ===\n")
+
+    // swap first and last name using numbered groups
+    var re_name <- regex_compile("(\\w+) (\\w+)")
+    let swapped = regex_replace(re_name, "John Smith", "$2 $1")
+    print("swapped: {swapped}\n")
+    // output: swapped: Smith John
+
+    // $0 or $& references the whole match
+    var re_word <- regex_compile("\\w+")
+    let wrapped = regex_replace(re_word, "hello world", "[$0]")
+    print("wrapped: {wrapped}\n")
+    // output: wrapped: [hello] [world]
+
+    // named groups with ${name}
+    var re_date <- regex_compile("(?P<month>\\d+)/(?P<day>\\d+)/(?P<year>\\d+)")
+    let reformatted = regex_replace(re_date, "12/25/2024", "$\{year\}-$\{month\}-$\{day\}")
+    print("reformatted: {reformatted}\n")
+    // output: reformatted: 2024-12-25
+
+    // $$ for literal dollar sign
+    var re_num <- regex_compile("\\d+")
+    let priced = regex_replace(re_num, "Price: 42", "$$$0.00")
+    print("priced: {priced}\n")
+    // output: priced: Price: $42.00
+}
+
+// === Reader Macro Flags ===
+// Flags are appended after a second ~ in the reader macro:
+//   %regex~pattern~i%%  — case-insensitive
+//   %regex~pattern~s%%  — dot matches newline (dot_all)
+//   %regex~pattern~is%% — both flags combined
+
+def reader_macro_flags() {
+    print("\n=== Reader macro flags ===\n")
+
+    // case-insensitive via ~i flag
+    var re_ci <- %regex~hello~i%%
+    print("~i flag: {regex_match(re_ci, "HELLO")}\n")
+    // output: ~i flag: 5
+
+    // dot-all via ~s flag
+    var re_s <- %regex~.+~s%%
+    print("~s flag on 'ab\\nc': {regex_match(re_s, "ab\nc")}\n")
+    // output: ~s flag on 'ab\nc': 4
+
+    // both flags combined
+    var re_is <- %regex~hello.+world~is%%
+    print("~is flag: {regex_match(re_is, "Hello\nWorld")}\n")
+    // output: ~is flag: 11
+}
+
 [export]
 def main() {
     compiling_and_matching()
@@ -494,4 +620,9 @@ def main() {
     named_groups()
     lazy_quantifiers()
     practical_examples()
+    case_insensitive_matching()
+    dot_and_newline()
+    lookahead_assertions()
+    template_replace()
+    reader_macro_flags()
 }

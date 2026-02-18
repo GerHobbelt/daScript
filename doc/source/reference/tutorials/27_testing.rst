@@ -9,7 +9,7 @@ Testing with dastest
     single: Tutorial; dastest
     single: Tutorial; Assertions
 
-This tutorial covers the daScript testing framework: writing tests with
+This tutorial covers the daslang testing framework: writing tests with
 ``[test]``, assertion functions, sub-tests, and running tests.
 
 Setup
@@ -84,3 +84,5 @@ To test an entire directory::
 .. seealso::
 
    Full source: :download:`tutorials/language/27_testing.das <../../../../tutorials/language/27_testing.das>`
+
+   Next tutorial: :ref:`tutorial_linq`

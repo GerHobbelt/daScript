@@ -289,6 +289,7 @@ def document_module_strings(root : string) {
         group_by_regex("String modifications", mod, %regex~(chop|escape|unescape|repeat|replace|reverse|slice|
 strip|strip_left|strip_right|to_lower|to_lower_in_place|to_upper|to_upper_in_place|rtrim|safe_unescape|ltrim|trim)$%%),
         group_by_regex("Search substrings", mod, %regex~find.*%%),
+        group_by_regex("String comparison", mod, %regex~(compare_ignore_case)$%%),
         group_by_regex("String conversion routines", mod, %regex~(double|float|int|uint|int64|uint64|to_double|to_float|to_int|to_uint|to_int64|to_uint64|string|to_char|fmt|int8|to_int8|uint8|to_uint8|int16|to_int16|uint16|to_uint16|to_cpp_float)$%%),
         group_by_regex("String as array", mod, %regex~(modify_data|peek_data)$%%),
         group_by_regex("Low level memory allocation", mod, %regex~(delete_string|reserve_string_buffer)$%%)
@@ -300,9 +301,11 @@ def document_module_strings_boost(root : string) {
     var mod = find_module("strings_boost")
     var groups <- array<DocGroup>(
         group_by_regex("Split and join", mod, %regex~(split|split_by_chars|join)$%%),
-        group_by_regex("Formatting", mod, %regex~(wide)$%%),
-        group_by_regex("Queries and comparisons", mod, %regex~(is_character_at|eq)$%%),
+        group_by_regex("Formatting", mod, %regex~(wide|pad_left|pad_right|capitalize)$%%),
+        group_by_regex("Queries and comparisons", mod, %regex~(is_character_at|eq|contains|count|is_null_or_whitespace)$%%),
+        group_by_regex("Search", mod, %regex~(last_index_of)$%%),
         group_by_regex("Replace", mod, %regex~(replace_multiple)$%%),
+        group_by_regex("Prefix and suffix", mod, %regex~(trim_prefix|trim_suffix)$%%),
         group_by_regex("Levenshtein distance", mod, %regex~(levenshtein_distance|levenshtein_distance_fast)$%%),
         group_by_regex("Character traits", mod, %regex~(is_hex|is_tab_or_space)$%%))
     document("Boost package for string manipulation library", mod, "strings_boost.rst", groups)
@@ -402,7 +405,9 @@ def document_module_jobque_boost(root : string) {
         group_by_regex("Invocations", mod, %regex~(new_job|new_thread)$%%),
         group_by_regex("Iteration", mod, %regex~(for_each|each|each_clone|for_each_clone)$%%),
         group_by_regex("Passing data", mod, %regex~(push|push_clone|push_batch|push_batch_clone)$%%),
-        group_by_regex("Receiving data", mod, %regex~(gather|gather_ex|gather_and_forward|peek|pop_one|pop_and_clone_one)$%%),
+        group_by_regex("Receiving data", mod, %regex~(gather|gather_ex|gather_and_forward|peek|pop_one|pop_and_clone_one|try_pop|try_pop_clone|pop_with_timeout|pop_with_timeout_clone)$%%),
+        group_by_regex("Synchronization", mod, %regex~(with_wait_group|done)$%%),
+        group_by_regex("Parallel execution", mod, %regex~(_parallel_for|parallel_for|_parallel_for_each|parallel_for_each|_parallel_map|parallel_map)$%%),
         group_by_regex("LockBox operations", mod, %regex~(set|get|update|clear)$%%),
         group_by_regex("Internal capture details", mod, %regex~(capture_jobque_channel|capture_jobque_job_status|release_capture_jobque_channel|release_capture_jobque_job_status|capture_jobque_lock_box|release_capture_jobque_lock_box)$%%)
     )
@@ -419,9 +424,9 @@ def document_module_apply_in_context(root : string) {
 def document_module_algorithm(root : string) {
     var mod = find_module("algorithm")
     var groups <- array<DocGroup>(
-        group_by_regex("Search", mod, %regex~(lower_bound|binary_search)$%%),
-        group_by_regex("Array manipulation", mod, %regex~(unique|sort_unique|reverse|combine|erase_all|topological_sort)$%%),
-        group_by_regex("Table manipulation", mod, %regex~(intersection|union|difference|identical)$%%)
+        group_by_regex("Search", mod, %regex~(lower_bound|upper_bound|binary_search|equal_range)$%%),
+        group_by_regex("Array manipulation", mod, %regex~(unique|sort_unique|reverse|combine|erase_all|topological_sort|fill|is_sorted|rotate|min_element|max_element)$%%),
+        group_by_regex("Table manipulation", mod, %regex~(intersection|union|difference|symmetric_difference|identical|is_subset)$%%)
     )
     document("Miscellaneous algorithms", mod, "algorithm.rst", groups)
 }
@@ -634,7 +639,8 @@ def document_module_decs(root : string) {
     var mod = find_module("decs")
     var groups <- array<DocGroup>(
         group_by_regex("Comparison and access", mod, %regex~(\=\=|\!\=|\.)$%%),
-        group_by_regex("Access (get/set/clone)", mod, %regex~(has|get|set|clone|remove)$%%),
+        group_by_regex("Access (get/set/clone)", mod, %regex~(has|get|set|clone|remove|get_component)$%%),
+        group_by_regex("Entity status", mod, %regex~(is_alive|entity_count)$%%),
         group_by_regex("Debug and serialization", mod, %regex~(describe|serialize|finalize|debug_dump)$%%),
         group_by_regex("Stages", mod, %regex~(register_decs_stage_call|decs_stage|commit)$%%),
         group_by_regex("Deferred actions", mod, %regex~(update_entity|create_entity|delete_entity)$%%),
@@ -805,7 +811,7 @@ def document_module_bitfield_boost(root : string) {
     var mod = find_module("bitfield_boost")
     var groups <- array<DocGroup>(
         group_by_regex("Bitfield element access", mod, %regex~(\[\]|\[\]\=|\[\]\&\&\=|\[\]\|\|\=|\[\]\^\^\=)$%%),
-        group_by_regex("Iteration", mod, %regex~(each)$%%)
+        group_by_regex("Iteration", mod, %regex~(each_bit)$%%)
     )
     document("Bitfield operator overloads", mod, "bitfield_boost.rst", groups)
 }
@@ -813,7 +819,7 @@ def document_module_bitfield_boost(root : string) {
 def document_module_bitfield_trait(root : string) {
     var mod = find_module("bitfield_trait")
     var groups <- array<DocGroup>(
-        group_by_regex("Iteration", mod, %regex~(each)$%%)
+        group_by_regex("Iteration", mod, %regex~(each|each_bit_name)$%%)
     )
     document("Bitfield name traits", mod, "bitfield_trait.rst", groups)
 }

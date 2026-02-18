@@ -14,7 +14,7 @@ module debug shared
 
 //! Debug server and Debug Adapter Protocol (DAP) implementation.
 //!
-//! Provides a full-featured debugger for daScript programs, implementing the
+//! Provides a full-featured debugger for daslang programs, implementing the
 //! `Debug Adapter Protocol <https://microsoft.github.io/debug-adapter-protocol/>`_.
 //! Supports breakpoints, stepping, variable inspection, watch expressions,
 //! call stacks, and interactive evaluation via a debug agent.
@@ -772,6 +772,17 @@ class private DAStackWalker : DapiStackWalker {
         let n = length(ctx.stack)
         if (n > 0) {
             ctx.stack[n - 1].name = pp.info != null ? "def {pp.info.name} [AOT]" : "def [AOT]"
+            ctx.stack[n - 1].path = "{fileName}"
+
+            self->collectGlobals()
+        }
+    }
+
+    def override onCallJIT(pp : Prologue; fileName : string#) : void {
+        //! Handles a JIT function call event, updating the current stack frame with JIT call info.
+        let n = length(ctx.stack)
+        if (n > 0) {
+            ctx.stack[n - 1].name = pp.info != null ? "def {pp.info.name} [JIT]" : "def [JIT]"
             ctx.stack[n - 1].path = "{fileName}"
 
             self->collectGlobals()
