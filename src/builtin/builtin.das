@@ -998,9 +998,17 @@ def emplace_default(var tab : table<auto(keyT), auto(valT)>, key : keyT | #) : v
 def get_with_default(var Tab : table<auto(keyT); auto(valT)> ==const; at : keyT | #; blk : block<(var p : valT&) : void>) : void {
     //! Gets the value from the table, add it with a default value if it does not exist. Callback is invoked with the value.
     unsafe {
-        var val & = Tab[at]
+        var pval = Tab?[at]
+        if (pval == null) {
+            pval = addr(Tab[at])
+            static_if (typeinfo is_workhorse(type<valT -const -&>)) {
+                *pval = default<valT -const -&>
+            } else {
+                *pval <- default<valT -const -&>
+            }
+        }
         __builtin_table_lock(Tab)
-        invoke(blk, val)
+        invoke(blk, *pval)
         __builtin_table_unlock(Tab)
     }
 }
@@ -1009,9 +1017,17 @@ def modify(var Tab : table<auto(keyT); auto(valT)> ==const; at : keyT | #; blk :
     //! Modifies the value in the table. Callback is invoked with the value and should return the modified value.
     //! Adds the value with a default value if it does not exist.
     unsafe {
-        var val & = Tab[at]
+        var pval = Tab?[at]
+        if (pval == null) {
+            pval = addr(Tab[at])
+            static_if (typeinfo is_workhorse(type<valT -const -&>)) {
+                *pval = default<valT -const -&>
+            } else {
+                *pval <- default<valT -const -&>
+            }
+        }
         __builtin_table_lock(Tab)
-        val = invoke(blk, val)
+        *pval = invoke(blk, *pval)
         __builtin_table_unlock(Tab)
     }
 }
@@ -1963,7 +1979,26 @@ def subarray(a : auto(TT)[]; r : urange) {
     return <- ra
 }
 
-def subarray(a : array<auto(TT)>; r : range) {
+def subarray(a : array<auto(TT)> ==const; r : range) {
+    var ra : array<TT -const -&>
+    if (r.x < r.y) {
+        ra |> reserve(r.y - r.x)
+        static_if (typeinfo need_lock_check(type<TT>)) {
+            unsafe(set_verify_array_locks(ra, false))
+            unsafe(set_verify_array_locks(a, false))
+        }
+        for (t in r) {
+            ra |> push_clone(a[t])
+        }
+        static_if (typeinfo need_lock_check(type<TT>)) {
+            unsafe(set_verify_array_locks(ra, true))
+            unsafe(set_verify_array_locks(a, true))
+        }
+    }
+    return <- ra
+}
+
+def subarray(var a : array<auto(TT)> ==const; r : range) {
     var ra : array<TT -const -&>
     if (r.x < r.y) {
         ra |> reserve(r.y - r.x)
