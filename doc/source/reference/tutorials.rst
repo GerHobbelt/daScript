@@ -4,9 +4,21 @@
   Tutorials
 *****************************
 
-This section provides a series of hands-on tutorials that introduce daslang's
-core features step by step. Each tutorial comes with a companion ``.das`` file
-in the ``tutorials/language/`` directory that you can run directly::
+This section provides hands-on tutorials organized into four groups:
+
+* **Language Tutorials** — learn daslang syntax and standard library features
+* **C Integration Tutorials** — embed daslang in a C host using the ``daScriptC.h`` API
+* **C++ Integration Tutorials** — embed daslang in a C++ host using the native ``daScript.h`` API
+* **Macro Tutorials** — write compile-time code transformations using the daslang macro system
+
+.. _tutorials_language:
+
+Language Tutorials
+==================
+
+These tutorials introduce daslang's core features step by step.
+Each comes with a companion ``.das`` file in ``tutorials/language/`` that you
+can run directly::
 
   daslang.exe tutorials/language/01_hello_world.das
 
@@ -14,6 +26,7 @@ The tutorials are designed to be followed in order. Each one builds on concepts
 introduced in earlier tutorials.
 
 .. toctree::
+   :maxdepth: 1
 
    tutorials/01_hello_world.rst
    tutorials/02_variables.rst
@@ -50,9 +63,18 @@ introduced in earlier tutorials.
    tutorials/33_algorithm.rst
    tutorials/34_decs.rst
    tutorials/35_jobque.rst
+   tutorials/36_pointers.rst
+   tutorials/37_utility_patterns.rst
+   tutorials/38_random.rst
+   tutorials/39_dynamic_type_checking.rst
+   tutorials/40_coroutines.rst
+   tutorials/41_serialization.rst
+   tutorials/42_testing_tools.rst
+
+.. _tutorials_integration_c:
 
 C Integration Tutorials
------------------------
+=======================
 
 These tutorials show how to embed daslang in a C application using the
 ``daScriptC.h`` API.  Each tutorial comes with a ``.c`` source file and a
@@ -71,8 +93,10 @@ companion ``.das`` script in ``tutorials/integration/c/``.
    tutorials/integration_c_08_serialization.rst
    tutorials/integration_c_09_aot.rst
 
+.. _tutorials_integration_cpp:
+
 C++ Integration Tutorials
---------------------------
+=========================
 
 These tutorials show how to embed daslang in a C++ application using the
 native ``daScript.h`` API.  Each tutorial comes with a ``.cpp`` source file
@@ -101,3 +125,23 @@ and a companion ``.das`` script in ``tutorials/integration/cpp/``.
    tutorials/integration_cpp_18_dynamic_scripts.rst
    tutorials/integration_cpp_19_class_adapters.rst
    tutorials/integration_cpp_20_standalone_contexts.rst
+
+.. _tutorials_macros:
+
+Macro Tutorials
+===============
+
+These tutorials teach daslang's compile-time macro system: call macros,
+reader macros, function macros, and AST manipulation.  Each tutorial has
+**two** source files — a module (``.das``) that defines the macros and a
+usage file that exercises them — because macros cannot be used in the same
+module that defines them.
+
+Run any tutorial from the project root::
+
+  daslang.exe tutorials/macros/01_call_macro.das
+
+.. toctree::
+   :maxdepth: 1
+
+   tutorials/macros/01_call_macro.rst
