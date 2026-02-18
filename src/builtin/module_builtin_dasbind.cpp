@@ -243,6 +243,7 @@ FastCallWrapper getExtraWrapper ( int nargs, int res, int perm ) {
                 err = "function has too many arguments for the current wrapper config";
                 return false;
             }
+            fun->stub = true;
 #ifndef _MSC_VER
             if ( fun->arguments.size()>6 ) {
                 int perm=0;
@@ -288,7 +289,10 @@ FastCallWrapper getExtraWrapper ( int nargs, int res, int perm ) {
                             break;
                         }
                     } else if ( strcmp(arg->__rtti,"ExprConstString")==0 ) {
-                        // do nothing
+                        auto str = static_pointer_cast<ExprConstString>(arg);
+                        if ( str->getValue().empty()) {
+                            needToTransform = true;
+                        }
                     } else {
                         needToTransform = true;
                         break;
@@ -302,11 +306,14 @@ FastCallWrapper getExtraWrapper ( int nargs, int res, int perm ) {
                     if ( arg->type->isString() ) {
                         if ( arg->rtti_isCallFunc() ) {
                             auto pCall = static_pointer_cast<ExprCallFunc>(arg);
-                            if ( pCall->func->name=="safe_pass_string") {
+                            if ( pCall->func->name!="safe_pass_string") {
                                 needToWrap = true;
                             }
                         } else if ( strcmp(arg->__rtti,"ExprConstString")==0 ) {
-                            // do nothing
+                            auto str = static_pointer_cast<ExprConstString>(arg);
+                            if ( str->getValue().empty()) {
+                                needToWrap = true;
+                            }
                         } else {
                             needToWrap = true;
                         }
@@ -351,11 +358,11 @@ FastCallWrapper getExtraWrapper ( int nargs, int res, int perm ) {
             }
             if ( anyTypeErrors ) return nullptr;
             string fn_name;
-            string library;
+            string library, platform_library;
             string api;
             bool late = false;
             for ( auto & arg : args ) {
-                        if ( arg.name=="name" && arg.type==Type::tString ) {
+                if ( arg.name=="name" && arg.type==Type::tString ) {
                     fn_name = arg.sValue;
                 } else if ( arg.name=="library" && arg.type==Type::tString ) {
                     library = arg.sValue;
@@ -368,6 +375,22 @@ FastCallWrapper getExtraWrapper ( int nargs, int res, int perm ) {
                 } else if ( arg.name=="late" ) {
                     late = true;
                 }
+#ifdef _MSC_VER
+                else if ( arg.name=="windows_library" && arg.type==Type::tString ) {
+                    platform_library = arg.sValue;
+                }
+#elif defined(__APPLE__)
+                else if ( arg.name=="macos_library" && arg.type==Type::tString ) {
+                    platform_library = arg.sValue;
+                }
+#elif defined(__linux__) || defined __HAIKU__
+                else if ( arg.name=="linux_library" && arg.type==Type::tString ) {
+                    platform_library = arg.sValue;
+                }
+#endif
+            }
+            if ( !platform_library.empty() ) {
+                library = platform_library;
             }
             if ( fn_name.empty() ) {
                 err = "missing name";
@@ -433,7 +456,7 @@ FastCallWrapper getExtraWrapper ( int nargs, int res, int perm ) {
             lib.addBuiltInModule();
             addAnnotation(make_smart<ExternFunctionAnnotation>());
             addExtern<DAS_BIND_FUN(safe_pass_string)>(*this, lib, "safe_pass_string",
-                SideEffects::none, "safe_pass_string")
+                SideEffects::accessExternal, "safe_pass_string")
                     ->args({"string"});
         }
         virtual ModuleAotType aotRequire ( TextWriter & tw ) const override {

@@ -2272,7 +2272,7 @@ namespace das {
                 if ( fromGeneric ) {
                     ctor->fromGeneric = getOrCreateDummy(var->module);
                 }
-                bool export_for_aot = !var->cppLayout && (*daScriptEnvironment::bound && (*daScriptEnvironment::bound)->g_isInAot);
+                bool export_for_aot = !var->cppLayout && (daScriptEnvironment::getBound() && daScriptEnvironment::getBound()->g_isInAot);
                 ctor->exports = alwaysExportInitializer || export_for_aot;
                 extraFunctions.push_back(ctor);
                 reportAstChanged();
@@ -2445,6 +2445,12 @@ namespace das {
                 error("global variable of type " + describeType(var->type) + " needs to be initialized", "", "",
                     var->at, CompilationError::invalid_variable_type);
             }
+            // we are looking into initialization with empty table or array to replace with nada
+            if ( isEmptyInit(var) ) {
+                var->init.reset();
+                reportAstChanged();
+                return Visitor::visitGlobalLet(var);
+            }
             verifyType(var->type);
             return Visitor::visitGlobalLet(var);
         }
@@ -2455,6 +2461,7 @@ namespace das {
             return false;
         }
         virtual bool canVisitFunction ( Function * fun ) override {
+            if ( fun->stub ) return false;
             if ( verbose || debugInferFlag ) {      // it can be fully inferred, and fail concept assert
                 return !fun->isTemplate;            // we don't do a thing with templates
             } else {
@@ -2573,11 +2580,17 @@ namespace das {
             }
             if ( func->result->isRefType() && !func->result->ref ) {
                 if ( func->result->canCopy() ) {
-                    func->copyOnReturn = true;
-                    func->moveOnReturn = false;
+                    if ( func->copyOnReturn!=true || func->moveOnReturn!=false ) {
+                        reportAstChanged();
+                        func->copyOnReturn = true;
+                        func->moveOnReturn = false;
+                    }
                 } else if ( func->result->canMove() ) {
-                    func->copyOnReturn = false;
-                    func->moveOnReturn = true;
+                    if ( func->copyOnReturn!=false || func->moveOnReturn!=true ) {
+                        reportAstChanged();
+                        func->copyOnReturn = false;
+                        func->moveOnReturn = true;
+                    }
                 } else {
                     // the error will be reported in the inferReturnType
                     /*
@@ -4048,6 +4061,7 @@ namespace das {
 
     // ExprTypeInfo
         bool skipLockCheck() const {
+            if ( program->policies.skip_lock_check ) return true;                   // if code of policy we should skip
             if ( program->thisModule->skipLockCheck ) return true;                  // if this module has options skip_lock_check - we skip
             if ( func ) {
                 if ( func->skipLockCheck ) return true;                             // if this function is [skip_lock_check] - we skip
@@ -7156,10 +7170,10 @@ namespace das {
                               + describeType(resType) + ", passing " + describeType(expr->subexpr->type), "", "",
                               expr->at, CompilationError::invalid_return_type);
                     }
-                    if ( resType->isRef() && !resType->isConst() && expr->subexpr->type->isConst() ) {
+                    if ( resType->isRef() && !resType->isConst() && expr->subexpr->type->isConst() && expr->moveSemantics ) {
                         error("incompatible return type, constant matters. expecting "
-                              + describeType(resType) + ", passing " + describeType(expr->subexpr->type), "", "",
-                              expr->at, CompilationError::invalid_return_type);
+                            + describeType(resType) + ", passing " + describeType(expr->subexpr->type), "", "",
+                            expr->at, CompilationError::invalid_return_type);
                     }
                 }
             }
@@ -7188,6 +7202,30 @@ namespace das {
             }
             if ( expr->subexpr ) markNoDiscard(expr->subexpr.get());
         }
+        void getDetailsAndSuggests( ExprReturn * expr, string & details, string & suggestions ) const {
+            if ( verbose ) {
+                bool canMove = expr->subexpr->type->canMove();
+                bool canClone = expr->subexpr->type->canClone();
+                bool isConstant = expr->subexpr->type->isConst();
+                if ( canMove ) {
+                    if ( isConstant ) {
+                        details += "this type can't be moved because it's constant ";
+                    } else {
+                        details += "this type can be moved ";
+                        suggestions += "use return <- instead";
+                    }
+                }
+                if ( canClone ) {
+                    details += (details.size()?"also, ":"");
+                    details += "this type can be cloned ";
+                    suggestions += (suggestions.size()?" or ":"");
+                    suggestions += "use return <- clone(...) instead";
+                }
+                if ( !canMove && !canClone ) {
+                    details += "this type can't be copied or moved, so it can't be returned at all";
+                }
+            }
+        }
         virtual ExpressionPtr visit ( ExprReturn * expr ) override {
             if ( blocks.size() ) {
                 ExprBlock * block = blocks.back();
@@ -7207,7 +7245,9 @@ namespace das {
                     setBlockCopyMoveFlags(block);
                 }
                 if ( block->moveOnReturn && !expr->moveSemantics ) {
-                    error("this type can't be copied; " + describeType(block->type),"","use return <- instead",
+                    string details, suggestions;
+                    getDetailsAndSuggests(expr, details, suggestions);
+                    error(details + ": " + describeType(block->type),"",suggestions,
                           expr->at, CompilationError::invalid_return_semantics );
                     if ( canRelaxAssign(expr->subexpr.get()) ) {
                         reportAstChanged();
@@ -7244,7 +7284,9 @@ namespace das {
                 }
                 inferReturnType(func->result, expr);
                 if ( func->moveOnReturn && !expr->moveSemantics && expr->subexpr ) {
-                    error("this type can't be copied; " + describeType(func->result),"","use return <- instead",
+                    string details, suggestions;
+                    getDetailsAndSuggests(expr, details, suggestions);
+                    error(details + ": " + describeType(func->result),"",suggestions,
                           expr->at, CompilationError::invalid_return_semantics );
                     if ( canRelaxAssign(expr->subexpr.get()) ) {
                         reportAstChanged();
@@ -7902,6 +7944,24 @@ namespace das {
                 error("in scope let can't be const", "", "", var->at, CompilationError::invalid_variable_type);
             }
         }
+        bool isEmptyInit ( const VariablePtr & var ) const {
+            if ( var->type && var->init ) {
+                if ( var->init->rtti_isMakeStruct() ) {
+                    auto ma = (ExprMakeStruct *)(var->init.get());
+                    if ( ma->structs.empty() && ma->makeType  ) {
+                        if ( var->type->isGoodArrayType() && ma->makeType->isGoodArrayType()
+                                    && ma->makeType->firstType->baseType==Type::autoinfer ) {
+                            return true;
+                        } else if ( var->type->isGoodTableType() && ma->makeType->isGoodTableType()
+                                    && ma->makeType->firstType->baseType==Type::autoinfer
+                                    && ma->makeType->secondType->baseType==Type::autoinfer ) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        }
         virtual VariablePtr visitLet ( ExprLet * expr, const VariablePtr & var, bool last ) override {
             if ( var->type && var->type->isExprType() ) {
                 return Visitor::visitLet(expr,var,last);
@@ -8015,6 +8075,12 @@ namespace das {
                         }
                     }
                 }
+            }
+            // we are looking into initialization with empty table or array to replace with nada
+            if ( isEmptyInit(var) ) {
+                var->init.reset();
+                reportAstChanged();
+                return Visitor::visitLet(expr,var,last);
             }
             verifyType(var->type);
             return Visitor::visitLet(expr,var,last);

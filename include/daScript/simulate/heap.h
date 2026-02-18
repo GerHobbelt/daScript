@@ -10,12 +10,7 @@ namespace das {
     public:
         StackAllocator(const StackAllocator &) = delete;
         StackAllocator & operator = (const StackAllocator &) = delete;
-
-        StackAllocator(uint32_t size, void *mem = nullptr) {
-            stackSize = size;
-            stack = stackSize ? (char*)(mem ? mem : das_aligned_alloc16(stackSize)) : nullptr;
-            reset();
-        }
+        StackAllocator(uint32_t size, void *mem = nullptr);
 
         void strip () {
             if ( stack ) {
@@ -127,7 +122,7 @@ namespace das {
         uint32_t    stackSize = 0;
     };
 
-    class AnyHeapAllocator : public ptr_ref_count {
+    class DAS_API AnyHeapAllocator : public ptr_ref_count {
     public:
         virtual bool breakOnFree ( void *, uint32_t ) { return false; }
         virtual char * impl_allocate ( uint32_t ) = 0;
@@ -195,7 +190,7 @@ namespace das {
 
     typedef das_hash_set<StrHashEntry,StrHashPred,StrEqPred> das_string_set;
 
-    class StringHeapAllocator : public AnyHeapAllocator {
+    class DAS_API StringHeapAllocator : public AnyHeapAllocator {
     public:
         virtual void forEachString ( const callable<void (const char *)> & fn ) = 0;
         virtual void reset() override;
@@ -215,7 +210,7 @@ namespace das {
 #define DAS_HEAP_DEBUGGER_BREAK_ON_FREE 0
 #endif
 
-    class PersistentHeapAllocator final : public AnyHeapAllocator {
+    class DAS_API PersistentHeapAllocator final : public AnyHeapAllocator {
 #if DAS_HEAP_DEBUGGER_BREAK_ON_FREE
         void * breakFreeAddr = nullptr;
         uint32_t breakFreeSize = 0;
@@ -247,37 +242,21 @@ namespace das {
         virtual void sweep() override { model.sweep(); }
 #endif
     public:
-        PersistentHeapAllocator() {}
-        virtual char * impl_allocate ( uint32_t size ) override {
-            if ( limit==0 || model.bytesAllocated()+size<=limit ) {
-                totalAllocations ++;
-                totalBytesAllocated += size;
-                return model.allocate(size);
-            } else {
-                return nullptr;
-            }
-        }
-        virtual char * impl_reallocate ( char * ptr, uint32_t oldSize, uint32_t newSize ) override {
-            if ( limit==0 || model.bytesAllocated()+newSize-oldSize<=limit ) {
-                totalAllocations ++;
-                totalBytesAllocated += newSize-oldSize;
-                return model.reallocate(ptr,oldSize,newSize);
-            } else {
-                return nullptr;
-            }
-        }
-        virtual int depth() const override { return model.depth(); }
-        virtual uint64_t bytesAllocated() const override { return model.bytesAllocated(); }
-        virtual uint64_t totalAlignedMemoryAllocated() const override { return model.totalAlignedMemoryAllocated(); }
+        PersistentHeapAllocator();
+        virtual char * impl_allocate ( uint32_t size ) override;
+        virtual char * impl_reallocate ( char * ptr, uint32_t oldSize, uint32_t newSize ) override;
+        virtual int depth() const override;
+        virtual uint64_t bytesAllocated() const override;
+        virtual uint64_t totalAlignedMemoryAllocated() const override;
         virtual void reset() override { model.reset(); }
         virtual void report() override;
         virtual bool mark() override;
         virtual bool mark ( char * ptr, uint32_t size ) override;
-        virtual bool isOwnPtr ( char * ptr, uint32_t size ) override { return model.isOwnPtr(ptr,size); }
-        virtual bool isValidPtr ( char * ptr, uint32_t size ) override { return model.isAllocatedPtr(ptr,size); }
-        virtual void setInitialSize ( uint32_t size ) override { model.setInitialSize(size); }
-        virtual int32_t getInitialSize() const override { return model.initialSize; }
-        virtual void setGrowFunction ( CustomGrowFunction && fun ) override { model.customGrow = fun; };
+        virtual bool isOwnPtr ( char * ptr, uint32_t size ) override;
+        virtual bool isValidPtr ( char * ptr, uint32_t size ) override;
+        virtual void setInitialSize ( uint32_t size ) override;
+        virtual int32_t getInitialSize() const override;
+        virtual void setGrowFunction ( CustomGrowFunction && fun ) override;
 #if DAS_TRACK_ALLOCATIONS
         virtual void mark_location ( void * ptr, const LineInfo * at ) override  { model.mark_location(ptr,at); };
         virtual  void mark_comment ( void * ptr, const char * what ) override { model.mark_comment(ptr,what); };
@@ -286,7 +265,7 @@ namespace das {
         MemoryModel model;
     };
 
-    class LinearHeapAllocator final : public AnyHeapAllocator {
+    class DAS_API LinearHeapAllocator final : public AnyHeapAllocator {
     public:
         LinearHeapAllocator() {}
         virtual char * impl_allocate ( uint32_t size ) override {
@@ -298,32 +277,21 @@ namespace das {
                 return nullptr;
             }
         }
-        virtual void impl_free ( char * ptr, uint32_t size ) override {
-            totalBytesDeleted += size;
-            model.free(ptr,size);
-        }
-        virtual char * impl_reallocate ( char * ptr, uint32_t oldSize, uint32_t newSize ) override {
-            if ( limit==0 || model.bytesAllocated()+newSize-oldSize<=limit ) {
-                totalAllocations ++;
-                totalBytesAllocated += newSize-oldSize;
-                return model.reallocate(ptr,oldSize,newSize);
-            } else {
-                return nullptr;
-            }
-        }
-        virtual int depth() const override { return model.depth(); }
-        virtual uint64_t bytesAllocated() const override { return model.bytesAllocated(); }
-        virtual uint64_t totalAlignedMemoryAllocated() const override { return model.totalAlignedMemoryAllocated(); }
-        virtual void reset() override { model.reset(); }
+        virtual void impl_free ( char * ptr, uint32_t size ) override;
+        virtual char * impl_reallocate ( char * ptr, uint32_t oldSize, uint32_t newSize ) override;
+        virtual int depth() const override;
+        virtual uint64_t bytesAllocated() const override;
+        virtual uint64_t totalAlignedMemoryAllocated() const override;
+        virtual void reset() override;
         virtual void report() override;
         virtual bool mark() override { return false; }
         virtual bool mark ( char *, uint32_t ) override { DAS_ASSERT(0 && "not supported"); return false; }
         virtual void sweep() override { DAS_ASSERT(0 && "not supported"); }
-        virtual bool isOwnPtr ( char * ptr, uint32_t ) override { return model.isOwnPtr(ptr); }
+        virtual bool isOwnPtr ( char * ptr, uint32_t ) override;
         virtual bool isValidPtr ( char *, uint32_t ) override { return true; }
-        virtual void setInitialSize ( uint32_t size ) override { model.setInitialSize(size); }
-        virtual int32_t getInitialSize() const override { return model.initialSize; }
-        virtual void setGrowFunction ( CustomGrowFunction && fun ) override { model.customGrow = fun; };
+        virtual void setInitialSize ( uint32_t size ) override;
+        virtual int32_t getInitialSize() const override;
+        virtual void setGrowFunction ( CustomGrowFunction && fun ) override;
     protected:
         LinearChunkAllocator model;
     };
@@ -347,45 +315,26 @@ namespace das {
         das_string_set internMap;
     };
 
-    class PersistentStringAllocator final : public StringHeapAllocator {
+    class DAS_API PersistentStringAllocator final : public StringHeapAllocator {
     public:
-        PersistentStringAllocator() { model.alignMask = 3; }
-        virtual char * impl_allocate ( uint32_t size ) override {
-            if ( limit==0 || model.bytesAllocated()+size<=limit ) {
-                totalAllocations ++;
-                totalBytesAllocated += size;
-                return model.allocate(size);
-            } else {
-                return nullptr;
-            }
-        }
-        virtual void impl_free ( char * ptr, uint32_t size ) override {
-            totalBytesDeleted += size;
-            model.free(ptr,size);
-        }
-        virtual char * impl_reallocate ( char * ptr, uint32_t oldSize, uint32_t newSize ) override {
-            if ( limit==0 || model.bytesAllocated()+newSize-oldSize<=limit ) {
-                totalAllocations ++;
-                totalBytesAllocated += newSize-oldSize;
-                return model.reallocate(ptr,oldSize,newSize);
-            } else {
-                return nullptr;
-            }
-        }
-        virtual int depth() const override { return model.depth(); }
-        virtual uint64_t bytesAllocated() const override { return model.bytesAllocated(); }
-        virtual uint64_t totalAlignedMemoryAllocated() const override { return model.totalAlignedMemoryAllocated(); }
-        virtual void reset() override { model.reset(); }
+        PersistentStringAllocator();
+        virtual char * impl_allocate ( uint32_t size ) override;
+        virtual void impl_free ( char * ptr, uint32_t size ) override;
+        virtual char * impl_reallocate ( char * ptr, uint32_t oldSize, uint32_t newSize ) override;
+        virtual int depth() const override;
+        virtual uint64_t bytesAllocated() const override;
+        virtual uint64_t totalAlignedMemoryAllocated() const override;
+        virtual void reset() override;
         virtual void forEachString ( const callable<void (const char *)> & fn ) override ;
         virtual void report() override;
         virtual bool mark() override;
         virtual bool mark ( char * ptr, uint32_t size ) override;
         virtual void sweep() override;
-        virtual bool isOwnPtr ( char * ptr, uint32_t size ) override { return model.isOwnPtr(ptr,size); }
-        virtual bool isValidPtr ( char * ptr, uint32_t size ) override { return model.isAllocatedPtr(ptr,size); }
-        virtual void setInitialSize ( uint32_t size ) override { model.setInitialSize(size); }
-        virtual int32_t getInitialSize() const override { return model.initialSize; }
-        virtual void setGrowFunction ( CustomGrowFunction && fun ) override { model.customGrow = fun; };
+        virtual bool isOwnPtr ( char * ptr, uint32_t size ) override;
+        virtual bool isValidPtr ( char * ptr, uint32_t size ) override;
+        virtual void setInitialSize ( uint32_t size ) override;
+        virtual int32_t getInitialSize() const override;
+        virtual void setGrowFunction ( CustomGrowFunction && fun ) override;
 #if DAS_TRACK_ALLOCATIONS
         virtual void mark_location ( void * ptr, const LineInfo * at ) override { model.mark_location(ptr,at); };
         virtual  void mark_comment ( void * ptr, const char * what ) override { model.mark_comment(ptr,what); };
@@ -394,45 +343,26 @@ namespace das {
         MemoryModel model;
     };
 
-    class LinearStringAllocator final : public StringHeapAllocator {
+    class DAS_API LinearStringAllocator final : public StringHeapAllocator {
     public:
-        LinearStringAllocator() { model.alignMask = 3; }
-        virtual char * impl_allocate ( uint32_t size ) override {
-            if ( limit==0 || model.bytesAllocated()+size<=limit ) {
-                totalAllocations ++;
-                totalBytesAllocated += size;
-                return model.allocate(size);
-            } else {
-                return nullptr;
-            }
-        }
-        virtual void impl_free ( char * ptr, uint32_t size ) override {
-            totalBytesDeleted += size;
-            model.free(ptr,size);
-        }
-        virtual char * impl_reallocate ( char * ptr, uint32_t oldSize, uint32_t newSize ) override {
-            if ( limit==0 || model.bytesAllocated()+newSize-oldSize<=limit ) {
-                totalAllocations ++;
-                totalBytesAllocated += newSize-oldSize;
-                return model.reallocate(ptr,oldSize,newSize);
-            } else {
-                return nullptr;
-            }
-        }
-        virtual int depth() const override { return model.depth(); }
-        virtual uint64_t bytesAllocated() const override { return model.bytesAllocated(); }
-        virtual uint64_t totalAlignedMemoryAllocated() const override { return model.totalAlignedMemoryAllocated(); }
-        virtual void reset() override { model.reset(); }
+        LinearStringAllocator();
+        virtual char * impl_allocate ( uint32_t size ) override;
+        virtual void impl_free ( char * ptr, uint32_t size ) override;
+        virtual char * impl_reallocate ( char * ptr, uint32_t oldSize, uint32_t newSize ) override;
+        virtual int depth() const override;
+        virtual uint64_t bytesAllocated() const override;
+        virtual uint64_t totalAlignedMemoryAllocated() const override;
+        virtual void reset() override;
         virtual void forEachString ( const callable<void (const char *)> & fn ) override;
         virtual void report() override;
         virtual bool mark() override { return false; }
         virtual bool mark ( char *, uint32_t ) override { DAS_ASSERT(0 && "not supported"); return false; }
         virtual void sweep() override { DAS_ASSERT(0 && "not supported"); }
-        virtual bool isOwnPtr ( char * ptr, uint32_t ) override { return model.isOwnPtr(ptr); }
+        virtual bool isOwnPtr ( char * ptr, uint32_t ) override;
         virtual bool isValidPtr ( char *, uint32_t ) override { return true; }
-        virtual void setInitialSize ( uint32_t size ) override { model.setInitialSize(size); }
-        virtual int32_t getInitialSize() const override { return model.initialSize; }
-        virtual void setGrowFunction ( CustomGrowFunction && fun ) override { model.customGrow = fun; };
+        virtual void setInitialSize ( uint32_t size ) override;
+        virtual int32_t getInitialSize() const override;
+        virtual void setGrowFunction ( CustomGrowFunction && fun ) override;
     protected:
         LinearChunkAllocator model;
     };

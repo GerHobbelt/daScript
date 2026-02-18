@@ -25,7 +25,7 @@ namespace das {
         virtual bool canVisitArgumentInit ( Function * , const VariablePtr &, Expression * ) override { return false; }
         virtual bool canVisitQuoteSubexpression ( ExprQuote * ) override { return false; }
         virtual bool canVisitGlobalVariable ( Variable * var ) override { return isEverything || var->used; }
-        virtual bool canVisitFunction ( Function * fun ) override { return !fun->isTemplate && (isEverything || fun->used); }
+        virtual bool canVisitFunction ( Function * fun ) override { return !fun->isTemplate && !fun->stub && (isEverything || fun->used); }
     // function
         virtual void preVisit ( Function * f ) override {
             Visitor::preVisit(f);
@@ -167,6 +167,7 @@ namespace das {
             return true;
         }
         virtual bool canVisitFunction ( Function * fun ) override {
+            if ( fun->stub ) return false;
             if ( fun->isTemplate ) return false;
             if ( fun->stackResolved ) return false;
             if ( !fun->used && !isEverything ) return false;

@@ -3,11 +3,10 @@
 
 using namespace das;
 
-void require_project_specific_modules() {
+DAS_API void require_project_specific_modules() {
 
     #if defined(_EMSCRIPTEN_VER)
     return;
     #else
-    NEED_MODULE(Module_UnitTest);
     #endif
 }
