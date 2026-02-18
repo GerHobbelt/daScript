@@ -6,6 +6,14 @@ options strict_smart_pointers = true
 
 module match shared private
 
+//! Pattern matching macro for daScript.
+//!
+//! Provides ``match``, ``static_match``, ``multi_match``, and ``static_multi_match`` macros
+//! that decompose values by structure, variant, tuple, array, or constant comparison.
+//! Also provides ``match_type`` and ``match_expr`` helpers, guard expressions (``&&``),
+//! alternation (``||``), wildcard (``_``), and variable capture (``$v(name)``).
+//! Structures annotated with ``[match_as_is]`` or ``[match_copy]`` enable custom matching.
+
 require daslib/ast_boost
 require daslib/templates_boost
 require daslib/macro_boost
@@ -20,16 +28,18 @@ require daslib/debug
 let LOG_MATCH = false
 
 struct MatchError {
-    msg : string
-    @do_not_delete at : LineInfo const?
+    //! Stores a single pattern-matching compilation error with its source location.
+    msg : string                        //! error message text
+    @do_not_delete at : LineInfo const? //! source location of the error
 }
 
 struct MatchTo {
-    conditions   : array<ExpressionPtr>
-    declarations : table<string; ExpressionPtr>
-    prefix       : array<ExpressionPtr>
-    errors       : array<MatchError>
-    failed       : bool
+    //! Accumulates the result of pattern analysis for one match arm.
+    conditions   : array<ExpressionPtr>             //! boolean conditions that must all be true for the arm to match
+    declarations : table<string; ExpressionPtr>     //! captured variables (name → access expression)
+    prefix       : array<ExpressionPtr>             //! prefix statements (e.g. temporaries for match_copy)
+    errors       : array<MatchError>                //! errors encountered during pattern analysis
+    failed       : bool                             //! true if a hard error occurred (unresolved types etc.)
 }
 
 [macro_function]
@@ -45,6 +55,7 @@ def match_error(var errors : array<MatchError>; msg : string; at : LineInfo) {//
 }
 
 enum MatchType {
+    //! Type of pattern match clause.
     none
     as_is
     copy
@@ -395,11 +406,13 @@ def match_expr(what : TypeDeclPtr; wthmt : ExprCall?; access : ExpressionPtr; va
         return false
     }
     var inscope expr <- clone_expression(value)
-    apply_template(expr) <| $(rules) {
-        for (dv, dn in keys(to.declarations), values(to.declarations)) {
-            rules |> replaceVariable(dv) <| clone_expression(dn)
+    unsafe {
+        expr <- apply_template(expr) <| $(rules) {
+            for (dv, dn in keys(to.declarations), values(to.declarations)) {
+                rules |> replaceVariable(dv) <| clone_expression(dn)
+            }
+            rules |> replaceVarTag("_") <| clone_expression(access)
         }
-        rules |> replaceVarTag("_") <| clone_expression(access)
     }
     var inscope cond <- qmacro($e(access) == $e(expr))
     cond |> force_at(value.at)
@@ -412,11 +425,13 @@ def match_guards(what : TypeDeclPtr; wth : ExprOp2?; access : ExpressionPtr; var
     if (match_any(what, get_ptr(wth.left), access, to)) {
         log_m("\tguards {describe(wth.right)} at {wth.right.at}\n")
         var inscope guards <- clone_expression(wth.right)
-        apply_template(guards) <| $(rules) {
-            for (dv, dn in keys(to.declarations), values(to.declarations)) {
-                rules |> replaceVariable(dv) <| clone_expression(dn)
+        unsafe {
+            guards <- apply_template(guards) <| $(rules) {
+                for (dv, dn in keys(to.declarations), values(to.declarations)) {
+                    rules |> replaceVariable(dv) <| clone_expression(dn)
+                }
+                rules |> replaceVarTag("_") <| clone_expression(access)
             }
-            rules |> replaceVarTag("_") <| clone_expression(access)
         }
         to.conditions |> emplace(guards)
         return true
@@ -604,10 +619,11 @@ class MatchMacro : AstCallMacro {
     def override preVisit(prog : ProgramPtr; mod : Module?; expr : smart_ptr<ExprCallMacro>) : void {
         return if (length(expr.arguments) != 2)
         assume blk = expr.arguments[1]
-        return if (blk._type == null)
-        return if (!blk._type.isGoodBlockType)
         return if (!(blk is ExprMakeBlock))
         // we mark all if's inside the match to not fold, so that we can fold the match later
+        // Note: must set doNotFold even before blk._type is resolved, otherwise
+        // if(true)/if(false) literal conditions get constant-folded before the
+        // match macro can analyze them as patterns.
         var eblk = ((blk as ExprMakeBlock)._block as ExprBlock)
         for (ee in eblk.list) {
             if (ee is ExprIfThenElse) {
@@ -630,6 +646,7 @@ class MatchMacro : AstCallMacro {
                 macro_verify(eite.if_false == null, prog, expr.at, "match to `if` can't have `else` section")
             } else {
                 macro_error(prog, ee.at, "match `block` argument can only contain match-to calls, not {ee.__rtti}")
+                return <- default<ExpressionPtr>
             }
         }
         var inscope access <- clone_expression(what)
@@ -740,12 +757,14 @@ class MatchCopy : AstStructureAnnotation {
 
 
 def public match_type(anytype, anything) : void {
-    //! this is a macro, it will be replaced with a match expression of specified type
+    //! Match by type. Inside a ``match`` arm, ``match_type(expr, Type)`` checks whether the
+    //! matched value has the given type and decomposes ``expr`` against it.
     pass
 }
 
 def public match_expr(anything) : void {
-    //! this is a macro, it will be replaced with a match expression
+    //! Match by expression equality. Inside a ``match`` arm, ``match_expr(expr)`` generates
+    //! a condition ``value == expr``. Captured variables (``$v``) are substituted before comparison.
     pass
 }
 

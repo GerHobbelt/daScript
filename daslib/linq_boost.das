@@ -5,6 +5,13 @@ options no_unused_function_arguments = false
 
 module linq_boost shared public
 
+//! LINQ operator-pipe macro support.
+//!
+//! Provides ``|>`` pipe-syntax rewrites for LINQ operations so that
+//! ``arr |> where(...) |> select(...)`` chains compile into efficient
+//! iterator pipelines.
+//! Requires the ``linq`` module.
+
 require daslib/linq public
 
 require daslib/ast_boost
@@ -19,11 +26,13 @@ def private clone_iterator_type(it : TypeDeclPtr) : TypeDeclPtr {
 }
 
 class private AstCallMacro_LinqPred2 : AstCallMacro {
+    //! Base call macro for LINQ-style two-argument predicate operators.
     predName = "where_"
     //! This macro converts _where(iterator, expresion) into::
     //!     where_(iterator, $(_) => expression)
     //!
     def override visit(prog : ProgramPtr; mod : Module?; var call : smart_ptr<ExprCallMacro>) : ExpressionPtr {
+        //! Visits the LINQ predicate macro call and rewrites it with a lambda argument.
         // verifying arguments
         macro_verify(call.arguments |> length == 2, prog, call.at, "expecting {predName}(iterator, predicate)")
         assume arg0 = call.arguments[0]
@@ -147,6 +156,15 @@ class private LinqAny : AstCallMacro_LinqPred2 {
     override predName = "any"
 }
 
+[call_macro(name="_count")]
+class private LinqCount : AstCallMacro_LinqPred2 {
+    //! implements _count(iterator, expression) shorthand notation
+    //! that expands into count(iterator, $(_) => expression)
+    //! for example::
+    //!   each(foo)._count(_ > 3)
+    override predName = "count"
+}
+
 [call_macro(name="_unique_by")]
 class private LinqUnique : AstCallMacro_LinqPred2 {
     //! implements _unique_by(iterator, expression) shorthand notation
@@ -220,12 +238,14 @@ class private LinqOrderByDescendingToArray : AstCallMacro_LinqPred2 {
 }
 
 class private AstCallMacro_LinqPredII2 : AstCallMacro {
+    //! Base call macro for LINQ-style two-iterator two-argument predicate operators.
     predName = "sequence_equal_by"
     //! implements sequence_equal_by(i1, i2, expresion) shorthand notation
     //! that expands into sequence_equal_by(i1, i2, $(_) => expression)
     //! for example::
     //!   each(foo1)._sequence_equal_by(each(foo2), _.id)
     def override visit(prog : ProgramPtr; mod : Module?; var call : smart_ptr<ExprCallMacro>) : ExpressionPtr {
+        //! Visits the LINQ two-iterator predicate macro call and rewrites it with a lambda argument.
         // verifying arguments
         macro_verify(call.arguments |> length == 3, prog, call.at, "expecting {predName}(iterator or array, iterator or array, predicate)")
         macro_verify(call.arguments[0]._type != null, prog, call.at, "expecting iterator or array")
@@ -345,6 +365,7 @@ def private fold_linq_cond(var expr : ExpressionPtr; argName : string) : Express
 }
 
 struct private LinqCall {
+    //! Internal struct representing a chained LINQ method call.
     name : string
     moduleName : string = "linq"
     skip : bool = false             // if specified, expression is skipped in folding
@@ -397,6 +418,10 @@ var private linqCalls = {
     "take_to_array" => LinqCall(name = "take", inplace = true),
     "take_while" => LinqCall(name = "take_while"),
     "take_while_to_array" => LinqCall(name = "take_while"),
+    "skip_last" => LinqCall(name = "skip_last", inplace = true),
+    "skip_last_to_array" => LinqCall(name = "skip_last", inplace = true),
+    "take_last" => LinqCall(name = "take_last", inplace = true),
+    "take_last_to_array" => LinqCall(name = "take_last", inplace = true),
     "chunk" => LinqCall(name = "chunk"),
     "chunk_to_array" => LinqCall(name = "chunk"),
 // concatenation operations
@@ -505,6 +530,7 @@ def private flatten_linq(var expr : ExpressionPtr)  {
 }
 
 struct private FoldSequence {
+    //! Internal struct representing a fold operation sequence.
     calls : array<string>
     folder : function<(
         argIndex : int;
@@ -703,9 +729,7 @@ def private fold_linq_default(var expr : ExpressionPtr) : ExpressionPtr {
             }
             if (found != null) {
                 var sub = subarray(calls, argIndex .. argIndex + found.calls |> length)
-                print("before topValue = {describe(topValue)}\n")
                 topValue |> move_new <| found.folder(argIndex, topValue, blk.get_ptr(), sub)
-                print("after topValue = {describe(topValue)}\n")
                 argIndex += found.calls |> length
             } else {
                 if (cll._0._type.isIterator || cll._0._type.isGoodArrayType) {
@@ -769,6 +793,7 @@ class private LinqFold : AstCallMacro {
     //!   _fold(each(foo)._where(_ > 5)._select(_ * 2))
     //! expands into a single comprehension that does all operations in one pass
     def override visit(prog : ProgramPtr; mod : Module?; var call : smart_ptr<ExprCallMacro>) : ExpressionPtr {
+        //! Visits the _fold macro call and folds LINQ expressions into optimized sequences.
         macro_verify(call.arguments |> length == 1, prog, call.at, "expecting _fold(expression)")
         macro_verify(call.arguments[0]._type != null, prog, call.at, "expecting linq expression")
         var inscope res : ExpressionPtr <- fold_linq_default(call.arguments[0])

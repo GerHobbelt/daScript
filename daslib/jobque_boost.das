@@ -7,6 +7,14 @@ options strict_smart_pointers = true
 
 module jobque_boost shared public
 
+//! Job queue macro helpers.
+//!
+//! Provides ``new_job``, ``new_thread``, ``with_job_que``,
+//! ``with_job_status``, ``channel_next``, ``channel_push``, and
+//! other convenience wrappers that capture lambda closures and
+//! correctly manage context cloning for multi-threaded execution.
+//! Extends the built-in ``jobque`` module.
+
 require jobque public
 
 require daslib/rtti
@@ -39,8 +47,9 @@ def new_thread(var l : lambda) {
 class private NewJobMacro : AstFunctionAnnotation {
     //! this macro handles `new_job` and `new_thread` calls.
     //! the call is replaced with `new_job_invoke` and `new_thread_invoke` accordingly.
-    //! a cloning infastructure is generated for the lambda, which is invoked in the new context.
+    //! a cloning infrastructure is generated for the lambda, which is invoked in the new context.
     def override transform(var call : smart_ptr<ExprCallFunc>; var errors : das_string) : ExpressionPtr {
+        //! Transforms the new_job or new_thread call by generating lambda cloning infrastructure.
         macro_verify(call.arguments[0] is ExprAscend, compiling_program(), call.at, "expecting lambda declaration, ExprAscend")
         var asc = call.arguments[0] as ExprAscend
         macro_verify(asc.subexpr is ExprMakeStruct, compiling_program(), call.at, "expecting lambda declaration, ExprMakeStruct")
@@ -186,7 +195,7 @@ def pop_and_clone_one(channel : Channel?; blk : block<(res : auto(TT)#) : void>)
 }
 
 def push_clone(channel : Channel?; data : auto(TT)) {
-    //! clones data and pushed value to the channel (at the end)
+    //! clones data and pushes value to the channel (at the end)
     var heap_data = new TT
     *heap_data := data
     _builtin_channel_push(channel, heap_data)
@@ -198,7 +207,7 @@ def push(channel : Channel?; data : auto?) {
 }
 
 def push_batch_clone(channel : Channel?; data : array<auto(TT)>) {
-    //! clones data and pushed values to the channel (at the end)
+    //! clones data and pushes values to the channel (at the end)
     var heap_data : array<TT?>
     for (d in data) {
         var tt = new TT
@@ -389,12 +398,15 @@ def private isPtrToJQ(typ : TypeDeclPtr; jqt : string) : bool {
 
 [capture_macro(name=channel_and_status_capture_macro)]
 class private ChannelAndStatusCapture : AstCaptureMacro {
+    //! Capture macro for channel and job status objects in lambda captures.
     def make_capture_call(expr : ExpressionPtr; name : string) : ExpressionPtr {
+        //! Creates a call expression that captures (adds a reference to) a jobque object.
         var inscope pCall <- new ExprCall(at = expr.at, name := name)
         pCall.arguments |> emplace_new <| clone_expression(expr)
         return <- pCall
     }
     def make_release_call(fld : FieldDeclaration; name : string) : ExpressionPtr {
+        //! Creates a call expression that releases (decrements the reference of) a captured jobque object.
         var inscope pCall <- new ExprCall(at = fld.at, name := name)
         pCall.arguments |> emplace_new <| new ExprField(at = fld.at,
             value <- new ExprVar(at = fld.at, name := "__this"),

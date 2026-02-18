@@ -5,51 +5,306 @@
 LINQ
 ====
 
-The LINQ module implements LINQ (Language Integrated Query) capabilities in Daslang.
+The LINQ module provides query-style operations on sequences: filtering
+(``where_``), projection (``select``), sorting (``order``, ``order_by``),
+deduplication (``distinct``), pagination (``skip``, ``take``), aggregation
+(``sum``, ``average``, ``aggregate``), and element access (``first``, ``last``).
+
+See also :doc:`linq_boost` for pipe-syntax macros with underscore shorthand.
 
 All functions and symbols are in "linq" module, use require to get access to it. ::
 
     require daslib/linq
 
+Example: ::
+
+    require daslib/linq
+
+        [export]
+        def main() {
+            var src <- [iterator for (x in range(10)); x]
+            var evens <- where_(src, $(x : int) : bool { return x % 2 == 0; })
+            for (v in evens) {
+                print("{v} ")
+            }
+            print("\n")
+        }
+        // output:
+        // 0 2 4 6 8
+
 ++++++++++++
 Sorting data
 ++++++++++++
 
-  *  :ref:`reverse_inplace (var buffer: array\<auto(TT)\>) : auto <function-linq_reverse_inplace_array_ls_autoTT_gr_>` 
-  *  :ref:`reverse (a: array\<auto(TT)\>) : array\<TT\> <function-linq_reverse_array_ls_autoTT_gr_>` 
-  *  :ref:`reverse (var a: iterator\<auto(TT)\>) : iterator\<TT\> <function-linq_reverse_iterator_ls_autoTT_gr_>` 
-  *  :ref:`reverse_to_array (var a: iterator\<auto(TT)\>) : array\<TT\> <function-linq_reverse_to_array_iterator_ls_autoTT_gr_>` 
-  *  :ref:`order_inplace (var buffer: array\<auto(TT)\>) : auto <function-linq_order_inplace_array_ls_autoTT_gr_>` 
   *  :ref:`order (var a: iterator\<auto(TT)\>) : iterator\<TT\> <function-linq_order_iterator_ls_autoTT_gr_>` 
-  *  :ref:`order (arr: array\<auto(TT)\>) : array\<TT\> <function-linq_order_array_ls_autoTT_gr_>` 
-  *  :ref:`order_to_array (var a: iterator\<auto(TT)\>) : array\<TT\> <function-linq_order_to_array_iterator_ls_autoTT_gr_>` 
-  *  :ref:`order_inplace (var buffer: array\<auto(TT)\>; fun: block\<(v1:TT;v2:TT):bool\>) : auto <function-linq_order_inplace_array_ls_autoTT_gr__block_ls_v1_c_TT;v2_c_TT_c_bool_gr_>` 
   *  :ref:`order (var a: iterator\<auto(TT)\>; fun: block\<(v1:TT;v2:TT):bool\>) : iterator\<TT\> <function-linq_order_iterator_ls_autoTT_gr__block_ls_v1_c_TT;v2_c_TT_c_bool_gr_>` 
   *  :ref:`order (a: array\<auto(TT)\>; fun: block\<(v1:TT;v2:TT):bool\>) : array\<TT\> <function-linq_order_array_ls_autoTT_gr__block_ls_v1_c_TT;v2_c_TT_c_bool_gr_>` 
-  *  :ref:`order_to_array (var a: iterator\<auto(TT)\>; fun: block\<(v1:TT;v2:TT):bool\>) : array\<TT\> <function-linq_order_to_array_iterator_ls_autoTT_gr__block_ls_v1_c_TT;v2_c_TT_c_bool_gr_>` 
-  *  :ref:`order_descending_inplace (var buffer: array\<auto(TT)\>; fun: block\<(v1:TT;v2:TT):bool\>) : auto <function-linq_order_descending_inplace_array_ls_autoTT_gr__block_ls_v1_c_TT;v2_c_TT_c_bool_gr_>` 
-  *  :ref:`order_descending (var a: iterator\<auto(TT)\>; fun: block\<(v1:TT;v2:TT):bool\>) : iterator\<TT\> <function-linq_order_descending_iterator_ls_autoTT_gr__block_ls_v1_c_TT;v2_c_TT_c_bool_gr_>` 
+  *  :ref:`order (arr: array\<auto(TT)\>) : array\<TT\> <function-linq_order_array_ls_autoTT_gr_>` 
+  *  :ref:`order_by (a: array\<auto(TT)\>; key: auto) : array\<TT\> <function-linq_order_by_array_ls_autoTT_gr__auto_0x1d1>` 
+  *  :ref:`order_by (var a: iterator\<auto(TT)\>; key: auto) : iterator\<TT\> <function-linq_order_by_iterator_ls_autoTT_gr__auto_0x1c9>` 
+  *  :ref:`order_by_descending (var a: iterator\<auto(TT)\>; key: auto) : iterator\<TT\> <function-linq_order_by_descending_iterator_ls_autoTT_gr__auto_0x1e7>` 
+  *  :ref:`order_by_descending (a: array\<auto(TT)\>; key: auto) : array\<TT\> <function-linq_order_by_descending_array_ls_autoTT_gr__auto_0x1ef>` 
+  *  :ref:`order_by_descending_inplace (var buffer: array\<auto(TT)\>; key: auto) : auto <function-linq_order_by_descending_inplace_array_ls_autoTT_gr__auto_0x1e1>` 
+  *  :ref:`order_by_descending_to_array (var a: iterator\<auto(TT)\>; key: auto) : array\<TT\> <function-linq_order_by_descending_to_array_iterator_ls_autoTT_gr__auto_0x1f7>` 
+  *  :ref:`order_by_inplace (var buffer: array\<auto(TT)\>; key: auto) : auto <function-linq_order_by_inplace_array_ls_autoTT_gr__auto_0x1c3>` 
+  *  :ref:`order_by_to_array (var a: iterator\<auto(TT)\>; key: auto) : array\<TT\> <function-linq_order_by_to_array_iterator_ls_autoTT_gr__auto_0x1d9>` 
+  *  :ref:`order_descending (var a: iterator\<auto(TT)\>) : iterator\<TT\> <function-linq_order_descending_iterator_ls_autoTT_gr_>` 
   *  :ref:`order_descending (a: array\<auto(TT)\>; fun: block\<(v1:TT;v2:TT):bool\>) : array\<TT\> <function-linq_order_descending_array_ls_autoTT_gr__block_ls_v1_c_TT;v2_c_TT_c_bool_gr_>` 
+  *  :ref:`order_descending (arr: array\<auto(TT)\>) : array\<TT\> <function-linq_order_descending_array_ls_autoTT_gr_>` 
+  *  :ref:`order_descending (var a: iterator\<auto(TT)\>; fun: block\<(v1:TT;v2:TT):bool\>) : iterator\<TT\> <function-linq_order_descending_iterator_ls_autoTT_gr__block_ls_v1_c_TT;v2_c_TT_c_bool_gr_>` 
+  *  :ref:`order_descending_inplace (var buffer: array\<auto(TT)\>) : auto <function-linq_order_descending_inplace_array_ls_autoTT_gr_>` 
+  *  :ref:`order_descending_inplace (var buffer: array\<auto(TT)\>; fun: block\<(v1:TT;v2:TT):bool\>) : auto <function-linq_order_descending_inplace_array_ls_autoTT_gr__block_ls_v1_c_TT;v2_c_TT_c_bool_gr_>` 
   *  :ref:`order_descending_to_array (var a: iterator\<auto(TT)\>; fun: block\<(v1:TT;v2:TT):bool\>) : array\<TT\> <function-linq_order_descending_to_array_iterator_ls_autoTT_gr__block_ls_v1_c_TT;v2_c_TT_c_bool_gr_>` 
-  *  :ref:`order_by_inplace (var buffer: array\<auto(TT)\>; key: auto) : auto <function-linq_order_by_inplace_array_ls_autoTT_gr__auto>` 
-  *  :ref:`order_by (var a: iterator\<auto(TT)\>; key: auto) : iterator\<TT\> <function-linq_order_by_iterator_ls_autoTT_gr__auto>` 
-  *  :ref:`order_by (a: array\<auto(TT)\>; key: auto) : array\<TT\> <function-linq_order_by_array_ls_autoTT_gr__auto>` 
-  *  :ref:`order_by_to_array (var a: iterator\<auto(TT)\>; key: auto) : array\<TT\> <function-linq_order_by_to_array_iterator_ls_autoTT_gr__auto>` 
-  *  :ref:`order_by_descending_inplace (var buffer: array\<auto(TT)\>; key: auto) : auto <function-linq_order_by_descending_inplace_array_ls_autoTT_gr__auto>` 
-  *  :ref:`order_by_descending (var a: iterator\<auto(TT)\>; key: auto) : iterator\<TT\> <function-linq_order_by_descending_iterator_ls_autoTT_gr__auto>` 
-  *  :ref:`order_by_descending (a: array\<auto(TT)\>; key: auto) : array\<TT\> <function-linq_order_by_descending_array_ls_autoTT_gr__auto>` 
-  *  :ref:`order_by_descending_to_array (var a: iterator\<auto(TT)\>; key: auto) : array\<TT\> <function-linq_order_by_descending_to_array_iterator_ls_autoTT_gr__auto>` 
-  *  :ref:`order_unique_folded (var a: array\<auto(TT)\>) : array\<TT\> <function-linq_order_unique_folded_array_ls_autoTT_gr_>` 
+  *  :ref:`order_descending_to_array (var a: iterator\<auto(TT)\>) : array\<TT\> <function-linq_order_descending_to_array_iterator_ls_autoTT_gr_>` 
+  *  :ref:`order_inplace (var buffer: array\<auto(TT)\>) : auto <function-linq_order_inplace_array_ls_autoTT_gr_>` 
+  *  :ref:`order_inplace (var buffer: array\<auto(TT)\>; fun: block\<(v1:TT;v2:TT):bool\>) : auto <function-linq_order_inplace_array_ls_autoTT_gr__block_ls_v1_c_TT;v2_c_TT_c_bool_gr_>` 
+  *  :ref:`order_to_array (var a: iterator\<auto(TT)\>; fun: block\<(v1:TT;v2:TT):bool\>) : array\<TT\> <function-linq_order_to_array_iterator_ls_autoTT_gr__block_ls_v1_c_TT;v2_c_TT_c_bool_gr_>` 
+  *  :ref:`order_to_array (var a: iterator\<auto(TT)\>) : array\<TT\> <function-linq_order_to_array_iterator_ls_autoTT_gr_>` 
   *  :ref:`order_unique_folded (var a: iterator\<auto(TT)\>) : array\<TT\> <function-linq_order_unique_folded_iterator_ls_autoTT_gr_>` 
+  *  :ref:`order_unique_folded (var a: array\<auto(TT)\>) : array\<TT\> <function-linq_order_unique_folded_array_ls_autoTT_gr_>` 
   *  :ref:`order_unique_folded_inplace (var a: array\<auto(TT)\>) : auto <function-linq_order_unique_folded_inplace_array_ls_autoTT_gr_>` 
+  *  :ref:`reverse (a: array\<auto(TT)\>) : array\<TT\> <function-linq_reverse_array_ls_autoTT_gr_>` 
+  *  :ref:`reverse (var a: iterator\<auto(TT)\>) : iterator\<TT\> <function-linq_reverse_iterator_ls_autoTT_gr_>` 
+  *  :ref:`reverse_inplace (var buffer: array\<auto(TT)\>) : auto <function-linq_reverse_inplace_array_ls_autoTT_gr_>` 
+  *  :ref:`reverse_to_array (var a: iterator\<auto(TT)\>) : array\<TT\> <function-linq_reverse_to_array_iterator_ls_autoTT_gr_>` 
 
-.. _function-linq_reverse_inplace_array_ls_autoTT_gr_:
 
-.. das:function:: reverse_inplace(buffer: array<auto(TT)>) : auto
+order
+^^^^^
 
-Reverses an array in place
+.. _function-linq_order_iterator_ls_autoTT_gr_:
+
+.. das:function:: order(a: iterator<auto(TT)>) : iterator<TT>
+
+Sorts an iterator
+
+:Arguments: * **a** : iterator<auto(TT)>
+
+.. _function-linq_order_iterator_ls_autoTT_gr__block_ls_v1_c_TT;v2_c_TT_c_bool_gr_:
+
+.. das:function:: order(a: iterator<auto(TT)>; fun: block<(v1:TT;v2:TT):bool>) : iterator<TT>
+
+.. _function-linq_order_array_ls_autoTT_gr__block_ls_v1_c_TT;v2_c_TT_c_bool_gr_:
+
+.. das:function:: order(a: array<auto(TT)>; fun: block<(v1:TT;v2:TT):bool>) : array<TT>
+
+.. _function-linq_order_array_ls_autoTT_gr_:
+
+.. das:function:: order(arr: array<auto(TT)>) : array<TT>
+
+----
+
+
+order_by
+^^^^^^^^
+
+.. _function-linq_order_by_array_ls_autoTT_gr__auto_0x1d1:
+
+.. das:function:: order_by(a: array<auto(TT)>; key: auto) : array<TT>
+
+Sorts an array
+
+:Arguments: * **a** : array<auto(TT)>
+
+            * **key** : auto
+
+.. _function-linq_order_by_iterator_ls_autoTT_gr__auto_0x1c9:
+
+.. das:function:: order_by(a: iterator<auto(TT)>; key: auto) : iterator<TT>
+
+----
+
+
+order_by_descending
+^^^^^^^^^^^^^^^^^^^
+
+.. _function-linq_order_by_descending_iterator_ls_autoTT_gr__auto_0x1e7:
+
+.. das:function:: order_by_descending(a: iterator<auto(TT)>; key: auto) : iterator<TT>
+
+Sorts an iterator in descending order
+
+:Arguments: * **a** : iterator<auto(TT)>
+
+            * **key** : auto
+
+.. _function-linq_order_by_descending_array_ls_autoTT_gr__auto_0x1ef:
+
+.. das:function:: order_by_descending(a: array<auto(TT)>; key: auto) : array<TT>
+
+----
+
+.. _function-linq_order_by_descending_inplace_array_ls_autoTT_gr__auto_0x1e1:
+
+.. das:function:: order_by_descending_inplace(buffer: array<auto(TT)>; key: auto) : auto
+
+Sorts an array in descending order in place
 
 :Arguments: * **buffer** : array<auto(TT)>
+
+            * **key** : auto
+
+.. _function-linq_order_by_descending_to_array_iterator_ls_autoTT_gr__auto_0x1f7:
+
+.. das:function:: order_by_descending_to_array(a: iterator<auto(TT)>; key: auto) : array<TT>
+
+Sorts an iterator in descending order and returns an array
+
+:Arguments: * **a** : iterator<auto(TT)>
+
+            * **key** : auto
+
+.. _function-linq_order_by_inplace_array_ls_autoTT_gr__auto_0x1c3:
+
+.. das:function:: order_by_inplace(buffer: array<auto(TT)>; key: auto) : auto
+
+Sorts an array in place
+
+:Arguments: * **buffer** : array<auto(TT)>
+
+            * **key** : auto
+
+.. _function-linq_order_by_to_array_iterator_ls_autoTT_gr__auto_0x1d9:
+
+.. das:function:: order_by_to_array(a: iterator<auto(TT)>; key: auto) : array<TT>
+
+Sorts an iterator and returns an array
+
+:Arguments: * **a** : iterator<auto(TT)>
+
+            * **key** : auto
+
+
+order_descending
+^^^^^^^^^^^^^^^^
+
+.. _function-linq_order_descending_iterator_ls_autoTT_gr_:
+
+.. das:function:: order_descending(a: iterator<auto(TT)>) : iterator<TT>
+
+Sorts an iterator in descending order
+
+:Arguments: * **a** : iterator<auto(TT)>
+
+.. _function-linq_order_descending_array_ls_autoTT_gr__block_ls_v1_c_TT;v2_c_TT_c_bool_gr_:
+
+.. das:function:: order_descending(a: array<auto(TT)>; fun: block<(v1:TT;v2:TT):bool>) : array<TT>
+
+.. _function-linq_order_descending_array_ls_autoTT_gr_:
+
+.. das:function:: order_descending(arr: array<auto(TT)>) : array<TT>
+
+.. _function-linq_order_descending_iterator_ls_autoTT_gr__block_ls_v1_c_TT;v2_c_TT_c_bool_gr_:
+
+.. das:function:: order_descending(a: iterator<auto(TT)>; fun: block<(v1:TT;v2:TT):bool>) : iterator<TT>
+
+----
+
+
+order_descending_inplace
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. _function-linq_order_descending_inplace_array_ls_autoTT_gr_:
+
+.. das:function:: order_descending_inplace(buffer: array<auto(TT)>) : auto
+
+Sorts an array in descending order in place
+
+:Arguments: * **buffer** : array<auto(TT)>
+
+.. _function-linq_order_descending_inplace_array_ls_autoTT_gr__block_ls_v1_c_TT;v2_c_TT_c_bool_gr_:
+
+.. das:function:: order_descending_inplace(buffer: array<auto(TT)>; fun: block<(v1:TT;v2:TT):bool>) : auto
+
+----
+
+
+order_descending_to_array
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. _function-linq_order_descending_to_array_iterator_ls_autoTT_gr__block_ls_v1_c_TT;v2_c_TT_c_bool_gr_:
+
+.. das:function:: order_descending_to_array(a: iterator<auto(TT)>; fun: block<(v1:TT;v2:TT):bool>) : array<TT>
+
+Sorts an iterator in descending order and returns an array
+
+:Arguments: * **a** : iterator<auto(TT)>
+
+            * **fun** : block<(v1:TT;v2:TT):bool>
+
+.. _function-linq_order_descending_to_array_iterator_ls_autoTT_gr_:
+
+.. das:function:: order_descending_to_array(a: iterator<auto(TT)>) : array<TT>
+
+----
+
+
+order_inplace
+^^^^^^^^^^^^^
+
+.. _function-linq_order_inplace_array_ls_autoTT_gr_:
+
+.. das:function:: order_inplace(buffer: array<auto(TT)>) : auto
+
+Sorts an array in place
+
+:Arguments: * **buffer** : array<auto(TT)>
+
+.. _function-linq_order_inplace_array_ls_autoTT_gr__block_ls_v1_c_TT;v2_c_TT_c_bool_gr_:
+
+.. das:function:: order_inplace(buffer: array<auto(TT)>; fun: block<(v1:TT;v2:TT):bool>) : auto
+
+----
+
+
+order_to_array
+^^^^^^^^^^^^^^
+
+.. _function-linq_order_to_array_iterator_ls_autoTT_gr__block_ls_v1_c_TT;v2_c_TT_c_bool_gr_:
+
+.. das:function:: order_to_array(a: iterator<auto(TT)>; fun: block<(v1:TT;v2:TT):bool>) : array<TT>
+
+Sorts an iterator and returns an array
+
+:Arguments: * **a** : iterator<auto(TT)>
+
+            * **fun** : block<(v1:TT;v2:TT):bool>
+
+.. _function-linq_order_to_array_iterator_ls_autoTT_gr_:
+
+.. das:function:: order_to_array(a: iterator<auto(TT)>) : array<TT>
+
+----
+
+
+order_unique_folded
+^^^^^^^^^^^^^^^^^^^
+
+.. _function-linq_order_unique_folded_iterator_ls_autoTT_gr_:
+
+.. das:function:: order_unique_folded(a: iterator<auto(TT)>) : array<TT>
+
+sort and remove duplicate elements from an iterator
+
+:Arguments: * **a** : iterator<auto(TT)>
+
+.. _function-linq_order_unique_folded_array_ls_autoTT_gr_:
+
+.. das:function:: order_unique_folded(a: array<auto(TT)>) : array<TT>
+
+----
+
+.. _function-linq_order_unique_folded_inplace_array_ls_autoTT_gr_:
+
+.. das:function:: order_unique_folded_inplace(a: array<auto(TT)>) : auto
+
+sort and remove duplicate elements from an array
+
+:Arguments: * **a** : array<auto(TT)>
+
+
+reverse
+^^^^^^^
 
 .. _function-linq_reverse_array_ls_autoTT_gr_:
 
@@ -63,9 +318,15 @@ Reverses an array
 
 .. das:function:: reverse(a: iterator<auto(TT)>) : iterator<TT>
 
-Reverses an iterator
+----
 
-:Arguments: * **a** : iterator<auto(TT)>
+.. _function-linq_reverse_inplace_array_ls_autoTT_gr_:
+
+.. das:function:: reverse_inplace(buffer: array<auto(TT)>) : auto
+
+Reverses an array in place
+
+:Arguments: * **buffer** : array<auto(TT)>
 
 .. _function-linq_reverse_to_array_iterator_ls_autoTT_gr_:
 
@@ -75,269 +336,49 @@ Reverses an iterator and returns an array
 
 :Arguments: * **a** : iterator<auto(TT)>
 
-.. _function-linq_order_inplace_array_ls_autoTT_gr_:
-
-.. das:function:: order_inplace(buffer: array<auto(TT)>) : auto
-
-Sorts an array in place
-
-:Arguments: * **buffer** : array<auto(TT)>
-
-.. _function-linq_order_iterator_ls_autoTT_gr_:
-
-.. das:function:: order(a: iterator<auto(TT)>) : iterator<TT>
-
-Sorts an iterator
-
-:Arguments: * **a** : iterator<auto(TT)>
-
-.. _function-linq_order_array_ls_autoTT_gr_:
-
-.. das:function:: order(arr: array<auto(TT)>) : array<TT>
-
-Sorts an array
-
-:Arguments: * **arr** : array<auto(TT)>
-
-.. _function-linq_order_to_array_iterator_ls_autoTT_gr_:
-
-.. das:function:: order_to_array(a: iterator<auto(TT)>) : array<TT>
-
-Sorts an iterator and returns an array
-
-:Arguments: * **a** : iterator<auto(TT)>
-
-.. _function-linq_order_inplace_array_ls_autoTT_gr__block_ls_v1_c_TT;v2_c_TT_c_bool_gr_:
-
-.. das:function:: order_inplace(buffer: array<auto(TT)>; fun: block<(v1:TT;v2:TT):bool>) : auto
-
-Sorts an array in place
-
-:Arguments: * **buffer** : array<auto(TT)>
-
-            * **fun** : block<(v1:TT;v2:TT):bool>
-
-.. _function-linq_order_iterator_ls_autoTT_gr__block_ls_v1_c_TT;v2_c_TT_c_bool_gr_:
-
-.. das:function:: order(a: iterator<auto(TT)>; fun: block<(v1:TT;v2:TT):bool>) : iterator<TT>
-
-Sorts an iterator
-
-:Arguments: * **a** : iterator<auto(TT)>
-
-            * **fun** : block<(v1:TT;v2:TT):bool>
-
-.. _function-linq_order_array_ls_autoTT_gr__block_ls_v1_c_TT;v2_c_TT_c_bool_gr_:
-
-.. das:function:: order(a: array<auto(TT)>; fun: block<(v1:TT;v2:TT):bool>) : array<TT>
-
-Sorts an array
-
-:Arguments: * **a** : array<auto(TT)>
-
-            * **fun** : block<(v1:TT;v2:TT):bool>
-
-.. _function-linq_order_to_array_iterator_ls_autoTT_gr__block_ls_v1_c_TT;v2_c_TT_c_bool_gr_:
-
-.. das:function:: order_to_array(a: iterator<auto(TT)>; fun: block<(v1:TT;v2:TT):bool>) : array<TT>
-
-Sorts an iterator and returns an array
-
-:Arguments: * **a** : iterator<auto(TT)>
-
-            * **fun** : block<(v1:TT;v2:TT):bool>
-
-.. _function-linq_order_descending_inplace_array_ls_autoTT_gr__block_ls_v1_c_TT;v2_c_TT_c_bool_gr_:
-
-.. das:function:: order_descending_inplace(buffer: array<auto(TT)>; fun: block<(v1:TT;v2:TT):bool>) : auto
-
-Sorts an array in descending order in place
-
-:Arguments: * **buffer** : array<auto(TT)>
-
-            * **fun** : block<(v1:TT;v2:TT):bool>
-
-.. _function-linq_order_descending_iterator_ls_autoTT_gr__block_ls_v1_c_TT;v2_c_TT_c_bool_gr_:
-
-.. das:function:: order_descending(a: iterator<auto(TT)>; fun: block<(v1:TT;v2:TT):bool>) : iterator<TT>
-
-Sorts an iterator in descending order
-
-:Arguments: * **a** : iterator<auto(TT)>
-
-            * **fun** : block<(v1:TT;v2:TT):bool>
-
-.. _function-linq_order_descending_array_ls_autoTT_gr__block_ls_v1_c_TT;v2_c_TT_c_bool_gr_:
-
-.. das:function:: order_descending(a: array<auto(TT)>; fun: block<(v1:TT;v2:TT):bool>) : array<TT>
-
-Sorts an array in descending order
-
-:Arguments: * **a** : array<auto(TT)>
-
-            * **fun** : block<(v1:TT;v2:TT):bool>
-
-.. _function-linq_order_descending_to_array_iterator_ls_autoTT_gr__block_ls_v1_c_TT;v2_c_TT_c_bool_gr_:
-
-.. das:function:: order_descending_to_array(a: iterator<auto(TT)>; fun: block<(v1:TT;v2:TT):bool>) : array<TT>
-
-Sorts an iterator in descending order and returns an array
-
-:Arguments: * **a** : iterator<auto(TT)>
-
-            * **fun** : block<(v1:TT;v2:TT):bool>
-
-.. _function-linq_order_by_inplace_array_ls_autoTT_gr__auto:
-
-.. das:function:: order_by_inplace(buffer: array<auto(TT)>; key: auto) : auto
-
-Sorts an array in place
-
-:Arguments: * **buffer** : array<auto(TT)>
-
-            * **key** : auto
-
-.. _function-linq_order_by_iterator_ls_autoTT_gr__auto:
-
-.. das:function:: order_by(a: iterator<auto(TT)>; key: auto) : iterator<TT>
-
-Sorts an iterator
-
-:Arguments: * **a** : iterator<auto(TT)>
-
-            * **key** : auto
-
-.. _function-linq_order_by_array_ls_autoTT_gr__auto:
-
-.. das:function:: order_by(a: array<auto(TT)>; key: auto) : array<TT>
-
-Sorts an array
-
-:Arguments: * **a** : array<auto(TT)>
-
-            * **key** : auto
-
-.. _function-linq_order_by_to_array_iterator_ls_autoTT_gr__auto:
-
-.. das:function:: order_by_to_array(a: iterator<auto(TT)>; key: auto) : array<TT>
-
-Sorts an iterator and returns an array
-
-:Arguments: * **a** : iterator<auto(TT)>
-
-            * **key** : auto
-
-.. _function-linq_order_by_descending_inplace_array_ls_autoTT_gr__auto:
-
-.. das:function:: order_by_descending_inplace(buffer: array<auto(TT)>; key: auto) : auto
-
-Sorts an array in descending order in place
-
-:Arguments: * **buffer** : array<auto(TT)>
-
-            * **key** : auto
-
-.. _function-linq_order_by_descending_iterator_ls_autoTT_gr__auto:
-
-.. das:function:: order_by_descending(a: iterator<auto(TT)>; key: auto) : iterator<TT>
-
-Sorts an iterator in descending order
-
-:Arguments: * **a** : iterator<auto(TT)>
-
-            * **key** : auto
-
-.. _function-linq_order_by_descending_array_ls_autoTT_gr__auto:
-
-.. das:function:: order_by_descending(a: array<auto(TT)>; key: auto) : array<TT>
-
-Sorts an array in descending order
-
-:Arguments: * **a** : array<auto(TT)>
-
-            * **key** : auto
-
-.. _function-linq_order_by_descending_to_array_iterator_ls_autoTT_gr__auto:
-
-.. das:function:: order_by_descending_to_array(a: iterator<auto(TT)>; key: auto) : array<TT>
-
-Sorts an iterator in descending order and returns an array
-
-:Arguments: * **a** : iterator<auto(TT)>
-
-            * **key** : auto
-
-.. _function-linq_order_unique_folded_array_ls_autoTT_gr_:
-
-.. das:function:: order_unique_folded(a: array<auto(TT)>) : array<TT>
-
-sort and remove duplicate elements from an array
-
-:Arguments: * **a** : array<auto(TT)>
-
-.. _function-linq_order_unique_folded_iterator_ls_autoTT_gr_:
-
-.. das:function:: order_unique_folded(a: iterator<auto(TT)>) : array<TT>
-
-sort and remove duplicate elements from an iterator
-
-:Arguments: * **a** : iterator<auto(TT)>
-
-.. _function-linq_order_unique_folded_inplace_array_ls_autoTT_gr_:
-
-.. das:function:: order_unique_folded_inplace(a: array<auto(TT)>) : auto
-
-sort and remove duplicate elements from an array
-
-:Arguments: * **a** : array<auto(TT)>
-
 ++++++++++++++
 Set operations
 ++++++++++++++
 
-  *  :ref:`unique_key (a: auto) : auto <function-linq_unique_key_auto>` 
   *  :ref:`distinct (a: array\<auto(TT)\>) : array\<TT\> <function-linq_distinct_array_ls_autoTT_gr_>` 
-  *  :ref:`distinct_to_array (var a: iterator\<auto(TT)\>) : array\<TT\> <function-linq_distinct_to_array_iterator_ls_autoTT_gr_>` 
-  *  :ref:`distinct_inplace (var a: array\<auto(TT)\>) : auto <function-linq_distinct_inplace_array_ls_autoTT_gr_>` 
   *  :ref:`distinct (var a: iterator\<auto(TT)\>) : iterator\<TT\> <function-linq_distinct_iterator_ls_autoTT_gr_>` 
   *  :ref:`distinct_by (a: array\<auto(TT)\>; key: block\<(arg:TT):auto\>) : array\<TT\> <function-linq_distinct_by_array_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_>` 
-  *  :ref:`distinct_by_to_array (var a: iterator\<auto(TT)\>; key: block\<(arg:TT):auto\>) : array\<TT\> <function-linq_distinct_by_to_array_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_>` 
   *  :ref:`distinct_by (var a: iterator\<auto(TT)\>; key: block\<(arg:TT):auto\>) : iterator\<TT\> <function-linq_distinct_by_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_>` 
   *  :ref:`distinct_by_inplace (var a: array\<auto(TT)\>; key: block\<(arg:TT):auto\>) : auto <function-linq_distinct_by_inplace_array_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_>` 
-  *  :ref:`unique (a: iterator\<auto(TT)\>) : iterator\<TT\> <function-linq_unique_iterator_ls_autoTT_gr_>` 
-  *  :ref:`unique (a: array\<auto(TT)\>) : array\<TT\> <function-linq_unique_array_ls_autoTT_gr_>` 
-  *  :ref:`unique_to_array (a: iterator\<auto(TT)\>) : array\<TT\> <function-linq_unique_to_array_iterator_ls_autoTT_gr_>` 
-  *  :ref:`unique_inplace (var a: array\<auto(TT)\>) : auto <function-linq_unique_inplace_array_ls_autoTT_gr_>` 
-  *  :ref:`unique_by (a: iterator\<auto(TT)\>; key: block\<(arg:TT):auto\>) : iterator\<TT\> <function-linq_unique_by_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_>` 
-  *  :ref:`unique_by (a: array\<auto(TT)\>; key: block\<(arg:TT):auto\>) : array\<TT\> <function-linq_unique_by_array_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_>` 
-  *  :ref:`unique_by_to_array (a: iterator\<auto(TT)\>; key: block\<(arg:TT):auto\>) : array\<TT\> <function-linq_unique_by_to_array_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_>` 
-  *  :ref:`unique_by_inplace (var a: array\<auto(TT)\>; key: block\<(arg:TT):auto\>) : auto <function-linq_unique_by_inplace_array_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_>` 
-  *  :ref:`union (var srca: array\<auto(TT)\>; var srcb: array\<auto(TT)\>) : array\<TT\> <function-linq_union_array_ls_autoTT_gr__array_ls_autoTT_gr_>` 
-  *  :ref:`union (var srca: iterator\<auto(TT)\>; var srcb: iterator\<auto(TT)\>) : iterator\<TT\> <function-linq_union_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_>` 
-  *  :ref:`union_to_array (var srca: iterator\<auto(TT)\>; var srcb: iterator\<auto(TT)\>) : array\<TT\> <function-linq_union_to_array_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_>` 
-  *  :ref:`union_by (var srca: iterator\<auto(TT)\>; var srcb: iterator\<auto(TT)\>; key: block\<(arg:TT):auto\>) : iterator\<TT\> <function-linq_union_by_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_>` 
-  *  :ref:`union_by (srca: array\<auto(TT)\>; srcb: array\<auto(TT)\>; key: block\<(arg:TT):auto\>) : array\<TT\> <function-linq_union_by_array_ls_autoTT_gr__array_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_>` 
-  *  :ref:`union_by_to_array (var srca: iterator\<auto(TT)\>; var srcb: iterator\<auto(TT)\>; key: block\<(arg:TT):auto\>) : array\<TT\> <function-linq_union_by_to_array_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_>` 
+  *  :ref:`distinct_by_to_array (var a: iterator\<auto(TT)\>; key: block\<(arg:TT):auto\>) : array\<TT\> <function-linq_distinct_by_to_array_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_>` 
+  *  :ref:`distinct_inplace (var a: array\<auto(TT)\>) : auto <function-linq_distinct_inplace_array_ls_autoTT_gr_>` 
+  *  :ref:`distinct_to_array (var a: iterator\<auto(TT)\>) : array\<TT\> <function-linq_distinct_to_array_iterator_ls_autoTT_gr_>` 
   *  :ref:`except (var src: iterator\<auto(TT)\>; var exclude: iterator\<auto(TT)\>) : iterator\<TT\> <function-linq_except_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_>` 
   *  :ref:`except (src: array\<auto(TT)\>; exclude: array\<auto(TT)\>) : array\<TT\> <function-linq_except_array_ls_autoTT_gr__array_ls_autoTT_gr_>` 
-  *  :ref:`except_to_array (var src: iterator\<auto(TT)\>; var exclude: iterator\<auto(TT)\>) : array\<TT\> <function-linq_except_to_array_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_>` 
-  *  :ref:`except_by (var src: iterator\<auto(TT)\>; var exclude: iterator\<auto(TT)\>; key: block\<(arg:TT):auto\>) : iterator\<TT\> <function-linq_except_by_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_>` 
   *  :ref:`except_by (src: array\<auto(TT)\>; exclude: array\<auto(TT)\>; key: block\<(arg:TT):auto\>) : array\<TT\> <function-linq_except_by_array_ls_autoTT_gr__array_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_>` 
+  *  :ref:`except_by (var src: iterator\<auto(TT)\>; var exclude: iterator\<auto(TT)\>; key: block\<(arg:TT):auto\>) : iterator\<TT\> <function-linq_except_by_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_>` 
   *  :ref:`except_by_to_array (var src: iterator\<auto(TT)\>; var exclude: iterator\<auto(TT)\>; key: block\<(arg:TT):auto\>) : array\<TT\> <function-linq_except_by_to_array_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_>` 
-  *  :ref:`intersect (var srca: iterator\<auto(TT)\>; var srcb: iterator\<auto(TT)\>) : iterator\<TT\> <function-linq_intersect_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_>` 
+  *  :ref:`except_to_array (var src: iterator\<auto(TT)\>; var exclude: iterator\<auto(TT)\>) : array\<TT\> <function-linq_except_to_array_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_>` 
   *  :ref:`intersect (srca: array\<auto(TT)\>; srcb: array\<auto(TT)\>) : array\<TT\> <function-linq_intersect_array_ls_autoTT_gr__array_ls_autoTT_gr_>` 
-  *  :ref:`intersect_to_array (var srca: iterator\<auto(TT)\>; var srcb: iterator\<auto(TT)\>) : array\<TT\> <function-linq_intersect_to_array_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_>` 
-  *  :ref:`intersect_by (var srca: iterator\<auto(TT)\>; var srcb: iterator\<auto(TT)\>; key: block\<(arg:TT):auto\>) : iterator\<TT\> <function-linq_intersect_by_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_>` 
+  *  :ref:`intersect (var srca: iterator\<auto(TT)\>; var srcb: iterator\<auto(TT)\>) : iterator\<TT\> <function-linq_intersect_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_>` 
   *  :ref:`intersect_by (srca: array\<auto(TT)\>; srcb: array\<auto(TT)\>; key: block\<(arg:TT):auto\>) : array\<TT\> <function-linq_intersect_by_array_ls_autoTT_gr__array_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_>` 
+  *  :ref:`intersect_by (var srca: iterator\<auto(TT)\>; var srcb: iterator\<auto(TT)\>; key: block\<(arg:TT):auto\>) : iterator\<TT\> <function-linq_intersect_by_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_>` 
   *  :ref:`intersect_by_to_array (var srca: iterator\<auto(TT)\>; var srcb: iterator\<auto(TT)\>; key: block\<(arg:TT):auto\>) : array\<TT\> <function-linq_intersect_by_to_array_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_>` 
+  *  :ref:`intersect_to_array (var srca: iterator\<auto(TT)\>; var srcb: iterator\<auto(TT)\>) : array\<TT\> <function-linq_intersect_to_array_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_>` 
+  *  :ref:`union (var srca: iterator\<auto(TT)\>; var srcb: iterator\<auto(TT)\>) : iterator\<TT\> <function-linq_union_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_>` 
+  *  :ref:`union (var srca: array\<auto(TT)\>; var srcb: array\<auto(TT)\>) : array\<TT\> <function-linq_union_array_ls_autoTT_gr__array_ls_autoTT_gr_>` 
+  *  :ref:`union_by (srca: array\<auto(TT)\>; srcb: array\<auto(TT)\>; key: block\<(arg:TT):auto\>) : array\<TT\> <function-linq_union_by_array_ls_autoTT_gr__array_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_>` 
+  *  :ref:`union_by (var srca: iterator\<auto(TT)\>; var srcb: iterator\<auto(TT)\>; key: block\<(arg:TT):auto\>) : iterator\<TT\> <function-linq_union_by_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_>` 
+  *  :ref:`union_by_to_array (var srca: iterator\<auto(TT)\>; var srcb: iterator\<auto(TT)\>; key: block\<(arg:TT):auto\>) : array\<TT\> <function-linq_union_by_to_array_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_>` 
+  *  :ref:`union_to_array (var srca: iterator\<auto(TT)\>; var srcb: iterator\<auto(TT)\>) : array\<TT\> <function-linq_union_to_array_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_>` 
+  *  :ref:`unique (a: array\<auto(TT)\>) : array\<TT\> <function-linq_unique_array_ls_autoTT_gr_>` 
+  *  :ref:`unique (a: iterator\<auto(TT)\>) : iterator\<TT\> <function-linq_unique_iterator_ls_autoTT_gr_>` 
+  *  :ref:`unique_by (a: array\<auto(TT)\>; key: block\<(arg:TT):auto\>) : array\<TT\> <function-linq_unique_by_array_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_>` 
+  *  :ref:`unique_by (a: iterator\<auto(TT)\>; key: block\<(arg:TT):auto\>) : iterator\<TT\> <function-linq_unique_by_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_>` 
+  *  :ref:`unique_by_inplace (var a: array\<auto(TT)\>; key: block\<(arg:TT):auto\>) : auto <function-linq_unique_by_inplace_array_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_>` 
+  *  :ref:`unique_by_to_array (a: iterator\<auto(TT)\>; key: block\<(arg:TT):auto\>) : array\<TT\> <function-linq_unique_by_to_array_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_>` 
+  *  :ref:`unique_inplace (var a: array\<auto(TT)\>) : auto <function-linq_unique_inplace_array_ls_autoTT_gr_>` 
+  *  :ref:`unique_key (a: auto) : auto <function-linq_unique_key_auto_0x1fe>` 
+  *  :ref:`unique_to_array (a: iterator\<auto(TT)\>) : array\<TT\> <function-linq_unique_to_array_iterator_ls_autoTT_gr_>` 
 
-.. _function-linq_unique_key_auto:
 
-.. das:function:: unique_key(a: auto) : auto
-
-generates unique key of workhorse type for the value
-
-:Arguments: * **a** : auto
+distinct
+^^^^^^^^
 
 .. _function-linq_distinct_array_ls_autoTT_gr_:
 
@@ -347,35 +388,37 @@ Returns distinct elements from an array
 
 :Arguments: * **a** : array<auto(TT)>
 
-.. _function-linq_distinct_to_array_iterator_ls_autoTT_gr_:
-
-.. das:function:: distinct_to_array(a: iterator<auto(TT)>) : array<TT>
-
-Returns distinct elements from an iterator and returns an array
-
-:Arguments: * **a** : iterator<auto(TT)>
-
-.. _function-linq_distinct_inplace_array_ls_autoTT_gr_:
-
-.. das:function:: distinct_inplace(a: array<auto(TT)>) : auto
-
-Returns distinct elements from an array in place
-
-:Arguments: * **a** : array<auto(TT)>
-
 .. _function-linq_distinct_iterator_ls_autoTT_gr_:
 
 .. das:function:: distinct(a: iterator<auto(TT)>) : iterator<TT>
 
-Returns distinct elements from an iterator
+----
 
-:Arguments: * **a** : iterator<auto(TT)>
+
+distinct_by
+^^^^^^^^^^^
 
 .. _function-linq_distinct_by_array_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_:
 
 .. das:function:: distinct_by(a: array<auto(TT)>; key: block<(arg:TT):auto>) : array<TT>
 
 Returns distinct elements from an array based on a key
+
+:Arguments: * **a** : array<auto(TT)>
+
+            * **key** : block<(arg:TT):auto>
+
+.. _function-linq_distinct_by_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_:
+
+.. das:function:: distinct_by(a: iterator<auto(TT)>; key: block<(arg:TT):auto>) : iterator<TT>
+
+----
+
+.. _function-linq_distinct_by_inplace_array_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_:
+
+.. das:function:: distinct_by_inplace(a: array<auto(TT)>; key: block<(arg:TT):auto>) : auto
+
+Returns distinct elements from an array based on a key in place
 
 :Arguments: * **a** : array<auto(TT)>
 
@@ -391,163 +434,25 @@ Returns distinct elements from an iterator based on a key and returns an array
 
             * **key** : block<(arg:TT):auto>
 
-.. _function-linq_distinct_by_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_:
+.. _function-linq_distinct_inplace_array_ls_autoTT_gr_:
 
-.. das:function:: distinct_by(a: iterator<auto(TT)>; key: block<(arg:TT):auto>) : iterator<TT>
+.. das:function:: distinct_inplace(a: array<auto(TT)>) : auto
 
-Returns distinct elements from an iterator based on a key
-
-:Arguments: * **a** : iterator<auto(TT)>
-
-            * **key** : block<(arg:TT):auto>
-
-.. _function-linq_distinct_by_inplace_array_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_:
-
-.. das:function:: distinct_by_inplace(a: array<auto(TT)>; key: block<(arg:TT):auto>) : auto
-
-Returns distinct elements from an array based on a key in place
+Returns distinct elements from an array in place
 
 :Arguments: * **a** : array<auto(TT)>
 
-            * **key** : block<(arg:TT):auto>
+.. _function-linq_distinct_to_array_iterator_ls_autoTT_gr_:
 
-.. _function-linq_unique_iterator_ls_autoTT_gr_:
+.. das:function:: distinct_to_array(a: iterator<auto(TT)>) : array<TT>
 
-.. das:function:: unique(a: iterator<auto(TT)>) : iterator<TT>
-
-sort and remove duplicate elements from an iterator
+Returns distinct elements from an iterator and returns an array
 
 :Arguments: * **a** : iterator<auto(TT)>
 
-.. _function-linq_unique_array_ls_autoTT_gr_:
 
-.. das:function:: unique(a: array<auto(TT)>) : array<TT>
-
-sort and remove duplicate elements from an array
-
-:Arguments: * **a** : array<auto(TT)>
-
-.. _function-linq_unique_to_array_iterator_ls_autoTT_gr_:
-
-.. das:function:: unique_to_array(a: iterator<auto(TT)>) : array<TT>
-
-sort and remove duplicate elements from an iterator and returns an array
-
-:Arguments: * **a** : iterator<auto(TT)>
-
-.. _function-linq_unique_inplace_array_ls_autoTT_gr_:
-
-.. das:function:: unique_inplace(a: array<auto(TT)>) : auto
-
-remove duplicate elements from sorted array in place
-
-:Arguments: * **a** : array<auto(TT)>
-
-.. _function-linq_unique_by_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_:
-
-.. das:function:: unique_by(a: iterator<auto(TT)>; key: block<(arg:TT):auto>) : iterator<TT>
-
-sort and remove duplicate elements from an iterator based on a key
-
-:Arguments: * **a** : iterator<auto(TT)>
-
-            * **key** : block<(arg:TT):auto>
-
-.. _function-linq_unique_by_array_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_:
-
-.. das:function:: unique_by(a: array<auto(TT)>; key: block<(arg:TT):auto>) : array<TT>
-
-sort and remove duplicate elements from an array based on a key
-
-:Arguments: * **a** : array<auto(TT)>
-
-            * **key** : block<(arg:TT):auto>
-
-.. _function-linq_unique_by_to_array_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_:
-
-.. das:function:: unique_by_to_array(a: iterator<auto(TT)>; key: block<(arg:TT):auto>) : array<TT>
-
-sort and remove duplicate elements from an iterator based on a key and returns an array
-
-:Arguments: * **a** : iterator<auto(TT)>
-
-            * **key** : block<(arg:TT):auto>
-
-.. _function-linq_unique_by_inplace_array_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_:
-
-.. das:function:: unique_by_inplace(a: array<auto(TT)>; key: block<(arg:TT):auto>) : auto
-
-remove duplicate elements from an array based on a key in place
-
-:Arguments: * **a** : array<auto(TT)>
-
-            * **key** : block<(arg:TT):auto>
-
-.. _function-linq_union_array_ls_autoTT_gr__array_ls_autoTT_gr_:
-
-.. das:function:: union(srca: array<auto(TT)>; srcb: array<auto(TT)>) : array<TT>
-
-Returns distinct elements from the concatenation of two arrays
-
-:Arguments: * **srca** : array<auto(TT)>
-
-            * **srcb** : array<auto(TT)>
-
-.. _function-linq_union_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_:
-
-.. das:function:: union(srca: iterator<auto(TT)>; srcb: iterator<auto(TT)>) : iterator<TT>
-
-Returns distinct elements from the concatenation of two iterators
-
-:Arguments: * **srca** : iterator<auto(TT)>
-
-            * **srcb** : iterator<auto(TT)>
-
-.. _function-linq_union_to_array_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_:
-
-.. das:function:: union_to_array(srca: iterator<auto(TT)>; srcb: iterator<auto(TT)>) : array<TT>
-
-Returns distinct elements from the concatenation of two iterators and returns an array
-
-:Arguments: * **srca** : iterator<auto(TT)>
-
-            * **srcb** : iterator<auto(TT)>
-
-.. _function-linq_union_by_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_:
-
-.. das:function:: union_by(srca: iterator<auto(TT)>; srcb: iterator<auto(TT)>; key: block<(arg:TT):auto>) : iterator<TT>
-
-Returns distinct elements from the concatenation of two iterators by key
-
-:Arguments: * **srca** : iterator<auto(TT)>
-
-            * **srcb** : iterator<auto(TT)>
-
-            * **key** : block<(arg:TT):auto>
-
-.. _function-linq_union_by_array_ls_autoTT_gr__array_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_:
-
-.. das:function:: union_by(srca: array<auto(TT)>; srcb: array<auto(TT)>; key: block<(arg:TT):auto>) : array<TT>
-
-Returns distinct elements from the concatenation of two arrays by key
-
-:Arguments: * **srca** : array<auto(TT)>
-
-            * **srcb** : array<auto(TT)>
-
-            * **key** : block<(arg:TT):auto>
-
-.. _function-linq_union_by_to_array_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_:
-
-.. das:function:: union_by_to_array(srca: iterator<auto(TT)>; srcb: iterator<auto(TT)>; key: block<(arg:TT):auto>) : array<TT>
-
-Returns distinct elements from the concatenation of two iterators by key and returns an array
-
-:Arguments: * **srca** : iterator<auto(TT)>
-
-            * **srcb** : iterator<auto(TT)>
-
-            * **key** : block<(arg:TT):auto>
+except
+^^^^^^
 
 .. _function-linq_except_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_:
 
@@ -563,33 +468,11 @@ Returns elements from the first iterator that are not in the second iterator
 
 .. das:function:: except(src: array<auto(TT)>; exclude: array<auto(TT)>) : array<TT>
 
-Returns elements from the first array that are not in the second array
+----
 
-:Arguments: * **src** : array<auto(TT)>
 
-            * **exclude** : array<auto(TT)>
-
-.. _function-linq_except_to_array_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_:
-
-.. das:function:: except_to_array(src: iterator<auto(TT)>; exclude: iterator<auto(TT)>) : array<TT>
-
-Returns elements from the first iterator that are not in the second iterator and returns an array
-
-:Arguments: * **src** : iterator<auto(TT)>
-
-            * **exclude** : iterator<auto(TT)>
-
-.. _function-linq_except_by_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_:
-
-.. das:function:: except_by(src: iterator<auto(TT)>; exclude: iterator<auto(TT)>; key: block<(arg:TT):auto>) : iterator<TT>
-
-Returns elements from the first iterator that are not in the second iterator by key
-
-:Arguments: * **src** : iterator<auto(TT)>
-
-            * **exclude** : iterator<auto(TT)>
-
-            * **key** : block<(arg:TT):auto>
+except_by
+^^^^^^^^^
 
 .. _function-linq_except_by_array_ls_autoTT_gr__array_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_:
 
@@ -603,6 +486,12 @@ Returns elements from the first array that are not in the second array by key
 
             * **key** : block<(arg:TT):auto>
 
+.. _function-linq_except_by_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_:
+
+.. das:function:: except_by(src: iterator<auto(TT)>; exclude: iterator<auto(TT)>; key: block<(arg:TT):auto>) : iterator<TT>
+
+----
+
 .. _function-linq_except_by_to_array_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_:
 
 .. das:function:: except_by_to_array(src: iterator<auto(TT)>; exclude: iterator<auto(TT)>; key: block<(arg:TT):auto>) : array<TT>
@@ -615,15 +504,19 @@ Returns elements from the first iterator that are not in the second iterator by 
 
             * **key** : block<(arg:TT):auto>
 
-.. _function-linq_intersect_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_:
+.. _function-linq_except_to_array_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_:
 
-.. das:function:: intersect(srca: iterator<auto(TT)>; srcb: iterator<auto(TT)>) : iterator<TT>
+.. das:function:: except_to_array(src: iterator<auto(TT)>; exclude: iterator<auto(TT)>) : array<TT>
 
-Returns elements that are present in both iterators
+Returns elements from the first iterator that are not in the second iterator and returns an array
 
-:Arguments: * **srca** : iterator<auto(TT)>
+:Arguments: * **src** : iterator<auto(TT)>
 
-            * **srcb** : iterator<auto(TT)>
+            * **exclude** : iterator<auto(TT)>
+
+
+intersect
+^^^^^^^^^
 
 .. _function-linq_intersect_array_ls_autoTT_gr__array_ls_autoTT_gr_:
 
@@ -635,27 +528,15 @@ Returns elements that are present in both arrays
 
             * **srcb** : array<auto(TT)>
 
-.. _function-linq_intersect_to_array_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_:
+.. _function-linq_intersect_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_:
 
-.. das:function:: intersect_to_array(srca: iterator<auto(TT)>; srcb: iterator<auto(TT)>) : array<TT>
+.. das:function:: intersect(srca: iterator<auto(TT)>; srcb: iterator<auto(TT)>) : iterator<TT>
 
-Returns elements that are present in both iterators and returns an array
+----
 
-:Arguments: * **srca** : iterator<auto(TT)>
 
-            * **srcb** : iterator<auto(TT)>
-
-.. _function-linq_intersect_by_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_:
-
-.. das:function:: intersect_by(srca: iterator<auto(TT)>; srcb: iterator<auto(TT)>; key: block<(arg:TT):auto>) : iterator<TT>
-
-Returns elements that are present in both iterators by key
-
-:Arguments: * **srca** : iterator<auto(TT)>
-
-            * **srcb** : iterator<auto(TT)>
-
-            * **key** : block<(arg:TT):auto>
+intersect_by
+^^^^^^^^^^^^
 
 .. _function-linq_intersect_by_array_ls_autoTT_gr__array_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_:
 
@@ -669,6 +550,12 @@ Returns elements that are present in both arrays by key
 
             * **key** : block<(arg:TT):auto>
 
+.. _function-linq_intersect_by_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_:
+
+.. das:function:: intersect_by(srca: iterator<auto(TT)>; srcb: iterator<auto(TT)>; key: block<(arg:TT):auto>) : iterator<TT>
+
+----
+
 .. _function-linq_intersect_by_to_array_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_:
 
 .. das:function:: intersect_by_to_array(srca: iterator<auto(TT)>; srcb: iterator<auto(TT)>; key: block<(arg:TT):auto>) : array<TT>
@@ -681,108 +568,204 @@ Returns elements that are present in both iterators by key and returns an array
 
             * **key** : block<(arg:TT):auto>
 
+.. _function-linq_intersect_to_array_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_:
+
+.. das:function:: intersect_to_array(srca: iterator<auto(TT)>; srcb: iterator<auto(TT)>) : array<TT>
+
+Returns elements that are present in both iterators and returns an array
+
+:Arguments: * **srca** : iterator<auto(TT)>
+
+            * **srcb** : iterator<auto(TT)>
+
+
+union
+^^^^^
+
+.. _function-linq_union_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_:
+
+.. das:function:: union(srca: iterator<auto(TT)>; srcb: iterator<auto(TT)>) : iterator<TT>
+
+Returns distinct elements from the concatenation of two iterators
+
+:Arguments: * **srca** : iterator<auto(TT)>
+
+            * **srcb** : iterator<auto(TT)>
+
+.. _function-linq_union_array_ls_autoTT_gr__array_ls_autoTT_gr_:
+
+.. das:function:: union(srca: array<auto(TT)>; srcb: array<auto(TT)>) : array<TT>
+
+----
+
+
+union_by
+^^^^^^^^
+
+.. _function-linq_union_by_array_ls_autoTT_gr__array_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_:
+
+.. das:function:: union_by(srca: array<auto(TT)>; srcb: array<auto(TT)>; key: block<(arg:TT):auto>) : array<TT>
+
+Returns distinct elements from the concatenation of two arrays by key
+
+:Arguments: * **srca** : array<auto(TT)>
+
+            * **srcb** : array<auto(TT)>
+
+            * **key** : block<(arg:TT):auto>
+
+.. _function-linq_union_by_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_:
+
+.. das:function:: union_by(srca: iterator<auto(TT)>; srcb: iterator<auto(TT)>; key: block<(arg:TT):auto>) : iterator<TT>
+
+----
+
+.. _function-linq_union_by_to_array_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_:
+
+.. das:function:: union_by_to_array(srca: iterator<auto(TT)>; srcb: iterator<auto(TT)>; key: block<(arg:TT):auto>) : array<TT>
+
+Returns distinct elements from the concatenation of two iterators by key and returns an array
+
+:Arguments: * **srca** : iterator<auto(TT)>
+
+            * **srcb** : iterator<auto(TT)>
+
+            * **key** : block<(arg:TT):auto>
+
+.. _function-linq_union_to_array_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_:
+
+.. das:function:: union_to_array(srca: iterator<auto(TT)>; srcb: iterator<auto(TT)>) : array<TT>
+
+Returns distinct elements from the concatenation of two iterators and returns an array
+
+:Arguments: * **srca** : iterator<auto(TT)>
+
+            * **srcb** : iterator<auto(TT)>
+
+
+unique
+^^^^^^
+
+.. _function-linq_unique_array_ls_autoTT_gr_:
+
+.. das:function:: unique(a: array<auto(TT)>) : array<TT>
+
+sort and remove duplicate elements from an array
+
+:Arguments: * **a** : array<auto(TT)>
+
+.. _function-linq_unique_iterator_ls_autoTT_gr_:
+
+.. das:function:: unique(a: iterator<auto(TT)>) : iterator<TT>
+
+----
+
+
+unique_by
+^^^^^^^^^
+
+.. _function-linq_unique_by_array_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_:
+
+.. das:function:: unique_by(a: array<auto(TT)>; key: block<(arg:TT):auto>) : array<TT>
+
+sort and remove duplicate elements from an array based on a key
+
+:Arguments: * **a** : array<auto(TT)>
+
+            * **key** : block<(arg:TT):auto>
+
+.. _function-linq_unique_by_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_:
+
+.. das:function:: unique_by(a: iterator<auto(TT)>; key: block<(arg:TT):auto>) : iterator<TT>
+
+----
+
+.. _function-linq_unique_by_inplace_array_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_:
+
+.. das:function:: unique_by_inplace(a: array<auto(TT)>; key: block<(arg:TT):auto>) : auto
+
+remove duplicate elements from an array based on a key in place
+
+:Arguments: * **a** : array<auto(TT)>
+
+            * **key** : block<(arg:TT):auto>
+
+.. _function-linq_unique_by_to_array_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_:
+
+.. das:function:: unique_by_to_array(a: iterator<auto(TT)>; key: block<(arg:TT):auto>) : array<TT>
+
+sort and remove duplicate elements from an iterator based on a key and returns an array
+
+:Arguments: * **a** : iterator<auto(TT)>
+
+            * **key** : block<(arg:TT):auto>
+
+.. _function-linq_unique_inplace_array_ls_autoTT_gr_:
+
+.. das:function:: unique_inplace(a: array<auto(TT)>) : auto
+
+remove duplicate elements from sorted array in place
+
+:Arguments: * **a** : array<auto(TT)>
+
+.. _function-linq_unique_key_auto_0x1fe:
+
+.. das:function:: unique_key(a: auto) : auto
+
+generates unique key of workhorse type for the value
+
+:Arguments: * **a** : auto
+
+.. _function-linq_unique_to_array_iterator_ls_autoTT_gr_:
+
+.. das:function:: unique_to_array(a: iterator<auto(TT)>) : array<TT>
+
+sort and remove duplicate elements from an iterator and returns an array
+
+:Arguments: * **a** : iterator<auto(TT)>
+
 ++++++++++++++++++++++++
 Concatenation operations
 ++++++++++++++++++++++++
 
-  *  :ref:`concat (a: array\<auto(TT)\>; b: array\<auto(TT)\>) : array\<TT\> <function-linq_concat_array_ls_autoTT_gr__array_ls_autoTT_gr_>` 
-  *  :ref:`concat_to_array (var a: iterator\<auto(TT)\>; var b: iterator\<auto(TT)\>) : array\<TT\> <function-linq_concat_to_array_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_>` 
-  *  :ref:`concat (var a: iterator\<auto(TT)\>; var b: iterator\<auto(TT)\>) : iterator\<TT\> <function-linq_concat_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_>` 
-  *  :ref:`concat_inplace (var a: array\<auto(TT)\>; b: array\<auto(TT)\>) : auto <function-linq_concat_inplace_array_ls_autoTT_gr__array_ls_autoTT_gr_>` 
-  *  :ref:`prepend (arr: array\<auto(TT)\>; value: TT) : array\<TT\> <function-linq_prepend_array_ls_autoTT_gr__TT>` 
-  *  :ref:`prepend_to_array (var it: iterator\<auto(TT)\>; value: TT) : array\<TT\> <function-linq_prepend_to_array_iterator_ls_autoTT_gr__TT>` 
-  *  :ref:`prepend (var it: iterator\<auto(TT)\>; value: TT) : iterator\<TT\> <function-linq_prepend_iterator_ls_autoTT_gr__TT>` 
-  *  :ref:`prepend_inplace (var arr: array\<auto(TT)\>; value: TT) : auto <function-linq_prepend_inplace_array_ls_autoTT_gr__TT>` 
   *  :ref:`append (arr: array\<auto(TT)\>; value: TT) : array\<TT\> <function-linq_append_array_ls_autoTT_gr__TT>` 
-  *  :ref:`append_to_array (var it: iterator\<auto(TT)\>; value: TT) : array\<TT\> <function-linq_append_to_array_iterator_ls_autoTT_gr__TT>` 
   *  :ref:`append (var it: iterator\<auto(TT)\>; value: TT) : iterator\<TT\> <function-linq_append_iterator_ls_autoTT_gr__TT>` 
   *  :ref:`append_inplace (var arr: array\<auto(TT)\>; value: TT) : auto <function-linq_append_inplace_array_ls_autoTT_gr__TT>` 
+  *  :ref:`append_to_array (var it: iterator\<auto(TT)\>; value: TT) : array\<TT\> <function-linq_append_to_array_iterator_ls_autoTT_gr__TT>` 
+  *  :ref:`concat (var a: iterator\<auto(TT)\>; var b: iterator\<auto(TT)\>) : iterator\<TT\> <function-linq_concat_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_>` 
+  *  :ref:`concat (a: array\<auto(TT)\>; b: array\<auto(TT)\>) : array\<TT\> <function-linq_concat_array_ls_autoTT_gr__array_ls_autoTT_gr_>` 
+  *  :ref:`concat_inplace (var a: array\<auto(TT)\>; b: array\<auto(TT)\>) : auto <function-linq_concat_inplace_array_ls_autoTT_gr__array_ls_autoTT_gr_>` 
+  *  :ref:`concat_to_array (var a: iterator\<auto(TT)\>; var b: iterator\<auto(TT)\>) : array\<TT\> <function-linq_concat_to_array_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_>` 
+  *  :ref:`prepend (var it: iterator\<auto(TT)\>; value: TT) : iterator\<TT\> <function-linq_prepend_iterator_ls_autoTT_gr__TT>` 
+  *  :ref:`prepend (arr: array\<auto(TT)\>; value: TT) : array\<TT\> <function-linq_prepend_array_ls_autoTT_gr__TT>` 
+  *  :ref:`prepend_inplace (var arr: array\<auto(TT)\>; value: TT) : auto <function-linq_prepend_inplace_array_ls_autoTT_gr__TT>` 
+  *  :ref:`prepend_to_array (var it: iterator\<auto(TT)\>; value: TT) : array\<TT\> <function-linq_prepend_to_array_iterator_ls_autoTT_gr__TT>` 
 
-.. _function-linq_concat_array_ls_autoTT_gr__array_ls_autoTT_gr_:
 
-.. das:function:: concat(a: array<auto(TT)>; b: array<auto(TT)>) : array<TT>
-
-Concatenates two arrays
-
-:Arguments: * **a** : array<auto(TT)>
-
-            * **b** : array<auto(TT)>
-
-.. _function-linq_concat_to_array_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_:
-
-.. das:function:: concat_to_array(a: iterator<auto(TT)>; b: iterator<auto(TT)>) : array<TT>
-
-Concatenates two iterators and returns an array
-
-:Arguments: * **a** : iterator<auto(TT)>
-
-            * **b** : iterator<auto(TT)>
-
-.. _function-linq_concat_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_:
-
-.. das:function:: concat(a: iterator<auto(TT)>; b: iterator<auto(TT)>) : iterator<TT>
-
-Concatenates two iterators
-
-:Arguments: * **a** : iterator<auto(TT)>
-
-            * **b** : iterator<auto(TT)>
-
-.. _function-linq_concat_inplace_array_ls_autoTT_gr__array_ls_autoTT_gr_:
-
-.. das:function:: concat_inplace(a: array<auto(TT)>; b: array<auto(TT)>) : auto
-
-Concatenates two arrays in place
-
-:Arguments: * **a** : array<auto(TT)>
-
-            * **b** : array<auto(TT)>
-
-.. _function-linq_prepend_array_ls_autoTT_gr__TT:
-
-.. das:function:: prepend(arr: array<auto(TT)>; value: TT) : array<TT>
-
-Prepends a value to the beginning of an array
-
-:Arguments: * **arr** : array<auto(TT)>
-
-            * **value** : TT
-
-.. _function-linq_prepend_to_array_iterator_ls_autoTT_gr__TT:
-
-.. das:function:: prepend_to_array(it: iterator<auto(TT)>; value: TT) : array<TT>
-
-Prepends a value to the beginning of an iterator and returns an array
-
-:Arguments: * **it** : iterator<auto(TT)>
-
-            * **value** : TT
-
-.. _function-linq_prepend_iterator_ls_autoTT_gr__TT:
-
-.. das:function:: prepend(it: iterator<auto(TT)>; value: TT) : iterator<TT>
-
-Prepends a value to the beginning of an iterator
-
-:Arguments: * **it** : iterator<auto(TT)>
-
-            * **value** : TT
-
-.. _function-linq_prepend_inplace_array_ls_autoTT_gr__TT:
-
-.. das:function:: prepend_inplace(arr: array<auto(TT)>; value: TT) : auto
-
-Prepends a value to the beginning of an array in place
-
-:Arguments: * **arr** : array<auto(TT)>
-
-            * **value** : TT
+append
+^^^^^^
 
 .. _function-linq_append_array_ls_autoTT_gr__TT:
 
 .. das:function:: append(arr: array<auto(TT)>; value: TT) : array<TT>
 
 Appends a value to the end of an array
+
+:Arguments: * **arr** : array<auto(TT)>
+
+            * **value** : TT
+
+.. _function-linq_append_iterator_ls_autoTT_gr__TT:
+
+.. das:function:: append(it: iterator<auto(TT)>; value: TT) : iterator<TT>
+
+----
+
+.. _function-linq_append_inplace_array_ls_autoTT_gr__TT:
+
+.. das:function:: append_inplace(arr: array<auto(TT)>; value: TT) : auto
+
+Appends a value to the end of an array in place
 
 :Arguments: * **arr** : array<auto(TT)>
 
@@ -798,23 +781,83 @@ Appends a value to the end of an iterator and returns an array
 
             * **value** : TT
 
-.. _function-linq_append_iterator_ls_autoTT_gr__TT:
 
-.. das:function:: append(it: iterator<auto(TT)>; value: TT) : iterator<TT>
+concat
+^^^^^^
 
-Appends a value to the end of an iterator
+.. _function-linq_concat_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_:
+
+.. das:function:: concat(a: iterator<auto(TT)>; b: iterator<auto(TT)>) : iterator<TT>
+
+Concatenates two iterators
+
+:Arguments: * **a** : iterator<auto(TT)>
+
+            * **b** : iterator<auto(TT)>
+
+.. _function-linq_concat_array_ls_autoTT_gr__array_ls_autoTT_gr_:
+
+.. das:function:: concat(a: array<auto(TT)>; b: array<auto(TT)>) : array<TT>
+
+----
+
+.. _function-linq_concat_inplace_array_ls_autoTT_gr__array_ls_autoTT_gr_:
+
+.. das:function:: concat_inplace(a: array<auto(TT)>; b: array<auto(TT)>) : auto
+
+Concatenates two arrays in place
+
+:Arguments: * **a** : array<auto(TT)>
+
+            * **b** : array<auto(TT)>
+
+.. _function-linq_concat_to_array_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_:
+
+.. das:function:: concat_to_array(a: iterator<auto(TT)>; b: iterator<auto(TT)>) : array<TT>
+
+Concatenates two iterators and returns an array
+
+:Arguments: * **a** : iterator<auto(TT)>
+
+            * **b** : iterator<auto(TT)>
+
+
+prepend
+^^^^^^^
+
+.. _function-linq_prepend_iterator_ls_autoTT_gr__TT:
+
+.. das:function:: prepend(it: iterator<auto(TT)>; value: TT) : iterator<TT>
+
+Prepends a value to the beginning of an iterator
 
 :Arguments: * **it** : iterator<auto(TT)>
 
             * **value** : TT
 
-.. _function-linq_append_inplace_array_ls_autoTT_gr__TT:
+.. _function-linq_prepend_array_ls_autoTT_gr__TT:
 
-.. das:function:: append_inplace(arr: array<auto(TT)>; value: TT) : auto
+.. das:function:: prepend(arr: array<auto(TT)>; value: TT) : array<TT>
 
-Appends a value to the end of an array in place
+----
+
+.. _function-linq_prepend_inplace_array_ls_autoTT_gr__TT:
+
+.. das:function:: prepend_inplace(arr: array<auto(TT)>; value: TT) : auto
+
+Prepends a value to the beginning of an array in place
 
 :Arguments: * **arr** : array<auto(TT)>
+
+            * **value** : TT
+
+.. _function-linq_prepend_to_array_iterator_ls_autoTT_gr__TT:
+
+.. das:function:: prepend_to_array(it: iterator<auto(TT)>; value: TT) : array<TT>
+
+Prepends a value to the beginning of an iterator and returns an array
+
+:Arguments: * **it** : iterator<auto(TT)>
 
             * **value** : TT
 
@@ -822,10 +865,26 @@ Appends a value to the end of an array in place
 Generation operations
 +++++++++++++++++++++
 
-  *  :ref:`range_sequence (start: int; count: int) : iterator\<int\> <function-linq_range_sequence_int_int>` 
-  *  :ref:`empty (var typ: auto(TT)) : iterator\<TT\> <function-linq_empty_autoTT>` 
   *  :ref:`default_empty (var src: iterator\<auto(TT)\>) : iterator\<TT\> <function-linq_default_empty_iterator_ls_autoTT_gr_>` 
-  *  :ref:`repeat (element: auto(TT); count: int) : iterator\<TT\> <function-linq_repeat_autoTT_int>` 
+  *  :ref:`empty (var typ: auto(TT)) : iterator\<TT\> <function-linq_empty_autoTT_0x8d5>` 
+  *  :ref:`range_sequence (start: int; count: int) : iterator\<int\> <function-linq_range_sequence_int_int>` 
+  *  :ref:`repeat (element: auto(TT); count: int) : iterator\<TT\> <function-linq_repeat_autoTT_int_0x8fc>` 
+
+.. _function-linq_default_empty_iterator_ls_autoTT_gr_:
+
+.. das:function:: default_empty(src: iterator<auto(TT)>) : iterator<TT>
+
+Returns the elements of the iterator, or a default value if the iterator is empty
+
+:Arguments: * **src** : iterator<auto(TT)>
+
+.. _function-linq_empty_autoTT_0x8d5:
+
+.. das:function:: empty(typ: auto(TT)) : iterator<TT>
+
+Returns an empty iterator of the specified type
+
+:Arguments: * **typ** : auto(TT)
 
 .. _function-linq_range_sequence_int_int:
 
@@ -837,23 +896,7 @@ Generates a sequence of integers within a specified range
 
             * **count** : int
 
-.. _function-linq_empty_autoTT:
-
-.. das:function:: empty(typ: auto(TT)) : iterator<TT>
-
-Returns an empty iterator of the specified type
-
-:Arguments: * **typ** : auto(TT)
-
-.. _function-linq_default_empty_iterator_ls_autoTT_gr_:
-
-.. das:function:: default_empty(src: iterator<auto(TT)>) : iterator<TT>
-
-Returns the elements of the iterator, or a default value if the iterator is empty
-
-:Arguments: * **src** : iterator<auto(TT)>
-
-.. _function-linq_repeat_autoTT_int:
+.. _function-linq_repeat_autoTT_int_0x8fc:
 
 .. das:function:: repeat(element: auto(TT); count: int) : iterator<TT>
 
@@ -867,56 +910,106 @@ Generates a sequence that contains one repeated value
 Aggregation operations
 ++++++++++++++++++++++
 
-  *  :ref:`count (var a: iterator\<auto(TT)\>) : int <function-linq_count_iterator_ls_autoTT_gr_>` 
+  *  :ref:`aggregate (var src: iterator\<auto(TT)\>; seed: auto(AGG); func: block\<(acc:AGG;x:TT):AGG\>) : AGG <function-linq_aggregate_iterator_ls_autoTT_gr__autoAGG_block_ls_acc_c_AGG;x_c_TT_c_AGG_gr__0x5f6>` 
+  *  :ref:`aggregate (src: array\<auto(TT)\>; seed: auto(AGG); func: block\<(acc:AGG;x:TT):AGG\>) : AGG <function-linq_aggregate_array_ls_autoTT_gr__autoAGG_block_ls_acc_c_AGG;x_c_TT_c_AGG_gr__0x600>` 
+  *  :ref:`average (src: array\<auto(TT)\>) : TT <function-linq_average_array_ls_autoTT_gr_>` 
+  *  :ref:`average (var src: iterator\<auto(TT)\>) : TT <function-linq_average_iterator_ls_autoTT_gr_>` 
+  *  :ref:`count (a: array\<auto(TT)\>; predicate: block\<(arg:TT):bool\>) : int <function-linq_count_array_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_>` 
   *  :ref:`count (a: array\<auto(TT)\>) : int <function-linq_count_array_ls_autoTT_gr_>` 
-  *  :ref:`long_count (var a: iterator\<auto(TT)\>) : int64 <function-linq_long_count_iterator_ls_autoTT_gr_>` 
+  *  :ref:`count (var a: iterator\<auto(TT)\>) : int <function-linq_count_iterator_ls_autoTT_gr_>` 
+  *  :ref:`count (var a: iterator\<auto(TT)\>; predicate: block\<(arg:TT):bool\>) : int <function-linq_count_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_>` 
   *  :ref:`long_count (a: array\<auto(TT)\>) : int64 <function-linq_long_count_array_ls_autoTT_gr_>` 
-  *  :ref:`min (var src: iterator\<auto(TT)\>) : TT <function-linq_min_iterator_ls_autoTT_gr_>` 
-  *  :ref:`min (src: array\<auto(TT)\>) : TT <function-linq_min_array_ls_autoTT_gr_>` 
-  *  :ref:`min_by (var src: iterator\<auto(TT)\>; key: auto) : TT <function-linq_min_by_iterator_ls_autoTT_gr__auto>` 
-  *  :ref:`min_by (src: array\<auto(TT)\>; key: auto) : TT <function-linq_min_by_array_ls_autoTT_gr__auto>` 
+  *  :ref:`long_count (var a: iterator\<auto(TT)\>) : int64 <function-linq_long_count_iterator_ls_autoTT_gr_>` 
   *  :ref:`max (var src: iterator\<auto(TT)\>) : TT <function-linq_max_iterator_ls_autoTT_gr_>` 
   *  :ref:`max (src: array\<auto(TT)\>) : TT <function-linq_max_array_ls_autoTT_gr_>` 
-  *  :ref:`max_by (var src: iterator\<auto(TT)\>; key: auto) : TT <function-linq_max_by_iterator_ls_autoTT_gr__auto>` 
-  *  :ref:`max_by (src: array\<auto(TT)\>; key: auto) : TT <function-linq_max_by_array_ls_autoTT_gr__auto>` 
+  *  :ref:`max_by (var src: iterator\<auto(TT)\>; key: auto) : TT <function-linq_max_by_iterator_ls_autoTT_gr__auto_0x57c>` 
+  *  :ref:`max_by (src: array\<auto(TT)\>; key: auto) : TT <function-linq_max_by_array_ls_autoTT_gr__auto_0x586>` 
+  *  :ref:`min (var src: iterator\<auto(TT)\>) : TT <function-linq_min_iterator_ls_autoTT_gr_>` 
+  *  :ref:`min (src: array\<auto(TT)\>) : TT <function-linq_min_array_ls_autoTT_gr_>` 
+  *  :ref:`min_by (src: array\<auto(TT)\>; key: auto) : TT <function-linq_min_by_array_ls_autoTT_gr__auto_0x52e>` 
+  *  :ref:`min_by (var src: iterator\<auto(TT)\>; key: auto) : TT <function-linq_min_by_iterator_ls_autoTT_gr__auto_0x524>` 
   *  :ref:`min_max (var src: iterator\<auto(TT)\>) : tuple\<TT;TT\> <function-linq_min_max_iterator_ls_autoTT_gr_>` 
   *  :ref:`min_max (src: array\<auto(TT)\>) : tuple\<TT;TT\> <function-linq_min_max_array_ls_autoTT_gr_>` 
-  *  :ref:`min_max_by (var src: iterator\<auto(TT)\>; key: auto) : tuple\<TT;TT\> <function-linq_min_max_by_iterator_ls_autoTT_gr__auto>` 
-  *  :ref:`min_max_by (src: array\<auto(TT)\>; key: auto) : tuple\<TT;TT\> <function-linq_min_max_by_array_ls_autoTT_gr__auto>` 
-  *  :ref:`aggregate (var src: iterator\<auto(TT)\>; seed: auto(AGG); func: block\<(acc:AGG;x:TT):AGG\>) : AGG <function-linq_aggregate_iterator_ls_autoTT_gr__autoAGG_block_ls_acc_c_AGG;x_c_TT_c_AGG_gr_>` 
-  *  :ref:`aggregate (src: array\<auto(TT)\>; seed: auto(AGG); func: block\<(acc:AGG;x:TT):AGG\>) : AGG <function-linq_aggregate_array_ls_autoTT_gr__autoAGG_block_ls_acc_c_AGG;x_c_TT_c_AGG_gr_>` 
-  *  :ref:`sum (var src: iterator\<auto(TT)\>) : TT <function-linq_sum_iterator_ls_autoTT_gr_>` 
-  *  :ref:`sum (src: array\<auto(TT)\>) : TT <function-linq_sum_array_ls_autoTT_gr_>` 
-  *  :ref:`average (var src: iterator\<auto(TT)\>) : TT <function-linq_average_iterator_ls_autoTT_gr_>` 
-  *  :ref:`average (src: array\<auto(TT)\>) : TT <function-linq_average_array_ls_autoTT_gr_>` 
-  *  :ref:`min_max_average (var src: iterator\<auto(TT)\>) : tuple\<TT;TT;TT\> <function-linq_min_max_average_iterator_ls_autoTT_gr_>` 
   *  :ref:`min_max_average (src: array\<auto(TT)\>) : tuple\<TT;TT;TT\> <function-linq_min_max_average_array_ls_autoTT_gr_>` 
-  *  :ref:`min_max_average_by (var src: iterator\<auto(TT)\>; key: auto) : tuple\<TT;TT;TT\> <function-linq_min_max_average_by_iterator_ls_autoTT_gr__auto>` 
-  *  :ref:`min_max_average_by (src: array\<auto(TT)\>; key: auto) : tuple\<TT;TT;TT\> <function-linq_min_max_average_by_array_ls_autoTT_gr__auto>` 
+  *  :ref:`min_max_average (var src: iterator\<auto(TT)\>) : tuple\<TT;TT;TT\> <function-linq_min_max_average_iterator_ls_autoTT_gr_>` 
+  *  :ref:`min_max_average_by (src: array\<auto(TT)\>; key: auto) : tuple\<TT;TT;TT\> <function-linq_min_max_average_by_array_ls_autoTT_gr__auto_0x6bd>` 
+  *  :ref:`min_max_average_by (var src: iterator\<auto(TT)\>; key: auto) : tuple\<TT;TT;TT\> <function-linq_min_max_average_by_iterator_ls_autoTT_gr__auto_0x6b7>` 
+  *  :ref:`min_max_by (var src: iterator\<auto(TT)\>; key: auto) : tuple\<TT;TT\> <function-linq_min_max_by_iterator_ls_autoTT_gr__auto_0x5d4>` 
+  *  :ref:`min_max_by (src: array\<auto(TT)\>; key: auto) : tuple\<TT;TT\> <function-linq_min_max_by_array_ls_autoTT_gr__auto_0x5da>` 
+  *  :ref:`sum (src: array\<auto(TT)\>) : TT <function-linq_sum_array_ls_autoTT_gr_>` 
+  *  :ref:`sum (var src: iterator\<auto(TT)\>) : TT <function-linq_sum_iterator_ls_autoTT_gr_>` 
 
-.. _function-linq_count_iterator_ls_autoTT_gr_:
 
-.. das:function:: count(a: iterator<auto(TT)>) : int
+aggregate
+^^^^^^^^^
 
-Counts elements in an iterator
+.. _function-linq_aggregate_iterator_ls_autoTT_gr__autoAGG_block_ls_acc_c_AGG;x_c_TT_c_AGG_gr__0x5f6:
 
-:Arguments: * **a** : iterator<auto(TT)>
+.. das:function:: aggregate(src: iterator<auto(TT)>; seed: auto(AGG); func: block<(acc:AGG;x:TT):AGG>) : AGG
+
+Aggregates elements in an iterator using a seed and a function
+
+:Arguments: * **src** : iterator<auto(TT)>
+
+            * **seed** : auto(AGG)
+
+            * **func** : block<(acc:AGG;x:TT):AGG>
+
+.. _function-linq_aggregate_array_ls_autoTT_gr__autoAGG_block_ls_acc_c_AGG;x_c_TT_c_AGG_gr__0x600:
+
+.. das:function:: aggregate(src: array<auto(TT)>; seed: auto(AGG); func: block<(acc:AGG;x:TT):AGG>) : AGG
+
+----
+
+
+average
+^^^^^^^
+
+.. _function-linq_average_array_ls_autoTT_gr_:
+
+.. das:function:: average(src: array<auto(TT)>) : TT
+
+Averages elements in an array
+
+:Arguments: * **src** : array<auto(TT)>
+
+.. _function-linq_average_iterator_ls_autoTT_gr_:
+
+.. das:function:: average(src: iterator<auto(TT)>) : TT
+
+----
+
+
+count
+^^^^^
+
+.. _function-linq_count_array_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_:
+
+.. das:function:: count(a: array<auto(TT)>; predicate: block<(arg:TT):bool>) : int
+
+Counts elements in an array that satisfy a predicate
+
+:Arguments: * **a** : array<auto(TT)>
+
+            * **predicate** : block<(arg:TT):bool>
 
 .. _function-linq_count_array_ls_autoTT_gr_:
 
 .. das:function:: count(a: array<auto(TT)>) : int
 
-Counts elements in an array
+.. _function-linq_count_iterator_ls_autoTT_gr_:
 
-:Arguments: * **a** : array<auto(TT)>
+.. das:function:: count(a: iterator<auto(TT)>) : int
 
-.. _function-linq_long_count_iterator_ls_autoTT_gr_:
+.. _function-linq_count_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_:
 
-.. das:function:: long_count(a: iterator<auto(TT)>) : int64
+.. das:function:: count(a: iterator<auto(TT)>; predicate: block<(arg:TT):bool>) : int
 
-Counts elements in an iterator, using a long integer
+----
 
-:Arguments: * **a** : iterator<auto(TT)>
+
+long_count
+^^^^^^^^^^
 
 .. _function-linq_long_count_array_ls_autoTT_gr_:
 
@@ -926,41 +1019,15 @@ Counts elements in an array, using a long integer
 
 :Arguments: * **a** : array<auto(TT)>
 
-.. _function-linq_min_iterator_ls_autoTT_gr_:
+.. _function-linq_long_count_iterator_ls_autoTT_gr_:
 
-.. das:function:: min(src: iterator<auto(TT)>) : TT
+.. das:function:: long_count(a: iterator<auto(TT)>) : int64
 
-Finds the minimum element in an iterator
+----
 
-:Arguments: * **src** : iterator<auto(TT)>
 
-.. _function-linq_min_array_ls_autoTT_gr_:
-
-.. das:function:: min(src: array<auto(TT)>) : TT
-
-Finds the minimum element in an array
-
-:Arguments: * **src** : array<auto(TT)>
-
-.. _function-linq_min_by_iterator_ls_autoTT_gr__auto:
-
-.. das:function:: min_by(src: iterator<auto(TT)>; key: auto) : TT
-
-Finds the minimum element in an iterator by key
-
-:Arguments: * **src** : iterator<auto(TT)>
-
-            * **key** : auto
-
-.. _function-linq_min_by_array_ls_autoTT_gr__auto:
-
-.. das:function:: min_by(src: array<auto(TT)>; key: auto) : TT
-
-Finds the minimum element in an array by key
-
-:Arguments: * **src** : array<auto(TT)>
-
-            * **key** : auto
+max
+^^^
 
 .. _function-linq_max_iterator_ls_autoTT_gr_:
 
@@ -974,11 +1041,13 @@ Finds the maximum element in an iterator
 
 .. das:function:: max(src: array<auto(TT)>) : TT
 
-Finds the maximum element in an array
+----
 
-:Arguments: * **src** : array<auto(TT)>
 
-.. _function-linq_max_by_iterator_ls_autoTT_gr__auto:
+max_by
+^^^^^^
+
+.. _function-linq_max_by_iterator_ls_autoTT_gr__auto_0x57c:
 
 .. das:function:: max_by(src: iterator<auto(TT)>; key: auto) : TT
 
@@ -988,15 +1057,53 @@ Finds the maximum element in an iterator by key
 
             * **key** : auto
 
-.. _function-linq_max_by_array_ls_autoTT_gr__auto:
+.. _function-linq_max_by_array_ls_autoTT_gr__auto_0x586:
 
 .. das:function:: max_by(src: array<auto(TT)>; key: auto) : TT
 
-Finds the maximum element in an array by key
+----
+
+
+min
+^^^
+
+.. _function-linq_min_iterator_ls_autoTT_gr_:
+
+.. das:function:: min(src: iterator<auto(TT)>) : TT
+
+Finds the minimum element in an iterator
+
+:Arguments: * **src** : iterator<auto(TT)>
+
+.. _function-linq_min_array_ls_autoTT_gr_:
+
+.. das:function:: min(src: array<auto(TT)>) : TT
+
+----
+
+
+min_by
+^^^^^^
+
+.. _function-linq_min_by_array_ls_autoTT_gr__auto_0x52e:
+
+.. das:function:: min_by(src: array<auto(TT)>; key: auto) : TT
+
+Finds the minimum element in an array by key
 
 :Arguments: * **src** : array<auto(TT)>
 
             * **key** : auto
+
+.. _function-linq_min_by_iterator_ls_autoTT_gr__auto_0x524:
+
+.. das:function:: min_by(src: iterator<auto(TT)>; key: auto) : TT
+
+----
+
+
+min_max
+^^^^^^^
 
 .. _function-linq_min_max_iterator_ls_autoTT_gr_:
 
@@ -1010,93 +1117,11 @@ Finds the minimum and maximum elements in an iterator
 
 .. das:function:: min_max(src: array<auto(TT)>) : tuple<TT;TT>
 
-Finds the minimum and maximum elements in an array
+----
 
-:Arguments: * **src** : array<auto(TT)>
 
-.. _function-linq_min_max_by_iterator_ls_autoTT_gr__auto:
-
-.. das:function:: min_max_by(src: iterator<auto(TT)>; key: auto) : tuple<TT;TT>
-
-Finds the minimum and maximum elements in an iterator by key
-
-:Arguments: * **src** : iterator<auto(TT)>
-
-            * **key** : auto
-
-.. _function-linq_min_max_by_array_ls_autoTT_gr__auto:
-
-.. das:function:: min_max_by(src: array<auto(TT)>; key: auto) : tuple<TT;TT>
-
-Finds the minimum and maximum elements in an array by key
-
-:Arguments: * **src** : array<auto(TT)>
-
-            * **key** : auto
-
-.. _function-linq_aggregate_iterator_ls_autoTT_gr__autoAGG_block_ls_acc_c_AGG;x_c_TT_c_AGG_gr_:
-
-.. das:function:: aggregate(src: iterator<auto(TT)>; seed: auto(AGG); func: block<(acc:AGG;x:TT):AGG>) : AGG
-
-Aggregates elements in an iterator using a seed and a function
-
-:Arguments: * **src** : iterator<auto(TT)>
-
-            * **seed** : auto(AGG)
-
-            * **func** : block<(acc:AGG;x:TT):AGG>
-
-.. _function-linq_aggregate_array_ls_autoTT_gr__autoAGG_block_ls_acc_c_AGG;x_c_TT_c_AGG_gr_:
-
-.. das:function:: aggregate(src: array<auto(TT)>; seed: auto(AGG); func: block<(acc:AGG;x:TT):AGG>) : AGG
-
-Aggregates elements in an array using a seed and a function
-
-:Arguments: * **src** : array<auto(TT)>
-
-            * **seed** : auto(AGG)
-
-            * **func** : block<(acc:AGG;x:TT):AGG>
-
-.. _function-linq_sum_iterator_ls_autoTT_gr_:
-
-.. das:function:: sum(src: iterator<auto(TT)>) : TT
-
-Sums elements in an iterator
-
-:Arguments: * **src** : iterator<auto(TT)>
-
-.. _function-linq_sum_array_ls_autoTT_gr_:
-
-.. das:function:: sum(src: array<auto(TT)>) : TT
-
-Sums elements in an array
-
-:Arguments: * **src** : array<auto(TT)>
-
-.. _function-linq_average_iterator_ls_autoTT_gr_:
-
-.. das:function:: average(src: iterator<auto(TT)>) : TT
-
-Averages elements in an iterator
-
-:Arguments: * **src** : iterator<auto(TT)>
-
-.. _function-linq_average_array_ls_autoTT_gr_:
-
-.. das:function:: average(src: array<auto(TT)>) : TT
-
-Averages elements in an array
-
-:Arguments: * **src** : array<auto(TT)>
-
-.. _function-linq_min_max_average_iterator_ls_autoTT_gr_:
-
-.. das:function:: min_max_average(src: iterator<auto(TT)>) : tuple<TT;TT;TT>
-
-Finds the minimum, maximum, and average elements in an iterator
-
-:Arguments: * **src** : iterator<auto(TT)>
+min_max_average
+^^^^^^^^^^^^^^^
 
 .. _function-linq_min_max_average_array_ls_autoTT_gr_:
 
@@ -1106,17 +1131,17 @@ Finds the minimum, maximum, and average elements in an array
 
 :Arguments: * **src** : array<auto(TT)>
 
-.. _function-linq_min_max_average_by_iterator_ls_autoTT_gr__auto:
+.. _function-linq_min_max_average_iterator_ls_autoTT_gr_:
 
-.. das:function:: min_max_average_by(src: iterator<auto(TT)>; key: auto) : tuple<TT;TT;TT>
+.. das:function:: min_max_average(src: iterator<auto(TT)>) : tuple<TT;TT;TT>
 
-Finds the minimum, maximum, and average elements in an iterator by key
+----
 
-:Arguments: * **src** : iterator<auto(TT)>
 
-            * **key** : auto
+min_max_average_by
+^^^^^^^^^^^^^^^^^^
 
-.. _function-linq_min_max_average_by_array_ls_autoTT_gr__auto:
+.. _function-linq_min_max_average_by_array_ls_autoTT_gr__auto_0x6bd:
 
 .. das:function:: min_max_average_by(src: array<auto(TT)>; key: auto) : tuple<TT;TT;TT>
 
@@ -1126,23 +1151,61 @@ Finds the minimum, maximum, and average elements in an array by key
 
             * **key** : auto
 
+.. _function-linq_min_max_average_by_iterator_ls_autoTT_gr__auto_0x6b7:
+
+.. das:function:: min_max_average_by(src: iterator<auto(TT)>; key: auto) : tuple<TT;TT;TT>
+
+----
+
+
+min_max_by
+^^^^^^^^^^
+
+.. _function-linq_min_max_by_iterator_ls_autoTT_gr__auto_0x5d4:
+
+.. das:function:: min_max_by(src: iterator<auto(TT)>; key: auto) : tuple<TT;TT>
+
+Finds the minimum and maximum elements in an iterator by key
+
+:Arguments: * **src** : iterator<auto(TT)>
+
+            * **key** : auto
+
+.. _function-linq_min_max_by_array_ls_autoTT_gr__auto_0x5da:
+
+.. das:function:: min_max_by(src: array<auto(TT)>; key: auto) : tuple<TT;TT>
+
+----
+
+
+sum
+^^^
+
+.. _function-linq_sum_array_ls_autoTT_gr_:
+
+.. das:function:: sum(src: array<auto(TT)>) : TT
+
+Sums elements in an array
+
+:Arguments: * **src** : array<auto(TT)>
+
+.. _function-linq_sum_iterator_ls_autoTT_gr_:
+
+.. das:function:: sum(src: iterator<auto(TT)>) : TT
+
+----
+
 ++++++++++++++
 Filtering data
 ++++++++++++++
 
-  *  :ref:`where_ (var src: iterator\<auto(TT)\>; predicate: block\<(arg:TT):bool\>) : iterator\<TT\> <function-linq_where__iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_>` 
   *  :ref:`where_ (src: array\<auto(TT)\>; predicate: block\<(arg:TT):bool\>) : array\<TT\> <function-linq_where__array_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_>` 
+  *  :ref:`where_ (var src: iterator\<auto(TT)\>; predicate: block\<(arg:TT):bool\>) : iterator\<TT\> <function-linq_where__iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_>` 
   *  :ref:`where_to_array (var src: iterator\<auto(TT)\>; predicate: block\<(arg:TT):bool\>) : array\<TT\> <function-linq_where_to_array_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_>` 
 
-.. _function-linq_where__iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_:
 
-.. das:function:: where_(src: iterator<auto(TT)>; predicate: block<(arg:TT):bool>) : iterator<TT>
-
-Filters elements in an iterator based on a predicate
-
-:Arguments: * **src** : iterator<auto(TT)>
-
-            * **predicate** : block<(arg:TT):bool>
+where_
+^^^^^^
 
 .. _function-linq_where__array_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_:
 
@@ -1153,6 +1216,12 @@ Filters elements in an array based on a predicate
 :Arguments: * **src** : array<auto(TT)>
 
             * **predicate** : block<(arg:TT):bool>
+
+.. _function-linq_where__iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_:
+
+.. das:function:: where_(src: iterator<auto(TT)>; predicate: block<(arg:TT):bool>) : iterator<TT>
+
+----
 
 .. _function-linq_where_to_array_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_:
 
@@ -1168,37 +1237,85 @@ Filters elements in an iterator based on a predicate and returns an array
 Partitioning data
 +++++++++++++++++
 
+  *  :ref:`chunk (src: array\<auto(TT)\>; size: int) : array\<array\<TT\>\> <function-linq_chunk_array_ls_autoTT_gr__int>` 
+  *  :ref:`chunk (var src: iterator\<auto(TT)\>; size: int) : iterator\<array\<TT\>\> <function-linq_chunk_iterator_ls_autoTT_gr__int>` 
+  *  :ref:`chunk_to_array (var src: iterator\<auto(TT)\>; size: int) : array\<array\<TT\>\> <function-linq_chunk_to_array_iterator_ls_autoTT_gr__int>` 
+  *  :ref:`skip (var src: iterator\<auto(TT)\>; var total: int) : iterator\<TT\> <function-linq_skip_iterator_ls_autoTT_gr__int>` 
   *  :ref:`skip (arr: array\<auto(TT)\>; var total: int) : array\<TT\> <function-linq_skip_array_ls_autoTT_gr__int>` 
   *  :ref:`skip_inplace (var arr: array\<auto(TT)\>; var total: int) : auto <function-linq_skip_inplace_array_ls_autoTT_gr__int>` 
-  *  :ref:`skip (var src: iterator\<auto(TT)\>; var total: int) : iterator\<TT\> <function-linq_skip_iterator_ls_autoTT_gr__int>` 
+  *  :ref:`skip_last (var src: iterator\<auto(TT)\>; var total: int) : iterator\<TT\> <function-linq_skip_last_iterator_ls_autoTT_gr__int>` 
+  *  :ref:`skip_last (arr: array\<auto(TT)\>; var total: int) : array\<TT\> <function-linq_skip_last_array_ls_autoTT_gr__int>` 
+  *  :ref:`skip_last_inplace (var arr: array\<auto(TT)\>; var total: int) : auto <function-linq_skip_last_inplace_array_ls_autoTT_gr__int>` 
+  *  :ref:`skip_last_to_array (var src: iterator\<auto(TT)\>; var total: int) : array\<TT\> <function-linq_skip_last_to_array_iterator_ls_autoTT_gr__int>` 
   *  :ref:`skip_to_array (var src: iterator\<auto(TT)\>; var total: int) : array\<TT\> <function-linq_skip_to_array_iterator_ls_autoTT_gr__int>` 
-  *  :ref:`skip_while (var src: iterator\<auto(TT)\>; predicate: block\<(arg:TT):bool\>) : iterator\<TT\> <function-linq_skip_while_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_>` 
   *  :ref:`skip_while (src: array\<auto(TT)\>; predicate: block\<(arg:TT):bool\>) : array\<TT\> <function-linq_skip_while_array_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_>` 
+  *  :ref:`skip_while (var src: iterator\<auto(TT)\>; predicate: block\<(arg:TT):bool\>) : iterator\<TT\> <function-linq_skip_while_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_>` 
   *  :ref:`skip_while_to_array (var src: iterator\<auto(TT)\>; predicate: block\<(arg:TT):bool\>) : array\<TT\> <function-linq_skip_while_to_array_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_>` 
-  *  :ref:`take (arr: array\<auto(TT)\>; var total: int) : array\<TT\> <function-linq_take_array_ls_autoTT_gr__int>` 
-  *  :ref:`take_inplace (var arr: array\<auto(TT)\>; var total: int) : auto <function-linq_take_inplace_array_ls_autoTT_gr__int>` 
-  *  :ref:`take (var src: iterator\<auto(TT)\>; var total: int) : iterator\<TT\> <function-linq_take_iterator_ls_autoTT_gr__int>` 
-  *  :ref:`take_to_array (var src: iterator\<auto(TT)\>; var total: int) : array\<TT\> <function-linq_take_to_array_iterator_ls_autoTT_gr__int>` 
-  *  :ref:`take (var src: iterator\<auto(TT)\>; from: range) : iterator\<TT\> <function-linq_take_iterator_ls_autoTT_gr__range>` 
   *  :ref:`take (src: array\<auto(TT)\>; from: range) : array\<TT\> <function-linq_take_array_ls_autoTT_gr__range>` 
-  *  :ref:`take_to_array (var src: iterator\<auto(TT)\>; from: range) : array\<TT\> <function-linq_take_to_array_iterator_ls_autoTT_gr__range>` 
+  *  :ref:`take (var src: iterator\<auto(TT)\>; from: range) : iterator\<TT\> <function-linq_take_iterator_ls_autoTT_gr__range>` 
+  *  :ref:`take (var src: iterator\<auto(TT)\>; var total: int) : iterator\<TT\> <function-linq_take_iterator_ls_autoTT_gr__int>` 
+  *  :ref:`take (arr: array\<auto(TT)\>; var total: int) : array\<TT\> <function-linq_take_array_ls_autoTT_gr__int>` 
   *  :ref:`take_inplace (var arr: array\<auto(TT)\>; from: range) : auto <function-linq_take_inplace_array_ls_autoTT_gr__range>` 
-  *  :ref:`take_while (var src: iterator\<auto(TT)\>; predicate: block\<(arg:TT):bool\>) : auto <function-linq_take_while_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_>` 
+  *  :ref:`take_inplace (var arr: array\<auto(TT)\>; var total: int) : auto <function-linq_take_inplace_array_ls_autoTT_gr__int>` 
+  *  :ref:`take_last (var src: iterator\<auto(TT)\>; var total: int) : iterator\<TT\> <function-linq_take_last_iterator_ls_autoTT_gr__int>` 
+  *  :ref:`take_last (arr: array\<auto(TT)\>; var total: int) : array\<TT\> <function-linq_take_last_array_ls_autoTT_gr__int>` 
+  *  :ref:`take_last_inplace (var arr: array\<auto(TT)\>; var total: int) : auto <function-linq_take_last_inplace_array_ls_autoTT_gr__int>` 
+  *  :ref:`take_last_to_array (var src: iterator\<auto(TT)\>; var total: int) : array\<TT\> <function-linq_take_last_to_array_iterator_ls_autoTT_gr__int>` 
+  *  :ref:`take_to_array (var src: iterator\<auto(TT)\>; var total: int) : array\<TT\> <function-linq_take_to_array_iterator_ls_autoTT_gr__int>` 
+  *  :ref:`take_to_array (var src: iterator\<auto(TT)\>; from: range) : array\<TT\> <function-linq_take_to_array_iterator_ls_autoTT_gr__range>` 
+  *  :ref:`take_while (var src: iterator\<auto(TT)\>; predicate: block\<(arg:TT):bool\>) : iterator\<TT\> <function-linq_take_while_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_>` 
   *  :ref:`take_while (src: array\<auto(TT)\>; predicate: block\<(arg:TT):bool\>) : array\<TT\> <function-linq_take_while_array_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_>` 
   *  :ref:`take_while_to_array (var src: iterator\<auto(TT)\>; predicate: block\<(arg:TT):bool\>) : array\<TT\> <function-linq_take_while_to_array_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_>` 
-  *  :ref:`chunk (src: array\<auto(TT)\>; size: int) : array\<array\<TT\>\> <function-linq_chunk_array_ls_autoTT_gr__int>` 
-  *  :ref:`chunk_to_array (var src: iterator\<auto(TT)\>; size: int) : array\<array\<TT\>\> <function-linq_chunk_to_array_iterator_ls_autoTT_gr__int>` 
-  *  :ref:`chunk (var src: iterator\<auto(TT)\>; size: int) : iterator\<array\<TT\>\> <function-linq_chunk_iterator_ls_autoTT_gr__int>` 
+
+
+chunk
+^^^^^
+
+.. _function-linq_chunk_array_ls_autoTT_gr__int:
+
+.. das:function:: chunk(src: array<auto(TT)>; size: int) : array<array<TT>>
+
+Splits an array into chunks of a specified size
+
+:Arguments: * **src** : array<auto(TT)>
+
+            * **size** : int
+
+.. _function-linq_chunk_iterator_ls_autoTT_gr__int:
+
+.. das:function:: chunk(src: iterator<auto(TT)>; size: int) : iterator<array<TT>>
+
+----
+
+.. _function-linq_chunk_to_array_iterator_ls_autoTT_gr__int:
+
+.. das:function:: chunk_to_array(src: iterator<auto(TT)>; size: int) : array<array<TT>>
+
+Splits an iterator into chunks of a specified size and returns an array
+
+:Arguments: * **src** : iterator<auto(TT)>
+
+            * **size** : int
+
+
+skip
+^^^^
+
+.. _function-linq_skip_iterator_ls_autoTT_gr__int:
+
+.. das:function:: skip(src: iterator<auto(TT)>; total: int) : iterator<TT>
+
+Yields all but the first `total` elements
+
+:Arguments: * **src** : iterator<auto(TT)>
+
+            * **total** : int
 
 .. _function-linq_skip_array_ls_autoTT_gr__int:
 
 .. das:function:: skip(arr: array<auto(TT)>; total: int) : array<TT>
 
-Yields all but the first `total` elements
-
-:Arguments: * **arr** : array<auto(TT)>
-
-            * **total** : int
+----
 
 .. _function-linq_skip_inplace_array_ls_autoTT_gr__int:
 
@@ -1210,11 +1327,41 @@ Removes the first `total` elements from an array in place
 
             * **total** : int
 
-.. _function-linq_skip_iterator_ls_autoTT_gr__int:
 
-.. das:function:: skip(src: iterator<auto(TT)>; total: int) : iterator<TT>
+skip_last
+^^^^^^^^^
 
-Yields all but the first `total` elements
+.. _function-linq_skip_last_iterator_ls_autoTT_gr__int:
+
+.. das:function:: skip_last(src: iterator<auto(TT)>; total: int) : iterator<TT>
+
+Yields all but the last `total` elements from an iterator
+
+:Arguments: * **src** : iterator<auto(TT)>
+
+            * **total** : int
+
+.. _function-linq_skip_last_array_ls_autoTT_gr__int:
+
+.. das:function:: skip_last(arr: array<auto(TT)>; total: int) : array<TT>
+
+----
+
+.. _function-linq_skip_last_inplace_array_ls_autoTT_gr__int:
+
+.. das:function:: skip_last_inplace(arr: array<auto(TT)>; total: int) : auto
+
+Removes the last `total` elements from an array in place
+
+:Arguments: * **arr** : array<auto(TT)>
+
+            * **total** : int
+
+.. _function-linq_skip_last_to_array_iterator_ls_autoTT_gr__int:
+
+.. das:function:: skip_last_to_array(src: iterator<auto(TT)>; total: int) : array<TT>
+
+Yields all but the last `total` elements from an iterator and returns an array
 
 :Arguments: * **src** : iterator<auto(TT)>
 
@@ -1230,15 +1377,9 @@ Yields all but the first `total` elements and returns an array
 
             * **total** : int
 
-.. _function-linq_skip_while_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_:
 
-.. das:function:: skip_while(src: iterator<auto(TT)>; predicate: block<(arg:TT):bool>) : iterator<TT>
-
-Skips all elements of an iterator while the predicate is true
-
-:Arguments: * **src** : iterator<auto(TT)>
-
-            * **predicate** : block<(arg:TT):bool>
+skip_while
+^^^^^^^^^^
 
 .. _function-linq_skip_while_array_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_:
 
@@ -1250,6 +1391,12 @@ Skips all elements of an array while the predicate is true
 
             * **predicate** : block<(arg:TT):bool>
 
+.. _function-linq_skip_while_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_:
+
+.. das:function:: skip_while(src: iterator<auto(TT)>; predicate: block<(arg:TT):bool>) : iterator<TT>
+
+----
+
 .. _function-linq_skip_while_to_array_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_:
 
 .. das:function:: skip_while_to_array(src: iterator<auto(TT)>; predicate: block<(arg:TT):bool>) : array<TT>
@@ -1260,55 +1407,9 @@ Skips all elements of an iterator while the predicate is true and returns an arr
 
             * **predicate** : block<(arg:TT):bool>
 
-.. _function-linq_take_array_ls_autoTT_gr__int:
 
-.. das:function:: take(arr: array<auto(TT)>; total: int) : array<TT>
-
-Yields only the first `total` elements
-
-:Arguments: * **arr** : array<auto(TT)>
-
-            * **total** : int
-
-.. _function-linq_take_inplace_array_ls_autoTT_gr__int:
-
-.. das:function:: take_inplace(arr: array<auto(TT)>; total: int) : auto
-
-Keeps only the first `total` elements in an array in place
-
-:Arguments: * **arr** : array<auto(TT)>
-
-            * **total** : int
-
-.. _function-linq_take_iterator_ls_autoTT_gr__int:
-
-.. das:function:: take(src: iterator<auto(TT)>; total: int) : iterator<TT>
-
-Yields only the first `total` elements
-
-:Arguments: * **src** : iterator<auto(TT)>
-
-            * **total** : int
-
-.. _function-linq_take_to_array_iterator_ls_autoTT_gr__int:
-
-.. das:function:: take_to_array(src: iterator<auto(TT)>; total: int) : array<TT>
-
-Yields only the first `total` elements and returns an array
-
-:Arguments: * **src** : iterator<auto(TT)>
-
-            * **total** : int
-
-.. _function-linq_take_iterator_ls_autoTT_gr__range:
-
-.. das:function:: take(src: iterator<auto(TT)>; from: range) : iterator<TT>
-
-Yields a range of elements from an iterator
-
-:Arguments: * **src** : iterator<auto(TT)>
-
-            * **from** : range
+take
+^^^^
 
 .. _function-linq_take_array_ls_autoTT_gr__range:
 
@@ -1320,15 +1421,23 @@ Yields a range of elements from an array
 
             * **from** : range
 
-.. _function-linq_take_to_array_iterator_ls_autoTT_gr__range:
+.. _function-linq_take_iterator_ls_autoTT_gr__range:
 
-.. das:function:: take_to_array(src: iterator<auto(TT)>; from: range) : array<TT>
+.. das:function:: take(src: iterator<auto(TT)>; from: range) : iterator<TT>
 
-Yields a range of elements from an iterator and returns an array
+.. _function-linq_take_iterator_ls_autoTT_gr__int:
 
-:Arguments: * **src** : iterator<auto(TT)>
+.. das:function:: take(src: iterator<auto(TT)>; total: int) : iterator<TT>
 
-            * **from** : range
+.. _function-linq_take_array_ls_autoTT_gr__int:
+
+.. das:function:: take(arr: array<auto(TT)>; total: int) : array<TT>
+
+----
+
+
+take_inplace
+^^^^^^^^^^^^
 
 .. _function-linq_take_inplace_array_ls_autoTT_gr__range:
 
@@ -1340,9 +1449,79 @@ Keeps only a range of elements in an array in place
 
             * **from** : range
 
+.. _function-linq_take_inplace_array_ls_autoTT_gr__int:
+
+.. das:function:: take_inplace(arr: array<auto(TT)>; total: int) : auto
+
+----
+
+
+take_last
+^^^^^^^^^
+
+.. _function-linq_take_last_iterator_ls_autoTT_gr__int:
+
+.. das:function:: take_last(src: iterator<auto(TT)>; total: int) : iterator<TT>
+
+Yields only the last `total` elements from an iterator
+
+:Arguments: * **src** : iterator<auto(TT)>
+
+            * **total** : int
+
+.. _function-linq_take_last_array_ls_autoTT_gr__int:
+
+.. das:function:: take_last(arr: array<auto(TT)>; total: int) : array<TT>
+
+----
+
+.. _function-linq_take_last_inplace_array_ls_autoTT_gr__int:
+
+.. das:function:: take_last_inplace(arr: array<auto(TT)>; total: int) : auto
+
+Keeps only the last `total` elements in an array in place
+
+:Arguments: * **arr** : array<auto(TT)>
+
+            * **total** : int
+
+.. _function-linq_take_last_to_array_iterator_ls_autoTT_gr__int:
+
+.. das:function:: take_last_to_array(src: iterator<auto(TT)>; total: int) : array<TT>
+
+Yields only the last `total` elements from an iterator and returns an array
+
+:Arguments: * **src** : iterator<auto(TT)>
+
+            * **total** : int
+
+
+take_to_array
+^^^^^^^^^^^^^
+
+.. _function-linq_take_to_array_iterator_ls_autoTT_gr__int:
+
+.. das:function:: take_to_array(src: iterator<auto(TT)>; total: int) : array<TT>
+
+Yields only the first `total` elements and returns an array
+
+:Arguments: * **src** : iterator<auto(TT)>
+
+            * **total** : int
+
+.. _function-linq_take_to_array_iterator_ls_autoTT_gr__range:
+
+.. das:function:: take_to_array(src: iterator<auto(TT)>; from: range) : array<TT>
+
+----
+
+
+take_while
+^^^^^^^^^^
+
 .. _function-linq_take_while_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_:
 
-.. das:function:: take_while(src: iterator<auto(TT)>; predicate: block<(arg:TT):bool>) : auto
+.. das:function:: take_while(src: iterator<auto(TT)>; predicate: block<(arg:TT):bool>) : iterator<TT>
 
 Yields only the elements of an iterator while the predicate is true
 
@@ -1354,11 +1533,7 @@ Yields only the elements of an iterator while the predicate is true
 
 .. das:function:: take_while(src: array<auto(TT)>; predicate: block<(arg:TT):bool>) : array<TT>
 
-Yields only the elements of an array while the predicate is true
-
-:Arguments: * **src** : array<auto(TT)>
-
-            * **predicate** : block<(arg:TT):bool>
+----
 
 .. _function-linq_take_while_to_array_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_:
 
@@ -1370,99 +1545,63 @@ Yields only the elements of an iterator while the predicate is true and returns 
 
             * **predicate** : block<(arg:TT):bool>
 
-.. _function-linq_chunk_array_ls_autoTT_gr__int:
-
-.. das:function:: chunk(src: array<auto(TT)>; size: int) : array<array<TT>>
-
-Splits an array into chunks of a specified size
-
-:Arguments: * **src** : array<auto(TT)>
-
-            * **size** : int
-
-.. _function-linq_chunk_to_array_iterator_ls_autoTT_gr__int:
-
-.. das:function:: chunk_to_array(src: iterator<auto(TT)>; size: int) : array<array<TT>>
-
-Splits an iterator into chunks of a specified size and returns an array
-
-:Arguments: * **src** : iterator<auto(TT)>
-
-            * **size** : int
-
-.. _function-linq_chunk_iterator_ls_autoTT_gr__int:
-
-.. das:function:: chunk(src: iterator<auto(TT)>; size: int) : iterator<array<TT>>
-
-Splits an iterator into chunks of a specified size
-
-:Arguments: * **src** : iterator<auto(TT)>
-
-            * **size** : int
-
 +++++++++++++++++++++++++
 Join and group operations
 +++++++++++++++++++++++++
 
-  *  :ref:`join (var srca: iterator\<auto(TA)\>; var srcb: iterator\<auto(TB)\>; keya: auto; keyb: auto; result: auto) : iterator\<typedecl(result(type\<TA\>,type\<TB\>))\> <function-linq_join_iterator_ls_autoTA_gr__iterator_ls_autoTB_gr__auto_auto_auto>` 
-  *  :ref:`join (srca: array\<auto(TA)\>; srcb: array\<auto(TB)\>; keya: auto; keyb: auto; result: auto) : array\<typedecl(result(type\<TA\>,type\<TB\>))\> <function-linq_join_array_ls_autoTA_gr__array_ls_autoTB_gr__auto_auto_auto>` 
-  *  :ref:`join_to_array (var srca: iterator\<auto(TA)\>; var srcb: iterator\<auto(TB)\>; keya: auto; keyb: auto; result: auto) : array\<typedecl(result(type\<TA\>,type\<TB\>))\> <function-linq_join_to_array_iterator_ls_autoTA_gr__iterator_ls_autoTB_gr__auto_auto_auto>` 
-  *  :ref:`group_join (var srca: iterator\<auto(TA)\>; var srcb: iterator\<auto(TB)\>; keya: auto; keyb: auto; result: auto) : iterator\<typedecl(result(type\<TA\>,type\<array\<TB -const -&\>\>))\> <function-linq_group_join_iterator_ls_autoTA_gr__iterator_ls_autoTB_gr__auto_auto_auto>` 
-  *  :ref:`group_join (srca: array\<auto(TA)\>; srcb: array\<auto(TB)\>; keya: auto; keyb: auto; result: auto) : array\<typedecl(result(type\<TA\>,type\<array\<TB -const -&\>\>))\> <function-linq_group_join_array_ls_autoTA_gr__array_ls_autoTB_gr__auto_auto_auto>` 
-  *  :ref:`group_join_to_array (var srca: iterator\<auto(TA)\>; var srcb: iterator\<auto(TB)\>; keya: auto; keyb: auto; result: auto) : array\<typedecl(result(type\<TA\>,type\<array\<TB -const -&\>\>))\> <function-linq_group_join_to_array_iterator_ls_autoTA_gr__iterator_ls_autoTB_gr__auto_auto_auto>` 
-  *  :ref:`group_by (var source: iterator\<auto(TT)\>; key: auto; element_selector: auto; result_selector: auto) : auto <function-linq_group_by_iterator_ls_autoTT_gr__auto_auto_auto>` 
-  *  :ref:`group_by (source: array\<auto(TT)\>; key: auto; element_selector: auto; result_selector: auto) : auto <function-linq_group_by_array_ls_autoTT_gr__auto_auto_auto>` 
-  *  :ref:`group_by_to_array (var source: iterator\<auto(TT)\>; key: auto; element_selector: auto; result_selector: auto) : auto <function-linq_group_by_to_array_iterator_ls_autoTT_gr__auto_auto_auto>` 
+  *  :ref:`group_by (var source: iterator\<auto(TT)\>; key: auto; element_selector: auto; result_selector: auto) : auto <function-linq_group_by_iterator_ls_autoTT_gr__auto_auto_auto_0x741>` 
+  *  :ref:`group_by (source: array\<auto(TT)\>; key: auto; element_selector: auto; result_selector: auto) : auto <function-linq_group_by_array_ls_autoTT_gr__auto_auto_auto_0x747>` 
+  *  :ref:`group_by_to_array (var source: iterator\<auto(TT)\>; key: auto; element_selector: auto; result_selector: auto) : auto <function-linq_group_by_to_array_iterator_ls_autoTT_gr__auto_auto_auto_0x74d>` 
+  *  :ref:`group_join (var srca: iterator\<auto(TA)\>; var srcb: iterator\<auto(TB)\>; keya: auto; keyb: auto; result: auto) : iterator\<typedecl(result(type\<TA\>,type\<array\<TB -const -&\>\>))\> <function-linq_group_join_iterator_ls_autoTA_gr__iterator_ls_autoTB_gr__auto_auto_auto_0x711>` 
+  *  :ref:`group_join (srca: array\<auto(TA)\>; srcb: array\<auto(TB)\>; keya: auto; keyb: auto; result: auto) : array\<typedecl(result(type\<TA\>,type\<array\<TB -const -&\>\>))\> <function-linq_group_join_array_ls_autoTA_gr__array_ls_autoTB_gr__auto_auto_auto_0x717>` 
+  *  :ref:`group_join_to_array (var srca: iterator\<auto(TA)\>; var srcb: iterator\<auto(TB)\>; keya: auto; keyb: auto; result: auto) : array\<typedecl(result(type\<TA\>,type\<array\<TB -const -&\>\>))\> <function-linq_group_join_to_array_iterator_ls_autoTA_gr__iterator_ls_autoTB_gr__auto_auto_auto_0x71d>` 
+  *  :ref:`join (srca: array\<auto(TA)\>; srcb: array\<auto(TB)\>; keya: auto; keyb: auto; result: auto) : array\<typedecl(result(type\<TA\>,type\<TB\>))\> <function-linq_join_array_ls_autoTA_gr__array_ls_autoTB_gr__auto_auto_auto_0x6e8>` 
+  *  :ref:`join (var srca: iterator\<auto(TA)\>; var srcb: iterator\<auto(TB)\>; keya: auto; keyb: auto; result: auto) : iterator\<typedecl(result(type\<TA\>,type\<TB\>))\> <function-linq_join_iterator_ls_autoTA_gr__iterator_ls_autoTB_gr__auto_auto_auto_0x6e2>` 
+  *  :ref:`join_to_array (var srca: iterator\<auto(TA)\>; var srcb: iterator\<auto(TB)\>; keya: auto; keyb: auto; result: auto) : array\<typedecl(result(type\<TA\>,type\<TB\>))\> <function-linq_join_to_array_iterator_ls_autoTA_gr__iterator_ls_autoTB_gr__auto_auto_auto_0x6ee>` 
 
-.. _function-linq_join_iterator_ls_autoTA_gr__iterator_ls_autoTB_gr__auto_auto_auto:
 
-.. das:function:: join(srca: iterator<auto(TA)>; srcb: iterator<auto(TB)>; keya: auto; keyb: auto; result: auto) : iterator<typedecl(result(type<TA>,type<TB>))>
+group_by
+^^^^^^^^
 
-Joins two iterators based on matching keys (inner join)
+.. _function-linq_group_by_iterator_ls_autoTT_gr__auto_auto_auto_0x741:
 
-:Arguments: * **srca** : iterator<auto(TA)>
+.. das:function:: group_by(source: iterator<auto(TT)>; key: auto; element_selector: auto; result_selector: auto) : auto
 
-            * **srcb** : iterator<auto(TB)>
+Groups the elements of an iterator according to a specified key selector function
 
-            * **keya** : auto
+:Arguments: * **source** : iterator<auto(TT)>
 
-            * **keyb** : auto
+            * **key** : auto
 
-            * **result** : auto
+            * **element_selector** : auto
 
-.. _function-linq_join_array_ls_autoTA_gr__array_ls_autoTB_gr__auto_auto_auto:
+            * **result_selector** : auto
 
-.. das:function:: join(srca: array<auto(TA)>; srcb: array<auto(TB)>; keya: auto; keyb: auto; result: auto) : array<typedecl(result(type<TA>,type<TB>))>
+.. _function-linq_group_by_array_ls_autoTT_gr__auto_auto_auto_0x747:
 
-Joins two arrays based on matching keys (inner join)
+.. das:function:: group_by(source: array<auto(TT)>; key: auto; element_selector: auto; result_selector: auto) : auto
 
-:Arguments: * **srca** : array<auto(TA)>
+----
 
-            * **srcb** : array<auto(TB)>
+.. _function-linq_group_by_to_array_iterator_ls_autoTT_gr__auto_auto_auto_0x74d:
 
-            * **keya** : auto
+.. das:function:: group_by_to_array(source: iterator<auto(TT)>; key: auto; element_selector: auto; result_selector: auto) : auto
 
-            * **keyb** : auto
+Groups the elements of an iterator according to a specified key selector function and returns an array
 
-            * **result** : auto
+:Arguments: * **source** : iterator<auto(TT)>
 
-.. _function-linq_join_to_array_iterator_ls_autoTA_gr__iterator_ls_autoTB_gr__auto_auto_auto:
+            * **key** : auto
 
-.. das:function:: join_to_array(srca: iterator<auto(TA)>; srcb: iterator<auto(TB)>; keya: auto; keyb: auto; result: auto) : array<typedecl(result(type<TA>,type<TB>))>
+            * **element_selector** : auto
 
-Joins two iterators based on matching keys (inner join) and returns an array
+            * **result_selector** : auto
 
-:Arguments: * **srca** : iterator<auto(TA)>
 
-            * **srcb** : iterator<auto(TB)>
+group_join
+^^^^^^^^^^
 
-            * **keya** : auto
-
-            * **keyb** : auto
-
-            * **result** : auto
-
-.. _function-linq_group_join_iterator_ls_autoTA_gr__iterator_ls_autoTB_gr__auto_auto_auto:
+.. _function-linq_group_join_iterator_ls_autoTA_gr__iterator_ls_autoTB_gr__auto_auto_auto_0x711:
 
 .. das:function:: group_join(srca: iterator<auto(TA)>; srcb: iterator<auto(TB)>; keya: auto; keyb: auto; result: auto) : iterator<typedecl(result(type<TA>,type<array<TB -const -&>>))>
 
@@ -1478,23 +1617,13 @@ we pass TA, and sequence of TB to 'result'
 
             * **result** : auto
 
-.. _function-linq_group_join_array_ls_autoTA_gr__array_ls_autoTB_gr__auto_auto_auto:
+.. _function-linq_group_join_array_ls_autoTA_gr__array_ls_autoTB_gr__auto_auto_auto_0x717:
 
 .. das:function:: group_join(srca: array<auto(TA)>; srcb: array<auto(TB)>; keya: auto; keyb: auto; result: auto) : array<typedecl(result(type<TA>,type<array<TB -const -&>>))>
 
-we pass TA, and sequence of TB to 'result'
+----
 
-:Arguments: * **srca** : array<auto(TA)>
-
-            * **srcb** : array<auto(TB)>
-
-            * **keya** : auto
-
-            * **keyb** : auto
-
-            * **result** : auto
-
-.. _function-linq_group_join_to_array_iterator_ls_autoTA_gr__iterator_ls_autoTB_gr__auto_auto_auto:
+.. _function-linq_group_join_to_array_iterator_ls_autoTA_gr__iterator_ls_autoTB_gr__auto_auto_auto_0x71d:
 
 .. das:function:: group_join_to_array(srca: iterator<auto(TA)>; srcb: iterator<auto(TB)>; keya: auto; keyb: auto; result: auto) : array<typedecl(result(type<TA>,type<array<TB -const -&>>))>
 
@@ -1510,86 +1639,84 @@ we pass TA, and sequence of TB to 'result'
 
             * **result** : auto
 
-.. _function-linq_group_by_iterator_ls_autoTT_gr__auto_auto_auto:
 
-.. das:function:: group_by(source: iterator<auto(TT)>; key: auto; element_selector: auto; result_selector: auto) : auto
+join
+^^^^
 
-Groups the elements of an iterator according to a specified key selector function
+.. _function-linq_join_array_ls_autoTA_gr__array_ls_autoTB_gr__auto_auto_auto_0x6e8:
 
-:Arguments: * **source** : iterator<auto(TT)>
+.. das:function:: join(srca: array<auto(TA)>; srcb: array<auto(TB)>; keya: auto; keyb: auto; result: auto) : array<typedecl(result(type<TA>,type<TB>))>
 
-            * **key** : auto
+Joins two arrays based on matching keys (inner join)
 
-            * **element_selector** : auto
+:Arguments: * **srca** : array<auto(TA)>
 
-            * **result_selector** : auto
+            * **srcb** : array<auto(TB)>
 
-.. _function-linq_group_by_array_ls_autoTT_gr__auto_auto_auto:
+            * **keya** : auto
 
-.. das:function:: group_by(source: array<auto(TT)>; key: auto; element_selector: auto; result_selector: auto) : auto
+            * **keyb** : auto
 
-Groups the elements of an array according to a specified key selector function
+            * **result** : auto
 
-:Arguments: * **source** : array<auto(TT)>
+.. _function-linq_join_iterator_ls_autoTA_gr__iterator_ls_autoTB_gr__auto_auto_auto_0x6e2:
 
-            * **key** : auto
+.. das:function:: join(srca: iterator<auto(TA)>; srcb: iterator<auto(TB)>; keya: auto; keyb: auto; result: auto) : iterator<typedecl(result(type<TA>,type<TB>))>
 
-            * **element_selector** : auto
+----
 
-            * **result_selector** : auto
+.. _function-linq_join_to_array_iterator_ls_autoTA_gr__iterator_ls_autoTB_gr__auto_auto_auto_0x6ee:
 
-.. _function-linq_group_by_to_array_iterator_ls_autoTT_gr__auto_auto_auto:
+.. das:function:: join_to_array(srca: iterator<auto(TA)>; srcb: iterator<auto(TB)>; keya: auto; keyb: auto; result: auto) : array<typedecl(result(type<TA>,type<TB>))>
 
-.. das:function:: group_by_to_array(source: iterator<auto(TT)>; key: auto; element_selector: auto; result_selector: auto) : auto
+Joins two iterators based on matching keys (inner join) and returns an array
 
-Groups the elements of an iterator according to a specified key selector function and returns an array
+:Arguments: * **srca** : iterator<auto(TA)>
 
-:Arguments: * **source** : iterator<auto(TT)>
+            * **srcb** : iterator<auto(TB)>
 
-            * **key** : auto
+            * **keya** : auto
 
-            * **element_selector** : auto
+            * **keyb** : auto
 
-            * **result_selector** : auto
+            * **result** : auto
 
 +++++++++++++
 Querying data
 +++++++++++++
 
-  *  :ref:`any (src: array\<auto(TT)\>) : bool <function-linq_any_array_ls_autoTT_gr_>` 
-  *  :ref:`any (var src: iterator\<auto(TT)\>) : bool <function-linq_any_iterator_ls_autoTT_gr_>` 
-  *  :ref:`any (var src: iterator\<auto(TT)\>; predicate: block\<(arg:TT):bool\>) : bool <function-linq_any_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_>` 
-  *  :ref:`any (src: array\<auto(TT)\>; predicate: block\<(arg:TT):bool\>) : bool <function-linq_any_array_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_>` 
-  *  :ref:`all (var src: iterator\<auto(TT)\>; predicate: block\<(arg:TT):bool\>) : bool <function-linq_all_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_>` 
   *  :ref:`all (src: array\<auto(TT)\>; predicate: block\<(arg:TT):bool\>) : bool <function-linq_all_array_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_>` 
+  *  :ref:`all (var src: iterator\<auto(TT)\>; predicate: block\<(arg:TT):bool\>) : bool <function-linq_all_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_>` 
+  *  :ref:`any (src: array\<auto(TT)\>; predicate: block\<(arg:TT):bool\>) : bool <function-linq_any_array_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_>` 
+  *  :ref:`any (var src: iterator\<auto(TT)\>) : bool <function-linq_any_iterator_ls_autoTT_gr_>` 
+  *  :ref:`any (src: array\<auto(TT)\>) : bool <function-linq_any_array_ls_autoTT_gr_>` 
+  *  :ref:`any (var src: iterator\<auto(TT)\>; predicate: block\<(arg:TT):bool\>) : bool <function-linq_any_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_>` 
   *  :ref:`contains (var src: iterator\<auto(TT)\>; element: TT) : bool <function-linq_contains_iterator_ls_autoTT_gr__TT>` 
   *  :ref:`contains (src: array\<auto(TT)\>; element: TT) : bool <function-linq_contains_array_ls_autoTT_gr__TT>` 
 
-.. _function-linq_any_array_ls_autoTT_gr_:
 
-.. das:function:: any(src: array<auto(TT)>) : bool
+all
+^^^
 
-Returns true if the array has at least one element
+.. _function-linq_all_array_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_:
+
+.. das:function:: all(src: array<auto(TT)>; predicate: block<(arg:TT):bool>) : bool
+
+Returns true if all elements in the array satisfy the predicate
 
 :Arguments: * **src** : array<auto(TT)>
 
-.. _function-linq_any_iterator_ls_autoTT_gr_:
-
-.. das:function:: any(src: iterator<auto(TT)>) : bool
-
-Returns true if the iterator has at least one element
-
-:Arguments: * **src** : iterator<auto(TT)>
-
-.. _function-linq_any_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_:
-
-.. das:function:: any(src: iterator<auto(TT)>; predicate: block<(arg:TT):bool>) : bool
-
-Returns true if any element in the iterator satisfies the predicate
-
-:Arguments: * **src** : iterator<auto(TT)>
-
             * **predicate** : block<(arg:TT):bool>
+
+.. _function-linq_all_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_:
+
+.. das:function:: all(src: iterator<auto(TT)>; predicate: block<(arg:TT):bool>) : bool
+
+----
+
+
+any
+^^^
 
 .. _function-linq_any_array_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_:
 
@@ -1601,25 +1728,23 @@ Returns true if any element in the array satisfies the predicate
 
             * **predicate** : block<(arg:TT):bool>
 
-.. _function-linq_all_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_:
+.. _function-linq_any_iterator_ls_autoTT_gr_:
 
-.. das:function:: all(src: iterator<auto(TT)>; predicate: block<(arg:TT):bool>) : bool
+.. das:function:: any(src: iterator<auto(TT)>) : bool
 
-Returns true if all elements in the iterator satisfy the predicate
+.. _function-linq_any_array_ls_autoTT_gr_:
 
-:Arguments: * **src** : iterator<auto(TT)>
+.. das:function:: any(src: array<auto(TT)>) : bool
 
-            * **predicate** : block<(arg:TT):bool>
+.. _function-linq_any_iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_:
 
-.. _function-linq_all_array_ls_autoTT_gr__block_ls_arg_c_TT_c_bool_gr_:
+.. das:function:: any(src: iterator<auto(TT)>; predicate: block<(arg:TT):bool>) : bool
 
-.. das:function:: all(src: array<auto(TT)>; predicate: block<(arg:TT):bool>) : bool
+----
 
-Returns true if all elements in the array satisfy the predicate
 
-:Arguments: * **src** : array<auto(TT)>
-
-            * **predicate** : block<(arg:TT):bool>
+contains
+^^^^^^^^
 
 .. _function-linq_contains_iterator_ls_autoTT_gr__TT:
 
@@ -1635,42 +1760,32 @@ Returns true if the element is present in the iterator
 
 .. das:function:: contains(src: array<auto(TT)>; element: TT) : bool
 
-Returns true if the element is present in the array
-
-:Arguments: * **src** : array<auto(TT)>
-
-            * **element** : TT
+----
 
 ++++++++++++++++++
 Element operations
 ++++++++++++++++++
 
-  *  :ref:`element_at (src: array\<auto(TT)\>; index: int) : TT <function-linq_element_at_array_ls_autoTT_gr__int>` 
   *  :ref:`element_at (var src: iterator\<auto(TT)\>; index: int) : TT <function-linq_element_at_iterator_ls_autoTT_gr__int>` 
-  *  :ref:`element_at_or_default (src: array\<auto(TT)\>; index: int) : TT <function-linq_element_at_or_default_array_ls_autoTT_gr__int>` 
+  *  :ref:`element_at (src: array\<auto(TT)\>; index: int) : TT <function-linq_element_at_array_ls_autoTT_gr__int>` 
   *  :ref:`element_at_or_default (var src: iterator\<auto(TT)\>; index: int) : TT <function-linq_element_at_or_default_iterator_ls_autoTT_gr__int>` 
-  *  :ref:`first (src: array\<auto(TT)\>) : TT <function-linq_first_array_ls_autoTT_gr_>` 
+  *  :ref:`element_at_or_default (src: array\<auto(TT)\>; index: int) : TT <function-linq_element_at_or_default_array_ls_autoTT_gr__int>` 
   *  :ref:`first (var src: iterator\<auto(TT)\>) : TT <function-linq_first_iterator_ls_autoTT_gr_>` 
+  *  :ref:`first (src: array\<auto(TT)\>) : TT <function-linq_first_array_ls_autoTT_gr_>` 
   *  :ref:`first_or_default (src: array\<auto(TT)\>; defaultValue: TT) : TT <function-linq_first_or_default_array_ls_autoTT_gr__TT>` 
   *  :ref:`first_or_default (var src: iterator\<auto(TT)\>; defaultValue: TT) : TT <function-linq_first_or_default_iterator_ls_autoTT_gr__TT>` 
-  *  :ref:`last (src: array\<auto(TT)\>) : TT <function-linq_last_array_ls_autoTT_gr_>` 
   *  :ref:`last (var src: iterator\<auto(TT)\>) : TT <function-linq_last_iterator_ls_autoTT_gr_>` 
+  *  :ref:`last (src: array\<auto(TT)\>) : TT <function-linq_last_array_ls_autoTT_gr_>` 
   *  :ref:`last_or_default (src: array\<auto(TT)\>; defaultValue: TT) : TT <function-linq_last_or_default_array_ls_autoTT_gr__TT>` 
   *  :ref:`last_or_default (var src: iterator\<auto(TT)\>; defaultValue: TT) : TT <function-linq_last_or_default_iterator_ls_autoTT_gr__TT>` 
   *  :ref:`single (src: array\<auto(TT)\>) : TT <function-linq_single_array_ls_autoTT_gr_>` 
   *  :ref:`single (var src: iterator\<auto(TT)\>) : TT <function-linq_single_iterator_ls_autoTT_gr_>` 
-  *  :ref:`single_or_default (src: array\<auto(TT)\>; defaultValue: TT) : TT <function-linq_single_or_default_array_ls_autoTT_gr__TT>` 
   *  :ref:`single_or_default (var src: iterator\<auto(TT)\>; defaultValue: TT) : TT <function-linq_single_or_default_iterator_ls_autoTT_gr__TT>` 
+  *  :ref:`single_or_default (src: array\<auto(TT)\>; defaultValue: TT) : TT <function-linq_single_or_default_array_ls_autoTT_gr__TT>` 
 
-.. _function-linq_element_at_array_ls_autoTT_gr__int:
 
-.. das:function:: element_at(src: array<auto(TT)>; index: int) : TT
-
-Returns the element at the specified index
-
-:Arguments: * **src** : array<auto(TT)>
-
-            * **index** : int
+element_at
+^^^^^^^^^^
 
 .. _function-linq_element_at_iterator_ls_autoTT_gr__int:
 
@@ -1682,15 +1797,15 @@ Returns the element at the specified index
 
             * **index** : int
 
-.. _function-linq_element_at_or_default_array_ls_autoTT_gr__int:
+.. _function-linq_element_at_array_ls_autoTT_gr__int:
 
-.. das:function:: element_at_or_default(src: array<auto(TT)>; index: int) : TT
+.. das:function:: element_at(src: array<auto(TT)>; index: int) : TT
 
-Returns the element at the specified index, or a default value if the index is out of range
+----
 
-:Arguments: * **src** : array<auto(TT)>
 
-            * **index** : int
+element_at_or_default
+^^^^^^^^^^^^^^^^^^^^^
 
 .. _function-linq_element_at_or_default_iterator_ls_autoTT_gr__int:
 
@@ -1702,13 +1817,15 @@ Returns the element at the specified index, or a default value if the index is o
 
             * **index** : int
 
-.. _function-linq_first_array_ls_autoTT_gr_:
+.. _function-linq_element_at_or_default_array_ls_autoTT_gr__int:
 
-.. das:function:: first(src: array<auto(TT)>) : TT
+.. das:function:: element_at_or_default(src: array<auto(TT)>; index: int) : TT
 
-Returns the first element of an array
+----
 
-:Arguments: * **src** : array<auto(TT)>
+
+first
+^^^^^
 
 .. _function-linq_first_iterator_ls_autoTT_gr_:
 
@@ -1717,6 +1834,16 @@ Returns the first element of an array
 Returns the first element of an iterator
 
 :Arguments: * **src** : iterator<auto(TT)>
+
+.. _function-linq_first_array_ls_autoTT_gr_:
+
+.. das:function:: first(src: array<auto(TT)>) : TT
+
+----
+
+
+first_or_default
+^^^^^^^^^^^^^^^^
 
 .. _function-linq_first_or_default_array_ls_autoTT_gr__TT:
 
@@ -1732,19 +1859,11 @@ Returns the first element of an array, or a default value if the array is empty
 
 .. das:function:: first_or_default(src: iterator<auto(TT)>; defaultValue: TT) : TT
 
-Returns the first element of an iterator, or a default value if the iterator is empty
+----
 
-:Arguments: * **src** : iterator<auto(TT)>
 
-            * **defaultValue** : TT
-
-.. _function-linq_last_array_ls_autoTT_gr_:
-
-.. das:function:: last(src: array<auto(TT)>) : TT
-
-Returns the last element of an array
-
-:Arguments: * **src** : array<auto(TT)>
+last
+^^^^
 
 .. _function-linq_last_iterator_ls_autoTT_gr_:
 
@@ -1753,6 +1872,16 @@ Returns the last element of an array
 Returns the last element of an iterator
 
 :Arguments: * **src** : iterator<auto(TT)>
+
+.. _function-linq_last_array_ls_autoTT_gr_:
+
+.. das:function:: last(src: array<auto(TT)>) : TT
+
+----
+
+
+last_or_default
+^^^^^^^^^^^^^^^
 
 .. _function-linq_last_or_default_array_ls_autoTT_gr__TT:
 
@@ -1768,11 +1897,11 @@ Returns the last element of an array, or a default value if the array is empty
 
 .. das:function:: last_or_default(src: iterator<auto(TT)>; defaultValue: TT) : TT
 
-Returns the last element of an iterator, or a default value if the iterator is empty
+----
 
-:Arguments: * **src** : iterator<auto(TT)>
 
-            * **defaultValue** : TT
+single
+^^^^^^
 
 .. _function-linq_single_array_ls_autoTT_gr_:
 
@@ -1786,19 +1915,11 @@ Returns the only element of an array, and throws if there is not exactly one ele
 
 .. das:function:: single(src: iterator<auto(TT)>) : TT
 
-Returns the only element of an iterator, and throws if there is not exactly one element
+----
 
-:Arguments: * **src** : iterator<auto(TT)>
 
-.. _function-linq_single_or_default_array_ls_autoTT_gr__TT:
-
-.. das:function:: single_or_default(src: array<auto(TT)>; defaultValue: TT) : TT
-
-Returns the only element of an array, or a default value if there is not exactly one element
-
-:Arguments: * **src** : array<auto(TT)>
-
-            * **defaultValue** : TT
+single_or_default
+^^^^^^^^^^^^^^^^^
 
 .. _function-linq_single_or_default_iterator_ls_autoTT_gr__TT:
 
@@ -1810,36 +1931,41 @@ Returns the only element of an iterator, or a default value if there is not exac
 
             * **defaultValue** : TT
 
+.. _function-linq_single_or_default_array_ls_autoTT_gr__TT:
+
+.. das:function:: single_or_default(src: array<auto(TT)>; defaultValue: TT) : TT
+
+----
+
 ++++++++++++++++++++
 Transform operations
 ++++++++++++++++++++
 
-  *  :ref:`select (var src: iterator\<auto(TT)\>) : iterator\<tuple\<int;TT\>\> <function-linq_select_iterator_ls_autoTT_gr_>` 
   *  :ref:`select (src: array\<auto(TT)\>) : array\<tuple\<int;TT\>\> <function-linq_select_array_ls_autoTT_gr_>` 
+  *  :ref:`select (var src: iterator\<auto(TT)\>) : iterator\<tuple\<int;TT\>\> <function-linq_select_iterator_ls_autoTT_gr_>` 
+  *  :ref:`select (var src: iterator\<auto(TT)\>; result_selector: auto) : iterator\<typedecl(result_selector(type\<TT\>))\> <function-linq_select_iterator_ls_autoTT_gr__auto_0xb51>` 
+  *  :ref:`select (src: array\<auto(TT)\>; result_selector: auto) : array\<typedecl(result_selector(type\<TT\>))\> <function-linq_select_array_ls_autoTT_gr__auto_0xb57>` 
+  *  :ref:`select_many (var src: iterator\<auto(TT)\>; result_selector: auto) : iterator\<typedecl(result_selector(iter_type(type\<TT\>)))\> <function-linq_select_many_iterator_ls_autoTT_gr__auto_0xbba>` 
+  *  :ref:`select_many (src: array\<auto(TT)\>; result_selector: auto) : array\<typedecl(result_selector(iter_type(type\<TT\>)))\> <function-linq_select_many_array_ls_autoTT_gr__auto_0xbc0>` 
+  *  :ref:`select_many (src: array\<auto(TT)\>; collection_selector: auto; result_selector: auto) : array\<typedecl(result_selector(iter_type(collection_selector(type\<TT\>))))\> <function-linq_select_many_array_ls_autoTT_gr__auto_auto_0xbe9>` 
+  *  :ref:`select_many (var src: iterator\<auto(TT)\>; collection_selector: auto; result_selector: auto) : iterator\<typedecl(result_selector(iter_type(collection_selector(type\<TT\>))))\> <function-linq_select_many_iterator_ls_autoTT_gr__auto_auto_0xbe3>` 
+  *  :ref:`select_many_to_array (var src: iterator\<auto(TT)\>; collection_selector: auto; result_selector: auto) : array\<typedecl(result_selector(iter_type(collection_selector(type\<TT\>))))\> <function-linq_select_many_to_array_iterator_ls_autoTT_gr__auto_auto_0xbef>` 
+  *  :ref:`select_many_to_array (var src: iterator\<auto(TT)\>; result_selector: auto) : array\<typedecl(result_selector(iter_type(type\<TT\>)))\> <function-linq_select_many_to_array_iterator_ls_autoTT_gr__auto_0xbc6>` 
+  *  :ref:`select_to_array (var src: iterator\<auto(TT)\>; result_selector: auto) : array\<typedecl(result_selector(type\<TT\>))\> <function-linq_select_to_array_iterator_ls_autoTT_gr__auto_0xb5d>` 
   *  :ref:`select_to_array (var src: iterator\<auto(TT)\>) : array\<tuple\<int;TT\>\> <function-linq_select_to_array_iterator_ls_autoTT_gr_>` 
-  *  :ref:`select (var src: iterator\<auto(TT)\>; result_selector: auto) : iterator\<typedecl(result_selector(type\<TT\>))\> <function-linq_select_iterator_ls_autoTT_gr__auto>` 
-  *  :ref:`select (src: array\<auto(TT)\>; result_selector: auto) : array\<typedecl(result_selector(type\<TT\>))\> <function-linq_select_array_ls_autoTT_gr__auto>` 
-  *  :ref:`select_to_array (var src: iterator\<auto(TT)\>; result_selector: auto) : array\<typedecl(result_selector(type\<TT\>))\> <function-linq_select_to_array_iterator_ls_autoTT_gr__auto>` 
-  *  :ref:`select_many (var src: iterator\<auto(TT)\>; result_selector: auto) : iterator\<typedecl(result_selector(iter_type(type\<TT\>)))\> <function-linq_select_many_iterator_ls_autoTT_gr__auto>` 
-  *  :ref:`select_many (src: array\<auto(TT)\>; result_selector: auto) : array\<typedecl(result_selector(iter_type(type\<TT\>)))\> <function-linq_select_many_array_ls_autoTT_gr__auto>` 
-  *  :ref:`select_many_to_array (var src: iterator\<auto(TT)\>; result_selector: auto) : array\<typedecl(result_selector(iter_type(type\<TT\>)))\> <function-linq_select_many_to_array_iterator_ls_autoTT_gr__auto>` 
-  *  :ref:`select_many (var src: iterator\<auto(TT)\>; collection_selector: auto; result_selector: auto) : iterator\<typedecl(result_selector(iter_type(collection_selector(type\<TT\>))))\> <function-linq_select_many_iterator_ls_autoTT_gr__auto_auto>` 
-  *  :ref:`select_many (src: array\<auto(TT)\>; collection_selector: auto; result_selector: auto) : array\<typedecl(result_selector(iter_type(collection_selector(type\<TT\>))))\> <function-linq_select_many_array_ls_autoTT_gr__auto_auto>` 
-  *  :ref:`select_many_to_array (var src: iterator\<auto(TT)\>; collection_selector: auto; result_selector: auto) : array\<typedecl(result_selector(iter_type(collection_selector(type\<TT\>))))\> <function-linq_select_many_to_array_iterator_ls_autoTT_gr__auto_auto>` 
   *  :ref:`zip (var a: iterator\<auto(TT)\>; var b: iterator\<auto(UU)\>) : iterator\<tuple\<TT;UU\>\> <function-linq_zip_iterator_ls_autoTT_gr__iterator_ls_autoUU_gr_>` 
   *  :ref:`zip (a: array\<auto(TT)\>; b: array\<auto(UU)\>) : array\<tuple\<TT;UU\>\> <function-linq_zip_array_ls_autoTT_gr__array_ls_autoUU_gr_>` 
-  *  :ref:`zip_to_array (var a: iterator\<auto(TT)\>; var b: iterator\<auto(UU)\>) : array\<tuple\<TT;UU\>\> <function-linq_zip_to_array_iterator_ls_autoTT_gr__iterator_ls_autoUU_gr_>` 
-  *  :ref:`zip (var a: iterator\<auto(TT)\>; var b: iterator\<auto(UU)\>; result_selector: block\<(l:TT;r:UU):auto\>) : iterator\<typedecl(result_selector(type\<TT\>,type\<UU\>))\> <function-linq_zip_iterator_ls_autoTT_gr__iterator_ls_autoUU_gr__block_ls_l_c_TT;r_c_UU_c_auto_gr_>` 
   *  :ref:`zip (a: array\<auto(TT)\>; b: array\<auto(UU)\>; result_selector: block\<(l:TT;r:UU):auto\>) : array\<typedecl(result_selector(type\<TT\>,type\<UU\>))\> <function-linq_zip_array_ls_autoTT_gr__array_ls_autoUU_gr__block_ls_l_c_TT;r_c_UU_c_auto_gr_>` 
+  *  :ref:`zip (var a: iterator\<auto(TT)\>; var b: iterator\<auto(UU)\>; result_selector: block\<(l:TT;r:UU):auto\>) : iterator\<typedecl(result_selector(type\<TT\>,type\<UU\>))\> <function-linq_zip_iterator_ls_autoTT_gr__iterator_ls_autoUU_gr__block_ls_l_c_TT;r_c_UU_c_auto_gr_>` 
+  *  :ref:`zip (a: array\<auto(TT)\>; b: array\<auto(UU)\>; c: array\<auto(WW)\>) : array\<tuple\<TT;UU;WW\>\> <function-linq_zip_array_ls_autoTT_gr__array_ls_autoUU_gr__array_ls_autoWW_gr_>` 
+  *  :ref:`zip (var a: iterator\<auto(TT)\>; var b: iterator\<auto(UU)\>; var c: iterator\<auto(WW)\>) : iterator\<tuple\<TT;UU;WW\>\> <function-linq_zip_iterator_ls_autoTT_gr__iterator_ls_autoUU_gr__iterator_ls_autoWW_gr_>` 
+  *  :ref:`zip_to_array (var a: iterator\<auto(TT)\>; var b: iterator\<auto(UU)\>; var c: iterator\<auto(WW)\>) : array\<tuple\<TT;UU;WW\>\> <function-linq_zip_to_array_iterator_ls_autoTT_gr__iterator_ls_autoUU_gr__iterator_ls_autoWW_gr_>` 
+  *  :ref:`zip_to_array (var a: iterator\<auto(TT)\>; var b: iterator\<auto(UU)\>) : array\<tuple\<TT;UU\>\> <function-linq_zip_to_array_iterator_ls_autoTT_gr__iterator_ls_autoUU_gr_>` 
   *  :ref:`zip_to_array (var a: iterator\<auto(TT)\>; var b: iterator\<auto(UU)\>; result_selector: block\<(l:TT;r:UU):auto\>) : array\<typedecl(result_selector(type\<TT\>,type\<UU\>))\> <function-linq_zip_to_array_iterator_ls_autoTT_gr__iterator_ls_autoUU_gr__block_ls_l_c_TT;r_c_UU_c_auto_gr_>` 
 
-.. _function-linq_select_iterator_ls_autoTT_gr_:
 
-.. das:function:: select(src: iterator<auto(TT)>) : iterator<tuple<int;TT>>
-
-Projects each element of an iterator into a new form
-
-:Arguments: * **src** : iterator<auto(TT)>
+select
+^^^^^^
 
 .. _function-linq_select_array_ls_autoTT_gr_:
 
@@ -1849,45 +1975,25 @@ Projects each element of an array into a new form
 
 :Arguments: * **src** : array<auto(TT)>
 
-.. _function-linq_select_to_array_iterator_ls_autoTT_gr_:
+.. _function-linq_select_iterator_ls_autoTT_gr_:
 
-.. das:function:: select_to_array(src: iterator<auto(TT)>) : array<tuple<int;TT>>
+.. das:function:: select(src: iterator<auto(TT)>) : iterator<tuple<int;TT>>
 
-Projects each element of an iterator into a new form and returns an array
-
-:Arguments: * **src** : iterator<auto(TT)>
-
-.. _function-linq_select_iterator_ls_autoTT_gr__auto:
+.. _function-linq_select_iterator_ls_autoTT_gr__auto_0xb51:
 
 .. das:function:: select(src: iterator<auto(TT)>; result_selector: auto) : iterator<typedecl(result_selector(type<TT>))>
 
-Projects each element of an iterator into a new form using a selector function
-
-:Arguments: * **src** : iterator<auto(TT)>
-
-            * **result_selector** : auto
-
-.. _function-linq_select_array_ls_autoTT_gr__auto:
+.. _function-linq_select_array_ls_autoTT_gr__auto_0xb57:
 
 .. das:function:: select(src: array<auto(TT)>; result_selector: auto) : array<typedecl(result_selector(type<TT>))>
 
-Projects each element of an array into a new form using a selector function
+----
 
-:Arguments: * **src** : array<auto(TT)>
 
-            * **result_selector** : auto
+select_many
+^^^^^^^^^^^
 
-.. _function-linq_select_to_array_iterator_ls_autoTT_gr__auto:
-
-.. das:function:: select_to_array(src: iterator<auto(TT)>; result_selector: auto) : array<typedecl(result_selector(type<TT>))>
-
-Projects each element of an iterator into a new form using a selector function and returns an array
-
-:Arguments: * **src** : iterator<auto(TT)>
-
-            * **result_selector** : auto
-
-.. _function-linq_select_many_iterator_ls_autoTT_gr__auto:
+.. _function-linq_select_many_iterator_ls_autoTT_gr__auto_0xbba:
 
 .. das:function:: select_many(src: iterator<auto(TT)>; result_selector: auto) : iterator<typedecl(result_selector(iter_type(type<TT>)))>
 
@@ -1897,51 +2003,25 @@ Projects each element of an iterator to an iterator and flattens the resulting i
 
             * **result_selector** : auto
 
-.. _function-linq_select_many_array_ls_autoTT_gr__auto:
+.. _function-linq_select_many_array_ls_autoTT_gr__auto_0xbc0:
 
 .. das:function:: select_many(src: array<auto(TT)>; result_selector: auto) : array<typedecl(result_selector(iter_type(type<TT>)))>
 
-Projects each element of an array to an iterator and flattens the resulting iterators into one array
-
-:Arguments: * **src** : array<auto(TT)>
-
-            * **result_selector** : auto
-
-.. _function-linq_select_many_to_array_iterator_ls_autoTT_gr__auto:
-
-.. das:function:: select_many_to_array(src: iterator<auto(TT)>; result_selector: auto) : array<typedecl(result_selector(iter_type(type<TT>)))>
-
-Projects each element of an iterator to an iterator and flattens the resulting iterators into one array
-
-:Arguments: * **src** : iterator<auto(TT)>
-
-            * **result_selector** : auto
-
-.. _function-linq_select_many_iterator_ls_autoTT_gr__auto_auto:
-
-.. das:function:: select_many(src: iterator<auto(TT)>; collection_selector: auto; result_selector: auto) : iterator<typedecl(result_selector(iter_type(collection_selector(type<TT>))))>
-
-Projects each element of an iterator to an iterator and flattens the resulting iterators into one iterator
-
-:Arguments: * **src** : iterator<auto(TT)>
-
-            * **collection_selector** : auto
-
-            * **result_selector** : auto
-
-.. _function-linq_select_many_array_ls_autoTT_gr__auto_auto:
+.. _function-linq_select_many_array_ls_autoTT_gr__auto_auto_0xbe9:
 
 .. das:function:: select_many(src: array<auto(TT)>; collection_selector: auto; result_selector: auto) : array<typedecl(result_selector(iter_type(collection_selector(type<TT>))))>
 
-Projects each element of an array to an iterator and flattens the resulting iterators into one array
+.. _function-linq_select_many_iterator_ls_autoTT_gr__auto_auto_0xbe3:
 
-:Arguments: * **src** : array<auto(TT)>
+.. das:function:: select_many(src: iterator<auto(TT)>; collection_selector: auto; result_selector: auto) : iterator<typedecl(result_selector(iter_type(collection_selector(type<TT>))))>
 
-            * **collection_selector** : auto
+----
 
-            * **result_selector** : auto
 
-.. _function-linq_select_many_to_array_iterator_ls_autoTT_gr__auto_auto:
+select_many_to_array
+^^^^^^^^^^^^^^^^^^^^
+
+.. _function-linq_select_many_to_array_iterator_ls_autoTT_gr__auto_auto_0xbef:
 
 .. das:function:: select_many_to_array(src: iterator<auto(TT)>; collection_selector: auto; result_selector: auto) : array<typedecl(result_selector(iter_type(collection_selector(type<TT>))))>
 
@@ -1952,6 +2032,36 @@ Projects each element of an iterator to an iterator and flattens the resulting i
             * **collection_selector** : auto
 
             * **result_selector** : auto
+
+.. _function-linq_select_many_to_array_iterator_ls_autoTT_gr__auto_0xbc6:
+
+.. das:function:: select_many_to_array(src: iterator<auto(TT)>; result_selector: auto) : array<typedecl(result_selector(iter_type(type<TT>)))>
+
+----
+
+
+select_to_array
+^^^^^^^^^^^^^^^
+
+.. _function-linq_select_to_array_iterator_ls_autoTT_gr__auto_0xb5d:
+
+.. das:function:: select_to_array(src: iterator<auto(TT)>; result_selector: auto) : array<typedecl(result_selector(type<TT>))>
+
+Projects each element of an iterator into a new form using a selector function and returns an array
+
+:Arguments: * **src** : iterator<auto(TT)>
+
+            * **result_selector** : auto
+
+.. _function-linq_select_to_array_iterator_ls_autoTT_gr_:
+
+.. das:function:: select_to_array(src: iterator<auto(TT)>) : array<tuple<int;TT>>
+
+----
+
+
+zip
+^^^
 
 .. _function-linq_zip_iterator_ls_autoTT_gr__iterator_ls_autoUU_gr_:
 
@@ -1967,66 +2077,58 @@ Merges two iterators into an iterator of tuples
 
 .. das:function:: zip(a: array<auto(TT)>; b: array<auto(UU)>) : array<tuple<TT;UU>>
 
-Merges two arrays into an array of tuples
+.. _function-linq_zip_array_ls_autoTT_gr__array_ls_autoUU_gr__block_ls_l_c_TT;r_c_UU_c_auto_gr_:
 
-:Arguments: * **a** : array<auto(TT)>
-
-            * **b** : array<auto(UU)>
-
-.. _function-linq_zip_to_array_iterator_ls_autoTT_gr__iterator_ls_autoUU_gr_:
-
-.. das:function:: zip_to_array(a: iterator<auto(TT)>; b: iterator<auto(UU)>) : array<tuple<TT;UU>>
-
-Merges two iterators into an array of tuples
-
-:Arguments: * **a** : iterator<auto(TT)>
-
-            * **b** : iterator<auto(UU)>
+.. das:function:: zip(a: array<auto(TT)>; b: array<auto(UU)>; result_selector: block<(l:TT;r:UU):auto>) : array<typedecl(result_selector(type<TT>,type<UU>))>
 
 .. _function-linq_zip_iterator_ls_autoTT_gr__iterator_ls_autoUU_gr__block_ls_l_c_TT;r_c_UU_c_auto_gr_:
 
 .. das:function:: zip(a: iterator<auto(TT)>; b: iterator<auto(UU)>; result_selector: block<(l:TT;r:UU):auto>) : iterator<typedecl(result_selector(type<TT>,type<UU>))>
 
-Merges two iterators into an iterator by applying a specified function
+.. _function-linq_zip_array_ls_autoTT_gr__array_ls_autoUU_gr__array_ls_autoWW_gr_:
+
+.. das:function:: zip(a: array<auto(TT)>; b: array<auto(UU)>; c: array<auto(WW)>) : array<tuple<TT;UU;WW>>
+
+.. _function-linq_zip_iterator_ls_autoTT_gr__iterator_ls_autoUU_gr__iterator_ls_autoWW_gr_:
+
+.. das:function:: zip(a: iterator<auto(TT)>; b: iterator<auto(UU)>; c: iterator<auto(WW)>) : iterator<tuple<TT;UU;WW>>
+
+----
+
+
+zip_to_array
+^^^^^^^^^^^^
+
+.. _function-linq_zip_to_array_iterator_ls_autoTT_gr__iterator_ls_autoUU_gr__iterator_ls_autoWW_gr_:
+
+.. das:function:: zip_to_array(a: iterator<auto(TT)>; b: iterator<auto(UU)>; c: iterator<auto(WW)>) : array<tuple<TT;UU;WW>>
+
+Merges three iterators into an array of tuples
 
 :Arguments: * **a** : iterator<auto(TT)>
 
             * **b** : iterator<auto(UU)>
 
-            * **result_selector** : block<(l:TT;r:UU):auto>
+            * **c** : iterator<auto(WW)>
 
-.. _function-linq_zip_array_ls_autoTT_gr__array_ls_autoUU_gr__block_ls_l_c_TT;r_c_UU_c_auto_gr_:
+.. _function-linq_zip_to_array_iterator_ls_autoTT_gr__iterator_ls_autoUU_gr_:
 
-.. das:function:: zip(a: array<auto(TT)>; b: array<auto(UU)>; result_selector: block<(l:TT;r:UU):auto>) : array<typedecl(result_selector(type<TT>,type<UU>))>
-
-Merges two arrays into an array by applying a specified function
-
-:Arguments: * **a** : array<auto(TT)>
-
-            * **b** : array<auto(UU)>
-
-            * **result_selector** : block<(l:TT;r:UU):auto>
+.. das:function:: zip_to_array(a: iterator<auto(TT)>; b: iterator<auto(UU)>) : array<tuple<TT;UU>>
 
 .. _function-linq_zip_to_array_iterator_ls_autoTT_gr__iterator_ls_autoUU_gr__block_ls_l_c_TT;r_c_UU_c_auto_gr_:
 
 .. das:function:: zip_to_array(a: iterator<auto(TT)>; b: iterator<auto(UU)>; result_selector: block<(l:TT;r:UU):auto>) : array<typedecl(result_selector(type<TT>,type<UU>))>
 
-Merges two iterators into an array by applying a specified function
-
-:Arguments: * **a** : iterator<auto(TT)>
-
-            * **b** : iterator<auto(UU)>
-
-            * **result_selector** : block<(l:TT;r:UU):auto>
+----
 
 +++++++++++++++++++++
-Convertion operations
+Conversion operations
 +++++++++++++++++++++
 
   *  :ref:`to_sequence (a: array\<auto(TT)\>) : iterator\<TT\> <function-linq_to_sequence_array_ls_autoTT_gr_>` 
   *  :ref:`to_sequence_move (var a: array\<auto(TT)\>) : iterator\<TT\> <function-linq_to_sequence_move_array_ls_autoTT_gr_>` 
-  *  :ref:`to_table (var a: iterator\<auto(TT)\>; key: block\<(v:TT):auto\>; elementSelector: block\<(v:TT):auto\>) : table\<typedecl(_::unique_key(type\<TT\>)), typedecl(elementSelector(type\<TT\>))\> <function-linq_to_table_iterator_ls_autoTT_gr__block_ls_v_c_TT_c_auto_gr__block_ls_v_c_TT_c_auto_gr_>` 
   *  :ref:`to_table (a: array\<auto(TT)\>; key: block\<(v:TT):auto\>; elementSelector: block\<(v:TT):auto\>) : table\<typedecl(_::unique_key(type\<TT\>)), typedecl(elementSelector(type\<TT\>))\> <function-linq_to_table_array_ls_autoTT_gr__block_ls_v_c_TT_c_auto_gr__block_ls_v_c_TT_c_auto_gr_>` 
+  *  :ref:`to_table (var a: iterator\<auto(TT)\>; key: block\<(v:TT):auto\>; elementSelector: block\<(v:TT):auto\>) : table\<typedecl(_::unique_key(type\<TT\>)), typedecl(elementSelector(type\<TT\>))\> <function-linq_to_table_iterator_ls_autoTT_gr__block_ls_v_c_TT_c_auto_gr__block_ls_v_c_TT_c_auto_gr_>` 
 
 .. _function-linq_to_sequence_array_ls_autoTT_gr_:
 
@@ -2044,17 +2146,9 @@ Converts an array to an iterator, captures input
 
 :Arguments: * **a** : array<auto(TT)>
 
-.. _function-linq_to_table_iterator_ls_autoTT_gr__block_ls_v_c_TT_c_auto_gr__block_ls_v_c_TT_c_auto_gr_:
 
-.. das:function:: to_table(a: iterator<auto(TT)>; key: block<(v:TT):auto>; elementSelector: block<(v:TT):auto>) : table<typedecl(_::unique_key(type<TT>)), typedecl(elementSelector(type<TT>))>
-
-Converts an iterator to a table
-
-:Arguments: * **a** : iterator<auto(TT)>
-
-            * **key** : block<(v:TT):auto>
-
-            * **elementSelector** : block<(v:TT):auto>
+to_table
+^^^^^^^^
 
 .. _function-linq_to_table_array_ls_autoTT_gr__block_ls_v_c_TT_c_auto_gr__block_ls_v_c_TT_c_auto_gr_:
 
@@ -2068,29 +2162,29 @@ Converts an array to a table
 
             * **elementSelector** : block<(v:TT):auto>
 
+.. _function-linq_to_table_iterator_ls_autoTT_gr__block_ls_v_c_TT_c_auto_gr__block_ls_v_c_TT_c_auto_gr_:
+
+.. das:function:: to_table(a: iterator<auto(TT)>; key: block<(v:TT):auto>; elementSelector: block<(v:TT):auto>) : table<typedecl(_::unique_key(type<TT>)), typedecl(elementSelector(type<TT>))>
+
+----
+
 ++++++++++++++++++++
 Comparators and keys
 ++++++++++++++++++++
 
-  *  :ref:`less (a: auto; b: auto) : bool <function-linq_less_auto_auto>` 
   *  :ref:`less (a: tuple\<auto(TT)\>; b: tuple\<auto(TT)\>) : bool <function-linq_less_tuple_ls_autoTT_gr__tuple_ls_autoTT_gr_>` 
-  *  :ref:`less (a: tuple\<auto(TT);auto(UU)\>; b: tuple\<auto(TT);auto(UU)\>) : bool <function-linq_less_tuple_ls_autoTT;autoUU_gr__tuple_ls_autoTT;autoUU_gr_>` 
+  *  :ref:`less (a: auto; b: auto) : bool <function-linq_less_auto_auto_0x19d>` 
   *  :ref:`less (a: tuple\<auto(TT);auto(UU);auto(VV)\>; b: tuple\<auto(TT);auto(UU);auto(VV)\>) : bool <function-linq_less_tuple_ls_autoTT;autoUU;autoVV_gr__tuple_ls_autoTT;autoUU;autoVV_gr_>` 
+  *  :ref:`less (a: tuple\<auto(TT);auto(UU)\>; b: tuple\<auto(TT);auto(UU)\>) : bool <function-linq_less_tuple_ls_autoTT;autoUU_gr__tuple_ls_autoTT;autoUU_gr_>` 
   *  :ref:`less (a: tuple\<auto(TT);auto(UU);auto(VV);auto(WW)\>; b: tuple\<auto(TT);auto(UU);auto(VV);auto(WW)\>) : bool <function-linq_less_tuple_ls_autoTT;autoUU;autoVV;autoWW_gr__tuple_ls_autoTT;autoUU;autoVV;autoWW_gr_>` 
   *  :ref:`sequence_equal (var first: iterator\<auto(TT)\>; var second: iterator\<auto(TT)\>) : bool <function-linq_sequence_equal_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_>` 
   *  :ref:`sequence_equal (first: array\<auto(TT)\>; second: array\<auto(TT)\>) : bool <function-linq_sequence_equal_array_ls_autoTT_gr__array_ls_autoTT_gr_>` 
   *  :ref:`sequence_equal_by (var first: iterator\<auto(TT)\>; var second: iterator\<auto(TT)\>; key: block\<(arg:TT):auto\>) : bool <function-linq_sequence_equal_by_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_>` 
   *  :ref:`sequence_equal_by (first: array\<auto(TT)\>; second: array\<auto(TT)\>; key: block\<(arg:TT):auto\>) : bool <function-linq_sequence_equal_by_array_ls_autoTT_gr__array_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_>` 
 
-.. _function-linq_less_auto_auto:
 
-.. das:function:: less(a: auto; b: auto) : bool
-
-Compares two values, returns true if first is less than second
-
-:Arguments: * **a** : auto
-
-            * **b** : auto
+less
+^^^^
 
 .. _function-linq_less_tuple_ls_autoTT_gr__tuple_ls_autoTT_gr_:
 
@@ -2102,35 +2196,27 @@ Compares two tuples, returns true if first is less than second
 
             * **b** : tuple<auto(TT)>
 
-.. _function-linq_less_tuple_ls_autoTT;autoUU_gr__tuple_ls_autoTT;autoUU_gr_:
+.. _function-linq_less_auto_auto_0x19d:
 
-.. das:function:: less(a: tuple<auto(TT);auto(UU)>; b: tuple<auto(TT);auto(UU)>) : bool
-
-Compares two tuples, returns true if first is less than second
-
-:Arguments: * **a** : tuple<auto(TT);auto(UU)>
-
-            * **b** : tuple<auto(TT);auto(UU)>
+.. das:function:: less(a: auto; b: auto) : bool
 
 .. _function-linq_less_tuple_ls_autoTT;autoUU;autoVV_gr__tuple_ls_autoTT;autoUU;autoVV_gr_:
 
 .. das:function:: less(a: tuple<auto(TT);auto(UU);auto(VV)>; b: tuple<auto(TT);auto(UU);auto(VV)>) : bool
 
-Compares two tuples, returns true if first is less than second
+.. _function-linq_less_tuple_ls_autoTT;autoUU_gr__tuple_ls_autoTT;autoUU_gr_:
 
-:Arguments: * **a** : tuple<auto(TT);auto(UU);auto(VV)>
-
-            * **b** : tuple<auto(TT);auto(UU);auto(VV)>
+.. das:function:: less(a: tuple<auto(TT);auto(UU)>; b: tuple<auto(TT);auto(UU)>) : bool
 
 .. _function-linq_less_tuple_ls_autoTT;autoUU;autoVV;autoWW_gr__tuple_ls_autoTT;autoUU;autoVV;autoWW_gr_:
 
 .. das:function:: less(a: tuple<auto(TT);auto(UU);auto(VV);auto(WW)>; b: tuple<auto(TT);auto(UU);auto(VV);auto(WW)>) : bool
 
-Compares two tuples, returns true if first is less than second
+----
 
-:Arguments: * **a** : tuple<auto(TT);auto(UU);auto(VV);auto(WW)>
 
-            * **b** : tuple<auto(TT);auto(UU);auto(VV);auto(WW)>
+sequence_equal
+^^^^^^^^^^^^^^
 
 .. _function-linq_sequence_equal_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr_:
 
@@ -2146,11 +2232,11 @@ Checks if two sequences are equal
 
 .. das:function:: sequence_equal(first: array<auto(TT)>; second: array<auto(TT)>) : bool
 
-Checks if two arrays are equal
+----
 
-:Arguments: * **first** : array<auto(TT)>
 
-            * **second** : array<auto(TT)>
+sequence_equal_by
+^^^^^^^^^^^^^^^^^
 
 .. _function-linq_sequence_equal_by_iterator_ls_autoTT_gr__iterator_ls_autoTT_gr__block_ls_arg_c_TT_c_auto_gr_:
 
@@ -2168,12 +2254,6 @@ Checks if two sequences are equal by key
 
 .. das:function:: sequence_equal_by(first: array<auto(TT)>; second: array<auto(TT)>; key: block<(arg:TT):auto>) : bool
 
-Checks if two arrays are equal by key
-
-:Arguments: * **first** : array<auto(TT)>
-
-            * **second** : array<auto(TT)>
-
-            * **key** : block<(arg:TT):auto>
+----
 
 

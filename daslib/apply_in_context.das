@@ -6,6 +6,13 @@ options strict_smart_pointers
 
 module apply_in_context shared private
 
+//! Cross-context function call annotation.
+//!
+//! ``[apply_in_context(agent_name)]`` rewrites a function so that its body
+//! executes inside a named debug-agent context rather than the caller's
+//! context. Useful for debug tooling, caches, and other agent-hosted
+//! services.
+
 require ast
 require daslib/ast_boost
 require daslib/templates_boost
@@ -19,7 +26,7 @@ require debugapi public
 class AppendCondAnnotation : AstFunctionAnnotation {
   //! [apply_in_context] function annotation.
   //! Function is modified, so that it is called in the debug agent context, specified in the annotation.
-  //! If specified context is not insalled, panic is called.
+  //! If specified context is not installed, panic is called.
   //!
   //! For example::
   //!  [apply_in_context(opengl_cache)]

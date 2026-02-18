@@ -5,7 +5,10 @@
 Assert once
 ===========
 
-The assert_once module implements single-time assertion infrastructure.
+The ASSERT_ONCE module provides the ``assert_once`` macro — an assertion that
+triggers only on its first failure. Subsequent failures at the same location
+are silently ignored, preventing assertion storms in loops or frequently
+called code.
 
 All functions and symbols are in "assert_once" module, use require to get access to it. ::
 
@@ -36,7 +39,7 @@ Assertion
 
 .. das:function:: assert_once(expr: bool; message: string = "")
 
-Same as assert, only the check will be not be repeated after the asseretion failed the first time.
+Same as assert, only the check will be not be repeated after the assertion failed the first time.
 
 :Arguments: * **expr** : bool
 

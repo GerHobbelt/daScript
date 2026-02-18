@@ -6,6 +6,13 @@ options strict_smart_pointers
 
 module archive shared private
 
+//! Binary serialization and deserialization framework.
+//!
+//! Provides ``serialize`` generics that read/write daScript values to binary
+//! archives. The `Archive` structure wraps a stream and tracks
+//! read vs. write direction. Supports primitive types, arrays, tables,
+//! variants, tuples, smart pointers, and user-extensible overloads.
+
 require daslib/contracts
 require daslib/apply
 require daslib/templates
@@ -36,7 +43,7 @@ class public MemSerializer : Serializer {
         return <- data
     }
     def getCopyOfData : array<uint8> {
-        //! Returns copy of the data from the seiralizer.
+        //! Returns copy of the data from the serializer.
         var cdata := data
         return <- cdata
     }

@@ -5,11 +5,30 @@
 defer and defer_delete macros
 =============================
 
-Apply module implements `defer` and `defer_delete` pattern, i.e. ability to attach a bit of code or a delete operation to a finally section of the block, without leaving the context of the code.
+The DEFER module implements the ``defer`` pattern — the ability to schedule cleanup
+code to run at scope exit, similar to Go's ``defer``. The deferred block is moved
+to the ``finally`` section of the enclosing scope at compile time.
 
 All functions and symbols are in "defer" module, use require to get access to it. ::
 
     require daslib/defer
+
+Example: ::
+
+    require daslib/defer
+
+        [export]
+        def main() {
+            print("start\n")
+            defer() <| $() {
+                print("cleanup runs last\n")
+            }
+            print("middle\n")
+        }
+        // output:
+        // start
+        // middle
+        // cleanup runs last
 
 ++++++++++++++++++++
 Function annotations
@@ -19,7 +38,7 @@ Function annotations
 
 .. das:attribute:: DeferMacro
 
-This macro covnerts defer() <| block expression
+This macro converts defer() <| block expression
 into {}, and move block to the finally section of the current block
 
 +++++++++++

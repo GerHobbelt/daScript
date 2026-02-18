@@ -6,6 +6,12 @@ options strict_smart_pointers
 
 module assert_once shared private
 
+//! One-shot assertion macro.
+//!
+//! ``assert_once`` works like ``assert`` but fires only on the first failure.
+//! After the first failed check, the assertion is permanently disabled via
+//! an auto-generated global flag variable.
+
 require ast
 require rtti
 require daslib/ast_boost
@@ -13,7 +19,7 @@ require daslib/templates_boost
 
 [tag_function(asset_once_tag)]
 def public assert_once(expr : bool; message : string = "") {
-    //! Same as assert, only the check will be not be repeated after the asseretion failed the first time.
+    //! Same as assert, only the check will be not be repeated after the assertion failed the first time.
     pass
 }
 

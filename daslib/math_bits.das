@@ -6,6 +6,12 @@ options strict_smart_pointers = true
 
 module math_bits shared private
 
+//! Bitwise math and geometric helpers.
+//!
+//! Provides ``int_bits_to_float``, ``float_bits_to_int``, look-at/projection
+//! matrix builders, AABB helpers, Perlin noise, and other low-level
+//! math primitives.
+
 // _rh, _lh - right handed vs left handed
 //  OpenGL, Vulkan - RH
 
@@ -94,7 +100,7 @@ def public double_bits_to_int64(x : double) {
 }
 
 def public float_bits_to_int(x : float2) {
-    //! bit representation of x is interpreted as a int2
+    //! bit representation of x is interpreted as an int2
     unsafe {
         return reinterpret<int2> x
     }

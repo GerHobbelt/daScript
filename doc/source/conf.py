@@ -38,6 +38,8 @@ extensions = [
 templates_path = ['_templates']
 exclude_patterns = ['index/detail/*', 'index/handmade/*']
 
+suppress_warnings = ['toctree.not_included']
+
 # The suffix(es) of source filenames.
 # You can specify multiple suffix as a list of string:
 # source_suffix = ['.rst', '.md']
@@ -97,6 +99,9 @@ exclude_patterns = []
 
 # The name of the Pygments (syntax highlighting) style to use.
 pygments_style = 'sphinx'
+
+# The default language for :: literal blocks.
+highlight_language = 'none'
 
 # A list of ignored prefixes for module index sorting.
 #modindex_common_prefix = []
@@ -209,7 +214,10 @@ htmlhelp_basename = 'daslang_doc'
 # -- Options for LaTeX output ---------------------------------------------
 
 latex_elements = {
-'extrapackages': r'\usepackage{textgreek}'
+'extrapackages': r'''
+\usepackage{textgreek}
+\usepackage{newunicodechar}
+''',
 # The paper size ('letterpaper' or 'a4paper').
 #'papersize': 'letterpaper',
 
@@ -217,7 +225,11 @@ latex_elements = {
 #'pointsize': '10pt',
 
 # Additional stuff for the LaTeX preamble.
-#'preamble': '',
+# This unicode characters is not known to LaTeX.
+'preamble': r'''
+\newunicodechar{✓}{\checkmark}
+\newunicodechar{✗}{\texttimes}
+''',
 
 # Latex figure (float) alignment
 #'figure_align': 'htbp',

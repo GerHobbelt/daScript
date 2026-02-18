@@ -5,7 +5,9 @@
 Cross-context evaluation helpers
 ================================
 
-The apply_in_context module exposes single [apply_in_context] annotation.
+The APPLY_IN_CONTEXT module extends apply operations to work across
+different execution contexts, enabling cross-context function invocation
+with packed arguments.
 
 All functions and symbols are in "apply_in_context" module, use require to get access to it. ::
 
@@ -21,7 +23,7 @@ Function annotations
 
 [apply_in_context] function annotation.
 Function is modified, so that it is called in the debug agent context, specified in the annotation.
-If specified context is not insalled, panic is called.
+If specified context is not installed, panic is called.
 
 For example::
  [apply_in_context(opengl_cache)]

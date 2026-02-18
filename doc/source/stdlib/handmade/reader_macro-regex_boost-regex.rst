@@ -1,1 +1,1 @@
-Reader macro regex. This once comnversts %regex~ macros into regex::Regex objects during compilation time.
+Reader macro that converts ``%regex~`` literals into precompiled ``regex::Regex`` objects at compilation time.

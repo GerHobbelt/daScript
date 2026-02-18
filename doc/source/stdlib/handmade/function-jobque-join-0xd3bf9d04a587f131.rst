@@ -1,1 +1,1 @@
- Wait until channel entry count reaches 0.
+Blocks the current thread until the job or channel's entry count reaches zero, indicating all work is complete.

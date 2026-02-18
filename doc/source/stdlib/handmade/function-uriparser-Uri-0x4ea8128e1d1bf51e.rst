@@ -1,1 +1,1 @@
- Creates new URI.
+Constructs a new empty ``Uri`` object.

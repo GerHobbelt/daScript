@@ -7,6 +7,12 @@ options strict_smart_pointers = true
 
 module rst shared private
 
+//! RST documentation generator.
+//!
+//! Core engine for producing reStructuredText files from compiled
+//! module RTTI. Provides ``document``, ``group_by_regex``,
+//! ``describe_type``, and other helpers used by ``das2rst``.
+
 require fio
 require math
 require rtti
@@ -17,7 +23,7 @@ require daslib/strings_boost
 require daslib/regex
 require daslib/regex_boost
 
-let {
+let { //! Configuration constants for the RST documentation generator.
     log_documentation = false
     show_hidden_groups = false
     STUB = "// stub"
@@ -29,6 +35,11 @@ var public {
     add_stub_header = true
     add_empty_topic = true
     strict_struct_fields = true
+}
+
+def PANIC(message : string) {
+    to_log(LOG_ERROR, "PANIC: {message}\n")
+    unsafe(exit(-1))
 }
 
 def module_name(mod) {
@@ -73,6 +84,7 @@ def call_macro_label_name(mod, value) {
 }
 
 def public safe_function_name(name : string) : string {
+    //! Replaces special characters in a function name to produce a safe RST label identifier.
     return name |> replace_multiple([
         (" ", "_"),
         ("$", "_builtin_"),
@@ -96,25 +108,55 @@ def public safe_function_name(name : string) : string {
 }
 
 def public function_label_file(value : FunctionPtr | Function?; drop_args : int = 0) {
+    //! Generates a unique RST label for a function based on its name and argument types.
     var mn = "{value.name}"
     var drop = drop_args
     for (arg in value.arguments) {
         if (drop-- > 0) {
             continue
         }
-        // if arg._type.baseType == Type autoinfer
-        //     error("autoinfer in function '{value.name}'")
-            // panic("autoinfer in function")
         let prefix = arg._type.flags.removeConstant ? "var " : ""
-        mn += "{prefix}{describe_type_short(arg._type)}"
+        if (arg._type.baseType == Type.autoinfer && arg.init != null) {
+            // During rst_comment (pre-inference), auto-inferred default arg types
+            // are unresolved. Determine the type from the init expression so the
+            // hash matches what das2rst (post-inference) produces.
+            let rtti = "{arg.init.__rtti}"
+            if (rtti == "ExprConstDouble") {
+                mn += "{prefix}double"
+            } elif (rtti == "ExprConstFloat") {
+                mn += "{prefix}float"
+            } elif (rtti == "ExprConstString") {
+                mn += "{prefix}string"
+            } elif (rtti == "ExprConstBool") {
+                mn += "{prefix}bool"
+            } elif (rtti == "ExprConstInt") {
+                mn += "{prefix}int"
+            } elif (rtti == "ExprConstUInt") {
+                mn += "{prefix}uint"
+            } elif (rtti == "ExprConstInt64") {
+                mn += "{prefix}int64"
+            } elif (rtti == "ExprConstUInt64") {
+                mn += "{prefix}uint64"
+            } elif (rtti == "ExprConstInt8") {
+                mn += "{prefix}int8"
+            } elif (rtti == "ExprConstUInt8") {
+                mn += "{prefix}uint8"
+            } elif (rtti == "ExprConstInt16") {
+                mn += "{prefix}int16"
+            } elif (rtti == "ExprConstUInt16") {
+                mn += "{prefix}uint16"
+            } else {
+                mn += "{prefix}auto"
+            }
+        } else {
+            mn += "{prefix}{describe_type_short(arg._type)}"
+        }
     }
-    // if value.name == "player_flash_blindness_es"
-    //     print("deep: {mn} {hash(mn)}\n")
-    //     stackwalk(false, false)
     return "{safe_function_name(string(value.name))}-{hash(mn)}"
 }
 
 def public function_label_file(name; value : smart_ptr<TypeDecl>&; drop_args : int = 0) {
+    //! Generates a unique RST label for a function type based on its name and argument types.
     var mn = "{name}"
     var drop = drop_args
     for (arg in value.argTypes) {
@@ -123,7 +165,7 @@ def public function_label_file(name; value : smart_ptr<TypeDecl>&; drop_args : i
         }
         // if arg.baseType == Type autoinfer
         //     error("autoinfer in function '{name}'")
-            // panic("autoinfer in function")
+            // PANIC("autoinfer in function")
         let prefix = arg.flags.removeConstant ? "var " : ""
         mn += "{prefix}{describe_type_short(arg)}"
     }
@@ -154,13 +196,22 @@ def function_short_mangled_name(value : FunctionPtr | Function?) {
 def function_label_name(value : FunctionPtr | Function?) {
     let mn = function_short_mangled_name(value)
     let res = "function-{safe_function_name(mn)}"
-    if (false) {
-        fopen("function_names.txt", "ab") <| $(f) {
-            if (f != null) {
-                fwrite(f, "{function_label_name0(value)}\n")
-                fwrite(f, "{res}\n")
-            }
+    // For generic functions, append a line suffix to disambiguate overloads
+    // that have the same short mangled name
+    var is_generic = false
+    for (arg in value.arguments) {
+        if (arg._type.baseType == Type.autoinfer) {
+            is_generic = true
+            break
         }
+    }
+    if (is_generic) {
+        return "{res}_{value.at.line}"
+    }
+    // For class/struct methods, operators like []=, []&&=, []||= collapse
+    // to the same safe name. Disambiguate with line number.
+    if (value.flags.isClassMethod) {
+        return "{res}_{value.at.line}"
     }
     return res
 }
@@ -206,7 +257,7 @@ def cleanup_type_short(name : string) {
 
 def describe_type_short(td : TypeDeclPtr) {
     if (td == null) {
-        panic("describe_type_short: null type")
+        PANIC("describe_type_short: null type")
     }
     if (!empty(td.alias) && !td.isAuto && !td.isAlias) {
         return string(td.alias)
@@ -287,6 +338,7 @@ def describe_type_short(td : TypeDeclPtr) {
 }
 
 def public describe_short(expr : Expression? | smart_ptr<Expression>&) {
+    //! Returns a short description of an expression, using empty parentheses for empty make-structs.
     if (expr is ExprMakeStruct) {
         let str = expr as ExprMakeStruct
         var count = 0
@@ -541,6 +593,7 @@ def make_ref(name, text : string) {
 }
 
 def public make_group(name : string; plus : string = "+") {
+    //! Creates an RST group header with the given name surrounded by separator lines.
     let len = length(name)
     return "{strings::repeat(plus,len)}\n{name}\n{strings::repeat(plus,len)}\n\n"
 }
@@ -705,7 +758,7 @@ def document_function_topic(doc_file : file; resType : smart_ptr<TypeDecl>&; top
                 if (!found) {
                     var inscope names <- [for (arg in args); arg[0]]
                     error("function {topic} has no argument '{name}' names {names}")
-                    panic("invalid documentation")
+                    PANIC("invalid documentation")
                 }
             } elif (l |> starts_with(":returns:")) {
                 lines[lineIdx] = l |> replace(":returns:", ":Returns: * {describe_type(resType)} - ")
@@ -725,7 +778,7 @@ def document_function_topic(doc_file : file; resType : smart_ptr<TypeDecl>&; top
             for (i in range(1, length(args))) {
                 if (length(args[i]) < length(args[0])) {
                     error("function {topic} doesn't have enough documentation for argument {args[i][0]}")
-                    panic("invalid documentation")
+                    PANIC("invalid documentation")
                     while (length(args[i]) < length(args[0])) {
                         args[i] |> push("")
                     }
@@ -761,12 +814,15 @@ def document_topic(header : string; doc_file : file; topic, content : string imp
 
         var hasDoc = false
         txt |> replace("\r\n", "\n") |> split("\n") <| $(lines) {
-            let got = length(lines) - (length(lines) > 0 && trim(lines[length(lines) - 1]) == "" ? 1 : 0)
+            var got = length(lines)
+            while (got > 0 && trim(lines[got - 1]) == "") {
+                got -= 1
+            }
             let expected = length(tab) - 1
             if (got < expected) {
                 if (strict_struct_fields) {
                     error("{topic} has less documentation than values. Expected {expected} ({[for (it in tab); it[0]]}), got {got}\n")
-                    panic("invalid documentation")
+                    PANIC("invalid documentation")
                 }
 
                 for (i in range(got)) {
@@ -830,7 +886,7 @@ def document_topic(doc_file : file; topic, content : string implicit; cb : block
                     fwrite(topic_file, "{content}\n")
                 }
             } else {
-                panic("can't open {topic_file_name}")
+                PANIC("can't open {topic_file_name}")
             }
         }
     }
@@ -842,7 +898,7 @@ def document_topic(doc_file : file; topic, content : string implicit; cb : block
                 fwrite(doc_file, instxt)
                 fwrite(doc_file, "\n")
             } else {
-                panic("can't open {topic_file_name}")
+                PANIC("can't open {topic_file_name}")
             }
         }
     } elif (add_empty_topic) {
@@ -997,6 +1053,7 @@ def document_global_constants(doc_file : file; mods : array<Module?>) {
 }
 
 def public document_enumeration(doc_file : file; mod : Module?; value) {
+    //! Writes RST documentation for a single enumeration to the doc file.
     fwrite(doc_file, make_label(enum_label_name(value)))
     fwrite(doc_file, make_domain("das:attribute"))
     fwrite(doc_file, "{value.name}\n\n")
@@ -1013,6 +1070,7 @@ def public document_enumeration(doc_file : file; mod : Module?; value) {
 
 
 def public document_enumerations(doc_file : file; mods : array<Module?>) : bool {
+    //! Writes RST documentation for all public enumerations across the given modules.
     var any = false
     for (mod in mods) {
         if (any) {
@@ -1121,6 +1179,55 @@ def document_class_method(doc_file : file; mod : Module?; value; var fld) {
     //     fwrite(doc_file,"``{fld.name}`` returns {describe_type(fld._type.firstType)}\n\n")
     var args <- document_function_arguments(doc_file, argNames, argTypes, /*skip args*/1)
     document_function_topic(doc_file, func.result, topic("function", mod, "{value.name}-{function_label_file(fld.name, fld.init._type, 1)}"), "def {fld.name} : {describe(fld._type)}", args)
+}
+
+def document_struct_method(doc_file : file; mod : Module?; value; var func) {
+    // For structs (not classes), methods become module-level functions with isClassMethod flag.
+    // Static methods get names like "BoolArray`clear"; non-static keep names like "[]", "finalize".
+    // We use moreFlags.isStaticClassMethod to distinguish them and rebuild the detail file key.
+    let fname = string(func.name)
+    let is_static = func.moreFlags.isStaticClassMethod
+    var method_name : string
+    if (is_static) {
+        let structPrefix = "{value.name}`"
+        method_name = fname |> slice(length(structPrefix))
+    } else {
+        method_name = fname
+    }
+
+    fwrite(doc_file, make_label(function_label_name(func)))
+
+    let argNames <- [for (arg in func.arguments); string(arg.name)]
+    let argTypes <- [for (arg in func.arguments); get_ptr(arg._type)]
+    let argInits <- [for (arg in func.arguments); get_ptr(arg.init)]
+    (document_function_declaration(doc_file, "das:function", "{value.name}.{method_name}",
+        argNames, argTypes, argInits, func.result, /*drop args*/1))
+
+    if (func.flags.unsafeOperation) {
+        document_warning(doc_file, "This is unsafe operation.")
+    }
+    if (func.moreFlags.deprecated) {
+        document_warning(doc_file, "This function is deprecated.")
+    }
+
+    var args <- document_function_arguments(doc_file, argNames, argTypes, /*skip args*/1)
+
+    // Build topic key matching rst_comment.das pre-inference output.
+    // Pre-inference: method name is unqualified, and:
+    //   non-static methods (isStaticClassMethod=false): self NOT in args (added during inference) → skip 1 for hash
+    //   static methods (isStaticClassMethod=true): self IS in args (explicit) → skip 0 for hash
+    let hash_drop = is_static ? 0 : 1
+    var mn = method_name
+    var drop = hash_drop
+    for (arg in func.arguments) {
+        if (drop-- > 0) {
+            continue
+        }
+        let prefix = arg._type.flags.removeConstant ? "var " : ""
+        mn += "{prefix}{describe_type_short(arg._type)}"
+    }
+    let file_label = "{safe_function_name(method_name)}-{hash(mn)}"
+    document_function_topic(doc_file, func.result, topic("function", mod, "{value.name}-{file_label}"), "def {value.name}.{method_name}", args)
 }
 
 def make_requirements_list(value : smart_ptr<ast::Structure>) {
@@ -1271,7 +1378,7 @@ def document_typemacro(doc_file : file; mod : Module?; value) {
             var tab : array<array<string>>
             for (arg in ann.arguments) {
                 if (first) {
-                    fwrite(doc_file, make_label(call_macro_label_name(mod, value)))
+                    fwrite(doc_file, make_label(call_macro_label_name(mod, string(arg.name))))
                     fwrite(doc_file, make_domain("das:attribute"))
                     fwrite(doc_file, "type macro {arg.name}")
                     fwrite(doc_file, "\n\n")
@@ -1366,6 +1473,26 @@ def document_structure(doc_file : file; mod : Module?; var value : StructurePtr)
         if (is_class_method(value, fld) && !(fld.flags.generated) && !fld.flags.privateField && !(fld.flags.parentType) && (fld.flags.implemented)) {
             document_class_method(doc_file, mod, value, fld)
         }
+    }
+
+    // Document struct methods (module-level functions with isClassMethod flag).
+    // For structs (unlike classes), methods are not stored as struct fields after inference.
+    for_each_function(mod, "") <| $(func) {
+        if (!func.flags.isClassMethod || func.classParent != value) {
+            return
+        }
+        if (func.flags.generated) {
+            return
+        }
+        // Skip constructors (handled below)
+        if (func.name == value.name) {
+            return
+        }
+        // Skip property functions (handled below)
+        if (string(func.name) |> starts_with(".`")) {
+            return
+        }
+        document_struct_method(doc_file, mod, value, func)
     }
 
     var inscope annT <- new TypeDecl(baseType = Type.tStructure, structType = get_ptr(value))
@@ -1702,7 +1829,7 @@ def document_variant_macro(doc_file : file; mod : Module?; value : string implic
     fwrite(doc_file, make_label(call_macro_label_name(mod, value)))
     fwrite(doc_file, make_domain("das:attribute"))
     fwrite(doc_file, "{value}\n\n")
-    document_topic(doc_file, topic("variant_macro", mod, value), "Varian macro {value}")
+    document_topic(doc_file, topic("variant_macro", mod, value), "Variant macro {value}")
 }
 
 def document_variant_macros(doc_file : file; mods : array<Module?>) {
@@ -1847,7 +1974,7 @@ def function_name(func : FunctionPtr | Function?) {
     return name
 }
 
-def document_function(doc_file : file; mod : Module?; var func : FunctionPtr | Function?; drop_args : int = 0; prefix : string = ""; objType : string = "das:function") {
+def document_function(doc_file : file; mod : Module?; var func : FunctionPtr | Function?; drop_args : int = 0; prefix : string = ""; objType : string = "das:function"; skip_body : bool = false) {
     let argNames <- [for (arg in func.arguments); string(arg.name)]
     let argTypes <- [for (arg in func.arguments); get_ptr(arg._type)]
     let argInits <- [for (arg in func.arguments); get_ptr(arg.init)]
@@ -1855,6 +1982,9 @@ def document_function(doc_file : file; mod : Module?; var func : FunctionPtr | F
     let funcSafeName = function_name(func)
     (document_function_declaration(doc_file, objType, funcSafeName,
         argNames, argTypes, argInits, func.result, drop_args))
+    if (skip_body) {
+        return
+    }
     // if func.result != null && !func.result.isVoid
     //     fwrite(doc_file,"``{funcSafeName}`` returns {describe_type(func.result)}\n\n")
     if (func.flags.unsafeOperation) {
@@ -1865,7 +1995,7 @@ def document_function(doc_file : file; mod : Module?; var func : FunctionPtr | F
     }
 
     var args <- document_function_arguments(doc_file, argNames, argTypes, drop_args)
-    document_function_topic(doc_file, func.result, topic("function", mod, "{prefix}{function_label_file(func,drop_args)}"), "def {describe_function(unsafe(reinterpret<FunctionPtr> func))}", args)
+    document_function_topic(doc_file, func.result, topic("function", mod, "{prefix}{function_label_file(func,drop_args)}"), "def {rst_describe_function_short(func)}", args)
 }
 
 
@@ -1882,6 +2012,7 @@ def document_functions(doc_file : file; mods : array<Module?>; var groups : arra
                 if (grp.hidden) {
                     document_warning(doc_file, "This group of functions is hidden. It will not be in the final documentation.")
                 }
+                grp.func |> sort($(a, b) => function_name(a.fn) < function_name(b.fn))
                 for (func in grp.func) {
                     if (!key_exists(tab, func.fn)) {
                         let descr = rst_describe_function_short(func.fn)
@@ -1890,12 +2021,49 @@ def document_functions(doc_file : file; mods : array<Module?>; var groups : arra
                     }
                 }
                 fwrite(doc_file, "\n")
+                // build set of names that have multiple overloads
+                var multi_overload : table<string>
+                var prev_count_name = ""
+                var count_run = 0
+                for (func in grp.func) {
+                    if (!tab.key_exists(func.fn)) {
+                        let cur_name = function_name(func.fn)
+                        if (cur_name == prev_count_name) {
+                            count_run += 1
+                            if (count_run == 2) {
+                                multi_overload |> insert(cur_name)
+                            }
+                        } else {
+                            prev_count_name = cur_name
+                            count_run = 1
+                        }
+                    }
+                }
+                var prev_func_name = ""
+                var prev_was_overload_group = false
                 for (func in grp.func) {
                     if (tab.key_exists(func.fn)) {
                         continue
                     }
                     tab.insert(func.fn)
-                    document_function(doc_file, func.mod, func.fn)
+                    let cur_name = function_name(func.fn)
+                    let is_overload = cur_name == prev_func_name
+                    if (!is_overload) {
+                        if (prev_was_overload_group) {
+                            fwrite(doc_file, "----\n\n")
+                        }
+                        if (multi_overload |> key_exists(cur_name)) {
+                            fwrite(doc_file, "\n{cur_name}\n{strings::repeat("^", length(cur_name))}\n\n")
+                            prev_was_overload_group = true
+                        } else {
+                            prev_was_overload_group = false
+                        }
+                    }
+                    document_function(doc_file, func.mod, func.fn, 0, "", "das:function", is_overload)
+                    prev_func_name = cur_name
+                }
+                if (prev_was_overload_group) {
+                    fwrite(doc_file, "----\n\n")
                 }
             }
         }
@@ -1952,6 +2120,7 @@ def debug_group(var group : DocGroup) {
 }
 
 def public append_to_group_by_regex(var group : DocGroup; var mod : Module?; var reg : Regex) : DocGroup& {
+    //! Appends functions whose names match the given regex to an existing DocGroup.
     for_each_function(mod, "") <| $(func) {
         if (function_needs_documenting(func)) {
             if (regex_match(reg, string(func.name)) != -1) {
@@ -2058,7 +2227,7 @@ def private generate_substitute_stub(mod : Module?; substname : string) {
                 }
             }
         } else {
-            panic("can't generate stub at {substname}\n")
+            PANIC("can't generate stub at {substname}\n")
         }
     }
 }
@@ -2073,23 +2242,25 @@ def public document(name : string; var mod : Module?; fname : string; var groups
 }
 
 struct public DocsHook {
+    //! Callback hooks for customizing RST documentation output.
     annotationFilter : lambda<(ann : rtti::Annotation const) : bool>
     afterEnums : lambda<(var f : FILE const?; was_enums : bool) : void>
 }
 
 
 def public documents(name : string; mods : array<Module?>; fname : string; var groups : array<DocGroup>; var hook : DocsHook = DocsHook()) {
+    //! Generates complete RST documentation for a set of modules into the specified file.
     static_if (log_documentation) {
         print("Documenting {name} into {fname}\n")
     }
     if (length(mods) == 0) {
-        panic("missing module {name}")
+        PANIC("missing module {name}")
     }
     let path = "{topic_root}/{fname}"
     mkdir_rec(dir_name(path))
     var doc_file = fopen(path, "wb")
     if (doc_file == null) {
-        panic("can't open {path}")
+        PANIC("can't open {path}")
     }
     fwrite(doc_file, "\n")
     var mod_name = string(mods[0].name)

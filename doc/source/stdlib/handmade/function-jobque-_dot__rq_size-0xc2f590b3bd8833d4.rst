@@ -1,1 +1,1 @@
-Number of remaining elements, which were previously appended.
+Returns the current entry count of the JobStatus or Channel.

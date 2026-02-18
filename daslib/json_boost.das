@@ -6,6 +6,13 @@ options strict_smart_pointers = true
 
 module json_boost shared public
 
+//! JSON ↔ struct automatic serialization.
+//!
+//! Generates ``from_JsValue`` and ``to_JsValue`` conversions for user
+//! structs using compile-time reflection. Also provides the ``%json~``
+//! reader macro for embedding JSON literals in source code.
+//! Requires the ``json`` module.
+
 require rtti public
 require ast
 require strings
@@ -171,7 +178,7 @@ def private is_json_ptr_value(td : TypeDeclPtr) {
 [variant_macro(name="better_json")]
 class private BetterJsonMacro : AstVariantMacro {
     //! This macro is used to implement `is json_value` and `as json_value` runtime checks.
-    //! It essencially substitutes `value as name` with `value.value as name` and `value is name` with `value.value is name`.
+    //! It essentially substitutes `value as name` with `value.value as name` and `value is name` with `value.value is name`.
     def override visitExprIsVariant(prog : ProgramPtr; mod : Module?; expr : smart_ptr<ExprIsVariant>) : ExpressionPtr {
         //! Visit ExprIsVariant node.
         if (is_json_ptr_value(expr.value._type)) {
@@ -415,6 +422,7 @@ def from_JV(v : JsonValue const explicit?; anything : table< auto(KT); auto(VT) 
 }
 
 struct public JsonFieldState {
+    //! Per-field serialization options for JSON struct conversion.
     argName : string        //! name of the field in JSON
     enumAsInt : bool        //! whether to parse enum as integer
     unescape : bool         //! whether to unescape strings

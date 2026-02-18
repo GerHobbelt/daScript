@@ -6,6 +6,14 @@ options strict_smart_pointers
 
 module templates shared private
 
+//! Template and type-introspection macros.
+//!
+//! Provides ``decltype`` / ``decltype_noref`` macros for obtaining
+//! compile-time ``TypeDecl`` values, and the ``[template]`` function
+//! annotation for removing template-only arguments from instantiated
+//! generic functions.
+//! See also ``templates_boost`` for template substitution and code generation.
+
 require ast
 require rtti
 require daslib/ast_boost

@@ -5,63 +5,56 @@
 Boost package for string manipulation library
 =============================================
 
-The STRINGS boost module implements collection of helper macros and functions to accompany :ref:`STRINGS <stdlib_strings>`.
+The STRINGS_BOOST module extends string handling with splitting, joining,
+padding, character replacement, and edit distance computation.
 
 All functions and symbols are in "strings_boost" module, use require to get access to it. ::
 
     require daslib/strings_boost
 
+Example: ::
+
+    require daslib/strings_boost
+
+        [export]
+        def main() {
+            let parts = split("one,two,three", ",")
+            print("split: {parts}\n")
+            print("join: {join(parts, " | ")}\n")
+            print("[{wide("hello", 10)}]\n")
+            print("distance: {levenshtein_distance("kitten", "sitting")}\n")
+        }
+        // output:
+        // split: [[ one; two; three]]
+        // join: one | two | three
+        // [hello     ]
+        // distance: 3
+
 ++++++++++++++
 Split and join
 ++++++++++++++
 
-  *  :ref:`split (text: string implicit; delim: string implicit) : array\<string\> <function-strings_boost_split_string_implicit_string_implicit>` 
-  *  :ref:`split_by_chars (text: string implicit; delim: string implicit) : array\<string\> <function-strings_boost_split_by_chars_string_implicit_string_implicit>` 
-  *  :ref:`join (it: auto; separator: string implicit) : auto <function-strings_boost_join_auto_string_implicit>` 
-  *  :ref:`join (var it: iterator\<auto(TT)\>; separator: string implicit) : auto <function-strings_boost_join_iterator_ls_autoTT_gr__string_implicit>` 
+  *  :ref:`join (it: auto; separator: string implicit) : auto <function-strings_boost_join_auto_string_implicit_0x1d>` 
   *  :ref:`join (iterable: array\<auto(TT)\>; separator: string; blk: block\<(var writer:StringBuilderWriter;elem:TT):void\>) : string <function-strings_boost_join_array_ls_autoTT_gr__string_block_ls_var_writer_c_StringBuilderWriter;elem_c_TT_c_void_gr_>` 
+  *  :ref:`join (var it: iterator\<auto(TT)\>; separator: string implicit) : auto <function-strings_boost_join_iterator_ls_autoTT_gr__string_implicit>` 
   *  :ref:`join (var iterable: iterator\<auto(TT)\>; separator: string; blk: block\<(var writer:StringBuilderWriter;elem:TT):void\>) : string <function-strings_boost_join_iterator_ls_autoTT_gr__string_block_ls_var_writer_c_StringBuilderWriter;elem_c_TT_c_void_gr_>` 
-  *  :ref:`join (iterable: auto(TT)[]; separator: string; blk: block\<(var writer:StringBuilderWriter;elem:TT):void\>) : string <function-strings_boost_join_autoTT_string_block_ls_var_writer_c_StringBuilderWriter;elem_c_TT_c_void_gr_>` 
+  *  :ref:`join (iterable: auto(TT)[]; separator: string; blk: block\<(var writer:StringBuilderWriter;elem:TT):void\>) : string <function-strings_boost_join_autoTT_string_block_ls_var_writer_c_StringBuilderWriter;elem_c_TT_c_void_gr__0x64>` 
+  *  :ref:`split (text: string implicit; delim: string implicit) : array\<string\> <function-strings_boost_split_string_implicit_string_implicit>` 
   *  :ref:`split (text: string implicit; delim: string implicit; blk: block\<(arg:array\<string\>#):auto\>) : auto <function-strings_boost_split_string_implicit_string_implicit_block_ls_arg_c_array_ls_string_gr__hh__c_auto_gr_>` 
+  *  :ref:`split_by_chars (text: string implicit; delim: string implicit) : array\<string\> <function-strings_boost_split_by_chars_string_implicit_string_implicit>` 
   *  :ref:`split_by_chars (text: string implicit; delim: string implicit; blk: block\<(arg:array\<string\>#):auto\>) : auto <function-strings_boost_split_by_chars_string_implicit_string_implicit_block_ls_arg_c_array_ls_string_gr__hh__c_auto_gr_>` 
 
-.. _function-strings_boost_split_string_implicit_string_implicit:
 
-.. das:function:: split(text: string implicit; delim: string implicit) : array<string>
+join
+^^^^
 
-Splits a string into an array of substrings based on the specified delimiter.
-
-:Arguments: * **text** : string implicit
-
-            * **delim** : string implicit
-
-.. _function-strings_boost_split_by_chars_string_implicit_string_implicit:
-
-.. das:function:: split_by_chars(text: string implicit; delim: string implicit) : array<string>
-
-Splits the input string into an array of substrings based on the specified delimiter characters.
-
-:Arguments: * **text** : string implicit
-
-            * **delim** : string implicit
-
-.. _function-strings_boost_join_auto_string_implicit:
+.. _function-strings_boost_join_auto_string_implicit_0x1d:
 
 .. das:function:: join(it: auto; separator: string implicit) : auto
 
-Joins the elements of an iterable into a single string, separated by the specified separator.
+Joins the elements of an iterable into a single string using the specified separator.
 
 :Arguments: * **it** : auto
-
-            * **separator** : string implicit
-
-.. _function-strings_boost_join_iterator_ls_autoTT_gr__string_implicit:
-
-.. das:function:: join(it: iterator<auto(TT)>; separator: string implicit) : auto
-
-Joins the elements of an iterable into a single string, separated by the specified separator.
-
-:Arguments: * **it** : iterator<auto(TT)>
 
             * **separator** : string implicit
 
@@ -69,60 +62,59 @@ Joins the elements of an iterable into a single string, separated by the specifi
 
 .. das:function:: join(iterable: array<auto(TT)>; separator: string; blk: block<(var writer:StringBuilderWriter;elem:TT):void>) : string
 
-Joins the elements of an array into a single string, separated by the specified separator, using a custom block to convert each element to a string.
-:Arguments: * **iterable** : array<auto(TT)>
+.. _function-strings_boost_join_iterator_ls_autoTT_gr__string_implicit:
 
-            * **separator** : string
-
-            * **blk** : block<(writer: :ref:`StringBuilderWriter <handle-strings-StringBuilderWriter>` ;elem:TT):void>
+.. das:function:: join(it: iterator<auto(TT)>; separator: string implicit) : auto
 
 .. _function-strings_boost_join_iterator_ls_autoTT_gr__string_block_ls_var_writer_c_StringBuilderWriter;elem_c_TT_c_void_gr_:
 
 .. das:function:: join(iterable: iterator<auto(TT)>; separator: string; blk: block<(var writer:StringBuilderWriter;elem:TT):void>) : string
 
-Joins the elements of an iterable into a single string, separated by the specified separator, using a custom block to convert each element to a string.
-
-:Arguments: * **iterable** : iterator<auto(TT)>
-
-            * **separator** : string
-
-            * **blk** : block<(writer: :ref:`StringBuilderWriter <handle-strings-StringBuilderWriter>` ;elem:TT):void>
-
-.. _function-strings_boost_join_autoTT_string_block_ls_var_writer_c_StringBuilderWriter;elem_c_TT_c_void_gr_:
+.. _function-strings_boost_join_autoTT_string_block_ls_var_writer_c_StringBuilderWriter;elem_c_TT_c_void_gr__0x64:
 
 .. das:function:: join(iterable: auto(TT)[]; separator: string; blk: block<(var writer:StringBuilderWriter;elem:TT):void>) : string
 
-Joins the elements of an array into a single string, separated by the specified separator, using a custom block to convert each element to a string.
+----
 
-:Arguments: * **iterable** : auto(TT)[-1]
 
-            * **separator** : string
+split
+^^^^^
 
-            * **blk** : block<(writer: :ref:`StringBuilderWriter <handle-strings-StringBuilderWriter>` ;elem:TT):void>
+.. _function-strings_boost_split_string_implicit_string_implicit:
+
+.. das:function:: split(text: string implicit; delim: string implicit) : array<string>
+
+Splits a string by the specified delimiter characters, invoking a block for each resulting substring.
+
+:Arguments: * **text** : string implicit
+
+            * **delim** : string implicit
 
 .. _function-strings_boost_split_string_implicit_string_implicit_block_ls_arg_c_array_ls_string_gr__hh__c_auto_gr_:
 
 .. das:function:: split(text: string implicit; delim: string implicit; blk: block<(arg:array<string>#):auto>) : auto
 
-Splits a string into substrings based on the specified delimiter characters, invoking a custom block for each substring.
+----
+
+
+split_by_chars
+^^^^^^^^^^^^^^
+
+.. _function-strings_boost_split_by_chars_string_implicit_string_implicit:
+
+.. das:function:: split_by_chars(text: string implicit; delim: string implicit) : array<string>
+
+Splits a string by the specified delimiter characters and returns an array of substrings.
 
 :Arguments: * **text** : string implicit
 
             * **delim** : string implicit
-
-            * **blk** : block<(arg:array<string>#):auto>
 
 .. _function-strings_boost_split_by_chars_string_implicit_string_implicit_block_ls_arg_c_array_ls_string_gr__hh__c_auto_gr_:
 
 .. das:function:: split_by_chars(text: string implicit; delim: string implicit; blk: block<(arg:array<string>#):auto>) : auto
 
-Splits a string into substrings based on the specified delimiter characters, invoking a custom block for each substring.
-
-:Arguments: * **text** : string implicit
-
-            * **delim** : string implicit
-
-            * **blk** : block<(arg:array<string>#):auto>
+----
 
 ++++++++++
 Formatting
@@ -134,7 +126,7 @@ Formatting
 
 .. das:function:: wide(text: string implicit; width: int) : string
 
-Pads the given string to the specified width by appending spaces if necessary.
+Pads the string with trailing spaces to reach the specified minimum width.
 
 :Arguments: * **text** : string implicit
 
@@ -144,27 +136,19 @@ Pads the given string to the specified width by appending spaces if necessary.
 Queries and comparisons
 +++++++++++++++++++++++
 
-  *  :ref:`is_character_at (foo: array\<uint8\>; idx: int; ch: int) : auto <function-strings_boost_is_character_at_array_ls_uint8_gr__int_int>` 
   *  :ref:`eq (a: string implicit; b: das_string) : auto <function-strings_boost_eq_string_implicit_das_string>` 
   *  :ref:`eq (b: das_string; a: string implicit) : auto <function-strings_boost_eq_das_string_string_implicit>` 
+  *  :ref:`is_character_at (foo: array\<uint8\>; idx: int; ch: int) : auto <function-strings_boost_is_character_at_array_ls_uint8_gr__int_int>` 
 
-.. _function-strings_boost_is_character_at_array_ls_uint8_gr__int_int:
 
-.. das:function:: is_character_at(foo: array<uint8>; idx: int; ch: int) : auto
-
-Returns whether the character at the specified index in the byte array matches the given character code.
-
-:Arguments: * **foo** : array<uint8> implicit
-
-            * **idx** : int
-
-            * **ch** : int
+eq
+^^
 
 .. _function-strings_boost_eq_string_implicit_das_string:
 
 .. das:function:: eq(a: string implicit; b: das_string) : auto
 
-Compares a string with a das_string for equality.
+Compares a ``string`` with a ``das_string`` for equality, returning ``true`` if they match.
 
 :Arguments: * **a** : string implicit
 
@@ -174,11 +158,19 @@ Compares a string with a das_string for equality.
 
 .. das:function:: eq(b: das_string; a: string implicit) : auto
 
-Compares a das_string with a string for equality.
+----
 
-:Arguments: * **b** :  :ref:`das_string <handle-builtin-das_string>` 
+.. _function-strings_boost_is_character_at_array_ls_uint8_gr__int_int:
 
-            * **a** : string implicit
+.. das:function:: is_character_at(foo: array<uint8>; idx: int; ch: int) : auto
+
+Returns ``true`` if the byte at the specified index in the array equals the given character code.
+
+:Arguments: * **foo** : array<uint8> implicit
+
+            * **idx** : int
+
+            * **ch** : int
 
 +++++++
 Replace
@@ -190,7 +182,7 @@ Replace
 
 .. das:function:: replace_multiple(source: string; replaces: array<tuple<text:string;replacement:string>>) : string
 
-Replaces multiple substrings in the source string according to the provided list of replacements.
+Applies multiple find-and-replace substitutions to a string in a single pass.
 
 :Arguments: * **source** : string
 
@@ -207,7 +199,7 @@ Levenshtein distance
 
 .. das:function:: levenshtein_distance(s: string implicit; t: string implicit) : int
 
-Returns the Levenshtein distance between two strings.
+Computes the Levenshtein edit distance between two strings.
 
 :Arguments: * **s** : string implicit
 
@@ -217,7 +209,7 @@ Returns the Levenshtein distance between two strings.
 
 .. das:function:: levenshtein_distance_fast(s: string implicit; t: string implicit) : int
 
-Returns the Levenshtein distance between two strings, which is a measure of the difference between them.
+Computes the Levenshtein edit distance between two strings using an optimized algorithm.
 
 :Arguments: * **s** : string implicit
 

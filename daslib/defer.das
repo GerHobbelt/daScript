@@ -6,6 +6,12 @@ options strict_smart_pointers = true
 
 module defer shared private
 
+//! Defer and defer_delete macros.
+//!
+//! ``defer`` moves a block of code to the ``finally`` section of the enclosing scope,
+//! ensuring it runs on scope exit (similar to Go's ``defer``). ``defer_delete`` is deprecated
+//! in favor of ``var inscope``.
+
 require ast
 require rtti
 require daslib/ast_boost
@@ -31,7 +37,7 @@ def public nada() {
 
 [tag_function_macro(tag="defer_tag")]
 class DeferMacro : AstFunctionAnnotation {
-    //! This macro covnerts defer() <| block expression
+    //! This macro converts defer() <| block expression
     //! into {}, and move block to the finally section of the current block
     def override transform(var call : smart_ptr<ExprCallFunc>; var errors : das_string) : ExpressionPtr {
         var success = true

@@ -5,7 +5,9 @@
 Boost package for the builtin sort
 ==================================
 
-The sort_boost module implements additional infrastructure for the sorting routines.
+The SORT_BOOST module provides the ``qsort`` macro that uniformly sorts
+built-in arrays, dynamic arrays, and C++ handled vectors using the same
+syntax. It automatically wraps handled types in ``temp_array`` as needed.
 
 All functions and symbols are in "sort_boost" module, use require to get access to it. ::
 
@@ -19,7 +21,7 @@ Call macros
 
 .. das:attribute:: qsort
 
-Implements `qsort` macro. I'ts `qsort(value,block)`.
+Implements `qsort` macro. It's `qsort(value,block)`.
 For the regular array<> or dim it's replaced with `sort(value,block)`.
 For the handled types like das`vector its replaced with `sort(temp_array(value),block)`.
 
