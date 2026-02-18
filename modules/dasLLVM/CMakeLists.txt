@@ -6,12 +6,6 @@ IF ((NOT DAS_LLVM_INCLUDED) AND ((NOT ${DAS_LLVM_DISABLED}) OR (NOT DEFINED DAS_
 
     LIST(APPEND CMAKE_MODULE_PATH ${DAS_LLVM_DIR})
 
-	SET(DAS_LLVM_MODULE_SRC
-		${DAS_LLVM_DIR}/src/dasLLVM.cpp
-	)
-
-	ADD_MODULE_CPP(dasLLVM)
-
 	ADD_MODULE_DAS(llvm bindings llvm_const)
 	ADD_MODULE_DAS(llvm bindings llvm_enum)
 	ADD_MODULE_DAS(llvm bindings llvm_func)
@@ -24,9 +18,6 @@ IF ((NOT DAS_LLVM_INCLUDED) AND ((NOT ${DAS_LLVM_DISABLED}) OR (NOT DEFINED DAS_
 	ADD_MODULE_DAS(llvm daslib llvm_jit_intrin)
 	ADD_MODULE_DAS(llvm daslib llvm_jit_common)
 	ADD_MODULE_DAS(llvm daslib llvm_dll_utils)
-	ADD_MODULE_LIB(libDasModuleLlvm ${DAS_LLVM_MODULE_SRC})
-
-	TARGET_INCLUDE_DIRECTORIES(libDasModuleLlvm PUBLIC ${LLVM_INCLUDE_DIRS})
 
     set(DAS_LLVM_LIB_OUTPUT "${PROJECT_SOURCE_DIR}/lib")
     set(DAS_CLANG_OUTPUT "${PROJECT_SOURCE_DIR}/bin")
@@ -38,9 +29,8 @@ IF ((NOT DAS_LLVM_INCLUDED) AND ((NOT ${DAS_LLVM_DISABLED}) OR (NOT DEFINED DAS_
             MESSAGE(STATUS "LLVM found at: ${LLVM_INSTALL_PREFIX}")
             IF(WIN32)
                 # Copy clang-cl to use it as a linker
-                add_custom_command(TARGET libDasModuleLlvm POST_BUILD
-                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${LLVM_INSTALL_PREFIX}/bin/clang-cl.exe"
+                FILE(COPY
+                    "${LLVM_INSTALL_PREFIX}/bin/clang-cl.exe" DESTINATION
                     "${DAS_CLANG_OUTPUT}/clang-cl.exe"
                 )
                 set(DAS_LLVM_DLL_PATH ${LLVM_INSTALL_PREFIX}/bin/LLVM-C.dll)
@@ -50,10 +40,9 @@ IF ((NOT DAS_LLVM_INCLUDED) AND ((NOT ${DAS_LLVM_DISABLED}) OR (NOT DEFINED DAS_
                 set(DAS_LLVM_DLL_PATH ${LLVM_INSTALL_PREFIX}/lib/libLLVM.so )
             ENDIF()
             get_filename_component(dll_name "${dll}" NAME)
-            add_custom_command(TARGET libDasModuleLlvm POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${DAS_LLVM_DLL_PATH}"
+            configure_file("${DAS_LLVM_DLL_PATH}"
                 "${DAS_LLVM_LIB_OUTPUT}/${DAS_LLVM_DLL_NAME}"
+                COPYONLY
             )
         ELSE()
             # File not exists locally and LLVM lib not found.
@@ -118,8 +107,7 @@ IF ((NOT DAS_LLVM_INCLUDED) AND ((NOT ${DAS_LLVM_DISABLED}) OR (NOT DEFINED DAS_
 	install(FILES ${DASLLVM_SOURCES}
 			DESTINATION ${DAS_INSTALL_MODULESDIR}/dasLLVM/daslib
 	)
-	file(GLOB DASLLVM_BINDINGS ${DAS_LLVM_DIR}/das_llvm/*.das)
-	install(FILES ${DASLLVM_BINDINGS} DESTINATION ${DAS_INSTALL_MODULESDIR}/dasLLVM/das_llvm)
+	file(GLOB DASLLVM_BINDINGS ${DAS_LLVM_DIR}/bindings/*.das)
+	install(FILES ${DASLLVM_BINDINGS} DESTINATION ${DAS_INSTALL_MODULESDIR}/dasLLVM/bindings)
 
-	SETUP_CPP11(libDasModuleLlvm)
 ENDIF()

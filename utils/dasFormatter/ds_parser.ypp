@@ -1037,6 +1037,7 @@ annotation_argument_name
 annotation_argument
     :   annotation_argument_name[name] '=' string_constant[value]   { $$ = new AnnotationArgument(*$name,*$value,tokRangeAt(scanner,@name,@value)); delete $value; delete $name; }
     |   annotation_argument_name[name] '=' NAME[value]              { $$ = new AnnotationArgument(*$name,*$value,tokRangeAt(scanner,@name,@value)); delete $value; delete $name; }
+    |   annotation_argument_name[name] '=' '@' '@' NAME[value]      { $$ = new AnnotationArgument(*$name,*$value,tokAt(scanner,@name)); delete $value; delete $name; }
     |   annotation_argument_name[name] '=' INTEGER[value]           { $$ = new AnnotationArgument(*$name,$value,tokRangeAt(scanner,@name,@value)); delete $name; }
     |   annotation_argument_name[name] '=' DAS_FLOAT[value]         { $$ = new AnnotationArgument(*$name,float($value),tokRangeAt(scanner,@name,@value)); delete $name; }
     |   annotation_argument_name[name] '=' DAS_TRUE[value]          { $$ = new AnnotationArgument(*$name,true,tokRangeAt(scanner,@name,@value)); delete $name; }
@@ -1241,6 +1242,8 @@ function_name
     |   DAS_OPERATOR ROTLEQU { $$ = new string("<<<="); }
     |   DAS_OPERATOR ROTREQU { $$ = new string(">>>="); }
     |   DAS_OPERATOR '[' ']' { $$ = new string("[]"); }
+    |   DAS_OPERATOR '[' ']' LARROW { $$ = new string("[]<-"); }
+    |   DAS_OPERATOR '[' ']' CLONEEQU { $$ = new string("[]:="); }
     |   DAS_OPERATOR QBRA ']'   { $$ = new string("?[]"); }
     |   DAS_OPERATOR '.'     { $$ = new string("."); }
     |   DAS_OPERATOR QDOT    { $$ = new string("?."); }

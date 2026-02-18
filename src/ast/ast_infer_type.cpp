@@ -3743,6 +3743,16 @@ namespace das {
                                     reportAstChanged();
                                     return newCall;
                                 }
+                                // lets try static class method
+                                if ( valueType->baseType==Type::tStructure ) {
+                                    callName = "_::" + valueType->structType->name + "`" + methodName;
+                                    newCall->name = callName;
+                                    fcall = inferFunctionCall(newCall.get(), InferCallError::tryOperator);
+                                    if ( fcall != nullptr || newCall->name != callName ) {
+                                        reportAstChanged();
+                                        return newCall;
+                                    }
+                                }
                             }
                             if ( auto mcall = makeCallMacro(expr->at, methodName) ) {
                                 mcall->arguments.push_back(value);
@@ -5210,7 +5220,7 @@ namespace das {
         virtual ExpressionPtr visit ( ExprAt * expr ) override {
             if ( !expr->subexpr->type || expr->subexpr->type->isAliasOrExpr() ) return Visitor::visit(expr);    // failed to infer
             if ( !expr->index->type   || expr->index->type->isAliasOrExpr()   ) return Visitor::visit(expr);    // failed to infer
-            if ( !expr->no_promotion ) {
+            if ( !expr->no_promotion && !expr->underClone ) {
                 if ( auto opE = inferGenericOperator("[]",expr->at,expr->subexpr,expr->index) ) {
                     opE->alwaysSafe = expr->alwaysSafe;
                     return opE;
@@ -6567,6 +6577,7 @@ namespace das {
         bool isAssignmentOperator ( const string & op ) {
             return (op=="+=") || (op=="-=") || (op=="*=") || (op=="/=")
                 || (op=="%=") || (op=="&=") || (op=="|=") || (op=="^=")
+                || (op=="||=") || (op=="&&=") || (op=="^^=")
                 || (op=="<<=") || (op==">>=") || (op=="<<<=") || (op==">>>=");
         }
 
@@ -6621,6 +6632,9 @@ namespace das {
                 } else if ( expr->left->rtti_isVar() ) {
                     auto var = static_pointer_cast<ExprVar>(expr->left);
                     var->underClone = true;
+                } else if ( expr->left->rtti_isAt() ) {
+                    auto at = static_pointer_cast<ExprAt>(expr->left);
+                    at->underClone = true;
                 }
             }
         }
@@ -6667,6 +6681,22 @@ namespace das {
                         } else {
                             expr->left = propGet;
                             return expr;
+                        }
+                    }
+                } else if ( expr->left->rtti_isAt() ) {
+                    ExprAt * eat = (ExprAt *)(expr->left.get());
+                    if ( auto atGet = inferGenericOperator("[]", eat->at, eat->subexpr, eat->index) ) { // we need bot get and set
+                        atGet->alwaysSafe = eat->alwaysSafe | expr->alwaysSafe;
+                        auto opRight = make_smart<ExprOp2>(expr->at, opName, atGet, expr->right);
+                        opRight->type = make_smart<TypeDecl>(*expr->right->type);
+                        if ( auto atSet = inferGenericOperator3("[]=", eat->at, eat->subexpr, eat->index, opRight) ) {
+                            atSet->alwaysSafe = eat->alwaysSafe | expr->alwaysSafe;
+                            removeR2v(atSet);
+                            return atSet;
+                        } else {
+                            reportAstChanged();
+                            expr->left = atGet;
+                            return nullptr;
                         }
                     }
                 }
@@ -6999,6 +7029,9 @@ namespace das {
                 } else if ( expr->left->rtti_isVar() ) {
                     auto var = static_pointer_cast<ExprVar>(expr->left);
                     var->underClone = true;
+                } else if ( expr->left->rtti_isAt() ) {
+                    auto at = static_pointer_cast<ExprAt>(expr->left);
+                    at->underClone = true;
                 }
             }
             markNoDiscard(expr->right.get());
@@ -7045,6 +7078,9 @@ namespace das {
             } else if ( expr->left->rtti_isVar() ) {
                 auto var = static_pointer_cast<ExprVar>(expr->left);
                 var->underClone = true;
+            } else if ( expr->left->rtti_isAt() ) {
+                auto at = static_pointer_cast<ExprAt>(expr->left);
+                at->underClone = true;
             }
             markNoDiscard(expr->right.get());
         }
@@ -7087,6 +7123,21 @@ namespace das {
                                 return call;
                             }
                         }
+                    }
+                } else if ( expr->left->rtti_isAt() ) {
+                    ExprAt * eat = (ExprAt*)(expr->left.get());
+                    // first, lets find []= operator
+                    auto opName = "[]" + expr->name;
+                    if ( auto opAtEq = inferGenericOperator3(opName, expr->at, eat->subexpr, eat->index, expr->right) ) {
+                        opAtEq->alwaysSafe = eat->alwaysSafe | expr->alwaysSafe;
+                        return opAtEq;
+                    }
+                    // now, lets see if at itself can be promoted
+                    if ( auto OpAt = inferGenericOperator("[]", expr->at, eat->subexpr, eat->index) ) {
+                        reportAstChanged();
+                        OpAt->alwaysSafe = eat->alwaysSafe;
+                        expr->left = OpAt;
+                        return nullptr;
                     }
                 }
             }
@@ -7936,14 +7987,33 @@ namespace das {
                     (that->type->isHandle() && that->type->annotation->isIterable()) ||
                     (that->type->isString())
              )) {
-                auto func = findMatchingFunctions("*", thisModule, "each", {that->type});
+                auto fnc = findMatchingFunctions("*", thisModule, "each", {that->type});
                 // If there's any `each` for handle type use it, otherwise
                 // stay in interpreter.
-                if ( !func.empty() ) {
+                if ( !fnc.empty() ) {
                     reportAstChanged();
                     auto eachFn = make_smart<ExprCall>(expr->at, "each");
                     eachFn->arguments.push_back(that->clone());
                     return eachFn;
+                }
+            }
+            // now, for the one where we did not find anything
+            if ( that->type ) {
+                if ( !that->type->dim.size() &&
+                     !that->type->isGoodIteratorType() &&
+                     !that->type->isGoodArrayType() &&
+                     !that->type->isRange() &&
+                     !that->type->isString() &&
+                     !(that->type->isHandle() && that->type->annotation->isIterable())
+                ) {
+                    auto eachCall = make_smart<ExprCall>(that->at, "each");
+                    eachCall->arguments.push_back(that->clone());
+                    if ( auto mkCall = inferFunctionCall(eachCall.get(), InferCallError::tryOperator) ) {
+                        if ( mkCall->result->isGoodIteratorType() ) {
+                            reportAstChanged();
+                            return eachCall;
+                        }
+                    }
                 }
             }
             if ( that->type && that->type->isRef() ) {
@@ -8990,6 +9060,7 @@ namespace das {
     // at this point we are dealing with 2 auto types
         // 3. one with dim is more specialized, than one without
         //      if both have dim, one with actual value is more specialized, than the other one
+        {
             int d1 = t1->dim.size() ? t1->dim[0] : 0;
             int d2 = t2->dim.size() ? t2->dim[0] : 0;
             if ( d1!=d2 ) {
@@ -8999,6 +9070,7 @@ namespace das {
                     return d1 ? 1 : -1;
                 }
             }
+        }
         // 4. the one with base type of auto\alias is less specialized
         //      if both are auto\alias - we assume its the same level of specialization
             bool ba1 = t1->baseType==Type::autoinfer || t1->baseType==Type::alias;
@@ -9008,6 +9080,37 @@ namespace das {
             } else if ( ba1 && ba2 ) {
                 return 0;
             }
+        // 5. if both are typemacros, we need to pick the more specialized one
+        if ( t1->baseType==Type::typeMacro && t2->baseType==Type::typeMacro ) {
+            // the one with more arguments wins
+            size_t d1 = t1->dimExpr.size();
+            size_t d2 = t2->dimExpr.size();
+            if ( d1!=d2 ) {
+                return d1<d2 ? -1 : 1;
+            }
+            // we go through argument, and for the type<...> compare specialization
+            bool less = false;
+            bool more = false;
+            for ( size_t d=0; d!=d1; ++d ) {
+                TypeDeclPtr t1Arg, t2Arg;
+                if ( t1->dimExpr[d]->rtti_isTypeDecl() ) {
+                    t1Arg = static_pointer_cast<ExprTypeDecl>(t1->dimExpr[d])->typeexpr;
+                }
+                if ( t2->dimExpr[d]->rtti_isTypeDecl() ) {
+                    t2Arg = static_pointer_cast<ExprTypeDecl>(t2->dimExpr[d])->typeexpr;
+                }
+                if ( t1Arg && t2Arg ) {
+                    // only if both are types, we can compare
+                    int cmpr = moreSpecialized(t1Arg, t2Arg, passType);
+                    if ( cmpr<0 ) less = true;
+                    else if ( cmpr>0 ) more = true;
+                }
+            }
+            if ( less && more ) return 0;
+            else if ( less ) return -1;
+            else if ( more ) return 1;
+            else return 0;
+        }
     // at this point base type is not auto for both, so lets compare the subtypes
         // if either does not match the base type, we arrive here through wrong option
         if ( t1->baseType!=passType->baseType || t2->baseType!=passType->baseType) {
@@ -9526,6 +9629,27 @@ namespace das {
                 }
             }
             return nullptr;
+        }
+        ExpressionPtr inferGenericOperator3 ( const string & opN, const LineInfo & expr_at, const ExpressionPtr & arg0, const ExpressionPtr & arg1, const ExpressionPtr & arg2, InferCallError err = InferCallError::tryOperator ) {
+            auto opName = "_::" + opN;
+            auto tempCall = make_smart<ExprLooksLikeCall>(expr_at,opName);
+            tempCall->arguments.push_back(arg0);
+            if ( arg1 ) tempCall->arguments.push_back(arg1);
+            if ( arg2 ) tempCall->arguments.push_back(arg2);
+            auto ffunc = inferFunctionCall(tempCall.get(),err).get();
+            if ( opName != tempCall->name ) {   // this happens when the operator gets instanced
+                reportAstChanged();
+                auto opCall = make_smart<ExprCall>(expr_at, tempCall->name);
+                opCall->arguments = das::move(tempCall->arguments);
+                return opCall;
+            } else if ( ffunc ) { // function found
+                reportAstChanged();
+                auto opCall = make_smart<ExprCall>(expr_at, opN);
+                opCall->arguments = das::move(tempCall->arguments);
+                return opCall;
+            } else {
+                return nullptr;
+            }
         }
         ExpressionPtr inferGenericOperator ( const string & opN, const LineInfo & expr_at, const ExpressionPtr & arg0, const ExpressionPtr & arg1, InferCallError err = InferCallError::tryOperator ) {
             auto opName = "_::" + opN;
