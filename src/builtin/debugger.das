@@ -161,6 +161,9 @@ class DapiDataWalker {
     def abstract Int(var value : int&) : void
     def abstract UInt(var value : uint&) : void
     def abstract Bitfield(var value : uint&; ti : TypeInfo) : void
+    def abstract Bitfield8(var value : uint8&; ti : TypeInfo) : void
+    def abstract Bitfield16(var value : uint16&; ti : TypeInfo) : void
+    def abstract Bitfield64(var value : uint64&; ti : TypeInfo) : void
     def abstract Int2(var value : int2&) : void
     def abstract Int3(var value : int3&) : void
     def abstract Int4(var value : int4&) : void
@@ -207,6 +210,7 @@ class DapiStackWalker {
     def abstract onBeforeVariables : void
     def abstract onVariable(inf : FuncInfo; vinfo : LocalVariableInfo; arg : void?; inScope : bool) : void
     def abstract onAfterCall(pp : Prologue) : bool
+    def abstract onCorruptStack(pp : Prologue) : void
 }
 
 def make_stack_walker(classPtr) : smart_ptr<StackWalker> {

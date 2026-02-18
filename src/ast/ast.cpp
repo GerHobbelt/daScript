@@ -230,6 +230,10 @@ namespace das {
 
     // structure
 
+    TypeDeclPtr Structure::findAlias ( const string & aliasName ) const {
+        return aliases.find(aliasName);
+    }
+
     uint64_t Structure::getOwnSemanticHash(HashBuilder & hb, das_set<Structure *> & dep, das_set<Annotation *> & adep) const {
         hb.updateString(getMangledName());
         hb.update(fields.size());
@@ -237,6 +241,10 @@ namespace das {
             hb.updateString(fld.name);
             hb.update(fld.type->getOwnSemanticHash(hb, dep, adep));
         }
+        aliases.foreach([&](const TypeDeclPtr & atype) {
+            hb.update(atype->getOwnSemanticHash(hb, dep, adep));
+            return true;
+        });
         return hb.getHash();
     }
 
@@ -247,6 +255,10 @@ namespace das {
             cs->fields.emplace_back(fd.name, make_smart<TypeDecl>(*fd.type), fd.init, fd.annotation, fd.moveSemantics, fd.at);
             cs->fields.back().flags = fd.flags;
         }
+        aliases.foreach([&](const TypeDeclPtr & atype) -> bool {
+            cs->aliases.insert(atype->alias, make_smart<TypeDecl>(*atype));
+            return true;
+        });
         cs->at = at;
         cs->module = module;
         cs->flags = flags;
@@ -2326,7 +2338,9 @@ namespace das {
     ExpressionPtr ExprAssume::visit(Visitor & vis) {
         vis.preVisit(this);
         if ( vis.canVisitWithAliasSubexpression(this) ) {
-            subexpr = subexpr->visit(vis);
+            if ( subexpr ) subexpr = subexpr->visit(vis);
+            if ( assumeType ) assumeType = assumeType->visit(vis);
+
         }
         return vis.visit(this);
     }
@@ -2335,7 +2349,8 @@ namespace das {
         auto cexpr = clonePtr<ExprAssume>(expr);
         Expression::clone(cexpr);
         cexpr->alias = alias;
-        cexpr->subexpr = subexpr->clone();
+        if ( subexpr ) cexpr->subexpr = subexpr->clone();
+        if ( assumeType ) cexpr->assumeType = make_smart<TypeDecl>(*assumeType);
         return cexpr;
     }
 
@@ -3108,9 +3123,21 @@ namespace das {
             case Type::tUInt64:         return make_smart<ExprConstUInt64>(at, cast<uint64_t>::to(value));
             case Type::tUInt:           return make_smart<ExprConstUInt>(at, cast<uint32_t>::to(value));
             case Type::tBitfield:       return make_smart<ExprConstBitfield>(at, cast<uint32_t>::to(value));
-            case Type::tBitfield8:      return make_smart<ExprConstBitfield>(at, cast<uint8_t>::to(value));
-            case Type::tBitfield16:     return make_smart<ExprConstBitfield>(at, cast<uint16_t>::to(value));
-            case Type::tBitfield64:     return make_smart<ExprConstBitfield>(at, cast<uint64_t>::to(value));
+            case Type::tBitfield8:      {
+                auto res = make_smart<ExprConstBitfield>(at, cast<uint8_t>::to(value));
+                res->baseType = Type::tBitfield8;
+                return res;
+            }
+            case Type::tBitfield16:     {
+                auto res = make_smart<ExprConstBitfield>(at, cast<uint16_t>::to(value));
+                res->baseType = Type::tBitfield16;
+                return res;
+            }
+            case Type::tBitfield64:     {
+                auto res = make_smart<ExprConstBitfield>(at, cast<uint64_t>::to(value));
+                res->baseType = Type::tBitfield64;
+                return res;
+            }
             case Type::tUInt2:          return make_smart<ExprConstUInt2>(at, cast<uint2>::to(value));
             case Type::tUInt3:          return make_smart<ExprConstUInt3>(at, cast<uint3>::to(value));
             case Type::tUInt4:          return make_smart<ExprConstUInt4>(at, cast<uint4>::to(value));
@@ -3129,6 +3156,17 @@ namespace das {
 
     StructurePtr Program::visitStructure(Visitor & vis, Structure * pst) {
         vis.preVisit(pst);
+        pst->aliases.foreach([&](auto & alsv){
+            vis.preVisitStructureAlias(pst, alsv->alias, alsv.get());
+            vis.preVisit(alsv.get());
+            auto alssv = alsv->visit(vis);
+            if ( alssv ) alssv = vis.visit(alssv.get());
+            if ( alssv ) alssv = vis.visitStructureAlias(pst, alssv->alias, alssv.get());
+            if ( alssv!=alsv ) {
+                pst->aliases.replace(alsv->alias, alssv);
+                alsv = alssv;
+            }
+        });
         for ( auto & fi : pst->fields ) {
             vis.preVisitStructureField(pst, fi, &fi==&pst->fields.back());
             if ( fi.type ) {

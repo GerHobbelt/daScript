@@ -54,6 +54,8 @@ require daslib/export_constructor
 require daslib/faker
 require daslib/fuzzer
 require daslib/match
+require daslib/linq
+require daslib/linq_boost
 
 def document_module_math(root : string) {
     var mod = get_module("math")
@@ -87,7 +89,8 @@ def document_module_builtin(root : string) {
         group_by_regex("Containers", mod, %regex~(capacity|clear|length|resize|resize_no_init|reserve|each|emplace|erase|find|
 find_for_edit|find_if_exists|find_index|find_index_if|has_value|key_exists|keys|values|lock|each_enum|each_ref|
 find_for_edit_if_exists|lock_forever|next|nothing|pop|push|push_clone|back|sort|to_array|to_table|to_array_move|
-to_table_move|empty|subarray|insert|move_to_ref|copy_to_local|move_to_local|get|remove_value)$%%),
+to_table_move|empty|subarray|insert|move_to_ref|copy_to_local|move_to_local|get|remove_value|erase_if|resize_and_init|
+get_value|insert_clone|emplace_new|insert_default|emplace_default|get_with_default|modify)$%%),
         group_by_regex("Character set groups", mod, %regex~(is_alpha|is_number|is_white_space|is_char_in_set)$%%),
         group_by_regex("das::string manipulation", mod, %regex~(peek|set)$%%),
         group_by_regex("String builder", mod, %regex~(build_string|write|write_char|write_chars|write_escape_string)$%%),
@@ -104,7 +107,7 @@ to_table_move|empty|subarray|insert|move_to_ref|copy_to_local|move_to_local|get|
         group_by_regex("Time and date", mod, %regex~(get_time_usec|ref_time_ticks|get_clock|get_time_nsec|mktime)$%%),
         group_by_regex("Lock checking", mod, %regex~(lock_count|set_verify_array_locks|set_verify_table_locks)$%%),
         group_by_regex("Lock checking internals", mod, %regex~(_move_with_lockcheck|_return_with_lockcheck|_at_with_lockcheck)$%%),
-        group_by_regex("Bit operations", mod, %regex~(popcnt|clz|ctz|mul128)$%%),
+        group_by_regex("Bit operations", mod, %regex~(popcnt|clz|ctz|mul128|__bit_set)$%%),
         group_by_regex("Intervals", mod, %regex~(interval)$%%),
         group_by_regex("RTTI", mod, %regex~(class_rtti_size)$%%),
         hide_group(group_by_regex("Jit", mod,%regex~(invoke_code|.*jit.*)$%%)),
@@ -112,7 +115,8 @@ to_table_move|empty|subarray|insert|move_to_ref|copy_to_local|move_to_local|get|
         group_by_regex("Initialization and finalization", mod, %regex~(using|clone|finalize)$%%),
         group_by_regex("Algorithms", mod, %regex~(swap|iter_range|count|ucount)$%%),
         group_by_regex("Memset", mod, %regex~(memset.*)$%%),
-        group_by_regex("Malloc", mod, %regex~(malloc|free|malloc_usable_size)$%%));
+        group_by_regex("Malloc", mod, %regex~(malloc|free|malloc_usable_size)$%%),
+        group_by_regex("Compilation and AOT", mod, %regex~(is_aot_enabled|set_aot|reset_aot|compiling_file_name|compiling_module_name)$%%))
     document("Built-in runtime", mod, "{root}/builtin.rst", "{root}/detail/builtin.rst", groups);
 }
 
@@ -123,7 +127,7 @@ def document_module_fio(root : string) {
         group_by_regex("File manipulation", mod, %regex~(f|stat$|getchar|remove|rename)%%),
         group_by_regex("Path manipulation", mod, %regex~(base_name|dir_name|get_full_file_name)$%%),
         group_by_regex("Directory manipulation", mod, %regex~(dir|mkdir|chdir|getcwd)$%%),
-        group_by_regex("OS specific routines", mod, %regex~(sleep|exit|popen|popen_binary|get_env_variable|sanitize_command_line)$%%)
+        group_by_regex("OS specific routines", mod, %regex~(sleep|exit|popen|popen_binary|get_env_variable|sanitize_command_line|has_env_variable)$%%)
     )
     document("File input output library", mod, "{root}/fio.rst", "{root}/detail/fio.rst", groups)
 }
@@ -666,6 +670,33 @@ def document_module_match(root : string) {
     document("Pattern matching", mod, "{root}/match.rst", "{root}/detail/match.rst", groups)
 }
 
+def document_module_linq(root : string) {
+    var mod = find_module("linq")
+    var groups <- array<DocGroup>(
+        group_by_regex("Sorting data", mod, %regex~(reverse.*|order.*)$%%),
+        group_by_regex("Set operations", mod, %regex~(distinct.*|union.*|intersect.*|except.*|unique.*)$%%),
+        group_by_regex("Concatenation operations", mod, %regex~(concat.*|append.*|prepend.*)$%%),
+        group_by_regex("Generation operations", mod, %regex~(default_empty|repeat|empty|range_sequence)$%%),
+        group_by_regex("Aggregation operations", mod, %regex~(count.*|long_count.*|sum.*|min.*|max.*|average.*|aggregate.*)$%%),
+        group_by_regex("Filtering data", mod, %regex~(where_.*)$%%),
+        group_by_regex("Partitioning data", mod, %regex~(skip.*|take.*|chunk.*)$%%),
+        group_by_regex("Join and group operations", mod, %regex~(join.*|group_join.*|group.*)$%%),
+        group_by_regex("Querying data", mod, %regex~(all.*|any.*|contains.*)$%%),
+        group_by_regex("Element operations", mod, %regex~(first.*|last.*|single.*|element_at.*)$%%),
+        group_by_regex("Transform operations", mod, %regex~(select.*|zip.*)$%%),
+        group_by_regex("Convertion operations", mod, %regex~(to_table.*|to_sequence.*)$%%),
+        group_by_regex("Comparators and keys", mod, %regex~(less.*|unique_key.*|sequence_equal.*)$%%)
+    )
+    document("LINQ", mod, "{root}/linq.rst", "{root}/detail/linq.rst", groups)
+}
+
+def document_module_linq_boost(root : string) {
+    var mod = find_module("linq_boost")
+    var groups <- array<DocGroup>(
+        hide_group(group_by_regex("Implementation details", mod, %regex~(match_type|match_expr)$%%))
+    )
+    document("Boost module for LINQ", mod, "{root}/linq_boost.rst", "{root}/detail/linq_boost.rst", groups)
+}
 
 [export]
 def main {
@@ -736,4 +767,6 @@ def main {
     document_module_uriparser_boost(root)
     document_module_utf8_utils(root)
     document_module_match(root)
+    document_module_linq(root)
+    document_module_linq_boost(root)
 }

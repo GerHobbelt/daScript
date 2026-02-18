@@ -1078,7 +1078,10 @@ namespace das {
                 DAS_VERIFYF_MULTI(!annotation, !structType, !!enumType, !firstType, !secondType,
                                 argTypes.empty(), argNames.empty());
                 break;
-            case tBitfield:  // blow up!
+            case tBitfield:
+            case tBitfield8:
+            case tBitfield16:
+            case tBitfield64:
                 ser << alias << argNames << dim << dimExpr;
                 DAS_VERIFYF_MULTI(!annotation, !structType, !enumType, !firstType, !secondType,
                                 argTypes.empty());
@@ -1187,6 +1190,7 @@ namespace das {
         ser << name;
         ser << at     << module;
         ser << fields << fieldLookup;
+        ser << aliases;
         ser << parent // parent could be in the current module or in some other
                       // module
             << flags
@@ -1491,10 +1495,15 @@ namespace das {
         ser << isSmartPtr << ptrType;
     }
 
-     void ExprConstEnumeration::serialize( AstSerializer & ser ) {
+    void ExprConstEnumeration::serialize( AstSerializer & ser ) {
         ExprConst::serialize(ser);
         ser << enumType << text;
-     }
+    }
+
+    void ExprConstBitfield::serialize( AstSerializer & ser ) {
+        ExprConst::serialize(ser);
+        ser << bitfieldType;
+    }
 
     void ExprConstString::serialize(AstSerializer& ser) {
         ExprConst::serialize(ser);
@@ -1535,7 +1544,7 @@ namespace das {
 
     void ExprAssume::serialize(AstSerializer& ser) {
         Expression::serialize(ser);
-        ser << alias << subexpr;
+        ser << alias << subexpr << assumeType;
     }
 
     void ExprMakeBlock::serialize(AstSerializer & ser) {
@@ -2306,7 +2315,7 @@ namespace das {
     }
 
     uint32_t AstSerializer::getVersion () {
-        static constexpr uint32_t currentVersion = 64;
+        static constexpr uint32_t currentVersion = 68;
         return currentVersion;
     }
 

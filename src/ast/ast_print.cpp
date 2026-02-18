@@ -210,6 +210,13 @@ namespace das {
                 ss << "] ";
             }
         }
+        virtual void preVisitStructureAlias ( Structure * var, const string & name, TypeDecl * at ) override {
+            Visitor::preVisitStructureAlias(var, name, at);
+            ss << "\ttypedef " << name << " = " << at->describe();
+            if ( gen2 ) ss << ";";
+            ss << "\n";
+        }
+
         virtual void preVisitStructureField ( Structure * that, Structure::FieldDeclaration & decl, bool last ) override {
             Visitor::preVisitStructureField(that, decl, last);
             ss << "\t";
@@ -648,7 +655,10 @@ namespace das {
         }
         virtual void preVisit ( ExprAssume * wh ) override {
             Visitor::preVisit(wh);
-            ss << "assume " << wh->alias << " = ";
+            ss << "assume ";
+            if ( wh->assumeType ) ss << "type ";
+            ss << wh->alias << " = ";
+            if ( wh->assumeType ) ss << wh->assumeType->describe();
         }
     // tag
         virtual void preVisit ( ExprTag * expr ) override {
@@ -778,7 +788,7 @@ namespace das {
             if ( c->enumType->module && !c->enumType->module->name.empty() ) {
                 ss << c->enumType->module->name << "::";
             }
-            ss << c->enumType->name << " " << c->text;
+            ss << c->enumType->name << "." << c->text;
             return Visitor::visit(c);
         }
         virtual ExpressionPtr visit ( ExprConstInt * c ) override {
@@ -819,7 +829,7 @@ namespace das {
                 name = c->bitfieldType->findBitfieldName(c->getValue());
             }
             if ( !name.empty() ) {
-                ss << c->bitfieldType->alias << " " << name;
+                ss << c->bitfieldType->alias << "." << name;
             } else {
                 ss << "bitfield(0x" << HEX << c->getValue() << DEC << ")";
             }

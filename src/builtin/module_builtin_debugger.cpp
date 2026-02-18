@@ -554,6 +554,21 @@ namespace debugapi {
                 invoke_Bitfield(context,fn_Bitfield,classPtr,value,*ti);
             }
         }
+        virtual void Bitfield8 ( uint8_t & value, TypeInfo * ti ) override {
+           if ( auto fn_Bitfield8 = get_Bitfield8(classPtr) ) {
+                invoke_Bitfield8(context,fn_Bitfield8,classPtr,value,*ti);
+            }
+        }
+        virtual void Bitfield16 ( uint16_t & value, TypeInfo * ti ) override {
+           if ( auto fn_Bitfield16 = get_Bitfield16(classPtr) ) {
+                invoke_Bitfield16(context,fn_Bitfield16,classPtr,value,*ti);
+            }
+        }
+        virtual void Bitfield64 ( uint64_t & value, TypeInfo * ti ) override {
+            if ( auto fn_Bitfield64 = get_Bitfield64(classPtr) ) {
+                invoke_Bitfield64(context,fn_Bitfield64,classPtr,value,*ti);
+            }
+        }
         virtual void Int2 ( int2 & value ) override {
            if ( auto fn_Int2 = get_Int2(classPtr) ) {
                 invoke_Int2(context,fn_Int2,classPtr,value);
@@ -742,6 +757,11 @@ namespace debugapi {
                 return true;
             }
         }
+        virtual void onCorruptStack ( Prologue * pp ) override {
+            if ( auto fnOnCorruptStack = get_onCorruptStack(classPtr) ) {
+                invoke_onCorruptStack(context,fnOnCorruptStack,classPtr,*pp);
+            }
+        }
     protected:
         void *      classPtr;
         Context *   context;
@@ -810,7 +830,7 @@ namespace debugapi {
     #if DAS_ENABLE_STACK_WALK
         char * sp = context.stack.ap();
         int32_t depth = 0;
-        while (  sp < context.stack.top() ) {
+        while ( sp < context.stack.top() ) {
             Prologue * pp = (Prologue *) sp;
             Block * block = nullptr;
             FuncInfo * info = nullptr;
@@ -825,7 +845,16 @@ namespace debugapi {
                     info = pp->info;
                 }
             }
-            sp += info ? info->stackSize : pp->stackSize;
+            auto incr = info ? info->stackSize : pp->stackSize;
+            if ( incr >= context.stack.size() || incr<sizeof(Prologue) ) {
+                // corrupted stack
+                break;
+            }
+            sp += incr;
+            if ( sp > context.stack.top() ) {
+                // corrupted stack
+                break;
+            }
             depth ++;
         }
         return depth;
@@ -839,7 +868,7 @@ namespace debugapi {
     #if DAS_ENABLE_STACK_WALK
         char * sp = context.stack.ap();
         const LineInfo * lineAt = &at;
-        while (  sp < context.stack.top() ) {
+        while ( sp < context.stack.top() ) {
             Prologue * pp = (Prologue *) sp;
             Block * block = nullptr;
             FuncInfo * info = nullptr;
@@ -853,6 +882,11 @@ namespace debugapi {
                 } else {
                     info = pp->info;
                 }
+            }
+            auto incr = info ? info->stackSize : pp->stackSize;
+            if ( incr >= context.stack.size() || incr<sizeof(Prologue) ) {
+                walker->onCorruptStack(pp);
+                break;
             }
             walker->onBeforeCall(pp,SP);
             if ( !info ) {
@@ -894,7 +928,11 @@ namespace debugapi {
                 }
             }
             lineAt = info ? pp->line : nullptr;
-            sp += info ? info->stackSize : pp->stackSize;
+            sp += incr;
+            if ( sp > context.stack.top() ) {
+                walker->onCorruptStack(pp);
+                break;
+            }
             if ( !walker->onAfterCall(pp) ) break;
         }
     #else
