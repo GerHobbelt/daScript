@@ -124,13 +124,13 @@ namespace das
         return that;
     }
 
-    vec4f SimNode_Jit::eval ( Context & context ) {
+    DAS_SUPPRESS_UB vec4f SimNode_Jit::eval ( Context & context ) {
         auto result = func(&context, context.abiArg, context.abiCMRES);
         context.result = result;
         return result;
     }
 
-    vec4f SimNode_JitBlock::eval ( Context & context ) {
+    DAS_SUPPRESS_UB vec4f SimNode_JitBlock::eval ( Context & context ) {
         auto ba = (BlockArguments *) ( context.stack.bottom() + blockPtr->argumentsOffset );
         return func(&context, ba->arguments, ba->copyOrMoveResult, blockPtr );
     }
@@ -1897,9 +1897,9 @@ namespace das
 
     void Context::throw_out_of_memory ( bool isStringHeap, uint32_t size, const LineInfo * at ) {
         if ( isStringHeap ) {
-            throw_error_at(at, "out of string heap memory, requested %u bytes, limit is %llu bytes", size, (unsigned long long) stringHeap->getLimit());
+            throw_error_at(at, "out of string heap memory, requested %u bytes, used %llu / limit %llu", size, (unsigned long long) stringHeap->bytesAllocated(), (unsigned long long) stringHeap->getLimit());
         } else {
-            throw_error_at(at, "out of heap memory, requested %u bytes, limit is %llu bytes", size, (unsigned long long) heap->getLimit());
+            throw_error_at(at, "out of heap memory, requested %u bytes, used %llu / limit %llu", size, (unsigned long long) heap->bytesAllocated(), (unsigned long long) heap->getLimit());
         }
     }
 

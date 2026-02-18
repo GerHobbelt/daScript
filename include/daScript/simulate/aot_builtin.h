@@ -1,6 +1,7 @@
 #pragma once
 
 namespace das {
+    DAS_API bool das_is_dll_build();
     DAS_API bool is_in_aot();
     DAS_API void set_aot();
     DAS_API void reset_aot();
@@ -68,6 +69,8 @@ namespace das {
     DAS_API void builtin_make_temp_array ( Array & arr, void * data, int size );
     DAS_API void builtin_array_free ( Array & dim, int szt, Context * __context__, LineInfoArg * at );
     DAS_API void builtin_table_free ( Table & tab, int szk, int szv, Context * __context__, LineInfoArg * at );
+    DAS_API vec4f builtin_collect_local ( Context & context, SimNode_CallBase * call, vec4f * args );
+    DAS_API vec4f builtin_collect_local_and_zero ( Context & context, SimNode_CallBase * call, vec4f * args );
 
     DAS_API void toLog ( int level, const char * text, Context * context, LineInfoArg * at );
     void toCompilerLog ( const char * text, Context * context, LineInfoArg * at );

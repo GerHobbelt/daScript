@@ -17,7 +17,7 @@ struct Far : Bar {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////
 // 0. substitute distance is number of casts required for the function
-//		function with less casts is picked
+//    function with less casts is picked
 
 def test(a : Foo; b : Foo) {
     return "foo foo"
@@ -111,11 +111,11 @@ def test_gen_4 {
 // if its an array or a pointer, we compare specialization of subtype
 
 def gen_5(arr : array<auto?>) {
-    return "<*>"
+    return "<*?>"
 }
 
 def gen_5(arr : array<auto>) {
-    return "<*?>"
+    return "<*>"
 }
 
 def test_gen_5 {

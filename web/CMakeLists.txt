@@ -318,6 +318,7 @@ SET(AST_SRC
 ../src/ast/ast_derive_alias.cpp
 ../src/ast/ast_const_folding.cpp
 ../src/ast/ast_block_folding.cpp
+../src/ast/ast_inscope_pod.cpp
 ../src/ast/ast_unused.cpp
 ../src/ast/ast_annotations.cpp
 ../src/ast/ast_export.cpp
@@ -630,7 +631,7 @@ include_directories(../include)
 include_directories(${PROJECT_SOURCE_DIR}/../3rdparty/fmt/include)
 ADD_LIBRARY(libDaScript ${PARSER_GENERATED_SRC} ${PARSER_SRC} ${VECMATH_SRC} ${AST_SRC} ${BUILTIN_SRC}
     ${MISC_SRC} ${SIMULATE_SRC} ${SIMULATE_FUSION_SRC} ${TEST_SRC} ${MAIN_SRC}
-	${DAGOR_NOISE_SRC} ${FLAT_HASH_MAP_SRC} ${DAS_LIB_SRC} ${DASCRIPT_FMT_SRC} ${AOT_STUB_SRC} ${AOT_GENERATED_SRC})
+    ${DAGOR_NOISE_SRC} ${FLAT_HASH_MAP_SRC} ${DAS_LIB_SRC} ${DASCRIPT_FMT_SRC} ${AOT_STUB_SRC} ${AOT_GENERATED_SRC})
 ADD_DEPENDENCIES(libDaScript need_and_resolve)
 ADD_PROJECT_XXD_DEPENDS(libDaScript)
 target_include_directories(libDaScript PUBLIC
