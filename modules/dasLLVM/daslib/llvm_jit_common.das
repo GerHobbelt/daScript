@@ -10,9 +10,9 @@ options stack = 4_194_304 // On huge files we need huge stack for jit
 
 module llvm_jit_common shared private
 
-require llvm/llvm_boost
-require llvm/llvm_dll_utils
-require llvm/llvm_targets
+require llvm/daslib/llvm_boost
+require llvm/daslib/llvm_dll_utils
+require llvm/daslib/llvm_targets
 
 require daslib/ast_boost
 require daslib/strings
@@ -20,7 +20,6 @@ require daslib/strings_boost
 require daslib/defer
 require daslib/enum_trait
 require jit
-require fio
 
 let public LLVM_DEBUG_RESULT = false
 let public LLVM_DEBUG_EVERYTHING = false
@@ -31,7 +30,8 @@ let public LLVM_DEBUG_LINE_TRACES = false
 
 let public LLVM_JIT_LOG = false || LLVM_DEBUG_EVERYTHING
 
-var public LLVM_JIT_ALLOW_UNALIGNED_VECTOR_READ_OUT_OF_BOUNDS = false
+let public LLVM_JIT_ALLOW_UNALIGNED_VECTOR_READ_OUT_OF_BOUNDS_DEFAULT = false   // NOTE - this should be true, to match interpreter and AOT behavior
+var public LLVM_JIT_ALLOW_UNALIGNED_VECTOR_READ_OUT_OF_BOUNDS = LLVM_JIT_ALLOW_UNALIGNED_VECTOR_READ_OUT_OF_BOUNDS_DEFAULT
 
 let public LLVM_ENABLE_OPT_PASS = LLVM_DEBUG_EVERYTHING ? false : true
 let public LLVM_LOG_RESULT = LLVM_DEBUG_EVERYTHING || LLVM_DEBUG_RESULT
@@ -284,7 +284,8 @@ def public init_jit(cg_opt_level : uint) {
     static_if (LLVM_DEBUG_EVERYTHING) {
         let hostcpu = LLVMGetHostCPUName()
         let features = LLVMGetHostCPUFeatures()
-        print("LLVM host cpu: {hostcpu}\nLLVM host cpu features: {features}\n")
+        to_log(LOG_DEBUG, "LLVM JIT: host cpu: {hostcpu}\n")
+        to_log(LOG_DEBUG, "LLVM JIT: host cpu features: {features}\n")
         LLVMDisposeMessage(hostcpu)
         LLVMDisposeMessage(features)
     }
@@ -678,7 +679,7 @@ def public get_string_constant_ptr(builder : LLVMOpaqueBuilder?; message : strin
 
 def public failed(msg : string) {
     static_if (LLVM_DEBUG_EVERYTHING) {
-        print("FAILED: {msg}\n")
+        to_log(LOG_ERROR, "LLVM JIT: {msg}\n")
     }
     g_errors |> push("{msg}")
 }
@@ -869,9 +870,8 @@ def public build_broadcast_vector(builder : LLVMOpaqueBuilder?; opType : TypeDec
     }
 }
 
-    def public LLVMBuildLoadData2Aligned(builder : LLVMOpaqueBuilder?; var typ : LLVMOpaqueType?; ptr : LLVMOpaqueValue?; alignment : int; name : string) {
+def public LLVMBuildLoadData2Aligned(builder : LLVMOpaqueBuilder?; var typ : LLVMOpaqueType?; ptr : LLVMOpaqueValue?; alignment : int; name : string) {
     if (!LLVM_JIT_ALLOW_UNALIGNED_VECTOR_READ_OUT_OF_BOUNDS && alignment != 16 && LLVMIsVector3(typ)) {
-        // slow path
         return LLVMBuildLoadVector3(builder, g_prim_t, typ, ptr, name)
     } else {
         return LLVMBuildLoad2Aligned(builder, typ, ptr, alignment |> uint, name)

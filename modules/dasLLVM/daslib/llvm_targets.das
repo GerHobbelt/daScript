@@ -1,6 +1,10 @@
 options gen2
 module llvm_targets shared
-require llvm/llvm_func
+require llvm/bindings/llvm_func
+
+// All target related functions use #define-s in LLVM-C.
+// There's no way to extract them to here. All we can do
+// is manually call requested functions.
 
 def LLVMInitializeAllTargetInfos() {
     LLVMInitializeAArch64TargetInfo()

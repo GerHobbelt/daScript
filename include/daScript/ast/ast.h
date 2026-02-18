@@ -378,7 +378,8 @@ namespace das
                 bool    bitfield_constant : 1;      // this is a bitfield constant
                 bool    pod_delete : 1;             // this variable can be deleted as POD
                 bool    pod_delete_gen : 1;         // pod delete has been generated
-                bool    single_return_via_move : 1; // this variable is returned via move, where function has only 1 return path
+                bool    single_return_via_move : 1; // this variable is returned via move, where function has only 1 return path (only set if force_pod_inscope is set)
+                bool    consumed : 1;               // this variable has been passed via consume (only set if force_pod_inscope is set)
             };
             uint32_t flags = 0;
         };
@@ -1551,6 +1552,8 @@ namespace das
         int32_t jit_size_level = 3u;             // Opt level for LLVM for binary size
         string jit_path_to_shared_lib;           // Path to libDaScript. Optional, we'll try to find it in _das_root_/lib/ if not provided.
         string jit_path_to_linker;               // Path to linker. Optional, we'll use clang-cl from LLVM on Windows and cc otherwise.
+    // dll loading
+        vector<string> dll_search_paths;          // additional search paths for dll loading
     };
 
     struct CommentReader : public ptr_ref_count {

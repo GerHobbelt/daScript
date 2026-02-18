@@ -10,10 +10,10 @@ options stack = 4_194_304 // On huge files we need huge stack for jit
 
 module llvm_jit shared private
 
-require llvm/llvm_boost
-require llvm/llvm_jit_intrin
-require llvm/llvm_jit_common
-require llvm/llvm_dll_utils
+require llvm/daslib/llvm_boost
+require llvm/daslib/llvm_jit_intrin
+require llvm/daslib/llvm_jit_common
+require llvm/daslib/llvm_dll_utils
 require daslib/ast_boost
 require daslib/templates_boost
 require daslib/macro_boost
@@ -240,7 +240,7 @@ class LlvmJitVisitor : AstVisitor {
     option_no_alias : bool = false
     option_no_capture : bool = false
     own_di : bool = false
-    ldu_hint : array<bool>
+    ldu_hint : bool
     attributes : Attributes?
 
     def LlvmJitVisitor(ctx : Context?; var types_ : PrimitiveTypes?; uids : UidNodes?; need_di : bool; dib : LLVMOpaqueDIBuilder?; attrs : Attributes?) {
@@ -479,7 +479,7 @@ class LlvmJitVisitor : AstVisitor {
             fun_type = LLVMFunctionType(type_to_llvm_abi_type(result), fun_args)
         }
         if (LLVMGetNamedFunction(g_mod, fun_name.impl()) != null) {
-            print("Function {fun_name.impl()} somehow already present!")
+            to_log(LOG_ERROR, "LLVM JIT: Function {fun_name.impl()} somehow already present!")
             failed("Function {fun_name.impl()} somehow already present!")
         }
         ffunc = LLVMAddFunctionWithType(g_mod, fun_name.impl(), fun_type)
@@ -624,8 +624,6 @@ class LlvmJitVisitor : AstVisitor {
     def create_line_info_ptr_global(line_info_global : LLVMOpaqueValue?) {
         let uint8_ptr = LLVMPointerType(LLVMPointerType(types.t_int8, 0u), 0u)
         let line_info_ptr_type = uint8_ptr
-        // print("Type of LineInfoPtrType : '{LineInfoPtrType |> describe}'\n")
-        // print("Type of ptrToLineInfoGlobal : '{ptrToLineInfoGlobal |> LLVMTypeOf() |> describe()}'\n")
         let line_info_ptr_global = LLVMAddGlobal(g_mod, line_info_ptr_type, "li_ptr" /* no name */)
         set_private_linkage(line_info_ptr_global)
         LLVMSetInitializer(line_info_ptr_global, line_info_global)
@@ -700,7 +698,7 @@ class LlvmJitVisitor : AstVisitor {
         assert(g_builder != null, "missing builder")
         thisFunc = get_ptr(fun)
         uid.reset(get_ptr(fun))
-        ldu_hint |> push(LLVM_JIT_ALLOW_UNALIGNED_VECTOR_READ_OUT_OF_BOUNDS)
+        ldu_hint = LLVM_JIT_ALLOW_UNALIGNED_VECTOR_READ_OUT_OF_BOUNDS
         let fnmna = uid.get_dll_fn_name(fun)
         ffunc = LLVMGetNamedFunction(g_mod, fnmna.impl())
         wfunc = LLVMGetNamedFunction(g_mod, fnmna.publ())
@@ -733,7 +731,7 @@ class LlvmJitVisitor : AstVisitor {
         LLVMPositionBuilderAtEnd(g_builder, function_entry)
         LLVMBuildBr(g_builder, function_body)
         debug_after_function()
-        ldu_hint |> pop()
+        LLVM_JIT_ALLOW_UNALIGNED_VECTOR_READ_OUT_OF_BOUNDS = ldu_hint
         ffunc = null
         thisFunc = null
         uid.reset(null)
@@ -1910,23 +1908,25 @@ class LlvmJitVisitor : AstVisitor {
     def visitExprOp2_NonMonade(var expr : smart_ptr<ExprOp2>) {
         var left = getE(expr.left)
         var right = getE(expr.right)
-        assume opType = expr.right._type
         assume shiftType = expr.left._type
+        assume rightType = expr.right._type
         var r2v_left = isReadModifyWriteOp2(expr.op) ? LLVMBuildLoadData2Aligned(g_builder, type_to_llvm_type(expr.left._type),
                                                             left, expr.left._type.alignOf, "") : null
         // note: we need to handle vector vs scalar operations here
         // the way we do it, is we expand scalar up to vector type
+        var use_left_type = false
         if (expr.op == "*" || expr.op == "*=" || expr.op == "/" || expr.op == "/=") {
-            if (expr.left._type.baseType != expr.right._type.baseType) {// vec * scalar || scalar * vec, and so on
-                if (opType.isVectorType) {
+            if (shiftType.baseType != rightType.baseType) {// vec * scalar || scalar * vec, and so on
+                if (rightType.isVectorType) {
                     assert(expr.op == "*" || expr.op == "/")// scalar * vec || scalar / vec only
-                    left = expand_scalar(g_builder, left, opType)
+                    left = expand_scalar(g_builder, left, rightType)
                 } else {
-                    right = expand_scalar(g_builder, right, expr.left._type)
-                    opType := expr.left._type
+                    right = expand_scalar(g_builder, right, shiftType)
+                    use_left_type = true
                 }
             }
         }
+        assume opType = use_left_type ? expr.left._type : expr.right._type
         // note: we need to handle shift operations
         // the way we do it, is we expand scalar up to vector type
         if (expr.op == "<<" || expr.op == ">>" || expr.op == ">>>" || expr.op == "<<<" || expr.op == "<<=" || expr.op == ">>=" || expr.op == ">>>=" || expr.op == "<<<=") {
@@ -4341,10 +4341,26 @@ class LlvmJitVisitor : AstVisitor {
 
     def override visitExprField(expr : smart_ptr<ExprField>) : ExpressionPtr {
         var field_ptr : LLVMOpaqueValue?;
-        if (expr.value._type.isBitfield) {
+        assume value_t = expr.value._type
+        if (value_t.isBitfield) {
             let mask = 1u << uint(expr.fieldIndex)
-            let mand = LLVMBuildAnd(g_builder, getE(expr.value), types.ConstI32(uint64(mask)), "")
-            let if_not_zero = LLVMBuildICmp(g_builder, LLVMIntPredicate.LLVMIntNE, mand, types.ConstI32(uint64(0)), "")
+            var llvm_mask : LLVMOpaqueValue? = null
+            var llvm_zero : LLVMOpaqueValue? = null
+            if (value_t.baseType == Type.tBitfield) {
+                llvm_mask = types.ConstI32(uint64(mask))
+                llvm_zero = types.ConstI32(uint64(0))
+            } elif (value_t.baseType == Type.tBitfield8) {
+                llvm_mask = types.ConstI8(mask |> int8)
+                llvm_zero = types.ConstI8(0 |> int8)
+            } elif (value_t.baseType == Type.tBitfield16) {
+                llvm_mask = types.ConstI16(mask |> int16)
+                llvm_zero = types.ConstI16(0 |> int16)
+            } elif (value_t.baseType == Type.tBitfield64) {
+                llvm_mask = types.ConstI64(uint64(mask))
+                llvm_zero = types.ConstI64(uint64(0))
+            }
+            let mand = LLVMBuildAnd(g_builder, getE(expr.value), llvm_mask, "")
+            let if_not_zero = LLVMBuildICmp(g_builder, LLVMIntPredicate.LLVMIntNE, mand, llvm_zero, "")
             var res_type = type_to_llvm_type(expr._type)
             var res = build_select(if_not_zero, res_type) <| $() {
                 return LLVMConstInt(types.t_int1, uint64(1), 0)
@@ -4952,14 +4968,21 @@ class LlvmJitVisitor : AstVisitor {
         // call jit_make_block
         var blk_ptr = LLVMBuildPointerCast(g_builder, blk, LLVMPointerType(g_t_block, 0u), "")
         let argStackTop = (expr._block as ExprBlock).stackTop
-        let annotationData = (expr._block as ExprBlock).annotationData
+        let annotationData = (expr._block as ExprBlock).annotationData |> uint64()
+        var ann_data_ptr : LLVMOpaqueValue? = null
+        if (annotationData != 0 |> uint64()) {
+            ann_data_ptr = LLVMBuildPtrToInt(g_builder, save_address_global(uid.get_block_ann(expr), unsafe(reinterpret<void?>(annotationData))), types.LLVMIntPtrType(), "")
+        } else {
+            // Just an optimization.
+            ann_data_ptr = LLVMConstInt(types.t_int64, 0 |> uint64(), 0)
+        }
         let null_ptr = LLVMConstPointerNull(types.LLVMVoidPtrType())
         let func_ptr = LLVMBuildPointerCast(g_builder, blk_make.func, types.LLVMVoidPtrType(), "")
         let impl_ptr = LLVMBuildPointerCast(g_builder, blk_make.impl, types.LLVMVoidPtrType(), "")
         var params = fixed_array(
             blk_ptr,                                                    // blk
-            types.ConstI32(uint64(argStackTop)),      // argStackTop
-            LLVMConstInt(types.t_int64, uint64(annotationData), 0),   // annotation data
+            types.ConstI32(uint64(argStackTop)),                        // argStackTop
+            ann_data_ptr,                                               // annotation data
             func_ptr,                                                   // bodyNode
             impl_ptr,                                                   // jitImpl
             null_ptr,                                                   // TODO: funcInfo
@@ -5010,13 +5033,14 @@ class LlvmJitVisitor : AstVisitor {
 
 // ExprConstInt8
     def override visitExprConstInt8(expr : smart_ptr<ExprConstInt8>) : ExpressionPtr {
+        setE(expr, types.ConstI8(expr.value))
         setE(expr, LLVMConstInt(types.t_int8, uint64(expr.value), 0))
         return expr
     }
 
 // ExprConstInt16
     def override visitExprConstInt16(expr : smart_ptr<ExprConstInt16>) : ExpressionPtr {
-        setE(expr, LLVMConstInt(types.t_int16, uint64(expr.value), 0))
+        setE(expr, types.ConstI16(expr.value))
         return expr
     }
 
@@ -5837,6 +5861,11 @@ class ResolveExternVisitor : AstVisitor {
 
     def override preVisitExprMakeBlock(expr : smart_ptr<ExprMakeBlock>) : void {
         thisBlock |> push <| get_ptr(unsafe(reinterpret<smart_ptr<ExprBlock>> expr._block))
+
+        let annotationData = (expr._block as ExprBlock).annotationData
+        if (annotationData != 0 |> uint64()) {
+            dll.set_glob_address(uid.get_block_ann(expr), unsafe(reinterpret<void?>(annotationData)))
+        }
     }
 
     def override visitExprMakeBlock(expr : smart_ptr<ExprMakeBlock>) : ExpressionPtr {
@@ -6017,6 +6046,7 @@ class DisableJitVisitor : AstVisitor {
         for (svar, ssrc in expr.iteratorVariables, expr.sources) {
             if (ssrc._type.isRange || ssrc._type.dim |> length != 0 || ssrc._type.isGoodArrayType || ssrc._type.isIterator) {
             } else {
+                // At least string is not supported yet as the source of loop.
                 disable = true
                 return
             }
@@ -6027,10 +6057,30 @@ class DisableJitVisitor : AstVisitor {
         disable = true
     }
 
+    def override preVisitExprAt(expr : smart_ptr<ExprAt>) : void {
+        if (expr.subexpr._type.isHandle) {
+            let type_str = describe(expr.subexpr._type)
+            to_log(LOG_WARNING,
+                "LLVM JIT: native operator `.[]` should be implemented for " +
+                "type {type_str} to be used in JIT, keeping interpreter mode.\n")
+            disable = true
+        }
+    }
+
+    def override preVisitExprForSource(var expr : smart_ptr<ExprFor>, var source : ExpressionPtr, last : bool) {
+        if (source._type.isHandle) {
+            let type_str = describe(source)
+            to_log(LOG_WARNING,
+                "LLVM JIT: `each` should be implemented for " +
+                "type {type_str} to be used in JIT, keeping interpreter mode.\n")
+            disable = true
+        }
+    }
+
     def disable_builtin_call(expr : smart_ptr<ExprCallFunc>) {
         if (expr.func.flags.builtIn && !expr.func.flags.interopFn && get_builtin_function_address(expr.func) == null) {
             if (!has_intrinsic(expr)) {
-                print("disable fn {expr.func.name}\n");
+                to_log(LOG_INFO, "LLVM JIT: disable fn {expr.func.name}\n");
                 disable = true
             }
         }
@@ -6129,7 +6179,8 @@ class JIT_LLVM : AstSimulateMacro {
         assume jit_all_functions = prog.policies.jit_jit_all_functions
         assume debug_info = prog.policies.jit_debug_info
         if (prog.policies.jit_use_dll_mode && !das_is_dll_build()) {
-            print("LLVM JIT WARNING: dll mode is enabled, however daslang build is static, disabling dll mode.\n")
+            to_log(LOG_WARNING, "LLVM JIT: dll mode is enabled, however " +
+                "daslang build is static, disabling dll mode.\n")
         }
         let use_dll = prog.policies.jit_use_dll_mode && das_is_dll_build()
         let opt_level = prog.policies.jit_opt_level
@@ -6138,6 +6189,9 @@ class JIT_LLVM : AstSimulateMacro {
         let output_folder = config_out_folder |> empty() ? "{get_das_root()}/jitted_scripts/" : config_out_folder
         assume path_to_shared_lib = string(prog.policies.jit_path_to_shared_lib)
         assume path_to_linker = string(prog.policies.jit_path_to_linker)
+
+        // Set global options
+        LLVM_JIT_ALLOW_UNALIGNED_VECTOR_READ_OUT_OF_BOUNDS = prog._options |> find_arg("jit_vec3_ldu") ?as tBool ?? LLVM_JIT_ALLOW_UNALIGNED_VECTOR_READ_OUT_OF_BOUNDS_DEFAULT
 
         prog |> for_each_module <| $(mod) {
             mod |> for_each_function("") <| $(fun) {
@@ -6151,7 +6205,7 @@ class JIT_LLVM : AstSimulateMacro {
                             fun.moreFlags |= MoreFunctionFlags.requestJit
                             funcs |> emplace(fun)
                         } else {
-                            print("LLVM JIT: disabled {fun.name}\n")
+                            to_log(LOG_INFO, "LLVM JIT: disabled {fun.name}\n")
                         }
                     } else {
                         disabled |> emplace(fun)
@@ -6195,11 +6249,11 @@ class JIT_LLVM : AstSimulateMacro {
 
                     assume maybe_mod = prog.thisModuleName |> length() == 0 ? "" : "in module {prog.thisModuleName}"
                     if (!LLVMVerifyFunction(fn_impl, LLVMVerifierFailureAction.LLVMPrintMessageAction, false)) {
-                        // print("{LLVMPrintModuleToString(g_mod)}\n");
+                        // to_log(LOG_ERROR, "LLVM JIT: {LLVMPrintModuleToString(g_mod)}\n");
                         panic("Internal jit error. Failed to get IR of '{fun.name} implementation' {maybe_mod}.\n")
                     }
                     if (!LLVMVerifyFunction(fn, LLVMVerifierFailureAction.LLVMPrintMessageAction, false)) {
-                        // print("{LLVMPrintModuleToString(g_mod)}\n");
+                        // to_log(LOG_ERROR, "LLVM JIT: {LLVMPrintModuleToString(g_mod)}\n");
                         panic("Internal jit error. Failed to get IR of '{fun.name}' in module {maybe_mod}.\n")
                     }
                 }
@@ -6221,7 +6275,7 @@ class JIT_LLVM : AstSimulateMacro {
                     let module_str = LLVMPrintModuleToString(g_mod)
                     let msg = clone_string(module_str)
                     LLVMDisposeMessage(module_str)
-                    print("{msg}\n");
+                    to_log(LOG_DEBUG, "LLVM JIT: {msg}\n");
                 }
                 if (!LLVMVerifyModule(g_mod, LLVMVerifierFailureAction.LLVMPrintMessageAction, false)) {
                     g_failed = true
@@ -6274,3 +6328,9 @@ class JIT_LLVM : AstSimulateMacro {
 }
 
 
+[_macro, macro_function]
+def init_llvm_jit_module_options() {
+    if (is_compiling_macros_in_module("llvm_jit")) {
+        this_module() |> add_module_option("jit_vec3_ldu", Type.tBool)
+    }
+}

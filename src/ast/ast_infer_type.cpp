@@ -125,6 +125,7 @@ namespace das {
         Module *                thisModule = nullptr;
         size_t                  beforeFunctionErrors = 0;
         TextWriter *            logs = nullptr;
+        int32_t                 consumeDepth = 0;
     public:
         vector<FunctionPtr>     extraFunctions;
     protected:
@@ -2484,6 +2485,7 @@ namespace das {
             oneReturn.reset(); returnCount = 0;
             canFoldResult = true;
             unsafeDepth = 0;
+            consumeDepth = 0;
             func = f;
             func->hasReturn = false;
             func->isFullyInferred = true;
@@ -3585,6 +3587,11 @@ namespace das {
                 } else {
                     string lname = generateNewLocalFunctionName(block->at);
                     auto pFn = generateLocalFunction(lname, block.get());
+                    if ( func  ) {
+                        if ( auto origin = func->getOriginPtr() ) {
+                            pFn->fromGeneric = getOrCreateDummy(origin->module);
+                        }
+                    }
                     if ( program->addFunction(pFn) ) {
                         reportAstChanged();
                         return make_smart<ExprAddr>(expr->at, "_::" + lname + "`function");
@@ -5209,6 +5216,18 @@ namespace das {
                     return opE;
                 }
             }
+            if ( jitEnabled() && expr->subexpr->type->isHandle() ) {
+                // If `[]` not found try looking for native `.[]`.
+                // In JIT we have `.[]` similar to `das_index` in aot.
+                auto candidates = findMatchingFunctions("*", thisModule, ".[]", {expr->subexpr->type,expr->index->type});
+                if ( !candidates.empty() ) {
+                    reportAstChanged();
+                    auto eachFn = make_smart<ExprCall>(expr->at, ".[]");
+                    eachFn->arguments.push_back(expr->subexpr->clone());
+                    eachFn->arguments.push_back(expr->index->clone());
+                    return eachFn;
+                }
+            }
             expr->index = Expression::autoDereference(expr->index);
             auto seT = expr->subexpr->type;
             auto ixT = expr->index->type;
@@ -6341,6 +6360,9 @@ namespace das {
                     TypeDecl::clone(expr->type,var->type);
                     expr->type->ref = true;
                     var->used_in_finally = inFinally.empty() ? false : inFinally.back();
+                    if ( consumeDepth ) {
+                        var->consumed = true;
+                    }
                     return Visitor::visit(expr);
                 }
             }
@@ -6915,9 +6937,9 @@ namespace das {
                 reportAstChanged();
                 if ( logs && logInscopePod ) {
                     if ( !expr->at.empty() && expr->at.fileInfo ) {
-                        *logs << expr->at.fileInfo->name << ":" << expr->at.line << ":" << expr->at.column << "\n";
+                        *logs << expr->at.fileInfo->name << ":" << expr->at.line << ":" << expr->at.column << " ";
                     }
-                    *logs << "In-scope POD applied to <- in function '" << func->module->name << "::" << func->name << "'\n";
+                    *logs << "In-scope POD applied to '" << *expr << "' in function '" << func->module->name << "::" << func->name << "'\n";
                 }
                 // we convert left <- right into
                 // var left`temp & = left
@@ -6935,7 +6957,7 @@ namespace das {
                 pVar->at = expr->left->at;
                 pVar->type = make_smart<TypeDecl>(Type::autoinfer);
                 pVar->type->ref = true;
-                pVar->name = "`pod`inscope`temp`" + to_string(pVar->at.line) + "`" + to_string(pVar->at.column);
+                pVar->name = "_pod_inscope_temp_" + to_string(pVar->at.line) + "_" + to_string(pVar->at.column);
                 pVar->init = expr->left->clone();
                 pLet->variables.push_back(pVar);
                 auto pCall = make_smart<ExprCall>(expr->at,"_::builtin_collect_local_and_zero");
@@ -7914,10 +7936,15 @@ namespace das {
                     (that->type->isHandle() && that->type->annotation->isIterable()) ||
                     (that->type->isString())
              )) {
-                reportAstChanged();
-                auto eachFn = make_smart<ExprCall>(expr->at, "each");
-                eachFn->arguments.push_back(that->clone());
-                return eachFn;
+                auto func = findMatchingFunctions("*", thisModule, "each", {that->type});
+                // If there's any `each` for handle type use it, otherwise
+                // stay in interpreter.
+                if ( !func.empty() ) {
+                    reportAstChanged();
+                    auto eachFn = make_smart<ExprCall>(expr->at, "each");
+                    eachFn->arguments.push_back(that->clone());
+                    return eachFn;
+                }
             }
             if ( that->type && that->type->isRef() ) {
                 return Expression::autoDereference(that);
@@ -8049,6 +8076,7 @@ namespace das {
         virtual void preVisitLet ( ExprLet * expr, const VariablePtr & var, bool last ) override {
             Visitor::preVisitLet(expr, var, last);
             var->single_return_via_move = false;
+            var->consumed = false;
             if ( var->type && var->type->isExprType() ) {
                 return;
             }
@@ -8803,16 +8831,38 @@ namespace das {
                 }
             }
         }
+        bool isConsumeArgumentFunc ( Function * fn ) {
+            if (    fn->fromGeneric
+                &&  fn->fromGeneric->module->name=="$"
+                &&  fn->fromGeneric->name=="consume_argument"
+            ) {
+                return true;
+            }
+            return false;
+        }
+        bool isConsumeArgumentCall ( Expression * arg ) {
+            if ( arg->rtti_isCall() ) {
+                auto argCall = (ExprCall *) arg;
+                if ( argCall->func && isConsumeArgumentFunc(argCall->func) ) return true;
+            }
+            return false;
+        }
         virtual void preVisitCallArg ( ExprCall * call, Expression * arg, bool last ) override {
             Visitor::preVisitCallArg(call, arg, last);
             arg->isCallArgument = true;
             markNoDiscard(arg);
+            if ( forceInscopePod && isConsumeArgumentCall(arg) ) {
+                consumeDepth ++;
+            }
         }
         virtual ExpressionPtr visitCallArg ( ExprCall * call, Expression * arg , bool last ) override {
             if (!arg->type) {
                 call->argumentsFailedToInfer = true;
             } else if (arg->type && arg->type->isAliasOrExpr()) {
                 call->argumentsFailedToInfer = true;
+            }
+            if ( forceInscopePod && isConsumeArgumentCall(arg) ) {
+                consumeDepth --;
             }
             checkEmptyBlock(arg);
             return Visitor::visitCallArg(call, arg, last);
@@ -9576,8 +9626,17 @@ namespace das {
                 if ( func ) func->notInferred();
                 return Visitor::visit(expr);
             }
-            expr->func = inferFunctionCall(expr, InferCallError::functionOrGeneric, expr->genericFunction ? expr->func : nullptr).get();
-            if ( expr->func && expr->func->fromGeneric ) expr->genericFunction = true;
+            if ( forceInscopePod ) {
+                bool resolvedBefore = expr->genericFunction && expr->func;
+                expr->func = inferFunctionCall(expr, InferCallError::functionOrGeneric, expr->genericFunction ? expr->func : nullptr).get();
+                if ( expr->func && expr->func->fromGeneric ) {
+                    expr->genericFunction = true;
+                    if ( !resolvedBefore && isConsumeArgumentFunc(expr->func) ) func->notInferred();
+                }
+            } else {
+                expr->func = inferFunctionCall(expr, InferCallError::functionOrGeneric, expr->genericFunction ? expr->func : nullptr).get();
+                if ( expr->func && expr->func->fromGeneric ) expr->genericFunction = true;
+            }
             if ( expr->aliasSubstitution  ) {
                 if ( expr->arguments.size()!=1 ) {
                     error("casting to bitfield requires one argument", "", "",

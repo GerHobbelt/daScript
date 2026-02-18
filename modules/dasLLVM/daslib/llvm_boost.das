@@ -6,9 +6,9 @@ options no_global_variables = false
 
 module llvm_boost shared
 
-require llvm/llvm_func public
-require llvm/llvm_struct public
-require llvm/llvm_enum public
+require llvm/bindings/llvm_func public
+require llvm/bindings/llvm_struct public
+require llvm/bindings/llvm_enum public
 
 require daslib/safe_addr
 require daslib/defer
@@ -92,6 +92,14 @@ class PrimitiveTypes {
         return LLVMPointerType(t_int8, 0u)
     }
 
+    def ConstI8(val : int8) {
+        return LLVMConstInt(t_int8, val |> uint64(), 0);
+    }
+
+    def ConstI16(val : int16) {
+        return LLVMConstInt(t_int16, val |> uint64, 0);
+    }
+
     def ConstI32(val : uint64) {
         return LLVMConstInt(t_int32, val, 0);
     }
@@ -168,12 +176,9 @@ def LLVMIsVector3(typ : LLVMOpaqueType?) : bool {
 def LLVMBuildLoadVector3(builder : LLVMOpaqueBuilder?; var types : PrimitiveTypes?; var typ : LLVMOpaqueType?; ptr : LLVMOpaqueValue?; name : string) {
     verify(LLVMGetVectorSize(typ) == 3u)
     let elemT = LLVMGetElementType(typ)
-    var ld = LLVMBuildLoad2(builder, LLVMVectorType(elemT, 4u), ptr, name)
-    LLVMSetVolatile(ld, 1)
-    LLVMSetAlignment(ld, 4u)
-    var x = LLVMBuildExtractElement(builder, ld, types.ConstI32(0ul), "")
-    var y = LLVMBuildExtractElement(builder, ld, types.ConstI32(1ul), "")
-    var z = LLVMBuildExtractElement(builder, ld, types.ConstI32(2ul), "")
+    var x = LLVMBuildLoad2(builder, elemT, ptr, "")
+    var y = LLVMBuildLoad2(builder, elemT, LLVMBuildGEP2(builder, elemT, ptr, types.ConstI32(1ul), "", true), "")
+    var z = LLVMBuildLoad2(builder, elemT, LLVMBuildGEP2(builder, elemT, ptr, types.ConstI32(2ul), "", true), "")
     var xyz = LLVMGetUndef(LLVMVectorType(elemT, 3u))
     xyz = LLVMBuildInsertElement(builder, xyz, x, types.ConstI32(0ul), "")
     xyz = LLVMBuildInsertElement(builder, xyz, y, types.ConstI32(1ul), "")
@@ -240,7 +245,7 @@ def LLVMAddAttributeToFunctionArgument(ffunc : LLVMOpaqueValue?; ai : uint; attr
 }
 
 def LLVMBuildShuffleVector(builder : LLVMOpaqueBuilder?; var types : PrimitiveTypes?; v1, v2 : LLVMOpaqueValue?; mask : array<int>; name : string) {
-    var inscope elem : array<LLVMOpaqueValue?>
+    var elem : array<LLVMOpaqueValue?>
     for (m in mask) {
         if (m != -1) {
             elem |> push(types.ConstI32(uint64(m)))

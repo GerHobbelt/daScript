@@ -1603,6 +1603,38 @@ namespace das
         idpi->noPointerCast = true;
     }
 
+    // windows, darwin, linux, etc
+    const char * das_get_platform_name() {
+        #if defined(_WIN32) || defined(_WIN64)
+            return "windows";
+        #elif defined(__APPLE__) || defined(__MACH__)
+            return "darwin";
+        #elif defined(__linux__)
+            return "linux";
+        #elif defined(__EMSCRIPTEN__)
+            return "emscripten";
+        #else
+            return "unknown";
+        #endif
+    }
+
+    // x86, arm, etc
+    const char * das_get_architecture_name() {
+        #if defined(__x86_64__) || defined(_M_X64)
+            return "x86_64";
+        #elif defined(__i386) || defined(_M_IX86)
+            return "x86";
+        #elif defined(__aarch64__)
+            return "arm64";
+        #elif defined(__arm__) || defined(_M_ARM)
+            return "arm";
+        #elif defined(__EMSCRIPTEN__)
+            return "wasm32";
+        #else
+            return "unknown";
+        #endif
+    }
+
     void Module_BuiltIn::addRuntime(ModuleLibrary & lib) {
         // printer flags
         addAlias(makePrintFlags());
@@ -1848,9 +1880,9 @@ namespace das
         addExtern<DAS_BIND_FUN(_builtin_hash_double)>(*this, lib, "hash", SideEffects::none, "_builtin_hash_double")->arg("value");
         addExtern<DAS_BIND_FUN(_builtin_hash_das_string)>(*this, lib, "hash", SideEffects::none, "_builtin_hash_string")->arg("value");
         // locks
-        addInterop<builtin_verify_locks,void,vec4f>(*this, lib, "_builtin_verify_locks",
+        addInterop<builtin_verify_locks,void,vec4f,char *>(*this, lib, "_builtin_verify_locks",
             SideEffects::modifyArgumentAndExternal, "builtin_verify_locks")
-                ->arg("anything");
+                ->args({"anything","errorMessage"});
         addExtern<DAS_BIND_FUN(builtin_set_verify_array_locks)>(*this, lib, "set_verify_array_locks",
             SideEffects::modifyArgument, "builtin_set_verify_array_locks")
                 ->args({"array","check"})->unsafeOperation = true;
@@ -1896,9 +1928,6 @@ namespace das
             SideEffects::modifyArgumentAndExternal, "builtin_table_free")
                 ->args({"table","sizeOfKey","sizeOfValue","context","at"});
         // local collection
-        addInterop<builtin_collect_local,void,vec4f>(*this, lib, "builtin_collect_local",
-            SideEffects::modifyArgumentAndExternal, "builtin_collect_local")
-                ->arg("anything")->unsafeOperation = true;
         addInterop<builtin_collect_local_and_zero,void,vec4f,uint32_t>(*this, lib, "builtin_collect_local_and_zero",
             SideEffects::modifyArgumentAndExternal, "builtin_collect_local_and_zero")
                 ->args({"anything","sizeOfAnything"})->unsafeOperation = true;
@@ -2136,5 +2165,10 @@ namespace das
         addExtern<DAS_BIND_FUN(__bit_set64)>(*this, lib, "__bit_set",
             SideEffects::modifyArgument, "__bit_set64")
                 ->args({"value","mask","on"});
+        // platform and architecture
+        addExtern<DAS_BIND_FUN(das_get_platform_name)>(*this, lib, "get_platform_name",
+            SideEffects::none, "das_get_platform_name");
+        addExtern<DAS_BIND_FUN(das_get_architecture_name)>(*this, lib, "get_architecture_name",
+            SideEffects::none, "das_get_architecture_name");
     }
 }

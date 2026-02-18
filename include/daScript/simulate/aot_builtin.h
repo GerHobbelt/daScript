@@ -69,7 +69,6 @@ namespace das {
     DAS_API void builtin_make_temp_array ( Array & arr, void * data, int size );
     DAS_API void builtin_array_free ( Array & dim, int szt, Context * __context__, LineInfoArg * at );
     DAS_API void builtin_table_free ( Table & tab, int szk, int szv, Context * __context__, LineInfoArg * at );
-    DAS_API vec4f builtin_collect_local ( Context & context, SimNode_CallBase * call, vec4f * args );
     DAS_API vec4f builtin_collect_local_and_zero ( Context & context, SimNode_CallBase * call, vec4f * args );
 
     DAS_API void toLog ( int level, const char * text, Context * context, LineInfoArg * at );
@@ -180,4 +179,7 @@ namespace das {
     void builtin_main_loop ( const TBlock<bool> & block, Context * context, LineInfoArg * at );
 
     vec4f _builtin_hash ( Context & context, SimNode_CallBase * call, vec4f * args );
+
+    const char * das_get_platform_name();
+    const char * das_get_architecture_name();
 }
