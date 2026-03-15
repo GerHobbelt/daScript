@@ -284,8 +284,12 @@ SET(NEED_MODULES_PATH "${CMAKE_CURRENT_BINARY_DIR}/include")
 
 SET(DAS_MODULES_RESOLVE_INC ${NEED_MODULES_PATH}/modules/external_resolve.inc)
 SET(DAS_MODULES_NEED_INC ${NEED_MODULES_PATH}/modules/external_need.inc)
+SET(DAS_MODULES_DECLARE_INC ${NEED_MODULES_PATH}/modules/external_declare.inc)
+SET(DAS_MODULES_PULL_INC ${NEED_MODULES_PATH}/modules/external_pull.inc)
 FILE(WRITE ${DAS_MODULES_RESOLVE_INC}.temp "")
 FILE(WRITE ${DAS_MODULES_NEED_INC}.temp "")
+FILE(WRITE ${DAS_MODULES_DECLARE_INC}.temp "")
+FILE(WRITE ${DAS_MODULES_PULL_INC}.temp "")
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${EXECUTABLE_OUTPUT_PATH})
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/lib)
@@ -320,7 +324,9 @@ MACRO(ADD_DAS_SHARED_MODULE_LIB module_name)
     # Ignore tutorial, profile, test.
     if(NOT "${FOLDER_NAME}" STREQUAL "tutorial" AND
        NOT "${FOLDER_NAME}" STREQUAL "profile" AND
-       NOT "${FOLDER_NAME}" STREQUAL "test")
+       NOT "${FOLDER_NAME}" STREQUAL "test" AND
+       NOT ${module_name} STREQUAL "dasModuleUnitTest"
+       )
         install(TARGETS ${module_name}
             ARCHIVE DESTINATION ${DAS_INSTALL_MODULESDIR}/${FOLDER_NAME}
             RUNTIME DESTINATION ${DAS_INSTALL_MODULESDIR}/${FOLDER_NAME} OPTIONAL
@@ -381,6 +387,8 @@ ENDMACRO()
 
 FUNCTION(ADD_MODULE_CPP cpp)
     FILE(APPEND ${DAS_MODULES_NEED_INC}.temp "NEED_MODULE(Module_${cpp});\n")
+    FILE(APPEND ${DAS_MODULES_DECLARE_INC}.temp "DECLARE_MODULE(Module_${cpp});\n")
+    FILE(APPEND ${DAS_MODULES_PULL_INC}.temp "PULL_MODULE(Module_${cpp});\n")
 ENDFUNCTION()
 
 FUNCTION(ADD_MODULE_NATIVE native)
@@ -394,6 +402,18 @@ ENDFUNCTION()
 
 FOREACH(_module ${_modules})
     INCLUDE(modules/${_module}/CMakeLists.txt OPTIONAL)
+ENDFOREACH()
+
+# Clean stale .shared_module files. When a module is disabled, its .shared_module
+# from a previous build may remain and cause crashes at startup (the dynamic module
+# loader tries to load them even though the module code is no longer linked).
+FILE(GLOB_RECURSE _all_shared_modules "${PROJECT_SOURCE_DIR}/modules/*.shared_module")
+FOREACH(_sm ${_all_shared_modules})
+    GET_FILENAME_COMPONENT(_sm_name "${_sm}" NAME_WE)
+    IF(NOT TARGET ${_sm_name})
+        MESSAGE(STATUS "Removing stale ${_sm}")
+        FILE(REMOVE "${_sm}")
+    ENDIF()
 ENDFOREACH()
 
 FOREACH(_example ${DAS_ALL_EXAMPLES})
@@ -416,7 +436,21 @@ ADD_CUSTOM_COMMAND(
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${DAS_MODULES_RESOLVE_INC}.temp  ${DAS_MODULES_RESOLVE_INC}
 )
 
-ADD_CUSTOM_TARGET(need_and_resolve ALL DEPENDS ${DAS_MODULES_NEED_INC} ${DAS_MODULES_RESOLVE_INC})
+ADD_CUSTOM_COMMAND(
+    DEPENDS ${DAS_MODULES_DECLARE_INC}.temp
+    OUTPUT ${DAS_MODULES_DECLARE_INC}
+    VERBATIM
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${DAS_MODULES_DECLARE_INC}.temp  ${DAS_MODULES_DECLARE_INC}
+)
+
+ADD_CUSTOM_COMMAND(
+    DEPENDS ${DAS_MODULES_PULL_INC}.temp
+    OUTPUT ${DAS_MODULES_PULL_INC}
+    VERBATIM
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${DAS_MODULES_PULL_INC}.temp  ${DAS_MODULES_PULL_INC}
+)
+
+ADD_CUSTOM_TARGET(need_and_resolve ALL DEPENDS ${DAS_MODULES_NEED_INC} ${DAS_MODULES_RESOLVE_INC} ${DAS_MODULES_DECLARE_INC} ${DAS_MODULES_PULL_INC})
 
 # libUriParser
 
@@ -911,6 +945,8 @@ endif()
 SET(DAS_DASCRIPT_MAIN_SRC
     ${PROJECT_SOURCE_DIR}/utils/daScript/main.cpp
     ${DAS_MODULES_NEED_INC}
+    ${DAS_MODULES_DECLARE_INC}
+    ${DAS_MODULES_PULL_INC}
     CACHE INTERNAL "DAS_DASCRIPT_MAIN_SRC"
 )
 
@@ -1006,6 +1042,19 @@ get_target_property(DAS_FMT_LIBS das-fmt LINK_LIBRARIES)
     #      MACOSX_BUNDLE_LONG_VERSION_STRING  "daslang 0.6"
     #      MACOSX_BUNDLE_INFO_PLIST ${CMAKE_SOURCE_DIR}/utils/daScript/MacOSXBundleInfo.plist.in)
     #ENDIF()
+
+    # Thread-safety test (issue #2027) — static link
+    add_executable(test_concurrent_init ${PROJECT_SOURCE_DIR}/tests/threading/test_concurrent_init.cpp)
+    TARGET_LINK_LIBRARIES(test_concurrent_init libDaScript ${SRC_LIBRARIES} ${DAS_MODULES_LIBS})
+    target_include_directories(test_concurrent_init PRIVATE ${NEED_MODULES_PATH})
+    SETUP_CPP11(test_concurrent_init)
+
+    # Thread-safety test (issue #2027) — dynamic link (DLL)
+    add_executable(test_concurrent_init_dyn ${PROJECT_SOURCE_DIR}/tests/threading/test_concurrent_init.cpp)
+    TARGET_LINK_LIBRARIES(test_concurrent_init_dyn libDaScriptDyn ${SRC_LIBRARIES})
+    ADD_DEPENDENCIES(test_concurrent_init_dyn libDaScriptDyn ${DAS_DYN_MODULES_LIBS})
+    target_include_directories(test_concurrent_init_dyn PRIVATE ${NEED_MODULES_PATH})
+    SETUP_CPP11(test_concurrent_init_dyn)
 
 endif()
 
@@ -1165,6 +1214,17 @@ install(FILES
 install(FILES
     ${VECMATH_SRC}
     DESTINATION include/vecmath
+)
+
+# Install dag_noise header (referenced by aot_builtin_math.h).
+install(FILES include/dag_noise/dag_uint_noise.h
+    DESTINATION include/dag_noise
+)
+
+# Install internal builtin headers (needed by integration tutorials like class adapters).
+file(GLOB DAS_BUILTIN_HEADERS ${PROJECT_SOURCE_DIR}/src/builtin/*.h)
+install(FILES ${DAS_BUILTIN_HEADERS}
+    DESTINATION include/daScript/builtin
 )
 
 # Install all modules and main library.

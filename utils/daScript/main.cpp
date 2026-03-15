@@ -1,4 +1,5 @@
 #include "daScript/ast/aot_templates.h"
+#include "daScript/ast/ast.h"
 #include "daScript/ast/dyn_modules.h"
 #include "daScript/daScript.h"
 #include "daScript/das_common.h"
@@ -29,7 +30,16 @@ static bool debuggerRequired = false;
 static bool scopedStackAllocator = true;
 static bool pauseAfterErrors = false;
 static bool quiet = false;
-static bool jitEnabled = false;
+enum class JitMode {
+    None,
+    Direct,
+    Dll,
+    Executable,
+};
+static JitMode jitEnabled = JitMode::None; // Disabled by default.
+static string jitOutPath = ""; // Empty, JIT module will choose default.
+
+static bool noDynamicModules = false;
 
 static bool version2syntax = true;
 static bool gen2MakeSyntax = false;
@@ -232,6 +242,8 @@ int das_aot_main ( int argc, char * argv[] ) {
             } else if ( strcmp(argv[ai],"-v2makeSyntax")==0 ) {
                 version2syntax = false;
                 gen2MakeSyntax = true;
+            } else if ( strcmp(argv[ai],"-no-dynamic-modules")==0 ) {
+                noDynamicModules = true;
             } else if ( strcmp(argv[ai],"--")==0 ) {
                 scriptArgs = true;
             } else if ( !scriptArgs ) {
@@ -286,9 +298,11 @@ int das_aot_main ( int argc, char * argv[] ) {
     #include "modules/external_need.inc"
     #endif
     #ifdef DAS_ENABLE_DYN_INCLUDES
-    daScriptEnvironment::ensure();
-    auto access = get_file_access((char*)(projectFile.empty() ? nullptr : projectFile.c_str()));
-    require_dynamic_modules(access, getDasRoot(), project_root, tout);
+    if ( !noDynamicModules ) {
+        daScriptEnvironment::ensure();
+        auto access = get_file_access((char*)(projectFile.empty() ? nullptr : projectFile.c_str()));
+        require_dynamic_modules(access, getDasRoot(), project_root, tout);
+    }
     #endif
     Module::Initialize();
     daScriptEnvironment::getBound()->g_isInAot = true;
@@ -369,9 +383,16 @@ bool compile_and_run ( const string & fn, const string & mainFnName, bool output
     } else if ( profilerRequired ) {
         policies.profiler = true;
         policies.profile_module = getDasRoot() + "/daslib/profiler.das";
-    } /*else*/ if ( jitEnabled ) {
+    } /*else*/ if ( jitEnabled != JitMode::None ) {
         policies.jit_enabled = true;
+        switch (jitEnabled) {
+            case JitMode::Executable: policies.jit_exe_mode = true; break;
+            case JitMode::Dll: policies.jit_dll_mode = true; break;
+            case JitMode::Direct: break;
+            default: break;
+        }
         policies.jit_module = getDasRoot() + "/daslib/just_in_time.das";
+        policies.jit_output_path = jitOutPath;
         policies.dll_search_paths.emplace_back(getDasRoot() + "/lib");
     } else if (aotEnabled) {
         policies.aot = false;
@@ -505,6 +526,7 @@ void print_help() {
         << "    -das-profiler-log-file <file> set profiler log file\n"
         << "    -das-profiler-manual manual profiler control\n"
         << "    -das-profiler-memory memory profiler\n"
+        << "    -no-dynamic-modules  skip loading dynamic modules from dasroot and project root\n"
         << "daslang -aot <in_script.das> <out_script.das.cpp> {-q} {-p}\n"
         << "    -project <path.das_project> path to project file\n"
         << "    -p          paranoid validation of CPP AOT\n"
@@ -588,7 +610,18 @@ int MAIN_FUNC_NAME ( int argc, char * argv[] ) {
                 version2syntax = false;
                 gen2MakeSyntax = true;
             } else if ( cmd=="jit") {
-                jitEnabled = true;
+                jitEnabled = JitMode::Direct;
+            } else if ( cmd=="output") {
+                if ( i+1 > argc ) {
+                    printf("output requires argument\n");
+                    print_help();
+                    return -1;
+                }
+                jitOutPath = argv[i+1];
+                i += 1;
+            } else if ( cmd=="exe") {
+                jitEnabled = JitMode::Executable;
+                dryRun = true;
             } else if ( cmd=="aot2") {
                 dryRun = true;
                 aotEnabled = true;
@@ -696,6 +729,8 @@ int MAIN_FUNC_NAME ( int argc, char * argv[] ) {
                 // do nohting, script handles it
             } else if ( cmd=="-das-profiler-memory" ) {
                 // do nohting, script handles it
+            } else if ( cmd=="no-dynamic-modules" ) {
+                noDynamicModules = true;
             } else if ( !scriptArgs) {
                 printf("unknown command line option %s\n", cmd.c_str());
                 print_help();
@@ -747,7 +782,7 @@ int MAIN_FUNC_NAME ( int argc, char * argv[] ) {
     #include "modules/external_need.inc"
     #endif
     #ifdef DAS_ENABLE_DYN_INCLUDES
-    {
+    if ( !noDynamicModules ) {
         // Search for external modules and init them. Only if flag is enabled.
         daScriptEnvironment::ensure();
         project_root = deduce_project_root(project_root, files.front());

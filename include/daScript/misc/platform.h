@@ -7,6 +7,14 @@
 #define DAS_VERSION (DAS_VERSION_MAJOR*10000 + DAS_VERSION_MINOR*100 + DAS_VERSION_PATCH)
 #endif
 
+#ifndef DAS_BUILD_ID
+#ifdef NDEBUG
+#define DAS_BUILD_ID (DAS_VERSION * 100 + sizeof(void*))
+#else
+#define DAS_BUILD_ID (DAS_VERSION * 100 + 10 + sizeof(void*))
+#endif
+#endif
+
 #ifdef __HAIKU__
 #define _GNU_SOURCE 1
 #endif
@@ -82,6 +90,7 @@
 
 #include <stdint.h>
 #include <float.h>
+#include <atomic>
 #include <daScript/das_config.h>
 #include <daScript/misc/hash.h>
 #include <daScript/misc/macro.h>
@@ -442,7 +451,7 @@ public:
     using SelfType = DasThreadLocal<T, TAG>;
 
     inline DasThreadLocal() {
-        if ( initCounter++ ) {
+        if ( initCounter.fetch_add(1, std::memory_order_relaxed) ) {
             DAS_ASSERTF(false, "Type with tag is already used, pls change tag!");
         }
     }
@@ -457,7 +466,7 @@ public:
 
 private:
     inline static thread_local T value_{};
-    inline static int initCounter = 0;
+    inline static std::atomic<int> initCounter{0};
 };
 
 #ifndef DAS_THREAD_LOCAL

@@ -57,6 +57,7 @@ All code MUST use gen2 syntax (add `options gen2` at the top of every file). Key
 - **Array literals:** `[1, 2, 3]` — NOT `[[int 1; 2; 3]]`. Creates `array<int>`; use `fixed_array(1, 2, 3)` for fixed-size
 - **Struct init:** `Foo(a=1, b=2)` — NOT `[[Foo() a=1, b=2]]`
 - **Table literals:** `{ "k" => v, "k2" => v2 }` — NOT `{{ "k" => v; "k2" => v2 }}`
+- **Bare blocks:** `{ var x = 1; ... }` at statement level creates a lexical scope (NOT a table literal). Supports `finally`: `{ ... } finally { ... }`
 - **Named arguments:** `foo([name = value])` with square brackets
 - **Block arguments:** block/lambda after `func()` pipes as last arg. No `$` for parameterless blocks: `defer() { ... }`. With params: `build_string() $(var writer) { ... }`. Lambdas: `emplace() @(x : int) { ... }`
 - **Lambda:** `@(args) { body }` or `@@(args) { body }` (no-capture)
@@ -65,6 +66,12 @@ All code MUST use gen2 syntax (add `options gen2` at the top of every file). Key
 - **`typeinfo`:** `typeinfo trait_name(type<T>)` — trait name outside parens
 - **`static_if`:** `static_if (condition) { ... }` — parentheses required
 - **Type function call:** `take(type<int>, 1, 2)` — NOT `take < int > (1, 2)`
+
+### Type modifiers
+
+- **`==const`** on a parameter type — accepts both const and non-const arguments: `def foo(self : MyStruct ==const)` — callers can pass `MyStruct` or `MyStruct const`
+- **`-const`** strips constness in type expressions — used with `reinterpret` for interior mutability: `unsafe(reinterpret<MyStruct? -const>(addr(self)))`
+- **Function pointer with explicit type:** `@@<(var self : T) : RetT> funcName` — specifies the exact parameter/return types of a function pointer literal
 
 ### Important defaults
 
@@ -97,6 +104,8 @@ All code MUST use gen2 syntax (add `options gen2` at the top of every file). Key
 - `key_exists(table, key)` — check without inserting
 - `table |> insert(key, value)` / `table |> erase(key)`
 - **Never use two `[]` lookups on the same table in one expression** — re-hashing can invalidate references
+- **Move-assign table literal:** `tab <- { "k" => v }` works for both `var tab <- { ... }` declarations and `tab <- { ... }` reassignment to existing variables
+- **Table comprehension move-assign:** `tab <- { for(x in range(5)); x => x*x }` — same move-assign rules apply
 
 ### Common gotchas
 

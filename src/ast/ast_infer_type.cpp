@@ -407,7 +407,7 @@ namespace das {
                 varT->ref = false;
                 TypeDecl::applyAutoContracts(varT, var->type);
                 if (!relaxedPointerConst) { // var a = Foo? const -> var a : Foo const? = Foo? const
-                    if (varT->isPointer() && !varT->constant && var->init->type->constant) {
+                    if (varT->isPointer() && !varT->constant && var->init->type->constant && varT->firstType) {
                         varT->firstType->constant = true;
                     }
                 }
@@ -1481,28 +1481,33 @@ namespace das {
                                         }
                                         if (fnAddr) {
                                             if (fnAddr->func) {
-                                                int fnArgSize = int(fnAddr->func->arguments.size());
-                                                int fromFnArgSize = int(expr->arguments.size() - 1);
-                                                bool allHaveInit = true;
-                                                for (int ai = fromFnArgSize; ai < fnArgSize; ++ai) {
-                                                    if (!fnAddr->func->arguments[ai]->init) {
-                                                        allHaveInit = false;
-                                                        break;
-                                                    }
-                                                }
-                                                if (allHaveInit) {
+                                                if ( inArgumentInit && fnAddr->func==func ) {
+                                                    error("recursive call in argument initializer", "", "",
+                                                        expr->at, CompilationError::invalid_argument_count);
+                                                } else {
+                                                    int fnArgSize = int(fnAddr->func->arguments.size());
+                                                    int fromFnArgSize = int(expr->arguments.size() - 1);
+                                                    bool allHaveInit = true;
                                                     for (int ai = fromFnArgSize; ai < fnArgSize; ++ai) {
-                                                        expr->arguments.emplace_back(fnAddr->func->arguments[ai]->init->clone());
+                                                        if (!fnAddr->func->arguments[ai]->init) {
+                                                            allHaveInit = false;
+                                                            break;
+                                                        }
                                                     }
-                                                    reportAstChanged();
-                                                    return Visitor::visit(expr);
+                                                    if (allHaveInit) {
+                                                        for (int ai = fromFnArgSize; ai < fnArgSize; ++ai) {
+                                                            expr->arguments.emplace_back(fnAddr->func->arguments[ai]->init->clone());
+                                                        }
+                                                        reportAstChanged();
+                                                        return Visitor::visit(expr);
+                                                    }
                                                 }
                                             } else {
                                                 error("'" + fnAddr->target + "' is not fully resolved yet", "", "",
                                                       expr->at, CompilationError::invalid_argument_count);
                                             }
                                         } else {
-                                            error("'" + fnAddr->target + "' expecting class_ptr or cast<auto> class_ptr", "", "",
+                                            error("expecting class_ptr or cast<auto> class_ptr", "", "",
                                                   expr->at, CompilationError::invalid_argument_count);
                                         }
                                     } else {
@@ -4285,8 +4290,8 @@ namespace das {
         }
         return expr;
     }
-    void InferTypes::preVisit(ExprWith *expr) {
-        Visitor::preVisit(expr);
+    void InferTypes::preVisitWithBody ( ExprWith * expr, Expression * body) {
+        Visitor::preVisitWithBody(expr, body);
         with.push_back(expr);
     }
     ExpressionPtr InferTypes::visit(ExprWith *expr) {
@@ -4799,7 +4804,7 @@ namespace das {
                 varT->ref = false;
                 TypeDecl::applyAutoContracts(varT, var->type);
                 if (!relaxedPointerConst) { // var a = Foo? const -> var a : Foo const? = Foo? const
-                    if (varT->isPointer() && !varT->constant && var->init->type->constant) {
+                    if (varT->isPointer() && varT->firstType && !varT->constant && var->init->type->constant) {
                         varT->firstType->constant = true;
                     }
                 }
@@ -5020,7 +5025,7 @@ namespace das {
                         return Visitor::visit(expr);
                     }
                 } else if (func && func->isClassMethod && !func->isStaticClassMethod) { // if its a class method with 'self'
-                    auto selfStruct = func->arguments[0]->type->structType;
+                    auto selfStruct = func->arguments.size() > 0 ? func->arguments[0]->type->structType : nullptr;
                     if (!selfStruct) {
                         reportMissing(expr, nonNamedTypes, "no matching functions or generics: ", true);
                         return Visitor::visit(expr);

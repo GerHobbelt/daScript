@@ -1,14 +1,12 @@
 # daslang Project Instructions
 
-> **Keep in sync:** This file and `.github/copilot-instructions.md` share identical content. Both reference skill files in the `skills/` directory at repo root — skill files are shared, not duplicated.
-
 ## Project Overview
 
 This is the [daslang](https://dascript.org/) programming language repository (GaijinEntertainment/daScript). daslang (formerly daScript) is a high-performance statically-typed scripting language designed for games and real-time applications. The language has been renamed to **daslang**, but the repository and many C++ API names still use the old "daScript" spelling.
 
 ## What and Why
 
-daslang was created at Gaijin Entertainment to solve a concrete problem: **interop overhead** between scripting languages (Lua/LuaJIT, Squirrel) and C++ was killing frame budgets in their ECS game engine. The key insight is that daslang's data layout matches C++ — no marshaling, no boxing — making script↔C++ calls near-zero cost.
+daslang was created at Gaijin Entertainment to solve a concrete problem: **interop overhead** between scripting languages (Lua/LuaJIT, Squirrel) and C++ was killing frame budgets in their ECS game engine. The key insight is that daslang’s data layout matches C++ — no marshaling, no boxing — making script↔C++ calls near-zero cost.
 
 **Core design principles:**
 - **Iteration speed is king** — full production game recompiles in ~5 sec; hot reload built in
@@ -43,6 +41,10 @@ See `doc/source/reference/design_philosophy.rst` for the full design philosophy 
 ## GitHub Operations
 
 - **Use `gh` CLI** for all GitHub operations (creating PRs, listing issues, etc.) — NOT GitKraken MCP tools
+- **PowerShell escaping:** Backticks (`` ` ``) are PowerShell’s escape character. Any `gh` command with backticks in arguments (e.g., PR/issue bodies with markdown code spans) will be corrupted. **Always use `gh api` with `-f` flag or `--body-file`** instead of `gh pr create --body` / `gh pr edit --body` when the text contains backticks:
+  - Write body to a temp `.md` file, then: `gh api repos/OWNER/REPO/pulls/N -X PATCH -f body="$(Get-Content -Raw body.md)"`
+  - Or: `gh pr create --body-file body.md`
+- **`gh pr edit` may fail** with `GraphQL: Projects (classic) is being deprecated` error — use `gh api` REST endpoint as workaround
 
 ## Skill Files (REQUIRED)
 
@@ -64,7 +66,7 @@ Multiple skill files may apply to a single task. For example, creating a new das
 
 ### Updating Instructions with New Knowledge
 
-When you discover something new about daslang syntax, semantics, or conventions — whether through compiler errors, user corrections, or experimentation — **update this file** (and its `.github/copilot-instructions.md` mirror) with the new knowledge. If it relates to a specific skill area, update the relevant `skills/*.md` file instead.
+When you discover something new about daslang syntax, semantics, or conventions — whether through compiler errors, user corrections, or experimentation — **update this file** with the new knowledge. If it relates to a specific skill area, update the relevant `skills/*.md` file instead.
 
 ## daslang Language — Gen2 Syntax (REQUIRED)
 
@@ -77,6 +79,7 @@ All code MUST use gen2 syntax (add `options gen2` at the top of every file). Key
 - **Array literals:** `[1, 2, 3]` — NOT `[[int 1; 2; 3]]`. Creates `array<int>`; use `fixed_array(1, 2, 3)` for fixed-size
 - **Struct init:** `Foo(a=1, b=2)` — NOT `[[Foo() a=1, b=2]]`
 - **Table literals:** `{ "k" => v, "k2" => v2 }` — NOT `{{ "k" => v; "k2" => v2 }}`
+- **Bare blocks:** `{ var x = 1; ... }` at statement level creates a lexical scope (NOT a table literal). Supports `finally`: `{ ... } finally { ... }`
 - **Named arguments:** `foo([name = value])` with square brackets
 - **Block arguments:** block/lambda after `func()` pipes as last arg. No `$` for parameterless blocks: `defer() { ... }`. With params: `build_string() $(var writer) { ... }`. Lambdas: `emplace() @(x : int) { ... }`
 - **Lambda:** `@(args) { body }` or `@@(args) { body }` (no-capture)
@@ -85,6 +88,12 @@ All code MUST use gen2 syntax (add `options gen2` at the top of every file). Key
 - **`typeinfo`:** `typeinfo trait_name(type<T>)` — trait name outside parens
 - **`static_if`:** `static_if (condition) { ... }` — parentheses required
 - **Type function call:** `take(type<int>, 1, 2)` — NOT `take < int > (1, 2)`
+
+### Type modifiers
+
+- **`==const`** on a parameter type — accepts both const and non-const arguments: `def foo(self : MyStruct ==const)` — callers can pass `MyStruct` or `MyStruct const`
+- **`-const`** strips constness in type expressions — used with `reinterpret` for interior mutability: `unsafe(reinterpret<MyStruct? -const>(addr(self)))`
+- **Function pointer with explicit type:** `@@<(var self : T) : RetT> funcName` — specifies the exact parameter/return types of a function pointer literal
 
 ### Important defaults
 
@@ -107,8 +116,8 @@ All code MUST use gen2 syntax (add `options gen2` at the top of every file). Key
 
 ### Generic function dispatch
 
-- **`_::foo(x)`**: resolves in the **calling** module — caller's overloads visible. Use in library generics.
-- **Unqualified** `foo(x)`: resolves in the **defining** module — caller's overloads NOT visible.
+- **`_::foo(x)`**: resolves in the **calling** module — caller’s overloads visible. Use in library generics.
+- **Unqualified** `foo(x)`: resolves in the **defining** module — caller’s overloads NOT visible.
 - This is why `:=` and `delete` emit `_::clone` / `_::finalize`
 
 ### Table operations
@@ -117,6 +126,8 @@ All code MUST use gen2 syntax (add `options gen2` at the top of every file). Key
 - `key_exists(table, key)` — check without inserting
 - `table |> insert(key, value)` / `table |> erase(key)`
 - **Never use two `[]` lookups on the same table in one expression** — re-hashing can invalidate references
+- **Move-assign table literal:** `tab <- { "k" => v }` works for both `var tab <- { ... }` declarations and `tab <- { ... }` reassignment to existing variables
+- **Table comprehension move-assign:** `tab <- { for(x in range(5)); x => x*x }` — same move-assign rules apply
 
 ### Common gotchas
 

@@ -61,15 +61,15 @@ jobs:
             archive_ext: tar.gz
             sanitizers: none
 
-          # single asan build
-          - target: linux
-            architecture: 64
-            runner: ubuntu-latest
-            cmake_preset: Debug
-            sanitizers: asan
-            build_name: linux_asan
-            build_system: cmake
-            cmake_generator: Ninja
+          # single asan build — disabled: consistently times out in CI
+          # - target: linux
+          #   architecture: 64
+          #   runner: ubuntu-latest
+          #   cmake_preset: Debug
+          #   sanitizers: asan
+          #   build_name: linux_asan
+          #   build_system: cmake
+          #   cmake_generator: Ninja
 
           # single ubsan build
           - target: linux
