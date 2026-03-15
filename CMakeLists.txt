@@ -17,13 +17,11 @@ option(DAS_GLFW_DISABLED "Disable dasGLFW (GLFW window for graphics apps)" OFF)
 option(DAS_IMGUI_DISABLED "Disable dasIMGUI (IMGUI, IMNODES, IMGUI-NODE-EDITOR gui libraries)" ON)
 option(DAS_MINFFT_DISABLED "Disable dasMinfft (Minimal FFT library)" ON)
 option(DAS_AUDIO_DISABLED "Disable dasAudio (Miniaudio sound library)" ON)
-option(DAS_OPENAI_DISABLED "Disable dasOpenAI (OpenAI site API)" ON)
 option(DAS_STDDLG_DISABLED "Disable dasStdDlg (File new,open,save etc dialogs)" OFF)
 option(DAS_STBIMAGE_DISABLED "Disable dasStbImage (StbImage bindings, image loading and saving)" OFF)
 option(DAS_STBTRUETYPE_DISABLED "Disable dasStbTrueType (StbTrueType bindings, ttf rasterization)" OFF)
 option(DAS_PUGIXML_DISABLED "Disable dasPUGIXML (xml parsing library)" ON)
 option(DAS_SQLITE_DISABLED "Disable dasSQLITE (sqlite3 library)" ON)
-option(DAS_TELEGRAM_DISABLED "Disable dasTelegram (Telegram API bindings)" ON)
 option(DAS_TOOLS_DISABLED "Disable dasTools" OFF)
 option(DAS_TREE_SITTER_DISABLED "Disable tree-sitter-daslang grammar (no dependencies)" OFF)
 option(DAS_AOT_EXAMPLES_DISABLED "Disable dasAOT examples" OFF)
@@ -773,6 +771,7 @@ src/simulate/data_walker.cpp
 include/daScript/simulate/data_walker.h
 src/simulate/debug_print.cpp
 src/simulate/json_print.cpp
+src/simulate/json_scan.cpp
 include/daScript/simulate/debug_print.h
 include/daScript/simulate/for_each.h
 include/daScript/simulate/bind_enum.h
@@ -1290,21 +1289,41 @@ install(FILES ${PROJECT_SOURCE_DIR}/include/vecmath/LICENSE DESTINATION ${DAS_IN
 install(FILES ${PROJECT_SOURCE_DIR}/utils/aot/main.das DESTINATION utils/aot)
 install(FILES ${PROJECT_SOURCE_DIR}/utils/dasCodeFormatter/main.das DESTINATION utils/dasCodeFormatter)
 
-# Install MCP server (requires dasHV)
-if(NOT DAS_HV_DISABLED)
-    install(FILES ${PROJECT_SOURCE_DIR}/utils/mcp/main.das DESTINATION utils/mcp)
-    install(FILES ${PROJECT_SOURCE_DIR}/utils/mcp/README.md DESTINATION utils/mcp)
-    file(GLOB DAS_MCP_TOOLS ${PROJECT_SOURCE_DIR}/utils/mcp/tools/*.das)
-    install(FILES ${DAS_MCP_TOOLS} DESTINATION utils/mcp/tools)
-    install(FILES
-        ${PROJECT_SOURCE_DIR}/utils/mcp/test_tools.das
-        DESTINATION utils/mcp
-    )
-    install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/mcp/tests/
-        DESTINATION utils/mcp/tests
-        FILES_MATCHING PATTERN "*.das"
-    )
-endif()
+# Install MCP server (stdio transport, no dasHV dependency)
+install(FILES
+    ${PROJECT_SOURCE_DIR}/utils/mcp/main.das
+    ${PROJECT_SOURCE_DIR}/utils/mcp/protocol.das
+    ${PROJECT_SOURCE_DIR}/utils/mcp/README.md
+    DESTINATION utils/mcp
+)
+file(GLOB DAS_MCP_TOOLS ${PROJECT_SOURCE_DIR}/utils/mcp/tools/*.das)
+install(FILES ${DAS_MCP_TOOLS} DESTINATION utils/mcp/tools)
+install(FILES
+    ${PROJECT_SOURCE_DIR}/utils/mcp/test_tools.das
+    DESTINATION utils/mcp
+)
+install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/mcp/tests/
+    DESTINATION utils/mcp/tests
+    FILES_MATCHING PATTERN "*.das"
+)
+
+# Install daspkg (package manager)
+file(GLOB DAS_DASPKG_FILES ${PROJECT_SOURCE_DIR}/utils/daspkg/*.das)
+install(FILES ${DAS_DASPKG_FILES} DESTINATION utils/daspkg)
+install(FILES
+    ${PROJECT_SOURCE_DIR}/utils/daspkg/README.md
+    ${PROJECT_SOURCE_DIR}/utils/daspkg/DESIGN.md
+    DESTINATION utils/daspkg
+)
+install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/daspkg/fixtures/
+    DESTINATION utils/daspkg/fixtures
+    FILES_MATCHING PATTERN "*.das_package"
+)
+
+# Install daspkg examples
+install(DIRECTORY ${PROJECT_SOURCE_DIR}/examples/daspkg/
+    DESTINATION examples/daspkg
+)
 
 # Install core example .das files
 install(FILES
@@ -1467,7 +1486,7 @@ if(NOT ${DAS_TREE_SITTER_DISABLED})
     set_target_properties(tree_sitter_daslang PROPERTIES
         C_STANDARD 11
         PREFIX ""
-        OUTPUT_NAME "tree_sitter_daslang"
+        OUTPUT_NAME "daslang"
     )
     if(MSVC)
         target_compile_options(tree_sitter_daslang PRIVATE /W3)
@@ -1478,6 +1497,11 @@ if(NOT ${DAS_TREE_SITTER_DISABLED})
         RUNTIME DESTINATION ${DAS_INSTALL_BINDIR}
         LIBRARY DESTINATION ${DAS_INSTALL_LIBDIR}
     )
+    # Also install DLL into tree-sitter-daslang/ for ast-grep (sgconfig.yml references it there)
+    install(TARGETS tree_sitter_daslang
+        RUNTIME DESTINATION tree-sitter-daslang
+        LIBRARY DESTINATION tree-sitter-daslang
+    )
     install(FILES
         tree-sitter-daslang/src/node-types.json
         tree-sitter-daslang/grammar.js
@@ -1487,5 +1511,16 @@ if(NOT ${DAS_TREE_SITTER_DISABLED})
     install(FILES
         tree-sitter-daslang/queries/highlights.scm
         DESTINATION tree-sitter-daslang/queries
+    )
+    # ast-grep config templates (used by grep_usage and outline MCP tools)
+    install(FILES
+        ${PROJECT_SOURCE_DIR}/sgconfig.yml.windows
+        ${PROJECT_SOURCE_DIR}/sgconfig.yml.linux
+        ${PROJECT_SOURCE_DIR}/sgconfig.yml.osx
+        DESTINATION ${DAS_INSTALL_DOCDIR}
+    )
+    install(FILES
+        tree-sitter-daslang/outline_rules.yml
+        DESTINATION tree-sitter-daslang
     )
 endif()

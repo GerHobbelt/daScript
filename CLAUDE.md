@@ -74,11 +74,8 @@ When AOT fails with `error[50101]: AOT link failed`, the issue is a **semantic h
 
 ## GitHub Operations
 
-- **Use `gh` CLI** for all GitHub operations (creating PRs, listing issues, etc.) — NOT GitKraken MCP tools
-- **PowerShell escaping:** Backticks (`` ` ``) are PowerShell’s escape character. Any `gh` command with backticks in arguments (e.g., PR/issue bodies with markdown code spans) will be corrupted. **Always use `gh api` with `-f` flag or `--body-file`** instead of `gh pr create --body` / `gh pr edit --body` when the text contains backticks:
-  - Write body to a temp `.md` file, then: `gh api repos/OWNER/REPO/pulls/N -X PATCH -f body="$(Get-Content -Raw body.md)"`
-  - Or: `gh pr create --body-file body.md`
-- **`gh pr edit` may fail** with `GraphQL: Projects (classic) is being deprecated` error — use `gh api` REST endpoint as workaround
+- **Use GitHub MCP tools** (`mcp__github__*`) for all GitHub operations (creating PRs, listing issues, reading PRs, etc.) — they avoid shell escaping issues entirely
+- **Fallback:** If MCP tools are unavailable, use `gh` CLI with `--body-file` for any text containing backticks (backticks are shell escape characters in both PowerShell and bash heredocs on MSYS2)
 
 ## Skill Files (REQUIRED)
 
@@ -93,7 +90,7 @@ Task-specific instructions are split into skill files under `skills/`. You MUST 
 | `skills/daslib_modules.md` | Working with `daslib/` modules (linq, json, regex, functional, match, etc.), channels, or extending the standard library |
 | `skills/das_macros.md` | Writing compile-time macros, AST manipulation, qmacro/quote code generation, smart_ptr ownership patterns |
 | `skills/writing_benchmarks.md` | Writing or running benchmark files under `benchmarks/` |
-| `skills/dynamic_modules.md` | Creating or editing `.das_module` descriptors, adding new modules under `modules/` |
+| `skills/dynamic_modules.md` | Creating or editing `.das_module` descriptors, adding new modules under `modules/`, structuring daspkg packages |
 | `skills/install_instructions.md` | Creating or updating AI instruction files (`install/CLAUDE.md`, `install/skills/`) for the installed SDK |
 | `skills/aot_testing.md` | Adding AOT test files, working with the `test_aot` binary, `Module::aotRequire()`, CMake AOT macros, **debugging AOT hash mismatches** |
 
@@ -139,14 +136,33 @@ All code MUST use gen2 syntax (add `options gen2` at the top of every file). Key
 - No `bool(int)` cast — use `x != 0`; no `string(bool)` — use `"{flag}"`
 - `int("123")` does NOT work — use `to_int` from `require strings`
 - Hex literals are `uint` by default — use `int(0x3F)` for int
+- **`default<T>`** — the default (zero) value of type `T`: `default<int>` is `0`, `default<string>` is `""`, `default<float>` is `0.0f`
+- **`typedecl(expr)`** — compile-time type-of expression, usable inside `default<>`: `default<typedecl(field)>` gives the zero value of `field`'s type. Useful in generic code with `static_if` to compare against defaults.
 - **Bitfield sizes**: `bitfield Name : uint8 { ... }`, `: uint16`, `: uint64`; default is `uint` (32-bit). Always unsigned.
 - **Bitfield from expression**: `bitfield64(1ul << 13ul)` — use the constructor to create a bitfield value from an integer expression. Similarly `bitfield8()`, `bitfield16()`.
+
+### Pass-by-value vs pass-by-reference
+
+- Most types (structs, arrays, tables) always pass by reference — `&` is unnecessary on them
+- Only **workhorse types** (`int`, `float`, `bool`, `string`, etc. — `isWorkhorseType` on the C++ side) pass by value
+- **`var s : string`** — writable local copy, changes do NOT propagate back to the caller
+- **`var s : string&`** — pass by reference, changes propagate back. Use `&` for string out-parameters
+- **`clone_string(s)`** — clones a string into the current context's heap. Required for cross-context calls where the source context may be destroyed
+- **`:=`** on strings performs a clone (allocates in current context). Plain `=` copies the pointer
 
 ### Memory and move semantics
 
 - daslang has garbage collection — `delete` is not required in most code
 - `var inscope` declares automatic cleanup; struct fields need defaults or `@safe_when_uninitialized`
 - `<-` is memcpy+memset(0), NOT smart_ptr-aware — see `skills/das_macros.md` for smart_ptr patterns
+
+### Unsafe
+
+- **`unsafe(expr)`** — narrow-scope unsafe, preferred over `unsafe { block }`. Limits unsafe to the exact expression that needs it
+- **Local reference binding is unsafe:** `let blk & = expr` requires `unsafe` whenever it creates a local reference to a non-local expression — `let blk & = unsafe(expr)`
+- **Variant `as` read access is safe:** `(v as _field).member` works without `unsafe` after an `is` check
+- **Variant field assignment is always unsafe:** `v._field = value` and `set_variant_index(v, N)` require `unsafe`
+- **`reinterpret<T>(expr)`** requires `unsafe` — used for const-stripping on regular pointers: `unsafe(reinterpret<Foo?>(const_ptr))`
 
 ### Error handling
 
@@ -201,13 +217,13 @@ All code MUST use gen2 syntax (add `options gen2` at the top of every file). Key
 - `tutorials/language/` — Language tutorial `.das` files
 - `tutorials/integration/cpp/` — C++ integration tutorials
 - `modules/` — External plugin modules
-- `utils/mcp/` — MCP server for AI coding assistants (requires dasHV)
+- `utils/mcp/` — MCP server for AI coding assistants (stdio transport, no extra deps)
 
 ## MCP Server (AI Tool Integration)
 
-The daslang MCP server (`utils/mcp/main.das`) exposes compiler diagnostics and program introspection to AI coding assistants via the [Model Context Protocol](https://modelcontextprotocol.io/). It requires dasHV (`DAS_HV_DISABLED=OFF`).
+The daslang MCP server (`utils/mcp/main.das`) exposes compiler diagnostics and program introspection to AI coding assistants via the [Model Context Protocol](https://modelcontextprotocol.io/). Uses stdio transport — no extra build dependencies.
 
-**When MCP tools are available**, prefer them over manual compilation and grep-based exploration:
+**When MCP tools are available**, prefer them over manual compilation and grep-based exploration. **For searching `.das` files, prefer MCP tools over built-in Grep/Glob** — `grep_usage` is parse-aware (tree-sitter), `find_references` resolves cross-module symbols, `find_symbol` searches all loaded modules:
 
 | Tool | Use instead of... |
 |---|---|
@@ -227,12 +243,14 @@ The daslang MCP server (`utils/mcp/main.das`) exposes compiler diagnostics and p
 | `type_of` | Manually inspecting expression types |
 | `list_requires` | Grepping for `require` statements and guessing transitive deps |
 | `find_references` | Manually searching for all usages of a symbol across files |
+| `eval_expression` | Evaluating expressions by writing throwaway scripts |
+| `describe_type` | Reading source to understand type fields, methods, and values |
+| `grep_usage` | Using built-in Grep tool to search for symbol names in `.das` files (parse-aware via ast-grep + tree-sitter — no false positives from comments/strings) |
+| `outline` | Manually scanning files for function/struct/enum declarations |
 
 Cursor-based tools (`goto_definition`, `type_of`, `find_references`) support a `no_opt` parameter that disables compiler optimizations to preserve the full AST — useful when globals, enum values, or bitfield constants get constant-folded away.
 
-**Starting the server:** `bin/Release/daslang.exe utils/mcp/main.das` (port 9500 by default)
-
-**Configuration:** See `utils/mcp/README.md` for `.mcp.json` setup and Claude Code permissions.
+**Configuration:** Configure `.mcp.json` with `"command": "bin/Release/daslang.exe", "args": ["utils/mcp/main.das"]`. See `utils/mcp/README.md` for details and Claude Code permissions.
 
 **Tests:** `bin/Release/daslang.exe dastest/dastest.das -- --test utils/mcp/test_tools.das`
 

@@ -12,6 +12,8 @@
 
 .. |handmade/function-builtin-get_das_root| replace:: to be documented in |handmade/function-builtin-get_das_root|.rst
 
+.. |handmade/function-builtin-get_das_version| replace:: to be documented in |handmade/function-builtin-get_das_version|.rst
+
 .. |handmade/function-builtin-builtin_get_command_line_arguments| replace:: to be documented in |handmade/function-builtin-builtin_get_command_line_arguments|.rst
 
 .. |handmade/function-builtin-is_compiling| replace:: to be documented in |handmade/function-builtin-is_compiling|.rst
@@ -41,6 +43,8 @@
 .. |handmade/function-builtin-sprint| replace:: to be documented in |handmade/function-builtin-sprint|.rst
 
 .. |handmade/function-builtin-sprint_json| replace:: to be documented in |handmade/function-builtin-sprint_json|.rst
+
+.. |handmade/function-builtin-sscan_json| replace:: to be documented in |handmade/function-builtin-sscan_json|.rst
 
 .. |handmade/function-builtin-terminate| replace:: to be documented in |handmade/function-builtin-terminate|.rst
 

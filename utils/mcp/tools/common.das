@@ -4,8 +4,10 @@ options no_unused_function_arguments = false
 options no_unused_block_arguments = false
 
 require daslib/json_boost public
+require daslib/strings_boost public
 require ast public
 require rtti public
+require math public
 require strings public
 require fio public
 
@@ -38,6 +40,34 @@ def compile_and_simulate(file : string; project : string = ""; blk : block<(prog
     return compile_program(file, false, false, project) <| blk
 }
 
+def compile_and_simulate_ctx(file : string; project : string = ""; blk : block<(program : smart_ptr<Program>; var ctx : smart_ptr<Context>; issues : string) : string>) : string {
+    var inscope access <- make_file_access(project)
+    var result : string
+    var had_error = false
+    using() <| $(var mg : ModuleGroup) {
+        using() <| $(var cop : CodeOfPolicies) {
+            cop.threadlock_context = true
+            cop.ignore_shared_modules = true
+            compile_file(file, access, unsafe(addr(mg)), cop) <| $(ok; program; issues) {
+                if (!ok) {
+                    result = "Compilation failed:\n{issues}"
+                    had_error = true
+                } else {
+                    simulate(program) <| $(sok; var ctx; serrors) {
+                        if (!sok) {
+                            result = "Simulation failed:\n{serrors}"
+                            had_error = true
+                            return
+                        }
+                        result = invoke(blk, program, ctx, string(issues))
+                    }
+                }
+            }
+        }
+    }
+    return make_tool_result(result, had_error)
+}
+
 def compile_program(file : string; _export_all : bool; blk : block<(program : smart_ptr<Program>; issues : string) : string>) : string {
     return compile_program(file, _export_all, false, "") <| blk
 }
@@ -49,6 +79,7 @@ def compile_program(file : string; _export_all : bool; _no_opt : bool; project :
     using() <| $(var mg : ModuleGroup) {
         using() <| $(var cop : CodeOfPolicies) {
             cop.threadlock_context = true
+            cop.ignore_shared_modules = true
             if (_export_all) {
                 cop.export_all = true
             }
@@ -175,5 +206,118 @@ def write_function_list(var writer : StringBuilderWriter; program : smart_ptr<Pr
         for (f in generic_instances) {
             write(writer, "{f}\n")
         }
+    }
+}
+
+// ── Executable path ──────────────────────────────────────────────────
+
+// Returns absolute path to the daslang executable, with backslashes on Windows
+def get_daslang_exe() : string {
+    let args <- get_command_line_arguments()
+    if (empty(args)) {
+        return ""
+    }
+    var exe = args[0]
+    // If relative path, make absolute using das_root
+    if (find(exe, ":") < 0 && character_at(exe, 0) != '/') {
+        exe = "{get_das_root()}/{exe}"
+    }
+    // Replace forward slashes with backslashes for cmd.exe on Windows only
+    if (get_platform_name() == "windows") {
+        return replace(exe, "/", "\\")
+    }
+    return exe
+}
+
+// Run an external command, capture stdout+stderr to a temp file, return (exit_code, output)
+def run_and_capture(cmd_line : string; var output : string&) : int {
+    let root = get_das_root()
+    let tmp_out = "{root}/_mcp_cmd_output.txt"
+    let full_cmd = "{cmd_line} > {tmp_out} 2>&1"
+    var exit_code = -1
+    unsafe {
+        exit_code = popen(full_cmd) <| $(f) {
+            if (f != null) {
+                fread(f)
+            }
+        }
+    }
+    fopen(tmp_out, "rb") <| $(f) {
+        if (f != null) {
+            output = fread(f)
+        }
+    }
+    remove(tmp_out)
+    return exit_code
+}
+
+// ── File path utilities ──────────────────────────────────────────────
+
+def resolve_path(path : string) : string {
+    if (empty(path)) {
+        return get_das_root()
+    }
+    if (length(path) > 0 && character_at(path, 0) != '/' && find(path, ":") < 0) {
+        return "{get_das_root()}/{path}"
+    }
+    return path
+}
+
+def make_relative_path(path, root : string) : string {
+    var result = path
+    if (find(result, root) == 0) {
+        result = slice(result, length(root) + 1)
+    }
+    return replace(result, "\\", "/")
+}
+
+// Expand a glob pattern (e.g. "utils/mcp/tools/*.das") into a list of file paths
+def expand_glob(pattern : string; var result : array<string>) {
+    let last_slash = max(rfind(pattern, "/"), rfind(pattern, "\\"))
+    var dir_part = "."
+    var file_pattern = pattern
+    if (last_slash >= 0) {
+        dir_part = slice(pattern, 0, last_slash)
+        file_pattern = slice(pattern, last_slash + 1)
+    }
+    dir(dir_part) <| $(fname) {
+        if (fname == "." || fname == "..") {
+            return
+        }
+        if (glob_match(file_pattern, fname)) {
+            if (dir_part == ".") {
+                result |> push(fname)
+            } else {
+                result |> push("{dir_part}/{fname}")
+            }
+        }
+    }
+    sort(result)
+}
+
+// Parse file argument: glob pattern, comma-separated list, or single file
+def parse_file_list(file : string; var result : array<string>) {
+    if (find(file, "*") >= 0 || find(file, "?") >= 0) {
+        expand_glob(file, result)
+    } elif (find(file, ",") >= 0) {
+        var rest = file
+        while (!empty(rest)) {
+            let comma = find(rest, ",")
+            if (comma >= 0) {
+                let part = strip(slice(rest, 0, comma))
+                if (!empty(part)) {
+                    result |> push(part)
+                }
+                rest = slice(rest, comma + 1)
+            } else {
+                let part = strip(rest)
+                if (!empty(part)) {
+                    result |> push(part)
+                }
+                break
+            }
+        }
+    } else {
+        result |> push(file)
     }
 }

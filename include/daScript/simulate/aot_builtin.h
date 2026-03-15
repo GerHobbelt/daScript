@@ -17,6 +17,7 @@ namespace das {
     DAS_API uint64_t get_context_share_counter ( Context * context );
 
     DAS_API char * builtin_das_root ( Context * context, LineInfoArg * at );
+    DAS_API char * builtin_get_das_version ( Context * context, LineInfoArg * at );
     DAS_API void builtin_throw ( char * text, Context * context, LineInfoArg * at );
     DAS_API void builtin_print ( char * text, Context * context, LineInfoArg * at );
     DAS_API void builtin_error ( char * text, Context * context, LineInfoArg * at );
@@ -24,6 +25,7 @@ namespace das {
     DAS_API void builtin_feint ( char * text, Context * context, LineInfoArg * at );
     DAS_API vec4f builtin_sprint ( Context & context, SimNode_CallBase * call, vec4f * args );
     DAS_API vec4f builtin_json_sprint ( Context & context, SimNode_CallBase * call, vec4f * args );
+    DAS_API vec4f builtin_json_sscan ( Context & context, SimNode_CallBase * call, vec4f * args );
     DAS_API char * builtin_print_data ( const void * data, const TypeInfo * typeInfo, Bitfield flags, Context * context, LineInfoArg * at );
     DAS_API char * builtin_print_data_v ( float4 data, const TypeInfo * typeInfo, Bitfield flags, Context * context, LineInfoArg * at );
     DAS_API char * builtin_debug_type ( const TypeInfo * typeInfo, Context * context, LineInfoArg * at );

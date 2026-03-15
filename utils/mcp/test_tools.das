@@ -6,11 +6,13 @@ require dastest/testing_boost public
 require daslib/json
 require daslib/json_boost
 require strings
+require fio
 
 require tools/compile_check public
 require tools/list_functions public
 require tools/list_types public
 require tools/run_script public
+require tools/run_test public
 require tools/format_file public
 require tools/ast_dump public
 require tools/list_modules public
@@ -23,6 +25,9 @@ require tools/type_of public
 require tools/find_references public
 require tools/eval_expression public
 require tools/describe_type public
+require tools/grep_usage public
+require tools/outline public
+require tools/aot public
 
 // helper: parse tool result JSON, return (text, isError)
 def parse_result(result : string; var text : string&; var is_error : bool&) : bool {
@@ -193,6 +198,29 @@ def test_run_script_error(t : T?) {
         var is_error = false
         let code = "options gen2\ndef broken() : int \{\n    return \"nope\"\n\}\n"
         parse_result(do_run_script("", code), text, is_error)
+        t |> success(is_error, "should be error")
+    }
+}
+
+// ── run_test ──────────────────────────────────────────────────────────
+
+[test]
+def test_run_test_passing(t : T?) {
+    t |> run("passing test returns success") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        parse_result(do_run_test(fixture_path("_fixture_test.das")), text, is_error)
+        t |> success(!is_error, "should not be error")
+        t |> success(find(text, "passed") >= 0, "should contain 'passed'")
+    }
+}
+
+[test]
+def test_run_test_bad_file(t : T?) {
+    t |> run("nonexistent file reports error") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        parse_result(do_run_test("nonexistent_test_file.das"), text, is_error)
         t |> success(is_error, "should be error")
     }
 }
@@ -791,5 +819,262 @@ def test_describe_type(t : T?) {
         parse_result(do_describe_type("NonExistentType", ""), text, is_error)
         t |> success(!is_error, "should not be error")
         t |> success(find(text, "not found") >= 0, "should report not found")
+    }
+}
+
+// ── grep_usage ──────────────────────────────────────────────────────
+
+[test]
+def test_grep_usage(t : T?) {
+    t |> run("finds symbol in directory") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        parse_result(do_grep_usage("compile_program", "utils/mcp/tools", "", ""), text, is_error)
+        t |> success(!is_error, "should not be error")
+        t |> success(find(text, "compile_program") >= 0, "should contain symbol name")
+        t |> success(find(text, "common.das") >= 0, "should find in common.das")
+        t |> success(find(text, "Found") >= 0, "should have Found header")
+    }
+    t |> run("returns correct line numbers") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        parse_result(do_grep_usage("compile_program", "utils/mcp/tools", "", ""), text, is_error)
+        // line numbers should be > 1 (not all zeros)
+        t |> success(find(text, "  1:") < 0 || find(text, "  38:") >= 0 || find(text, "  41:") >= 0, "should have real line numbers")
+    }
+    t |> run("no matches returns clean message") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        parse_result(do_grep_usage("xyzzy_nonexistent_symbol_12345", "utils/mcp/tools", "", ""), text, is_error)
+        t |> success(!is_error, "should not be error")
+    }
+    t |> run("missing symbol is error") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        parse_result(do_grep_usage("", "", "", ""), text, is_error)
+        t |> success(is_error, "should be error")
+    }
+}
+
+[test]
+def test_grep_usage_parse_aware(t : T?) {
+    t |> run("skips comments and strings") <| @(t : T?) {
+        // search for 'compile_program' in tools — should only find code references,
+        // not occurrences inside comments or strings
+        var text : string
+        var is_error = false
+        parse_result(do_grep_usage("compile_program", "utils/mcp/tools", "", ""), text, is_error)
+        t |> success(!is_error, "should not be error")
+        // all matches should be actual code (compile_program function calls/defs)
+        t |> success(find(text, "common.das") >= 0, "should find in common.das where it's defined")
+    }
+}
+
+[test]
+def test_grep_usage_glob_exclude(t : T?) {
+    t |> run("exclude glob filters out files") <| @(t : T?) {
+        // compile_program is defined in common.das — exclude it
+        var text : string
+        var is_error = false
+        parse_result(do_grep_usage("compile_program", "utils/mcp/tools", "", "!**/common.das"), text, is_error)
+        t |> success(!is_error, "should not be error")
+        t |> success(find(text, "common.das") < 0, "common.das should be excluded")
+    }
+    t |> run("include glob limits to matching files") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        parse_result(do_grep_usage("compile_program", "utils/mcp/tools", "", "common.das"), text, is_error)
+        t |> success(!is_error, "should not be error")
+        // only common.das should appear
+        t |> success(find(text, "common.das") >= 0, "should find in common.das")
+        t |> success(find(text, "compile_check.das") < 0, "should not find in other files")
+    }
+}
+
+[test]
+def test_outline(t : T?) {
+    t |> run("lists functions and structs") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        parse_result(do_outline("utils/mcp/tests/_fixture_valid.das", ""), text, is_error)
+        t |> success(!is_error, "should not be error")
+        t |> success(find(text, "[function]") >= 0, "should find functions")
+        t |> success(find(text, "[struct]") >= 0, "should find structs")
+        t |> success(find(text, "add") >= 0, "should find 'add' function")
+        t |> success(find(text, "Point") >= 0, "should find 'Point' struct")
+    }
+    t |> run("lists enums") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        parse_result(do_outline("utils/mcp/tests/_fixture_valid.das", ""), text, is_error)
+        t |> success(!is_error, "should not be error")
+        t |> success(find(text, "[enum]") >= 0, "should find enums")
+        t |> success(find(text, "Color") >= 0, "should find 'Color' enum")
+    }
+    t |> run("lists bitfields and variants") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        parse_result(do_outline("utils/mcp/tests/_fixture_valid.das", ""), text, is_error)
+        t |> success(!is_error, "should not be error")
+        t |> success(find(text, "[bitfield]") >= 0, "should find bitfields")
+        t |> success(find(text, "Access") >= 0, "should find 'Access' bitfield")
+        t |> success(find(text, "[variant]") >= 0, "should find variants")
+        t |> success(find(text, "Value") >= 0, "should find 'Value' variant")
+    }
+    t |> run("sorted by line number") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        parse_result(do_outline("utils/mcp/tests/_fixture_valid.das", ""), text, is_error)
+        t |> success(!is_error, "should not be error")
+        // Point is defined before Color, which is before add
+        let point_pos = find(text, "Point")
+        let color_pos = find(text, "Color")
+        let add_pos = find(text, "add")
+        t |> success(point_pos < color_pos, "Point should come before Color")
+        t |> success(color_pos < add_pos, "Color should come before add")
+    }
+    t |> run("missing args is error") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        parse_result(do_outline("", ""), text, is_error)
+        t |> success(is_error, "should be error")
+    }
+}
+
+[test]
+def test_outline_glob(t : T?) {
+    t |> run("glob scans multiple files") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        parse_result(do_outline("", "utils/mcp/tests/_fixture_*.das"), text, is_error)
+        t |> success(!is_error, "should not be error")
+        // Should find declarations from multiple fixture files
+        t |> success(find(text, "_fixture_valid.das") >= 0, "should include _fixture_valid.das")
+    }
+}
+
+[test]
+def test_grep_usage_detect(t : T?) {
+    t |> run("detects ast-grep") <| @(t : T?) {
+        let sg = detect_ast_grep()
+        t |> success(!empty(sg), "ast-grep should be detected in test environment")
+    }
+}
+
+// ── shared module caching ───────────────────────────────────────────
+
+[test]
+def test_shared_module_not_cached(t : T?) {
+    let shared_mod = "utils/mcp/tests/fixture_shared_mod.das"
+    let original = "options gen2\nmodule fixture_shared_mod shared\n\nstruct Foo \{\n    x : int = 0;\n\}\n"
+    let modified = "options gen2\nmodule fixture_shared_mod shared\n\nstruct Foo \{\n    x : int = 0;\n\}\n\nstruct Bar \{\n    y : int = 0;\n\}\n"
+    t |> run("sees new struct after shared module changes") <| @(t : T?) {
+        // 1. compile user1 — caches shared module with only Foo
+        var text : string
+        var is_error = false
+        parse_result(do_compile_check(fixture_path("_fixture_shared_user.das")), text, is_error)
+        t |> success(!is_error, "user1 should compile (Foo exists)")
+        // 2. add Bar to the shared module
+        t |> success(fwrite(shared_mod, modified), "should write modified shared module")
+        // 3. compile user2 — uses Bar, must see the updated module
+        parse_result(do_compile_check(fixture_path("_fixture_shared_user2.das")), text, is_error)
+        t |> success(!is_error, "user2 should compile (Bar should be visible after module change)")
+        // 4. restore original
+        fwrite(shared_mod, original)
+    }
+}
+
+// ── aot ─────────────────────────────────────────────────────────────
+
+[test]
+def test_aot_full_file(t : T?) {
+    t |> run("full file AOT") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        let ok = parse_result(do_aot(fixture_path("_fixture_valid.das"), ""), text, is_error)
+        t |> success(ok, "parse result JSON")
+        t |> success(!is_error, "should not be error")
+        t |> success(find(text, "inline") >= 0, "should contain inline functions")
+        t |> success(find(text, "namespace das") >= 0, "should contain namespace")
+    }
+}
+
+[test]
+def test_aot_single_function(t : T?) {
+    t |> run("extracts single function by name") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        let ok = parse_result(do_aot(fixture_path("_fixture_aot.das"), "helper"), text, is_error)
+        t |> success(ok, "parse result JSON")
+        t |> success(!is_error, "should not be error")
+        t |> success(find(text, "inline") >= 0, "should contain inline keyword")
+        t |> success(find(text, "helper") >= 0, "should contain helper function name")
+        // should NOT contain describe
+        t |> success(find(text, "describe") < 0, "should not contain other functions")
+    }
+}
+
+[test]
+def test_aot_not_found(t : T?) {
+    t |> run("nonexistent function") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        let ok = parse_result(do_aot(fixture_path("_fixture_aot.das"), "nonexistent"), text, is_error)
+        t |> success(ok, "parse result JSON")
+        t |> success(!is_error, "should not be error (informational)")
+        t |> success(find(text, "No function matching") >= 0, "should say no match")
+        t |> success(find(text, "Available functions") >= 0, "should list available functions")
+    }
+}
+
+[test]
+def test_aot_multiple_matches(t : T?) {
+    t |> run("overloaded function returns disambiguation list") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        let ok = parse_result(do_aot(fixture_path("_fixture_aot.das"), "describe"), text, is_error)
+        t |> success(ok, "parse result JSON")
+        t |> success(!is_error, "should not be error")
+        t |> success(find(text, "Multiple functions match") >= 0, "should say multiple matches")
+        t |> success(find(text, "int") >= 0, "should show int overload signature")
+        t |> success(find(text, "float") >= 0, "should show float overload signature")
+    }
+}
+
+[test]
+def test_aot_select_by_aot_name(t : T?) {
+    t |> run("select overload by mangled aot_name") <| @(t : T?) {
+        // first get the disambiguation list to find the aot_name
+        var text : string
+        var is_error = false
+        parse_result(do_aot(fixture_path("_fixture_aot.das"), "describe"), text, is_error)
+        // extract an aot_name from the list (format: "describe(...) [describe_HEXHASH]")
+        let bracket_pos = find(text, "[describe_")
+        t |> success(bracket_pos >= 0, "should contain bracketed aot_name")
+        if (bracket_pos < 0) {
+            return
+        }
+        let name_start = bracket_pos + 1
+        let name_end = find(text, "]", name_start)
+        t |> success(name_end > name_start, "should have closing bracket")
+        if (name_end <= name_start) {
+            return
+        }
+        let aot_name = slice(text, name_start, name_end)
+        // now select by aot_name
+        parse_result(do_aot(fixture_path("_fixture_aot.das"), aot_name), text, is_error)
+        t |> success(!is_error, "should not be error")
+        t |> success(find(text, "inline") >= 0, "should contain inline function")
+        t |> success(find(text, aot_name) >= 0, "should contain the selected aot_name")
+    }
+}
+
+[test]
+def test_aot_missing_file(t : T?) {
+    t |> run("missing file reports error") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        parse_result(do_aot("nonexistent_file_12345.das", ""), text, is_error)
+        t |> success(is_error, "should be error")
     }
 }

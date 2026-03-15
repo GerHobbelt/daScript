@@ -80,12 +80,22 @@ All code MUST use gen2 syntax (add `options gen2` at the top of every file). Key
 - No `bool(int)` cast — use `x != 0`; no `string(bool)` — use `"{flag}"`
 - `int("123")` does NOT work — use `to_int` from `require strings`
 - Hex literals are `uint` by default — use `int(0x3F)` for int
+- **`default<T>`** — the default (zero) value of type `T`: `default<int>` is `0`, `default<string>` is `""`, `default<float>` is `0.0f`
+- **`typedecl(expr)`** — compile-time type-of expression, usable inside `default<>`: `default<typedecl(field)>` gives the zero value of `field`'s type. Useful in generic code with `static_if` to compare against defaults.
 
 ### Memory and move semantics
 
 - daslang has garbage collection — `delete` is not required in most code
 - `var inscope` declares automatic cleanup; struct fields need defaults or `@safe_when_uninitialized`
 - `<-` is memcpy+memset(0), NOT smart_ptr-aware — see `skills/das_macros.md` for smart_ptr patterns
+
+### Unsafe
+
+- **`unsafe(expr)`** — narrow-scope unsafe, preferred over `unsafe { block }`. Limits unsafe to the exact expression that needs it
+- **Local reference binding is unsafe:** `let blk & = expr` requires `unsafe` whenever it creates a local reference to a non-local expression — `let blk & = unsafe(expr)`
+- **Variant `as` read access is safe:** `(v as _field).member` works without `unsafe` after an `is` check
+- **Variant field assignment is always unsafe:** `v._field = value` and `set_variant_index(v, N)` require `unsafe`
+- **`reinterpret<T>(expr)`** requires `unsafe` — used for const-stripping on regular pointers: `unsafe(reinterpret<Foo?>(const_ptr))`
 
 ### Error handling
 
@@ -136,11 +146,11 @@ All code MUST use gen2 syntax (add `options gen2` at the top of every file). Key
 - `daslib/` — Standard library modules (.das files)
 - `examples/` — Example scripts
 - `dastest/` — Test framework (usable for testing your own code)
-- `utils/mcp/` — MCP server for AI coding assistants (if dasHV was enabled at build time)
+- `utils/mcp/` — MCP server for AI coding assistants (stdio transport, no extra deps)
 
 ## MCP Server (AI Tool Integration)
 
-If the SDK was built with dasHV enabled, `utils/mcp/` contains a [Model Context Protocol](https://modelcontextprotocol.io/) server that exposes compiler diagnostics and program introspection to AI coding assistants.
+`utils/mcp/` contains a [Model Context Protocol](https://modelcontextprotocol.io/) server that exposes compiler diagnostics and program introspection to AI coding assistants. Uses stdio transport — no extra build dependencies.
 
 **When MCP tools are available**, prefer them over manual compilation and grep-based exploration:
 
@@ -162,12 +172,14 @@ If the SDK was built with dasHV enabled, `utils/mcp/` contains a [Model Context 
 | `type_of` | Manually inspecting expression types |
 | `list_requires` | Grepping for `require` statements and guessing transitive deps |
 | `find_references` | Manually searching for all usages of a symbol across files |
+| `eval_expression` | Evaluating expressions by writing throwaway scripts |
+| `describe_type` | Reading source to understand type fields, methods, and values |
+| `grep_usage` | Grepping for symbol names across files (parse-aware via ast-grep + tree-sitter) |
+| `outline` | Manually scanning files for function/struct/enum declarations |
 
 Cursor-based tools (`goto_definition`, `type_of`, `find_references`) support a `no_opt` parameter that disables compiler optimizations to preserve the full AST — useful when globals, enum values, or bitfield constants get constant-folded away.
 
-**Starting the server:** `bin/daslang utils/mcp/main.das` (port 9500 by default)
-
-**Configuration:** See `utils/mcp/README.md` for `.mcp.json` setup and permissions.
+**Configuration:** Configure `.mcp.json` with `"command": "bin/daslang", "args": ["utils/mcp/main.das"]`. See `utils/mcp/README.md` for details and permissions.
 
 ## Keywords Reference
 

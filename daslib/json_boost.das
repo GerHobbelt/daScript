@@ -436,8 +436,12 @@ def public parse_json_annotation(name : string; annotation : array<tuple<name : 
     var fieldState : JsonFieldState
     fieldState.argName = name
     for (ann in annotation) {
-        if (ann.name == "rename" && ann.data is tString) {
-            fieldState.argName = ann.data as tString
+        if (ann.name == "rename") {
+            if (ann.data is tString) {
+                fieldState.argName = ann.data as tString
+            } elif (ann.data is tBool && length(name) > 0 && character_at(name, 0) == '_') {
+                fieldState.argName = slice(name, 1)
+            }
         } elif (ann.name == "enum_as_int" && ann.data is tBool) {
             fieldState.enumAsInt = ann.data as tBool
         } elif (ann.name == "unescape" && ann.data is tBool) {
@@ -585,6 +589,22 @@ def JV(value : auto(TT)) : JsonValue? {
                 if (!fieldStateParsed) {
                     fieldState <- parse_json_annotation(name, annotations)
                     fieldStateParsed = true
+                }
+                if (fieldState.optional) {
+                    // skip @optional fields at default (zero) value, matching sprint_json behavior
+                    static_if (typeinfo is_string(field)) {
+                        if (empty(field)) { return ; }
+                    } static_elif (typeinfo is_array(field)) {
+                        if (length(field) == 0) { return ; }
+                    } static_elif (typeinfo is_table(field)) {
+                        if (length(field) == 0) { return ; }
+                    } static_elif (typeinfo is_pointer(field)) {
+                        if (field == null) { return ; }
+                    } else {
+                        static_if (typeinfo is_workhorse(field)) {
+                            if (field == default<typedecl(field)>) { return ; }
+                        }
+                    }
                 }
                 if (fieldState.enumAsInt) {     // we only need to handle it as we are writing out, reading handles it at the enum level
                     static_if (typeinfo is_enum(field)) {

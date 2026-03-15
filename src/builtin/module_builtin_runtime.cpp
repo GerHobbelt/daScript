@@ -1408,6 +1408,21 @@ namespace das
         return cast<char *>::from(sres);
     }
 
+    vec4f builtin_json_sscan ( Context & context, SimNode_CallBase * call, vec4f * args ) {
+        auto json = cast<char *>::to(args[0]);
+        if ( !json ) return cast<bool>::from(false);
+        auto typeInfo = call->types[1];
+        char * dst;
+        if ( typeInfo->flags & TypeInfo::flag_refType ) {
+            dst = cast<char *>::to(args[1]);
+        } else {
+            dst = (char *)&args[1];
+        }
+        uint32_t jsonLen = uint32_t(strlen(json));
+        bool ok = debug_json_scan(context, dst, typeInfo, json, jsonLen, &call->debugInfo);
+        return cast<bool>::from(ok);
+    }
+
     Array  g_CommandLineArguments;
 
     void setCommandLineArguments ( int argc, char * argv[] ) {
@@ -1420,6 +1435,12 @@ namespace das
 
     char * builtin_das_root ( Context * context, LineInfoArg * at ) {
         return context->allocateString(getDasRoot(), at);
+    }
+
+    char * builtin_get_das_version ( Context * context, LineInfoArg * at ) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%d.%d.%d", DAS_VERSION_MAJOR, DAS_VERSION_MINOR, DAS_VERSION_PATCH);
+        return context->allocateString(string(buf), at);
     }
 
     char * to_das_string(const string & str, Context * ctx, LineInfoArg * at) {
@@ -1685,6 +1706,9 @@ namespace das
         addExtern<DAS_BIND_FUN(builtin_das_root)>(*this, lib, "get_das_root",
             SideEffects::accessExternal,"builtin_das_root")
                 ->args({"context","at"});
+        addExtern<DAS_BIND_FUN(builtin_get_das_version)>(*this, lib, "get_das_version",
+            SideEffects::none,"builtin_get_das_version")
+                ->args({"context","at"});
         addExtern<DAS_BIND_FUN(getCommandLineArguments)>(*this, lib, "builtin_get_command_line_arguments",
             SideEffects::accessExternal,"getCommandLineArguments")
                 ->arg("arguments");
@@ -1781,6 +1805,9 @@ namespace das
         addInterop<builtin_json_sprint,char *,vec4f,bool>(*this, lib, "sprint_json",
             SideEffects::modifyExternal, "builtin_json_sprint")
                 ->args({"value","humanReadable"});
+        addInterop<builtin_json_sscan,bool,char *,vec4f>(*this, lib, "sscan_json",
+            SideEffects::modifyArgumentAndExternal, "builtin_json_sscan")
+                ->args({"json","value"});
         addExtern<DAS_BIND_FUN(builtin_terminate)>(*this, lib, "terminate",
             SideEffects::modifyExternal, "terminate")
                 ->args({"context","at"});

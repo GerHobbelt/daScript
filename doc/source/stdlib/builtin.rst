@@ -2300,12 +2300,14 @@ System infrastructure
   *  :ref:`eval_main_loop (block: block\<():void\>) <function-builtin_eval_main_loop_block_ls__c_void_gr_>`
   *  :ref:`feint (text: string) <function-builtin_feint_string>`
   *  :ref:`get_das_root () : string <function-builtin_get_das_root>`
+  *  :ref:`get_das_version () : string <function-builtin_get_das_version>`
   *  :ref:`is_in_aot () : bool <function-builtin_is_in_aot>`
   *  :ref:`is_intern_strings () : bool <function-builtin_is_intern_strings>`
   *  :ref:`panic (text: string) <function-builtin_panic_string>`
   *  :ref:`print (text: string) <function-builtin_print_string>`
   *  :ref:`sprint (value: any; flags: print_flags) : string <function-builtin_sprint_any_print_flags>`
   *  :ref:`sprint_json (value: any; humanReadable: bool) : string <function-builtin_sprint_json_any_bool>`
+  *  :ref:`sscan_json (json: string; value: any) : bool <function-builtin_sscan_json_string_any>`
   *  :ref:`stackwalk (args: bool = true; vars: bool = true) <function-builtin_stackwalk_bool_bool>`
   *  :ref:`terminate () <function-builtin_terminate>`
   *  :ref:`to_compiler_log (text: string) <function-builtin_to_compiler_log_string>`
@@ -2357,6 +2359,13 @@ No-op replacement for `print`. Has the same signature and side-effect annotation
 .. das:function:: get_das_root() : string
 
 Returns the file-system path to the daslang root directory, where `daslib` and other standard libraries are located.
+
+
+.. _function-builtin_get_das_version:
+
+.. das:function:: get_das_version() : string
+
+Returns the daslang SDK version as a string in "major.minor.patch" format (e.g. "0.6.0").
 
 
 .. _function-builtin_is_in_aot:
@@ -2412,6 +2421,17 @@ Serializes `value` directly to a JSON string, bypassing intermediate representat
 :Arguments: * **value** : any
 
             * **humanReadable** : bool
+
+.. _function-builtin_sscan_json_string_any:
+
+.. das:function:: sscan_json(json: string; value: any) : bool
+
+Parses a JSON string directly into `value` using RTTI type information — no intermediate ``JsonValue?`` representation. Returns true on success. Supports structs, pointers, arrays, tables, tuples, variants, enums, bitfields, vector types, and all scalar types. Handles ``@rename`` field annotations. Throws an error for handled types.
+
+
+:Arguments: * **json** : string
+
+            * **value** : any
 
 .. _function-builtin_stackwalk_bool_bool:
 

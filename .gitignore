@@ -44,5 +44,13 @@ utils/dasFormatter/ds_parser.output
 src/parser/ds2_parser.output
 src/parser/ds_parser.output
 
-# MCP server log
+# MCP / ast-grep (platform-specific config)
+.mcp.json
+sgconfig.yml
 utils/mcp/mcp_server.log
+
+# Emscripten SDK (local install)
+emsdk/
+
+# Claude Code (local settings)
+.claude/settings.json
