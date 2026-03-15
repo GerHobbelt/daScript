@@ -20,6 +20,7 @@ require daslib/json
 require daslib/json_boost public
 require daslib/jobque_boost
 require strings
+require fio
 
 require tools/compile_check public
 require tools/list_functions public
@@ -36,10 +37,77 @@ require tools/convert_to_gen2 public
 require tools/goto_definition public
 require tools/type_of public
 require tools/find_references public
+require tools/program_log public
+require tools/eval_expression public
+require tools/describe_type public
 
 let MCP_PORT = 9500
 let HEAP_COLLECT_THRESHOLD = 1024ul * 1024ul  // 1 MB
 let HEAP_LOG_INTERVAL = 60000l                // log heap stats every 60 seconds
+let LOG_FILE = "utils/mcp/mcp_server.log"
+
+// ── Logging ───────────────────────────────────────────────────────────
+
+var log_path : string
+var log_start_clock : clock
+
+def log_open() {
+    log_start_clock = get_clock()
+    // write a separator to mark server restart
+    fopen(log_path, "ab") <| $(f) {
+        if (f != null) {
+            fprint(f, "\n--- server start ---\n")
+        }
+    }
+}
+
+def log_timestamp() : string {
+    let elapsed = get_clock() - log_start_clock
+    let total_sec = int(elapsed)
+    let h = total_sec / 3600
+    let m = (total_sec % 3600) / 60
+    let s = total_sec % 60
+    return build_string() <| $(var w) {
+        if (h > 0) {
+            write(w, "{h}h")
+        }
+        write(w, "{m}m{s}s")
+    }
+}
+
+def log_write(msg : string) {
+    let line = "[{log_timestamp()}] {msg}\n"
+    print(line)
+    fopen(log_path, "ab") <| $(f) {
+        if (f != null) {
+            fprint(f, line)
+        }
+    }
+}
+
+def log_request(method, body : string) {
+    let truncated = length(body) > 500 ? slice(body, 0, 500) + "..." : body
+    log_write("REQ {method} {truncated}")
+}
+
+def log_response(method : string; elapsed_sec : double) {
+    let ms = int(elapsed_sec * 1000.0lf)
+    log_write("RES {method} ({ms}ms)")
+}
+
+def log_tool(tool_name : string; args : string) {
+    log_write("TOOL {tool_name} {args}")
+}
+
+def log_tool_done(tool_name : string; elapsed_sec : double; is_error : bool) {
+    let ms = int(elapsed_sec * 1000.0lf)
+    let status = is_error ? "ERR" : "OK"
+    log_write("TOOL {tool_name} {status} ({ms}ms)")
+}
+
+def log_error(msg : string) {
+    log_write("ERROR {msg}")
+}
 
 // ── MCP protocol structs ─────────────────────────────────────────────
 
@@ -115,6 +183,8 @@ struct ToolsListResult {
     tools : array<MakeFileTool>
 }
 
+let PROJECT_PROP = PropertySchema(_type = "string", description = "Path to a .das_project file for custom module resolution")
+
 def make_file_tool(name, description : string) : MakeFileTool {
     return MakeFileTool(
         name = name,
@@ -125,7 +195,8 @@ def make_file_tool(name, description : string) : MakeFileTool {
                 "file" => PropertySchema(
                     _type = "string",
                     description = "Path to the .das file"
-                )
+                ),
+                "project" => PROJECT_PROP
             },
             required = ["file"]
         )
@@ -146,7 +217,15 @@ def make_tool(name, description : string; var props : table<string; PropertySche
 
 def handle_tools_list(id_json : string) : string {
     var result : ToolsListResult
-    result.tools |> emplace(make_file_tool("compile_check", "Compile a daScript file and return errors or success"))
+    result.tools |> emplace(make_tool(
+        "compile_check",
+        "Compile daScript file(s) and return errors or success. Supports single file, comma-separated list, or glob pattern (e.g. 'utils/mcp/tools/*.das'). Batch mode reports pass/fail per file with summary.",
+        {
+            "file" => PropertySchema(_type = "string", description = "Path to .das file, comma-separated paths, or glob pattern (e.g. 'dir/*.das')"),
+            "project" => PROJECT_PROP
+        },
+        ["file"]
+    ))
     result.tools |> emplace(make_file_tool("list_functions", "Compile a daScript file and list all functions (after macro expansion)"))
     result.tools |> emplace(make_file_tool("list_types", "Compile a daScript file and list all structs, classes, enums, and type aliases"))
     result.tools |> emplace(make_file_tool("run_test", "Run dastest on a .das test file and return pass/fail results"))
@@ -161,13 +240,34 @@ def handle_tools_list(id_json : string) : string {
         []
     ))
     result.tools |> emplace(make_tool(
+        "eval_expression",
+        "Evaluate a daslang expression and return its printed result. Wraps the expression in a string builder print statement. Use 'require' to add module imports (comma-separated).",
+        {
+            "expression" => PropertySchema(_type = "string", description = "daslang expression to evaluate (e.g. 'to_float(42) + 1.0', 'length(\"hello\")')"),
+            "require" => PropertySchema(_type = "string", description = "Comma-separated module imports (e.g. 'math', 'strings, daslib/json')")
+        },
+        ["expression"]
+    ))
+    result.tools |> emplace(make_tool(
+        "describe_type",
+        "Describe a type in detail: fields, methods, enum values, bitfield flags, variant options. Works for structs, classes, handled types, enums, bitfields, variants, tuples, and typedefs.",
+        {
+            "name" => PropertySchema(_type = "string", description = "Type name (e.g. 'TypeDecl', 'ExprCall', 'Type', 'FunctionFlags')"),
+            "module" => PropertySchema(_type = "string", description = "Module to require for the type (e.g. 'ast', 'daslib/json')"),
+            "project" => PROJECT_PROP
+        },
+        ["name"]
+    ))
+    result.tools |> emplace(make_tool(
         "ast_dump",
         "Dump AST of a daslang expression or function. mode='source' shows post-macro daslang code (via describe), mode='ast' (default) shows S-expression with node types.",
         {
             "expression" => PropertySchema(_type = "string", description = "A daslang expression to dump (e.g. 'a.b[0]', 'foo(x, y + 1)')"),
             "file" => PropertySchema(_type = "string", description = "Path to a .das file — dumps AST of compiled functions"),
             "function" => PropertySchema(_type = "string", description = "Function name to dump (optional, defaults to all functions)"),
-            "mode" => PropertySchema(_type = "string", description = "Output mode: 'ast' (default) for S-expression, 'source' for post-macro daslang code")
+            "mode" => PropertySchema(_type = "string", description = "Output mode: 'ast' (default) for S-expression, 'source' for post-macro daslang code"),
+            "lineinfo" => PropertySchema(_type = "string", description = "If 'true', include LineInfo (file, line:col spans) on each AST node. Only for mode='ast'"),
+            "project" => PROJECT_PROP
         },
         []
     ))
@@ -183,7 +283,8 @@ def handle_tools_list(id_json : string) : string {
         {
             "query" => PropertySchema(_type = "string", description = "Case-insensitive substring search. Prefix with '=' for exact case-sensitive match (e.g. '=print')"),
             "kind" => PropertySchema(_type = "string", description = "Limit to kind: 'function', 'generic', 'struct', 'handled', 'field', 'enum', 'global'"),
-            "file" => PropertySchema(_type = "string", description = "Optional .das file — if provided, searches all modules loaded by that file (including daslib)")
+            "file" => PropertySchema(_type = "string", description = "Optional .das file — if provided, searches all modules loaded by that file (including daslib)"),
+            "project" => PROJECT_PROP
         },
         ["query"]
     ))
@@ -203,7 +304,9 @@ def handle_tools_list(id_json : string) : string {
         {
             "file" => PropertySchema(_type = "string", description = "Path to the .das file"),
             "line" => PropertySchema(_type = "string", description = "Line number (1-based)"),
-            "column" => PropertySchema(_type = "string", description = "Column number (1-based)")
+            "column" => PropertySchema(_type = "string", description = "Column number (1-based)"),
+            "no_opt" => PropertySchema(_type = "string", description = "If 'true', disable optimizations to preserve original AST (constant folding, inlining)"),
+            "project" => PROJECT_PROP
         },
         ["file", "line", "column"]
     ))
@@ -213,7 +316,9 @@ def handle_tools_list(id_json : string) : string {
         {
             "file" => PropertySchema(_type = "string", description = "Path to the .das file"),
             "line" => PropertySchema(_type = "string", description = "Line number (1-based)"),
-            "column" => PropertySchema(_type = "string", description = "Column number (1-based)")
+            "column" => PropertySchema(_type = "string", description = "Column number (1-based)"),
+            "no_opt" => PropertySchema(_type = "string", description = "If 'true', disable optimizations to preserve original AST (constant folding, inlining)"),
+            "project" => PROJECT_PROP
         },
         ["file", "line", "column"]
     ))
@@ -224,17 +329,30 @@ def handle_tools_list(id_json : string) : string {
             "file" => PropertySchema(_type = "string", description = "Path to the .das file"),
             "line" => PropertySchema(_type = "string", description = "Line number (1-based)"),
             "column" => PropertySchema(_type = "string", description = "Column number (1-based)"),
-            "scope" => PropertySchema(_type = "string", description = "Search scope: 'file' (default) for current file only, 'all' for all loaded modules")
+            "scope" => PropertySchema(_type = "string", description = "Search scope: 'file' (default) for current file only, 'all' for all loaded modules"),
+            "no_opt" => PropertySchema(_type = "string", description = "If 'true', disable optimizations to preserve original AST (constant folding, inlining)"),
+            "project" => PROJECT_PROP
         },
         ["file", "line", "column"]
     ))
     result.tools |> emplace(make_tool(
+        "program_log",
+        "Produce post-compilation program text (like 'options log'). Shows all types, globals, and functions after macro expansion, template instantiation, and inference.",
+        {
+            "file" => PropertySchema(_type = "string", description = "Path to the .das file to compile"),
+            "function" => PropertySchema(_type = "string", description = "Limit output to a specific function name (optional)"),
+            "project" => PROJECT_PROP
+        },
+        ["file"]
+    ))
+    result.tools |> emplace(make_tool(
         "list_module_api",
-        "List all functions, types, enums, and globals exported by a daslang module (e.g. 'math', 'strings', 'fio', 'ast', 'daslib/json')",
+        "List all functions, types, enums, globals, and annotations exported by a daslang module (e.g. 'math', 'strings', 'fio', 'ast', 'daslib/json')",
         {
             "module" => PropertySchema(_type = "string", description = "Module name (e.g. 'math', 'strings', 'fio', 'ast', 'daslib/json')"),
             "filter" => PropertySchema(_type = "string", description = "Substring filter on names (e.g. 'for_each', 'json')"),
-            "section" => PropertySchema(_type = "string", description = "Limit to section: 'functions', 'generics', 'operators', 'structs', 'handled', 'enums', 'globals'")
+            "section" => PropertySchema(_type = "string", description = "Limit to section: 'functions', 'generics', 'operators', 'structs', 'handled', 'enums', 'globals', 'annotations'"),
+            "project" => PROJECT_PROP
         },
         ["module"]
     ))
@@ -258,47 +376,55 @@ def get_string_arg(args : JsonValue?; name : string) : string {
     return v.value as _string
 }
 
-def dispatch_tool(tool_name, arg1, arg2, arg3, arg4 : string) : string {
+def dispatch_tool(tool_name, arg1, arg2, arg3, arg4, arg5, project : string) : string {
     if (tool_name == "compile_check") {
-        return do_compile_check(arg1)
+        return do_compile_check(arg1, project)
     } elif (tool_name == "list_functions") {
-        return do_list_functions(arg1)
+        return do_list_functions(arg1, project)
     } elif (tool_name == "list_types") {
-        return do_list_types(arg1)
+        return do_list_types(arg1, project)
     } elif (tool_name == "run_test") {
         return do_run_test(arg1)
     } elif (tool_name == "format_file") {
         return do_format_file(arg1)
     } elif (tool_name == "run_script") {
         return do_run_script(arg1, arg2)
+    } elif (tool_name == "eval_expression") {
+        return do_eval_expression(arg1, arg2)
+    } elif (tool_name == "describe_type") {
+        return do_describe_type(arg1, arg2, project)
     } elif (tool_name == "ast_dump") {
-        return do_ast_dump(arg1, arg2, arg3, arg4)
+        return do_ast_dump(arg1, arg2, arg3, arg4, arg5, project)
     } elif (tool_name == "list_requires") {
-        return do_list_requires(arg1)
+        return do_list_requires(arg1, project)
     } elif (tool_name == "convert_to_gen2") {
         return do_convert_to_gen2(arg1, arg2 == "true")
     } elif (tool_name == "goto_definition") {
-        return do_goto_definition(arg1, arg2, arg3)
+        return do_goto_definition(arg1, arg2, arg3, arg4, project)
     } elif (tool_name == "type_of") {
-        return do_type_of(arg1, arg2, arg3)
+        return do_type_of(arg1, arg2, arg3, arg4, project)
     } elif (tool_name == "find_references") {
-        return do_find_references(arg1, arg2, arg3, arg4)
+        return do_find_references(arg1, arg2, arg3, arg4, arg5, project)
+    } elif (tool_name == "program_log") {
+        return do_program_log(arg1, arg2, project)
     } elif (tool_name == "list_modules") {
         return do_list_modules()
     } elif (tool_name == "find_symbol") {
-        return do_find_symbol(arg1, arg2, arg3)
+        return do_find_symbol(arg1, arg2, arg3, project)
     } elif (tool_name == "list_module_api") {
-        return do_list_module_api(arg1, arg2, arg3)
+        return do_list_module_api(arg1, arg2, arg3, project)
     } else {
         return make_tool_result("unknown tool: {tool_name}", true)
     }
 }
 
-def run_tool(tool_name, arg1, arg2, arg3, arg4 : string) : string {
+def run_tool(tool_name, arg1, arg2, arg3, arg4, arg5, project : string) : string {
+    log_tool(tool_name, "{arg1} {arg2} {arg3} {arg4} {arg5}")
+    let t0 = get_clock()
     var result : string
     with_channel(1) <| $(ch) {
         new_thread() <| @() {
-            let tool_result = dispatch_tool(tool_name, arg1, arg2, arg3, arg4)
+            let tool_result = dispatch_tool(tool_name, arg1, arg2, arg3, arg4, arg5, project)
             ch |> push_clone(ToolMessage(text = tool_result))
             ch |> notify_and_release()
         }
@@ -306,6 +432,8 @@ def run_tool(tool_name, arg1, arg2, arg3, arg4 : string) : string {
             result = clone_string(msg.text)
         }
     }
+    let is_error = find(result, "\"isError\":true") >= 0
+    log_tool_done(tool_name, get_clock() - t0, is_error)
     return result
 }
 
@@ -316,7 +444,8 @@ def handle_tools_call(id_json : string; params : JsonValue?) : string {
         return json_rpc_error(id_json, -32602, "missing tool name")
     }
     let name = tool_name_val.value as _string
-    var arg1, arg2, arg3, arg4 : string
+    var arg1, arg2, arg3, arg4, arg5 : string
+    let project = get_string_arg(args, "project")
     if (name == "compile_check" || name == "list_functions" || name == "list_types" || name == "run_test" || name == "format_file" || name == "list_requires") {
         arg1 = get_string_arg(args, "file")
         if (empty(arg1)) {
@@ -335,6 +464,7 @@ def handle_tools_call(id_json : string; params : JsonValue?) : string {
         }
         arg2 = get_string_arg(args, "line")
         arg3 = get_string_arg(args, "column")
+        arg4 = get_string_arg(args, "no_opt")
     } elif (name == "find_references") {
         arg1 = get_string_arg(args, "file")
         if (empty(arg1)) {
@@ -343,14 +473,28 @@ def handle_tools_call(id_json : string; params : JsonValue?) : string {
         arg2 = get_string_arg(args, "line")
         arg3 = get_string_arg(args, "column")
         arg4 = get_string_arg(args, "scope")
+        arg5 = get_string_arg(args, "no_opt")
     } elif (name == "run_script") {
         arg1 = get_string_arg(args, "file")
         arg2 = get_string_arg(args, "code")
+    } elif (name == "eval_expression") {
+        arg1 = get_string_arg(args, "expression")
+        if (empty(arg1)) {
+            return json_rpc_error(id_json, -32602, "missing 'expression' argument")
+        }
+        arg2 = get_string_arg(args, "require")
+    } elif (name == "describe_type") {
+        arg1 = get_string_arg(args, "name")
+        if (empty(arg1)) {
+            return json_rpc_error(id_json, -32602, "missing 'name' argument")
+        }
+        arg2 = get_string_arg(args, "module")
     } elif (name == "ast_dump") {
         arg1 = get_string_arg(args, "expression")
         arg2 = get_string_arg(args, "file")
         arg3 = get_string_arg(args, "function")
         arg4 = get_string_arg(args, "mode")
+        arg5 = get_string_arg(args, "lineinfo")
     } elif (name == "find_symbol") {
         arg1 = get_string_arg(args, "query")
         if (empty(arg1)) {
@@ -365,12 +509,18 @@ def handle_tools_call(id_json : string; params : JsonValue?) : string {
         }
         arg2 = get_string_arg(args, "filter")
         arg3 = get_string_arg(args, "section")
+    } elif (name == "program_log") {
+        arg1 = get_string_arg(args, "file")
+        if (empty(arg1)) {
+            return json_rpc_error(id_json, -32602, "missing 'file' argument")
+        }
+        arg2 = get_string_arg(args, "function")
     } elif (name == "list_modules") {
         // no args needed
     } else {
         return json_rpc_error(id_json, -32602, "unknown tool: {name}")
     }
-    return json_rpc_response(id_json, run_tool(name, arg1, arg2, arg3, arg4))
+    return json_rpc_response(id_json, run_tool(name, arg1, arg2, arg3, arg4, arg5, project))
 }
 
 // ── HTTP server ───────────────────────────────────────────────────────
@@ -379,16 +529,20 @@ def dispatch_jsonrpc(body : string) : string {
     var err : string
     var parsed = read_json(body, err)
     if (parsed == null) {
+        log_error("JSON parse error: {err}")
         return json_rpc_error("null", -32700, "parse error: {err}")
     }
     let id_json = json_value_to_string(parsed?.id)
     let method_val = parsed?.method
     let params_val = parsed?.params
     if (method_val == null || !(method_val.value is _string)) {
+        log_error("missing method in request")
         unsafe { delete parsed; }
         return json_rpc_error(id_json, -32600, "invalid request: missing method")
     }
     let method = method_val.value as _string
+    log_request(method, body)
+    let t0 = get_clock()
     var result : string
     if (method == "initialize") {
         result = handle_initialize(id_json)
@@ -402,8 +556,10 @@ def dispatch_jsonrpc(body : string) : string {
     } elif (method == "ping") {
         result = json_rpc_response(id_json, "\{\}")
     } else {
+        log_error("method not found: {method}")
         result = json_rpc_error(id_json, -32601, "method not found: {method}")
     }
+    log_response(method, get_clock() - t0)
     unsafe { delete parsed; }
     return result
 }
@@ -413,7 +569,6 @@ class McpServer : HvWebServer {
         allow_cors()
         POST("/mcp") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             let body = string(req.body)
-            print("[MCP] POST /mcp: {body}\n")
             let response = dispatch_jsonrpc(body)
             if (empty(response)) {
                 return http_status.NO_CONTENT
@@ -445,33 +600,35 @@ def main() {
             port = maybe_port
         }
     }
-    print("Starting daslang MCP server on port {port}...\n")
+    log_path = "{get_das_root()}/{LOG_FILE}"
+    log_open()
+    log_write("Starting daslang MCP server on port {port}")
     print("Configure Claude Code with: \"url\": \"http://localhost:{port}/mcp\"\n")
     var server = new McpServer()
     server->init(port)
     server->start()
-    print("Server running. Press Ctrl+C to stop.\n")
-    var log_ref_time = ref_time_ticks()
+    log_write("Server running. Press Ctrl+C to stop.")
+    var heap_log_ref = get_clock()
     while (true) {
         server->tick()
         sleep(10u)
         // periodic heap stats logging
-        let elapsed = get_time_usec(log_ref_time) / 1000
-        if (elapsed > int(HEAP_LOG_INTERVAL)) {
-            log_ref_time = ref_time_ticks()
+        let elapsed = get_clock() - heap_log_ref
+        if (elapsed > double(HEAP_LOG_INTERVAL) / 1000.0lf) {
+            heap_log_ref = get_clock()
             let heap_used = heap_bytes_allocated()
             let str_used = string_heap_bytes_allocated()
-            print("[MCP] heap: {int(heap_used)} bytes ({heap_depth()} depth), string heap: {int(str_used)} bytes ({string_heap_depth()} depth)\n")
+            log_write("HEAP heap: {int(heap_used)} bytes ({heap_depth()} depth), string heap: {int(str_used)} bytes ({string_heap_depth()} depth)")
         }
         // collect if over threshold
         let heap_used = heap_bytes_allocated()
         let str_used = string_heap_bytes_allocated()
         if (heap_used > HEAP_COLLECT_THRESHOLD || str_used > HEAP_COLLECT_THRESHOLD) {
-            print("[MCP] collecting — heap: {int(heap_used)}, string heap: {int(str_used)}\n")
+            log_write("HEAP collecting — heap: {int(heap_used)}, string heap: {int(str_used)}")
             unsafe {
                 heap_collect(str_used > HEAP_COLLECT_THRESHOLD, false)
             }
-            print("[MCP] after collect — heap: {int(heap_bytes_allocated())}, string heap: {int(string_heap_bytes_allocated())}\n")
+            log_write("HEAP after collect — heap: {int(heap_bytes_allocated())}, string heap: {int(string_heap_bytes_allocated())}")
         }
     }
 }

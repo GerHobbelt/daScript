@@ -391,17 +391,37 @@ def identify_declaration_target(program : smart_ptr<Program>; file : string; lin
             }
         }
     }
+    if (result.kind != RefTargetKind.none) {
+        return result
+    }
+    // check global variable declarations
+    ast::for_each_global(thisMod) <| $(var value : VariablePtr) {
+        if (result.kind != RefTargetKind.none) {
+            return
+        }
+        let v = get_ptr(value)
+        if (int(v.at.line) == line && v.at.fileInfo != null) {
+            if (find(string(v.at.fileInfo.name), file) >= 0) {
+                result = RefTarget(kind = RefTargetKind.variable, target_ptr = to_void(v), name = string(v.name))
+            }
+        }
+    }
     return result
 }
 
 def public do_find_references(file : string; line_str, col_str, scope_str : string) : string {
+    return do_find_references(file, line_str, col_str, scope_str, "")
+}
+
+def public do_find_references(file : string; line_str, col_str, scope_str, no_opt_str : string; project : string = "") : string {
     let line = to_int(line_str)
     let col = to_int(col_str)
     if (line <= 0 || col <= 0) {
         return make_tool_result("Invalid line or column (must be >= 1)", true)
     }
     let all_modules = scope_str == "all"
-    return compile_program(file, true) <| $(program; issues) {
+    let no_opt = no_opt_str == "true"
+    return compile_program(file, true, no_opt, project) <| $(program; issues) {
         // Step 1: identify the target from cursor (expression-based)
         var target : RefTarget
         var hits <- find_at_cursor(program, file, line, col)

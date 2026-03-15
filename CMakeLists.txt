@@ -25,6 +25,7 @@ option(DAS_PUGIXML_DISABLED "Disable dasPUGIXML (xml parsing library)" ON)
 option(DAS_SQLITE_DISABLED "Disable dasSQLITE (sqlite3 library)" ON)
 option(DAS_TELEGRAM_DISABLED "Disable dasTelegram (Telegram API bindings)" ON)
 option(DAS_TOOLS_DISABLED "Disable dasTools" OFF)
+option(DAS_TREE_SITTER_DISABLED "Disable tree-sitter-daslang grammar (no dependencies)" OFF)
 option(DAS_AOT_EXAMPLES_DISABLED "Disable dasAOT examples" OFF)
 option(DAS_TUTORIAL_DISABLED "Disable dasTutorial" OFF)
 option(DAS_TESTS_DISABLED "Disable dasTests" OFF)
@@ -917,6 +918,7 @@ if(NOT ${DAS_AOT_EXAMPLES_DISABLED})
 
     set(AotDaslibList
         daslib/ast_boost.das
+        daslib/ast_cursor.das
         daslib/functional.das
         daslib/json_boost.das
         daslib/json.das
@@ -957,7 +959,7 @@ SET(DAS_DASCRIPT_MAIN_SRC
 # Tests
 if (NOT ${DAS_TESTS_DISABLED})
     include(examples/pathTracer/CMakeLists.txt)
-    if(NOT ${DAS_AOT_EXAMPLES_DISABLED})
+    if(NOT ${DAS_AOT_EXAMPLES_DISABLED} AND NOT WIN32)
         include(tests/aot/CMakeLists.txt)
     endif()
 endif()
@@ -1033,6 +1035,7 @@ if (NOT ${DAS_TOOLS_DISABLED})
 
     SETUP_CPP11(das-fmt)
     SETUP_LTO(das-fmt)
+    install(TARGETS das-fmt RUNTIME DESTINATION ${DAS_INSTALL_BINDIR})
 get_target_property(DAS_FMT_INCLUDES libDaScriptDyn INCLUDE_DIRECTORIES)
 get_target_property(DAS_FMT_DEFS das-fmt COMPILE_DEFINITIONS)
 get_target_property(DAS_FMT_LIBS das-fmt LINK_LIBRARIES)
@@ -1447,4 +1450,42 @@ if(APPLE)
             endif()
         endforeach()
     ]])
+endif()
+
+# ============================================================================
+# tree-sitter-daslang grammar
+# ============================================================================
+
+if(NOT ${DAS_TREE_SITTER_DISABLED})
+    add_library(tree_sitter_daslang SHARED
+        tree-sitter-daslang/src/parser.c
+        tree-sitter-daslang/src/scanner.c
+    )
+    target_include_directories(tree_sitter_daslang PRIVATE
+        tree-sitter-daslang/src
+    )
+    set_target_properties(tree_sitter_daslang PROPERTIES
+        C_STANDARD 11
+        PREFIX ""
+        OUTPUT_NAME "tree_sitter_daslang"
+    )
+    if(MSVC)
+        target_compile_options(tree_sitter_daslang PRIVATE /W3)
+    else()
+        target_compile_options(tree_sitter_daslang PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    endif()
+    install(TARGETS tree_sitter_daslang
+        RUNTIME DESTINATION ${DAS_INSTALL_BINDIR}
+        LIBRARY DESTINATION ${DAS_INSTALL_LIBDIR}
+    )
+    install(FILES
+        tree-sitter-daslang/src/node-types.json
+        tree-sitter-daslang/grammar.js
+        tree-sitter-daslang/package.json
+        DESTINATION tree-sitter-daslang
+    )
+    install(FILES
+        tree-sitter-daslang/queries/highlights.scm
+        DESTINATION tree-sitter-daslang/queries
+    )
 endif()

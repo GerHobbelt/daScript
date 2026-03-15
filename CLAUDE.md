@@ -217,7 +217,8 @@ The daslang MCP server (`utils/mcp/main.das`) exposes compiler diagnostics and p
 | `find_symbol` | Searching across modules for function/type names |
 | `list_module_api` | Reading daslib source to find available functions |
 | `list_modules` | Guessing module names or scanning `daslib/` directory |
-| `ast_dump` | Manually inspecting AST or post-macro output |
+| `ast_dump` | Manually inspecting AST or post-macro output (supports `lineinfo` for source locations) |
+| `program_log` | Running with `options log` to see full post-compilation program text |
 | `run_script` | Running scripts via shell and capturing output |
 | `run_test` | Running dastest via shell and parsing results |
 | `format_file` | Running the formatter script manually |
@@ -226,6 +227,8 @@ The daslang MCP server (`utils/mcp/main.das`) exposes compiler diagnostics and p
 | `type_of` | Manually inspecting expression types |
 | `list_requires` | Grepping for `require` statements and guessing transitive deps |
 | `find_references` | Manually searching for all usages of a symbol across files |
+
+Cursor-based tools (`goto_definition`, `type_of`, `find_references`) support a `no_opt` parameter that disables compiler optimizations to preserve the full AST — useful when globals, enum values, or bitfield constants get constant-folded away.
 
 **Starting the server:** `bin/Release/daslang.exe utils/mcp/main.das` (port 9500 by default)
 
