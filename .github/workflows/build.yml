@@ -348,11 +348,11 @@ jobs:
             ;;
            windows*)
             cd bin/"${{ matrix.cmake_preset }}"
-            ./test_aot -use-aot _dasroot_/dastest/dastest.das -- --use-aot --color --test ../../tests/aot
+            ./test_aot -use-aot _dasroot_/dastest/dastest.das -- --use-aot --color --test ../../tests
             ;;
            *)
             cd bin
-            ./test_aot -use-aot _dasroot_/dastest/dastest.das -- --use-aot --color --test ../tests/aot
+            ./test_aot -use-aot _dasroot_/dastest/dastest.das -- --use-aot --color --test ../tests
             ;;
         esac
 

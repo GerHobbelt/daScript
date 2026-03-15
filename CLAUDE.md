@@ -32,12 +32,45 @@ See `doc/source/reference/design_philosophy.rst` for the full design philosophy 
 - **Run tests:** `bin/Release/daslang.exe dastest/dastest.das -- --test path/to/test.das`
 - **AOT tests:** `cmake --build build --config Release --target test_aot` then `bin/Release/test_aot.exe dastest/dastest.das -- --test tests/aot`
 
+### Build Timing
+
+- **Builds are slow** — clean builds take **15-25 minutes**, incremental builds take **2-10 minutes** depending on what changed
+- **Always use `timeout: 0`** (no timeout) when running `cmake --build` commands in the terminal. Never set a short timeout on build commands — a build that hasn't finished is not stuck or broken, it's just compiling
+- **Do not assume build failure** from lack of output — MSVC is silent during compilation and only prints when there are warnings/errors or when it finishes
+- **Wait for the build to complete** before drawing any conclusions. If a terminal command times out, check the output — it likely just needed more time
+- For incremental builds after editing a single `.cpp` file, expect ~2-5 minutes. For changes touching headers, expect longer
+
 ### Debugging
 
 - **Always check the exit code** after running `daslang.exe` — a crash may produce no output at all, looking like a silent success
 - On Windows, check `$LASTEXITCODE` in PowerShell after every run. Exit code `0` = success, non-zero = error
 - Exit code `-1073741819` (`0xC0000005`) = **Access Violation** — indicates a native crash (segfault)
 - If the program crashes with no error message, the bug is in native code (C++ bindings or smart pointer misuse) — check exit code first
+
+### Build Configurations (Module Flags)
+
+Optional modules are controlled by CMake flags (`DAS_*_DISABLED`). The active configuration lives in `.vscode/settings.json` under `cmake.configureSettings` (the "WIP" block is the active one; others are commented-out presets).
+
+Key flags (all default to `ON` = disabled in CMakeLists.txt):
+- `DAS_HV_DISABLED` — dasHV (HTTP/WebSocket via libhv)
+- `DAS_PUGIXML_DISABLED` — dasPUGIXML (XML parsing)
+- `DAS_GLFW_DISABLED` — GLFW (OpenGL windowing)
+- `DAS_IMGUI_DISABLED` — ImGui
+- `DAS_LLVM_DISABLED` — LLVM JIT
+- `DAS_CLANG_BIND_DISABLED` — Clang bindings
+- `DAS_AUDIO_DISABLED`, `DAS_MINFFT_DISABLED`, `DAS_STBIMAGE_DISABLED`, `DAS_STBTRUETYPE_DISABLED`, `DAS_STDDLG_DISABLED`, `DAS_SQLITE_DISABLED`
+
+**To change modules:** Edit the active `cmake.configureSettings` in `.vscode/settings.json`, then reconfigure:
+```
+cmake --no-warn-unused-cli -B./build -G "Visual Studio 17 2022" -A x64 -DFLAG=VALUE ...
+```
+Or let VSCode CMake Tools pick up the settings change automatically.
+
+**Documentation generation** (`doc/reflections/das2rst.das`) requires `DAS_HV_DISABLED=OFF` and `DAS_PUGIXML_DISABLED=OFF` because it documents all modules. Temporarily enable them, rebuild `daslang`, run das2rst, then revert settings.
+
+### AOT Hash Debugging
+
+When AOT fails with `error[50101]: AOT link failed`, the issue is a **semantic hash mismatch** between the generated C++ stubs and runtime. Each generated `.cpp` file has hash comments showing function hashes and dependency hashes. The runtime error also prints the same breakdown. Compare them to find the diverging function or dependency. See `skills/aot_testing.md` for the full debugging guide (hash architecture, debug macros, common causes).
 
 ## GitHub Operations
 
@@ -62,7 +95,7 @@ Task-specific instructions are split into skill files under `skills/`. You MUST 
 | `skills/writing_benchmarks.md` | Writing or running benchmark files under `benchmarks/` |
 | `skills/dynamic_modules.md` | Creating or editing `.das_module` descriptors, adding new modules under `modules/` |
 | `skills/install_instructions.md` | Creating or updating AI instruction files (`install/CLAUDE.md`, `install/skills/`) for the installed SDK |
-| `skills/aot_testing.md` | Adding AOT test files, working with the `test_aot` binary, `Module::aotRequire()`, CMake AOT macros |
+| `skills/aot_testing.md` | Adding AOT test files, working with the `test_aot` binary, `Module::aotRequire()`, CMake AOT macros, **debugging AOT hash mismatches** |
 
 Multiple skill files may apply to a single task. For example, creating a new daslib module requires reading `skills/das_formatting.md`, `skills/daslib_modules.md`, and possibly `skills/documentation_rst.md`.
 
@@ -154,6 +187,7 @@ All code MUST use gen2 syntax (add `options gen2` at the top of every file). Key
 - Non-copyable types (`array<T>`, `table<K;V>`, lambdas): use `:=`, `push_clone`, or `<-`
 - Blocks cannot be stored/returned/captured — use lambdas or function pointers
 - Class methods: `def const`, `def abstract const`, `def static`; call syntax `obj.method()`, `obj->method()`, `obj |> method()`
+- **`is`/`as` on handled types checks EXACT type**, not C++ inheritance — `expr is ExprField` is `false` when `expr` is `ExprSafeField`. `as` on wrong type crashes. Must handle each concrete type explicitly.
 
 ## Key Directories
 
@@ -167,6 +201,37 @@ All code MUST use gen2 syntax (add `options gen2` at the top of every file). Key
 - `tutorials/language/` — Language tutorial `.das` files
 - `tutorials/integration/cpp/` — C++ integration tutorials
 - `modules/` — External plugin modules
+- `utils/mcp/` — MCP server for AI coding assistants (requires dasHV)
+
+## MCP Server (AI Tool Integration)
+
+The daslang MCP server (`utils/mcp/main.das`) exposes compiler diagnostics and program introspection to AI coding assistants via the [Model Context Protocol](https://modelcontextprotocol.io/). It requires dasHV (`DAS_HV_DISABLED=OFF`).
+
+**When MCP tools are available**, prefer them over manual compilation and grep-based exploration:
+
+| Tool | Use instead of... |
+|---|---|
+| `compile_check` | Running `daslang.exe` manually and parsing errors |
+| `list_functions` | Grepping for `def ` in `.das` files |
+| `list_types` | Grepping for `struct`/`class`/`enum` definitions |
+| `find_symbol` | Searching across modules for function/type names |
+| `list_module_api` | Reading daslib source to find available functions |
+| `list_modules` | Guessing module names or scanning `daslib/` directory |
+| `ast_dump` | Manually inspecting AST or post-macro output |
+| `run_script` | Running scripts via shell and capturing output |
+| `run_test` | Running dastest via shell and parsing results |
+| `format_file` | Running the formatter script manually |
+| `convert_to_gen2` | Running `das-fmt` manually to convert gen1→gen2 syntax |
+| `goto_definition` | Manually tracing symbol definitions across files |
+| `type_of` | Manually inspecting expression types |
+| `list_requires` | Grepping for `require` statements and guessing transitive deps |
+| `find_references` | Manually searching for all usages of a symbol across files |
+
+**Starting the server:** `bin/Release/daslang.exe utils/mcp/main.das` (port 9500 by default)
+
+**Configuration:** See `utils/mcp/README.md` for `.mcp.json` setup and Claude Code permissions.
+
+**Tests:** `bin/Release/daslang.exe dastest/dastest.das -- --test utils/mcp/test_tools.das`
 
 ## Keywords Reference
 

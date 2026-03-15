@@ -93,8 +93,10 @@ SETUP_COMPILER()
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
+FILE(GLOB DAS_AOT_DASLIB_DEPENDS "${PROJECT_SOURCE_DIR}/daslib/*.das")
+
 MACRO(DAS_AOT_EXT input_files genList mainTarget dasAotTool dasAotToolArg)
-    set(all_depends ${dasAotTool})
+    set(all_depends ${dasAotTool} ${PROJECT_SOURCE_DIR}/utils/aot/main.das ${DAS_AOT_DASLIB_DEPENDS})
     set(all_outputs "")
     set(command_args "")
     list(LENGTH input_files num_files)
@@ -265,6 +267,7 @@ ENDIF()
 # It sets required properties for shared libraries.
 MACRO(SETUP_DAS_SHARED_LIBRARY lib)
     ADD_LIBRARY(${lib} SHARED ${ARGN})
+    SETUP_LIB_DEFINITIONS(${lib})
     if(WIN32)
         # We export a lot of structures, some of them has not exported internals.
         # Instead of marking everything as exported let's disable
@@ -277,6 +280,7 @@ ENDMACRO()
 
 MACRO(ADD_DAS_STATIC_LIBRARY lib)
     ADD_LIBRARY(${lib} STATIC ${ARGN})
+    SETUP_LIB_DEFINITIONS(${lib})
 ENDMACRO()
 
 
@@ -859,7 +863,7 @@ MACRO(SETUP_LIBDASCRIPT library shared_lib)
         TARGET_COMPILE_DEFINITIONS(${library} PUBLIC DAS_ENABLE_DLL=1)
         # Set DAS_EXPORTS to export all MOD symbols from libDaScript
     ELSE()
-        ADD_LIBRARY(${library} STATIC ${PARSER_GENERATED_SRC}
+        ADD_DAS_STATIC_LIBRARY(${library} ${PARSER_GENERATED_SRC}
                 ${PARSER_SRC} ${VECMATH_SRC} ${AST_SRC} ${SIMULATE_SRC} ${BUILTIN_SRC}
                 ${MISC_SRC} ${SIMULATE_FUSION_SRC} ${MAIN_SRC}
                 ${DAGOR_NOISE_SRC} ${FLAT_HASH_MAP_SRC} ${FAST_FLOAT_SRC} ${DASCRIPT_FMT_SRC})
@@ -1282,6 +1286,22 @@ install(FILES ${PROJECT_SOURCE_DIR}/include/vecmath/LICENSE DESTINATION ${DAS_IN
 # Install utility scripts
 install(FILES ${PROJECT_SOURCE_DIR}/utils/aot/main.das DESTINATION utils/aot)
 install(FILES ${PROJECT_SOURCE_DIR}/utils/dasCodeFormatter/main.das DESTINATION utils/dasCodeFormatter)
+
+# Install MCP server (requires dasHV)
+if(NOT DAS_HV_DISABLED)
+    install(FILES ${PROJECT_SOURCE_DIR}/utils/mcp/main.das DESTINATION utils/mcp)
+    install(FILES ${PROJECT_SOURCE_DIR}/utils/mcp/README.md DESTINATION utils/mcp)
+    file(GLOB DAS_MCP_TOOLS ${PROJECT_SOURCE_DIR}/utils/mcp/tools/*.das)
+    install(FILES ${DAS_MCP_TOOLS} DESTINATION utils/mcp/tools)
+    install(FILES
+        ${PROJECT_SOURCE_DIR}/utils/mcp/test_tools.das
+        DESTINATION utils/mcp
+    )
+    install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/mcp/tests/
+        DESTINATION utils/mcp/tests
+        FILES_MATCHING PATTERN "*.das"
+    )
+endif()
 
 # Install core example .das files
 install(FILES

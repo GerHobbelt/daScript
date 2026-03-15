@@ -1,0 +1,221 @@
+options gen2
+options no_unused_function_arguments = false
+options no_unused_block_arguments = false
+
+require common public
+
+def do_list_module_api(module_name : string; filter : string = ""; section : string = "") : string {
+    // write a temp stub file that requires the module
+    let stub_path = "{get_das_root()}/_mcp_stub.das"
+    let stub = "require {module_name}\n[export]\ndef main\n    pass\n"
+    fopen(stub_path, "w") <| $(f) {
+        fwrite(f, stub)
+    }
+    return compile_and_simulate(stub_path) <| $(program; issues) {
+        // find the target module
+        var target_mod : Module?
+        program_for_each_module(program) <| $(mod) {
+            let mname = string(mod.name)
+            if (mname == module_name || "{module_name}" |> ends_with("/{mname}")) {
+                target_mod = mod
+            }
+        }
+        if (target_mod == null) {
+            return "Module '{module_name}' not found after compilation"
+        }
+        var res = build_string() <| $(var writer) {
+            write_module_api(writer, target_mod, filter, section)
+        }
+        return empty(res) ? "(empty module)" : res
+    }
+}
+
+def is_operator_function(name : string) : bool {
+    let ch = character_at(name, 0)
+    return !is_alpha(ch) && !is_number(ch) && ch != '_'
+}
+
+def name_matches_filter(name : string; filter : string) : bool {
+    return empty(filter) || symbol_matches(name, filter)
+}
+
+def want_section(section : string; name : string) : bool {
+    return empty(section) || section == name
+}
+
+def write_module_api(var writer : StringBuilderWriter; mod : Module?; filter : string = ""; section : string = "") {
+    write(writer, "Module: {mod.name}\n")
+    var funcs : array<string>
+    var generics : array<string>
+    var operators : array<string>
+    var structs : array<string>
+    var handled : array<string>
+    var enums : array<string>
+    var globals : array<string>
+    // functions via AST
+    if (want_section(section, "functions") || want_section(section, "operators")) {
+        for_each_function(mod, "") <| $(func) {
+            if (func.flags.privateFunction || func.flags._lambda || func.flags.generated) {
+                return
+            }
+            let fname = string(func.name)
+            if (!name_matches_filter(fname, filter)) {
+                return
+            }
+            var entry = build_string() <| $(var w) {
+                write(w, "  def {func.name}")
+                write_func_signature(w, func)
+            }
+            if (is_operator_function(fname) && want_section(section, "operators")) {
+                operators |> push(entry)
+            } elif (!is_operator_function(fname) && want_section(section, "functions")) {
+                funcs |> push(entry)
+            }
+        }
+    }
+    // generics via AST
+    if (want_section(section, "generics") || want_section(section, "operators")) {
+        for_each_generic(mod) <| $(func) {
+            if (func.flags.privateFunction || func.flags.generated || string(func.name) |> starts_with("```")) {
+                return
+            }
+            let fname = string(func.name)
+            if (!name_matches_filter(fname, filter)) {
+                return
+            }
+            var entry = build_string() <| $(var w) {
+                write(w, "  def {func.name}")
+                write_func_signature(w, func)
+            }
+            if (is_operator_function(fname) && want_section(section, "operators")) {
+                operators |> push(entry)
+            } elif (!is_operator_function(fname) && want_section(section, "generics")) {
+                generics |> push(entry)
+            }
+        }
+    }
+    // structures via AST
+    if (want_section(section, "structs")) {
+        for_each_structure(mod) <| $(value) {
+        if (value.flags.isLambda || value.flags._generator || value.flags.generated || value.flags.privateStructure) {
+            return
+        }
+        if (!name_matches_filter(string(value.name), filter)) {
+            return
+        }
+        var entry = build_string() <| $(var w) {
+            if (value.flags.isClass) {
+                write(w, "  class {value.name}")
+            } else {
+                write(w, "  struct {value.name}")
+            }
+            if (value.parent != null) {
+                write(w, " : {value.parent.name}")
+            }
+            if (int(value.at.line) > 0) {
+                write(w, "  // line {int(value.at.line)}")
+            }
+            write(w, "\n")
+            for (fld in value.fields) {
+                write(w, "    {fld.name} : {describe(fld._type)}\n")
+            }
+        }
+        structs |> push(entry)
+        }
+    }
+    // handled types via annotations
+    if (want_section(section, "handled")) {
+        module_for_each_annotation(mod) <| $(value) {
+            if (!value.isBasicStructureAnnotation) {
+                return
+            }
+            if (!name_matches_filter(string(value.name), filter)) {
+                return
+            }
+            var entry = build_string() <| $(var w) {
+                write_handled_type(w, value)
+            }
+            handled |> push(entry)
+        }
+    }
+    // enumerations via AST
+    if (want_section(section, "enums")) {
+        for_each_enumeration(mod) <| $(value) {
+            if (value.isPrivate) {
+                return
+            }
+            if (!name_matches_filter(string(value.name), filter)) {
+                return
+            }
+            var entry = build_string() <| $(var w) {
+                write(w, "  enum {value.name}")
+                if (int(value.at.line) > 0) {
+                    write(w, "  // line {int(value.at.line)}")
+                }
+                write(w, "\n")
+                for (en in value.list) {
+                    write(w, "    {en.name}\n")
+                }
+            }
+            enums |> push(entry)
+        }
+    }
+    // globals via AST
+    if (want_section(section, "globals")) {
+        for_each_global(mod) <| $(value) {
+            if (value.flags.private_variable) {
+                return
+            }
+            if (!name_matches_filter(string(value.name), filter)) {
+                return
+            }
+            var line = "  {value.name} : {describe(value._type)}"
+            if (int(value.at.line) > 0) {
+                line = "{line}  // line {int(value.at.line)}"
+            }
+            globals |> push("{line}\n")
+        }
+    }
+    if (!empty(funcs)) {
+        write(writer, "Functions ({length(funcs)}):\n")
+        for (f in funcs) {
+            write(writer, "{f}\n")
+        }
+    }
+    if (!empty(generics)) {
+        write(writer, "Generics ({length(generics)}):\n")
+        for (g in generics) {
+            write(writer, "{g}\n")
+        }
+    }
+    if (!empty(operators)) {
+        write(writer, "Operators ({length(operators)}):\n")
+        for (o in operators) {
+            write(writer, "{o}\n")
+        }
+    }
+    if (!empty(structs)) {
+        write(writer, "Structs/Classes:\n")
+        for (s in structs) {
+            write(writer, s)
+        }
+    }
+    if (!empty(handled)) {
+        write(writer, "Handled types ({length(handled)}):\n")
+        for (h in handled) {
+            write(writer, h)
+        }
+    }
+    if (!empty(enums)) {
+        write(writer, "Enumerations:\n")
+        for (e in enums) {
+            write(writer, e)
+        }
+    }
+    if (!empty(globals)) {
+        write(writer, "Globals:\n")
+        for (g in globals) {
+            write(writer, g)
+        }
+    }
+}

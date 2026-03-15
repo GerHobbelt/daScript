@@ -35,6 +35,30 @@ namespace das {
 
     DAS_API void das_debug ( Context * context, TypeInfo * typeInfo, const char * FILE, int LINE, vec4f res, const char * message = nullptr );
 
+    __forceinline void das_assert ( bool cond, Context * __context__ ) {
+        if ( !cond ) {
+            __context__->throw_error("assert failed");
+        }
+    }
+
+    __forceinline void das_assertf ( bool cond, const char * message, Context * __context__ ) {
+        if ( !cond ) {
+            __context__->throw_error_ex("assert failed, %s", message ? message : "");
+        }
+    }
+
+    __forceinline void das_verify ( bool cond, Context * __context__ ) {
+        if ( !cond ) {
+            __context__->throw_error("assert failed");
+        }
+    }
+
+    __forceinline void das_verifyf ( bool cond, const char * message, Context * __context__ ) {
+        if ( !cond ) {
+            __context__->throw_error_ex("assert failed, %s", message ? message : "");
+        }
+    }
+
 #if (!defined(DAS_ENABLE_EXCEPTIONS)) || (!DAS_ENABLE_EXCEPTIONS)
     void das_throw(const char * msg);
     void das_trycatch(callable<void()> tryBody, callable<void(const char * msg)> catchBody);
@@ -355,7 +379,7 @@ namespace das {
         }
     };
 
-    template <typename ResT,typename VecT, int f0, int f1, int f2 = 0, int f3 = 0>
+    template <typename ResT,typename VecT, int f0, int f1, int f2 = -1, int f3 = -1>
     struct das_swizzle {
         static __forceinline ResT swizzle ( const VecT & val ) {
             ResT res;
@@ -371,7 +395,7 @@ namespace das {
     };
 
     template <typename ResT,typename VecT, int f0, int f1, int f2>
-    struct das_swizzle<ResT,VecT,f0,f1,f2,0> {
+    struct das_swizzle<ResT,VecT,f0,f1,f2,-1> {
         static __forceinline ResT swizzle ( const VecT & val ) {
             ResT res;
             res.x = *((&val.x) + f0);
@@ -385,7 +409,7 @@ namespace das {
     };
 
     template <typename ResT,typename VecT, int f0, int f1>
-    struct das_swizzle<ResT,VecT,f0,f1,0,0> {
+    struct das_swizzle<ResT,VecT,f0,f1,-1,-1> {
         static __forceinline ResT swizzle ( const VecT & val ) {
             ResT res;
             res.x = *((&val.x) + f0);
@@ -893,7 +917,6 @@ namespace das {
     template <typename TT>
     struct TArray : Array {
         using THIS_TYPE = TArray<TT>;
-        enum { stride = sizeof(TT) };
         TArray()  {}
         TArray(TArray & arr) { moveA(arr); }
         TArray(TArray && arr ) { moveA(arr); }
@@ -904,6 +927,7 @@ namespace das {
             size = arr.size; arr.size = 0;
             capacity = arr.capacity; arr.capacity = 0;
             lock = arr.lock; arr.lock = 0;
+            magic = arr.magic; arr.magic = 0;
             flags = arr.flags; arr.flags = 0;
         }
         __forceinline TT & operator [] ( int32_t index ) {
@@ -972,6 +996,7 @@ namespace das {
             size = arr.size; arr.size = 0;
             capacity = arr.capacity; arr.capacity = 0;
             lock = arr.lock; arr.lock = 0;
+            magic = arr.magic; arr.magic = 0;
             flags = arr.flags; arr.flags = 0;
             keys = arr.keys; arr.keys = 0;
             hashes = arr.hashes; arr.hashes = 0;
@@ -1012,6 +1037,7 @@ namespace das {
             size = arr.size; arr.size = 0;
             capacity = arr.capacity; arr.capacity = 0;
             lock = arr.lock; arr.lock = 0;
+            magic = arr.magic; arr.magic = 0;
             flags = arr.flags; arr.flags = 0;
             keys = arr.keys; arr.keys = 0;
             hashes = arr.hashes; arr.hashes = 0;
@@ -1354,8 +1380,8 @@ namespace das {
         }
         template <typename QQ>
         __forceinline void close(Context * __context__, QQ * & i) {
-            array_unlock(*__context__, *that, /*at*/nullptr);
             context = nullptr;
+            array_unlock(*__context__, *that, /*at*/nullptr);
             i = nullptr;
         }
         ~das_iterator() {
@@ -1387,8 +1413,8 @@ namespace das {
         }
         template <typename QQ>
         __forceinline void close ( Context * __context__, const QQ * & i ) {
-            array_unlock(*__context__, *(Array *)(that), /*at*/nullptr);  // technically we don't need for the const array, but...
             context = nullptr;
+            array_unlock(*__context__, *(Array *)(that), /*at*/nullptr);  // technically we don't need for the const array, but...
             i = nullptr;
         }
         ~das_iterator() {
@@ -1749,6 +1775,19 @@ namespace das {
     __forceinline TT & das_deref ( Context * __context__, const TT * ptr, const char * file = "", int line = 0 ) {
         if ( !ptr ) __context__->throw_error_ex("dereferencing null pointer at %s:%d", file, line);
         return *((TT *)ptr);
+    }
+
+    struct das_null_deref {
+        Context * ctx; const char * file; int line;
+        template <typename TT>
+        __forceinline operator TT & () const {
+            ctx->throw_error_ex("dereferencing null pointer at %s:%d", file, line);
+            return *(TT *)nullptr;
+        }
+    };
+
+    __forceinline das_null_deref das_deref ( Context * __context__, nullptr_t, const char * file = "", int line = 0 ) {
+        return das_null_deref { __context__, file, line };
     }
 
     template <typename TT>
@@ -2690,8 +2729,8 @@ namespace das {
         }
         template <typename TT>
         __forceinline void close ( Context * __context__, TT & i ) {
-            that->close(*__context__,(char *)&i);
             context = nullptr;
+            that->close(*__context__,(char *)&i);
         }
         ~das_iterator() {
             if (context) that->close(*context, nullptr);

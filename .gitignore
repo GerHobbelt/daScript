@@ -6,15 +6,17 @@ benchdata.db
 *.output
 *.temp
 
-build/                      # build artifacts
-bin/                        # All build binaries stored here
-jitted_scripts/             # JIT stores dll's here
-lib/                        # All build libraries stored here
+# build artifacts
+build/
+# All build binaries stored here
+bin/
+# JIT stores dll's here
+jitted_scripts/
+# All build libraries stored here
+lib/
 modules/**/*.shared_module
 examples/**/*.shared_module
-tests/aot/_aot_generated/
-dastest/_aot_generated/
-daslib/_aot_generated/
+_aot_generated/
 .vscode/
 .cache/
 
