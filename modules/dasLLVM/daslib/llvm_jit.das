@@ -1159,6 +1159,16 @@ class LlvmJitVisitor : AstVisitor {
                 var arg_cast_type = type_to_llvm_abi_type(a._type)
                 if (a._type.isRef) {
                     arg_val = LLVMBuildPointerCast(g_builder, arg_val, arg_cast_type, "call_arg_{ai}_cast")
+                } elif (need_z_or_s_ext(a._type) != null) {
+                    // types must be zero/sign-extended to i32 before
+                    // storing into the vec4f args slot to avoid garbage.
+                    // Garbage can lead to incorrect conversion to bool.
+                    if (a._type.isSignedInteger) {
+                        arg_val = LLVMBuildSExt(g_builder, arg_val, types.t_int32, "sext_{ai}")
+                    } else {
+                        arg_val = LLVMBuildZExt(g_builder, arg_val, types.t_int32, "zext_{ai}")
+                    }
+                    arg_cast_type = types.t_int32
                 }
                 LLVMBuildStore2(g_builder, types, arg_cast_type, arg_val, arg_ptr)
             }
@@ -3838,6 +3848,14 @@ class LlvmJitVisitor : AstVisitor {
             if (expr.arguments[0] is ExprField) {
                 var efield = expr.arguments[0] as ExprField
                 methodOffset = efield.field.offset
+            } elif (expr.arguments[0] is ExprRef2Value) {
+                var er2v = expr.arguments[0] as ExprRef2Value
+                if (er2v.subexpr is ExprField) {
+                    var efield = er2v.subexpr as ExprField
+                    methodOffset = efield.field.offset
+                } else {
+                    failed_E(expr, "method call expects field and got {describe(expr.arguments[0])}")
+                }
             } else {
                 failed_E(expr, "method call expects field and got {describe(expr.arguments[0])}")
             }
@@ -4823,6 +4841,24 @@ class LlvmJitVisitor : AstVisitor {
             }
         }
 
+        // Make move (and copy), before finalize.
+        // So finalize won't have access to returned value.
+        if (isCmres) {
+            assert(!returnType.isVoid)
+            if (!expr.returnFlags.returnCMRES) {
+                if (any_afb) {
+                    var subPtrType = LLVMPointerType(type_to_llvm_type(returnType), 0u)
+                    var temp_load = LLVMBuildLoad2(g_builder, subPtrType, getE(expr.subexpr), "return_cmres_temp_load_")
+                    setE(expr.subexpr, temp_load)
+                }
+                if (expr.returnFlags.moveSemantics) {
+                    build_move(get_cmres_param(), expr.subexpr, true)
+                } else {
+                    build_copy(get_cmres_param(), expr.subexpr)
+                }
+            }
+        }
+
         call_all_finally_blocks("return", false)
         build_exit(expr.at)
 
@@ -4832,22 +4868,10 @@ class LlvmJitVisitor : AstVisitor {
 
         build_epilogue()
 
-        if (!returnType.isVoid) {
-            if (isCmres) {
-                if (!expr.returnFlags.returnCMRES) {
-                    if (isCmres && any_afb) {
-                        var subPtrType = LLVMPointerType(type_to_llvm_type(returnType), 0u)
-                        var temp_load = LLVMBuildLoad2(g_builder, subPtrType, getE(expr.subexpr), "return_cmres_temp_load_")
-                        setE(expr.subexpr, temp_load)
-                    }
-                    if (expr.returnFlags.moveSemantics) {
-                        build_move(get_cmres_param(), expr.subexpr, true)
-                    } else {
-                        build_copy(get_cmres_param(), expr.subexpr)
-                    }
-                }
-                LLVMBuildRetVoid(g_builder)
-            } elif (returnType.isPointer && (expr.subexpr is ExprConstPtr)) {// return null
+        if (returnType.isVoid || isCmres) {
+            LLVMBuildRetVoid(g_builder)
+        } else {
+            if (returnType.isPointer && (expr.subexpr is ExprConstPtr)) {// return null
                 LLVMBuildRet(g_builder, LLVMConstPointerNull(type_to_llvm_abi_type(returnType)))
             } elif (returnType.isPointer) {
                 LLVMBuildRet(g_builder, expr_res)
@@ -4856,8 +4880,6 @@ class LlvmJitVisitor : AstVisitor {
             } else {
                 LLVMBuildRet(g_builder, expr_res)
             }
-        } else {
-            LLVMBuildRetVoid(g_builder)
         }
     }
 

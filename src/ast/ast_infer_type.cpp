@@ -737,7 +737,11 @@ namespace das {
             return v_zero();
         }
         vec4f envalue = v_zero();
-        int64_t iou = getConstExprIntOrUInt(cfa.first);
+        auto eva = tryGetConstExprIntOrUInt(cfa.first);
+        if ( !eva.second ) {
+            return v_zero();
+        }
+        int64_t iou = eva.first;
         switch (expr->enumType->baseType) {
         case Type::tInt8:
         case Type::tUInt8:
@@ -2699,12 +2703,22 @@ namespace das {
                       expr->at, CompilationError::invalid_new_type);
             }
         } else if (expr->typeexpr->baseType == Type::tTuple) {
+            if ( expr->typeexpr->isAutoOrAlias() ) {
+                error("new expression cannot be auto or alias type '" + describeType(expr->typeexpr) + "'", "", "",
+                      expr->at, CompilationError::invalid_new_type);
+                return Visitor::visit(expr);
+            }
             expr->type = make_smart<TypeDecl>(Type::tPointer);
             expr->type->firstType = make_smart<TypeDecl>(*expr->typeexpr);
             expr->type->firstType->dim.clear();
             expr->type->dim = expr->typeexpr->dim;
             expr->name = expr->typeexpr->getMangledName();
         } else if (expr->typeexpr->baseType == Type::tVariant) {
+            if ( expr->typeexpr->isAutoOrAlias() ) {
+                error("new expression cannot be auto or alias type '" + describeType(expr->typeexpr) + "'", "", "",
+                      expr->at, CompilationError::invalid_new_type);
+                return Visitor::visit(expr);
+            }
             expr->type = make_smart<TypeDecl>(Type::tPointer);
             expr->type->firstType = make_smart<TypeDecl>(*expr->typeexpr);
             expr->type->firstType->dim.clear();
@@ -3969,7 +3983,7 @@ namespace das {
                 TypeDecl::clone(block->returnType, block->type);
                 setBlockCopyMoveFlags(block);
             }
-            if (block->moveOnReturn && !expr->moveSemantics) {
+            if (block->moveOnReturn && !expr->moveSemantics && expr->subexpr) {
                 string details, suggestions;
                 getDetailsAndSuggests(expr, details, suggestions);
                 error(details + ": " + describeType(block->type), "", suggestions,
@@ -5007,6 +5021,10 @@ namespace das {
                     }
                 } else if (func && func->isClassMethod && !func->isStaticClassMethod) { // if its a class method with 'self'
                     auto selfStruct = func->arguments[0]->type->structType;
+                    if (!selfStruct) {
+                        reportMissing(expr, nonNamedTypes, "no matching functions or generics: ", true);
+                        return Visitor::visit(expr);
+                    }
                     vector<TypeDeclPtr> nonNamedArgumentTypes;
                     for (auto &arg : expr->nonNamedArguments) {
                         nonNamedArgumentTypes.push_back(arg->type);
@@ -5037,6 +5055,10 @@ namespace das {
                     reportExcess(expr, nonNamedTypes, "too many matching functions or generics: ", functions, generics);
                     return Visitor::visit(expr);
                 }
+            }
+            if ( inArgumentInit && func==fun ) {
+                error("recursive call to " + func->name + " in argument initializer is not allowed", "", "",expr->at);
+                return Visitor::visit(expr);
             }
             reportAstChanged();
             return demoteCall(expr, fun);

@@ -324,6 +324,7 @@ namespace das
             };
             uint32_t    flags = 0;
         };
+        mutable bool circularGuard = false;   // we prevent circular lookups with this guard. Do not serialize, do not expose to daslang
 #if DAS_MACRO_SANITIZER
     public:
         void* operator new ( size_t count ) { return das_aligned_alloc16(count); }
@@ -1346,6 +1347,7 @@ namespace das
         TypeDeclPtr makeHandleType ( const string & name ) const;
         TypeDeclPtr makeEnumType ( const string & name ) const;
         Module* front() const { return modules.front(); }
+        Module* back() const { return modules.back(); }
         vector<Module *> & getModules() { return modules; }
         Module* getThisModule() const { return thisModule; }
         void reset();

@@ -7,7 +7,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(DAS_FLEX_BISON_DISABLED "Disable FLEX/BISON stage" ON)
 option(DAS_CLANG_BIND_DISABLED "Disable dasClangBind (libclang bindings, C/C++ parsing)" ON)
 option(DAS_LLVM_DISABLED "Disable dasLLVM (llvm bindings)" ON)
-option(DAS_QUIRREL_DISABLED "Disable dasQuirrel (quirrel bindings)" ON)
 option(DAS_HV_DISABLED "Disable dasHV (websokets,http server and client)" ON)
 option(DAS_GLFW_DISABLED "Disable dasGLFW (GLFW window for graphics apps)" ON)
 option(DAS_IMGUI_DISABLED "Disable dasIMGUI (IMGUI, IMNODES, IMGUI-NODE-EDITOR gui libraries)" ON)
@@ -479,7 +478,6 @@ SET(SIMULATE_SRC
 ../src/hal/debug_break.cpp
 ../src/hal/project_specific.cpp
 ../src/hal/project_specific_file_info.cpp
-../src/hal/crash_handler.cpp
 ../include/daScript/misc/crash_handler.h
 ../include/daScript/misc/network.h
 ../src/misc/network.cpp
@@ -667,13 +665,3 @@ if (NOT ${DAS_BUILD_TOOLS} MATCHES NO)
 
 
 endif()
-
-
-SET(PROFILE_MAIN_LIB_SRC
-../examples/profile/test_profile.cpp
-../examples/profile/test_profile.h
-)
-SOURCE_GROUP_FILES("source" PROFILE_MAIN_LIB_SRC)
-
-ADD_LIBRARY(libDaScriptProfile ${PROFILE_MAIN_LIB_SRC})
-SETUP_CPP11(libDaScriptProfile)
