@@ -14,7 +14,6 @@ option(DAS_CLANG_BIND_DISABLED "Disable dasClangBind (libclang bindings, C/C++ p
 option(DAS_LLVM_DISABLED "Disable dasLLVM (llvm bindings)" ON)
 option(DAS_HV_DISABLED "Disable dasHV (websokets,http server and client)" ON)
 option(DAS_GLFW_DISABLED "Disable dasGLFW (GLFW window for graphics apps)" OFF)
-option(DAS_MINFFT_DISABLED "Disable dasMinfft (Minimal FFT library)" ON)
 option(DAS_AUDIO_DISABLED "Disable dasAudio (Miniaudio sound library)" ON)
 option(DAS_STDDLG_DISABLED "Disable dasStdDlg (File new,open,save etc dialogs)" OFF)
 option(DAS_STBIMAGE_DISABLED "Disable dasStbImage (StbImage bindings, image loading and saving)" OFF)
@@ -1068,6 +1067,9 @@ get_target_property(DAS_FMT_LIBS das-fmt LINK_LIBRARIES)
     target_include_directories(test_concurrent_init_dyn PRIVATE ${NEED_MODULES_PATH})
     SETUP_CPP11(test_concurrent_init_dyn)
 
+    # Build daslang utilities as standalone executables (-exe mode)
+    add_subdirectory(utils)
+
 endif()
 
 # This list should be significantly reduced, most of the files, except aot related should be private.
@@ -1290,7 +1292,6 @@ install(FILES ${PROJECT_SOURCE_DIR}/include/vecmath/LICENSE DESTINATION ${DAS_IN
 
 # Install utility scripts
 install(FILES ${PROJECT_SOURCE_DIR}/utils/aot/main.das DESTINATION utils/aot)
-install(FILES ${PROJECT_SOURCE_DIR}/utils/dasCodeFormatter/main.das DESTINATION utils/dasCodeFormatter)
 
 # Install MCP server (stdio transport, no dasHV dependency)
 install(FILES
