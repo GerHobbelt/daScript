@@ -5,17 +5,21 @@ management. For higher-level job abstractions, see ``jobque_boost``.
 
 See :ref:`tutorial_jobque` for a hands-on tutorial.
 
-All functions and symbols are in "jobque" module, use require to get access to it. ::
+All functions and symbols are in "jobque" module, use require to get access to it.
+
+.. code-block:: das
 
     require jobque
 
-Example: ::
+Example:
+
+.. code-block:: das
 
     require jobque
 
         [export]
         def main() {
-            with_atomic32 <| $(counter) {
+            with_atomic32() $(counter) {
                 counter |> set(10)
                 print("value = {counter |> get}\n")
                 let after_inc = counter |> inc

@@ -206,7 +206,7 @@ namespace das {
                 ...block_finally...
      */
     DAS_API FunctionPtr generateLambdaFinalizer ( const string & lambdaName, ExprBlock * block,
-                                         const StructurePtr & ls );
+                                         const StructurePtr & ls, Program * thisProgram );
 
     /*
          [[__lambda_at_line_xxx
@@ -216,7 +216,7 @@ namespace das {
      */
     DAS_API ExpressionPtr generateLambdaMakeStruct ( const StructurePtr & ls, const FunctionPtr & lf, const FunctionPtr & lff,
                                             const safe_var_set & capt, const vector<CaptureEntry> & capture, const LineInfo & at,
-                                            Program * thisProgram );
+                                            const LineInfo & captureAt, Program * thisProgram );
 
     /*
          array comprehension [{ for x in src; x_expr; where x_expr }]

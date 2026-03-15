@@ -1336,6 +1336,7 @@ namespace das {
             cexpr->iterType = make_smart<TypeDecl>(*iterType);
         }
         cexpr->capture = capture;
+        cexpr->captureAt = captureAt;
         return cexpr;
     }
 
@@ -1375,6 +1376,7 @@ namespace das {
         cexpr->isLambda = isLambda;
         cexpr->isLocalFunction = isLocalFunction;
         cexpr->capture = capture;
+        cexpr->captureAt = captureAt;
         cexpr->aotFunctorName = aotFunctorName;
         return cexpr;
     }
@@ -3132,10 +3134,7 @@ namespace das {
             case Type::tURange:         return make_smart<ExprConstURange>(at, cast<urange>::to(value));
             case Type::tRange64:        return make_smart<ExprConstRange64>(at, cast<range64>::to(value));
             case Type::tURange64:       return make_smart<ExprConstURange64>(at, cast<urange64>::to(value));
-            default:
-                DAS_FATAL_LOG("unsupported type in makeConstExpression: %s", type->describe().c_str());
-                DAS_FATAL_ERROR("unsupported type in makeConstExpression");
-                break;
+            default:                    DAS_ASSERTF(0, "we should not even be here"); return nullptr;
         }
     }
 

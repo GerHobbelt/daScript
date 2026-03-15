@@ -218,6 +218,7 @@ namespace das
             };
             uint32_t            blockFlags = 0;
         };
+        size_t                  insideErrorCount = 0;       // this is used to track errors in the block, so we can reporting block errors caused by inside block, and avoid reporting them twice
         Function *              inFunction = nullptr;       // moving this to the last position of a class
                                                             // is a workaround of a compiler bug in 32-bit MVSC 2015
     };
@@ -1061,6 +1062,7 @@ namespace das
         virtual bool rtti_isMakeBlock() const override { return true; }
         virtual void serialize( AstSerializer & ser ) override;
         vector<CaptureEntry>    capture;
+        LineInfo                captureAt;
         ExpressionPtr block;
         uint32_t stackTop = 0;
         union {
@@ -1082,6 +1084,7 @@ namespace das
         virtual void serialize( AstSerializer & ser ) override;
         TypeDeclPtr iterType;
         vector<CaptureEntry> capture;
+        LineInfo captureAt;
     };
 
     struct DAS_API ExprYield : Expression {

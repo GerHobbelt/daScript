@@ -11,7 +11,9 @@ The BITFIELD_TRAIT module implements reflection utilities for bitfield types:
 converting bitfield values to and from human-readable strings, iterating
 over individual set bits, and constructing bitfield values from string names.
 
-All functions and symbols are in "bitfield_trait" module, use require to get access to it. ::
+All functions and symbols are in "bitfield_trait" module, use require to get access to it.
+
+.. code-block:: das
 
     require daslib/bitfield_trait
 
@@ -51,7 +53,7 @@ Iteration
 +++++++++
 
   *  :ref:`each (argT: auto) : auto <function-bitfield_trait_each_auto_0x16>`
-  *  :ref:`each_bit_name (argT: auto) : auto <function-bitfield_trait_each_bit_name_auto_0x39>`
+  *  :ref:`each_bit_name (argT: auto) : auto <function-bitfield_trait_each_bit_name_auto_0x47>`
 
 .. _function-bitfield_trait_each_auto_0x16:
 
@@ -62,7 +64,7 @@ Iterates over the names of a bitfield type, yielding each bit as a bitfield valu
 
 :Arguments: * **argT** : auto
 
-.. _function-bitfield_trait_each_bit_name_auto_0x39:
+.. _function-bitfield_trait_each_bit_name_auto_0x47:
 
 .. das:function:: each_bit_name(argT: auto) : auto
 

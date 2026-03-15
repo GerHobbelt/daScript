@@ -863,6 +863,7 @@ namespace das
             return this;
         }
         FunctionPtr arg_type ( int argIndex, const TypeDeclPtr & td ) {
+            DAS_ASSERTF(!module, "cannot change argument type after function is added to module, use makeExtern/addToModule instead");
             arguments[argIndex]->type = td;
             return this;
         }
@@ -1413,6 +1414,7 @@ namespace das
         CaptureMacro ( const string & na = "" ) : name(na) {}
         virtual ExpressionPtr captureExpression ( Program *, Module *, Expression *, TypeDecl * ) { return nullptr; }
         virtual void captureFunction ( Program *, Module *, Structure *, Function * ) { }
+        virtual void releaseFunction ( Program *, Module *, Structure *, Function * ) { }
         string name;
     };
 

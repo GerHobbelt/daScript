@@ -116,7 +116,7 @@ namespace das {
                                 if (func && func->skipLockCheck)
                                     pFn->skipLockCheck = true; // we propagate skipLockCheck to the generator function
                                 if (program->addFunction(pFn)) {
-                                    auto pFnFin = generateLambdaFinalizer(lname, block.get(), ls);
+                                    auto pFnFin = generateLambdaFinalizer(lname, block.get(), ls, program);
                                     if (program->addFunction(pFnFin)) {
                                         if (func && func->isClassMethod) {
                                             // lambda, captured in the class is a method of that class - for the purposes of 'private'
@@ -128,7 +128,7 @@ namespace das {
                                             DAS_ASSERT(pFnFin->classParent);
                                         }
                                         reportAstChanged();
-                                        auto ms = generateLambdaMakeStruct(ls, pFn, pFnFin, cl.capt, expr->capture, expr->at, program);
+                                        auto ms = generateLambdaMakeStruct(ls, pFn, pFnFin, cl.capt, expr->capture, expr->at, expr->captureAt, program);
                                         // each ( [[ ]]] )
                                         auto cEach = make_smart<ExprCall>(block->at, makeRef ? "each_ref" : "each");
                                         cEach->generated = true;
@@ -246,7 +246,7 @@ namespace das {
                             if (func && func->skipLockCheck)
                                 pFn->skipLockCheck = true; // we propagate skipLockCheck to the lambda function
                             if (program->addFunction(pFn)) {
-                                auto pFnFin = generateLambdaFinalizer(lname, block.get(), ls);
+                                auto pFnFin = generateLambdaFinalizer(lname, block.get(), ls, program);
                                 if (program->addFunction(pFnFin)) {
                                     // lambda, captured in the class is a method of that class - for the purposes of 'private'
                                     if (func && func->isClassMethod) {
@@ -258,7 +258,7 @@ namespace das {
                                         DAS_ASSERT(pFnFin->classParent);
                                     }
                                     reportAstChanged();
-                                    auto ms = generateLambdaMakeStruct(ls, pFn, pFnFin, cl.capt, expr->capture, expr->at, program);
+                                    auto ms = generateLambdaMakeStruct(ls, pFn, pFnFin, cl.capt, expr->capture, expr->at, expr->captureAt, program);
                                     return ms;
                                 } else {
                                     error("lambda finalizer name mismatch", "", "",
@@ -318,11 +318,14 @@ namespace das {
             expr->type->baseType = Type::tLambda;
             if (!expr->type->isAutoOrAlias()) {
                 if (auto unInferred = isFullyInferredBlock(block.get())) {
-                    TextWriter tt;
-                    if (verbose)
-                        tt << unInferred->at.describe() << ": " << unInferred->describe() << " is not fully inferred yet";
-                    error("block is not fully inferred yet", tt.str(), "",
-                          expr->at, CompilationError::invalid_block);
+                    // only report block inference error if there is no error inside the block, to avoid reporting multiple errors caused by the same issue
+                    if ( ((ExprBlock *)expr->block.get())->insideErrorCount==0 ) {
+                        TextWriter tt;
+                        if (verbose)
+                            tt << unInferred->at.describe() << ": " << unInferred->describe() << " is not fully inferred yet";
+                        error("block is not fully inferred yet", tt.str(), "",
+                            expr->at, CompilationError::invalid_block);
+                    }
                 } else {
                     if (auto btl = convertBlockToLambda(expr)) {
                         return btl;
@@ -333,11 +336,14 @@ namespace das {
             expr->type->baseType = Type::tFunction;
             if (!expr->type->isAutoOrAlias()) {
                 if (auto unInferred = isFullyInferredBlock(block.get())) {
-                    TextWriter tt;
-                    if (verbose)
-                        tt << unInferred->at.describe() << ": " << unInferred->describe() << " is not fully inferred yet";
-                    error("block is not fully inferred yet", tt.str(), "",
-                          expr->at, CompilationError::invalid_block);
+                    // only report block inference error if there is no error inside the block, to avoid reporting multiple errors caused by the same issue
+                    if ( ((ExprBlock *)expr->block.get())->insideErrorCount==0 ) {
+                        TextWriter tt;
+                        if (verbose)
+                            tt << unInferred->at.describe() << ": " << unInferred->describe() << " is not fully inferred yet";
+                        error("block is not fully inferred yet", tt.str(), "",
+                            expr->at, CompilationError::invalid_block);
+                    }
                 } else {
                     if (auto btl = convertBlockToLocalFunction(expr)) {
                         return btl;

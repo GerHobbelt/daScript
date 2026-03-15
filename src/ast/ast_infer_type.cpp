@@ -3043,6 +3043,7 @@ namespace das {
         }
         scopes.push_back(block);
         inFinally.push_back(false);
+        block->insideErrorCount = program->errors.size();
         pushVarStack();
         block->inFunction = func.get();
     }
@@ -3170,6 +3171,7 @@ namespace das {
     }
     ExpressionPtr InferTypes::visit(ExprBlock *block) {
         // to the rest of it
+        block->insideErrorCount = program->errors.size() - block->insideErrorCount;
         popVarStack();
         scopes.pop_back();
         inFinally.pop_back();
@@ -4412,8 +4414,9 @@ namespace das {
                 if (pVar->type && !pVar->type->isTuple()) {
                     error("for loop iterator variable " + pVar->name + " is not a tuple", "", "",
                           expr->at, CompilationError::invalid_iteration_source);
+                } else {
+                    expandTupleName(pVar->name, pVar->at);
                 }
-                expandTupleName(pVar->name, pVar->at);
             }
             ++idx;
         }

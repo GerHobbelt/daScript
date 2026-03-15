@@ -70,6 +70,8 @@ introduced in earlier tutorials.
    tutorials/40_coroutines.rst
    tutorials/41_serialization.rst
    tutorials/42_testing_tools.rst
+   tutorials/43_interfaces.rst
+   tutorials/44_compile_and_run.rst
 
 .. _tutorials_integration_c:
 
@@ -146,3 +148,18 @@ Run any tutorial from the project root::
 
    tutorials/macros/01_call_macro.rst
    tutorials/macros/02_when_macro.rst
+   tutorials/macros/03_function_macro.rst
+   tutorials/macros/04_advanced_function_macro.rst
+   tutorials/macros/05_tag_function_macro.rst
+   tutorials/macros/06_structure_macro.rst
+   tutorials/macros/07_block_macro.rst
+   tutorials/macros/08_variant_macro.rst
+   tutorials/macros/09_for_loop_macro.rst
+   tutorials/macros/10_capture_macro.rst
+   tutorials/macros/11_reader_macro.rst
+   tutorials/macros/12_typeinfo_macro.rst
+   tutorials/macros/13_enumeration_macro.rst
+   tutorials/macros/14_pass_macro.rst
+   tutorials/macros/15_type_macro.rst
+   tutorials/macros/16_template_type_macro.rst
+   tutorials/macros/17_qmacro.rst

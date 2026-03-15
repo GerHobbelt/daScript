@@ -103,13 +103,18 @@ class DASObject(ObjectDescription):
         if prefix:
             signode += addnodes.desc_addname(prefix + '.', prefix + '.')
         elif mod_name:
-            signode += addnodes.desc_addname(mod_name + '.', mod_name + '.')
+            signode += addnodes.desc_addname(mod_name + '::', mod_name + '::')
         signode += addnodes.desc_name(name, name)
         if self.has_arguments:
             if not arglist:
                 signode += addnodes.desc_parameterlist()
             else:
-                _pseudo_parse_arglist(signode, arglist)
+                import inspect as _inspect
+                _ppa_params = _inspect.signature(_pseudo_parse_arglist).parameters
+                if 'env' in _ppa_params:
+                    _pseudo_parse_arglist(signode, arglist, env=self.env)
+                else:
+                    _pseudo_parse_arglist(signode, arglist)
         return fullname, prefix
 
     def add_target_and_index(self, name_obj, sig, signode):
@@ -498,7 +503,7 @@ class DaslangLexer(RegexLexer):
             (r'[/*]', Comment.Multiline),
         ],
         'string': [
-            (r'\\[\\nrt"\'{]', String.Escape),
+            (r'\\[\\nrt"\'{}]', String.Escape),
             (r'\{', String.Interpol, 'interpolation'),
             (r'[^"\\{]+', String.Double),
             (r'"', String.Double, '#pop'),

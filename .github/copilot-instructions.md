@@ -15,6 +15,13 @@ This is the [daslang](https://dascript.org/) programming language repository (Ga
 - **Run a script:** `bin/Release/daslang.exe path/to/script.das`
 - **Run tests:** `bin/Release/daslang.exe dastest/dastest.das -- --test path/to/test.das`
 
+### Debugging
+
+- **Always check the exit code** after running `daslang.exe` — a crash may produce no output at all, looking like a silent success
+- On Windows, check `$LASTEXITCODE` in PowerShell after every run. Exit code `0` = success, non-zero = error
+- Exit code `-1073741819` (`0xC0000005`) = **Access Violation** — indicates a native crash (segfault), usually a dangling pointer or double-free in macro AST manipulation
+- If the program crashes with no error message, the bug is in native code (C++ bindings or smart pointer misuse), not in daScript logic — check exit code first before investigating script errors
+
 ## Skill Files (REQUIRED)
 
 Task-specific instructions are split into skill files under `skills/`. You MUST read the relevant skill file(s) before performing the corresponding task.
@@ -23,7 +30,7 @@ Task-specific instructions are split into skill files under `skills/`. You MUST 
 |---|---|
 | `skills/das_formatting.md` | Creating or modifying any `.das` file (tutorials, tests, daslib modules, utilities) |
 | `skills/writing_tests.md` | Writing or editing test files under `tests/` |
-| `skills/documentation_rst.md` | Editing RST files in `doc/source/`, editing `//!` doc-comments in `daslib/*.das`, or writing tutorial RST pages |
+| `skills/documentation_rst.md` | Editing RST files in `doc/source/`, editing `//!` doc-comments in `daslib/*.das`, writing tutorial RST pages, editing `doc/source/stdlib/handmade/` files, running `das2rst.das`, or regenerating stdlib module documentation |
 | `skills/cpp_integration.md` | Writing or editing C++ files in `src/`, `modules/`, or `tutorials/integration/cpp/` |
 | `skills/daslib_modules.md` | Working with `daslib/` modules (linq, json, regex, functional, match, etc.) or extending the standard library |
 
@@ -42,13 +49,13 @@ All code examples and documentation MUST use gen2 syntax (add `options gen2` at 
 - **No `[[ ]]` for `new`** — `new` always uses parentheses: `new Foo(x=1)`
 - **Table literals:** `{ "k" => v, "k2" => v2 }` (single braces, commas) — NOT `{{ "k" => v; "k2" => v2 }}`
 - **Named arguments:** `foo([name = value])` with square brackets — NOT `foo(name=value)`
-- **Block arguments with `<|`:** use `$()` or `@()` prefix: `defer() <| $() { ... }` — NOT `defer <| { ... }` (bare `{ }` creates a table literal)
+- **Block arguments:** a block or lambda after `func()` is automatically piped as the last argument — no `<|` needed. Parameterless blocks need no `$`: `defer() { ... }`. Blocks with parameters use `$`: `build_string() $(var writer) { ... }`. Lambdas use `@`: `emplace() @(x : int) { ... }`
 - **Lambda:** `@(args) { body }` or `@@(args) { body }` (no-capture)
 - **Generator:** `$() { yield value; }` or `$ { yield value; }` — both are valid gen2 syntax
 - **Tuple `=>` operator:** `a => b` creates a `tuple<auto;auto>` — useful in LINQ, table construction, and ad-hoc pairs
 - **Bitfield variables** need explicit type for `.field` access and printing: `var f : MyBitfield`
 - **Bitfield dot access:** read with `f.flag` (returns bool), write with `f.flag = true/false`
-- **`typeinfo`** special syntax: `typeinfo enum_length(type<MyEnum>)` — NOT `typeinfo(enum_length type<MyEnum>)`
+- **`typeinfo`** gen2 syntax: trait name goes **outside** parentheses — `typeinfo trait_name(type<T>)`, NOT `typeinfo(trait_name type<T>)`. With subtrait: `typeinfo has_method<name>(type<T>)`. With two traits: `typeinfo trait<sub;extra>(type<T>)`
 - **`static_if`:** `static_if (condition) { ... }` — parentheses required in gen2
 
 ### Important defaults
@@ -73,10 +80,27 @@ All code examples and documentation MUST use gen2 syntax (add `options gen2` at 
 ### Move semantics (`<-` vs `move`)
 
 - **`<-` operator**: ALWAYS `memcpy(dest, src) + memset(src, 0)` — it is a raw memory operation, NOT smart_ptr-aware. It zeros the source regardless of type.
-- **`move` function**: Bound via C++ `builtin_smart_ptr_move*` family in `module_builtin_runtime.cpp` — proper smart pointer move with reference counting. Use `move(dest, src)` or `move(dest) <| src` for `smart_ptr<T>` transfers.
+- **`move` function**: Bound via C++ `builtin_smart_ptr_move*` family in `module_builtin_runtime.cpp` — proper smart pointer move with reference counting. Use `move(dest, src)` or `move(dest) src` for `smart_ptr<T>` transfers.
 - **`return <- expr`**: Moves value to return slot and zeroes `expr`. If `expr` is a `&` ref parameter, this zeroes the *caller's* variable since they share memory.
-- **Key subtlety**: When a function takes `var x : smart_ptr<T>&` (by reference) and internally calls a function that takes `var x : smart_ptr<T>` (by value/move), the `<-` inside `return` zeroes the `&` ref. Callers MUST capture the return value: `unsafe { expr <- apply_template(expr) <| ... }`
-- **Safe pattern**: `unsafe { variable <- function_returning_smart_ptr(variable) <| ... }` — captures return value back into the same variable
+- **Key subtlety**: When a function takes `var x : smart_ptr<T>&` (by reference) and internally calls a function that takes `var x : smart_ptr<T>` (by value/move), the `<-` inside `return` zeroes the `&` ref. Callers MUST capture the return value: `unsafe { expr <- apply_template(expr) $() { ... } }`
+- **Safe pattern**: `unsafe { variable <- function_returning_smart_ptr(variable) $() { ... } }` — captures return value back into the same variable
+
+### AST smart pointer ownership (macros)
+
+- Many AST functions take `smart_ptr<T>` **by value** — this **moves** the pointer from the caller. After the call, the caller's variable is null/zeroed.
+- **`var inscope` + move = double-free crash**: If you declare `var inscope p = make_something()` and pass `p` to a function that moves it, `p` is zeroed by the move. Then `inscope` destroys `p` at scope exit → double-free → Access Violation.
+- **`clone_type(typeExpr)`** — deep-copies a `TypeDeclPtr`. Use when passing a type to a consuming function while keeping the original, or when the source is a `var inscope` variable.
+- **`clone_expression(expr)`** — deep-copies an `ExpressionPtr`. Same ownership rules as `clone_type`.
+- **Safe pattern for `add_structure_field`**: pass temporaries directly — `st |> add_structure_field("name", clone_type(qmacro_type(type<int>)), qmacro($v(val)))` — the `clone_type` result is a temporary safely consumed by the move.
+- **`move_new`**: `field |> move_new <| expr` — idiomatic way to assign a newly created `smart_ptr<T>` into a field. Equivalent to `field <- expr` but does not require `unsafe`. Preferred over `field := null; unsafe { field <- expr }` when setting AST node fields (e.g. `cm.init |> move_new <| qmacro(...)`).
+- **`add_ptr_ref(raw_ptr)`** — wraps a raw pointer (`T?`) into a `smart_ptr<T>` by adding a reference. AST node fields are often raw pointers (e.g. `typeDecl.structType` is `Structure?`, `typeDecl.enumType` is `Enumeration?`), but many API functions expect `smart_ptr<T>`. Use `add_ptr_ref` to bridge: `var inscope st <- add_ptr_ref(pair_type.structType)` gives a `StructurePtr` from a `Structure?` field. Also accepts `smart_ptr<T>` input (adds a ref and returns a new smart_ptr). Always use `var inscope` for the result to manage lifetime.
+- **Rule of thumb**: if a function signature takes `var x : smart_ptr<T>` (not `&`), it **consumes** `x`. Pass a temporary, a clone, or accept that your variable will be null after the call.
+
+### `qmacro` vs `quote` (code generation)
+
+- **`qmacro(expr)`** — quasi-quote with reification splices (`$v()`, `$e()`, `$c()`, `$t()`, `$i()`, `$f()`, `$a()` etc.). Use when the generated code contains interpolated values.
+- **`quote(expr)`** — plain quote with NO reification. Use when the expression is a simple literal or constant with no splices — e.g. `quote(true)`, `quote(false)`, `quote(0)`.
+- **Rule**: if the expression contains no `$…()` reification operators, prefer `quote()` over `qmacro()` — it is simpler, clearer, and avoids unnecessary reification overhead.
 
 ### Error handling
 
@@ -113,14 +137,13 @@ All code examples and documentation MUST use gen2 syntax (add `options gen2` at 
 - `table |> insert(key, value)` — insert into `table<K;V>`; `table |> insert(key)` — insert into set `table<K>`
 - `table |> erase(key)` — remove a key
 - **Never use two `[]` lookups on the same table in one expression** (e.g. `tab[k1] = tab[k2]`) — tables are unboxed containers and re-hashing on insert can invalidate the first reference
-- `find(table, key) <| $(pval) { ... }` — block-based lookup; block receives pointer to value if found
-- `get(table, key, blk)` — similar block-based access (see `daslib/builtin.das`)
+- `get(table, key) $(pval) { ... }` — block-based lookup; block receives value reference if found
 
 ### Common gotchas
 
 - Lambda params can shadow function params — use distinct names (e.g., `$(lhs, rhs)` not `$(a, b)` when `a` is already in scope)
 - `struct Foo { ... }` requires braces in gen2 — empty struct is `struct Foo {}`
-- String builder: `build_string() <| $(var writer) { write(writer, "text") }` — requires `unsafe` or `options persistent_heap` if returned
+- String builder: `build_string() $(var writer) { write(writer, "text") }` — requires `unsafe` or `options persistent_heap` if returned
 - `options persistent_heap` — needed when returning strings built with `build_string`
 - Tuple field access uses underscore prefix: `t._0`, `t._1`, `t._2`
 - Annotations: `[export]` for entry points, `[private]` for private functions, `[test]` for test functions
@@ -129,13 +152,23 @@ All code examples and documentation MUST use gen2 syntax (add `options gen2` at 
 - `require` uses forward slash paths: `require daslib/linq` — NOT `require daslib\linq`
 - `require foo public` — re-exports `foo` so that any module requiring the current module also sees `foo`'s symbols transitively. Example: `regex.das` has `require strings public`, so `require daslib/regex` automatically makes `slice`, `starts_with`, etc. visible without a separate `require strings`
 - `<-` is memcpy+memset(0), NOT a smart_ptr-aware move — see "Move semantics" section above
-- When calling `apply_template`, always capture the return value: `unsafe { expr <- apply_template(expr) <| ... }` — discarding the return loses the expression data
+- When calling `apply_template`, always capture the return value: `unsafe { expr <- apply_template(expr) $() { ... } }` — discarding the return loses the expression data
 - Iterator comprehension: `[iterator for(x in src); expression]` — semicolon separates generator from body
 - `to_array` (from `daslib/builtin`) converts any iterator to an array
-- Lambdas CAN be stored in arrays: `var fns : array<lambda<(x:int):int>>` + `fns |> emplace() <| @(x : int) : int { return x * 2; }` — move semantics, not copy
+- Lambdas CAN be stored in arrays: `var fns : array<lambda<(x:int):int>>` + `fns |> emplace() @(x : int) : int { return x * 2; }` — move semantics, not copy
 - Blocks CANNOT be stored in containers, returned from functions, or captured — use lambdas or function pointers for those use cases
 - `match`, `multi_match`, `static_match` macros (from `daslib/match.das`) handle side effects automatically — do NOT add `[sideeffects]` annotations to functions that only use match
 - `[export] def main()` returns `void` — do NOT `return true` or return other values from main
+
+### Channels and cross-context communication
+
+- `with_channel(N) $(ch) { ... }` — creates a channel expecting `N` notify calls before `for_each_clone` unblocks
+- **`notify` vs `notify_and_release`**: when a lambda captures a channel, the reference count is incremented; `notify_and_release` decrements the entry count AND releases that extra reference, setting the variable to `null`. When passing a channel as a plain argument (e.g. via `invoke_in_context`), no lambda capture occurs — no extra reference is added — so use plain `notify`
+- `notify_and_release` sets the channel/status variable to `null` after release
+- `push_clone(ch, value)` — push a clone of `value` into the channel
+- `for_each_clone(ch) $(val : T#) { ... }` — drain channel; data arrives as temporary type `T#`
+- `invoke_in_context(context, "func", ch)` — can pass `Channel?` directly to a child context
+- Child scripts that use channel operations need `require daslib/jobque_boost`; compile with `compile_file` + `make_file_access("")` so the child can resolve daslib modules from disk
 
 ## Key Directories
 
@@ -155,6 +188,7 @@ All code examples and documentation MUST use gen2 syntax (add `options gen2` at 
 - `tests/functional/` — Functional module tests
 - `tests/json/` — JSON module tests (4 test files, ~148 tests)
 - `tests/regex/` — Regex module tests (8 test files, 278 tests)
+- `tests/interfaces/` — Interface module tests (4 test files, 67 tests)
 - `modules/` — External plugin modules
 
 ## Keywords Reference

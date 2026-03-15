@@ -12,11 +12,15 @@ Optional flags can be appended after a second ``~`` separator:
 See :doc:`regex` for the full list of supported syntax.
 See :ref:`tutorial_regex` for a hands-on tutorial.
 
-All functions and symbols are in "regex_boost" module, use require to get access to it. ::
+All functions and symbols are in "regex_boost" module, use require to get access to it.
+
+.. code-block:: das
 
     require daslib/regex_boost
 
-Example: ::
+Example:
+
+.. code-block:: das
 
     require daslib/regex_boost
         require strings
@@ -27,7 +31,7 @@ Example: ::
             let m = regex_match(re, "123abc")
             print("match length = {m}\n")
             let text = "age 25, height 180"
-            regex_foreach(re, text) <| $(r) {
+            regex_foreach(re, text) $(r) {
                 print("found: {slice(text, r.x, r.y)}\n")
                 return true
             }

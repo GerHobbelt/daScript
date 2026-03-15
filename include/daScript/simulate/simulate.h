@@ -211,7 +211,6 @@ namespace das
         goto loopend; \
     } }
 
-#if DAS_ENABLE_EXCEPTIONS
     class dasException final : public std::exception {
     public:
         dasException ( const char * why, const LineInfo & at )
@@ -223,7 +222,6 @@ namespace das
         LineInfo exceptionAt;
         das::string exceptionWhat;
     };
-#endif
 
     struct DAS_API SimVisitor {
         virtual void preVisit ( SimNode * ) { }
@@ -824,6 +822,7 @@ namespace das
         bool                            gcEnabled = false;
         bool                            failed = false;
         bool                            verySafeContext = false;    // when true, array and table reserves don't free memory
+        bool                            sharedPtrContext = false;   // there is a shared ptr to this context
     public:
         string                          name;
         Bitfield                        category = 0;

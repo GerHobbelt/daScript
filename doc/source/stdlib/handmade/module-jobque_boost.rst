@@ -5,18 +5,22 @@ and channel-based patterns for simplified concurrent programming.
 See also :doc:`jobque` for the low-level job queue primitives.
 See :ref:`tutorial_jobque` for a hands-on tutorial.
 
-All functions and symbols are in "jobque_boost" module, use require to get access to it. ::
+All functions and symbols are in "jobque_boost" module, use require to get access to it.
+
+.. code-block:: das
 
     require daslib/jobque_boost
 
-Example: ::
+Example:
+
+.. code-block:: das
 
     require daslib/jobque_boost
 
         [export]
         def main() {
-            with_job_status(1) <| $(status) {
-                new_thread <| @() {
+            with_job_status(1) $(status) {
+                new_thread() @() {
                     print("from thread\n")
                     status |> notify_and_release()
                 }

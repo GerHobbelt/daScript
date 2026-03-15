@@ -35,6 +35,22 @@ Functions in each module's RST are organized into named groups (e.g. "Compilatio
 3. Regenerate: `python doc/reflections/gen_module_examples.py`
 4. Validate: `bin/Release/daslang.exe doc/reflections/das2rst.das`
 
+### Checking for `// stub` files (REQUIRED after regeneration)
+
+When `das2rst.das` encounters a function, typedef, structure, or class that has no handmade doc file, it creates a stub file in `doc/source/stdlib/handmade/` starting with `// stub` followed by the signature. These stubs produce raw signature text in the generated docs instead of descriptions.
+
+**After every doc regeneration**, check for remaining stubs:
+```
+Select-String -Path "doc\source\stdlib\handmade\*.rst" -Pattern "// stub" -SimpleMatch
+```
+
+To fix a stub:
+1. Open the stub file (e.g., `function-strings_boost-capitalize-0x1747f4e995e14ba9.rst`)
+2. The second line contains the function signature — use it to locate the source
+3. Replace the **entire file content** with a plain-text description (1–2 sentences, no RST directives). For bitfield typedefs, use one line per flag (first line = type description, subsequent = per-flag descriptions)
+4. Regenerate: `bin/Release/daslang.exe doc/reflections/das2rst.das`
+5. Verify: `Select-String -Path "doc\source\stdlib\*.rst" -Pattern "// stub"` should return 0 matches
+
 ## RST Editing Conventions
 
 When editing RST files in `doc/source/reference/language/`:
@@ -125,9 +141,21 @@ Macro tutorial RST files live in `doc/source/reference/tutorials/macros/` with `
   - Next tutorial link (except last)
 - Toctree is the "Macro Tutorials" section (label `tutorials_macros`) in `doc/source/reference/tutorials.rst`
 
+## Tutorial development workflow
+
+When creating or modifying tutorials:
+
+1. **Write a throwaway test file** (e.g., `test_<topic>.das`) during development to validate the tutorial code works correctly
+2. **Run the test file** with `dastest` to confirm all behavior — always check `$LASTEXITCODE` after running `daslang.exe` (a crash may produce no output)
+3. **Do NOT stage or commit the test file** — tutorials are self-demonstrating (run them, read the output); they don't need a permanent test suite
+4. **Delete the test file** once the tutorial is confirmed working
+5. **Stage only** the tutorial source files (`.das`), RST documentation, and toctree/seealso updates
+
+Test files for tutorials are development scaffolding, not deliverables.
+
 ## Cross-reference labels
 
-- Tutorial labels for cross-references: `tutorial_hello_world`, `tutorial_variables`, `tutorial_operators`, `tutorial_control_flow`, `tutorial_functions`, `tutorial_arrays`, `tutorial_strings`, `tutorial_structs`, `tutorial_enumerations`, `tutorial_tables`, `tutorial_tuples_and_variants`, `tutorial_function_pointers`, `tutorial_blocks`, `tutorial_lambdas`, `tutorial_iterators_and_generators`, `tutorial_modules`, `tutorial_move_copy_clone`, `tutorial_classes`, `tutorial_generics`, `tutorial_lifetime`, `tutorial_error_handling`, `tutorial_unsafe`, `tutorial_string_format`, `tutorial_pattern_matching`, `tutorial_annotations`, `tutorial_contracts`, `tutorial_testing`, `tutorial_linq`, `tutorial_functional`, `tutorial_json`, `tutorial_regex`, `tutorial_operator_overloading`, `tutorial_pointers`, `tutorial_utility_patterns`, `tutorial_random`, `tutorial_dynamic_type_checking`, `tutorial_coroutines`, `tutorial_serialization`, `tutorial_testing_tools`
+- Tutorial labels for cross-references: `tutorial_hello_world`, `tutorial_variables`, `tutorial_operators`, `tutorial_control_flow`, `tutorial_functions`, `tutorial_arrays`, `tutorial_strings`, `tutorial_structs`, `tutorial_enumerations`, `tutorial_tables`, `tutorial_tuples_and_variants`, `tutorial_function_pointers`, `tutorial_blocks`, `tutorial_lambdas`, `tutorial_iterators_and_generators`, `tutorial_modules`, `tutorial_move_copy_clone`, `tutorial_classes`, `tutorial_generics`, `tutorial_lifetime`, `tutorial_error_handling`, `tutorial_unsafe`, `tutorial_string_format`, `tutorial_pattern_matching`, `tutorial_annotations`, `tutorial_contracts`, `tutorial_testing`, `tutorial_linq`, `tutorial_functional`, `tutorial_json`, `tutorial_regex`, `tutorial_operator_overloading`, `tutorial_pointers`, `tutorial_utility_patterns`, `tutorial_random`, `tutorial_dynamic_type_checking`, `tutorial_coroutines`, `tutorial_serialization`, `tutorial_testing_tools`, `tutorial_interfaces`, `tutorial_compile_and_run`
 - C++ integration tutorial labels: `tutorial_integration_cpp_hello_world`, `tutorial_integration_cpp_calling_functions`, `tutorial_integration_cpp_binding_functions`, `tutorial_integration_cpp_binding_types`, `tutorial_integration_cpp_binding_enums`, `tutorial_integration_cpp_interop`, `tutorial_integration_cpp_callbacks`, `tutorial_integration_cpp_methods`, `tutorial_integration_cpp_operators_and_properties`
 - C++ integration tutorial plan (remaining): 10 Custom Modules, 11 Context Variables, 12 Smart Pointers & GC, 13 AOT, 14 Serialization, 15 Custom Annotations, 16 Sandbox
-- Macro tutorial labels: `tutorial_macro_call_macro`, `tutorial_macro_when_expression`
+- Macro tutorial labels: `tutorial_macro_call_macro`, `tutorial_macro_when_expression`, `tutorial_macro_tag_function_macro`, `tutorial_macro_reader_macro`, `tutorial_macro_variant_macro`, `tutorial_macro_structure_macro`
