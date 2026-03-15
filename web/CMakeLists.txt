@@ -12,7 +12,7 @@ option(DAS_GLFW_DISABLED "Disable dasGLFW (GLFW window for graphics apps)" ON)
 option(DAS_AUDIO_DISABLED "Disable dasAudio (Miniaudio sound library)" ON)
 option(DAS_STDDLG_DISABLED "Disable dasStdDlg (File new,open,save etc dialogs)" ON)
 option(DAS_STBIMAGE_DISABLED "Disable dasStbImage (StbImage bindings, image loading and saving)" ON)
-option(DAS_STBTRUETYPE_DISABLED "Disable dasStbTrueType (StbTrueType bindings, ttf rasterization)" ON)
+
 option(DAS_PUGIXML_DISABLED "Disable dasPUGIXML (xml parsing library)" ON)
 option(DAS_SQLITE_DISABLED "Disable dasSQLITE (sqlite3 library)" ON)
 
@@ -373,7 +373,6 @@ SET(BUILTIN_SRC
 ../src/builtin/module_builtin_array.cpp
 ../src/builtin/module_builtin_das.cpp
 ../src/builtin/module_builtin_math.cpp
-../src/builtin/module_builtin_raster.cpp
 ../src/builtin/module_builtin_string.cpp
 ../src/builtin/module_builtin_rtti.h
 ../src/builtin/module_builtin_rtti.cpp
@@ -549,7 +548,6 @@ SET(SIMULATE_SRC
 ../include/daScript/simulate/aot_library.h
 ../include/daScript/simulate/aot_builtin.h
 ../include/daScript/simulate/aot_builtin_math.h
-../include/daScript/simulate/aot_builtin_raster.h
 ../include/daScript/simulate/aot_builtin_matrix.h
 ../include/daScript/simulate/aot_builtin_time.h
 ../include/daScript/simulate/aot_builtin_string.h

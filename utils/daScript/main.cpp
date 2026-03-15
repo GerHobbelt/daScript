@@ -7,6 +7,9 @@
 #include "../dasFormatter/fmt.h"
 #include "daScript/ast/ast_aot_cpp.h"
 #include "daScript/misc/crash_handler.h"
+#if defined(_WIN32) && defined(_DEBUG)
+#include <crtdbg.h>
+#endif
 
 using namespace das;
 
@@ -258,9 +261,6 @@ int das_aot_main ( int argc, char * argv[] ) {
     }
     if (!Module::require("math")) {
         NEED_MODULE(Module_Math);
-    }
-    if (!Module::require("raster")) {
-        NEED_MODULE(Module_Raster);
     }
     if (!Module::require("strings")) {
         NEED_MODULE(Module_Strings);
@@ -562,6 +562,16 @@ namespace das {
 }
 
 int MAIN_FUNC_NAME ( int argc, char * argv[] ) {
+#if defined(_WIN32) && defined(_DEBUG)
+    // Suppress all CRT assertion/error dialogs — print to stderr instead
+    _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+    _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
+    _CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_WARN, _CRTDBG_FILE_STDERR);
+    _set_error_mode(_OUT_TO_STDERR);
+#endif
     install_das_crash_handler();
     bool isArgAot = false;
     if (argc > 1) {
@@ -760,9 +770,6 @@ int MAIN_FUNC_NAME ( int argc, char * argv[] ) {
     }
     if (!Module::require("math")) {
         NEED_MODULE(Module_Math);
-    }
-    if (!Module::require("raster")) {
-        NEED_MODULE(Module_Raster);
     }
     if (!Module::require("strings")) {
         NEED_MODULE(Module_Strings);

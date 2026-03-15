@@ -106,6 +106,9 @@ FILE(GLOB AOT_DYNAMIC_CAST_RTTI_FILES RELATIVE ${PROJECT_SOURCE_DIR} "tests/dyna
 # AOT for fio test files
 FILE(GLOB AOT_FIO_FILES RELATIVE ${PROJECT_SOURCE_DIR} "tests/fio/*.das")
 
+# AOT for fs test files
+FILE(GLOB AOT_FS_FILES RELATIVE ${PROJECT_SOURCE_DIR} "tests/fs/*.das")
+
 # AOT for functional test files
 FILE(GLOB AOT_FUNCTIONAL_FILES RELATIVE ${PROJECT_SOURCE_DIR} "tests/functional/*.das")
 
@@ -180,6 +183,17 @@ FILE(GLOB AOT_URI_FILES RELATIVE ${PROJECT_SOURCE_DIR} "tests/uri/*.das")
 
 # AOT for lpipe test files
 FILE(GLOB AOT_LPIPE_FILES RELATIVE ${PROJECT_SOURCE_DIR} "tests/lpipe/*.das")
+
+# AOT for stbimage test files
+FILE(GLOB AOT_STBIMAGE_FILES RELATIVE ${PROJECT_SOURCE_DIR} "tests/stbimage/*.das")
+# Exclude gen_test_images (utility script, not a test)
+list(FILTER AOT_STBIMAGE_FILES EXCLUDE REGEX "gen_test_images")
+
+# StbImage test module files (libraries required by stbimage tests)
+SET(AOT_STBIMAGE_MODULE_FILES
+    modules/dasStbImage/stbimage/stbimage_boost.das
+    modules/dasStbImage/stbimage/stbimage_ttf.das
+)
 
 # AOT for language test files
 FILE(GLOB AOT_LANGUAGE_TEST_FILES RELATIVE ${PROJECT_SOURCE_DIR} "tests/language/*.das")
@@ -259,6 +273,10 @@ DAS_AOT("${AOT_DYNAMIC_CAST_RTTI_FILES}" DYNAMIC_CAST_RTTI_AOT_GENERATED_SRC tes
 add_custom_target(test_aot_fio)
 SET(FIO_AOT_GENERATED_SRC)
 DAS_AOT("${AOT_FIO_FILES}" FIO_AOT_GENERATED_SRC test_aot_fio daslang)
+
+add_custom_target(test_aot_fs)
+SET(FS_AOT_GENERATED_SRC)
+DAS_AOT("${AOT_FS_FILES}" FS_AOT_GENERATED_SRC test_aot_fs daslang)
 
 add_custom_target(test_aot_functional)
 SET(FUNCTIONAL_AOT_GENERATED_SRC)
@@ -352,6 +370,14 @@ add_custom_target(test_aot_language_modules)
 SET(LANGUAGE_MODULES_AOT_GENERATED_SRC)
 DAS_AOT_LIB("${AOT_LANGUAGE_MODULE_FILES}" LANGUAGE_MODULES_AOT_GENERATED_SRC test_aot_language_modules daslang)
 
+add_custom_target(test_aot_stbimage)
+SET(STBIMAGE_AOT_GENERATED_SRC)
+DAS_AOT("${AOT_STBIMAGE_FILES}" STBIMAGE_AOT_GENERATED_SRC test_aot_stbimage daslang)
+
+add_custom_target(test_aot_stbimage_modules)
+SET(STBIMAGE_MODULES_AOT_GENERATED_SRC)
+DAS_AOT_LIB("${AOT_STBIMAGE_MODULE_FILES}" STBIMAGE_MODULES_AOT_GENERATED_SRC test_aot_stbimage_modules daslang)
+
 add_custom_target(test_aot_tests)
 SET(TEST_AOT_GENERATED_SRC)
 DAS_AOT("${AOT_TEST_FILES}" TEST_AOT_GENERATED_SRC test_aot_tests daslang)
@@ -373,6 +399,7 @@ SOURCE_GROUP_FILES("aot generated" DEBUG_AGENT_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" DECS_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" DYNAMIC_CAST_RTTI_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" FIO_AOT_GENERATED_SRC)
+SOURCE_GROUP_FILES("aot generated" FS_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" FUNCTIONAL_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" HANDLE_TYPES_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" HASH_MAP_AOT_GENERATED_SRC)
@@ -398,6 +425,8 @@ SOURCE_GROUP_FILES("aot generated" LANGUAGE_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" LANGUAGE_MODULES_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" DASLIB_MODULES_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" DECS_MODULES_AOT_GENERATED_SRC)
+SOURCE_GROUP_FILES("aot generated" STBIMAGE_AOT_GENERATED_SRC)
+SOURCE_GROUP_FILES("aot generated" STBIMAGE_MODULES_AOT_GENERATED_SRC)
 
 # Build the test_aot executable using the same main.cpp as daslang
 add_executable(test_aot ${DAS_DASCRIPT_MAIN_SRC}
@@ -418,6 +447,7 @@ add_executable(test_aot ${DAS_DASCRIPT_MAIN_SRC}
     ${DECS_AOT_GENERATED_SRC}
     ${DYNAMIC_CAST_RTTI_AOT_GENERATED_SRC}
     ${FIO_AOT_GENERATED_SRC}
+    ${FS_AOT_GENERATED_SRC}
     ${FUNCTIONAL_AOT_GENERATED_SRC}
     ${HANDLE_TYPES_AOT_GENERATED_SRC}
     ${HASH_MAP_AOT_GENERATED_SRC}
@@ -443,6 +473,8 @@ add_executable(test_aot ${DAS_DASCRIPT_MAIN_SRC}
     ${LANGUAGE_MODULES_AOT_GENERATED_SRC}
     ${DASLIB_MODULES_AOT_GENERATED_SRC}
     ${DECS_MODULES_AOT_GENERATED_SRC}
+    ${STBIMAGE_AOT_GENERATED_SRC}
+    ${STBIMAGE_MODULES_AOT_GENERATED_SRC}
 )
 TARGET_LINK_LIBRARIES(test_aot libDaScriptAot ${SRC_LIBRARIES} ${DAS_MODULES_LIBS})
 ADD_DEPENDENCIES(test_aot libDaScriptAot
@@ -452,7 +484,7 @@ ADD_DEPENDENCIES(test_aot libDaScriptAot
     test_aot_bitfields test_aot_bool_array
     test_aot_data_walker test_aot_debug
     test_aot_debug_agent test_aot_decs test_aot_dynamic_cast_rtti
-    test_aot_fio test_aot_functional
+    test_aot_fio test_aot_fs test_aot_functional
     test_aot_handle_types test_aot_hash_map
     test_aot_interfaces
     test_aot_jobque test_aot_json
@@ -465,6 +497,7 @@ ADD_DEPENDENCIES(test_aot libDaScriptAot
     test_aot_lpipe
     test_aot_language test_aot_language_modules
     test_aot_daslib_modules test_aot_decs_modules
+    test_aot_stbimage test_aot_stbimage_modules
 )
 target_include_directories(test_aot PRIVATE ${NEED_MODULES_PATH} ${PROJECT_SOURCE_DIR}/modules/dasUnitTest)
 SETUP_CPP11(test_aot)

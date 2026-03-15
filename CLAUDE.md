@@ -31,6 +31,7 @@ See `doc/source/reference/design_philosophy.rst` for the full design philosophy 
 - **Run a script:** `bin/Release/daslang.exe path/to/script.das`
 - **Run tests:** `bin/Release/daslang.exe dastest/dastest.das -- --test path/to/test.das`
 - **AOT tests:** `cmake --build build --config Release --target test_aot` then `bin/Release/test_aot.exe dastest/dastest.das -- --test tests/aot`
+- **IMPORTANT:** When adding a new test directory under `tests/`, register it in `tests/aot/CMakeLists.txt` for AOT compilation. See `skills/aot_testing.md` for the step-by-step pattern. CI runs ALL tests with AOT enabled — unregistered test directories cause `error[50101]: AOT link failed`
 
 ### Build Timing
 
@@ -94,6 +95,7 @@ Task-specific instructions are split into skill files under `skills/`. You MUST 
 | `skills/dynamic_modules.md` | Creating or editing `.das_module` descriptors, adding new modules under `modules/` |
 | `skills/install_instructions.md` | Creating or updating AI instruction files (`install/CLAUDE.md`, `install/skills/`) for the installed SDK |
 | `skills/aot_testing.md` | Adding AOT test files, working with the `test_aot` binary, `Module::aotRequire()`, CMake AOT macros, **debugging AOT hash mismatches** |
+| `skills/visitor_gen_bind.md` | Adding or modifying `Visitor` virtual methods, `canVisit*` gates, running `gen_bind.das`, updating adapter bindings in `ast_gen.inc` |
 
 Multiple skill files may apply to a single task. For example, creating a new daslib module requires reading `skills/das_formatting.md`, `skills/daslib_modules.md`, and possibly `skills/documentation_rst.md`.
 

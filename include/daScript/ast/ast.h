@@ -259,7 +259,9 @@ namespace das
         FieldDeclarationRef findFieldRef ( const string & name ) const;
         int getSizeOf() const;
         uint64_t getSizeOf64() const;
+        uint64_t getSizeOf64(bool & failed) const;
         int getAlignOf() const;
+        int getAlignOfFailed(bool & failed) const;
         __forceinline bool canCopy() const { return canCopy(false); }
         bool canCopy(bool tempMatters) const;
         bool canCloneFromConst() const;
@@ -1493,6 +1495,7 @@ namespace das
         int32_t     always_report_candidates_threshold = 6; // always report candidates if there are less than this number
     // infer passes
         /*option*/ int32_t     max_infer_passes = 50;              // maximum number of infer passes
+        /*option*/ int32_t     max_call_depth = 50;                // maximum call expression nesting depth during inference
         bool verify_infer_types = false;                       // verify inferred types (to see if there is internal consistency). note - this adds errors to failing tests
     // memory
         /*option*/ uint32_t    stack = 16*1024;                    // 0 for unique stack
@@ -1575,7 +1578,7 @@ namespace das
         bool jit_dll_mode = true;                // Create if missing and reuse DLL or JIT compile
         bool jit_exe_mode = false;                // Create executable
         bool jit_emit_prologue = false;          // Emit prologue for all functions and blocks
-        string jit_output_path;                  // Folder to store compiled dll's. By default it'll be _das_root_/jitted_scripts
+        string jit_output_path;                  // Folder to store compiled dll's. By default it'll be _das_root_/.jitted_scripts
         int32_t jit_opt_level = 3u;              // Opt level for LLVM to codegen and IR optimizations
         int32_t jit_size_level = 3u;             // Opt level for LLVM for binary size
         string jit_path_to_shared_lib;           // Path to libDaScript. Optional, we'll try to find it in _das_root_/lib/ if not provided.

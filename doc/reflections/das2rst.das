@@ -86,7 +86,6 @@ require daslib/profiler_boost
 require daslib/quote
 require daslib/refactor
 require daslib/remove_call_args
-// require daslib/raster_boost                    // depends on external raster module
 // require daslib/spoof                           // depends on peg module
 require daslib/stringify
 require daslib/temp_strings
@@ -95,6 +94,8 @@ require daslib/typemacro_boost
 require daslib/validate_code
 require dashv/dashv_boost
 require pugixml/PUGIXML_boost
+require stbimage/stbimage_boost
+require stbimage/stbimage_ttf
 
 def document_module_math(root : string) {
     var mod = get_module("math")
@@ -165,9 +166,10 @@ def document_module_fio(root : string) {
     var mod = get_module("fio")
     var groups <- array<DocGroup>(
         hide_group(group_by_regex("Internal builtin functions", mod, %regex~builtin%%)),
-        group_by_regex("File manipulation", mod, %regex~(f|stat$|getchar|remove|rename)%%),
-        group_by_regex("Path manipulation", mod, %regex~(base_name|dir_name|get_full_file_name)$%%),
-        group_by_regex("Directory manipulation", mod, %regex~(dir|mkdir|mkdir_rec|rmdir|rmdir_rec|chdir|getcwd)$%%),
+        group_by_regex("File manipulation", mod, %regex~(f|stat$|getchar|remove|rename|copy_file|file_size|equivalent|is_symlink|set_mtime)%%),
+        group_by_regex("Path manipulation", mod, %regex~(base_name|dir_name|get_full_file_name|extension|stem|replace_extension|path_join|normalize|is_absolute|relative|parent)$%%),
+        group_by_regex("Directory manipulation", mod, %regex~(dir|dir_rec|mkdir|mkdir_rec|rmdir|rmdir_rec|chdir|getcwd)$%%),
+        group_by_regex("Filesystem queries", mod, %regex~(temp_directory|create_temp_file|create_temp_directory|disk_space)$%%),
         group_by_regex("OS specific routines", mod, %regex~(sleep|exit|popen|popen_binary|popen_timeout|popen_timed_out|get_env_variable|sanitize_command_line|has_env_variable)$%%),
         group_by_regex("Dynamic modules", mod, %regex~(register_dynamic_module|register_native_path)$%%)
     )
@@ -1132,17 +1134,97 @@ def document_module_validate_code(root : string) {
     document("Code validation annotations", mod, "validate_code.rst", groups)
 }
 
+def document_module_stbimage(root : string) {
+    var mod = get_module("stbimage")
+    var groups <- array<DocGroup>(
+        group_by_regex("Image loading", mod, %regex~(stbi_load|stbi_loadf|stbi_load_16|stbi_load_from_memory|stbi_loadf_from_memory|stbi_load_16_from_memory|stbi_load_gif_from_memory)$%%),
+        group_by_regex("Image info", mod, %regex~(stbi_info|stbi_info_from_memory|stbi_is_hdr|stbi_is_hdr_from_memory|stbi_is_16_bit|stbi_is_16_bit_from_memory)$%%),
+        group_by_regex("Memory management", mod, %regex~(stbi_image_free|stbi_failure_reason)$%%),
+        group_by_regex("Load settings", mod, %regex~(stbi_set_flip_vertically_on_load|stbi_set_unpremultiply_on_load|stbi_convert_iphone_png_to_rgb)$%%),
+        group_by_regex("HDR gamma and scale", mod, %regex~(stbi_hdr_to_ldr_gamma|stbi_hdr_to_ldr_scale|stbi_ldr_to_hdr_gamma|stbi_ldr_to_hdr_scale)$%%),
+        group_by_regex("File writing", mod, %regex~(stbi_write_png|stbi_write_bmp|stbi_write_tga|stbi_write_jpg|stbi_write_hdr)$%%),
+        group_by_regex("Write to memory", mod, %regex~(stbi_write_png_to_memory|stbi_write_bmp_to_memory|stbi_write_tga_to_memory|stbi_write_jpg_to_memory)$%%),
+        group_by_regex("Write settings", mod, %regex~(stbi_flip_vertically_on_write|stbi_write_set_.*|stbi_write_get_.*)$%%),
+        group_by_regex("Image resizing", mod, %regex~(stbir_resize|stbir_resize_uint8_srgb|stbir_resize_uint8_linear|stbir_resize_float_linear)$%%)
+    )
+    document("Image loading, writing, and resizing (stb_image)", mod, "stbimage.rst", groups)
+}
+
+def document_module_raster(root : string) {
+    var mod = get_module("raster")
+    var groups <- array<DocGroup>(
+        group_by_regex("Gather", mod, %regex~gather$%%),
+        group_by_regex("Scatter", mod, %regex~scatter$%%),
+        group_by_regex("Scatter with mask", mod, %regex~scatter_neq_mask$%%),
+        group_by_regex("Store with mask", mod, %regex~store_neq_mask$%%),
+        group_by_regex("Gather-scatter", mod, %regex~gather_scatter$%%),
+        group_by_regex("Gather-scatter with mask", mod, %regex~gather_scatter_neq_mask$%%),
+        group_by_regex("Gather-store with mask", mod, %regex~gather_store_neq_mask$%%),
+        group_by_regex("Gather-store with stride", mod, %regex~gather_store_stride$%%),
+        group_by_regex("Byte gather-store", mod, %regex~u8x4_gather_store$%%),
+        group_by_regex("Copy reversed", mod, %regex~rast_copy_reversed_.*$%%),
+        group_by_regex("Copy rect", mod, %regex~rast_copy_rect_.*$%%),
+        group_by_regex("Channel conversion", mod, %regex~rast_convert_channels_.*$%%),
+        group_by_regex("BPC conversion", mod, %regex~rast_convert_.*_to_.*$%%),
+        group_by_regex("Span raster", mod, %regex~rast_hspan.*$%%),
+        group_by_regex("Fill rect", mod, %regex~rast_fill_rect_.*$%%),
+        group_by_regex("Alpha blit", mod, %regex~rast_blit_alpha$%%)
+    )
+    document("Raster operations (pixel copy, convert, SIMD gather/scatter)", mod, "raster.rst", groups)
+}
+
+def document_module_stbimage_boost(root : string) {
+    var mod = find_module("stbimage_boost")
+    var groups <- array<DocGroup>(
+        group_by_regex("Image construction", mod, %regex~(make_image)$%%),
+        group_by_regex("Image loading", mod, %regex~(load_image|image_info|is_hdr|is_16_bit|is_hdr_from_memory|is_16_bit_from_memory)$%%),
+        group_by_regex("Pixel access", mod, %regex~(with_pixels|with_pixels_f|with_pixels_16|with_row|with_row_f|with_row_16)$%%),
+        group_by_regex("Drawing", mod, %regex~.*(fill_rect|blit_alpha|blit)$%%),
+        group_by_regex("Format conversion", mod, %regex~.*(to_channels|to_bpc)$%%),
+        group_by_regex("Transforms", mod, %regex~.*(resize|flip_vertical|flip_horizontal|crop)$%%),
+        group_by_regex("Save and encode", mod, %regex~.*(save|encode)$%%),
+        group_by_regex("Image properties", mod, %regex~.*(valid|stride|has_alpha|pixel_size|is_hdr|data_size)$%%),
+        group_by_regex("Image loading (methods)", mod, %regex~.*(load|load_hdr|load_16|load_from_memory|load_hdr_from_memory|load_16_from_memory)$%%)
+    )
+    document("High-level image API (stbimage_boost)", mod, "stbimage_boost.rst", groups)
+}
+
+def document_module_stbtruetype(root : string) {
+    var mod = get_module("stbtruetype")
+    var groups <- array<DocGroup>(
+        group_by_regex("Font loading", mod, %regex~.*(GetNumberOfFonts|GetFontOffsetForIndex|InitFont)$%%),
+        group_by_regex("Font packing", mod, %regex~.*(PackBegin|PackEnd|PackFontRange|PackSetOversampling|PackSetSkipMissingCodepoints|GetPackedQuad)$%%),
+        group_by_regex("Font metrics", mod, %regex~.*(ScaleForPixelHeight|ScaleForMappingEmToPixels|GetFontVMetrics|GetFontBoundingBox)$%%),
+        group_by_regex("Codepoint metrics", mod, %regex~.*(GetCodepointHMetrics|GetCodepointKernAdvance|GetCodepointBox|FindGlyphIndex)$%%),
+        group_by_regex("Codepoint bitmaps", mod, %regex~.*(GetCodepointBitmap|GetCodepointBitmapSubpixel|MakeCodepointBitmap|MakeCodepointBitmapSubpixel|GetCodepointBitmapBox|GetCodepointBitmapBoxSubpixel|FreeBitmap)$%%)
+    )
+    document("TrueType font loading and rasterization (stb_truetype)", mod, "stbtruetype.rst", groups)
+}
+
+def document_module_stbimage_ttf(root : string) {
+    var mod = find_module("stbimage_ttf")
+    var groups <- array<DocGroup>(
+        group_by_regex("Font loading", mod, %regex~(load_ttf)$%%),
+        group_by_regex("Font metrics", mod, %regex~(font_metrics)$%%),
+        group_by_regex("Text rendering", mod, %regex~(render_text)$%%)
+    )
+    document("High-level TrueType font API (stbimage_ttf)", mod, "stbimage_ttf.rst", groups)
+}
+
 [export]
 def main {
     disable_profiler(this_context())
     disable_profiler_log(this_context())
-    let root = get_das_root() + "/doc/source/stdlib"// todo: modify to output /temp so that we can merge changes
+    let root = get_das_root() + "/doc/source/stdlib/generated"
     // document embedded modules
     document_module_builtin(root)
     document_module_math(root)
     document_module_fio(root)
     document_module_network(root)
     document_module_dashv(root)
+    document_module_stbimage(root)
+    document_module_raster(root)
+    document_module_stbtruetype(root)
     document_module_uriparser(root)
     document_module_pugixml(root)
     document_module_debugapi(root)
@@ -1225,6 +1307,8 @@ def main {
     document_module_soa(root)
     document_module_sort_boost(root)
     document_module_static_let(root)
+    document_module_stbimage_boost(root)
+    document_module_stbimage_ttf(root)
     document_module_stringify(root)
     document_module_strings_boost(root)
     document_module_temp_strings(root)

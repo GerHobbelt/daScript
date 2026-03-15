@@ -412,12 +412,49 @@ namespace das {
         return size;
     }
 
+    uint64_t Structure::getSizeOf64(bool & failed) const {
+        if ( circularGuard ) return 1;
+        circularGuard = true;
+        uint64_t size = 0;
+        const Structure * cppLayoutParent = nullptr;
+        for ( const auto & fd : fields ) {
+            int fieldAlignemnt = fd.type->getAlignOfFailed(failed);
+            int al = fieldAlignemnt - 1;
+            if ( cppLayout ) {
+                auto fp = findFieldParent(fd.name);
+                if ( fp!=cppLayoutParent ) {
+                    if (DAS_NON_POD_PADDING || !cppLayoutNotPod) {
+                        size = cppLayoutParent ? cppLayoutParent->getSizeOf64(failed) : 0;
+                    }
+                    cppLayoutParent = fp;
+                }
+            }
+            size = (size + al) & ~al;
+            size += fd.type->getSizeOf64(failed);
+        }
+        circularGuard = false;
+        int al = getAlignOfFailed(failed) - 1;
+        size = (size + al) & ~al;
+        return size;
+    }
+
     int Structure::getAlignOf() const {
         if ( circularGuard ) return 1;
         circularGuard = true;
         int align = 1;
         for ( const auto & fd : fields ) {
             align = das::max ( fd.type->getAlignOf(), align );
+        }
+        circularGuard = false;
+        return align;
+    }
+
+    int Structure::getAlignOfFailed(bool & failed) const {
+        if ( circularGuard ) return 1;
+        circularGuard = true;
+        int align = 1;
+        for ( const auto & fd : fields ) {
+            align = das::max ( fd.type->getAlignOfFailed(failed), align );
         }
         circularGuard = false;
         return align;
@@ -2535,15 +2572,19 @@ namespace das {
     // ExprLooksLikeCall
 
     ExpressionPtr ExprLooksLikeCall::visit(Visitor & vis) {
-        vis.preVisit(this);
-        for ( auto & arg : arguments ) {
-            if ( vis.canVisitLooksLikeCallArg(this, arg.get(), arg==arguments.back()) ) {
-                vis.preVisitLooksLikeCallArg(this, arg.get(), arg==arguments.back());
-                arg = arg->visit(vis);
-                arg = vis.visitLooksLikeCallArg(this, arg.get(), arg==arguments.back());
+        if ( vis.canVisitLooksLikeCall(this) ) {
+            vis.preVisit(this);
+            for ( auto & arg : arguments ) {
+                if ( vis.canVisitLooksLikeCallArg(this, arg.get(), arg==arguments.back()) ) {
+                    vis.preVisitLooksLikeCallArg(this, arg.get(), arg==arguments.back());
+                    arg = arg->visit(vis);
+                    arg = vis.visitLooksLikeCallArg(this, arg.get(), arg==arguments.back());
+                }
             }
+            return vis.visit(this);
+        } else {
+            return this;
         }
-        return vis.visit(this);
     }
 
     ExpressionPtr ExprLooksLikeCall::clone( const ExpressionPtr & expr ) const {
@@ -2609,23 +2650,27 @@ namespace das {
     // named call
 
     ExpressionPtr ExprNamedCall::visit(Visitor & vis) {
-        vis.preVisit(this);
+        if ( vis.canVisitNamedCall(this) ) {
+            vis.preVisit(this);
 
-        if (nonNamedArguments.size() > 0) {
-            ExprCall dummy;
-            for (auto& arg : nonNamedArguments) {
-                vis.preVisitCallArg(&dummy, arg.get(), arg == nonNamedArguments.back());
-                arg = arg->visit(vis);
-                arg = vis.visitCallArg(&dummy, arg.get(), arg == nonNamedArguments.back());
+            if (nonNamedArguments.size() > 0) {
+                ExprCall dummy;
+                for (auto& arg : nonNamedArguments) {
+                    vis.preVisitCallArg(&dummy, arg.get(), arg == nonNamedArguments.back());
+                    arg = arg->visit(vis);
+                    arg = vis.visitCallArg(&dummy, arg.get(), arg == nonNamedArguments.back());
+                }
+                this->argumentsFailedToInfer = dummy.argumentsFailedToInfer;
             }
-            this->argumentsFailedToInfer = dummy.argumentsFailedToInfer;
+            for (auto& arg : arguments) {
+                vis.preVisitNamedCallArg(this, arg.get(), arg == arguments.back());
+                arg->value = arg->value->visit(vis);
+                arg = vis.visitNamedCallArg(this, arg.get(), arg==arguments.back());
+            }
+            return vis.visit(this);
+        } else {
+            return this;
         }
-        for (auto& arg : arguments) {
-            vis.preVisitNamedCallArg(this, arg.get(), arg == arguments.back());
-            arg->value = arg->value->visit(vis);
-            arg = vis.visitNamedCallArg(this, arg.get(), arg==arguments.back());
-        }
-        return vis.visit(this);
     }
 
     ExpressionPtr ExprNamedCall::clone( const ExpressionPtr & expr ) const {
