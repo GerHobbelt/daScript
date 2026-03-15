@@ -92,6 +92,7 @@ require daslib/type_traits
 require daslib/typemacro_boost
 require daslib/validate_code
 require dashv/dashv_boost
+require pugixml/PUGIXML_boost
 
 def document_module_math(root : string) {
     var mod = get_module("math")
@@ -145,13 +146,11 @@ get_value|insert_clone|emplace_new|insert_default|emplace_default|get_with_defau
         group_by_regex("Platform queries", mod, %regex~(get_context_share_counter|das_is_dll_build|get_platform_name|get_architecture_name)$%%),
         group_by_regex("String formatting", mod, %regex~(fmt)$%%),
         group_by_regex("Argument consumption", mod, %regex~(consume_argument)$%%),
-        group_by_regex("Lock checking", mod, %regex~(lock_count|set_verify_array_locks|set_verify_table_locks)$%%),
-        group_by_regex("Lock checking internals", mod, %regex~(_move_with_lockcheck|_return_with_lockcheck|_at_with_lockcheck)$%%),
+        group_by_regex("Lock checking", mod, %regex~(lock_count)$%%),
         group_by_regex("Bit operations", mod, %regex~(popcnt|clz|ctz|mul128|__bit_set)$%%),
         group_by_regex("Intervals", mod, %regex~(interval)$%%),
         group_by_regex("RTTI", mod, %regex~(class_rtti_size)$%%),
         hide_group(group_by_regex("Jit", mod,%regex~(invoke_code|.*jit.*)$%%)),
-        group_by_regex("Lock verification", mod, %regex~(set_verify_context_locks)$%%),
         group_by_regex("Initialization and finalization", mod, %regex~(using|clone|finalize)$%%),
         group_by_regex("Algorithms", mod, %regex~(swap|iter_range|count|ucount)$%%),
         group_by_regex("Memset", mod, %regex~(memset.*)$%%),
@@ -652,6 +651,49 @@ def document_module_uriparser_boost(root : string) {
     document("Boost package for the URI parser", mod, "uriparser_boost.rst", groups)
 }
 
+def document_module_pugixml(root : string) {
+    // NOTE: regex_match is start-anchored, so patterns must begin with .* to match
+    // property names like .`ok, .`first_child (dot-backtick prefix).
+    var mod = get_module("pugixml")
+    var groups <- array<DocGroup>(
+        group_by_regex("Document operations", mod, %regex~.*(document_element|document_as_node|load_document|load_string|save_file|save_string|reset)$%%),
+        group_by_regex("Node lookup", mod, %regex~.*(child|find_child_by_attribute|first_element_by_path)$%%),
+        group_by_regex("Node navigation", mod, %regex~.*(first_child|last_child|next_sibling|previous_sibling|parent|root|path|print_to_string)$%%),
+        group_by_regex("Node mutation", mod, %regex~.*(set_name|set_value|append_child|prepend_child|insert_child_after|insert_child_before|remove_child|remove_children)$%%),
+        group_by_regex("Attribute access", mod, %regex~.*(attribute|first_attribute|last_attribute|next_attribute|previous_attribute|append_attribute|prepend_attribute|insert_attribute_after|insert_attribute_before|remove_attribute|remove_attributes)$%%),
+        group_by_regex("Copy and move", mod, %regex~.*(append_copy|prepend_copy|append_move|prepend_move)$%%),
+        group_by_regex("Value reading", mod, %regex~.*(as_string|as_int|as_uint|as_float|as_double|as_bool|as_int64|as_uint64|text|data|child_value)$%%),
+        group_by_regex("Value writing", mod, %regex~.*^set$%%),
+        group_by_regex("XPath compilation and evaluation", mod, %regex~.*(xpath_compile|evaluate_boolean|evaluate_number|evaluate_string|evaluate_node_set|evaluate_node|return_type|result_description|result_offset)$%%),
+        group_by_regex("XPath selection", mod, %regex~.*(select_node|select_nodes|node)$%%),
+        group_by_regex("XPath node set operations", mod, %regex~.*(at|sort|size|empty|first)$%%),
+        group_by_regex("Construction and RAII", mod, %regex~.*(xml_document|xpath_node_set|xpath_variable_set|using)$%%),
+        group_by_regex("Handle validity and comparison", mod, %regex~.*(ok|hash_value|offset_debug|==|!=)$%%)
+    )
+    document("XML parser (pugixml)", mod, "pugixml.rst", groups)
+}
+
+def document_module_PUGIXML_boost(root : string) {
+    // NOTE: regex_match is start-anchored. Backtick operator names like `is`int
+    // need regex_compile (reader macro %regex~ can't embed literal backticks).
+    var mod = find_module("PUGIXML_boost")
+    var r_type_conv : Regex
+    regex_compile(r_type_conv, ".*(`is`|`as`|\\[\\])")
+    var groups <- array<DocGroup>(
+        group_by_regex("Block-based iteration", mod, %regex~.*(for_each_child|for_each_attribute|for_each)$%%),
+        group_by_regex("Iterator-based iteration", mod, %regex~.*(each|each_child|each_attribute)$%%),
+        group_by_regex("RAII document handling", mod, %regex~.*(open_xml|parse_xml|with_doc)$%%),
+        group_by_regex("Quick accessors", mod, %regex~.*(node_text|node_attr|node_attr_int|node_attr_float|node_attr_bool)$%%),
+        group_by_regex("Builder helpers", mod, %regex~.*(add_child|add_child_ex|add_attr)$%%),
+        group_by_regex("Builder EDSL", mod, %regex~.*(tag|attr)$%%),
+        group_by_regex("String conversion", mod, %regex~.*(to_string)$%%),
+        group_by_regex("XPath helpers", mod, %regex~.*(with_xpath|select_text|select_value|for_each_select)$%%),
+        group_by_regex("Serialization", mod, %regex~.*(to_XML|from_XML|XML|XML_table)$%%),
+        group_by_regex("Type conversion operators", mod, r_type_conv)
+    )
+    document("High-level XML helpers (pugixml boost)", mod, "PUGIXML_boost.rst", groups)
+}
+
 def document_module_sort_boost(root : string) {
     var mod = find_module("sort_boost")
     var groups <- array<DocGroup>(
@@ -1080,6 +1122,7 @@ def main {
     document_module_network(root)
     document_module_dashv(root)
     document_module_uriparser(root)
+    document_module_pugixml(root)
     document_module_debugapi(root)
     document_module_rtti(root)
     document_module_ast(root)
@@ -1146,6 +1189,7 @@ def main {
     document_module_math_boost(root)
     document_module_profiler(root)
     document_module_profiler_boost(root)
+    document_module_PUGIXML_boost(root)
     document_module_quote(root)
     document_module_random(root)
     document_module_refactor(root)

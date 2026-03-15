@@ -213,6 +213,7 @@ namespace das
     }
 
     void TypeDecl::applyAutoContracts ( const TypeDeclPtr & TT, const TypeDeclPtr & autoT ) {
+        if ( !TT || !autoT ) return;
         if ( !autoT->isAuto() ) return;
         TT->ref = (TT->ref || autoT->ref) && !autoT->removeRef && !TT->removeRef;
         TT->constant = (TT->constant || autoT->constant) && !autoT->removeConstant && !TT->removeConstant;
@@ -238,7 +239,7 @@ namespace das
             if ( TT->firstType ) {
                 applyAutoContracts(TT->firstType, autoT->firstType);
             }
-            for ( size_t i=0, is=autoT->argTypes.size(); i!=is; ++i ) {
+            for ( size_t i=0, is=min(TT->argTypes.size(),autoT->argTypes.size()); i!=is; ++i ) {
                 applyAutoContracts(TT->argTypes[i], autoT->argTypes[i]);
             }
         }
@@ -1424,43 +1425,6 @@ namespace das
         } else if ( baseType==Type::tArray || baseType==Type::tTable ) {
             if ( firstType && firstType->hasClasses(dep) ) return true;
             if ( secondType && secondType->hasClasses(dep) ) return true;
-        }
-        return false;
-    }
-
-    bool TypeDecl::lockCheck() const {
-        das_set<Structure *> dep;
-        return lockCheck(dep);
-    }
-
-    bool TypeDecl::lockCheck(das_set<Structure *> & dep) const {
-        // logic is 'OR'
-        if ( baseType==Type::tStructure ) {
-            if ( structType ) {
-                if (dep.find(structType) != dep.end()) return false;
-                if ( structType->skipLockCheck ) return false;
-                dep.insert(structType);
-                for ( auto fld : structType->fields ) {
-                    bool checkLocks = true;
-                    for ( auto & ann : fld.annotation ) {
-                        if ( ann.name=="skip_field_lock_check" ) {
-                            checkLocks = false;
-                            break;
-                        }
-                    }
-                    if ( checkLocks && fld.type->lockCheck(dep) ) {
-                        return true;
-                    }
-                }
-            }
-        } else if ( baseType==Type::tTuple || baseType==Type::tVariant || baseType == Type::option ) {
-            for ( const auto & arg : argTypes ) {
-                if ( arg->lockCheck(dep) ) {
-                    return true;
-                }
-            }
-        } else if ( baseType==Type::tArray || baseType==Type::tTable ) {
-            return true;
         }
         return false;
     }

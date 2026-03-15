@@ -1131,8 +1131,6 @@ namespace das
         tabMnLookup = ctx.tabMnLookup;
         tabGMnLookup = ctx.tabGMnLookup;
         tabAdLookup = ctx.tabAdLookup;
-        // lockcheck
-        skipLockChecks = ctx.skipLockChecks;
     }
 
     void Context::freeGlobalsAndShared() {
@@ -1150,6 +1148,7 @@ namespace das
         freeGlobalsAndShared();
         globals = globalsSize ? (char *) das_aligned_alloc16(globalsSize) : nullptr;
         shared = (sharedOwner && sharedSize) ? (char *) das_aligned_alloc16(sharedSize) : nullptr;
+        if ( shared ) memset(shared, 0, sharedSize);
         globalsOwner = true;
         sharedOwner = true;
     }
@@ -1224,8 +1223,6 @@ namespace das
         tabMnLookup = ctx.tabMnLookup;
         tabGMnLookup = ctx.tabGMnLookup;
         tabAdLookup = ctx.tabAdLookup;
-        // lockcheck
-        skipLockChecks = ctx.skipLockChecks;
         // threadlock_context
         if ( ctx.contextMutex ) contextMutex = new recursive_mutex;
         // register
@@ -1408,6 +1405,7 @@ namespace das
         };
         abiArg = args;
         abiCMRES = nullptr;
+        if (globals) memset(globals, 0, globalsSize);
         if ( aotInitScript ) {
             aotInitScript->eval(*this);
         } else {
@@ -1434,8 +1432,6 @@ namespace das
                         pp->info = nullptr;
 #endif
                     }
-                } else {
-                    memset ( globals + pv.offset, 0, pv.size );
                 }
             }
         }

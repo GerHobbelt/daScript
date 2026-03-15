@@ -101,7 +101,9 @@ addExtern<DAS_BIND_FUN(cpp_function)>(*this, lib, "das_name",
         ->args({"param1", "param2"});
 ```
 
-`SideEffects` flags: `none` (pure), `modifyExternal` (stdout/files), `modifyArgument` (mutates ref params), `accessGlobal` (reads shared state), `invoke` (calls daslang), `worstDefault` (safe fallback).
+`SideEffects` flags: `none` (pure), `modifyExternal` (stdout/files), `modifyArgument` (mutates ref params), `modifyArgumentAndExternal` (mutates ref params AND has external side effects), `accessGlobal` (reads shared state), `invoke` (calls daslang), `worstDefault` (safe fallback).
+
+**`modifyArgument` vs `modifyArgumentAndExternal`**: Use `modifyArgumentAndExternal` when a function mutates state reachable *through* an argument but the argument itself is a temporary (returned by value from a property). With plain `modifyArgument` the optimizer sees the temporary is unused after the call and may **eliminate the call entirely**. Classic example: `node.text` returns `xml_text` by value — calling `set(node.text, value)` with `modifyArgument` gets optimized away; `modifyArgumentAndExternal` prevents this.
 
 ## Binding C++ types — `MAKE_TYPE_FACTORY` + `ManagedStructureAnnotation`
 
@@ -263,6 +265,24 @@ addInterop<new_and_init, void *, vec4f>(*this, lib, "new_and_init",
 - Compilation errors: `include/daScript/ast/compilation_errors.h` (error codes 10001–40214)
 - Lexer: `src/parser/ds2_lexer.lpp`
 - Parser: `src/parser/ds2_parser.ypp`
+
+## Module::aotRequire() — AOT Header Declarations
+
+When a C++ module binds functions whose declarations live in specific headers, it must override `aotRequire()` so AOT-generated C++ can find those declarations:
+
+```cpp
+virtual ModuleAotType aotRequire(TextWriter & tw) const override {
+    tw << "#include \"daScript/simulate/bin_serializer.h\"\n";
+    tw << "#include \"daScript/misc/performance_time.h\"\n";
+    return ModuleAotType::cpp;
+}
+```
+
+**If you add `extern "C"` or `extern` functions via `addExtern` and the declaration lives in a header, you MUST add that header to `aotRequire()`**. Otherwise, AOT-generated C++ will fail to compile with "undeclared identifier" errors.
+
+Real example: `Module_BuiltIn::addTime()` binds `ref_time_ticks`, `get_time_usec`, `get_time_nsec` (declared in `performance_time.h`). The `aotRequire()` must emit `#include "daScript/misc/performance_time.h"` or AOT compilation of any script using these functions will fail.
+
+See `skills/aot_testing.md` for the full AOT pipeline and testing infrastructure.
 
 ### Key AST function flags
 

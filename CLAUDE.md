@@ -30,6 +30,7 @@ See `doc/source/reference/design_philosophy.rst` for the full design philosophy 
 - **Compiler binary:** `bin/Release/daslang.exe`
 - **Run a script:** `bin/Release/daslang.exe path/to/script.das`
 - **Run tests:** `bin/Release/daslang.exe dastest/dastest.das -- --test path/to/test.das`
+- **AOT tests:** `cmake --build build --config Release --target test_aot` then `bin/Release/test_aot.exe dastest/dastest.das -- --test tests/aot`
 
 ### Debugging
 
@@ -61,8 +62,11 @@ Task-specific instructions are split into skill files under `skills/`. You MUST 
 | `skills/writing_benchmarks.md` | Writing or running benchmark files under `benchmarks/` |
 | `skills/dynamic_modules.md` | Creating or editing `.das_module` descriptors, adding new modules under `modules/` |
 | `skills/install_instructions.md` | Creating or updating AI instruction files (`install/CLAUDE.md`, `install/skills/`) for the installed SDK |
+| `skills/aot_testing.md` | Adding AOT test files, working with the `test_aot` binary, `Module::aotRequire()`, CMake AOT macros |
 
 Multiple skill files may apply to a single task. For example, creating a new daslib module requires reading `skills/das_formatting.md`, `skills/daslib_modules.md`, and possibly `skills/documentation_rst.md`.
+
+**Formatter reminder:** Always use `utils/dasCodeFormatter/main.das` for formatting `.das` files. Do NOT use `utils/dasFormatter/` (that is the v1→v2 syntax converter, not a code formatter).
 
 ### Updating Instructions with New Knowledge
 
@@ -102,6 +106,8 @@ All code MUST use gen2 syntax (add `options gen2` at the top of every file). Key
 - No `bool(int)` cast — use `x != 0`; no `string(bool)` — use `"{flag}"`
 - `int("123")` does NOT work — use `to_int` from `require strings`
 - Hex literals are `uint` by default — use `int(0x3F)` for int
+- **Bitfield sizes**: `bitfield Name : uint8 { ... }`, `: uint16`, `: uint64`; default is `uint` (32-bit). Always unsigned.
+- **Bitfield from expression**: `bitfield64(1ul << 13ul)` — use the constructor to create a bitfield value from an integer expression. Similarly `bitfield8()`, `bitfield16()`.
 
 ### Memory and move semantics
 
@@ -129,6 +135,12 @@ All code MUST use gen2 syntax (add `options gen2` at the top of every file). Key
 - **Move-assign table literal:** `tab <- { "k" => v }` works for both `var tab <- { ... }` declarations and `tab <- { ... }` reassignment to existing variables
 - **Table comprehension move-assign:** `tab <- { for(x in range(5)); x => x*x }` — same move-assign rules apply
 
+### Iterators and `each`
+
+- `[unsafe_outside_of_for] def each(x) : iterator<T>` makes a type iterable in `for` loops
+- When the iterator is named `each`, the call can be omitted: `for (v in each(x))` is identical to `for (v in x)`
+- Other iterator names (e.g. `filter`, `map`) cannot be omitted
+
 ### Common gotchas
 
 - Lambda params can shadow function params — use distinct names
@@ -150,6 +162,7 @@ All code MUST use gen2 syntax (add `options gen2` at the top of every file). Key
 - `daslib/` — Standard library modules (86 .das files)
 - `dastest/` — Test framework
 - `tests/` — Test suite. See `tests/README.md` for full index
+- `tests/aot/` — AOT compilation tests (built into `test_aot` binary)
 - `doc/source/reference/language/` — RST language documentation
 - `tutorials/language/` — Language tutorial `.das` files
 - `tutorials/integration/cpp/` — C++ integration tutorials
