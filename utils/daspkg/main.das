@@ -8,6 +8,8 @@ options no_global_variables = false
 require fio
 require strings
 
+require daslib/ansi_colors
+
 require lockfile
 require utils
 require index
@@ -24,16 +26,20 @@ def print_usage() {
     print("  update [name]                      Re-install at pinned version\n")
     print("  upgrade [name]                     Upgrade to latest version\n")
     print("  list                               List installed packages\n")
-    print("  search <query>                     Search the package index\n")
+    print("  search [query]                     Search the package index\n")
     print("  introduce [url]                    Add a package to the index via PR\n")
     print("  withdraw <name>                    Remove a package from the index via PR\n")
+    print("  update-index                       Refresh all index metadata from repos\n")
     print("  build                              Build C/C++ packages\n")
     print("  check                              Verify installed packages\n")
     print("  doctor                             Check environment (git, cmake, gh)\n")
     print("\nOptions:\n")
     print("  --root <path>   Project root (default: current directory)\n")
     print("  --force         Force reinstall\n")
+    print("  --color         Enable colored output\n")
+    print("  --no-color      Disable colored output\n")
     print("  --verbose, -v   Print detailed progress\n")
+    print("  --json          Machine-readable JSON output (list, check, search)\n")
 }
 
 [export]
@@ -51,7 +57,7 @@ def main() {
     let command = parsed.command
 
     if (command == "list") {
-        cmd_list(root)
+        cmd_list(root, parsed.json)
     } elif (command == "install") {
         if (empty(parsed.command_arg)) {
             cmd_install_all(root, parsed.force)
@@ -79,15 +85,17 @@ def main() {
     } elif (command == "build") {
         cmd_build(root)
     } elif (command == "check") {
-        cmd_check(root)
+        cmd_check(root, parsed.json)
     } elif (command == "doctor") {
         cmd_doctor()
     } elif (command == "search") {
         if (empty(parsed.command_arg)) {
-            print("Error: search requires a query\n")
+            cmd_search_all(root, parsed.json)
         } else {
-            cmd_search(root, parsed.command_arg)
+            cmd_search(root, parsed.command_arg, parsed.json)
         }
+    } elif (command == "update-index") {
+        cmd_update_index(root)
     } elif (command == "introduce") {
         cmd_introduce(root, parsed.command_arg)
     } elif (command == "withdraw") {

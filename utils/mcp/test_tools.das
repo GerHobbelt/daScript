@@ -1078,3 +1078,78 @@ def test_aot_missing_file(t : T?) {
         t |> success(is_error, "should be error")
     }
 }
+
+// ── JSON output mode tests ──────────────────────────────────────────
+
+[test]
+def test_compile_check_json(t : T?) {
+    t |> run("json mode returns CompileResult array") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        let ok = parse_result(do_compile_check(fixture_path("_fixture_valid.das"), "", true), text, is_error)
+        t |> success(ok, "parse result JSON")
+        t |> success(!is_error, "should not be error")
+        t |> success(find(text, "\"success\":true") >= 0, "should contain success:true")
+        t |> success(find(text, "\"file\":") >= 0, "should contain file field")
+    }
+    t |> run("json mode reports errors") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        parse_result(do_compile_check(fixture_path("_fixture_error.das"), "", true), text, is_error)
+        t |> success(find(text, "\"success\":false") >= 0, "should contain success:false")
+        t |> success(find(text, "\"errors\":") >= 0, "should contain errors field")
+    }
+    t |> run("json batch returns array") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        let batch = fixture_path("_fixture_valid.das") + "," + fixture_path("_fixture_error.das")
+        parse_result(do_compile_check(batch, "", true), text, is_error)
+        // Should be a JSON array with 2 elements
+        let arr_start = "[" + "\{"
+        t |> success(find(text, arr_start) >= 0, "should start with array")
+        t |> success(find(text, "\"success\":true") >= 0, "should have a passing result")
+        t |> success(find(text, "\"success\":false") >= 0, "should have a failing result")
+    }
+}
+
+[test]
+def test_run_test_json(t : T?) {
+    t |> run("json mode returns TestSummary") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        let ok = parse_result(do_run_test(fixture_path("_fixture_test.das"), "", "", true), text, is_error)
+        t |> success(ok, "parse result JSON")
+        t |> success(!is_error, "should not be error")
+        t |> success(find(text, "\"success\":true") >= 0, "should contain success:true")
+        t |> success(find(text, "\"total\":") >= 0, "should contain total field")
+        t |> success(find(text, "\"tests\":") >= 0, "should contain tests array")
+    }
+}
+
+[test]
+def test_list_modules_json(t : T?) {
+    t |> run("json mode returns ModuleList") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        let ok = parse_result(do_list_modules(true), text, is_error)
+        t |> success(ok, "parse result JSON")
+        t |> success(!is_error, "should not be error")
+        t |> success(find(text, "\"builtin\":") >= 0, "should contain builtin field")
+        t |> success(find(text, "\"daslib\":") >= 0, "should contain daslib field")
+        t |> success(find(text, "\"math\"") >= 0, "should contain math module")
+    }
+}
+
+[test]
+def test_list_requires_json(t : T?) {
+    t |> run("json mode returns RequiresResult") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        let ok = parse_result(do_list_requires(fixture_path("_fixture_valid.das"), "", true), text, is_error)
+        t |> success(ok, "parse result JSON")
+        t |> success(!is_error, "should not be error")
+        t |> success(find(text, "\"direct\":") >= 0, "should contain direct field")
+        t |> success(find(text, "\"transitive\":") >= 0, "should contain transitive field")
+    }
+}
+

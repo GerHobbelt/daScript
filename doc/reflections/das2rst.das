@@ -19,6 +19,7 @@ require daslib/regex
 require daslib/regex_boost
 require daslib/apply
 require daslib/algorithm
+require daslib/ansi_colors
 require daslib/jobque_boost
 require daslib/apply_in_context
 require daslib/contracts
@@ -167,7 +168,7 @@ def document_module_fio(root : string) {
         group_by_regex("File manipulation", mod, %regex~(f|stat$|getchar|remove|rename)%%),
         group_by_regex("Path manipulation", mod, %regex~(base_name|dir_name|get_full_file_name)$%%),
         group_by_regex("Directory manipulation", mod, %regex~(dir|mkdir|mkdir_rec|rmdir|rmdir_rec|chdir|getcwd)$%%),
-        group_by_regex("OS specific routines", mod, %regex~(sleep|exit|popen|popen_binary|get_env_variable|sanitize_command_line|has_env_variable)$%%),
+        group_by_regex("OS specific routines", mod, %regex~(sleep|exit|popen|popen_binary|popen_timeout|popen_timed_out|get_env_variable|sanitize_command_line|has_env_variable)$%%),
         group_by_regex("Dynamic modules", mod, %regex~(register_dynamic_module|register_native_path)$%%)
     )
     document("File input output library", mod, "fio.rst", groups)
@@ -461,6 +462,16 @@ def document_module_apply_in_context(root : string) {
     var groups <- array<DocGroup>(
     )
     document("Cross-context evaluation helpers", mod, "apply_in_context.rst", groups)
+}
+
+def document_module_ansi_colors(root : string) {
+    var mod = find_module("ansi_colors")
+    var groups <- array<DocGroup>(
+        group_by_regex("Configuration", mod, %regex~.*(init_ansi_colors|use_tty_colors)$%%),
+        group_by_regex("Colors", mod, %regex~.*(red_str|green_str|yellow_str|blue_str|magenta_str|cyan_str)$%%),
+        group_by_regex("Styles", mod, %regex~.*(bold_str|dim_str|underline_str|reset_str)$%%)
+    )
+    document("ANSI terminal color and style helpers", mod, "ansi_colors.rst", groups)
 }
 
 def document_module_algorithm(root : string) {
@@ -1141,6 +1152,7 @@ def main {
     document_module_jobque(root)
     // document daslib modules
     document_module_algorithm(root)
+    document_module_ansi_colors(root)
     document_module_apply_in_context(root)
     document_module_apply(root)
     document_module_archive(root)

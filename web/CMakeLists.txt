@@ -9,7 +9,6 @@ option(DAS_CLANG_BIND_DISABLED "Disable dasClangBind (libclang bindings, C/C++ p
 option(DAS_LLVM_DISABLED "Disable dasLLVM (llvm bindings)" ON)
 option(DAS_HV_DISABLED "Disable dasHV (websokets,http server and client)" ON)
 option(DAS_GLFW_DISABLED "Disable dasGLFW (GLFW window for graphics apps)" ON)
-option(DAS_IMGUI_DISABLED "Disable dasIMGUI (IMGUI, IMNODES, IMGUI-NODE-EDITOR gui libraries)" ON)
 option(DAS_MINFFT_DISABLED "Disable dasMinfft (Minimal FFT library)" ON)
 option(DAS_AUDIO_DISABLED "Disable dasAudio (Miniaudio sound library)" ON)
 option(DAS_STDDLG_DISABLED "Disable dasStdDlg (File new,open,save etc dialogs)" ON)
@@ -498,6 +497,7 @@ SET(SIMULATE_SRC
 ../src/hal/debug_break.cpp
 ../src/hal/project_specific.cpp
 ../src/hal/project_specific_file_info.cpp
+../src/hal/project_specific_crash_handler.cpp
 ../include/daScript/misc/crash_handler.h
 ../include/daScript/misc/network.h
 ../src/misc/network.cpp

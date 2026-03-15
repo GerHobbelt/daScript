@@ -23,6 +23,7 @@ _aot_generated/
 modules/dasSFML/libsfml/
 site/
 doc/sphinx-build/
+doc/source/stdlib/detail/
 doc/source/__pycache__/
 doc/source/_build/doctrees/environment.pickle
 doc/source/_build/
@@ -51,6 +52,10 @@ utils/mcp/mcp_server.log
 
 # Emscripten SDK (local install)
 emsdk/
+
+# daspkg artifacts
+daspkg.lock
+examples/*/modules/
 
 # Claude Code (local settings)
 .claude/settings.json

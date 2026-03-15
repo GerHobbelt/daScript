@@ -17,6 +17,11 @@ require log
 require testing
 require suite_result public
 
+var test_results : array<SuiteTestResult>
+
+def clear_test_results() {
+    delete test_results
+}
 
 struct SuiteCtx {
     // Shared options.
@@ -26,6 +31,7 @@ struct SuiteCtx {
     verbose : bool = false
     compile_only : bool = false
     use_aot : bool = false
+    cov_path : string = ""
 
     // Testing-related options.
     testNames : array<string>
@@ -91,6 +97,7 @@ def SuiteCtx(args : array<string>) : SuiteCtx {
     ctx.projectPath = args |> get_str_arg("--test-project", "")
     ctx.compile_only = args |> has_value("--compile-only")
     ctx.use_aot = args |> has_value("--use-aot") || is_in_aot()
+    ctx.cov_path = args |> get_str_arg("--cov-path", "")
     collect_tests_names(args, ctx.testNames)
 
     ctx.bench_enabled = args |> has_value("--bench")
@@ -165,7 +172,14 @@ def test_file(file_name : string; var ctx : SuiteCtx; var file_ctx : FileCtx) : 
             cop.fail_on_no_aot = ctx.use_aot
             cop.threadlock_context = true
             cop.jit_enabled = jit_enabled()
-            cop.jit_module := "{get_das_root()}/daslib/just_in_time.das"
+            if (jit_enabled()) {
+                access |> add_extra_module("just_in_time", "{get_das_root()}/daslib/just_in_time.das")
+            }
+            if (!ctx.cov_path |> empty()) {
+                cop.export_all = true
+                cop.rtti = true
+                access |> add_extra_module("coverage", "{get_das_root()}/daslib/coverage.das")
+            }
             compile_file(file_name, access, unsafe(addr(mg)), cop) $(ok, program, output) {
                 var expectedErrors : table<CompilationError; int>
                 if (program != null) {
@@ -240,6 +254,21 @@ def test_file(file_name : string; var ctx : SuiteCtx; var file_ctx : FileCtx) : 
                     var mod = program |> get_this_module()
                     if (mod != null && context != null) {
                         let module_result = test_module(*mod, *context, ctx, file_ctx)
+                        if (module_result.total > 0 && !ctx.cov_path |> empty()) {
+                            var report = ""
+                            unsafe(invoke_in_context(*context, "fill_coverage_report", unsafe(addr(report)), ""))
+                            // Clone to current context.
+                            report := report
+                            fopen(ctx.cov_path, "ab") <| $(fw) {
+                                if (fw != null) {
+                                    to_log(LOG_INFO, "Coverage to {ctx.cov_path}\n")
+                                    fwrite(fw, report)
+                                } else {
+                                    to_log(LOG_ERROR, "Couldn't create output file {ctx.cov_path}\n")
+                                }
+                            }
+
+                        }
                         if (module_result.failed + module_result.errors == 0) {
                             unsafe {
                                 file_ctx.context = addr(*context)
@@ -390,7 +419,9 @@ def private sub_test_any_lambda(name : string; func : lambda; args_num : int; va
 
 
 def private test_any(name : string; func; args_num : int; var context : FileCtx; var res : SuiteResult&) {
-    log::info("{context.indenting}=== RUN '{name}'")
+    if (!log::failuresOnly) {
+        log::info("{context.indenting}=== RUN '{name}'")
+    }
     let beforeFailed = res.failed
     let beforeErrors = res.errors
     res.total += 1
@@ -488,6 +519,13 @@ def private test_any(name : string; func; args_num : int; var context : FileCtx;
     } else {
         log::green("{context.indenting}--- PASS '{name}' {time_dt_hr(dt)}")
     }
+
+    test_results |> emplace(SuiteTestResult(
+        name = clone_string(name),
+        passed = !failed && !skipped,
+        skipped = skipped,
+        time_usec = dt
+    ))
 }
 
 def private run_queued_benchmarks(var suite_ctx : SuiteCtx; var file_ctx : FileCtx, var res : SuiteResult&) {

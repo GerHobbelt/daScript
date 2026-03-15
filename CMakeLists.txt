@@ -14,7 +14,6 @@ option(DAS_CLANG_BIND_DISABLED "Disable dasClangBind (libclang bindings, C/C++ p
 option(DAS_LLVM_DISABLED "Disable dasLLVM (llvm bindings)" ON)
 option(DAS_HV_DISABLED "Disable dasHV (websokets,http server and client)" ON)
 option(DAS_GLFW_DISABLED "Disable dasGLFW (GLFW window for graphics apps)" OFF)
-option(DAS_IMGUI_DISABLED "Disable dasIMGUI (IMGUI, IMNODES, IMGUI-NODE-EDITOR gui libraries)" ON)
 option(DAS_MINFFT_DISABLED "Disable dasMinfft (Minimal FFT library)" ON)
 option(DAS_AUDIO_DISABLED "Disable dasAudio (Miniaudio sound library)" ON)
 option(DAS_STDDLG_DISABLED "Disable dasStdDlg (File new,open,save etc dialogs)" OFF)
@@ -99,8 +98,6 @@ MACRO(DAS_AOT_EXT input_files genList mainTarget dasAotTool dasAotToolArg)
     set(all_outputs "")
     set(command_args "")
     list(LENGTH input_files num_files)
-
-    message(STATUS "DAS_AOT_EXT called on ${mainTarget} with files number: ${num_files}")
 
     foreach(input ${input_files})
         get_filename_component(input_src ${input} ABSOLUTE)
@@ -729,6 +726,7 @@ include/daScript/misc/performance_time.h
 src/hal/debug_break.cpp
 src/hal/project_specific.cpp
 src/hal/project_specific_file_info.cpp
+src/hal/project_specific_crash_handler.cpp
 include/daScript/misc/crash_handler.h
 include/daScript/misc/network.h
 src/misc/network.cpp
@@ -958,6 +956,7 @@ SET(DAS_DASCRIPT_MAIN_SRC
 # Tests
 if (NOT ${DAS_TESTS_DISABLED})
     include(examples/pathTracer/CMakeLists.txt)
+    include(examples/crash/CMakeLists.txt)
     if(NOT ${DAS_AOT_EXAMPLES_DISABLED} AND NOT WIN32)
         include(tests/aot/CMakeLists.txt)
     endif()
@@ -1026,6 +1025,10 @@ if (NOT ${DAS_TOOLS_DISABLED})
         ${PROJECT_SOURCE_DIR}/dastest/LICENSE
         ${PROJECT_SOURCE_DIR}/dastest/README.md
         DESTINATION ${DAS_INSTALL_DASTESTDIR}
+    )
+    install(DIRECTORY ${PROJECT_SOURCE_DIR}/dastest/tests/
+        DESTINATION ${DAS_INSTALL_DASTESTDIR}/tests
+        FILES_MATCHING PATTERN "*.das"
     )
 
     add_executable(das-fmt ${PROJECT_SOURCE_DIR}/utils/dasFormatter/main.cpp)
@@ -1307,6 +1310,11 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/mcp/tests/
     FILES_MATCHING PATTERN "*.das"
 )
 
+# Install benchctl (benchmark analysis)
+file(GLOB DAS_BENCHCTL_FILES ${PROJECT_SOURCE_DIR}/utils/benchctl/*.das)
+install(FILES ${DAS_BENCHCTL_FILES} DESTINATION utils/benchctl)
+install(FILES ${PROJECT_SOURCE_DIR}/utils/benchctl/README.md DESTINATION utils/benchctl)
+
 # Install daspkg (package manager)
 file(GLOB DAS_DASPKG_FILES ${PROJECT_SOURCE_DIR}/utils/daspkg/*.das)
 install(FILES ${DAS_DASPKG_FILES} DESTINATION utils/daspkg)
@@ -1340,9 +1348,21 @@ install(FILES ${DAS_DEBUGAPI_EXAMPLES}
 
 file(GLOB DAS_GRAPHICS_EXAMPLES
     ${PROJECT_SOURCE_DIR}/examples/graphics/*.das
+    ${PROJECT_SOURCE_DIR}/examples/graphics/.das_package
+    ${PROJECT_SOURCE_DIR}/examples/graphics/README.md
 )
 install(FILES ${DAS_GRAPHICS_EXAMPLES}
     DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/graphics
+)
+
+# Install node-editor example
+file(GLOB DAS_NODE_EDITOR_EXAMPLES
+    ${PROJECT_SOURCE_DIR}/examples/node-editor/*.das
+    ${PROJECT_SOURCE_DIR}/examples/node-editor/.das_package
+    ${PROJECT_SOURCE_DIR}/examples/node-editor/README.md
+)
+install(FILES ${DAS_NODE_EDITOR_EXAMPLES}
+    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/node-editor
 )
 
 file(GLOB DAS_UNCATEGORIZED_EXAMPLES
@@ -1350,6 +1370,27 @@ file(GLOB DAS_UNCATEGORIZED_EXAMPLES
 )
 install(FILES ${DAS_UNCATEGORIZED_EXAMPLES}
     DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/uncategorized
+)
+
+# Install telegram example
+install(FILES
+    ${PROJECT_SOURCE_DIR}/examples/telegram/.das_package
+    ${PROJECT_SOURCE_DIR}/examples/telegram/README.md
+    ${PROJECT_SOURCE_DIR}/examples/telegram/echo_bot.das
+    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/telegram
+)
+
+# Install claude example
+install(FILES
+    ${PROJECT_SOURCE_DIR}/examples/claude/.das_package
+    ${PROJECT_SOURCE_DIR}/examples/claude/.gitignore
+    ${PROJECT_SOURCE_DIR}/examples/claude/daslang_helper_bot.das
+    ${PROJECT_SOURCE_DIR}/examples/claude/sandbox.das_project
+    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/claude
+)
+install(FILES
+    ${PROJECT_SOURCE_DIR}/examples/claude/examples/daslang_helper/system_prompt.md
+    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/claude/examples/daslang_helper
 )
 
 file(GLOB DAS_HV_EXAMPLES
@@ -1493,6 +1534,20 @@ if(NOT ${DAS_TREE_SITTER_DISABLED})
     else()
         target_compile_options(tree_sitter_daslang PRIVATE -Wall -Wextra -Wno-unused-parameter)
     endif()
+    # Copy platform-specific sgconfig.yml to project root for ast-grep
+    if(WIN32)
+        set(SGCONFIG_TEMPLATE "${PROJECT_SOURCE_DIR}/sgconfig.yml.windows")
+    elseif(APPLE)
+        set(SGCONFIG_TEMPLATE "${PROJECT_SOURCE_DIR}/sgconfig.yml.osx")
+    else()
+        set(SGCONFIG_TEMPLATE "${PROJECT_SOURCE_DIR}/sgconfig.yml.linux")
+    endif()
+    add_custom_command(TARGET tree_sitter_daslang POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${SGCONFIG_TEMPLATE}"
+            "${PROJECT_SOURCE_DIR}/sgconfig.yml"
+        COMMENT "Copying sgconfig.yml for ast-grep (from ${SGCONFIG_TEMPLATE})"
+    )
     install(TARGETS tree_sitter_daslang
         RUNTIME DESTINATION ${DAS_INSTALL_BINDIR}
         LIBRARY DESTINATION ${DAS_INSTALL_LIBDIR}
@@ -1512,13 +1567,8 @@ if(NOT ${DAS_TREE_SITTER_DISABLED})
         tree-sitter-daslang/queries/highlights.scm
         DESTINATION tree-sitter-daslang/queries
     )
-    # ast-grep config templates (used by grep_usage and outline MCP tools)
-    install(FILES
-        ${PROJECT_SOURCE_DIR}/sgconfig.yml.windows
-        ${PROJECT_SOURCE_DIR}/sgconfig.yml.linux
-        ${PROJECT_SOURCE_DIR}/sgconfig.yml.osx
-        DESTINATION ${DAS_INSTALL_DOCDIR}
-    )
+    # Install platform-specific sgconfig.yml for ast-grep (used by grep_usage and outline MCP tools)
+    install(FILES "${SGCONFIG_TEMPLATE}" DESTINATION . RENAME sgconfig.yml)
     install(FILES
         tree-sitter-daslang/outline_rules.yml
         DESTINATION tree-sitter-daslang
