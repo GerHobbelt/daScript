@@ -72,6 +72,12 @@ introduced in earlier tutorials.
    tutorials/42_testing_tools.rst
    tutorials/43_interfaces.rst
    tutorials/44_compile_and_run.rst
+   tutorials/45_debug_agents.rst
+   tutorials/46_apply_in_context.rst
+   tutorials/47_data_walker.rst
+   tutorials/48_apply.rst
+   tutorials/49_async.rst
+   tutorials/50_soa.rst
 
 .. _tutorials_integration_c:
 
@@ -94,6 +100,7 @@ companion ``.das`` script in ``tutorials/integration/c/``.
    tutorials/integration_c_07_context_variables.rst
    tutorials/integration_c_08_serialization.rst
    tutorials/integration_c_09_aot.rst
+   tutorials/integration_c_10_threading.rst
 
 .. _tutorials_integration_cpp:
 
@@ -127,6 +134,7 @@ and a companion ``.das`` script in ``tutorials/integration/cpp/``.
    tutorials/integration_cpp_18_dynamic_scripts.rst
    tutorials/integration_cpp_19_class_adapters.rst
    tutorials/integration_cpp_20_standalone_contexts.rst
+   tutorials/integration_cpp_21_threading.rst
 
 .. _tutorials_macros:
 
