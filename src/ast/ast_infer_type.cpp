@@ -73,6 +73,14 @@ namespace das {
     }
     TypeDeclPtr InferTypes::visitAlias(TypeDecl *td, const string &) {
         if (td->isAlias()) {
+            vector<string> visited;
+            visited.push_back(saveAliasName);
+            if ( isLoop(visited, td) ) {
+                fatalAliasLoop = true;
+                error("alias loop detected: '" + describeType(td) + "'", "", "",
+                      td->at, CompilationError::invalid_type);
+                return td;
+            }
             if (auto ta = inferAlias(td)) {
                 if (ta->isAutoOrAlias()) {
                     error("internal compiler error: can't be inferred: '" + describeType(td) + "'", "", "",
@@ -190,6 +198,7 @@ namespace das {
         return Visitor::visit(enu);
     }
     bool InferTypes::canVisitStructure(Structure *st) {
+        if ( fatalAliasLoop ) return false;
         return !st->isTemplate; // we don't do a thing with templates
     }
     void InferTypes::preVisit(Structure *that) {
@@ -474,8 +483,8 @@ namespace das {
         if (var->type->isVoid())
             error("global variable can't be declared void", "", "",
                   var->at, CompilationError::invalid_variable_type);
-        if (var->type->isHandle() && !var->type->annotation->isLocal())
-            error("can't have a global variable of handled type " + var->type->annotation->name, "", "",
+        if (!var->type->isLocal())
+            error("can't have a global variable of type " + describeType(var->type), "", "",
                   var->at, CompilationError::invalid_variable_type);
         if (!var->type->constant && var->global_shared)
             error("shared global variable must be constant", "", "",
@@ -507,6 +516,7 @@ namespace das {
         return Visitor::visitGlobalLet(var);
     }
     bool InferTypes::canVisitFunction(Function *fun) {
+        if ( fatalAliasLoop ) return false;
         if (fun->stub)
             return false;
         if (verbose || debugInferFlag) { // it can be fully inferred, and fail concept assert
@@ -564,7 +574,12 @@ namespace das {
             }
         }
     }
+    void InferTypes::preVisitArgumentInit(Function *f, const VariablePtr &arg, Expression *that) {
+        Visitor::preVisitArgumentInit(f, arg, that);
+        inArgumentInit = true;
+    }
     ExpressionPtr InferTypes::visitArgumentInit(Function *f, const VariablePtr &arg, Expression *that) {
+        inArgumentInit = false;
         if (arg->type->isAuto() && arg->init->type) {
             auto varT = TypeDecl::inferGenericType(arg->type, arg->init->type, false, false, nullptr);
             if (!varT) {
@@ -725,13 +740,15 @@ namespace das {
         int64_t iou = getConstExprIntOrUInt(cfa.first);
         switch (expr->enumType->baseType) {
         case Type::tInt8:
-        case Type::tUInt8: {
+        case Type::tUInt8:
+        case Type::tBitfield8: {
             int8_t tv = int8_t(iou);
             memcpy(&envalue, &tv, sizeof(int8_t));
             break;
         }
         case Type::tInt16:
-        case Type::tUInt16: {
+        case Type::tUInt16:
+        case Type::tBitfield16: {
             int16_t tv = int16_t(iou);
             memcpy(&envalue, &tv, sizeof(int16_t));
             break;
@@ -744,7 +761,8 @@ namespace das {
             break;
         }
         case Type::tInt64:
-        case Type::tUInt64: {
+        case Type::tUInt64:
+        case Type::tBitfield64:{
             memcpy(&envalue, &iou, sizeof(int64_t));
             break;
         }
@@ -3195,6 +3213,20 @@ namespace das {
                 reportAstChanged();
             }
             if (block->returnType) {
+                if (block->returnType->isAlias()) {
+                    if (auto aT = inferAlias(block->returnType)) {
+                        block->returnType = aT;
+                        block->returnType->sanitize();
+                        if (!block->returnType->ref && block->returnType->isWorkhorseType() && !block->returnType->isPointer()) {
+                            block->returnType->constant = true;
+                        }
+                        reportAstChanged();
+                    } else {
+                        error("undefined block result type '" + describeType(block->returnType) + "'",
+                            reportInferAliasErrors(block->returnType), "", block->at, CompilationError::type_not_found);
+                        return Visitor::visit(block);
+                    }
+                }
                 setBlockCopyMoveFlags(block);
                 verifyType(block->returnType);
             }
@@ -3949,11 +3981,11 @@ namespace das {
             }
             if (block->returnType && block->returnType->ref && !safeExpression(expr)) {
                 error("returning reference requires unsafe", "", "",
-                      func->result->at, CompilationError::invalid_return_type);
+                      expr->at, CompilationError::invalid_return_type);
             }
             if (block->returnType && block->returnType->isTemp() && !safeExpression(expr)) {
                 error("returning temporary value from block requires unsafe", "", "",
-                      func->result->at, CompilationError::invalid_return_type);
+                      expr->at, CompilationError::invalid_return_type);
             }
             if (strictSmartPointers && block->returnType && !expr->moveSemantics && !safeExpression(expr) && block->returnType->needInScope()) {
                 error("returning smart pointers without move semantics is unsafe", "use return <- instead", "",
@@ -4652,6 +4684,11 @@ namespace das {
             }
             if (expr->inScope) {
                 if (!var->inScope) {
+                    if ( inFinally.back() ) {
+                        error("in-scope variable " + var->name + " can't be declared in the finally block", "", "",
+                              var->at, CompilationError::invalid_variable_type);
+                        return Visitor::visitLet(expr, var, last);
+                    }
                     if (var->type->canDelete()) {
                         if (var->type->constant) {
                             error("variable " + var->name + " of type " + describeType(var->type) + " can't be in-scope const",
@@ -4939,6 +4976,10 @@ namespace das {
                 return demoteCall(expr, generics.back());
             } else {
                 if (expr->methodCall) {
+                    if ( expr->nonNamedArguments.empty() ) {
+                        reportMissing(expr, nonNamedTypes, "no matching functions or generics: ", true);
+                        return Visitor::visit(expr);
+                    }
                     auto tp = expr->nonNamedArguments[0]->type.get();
                     auto vSelf = expr->nonNamedArguments[0];
                     if (tp->isPointer() && tp->firstType) {

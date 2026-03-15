@@ -465,13 +465,11 @@ SET(PARSER_GENERATED_SRC
 # 1st parser
 src/parser/ds_parser.hpp
 src/parser/ds_parser.cpp
-src/parser/ds_parser.output
 src/parser/ds_lexer.cpp
 src/parser/lex.yy.h
 # 2nd parser
 src/parser/ds2_parser.hpp
 src/parser/ds2_parser.cpp
-src/parser/ds2_parser.output
 src/parser/ds2_lexer.cpp
 src/parser/lex2.yy.h
 )
@@ -692,6 +690,8 @@ include/daScript/misc/performance_time.h
 src/hal/debug_break.cpp
 src/hal/project_specific.cpp
 src/hal/project_specific_file_info.cpp
+src/hal/crash_handler.cpp
+include/daScript/misc/crash_handler.h
 include/daScript/misc/network.h
 src/misc/network.cpp
 src/simulate/hash.cpp
@@ -852,6 +852,9 @@ MACRO(SETUP_LIBDASCRIPT library shared_lib)
     IF(HAIKU)
         TARGET_LINK_LIBRARIES(${library} network uuid)
     ENDIF()
+    IF(WIN32)
+        target_link_libraries(${library} dbghelp)
+    ENDIF()
     SETUP_CPP11(${library})
     #target_precompile_headers(${library} PUBLIC include/daScript/misc/platform.h)
 
@@ -909,17 +912,9 @@ SET(DAS_DASCRIPT_MAIN_SRC
     CACHE INTERNAL "DAS_DASCRIPT_MAIN_SRC"
 )
 
-# Test module
-
-
 # Tests
 if (NOT ${DAS_TESTS_DISABLED})
-    include(examples/test/CMakeLists.txt)
     include(examples/pathTracer/CMakeLists.txt)
-
-    FOREACH(_example ${DAS_ALL_EXAMPLES})
-        TARGET_LINK_LIBRARIES(${_example} libDaScriptTest)
-    ENDFOREACH()
 endif()
 
 # Profile module

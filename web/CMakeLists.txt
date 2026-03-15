@@ -253,13 +253,11 @@ SET(PARSER_GENERATED_SRC
 # parser 1
 ../src/parser/ds_parser.hpp
 ../src/parser/ds_parser.cpp
-../src/parser/ds_parser.output
 ../src/parser/ds_lexer.cpp
 ../src/parser/lex.yy.h
 # parser 2
 ../src/parser/ds2_parser.hpp
 ../src/parser/ds2_parser.cpp
-../src/parser/ds2_parser.output
 ../src/parser/ds2_lexer.cpp
 ../src/parser/lex2.yy.h
 )
@@ -481,6 +479,8 @@ SET(SIMULATE_SRC
 ../src/hal/debug_break.cpp
 ../src/hal/project_specific.cpp
 ../src/hal/project_specific_file_info.cpp
+../src/hal/crash_handler.cpp
+../include/daScript/misc/crash_handler.h
 ../include/daScript/misc/network.h
 ../src/misc/network.cpp
 ../src/simulate/hash.cpp

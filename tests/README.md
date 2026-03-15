@@ -26,6 +26,12 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 |---|---|---|
 | test_archive.das | mem_archive_save/load for variants, tables, arrays, structs | |
 
+## assert_once/
+
+| File | Description | Expects errors |
+|---|---|---|
+| test_assert_once.das | `assert_once` fires only on first iteration (loop + try/recover) | |
+
 ## async/
 
 | File | Description | Expects errors |
@@ -251,14 +257,26 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | _module_b.das | *(helper)* Module for module_vis_fail — requires _module_a | |
 | _operators_derived.das | *(helper)* Derived class BarOp | |
 | _operators_parent.das | *(helper)* Parent class FooOp with property operator | |
+| access_private_from_lambda.das | Class private field access from lambda + operator delete | |
+| add_property_ext_const.das | `isReadOnly` property on `TestObjectFoo` — const vs non-const dispatch | |
 | aka.das | `aka` variable aliasing in various contexts | |
 | aliasing.das | Aliasing behavior with `no_aliasing = false` | |
+| array.das | Dynamic array ops — make, verify, pass, erase, push, sort, move, multi-push, const | |
+| array_comprehension.das | Array/iterator comprehension — square, filtered with `where` | |
 | ascend_ctor.das | `new` with class constructors and fields | |
 | assume.das | `assume` for deep field access | |
 | auto_infer.das | Auto type inference failures — missing overloads, wrong types | **expect** `31101` `31102:8` `30304:2` `30105:1` `30102:2` `30106` `30113` `31300` |
 | auto_infer_success.das | Successful auto type inference — generics, dim, static_if, variants | |
+| auto_ref_and_move_ret.das | Auto ref alias and move return of array | |
+| bin_serializer.das | `binary_save`/`binary_load` — struct with bool, int, float, array, fixed_array fields | |
 | bitfields.das | Bitfield operations — 32-bit and 64-bit, operators, `typeinfo` | |
 | block.das | Block creation and invocation | |
+| block_invoke.das | Block invocation — twice, nested chaining, value capture, ref passing | |
+| block_access_function_arg.das | Nested block accessing outer lambda variable via helper | |
+| block_args_nested.das | Deeply nested blocks — int, ref, ptr, struct passthrough | |
+| block_variable.das | Local block variables — void/result × no-arg/with-arg × value/cmres | |
+| block_vs_local_block.das | Pipe `<\|` block vs local block variable invoke | |
+| bool_condition.das | Boolean condition in `if` — false skips body | |
 | cant_access_private_members.das | Private member access violations | **expect** `30503:3` `30301:1` |
 | cant_dereference_mix.das | Invalid dereference operations | **expect** `30501:5` |
 | cant_derive_from_sealed_class.das | Sealed class derivation error | **expect** `30115` |
@@ -267,8 +285,16 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | cant_index.das | Invalid index operations | **expect** `30502:2` |
 | cant_override_sealed.das | Sealed method override errors | **expect** `30115:2` |
 | cant_write_to_constant_value.das | Const value write violations | **expect** `30504:3` |
-| capture_string.das | String capture in lambdas and string builder (gen2=false, module) | |
+| capture_as_ref.das | Class lambda capturing `self` as ref | |
+| capture_string.das | String capture in lambdas and string builder (module) | |
 | cast.das | `cast<>` struct inheritance, `reinterpret<>` memory reinterpretation | |
+| check_eid.das | `CheckEid`/`CheckEid2` on `TestObjectFoo` with custom `unit_test` option | |
+| clone.das | Clone complex nested structs, arrays, tables — deep copy verification | |
+| clone_temp.das | Clone of temporary struct returned from function | |
+| clone_to_move.das | Clone-assign `:=` for arrays — global and local | |
+| copy_and_move_on_return.das | Copy on return + move on return + block return | |
+| ctor.das | Struct default initializer and custom constructor | |
+| chain_invoke_method.das | Chained `new Obj()->method1()->method2()` invocation | |
 | comment_eof.das | Unterminated comment at end of file | **expect** `10007` |
 | condition_must_be_bool.das | Non-bool condition in if/while | **expect** `30601:2` `30303` `30506` |
 | const_and_block_folding.das | Constant folding side-effect errors | **expect** `40209:2` |
@@ -277,28 +303,53 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | containers_failed.das | Container compile-time failures | **expect** `30304:4` |
 | contracts.das | `daslib/contracts` — expect_dim, expect_any_tuple, expect_any_variant | |
 | coroutines.das | Typed coroutines — count_up, count_down, yield, co_continue | |
+| cpp_layout.das | `[cpp_layout]` struct annotation — sizeof, offsetof, pod=false | |
+| das_string.das | `das_string` type — assign, peek, string conversion, interpolation | |
+| defer.das | Defer execution order, defer_delete, short pipe syntax | |
 | default_method_arguments.das | Default argument values in abstract/override methods | |
+| deref_ptr_fun.das | `deref(getPtr())` — function pointer dereference | |
+| dim.das | Fixed-size 2D arrays — indexing, pointer arithmetic, string representation | |
+| div_by_zero.das | Division/modulo by zero — int, uint, int64, uint64 via try/recover | |
+| dummy.das | `SomeDummyType` — sizeof, alignof with `@safe_when_uninitialized` | |
 | duplicate_keys.das | Duplicate table keys at compile time | **expect** `40300:4` |
 | dynamic_array.das | Dynamic array — push, resize, reserve, capacity, erase, move | |
 | dynamic_type_checking.das | dynamic_cast, is_instance_of with class hierarchies | |
+| each_std_vector.das | `testFooArray()` iteration over std::vector — length, capacity, find_index_if | |
+| enum.das | Enum ops — int16 base, negative values, typeinfo, enum_trait, C++ bindings | |
 | enumerations.das | Enum conversion — to/from string, enum_trait | |
+| erase_if.das | `erase_if` on dynamic arrays — remove negative values, stress patterns | |
 | failed_aka.das | Global aka and typedef aka produce errors | **expect** `20000:1` |
 | failed_aliasing.das | Aliasing errors with `no_aliasing` option | **expect** `40211:23` `40212:3` |
 | failed_block.das | Block variable initialization failures | **expect** `30108` `30113` |
 | failed_capture_self.das | Capturing `self` in lambda fails | **expect** `30508` `30124` |
 | failed_constants.das | Out-of-range numeric literal errors | **expect** `10006:12` `10010:4` |
 | finally.das | `finally` blocks — exceptions, loops, nested, return | |
+| for_const_array.das | For-loop over `fixed_array` constant | |
+| for_continue.das | `continue` in while, for, and complex nested loops | |
 | for_loop.das | For-loop mechanics — range, collections, nested, iterators | |
+| for_single_element.das | For-loop over single-element dim array | |
+| fully_qualified_generic_name.das | Fully qualified `UnitTest::start_effect` generic call | |
+| func_addr.das | Function pointer via `@@` — invoke, comparison, null check | |
+| if_not_null.das | `if_not_null` macro — null skips, non-null invokes block | |
+| ignore_deref.das | Pointer deref from array — by value and explicit type | |
+| infer_alias_and_alias_ctor.das | Auto alias inference — generic join, findObject | |
+| infer_alias_argument.das | Auto alias argument inference — fold | |
+| infer_remove_ref_const.das | Auto ref/const removal inference | |
+| inscope_return_inscope.das | Early return with `finally` delete of inscope pointers | |
 | function_already_declared.das | Duplicate function declaration | **expect** `30201` |
 | function_argument_already_declared.das | Duplicate function argument name | **expect** `30202` |
 | function_not_found_ambiguous.das | Ambiguous function call — same name in two modules | **expect** `30304` |
 | generators.das | Generator mechanics — yield, ranges, nested, early return | |
 | global_init_type_mismatch.das | Global variable type mismatch on init | **expect** `30113` |
+| global_order.das | Global variable initialization ordering with clone | |
+| global_ptr_init.das | Global pointer struct initialization | |
 | global_variable_already_declared.das | Duplicate global variable declaration | **expect** `30204` |
 | global_variable_order.das | Global variable initialization ordering | **expect** `30305:1` |
 | global_variable_order_itself.das | Global variable self-initialization error | **expect** `30305:1` |
+| handle.das | Handled types — TestObjectFoo/Bar pointer ops, FancyClass, checkRange | |
 | hash.das | Hash function for various types | |
 | init_order.das | `[init]` function ordering with before/tag | |
+| int_types.das | Integer literal types, char literal, small integer operators | |
 | intrinsics.das | clz, ctz, popcnt for u32/u64 with fuzzing | |
 | invoke_cmres.das | CMRES invoke — functions, hybrid, pointers, blocks, lambdas | |
 | invalid_argument_count_mix.das | Wrong argument count in function calls | **expect** `30107:4` |
@@ -313,59 +364,110 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | invalid_table_type_mix.das | Invalid table key/value types | **expect** `30106:2` `30108` |
 | invalid_type_ref_in_table_value.das | Ref type as table value | **expect** `30106` |
 | invalid_types.das | Oversized types and arguments | **expect** `30101:2` `30108:4` `30109:2` |
+| jit_abi.das | JIT ABI correctness — `test_abi_mad` for float2/3/4, function pointers | |
 | labels.das | Labels and goto — control flow, nested loops, labeled break | |
+| lambda_basic.das | Lambda capture, invoke, null check, addX returning lambda | |
 | lambda_capture.das | Lambda capturing const values, finalizer behavior | |
+| lambda_capture_modes.das | Lambda capture ref/move/clone modes, capture with delete | |
+| lambda_to_iter.das | Lambda as iterator via `each(lam)` for int& and struct | |
+| line_info.das | `testCallLine()` line info correctness (6 in script, 0 with AOT) | |
 | local_classes_failed.das | no_local_class_members restriction | **expect** `31300:1` |
+| lock_array.das | `lock`/`lock_data` on arrays — read-only iteration, mutable data access | |
+| loop_ret.das | Loop early return fills unique entries (random + tuple) | |
+| make_default.das | Default values for int, string, tuple, variant, struct, enum, array | |
+| make_handle.das | Handle construction — `TestObjectFoo(fooData=...)`, global/local/cmres/ascend | |
+| make_local.das | Struct local construction — defaults, `uninitialized`, fixed_array | |
+| make_struct_with_clone.das | Struct construction with clone `:=` for array fields | |
+| map_to_a.das | `map_to_array` — reinterpret raw memory as typed array via unsafe block | |
 | memset.das | memset8, memset16, memset32, memset64, memset128 | |
+| memzero.das | memzero for float and fixed_array | |
+| method_semantic.das | Struct with `@@` function pointer fields — magnitude, dot product | |
 | mismatching_curly_bracers.das | Mismatched `{` `}` brackets | **expect** `20000` `10002` |
 | mismatching_parentheses.das | Mismatched `(` `)` parentheses | **expect** `20000` `10001` |
+| mksmart_zero.das | `default<smart_ptr<TestObjectSmart>>` returns null smart pointer | |
 | module_vis_fail.das | Module visibility and scope errors | **expect** `30304:4` `30305:2` `30301:2` |
 | move_and_return_move.das | Move semantics — self-move, function move, struct with arrays | |
+| move_lambda_local_ref.das | `capture(<- arr)` moving array into lambda | |
+| move_on_return.das | Move with `finally` delete — pipeline array return | |
 | named_call.das | Named arguments — reordering, skipping, defaults, error cases | **expect** `30304:12` `30101:1` `30507:1` |
+| new_and_init.das | `new_and_init` — allocate and copy struct with `always_export_initializer` | |
+| new_delete.das | `delete` for arrays, tables, structs, handles, strings — heap tracking | |
+| new_with_init.das | `new` with struct constructors — zeroed, defaults, custom, array | |
 | new_type_infer.das | `new` type inference failures | **expect** `30109` `30301` |
 | no_default_initializer.das | `[no_default_initializer]` annotation | |
 | no_init.das | `options no_init` preventing `[init]` functions | **expect** `40214:3` |
 | not_all_paths_return_a_value.das | Missing return in some code paths | **expect** `40200` |
+| operator_overload.das | Custom `operator -`, `operator +`, `operator ==` on user struct | |
 | operators.das | Custom operators — `as`, `?as`, derived class operators | |
 | oop.das | Classes — constructors, finalizers, inheritance, RTTI, virtual dispatch | |
 | option_type.das | Option types (int& \| auto) ref preservation | |
-| pointers.das | Pointer operations — new, deref, safe navigation, null checks | |
+| override_field.das | Struct field `override` for function pointers in derived struct | |
 | partial_specialization.das | Generic function specialization dispatch | |
+| peek_and_modify_string.das | `peek_data` finds chars, `modify_data` replaces bytes | |
+| pointers.das | Pointer operations — new, deref, safe navigation, null checks | |
+| ptr_arithmetic.das | Pointer arithmetic — signed/unsigned int/int64/uint/uint64 | |
+| ptr_index.das | Pointer deref and index, default null pointer argument | |
 | properties.das | Property operators (.res :=, getter/setter) | |
 | random_numbers.das | Random seeding, distributions, reproducibility | |
+| reflection.das | RTTI reflection — compile source, inspect modules/structs/enums/functions | |
 | reserved_names.das | Use of reserved identifier names | **expect** `30116:9` |
 | resize_locked.das | Locked array operations — resize-while-iterating protection | |
+| return_reference.das | Return reference — global ref, assign via ref, block returning ref | |
+| rpipe.das | Right pipe `\|>` and `<\|` operator chaining | |
 | run_annotation_side_effects.das | `[run]` annotation side effects check | **expect** `40101` |
 | safe_index.das | Safe index `?[]` on arrays, tables, vectors, strings | |
+| safe_operators.das | Custom `operator []`, `?[]`, `.`, `?.` on user struct | |
+| scatter_gather.das | SIMD gather/scatter ops — int, uint, float arrays with uint4 indices | |
 | serialization.das | Archive serialization — structs, custom serialize, arrays, tables | |
+| set_table.das | `table<int>` as set — insert, erase, keys iteration, clone, literal | |
+| setand_and_setor_bool.das | Short-circuit `\|\|=` and `&&=` operators | |
 | shifts.das | Bit shift operators — <<, >>, <<<, >>> for int/uint/int64/uint64 | |
 | sizeof_reference.das | `sizeof` on reference types | **expect** `39902:2` |
+| smart_ptr.das | `smart_ptr<TestObjectSmart>` — scope, move, ref count, clone, use_count | |
 | smart_ptr_move.das | Unsafe `<-` move on `smart_ptr<>` type | **expect** `31300:1` |
+| sort.das | Sort on arrays/fixed_arrays — int, uint, int64, float, double, string, custom struct, vector | |
 | static.das | Static class members and methods | |
 | static_assert_in_infer.das | Static assertion during type inference | **expect** `40100` |
+| static_if.das | `static_if` with `has_field`, const false elimination | |
+| stdvec_r2v.das | `testFooArray()` — read-to-value iteration over std::vector binding | |
+| storage_types.das | int8, uint8, int16, uint16 storage struct — sizeof and roundtrip | |
 | strict_smart_ptr.das | strict_smart_pointers — emplace, inscope, smart_ptr operations | |
+| string_builder.das | String interpolation `{expr}` — nested, escaped braces | |
+| string_ops.das | String operations — case, find, strip, slice, conversions, fmt, iterator | |
 | struct.das | Struct operations — pointers, null-safe chains, typeinfo, variants | |
 | structure_already_defined.das | Duplicate struct definition | **expect** `30206` |
 | structure_field_already_declared.das | Duplicate struct field name | **expect** `30115` |
 | structure_not_found_ambiguous.das | Ambiguous struct name — same name in two modules | **expect** `30302` |
 | table.das | Table tombstone handling and iteration | |
+| table_operations.das | Table find, insert, delete, key_exists, erase collision, lock panic, defaults, modify | |
+| test_value_table_key.das | `table<EntityId; string>` — value-type table key ops, set operations | |
 | testing_tools.das | Faker, fuzzer, testing_boost tools | |
+| to_array.das | `to_array` — from fixed_array, range, each(), static/dynamic arrays | |
+| to_table.das | `to_table` — from fixed_array of tuples | |
 | trailing_delimiters.das | Trailing commas — arrays, structs, tables, block syntax | |
+| try_recover.das | `try`/`recover` — null deref recovery, panic recovery | |
 | tuple.das | Tuple — creation, named/positional fields, sizeof, clone, fixed_array | |
 | tuple_expansion.das | Tuple expansion — `let (i, s, f) = foo()` | |
 | type_loop.das | Recursive type definition loop | **expect** `41000` |
 | type_not_found.das | Unknown type name error | **expect** `30301` |
-| typefunction.das | `[type_function]` annotation (gen2=false) | |
+| typeAlias.das | Type aliases — `Point3Array`, indexing, swizzle, array ops on aliased types | |
+| typefunction.das | `[type_function]` annotation — `type<T>` argument syntax | |
 | typeinfo.das | typeinfo sizeof, has_field, struct_get_annotation_argument | |
+| typeinfo_annotations.das | Struct annotation queries — has_annotation, get_annotation_argument | |
 | typeinfo_traits.das | typeinfo trait queries — is_local, is_ref, is_numeric, etc. | |
+| typename.das | `typeinfo typename` for various types — generics, arrays, tables | |
+| types.das | Global, local, argument, block variable types — int, float, string | |
 | unused_argument.das | Unused function argument warnings | **expect** `40206:2` |
+| unused_arguments_annotation.das | `[unused_argument(b, c)]` annotation suppresses warnings | |
 | utility_patterns.das | defer, static_let utility patterns | |
+| variant.das | Variant type — typedef, struct sugar, `is`/`as`, `?as`, IorA, clone | |
 | variants.das | Variant type — construction, match, access | |
 | vec_constructors.das | Vector constructors — float/int/uint 2/3/4, range, type conversions | |
 | vec_index.das | Vector indexing — [], ?[], out-of-range, array-of-vectors | |
 | vec_ops.das | Vector arithmetic — *=, /= with scalar for float/int/uint | |
 | vec_swizzle.das | Vector swizzle — .xy, .yx, .xyz, struct member vectors | |
 | vector_fields.das | float4 .r/.g/.b/.a fields and swizzle | |
+| with_statement.das | `with (struct) { field = val }` block scoping | |
 
 ## linq/
 
@@ -400,6 +502,13 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | all_matches.das | match/multi_match/static_match on enums, variants, structs, tuples | |
 | test_match_edge.das | Match edge cases — nested, empty struct, wildcard, bindings, guards | |
 
+## module_tests/
+
+| File | Description | Expects errors |
+|---|---|---|
+| test_modules.das | Module system integration — compiles and runs 7 module scenarios via compile_file + make_file_access | |
+| _modules/ | *(helper directory)* Module source files for test_modules.das (dastest skips `_`-prefixed dirs) | |
+
 ## math/
 
 | File | Description | Expects errors |
@@ -408,6 +517,9 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | inf_and_nan.das | Infinity and NaN comparisons | |
 | math_matrix.das | Matrix operations — multiply, equality, transpose with fuzzing | |
 | math_numeric.das | Numeric math functions (sin, cos, tan, etc.) via fake_numeric macro | |
+| mat_ctors.das | Matrix constructors — float3x3, float3x4, float4x4, identity, sequence, row verification | |
+| mat_let_handle.das | Matrix let/handle — float3x4 element access, transpose folding | |
+| math_misc.das | Misc math — min, lerp, reflect, dot, length, cross, noise, ceili, saturate | |
 | math_pack_unpack.das | pack_float_to_byte / unpack_byte_to_float with fuzzing | |
 | math_quaternions.das | Quaternion operations with fuzzing | |
 
@@ -473,6 +585,12 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | test_new_string_functions.das | New string utilities — contains, count_chars, pad_left/right, trim_chars | |
 | test_strings_boost_extra.das | Extra strings_boost — wide, is_character_at, eq, join overloads | |
 
+## template/
+
+| File | Description | Expects errors |
+|---|---|---|
+| test_template.das | `[template]` annotation — `type<T>` and `decltype` as template arguments | |
+
 ## type_traits/
 
 | File | Description | Expects errors |
@@ -502,6 +620,6 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 
 ## Summary
 
-- **35** test directories
-- **226** `.das` files total (~13 helper/module files, ~213 test files)
+- **38** test directories
+- **328** `.das` files total (~13 helper/module files, ~315 test files)
 - **21** files with `expect` directives (expected compile errors)
