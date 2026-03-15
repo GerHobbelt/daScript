@@ -1307,6 +1307,15 @@ install(FILES ${DAS_UNCATEGORIZED_EXAMPLES}
     DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/uncategorized
 )
 
+file(GLOB DAS_HV_EXAMPLES
+    ${PROJECT_SOURCE_DIR}/examples/hv/*.das
+    ${PROJECT_SOURCE_DIR}/examples/hv/*.html
+    ${PROJECT_SOURCE_DIR}/examples/hv/*.md
+)
+install(FILES ${DAS_HV_EXAMPLES}
+    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/hv
+)
+
 # Install language tutorial .das files
 file(GLOB LANGUAGE_TUTORIAL_SOURCES
     ${PROJECT_SOURCE_DIR}/tutorials/language/*.das
@@ -1321,6 +1330,14 @@ file(GLOB MACRO_TUTORIAL_SOURCES
 )
 install(FILES ${MACRO_TUTORIAL_SOURCES}
     DESTINATION ${DAS_INSTALL_TUTORIALSDIR}/macros
+)
+
+# Install dasHV tutorial .das files
+file(GLOB DASHV_TUTORIAL_SOURCES
+    ${PROJECT_SOURCE_DIR}/tutorials/dasHV/*.das
+)
+install(FILES ${DASHV_TUTORIAL_SOURCES}
+    DESTINATION ${DAS_INSTALL_TUTORIALSDIR}/dasHV
 )
 
 # ── Documentation build (optional) ──────────────────────────────────────────
@@ -1377,4 +1394,34 @@ if(DAS_BUILD_DOCUMENTATION)
         message(WARNING "DAS_BUILD_DOCUMENTATION is ON but Sphinx was not found. "
                         "Install Python 3 and run: pip install sphinx sphinx-rtd-theme")
     endif()
+endif()
+
+# macOS: ad-hoc code sign all installed binaries and shared libraries.
+# This prevents Gatekeeper from quarantining downloaded SDK artifacts
+# ("cannot be opened because the developer cannot be verified").
+if(APPLE)
+    install(CODE [[
+        message(STATUS "Ad-hoc code signing installed binaries...")
+        file(GLOB_RECURSE _sign_targets
+            "${CMAKE_INSTALL_PREFIX}/*.dylib"
+            "${CMAKE_INSTALL_PREFIX}/*.shared_module"
+            "${CMAKE_INSTALL_PREFIX}/bin/*"
+        )
+        foreach(_f IN LISTS _sign_targets)
+            if(IS_SYMLINK "${_f}")
+                continue()
+            endif()
+            execute_process(
+                COMMAND codesign --force --sign - "${_f}"
+                RESULT_VARIABLE _sign_result
+                ERROR_VARIABLE  _sign_err
+                OUTPUT_QUIET
+            )
+            if(_sign_result EQUAL 0)
+                message(STATUS "  Signed: ${_f}")
+            else()
+                message(WARNING "  Failed to sign ${_f}: ${_sign_err}")
+            endif()
+        endforeach()
+    ]])
 endif()

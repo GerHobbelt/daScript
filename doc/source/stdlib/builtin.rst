@@ -72,6 +72,8 @@ This bitfield specifies how exactly values are to be printed
 
          * **fixedPoint** (0x20) - always output fixed point precision for floating point values
 
+         * **fullTypeInfo** (0x40) - show full type info on containers (e.g. ``array<int>`` instead of ``[]``, ``fixed_array<int>`` instead of ``[]``, ``table<int;string>`` instead of ``{}``, ``tuple<int;float>`` instead of ``()``)
+
 
 
 
@@ -207,7 +209,7 @@ Read-only string constant used as the separator between vector components when p
 
 .. _global-builtin-print_flags_debugger:
 
-.. das:attribute:: print_flags_debugger = bitfield(0xf)
+.. das:attribute:: print_flags_debugger = bitfield(0x2f)
 
 Predefined set of print_flags configured to match the output formatting used by the `debug` function.
 
@@ -318,7 +320,7 @@ Forces a function to be exported and retained in the final compiled context, eve
 
 .. das:attribute:: pinvoke
 
-Marks a function as a platform invoke (pinvoke) entry, routing its calls through the pinvoke interop machinery.
+Marks a function as a platform invoke (pinvoke) entry, enabling cross-context calls via ``invoke_in_context``, ``invoke_debug_agent_method``, and ``invoke_debug_agent_function``.  The annotation adds a context mutex so the function can be safely invoked from another context (including the single thread-local agent context when the category is ``""``).  Functions called cross-context must also be marked ``[export]``.
 
 
 .. _handle-builtin-no_lint:
