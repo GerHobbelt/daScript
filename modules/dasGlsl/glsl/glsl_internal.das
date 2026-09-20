@@ -19,6 +19,7 @@ require daslib/ast_boost
 require daslib/templates_boost
 require daslib/strings_boost
 require daslib/ast_used
+require daslib/shader_block_layout
 
 let DEBUG_SHADER_TEXT = false
 let DEBUG_SHADER_BINDINGS = false
@@ -45,6 +46,7 @@ bitfield ShaderExportCaps {
     output_structure_initializers               // generate Foo_STRUCTURE_INITIALIZER instead of Foo() for HLSL compatibility
     allow_unitialized_local_arrays              // var a: float[9] can be local, and will not be initialized for HLSL (only if restrict_array_as_result)
     resolve_supported_semantics                 // resolve semantics from variable name (a_color0, v_position etc)
+    pack_std140_uniforms                        // emit a struct @uniform/@push_constant as a std140 interface block (UBO) instead of a free `uniform Struct name;`; the host binds it via glBindBufferRange (GL/WebGL2 portable floor)
 }
 
 class GlslShader : AstFunctionAnnotation {
@@ -64,6 +66,7 @@ class GlslShader : AstFunctionAnnotation {
     output_structure_initializers = false
     allow_unitialized_local_arrays = false
     resolve_supported_semantics = false
+    pack_std140_uniforms = false
     def get_glsl_prefix {
         return ""
     }
@@ -146,6 +149,9 @@ class GlslShader : AstFunctionAnnotation {
         }
         if (resolve_supported_semantics) {
             caps.resolve_supported_semantics = true
+        }
+        if (pack_std140_uniforms) {
+            caps.pack_std140_uniforms = true
         }
         return caps
     }
@@ -312,6 +318,7 @@ class GlslExport : AstVisitor {
     depEnum   : table<uint64; bool>
     trackLine : int = 0
     trackFile : string
+    suppress_bounds_arg : bool = false    // the very next expr visited is a `.[]` call's __context__/__lineinfo__ tail arg; elide it
     shaderType : ShaderType
     version : int = 0
     renames : array<tuple<name : string; repl : string>>
@@ -572,7 +579,15 @@ class GlslExport : AstVisitor {
         // the host and would need an explicit target flag threaded into GlslExport;
         // not wired yet.) ES 3.00 already matches what desktop core wants minus the
         // version token, so the body emission below is unchanged.
-        let es300 = get_platform_name() == "emscripten"
+        var es300 = get_platform_name() == "emscripten"
+        if (!es300) {
+            for (a in get_command_line_arguments()) {
+                if (find(a, "wasm32") >= 0 || find(a, "emscripten") >= 0) {
+                    es300 = true
+                    break
+                }
+            }
+        }
         if (caps.write_version) {
             if (es300) {
                 *writer |> write("#version 300 es\n")
@@ -981,6 +996,40 @@ class GlslExport : AstVisitor {
         *writer |> write("{suffix}({arg.name},{format},{binding})")
         return true
     }
+    // std140 UBO pack: a struct @uniform / @push_constant (not a sampler/image marker) lowers to a
+    // `layout(std140) uniform <BlockType> { fields } <instance>;` interface block instead of a free
+    // `uniform Struct name;`. The host binds it as a UBO (glBindBufferRange). ES3.00 / WebGL2 allows no
+    // layout(binding=) on a block, so no binding qualifier is emitted — the host assigns the point at
+    // bind time. The shader body's `name.field` access is identical to the loose form. Returns false
+    // when packing is off (loose fallback) or the type isn't a packable struct. visitGlobalLetVariable
+    // appends the trailing ';'.
+    def outputStd140UboBlock(arg : VariablePtr) : bool {
+        if (!caps.pack_std140_uniforms) return false
+        let t = arg._type
+        if (t.baseType != Type.tStructure || t.structType == null) return false
+        // Skip the UBO path (fall through to the loose `uniform Struct name;` form + by-name binder) for
+        // sampler/image markers (they bind as textures, not UBOs) and for blocks with no physical std140
+        // layout (a bool / non-numeric field). The host bind macro consults the SAME predicate
+        // (std140_block_is_packable) so emitter and binder agree on which blocks pack.
+        let snm = "{t.structType.name}"
+        if (snm |> find("sampler") != -1 || snm |> find("image") != -1 || !std140_block_is_packable(t.structType)) return false
+        // Block name = <instance>_ubo, NOT the struct type name: the struct type is still emitted as a
+        // standalone GLSL `struct` (it may be used elsewhere), and a block sharing that name would
+        // collide. Per-instance keeps two uniforms of the same struct type distinct, and keeps a global
+        // shared by vertex+fragment one block (same name -> the linker merges it). Host binder matches.
+        *writer |> write("layout(std140) uniform {arg.name}_ubo")
+        newLine(1)
+        *writer |> write("\{")
+        newLine(1)
+        for (f in t.structType.fields) {
+            *writer |> write("    {describe_glsl_type_ex(f._type, false)} {f.name}")
+            write_dim_suffix(f._type)
+            *writer |> write(";")
+            newLine(1)
+        }
+        *writer |> write("\} {arg.name}")
+        return true
+    }
     def override preVisitGlobalLetVariable(arg : VariablePtr; lastArg : bool) {
         line(arg.at)
         if (caps.restrict_array_as_result) {
@@ -1021,7 +1070,7 @@ class GlslExport : AstVisitor {
             if (shaderType == ShaderType.vertex) {
                 if (isUniform) {
                     checkUniformType(arg._type)
-                    if (outputSamplerMacro(arg)) return
+                    if (outputSamplerMacro(arg) || outputStd140UboBlock(arg)) return
                     *writer |> write("uniform "); needInit = false
                 }
                 let argLoc = arg.annotation |> find_arg("location")
@@ -1039,7 +1088,7 @@ class GlslExport : AstVisitor {
             } elif (shaderType == ShaderType.fragment) {
                 if (isUniform) {
                     checkUniformType(arg._type)
-                    if (outputSamplerMacro(arg)) return
+                    if (outputSamplerMacro(arg) || outputStd140UboBlock(arg)) return
                     *writer |> write("uniform "); needInit = false
                 }
                 // GLSL ES 3.00 REQUIRES an explicit layout(location=N) on every fragment output when
@@ -1068,7 +1117,7 @@ class GlslExport : AstVisitor {
                 }
                 if (isUniform) {
                     checkUniformType(arg._type)
-                    if (outputSamplerMacro(arg) || outputImageMacro(arg)) return
+                    if (outputSamplerMacro(arg) || outputImageMacro(arg) || outputStd140UboBlock(arg)) return
                     *writer |> write("uniform "); needInit = false
                 }
                 if (arg.annotation |> find_arg("in") is tBool) {
@@ -1224,6 +1273,10 @@ class GlslExport : AstVisitor {
     }
 // call
     def override preVisitExprCall(expr : ExprCall?) {
+        if (is_index_op_call(expr)) {
+            // `.[]` runtime index -> base[index]; opened/closed in visitExprCallArgument, no `fn(`.
+            return
+        }
         if (is_shadow_compare_call(expr)) {
             // GL has no textureCompare(): a sampler2DShadow samples with texture(s, vec3(uv, ref)).
             // The vec3() wrap of (uv, compare) is emitted around args 1+2 in visitExprCallArgument.
@@ -1245,10 +1298,29 @@ class GlslExport : AstVisitor {
         *writer |> write("{fnName}(")
     }
     def override visitExprCall(expr : ExprCall?) : ExpressionPtr {
+        if (is_index_op_call(expr)) {
+            return expr
+        }
         *writer |> write(")")
         return expr
     }
+    def override preVisitExprCallArgument(expr : ExprCall?; arg : ExpressionPtr; last : bool) {
+        // Mark EXACTLY a `.[]` runtime-index call's 3rd/4th args (its __context__ / __lineinfo__
+        // bounds-check tail) for elision, by node identity. Scoping to those nodes (not the whole
+        // `.[]` subtree) keeps an explicit __context__ in the base / index failing closed.
+        suppress_bounds_arg = (is_index_op_call(expr) && length(expr.arguments) > 3 &&
+            (arg == expr.arguments[2] || arg == expr.arguments[3]))
+    }
     def override visitExprCallArgument(expr : ExprCall?; arg : ExpressionPtr; last : bool) {
+        if (is_index_op_call(expr)) {
+            // base -> `[`, index -> `]`; the trailing __context__ / __lineinfo__ args emit nothing.
+            if (arg == expr.arguments[0]) {
+                *writer |> write("[")
+            } elif (arg == expr.arguments[1]) {
+                *writer |> write("]")
+            }
+            return arg
+        }
         if (is_shadow_compare_call(expr)) {
             // args: 0=sampler, 1=uv (float2), 2=compare (float) -> texture(s, vec3(uv, compare))
             if (arg == expr.arguments[0]) {
@@ -1900,10 +1972,20 @@ class GlslExport : AstVisitor {
     }
 // fake context
     def override preVisitExprFakeContext(expr : ExprFakeContext?) : void {
+        // dropped only when it IS a `.[]` bounds-check tail arg (flagged in preVisitExprCallArgument);
+        // an explicit __context__ anywhere else still fails closed.
+        if (suppress_bounds_arg) {
+            suppress_bounds_arg = false
+            return
+        }
         error("__context__ is not supported", expr.at)
     }
 // fake line info
     def override preVisitExprFakeLineInfo(expr : ExprFakeLineInfo?) : void {
+        if (suppress_bounds_arg) {
+            suppress_bounds_arg = false
+            return
+        }
         error("__lineinfo__ is not supported", expr.at)
     }
 // reader
@@ -1975,6 +2057,16 @@ def is_glsl_structure(arg; name : string) {
 def is_shadow_compare_call(expr : ExprCall?) : bool {
     return (expr != null && expr.name == "textureCompare" &&
         expr.func != null && expr.func._module != null && expr.func._module.name == "shader_lingua_franca")
+}
+
+// A runtime-index `m[i]` (vector / matrix / fixed-array indexed by a non-const value) lowers to a
+// `.[](base, index, __context__, __lineinfo__)` operator call under no-opt / JIT — the bounds-check
+// carries the context + line for an out-of-range panic (a const index stays a plain ExprAt and folds).
+// GLSL has its own (undefined-but-not-trapping) out-of-bounds behavior, so the emitter drops the check
+// and writes `base[index]`, eliding the two trailing __context__ / __lineinfo__ args.
+[macro_function]
+def is_index_op_call(expr : ExprCall?) : bool {
+    return expr != null && expr.name == ".[]"
 }
 
 [macro_function]

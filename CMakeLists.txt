@@ -43,6 +43,10 @@ option(DAS_TUTORIAL_DISABLED "Disable dasTutorial" OFF)
 option(DAS_TESTS_DISABLED "Disable dasTests" OFF)
 option(DAS_BUILD_DOCUMENTATION "Build HTML documentation via Sphinx during install" OFF)
 option(DAS_ENABLE_PIC "Build static libs as position-independent code (UNIX, required to link into shared objects)" ON)
+# Single source of truth for the MSVC C runtime: drives CMAKE_MSVC_RUNTIME_LIBRARY
+# (all daslang targets, every config) and libhv's BUILD_FOR_MT (modules/dasHV) in
+# lockstep, so no target can disagree on /MT vs /MD. See CMakeCommon.txt.
+option(DAS_USE_STATIC_STD_LIBS "Link the static MSVC runtime (/MT); OFF = dynamic (/MD)" OFF)
 # RelWithDebInfo is permanently our heap-leak tracking / audit build.
 # DAS_TRACK_ALLOC=1 (and the global new/delete override) are auto-enabled below
 # via generator expressions; tracker source files are #if DAS_TRACK_ALLOC-gated
@@ -574,14 +578,26 @@ ENDFOREACH()
 # Clean stale .shared_module files. When a module is disabled, its .shared_module
 # from a previous build may remain and cause crashes at startup (the dynamic module
 # loader tries to load them even though the module code is no longer linked).
-FILE(GLOB_RECURSE _all_shared_modules CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/modules/*.shared_module")
-FOREACH(_sm ${_all_shared_modules})
-    GET_FILENAME_COMPONENT(_sm_name "${_sm}" NAME_WE)
-    IF(NOT TARGET ${_sm_name})
-        MESSAGE(STATUS "Removing stale ${_sm}")
-        FILE(REMOVE "${_sm}")
-    ENDIF()
-ENDFOREACH()
+#
+# Skip this entirely under EMSCRIPTEN. The wasm build has no native dynamic
+# loading (das_is_dll_build() is false; it's a static monolith), so a leftover
+# native .shared_module can never be loaded there — the crash this guards against
+# can't happen. More importantly, configuring the web build against the shared
+# source tree builds modules like dasGlfw/dasOpenGL as their STATIC variant
+# (target libDasModule*, not dasModule*), so this loop would otherwise treat the
+# desktop-built host .shared_module as "stale" and DELETE it — destroying exactly
+# the host artifacts a wasm cross-compile (daspkg release wasm) needs. A later
+# desktop configure still cleans genuinely-disabled modules.
+IF(NOT EMSCRIPTEN)
+    FILE(GLOB_RECURSE _all_shared_modules CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/modules/*.shared_module")
+    FOREACH(_sm ${_all_shared_modules})
+        GET_FILENAME_COMPONENT(_sm_name "${_sm}" NAME_WE)
+        IF(NOT TARGET ${_sm_name})
+            MESSAGE(STATUS "Removing stale ${_sm}")
+            FILE(REMOVE "${_sm}")
+        ENDIF()
+    ENDFOREACH()
+ENDIF()
 
 FOREACH(_example ${DAS_ALL_EXAMPLES})
     MESSAGE("adding to ${_example} ${DAS_MODULES_LIBS}")
@@ -1721,6 +1737,24 @@ install(FILES ${PROJECT_SOURCE_DIR}/include/vecmath/LICENSE DESTINATION ${DAS_IN
 # Install utility scripts
 install(FILES ${PROJECT_SOURCE_DIR}/utils/aot/main.das DESTINATION utils/aot)
 
+# Install jit tool (LLVM JIT CLI — .das to shared lib or standalone -exe)
+install(FILES ${PROJECT_SOURCE_DIR}/utils/jit/main.das DESTINATION utils/jit)
+
+# Install fix-lint-errors tool (mechanical lint auto-fixer)
+install(FILES ${PROJECT_SOURCE_DIR}/utils/fix-lint-errors/main.das DESTINATION utils/fix-lint-errors)
+
+# Install requirefix tool (require-statement fixer + its module)
+install(FILES
+    ${PROJECT_SOURCE_DIR}/utils/requirefix/main.das
+    ${PROJECT_SOURCE_DIR}/utils/requirefix/requirefix.das
+    ${PROJECT_SOURCE_DIR}/utils/requirefix/test_requirefix.das
+    DESTINATION utils/requirefix
+)
+install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/requirefix/testdata/
+    DESTINATION utils/requirefix/testdata
+    FILES_MATCHING PATTERN "*.das"
+)
+
 # Install MCP server (stdio transport, no dasHV dependency)
 #   main.das        — full server entry point
 #   cpp_main.das    — cpp/agnostic-subset entry point
@@ -1858,6 +1892,31 @@ install(FILES
     DESTINATION ${DAS_INSTALL_EXAMPLESDIR}
 )
 
+# Install clargs example
+file(GLOB DAS_CLARGS_EXAMPLES
+    ${PROJECT_SOURCE_DIR}/examples/clargs/*.das
+)
+install(FILES ${DAS_CLARGS_EXAMPLES}
+    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/clargs
+)
+
+# Install file_path_require example (cross-file require + .das_project resolution)
+install(FILES
+    ${PROJECT_SOURCE_DIR}/examples/file_path_require/main.das
+    ${PROJECT_SOURCE_DIR}/examples/file_path_require/shared_helpers.das
+    ${PROJECT_SOURCE_DIR}/examples/file_path_require/project.das_project
+    ${PROJECT_SOURCE_DIR}/examples/file_path_require/README.md
+    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/file_path_require
+)
+
+# Install mcp echo example (stdio MCP server + client)
+install(FILES
+    ${PROJECT_SOURCE_DIR}/examples/mcp/echo/server.das
+    ${PROJECT_SOURCE_DIR}/examples/mcp/echo/client.das
+    ${PROJECT_SOURCE_DIR}/examples/mcp/echo/README.md
+    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/mcp/echo
+)
+
 # Install dasbind example
 install(FILES
     ${PROJECT_SOURCE_DIR}/examples/dasbind/dasbind_example.das
@@ -1956,67 +2015,11 @@ install(FILES
 
 add_subdirectory(tutorials)
 
-# ── Documentation build (optional) ──────────────────────────────────────────
-# Requires the `daslang` target (das2rst stdlib RST generator runs it). If the
-# user explicitly asked for docs but also disabled tools, fail early rather
-# than silently skipping — mirrors the DAS_AOT_EXAMPLES check above.
-if(DAS_BUILD_DOCUMENTATION)
-    if(DAS_TOOLS_DISABLED)
-        message(FATAL_ERROR "DAS_BUILD_DOCUMENTATION requires DAS_TOOLS_DISABLED to be OFF (the docs pipeline runs daslang via das2rst.das)")
-    endif()
-    find_package(Python3 COMPONENTS Interpreter)
-    if(Python3_FOUND)
-        execute_process(
-            COMMAND ${Python3_EXECUTABLE} -c "import sphinx; print(sphinx.__version__)"
-            RESULT_VARIABLE SPHINX_CHECK_RESULT
-            OUTPUT_VARIABLE SPHINX_VERSION
-            ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE
-        )
-    endif()
-    if(Python3_FOUND AND SPHINX_CHECK_RESULT EQUAL 0)
-        message(STATUS "Sphinx ${SPHINX_VERSION} found — documentation build enabled")
-        set(DAS_DOC_SOURCE_DIR  "${PROJECT_SOURCE_DIR}/doc/source")
-        set(DAS_DOC_BUILD_DIR   "${CMAKE_CURRENT_BINARY_DIR}/doc_html")
-        set(DAS_DOC_DOCTREE_DIR "${CMAKE_CURRENT_BINARY_DIR}/doc_doctrees")
+# Test-runner targets (run_tests_interpreter / _jit / _aot).
+add_subdirectory(tests)
 
-        # Step 1: regenerate stdlib RST from daslib source comments (requires daslang)
-        add_custom_command(
-            OUTPUT  ${CMAKE_CURRENT_BINARY_DIR}/das2rst.stamp
-            COMMAND $<TARGET_FILE:daslang> "${PROJECT_SOURCE_DIR}/doc/reflections/das2rst.das"
-            COMMAND ${CMAKE_COMMAND} -E touch ${CMAKE_CURRENT_BINARY_DIR}/das2rst.stamp
-            DEPENDS daslang
-            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-            COMMENT "Generating stdlib RST documentation (das2rst)"
-        )
-
-        # Step 2: build HTML with Sphinx
-        add_custom_command(
-            OUTPUT  ${CMAKE_CURRENT_BINARY_DIR}/sphinx.stamp
-            COMMAND ${Python3_EXECUTABLE} -m sphinx
-                    -b html
-                    -d "${DAS_DOC_DOCTREE_DIR}"
-                    "${DAS_DOC_SOURCE_DIR}"
-                    "${DAS_DOC_BUILD_DIR}"
-            COMMAND ${CMAKE_COMMAND} -E touch ${CMAKE_CURRENT_BINARY_DIR}/sphinx.stamp
-            DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/das2rst.stamp
-            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/doc
-            COMMENT "Building HTML documentation (Sphinx)"
-        )
-
-        add_custom_target(das_documentation ALL
-            DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/sphinx.stamp
-        )
-
-        install(DIRECTORY ${DAS_DOC_BUILD_DIR}/
-            DESTINATION ${DAS_INSTALL_DOCDIR}/doc
-            PATTERN ".buildinfo" EXCLUDE
-            PATTERN ".doctrees" EXCLUDE
-        )
-    else()
-        message(WARNING "DAS_BUILD_DOCUMENTATION is ON but Sphinx was not found. "
-                        "Install Python 3 and run: pip install sphinx sphinx-rtd-theme")
-    endif()
-endif()
+# Documentation targets (check_docs_generated, build_doc, das_documentation).
+add_subdirectory(doc)
 
 # macOS: ad-hoc code sign all installed binaries and shared libraries.
 # This prevents Gatekeeper from quarantining downloaded SDK artifacts

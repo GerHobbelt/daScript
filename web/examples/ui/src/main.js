@@ -8,6 +8,38 @@ var code;
 var sampleList = {"examples":null};
 
 
+// --- Audio autoplay unlock -------------------------------------------------
+// dasAudio programs (miniaudio's emscripten Web Audio / ScriptProcessor backend)
+// create an AudioContext deep inside the wasm run. The Run handler awaits
+// (preloadSampleAssets) before callMain, so the context is born after the click's
+// synchronous frame — browsers would leave it 'suspended'. We wrap AudioContext to
+// resume it on creation (the Run click gives sticky activation, so resume() is
+// allowed), and also resume on any later gesture. No-op for non-audio programs.
+// Installed at script-eval time, BEFORE pageInit loads daslang_static.js, so the
+// wasm's `new AudioContext()` sees the wrapper.
+(function installAudioUnlock() {
+    var OrigAC = window.AudioContext || window.webkitAudioContext;
+    if (!OrigAC) return;
+    var ctxs = new Set();
+    var Wrapped = function () {
+        var c = new OrigAC(...arguments);
+        ctxs.add(c);
+        try { c.resume(); } catch (e) {}
+        return c;
+    };
+    Wrapped.prototype = OrigAC.prototype;
+    window.AudioContext = Wrapped;
+    if (window.webkitAudioContext) window.webkitAudioContext = Wrapped;
+    var resumeAll = function () {
+        ctxs.forEach(function (c) {
+            if (c.state === "closed") ctxs.delete(c);          // drop dead contexts so the set can't grow across runs
+            else if (c.state === "suspended") c.resume().catch(function () {});
+        });
+    };
+    ["pointerdown", "keydown", "click"].forEach(function (e) { document.addEventListener(e, resumeAll, true); });
+})();
+
+
 pageInit = function () {
 
     $.getScript("daslang_static.js")
@@ -98,11 +130,15 @@ pageInit = function () {
 }
 
 // Derive a URL-friendly slug from a sample entry. Used by the ?example=
-// query-string deep-link from daslang.io's § 01 bench cycler. The slug is
-// the first file's basename without the `.das` suffix, which by convention
-// matches the dasProfile bench test name (`sha256.das` → `sha256`, etc.).
+// query-string deep-link (daslang.io's § 01 bench cycler, and the /examples
+// page's embedded player). An explicit "slug" field wins — multi-file samples
+// (the games) all share a main.das basename, so they MUST carry a slug to be
+// addressable. Otherwise fall back to the first file's basename without `.das`
+// (so `examples/sha256.das` → `sha256`, matching the dasProfile bench name).
 function slugForSample(entry) {
-    if (!entry || !entry.files || !entry.files.length) return null;
+    if (!entry) return null;
+    if (entry.slug) return entry.slug;
+    if (!entry.files || !entry.files.length) return null;
     const f = entry.files[0];
     const base = f.split('/').pop();
     return base.replace(/\.das$/, '');
@@ -164,6 +200,23 @@ async function preloadSampleAssets() {
     }
 }
 
+// Precompiled sample .wasm are now wasm64 (memory64) — browsers without
+// memory64 (Safari/iOS) cannot instantiate them, so the JIT engine must stay
+// disabled there regardless of artifact presence. Detected once at load.
+const WASM64_SUPPORTED = (() => {
+    try {
+        // Validate a minimal module declaring a 64-bit (memory64) memory:
+        // \0asm | version | memory section {count=1, flags=0x04 (memory64), min=1}.
+        // More robust than `new WebAssembly.Memory({index:'i64'})`, which can
+        // false-positive on engines that silently ignore the unknown descriptor
+        // field and hand back a wasm32 memory. validate() parses the memory64
+        // flag, so it is true only where the engine truly supports it.
+        return WebAssembly.validate(new Uint8Array([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0, 5, 3, 1, 4, 1]));
+    } catch (e) {
+        return false;
+    }
+})();
+
 function updateEngineAvailability(name) {
     const jitRadio = document.querySelector('input[name=engine][value=jit]');
     if (!jitRadio) return;
@@ -179,6 +232,9 @@ function updateEngineAvailability(name) {
             if (interpRadio) interpRadio.checked = true;
         }
     };
+    // Gate 1: no memory64 → wasm64 artifacts can't run here at all.
+    if (!WASM64_SUPPORTED) { disableJit(); return; }
+    // Gate 2: no precompiled .wasm for this sample (multi-file or absent).
     if (!name) { disableJit(); return; }
     // Rapid sample-switching can land HEAD-fetch responses out of order
     // (HTTP/2). Gate the late .then/.catch on the sample still being current
@@ -429,12 +485,31 @@ runTests = function() {
 // touches stdout (fd_write), proc_exit, clock, args/environ stubs, and a few
 // fd_* no-ops emscripten's libc emits at link time. See
 // modules/dasLLVM/README.md "Cross-compilation" for the import surface.
+//
+// The JIT samples are compiled to wasm64 (memory64). Under memory64 every
+// pointer/size argument arrives as a BigInt (not a Number), the iovec struct
+// fields are 8 bytes (not 4), and `__wasi_size_t` outputs are 8 bytes — so the
+// shim must coerce BigInt offsets for DataView and write 64-bit sizes. The
+// helpers below keep it correct for both wasm64 and (legacy) wasm32 modules.
 function makeWasiShim(memoryRef) {
     let stdoutBuf = '';
     const decoder = new TextDecoder('utf-8');
 
     function mem() { return new DataView(memoryRef.buffer); }
     function u8() { return new Uint8Array(memoryRef.buffer); }
+
+    // memory64 passes pointer/size args as BigInt; wasm32 passes Number. Coerce
+    // to a Number for DataView offsets and array slicing — playground linear
+    // memory is far below 2^53, so the narrowing is lossless.
+    const N = (x) => (typeof x === 'bigint' ? Number(x) : x);
+
+    // A WASI `__wasi_size_t` output is 4 bytes under wasm32 and 8 bytes under
+    // wasm64 (it is size_t). Pick the width from whether the destination
+    // pointer arrived as a BigInt (memory64).
+    function putSize(dv, ptr, val) {
+        if (typeof ptr === 'bigint') dv.setBigUint64(Number(ptr), BigInt(val), true);
+        else dv.setUint32(ptr, val, true);
+    }
 
     function flushStdout(force) {
         // Flush by newline so each printed line gets its own output row.
@@ -452,25 +527,30 @@ function makeWasiShim(memoryRef) {
     return {
         fd_write(fd, iovsPtr, iovsLen, nWrittenPtr) {
             const dv = mem();
+            const wide = typeof iovsPtr === 'bigint';
+            const base = N(iovsPtr);
+            const count = N(iovsLen);
+            // iovec = { buf, buf_len }: two pointer-sized fields — 4 bytes each
+            // under wasm32, 8 bytes each under wasm64.
+            const fsz = wide ? 8 : 4;
             let total = 0;
-            for (let i = 0; i < iovsLen; i++) {
-                const off = iovsPtr + i * 8;
-                const bufPtr = dv.getUint32(off, true);
-                const bufLen = dv.getUint32(off + 4, true);
+            for (let i = 0; i < count; i++) {
+                const off = base + i * fsz * 2;
+                const bufPtr = wide ? Number(dv.getBigUint64(off, true)) : dv.getUint32(off, true);
+                const bufLen = wide ? Number(dv.getBigUint64(off + fsz, true)) : dv.getUint32(off + fsz, true);
                 const bytes = u8().subarray(bufPtr, bufPtr + bufLen);
                 stdoutBuf += decoder.decode(bytes, { stream: true });
                 total += bufLen;
             }
-            dv.setUint32(nWrittenPtr, total, true);
+            putSize(dv, nWrittenPtr, total);
             flushStdout(false);
             return 0;
         },
         fd_read() { return 0; },
         fd_close() { return 0; },
-        fd_seek(fd, offLo, offHi, whence, newOffPtr) {
-            const dv = mem();
-            dv.setUint32(newOffPtr, 0, true);
-            dv.setUint32(newOffPtr + 4, 0, true);
+        fd_seek(fd, offset, whence, newOffPtr) {
+            // __wasi_filesize_t result is u64 on both wasm32 and wasm64.
+            mem().setBigUint64(N(newOffPtr), 0n, true);
             return 0;
         },
         fd_fdstat_get() { return 0; },
@@ -479,29 +559,29 @@ function makeWasiShim(memoryRef) {
         fd_prestat_dir_name() { return 8; },
         args_sizes_get(argcPtr, argvBufSizePtr) {
             const dv = mem();
-            dv.setUint32(argcPtr, 0, true);
-            dv.setUint32(argvBufSizePtr, 0, true);
+            putSize(dv, argcPtr, 0);
+            putSize(dv, argvBufSizePtr, 0);
             return 0;
         },
         args_get() { return 0; },
         environ_sizes_get(envcPtr, envBufSizePtr) {
             const dv = mem();
-            dv.setUint32(envcPtr, 0, true);
-            dv.setUint32(envBufSizePtr, 0, true);
+            putSize(dv, envcPtr, 0);
+            putSize(dv, envBufSizePtr, 0);
             return 0;
         },
         environ_get() { return 0; },
         clock_time_get(id, precision, timePtr) {
             const ns = BigInt(Date.now()) * 1000000n;
-            mem().setBigUint64(timePtr, ns, true);
+            mem().setBigUint64(N(timePtr), ns, true);
             return 0;
         },
         clock_res_get(id, resPtr) {
-            mem().setBigUint64(resPtr, 1000000n, true);
+            mem().setBigUint64(N(resPtr), 1000000n, true);
             return 0;
         },
         random_get(bufPtr, bufLen) {
-            const view = u8().subarray(bufPtr, bufPtr + bufLen);
+            const view = u8().subarray(N(bufPtr), N(bufPtr) + N(bufLen));
             crypto.getRandomValues(view);
             return 0;
         },

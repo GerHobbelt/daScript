@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>daslang</title>
+<style>
+  html, body {
+    margin: 0; height: 100%; background: #0d0c0a; overflow: hidden;
+    display: flex; align-items: center; justify-content: center;
+  }
+  /* Letterbox, never stretch: the canvas keeps its intrinsic (game) aspect
+     ratio and scales to fit. Forcing width/height:100% would distort the
+     fixed-size backing store into the container shape — the "squished" look. */
+  #canvas { max-width: 100%; max-height: 100%; border: 0; outline: none; display: block; }
+</style>
+</head>
+<body>
+<!-- Minimal canvas-only shell shipped by `daspkg release wasm`. Sites embed
+     this artifact in an iframe; override with release_web_shell(<path>) for a
+     custom frame. -->
+<canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
+<script>
+  var Module = {
+    canvas: (function () {
+      var c = document.getElementById('canvas');
+      // Keep focus on the canvas so keyboard input reaches the game.
+      c.addEventListener('click', function () { c.focus(); });
+      return c;
+    })(),
+  };
+</script>
+{{{ SCRIPT }}}
+</body>
+</html>

@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-This is the [daslang](https://dascript.org/) programming language repository (GaijinEntertainment/daScript). daslang (formerly daScript) is a high-performance statically-typed scripting language for games and real-time applications. The repository and many C++ API names still use the old "daScript" spelling.
+This is the [daslang](https://daslang.io/) programming language repository (GaijinEntertainment/daScript). daslang (formerly daScript) is a high-performance statically-typed scripting language for games and real-time applications. The repository and many C++ API names still use the old "daScript" spelling.
 
 For the **why** — design principles, three-tier execution model, the macros-as-design-lens rule — read `skills/project_overview.md`. The full long-form rationale lives in `doc/source/reference/design_philosophy.rst`.
 
@@ -120,7 +120,7 @@ All code MUST use gen2 syntax (add `options gen2` at the top of every file). Key
 - **`typeinfo`:** `typeinfo trait_name(type<T>)` — trait name outside parens
 - **`static_if`:** `static_if (condition) { ... }` — parentheses required
 - **Type function call:** `take(type<int>, 1, 2)` — NOT `take < int > (1, 2)`
-- **Newlines inside `(...)`, `[...]`, `{...}` are free** — long pipe chains, multi-arg calls, array/table literals can wrap freely. Statement-level (no surrounding bracket) still requires one statement per line, so wrap the RHS in `(...)` if a `let x = a |> b |> c` needs to break across lines
+- **Newlines inside `(...)`, `[...]`, `{...}` are free** — long pipe chains, multi-arg calls, array/table literals can wrap freely. Statement-level (no surrounding bracket) still requires one statement per line, so wrap the RHS in `(...)` if a `let x = a |> b |> c` needs to break across lines. **DANGER — silent, no error:** without the parens, a continuation line starting with a *unary-capable* operator (`+`, `-`) parses as a separate statement — `+ b` is unary plus, pure, so the optimizer **silently deletes it**. `let x = a` ⏎ `+ b` ⏎ `+ c` becomes just `let x = a` (the `+ b`/`+ c` lines vanish) — wrong result, no diagnostic (verified: `x` is `a`, not `a+b+c`). A non-unary operator like `|> f()` can't begin a statement, so it errors loudly instead — it's `+`/`-` that bite silently. Always wrap a multi-line arithmetic RHS in `(...)`
 - **Inline literals over temp-var-and-push** — for short arrays consumed in one expression, write `stack([a, b, c])` rather than `var xs : array<T>; xs |> emplace(a); xs |> emplace(b); stack(xs)`. Faster in interpreted mode and easier to read; same applies to table literals and other bracketed constructors. Threshold: while it stays readable
 
 ### Type modifiers

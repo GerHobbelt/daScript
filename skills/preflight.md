@@ -123,14 +123,14 @@ cmake -B build -DDAS_HV_DISABLED=OFF -DDAS_LLVM_DISABLED=OFF -DDAS_AUDIO_DISABLE
 
 | CI step | Local mirror | Notes |
 |---|---|---|
-| dasgen freshness | `<daslang> dasgen/gen_bind.das` then `git diff --exit-code -- include/daScript/builtin/` | regen + commit if dirty; see `skills/visitor_gen_bind.md` |
+| dasgen freshness | `<daslang> utils/dasgen/gen_bind.das` then `git diff --exit-code -- include/daScript/builtin/` | regen + commit if dirty; see `skills/visitor_gen_bind.md` |
 | Run examples | `cmake --build build --config Release --target run_examples` | |
 | Utils tests | `cmake --build build --config Release --target run_utils_tests` | |
 | Tutorial dry-runs | `cmake --build build --config Release --target dry_run_tutorials` | catches compile rot in `tutorials/` — run after daslib API changes |
 | Standalone exes | `cmake --build build --config Release --target all_utils_exe`, plus `<daslang> -exe -output bin/das-fmt utils/das-fmt/dasfmt.das` and `... bin/das-lint utils/lint/main.das` | `-exe` needs dasLLVM + lld-link on PATH |
 | Sequence smoke | Windows: `pwsh examples/games/sequence/ci_smoke_test.ps1 "$(pwd)"`; linux/mac: `bash examples/games/sequence/ci_smoke_test.sh "$(pwd)"` | build the runtime modules first: `cmake --build build --config Release --target dasModuleGlfw dasModuleLiveHost dasModuleHV dasModuleAudio dasModulePUGIXML dasModuleStbImage`. **This is the only pre-merge lane that compiles GLFW-gated `.das` like dasOpenGL** — run it for type-system / daslib-generics changes |
-| Formatter `--verify` | the pre-push hook runs it exactly (tracked files via `--files-from`); manual: `<daslang> utils/das-fmt/dasfmt.das -- --path ./ --verify` | name trap: a locally built `bin/Release/das-fmt.exe` is the **v1→v2 converter** (`utils/dasFormatter/`), not the formatter — CI overwrites its copy with an `-exe`-compiled `dasfmt.das` before verifying |
-| Lint changed `.das` | the pre-push hook, or `git diff --name-only origin/master..HEAD -- '*.das' \| xargs <daslang> utils/lint/main.das -- --quiet` | zero warnings required |
+| Formatter `--verify` | preflight's `format` gate runs it exactly (tracked files via `--files-from`); manual: `<daslang> utils/das-fmt/dasfmt.das -- --path ./ --verify` | name trap: a locally built `bin/Release/das-fmt.exe` is the **v1→v2 converter** (`utils/dasFormatter/`), not the formatter — CI overwrites its copy with an `-exe`-compiled `dasfmt.das` before verifying |
+| Lint changed `.das` | preflight's `lint` gate, or `git diff --name-only origin/master..HEAD -- '*.das' \| xargs <daslang> utils/lint/main.das -- --quiet` | zero warnings required |
 | daslang_static sweep | `cmake --build build --config Release --target daslang_static`, then `bin/Release/daslang_static.exe dastest/dastest.das -- --color --failures-only --test tests` | rarely built locally; catches static-registration / no-dynamic-modules divergence |
 | Ser/deser sweep | `<daslang> dastest/dastest.das -- --test tests --ser serialized.bin` then `... --deser serialized.bin` | run after touching AST serialization (`ast_serializer.cpp`, flag-bit additions) |
 | MCP tools test | `<daslang> dastest/dastest.das -- --color --failures-only --test utils/mcp/test_tools.das` | linux-only in CI but runs anywhere; MCP signature changes break it silently — run after editing `utils/mcp/` |

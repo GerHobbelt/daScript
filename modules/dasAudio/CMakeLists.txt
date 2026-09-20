@@ -11,6 +11,16 @@ IF ((NOT DAS_AUDIO_INCLUDED) AND ((NOT ${DAS_AUDIO_DISABLED}) OR (NOT DEFINED DA
 	FetchContent_Populate(miniaudio)
 
 	SET(DAS_AUDIO_DIR ${PROJECT_SOURCE_DIR}/modules/dasAudio)
+
+	# Make miniaudio's emscripten WebAudio backend memory64-aware: route the
+	# device / intermediary-buffer pointers it passes to its _ma_*__webaudio wasm
+	# exports through a BigInt-on-wasm64 / identity-on-wasm32 helper. Without this
+	# a -sMEMORY64=1 build throws "Cannot convert <n> to a BigInt" every audio
+	# buffer (fatal). Idempotent; a no-op on wasm32. See patches/.
+	execute_process(COMMAND ${CMAKE_COMMAND}
+		-DMINIAUDIO_H=${miniaudio_SOURCE_DIR}/miniaudio.h
+		-P ${DAS_AUDIO_DIR}/patches/miniaudio_memory64.cmake)
+
 	SET(AUDIO_INCLUDE_DIR ${DAS_AUDIO_DIR}/src ${miniaudio_SOURCE_DIR})
 	SET(CIPIC_HRTF_INCLUDE_DIR ${DAS_AUDIO_DIR}/cipic-hrtf/include)
 	SET(CIPIC_HRTF_SOURCE_DIR ${DAS_AUDIO_DIR}/cipic-hrtf/source)
@@ -70,6 +80,10 @@ IF ((NOT DAS_AUDIO_INCLUDED) AND ((NOT ${DAS_AUDIO_DISABLED}) OR (NOT DEFINED DA
 	ADD_MODULE_DAS(strudel strudel strudel_time)
 	ADD_MODULE_DAS(strudel strudel strudel_pattern)
 	ADD_MODULE_DAS(strudel strudel strudel_synth)
+	ADD_MODULE_DAS(strudel strudel strudel_sfx)
+	ADD_MODULE_DAS(strudel strudel strudel_sfxr)
+	ADD_MODULE_DAS(strudel strudel strudel_modal)
+	ADD_MODULE_DAS(strudel strudel strudel_scales)
 	ADD_MODULE_DAS(strudel strudel strudel_scheduler)
 	ADD_MODULE_DAS(strudel strudel strudel_mini)
 	ADD_MODULE_DAS(strudel strudel strudel_samples)

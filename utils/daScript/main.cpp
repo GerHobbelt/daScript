@@ -278,6 +278,10 @@ namespace {
     // GLFW window at a time, so a new run must tear the previous one down first.
     WebLoop * g_activeWebLoop = nullptr;
 
+    // Mirror of main()'s dumpLeaks (-no-dump-leaks), so the post-shutdown leak check
+    // in stop_browser_loop respects the same flag as the end-of-callMain dump.
+    bool g_webloop_dump_leaks = true;
+
     // Stop the active loop: cancel its main loop, run its shutdown() (which
     // destroys the GLFW window + glfwTerminate — without this the next program's
     // glfwCreateWindow aborts "only supports one window at a time"), free the
@@ -291,7 +295,18 @@ namespace {
             loop->ctx->evalWithCatch(loop->shutdownFn, nullptr);
             loop->ctx->getException();   // swallow — teardown is best-effort
         }
-        delete loop;
+        delete loop;   // drops the Context shared_ptr -> Context + its objects freed
+        // Real leak check for browser-loop programs: now that the program has ended
+        // and shutdown() ran, report any JobStatus/Channel/LockBox the program failed
+        // to free. (The end-of-callMain dump in main() is skipped while a loop is live
+        // — at that point the program is still running and its objects are in use.)
+        // Honors -no-dump-leaks via g_webloop_dump_leaks.
+        if ( g_webloop_dump_leaks ) {
+            if ( uint64_t n = JobStatus::CountJobQueLeaks() ) {
+                tout << "JobQue leak after browser-loop shutdown: " << n << "\n";
+                JobStatus::DumpJobQueLeaks();
+            }
+        }
     }
 
     void web_loop_tick ( void * arg ) {
@@ -553,6 +568,7 @@ void print_help() {
         << "    -project <path.das_project> path to project file\n"
         << "    -project_root <path> root directory of the project (used for dyn modules)\n"
         << "    -load_module <path> directly load a single dynamic-module folder (the one containing .das_module); repeatable. Bypasses the project_root/modules/<name> scan and shadows same-basename entries from dasroot/project_root.\n"
+        << "    --disable-module <name> never load/register the named dynamic module (case-insensitive folder match); repeatable. Keeps a native-only module (e.g. dashv) out of a wasm cross-compile so a guarded `require ?name` resolves as absent.\n"
         << "    -run-fmt    <-i/-d> <-v2/-v1> {--semicolon} run formatter\n"
         << "    -log        output program code\n"
         << "    -pause      pause after errors and pause again before exiting program\n"
@@ -644,6 +660,7 @@ int MAIN_FUNC_NAME ( int argc, char * argv[] ) {
     bool dumpLeaks = true;
     string project_root;
     vector<string> load_modules;
+    vector<string> disabled_modules;
     optional<format::FormatOptions> formatter;
     for ( int i=1; i < argc; ++i ) {
         if ( argv[i][0]=='-' ) {
@@ -734,6 +751,14 @@ int MAIN_FUNC_NAME ( int argc, char * argv[] ) {
                     return -1;
                 }
                 load_modules.push_back(argv[i + 1]);
+                i++;
+            } else if ( cmd=="-disable-module" ) {
+                if ( i+1 >= argc ) {
+                    printf("--disable-module requires module-name argument\n");
+                    print_help();
+                    return -1;
+                }
+                disabled_modules.push_back(argv[i + 1]);
                 i++;
             } else if ( cmd=="run-fmt" ) {
                 formatter.emplace();
@@ -877,7 +902,7 @@ int MAIN_FUNC_NAME ( int argc, char * argv[] ) {
         daScriptEnvironment::ensure();
         project_root = deduce_project_root(project_root, files.front());
         auto access = get_file_access((char*)(projectFile.empty() ? nullptr : projectFile.c_str()));
-        require_dynamic_modules(access, getDasRoot(), project_root, load_modules, tout);
+        require_dynamic_modules(access, getDasRoot(), project_root, load_modules, disabled_modules, tout);
     }
     #endif
     Module::Initialize();
@@ -892,6 +917,9 @@ int MAIN_FUNC_NAME ( int argc, char * argv[] ) {
         return -1;
     }
 
+#ifdef __EMSCRIPTEN__
+    g_webloop_dump_leaks = dumpLeaks;   // stop_browser_loop's leak check honors -no-dump-leaks
+#endif
     for ( auto & fn : files ) {
         replace(fn, "_dasroot_", getDasRoot());
         int rc = compile_and_run(fn, mainName, outputProgramCode, dryRun, compileOnly);
@@ -901,10 +929,25 @@ int MAIN_FUNC_NAME ( int argc, char * argv[] ) {
     }
     // and done
     if ( pauseAfterDone ) getchar();
+#ifdef __EMSCRIPTEN__
+    // A browser main-loop (update/init/shutdown program) keeps running after
+    // callMain returns — its Context, JobStatus and smart_ptrs are legitimately
+    // still alive (freed when the loop ends, via stop_browser_loop, which runs its
+    // own leak check). Module::Shutdown still runs (its per-run cleanup is needed
+    // for the next program to start cleanly), but with leak reporting off; then we
+    // return before the end-of-run JobStatus/smart_ptr dump + exit(1), which assume
+    // the program is finished and would flag every in-use object as "leaked".
+    const bool browserLoopActive = ( g_activeWebLoop != nullptr );
+#else
+    const bool browserLoopActive = false;
+#endif
     // Handle-leak dump runs inside Module::Shutdown, between module
     // destruction (drains job threads) and DLL unload (invalidates the
     // dumpHandleLeaks<T> function pointers registered from shared modules).
-    Module::Shutdown(dumpLeaks);
+    Module::Shutdown(dumpLeaks && !browserLoopActive);
+    if ( browserLoopActive ) {
+        return exitCode;
+    }
     if ( dumpLeaks ) {
         JobStatus::DumpJobQueLeaks();
     }
