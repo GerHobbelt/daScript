@@ -3,9 +3,9 @@ options rtti = true
 // docs describe the SOURCE API: splices legitimately rewrite ctor bodies, method
 // shapes, and describe() output, which would rename hash-keyed doc files per run
 options auto_inline_functions = false
-options _no_tune = true   // documentation compile — no [tune_policy] auto-tune / restart guards
 
 require daslib/fio
+require clipboard/clipboard
 require daslib/rtti
 require daslib/ast
 require math
@@ -141,7 +141,7 @@ require strudel/strudel_sf2_voice
 require strudel/strudel_pattern
 require spirv/spirv_reflect
 require dasllama/dasllama
-require llvm/daslib/llvm_tune   // [tune_policy]: doc generation never runs kernels — no auto-tune
+require llvm/daslib/llvm_tune   // documentation context keeps [tune] fully inert
 
 def document_module_math(_root : string) {
     var mod = get_module("math")
@@ -186,7 +186,7 @@ get_value|insert_clone|emplace_new|insert_default|emplace_default|get_with_defau
         group_by_regex("16/8-bit lattice converts", mod, %regex~(short2_sat|short3_sat|short4_sat|ushort2_sat|ushort3_sat|ushort4_sat|byte2_sat|byte3_sat|byte4_sat|byte8_sat|ubyte2_sat|ubyte3_sat|ubyte4_sat|ubyte8_sat|half8_lo|half8_hi)$%%),
         group_by_regex("GC0 infrastructure", mod, %regex~gc0%%),
         group_by_regex("Smart ptr infrastructure", mod, %regex~(add_ptr_ref|smart_ptr|get_const_ptr|move|move_new|get_ptr$)%%),
-        group_by_regex("Macro infrastructure", mod, %regex~(is_folding|is_compiling|is_in_completion|is_in_lint_check|is_reporting_compilation_errors)%%),
+        group_by_regex("Macro infrastructure", mod, %regex~(is_folding|is_compiling|is_in_completion|is_in_lint_check|is_building_documentation|is_reporting_compilation_errors)%%),
         group_by_regex("Profiler", mod, %regex~(profile|reset_profiler|dump_profile_info|collect_profile_info)$%%),
         group_by_regex("System infrastructure", mod, %regex~(panic|print|feint|sprint|sprint_json|sscan_json|to_log|to_compiler_log|error|terminate|breakpoint|stackwalk|get_stackwalk|get_das_root|get_das_version|is_in_aot|aot_enabled|is_intern_strings|is_safe_hash|eval_main_loop|shared_module_extension)$%%),
         group_by_regex("Memory manipulation", mod, %regex~(intptr|memcmp|variant_index|set_variant_index|hash|memcpy|lock_data|map_to_array|map_to_ro_array)$%%),
@@ -219,10 +219,19 @@ def document_module_fio(_root : string) {
         group_by_regex("Directory manipulation", mod, %regex~(dir|dir_rec|mkdir|mkdir_rec|mkdir_result|rmdir|rmdir_rec|rmdir_rec_result|rmdir_result|chdir|getcwd)$%%),
         group_by_regex("Glob and pattern matching", mod, %regex~(match_glob|glob|glob_filtered|is_glob_pattern|expand_glob|parse_file_list)$%%),
         group_by_regex("Filesystem queries", mod, %regex~(temp_directory|temp_directory_result|create_temp_file|create_temp_file_result|create_temp_directory|create_temp_directory_result|disk_space)$%%),
-        group_by_regex("OS specific routines", mod, %regex~(sleep|exit|system|popen|popen_binary|popen_timeout|popen_argv|popen_argv_pipe|popen_timed_out|run_and_capture|get_env_variable|sanitize_command_line|has_env_variable)$%%),
+        group_by_regex("OS specific routines", mod, %regex~(sleep|exit|system|popen|popen_binary|popen_timeout|spawn_argv|popen_argv|popen_argv_pipe|popen_timed_out|run_and_capture|get_env_variable|sanitize_command_line|has_env_variable)$%%),
         group_by_regex("Dynamic modules", mod, %regex~(register_dynamic_module|register_native_path)$%%)
     )
     documents("File input output library", mod, "fio.rst", groups)
+}
+
+def document_module_clipboard(_root : string) {
+    var mod = [get_module("clipboard_core"), find_module("clipboard")]
+    var groups <- array<DocGroup>(
+        hide_group(group_by_regex("Internal clipboard functions", mod, %regex~^_clipboard_%%)),
+        group_by_regex("UTF-8 system clipboard", mod, %regex~^clipboard_%%)
+    )
+    documents("System clipboard", mod, "clipboard.rst", groups)
 }
 
 def document_module_random(_root : string) {
@@ -1772,9 +1781,9 @@ def document_module_gltf(_root : string) {
     documents("glTF 2.0 loader (dasGLTF): GLB/.gltf parse, accessor decode, node hierarchy, skinning and keyframe animation into a backend-neutral scene", mod, "gltf.rst", groups)
 }
 
-// fallback: das2rst compiles dasllama to document it but never RUNS its kernels — an
-// untuned box must not trigger the minutes-long auto-tune here
-[export, tune_policy(missing = "fallback")]
+// das2rst compiles tuned libraries to inspect their source API. The explicit
+// documentation context keeps all [tune] transforms and policy machinery inert.
+[export]
 def main {
     disable_profiler(this_context())
     disable_profiler_log(this_context())
@@ -1784,6 +1793,7 @@ def main {
     document_module_builtin(root)
     document_module_math(root)
     document_module_fio(root)
+    document_module_clipboard(root)
     document_module_network(root)
     document_module_dashv(root)
     document_module_openai(root)

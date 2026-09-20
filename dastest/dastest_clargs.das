@@ -21,6 +21,9 @@ struct DastestArgs {
     @clarg_doc = "Print the top N slowest test files and highlight statistical timing outliers (above mean + 2x stddev)"
     timing_outliers : int = 0
 
+    @clarg_doc = "Fail the suite when any completed test file takes longer than this many seconds. If 0, the limit is disabled"
+    max_file_time : float = 0.0
+
     @clarg_doc = "Path to write the JSON test results report to"
     json_file : string
 
@@ -33,7 +36,7 @@ struct DastestArgs {
     @clarg_doc = "Project file. Will be used to compile given tests"
     test_project : string
 
-    @clarg_doc = "Number of threads to use in isolated mode; defaults to 2x the number of hardware threads when 0"
+    @clarg_doc = "Number of threads to use in isolated mode; 0 uses a conservative hardware rule for JIT and 2x hardware threads otherwise"
     isolated_mode_threads : int
 
     @clarg_doc = "Files per worker subprocess in isolated mode (semi-isolated sharding). 1 (default) = one process per test (full isolation). >1 amortizes process/compile cold-start across a batch; a crash in a batch is auto-recovered by re-running the remainder one-per-process"

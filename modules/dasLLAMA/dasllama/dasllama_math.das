@@ -1451,45 +1451,58 @@ var g_repack_mx4 = @@repack_mx4_identity     // no-op until a repack backend is 
 var g_repack_kq = @@repack_kq_identity       // no-op until a kq-capable backend is selected
 
 // ===== MoE GPU tier (per-layer expert offload) =====
-// A GPU tier (dasllama_math_vulkan) installs a region-list GEMV override plus a weight-stack
-// upload hook; the loader and moe_experts_apply route layers >= g_moe_gpu_from_layer through
+// A GPU tier (dasllama_math_vulkan) installs a fused MoE FFN override plus a weight-stack
+// upload hook; the loader and the MoE dispatches route layers >= g_moe_gpu_from_layer through
 // them. Hooks live HERE (not in dasllama_common) so the engine never names a GPU symbol — the
-// dasVulkan package is optional. Weights cross as llama.cpp block_q8_0 bytes (f16 scale +
-// 32 int8 quants, 34 B per block) gathered from the PREPARED planes by the loader
-// (moe_gpu_upload_resident), so the tier never sees a CPU plane layout. The GEMV override
-// resolves weight regions purely by element offset (the same offs values the loader uploaded),
-// so it needs no host plane pointers.
-typedef MoeGpuGroupNFn = function<(var yp : float?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n : int64; d : int64) : void>
-typedef MoeGpuGroupN2Fn = function<(var y1p : float?; var y2p : float?; offs1 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n : int64; d : int64) : void>
-typedef MoeGpuUploadFn = function<(wq : uint8 const?; ws : uint8 const?; woff : int64; n : int64; rows : int64) : bool>
+// dasVulkan package is optional. Weights cross as row-major planes gathered from the PREPARED
+// planes by the loader (moe_gpu_upload_resident) — q8 stacks as int8 quants + f16 halfword
+// scales, native K-quant stacks (fmt = int(KqFmt), k4/k5/k6) as superblock quant payloads +
+// decoded 20B scale rows — so the tier never sees a CPU plane layout. The FFN override resolves
+// weight regions purely by element offset (the same offs values the loader uploaded), so it
+// needs no host plane pointers.
+//
+// offs1/offs3/offs2 are gate/up/down region TRIPLES (weight element offset, first row, row
+// count — the three lists share row ranges, which partition [0, nrows)); x is the row-major
+// gathered activation image — nrows x n quants + per-32 scales (q8 stacks) or the Q8_K form,
+// per-256 scales (kq stacks; the tier resolves which from the uploaded stack format). The whole
+// gate+up -> act -> requant -> down chain runs device-side; gout returns nrows x n floats.
+// is_gelu picks GeGLU over SwiGLU (swiglu_oai belongs to biased arches the callers exclude).
+// f1/f3/f2 (and the cls fmt) ride along because weight element offsets are PER-FORMAT plane
+// spaces (q8 qblob vs the k4/k5/k6 planes) — a bare offset is ambiguous across formats (a k4
+// gate and a k5 down can share the numeric range), so the tier resolves stacks by (fmt, offset).
+typedef MoeGpuFfnFn = function<(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n : int64; nfe : int64; nrows : int64; f1 : int; f3 : int; f2 : int; is_gelu : bool) : void>
+typedef MoeGpuUploadFn = function<(wq : uint8 const?; ws : uint8 const?; woff : int64; n : int64; rows : int64; fmt : int; stream : bool) : bool>
+typedef MoeGpuClsFn = function<(var yp : float?; woff : int64; xqp : int8 const?; xsp : float const?; n : int64; d : int64; fmt : int) : void>
 
-[unused_argument(yp, offs, nregions, xqp, xsp, n, d)]
-def private moe_gpu_unset_groupn(var yp : float?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, d : int64) {
-    panic("dasLLAMA: MoE GPU dispatch hit without an installed GPU tier")
+[unused_argument(goutp, offs1, offs3, offs2, nregions, xqp, xsp, n, nfe, nrows, f1, f3, f2, is_gelu)]
+def private moe_gpu_unset_ffn(var goutp : float?; offs1 : int64 const?; offs3 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, nfe, nrows : int64; f1, f3, f2 : int; is_gelu : bool) {
+    panic("dasLLAMA: MoE GPU FFN dispatch hit without an installed GPU tier")
 }
 
-[unused_argument(y1p, y2p, offs1, offs2, nregions, xqp, xsp, n, d)]
-def private moe_gpu_unset_groupn2(var y1p : float?; var y2p : float?; offs1 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, d : int64) {
-    panic("dasLLAMA: MoE GPU pair dispatch hit without an installed GPU tier")
-}
-
-[unused_argument(wq, ws, woff, n, rows)]
-def private moe_gpu_unset_upload(wq : uint8 const?; ws : uint8 const?; woff : int64; n : int64; rows : int64) : bool {
+[unused_argument(wq, ws, woff, n, rows, fmt, stream)]
+def private moe_gpu_unset_upload(wq : uint8 const?; ws : uint8 const?; woff : int64; n : int64; rows : int64; fmt : int; stream : bool) : bool {
     return false
 }
 
-var g_moe_gpu_groupn = @@moe_gpu_unset_groupn
-var g_moe_gpu_groupn2 = @@moe_gpu_unset_groupn2
+[unused_argument(yp, woff, xqp, xsp, n, d, fmt)]
+def private moe_gpu_unset_cls(var yp : float?; woff : int64; xqp : int8 const?; xsp : float const?; n, d : int64; fmt : int) {
+    panic("dasLLAMA: GPU classifier dispatch hit without an installed GPU tier")
+}
+
+var g_moe_gpu_ffn = @@moe_gpu_unset_ffn
 var g_moe_gpu_upload = @@moe_gpu_unset_upload
+var g_moe_gpu_cls = @@moe_gpu_unset_cls
 var g_moe_gpu_installed = false
 var g_moe_gpu_layer_count = 0l         // K = layers offloaded from the END (env-driven, set by the tier)
 var g_moe_gpu_from_layer = 1000000l    // first offloaded layer (n_layers - K, set by the loader)
+var g_moe_gpu_cls_off = -1l            // element offset of the resident classifier plane (loader contract)
+var g_moe_gpu_stream_from = 1000000l   // first STREAMED layer (streamed range = [stream_from, from_layer))
 
 //! Install the GPU MoE tier (a GPU backend calls this at [init] when its device probe passes).
-def public install_moe_gpu_tier(groupn : MoeGpuGroupNFn; groupn2 : MoeGpuGroupN2Fn; upload : MoeGpuUploadFn) {
-    g_moe_gpu_groupn = groupn
-    g_moe_gpu_groupn2 = groupn2
+def public install_moe_gpu_tier(ffn : MoeGpuFfnFn; upload : MoeGpuUploadFn; cls : MoeGpuClsFn) {
+    g_moe_gpu_ffn = ffn
     g_moe_gpu_upload = upload
+    g_moe_gpu_cls = cls
     g_moe_gpu_installed = true
 }
 
@@ -1510,88 +1523,62 @@ def public moe_gpu_layer_on_gpu(l : int64) : bool {
     return g_moe_gpu_installed && l >= g_moe_gpu_from_layer
 }
 
-//! Upload one Q8 weight stack ([rows x n] at element offset woff) as the GPU tier's row-major
-//! planes — int8 quants + f16 halfword scales; false = tier absent or VRAM budget hit.
-def public moe_gpu_upload_stack(wq : array<uint8> | #; ws : array<uint8> | #; woff : int64; n, rows : int64) : bool {
+//! Loader contract: first streamed layer (streamed range = [from, the resident set); reset per
+//! load). Streamed layers keep their CPU planes — only PREFILL batches dispatch on the GPU,
+//! the expert stacks DMA-streamed from pinned host mirrors; decode stays on the CPU.
+def public set_moe_gpu_stream_from(from_layer : int64) {
+    g_moe_gpu_stream_from = from_layer
+}
+
+def public moe_gpu_layer_streamed(l : int64) : bool {
+    return g_moe_gpu_installed && l >= g_moe_gpu_stream_from && l < g_moe_gpu_from_layer
+}
+
+//! Loader contract: the resident classifier plane's element offset (-1 = none; reset per load).
+def public set_moe_gpu_cls_off(woff : int64) {
+    g_moe_gpu_cls_off = woff
+}
+
+def public moe_gpu_cls_on_gpu(woff : int64) : bool {
+    return g_moe_gpu_installed && woff == g_moe_gpu_cls_off
+}
+
+//! Upload one weight stack ([rows x n] at element offset woff) as the GPU tier's row-major
+//! planes — q8 (fmt 0): int8 quants + f16 halfword scales; native K-quant (fmt = int(KqFmt)
+//! k4/k5/k6): superblock quant payloads + decoded 20B scale rows. stream = keep in a pinned
+//! host mirror for per-prefill DMA streaming instead of resident VRAM. false = tier absent or
+//! VRAM budget hit.
+def public moe_gpu_upload_stack(wq : array<uint8> | #; ws : array<uint8> | #; woff : int64; n, rows : int64; fmt : int; stream : bool = false) : bool {
     if (!g_moe_gpu_installed) {
         return false
     }
     unsafe {
-        return invoke(g_moe_gpu_upload, addr<uint8 const?>(wq[0]), addr<uint8 const?>(ws[0]), woff, n, rows)
+        return invoke(g_moe_gpu_upload, addr<uint8 const?>(wq[0]), addr<uint8 const?>(ws[0]), woff, n, rows, fmt, stream)
     }
 }
 
-//! Region-list GEMV on the GPU tier — the MoE dispatch twin of matmul_q8q8_groupn for offloaded layers.
-def public matmul_q8q8_moe_gpu(var y : array<float>; offs : array<int64>; nregions : int64;
-                               xq : array<int8>; xs : array<float>; n, d : int64) {
+//! Fused MoE FFN on the GPU tier — the whole gate+up -> act -> requant -> down chain of the
+//! routed experts in one device-side dispatch chain (decode row counts and prefill batches
+//! alike; the tier chunks internally, so any nrows serves). gout is nrows x n floats. xq/xs is
+//! the gathered activation image in the layer's own form — q8_0 per-32 scales for q8 stacks,
+//! Q8_K per-256 for kq stacks (the tier resolves which from the uploaded stack format).
+def public matmul_moe_gpu_ffn(var gout : array<float>; offs1 : array<int64>; offs3 : array<int64>; offs2 : array<int64>;
+                              nregions : int64; xq : array<int8>; xs : array<float>; n, nfe, nrows : int64;
+                              f1, f3, f2 : int; is_gelu : bool) {
     unsafe {
-        invoke(g_moe_gpu_groupn, addr(y[0]),
-            addr<int64 const?>(offs[0]), nregions,
-            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, d)
+        invoke(g_moe_gpu_ffn, addr(gout[0]),
+            addr<int64 const?>(offs1[0]), addr<int64 const?>(offs3[0]), addr<int64 const?>(offs2[0]), nregions,
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, nfe, nrows, f1, f3, f2, is_gelu)
     }
 }
 
-//! Fused gate+up region-list GEMV on the GPU tier — one submit covers both stacks (they read
-//! the same activation image; same n/d/region count, distinct weight offsets and outputs).
-def public matmul_q8q8_moe_gpu2(var y1 : array<float>; var y2 : array<float>; offs1 : array<int64>; offs2 : array<int64>;
-                                nregions : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
+//! Classifier GEMV on the GPU tier — y[d] = W · x over the resident plane at woff (one region
+//! covering the whole vocab). xq/xs is the activation vector in the plane's own quant form —
+//! q8_0 per-32 scales for a q8 plane, Q8_K per-256 for kq (the tier resolves which from the
+//! uploaded stack format).
+def public matmul_moe_gpu_cls(var y : array<float>; woff : int64; xq : array<int8>; xs : array<float>; n, d : int64; fmt : int) {
     unsafe {
-        invoke(g_moe_gpu_groupn2, addr(y1[0]), addr(y2[0]),
-            addr<int64 const?>(offs1[0]), addr<int64 const?>(offs2[0]), nregions,
-            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, d)
-    }
-}
-
-// The prefill twin: region-list batched GEMM over the same resident stacks. offs are the fused
-// prefill TRIPLES (weight element offset, first bucket row, row count — stride 3, row ranges
-// partition [0, nrows)); x is the gathered bucket-ordered activation image, y rows key by the
-// region's own row0. The tier chunks internally, so any nrows serves.
-typedef MoeGpuBatchFn = function<(var yp : float?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n : int64; d : int64; nrows : int64) : void>
-typedef MoeGpuBatch2Fn = function<(var y1p : float?; var y2p : float?; offs1 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n : int64; d : int64; nrows : int64) : void>
-
-[unused_argument(yp, offs, nregions, xqp, xsp, n, d, nrows)]
-def private moe_gpu_unset_batch(var yp : float?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, d, nrows : int64) {
-    panic("dasLLAMA: MoE GPU batch dispatch hit without an installed GPU batch tier")
-}
-
-[unused_argument(y1p, y2p, offs1, offs2, nregions, xqp, xsp, n, d, nrows)]
-def private moe_gpu_unset_batch2(var y1p : float?; var y2p : float?; offs1 : int64 const?; offs2 : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, d, nrows : int64) {
-    panic("dasLLAMA: MoE GPU batch pair dispatch hit without an installed GPU batch tier")
-}
-
-var g_moe_gpu_batch = @@moe_gpu_unset_batch
-var g_moe_gpu_batch2 = @@moe_gpu_unset_batch2
-var g_moe_gpu_batch_installed = false
-
-//! Install the GPU MoE prefill (batched GEMM) tier — optional alongside install_moe_gpu_tier.
-def public install_moe_gpu_batch_tier(batch : MoeGpuBatchFn; batch2 : MoeGpuBatch2Fn) {
-    g_moe_gpu_batch = batch
-    g_moe_gpu_batch2 = batch2
-    g_moe_gpu_batch_installed = true
-}
-
-def public moe_gpu_batch_ready : bool {
-    return g_moe_gpu_batch_installed
-}
-
-//! Region-list batched GEMM on the GPU tier — the MoE prefill twin of matmul_q8q8_moe_gpu.
-def public matmul_q8q8_moe_gpu_batch(var y : array<float>; offs : array<int64>; nregions : int64;
-                                     xq : array<int8>; xs : array<float>; n, d, nrows : int64) {
-    unsafe {
-        invoke(g_moe_gpu_batch, addr(y[0]),
-            addr<int64 const?>(offs[0]), nregions,
-            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, d, nrows)
-    }
-}
-
-//! Fused gate+up batched GEMM on the GPU tier — both stacks read the same gathered activation
-//! image; the regions share row0/cnt (distinct weight offsets and outputs).
-def public matmul_q8q8_moe_gpu_batch2(var y1 : array<float>; var y2 : array<float>; offs1 : array<int64>; offs2 : array<int64>;
-                                      nregions : int64; xq : array<int8>; xs : array<float>; n, d, nrows : int64) {
-    unsafe {
-        invoke(g_moe_gpu_batch2, addr(y1[0]), addr(y2[0]),
-            addr<int64 const?>(offs1[0]), addr<int64 const?>(offs2[0]), nregions,
-            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, d, nrows)
+        invoke(g_moe_gpu_cls, addr(y[0]), woff, addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, d, fmt)
     }
 }
 

@@ -16,6 +16,12 @@ host tool or module is missing report `SKIP` with an install/rebuild hint. The
 tables below remain the reference for what each gate mirrors and for running
 any step by hand.
 
+A complete `--full` run is Release-only and fails immediately for a Debug
+host. Debug may be used for intentional subset diagnosis with `--only` or
+`--skip`; it must never be substituted when a Windows MCP process locks the
+Release runtime DLL. Stop the worktree's `utils/mcp/main.das` host and rebuild
+Release instead — the MCP watcher restarts it.
+
 **Conventions.** `<daslang>` = your compiler binary: `bin/Release/daslang.exe`
 (Windows MSVC multi-config), `bin/daslang` (Ninja single-config — what CI's
 extended_checks uses on all three OSes), or `build/daslang` (Make/Ninja
@@ -51,10 +57,10 @@ pre-push check for AOT regressions outside tests/language — don't skip it.**
 
 | CI step | Local mirror | Notes |
 |---|---|---|
-| Interpreter sweep | `<daslang> dastest/dastest.das -- --color --failures-only --timeout 1800 --test tests` | |
-| JIT sweep | `<daslang> dastest/dastest.das -jit -- --jit-opt-level=3 --color --failures-only --isolated-mode --batch 4 --timeout 1800 --test tests` | isolated-PARALLEL (2×hw-thread workers, 4 files/batch, ~3× vs sequential, identical pass/fail set; CI's retry drops `--batch` for one-process-per-test). Windows-local `clang-cl` link failures are env noise — the catchable class is LLVM verifier errors; full end-to-end JIT needs WSL/mac. See `skills/make_pr.md` §2.5 for the 2-test smoke version |
+| Interpreter sweep | `<daslang> dastest/dastest.das -- --color --failures-only --max-file-time 30 --timeout 1800 --test tests` | Fails if any completed test file exceeds 30 seconds. |
+| JIT sweep | `<daslang> dastest/dastest.das -jit -- --jit-opt-level=3 --color --failures-only --max-file-time 30 --isolated-mode --batch 4 --timeout 1800 --test tests` | isolated-PARALLEL (2×hw-thread workers, 4 files/batch, ~3× vs sequential, identical pass/fail set; CI's retry drops `--batch` for one-process-per-test). Windows-local `clang-cl` link failures are env noise — the catchable class is LLVM verifier errors; full end-to-end JIT needs WSL/mac. See `skills/make_pr.md` §2.5 for the 2-test smoke version |
 | Small C++ tests | `ctest --test-dir build --build-config Release -L small --output-on-failure` | drop `--build-config` on single-config generators. **Run this after touching `tests-cpp/`** — and remember MSVC tolerates C++ that clang/gcc reject (the doctest bit-field incident); see `skills/writing_cpp_tests.md` |
-| AOT sweep (full) | `cmake --build build --config Release --target test_aot`, then `bin/Release/test_aot.exe -use-aot dastest/dastest.das -- --use-aot --color --failures-only --timeout 1800 --test tests` | nightly CI + manual `workflow_dispatch` only — this local mirror is the only pre-push gate for it |
+| AOT sweep (full) | `cmake --build build --config Release --target test_aot`, then `bin/Release/test_aot.exe -use-aot dastest/dastest.das -- --use-aot --color --failures-only --max-file-time 30 --timeout 1800 --test tests` | nightly CI + manual `workflow_dispatch` only — this local mirror is the only pre-push gate for it |
 | AOT subset gate | `cmake --build build --config Release --target test_aot_subset` (optionally `--target run_tests_aot_subset` to also sweep tests/language) | what per-PR CI lanes actually build (part of ALL) |
 | Debug lanes | `cmake --build build --config Debug --target daslang`, then the sweep against `bin/Debug/daslang.exe` — safe in-checkout: Debug coexists with Release by design (`bin/Debug/`, `_debug.shared_module` suffix) | Debug bypasses the fused interpreter permutations — a fix that lands only in the fused path passes Release everywhere and trips Debug; conversely fused-path bugs need Release. If you touched `src/simulate/simulate_fusion_*`, run both configs |
 | Sanitizer lanes (linux Release asan/tsan/ubsan) | WSL: `CC=clang CXX=clang++ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDAS_USE_SANITIZER=<asan\|tsan\|ubsan>`, then the JIT sweep on `tests/language` | not mirrorable on Windows/mac. CI applies LSan suppressions (`format_error`, `uriParseSingleUriA`, `uriMakeOwner`) — see the workflow's Test step |
@@ -157,7 +163,7 @@ workflow: `skills/make_pr.md` §4; conventions: `skills/documentation_rst.md`.
 
 | # | Gate | Local mirror |
 |---|---|---|
-| 1 | das2rst runs clean (positional handmade-doc validation panics on count mismatch) | `<daslang> doc/reflections/das2rst.das` — repeat until no panic |
+| 1 | das2rst runs clean (positional handmade-doc validation panics on count mismatch) | `<daslang> -documentation doc/reflections/das2rst.das` — repeat until no panic; the host policy keeps per-box transforms inert |
 | 2 | no `// stub` in handmade docs | `grep -rl '// stub' doc/source/stdlib/handmade/` → must be empty |
 | 3 | no `Uncategorized` sections | `grep -rl '^Uncategorized$' doc/source/stdlib/generated/` → must be empty; fix via `group_by_regex` in das2rst.das |
 | 4 | no untracked generated RST | `git ls-files --others --exclude-standard doc/source/stdlib/` → must be empty; `git add` the new files |
