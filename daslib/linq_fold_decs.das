@@ -16,7 +16,7 @@ require daslib/macro_boost
 require strings
 require daslib/linq_fold_common public
 
-// Hashed equi-join payload — feeds the per-pair `let resBindName = result(tupA,tupB)` bind used by both GroupBy's decs-join arm and `emit_decs_join`. The 2 consumers differ on whether the per-pair loop is the right granularity (GroupBy: yes; emit_decs_join keeps a bucket-length fast path for count-no-where).
+// Hashed equi-join payload — feeds the per-pair `let resBindName = result(tupA,tupB)` bind used by both GroupBy's decs-join arm and `emit_decs_join_impl`. The 2 consumers differ on whether the per-pair loop is the right granularity (GroupBy: yes; emit_decs_join_impl keeps a bucket-length fast path for count-no-where).
 struct DecsJoinShape {
     bridgeA, bridgeB : DecsBridgeShape?
     keyaLam, keybLam, resultLam : Expression?
@@ -27,8 +27,17 @@ struct DecsJoinShape {
 class DecsAdapter : SourceAdapter {
     bridge : DecsBridgeShape?
     tupName : string
-    def override kind() : AdapterKind {
-        return AdapterKind.k_decs
+    def override name_prefix() : string {
+        return "decs_"
+    }
+    def override has_own_loop_or_count_lane() : bool {
+        return true
+    }
+    def override const can_group_by() : bool {
+        return true
+    }
+    def override const can_join() : bool {
+        return true
     }
     def override emit_loop_or_count(var c : Captures; var ctx : EmitCtx; at : LineInfo) : Expression? {
         return emit_loop_or_count_lane_decs(bridge, tupName, c, ctx, at)
@@ -87,7 +96,7 @@ class DecsAdapter : SourceAdapter {
         }
         return new DecsAdapter(bridge = bridge, tupName = qn("decs_tup", at))
     }
-    def override emit_decs_join_hook(var c : Captures; var ctx : EmitCtx; at : LineInfo) : Expression? {
+    def override emit_join_hook(var c : Captures; var ctx : EmitCtx; at : LineInfo) : Expression? {
         return emit_decs_join_impl(bridge, c, ctx, at)
     }
     def override count_shortcut(opName : string; at : LineInfo) : Expression? {
@@ -133,8 +142,8 @@ class DecsAdapter : SourceAdapter {
 
 class DecsJoinAdapter : SourceAdapter {
     shape : DecsJoinShape
-    def override kind() : AdapterKind {
-        return AdapterKind.k_decs_join
+    def override name_prefix() : string {
+        return "djoin_"
     }
     def override bind_name(at : LineInfo) : string {
         return shape.resBindName

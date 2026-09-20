@@ -86,10 +86,9 @@ what would otherwise be many lookalike chains:
   Applied by ``collapse_chained_selects``, called from
   ``plan_zip``, ``plan_distinct``, ``plan_decs_distinct``,
   ``plan_reverse``, ``plan_decs_reverse``, ``plan_decs_join`` (also
-  ``collapse_chained_wheres`` per PR D2), and defensively from
-  ``plan_order_family`` / ``plan_decs_order_family``
-  (which don't currently accept any leading ``_select`` but would
-  inherit collapse if they ever did). Mirrors how chained ``_where``
+  ``collapse_chained_wheres`` per PR D2), and from
+  ``plan_order_family`` / ``plan_decs_order_family`` (which now accept
+  a leading ``_select`` — see the next bullet). Mirrors how chained ``_where``
   already compose via ``&&``. Composition takes the INNER lambda's
   structure (preserves param type), renames its bound param to a
   fresh ``qn("cs", at)`` name to avoid ``apply_template`` recursive
@@ -108,6 +107,21 @@ what would otherwise be many lookalike chains:
   ``plan_loop_or_count``, ``plan_group_by_core``, and ``plan_decs_unroll``
   already handle chained selects natively via their ``intermediateBinds`` /
   chain-info machinery and don't need the pre-pass.
+
+- ``source |> _select(f) |> <order/distinct/take>`` — a leading ``_select(f)``
+  that projects the source is absorbed into the source walk. An optional leading
+  ``srcsel`` slot on the four ``wrap_source_loop``-based order rows
+  (``streaming_min`` / ``bounded_heap`` / ``order_then_plain_distinct`` /
+  ``fused_prefilter`` — not the source-direct ``buffer_helper_dispatch``)
+  captures the ``_select``; ``run_splice_adapter`` then wraps the source adapter
+  in ``ProjectedSourceAdapter`` (``linq_fold_common``), which binds
+  ``projName = f(rawElem)`` atop the per-element body and delegates
+  ``wrap_source_loop`` / ``wrap_invoke`` to the inner adapter. Every emit sees
+  ``f(rawElem)`` as the element with no emit-fn change, and XML field-pruning is
+  preserved (``f``'s ``it.<field>`` reads reach the inner materializer). Without
+  it the chain bails to tier-2 (materialize-all + sort-all); the bench m3f/m4
+  lanes hid the gap by pre-projecting their source array, the XML lane can't.
+  The slot is optional — chains with no leading ``_select`` are byte-identical.
 
 Source-side entry points
 ========================
@@ -214,9 +228,12 @@ Array-source patterns
    * - ``[._where(P)][._select(f)].reverse().take(N)._select(F).to_array()`` / ``.reverse()._select(F).first()``
      - ``plan_reverse`` R1-R4 (terminal ``_select`` on catch-all) / Rb (walk-and-overwrite scalar)
      - Catch-all path for chains with pre-reverse ``_where`` / ``_select`` (R6 doesn't accept those slots, cascades here). Projection runs ≤K times at return on the R1-R4 buffer or on the surviving ``last`` value. NOT accepted: ``reverse._select.take`` — user must reorder to ``reverse.take._select``.
-   * - ``each(arr).reverse()._distinct[_by](K).to_array()``
-     - ``plan_reverse`` (backward index walk + set-gate)
-     - Theme 8 (audit 2a). Array source only. Walks source backward via index (``arr[len-1-k]``), maintains ``var rev_dset : table<...>`` and gates push by set-insert on the dedup key (or whole element for plain ``distinct``). LAST-per-key semantics preserved: backward walk picks first-seen-in-reversed-order = last-in-source occurrence, matching tier-2 ``reverse.distinct_by``. Saves cascade's ``reverse_to_array`` allocation AND second ``distinct_by_inplace`` pass. v1 implicit ``to_array`` only; pre-reverse ``_where`` / ``_select`` / ``take`` and non-array sources bail to cascade.
+   * - ``each(arr).reverse()._distinct[_by](K).to_array()`` (array source)
+     - ``plan_reverse`` R-2a (backward index walk + set-gate)
+     - Theme 8 (audit 2a). Array source only (``array_source`` predicate). Walks source backward via index (``arr[len-1-k]``), maintains ``var rev_dset : table<...>`` and gates push by set-insert on the dedup key (or whole element for plain ``distinct``). LAST-per-key semantics preserved: backward walk picks first-seen-in-reversed-order = last-in-source occurrence, matching tier-2 ``reverse.distinct_by``. Saves cascade's ``reverse_to_array`` allocation AND second ``distinct_by_inplace`` pass. v1 implicit ``to_array`` only; pre-reverse ``_where`` / ``_select`` / ``take`` bail to cascade. Non-array (forward) sources take R-2b below.
+   * - ``src.reverse()._distinct[_by](K).to_array()`` (XML / decs / iterator source)
+     - ``plan_reverse`` R-2b (forward keep-last table-overwrite)
+     - The exact complement of R-2a (``non_array_source`` predicate): forward-only sources have no random index for the backward walk. One forward pass OVERWRITES ``var rdb_tab : table<key; (seq, val)>`` per element (so the slot ends at the last forward occurrence + its monotonic seq), then sorts survivors by **descending seq** and emits — output-identical to R-2a (descending forward-index of each last occurrence). Source-generic via ``emit_terminator_lane`` + ``wrap_source_loop``: an XML source **defers** (``val`` is the ``xml_node`` handle; ``build_xml_row`` runs only for the K survivors, field-pruned to the key), while decs / iterator store the full element and still win single-pass over the cascade's reverse-buffer + second walk. Closes the decs ``m4`` cell for this shape (D6).
 
 Decs-source patterns
 ====================
@@ -250,8 +267,10 @@ identical — only the source iteration changes.
    to Array adapter via ``array_source`` — decs cascades to Row 3
    (``fused_prefilter``) which materializes the buffer, matching the
    imperative decs behavior. ``reverse |> distinct[_by]`` on decs
-   sources cascades to tier-2 (no decs equivalent of the array
-   backward-walk dset gate; deferred per masterplan D6).
+   sources now fuses via the source-generic R-2b forward keep-last row
+   (``emit_reverse_distinct_forward_keeplast``, gated ``non_array_source``)
+   — one table-overwrite emit shared by decs / XML / iterators, not a
+   parallel decs fn (closes masterplan D6).
 
    As of PR D3, the ``GroupBySourceAdapter`` shim (a parallel adapter
    used only by ``plan_group_by_core``) is gone — group_by's three

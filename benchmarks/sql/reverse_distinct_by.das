@@ -16,9 +16,10 @@ require sqlite/sqlite_linq
 // engine-defined order (group-key order, typically), while linq returns
 // reverse-source-order. Bench doesn't assert order; for deterministic ordering add
 // `_order_by` to the m1 chain.
-// Decs (m4) — splice gates on `array_source` predicate (linq_fold.das:3221), so the
-// arm is array-only. plan_decs_reverse has no backward-index analog (archetype walk
-// is forward-only). Closed by design — see sqlite_linq_gaps.md "decs scope".
+// Decs (m4) + XML fold (m5f) — the array backward-index walk is array-only (needs O(1) random
+// indexing), but the FORWARD keep-last splice (R-2b, emit_reverse_distinct_forward_keeplast) fuses
+// any forward source single-pass: OVERWRITE tab[key]=(seq,val) per element, sort survivors by
+// descending seq. decs stores the full element; XML defers to (seq, node) + build_xml_row per survivor.
 
 def run_m1(b : B?; n : int) {
     with_sqlite(":memory:") $(db) {
@@ -46,6 +47,61 @@ def run_m3f(b : B?; n : int) {
     }
 }
 
+// Decs (m4) — forward keep-last splice (R-2b): `reverse()` is forward over the archetype walk, so
+// the array-only backward-index walk doesn't apply; the table-overwrite emit fuses it single-pass.
+def run_m4(b : B?; n : int) {
+    fixture_decs(n)
+    b |> run("m4_decs_fold/{n}", n) {
+        unsafe {
+            let rows <- _fold(from_decs_template(type<DecsCar>).reverse()._distinct_by(_.brand).to_array())
+            b |> accept(rows)
+            if (empty(rows)) {
+                b->failNow()
+            }
+        }
+    }
+}
+
+// m5_xml lane: non-fold baseline — the same chain over from_xml_node, un-fused (tier-2 cascade).
+def run_m5(b : B?; n : int) {
+    let xml = fixture_xml_string(n)
+    parse_xml(xml) $(doc, ok) {
+        if (!ok) {
+            b->failNow()
+            return
+        }
+        b |> run("m5_xml/{n}", n) {
+            unsafe {
+                let rows <- (from_xml_node(doc.document_element, type<Car>) |> reverse() |> _distinct_by(_.brand) |> to_array())
+                b |> accept(rows)
+                if (empty(rows)) {
+                    b->failNow()
+                }
+            }
+        }
+    }
+}
+
+// m5f_xml_fold lane: fused _fold over from_xml_node.
+def run_m5f(b : B?; n : int) {
+    let xml = fixture_xml_string(n)
+    parse_xml(xml) $(doc, ok) {
+        if (!ok) {
+            b->failNow()
+            return
+        }
+        b |> run("m5f_xml_fold/{n}", n) {
+            unsafe {
+                let rows <- _fold(from_xml_node(doc.document_element, type<Car>).reverse()._distinct_by(_.brand).to_array())
+                b |> accept(rows)
+                if (empty(rows)) {
+                    b->failNow()
+                }
+            }
+        }
+    }
+}
+
 [benchmark]
 def reverse_distinct_by_m1(b : B?) {
     run_m1(b, 100000)
@@ -54,4 +110,19 @@ def reverse_distinct_by_m1(b : B?) {
 [benchmark]
 def reverse_distinct_by_m3f(b : B?) {
     run_m3f(b, 100000)
+}
+
+[benchmark]
+def reverse_distinct_by_m4(b : B?) {
+    run_m4(b, 100000)
+}
+
+[benchmark]
+def reverse_distinct_by_m5(b : B?) {
+    run_m5(b, 100000)
+}
+
+[benchmark]
+def reverse_distinct_by_m5f(b : B?) {
+    run_m5f(b, 100000)
 }

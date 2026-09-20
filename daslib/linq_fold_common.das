@@ -29,24 +29,32 @@ struct LinqCall {
 // See daslib/linq_fold.md for masterplan.
 
 // ===== Source adapter (class hierarchy) — see linq_fold.md "Module layout & adapter contract" =====
-// Abstract base + one subclass per data source. The 4 dispatch methods are the adapter contract;
-// transitional getters (arrayTop/arraySrcName) + kind() are removed once consumers move to subclass methods.
-enum AdapterKind {
-    k_array
-    k_decs
-    k_decs_join
-    k_zip
-    k_array_join
-    k_xml
-}
+// Abstract base + one subclass per data source. Sources answer capability questions about themselves
+// (can_*/name_prefix) — no central source enum, so a new source only implements the methods.
 
 [macro_interface]
 class SourceAdapter {
-    def abstract kind() : AdapterKind
     def abstract bind_name(at : LineInfo) : string
     def abstract element_type() : TypeDeclPtr
     def abstract wrap_source_loop(var body : Expression?; at : LineInfo) : Expression?
     def abstract wrap_invoke(var stmts : array<Expression?>; retType : TypeDeclPtr; wrapIter : bool; at : LineInfo) : Expression?
+    // Capability queries — the source answers about itself; no central source enum to extend. Defaults
+    // are the conservative answer (no fast path); the owning source overrides.
+    def can_reserve_by_length() : bool {        // O(1) length known → planners pre-reserve buffers
+        return false
+    }
+    def has_own_loop_or_count_lane() : bool {   // emits loop_or_count itself (via emit_loop_or_count) instead of the array lane; a null hook result then bails to tier-2 rather than falling through
+        return false
+    }
+    def const can_group_by() : bool {           // supports plan_group_by_core (the actual source loop + adapter come from build_group_by_adapter, which gates the join shape). const: queried from a predicate's const adapter
+        return false
+    }
+    def const can_join() : bool {               // supports the join_general splice (the source-specific emit comes from emit_join_hook, which gates the srcb shape). const: queried from a predicate's const adapter
+        return false
+    }
+    def name_prefix() : string {                // gensym prefix keeping hoisted names per-source distinct in plan_group_by_core
+        return ""
+    }
     // Per-operation source-specific emit hooks. Default null = "this source has no special path here";
     // the dispatcher falls back to its inline (array) body. Overridden by the source that owns a path.
     def emit_loop_or_count(var c : Captures; var ctx : EmitCtx; at : LineInfo) : Expression? {
@@ -61,7 +69,23 @@ class SourceAdapter {
     def build_group_by_adapter(var c : Captures; var ctx : EmitCtx; at : LineInfo) : SourceAdapter? {
         return null
     }
-    def emit_decs_join_hook(var c : Captures; var ctx : EmitCtx; at : LineInfo) : Expression? {
+    def emit_join_hook(var c : Captures; var ctx : EmitCtx; at : LineInfo) : Expression? {
+        return null
+    }
+    // Deferred materialization (handle-buffering): a buffered reducer (order/take, distinct) holds a
+    // cheap `(key, handle)` surrogate and builds the full row only for the K survivors. Default = off;
+    // only sources whose iterator materializes every element (XML/json) override (see linq_fold.md).
+    def const defers_materialization() : bool {
+        return false
+    }
+    def handle_type() : TypeDeclPtr {                       // the surrogate's handle field type (e.g. xml_node)
+        return null
+    }
+    def current_handle_expr(at : LineInfo) : Expression? {  // handle for the element in scope inside wrap_source_loop's walk
+        return null
+    }
+    def materialize_handle(var handleExpr : Expression?; outBind : string; at : LineInfo) : Expression? {
+        // statement(s) that fill an already-declared `var <outBind> = default<rowType>` from the handle.
         return null
     }
     // Bare-count fast path (no chain/range ops): O(1)-ish count without an element walk.
@@ -75,6 +99,38 @@ class SourceAdapter {
     }
     def arraySrcName() : string {
         return ""
+    }
+}
+
+// Decorator adapter — absorbs a leading `_select(f)` source projection: binds `projName = f(innerBind)` atop
+// the per-element body and delegates loop/invoke to the inner adapter, so order/distinct fuse over
+// `source |> _select(f) |> <rest>` (XML field-pruning preserved — f's it.<field> reads reach the materializer).
+class ProjectedSourceAdapter : SourceAdapter {
+    inner     : SourceAdapter?
+    selectLam : Expression?
+    projType  : TypeDeclPtr
+    projName  : string
+    def override name_prefix() : string {
+        return inner->name_prefix()
+    }
+    def override bind_name(at : LineInfo) : string {
+        return projName
+    }
+    def override element_type() : TypeDeclPtr {
+        return clone_type(projType)
+    }
+    def override wrap_source_loop(var body : Expression?; at : LineInfo) : Expression? {
+        let innerBind = inner->bind_name(at)
+        var projExpr = peel_lambda_rename_var(selectLam, innerBind)
+        let pn = projName
+        var newBody = qmacro_block() {
+            let $i(pn) = $e(projExpr)
+            $e(body)
+        }
+        return inner->wrap_source_loop(newBody, at)
+    }
+    def override wrap_invoke(var stmts : array<Expression?>; retType : TypeDeclPtr; wrapIter : bool; at : LineInfo) : Expression? {
+        return inner->wrap_invoke(stmts, retType, wrapIter, at)
     }
 }
 
@@ -109,7 +165,7 @@ variant MatchResult {
     matched  : Captures
 }
 
-typedef RequiresPredicate = function<(var c : Captures; var top : Expression?) : bool>
+typedef RequiresPredicate = function<(var c : Captures; var top : Expression?; src : SourceAdapter?) : bool>
 
 // Fold-time context passed to every emit archetype. Carries the peeled source expression, source adapter, and the outer
 // `_fold(...)` expression's iterator-ness (drives `buffer_return` wrap so iterator-typed contexts wrap survivors with
@@ -268,7 +324,8 @@ def slot_matches_call(slot : Slot; call : ExprCall?; name : string; pattern_name
 
 def match_pattern(p : SplicePattern;
                   var calls : array<tuple<ExprCall?; LinqCall?>>;
-                  var top : Expression?) : MatchResult {
+                  var top : Expression?;
+                  src : SourceAdapter?) : MatchResult {
     var captures : Captures
     var slot_i = 0
     var call_i = 0
@@ -307,7 +364,7 @@ def match_pattern(p : SplicePattern;
     }
     if (call_i < length(calls)) return MatchResult(no_match = null)
     for (pred in p.requires) {
-        if (!invoke(pred, captures, top)) return MatchResult(no_match = null)
+        if (!invoke(pred, captures, top, src)) return MatchResult(no_match = null)
     }
     return MatchResult(matched <- captures)
 }
@@ -316,20 +373,36 @@ def match_pattern(p : SplicePattern;
 // produce `_localfunction_*` symbols the JIT pass can't resolve). Pattern rows wrap each with `@@<RequiresPredicate>`.
 // Starts minimal; grows with use per masterplan.
 
-[unused_argument(c)]
-def array_source(var c : Captures; var top : Expression?) : bool {
+// RequiresPredicates take the source `src` adapter (threaded from run_splice_adapter via match_pattern) so
+// source/capability gating asks the adapter (src->can_*()) rather than re-deriving the source kind here.
+[unused_argument(c, src)]
+def array_source(var c : Captures; var top : Expression?; src : SourceAdapter?) : bool {
     // top is already peel_each'd by the calling stub; verify it carries an array type. Naturally false for decs sources (`from_decs_template(...)` is iterator-typed).
     return top != null && top._type != null && (top._type.isGoodArrayType || top._type.isArray)
 }
 
-[unused_argument(c)]
-def decs_source(var c : Captures; var top : Expression?) : bool {
-    // For rows that should only match decs adapter (PR C). extract_decs_bridge is cheap shape check.
-    return extract_decs_bridge(top) != null
+def non_array_source(var c : Captures; var top : Expression?; src : SourceAdapter?) : bool {
+    // Exact complement of array_source — forward-only sources (XML, decs, plain iterators) that walk via
+    // wrap_source_loop and can't do the backward-index walk. Gates the forward keep-last reverse+distinct emit.
+    return !array_source(c, top, src)
 }
 
-[unused_argument(top)]
-def take_arg_is_int(var c : Captures; var top : Expression?) : bool {
+[unused_argument(c, top)]
+def can_join_source(var c : Captures; var top : Expression?; src : SourceAdapter?) : bool {
+    // Adapter-owned gate: any source whose adapter supports the join_general splice. emit_join_hook
+    // then supplies the source-specific emit and gates the srcb shape, so no per-source predicate is needed.
+    return src != null && src->can_join()
+}
+
+[unused_argument(c, top)]
+def can_group_by_source(var c : Captures; var top : Expression?; src : SourceAdapter?) : bool {
+    // Adapter-owned gate: any source whose adapter supports plan_group_by_core. build_group_by_adapter
+    // then supplies the loop and gates the upstream-join srcb shape, so no per-source predicate is needed.
+    return src != null && src->can_group_by()
+}
+
+[unused_argument(top, src)]
+def take_arg_is_int(var c : Captures; var top : Expression?; src : SourceAdapter?) : bool {
     if (!(c.single |> key_exists("take"))) return true   // vacuous: no take to constrain
     let take = c.single["take"]
     return (take != null && length(take.arguments) >= 2 && take.arguments[1] != null
@@ -338,14 +411,14 @@ def take_arg_is_int(var c : Captures; var top : Expression?) : bool {
 
 // `no_terminator` — chain ends bare (no `count` / `sum` / `first[_or_default]` / `to_array` captured).
 // Return shape (array vs iterator) is decided by `ctx.expr_is_iterator` in the emit fn, not this predicate.
-[unused_argument(top)]
-def no_terminator(var c : Captures; var top : Expression?) : bool {
+[unused_argument(top, src)]
+def no_terminator(var c : Captures; var top : Expression?; src : SourceAdapter?) : bool {
     return !(c.single |> key_exists("term"))
 }
 
 // True only for `order_by[_descending]` with an inline-splice-able key lambda. `order` / `order_descending` route elsewhere.
-[unused_argument(top)]
-def inline_cmp_available(var c : Captures; var top : Expression?) : bool {
+[unused_argument(top, src)]
+def inline_cmp_available(var c : Captures; var top : Expression?; src : SourceAdapter?) : bool {
     if (!(c.single |> key_exists("order"))) return false
     let orderCall = c.single["order"]
     if (orderCall == null || orderCall._type == null || orderCall._type.firstType == null
@@ -357,14 +430,14 @@ def inline_cmp_available(var c : Captures; var top : Expression?) : bool {
 
 // `has_where_or_distinct` — used by order_fused_prefilter row to distinguish from bare buffer_helper_dispatch.
 // At least one prefilter source must be present for the fused-loop path to make sense.
-[unused_argument(top)]
-def has_where_or_distinct(var c : Captures; var top : Expression?) : bool {
+[unused_argument(top, src)]
+def has_where_or_distinct(var c : Captures; var top : Expression?; src : SourceAdapter?) : bool {
     return (c.single |> key_exists("where")) || (c.single |> key_exists("distinct"))
 }
 
 // v1 limit (imperative line 6011): upstream `join` requires empty head + no having + no trailing_where. Vacuous when no upstream_join captured.
-[unused_argument(top)]
-def decs_join_invariants(var c : Captures; var top : Expression?) : bool {
+[unused_argument(top, src)]
+def decs_join_invariants(var c : Captures; var top : Expression?; src : SourceAdapter?) : bool {
     if (!(c.single |> key_exists("upstream_join"))) return true
     return ((c.many["head"] |> empty)
             && !(c.single |> key_exists("having"))
@@ -381,36 +454,25 @@ def srcb_is_array_shaped(var c : Captures; captureName : string) : bool {
     return srcb._type.isGoodArrayType || srcb._type.isArray || srcb._type.isIterator
 }
 
-// Array mirror of decs_join_invariants — strict superset (same v1 shape limits + srcb-shape on the upstream join).
-def array_join_invariants(var c : Captures; var top : Expression?) : bool {
-    return decs_join_invariants(c, top) && srcb_is_array_shaped(c, "upstream_join")
-}
-
 // plan_group_by_core's count lane ignores orderName/orderKey — splicing this shape would silently drop
 // the order_by key lambda (and its side effects). Cascade to tier-2 instead. Matches the pre-PR-D1
 // imperative recognizer which only popped trailing order when no count terminator was present.
-[unused_argument(top)]
-def no_order_with_count(var c : Captures; var top : Expression?) : bool {
+[unused_argument(top, src)]
+def no_order_with_count(var c : Captures; var top : Expression?; src : SourceAdapter?) : bool {
     return !((c.single |> key_exists("trailing_order")) && (c.single |> key_exists("term")))
 }
 
-// Matches pre-PR-D2 plan_decs_join: trailing_select is only popped when terminator is NOT count
-// (count's emission ignores select entirely). Splicing `join+select+count` would silently drop
-// select's side effects — cascade to tier-2 instead.
-[unused_argument(top)]
-def decs_join_no_select_with_count(var c : Captures; var top : Expression?) : bool {
+// Trailing_select is only popped when the terminator is NOT count (count's emission ignores select
+// entirely). Splicing `join+select+count` would silently drop select's side effects — cascade to
+// tier-2 instead. Shared across every join source (array / decs / xml).
+[unused_argument(top, src)]
+def join_no_select_with_count(var c : Captures; var top : Expression?; src : SourceAdapter?) : bool {
     return !((c.single |> key_exists("trailing_select")) && (c.single |> key_exists("term")))
 }
 
-// Array-side join splice guard — same srcb-shape check as on the upstream-join slot of array_join_invariants, but applied to the `join` capture.
-[unused_argument(top)]
-def array_join_srcb_is_array(var c : Captures; var top : Expression?) : bool {
-    return srcb_is_array_shaped(c, "join")
-}
-
 // Zip arity guard: 2-source (lockstep) or 3-source (result-selector form). Matches pre-PR-D2 plan_zip.
-[unused_argument(top)]
-def zip_arity_2_or_3(var c : Captures; var top : Expression?) : bool {
+[unused_argument(top, src)]
+def zip_arity_2_or_3(var c : Captures; var top : Expression?; src : SourceAdapter?) : bool {
     if (!(c.single |> key_exists("zip"))) return true
     let n = c.single["zip"].arguments |> length
     return n == 2 || n == 3
@@ -418,8 +480,8 @@ def zip_arity_2_or_3(var c : Captures; var top : Expression?) : bool {
 
 // skip_while/take_while peel against the zip tuple `it`; an upstream select rebinds the element type
 // so the while predicate would dangle. Matches pre-PR-D2 plan_zip chain-walk bail (lines 6494/6500).
-[unused_argument(top)]
-def zip_no_while_after_select(var c : Captures; var top : Expression?) : bool {
+[unused_argument(top, src)]
+def zip_no_while_after_select(var c : Captures; var top : Expression?; src : SourceAdapter?) : bool {
     if (!(c.single |> key_exists("skip_while")) && !(c.single |> key_exists("take_while"))) return true
     for (call in c.many["head"]) {
         if (call_norm_name(call) == "select") return false
@@ -429,8 +491,8 @@ def zip_no_while_after_select(var c : Captures; var top : Expression?) : bool {
 
 // Trailing reverse is identity for count/sum/min/max/average/any/all/contains but picks a different
 // element for first/first_or_default. Matches pre-PR-D2 plan_zip post-walk bail (line 6644).
-[unused_argument(top)]
-def zip_reverse_compatible_with_term(var c : Captures; var top : Expression?) : bool {
+[unused_argument(top, src)]
+def zip_reverse_compatible_with_term(var c : Captures; var top : Expression?; src : SourceAdapter?) : bool {
     if (!(c.single |> key_exists("trailing_reverse")) || !(c.single |> key_exists("term"))) return true
     let name = c.single_name["term"]
     return name != "first" && name != "first_or_default"
@@ -1410,6 +1472,7 @@ def build_order_family_rows {
     splice_patterns |> emplace <| SplicePattern(
         name = "order_streaming_min",
         chain <- [
+            Slot(matcher = m_literal("select"),        cardinality = c_opt(), capture_name = "srcsel"),
             Slot(matcher = m_literal("where_"),       cardinality = c_opt(), capture_name = "where"),
             Slot(matcher = m_alias("distinct_family"), cardinality = c_opt(), capture_name = "distinct"),
             Slot(matcher = m_alias("order_family"),    cardinality = c_one(), capture_name = "order"),
@@ -1423,6 +1486,7 @@ def build_order_family_rows {
     splice_patterns |> emplace <| SplicePattern(
         name = "order_bounded_heap",
         chain <- [
+            Slot(matcher = m_literal("select"),        cardinality = c_opt(), capture_name = "srcsel"),
             Slot(matcher = m_literal("where_"),       cardinality = c_opt(), capture_name = "where"),
             Slot(matcher = m_alias("distinct_family"), cardinality = c_opt(), capture_name = "distinct"),
             Slot(matcher = m_alias("order_family"),    cardinality = c_one(), capture_name = "order"),
@@ -1436,6 +1500,7 @@ def build_order_family_rows {
     splice_patterns |> emplace <| SplicePattern(
         name = "order_then_plain_distinct",
         chain <- [
+            Slot(matcher = m_literal("select"),     cardinality = c_opt(), capture_name = "srcsel"),
             Slot(matcher = m_alias("order_family"), cardinality = c_one(), capture_name = "order"),
             Slot(matcher = m_literal("distinct"),   cardinality = c_one(), capture_name = "distinct_after"),
             Slot(matcher = m_literal("take"),       cardinality = c_opt(), capture_name = "take"),
@@ -1449,6 +1514,7 @@ def build_order_family_rows {
     splice_patterns |> emplace <| SplicePattern(
         name = "order_fused_prefilter",
         chain <- [
+            Slot(matcher = m_literal("select"),        cardinality = c_opt(), capture_name = "srcsel"),
             Slot(matcher = m_literal("where_"),       cardinality = c_opt(), capture_name = "where"),
             Slot(matcher = m_alias("distinct_family"), cardinality = c_opt(), capture_name = "distinct"),
             Slot(matcher = m_alias("order_family"),    cardinality = c_one(), capture_name = "order"),
@@ -1557,6 +1623,87 @@ def emit_streaming_min(var c : Captures; var ctx : EmitCtx; at : LineInfo) : Exp
     let bestName = qn("order_best", at)
     let seenName = qn("order_seen", at)
     var elemType = clone_type(oc.orderElemType)
+
+    // Deferred materialization: track `(bestKey, bestNode)` instead of the best element, building the full
+    // row only once (the survivor) at the tail — `from_xml_node` otherwise materializes all N to compare.
+    if (ctx.src->defers_materialization() && oc.hasKey) {
+        var keyType = (oc.orderKey != null && oc.orderKey._type != null) ? strip_const_ref(clone_type(oc.orderKey._type.firstType)) : null
+        var handleType = ctx.src->handle_type()
+        var keyBody = peel_lambda_rename_var(oc.orderKey, bindName)
+        if (keyType != null && handleType != null && keyBody != null) {
+            let bestKeyName = qn("order_best_key", at)
+            let bestNodeName = qn("order_best_node", at)
+            let xkeyName = qn("order_xkey", at)
+            let matItName = qn("order_mat_it", at)
+            var dLess = (oc.orderName == "order_by_descending"
+                ? qmacro(_::less($i(bestKeyName), $i(xkeyName)))
+                : qmacro(_::less($i(xkeyName), $i(bestKeyName))))
+            var dPerElement : array<Expression?>
+            dPerElement |> push_from <| qmacro_block_to_array() {
+                let $i(xkeyName) = $e(keyBody)
+                if (!$i(seenName)) {
+                    $i(bestKeyName) = $i(xkeyName)
+                    $i(bestNodeName) = $e(ctx.src->current_handle_expr(at))
+                    $i(seenName) = true
+                } elif ($e(dLess)) {
+                    $i(bestKeyName) = $i(xkeyName)
+                    $i(bestNodeName) = $e(ctx.src->current_handle_expr(at))
+                }
+            }
+            var dOutElemType = (oc.selectLam != null) ? oc.selectElemType : clone_type(oc.orderElemType)
+            var matStmt = ctx.src->materialize_handle(qmacro($i(bestNodeName)), matItName, at)
+            var dRet = (oc.selectLam != null
+                ? peel_lambda_replace_var(oc.selectLam, qmacro($i(matItName)))
+                : qmacro($i(matItName)))
+            var dPrologue : array<Expression?>
+            var dTail : array<Expression?>
+            if (oc.firstName == "first") {
+                dPrologue <- qmacro_block_to_array() {
+                    var $i(bestKeyName) = default<$t(keyType)>
+                    var $i(bestNodeName) = default<$t(handleType)>
+                    var $i(seenName) = false
+                }
+                dTail |> push <| qmacro_expr() {
+                    panic("sequence contains no elements") if (!$i(seenName))
+                }
+                dTail |> push <| qmacro_expr() {
+                    var $i(matItName) = default<$t(oc.orderElemType)>
+                }
+                dTail |> push(matStmt)
+                dTail |> push <| qmacro_expr() {
+                    return $e(dRet)
+                }
+            } else {
+                let dBindName = qn("order_d", at)
+                var dDefRet = (oc.selectLam != null
+                    ? peel_lambda_replace_var(oc.selectLam, qmacro($i(dBindName)))
+                    : qmacro($i(dBindName)))
+                dPrologue <- qmacro_block_to_array() {
+                    let $i(dBindName) = $e(oc.firstDefaultExpr)
+                    var $i(bestKeyName) = default<$t(keyType)>
+                    var $i(bestNodeName) = default<$t(handleType)>
+                    var $i(seenName) = false
+                }
+                dTail |> push <| qmacro_expr() {
+                    return $e(dDefRet) if (!$i(seenName))
+                }
+                dTail |> push <| qmacro_expr() {
+                    var $i(matItName) = default<$t(oc.orderElemType)>
+                }
+                dTail |> push(matStmt)
+                dTail |> push <| qmacro_expr() {
+                    return $e(dRet)
+                }
+            }
+            return emit_terminator_lane(TerminatorSpec(
+                prologue <- dPrologue,
+                whereCond = oc.whereCond,
+                perElementStmts <- dPerElement,
+                tailStmts <- dTail,
+                outElemType = dOutElemType
+            ), ctx.src, at)
+        }
+    }
     var lessTest = make_inline_less_call(oc.orderKey, oc.orderName,
         qmacro($i(bindName)), qmacro($i(bestName)), at)
     var perElementStmts : array<Expression?>
@@ -1616,7 +1763,58 @@ def emit_streaming_min(var c : Captures; var ctx : EmitCtx; at : LineInfo) : Exp
     ), ctx.src, at)
 }
 
+// ===== Deferred-materialization surrogate helpers (handle-buffering) — shared by the order emits =====
+// The reducer buffers `(orderKey, handle)` tuples; the full row is built from the handle only for the
+// survivors. See linq_fold.md "Deferred materialization".
+
+// surrogate element type = tuple<keyType; handleType>; key at ._0, handle at ._1.
+[macro_function]
+def private build_surrogate_type(keyType : TypeDeclPtr; handleType : TypeDeclPtr; at : LineInfo) : TypeDeclPtr {
+    var t = new TypeDecl(baseType = Type.tTuple, at = at)
+    t.argTypes |> push(clone_type(keyType))
+    t.argTypes |> push(clone_type(handleType))
+    return t
+}
+
+// comparator over surrogate keys (._0); flipped for descending. Reused across heap push/pop + order_inplace.
+[macro_function, unused_argument(at)]
+def private build_surrogate_cmp(descending : bool; at : LineInfo) : Expression? {
+    if (descending) {
+        return qmacro($(v1, v2) { return _::less(v2._0, v1._0) })
+    }
+    return qmacro($(v1, v2) { return _::less(v1._0, v2._0) })
+}
+
+// the materialize-survivors loop: fill an already-declared `outBuf` by building the full row from each
+// surrogate handle (then projecting through selectLam). handleIsTuple: true → buffer holds `(key, handle)`
+// (handle at ._1); false → bare handle (reverse, no key). Returns [reserve; for; return <- outBuf].
+[macro_function]
+def private build_surrogate_materialize_loop(var ctx : EmitCtx; bufName, outBufName : string;
+                                             rowType : TypeDeclPtr; var selectLam : Expression?;
+                                             handleIsTuple : bool; at : LineInfo) : array<Expression?> {
+    let surrName = qn("order_surr", at)
+    let matItName = qn("order_mat_it", at)
+    var pushItem = (selectLam != null
+        ? peel_lambda_replace_var(selectLam, qmacro($i(matItName)))
+        : qmacro($i(matItName)))
+    var matHandle = (handleIsTuple ? qmacro($i(surrName)._1) : qmacro($i(surrName)))
+    var matStmt = ctx.src->materialize_handle(matHandle, matItName, at)
+    var stmts : array<Expression?>
+    stmts |> push_from <| qmacro_block_to_array() {
+        $i(outBufName) |> reserve(length($i(bufName)))
+        for ($i(surrName) in $i(bufName)) {
+            var $i(matItName) = default<$t(rowType)>
+            $e(matStmt)
+            $i(outBufName) |> push_clone($e(pushItem))
+        }
+        return <- $i(outBufName)
+    }
+    return <- stmts
+}
+
 // emit_bounded_heap — take(N) with inline-cmp key. Heap of size N during walk; distinct gate variant + terminal _select.
+// Deferred-materialization variant (XML): the heap holds `(orderKey, handle)` surrogates and build_xml_row
+// runs only for the K survivors — see linq_fold.md "Deferred materialization".
 [macro_function]
 def emit_bounded_heap(var c : Captures; var ctx : EmitCtx; at : LineInfo) : Expression? {
     let bindName = ctx.src->bind_name(at)
@@ -1628,26 +1826,106 @@ def emit_bounded_heap(var c : Captures; var ctx : EmitCtx; at : LineInfo) : Expr
     let bhBufName = qn("order_buf", at)
     let dsetName = qn("order_dset", at)
     let dkeyName = qn("order_dkey", at)
-    var bufElemType = clone_type(oc.orderElemType)
-    var lessTest = make_inline_less_call(oc.orderKey, oc.orderName,
-        qmacro($i(bindName)), qmacro($i(bhBufName)[0]), at)
-    var perElementPush : Expression? = qmacro_expr() {
-        if (length($i(bhBufName)) < $i(takeNName)) {
-            $i(bhBufName) |> push_clone($i(bindName))
-            _::spliced_push_heap($i(bhBufName), $e(inlineCmp))
-        } elif ($e(lessTest)) {
-            _::spliced_pop_heap($i(bhBufName), $e(inlineCmp))
-            $i(bhBufName)[length($i(bhBufName)) - 1] := $i(bindName)
-            _::spliced_push_heap($i(bhBufName), $e(inlineCmp))
+    var rowType = clone_type(oc.orderElemType)
+
+    // Deferred path requires a keyed order (whole-element compare can't be reduced to a surrogate key)
+    // and a peelable key + a handle type from the source.
+    var deferred = ctx.src->defers_materialization() && oc.hasKey
+    var keyType : TypeDeclPtr
+    var handleType : TypeDeclPtr
+    var keyBody : Expression?
+    if (deferred) {
+        keyType = (oc.orderKey != null && oc.orderKey._type != null) ? strip_const_ref(clone_type(oc.orderKey._type.firstType)) : null
+        handleType = ctx.src->handle_type()
+        keyBody = peel_lambda_rename_var(oc.orderKey, bindName)
+        if (keyType == null || handleType == null || keyBody == null) {
+            deferred = false
         }
     }
+
+    var laneBufType : TypeDeclPtr
+    var perElementPush : Expression?
+    var postBufDeclStmts : array<Expression?>
+    var tailStmts : array<Expression?>
+
+    if (deferred) {
+        laneBufType = build_surrogate_type(keyType, handleType, at)
+        let xkeyName = qn("order_xkey", at)
+        let outBufName = qn("order_out_buf", at)
+        var surrCmp = build_surrogate_cmp(oc.orderName == "order_by_descending", at)   // nolint:PERF023 reused 3× across heap/order splices
+        var admitTest = (oc.orderName == "order_by_descending"
+            ? qmacro(_::less($i(bhBufName)[0]._0, $i(xkeyName)))
+            : qmacro(_::less($i(xkeyName), $i(bhBufName)[0]._0)))
+        perElementPush = qmacro_block() {
+            let $i(xkeyName) = $e(keyBody)
+            if (length($i(bhBufName)) < $i(takeNName)) {
+                $i(bhBufName) |> push(($i(xkeyName) => $e(ctx.src->current_handle_expr(at))))
+                _::spliced_push_heap($i(bhBufName), $e(surrCmp))
+            } elif ($e(admitTest)) {
+                _::spliced_pop_heap($i(bhBufName), $e(surrCmp))
+                $i(bhBufName)[length($i(bhBufName)) - 1] = ($i(xkeyName) => $e(ctx.src->current_handle_expr(at)))
+                _::spliced_push_heap($i(bhBufName), $e(surrCmp))
+            }
+        }
+        let outElemT = oc.selectLam != null ? clone_type(oc.selectElemType) : clone_type(rowType)
+        postBufDeclStmts |> push_from <| qmacro_block_to_array() {
+            var $i(outBufName) : array<$t(outElemT)>
+            return <- $i(outBufName) if ($i(takeNName) <= 0)
+        }
+        tailStmts |> push <| qmacro_expr() {
+            _::order_inplace($i(bhBufName), $e(surrCmp))
+        }
+        tailStmts |> push_from(build_surrogate_materialize_loop(ctx, bhBufName, outBufName, rowType, oc.selectLam, true, at))
+    } else {
+        laneBufType = clone_type(rowType)
+        var lessTest = make_inline_less_call(oc.orderKey, oc.orderName,
+            qmacro($i(bindName)), qmacro($i(bhBufName)[0]), at)
+        perElementPush = qmacro_expr() {
+            if (length($i(bhBufName)) < $i(takeNName)) {
+                $i(bhBufName) |> push_clone($i(bindName))
+                _::spliced_push_heap($i(bhBufName), $e(inlineCmp))
+            } elif ($e(lessTest)) {
+                _::spliced_pop_heap($i(bhBufName), $e(inlineCmp))
+                $i(bhBufName)[length($i(bhBufName)) - 1] := $i(bindName)
+                _::spliced_push_heap($i(bhBufName), $e(inlineCmp))
+            }
+        }
+        tailStmts |> push <| qmacro_expr() {
+            _::order_inplace($i(bhBufName), $e(inlineCmp))
+        }
+        if (oc.selectLam != null) {
+            let outBufName = qn("order_proj_buf", at)
+            let elemName = qn("order_proj_e", at)
+            var projBody = peel_lambda_replace_var(oc.selectLam, qmacro($i(elemName)))
+            postBufDeclStmts |> push_from <| qmacro_block_to_array() {
+                var $i(outBufName) : array<$t(oc.selectElemType)>
+                return <- $i(outBufName) if ($i(takeNName) <= 0)
+            }
+            tailStmts |> push_from <| qmacro_block_to_array() {
+                $i(outBufName) |> reserve(length($i(bhBufName)))
+                for ($i(elemName) in $i(bhBufName)) {
+                    $i(outBufName) |> push_clone($e(projBody))
+                }
+                return <- $i(outBufName)
+            }
+        } else {
+            postBufDeclStmts |> push <| qmacro_expr() {
+                return <- $i(bhBufName) if ($i(takeNName) <= 0)
+            }
+            tailStmts |> push <| qmacro_expr() {
+                return <- $i(bhBufName)
+            }
+        }
+    }
+
     var distinctGate : DistinctGateSpec?
     if (oc.distinctName != "") {
         var dgKind : DistinctGateKind = (oc.distinctName == "distinct_by"
             ? DistinctGateKind(KeyLam = oc.distinctKey)
             : DistinctGateKind(NonKey = null))
+        // dedup key applies to the source element, so its witness type stays the full row even when deferred.
         distinctGate = new DistinctGateSpec(
-            kind = dgKind, bindName = bindName, bufElemType = bufElemType,
+            kind = dgKind, bindName = bindName, bufElemType = clone_type(rowType),
             dsetName = dsetName, dkeyName = dkeyName
         )
     }
@@ -1655,38 +1933,9 @@ def emit_bounded_heap(var c : Captures; var ctx : EmitCtx; at : LineInfo) : Expr
     prologueStmts |> push <| qmacro_expr() {
         let $i(takeNName) = $e(oc.takeExpr)
     }
-    // takeN<=0 early-return + outBuf decl land in postBufDeclStmts so they emit AFTER bufDecl + dsetDecl.
-    var postBufDeclStmts : array<Expression?>
-    var tailStmts : array<Expression?>
-    tailStmts |> push <| qmacro_expr() {
-        _::order_inplace($i(bhBufName), $e(inlineCmp))
-    }
-    if (oc.selectLam != null) {
-        let outBufName = qn("order_proj_buf", at)
-        let elemName = qn("order_proj_e", at)
-        var projBody = peel_lambda_replace_var(oc.selectLam, qmacro($i(elemName)))
-        postBufDeclStmts |> push_from <| qmacro_block_to_array() {
-            var $i(outBufName) : array<$t(oc.selectElemType)>
-            return <- $i(outBufName) if ($i(takeNName) <= 0)
-        }
-        tailStmts |> push_from <| qmacro_block_to_array() {
-            $i(outBufName) |> reserve(length($i(bhBufName)))
-            for ($i(elemName) in $i(bhBufName)) {
-                $i(outBufName) |> push_clone($e(projBody))
-            }
-            return <- $i(outBufName)
-        }
-    } else {
-        postBufDeclStmts |> push <| qmacro_expr() {
-            return <- $i(bhBufName) if ($i(takeNName) <= 0)
-        }
-        tailStmts |> push <| qmacro_expr() {
-            return <- $i(bhBufName)
-        }
-    }
     return emit_fold_array_lane(FoldArraySpec(
         prologueStmts <- prologueStmts,
-        bufElemType = bufElemType,
+        bufElemType = laneBufType,
         bufName = bhBufName,
         postBufDeclStmts <- postBufDeclStmts,
         whereCond = oc.whereCond,
@@ -1810,13 +2059,43 @@ def emit_fused_prefilter(var c : Captures; var ctx : EmitCtx; at : LineInfo) : E
         )
     }
     var reserveStmts : array<Expression?>
-    if (ctx.src->kind() == AdapterKind.k_array && oc.distinctName == "") {
+    if (ctx.src->can_reserve_by_length() && oc.distinctName == "") {
         let top = ctx.src->arrayTop()
         let srcName = ctx.src->arraySrcName()
         if (top != null && top._type != null && type_has_length(top._type)) {
             reserveStmts |> push <| qmacro_expr() {
                 $i(bufName) |> reserve(length($i(srcName)))
             }
+        }
+    }
+    // Deferred materialization (distinct, no-take, no-first arm): buffer `(orderKey, handle)` surrogates
+    // gated by the distinct prefilter, order on the keys, build the full row only for survivors. Distinct-
+    // only — the pure-where case is already materialize-under-guard'd (see linq_fold.md).
+    if (ctx.src->defers_materialization() && oc.hasKey && oc.takeExpr == null && oc.firstName == "" && oc.distinctName != "") {
+        var keyType = (oc.orderKey != null && oc.orderKey._type != null) ? strip_const_ref(clone_type(oc.orderKey._type.firstType)) : null
+        var handleType = ctx.src->handle_type()
+        var keyBody = peel_lambda_rename_var(oc.orderKey, bindName)
+        if (keyType != null && handleType != null && keyBody != null) {
+            let dOutBufName = qn("order_out_buf", at)
+            let dOutElemT = oc.selectLam != null ? clone_type(oc.selectElemType) : clone_type(oc.orderElemType)
+            var dSurrCmp = build_surrogate_cmp(oc.orderName == "order_by_descending", at)
+            var dPush = qmacro_expr() {
+                $i(bufName) |> push(($e(keyBody) => $e(ctx.src->current_handle_expr(at))))
+            }
+            var dTail <- qmacro_block_to_array() {
+                _::order_inplace($i(bufName), $e(dSurrCmp))
+                var $i(dOutBufName) : array<$t(dOutElemT)>
+            }
+            dTail |> push_from(build_surrogate_materialize_loop(ctx, bufName, dOutBufName, oc.orderElemType, oc.selectLam, true, at))
+            return emit_fold_array_lane(FoldArraySpec(
+                bufElemType = build_surrogate_type(keyType, handleType, at),
+                bufName = bufName,
+                whereCond = oc.whereCond,
+                distinctGate = distinctGate,
+                perElementPush = dPush,
+                tailStmts <- dTail,
+                wrapIter = ctx.expr_is_iterator
+            ), ctx.src, at)
         }
     }
     // 4 tail arms hand-emitted: arms 1-2 bind single element (no re-iter), arm 4 wraps top_n result.
@@ -2188,6 +2467,102 @@ def emit_reverse_backward_walk_dset_gate(var c : Captures; var ctx : EmitCtx; at
     return emit_fold_array_lane(spec, ctx.src, at)
 }
 
+// R-2b — reverse + distinct[_by] + to_array over a FORWARD source (XML / decs / iterator). Single-pass
+// keep-last: OVERWRITE tab[key] = (seq, val) per element, sort survivors by descending seq, emit — output-
+// identical to the array backward-index walk; XML defers (table holds the node, build per survivor). See linq_fold.md.
+[macro_function]
+def emit_reverse_distinct_forward_keeplast(var c : Captures; var ctx : EmitCtx; at : LineInfo) : Expression? {
+    if (!(c.single |> key_exists("dist"))) return null
+    let distinctCall = c.single["dist"]
+    let distinctName = call_norm_name(distinctCall)
+    let bindName = ctx.src->bind_name(at)
+    // ctx.top is null for decs sources (they walk via the bridge, not a top expression) — fall back to
+    // the adapter's element type. XML / array / iterator carry a typed top.
+    var top = ctx.top
+    var elemType = ((top != null && top._type != null && top._type.firstType != null)
+        ? strip_const_ref(clone_type(top._type.firstType))
+        : ctx.src->element_type())
+    if (elemType == null) return null
+    // Distinct key: distinct_by → peel the key lambda onto bindName; bare distinct → the whole element.
+    let isKeyed = distinctName == "distinct_by"
+    if (isKeyed && ((distinctCall.arguments |> length) < 2 || distinctCall.arguments[1] == null)) return null
+    var keyBody = isKeyed ? peel_lambda_rename_var(distinctCall.arguments[1], bindName) : qmacro($i(bindName))
+    if (keyBody == null) return null
+    // Defer only for distinct_by over a deferring source: bare distinct needs the whole element as its key
+    // (no handle reduction possible), so it always stores the full element.
+    var deferred = ctx.src->defers_materialization() && distinctName == "distinct_by"
+    var valType : TypeDeclPtr
+    var storeVal : Expression?
+    if (deferred) {
+        valType = ctx.src->handle_type()
+        storeVal = ctx.src->current_handle_expr(at)
+        if (valType == null || storeVal == null) {
+            deferred = false
+        }
+    }
+    if (!deferred) {
+        valType = clone_type(elemType)
+        storeVal = qmacro($i(bindName))
+    }
+    let tabName = qn("rdb_tab", at)
+    let seqName = qn("rdb_seq", at)
+    let pairsName = qn("rdb_pairs", at)
+    let svName = qn("rdb_sv", at)
+    let outBufName = qn("rdb_out", at)
+    var intType = new TypeDecl(baseType = Type.tInt, at = at)
+    var surrType = build_surrogate_type(intType, valType, at)
+    // Prologue: `table<keyType; (seq, val)>` + the seq counter. keyType = the unique_key of the distinct key.
+    var prologue : array<Expression?>
+    if (isKeyed) {
+        var keyLamClone = clone_expression(distinctCall.arguments[1])  // nolint:PERF023 load-bearing const-strip: $e wants Expression?, arg reads as const
+        prologue |> push <| qmacro_expr() {
+            var $i(tabName) : table<typedecl(_::unique_key(invoke($e(keyLamClone), default<$t(elemType)>))); $t(surrType)>
+        }
+    } else {
+        prologue |> push <| qmacro_expr() {
+            var $i(tabName) : table<typedecl(_::unique_key(default<$t(elemType)>)); $t(surrType)>
+        }
+    }
+    prologue |> push <| qmacro_expr() {
+        var $i(seqName) = 0
+    }
+    // Per-element: overwrite the key's slot, so it ends holding the last forward occurrence + its seq.
+    var perElement <- qmacro_block_to_array() {
+        $i(tabName)[_::unique_key($e(keyBody))] = ($i(seqName), $e(storeVal))
+        $i(seqName) ++
+    }
+    // Tail: collect survivors, sort by descending seq, materialize (deferred) or emit the stored element.
+    var seqDescCmp = build_surrogate_cmp(true, at)
+    var tail : array<Expression?>
+    tail |> push_from <| qmacro_block_to_array() {
+        var $i(pairsName) : array<$t(surrType)>
+        $i(pairsName) |> reserve(length($i(tabName)))
+        for ($i(svName) in values($i(tabName))) {
+            $i(pairsName) |> push_clone($i(svName))
+        }
+        _::order_inplace($i(pairsName), $e(seqDescCmp))
+        var $i(outBufName) : array<$t(elemType)>
+    }
+    if (deferred) {
+        tail |> push_from(build_surrogate_materialize_loop(ctx, pairsName, outBufName, elemType, null, true, at))
+    } else {
+        let oName = qn("rdb_o", at)
+        tail |> push_from <| qmacro_block_to_array() {
+            $i(outBufName) |> reserve(length($i(pairsName)))
+            for ($i(oName) in $i(pairsName)) {
+                $i(outBufName) |> push_clone($i(oName)._1)
+            }
+            return <- $i(outBufName)
+        }
+    }
+    return emit_terminator_lane(TerminatorSpec(
+        prologue <- prologue,
+        perElementStmts <- perElement,
+        tailStmts <- tail,
+        wrapIter = ctx.expr_is_iterator
+    ), ctx.src, at)
+}
+
 // R1-R4 — catch-all buffer + reverse_inplace + optional resize + optional terminal _select.
 [macro_function]
 def emit_reverse_buffer_inplace(var c : Captures; var ctx : EmitCtx; at : LineInfo) : Expression? {
@@ -2213,9 +2588,48 @@ def emit_reverse_buffer_inplace(var c : Captures; var ctx : EmitCtx; at : LineIn
             terminalSelectElemType_check = c.single["termsel"]._type.firstType
         }
     }
-    // Decs skip-into-tail fast path for `reverse |> take(N) [|> _select(F)] |> to_array` (no where, no pre-reverse select) — preserves PR #2834's 5.2× perf gain and extends to the trailing-select case so the catch-all (which walks ALL N entities, push_clones full tuples, reverses, resizes, then projects) is reserved for shapes that genuinely need it (pre-reverse where_/select, or termsel without a resolved element type).
-    if (ctx.src->kind() == AdapterKind.k_decs && (c.single |> key_exists("take")) && whereCond == null && projection == null && termsel_fast_path_ok)
-        return ctx.src->emit_reverse_skip_into_tail(c.single["take"].arguments[1], ctx.expr_is_iterator, terminalSelectLam_check, terminalSelectElemType_check, at)
+    // skip-into-tail fast path for `reverse |> take(N) [|> _select(F)] |> to_array` (no where, no pre-reverse select) — preserves PR #2834's 5.2× perf gain and extends to the trailing-select case so the catch-all (which walks ALL N entities, push_clones full tuples, reverses, resizes, then projects) is reserved for shapes that genuinely need it (pre-reverse where_/select, or termsel without a resolved element type). The hook is null for sources without the fast path (only decs overrides it) → fall through to the catch-all.
+    if ((c.single |> key_exists("take")) && whereCond == null && projection == null && termsel_fast_path_ok) {
+        var rev = ctx.src->emit_reverse_skip_into_tail(c.single["take"].arguments[1], ctx.expr_is_iterator, terminalSelectLam_check, terminalSelectElemType_check, at)
+        if (rev != null) return rev
+    }
+    // Deferred materialization (reverse + take): reverse has no order key, so the buffer holds bare node
+    // handles. Reverse, take K, then build the full row only for the K survivors. No pre-reverse projection
+    // (the buffer would hold projected values, not handles). where/termsel compose as in the order emits.
+    if (ctx.src->defers_materialization() && (c.single |> key_exists("take")) && projection == null && termsel_fast_path_ok) {
+        var handleType = ctx.src->handle_type()
+        var dRowType = ctx.src->element_type()
+        if (handleType != null && dRowType != null) {
+            var dTermselLam : Expression?
+            var dTermselElemType : TypeDeclPtr
+            if (c.single |> key_exists("termsel")) {
+                dTermselLam = c.single["termsel"].arguments[1]
+                dTermselElemType = clone_type(terminalSelectElemType_check)
+            }
+            var dTakeExpr = c.single["take"].arguments[1]
+            let dOutBufName = qn("rev_out_buf", at)
+            let dTakeLimName = qn("rev_takeLim", at)
+            let dOutElemT = dTermselLam != null ? clone_type(dTermselElemType) : clone_type(dRowType)
+            var dHandlePush = qmacro_expr() {
+                $i(bufName) |> push($e(ctx.src->current_handle_expr(at)))
+            }
+            var dTail <- qmacro_block_to_array() {
+                _::reverse_inplace($i(bufName))
+                let $i(dTakeLimName) = $e(dTakeExpr)
+                $i(bufName) |> resize($i(dTakeLimName) <= 0 ? 0 : ($i(dTakeLimName) < length($i(bufName)) ? $i(dTakeLimName) : length($i(bufName))))
+                var $i(dOutBufName) : array<$t(dOutElemT)>
+            }
+            dTail |> push_from(build_surrogate_materialize_loop(ctx, bufName, dOutBufName, dRowType, dTermselLam, false, at))
+            return emit_fold_array_lane(FoldArraySpec(
+                bufElemType = clone_type(handleType),
+                bufName = bufName,
+                whereCond = whereCond,
+                perElementPush = dHandlePush,
+                tailStmts <- dTail,
+                wrapIter = ctx.expr_is_iterator
+            ), ctx.src, at)
+        }
+    }
     var takeExpr : Expression?
     if (c.single |> key_exists("take")) {
         takeExpr = clone_expression(c.single["take"].arguments[1])
@@ -2249,7 +2663,7 @@ def emit_reverse_buffer_inplace(var c : Captures; var ctx : EmitCtx; at : LineIn
     }
     // Reserve hint: array source with no prefilter has known length. Decs has no random-access length — skip.
     var reserveStmts : array<Expression?>
-    if (ctx.src->kind() == AdapterKind.k_array && whereCond == null) {
+    if (ctx.src->can_reserve_by_length() && whereCond == null) {
         let top = ctx.src->arrayTop()
         let srcName = ctx.src->arraySrcName()
         if (top != null && top._type != null && type_has_length(top._type)) {
@@ -2295,6 +2709,17 @@ def build_reverse_rows {
         ],
         requires <- [@@ < RequiresPredicate > array_source, @@ < RequiresPredicate > no_terminator],
         emit = @@ < EmitFn > emit_reverse_backward_walk_dset_gate
+    )
+    // R-2b — same chain over a FORWARD source (XML / decs / plain iterator): single-pass keep-last
+    // table-overwrite (no random index). `non_array_source` is the exact complement of R-2a's gate.
+    splice_patterns |> emplace <| SplicePattern(
+        name = "reverse_distinct_forward_keeplast",
+        chain <- [
+            Slot(matcher = m_literal("reverse"), cardinality = c_one()),
+            Slot(matcher = m_alias("distinct_family"), cardinality = c_one(), capture_name = "dist")
+        ],
+        requires <- [@@ < RequiresPredicate > non_array_source, @@ < RequiresPredicate > no_terminator],
+        emit = @@ < EmitFn > emit_reverse_distinct_forward_keeplast
     )
     // R6 — bare reverse + take + [optional trailing _select(F)] + to_array, backward index walk
     splice_patterns |> emplace <| SplicePattern(
@@ -2515,7 +2940,10 @@ def emit_hashtable_dedup(var c : Captures; var ctx : EmitCtx; at : LineInfo) : E
     perElement = wrap_with_condition(perElement, whereCond)
     if (takeExpr != null) {
         // take(N) early-exit shape diverges by adapter (array break vs decs for_each_archetype_find) — see emit_distinct_take_loop overrides.
-        stmts |> push <| ctx.src->emit_distinct_take_loop(bindName, takenName, takeLimName, perElement, at)
+        // A null hook means this source has no distinct+take fusion path — bail so the chain falls back to the tier-2 cascade rather than emitting a null statement.
+        var dtl = ctx.src->emit_distinct_take_loop(bindName, takenName, takeLimName, perElement, at)
+        if (dtl == null) return null
+        stmts |> push(dtl)
     } else {
         stmts |> push <| ctx.src->wrap_source_loop(perElement, at)
     }
@@ -2835,6 +3263,23 @@ def mk_reducer_first_inner(spec : ReducerSpec; at : LineInfo; entryName, itName 
     return (missInit, null)
 }
 
+// Deferred first-per-group (XML): build the full row from the source handle INSIDE the miss-branch, so the
+// per-element walk reads only the group key (field-pruned) instead of `slot := it` pinning every row.
+[macro_function, unused_argument(itName)]
+def mk_reducer_first_deferred(spec : ReducerSpec; at : LineInfo; entryName, itName : string;
+                              var adapter : SourceAdapter?) : tuple<Expression?; Expression?> {
+    var l1 = mk_slot_ref(at, entryName, spec.slot)
+    var rowType = strip_const_ref(clone_type(spec.accType))
+    let matName = qn("gbf_mat_{spec.slot}", at)
+    var matStmt = adapter->materialize_handle(adapter->current_handle_expr(at), matName, at)
+    let missInit = qmacro_block() {
+        var $i(matName) = default<$t(rowType)>
+        $e(matStmt)
+        $e(l1) := $i(matName)
+    }
+    return (missInit, null)
+}
+
 // 2-slot acc: ._0 = sum (double), ._1 = count (uint64). Source cast to double once per side.
 [macro_function]
 def mk_reducer_average(spec : ReducerSpec; at : LineInfo; entryName, itName : string) : tuple<Expression?; Expression?> {
@@ -2887,8 +3332,13 @@ var reducer_emitters : table<string; ReducerEmitterFn> <- {
 }
 
 [macro_function]
-def emit_reducer_branches(spec : ReducerSpec; at : LineInfo; entryName, itName : string) : tuple<Expression?; Expression?> {
+def emit_reducer_branches(spec : ReducerSpec; at : LineInfo; entryName, itName : string;
+                          var adapter : SourceAdapter? = null) : tuple<Expression?; Expression?> {
     // (missInit, hitUpdate); hitUpdate null for first* (subsequent same-key elements ignored).
+    // Whole-element `first` over a deferring source materializes from the handle in the miss-branch.
+    if (spec.name == "first" && adapter != null && adapter->handle_type() != null) {
+        return mk_reducer_first_deferred(spec, at, entryName, itName, adapter)
+    }
     let emitter = reducer_emitters?[spec.name] ?? default<ReducerEmitterFn>
     return (null, null) if (emitter == null)
     return invoke(emitter, spec, at, entryName, itName)
@@ -3165,8 +3615,8 @@ def plan_group_by_core(var calls : array<tuple<ExprCall?; LinqCall?>>;
                        exprIsIterator : bool;
                        at : LineInfo;
                        var adapter : SourceAdapter?) : Expression? {
-    // Prefix keeps hoisted names per-source distinct ("" array / "decs_" decs / "djoin_" decs-join / "ajoin_" array-join).
-    let prefix = (adapter->kind() == AdapterKind.k_array) ? "" : ((adapter->kind() == AdapterKind.k_decs_join) ? "djoin_" : ((adapter->kind() == AdapterKind.k_array_join) ? "ajoin_" : "decs_"))
+    // Prefix keeps hoisted names per-source distinct ("" array / "decs_" decs / "djoin_" decs-join / "ajoin_" array-join / "xml_" xml). The adapter supplies its own.
+    let prefix = adapter->name_prefix()
     let tabName    = qn("{prefix}tab", at)
     let kName      = qn("{prefix}k", at)
     let ukName     = qn("{prefix}uk", at)
@@ -3303,8 +3753,12 @@ def plan_group_by_core(var calls : array<tuple<ExprCall?; LinqCall?>>;
     // `tab?[uk] ?? dummy` + addr-compare: one hash op/elem on hits, two on misses (insert).
     var missInitStmts : array<Expression?>
     var hitUpdateStmts : array<Expression?>
+    // XML deferral: whole-element `first` pins the full row (`slot := it`) → wrap_source_loop materializes
+    // every element. When the source defers and `it` is the raw element (no upstream select rebound the
+    // bind, so the handle's materialized row equals the reducer's `it`), build from the handle in the miss-branch.
+    var reducerAdapter : SourceAdapter? = (adapter->defers_materialization() && itName == adapter->bind_name(at)) ? adapter : null
     for (s in specs) {
-        let (mi, hu) = emit_reducer_branches(s, at, entryName, itName)
+        let (mi, hu) = emit_reducer_branches(s, at, entryName, itName, reducerAdapter)
         if (mi != null) {
             missInitStmts |> push(clone_expression(mi))
         }
@@ -3563,9 +4017,11 @@ def emit_group_by(var c : Captures; var ctx : EmitCtx; at : LineInfo) : Expressi
 
 [macro_function]
 def build_group_by_rows {
-    // Array-source group_by: head segments + opt upstream_join + group_by_lazy + opt having + select(groupproj) + opt trailing_where + opt trailing_order + opt count terminator.
+    // group_by, one pattern for every source: `can_group_by()` admits the adapter; `build_group_by_adapter()`
+    // then supplies the source loop and gates the upstream-join srcb shape (null bails to tier-2).
+    // decs_join_invariants is the shared v1 join-shape limit. Shape: head + opt join + group_by_lazy + opt having + select + opt where/order/count.
     splice_patterns |> emplace <| SplicePattern(
-        name = "group_by_array",
+        name = "group_by",
         chain <- [
             slot_chain_of(["where_", "select"], "head"),
             Slot(matcher = m_literal("join"),          cardinality = c_opt(), capture_name = "upstream_join", arity = 5),
@@ -3576,23 +4032,7 @@ def build_group_by_rows {
             Slot(matcher = m_alias("order_by_family"), cardinality = c_opt(), capture_name = "trailing_order", arity = 2),
             Slot(matcher = m_literal("count"),         cardinality = c_opt(), capture_name = "term", arity = 1)
         ],
-        requires <- [@@ < RequiresPredicate > array_source, @@ < RequiresPredicate > array_join_invariants, @@ < RequiresPredicate > no_order_with_count],
-        emit = @@ < EmitFn > emit_group_by
-    )
-    // Decs-source: same shape + optional upstream `join` slot; v1 join-shape limits via decs_join_invariants.
-    splice_patterns |> emplace <| SplicePattern(
-        name = "group_by_decs",
-        chain <- [
-            slot_chain_of(["where_", "select"], "head"),
-            Slot(matcher = m_literal("join"),          cardinality = c_opt(), capture_name = "upstream_join", arity = 5),
-            Slot(matcher = m_literal("group_by_lazy"), cardinality = c_one(), capture_name = "gb", arity = 2),
-            Slot(matcher = m_literal("having_"),       cardinality = c_opt(), capture_name = "having"),
-            Slot(matcher = m_literal("select"),        cardinality = c_one(), capture_name = "groupproj"),
-            Slot(matcher = m_literal("where_"),        cardinality = c_opt(), capture_name = "trailing_where", arity = 2),
-            Slot(matcher = m_alias("order_by_family"), cardinality = c_opt(), capture_name = "trailing_order", arity = 2),
-            Slot(matcher = m_literal("count"),         cardinality = c_opt(), capture_name = "term", arity = 1)
-        ],
-        requires <- [@@ < RequiresPredicate > decs_source, @@ < RequiresPredicate > decs_join_invariants, @@ < RequiresPredicate > no_order_with_count],
+        requires <- [@@ < RequiresPredicate > can_group_by_source, @@ < RequiresPredicate > decs_join_invariants, @@ < RequiresPredicate > no_order_with_count],
         emit = @@ < EmitFn > emit_group_by
     )
 }
@@ -3761,7 +4201,7 @@ def is_primitive_join_key_type(keyType : TypeDeclPtr) : bool {
             || keyType.baseType == Type.tBool))
 }
 
-// JoinStandalonePieces — shared output of the standalone hashed-join shape builder. Returned to emit_decs_join / emit_array_join which then wrap the source loops differently (decs uses for_each_archetype + build_decs_inner_for; array uses plain `for`).
+// JoinStandalonePieces — shared output of the standalone hashed-join shape builder. Returned to emit_decs_join_impl / emit_array_join / emit_xml_join which then wrap the source loops differently (decs uses for_each_archetype + build_decs_inner_for; array uses plain `for`; xml uses the DOM walk).
 struct JoinStandalonePieces {
     preludeStmts  : array<Expression?>
     probeOuter    : Expression?
@@ -3814,7 +4254,7 @@ def build_join_standalone_pieces(
                 for ($i(bElemName) in $i(arrName)) {
                     let $i(resBindName) : $t(joinResultType) = $e(resultBody)
                     if ($e(wherePred)) {
-                        $i(cntName) += 1
+                        $i(cntName) ++
                     }
                 }
             }
@@ -3894,48 +4334,36 @@ def build_join_standalone_pieces(
     )
 }
 
-// ── decs join splice (PR D2 — pattern-table stub through splice_patterns) ───────
+// ── join splice (one pattern for every source) ───────
+// `can_join()` admits the adapter; `emit_join_hook()` supplies the source-specific emit + srcb gate
+// (null → tier-2). decs / array / xml each override emit_join_hook — no parallel per-source pattern.
 
 [macro_function]
-def build_decs_join_rows {
+def build_join_rows {
     splice_patterns |> emplace <| SplicePattern(
-        name = "decs_join_general",
+        name = "join_general",
         chain <- [
             Slot(matcher = m_literal("join"),    cardinality = c_one(), capture_name = "join", arity = 5),
             Slot(matcher = m_literal("where_"),  cardinality = c_opt(), capture_name = "trailing_where", arity = 2),
             Slot(matcher = m_literal("select"),  cardinality = c_opt(), capture_name = "trailing_select"),
             Slot(matcher = m_literal("count"),   cardinality = c_opt(), capture_name = "term", arity = 1)
         ],
-        requires <- [@@ < RequiresPredicate > decs_source, @@ < RequiresPredicate > decs_join_no_select_with_count],
-        emit = @@ < EmitFn > emit_decs_join
+        requires <- [@@ < RequiresPredicate > can_join_source, @@ < RequiresPredicate > join_no_select_with_count],
+        emit = @@ < EmitFn > emit_join
     )
 }
 
-// Row emit (thin): routes to the DecsAdapter override so the standalone join body reads self.bridge.
+// Row emit (thin): routes to the source adapter's emit_join_hook override.
 [macro_function]
-def emit_decs_join(var c : Captures; var ctx : EmitCtx; at : LineInfo) : Expression? {
-    return ctx.src->emit_decs_join_hook(c, ctx, at)
-}
-
-[macro_function]
-def build_array_join_rows {
-    splice_patterns |> emplace <| SplicePattern(
-        name = "array_join_general",
-        chain <- [
-            Slot(matcher = m_literal("join"),    cardinality = c_one(), capture_name = "join", arity = 5),
-            Slot(matcher = m_literal("where_"),  cardinality = c_opt(), capture_name = "trailing_where", arity = 2),
-            Slot(matcher = m_literal("select"),  cardinality = c_opt(), capture_name = "trailing_select"),
-            Slot(matcher = m_literal("count"),   cardinality = c_opt(), capture_name = "term", arity = 1)
-        ],
-        requires <- [@@ < RequiresPredicate > array_source, @@ < RequiresPredicate > decs_join_no_select_with_count, @@ < RequiresPredicate > array_join_srcb_is_array],
-        emit = @@ < EmitFn > emit_array_join
-    )
+def emit_join(var c : Captures; var ctx : EmitCtx; at : LineInfo) : Expression? {
+    return ctx.src->emit_join_hook(c, ctx, at)
 }
 
 [macro_function]
 def emit_array_join(var c : Captures; var ctx : EmitCtx; at : LineInfo) : Expression? {
-    // Array mirror of emit_decs_join: hashed equi-join with collect+probe inline, preserving the count-no-where bucket-length fast path. Two sources bind as invoke parameters (mirrors Zip's 2-source wrap rather than the 1-source Array helper).
+    // Array mirror of emit_decs_join_impl: hashed equi-join with collect+probe inline, preserving the count-no-where bucket-length fast path. Two sources bind as invoke parameters (mirrors Zip's 2-source wrap rather than the 1-source Array helper).
     var joinCall = c.single["join"]
+    if (!srcb_is_array_shaped(c, "join")) return null   // srcb must be array/iterator-shaped (formerly the array_join_srcb_is_array requires gate, moved here so the unified pattern asks the adapter)
     var whereLam : Expression?
     if (c.single |> key_exists("trailing_where")) {
         whereLam = joinCall != null && c.single["trailing_where"] != null ? c.single["trailing_where"].arguments[1] : null

@@ -120,8 +120,7 @@ def private register_all_linq_fold_rows {
     build_reverse_rows()
     build_distinct_rows()
     build_group_by_rows()
-    build_decs_join_rows()
-    build_array_join_rows()
+    build_join_rows()
     build_zip_rows()
 }
 
@@ -133,11 +132,29 @@ def private run_splice_adapter(var calls : array<tuple<ExprCall?; LinqCall?>>; v
                                onlyRow : string = "") : Expression? {
     for (p in splice_patterns) {
         if (onlyRow != "" && p.name != onlyRow) continue
-        var r <- match_pattern(p, calls, matchTop)
+        var r <- match_pattern(p, calls, matchTop, adapter)
         if (r is matched) {
-            var ctx = EmitCtx(top = ctxTop, src = adapter, expr_is_iterator = exprIsIter)
-            var result = invoke(p.emit, r as matched, ctx, at)
-            if (result != null) return result
+            var caps <- r as matched
+            // A captured leading `_select(f)` (srcsel slot) wraps the adapter so the emit sees f(rawElem); skip if unusable (un-projected would order/dedup raw rows).
+            var effSrc = adapter
+            var usable = true
+            if (caps.single |> key_exists("srcsel")) {
+                var selCall = caps.single["srcsel"]
+                if (selCall != null && length(selCall.arguments) >= 2 && selCall.arguments[1] != null
+                        && selCall._type != null && selCall._type.firstType != null) {
+                    effSrc = new ProjectedSourceAdapter(inner = adapter,
+                        selectLam = clone_expression(selCall.arguments[1]),
+                        projType = clone_type(selCall._type.firstType),
+                        projName = qn("psel", at))
+                } else {
+                    usable = false
+                }
+            }
+            if (usable) {
+                var ctx = EmitCtx(top = ctxTop, src = effSrc, expr_is_iterator = exprIsIter)
+                var result = invoke(p.emit, caps, ctx, at)
+                if (result != null) return result
+            }
         }
     }
     return null
@@ -158,7 +175,7 @@ def private try_splice_patterns(var expr : Expression?) : Expression? {
         return run_splice_adapter(calls, top, null,
             new DecsAdapter(bridge = bridge, tupName = qn("decs_tup", at)), exprIsIter, at)
     }
-    // XML adapter (pass 2a, loop_or_count_general only) — static_if drops the block pre name-resolution when pugixml is absent, so extract_xml_source / XmlAdapter never resolve in pugixml-disabled builds.
+    // XML adapter (static_if drops it pre name-resolution when pugixml is absent). No onlyRow restriction: the XmlAdapter rides every pattern; capability gates + null hooks keep cascades it can't fuse on the tier-2 path. See linq_fold.md.
     static_if (typeinfo builtin_module_exists(pugixml)) {
         var xmlCall = extract_xml_source(top)
         if (xmlCall != null) {
@@ -167,7 +184,7 @@ def private try_splice_patterns(var expr : Expression?) : Expression? {
             return run_splice_adapter(calls, topClone, topClone,
                 new XmlAdapter(nodeExpr = clone_expression(xmlCall.arguments[0]), srcName = qn("xnode", at),
                                elemType = clone_type(xmlCall._type.firstType), nameArg = nameArg),
-                exprIsIter, at, "loop_or_count_general")
+                exprIsIter, at)
         }
     }
     top = peel_each(top)
