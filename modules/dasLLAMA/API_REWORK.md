@@ -339,6 +339,23 @@ gets a note HERE instead of being acted on mid-wave — the model waves optimize
 and coverage; this ledger is the backlog for the perf pass that follows them. Every entry says
 what it costs today and what the fix would change.
 
+- **x64 intrinsic backends lack the `mm_rows` row-range GEMV core (fused-chain fallback).** The
+  fused decode chains (team_parallel_stages, 2026-07-03) gate on `kernel_backend_has_rows()`;
+  portable + both arm64 backends carry the core, so the EPYC (profile-pinned portable) and M1
+  get the fused path — but an x64 box on auto-select (avx2-repack / acc8 / vnni tiers) falls
+  back to per-op dispatches. Fix = extract each x64 family's GEMV inner loop into a
+  `q8q8_rows_kernel_*` (mechanical, mirrors the arm64 extraction); worth ~the same join-tail
+  savings wherever an intrinsic tier ever beats tuned-portable at decode. Cost today: none on
+  the campaign boxes (both run backends that carry the core). (Spotted during the fused-dispatch
+  work, 2026-07-03.)
+- **Fused-chain follow-ups: MoE FFN chain + norm/quantize as a stage.** The 2026-07-03 fused
+  decode covers the attention block (all q8 arches, head_size %% 32 == 0) and the DENSE FFN;
+  gpt-oss's routed-expert FFN keeps its per-op groupn dispatches (3/layer) — a 2-stage MoE chain
+  (router serial, [experts' gate+up + act + requant] -> [downs + weighted reduce]) is the same
+  shape one level up. And each chain still has a serial ~3-6us norm+quantize prologue per block;
+  folding it in as a tiny stage-0 (chunked scale+quantize after a serial sum-of-squares) or
+  fusing norm INTO the quantize pass is the last serial glue. Sized: MoE chain ~= the dense win
+  for gpt-oss decode; norm-stage ~1%% at 1B. (Spotted during the fused-dispatch work, 2026-07-03.)
 - **DONE (perf pass, 2026-07-02): tied classifier matmuls the Q8 disk quants (`Model.cls_q8`).**
   Tied Q8 loads of a Q8_0 embedding (every tied model we run — probed all 11) transcode
   `token_embd` twice into qblob — a classifier copy at wcls_off (repacked with the other 2D
@@ -475,11 +492,37 @@ what it costs today and what the fix would change.
   the fa_* scratch sizing, so this is a compile-time axis à la `[tuned]` (profile-keyed), not a
   runtime setter. DEFERRED until an x64 box exists to measure on — do not solve the coupling
   speculatively. (Spotted tune audit, 2026-07-02.)
-- **DONE (perf pass, 2026-07-02): decode-path micros.** (a) `forward_prefill` no longer sizes
-  `att_b` in flash mode (flash packs into the fa_* tiles instead). (b) Decode `layer_out_scale`
-  and the embedding-row copy now use `scale_inplace`/`copy_floats`. The MoE weighted accumulate
-  deliberately STAYS a plain loop — `axpy`'s fused-FMA kernel would perturb the frozen fixtures
-  for a negligible win. (Spotted tune audit, 2026-07-02.)
+- **DONE (GEMV hunt, 2026-07-03): the decode "kernel top-end gap" was chunk-count misalignment,
+  not the kernel.** A 12-variant GEMV race (`bench_gemv_decode.das` + the matmul_variants decode
+  cells: unroll/ILP/fma-flush/dual-group/inline-scale) proved every kernel micro-opt a wash —
+  llama.cpp's live M1 kernel (`ggml_gemv_q8_0_4x4_q8_0`; their 4x8 tier needs i8mm) is the same
+  shape as `dot_q8q8_laneq4`. The real delta: njobs = `get_total_hw_jobs()*k` sized chunks to the
+   7 WORKERS, but 8 lanes serve them (workers + caller — team by design, fifo via main-steal), so
+  the last wave ran half-empty (28 chunks / 8 lanes = 87.5% utilization). Fix:
+  `get_dispatch_lanes()` (workers + caller; knob `set_dispatch_caller_lane`, decode_prof
+  `--legacy-lanes`) at all 54 dispatch sites incl. x64 (same effect there, smaller: ~2-3% at 32+
+  workers). Measured: GEMV cls 109 → 118-120 GB/s (their exact rate); decode e2e 74.3 → 77.6 t/s
+  @ ctx 8 (+4.4%, ~0.95× lcpp) / 66.3 → 67.8 @ ctx 512; mm_ffn 1.10× → 1.04×, cls 1.19× → 1.12×
+  of lcpp per-op. Suite 171/171 token-for-token (chunk splits don't move per-row math). Oversplit
+  re-sweep under aligned lanes: decode e2e is a WASH across ×1/×2/×4 (×8 past the knee) — the
+  straggler-mitigation rationale dissolved once the split became 8-on-8, ×4 default stands on the
+  prefill iso numbers. (GEMV hunt session, 2026-07-03.)
+- **Q8 scales stream as a separate fp32 plane — llama.cpp's inline-fp16 layout moves ~6% less
+  weight traffic.** Their `block_q8_0x4` packs 4 fp16 scales WITH the 128 quant bytes (136 B per
+  4-row block-group, one stream); our laneq layout reads a second fp32-plane stream (144 B total
+  per group). At the now-aligned ~118-120 GB/s both sides saturate equally, so the remaining
+  cls/ffn per-op gap (1.04-1.12× of lcpp) is almost exactly this byte ratio (144/136 = 5.9%;
+  bench: our best cls call 2448us vs their 2307 = 6.1%). The bench's `inline`/`inline_u2m` cells
+  already prove the single-stream kernel shape works (fp32 inline = parity, occasionally +1%).
+  The win requires fp16: (a) an f16→f32 convert intrinsic in dasLLVM aarch64_neon (vcvt_f32_f16
+  via LLVM fpext, x64 twin F16C `vcvtph2ps` — gate on `cpu_supports`); (b) a repack variant
+  writing [4×fp16 d | 128 qs] blocks + the GEMV/batch/group3/groupn kernels reading it; (c) the
+  element-offset plumbing moves from plane offsets to block strides (loader `w*_off` math, groupn
+  offs contracts). Sized: dasLLVM intrinsic + codegen bump, ~4 kernel twins, loader/offset sweep,
+  fixture risk LOW (same math, scales exact fp16 round-trip of what the loader already computes —
+  but the quantizer would store fp16-rounded scales, so oracle fixtures need a refreeze check).
+  Expected: cls 1.12× → ~1.06×, ffn 1.04× → ~parity; decode e2e ~+2-3%. NOT this PR — needs its
+  own arc. (Spotted GEMV hunt, 2026-07-03.)
 
 ## What collapsed (done — Phase 5)
 

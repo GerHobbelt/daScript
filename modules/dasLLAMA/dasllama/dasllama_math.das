@@ -137,8 +137,21 @@ def public get_jobque_join_poll() : int64 { return g_jobque_join_poll }
 def setup_dasllama_jobque_() {
     set_jobque_fork_pool(true, true)
     set_jobque_batch_dispatch(true)
+    // team dispatch (#3368) as the runner default: fifo fork/join costs ~10us PER JOB, so a
+    // 96-lane dispatch is ~1ms x ~160 dispatches/decoded token — EPYC 9654 measured Llama-1B
+    // decode 7.6 -> 43 t/s (5.7x) and prefill-512 2x from this one switch (epyc9654_measurements.md)
+    set_jobque_team_mode(true)
     set_jobque_worker_spin(int(min(g_jobque_spin_us, 2147483647l)))
     set_jobque_join_spin(int(min(g_jobque_join_poll, 2147483647l)))
+}
+
+// dasLLAMA matmuls are lockstep linear algebra: SMT siblings share the FMA/load ports, so the
+// default jobque gets physical cores - 1 workers (+ the computing main == physical cores, ggml's
+// -t default; EPYC 9654 in-model prefill confirmed 192 SMT lanes lose to 96). The cap min()s with
+// the stock rule at creation, so the Apple P-core-1 default stays; DAS_JOBQUE_THREADS overrides.
+[init]
+def dasllama_jobque_threads_cap() {
+    set_jobque_threads_cap(max(get_total_hw_cores() - 1, 1))
 }
 
 // Chunks-per-hw-job for the quantized matmuls' row split (the fp32 kernels use 1). Q8's
@@ -169,6 +182,69 @@ def public set_dispatch_caller_lane(v : bool) { g_dispatch_caller_lane = v }
 def public get_dispatch_caller_lane() : bool { return g_dispatch_caller_lane }
 def public get_dispatch_lanes() : int { return get_total_hw_jobs() + (g_dispatch_caller_lane ? 1 : 0) }
 
+// Min grain for matmul row splits (ggml-cpu.c mul_mat chunk_size = 16): without it a fixed
+// lanes×oversplit chunk count shatters a small matmul into sub-grain work items on many-core
+// boxes (EPYC 9654: kv 2048x512 GEMM 2.5x slower at 192 lanes than at 48). 0 disables.
+var g_matmul_min_chunk_rows = 16
+def public set_matmul_min_chunk_rows(v : int) { g_matmul_min_chunk_rows = max(v, 0) }
+def public get_matmul_min_chunk_rows() : int { return g_matmul_min_chunk_rows }
+
+// The dispatch invariant that killed the prefill regression: a chunk count > lanes MUST be a whole
+// multiple of the dispatch lanes, so no wave is ragged (a partial final wave makes the join wait on
+// its stragglers every matmul). A count <= lanes is one (possibly partial) wave and is fine — a
+// matmul too small for a full wave can't be split further without going sub-grain. Fires in debug/
+// test builds so a future change to the chunk math can't silently re-introduce the ragged wave.
+def private assert_wave_aligned(chunks, lanes : int) {
+    assert(chunks <= lanes || chunks % lanes == 0, "matmul dispatch chunk count must be a whole number of dispatch-lane waves")
+}
+
+//! Chunk count for a matmul row split, rounded DOWN to a whole number of lane-waves so every wave
+//! is fully populated — no ragged final wave whose stragglers the join waits on. `want`
+//! (lanes × oversplit) is the wave ceiling; the min-grain caps the wave count for small matmuls, and
+//! a matmul too small for even one full wave stays at its grain count (a partial wave beats shredding
+//! it sub-grain). `rows` is the TOTAL row count of the split range — group-indexed ranges pass groups * 4.
+def public matmul_chunks(rows, want : int) : int {
+    if (g_matmul_min_chunk_rows <= 0) {
+        return want
+    }
+    let lanes = max(get_dispatch_lanes(), 1)
+    let cap = clamp(rows / g_matmul_min_chunk_rows, 1, want)   // grain-limited ceiling (<= want = lanes × oversplit)
+    let waves = max(cap / lanes, 1)                            // whole lane-waves within the cap
+    let chunks = min(waves * lanes, cap)                       // full waves; never exceed the grain cap
+    assert_wave_aligned(chunks, lanes)
+    return chunks
+}
+
+// Coarser grain for GEMV-shaped splits (ggml mul_mat: chunk_size 16 -> 64 when nr0==1||nr1==1):
+// a decode matvec row is one dot, far less work than a GEMM row reused across ntok tokens, and
+// the coarser floor doubles as the decode lane cap (EPYC 9654: grain 64 = +13-15% decode at
+// default threads). 0 disables.
+var g_matmul_min_chunk_rows_gemv = 64
+def public set_matmul_min_chunk_rows_gemv(v : int) { g_matmul_min_chunk_rows_gemv = max(v, 0) }
+def public get_matmul_min_chunk_rows_gemv() : int { return g_matmul_min_chunk_rows_gemv }
+
+// Wave fill: when the grain-derived count lands in [lanes/2, lanes), round UP to one full wave —
+// chunks shrink but stay >= grain/2 (the grain is chosen halvable), and no lane idles. Counts
+// below lanes/2 stay grain-limited (filling would shred chunks below the halvable bound).
+var g_gemv_wave_fill = true
+def public set_gemv_wave_fill(v : bool) { g_gemv_wave_fill = v }
+def public get_gemv_wave_fill() : bool { return g_gemv_wave_fill }
+
+//! matmul_chunks for the GEMV-shaped dispatches (single-token mm / group3 / groupn): the coarser
+//! GEMV grain, capped at ONE chunk per lane (ggml's mul_mat decode fallback — equal split, no
+//! oversplit). A decode chunk is one bandwidth stream; oversplit only quantizes the tail (EPYC
+//! T=24 anatomy: last lane's +1 chunk = 37% of op wall). `rows` is the TOTAL split row count.
+def public matmul_chunks_gemv(rows, want : int) : int {
+    if (g_matmul_min_chunk_rows_gemv <= 0) {
+        return want
+    }
+    let lanes = min(want, get_dispatch_lanes())
+    let n = clamp(rows / g_matmul_min_chunk_rows_gemv, 1, lanes)
+    let chunks = (g_gemv_wave_fill && n < lanes && 2 * n >= lanes) ? lanes : n
+    assert_wave_aligned(chunks, get_dispatch_lanes())
+    return chunks
+}
+
 //! y = W·x — matrix-vector product, the dominant LLM compute kernel.
 //! W is row-major [d rows x n cols], x is [n], y is [d]; each y[i] is one dot
 //! product of W's i-th row with x. Shapes match llama2.c (n = input dim, d = output dim).
@@ -179,7 +255,7 @@ def matmul(var y : array<float>; w : array<float> | #; x : array<float>; n, d : 
         var yp = addr(y[0])                              // var: stays a writable pointer when captured
         let wp = reinterpret<float const?>(addr(w[0]))   // strip the `#` if w is a view
         let xp = addr(x[0])
-        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), get_dispatch_lanes()) $(rb, re) {
+        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), matmul_chunks_gemv(int(d), get_dispatch_lanes())) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     yp[i] = dot(wp + int64(i) * n, xp, n)
@@ -198,7 +274,7 @@ def matmul_batch(var y : array<float>; w : array<float> | #; x : array<float>; n
         var yp = addr(y[0])
         let wp = reinterpret<float const?>(addr(w[0]))
         let xp = reinterpret<float const?>(addr(x[0]))
-        maybe_parallel_for(n * d * ntok >= g_matmul_par_threshold, 0, int(d), get_dispatch_lanes()) $(rb, re) {
+        maybe_parallel_for(n * d * ntok >= g_matmul_par_threshold, 0, int(d), matmul_chunks(int(d), get_dispatch_lanes())) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     let wrow = wp + int64(i) * n
@@ -338,7 +414,7 @@ def matmul_q8(var y : array<float>; wq : array<int8> | #; ws : array<float> | #;
         let sp = reinterpret<float const?>(addr(ws[0]))
         let xp = addr(x[0])
         // default 2 chunks per hw job (knob): Q8 dequant-in-dot is compute-bound and threads better than fp32
-        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), g_q8_chunks_per_job * get_dispatch_lanes()) $(rb, re) {
+        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), matmul_chunks_gemv(int(d), g_q8_chunks_per_job * get_dispatch_lanes())) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     yp[i] = dot_q8(wp + int64(i) * n, sp + int64(i) * nb, xp, n)
@@ -421,6 +497,10 @@ typedef RepackQ8Q8Fn = function<(var wp : int8?; var sp : float?; n : int64; d :
 // 32-block, row stride n/2) + `we` RAW E8M0 scale bytes (1 per block, row stride n/32) — against a
 // pre-quantized Q8 activation. Native half-traffic path for MoE expert stacks (gpt-oss decode).
 typedef MatmulMx4Q8Fn = function<(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n : int64; d : int64) : void>
+// Batched MXFP4·Q8 GEMM — the batch analog of MatmulMx4Q8Fn (Y token-major [ntok x d], activations
+// pre-quantized per token like MatmulQ8Q8BatchFn). Grouped MoE prefill dispatches here INSTEAD of
+// expanding the expert to Q8 scratch when the backend sets mx4_native_batch.
+typedef MatmulMx4Q8BatchFn = function<(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n : int64; d : int64; ntok : int64) : void>
 // In-place repack of one MXFP4 region [d rows x n cols] (raw plane pointers at the region start)
 // into the active backend's preferred layout. Default = no-op (row-major). n % 32 == 0.
 typedef RepackMx4Fn = function<(var np : uint8?; var ep : uint8?; n : int64; d : int64) : void>
@@ -435,7 +515,22 @@ typedef RepackMx4Fn = function<(var np : uint8?; var ep : uint8?; n : int64; d :
 // to add-after (same add, same chain point). Bit-exact vs the per-region loop: the same per-row
 // dots, only scheduled in one parallel_for.
 typedef MatmulQ8Q8GroupNFn = function<(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n : int64; d : int64) : void>
+// Row-range GEMV core: compute y rows [rb,re) of ONE [d x n] region (wp/sp at the region base,
+// like the mm slot) with NO internal dispatch — the caller owns the threading. This is what lets a
+// fused multi-stage decode chain (team_parallel_stages) serve matmul rows from inside its own
+// stage lambdas. Contract: rb/re are multiples of 32 (so interleaved 4-row-group layouts divide
+// evenly and Q8 block epilogues stay aligned); same per-row dots as the mm slot — bit-identical.
+typedef MatmulQ8Q8RowsFn = function<(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n : int64; rb : int64; re : int64) : void>
 typedef MatmulMx4GroupNFn = function<(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n : int64; d : int64) : void>
+// Region-list batched MXFP4·Q8 GEMM — the batch analog of MatmulMx4GroupNFn and the llama.cpp
+// mul_mat_id shape: ONE dispatch runs every routed expert's same-shape [d x n] GEMM over its own
+// row range of a shared token-row image. `offs` packs TRIPLES per region: [3r] = the weight-element
+// offset of region r's rows, [3r+1] = row0, [3r+2] = cnt — region r consumes activation rows
+// row0..row0+cnt of (xqp, xsp) AND produces y rows row0..row0+cnt (token-major, y[(row0+tk)*d +
+// row]); the row ranges of the regions partition the image. A non-null bp folds bp[boffs[r] + row]
+// into every store of region r (per-expert bias vectors). Bit-exact vs a per-region loop of the
+// same backend's mx4 batch kernel — the same per-row dots, one fork instead of nregions.
+typedef MatmulMx4Q8BatchGroupNFn = function<(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n : int64; d : int64) : void>
 
 //! One kernel backend: the three Q8·Q8 matmul kernels + the weight repack, plus selection metadata.
 //! needs_repack = the kernels read an interleaved weight layout, so the loader must repack first
@@ -450,10 +545,31 @@ struct KernelBackend {
     group3 : MatmulQ8Q8Group3Fn
     repack : RepackQ8Q8Fn
     mm_mx4 : MatmulMx4Q8Fn = @@mx4q8_unset_kernel
+    // The mx4 BATCH kernels are optional (unlike mm_mx4): they are only dispatched when
+    // mx4_native_batch is set, so backends without them (arm64 — the laneq plane interleave makes a
+    // generic row-major fallback read garbage, not just run slow) keep the panic stubs and the
+    // expansion path instead. A backend that sets the flag must supply BOTH forms.
+    mx4_batch : MatmulMx4Q8BatchFn = @@mx4q8_unset_batch
+    mx4_batch_groupn : MatmulMx4Q8BatchGroupNFn = @@mx4q8_unset_batch_groupn
     repack_mx4 : RepackMx4Fn = @@repack_mx4_identity
     groupn : MatmulQ8Q8GroupNFn = @@q8q8_unset_groupn
     groupn_mx4 : MatmulMx4GroupNFn = @@mx4q8_unset_groupn
+    // Optional row-range GEMV core (see MatmulQ8Q8RowsFn) — backends without one keep the panic
+    // stub, and the fused multi-stage decode falls back to the per-op dispatch path.
+    mm_rows : MatmulQ8Q8RowsFn = @@q8q8_unset_rows
     needs_repack : bool
+    // The backend's repack_mx4 plane layout and repack Q8 layout satisfy the laneq byte-for-byte
+    // expand map (expand_mx4_region_q8's direct-interleave branch): nibble byte `off` of block-
+    // group bg -> q8[bg*128 + off] / q8[bg*128 + 64 + off], scale bytes 1:1 positional. True only
+    // for arm64-laneq. When false on a needs_repack backend (x64 grp4: repack_mx4 is identity and
+    // the Q8 interleave is block-granular), grouped prefill expands row-major and repacks the
+    // scratch through `repack` instead.
+    mx4_expand_interleaved : bool = false
+    // The backend's mx4_batch beats expand-to-Q8 + Q8 batch, so grouped MoE prefill should dispatch
+    // matmul_mx4q8_batch instead of expand_mx4_region_q8 (x64: the expansion's 3·d·n Q8 scratch
+    // round-trip through DRAM was 87% of gpt-oss prefill wall). The slot may be set without the
+    // flag (probe/A-B reference) — the flag is the in-model routing decision.
+    mx4_native_batch : bool = false
     priority : int
 }
 
@@ -463,8 +579,12 @@ var g_mm_q8q8 = @@q8q8_unset_kernel
 var g_mm_q8q8_batch = @@q8q8_unset_batch
 var g_mm_q8q8_group3 = @@q8q8_unset_group3
 var g_mm_mx4q8 = @@mx4q8_unset_kernel
+var g_mm_mx4q8_batch = @@mx4q8_unset_batch
+var g_mm_mx4q8_batch_groupn = @@mx4q8_unset_batch_groupn
 var g_mm_q8q8_groupn = @@q8q8_unset_groupn
 var g_mm_mx4q8_groupn = @@mx4q8_unset_groupn
+var g_mm_q8q8_rows = @@q8q8_unset_rows
+var g_active_has_rows = false       // does the active backend carry a row-range GEMV core?
 var g_repack_q8q8 = @@repack_q8q8_identity   // no-op until a repack backend is selected
 var g_repack_mx4 = @@repack_mx4_identity     // no-op until a repack backend is selected
 
@@ -472,7 +592,11 @@ var g_kernel_backends : table<string; KernelBackend>
 var g_active_backend = ""           // name of the active backend ("" = the unset stub)
 var g_active_priority = -1          // priority of the active row-major default (auto-activate compare)
 var g_active_needs_repack = false   // does the active backend need repacked weights?
+var g_active_mx4_expand_interleaved = false   // see KernelBackend.mx4_expand_interleaved
+var g_active_mx4_native_batch = false         // see KernelBackend.mx4_native_batch
 var g_backend_pin = ""              // A/B: force this backend by name; "" = auto-select
+var g_batch_pin = ""                // hybrid: donor backend for the BATCH-shaped slots; "" = whole-backend
+var g_active_batch_backend = ""     // == g_active_backend unless a batch pin overrode the batch slots
 
 //! Default repack: no-op — weights stay row-major for the portable / sdot4x4 kernels.
 [unused_argument(wp, sp, n, d)]
@@ -493,8 +617,23 @@ def private q8q8_unset_batch(var yp : float?; wp : int8 const?; sp : float const
 def private q8q8_unset_group3(var y0p : float?; var y1p : float?; var y2p : float?; wp : int8 const?; sp : float const?; woff0, woff1, woff2 : int64; xqp : int8 const?; xsp : float const?; n, d0, d1, d2 : int64) { no_backend() }
 [unused_argument(yp, wn, we, xqp, xsp, n, d)]
 def private mx4q8_unset_kernel(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n, d : int64) { no_backend() }
+[unused_argument(yp, wn, we, xqp, xsp, n, d, ntok)]
+def private mx4q8_unset_batch(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n, d, ntok : int64) {
+    // reachable with a registered backend (unlike the other stubs): the slot is optional — see
+    // KernelBackend.mx4_batch
+    panic("dasLLAMA: the active kernel backend '{g_active_backend}' provides no MXFP4·Q8 batch kernel (mx4_batch)")
+}
+[unused_argument(yp, wn, we, offs, nregions, xqp, xsp, bp, boffs, n, d)]
+def private mx4q8_unset_batch_groupn(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) {
+    panic("dasLLAMA: the active kernel backend '{g_active_backend}' provides no MXFP4·Q8 batch groupN kernel (mx4_batch_groupn)")
+}
 [unused_argument(yp, wp, sp, offs, nregions, xqp, xsp, bp, boffs, n, d)]
 def private q8q8_unset_groupn(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) { no_backend() }
+[unused_argument(yp, wp, sp, xqp, xsp, n, rb, re)]
+def private q8q8_unset_rows(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n, rb, re : int64) {
+    // reachable with a registered backend: the slot is optional — gate on kernel_backend_has_rows()
+    panic("dasLLAMA: the active kernel backend '{g_active_backend}' provides no row-range GEMV core (mm_rows)")
+}
 [unused_argument(yp, wn, we, offs, nregions, xqp, xsp, bp, boffs, n, d)]
 def private mx4q8_unset_groupn(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) { no_backend() }
 
@@ -503,12 +642,44 @@ def private activate(be : KernelBackend) {
     g_mm_q8q8_batch = be.batch
     g_mm_q8q8_group3 = be.group3
     g_mm_mx4q8 = be.mm_mx4
+    g_mm_mx4q8_batch = be.mx4_batch
+    g_mm_mx4q8_batch_groupn = be.mx4_batch_groupn
     g_mm_q8q8_groupn = be.groupn
     g_mm_mx4q8_groupn = be.groupn_mx4
+    g_mm_q8q8_rows = be.mm_rows
+    g_active_has_rows = !(be.mm_rows == @@q8q8_unset_rows)
     g_repack_q8q8 = be.repack
     g_repack_mx4 = be.repack_mx4
     g_active_backend = be.name
     g_active_needs_repack = be.needs_repack
+    g_active_mx4_expand_interleaved = be.mx4_expand_interleaved
+    g_active_mx4_native_batch = be.mx4_native_batch
+    g_active_batch_backend = be.name
+    // a standing batch pin survives re-activation (auto-select, load-time select, explicit select)
+    if (g_batch_pin != "") {
+        apply_batch_override(g_batch_pin)
+    }
+}
+
+// The batch half of a hybrid: overwrite only the BATCH-shaped slots (prefill GEMM + mx4 batch)
+// from the donor. GEMV-shaped slots (mm / group3 / groupn) stay with the active backend. The
+// donor must read the same weight layout: same needs_repack, and for repack backends the same
+// repack fn (laneq vs grp4 are both "repacked" but mutually unreadable).
+def private apply_batch_override(name : string) {
+    if (!key_exists(g_kernel_backends, name)) {
+        to_log(LOG_WARNING, "dasLLAMA: batch backend '{name}' — no such backend registered; keeping '{g_active_backend}' batch kernels\n")
+        return
+    }
+    let be = g_kernel_backends[name]
+    if (be.needs_repack != g_active_needs_repack || (g_active_needs_repack && !(be.repack == g_repack_q8q8))) {
+        to_log(LOG_WARNING, "dasLLAMA: batch backend '{name}' reads a different weight layout than active '{g_active_backend}'; keeping '{g_active_backend}' batch kernels\n")
+        return
+    }
+    g_mm_q8q8_batch = be.batch
+    g_mm_mx4q8_batch = be.mx4_batch
+    g_mm_mx4q8_batch_groupn = be.mx4_batch_groupn
+    g_active_mx4_native_batch = be.mx4_native_batch
+    g_active_batch_backend = be.name
 }
 
 //! Register a kernel backend under its name. Auto-activates it as the row-major default when it is the
@@ -546,6 +717,25 @@ def clear_kernel_backend_pin() {
     g_backend_pin = ""
 }
 
+//! Pin the BATCH-shaped kernel slots (prefill GEMM + mx4 batch) to backend `name`, keeping the
+//! active backend's GEMV slots — the hybrid for boxes where decode and prefill prefer different
+//! backends (EPYC 9654: portable GEMV + x64-avx2-acc8 batch). The pin survives later backend
+//! (re)selection, including select_matmul_backend_for_load. `""` clears it (next activation
+//! restores whole-backend slots). The donor must read the active backend's weight layout —
+//! a layout-incompatible or unknown donor logs a warning and leaves the batch slots alone.
+def select_batch_backend(name : string) {
+    g_batch_pin = name
+    if (name != "") {
+        apply_batch_override(name)
+    }
+}
+
+//! The backend serving the BATCH-shaped slots (== active_kernel_backend() unless a batch pin
+//! overrode them — diagnostics / tests).
+def active_batch_backend() : string {
+    return g_active_batch_backend
+}
+
 //! Select the best backend for a model load — INCLUDING repack backends (arm64 laneq). Honors a pin.
 //! Returns true if the selected backend needs the loader to repack every weight tensor (via
 //! repack_q8q8_weight) into its interleaved layout before any matmul runs.
@@ -571,6 +761,18 @@ def select_matmul_backend_for_load() : bool {
 //! The active backend's name (diagnostics / tests). "" until a backend registers.
 def active_kernel_backend() : string {
     return g_active_backend
+}
+
+//! Does the active backend carry a row-range GEMV core (mm_rows)? The fused multi-stage decode
+//! chains gate on this and fall back to the per-op dispatch path when false.
+def kernel_backend_has_rows() : bool {
+    return g_active_has_rows
+}
+
+//! The active backend's row-range GEMV core (see MatmulQ8Q8RowsFn). Read it into a local in the
+//! MAIN context and capture that in worker lambdas — same rule as every kernel-pointer read.
+def mm_q8q8_rows_fn() : MatmulQ8Q8RowsFn {
+    return g_mm_q8q8_rows
 }
 
 //! Registered backend names (diagnostics / tests).
@@ -682,6 +884,44 @@ def matmul_mx4q8(var y : array<float>; wn : array<uint8> | #; we : array<uint8> 
     }
 }
 
+//! Batched MXFP4·Q8 GEMM for prefill — the batch analog of matmul_mx4q8 (Y token-major [ntok x d],
+//! activations PRE-quantized per token into xq [ntok x n] / xs [ntok x n/32]). Dispatches to the
+//! active backend (g_mm_mx4q8_batch); only backends flagged mx4_native_batch provide one (the stub
+//! panics — the grouped prefill routes through the Q8 expansion elsewhere). n % 32 == 0.
+def matmul_mx4q8_batch(var y : array<float>; wn : array<uint8> | #; we : array<uint8> | #; xq : array<int8>; xs : array<float>; n, d, ntok : int64) {
+    unsafe {
+        invoke(g_mm_mx4q8_batch, addr(y[0]),
+            reinterpret<uint8 const?>(addr(wn[0])), reinterpret<uint8 const?>(addr(we[0])),
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d, ntok)
+    }
+}
+
+//! Region-list batched MXFP4·Q8 GEMM — every routed expert's [d x n] GEMM over its own row range
+//! of one token-row image, in ONE dispatch (see the MatmulMx4Q8BatchGroupNFn doc for the packed
+//! `offs` triples). Only backends flagged mx4_native_batch provide one. n % 32 == 0.
+def matmul_mx4q8_batch_groupn(var y : array<float>; wn : array<uint8> | #; we : array<uint8> | #; offs : array<int64>; nregions : int64;
+                              xq : array<int8>; xs : array<float>; n, d : int64) {
+    unsafe {
+        invoke(g_mm_mx4q8_batch_groupn, addr(y[0]),
+            reinterpret<uint8 const?>(addr(wn[0])), reinterpret<uint8 const?>(addr(we[0])),
+            reinterpret<int64 const?>(addr(offs[0])), nregions,
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
+            null, null, n, d)
+    }
+}
+
+//! Biased form: folds bias[boffs[r] + row] into every store of region r (per-expert bias vectors).
+def matmul_mx4q8_batch_groupn(var y : array<float>; wn : array<uint8> | #; we : array<uint8> | #; offs : array<int64>; nregions : int64;
+                              xq : array<int8>; xs : array<float>; bias : array<float> | #; boffs : array<int64>; n, d : int64) {
+    unsafe {
+        invoke(g_mm_mx4q8_batch_groupn, addr(y[0]),
+            reinterpret<uint8 const?>(addr(wn[0])), reinterpret<uint8 const?>(addr(we[0])),
+            reinterpret<int64 const?>(addr(offs[0])), nregions,
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
+            reinterpret<float const?>(addr(bias[0])), reinterpret<int64 const?>(addr(boffs[0])), n, d)
+    }
+}
+
 //! Region-list Q8·Q8 GEMV: ONE dispatch for `nregions` same-shape [d x n] projections (see the
 //! MatmulQ8Q8GroupNFn doc for the packed `offs` pairs). wq/ws are the WHOLE blob (offsets are
 //! absolute); xq/xs hold the activation row(s) the offs pairs index. Region r -> y[r*d .. r*d+d).
@@ -772,7 +1012,7 @@ def matmul_q4(var y : array<float>; wq : array<uint8> | #; ws : array<float> | #
         let xp = addr(x[0])
         // default 4 chunks per hw job (knob): the heavy nibble unpack makes each row compute-bound, so finer
         // splitting balances better (esp. the classifier) — more than the compute-light Q8 path.
-        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), g_q4_chunks_per_job * get_dispatch_lanes()) $(rb, re) {
+        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), matmul_chunks_gemv(int(d), g_q4_chunks_per_job * get_dispatch_lanes())) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     yp[i] = dot_q4(wp + int64(i) * nh, sp + int64(i) * nb, xp, n)

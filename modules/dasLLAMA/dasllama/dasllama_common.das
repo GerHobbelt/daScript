@@ -1213,6 +1213,12 @@ struct Session {
     logits : array<float>     // output logits (vocab_size)
     xq : array<int8>          // activation quantized to Q8 (sized max(dim, hidden_dim)) for the Q8·Q8 kernel
     xs : array<float>         // per-block activation scales (sized max(dim, hidden_dim) / 32)
+    // fused decode-chain scratch (team_parallel_stages): the FFN chain's stage-0 workers requant
+    // their activated-hidden rows while OTHER chunks still read the input quants in xq/xs, so the
+    // requant needs its own buffers; chain_stages is the reused stage-def array (no per-layer alloc)
+    xq2 : array<int8>         // activated-hidden requant quants (ffn width)
+    xs2 : array<float>        // ... and their scales (ffn width / 32)
+    chain_stages : array<int3>  // stage defs, int3(range_begin, range_end, num_chunks)
     key_cache : array<float>  // (n_layers * seq_len * kv_dim)
     value_cache : array<float>
     // batched prefill scratch — empty until forward_prefill sizes them to npos × ... (see forward_prefill)
@@ -1323,6 +1329,9 @@ def make_run_state(c : Config) : Session {
     let maxn = max(xdim, ffw)   // the Q8·Q8 path quantizes whichever activation feeds a matmul
     s.xq |> resize(maxn)
     s.xs |> resize(maxn / 32l)
+    s.xq2 |> resize(ffw)        // fused-FFN chain requant (see the Session field comment)
+    s.xs2 |> resize(ffw / 32l)
+    s.chain_stages |> resize(3)
     s.key_cache |> resize(c.seq_len * kv_row_total(c))
     s.value_cache |> resize(c.seq_len * kv_row_total(c))
     s.sample_scratch |> resize(c.vocab_size)
@@ -1387,6 +1396,10 @@ def apply_box_profile_runtime(path : string = "") {
     apply_i64_knob(rt, "q8_chunks_per_job") $(v) { set_q8_chunks_per_job(int(min(v, 2147483647l))) }
     apply_i64_knob(rt, "q4_chunks_per_job") $(v) { set_q4_chunks_per_job(int(min(v, 2147483647l))) }
     apply_i64_knob(rt, "q8_batch_chunks_per_job") $(v) { set_q8_batch_chunks_per_job(int(min(v, 2147483647l))) }
+    apply_i64_knob(rt, "matmul_min_chunk_rows") $(v) { set_matmul_min_chunk_rows(int(min(v, 2147483647l))) }
+    apply_i64_knob(rt, "matmul_min_chunk_rows_gemv") $(v) { set_matmul_min_chunk_rows_gemv(int(min(v, 2147483647l))) }
+    apply_i64_knob(rt, "gemv_wave_fill") $(v) { set_gemv_wave_fill(v != 0l) }
+    apply_i64_knob(rt, "fused_decode") $(v) { set_fused_decode(v != 0l) }
     // stored only — the queue may not exist yet; setup_dasllama_jobque applies these inside with_job_que
     apply_i64_knob(rt, "jobque_spin_us") $(v) { set_jobque_spin_us(v) }
     apply_i64_knob(rt, "jobque_join_poll") $(v) { set_jobque_join_poll(v) }
@@ -1394,6 +1407,13 @@ def apply_box_profile_runtime(path : string = "") {
     if (be != "") {
         pin_kernel_backend(be)   // warns and keeps the current backend if the name is unknown
         to_log(LOG_INFO, "dasLLAMA: box profile runtime: backend = {active_kernel_backend()} (profile pin '{be}')\n")
+    }
+    let bbe = read_json_field(rt, "batch_backend", "")
+    if (bbe != "") {
+        // sticky through the load-time (re)select — activate() re-applies it; warns and keeps the
+        // active backend's batch slots if the donor is unknown or reads a different weight layout
+        select_batch_backend(bbe)
+        to_log(LOG_INFO, "dasLLAMA: box profile runtime: batch_backend = {active_batch_backend()} (profile pin '{bbe}')\n")
     }
     // "threads" is advisory — the worker count is fixed at jobque creation, controlled by the
     // DAS_JOBQUE_THREADS env (see tune_for_this_box.md); a profile can only recommend it. No live
@@ -1806,6 +1826,20 @@ def private requant_rows_q8(x : array<float>; n, npos : int64; var xqb : array<i
     prof_add("mm_requant", ts_rq)
 }
 
+// Batched native-MXFP4 GEMM against a PRE-quantized activation image (the batch analog of
+// mm_at_mx4_pre): grouped MoE prefill dispatches here — no Q8 expansion — when the active backend
+// carries a native mx4 batch kernel (g_active_mx4_native_batch).
+def private mm_b_mx4_pre(var y : array<float>; t : Model; woff : int64; xqb : array<int8>; xsb : array<float>; n, d, npos : int64) {
+    let total = n * d
+    let ts_gemm = ref_time_ticks()
+    array_view(t.mxq, woff / 2l, total / 2l) $(wn : array<uint8>#) {
+        array_view(t.mxs, woff / 32l, total / 32l) $(we : array<uint8>#) {
+            matmul_mx4q8_batch(y, wn, we, xqb, xsb, n, d, npos)
+        }
+    }
+    prof_add("mm_gemm", ts_gemm)
+}
+
 // Batched Q8 GEMM against a PRE-quantized activation image (the batch analog of mm_at_q8_pre) —
 // the grouped MoE prefill runs many GEMMs off one requant (the whole-batch image or a gathered
 // expert bucket).
@@ -1911,7 +1945,309 @@ def has_dual_rope(c : Config) : bool => (c.sliding_window > 0l
 // here without touching forward(). Bit-identical to the inlined form.
 
 // attn-norm → QKV(+bias) → RoPE → KV-store → GQA multi-head attention → out-proj(+post-norm) → residual.
+// Can layer l's attention run as the fused 3-stage chain? Std shape only: Q8 weights, group3
+// layout (no V-from-K), no post-block norm, table rope. Also needs team mode, a backend row core,
+// and the same size threshold the group3 fuse gates on.
+def private fused_attn_ok(t : Model; l : int64) : bool {
+    let c = t.config
+    // head_size % 32: the per-head epilogues slice on head boundaries, and the wo-input requant
+    // needs whole 32-quant groups per head (real targets are 64/128/256; stories15M's 48 falls back)
+    return (g_fused_decode && t.quant == QuantMode.q8 && !c.pre_post_norm && g_use_rope_table
+        && t.wv_offs[l] >= 0l && layer_head_size(c, l) % 32l == 0l
+        && get_jobque_team_mode() && kernel_backend_has_rows()
+        && c.dim * (layer_qd(c, l) + 2l * layer_kv_dim(c, l)) >= g_matmul_par_threshold)
+}
+
+// Fused attention block: ONE team rendezvous runs [qkv rows + bias/qk-norm/rope/kv-store] →
+// [attn heads + per-head wo-input requant] → [wo rows + bias + residual add] as three stages
+// (team_parallel_stages). Bit-identical to attention_std_decode — the same backend row dots, the
+// same per-head norm/rope/store/softmax order, the same adds — only the scheduling changes: the
+// per-op fork/joins collapse into worker-side stage barriers, and every piece of serial glue
+// between the old dispatches becomes a chunk-local epilogue. Stage geometry: stage 0 splits over
+// HEAD slots (q heads, then k heads, then v heads — each head_size rows, so rope/norm/store are
+// chunk-local), stage 1 over query heads, stage 2 over 32-row output groups.
+def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : int64) {
+    let c = t.config
+    let dim = c.dim
+    let kv_dim = layer_kv_dim(c, l)
+    let head_size = layer_head_size(c, l)
+    let n_heads = c.n_heads
+    let n_kv_heads = layer_n_kv_heads(c, l)
+    let qd = n_heads * head_size
+    let kv_mul = n_heads / n_kv_heads
+    let scale = c.attn_scale > 0.0 ? c.attn_scale : 1.0 / sqrt(float(head_size))
+    let loff = kv_cache_off(t, l)
+    let is_sliding = layer_is_sliding(c, l)
+    let kstart = (is_sliding && pos + 1l > c.sliding_window) ? (pos + 1l - c.sliding_window) : 0l
+    let cnt = pos + 1l - kstart
+    // attention rmsnorm + input quantize (serial — dim-sized, microseconds)
+    let ts_norm0 = ref_time_ticks()
+    rms_at(s.xb, t, t.rms_att_off + l * dim, s.x, dim)
+    quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)
+    prof_add("norm", ts_norm0)
+    let ts_chain = ref_time_ticks()
+    // stage geometry (same grain math as the per-op dispatches; the C++ side clamps chunks <= range)
+    let nslots = int(n_heads + 2l * n_kv_heads)
+    let n0 = matmul_chunks_gemv(int(qd + 2l * kv_dim), get_dispatch_lanes())
+    let n1 = get_dispatch_lanes()
+    let ngrp = int(dim / 32l)
+    let n2 = matmul_chunks_gemv(int(dim), get_dispatch_lanes())
+    s.chain_stages |> resize(3)
+    s.chain_stages[0] = int3(0, nslots, n0)
+    s.chain_stages[1] = int3(0, int(n_heads), n1)
+    s.chain_stages[2] = int3(0, ngrp, n2)
+    count_parallel_dispatch(min(n0, nslots) + min(n1, int(n_heads)) + min(n2, ngrp))
+    let mmrows = mm_q8q8_rows_fn()
+    let neox = c.rope_neox
+    let eps = c.norm_eps
+    let seq_len = c.seq_len
+    let attn_softcap = c.attn_logit_softcap
+    let kvoff = loff + pos * kv_dim
+    unsafe {
+        // activations / scratch — raw pointers only (the stage lambda runs in fork contexts)
+        var qp = addr(s.q[0])
+        var kp = addr(s.k[0])
+        var vp = addr(s.v[0])
+        var xbp = addr(s.xb[0])
+        var xb2p = addr(s.xb2[0])
+        var xp = addr(s.x[0])
+        var attp = addr(s.att[0])
+        var xqp = addr(s.xq[0])
+        var xsp = addr(s.xs[0])
+        var kcp = addr(s.key_cache[0])
+        var vcp = addr(s.value_cache[0])
+        // weight region bases (element offsets into the Q8 blob, scales at /32)
+        let wqb = reinterpret<int8 const?>(addr(t.qblob[0]))
+        let wsb = reinterpret<float const?>(addr(t.qscales[0]))
+        let wpq = wqb + t.wq_offs[l]
+        let wsq = wsb + t.wq_offs[l] / 32l
+        let wpk = wqb + t.wk_offs[l]
+        let wsk = wsb + t.wk_offs[l] / 32l
+        let wpv = wqb + t.wv_offs[l]
+        let wsv = wsb + t.wv_offs[l] / 32l
+        let wpo = wqb + t.wo_offs[l]
+        let wso = wsb + t.wo_offs[l] / 32l
+        // this position's rope table row (dual-rope arches: the sliding class's row)
+        let swa_row = is_sliding && has_dual_rope(c)
+        let crow = swa_row ? reinterpret<float const?>(addr(s.rope_cos_swa[0])) : reinterpret<float const?>(addr(s.rope_cos[0]))
+        let srow = swa_row ? reinterpret<float const?>(addr(s.rope_sin_swa[0])) : reinterpret<float const?>(addr(s.rope_sin[0]))
+        // optional per-arch epilogues (null = off): qkv bias, per-head q/k norm, weightless v norm,
+        // attention sinks, wo bias
+        let bqp = c.attn_qkv_bias ? reinterpret<float const?>(addr(t.bq[0])) : null
+        let bkp = c.attn_qkv_bias ? reinterpret<float const?>(addr(t.bk[0])) : null
+        let bvp = c.attn_qkv_bias ? reinterpret<float const?>(addr(t.bv[0])) : null
+        let rqp = c.qk_norm ? reinterpret<float const?>(addr(t.fblob[t.rms_q_offs[l]])) : null
+        let rkp = c.qk_norm ? reinterpret<float const?>(addr(t.fblob[t.rms_k_offs[l]])) : null
+        let rvp = c.v_norm ? reinterpret<float const?>(addr(t.fblob[t.rms_ones_off])) : null
+        let sinksp = c.attn_sinks ? reinterpret<float const?>(addr(t.fblob[t.sinks_off + l * n_heads])) : null
+        let bop = c.attn_out_bias ? reinterpret<float const?>(addr(t.bo[0])) : null
+        let bqoff = l * qd
+        let bkvoff = l * kv_dim
+        let booff = l * dim
+        team_parallel_stages(s.chain_stages) <| @(stage : int; jb : int; je : int) {
+            if (stage == 0) {
+                // qkv rows by head slot; per-slot epilogue = bias → norm → rope → cache store
+                unsafe {
+                    for (slot in range(jb, je)) {
+                        let sl = int64(slot)
+                        if (sl < n_heads) {
+                            let r0 = sl * head_size
+                            invoke(mmrows, qp, wpq, wsq, xqp, xsp, dim, r0, r0 + head_size)
+                            if (bqp != null) {
+                                for (i in range64(r0, r0 + head_size)) {
+                                    qp[i] += bqp[bqoff + i]
+                                }
+                            }
+                            if (rqp != null) {
+                                rmsnorm(qp + r0, qp + r0, rqp, head_size, eps)
+                            }
+                            if (neox) {
+                                rope_scaled_neox_tab(qp + r0, head_size, head_size, crow, srow)
+                            } else {
+                                rope_scaled_tab(qp + r0, head_size, head_size, crow, srow)
+                            }
+                        } elif (sl < n_heads + n_kv_heads) {
+                            let r0 = (sl - n_heads) * head_size
+                            invoke(mmrows, kp, wpk, wsk, xqp, xsp, dim, r0, r0 + head_size)
+                            if (bkp != null) {
+                                for (i in range64(r0, r0 + head_size)) {
+                                    kp[i] += bkp[bkvoff + i]
+                                }
+                            }
+                            if (rkp != null) {
+                                rmsnorm(kp + r0, kp + r0, rkp, head_size, eps)
+                            }
+                            if (neox) {
+                                rope_scaled_neox_tab(kp + r0, head_size, head_size, crow, srow)
+                            } else {
+                                rope_scaled_tab(kp + r0, head_size, head_size, crow, srow)
+                            }
+                            copy_floats(kcp + kvoff + r0, kp + r0, head_size)
+                        } else {
+                            let r0 = (sl - n_heads - n_kv_heads) * head_size
+                            invoke(mmrows, vp, wpv, wsv, xqp, xsp, dim, r0, r0 + head_size)
+                            if (bvp != null) {
+                                for (i in range64(r0, r0 + head_size)) {
+                                    vp[i] += bvp[bkvoff + i]
+                                }
+                            }
+                            if (rvp != null) {
+                                rmsnorm(vp + r0, vp + r0, rvp, head_size, eps)
+                            }
+                            copy_floats(vcp + kvoff + r0, vp + r0, head_size)
+                        }
+                    }
+                }
+            } elif (stage == 1) {
+                // multi-head attention (the attention_std_decode worker body) + per-head requant of
+                // the wo input — each head's xb slice is final here, and head_size % 32 == 0, so the
+                // quant groups are chunk-local. Overwrites xq/xs; stage 0 (the only reader of the
+                // input quants) is complete by the stage barrier.
+                unsafe {
+                    for (h in range(jb, je)) {
+                        let hh = int64(h)
+                        let qoff = hh * head_size
+                        let kvhoff = (hh / kv_mul) * head_size  // GQA: which kv head this query head reads
+                        var arow = attp + hh * seq_len          // scores for keys kstart..pos
+                        for (j in range64(cnt)) {
+                            let koff = loff + (kstart + j) * kv_dim + kvhoff
+                            arow[j] = dot(qp + qoff, kcp + koff, head_size) * scale
+                        }
+                        if (attn_softcap > 0.0) {  // Gemma2: soft-cap scores before softmax
+                            softcap(arow, cnt, attn_softcap)
+                        }
+                        if (sinksp != null) {  // gpt-oss: this head's sink logit joins the softmax denominator
+                            softmax_sink(arow, cnt, sinksp[hh])
+                        } else {
+                            softmax(arow, cnt)
+                        }
+                        // weighted sum of values into xb[qoff..]
+                        for (i in range64(head_size)) {
+                            xbp[qoff + i] = 0.0
+                        }
+                        for (j in range64(cnt)) {
+                            let voff = loff + (kstart + j) * kv_dim + kvhoff
+                            axpy(xbp + qoff, vcp + voff, arow[j], head_size)
+                        }
+                        quantize_q8_0_into_ptr(xbp + qoff, head_size, xqp, xsp, qoff, qoff / 32l)
+                    }
+                }
+            } else {
+                // output projection rows + optional bias + residual add, all chunk-local
+                unsafe {
+                    let r0 = int64(jb) * 32l
+                    let r1 = int64(je) * 32l
+                    invoke(mmrows, xb2p, wpo, wso, xqp, xsp, qd, r0, r1)
+                    if (bop != null) {
+                        for (i in range64(r0, r1)) {
+                            xb2p[i] += bop[booff + i]
+                        }
+                    }
+                    add_inplace(xp + r0, xb2p + r0, r1 - r0)
+                }
+            }
+        }
+    }
+    prof_add("attn_chain", ts_chain)
+}
+
+// Can the dense FFN run as the fused 2-stage chain? Q8, no post-block norm/scale, team mode +
+// a backend row core, and the size threshold.
+def private fused_ffn_ok(t : Model) : bool {
+    let c = t.config
+    return (g_fused_decode && t.quant == QuantMode.q8 && !c.pre_post_norm && !c.layer_out_scale
+        && get_jobque_team_mode() && kernel_backend_has_rows()
+        && c.dim * c.hidden_dim >= g_matmul_par_threshold)
+}
+
+// Fused dense FFN block: ONE team rendezvous runs [w1+w3 rows + act + requant] → [w2 rows +
+// residual add] as two stages. Stage 0 splits over 32-row groups of the hidden dim with gate and
+// up rows PAIRED per chunk, so the act(g)*u epilogue and the w2-input requant are chunk-local;
+// the requant lands in xq2/xs2 (NOT xq/xs — other stage-0 chunks are still reading the input
+// quants). Bit-identical to ffn_dense_decode's Q8 path — same dots, same act formula, same
+// quant groups, same adds.
+def private ffn_chain_decode(t : Model; var s : Session; l : int64) {
+    let c = t.config
+    let dim = c.dim
+    let hidden = c.hidden_dim
+    let ts_norm1 = ref_time_ticks()
+    rms_at(s.xb, t, t.rms_ffn_off + l * dim, s.x, dim)
+    quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)
+    prof_add("norm", ts_norm1)
+    let ts_chain = ref_time_ticks()
+    let mmrows = mm_q8q8_rows_fn()
+    let is_gelu = c.ffn_act == FfnAct.gelu
+    let is_oai = c.ffn_act == FfnAct.swiglu_oai
+    let vec = g_act_vec
+    let ngrp0 = int(hidden / 32l)
+    let ngrp1 = int(dim / 32l)
+    let n0 = matmul_chunks_gemv(int(hidden), get_dispatch_lanes())
+    let n1 = matmul_chunks_gemv(int(dim), get_dispatch_lanes())
+    s.chain_stages |> resize(2)
+    s.chain_stages[0] = int3(0, ngrp0, n0)
+    s.chain_stages[1] = int3(0, ngrp1, n1)
+    count_parallel_dispatch(min(n0, ngrp0) + min(n1, ngrp1))
+    unsafe {
+        var xp = addr(s.x[0])
+        var xbp = addr(s.xb[0])
+        var gup = addr(s.ffn_gu[0])
+        var xqp = addr(s.xq[0])
+        var xsp = addr(s.xs[0])
+        var xq2p = addr(s.xq2[0])
+        var xs2p = addr(s.xs2[0])
+        let wqb = reinterpret<int8 const?>(addr(t.qblob[0]))
+        let wsb = reinterpret<float const?>(addr(t.qscales[0]))
+        let w1o = t.w1_off + l * dim * hidden
+        let w3o = t.w3_off + l * dim * hidden
+        let w2o = t.w2_off + l * hidden * dim
+        let wp1 = wqb + w1o
+        let ws1 = wsb + w1o / 32l
+        let wp3 = wqb + w3o
+        let ws3 = wsb + w3o / 32l
+        let wp2 = wqb + w2o
+        let ws2 = wsb + w2o / 32l
+        team_parallel_stages(s.chain_stages) <| @(stage : int; jb : int; je : int) {
+            unsafe {
+                let r0 = int64(jb) * 32l
+                let r1 = int64(je) * 32l
+                if (stage == 0) {
+                    // paired gate/up rows, then act + requant on exactly these rows
+                    invoke(mmrows, gup, wp1, ws1, xqp, xsp, dim, r0, r1)
+                    invoke(mmrows, gup + hidden, wp3, ws3, xqp, xsp, dim, r0, r1)
+                    if (vec) {
+                        if (is_gelu) {
+                            geglu4(gup + r0, gup + hidden + r0, r1 - r0)
+                        } elif (is_oai) {
+                            swiglu_oai4(gup + r0, gup + hidden + r0, r1 - r0)
+                        } else {
+                            swiglu4(gup + r0, gup + hidden + r0, r1 - r0)
+                        }
+                    } else {
+                        if (is_gelu) {
+                            geglu(gup + r0, gup + hidden + r0, r1 - r0)
+                        } elif (is_oai) {
+                            swiglu_oai(gup + r0, gup + hidden + r0, r1 - r0)
+                        } else {
+                            swiglu(gup + r0, gup + hidden + r0, r1 - r0)
+                        }
+                    }
+                    quantize_q8_0_into_ptr(gup + r0, r1 - r0, xq2p, xs2p, r0, r0 / 32l)
+                } else {
+                    // down-projection rows + residual add
+                    invoke(mmrows, xbp, wp2, ws2, xq2p, xs2p, hidden, r0, r1)
+                    add_inplace(xp + r0, xbp + r0, r1 - r0)
+                }
+            }
+        }
+    }
+    prof_add("ffn_chain", ts_chain)
+}
+
 def private attention_std_decode(t : Model; var s : Session; l : int64; pos : int64) {
+    if (fused_attn_ok(t, l)) {
+        attention_chain_decode(t, s, l, pos)
+        return
+    }
     let c = t.config
     let dim = c.dim
     let kv_dim = layer_kv_dim(c, l)
@@ -2054,6 +2390,10 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
 
 // ffn-norm → gated FFN (act(W1·x) * (W3·x)) → down-proj(+post-norm) → residual.
 def private ffn_dense_decode(t : Model; var s : Session; l : int64) {
+    if (fused_ffn_ok(t)) {
+        ffn_chain_decode(t, s, l)
+        return
+    }
     let c = t.config
     let dim = c.dim
     let hidden = c.hidden_dim
@@ -2510,6 +2850,25 @@ def get_prefill_attn_mode() : AttnPrefillMode {
     return g_attn_prefill_mode
 }
 
+// Fused decode chains: ONE multi-stage team dispatch per attention block (qkv→attn→wo) and per
+// dense-FFN block (w1/w3→w2) instead of one per matmul — team_parallel_stages replaces the per-op
+// rendezvous with worker-side stage barriers, and the serial glue (rope, kv store, activation,
+// requant, residual adds) rides inside the stages' chunk epilogues. Bit-identical to the per-op
+// path (same row dots, same per-element order); requires team mode + a backend row core
+// (kernel_backend_has_rows) — per-layer gates fall back to the std path otherwise.
+var g_fused_decode = true
+
+//! Select the decode dispatch shape: fused per-block stage chains (default true) vs one dispatch
+//! per matmul. Bit-identical either way — A/B benchmarking toggle.
+def set_fused_decode(on : bool) {
+    g_fused_decode = on
+}
+
+//! Whether decode uses the fused per-block stage chains.
+def get_fused_decode() : bool {
+    return g_fused_decode
+}
+
 // Prefill RoPE: when true (default) precompute the cos/sin table once per prefill and look it up;
 // when false fall back to the classic per-position pow/cos/sin path. A/B toggle for benchmarking
 // (the two paths are bit-identical — the table just deduplicates the transcendentals across heads/layers).
@@ -2550,6 +2909,18 @@ var g_moe_grouped_prefill = true
 //! reference path. Bit-identical either way.
 def set_moe_grouped_prefill(on : bool) {
     g_moe_grouped_prefill = on
+}
+
+// Fused expert GEMMs in grouped MoE prefill (native mx4-batch backends only): all touched experts'
+// gate / up / down projections run as three region-list dispatches per layer (the llama.cpp
+// mul_mat_id shape) instead of a per-expert call chain. A/B toggle; bit-identical either way (the
+// same per-row dots, only the scheduling changes).
+var g_moe_fused_expert_gemms = true
+
+//! Select fused (region-list, default) vs per-expert expert GEMMs in the grouped MoE prefill on a
+//! native mx4-batch backend. Bit-identical either way — A/B benchmarking toggle.
+def set_moe_fused_expert_gemms(on : bool) {
+    g_moe_fused_expert_gemms = on
 }
 
 //! Whether the MoE prefill uses the grouped expert-bucketed path.
@@ -3073,11 +3444,14 @@ def private moe_gather_rows(var s : Session; b0, cnt, dim, k : int64) {
 // into EXACT Q8 blocks in the given scratch: q[j] = the doubled-e2m1 LUT value (already an int8),
 // scale = e8m0_half(e) — no requantization error, every value representable. Grouped prefill runs
 // the proven Q8 batch GEMM off this scratch (one expansion per touched expert amortizes over the
-// whole bucket). On a repack backend the mx planes are ALREADY interleaved (repack_mx4_stacks),
-// and the interleaved nibble order maps byte-for-byte onto the interleaved Q8 order — nibble byte
-// `off` (0..63) of block-group bg lands at q8[bg*128 + off] (low nibbles, k-chunk 0..15) and
-// q8[bg*128 + 64 + off] (high, k 16..31), with the scale bytes 1:1 positional in BOTH layouts —
-// so the expansion writes the repacked form directly, no separate repack pass.
+// whole bucket). On a backend with mx4_expand_interleaved (arm64-laneq) the mx planes are ALREADY
+// interleaved (repack_mx4_stacks), and the interleaved nibble order maps byte-for-byte onto the
+// interleaved Q8 order — nibble byte `off` (0..63) of block-group bg lands at q8[bg*128 + off]
+// (low nibbles, k-chunk 0..15) and q8[bg*128 + 64 + off] (high, k 16..31), with the scale bytes
+// 1:1 positional in BOTH layouts — so the expansion writes the repacked form directly, no separate
+// repack pass. A repack backend WITHOUT that map (x64 grp4: repack_mx4 is identity, so the planes
+// are row-major, and the Q8 interleave is block-granular) expands row-major here and repacks the
+// scratch through the backend's own repack below.
 def private expand_mx4_region_q8(t : Model; woff, n, d : int64; var wq : array<int8>; var ws : array<float>) {
     let total = n * d
     wq |> resize(total)
@@ -3099,7 +3473,7 @@ def private expand_mx4_region_q8(t : Model; woff, n, d : int64; var wq : array<i
                 }
             }
         }
-        if (g_active_needs_repack) {
+        if (g_active_mx4_expand_interleaved) {
             // interleaved: whole 4-row block-groups first, then the row-major tail rows
             let ngrp = (d / 4l) * (n / 32l)
             maybe_parallel_for(total >= g_requant_par_threshold, 0, int(ngrp), get_dispatch_lanes()) $(gb, ge) {
@@ -3142,6 +3516,12 @@ def private expand_mx4_region_q8(t : Model; woff, n, d : int64; var wq : array<i
             }
         }
     }
+    if (g_active_needs_repack && !g_active_mx4_expand_interleaved) {
+        // row-major-expanded scratch on a repack backend: interleave it through the backend's own
+        // Q8 repack so the batch kernels read their layout (x64 grp4). Bit-identical data, layout
+        // only; the direct-into-interleaved expand is the recorded follow-up lever.
+        repack_q8q8_weight(wq, ws, 0l, n, d)
+    }
 }
 
 // MoE FFN prefill, grouped: route every position, bucket the (position, slot) pairs by expert, and
@@ -3149,9 +3529,9 @@ def private expand_mx4_region_q8(t : Model; woff, n, d : int64; var wq : array<i
 // mul_mat_id shape). Bit-exact vs the per-position reference path: the batch GEMM is bit-for-bit
 // N x the single-token kernel, rows quantize identically, and the reduce applies the k weighted
 // outputs (then the shared expert) in exactly the decode accumulation order. (Native-MXFP4 experts
-// are the one exception — grouped runs the Q8 batch GEMM off an exact expansion while the
-// per-position path runs the mx4 GEMV, so the two differ by kernel summation order, like a kernel
-// perm change; the counting fixtures absorb that by design.)
+// are the one exception — grouped runs the backend's native mx4 batch kernel, or the Q8 batch GEMM
+// off an exact expansion, while the per-position path runs the mx4 GEMV, so the two may differ by
+// kernel summation order, like a kernel perm change; the counting fixtures absorb that by design.)
 def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos : int64) {
     let c = t.config
     let dim = c.dim
@@ -3162,18 +3542,22 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
     let nsh = c.n_ff_shexp
     let nfx = max(nfe, nsh)
     let nk = npos * k
+    // fused expert GEMMs (native mx4-batch backends): the gather / hidden / output images span
+    // every routed row at once (nk rows, bucket-ordered) instead of one expert's bucket at a time
+    let fused = t.experts_mx4 && g_active_mx4_native_batch && g_moe_fused_expert_gemms
+    let grows = fused ? nk : npos
     s.moe_rlog |> resize(npos * ne)
     s.moe_idx_b |> resize(nk)
     s.moe_w_b |> resize(nk)
     s.moe_cnt |> resize(ne)
     s.moe_bkt |> resize(nk)
-    s.moe_gxq |> resize(npos * dim)
-    s.moe_gxs |> resize(npos * nb)
-    s.moe_ghb |> resize(npos * nfx)
-    s.moe_ghb2 |> resize(npos * nfx)
-    s.moe_hq |> resize(npos * nfx)
-    s.moe_hs |> resize(npos * nfx / 32l)
-    s.moe_gout |> resize(npos * dim)
+    s.moe_gxq |> resize(grows * dim)
+    s.moe_gxs |> resize(grows * nb)
+    s.moe_ghb |> resize(grows * nfx)
+    s.moe_ghb2 |> resize(grows * nfx)
+    s.moe_hq |> resize(grows * nfx)
+    s.moe_hs |> resize(grows * nfx / 32l)
+    s.moe_gout |> resize(grows * dim)
     s.moe_eout |> resize(nk * dim)
     if (nsh > 0l) {
         s.moe_gl_b |> resize(npos)
@@ -3221,9 +3605,92 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
     // 2. quantize every normed activation row ONCE (same per-row quants as the decode hoist)
     requant_rows_q8(s.xb_b, dim, npos, s.xqb, s.xsb)
 
+    // 3F. fused expert GEMMs (native mx4-batch backends): gather every routed row once (bucket
+    //     order), then ALL touched experts' gates, ups, and downs each run as ONE region-list
+    //     dispatch — the llama.cpp mul_mat_id shape, 3 fork/joins per layer instead of 3 per
+    //     expert, with chunks spanning experts so bucket-count imbalance load-balances. Bit-exact
+    //     vs the per-expert loop below: the same per-row dots / bias / act / requant per row, only
+    //     the scheduling changes.
+    if (fused) {
+        let ts_gather = ref_time_ticks()
+        moe_gather_rows(s, 0l, nk, dim, k)
+        prof_add("moe_gather", ts_gather)
+        // region triples (woff, row0, cnt) per touched expert; the three planes share row0/cnt
+        var offs1 : array<int64>
+        var offs3 : array<int64>
+        var offs2 : array<int64>
+        var boffs1 : array<int64>
+        var boffs3 : array<int64>
+        var boffs2 : array<int64>
+        offs1 |> reserve(ne * 3l)
+        offs3 |> reserve(ne * 3l)
+        offs2 |> reserve(ne * 3l)
+        if (c.moe_exps_bias) {
+            boffs1 |> reserve(ne)
+            boffs3 |> reserve(ne)
+            boffs2 |> reserve(ne)
+        }
+        var nreg = 0l
+        for (e in range64(ne)) {
+            let b0 = e == 0l ? 0l : s.moe_cnt[e - 1l]
+            let cnt = s.moe_cnt[e] - b0
+            if (cnt == 0l) {
+                continue
+            }
+            let eg = l * ne + e
+            let base = eg * dim * nfe
+            offs1 |> push(t.we1_off + base)
+            offs1 |> push(b0)
+            offs1 |> push(cnt)
+            offs3 |> push(t.we3_off + base)
+            offs3 |> push(b0)
+            offs3 |> push(cnt)
+            offs2 |> push(t.we2_off + base)
+            offs2 |> push(b0)
+            offs2 |> push(cnt)
+            if (c.moe_exps_bias) {
+                boffs1 |> push(t.web1_off + eg * nfe)
+                boffs3 |> push(t.web3_off + eg * nfe)
+                boffs2 |> push(t.web2_off + eg * dim)
+            }
+            nreg++
+        }
+        let ts_g1 = ref_time_ticks()
+        if (c.moe_exps_bias) {   // gpt-oss: gate/up biases fold into the stores, before the act
+            matmul_mx4q8_batch_groupn(s.moe_ghb, t.mxq, t.mxs, offs1, nreg, s.moe_gxq, s.moe_gxs, t.fblob, boffs1, dim, nfe)
+            matmul_mx4q8_batch_groupn(s.moe_ghb2, t.mxq, t.mxs, offs3, nreg, s.moe_gxq, s.moe_gxs, t.fblob, boffs3, dim, nfe)
+        } else {
+            matmul_mx4q8_batch_groupn(s.moe_ghb, t.mxq, t.mxs, offs1, nreg, s.moe_gxq, s.moe_gxs, dim, nfe)
+            matmul_mx4q8_batch_groupn(s.moe_ghb2, t.mxq, t.mxs, offs3, nreg, s.moe_gxq, s.moe_gxs, dim, nfe)
+        }
+        prof_add("mm_gemm", ts_g1)
+        let ts_act = ref_time_ticks()
+        gate_batch(s.moe_ghb, s.moe_ghb2, c.ffn_act, nfe, nk)
+        prof_add("act", ts_act)
+        requant_rows_q8(s.moe_ghb, nfe, nk, s.moe_hq, s.moe_hs)
+        let ts_g3 = ref_time_ticks()
+        if (c.moe_exps_bias) {   // ... and the down biases, inside the routed weight (ggml_add_id order)
+            matmul_mx4q8_batch_groupn(s.moe_gout, t.mxq, t.mxs, offs2, nreg, s.moe_hq, s.moe_hs, t.fblob, boffs2, nfe, dim)
+        } else {
+            matmul_mx4q8_batch_groupn(s.moe_gout, t.mxq, t.mxs, offs2, nreg, s.moe_hq, s.moe_hs, nfe, dim)
+        }
+        prof_add("mm_gemm", ts_g3)
+        let ts_park = ref_time_ticks()
+        for (j in range64(nk)) {   // bucket row j -> the (position, slot) grid row for the reduce
+            copy_floats(s.moe_gout, j * dim, s.moe_eout, s.moe_bkt[j] * dim, dim)
+        }
+        prof_add("moe_park", ts_park)
+        delete offs1
+        delete offs3
+        delete offs2
+        delete boffs1
+        delete boffs3
+        delete boffs2
+    }
+
     // 3. one batched GEMM chain per touched expert over its gathered rows; raw down-projection
-    //    rows park in the (position, slot) grid for the ordered reduce
-    for (e in range64(ne)) {
+    //    rows park in the (position, slot) grid for the ordered reduce (skipped when fused ran)
+    for (e in range64(fused ? 0l : ne)) {
         let b0 = e == 0l ? 0l : s.moe_cnt[e - 1l]
         let cnt = s.moe_cnt[e] - b0
         if (cnt == 0l) {
@@ -3234,15 +3701,23 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
         prof_add("moe_gather", ts_gather)
         let eg = l * ne + e
         let base = eg * dim * nfe
-        if (t.experts_mx4) {   // exact Q8 expansion of this expert, then the proven batch GEMMs
+        if (t.experts_mx4 && g_active_mx4_native_batch) {
+            // native mx4 batch GEMMs straight off the nibble/E8M0 planes — no expansion
+            mm_b_mx4_pre(s.moe_ghb, t, t.we1_off + base, s.moe_gxq, s.moe_gxs, dim, nfe, cnt)
+            mm_b_mx4_pre(s.moe_ghb2, t, t.we3_off + base, s.moe_gxq, s.moe_gxs, dim, nfe, cnt)
+        } elif (t.experts_mx4) {   // exact Q8 expansion of this expert, then the proven batch GEMMs
             let ts_ex = ref_time_ticks()
             expand_mx4_region_q8(t, t.we1_off + base, dim, nfe, s.mx4_wq, s.mx4_ws)
             prof_add("moe_expand", ts_ex)
+            let ts_g1 = ref_time_ticks()
             matmul_q8q8_batch(s.moe_ghb, s.mx4_wq, s.mx4_ws, s.moe_gxq, s.moe_gxs, dim, nfe, cnt)
+            prof_add("mm_gemm", ts_g1)
             let ts_ex2 = ref_time_ticks()
             expand_mx4_region_q8(t, t.we3_off + base, dim, nfe, s.mx4_wq, s.mx4_ws)
             prof_add("moe_expand", ts_ex2)
+            let ts_g2 = ref_time_ticks()
             matmul_q8q8_batch(s.moe_ghb2, s.mx4_wq, s.mx4_ws, s.moe_gxq, s.moe_gxs, dim, nfe, cnt)
+            prof_add("mm_gemm", ts_g2)
         } else {
             mm_b_q8_pre(s.moe_ghb, t, t.we1_off + base, s.moe_gxq, s.moe_gxs, dim, nfe, cnt)
             mm_b_q8_pre(s.moe_ghb2, t, t.we3_off + base, s.moe_gxq, s.moe_gxs, dim, nfe, cnt)
@@ -3257,11 +3732,15 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
         gate_batch(s.moe_ghb, s.moe_ghb2, c.ffn_act, nfe, cnt)
         prof_add("act", ts_act)
         requant_rows_q8(s.moe_ghb, nfe, cnt, s.moe_hq, s.moe_hs)
-        if (t.experts_mx4) {
+        if (t.experts_mx4 && g_active_mx4_native_batch) {
+            mm_b_mx4_pre(s.moe_gout, t, t.we2_off + base, s.moe_hq, s.moe_hs, nfe, dim, cnt)
+        } elif (t.experts_mx4) {
             let ts_ex3 = ref_time_ticks()
             expand_mx4_region_q8(t, t.we2_off + base, nfe, dim, s.mx4_wq, s.mx4_ws)
             prof_add("moe_expand", ts_ex3)
+            let ts_g3 = ref_time_ticks()
             matmul_q8q8_batch(s.moe_gout, s.mx4_wq, s.mx4_ws, s.moe_hq, s.moe_hs, nfe, dim, cnt)
+            prof_add("mm_gemm", ts_g3)
         } else {
             mm_b_q8_pre(s.moe_gout, t, t.we2_off + base, s.moe_hq, s.moe_hs, nfe, dim, cnt)
         }
@@ -3348,6 +3827,8 @@ def private ffn_moe_prefill(t : Model; var s : Session; l : int64; npos : int64)
     // Native-MXFP4 experts pay a per-touched-expert Q8 expansion in the grouped path (~120MB of
     // traffic per expert incl. the repack), so it only wins once buckets average enough rows to
     // amortize it — under ~8 rows/expert (short chat turns) the per-position mx4 GEMVs are cheaper.
+    // A native mx4-batch backend (x64) has no expansion tax, so its crossover sits lower (per-fork
+    // overhead only) — the 8-rows/expert gate is kept until re-measured there.
     let mx4_grouped_pays = !t.experts_mx4 || npos * c.n_expert_used >= 8l * c.n_expert
     if (t.quant == QuantMode.q8 && g_moe_grouped_prefill && mx4_grouped_pays) {
         ffn_moe_prefill_grouped(t, s, l, npos)
