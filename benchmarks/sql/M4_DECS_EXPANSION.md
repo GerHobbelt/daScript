@@ -264,3 +264,94 @@ PR #2742's accumulator + early-exit terminator work on `plan_zip` was orphaned o
 | zip_dot_product | — | 53 | 58 | **7** | 8.3× |
 
 `zip(xs, ys)._select(_._0 * _._1).sum()` now fuses to a single multi-iter for-loop with inline accumulator, zero alloc. Falls in line with the rest of the accumulator-class benchmarks.
+
+## Update — Slice 5a take/skip on decs (2026-05-20, plan_decs_unroll + DecsRangeInfo)
+
+`plan_decs_unroll` now recognizes trailing `take(N)` / `skip(N)` after the where/select chain. New `extract_decs_ranges` peels them into `DecsRangeInfo`; counter inits hoist above `for_each_archetype` (so they span archetypes); per-element guards (take-cap → return true, skip-counter → continue, take++) wrap `perElement` BEFORE chain so ranges apply to the post-`where_` stream. When `takeExpr != null` the outer call switches to `for_each_archetype_find` with a `: bool` lambda so the take-cap stop propagates across archetypes.
+
+Affected emit paths (all 4 non-bare-count): `emit_decs_accumulator`, `emit_decs_early_exit`, `emit_decs_min_max_by`, `emit_decs_to_array`. Bare `count` via arch.size shortcut still bails on any chain ops including ranges.
+
+**Coverage:** take, skip, skip+take, where+take, select+take+sum, take+first, take+to_array, take(-1) short-circuit, skip-beyond-end, AST-shape gates for take→`_find` routing + skip-only→`for_each_archetype` routing. +11 tests.
+
+| benchmark | shape | m4 (old) | m4 (new) | m3f (array splice) |
+|---|---|---:|---:|---:|
+| take_count | `.take(N).count()` | 36 | 0 | 0 |
+| skip_take | `.skip(N).take(M).count()` | 37 | 0 | 0 |
+| take_count_filtered | `_where.take(N).count()` | — | 0 | 0 |
+| take_sum_aggregate | `_select.take(N).sum()` | — | 0 | 0 |
+
+m4 splice rounds to 0 ns/op alongside the m3f array splice — same shape (inline counter + early-exit), same measurement floor. Not DCE: `ast_dump --mode source` confirms `for_each_archetype_find` is emitted with `decs_takec >= 1000 → return true` and `++decs_takec; push_clone(decs_buf, decs_tup)` actively building the full 1000-element result array per bench iteration. Old m4 baseline (36-37 ns/op via eager bridge) → new 0 ns/op (~sub-1 ns/iter, indistinguishable from m3f array splice) ≈ 36× actual win, just below the bench's `body_time / n_iters` resolution floor.
+
+## Update — Slice 5b take_while/skip_while on decs (2026-05-20, plan_decs_unroll + predicate-driven ranges)
+
+`plan_decs_unroll` now recognizes trailing `take_while(pred)` / `skip_while(pred)` after the where/skip prefix. `DecsRangeInfo` gains `skipWhileCond` / `takeWhileCond`; `extract_decs_ranges` walks the suffix in canonical order (`skip → skip_while → take_while → take`) and bails when a `select` appears in the prefix (mirrors array-side `seenSelect` bail at `linq_fold.das:1615/1623`). Predicates peel against the source tuple (`tupName`), so the post-where stream is visible but selects are forbidden — same shape as array side. `skipping` flag hoists at invoke scope (one-way; flips false on first non-matching elem, persists across archetypes). When `takeWhileCond != null` the outer call switches to `for_each_archetype_find` with a `: bool` lambda just like `take(N)`, and `useExplicitState` in `emit_decs_early_exit` extends so `any/all/contains + take_while` route through explicit `foundName` (distinguishes "real match" from "take_while-stop" — both produce inner `return true`).
+
+| benchmark | shape | m1 sql | m3 | m3f (array splice) | m4 (old, eager bridge) | m4 (new, splice) | m3f→m4 gap | win vs baseline |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| take_while_match | `._take_while(_.id < 50K).count()` | 7 | 23 | 2 | 55 | **8** | 6× | 6.9× |
+
+m4 lands close to m3f (8 vs 2 ns/op — within Wave 4 known multi-component get_ro overhead). Splice fires; `ast_dump --mode source` confirms `for_each_archetype_find` with `if !(decs_tup.id < 50000) return true else ++decs_acc`.
+
+**Coverage:** take_while, skip_while, skip_while+take_while, where+take_while, take_while+sum, take_while+first, take_while+to_array, take_while always-true (no break) / always-false (immediate break), skip_while always-true (drops all) / always-false (immediate done), skip+take_while, skip_while+take, take_while+any/all/contains (regression guards for explicit-state routing under take_while), AST shape gates for take_while→`_find` routing + skip_while-only→`for_each_archetype` routing. +21 tests (60 → 81 in file).
+
+## Update — Slice 5e group_by on decs (2026-05-20, plan_decs_group_by)
+
+New `plan_decs_group_by` planner mirrors `plan_group_by` machinery (state-table `tab?[uk] ?? dummy` + addr-compare miss detection + `tab[uk] = dummy; dummy = default<typedecl(dummy)>` first-key-wins) but emits the per-element splice into the bridge's inner multi-iter for-loop, wrapped by the outer `for_each_archetype` — replacing the eager bridge's `array<tuple>` materialization. Reuses `recognize_reducer_specs` / `emit_reducer_branches` / `extend_specs_for_missing_having_reducers` / `rewrite_having_pred` / averaging + hidden-slot machinery wholesale; the only delta is the source iteration shape. Inserted in the cascade BEFORE `plan_group_by` (the bridge-match is stricter so it won't grab array chains; running after `plan_group_by` would cause the array planner to fire on the eager-bridge invoke and short-circuit the decs path).
+
+| benchmark | m1 sql | m3 | m3f (array splice) | m4 (eager bridge, was) | m4 (Slice 5e, now) | m4 win | m4 vs m1 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| groupby_count             | 142 | 67  | 37  | 115 | **50**  | 2.3× | 2.8× faster |
+| groupby_sum               | 172 | 101 | 36  | 115 | **50**  | 2.3× | 3.4× faster |
+| groupby_average           | 175 | 101 | 52  | 128 | **62**  | 2.1× | 2.8× faster |
+| groupby_max               | 173 | 103 | 49  | 120 | **57**  | 2.1× | 3.0× faster |
+| groupby_min               | 177 | 106 | 42  | 122 | **56**  | 2.2× | 3.2× faster |
+| groupby_first             | —   | 70  | 35  | 112 | **46**  | 2.4× | — |
+| groupby_having_count      | 142 | 73  | 36  | 114 | **49**  | 2.3× | 2.9× faster |
+| groupby_having_hidden_sum | 175 | 103 | 40  | 122 | **57**  | 2.1× | 3.1× faster |
+| groupby_multi_reducer     | 191 | 139 | 52  | 130 | **63**  | 2.1× | 3.0× faster |
+| groupby_select_sum        | —   | 110 | 60  | 137 | **71**  | 1.9× | — |
+| groupby_where_count       | 75  | 65  | 23  | 101 | **36**  | 2.8× | 2.1× faster |
+| groupby_where_sum         | 94  | 80  | 23  | 105 | **36**  | 2.9× | 2.6× faster |
+
+All 12 groupby_* rows improve 1.9-2.9× (avg ~2.3×). m4 now consistently lands 10-20 ns above m3f — the remaining gap is the Wave 4 multi-component `get_ro` overhead (every bridge component participates in the inner for-loop iteration even when the chain only reads one). m4 beats SQL on 10/10 measurable rows by 2.1-3.4×.
+
+**Coverage:** count terminator (length(tab)), implicit to_array terminator, sum/min/max/average/first reducers, multi-reducer (N+S+MX in one pass), having_ predicate over named slot, having_ predicate over hidden synthesized slot, upstream where_+group_by, upstream select+group_by(expression key), AST shape gate (no `to_sequence`, exactly one `for_each_archetype`, no `_find` variant — group_by doesn't early-exit, `decs_tab` 6 refs + `decs_dummy` 6 refs in the splice). +13 tests (80 → 93 in file).
+
+## Update — Slice 5d order/reverse on decs (2026-05-21, plan_decs_order_family + plan_decs_reverse)
+
+Two new planners `plan_decs_order_family` (mirrors `plan_order_family`) and `plan_decs_reverse` (mirrors `plan_reverse`), inserted in the cascade BEFORE their array-side equivalents per the same cascade-ordering rule as Slice 5e. Both emit a hoisted buffer above `for_each_archetype`, then dispatch to the existing daslib helper family — `order_inplace` / `top_n*` / `min_by` / `max_by` for the order arm, `reverse_inplace` + optional `resize(takeN)` for the reverse arm.
+
+`plan_decs_reverse` has three emit paths matching the array side: `count` terminator → counter loop (reverse is identity for count); `first`/`first_or_default` → walk + overwrite `last` (reverse-of-last = first-of-reverse); else → buffer + `reverse_inplace` + optional resize. The R6 backward-index optimization from array side doesn't apply: multi-iter for has no random access into the archetype.
+
+`plan_decs_order_family` has a single uniform emit (always buffers, then dispatches the appropriate terminator) — simpler than array side which has separate "no where" direct-call vs "with where" buffered paths. The decs source can never random-access, so the direct-call optimization isn't available.
+
+| benchmark | shape | m1 sql | m3 | m3f (array splice) | m4 (old, eager bridge) | m4 (new, splice) | m4 win |
+|---|---|---:|---:|---:|---:|---:|---:|
+| sort_take                | `_order_by + take` | 38 | 713 | 28 | 119 | **57** | 2.1× |
+| sort_first               | `_order_by + first` | 37 | 711 | 41 | 121 | **71** | 1.7× |
+| order_take_desc          | `_order_by_descending + take` | 37 | 694 | 28 | 117 | **58** | 2.0× |
+| select_where_order_take  | `_where + _order_by + take` | 36 | 352 | 25 | 102 | **38** | 2.7× |
+| bare_order_where         | `_where + _order_by` | 274 | 359 | 118 | 196 | **130** | 1.5× |
+| reverse_take             | `.reverse().take(N)` | 0 | 22 | 0 | 114 | **48** | 2.4× |
+
+All 6 rows improve 1.5-2.7× (avg ~2.1×). m4 lands within 2× of m3f on most rows — the remaining gap is the Wave 4 multi-component `get_ro` overhead (sort dominates the wall-clock so the gap doesn't fully close even when the splice fires). `bare_order_where` is the tightest squeeze (1.5×) because sort over 100K rows is the bottleneck; once the m4 buffer build matches m3f (~117 ns), the rest is pure sort time.
+
+**Coverage:** bare `_order_by` + to_array, bare `_order_by_descending` + to_array, `_order_by` + take, `_order_by_descending` + take, `_order_by` + first, `_order_by_descending` + first, `_order_by` + first_or_default (nonempty + empty), `_where + _order_by + take`, `_where + _order_by + first`; `.reverse() + to_array`, `.reverse() + take(N)` (in-range, beyond-length, and zero — last uses runtime-var to defeat const-fold of PERF017 false-positive on splice-emitted `0 < length(buf)`), `.reverse() + count` (no-buffer counter loop), `_where + .reverse() + first_or_default` (empty + nonempty), `_where + .reverse() + to_array`, `_where + _select + .reverse() + to_array` (projection through reverse). AST shape gates for: order+take (top_n_by emit + no to_sequence + 1 for_each_archetype), order+first (min_by emit + panic-on-empty guard + no top_n_by), reverse+to_array (1 reverse_inplace), reverse+count (no decs_buf, no reverse_inplace). +20 tests (100 → 120 in file).
+
+## Update — Slice 5c distinct/distinct_by on decs (2026-05-21, plan_decs_distinct)
+
+New `plan_decs_distinct` planner mirrors `plan_distinct` — streaming dedup via `var inscope seen : table<typedecl(_::unique_key(...))>` hoisted above `for_each_archetype` so the seen-table persists across archetypes. Inserted in the cascade BEFORE `plan_distinct` (same rule as 5d/5e — decs bridge match is stricter). Two emit shapes:
+
+- **Buffer-required** (`to_array` default, optionally `take(N)`): per-element splice computes the key, `key_exists` check, on miss does `taken++ → seen|>insert → buf|>push_clone`. When `take(N)` is present, outer iteration switches to `for_each_archetype_find` and the take-cap `return true` propagates across archetypes — true streaming early-exit. Take-limit bound to a `let` at outer scope so a side-effecting `take(arg)` evaluates exactly once.
+- **Buffer-elided** (`count`/`long_count` → `length(seen)`/`int64(length(seen))`; `sum` folds inline at fresh-key site via `acc += <projection>`): no buffer allocation, only the seen-table is materialized. count + take both present cascades to tier 2 (matches array-side).
+
+Side-effecting `_select(proj)` upstream binds once per element to a fresh `decs_pv` local — key + buf push (or sum fold) share the bind, matching array-side single-eval per source element. `distinct_by(key)` wraps the key block in `invoke(<keyBlock>, <projection-or-tup>)` and the seen-table's value type is derived via `_::unique_key(invoke(<keyBlock>, default<elemT>))` so the table key type tracks the key function's return type.
+
+| benchmark | shape | m1 sql | m3 | m3f (array splice) | m4 (eager bridge, was) | m4 (Slice 5c, now) | m4 win |
+|---|---|---:|---:|---:|---:|---:|---:|
+| distinct_count | `_select(_.brand).distinct().to_array()` | 41 | 44 | 15 | 97 | **28** | 3.5× |
+| distinct_take  | `_select(_.brand).distinct().take(3).to_array()` | 0 | 30 | 0 | 34 | **0** | matches m3f |
+
+`distinct_count` lands at 28 ns/op vs m3f's 15 — the ~13 ns gap is the Wave 4 multi-component `get_ro` floor (3 components participate in the inner for-loop even when chain only reads `brand`). `distinct_take` collapses to 0 ns/op — early-exit at the 3rd distinct brand visits only ~3 source elements regardless of N=100K, same as the array-side splice.
+
+**Coverage:** `_select(_.brand).distinct()` + to_array / count / long_count / sum / take(N) / take(0) / take(N>num_distinct), `_where(_.id<8)._select(_.brand).distinct()`, `_distinct_by(_.brand)` + to_array / count / take(N), empty-decs distinct yields empty, side-effecting take(N) arg evaluates exactly once at invoke entry. AST shape gates for: distinct+count (no to_sequence, no decs_buf, single key_exists, plain for_each_archetype), distinct+take (for_each_archetype_find + decs_buf + decs_seen + decs_taken counters), distinct_by+to_array (unique_key wrapping the key invocation), distinct+sum (no decs_buf, decs_acc declared+folded). +17 tests (122 → 139 in file).

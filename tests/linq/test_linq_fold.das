@@ -1724,6 +1724,21 @@ def test_distinct_extended_parity(t : T?) {
     t |> run("distinct.long_count: [1,2,2,3,3,3] → int64 3") @(tt : T?) {
         tt |> equal(3l, _fold([1, 2, 2, 3, 3, 3].to_sequence().distinct().long_count()))
     }
+    // D8: predicate-form terminators must NOT be silently dropped — plan_distinct guards arg count and cascades to tier 2.
+    t |> run("distinct.count(pred) parity: [1,1,2,2,3,3,4,4,5,5].distinct.count(>2) → 3 (not 5)") @(tt : T?) {
+        let arr = [1, 1, 2, 2, 3, 3, 4, 4, 5, 5]
+        let got = _fold(arr.to_sequence().distinct().count($(x : int) => x > 2))
+        let raw = arr.to_sequence().distinct().count($(x : int) => x > 2)
+        tt |> equal(got, raw, "predicate must be honored, not dropped")
+        tt |> equal(got, 3)
+    }
+    t |> run("distinct.long_count(pred) parity: [1,1,2,2,3,3,4,4,5,5].distinct.long_count(>=3) → 3l") @(tt : T?) {
+        let arr = [1, 1, 2, 2, 3, 3, 4, 4, 5, 5]
+        let got = _fold(arr.to_sequence().distinct().long_count($(x : int) => x >= 3))
+        let raw = arr.to_sequence().distinct().long_count($(x : int) => x >= 3)
+        tt |> equal(got, raw, "predicate must be honored, not dropped")
+        tt |> equal(got, 3l)
+    }
 }
 
 [test]
@@ -2374,6 +2389,21 @@ def test_group_by_having_fold_parity(t : T?) {
         tt |> equal(2, seen |> length)
         tt |> equal(12, seen[1])
         tt |> equal(15, seen[2])
+    }
+}
+
+[test]
+def test_group_by_count_predicate_cascades(t : T?) {
+    // Regression for Copilot review on PR #2775: the recognizer pops `.count()` as the bare-count terminator (→ length(tab)) — but `count(src, predicate)` is a valid linq.das overload, and popping that form silently drops the predicate. Recognizer must check `length(arguments) == 1` and otherwise cascade.
+    t |> run("count(predicate) over group-by output cascades and honors the predicate") @(tt : T?) {
+        let nums = [1, 2, 3, 4, 5, 6, 7]
+        // Buckets %3: 0=[3,6] N=2, 1=[1,4,7] N=3, 2=[2,5] N=2. Pred `_.N >= 3` → matches only bucket 1 → result 1.
+        let c = _fold(nums._group_by(_ % 3)._select((K = _._0, N = _._1 |> length))._count(_.N >= 2))
+        // All 3 buckets have N >= 2 → result 3.
+        tt |> equal(3, c)
+        let c2 = _fold(nums._group_by(_ % 3)._select((K = _._0, N = _._1 |> length))._count(_.N >= 3))
+        // Only bucket 1 has N >= 3 → result 1.
+        tt |> equal(1, c2)
     }
 }
 

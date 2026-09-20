@@ -21,6 +21,8 @@ If a rebase produces conflicts on files that were independently changed on origi
 
 ## 1. Lint all changed `.das` files — **zero warnings required**
 
+**Pre-push hook:** the repo ships `.githooks/pre-push` (formatter `--verify` on the whole tree + lint on changed `.das` files — same gates as CI's `extended_checks`). One-time enable per clone: `git config core.hooksPath .githooks`. After that, every `git push` runs lint+format before pushing — the manual command below is for debugging hook output or running ahead of `git push`. `git push --no-verify` skips it; reserve that for emergencies (CI catches the same issues ~25 minutes later, but the round-trip is the cost the hook exists to avoid). See [.githooks/README.md](../.githooks/README.md).
+
 CI's `extended_checks` job runs the same lint utility on every `.das` file changed vs `origin/master` and **exits non-zero on any warning** (`./bin/daslang ./utils/lint/main.das -- <files> --quiet` → exit code 2 on ≥1 warning). One STYLE/LINT/PERF warning anywhere in your diff fails CI. Local lint must be clean before push — there is no "minor warning, will ignore" tier here.
 
 Lint only the files changed relative to `origin/master` (matches what CI lints):
@@ -266,10 +268,6 @@ CI's `extended_checks` job runs `./bin/Release/daslang ./das-fmt/dasfmt.das -- -
 `bin/Release/das-fmt.exe` built from `utils/dasFormatter/` is the **v1→v2 syntax converter**, NOT the same formatter — running it locally does not reproduce CI.
 
 **Before pushing:** mentally format named-arg constructor / call sites with spaces around `=`. If CI `extended_checks` fails on a format diff after MCP said "already formatted", fix the spacing and re-push (or amend, on a squashed branch).
-
-## 5.5. Run the task-wrap-up curation pass
-
-Pre-PR is a natural moment to close the blind-mouse loop — work is final, you know what was learned, diff is locked. The full curation steps (review log, surface un-asked, cost calculus) live in `skills/task_wrap_up.md` and apply to *any* major task wrap-up, not just PRs. Run that pass now if you keep a personal Q&A cache.
 
 ## 6. Create the PR
 

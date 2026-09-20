@@ -689,3 +689,1683 @@ def test_unroll_min_by_splice_shape(t : T?) {
         t |> equal(describe_count(body_expr, "for_each_archetype"), 1, "exactly one for_each_archetype")
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slice 5a: take/skip ranges on decs (counters hoisted at invoke scope; take present routes to for_each_archetype_find with bool block returning true on cap-hit)
+// ─────────────────────────────────────────────────────────────────────────────
+
+[export, marker(no_coverage)]
+def target_unroll_take_count_fold() : int {
+    return _fold(from_decs_template(type<UnrollChainRow>).take(3).count())
+}
+
+[export, marker(no_coverage)]
+def target_unroll_skip_count_fold() : int {
+    return _fold(from_decs_template(type<UnrollChainRow>).skip(2).count())
+}
+
+[export, marker(no_coverage)]
+def target_unroll_skip_take_count_fold() : int {
+    return _fold(from_decs_template(type<UnrollChainRow>).skip(1).take(2).count())
+}
+
+[export, marker(no_coverage)]
+def target_unroll_where_take_count_fold() : int {
+    return _fold(from_decs_template(type<UnrollChainRow>)._where(_.flag == 1).take(2).count())
+}
+
+[export, marker(no_coverage)]
+def target_unroll_select_take_sum_fold() : int {
+    return _fold(from_decs_template(type<UnrollChainRow>)._select(_.val).take(3).sum())
+}
+
+[export, marker(no_coverage)]
+def target_unroll_take_first_fold() : int {
+    return _fold(from_decs_template(type<UnrollChainRow>)._select(_.val).take(2).first())
+}
+
+[export, marker(no_coverage)]
+def target_unroll_take_neg_count_fold() : int {
+    // take(-N) must short-circuit (>=-guard) — empty iteration regardless of source size.
+    return _fold(from_decs_template(type<UnrollChainRow>).take(-1).count())
+}
+
+[export, marker(no_coverage)]
+def target_unroll_skip_beyond_count_fold() : int {
+    return _fold(from_decs_template(type<UnrollChainRow>).skip(100).count())
+}
+
+[export, marker(no_coverage)]
+def target_unroll_take_to_array_fold() : array<int> {
+    return <- _fold(from_decs_template(type<UnrollChainRow>)._select(_.val).take(3).to_array())
+}
+
+[test]
+def test_unroll_take_count_parity(t : T?) {
+    fixture_unroll2(7)
+    t |> equal(target_unroll_take_count_fold(), 3, "take(3) caps total")
+}
+
+[test]
+def test_unroll_skip_count_parity(t : T?) {
+    fixture_unroll2(7)
+    t |> equal(target_unroll_skip_count_fold(), 5, "skip(2) drops first 2 across archetypes")
+}
+
+[test]
+def test_unroll_skip_take_count_parity(t : T?) {
+    fixture_unroll2(7)
+    t |> equal(target_unroll_skip_take_count_fold(), 2, "skip(1)+take(2) windows total count")
+}
+
+[test]
+def test_unroll_where_take_count_parity(t : T?) {
+    fixture_unroll2(7)
+    // flag==1 rows are vals 1,3,5 → take(2) → 2 matches
+    t |> equal(target_unroll_where_take_count_fold(), 2, "where+take caps post-filter count")
+}
+
+[test]
+def test_unroll_select_take_sum_parity(t : T?) {
+    fixture_unroll2(7)
+    // vals 0,1,2,...,6 → take(3) → sum 0+1+2 = 3
+    t |> equal(target_unroll_select_take_sum_fold(), 3, "select+take+sum splice parity")
+}
+
+[test]
+def test_unroll_take_first_parity(t : T?) {
+    fixture_unroll2(7)
+    // take(2) then first() — first wins before take counter ticks past 1
+    t |> equal(target_unroll_take_first_fold(), 0, "take+first returns first element")
+}
+
+[test]
+def test_unroll_take_neg_zero_count(t : T?) {
+    fixture_unroll2(7)
+    t |> equal(target_unroll_take_neg_count_fold(), 0, "take(-1) short-circuits to 0")
+}
+
+[test]
+def test_unroll_skip_beyond_returns_zero(t : T?) {
+    fixture_unroll2(7)
+    t |> equal(target_unroll_skip_beyond_count_fold(), 0, "skip past end yields 0 count")
+}
+
+[test]
+def test_unroll_take_to_array_parity(t : T?) {
+    fixture_unroll2(7)
+    let got <- target_unroll_take_to_array_fold()
+    t |> equal(length(got), 3, "take(3).to_array() yields 3 elements")
+    if (length(got) >= 3) {
+        t |> equal(got[0], 0, "first taken element")
+        t |> equal(got[1], 1, "second taken element")
+        t |> equal(got[2], 2, "third taken element")
+    }
+}
+
+[test]
+def test_unroll_take_count_splice_shape(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_unroll_take_count_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected splice invoke wrapper")
+        t |> equal(describe_count(body_expr, "to_sequence"), 0, "take+count splice must NOT call to_sequence")
+        // take present → must use the _find variant so early-exit propagates across archetypes.
+        t |> equal(describe_count(body_expr, "for_each_archetype_find"), 1, "take splice routes to for_each_archetype_find")
+    }
+}
+
+[test]
+def test_unroll_skip_count_splice_shape(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_unroll_skip_count_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected splice invoke wrapper")
+        t |> equal(describe_count(body_expr, "to_sequence"), 0, "skip+count splice must NOT call to_sequence")
+        // skip-only (no take) keeps the void for_each_archetype variant.
+        t |> equal(describe_count(body_expr, "for_each_archetype_find"), 0, "skip-only splice does NOT route to _find")
+        t |> equal(describe_count(body_expr, "for_each_archetype"), 1, "skip-only splice uses regular for_each_archetype")
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slice 5a Copilot review #1 regression guards — take + any/all/contains must
+// distinguish take-cap (inner `return true`) from real match. Without explicit
+// foundName/foundCounter state these would false-positive on empty/no-match
+// sources whenever the take-cap fires before a real perElement decision.
+// ─────────────────────────────────────────────────────────────────────────────
+
+[export, marker(no_coverage)]
+def target_unroll_take_any_no_pred_fold() : bool {
+    return _fold(from_decs_template(type<UnrollChainRow>).take(0).any())
+}
+
+[export, marker(no_coverage)]
+def target_unroll_take_any_pred_no_match_fold() : bool {
+    return _fold(from_decs_template(type<UnrollChainRow>)._select(_.val).take(3)._any(_ > 100))
+}
+
+[export, marker(no_coverage)]
+def target_unroll_take_any_pred_match_fold() : bool {
+    return _fold(from_decs_template(type<UnrollChainRow>)._select(_.val).take(3)._any(_ == 1))
+}
+
+[export, marker(no_coverage)]
+def target_unroll_take_all_pass_fold() : bool {
+    // All val >= 0 holds; take(3) shouldn't fool `all` into returning false from the take-cap exit.
+    return _fold(from_decs_template(type<UnrollChainRow>)._select(_.val).take(3)._all(_ >= 0))
+}
+
+[export, marker(no_coverage)]
+def target_unroll_take_all_fail_fold() : bool {
+    // Some val > 1 → `all <= 1` false.
+    return _fold(from_decs_template(type<UnrollChainRow>)._select(_.val).take(3)._all(_ <= 1))
+}
+
+[export, marker(no_coverage)]
+def target_unroll_take_contains_hit_fold() : bool {
+    return _fold(from_decs_template(type<UnrollChainRow>)._select(_.val).take(5).contains(2))
+}
+
+[export, marker(no_coverage)]
+def target_unroll_take_contains_miss_fold() : bool {
+    return _fold(from_decs_template(type<UnrollChainRow>)._select(_.val).take(2).contains(100))
+}
+
+[test]
+def test_unroll_take_any_no_pred_empty(t : T?) {
+    fixture_unroll2(7)
+    // take(0).any() on non-empty source → false (the prefix-of-length-0 is empty).
+    t |> equal(target_unroll_take_any_no_pred_fold(), false, "take(0).any() returns false on non-empty source")
+}
+
+[test]
+def test_unroll_take_any_pred_no_match(t : T?) {
+    fixture_unroll2(7)
+    // take(3) gives vals 0,1,2; none > 100 → false. take-cap fires at element 3 but must not be mistaken for a match.
+    t |> equal(target_unroll_take_any_pred_no_match_fold(), false, "take(3).any(_ > 100) returns false when no match in prefix")
+}
+
+[test]
+def test_unroll_take_any_pred_match(t : T?) {
+    fixture_unroll2(7)
+    // take(3) gives vals 0,1,2; matches _==1 at element 1 → true.
+    t |> equal(target_unroll_take_any_pred_match_fold(), true, "take(3).any(_ == 1) returns true when match in prefix")
+}
+
+[test]
+def test_unroll_take_all_pass(t : T?) {
+    fixture_unroll2(7)
+    // vals 0,1,2,...,6 all >= 0; take(3) gives 0,1,2 all pass → true. Take-cap fire at element 3 must not be mistaken for "counterexample found".
+    t |> equal(target_unroll_take_all_pass_fold(), true, "take(3).all(_ >= 0) returns true when all prefix elements pass")
+}
+
+[test]
+def test_unroll_take_all_fail(t : T?) {
+    fixture_unroll2(7)
+    // take(3) gives 0,1,2; element 2 fails `_ <= 1` → false.
+    t |> equal(target_unroll_take_all_fail_fold(), false, "take(3).all(_ <= 1) returns false when prefix contains counterexample")
+}
+
+[test]
+def test_unroll_take_contains_hit(t : T?) {
+    fixture_unroll2(7)
+    // take(5) gives 0..4; contains(2) → true.
+    t |> equal(target_unroll_take_contains_hit_fold(), true, "take(5).contains(2) returns true when value in prefix")
+}
+
+[test]
+def test_unroll_take_contains_miss(t : T?) {
+    fixture_unroll2(7)
+    // take(2) gives 0,1; contains(100) → false. take-cap fires at element 2 but must not be mistaken for a hit.
+    t |> equal(target_unroll_take_contains_miss_fold(), false, "take(2).contains(100) returns false when value not in prefix")
+}
+
+// Slice 5a Copilot review #2 regression guard — take(N) expression must evaluate
+// exactly once per invoke (matches take(src, total:int) call-site semantics).
+// Side-effect counter proves the hoist works.
+
+var private take_n_eval_counter : int = 0
+
+def private take_n_with_side_effect() : int {
+    take_n_eval_counter ++
+    return 3
+}
+
+[export, marker(no_coverage)]
+def target_unroll_take_with_side_effect_fold() : int {
+    return _fold(from_decs_template(type<UnrollChainRow>).take(take_n_with_side_effect()).count())
+}
+
+[test]
+def test_unroll_take_n_evaluated_once(t : T?) {
+    fixture_unroll2(7)
+    take_n_eval_counter = 0
+    let c = target_unroll_take_with_side_effect_fold()
+    t |> equal(c, 3, "take(3).count() returns 3")
+    // Single hoisted evaluation — NOT once per element across 7 entities.
+    t |> equal(take_n_eval_counter, 1, "take(N) expression must evaluate exactly once per invoke")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slice 5b: take_while / skip_while on decs. Predicate-driven ranges, predicates
+// peeled against the source tuple (matches array-side seenSelect bail rule).
+// take_while breaks iteration on first false → routes to for_each_archetype_find
+// just like take(N). skip_while sets a one-way flag (flips false on first
+// non-matching elem); flag hoisted at invoke scope so it persists across
+// archetypes.
+// ─────────────────────────────────────────────────────────────────────────────
+
+[export, marker(no_coverage)]
+def target_unroll_take_while_count_fold() : int {
+    return _fold(from_decs_template(type<UnrollChainRow>)._take_while(_.val < 3).count())
+}
+
+[export, marker(no_coverage)]
+def target_unroll_skip_while_count_fold() : int {
+    return _fold(from_decs_template(type<UnrollChainRow>)._skip_while(_.val < 3).count())
+}
+
+[export, marker(no_coverage)]
+def target_unroll_skip_while_take_while_count_fold() : int {
+    return _fold(from_decs_template(type<UnrollChainRow>)._skip_while(_.val < 2)._take_while(_.val < 5).count())
+}
+
+[export, marker(no_coverage)]
+def target_unroll_where_take_while_count_fold() : int {
+    return _fold(from_decs_template(type<UnrollChainRow>)._where(_.flag == 1)._take_while(_.val < 5).count())
+}
+
+// take_while + select is REJECTED by extract_decs_ranges (canonical order forbids
+// select-after-range — array side bails at linq_fold.das:1623). So for sum/first/
+// to_array splice coverage we drop select and operate on the source tuple
+// directly. first/to_array yield source tuples; sum needs a scalar so we use
+// _select-BEFORE-take_while is also forbidden (skip_while/take_while bail on
+// seenSelect), so sum-after-take_while can't splice on either side. The variants
+// here keep the chain in shapes that DO splice.
+
+[export, marker(no_coverage)]
+def target_unroll_take_while_first_fold() : int {
+    // first returns the source tuple; we extract .val for the parity check.
+    return _fold(from_decs_template(type<UnrollChainRow>)._take_while(_.val < 3).first()).val
+}
+
+[export, marker(no_coverage)]
+def target_unroll_take_while_to_array_fold() : array<tuple<val : int; flag : int>> {
+    return <- _fold(from_decs_template(type<UnrollChainRow>)._take_while(_.val < 3).to_array())
+}
+
+[export, marker(no_coverage)]
+def target_unroll_take_while_min_by_fold() : int {
+    // min_by takes a key extractor lambda over the source tuple — splice fires
+    // (chain prefix empty; rangeInfo carries the take_while; min_by routes to
+    // emit_decs_min_max_by). Source vals 0..6, take_while(<3) keeps 0,1,2 → min .val = 0.
+    return _fold(from_decs_template(type<UnrollChainRow>)._take_while(_.val < 3)._min_by(_.val)).val
+}
+
+[export, marker(no_coverage)]
+def target_unroll_take_while_never_fires_count_fold() : int {
+    // pred always true → take_while never breaks → full source count.
+    return _fold(from_decs_template(type<UnrollChainRow>)._take_while(_.val < 100).count())
+}
+
+[export, marker(no_coverage)]
+def target_unroll_take_while_immediate_break_count_fold() : int {
+    // pred false on first elem → break immediately → 0.
+    return _fold(from_decs_template(type<UnrollChainRow>)._take_while(_.val < 0).count())
+}
+
+[export, marker(no_coverage)]
+def target_unroll_skip_while_never_done_count_fold() : int {
+    // pred always true → skip_while never flips → everything skipped → 0.
+    return _fold(from_decs_template(type<UnrollChainRow>)._skip_while(_.val < 100).count())
+}
+
+[export, marker(no_coverage)]
+def target_unroll_skip_while_immediate_done_count_fold() : int {
+    // pred false on first elem → flag flips on entry → nothing skipped → full count.
+    return _fold(from_decs_template(type<UnrollChainRow>)._skip_while(_.val < 0).count())
+}
+
+[export, marker(no_coverage)]
+def target_unroll_skip_take_while_count_fold() : int {
+    // skip(2) then take_while(val<5) → drops 0,1 → walks 2,3,4 stops at 5 → count 3.
+    return _fold(from_decs_template(type<UnrollChainRow>).skip(2)._take_while(_.val < 5).count())
+}
+
+[export, marker(no_coverage)]
+def target_unroll_skip_while_take_count_fold() : int {
+    // skip_while(val<2) drops 0,1 → take(2) windows 2,3 → count 2.
+    return _fold(from_decs_template(type<UnrollChainRow>)._skip_while(_.val < 2).take(2).count())
+}
+
+// Predicates over the SOURCE TUPLE (no select; select-after-take_while bails per
+// canonical order). This is the only shape where the splice actually fires for
+// any/all/contains + take_while, which is what exercises the explicit-state
+// (decs_found) routing added in emit_decs_early_exit.
+
+[export, marker(no_coverage)]
+def target_unroll_take_while_any_match_fold() : bool {
+    return _fold(from_decs_template(type<UnrollChainRow>)._take_while(_.val < 3)._any(_.val == 2))
+}
+
+[export, marker(no_coverage)]
+def target_unroll_take_while_any_after_window_fold() : bool {
+    // val 5 is outside the take_while window — must NOT report true even though take_while produces inner `return true` on val=3.
+    return _fold(from_decs_template(type<UnrollChainRow>)._take_while(_.val < 3)._any(_.val == 5))
+}
+
+[export, marker(no_coverage)]
+def target_unroll_take_while_all_pass_fold() : bool {
+    return _fold(from_decs_template(type<UnrollChainRow>)._take_while(_.val < 3)._all(_.val < 5))
+}
+
+[export, marker(no_coverage)]
+def target_unroll_take_while_all_fail_fold() : bool {
+    // val=1 fails the all-pred. take_while-stop inner `return true` must not be misread as "no counterexample".
+    return _fold(from_decs_template(type<UnrollChainRow>)._take_while(_.val < 3)._all(_.val == 0))
+}
+
+// take_while + contains: source-tuple equality isn't defined (no `==` on tuple),
+// and the canonical-order rule forbids _select between take_while and contains
+// to project to a scalar — so this combination is not testable on decs today.
+// any/all above already exercise the same useExplicitState code path
+// (contains shares the branch in emit_decs_early_exit).
+
+[test]
+def test_unroll_take_while_count_parity(t : T?) {
+    fixture_unroll2(7)
+    // vals 0,1,2 satisfy <3 → break on val=3 → count 3.
+    t |> equal(target_unroll_take_while_count_fold(), 3, "take_while breaks on first false-pred")
+}
+
+[test]
+def test_unroll_skip_while_count_parity(t : T?) {
+    fixture_unroll2(7)
+    // skip 0,1,2; keep 3..6 → count 4.
+    t |> equal(target_unroll_skip_while_count_fold(), 4, "skip_while drops leading matches, keeps rest")
+}
+
+[test]
+def test_unroll_skip_while_take_while_count_parity(t : T?) {
+    fixture_unroll2(7)
+    // skip 0,1; flag flips on val=2; take_while keeps 2,3,4; breaks on 5 → count 3.
+    t |> equal(target_unroll_skip_while_take_while_count_fold(), 3, "skip_while + take_while compose")
+}
+
+[test]
+def test_unroll_where_take_while_count_parity(t : T?) {
+    fixture_unroll2(7)
+    // flag==1 → vals 1,3,5; take_while(val<5) keeps 1,3; breaks on 5 → count 2.
+    t |> equal(target_unroll_where_take_while_count_fold(), 2, "where + take_while applies pred to post-filter stream")
+}
+
+[test]
+def test_unroll_take_while_first_parity(t : T?) {
+    fixture_unroll2(7)
+    // first returns source tuple; we project to .val. vals 0,1,2 satisfy <3, first = 0.
+    t |> equal(target_unroll_take_while_first_fold(), 0, "take_while + first returns first source elem before break")
+}
+
+[test]
+def test_unroll_take_while_to_array_parity(t : T?) {
+    fixture_unroll2(7)
+    // to_array yields the take_while prefix as tuples; check length + field access on each.
+    let got <- target_unroll_take_while_to_array_fold()
+    t |> equal(length(got), 3, "take_while.to_array() yields the prefix")
+    if (length(got) >= 3) {
+        t |> equal(got[0].val, 0, "first tuple .val")
+        t |> equal(got[1].val, 1, "second tuple .val")
+        t |> equal(got[2].val, 2, "third tuple .val")
+    }
+}
+
+[test]
+def test_unroll_take_while_min_by_parity(t : T?) {
+    fixture_unroll2(7)
+    // min_by takes a key extractor over the source tuple; splice routes to emit_decs_min_max_by
+    // with take_while routing through for_each_archetype_find. Window {0,1,2}; min .val = 0.
+    t |> equal(target_unroll_take_while_min_by_fold(), 0, "take_while + min_by returns the min in window")
+}
+
+[test]
+def test_unroll_take_while_never_fires_returns_all(t : T?) {
+    fixture_unroll2(7)
+    t |> equal(target_unroll_take_while_never_fires_count_fold(), 7, "take_while with always-true pred returns full source count")
+}
+
+[test]
+def test_unroll_take_while_immediate_break_returns_zero(t : T?) {
+    fixture_unroll2(7)
+    t |> equal(target_unroll_take_while_immediate_break_count_fold(), 0, "take_while breaks on first elem when pred false")
+}
+
+[test]
+def test_unroll_skip_while_never_done_returns_zero(t : T?) {
+    fixture_unroll2(7)
+    t |> equal(target_unroll_skip_while_never_done_count_fold(), 0, "skip_while with always-true pred drops everything")
+}
+
+[test]
+def test_unroll_skip_while_immediate_done_returns_all(t : T?) {
+    fixture_unroll2(7)
+    t |> equal(target_unroll_skip_while_immediate_done_count_fold(), 7, "skip_while flag flips on first elem when pred false")
+}
+
+[test]
+def test_unroll_skip_take_while_count_parity(t : T?) {
+    fixture_unroll2(7)
+    t |> equal(target_unroll_skip_take_while_count_fold(), 3, "skip(2) + take_while(val<5) walks 2,3,4")
+}
+
+[test]
+def test_unroll_skip_while_take_count_parity(t : T?) {
+    fixture_unroll2(7)
+    t |> equal(target_unroll_skip_while_take_count_fold(), 2, "skip_while(val<2) + take(2) yields 2,3")
+}
+
+[test]
+def test_unroll_take_while_any_match(t : T?) {
+    fixture_unroll2(7)
+    // val 2 is in the window → true. Real match, not the take_while-stop signal.
+    t |> equal(target_unroll_take_while_any_match_fold(), true, "take_while + any returns true when match in window")
+}
+
+[test]
+def test_unroll_take_while_any_after_window(t : T?) {
+    fixture_unroll2(7)
+    // val 5 outside take_while window → false. take_while-stop must NOT register as a match.
+    t |> equal(target_unroll_take_while_any_after_window_fold(), false, "take_while + any returns false when match outside window")
+}
+
+[test]
+def test_unroll_take_while_all_pass(t : T?) {
+    fixture_unroll2(7)
+    // window {0,1,2}; all < 5 → true.
+    t |> equal(target_unroll_take_while_all_pass_fold(), true, "take_while + all returns true when window satisfies pred")
+}
+
+[test]
+def test_unroll_take_while_all_fail(t : T?) {
+    fixture_unroll2(7)
+    // window {0,1,2}; not all == 0 → false. take_while-stop inner true must not be misread as "no counterexample".
+    t |> equal(target_unroll_take_while_all_fail_fold(), false, "take_while + all returns false on counterexample in window")
+}
+
+[test]
+def test_unroll_take_while_count_splice_shape(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_unroll_take_while_count_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected splice invoke wrapper")
+        t |> equal(describe_count(body_expr, "to_sequence"), 0, "take_while+count splice must NOT call to_sequence")
+        // take_while present → must use the _find variant so first-false propagates across archetypes.
+        t |> equal(describe_count(body_expr, "for_each_archetype_find"), 1, "take_while splice routes to for_each_archetype_find")
+    }
+}
+
+[test]
+def test_unroll_skip_while_count_splice_shape(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_unroll_skip_while_count_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected splice invoke wrapper")
+        t |> equal(describe_count(body_expr, "to_sequence"), 0, "skip_while+count splice must NOT call to_sequence")
+        // skip_while alone does NOT early-exit — must use plain for_each_archetype.
+        t |> equal(describe_count(body_expr, "for_each_archetype_find"), 0, "skip_while-only splice does NOT route to _find")
+        t |> equal(describe_count(body_expr, "for_each_archetype"), 1, "skip_while-only splice uses regular for_each_archetype")
+    }
+}
+
+[test]
+def test_unroll_take_while_any_splice_shape(t : T?) {
+    // Verifies the take_while + any splice fires AND routes through explicit-state
+    // (decs_found) — distinguishing take_while-stop `return true` from real-match
+    // `return true`. This is the exact code path that fails to be exercised when
+    // tests put _select between take_while and the terminator (Copilot PR #2772
+    // review feedback). Predicate over the source tuple keeps the splice hot.
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_unroll_take_while_any_match_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected splice invoke wrapper")
+        t |> equal(describe_count(body_expr, "to_sequence"), 0, "take_while+any splice must NOT fall to tier-2 to_sequence")
+        // take_while-stop produces inner `return true` — needs _find dispatch.
+        t |> equal(describe_count(body_expr, "for_each_archetype_find"), 1, "take_while+any splice routes to for_each_archetype_find")
+        // Explicit-state routing emits `decs_found` to disambiguate take_while-stop from real-match.
+        t |> equal(describe_count(body_expr, "decs_found"), 3, "take_while+any routes through explicit decs_found state (var + set + return)")
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slice 5e: group_by on decs — state-table over for_each_archetype
+// ─────────────────────────────────────────────────────────────────────────────
+
+[decs_template(prefix = "unroll5e_")]
+struct UnrollGroupRow {
+    brand : int
+    val   : int
+    flag  : int
+}
+
+// Mirrors the tuple yielded by the from_decs_template bridge — used to type inner-select lambdas inside `_._1 |> select(@(r : UnrollGroupTup) => r.val) |> ...`.
+typedef UnrollGroupTup = tuple<brand : int; val : int; flag : int>
+
+def private fixture_unroll5e() {
+    // 7 entities: brand=val%3, val=10..16, flag=val%2
+    // brand 0 → vals {12,15}      len=2 sum=27 min=12 max=15 avg=13.5
+    // brand 1 → vals {10,13,16}   len=3 sum=39 min=10 max=16 avg=13.0
+    // brand 2 → vals {11,14}      len=2 sum=25 min=11 max=14 avg=12.5
+    restart()
+    var i = 10
+    while (i <= 16) {
+        let v = i
+        create_entity() @(eid, cmp) {
+            cmp.eid := eid
+            cmp.unroll5e_brand := v % 3
+            cmp.unroll5e_val := v
+            cmp.unroll5e_flag := v % 2
+        }
+        i ++
+    }
+    commit()
+}
+
+[export, marker(no_coverage)]
+def target_unroll5e_groupby_count_fold() : array<tuple<Brand : int; N : int>> {
+    return <- _fold(from_decs_template(type<UnrollGroupRow>)
+                    ._group_by(_.brand)
+                    ._select((Brand = _._0, N = _._1 |> length))
+                    .to_array())
+}
+
+[export, marker(no_coverage)]
+def target_unroll5e_groupby_sum_fold() : array<tuple<Brand : int; S : int>> {
+    return <- _fold(from_decs_template(type<UnrollGroupRow>)
+                    ._group_by(_.brand)
+                    ._select((Brand = _._0, S = _._1 |> select(@(r : UnrollGroupTup) => r.val) |> sum))
+                    .to_array())
+}
+
+[export, marker(no_coverage)]
+def target_unroll5e_groupby_min_fold() : array<tuple<Brand : int; Min : int>> {
+    return <- _fold(from_decs_template(type<UnrollGroupRow>)
+                    ._group_by(_.brand)
+                    ._select((Brand = _._0, Min = _._1 |> select(@(r : UnrollGroupTup) => r.val) |> min))
+                    .to_array())
+}
+
+[export, marker(no_coverage)]
+def target_unroll5e_groupby_max_fold() : array<tuple<Brand : int; Max : int>> {
+    return <- _fold(from_decs_template(type<UnrollGroupRow>)
+                    ._group_by(_.brand)
+                    ._select((Brand = _._0, Max = _._1 |> select(@(r : UnrollGroupTup) => r.val) |> max))
+                    .to_array())
+}
+
+[export, marker(no_coverage)]
+def target_unroll5e_groupby_avg_fold() : array<tuple<Brand : int; Avg : double>> {
+    return <- _fold(from_decs_template(type<UnrollGroupRow>)
+                    ._group_by(_.brand)
+                    ._select((Brand = _._0, Avg = _._1 |> select(@(r : UnrollGroupTup) => r.val) |> average))
+                    .to_array())
+}
+
+[export, marker(no_coverage)]
+def target_unroll5e_groupby_first_fold() : array<tuple<Brand : int; F : int>> {
+    return <- _fold(from_decs_template(type<UnrollGroupRow>)
+                    ._group_by(_.brand)
+                    ._select((Brand = _._0, F = _._1 |> select(@(r : UnrollGroupTup) => r.val) |> first))
+                    .to_array())
+}
+
+[export, marker(no_coverage)]
+def target_unroll5e_groupby_multi_reducer_fold() : array<tuple<Brand : int; N : int; S : int; MX : int>> {
+    return <- _fold(from_decs_template(type<UnrollGroupRow>)
+                    ._group_by(_.brand)
+                    ._select((Brand = _._0,
+                              N = _._1 |> length,
+                              S = _._1 |> select(@(r : UnrollGroupTup) => r.val) |> sum,
+                              MX = _._1 |> select(@(r : UnrollGroupTup) => r.val) |> max))
+                    .to_array())
+}
+
+[export, marker(no_coverage)]
+def target_unroll5e_groupby_count_terminator_fold() : int {
+    return _fold(from_decs_template(type<UnrollGroupRow>)
+                 ._group_by(_.brand)
+                 ._select((Brand = _._0, N = _._1 |> length))
+                 .count())
+}
+
+// Iterator-typed chain — bridge's `to_sequence(res)` makes `_group_by._select` yield iterator<...> by default (no trailing `.to_array()` peel). The splice must emit `to_sequence_move` to match the caller's static type; otherwise error[30343] iterator vs array. Regression guard for Copilot review on PR #2775.
+[export, marker(no_coverage)]
+def target_unroll5e_groupby_iter_typed_fold() : iterator<tuple<Brand : int; N : int>> {
+    return <- _fold(from_decs_template(type<UnrollGroupRow>)
+                    ._group_by(_.brand)
+                    ._select((Brand = _._0, N = _._1 |> length)))
+}
+
+// count(predicate) overload — the planner must NOT pop `.count(_.N >= 2)` as a bare count terminator (would silently drop the predicate). Must cascade to tier-2 so the 2-arg `count(src, pred)` overload runs. Regression guard for Copilot review on PR #2775.
+[export, marker(no_coverage)]
+def target_unroll5e_groupby_count_pred_fold() : int {
+    return _fold(from_decs_template(type<UnrollGroupRow>)
+                 ._group_by(_.brand)
+                 ._select((Brand = _._0, N = _._1 |> length))
+                 ._count(_.N >= 2))
+}
+
+[export, marker(no_coverage)]
+def target_unroll5e_groupby_where_count_fold() : array<tuple<Brand : int; N : int>> {
+    return <- _fold(from_decs_template(type<UnrollGroupRow>)
+                    ._where(_.flag == 1)
+                    ._group_by(_.brand)
+                    ._select((Brand = _._0, N = _._1 |> length))
+                    .to_array())
+}
+
+[export, marker(no_coverage)]
+def target_unroll5e_groupby_select_sum_fold() : array<tuple<K : int; S : int>> {
+    return <- _fold(from_decs_template(type<UnrollGroupRow>)
+                    ._select(_.val)
+                    ._group_by(_ % 3)
+                    ._select((K = _._0, S = _._1 |> sum))
+                    .to_array())
+}
+
+[export, marker(no_coverage)]
+def target_unroll5e_groupby_having_count_fold() : array<tuple<Brand : int; N : int>> {
+    return <- _fold(from_decs_template(type<UnrollGroupRow>)
+                    ._group_by_lazy(_.brand)
+                    ._having(_._1 |> length >= 3)
+                    ._select((Brand = _._0, N = _._1 |> length))
+                    .to_array())
+}
+
+[export, marker(no_coverage)]
+def target_unroll5e_groupby_having_hidden_sum_fold() : array<tuple<Brand : int; N : int>> {
+    return <- _fold(from_decs_template(type<UnrollGroupRow>)
+                    ._group_by_lazy(_.brand)
+                    ._having(_._1 |> select(@(r : UnrollGroupTup) => r.val) |> sum > 30)
+                    ._select((Brand = _._0, N = _._1 |> length))
+                    .to_array())
+}
+
+[test]
+def test_unroll5e_groupby_count_parity(t : T?) {
+    fixture_unroll5e()
+    let got <- target_unroll5e_groupby_count_fold()
+    t |> equal(got.length(), 3, "3 brand buckets")
+    var perBrand : table<int; int>
+    for (item in got) {
+        perBrand[item.Brand] = item.N
+    }
+    t |> equal(perBrand[0], 2)
+    t |> equal(perBrand[1], 3)
+    t |> equal(perBrand[2], 2)
+}
+
+[test]
+def test_unroll5e_groupby_sum_parity(t : T?) {
+    fixture_unroll5e()
+    let got <- target_unroll5e_groupby_sum_fold()
+    t |> equal(got.length(), 3)
+    var perBrand : table<int; int>
+    for (item in got) {
+        perBrand[item.Brand] = item.S
+    }
+    t |> equal(perBrand[0], 27)
+    t |> equal(perBrand[1], 39)
+    t |> equal(perBrand[2], 25)
+}
+
+[test]
+def test_unroll5e_groupby_min_parity(t : T?) {
+    fixture_unroll5e()
+    let got <- target_unroll5e_groupby_min_fold()
+    t |> equal(got.length(), 3)
+    var perBrand : table<int; int>
+    for (item in got) {
+        perBrand[item.Brand] = item.Min
+    }
+    t |> equal(perBrand[0], 12)
+    t |> equal(perBrand[1], 10)
+    t |> equal(perBrand[2], 11)
+}
+
+[test]
+def test_unroll5e_groupby_max_parity(t : T?) {
+    fixture_unroll5e()
+    let got <- target_unroll5e_groupby_max_fold()
+    t |> equal(got.length(), 3)
+    var perBrand : table<int; int>
+    for (item in got) {
+        perBrand[item.Brand] = item.Max
+    }
+    t |> equal(perBrand[0], 15)
+    t |> equal(perBrand[1], 16)
+    t |> equal(perBrand[2], 14)
+}
+
+[test]
+def test_unroll5e_groupby_avg_parity(t : T?) {
+    fixture_unroll5e()
+    let got <- target_unroll5e_groupby_avg_fold()
+    t |> equal(got.length(), 3)
+    var perBrand : table<int; double>
+    for (item in got) {
+        perBrand[item.Brand] = item.Avg
+    }
+    t |> equal(perBrand[0], 13.5lf)
+    t |> equal(perBrand[1], 13.0lf)
+    t |> equal(perBrand[2], 12.5lf)
+}
+
+[test]
+def test_unroll5e_groupby_first_parity(t : T?) {
+    fixture_unroll5e()
+    let got <- target_unroll5e_groupby_first_fold()
+    t |> equal(got.length(), 3)
+    // First per bucket depends on iteration order, but it must be A value FROM the bucket.
+    for (item in got) {
+        if (item.Brand == 0) t |> success(item.F == 12 || item.F == 15, "brand 0 first must be 12 or 15")
+        elif (item.Brand == 1) t |> success(item.F == 10 || item.F == 13 || item.F == 16, "brand 1 first must be 10/13/16")
+        elif (item.Brand == 2) t |> success(item.F == 11 || item.F == 14, "brand 2 first must be 11 or 14")
+    }
+}
+
+[test]
+def test_unroll5e_groupby_multi_reducer_parity(t : T?) {
+    fixture_unroll5e()
+    let got <- target_unroll5e_groupby_multi_reducer_fold()
+    t |> equal(got.length(), 3)
+    var keysSeen = 0
+    for (item in got) {
+        if (item.Brand == 0) {
+            t |> equal(item.N, 2); t |> equal(item.S, 27); t |> equal(item.MX, 15)
+            keysSeen ++
+        } elif (item.Brand == 1) {
+            t |> equal(item.N, 3); t |> equal(item.S, 39); t |> equal(item.MX, 16)
+            keysSeen ++
+        } elif (item.Brand == 2) {
+            t |> equal(item.N, 2); t |> equal(item.S, 25); t |> equal(item.MX, 14)
+            keysSeen ++
+        }
+    }
+    t |> equal(keysSeen, 3, "all 3 keys observed")
+}
+
+[test]
+def test_unroll5e_groupby_count_terminator_parity(t : T?) {
+    fixture_unroll5e()
+    t |> equal(target_unroll5e_groupby_count_terminator_fold(), 3, "count terminator returns length(tab)")
+}
+
+[test]
+def test_unroll5e_groupby_iter_typed_parity(t : T?) {
+    // Walks the iterator-typed chain; counts entries.
+    fixture_unroll5e()
+    var count = 0
+    for (item in target_unroll5e_groupby_iter_typed_fold()) {
+        count ++
+        // Every entry has a valid Brand (0/1/2) and N (count per bucket).
+        t |> success(item.Brand >= 0 && item.Brand <= 2, "Brand in 0..2")
+        t |> success(item.N >= 1, "N >= 1 (at least one row per bucket)")
+    }
+    t |> equal(count, 3, "iterator-typed group_by yields 3 buckets")
+}
+
+[test]
+def test_unroll5e_groupby_count_pred_parity(t : T?) {
+    // Buckets per brand: 0→2, 1→3, 2→2. `_.N >= 2` matches all 3 → result is 3.
+    fixture_unroll5e()
+    t |> equal(target_unroll5e_groupby_count_pred_fold(), 3, "count(predicate) over groups counts buckets satisfying pred")
+    // Smoke: change pred to keep only buckets with N >= 3 → only brand 1.
+}
+
+[test]
+def test_unroll5e_groupby_count_pred_cascade_shape(t : T?) {
+    // count(predicate) must NOT be popped as the bare count terminator (would drop the predicate). Splice cascades to tier-2 eager bridge which honors the 2-arg count overload — verified by presence of tier-2 fingerprints (`to_sequence`, `group_by_lazy_to_array` materialized intermediate).
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_unroll5e_groupby_count_pred_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected invoke wrapper")
+        // Splice did NOT fire: the decs-specific table (`decs_tab`) is absent.
+        t |> equal(describe_count(body_expr, "decs_tab"), 0, "count(pred) must cascade — no decs_tab hoisted")
+        // Tier-2 fingerprint: `count(_, predicate)` runs on the materialized array.
+        t |> success(describe_count(body_expr, "_.N >= 2") >= 1, "predicate body must appear in the cascaded emission")
+    }
+}
+
+[test]
+def test_unroll5e_groupby_iter_typed_splice_shape(t : T?) {
+    // Verifies the iterator-typed splice fires (not falling to tier-2) and emits to_sequence_move at the tail to convert the buffer array to iterator.
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_unroll5e_groupby_iter_typed_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected splice invoke wrapper")
+        // Splice fires: no tier-2 fall-through (would manifest as inner-invoke `to_sequence(res)` from the eager bridge).
+        t |> equal(describe_count(body_expr, "to_sequence("), 0, "iterator-typed group_by splice must NOT call eager bridge's to_sequence(res)")
+        t |> equal(describe_count(body_expr, "for_each_archetype"), 1, "exactly one for_each_archetype outer call")
+        // Tail emits `to_sequence_move(buf)` to convert array<...> result to iterator<...> matching caller's type.
+        t |> equal(describe_count(body_expr, "to_sequence_move"), 1, "iterator-typed splice tail emits to_sequence_move(buf)")
+    }
+}
+
+[test]
+def test_unroll5e_groupby_where_count_parity(t : T?) {
+    fixture_unroll5e()
+    // flag==1 → odd vals: {11,13,15}. Buckets: brand 0→{15} N=1, brand 1→{13} N=1, brand 2→{11} N=1.
+    let got <- target_unroll5e_groupby_where_count_fold()
+    t |> equal(got.length(), 3)
+    var perBrand : table<int; int>
+    for (item in got) {
+        perBrand[item.Brand] = item.N
+    }
+    t |> equal(perBrand[0], 1)
+    t |> equal(perBrand[1], 1)
+    t |> equal(perBrand[2], 1)
+}
+
+[test]
+def test_unroll5e_groupby_select_sum_parity(t : T?) {
+    fixture_unroll5e()
+    // _select(r=>r.val) projects vals 10..16 then group by val%3:
+    // key 0 (vals 12,15) S=27, key 1 (vals 10,13,16) S=39, key 2 (vals 11,14) S=25.
+    let got <- target_unroll5e_groupby_select_sum_fold()
+    t |> equal(got.length(), 3)
+    var perKey : table<int; int>
+    for (item in got) {
+        perKey[item.K] = item.S
+    }
+    t |> equal(perKey[0], 27)
+    t |> equal(perKey[1], 39)
+    t |> equal(perKey[2], 25)
+}
+
+[test]
+def test_unroll5e_groupby_having_count_parity(t : T?) {
+    fixture_unroll5e()
+    // having length >= 3 keeps only brand 1 (N=3).
+    let got <- target_unroll5e_groupby_having_count_fold()
+    t |> equal(got.length(), 1)
+    t |> equal(got[0].Brand, 1)
+    t |> equal(got[0].N, 3)
+}
+
+[test]
+def test_unroll5e_groupby_having_hidden_sum_parity(t : T?) {
+    fixture_unroll5e()
+    // sums: brand 0→27, brand 1→39, brand 2→25. having sum > 30 keeps brand 1 (N=3).
+    let got <- target_unroll5e_groupby_having_hidden_sum_fold()
+    t |> equal(got.length(), 1)
+    t |> equal(got[0].Brand, 1)
+    t |> equal(got[0].N, 3)
+}
+
+[test]
+def test_unroll5e_groupby_count_splice_shape(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_unroll5e_groupby_count_fold)
+        t |> success(func != null, "RTTI must resolve target")
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected splice invoke wrapper")
+        t |> equal(describe_count(body_expr, "to_sequence"), 0, "group_by splice must NOT fall to tier-2 to_sequence")
+        t |> equal(describe_count(body_expr, "for_each_archetype"), 1, "exactly one for_each_archetype outer call")
+        t |> equal(describe_count(body_expr, "for_each_archetype_find"), 0, "group_by does NOT use _find variant (no early-exit)")
+        // State-table hoisted ABOVE the for_each_archetype call so it spans archetypes.
+        t |> equal(describe_count(body_expr, "decs_tab"), 1 + 5, "decs_tab declared once + 5 refs (?[uk], [uk]=, length, values, finalize)")
+        t |> equal(describe_count(body_expr, "decs_dummy"), 1 + 5, "decs_dummy declared once + 5 splice refs (??dummy, addr(dummy), dummy._0=, tab[uk]=dummy, dummy=default)")
+        t |> equal(describe_count(body_expr, "unique_key"), 1, "single unique_key derivation per element")
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slice 5d: order_by / order_by_descending / reverse on decs (buffer arms)
+// ─────────────────────────────────────────────────────────────────────────────
+
+[decs_template(prefix = "unroll5d_")]
+struct Unroll5dRow {
+    id    : int
+    price : int
+    flag  : int
+}
+
+def private fixture_unroll5d() {
+    restart()
+    // 7 rows. price (jumbled walk-order so order_by must actually sort): 30,10,50,20,40,5,35.
+    // flag pattern: even-id => 1, odd-id => 0.
+    let prices = fixed_array(30, 10, 50, 20, 40, 5, 35)
+    for (i in range(7)) {
+        create_entity() @(eid, cmp) {
+            cmp.eid := eid
+            cmp.unroll5d_id := i
+            cmp.unroll5d_price := prices[i]
+            cmp.unroll5d_flag := (i % 2 == 0) ? 1 : 0
+        }
+    }
+    commit()
+}
+
+// ── order_by + to_array (bare sort) ──
+
+[export, marker(no_coverage)]
+def target_unroll5d_order_by_to_array_fold() : array<tuple<id : int; price : int; flag : int>> {
+    return <- _fold(from_decs_template(type<Unroll5dRow>)._order_by(_.price).to_array())
+}
+
+[test]
+def test_unroll5d_order_by_to_array_parity(t : T?) {
+    fixture_unroll5d()
+    let got <- target_unroll5d_order_by_to_array_fold()
+    t |> equal(got.length(), 7)
+    // sorted ascending by price: 5,10,20,30,35,40,50.
+    let expected = [5, 10, 20, 30, 35, 40, 50]
+    for (i in range(7)) {
+        t |> equal(got[i].price, expected[i])
+    }
+}
+
+[export, marker(no_coverage)]
+def target_unroll5d_order_by_desc_to_array_fold() : array<tuple<id : int; price : int; flag : int>> {
+    return <- _fold(from_decs_template(type<Unroll5dRow>)._order_by_descending(_.price).to_array())
+}
+
+[test]
+def test_unroll5d_order_by_desc_to_array_parity(t : T?) {
+    fixture_unroll5d()
+    let got <- target_unroll5d_order_by_desc_to_array_fold()
+    t |> equal(got.length(), 7)
+    let expected = [50, 40, 35, 30, 20, 10, 5]
+    for (i in range(7)) {
+        t |> equal(got[i].price, expected[i])
+    }
+}
+
+// ── order_by + take ──
+
+[export, marker(no_coverage)]
+def target_unroll5d_order_by_take3_fold() : array<tuple<id : int; price : int; flag : int>> {
+    return <- _fold(from_decs_template(type<Unroll5dRow>)._order_by(_.price).take(3).to_array())
+}
+
+[test]
+def test_unroll5d_order_by_take_parity(t : T?) {
+    fixture_unroll5d()
+    let got <- target_unroll5d_order_by_take3_fold()
+    t |> equal(got.length(), 3)
+    let expected = [5, 10, 20]
+    for (i in range(3)) {
+        t |> equal(got[i].price, expected[i])
+    }
+}
+
+[export, marker(no_coverage)]
+def target_unroll5d_order_by_desc_take3_fold() : array<tuple<id : int; price : int; flag : int>> {
+    return <- _fold(from_decs_template(type<Unroll5dRow>)._order_by_descending(_.price).take(3).to_array())
+}
+
+[test]
+def test_unroll5d_order_by_desc_take_parity(t : T?) {
+    fixture_unroll5d()
+    let got <- target_unroll5d_order_by_desc_take3_fold()
+    t |> equal(got.length(), 3)
+    let expected = [50, 40, 35]
+    for (i in range(3)) {
+        t |> equal(got[i].price, expected[i])
+    }
+}
+
+// ── order_by + first ──
+
+[export, marker(no_coverage)]
+def target_unroll5d_order_by_first_fold() : tuple<id : int; price : int; flag : int> {
+    return _fold(from_decs_template(type<Unroll5dRow>)._order_by(_.price).first())
+}
+
+[test]
+def test_unroll5d_order_by_first_parity(t : T?) {
+    fixture_unroll5d()
+    t |> equal(target_unroll5d_order_by_first_fold().price, 5)
+}
+
+[export, marker(no_coverage)]
+def target_unroll5d_order_by_desc_first_fold() : tuple<id : int; price : int; flag : int> {
+    return _fold(from_decs_template(type<Unroll5dRow>)._order_by_descending(_.price).first())
+}
+
+[test]
+def test_unroll5d_order_by_desc_first_parity(t : T?) {
+    fixture_unroll5d()
+    t |> equal(target_unroll5d_order_by_desc_first_fold().price, 50)
+}
+
+// ── order_by + first_or_default ──
+
+[export, marker(no_coverage)]
+def target_unroll5d_order_by_first_or_default_fold() : tuple<id : int; price : int; flag : int> {
+    return _fold(from_decs_template(type<Unroll5dRow>)._order_by(_.price).first_or_default((id = -1, price = -99, flag = -1)))
+}
+
+[test]
+def test_unroll5d_order_by_first_or_default_nonempty(t : T?) {
+    fixture_unroll5d()
+    t |> equal(target_unroll5d_order_by_first_or_default_fold().price, 5)
+}
+
+[test]
+def test_unroll5d_order_by_first_or_default_empty(t : T?) {
+    restart()
+    commit()
+    t |> equal(target_unroll5d_order_by_first_or_default_fold().price, -99, "empty decs source → default")
+}
+
+// Eval-order invariant: the splice must evaluate the first_or_default default expression BEFORE the for_each_archetype loop, matching plan_decs_reverse's first_or_default hoist + the eager-arg-eval semantics of the equivalent non-spliced chain. Detected via a side-effecting predicate that flips a global flag during iter and a side-effecting default that snapshots the flag.
+var g_eval_order_iter_seen : bool = false
+var g_eval_order_default_saw_iter : bool = false
+def trace_pred_for_eval_order(rec : tuple<id : int; price : int; flag : int>) : bool {
+    g_eval_order_iter_seen = true
+    return rec.flag == 1
+}
+def trace_default_for_eval_order() : tuple<id : int; price : int; flag : int> {
+    g_eval_order_default_saw_iter = g_eval_order_iter_seen
+    return (id = -1, price = -99, flag = -1)
+}
+
+[test]
+def test_unroll5d_order_by_first_or_default_eval_order(t : T?) {
+    fixture_unroll5d()
+    g_eval_order_iter_seen = false
+    g_eval_order_default_saw_iter = true
+    let got = _fold(
+        from_decs_template(type<Unroll5dRow>)
+            ._where(trace_pred_for_eval_order(_))
+            ._order_by(_.price)
+            .first_or_default(trace_default_for_eval_order())
+    )
+    t |> equal(g_eval_order_default_saw_iter, false, "default arg evaluated before for_each_archetype iteration")
+    t |> equal(got.flag, 1, "non-empty: top-1 by price among flag==1 returned")
+}
+
+// ── where + order_by + take ──
+
+[export, marker(no_coverage)]
+def target_unroll5d_where_order_by_take_fold() : array<tuple<id : int; price : int; flag : int>> {
+    return <- _fold(from_decs_template(type<Unroll5dRow>)._where(_.flag == 1)._order_by(_.price).take(2).to_array())
+}
+
+[test]
+def test_unroll5d_where_order_by_take_parity(t : T?) {
+    fixture_unroll5d()
+    let got <- target_unroll5d_where_order_by_take_fold()
+    // flag==1 rows: ids 0,2,4,6 → prices 30,50,40,35. Sorted asc: 30,35,40,50. take(2) → 30,35.
+    t |> equal(got.length(), 2)
+    t |> equal(got[0].price, 30)
+    t |> equal(got[1].price, 35)
+}
+
+// ── where + order_by + first ──
+
+[export, marker(no_coverage)]
+def target_unroll5d_where_order_by_first_fold() : tuple<id : int; price : int; flag : int> {
+    return _fold(from_decs_template(type<Unroll5dRow>)._where(_.flag == 1)._order_by(_.price).first())
+}
+
+[test]
+def test_unroll5d_where_order_by_first_parity(t : T?) {
+    fixture_unroll5d()
+    // flag==1 rows: prices 30,50,40,35 → min = 30.
+    t |> equal(target_unroll5d_where_order_by_first_fold().price, 30)
+}
+
+// ── reverse + to_array ──
+
+[export, marker(no_coverage)]
+def target_unroll5d_reverse_to_array_fold() : array<tuple<id : int; price : int; flag : int>> {
+    return <- _fold(from_decs_template(type<Unroll5dRow>).reverse().to_array())
+}
+
+[test]
+def test_unroll5d_reverse_to_array_parity(t : T?) {
+    fixture_unroll5d()
+    let got <- target_unroll5d_reverse_to_array_fold()
+    // Decs walk order is archetype-dependent. We don't assert exact order vs the eager bridge — we assert .reverse() produces the SAME multiset reversed wrt a non-reverse fold. Cheap check: length + presence of all ids.
+    t |> equal(got.length(), 7)
+    var idsSeen : table<int>
+    for (r in got) {
+        idsSeen |> insert(r.id)
+    }
+    for (i in range(7)) {
+        t |> success(key_exists(idsSeen, i), "id {i} present")
+    }
+}
+
+// ── reverse + take ──
+
+[export, marker(no_coverage)]
+def target_unroll5d_reverse_take_fold() : array<tuple<id : int; price : int; flag : int>> {
+    return <- _fold(from_decs_template(type<Unroll5dRow>).reverse().take(3).to_array())
+}
+
+[test]
+def test_unroll5d_reverse_take_parity(t : T?) {
+    fixture_unroll5d()
+    let got <- target_unroll5d_reverse_take_fold()
+    t |> equal(got.length(), 3, "reverse + take(3) yields 3 rows")
+}
+
+[test]
+def test_unroll5d_reverse_take_beyond_length(t : T?) {
+    fixture_unroll5d()
+    let huge = _fold(from_decs_template(type<Unroll5dRow>).reverse().take(99).to_array())
+    t |> equal(huge.length(), 7, "take(N>length) returns all rows reversed")
+}
+
+[test]
+def test_unroll5d_reverse_take_zero(t : T?) {
+    fixture_unroll5d()
+    // Runtime-0 take expression: a const-folded `take(0)` literal trips PERF017 on the splice-emitted resize formula (`takeB < length(buf)` collapses to `0 < length(buf)`).
+    var zeroN = 0  // nolint:LINT003 — kept as var to defeat const-fold of the take(N) arg
+    let zero = _fold(from_decs_template(type<Unroll5dRow>).reverse().take(zeroN).to_array())
+    t |> success(empty(zero), "take(0) returns empty")
+}
+
+// Side-effecting take(N) source — the splice must evaluate the take expression EXACTLY ONCE.
+var g_take_call_count = 0
+def bump_take_count() : int {
+    g_take_call_count ++
+    return 3
+}
+
+[test]
+def test_unroll5d_reverse_take_single_eval(t : T?) {
+    fixture_unroll5d()
+    g_take_call_count = 0
+    let got <- _fold(from_decs_template(type<Unroll5dRow>).reverse().take(bump_take_count()).to_array())
+    t |> equal(got.length(), 3, "take(N) honored — 3 rows")
+    t |> equal(g_take_call_count, 1, "take(N) expression evaluated exactly once (no multi-eval from splice clones)")
+}
+
+// ── reverse + count (identity — counter loop) ──
+
+[export, marker(no_coverage)]
+def target_unroll5d_reverse_count_fold() : int {
+    return _fold(from_decs_template(type<Unroll5dRow>).reverse().count())
+}
+
+[test]
+def test_unroll5d_reverse_count_parity(t : T?) {
+    fixture_unroll5d()
+    t |> equal(target_unroll5d_reverse_count_fold(), 7)
+}
+
+// ── reverse + first (= last of source) ──
+
+[export, marker(no_coverage)]
+def target_unroll5d_where_reverse_first_or_default_fold() : tuple<id : int; price : int; flag : int> {
+    return _fold(from_decs_template(type<Unroll5dRow>)._where(_.flag == 1).reverse().first_or_default((id = -1, price = -99, flag = -1)))
+}
+
+[test]
+def test_unroll5d_where_reverse_first_or_default_empty(t : T?) {
+    restart()
+    commit()
+    t |> equal(target_unroll5d_where_reverse_first_or_default_fold().id, -1, "empty decs source → default")
+}
+
+[test]
+def test_unroll5d_where_reverse_first_or_default_nonempty(t : T?) {
+    fixture_unroll5d()
+    // flag==1 ids = {0,2,4,6}; last-encountered (reverse-of-first) is the maximum encountered id in archetype walk order. We only assert it's one of the flag==1 ids.
+    let id = target_unroll5d_where_reverse_first_or_default_fold().id
+    t |> success(id == 0 || id == 2 || id == 4 || id == 6, "first-of-reverse(flag==1) is one of the matching ids")
+}
+
+// ── where + reverse + to_array ──
+
+[export, marker(no_coverage)]
+def target_unroll5d_where_reverse_to_array_fold() : array<tuple<id : int; price : int; flag : int>> {
+    return <- _fold(from_decs_template(type<Unroll5dRow>)._where(_.flag == 1).reverse().to_array())
+}
+
+[test]
+def test_unroll5d_where_reverse_to_array_parity(t : T?) {
+    fixture_unroll5d()
+    let got <- target_unroll5d_where_reverse_to_array_fold()
+    t |> equal(got.length(), 4)
+    for (r in got) {
+        t |> equal(r.flag, 1)
+    }
+}
+
+// ── where + select + reverse + to_array (projection through reverse) ──
+
+[export, marker(no_coverage)]
+def target_unroll5d_where_select_reverse_to_array_fold() : array<int> {
+    return <- _fold(from_decs_template(type<Unroll5dRow>)._where(_.flag == 1)._select(_.id).reverse().to_array())
+}
+
+[test]
+def test_unroll5d_where_select_reverse_to_array_parity(t : T?) {
+    fixture_unroll5d()
+    let got <- target_unroll5d_where_select_reverse_to_array_fold()
+    t |> equal(got.length(), 4, "4 flag==1 rows projected to id")
+    var idsSeen : table<int>
+    for (id in got) {
+        idsSeen |> insert(id)
+    }
+    for (expectedId in [0, 2, 4, 6]) {
+        t |> success(key_exists(idsSeen, expectedId), "id {expectedId} present in projection")
+    }
+}
+
+// ── AST shape gates ──
+
+[test]
+def test_unroll5d_order_by_take_splice_shape(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_unroll5d_order_by_take3_fold)
+        t |> success(func != null, "RTTI must resolve target")
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected splice invoke wrapper")
+        t |> equal(describe_count(body_expr, "to_sequence"), 0, "order_by+take splice must NOT fall to tier-2 to_sequence (cascade ordering trap)")
+        t |> equal(describe_count(body_expr, "for_each_archetype"), 1, "exactly one for_each_archetype (no eager-bridge wrapping)")
+        t |> equal(describe_count(body_expr, "for_each_archetype_find"), 0, "order family uses for_each_archetype (no early-exit needed)")
+        // Buffer hoisted ABOVE for_each_archetype so it survives the archetype walk.
+        t |> success(describe_count(body_expr, "decs_buf") >= 2, "decs_buf declared + populated")
+        // top_n_by call replaces the array-side to_array / sort sequence.
+        t |> equal(describe_count(body_expr, "top_n_by"), 1, "splice dispatches to top_n_by")
+    }
+}
+
+[test]
+def test_unroll5d_order_by_first_splice_shape(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_unroll5d_order_by_first_fold)
+        t |> success(func != null, "RTTI must resolve target")
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched, "qmatch must capture body")
+        t |> equal(describe_count(body_expr, "to_sequence"), 0, "order_by+first splice must NOT fall to tier-2 to_sequence")
+        t |> equal(describe_count(body_expr, "for_each_archetype"), 1, "exactly one for_each_archetype")
+        // first → min_by on the buffer (NOT top_n_by + index).
+        t |> equal(describe_count(body_expr, "min_by"), 1, "order_by+first emits min_by call")
+        t |> equal(describe_count(body_expr, "top_n_by"), 0, "order_by+first should NOT use top_n_by")
+        // Empty-buffer panic guard present.
+        t |> equal(describe_count(body_expr, "sequence contains no elements"), 1, "panic-on-empty guard for first()")
+    }
+}
+
+[test]
+def test_unroll5d_reverse_to_array_splice_shape(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_unroll5d_reverse_to_array_fold)
+        t |> success(func != null, "RTTI must resolve target")
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched, "qmatch must capture body")
+        t |> equal(describe_count(body_expr, "to_sequence"), 0, "reverse splice must NOT fall to tier-2 to_sequence")
+        t |> equal(describe_count(body_expr, "for_each_archetype"), 1, "exactly one for_each_archetype")
+        t |> equal(describe_count(body_expr, "reverse_inplace"), 1, "buffer reversed via reverse_inplace")
+    }
+}
+
+[test]
+def test_unroll5d_reverse_count_splice_shape(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_unroll5d_reverse_count_fold)
+        t |> success(func != null, "RTTI must resolve target")
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched, "qmatch must capture body")
+        // reverse+count → counter loop, NO buffer, NO reverse_inplace.
+        t |> equal(describe_count(body_expr, "to_sequence"), 0, "reverse+count splice must NOT fall to tier-2 to_sequence")
+        t |> equal(describe_count(body_expr, "for_each_archetype"), 1, "exactly one for_each_archetype")
+        t |> equal(describe_count(body_expr, "reverse_inplace"), 0, "reverse is identity for count — no reverse_inplace")
+        t |> equal(describe_count(body_expr, "decs_buf"), 0, "no buffer needed for count")
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slice 5c: distinct / distinct_by on decs (streaming dedup via hoisted table<unique_key>)
+// ─────────────────────────────────────────────────────────────────────────────
+
+[decs_template(prefix = "unroll5c_")]
+struct Unroll5cRow {
+    id    : int
+    brand : int
+    price : int
+}
+
+def private fixture_unroll5c() {
+    restart()
+    // 12 rows. brand cycles 0..3 (so 4 distinct brands). price = id*10 (12 distinct values).
+    for (i in range(12)) {
+        create_entity() @(eid, cmp) {
+            cmp.eid := eid
+            cmp.unroll5c_id := i
+            cmp.unroll5c_brand := i % 4
+            cmp.unroll5c_price := i * 10
+        }
+    }
+    commit()
+}
+
+// ── distinct |> to_array (bare select + distinct) ──
+
+[export, marker(no_coverage)]
+def target_unroll5c_select_distinct_to_array_fold() : array<int> {
+    return <- _fold(from_decs_template(type<Unroll5cRow>)._select(_.brand).distinct().to_array())
+}
+
+[test]
+def test_unroll5c_select_distinct_to_array_parity(t : T?) {
+    fixture_unroll5c()
+    let got <- target_unroll5c_select_distinct_to_array_fold()
+    t |> equal(got.length(), 4, "4 distinct brands (0..3)")
+    // Brands cycle 0,1,2,3,0,1,2,3,0,1,2,3 → first-seen order is 0,1,2,3.
+    let expected = [0, 1, 2, 3]
+    for (i in range(4)) {
+        t |> equal(got[i], expected[i])
+    }
+}
+
+[test]
+def test_unroll5c_select_distinct_to_array_empty(t : T?) {
+    restart()
+    commit()
+    let got <- target_unroll5c_select_distinct_to_array_fold()
+    t |> equal(got.length(), 0, "empty decs → empty distinct")
+}
+
+// ── distinct |> count ──
+
+[export, marker(no_coverage)]
+def target_unroll5c_select_distinct_count_fold() : int {
+    return _fold(from_decs_template(type<Unroll5cRow>)._select(_.brand).distinct().count())
+}
+
+[test]
+def test_unroll5c_select_distinct_count_parity(t : T?) {
+    fixture_unroll5c()
+    t |> equal(target_unroll5c_select_distinct_count_fold(), 4, "length(seen) = 4 distinct brands")
+}
+
+// ── distinct |> long_count ──
+
+[export, marker(no_coverage)]
+def target_unroll5c_select_distinct_long_count_fold() : int64 {
+    return _fold(from_decs_template(type<Unroll5cRow>)._select(_.brand).distinct().long_count())
+}
+
+[test]
+def test_unroll5c_select_distinct_long_count_parity(t : T?) {
+    fixture_unroll5c()
+    t |> equal(target_unroll5c_select_distinct_long_count_fold(), 4l, "int64(length(seen)) = 4")
+}
+
+// ── distinct |> sum ──
+
+[export, marker(no_coverage)]
+def target_unroll5c_select_distinct_sum_fold() : int {
+    return _fold(from_decs_template(type<Unroll5cRow>)._select(_.brand).distinct().sum())
+}
+
+[test]
+def test_unroll5c_select_distinct_sum_parity(t : T?) {
+    fixture_unroll5c()
+    // sum of distinct brands {0,1,2,3} = 6
+    t |> equal(target_unroll5c_select_distinct_sum_fold(), 6, "acc folds at fresh-key site only")
+}
+
+// ── distinct |> take(N) |> to_array (streaming early-exit) ──
+
+[export, marker(no_coverage)]
+def target_unroll5c_select_distinct_take2_fold() : array<int> {
+    return <- _fold(from_decs_template(type<Unroll5cRow>)._select(_.brand).distinct().take(2).to_array())
+}
+
+[test]
+def test_unroll5c_select_distinct_take_parity(t : T?) {
+    fixture_unroll5c()
+    let got <- target_unroll5c_select_distinct_take2_fold()
+    // First 2 distinct in source order: 0, 1.
+    t |> equal(got.length(), 2)
+    t |> equal(got[0], 0)
+    t |> equal(got[1], 1)
+}
+
+[test]
+def test_unroll5c_select_distinct_take_zero(t : T?) {
+    fixture_unroll5c()
+    let got <- _fold(from_decs_template(type<Unroll5cRow>)._select(_.brand).distinct().take(0).to_array())
+    t |> equal(got.length(), 0, "take(0) yields empty")
+}
+
+[test]
+def test_unroll5c_select_distinct_take_beyond(t : T?) {
+    fixture_unroll5c()
+    let got <- _fold(from_decs_template(type<Unroll5cRow>)._select(_.brand).distinct().take(99).to_array())
+    t |> equal(got.length(), 4, "take(N>num_distinct) returns all distinct")
+}
+
+// ── where + distinct |> to_array ──
+
+[export, marker(no_coverage)]
+def target_unroll5c_where_distinct_to_array_fold() : array<int> {
+    return <- _fold(from_decs_template(type<Unroll5cRow>)._where(_.id < 8)._select(_.brand).distinct().to_array())
+}
+
+[test]
+def test_unroll5c_where_distinct_parity(t : T?) {
+    fixture_unroll5c()
+    let got <- target_unroll5c_where_distinct_to_array_fold()
+    // id<8 → ids 0..7 → brands 0,1,2,3,0,1,2,3 → distinct = 4.
+    t |> equal(got.length(), 4)
+}
+
+// ── distinct_by(key) |> to_array ──
+
+[export, marker(no_coverage)]
+def target_unroll5c_distinct_by_to_array_fold() : array<tuple<id : int; brand : int; price : int>> {
+    return <- _fold(from_decs_template(type<Unroll5cRow>)._distinct_by(_.brand).to_array())
+}
+
+[test]
+def test_unroll5c_distinct_by_parity(t : T?) {
+    fixture_unroll5c()
+    let got <- target_unroll5c_distinct_by_to_array_fold()
+    // First row per distinct brand: ids 0,1,2,3 (brands 0,1,2,3).
+    t |> equal(got.length(), 4)
+    for (i in range(4)) {
+        t |> equal(got[i].id, i)
+        t |> equal(got[i].brand, i)
+    }
+}
+
+// ── distinct_by(key) |> count ──
+
+[export, marker(no_coverage)]
+def target_unroll5c_distinct_by_count_fold() : int {
+    return _fold(from_decs_template(type<Unroll5cRow>)._distinct_by(_.brand).count())
+}
+
+[test]
+def test_unroll5c_distinct_by_count_parity(t : T?) {
+    fixture_unroll5c()
+    t |> equal(target_unroll5c_distinct_by_count_fold(), 4)
+}
+
+// ── distinct_by(key) |> take(N) |> to_array ──
+
+[export, marker(no_coverage)]
+def target_unroll5c_distinct_by_take2_fold() : array<tuple<id : int; brand : int; price : int>> {
+    return <- _fold(from_decs_template(type<Unroll5cRow>)._distinct_by(_.brand).take(2).to_array())
+}
+
+[test]
+def test_unroll5c_distinct_by_take_parity(t : T?) {
+    fixture_unroll5c()
+    let got <- target_unroll5c_distinct_by_take2_fold()
+    t |> equal(got.length(), 2)
+    t |> equal(got[0].brand, 0)
+    t |> equal(got[1].brand, 1)
+}
+
+// ── Side-effect single-eval guard: take(N) limit binds once, projection binds once per element ──
+
+var g_unroll5c_take_arg_calls : int = 0
+def trace_take_arg() : int {
+    g_unroll5c_take_arg_calls ++
+    return 2
+}
+
+[test]
+def test_unroll5c_distinct_take_arg_evaluated_once(t : T?) {
+    fixture_unroll5c()
+    g_unroll5c_take_arg_calls = 0
+    let got <- _fold(from_decs_template(type<Unroll5cRow>)._select(_.brand).distinct().take(trace_take_arg()).to_array())
+    t |> equal(g_unroll5c_take_arg_calls, 1, "take(N) arg must evaluate exactly once at invoke entry, not per fresh-key check")
+    t |> equal(got.length(), 2, "result still matches the bound N")
+}
+
+// ── AST shape gates ──
+
+[test]
+def test_unroll5c_select_distinct_count_splice_shape(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_unroll5c_select_distinct_count_fold)
+        t |> success(func != null, "RTTI must resolve target")
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched, "qmatch must capture body")
+        t |> equal(describe_count(body_expr, "to_sequence"), 0, "distinct+count splice must NOT fall to tier-2 to_sequence")
+        t |> equal(describe_count(body_expr, "for_each_archetype"), 1, "exactly one for_each_archetype (no _find — no take present)")
+        t |> equal(describe_count(body_expr, "for_each_archetype_find"), 0, "no take → no _find")
+        t |> equal(describe_count(body_expr, "decs_buf"), 0, "count terminator elides the buffer")
+        t |> success(describe_count(body_expr, "decs_seen") >= 2, "seen-table declared + queried")
+        t |> equal(describe_count(body_expr, "key_exists"), 1, "single fresh-key check per element")
+    }
+}
+
+[test]
+def test_unroll5c_select_distinct_take_splice_shape(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_unroll5c_select_distinct_take2_fold)
+        t |> success(func != null, "RTTI must resolve target")
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched, "qmatch must capture body")
+        t |> equal(describe_count(body_expr, "to_sequence"), 0, "distinct+take splice must NOT fall to tier-2 to_sequence")
+        // take present → outer iteration switches to _find so take-cap can stop across archetypes.
+        t |> equal(describe_count(body_expr, "for_each_archetype_find"), 1, "take present → for_each_archetype_find")
+        t |> success(describe_count(body_expr, "decs_buf") >= 2, "buffer needed for to_array terminator")
+        t |> success(describe_count(body_expr, "decs_seen") >= 2, "seen-table declared + queried")
+        t |> success(describe_count(body_expr, "decs_taken") >= 2, "taken counter declared + incremented")
+    }
+}
+
+[test]
+def test_unroll5c_distinct_by_to_array_splice_shape(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_unroll5c_distinct_by_to_array_fold)
+        t |> success(func != null, "RTTI must resolve target")
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched, "qmatch must capture body")
+        t |> equal(describe_count(body_expr, "to_sequence"), 0, "distinct_by splice must NOT fall to tier-2")
+        t |> equal(describe_count(body_expr, "for_each_archetype"), 1, "exactly one for_each_archetype")
+        t |> equal(describe_count(body_expr, "for_each_archetype_find"), 0, "no take → no _find")
+        // The key lambda invocation is the distinct_by signature — invoke the key block to compute the key, then unique_key wraps it.
+        t |> success(describe_count(body_expr, "unique_key") >= 1, "distinct_by routes key through unique_key")
+    }
+}
+
+[test]
+def test_unroll5c_select_distinct_sum_splice_shape(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_unroll5c_select_distinct_sum_fold)
+        t |> success(func != null, "RTTI must resolve target")
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched, "qmatch must capture body")
+        t |> equal(describe_count(body_expr, "to_sequence"), 0, "distinct+sum splice must NOT fall to tier-2")
+        t |> equal(describe_count(body_expr, "for_each_archetype"), 1, "no take → plain for_each_archetype")
+        t |> equal(describe_count(body_expr, "decs_buf"), 0, "sum terminator elides the buffer")
+        t |> success(describe_count(body_expr, "decs_acc") >= 2, "accumulator declared + folded")
+    }
+}
+
+// ── Predicate-form terminator regression (Copilot review on PR #2785) — plan_decs_distinct bails on the predicate overload (arg-count guard at the terminator pop); plan_distinct must also bail (post-fix in the same PR). The chain must NOT silently drop the predicate — pre-fix this returned `length(seen)` ignoring the predicate. ──
+
+[test]
+def test_unroll5c_select_distinct_count_pred_parity(t : T?) {
+    fixture_unroll5c()
+    // brands cycle 0..3 (4 distinct). distinct |> count(>=2) → only brands 2 and 3 → 2.
+    let got = _fold(from_decs_template(type<Unroll5cRow>)._select(_.brand).distinct().count($(x : int) => x >= 2))
+    t |> equal(got, 2, "predicate must be honored, not dropped")
+}
+
+[test]
+def test_unroll5c_select_distinct_long_count_pred_parity(t : T?) {
+    fixture_unroll5c()
+    let got = _fold(from_decs_template(type<Unroll5cRow>)._select(_.brand).distinct().long_count($(x : int) => x >= 2))
+    t |> equal(got, 2l, "predicate must be honored, not dropped")
+}
+
