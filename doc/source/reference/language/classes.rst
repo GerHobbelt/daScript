@@ -169,7 +169,33 @@ up the inheritance chain to the nearest ancestor that does:
 
 Walk-up matches by argument types, so overloaded ``super(args)`` calls pick the closest
 ancestor whose constructor or method accepts those arguments. If no ancestor matches, the
-call is rejected at compile time.
+call is rejected at compile time. The walk-up may only step past a class that has no
+user-defined constructor (or method, in the case of ``super.method()``); attempting to
+skip a class whose user constructor (or method) would otherwise establish invariants is
+rejected — call the immediate parent and let it chain via its own ``super()``.
+
+Every constructor in a derived class whose parent has a user-defined constructor must call
+``super(...)`` exactly once on every control-flow path. The lint is unconditional:
+
+* zero ``super(...)`` calls on any reachable path → error;
+* two or more ``super(...)`` calls on any path → error;
+* ``super(...)`` inside a loop body → error (call count is not bounded to one).
+
+When the derived class has *no* constructor of its own and the parent has a user
+constructor callable with no arguments (or with all arguments default-initialized), the
+compiler synthesizes a default constructor for the derived class that chains ``super()``
+automatically — so ``new Derived()`` runs the parent's ctor body instead of silently
+skipping it. If the parent's user constructors all require arguments, the derived class
+must declare its own constructor; otherwise compilation fails with
+``missing_super_call``.
+
+The synth chain only fires when the derived class has *no* user constructor. If the
+derived class defines any user constructor — even one that only takes arguments —
+the auto-generated 0-arg ctor falls back to plain field-init (preserving the existing
+``new Class(field=val)`` named-init idiom). The lint catches missing ``super(...)`` in
+user-defined ctors on every control-flow path, so the user-ctor path always runs the
+parent's invariants. ``new Class()`` (no args) on such a class continues to call the
+field-init synth — it does not run the user ctor.
 
 Inside a derived class's finalizer (``operator delete``), ``delete super.self`` runs the
 parent's finalizer on the current object:
@@ -196,9 +222,6 @@ functions — see :ref:`Structs <structs>`.
 
 Base-class finalization is explicit, not automatic: a derived finalizer that omits
 ``delete super.self`` will not run any ancestor finalizer.
-
-The option ``always_call_super`` can be enabled to require ``super()`` in every constructor
-(see :ref:`Options <options>`).
 
 Alternatively, the parent's method can be called directly using the backtick syntax:
 

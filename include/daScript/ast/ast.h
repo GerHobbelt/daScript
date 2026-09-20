@@ -288,6 +288,8 @@ namespace das
         string describe() const { return name; }
         string getMangledName() const;
         bool hasAnyInitializers() const;
+        bool hasUserConstructor() const;
+        bool hasUserDefaultConstructor() const;
         void serialize( AstSerializer & ser );
         void gc_collect ( gc_root * target, gc_root * from );
         uint64_t getOwnSemanticHash(HashBuilder & hb,das_set<Structure *> & dep, das_set<Annotation *> & adep) const;
@@ -1567,7 +1569,6 @@ namespace das
         /*option*/ bool no_unsafe_uninitialized_structures = true; // if true, then unsafe uninitialized structures are not allowed
         /*option*/ bool strict_properties = false;                 // if true, then properties are strict, i.e. a.prop = b does not get promoted to a.prop := b
         /*option*/ bool no_writing_to_nameless = true;             // if true, then writing to nameless variables (intermediate on the stack) is not allowed
-        /*option*/ bool always_call_super = false;                  // if true, then super() needs to be called from every class constructor
     // environment
         /*option*/ bool no_optimizations = false;                  // disable optimizations, regardless of settings
         /*option*/ bool no_infer_time_folding = false;             // disable infer-time constant folding
