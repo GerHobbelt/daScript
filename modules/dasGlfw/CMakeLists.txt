@@ -122,6 +122,10 @@ IF((NOT DAS_GLFW_INCLUDED) AND ((NOT ${DAS_GLFW_DISABLED}) OR (NOT DEFINED DAS_G
 	ADD_MODULE_LIB(libDasModuleGlfw dasModuleGlfw ${DAS_GLFW_BIND_MODULE_SRC})
 	MACRO(SETUP_GLFW glfw_mod_lib glfw_target)
 		ADD_DEPENDENCIES(${glfw_mod_lib} ${glfw_target})
+		IF(APPLE)
+			# On new MAC versions elaborated-enum-base fails in `Core`.
+			TARGET_COMPILE_OPTIONS(${glfw_mod_lib} PRIVATE -Wno-elaborated-enum-base)
+		ENDIF()
 		IF(UNIX AND NOT APPLE)
 			find_package(OpenGL REQUIRED)
 			target_link_libraries(${glfw_mod_lib} PRIVATE ${OPENGL_gl_LIBRARY} GL X11 Xrandr pthread Xi dl)
@@ -134,6 +138,12 @@ IF((NOT DAS_GLFW_INCLUDED) AND ((NOT ${DAS_GLFW_DISABLED}) OR (NOT DEFINED DAS_G
 	# We do not need to link dynamic library.
 	SETUP_GLFW(dasModuleGlfw GLFW3_DYN)
 	TARGET_LINK_LIBRARIES(dasModuleGlfw PUBLIC ${DAS_GLFW_DYN_PATH})
+	# Xcode 16.4+ triggers -Welaborated-enum-base on macOS SDK headers
+	# included transitively via glfw3native.h → ApplicationServices.h
+	IF(APPLE)
+		TARGET_COMPILE_OPTIONS(libDasModuleGlfw PRIVATE -Wno-elaborated-enum-base)
+		TARGET_COMPILE_OPTIONS(dasModuleGlfw PRIVATE -Wno-elaborated-enum-base)
+	ENDIF()
 	IF(APPLE)
 		find_library(COCOA_LIBRARY Cocoa)
 		find_library(IOKIT_LIBRARY IOKit)

@@ -1129,7 +1129,7 @@ namespace das
 
     void builtin_array_free ( Array & dim, int szt, Context * __context__, LineInfoArg * at ) {
         if ( dim.data ) {
-            if ( !dim.lock || dim.hopeless ) {
+            if ( !dim.isLocked() || dim.hopeless ) {
                 uint32_t oldSize = dim.capacity*szt;
                 __context__->free(dim.data, oldSize, at);
             } else {
@@ -1146,7 +1146,7 @@ namespace das
 
     void builtin_table_free ( Table & tab, int szk, int szv, Context * __context__, LineInfoArg * at ) {
         if ( tab.data ) {
-            if ( !tab.lock || tab.hopeless ) {
+            if ( !tab.isLocked() || tab.hopeless ) {
                 uint32_t oldSize = tab.capacity*(szk+szv+sizeof(TableHashKey));
                 __context__->free(tab.data, oldSize, at);
             } else {
@@ -1551,6 +1551,34 @@ namespace das
 
     const char * compiling_module_name ( ) {
         return daScriptEnvironment::getBound() ? daScriptEnvironment::getBound()->g_compilingModuleName : nullptr;
+    }
+
+    const char * get_module_file_name ( const char * name, Context * context ) {
+        if ( context && context->thisProgram ) {
+            string modName = name ? name : "";
+            if ( modName.empty() ) {
+                // return the main module's file name
+                auto mod = context->thisProgram->thisModule.get();
+                if ( mod && !mod->fileName.empty() ) return mod->fileName.c_str();
+            } else {
+                // search program's library for named module
+                const char * result = nullptr;
+                context->thisProgram->library.foreach([&](Module * mod) {
+                    if ( mod->name == modName && !mod->fileName.empty() ) {
+                        result = mod->fileName.c_str();
+                        return false;
+                    }
+                    return true;
+                }, modName);
+                if ( result ) return result;
+            }
+        }
+        // fallback to global module list
+        auto mod = Module::require(name ? name : "");
+        if ( mod && !mod->fileName.empty() ) {
+            return mod->fileName.c_str();
+        }
+        return nullptr;
     }
 
 // remove define to enable emscripten version
@@ -2135,6 +2163,8 @@ namespace das
             SideEffects::accessExternal, "compiling_file_name");
         addExtern<DAS_BIND_FUN(compiling_module_name)>(*this, lib, "compiling_module_name",
             SideEffects::accessExternal, "compiling_module_name");
+        addExtern<DAS_BIND_FUN(get_module_file_name)>(*this, lib, "get_module_file_name",
+            SideEffects::accessExternal, "get_module_file_name")->args({"name", "context"});
         // logger
         addExtern<DAS_BIND_FUN(toLog)>(*this, lib, "to_log",
             SideEffects::modifyExternal, "toLog")->args({"level", "text", "context", "at"});

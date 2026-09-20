@@ -143,7 +143,7 @@ get_value|insert_clone|emplace_new|insert_default|emplace_default|get_with_defau
         group_by_regex("System infrastructure", mod, %regex~(panic|print|feint|sprint|sprint_json|sscan_json|to_log|to_compiler_log|error|terminate|breakpoint|stackwalk|get_das_root|get_das_version|is_in_aot|aot_enabled|is_intern_strings|eval_main_loop)$%%),
         group_by_regex("Memory manipulation", mod, %regex~(intptr|memcmp|variant_index|set_variant_index|hash|memcpy|lock_data|map_to_array|map_to_ro_array)$%%),
         group_by_regex("Binary serializer", mod, %regex~(binary_load|binary_save)$%%),
-        group_by_regex("Path and command line", mod, %regex~(get_command_line_arguments)$%%),
+        group_by_regex("Path and command line", mod, %regex~(get_command_line_arguments|with_argv)$%%),
         group_by_regex("Time and date", mod, %regex~(get_time_usec|ref_time_ticks|get_clock|get_time_nsec|mktime)$%%),
         group_by_regex("Platform queries", mod, %regex~(get_context_share_counter|das_is_dll_build|get_platform_name|get_architecture_name)$%%),
         group_by_regex("String formatting", mod, %regex~(fmt)$%%),
@@ -157,7 +157,7 @@ get_value|insert_clone|emplace_new|insert_default|emplace_default|get_with_defau
         group_by_regex("Algorithms", mod, %regex~(swap|iter_range|count|ucount)$%%),
         group_by_regex("Memset", mod, %regex~(memset.*)$%%),
         group_by_regex("Malloc", mod, %regex~(malloc|free|malloc_usable_size)$%%),
-        group_by_regex("Compilation and AOT", mod, %regex~(is_aot_enabled|set_aot|reset_aot|compiling_file_name|compiling_module_name)$%%))
+        group_by_regex("Compilation and AOT", mod, %regex~(is_aot_enabled|set_aot|reset_aot|compiling_file_name|compiling_module_name|get_module_file_name)$%%))
     document("Built-in runtime", mod, "builtin.rst", groups);
 }
 
@@ -169,7 +169,7 @@ def document_module_fio(root : string) {
         group_by_regex("Path manipulation", mod, %regex~(base_name|dir_name|get_full_file_name|extension|stem|replace_extension|path_join|normalize|is_absolute|relative|parent)$%%),
         group_by_regex("Directory manipulation", mod, %regex~(dir|dir_rec|mkdir|mkdir_rec|rmdir|rmdir_rec|chdir|getcwd)$%%),
         group_by_regex("Filesystem queries", mod, %regex~(temp_directory|create_temp_file|create_temp_directory|disk_space)$%%),
-        group_by_regex("OS specific routines", mod, %regex~(sleep|exit|popen|popen_binary|popen_timeout|popen_timed_out|get_env_variable|sanitize_command_line|has_env_variable)$%%),
+        group_by_regex("OS specific routines", mod, %regex~(sleep|exit|system|popen|popen_binary|popen_timeout|popen_timed_out|get_env_variable|sanitize_command_line|has_env_variable)$%%),
         group_by_regex("Dynamic modules", mod, %regex~(register_dynamic_module|register_native_path)$%%)
     )
     document("File input output library", mod, "fio.rst", groups)

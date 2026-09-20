@@ -12,6 +12,7 @@
 #include "daScript/simulate/fs_file_info.h"
 #include "daScript/ast/dyn_modules.h"
 #include "daScript/misc/crash_handler.h"
+#include <sys/stat.h>
 
 #if defined(_WIN32) && defined(_DEBUG)
 #include <crtdbg.h>
@@ -53,6 +54,7 @@ static SetFloatFn dll_set_fps = nullptr;
 static SetBoolFn  dll_set_is_reload = nullptr;
 static SetBoolFn  dll_set_paused = nullptr;
 static VoidFn  dll_clear_reload_flags = nullptr;
+static VoidFn  dll_clear_live_vars = nullptr;
 static VoidFn  dll_clear_error = nullptr;
 
 typedef void (*SetStringFn)(const char *);
@@ -86,6 +88,7 @@ static bool load_live_host_functions() {
     dll_set_is_reload     = (SetBoolFn)get_dll_symbol("live_host_set_is_reload");
     dll_set_paused        = (SetBoolFn)get_dll_symbol("live_host_set_paused");
     dll_clear_reload_flags = (VoidFn)get_dll_symbol("live_host_clear_reload_flags");
+    dll_clear_live_vars   = (VoidFn)get_dll_symbol("live_host_clear_live_vars");
     dll_clear_error       = (VoidFn)get_dll_symbol("live_host_clear_error");
     dll_set_last_error    = (SetStringFn)get_dll_symbol("live_host_set_last_error");
     dll_set_live_mode        = (SetBoolFn)get_dll_symbol("live_host_set_live_mode");
@@ -163,6 +166,7 @@ static CompileResult compile_script(const string & fn) {
     policies.persistent_heap = true;
     policies.threadlock_context = true;
     policies.ignore_shared_modules = true;
+    policies.rtti = true;
 
     result.program = compileDaScript(fn, result.access, tout, dummyGroup, policies);
     if (!result.program) {
@@ -244,57 +248,84 @@ static void call_annotated_list(Context * ctx, const vector<SimFunction *> & fns
 
 // --- Set watched files ---
 
-static void set_watched_files(const string & scriptFile) {
+static void set_watched_files(Context * ctx) {
     if (!dll_set_watched_files) return;
-    const char * files[] = { scriptFile.c_str() };
-    dll_set_watched_files(files, 1);
+    auto allFiles = ctx->getAllFiles();
+    vector<string> names;
+    names.reserve(allFiles.size());
+    for (auto * fi : allFiles) {
+        if (fi && !fi->name.empty()) {
+            struct stat st;
+            if (stat(fi->name.c_str(), &st) == 0) {
+                names.push_back(fi->name);
+            }
+        }
+    }
+    vector<const char *> ptrs;
+    ptrs.reserve(names.size());
+    for (auto & n : names) {
+        ptrs.push_back(n.c_str());
+    }
+    if (!ptrs.empty()) {
+        dll_set_watched_files(ptrs.data(), int(ptrs.size()));
+    }
 }
 
 // --- Main lifecycle loop ---
 
 static int run_lifecycle(const string & fn) {
     auto cr = compile_script(fn);
-    if (!cr.ctx) return 1;
 
-    auto * ctx = cr.ctx.get();
+    Context * ctx = cr.ctx ? cr.ctx.get() : nullptr;
+    SimFunction * fnInit = nullptr;
+    SimFunction * fnUpdate = nullptr;
+    SimFunction * fnShutdown = nullptr;
 
-    // Detect mode: init exists → lifecycle, otherwise → main
-    auto * fnInit = find_void_function(ctx, "init");
-    auto * fnUpdate = find_void_function(ctx, "update");
-    auto * fnShutdown = find_void_function(ctx, "shutdown");
-    auto * fnMain = find_void_function(ctx, "main");
+    if (!ctx) {
+        // Initial compile failed — enter main loop with no context, paused,
+        // so the REST API can report the error and accept reload requests
+        tout << "daslang-live: initial compile FAILED, waiting for reload\n";
+        if (dll_set_last_error) dll_set_last_error(cr.errors.c_str());
+        if (dll_set_paused) dll_set_paused(true);
+    } else {
+        // Detect mode: init exists → lifecycle, otherwise → main
+        fnInit = find_void_function(ctx, "init");
+        fnUpdate = find_void_function(ctx, "update");
+        fnShutdown = find_void_function(ctx, "shutdown");
+        auto * fnMain = find_void_function(ctx, "main");
 
-    if (!fnInit && fnMain) {
-        // Simple mode: just call main() like daslang.exe
-        tout << "daslang-live: running main()\n";
-        ctx->restart();
-        ctx->evalWithCatch(fnMain, nullptr);
-        if (auto ex = ctx->getException()) {
-            tout << "EXCEPTION: " << ex << " at " << ctx->exceptionAt.describe() << "\n";
+        if (!fnInit && fnMain) {
+            // Simple mode: just call main() like daslang.exe
+            tout << "daslang-live: running main()\n";
+            ctx->restart();
+            ctx->evalWithCatch(fnMain, nullptr);
+            if (auto ex = ctx->getException()) {
+                tout << "EXCEPTION: " << ex << " at " << ctx->exceptionAt.describe() << "\n";
+                return 1;
+            }
+            return 0;
+        }
+
+        if (!fnInit) {
+            tout << "ERROR: script must export either init() or main()\n";
             return 1;
         }
-        return 0;
-    }
 
-    if (!fnInit) {
-        tout << "ERROR: script must export either init() or main()\n";
-        return 1;
-    }
+        // Lifecycle mode
+        tout << "daslang-live: lifecycle mode (init/update/shutdown)\n";
 
-    // Lifecycle mode
-    tout << "daslang-live: lifecycle mode (init/update/shutdown)\n";
+        if (dll_set_is_reload) dll_set_is_reload(false);
+        if (dll_set_dispatch_context) dll_set_dispatch_context(ctx);
+        set_watched_files(ctx);
+        g_annotated.build(ctx);
+        ctx->restart();
 
-    if (dll_set_is_reload) dll_set_is_reload(false);
-    if (dll_set_dispatch_context) dll_set_dispatch_context(ctx);
-    set_watched_files(fn);
-    g_annotated.build(ctx);
-    ctx->restart();
-
-    // Call init()
-    ctx->evalWithCatch(fnInit, nullptr);
-    if (auto ex = ctx->getException()) {
-        tout << "EXCEPTION in init(): " << ex << " at " << ctx->exceptionAt.describe() << "\n";
-        return 1;
+        // Call init()
+        ctx->evalWithCatch(fnInit, nullptr);
+        if (auto ex = ctx->getException()) {
+            tout << "EXCEPTION in init(): " << ex << " at " << ctx->exceptionAt.describe() << "\n";
+            return 1;
+        }
     }
 
     double lastTime = get_time_sec();
@@ -322,20 +353,24 @@ static int run_lifecycle(const string & fn) {
         }
 
         // Before-update hooks (lockbox dispatch, etc.)
-        call_annotated_list(ctx, g_annotated.before_update);
+        if (ctx) call_annotated_list(ctx, g_annotated.before_update);
 
-        // Update (unless paused)
+        // Update (unless paused or no context)
         bool paused = dll_is_paused ? dll_is_paused() : false;
-        if (!paused) {
+        if (!paused && ctx && fnUpdate) {
             ctx->evalWithCatch(fnUpdate, nullptr);
             if (auto ex = ctx->getException()) {
                 tout << "EXCEPTION in update(): " << ex << " at " << ctx->exceptionAt.describe() << "\n";
                 if (dll_set_paused) dll_set_paused(true);
             }
         }
+        // Avoid busy-spinning when there's no context or paused
+        if (!ctx || paused) {
+            builtin_sleep(16);
+        }
 
         // GC
-        maybe_collect_gc(ctx);
+        if (ctx) maybe_collect_gc(ctx);
 
         // Auto-tick debug agents
         auto_tick_agents();
@@ -349,14 +384,14 @@ static int run_lifecycle(const string & fn) {
             // Set reload flag BEFORE shutdown so is_reload() returns true
             if (dll_set_is_reload) dll_set_is_reload(true);
 
-            // Call [before_reload] functions
-            call_annotated_list(ctx, g_annotated.before_reload);
-
-            // Call shutdown()
-            if (fnShutdown) {
-                ctx->evalWithCatch(fnShutdown, nullptr);
-                if (auto ex = ctx->getException()) {
-                    tout << "EXCEPTION in shutdown() during reload: " << ex << "\n";
+            // Call [before_reload] functions and shutdown (skip if no context, e.g. initial compile failed)
+            if (ctx) {
+                call_annotated_list(ctx, g_annotated.before_reload);
+                if (fnShutdown) {
+                    ctx->evalWithCatch(fnShutdown, nullptr);
+                    if (auto ex = ctx->getException()) {
+                        tout << "EXCEPTION in shutdown() during reload: " << ex << "\n";
+                    }
                 }
             }
 
@@ -367,12 +402,14 @@ static int run_lifecycle(const string & fn) {
                 if (dll_set_last_error) dll_set_last_error(newCr.errors.c_str());
                 if (dll_set_paused) dll_set_paused(true);
                 if (dll_clear_reload_flags) dll_clear_reload_flags();
-                // Re-init old context (shutdown was already called)
-                if (dll_set_is_reload) dll_set_is_reload(true);
-                ctx->restart();
-                call_annotated_list(ctx, g_annotated.after_reload);
-                if (fnInit) {
-                    ctx->evalWithCatch(fnInit, nullptr);
+                // Re-init old context if we have one (shutdown was already called)
+                if (ctx) {
+                    if (dll_set_is_reload) dll_set_is_reload(true);
+                    ctx->restart();
+                    call_annotated_list(ctx, g_annotated.after_reload);
+                    if (fnInit) {
+                        ctx->evalWithCatch(fnInit, nullptr);
+                    }
                 }
                 continue;
             }
@@ -394,18 +431,27 @@ static int run_lifecycle(const string & fn) {
             }
 
             // Reset state
+            bool isFullReload = dll_full_reload && dll_full_reload();
             if (dll_set_dispatch_context) dll_set_dispatch_context(ctx);
+            set_watched_files(ctx);
             g_annotated.build(ctx);
             if (dll_set_is_reload) dll_set_is_reload(true);
             if (dll_set_paused) dll_set_paused(false);
             if (dll_clear_reload_flags) dll_clear_reload_flags();
             if (dll_clear_error) dll_clear_error();
 
+            // Full reload: clear @live var entries so they reset to code defaults
+            if (isFullReload && dll_clear_live_vars) {
+                tout << "daslang-live: full reload — resetting @live variables\n";
+                dll_clear_live_vars();
+            }
+
             // Restart context and restore state before init
             ctx->restart();
 
             // Call [after_reload] functions BEFORE init — restores persistent
             // state (DECS, globals) so init() can use it immediately.
+            // On full reload the store is empty, so these are no-ops.
             call_annotated_list(ctx, g_annotated.after_reload);
 
             // Call init() in new context
@@ -420,7 +466,7 @@ static int run_lifecycle(const string & fn) {
     }
 
     // Shutdown
-    if (fnShutdown) {
+    if (ctx && fnShutdown) {
         ctx->evalWithCatch(fnShutdown, nullptr);
         if (auto ex = ctx->getException()) {
             tout << "EXCEPTION in shutdown(): " << ex << "\n";
@@ -441,12 +487,63 @@ static void print_help() {
     tout << "  -h, --help        — this help\n";
 }
 
+// --- Single instance ---
+
+#ifdef _WIN32
+static HANDLE g_singleInstanceMutex = nullptr;
+#else
+#include <sys/file.h>
+#include <unistd.h>
+static int g_lockFd = -1;
+#endif
+
+static bool acquire_single_instance() {
+#ifdef _WIN32
+    g_singleInstanceMutex = CreateMutexA(nullptr, TRUE, "daslang-live-single-instance");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (g_singleInstanceMutex) {
+            CloseHandle(g_singleInstanceMutex);
+            g_singleInstanceMutex = nullptr;
+        }
+        return false;
+    }
+    return g_singleInstanceMutex != nullptr;
+#else
+    const char * lockPath = "/tmp/daslang-live.lock";
+    g_lockFd = open(lockPath, O_CREAT | O_RDWR, 0600);
+    if (g_lockFd < 0) return true;  // can't create lock file — allow running
+    if (flock(g_lockFd, LOCK_EX | LOCK_NB) != 0) {
+        close(g_lockFd);
+        g_lockFd = -1;
+        return false;
+    }
+    return true;
+#endif
+}
+
+static void release_single_instance() {
+#ifdef _WIN32
+    if (g_singleInstanceMutex) {
+        ReleaseMutex(g_singleInstanceMutex);
+        CloseHandle(g_singleInstanceMutex);
+        g_singleInstanceMutex = nullptr;
+    }
+#else
+    if (g_lockFd >= 0) {
+        flock(g_lockFd, LOCK_UN);
+        close(g_lockFd);
+        g_lockFd = -1;
+    }
+#endif
+}
+
 // --- Entry point ---
 
 int main(int argc, char * argv[]) {
 #if defined(_WIN32) && defined(_DEBUG)
     _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
 #endif
+
     install_das_crash_handler();
 
     string scriptFile;
@@ -479,6 +576,11 @@ int main(int argc, char * argv[]) {
 
     if (scriptFile.empty()) {
         print_help();
+        return 1;
+    }
+
+    if (!acquire_single_instance()) {
+        fprintf(stderr, "ERROR: another instance of daslang-live is already running\n");
         return 1;
     }
 
@@ -540,5 +642,6 @@ int main(int argc, char * argv[]) {
     int result = run_lifecycle(scriptFile);
 
     Module::Shutdown();
+    release_single_instance();
     return result;
 }
