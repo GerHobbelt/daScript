@@ -20,7 +20,7 @@ let JSON_PREFIX = "##lint##\n"
 struct LintResult {
     file : string
     count : int
-    errors : array<string>
+    issues : array<LintIssue>
     failed : bool
     compile_errors : string
     skip_reason : string
@@ -31,6 +31,9 @@ struct Config {
     @clarg_short = "q"
     @clarg_doc = "Suppress PASS lines and progress messages"
     quiet : bool
+
+    @clarg_doc = "Do not print source lines under warnings"
+    silent : bool
 
     @clarg_doc = "Enable STYLE014/STYLE015 comment-length checks"
     comment_hygiene : bool
@@ -64,23 +67,57 @@ struct Config {
     help : bool
 }
 
-def write_deduped(var writer : StringBuilderWriter; messages : array<string>; prefix : string = "  ") {
+var private source_text_cache : table<string; string>
+
+// Same shape the *_collect string overloads emit: pass prefix + message + LineInfo::describe location.
+def private format_issue(issue : LintIssue) : string {
+    let kind = (issue.code |> starts_with("PERF") ? "performance warning: "
+        : (issue.code |> starts_with("STYLE") ? "style warning: " : ""))
+    let loc = empty(issue.file) ? "" : "{issue.file}:{issue.line}:{issue.column}"
+    return "{kind}{issue.message} at {loc}"
+}
+
+def private source_line_at(file : string; lineno : int) : string {
+    if (!source_text_cache |> key_exists(file)) {
+        source_text_cache[file] = fread(file)
+    }
+    let text = source_text_cache[file]
+    return "" if (empty(text))
+    var start = 0
+    for (_ in range(lineno - 1)) {
+        let nl = find(text, "\n", start)
+        return "" if (nl < 0)
+        start = nl + 1
+    }
+    let fin = find(text, "\n", start)
+    let line = fin < 0 ? slice(text, start) : slice(text, start, fin)
+    return line |> strip
+}
+
+def write_deduped(var writer : StringBuilderWriter; issues : array<LintIssue>; prefix : string = "  "; show_source : bool = true) {
     var counts : table<string; int>
-    var order : array<string>
-    for (msg in messages) {
+    var order : array<int>  // index of first occurrence per unique message
+    for (i in range(length(issues))) {
+        let msg = format_issue(issues[i])
         if (key_exists(counts, msg)) {
             counts[msg]++
         } else {
             counts[msg] = 1
-            order |> push(msg)
+            order |> push(i)
         }
     }
-    for (msg in order) {
+    for (i in order) {
+        let msg = format_issue(issues[i])
         let n = counts[msg]
         if (n > 1) {
             writer |> write("{prefix}{msg} (x{n})\n")
         } else {
             writer |> write("{prefix}{msg}\n")
+        }
+        continue if (!show_source || empty(issues[i].file) || issues[i].line <= 0)
+        let src = source_line_at(issues[i].file, issues[i].line)
+        if (!empty(src)) {
+            writer |> write("{prefix}  > {src}\n")
         }
     }
 }
@@ -220,24 +257,24 @@ def lint_file(file : string; run_paranoid, run_perf, run_style, comment_hygiene 
                     return
                 }
                 if (run_paranoid) {
-                    var paranoid_issues : array<string>
-                    result.count += paranoid_collect(program, paranoid_issues, disabled_codes, enabled_codes)
+                    var paranoid_issues : array<LintIssue>
+                    result.count += paranoid_collect_issues(program, paranoid_issues, disabled_codes, enabled_codes)
                     for (w in paranoid_issues) {
-                        result.errors |> push(w)
+                        result.issues |> push(w)
                     }
                 }
                 if (run_perf) {
-                    var perf_issues : array<string>
-                    result.count += perf_lint_collect(program, perf_issues, disabled_codes, enabled_codes)
+                    var perf_issues : array<LintIssue>
+                    result.count += perf_lint_collect_issues(program, perf_issues, disabled_codes, enabled_codes)
                     for (w in perf_issues) {
-                        result.errors |> push(w)
+                        result.issues |> push(w)
                     }
                 }
                 if (run_style) {
-                    var style_issues : array<string>
-                    result.count += style_lint_collect(program, style_issues, disabled_codes, enabled_codes, comment_hygiene)
+                    var style_issues : array<LintIssue>
+                    result.count += style_lint_collect_issues(program, style_issues, disabled_codes, enabled_codes, comment_hygiene)
                     for (w in style_issues) {
-                        result.errors |> push(w)
+                        result.issues |> push(w)
                     }
                 }
             }
@@ -248,7 +285,7 @@ def lint_file(file : string; run_paranoid, run_perf, run_style, comment_hygiene 
 
 // Print a single LintResult in the user-facing format. Shared by serial
 // and parallel paths so output is byte-identical regardless of mode.
-def print_result(result : LintResult; quiet : bool) {
+def print_result(result : LintResult; quiet, silent : bool) {
     if (!empty(result.skip_reason)) {
         if (!quiet) {
             print("SKIP {result.file} {result.skip_reason}\n")
@@ -263,7 +300,7 @@ def print_result(result : LintResult; quiet : bool) {
     } elif (result.count > 0) {
         print("WARN {result.file} ({result.count})\n")
         print(build_string() $(var w) {
-            write_deduped(w, result.errors)
+            write_deduped(w, result.issues, "  ", !silent)
         })
     } elif (!quiet) {
         print("PASS {result.file}\n")
@@ -292,6 +329,40 @@ def run_worker(paths : array<string>; run_paranoid, run_perf, run_style, comment
         let result = lint_file(f, run_paranoid, run_perf, run_style, comment_hygiene, disabled_codes, enabled_codes)
         print("{JSON_PREFIX}{write_json(JV(result))}\n{JSON_PREFIX}")
     }
+}
+
+// Worker argv: spawn prefix + `--paths-from <chunk>` + the driver's pass/filter flags.
+def build_worker_argv(spawn_prefix : array<string>; chunk_path : string; cfg : Config) : array<string> {
+    var argv : array<string>
+    argv |> reserve(length(spawn_prefix) + 12)
+    argv |> push_from(spawn_prefix)
+    argv |> push("--")
+    argv |> push("--paths-from")
+    argv |> push(chunk_path)
+    if (cfg.quiet) {
+        argv |> push("--quiet")
+    }
+    if (cfg.comment_hygiene) {
+        argv |> push("--comment-hygiene")
+    }
+    if (cfg.paranoid_only) {
+        argv |> push("--paranoid-only")
+    }
+    if (cfg.perf_only) {
+        argv |> push("--perf-only")
+    }
+    if (cfg.style_only) {
+        argv |> push("--style-only")
+    }
+    if (!empty(cfg.disable)) {
+        argv |> push("--disable")
+        argv |> push(cfg.disable |> join(","))
+    }
+    if (!empty(cfg.enable)) {
+        argv |> push("--enable")
+        argv |> push(cfg.enable |> join(","))
+    }
+    return <- argv
 }
 
 // Driver: chunk files, write per-chunk paths-from tempfiles, spawn N
@@ -344,35 +415,7 @@ def run_parallel_lint(files : array<string>; cfg : Config) : array<LintResult> {
             print("error: could not write chunk file {cp}\n")
             return <- results
         }
-        var argv : array<string>
-        argv |> reserve(length(spawn_prefix) + 12)
-        argv |> push_from(spawn_prefix)
-        argv |> push("--")
-        argv |> push("--paths-from")
-        argv |> push(cp)
-        if (cfg.quiet) {
-            argv |> push("--quiet")
-        }
-        if (cfg.comment_hygiene) {
-            argv |> push("--comment-hygiene")
-        }
-        if (cfg.paranoid_only) {
-            argv |> push("--paranoid-only")
-        }
-        if (cfg.perf_only) {
-            argv |> push("--perf-only")
-        }
-        if (cfg.style_only) {
-            argv |> push("--style-only")
-        }
-        if (!empty(cfg.disable)) {
-            argv |> push("--disable")
-            argv |> push(cfg.disable |> join(","))
-        }
-        if (!empty(cfg.enable)) {
-            argv |> push("--enable")
-            argv |> push(cfg.enable |> join(","))
-        }
+        var argv <- build_worker_argv(spawn_prefix, cp, cfg)
         argvs |> emplace(argv)
     }
 
@@ -381,35 +424,8 @@ def run_parallel_lint(files : array<string>; cfg : Config) : array<LintResult> {
     }
 
     let chunk_results <- parallel_workers::run_chunk_workers(argvs)
-
-    // Parse each worker's stdout: alternating JSON_PREFIX-delimited blocks.
     for (cr in chunk_results) {
-        if (cr.exit_code != 0) {
-            print("error: worker {cr.index} exited with code {cr.exit_code}\n")
-        }
-        // Normalize CRLF → LF: on Windows the popen pipe text-mode reader
-        // translates child `\n` to `\r\n`, which prevents `split(JSON_PREFIX)`
-        // (which ends in `\n`) from finding the markers. Strip the trailing
-        // `\r` from each split-on-LF segment, then re-join with LF.
-        let normalized = cr.stdout |> split("\r\n") |> join("\n")
-        let pieces <- normalized |> split(JSON_PREFIX)
-        // Stream emits <PREFIX><json><PREFIX> per file. Splitting on the
-        // marker yields odd-indexed pieces as JSON, even-indexed as
-        // outside-marker text (compile_file chatter, blank). Indexing
-        // by parity is robust to pre/post-marker stdout from the child.
-        for (i in range(length(pieces))) {
-            continue if (i % 2 == 0)
-            let piece = pieces[i]
-            continue if (empty(piece |> strip))
-            var jerr : string
-            let jv = piece |> read_json(jerr)
-            if (jv == null) {
-                print("error: worker {cr.index} emitted invalid JSON: {jerr}\n")
-                continue
-            }
-            let lr <- from_JV(jv, type<LintResult>)
-            results |> push_clone(lr)
-        }
+        parse_worker_output(cr, results)
     }
 
     for (p in chunk_paths) {
@@ -417,6 +433,118 @@ def run_parallel_lint(files : array<string>; cfg : Config) : array<LintResult> {
     }
 
     return <- results
+}
+
+// Parse one worker's stdout — alternating JSON_PREFIX-delimited blocks — into LintResult records.
+def parse_worker_output(cr : parallel_workers::ChunkResult; var results : array<LintResult>) : void {
+    if (cr.exit_code != 0) {
+        print("error: worker {cr.index} exited with code {cr.exit_code}\n")
+    }
+    // Normalize CRLF → LF: on Windows the popen pipe text-mode reader
+    // translates child `\n` to `\r\n`, which prevents `split(JSON_PREFIX)`
+    // (which ends in `\n`) from finding the markers. Strip the trailing
+    // `\r` from each split-on-LF segment, then re-join with LF.
+    let normalized = cr.stdout |> split("\r\n") |> join("\n")
+    let pieces <- normalized |> split(JSON_PREFIX)
+    // Stream emits <PREFIX><json><PREFIX> per file. Splitting on the
+    // marker yields odd-indexed pieces as JSON, even-indexed as
+    // outside-marker text (compile_file chatter, blank). Indexing
+    // by parity is robust to pre/post-marker stdout from the child.
+    for (i in range(length(pieces))) {
+        continue if (i % 2 == 0)
+        let piece = pieces[i]
+        continue if (empty(piece |> strip))
+        var jerr : string
+        let jv = piece |> read_json(jerr)
+        if (jv == null) {
+            print("error: worker {cr.index} emitted invalid JSON: {jerr}\n")
+            continue
+        }
+        let lr <- from_JV(jv, type<LintResult>)
+        results |> push_clone(lr)
+    }
+}
+
+// CLI --disable/--enable → code tables, layered with repo policy (default-off rules + .lint_config).
+// Prints the error and returns false on an invalid rule code.
+def resolve_rule_filters(cfg : Config; var disabled_codes : table<string>&; var enabled_codes : table<string>&) : bool {
+    let dis_bad = normalize_rule_list(cfg.disable, disabled_codes)
+    if (!empty(dis_bad)) {
+        print("error: invalid rule code \"{dis_bad}\" in --disable (expected LINT|PERF|STYLE + 3 digits)\n")
+        return false
+    }
+    let en_bad = normalize_rule_list(cfg.enable, enabled_codes)
+    if (!empty(en_bad)) {
+        print("error: invalid rule code \"{en_bad}\" in --enable (expected LINT|PERF|STYLE + 3 digits)\n")
+        return false
+    }
+    // Layer repo-wide policy on top of CLI flags: default-off rules + .lint_config.
+    // Skipped under --enable (whitelist mode) so the user's explicit pick wins.
+    if (empty(enabled_codes)) {
+        seed_default_disabled(disabled_codes)
+        load_lint_config(disabled_codes)
+    }
+    return true
+}
+
+// Driver-mode positionals → sorted .das file list. Returns a process exit code, or -1 to proceed.
+def collect_input_files(var files : array<string>&) : int {
+    let cli_args <- get_user_args()
+    let paths <- [for (arg in cli_args); arg; where !starts_with(arg, "-")]
+    if (empty(paths)) {
+        print("Error: no files or directories specified\n\n")
+        print_help(get_command_info(type<Config>), "utils/lint/main.das")
+        return 1
+    }
+    var cache : table<string; void?>
+    var skipped = 0
+    for (p in paths) {
+        // absolutize: module identity is spelling-sensitive — a relative root file registers
+        // same-dir requires under a relative key while module-mount-routed requires register
+        // absolute, tripping error 20605 "several modules with the same name" (e.g. dasPEG)
+        let full = get_full_file_name(p)
+        scan_das_files(empty(full) ? p : replace(full, "\\", "/"), files, cache, skipped)
+    }
+    if (empty(files)) {
+        // All inputs were intentionally skipped (e.g. builtin.das) -- success.
+        // Distinguishes a clean "nothing to lint" from a genuine "no .das at the
+        // given path", which still errors. This matters for the pre-push hook:
+        // a commit that only touches a skip-listed file would otherwise fail.
+        return 0 if (skipped > 0)
+        print("Error: no .das files found\n")
+        return 1
+    }
+    // Sort so output is deterministic across runs (filesystem traversal
+    // order varies by FS) and matches parallel mode byte-for-byte.
+    files |> sort
+    return -1
+}
+
+def tally_result(result : LintResult; var issues : int&; var errors : int&; var skipped : int&) : void {
+    if (!empty(result.skip_reason)) {
+        skipped++
+    } elif (result.failed) {
+        errors++
+    } elif (result.count > 0) {
+        issues += result.count
+    }
+}
+
+// Prints the summary block; returns the process exit code (0 clean, 1 errors, 2 issues).
+def print_summary(files_count, total_issues, total_errors, total_skipped : int) : int {
+    print("\n--- Summary ---\n")
+    if (total_skipped > 0) {
+        print("{files_count} files, {total_issues} issue(s), {total_errors} error(s), {total_skipped} skipped\n")
+    } else {
+        print("{files_count} files, {total_issues} issue(s), {total_errors} error(s)\n")
+    }
+    if (total_errors > 0) {
+        return 1
+    } elif (total_issues > 0) {
+        return 2
+    } else {
+        return 0
+    }
 }
 
 [export]
@@ -442,23 +570,7 @@ def main() : int {
 
     var disabled_codes : table<string>
     var enabled_codes : table<string>
-    let dis_bad = normalize_rule_list(cfg.disable, disabled_codes)
-    if (!empty(dis_bad)) {
-        print("error: invalid rule code \"{dis_bad}\" in --disable (expected LINT|PERF|STYLE + 3 digits)\n")
-        return 1
-    }
-    let en_bad = normalize_rule_list(cfg.enable, enabled_codes)
-    if (!empty(en_bad)) {
-        print("error: invalid rule code \"{en_bad}\" in --enable (expected LINT|PERF|STYLE + 3 digits)\n")
-        return 1
-    }
-
-    // Layer repo-wide policy on top of CLI flags: default-off rules + .lint_config.
-    // Skipped under --enable (whitelist mode) so the user's explicit pick wins.
-    if (empty(enabled_codes)) {
-        seed_default_disabled(disabled_codes)
-        load_lint_config(disabled_codes)
-    }
+    if (!resolve_rule_filters(cfg, disabled_codes, enabled_codes)) return 1
 
     // Worker mode: lint a pre-resolved list from a paths-from file and emit
     // JSON-wrapped results. No banner, no summary, no exit-code derivation.
@@ -473,35 +585,9 @@ def main() : int {
     }
 
     // Driver mode: scan positional paths, collect file list.
-    let cli_args <- get_user_args()
-    let paths <- [for (arg in cli_args); arg; where !starts_with(arg, "-")]
-    if (empty(paths)) {
-        print("Error: no files or directories specified\n\n")
-        print_help(get_command_info(type<Config>), "utils/lint/main.das")
-        return 1
-    }
     var files : array<string>
-    var cache : table<string; void?>
-    var skipped = 0
-    for (p in paths) {
-        // absolutize: module identity is spelling-sensitive — a relative root file registers
-        // same-dir requires under a relative key while module-mount-routed requires register
-        // absolute, tripping error 20605 "several modules with the same name" (e.g. dasPEG)
-        let full = get_full_file_name(p)
-        scan_das_files(empty(full) ? p : replace(full, "\\", "/"), files, cache, skipped)
-    }
-    if (empty(files)) {
-        // All inputs were intentionally skipped (e.g. builtin.das) -- success.
-        // Distinguishes a clean "nothing to lint" from a genuine "no .das at the
-        // given path", which still errors. This matters for the pre-push hook:
-        // a commit that only touches a skip-listed file would otherwise fail.
-        return 0 if (skipped > 0)
-        print("Error: no .das files found\n")
-        return 1
-    }
-    // Sort so output is deterministic across runs (filesystem traversal
-    // order varies by FS) and matches parallel mode byte-for-byte.
-    files |> sort
+    let collect_rc = collect_input_files(files)
+    if (collect_rc >= 0) return collect_rc
 
     var total_issues = 0
     var total_errors = 0
@@ -512,14 +598,8 @@ def main() : int {
         // Sort by file path so output is deterministic across worker counts.
         sort(results, $(a, b : LintResult) => a.file < b.file)
         for (result in results) {
-            print_result(result, cfg.quiet)
-            if (!empty(result.skip_reason)) {
-                total_skipped++
-            } elif (result.failed) {
-                total_errors++
-            } elif (result.count > 0) {
-                total_issues += result.count
-            }
+            print_result(result, cfg.quiet, cfg.silent)
+            tally_result(result, total_issues, total_errors, total_skipped)
         }
     } else {
         if (!cfg.quiet) {
@@ -530,28 +610,10 @@ def main() : int {
                 print("checking {file}...\n")
             }
             let result = lint_file(file, run_paranoid, run_perf, run_style, cfg.comment_hygiene, disabled_codes, enabled_codes)
-            print_result(result, cfg.quiet)
-            if (!empty(result.skip_reason)) {
-                total_skipped++
-            } elif (result.failed) {
-                total_errors++
-            } elif (result.count > 0) {
-                total_issues += result.count
-            }
+            print_result(result, cfg.quiet, cfg.silent)
+            tally_result(result, total_issues, total_errors, total_skipped)
         }
     }
 
-    print("\n--- Summary ---\n")
-    if (total_skipped > 0) {
-        print("{length(files)} files, {total_issues} issue(s), {total_errors} error(s), {total_skipped} skipped\n")
-    } else {
-        print("{length(files)} files, {total_issues} issue(s), {total_errors} error(s)\n")
-    }
-    if (total_errors > 0) {
-        return 1
-    } elif (total_issues > 0) {
-        return 2
-    } else {
-        return 0
-    }
+    return print_summary(length(files), total_issues, total_errors, total_skipped)
 }

@@ -216,6 +216,7 @@ def document_module_fio(_root : string) {
     var mod = [get_module("fio_core"), find_module("fio")]
     var groups <- array<DocGroup>(
         hide_group(group_by_regex("Internal builtin functions", mod, %regex~builtin%%)),
+        group_by_regex("Direct IO and mapping advice", mod, %regex~(dwrite_open|dwrite_append|dwrite_band|dwrite_commit|dwrite_stat|dwrite_close|prefetch_map)$%%),
         group_by_regex("File manipulation", mod, %regex~(f|long_f|stat$|getchar|remove|rename|copy_file|file_size|equivalent|is_symlink|set_mtime)%%),
         group_by_regex("Path manipulation", mod, %regex~(base_name|dir_name|get_full_file_name|extension|stem|replace_extension|path_join|normalize|to_generic_path|is_absolute|relative|relative_result|parent)$%%),
         group_by_regex("Directory manipulation", mod, %regex~(dir|dir_rec|mkdir|mkdir_rec|mkdir_result|rmdir|rmdir_rec|rmdir_rec_result|rmdir_result|chdir|getcwd)$%%),
@@ -1797,10 +1798,10 @@ def document_module_gltf(_root : string) {
 // das2rst compiles tuned libraries to inspect their source API. The explicit
 // documentation context keeps all [tune] transforms and policy machinery inert.
 [export]
-def main {
+def main {  // nolint:STYLE038 — flat one-call-per-documented-module dispatch list
     disable_profiler(this_context())
     disable_profiler_log(this_context())
-    ast_gc_guard() {
+    ast_gc_guard() {  // nolint:STYLE038 — same flat dispatch list, one guard scope
     let root = get_das_root() + "/doc/source/stdlib/generated"
     // document embedded modules
     document_module_builtin(root)

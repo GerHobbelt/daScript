@@ -53,15 +53,148 @@ struct ImgSection {
 // the box + knob identity an image is valid for; folded into filename AND header. A PURE
 // formatter of DlimConfiguration — the backend-select side effect lives in the config's cpu
 // source, so callers need no ordering ritual. `tag` distinguishes kinds sharing one source path.
-def image_identity(tag : string = "") : string {
-    return dlim_identity(dlim_config_current(), IMAGE_VERSION, tag)
+def image_identity(tag : string = ""; quant : string = "q8") : string {
+    return dlim_identity(dlim_config_current(quant), IMAGE_VERSION, tag)
 }
 
 // the image path for (gguf, current identity) — knob combos coexist as separate files
 // (the full 64-bit hash keeps that deterministic in practice; the header check would catch
 // a collision loudly, but two identities fighting over one path re-save forever)
-def image_path_for(gguf_path : string; tag : string = "") : string {
-    return "{gguf_path}.{hash(image_identity(tag))}.dlim"
+def image_path_for(gguf_path : string; tag : string = ""; quant : string = "q8") : string {
+    return "{gguf_path}.{hash(image_identity(tag, quant))}.dlim"
+}
+
+//! What list/GC tooling reads from an image WITHOUT loading it: the header fields plus the
+//! meta head's baked identity and embedded config JSON (empty when the version's layout is
+//! unknown — pre-v7 images carry no readable head).
+struct DlimPeek {
+    valid : bool          //!< magic/page/bounds all sane (any version)
+    version : int
+    bytes : int64
+    identity : string
+    config_json : string
+}
+
+def image_peek(path : string) : DlimPeek {
+    var p = DlimPeek()
+    var msize = 0ul
+    var base : void?
+    unsafe {
+        base = fmap_open(path, addr(msize))
+    }
+    if (base == null || int64(msize) < IMAGE_HEADER_BYTES) {
+        if (base != null) {
+            unsafe(fmap_close(base, msize))
+        }
+        return p
+    }
+    var bp = unsafe(reinterpret<uint8 const?>(base))
+    p.bytes = int64(msize)
+    p.version = int(read_u32(bp, 4l))
+    let meta_off = read_u64(bp, 16l)
+    let meta_bytes = read_u64(bp, 24l)
+    p.valid = (read_u32(bp, 0l) == IMAGE_MAGIC && read_u32(bp, 8l) == uint(IMAGE_PAGE)
+        && read_u64(bp, 32l) == msize && meta_bytes != 0ul && meta_bytes <= msize
+        && meta_off <= msize - meta_bytes && meta_bytes <= uint64(INT_MAX))
+    if (p.valid && p.version >= 7) {
+        var head : array<uint8>
+        head |> resize(int(min(meta_bytes, 65536ul)))
+        unsafe {
+            memcpy(addr(head[0]), reinterpret<void?>(bp + int64(meta_off)), uint64(long_length(head)))
+        }
+        var hmeta <- new MemSerializer(head)
+        var harch = Archive(reading = true, stream = hmeta)
+        harch |> serialize(p.identity)
+        harch |> serialize(p.config_json)
+        if (!hmeta->OK()) {
+            p.identity = ""
+            p.config_json = ""
+        }
+        delete head
+        unsafe {
+            delete hmeta
+        }
+    }
+    unsafe(fmap_close(base, msize))
+    return p
+}
+
+//! One .dlim sibling of a GGUF, as list/GC tooling sees it (converter --list, the server page).
+struct DlimImageInfo {
+    file : string         //!< basename
+    path : string
+    bytes : int64
+    version : int
+    verdict : string      //!< CURRENT | OTHER | STALE vN | BROKEN
+    identity : string
+}
+
+//! The identities THIS box would produce right now, across flavors and quants — the CURRENT
+//! verdict's reference set. Callers pin the box profile first (same ordering as the load path).
+def dlim_current_identities : table<string> {
+    var idents : table<string>
+    for (q in ["q8", "fp32", "q4_0"]) {
+        idents |> insert(image_identity("", q))
+        idents |> insert(image_identity(METAL_IMAGE_TAG, q))
+        let vk = moe_gpu_bake_tag()
+        if (vk != "") {
+            idents |> insert(image_identity(vk, q))
+        }
+    }
+    return <- idents
+}
+
+def dlim_image_verdict(p : DlimPeek; current : table<string>) : string {
+    if (!p.valid) {
+        return "BROKEN"
+    }
+    if (p.version != IMAGE_VERSION) {
+        return "STALE v{p.version}"
+    }
+    return key_exists(current, p.identity) ? "CURRENT" : "OTHER"
+}
+
+//! Every .dlim beside `gguf_path` (or in a directory), with sizes and verdicts.
+def dlim_inventory(gguf_path : string) : array<DlimImageInfo> {
+    var out : array<DlimImageInfo>
+    var st : FStat
+    if (!stat(gguf_path, st)) {
+        return <- out
+    }
+    let dirp = st.is_dir ? gguf_path : dir_name(gguf_path)
+    let base = st.is_dir ? "" : base_name(gguf_path)
+    var current <- dlim_current_identities()
+    dir(dirp) $(name : string) {
+        if (!(name |> ends_with(".dlim")) || (base != "" && !(name |> starts_with(base)))) {
+            return
+        }
+        let full = path_join(dirp, name)
+        let p = image_peek(full)
+        out |> push(DlimImageInfo(file = name, path = full, bytes = p.bytes, version = p.version,
+                                  verdict = dlim_image_verdict(p, current), identity = p.identity))
+    }
+    delete current
+    return <- out
+}
+
+//! The dlim GC: remove what can never load again (BROKEN + version-stale) beside `gguf_path`.
+//! NEVER a loadable image — OTHER may be another box's bake carried here on purpose.
+//! apply = false is a dry run (stale counted, nothing removed).
+def dlim_clean(gguf_path : string; apply : bool) : tuple<total : int; stale : int; removed : int; freed : int64> {
+    var r = (total = 0, stale = 0, removed = 0, freed = 0l)
+    var inv <- dlim_inventory(gguf_path)
+    for (im in inv) {
+        r.total++
+        continue if (im.verdict != "BROKEN" && !(im.verdict |> starts_with("STALE")))
+        r.stale++
+        if (apply && remove(im.path)) {
+            r.removed++
+            r.freed += im.bytes
+            to_log(LOG_INFO, "dasLLAMA image: GC removed {im.file} ({im.bytes >> 20l} MB, {im.verdict})\n")
+        }
+    }
+    delete inv
+    return r
 }
 
 def private pad_to_page(cur : uint64) : uint64 {
@@ -311,6 +444,7 @@ def private serialize_image_meta(var arch : Archive; var t : Model) {
     arch |> serialize_raw(t.ple_post_off)
     arch |> serialize_raw(t.wscale_f16)
     arch |> serialize_raw(t.metal_blob)
+    arch |> serialize_raw(t.planes_trimmed)
     arch |> serialize_raw(t.experts_mx4)
     arch |> serialize_raw(t.ple_model_bf16)
     arch |> serialize_raw(t.kquant_native)
@@ -358,9 +492,9 @@ def private serialize_image_meta(var arch : Archive; var t : Model) {
     arch |> serialize_raw(t.mtp_headnorm_off)
 }
 
-// the tripwire: serialize_image_meta(Model) covers 65 fields; blocks + image_map +
+// the tripwire: serialize_image_meta(Model) covers 66 fields; blocks + image_map +
 // image_bytes are deliberate skips. A new non-array Model field trips this until BOTH agree.
-let IMAGE_META_FIELDS = 65 + 3
+let IMAGE_META_FIELDS = 66 + 3
 
 //! Count of meta-carried fields of any struct: non-arrays plus string arrays (those cannot
 //! be raw planes — see serialize_strings). Pair with a per-type field-count constant to
@@ -418,12 +552,12 @@ def private write_plane(var w : ImgWriter; var sections : array<ImgSection>;
 //! Serialize a loaded weight-carrying struct as a prepared image: array planes page-aligned raw
 //! (borrowed back at load), everything else archived. Tmp+rename: atomic on POSIX; on Windows a
 //! brief missing-file window lets a concurrent reader regenerate. Caller supplies `serialize_image_meta`/`image_post_load` (`_::` dispatch).
-def save_image(var t; path : string; tag : string = "") : bool {
+def save_image(var t; path : string; tag : string = ""; quant : string = "q8") : bool {
     // per-writer tmp name: concurrent savers (parallel test workers on one cache miss) must
     // not clobber each other's half-written file; last atomic rename wins with same content
     let tmp_path = "{path}.{ref_time_ticks()}.tmp"
     // one config snapshot serves the meta embed AND the header hash — they must agree
-    let dcfg = dlim_config_current()
+    let dcfg = dlim_config_current(quant)
     let ident = dlim_identity(dcfg, IMAGE_VERSION, tag)
     var fend = 0ul
     var meta_off = 0ul
@@ -563,8 +697,143 @@ def save_image(var t; path : string; tag : string = "") : bool {
 
 //! Model entry point (the AudioTower one is load_audio_tower's cache in dasllama_audio).
 //! `tag` names the flavor (METAL_IMAGE_TAG for blob-only metal-flavor models, "" planar).
-def save_model_image(var t : Model; path : string; tag : string = "") : bool {
-    return save_image(t, path, tag)
+def save_model_image(var t : Model; path : string; tag : string = ""; quant : string = "q8") : bool {
+    return save_image(t, path, tag, quant)
+}
+
+//! save_image's STREAMING twin (Model-only): fields with recorded FillJobs stream through
+//! fill_stream_plane; empty `jobs` degrades to the eager save exactly. Call from
+//! load_gguf_streaming's block (m/bytes must be alive); keep the tails in step with save_image.
+def save_model_image_streaming(var t : Model; m : GGUFMeta; bytes : array<uint8> | #;
+                               var jobs : array<FillJob>; path : string; tag : string = ""; quant : string = "q8") : bool {
+    let tmp_path = "{path}.{ref_time_ticks()}.tmp"
+    let dcfg = dlim_config_current(quant)
+    let ident = dlim_identity(dcfg, IMAGE_VERSION, tag)
+    var fend = 0ul
+    var meta_off = 0ul
+    var meta_bytes = 0ul
+    var nsections = 0
+    var meta <- new MemSerializer()
+    var warch = Archive(reading = false, stream = meta)
+    var sections : array<ImgSection>
+    let ts_meta = ref_time_ticks()
+    serialize_image_meta(warch, t)
+    to_log(LOG_INFO, "dasLLAMA image: meta serialize {get_time_usec(ts_meta) / 1000}ms\n")
+    var scalar_blob <- meta->extractData()
+    unsafe {
+        delete meta
+    }
+    // preallocation: the generic total (streamed fields are empty, contributing 0) plus each
+    // streamed plane's exact bytes + a page of padding, plus the pending-wscale qscales16
+    // (absent until the epilogue). Over-reserve is free — dwrite_close truncates.
+    var extra = 0ul
+    for (fname in ["qblob", "k4q", "k5q", "k6q", "q40q", "q51q"]) {
+        let sb = stream_plane_bytes(t, jobs, fname)
+        if (sb > 0l) {
+            extra += uint64(sb) + uint64(IMAGE_PAGE)
+        }
+    }
+    if (t.wscale_f16 && empty(t.qscales16) && !empty(t.qscales)) {
+        extra += uint64(long_length(t.qscales) * 2l) + uint64(IMAGE_PAGE)
+    }
+    var regs : array<StreamReg>
+    stream_collect_regions(t, regs)
+    var fill_ok = true
+    var w = w_open(tmp_path, image_total_bytes(t, uint64(long_length(scalar_blob)) + SECTION_TABLE_SLACK) + extra)
+    if (w.ok) {
+        w_zeros(w, uint64(IMAGE_PAGE))   // page 0: header placeholder — patched after close
+        let ts_planes = ref_time_ticks()
+        apply(t) $(name : string; var field) {
+            static_if (typeinfo is_array(field)) {
+                static_if (!typeinfo is_string(field[0])) {
+                    if (stream_plane_bytes(t, jobs, name) > 0l) {
+                        let padded = pad_to_page(w.cur)
+                        w_zeros(w, padded - w.cur)
+                        let at = w.cur
+                        if (!fill_stream_plane(m, bytes, t, name, jobs, regs) $(p : void?; nb : uint64) { w_append(w, p, nb) }) {
+                            fill_ok = false
+                        }
+                        sections |> push(ImgSection(name = name, off = at, bytes = w.cur - at))
+                    } else {
+                        write_plane(w, sections, name, field)
+                    }
+                }
+            }
+        }
+        let planes_ms = int64(get_time_usec(ts_planes)) / 1000l
+        let planes_mb = int64(w.cur) >> 20l
+        to_log(LOG_INFO, "dasLLAMA image: streamed planes write {planes_ms}ms ({planes_mb} MB at {planes_ms > 0l ? planes_mb * 1000l / planes_ms : 0l} MB/s)\n")
+        var smeta <- new MemSerializer()
+        var sarch = Archive(reading = false, stream = smeta)
+        var m_ident = ident
+        var m_cfg = dlim_config_json(dcfg)
+        sarch |> serialize(m_ident)
+        sarch |> serialize(m_cfg)
+        sarch |> serialize(sections)
+        var meta_blob <- smeta->extractData()
+        meta_blob |> push_from(scalar_blob)
+        nsections = length(sections)
+        meta_off = w.cur
+        meta_bytes = uint64(long_length(meta_blob))
+        if (meta_bytes > 0ul) {
+            unsafe {
+                w_append(w, addr<void?>(meta_blob[0]), meta_bytes)
+            }
+        }
+        fend = pad_to_page(w.cur)
+        w_zeros(w, fend - w.cur)
+        delete meta_blob
+        unsafe {
+            delete smeta
+        }
+        delete sections
+    }
+    delete scalar_blob
+    delete regs
+    var ok = w_close(w) && fill_ok
+    if (ok) {
+        var hdr : array<uint8>
+        hdr |> resize(int(IMAGE_HEADER_BYTES))
+        store_u32(hdr, 0, IMAGE_MAGIC)
+        store_u32(hdr, 4, uint(IMAGE_VERSION))
+        store_u32(hdr, 8, uint(IMAGE_PAGE))
+        store_u32(hdr, 12, uint(nsections))
+        store_u64(hdr, 16, meta_off)
+        store_u64(hdr, 24, meta_bytes)
+        store_u64(hdr, 32, fend)
+        store_u64(hdr, 40, hash(ident))
+        ok = false
+        fopen(tmp_path, "r+b") $(hf) {
+            if (hf != null) {
+                fseek(hf, 0l, seek_set)
+                ok = int64(hf |> fwrite(hdr)) == IMAGE_HEADER_BYTES
+            }
+        }
+        if (!ok) {
+            to_log(LOG_ERROR, "dasLLAMA image: '{tmp_path}' header patch failed — image save aborted\n")
+        }
+        delete hdr
+    }
+    if (ok) {
+        var st : FStat
+        if (!stat(tmp_path, st) || st.size != fend) {
+            to_log(LOG_ERROR, "dasLLAMA image: '{tmp_path}' is {int64(st.size)} bytes on disk, expected {int64(fend)} — disk full? image save aborted\n")
+            ok = false
+        }
+    }
+    if (!ok) {
+        if (stat(tmp_path).is_valid && !remove(tmp_path)) {
+            to_log(LOG_WARNING, "dasLLAMA image: orphaned tmp '{tmp_path}' could not be removed — clean it up by hand\n")
+        }
+        return false
+    }
+    // POSIX rename-over is atomic; Windows needs remove-then-rename (a concurrent reader may
+    // regenerate in the window)
+    if (rename(tmp_path, path) || (remove(path) && rename(tmp_path, path))) {
+        return true
+    }
+    to_log(LOG_ERROR, "dasLLAMA image: could not move '{tmp_path}' over '{path}'\n")
+    return false
 }
 
 // ===== load =====
@@ -592,7 +861,7 @@ def private borrow_plane(bp : uint8 const?; msize : uint64; path : string;
 //! Map a prepared image and rebuild the struct with zero O(model) work: array plane fields borrow
 //! the mapping (finalizer forgets + unmaps), archive blob restores everything else. false = absent /
 //! wrong identity / wrong version — caller regenerates from gguf. Same `_::` contract as save_image.
-def load_image(path : string; var t; tag : string = "") : bool {
+def load_image(path : string; var t; tag : string = ""; quant : string = "q8") : bool {
     if (!stat(path).is_valid) {
         return false
     }
@@ -635,7 +904,7 @@ def load_image(path : string; var t; tag : string = "") : bool {
         unsafe(fmap_close(base, msize))
         return false
     }
-    let want_ident = image_identity(tag)
+    let want_ident = image_identity(tag, quant)
     if (read_u64(bp, 40l) != hash(want_ident)) {
         // same version ⇒ the meta head is readable: say WHAT the image was baked for, not
         // just that a 64-bit hash missed (bounds were validated above)
@@ -773,8 +1042,8 @@ def private guard_interp_gguf_load(path : string) {
 }
 
 //! Model entry point — see load_image (`tag` = the flavor, like save_model_image).
-def load_model_image(path : string; var t : Model; tag : string = "") : bool {
-    if (!load_image(path, t, tag)) {
+def load_model_image(path : string; var t : Model; tag : string = ""; quant : string = "q8") : bool {
+    if (!load_image(path, t, tag, quant)) {
         return false
     }
     // AFTER the plane borrows (image_post_load runs before them, when every array is still
@@ -796,7 +1065,7 @@ def load_model_cached(path : string; mode : QuantMode = QuantMode.fp32) : Model 
         var t = Model()
         let metal_first = get_metal_mode() != MetalMode.off && has_decode_override("metal")
         let vk_cfg = metal_first ? "" : moe_gpu_bake_tag()
-        let vk_tag = vk_cfg == "" ? "" : "vulkan|{vk_cfg}"
+        let vk_tag = vk_cfg   // dlim_vulkan_tag already carries the "vulkan|" prefix ("" = tier absent)
         var loaded = false
         if (vk_tag != "") {
             vulkan_bake_slice_begin()
@@ -836,7 +1105,7 @@ def load_model_cached(path : string; mode : QuantMode = QuantMode.fp32) : Model 
         // the vulkan flavor: the GPU walk slices the baked device-layout planes off the mapping
         // instead of re-gathering; ANY vulkan config switch changes the tag and rebakes below
         let vk_cfg = want_metal ? "" : moe_gpu_bake_tag()
-        let vk_tag = vk_cfg == "" ? "" : "vulkan|{vk_cfg}"
+        let vk_tag = vk_cfg   // dlim_vulkan_tag already carries the "vulkan|" prefix ("" = tier absent)
         if (vk_tag != "") {
             let img_v = image_path_for(path, vk_tag)
             vulkan_bake_slice_begin()

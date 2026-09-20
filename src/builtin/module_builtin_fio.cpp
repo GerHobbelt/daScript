@@ -43,9 +43,11 @@ MAKE_TYPE_FACTORY(clock, das::Time)// use MAKE_TYPE_FACTORY out of namespace. So
 #define getchar_wrapper getchar
 #endif
 
-// The direct sequential writer (dwrite_*): cache-bypassing, strictly-ascending append, used by
-// bulk producers that already know their total size — measured 2060 MB/s vs 275 MB/s for the same
-// volume through buffered fwrite, and it leaves the page cache to whatever the producer is READING.
+// The direct sequential writer (dwrite_*): strictly-ascending append for bulk producers that
+// already know their total size — measured 2060 MB/s vs 275 MB/s for the same volume through
+// buffered fwrite. Cache-bypassing where the platform offers it (FILE_FLAG_NO_BUFFERING on
+// Windows, F_NOCACHE on macOS); the generic POSIX arm is buffered write + posix_fadvise
+// DONTNEED — the page cache is still touched, just released, so the producer's READS keep it.
 // Implemented per-platform at the bottom of this file (same split as the mmap shim above); the
 // handle owns an aligned bounce buffer, so callers append any pointer at any size.
 void * das_dwrite_open ( const char * path, uint64_t total_bytes, uint64_t band_bytes );
@@ -54,6 +56,7 @@ void * das_dwrite_band ( void * h, uint64_t * avail );
 bool das_dwrite_commit ( void * h, uint64_t bytes );
 uint64_t das_dwrite_stat ( void * h, int which );
 bool das_dwrite_close ( void * h );
+bool das_prefetch_map ( void * base, uint64_t bytes );
 
 namespace das {
 
@@ -184,7 +187,15 @@ namespace das {
     void builtin_fflush ( const FILE * f, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     void builtin_map_file(const FILE* f, const TBlock<void, TTemporary<TArray<uint8_t>>>& blk, Context* context, LineInfoArg * at) GENERATE_IO_STUB
     void * builtin_fmap_open ( const char * name, uint64_t * size, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
+    void * builtin_fmap_open_rw ( const char * name, uint64_t * size, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     void builtin_fmap_close ( void * data, uint64_t size, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
+    void * builtin_dwrite_open ( const char * name, uint64_t total_bytes, uint64_t band_bytes, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
+    bool builtin_dwrite_append ( void * h, void * data, uint64_t bytes, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
+    void * builtin_dwrite_band ( void * h, uint64_t * avail, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
+    bool builtin_dwrite_commit ( void * h, uint64_t bytes, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
+    uint64_t builtin_dwrite_stat ( void * h, int32_t which, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
+    bool builtin_dwrite_close ( void * h, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
+    bool builtin_prefetch_map ( void * base, uint64_t bytes, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     int64_t builtin_ftell ( const FILE * f, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     int64_t builtin_fseek ( const FILE * f, int64_t offset, int32_t mode, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
     char * builtin_fread ( const FILE * f, Context * context, LineInfoArg * at ) GENERATE_IO_STUB
@@ -493,6 +504,33 @@ namespace das {
         return data;
     }
 
+    // the writable twin: a PAGE_READWRITE / PROT_WRITE SHARED mapping — writes go back to the
+    // file through the page cache; still no commit charge (not WRITECOPY). The consumer that
+    // wanted it: device APIs that refuse to import read-only pages (VK_EXT_external_memory_host
+    // on NVIDIA/Windows). Same ownership contract as fmap_open; fmap_close unmaps either kind.
+    void * builtin_fmap_open_rw ( const char * name, uint64_t * size, Context * context, LineInfoArg * at ) {
+        if ( !size ) context->throw_error_at(at, "fmap_open_rw: null size out-param");
+        *size = 0;
+        if ( !name ) context->throw_error_at(at, "fmap_open_rw: null path");
+        FILE * f = das_fopen_utf8(name, "r+b");   // the writable section needs write on the handle
+        if ( !f ) return nullptr;
+        das_filestat st;
+        int fd = fileno(f);
+        if ( das_fstat64(fd, st) != 0 ) {
+            fclose(f);
+            return nullptr;
+        }
+        if ( st.st_size == 0 || uint64_t(st.st_size) != uint64_t(size_t(st.st_size)) ) {
+            fclose(f);
+            return nullptr;
+        }
+        void * data = mmap(nullptr, size_t(st.st_size), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        fclose(f);
+        if ( data == MAP_FAILED ) return nullptr;
+        *size = uint64_t(st.st_size);
+        return data;
+    }
+
     void builtin_fmap_close ( void * data, uint64_t size, Context * context, LineInfoArg * at ) {
         if ( !data ) context->throw_error_at(at, "fmap_close: null mapping");
         munmap(data, size_t(size));
@@ -541,6 +579,13 @@ namespace das {
     bool builtin_dwrite_close ( void * h, Context * context, LineInfoArg * at ) {
         if ( !h ) context->throw_error_at(at, "dwrite_close: null writer");
         return das_dwrite_close(h);
+    }
+
+    // advisory readahead over a mapped range (PrefetchVirtualMemory / madvise WILLNEED) — the
+    // cold-conversion fix. false = the OS declined; reads still work, just cold.
+    bool builtin_prefetch_map ( void * base, uint64_t bytes, Context * context, LineInfoArg * at ) {
+        if ( !base && bytes ) context->throw_error_at(at, "prefetch_map: null base");
+        return das_prefetch_map(base, bytes);
     }
 
     // plain ftell/fseek take `long`, which is 32-bit on Windows (LLP64) — use the explicit
@@ -2342,6 +2387,9 @@ namespace das {
             addExtern<DAS_BIND_FUN(builtin_fmap_open)>(*this, lib, "fmap_open",
                 SideEffects::modifyExternal, "builtin_fmap_open")
                     ->args({"path","size","context","line"})->unsafeOperation = true;
+            addExtern<DAS_BIND_FUN(builtin_fmap_open_rw)>(*this, lib, "fmap_open_rw",
+                SideEffects::modifyExternal, "builtin_fmap_open_rw")
+                    ->args({"path","size","context","line"})->unsafeOperation = true;
             addExtern<DAS_BIND_FUN(builtin_fmap_close)>(*this, lib, "fmap_close",
                 SideEffects::modifyExternal, "builtin_fmap_close")
                     ->args({"data","size","context","line"})->unsafeOperation = true;
@@ -2363,6 +2411,9 @@ namespace das {
             addExtern<DAS_BIND_FUN(builtin_dwrite_close)>(*this, lib, "dwrite_close",
                 SideEffects::modifyExternal, "builtin_dwrite_close")
                     ->args({"writer","context","line"})->unsafeOperation = true;
+            addExtern<DAS_BIND_FUN(builtin_prefetch_map)>(*this, lib, "prefetch_map",
+                SideEffects::modifyExternal, "builtin_prefetch_map")
+                    ->args({"base","bytes","context","line"})->unsafeOperation = true;
             addExtern<DAS_BIND_FUN(builtin_fgets)>(*this, lib, "fgets",
                 SideEffects::modifyExternal, "builtin_fgets")
                     ->args({"file","context","line"});
@@ -2585,7 +2636,7 @@ namespace das {
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
-void * mmap (void* start, size_t length, int /*prot*/, int /*flags*/, int fd, off_t offset) {
+void * mmap (void* start, size_t length, int prot, int /*flags*/, int fd, off_t offset) {
     HANDLE hmap;
     void* temp;
     size_t len;
@@ -2603,11 +2654,14 @@ void * mmap (void* start, size_t length, int /*prot*/, int /*flags*/, int fd, of
     // a 73 GB gguf mapping showed up as 73 GB of private bytes on top of the model itself
     // (measured 2026-07-27: 149.9 GB private for a 78 GB image). Read-only maps charge nothing,
     // match what POSIX already does here (PROT_READ), and fault loudly on an accidental write
-    // instead of silently privatizing the page.
-    hmap = CreateFileMapping((HANDLE)_get_osfhandle(fd), 0, PAGE_READONLY, 0, 0, 0);
+    // instead of silently privatizing the page. PROT_WRITE = a real shared writable view
+    // (PAGE_READWRITE, writes go back to the file) — the fmap_open_rw path; still no commit charge.
+    DWORD page = (prot & PROT_WRITE) ? PAGE_READWRITE : PAGE_READONLY;
+    DWORD access = (prot & PROT_WRITE) ? (FILE_MAP_READ | FILE_MAP_WRITE) : FILE_MAP_READ;
+    hmap = CreateFileMapping((HANDLE)_get_osfhandle(fd), 0, page, 0, 0, 0);
     if (!hmap)
         return MAP_FAILED;
-    temp = MapViewOfFileEx(hmap, FILE_MAP_READ, h, l, length, start);
+    temp = MapViewOfFileEx(hmap, access, h, l, length, start);
     if (!CloseHandle(hmap))
         fprintf(stderr, "unable to close file mapping handle\n");
     return temp ? temp : MAP_FAILED;
@@ -2615,6 +2669,32 @@ void * mmap (void* start, size_t length, int /*prot*/, int /*flags*/, int fd, of
 
 int munmap ( void* start, size_t ) {
     return !UnmapViewOfFile(start);
+}
+
+#endif
+
+// ===== prefetch: advisory readahead over a mapped range =====
+
+#if DAS_NO_FILEIO
+
+bool das_prefetch_map ( void *, uint64_t ) { return false; }
+
+#else
+
+// Ask the OS to fault a mapped range in AHEAD of use — the cold-read fix (on-demand page
+// faults inside a parallel transcode loop serialize the lanes; measured 9x on Q4_K source).
+// Advisory: a false return means the OS declined — reads still work, just cold.
+bool das_prefetch_map ( void * base, uint64_t bytes ) {
+    if ( !base || bytes==0 ) return false;
+#if defined(_WIN32)
+    // _WIN32, not _MSC_VER — clang-mingw is Windows too and has no madvise
+    WIN32_MEMORY_RANGE_ENTRY range;
+    range.VirtualAddress = base;
+    range.NumberOfBytes = (SIZE_T) bytes;
+    return PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0) != 0;
+#else
+    return madvise(base, (size_t)bytes, MADV_WILLNEED)==0;
+#endif
 }
 
 #endif
@@ -2632,11 +2712,19 @@ bool das_dwrite_close ( void * ) { return false; }
 
 #else
 
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+
 // The bounce buffer is what makes the API take any pointer at any size: FILE_FLAG_NO_BUFFERING
 // demands sector-aligned buffer, offset AND count, and O_DIRECT-class paths elsewhere want the
 // same. Re-blocking costs one memcpy at memory bandwidth against a ~2 GB/s device — noise.
+// Two bands double-buffer: a full band flushes on a writer thread while the caller stages the
+// other, so transcode and device time overlap. One job in flight, handed off in order — the
+// strictly-ascending cursor the NTFS valid-data-length watermark demands is preserved.
 struct DasDirectWriter {
     uint8_t *   band = nullptr;
+    uint8_t *   band2 = nullptr;   // the async double-buffer; null = synchronous fallback
     uint64_t    band_bytes = 0;
     uint64_t    fill = 0;          // bytes currently staged in `band`
     uint64_t    written = 0;       // bytes handed to the OS so far
@@ -2649,6 +2737,13 @@ struct DasDirectWriter {
     uint64_t    write_ns = 0;
     uint64_t    direct_bytes = 0;  // bypassed the band (already aligned)
     uint64_t    bounce_bytes = 0;  // staged through the band
+    std::thread writer;            // spawned lazily on the first full band
+    std::mutex  mtx;
+    std::condition_variable cv;
+    const uint8_t * job_src = nullptr;   // the one in-flight async write (null = idle)
+    uint64_t    job_bytes = 0;
+    bool        quit = false;
+    bool        async_fail = false;
 #if _WIN32
     HANDLE      h = INVALID_HANDLE_VALUE;
     wchar_t *   wpath = nullptr;   // kept for the close-time truncate (NO_BUFFERING can't set EOF)
@@ -2656,6 +2751,9 @@ struct DasDirectWriter {
     int         fd = -1;
 #endif
 };
+
+static bool das_dwrite_wait_async ( DasDirectWriter * w );
+static void das_dwrite_join_async ( DasDirectWriter * w );
 
 static const uint64_t DAS_DWRITE_DEFAULT_BAND = 16u << 20;
 
@@ -2709,6 +2807,8 @@ void * das_dwrite_open ( const char * path, uint64_t total_bytes, uint64_t band_
         delete w;
         return nullptr;
     }
+    // the async double-buffer; when this fails the writer just stays synchronous
+    w->band2 = (uint8_t *) VirtualAlloc(nullptr, (SIZE_T) w->band_bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     return w;
 }
 
@@ -2729,6 +2829,7 @@ static bool das_dwrite_raw ( DasDirectWriter * w, const uint8_t * src, uint64_t 
 bool das_dwrite_close ( void * hh ) {
     DasDirectWriter * w = (DasDirectWriter *) hh;
     if ( !w ) return false;
+    das_dwrite_join_async(w);   // the in-flight band lands (or fails into w->ok) before the tail
     uint64_t final_bytes = w->written + w->fill;
     if ( w->ok && w->fill ) {
         // the tail: pad to a sector so NO_BUFFERING accepts it, then truncate below
@@ -2754,6 +2855,7 @@ bool das_dwrite_close ( void * hh ) {
         }
     }
     VirtualFree(w->band, 0, MEM_RELEASE);
+    if ( w->band2 ) VirtualFree(w->band2, 0, MEM_RELEASE);
     free(w->wpath);
     delete w;
     return ok;
@@ -2778,6 +2880,8 @@ void * das_dwrite_open ( const char * path, uint64_t total_bytes, uint64_t band_
         delete w;
         return nullptr;
     }
+    // the async double-buffer; when this fails the writer just stays synchronous
+    w->band2 = (uint8_t *) malloc((size_t) w->band_bytes);
 #if defined(__APPLE__)
     fcntl(fd, F_NOCACHE, 1);            // the APFS/HFS equivalent of NO_BUFFERING
     if ( total_bytes ) {
@@ -2821,6 +2925,7 @@ static bool das_dwrite_raw ( DasDirectWriter * w, const uint8_t * src, uint64_t 
 bool das_dwrite_close ( void * hh ) {
     DasDirectWriter * w = (DasDirectWriter *) hh;
     if ( !w ) return false;
+    das_dwrite_join_async(w);   // the in-flight band lands (or fails into w->ok) before the tail
     uint64_t final_bytes = w->written + w->fill;
     if ( w->ok && w->fill ) {
         w->ok = das_dwrite_raw(w, w->band, w->fill);
@@ -2830,11 +2935,81 @@ bool das_dwrite_close ( void * hh ) {
     if ( ok && ftruncate(w->fd, (off_t) final_bytes) != 0 ) ok = false;
     close(w->fd);
     free(w->band);
+    free(w->band2);
     delete w;
     return ok;
 }
 
 #endif
+
+// the writer thread: one job in flight at a time, handed off in order — the async half of the
+// double-buffer. Owns w->written and write_ns while a job runs (the caller waits before touching).
+static void das_dwrite_thread ( DasDirectWriter * w ) {
+    std::unique_lock<std::mutex> lk(w->mtx);
+    for ( ;; ) {
+        w->cv.wait(lk, [&]{ return w->job_src != nullptr || w->quit; });
+        if ( w->job_src ) {
+            const uint8_t * src = w->job_src;
+            uint64_t bytes = w->job_bytes;
+            lk.unlock();
+            uint64_t t0 = das_dwrite_now_ns();
+            bool wok = das_dwrite_raw(w, src, bytes);
+            uint64_t dt = das_dwrite_now_ns() - t0;
+            lk.lock();
+            w->write_ns += dt;
+            if ( !wok ) w->async_fail = true;
+            w->job_src = nullptr;
+            w->cv.notify_all();
+            continue;
+        }
+        if ( w->quit ) break;
+    }
+}
+
+// drain the in-flight band; false = the async write failed (the writer is broken)
+static bool das_dwrite_wait_async ( DasDirectWriter * w ) {
+    if ( !w->writer.joinable() ) return !w->async_fail;
+    std::unique_lock<std::mutex> lk(w->mtx);
+    w->cv.wait(lk, [&]{ return w->job_src == nullptr; });
+    return !w->async_fail;
+}
+
+// close-time retirement: drain, stop, join; an async failure lands in w->ok
+static void das_dwrite_join_async ( DasDirectWriter * w ) {
+    if ( !das_dwrite_wait_async(w) ) w->ok = false;
+    if ( w->writer.joinable() ) {
+        {
+            std::lock_guard<std::mutex> g(w->mtx);
+            w->quit = true;
+        }
+        w->cv.notify_all();
+        w->writer.join();
+    }
+}
+
+// a full band: hand it to the writer thread and keep staging into the other; without the second
+// band (alloc failed) flush synchronously exactly as before
+static bool das_dwrite_flush_full_band ( DasDirectWriter * w ) {
+    if ( w->band2 ) {
+        if ( !das_dwrite_wait_async(w) ) return false;
+        if ( !w->writer.joinable() ) w->writer = std::thread(das_dwrite_thread, w);
+        {
+            std::lock_guard<std::mutex> g(w->mtx);
+            w->job_src = w->band;
+            w->job_bytes = w->band_bytes;
+        }
+        w->cv.notify_all();
+        std::swap(w->band, w->band2);
+        w->fill = 0;
+        return true;
+    }
+    uint64_t t0 = das_dwrite_now_ns();
+    bool wok = das_dwrite_raw(w, w->band, w->band_bytes);
+    w->write_ns += das_dwrite_now_ns() - t0;
+    if ( !wok ) return false;
+    w->fill = 0;
+    return true;
+}
 
 // platform-independent half: stage into the band, push whenever it fills. A writer that has
 // already failed stays failed and stops touching the disk.
@@ -2847,7 +3022,13 @@ bool das_dwrite_append ( void * hh, const void * data, uint64_t bytes ) {
         // source goes straight to the device, skipping a full memcpy of the payload (~10% of wall
         // time at 2 GB/s). Checked per iteration, not once on entry — a plane rarely starts on a
         // band boundary, but it reaches one after the first partial band and the rest is bulk.
+        // Synchronous by contract (the caller may retire `data` the moment we return), so the
+        // in-flight band must land first to keep the cursor strictly ascending.
         if ( w->fill == 0 && bytes >= w->band_bytes && (uintptr_t(src) % w->align) == 0 ) {
+            if ( !das_dwrite_wait_async(w) ) {
+                w->ok = false;
+                return false;
+            }
             uint64_t direct = (bytes / w->align) * w->align;
             uint64_t t0 = das_dwrite_now_ns();
             bool wok = das_dwrite_raw(w, src, direct);
@@ -2871,14 +3052,10 @@ bool das_dwrite_append ( void * hh, const void * data, uint64_t bytes ) {
         src += take;
         bytes -= take;
         if ( w->fill == w->band_bytes ) {
-            uint64_t t0 = das_dwrite_now_ns();
-            bool wok = das_dwrite_raw(w, w->band, w->band_bytes);
-            w->write_ns += das_dwrite_now_ns() - t0;
-            if ( !wok ) {
+            if ( !das_dwrite_flush_full_band(w) ) {
                 w->ok = false;
                 return false;
             }
-            w->fill = 0;
         }
     }
     return true;
@@ -2892,6 +3069,7 @@ bool das_dwrite_append ( void * hh, const void * data, uint64_t bytes ) {
 uint64_t das_dwrite_stat ( void * hh, int which ) {
     DasDirectWriter * w = (DasDirectWriter *) hh;
     if ( !w ) return 0;
+    std::lock_guard<std::mutex> g(w->mtx);   // write_ns updates on the writer thread
     switch ( which ) {
         case 0: return w->copy_ns;
         case 1: return w->write_ns;
@@ -2917,11 +3095,10 @@ bool das_dwrite_commit ( void * hh, uint64_t bytes ) {
     if ( w->fill + bytes > w->band_bytes ) return false;   // the producer overran its own band
     w->fill += bytes;
     if ( w->fill == w->band_bytes ) {
-        if ( !das_dwrite_raw(w, w->band, w->band_bytes) ) {
+        if ( !das_dwrite_flush_full_band(w) ) {
             w->ok = false;
             return false;
         }
-        w->fill = 0;
     }
     return true;
 }

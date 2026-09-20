@@ -79,7 +79,7 @@ def test_handled(t : T?) {
 }
 
 [export]
-def test_fancy_container(var a : array<FancyClass>) {
+def test_fancy_container(a : array<FancyClass>) {
     feint("a = {a}\n")
 }
 
@@ -88,10 +88,10 @@ def test_fancy(t : T?) {
     t |> equal(fc0.value, 13)
     var fc = FancyClass(1, 2)
     t |> equal(fc.value, 3)
-    using() <| $(var f : FancyClass) {
+    using() $(var f : FancyClass) {
         t |> equal(f.value, 13)
     }
-    using(1, 3) <| $(var f : FancyClass) {
+    using(1, 3) $(var f : FancyClass) {
         t |> equal(f.value, 4)
     }
     // otherwise we leak hidden std::string inside fancy class
@@ -101,7 +101,7 @@ def test_fancy(t : T?) {
 
 def test_nc_alias(t : T?) {
     var lookingAt = new TestObjectFoo
-    var lookPos = lookingAt.lookAt ?? float3()
+    let lookPos = lookingAt.lookAt ?? float3()
     t |> equal(lookPos, float3())
     unsafe {
         delete lookingAt
