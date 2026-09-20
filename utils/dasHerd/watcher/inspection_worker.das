@@ -19,6 +19,35 @@ require math
 
 let private MAX_BINARY_PREVIEW_PIXELS = 64l * 1024l * 1024l
 
+// Above this, a file is served as plain text instead of being parsed and
+// highlighted. Measured on utils/dasFormatter/ds_parser.cpp (716 KB of
+// generated C++): tree-sitter plus the two full-syntax projections took 21.0
+// SECONDS and produced 148,590 spans, for a diff with zero hunks. The view
+// renders anything over 128 KB through the virtualised path, drawing only the
+// visible runs, so nearly all of that work was thrown away. 256 KB keeps
+// highlighting for every hand-written source file in the tree.
+let private MAX_SYNTAX_HIGHLIGHT_BYTES = 2 * 1024 * 1024
+let private MAX_SYNTAX_HIGHLIGHT_LINE_BYTES = 16 * 1024
+
+def public inspector_syntax_worth_highlighting(source : string) : bool {
+    //! Shape-aware highlight gate. Size alone is generous (2 MiB); what kills
+    //! tree-sitter is BYTES PER LINE — generated tables and minified sources
+    //! put hundreds of KB on one line. No hand-written code has a 16 KB line.
+    if (length(source) > MAX_SYNTAX_HIGHLIGHT_BYTES) return false
+    var line_start = 0
+    var worst = 0
+    peek_data(source) $(data) {
+        for (index in range(length(data))) {
+            if (data[index] == uint8('\n')) {
+                worst = max(worst, index - line_start)
+                line_start = index + 1
+            }
+        }
+        worst = max(worst, length(data) - line_start)
+    }
+    return worst <= MAX_SYNTAX_HIGHLIGHT_LINE_BYTES
+}
+
 enum public InspectorPrepareEventKind {
     ready
     started
@@ -36,6 +65,9 @@ struct public InspectorPrepareJob {
     view_available : bool
     language : string
     stop : bool
+    // Extra new-file line windows the aligned Diff must display (find
+    // reveals hidden matches in the diff); injected after parsing.
+    context_windows : array<int2>
 }
 
 [safe_when_uninitialized]
@@ -51,6 +83,9 @@ struct public InspectorPrepareEvent {
     changed_source_ranges : array<TextSourceRange>
     view_source : string
     view_text_ready : bool
+    // True when a resolvable language was DROPPED by the highlight gate
+    // (size/line-shape) — the UI says "syntax off" instead of looking broken.
+    syntax_capped : bool
     preview_pixels : array<uint8>
     preview_width : int
     preview_height : int
@@ -291,6 +326,8 @@ def private prepare_worker_main(var jobs : Channel?&;
             let job_view_text = clone_string(job.view_text)
             let view_base64 = clone_string(job.view_base64)
             let language = clone_string(job.language)
+            var inscope context_windows : array<int2>
+            context_windows := job.context_windows
             var failure = ""
             var parsed = GitParsedPatch()
             var old_document = TextSourceDocument()
@@ -301,6 +338,7 @@ def private prepare_worker_main(var jobs : Channel?&;
             var changed_ranges : array<TextSourceRange>
             var view_source = ""
             var view_text_ready = false
+            var syntax_capped = false
             var inscope decoded_view_bytes : array<uint8>
             var preview_pixels : array<uint8>
             var preview_width = 0
@@ -352,10 +390,29 @@ def private prepare_worker_main(var jobs : Channel?&;
                     }
                     let old_source = inspector_reconstruct_old_source(
                         view_source, prepared_patch)
+                    // AFTER reconstruction (which must see the pristine parse):
+                    // make the diff display any find-revealed regions.
+                    if (view_text_ready && !empty(context_windows)) {
+                        git_patch_inject_context(prepared_patch, view_source,
+                            context_windows)
+                    }
+                    // Past the cap, drop the language: tree_sitter_source_document
+                    // with no language builds the same document without parsing
+                    // or spans, so a pathological file opens instantly as plain
+                    // text instead of stalling the inspector for twenty seconds.
+                    // The cap is SHAPE-aware: the 21-second file was 716 KB
+                    // across SEVEN lines (generated parser tables); a normal
+                    // 700 KB hand-written module parses in well under a second
+                    // and keeps its colors (the live-review regression).
+                    let highlight_language = (
+                        inspector_syntax_worth_highlighting(view_source)
+                            && inspector_syntax_worth_highlighting(old_source)
+                        ? language : "")
+                    syntax_capped = !empty(language) && empty(highlight_language)
                     var full_old <- tree_sitter_source_document(
-                        old_source, language, job.generation)
+                        old_source, highlight_language, job.generation)
                     var full_new <- tree_sitter_source_document(
-                        view_source, language, job.generation)
+                        view_source, highlight_language, job.generation)
                     var prepared_old <- inspector_project_full_syntax(
                         full_old, prepared_patch.old_aligned_text,
                         prepared_patch.rows, true, job.generation)
@@ -391,7 +448,9 @@ def private prepare_worker_main(var jobs : Channel?&;
                                 line_index = line, kind = TextSourceLineMarkKind.added))
                         }
                         view_document <- full_new
-                        if (language == "markdown") {
+                        // Same cap for the markdown render pass, which parses
+                        // and lays out the whole document up front.
+                        if (highlight_language == "markdown") {
                             var prepared_markdown <- md_parse(view_source)
                             if (!prepared_markdown.ok) {
                                 failure = (empty(prepared_markdown.error)
@@ -454,6 +513,7 @@ def private prepare_worker_main(var jobs : Channel?&;
                     generation = job.generation,
                     view_source = view_source,
                     view_text_ready = view_text_ready,
+                    syntax_capped = syntax_capped,
                     preview_width = preview_width,
                     preview_height = preview_height,
                     preview_byte_count = job.view_byte_count,
@@ -516,12 +576,29 @@ def public inspector_prepare_worker_queue(var worker : InspectorPrepareWorker;
                                           view_base64 : string = "";
                                           view_byte_count : int = 0;
                                           view_available : bool = false) : bool {
+    var inscope none : array<int2>
+    return inspector_prepare_worker_queue_windows(worker, generation, patch,
+        view_text, language, view_base64, view_byte_count, view_available, none)
+}
+
+def public inspector_prepare_worker_queue_windows(var worker : InspectorPrepareWorker;
+                                                  generation : int;
+                                                  patch : string;
+                                                  view_text : string;
+                                                  language : string;
+                                                  view_base64 : string;
+                                                  view_byte_count : int;
+                                                  view_available : bool;
+                                                  context_windows : array<int2> const) : bool {
     if (!worker.started || worker.stopped || worker.jobs == null) return false
-    worker.jobs |> push_clone(InspectorPrepareJob(
+    var job = InspectorPrepareJob(
         generation = generation, patch = patch, view_text = view_text,
         language = language, view_base64 = view_base64,
         view_byte_count = view_byte_count,
-        view_available = view_available))
+        view_available = view_available)
+    job.context_windows := context_windows
+    worker.jobs |> push_clone(job)
+    delete job.context_windows
     return true
 }
 
