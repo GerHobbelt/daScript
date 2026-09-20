@@ -1,6 +1,14 @@
 # Benchmarks — SQL / Array / Decs / XML comparison
 
-Updated 2026-05-31 (branch `bbatkin/linq-fold-sql-passthrough`): **`_fold` now routes a SQL source straight to `_sql`.** When a `_fold(...)` chain's source is a `[sql_table]`/`[sql_view]`/`[sql_fts5]` `select_from(db, type<Row>)`, `_fold` re-dispatches the *entire* chain to the `_sql` macro — pure pass-through, observationally identical to writing `_sql(...)` by hand (if `_sql` can't map an op, it errors exactly as it would directly). The **m1 (SQL) lane in every bench is now authored as `_fold(db |> select_from(type<Car>) |> ...)`** instead of `_sql(...)`; the generated SQL and code are identical, so the m1 column is unchanged within thermal noise (early-exit terminals — `first`/`any`/`contains`/`element_at`/`single`/`last` — stay `0.0`, i.e. `LIMIT 1` pushdown, not a full-table materialization). Detection lives in `sqlite/linq_fold_sql` (optional `require ?sqlite` + `static_if (typeinfo builtin_module_exists(sqlite))`, so non-sqlite builds are unaffected) and walks the chain's `arguments[0]` source spine for a SQL-table `select_from` — it deliberately does **not** use `flatten_linq`'s recognized-op `top`, since the SQL DSL ops (`_where`/`_select`/`_join`/`_first`/...) aren't `linqCalls`. Other cell deltas are long-sweep thermal noise.
+Updated 2026-06-02 (branch `bbatkin/linq-das-correlated-selectmany`): **the `%linq!` reader now emits the correlated SelectMany flatten — `from o in O from l in o.lines select f(o, l)` → `_select_many` over a new both-vars `select_many_pair` op** (the result selector sees both the outer and inner element). The `select_many` bench is swapped from PR1's inner-only `select_many` baseline to the both-vars `select_many_pair` form the correlated reader emits, with a zero-copy `each`-based collection selector (still UNFUSED — no `_fold` select_many splice): m3f array INTERP 189.3 / JIT 63.7. Two codegen-neutral library tweaks rode along — `group_by_lazy_impl` now `reserve`s its bucket buffer, and `to_array(iterator)` carries a `nolint:PERF006` — both clearing false-positive perf advisories surfaced by generic-instance mangling. `cross_join` and every other family are stable within noise (`cross_join` INTERP 12.7k/3.7k/—/4.1k, matching the prior sweep); remaining cell deltas are long-sweep thermal noise.
+
+Earlier (branch `bbatkin/linq-das-uncorrelated-multifrom`): **the `%linq!` reader now emits the `cross_join` family's shape from `from c in A from b in B` (uncorrelated SelectMany).** This is a correctness feature, not a perf change — `_cross_join`'s new lambda type-injection only fires for *untyped* lambdas (the benchmark uses typed ones) and the `to_array(array<T>)` move from `sqlite_linq` to `builtin` is macro-time, so the engine codegen is byte-identical. Re-swept on the same machine to confirm: `cross_join` is stable within noise (INTERP 12.7k/3.7k/—/4.1k, JIT 6.0k/0.7k/—/0.9k — matching the prior sweep), and all other cell deltas are long-sweep thermal noise. No `_fold` cross splice yet (still UNFUSED, the fusion optimization is deferred).
+
+Earlier (branch `bbatkin/linq-das-projections-bench`): **two new families — `cross_join` and `select_many` — establish the multiple-`from` (SelectMany) baseline.** `cross_join` measures the Cartesian product `cross_join(A, B, into)` across SQL / array / XML; `select_many` measures the correlated flatten `select_many(orders, $(o) => o.lines, …)` over an array of nested-collection rows. **Both are UNFUSED** — there is no `_fold` cross-join or select_many splice arm yet, so they run as the plain library calls (the in-memory lanes materialize the full result); this is the baseline the engine-integration PRs improve. `cross_join` uses a smaller n (1000 cars × 100 dealers = 100k pairs) because the product is O(n·m), so its absolute ns are not comparable to the n=100000 families. Empty cells are explained in "Notes on missing lanes". A one-line parity fix in `daslib/linq.das` rode along: the 3-arg `select_many_impl` now reserves `length(src)` up front like the 2-arg form (clears a PERF006).
+
+Earlier (branch `bbatkin/linq-das-join`): **join now fuses a leading `_where`.** The `join_general` splice arm gained an optional leading `_where` slot — a `where` that filters the left source *before* a `_join` is wrapped into the per-A probe loop as `if (pred(a)) { <probe> }` (shared `build_join_standalone_pieces`, so array / decs / XML all inherit it), so the pre-join filter no longer materializes an intermediate filtered-srcA array. The new **`where_join_count`** family measures this (`_where(price > T) |> _join(...) |> count`) against the trailing-filter `join_where_count`; over SQL the same pre-join `where` pushes down to the left table's `WHERE`. All other cell deltas are long-sweep thermal noise — the existing join families (`join_count` / `join_select` / `join_where_count` / `join_groupby_*`) are unchanged, since the new slot is empty for them.
+
+Earlier (branch `bbatkin/linq-fold-sql-passthrough`): **`_fold` routes a SQL source straight to `_sql`.** When a `_fold(...)` chain's source is a `[sql_table]`/`[sql_view]`/`[sql_fts5]` `select_from(db, type<Row>)`, `_fold` re-dispatches the *entire* chain to the `_sql` macro — pure pass-through, observationally identical to writing `_sql(...)` by hand. The **m1 (SQL) lane in every bench is authored as `_fold(db |> select_from(type<Car>) |> ...)`**; the generated SQL and code are identical (early-exit terminals — `first`/`any`/`contains`/`element_at`/`single`/`last` — stay `0.0`, i.e. `LIMIT 1` pushdown, not a full-table materialization). Detection lives in `sqlite/linq_fold_sql` (optional `require ?sqlite` + `static_if (typeinfo builtin_module_exists(sqlite))`, so non-sqlite builds are unaffected) and walks the chain's `arguments[0]` source spine for a SQL-table `select_from`.
 
 Fixture size: n = 100 000 (cars), 100 dealers, 5 brands. Each row is
 one bench family in `benchmarks/sql/`; columns are nanoseconds per
@@ -55,161 +63,167 @@ DOM-parse + per-element attribute reads + `string` clones the in-memory lanes ne
 
 
 <!-- BENCH:TABLES BEGIN -->
-*Generated 2026-05-31 by `benchmarks/sql/_update_results.das` — ns/op; `—` = absent lane. Edit the prose around the markers, not the tables.*
+*Generated 2026-06-02 by `benchmarks/sql/_update_results.das` — ns/op; `—` = absent lane. Edit the prose around the markers, not the tables.*
 
 ## INTERP
 
 | Benchmark | SQL (m1) | Array (m3f) | Decs (m4) | XML fold (m5f) |
 |---|---:|---:|---:|---:|
-| `aggregate_match` | 34.9 | 6.0 | 6.0 | 58.1 |
-| `all_match` | 27.6 | 3.7 | 3.4 | 55.9 |
+| `aggregate_match` | 34.3 | 5.9 | 5.9 | 58.0 |
+| `all_match` | 27.5 | 4.0 | 3.3 | 55.2 |
 | `any_match` | 0.0 | 0.0 | 0.0 | 0.0 |
-| `average_aggregate` | 30.3 | 5.9 | 8.7 | 59.3 |
-| `bare_order_where` | 280.7 | 116.0 | 125.4 | 328.4 |
-| `chained_select_collapse` | — | 17.9 | 17.6 | 70.2 |
-| `chained_where` | 36.6 | 6.6 | 7.2 | 102.2 |
-| `contains_match` | 0.0 | 2.2 | 1.4 | 27.5 |
-| `count_aggregate` | 29.7 | 4.1 | 4.1 | 64.1 |
-| `decs_count_bare_pred` | — | — | 4.1 | — |
-| `distinct_by_count` | 40.6 | 15.8 | 16.0 | 72.6 |
-| `distinct_by_order_take` | 239.3 | 21.8 | 23.1 | 126.0 |
-| `distinct_by_order_to_array` | 239.2 | 21.8 | 23.4 | 126.3 |
-| `distinct_count` | 41.5 | 15.7 | 15.8 | 70.9 |
-| `distinct_count_pred` | 252.3 | 15.8 | 15.9 | 112.0 |
+| `average_aggregate` | 29.7 | 5.8 | 10.0 | 59.4 |
+| `bare_order_where` | 271.6 | 118.5 | 124.6 | 337.3 |
+| `chained_select_collapse` | — | 17.7 | 17.5 | 70.0 |
+| `chained_where` | 36.2 | 6.6 | 7.2 | 102.6 |
+| `contains_match` | 0.0 | 2.2 | 1.4 | 29.0 |
+| `count_aggregate` | 29.6 | 4.2 | 4.2 | 64.1 |
+| `cross_join` | 12703.0 | 3702.9 | — | 4061.3 |
+| `decs_count_bare_pred` | — | — | 4.2 | — |
+| `distinct_by_count` | 41.5 | 15.8 | 15.9 | 72.2 |
+| `distinct_by_order_take` | 244.1 | 21.6 | 23.4 | 125.6 |
+| `distinct_by_order_to_array` | 240.5 | 22.0 | 23.8 | 127.3 |
+| `distinct_count` | 41.3 | 15.9 | 15.8 | 70.4 |
+| `distinct_count_pred` | 251.1 | 15.7 | 15.9 | 111.6 |
 | `distinct_take` | 0.0 | 0.0 | 0.0 | 0.0 |
-| `element_at_match` | 0.0 | 0.0 | 0.0 | 0.4 |
+| `element_at_match` | 0.0 | 0.0 | 0.0 | 0.5 |
 | `first_match` | 0.0 | 0.0 | 0.0 | 0.0 |
 | `first_or_default_match` | 0.0 | 0.0 | 0.0 | 0.0 |
-| `groupby_average` | 170.9 | 30.3 | 29.9 | 125.3 |
-| `groupby_count` | 142.4 | 19.1 | 19.1 | 76.6 |
-| `groupby_first` | 252.6 | 18.4 | 19.1 | 71.7 |
-| `groupby_having_count` | 141.3 | 19.1 | 19.1 | 78.7 |
-| `groupby_having_hidden_sum` | 174.8 | 23.7 | 24.0 | 122.9 |
-| `groupby_having_post_where` | 171.0 | 19.0 | 18.6 | 115.7 |
-| `groupby_max` | 173.7 | 25.0 | 25.0 | 120.6 |
-| `groupby_min` | 173.7 | 25.0 | 25.0 | 121.0 |
-| `groupby_multi_reducer` | 190.5 | 31.9 | 32.5 | 126.8 |
-| `groupby_select_order` | 171.3 | 18.8 | 18.7 | 118.0 |
-| `groupby_select_sum` | 201.0 | 36.2 | 36.0 | 98.3 |
-| `groupby_sum` | 171.3 | 18.5 | 18.7 | 115.5 |
-| `groupby_where_count` | 76.0 | 14.4 | 14.9 | 119.4 |
-| `groupby_where_sum` | 87.0 | 14.2 | 14.6 | 117.2 |
-| `indexed_lookup` | 1445.9 | 205724.2 | 487.9 | 5565511.1 |
-| `join_count` | 38.3 | 51.1 | 63.9 | 112.6 |
-| `join_groupby_count` | 158.0 | 78.2 | 89.8 | 179.5 |
-| `join_groupby_to_array` | 190.1 | 83.0 | 93.3 | 214.6 |
-| `join_select` | 152.5 | 72.3 | 85.9 | 192.1 |
-| `join_where_count` | 39.2 | 61.9 | 77.3 | 160.3 |
-| `last_match` | 0.0 | 5.8 | 13.9 | 65.6 |
-| `long_count_aggregate` | 30.1 | 4.1 | 4.1 | 64.2 |
-| `max_aggregate` | 31.4 | 6.2 | 6.9 | 58.2 |
-| `min_aggregate` | 31.3 | 6.0 | 6.8 | 58.1 |
-| `order_distinct_take` | 138.4 | 15.7 | 93.1 | 73.2 |
-| `order_reverse_normalized` | 38.6 | 16.3 | 20.0 | 69.4 |
-| `order_take_desc` | 38.6 | 16.2 | 20.0 | 69.4 |
-| `reverse_distinct_by` | 295.5 | 21.8 | 28.4 | 74.3 |
-| `reverse_take` | 0.1 | 0.0 | 9.2 | 86.2 |
-| `reverse_take_select` | 0.0 | 0.0 | 9.2 | 85.9 |
-| `select_count` | 0.1 | 0.0 | 2.2 | 64.7 |
-| `select_where` | 195.8 | 11.1 | 19.5 | 225.5 |
-| `select_where_count` | 33.0 | 5.2 | 7.5 | 62.0 |
-| `select_where_order_take` | 37.1 | 12.4 | 14.9 | 71.6 |
-| `select_where_sum` | 37.4 | 7.4 | 7.5 | 64.4 |
-| `single_match` | 0.0 | 2.8 | 5.5 | 54.8 |
+| `groupby_average` | 173.1 | 30.3 | 29.9 | 125.2 |
+| `groupby_count` | 148.0 | 19.2 | 19.1 | 75.7 |
+| `groupby_first` | 249.8 | 18.4 | 19.2 | 72.1 |
+| `groupby_having_count` | 141.8 | 19.2 | 19.6 | 78.1 |
+| `groupby_having_hidden_sum` | 177.0 | 23.7 | 24.0 | 123.0 |
+| `groupby_having_post_where` | 173.2 | 18.4 | 18.7 | 114.8 |
+| `groupby_max` | 173.7 | 32.7 | 25.0 | 121.5 |
+| `groupby_min` | 210.6 | 24.9 | 25.0 | 141.8 |
+| `groupby_multi_reducer` | 190.9 | 32.3 | 32.9 | 126.6 |
+| `groupby_select_order` | 179.4 | 18.8 | 18.9 | 117.2 |
+| `groupby_select_sum` | 209.5 | 35.9 | 36.0 | 98.6 |
+| `groupby_sum` | 170.7 | 18.6 | 18.8 | 114.9 |
+| `groupby_where_count` | 75.1 | 14.3 | 14.9 | 116.8 |
+| `groupby_where_sum` | 85.9 | 14.2 | 14.7 | 118.5 |
+| `indexed_lookup` | 1404.4 | 205182.8 | 501.6 | 5938416.7 |
+| `join_count` | 37.7 | 51.1 | 64.0 | 112.4 |
+| `join_groupby_count` | 157.6 | 78.3 | 90.6 | 178.9 |
+| `join_groupby_to_array` | 191.1 | 78.6 | 90.8 | 214.7 |
+| `join_select` | 147.0 | 76.3 | 85.1 | 188.5 |
+| `join_where_count` | 38.8 | 63.3 | 75.4 | 160.7 |
+| `last_match` | 0.0 | 5.8 | 14.0 | 65.1 |
+| `long_count_aggregate` | 29.2 | 4.2 | 4.2 | 63.7 |
+| `max_aggregate` | 30.4 | 6.1 | 6.8 | 58.0 |
+| `min_aggregate` | 30.6 | 6.0 | 6.8 | 58.0 |
+| `order_distinct_take` | 138.1 | 15.8 | 93.3 | 73.9 |
+| `order_reverse_normalized` | 37.8 | 16.2 | 19.9 | 69.4 |
+| `order_take_desc` | 37.8 | 16.1 | 19.9 | 69.5 |
+| `reverse_distinct_by` | 292.5 | 21.3 | 28.1 | 73.7 |
+| `reverse_take` | 0.1 | 0.0 | 9.2 | 99.1 |
+| `reverse_take_select` | 0.0 | 0.0 | 9.2 | 98.8 |
+| `select_count` | 0.1 | 0.0 | 2.2 | 77.9 |
+| `select_many` | — | 189.3 | — | — |
+| `select_where` | 193.6 | 10.9 | 19.3 | 223.8 |
+| `select_where_count` | 32.1 | 5.2 | 7.4 | 61.7 |
+| `select_where_order_take` | 36.1 | 12.3 | 15.0 | 70.4 |
+| `select_where_sum` | 36.7 | 7.4 | 7.5 | 63.8 |
+| `single_match` | 0.0 | 2.8 | 5.6 | 58.8 |
 | `skip_take` | 0.5 | 0.1 | 0.2 | 3.7 |
-| `skip_while_match` | 3.4 | 5.3 | 5.4 | 56.4 |
-| `sort_first` | 37.9 | 11.1 | 13.3 | 69.6 |
-| `sort_take` | 38.5 | 16.3 | 20.0 | 70.3 |
-| `sort_take_select` | 38.5 | 16.3 | 20.1 | 70.3 |
-| `sum_aggregate` | 29.9 | 2.1 | 2.1 | 53.9 |
-| `sum_where` | 33.1 | 4.3 | 4.3 | 61.1 |
-| `take_count` | 3.6 | 0.2 | 0.4 | 3.6 |
+| `skip_while_match` | 3.4 | 5.2 | 5.4 | 60.9 |
+| `sort_first` | 37.5 | 11.0 | 13.3 | 63.9 |
+| `sort_take` | 37.8 | 16.4 | 20.0 | 68.2 |
+| `sort_take_select` | 37.4 | 16.2 | 19.9 | 70.0 |
+| `sum_aggregate` | 29.8 | 2.1 | 2.1 | 55.3 |
+| `sum_where` | 32.9 | 4.3 | 4.3 | 61.1 |
+| `take_count` | 3.6 | 0.2 | 0.4 | 3.5 |
 | `take_count_filtered` | 1.1 | 0.2 | 0.2 | 1.3 |
 | `take_sum_aggregate` | 0.8 | 0.1 | 0.1 | 0.6 |
 | `take_where_count` | 0.9 | 0.1 | 0.1 | 0.7 |
-| `take_while_match` | 7.8 | 2.4 | 2.4 | 28.3 |
-| `to_array_filter` | 71.0 | 11.7 | 11.8 | 73.5 |
-| `zip_count_pred` | 39.2 | 15.1 | — | 374.4 |
-| `zip_dot_product` | — | 12.9 | 10.7 | 365.1 |
-| `zip_dot_product_3arg` | — | 12.6 | — | 364.0 |
-| `zip_reverse_to_array` | — | 31.0 | — | 398.4 |
+| `take_while_match` | 7.8 | 2.4 | 2.5 | 30.1 |
+| `to_array_filter` | 70.1 | 11.7 | 11.8 | 71.7 |
+| `where_join_count` | 40.8 | 29.4 | 41.6 | 135.4 |
+| `zip_count_pred` | 38.8 | 15.0 | — | 374.0 |
+| `zip_dot_product` | — | 12.8 | 10.4 | 364.7 |
+| `zip_dot_product_3arg` | — | 12.7 | — | 409.5 |
+| `zip_reverse_to_array` | — | 30.8 | — | 397.3 |
 
 ## JIT
 
 | Benchmark | SQL (m1) | Array (m3f) | Decs (m4) | XML fold (m5f) |
 |---|---:|---:|---:|---:|
-| `aggregate_match` | 35.1 | 0.3 | 0.6 | 16.4 |
-| `all_match` | 27.8 | 0.3 | 0.2 | 16.4 |
+| `aggregate_match` | 34.9 | 0.3 | 0.6 | 16.6 |
+| `all_match` | 27.5 | 0.3 | 0.2 | 16.6 |
 | `any_match` | 0.0 | 0.0 | 0.0 | 0.0 |
-| `average_aggregate` | 30.6 | 1.0 | 3.6 | 17.5 |
-| `bare_order_where` | 187.7 | 34.0 | 35.5 | 125.2 |
+| `average_aggregate` | 29.8 | 1.0 | 3.5 | 17.8 |
+| `bare_order_where` | 184.2 | 34.5 | 35.0 | 124.5 |
 | `chained_select_collapse` | — | 2.1 | 2.1 | 21.2 |
-| `chained_where` | 36.8 | 0.6 | 0.8 | 35.7 |
-| `contains_match` | 0.0 | 0.2 | 0.1 | 17.1 |
-| `count_aggregate` | 30.1 | 0.3 | 0.6 | 16.4 |
+| `chained_where` | 36.1 | 0.6 | 0.8 | 35.7 |
+| `contains_match` | 0.0 | 0.2 | 0.1 | 18.3 |
+| `count_aggregate` | 29.2 | 0.3 | 0.6 | 16.6 |
+| `cross_join` | 5952.3 | 730.1 | — | 877.6 |
 | `decs_count_bare_pred` | — | — | 0.6 | — |
-| `distinct_by_count` | 42.0 | 2.1 | 2.1 | 21.7 |
-| `distinct_by_order_take` | 240.3 | 2.7 | 3.2 | 46.4 |
-| `distinct_by_order_to_array` | 239.9 | 2.7 | 3.3 | 47.4 |
-| `distinct_count` | 41.7 | 2.1 | 2.1 | 21.2 |
-| `distinct_count_pred` | 252.8 | 2.1 | 2.3 | 39.5 |
-| `distinct_take` | 0.0 | 0.0 | 0.0 | 0.0 |
+| `distinct_by_count` | 41.2 | 2.1 | 2.1 | 21.8 |
+| `distinct_by_order_take` | 239.8 | 2.6 | 3.2 | 46.3 |
+| `distinct_by_order_to_array` | 238.2 | 2.7 | 3.2 | 47.4 |
+| `distinct_count` | 41.1 | 2.1 | 2.1 | 21.3 |
+| `distinct_count_pred` | 249.2 | 2.1 | 2.3 | 39.5 |
+| `distinct_take` | 0.0 | 0.0 | 0.0 | 0.1 |
 | `element_at_match` | 0.0 | 0.0 | 0.0 | 0.2 |
 | `first_match` | 0.0 | 0.0 | 0.0 | 0.0 |
 | `first_or_default_match` | 0.0 | 0.0 | 0.0 | 0.0 |
-| `groupby_average` | 171.8 | 2.6 | 2.9 | 36.4 |
-| `groupby_count` | 142.0 | 2.3 | 2.5 | 21.3 |
-| `groupby_first` | 252.9 | 2.2 | 3.1 | 21.8 |
-| `groupby_having_count` | 142.4 | 2.4 | 2.5 | 22.3 |
-| `groupby_having_hidden_sum` | 175.8 | 2.5 | 2.8 | 37.3 |
-| `groupby_having_post_where` | 175.7 | 2.4 | 2.7 | 35.7 |
-| `groupby_max` | 175.3 | 2.4 | 2.7 | 37.8 |
-| `groupby_min` | 174.7 | 2.4 | 2.7 | 35.8 |
-| `groupby_multi_reducer` | 190.5 | 2.7 | 3.0 | 36.0 |
-| `groupby_select_order` | 171.8 | 2.4 | 2.7 | 35.6 |
-| `groupby_select_sum` | 200.0 | 3.2 | 3.7 | 32.5 |
-| `groupby_sum` | 171.8 | 2.4 | 2.7 | 35.6 |
-| `groupby_where_count` | 76.4 | 1.5 | 1.8 | 36.4 |
-| `groupby_where_sum` | 87.5 | 1.5 | 1.8 | 37.0 |
-| `indexed_lookup` | 1248.5 | 32521.3 | 106.6 | 4374637.3 |
-| `join_count` | 38.5 | 11.8 | 12.8 | 46.6 |
-| `join_groupby_count` | 158.0 | 19.6 | 21.8 | 68.8 |
-| `join_groupby_to_array` | 191.2 | 19.6 | 21.8 | 80.5 |
-| `join_select` | 94.2 | 20.3 | 22.7 | 74.0 |
-| `join_where_count` | 39.5 | 19.6 | 21.8 | 65.8 |
+| `groupby_average` | 173.7 | 2.6 | 2.9 | 36.4 |
+| `groupby_count` | 140.9 | 2.4 | 2.5 | 21.3 |
+| `groupby_first` | 250.0 | 2.2 | 3.1 | 21.8 |
+| `groupby_having_count` | 140.9 | 2.3 | 2.5 | 22.3 |
+| `groupby_having_hidden_sum` | 173.6 | 2.5 | 2.8 | 37.3 |
+| `groupby_having_post_where` | 169.2 | 2.4 | 2.7 | 35.5 |
+| `groupby_max` | 172.6 | 2.4 | 2.7 | 37.8 |
+| `groupby_min` | 171.0 | 2.4 | 2.7 | 35.9 |
+| `groupby_multi_reducer` | 188.7 | 2.7 | 3.0 | 35.9 |
+| `groupby_select_order` | 169.8 | 2.4 | 2.7 | 35.6 |
+| `groupby_select_sum` | 200.9 | 3.2 | 3.9 | 33.2 |
+| `groupby_sum` | 170.7 | 2.4 | 2.7 | 35.6 |
+| `groupby_where_count` | 75.6 | 1.5 | 1.8 | 36.3 |
+| `groupby_where_sum` | 86.3 | 1.5 | 1.8 | 36.9 |
+| `indexed_lookup` | 1234.7 | 32482.7 | 106.4 | 4881806.5 |
+| `join_count` | 37.8 | 11.8 | 13.1 | 47.3 |
+| `join_groupby_count` | 157.7 | 19.5 | 21.9 | 68.8 |
+| `join_groupby_to_array` | 191.7 | 19.9 | 22.0 | 81.2 |
+| `join_select` | 92.1 | 20.0 | 22.5 | 73.8 |
+| `join_where_count` | 39.0 | 19.4 | 22.0 | 65.7 |
 | `last_match` | 0.0 | 0.5 | 1.4 | 21.0 |
-| `long_count_aggregate` | 30.1 | 0.3 | 0.6 | 16.4 |
-| `max_aggregate` | 31.1 | 0.3 | 0.5 | 24.4 |
-| `min_aggregate` | 31.1 | 0.3 | 0.5 | 16.7 |
-| `order_distinct_take` | 139.2 | 2.1 | 75.2 | 21.2 |
-| `order_reverse_normalized` | 38.6 | 0.7 | 1.3 | 16.8 |
-| `order_take_desc` | 38.4 | 0.7 | 1.3 | 16.8 |
-| `reverse_distinct_by` | 302.5 | 2.6 | 5.0 | 22.0 |
-| `reverse_take` | 0.0 | 0.0 | 1.1 | 65.9 |
-| `reverse_take_select` | 0.0 | 0.0 | 1.1 | 65.3 |
-| `select_count` | 0.1 | 0.0 | 0.0 | 63.8 |
-| `select_where` | 108.9 | 4.3 | 5.7 | 95.3 |
-| `select_where_count` | 33.0 | 0.3 | 0.6 | 16.4 |
-| `select_where_order_take` | 37.0 | 0.7 | 1.4 | 17.3 |
-| `select_where_sum` | 37.5 | 0.4 | 0.6 | 18.4 |
-| `single_match` | 0.0 | 0.4 | 1.1 | 47.0 |
+| `long_count_aggregate` | 29.5 | 0.3 | 0.6 | 16.7 |
+| `max_aggregate` | 32.0 | 0.3 | 0.5 | 24.4 |
+| `min_aggregate` | 30.9 | 0.3 | 0.5 | 20.4 |
+| `order_distinct_take` | 144.9 | 2.1 | 75.8 | 21.4 |
+| `order_reverse_normalized` | 37.9 | 0.7 | 1.3 | 17.0 |
+| `order_take_desc` | 37.8 | 0.7 | 1.3 | 16.9 |
+| `reverse_distinct_by` | 331.7 | 2.6 | 5.0 | 21.9 |
+| `reverse_take` | 0.0 | 0.0 | 1.1 | 72.6 |
+| `reverse_take_select` | 0.0 | 0.0 | 1.1 | 71.4 |
+| `select_count` | 0.1 | 0.0 | 0.0 | 70.1 |
+| `select_many` | — | 63.7 | — | — |
+| `select_where` | 105.6 | 4.1 | 5.5 | 95.1 |
+| `select_where_count` | 32.5 | 0.3 | 0.6 | 16.6 |
+| `select_where_order_take` | 36.3 | 0.7 | 1.3 | 17.5 |
+| `select_where_sum` | 36.8 | 0.4 | 0.6 | 18.9 |
+| `single_match` | 0.0 | 0.4 | 1.1 | 48.8 |
 | `skip_take` | 0.3 | 0.0 | 0.0 | 1.6 |
-| `skip_while_match` | 3.4 | 0.4 | 0.4 | 43.7 |
-| `sort_first` | 38.2 | 0.4 | 1.3 | 16.5 |
-| `sort_take` | 38.6 | 0.7 | 1.4 | 18.0 |
-| `sort_take_select` | 38.6 | 0.7 | 1.4 | 16.7 |
-| `sum_aggregate` | 30.6 | 0.3 | 0.1 | 17.7 |
-| `sum_where` | 33.3 | 0.3 | 0.6 | 16.5 |
-| `take_count` | 1.8 | 0.1 | 0.1 | 1.6 |
+| `skip_while_match` | 3.5 | 0.4 | 0.4 | 48.8 |
+| `sort_first` | 37.5 | 0.4 | 1.3 | 16.8 |
+| `sort_take` | 38.2 | 0.7 | 1.4 | 18.3 |
+| `sort_take_select` | 37.9 | 0.7 | 1.3 | 17.0 |
+| `sum_aggregate` | 29.8 | 0.3 | 0.0 | 26.4 |
+| `sum_where` | 32.8 | 0.3 | 0.6 | 18.5 |
+| `take_count` | 1.8 | 0.1 | 0.1 | 1.5 |
 | `take_count_filtered` | 1.1 | 0.0 | 0.0 | 0.5 |
 | `take_sum_aggregate` | 0.8 | 0.0 | 0.0 | 0.2 |
 | `take_where_count` | 0.9 | 0.0 | 0.0 | 0.2 |
-| `take_while_match` | 7.8 | 0.2 | 0.3 | 15.8 |
-| `to_array_filter` | 48.2 | 3.4 | 3.6 | 20.1 |
-| `zip_count_pred` | 39.4 | 0.1 | — | 152.4 |
-| `zip_dot_product` | — | 0.1 | 0.1 | 152.5 |
-| `zip_dot_product_3arg` | — | 0.1 | — | 152.4 |
-| `zip_reverse_to_array` | — | 4.9 | — | 160.7 |
+| `take_while_match` | 7.7 | 0.2 | 0.3 | 18.0 |
+| `to_array_filter` | 47.4 | 3.2 | 3.9 | 20.1 |
+| `where_join_count` | 40.9 | 6.3 | 8.4 | 48.0 |
+| `zip_count_pred` | 38.7 | 0.1 | — | 151.6 |
+| `zip_dot_product` | — | 0.1 | 0.1 | 151.1 |
+| `zip_dot_product_3arg` | — | 0.1 | — | 152.0 |
+| `zip_reverse_to_array` | — | 4.5 | — | 161.3 |
 <!-- BENCH:TABLES END -->
 
 ## Notes on missing lanes (the `—` cells)
@@ -224,6 +238,18 @@ and which gaps could land in a single PR — see
 - **`chained_select_collapse` SQL** — `_sql` rejects `distinct() |> count()`
   as non-translatable. The equivalent SQL `COUNT(DISTINCT computed-expr)`
   isn't currently emitted by sqlite_linq's surface. By design — no follow-up.
+- **`cross_join` Decs (m4)** — a standalone `from_decs_template` source yields
+  anonymous row tuples, so there is no clean typed-lambda cross form
+  (`_cross_join` requires typed lambdas and is not `_fold`-integrated yet). The
+  decs lane arrives with the cross-join `_fold` engine integration; SQL / array /
+  XML only for now.
+- **`select_many` SQL (m1) / Decs (m4) / XML (m5f)** — the correlated flatten
+  needs a per-element nested collection (an `array<…>` field). SQL has no
+  nested-collection flatten (correlated select_many over SQL is rejected); a decs
+  component has no `array<…>` field; and the XML linq source `from_xml_node`
+  materializes rows from flat attributes only (`build_xml_row`), so it cannot
+  populate a nested field. Array-only — a source-shape gap, by design for these
+  backends.
 - **`decs_count_bare_pred` SQL / Array / XML (m5f)** — covers a Theme 4
   root-cause fix specific to the decs lane (bare `from_decs_template(...).count(P)`
   with no upstream where/select previously bailed because

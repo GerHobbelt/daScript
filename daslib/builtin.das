@@ -1597,7 +1597,7 @@ def nothing(var it : iterator<auto(TT)>) : iterator<TT> {
 def to_array(var it : iterator<auto(TT)>) : array<TT -const -&> {
     var arr : array<TT -const -&>
     for (x in it) {
-        push_clone(arr, x)
+        push_clone(arr, x) // nolint:PERF006 iterator length is unknown ahead of time — cannot reserve
     }
     return <- arr
 }
@@ -1608,6 +1608,14 @@ def to_array(a : auto(TT)[]) : array<TT -const> {
     unsafe {
         reinterpret<TT -const[typeinfo dim(a)]>(addr(arr[0])) := a
     }
+    return <- arr
+}
+
+[unused_argument(arr)]
+def to_array(var arr : array<auto(TT)>) : array<TT -const -#> {
+    //! No-op identity over an `array` — moves it through unchanged. Lets source-agnostic linq
+    //! emitters (e.g. linq_das) always append `|> to_array()` regardless of whether the chain is
+    //! already array-typed. `_sql(...)` intercepts this call as a no-op terminal (see analyze_chain).
     return <- arr
 }
 
