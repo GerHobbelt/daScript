@@ -91,6 +91,45 @@ def test_vertex_index_builtins(t : T?) {
 }
 
 [test]
+def test_vertex_point_size(t : T?) {
+    t |> run("vertex: gl_PointSize (BuiltIn PointSize Output) for POINT_LIST rasterisation") <| @(t : T?) {
+        var words <- point_size_words()
+        let vmodel = op_first_operand(words, SpvOp.EntryPoint)
+        t |> success(vmodel.ok && vmodel.value == uint(SpvExecutionModel.Vertex),
+            "point_size: EntryPoint model is Vertex")
+        // gl_PointSize -> BuiltIn PointSize decoration on a vertex-stage Output variable
+        t |> success(op_has_operand_pair(words, SpvOp.Decorate, uint(SpvDecoration.BuiltIn), uint(SpvBuiltIn.PointSize)),
+            "point_size: gl_PointSize -> BuiltIn PointSize")
+        t |> success(has_builtin(words, SpvBuiltIn.Position),
+            "point_size: gl_Position still present (Vertex shaders must write it)")
+        // an Output-storage variable (gl_Position + gl_PointSize)
+        t |> success(op_has_operand_at(words, SpvOp.Variable, 2, uint(SpvStorageClass.Output)),
+            "point_size: has an Output-storage OpVariable")
+        check_ops(t, words, "point_size", [SpvOp.Store])
+        validate(t, words, "point_size")
+        delete words
+    }
+}
+
+[test]
+def test_fragment_point_coord(t : T?) {
+    t |> run("fragment: gl_PointCoord (BuiltIn PointCoord Input) for point-sprite UV") <| @(t : T?) {
+        var words <- point_coord_words()
+        let fmodel = op_first_operand(words, SpvOp.EntryPoint)
+        t |> success(fmodel.ok && fmodel.value == uint(SpvExecutionModel.Fragment),
+            "point_coord: EntryPoint model is Fragment")
+        // gl_PointCoord -> BuiltIn PointCoord decoration on a fragment-stage Input variable
+        t |> success(op_has_operand_pair(words, SpvOp.Decorate, uint(SpvDecoration.BuiltIn), uint(SpvBuiltIn.PointCoord)),
+            "point_coord: gl_PointCoord -> BuiltIn PointCoord")
+        t |> success(op_has_operand_at(words, SpvOp.Variable, 2, uint(SpvStorageClass.Input)),
+            "point_coord: has an Input-storage OpVariable")
+        check_ops(t, words, "point_coord", [SpvOp.CompositeConstruct, SpvOp.Load, SpvOp.Store])
+        validate(t, words, "point_coord")
+        delete words
+    }
+}
+
+[test]
 def test_fragment_math(t : T?) {
     t |> run("fragment: gl_FragCoord + GLSL.std.450 math (dot/sqrt/clamp)") <| @(t : T?) {
         var words <- raster_math_words()
@@ -98,6 +137,37 @@ def test_fragment_math(t : T?) {
         check_ops(t, words, "raster_math", [SpvOp.Dot, SpvOp.ExtInstImport, SpvOp.ExtInst,
             SpvOp.CompositeConstruct])
         validate(t, words, "raster_math")
+        delete words
+    }
+}
+
+// Flat decoration: Vulkan mandates Flat on any integer / uint varying — int can't interpolate, so
+// without it the driver returns garbage. The emitter auto-applies Flat to int/uint @in/@out, and
+// honours an explicit `@flat` on float varyings (low-poly stylised look). The negative control is a
+// plain float varying with no @flat — it must NOT pick up Flat.
+[test]
+def test_vertex_flat(t : T?) {
+    t |> run("vertex: int @out is auto-Flat; @flat float @out is Flat; plain float @out is not") <| @(t : T?) {
+        var words <- flat_vert_words()
+        // exactly two Flat decorations (mat_id + flat_val); plain smooth_val stays unflagged
+        let nflat = count_op_operand_at(words, SpvOp.Decorate, 1, uint(SpvDecoration.Flat))
+        t |> success(nflat == 2, "flat_vert: 2 Flat decorations (got {nflat})")
+        // each Location is still present (Flat decoration sits alongside, not in place of, Location)
+        t |> success(has_location(words, 0u), "flat_vert: Location 0 (mat_id) still present")
+        t |> success(has_location(words, 1u), "flat_vert: Location 1 (flat_val) still present")
+        t |> success(has_location(words, 2u), "flat_vert: Location 2 (smooth_val) still present")
+        validate(t, words, "flat_vert")
+        delete words
+    }
+}
+
+[test]
+def test_fragment_flat(t : T?) {
+    t |> run("fragment: int @in is auto-Flat; @flat float @in is Flat; plain float @in is not") <| @(t : T?) {
+        var words <- flat_frag_words()
+        let nflat = count_op_operand_at(words, SpvOp.Decorate, 1, uint(SpvDecoration.Flat))
+        t |> success(nflat == 2, "flat_frag: 2 Flat decorations (got {nflat})")
+        validate(t, words, "flat_frag")
         delete words
     }
 }

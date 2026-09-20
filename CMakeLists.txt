@@ -74,6 +74,27 @@ set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 
 set(EXECUTABLE_OUTPUT_PATH  ${PROJECT_SOURCE_DIR}/bin/)
 
+# Disable vcpkg's per-target applocal deploy project-wide.
+#
+# When built through the vcpkg toolchain on Windows, VCPKG_APPLOCAL_DEPS
+# defaults to ON, which appends a POST_BUILD "vcpkg z-applocal" step to every
+# executable / shared library. Since all of our binaries emit into the single
+# shared bin/, that means dozens of targets (the ~40 integration tutorials, the
+# test exes, the modules) each concurrently re-copy the same runtime DLLs into
+# bin/. Under Ninja's parallel link those copies collide on Windows with
+# "The process cannot access the file because it is being used by another
+# process" — a flaky build failure (observed on win32 Release).
+#
+# That deploy is pure redundant work for this project: our own DLLs
+# (libDaScriptDyn*.dll, ...) build directly into bin/, and every module that
+# needs a third-party DLL deploys it itself with an idempotent, single-target
+# copy_if_different (openssl via dasHV, glfw3.dll via dasGlfw). openssl is the
+# only vcpkg-installed package in any workflow, and it is covered by dasHV — so
+# nothing relies on vcpkg's applocal pass. Turning it off removes the race for
+# all targets and loses no deployed dependency. No-op on non-Windows / non-vcpkg
+# builds, where the variable is unused.
+set(VCPKG_APPLOCAL_DEPS OFF)
+
 SET(LINUX_UUID FALSE)
 
 IF(NOT DAS_FLEX_BISON_DISABLED)
@@ -1248,6 +1269,20 @@ if (NOT ${DAS_TOOLS_DISABLED})
         SETUP_LTO(${target_name})
     ENDMACRO()
 
+    # Relative RPATH so an installed binary in bin/ finds the shared libs in ../lib.
+    MACRO(SETUP_BIN_RPATH target_name)
+        if(APPLE)
+            SET_TARGET_PROPERTIES(${target_name} PROPERTIES
+                INSTALL_RPATH "@loader_path/../lib"
+                CMAKE_MACOSX_RPATH ON
+            )
+        elseif(UNIX)
+            SET_TARGET_PROPERTIES(${target_name} PROPERTIES
+                INSTALL_RPATH "\$ORIGIN/../lib"
+            )
+        endif()
+    ENDMACRO()
+
     SETUP_COMPILER_BINARY(daslang_static libDaScript DAS_MODULES_LIBS "")
 
     # Dynamic/DLL compiler binary — the default shipped binary.
@@ -1257,16 +1292,7 @@ if (NOT ${DAS_TOOLS_DISABLED})
     target_sources(daslang        PRIVATE src/misc/alloc_tracker_overrides.cpp)
     target_sources(daslang_static PRIVATE src/misc/alloc_tracker_overrides.cpp)
     # relative RPATH from install location
-    if(APPLE)
-        SET_TARGET_PROPERTIES(daslang PROPERTIES
-            INSTALL_RPATH "@loader_path/../lib"
-            CMAKE_MACOSX_RPATH ON
-        )
-    elseif(UNIX)
-        SET_TARGET_PROPERTIES(daslang PROPERTIES
-            INSTALL_RPATH "\$ORIGIN/../lib"
-        )
-    endif()
+    SETUP_BIN_RPATH(daslang)
     # Export daslang target, so it can be found
     # as a target (for example in aot).
     INSTALL(
@@ -1289,17 +1315,10 @@ if (NOT ${DAS_TOOLS_DISABLED})
     SETUP_CPP11(daslang-live)
     DAS_APPLY_STRICT_WARNINGS(daslang-live)
     SETUP_LTO(daslang-live)
+    SETUP_BIN_RPATH(daslang-live)
     if(APPLE)
-        SET_TARGET_PROPERTIES(daslang-live PROPERTIES
-            INSTALL_RPATH "@loader_path/../lib"
-            CMAKE_MACOSX_RPATH ON
-        )
         # Foundation: NSProcessInfo, used to disable App Nap at startup (dasImgui #190).
         TARGET_LINK_LIBRARIES(daslang-live "-framework Foundation")
-    elseif(UNIX)
-        SET_TARGET_PROPERTIES(daslang-live PROPERTIES
-            INSTALL_RPATH "\$ORIGIN/../lib"
-        )
     endif()
     INSTALL(
         TARGETS daslang-live
@@ -1330,12 +1349,14 @@ if (NOT ${DAS_TOOLS_DISABLED})
     )
 
     add_executable(das-fmt ${PROJECT_SOURCE_DIR}/utils/dasFormatter/main.cpp)
-    TARGET_LINK_LIBRARIES(das-fmt libDaScript ${SRC_LIBRARIES} ${DAS_MODULES_LIBS})
+    TARGET_LINK_LIBRARIES(das-fmt libDaScriptDyn ${SRC_LIBRARIES})
+    ADD_DEPENDENCIES(das-fmt libDaScriptDyn ${DAS_DYN_MODULES_LIBS})
     target_include_directories(das-fmt PRIVATE ${NEED_MODULES_PATH})
 
     SETUP_CPP11(das-fmt)
     DAS_APPLY_STRICT_WARNINGS(das-fmt)
     SETUP_LTO(das-fmt)
+    SETUP_BIN_RPATH(das-fmt)
     install(TARGETS das-fmt RUNTIME DESTINATION ${DAS_INSTALL_BINDIR})
 get_target_property(DAS_FMT_INCLUDES libDaScriptDyn INCLUDE_DIRECTORIES)
 get_target_property(DAS_FMT_DEFS das-fmt COMPILE_DEFINITIONS)

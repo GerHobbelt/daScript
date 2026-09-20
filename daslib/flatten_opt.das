@@ -447,6 +447,77 @@ def public dse_pass(var out : array<ExpressionPtr>) {
     delete dead
 }
 
+// ===== Flow-sensitive const-bool propagation of loop/iter masks =====
+// The break/continue masks (`__flat_loop_*`, `__flat_iter_*`) are multi-def — a `var M = true`
+// decl plus `M = M && !(term)` narrows — so copy_prop (single-def only) leaves them. But the body
+// is straight-line, so a forward scan carries each mask's known const-bool value to its next use:
+// the decl seeds `true`; every use before the first narrow folds (`true && X → X`, `true ? a : b →
+// a`, so the first unrolled iteration is unconditional); the first narrow itself (`M = M && X`, M
+// known true → `M = X`) drops the dead `&& true` AND — when M is read nowhere else (a continue
+// mask whose sole consumer was its own narrow) — leaves the whole decl+store dead for the
+// following dse_pass. A non-const narrow clears the mask (subsequent uses are genuine reads).
+
+// True if `e` reads any flat-mask currently in `known` (fills `reads`, cleared first). Cheap
+// O(size) scan gating the cloning fold_const so mask-free statements are skipped.
+def private reads_known(var e : ExpressionPtr; known : table<uint64; bool>; var reads : table<uint64>) : bool {
+    clear(reads)
+    var risky = false
+    scan_flat(e, reads, risky)
+    for (h in keys(reads)) {
+        if (key_exists(known, h)) return true
+    }
+    return false
+}
+
+def public mask_const_prop_pass(var out : array<ExpressionPtr>) {
+    var known : table<uint64; bool>   // flat-mask name-hash -> currently-known const bool value
+    var reads : table<uint64>         // scratch, cleared per statement
+    let n = length(out)
+    for (i in range(n)) {
+        var s = out[i]
+        // (1) flat-mask decl `var M = <init>`: fold init under known masks, then (re)seed M.
+        if (s is ExprLet && length((s as ExprLet).variables) == 1 && is_flat_temp((s as ExprLet).variables[0].name)) {
+            var lc = s as ExprLet
+            let h = hash(lc.variables[0].name)
+            if (lc.variables[0].init != null) {
+                if (!empty(known) && reads_known(lc.variables[0].init, known, reads)) {
+                    lc.variables[0].init = fold_const(lc.variables[0].init, known)
+                }
+                var bv = false
+                if (const_bool(lc.variables[0].init, bv)) {
+                    known[h] = bv
+                } else {
+                    known |> erase(h)
+                }
+            } else {
+                known |> erase(h)
+            }
+            continue
+        }
+        // (2) flat-mask store `M = <rhs>`: fold rhs (the `M = M && X` collapse), then update M.
+        if (s is ExprCopy && (s as ExprCopy).left is ExprVar && is_flat_temp(((s as ExprCopy).left as ExprVar).name)) {
+            var cp = s as ExprCopy
+            let h = hash((cp.left as ExprVar).name)
+            if (!empty(known) && reads_known(cp.right, known, reads)) {
+                cp.right = fold_const(cp.right, known)
+            }
+            var bv = false
+            if (const_bool(cp.right, bv)) {
+                known[h] = bv
+            } else {
+                known |> erase(h)
+            }
+            continue
+        }
+        // (3) any other statement: fold its mask reads (select predicates) under known masks.
+        if (!empty(known) && reads_known(s, known, reads)) {
+            out[i] = fold_stmt(s, known)
+        }
+    }
+    delete known
+    delete reads
+}
+
 // ===== SSA-rename of reassigned user locals =====
 // Straight-line body → a reassigned local is a linear def-chain (no phi); renaming each write to a
 // fresh single-def `__ssa_` version lets post-infer const-prop fold the chain (declared-with-init only).
@@ -523,6 +594,12 @@ def public ssa_rename_pass(var out : array<ExpressionPtr>) {
     delete ssaNames
     delete current
 }
+
+// radians/degrees are each exactly one float32 multiply by these conversion constants —
+// the bit pattern the C++ helpers (aot_builtin_math.h radians_float/degrees_float) fold to,
+// verified bit-identical to evaluating the builtin at 1.0 (0x3c8efa35 / 0x42652ee0).
+let private DEG_TO_RAD = 0.017453292f
+let private RAD_TO_DEG = 57.295776f
 
 class private FoldVisitor : AstVisitor {
     changed : bool
@@ -684,6 +761,21 @@ class private FoldVisitor : AstVisitor {
             if (!(folded is ExprCall)) {   // eval_to_const returns the call unchanged on failure
                 changed = true
                 return folded
+            }
+        }
+        // Lower radians/degrees to their defining multiply (`x * K`) so an adjacent const
+        // factor merges (`degrees(x) * C → x * (K*C)`, via reassoc) and a backend needs no
+        // radians/degrees opcode — only `mul`. Bit-exact (K = the builtin at 1.0); a const
+        // arg already folded to a literal above. `x * scalarK` covers float and float-vector
+        // (vec*scalar is native, matching the C++ v_mul-by-splat form).
+        if (that.func != null && that.func.flags.builtIn && length(that.arguments) == 1
+                && is_float_family(expr_bt(that.arguments[0]))) {
+            let nm = psh_simple_name("{that.func.name}")
+            if (nm == "radians" || nm == "degrees") {
+                changed = true
+                let k = nm == "radians" ? DEG_TO_RAD : RAD_TO_DEG
+                return new ExprOp2(at = that.at, op := "*", left = that.arguments[0],
+                    right = new ExprConstFloat(at = that.at, value = k))
             }
         }
         // DISASSEMBLE mad (and, under `expandLerp`, lerp) into raw arithmetic so the folds,
@@ -1523,6 +1615,195 @@ class private ReassocVisitor : AstVisitor {
     }
 }
 
+// ===== Same-condition select-accumulation fusion =====
+// An unrolled loop with a LOOP-INVARIANT guard (`if (uniform) { acc OP= tap }`) emits a chain of
+// selects all on ONE condition: `a0 = c ? T0 : B; a1 = c ? T1(a0) : a0; … ; am = c ? Tm(a_{m-1}) :
+// a_{m-1}`. Since `c` is a single value, the whole chain is binary — `c ? <full accumulation> : B`.
+// We hoist the shared `c` out of all N selects: strip the select from every link but the last
+// (its accumulation runs unconditionally, which in branchless code it already does — predication
+// computes both arms), and rewrite the last select's false arm to the base `B`. The op tree is
+// PRESERVED (not reassociated), so this is bit-exact for ANY ops in the Tk (mad/+/*/min/max/clamp,
+// even mixed) and NOT fast-math gated. Each intermediate accumulator must be single-use (consumed
+// only by the next link); the chain end may be multi-use (returned, etc.).
+
+def private sel3(e : ExpressionPtr) : ExprOp3? {
+    return (e != null && e is ExprOp3) ? (e as ExprOp3) : null   // ExprOp3 is the ternary `?:`
+}
+
+// The select-let `var a = (c ? T : F)` at `s`: its var name (or "" if not a single-var select-let).
+def private select_let_name(s : ExpressionPtr) : string {
+    if (s is ExprLet && length((s as ExprLet).variables) == 1 &&
+            sel3((s as ExprLet).variables[0].init) != null) {
+        return "{(s as ExprLet).variables[0].name}"
+    }
+    return ""
+}
+
+// Bare ExprVar name under an optional ExprRef2Value wrap (a value-context local read), else "".
+def private ref_var_name(e : ExpressionPtr) : string {
+    var x = e
+    if (x != null && x is ExprRef2Value) {
+        x = (x as ExprRef2Value).subexpr
+    }
+    return (x != null && x is ExprVar) ? "{(x as ExprVar).name}" : ""
+}
+
+// Safe to evaluate UNCONDITIONALLY? A stripped (non-last) chain link's true arm runs even when the
+// guard is false (in interp/JIT/AOT `?:` short-circuits, so the original did not), so it must not
+// be able to fault or have a side effect. CONSERVATIVE: explicitly whitelist the known-pure nodes
+// and recurse; ANYTHING else — `ExprAt` (index OOB), `ExprPtr2Ref` (null deref), `ExprNullCoalescing`,
+// or a node kind not reasoned about — is unsafe by default. Integer `/` / `%` panic on a zero divisor
+// (float div is inf, safe). Surviving calls are whitelisted pure GPU builtins (verify_flat bars user
+// calls) — total, no fault. A rejected true arm just isn't fused (a missed opt, never a miscompile).
+def private select_arm_eval_safe(e : ExpressionPtr) : bool {
+    if (e == null || e is ExprVar || e |> is_expr_const()) return true   // null / var read / literal is pure
+    if (e is ExprOp1) return select_arm_eval_safe((e as ExprOp1).subexpr)
+    if (e is ExprOp2) {
+        let o = e as ExprOp2
+        if ((o.op == "/" || o.op == "%") && !is_float_valued(e)) return false
+        return select_arm_eval_safe(o.left) && select_arm_eval_safe(o.right)
+    }
+    if (e is ExprOp3) {
+        let o = e as ExprOp3
+        return select_arm_eval_safe(o.subexpr) && select_arm_eval_safe(o.left) && select_arm_eval_safe(o.right)
+    }
+    if (e is ExprCall) {
+        for (a in (e as ExprCall).arguments) {
+            if (!select_arm_eval_safe(a)) return false
+        }
+        return true
+    }
+    if (e is ExprRef2Value) return select_arm_eval_safe((e as ExprRef2Value).subexpr)
+    if (e is ExprSwizzle) return select_arm_eval_safe((e as ExprSwizzle).value)
+    if (e is ExprField) return select_arm_eval_safe((e as ExprField).value)
+    if (e is ExprCast) return select_arm_eval_safe((e as ExprCast).subexpr)
+    if (e is ExprMakeTuple) {
+        for (v in (e as ExprMakeTuple).values) {
+            if (!select_arm_eval_safe(v)) return false
+        }
+        return true
+    }
+    return false   // ExprAt / ExprPtr2Ref / ExprNullCoalescing / unrecognized → conservatively unsafe
+}
+
+// Walk the def-use successor of `accName` (its sole referencing statement, since single-use) and,
+// if that statement is a same-`condKey` select whose false arm is `accName`, return its index; else -1.
+def private chain_successor(var ub : FlatUsesBuilder?; var blk : ExprBlock?; accName, condKey : string;
+                            afterIdx : int; consumed : table<int>) : int {
+    let hk = hash(accName)
+    // single-use: accName referenced in exactly one statement (its successor)
+    if (!key_exists(ub.nameUses, hk) || length(ub.nameUses[hk]) != 1) return -1
+    let j = ub.nameUses[hk][0]
+    // successor must be a later, unconsumed select-let
+    if (j <= afterIdx || key_exists(consumed, j) || select_let_name(blk.list[j]) == "") return -1
+    let succSel = sel3((blk.list[j] as ExprLet).variables[0].init)
+    // …on the same condition, with its false arm = the running accumulator
+    if (describe(succSel.subexpr) != condKey || ref_var_name(succSel.right) != accName) return -1
+    return j
+}
+
+// The maximal same-condition select chain headed at statement `i` (chain[0]=i, then each def-use
+// successor), or a <2 chain when `i` heads none. Shared by the fuse transform and its residual
+// oracle so they cannot drift. The condition must be STABLE: a syntactically-identical condition
+// over a reassigned var (a break/continue loop mask `__flat_loop_*` narrowed between selects) has a
+// DIFFERENT value per link, so a mutable-reading condition is rejected.
+def private build_select_chain(var ub : FlatUsesBuilder?; var blk : ExprBlock?; mutableVars : table<string>;
+                               consumed : table<int>; i : int) : array<int> {
+    var chain : array<int>
+    let headName = select_let_name(blk.list[i])
+    if (headName == "") return <- chain
+    var headSel = sel3((blk.list[i] as ExprLet).variables[0].init)
+    if (reads_mutable(headSel.subexpr, mutableVars)) return <- chain
+    let condKey = describe(headSel.subexpr)
+    chain |> push(i)
+    var accName = headName
+    while (true) {
+        let j = chain_successor(ub, blk, accName, condKey, chain[length(chain) - 1], consumed)
+        if (j < 0) break
+        // Appending j makes the current tail a STRIPPED non-last link — its true arm will run
+        // unconditionally, so it must be fault-free / side-effect-free. If not, stop here: the
+        // current tail stays the (guarded) last link. The check is in this shared walk so the
+        // transform and the residual oracle agree on which chains are fusable.
+        let tailSel = sel3((blk.list[chain[length(chain) - 1]] as ExprLet).variables[0].init)
+        if (!select_arm_eval_safe(tailSel.left)) break
+        chain |> push(j)
+        accName = "{(blk.list[j] as ExprLet).variables[0].name}"
+    }
+    return <- chain
+}
+
+def public fuse_select_chains(var blk : ExprBlock?) : bool {
+    let n = length(blk.list)
+    if (n < 2) return false
+    var mutableVars <- collect_mutable(blk)
+    var ub = new FlatUsesBuilder()
+    make_visitor(*ub) $(adapter) {
+        for (j in range(n)) {
+            ub.j = j
+            clear(ub.seen)
+            visit(blk.list[j], adapter)
+        }
+    }
+    var consumed : table<int>
+    var changed = false
+    for (i in range(n)) {
+        if (key_exists(consumed, i)) continue
+        var chain <- build_select_chain(ub, blk, mutableVars, consumed, i)
+        if (length(chain) >= 2) {
+            // base = the head select's false arm; clone it before re-parenting onto the tail select.
+            var baseExpr = clone_expression(sel3((blk.list[chain[0]] as ExprLet).variables[0].init).right)
+            for (ci in range(length(chain) - 1)) {     // strip every link but the last → its true arm
+                var lc = blk.list[chain[ci]] as ExprLet
+                lc.variables[0].init = sel3(lc.variables[0].init).left
+                consumed |> insert(chain[ci])
+            }
+            let lastIdx = chain[length(chain) - 1]      // tail keeps its select; false arm := base
+            sel3((blk.list[lastIdx] as ExprLet).variables[0].init).right = baseExpr
+            consumed |> insert(lastIdx)
+            changed = true
+        }
+        delete chain
+    }
+    delete consumed
+    delete mutableVars
+    unsafe {
+        delete ub
+    }
+    return changed
+}
+
+// Read-only oracle mirror: true if a same-condition select chain (≥2 links) is still un-fused.
+def public has_fusable_select_chain(var blk : ExprBlock?) : bool {
+    let n = length(blk.list)
+    if (n < 2) return false
+    var mutableVars <- collect_mutable(blk)
+    var ub = new FlatUsesBuilder()
+    make_visitor(*ub) $(adapter) {
+        for (j in range(n)) {
+            ub.j = j
+            clear(ub.seen)
+            visit(blk.list[j], adapter)
+        }
+    }
+    var consumed : table<int>   // always empty here — the oracle does not consume
+    var found = false
+    for (i in range(n)) {
+        var chain <- build_select_chain(ub, blk, mutableVars, consumed, i)
+        let isChain = length(chain) >= 2
+        delete chain
+        if (isChain) {
+            found = true
+            break
+        }
+    }
+    delete consumed
+    delete mutableVars
+    unsafe {
+        delete ub
+    }
+    return found
+}
+
 def public fold_body(var func : FunctionPtr; no_fast_math : bool = false; expand_lerp : bool = false) : bool {
     //! Post-infer fold over a flattened body: const-propagate single-def locals, reassociate scattered
     //! consts, collapse `const ? a : b`, fold identities/const ctors, drop pure self-assigns. SINGLE pass
@@ -1530,6 +1811,11 @@ def public fold_body(var func : FunctionPtr; no_fast_math : bool = false; expand
     if (!(func.body is ExprBlock)) return false
     let nfm = no_fast_math
     var changed = const_prop_locals(func.body as ExprBlock)
+    // Hoist a shared condition out of an invariant-guarded accumulation chain (N selects → 1),
+    // exposing the now-unconditional accumulation to reassoc / CSE / fuse below.
+    if (fuse_select_chains(func.body as ExprBlock)) {
+        changed = true
+    }
     // Reassociate BEFORE the fold — gather scattered consts into one adjacent group so the
     // FoldVisitor all-const arm (and the typer's re-infer) can collapse them. After const-prop,
     // which is what scatters consts (a substituted single-def local lands mid-chain).

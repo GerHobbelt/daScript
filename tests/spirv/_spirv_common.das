@@ -361,6 +361,26 @@ def vindex {
     vi_col = float4(x, x, x, 1.0f)
 }
 
+// vertex: gl_PointSize (BuiltIn PointSize Output) — the rasteriser uses this when the pipeline's
+// topology is POINT_LIST, drawing each point as a screen-space splat of width gl_PointSize pixels.
+// Same vertex-shader storage class as gl_Position (Output); writes route to a BuiltIn PointSize
+// decorated OpVariable. Requires the largePoints device feature on the Vulkan side for sizes > 1.
+[vertex_shader(name="point_size_spv"), marker(no_coverage)]
+def point_size {
+    gl_Position = float4(float(gl_VertexIndex), 0.0f, 0.0f, 1.0f)
+    gl_PointSize = 4.0f                              // BuiltIn PointSize write -> screen-space splat width
+}
+
+// fragment: gl_PointCoord (BuiltIn PointCoord Input) — the UV inside a rasterised point primitive,
+// [0,1]^2 with (0.5, 0.5) at the centre of the sprite. Lets a fragment shader compute a circular
+// mask + soft falloff for "pretty point sprites" without uploading a texture; valid only when the
+// pipeline's topology is POINT_LIST. Storage class Input (read-only), fragment-stage-only.
+var @out @location = 0 pc_color : float4
+[fragment_shader(name="point_coord_spv"), marker(no_coverage)]
+def point_coord {
+    pc_color = float4(gl_PointCoord, 0.0f, 1.0f)     // BuiltIn PointCoord read -> sprite-space UV
+}
+
 // fragment: gl_FragCoord builtin + GLSL.std.450 math (dot/sqrt/clamp) -> grayscale
 var @out @location = 0 m_out : float4
 [fragment_shader(name="raster_math_spv"), marker(no_coverage)]
@@ -372,9 +392,48 @@ def raster_math {
     m_out = float4(c, c, c, 1.0f)                 // CompositeConstruct
 }
 
+// vertex / fragment Flat-decoration fixtures: integer varyings auto-Flat (Vulkan spec mandate —
+// the driver can't interpolate ints, so the emitter MUST decorate them), and an explicit @flat on a
+// float varying forces flat-shading (a stylised-look knob). flat_vert/flat_frag cover both: an int
+// passthrough (`mat_id`) which should emit Flat without the user asking, and a float passthrough
+// (`flat_val`) carrying @flat which should also emit Flat. The plain float `smooth_val` carries no
+// @flat and must NOT pick up the decoration — that's the negative control.
+var @out @location = 0 mat_id : int                   // int Output -> auto-Flat
+var @flat @out @location = 1 flat_val : float          // float Output + @flat -> Flat
+var @out @location = 2 smooth_val : float              // float Output, no @flat -> no Flat
+[vertex_shader(name="flat_vert_spv"), marker(no_coverage)]
+def flat_vert {
+    mat_id = gl_VertexIndex
+    flat_val = float(gl_VertexIndex) * 0.5f
+    smooth_val = float(gl_VertexIndex) * 0.25f
+    gl_Position = float4(0.0f, 0.0f, 0.0f, 1.0f)
+}
+
+var @in @location = 0 fi_mat_id : int                  // int Input -> auto-Flat
+var @flat @in @location = 1 fi_flat_val : float        // float Input + @flat -> Flat
+var @in @location = 2 fi_smooth_val : float            // float Input, no @flat -> no Flat
+var @out @location = 0 flat_color : float4
+[fragment_shader(name="flat_frag_spv"), marker(no_coverage)]
+def flat_frag {
+    let m = float(fi_mat_id)
+    flat_color = float4(m, fi_flat_val, fi_smooth_val, 1.0f)
+}
+
 def public tri_vert_words : array<uint> {
     var w : array<uint>
     w |> push_from(tri_vert_spv)
+    return <- w
+}
+
+def public point_size_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(point_size_spv)
+    return <- w
+}
+
+def public point_coord_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(point_coord_spv)
     return <- w
 }
 
@@ -393,6 +452,18 @@ def public vindex_words : array<uint> {
 def public raster_math_words : array<uint> {
     var w : array<uint>
     w |> push_from(raster_math_spv)
+    return <- w
+}
+
+def public flat_vert_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(flat_vert_spv)
+    return <- w
+}
+
+def public flat_frag_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(flat_frag_spv)
     return <- w
 }
 
@@ -802,6 +873,47 @@ def fragshadow {
 def public fragshadow_words : array<uint> {
     var w : array<uint>
     w |> push_from(fragshadow_spv)
+    return <- w
+}
+
+// ===== MRT: multiple @location outputs in a fragment shader (G-buffer prep for tutorial 10's
+// deferred rendering). Each `var @out @location = N` global is its own Output OpVariable with a
+// distinct Location decoration; the entry-point interface lists all of them. This locks in the
+// per-global Location model so a future MRT-breaking change in spirv_emit.das gets caught here
+// instead of in a downstream tutorial. =====
+var @in @location = 0 mrt_uv : float2
+var @out @location = 0 mrt_position : float4
+var @out @location = 1 mrt_normal   : float4
+var @out @location = 2 mrt_albedo   : float4
+[fragment_shader(name="mrt_spv"), marker(no_coverage)]
+def mrt {
+    mrt_position = float4(mrt_uv.x, mrt_uv.y, 0.0f, 1.0f)   // OpStore -> mrt_position (location 0)
+    mrt_normal   = float4(0.0f, 1.0f, 0.0f, 0.0f)            // OpStore -> mrt_normal   (location 1)
+    mrt_albedo   = float4(0.8f, 0.2f, 0.4f, 1.0f)            // OpStore -> mrt_albedo   (location 2)
+}
+
+def public mrt_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(mrt_spv)
+    return <- w
+}
+
+// ===== Subpass input attachment: a Vulkan deferred-rendering rail (tutorial 10 lighting subpass).
+// Reads a previous subpass's color/depth at the SAME fragment coordinate via subpassLoad. The
+// opaque type subpassInput lowers to OpTypeImage Dim=SubpassData (Sampled=2, no format) decorated
+// with InputAttachmentIndex (from @input_attachment_index); subpassLoad emits OpImageRead with an
+// internal int2(0,0) coord. Requires the InputAttachment capability. =====
+var @set = 0 @binding = 0 @input_attachment_index = 0 sp_color : subpassInput
+var @out @location = 0 sp_out : float4
+[fragment_shader(name="subpass_spv"), marker(no_coverage)]
+def subpass_load_frag {
+    let sample = subpassLoad(sp_color)         // OpImageRead -> read color from prev subpass
+    sp_out = float4(sample.x, sample.y, sample.z, 1.0f)
+}
+
+def public subpass_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(subpass_spv)
     return <- w
 }
 
