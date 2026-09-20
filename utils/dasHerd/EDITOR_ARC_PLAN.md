@@ -53,6 +53,69 @@ in both views. Known v1 bounds: no folding in the VIRTUAL source path
 document revision changes; code-block interiors still have no selection
 highlight (the E2/E4 gap above).
 
+**E1 status (shipped 2026-07-30):** `imgui_text_source_edit.das` carries the
+line-buffer core (load/source round-trip incl. CRLF flavor, grapheme-aware
+cursor + insert/backspace/delete, vertical moves with preferred column) and
+the widget (InvisibleButton hit target + own virtualised drawlist rows,
+terminal-pattern typed input, scroll-follow, blink caret, current-line tint,
+line-number gutter). Preview: `examples/features/text_edit.das`; tests:
+`test_text_edit_model` (pure logic) + `test_text_edit` (keystrokes → buffer
+via snapshot — the registered state serializes the whole `lines` array).
+`codepoint_utf8` moved to `imgui_text_flow` (terminal now shares it); the
+view's tab-expanded draw/measure helpers went public
+(`text_source_draw_range` / `text_source_range_width`). Bug found by the
+smoke and fixed: drawing against the pre-input line count crashed on
+line-join edits — the draw section recounts after input runs.
+
+**E2 status (SHIPPED 2026-07-30, commits bcf40261f..dc9edcc8e):** the
+component is an honest plain-text editor with every binding editable.
+Landed per the spec: window-focus keyboard arbitration; selection model
+(Shift-nav select twins, collapse rules, mouse drag/double-word/
+triple-line select, per-row rects with newline nub); one-predicate word
+boundaries (Ctrl+Left word starts w/ lone-separator skip, Ctrl+Right
+word ENDS, whitespace-heuristic word deletes); the undo journal
+(commit_edit primitive, word-sized coalescing, adjacency break on caret
+jumps, Enter/paste fences, public push_undo_stop, selection restore,
+redo cleared on edit); clipboard verbs with line-mode copy/cut/paste +
+the six CUA/modern chords; numpad twins in ALL modifier combos with
+char-queue NumLock disambiguation; insert/overtype with block caret;
+and the keymap routed through imgui_commands (second-chord slot,
+collision-safe polling, capture-sentinel OOB fix, command_take_prefix,
+JSON-persisted bindings editor in the demo). Synth layer grew
+key_chord_tap / key_hold + named-key imgui_key_chord. Tests: edit model
+22, smoke 2 (registry-routed chords incl. keypad + overtype), commands
+3, viewer 8, terminal 1 — all green. Known E2 residuals: drag after
+double-click extends by characters (not words); Shift+keypad selection
+under NumLock-ON Windows fake-Shift not yet probed on hardware;
+multi-editor invocation routing by context field deferred; the base
+(registry-less) overload keeps the built-in keymap by design.
+
+**E3 status (SHIPPED 2026-07-30, commits ce7cb09d8 + 93a921cbd):**
+replace rides the find bar. Find module: replace row (toggle chevron,
+input, Replace/All buttons; Enter = replace one, Ctrl+Alt+Enter =
+replace all; Esc closes), request counters the host applies, per-match
+template expansion in regex mode ($0/$&, $1-$9, ${n}/${name}, $$ —
+mirrors daslib/regex's private expand_replacement). Editor: byte↔
+(line,column) mapping over the LF-joined `text_edit_text` domain,
+`text_edit_replace_range` / `text_edit_replace_all` (ascending spans
+applied back-to-front as ONE undo unit), match highlights painted under
+the text (`match_color`), and `text_edit_find_sync` — the one-call pure
+glue (rebuild, apply requests, select current match, refresh
+highlights; replace-one resumes PAST its insertion so self-matching
+replacements can't pin). find.* commands in the registry (Ctrl+F seeds
+from single-line selection, Ctrl+H opens replace focused, F3/Shift+F3,
+Escape closes BEFORE edit.cancel — registration order is the Escape
+chain). Bug found by the smoke and fixed: component-scope Shortcut
+routing follows ImGui item focus, which the bar's inputs kept after
+close — the editor now reclaims item focus (FocusItem) whenever its
+model owns the keyboard, which is also VS Code's Escape-returns-focus
+behavior. Tests: edit model 32, find model 9, smoke 3 — all green.
+Known E3 residuals: F3 doesn't step while typing in a bar input (Enter
+covers it); Ctrl+F/Ctrl+H only fire while the editor is focused
+(component scope — application-scope twins are a host decision); no
+case/whole-word toggles yet (find bar is case-insensitive literal or
+regex, as shipped in the viewer arc).
+
 ## Shape: ONE component, one arc, two skins
 
 One arc, not two. The editing core — buffer, cursor, selection, undo,
@@ -77,6 +140,24 @@ proves insufficient in use.
   the old staging caveat is gone.)
 
 ## The component, in detail
+
+> **EDITOR_EDITING_SPEC.md** (2026-07-30) is the spec of record for command
+> semantics, default chords, word-boundary rules, the undo model, numpad
+> aliasing, and the imgui_commands integration — research-backed (MS canon +
+> VS Code/VS/Sublime/JetBrains + our infra map). Where the sketches below
+> differ, the spec wins.
+
+### The API is the product (Boris, 2026-07-30)
+
+Every editing capability is a PUBLIC, programmatic verb on the state —
+`undo`, `redo`, `delete`, `select`, `type`/`insert`, `navigate_to`, word
+moves, line ops, search/replace — usable by anyone building their own
+editor on the component, with no ImGui frame required. The keymap is just
+one CLIENT of that verb surface (the live rails and tests are two more);
+a chord never carries logic of its own, it only names a verb. E1 set the
+shape (`text_edit_insert`/`text_edit_move_*`/... are public pure ops
+driven headless by tests); every E2+ capability lands verb-first, then
+gets its binding.
 
 ### Buffer
 
@@ -150,27 +231,111 @@ highlight inside code blocks lands with the selection work in E2/E4.
 - **E1** Buffer + cursor + virtualised render + typed input. A file
   opens, you type, it shows. No selection yet. dasImgui example
   `features/`-style smoke proves keystrokes → buffer via imgui_snapshot.
-- **E2** Selection + clipboard + undo/redo + the keymap. The component is
-  now an honest plain-text editor.
+- **E2** Selection + clipboard + undo/redo + the keymap — per
+  EDITOR_EDITING_SPEC.md Tier 1. Work order within the slice (each
+  sub-step commits + tests headless): (1) key-owner focus fix
+  (`SetItemKeyOwner`, kills the two-editors-both-focused bug); (2)
+  selection model + Shift-extended nav + mouse word/line click-select;
+  (3) word boundaries (one predicate) + word moves/deletes; (4) undo
+  journal (fences, kind-coalescing, adjacency break, `push_undo_stop`
+  public from day one); (5) clipboard incl. the six chords + empty-
+  selection line mode; (6) the keymap through imgui_commands (registry
+  extensions: second chord per binding, collision safety, capture-tick
+  sentinel fix, ALLOWED_IMGUI additions) + numpad aliases + smart Home +
+  overtype; (7) synth-layer extensions (named-key chords, key_hold) so
+  the chord tests read cleanly. The component is then an honest
+  plain-text editor with every binding editable.
 - **E3** Search/replace/replace-all (the standing rule lands here, not
   later).
-- **E4** Syntax-while-editing (fallback immediate + debounced full pass).
+- **E4** Syntax-while-editing (fallback immediate + debounced full pass)
+  plus editing polish — scope set by Boris's brain dump (2026-07-30):
+  1. **Language profile** (the mechanism the rest hangs off): per-language
+     editor settings — indent rules, bracket pairs, keyword list, fold
+     kinds. NOT keybindings (those stay global). Hardcoded first-class
+     das/C++/md profiles are fine; data-driven-ness is an open question,
+     not a requirement.
+  2. **Bracket-aware auto-indent on Enter**: new line lands indented;
+     counts `{ }` — deeper after `{`, and typing `}` dedents the line.
+     Per-language on/off + which symbols (md: off; some languages may
+     indent with no symbol at all).
+  3. **Bracket-pair highlight**: cursor on `[ ( {` or a closer highlights
+     the counterpart; pairs come from the language profile.
+  4. **Basic completion, from the get go**: candidates = words in this
+     document + the language's keyword list (+ words across the
+     language's open documents); ghost-text as-you-type (type `hel`,
+     greyed completion shows), Tab accepts. LSP tier waits for E6; LLM
+     tier is a recorded follow-up (below), not pressing.
+  5. **Go-to-line dialog** (very important) + permanent Ln/Col readout in
+     the editor chrome.
+  6. Leftover Tier-2: join lines, double-click-drag word-granular extend,
+     drag-and-drop selection move.
+  7. **Inline color embed** (tail of E4): `0x12AF2A` literals (with and
+     without alpha) get a swatch + real ImGui color dialog writing back —
+     the proof case that the editor embeds live widgets over source
+     ranges.
+  Settled in discussion (2026-07-30, no pushback): language profile is a
+  plain das struct with hardcoded das/cpp/md constructors (not
+  data-driven); syntax-while-editing lands BEFORE auto-indent so the
+  lexical pass tells the indenter which braces are real (`// {` and
+  `"{"` must not count); ghost-text completion defaults ON with a
+  per-language kill switch. All revisable if it feels wrong in use.
+  Settled 2026-07-31 (Boris: "now, for sure"): the E6 provider interface
+  is built IN E4 as the completion carrier from day one —
+  document-words+keywords is provider #1; LSP and LLM slot in later
+  without touching the editor, and the interface grows hover/definition
+  arms in E6. The language profile ABSORBS the per-language data already
+  scattered in the tree — what's collapsible (`g_fold_types` in
+  imgui_text_tree_sitter), extension→language mapping, bracket pairs,
+  keyword lists — one home, the modules consume the profile instead of
+  private tables. Tab default: a visible ghost suggestion accepts on
+  Tab; otherwise Tab keeps its indent behavior (the VS Code rule).
+  Settled 2026-07-31 (second round): the provider interface ships with
+  TWO REAL BACKENDS in E4, minimal but real, to keep it honest — .das
+  calls the compiler infrastructure borderline directly (in-process
+  worker, das data back, no protocol tax; utils/lsp internals minus the
+  protocol), .cpp does one honest textDocument/completion round-trip to
+  an external clangd. Each guards a different lie: the external one
+  forces spawn/lifecycle/latency/cancellation into the interface, the
+  local one forbids baking protocol assumptions in. Async-first shape
+  either way: request → token, poll/cancel, results land in the frame
+  loop (jobque worker + clone-back for the local provider). Depth and
+  quality stay E6; E4 proves the interface against both extremes.
+- **E4-follow-up (recorded, not pressing): LLM completion tier.** Own
+  section when it comes: API port setting, async request, model picked
+  for fill speed, model-per-language setting; basic-basic completion.
+- **Post-LSP tail (Boris): block/column selection** — Alt+mouse drag +
+  multi-line insert. Deliberately late: the undo journal already carries
+  multi-op units and selection lives inside TextEditState, so nothing
+  architectural forces it early.
 - **E5** `examples/text` becomes an honest editor: the component wired
   into both its presentations (markdown source with live preview beside
-  it, plain/code source), carrying save, dirty-state, and the find
-  widget. Decide HERE whether a separate minimal code-editor example
-  still earns its keep or the viewer covers it.
+  it, plain/code source), carrying save/load, dirty-state (undo back to
+  the save point clears dirty), and the find widget. Decide HERE whether
+  a separate minimal code-editor example still earns its keep or the
+  viewer covers it.
 - **E6** LSP in the code editor: hover + definition reuse the viewing
   arc's spawn-per-request transport verbatim (`nav.das`, overlay = the
   unsaved buffer — the SAME `--overlay` flag, no new machinery);
   diagnostics via `validate.das` on the debounce, squiggles from the
   span layer. Completion stays in LANGUAGE_SUPPORT_PLAN step 6 with the
   profelis floor.
+  **Provider abstraction (Boris, 2026-07-30, dropped mid-E3): the editor
+  talks to an LSP-LIKE interface, not to LSP.** One abstracted
+  language-intelligence surface (hover / definition / diagnostics /
+  completion verbs); per-language providers plug in behind it — for .das
+  some requests answer from tree-sitter, others from the compiler; C++
+  may route to a real LSP server, and even .das could. Completion goes
+  through the SAME route: the E4 document-words/keywords tier, the LSP
+  tier, and the LLM follow-up are providers behind one interface, not
+  special cases.
 - **E7** dasHerd binds it: PR body (markdown instance, no preview pane
-  needed at first) and conflict resolution (ours / base / theirs +
+  needed at first), conflict resolution (ours / base / theirs +
   editable result, per-conflict accept-ours / accept-theirs / edit,
   save writes and stages — the changelist already refuses to discard
-  conflicts).
+  conflicts), and the **git change gutter** (Boris): green/red/modified
+  line marks against HEAD beside the editable buffer, updating as you
+  type — the viewer's line-mark gutter + the inspector's diff pipeline
+  already produce exactly these marks.
 
 Each step ends the usual way: lint clean, suite green, live drive of the
 example through the rails, commit.
