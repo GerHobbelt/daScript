@@ -180,17 +180,66 @@
     // ─── Overlay player ─────────────────────────────────────────────────
     var activeOverlay = null;
 
+    // Keys whose browser default is to scroll — a game reading them through the
+    // wasm canvas should not also scroll the embedding page.
+    var SCROLL_KEYS = { ArrowUp: 1, ArrowDown: 1, ArrowLeft: 1, ArrowRight: 1, ' ': 1, Spacebar: 1, PageUp: 1, PageDown: 1, Home: 1, End: 1 };
+
     function closePlayer() {
         if (!activeOverlay) return;
         // Removing the iframe tears down the wasm instance + its rAF loop.
         activeOverlay.parentNode && activeOverlay.parentNode.removeChild(activeOverlay);
         activeOverlay = null;
         document.removeEventListener('keydown', onKeydown);
+        document.removeEventListener('fullscreenchange', onFsChange);
         if (document.fullscreenElement) document.exitFullscreen().catch(function () {});
     }
 
     function onKeydown(e) {
         if (e.key === 'Escape') closePlayer();
+    }
+
+    // The "⤢ fullscreen" button fullscreens the parent viewport element, which
+    // (a) leaves keyboard focus on the parent so a game — whose input listener
+    // lives inside the iframe — goes deaf, and (b) doesn't resize the iframe's
+    // fixed-backing-store canvas. Reaching into the same-origin game frame fixes
+    // both: refocus it, and let a game canvas fill the box letterboxed.
+    function onFsChange() {
+        var frame = document.getElementById('ex-frame');
+        var vp = document.getElementById('ex-viewport');
+        if (!frame) return;
+        var entering = !!document.fullscreenElement && document.fullscreenElement === vp;
+        try {
+            var idoc = frame.contentDocument;
+            var canvas = idoc && idoc.getElementById('canvas');
+            if (canvas) {
+                if (entering) {
+                    // Fill ONLY a fixed-backing (game) canvas — object-fit:contain scales
+                    // it up preserving aspect (no squish). A canvas whose size emscripten
+                    // manages itself (GLFW_SCALE_TO_MONITOR imgui cards set an inline
+                    // width/height + a HiDPI backing store) must be left alone: overriding
+                    // it desyncs emscripten's device-pixel cursor mapping, so on a HiDPI
+                    // display clicks land in the wrong place. Those cards fill via their
+                    // own in-app F11 (which routes through emscripten's real fullscreen).
+                    if (!canvas.style.width && !canvas.style.height) {
+                        canvas.style.width = '100%';
+                        canvas.style.height = '100%';
+                        canvas.style.objectFit = 'contain';
+                    }
+                    if (canvas.focus) canvas.focus();
+                } else if (canvas.style.width === '100%' && canvas.style.objectFit === 'contain') {
+                    // Revert only the fill WE applied, matched by its exact inline signature
+                    // (100% + contain — a value we alone set; games start with no inline size,
+                    // imgui cards carry emscripten's px). Stateless, so a cross-session
+                    // fullscreenchange race (exitFullscreen is async; opening another card
+                    // re-attaches this listener before the pending event lands) can never
+                    // clear a different card's inline sizing.
+                    canvas.style.width = '';
+                    canvas.style.height = '';
+                    canvas.style.objectFit = '';
+                }
+            }
+        } catch (e) {}
+        if (entering && frame.contentWindow) { try { frame.contentWindow.focus(); } catch (e) {} }
     }
 
     // wasm64 present → the compiled standalone build; else → the interpreted
@@ -261,6 +310,7 @@
         document.body.appendChild(overlay);
         activeOverlay = overlay;
         document.addEventListener('keydown', onKeydown);
+        document.addEventListener('fullscreenchange', onFsChange);
 
         var player = overlay.querySelector('.forge-ex-player');
         player.addEventListener('click', function (e) {
@@ -283,8 +333,21 @@
         if (frame) {
             frame.addEventListener('load', function () {
                 setStatus(USE_WASM64 ? 'running' : 'running · interpreted', 'is-running');
-                // Focus the game canvas inside the iframe so keyboard input flows.
-                try { frame.contentWindow && frame.contentWindow.focus(); } catch (e) {}
+                // Focus the game canvas inside the iframe so keyboard input flows, and
+                // guard scroll-keys at runtime (belt-and-suspenders with the shell's own
+                // guard — covers any already-deployed card built before that shell). The
+                // game frame is same-origin, so both are reachable.
+                try {
+                    frame.contentWindow && frame.contentWindow.focus();
+                    var idoc = frame.contentDocument;
+                    var canvas = idoc && idoc.getElementById('canvas');
+                    if (canvas && canvas.focus) canvas.focus();
+                    if (frame.contentWindow) {
+                        frame.contentWindow.addEventListener('keydown', function (e) {
+                            if (SCROLL_KEYS[e.key]) e.preventDefault();
+                        }, { passive: false });
+                    }
+                } catch (e) {}
             });
         }
     }
