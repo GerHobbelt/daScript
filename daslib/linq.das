@@ -509,6 +509,107 @@ def top_n(var a : iterator<auto(TT)>; n : int) : array<TT -const -&> {
     return <- top_n_by(a, n, $(v : TT -&) => v)
 }
 
+// ============================================================================
+// top_n_descending / top_n_by_descending — return the N largest elements in
+// descending order. Mirror of top_n / top_n_by with flipped comparator.
+//
+// Array source: partial_sort on a clone with reversed less, then resize to N.
+// Iterator source: bounded min-heap of size N tracks the N largest seen so far;
+// when an element greater than the heap min arrives, evict and insert.
+// ============================================================================
+
+def top_n_by_descending(arr : array<auto(TT)>; n : int; key) : array<TT -const -&> {
+    //! Returns the ``n`` largest elements of ``arr`` by ``key(element)``,
+    //! sorted descending. ``n <= 0`` or empty ``arr`` yields an empty result.
+    var buf : array<TT -const -&>
+    if (n <= 0 || empty(arr)) return <- buf
+    let take_count = min(n, length(arr))
+    buf |> reserve(length(arr))
+    for (it in arr) {
+        buf |> push_clone(it)
+    }
+    sort_boost::partial_sort(buf, take_count, $(v1, v2) => _::less(key(v2), key(v1)))
+    buf |> resize(take_count)
+    return <- buf
+}
+
+def top_n_by_descending(var a : iterator<auto(TT)>; n : int; key) : array<TT -const -&> {
+    //! Returns the ``n`` largest elements of an iterator by ``key(element)``,
+    //! sorted descending. Uses a bounded min-heap of size ``n`` during the scan;
+    //! at most ``n`` elements resident.
+    var buf : array<TT -const -&>
+    if (n <= 0) return <- buf
+    // Heap is ordered by reversed less — top is the MIN element seen so far.
+    // When an element greater than the heap min arrives, evict and insert.
+    for (it in a) {
+        if (length(buf) < n) {
+            buf |> push_clone(it)
+            sort_boost::push_heap(buf, $(v1, v2) => _::less(key(v2), key(v1)))
+        } elif (_::less(key(buf[0]), key(it))) {
+            sort_boost::pop_heap(buf, $(v1, v2) => _::less(key(v2), key(v1)))
+            buf[length(buf) - 1] := it
+            sort_boost::push_heap(buf, $(v1, v2) => _::less(key(v2), key(v1)))
+        }
+    }
+    sort(buf, $(v1, v2) => _::less(key(v2), key(v1)))
+    return <- buf
+}
+
+def top_n_descending(arr : array<auto(TT)>; n : int) : array<TT -const -&> {
+    //! Returns the ``n`` largest elements of ``arr`` (by ``<``), sorted descending.
+    return <- top_n_by_descending(arr, n, $(v : TT -&) => v)
+}
+
+def top_n_descending(var a : iterator<auto(TT)>; n : int) : array<TT -const -&> {
+    //! Returns the ``n`` largest elements of an iterator (by ``<``), descending.
+    return <- top_n_by_descending(a, n, $(v : TT -&) => v)
+}
+
+// ============================================================================
+// top_n_by_with_cmp — take a comparator block directly instead of a key
+// lambda. The splice planner uses this when an order-by key body is pure and
+// inlineable: the body is spliced into the comparator twice (once per side),
+// eliminating both the per-comparison lambda dispatch (`cmp(v1, v2)`) AND the
+// per-side `key(v)` dispatch nested inside the standard comparator.
+//
+// Direction is encoded in the comparator: asc emits `less(body[v1], body[v2])`,
+// desc emits `less(body[v2], body[v1])`. The output is sorted ascending by the
+// comparator, so a reversed comparator yields a descending natural-key order.
+// ============================================================================
+
+def top_n_by_with_cmp(arr : array<auto(TT)>; n : int; cmp : block<(v1 : TT -&, v2 : TT -&) : bool>) : array<TT -const -&> {
+    //! Returns the ``n`` smallest-per-``cmp`` elements of ``arr``.
+    //! Pass a reversed comparator to extract the ``n`` largest instead.
+    var buf : array<TT -const -&>
+    if (n <= 0 || empty(arr)) return <- buf
+    let take_count = min(n, length(arr))
+    buf |> reserve(length(arr))
+    for (it in arr) {
+        buf |> push_clone(it)
+    }
+    sort_boost::partial_sort(buf, take_count, cmp)
+    buf |> resize(take_count)
+    return <- buf
+}
+
+def top_n_by_with_cmp(var a : iterator<auto(TT)>; n : int; cmp : block<(v1 : TT -&, v2 : TT -&) : bool>) : array<TT -const -&> {
+    //! Iterator variant — bounded heap of size ``n`` maintained during scan.
+    var buf : array<TT -const -&>
+    if (n <= 0) return <- buf
+    for (it in a) {
+        if (length(buf) < n) {
+            buf |> push_clone(it)
+            sort_boost::push_heap(buf, cmp)
+        } elif (cmp(it, buf[0])) {
+            sort_boost::pop_heap(buf, cmp)
+            buf[length(buf) - 1] := it
+            sort_boost::push_heap(buf, cmp)
+        }
+    }
+    sort(buf, cmp)
+    return <- buf
+}
+
 def unique_key(a) {
     //! generates unique key of workhorse type for the value
     static_if (typeinfo is_workhorse(a)) {
@@ -967,8 +1068,8 @@ def take(var src : iterator<auto(TT)>; from : range) : iterator<TT -& -const> {
 def take(src : array<auto(TT)>; from : range) : array<TT -& -const> {
     //! Yields a range of elements from an array
     let len = length(src)
-    let start = (from.x < 0) ? 0 : ((from.x > len) ? len : from.x)
-    var end = (from.y < 0) ? 0 : ((from.y > len) ? len : from.y)
+    let start = clamp(from.x, 0, len)
+    var end = clamp(from.y, 0, len)
     if (end < start) {
         end = start
     }

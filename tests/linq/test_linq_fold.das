@@ -800,9 +800,6 @@ def test_sum_accumulator(t : T?) {
         let arr <- [1, 2, 3, 4, 5]
         let s = _fold(each(arr).sum())
         t |> equal(15, s)
-        // parity vs _old_fold
-        let s_old = _old_fold(each(arr).sum())
-        t |> equal(s_old, s)
     }
     t |> run("sum: where filter") @(t : T?) {
         let arr <- [1, 2, 3, 4, 5]
@@ -838,8 +835,6 @@ def test_min_accumulator(t : T?) {
         let arr <- [5, 3, 8, 1, 4]
         let m = _fold(each(arr).min())
         t |> equal(1, m)
-        let m_old = _old_fold(each(arr).min())
-        t |> equal(m_old, m)
     }
     t |> run("min: where filter") @(t : T?) {
         let arr <- [5, 3, 8, 1, 4]
@@ -869,8 +864,6 @@ def test_max_accumulator(t : T?) {
         let arr <- [5, 3, 8, 1, 4]
         let m = _fold(each(arr).max())
         t |> equal(8, m)
-        let m_old = _old_fold(each(arr).max())
-        t |> equal(m_old, m)
     }
     t |> run("max: where filter") @(t : T?) {
         let arr <- [5, 3, 8, 1, 4]
@@ -900,8 +893,6 @@ def test_average_accumulator(t : T?) {
         let arr <- [2, 4, 6, 8]
         let a = _fold(each(arr).average())
         t |> equal(5.0lf, a)
-        let a_old = _old_fold(each(arr).average())
-        t |> equal(a_old, a)
     }
     t |> run("average: where filter") @(t : T?) {
         let arr <- [1, 2, 3, 4, 5]
@@ -927,8 +918,6 @@ def test_long_count_accumulator(t : T?) {
         let arr <- [1, 2, 3, 4, 5]
         let c = _fold(each(arr).long_count())
         t |> equal(5l, c)
-        let c_old = _old_fold(each(arr).long_count())
-        t |> equal(c_old, c)
     }
     t |> run("long_count: where filter") @(t : T?) {
         let arr <- [1, 2, 3, 4, 5]
@@ -954,8 +943,6 @@ def test_first_early_exit(t : T?) {
         let arr <- [7, 8, 9]
         let f = _fold(each(arr).first())
         t |> equal(7, f)
-        let f_old = _old_fold(each(arr).first())
-        t |> equal(f_old, f)
     }
     t |> run("first: where matches returns first match") @(t : T?) {
         let arr <- [1, 2, 3, 4, 5]
@@ -980,8 +967,6 @@ def test_first_or_default_early_exit(t : T?) {
         let arr <- [7, 8, 9]
         let f = _fold(each(arr).first_or_default(99))
         t |> equal(7, f)
-        let f_old = _old_fold(each(arr).first_or_default(99))
-        t |> equal(f_old, f)
     }
     t |> run("first_or_default: where matches returns first match") @(t : T?) {
         let arr <- [1, 2, 3, 4, 5]
@@ -1306,5 +1291,643 @@ def test_chained_non_workhorse_select(t : T?) {
             .max())
         // _ * 2 → [2,4,6,8,10]; .a[1] → [3,5,7,9,11]; max = 11
         t |> equal(11, r)
+    }
+}
+
+[test]
+def test_iterator_source_bare_order(t : T?) {
+    // Regression — splice path for bare order family on an iterator source. peel_each only
+    // unwraps `each(<array>)`; `each(<iterator-yielding source>)` leaves an iterator on top.
+    // Old planner unconditionally wrapped the emission with `to_sequence_move()` whenever
+    // `expr._type.isIterator`, which compile-errored because daslib's `order_*(iter,…)`
+    // overloads already return iterator and `to_sequence_move` is array-only.
+    t |> run("each(range) |> order_by — splice emits iter-returning overload") @(tt : T?) {
+        var query = _fold(each(range(0, 5))._order_by(-_))
+        // range(0,5) = [0,1,2,3,4]; ordered by -v = [4,3,2,1,0]
+        let expected = [4, 3, 2, 1, 0]
+        for (v, i in query, 0 .. 5) {
+            tt |> equal(expected[i], v)
+        }
+    }
+}
+
+[test]
+def test_reverse_basic_parity(t : T?) {
+    // Phase 3+ / R1: bare reverse + to_array splices into buffer + reverse_inplace.
+    // Parity test — output element-by-element matches plain reverse().
+    t |> run("reverse → to_array: 5-element array") @(tt : T?) {
+        let got <- _fold(each([1, 2, 3, 4, 5]) |> reverse() |> to_array())
+        let expected = [5, 4, 3, 2, 1]
+        tt |> equal(length(got), length(expected))
+        for (v, e in got, expected) {
+            tt |> equal(v, e)
+        }
+    }
+    t |> run("reverse → to_array: empty source") @(tt : T?) {
+        var empty : array<int>
+        let got <- _fold(each(empty) |> reverse() |> to_array())
+        tt |> equal(0, length(got))
+    }
+    t |> run("reverse → to_array: single-element source") @(tt : T?) {
+        let got <- _fold(each([42]) |> reverse() |> to_array())
+        tt |> equal(1, length(got))
+        tt |> equal(42, got[0])
+    }
+}
+
+[test]
+def test_reverse_with_where_parity(t : T?) {
+    // R2: where_ before reverse — buffer accumulates filtered survivors, then reverses.
+    t |> run("where(>2).reverse: [1..5] → survivors [3,4,5] reversed = [5,4,3]") @(tt : T?) {
+        let got <- _fold(each([1, 2, 3, 4, 5])._where(_ > 2) |> reverse() |> to_array())
+        let expected = [5, 4, 3]
+        tt |> equal(length(got), length(expected))
+        for (v, e in got, expected) {
+            tt |> equal(v, e)
+        }
+    }
+    t |> run("where(false).reverse: empty survivor list → empty result") @(tt : T?) {
+        let got <- _fold(each([1, 2, 3, 4, 5])._where(_ > 999) |> reverse() |> to_array())
+        tt |> equal(0, length(got))
+    }
+    t |> run("where(true).reverse: identity filter equivalent to bare reverse") @(tt : T?) {
+        let got <- _fold(each([1, 2, 3, 4, 5])._where(_ > 0) |> reverse() |> to_array())
+        let expected = [5, 4, 3, 2, 1]
+        tt |> equal(length(got), length(expected))
+        for (v, e in got, expected) {
+            tt |> equal(v, e)
+        }
+    }
+    t |> run("where.where.reverse: fused predicates with &&") @(tt : T?) {
+        let got <- _fold(each([1, 2, 3, 4, 5])._where(_ > 1)._where(_ < 5) |> reverse() |> to_array())
+        let expected = [4, 3, 2]
+        tt |> equal(length(got), length(expected))
+        for (v, e in got, expected) {
+            tt |> equal(v, e)
+        }
+    }
+}
+
+[test]
+def test_reverse_with_select_parity(t : T?) {
+    // R3: select before reverse — projected values land in the buffer, then reverse.
+    t |> run("select(x*10).reverse: [1..5] → [10,20,30,40,50] reversed = [50,40,30,20,10]") @(tt : T?) {
+        let got <- _fold(each([1, 2, 3, 4, 5])._select(_ * 10) |> reverse() |> to_array())
+        let expected = [50, 40, 30, 20, 10]
+        tt |> equal(length(got), length(expected))
+        for (v, e in got, expected) {
+            tt |> equal(v, e)
+        }
+    }
+    t |> run("where.select.reverse: filter then project then reverse") @(tt : T?) {
+        let got <- _fold(each([1, 2, 3, 4, 5])._where(_ > 2)._select(_ * 10) |> reverse() |> to_array())
+        let expected = [50, 40, 30]
+        tt |> equal(length(got), length(expected))
+        for (v, e in got, expected) {
+            tt |> equal(v, e)
+        }
+    }
+    t |> run("select(non-workhorse ComplexType).reverse parity") @(tt : T?) {
+        let got <- _fold(each([1, 2, 3])._select(ComplexType(a = [_ * 100, _ * 200])) |> reverse() |> to_array())
+        tt |> equal(3, length(got))
+        // [{a=[100,200]}, {a=[200,400]}, {a=[300,600]}] reversed
+        tt |> equal(300, got[0].a[0])
+        tt |> equal(200, got[1].a[0])
+        tt |> equal(100, got[2].a[0])
+    }
+}
+
+[test]
+def test_reverse_with_take_parity(t : T?) {
+    // R4: take(N) after reverse — resize the reversed buffer to keep first N.
+    // Equivalent to "last N of source in reverse".
+    t |> run("reverse.take(3): [1..8] → reversed [8,7,6,5,4,3,2,1] take 3 = [8,7,6]") @(tt : T?) {
+        let got <- _fold(each([1, 2, 3, 4, 5, 6, 7, 8]) |> reverse() |> take(3) |> to_array())
+        let expected = [8, 7, 6]
+        tt |> equal(length(got), length(expected))
+        for (v, e in got, expected) {
+            tt |> equal(v, e)
+        }
+    }
+    t |> run("reverse.take(0): empty result") @(tt : T?) {
+        let got <- _fold(each([1, 2, 3, 4, 5]) |> reverse() |> take(0) |> to_array())
+        tt |> equal(0, length(got))
+    }
+    t |> run("reverse.take(-1): non-positive N → empty (matches take_impl)") @(tt : T?) {
+        let got <- _fold(each([1, 2, 3, 4, 5]) |> reverse() |> take(-1) |> to_array())
+        tt |> equal(0, length(got))
+    }
+    t |> run("reverse.take(N > length): no truncation, just reversed") @(tt : T?) {
+        let got <- _fold(each([1, 2, 3]) |> reverse() |> take(999) |> to_array())
+        let expected = [3, 2, 1]
+        tt |> equal(length(got), length(expected))
+        for (v, e in got, expected) {
+            tt |> equal(v, e)
+        }
+    }
+    t |> run("where.reverse.take: filter then reverse-take last 2 survivors") @(tt : T?) {
+        // survivors: [3,4,5,6]; reversed: [6,5,4,3]; take 2: [6,5]
+        let got <- _fold(each([1, 2, 3, 4, 5, 6])._where(_ > 2) |> reverse() |> take(2) |> to_array())
+        let expected = [6, 5]
+        tt |> equal(length(got), length(expected))
+        for (v, e in got, expected) {
+            tt |> equal(v, e)
+        }
+    }
+}
+
+[test]
+def test_distinct_fold_parity(t : T?) {
+    // D1: bare distinct → to_array splices into streaming dedup. Verify identical
+    // output to plain distinct(). Uses `.to_sequence()` (const-iterator source) instead
+    // of `each(...)` (non-const-iterator) to dodge the iterator-variance mangler ICE
+    // documented in iterator_variance_and_mangler_ice — distinct ships both flavors
+    // and a non-const-flavored caller currently hash-collides.
+    t |> run("distinct: [1,2,2,3,3,3] → [1,2,3]") @(tt : T?) {
+        let got <- _fold([1, 2, 2, 3, 3, 3].to_sequence().distinct().to_array())
+        let expected = [1, 2, 3]
+        tt |> equal(length(got), length(expected))
+        for (v, e in got, expected) {
+            tt |> equal(v, e)
+        }
+    }
+    t |> run("distinct preserves first-seen order") @(tt : T?) {
+        let got <- _fold([3, 1, 4, 1, 5, 9, 2, 6, 5, 3].to_sequence().distinct().to_array())
+        let expected = [3, 1, 4, 5, 9, 2, 6]
+        tt |> equal(length(got), length(expected))
+        for (v, e in got, expected) {
+            tt |> equal(v, e)
+        }
+    }
+    t |> run("distinct: empty source") @(tt : T?) {
+        var empty : array<int>
+        let got <- _fold(empty.to_sequence().distinct().to_array())
+        tt |> equal(0, length(got))
+    }
+    t |> run("distinct: all-unique source = identity") @(tt : T?) {
+        let got <- _fold([1, 2, 3, 4, 5].to_sequence().distinct().to_array())
+        tt |> equal(5, length(got))
+        for (v, e in got, [1, 2, 3, 4, 5]) {
+            tt |> equal(v, e)
+        }
+    }
+    t |> run("distinct: all-same source = single element") @(tt : T?) {
+        let got <- _fold([7, 7, 7, 7, 7].to_sequence().distinct().to_array())
+        tt |> equal(1, length(got))
+        tt |> equal(7, got[0])
+    }
+}
+
+[test]
+def test_distinct_extended_parity(t : T?) {
+    // D2: where_ before distinct
+    t |> run("where(>1).distinct: [1,2,3,2,4,1,5] → survivors [2,3,4,5] distinct") @(tt : T?) {
+        let got <- _fold([1, 2, 3, 2, 4, 1, 5].to_sequence()._where(_ > 1).distinct().to_array())
+        let expected = [2, 3, 4, 5]
+        tt |> equal(length(got), length(expected))
+        for (v, e in got, expected) {
+            tt |> equal(v, e)
+        }
+    }
+    // D3: select before distinct
+    t |> run("select(_%3).distinct: [1,2,3,4] → projected [1,2,0,1] distinct = [1,2,0]") @(tt : T?) {
+        let got <- _fold([1, 2, 3, 4].to_sequence()._select(_ % 3).distinct().to_array())
+        let expected = [1, 2, 0]
+        tt |> equal(length(got), length(expected))
+        for (v, e in got, expected) {
+            tt |> equal(v, e)
+        }
+    }
+    // D4: distinct_by — dedup keyed by mod-10. Keys: 0,1,2,1,3,2 → first per bucket
+    t |> run("distinct_by(x%10): [10,21,32,11,23,42] → first per bucket [10,21,32,23]") @(tt : T?) {
+        let got <- _fold([10, 21, 32, 11, 23, 42].to_sequence()._distinct_by(_ % 10).to_array())
+        let expected = [10, 21, 32, 23]
+        tt |> equal(length(got), length(expected))
+        for (v, e in got, expected) {
+            tt |> equal(v, e)
+        }
+    }
+    // D5: take(N) early-exit
+    t |> run("distinct.take(3): [1,1,2,2,3,3,4,4,5,5] → first 3 distinct = [1,2,3]") @(tt : T?) {
+        let got <- _fold([1, 1, 2, 2, 3, 3, 4, 4, 5, 5].to_sequence().distinct().take(3).to_array())
+        let expected = [1, 2, 3]
+        tt |> equal(length(got), length(expected))
+        for (v, e in got, expected) {
+            tt |> equal(v, e)
+        }
+    }
+    t |> run("distinct.take(0): zero early-exit yields empty") @(tt : T?) {
+        let got <- _fold([1, 2, 3].to_sequence().distinct().take(0).to_array())
+        tt |> equal(0, length(got))
+    }
+    t |> run("distinct.take(-1): negative N → empty (matches take_impl)") @(tt : T?) {
+        let got <- _fold([1, 2, 3].to_sequence().distinct().take(-1).to_array())
+        tt |> equal(0, length(got))
+    }
+    // D6: count terminator
+    t |> run("distinct.count: [1,2,2,3,3,3] → 3 distinct values") @(tt : T?) {
+        tt |> equal(3, _fold([1, 2, 2, 3, 3, 3].to_sequence().distinct().count()))
+    }
+    t |> run("where.distinct.count: filter then count distinct") @(tt : T?) {
+        tt |> equal(3, _fold([1, 2, 2, 3, 3, 3, 1].to_sequence()._where(_ > 0).distinct().count()))
+    }
+    t |> run("distinct.count on empty source: 0") @(tt : T?) {
+        var empty : array<int>
+        tt |> equal(0, _fold(empty.to_sequence().distinct().count()))
+    }
+    // D7: sum / long_count
+    t |> run("distinct.sum: [1,2,2,3,3,3,4] → 1+2+3+4 = 10") @(tt : T?) {
+        tt |> equal(10, _fold([1, 2, 2, 3, 3, 3, 4].to_sequence().distinct().sum()))
+    }
+    t |> run("distinct.long_count: [1,2,2,3,3,3] → int64 3") @(tt : T?) {
+        tt |> equal(3l, _fold([1, 2, 2, 3, 3, 3].to_sequence().distinct().long_count()))
+    }
+}
+
+[test]
+def test_group_by_count_fold_parity(t : T?) {
+    // G2/G3: group_by + select(count) splice should produce same per-bucket counts
+    // as the plain LINQ chain.
+    t |> run("group_by(x%3).select(_._1|>length): [1..7] → counts of buckets") @(tt : T?) {
+        let got <- _fold([1, 2, 3, 4, 5, 6, 7]._group_by(_ % 3)._select(_._1 |> length))
+        // Source by mod 3: 0→{3,6}, 1→{1,4,7}, 2→{2,5}. Counts: 2, 3, 2 (table order varies).
+        tt |> equal(3, length(got))
+        var total = 0
+        for (c in got) {
+            total += c
+        }
+        tt |> equal(7, total)
+    }
+    t |> run("group_by + named tuple wrap preserves key + count") @(tt : T?) {
+        let got <- _fold([1, 2, 3, 4, 5, 6, 7]._group_by(_ % 3)._select((K = _._0, N = _._1 |> length)))
+        tt |> equal(3, length(got))
+        // Per-key expectations: 0→{3,6}=2, 1→{1,4,7}=3, 2→{2,5}=2. Tests bucket assignment, not just total.
+        var perKey : table<int; int>
+        for (item in got) {
+            perKey[item.K] = item.N
+        }
+        tt |> equal(2, perKey[0])
+        tt |> equal(3, perKey[1])
+        tt |> equal(2, perKey[2])
+    }
+    t |> run("group_by on empty source → empty result") @(tt : T?) {
+        var empty : array<int>
+        let got <- _fold(empty._group_by(_ % 3)._select(_._1 |> length))
+        tt |> equal(0, length(got))
+    }
+    // G8: count terminator → number of buckets
+    t |> run("group_by.count: number of distinct buckets") @(tt : T?) {
+        tt |> equal(3, _fold([1, 2, 3, 4, 5, 6, 7]._group_by(_ % 3)._select((K = _._0, N = _._1 |> length)).count()))
+    }
+    // G4: sum reducer — per-bucket sum of elements
+    t |> run("group_by.select(_._1|>sum): bare-sum bucket reducer") @(tt : T?) {
+        let got <- _fold([10, 20, 30, 11, 21, 31, 12]._group_by(_ % 3)._select(_._1 |> sum))
+        // Buckets: 0→{30,21,12}=63, 1→{10,31}=41, 2→{20,11}=31. Total = 135.
+        tt |> equal(3, length(got))
+        var totalSum = 0
+        for (s in got) {
+            totalSum += s
+        }
+        tt |> equal(135, totalSum)
+    }
+    t |> run("group_by + named tuple sum: preserves K + Sum") @(tt : T?) {
+        let got <- _fold([10, 20, 30, 11, 21, 31, 12]._group_by(_ % 3)._select((K = _._0, Sum = _._1 |> sum)))
+        tt |> equal(3, length(got))
+        // Per-key expectations: 0→63, 1→41, 2→31. Tests bucket assignment, not just total.
+        var perKey : table<int; int>
+        for (item in got) {
+            perKey[item.K] = item.Sum
+        }
+        tt |> equal(63, perKey[0])
+        tt |> equal(41, perKey[1])
+        tt |> equal(31, perKey[2])
+    }
+    // G5: long_count reducer — per-bucket int64 count
+    t |> run("group_by.select(_._1|>long_count): per-bucket int64 count") @(tt : T?) {
+        let got <- _fold([1, 2, 3, 4, 5, 6, 7]._group_by(_ % 3)._select(_._1 |> long_count))
+        tt |> equal(3, length(got))
+        var totalCount = 0l
+        for (c in got) {
+            totalCount += c
+        }
+        tt |> equal(7l, totalCount)
+    }
+}
+
+[test]
+def test_group_by_inner_select_sum_fold_parity(t : T?) {
+    // G4 (PR-A1): inner-select-sum recognized via is_bucket_reducer_call's new arm.
+    // Splice inlines the inner projection into the per-element accumulator update so the
+    // bucket array is never materialized and the inner select-call disappears from the body.
+    t |> run("bare inner-select-sum: per-bucket sum of projected values") @(tt : T?) {
+        let got <- _fold([10, 20, 30, 11, 21, 31, 12]._group_by(_ % 3)._select(_._1 |> select(@(x : int) => x * 2) |> sum))
+        // Buckets: 0→{30,21,12} *2 = 126; 1→{10,31} *2 = 82; 2→{20,11} *2 = 62. Total = 270.
+        tt |> equal(3, length(got))
+        var total = 0
+        for (s in got) {
+            total += s
+        }
+        tt |> equal(270, total)
+    }
+    t |> run("named inner-select-sum: preserves K + projected sum") @(tt : T?) {
+        let got <- _fold([10, 20, 30, 11, 21, 31, 12]._group_by(_ % 3)._select((K = _._0, T = _._1 |> select(@(x : int) => x * 2) |> sum)))
+        tt |> equal(3, length(got))
+        var perKey : table<int; int>
+        for (item in got) {
+            perKey[item.K] = item.T
+        }
+        tt |> equal(126, perKey[0])   // (30+21+12)*2
+        tt |> equal(82,  perKey[1])   // (10+31)*2
+        tt |> equal(62,  perKey[2])   // (20+11)*2
+    }
+    t |> run("inner-select-sum on empty source → empty result") @(tt : T?) {
+        var empty : array<int>
+        let got <- _fold(empty._group_by(_ % 3)._select(_._1 |> select(@(x : int) => x * 2) |> sum))
+        tt |> equal(0, length(got))
+    }
+    t |> run("inner-select-sum matches plain LINQ reference (parity)") @(tt : T?) {
+        let arr = [10, 20, 30, 11, 21, 31, 12, 22, 32, 13]
+        let foldGot <- _fold(arr._group_by(_ % 4)._select((K = _._0, T = _._1 |> select(@(x : int) => x + 1) |> sum)))
+        let refGot  <- (arr._group_by(_ % 4)._select((K = _._0, T = _._1 |> select(@(x : int) => x + 1) |> sum)))
+        tt |> equal(length(refGot), length(foldGot))
+        var refMap : table<int; int>
+        var foldMap : table<int; int>
+        for (r in refGot) {
+            refMap[r.K] = r.T
+        }
+        for (f in foldGot) {
+            foldMap[f.K] = f.T
+        }
+        // Use ?[k] (safe lookup, no auto-insert) to avoid locking refMap while iterating its keys.
+        for (k in keys(refMap)) {
+            tt |> equal(refMap?[k] ?? -1, foldMap?[k] ?? -1)
+        }
+    }
+}
+
+[test]
+def test_group_by_min_max_first_fold_parity(t : T?) {
+    // PR-A2: min/max/first bare + named + inner-select reducers. Each splices into the
+    // miss/hit emission with per-reducer init+update shapes (min/max compare; first no-op on hit).
+    t |> run("bare min: per-bucket workhorse min") @(tt : T?) {
+        let got <- _fold([10, 20, 30, 11, 21, 31, 12]._group_by(_ % 3)._select(_._1 |> min))
+        // Buckets: 0→{30,21,12}=12, 1→{10,31}=10, 2→{20,11}=11. Total of mins = 33.
+        tt |> equal(3, length(got))
+        var totalMin = 0
+        for (m in got) {
+            totalMin += m
+        }
+        tt |> equal(33, totalMin)
+    }
+    t |> run("named min: preserves K + Min") @(tt : T?) {
+        let got <- _fold([10, 20, 30, 11, 21, 31, 12]._group_by(_ % 3)._select((K = _._0, Min = _._1 |> min)))
+        tt |> equal(3, length(got))
+        var perKey : table<int; int>
+        for (item in got) {
+            perKey[item.K] = item.Min
+        }
+        tt |> equal(12, perKey[0])
+        tt |> equal(10, perKey[1])
+        tt |> equal(11, perKey[2])
+    }
+    t |> run("bare max: per-bucket workhorse max") @(tt : T?) {
+        let got <- _fold([10, 20, 30, 11, 21, 31, 12]._group_by(_ % 3)._select(_._1 |> max))
+        // Buckets: 0→30, 1→31, 2→20. Sum = 81.
+        tt |> equal(3, length(got))
+        var totalMax = 0
+        for (m in got) {
+            totalMax += m
+        }
+        tt |> equal(81, totalMax)
+    }
+    t |> run("named max: preserves K + Max") @(tt : T?) {
+        let got <- _fold([10, 20, 30, 11, 21, 31, 12]._group_by(_ % 3)._select((K = _._0, Max = _._1 |> max)))
+        tt |> equal(3, length(got))
+        var perKey : table<int; int>
+        for (item in got) {
+            perKey[item.K] = item.Max
+        }
+        tt |> equal(30, perKey[0])
+        tt |> equal(31, perKey[1])
+        tt |> equal(20, perKey[2])
+    }
+    t |> run("bare first: per-bucket FIRST source element (first-key-wins)") @(tt : T?) {
+        let got <- _fold([10, 20, 30, 11, 21, 31, 12]._group_by(_ % 3)._select(_._1 |> first))
+        // Buckets, in source order: 1→{10,31}=10, 2→{20,11}=20, 0→{30,21,12}=30. Sum = 60.
+        tt |> equal(3, length(got))
+        var totalFirst = 0
+        for (f in got) {
+            totalFirst += f
+        }
+        tt |> equal(60, totalFirst)
+    }
+    t |> run("named first: preserves K + First (first source elem per key)") @(tt : T?) {
+        let got <- _fold([10, 20, 30, 11, 21, 31, 12]._group_by(_ % 3)._select((K = _._0, First = _._1 |> first)))
+        tt |> equal(3, length(got))
+        var perKey : table<int; int>
+        for (item in got) {
+            perKey[item.K] = item.First
+        }
+        tt |> equal(30, perKey[0])    // 30 is the first elem for key 0
+        tt |> equal(10, perKey[1])    // 10 is the first elem for key 1
+        tt |> equal(20, perKey[2])    // 20 is the first elem for key 2
+    }
+    t |> run("inner-select-min: bare min of projected values") @(tt : T?) {
+        let got <- _fold([10, 20, 30, 11, 21, 31, 12]._group_by(_ % 3)._select(_._1 |> select(@(x : int) => x * 2) |> min))
+        // Buckets *2: 0→{60,42,24}=24, 1→{20,62}=20, 2→{40,22}=22. Sum = 66.
+        tt |> equal(3, length(got))
+        var totalMin = 0
+        for (m in got) {
+            totalMin += m
+        }
+        tt |> equal(66, totalMin)
+    }
+    t |> run("inner-select-max: named (K, M) with projected max") @(tt : T?) {
+        let got <- _fold([10, 20, 30, 11, 21, 31, 12]._group_by(_ % 3)._select((K = _._0, M = _._1 |> select(@(x : int) => x * 2) |> max)))
+        tt |> equal(3, length(got))
+        var perKey : table<int; int>
+        for (item in got) {
+            perKey[item.K] = item.M
+        }
+        tt |> equal(60, perKey[0])    // max(30,21,12)*2 = 60
+        tt |> equal(62, perKey[1])    // max(10,31)*2 = 62
+        tt |> equal(40, perKey[2])    // max(20,11)*2 = 40
+    }
+    t |> run("inner-select-first: named (K, F) with projected first") @(tt : T?) {
+        let got <- _fold([10, 20, 30, 11, 21, 31, 12]._group_by(_ % 3)._select((K = _._0, F = _._1 |> select(@(x : int) => x * 2) |> first)))
+        tt |> equal(3, length(got))
+        var perKey : table<int; int>
+        for (item in got) {
+            perKey[item.K] = item.F
+        }
+        tt |> equal(60, perKey[0])    // first elem 30, *2 = 60
+        tt |> equal(20, perKey[1])    // first elem 10, *2 = 20
+        tt |> equal(40, perKey[2])    // first elem 20, *2 = 40
+    }
+    t |> run("min/max/first on empty source → empty result") @(tt : T?) {
+        var empty : array<int>
+        let g1 <- _fold(empty._group_by(_ % 3)._select(_._1 |> min))
+        tt |> equal(0, length(g1))
+        let g2 <- _fold(empty._group_by(_ % 3)._select(_._1 |> max))
+        tt |> equal(0, length(g2))
+        let g3 <- _fold(empty._group_by(_ % 3)._select(_._1 |> first))
+        tt |> equal(0, length(g3))
+    }
+    t |> run("min on struct (non-workhorse) Person.age via inner-select: parity with reference") @(tt : T?) {
+        let foldGot <- _fold(_common::people._group_by(_.name)._select((K = _._0, MinAge = _._1 |> select(@(p : _common::Person) => p.age) |> min)))
+        let refGot  <- (_common::people._group_by(_.name)._select((K = _._0, MinAge = _._1 |> select(@(p : _common::Person) => p.age) |> min)))
+        tt |> equal(length(refGot), length(foldGot))
+        var refMap  : table<string; int>
+        var foldMap : table<string; int>
+        for (r in refGot) {
+            refMap[r.K] = r.MinAge
+        }
+        for (f in foldGot) {
+            foldMap[f.K] = f.MinAge
+        }
+        for (k in keys(refMap)) {
+            tt |> equal(refMap?[k] ?? -1, foldMap?[k] ?? -1)
+        }
+    }
+}
+
+[test]
+def test_group_by_multi_reducer_fold_parity(t : T?) {
+    // PR-A2 A.4: N-slot named tuples fuse multiple reducers into a single per-element pass.
+    t |> run("3-slot (K, N=length, S=sum): two reducers per bucket") @(tt : T?) {
+        let got <- _fold([10, 20, 30, 11, 21, 31, 12]._group_by(_ % 3)._select((K = _._0, N = _._1 |> length, S = _._1 |> sum)))
+        tt |> equal(3, length(got))
+        var perKeyN : table<int; int>
+        var perKeyS : table<int; int>
+        for (item in got) {
+            perKeyN[item.K] = item.N
+            perKeyS[item.K] = item.S
+        }
+        // Per key: 0→{30,21,12} N=3 S=63; 1→{10,31} N=2 S=41; 2→{20,11} N=2 S=31.
+        tt |> equal(3, perKeyN[0])
+        tt |> equal(63, perKeyS[0])
+        tt |> equal(2, perKeyN[1])
+        tt |> equal(41, perKeyS[1])
+        tt |> equal(2, perKeyN[2])
+        tt |> equal(31, perKeyS[2])
+    }
+    t |> run("4-slot (K, N, S, MX): count + sum + max fused into one pass") @(tt : T?) {
+        let got <- _fold([10, 20, 30, 11, 21, 31, 12]._group_by(_ % 3)._select(
+            (K = _._0, N = _._1 |> length, S = _._1 |> sum, MX = _._1 |> max)))
+        tt |> equal(3, length(got))
+        // Compare slot-by-slot since named tuples lack a default operator==.
+        var keysSeen = 0
+        for (item in got) {
+            if (item.K == 0) { tt |> equal(3, item.N); tt |> equal(63, item.S); tt |> equal(30, item.MX); keysSeen ++; }
+            elif (item.K == 1) { tt |> equal(2, item.N); tt |> equal(41, item.S); tt |> equal(31, item.MX); keysSeen ++; }
+            elif (item.K == 2) { tt |> equal(2, item.N); tt |> equal(31, item.S); tt |> equal(20, item.MX); keysSeen ++; }
+        }
+        tt |> equal(3, keysSeen)
+    }
+    t |> run("multi-reducer with inner-select: (K, N, Total = sum of *2)") @(tt : T?) {
+        let got <- _fold([10, 20, 30, 11, 21, 31, 12]._group_by(_ % 3)._select(
+            (K = _._0, N = _._1 |> length, Total = _._1 |> select(@(x : int) => x * 2) |> sum)))
+        tt |> equal(3, length(got))
+        var keysSeen = 0
+        for (item in got) {
+            if (item.K == 0) { tt |> equal(3, item.N); tt |> equal(126, item.Total); keysSeen ++; }
+            elif (item.K == 1) { tt |> equal(2, item.N); tt |> equal(82,  item.Total); keysSeen ++; }
+            elif (item.K == 2) { tt |> equal(2, item.N); tt |> equal(62,  item.Total); keysSeen ++; }
+        }
+        tt |> equal(3, keysSeen)
+    }
+    t |> run("multi-reducer on empty source → empty result") @(tt : T?) {
+        var empty : array<int>
+        let got <- _fold(empty._group_by(_ % 3)._select((K = _._0, N = _._1 |> length, S = _._1 |> sum)))
+        tt |> equal(0, length(got))
+    }
+    t |> run("multi-reducer parity with reference (Person)") @(tt : T?) {
+        let foldGot <- _fold(_common::people._group_by(_.name)._select(
+            (K = _._0, N = _._1 |> length, MinAge = _._1 |> select(@(p : _common::Person) => p.age) |> min, MaxAge = _._1 |> select(@(p : _common::Person) => p.age) |> max)))
+        let refGot  <- (_common::people._group_by(_.name)._select(
+            (K = _._0, N = _._1 |> length, MinAge = _._1 |> select(@(p : _common::Person) => p.age) |> min, MaxAge = _._1 |> select(@(p : _common::Person) => p.age) |> max)))
+        tt |> equal(length(refGot), length(foldGot))
+        // Three separate tables — daslang tuples lack a default `==` operator.
+        var refN, refMin, refMax : table<string; int>
+        var foldN, foldMin, foldMax : table<string; int>
+        for (r in refGot) {
+            refN[r.K] = r.N; refMin[r.K] = r.MinAge; refMax[r.K] = r.MaxAge
+        }
+        for (f in foldGot) {
+            foldN[f.K] = f.N; foldMin[f.K] = f.MinAge; foldMax[f.K] = f.MaxAge
+        }
+        for (k in keys(refN)) {
+            tt |> equal(refN?[k] ?? -1,   foldN?[k] ?? -1)
+            tt |> equal(refMin?[k] ?? -1, foldMin?[k] ?? -1)
+            tt |> equal(refMax?[k] ?? -1, foldMax?[k] ?? -1)
+        }
+    }
+}
+
+[test]
+def test_reverse_count_parity(t : T?) {
+    // R5: reverse |> count — counter loop, no reverse work.
+    t |> run("reverse.count: identity") @(tt : T?) {
+        tt |> equal(5, _fold(each([1, 2, 3, 4, 5]) |> reverse() |> count()))
+    }
+    t |> run("where(>2).reverse.count: counter over survivors") @(tt : T?) {
+        tt |> equal(3, _fold(each([1, 2, 3, 4, 5])._where(_ > 2) |> reverse() |> count()))
+    }
+    t |> run("reverse.count on empty source: 0") @(tt : T?) {
+        var empty : array<int>
+        tt |> equal(0, _fold(each(empty) |> reverse() |> count()))
+    }
+    t |> run("where(false).reverse.count: 0 survivors") @(tt : T?) {
+        tt |> equal(0, _fold(each([1, 2, 3, 4, 5])._where(_ > 999) |> reverse() |> count()))
+    }
+}
+
+[test]
+def test_reverse_first_parity(t : T?) {
+    // R5: reverse |> first = LAST survivor in source order.
+    t |> run("reverse.first: [1..5] → 5 (last element)") @(tt : T?) {
+        tt |> equal(5, _fold(each([1, 2, 3, 4, 5]) |> reverse() |> first()))
+    }
+    t |> run("where(>2).reverse.first: 5 (last survivor)") @(tt : T?) {
+        tt |> equal(5, _fold(each([1, 2, 3, 4, 5])._where(_ > 2) |> reverse() |> first()))
+    }
+    t |> run("select(*10).reverse.first: 50 (last projected)") @(tt : T?) {
+        tt |> equal(50, _fold(each([1, 2, 3, 4, 5])._select(_ * 10) |> reverse() |> first()))
+    }
+    t |> run("where.select.reverse.first: 60 (last survivor projected)") @(tt : T?) {
+        // survivors: [3,4,5,6]; projected*10: [30,40,50,60]; last = 60
+        tt |> equal(60, _fold(each([1, 2, 3, 4, 5, 6])._where(_ > 2)._select(_ * 10) |> reverse() |> first()))
+    }
+}
+
+[test]
+def test_reverse_first_or_default_parity(t : T?) {
+    // R5: reverse |> first_or_default — return default if no survivor, else last survivor.
+    t |> run("non-empty source returns last survivor") @(tt : T?) {
+        tt |> equal(5, _fold(each([1, 2, 3, 4, 5]) |> reverse() |> first_or_default(-1)))
+    }
+    t |> run("filter rejects all → default") @(tt : T?) {
+        tt |> equal(-1, _fold(each([1, 2, 3, 4, 5])._where(_ > 999) |> reverse() |> first_or_default(-1)))
+    }
+    t |> run("empty source → default") @(tt : T?) {
+        var empty : array<int>
+        tt |> equal(42, _fold(each(empty) |> reverse() |> first_or_default(42)))
+    }
+}
+
+[test]
+def test_top_n_mid_chain_iterator_source(t : T?) {
+    // Regression — `top_n_*` registered in linqCalls but always returns array regardless of
+    // input shape, so no `_to_array` variant exists. `fold_linq_default`'s first-position
+    // iterator-source rewrite must skip the `_to_array` suffix for these. Hits when the user
+    // hand-pipes `top_n_*(...)` mid-chain (it isn't a comprehension form, so this is the
+    // only way to land here, but the path is real and the bug was a compile error.)
+    t |> run("each(range) |> top_n_by |> _select — top_n_by stays unrewritten") @(tt : T?) {
+        var query = _fold(each(range(0, 10)) |> top_n_by(3, @@(v : int) => -v) |> _select(_ + 100))
+        // top_n_by smallest 3 by -v ⇒ largest 3 by v = [9, 8, 7]; + 100 ⇒ [109, 108, 107]
+        let expected = [109, 108, 107]
+        for (v, i in query, 0 .. 3) {
+            tt |> equal(expected[i], v)
+        }
     }
 }
