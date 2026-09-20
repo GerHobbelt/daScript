@@ -71,9 +71,13 @@ enum SF2GenOper {
 
 // ─── SF2 Sample Types ───
 
+//! Mono sample — produces a single channel.
 let public SF2_SAMPLE_MONO   = 1u
+//! Right channel of a stereo pair (linked to a left sample).
 let public SF2_SAMPLE_RIGHT  = 2u
+//! Left channel of a stereo pair (linked to a right sample).
 let public SF2_SAMPLE_LEFT   = 4u
+//! Linked sample flag — indicates a multi-sample link set.
 let public SF2_SAMPLE_LINKED = 8u
 
 // ─── SF2 Data Structures ───
@@ -176,6 +180,58 @@ struct SF2File {
     instruments : array<SF2InstrumentDef?>  //! Instrument definitions.
     presets : array<SF2PresetDef?>      //! Preset definitions.
     preset_lookup : table<int; int>     //! Fast lookup: (bank << 8 | program) -> index into presets.
+}
+
+// ─── Finalizers (release pointer-based ownership graph) ───
+
+def finalize(var d : SF2InstrumentDef explicit) {
+    //! Release global_zone and each zones[i] — structs held by raw pointer.
+    if (d.global_zone != null) {
+        unsafe {
+            delete d.global_zone
+        }
+    }
+    for (z in d.zones) {
+        unsafe {
+            delete z
+        }
+    }
+    delete d.zones
+}
+
+def finalize(var d : SF2PresetDef explicit) {
+    //! Release global_zone and each zones[i] — structs held by raw pointer.
+    if (d.global_zone != null) {
+        unsafe {
+            delete d.global_zone
+        }
+    }
+    for (z in d.zones) {
+        unsafe {
+            delete z
+        }
+    }
+    delete d.zones
+}
+
+def finalize(var f : SF2File explicit) {
+    //! Release every instrument / preset pointer. delete of each triggers its own finalize.
+    for (inst in f.instruments) {
+        unsafe {
+            delete inst
+        }
+    }
+    delete f.instruments
+    for (preset in f.presets) {
+        unsafe {
+            delete preset
+        }
+    }
+    delete f.presets
+    // explicit finalizer replaces the default cascade — must delete remaining heap-owning fields
+    delete f.sample_data
+    delete f.samples
+    delete f.preset_lookup
 }
 
 // ─── Binary Readers (Little-Endian) ───
@@ -294,19 +350,19 @@ def private parse_sample_headers(data : array<uint8>; offset, size : int) : arra
     return <- result
 }
 
-struct RawPresetHeader {
+struct private RawPresetHeader {
     name : string
     preset : int
     bank : int
     pbag_index : int
 }
 
-struct RawInstrumentHeader {
+struct private RawInstrumentHeader {
     name : string
     ibag_index : int
 }
 
-struct RawBag {
+struct private RawBag {
     gen_index : int
     mod_index : int
 }
@@ -511,7 +567,9 @@ def public sf2_load(path : string) : SF2File? {
         to_log(0, "SF2: file too small or not found: {path}\n")
         return null
     }
-    return <- sf2_parse(data)
+    var result = sf2_parse(data)
+    delete data
+    return <- result
 }
 
 def public sf2_parse(data : array<uint8>) : SF2File? {

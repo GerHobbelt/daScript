@@ -198,7 +198,7 @@ def init() {
     }
     upload_font_texture(font)
     // audio
-    if (get_audio_command_channel() == null) {
+    if (get_audio_command_stream() == null) {
         asch = audio_system_create()
     }
     // load SF2 soundfont
@@ -403,6 +403,7 @@ def update() {
             let py0 = fh - panel_h * float(pi + 1)
             render_panel_name(font, p.name, display_w, display_h, py0 + m, py1 - m)
         }
+        delete verts
     }
     live_end_frame()
 }
@@ -411,7 +412,7 @@ def update() {
 def shutdown() {
     print("Shutting down...\n")
     strudel_shutdown()
-    audio_system_finalize(asch.command, asch.collect, asch.next_sid)
+    audio_system_finalize(asch.command, asch.next_sid)
     delete render_states
     delete audio_analyses
     delete drum_panel_states

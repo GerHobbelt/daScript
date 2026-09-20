@@ -26,6 +26,17 @@ option(DAS_AOT_EXAMPLES_DISABLED "Disable dasAOT examples" OFF)
 option(DAS_TUTORIAL_DISABLED "Disable dasTutorial" OFF)
 option(DAS_TESTS_DISABLED "Disable dasTests" OFF)
 option(DAS_BUILD_DOCUMENTATION "Build HTML documentation via Sphinx during install" OFF)
+# RelWithDebInfo is permanently our heap-leak tracking / audit build.
+# DAS_TRACK_ALLOC=1 (and the global new/delete override) are auto-enabled below
+# via generator expressions; tracker source files are #if DAS_TRACK_ALLOC-gated
+# so they compile to empty TUs in Release/Debug.
+#
+# Note on RelWithDebInfo inlining: CMakeCommon's SETUP_COMPILER hard-resets
+# CMAKE_CXX_FLAGS_RELWITHDEBINFO without any explicit /Ob level. Because the
+# flag string retains /O2 (added by MSBuild's RelWithDebInfo defaults), /O2
+# implies /Ob2 per the MSVC docs, so codegen still matches Release inlining.
+# Do not reintroduce an /Ob1 -> /Ob2 string(REPLACE) here -- CMakeCommon would
+# overwrite it, making the replace dead code.
 set(DAS_INSTALL_BINDIR bin CACHE STRING "Directory where to install binaries")
 set(DAS_INSTALL_LIBDIR lib CACHE STRING "Directory where to install binaries")
 set(DAS_INSTALL_DOCDIR . CACHE STRING "Directory where to install documentation")
@@ -343,6 +354,12 @@ MACRO(ADD_DAS_SHARED_MODULE_LIB module_name)
     TARGET_COMPILE_DEFINITIONS(${module_name} PRIVATE DAS_MOD_EXPORTS DAS_ENABLE_DLL=1)
     TARGET_LINK_LIBRARIES(${module_name} PUBLIC libDaScriptDyn)
     ADD_DEPENDENCIES(${module_name} libDaScriptDyn)
+    # Each shared module needs its own copy of the global new/delete overrides:
+    # Windows resolves operator new per-module at link time, and a module that
+    # allocates via the tracker but frees through the default CRT (or vice versa)
+    # looks like a leak. The TU is #if DAS_TRACK_ALLOC-gated so it compiles empty
+    # outside RelWithDebInfo. DAS_TRACK_ALLOC propagates from libDaScriptDyn_runtime.
+    target_sources(${module_name} PRIVATE ${PROJECT_SOURCE_DIR}/src/misc/alloc_tracker_overrides.cpp)
     LIST(APPEND DAS_DYN_MODULES_LIBS ${module_name})
 ENDMACRO()
 
@@ -635,7 +652,6 @@ src/ast/ast_typedecl.cpp
 src/ast/ast_match.cpp
 src/ast/ast_module.cpp
 src/ast/ast_print.cpp
-src/ast/ast_aot_cpp.cpp
 src/ast/ast_infer_type.cpp
 src/ast/ast_infer_type_report.cpp
 src/ast/ast_infer_type_function.cpp
@@ -676,7 +692,6 @@ SET(BUILTIN_SRC
 include/daScript/builtin/ast_gen.inc
 include/daScript/builtin/debugapi_gen.inc
 
-src/builtin/modules.cpp
 src/builtin/module_builtin.h
 src/builtin/module_builtin.cpp
 src/builtin/module_builtin_misc_types.cpp
@@ -742,7 +757,8 @@ src/misc/string_writer.cpp
 src/misc/memory_model.cpp
 src/misc/job_que.cpp
 src/misc/free_list.cpp
-src/misc/daScriptC.cpp
+src/misc/alloc_tracker.cpp
+src/misc/alloc_tracker_fast_stack.cpp
 src/misc/uric.cpp
 src/misc/format.cpp
 )
@@ -917,20 +933,13 @@ list(SORT DAS_LIB_SRC)
 include_directories(include)
 include_directories(3rdparty/fmt/include)
 
-MACRO(SETUP_LIBDASCRIPT library shared_lib)
+MACRO(SETUP_LIBDASCRIPT library shared_lib full_setup sources exports_def)
     IF(${shared_lib})
-        SETUP_DAS_SHARED_LIBRARY(${library} ${PARSER_GENERATED_SRC}
-                ${PARSER_SRC} ${VECMATH_SRC} ${AST_SRC} ${SIMULATE_SRC} ${BUILTIN_SRC}
-                ${MISC_SRC} ${SIMULATE_FUSION_SRC} ${MAIN_SRC}
-                ${DAGOR_NOISE_SRC} ${FLAT_HASH_MAP_SRC} ${FAST_FLOAT_SRC} ${DASCRIPT_FMT_SRC})
-        TARGET_COMPILE_DEFINITIONS(${library} PRIVATE DAS_EXPORTS=1 DAS_MOD_EXPORTS=1)
+        SETUP_DAS_SHARED_LIBRARY(${library} ${${sources}})
+        TARGET_COMPILE_DEFINITIONS(${library} PRIVATE ${exports_def}=1 DAS_MOD_EXPORTS=1)
         TARGET_COMPILE_DEFINITIONS(${library} PUBLIC DAS_ENABLE_DLL=1)
-        # Set DAS_EXPORTS to export all MOD symbols from libDaScript
     ELSE()
-        ADD_DAS_STATIC_LIBRARY(${library} ${PARSER_GENERATED_SRC}
-                ${PARSER_SRC} ${VECMATH_SRC} ${AST_SRC} ${SIMULATE_SRC} ${BUILTIN_SRC}
-                ${MISC_SRC} ${SIMULATE_FUSION_SRC} ${MAIN_SRC}
-                ${DAGOR_NOISE_SRC} ${FLAT_HASH_MAP_SRC} ${FAST_FLOAT_SRC} ${DASCRIPT_FMT_SRC})
+        ADD_DAS_STATIC_LIBRARY(${library} ${${sources}})
     ENDIF()
     TARGET_COMPILE_DEFINITIONS(${library} PUBLIC DAS_ENABLE_DYN_INCLUDES=1)
     ADD_DEPENDENCIES(${library} need_and_resolve)
@@ -940,23 +949,25 @@ MACRO(SETUP_LIBDASCRIPT library shared_lib)
             ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/uriparser/include
             ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
-    IF(${shared_lib})
-        target_link_libraries(${library} libUriParserDyn)
-    ELSE()
-        target_link_libraries(${library} libUriParser)
-    ENDIF()
-    #target_link_libraries(${library} fmt::fmt)
-    IF(LINUX_UUID)
-        target_link_libraries(${library} uuid)
-    ENDIF()
-    IF(UNIX AND NOT APPLE)
-        TARGET_LINK_LIBRARIES(${library} ${CMAKE_DL_LIBS})
-    ENDIF()
-    IF(HAIKU)
-        TARGET_LINK_LIBRARIES(${library} network uuid)
-    ENDIF()
-    IF(WIN32)
-        target_link_libraries(${library} dbghelp)
+    IF(${full_setup})
+        IF(${shared_lib})
+            target_link_libraries(${library} libUriParserDyn)
+        ELSE()
+            target_link_libraries(${library} libUriParser)
+        ENDIF()
+        #target_link_libraries(${library} fmt::fmt)
+        IF(LINUX_UUID)
+            target_link_libraries(${library} uuid)
+        ENDIF()
+        IF(UNIX AND NOT APPLE)
+            TARGET_LINK_LIBRARIES(${library} ${CMAKE_DL_LIBS})
+        ENDIF()
+        IF(HAIKU)
+            TARGET_LINK_LIBRARIES(${library} network uuid)
+        ENDIF()
+        IF(WIN32)
+            target_link_libraries(${library} dbghelp)
+        ENDIF()
     ENDIF()
     SETUP_CPP11(${library})
     target_compile_features(${library} PUBLIC cxx_std_17)
@@ -969,8 +980,50 @@ MACRO(SETUP_LIBDASCRIPT library shared_lib)
     )
 ENDMACRO()
 
-SETUP_LIBDASCRIPT(libDaScript OFF)
-SETUP_LIBDASCRIPT(libDaScriptDyn ON)
+SET(LIBDASCRIPT_RUNTIME_SRC
+    ${PARSER_GENERATED_SRC}
+    ${PARSER_SRC} ${VECMATH_SRC} ${AST_SRC} ${SIMULATE_SRC} ${BUILTIN_SRC}
+    ${MISC_SRC} ${MAIN_SRC}
+    ${DAGOR_NOISE_SRC} ${FLAT_HASH_MAP_SRC} ${FAST_FLOAT_SRC} ${DASCRIPT_FMT_SRC}
+)
+
+SET(LIBDASCRIPT_COMPILER_SRC
+    ${SIMULATE_FUSION_SRC}
+    src/misc/daScriptC.cpp
+    src/builtin/modules.cpp
+)
+
+# Eventually libDaScript_runtime will contain only minimal subset of sources
+# required to run standalone executable.
+#
+# Note: Now it contains everything except fusion.
+SETUP_LIBDASCRIPT(libDaScript_runtime OFF ON LIBDASCRIPT_RUNTIME_SRC DAS_EXPORTS)
+SETUP_LIBDASCRIPT(libDaScriptDyn_runtime ON ON LIBDASCRIPT_RUNTIME_SRC DAS_EXPORTS)
+
+SETUP_LIBDASCRIPT(libDaScript OFF OFF LIBDASCRIPT_COMPILER_SRC DAS_CC_EXPORTS)
+SETUP_LIBDASCRIPT(libDaScriptDyn ON OFF LIBDASCRIPT_COMPILER_SRC DAS_CC_EXPORTS)
+
+# Heap leak tracking: permanently enabled in RelWithDebInfo only.
+# DAS_FREE_LIST=0 forces the reuse cache off so every aligned allocation reaches
+# the tracker and free_list.cpp's global operator new/delete overrides stay inert
+# (no double-override).
+target_compile_definitions(libDaScript_runtime    PUBLIC
+    $<$<CONFIG:RelWithDebInfo>:DAS_TRACK_ALLOC=1>
+    $<$<CONFIG:RelWithDebInfo>:DAS_FREE_LIST=0>)
+target_compile_definitions(libDaScriptDyn_runtime PUBLIC
+    $<$<CONFIG:RelWithDebInfo>:DAS_TRACK_ALLOC=1>
+    $<$<CONFIG:RelWithDebInfo>:DAS_FREE_LIST=0>)
+# Global new/delete override: covers STL/raw new/smart_ptr refcount blocks.
+# On Windows each module resolves operator new per-CRT, so the override TU must
+# be compiled into every binary that wants its own code covered. Uses std::malloc
+# internally for cross-CRT compatibility; orphan frees (cross-module) are counted
+# at track_free_hook for diagnostics. The TU is #if DAS_TRACK_ALLOC-gated, so it
+# compiles empty in Release/Debug.
+target_sources(libDaScript_runtime    PRIVATE src/misc/alloc_tracker_overrides.cpp)
+target_sources(libDaScriptDyn_runtime PRIVATE src/misc/alloc_tracker_overrides.cpp)
+
+target_link_libraries(libDaScript libDaScript_runtime)
+target_link_libraries(libDaScriptDyn libDaScriptDyn_runtime)
 
 if(NOT ${DAS_AOT_EXAMPLES_DISABLED})
 
@@ -1055,6 +1108,10 @@ if (NOT ${DAS_TOOLS_DISABLED})
 
     # Dynamic/DLL compiler binary — the default shipped binary.
     SETUP_COMPILER_BINARY(daslang libDaScriptDyn "" DAS_DYN_MODULES_LIBS)
+    # Each binary needs its own copy of the override TU to cover its own code
+    # (Windows resolves operator new per-CRT). TU is #if DAS_TRACK_ALLOC-gated.
+    target_sources(daslang        PRIVATE src/misc/alloc_tracker_overrides.cpp)
+    target_sources(daslang_static PRIVATE src/misc/alloc_tracker_overrides.cpp)
     # relative RPATH from install location
     if(APPLE)
         SET_TARGET_PROPERTIES(daslang PROPERTIES
@@ -1080,6 +1137,7 @@ if (NOT ${DAS_TOOLS_DISABLED})
         ${DAS_MODULES_NEED_INC}
     )
     add_executable(daslang-live ${DAS_LIVE_MAIN_SRC})
+    target_sources(daslang-live PRIVATE src/misc/alloc_tracker_overrides.cpp)
     TARGET_LINK_LIBRARIES(daslang-live libDaScriptDyn ${SRC_LIBRARIES})
     ADD_DEPENDENCIES(daslang-live libDaScriptDyn ${DAS_DYN_MODULES_LIBS})
     target_include_directories(daslang-live PRIVATE
@@ -1169,7 +1227,6 @@ endif()
 # This list should be significantly reduced, most of the files, except aot related should be private.
 SET(DAS_RELEASE_AST_INCLUDE
     include/daScript/ast/aot_templates.h
-    include/daScript/ast/ast_aot_cpp.h
     include/daScript/ast/ast_expressions.h
     include/daScript/ast/ast_generate.h
     include/daScript/ast/ast.h
@@ -1336,7 +1393,7 @@ install(FILES ${DAS_BUILTIN_HEADERS}
 
 # Install all modules and main library.
 install(TARGETS
-    libDaScript libDaScriptDyn libUriParser libUriParserDyn
+    libDaScript libDaScript_runtime libDaScriptDyn libDaScriptDyn_runtime libUriParser libUriParserDyn
     EXPORT DASTargets
     RUNTIME DESTINATION ${DAS_INSTALL_BINDIR}
     LIBRARY DESTINATION ${DAS_INSTALL_LIBDIR}

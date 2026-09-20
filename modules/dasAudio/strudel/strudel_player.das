@@ -4,6 +4,9 @@ options no_unused_block_arguments = false
 options no_unused_function_arguments = false
 
 module strudel_player shared public
+//! Top-level playback harness for strudel patterns.
+//! Manages tracks, BPM/CPS, sample/SF2 banks, and a command stream for both
+//! main-thread (strudel_tick) and dedicated-thread (strudel_play) playback modes.
 
 require strudel/strudel_event
 require strudel/strudel_time
@@ -20,9 +23,9 @@ require daslib/fio
 require daslib/strings_boost
 require math
 
-// --- Command channel ---
+// --- Command stream ---
 
-variant StrudelCommand {
+variant private StrudelCommand {
     shutdown : bool;
     set_bpm  : double;
     set_cps  : double;
@@ -32,7 +35,7 @@ variant StrudelCommand {
 // --- Track ---
 
 [safe_when_uninitialized]
-struct StrudelTrack {
+struct private StrudelTrack {
     pat         : Pattern
     @safe_when_uninitialized sched : Scheduler
     gain        : float = 1.0
@@ -45,11 +48,14 @@ struct StrudelTrack {
 var private g_bank : SampleBank
 var private g_bank_ptr : SampleBank?   // for threaded mode: points to main thread's bank
 var private g_sid : uint64 = 0ul
+//! Current playback wall-clock time in seconds. Derived from exact sample count.
+//! Written by the playback thread (threaded mode) or strudel_tick (main-thread mode).
 var public g_wall_time : double = 0.0lf
 var private g_wall_samples : int64 = 0l  // exact sample count — g_wall_time derived from this
+//! Current tempo in cycles per second (0.5 = 120 BPM at 4 beats/cycle).
 var public g_cps : double = 0.5lf
-var private g_cmd_channel : Channel?
-var private g_done_channel : Channel?
+var private g_cmd_stream : Stream?
+var private g_done_status : JobStatus?
 var private g_sf2 : SF2File?
 var private g_sf2_path : string
 var private g_cmd_fn : function<(cmd : string) : void>
@@ -60,14 +66,17 @@ var private g_chunk_seconds : float = 0.05
 var private g_tick_status_box : LockBox?  // buffer level feedback for strudel_tick
 var private g_tick_pcm_box : LockBox?    // lock box for append_box_to_pcm in main-thread mode
 
-// Per-track PCM output (populated by strudel_tick, main-thread mode only)
+//! Per-track PCM output written by strudel_tick (main-thread mode only), indexed by track index.
+//! Visualizer combinators read this to render per-track waveforms.
 var public g_track_pcm : array<array<float>>
+//! Master mixed stereo PCM output for the most recent tick (main-thread mode only).
 var public g_master_pcm : array<float>
 
-// Rolling vis index — bumped by strudel_add_track, read by visualizer combinators
+//! Rolling visualizer index — incremented by strudel_add_track, read by visualizer combinators.
 var public g_vis_index : int = 0
 
 // --- Memory tracking ---
+let private LEAK_WARN_THRESHOLD = 1024l  // bytes; only warn on leaks strictly above this
 var private g_debug_memory : bool = false
 var private g_mem_heap_baseline : uint64 = 0ul
 var private g_mem_str_baseline : uint64 = 0ul
@@ -80,23 +89,23 @@ var private g_tick_total_time : double = 0.lf       // total tick time in ms
 var private g_tick_total_samples : uint64 = 0ul     // total samples rendered
 var private g_tick_max_chunk_usec : double = 0.lf   // peak chunk time in usec
 
+//! A PCM audio block passed between the playback thread and the visualizer or saver.
 struct AudioChunk {
     samples : array<float>
+        //! Interleaved stereo PCM samples for one chunk.
 }
 
-struct PlaybackTime {
+struct private PlaybackTime {
     wall_time : double
     cps       : double
 }
 
 // --- Playback time ---
 
-// Get current playback position and tempo.
-// In threaded mode reads from lockbox.
-// In main-thread mode uses hardware playback position (smooth, matches what you hear).
-// The playback position lags behind g_wall_time by the audio buffer depth — that's correct:
-// the pianoroll shows upcoming notes, and the playhead shows where playback actually is.
 def public strudel_get_playback_time() : tuple<double; double> {
+    //! Get current playback wall-clock time and tempo as (wall_time, cps).
+    //! In threaded mode reads from a lockbox; in main-thread mode uses the hardware
+    //! consumed position (smooth, matches what you hear) and lags g_wall_time by the audio buffer depth.
     var wt = 0.0lf
     var cp = 0.5lf
     if (g_playback_box != null) {
@@ -124,6 +133,7 @@ def public strudel_get_playback_time() : tuple<double; double> {
 // --- Resource loading ---
 
 def public strudel_load_sound(path, name : string) {
+    //! Load a single audio sample from disk and register it under the given name. Duplicates are ignored.
     let sname = to_lower(name)
     if (key_exists(g_bank.sounds, sname)) {
         return
@@ -132,6 +142,7 @@ def public strudel_load_sound(path, name : string) {
 }
 
 def public strudel_load_sample_dir(root : string) {
+    //! Load every audio file under root as a named sample (filename becomes the sound name).
     dir(root) $(entry) {
         if (entry == "." || entry == "..") {
             return
@@ -145,6 +156,7 @@ def public strudel_load_sample_dir(root : string) {
 }
 
 def public strudel_load_sf2(path : string) : bool {
+    //! Load a SoundFont (.sf2) file for SF2-based synthesis. Returns true on success.
     g_sf2 = sf2_load(path)
     if (g_sf2 != null) {
         g_sf2_path = path
@@ -153,22 +165,26 @@ def public strudel_load_sf2(path : string) : bool {
 }
 
 def public strudel_get_sf2_path() : string {
+    //! Return the path of the currently loaded SoundFont (empty string if none).
     return g_sf2_path
 }
 
 def public strudel_has_sf2() : bool {
+    //! Return true if a SoundFont has been loaded.
     return g_sf2 != null
 }
 
 // --- Volume / Pause ---
 
 def public strudel_set_volume(volume : float; time : float = 0.0) {
+    //! Set the master playback volume, optionally ramping to it over the given time in seconds.
     if (g_sid != 0ul) {
         set_volume(g_sid, volume, time)
     }
 }
 
 def public strudel_set_pause(paused : bool) {
+    //! Pause or resume audio output.
     if (g_sid != 0ul) {
         set_pause(g_sid, paused)
     }
@@ -177,30 +193,34 @@ def public strudel_set_pause(paused : bool) {
 // --- Tempo (affects both threads) ---
 
 def public strudel_set_bpm(bpm : double) {
+    //! Set tempo in beats per minute (assumes 4 beats per cycle). Safe to call from the main thread.
     g_cps = bpm / 240.0lf
-    if (g_cmd_channel != null) {
-        g_cmd_channel |> push(new StrudelCommand(set_bpm = bpm))
+    if (g_cmd_stream != null) {
+        g_cmd_stream |> push_archive(StrudelCommand(set_bpm = bpm))
     }
 }
 
 def public strudel_set_cps(cps : double) {
+    //! Set tempo directly in cycles per second. Safe to call from the main thread.
     g_cps = cps
-    if (g_cmd_channel != null) {
-        g_cmd_channel |> push(new StrudelCommand(set_cps = cps))
+    if (g_cmd_stream != null) {
+        g_cmd_stream |> push_archive(StrudelCommand(set_cps = cps))
     }
 }
 
 def public strudel_set_look_ahead(look_ahead : float) {
+    //! Set how far ahead (in seconds) to query the pattern for upcoming events.
     g_look_ahead = look_ahead
 }
 
 def public strudel_debug_memory(enabled : bool) {
+    //! Enable or disable periodic heap/string-memory logging during playback.
     g_debug_memory = enabled
 }
 
-// Reset memory baseline to current heap state. Call after all one-time setup
-// (audio stream, pattern, tracks) so only growth during playback is measured.
 def public strudel_reset_memory_baseline() {
+    //! Reset memory-tracking baseline to the current heap state.
+    //! Call after all one-time setup (audio stream, pattern, tracks) so only playback growth is measured.
     g_mem_heap_baseline = heap_bytes_allocated()
     g_mem_str_baseline = string_heap_bytes_allocated()
     g_mem_heap_max = g_mem_heap_baseline
@@ -209,6 +229,7 @@ def public strudel_reset_memory_baseline() {
 }
 
 def public strudel_debug_sample_peaks() {
+    //! Log the peak amplitude of every loaded sample in the bank (debug helper).
     for (name in keys(g_bank.sounds)) {
         var samples <- render_sample(g_bank, name, 0, 1.0)
         var peak = 0.0
@@ -221,6 +242,7 @@ def public strudel_debug_sample_peaks() {
 }
 
 def public strudel_debug_master_peak() {
+    //! Log the peak amplitude of the current master PCM buffer (debug helper, main-thread mode).
     if (length(g_master_pcm) > 0) {
         var peak = 0.0
         for (i in range(length(g_master_pcm))) {
@@ -233,6 +255,7 @@ def public strudel_debug_master_peak() {
 }
 
 def public strudel_debug_output_peak() {
+    //! Log the peak amplitude of each track's scheduler output (debug helper).
     for (i in range(length(g_tracks))) {
         var track = g_tracks[i]
         if (track != null && length(track.sched.output) > 0) {
@@ -248,6 +271,7 @@ def public strudel_debug_output_peak() {
 }
 
 def public strudel_debug_voices() {
+    //! Log the number of active sample/oscillator voices on each track (debug helper).
     for (i in range(length(g_tracks))) {
         var track = g_tracks[i]
         if (track != null) {
@@ -258,8 +282,8 @@ def public strudel_debug_voices() {
 
 // --- Track management ---
 
-// Add a track. Returns its index (matches g_vis_index for visualizer combinators).
 def public strudel_add_track(var pat : Pattern; gain : float = 1.0) : int {
+    //! Add a track playing the given pattern at the given gain. Returns its index (matches g_vis_index for visualizer combinators).
     let idx = g_vis_index
     g_tracks |> push(new StrudelTrack(
         pat <- pat,
@@ -283,8 +307,8 @@ def public strudel_add_track(var pat : Pattern; gain : float = 1.0) : int {
     return idx
 }
 
-// Remove a track by index (sets slot to null).
 def public strudel_remove_track(idx : int) {
+    //! Remove a track by index (shuts down its scheduler and sets the slot to null).
     if (idx >= 0 && idx < length(g_tracks) && g_tracks[idx] != null) {
         shutdown_scheduler(g_tracks[idx].sched)
         unsafe { delete g_tracks[idx]; }
@@ -292,8 +316,8 @@ def public strudel_remove_track(idx : int) {
     }
 }
 
-// Fade a track by index.
 def public strudel_fade_track(idx : int; target_gain : float; time : float) {
+    //! Fade a track's gain to target_gain over the given time in seconds (time=0 snaps instantly).
     if (idx >= 0 && idx < length(g_tracks) && g_tracks[idx] != null) {
         var track = g_tracks[idx]
         track.target_gain = target_gain
@@ -312,28 +336,26 @@ def public strudel_fade_track(idx : int; target_gain : float; time : float) {
 // --- Commands (main -> thread) ---
 
 def public strudel_command(cmd : string) {
-    if (g_cmd_channel != null) {
-        var sc = new StrudelCommand(shutdown = false)
-        unsafe {
-            set_variant_index(*sc, 3)  // user_cmd
-            sc.user_cmd = cmd
-        }
-        g_cmd_channel |> push(sc)
+    //! Send a user command string from the main thread to the strudel playback thread.
+    //! The command is dispatched to the cmd_fn passed to strudel_init.
+    if (g_cmd_stream != null) {
+        g_cmd_stream |> push_archive(StrudelCommand(user_cmd = cmd))
     }
 }
 
 def public strudel_noop_cmd(cmd : string) {
+    //! No-op command handler — default argument when no user command dispatcher is needed.
     pass
 }
 
 // --- Command processing (called on strudel thread) ---
 
 def private strudel_process_commands(cmd_fn : function<(cmd : string) : void>) : bool {
-    if (g_cmd_channel == null) {
+    if (g_cmd_stream == null) {
         return true
     }
     var running = true
-    g_cmd_channel |> gather() $(cmd : StrudelCommand#) {
+    g_cmd_stream |> gather_archive() $(var cmd : StrudelCommand) {
         if (cmd is shutdown) {
             running = false
         } elif (cmd is set_bpm) {
@@ -350,8 +372,8 @@ def private strudel_process_commands(cmd_fn : function<(cmd : string) : void>) :
 
 // --- Main-thread mode ---
 
-// Create a PCM stream for main-thread playback. Call after audio_system_create().
 def public strudel_create_channel() {
+    //! Create the PCM stream for main-thread playback. Call once after audio_system_create() and before strudel_tick.
     if (g_sid == 0ul) {
         g_sid = play_sound_from_pcm_stream(MA_SAMPLE_RATE, MA_CHANNELS)
         g_tick_status_box = unsafe(lock_box_create())
@@ -367,9 +389,9 @@ def public strudel_create_channel() {
     }
 }
 
-// Single tick: queries all tracks, renders audio, mixes, appends to PCM stream.
-// Call from your render loop. Self-regulating: skips when audio buffer has enough data.
 def public strudel_tick() {
+    //! Single main-thread tick: query all tracks, render audio, mix, append to the PCM stream.
+    //! Call from your render loop; self-regulating — skips when the audio buffer has enough data queued.
     if (g_sid == 0ul) {
         return
     }
@@ -471,10 +493,9 @@ def public strudel_tick() {
     }
 }
 
-// Offline tick: same as strudel_tick but without audio driver.
-// Does not require audio system or PCM channel — renders into g_master_pcm,
-// advances g_wall_time. Call in a tight loop for offline WAV rendering.
 def public strudel_tick_offline() {
+    //! Offline tick: same as strudel_tick but without an audio driver.
+    //! Renders into g_master_pcm and advances g_wall_time; call in a tight loop for offline WAV rendering.
     let t0 = ref_time_ticks()
     let CHUNK_SEC = g_chunk_seconds
     let chunkSamples = int(float(CHUNK_SEC) * float(SAMPLE_RATE)) * 2
@@ -557,8 +578,9 @@ def public strudel_tick_offline() {
 
 // --- Threaded mode ---
 
-// Blocking multi-track tick loop. Call from your strudel_main on the thread.
 def public strudel_play(cmd_fn : function<(cmd : string) : void> = @@strudel_noop_cmd) {
+    //! Blocking multi-track tick loop for threaded playback.
+    //! Runs on the strudel thread (spawned by strudel_init); dispatches incoming user commands via cmd_fn until shutdown.
     let CHUNK_SEC = g_chunk_seconds
     let TARGET_CHUNKS = 4
     let LOW_WATERMARK = 2
@@ -677,7 +699,7 @@ def public strudel_play(cmd_fn : function<(cmd : string) : void> = @@strudel_noo
         let delta_heap = int64(mem_heap_max) - int64(mem_heap_base)
         let delta_str = int64(mem_str_max) - int64(mem_str_base)
         to_log(0, "strudel {UTILIZATION/10}.{UTILIZATION%10}% avg, {MAX_UTIL/10}.{MAX_UTIL%10}% peak util, heap {mem_heap_max/1024ul}kb (delta {delta_heap}), str {mem_str_max/1024ul}kb (delta {delta_str})\n")
-        if (delta_heap > 0l || delta_str > 0l) {
+        if (delta_heap > LEAK_WARN_THRESHOLD || delta_str > LEAK_WARN_THRESHOLD) {
             to_log(0, "strudel WARNING: potential memory leak detected (delta heap={delta_heap}, str={delta_str})\n")
         }
     }
@@ -690,10 +712,10 @@ def public strudel_play(cmd_fn : function<(cmd : string) : void> = @@strudel_noo
     unsafe(lock_box_remove(status_box))
 }
 
-// Spawn strudel thread. Captures bank/sf2 pointers from main thread.
-// fn runs on the thread — add tracks and call strudel_play() there.
 def public strudel_init(fn : function<() : void>; cmd_fn : function<(cmd : string) : void> = @@strudel_noop_cmd) {
-    if (get_audio_command_channel() == null) {
+    //! Spawn the strudel playback thread and inject shared resources (sample bank, SF2, audio channel).
+    //! fn runs on the new thread — it should add tracks and call strudel_play(). Call from main thread only.
+    if (get_audio_command_stream() == null) {
         panic("strudel_init: audio system not initialized. Call audio_system_create() first.")
     }
     g_cmd_fn = cmd_fn
@@ -701,31 +723,33 @@ def public strudel_init(fn : function<() : void>; cmd_fn : function<(cmd : strin
     if (g_playback_box == null) {
         g_playback_box = unsafe(lock_box_create())
     }
-    // create channels
-    g_cmd_channel = unsafe(channel_create())
-    g_done_channel = unsafe(channel_create())
+    // create command stream and done status (thread-exit signal, wait group of 1).
+    // @capture auto-bumps refcount for Stream and JobStatus — no manual add_ref needed.
+    g_cmd_stream = unsafe(stream_create())
+    g_done_status = unsafe(job_status_create())
+    g_done_status |> append(1)
     // create PCM stream on main thread (audio globals are initialized here)
     let thread_sid = play_sound_from_pcm_stream(MA_SAMPLE_RATE, MA_CHANNELS)
     // capture shared resources from main thread
     var bank_ptr = unsafe(addr(g_bank))
     var sf2_ptr = g_sf2 != null ? unsafe(reinterpret<SF2File const?>(g_sf2)) : null
-    var audio_ch = get_audio_command_channel()
-    var cmd_ch = g_cmd_channel
-    var done_ch = g_done_channel
+    var audio_ch = get_audio_command_stream()
+    var cmd_st = g_cmd_stream
+    var done_st = g_done_status
     var pb_box = g_playback_box
     let wt = g_wall_time
     let cps = g_cps
     let la = g_look_ahead
-    new_thread() <| @capture(= fn, = bank_ptr, = sf2_ptr, = audio_ch, = cmd_ch, = done_ch, = pb_box, = wt, = cps, = la, = thread_sid) {
+    new_thread() <| @capture(= fn, = bank_ptr, = sf2_ptr, = audio_ch, = cmd_st, = done_st, = pb_box, = wt, = cps, = la, = thread_sid) {
         // inject shared resources into thread context
         g_bank_ptr = bank_ptr
         unsafe {
-            set_audio_thread_command_channel(audio_ch)
+            set_audio_thread_command_stream(audio_ch)
         }
         g_sf2 = unsafe(reinterpret<SF2File?>(sf2_ptr))
         g_sid = thread_sid
-        g_cmd_channel = cmd_ch
-        g_done_channel = done_ch
+        g_cmd_stream = cmd_st
+        g_done_status = done_st
         g_playback_box = pb_box
         g_wall_time = wt
         g_cps = cps
@@ -734,32 +758,24 @@ def public strudel_init(fn : function<() : void>; cmd_fn : function<(cmd : strin
         invoke(fn)
         // cleanup
         unsafe {
-            set_audio_thread_command_channel(null)
+            set_audio_thread_command_stream(null)
         }
-        cmd_ch |> release()
+        cmd_st |> release()
         pb_box |> release()
-        done_ch |> push(new StrudelCommand(shutdown = true))
-        done_ch |> release()
+        done_st |> notify_and_release
     }
 }
 
 def public strudel_shutdown() {
-    if (g_cmd_channel != null) {
-        g_cmd_channel |> push(new StrudelCommand(shutdown = true))
-        var got_done = false
-        while (!got_done) {
-            _builtin_channel_pop(g_done_channel) $(data) {
-                if (data != null) {
-                    got_done = true
-                }
-            }
-        }
-        // command channel
-        unsafe(channel_remove(g_cmd_channel))
-        g_cmd_channel = null
-        // done channel
-        unsafe(channel_remove(g_done_channel))
-        g_done_channel = null
+    //! Shut down playback: signal the strudel thread to stop, release stream/status/lockboxes, free all tracks.
+    //! Safe to call from the main thread; also finalizes memory/utilization stats.
+    if (g_cmd_stream != null) {
+        g_cmd_stream |> push_archive(StrudelCommand(shutdown = true))
+        // wait for worker thread to exit (notify_and_release on done_status)
+        g_done_status |> join
+        // refcount was 2 after init; worker's release made it 1; *_remove decrements to 0 and deletes
+        unsafe(stream_remove(g_cmd_stream))
+        unsafe(job_status_remove(g_done_status))
         // player box
         unsafe(lock_box_remove(g_playback_box))
         g_playback_box = null
@@ -792,6 +808,14 @@ def public strudel_shutdown() {
     delete g_track_pcm
     delete g_master_pcm
     g_sid = 0ul
+    // release SF2 soundfont (finalizer recursively frees instruments/presets/zones)
+    if (g_sf2 != null) {
+        unsafe {
+            delete g_sf2
+        }
+        g_sf2 = null
+        g_sf2_path := ""
+    }
     // utilization stats
     if (g_tick_total_samples > 0ul) {
         let SPEED = g_tick_total_time / double(g_tick_total_samples)
@@ -811,7 +835,7 @@ def public strudel_shutdown() {
         let leak_heap = int64(mem_heap_now) - int64(g_mem_heap_baseline)
         let leak_str = int64(mem_str_now) - int64(g_mem_str_baseline)
         to_log(0, "strudel mem: heap {int(mem_heap_now)/1024}kb (peak {int(g_mem_heap_max)/1024}kb, leak {leak_heap/1024l}kb), str {int(mem_str_now)/1024}kb (leak {leak_str/1024l}kb)\n")
-        if (leak_heap > 65536l || leak_str > 0l) {
+        if (leak_heap > LEAK_WARN_THRESHOLD || leak_str > LEAK_WARN_THRESHOLD) {
             to_log(0, "strudel WARNING: potential memory leak detected (heap={leak_heap}, str={leak_str})\n")
         }
         g_mem_heap_baseline = 0ul
@@ -969,6 +993,7 @@ def private serialize_sf2(var arch : Archive; var sf2 : SF2File?&) {
 }
 
 def public strudel_save_sf2_state() : array<uint8> {
+    //! Serialize the currently loaded SoundFont to a byte array (empty if none loaded).
     if (g_sf2 == null) {
         var empty : array<uint8>
         return <- empty
@@ -982,6 +1007,7 @@ def public strudel_save_sf2_state() : array<uint8> {
 }
 
 def public strudel_restore_sf2_state(data : array<uint8>) {
+    //! Restore a previously serialized SoundFont from a byte array (no-op on empty data).
     if (length(data) == 0) {
         return
     }
@@ -992,6 +1018,7 @@ def public strudel_restore_sf2_state(data : array<uint8>) {
 }
 
 def public strudel_save_state() : array<uint8> {
+    //! Serialize playback state (wall time, CPS, sample bank) into a byte array; shuts down playback first.
     if (g_sid == 0ul) {
         var empty : array<uint8>
         return <- empty
@@ -1009,6 +1036,7 @@ def public strudel_save_state() : array<uint8> {
 }
 
 def public strudel_restore_state(data : array<uint8>) {
+    //! Restore previously saved playback state (wall time, CPS, sample bank) from a byte array.
     if (length(data) == 0) {
         return
     }

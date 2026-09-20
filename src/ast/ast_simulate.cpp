@@ -5,6 +5,7 @@
 #include "daScript/ast/ast_expressions.h"
 #include "daScript/ast/ast_visitor.h"
 #include "daScript/ast/ast_simulate.h"
+#include "daScript/simulate/simulate_fusion.h"
 
 #include "daScript/simulate/runtime_array.h"
 #include "daScript/simulate/runtime_table_nodes.h"
@@ -22,6 +23,9 @@ das::Context * get_context ( int stackSize=0 );//link time resolved dependencies
 
 namespace das
 {
+    // fusion function pointers (defined here in main lib, set by fusion lib)
+    void (*g_fusionContextFn) ( Context & context, TextWriter & logs, bool enableFusion ) = nullptr;
+    void (*g_resetFusionEngineFn) () = nullptr;
     // topological sort for the [init] nodes
 
     struct InitSort {
@@ -3592,6 +3596,9 @@ namespace das
         context.heap->setLimit ( options.getUInt64OptionEx("heap_size_limit", "max_heap_allocated", policies.max_heap_allocated) );
         context.stringHeap->setInitialSize ( options.getIntOption("string_heap_size_hint", policies.string_heap_size_hint) );
         context.stringHeap->setLimit ( options.getUInt64OptionEx("string_heap_size_limit", "max_string_heap_allocated", policies.max_string_heap_allocated) );
+        bool trackAlloc = options.getBoolOption("track_allocations", policies.track_allocations);
+        context.heap->setTrackAllocations(trackAlloc);
+        context.stringHeap->setTrackAllocations(trackAlloc);
         context.constStringHeap = make_shared<ConstStringAllocator>();
         if ( globalStringHeapSize ) {
             context.constStringHeap->setInitialSize(globalStringHeapSize);
@@ -3760,7 +3767,8 @@ namespace das
         bool aot_hint = policies.aot && !folding && !thisModule->isModule;
 #if DAS_FUSION
         if ( !folding ) {               // note: only run fusion when not folding
-            fusion(context, logs);
+            DAS_ASSERTF(g_fusionContextFn, "fusion library not loaded, add call to NEED_FUSION macro.");
+            g_fusionContextFn(context, logs, options.getBoolOption("fusion",true));
             context.relocateCode(true); // this to get better estimate on relocated size. its fust enough
         }
 #else
@@ -3916,11 +3924,6 @@ namespace das
             logs << "unique        " << context.getUniqueMemorySize() << "\n";
         }
 
-        // log CPP
-        if (options.getBoolOption("log_cpp")) {
-            aotCpp(context,logs);
-            registerAotCpp(logs,context);
-        }
         isSimulating = false;
         context.thisHelper = &helper;   // note - we may need helper for the 'complete'
         auto bound_env = daScriptEnvironment::getBound();
@@ -4035,7 +4038,7 @@ namespace das
         for ( int fni=0, fnis=context.totalFunctions; fni!=fnis; ++fni ) {
             if ( !fnn[fni]->noAot ) {
                 SimFunction & fn = context.functions[fni];
-                uint64_t semHash = fnn[fni]->aotHash = getFunctionAotHash(fnn[fni]);
+                uint64_t semHash = getFunctionAotHash(fnn[fni]);
                 auto it = aotLib.find(semHash);
                 if ( it != aotLib.end() ) {
                     fn.code = (it->second)(context);

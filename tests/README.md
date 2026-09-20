@@ -373,6 +373,7 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 |---|---|---|
 | _glob.das | *(helper)* Shared module defining `AAA = 10` | |
 | _helper_foo.das | *(helper)* Module providing `TestObjectFoo` struct and `testFoo` function | |
+| _helper_macro_uninferred.das | *(helper)* `[bad_emitter]` structure_macro that adds an un-inferred function during patch | |
 | _module_a.das | *(helper)* Module for module_vis_fail — globals, types, functions | |
 | _module_b.das | *(helper)* Module for module_vis_fail — requires _module_a | |
 | _operators_derived.das | *(helper)* Derived class BarOp | |
@@ -505,6 +506,7 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | make_handle.das | Handle construction — `TestObjectFoo(fooData=...)`, global/local/cmres/ascend | |
 | make_local.das | Struct local construction — defaults, `uninitialized`, fixed_array | |
 | make_struct_with_clone.das | Struct construction with clone `:=` for array fields | |
+| failed_macro_added_function_must_infer.das | structure_macro adds a function during patch without setting astChanged — compiler reports internal-error diagnostics with a hint, instead of crashing | **expect** `50100:2` |
 | map_to_a.das | `map_to_array` — reinterpret raw memory as typed array via unsafe block | |
 | memset.das | memset8, memset16, memset32, memset64, memset128 | |
 | memzero.das | memzero for float and fixed_array | |
@@ -531,6 +533,7 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | override_field.das | Struct field `override` for function pointers in derived struct | |
 | partial_specialization.das | Generic function specialization dispatch | |
 | peek_and_modify_string.das | `peek_data` finds chars, `modify_data` replaces bytes | |
+| permissive_tuple_const.das | Tuple param with `const?` field accepts argument tuple with non-const `?` field (generic + exact overloads) | |
 | pointers.das | Pointer operations — new, deref, safe navigation, null checks | |
 | ptr_arithmetic.das | Pointer arithmetic — signed/unsigned int/int64/uint/uint64 | |
 | ptr_index.das | Pointer deref and index, default null pointer argument | |
@@ -598,6 +601,21 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | vec_swizzle.das | Vector swizzle — .xy, .yx, .xyz, struct member vectors | |
 | vector_fields.das | float4 .r/.g/.b/.a fields and swizzle | |
 | with_statement.das | `with (struct) { field = val }` block scoping | |
+
+## loops/
+
+Coverage of per-iteration `finally` semantics across every loop form. Each cell asserts the finally counter equals the expected per-iteration count; `inscope` cells verify `var inscope` inside a loop body is legal and leak-free.
+
+| File | Description | Expects errors |
+|---|---|---|
+| for_range.das | `for (x in range(n))` — plain, break, continue, return, nested, var inscope, empty | |
+| for_array.das | `for (x in array<int>)` — plain, break, continue, return, nested, var inscope, empty | |
+| for_fixed_array.das | `for (x in int[N])` — plain, break, continue, return, var inscope | |
+| for_iterator.das | `for (x in iterator<int>)` (generator-backed) — plain, break, continue, return, var inscope, empty | |
+| for_multi_source.das | `for (a, b in src1, src2)` — plain, break, continue, return, var inscope, empty, uneven sources | |
+| while.das | `while (cond)` — plain, break, continue, return, nested, var inscope, never-taken | |
+| nested.das | Mixed nested loops — for-in-for, while-in-for, for-in-while, triple-nested, break isolation | |
+| generator_loops.das | `for`/`while` inside a generator body — yield-from-finally interleaves with body yields per iteration; break, continue, return, nested, empty | |
 
 ## linq/
 

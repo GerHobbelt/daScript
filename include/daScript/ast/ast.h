@@ -197,12 +197,6 @@ namespace das
         Type                baseType = Type::tInt;
         AnnotationList      annotations;
         bool                isPrivate = false;
-#if DAS_MACRO_SANITIZER
-    public:
-        void* operator new ( size_t count ) { return das_aligned_alloc16(count); }
-        void operator delete  ( void* ptr ) { auto size = das_aligned_memsize(ptr);
-            memset(ptr, 0xcd, size); das_aligned_free16(ptr); }
-#endif
     };
 
     class DAS_API Structure : public gc_node {
@@ -330,12 +324,6 @@ namespace das
             uint32_t    flags = 0;
         };
         mutable bool circularGuard = false;   // we prevent circular lookups with this guard. Do not serialize, do not expose to daslang
-#if DAS_MACRO_SANITIZER
-    public:
-        void* operator new ( size_t count ) { return das_aligned_alloc16(count); }
-        void operator delete  ( void* ptr ) { auto size = das_aligned_memsize(ptr);
-            memset(ptr, 0xcd, size); das_aligned_free16(ptr); }
-#endif
     };
 
     struct DAS_API Variable : gc_node {
@@ -415,12 +403,6 @@ namespace das
         };
 
         AnnotationArgumentList  annotation;
-#if DAS_MACRO_SANITIZER
-    public:
-        void* operator new ( size_t count ) { return das_aligned_alloc16(count); }
-        void operator delete  ( void* ptr ) { auto size = das_aligned_memsize(ptr);
-            memset(ptr, 0xcd, size); das_aligned_free16(ptr); }
-#endif
     };
 
     struct VarLessPred {
@@ -739,12 +721,6 @@ namespace das
             };
             uint32_t    printFlags = 0;
         };
-#if DAS_MACRO_SANITIZER
-    public:
-        void* operator new ( size_t count ) { return das_aligned_alloc16(count); }
-        void operator delete  ( void* ptr ) { auto size = das_aligned_memsize(ptr);
-            memset(ptr, 0xcd, size); das_aligned_free16(ptr); }
-#endif
     };
 
     struct ExprLooksLikeCall;
@@ -1023,17 +999,11 @@ namespace das
         bool isFullyInferred = false;
         string inferredSource;
 
-#if DAS_MACRO_SANITIZER
-    public:
-        void* operator new ( size_t count ) { return das_aligned_alloc16(count); }
-        void operator delete  ( void* ptr ) { auto size = das_aligned_memsize(ptr);
-            memset(ptr, 0xcd, size); das_aligned_free16(ptr); }
-#endif
     };
 
     uint64_t getFunctionHash ( Function * fun, SimNode * node, Context * context );
 
-    uint64_t getFunctionAotHash ( const Function * fun );
+    uint64_t getFunctionAotHash ( Function * fun );
     string getAotHashComment ( const Function * fun );
     uint64_t getVariableListAotHash ( const vector<const Variable *> & globs, uint64_t initHash );
 
@@ -1260,6 +1230,7 @@ namespace das
         gc_root                                     module_gc_root;     // gc_node root for this module's gc-managed AST nodes
         uint64_t                                    cumulativeHash = 0; // hash of all mangled names in this module (for builtin modules)
         string                                      name;
+        string                                      cppClassName;       // C++ class name (e.g. "Module_Math"), set by REGISTER_MODULE
         uint64_t                                    nameHash = 0;
         string                                      fileName;           // where the module was found, if not built-in
         union {
@@ -1287,7 +1258,11 @@ namespace das
         DAS_EXPORT_DLL das::Module * register_##ClassName () { \
             das::daScriptEnvironment::ensure(); \
             ClassName * module_##ClassName = new ClassName(); \
+            module_##ClassName->cppClassName = #ClassName; \
             return module_##ClassName; \
+        } \
+        extern "C" DAS_EXPORT_DLL das::Module * jit_register_##ClassName () { \
+            return register_##ClassName(); \
         }
 
     #if DAS_ENABLE_DLL
@@ -1297,6 +1272,7 @@ namespace das
                 if ( buildId != DAS_BUILD_ID ) return nullptr; \
                 das::daScriptEnvironment::ensure(); \
                 ClassName * module_##ClassName = new ClassName(); \
+                module_##ClassName->cppClassName = #ClassName; \
                 return module_##ClassName; \
             } \
         }
@@ -1312,7 +1288,11 @@ namespace das
         DAS_EXPORT_DLL das::Module * register_##ClassName () { \
             das::daScriptEnvironment::ensure(); \
             Namespace::ClassName * module_##ClassName = new Namespace::ClassName(); \
+            module_##ClassName->cppClassName = #ClassName; \
             return module_##ClassName; \
+        } \
+        extern "C" DAS_EXPORT_DLL das::Module * jit_register_##ClassName () { \
+            return register_##ClassName(); \
         }
 
     using module_pull_t = das::Module*(*)();
@@ -1537,6 +1517,7 @@ namespace das
         uint64_t    max_static_variables_size = 0x100000000;   // 4GB
         /*option*/ uint64_t    max_heap_allocated = 0;
         /*option*/ uint64_t    max_string_heap_allocated = 0;
+        /*option*/ bool        track_allocations = false;          // track where heap allocations came from (line info + comment)
     // rtti
         /*option*/ bool rtti = false;                              // create extended RTTI
     // language
@@ -1693,7 +1674,6 @@ namespace das
         bool optimizationBlockFolding(int32_t round);
         bool optimizationCondFolding(int32_t round);
         bool optimizationUnused(TextWriter & logs, int32_t round);
-        void fusion ( Context & context, TextWriter & logs );
         void buildAccessFlags(TextWriter & logs);
         bool verifyAndFoldContracts();
         void validateAst();

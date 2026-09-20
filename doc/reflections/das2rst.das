@@ -101,8 +101,20 @@ require stbimage/stbimage_boost
 require stbimage/stbimage_ttf
 require audio/audio_boost
 require audio/audio_wav
+require strudel/strudel_event
+require strudel/strudel_time
+require strudel/strudel_live
+require strudel/strudel_scales
+require strudel/strudel_mini
+require strudel/strudel_samples
+require strudel/strudel_synth
+require strudel/strudel_scheduler
+require strudel/strudel_player
 require strudel/strudel_midi
+require strudel/strudel_midi_player
 require strudel/strudel_sf2
+require strudel/strudel_sf2_voice
+require strudel/strudel_pattern
 
 def document_module_math(root : string) {
     var mod = get_module("math")
@@ -205,9 +217,10 @@ def document_module_network(root : string) {
 def document_module_dashv(root : string) {
     var mod = get_module("dashv")
     var groups <- array<DocGroup>(
-        group_by_regex("WebSocket client", mod, %regex~(make_web_socket_client|open|close|is_connected|tick|send)$%%),
-        group_by_regex("WebSocket server lifecycle", mod, %regex~(make_web_socket_server|start|stop)$%%),
+        group_by_regex("WebSocket client", mod, %regex~(make_web_socket_client|destroy_web_socket_client|open|close|is_connected|tick|send)$%%),
+        group_by_regex("WebSocket server lifecycle", mod, %regex~(make_web_socket_server|destroy_web_socket_server|start|stop)$%%),
         group_by_regex("WebSocket channel send", mod, %regex~(send)$%%),
+        group_by_regex("Handle operations", mod, %regex~(is_alive|==|!=)$%%),
         group_by_regex("HTTP route registration", mod, %regex~(GET|POST|PUT|DELETE|PATCH|HEAD|ANY|SSE)$%%),
         group_by_regex("HTTP server configuration", mod, %regex~(STATIC|allow_cors|set_document_root|set_home_page|set_index_of|set_error_page)$%%),
         group_by_regex("HTTP response helpers", mod, %regex~(TEXT_PLAIN|JSON|REDIRECT|SERVE_FILE|DATA|set_header|set_content_type)$%%),
@@ -444,10 +457,10 @@ def document_module_apply(root : string) {
 def document_module_jobque(root : string) {
     var mod = find_module("jobque")
     var groups <- array<DocGroup>(
-        group_by_regex("Channel, JobStatus, Lockbox", mod, %regex~(append|notify|join|channel_create|channel_remove|add_ref|release|notify_and_release|lock_box_create|lock_box_remove|job_status_create|job_status_remove)$%%),
+        group_by_regex("Channel, JobStatus, Lockbox, Stream", mod, %regex~(append|notify|join|channel_create|channel_remove|stream_create|stream_remove|add_ref|release|notify_and_release|lock_box_create|lock_box_remove|job_status_create|job_status_remove)$%%),
         group_by_regex("Queries", mod, %regex~(get_total_hw_jobs|get_total_hw_threads|is_job_que_shutting_down)$%%),
         group_by_regex("Internal invocations", mod, %regex~(new_job_invoke|new_thread_invoke|new_debugger_thread)$%%),
-        group_by_regex("Construction", mod, %regex~(with_channel|with_job_status|with_job_que|with_lock_box)$%%),
+        group_by_regex("Construction", mod, %regex~(with_channel|with_stream|with_job_status|with_job_que|with_lock_box)$%%),
         group_by_regex("Atomic", mod, %regex~(atomic32_create|atomic32_remove|with_atomic32|atomic64_create|atomic64_remove|with_atomic64|get|set|inc|dec)$%%)
     )
     document("Jobs and threads", mod, "jobque.rst", groups)
@@ -458,12 +471,12 @@ def document_module_jobque_boost(root : string) {
     var groups <- array<DocGroup>(
         group_by_regex("Invocations", mod, %regex~(new_job|new_thread)$%%),
         group_by_regex("Iteration", mod, %regex~(for_each|each|each_clone|for_each_clone)$%%),
-        group_by_regex("Passing data", mod, %regex~(push|push_clone|push_batch|push_batch_clone)$%%),
-        group_by_regex("Receiving data", mod, %regex~(gather|gather_ex|gather_and_forward|peek|pop_one|pop_and_clone_one|try_pop|try_pop_clone|pop_with_timeout|pop_with_timeout_clone)$%%),
+        group_by_regex("Passing data", mod, %regex~(push|push_clone|push_batch|push_batch_clone|push_archive)$%%),
+        group_by_regex("Receiving data", mod, %regex~(gather|gather_ex|gather_and_forward|peek|pop|pop_one|pop_and_clone_one|try_pop|try_pop_clone|pop_with_timeout|pop_with_timeout_clone|pop_archive|try_pop_archive|gather_archive)$%%),
         group_by_regex("Synchronization", mod, %regex~(with_wait_group|done)$%%),
         group_by_regex("Parallel execution", mod, %regex~(_parallel_for|parallel_for|_parallel_for_each|parallel_for_each|_parallel_map|parallel_map)$%%),
         group_by_regex("LockBox operations", mod, %regex~(set|get|update|clear|fill|grab)$%%),
-        group_by_regex("Internal capture details", mod, %regex~(capture_jobque_channel|capture_jobque_job_status|release_capture_jobque_channel|release_capture_jobque_job_status|capture_jobque_lock_box|release_capture_jobque_lock_box)$%%)
+        group_by_regex("Internal capture details", mod, %regex~(capture_jobque_channel|capture_jobque_job_status|release_capture_jobque_channel|release_capture_jobque_job_status|capture_jobque_lock_box|release_capture_jobque_lock_box|capture_jobque_stream|release_capture_jobque_stream)$%%)
     )
     document("Boost package for jobs and threads", mod, "jobque_boost.rst", groups)
 }
@@ -1288,7 +1301,7 @@ def document_module_audio(root : string) {
 def document_module_audio_boost(root : string) {
     var mod = find_module("audio_boost")
     var groups <- array<DocGroup>(
-        group_by_regex("Audio system lifecycle", mod, %regex~(with_audio_system|with_collected_audio_system|audio_system_create|audio_system_finalize|audio_system_collect|audio_system_release_context)$%%),
+        group_by_regex("Audio system lifecycle", mod, %regex~(with_audio_system|audio_system_create|audio_system_finalize|audio_system_release_context)$%%),
         group_by_regex("Sound playback", mod, %regex~(play_sound|play_3d_sound)%%),
         group_by_regex("Sound control", mod, %regex~(set_volume|set_pan|set_pitch|set_pause|set_global_pitch|set_global_pause|stop|set_playback_position)$%%),
         group_by_regex("3D audio", mod, %regex~(set_head_position|set_position)$%%),
@@ -1300,7 +1313,7 @@ def document_module_audio_boost(root : string) {
         group_by_regex("PCM stream", mod, %regex~(append_to_pcm|append_box_to_pcm)$%%),
         group_by_regex("Decoding", mod, %regex~(decode_audio)$%%),
         group_by_regex("Sound ID", mod, %regex~(generate_sound_sid)$%%),
-        group_by_regex("Internal channel management", mod, %regex~(get_audio_command_channel|set_audio_thread_command_channel|get_collect_command_channel|set_collect_thread_command_channel|get_sound_sid|set_sound_sid)$%%)
+        group_by_regex("Internal stream management", mod, %regex~(get_audio_command_stream|set_audio_thread_command_stream|get_sound_sid|set_sound_sid)$%%)
     )
     document("Audio playback, mixing, 3D spatial audio, and effects", mod, "audio_boost.rst", groups)
 }
@@ -1313,6 +1326,96 @@ def document_module_audio_wav(root : string) {
     document("WAV file reading and writing", mod, "audio_wav.rst", groups)
 }
 
+def document_module_strudel_event(root : string) {
+    var mod = find_module("strudel_event")
+    var groups <- array<DocGroup>(
+        group_by_regex("ADSR and delay resolution", mod, %regex~(resolve_adsr|resolve_delaytime)$%%)
+    )
+    document("Event payload and ADSR/delay-time resolvers", mod, "strudel_event.rst", groups)
+}
+
+def document_module_strudel_time(root : string) {
+    var mod = find_module("strudel_time")
+    var groups <- array<DocGroup>(
+        group_by_regex("Cycle math", mod, %regex~(cyclePos|sameCycle|splitSpans)$%%)
+    )
+    document("Cycle-space time primitives: TimeSpan, Hap, and cycle helpers", mod, "strudel_time.rst", groups)
+}
+
+def document_module_strudel_live(root : string) {
+    var mod = find_module("strudel_live")
+    var groups <- array<DocGroup>(
+        group_by_regex("Live-reload state", mod, %regex~(save_strudel_state|restore_strudel_state)$%%)
+    )
+    document("Live-reload state preservation", mod, "strudel_live.rst", groups)
+}
+
+def document_module_strudel_scales(root : string) {
+    var mod = find_module("strudel_scales")
+    var groups <- array<DocGroup>(
+        group_by_regex("Scale and note selection", mod, %regex~(scale|set_scale|scale_pattern|get_scale_intervals_by_name|degree_to_note|parse_root)$%%)
+    )
+    document("Musical scales and note-name helpers", mod, "strudel_scales.rst", groups)
+}
+
+def document_module_strudel_mini(root : string) {
+    var mod = find_module("strudel_mini")
+    var groups <- array<DocGroup>(
+        group_by_regex("Tokenizer and parser", mod, %regex~(tokenize|parse_note_name|parse_note_name_default)$%%),
+        group_by_regex("Fluent DSL constructors", mod, %regex~(s|n|note_pattern|seq|note|vowel|set_s|set_vowel)$%%),
+        group_by_regex("Cycle-rate variants", mod, %regex~(every_fast|every_slow|every_degrade)$%%)
+    )
+    document("Mini-notation tokenizer, parser, and fluent-DSL entry points", mod, "strudel_mini.rst", groups)
+}
+
+def document_module_strudel_samples(root : string) {
+    var mod = find_module("strudel_samples")
+    var groups <- array<DocGroup>(
+        group_by_regex("Loading", mod, %regex~(load_audio_file|load_sound|load_audio_memory|load_sound_memory)$%%),
+        group_by_regex("Rendering", mod, %regex~(render_sample)$%%)
+    )
+    document("Sample bank and audio file loading", mod, "strudel_samples.rst", groups)
+}
+
+def document_module_strudel_synth(root : string) {
+    var mod = find_module("strudel_synth")
+    var groups <- array<DocGroup>(
+        group_by_regex("Pitch conversion", mod, %regex~(note_to_freq)$%%),
+        group_by_regex("Noise generators", mod, %regex~(noise)$%%),
+        group_by_regex("Drum renderers", mod, %regex~render_(bd|sd|hh|cp|oh|tom|ride|crash|rimshot|cowbell|tambourine)$%%),
+        group_by_regex("Oscillator type", mod, %regex~(to_osc_type)$%%),
+        group_by_regex("Voice FX chain", mod, %regex~(fx_init_from_event|fx_apply|fx_apply_to_samples)$%%),
+        group_by_regex("Oscillator voice", mod, %regex~(osc_voice_init_supersaw|osc_voice_init_filters|osc_render_chunk)$%%),
+        group_by_regex("Vowel filter", mod, %regex~(vowel_get_formant_data|vowel_filter_init|vowel_filter_tick|formant_biquad_setup_bpf|formant_biquad_tick)$%%),
+        group_by_regex("Voice rendering", mod, %regex~(render_event_stereo|mono_to_stereo)$%%)
+    )
+    document("Audio synthesis: oscillators, drums, filters, and effects", mod, "strudel_synth.rst", groups)
+}
+
+def document_module_strudel_scheduler(root : string) {
+    var mod = find_module("strudel_scheduler")
+    var groups <- array<DocGroup>(
+        group_by_regex("Orbit effects", mod, %regex~(init_reverb|init_chorus|init_delay|get_orbit_reverb|get_orbit_delay)$%%),
+        group_by_regex("Scheduler lifecycle", mod, %regex~(tick|shutdown_scheduler)$%%)
+    )
+    document("Voice allocation, effect bus routing, and per-tick mixing", mod, "strudel_scheduler.rst", groups)
+}
+
+def document_module_strudel_player(root : string) {
+    var mod = find_module("strudel_player")
+    var groups <- array<DocGroup>(
+        group_by_regex("Lifecycle", mod, %regex~strudel_(init|shutdown|create_channel)$%%),
+        group_by_regex("Playback control", mod, %regex~strudel_(play|stop|set_pause|is_playing|noop_cmd|tick|tick_offline|command)$%%),
+        group_by_regex("Tempo and timing", mod, %regex~strudel_(set_bpm|set_cps|get_bpm|get_cps|get_playback_time|set_look_ahead)$%%),
+        group_by_regex("Volume", mod, %regex~strudel_(set_volume|get_volume)$%%),
+        group_by_regex("Asset loading", mod, %regex~strudel_(load_sound|load_sample_dir|load_sf2|get_sf2_path|has_sf2)$%%),
+        group_by_regex("Track management", mod, %regex~strudel_(add_track|remove_track|fade_track)$%%),
+        group_by_regex("State serialization", mod, %regex~strudel_(save_state|restore_state|save_sf2_state|restore_sf2_state)$%%),
+        group_by_regex("Debug and diagnostics", mod, %regex~strudel_(debug_memory|reset_memory_baseline|debug_sample_peaks|debug_master_peak|debug_output_peak|debug_voices)$%%)
+    )
+    document("Top-level playback harness: tracks, BPM/CPS, and threaded audio", mod, "strudel_player.rst", groups)
+}
+
 def document_module_strudel_midi(root : string) {
     var mod = find_module("strudel_midi")
     var groups <- array<DocGroup>(
@@ -1323,6 +1426,19 @@ def document_module_strudel_midi(root : string) {
     document("MIDI file parser", mod, "strudel_midi.rst", groups)
 }
 
+def document_module_strudel_midi_player(root : string) {
+    var mod = find_module("strudel_midi_player")
+    var groups <- array<DocGroup>(
+        group_by_regex("Lifecycle", mod, %regex~midi_(init|shutdown|init_reverb)$%%),
+        group_by_regex("Playback control", mod, %regex~midi_(play|play_data|stop|set_pause|is_playing|tick)$%%),
+        group_by_regex("Audio setup", mod, %regex~midi_(set_volume|set_audio_vis_channel)$%%),
+        group_by_regex("Asset loading", mod, %regex~midi_(load_samples|load_sf2)$%%),
+        group_by_regex("Event processing", mod, %regex~(init_playback|process_events)$%%),
+        group_by_regex("Drum and GM preset rendering", mod, %regex~(render_drum_hit|gm_preset|midi_adsr)$%%)
+    )
+    document("MIDI file playback with GM preset mapping", mod, "strudel_midi_player.rst", groups)
+}
+
 def document_module_strudel_sf2(root : string) {
     var mod = find_module("strudel_sf2")
     var groups <- array<DocGroup>(
@@ -1330,9 +1446,40 @@ def document_module_strudel_sf2(root : string) {
         group_by_regex("Preset and zone lookup", mod, %regex~(sf2_find_preset|sf2_find_zones)$%%),
         group_by_regex("Generator access", mod, %regex~(has_generator|get_generator|get_generator_range)$%%),
         group_by_regex("Unit conversion", mod, %regex~(timecents_to_seconds|cents_to_hz|centibels_to_linear)$%%),
-        group_by_regex("Modulator source helpers", mod, %regex~(sf2_mod_src)%%)
+        group_by_regex("Modulator source helpers", mod, %regex~(sf2_mod_src)%%),
+        hide_group(group_by_regex("Internal finalize infrastructure", mod, %regex~finalize%%))
     )
     document("SoundFont 2 file parser", mod, "strudel_sf2.rst", groups)
+}
+
+def document_module_strudel_sf2_voice(root : string) {
+    var mod = find_module("strudel_sf2_voice")
+    var groups <- array<DocGroup>(
+        group_by_regex("Envelope", mod, %regex~sf2_env_(start|tick)$%%),
+        group_by_regex("LFO", mod, %regex~sf2_lfo_tick$%%),
+        group_by_regex("Modulators", mod, %regex~sf2_(velocity_attenuation|mod_get_value|apply_modulators|mod_identity_match|apply_default_modulators|default_cc_values|collect_atten_modulators|recalc_atten)$%%),
+        group_by_regex("Voice creation", mod, %regex~sf2_(create_c_voice|get_exclusive_class|get_reverb_send|get_chorus_send)$%%)
+    )
+    document("SoundFont 2 per-voice runtime: envelope, LFO, modulators, biquad", mod, "strudel_sf2_voice.rst", groups)
+}
+
+def document_module_strudel_pattern(root : string) {
+    var mod = find_module("strudel_pattern")
+    var groups <- array<DocGroup>(
+        group_by_regex("Pattern construction", mod, %regex~(pure|silence|atom|querySpan|queryArc|patternType)$%%),
+        group_by_regex("Time manipulation", mod, %regex~(fast|slow|stack|cat|fastcat|weighted_fastcat|fmap)$%%),
+        group_by_regex("Combinators", mod, %regex~(rev|jux|off|layer|superimpose|euclid|palindrome|ply|iter|iterBack|when_cycle|linger|hurry|compress|chunk|striate|struct_|mask|choose|wchoose|randcat|chooseCycles|shuffle|scramble|echo|stut|transpose|add|innerJoin|combineWith|combineWithStr|degrade|degradeBy|every|bjorklund|sometimes|often|sometimesby)$%%),
+        group_by_regex("Setter primitives", mod, %regex~set_.*$%%),
+        group_by_regex("Fluent control: dynamics and routing", mod, %regex~(gain|velocity|vel|pan|speed|note|sound|cut|orbit|begin|end_pos)$%%),
+        group_by_regex("Fluent control: effects sends", mod, %regex~(room|roomsize|size|delay|delaytime|dt|delayfeedback|dfb|delaysync|chorus)$%%),
+        group_by_regex("Fluent control: filters", mod, %regex~(lpf|lp|hpf|hp|lpq|resonance|hpq|bpf|bpq|djf)$%%),
+        group_by_regex("Fluent control: envelope", mod, %regex~(attack|att|decay|dec|sustain|sus|release|rel)$%%),
+        group_by_regex("Fluent control: synthesis and shaping", mod, %regex~(fm|fmh|crush|coarse|shape)$%%),
+        group_by_regex("Fluent control: modulation FX", mod, %regex~(phaser|ph|phaserdepth|phd|phasercenter|phc|phasersweep|phs|tremolo|trem|tremolodepth|tremdepth|compressor.*)$%%),
+        group_by_regex("Fluent control: SF2", mod, %regex~sf2.*$%%),
+        group_by_regex("Signals", mod, %regex~(signal|signal_.*|sine|cosine|saw|tri|perlin|range|square|isaw|itri|sine2|cosine2|saw2|tri2|square2|isaw2|itri2|rand|rand2|irand|run)$%%)
+    )
+    document("Pattern algebra, combinators, and fluent control API", mod, "strudel_pattern.rst", groups)
 }
 
 def document_module_peg(root : string) {
@@ -1369,8 +1516,21 @@ def main {
     // document dasAudio daScript modules
     document_module_audio_boost(root)
     document_module_audio_wav(root)
+    // document strudel modules
+    document_module_strudel_event(root)
+    document_module_strudel_time(root)
+    document_module_strudel_live(root)
+    document_module_strudel_scales(root)
+    document_module_strudel_mini(root)
+    document_module_strudel_samples(root)
+    document_module_strudel_synth(root)
+    document_module_strudel_scheduler(root)
+    document_module_strudel_player(root)
     document_module_strudel_midi(root)
+    document_module_strudel_midi_player(root)
     document_module_strudel_sf2(root)
+    document_module_strudel_sf2_voice(root)
+    document_module_strudel_pattern(root)
     // document dasPEG module
     document_module_peg(root)
     document_module_debugapi(root)
