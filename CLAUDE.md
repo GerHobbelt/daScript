@@ -4,7 +4,7 @@
 
 This is the [daslang](https://daslang.io/) programming language repository (GaijinEntertainment/daScript). daslang (formerly daScript) is a high-performance statically-typed scripting language for games and real-time applications. The repository and many C++ API names still use the old "daScript" spelling.
 
-For the **why** — design principles, three-tier execution model, the macros-as-design-lens rule — read `skills/project_overview.md`. The full long-form rationale lives in `doc/source/reference/design_philosophy.rst`.
+For the **why** — design principles, three-tier execution model, the macros-as-design-lens rule — read `skills/project_overview.md`. The full long-form rationale lives in `skills/design_philosophy.md`, which is also the single source `doc/source/reference/design_philosophy.rst` includes for daslang.io — edit the `.md`, never a copy.
 
 ## Build & Run
 
@@ -55,7 +55,8 @@ Task-specific instructions are split into skill files under `skills/`. You MUST 
 | `skills/build_and_debug.md` | Build flags, AOT build commands, exit-code/crash diagnosis, `options log_infer_passes` |
 | `skills/mcp_tools.md` | Full MCP tool table + live-API reference |
 | `skills/das_formatting.md` | Creating or modifying any `.das` file |
-| `skills/writing_tests.md` | Writing or editing test files under `tests/` |
+| `skills/writing_tests.md` | Writing or editing any dastest test (ships in the SDK; applies everywhere) |
+| `skills/tests_in_repo.md` | Adding/moving tests **in this repo** — AOT registration for a new `tests/` dir, the `tests/.das_test` gating filter, deep-engine model-test rules. Repo-only; deliberately not shipped |
 | `skills/writing_cpp_tests.md` | Writing or editing C++ tests under `tests-cpp/` (doctest, leak guards, ctest wiring) |
 | `skills/documentation_rst.md` | Editing RST in `doc/source/`, `//!` doc-comments in `daslib/*.das`, tutorial RST pages |
 | `skills/tutorials.md` | Anything that looks like a tutorial — they live under `/tutorials/<area>/`, NEVER `modules/<X>/tutorial/` |
@@ -69,6 +70,7 @@ Task-specific instructions are split into skill files under `skills/`. You MUST 
 | `skills/dynamic_modules.md` | `.das_module` descriptors, adding modules under `modules/` |
 | `skills/external_module_debugging.md` | Working on an external daslang module (dasImgui, dasPUGIXML, dasSQLITE, etc.) locally — need to run/lint/test from a standalone daslang.exe or via MCP before push-to-CI. Covers the `<DummyRoot>/modules/<your-module>` junction pattern + `project_root` MCP arg |
 | `skills/install_instructions.md` | Updating `install/CLAUDE.md` or `install/skills/` for the shipped SDK |
+| `skills/writing_skills.md` | Adding a `skills/*.md` file, moving content between skills, or reviewing a skill change — the audience decision (SDK vs repo-only), the shipping gate, and the review checklist for what the gate can't check |
 | `skills/aot_testing.md` | AOT test files, `test_aot` binary, `Module::aotRequire()`, AOT hash mismatches |
 | `skills/llvm_tune.md` | The `[tune]` kernel-tuning framework — `[tune_perm]`/`[tune_scope]`/`[tune_policy]`/`--tune`, per-box manifests, the runtime-tune-and-re-exec model, the AOT/-exe gates, adding a kernel family (`modules/dasLLVM/daslib/llvm_tune.das`) |
 | `skills/visitor_gen_bind.md` | Adding `Visitor` virtual methods / `canVisit*` gates / `gen_bind.das` regen |
@@ -76,7 +78,7 @@ Task-specific instructions are split into skill files under `skills/`. You MUST 
 | `skills/daslang_lsp.md` | Working on `utils/lsp/` (the LSP server for Claude Code / stdio clients) — locked architecture, coordinate conventions, CC wire facts, headless dev rig, protocol tests |
 | `utils/dasHerd/dasherder.md` | Running INSIDE a dasHerd-managed agent session (any `DASHERD_SESSION_ID` env var set) — the session cooperation contract: inbox/outbox mailbox, declaring participating repositories, Review Bundles, the `dasherd.ps1` CLI |
 | `skills/imgui_ui_debugging.md` | **CRITICAL UI SKILL** — diagnosing/fixing ANY dasImgui UI or interaction bug. The discipline: reproduce + screenshot → make it observable in `imgui_snapshot` (fix the inspection if it isn't) → fix → prove via snapshot + test → 'after' screenshot. UI is hard; **never claim a UI fix works from logic or a screenshot — only from structured snapshot state.** |
-| `skills/perf_lint.md` | Adding rules to `daslib/perf_lint.das` |
+| `skills/perf_lint.md` | Adding rules to `daslib/perf_lint.das` — **and before declaring any hot path off-limits to allocation**: `[hot_path]` / `[no_alloc]` / `[no_env]` / `[no_io]` contracts (PERF026-028), `[cold_path]` to prune, `@scratch` to declare a reused buffer |
 | `skills/style_lint.md` | Adding rules to `daslib/style_lint.das` |
 | `skills/strings.md` | Any `.das` string operation — `find`/`replace`/`split`/parsing/`build_string`/`peek_data` (covers `strings`, `daslib/strings_boost`, `daslib/strings_convert`) |
 | `skills/regex.md` | Writing regular expressions in `.das` code |
@@ -115,6 +117,14 @@ When you discover something new about daslang syntax, semantics, or conventions 
 **Syntax and factual corrections are fix-in-place, always.** If a compiler error, probe, or user correction shows that a claim in CLAUDE.md or `skills/*.md` is wrong, incomplete, or stale, fix it in the same session and flag the edit in the end-of-turn summary — never defer it to a proposal. Verify the corrected claim before writing it (grammar truth is `src/parser/ds2_parser.ypp`; behavior truth is a probe-compile with the current binary).
 
 **Doc improvements at stopping points.** Propose-first applies only to what's left: restructuring, removing existing guidance, **or proposing a new skill file when you see a recurring pattern that no existing skill covers**. Doc edits direct future Claude behavior, so structural diffs still get review — but factual drift must be self-healing, not queued behind it.
+
+### Writing a new skill
+
+Read `skills/writing_skills.md` first — it carries the full checklist. The three things that matter most:
+
+1. **Decide the audience before writing.** Skills named in `install/skills.list` are copied verbatim into the SDK bundle, where `src/`, `tests/`, `benchmarks/`, `doc/source/` and `modules/*/src` **do not exist**. A skill that mixes SDK-usable content with repo plumbing serves neither audience and is painful to split later. Ship it and push repo bits into a `(repo-only)` section, or keep the whole file repo-only and leave it off the list.
+2. **Never fix an audience mismatch by shipping `src/` or `tests/`.** Mark the line `repo-only` instead (works on a line, or on a heading to cover a whole section). `python3 ci/check_shipped_skills.py <bundle> install/skills.list` enforces this per-PR via `ci/smoke_test_bundle.sh`; it also catches `bin/Release/…` paths, `daslang.exe` invocations, machine-local paths, dead relative links, and references to skills that aren't shipped.
+3. **Register it in all the places.** `skills/<name>.md`, plus a row in the top-level `CLAUDE.md` table; if shipped, also `install/skills.list` **and** a row in `install/CLAUDE.md`. A skill with no trigger row is a skill nobody opens.
 
 ## daslang Language — Gen2 Syntax (REQUIRED)
 
@@ -177,6 +187,7 @@ When you discover something new about daslang syntax, semantics, or conventions 
 
 - No implicit type promotion: `int + float` is a compile error — both sides must match
 - No `bool(int)` cast — use `x != 0`; no `string(bool)` — use `"{flag}"`
+- **`length` and `empty` on a string need no `require`** — both live in the base module, so `length(s)` compiles in a bare file (the rest of the string surface still needs `require strings`). 64-bit forms: `long_length(s)`. The `int`-returning `length` panics past 2^31 rather than wrapping — same always-on guard array/table length already carry
 - `int("123")` does NOT work — use `to_int` from `require strings`. **`to_int` silently returns `0` on garbage** (`to_int("foo")` → `0`, `to_int("12abc")` → `12`). When you need to validate user/external input — including any string that flows into a shell command, file path, or system call — use `try_to_int` / `try_to_float` from `daslib/strings_convert` instead. Those return `Result<T; ConversionError>` distinguishing `invalid_argument` / `out_of_range` / `trailing_garbage`, so `";rm -rf;"` rejects cleanly instead of becoming `0`. Same for `to_float` → `try_to_float`
 - Hex literals are `uint` by default — use `int(0x3F)` for int
 - **16/8-bit type lattice**: `float16` scalar (`half` = builtin alias; literal suffix `1.5h`) + packed vectors `half2/3/4/8`, `short2/3/4/8`, `ushort2/3/4/8`, `byte2/3/4/8/16` (**byte = SIGNED int8**), `ubyte2/3/4/8/16`. Tightly packed (half3 = 6B), element-aligned, pass by value. fp16 family has **closed arithmetic** (per-op promote-to-float-round-back — bit-identical to native fp16); int families are **storage + converts only** (`byte4 + byte4` is a compile error; widen via `int4(b4)`, narrow via ctor = C-truncate or `short4_sat(i4)`-style saturating forms). `.s`-hex swizzles on every vector (`v.s3210`, `b16.sf`), `.lo`/`.hi` on 8/16-lane forms; `xyzw` stays ≤4 lanes. Conformance harness: `tests/type_lattice/` (GENERATED — regen via `daslang utils/dasgen/gen_type_conformance.das`). Lattice vectors have NO ExprConst nodes by design (`isFoldable` false; `Program::makeConst` returns null — callers must handle)
@@ -289,6 +300,9 @@ A generic that should accept `array<T>`, `array<array<T>>`, … (any nesting) �
 ### Common gotchas
 
 - Lambda params can shadow function params — use distinct names
+- **`where` and `shared` are reserved words too** — `where` is the comprehension filter keyword and
+  `shared` the module modifier; both are a syntax error as a variable name (`let where = ...`,
+  `let shared = ...`). Rename (`sink_pos`, `shared_node`); hit while writing PERF026-028
 - **`label`, `expect`, and `pass` are reserved words** (lexer keywords `DAS_LABEL`/`DAS_EXPECT`/`DAS_PASS` — `pass` is the no-op statement) — using any as a parameter/variable name is a syntax error; rename (`tag`, `want`, `cpass`)
 - **`range`/`urange`/`range64`/`urange64` are lexer TYPE tokens** (`DAS_TRANGE` etc., like `int`) — unusable as struct-field, parameter, or annotation-argument names (`@range = ...` is a syntax error); the grammar whitelists them back to a plain name only in call position, which is why `range(10)` works. Rename (`rng`, `span`); grammar-verified 2026-07-23
 - **Literal `{`/`}` in string literals must be escaped `\{`/`\}`** — unescaped `{...}` is interpolation. Bites when embedding shader/C source as inline strings. String literals may span multiple lines (raw newlines are legal); probe-verified 2026-07-11
@@ -344,6 +358,9 @@ A generic that should accept `array<T>`, `array<array<T>>`, … (any nesting) �
 | hand-rolled `is X` / `as X` / null-guard / `ExprRef2Value`-peel ladders in macro code | `qmatch(e, $e(a) + $e(b))` for source-syntax shapes; `match (e) { if (ExprField(name = "key", value = ExprVar(...))) { ... } }` for node-class shapes | both matchers peel `ExprRef2Value` automatically; `\|\|` alternation, `&&` guards, and `match_expr(local)` cover most ladders. Limits + the qmatch↔match division of labor: `skills/das_macros.md` "`match` (daslib/match)" |
 | `unsafe(reinterpret<T?>(unsafe(addr(x))))` (reinterpret-of-addr, pointer target) | `unsafe(addr<T?>(x))` | STYLE034: same AST, one unsafe gate instead of two. Non-pointer puns (`reinterpret<uint64>(addr(x))`) have no `addr<T?>` spelling and stay silent; the sugar's own desugared output is exempt via `castFlags.fromAddrSugar` |
 | `b == T('(')` where `b : T` and T is a non-`int` built-in numeric scalar (also `!=`, ranges, and Yoda forms) | make `b : int`, then write `b == '('` | STYLE035: character literals are `int`; changing the plain variable once removes every repeated numeric cast. The warning is deduplicated at the declaration. |
+| `int64(length(x))` / `uint64(capacity(x))` (also `count`, `find_index`, `fread`, `fwrite`) | `long_length(x)` / `long_capacity(x)` / … | LINT017: the inner call returns `int`, so the 2^31 limit is hit *before* the widening cast — as a wrap, or as the panic guard on array/table/string length — and the cast buys nothing. Pair table is hardcoded (an exists-check is meaningless for user functions, since a macro can add/remove them) and gated on receiver type, which keeps same-named user overloads and the fixed-array `length` generic (no `long_` twin) silent |
+| `memcpy(d, s, int(n))` / `memcmp(d, s, int(n))` where `n` is `int64`/`uint64`/`uint` | `memcpy(d, s, n)` | LINT018: `memcpy`/`memcmp` now carry `uint`/`int64`/`uint64` size overloads, so the `int(...)` narrowing is pure loss — above 2^31 it copies the wrong byte count |
+| `cast<T -const>(x)` / `reinterpret<T -#>(x)` / `addr<void? -const>(x)` — any of `-const` `-&` `-[]` `-#` `==const` `==&` on a **concrete** cast target | drop the contract | STYLE036: these are *substitution* contracts — they act only while a generic binds, and infer clears them once consumed, so a flag still set at lint time proves it did nothing. `auto`/unresolved-alias targets are excluded (there substitution hasn't run and the contract is real); a concrete typedef is NOT excluded (`reinterpret<CI? -const>` with `typedef CI = int const` keeps the const) |
 
 For path/filename ops use `fio` helpers (`base_name`/`dir_name`/`path_join`/etc.) — see `skills/filesystem.md`. Never hand-roll `rfind("/")` / slice — misses Windows separators.
 

@@ -58,6 +58,7 @@ Task-specific instructions are in skill files under `skills/`. Read the relevant
 | Skill file | Read BEFORE... |
 |---|---|
 | `skills/project_overview.md` | First significant task — design philosophy, three execution tiers, macros-as-design-lens |
+| `skills/design_philosophy.md` | The long-form **why** behind daslang — origins, the deliberate trade-offs, the performance model, and why the language is shaped the way it is |
 | `skills/mcp_tools.md` | Full MCP tool table + live-API reference |
 | `skills/das_formatting.md` | Creating or modifying any `.das` file |
 | `skills/cpp_integration.md` | Embedding daslang in C++; binding types/functions/enums |
@@ -76,6 +77,7 @@ Task-specific instructions are in skill files under `skills/`. Read the relevant
 | `skills/memory_leak_detection.md` | Diagnosing leaks (`--das-profiler-leaks`, `--track-smart-ptr`, `GC APP LEAK`, `HandleRegistry`) |
 | `skills/jobque_debugging.md` | Channel/LockBox/JobStatus/Stream/Feature leaks |
 | `skills/detect_dupe.md` | Duplicate-function detection (corpus, MCP tools `export_corpus`/`detect_duplicates`, CLI under `utils/detect-dupe/`) |
+| `skills/detect_dupe_reference.md` | The long-form detect-dupe reference `detect_dupe.md` points at — every flag, in tables |
 | `skills/find_dupe.md` | AI-judging a detect-dupe report via Claude (MCP tools `judge_duplicates`/`find_dupe`, CLI under `utils/find-dupe/`, needs `ANTHROPIC_API_KEY`); cost guardrails (`--dry-run`, `--max-clusters`, `--positives-only`) |
 | `skills/linq.md` | Filter/map/sort/group/aggregate transforms — prefer comprehension → linq_boost → plain `for`; avoid `daslib/functional` for new code |
 | `skills/decs.md` | Programming with `daslib/decs` / `decs_boost` — entities, components, queries, `[decs_template]`, stages, bulk creation, `from_decs` linq bridge |
@@ -86,8 +88,16 @@ Task-specific instructions are in skill files under `skills/`. Read the relevant
 | `skills/dashv.md` | Any `.das` that serves HTTP, streams SSE, makes outbound HTTP requests, or tests a server — `HvWebServer` routes (`GET`/`POST`/`STREAM`/…), buffered vs streaming responses, the SSE writer ops, the client API (`GET`/`POST`/`request`/`with_http_request`/`get_body_bytes`), the `with_test_server` harness, and the per-context / `options stack` gotchas |
 | `skills/gc_migration.md` | Migrating older code (external repos, archived projects) from `smart_ptr<T>` AST patterns to gc_node |
 | `skills/strudel_port.md` | Porting strudel.cc patterns into `dasStrudel` |
+| `skills/llvm_tune.md` | The `[tune]` kernel-tuning framework — `[tune_perm]`/`[tune_scope]`/`--tune`, per-box manifests, the runtime-tune-and-re-exec model, the AOT/`-exe` gates |
+| `skills/tune.md` | The long-form `[tune]` reference that `llvm_tune.md` points at — the full permutation/scope/policy surface |
+| `skills/profiler.md` | Runtime profiling and `--das-profiler-leaks` — the full guide `memory_leak_detection.md` points at |
+| `skills/linq_fold_patterns.md` | Which chain shapes `_fold(...)` recognizes — the full pattern reference `linq.md` points at |
+| `skills/perf_lint.md` | Adding or interpreting `PERF*` rules in `daslib/perf_lint.das` — **and before declaring any hot path off-limits to allocation**: `[hot_path]` / `[no_alloc]` / `[no_env]` / `[no_io]` contracts (PERF026-028), `[cold_path]` to prune, `@scratch` to declare a reused buffer |
+| `skills/style_lint.md` | Adding or interpreting `STYLE*` rules in `daslib/style_lint.das` |
 
 Multiple skill files may apply to a single task. For example, embedding daslang and calling its standard library requires reading both `skills/cpp_integration.md` and `skills/daslib_modules.md`.
+
+**`repo-only` marks paths that are not in this SDK.** The skills are shared with the daslang repository, so a few of them point at daslang's own sources (`src/…`, `tests/…`) when explaining internals. Any such line — or the heading of a whole section of them — carries the token `repo-only`. Those paths do not exist in this bundle and never will; skip them. Everything not marked that way resolves inside the SDK.
 
 ## daslang Language — Gen2 Syntax (REQUIRED)
 
@@ -146,6 +156,7 @@ Multiple skill files may apply to a single task. For example, embedding daslang 
 
 - No implicit type promotion: `int + float` is a compile error — both sides must match
 - No `bool(int)` cast — use `x != 0`; no `string(bool)` — use `"{flag}"`
+- **`length` and `empty` on a string need no `require`** — both live in the base module, so `length(s)` compiles in a bare file (the rest of the string surface still needs `require strings`). 64-bit forms: `long_length(s)`. The `int`-returning `length` panics past 2^31 rather than wrapping — same always-on guard array/table length already carry
 - `int("123")` does NOT work — use `to_int` from `require strings`. **`to_int` silently returns `0` on garbage** (`to_int("foo")` → `0`, `to_int("12abc")` → `12`). When you need to validate user/external input — including any string that flows into a shell command, file path, or system call — use `try_to_int` / `try_to_float` from `daslib/strings_convert` instead. Those return `Result<T; ConversionError>` distinguishing `invalid_argument` / `out_of_range` / `trailing_garbage`, so `";rm -rf;"` rejects cleanly instead of becoming `0`. Same for `to_float` → `try_to_float`
 - Hex literals are `uint` by default — use `int(0x3F)` for int
 - **`default<T>`** — the zero value of `T`. Body of the called function CAN use it.
@@ -313,6 +324,9 @@ A generic that should accept `array<T>`, `array<array<T>>`, … (any nesting) �
 | hand-rolled `is X` / `as X` / null-guard / `ExprRef2Value`-peel ladders in macro code | `qmatch(e, $e(a) + $e(b))` for source-syntax shapes; `match (e) { if (ExprField(name = "key", value = ExprVar(...))) { ... } }` for node-class shapes | both matchers peel `ExprRef2Value` automatically; `\|\|` alternation, `&&` guards, and `match_expr(local)` cover most ladders. Limits + the qmatch↔match division of labor: `skills/das_macros.md` "`match` (daslib/match)" |
 | `unsafe(reinterpret<T?>(unsafe(addr(x))))` (reinterpret-of-addr, pointer target) | `unsafe(addr<T?>(x))` | STYLE034: same AST, one unsafe gate instead of two. Non-pointer puns (`reinterpret<uint64>(addr(x))`) have no `addr<T?>` spelling and stay silent; the sugar's own desugared output is exempt |
 | `b == T('(')` where `b : T` and T is a non-`int` built-in numeric scalar (also `!=`, ranges, and Yoda forms) | make `b : int`, then write `b == '('` | STYLE035: character literals are `int`; changing the plain variable once removes every repeated numeric cast. The warning is deduplicated at the declaration. |
+| `int64(length(x))` / `uint64(capacity(x))` (also `count`, `find_index`, `fread`, `fwrite`) | `long_length(x)` / `long_capacity(x)` / … | LINT017: the inner call returns `int`, so the 2^31 limit is hit *before* the widening cast — as a wrap, or as the panic guard on array/table/string length — and the cast buys nothing. Gated on receiver type, so same-named user overloads and the fixed-array `length` generic (no `long_` twin) stay silent |
+| `memcpy(d, s, int(n))` / `memcmp(d, s, int(n))` where `n` is `int64`/`uint64`/`uint` | `memcpy(d, s, n)` | LINT018: both carry `uint`/`int64`/`uint64` size overloads, so the `int(...)` narrowing is pure loss — above 2^31 it copies the wrong byte count |
+| `cast<T -const>(x)` / `reinterpret<T -#>(x)` / `addr<void? -const>(x)` — any of `-const` `-&` `-[]` `-#` `==const` `==&` on a **concrete** cast target | drop the contract | STYLE036: these are *substitution* contracts — they act only while a generic binds, and infer clears them once consumed, so a flag still set at lint time proves it did nothing. `auto`/unresolved-alias targets are excluded (substitution hasn't run there); a concrete typedef is NOT (`reinterpret<CI? -const>` with `typedef CI = int const` keeps the const) |
 
 For path/filename ops use `fio` helpers (`base_name`/`dir_name`/`path_join`/etc.) — see `skills/filesystem.md`. Never hand-roll `rfind("/")` / slice — misses Windows separators.
 
