@@ -30,6 +30,7 @@ struct public InspectorPrepareJob {
     view_text : string
     view_base64 : string
     view_byte_count : int
+    view_available : bool
     language : string
     stop : bool
 }
@@ -186,7 +187,7 @@ def private prepare_worker_main(var jobs : Channel?&;
                                 kind = TextSourceLineMarkKind.added))
                         }
                     }
-                    view_source = !empty(job.view_text) ? job.view_text : prepared_patch.new_text
+                    view_source = (job.view_available || !empty(job.view_text)) ? job.view_text : prepared_patch.new_text
                     if (!prepared_patch.binary) {
                         var prepared_view <- tree_sitter_source_document(
                             view_source, job.language, job.generation)
@@ -215,8 +216,12 @@ def private prepare_worker_main(var jobs : Channel?&;
                         }
                     }
                     if (prepared_patch.binary) {
-                        if (job.view_byte_count > MAX_BINARY_PREVIEW_RAW_BYTES) {
+                        if (job.view_byte_count > MAX_FILE_PREVIEW_RAW_BYTES) {
                             preview_error = "Binary preview exceeds the 8 MiB raw-byte limit"
+                        } elif (job.view_byte_count == 0) {
+                            preview_error = "Binary preview is empty"
+                        } elif (job.view_byte_count < 0) {
+                            preview_error = "Binary transport reported an invalid byte count"
                         } elif (empty(job.view_base64)) {
                             preview_error = "Binary preview bytes are unavailable for this comparison"
                         } else {
@@ -323,27 +328,43 @@ def public inspector_prepare_worker_start(var worker : InspectorPrepareWorker) :
 
 def public inspector_prepare_worker_queue(var worker : InspectorPrepareWorker;
                                           generation : int;
-                                          patch, view_text, language : string;
+                                          patch : string;
+                                          view_text : string;
+                                          language : string;
                                           view_base64 : string = "";
-                                          view_byte_count : int = 0) : bool {
+                                          view_byte_count : int = 0;
+                                          view_available : bool = false) : bool {
     if (!worker.started || worker.stopped || worker.jobs == null) return false
     worker.jobs |> push_clone(InspectorPrepareJob(
         generation = generation, patch = patch, view_text = view_text,
         language = language, view_base64 = view_base64,
-        view_byte_count = view_byte_count))
+        view_byte_count = view_byte_count,
+        view_available = view_available))
+    return true
+}
+
+def public inspector_prepare_worker_take_event(var worker : InspectorPrepareWorker;
+                                               var event : InspectorPrepareEvent) : bool {
+    if (!worker.started || worker.events == null) return false
+    delete event
+    let popped = worker.events |> try_pop_clone() $(next : InspectorPrepareEvent#) {
+        event := next
+    }
+    if (!popped) return false
+    if (event.kind == InspectorPrepareEventKind.stopped) {
+        worker.stopped = true
+    }
     return true
 }
 
 def public inspector_prepare_worker_try_event(
-        var worker : InspectorPrepareWorker;
-        blk : block<(event : InspectorPrepareEvent#) : void>) : bool {
-    if (!worker.started || worker.events == null) return false
-    return worker.events |> try_pop_clone() $(event : InspectorPrepareEvent#) {
-        if (event.kind == InspectorPrepareEventKind.stopped) {
-            worker.stopped = true
-        }
-        invoke(blk, event)
-    }
+                                              var worker : InspectorPrepareWorker;
+                                              blk : block<(event : InspectorPrepareEvent const) : void>) : bool {
+    var event : InspectorPrepareEvent
+    if (!inspector_prepare_worker_take_event(worker, event)) return false
+    invoke(blk, event)
+    delete event
+    return true
 }
 
 def public inspector_prepare_worker_shutdown(var worker : InspectorPrepareWorker;

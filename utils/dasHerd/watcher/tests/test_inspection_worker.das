@@ -34,7 +34,8 @@ def test_inspection_prepare_worker(t : T?) {
         var span_count = 0
         let wait_started = ref_time_ticks()
         while (!completed && int64(get_time_usec(wait_started)) < 5000000l) {
-            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent#) {
+            var event : InspectorPrepareEvent
+            if (inspector_prepare_worker_take_event(worker, event)) {
                 if (event.kind == InspectorPrepareEventKind.ready) {
                     ready = true
                 } elif (event.kind == InspectorPrepareEventKind.started) {
@@ -75,7 +76,7 @@ def test_inspection_prepare_worker(t : T?) {
         var completed = false
         let wait_started = ref_time_ticks()
         while (!completed && int64(get_time_usec(wait_started)) < 5000000l) {
-            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent#) {
+            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent const) {
                 if (event.kind == InspectorPrepareEventKind.completed) {
                     completed = true
                     tt |> success(event.markdown_document.ok,
@@ -103,7 +104,7 @@ def test_inspection_prepare_worker(t : T?) {
         var failure = ""
         let wait_started = ref_time_ticks()
         while (!failed && int64(get_time_usec(wait_started)) < 5000000l) {
-            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent#) {
+            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent const) {
                 if (event.kind == InspectorPrepareEventKind.failed) {
                     failed = true
                     failure = clone_string(event.error)
@@ -137,7 +138,7 @@ def test_inspection_prepare_worker(t : T?) {
         var completed = false
         let wait_started = ref_time_ticks()
         while (!completed && int64(get_time_usec(wait_started)) < 5000000l) {
-            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent#) {
+            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent const) {
                 if (event.kind == InspectorPrepareEventKind.completed) {
                     completed = true
                     tt |> equal(event.parsed.binary, true)
@@ -155,7 +156,7 @@ def test_inspection_prepare_worker(t : T?) {
         destroy_job_que()
     }
     t |> run("unsupported binary completes with an unavailable-preview reason") <| @(tt : T?) {
-        var bytes : array<uint8> <- [uint8(0), uint8(1), uint8(2), uint8(3)]
+        let bytes : array<uint8> <- [uint8(0), uint8(1), uint8(2), uint8(3)]
         let encoded = base64_encode(bytes)
         create_job_que()
         var worker = InspectorPrepareWorker()
@@ -166,12 +167,57 @@ def test_inspection_prepare_worker(t : T?) {
         var completed = false
         let wait_started = ref_time_ticks()
         while (!completed && int64(get_time_usec(wait_started)) < 5000000l) {
-            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent#) {
+            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent const) {
                 if (event.kind == InspectorPrepareEventKind.completed) {
                     completed = true
                     tt |> equal(event.parsed.binary, true)
                     tt |> equal(empty(event.preview_pixels), true)
                     tt |> equal(empty(event.preview_error), false)
+                }
+            }
+        }
+        tt |> equal(completed, true)
+        tt |> equal(inspector_prepare_worker_shutdown(worker), true)
+        destroy_job_que()
+    }
+    t |> run("empty binary preview completes without decoding") <| @(tt : T?) {
+        create_job_que()
+        var worker = InspectorPrepareWorker()
+        tt |> equal(inspector_prepare_worker_start(worker), true)
+        tt |> equal(inspector_prepare_worker_queue(worker, 15,
+            "diff --git a/empty.bin b/empty.bin\nBinary files a/empty.bin and b/empty.bin differ\n",
+            "", "", "", 0), true)
+        var completed = false
+        let wait_started = ref_time_ticks()
+        while (!completed && int64(get_time_usec(wait_started)) < 5000000l) {
+            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent const) {
+                if (event.kind == InspectorPrepareEventKind.completed) {
+                    completed = true
+                    tt |> equal(event.parsed.binary, true)
+                    tt |> equal(event.preview_error, "Binary preview is empty")
+                    tt |> equal(empty(event.preview_pixels), true)
+                }
+            }
+        }
+        tt |> equal(completed, true)
+        tt |> equal(inspector_prepare_worker_shutdown(worker), true)
+        destroy_job_que()
+    }
+    t |> run("explicit empty full View does not fall back to diff context") <| @(tt : T?) {
+        create_job_que()
+        var worker = InspectorPrepareWorker()
+        tt |> equal(inspector_prepare_worker_start(worker), true)
+        tt |> equal(inspector_prepare_worker_queue(worker, 16,
+            "diff --git a/old.txt b/old.txt\ndeleted file mode 100644\n--- a/old.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n",
+            "", "plain", "", 0, true), true)
+        var completed = false
+        let wait_started = ref_time_ticks()
+        while (!completed && int64(get_time_usec(wait_started)) < 5000000l) {
+            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent const) {
+                if (event.kind == InspectorPrepareEventKind.completed) {
+                    completed = true
+                    tt |> equal(event.view_source, "")
+                    tt |> equal(event.view_document.source, "")
                 }
             }
         }

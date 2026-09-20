@@ -8,6 +8,10 @@ require strings
 
 [test]
 def test_watcher_machine_output(t : T?) {
+    t |> run("empty transport target defaults to local") <| @(t : T?) {
+        t |> equal(watcher_target_id_or_local(""), "local")
+        t |> equal(watcher_target_id_or_local("ssh-build"), "ssh-build")
+    }
     t |> run("ConPTY wrapper controls are removed without changing task text") <| @(t : T?) {
         let esc = to_char(27)
         let bel = to_char(7)
@@ -62,8 +66,17 @@ def test_watcher_process_lifecycle(t : T?) {
             columns = 1, rows = 999, timeout_ms = 5000l))
         t |> success(!failed.ok, "failed PTY launch is reported to the caller")
         t |> success(!empty(failed.session_id), "failed PTY launch retains its diagnostic session")
-        t |> success(find(watcher_snapshot_json(failed.session_id), "\"state\":\"failed\"") >= 0,
+        let failed_snapshot = watcher_snapshot_json(failed.session_id)
+        t |> success(find(failed_snapshot, "\"state\":\"failed\"") >= 0,
             "failed PTY launch is retained in watcher state")
+        t |> success(find(failed_snapshot, "\"pid\":0") >= 0,
+            "failed PTY launch retains a deterministic zero process id")
+        t |> equal(base_name(watcher_session_artifact_path(
+            failed.session_id, "staged-view.raw")), "staged-view.raw")
+        t |> equal(watcher_session_artifact_path(
+            failed.session_id, "../outside.raw"), "")
+        t |> equal(watcher_session_artifact_path(
+            failed.session_id, "C:outside.raw"), "")
         let failed_metadata = fread(path_join(path_join(path_join(root, "sessions"),
             failed.session_id), "session.json"))
         t |> success(find(failed_metadata, "\"columns\":20") >= 0

@@ -121,9 +121,8 @@ def private repository_id(target_id, path : string) : string {
 
 def public repository_valid_relative_file_path(path : string) : bool {
     if (!valid_path(path) || starts_with(path, "/") || starts_with(path, "\\")
-            || is_absolute(path)) return false
-    if (get_platform_name() == "windows" && length(path) >= 2
-            && byte_at(path, 1) == ':') return false
+            || is_absolute(path) || (get_platform_name() == "windows"
+                && length(path) >= 2 && byte_at(path, 1) == ':')) return false
     return (path != ".." && !ends_with(path, "/..") && !ends_with(path, "\\..")
         && find(path, "../") < 0 && find(path, "..\\") < 0)
 }
@@ -164,7 +163,7 @@ def private load_config : string {
     return ""
 }
 
-def public repository_init(config_path, bootstrap_checkout : string) : string {
+def public repository_init(config_path : string; bootstrap_checkout : string) : string {
     g_config_path = config_path
     let load_error = load_config()
     if (!empty(load_error)) return load_error
@@ -257,8 +256,8 @@ def public repository_build_file_diff_argv(worktree_path : string;
     } elif (diff_context != "compact") {
         return "diff context is not implemented"
     }
-    var inscope common <- ["git", "-C", worktree_path, "--no-pager", "-c",
-        "color.ui=false", "diff"]
+    var inscope common <- ["git", "--literal-pathspecs", "-C", worktree_path,
+        "--no-pager", "-c", "color.ui=false", "diff"]
     argv := common
     if (comparison == "staged") argv |> push("--cached")
     if (comparison == "working" && file.code == "??") {
@@ -275,7 +274,9 @@ def public repository_build_file_diff_argv(worktree_path : string;
     return ""
 }
 
-def public repository_file_diff_argv(repository_id, worktree_path, file_path,
+def public repository_file_diff_argv(repository_id : string;
+                                     worktree_path : string;
+                                     file_path : string;
                                      comparison : string;
                                      var argv : array<string>&;
                                      var expected_exit_code : int64&;
@@ -311,8 +312,85 @@ def public repository_file_diff_argv(repository_id, worktree_path, file_path,
         diff_context)
 }
 
-def public repository_working_file_text(repository_id, worktree_path, file_path : string;
-                                        var text : string&) : string {
+def public repository_read_text_file(path : string; max_bytes : int;
+                                     var text : string&) : string {
+    text = ""
+    let file_status = stat(path)
+    if (!file_status.is_valid || !file_status.is_reg) {
+        return "could not read file text"
+    }
+    var loaded = false
+    var too_large = false
+    fopen(path, "rb") $(file) {
+        if (file != null) {
+            fmap(file) $(var data : array<uint8>#) {
+                if (length(data) <= max_bytes) {
+                    text = string(data)
+                } else {
+                    too_large = true
+                }
+                loaded = true
+            }
+        }
+    }
+    if (too_large) return "file exceeds the raw-byte View limit"
+    return loaded ? "" : "could not read file text"
+}
+
+def public repository_read_file_bytes(path : string; max_bytes : int;
+                                      var bytes : array<uint8>;
+                                      var byte_count : int&) : string {
+    delete bytes
+    byte_count = 0
+    let file_status = stat(path)
+    if (!file_status.is_valid || !file_status.is_reg) {
+        return "could not read file bytes"
+    }
+    var loaded = false
+    fopen(path, "rb") $(file) {
+        if (file != null) {
+            fmap(file) $(var data : array<uint8>#) {
+                byte_count = length(data)
+                if (byte_count <= max_bytes) {
+                    bytes := data
+                }
+                loaded = true
+            }
+        }
+    }
+    return loaded ? "" : "could not read file bytes"
+}
+
+def public repository_working_preview_path(worktree_path : string;
+                                           file_path : string;
+                                           var absolute_path : string&) : string {
+    absolute_path = ""
+    if (!repository_valid_relative_file_path(file_path)) {
+        return "invalid worktree-relative file path"
+    }
+    let candidate = path_join(worktree_path, file_path)
+    if (!fexist(candidate)) return "working file does not exist"
+    var current = worktree_path
+    var inscope components <- split(replace(file_path, "\\", "/"), "/")
+    for (component in components) {
+        if (empty(component) || component == ".") continue
+        current = path_join(current, component)
+        var symlink_error = ""
+        if (is_symlink(current, symlink_error)) {
+            return "working file path contains a symlink"
+        }
+        if (!empty(symlink_error)) {
+            return "could not inspect working file path: {symlink_error}"
+        }
+    }
+    absolute_path = candidate
+    return ""
+}
+
+def public repository_working_file_text(repository_id : string;
+                                        worktree_path : string;
+                                        file_path : string;
+                                        max_bytes : int; var text : string&) : string {
     text = ""
     let repository_index = find_repository(repository_id)
     if (repository_index < 0 || g_repositories[repository_index] == null) {
@@ -328,16 +406,16 @@ def public repository_working_file_text(repository_id, worktree_path, file_path 
         }
     }
     if (!file_found) return "file has no observed working-tree change"
-    if (!repository_valid_relative_file_path(file_path)) {
-        return "invalid worktree-relative file path"
-    }
-    let absolute_path = path_join(worktree_path, file_path)
-    if (!fexist(absolute_path)) return "working file does not exist"
-    text = fread(absolute_path)
-    return ""
+    var absolute_path = ""
+    let path_error = repository_working_preview_path(
+        worktree_path, file_path, absolute_path)
+    if (!empty(path_error)) return path_error
+    return repository_read_text_file(absolute_path, max_bytes, text)
 }
 
-def public repository_working_file_bytes(repository_id, worktree_path, file_path : string;
+def public repository_working_file_bytes(repository_id : string;
+                                         worktree_path : string;
+                                         file_path : string;
                                          max_bytes : int;
                                          var bytes : array<uint8>;
                                          var byte_count : int&) : string {
@@ -357,24 +435,28 @@ def public repository_working_file_bytes(repository_id, worktree_path, file_path
         }
     }
     if (!file_found) return "file has no observed working-tree change"
+    var absolute_path = ""
+    let path_error = repository_working_preview_path(
+        worktree_path, file_path, absolute_path)
+    if (!empty(path_error)) return path_error
+    let read_error = repository_read_file_bytes(
+        absolute_path, max_bytes, bytes, byte_count)
+    return read_error
+}
+
+def public repository_staged_file_view_argv(worktree_path : string;
+                                            file_path : string;
+                                            output_path : string;
+                                            var argv : array<string>&) : string {
+    delete argv
     if (!repository_valid_relative_file_path(file_path)) {
         return "invalid worktree-relative file path"
     }
-    let absolute_path = path_join(worktree_path, file_path)
-    if (!fexist(absolute_path)) return "working file does not exist"
-    var loaded = false
-    fopen(absolute_path, "rb") $(file) {
-        if (file != null) {
-            fmap(file) $(var data : array<uint8>#) {
-                byte_count = length(data)
-                if (byte_count <= max_bytes) {
-                    bytes := data
-                }
-                loaded = true
-            }
-        }
-    }
-    return loaded ? "" : "could not read working file bytes"
+    if (empty(output_path)) return "staged view output path is required"
+    var inscope command <- ["git", "-C", worktree_path, "--no-pager", "show",
+        "--format=", "--output={output_path}", ":0:{file_path}"]
+    argv := command
+    return ""
 }
 
 def private launch_git(var runtime : RepositoryRuntime?; argv : array<string>;
@@ -426,7 +508,7 @@ def private byte_at(value : string; index : int) : int {
 }
 
 def private append_worktree(var worktrees : array<WorktreeState>;
-                            var current : WorktreeState) {
+                            current : WorktreeState) {
     worktrees |> push(WorktreeState(path = current.path, head = current.head,
         branch = current.branch, is_main = empty(worktrees), detached = current.detached,
         bare = current.bare, locked = current.locked, prunable = current.prunable))
@@ -469,12 +551,18 @@ def private conflict_code(code : string) : bool {
     return code == "DD" || code == "AU" || code == "UD" || code == "UA" || code == "DU" || code == "AA" || code == "UU"
 }
 
+def private rename_or_copy_code(code : string) : bool {
+    if (length(code) != 2) return false
+    return byte_at(code, 0) == 'R' || byte_at(code, 0) == 'C' || byte_at(code, 1) == 'R' || byte_at(code, 1) == 'C'
+}
+
 def private parse_counter(text, marker : string) : int {
     let start = find(text, marker)
     if (start < 0) return 0
     let value_start = start + length(marker)
     var value_end = value_start
-    while (value_end < length(text) && is_number(byte_at(text, value_end))) {
+    let text_length = length(text)
+    while (value_end < text_length && is_number(byte_at(text, value_end))) {
         value_end++
     }
     return to_int(slice(text, value_start, value_end))
@@ -500,7 +588,7 @@ def public repository_parse_status(text : string; var worktree : WorktreeState;
         var path = slice(line, 3)
         var old_path : string
         let rename_separator = find(path, " -> ")
-        if (rename_separator >= 0) {
+        if (rename_separator >= 0 && rename_or_copy_code(code)) {
             old_path = slice(path, 0, rename_separator)
             path = slice(path, rename_separator + 4)
         }
@@ -541,6 +629,10 @@ def private fail_refresh(var runtime : RepositoryRuntime?; message : string) {
     runtime.snapshot.refreshing = false
     runtime.snapshot.error = message
     changed(runtime)
+    if (runtime.rerun_pending) {
+        runtime.rerun_pending = false
+        runtime.refresh_pending = true
+    }
 }
 
 def private advance_repository(var runtime : RepositoryRuntime?) {
@@ -550,7 +642,7 @@ def private advance_repository(var runtime : RepositoryRuntime?) {
     }
     var info = WatcherSessionInfo()
     if (!watcher_get_session_info(runtime.snapshot.task_session_id, info) || !info.drained) return
-    var scrollback_rows = 0
+    let scrollback_rows = 0
     let output = watcher_terminal_text(runtime.snapshot.task_session_id, scrollback_rows)
     if (scrollback_rows > 0) {
         let _compacted_overflow = watcher_compact_session(runtime.snapshot.task_session_id)

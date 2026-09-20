@@ -33,6 +33,10 @@ struct public WatcherLaunchRequest {
     timeout_ms : int64
 }
 
+def public watcher_target_id_or_local(target_id : string) : string {
+    return empty(target_id) ? "local" : target_id
+}
+
 struct public WatcherInputRequest {
     session_id : string
     text : string
@@ -66,7 +70,7 @@ struct public WatcherSessionInfo {
     worktree_path : string
     state : string
     reason : string
-    pid : int
+    pid : int = 0
     exit_code : int64 = -1l
     elapsed_ms : int64
     output_bytes : int64
@@ -117,7 +121,7 @@ class private WatcherSession {
     events_path : string
     state : string = "starting"
     reason : string
-    pid : int
+    pid : int = 0
     terminal : Terminal = Terminal()
     output_file : FILE const? = null
     events_file : FILE const? = null
@@ -511,6 +515,14 @@ def public watcher_compact_session(session_id : string;
     return true
 }
 
+def public watcher_session_artifact_path(session_id : string; name : string) : string {
+    if (empty(name) || name == "." || name == ".." || find(name, "/") >= 0
+            || find(name, "\\") >= 0 || find(name, ":") >= 0) return ""
+    let index = watcher_find_session(session_id)
+    if (index < 0 || g_sessions[index] == null) return ""
+    return path_join(g_sessions[index].session_dir, name)
+}
+
 def public watcher_prune_completed_sessions(kind : string;
                                             repository_id : string;
                                             worktree_path : string) : int {
@@ -538,7 +550,7 @@ def private input_session(var session : WatcherSession?; text : string; client_i
     return ""
 }
 
-def public watcher_input(session_id, text : string; client_id : int = 0) : string {
+def public watcher_input(session_id : string; text : string; client_id : int = 0) : string {
     let index = watcher_find_session(session_id)
     if (index < 0) return "unknown session"
     if (length(text) > MAX_INPUT_BYTES) return "input is too large"
@@ -552,15 +564,16 @@ def private resize_session(var session : WatcherSession?; columns, rows, client_
     return ""
 }
 
-def public watcher_resize(session_id : string; columns, rows, client_id : int) : string {
+def public watcher_resize(session_id : string; columns : int; rows : int;
+                          client_id : int) : string {
     let index = watcher_find_session(session_id)
     if (index < 0) return "unknown session"
     return resize_session(g_sessions[index], columns, rows, client_id)
 }
 
 def private terminate_session(var session : WatcherSession?; detail : string) : string {
-    if (session.state != "running" && session.state != "terminating") return ""
-    if (terminal_process_exited(session.terminal)) return ""
+    if ((session.state != "running" && session.state != "terminating")
+            || terminal_process_exited(session.terminal)) return ""
     session.reason = detail
     session.state = "terminating"
     session.status_revision++

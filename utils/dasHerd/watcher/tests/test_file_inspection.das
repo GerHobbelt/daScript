@@ -56,6 +56,17 @@ def test_unified_patch_projection(t : T?) {
         tt |> equal(parsed.hunks[1].old_start, 20)
         tt |> equal(parsed.hunks[1].new_start, 20)
     }
+    t |> run("header-only Git diffs remain valid") <| @(tt : T?) {
+        let source = "diff --git a/old.das b/new.das\nsimilarity index 100%\nrename from old.das\nrename to new.das\n"
+        var inscope parsed <- git_parse_unified_patch(source)
+        tt |> equal(parsed.error, "")
+        tt |> equal(parsed.binary, false)
+        tt |> equal(length(parsed.hunks), 0)
+        tt |> equal(length(parsed.rows), 0)
+
+        var inscope invalid <- git_parse_unified_patch("not a Git diff")
+        tt |> equal(invalid.error, "diff contains no text hunks")
+    }
 }
 
 [test]
@@ -67,6 +78,9 @@ def test_binary_patch_detection(t : T?) {
         t |> equal(git_patch_is_binary(binary_patch), true)
         let literal_patch = "diff --git a/image.png b/image.png\nGIT binary patch\nliteral 0\n"
         t |> equal(git_patch_is_binary(literal_patch), true)
+        let deleted_patch = "diff --git a/old.txt b/old.txt\ndeleted file mode 100644\n--- a/old.txt\n+++ /dev/null\n"
+        t |> equal(git_patch_result_is_deleted(deleted_patch), true)
+        t |> equal(git_patch_result_is_deleted(text_patch), false)
     }
 }
 

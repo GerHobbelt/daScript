@@ -5,6 +5,7 @@ module dasllama_gguf shared public
 
 require daslib/array_boost // nolint:STYLE030 — temp_array is [template]; STYLE030 misses template-fn refs
 require strings
+require math                        // sqrt/abs/clamp — the Q5_K encoder's per-sub-block fit
 require daslib/fio                  // shard-path expansion + mapping (split GGUF)
 require daslib/strings_boost        // trim_suffix / pad_left (split shard names)
 require daslib/strings_convert     // try_to_int (validating shard-index parse)
@@ -42,6 +43,7 @@ let GGML_TYPE_F32 = 0
 let GGML_TYPE_F16 = 1
 let GGML_TYPE_Q4_0 = 2
 let GGML_TYPE_Q5_0 = 6
+let GGML_TYPE_Q5_1 = 7
 let GGML_TYPE_Q8_0 = 8
 let GGML_TYPE_Q4_K = 12
 let GGML_TYPE_Q5_K = 13
@@ -839,6 +841,210 @@ def dequant_k5_plane_superblock(kq : array<uint8> | #; kqo : int64; ks : array<u
     }
 }
 
+// llama.cpp's nearest_int — round-half-to-even via the fp32 add-magic trick, replicated bit-for-bit
+// so encoder output stays byte-comparable against llama.cpp's. Caller guarantees |fval| <= 4194303.
+def private nearest_int(fval : float) : int {
+    let v = fval + 12582912.0
+    let i = int(unsafe(reinterpret<uint>(v)))
+    return (i & int(0x007fffff)) - int(0x00400000)
+}
+
+// Weighted joint scale/min fit for one 32-weight sub-block (llama.cpp make_qkx2_quants, nmax=31,
+// rmin=-0.5, rdelta=0.1, 16 steps): sweeps iscale around the naive max/min fit and keeps the
+// weighted-least-squares (scale, min) with the lowest weighted square error. Returns (scale, -min).
+def private k5_fit_sub(x : float const?; wt : float const?; var lout : int?) : float2 {
+    unsafe {
+        var vmin = x[0]
+        var vmax = x[0]
+        var sum_w = wt[0]
+        var sum_x = wt[0] * x[0]
+        for (i in range64(1l, 32l)) {
+            vmin = min(vmin, x[i])
+            vmax = max(vmax, x[i])
+            sum_w += wt[i]
+            sum_x += wt[i] * x[i]
+        }
+        if (vmin > 0.0) {
+            vmin = 0.0
+        }
+        if (vmax == vmin) {
+            for (i in range64(32l)) {
+                lout[i] = 0
+            }
+            return float2(0.0, -vmin)
+        }
+        let iscale0 = 31.0 / (vmax - vmin)
+        var scale = 1.0 / iscale0
+        var best_mad = 0.0
+        for (i in range64(32l)) {
+            let l = clamp(nearest_int(iscale0 * (x[i] - vmin)), 0, 31)
+            lout[i] = l
+            let diff = scale * float(l) + vmin - x[i]
+            best_mad += wt[i] * diff * diff
+        }
+        var laux : int[32]
+        for (istep in range64(16l)) {
+            let isc = (30.5 + 0.1 * float(istep)) / (vmax - vmin)
+            var sum_l = 0.0
+            var sum_l2 = 0.0
+            var sum_xl = 0.0
+            for (i in range64(32l)) {
+                let l = clamp(nearest_int(isc * (x[i] - vmin)), 0, 31)
+                laux[i] = l
+                let fl = float(l)
+                sum_l += wt[i] * fl
+                sum_l2 += wt[i] * fl * fl
+                sum_xl += wt[i] * fl * x[i]
+            }
+            let dd = sum_w * sum_l2 - sum_l * sum_l
+            if (dd <= 0.0) {
+                continue
+            }
+            var this_scale = (sum_w * sum_xl - sum_x * sum_l) / dd
+            var this_min = (sum_l2 * sum_x - sum_l * sum_xl) / dd
+            if (this_min > 0.0) {   // min is clamped non-positive; refit scale alone
+                this_min = 0.0
+                this_scale = sum_xl / sum_l2
+            }
+            var mad = 0.0
+            for (i in range64(32l)) {
+                let diff = this_scale * float(laux[i]) + this_min - x[i]
+                mad += wt[i] * diff * diff
+            }
+            if (mad < best_mad) {
+                for (i in range64(32l)) {
+                    lout[i] = laux[i]
+                }
+                best_mad = mad
+                scale = this_scale
+                vmin = this_min
+            }
+        }
+        return float2(scale, -vmin)
+    }
+}
+
+// Encode one 256-weight superblock into the k5 planes — the exact inverse of
+// dequant_k5_plane_superblock, following llama.cpp quantize_row_q5_K_ref op-for-op.
+def private quantize_k5_superblock_p(x : float const?; var kq : uint8?; kqo : int64; var ks : uint8?; kso : int64) {
+    unsafe {
+        var lq : int[256]
+        var lsub : int[32]
+        var wt : float[32]
+        var scales : float[8]
+        var mins : float[8]
+        var max_scale = 0.0
+        var max_min = 0.0
+        for (j in range64(8l)) {
+            var sum_x2 = 0.0
+            for (l in range64(32l)) {
+                sum_x2 += x[j * 32l + l] * x[j * 32l + l]
+            }
+            let av_x = sqrt(sum_x2 / 32.0)
+            for (l in range64(32l)) {
+                wt[l] = av_x + abs(x[j * 32l + l])
+            }
+            let sm = k5_fit_sub(x + j * 32l, addr(wt[0]), addr(lsub[0]))
+            scales[j] = sm.x
+            mins[j] = sm.y
+            max_scale = max(max_scale, sm.x)
+            max_min = max(max_min, sm.y)
+            for (l in range64(32l)) {
+                lq[j * 32l + l] = lsub[l]
+            }
+        }
+        let inv_scale = max_scale > 0.0 ? 63.0 / max_scale : 0.0
+        let inv_min = max_min > 0.0 ? 63.0 / max_min : 0.0
+        for (b in range64(16l)) {   // the |= packing below needs a zeroed strip; also clears the 4B pad
+            ks[kso + 4l + b] = uint8(0)
+        }
+        for (j in range64(8l)) {
+            let ls = min(63, nearest_int(inv_scale * scales[j]))
+            let lm = min(63, nearest_int(inv_min * mins[j]))
+            if (j < 4l) {
+                ks[kso + 4l + j] = uint8(ls)
+                ks[kso + 8l + j] = uint8(lm)
+            } else {
+                ks[kso + 8l + j] = uint8((ls & 15) | ((lm & 15) << 4))
+                ks[kso + j] = uint8(int(ks[kso + j]) | ((ls >> 4) << 6))
+                ks[kso + 4l + j] = uint8(int(ks[kso + 4l + j]) | ((lm >> 4) << 6))
+            }
+        }
+        let d = f32_to_f16(max_scale / 63.0)
+        let dmin = f32_to_f16(max_min / 63.0)
+        ks[kso] = uint8(d & 0xFFu)
+        ks[kso + 1l] = uint8((d >> 8u) & 0xFFu)
+        ks[kso + 2l] = uint8(dmin & 0xFFu)
+        ks[kso + 3l] = uint8((dmin >> 8u) & 0xFFu)
+        // second pass: re-derive quants against the ROUNDED 6-bit sc/mn, not the fitted floats
+        let df = f16_to_f32(d)
+        let dmf = f16_to_f32(dmin)
+        for (j in range64(8l)) {
+            let sm = q4k_scale_min_p(ks, kso + 4l, j)
+            let dj = df * float(sm.x)
+            if (dj == 0.0) {
+                continue
+            }
+            let mj = dmf * float(sm.y)
+            for (l in range64(32l)) {
+                lq[j * 32l + l] = clamp(nearest_int((x[j * 32l + l] + mj) / dj), 0, 31)
+            }
+        }
+        for (l in range64(32l)) {
+            kq[kqo + 128l + l] = uint8(0)
+        }
+        for (js in range64(4l)) {   // sub-blocks 2js/2js+1 share 32 nibble bytes; qh bit 2js / 2js+1
+            for (l in range64(32l)) {
+                var l1 = lq[js * 64l + l]
+                var l2 = lq[js * 64l + l + 32l]
+                var h = 0
+                if (l1 > 15) {
+                    l1 -= 16
+                    h |= 1 << int(2l * js)
+                }
+                if (l2 > 15) {
+                    l2 -= 16
+                    h |= 2 << int(2l * js)
+                }
+                kq[kqo + 128l + l] = uint8(int(kq[kqo + 128l + l]) | h)
+                kq[kqo + js * 32l + l] = uint8(l1 | (l2 << 4))
+            }
+        }
+    }
+}
+
+//! Encode n fp32 weights (n % 256 == 0) into the k5 planes at plane-local element offset `eloff` —
+//! the encode counterpart of gguf_transcode_q5k, for disk types that are not already Q5_K.
+def quantize_k5_plane(src : array<float> | #; n : int64; var kq : array<uint8>; var ks : array<uint8>; eloff : int64) {
+    if (n % 256l != 0l) {
+        panic("quantize_k5_plane: n={n} is not a multiple of 256")
+    }
+    // O(1) source guard — the loop below reads n weights through a raw pointer, bypassing bounds checks
+    if (n > long_length(src)) {
+        panic("quantize_k5_plane: n={n} exceeds src length {long_length(src)}")
+    }
+    let nb = n / 256l
+    if (nb <= 0l) {
+        return
+    }
+    guard_dst("<k5 encode>", "k5 quant plane", (eloff / 256l) * K5_QSB, nb * K5_QSB, long_length(kq))
+    guard_dst("<k5 encode>", "k5 scale plane", (eloff / 256l) * K5_SSB, nb * K5_SSB, long_length(ks))
+    unsafe {
+        let srcp = addr<float const?>(src[0])
+        var kqp = addr(kq[(eloff / 256l) * K5_QSB])
+        var ksp = addr(ks[(eloff / 256l) * K5_SSB])
+        // the qkx2 sweep is ~100x a byte copy per superblock, so thread far earlier than transcode_jobs
+        let njobs = is_job_que_available() ? int(clamp(nb / 64l, 1l, 64l)) : 1
+        maybe_parallel_for(0, int(nb), njobs) $(rb, re) {
+            unsafe {
+                for (blk in range64(int64(rb), int64(re))) {
+                    quantize_k5_superblock_p(srcp + blk * 256l, kqp, blk * K5_QSB, ksp, blk * K5_SSB)
+                }
+            }
+        }
+    }
+}
+
 //! Reference dequant of one k6-plane superblock: w = (d*sc16)*(q - 32) — bit-identical to the
 //! disk dequant (the k6 planes are verbatim).
 def dequant_k6_plane_superblock(kq : array<uint8> | #; kqo : int64; ks : array<uint8> | #; kso : int64; var dst : array<float> | #; doff : int64) {
@@ -899,6 +1105,34 @@ def dequant_q40_plane_superblock(kq : array<uint8> | #; kqo : int64; ks : array<
     }
 }
 
+//! Transcode one Q5_1 disk block (24 bytes at `bo`: d f16, m f16, qh u32, 16 nibble bytes) into
+//! the q51 planes — verbatim splits, exact. The per-block array form the tests drive; the bulk
+//! loader (gguf_transcode_q51) runs the same split pointerized and threaded.
+def transcode_q51_block(bytes : array<uint8> | #; bo : int64; var kq : array<uint8>; kqo : int64; var ks : array<uint8>; kso : int64) {
+    for (i in range64(4l)) {
+        ks[kso + i] = bytes[bo + i]
+        kq[kqo + 16l + i] = bytes[bo + 4l + i]
+    }
+    for (i in range64(16l)) {
+        kq[kqo + i] = bytes[bo + 8l + i]
+    }
+}
+
+//! Reference dequant of one q51-plane 32-block: w = d * q + m with q = nibble | qh_bit << 4
+//! (elem k reads qh bit k, elem k+16 bit k+16 — the llama.cpp Q5_1 bit map, kept verbatim).
+def dequant_q51_plane_block(kq : array<uint8> | #; kqo : int64; ks : array<uint8> | #; kso : int64; var dst : array<float> | #; doff : int64) {
+    let d = f16_to_f32(rd_u16(ks, kso))
+    let m = f16_to_f32(rd_u16(ks, kso + 2l))
+    let qh = rd_u32(kq, kqo + 16l)
+    for (k in range64(16l)) {
+        let b = int(kq[kqo + k])
+        let h0 = (int(qh >> uint(k)) & 1) << 4
+        let h1 = (int(qh >> uint(k + 16l)) & 1) << 4
+        dst[doff + k] = d * float((b & 15) | h0) + m
+        dst[doff + k + 16l] = d * float((b >> 4) | h1) + m
+    }
+}
+
 // K-quant plane strides (bytes per 256-weight superblock)
 let K4_QSB = 128l
 let K4_SSB = 20l   // kq v2: 16B verbatim disk scale block + 4B pad (repack decodes in place)
@@ -908,6 +1142,10 @@ let K6_QSB = 192l
 let K6_SSB = 18l
 let Q40_QSB = 128l   // q40 tier: 8 x 16 nibble bytes (the k4 pairing, k / k+16 per 32-block)
 let Q40_SSB = 16l    // 8 x f16 d, verbatim disk halfwords
+// q51 tier strides are per 32-block, NOT per superblock: Q5_1 exists precisely for rows that are
+// % 32 but not % 256 (llama.cpp's quantizer fallback), so the planes carry no superblock structure
+let Q51_QB = 20l   // 16 nibble bytes (k / k+16 pairing) + 4 qh bytes, verbatim disk splits
+let Q51_SB = 4l    // d, m f16 halfwords, verbatim
 
 // Raw byte copy via unaligned u64 moves + byte tail — the workhorse of the pointerized transcode
 // loops (uint8 source and destination regions never overlap).
@@ -1079,6 +1317,40 @@ def gguf_transcode_q40(m : GGUFMeta; srcbytes : array<uint8> | #; name : string;
     }
 }
 
+//! Transcode a Q5_1 tensor into the q51 planes (per 32-BLOCK strides 20/4 — see Q51_QB): each
+//! 24B disk block splits into 2B d + 2B m (scale plane) and 16B nibbles + 4B qh (quant plane),
+//! all verbatim. Exact; `eloff`/`src_off`/`expect_n` are element offsets, % 32.
+def gguf_transcode_q51(m : GGUFMeta; srcbytes : array<uint8> | #; name : string; var kq : array<uint8>; var ks : array<uint8>; eloff, expect_n : int64; src_off : int64 = 0l) {
+    let ti = kq_transcode_check(m, name, GGML_TYPE_Q5_1, "Q5_1", src_off, expect_n)
+    let nb = expect_n / 32l
+    if (nb <= 0l) {
+        return
+    }
+    if (eloff % 32l != 0l || src_off % 32l != 0l || expect_n % 32l != 0l) {
+        panic("gguf: tensor '{name}' Q5_1 slice [{src_off}, +{expect_n}) @ {eloff} is not block-aligned")
+    }
+    guard_dst(name, "q51 quant plane", (eloff / 32l) * Q51_QB, nb * Q51_QB, long_length(kq))
+    guard_dst(name, "q51 scale plane", (eloff / 32l) * Q51_SB, nb * Q51_SB, long_length(ks))
+    with_tensor_view(m, srcbytes, ti) $(bytes, tbase) {
+        let bo = tbase + (src_off / 32l) * 24l
+        unsafe {
+            let srcp = addr<uint8 const?>(bytes[bo])
+            var kqp = addr(kq[(eloff / 32l) * Q51_QB])
+            var ksp = addr(ks[(eloff / 32l) * Q51_SB])
+            maybe_parallel_for(0, int(nb), transcode_jobs(nb, 24l)) $(rb, re) {
+                unsafe {
+                    for (blk in range64(int64(rb), int64(re))) {
+                        let src = srcp + blk * 24l
+                        bcopy(ksp + blk * Q51_SB, src, 4l)               // f16 d, f16 m
+                        bcopy(kqp + blk * Q51_QB, src + 8l, 16l)         // nibbles
+                        bcopy(kqp + blk * Q51_QB + 16l, src + 4l, 4l)    // qh
+                    }
+                }
+            }
+        }
+    }
+}
+
 //! Decode tensor `name` (F32 or F16 on disk) into dst[dst_off ..] as fp32. Panics if the
 //! tensor is missing, has a different element count than expected, or uses a type we don't
 //! yet read (quantized types are wired in a later step).
@@ -1186,6 +1458,28 @@ def gguf_read_tensor_f32(m : GGUFMeta; srcbytes : array<uint8> | #; name : strin
             }
             bo += 16l
         }
+    } elif (gtype == GGML_TYPE_Q5_1) {
+        // block of 32: fp16 d + fp16 min m (4 bytes) + 4 bytes of high bits + 16 bytes (split-half
+        // nibbles); x = (nibble | high_bit << 4) * d + m — the min carries the offset, q is unsigned
+        if (src_off % 32l != 0l || expect_n % 32l != 0l) {
+            panic("gguf: tensor '{name}' Q5_1 slice [{src_off}, +{expect_n}) is not block-aligned")
+        }
+        let nb = expect_n / 32l
+        var bo = base + (src_off / 32l) * 24l
+        for (blk in range64(nb)) {
+            let d = f16_to_f32(rd_u16(bytes, bo))
+            let mn = f16_to_f32(rd_u16(bytes, bo + 2l))
+            let qh = rd_u32(bytes, bo + 4l)
+            bo += 8l
+            for (k in range64(16l)) {
+                let b = int(bytes[bo + k])
+                let h0 = (int(qh >> uint(k)) & 1) << 4
+                let h1 = (int(qh >> uint(k + 16l)) & 1) << 4
+                dst[dst_off + blk * 32l + k] = float((b & 15) | h0) * d + mn
+                dst[dst_off + blk * 32l + k + 16l] = float((b >> 4) | h1) * d + mn
+            }
+            bo += 16l
+        }
     } elif (gtype == GGML_TYPE_Q4_K || gtype == GGML_TYPE_Q5_K || gtype == GGML_TYPE_Q6_K) {
         if (src_off % 256l != 0l || expect_n % 256l != 0l) {
             panic("gguf: tensor '{name}' K-quant slice [{src_off}, +{expect_n}) is not superblock-aligned")
@@ -1229,7 +1523,7 @@ def gguf_read_tensor_f32(m : GGUFMeta; srcbytes : array<uint8> | #; name : strin
             bo += 16l
         }
     } else {
-        panic("gguf: tensor '{name}' type {gtype} not supported (have F32/F16/BF16/Q8_0/Q4_0/Q5_0/Q4_K/Q5_K/Q6_K/MXFP4)")
+        panic("gguf: tensor '{name}' type {gtype} not supported (have F32/F16/BF16/Q8_0/Q4_0/Q5_0/Q5_1/Q4_K/Q5_K/Q6_K/MXFP4)")
     }
     }
 }
