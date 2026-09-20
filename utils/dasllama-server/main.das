@@ -4,7 +4,11 @@ options stack = 262144   // the forward chain runs deep under the HTTP tick + C+
 // dasllama-server — an OpenAI-compatible HTTP server over the dasLLAMA facade.
 //
 //   bin/daslang -jit utils/dasllama-server/main.das -- --model <model.gguf> [--port 8080] [--quant q8]
-//                                                       [--asr <asr.bin>] [--mmproj <mmproj.gguf>] [--tune]
+//                                                       [--kv-dtype f16] [--asr <asr.bin>] [--mmproj <mmproj.gguf>]
+//                                                       [--config server.toml] [--tune]
+//
+// --config points at a TOML file whose keys mirror the long flag names (model = "...", port = 8080,
+// kv_dtype = "tq4", ...); explicit CLI flags override it.
 //
 // Then point any OpenAI client at http://127.0.0.1:<port>/v1 (opencode, Open WebUI, the `llm` CLI, …).
 //
@@ -15,16 +19,23 @@ options stack = 262144   // the forward chain runs deep under the HTTP tick + C+
 
 require openai_server           // the server + route handlers (this directory)
 require dasllama/dasllama       // load_model / QuantMode / load_asr_model
+require dasllama/dasllama_math  // set_dispatch_worker_limit (engine-level knob, not re-exported)
 require llvm/daslib/llvm_tune   // [tune_policy] + tune_status (the injected guard resolves here)
 require daslib/clargs
+require daslib/toml
+require daslib/json_boost
+require daslib/module_path
 require daslib/fio
 require math
 
 [CommandLineArgs]
 struct ServerArgs {
-    @clarg_required
+    @clarg_short = "c"
+    @clarg_doc = "TOML config file; keys mirror the long flag names (explicit CLI flags override)"
+    config : string
+
     @clarg_short = "m"
-    @clarg_doc = "Path to the GGUF model to serve"
+    @clarg_doc = "Path to the GGUF model to serve (or model = in --config)"
     model : string
 
     @clarg_short = "p"
@@ -34,6 +45,9 @@ struct ServerArgs {
     @clarg_short = "q"
     @clarg_doc = "Weight quantization: fp32 | q8 | q4 (default q8)"
     quant : string
+
+    @clarg_doc = "KV cache codec: f32 | f16 | q8_0 | tq4 (default f16)"
+    kv_dtype : string
 
     @clarg_short = "a"
     @clarg_doc = "Path to an ASR model — enables /v1/audio/transcriptions"
@@ -48,6 +62,10 @@ struct ServerArgs {
     @clarg_short = "s"
     @clarg_doc = "Max concurrent generation streams (default 4)"
     streams : int
+
+    @clarg_short = "t"
+    @clarg_doc = "Worker-lane cap for the matmul dispatch (default 16; -1 = all cores)"
+    threads : int
 
     @clarg_doc = "Prefill chunk in tokens: decode stalls at most this many per tick (default 64)"
     chunk : int
@@ -68,6 +86,93 @@ struct ServerArgs {
     @clarg_name = "show-help"
     @clarg_doc = "Show this help and exit"
     help : bool
+}
+
+def pick_kv_dtype(s : string) : KVDtype {
+    if (s == "f32") {
+        return KVDtype.f32
+    } elif (s == "q8_0") {
+        return KVDtype.q8_0
+    } elif (s == "tq4") {
+        return KVDtype.tq4
+    } elif (!empty(s) && s != "f16") {
+        to_log(LOG_WARNING, "dasllama-server: unknown --kv-dtype '{s}', using f16 (valid: f32 | f16 | q8_0 | tq4)\n")
+    }
+    return KVDtype.f16
+}
+
+def private cli_has_flag(flag : string) : bool {
+    var args <- get_cli_arguments()
+    let eqform = "{flag}="
+    for (a in args) {
+        if (a == flag || a |> starts_with(eqform)) {
+            delete args
+            return true
+        }
+    }
+    delete args
+    return false
+}
+
+// fill CLI-unset fields (zero / empty / false — the same sentinels the guards below use) from the
+// TOML config, so precedence is defaults < config file < explicit flags
+def apply_config(var cfg : ServerArgs) : bool {
+    let body = fread(cfg.config)
+    if (empty(body)) {
+        to_log(LOG_ERROR, "dasllama-server: cannot read config '{cfg.config}'\n")
+        return false
+    }
+    var terr = ""
+    var root = read_toml(body, terr)
+    if (root == null) {
+        to_log(LOG_ERROR, "dasllama-server: bad TOML in '{cfg.config}': {terr}\n")
+        return false
+    }
+    if (empty(cfg.model)) {
+        cfg.model = root?["model"] ?? ""
+    }
+    if (cfg.port <= 0) {
+        cfg.port = int(root?["port"] ?? 0l)
+    }
+    if (empty(cfg.quant)) {
+        cfg.quant = root?["quant"] ?? ""
+    }
+    if (empty(cfg.kv_dtype)) {
+        cfg.kv_dtype = root?["kv_dtype"] ?? ""
+    }
+    if (empty(cfg.asr)) {
+        cfg.asr = root?["asr"] ?? ""
+    }
+    if (empty(cfg.mmproj)) {
+        cfg.mmproj = root?["mmproj"] ?? ""
+    }
+    if (cfg.ctx <= 0) {
+        cfg.ctx = int(root?["ctx"] ?? 0l)
+    }
+    if (cfg.streams <= 0) {
+        cfg.streams = int(root?["streams"] ?? 0l)
+    }
+    if (cfg.chunk <= 0) {
+        cfg.chunk = int(root?["chunk"] ?? 0l)
+    }
+    if (cfg.page_rows <= 0) {
+        cfg.page_rows = int(root?["page_rows"] ?? 0l)
+    }
+    if (cfg.threads == 0 && !cli_has_flag("--threads")) {
+        cfg.threads = int(root?["threads"] ?? 0l)
+    }
+    // --prefix is the one flag where 0 is a meaningful EXPLICIT value (auto-sizing), so the
+    // zero-sentinel isn't enough: only fill from TOML when the flag is truly absent from argv
+    if (cfg.prefix == 0 && !cli_has_flag("--prefix")) {
+        cfg.prefix = int(root?["prefix"] ?? 0l)
+    }
+    if (!cfg.flat) {
+        cfg.flat = root?["flat"] ?? false
+    }
+    unsafe {
+        delete root
+    }
+    return true
 }
 
 def pick_quant(s : string) : QuantMode {
@@ -97,10 +202,32 @@ def main : int {
         print_help(get_command_info(type<ServerArgs>), "dasllama-server")
         return 1
     }
-    let cfg <- r |> move_unwrap
+    var cfg <- r |> move_unwrap
     if (cfg.help) {
         print_help(get_command_info(type<ServerArgs>), "dasllama-server")
         return 0
+    }
+    if (empty(cfg.config)) {
+        // dictation-bot convention: a same-name config next to the program (or in cwd) loads
+        // automatically, so a release bundle configures itself with no flags at all
+        let here = "dasllama-server.toml"
+        let beside = path_join(get_this_module_dir(), "dasllama-server.toml")
+        if (stat(here).is_valid) {
+            cfg.config = here
+        } elif (stat(beside).is_valid) {
+            cfg.config = beside
+        }
+        if (!empty(cfg.config)) {
+            print("using config {cfg.config}\n")
+        }
+    }
+    if (!empty(cfg.config) && !apply_config(cfg)) {
+        return 1
+    }
+    if (empty(cfg.model)) {
+        print("error: no model — pass --model or set model = in --config\n\n")
+        print_help(get_command_info(type<ServerArgs>), "dasllama-server")
+        return 1
     }
 
     let port = cfg.port > 0 ? cfg.port : 8080     // non-positive (incl. a stray negative) -> default
@@ -109,6 +236,12 @@ def main : int {
     let chunk = cfg.chunk > 0 ? int64(cfg.chunk) : 64l
     let page_rows = cfg.flat ? 0l : (cfg.page_rows > 0 ? int64(cfg.page_rows) : 64l)
     let prefix = int64(cfg.prefix)   // 0 = auto (run_server sizes it), < 0 = unbounded
+    // matmul dispatch lane cap: LLM decode saturates memory bandwidth long before big core
+    // counts, and an uncapped dispatch fights every other process on the box. -1 = all cores.
+    let threads = cfg.threads > 0 ? cfg.threads : (cfg.threads < 0 ? 0 : 16)
+    set_dispatch_worker_limit(threads)
+    let lanes_desc = threads > 0 ? "{threads}" : "all"
+    print("dispatch: {lanes_desc} worker lanes\n")
 
     log_tune_status("dasllama-server")
     print("loading {cfg.model} ...\n")
@@ -122,6 +255,7 @@ def main : int {
         set_asr(a)
     }
 
-    run_server(port, streams, chunk_tokens = chunk, page_rows = page_rows, prefix_groups = prefix)
+    run_server(port, streams, chunk_tokens = chunk, page_rows = page_rows, prefix_groups = prefix,
+        kv_dtype = pick_kv_dtype(cfg.kv_dtype))
     return 0
 }
