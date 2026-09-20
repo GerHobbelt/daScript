@@ -2,7 +2,7 @@ options gen2
 options indenting = 4
 options rtti
 
-require ast
+require daslib/ast
 require daslib/ast_match
 require daslib/ast_boost
 require daslib/templates_boost
@@ -81,6 +81,3 @@ def test_e_in_block(t : T?) {
         t |> equal(string(get_ptr(captured).__rtti), "ExprOp2")
     }
 }
-
-[export]
-def main() {}
