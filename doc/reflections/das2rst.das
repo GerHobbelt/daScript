@@ -326,10 +326,10 @@ def document_module_strings(root : string) {
         hide_group(group_by_regex("Internal builtin functions", mod, %regex~builtin%%)),
         group_by_regex("Character set", mod, %regex~(set_total|set_element|is_char_in_set)$%%),
         group_by_regex("Character groups", mod, %regex~is.+%%),
-        group_by_regex("Character by index", mod, %regex~(character_at|character_uat)$%%),
+        group_by_regex("Character by index", mod, %regex~(character_at|character_uat|first_character)$%%),
         group_by_regex("String properties", mod, %regex~(empty|ends_with|length|starts_with)$%%),
         group_by_regex("String builder", mod, %regex~(build_string|format|write|write_char|write_chars|write_escape_string|build_hash)$%%),
-        group_by_regex("das::string manipulation", mod, %regex~(append|resize)$%%),
+        group_by_regex("das::string manipulation", mod, %regex~(append|resize|with_das_string)$%%),
         group_by_regex("String modifications", mod, %regex~(chop|escape|unescape|repeat|replace|reverse|slice|
 strip|strip_left|strip_right|to_lower|to_lower_in_place|to_upper|to_upper_in_place|rtrim|safe_unescape|ltrim|trim)$%%),
         group_by_regex("Search substrings", mod, %regex~(find|rfind).*%%),
@@ -1204,11 +1204,22 @@ def document_module_stbtruetype(root : string) {
 def document_module_stbimage_ttf(root : string) {
     var mod = find_module("stbimage_ttf")
     var groups <- array<DocGroup>(
-        group_by_regex("Font loading", mod, %regex~(load_ttf)$%%),
-        group_by_regex("Font metrics", mod, %regex~(font_metrics)$%%),
-        group_by_regex("Text rendering", mod, %regex~(render_text)$%%)
+        // Low-level safe wrappers (stbtt_fontinfo)
+        group_by_regex("Low-level initialization", mod, %regex~(stbtt_init|stbtt_num_fonts)$%%),
+        group_by_regex("Low-level scale", mod, %regex~(stbtt_scale_for_pixel_height|stbtt_scale_for_em)$%%),
+        group_by_regex("Low-level metrics", mod, %regex~(stbtt_font_vmetrics|stbtt_font_bbox|stbtt_codepoint_hmetrics|stbtt_codepoint_kern|stbtt_codepoint_box|stbtt_find_glyph)$%%),
+        group_by_regex("Low-level glyph shape", mod, %regex~(stbtt_codepoint_shape|stbtt_codepoint_shape_count)$%%),
+        group_by_regex("Low-level bitmap rendering", mod, %regex~(stbtt_codepoint_bitmap_box|stbtt_codepoint_bitmap_box_subpixel|stbtt_codepoint_bitmap|stbtt_codepoint_bitmap_subpixel|stbtt_make_codepoint_bitmap|stbtt_make_codepoint_bitmap_subpixel)$%%),
+        group_by_regex("Low-level packing", mod, %regex~(stbtt_pack|stbtt_packed_quad)$%%),
+        // Font API (high-level)
+        group_by_regex("Font loading", mod, %regex~^(load_font|load_ttf|is_valid)$%%),
+        group_by_regex("Font scale", mod, %regex~^(scale_for_pixel_height|scale_for_em)$%%),
+        group_by_regex("Font metrics", mod, %regex~^(font_vmetrics|font_metrics|font_bounding_box|codepoint_hmetrics|codepoint_kern|codepoint_box|find_glyph)$%%),
+        group_by_regex("Font glyph shape", mod, %regex~^(codepoint_shape|codepoint_shape_count)$%%),
+        group_by_regex("Font bitmap rendering", mod, %regex~^(codepoint_bitmap_box|codepoint_bitmap_box_subpixel|codepoint_bitmap|codepoint_bitmap_subpixel)$%%),
+        group_by_regex("Text measurement and rendering", mod, %regex~^(measure_text|render_text)$%%)
     )
-    document("High-level TrueType font API (stbimage_ttf)", mod, "stbimage_ttf.rst", groups)
+    document("TrueType font API (stbimage_ttf)", mod, "stbimage_ttf.rst", groups)
 }
 
 [export]

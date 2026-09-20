@@ -45,6 +45,8 @@ Task-specific instructions are in skill files under `skills/`. Read the relevant
 | `skills/daslib_modules.md` | Using `daslib/` modules (linq, json, regex, functional, match, etc.), channels |
 | `skills/das_macros.md` | Writing compile-time macros, AST manipulation, qmacro/quote code generation, smart_ptr ownership |
 | `skills/daspkg.md` | Creating `.das_package` manifests, package structure, daspkg commands |
+| `skills/dynamic_modules.md` | Understanding `.das_module` descriptors, module resolution, `register_native_path`, `register_dynamic_module` |
+| `skills/daslang_live.md` | Working with `daslang-live`, live-reload lifecycle, REST API, `[live_command]`, persistent state |
 
 Multiple skill files may apply to a single task. For example, embedding daslang and calling its standard library requires reading both `skills/cpp_integration.md` and `skills/daslib_modules.md`.
 
@@ -84,6 +86,17 @@ All code MUST use gen2 syntax (add `options gen2` at the top of every file). Key
 - Hex literals are `uint` by default — use `int(0x3F)` for int
 - **`default<T>`** — the default (zero) value of type `T`: `default<int>` is `0`, `default<string>` is `""`, `default<float>` is `0.0f`
 - **`typedecl(expr)`** — compile-time type-of expression, usable inside `default<>`: `default<typedecl(field)>` gives the zero value of `field`'s type. Useful in generic code with `static_if` to compare against defaults.
+- **Bitfield sizes**: `bitfield Name : uint8 { ... }`, `: uint16`, `: uint64`; default is `uint` (32-bit). Always unsigned.
+- **Bitfield from expression**: `bitfield64(1ul << 13ul)` — use the constructor to create a bitfield value from an integer expression. Similarly `bitfield8()`, `bitfield16()`.
+
+### Pass-by-value vs pass-by-reference
+
+- Most types (structs, arrays, tables) always pass by reference — `&` is unnecessary on them
+- Only **workhorse types** (`int`, `float`, `bool`, `string`, etc.) pass by value
+- **`var s : string`** — writable local copy, changes do NOT propagate back to the caller
+- **`var s : string&`** — pass by reference, changes propagate back. Use `&` for string out-parameters
+- **`clone_string(s)`** — clones a string into the current context's heap. Required for cross-context calls where the source context may be destroyed
+- **`:=`** on strings performs a clone (allocates in current context). Plain `=` copies the pointer
 
 ### Memory and move semantics
 
@@ -103,6 +116,7 @@ All code MUST use gen2 syntax (add `options gen2` at the top of every file). Key
 
 - `try/recover` — NOT `try/catch` (`recover` is the keyword)
 - `panic("message")`, `assert(condition)`, `verify(condition)` (stays in release)
+- **Postfix conditional:** `return expr if (cond)`, `break if (cond)`, `continue if (cond)` — early-exit guard on one line
 
 ### Generic function dispatch
 
@@ -144,14 +158,18 @@ All code MUST use gen2 syntax (add `options gen2` at the top of every file). Key
 
 ## SDK Directory Layout
 
-- `bin/` — Compiler binary (`daslang`)
-- `lib/` — Static libraries for C++ embedding
+- `bin/` — Compiler binaries (`daslang`, `daslang-live`, `das-fmt`, `clang-cl`, `sqlite_shell`)
+- `lib/` — Static and shared libraries for C++ embedding
 - `include/daScript/` — C++ headers for embedding
 - `daslib/` — Standard library modules (.das files)
+- `modules/` — Optional plugin modules (dasHV, dasGlfw, dasImgui, dasPUGIXML, etc.)
 - `examples/` — Example scripts
+- `tutorials/` — Language, integration, and module tutorials
 - `dastest/` — Test framework (usable for testing your own code)
-- `utils/mcp/` — MCP server for AI coding assistants (28 tools, stdio transport, no extra deps)
+- `utils/mcp/` — MCP server for AI coding assistants (29 tools, stdio transport, no extra deps)
 - `utils/daspkg/` — Package manager
+- `utils/dascov/` — Code coverage tool
+- `tree-sitter-daslang/` — Tree-sitter grammar, shared library, and highlighting queries
 
 ## Package Manager (daspkg)
 

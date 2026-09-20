@@ -19,6 +19,7 @@ require fio
 require gameplay
 require bot_random
 require bot_greedy
+require bot_lookahead
 require sfx
 
 // --- Chip shader ---
@@ -162,9 +163,14 @@ var @live seq_pulse_speed = 2.0  // speed of sequence highlight pulsing
 var @live seq_pulse_min = 0.7   // minimum brightness of pulse
 var @live seq_card_tint = 0.35  // how strongly sequence cards are tinted with chip color
 var @live bot_delay = 0.5       // seconds between bot moves
+var @live bot_mode = 1          // 0=greedy, 1=lookahead
 var @live anim_chip_duration = 0.25   // chip bounce duration
 var @live anim_remove_duration = 0.3  // chip removal flash duration
 var @live anim_card_duration = 0.3    // card fly duration
+var @live last_drawn_card = Card.card_none  // last card human received (for highlight)
+var @live last_drawn_pulse_speed = 1.5  // pulse speed for last drawn card
+var @live last_drawn_pulse_min = 0.7    // minimum brightness (dimmed)
+var @live last_drawn_pulse_max = 0.9    // maximum brightness
 var @live selected_card = -1      // index of selected card in human hand (-1 = none
 var @live bot_timer = 0.0         // countdown until next bot move
 var @live bot_rng_seed = 12345    // RNG seed for bot moves, incremented each move
@@ -367,7 +373,24 @@ def tick_animations(dt : float) {
             } elif (a.atype == AnimType.chip_remove) {
                 sfx_chip_remove()
             }
+            // Capture the card about to be drawn (top of draw pile)
+            var drawn = Card.card_none
+            if (length(game.draw_pile) > 0) {
+                drawn = game.draw_pile[length(game.draw_pile) - 1]
+            }
             apply_move(game, player, a.deferred_move)
+            // Track last drawn card for human player highlight
+            if (player == 0 && drawn != Card.card_none) {
+                // Check if the drawn card is still in hand (not dead-discarded)
+                var found = false
+                for (ci in range(get_hand_size(game, 0))) {
+                    if (get_hand_card(game, 0, ci) == drawn) {
+                        found = true
+                        break
+                    }
+                }
+                last_drawn_card = found ? drawn : Card.card_none
+            }
             // Check for new sequences or win
             if (game.phase == GamePhase.game_over) {
                 sfx_game_win()
@@ -573,6 +596,7 @@ def handle_mouse() {
                     let is_rj = is_red_jack(card)
                     queue_animated_move(0, m, player_chip_color(0), is_bj, is_rj, hover_row, hover_col)
                     selected_card = -1
+                    last_drawn_card = Card.card_none
                     bot_timer = float(bot_delay)
                 }
             }
@@ -590,7 +614,7 @@ def compute_hand_step_x(cs_w, avail_width : float; max_cards : int) : float {
     }
     // Need: (max_cards - 1) * step + cs_w <= avail_width
     let step = (avail_width - cs_w) / float(max_cards - 1)
-    return min(step, cs_w)  // don't space more than card width
+    return min(step, cs_w) * 0.93  // 7% more overlap
 }
 
 // Draw a player's hand as rows (one per suit), sorted by rank
@@ -638,6 +662,11 @@ def draw_hand_by_suit(player_idx : int; anchor_x, anchor_y : float; scale : floa
                 } else {
                     tint = float4(0.5, 0.5, 0.5, 1.0)
                 }
+            } elif (is_human && last_drawn_card != Card.card_none && card == last_drawn_card) {
+                let t = 0.5 + 0.5 * sin(get_uptime() * float(last_drawn_pulse_speed))
+                let rg = lerp(float(last_drawn_pulse_min), float(last_drawn_pulse_max), t)
+                let b = lerp(float(last_drawn_pulse_min) * 1.2, float(last_drawn_pulse_max), t)
+                tint = float4(rg, rg, b, 1.0)
             }
             if (card_idx >= 0) {
                 draw_card(renderer, deck, card_idx, card_x, card_y, scale, screen_w, screen_h,
@@ -806,6 +835,33 @@ def draw_ui_text(text : string; x, y : int; tint : float3 = float3(1.0)) {
     delete quads
 }
 
+// Draw text vertically, one char per line, going upward from (x, y)
+// Draw text rotated 90° counter-clockwise, centered vertically at (x, y)
+def draw_ui_text_vertical(text : string; x, y : int; tint : float3 = float3(1.0)) {
+    if (!ui_font_loaded) {
+        return
+    }
+    var quads <- ui_font |> create_quads(text)
+    if (empty(quads)) {
+        return
+    }
+    // Get text width to center it (width becomes height after rotation)
+    let dim = quads_dim(quads)
+    let text_width = dim.vmax.x - dim.vmin.x
+    let projection = ortho_rh(0.0, float(screen_w), float(screen_h), 0.0, -1.0, 1.0)
+    // Rotate 90° CCW, then translate. After rotation, text runs bottom-to-top.
+    // Offset by half text width along Y to center vertically.
+    var rot : float4x4
+    rot[0] = float4(0.0, -1.0, 0.0, 0.0)
+    rot[1] = float4(1.0, 0.0, 0.0, 0.0)
+    rot[2] = float4(0.0, 0.0, 1.0, 0.0)
+    rot[3] = float4(0.0, 0.0, 0.0, 1.0)
+    let view = translation(float3(float(x), float(y) + text_width * 0.5, 0.0)) * rot
+    let mvp = projection * view
+    ui_font |> draw_quads(quads, mvp, tint)
+    delete quads
+}
+
 def draw_ui_text_small(text : string; x, y : int; tint : float3 = float3(1.0)) {
     if (!ui_font_loaded) {
         return
@@ -853,14 +909,26 @@ def draw_hud(screen_w, screen_h : int) {
     draw_ui_text("N new", hint_x, hint_y, float3(0.5))
     draw_ui_text("C cheat", hint_x, hint_y + 26, float3(0.5))
     draw_ui_text("2/3/4", hint_x, hint_y + 52, float3(0.5))
+    draw_ui_text("B bot", hint_x, hint_y + 78, float3(0.5))
+    let bot_name = bot_mode == 0 ? "greedy" : "lookahead"
+    draw_ui_text(bot_name, hint_x + 4, hint_y + 100, float3(0.8, 0.8, 0.3))
+    // Jack hints — vertical text, left edge of board, vertically centered
+    let board_mid_y = int(board_oy + float(BOARD_ROWS) * (board_cs_h + board_pad_cur) * 0.5)
+    let jack_x = int(board_ox) - 2
+    draw_ui_text_vertical("red jacks are wild  ~  black jacks remove", jack_x, board_mid_y, float3(0.4))
 }
 
 // --- Keyboard input ---
 
+def game_seed() : int {
+    return int(get_time_usec(0l))
+}
+
 def start_new_game(num_players : int) {
-    make_game(game, num_players, int(get_uptime() * 1000.0))
+    make_game(game, num_players, game_seed())
     sort_hand(game, 0)
     selected_card = -1
+    last_drawn_card = Card.card_none
     bot_timer = float(bot_delay)
     anim_queue |> clear()
 }
@@ -870,6 +938,7 @@ var key_c_was_pressed : bool = false
 var key_2_was_pressed : bool = false
 var key_3_was_pressed : bool = false
 var key_4_was_pressed : bool = false
+var key_b_was_pressed : bool = false
 
 def key_edge(key : int; var was_pressed : bool&) : bool {
     let pressed = glfwGetKey(live_window, key) == int(GLFW_PRESS)
@@ -893,6 +962,9 @@ def handle_keyboard() {
     }
     if (key_edge(int(GLFW_KEY_4), key_4_was_pressed)) {
         start_new_game(4)
+    }
+    if (key_edge(int(GLFW_KEY_B), key_b_was_pressed)) {
+        bot_mode = (bot_mode + 1) % 2
     }
 }
 
@@ -953,7 +1025,7 @@ def init() {
         }
     }
     if (game.phase == GamePhase.not_started) {
-        make_game(game, 2, int(get_uptime() * 1000.0))
+        make_game(game, 2, game_seed())
         sort_hand(game, 0)
         bot_timer = float(bot_delay)
     }
@@ -990,7 +1062,7 @@ def update() {
                 let bot_player = game.current_player
                 queue_discard_anims(bot_player)
                 bot_rng_seed++
-                let m = bot_greedy_move(game, bot_player, bot_rng_seed)
+                let m = bot_mode == 0 ? bot_greedy_move(game, bot_player, bot_rng_seed) : bot_lookahead_move(game, bot_player, bot_rng_seed)
                 if (m.card_idx >= 0) {
                     let card = get_hand_card(game, bot_player, m.card_idx)
                     let is_bj = is_black_jack(card)
@@ -1346,7 +1418,7 @@ def cmd_bot_move(input : JsonValue?) : JsonValue? {
     }
     queue_discard_anims(p)
     bot_rng_seed++
-    let m = bot_greedy_move(game, p, bot_rng_seed)
+    let m = bot_mode == 0 ? bot_greedy_move(game, p, bot_rng_seed) : bot_lookahead_move(game, p, bot_rng_seed)
     if (m.card_idx >= 0) {
         let card_name = card_to_string(get_hand_card(game, p, m.card_idx))
         if (apply_move(game, p, m)) {
