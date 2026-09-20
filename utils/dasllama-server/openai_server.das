@@ -60,22 +60,27 @@ struct ModelSlot {
     backend_effective : string = "cpu"   // arm outcome: cpu | gpu:rails | gpu:resident
     is_default : bool
     last_used : int64
-    sw_count : int64                // P2 gpu-switch telemetry (count / total usec)
+    sw_count : int64                // gpu-switch telemetry (count / total usec)
     sw_us : int64
+    gpu_want : GpuTierWant = GpuTierWant()   // the tier request this slot re-arms with on switch-in
+    gpu_capable : bool              // want is non-zero and backend != cpu (set_slot_gpu_want)
+    gpu_marks : GpuModelMarks <- GpuModelMarks()   // this model's tier routing marks while NOT installed
 }
 
 var g_slots : array<ModelSlot>
 var g_default_slot = 0
-var g_active = 0                // slot the tick loop stepped last (post-P2: the GPU owner)
+var g_active = 0                // slot the tick loop stepped last
 var g_cur = 0                   // slot the request being handled resolved to (handlers are serial)
+var g_gpu_owner = -1            // slot holding the GPU tier's VRAM state (-1 = none)
+var g_marks_slot = -1           // slot whose routing marks are INSTALLED in the engine globals
 
-def private cur_model : Model& {
+def private cur_model : Model & {
     unsafe {
         return g_slots[g_cur].model
     }
 }
 
-def private cur_sched : Scheduler& {
+def private cur_sched : Scheduler & {
     unsafe {
         return g_slots[g_cur].sched
     }
@@ -99,14 +104,17 @@ def private total_queued : int64 {
     return n
 }
 
-// Slot index for a request's "model" field: "" -> the default slot; the exact slot name (or the
-// legacy "{name}-asr" alias) -> that slot; unknown -> -1 (the caller owns the 404).
+// Slot index for a request's "model" field: "" -> the default slot; the exact slot name -> that
+// slot; unknown -> -1 (the caller owns the 404). The legacy "{name}-asr" alias routes to the
+// DEFAULT slot only — that is the only "-asr" id /v1/models ever advertises, so a made-up
+// "{other}-asr" stays a 404 instead of silently serving.
 def private slot_index(model_field : string) : int {
     if (empty(model_field)) {
         return g_default_slot
     }
     for (i in range(length(g_slots))) {
-        if (g_slots[i].name == model_field || "{g_slots[i].name}-asr" == model_field) {
+        if (g_slots[i].name == model_field
+                || (i == g_default_slot && "{g_slots[i].name}-asr" == model_field)) {
             return i
         }
     }
@@ -146,12 +154,24 @@ var private g_started_at = 0l   // ref_time_ticks at init_server; /v1/stats deri
 
 //! Append a loaded model as a serving slot (call once per model, before ``run_server``). ``name``
 //! is the id ``/v1/models`` reports and requests route on via their ``"model"`` field. The first
-//! slot added is the default until an entry with ``opts.backend``/``default`` says otherwise.
+//! slot added is the default until ``set_default_model`` says otherwise.
 def add_model(var m : Model; name : string; opts : SlotOpts = SlotOpts()) {
     var slot <- ModelSlot(name = name, is_default = empty(g_slots))
     slot.model <- m
     slot.opts = opts
+    // the load's arm outcome (routing marks + resident-driver state) belongs to THIS slot:
+    // capture it, so two models' offset-keyed marks never mix. Whichever slot is stepped gets
+    // its set re-installed (install_slot_marks); an armed capture makes this slot the GPU owner.
+    // Attribution reads the CAPTURED marks, not the process-global VRAM counter — that still
+    // holds the previous load's bytes when a later CPU-only slot loads.
+    let was_resident = moe_gpu_resident_active()
+    moe_gpu_model_marks_save(slot.gpu_marks)
+    let was_gpu = was_resident || moe_gpu_marks_armed(slot.gpu_marks.marks)
+    slot.backend_effective = was_resident ? "gpu:resident" : (was_gpu ? "gpu:rails" : "cpu")
     g_slots |> emplace(slot)
+    if (was_gpu) {
+        g_gpu_owner = length(g_slots) - 1
+    }
 }
 
 //! Move a loaded model into the server as the ONLY slot (call once, before run_server). ``name``
@@ -164,7 +184,80 @@ def set_model(var m : Model; name : string) {
     g_default_slot = 0
     g_active = 0
     g_cur = 0
+    g_gpu_owner = -1
+    g_marks_slot = -1
     add_model(m, name)
+}
+
+//! Record the GPU tier want slot `name` re-arms with when the tier switches to it (main.das
+//! passes the same want it set before that slot's load). A zero want or ``backend = "cpu"``
+//! keeps the slot off the device permanently.
+def set_slot_gpu_want(name : string; want : GpuTierWant) {
+    for (s in g_slots) {
+        if (s.name == name) {
+            s.gpu_want = want
+            s.gpu_capable = (s.opts.backend != "cpu"
+                && (want.auto_tier || want.moe_layers != 0l || want.moe_stream != 0l || want.dn
+                    || want.attn || want.dense || want.dnd || want.shexp || want.qkv || want.heat > 0l))
+        }
+    }
+}
+
+// The stepped slot's marks must be the installed ones — swap on change (pure table moves, no
+// device work; this is what keeps gpu<->cpu slot alternation free).
+def private install_slot_marks(si : int) {
+    if (g_marks_slot == si) {
+        return
+    }
+    if (g_marks_slot >= 0 && g_marks_slot < length(g_slots)) {
+        moe_gpu_model_marks_save(g_slots[g_marks_slot].gpu_marks)
+    }
+    moe_gpu_model_marks_restore(g_slots[si].gpu_marks)
+    g_marks_slot = si
+}
+
+// Move the GPU tier's VRAM state to slot `si`: hydrate + drop the current owner's whole state,
+// re-arm `si` from its mmap'd image (the same walk its load ran). Serialized with stepping —
+// only called between scheduler steps.
+def private bind_gpu_slot(si : int) {
+    if (g_gpu_owner == si || !g_slots[si].gpu_capable) {
+        return
+    }
+    let t0 = ref_time_ticks()
+    let prev = g_gpu_owner
+    var prev_note = ""
+    if (prev >= 0) {
+        install_slot_marks(prev)   // the drop acts on the INSTALLED per-model state
+        for (st in g_slots[prev].sched.streams) {   // server flow keeps host KV authoritative; belt-and-braces
+            moe_gpu_hydrate_session(g_slots[prev].model, st.session)
+        }
+        moe_gpu_drop_model()
+        g_slots[prev].backend_effective = "cpu"
+        prev_note = "from {g_slots[prev].name}, "
+    }
+    install_slot_marks(si)
+    set_gpu_tier_want(g_slots[si].gpu_want)
+    moe_gpu_tier_arm()
+    moe_gpu_upload_resident(g_slots[si].model)
+    g_gpu_owner = si
+    let us = int64(get_time_usec(t0))
+    g_slots[si].sw_count ++
+    g_slots[si].sw_us += us
+    g_slots[si].backend_effective = (moe_gpu_resident_active() ? "gpu:resident"
+        : (gpu_tier_status().vram_bytes > 0l ? "gpu:rails" : "cpu"))
+    to_log(LOG_INFO, "dasllama-server: GPU tier -> {g_slots[si].name} ({prev_note}{us / 1000l}ms, {g_slots[si].backend_effective})\n")
+}
+
+// Auto-switch policy: move the tier to a gpu-wanting slot only when the current owner is idle
+// (drain, never preempt — its live streams keep their device speed). gpu<->cpu alternation
+// never lands here: cpu slots are not gpu_capable and never evict the owner.
+def private maybe_bind_gpu(si : int) {
+    if (g_gpu_owner == si || !g_slots[si].gpu_capable
+            || (g_gpu_owner >= 0
+                && (n_active(g_slots[g_gpu_owner].sched) > 0l || n_queued(g_slots[g_gpu_owner].sched) > 0l))) {
+        return
+    }
+    bind_gpu_slot(si)
 }
 
 //! Record a slot's backend arm outcome for the stats/config surfaces (P1: coarse gpu/cpu; the
@@ -180,13 +273,18 @@ def set_slot_backend_effective(name : string; eff : string) {
 //! Mark the default slot (the one serving requests with no ``"model"`` field). No-op on an
 //! unknown name.
 def set_default_model(name : string) {
+    var ni = -1
     for (i in range(length(g_slots))) {
         if (g_slots[i].name == name) {
-            g_default_slot = i
-            g_slots[i].is_default = true
-        } elif (g_slots[i].is_default) {
-            g_slots[i].is_default = false
+            ni = i
         }
+    }
+    if (ni < 0) {
+        return
+    }
+    g_default_slot = ni
+    for (i in range(length(g_slots))) {
+        g_slots[i].is_default = i == ni
     }
 }
 
@@ -1061,7 +1159,9 @@ def private handle_models(var resp : HttpResponse?) : http_status {
     if (g_has_asr && !empty(g_slots)) {
         list.data |> push(OaiModel(id = "{g_slots[g_default_slot].name}-asr", _object = "model", created = created_ts(), owned_by = "dasllama"))
     }
-    return resp |> JSON(sprint_json(list, false), http_status.OK)
+    let body = sprint_json(list, false)
+    delete list
+    return resp |> JSON(body, http_status.OK)
 }
 
 // /v1/embeddings: mean-pooled, L2-normalized sentence embeddings over the facade `embed` verb.
@@ -1081,6 +1181,7 @@ def private handle_embeddings(var req : HttpRequest?; var resp : HttpResponse?) 
         return resp_error(resp, http_status.NOT_FOUND, "model '{want_model}' not found — GET /v1/models lists the served ids")
     }
     g_cur = mi
+    install_slot_marks(mi)   // this handler evals IN-handler — the embed forward needs ITS marks
     let iv = js?["input"]
     if (iv == null) {
         return resp_error(resp, http_status.BAD_REQUEST, "'input' is required (a string or array of strings)")
@@ -1111,7 +1212,56 @@ def private handle_embeddings(var req : HttpRequest?; var resp : HttpResponse?) 
         idx ++
     }
     out.usage = OaiEmbUsage(prompt_tokens = prompt_tokens, total_tokens = prompt_tokens)
-    return resp |> JSON(sprint_json(out, false), http_status.OK)
+    let body = sprint_json(out, false)
+    delete out
+    delete inputs
+    return resp |> JSON(body, http_status.OK)
+}
+
+// POST /v1/models/activate {"model": name}: admin warm-switch — make `name` the stepped slot
+// and move the GPU tier to it NOW instead of waiting for the owner to drain. 409 while any
+// work is live: the switch drops the owner's whole VRAM state.
+def private handle_activate(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+    var perr = ""
+    var js = read_json(string(req.body), perr)
+    if (js == null) {
+        return resp_error(resp, http_status.BAD_REQUEST, "invalid JSON: {perr}")
+    }
+    defer() {
+        unsafe {
+            delete js
+        }
+    }
+    let want = js?["model"] ?? ""
+    if (empty(want)) {
+        // an admin switch has one required parameter — silently activating the default slot on
+        // a malformed body would hide the client bug behind a real VRAM-state switch
+        return resp |> JSON(
+            error_body("'model' is required — GET /v1/models lists the served ids", "invalid_request_error"),
+            http_status.BAD_REQUEST)
+    }
+    let mi = slot_index(want)
+    if (mi < 0) {
+        return resp |> JSON(
+            error_body("model '{want}' not found — GET /v1/models lists the served ids", "model_not_found"),
+            http_status.NOT_FOUND)
+    }
+    if (total_active() > 0l || total_queued() > 0l || g_asr_pending > 0) {
+        return resp |> JSON(
+            error_body("streams are live (active {total_active()}, queued {total_queued()}) — retry when idle", "busy"),
+            http_status.CONFLICT)
+    }
+    let t0 = ref_time_ticks()
+    g_active = mi
+    g_cur = mi
+    set_mtp_spec(g_slots[mi].sched.mtp)
+    install_slot_marks(mi)
+    bind_gpu_slot(mi)   // no-op for cpu slots and the current owner
+    g_slots[mi].last_used = ref_time_ticks()
+    let sw_ms = int64(get_time_usec(t0)) / 1000l
+    return resp |> JSON(
+        "\{\"ok\":true,\"model\":{json_str(g_slots[mi].name)},\"backend_effective\":{json_str(g_slots[mi].backend_effective)},\"switch_ms\":{sw_ms}}",
+        http_status.OK)
 }
 
 // Resolve a streaming request's "model" field to a slot (sets g_cur). False = unknown model —
@@ -1594,7 +1744,8 @@ def private flush_events(srv : WebSocketServer) {
 struct private OaiSlotStats {
     name : string
     is_default : bool
-    is_active : bool          // the slot the tick loop is stepping (post-P2: the GPU owner)
+    is_active : bool          // the slot the tick loop is stepping
+    holds_gpu : bool          // the slot whose VRAM state is armed (the GPU owner)
     backend : string          // requested: auto | cpu | gpu
     backend_effective : string
     ctx : int64
@@ -1646,12 +1797,18 @@ struct private OaiStatsResponse {
     kv_bytes : int64
     heap_bytes : int64
     string_heap_bytes : int64
+    gpu_vram_bytes : int64    // resident weight bytes on the device (0 = no tier / nothing resident)
+    gpu_budget_bytes : int64  // the tier's weight cap — the page's VRAM bar denominator
     hardware : string
     asr_done_jobs : int64
     asr_audio_s : float
 }
 
 def private handle_stats(var resp : HttpResponse?) : http_status {
+    // budget only when the device already EXISTS (tier.device is "" until first upload creates
+    // it) — the budget hook device-inits on first call, and `supported` can read true while the
+    // tier is merely armed, so it must not gate this
+    let tier = gpu_tier_status()
     var out = OaiStatsResponse(
         model = g_slots[g_active].name, active_model = g_slots[g_active].name,
         ctx = g_slots[g_active].model.config.seq_len,
@@ -1677,6 +1834,8 @@ def private handle_stats(var resp : HttpResponse?) : http_status {
         kv_bytes = kv_pool_bytes(g_slots[g_active].sched.pool),
         heap_bytes = int64(heap_bytes_allocated()),
         string_heap_bytes = int64(string_heap_bytes_allocated()),
+        gpu_vram_bytes = tier.vram_bytes,
+        gpu_budget_bytes = !empty(tier.device) ? moe_gpu_weight_budget() : 0l,
         hardware = g_hardware_line,
         asr_done_jobs = g_asr_done_jobs, asr_audio_s = g_asr_audio_s)
     out.models |> reserve(length(g_slots))
@@ -1684,6 +1843,7 @@ def private handle_stats(var resp : HttpResponse?) : http_status {
         var s & = unsafe(g_slots[i])
         out.models |> push(OaiSlotStats(
             name = s.name, is_default = s.is_default, is_active = i == g_active,
+            holds_gpu = i == g_gpu_owner,
             backend = s.opts.backend, backend_effective = s.backend_effective,
             ctx = s.model.config.seq_len,
             active = n_active(s.sched), queued = n_queued(s.sched),
@@ -1755,7 +1915,13 @@ def private age_seconds(t : int64) : float {
 }
 
 def private handle_streams(var resp : HttpResponse?) : http_status {
-    var out = OaiStreamsResponse(max_streams = g_slots[g_active].sched.max_streams)
+    // the stream list below aggregates every slot, so the lane capacity the page sizes its
+    // swimlane from must be the cross-slot total, not the active slot's own cap
+    var total_cap = 0l
+    for (slot in g_slots) {
+        total_cap += slot.sched.max_streams
+    }
+    var out = OaiStreamsResponse(max_streams = total_cap)
     for (slot in g_slots) {
         var sch & = unsafe(slot.sched)
         let mname = slot.name
@@ -2393,6 +2559,9 @@ class OpenAiServer : HvWebServer {
             }
             return handle_embeddings(req, resp)
         }
+        POST("/v1/models/activate") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            return handle_activate(req, resp)
+        }
         GET("/v1/stats") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             return handle_stats(resp)
         }
@@ -2570,7 +2739,8 @@ def update_server() : bool {
     drain_bench_events()
     reap_disconnected(g_server.server)
     // serialized multi-model stepping: ONE scheduler step per tick, slots with work interleave
-    // round-robin. Switching the stepped slot is free in P1 (P2 hangs the GPU rebind here).
+    // round-robin. Every step runs under ITS model's routing marks; the GPU tier follows a
+    // gpu-wanting slot once the current owner drains.
     let si = pick_step_slot()
     var busy = false
     if (si >= 0) {
@@ -2578,6 +2748,8 @@ def update_server() : bool {
             g_active = si
             set_mtp_spec(g_slots[si].sched.mtp)   // the engine prefill-warm gate follows the stepped slot
         }
+        install_slot_marks(si)
+        maybe_bind_gpu(si)
         let t_step = ref_time_ticks()
         busy = scheduler_step(g_slots[si].model, g_slots[si].sched, g_events)
         let step_ms = int64(get_time_usec(t_step)) / 1000l
@@ -2616,6 +2788,16 @@ def shutdown_server() {
         }
         g_server = null
     }
+    // clean tier epoch: drop the owner's VRAM state and leave the engine globals bare, so a
+    // same-context restart (tests) starts from an unarmed device with no stale marks
+    if (g_gpu_owner >= 0 && g_gpu_owner < length(g_slots)) {
+        install_slot_marks(g_gpu_owner)
+        moe_gpu_drop_model()
+    } elif (g_marks_slot >= 0 && g_marks_slot < length(g_slots)) {
+        moe_gpu_model_marks_save(g_slots[g_marks_slot].gpu_marks)
+    }
+    g_gpu_owner = -1
+    g_marks_slot = -1
     unsafe {
         delete g_slots   // per slot: live sessions + workspace + the model go together (writers already died with the server)
     }
