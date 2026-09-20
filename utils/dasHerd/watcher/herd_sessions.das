@@ -186,8 +186,20 @@ def private save_registry : string {
     if (!mkdir_rec(dir_name(g_registry_path), error)) {
         return "could not create herd registry directory: {error}"
     }
-    if (!fwrite(g_registry_path, sprint_json(file, true))) {
-        return "could not write {g_registry_path}"
+    // Durability boundary: never overwrite the registry in place — a kill or
+    // full disk mid-write must not truncate it. Write the temp fully, then
+    // swap (remove + rename; Windows _wrename cannot replace). A crash leaves
+    // either file COMPLETE, and herd_init recovers the temp when only the
+    // swap was cut.
+    let temp_path = "{g_registry_path}.tmp"
+    if (!fwrite(temp_path, sprint_json(file, true))) {
+        return "could not write {temp_path}"
+    }
+    if (fexist(g_registry_path) && !remove(g_registry_path)) {
+        return "could not replace {g_registry_path}"
+    }
+    if (!rename(temp_path, g_registry_path)) {
+        return "could not swap {temp_path} into place"
     }
     return ""
 }
@@ -198,6 +210,14 @@ def public herd_init(registry_path, profiles_path : string) : string {
     delete g_herd
     g_next_herd_id = 0
     g_herd_revision++
+    if (!fexist(registry_path)) {
+        // A crash between save_registry's remove and rename leaves only the
+        // completed temp — adopt it.
+        let temp_path = "{registry_path}.tmp"
+        if (fexist(temp_path)) {
+            let _ = rename(temp_path, registry_path)
+        }
+    }
     if (!fexist(registry_path)) return ""
     var inscope file = HerdRegistryFile()
     if (!sscan_json(fread(registry_path), file)) return "invalid herd registry JSON"
@@ -205,15 +225,21 @@ def public herd_init(registry_path, profiles_path : string) : string {
         return "unsupported herd registry version {file.version}"
     }
     g_next_herd_id = file.next_id
-    // The watcher owns every PTY, so none of them survived the restart.
+    // In-process PTYs never survive a restart; host-backed ones do when their
+    // detached host was re-attached (watcher_adopt_hosts runs before this).
     var orphaned = 0
     var healed = 0
     for (record in file.sessions) {
         if (record.state == "running") {
-            record.state = "exited"
-            record.reason = "watcher_restart"
-            record.updated_wall_s = wall_seconds()
-            orphaned++
+            var info = WatcherSessionInfo()
+            let adopted = (watcher_get_session_info(record.pty_session_id, info)
+                && info.state == "running")
+            if (!adopted) {
+                record.state = "exited"
+                record.reason = "watcher_restart"
+                record.updated_wall_s = wall_seconds()
+                orphaned++
+            }
         }
         // Heal records saved before path spellings were canonicalized.
         let display_path = herd_display_worktree(record.worktree_path)
@@ -451,6 +477,40 @@ def public herd_close(herd_id : string; var pty_to_terminate : string&) : string
     g_herd[index].updated_wall_s = wall_seconds()
     g_herd_revision++
     return save_registry()
+}
+
+def public herd_delete(herd_id : string; var removed : HerdSession) : string {
+    //! Removes the record entirely (unlike herd_close, which keeps it as
+    //! history). The caller gets the removed record so it can attempt guarded
+    //! removal of the session's worktrees. Running sessions never delete.
+    let index = herd_find(herd_id)
+    if (index < 0) return "unknown herd session"
+    if (g_herd[index].state == "running") {
+        return "session is running; close it before deleting"
+    }
+    removed := g_herd[index]
+    g_herd |> erase(index)
+    g_herd_revision++
+    return save_registry()
+}
+
+def public herd_worktree_user(worktree_path : string; exclude_herd_id : string = "") : string {
+    //! Name of a non-closed session attending this worktree (primary or
+    //! satellite), or "" when the worktree is free. Drives the hard block on
+    //! worktree deletion.
+    let canonical = herd_canonical_worktree(worktree_path)
+    for (record in g_herd) {
+        if (record.id == exclude_herd_id || record.state == "closed") continue
+        if (herd_canonical_worktree(record.worktree_path) == canonical) {
+            return record.name
+        }
+        for (entry in record.satellites) {
+            if (herd_canonical_worktree(entry.worktree_path) == canonical) {
+                return record.name
+            }
+        }
+    }
+    return ""
 }
 
 def public herd_rename(herd_id, name : string) : string {

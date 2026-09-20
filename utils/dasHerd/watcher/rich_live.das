@@ -135,7 +135,8 @@ def herder_client_state(_input : JsonValue?) : JsonValue? {
         session_count = length(g_client.sessions),
         repository_count = length(g_client.repositories),
         selected_repository_id = g_selected_repository_id,
-        selected_worktree_path = g_selected_worktree_path))
+        selected_worktree_path = g_selected_worktree_path,
+        selection_explicit = g_selection_explicit))
 }
 
 [live_command(description = "Restore the rich client's default dock layout.")]
@@ -234,7 +235,7 @@ def herder_perf_state(input : JsonValue?) : JsonValue? {
 [live_command(description = "Open the New Session launcher pane seeded from the current selection.")]
 def herder_open_launcher(_input : JsonValue?) : JsonValue? {
     prepare_launcher(g_selected_repository_id, g_selected_worktree_path)
-    open_dock_window(LAUNCHER_WIN)
+    open_launcher_modal()
     return JV((ok = true, repository_id = g_selected_repository_id,
         worktree_path = g_selected_worktree_path))
 }
@@ -255,7 +256,7 @@ def herder_herd_state(_input : JsonValue?) : JsonValue? {
             exit_code = record.exit_code, launch_count = record.launch_count,
             satellite_count = length(record.satellites)))]
     var result = JV((ok = true, revision = g_client.herd_revision,
-        launcher_open = LAUNCHER_WIN.open,
+        launcher_open = launcher_modal_open(),
         profiles = profiles, sessions = records))
     return result
 }
@@ -306,6 +307,26 @@ struct HerderTerminalInputArgs {
     expect_session : string
 }
 
+// A second say inside the prior say's ~200ms Enter window would merge both
+// texts into one paste (single global submit slot). Queue it; the frame loop
+// feeds the queue only after the pending \r has flushed.
+def private queue_or_send_input(text : string; submit : bool) {
+    if (g_submit_stamp != 0l || !empty(g_input_queue)) {
+        g_input_queue |> push(PendingSay(text = clone_string(text), submit = submit,
+            session = clone_string(g_client.selected_id)))
+        return
+    }
+    if (!empty(text)) {
+        g_client->send_input(text)
+        if (submit) {
+            g_submit_stamp = ref_time_ticks()
+            g_submit_session = g_client.selected_id
+        }
+    } elif (submit) {
+        g_client->send_input("\r")
+    }
+}
+
 [live_command(description = "Type into the attached session's terminal. Args: text, submit (true appends Enter), optional expect_session (reject if another session is attached). Requires the controller lease.")]
 def herder_terminal_input(input : JsonValue?) : JsonValue? {
     if (g_client == null || !g_client.connected) {
@@ -328,15 +349,7 @@ def herder_terminal_input(input : JsonValue?) : JsonValue? {
     // The Enter must arrive OUTSIDE the text's paste window or Ink-based TUIs
     // (Claude Code) keep it as part of the paste: text now, \r deferred ~200ms
     // via the frame loop. A lone submit (empty text) sends immediately.
-    if (!empty(args.text)) {
-        g_client->send_input(args.text)
-        if (args.submit) {
-            g_submit_stamp = ref_time_ticks()
-            g_submit_session = g_client.selected_id
-        }
-    } elif (args.submit) {
-        g_client->send_input("\r")
-    }
+    queue_or_send_input(args.text, args.submit)
     return JV((ok = true, bytes = length(args.text) + (args.submit ? 1 : 0),
         session_id = g_client.selected_id))
 }
@@ -427,9 +440,7 @@ def herder_session_say(input : JsonValue?) : JsonValue? {
     delete g_say_baseline
     g_say_baseline <- split(g_terminal_view.screen_text, "\n")
     g_say_revision = g_terminal_view.content_revision
-    g_client->send_input(args.text)
-    g_submit_stamp = ref_time_ticks()
-    g_submit_session = g_client.selected_id
+    queue_or_send_input(args.text, true)
     return JV((ok = true, session_id = g_client.selected_id,
         baseline_revision = g_say_revision))
 }
@@ -498,6 +509,7 @@ def herder_git_select_worktree(input : JsonValue?) : JsonValue? {
             if (worktree.path != args.worktree_path) continue
             g_selected_repository_id = args.repository_id
             g_selected_worktree_path = args.worktree_path
+            g_selection_explicit = true
             g_requested_history_commit = ""
             g_client->refresh_repository(args.repository_id)
             g_client->request_repository_review(
@@ -1068,7 +1080,7 @@ var SHORTCUT_CONFLICT : table<int; NarrativeState>
 def private draw_shortcuts_tab() {
     if (!empty(g_command_registry.capture_command_id)) {
         text_colored(SHORTCUT_CAPTURE_TEXT,
-            (color = float4(0.97f, 0.76f, 0.28f, 1.0f),
+            (color = token_warning_color(),
                 text = "Press the new shortcut (Escape cancels)"))
     } elif (!empty(g_command_registry.status)) {
         text_disabled(SHORTCUT_STATUS_TEXT, (text = g_command_registry.status))
@@ -1107,7 +1119,7 @@ def private draw_shortcuts_tab() {
             if (!empty(conflict)) {
                 same_line(SHORTCUT_CONFLICT_JOIN[index])
                 text_colored(SHORTCUT_CONFLICT[index],
-                    (color = float4(1.0f, 0.45f, 0.25f, 1.0f),
+                    (color = token_error_color(),
                         text = "conflicts with {conflict}"))
             }
         }

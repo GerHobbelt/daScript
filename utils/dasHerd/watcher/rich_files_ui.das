@@ -40,6 +40,9 @@ struct private ProjectNode {
     // A nested git repository (git lists it as one "dir/" entry) — its
     // contents are invisible to this repository's file listing.
     external : bool
+    // Portal listing already ran; empty children can't stand in for this
+    // (an empty dir would re-run dir() every frame while expanded).
+    populated : bool
     stat_size : int64
     stat_mtime : int64
     children : array<int>
@@ -211,8 +214,8 @@ def private ensure_project_model() {
 def private project_name_color(node : ProjectNode const) : uint {
     let alpha = node.hidden ? 0.55f : 1.0f
     return (node.is_folder
-        ? GetColorU32(float4(0.43f, 0.64f, 0.82f, alpha))
-        : GetColorU32(float4(0.90f, 0.91f, 0.93f, alpha)))
+        ? GetColorU32(token_path_dir_color(alpha))
+        : GetColorU32(token_path_name_color(alpha)))
 }
 
 def private project_size_label(size : int64) : string {
@@ -236,12 +239,15 @@ def private decorate_project_row(node : ProjectNode const;
                                  name_position : float2) {
     let row_max = GetItemRectMax()
     let row_right = git_visible_row_right(row_max.x)
-    let dirty_color = GetColorU32(float4(0.97f, 0.76f, 0.28f, 1.0f))
+    let dirty_color = GetColorU32(token_warning_color())
     with_window_drawlist() $(var dl) {
         let name_text = node.name + (node.is_folder ? "/" : "")
         dl |> add_text(name_position, project_name_color(node), name_text)
         var marker_x = name_position.x + CalcTextSize(name_text).x + 4.0f
-        if (node.external) {
+        // Tag only a portal ROOT — every folder inside stays external for
+        // recursive listing, but repeating the tag would be noise.
+        if (node.external && node.parent >= 0
+                && !g_project_nodes[node.parent].external) {
             let repo_tag = "(repo)"
             dl |> add_text(float2(marker_x, name_position.y),
                 GetColorU32(ImGuiCol.TextDisabled), repo_tag)
@@ -305,6 +311,63 @@ def private draw_project_row(var row : int&; node_index, depth : int) : bool {
     return clicked
 }
 
+// Note 37: a nested repository is one opaque "dir/" entry in the parent's
+// listing. Expanding it lists the filesystem directly — a local portal into
+// its contents. Folder children stay external so the portal recurses; .git
+// stays out of the tree.
+def private populate_external_folder(node_index : int) {
+    g_project_nodes[node_index].populated = true
+    var inscope names : array<string>
+    names |> reserve(32)
+    {
+        let full = path_join(g_selected_worktree_path,
+            g_project_nodes[node_index].path)
+        dir(full) $(name) {
+            if (name != "." && name != ".." && name != ".git") {
+                names |> push(clone_string(name))
+            }
+        }
+    }
+    g_project_nodes[node_index].children |> reserve(length(names))
+    for (name in names) {
+        let child_path = "{g_project_nodes[node_index].path}/{name}"
+        let st = stat(path_join(g_selected_worktree_path, child_path))
+        let is_dir = st.is_valid && st.is_dir
+        let child_index = length(g_project_nodes)
+        g_project_nodes |> emplace(ProjectNode(name = name, path = child_path,
+            parent = node_index, is_folder = is_dir,
+            hidden = starts_with(name, "."), external = is_dir,
+            stat_size = (st.is_valid && !is_dir ? int64(st.size) : 0l),
+            stat_mtime = (st.is_valid ? int64(st.mtime) : 0l)))
+        g_project_index[child_path] = child_index
+        g_project_nodes[node_index].children |> push(child_index)
+    }
+    var order := g_project_nodes[node_index].children
+    sort(order) $(a, b) => project_child_before(a, b)
+    g_project_nodes[node_index].children <- order
+    // Aggregate the discovered stats up the ancestor chain and re-sort each
+    // level, so Largest/Newest order the portal by its real contents. Runs
+    // once per portal level (the populated flag gates re-entry).
+    var added_size = 0l
+    var newest = 0l
+    for (child in g_project_nodes[node_index].children) {
+        added_size += g_project_nodes[child].stat_size
+        newest = max(newest, g_project_nodes[child].stat_mtime)
+    }
+    var parent = node_index
+    while (parent >= 0) {
+        g_project_nodes[parent].stat_size += added_size
+        g_project_nodes[parent].stat_mtime = max(
+            g_project_nodes[parent].stat_mtime, newest)
+        if (parent != node_index && !empty(g_project_nodes[parent].children)) {
+            var sibling_order := g_project_nodes[parent].children
+            sort(sibling_order) $(a, b) => project_child_before(a, b)
+            g_project_nodes[parent].children <- sibling_order
+        }
+        parent = g_project_nodes[parent].parent
+    }
+}
+
 def private draw_project_tree() {
     var row = 0
     // Explicit stack: (node, depth) pairs, children pushed in reverse so the
@@ -332,6 +395,10 @@ def private draw_project_tree() {
             }
         }
         if (is_folder && expanded) {
+            if (g_project_nodes[node_index].external
+                    && !g_project_nodes[node_index].populated) {
+                populate_external_folder(node_index)
+            }
             let children & = unsafe(g_project_nodes[node_index].children)
             for (index in range(length(children))) {
                 stack |> push(children[length(children) - 1 - index] => depth + 1)
@@ -339,7 +406,15 @@ def private draw_project_tree() {
         }
     }
     if (row == 0 && !g_worktree_files_loading) {
-        text_disabled("Select a worktree to browse its files")
+        // Say what is actually missing (note 48): selection, a failed
+        // listing, and an empty tree are three different states.
+        if (empty(g_selected_worktree_path)) {
+            text_disabled("Select a worktree to browse its files")
+        } elif (!empty(g_worktree_files_error)) {
+            text_disabled("File list failed: {g_worktree_files_error}")
+        } else {
+            text_disabled("No files listed - Refresh re-reads the worktree")
+        }
     }
 }
 

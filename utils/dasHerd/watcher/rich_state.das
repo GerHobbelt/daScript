@@ -21,6 +21,7 @@ require daslib/json_boost
 require daslib/jobque_boost
 require daslib/strings_boost
 require live/live_commands
+require ./rich_tokens.das public
 require ./watcher_core.das
 require ./repository_core.das
 require ./herd_sessions.das
@@ -77,6 +78,29 @@ struct WatcherHerdLaunchedMessage {
     @rename = "type" _type : string
     herd_session_id : string
     session_id : string
+}
+
+struct WatcherWorktreeDeleteResult {
+    @rename = "type" _type : string
+    ok : bool
+    reason : string
+    detail : string
+    repository_id : string
+    worktree_path : string
+}
+
+struct WatcherHerdDeleteKept {
+    path : string
+    repository_id : string
+    reason : string
+    detail : string
+}
+
+struct WatcherHerdDeleteResult {
+    @rename = "type" _type : string
+    herd_session_id : string
+    removed : array<string>
+    kept : array<WatcherHerdDeleteKept>
 }
 
 struct WatcherMailboxMessageEnvelope {
@@ -391,6 +415,27 @@ var g_selected_worktree_path : string
 
 var g_selected_repository_id : string
 
+// True once the selection came from a deliberate pick (worktree row click,
+// focus-target navigation, select rail) rather than a seed or auto-aim.
+// Note-9 policy: attaches may re-aim only while the selection is not explicit.
+var g_selection_explicit : bool
+
+// Cross-module window-raise request (same pattern as g_open_terminal_pending):
+// surfaces that can't see SESSIONS_WIN set this; rich_client's frame loop acts.
+var g_open_sessions_pending : bool
+
+// Output-age tracking (note 29): wall time of the last observed output_bytes
+// delta per session. Only a witnessed CHANGE records a time — the first
+// sighting after connect proves nothing about freshness.
+var g_session_output_seen : table<string; int64>
+var g_session_output_wall : table<string; int64>
+
+// Client error ring (note 28): the menu chrome shows only the latest error;
+// dismissed ones land here (newest last, capped).
+var g_error_history : array<string>
+var g_error_history_wall : array<int64>
+var g_last_seen_error : string
+
 var g_agent_source_worktree_path : string
 
 var g_agent_source_repository_id : string
@@ -476,6 +521,33 @@ def settings_load() {
 // lone \r once ~200ms have passed.
 var g_submit_stamp : int64
 var g_submit_session : string
+
+// Say requests that arrive while an Enter is still pending: sending their text
+// immediately would merge it into the prior paste and garble both commands, so
+// they wait here until the frame loop flushes the pending \r.
+struct PendingSay {
+    text : string
+    submit : bool
+    session : string
+}
+var g_input_queue : array<PendingSay>
+
+// A blocked worktree delete (in_use / dirty / main / error). The frame loop
+// opens the block modal when active; "dirty" adds the offer to launch a
+// resolver session briefed with the blocking state.
+struct WorktreeDeleteBlock {
+    active : bool
+    repository_id : string
+    worktree_path : string
+    reason : string
+    detail : string
+}
+var g_worktree_delete_block = WorktreeDeleteBlock()
+
+// Deferred launcher open for the resolver offer: open_popup from inside the
+// block modal would nest the launcher under the popup being closed, so the
+// button preps the launcher fields and the frame loop opens it at root level.
+var g_launch_resolver_pending = false
 
 // Real-input forensics: per-frame counters of wheel/click events that reached
 // ImGui IO. With user control locked these must stay flat — a moving counter
@@ -776,9 +848,9 @@ def git_visible_row_right(row_right : float) : float {
 def draw_git_path_text(path : string; p0, p1 : float2;
                        subdued : bool) {
     let alpha = subdued ? 0.55f : 1.0f
-    let directory_color = GetColorU32(float4(0.43f, 0.64f, 0.82f, alpha))
-    let separator_color = GetColorU32(float4(0.78f, 0.55f, 0.30f, alpha))
-    let name_color = GetColorU32(float4(0.90f, 0.91f, 0.93f, alpha))
+    let directory_color = GetColorU32(token_path_dir_color(alpha))
+    let separator_color = GetColorU32(token_path_sep_color(alpha))
+    let name_color = GetColorU32(token_path_name_color(alpha))
     var inscope components <- split(replace(path, "\\", "/"), "/")
     var position = p0
     with_window_drawlist() $(var dl) {

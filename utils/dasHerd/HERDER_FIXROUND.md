@@ -286,16 +286,56 @@ widget already counted). Also learned: set_user_control(false)
 detaches the GLFW layer imgui_click itself injects through — use the
 imgui_mouse_* bypass commands while input is detached.
 
+39. (Boris, end of round) Opening a portal (nested-repo) file from the
+    Project view in sticky Diff mode shows a SILENT EMPTY inspector —
+    reads as stuck. Forensics (live, while stuck): the app was fine
+    (frames advancing); diff_row_count/old/new byte counts all 0 with
+    prepare_outcome "ready", status "" — the parent repo's git cannot
+    diff a nested-repo file, and nothing says so. The VIEW side had
+    prepared fine (13.7KB). Fix shape for the review round: portal
+    files force View mode (or the diff pane states "file belongs to a
+    nested repository — no diff against the parent") — pairs with the
+    registered-repo synthesis follow-up under note 37.
+
 ## Wave 3 — surface reworks (each needs a short design pass)
 
-- 3+11+5 launcher: modal dialog, explicit run-here vs create-new,
-  claimed-worktree awareness (ties to conflict advisory).
-- 7+19+26+28+29 sessions panel: session subtree (terminal link,
-  attention, bundles, errors as children), no zero-count sections,
-  needs-me + output-age signals (watcher activity telemetry).
+- DONE 3+11+5 launcher (11/5 landed earlier; 3 on 2026-07-25): the
+  launcher is now a true MODAL dialog — popup_modal centers it, dims
+  the whole UI, and blocks input to everything behind (note 3's exact
+  ask); Escape or the X dismisses; a successful Launch closes it via
+  close_current_popup. LAUNCHER_WIN is gone; all openers (menus, the
+  session.new command, worktree context menu, herder_open_launcher
+  rail) route through open_launcher_modal, and herder_herd_state's
+  launcher_open now reads the modal. Claimed-worktree awareness stays
+  covered by the conflict icon/advisory from the earlier rounds.
+  Live-verified: rail-opened modal renders centered over a dimmed,
+  input-blocked UI.
+- MOSTLY DONE 7+19+28+29 sessions panel (2026-07-25): each herd card
+  now carries its own Attention (N) / Review bundles (N) children
+  (mailbox/bundle session_id joined to the card's pty_session_id via
+  shared row renderers with frame-global widget indices); the global
+  sections render only UNOWNED items and only when non-empty — the
+  perpetual "(0)" sections are gone. Cards show "output <age>" from
+  client-witnessed output_bytes deltas beside the registry age (29).
+  A client-side error ring (note 28, cap 20) keeps every error
+  transition the chrome dismissed, shown as an Errors (N) section
+  with clear, hidden while empty. Verified live: zero-count sections
+  vanished, panel clean; per-card children reuse the verified
+  fallback renderers and light up with live agent data. REMAINING 26:
+  "agent needs me" (blocked-at-prompt) needs watcher-side terminal
+  heuristics — pairs with the note-25 multiple-terminals work.
 - 8+4a terminal: watcher-side scrollback retention → client viewport,
   wheel scroll, then the color/palette fix (after 30b makes it
   provable). Search lands here too (13).
+  - 13 FIRST SLICE DONE (2026-07-25): File Inspector View mode has
+    find — case-insensitive, incremental (rebuilds per keystroke),
+    prev/next with wraparound, "N of M" counter, amber "no matches";
+    jumps reuse the focus-scroll rail (row * line_height). Verified
+    live: "th" in rich_state.das → "1 of 154" scrolled exactly to
+    "require math"; next → "2 of 154" deep-jump. Diff-mode search
+    deferred: the aligned panes need a text-line -> display-row map
+    before jumps can land right. Terminal + history search still open
+    with the scrollback work.
 - DONE 16 project view (2026-07-25): cached tree model; folder/file/
   hidden color tiers; dirty * propagating up folders from repository
   status; four sort modes cycling on a header button (stat-backed
@@ -303,19 +343,70 @@ imgui_mouse_* bypass commands while input is detached.
   columns; name filter + include-subfolders flat results. Verified
   live: 8439-file model, 21 dirty nodes on exactly the changed chains,
   filter and sort driven through the rails.
-- 18 repositories readability; 20 token color language (one shared
-  palette module feeds 18/20/22).
+- DONE 18 repositories readability (2026-07-25, also closes the
+  never-landed Wave 1 notes 1 and 2): worktree rows draw MAIN in the
+  title tint, branches slash-segmented in the path palette, dirty
+  counts amber; a play/clock marker shows the claiming (running/
+  parked) herd session with a right-click "Open session '<name>'"
+  that raises Sessions and attaches only when the PTY is still alive
+  (a registry entry can outlive its PTY across a watcher restart);
+  right-click also offers "New Session here..." (note 2) which
+  selects the worktree and routes through the session.new command;
+  the Sessions header gained the "add" new-session icon (note 1).
+  Live-verified: colored rows, claim markers on both occupied
+  worktrees, both context items, dead-PTY navigation no longer
+  surfaces "unknown session".
+- DONE 22 perspective indication (2026-07-25): every Git Activity tab
+  opens with a loud banner — perspective name in the warning accent,
+  context in the branch tint (PR shows "branch -> base", History
+  "branch - outgoing first, then base", Tree the branch, Project the
+  worktree path). The History table inserts a branch/base delimiter
+  row where the outgoing (review-set) commits end and base history
+  begins, list_clipper-safe via a +1 visual-row mapping. Verified
+  live on the HISTORY banner; the delimiter sits below the fold on a
+  177-ahead branch (deterministic row math against the review set).
+- 20 token color language (one shared palette module feeds 18/20/22).
+  - 20 FOUNDATION DONE (2026-07-25): rich_tokens.das names every token
+    color once (sha/branch/pid/path dir-sep-name/warning/error/
+    added/deleted/title/muted/state) and rich_state re-exports it to
+    every surface; all previously hard-coded literals in git_ui,
+    files_ui, client chrome, terminal footer, and the shortcuts tab
+    now pull from it (identical values — zero visual delta), and the
+    terminal session line renders state + pid as colored tokens as
+    the exemplar for previously-plain tokens. Remaining under 18/22:
+    branch/path/sha adoption on herd cards and the repositories panel,
+    perspective indication.
 - 37 nested repositories in the Project view (found by Boris opening
   modules/dasVulkan): git lists a nested repo as one "dir/" entry.
   FIXED same day: the entry builds a folder chain tagged "(repo)"
   instead of a phantom empty-named file row that opened the directory
-  as a file. OPEN follow-up: their CONTENTS stay invisible to the
-  repository-scoped listing — options are a filesystem-based listing
-  or treating a registered nested repo as a portal into its own
-  worktree's Project view.
-- 9 auto-aim policy: empty selection may aim at attach origin;
-  explicit selection stays sacred.
-- 27 destructive confirmations.
+  as a file. PORTAL DONE (2026-07-25): expanding a "(repo)" folder
+  lazily lists the FILESYSTEM (skipping .git), children recurse as
+  portals, hidden tier applies, only the portal root carries the tag,
+  and children sort with the active mode. Verified live: dasVulkan in
+  MAIN expands to .github/_build/cmake/daslib/doc/examples/generator —
+  contents no git listing can see. LIMITATION: a GITIGNORED nested
+  repo (modules/dasImgui inside worktrees, .gitignore:108) produces
+  no status entry at all, so no portal root exists — discovery for
+  those needs registered-repository synthesis (planned with the
+  portal-into-own-Project-view follow-up). Opening a portal file in
+  the inspector still goes through the parent repo's git plumbing and
+  may error — acceptable until nested repos register as repositories.
+- DONE 9 auto-aim policy (2026-07-25): g_selection_explicit tracks
+  whether the selection came from a deliberate pick (worktree row
+  click, focus-target navigation, herder_git_select_worktree) vs a
+  seed/auto-aim; attach_session may re-aim at the session origin
+  whenever the selection is not explicit, even for task auto-attaches
+  with follow_origin=false. Flag exposed in herder_client_state;
+  verified false on the seeded default, true after an explicit select.
+- DONE 27 destructive confirmations (2026-07-25): Terminate-session
+  and Close-session route through one confirmation modal; the target
+  is captured at open and re-checked at confirm so a selection change
+  under an open dialog can't redirect the action. Live-verified:
+  right-click Close on scroll-probe -> modal with target-specific
+  text -> Confirm -> closed_by_user in the registry. Agent rails
+  (herder_close_session) stay direct by design — confirmation is a
+  human-mistake guard, not an agent gate.
 
 ## Wave 4 — structural
 
@@ -325,14 +416,139 @@ imgui_mouse_* bypass commands while input is detached.
 
 ## Icon-set expansion (dasImgui, consult Claude Design)
 
-Existing set covers refresh/stop/add/folder/search/gear/prev/next.
-Likely new needs: file glyph (vs folder), dirty badge/dot, sort-mode
-cycle, filter, confirm/danger, collapse/expand-all, send/submit.
+Existing set covers refresh/stop/add/folder/search/gear/prev/next,
+plus play/clock/check/warning/bolt/chevron-right/bell/link/unlink/
+close/edit in use across dasHerd.
 Run the proposed additions past Claude Design (daslang.io Forge design
 system) before drawing them; regen the icon catalog after.
+
+PROPOSAL (ready for the consult, 2026-07-25 — every entry is a place
+the UI currently substitutes text or a wrong-shaped glyph):
+- file: Project rows borrow "edit" for files today; a document glyph
+  pairs with the existing folder.
+- repo-portal: the "(repo)" text tag on nested-repository folders
+  wants a small badge glyph (folder + branch node?).
+- dirty-dot: the amber "*N" works but a small dot/badge form would
+  read cleaner in narrow rows (worktrees, Project).
+- sort-cycle: the Project header sort is a text button ("Sort:
+  Folders first"); one glyph with a mode sub-mark.
+- filter: the Project filter row and future search fields.
+- confirm / danger: the destructive-confirm modal buttons are plain
+  text; a danger accent glyph for Terminate/Close affordances.
+- send: "Send to session agent" context items and future outbox.
+- keyboard: the Shortcuts tab and capture state.
+- terminal: session cards and the worktree->session jump currently
+  borrow play/clock; a terminal glyph distinguishes "has a terminal"
+  from lifecycle state.
+- agent-lock: the SYNTH LOCK / [AGENT CONTROL] states borrow
+  "warning"; a dedicated takeover glyph reads less like an error.
+- expand-all / collapse-all: Project tree QoL.
 
 ## Sequencing (settled 2026-07-25)
 
 No intermediate PR — no users yet. The whole fix round (Waves 0-4)
 lands on this branch, then one PR for historical record, then the big
 review happens on that PR.
+
+## Review round (2026-07-25, post-merge of PR #3567)
+
+Full-tree review: personal pass on watcher core/server/net + 3 agent
+passes (git/inspector/files UI, sessions/launcher/terminal, C++/glue).
+9 verified defects fixed in commits 872fe420d + c6e285d74 (token
+dual-spelling auth, empty-cwd guard, worktree-row highlight, portal
+re-list, say-queue garbling, output-age table growth, glfw chain
+dispatch UAF, daslang-live is_reload, CMake stale-module sweep
+deleting standalone-module artifacts).
+
+## Block: external sessions (2026-07-25 evening)
+
+Goal (Boris): "external sessions" — a session whose terminal lives OUTSIDE
+the herder (like the dev session building dasHerd itself), claimed from the
+outside, attached to worktree(s), coordination-only (mailbox/bundles/claims;
+no terminal view, no lease, no input), and able to OUTLIVE the herder across
+watcher restarts. Follow-up: "Repositories and worktrees" migrates to the
+right side as "Git repositories and worktrees"; the left side is sessions,
+sessions-first.
+
+Issue intake (live rig, numbering continues):
+- 40: sessions list: alive on top, dead in a different color, delete button
+  for session + associated worktrees — IMPLEMENTED, pending deploy
+- 41: worktree delete from the git panel — in-use = hard block; uncommitted
+  changes = block + offer to launch a resolver session briefed with the
+  blocking state — IMPLEMENTED, pending deploy
+- 42: terminal in a NEW session does not scroll
+- 43: herd card click selects then unselects (cc-color-probe3 clicked while
+  "Towards 0.6.4 release" attached; selection bounces back)
+- 44: after creating a new session the terminal opens but has no keyboard
+  focus — a mouse click is needed before typing
+- 45: the icons left of each session card (profile / state / conflict) have
+  no tooltips — unexplained glyphs
+- 46: Sessions & Activity shows opaque rows — "REGULAR s2563..." entries and
+  an error list ("unknown session", "4m ago") that is not clickable, not
+  scrollable, not hideable, purpose unclear. Needs names over raw ids,
+  click-through, dismiss/collapse, and dropping entries whose session no
+  longer resolves
+- 47: visual artifacts in a NEW session's terminal — stray letters in a
+  one-character column outside the text flow (Boris saw red "S"s stacked
+  vertically bottom-right; captured 'e'/'w'/'s'/'n' on the pane's left
+  edge). Looks like a stale/displaced grid column surviving the
+  attach-time resize, un-clipped; fades as output overwrites
+- 51: BLOCK PIVOT (Boris, 2026-07-25): --continue resume is a crutch, not
+  the answer. Next block, ahead of external sessions and everything else:
+  redesign PTY hosting until a terminal session "does not depend on
+  anything, and yet can be communicated to" — detached ConPTY host that
+  owns the console + child on its own, survives watcher/client/upgrade,
+  reachable over a versioned IPC channel. Current UI/feature work is
+  parked (committed on this branch) until that lands.
+  PROGRESS (same evening): dasTerminal grew spawn_detached (CREATE_NO_WINDOW
+  + job breakaway; DETACHED_PROCESS breaks console apps) and environment
+  blocks on both spawn paths (retires the token-on-command-line item);
+  utils/dasHerd/ptyhost/main.das v1 landed and smoke-proved the whole
+  claim live: host spawned detached, launcher died, host kept journaling;
+  a fresh client authenticated, replayed from byte 0, sent input, got the
+  child's echo with a forwarded env var. Remaining: dastest lifecycle
+  test, watcher launch-via-host + adoption, daspkg release packaging.
+  LANDED (2026-07-26): all of it — lifecycle test, release packaging, and
+  the watcher rework (launch-via-host for herd sessions, pumps proxied
+  over the host WS, adoption on startup with sessions resurrecting as
+  RUNNING, herd registry fold of dead hosts' exit stamps). Suite 71/71
+  incl. test_watcher_adoption.das proving restart survival end-to-end.
+  Decisions + the ConPTY drained-never-fires finding: PTY_HOST_DESIGN.md.
+- 50: HARD RULE + arc — a watcher restart must never kill hosted sessions
+  ("its not ok to kill my terminal session"). Today PTYs are ConPTY
+  children of the watcher and die with it; needs a per-session broker
+  process that owns the ConPTY and outlives the watcher (tmux-server
+  model), with restart = re-discover + re-attach. Operationally until
+  then: the watcher only restarts when no agent session is running or
+  Boris explicitly says go. RESOLVED BY ARCHITECTURE (2026-07-26): herd
+  sessions run in detached hosts; watcher restart adopts them back as
+  running (see 51 / PTY_HOST_DESIGN.md). The operational rule stays until
+  the rework is deployed to the live rig and proven there
+- 49: default layout — Git Changelist docks bottom-right as its own pane
+  under the Git Activity + File Inspector tab stack (per Boris's live
+  arrangement, captured in boris_changelist_dock.png); update
+  setup_layout_preset so dock reset / fresh install lands there
+- 48: Project tab says "Select a worktree to browse its files" while a
+  session is attached and selected. Rule: selecting or creating a session
+  selects its primary worktree (a session pick IS a deliberate worktree
+  pick; set the explicit flag), so Project/Changelist immediately point
+  at the session's tree. Evidence: the header above that empty-state
+  ALREADY shows "PROJECT D:/Work/..." (the path), and visiting History or
+  Tree populates Project — so (1) the files request is not kicked on
+  Project tab entry, and (2) the empty-state message lies (state is
+  not-requested, not no-selection)
+
+Deferred — nice-to-have, never over real work (Boris, 2026-07-25):
+- token in child command line: fix is env-block support in dasTerminal
+  spawn (pass DASHERD_* via CreateProcess lpEnvironment instead of a
+  powershell -Command prefix). Harden later, way later.
+- lease heartbeat starvation under multi-second frame stalls (client
+  pumps ~1s, server timeout 5s) — observation, no repro.
+- diff BEFORE/AFTER one-frame scroll desync when the AFTER pane drives
+  the wheel — cosmetic, inherent child draw order.
+- ImGui Install/RestoreCallbacks vs chain prev caches can strand a das
+  glfw_chain_add_* listener after mute/unmute — latent, zero in-tree
+  callers; touching the interleave risks regressing note 38.
+- mcp_supervisor.py cannot answer ping while a tool call blocks
+  (single-threaded stdin loop); mcp_main.das query values not
+  URL-encoded (watcher-generated ids/tokens are URL-safe).

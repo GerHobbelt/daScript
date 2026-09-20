@@ -503,7 +503,13 @@ static int run_lifecycle(const string & fn) {
             // before_reload/shutdown never run on a corrupted frame.
             if (ctx) {
                 ctx->restart();
-                call_annotated_list(ctx, g_annotated.before_reload);
+                if (!call_annotated_list(ctx, g_annotated.before_reload)) {
+                    // The hook's exception was already reported under its own
+                    // name; evalWithCatch never clears prior state, so restart
+                    // again or shutdown()'s getException() re-blames the hook
+                    // failure as a shutdown failure.
+                    ctx->restart();
+                }
                 if (fnShutdown) {
                     ctx->evalWithCatch(fnShutdown, nullptr);
                     if (auto ex = ctx->getException()) {
@@ -637,7 +643,10 @@ static int run_lifecycle(const string & fn) {
         }
     }
 
-    // Shutdown
+    // Shutdown — the real one, not a reload teardown. The flag stays true from
+    // the last reload otherwise, and shutdown()-time checks like glfw_live's
+    // live_destroy_window skip their final cleanup.
+    if (dll_set_is_reload) dll_set_is_reload(false);
     if (ctx && fnShutdown) {
         ctx->evalWithCatch(fnShutdown, nullptr);
         if (auto ex = ctx->getException()) {

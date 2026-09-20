@@ -39,8 +39,10 @@ require ./rich_launcher_ui.das
 require ./rich_files_ui.das
 require ./rich_live.das
 
-// Session preset: the terminal is the spine; the inspector and Git
-// surfaces share a modest right column (HERDER_UX.md scenarios).
+// Session preset: sessions own the left (sessions-first); ALL git surfaces
+// live on the right — repositories on top, Activity/Inspector tabbed in the
+// middle, Changelist at the bottom (notes 49 and the external-sessions
+// layout call: "worktree stuff moves to the right").
 def private setup_session_layout(dock_id : uint) {
     DockBuilderRemoveNode(dock_id)
     DockBuilderAddDockSpaceNode(dock_id, ImGuiDockNodeFlags.None)
@@ -50,23 +52,24 @@ def private setup_session_layout(dock_id : uint) {
     var center_id : uint = 0u
     var right_id : uint = 0u
     var repositories_id : uint = 0u
-    var sessions_id : uint = 0u
+    var changelist_id : uint = 0u
     DockBuilderSplitNode(dock_id, ImGuiDir.Left, 0.18f, left_id, center_id)
-    DockBuilderSplitNode(left_id, ImGuiDir.Down, 0.45f,
-        sessions_id, repositories_id)
     DockBuilderSplitNode(center_id, ImGuiDir.Right, 0.32f, right_id, center_id)
-    DockBuilderDockWindow("Repositories & Worktrees", repositories_id)
-    DockBuilderDockWindow("Sessions & Activity###SessionsActivity", sessions_id)
-    DockBuilderDockWindow("File Inspector", right_id)
-    DockBuilderDockWindow("Git Changelist", right_id)
+    DockBuilderSplitNode(right_id, ImGuiDir.Up, 0.28f, repositories_id, right_id)
+    DockBuilderSplitNode(right_id, ImGuiDir.Down, 0.45f, changelist_id, right_id)
+    DockBuilderDockWindow("Sessions & Activity###SessionsActivity", left_id)
+    DockBuilderDockWindow("Git Repositories & Worktrees###Repositories", repositories_id)
     DockBuilderDockWindow("Git Activity", right_id)
+    DockBuilderDockWindow("File Inspector", right_id)
     DockBuilderDockWindow("Settings", right_id)
+    DockBuilderDockWindow("Git Changelist", changelist_id)
     DockBuilderDockWindow("Terminal", center_id)
     DockBuilderFinish(dock_id)
     TERMINAL_WIN.pending_raise = true
 }
 
-// Review preset: terminal and inspector side by side, one Git column.
+// Review preset: terminal and inspector side by side; same sessions-left /
+// git-right shape as the session preset.
 def private setup_review_layout(dock_id : uint) {
     DockBuilderRemoveNode(dock_id)
     DockBuilderAddDockSpaceNode(dock_id, ImGuiDockNodeFlags.None)
@@ -75,20 +78,19 @@ def private setup_review_layout(dock_id : uint) {
     var left_id : uint = 0u
     var work_id : uint = 0u
     var repositories_id : uint = 0u
-    var sessions_id : uint = 0u
     var git_column_id : uint = 0u
     var activity_id : uint = 0u
     var changelist_id : uint = 0u
     var terminal_id : uint = 0u
     DockBuilderSplitNode(dock_id, ImGuiDir.Left, 0.14f, left_id, work_id)
-    DockBuilderSplitNode(left_id, ImGuiDir.Down, 0.45f,
-        sessions_id, repositories_id)
     DockBuilderSplitNode(work_id, ImGuiDir.Right, 0.24f, git_column_id, work_id)
-    DockBuilderSplitNode(git_column_id, ImGuiDir.Down, 0.55f,
+    DockBuilderSplitNode(git_column_id, ImGuiDir.Up, 0.28f,
+        repositories_id, git_column_id)
+    DockBuilderSplitNode(git_column_id, ImGuiDir.Down, 0.5f,
         changelist_id, activity_id)
     DockBuilderSplitNode(work_id, ImGuiDir.Left, 0.40f, terminal_id, work_id)
-    DockBuilderDockWindow("Repositories & Worktrees", repositories_id)
-    DockBuilderDockWindow("Sessions & Activity###SessionsActivity", sessions_id)
+    DockBuilderDockWindow("Sessions & Activity###SessionsActivity", left_id)
+    DockBuilderDockWindow("Git Repositories & Worktrees###Repositories", repositories_id)
     DockBuilderDockWindow("Git Activity", activity_id)
     DockBuilderDockWindow("Git Changelist", changelist_id)
     DockBuilderDockWindow("Terminal", terminal_id)
@@ -166,7 +168,7 @@ def private draw_menu_status_cluster() {
         icon("warning", line)
         same_line()
         text_colored(MENU_STATUS_SYNTH_LOCK,
-            (color = float4(0.97f, 0.76f, 0.28f, 1.0f), text = "SYNTH LOCK"))
+            (color = token_warning_color(), text = "SYNTH LOCK"))
         set_item_tooltip(MENU_STATUS_SYNTH_LOCK_TIP,
             (text = "Real input is detached (set_user_control off) - an agent " +
                 "owns the UI; live command set_user_control enabled=true releases it"))
@@ -176,7 +178,7 @@ def private draw_menu_status_cluster() {
         icon("warning", line)
         same_line()
         text_colored(MENU_STATUS_ERROR,
-            (color = float4(1.0f, 0.35f, 0.30f, 1.0f), text = error_text))
+            (color = token_error_color(), text = error_text))
         set_item_tooltip(MENU_STATUS_ERROR_TIP, (text = full_error))
         draw_error_context(MENU_ERROR_POPUP, MENU_ERROR_COPY,
             MENU_ERROR_SEND, "menu_error", "Watcher", full_error)
@@ -212,7 +214,50 @@ def private draw_menu_status_cluster() {
 def private command_new_session() {
     return if (g_client == null || !g_client.connected || empty(g_selected_worktree_path))
     prepare_launcher(g_selected_repository_id, g_selected_worktree_path)
-    open_dock_window(LAUNCHER_WIN)
+    open_launcher_modal()
+}
+
+def private draw_worktree_block_popup() {
+    if (g_worktree_delete_block.active) {
+        g_worktree_delete_block.active = false
+        open_popup(WORKTREE_BLOCK_DIALOG)
+    }
+    popup_modal(WORKTREE_BLOCK_DIALOG.PUBLIC, (text = "Cannot delete worktree",
+            closable = true, flags = ImGuiWindowFlags.AlwaysAutoResize)) {
+        text(WORKTREE_BLOCK_PATH, (text = g_worktree_delete_block.worktree_path))
+        if (g_worktree_delete_block.reason == "in_use") {
+            text(WORKTREE_BLOCK_WHY,
+                (text = "A session is working here: {g_worktree_delete_block.detail}"))
+            text_disabled(WORKTREE_BLOCK_HINT,
+                (text = "Close or delete that session first."))
+        } elif (g_worktree_delete_block.reason == "dirty") {
+            text(WORKTREE_BLOCK_WHY, (text = "Uncommitted changes block deletion:"))
+            text_disabled(WORKTREE_BLOCK_DETAIL,
+                (text = g_worktree_delete_block.detail))
+            if (button(WORKTREE_BLOCK_LAUNCH,
+                    (text = "Launch session to resolve..."))) {
+                g_selected_repository_id = g_worktree_delete_block.repository_id
+                g_selected_worktree_path = g_worktree_delete_block.worktree_path
+                g_selection_explicit = true
+                prepare_resolver_launcher(g_worktree_delete_block.repository_id,
+                    g_worktree_delete_block.worktree_path,
+                    "The user wants to DELETE the worktree " +
+                    "{g_worktree_delete_block.worktree_path}, but it has " +
+                    "uncommitted changes:\n{g_worktree_delete_block.detail}\n" +
+                    "Review the changes and resolve them: commit (and push) " +
+                    "what should be kept, discard what should not. Do not " +
+                    "delete the worktree yourself. When the tree is clean, " +
+                    "report what you did and finish.")
+                g_launch_resolver_pending = true
+                close_current_popup(WORKTREE_BLOCK_DIALOG)
+            }
+        } else {
+            text(WORKTREE_BLOCK_WHY, (text = g_worktree_delete_block.detail))
+        }
+        if (button(WORKTREE_BLOCK_CLOSE, (text = "Close"))) {
+            close_current_popup(WORKTREE_BLOCK_DIALOG)
+        }
+    }
 }
 
 def private command_powershell() {
@@ -236,7 +281,7 @@ def private register_commands() {
     register_herd_command("session.powershell", "Session", "PowerShell here",
         command_binding("session.powershell", ImGuiKey.P, primary = true, shift = true),
         @@command_powershell)
-    register_herd_command("view.repositories", "View", "Repositories & Worktrees",
+    register_herd_command("view.repositories", "View", "Git Repositories & Worktrees",
         CommandBinding(), @@() { open_dock_window(REPOSITORIES_WIN); })
     register_herd_command("view.sessions", "View", "Sessions & Activity",
         command_binding("view.sessions", ImGuiKey.S, primary = true, shift = true),
@@ -250,8 +295,8 @@ def private register_commands() {
     register_herd_command("view.terminal", "View", "Terminal",
         command_binding("view.terminal", ImGuiKey.T, primary = true, shift = true),
         @@() { open_dock_window(TERMINAL_WIN); })
-    register_herd_command("view.launcher", "View", "New Session window",
-        CommandBinding(), @@() { open_dock_window(LAUNCHER_WIN); })
+    register_herd_command("view.launcher", "View", "New Session dialog",
+        CommandBinding(), @@() { open_launcher_modal(); })
     register_herd_command("view.settings", "View", "Settings",
         command_binding("view.settings", ImGuiKey.Comma, primary = true),
         @@() { open_dock_window(SETTINGS_WIN); })
@@ -328,7 +373,7 @@ def draw_main_menu() {
         }
         menu(VIEW_MENU, (text = "View", enabled = true)) {
             if (menu_label(VIEW_REPOSITORIES,
-                    (text = "Repositories & Worktrees", selected = REPOSITORIES_WIN.open,
+                    (text = "Git Repositories & Worktrees", selected = REPOSITORIES_WIN.open,
                         shortcut = herd_command_shortcut("view.repositories")))) {
                 let _ = run_herd_command("view.repositories")
             }
@@ -360,7 +405,7 @@ def draw_main_menu() {
                 let _ = run_herd_command("view.terminal")
             }
             if (menu_label(VIEW_LAUNCHER,
-                    (text = "New Session", selected = LAUNCHER_WIN.open,
+                    (text = "New Session", selected = launcher_modal_open(),
                         shortcut = herd_command_shortcut("view.launcher")))) {
                 let _ = run_herd_command("view.launcher")
             }
@@ -468,6 +513,44 @@ def update() {
     // Keep the transport alive outside that gate so heartbeats, controller
     // renewal, and queued PTY output continue until the window is restored.
     if (g_client != null) g_client->pump()
+    if (g_client != null) {
+        // Error ring (note 28): capture every transition to a new error text.
+        if (g_client.error != g_last_seen_error) {
+            g_last_seen_error = g_client.error
+            if (!empty(g_client.error)) {
+                g_error_history |> push(g_client.error)
+                g_error_history_wall |> push(int64(get_clock()))
+                while (length(g_error_history) > 20) {
+                    g_error_history |> erase(0)
+                    g_error_history_wall |> erase(0)
+                }
+            }
+        }
+        // Output age (note 29): stamp only witnessed output_bytes deltas.
+        for (session in g_client.sessions) {
+            let seen = g_session_output_seen?[session.id] ?? -1l
+            if (seen != session.output_bytes) {
+                if (seen >= 0l) {
+                    g_session_output_wall[session.id] = int64(get_clock())
+                }
+                g_session_output_seen[session.id] = session.output_bytes
+            }
+        }
+        // Sessions the watcher pruned leave orphaned entries behind forever
+        // otherwise (the tables only ever gain keys above).
+        if (length(g_session_output_seen) > length(g_client.sessions)) {
+            var inscope live_ids : table<string>
+            for (session in g_client.sessions) {
+                live_ids |> insert(session.id)
+            }
+            var inscope stale <- [for (id in keys(g_session_output_seen));
+                clone_string(id); where !key_exists(live_ids, id)]
+            for (id in stale) {
+                g_session_output_seen |> erase(id)
+                g_session_output_wall |> erase(id)
+            }
+        }
+    }
     if (g_submit_stamp != 0l
             && get_time_nsec(g_submit_stamp) / 1000000l >= 200l) {
         if (g_client != null && g_client.controls
@@ -476,6 +559,23 @@ def update() {
         }
         g_submit_stamp = 0l
         g_submit_session = ""
+    }
+    // Feed queued says only once the pending Enter has flushed; an item for a
+    // session we no longer control is dropped (same rule as the \r above).
+    while (g_submit_stamp == 0l && !empty(g_input_queue)) {
+        let item = g_input_queue[0]
+        g_input_queue |> erase(0)
+        if (g_client == null || !g_client.controls
+                || g_client.selected_id != item.session) continue
+        if (!empty(item.text)) {
+            g_client->send_input(item.text)
+        }
+        if (item.submit) {
+            // Even a lone queued submit re-arms the paste window — its \r must
+            // stay clear of whatever text drained just before it.
+            g_submit_stamp = ref_time_ticks()
+            g_submit_session = item.session
+        }
     }
     if (!harness_begin_frame()) return
     service_sha_copy()
@@ -534,9 +634,18 @@ def update() {
         TERMINAL_WIN.open = true
         TERMINAL_WIN.pending_raise = true
     }
+    if (g_open_sessions_pending) {
+        g_open_sessions_pending = false
+        SESSIONS_WIN.open = true
+        SESSIONS_WIN.pending_raise = true
+    }
     if (g_dock_reset_pending) {
         g_dock_reset_pending = false
         DOCK_ROOT.pending_reset = true
+    }
+    if (g_launch_resolver_pending) {
+        g_launch_resolver_pending = false
+        open_launcher_modal()
     }
     draw_main_menu()
     dockspace(DOCK_ROOT, (flags = ImGuiDockNodeFlags.PassthruCentralNode)) {
@@ -566,11 +675,13 @@ def update() {
         draw_git_activity_dock()
         draw_git_changelist_dock()
         draw_file_inspector_dock()
-        draw_launcher_dock()
         draw_terminal_dock()
         draw_settings_dock()
     }
     draw_herd_rename_popup()
+    draw_destructive_confirm_popup()
+    draw_worktree_block_popup()
+    draw_launcher_modal()
     herd_commands_drain()
     harness_end_frame()
 }

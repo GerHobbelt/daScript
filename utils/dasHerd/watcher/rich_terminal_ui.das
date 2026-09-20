@@ -26,14 +26,27 @@ require math
 require ./rich_state.das
 require ./rich_net.das
 
-def selected_session_label() : string {
-    if (g_client == null || empty(g_client.selected_id)) return "No session selected"
+// Token-colored session line (note 20): state and pid render in the shared
+// token palette instead of one plain string.
+def draw_session_label() {
+    if (g_client == null || empty(g_client.selected_id)) {
+        text(SESSION_LABEL, (text = "No session selected"))
+        return
+    }
     for (session in g_client.sessions) {
         if (session.id == g_client.selected_id) {
-            return "{session.state}  pid {session.pid}  {session.command_line}"
+            text_colored(SESSION_STATE_TOKEN,
+                (color = token_state_color("{session.state}"),
+                    text = "{session.state}"))
+            same_line()
+            text_colored(SESSION_PID_TOKEN,
+                (color = token_pid_color(), text = "pid {session.pid}"))
+            same_line()
+            text(SESSION_LABEL, (text = session.command_line))
+            return
         }
     }
-    return g_client.selected_id
+    text(SESSION_LABEL, (text = g_client.selected_id))
 }
 
 def draw_terminal_footer() {
@@ -48,7 +61,7 @@ def draw_terminal_footer() {
     if (g_client != null && g_client.attached && !g_client.controls) {
         icon("warning", GetTextLineHeight())
         same_line()
-        text_colored(TERMINAL_INPUT_OFF, (color = float4(0.97f, 0.76f, 0.28f, 1.0f),
+        text_colored(TERMINAL_INPUT_OFF, (color = token_warning_color(),
             text = "VIEW ONLY - input lease held elsewhere"))
         set_item_tooltip(TERMINAL_INPUT_OFF_TIP,
             (text = "Scrollback and selection stay local; typing goes to the " +
@@ -83,7 +96,7 @@ def draw_terminal_window() {
         if (io.MouseWheel > 0.0f) zoom_by(5)
         elif (io.MouseWheel < 0.0f) zoom_by(-5)
     }
-    text(SESSION_LABEL, (text = selected_session_label()))
+    draw_session_label()
     separator()
     let terminal_style = ImGuiTerminalStyle(
         external_input = true,
@@ -93,8 +106,13 @@ def draw_terminal_window() {
                 - GetStyle().ItemSpacing.y))
     with_font(g_terminal_font) {
         if (g_focus_terminal_pending) {
-            set_keyboard_focus_here()
-            g_focus_terminal_pending = false
+            // The window raise lands a frame after open; focusing the input
+            // while the window is still unfocused is a no-op that used to eat
+            // the request (note 44). Hold the flag until the raise arrives.
+            if (IsWindowFocused(ImGuiFocusedFlags.RootAndChildWindows)) {
+                set_keyboard_focus_here()
+                g_focus_terminal_pending = false
+            }
         }
         let result <- imgui_terminal("watcher", g_terminal, g_terminal_view,
             g_terminal_cache, terminal_style)

@@ -27,12 +27,25 @@ require math
 require strings
 require ./rich_state.das
 require ./rich_net.das
+require ./rich_commands.das
+require ./herd_sessions.das
 require ./rich_inspector_ui.das
 require ./rich_files_ui.das
+require ./rich_sessions_ui.das
 
 var WORKTREE_ROW : table<int; ToggleState>
 
 var WORKTREE_CONFLICT_JOIN : table<int; EmptyMarkerState>
+
+var WORKTREE_ACTIVE_JOIN : table<int; EmptyMarkerState>
+
+var WORKTREE_POPUP : table<int; PopupContextItemState>
+
+var WORKTREE_MENU_NEW_SESSION : table<int; ToggleState>
+
+var WORKTREE_MENU_OPEN_SESSION : table<int; ToggleState>
+
+var WORKTREE_MENU_DELETE : table<int; ToggleState>
 
 var REPOSITORY_FOLDER_JOIN : table<int; EmptyMarkerState>
 
@@ -98,6 +111,43 @@ var ACTIVITY_ERROR_COPY : ToggleState
 
 var ACTIVITY_ERROR_SEND : ToggleState
 
+// Index of a non-closed herd session claiming this worktree, or -1. A running
+// session prefers over an exited one so the marker reflects the live claimant.
+def private active_herd_for_worktree(worktree_path : string) : int {
+    if (g_client == null) return -1
+    let canonical = herd_canonical_worktree(worktree_path)
+    var found = -1
+    for (index, record in count(), g_client.herd_sessions) {
+        if (record.state != "closed"
+                && herd_canonical_worktree(record.worktree_path) == canonical) {
+            if (record.state == "running") return index
+            if (found < 0) {
+                found = index
+            }
+        }
+    }
+    return found
+}
+
+// Worktree -> session navigation (note 18): raise Sessions and attach the
+// claiming session's terminal when it has one.
+def private navigate_to_herd(record_index : int) {
+    return if (g_client == null || record_index < 0
+        || record_index >= length(g_client.herd_sessions))
+    let record & = unsafe(g_client.herd_sessions[record_index])
+    g_open_sessions_pending = true
+    // Attach only when the PTY is still alive in the watcher's session list;
+    // a registry entry can outlive its PTY (watcher restart), and the Sessions
+    // card offers Relaunch for those.
+    for (session in g_client.sessions) {
+        if (session.id == record.pty_session_id) {
+            g_client->attach_session(record.pty_session_id, false)
+            g_open_terminal_pending = true
+            return
+        }
+    }
+}
+
 def draw_repositories_window() {
     text_disabled("Target: Local")
     separator()
@@ -119,7 +169,7 @@ def draw_repositories_window() {
             text(REPOSITORY_TITLE[repository_row],
                 (text = "{repository.record.display_name}  [Local]{refreshing}"))
             if (!empty(repository.error)) {
-                text_colored(REPOSITORY_ERROR[repository_row], (color = float4(1.0f, 0.35f, 0.30f, 1.0f),
+                text_colored(REPOSITORY_ERROR[repository_row], (color = token_error_color(),
                     text = repository.error))
                 draw_error_context(REPOSITORY_ERROR_POPUP[repository_row],
                     REPOSITORY_ERROR_COPY[repository_row],
@@ -137,13 +187,38 @@ def draw_repositories_window() {
                 let dirty_label = dirty > 0 ? "  *{dirty}" : ""
                 if (g_client->herd_worktree_conflicted(worktree.path)) {
                     icon("warning", GetTextLineHeight())
+                    if (IsItemHovered()) {
+                        set_tooltip(WORKTREE_ICON_TOOLTIP,
+                            "Two or more sessions attend this worktree")
+                    }
                     same_line(WORKTREE_CONFLICT_JOIN[row])
                 }
+                let active_herd = active_herd_for_worktree(worktree.path)
+                if (active_herd >= 0) {
+                    let claim_running = (g_client.herd_sessions[active_herd].state
+                        == "running")
+                    icon(claim_running ? "play" : "clock", GetTextLineHeight())
+                    if (IsItemHovered()) {
+                        set_tooltip(WORKTREE_ICON_TOOLTIP, (claim_running
+                            ? "Session '{g_client.herd_sessions[active_herd].name}' is running here"
+                            : "Session '{g_client.herd_sessions[active_herd].name}' is attached here (not running)"))
+                    }
+                    same_line(WORKTREE_ACTIVE_JOIN[row])
+                }
+                // Transparent label keeps the row id + snapshot text; the
+                // overlay draws MAIN / slash-tinted branch / amber dirty in
+                // the shared token palette (notes 18/20).
                 let row_label = "{prefix}{branch}{dirty_label}##{repository.record.id}:{worktree.path}"
-                if (selectable(WORKTREE_ROW[row], (text = row_label))) {
+                WORKTREE_ROW[row].value = (repository.record.id == g_selected_repository_id && worktree.path == g_selected_worktree_path)
+                var row_clicked = false
+                with_style((ImGuiCol.Text, float4(0.0f, 0.0f, 0.0f, 0.0f))) {
+                    row_clicked = selectable(WORKTREE_ROW[row], (text = row_label))
+                }
+                if (row_clicked) {
                     ui_event("worktree-row-click {worktree.path}")
                     g_selected_repository_id = repository.record.id
                     g_selected_worktree_path = worktree.path
+                    g_selection_explicit = true
                     g_client->refresh_repository(repository.record.id)
                     g_client->request_repository_review(
                         repository.record.id, worktree.path)
@@ -151,7 +226,84 @@ def draw_repositories_window() {
                     GIT_CHANGELIST_WIN.pending_raise = true
                     GIT_ACTIVITY_WIN.open = true
                 }
-                WORKTREE_ROW[row].value = (repository.record.id == g_selected_repository_id && worktree.path == g_selected_worktree_path)
+                {
+                    let row_min = GetItemRectMin()
+                    let row_max = GetItemRectMax()
+                    let text_y = row_min.y + max(0.0f,
+                        (row_max.y - row_min.y - GetTextLineHeight()) * 0.5f)
+                    let x0 = row_min.x + GetStyle().FramePadding.x
+                    if (worktree.is_main) {
+                        with_window_drawlist() $(var dl) {
+                            dl |> add_text(float2(x0, text_y),
+                                GetColorU32(token_title_color()), "MAIN")
+                        }
+                    }
+                    let branch_x = x0 + CalcTextSize(prefix).x
+                    let right_limit = git_visible_row_right(row_max.x)
+                    draw_git_path_text(branch, float2(branch_x, text_y),
+                        float2(right_limit, row_max.y), false)
+                    if (dirty > 0) {
+                        with_window_drawlist() $(var dl) {
+                            dl |> add_text(
+                                float2(branch_x + CalcTextSize(branch).x, text_y),
+                                GetColorU32(token_warning_color()), dirty_label)
+                        }
+                    }
+                }
+                popup_context_item(WORKTREE_POPUP[row],
+                        (str_id = "worktree:{worktree.path}",
+                         flags = ImGuiPopupFlags.MouseButtonRight)) {
+                    if (menu_item(WORKTREE_MENU_NEW_SESSION[row],
+                            (text = "New Session here...", shortcut = "",
+                             enabled = g_client != null && g_client.connected))) {
+                        // Select this worktree, then the shared command opens
+                        // the launcher preselected from the selection.
+                        g_selected_repository_id = repository.record.id
+                        g_selected_worktree_path = worktree.path
+                        g_selection_explicit = true
+                        let _ = run_herd_command("session.new")
+                    }
+                    if (active_herd >= 0) {
+                        if (menu_item(WORKTREE_MENU_OPEN_SESSION[row],
+                                (text = "Open session '{g_client.herd_sessions[active_herd].name}'",
+                                 shortcut = "", enabled = true))) {
+                            navigate_to_herd(active_herd)
+                        }
+                    }
+                    if (menu_item(WORKTREE_MENU_DELETE[row],
+                            (text = "Delete worktree...", shortcut = "",
+                             enabled = g_client != null && g_client.connected
+                                && !worktree.is_main))) {
+                        // Client-side pre-guards give the block dialog without
+                        // a round trip; the watcher re-checks on the request.
+                        let change_count = (worktree.staged + worktree.unstaged
+                            + worktree.untracked + worktree.conflicted)
+                        if (active_herd >= 0) {
+                            g_worktree_delete_block = WorktreeDeleteBlock(
+                                active = true,
+                                repository_id = repository.record.id,
+                                worktree_path = worktree.path,
+                                reason = "in_use",
+                                detail = "in use by session " +
+                                    "'{g_client.herd_sessions[active_herd].name}'")
+                        } elif (change_count > 0) {
+                            g_worktree_delete_block = WorktreeDeleteBlock(
+                                active = true,
+                                repository_id = repository.record.id,
+                                worktree_path = worktree.path,
+                                reason = "dirty",
+                                detail = "{worktree.staged} staged, " +
+                                    "{worktree.unstaged} unstaged, " +
+                                    "{worktree.untracked} untracked, " +
+                                    "{worktree.conflicted} conflicted")
+                        } else {
+                            g_confirm_repository = repository.record.id
+                            open_destructive_confirm("worktree_delete",
+                                worktree.path,
+                                "Delete worktree {worktree.path}?")
+                        }
+                    }
+                }
                 if (worktree.is_main) separator(WORKTREE_SEPARATOR[row])
                 row++
             }
@@ -229,10 +381,10 @@ def draw_git_stats_text(position : float2;
             let added = "+{added_lines}"
             let deleted = "-{deleted_lines}"
             dl |> add_text(position,
-                GetColorU32(float4(0.42f, 0.82f, 0.42f, alpha)), added)
+                GetColorU32(token_added_color(alpha)), added)
             dl |> add_text(float2(position.x + CalcTextSize(added).x
                     + GetStyle().ItemSpacing.x, position.y),
-                GetColorU32(float4(0.37f, 0.65f, 0.96f, alpha)), deleted)
+                GetColorU32(token_deleted_color(alpha)), deleted)
         }
     }
 }
@@ -408,6 +560,9 @@ def draw_sha_copy_icon(hash, row_id : string;
 
 def draw_pr_review(repository : RepositorySnapshot const;
                    worktree : WorktreeState const) {
+    let base = (!empty(worktree.review_base_ref)
+        ? worktree.review_base_ref : "detecting base...")
+    draw_perspective_banner("PR", "{worktree.branch}  ->  {base}")
     var commit_row = 0
     let sha_width = (CalcTextSize("000000000").x
         + GetFrameHeightWithSpacing() + 8.0f)
@@ -426,7 +581,7 @@ def draw_pr_review(repository : RepositorySnapshot const;
             if (commit.worktree_path != worktree.path) continue
             table_next_row()
             table_set_column_index(0)
-            with_style((ImGuiCol.Text, float4(0.36f, 0.76f, 0.96f, 1.0f))) {
+            with_style((ImGuiCol.Text, token_sha_color())) {
                 selectable_hover(GIT_PR_COMMIT_HOVER[commit_row],
                     (text = "{commit.short_hash}##pr:{commit.hash}",
                     flags = ImGuiSelectableFlags.SpanAllColumns |
@@ -436,11 +591,11 @@ def draw_pr_review(repository : RepositorySnapshot const;
                 commit.short_hash)
             table_set_column_index(1)
             text_colored(GIT_COMMIT_TITLE_TEXT[commit_row],
-                (color = float4(0.91f, 0.93f, 0.96f, 1.0f),
+                (color = token_title_color(),
                 text = commit.subject))
             table_set_column_index(2)
             text_colored(GIT_COMMIT_AUTHOR_TEXT[commit_row],
-                (color = float4(0.64f, 0.70f, 0.80f, 1.0f),
+                (color = token_muted_color(),
                 text = commit.author))
             commit_row++
         }
@@ -514,7 +669,28 @@ def draw_history_commits(repository : RepositorySnapshot const;
             commit_indices |> push(index)
         }
     }
+    // The branch/base delimiter (note 22): rows above it are outgoing (the PR
+    // view's review set); the first row outside that set starts base history.
+    var inscope outgoing : table<string>
+    for (commit in repository.review_commits) {
+        if (commit.worktree_path == worktree.path) {
+            outgoing |> insert(commit.hash)
+        }
+    }
+    var boundary_row = -1
+    if (!empty(outgoing)) {
+        for (position, index in count(), commit_indices) {
+            if (!key_exists(outgoing, repository.history_commits[index].hash)) {
+                boundary_row = position
+                break
+            }
+        }
+    }
+    if (boundary_row == 0) {
+        boundary_row = -1
+    }
     let count = length(commit_indices)
+    let total = count + (boundary_row >= 0 ? 1 : 0)
     let sha_width = (CalcTextSize("000000000").x
         + GetFrameHeightWithSpacing() + 8.0f)
     let table_flags = (ImGuiTableFlags.Resizable | ImGuiTableFlags.RowBg |
@@ -528,14 +704,28 @@ def draw_history_commits(repository : RepositorySnapshot const;
         table_setup_column("Title", ImGuiTableColumnFlags.WidthStretch, 0.72f)
         table_setup_column("Author", ImGuiTableColumnFlags.WidthStretch, 0.28f)
         table_headers_row()
-        list_clipper(count) $(start, end_) {
+        list_clipper(total) $(start, end_) {
             for (row in range(start, end_)) {
-                let commit = repository.history_commits[commit_indices[row]]
+                if (boundary_row >= 0 && row == boundary_row) {
+                    let base = (!empty(worktree.review_base_ref)
+                        ? worktree.review_base_ref : "base")
+                    table_next_row()
+                    table_set_column_index(0)
+                    text_disabled(HISTORY_BASE_MARK, (text = "base"))
+                    table_set_column_index(1)
+                    text_colored(HISTORY_BASE_TEXT,
+                        (color = token_branch_color(),
+                            text = "^ outgoing on {worktree.branch}    v {base}"))
+                    continue
+                }
+                let commit_row = ((boundary_row >= 0 && row > boundary_row)
+                    ? row - 1 : row)
+                let commit = repository.history_commits[commit_indices[commit_row]]
                 let selected_commit = !empty(g_requested_history_commit) ? g_requested_history_commit : worktree.history_commit
                 table_next_row()
                 table_set_column_index(0)
                 var selected = false
-                with_style((ImGuiCol.Text, float4(0.36f, 0.76f, 0.96f, 1.0f))) {
+                with_style((ImGuiCol.Text, token_sha_color())) {
                     selected = selectable_label(GIT_HISTORY_COMMIT_ROW[row],
                         (text = "{commit.short_hash}##history:{commit.hash}",
                         selected = commit.hash == selected_commit,
@@ -546,11 +736,11 @@ def draw_history_commits(repository : RepositorySnapshot const;
                     commit.short_hash)
                 table_set_column_index(1)
                 text_colored(GIT_COMMIT_TITLE_TEXT[row],
-                    (color = float4(0.91f, 0.93f, 0.96f, 1.0f),
+                    (color = token_title_color(),
                     text = commit.subject))
                 table_set_column_index(2)
                 text_colored(GIT_COMMIT_AUTHOR_TEXT[row],
-                    (color = float4(0.64f, 0.70f, 0.80f, 1.0f),
+                    (color = token_muted_color(),
                     text = commit.author))
                 if (selected && g_client != null && commit.hash != selected_commit) {
                     ui_event("history-commit-click {commit.short_hash}")
@@ -561,8 +751,21 @@ def draw_history_commits(repository : RepositorySnapshot const;
     }
 }
 
+// Loud active-perspective line (note 22): only the selected tab's body runs,
+// so one shared widget set renders exactly once per frame.
+def draw_perspective_banner(name, context : string) {
+    text_colored(PERSPECTIVE_BADGE,
+        (color = token_warning_color(), text = name))
+    same_line(PERSPECTIVE_JOIN)
+    text_colored(PERSPECTIVE_CONTEXT,
+        (color = token_branch_color(), text = context))
+    separator(PERSPECTIVE_SEPARATOR)
+}
+
 def draw_history_review(repository : RepositorySnapshot const;
                         worktree : WorktreeState const) {
+    draw_perspective_banner("HISTORY",
+        "{worktree.branch} - outgoing first, then base")
     ensure_history(repository, worktree, worktree.branch)
     draw_history_commits(repository, worktree)
 }
@@ -689,7 +892,7 @@ def draw_tree_commits(repository : RepositorySnapshot const;
                 table_set_column_index(0)
                 var selected = false
                 with_style((ImGuiCol.Text,
-                        float4(0.36f, 0.76f, 0.96f, text_alpha))) {
+                        token_sha_color(text_alpha))) {
                     selected = selectable_label(GIT_HISTORY_COMMIT_ROW[row],
                         (text = "{commit.short_hash}##tree:{commit.hash}",
                         selected = commit.hash == selected_commit,
@@ -724,11 +927,11 @@ def draw_tree_commits(repository : RepositorySnapshot const;
                     same_line(GIT_TREE_REF_SAME_LINE[row])
                 }
                 text_colored(GIT_COMMIT_TITLE_TEXT[row],
-                    (color = float4(0.91f, 0.93f, 0.96f, text_alpha),
+                    (color = token_title_color(text_alpha),
                     text = commit.subject))
                 table_set_column_index(2)
                 text_colored(GIT_COMMIT_AUTHOR_TEXT[row],
-                    (color = float4(0.64f, 0.70f, 0.80f, text_alpha),
+                    (color = token_muted_color(text_alpha),
                     text = commit.author))
                 if (selected && g_client != null
                         && commit.hash != selected_commit) {
@@ -758,6 +961,7 @@ def draw_tree_commits(repository : RepositorySnapshot const;
 
 def draw_tree_review(repository : RepositorySnapshot const;
                      worktree : WorktreeState const) {
+    draw_perspective_banner("TREE", worktree.branch)
     if (g_client != null) {
         let identity = "{repository.record.id}\n{worktree.path}"
         if (g_client.last_refs_identity != identity) {
@@ -956,6 +1160,7 @@ def draw_git_activity_window() {
                         }
                         tab_item(GIT_PROJECT_TAB.PUBLIC, (text = "Project", closable = false,
                             flags = ImGuiTabItemFlags.None)) {
+                            draw_perspective_banner("PROJECT", worktree.path)
                             draw_project_files()
                         }
                     }
@@ -984,7 +1189,7 @@ def git_ui_init() {
 }
 
 def draw_repositories_dock() {
-    dock_window(REPOSITORIES_WIN.PUBLIC, (text = "Repositories & Worktrees", closable = true,
+    dock_window(REPOSITORIES_WIN.PUBLIC, (text = "Git Repositories & Worktrees###Repositories", closable = true,
             flags = ImGuiWindowFlags.None)) {
         window_zoom_scope("repositories") {
             draw_repositories_window()

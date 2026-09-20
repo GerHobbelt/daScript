@@ -268,6 +268,26 @@ class WatcherRichClient : HvWebSocketClient {
                 g_open_terminal_pending = true
                 g_focus_terminal_pending = true
             }
+        } elif (envelope._type == "worktree_delete_result") {
+            var incoming = WatcherWorktreeDeleteResult()
+            if (sscan_json(body, incoming) && !incoming.ok) {
+                g_worktree_delete_block = WorktreeDeleteBlock(active = true,
+                    repository_id = clone_string(incoming.repository_id),
+                    worktree_path = clone_string(incoming.worktree_path),
+                    reason = clone_string(incoming.reason),
+                    detail = clone_string(incoming.detail))
+            }
+        } elif (envelope._type == "herd_delete_result") {
+            var incoming = WatcherHerdDeleteResult()
+            if (sscan_json(body, incoming) && !empty(incoming.kept)) {
+                // Surface the first kept worktree; the rest stay visible in
+                // the git panel with their own delete flow.
+                g_worktree_delete_block = WorktreeDeleteBlock(active = true,
+                    repository_id = clone_string(incoming.kept[0].repository_id),
+                    worktree_path = clone_string(incoming.kept[0].path),
+                    reason = clone_string(incoming.kept[0].reason),
+                    detail = clone_string(incoming.kept[0].detail))
+            }
         } elif (envelope._type == "mailbox") {
             var incoming = WatcherMailboxMessageEnvelope()
             if (sscan_json(body, incoming)) {
@@ -447,7 +467,11 @@ class WatcherRichClient : HvWebSocketClient {
                 break
             }
         }
-        if (follow_origin && !empty(origin_repository_id) && !empty(origin_worktree_path)) {
+        // Auto-aim policy (note 9): an explicit worktree selection is sacred,
+        // but a seeded/default selection may always aim at the attach origin —
+        // even for task auto-attaches that pass follow_origin=false.
+        let may_aim = follow_origin || !g_selection_explicit
+        if (may_aim && !empty(origin_repository_id) && !empty(origin_worktree_path)) {
             let origin_changed = (g_selected_repository_id
                     != origin_repository_id
                 || g_selected_worktree_path != origin_worktree_path)
@@ -513,6 +537,19 @@ class WatcherRichClient : HvWebSocketClient {
         if (!connected || empty(herd_session_id)) return
         send("\{\"op\":\"herd_close\",\"herd_session_id\":" +
             "{sprint_json(herd_session_id, false)}\}")
+    }
+
+    def request_herd_delete(herd_session_id : string) {
+        if (!connected || empty(herd_session_id)) return
+        send("\{\"op\":\"herd_delete\",\"herd_session_id\":" +
+            "{sprint_json(herd_session_id, false)}\}")
+    }
+
+    def request_worktree_delete(repository_id, worktree_path : string) {
+        if (!connected || empty(worktree_path)) return
+        send("\{\"op\":\"worktree_delete\",\"repository_id\":" +
+            "{sprint_json(repository_id, false)},\"worktree_path\":" +
+            "{sprint_json(worktree_path, false)}\}")
     }
 
     def request_herd_rename(herd_session_id, name : string) {
