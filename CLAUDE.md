@@ -37,9 +37,7 @@ Fall back to `Bash`/`Grep`/`Read` only when the MCP tool reports an error or the
 
 ## Asking blind-mouse
 
-Before doing significant research on a "how do I X?" / "what's the pattern for Y?" / "why does Z behave this way?" question, ask `mouse__ask`. blind-mouse (`utils/mouse/`) is a personal Q&A cache backed by curated `.md` answers — full vision in `utils/mouse/OVERVIEW.md`. Same deferred-tool dance as the daslang MCP: `ToolSearch select:mcp__mouse__<tool>` → invoke.
-
-**During plan mode / planning phase, ask the mouse early and often.** Planning is exactly the phase where prior-session research has the highest leverage: each "what's the pattern for X" / "where do we usually put Y" / "why did we pick Z" answer that's already in the cache saves a research detour, and each new finding worth keeping is one `mouse__add` away from being free next time. Concrete planning-phase prompts: design questions ("what's the right pattern for adding a new `[sql_*]` annotation?"), prior-art questions ("have we hit this glob-vs-rfind path bug before?"), gotcha-recall ("what's the const-stripping reinterpret incantation?"), trade-off recall ("why did we pick (a) over (b) last time?"). If the cache has nothing useful, do the research yourself — then `mouse__add` the answer before moving on, even if rough. The cost of writing a brief `.md` is far smaller than re-researching the same thing.
+Before doing significant research on a "how do I X?" / "what's the pattern for Y?" / "why does Z behave this way?" question, ask `mouse__ask`. blind-mouse (`utils/mouse/`) is a personal Q&A cache backed by curated `.md` answers. Operational manual: `skills/mouse.md`. Design vision: `utils/mouse/OVERVIEW.md`.
 
 | Reach for the mouse when… | Don't, when… |
 |---|---|
@@ -47,8 +45,6 @@ Before doing significant research on a "how do I X?" / "what's the pattern for Y
 | "how do I write a `[typefunction]` macro?" / "what's the right pattern for X?" / "why does Y behave this way?" | categorical conventions — those belong in `skills/*.md` / `CLAUDE.md` |
 | Discovered facts that don't fit any `skills/*.md` slot | project state, branch status, who's doing what — use git/issues/memory |
 | Recurring questions you remember answering before but forget the answer | |
-
-If `mouse__ask` returns nothing relevant and you do the research yourself, finish with `mouse__add` so the next session doesn't redo the work. If a returned answer is stale or wrong, edit the `.md` directly under `mouse-data/docs/` (it's a regular file, `Edit` works) and bump `last_verified`.
 
 ## Skill Files (REQUIRED)
 
@@ -59,6 +55,7 @@ Task-specific instructions are split into skill files under `skills/`. You MUST 
 | `skills/project_overview.md` | First significant task — design philosophy, three execution tiers, macros-as-design-lens |
 | `skills/build_and_debug.md` | Build flags, AOT build commands, exit-code/crash diagnosis, `options log_infer_passes` |
 | `skills/mcp_tools.md` | Full MCP tool table + live-API reference |
+| `skills/mouse.md` | Asking, adding, or curating blind-mouse cards (`mouse__ask` / `mouse__add`) — operational manual behind the MOUSE FIRST rule |
 | `skills/das_formatting.md` | Creating or modifying any `.das` file |
 | `skills/writing_tests.md` | Writing or editing test files under `tests/` |
 | `skills/writing_cpp_tests.md` | Writing or editing C++ tests under `tests-cpp/` (doctest, leak guards, ctest wiring) |
@@ -83,6 +80,7 @@ Task-specific instructions are split into skill files under `skills/`. You MUST 
 | `skills/version_update.md` | Bumping the daslang version number |
 | `skills/jobque_debugging.md` | Channel/LockBox/JobStatus/Feature leaks (`--track-job-status`, `DumpJobQueLeaks`) |
 | `skills/make_pr.md` | Creating a pull request (lint, test, AOT, format checklist) |
+| `skills/task_wrap_up.md` | Read AFTER finishing any major chunk of work — blind-mouse curation pass (review log, surface the un-asked, add what was learned). Not just for PRs |
 | `skills/pr_review_iteration.md` | Working an open PR through CI failures and Copilot/human review feedback after the PR is created |
 | `skills/strudel_port.md` | Porting strudel.cc patterns into daslang |
 | `skills/clargs_usage.md` | Writing or editing any tool that parses command-line flags — declarative argv parsing via `daslib/clargs`, plus migration discipline for legacy `get_command_line_arguments()` callers |
@@ -213,7 +211,7 @@ Full migration table (when reading older docs that say `var inscope` or `<-` for
 - `table[key]` (read or assign) is **safe** — do NOT wrap in `unsafe(...)`. Some legacy daslib code has `unsafe(tab[k])`; do not propagate that pattern
 - **Move-assign table literal:** `tab <- { "k" => v }` works for both `var tab <- { ... }` declarations and `tab <- { ... }` reassignment to existing variables
 - **Table comprehension move-assign:** `tab <- { for(x in range(5)); x => x*x }` — same move-assign rules apply
-- **`table<T>` (one type param) is the set type** — value type elided. `var s : table<int>; s |> insert(5); key_exists(s, 5)`. Distinct from `table<K; V>` (the map form); both shapes coexist.
+- **`table<T>` (one type param) is the set type** — value type elided. `var s : table<int>; s |> insert(5); key_exists(s, 5)`. Distinct from `table<K; V>` (the map form); both shapes coexist. Set-literal init: `let STOP_WORDS : table<string> <- { "a", "an", "the" }` — value-less braces, comma-separated. Use this instead of declaring `var X : table<T>` and populating in an `[init]` function.
 
 ### Iterators and `each`
 
@@ -289,3 +287,24 @@ Most layout is obvious from `ls`. Non-obvious ones worth knowing:
 The daslang MCP server (`utils/mcp/main.das`) exposes compiler diagnostics, program introspection, and live-reload control. **Prefer MCP tools** over manual compilation and grep — `grep_usage` is parse-aware (tree-sitter), `find_references` resolves cross-module symbols, and `live_*` tools talk to `daslang-live` directly instead of curl.
 
 Full tool table (including `detect_duplicates`/`judge_duplicates`/`find_dupe`), live-API caveats, and `.mcp.json` configuration: **`skills/mcp_tools.md`**.
+
+---
+
+## MOUSE FIRST (hard rule)
+
+**The trigger:** the moment you are about to call `Grep`, `Read`, `Explore`, or launch any agent to answer a "how do I X?" / "what's the right pattern for Y?" / "why does Z behave this way?" question. **Stop. Call `mouse__ask` first.** This is not a courtesy and not a fallback — `mouse__ask` is the *first* research tool. Every time.
+
+If you find yourself reaching for a research tool with a how/why/pattern-shaped question in mind and you haven't asked mouse, you are violating the rule. The trigger fires every time, not just the first time in a session.
+
+**Reject these rationalizations** — they are exactly the failure modes that have demoted past sessions:
+
+- *"I know this codebase, I'll just grep."* — Your model is stale; the cache is current. If mouse has the answer, you should read THAT, not your own re-derivation.
+- *"It's a small/quick question, mouse is overkill."* — 50ms ask vs minutes of grep-then-re-derive when the cache had the answer. The asymmetry is the whole point of the rule. Small questions are exactly when the cost of asking is cheapest.
+- *"I'll mouse__ask if grep doesn't find it."* — Backwards. Mouse short-circuits grep; it doesn't backstop it. By the time grep fails, you've already paid the cost the rule was designed to avoid.
+- *"The mouse MCP just disconnected, I'll skip this round."* — When the MCP reconnects (the system reminder will tell you), re-anchor immediately. Your *next* how/why moment is a `mouse__ask`, not a free pass.
+
+**Mid-stream recovery is non-negotiable.** Two consecutive `Grep` / `Read` / `Glob` / `Agent` calls on the same topic without a `mouse__ask` between them = warning sign. **Stop. Ask mouse now.** Don't promise yourself you'll do it "after this one more grep." The longer you research without asking, the harder sunk-cost makes it to ask.
+
+**Cache-miss discipline.** If `mouse__ask` returns nothing useful, immediately call `mouse__bad` with the `query_id` from the response (signals: BM25 matched on tokens, no real answer in corpus). Finish the research the long way. Then `mouse__add` the answer you found before moving on to the next task. Misses you skip never show up in `mouse log --misses`; the wrap-up curation pass (`skills/task_wrap_up.md`) is the only safety net, and it only fires if you run it.
+
+A session that does research without `mouse__ask` is leaking time *and* losing the chance to make the cache smarter for the next session. Treat this as a load-bearing constraint on every tool call, not a hint to remember at session start.

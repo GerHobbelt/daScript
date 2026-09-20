@@ -122,8 +122,14 @@ jobs:
           - target: linux_arm
             architecture: 32
 
+          # The linux_arm × 64 cell already produces daslang-bundle-linux-arm64.zip
+          # (release_arch: arm64 via the include overlay at L53-57, which applies
+          # to all linux_arm cells regardless of architecture). Lifting this
+          # exclude would make the ×arm64 cell build the same bundle name on the
+          # same ARM64 hardware (ubuntu-24.04-arm-fat) and clobber via the
+          # `--clobber` flag in the upload step. Wasted CI for no extra artifact.
           - target: linux_arm
-            architecture: arm64 # todo
+            architecture: arm64
 
           - target: windows
             architecture: arm64
@@ -145,7 +151,7 @@ jobs:
         run: |
           set -eux
           case "${{ matrix.target }}${{ matrix.architecture }}" in
-            linux64|linux_arm64)
+            linux64|linux_arm*)
               echo "MARCH=64" >> $GITHUB_ENV
               sudo apt-get update -y
               sudo apt-get install --no-install-recommends -y \

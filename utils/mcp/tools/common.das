@@ -26,10 +26,25 @@ struct ToolResult {
 
 // query matching: case-insensitive substring by default, "=foo" for exact case-sensitive
 def symbol_matches(name, query : string) : bool {
-    if (length(query) > 0 && first_character(query) == '=') {
+    if (!empty(query) && first_character(query) == '=') {
         return name == slice(query, 1)
     }
     return find(to_lower(name), to_lower(query)) >= 0
+}
+
+// True when `name` looks like a path-qualified module ("daslib/ast", "foo/bar").
+// Used to gate the auto-`daslib/` fallback: only single-token names get rewritten.
+def is_qualified_module_name(name : string) : bool {
+    return find(name, "/") >= 0
+}
+
+// Result of an attempt by an MCP tool helper that compiles a stub-with-`require`.
+// `retryable=false` means the failure happened before compile (e.g. temp-file write),
+// so retrying with `daslib/<name>` cannot help.
+struct TryResult {
+    text : string
+    ok : bool
+    retryable : bool
 }
 
 def make_tool_result(text : string; is_error : bool = false) : string {
@@ -37,6 +52,32 @@ def make_tool_result(text : string; is_error : bool = false) : string {
     result.isError = is_error
     result.content |> emplace(ContentItem(_type = "text", text = text))
     return sprint_json(result, false)
+}
+
+// Validate the `project` argument shared across MCP subtools. Empty is fine
+// (means "no project, default file access"). Non-empty must point at an
+// existing regular `.das_project` file. Returns empty on success, otherwise
+// a focused error suitable for `make_tool_result(...)`. Catches the common
+// failure mode where callers pass a directory or a non-project file and the
+// underlying compile_file() surfaces a misleading "missing prerequisite".
+def validate_project_arg(project : string) : string {
+    if (empty(project)) {
+        return ""
+    }
+    if (!ends_with(project, ".das_project")) {
+        return "invalid 'project' argument: '{project}' — expected a path to a .das_project file"
+    }
+    let st = stat(project)
+    if (!st.is_valid) {
+        return "'project' file not found: '{project}'"
+    }
+    if (st.is_dir) {
+        return "'project' is a directory, not a .das_project file: '{project}'"
+    }
+    if (!st.is_reg) {
+        return "'project' is not a regular file: '{project}'"
+    }
+    return ""
 }
 
 def write_deduped(var writer : StringBuilderWriter; messages : array<string>; prefix : string = "  ") {
@@ -65,6 +106,10 @@ def compile_and_simulate(file : string; project : string = ""; blk : block<(prog
 }
 
 def compile_and_simulate_ctx(file : string; project : string = ""; blk : block<(program : smart_ptr<Program>; var ctx : smart_ptr<Context>; issues : string) : string>) : string {
+    let proj_err = validate_project_arg(project)
+    if (!empty(proj_err)) {
+        return make_tool_result(proj_err, true)
+    }
     var inscope access <- make_file_access(project)
     var result : string
     var had_error = false
@@ -97,6 +142,10 @@ def compile_program(file : string; _export_all : bool; blk : block<(program : sm
 }
 
 def compile_program(file : string; _export_all : bool; _no_opt : bool; project : string = ""; blk : block<(program : smart_ptr<Program>; issues : string) : string>) : string {
+    let proj_err = validate_project_arg(project)
+    if (!empty(proj_err)) {
+        return make_tool_result(proj_err, true)
+    }
     var inscope access <- make_file_access(project)
     var result : string
     var had_error = false
@@ -136,6 +185,10 @@ def compile_only(file : string; _export_all : bool; project : string = ""; blk :
 }
 
 def compile_only(file : string; _export_all : bool; _no_opt : bool; project : string = ""; _lint : bool = false; blk : block<(program : smart_ptr<Program>; issues : string) : string>) : string {
+    let proj_err = validate_project_arg(project)
+    if (!empty(proj_err)) {
+        return make_tool_result(proj_err, true)
+    }
     var inscope access <- make_file_access(project)
     var result : string
     var had_error = false
@@ -276,24 +329,71 @@ def get_daslang_exe() : string {
     return get_das_exe()
 }
 
-// Run an external command, capture stdout+stderr, return exit_code.
-// `args[0]` is the executable; remaining elements are positional arguments.
-// timeout_sec > 0 kills the process tree after that many seconds (returns popen_timed_out).
-// timeout_sec <= 0 means no timeout.
+// ── MCP subtool runner ──────────────────────────────────────────────
 //
-// Argv-based: `popen_argv` (Windows: CreateProcess; Unix: fork+execvp) bypasses
-// the shell entirely. No cmd.exe quote-stripping, no /bin/sh `$()`/backtick
-// expansion — every argv element reaches the child verbatim. Callers don't
-// (and shouldn't) quote arguments themselves.
-def run_and_capture(args : array<string>; var output : string&; timeout_sec : float = 0.0) : int {
-    var captured : string
-    let exit_code = unsafe(popen_argv(args, timeout_sec, $(f) {
-        if (f != null) {
-            captured := unsafe(fread_to_eof(f))
+// Why subprocess: in-process compile_file / RTTI walks leak C++-side
+// [function_macro] and [call_macro] registrations into the long-lived MCP
+// daslang process. A second call against an edited .das file sees the OLD
+// macros. Spawning a fresh daslang.exe per call resets that state entirely.
+//
+// Subtool contract:
+//   - Lives at utils/mcp/subtools/<subtool_name>.das.
+//   - [export] def main reads positional argv via get_command_line_arguments().
+//   - Prints the FINAL tool-result envelope (the full make_tool_result(...) JSON)
+//     to stdout. The wrapper passes it through verbatim — no extra wrapping.
+//   - Exits 0 on success AND on tool-level failure (e.g. compile errors are a
+//     successful tool run that reports isError=true). Exit non-0 ONLY on
+//     catastrophic failure (cannot read args, internal panic).
+// Inside an MCP subtool's `[export] def main`, locate the caller-supplied
+// args inside daslang's full argv. Conventional invocation:
+//   daslang.exe utils/mcp/subtools/<name>.das -- <arg1> <arg2> ...
+// Returns the args after `--`. Falls back to args[2..] (skip exe + script
+// path) if no `--` is present, so subtools can also be invoked manually
+// for debugging without the separator.
+def subtool_user_args(args : array<string>) : array<string> {
+    var out : array<string>
+    var i = 0
+    while (i < length(args)) {
+        if (args[i] == "--") {
+            i++
+            while (i < length(args)) {
+                out |> push(args[i])
+                i++
+            }
+            return <- out
         }
-    }))
-    output := captured
-    return exit_code
+        i++
+    }
+    out |> reserve(max(0, length(args) - 2))
+    for (j in range(2, length(args))) {
+        out |> push(args[j])
+    }
+    return <- out
+}
+
+def run_mcp_subtool(subtool_name : string; args : array<string>; timeout_sec : float = 120.0) : string {
+    let exe = get_daslang_exe()
+    if (empty(exe)) {
+        return make_tool_result("Cannot determine daslang executable path", true)
+    }
+    let subtool_path = path_join(get_das_root(), "utils/mcp/subtools/{subtool_name}.das")
+    // `--` is critical: without it, daslang treats positional argv as extra
+    // .das files to load AND auto-runs each. With `--`, daslang stops parsing
+    // its own options and just exposes the rest via get_command_line_arguments().
+    var argv <- [exe, subtool_path, "--"]
+    argv |> reserve(length(argv) + length(args))
+    for (a in args) {
+        argv |> push(a)
+    }
+    var output : string
+    let exit_code = run_and_capture(argv, output, timeout_sec)
+    if (exit_code == popen_timed_out) {
+        return make_tool_result("MCP subtool '{subtool_name}' timed out after {timeout_sec}s:\n{output}", true)
+    }
+    if (exit_code != 0) {
+        return make_tool_result("MCP subtool '{subtool_name}' failed (exit {exit_code}):\n{output}", true)
+    }
+    return output
 }
 
 // ── Temp file utilities ──────────────────────────────────────────────
@@ -309,13 +409,10 @@ def resolve_path(path : string) : string {
     if (empty(path)) {
         return get_das_root()
     }
-    if (is_absolute(path)) {
-        return path
-    }
-    // Preserve Windows drive-relative paths (`C:foo`). std::filesystem
-    // doesn't classify them as absolute (no trailing separator), so they'd
-    // otherwise be joined under das_root and produce an invalid path.
-    if (find(path, ":") == 1) {
+    // `find(path, ":") == 1` preserves Windows drive-relative paths (`C:foo`):
+    // std::filesystem doesn't classify them as absolute (no trailing separator),
+    // so they'd otherwise be joined under das_root and produce an invalid path.
+    if (is_absolute(path) || find(path, ":") == 1) {
         return path
     }
     return path_join(get_das_root(), path)

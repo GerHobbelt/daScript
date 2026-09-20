@@ -155,20 +155,11 @@ def operator ?. value(var a : JsonValue? ==const) : JsValue? {
 [macro_function]
 def private is_json_ptr_value(td : TypeDeclPtr) {
     //! Checks if the type is a pointer to json::JsonValue
-    if (td.baseType != Type.tPointer) {
-        return false
-    }
-    if (td.firstType == null) {
-        return false
-    }
-    if (td.firstType.baseType != Type.tStructure) {
+    if (td.baseType != Type.tPointer || td.firstType == null || td.firstType.baseType != Type.tStructure) {
         return false
     }
     let st = td.firstType.structType
-    if (st.name != "JsonValue" && st._module.name != "json") {
-        return false
-    }
-    return true
+    return st.name == "JsonValue" && st._module.name == "json"
 }
 
 
@@ -438,7 +429,7 @@ def public parse_json_annotation(name : string; annotation : array<tuple<name : 
         if (ann.name == "rename") {
             if (ann.data is tString) {
                 fieldState.argName = ann.data as tString
-            } elif (ann.data is tBool && length(name) > 0 && first_character(name) == '_') {
+            } elif (ann.data is tBool && !empty(name) && first_character(name) == '_') {
                 fieldState.argName = slice(name, 1)
             }
         } elif (ann.name == "enum_as_int" && ann.data is tBool) {
@@ -555,7 +546,12 @@ def JV(value : auto(TT)) : JsonValue? {
         return _::JV(arr)
     }
     static_if (typeinfo typename(value) == "json::JsonValue?" || typeinfo typename(value) == "json::JsonValue? const") {
-        return value
+        // Pass-through: JsonValue? IS a JsonValue?. Const-strip the pointer
+        // so callers walking const containers (apply on a const struct/tuple
+        // hands fields as const) round-trip cleanly.
+        unsafe {
+            return reinterpret<JsonValue?>(value)
+        }
     } static_elif (typeinfo is_pointer(value)) {
         return value == null ? default<JsonValue?> : _::JV(*value)
     } static_elif (typeinfo is_enum(value)) {
@@ -595,14 +591,20 @@ def JV(value : auto(TT)) : JsonValue? {
                     static_if (typeinfo is_string(field)) {
                         if (empty(field)) { return ; }
                     } static_elif (typeinfo is_array(field)) {
-                        if (length(field) == 0) { return ; }
+                        if (empty(field)) { return ; }
                     } static_elif (typeinfo is_table(field)) {
-                        if (length(field) == 0) { return ; }
+                        if (empty(field)) { return ; }
                     } static_elif (typeinfo is_pointer(field)) {
                         if (field == null) { return ; }
                     } else {
                         static_if (typeinfo is_workhorse(field)) {
-                            if (field == default<typedecl(field)>) { return ; }
+                            // bool path uses `!field` (avoids STYLE018 on `bool == false` after
+                            // generic instantiation); numeric workhorses keep the generic-zero compare.
+                            static_if (typeinfo stripped_typename(field) == "bool") {
+                                if (!field) { return ; }
+                            } else {
+                                if (field == default<typedecl(field)>) { return ; }
+                            }
                         }
                     }
                 }
