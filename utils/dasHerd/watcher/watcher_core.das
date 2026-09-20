@@ -18,6 +18,21 @@ let private MAX_COMMAND_BYTES = 32 * 1024
 let private MAX_INPUT_BYTES = 1024 * 1024
 let private MAX_RAW_HISTORY_BYTES = 8 * 1024 * 1024
 let private RAW_HISTORY_TRIM_SLACK = 1024 * 1024
+let private WATCHER_GC_STRING_PRESSURE_BYTES = 64ul * 1024ul * 1024ul
+let private WATCHER_GC_HEAP_PRESSURE_BYTES = 128ul * 1024ul * 1024ul
+
+def public watcher_gc_reason(string_used, string_total,
+                             heap_used, heap_total : uint64) : string {
+    if (string_used >= WATCHER_GC_STRING_PRESSURE_BYTES) return "string_pressure"
+    if (heap_used >= WATCHER_GC_HEAP_PRESSURE_BYTES) return "heap_pressure"
+    if (string_total > 0ul && string_used * 3ul < string_total * 2ul) {
+        return "string_fragmentation"
+    }
+    if (heap_total > 0ul && heap_used * 3ul < heap_total) {
+        return "heap_fragmentation"
+    }
+    return ""
+}
 
 struct public WatcherLaunchRequest {
     command_line : string
@@ -50,6 +65,73 @@ struct public WatcherResizeRequest {
 
 struct public WatcherSessionRequest {
     session_id : string
+}
+
+struct public WatcherFocusRange {
+    start_byte : int = -1
+    end_byte : int = -1
+    caption : string
+}
+
+struct public WatcherFocusTarget {
+    file_path : string
+    whole_file : bool
+    ranges : array<WatcherFocusRange>
+}
+
+struct public WatcherFocusSet {
+    repository_id : string
+    worktree_path : string
+    comparison : string = "working"
+    revision : string
+    summary : string
+    targets : array<WatcherFocusTarget>
+}
+
+struct public WatcherMailboxPostRequest {
+    session_id : string
+    direction : string
+    sender : string = ""
+    kind : string = "note"
+    subject : string
+    reply_to : string
+    notify : bool = true
+    focus : WatcherFocusSet = WatcherFocusSet()
+}
+
+struct public WatcherMailboxStateRequest {
+    session_id : string
+    message_id : string
+    status : string
+}
+
+struct public WatcherMailboxMessage {
+    id : string
+    session_id : string
+    direction : string
+    sender : string
+    kind : string
+    subject : string
+    reply_to : string
+    status : string = "new"
+    notified : bool
+    notification_error : string
+    fetched : bool
+    created_ms : int64
+    revision : int64
+    focus : WatcherFocusSet = WatcherFocusSet()
+}
+
+struct public WatcherMailboxResult {
+    ok : bool
+    message_id : string
+    revision : int64
+    error : string
+}
+
+struct private WatcherPendingNotification {
+    message_id : string
+    text : string
 }
 
 struct public WatcherEvent {
@@ -119,6 +201,7 @@ class private WatcherSession {
     session_dir : string
     output_path : string
     events_path : string
+    mailbox_path : string
     state : string = "starting"
     reason : string
     pid : int = 0
@@ -137,6 +220,12 @@ class private WatcherSession {
     status_revision : int64
     controller_id : int
     drained : bool
+    mailbox : array<WatcherMailboxMessage>
+    mailbox_revision : int64
+    mailbox_file : FILE const? = null
+    input_line_bytes : int
+    input_escape_state : int
+    pending_notifications : array<WatcherPendingNotification>
     def operator delete {
         if (output_file != null) {
             fflush(output_file)
@@ -148,8 +237,15 @@ class private WatcherSession {
             fclose(events_file)
             events_file = null
         }
+        if (mailbox_file != null) {
+            fflush(mailbox_file)
+            fclose(mailbox_file)
+            mailbox_file = null
+        }
         terminal_dispose(terminal)
         delete raw_history
+        delete mailbox
+        delete pending_notifications
     }
 }
 
@@ -170,6 +266,8 @@ def private retain_raw_output(var session : WatcherSession?; bytes : array<uint8
 var private g_sessions : array<WatcherSession?>
 var private g_log_root : string
 var private g_next_session_id = 0
+var private g_next_mailbox_id = 0
+var private g_mailbox_revision : int64
 
 def private elapsed_ms(session : WatcherSession?) : int64 {
     return get_time_nsec(session.started) / 1000000l
@@ -267,15 +365,18 @@ def public watcher_launch(request : WatcherLaunchRequest) : WatcherLaunchResult 
         session_dir = session_dir,
         output_path = path_join(session_dir, "output.raw"),
         events_path = path_join(session_dir, "events.jsonl"),
+        mailbox_path = path_join(session_dir, "mailbox.jsonl"),
         started = ref_time_ticks(), timeout_ms = max(0l, request.timeout_ms))
     session.output_file = fopen(session.output_path, "wb")
     session.events_file = fopen(session.events_path, "wb")
-    if (session.output_file == null || session.events_file == null) {
+    session.mailbox_file = fopen(session.mailbox_path, "wb")
+    if (session.output_file == null || session.events_file == null
+            || session.mailbox_file == null) {
         unsafe { delete session }
         return WatcherLaunchResult(error = "could not open session logs")
     }
     let columns = clamp(request.columns, 20, 400)
-    let rows = clamp(request.rows, 5, 200)
+    let rows = clamp(request.rows, 5, 512)
     var inscope persisted_request := request
     persisted_request.columns = columns
     persisted_request.rows = rows
@@ -425,11 +526,22 @@ def public watcher_output_text(session_id : string) : string {
 def public watcher_strip_terminal_controls(value : string) : string {
     // Task processes launched through ConPTY are wrapped in cursor, screen,
     // title, and mode sequences even when the child itself emits plain text.
-    // Machine consumers need the original printable byte stream, not a
-    // bounded reconstructed screen.
+    // Machine consumers need the printable byte stream, not a bounded screen;
+    // cursor moves are intentionally normalized into spaces/newlines so
+    // ConPTY-expanded field and record separators remain machine-parseable.
     var inscope output : array<uint8>
     output |> reserve(length(value))
     var state = 0 // 0=text, 1=ESC, 2=CSI, 3=OSC, 4=OSC ESC, 5=ST string, 6=ST ESC
+    var csi_first = 0
+    var csi_second = 0
+    var csi_field = 0
+    var csi_has_first = false
+    var csi_has_second = false
+    var cursor_row = 1
+    var cursor_column = 1
+    var utf8_codepoint = 0u
+    var utf8_minimum = 0u
+    var utf8_remaining = 0
     peek_data(value) $(bytes) {
         for (index in range(length(value))) {
             let byte = int(bytes[index])
@@ -439,10 +551,54 @@ def public watcher_strip_terminal_controls(value : string) : string {
                 }
                 elif (byte == '\t' || byte == '\r' || byte == '\n' || byte >= 0x20) {
                     output |> push(uint8(byte))
+                    if (byte == '\r') {
+                        cursor_column = 1
+                        utf8_remaining = 0
+                    } elif (byte == '\n') {
+                        cursor_row++
+                        cursor_column = 1
+                        utf8_remaining = 0
+                    } elif (byte < 0x80) {
+                        cursor_column++
+                        utf8_remaining = 0
+                    } elif (utf8_remaining > 0 && (byte & 0xc0) == 0x80) {
+                        utf8_codepoint = (utf8_codepoint << 6u) | uint(byte & 0x3f)
+                        utf8_remaining--
+                        if (utf8_remaining == 0) {
+                            let valid = (utf8_codepoint >= utf8_minimum &&
+                                utf8_codepoint <= 0x10ffffu &&
+                                !(utf8_codepoint >= 0xd800u && utf8_codepoint <= 0xdfffu))
+                            cursor_column += terminal_codepoint_width(
+                                valid ? utf8_codepoint : 0xfffdu)
+                        }
+                    } else {
+                        if (utf8_remaining > 0) cursor_column++
+                        if ((byte & 0xe0) == 0xc0) {
+                            utf8_codepoint = uint(byte & 0x1f)
+                            utf8_minimum = 0x80u
+                            utf8_remaining = 1
+                        } elif ((byte & 0xf0) == 0xe0) {
+                            utf8_codepoint = uint(byte & 0x0f)
+                            utf8_minimum = 0x800u
+                            utf8_remaining = 2
+                        } elif ((byte & 0xf8) == 0xf0) {
+                            utf8_codepoint = uint(byte & 0x07)
+                            utf8_minimum = 0x10000u
+                            utf8_remaining = 3
+                        } else {
+                            cursor_column++
+                            utf8_remaining = 0
+                        }
+                    }
                 }
             } elif (state == 1) {
                 if (byte == '[') {
                     state = 2
+                    csi_first = 0
+                    csi_second = 0
+                    csi_field = 0
+                    csi_has_first = false
+                    csi_has_second = false
                 } elif (byte == ']') {
                     state = 3
                 } elif (byte == 'P' || byte == '^' || byte == '_' || byte == 'X') {
@@ -451,7 +607,45 @@ def public watcher_strip_terminal_controls(value : string) : string {
                     state = 0
                 }
             } elif (state == 2) {
-                if (byte >= 0x40 && byte <= 0x7e) {
+                if (is_number(byte)) {
+                    if (csi_field == 0) {
+                        csi_first = min(4096, csi_first * 10 + byte - '0')
+                        csi_has_first = true
+                    } else {
+                        csi_second = min(4096, csi_second * 10 + byte - '0')
+                        csi_has_second = true
+                    }
+                } elif (byte == ';') {
+                    csi_field = 1
+                } elif (byte >= 0x40 && byte <= 0x7e) {
+                    // ConPTY expands horizontal tabs emitted by console
+                    // applications into CSI cursor commands. Preserve their
+                    // field and record-separating effect for machine consumers.
+                    if (byte == 'C') {
+                        let spaces = csi_has_first ? max(1, csi_first) : 1
+                        for (_ in range(spaces)) {
+                            output |> push(uint8(' '))
+                        }
+                        cursor_column += spaces
+                    } elif (byte == 'G') {
+                        let target_column = csi_has_first ? max(1, csi_first) : 1
+                        while (cursor_column < target_column) {
+                            output |> push(uint8(' '))
+                            cursor_column++
+                        }
+                    } elif (byte == 'H' || byte == 'f') {
+                        let target_row = csi_has_first ? max(1, csi_first) : 1
+                        let target_column = csi_has_second ? max(1, csi_second) : 1
+                        while (cursor_row < target_row) {
+                            output |> push(uint8('\n'))
+                            cursor_row++
+                            cursor_column = 1
+                        }
+                        while (cursor_column < target_column) {
+                            output |> push(uint8(' '))
+                            cursor_column++
+                        }
+                    }
                     state = 0
                 }
             } elif (state == 3) {
@@ -475,7 +669,7 @@ def public watcher_strip_terminal_controls(value : string) : string {
 }
 
 def public watcher_machine_output_text(session_id : string;
-                                       var truncated : bool) : string {
+                                       var truncated : bool&) : string {
     truncated = false
     let index = watcher_find_session(session_id)
     if (index < 0 || g_sessions[index] == null) return ""
@@ -503,7 +697,7 @@ def public watcher_compact_session(session_id : string;
     var session = g_sessions[index]
     if (!session.drained || session.state == "running" || session.state == "terminating") return false
     let compact_columns = clamp(columns, 20, 400)
-    let compact_rows = clamp(rows, 5, 200)
+    let compact_rows = clamp(rows, 5, 512)
     if (session.terminal.transport == null && session.terminal.columns == compact_columns
             && session.terminal.rows == compact_rows) return true
     var inscope compact <- terminal_create(compact_columns, compact_rows)
@@ -550,16 +744,241 @@ def private input_session(var session : WatcherSession?; text : string; client_i
     return ""
 }
 
+def private observe_input_line(var session : WatcherSession?; text : string) {
+    peek_data(text) $(bytes) {
+        for (byte_u8 in bytes) {
+            let byte = int(byte_u8)
+            if (session.input_escape_state == 1) {
+                session.input_escape_state = (byte == '[' || byte == 'O') ? 2 : 0
+            } elif (session.input_escape_state == 2) {
+                if (byte >= 0x40 && byte <= 0x7e) {
+                    session.input_escape_state = 0
+                }
+            } elif (byte == 0x1b) {
+                session.input_escape_state = 1
+            } elif (byte == '\r' || byte == '\n') {
+                session.input_line_bytes = 0
+            } elif (byte == 0x03 || byte == 0x15) {
+                session.input_line_bytes = 0
+            } elif (byte == 0x08 || byte == 0x7f) {
+                session.input_line_bytes = max(0, session.input_line_bytes - 1)
+            } elif (byte >= 0x20) {
+                session.input_line_bytes++
+            }
+        }
+    }
+}
+
+def private flush_pending_notifications(var session : WatcherSession?) {
+    if (session.input_line_bytes != 0 || empty(session.pending_notifications)) return
+    var delivered = 0
+    while (delivered < length(session.pending_notifications)) {
+        let pending & = unsafe(session.pending_notifications[delivered])
+        if (!terminal_write(session.terminal, pending.text)) break
+        session.input_bytes += int64(length(pending.text))
+        if (!empty(pending.message_id)) {
+            let _ = watcher_mailbox_set_notification(session.id, pending.message_id)
+            append_event(session, "mailbox_notified",
+                "id={pending.message_id}; delivery=deferred")
+        }
+        delivered++
+    }
+    if (delivered > 0) {
+        session.pending_notifications |> erase(0, delivered)
+    }
+}
+
 def public watcher_input(session_id : string; text : string; client_id : int = 0) : string {
     let index = watcher_find_session(session_id)
     if (index < 0) return "unknown session"
     if (length(text) > MAX_INPUT_BYTES) return "input is too large"
-    return input_session(g_sessions[index], text, client_id)
+    let error = input_session(g_sessions[index], text, client_id)
+    if (!empty(error)) return error
+    observe_input_line(g_sessions[index], text)
+    flush_pending_notifications(g_sessions[index])
+    return ""
+}
+
+def public watcher_notify(session_id : string; text : string;
+                          message_id : string = "") : string {
+    //! A mailbox wake-up is one serialized terminal write. It deliberately
+    //! bypasses controller ownership: the controller is UI transport state,
+    //! not an authorization boundary for Herder's trusted local mailbox.
+    let index = watcher_find_session(session_id)
+    if (index < 0) return "unknown session"
+    if (length(text) > MAX_INPUT_BYTES) return "input is too large"
+    if (g_sessions[index].input_line_bytes != 0) {
+        var pending = WatcherPendingNotification(
+            message_id = message_id, text = text)
+        g_sessions[index].pending_notifications |> emplace(pending)
+        if (!empty(message_id)) {
+            let _ = watcher_mailbox_set_notification(
+                session_id, message_id, "queued")
+            append_event(g_sessions[index], "mailbox_notification_queued",
+                "id={message_id}; partial_input_bytes={g_sessions[index].input_line_bytes}")
+        } else {
+            append_event(g_sessions[index], "terminal_notification_queued",
+                "partial_input_bytes={g_sessions[index].input_line_bytes}")
+        }
+        return "queued"
+    }
+    let controller_id = g_sessions[index].controller_id
+    return input_session(g_sessions[index], text, controller_id)
+}
+
+def private valid_focus(focus : WatcherFocusSet const) : string {
+    for (target in focus.targets) {
+        if (empty(target.file_path)) return "focus target file_path is required"
+        for (focus_range in target.ranges) {
+            if (focus_range.start_byte < 0
+                    || focus_range.end_byte <= focus_range.start_byte) {
+                return "focus ranges require non-negative, increasing byte offsets"
+            }
+        }
+    }
+    return ""
+}
+
+def private append_mailbox_record(var session : WatcherSession?;
+                                  message : WatcherMailboxMessage const) {
+    if (session.mailbox_file == null) return
+    fwrite(session.mailbox_file, sprint_json(message, false) + "\n")
+    fflush(session.mailbox_file)
+}
+
+def public watcher_mailbox_session_revision(session_id : string) : int64 {
+    let index = watcher_find_session(session_id)
+    if (index < 0 || g_sessions[index] == null) return -1l
+    return g_sessions[index].mailbox_revision
+}
+
+def public watcher_mailbox_post(request : WatcherMailboxPostRequest) : WatcherMailboxResult {
+    let index = watcher_find_session(request.session_id)
+    if (index < 0 || g_sessions[index] == null) {
+        return WatcherMailboxResult(error = "unknown session")
+    }
+    if (request.direction != "inbox" && request.direction != "outbox") {
+        return WatcherMailboxResult(error = "direction must be inbox or outbox")
+    }
+    if (empty(request.subject)) return WatcherMailboxResult(error = "subject is required")
+    let focus_error = valid_focus(request.focus)
+    if (!empty(focus_error)) return WatcherMailboxResult(error = focus_error)
+    let sender = (request.direction == "outbox"
+        ? "agent_session:{request.session_id}"
+        : "human:local")
+    g_next_mailbox_id++
+    g_mailbox_revision++
+    var message = WatcherMailboxMessage(
+        id = "hf_{g_next_mailbox_id}", session_id = request.session_id,
+        direction = request.direction, sender = sender,
+        kind = request.kind, subject = request.subject,
+        reply_to = request.reply_to, created_ms = elapsed_ms(g_sessions[index]),
+        revision = g_mailbox_revision, focus := request.focus)
+    let message_id = message.id
+    let message_revision = message.revision
+    g_sessions[index].mailbox |> emplace(message)
+    g_sessions[index].mailbox_revision = g_mailbox_revision
+    append_mailbox_record(g_sessions[index],
+        g_sessions[index].mailbox[length(g_sessions[index].mailbox) - 1])
+    append_event(g_sessions[index], "mailbox_posted",
+        "id={message_id}; direction={request.direction}; sender={sender}")
+    return WatcherMailboxResult(ok = true, message_id = message_id,
+        revision = message_revision)
+}
+
+def public watcher_mailbox_set_notification(session_id, message_id : string;
+                                            error : string = "") : WatcherMailboxResult {
+    let index = watcher_find_session(session_id)
+    if (index < 0 || g_sessions[index] == null) {
+        return WatcherMailboxResult(error = "unknown session")
+    }
+    var session = g_sessions[index]
+    for (message_index in range(length(session.mailbox))) {
+        if (session.mailbox[message_index].id != message_id) continue
+        g_mailbox_revision++
+        session.mailbox[message_index].notified = empty(error)
+        session.mailbox[message_index].notification_error = error
+        session.mailbox[message_index].revision = g_mailbox_revision
+        session.mailbox_revision = g_mailbox_revision
+        append_mailbox_record(session, session.mailbox[message_index])
+        return WatcherMailboxResult(ok = true, message_id = message_id,
+            revision = g_mailbox_revision)
+    }
+    return WatcherMailboxResult(error = "unknown mailbox message")
+}
+
+def public watcher_mailbox_mark_fetched(session_id, message_id : string) : WatcherMailboxResult {
+    let index = watcher_find_session(session_id)
+    if (index < 0 || g_sessions[index] == null) {
+        return WatcherMailboxResult(error = "unknown session")
+    }
+    var session = g_sessions[index]
+    for (message_index in range(length(session.mailbox))) {
+        if (session.mailbox[message_index].id != message_id) continue
+        if (session.mailbox[message_index].fetched) {
+            return WatcherMailboxResult(ok = true, message_id = message_id,
+                revision = session.mailbox[message_index].revision)
+        }
+        g_mailbox_revision++
+        session.mailbox[message_index].fetched = true
+        session.mailbox[message_index].revision = g_mailbox_revision
+        session.mailbox_revision = g_mailbox_revision
+        append_mailbox_record(session, session.mailbox[message_index])
+        append_event(session, "mailbox_fetched", "id={message_id}")
+        return WatcherMailboxResult(ok = true, message_id = message_id,
+            revision = g_mailbox_revision)
+    }
+    return WatcherMailboxResult(error = "unknown mailbox message")
+}
+
+def public watcher_mailbox_set_state(request : WatcherMailboxStateRequest) : WatcherMailboxResult {
+    let index = watcher_find_session(request.session_id)
+    if (index < 0 || g_sessions[index] == null) {
+        return WatcherMailboxResult(error = "unknown session")
+    }
+    if (request.status != "new" && request.status != "acknowledged"
+            && request.status != "completed") {
+        return WatcherMailboxResult(error = "status must be new, acknowledged, or completed")
+    }
+    var session = g_sessions[index]
+    for (message_index in range(length(session.mailbox))) {
+        if (session.mailbox[message_index].id != request.message_id) continue
+        g_mailbox_revision++
+        session.mailbox[message_index].status = request.status
+        session.mailbox[message_index].revision = g_mailbox_revision
+        session.mailbox_revision = g_mailbox_revision
+        append_mailbox_record(session, session.mailbox[message_index])
+        append_event(session, "mailbox_state",
+            "id={request.message_id}; status={request.status}")
+        return WatcherMailboxResult(ok = true,
+            message_id = request.message_id, revision = g_mailbox_revision)
+    }
+    return WatcherMailboxResult(error = "unknown mailbox message")
+}
+
+def public watcher_mailbox_json(session_id : string; direction : string = "";
+                                message_id : string = "") : string {
+    let index = watcher_find_session(session_id)
+    if (index < 0 || g_sessions[index] == null) return "[]"
+    return build_string() $(var writer) {
+        writer |> write("[")
+        var first = true
+        for (message in g_sessions[index].mailbox) {
+            if ((!empty(direction) && message.direction != direction)
+                    || (!empty(message_id) && message.id != message_id)) continue
+            if (!first) {
+                writer |> write(",")
+            }
+            writer |> write(sprint_json(message, false))
+            first = false
+        }
+        writer |> write("]")
+    }
 }
 
 def private resize_session(var session : WatcherSession?; columns, rows, client_id : int) : string {
     if (session.controller_id != 0 && session.controller_id != client_id) return "controller lease is held by another client"
-    terminal_resize(session.terminal, clamp(columns, 20, 400), clamp(rows, 5, 200))
+    terminal_resize(session.terminal, clamp(columns, 20, 400), clamp(rows, 5, 512))
     append_event(session, "resized", "{session.terminal.columns}x{session.terminal.rows}")
     return ""
 }

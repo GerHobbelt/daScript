@@ -3,6 +3,7 @@ options gc
 options persistent_heap
 
 require dastest/testing_boost public
+require ../file_inspection.das
 require ../inspection_worker.das
 require daslib/jobque_boost
 require daslib/utf8_utils
@@ -18,6 +19,37 @@ def test_inspection_prepare_worker(t : T?) {
             "cpp", 1)
         tt |> equal(length(cpp.spans) > 1, true)
         text_source_document_dispose(cpp)
+    }
+    t |> run("compact Diff projects syntax from complete files") <| @(tt : T?) {
+        let complete_new = "options gen2\n\nstruct Sample \{\n    value : int\n\}\n\ndef answer(sample : Sample) : int \{\n    return sample.value + 1\n\}\n"
+        let compact_patch = "diff --git a/a.das b/a.das\n--- a/a.das\n+++ b/a.das\n@@ -8 +8 @@\n-    return sample.value\n+    return sample.value + 1\n"
+        var parsed <- git_parse_unified_patch(compact_patch)
+        let complete_old = inspector_reconstruct_old_source(complete_new, parsed)
+        tt |> equal(complete_old,
+            "options gen2\n\nstruct Sample \{\n    value : int\n\}\n\ndef answer(sample : Sample) : int \{\n    return sample.value\n\}\n")
+        var full_old <- tree_sitter_source_document(complete_old, "daslang", 21)
+        var full_new <- tree_sitter_source_document(complete_new, "daslang", 21)
+        var compact_old <- inspector_project_full_syntax(full_old,
+            parsed.old_aligned_text, parsed.rows, true, 21)
+        var compact_new <- inspector_project_full_syntax(full_new,
+            parsed.new_aligned_text, parsed.rows, false, 21)
+        tt |> success(length(compact_old.spans) > 1,
+            "old compact row retains complete-file syntax")
+        tt |> success(length(compact_new.spans) > 1,
+            "new compact row retains complete-file syntax")
+        var saw_keyword = false
+        for (span in compact_new.spans) {
+            if (span.syntax_style == TextSourceSyntaxStyle.keyword) {
+                saw_keyword = true
+            }
+        }
+        tt |> success(saw_keyword,
+            "the return keyword remains highlighted outside full context")
+        text_source_document_dispose(compact_old)
+        text_source_document_dispose(compact_new)
+        text_source_document_dispose(full_old)
+        text_source_document_dispose(full_new)
+        git_parsed_patch_dispose(parsed)
     }
     t |> run("worker prepares syntax off-thread and shuts down cleanly") <| @(t : T?) {
         t |> equal(is_utf8_string_valid("Καλημέρα, мир, こんにちは, 🐑"), true)
@@ -218,6 +250,63 @@ def test_inspection_prepare_worker(t : T?) {
                     completed = true
                     tt |> equal(event.view_source, "")
                     tt |> equal(event.view_document.source, "")
+                }
+            }
+        }
+        tt |> equal(completed, true)
+        tt |> equal(inspector_prepare_worker_shutdown(worker), true)
+        destroy_job_que()
+    }
+    t |> run("no-hunk patch still prepares the selected full View") <| @(tt : T?) {
+        let source = "int generated_value = 42;\n"
+        create_job_que()
+        var worker = InspectorPrepareWorker()
+        tt |> equal(inspector_prepare_worker_start(worker), true)
+        tt |> equal(inspector_prepare_worker_queue(worker, 17,
+            "warning: diff emitted no file patch\n", source,
+            "cpp", "", 0, true), true)
+        var completed = false
+        let wait_started = ref_time_ticks()
+        while (!completed && int64(get_time_usec(wait_started)) < 5000000l) {
+            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent const) {
+                if (event.kind == InspectorPrepareEventKind.completed) {
+                    completed = true
+                    tt |> equal(event.view_text_ready, true)
+                    tt |> equal(event.view_source, source)
+                    tt |> equal(event.view_document.source, source)
+                    tt |> equal(length(event.parsed.hunks), 0)
+                    tt |> success(length(event.view_document.spans) > 1,
+                        "zero-hunk View is syntax highlighted")
+                }
+            }
+        }
+        tt |> equal(completed, true)
+        tt |> equal(inspector_prepare_worker_shutdown(worker), true)
+        destroy_job_que()
+    }
+    t |> run("Git-binary UTF-8 bytes prepare as source View") <| @(tt : T?) {
+        let source = "// generated source\nint answer = 42;\n"
+        let encoded = base64_encode(source)
+        create_job_que()
+        var worker = InspectorPrepareWorker()
+        tt |> equal(inspector_prepare_worker_start(worker), true)
+        tt |> equal(inspector_prepare_worker_queue(worker, 18,
+            "diff --git a/generated.cpp b/generated.cpp\nBinary files a/generated.cpp and b/generated.cpp differ\n",
+            "", "cpp", encoded, length(source), true), true)
+        var completed = false
+        let wait_started = ref_time_ticks()
+        while (!completed && int64(get_time_usec(wait_started)) < 5000000l) {
+            inspector_prepare_worker_try_event(worker) $(event : InspectorPrepareEvent const) {
+                if (event.kind == InspectorPrepareEventKind.completed) {
+                    completed = true
+                    tt |> equal(event.parsed.binary, true)
+                    tt |> equal(event.view_text_ready, true)
+                    tt |> equal(event.view_source, source)
+                    tt |> equal(event.view_document.source, source)
+                    tt |> equal(event.preview_error, "")
+                    tt |> equal(empty(event.preview_pixels), true)
+                    tt |> success(length(event.view_document.spans) > 1,
+                        "Git-binary source is syntax highlighted")
                 }
             }
         }

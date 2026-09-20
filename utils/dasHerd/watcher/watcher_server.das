@@ -50,6 +50,8 @@ struct private WatcherWsMessage {
     worktree_path : string
     file_path : string
     comparison : string
+    revision : string
+    action : string
     diff_context : string
     request_id : int
     text : string
@@ -58,6 +60,14 @@ struct private WatcherWsMessage {
     timeout_ms : int64
     control : bool
     raw : bool
+    direction : string
+    sender : string = ""
+    subject : string
+    reply_to : string
+    message_id : string
+    status : string
+    notify : bool = true
+    focus : WatcherFocusSet = WatcherFocusSet()
 }
 
 struct public RepositoryFileInspectionMessage {
@@ -68,6 +78,7 @@ struct public RepositoryFileInspectionMessage {
     worktree_path : string
     file_path : string
     comparison : string
+    revision : string
     diff_context : string
     task_session_id : string
     loading : bool
@@ -78,6 +89,28 @@ struct public RepositoryFileInspectionMessage {
     view_available : bool
     status : string
     error : string
+}
+
+struct public RepositoryGitFileActionMessage {
+    @rename = "type"
+    _type : string = "git_file_action"
+    request_id : int
+    repository_id : string
+    worktree_path : string
+    file_path : string
+    action : string
+    task_session_id : string
+    loading : bool
+    status : string
+    error : string
+}
+
+struct private OrphanedGitFileAction {
+    session_id : string
+    repository_id : string
+    worktree_path : string
+    file_path : string
+    action : string
 }
 
 class private WatcherClient {
@@ -91,11 +124,13 @@ class private WatcherClient {
     raw : bool
     raw_offset : int64
     repository_revision : int64 = -1l
+    mailbox_revision : int64 = -1l
     inspection_request_id : int
     inspection_repository_id : string
     inspection_worktree_path : string
     inspection_file_path : string
     inspection_comparison : string
+    inspection_revision : string
     inspection_diff_context : string
     inspection_session_id : string
     inspection_expected_exit_code : int64
@@ -103,6 +138,13 @@ class private WatcherClient {
     inspection_phase : string
     inspection_patch : string
     inspection_artifact_path : string
+    action_request_id : int
+    action_repository_id : string
+    action_worktree_path : string
+    action_file_path : string
+    action : string
+    action_session_id : string
+    action_delivered : bool = true
 }
 
 struct private WatcherOk {
@@ -176,6 +218,7 @@ class DasHerdWatcherServer : HvWebServer {
     xterm_web_links_js : string
     clients : array<WatcherClient?>
     pending_inspection_artifacts : array<string>
+    orphaned_git_actions : array<OrphanedGitFileAction>
     next_client_id : int
 
     def authorized(url : string) : bool {
@@ -190,6 +233,23 @@ class DasHerdWatcherServer : HvWebServer {
         if (req != null && authorized(string(req.url))) return true
         let _ = respond_error(resp, http_status.UNAUTHORIZED, "invalid watcher token")
         return false
+    }
+
+    def maybe_notify_inbox_message(session_id, direction, message_id : string;
+                                   notify : bool) {
+        if (direction != "inbox" || !notify) return
+        let nudge_error = watcher_notify(session_id,
+            "dasHerd review request {message_id} is ready. " +
+            "Use the dasHerd skill to fetch and acknowledge it.\r",
+            message_id)
+        if (!empty(nudge_error) && nudge_error != "queued") {
+            print("dasHerd watcher: mailbox {message_id} persisted; " +
+                "TTY nudge failed: {nudge_error}\n")
+        }
+        if (nudge_error != "queued") {
+            let _ = watcher_mailbox_set_notification(
+                session_id, message_id, nudge_error)
+        }
     }
 
     def override onInit {
@@ -228,6 +288,31 @@ class DasHerdWatcherServer : HvWebServer {
         GET("/api/v1/repositories") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
             return resp |> JSON(repository_list_json(), http_status.OK)
+        }
+        GET("/api/v1/mailbox") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            let url = req != null ? string(req.url) : ""
+            let session_id = query_value(url, "session_id")
+            if (empty(session_id)) {
+                return self.respond_error(resp, http_status.BAD_REQUEST, "session_id is required")
+            }
+            if (watcher_find_session(session_id) < 0) {
+                return self.respond_error(resp, http_status.NOT_FOUND, "unknown session")
+            }
+            let direction = query_value(url, "direction")
+            if (!empty(direction) && direction != "inbox" && direction != "outbox") {
+                return self.respond_error(resp, http_status.BAD_REQUEST,
+                    "direction must be inbox or outbox")
+            }
+            let message_id = query_value(url, "message_id")
+            if (direction == "inbox" && !empty(message_id)) {
+                let fetched = watcher_mailbox_mark_fetched(session_id, message_id)
+                if (!fetched.ok) {
+                    return self.respond_error(resp, http_status.NOT_FOUND, fetched.error)
+                }
+            }
+            return resp |> JSON(watcher_mailbox_json(session_id,
+                direction, message_id), http_status.OK)
         }
         POST("/api/v1/gc") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
@@ -313,6 +398,35 @@ class DasHerdWatcherServer : HvWebServer {
             if (!empty(error)) return self.respond_error(resp, http_status.CONFLICT, error)
             return resp |> JSON(sprint_json(WatcherOk(), false), http_status.OK)
         }
+        POST("/api/v1/mailbox") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            if (req == null || length(req.body) > MAX_REQUEST_BODY_BYTES) {
+                return self.respond_error(resp, http_status.BAD_REQUEST, "request body is too large")
+            }
+            var request = WatcherMailboxPostRequest()
+            if (!sscan_json(string(req.body), request)) {
+                return self.respond_error(resp, http_status.BAD_REQUEST, "invalid mailbox JSON")
+            }
+            var result = watcher_mailbox_post(request)
+            if (!result.ok) return self.respond_error(resp, http_status.BAD_REQUEST, result.error)
+            self.maybe_notify_inbox_message(request.session_id,
+                request.direction, result.message_id, request.notify)
+            result.revision = watcher_mailbox_session_revision(request.session_id)
+            return resp |> JSON(sprint_json(result, false), http_status.CREATED)
+        }
+        POST("/api/v1/mailbox/state") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            if (req == null || length(req.body) > MAX_REQUEST_BODY_BYTES) {
+                return self.respond_error(resp, http_status.BAD_REQUEST, "request body is too large")
+            }
+            var request = WatcherMailboxStateRequest()
+            if (!sscan_json(string(req.body), request)) {
+                return self.respond_error(resp, http_status.BAD_REQUEST, "invalid mailbox state JSON")
+            }
+            let result = watcher_mailbox_set_state(request)
+            if (!result.ok) return self.respond_error(resp, http_status.BAD_REQUEST, result.error)
+            return resp |> JSON(sprint_json(result, false), http_status.OK)
+        }
     }
 
     def find_client(channel : WebSocketChannel) : int {
@@ -341,6 +455,21 @@ class DasHerdWatcherServer : HvWebServer {
             ws_opcode.WS_OPCODE_TEXT, true)
     }
 
+    def send_mailbox(var client : WatcherClient?; force : bool = false) {
+        if (client == null || empty(client.session_id)) return
+        let revision = watcher_mailbox_session_revision(client.session_id)
+        if (revision < 0l) {
+            send_error(client.channel, "unknown session")
+            return
+        }
+        if (!force && client.mailbox_revision == revision) return
+        client.mailbox_revision = revision
+        send(client.channel, "\{\"type\":\"mailbox\",\"session_id\":" +
+            "{sprint_json(client.session_id, false)},\"revision\":{revision},\"data\":" +
+            "{watcher_mailbox_json(client.session_id)}\}",
+            ws_opcode.WS_OPCODE_TEXT, true)
+    }
+
     def send_file_inspection(var client : WatcherClient?;
                              loading : bool; patch, error : string;
                              view_text : string = ""; status : string = "";
@@ -354,6 +483,7 @@ class DasHerdWatcherServer : HvWebServer {
             worktree_path = client.inspection_worktree_path,
             file_path = client.inspection_file_path,
             comparison = client.inspection_comparison,
+            revision = client.inspection_revision,
             diff_context = client.inspection_diff_context,
             task_session_id = client.inspection_session_id,
             loading = loading, patch = patch, view_text = view_text,
@@ -391,14 +521,166 @@ class DasHerdWatcherServer : HvWebServer {
         client.inspection_artifact_path = ""
     }
 
-    def start_staged_file_view(var client : WatcherClient?; patch : string) {
+    def send_git_file_action(var client : WatcherClient?; loading : bool;
+                             status : string; error : string = "") {
+        if (client == null) return
+        let message = RepositoryGitFileActionMessage(
+            request_id = client.action_request_id,
+            repository_id = client.action_repository_id,
+            worktree_path = client.action_worktree_path,
+            file_path = client.action_file_path,
+            action = client.action,
+            task_session_id = client.action_session_id,
+            loading = loading, status = status, error = error)
+        send(client.channel, sprint_json(message, false),
+            ws_opcode.WS_OPCODE_TEXT, true)
+    }
+
+    def start_git_file_action(var client : WatcherClient?;
+                              incoming : WatcherWsMessage const) {
+        if (client == null) return
+        if (!client.action_delivered) {
+            self.send_git_file_action(client, false, "failed",
+                "another Git file action is still running")
+            return
+        }
+        client.action_request_id = incoming.request_id
+        client.action_repository_id = incoming.repository_id
+        client.action_worktree_path = incoming.worktree_path
+        client.action_file_path = incoming.file_path
+        client.action = incoming.action
+        client.action_session_id = ""
+        var inscope argv : array<string>
+        let command_error = repository_file_action_argv(
+            incoming.repository_id, incoming.worktree_path,
+            incoming.file_path, incoming.action, argv)
+        if (!empty(command_error)) {
+            self.send_git_file_action(client, false, "failed", command_error)
+            return
+        }
+        let kind = incoming.action == "stage" ? "git-stage" : "git-unstage"
+        let _pruned = watcher_prune_completed_sessions(
+            kind, incoming.repository_id, incoming.worktree_path)
+        var inscope request = WatcherLaunchRequest(
+            cwd = incoming.worktree_path,
+            display_name = "Git {incoming.action}: {incoming.file_path}",
+            kind = kind, target_id = "local",
+            repository_id = incoming.repository_id,
+            worktree_path = incoming.worktree_path,
+            columns = 160, rows = 50, timeout_ms = 15000l)
+        request.argv := argv
+        let result = watcher_launch(request)
+        client.action_session_id = result.session_id
+        if (!result.ok) {
+            self.send_git_file_action(client, false, "failed", result.error)
+            return
+        }
+        client.action_delivered = false
+        self.send_git_file_action(client, true, "running")
+    }
+
+    def poll_git_file_action(var client : WatcherClient?) {
+        if (client == null || client.action_delivered
+                || empty(client.action_session_id)) return
+        var info = WatcherSessionInfo()
+        if (!watcher_get_session_info(client.action_session_id, info)
+                || !info.drained) return
+        client.action_delivered = true
+        var truncated = false
+        let output = watcher_machine_output_text(client.action_session_id, truncated)
+        let _compacted = watcher_compact_session(client.action_session_id, 160, 50)
+        var failure = ""
+        if (truncated) {
+            failure = "Git action output exceeded the retained machine-output limit"
+        } elif (info.exit_code != 0l) {
+            failure = "git exited with {info.exit_code}: {output}"
+        }
+        if (!empty(failure)) {
+            let _failure_error = repository_record_task_failure(
+                client.action_repository_id, client.action_session_id, failure)
+            self.send_git_file_action(client, false, "failed", failure)
+        } else {
+            self.send_git_file_action(client, false, "completed")
+        }
+        let _refresh_error = repository_refresh(client.action_repository_id)
+        let _review_error = repository_review(
+            client.action_repository_id, client.action_worktree_path)
+    }
+
+    def remember_orphaned_git_action(var client : WatcherClient?) {
+        if (client == null || client.action_delivered
+                || empty(client.action_session_id)) return
+        orphaned_git_actions |> push(OrphanedGitFileAction(
+            session_id = client.action_session_id,
+            repository_id = client.action_repository_id,
+            worktree_path = client.action_worktree_path,
+            file_path = client.action_file_path,
+            action = client.action))
+        print("dasHerd watcher: retaining Git {client.action} task " +
+            "{client.action_session_id} for {client.action_file_path} " +
+            "after client disconnect\n")
+    }
+
+    def poll_orphaned_git_actions() {
+        var index = length(orphaned_git_actions)
+        while (index > 0) {
+            index--
+            let action = orphaned_git_actions[index]
+            var info = WatcherSessionInfo()
+            if (!watcher_get_session_info(action.session_id, info)) {
+                let failure = "orphaned Git action session disappeared before observation"
+                let _failure_error = repository_record_task_failure(
+                    action.repository_id, action.session_id, failure)
+                let _refresh_error = repository_refresh(action.repository_id)
+                let _review_error = repository_review(
+                    action.repository_id, action.worktree_path)
+                print("dasHerd watcher: Git {action.action} task " +
+                    "{action.session_id} for {action.file_path} disappeared\n")
+                orphaned_git_actions |> erase(index)
+                continue
+            }
+            if (!info.drained) continue
+            var truncated = false
+            let output = watcher_machine_output_text(action.session_id, truncated)
+            let _compacted = watcher_compact_session(
+                action.session_id, 160, 50)
+            var failure = ""
+            if (truncated) {
+                failure = "Git action output exceeded the retained machine-output limit"
+            } elif (info.exit_code != 0l) {
+                failure = "git exited with {info.exit_code}: {output}"
+            }
+            if (!empty(failure)) {
+                let _failure_error = repository_record_task_failure(
+                    action.repository_id, action.session_id, failure)
+                print("dasHerd watcher: orphaned Git {action.action} task " +
+                    "{action.session_id} for {action.file_path} failed: {failure}\n")
+            } else {
+                print("dasHerd watcher: orphaned Git {action.action} task " +
+                    "{action.session_id} for {action.file_path} completed\n")
+            }
+            let _refresh_error = repository_refresh(action.repository_id)
+            let _review_error = repository_review(
+                action.repository_id, action.worktree_path)
+            orphaned_git_actions |> erase(index)
+        }
+    }
+
+    def start_indexed_file_view(var client : WatcherClient?; patch : string) {
         if (client == null) return
         let artifact_path = watcher_session_artifact_path(
-            client.inspection_session_id, "staged-view.raw")
+            client.inspection_session_id, "git-view.raw")
         var inscope argv : array<string>
-        let command_error = repository_staged_file_view_argv(
-            client.inspection_worktree_path, client.inspection_file_path,
-            artifact_path, argv)
+        var command_error = ""
+        if (client.inspection_comparison == "commit") {
+            command_error = repository_commit_file_view_argv(
+                client.inspection_worktree_path, client.inspection_revision,
+                client.inspection_file_path, artifact_path, argv)
+        } else {
+            command_error = repository_staged_file_view_argv(
+                client.inspection_worktree_path, client.inspection_file_path,
+                artifact_path, argv)
+        }
         if (!empty(command_error)) {
             client.inspection_delivered = true
             self.send_file_inspection(client, false, patch, command_error)
@@ -409,14 +691,14 @@ class DasHerdWatcherServer : HvWebServer {
             client.inspection_worktree_path)
         var inscope request = WatcherLaunchRequest(
             cwd = client.inspection_worktree_path,
-            display_name = "Git staged view: {client.inspection_file_path}",
+            display_name = "Git file view: {client.inspection_file_path}",
             kind = "git-file-view", target_id = "local",
             repository_id = client.inspection_repository_id,
             worktree_path = client.inspection_worktree_path,
             columns = 80, rows = 25, timeout_ms = 15000l)
         request.argv := argv
         let result = watcher_launch(request)
-        client.inspection_phase = "staged-view"
+        client.inspection_phase = "indexed-view"
         client.inspection_patch = clone_string(patch)
         client.inspection_artifact_path = artifact_path
         client.inspection_session_id = result.session_id
@@ -430,7 +712,7 @@ class DasHerdWatcherServer : HvWebServer {
         }
         client.inspection_delivered = false
         self.send_file_inspection(client, true, "", "", "",
-            "Reading full staged file (15 second limit)...")
+            "Reading full Git file (15 second limit)...")
     }
 
     def start_file_inspection(var client : WatcherClient?;
@@ -446,6 +728,7 @@ class DasHerdWatcherServer : HvWebServer {
         client.inspection_worktree_path = incoming.worktree_path
         client.inspection_file_path = incoming.file_path
         client.inspection_comparison = incoming.comparison
+        client.inspection_revision = incoming.revision
         client.inspection_diff_context = incoming.diff_context
         if (empty(client.inspection_diff_context)) {
             client.inspection_diff_context = "compact"
@@ -460,7 +743,8 @@ class DasHerdWatcherServer : HvWebServer {
         let command_error = repository_file_diff_argv(
             incoming.repository_id, incoming.worktree_path,
             incoming.file_path, incoming.comparison,
-            argv, expected_exit_code, client.inspection_diff_context)
+            argv, expected_exit_code, client.inspection_diff_context,
+            client.inspection_revision)
         if (!empty(command_error)) {
             self.send_file_inspection(client, false, "", command_error)
             return
@@ -493,17 +777,17 @@ class DasHerdWatcherServer : HvWebServer {
         var info = WatcherSessionInfo()
         if (!watcher_get_session_info(client.inspection_session_id, info)
                 || !info.drained) return
-        let truncated = false
+        var truncated = false
         let output = watcher_machine_output_text(client.inspection_session_id, truncated)
         let _compacted = watcher_compact_session(client.inspection_session_id, 80, 25)
-        if (client.inspection_phase == "staged-view") {
+        if (client.inspection_phase == "indexed-view") {
             client.inspection_delivered = true
             if (truncated) {
                 self.cleanup_inspection_artifact(client)
                 let patch = client.inspection_patch
                 client.inspection_patch = ""
                 self.send_file_inspection(client, false, patch,
-                    "staged file command exceeded the retained machine-output limit")
+                    "Git file command exceeded the retained machine-output limit")
                 return
             }
             if (info.exit_code != client.inspection_expected_exit_code) {
@@ -550,13 +834,15 @@ class DasHerdWatcherServer : HvWebServer {
             self.send_file_inspection(client, false, "",
                 "git diff exited with {info.exit_code}: {output}")
         } else {
-            if (client.inspection_comparison == "staged") {
+            if (client.inspection_comparison == "staged"
+                    || client.inspection_comparison == "pr"
+                    || client.inspection_comparison == "commit") {
                 if (git_patch_result_is_deleted(output)) {
                     self.send_file_inspection(client, false, output, "",
                         "", "", "", 0, true)
                     return
                 }
-                self.start_staged_file_view(client, output)
+                self.start_indexed_file_view(client, output)
                 return
             }
             var view_text = ""
@@ -647,6 +933,7 @@ class DasHerdWatcherServer : HvWebServer {
         next_client_id++
         clients |> push(new WatcherClient(channel = channel, id = next_client_id,
             last_heartbeat = ref_time_ticks()))
+        print("dasHerd watcher: client {next_client_id} connected\n")
         send(channel, "\{\"type\":\"connected\",\"client_id\":{next_client_id}\}",
             ws_opcode.WS_OPCODE_TEXT, true)
         send_sessions(channel)
@@ -657,16 +944,19 @@ class DasHerdWatcherServer : HvWebServer {
         let index = find_client(channel)
         if (index < 0) return
         var client = clients[index]
+        let client_id = client.id
         detach(client, "client_closed")
         self.cleanup_inspection_artifact(client)
+        self.remember_orphaned_git_action(client)
         clients |> erase(index)
         unsafe { delete client }
+        print("dasHerd watcher: client {client_id} disconnected\n")
     }
 
     def override onWsMessage(channel : WebSocketChannel; message : string#) {
         let index = find_client(channel)
         if (index < 0) return
-        var inscope incoming : WatcherWsMessage
+        var inscope incoming = WatcherWsMessage()
         if (length(message) > MAX_REQUEST_BODY_BYTES || !sscan_json(string(message), incoming)) {
             send_error(channel, "invalid WebSocket message")
             return
@@ -678,7 +968,6 @@ class DasHerdWatcherServer : HvWebServer {
             send(channel, "\{\"type\":\"heartbeat\"\}", ws_opcode.WS_OPCODE_TEXT, true)
         } elif (incoming.op == "list") {
             send_sessions(channel)
-            send_repositories(client, true)
         } elif (incoming.op == "repository_add") {
             let error = repository_add(RepositoryAddRequest(path = incoming.repository_path,
                 display_name = incoming.display_name,
@@ -687,13 +976,62 @@ class DasHerdWatcherServer : HvWebServer {
                 send_error(channel, error)
                 return
             }
-            send_repositories(client, true)
         } elif (incoming.op == "repository_refresh") {
             let error = repository_refresh(incoming.repository_id)
             if (!empty(error)) send_error(channel, error)
-            send_repositories(client, true)
+        } elif (incoming.op == "repository_review") {
+            let error = repository_review(
+                incoming.repository_id, incoming.worktree_path)
+            if (!empty(error)) send_error(channel, error)
+        } elif (incoming.op == "repository_history") {
+            let error = repository_history(
+                incoming.repository_id, incoming.worktree_path,
+                incoming.revision)
+            if (!empty(error)) send_error(channel, error)
+        } elif (incoming.op == "repository_commit_files") {
+            let error = repository_commit_files(
+                incoming.repository_id, incoming.worktree_path,
+                incoming.revision)
+            if (!empty(error)) send_error(channel, error)
+        } elif (incoming.op == "repository_refs") {
+            let error = repository_refs(
+                incoming.repository_id, incoming.worktree_path)
+            if (!empty(error)) send_error(channel, error)
+        } elif (incoming.op == "git_file_action") {
+            self.start_git_file_action(client, incoming)
         } elif (incoming.op == "file_inspect") {
             self.start_file_inspection(client, incoming)
+        } elif (incoming.op == "mailbox_post") {
+            let request = WatcherMailboxPostRequest(
+                session_id = incoming.session_id,
+                direction = incoming.direction,
+                sender = incoming.sender,
+                kind = incoming.kind,
+                subject = incoming.subject,
+                reply_to = incoming.reply_to,
+                notify = incoming.notify,
+                focus := incoming.focus)
+            var result = watcher_mailbox_post(request)
+            if (!result.ok) {
+                send_error(channel, result.error)
+                return
+            }
+            self.maybe_notify_inbox_message(request.session_id,
+                request.direction, result.message_id, request.notify)
+            result.revision = watcher_mailbox_session_revision(request.session_id)
+            send(channel, "\{\"type\":\"mailbox_posted\",\"message_id\":" +
+                "{sprint_json(result.message_id, false)},\"revision\":{result.revision}\}",
+                ws_opcode.WS_OPCODE_TEXT, true)
+            self.send_mailbox(client, true)
+        } elif (incoming.op == "mailbox_state") {
+            let result = watcher_mailbox_set_state(WatcherMailboxStateRequest(
+                session_id = incoming.session_id,
+                message_id = incoming.message_id, status = incoming.status))
+            if (!result.ok) {
+                send_error(channel, result.error)
+                return
+            }
+            self.send_mailbox(client, true)
         } elif (incoming.op == "launch") {
             var inscope launch = WatcherLaunchRequest(
                 command_line = incoming.command_line, cwd = incoming.cwd,
@@ -732,6 +1070,7 @@ class DasHerdWatcherServer : HvWebServer {
                 ws_opcode.WS_OPCODE_TEXT, true)
             send_snapshot(client, true)
             send_raw_output(client)
+            self.send_mailbox(client, true)
         } elif (incoming.op == "detach") {
             detach(client, "client_detached")
             send(channel, "\{\"type\":\"detached\"\}", ws_opcode.WS_OPCODE_TEXT, true)
@@ -763,6 +1102,7 @@ class DasHerdWatcherServer : HvWebServer {
         watcher_tick()
         repository_tick()
         self.retry_inspection_artifact_cleanup()
+        self.poll_orphaned_git_actions()
         for (index in range(length(clients))) {
             var client = clients[index]
             if (client == null) continue
@@ -774,6 +1114,8 @@ class DasHerdWatcherServer : HvWebServer {
             send_snapshot(client)
             send_raw_output(client)
             send_repositories(client)
+            send_mailbox(client)
+            self.poll_git_file_action(client)
             self.poll_file_inspection(client)
         }
     }
@@ -794,5 +1136,6 @@ class DasHerdWatcherServer : HvWebServer {
     def cleanup_inspection_artifacts {
         self.retry_inspection_artifact_cleanup()
         delete pending_inspection_artifacts
+        delete orphaned_git_actions
     }
 }
