@@ -152,6 +152,22 @@ add_link_options("SHELL:--embed-file ${CMAKE_CURRENT_SOURCE_DIR}/../modules/dasS
 add_link_options("SHELL:--embed-file ${CMAKE_CURRENT_SOURCE_DIR}/../modules/dasAudio/audio@modules/dasAudio/audio")
 add_link_options("SHELL:--embed-file ${CMAKE_CURRENT_SOURCE_DIR}/../modules/dasAudio/strudel@modules/dasAudio/strudel")
 
+# External dasImgui bound into the interpreter (the /examples furier + path_tracer_lab
+# playground cards). DAS_WEB_IMGUI_DIR points at a built dasImgui; CMakeLists.txt (root)
+# registers the imgui/* NATIVE_MODULE names when it is set, here we embed the matching
+# .das sources + font and link the wasm32 archives. The imgui harness also requires the
+# dasLiveHost live/* halves (registered as NATIVE_MODULE but never embedded before, since
+# no interpreter sample required them) and the JetBrainsMono font it loads at init.
+IF(DAS_WEB_IMGUI_DIR)
+    MESSAGE(STATUS "web: embedding dasImgui (${DAS_WEB_IMGUI_DIR}) into daslang_static")
+    add_link_options("SHELL:--embed-file ${DAS_WEB_IMGUI_DIR}/widgets@modules/dasImgui/imgui")
+    # module imgui_boost_v2 lives in the file widgets/imgui_boost.das; the NATIVE_MODULE
+    # resolver maps require imgui/imgui_boost_v2 -> imgui_boost_v2.das, so mount it there too.
+    add_link_options("SHELL:--embed-file ${DAS_WEB_IMGUI_DIR}/widgets/imgui_boost.das@modules/dasImgui/imgui/imgui_boost_v2.das")
+    add_link_options("SHELL:--embed-file ${DAS_WEB_IMGUI_DIR}/font/JetBrainsMono-Regular.ttf@modules/dasImgui/font/JetBrainsMono-Regular.ttf")
+    add_link_options("SHELL:--embed-file ${CMAKE_CURRENT_SOURCE_DIR}/../modules/dasLiveHost/live@modules/dasLiveHost/live")
+ENDIF()
+
 IF(DEFINED DAS_CONFIG_INCLUDE_DIR)
     INCLUDE_DIRECTORIES(${DAS_CONFIG_INCLUDE_DIR})
 ENDIF()
@@ -166,6 +182,30 @@ add_subdirectory(.. ${CMAKE_BINARY_DIR}/daslang_src EXCLUDE_FROM_ALL)
 set_target_properties(daslang_static PROPERTIES
     EXCLUDE_FROM_ALL FALSE
     RUNTIME_OUTPUT_DIRECTORY ${DAS_WEB_OUTPUT_DIR})
+
+# Link the prebuilt dasImgui wasm32 archives into daslang_static. The root CMake's
+# ADD_MODULE_CPP(dasIMGUI/imgui_app/imgui_app_headless) put register_Module_* references
+# into the interpreter's main; these archives supply them (+ imgui itself). App/headless
+# reference the imgui core, so list core last (wasm-ld resolves archives iteratively, but
+# keep the natural order). GLFW symbols come from -sUSE_GLFW=3 at this final link.
+IF(DAS_WEB_IMGUI_DIR)
+    # Match the dasImgui archive ABI to this build: threaded daslang_static (-pthread,
+    # DAS_WASM_PTHREADS=ON, so new_thread/JobQue run on real Web Workers in the playground)
+    # links the _wasm32mt archives; a single-thread build links _wasm32.
+    IF(DAS_WASM_PTHREADS)
+        SET(_imgui_archive_dir "${DAS_WEB_IMGUI_DIR}/_wasm32mt")
+    ELSE()
+        SET(_imgui_archive_dir "${DAS_WEB_IMGUI_DIR}/_wasm32")
+    ENDIF()
+    target_link_libraries(daslang_static
+        "${_imgui_archive_dir}/liblibImguiApp.a"
+        "${_imgui_archive_dir}/liblibImguiAppHeadless.a"
+        "${_imgui_archive_dir}/liblibDasModuleImgui.a")
+    # imguiApp's glfw backend re-instantiates daslang's typeFactory<GLFWwindow> (also in
+    # dasGlfw); the instantiations are identical, so let the linker take the first. This is
+    # the same flag the cross-compiled examples-card apps use for the same imgui+glfw stack.
+    target_link_options(daslang_static PRIVATE "-Wl,--allow-multiple-definition")
+ENDIF()
 
 # Pin the wasm32 runtime archive into web/output/lib so it doesn't collide
 # with the host build's lib/ (root CMakeLists.txt:317 resets
@@ -206,6 +246,14 @@ add_custom_target(stage_site_playground ALL
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         ${CMAKE_CURRENT_SOURCE_DIR}/examples/ui/samples
         ${SITE_PLAYGROUND_DIR}/samples
+    # The dasImgui showcase samples (furier, path_tracer_lab) are generated from the canonical
+    # examples/graphics sources — no committed copies. Must run AFTER the samples copy_directory
+    # above (which would otherwise overwrite them). data.json lists them; they only run in the
+    # threaded daslang_static interpreter (DAS_WEB_IMGUI_DIR + DAS_WASM_PTHREADS build).
+    COMMAND ${CMAKE_COMMAND}
+        -DREPO=${CMAKE_CURRENT_SOURCE_DIR}/..
+        -DDEST=${SITE_PLAYGROUND_DIR}/samples/examples
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/stage_playground_imgui_samples.cmake
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         ${CMAKE_CURRENT_SOURCE_DIR}/../tutorials/_assets
         ${SITE_PLAYGROUND_DIR}/tutorials/_assets
@@ -240,10 +288,35 @@ else()
     find_program(DAS_HOST_CC  NAMES clang gcc   REQUIRED)
     find_program(DAS_HOST_CXX NAMES clang++ g++ REQUIRED)
     set(_host_compiler_args)
+    set(_host_abi_args)
     if(NOT CMAKE_HOST_WIN32)
         set(_host_compiler_args
             -DCMAKE_C_COMPILER:FILEPATH=${DAS_HOST_CC}
             -DCMAKE_CXX_COMPILER:FILEPATH=${DAS_HOST_CXX})
+        # Match the wasm TARGET's C++ ABI so cross-compiled handled-type layouts
+        # (Context, jobque, std::string-bearing structs) bake identically. The
+        # emscripten target is libc++ + C++ exceptions (-fwasm-exceptions +
+        # DAS_ENABLE_EXCEPTIONS, top of this file); the default Linux host is
+        # libstdc++ + setjmp, whose std::string (32 vs 24) / std::mutex (80 vs 40)
+        # / exception layouts diverge -> the JIT bakes wrong handled-type offsets
+        # and sizes. Building the cross-compile host libc++ + DAS_ENABLE_EXCEPTIONS
+        # makes host==target layout (verified: drops handled-type divergence to
+        # zero on every runtime-live type; only the compiler-only Program residual
+        # remains). _LIBCPP_DISABLE_DEPRECATION_WARNINGS keeps -Werror happy with
+        # libc++ deprecations (codecvt_utf8 in dasUnitTest).
+        # -stdlib=libc++ requires clang; the find_program above prefers clang but
+        # can fall back to gcc, which rejects -stdlib=libc++. Only apply the libc++
+        # ABI args when the host compiler is clang; otherwise warn that the layouts
+        # may diverge (degraded but builds) rather than hard-failing the sub-build.
+        if(DAS_HOST_CXX MATCHES "clang")
+            set(_host_abi_args
+                "-DCMAKE_CXX_FLAGS:STRING=-stdlib=libc++ -DDAS_ENABLE_EXCEPTIONS=1 -D_LIBCPP_DISABLE_DEPRECATION_WARNINGS"
+                "-DCMAKE_C_FLAGS:STRING=-DDAS_ENABLE_EXCEPTIONS=1"
+                "-DCMAKE_EXE_LINKER_FLAGS:STRING=-stdlib=libc++"
+                "-DCMAKE_SHARED_LINKER_FLAGS:STRING=-stdlib=libc++")
+        else()
+            message(WARNING "host_daslang: clang not found (using ${DAS_HOST_CXX}); building the wasm cross-compile host with the default stdlib + setjmp — handled-type layouts may diverge from the libc++ emscripten target. Install clang for ABI parity.")
+        endif()
     endif()
     ExternalProject_Add(host_daslang
         EXCLUDE_FROM_ALL TRUE
@@ -253,6 +326,7 @@ else()
         STEP_TARGETS     build
         CMAKE_CACHE_ARGS -DCMAKE_TOOLCHAIN_FILE:STRING=
                          ${_host_compiler_args}
+                         ${_host_abi_args}
                          -DCMAKE_BUILD_TYPE:STRING=Release
                          -DDAS_LLVM_DISABLED:BOOL=OFF
                          -DDAS_PUGIXML_DISABLED:BOOL=OFF
