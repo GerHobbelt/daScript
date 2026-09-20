@@ -964,7 +964,7 @@ namespace das
                 bool    lateInit : 1;
                 bool    requestJit : 1;
                 bool    unsafeOutsideOfFor : 1;
-                // empty spot
+                bool    mustInline : 1;             // [inline] - body is spliced into every direct call site (fail-closed contract)
                 bool    safeImplicit : 1;
 
                 bool    deprecated : 1;
@@ -1599,13 +1599,19 @@ namespace das
         /*option*/ bool fast_math = false;                         // allow float optimizations with major bit differences (x*0, x-x, rcp division, NaN-compare flips, reassociation); doubles stay bit-exact unless this is on
         /*option*/ bool disable_dse = false;                       // disable the dead-store-elimination pass
         /*option*/ bool disable_cse = false;                       // disable the common-subexpression-elimination pass
+        /*option*/ bool disable_inline = false;                    // disable the [inline] function inliner (calls stay regular calls; declaration-level contract checks - shape, recursion, @@ - still lint)
+        /*option*/ bool disable_auto_inline = false;               // disable automatic inlining of block-literal call sites and invoke-of-literal devirtualization ([inline] splicing is unaffected)
+        /*option*/ bool disable_run = false;                       // disable compile-time function evaluation (RunFolding of pure calls over constants)
         /*option*/ bool no_infer_time_folding = false;             // disable infer-time constant folding
         bool fail_on_no_aot = true;                     // AOT link failure is error
         bool fail_on_lack_of_aot_export = false;        // remove_unused_symbols = false is missing in the module, which is passed to AOT
         /*option*/ bool log_compile_time = false;                  // if true, then compile time will be printed at the end of the compilation
         /*option*/ bool log_total_compile_time = false;            // if true, then detailed compile time will be printed at the end of the compilation
         /*option*/ bool log_module_compile_time = false;           // if true, every required module logs its own parse / infer (with pass count) / optimize / macro (in infer) / macro mods breakdown + function count; also enables per-context simulate timing and the top-level aggregate summary (CLI: -log-compile-time)
+        /*option*/ bool log_optimization = false;                  // log optimizer rewrites (per-pass fired/nothing lines, inline/devirt sites and declines)
+        /*option*/ bool log_optimization_passes = false;           // log the AST after every optimizer pass (verbose)
         /*option*/ bool no_fast_call = false;                      // disable fastcall
+        /*option*/ bool fusion = true;                             // fuse interpreter nodes into wider superinstructions at simulate time
         /*option*/ bool scoped_stack_allocator = true;             // reuse stack memory after variables out of scope
         /*option*/ bool force_inscope_pod = false;                 // force in-scope for POD-like types
         /*option*/ bool log_inscope_pod = false;                   // log in-scope for POD-like types
@@ -1709,6 +1715,7 @@ namespace das
         Module * addModule ( const string & name );
         void finalizeAnnotations();
         bool patchAnnotations();
+        bool patchInline();     // [inline] splicing; runs in the patch slot, returns true when the AST changed
         void fixupAnnotations();
         void normalizeOptionTypes ();
         bool relocatePotentiallyUninitialized(TextWriter & logs);
@@ -1846,6 +1853,11 @@ namespace das
 
     // optimization pass (compiler lib); runs after type inference
     void optimizeProgram ( Program * program, TextWriter & logs, ModuleGroup & libGroup );
+
+    // [inline] shape contract (ast_inline.cpp); shared between the patch pass (skips
+    // non-conforming callees) and the annotation lint hook (reports them as errors)
+    bool checkInlineShape ( Function * fn, string & err );
+    bool checkInlineRecursion ( Function * fn, string & err );
 
     // compile an embedded builtin module's source into `module` (compiler lib)
     DAS_CC_API bool compileBuiltinModule ( Module * module, const string & name, const unsigned char * const str, unsigned int str_len );

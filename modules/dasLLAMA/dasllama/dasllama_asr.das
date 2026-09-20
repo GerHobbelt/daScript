@@ -72,6 +72,11 @@ def load_asr_model(path : string) : AsrModel {
     if (f == null) {
         panic("dasLLAMA asr: cannot open model '{path}'")
     }
+    // stat, not length(bytes): the fmap array's length() wraps int32 on >2GB files (whisper
+    // large-v3 / parakeet f32 bins), which would reject valid models here
+    if (stat(path).size < 8ul) {
+        panic("dasLLAMA asr: '{path}' is too short to be a model file ({stat(path).size} bytes)")
+    }
     var magic = 0u
     var vocab = 0
     fmap(f) $(var bytes : array<uint8>#) {
@@ -85,10 +90,15 @@ def load_asr_model(path : string) : AsrModel {
     if (magic != 0x67676d6cu) {
         panic("dasLLAMA asr: '{path}' is neither a GGUF nor a ggml bin")
     }
-    if (vocab < 32768) {   // parakeet bins carry a ~1k SPM vocab; whisper >= 51864
+    if (vocab < 8192) {   // parakeet bins carry a ~1k SPM vocab
         var pm = AsrModel(kind = AsrKind.parakeet)
         pm.pk <- load_parakeet_model(path)
         return <- pm
+    }
+    // whisper vocabs: 51864 (.en) / 51865 (multilingual) / 51866 (large-v3 family); anything
+    // else with the ggml magic (e.g. a legacy GPT-2 bin, 50257) fails HERE, not deep in the loader
+    if (vocab < 51864 || vocab > 51999) {
+        panic("dasLLAMA asr: '{path}' has n_vocab {vocab} — matches neither whisper (51864-51866) nor parakeet (~1k)")
     }
     var m = AsrModel(kind = AsrKind.whisper)
     m.whisper <- load_whisper_model(path)
@@ -111,9 +121,10 @@ def load_asr_model(path : string; mmproj : string) : AsrModel {
     return <- m
 }
 
-//! What this model supports. Whisper: 100 languages (or English-only for *.en models),
-//! translation on multilingual models, segment timestamps. Qwen3-ASR: the model detects and
-//! reports the language itself (``detected_lang``), no timestamps, context biasing via
+//! What this model supports. Whisper: the model's own language set (99, or 100 on the
+//! large-v3 family which adds Cantonese; English-only for *.en models), translation on
+//! multilingual models, segment timestamps. Qwen3-ASR: the model detects and reports the
+//! language itself (``detected_lang``), no timestamps, context biasing via
 //! ``AsrSession.context``.
 def caps(m : AsrModel) : AsrCaps {
     if (m.kind == AsrKind.qwen3a) {
@@ -132,6 +143,9 @@ def caps(m : AsrModel) : AsrCaps {
                     prompt = false)
     if (m.whisper.multilingual) {
         c.languages <- whisper_lang_list()
+        if (int64(length(c.languages)) > m.whisper.n_lang) {   // 99-lang models predate "yue"
+            c.languages |> resize(int(m.whisper.n_lang))
+        }
     } else {
         c.languages <- ["en"]
     }

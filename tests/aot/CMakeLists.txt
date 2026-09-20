@@ -112,6 +112,10 @@ SET(AOT_DASLLAMA_MODULE_FILES
     modules/dasLLAMA/dasllama/dasllama_tokenizer.das
     modules/dasLLAMA/dasllama/dasllama_bpe.das
     modules/dasLLAMA/dasllama/dasllama_common.das
+    modules/dasLLAMA/dasllama/dasllama_audio.das
+    modules/dasLLAMA/dasllama/dasllama_whisper.das
+    modules/dasLLAMA/dasllama/dasllama_qwen3a.das
+    modules/dasLLAMA/dasllama/dasllama_parakeet.das
     modules/dasLLAMA/dasllama/dasllama_arch_llama.das
     modules/dasLLAMA/dasllama/dasllama_arch_qwen2.das
     modules/dasLLAMA/dasllama/dasllama_arch_qwen3.das
@@ -122,6 +126,7 @@ SET(AOT_DASLLAMA_MODULE_FILES
     modules/dasLLAMA/dasllama/dasllama_arch_qwen2moe.das
     modules/dasLLAMA/dasllama/dasllama_arch_gptoss.das
     modules/dasLLAMA/dasllama/dasllama_transformer.das
+    modules/dasLLAMA/dasllama/dasllama_asr.das
     modules/dasLLAMA/dasllama/dasllama_chat.das
     modules/dasLLAMA/dasllama/dasllama.das
 )
@@ -544,6 +549,7 @@ list(FILTER AOT_LANGUAGE_TEST_FILES EXCLUDE REGEX "/_")
 SET(AOT_LANGUAGE_MODULE_FILES
     tests/language/_glob.das
     tests/language/_helper_foo.das
+    tests/language/_inline_unsafe_helper.das
     tests/language/_operators_derived.das
     tests/language/_operators_parent.das
 )

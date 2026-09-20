@@ -740,7 +740,7 @@ class StyleLintVisitor : AstVisitor {
     }
 
     def override preVisitExprIfThenElse(ifte : ExprIfThenElse?) : void {
-        if (ifte.if_flags.isStatic) return
+        if (ifte.if_flags.isStatic || ifte.genFlags.generated) return  // macro-made ifs are not user style
         // STYLE010: if (true) { ... }
         var cond = ifte.cond
         if (cond is ExprConstBool) {
@@ -826,7 +826,7 @@ class StyleLintVisitor : AstVisitor {
         for (i in range(n - 1)) {
             let cur = blk.list[i]
             let nxt = blk.list[i + 1]
-            if (!(cur is ExprIfThenElse)) continue
+            if (!(cur is ExprIfThenElse) || cur.genFlags.generated || nxt.genFlags.generated) continue  // macro-made guards skip
             let outer_if = cur as ExprIfThenElse
             if (outer_if.if_false != null) continue
             let outer_term = single_terminator_body(outer_if.if_true)
@@ -2459,9 +2459,13 @@ class StyleLintVisitor : AstVisitor {
             mark_unsafe_in_stack()
             return
         }
-        if (bt == Type.tPointer && expr.subexpr._type.firstType != null) {
-            let inner = expr.subexpr._type.firstType.baseType
-            if (inner == Type.tTable || inner == Type.tArray || inner == Type.tPointer) {
+        if (bt == Type.tPointer) {
+            // mirror ast_infer_type visit(ExprSafeAt): through a pointer, only
+            // vector and fixed-array pointees index without unsafe — everything
+            // else (scalar/struct/table/array/pointer pointee, or unknown) is
+            // unsafe_pointer_safe_index / unsafe_*_safe_index territory
+            let inner = expr.subexpr._type.firstType
+            if (inner == null || !(inner.isVectorType || inner.baseType == Type.tFixedArray)) {
                 mark_unsafe_in_stack()
             }
         }

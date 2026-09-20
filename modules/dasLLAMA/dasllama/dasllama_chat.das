@@ -67,6 +67,7 @@ def private mistral_instruct_template() : ChatTemplate {
     var ct = ChatTemplate()
     ct.add_bos = true   // <s>
     ct.user.parts <- [chat_special("[INST]"), chat_text(" "), chat_content(), chat_text(" "), chat_special("[/INST]")]
+    ct.assistant_close.parts <- [chat_special("</s>")]   // [INST] wraps USER turns; assistant turns end with EOS
     ct.stop <- ["</s>"]
     return <- ct
 }
@@ -297,6 +298,31 @@ def add_user_(var c : ChatSession; text : string) {
     c.history |> push(Message(role = Role.user, content = text))
 }
 
+//! Inject a KNOWN assistant reply into the conversation WITHOUT generating: prefills the pending
+//! user turn and this assistant text into the KV cache, then closes the turn — exactly what respond
+//! does, but with a given reply instead of a sampled one. Use it to replay a prior transcript before
+//! respond() generates the final turn (e.g. a stateless OpenAI-style request that resends the whole
+//! history). Precondition: a user message is pending (call add_user first); a no-op otherwise. Text
+//! turns only — a pending audio turn is not replayed.
+def add_assistant_(m : Model; var c : ChatSession; text : string) {
+    if (!c.has_pending) {
+        return
+    }
+    var pre : array<int64>
+    render_prompt(m, c, pre)   // user turn + the assistant-open generation prompt
+    eval_(m, c.session, pre)
+    let body <- encode_(m, text, false, false)
+    eval_(m, c.session, body)
+    c.first = false
+    c.has_pending = false
+    c.pending = ""   // consumed — render_prompt_audio reads it gated only on n_audio_rows, so a
+                     // leftover would silently re-inject this text into a later audio-only turn
+    var close : array<int64>
+    render_parts(m, c.close_parts, "", close)
+    eval_(m, c.session, close)
+    c.history |> push(Message(role = Role.assistant, content = text))
+}
+
 //! `reply` with a leading `<think>…</think>` reasoning block removed (the Qwen3 thinking format) —
 //! the reasoning of prior turns is excluded from chat history per the Qwen3 protocol. Replies that
 //! don't open with `<think>` pass through unchanged; an unterminated block (the token budget ran out
@@ -361,6 +387,8 @@ def respond_(m : Model; var c : ChatSession; params : SamplingParams;
     }
     c.first = false
     c.has_pending = false
+    c.pending = ""   // consumed — render_prompt_audio reads it gated only on n_audio_rows, so a
+                     // leftover would silently re-inject this text into a later audio-only turn
     // close the assistant turn so the next turn continues cleanly
     var close : array<int64>
     render_parts(m, c.close_parts, "", close)
