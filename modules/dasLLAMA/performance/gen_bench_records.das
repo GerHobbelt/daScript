@@ -1,7 +1,10 @@
 options gen2
 options stack = 65536   // dasLLAMA program-root convention (options stack does not unify up from libs)
+options _cyclomatic_complexity = 0   // orchestrator passes; reshaped by the single-rig consolidation
+options _function_length = 0   // same
 
 require profile_common
+require dasllama/dasllama_image   // dlim_clean — the automatic step-zero GC
 require daslib/clargs
 require daslib/fio
 require math
@@ -138,6 +141,7 @@ def private das_cell(file, path, be : string; accel : bool; cfg : Args; threads 
     let t0 = ref_time_ticks()
     let tag = accel ? "{be} accel" : be
     to_log(LOG_INFO, "gen_bench_records: START {file} das {tag}\n")
+    logger_info("bench.records", "cell start", JV({"model" => JV(file), "engine" => JV("das"), "leg" => JV(tag)}))
     var args <- [daslang_bin(), "-jit", "modules/dasLLAMA/benchmarks/lcpp_bench.das", "--",
                  "-m", path, "-p", "{cfg.plen}", "-n", "{cfg.ngen}", "-r", "{cfg.reps}",
                  "-t", "{threads}", "-o", "json", "--json-path", cellPath]
@@ -151,11 +155,12 @@ def private das_cell(file, path, be : string; accel : bool; cfg : Args; threads 
     var cell : array<BenchModel>
     for (attempt in range(2)) {
         var out = ""
-        let rc = run_and_capture(args, out)
+        let rc = run_and_stream(args, out)
         cell |> clear()
         if (rc != 0 || !read_bench_records(cellPath, cell)) {
             let tail = slice(out, max(0, length(out) - 400))
             to_log(LOG_ERROR, "gen_bench_records: FAILED {file} das {tag} rc={rc} ({elapsed_ms(t0)} ms) — tail: {tail}\n")
+            logger_error("bench.records", "cell FAILED", JV({"model" => JV(file), "engine" => JV("das"), "leg" => JV(tag), "rc" => JV(rc), "elapsed_ms" => JV(elapsed_ms(t0))}))
             failed |> push("{file} das {tag}")
             return
         }
@@ -182,6 +187,7 @@ def private das_cell(file, path, be : string; accel : bool; cfg : Args; threads 
         }
         if (attempt == 0) {
             to_log(LOG_WARNING, "gen_bench_records: HIGH VARIANCE {file} das {tag} (cv {worst * 100.0lf:.1f}%) — cold-map warming suspect, re-running the cell warm\n")
+            logger_warning("bench.records", "high variance — warm re-run", JV({"model" => JV(file), "leg" => JV(tag), "cv_pct" => JV(worst * 100.0lf)}))
             settle(cfg)
         } else {
             to_log(LOG_WARNING, "gen_bench_records: STILL HIGH VARIANCE {file} das {tag} (cv {worst * 100.0lf:.1f}%) after a warm re-run — keeping it, treat with suspicion\n")
@@ -190,6 +196,7 @@ def private das_cell(file, path, be : string; accel : bool; cfg : Args; threads 
     absorb_cell(models, cell, store, note)
     remove(cellPath)
     to_log(LOG_INFO, "gen_bench_records: DONE {file} das {tag} ({elapsed_ms(t0)} ms)\n")
+    logger_info("bench.records", "cell done", JV({"model" => JV(file), "engine" => JV("das"), "leg" => JV(tag), "elapsed_ms" => JV(elapsed_ms(t0))}))
 }
 
 def private ref_pass(file, path, bin, flavor : string; ngl : int; nopo : bool; cfg : Args; threads : int;
@@ -200,15 +207,24 @@ def private ref_pass(file, path, bin, flavor : string; ngl : int; nopo : bool; c
     }
     let backend = ngl != 0 ? "metal" : "cpu"
     let t0 = ref_time_ticks()
-    let aff = ngl == 0 && affinity_on() ? lcpp_affinity_args(threads) : ""
+    var args <- [bin, "-m", path, "-ngl", "{ngl}"]
     // -nopo 1 = --no-op-offload: without it a stock build at -ngl 0 still ships big-batch ops
     // with host weights to Metal (26B: MTL0 193MB, +33% pp) — not a CPU number
-    let np = nopo ? " -nopo 1" : ""
-    let cmd = "\"{bin}\" -m \"{path}\" -ngl {ngl}{np} -t {threads}{aff} -p {cfg.plen} -n {cfg.ngen} -r {cfg.reps} -o json"
+    if (nopo) {
+        args |> push_from(["-nopo", "1"])
+    }
+    args |> push_from(["-t", "{threads}"])
+    if (ngl == 0) {
+        args |> push_from(lcpp_affinity_argv(threads))
+    }
+    args |> push_from(["-p", "{cfg.plen}", "-n", "{cfg.ngen}", "-r", "{cfg.reps}", "-o", "json"])
+    let cmd = argv_line(args)
     to_log(LOG_INFO, "gen_bench_records: START {file} ref {flavor} {backend}\n")
+    logger_info("bench.records", "cell start", JV({"model" => JV(file), "engine" => JV("llama.cpp"), "leg" => JV("{flavor} {backend}")}))
     var rows : array<LlamaBenchRow>
-    if (!run_llama_bench(cmd, rows) || empty(rows)) {
+    if (!run_llama_bench(args, rows) || empty(rows)) {
         to_log(LOG_ERROR, "gen_bench_records: FAILED {file} ref {flavor} {backend} ({elapsed_ms(t0)} ms)\n")
+        logger_error("bench.records", "cell FAILED", JV({"model" => JV(file), "engine" => JV("llama.cpp"), "leg" => JV("{flavor} {backend}"), "elapsed_ms" => JV(elapsed_ms(t0))}))
         failed |> push("{file} ref {flavor} {backend}")
         return
     }
@@ -235,6 +251,7 @@ def private ref_pass(file, path, bin, flavor : string; ngl : int; nopo : bool; c
     stamp_note(models, file, note)
     write_bench_records(store, models)
     to_log(LOG_INFO, "gen_bench_records: DONE {file} ref {flavor} {backend} ({elapsed_ms(t0)} ms)\n")
+    logger_info("bench.records", "cell done", JV({"model" => JV(file), "engine" => JV("llama.cpp"), "leg" => JV("{flavor} {backend}"), "elapsed_ms" => JV(elapsed_ms(t0))}))
 }
 
 // ===== ASR legs (the audio workloads, same adjacency discipline as the LLM legs) =====
@@ -244,21 +261,24 @@ def private asr_das_cell(spec : AsrModelSpec; cfg : Args; threads : int; cellPat
                          var models : array<BenchModel>; var failed : array<string>) {
     let t0 = ref_time_ticks()
     to_log(LOG_INFO, "gen_bench_records: START {spec.display} das asr\n")
+    logger_info("bench.records", "cell start", JV({"model" => JV(spec.display), "engine" => JV("das"), "leg" => JV("asr")}))
     let args <- [daslang_bin(), "-jit", "modules/dasLLAMA/benchmarks/asr/asr_bench_cell.das", "--",
                  "-m", spec.das_model, "-r", "{cfg.asr_reps}", "-t", "{threads}",
                  "--json-path", cellPath]
     var out = ""
-    let rc = run_and_capture(args, out)
+    let rc = run_and_stream(args, out)
     var cell : array<BenchModel>
     if (rc != 0 || !read_bench_records(cellPath, cell)) {
         let tail = slice(out, max(0, length(out) - 400))
         to_log(LOG_ERROR, "gen_bench_records: FAILED {spec.display} das asr rc={rc} ({elapsed_ms(t0)} ms) — tail: {tail}\n")
+        logger_error("bench.records", "cell FAILED", JV({"model" => JV(spec.display), "engine" => JV("das"), "leg" => JV("asr"), "rc" => JV(rc)}))
         failed |> push("{spec.display} das asr")
         return
     }
     absorb_cell(models, cell, store, "")
     remove(cellPath)
     to_log(LOG_INFO, "gen_bench_records: DONE {spec.display} das asr ({elapsed_ms(t0)} ms)\n")
+    logger_info("bench.records", "cell done", JV({"model" => JV(spec.display), "engine" => JV("das"), "leg" => JV("asr"), "elapsed_ms" => JV(elapsed_ms(t0))}))
 }
 
 // True when the reference tool's binary/interpreter exists on this box (skip-with-warning gate)
@@ -289,6 +309,7 @@ def private asr_ref_pass(spec : AsrModelSpec; ref : AsrRef; versions : string; c
     }
     let t0 = ref_time_ticks()
     to_log(LOG_INFO, "gen_bench_records: START {spec.display} ref {ref.tool}\n")
+    logger_info("bench.records", "cell start", JV({"model" => JV(spec.display), "engine" => JV(asr_engine_name(ref.tool)), "leg" => JV("asr")}))
     let model_path = "{spec.root}{spec.das_model}"
     var rr = BenchRun(
         engine = asr_engine_name(ref.tool),
@@ -305,9 +326,34 @@ def private asr_ref_pass(spec : AsrModelSpec; ref : AsrRef; versions : string; c
     if (ref.tool == "onnx" || ref.tool == "nemo") {
         // the onnx/nemo weights are venv-managed (the variant/HF handle in `versions` names
         // them); only the clips are local files here
-        let cmd = asr_pybench_cmd(ref.tool, ref.handle, spec.buckets, threads, cfg.asr_reps)
-        rr.cmd = cmd
-        let out = run_capture("{cmd} 2>&1", false)
+        var clips := spec.buckets
+        var lib : array<string>
+        if (!empty(spec.libri_short) && ref.tool == "onnx") {
+            // the dictation aggregate pairs against onnx only: one amortized process covers all
+            // 25 clips in ~30 s, where a per-clip cli process would cost ~9 min per sweep
+            lib <- libri_wavs()
+            if (empty(lib)) {
+                to_log(LOG_WARNING, "gen_bench_records: {spec.display} ref onnx — librispeech set absent/partial, leg skipped\n")
+            } else {
+                clips |> push_from(lib)
+            }
+        }
+        to_log(LOG_INFO, "gen_bench_records:   {ref.tool} over {length(clips)} clip(s) in one process (python model load amortized)\n")
+        let pyargs <- asr_pybench_args(ref.tool, ref.handle, clips, threads, cfg.asr_reps)
+        rr.cmd = argv_line(pyargs)
+        var out = run_capture_argv(pyargs)
+        if (find(out, "BENCH") < 0) {
+            // pipe came back rowless — fall back to the --out file (Windows: parakeet loaders
+            // wreck the child's stdout pipe; the file survives everything)
+            let sidecar = fread(asr_pybench_out_path())
+            if (find(sidecar, "BENCH") >= 0) {
+                to_log(LOG_INFO, "gen_bench_records:   {ref.tool} pipe was rowless — rows recovered from --out file\n")
+                out = sidecar
+            } else {
+                let dtail = slice(out, max(0, length(out) - 400))
+                to_log(LOG_WARNING, "gen_bench_records:   {ref.tool} output carries no BENCH rows — tail: {dtail}\n")
+            }
+        }
         for (wav in spec.buckets) {
             var audio_s = -1.0lf
             let ms = parse_bench_best(out, wav, audio_s)
@@ -317,6 +363,31 @@ def private asr_ref_pass(spec : AsrModelSpec; ref : AsrRef; versions : string; c
                 measured++
             }
         }
+        if (!empty(lib)) {
+            // all-or-nothing: a partial sum would pair against das's full-set total and lie
+            var lib_ms = 0.0lf
+            var lib_audio = 0.0lf
+            var lib_n = 0
+            for (wav in lib) {
+                var audio_s = -1.0lf
+                let ms = parse_bench_best(out, base_name(wav), audio_s)
+                if (ms > 0.0lf) {
+                    lib_ms += ms
+                    lib_audio += audio_s
+                    lib_n++
+                    rr.files |> emplace(file_identity("{asr_corpus_dir()}{wav}", "clip"))
+                }
+            }
+            if (lib_n == length(lib)) {
+                rr.tests |> insert(libri_test_key(), BenchTest(ms = lib_ms, audio_s = lib_audio))
+                measured++
+                to_log(LOG_INFO, "gen_bench_records:   onnx librispeech25 total {lib_ms:.0f} ms ({lib_n} clips)\n")
+            } else {
+                to_log(LOG_WARNING, "gen_bench_records: {spec.display} ref onnx — {lib_n}/{length(lib)} libri clips parsed, aggregate NOT recorded\n")
+            }
+        }
+        delete lib
+        delete clips
     } else {
         rr.files |> emplace(file_identity(model_path, "weights"))
         if (ref.tool == "mtmd") {
@@ -324,12 +395,14 @@ def private asr_ref_pass(spec : AsrModelSpec; ref : AsrRef; versions : string; c
         }
         for (wav in spec.buckets) {
             let wav_path = "{asr_corpus_dir()}{wav}"
+            to_log(LOG_INFO, "gen_bench_records:   {ref.tool} {wav} ({cfg.asr_reps} rep(s))...\n")
             var cmd = ""
             let ms = (ref.tool == "mtmd"
                 ? run_asr_mtmd(model_path, "{spec.root}{ref.handle}", wav_path, threads, cfg.asr_reps, cmd)
                 : run_asr_cli(ref.tool, model_path, wav_path, threads, cfg.asr_reps, cmd))
             rr.cmd = cmd   // last clip's line; they differ only in -f
             if (ms > 0.0lf) {
+                to_log(LOG_INFO, "gen_bench_records:   {ref.tool} {wav} = {ms:.0f} ms\n")
                 // audio seconds live on the das cell's matching test key; cli tools don't report it
                 rr.tests |> insert("asr:{wav}", BenchTest(ms = ms))
                 rr.files |> emplace(file_identity(wav_path, "clip"))
@@ -338,9 +411,37 @@ def private asr_ref_pass(spec : AsrModelSpec; ref : AsrRef; versions : string; c
                 to_log(LOG_WARNING, "gen_bench_records: {spec.display} ref {ref.tool} {wav} — no timing parsed\n")
             }
         }
+        if (!empty(spec.libri_short) && ref.tool == "parakeet-cli") {
+            // ONE multi-file process: the load (~0.6 s) amortizes over the whole set and the
+            // cumulative total − load IS the aggregate (see run_asr_cli_multi)
+            var lib <- libri_wavs()
+            if (empty(lib)) {
+                to_log(LOG_WARNING, "gen_bench_records: {spec.display} ref {ref.tool} — librispeech set absent/partial, leg skipped\n")
+            } else {
+                var paths <- [for (w in lib); "{asr_corpus_dir()}{w}"]
+                to_log(LOG_INFO, "gen_bench_records:   {ref.tool} librispeech25 — one process over {length(lib)} clip(s) ({cfg.asr_reps} rep(s))...\n")
+                var cmd = ""
+                let ms = run_asr_cli_multi(ref.tool, model_path, paths, threads, cfg.asr_reps, cmd)
+                rr.cmd = cmd
+                if (ms > 0.0lf) {
+                    rr.tests |> insert(libri_test_key(), BenchTest(ms = ms))
+                    rr.files |> reserve(length(rr.files) + length(lib))
+                    for (w in lib) {
+                        rr.files |> emplace(file_identity("{asr_corpus_dir()}{w}", "clip"))
+                    }
+                    measured++
+                    to_log(LOG_INFO, "gen_bench_records:   {ref.tool} librispeech25 = {ms:.0f} ms\n")
+                } else {
+                    to_log(LOG_WARNING, "gen_bench_records: {spec.display} ref {ref.tool} librispeech25 — no timing parsed\n")
+                }
+                delete paths
+            }
+            delete lib
+        }
     }
     if (measured == 0) {
         to_log(LOG_ERROR, "gen_bench_records: FAILED {spec.display} ref {ref.tool} — nothing measured ({elapsed_ms(t0)} ms)\n")
+        logger_error("bench.records", "cell FAILED", JV({"model" => JV(spec.display), "engine" => JV(asr_engine_name(ref.tool)), "leg" => JV("asr")}))
         failed |> push("{spec.display} ref {ref.tool}")
         return
     }
@@ -350,6 +451,7 @@ def private asr_ref_pass(spec : AsrModelSpec; ref : AsrRef; versions : string; c
     upsert_bench_model(models, bm)
     write_bench_records(store, models)
     to_log(LOG_INFO, "gen_bench_records: DONE {spec.display} ref {ref.tool} ({measured} clip(s), {elapsed_ms(t0)} ms)\n")
+    logger_info("bench.records", "cell done", JV({"model" => JV(spec.display), "engine" => JV(asr_engine_name(ref.tool)), "leg" => JV("asr"), "clips" => JV(measured), "elapsed_ms" => JV(elapsed_ms(t0))}))
 }
 
 [export]
@@ -364,6 +466,29 @@ def main : int {
     if (cfg.help) {
         print_help(get_command_info(type<Args>), "gen_bench_records")
         return 0
+    }
+    // stdout is the live narration (cells stream their children through); the ndjson logger is
+    // the timestamped machine-readable record beside it
+    logger_set_name(prof_log_name())
+    to_log(LOG_INFO, "gen_bench_records: box={box_name()} workload={cfg.workload} — ndjson record: {logger_get_path()}\n")
+    // ONE tune per box: every child (das cells, converter runs) reads the same env-pointed
+    // manifest, so their image identities agree and the pre-bake serves every cell. Divergent
+    // per-script mints (near-tie winners flip) were observed to fork identities — B7.
+    if (empty(get_env_variable("DAS_TUNE_MANIFEST"))) {
+        set_env_variable("DAS_TUNE_MANIFEST", rig_tune_manifest())
+        to_log(LOG_INFO, "gen_bench_records: DAS_TUNE_MANIFEST={rig_tune_manifest()} (one tune per box)\n")
+    }
+    // STEP ZERO, automatic: GC image siblings that can never load again (BROKEN/version-stale)
+    // across the dirs this sweep reads — a box once carried 274 GB of them. OTHER stays.
+    let gc_llm = dlim_clean(models_dir(), true)
+    if (gc_llm.removed > 0) {
+        to_log(LOG_INFO, "gen_bench_records: GC freed {gc_llm.freed >> 20l} MB — {gc_llm.removed} stale image(s) in {models_dir()}\n")
+    }
+    if (cfg.workload == "asr" || cfg.workload == "all") {
+        let gc_w = dlim_clean(whisper_models_dir(), true)
+        if (gc_w.removed > 0) {
+            to_log(LOG_INFO, "gen_bench_records: GC freed {gc_w.freed >> 20l} MB — {gc_w.removed} stale image(s) in {whisper_models_dir()}\n")
+        }
     }
     let apple = is_apple_box()
     if (cfg.backend == "metal" && !apple) {   // fail fast instead of running metal cells that all decline on non-Apple boxes

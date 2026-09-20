@@ -4,7 +4,7 @@
 
    Every table on this page is a *pair* table: one row is one das measurement and
    the reference run it was measured against, same workload and same machine. A das
-   number is never rendered without its yardstick, so a measurement whose reference
+   number is never rendered without its reference, so a measurement whose reference
    is missing simply produces no row. */
 
 (function () {
@@ -37,6 +37,18 @@
   // a visible mark on rows that carry a hand-written note — the full text is in the receipt
   function notedCell(text, sub) {
     return esc(text) + (sub ? ' <span class="dl-model-sub">' + esc(sub) + '</span>' : '');
+  }
+
+  // Noted rows carry the note ON the model cell: hovering anywhere in the cell shows the note
+  // itself (CSS tooltip, instant), the ✱ just marks the row. Emits the full <td> so the note
+  // rides a data attribute.
+  function modelCell(r, inner) {
+    if (!r.noted) return '<td class="dl-td-model">' + inner + '</td>';
+    var t = [r.modelNote,
+      r.das && r.das.comment ? 'das: ' + r.das.comment : '',
+      r.ref && r.ref.comment ? 'reference: ' + r.ref.comment : ''].filter(Boolean).join('\n');
+    return '<td class="dl-td-model" data-note="' + esc(t).replace(/"/g, '&quot;') + '">' +
+      inner + ' <span class="dl-note-mark">✱</span></td>';
   }
 
   /* ── generic pair table ─────────────────────────────────────────
@@ -193,30 +205,43 @@
       hw.ram_gb ? hw.ram_gb + ' GB' : '', hw.ram_config, hw.gpu, hw.os, hw.power_plan,
       hw.smt ? 'SMT ' + hw.smt : ''].filter(Boolean).join(' · ');
     if (hwLine) lines.push('        ' + esc(hwLine));
-    if (r.comment) lines.push('        <b>note</b>  ' + esc(r.comment));
+    if (r.comment) lines.push('        <span class="dl-receipt-note"><b>note</b>  ' + esc(r.comment) + '</span>');
   }
 
   function pairReceipt(p) {
     var lines = [];
-    if (p.modelNote) lines.push('<b>note     </b> ' + esc(p.modelNote));
+    if (p.modelNote) lines.push('<span class="dl-receipt-note"><b>note     </b> ' + esc(p.modelNote) + '</span>');
     sideLines('das      ', p.das, lines);
     lines.push('');
     sideLines('reference', p.ref, lines);
     return lines.join('\n');
   }
 
-  // "measured YYYY-MM-DD → YYYY-MM-DD · reference @ shas" — the when-and-against-what line
+  // "measured YYYY-MM-DD → YYYY-MM-DD · reference @ shas" — the when-and-against-what line.
+  // Commit abbreviation length varies by reporting tool (llama-bench emits 7 chars, git 9), so
+  // shas where one is a prefix of the other are the same build and merge to the longer form.
   function measuredLine(rows) {
-    var dates = {}, refs = {};
+    var dates = {}, byEngine = {};
     rows.forEach(function (p) {
       if (p.das.date) dates[p.das.date] = 1;
       if (p.ref.date) dates[p.ref.date] = 1;
-      var tag = p.ref.engine + (p.ref.sha ? ' @ ' + p.ref.sha : '');
-      refs[tag] = 1;
+      var shas = byEngine[p.ref.engine] = byEngine[p.ref.engine] || [];
+      var sha = p.ref.sha || '';
+      var merged = false;
+      for (var i = 0; i < shas.length; i++) {
+        if (!sha || shas[i].indexOf(sha) === 0) { merged = true; break; }
+        if (sha.indexOf(shas[i]) === 0) { shas[i] = sha; merged = true; break; }
+      }
+      if (!merged && sha) shas.push(sha);
+    });
+    var refs = [];
+    Object.keys(byEngine).sort().forEach(function (e) {
+      var shas = byEngine[e];
+      refs.push(shas.length ? shas.sort().map(function (s) { return e + ' @ ' + s; }).join(', ') : e);
     });
     var ds = Object.keys(dates).sort();
     var span = ds.length ? (ds[0] === ds[ds.length - 1] ? ds[0] : ds[0] + ' → ' + ds[ds.length - 1]) : '';
-    return ['measured ' + span, Object.keys(refs).sort().join(', ')].filter(Boolean).join(' · ');
+    return ['measured ' + span, refs.join(', ')].filter(Boolean).join(' · ');
   }
 
   /* ── § 01 LLM: pair rows from the records ───────────────────── */
@@ -259,7 +284,7 @@
             return hits.length ? newest(hits) : null;
           }
           var das = pick('das', L.das), ref = pick('llama.cpp', L.ref);
-          if (!das || !ref) return;                    // no yardstick → no row
+          if (!das || !ref) return;                    // no reference → no row
           out.push({
             model: m.gguf.replace(/\.gguf$/, ''), arch: m.arch || '',
             size: m.size_bytes || 0, box: bx, boxName: boxLabel(das.hardware && das.hardware.cpu, bx),
@@ -277,6 +302,113 @@
     return out;
   }
 
+  /* ── stacked bar pairs, the default view of every section ────────
+     das (amber) over its reference (teal) from one baseline; each pair normalized to its own
+     max so the longer side spans the track and the gap IS the ratio. Bars are RATES in every
+     section — tok/s in § 01, ×RT in § 02/03 — so longer amber always means faster. */
+  function renderPairBars(box, items) {
+    if (!items.length) {
+      box.innerHTML = '<div class="dl-empty">No runs match these filters.</div>';
+      return;
+    }
+    box.innerHTML = items.map(function (it) {
+      var mx = Math.max(it.das, it.ref);
+      var dasW = (it.das / mx) * 100, refW = (it.ref / mx) * 100;
+      var rcls = it.ratio > 1.005 ? 'dl-win' : (it.ratio < 0.995 ? 'dl-loss' : '');
+      return '<div class="dl-bar-row">' +
+        '<div class="dl-bar-label">' + esc(it.label) + '<span class="dl-dim2">' + esc(it.sub) + '</span></div>' +
+        '<div class="dl-bar-pair">' +
+        '<div class="dl-bar-line"><div class="dl-bar-das" style="width:' + dasW.toFixed(2) + '%"></div><span class="dl-bar-val dl-bar-val--das">' + it.dasText + '</span></div>' +
+        '<div class="dl-bar-line"><div class="dl-bar-ref" style="width:' + refW.toFixed(2) + '%"></div><span class="dl-bar-val">' + it.refText + '</span></div>' +
+        '</div>' +
+        '<div class="dl-bar-ratio ' + rcls + '">' + fmt(it.ratio, 2) + '×</div>' +
+        '</div>';
+    }).join('');
+  }
+
+  /* one wiring for any section: view toggle, optional metric toggle, the SAME filter selects
+     the table owns, sorted by ratio from the first paint */
+  function wireBars(sec, rows, itemsOf) {
+    var viewSeg = document.getElementById(sec + '-view');
+    var metricSeg = document.getElementById(sec + '-metric');
+    var barsBox = document.getElementById(sec + '-bars');
+    var tableWrap = document.getElementById(sec + '-table-wrap');
+    if (!viewSeg || !barsBox || !tableWrap) return;
+    function metric() {
+      var b = metricSeg && metricSeg.querySelector('.is-on');
+      return b ? b.dataset.metric : '';
+    }
+    function draw() {
+      var filters = {};
+      document.querySelectorAll('#' + sec + '-filters .js-filter').forEach(function (s) { filters[s.dataset.field] = s.value; });
+      renderPairBars(barsBox, itemsOf(rows, filters, metric()));
+    }
+    function setSeg(seg, btn) {
+      seg.querySelectorAll('button').forEach(function (b) { b.classList.toggle('is-on', b === btn); });
+    }
+    viewSeg.querySelectorAll('button').forEach(function (b) {
+      b.addEventListener('click', function () {
+        setSeg(viewSeg, b);
+        var bars = b.dataset.view === 'bars';
+        barsBox.hidden = !bars;
+        tableWrap.hidden = bars;
+        if (metricSeg) metricSeg.style.visibility = bars ? 'visible' : 'hidden';
+        if (bars) draw();
+      });
+    });
+    if (metricSeg) {
+      metricSeg.querySelectorAll('button').forEach(function (b) {
+        b.addEventListener('click', function () { setSeg(metricSeg, b); draw(); });
+      });
+    }
+    var fbox = document.getElementById(sec + '-filters');
+    if (fbox) {
+      fbox.addEventListener('change', draw);
+      var reset = fbox.querySelector('.js-reset');
+      if (reset) reset.addEventListener('click', draw);
+    }
+    draw();
+  }
+
+  function mountLLMViews(rows) {
+    wireBars('bench', rows, function (all, filters, m) {
+      m = m || 'pp';
+      return all.filter(function (r) {
+        return (!filters.model || r.model === filters.model) &&
+               (!filters.box || r.box === filters.box) &&
+               (!filters.lane || r.lane === filters.lane) &&
+               r[m + '_ratio'] !== null;
+      }).sort(function (a, b) { return b[m + '_ratio'] - a[m + '_ratio']; })
+        .map(function (r) {
+          return { label: r.model, sub: r.boxName + ' · ' + r.lane,
+                   das: r[m + '_das'], ref: r[m + '_ref'],
+                   dasText: tps(r[m + '_das']), refText: tps(r[m + '_ref']),
+                   ratio: r[m + '_ratio'] };
+        });
+    });
+  }
+
+  function mountAudioViews(sec, rows) {
+    // bars are RATES everywhere (longer amber = faster): audio pairs bar ×RT — seconds of
+    // audio per second of compute — on both sides; the millisecond wall times live in the table
+    function xrt(audio_s, msv) { return msv > 0 ? (audio_s * 1000) / msv : 0; }
+    function xrtText(v) { return fmt(v, v < 10 ? 1 : 0) + '×RT'; }
+    wireBars(sec, rows, function (all, filters) {
+      return all.filter(function (r) {
+        return (!filters.model || r.model === filters.model) &&
+               (!filters.box || r.box === filters.box) &&
+               (!filters.tool || r.tool === filters.tool) &&
+               r.audio_s > 0;
+      }).sort(function (a, b) { return b.speed - a.speed; })
+        .map(function (r) {
+          var d = xrt(r.audio_s, r.das_ms), f = xrt(r.audio_s, r.ref_ms);
+          return { label: r.model, sub: r.boxName + ' · ' + r.tool + ' · ' + r.wav,
+                   das: d, ref: f, dasText: xrtText(d), refText: xrtText(f),
+                   ratio: r.speed };
+        });
+    });
+  }
+
   function mountLLM(rows) {
     if (!rows.length) return;
     document.getElementById('bench').hidden = false;
@@ -288,7 +420,7 @@
         // m.quant is the runtime activation mode, not the file's weight format — the weight
         // format is in the model name, and exec_fmt in the receipt spells it out exactly.
         { key: 'model', label: 'model', get: function (r) { return r.model; },
-          cell: function (r) { return notedCell(r.model, r.arch) + (r.noted ? ' <span class="dl-note-mark" title="annotated — open the receipt">✱</span>' : ''); },
+          cell: function (r) { return modelCell(r, notedCell(r.model, r.arch)); },
           cls: 'dl-td-model' },
         { key: 'box', label: 'machine', get: function (r) { return r.boxName; },
           cell: function (r) { return esc(r.boxName); }, cls: 'dl-dim2' },
@@ -345,7 +477,7 @@
           Object.keys(das.tests || {}).forEach(function (k) {
             if (k.indexOf('asr:') !== 0 || !ref.tests || !ref.tests[k]) return;
             var dm = das.tests[k].ms, rm = ref.tests[k].ms;
-            if (!(dm > 0) || !(rm > 0)) return;        // no yardstick → no row
+            if (!(dm > 0) || !(rm > 0)) return;        // no reference → no row
             out.push({
               model: m.arch || m.gguf, box: bx,
               boxName: boxLabel(das.hardware && das.hardware.cpu, bx),
@@ -379,7 +511,7 @@
         tiebreak: function (a, b) { return a.audio_s - b.audio_s || a.tool.localeCompare(b.tool); },
         cols: [
           { key: 'model', label: 'model', get: function (r) { return r.model; },
-            cell: function (r) { return notedCell(r.model, '') + (r.noted ? ' <span class="dl-note-mark" title="annotated — open the receipt">✱</span>' : ''); },
+            cell: function (r) { return modelCell(r, notedCell(r.model, '')); },
             cls: 'dl-td-model' },
           { key: 'box', label: 'machine', get: function (r) { return r.boxName; },
             cell: function (r) { return esc(r.boxName); }, cls: 'dl-dim2' },
@@ -412,15 +544,52 @@
             ' &nbsp;·&nbsp; speedup = reference time ÷ das time; ×RT = seconds of audio per second of compute';
         }
       });
+      mountAudioViews(cfg.sec, rows);
     });
+  }
+
+  /* Everything numeric in the hero derives from the records — the same rows the tables show,
+     never a hand-typed number. The "up to N×" is the best audio-in pair, floored (6.19 measured
+     → "6×"); the terminal output is the strongest un-annotated LLM pair, re-picked per load. */
+  function mountHero(recs) {
+    var el = document.getElementById('dl-hero-x');
+    if (el) {
+      var best = 0;
+      buildAudioRows(recs, 'audio-chat').forEach(function (r) {
+        if (r.noted) return;   // caveated rows never front the page (same rule as the mock)
+        if (r.speed > best) best = r.speed;
+      });
+      if (best > 1) el.textContent = best >= 3 ? String(Math.floor(best)) : best.toFixed(1);
+    }
+    var top = null;
+    buildLLMPairs(recs).forEach(function (r) {
+      if (r.noted || !(r.pp_ratio > 1) || !(r.tg_ratio > 1)) return;   // caveated rows never front the page
+      if (!(r.das.files && r.das.files.length)) return;               // nor rows without full input receipts
+      if (!top || r.pp_ratio * r.tg_ratio > top.pp_ratio * top.tg_ratio) top = r;
+    });
+    if (!top) return;
+    function put(id, text) {
+      var n = document.getElementById(id);
+      if (n) n.textContent = text;
+    }
+    put('dl-mock-load', '  loaded ' + top.model + ' · q8 · ' + fmt(top.size / 1073741824, 1) + ' GB · ' +
+      top.lane + ' / ' + top.das.threads + ' threads');
+    put('dl-mock-pp', fmt(top.pp_das, 1) + ' tok/s');
+    put('dl-mock-ppr', '· das/llama.cpp ' + fmt(top.pp_ratio, 2) + '×');
+    put('dl-mock-tg', fmt(top.tg_das, 1) + ' tok/s');
+    put('dl-mock-tgr', '· das/llama.cpp ' + fmt(top.tg_ratio, 2) + '×');
+    put('dl-mock-foot', '  ✓ no hand-written assembly · ' + top.boxName + ' · measured ' + (top.das.date || ''));
   }
 
   /* ── load ───────────────────────────────────────────────────── */
   fetch('files/dasllama/bench_records.json')
     .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
     .then(function (recs) {
-      mountLLM(buildLLMPairs(recs));
+      var llmRows = buildLLMPairs(recs);
+      mountLLM(llmRows);
+      mountLLMViews(llmRows);
       mountAudio(recs);
+      mountHero(recs);
     })
     .catch(function () { /* no records yet — sections stay hidden */ });
 })();

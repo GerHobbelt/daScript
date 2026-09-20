@@ -47,6 +47,13 @@ def box_name() : string {
     return empty(env) ? "m1" : env
 }
 
+//! The per-box shared tune manifest (`DAS_TUNE_MANIFEST` target): ONE tune per box, so every
+//! rig process — cells, converter pre-bakes — stamps the same winners and their .dlim image
+//! identities agree. Gitignored (machine-local; staleness = older than the binary).
+def public rig_tune_manifest() : string {
+    return "modules/dasLLAMA/performance/{box_name()}.tune.json"
+}
+
 //! Profiling lane/thread count: min(16, physical performance cores), same count both engines,
 //! pinned — one rule for every box (M1 Max 8, M4 Pro 10, M3 Air 4, big x86 16). Fixed by policy:
 //! no per-engine detection, no thread matrix (METHODOLOGY.md carries the why). Override with
@@ -55,6 +62,13 @@ def profile_threads() : int {
     let env = get_env_variable("DASLLAMA_THREADS")
     if (!empty(env)) {
         return max(to_int(env), 1)
+    }
+    // Intel hybrid (12th-gen+/Core Ultra) tripwire: the rig pins against the slow cores on
+    // Apple but has NO E-core avoidance on x86 yet — measuring through E-cores would publish
+    // garbage that looks plausible. Fail loudly until P/E pinning is implemented.
+    let cpu = platform_cpu()
+    if (find(cpu, "Intel") >= 0 && (find(cpu, "th Gen") >= 0 || find(cpu, "Core(TM) Ultra") >= 0)) {
+        panic("profile_threads: Intel hybrid CPU detected ({cpu}) — P/E pinning is not implemented; set DASLLAMA_THREADS + affinity manually or implement the P-core mask first")
     }
     let phys = physical_perf_cores()
     return phys > 0 ? min(16, phys) : 16
@@ -69,15 +83,16 @@ def affinity_on() : bool {
 //! llama-bench affinity arguments (leading space; "" when affinity is off): the first `threads`
 //! physical cores as a logical-CPU mask — SMT siblings are adjacent on Windows, so even bits
 //! (16 -> 0x55555555) — plus --cpu-strict so the pins hold. The das-side mirror is jobque affinity.
-def lcpp_affinity_args(threads : int) : string {
-    if (!affinity_on()) {
-        return ""
+def lcpp_affinity_argv(threads : int) : array<string> {
+    var args : array<string>
+    if (affinity_on()) {
+        var mask = 0ul
+        for (i in range(min(threads, 32))) {
+            mask |= 1ul << uint64(2 * i)
+        }
+        args <- ["--cpu-mask", "0x{mask:x}", "--cpu-strict", "1"]
     }
-    var mask = 0ul
-    for (i in range(min(threads, 32))) {
-        mask |= 1ul << uint64(2 * i)
-    }
-    return " --cpu-mask 0x{mask:x} --cpu-strict 1"
+    return <- args
 }
 
 // Models at or above this are large-tier (deferred unless --tier large|all). 6 GiB splits the
@@ -302,6 +317,70 @@ struct PlatformInfo {
     @optional tune : string
 }
 
+//! Run a child STREAMING: every line it emits (stdout+stderr, merged by popen_argv) prints to OUR
+//! stdout the moment it arrives — the visibility contract: stdout alone tells how far the process
+//! is and what it does, at every stage, without waiting for the child to exit. A rolling tail is
+//! retained for failure reporting. Returns the exit code.
+def run_and_stream(args : array<string>; var tail_out : string&; keep_tail : int = 4096) : int {
+    var acc = ""
+    let rc = unsafe(popen_argv(args, 0.0, $(f) {
+        if (f == null) {
+            return
+        }
+        while (true) {
+            let line = fgets(f)
+            if (empty(line)) {   // fgets keeps the newline, so "" only at EOF
+                break
+            }
+            print(line)
+            acc = "{acc}{line}"
+            if (length(acc) > keep_tail * 2) {
+                acc = slice(acc, length(acc) - keep_tail)
+            }
+        }
+    }))
+    tail_out = length(acc) > keep_tail ? slice(acc, length(acc) - keep_tail) : acc
+    return rc
+}
+
+//! Capture twin of [[run_and_stream]] — argv spawn (no shell parse, the Windows cmd quoting
+//! traps can't bite), stdout+stderr merged by popen_argv, whole output returned trimmed.
+//! Reads via the same fgets loop as run_and_stream — fread_to_eof lost multi-KB pipe output
+//! on Windows (zen2: a 95-s onnx child's rows captured as empty; the line loop never has).
+def run_capture_argv(args : array<string>) : string {
+    var acc = ""
+    unsafe {
+        popen_argv(args, 0.0, $(f) {
+            if (f == null) {   // popen_argv can hand a null handle on spawn failure (bad binary path)
+                return
+            }
+            while (true) {
+                let line = fgets(f)
+                if (empty(line)) {   // fgets keeps the newline, so "" only at EOF
+                    break
+                }
+                acc = "{acc}{line}"
+            }
+        })
+    }
+    return strip(acc)
+}
+
+//! The display form of an argv for receipts — one line, elements with spaces quoted.
+def argv_line(args : array<string>) : string {
+    let line = build_string() $(w) {
+        var first = true
+        for (a in args) {
+            if (!first) {
+                w |> write(" ")
+            }
+            first = false
+            w |> write(find(a, " ") >= 0 ? "\"{a}\"" : a)
+        }
+    }
+    return "{line}"
+}
+
 // Run `cmd`, return its trimmed stdout (first line only when `first_line`). Uses fread_to_eof (fio's
 // pipe-safe reader) — fread(f) whole-file sizes via seek and returns empty on a non-seekable pipe.
 def run_capture(cmd : string; first_line : bool) : string {
@@ -400,6 +479,59 @@ def tune_summary() : string {
     delete parts
     delete st
     return s
+}
+
+//! The bench cells' provenance gate: REFUSE to measure on fallback kernel winners. A
+//! stale/absent sidecar silently downgrades every ``[tune]`` kernel with only [I]-level
+//! warnings — the m4 pilot shipped a full board that way. Under ``DAS_TUNE_MANIFEST`` the
+//! stamps apply but ``tune_status()`` does not populate (framework gap, ledgered), so the
+//! env-pinned path gates on the FILE: present, newer than the binary, carrying kernels —
+//! exactly the observed failure modes. ``DASLLAMA_ALLOW_UNTUNED=1`` is the dev-run escape.
+def tune_gate() : bool {
+    var why = ""
+    let mpath = get_env_variable("DAS_TUNE_MANIFEST")
+    if (!empty(mpath)) {
+        var mst : FStat
+        var bst : FStat
+        let args <- get_command_line_arguments()
+        if (!stat(mpath, mst)) {
+            why = "DAS_TUNE_MANIFEST='{mpath}' does not exist — every kernel runs its fallback"
+        } elif (stat(args[0], bst) && bst.mtime > mst.mtime) {
+            why = "DAS_TUNE_MANIFEST='{mpath}' is OLDER than the binary ({args[0]}) — the staleness rule drops every kernel to its fallback"
+        } elif (find(fread(mpath), "\"kernels\"") < 0) {
+            why = "DAS_TUNE_MANIFEST='{mpath}' carries no kernels section — not a minted manifest"
+        }
+    } else {
+        // per-script sidecar world: tune_status populates — require all-manifest stamps
+        var st <- tune_status()
+        var total = 0
+        var bad = 0
+        var sample = ""
+        for (r in st) {
+            total++
+            if (r.source != "manifest") {
+                bad++
+                if (empty(sample)) {
+                    sample = tune_row_str(r)
+                }
+            }
+        }
+        delete st
+        if (total == 0) {
+            why = "tune_status is EMPTY — the cell cannot prove its kernel provenance"
+        } elif (bad > 0) {
+            why = "{bad}/{total} kernels stamp non-manifest winners (first: {sample}) — stale or absent sidecar"
+        }
+    }
+    if (empty(why)) {
+        return true
+    }
+    if (env_flag("DASLLAMA_ALLOW_UNTUNED", false)) {
+        to_log(LOG_WARNING, "tune gate: {why} — measuring anyway (DASLLAMA_ALLOW_UNTUNED=1, numbers are NOT publishable)\n")
+        return true
+    }
+    to_log(LOG_ERROR, "tune gate: {why}. Mint with: DAS_TUNE_MODE=tune bin/daslang -jit modules/dasLLAMA/harness/dasllama_tuner.das -dasroot <repo>; DASLLAMA_ALLOW_UNTUNED=1 overrides for dev runs\n")
+    return false
 }
 
 // Gather the platform block. `llama_cpp` (the reference commit) and `date` are passed in — the caller
@@ -878,7 +1010,12 @@ def upsert_llm(var tests : array<LlmRec>; rec : LlmRec) {
 // references). Override with WHISPER_CPP_MODELS.
 def whisper_models_dir() : string {
     let env = get_env_variable("WHISPER_CPP_MODELS")
-    return empty(env) ? "/Users/borisbatkin/Work/whisper.cpp/models/" : env
+    if (empty(env)) {
+        return "{whisper_cpp_root()}/models/"
+    }
+    // callers concat "{whisper_models_dir()}{file}" — guarantee the separator (a slashless
+    // override silently skipped every whisper/parakeet catalog entry on the m4 pilot)
+    return ends_with(env, "/") || ends_with(env, "\\") ? env : "{env}/"
 }
 
 // The bench corpus (relative to the repo-root cwd these tools run in).
@@ -975,8 +1112,11 @@ def asr_engine_name(tool : string) : string {
     return tool == "mtmd" ? "llama-mtmd-cli" : tool
 }
 
+// Box-neutral defaults: every reference lands where setup_asr_rig puts it — the checkouts as
+// siblings of the repo root, the venvs inside the repo — so a fresh box needs NO exports
+// (the env vars remain the overrides). A laptop-absolute default here is a BRINGUP bug.
 def whisper_cpp_root() : string {
-    return env_str("WHISPER_CPP", "/Users/borisbatkin/Work/whisper.cpp")
+    return env_str("WHISPER_CPP", "../whisper.cpp")
 }
 
 def whisper_cpp_bin(cli : string) : string {
@@ -993,12 +1133,19 @@ def whisper_cpp_bin(cli : string) : string {
     return normalize("{root}/build/bin/{cli}")
 }
 
+//! A venv's interpreter across layouts — POSIX puts it in bin/, Windows in Scripts/.
+def venv_python(venv : string) : string {
+    // native separators: cmd parses a bare `foo/Scripts/python.exe` as command `foo` + switches
+    let posix = "{venv}/bin/python"
+    return normalize(stat(posix).is_valid ? posix : "{venv}/Scripts/python.exe")
+}
+
 def onnx_py() : string {
-    return normalize(env_str("ONNX_PY", "/Users/borisbatkin/Work/parakeet-tdt-0.6b-v3-fastapi-openai/.venv/bin/python"))
+    return normalize(env_str("ONNX_PY", venv_python("modules/dasLLAMA/benchmarks/asr/.venv-onnx")))
 }
 
 def nemo_py() : string {
-    return normalize(env_str("NEMO_PY", "/Users/borisbatkin/Work/canary-nemo-oracle/.venv/bin/python"))
+    return normalize(env_str("NEMO_PY", venv_python("modules/dasLLAMA/benchmarks/asr/.venv-nemo")))
 }
 
 // The clean CPU-only build (llama.cpp-clean, ebd048fc5, Accelerate ON, Metal OFF, no dasprof)
@@ -1006,7 +1153,20 @@ def nemo_py() : string {
 // rode Metal (GPU) despite the "CPU-only" label — ggml's Conformer audio ops don't route through
 // BLAS/AMX, so a genuine CPU encode is ~16 s (and das's optimized scalar Conformer beats it).
 def mtmd_bin() : string {
-    return normalize(env_str("MTMD_BIN", "/Users/borisbatkin/Work/llama.cpp-clean/build-amx/bin/llama-mtmd-cli"))
+    let env = env_str("MTMD_BIN", "")
+    if (!empty(env)) {
+        return normalize(env)
+    }
+    // same cmake-layout probe as whisper_cpp_bin: MSVC multi-config, Ninja, Mac/Make
+    let root = "../llama.cpp-mtmd-ref/build-cpu/bin"
+    for (c in [normalize("{root}/Release/llama-mtmd-cli.exe"),
+               normalize("{root}/llama-mtmd-cli.exe"),
+               normalize("{root}/llama-mtmd-cli")]) {
+        if (stat(c).is_valid) {
+            return c
+        }
+    }
+    return normalize("{root}/llama-mtmd-cli")
 }
 
 // The python bench scripts live beside the corpus (asr/); these tools run from the repo-root cwd.
@@ -1089,11 +1249,44 @@ def parse_mtmd_ms(out : string) : tuple<total : double; encode : double> {
 //! whisper.cpp parakeet-cli / whisper-cli — one process per clip (load is ~ms; parse_cli_ms
 //! subtracts it regardless). Best over `reps`. Returns the winning command line too — the receipt.
 def run_asr_cli(cli, model_path, wav_path : string; threads, reps : int; var cmd_out : string&) : double {
-    let flags = cli == "whisper-cli" ? "-bs 1 -bo 1 -nf -ng" : "-ng"
+    var args <- [whisper_cpp_bin(cli), "-m", model_path, "-f", wav_path, "-t", "{threads}"]
+    if (cli == "whisper-cli") {
+        args |> push_from(["-bs", "1", "-bo", "1", "-nf"])
+    }
+    args |> push("-ng")
     var best = -1.0lf
-    cmd_out = "{whisper_cpp_bin(cli)} -m {model_path} -f {wav_path} -t {threads} {flags}"
+    cmd_out = argv_line(args)
     for (_rep in range(reps)) {
-        let ms = parse_cli_ms(run_capture("{cmd_out} 2>&1", false))
+        let ms = parse_cli_ms(run_capture_argv(args))
+        if (ms > 0.0lf && (best < 0.0lf || ms < best)) {
+            best = ms
+        }
+    }
+    return best
+}
+
+//! One parakeet-cli process over MANY clips (`file0 file1 ...`): the per-file timing blocks
+//! repeat the load and ACCUMULATE `total time`, so parse_cli_ms on the full output (last
+//! total − load) is the whole-set engine time. A block-count mismatch (an unreadable clip
+//! mid-list) discards the rep — a partial cumulative total would mispair. Best over `reps`.
+def run_asr_cli_multi(cli, model_path : string; wav_paths : array<string>; threads, reps : int; var cmd_out : string&) : double {
+    var args <- [whisper_cpp_bin(cli), "-m", model_path, "-t", "{threads}", "-ng"]
+    args |> push_from(wav_paths)
+    cmd_out = argv_line(args)
+    var best = -1.0lf
+    for (_rep in range(reps)) {
+        let out = run_capture_argv(args)
+        var blocks = 0
+        for (line in split(out, "\n")) {
+            if (find(line, "_print_timings") >= 0 && find(line, "total time") >= 0) {
+                blocks++
+            }
+        }
+        if (blocks != length(wav_paths)) {
+            to_log(LOG_WARNING, "run_asr_cli_multi: {blocks}/{length(wav_paths)} files timed — rep discarded\n")
+            continue
+        }
+        let ms = parse_cli_ms(out)
         if (ms > 0.0lf && (best < 0.0lf || ms < best)) {
             best = ms
         }
@@ -1105,10 +1298,12 @@ def run_asr_cli(cli, model_path, wav_path : string; threads, reps : int; var cmd
 //! Best total over `reps`.
 def run_asr_mtmd(model_path, mmproj_path, wav_path : string; threads, reps : int; var cmd_out : string&) : double {
     var best = -1.0lf
-    cmd_out = ("{mtmd_bin()} -m {model_path} --mmproj {mmproj_path} --audio {wav_path} " +
-        "-p \"Transcribe the audio.\" --temp 0 --jinja --reasoning off -ngl 0 -t {threads}")
+    let args <- [mtmd_bin(), "-m", model_path, "--mmproj", mmproj_path, "--audio", wav_path,
+                 "-p", "Transcribe the audio.", "--temp", "0", "--jinja", "--reasoning", "off",
+                 "-ngl", "0", "-t", "{threads}"]
+    cmd_out = argv_line(args)
     for (_rep in range(reps)) {
-        let r = parse_mtmd_ms(run_capture("{cmd_out} 2>&1", false))
+        let r = parse_mtmd_ms(run_capture_argv(args))
         if (r.total > 0.0lf && (best < 0.0lf || r.total < best)) {
             best = r.total
         }
@@ -1118,15 +1313,22 @@ def run_asr_mtmd(model_path, mmproj_path, wav_path : string; threads, reps : int
 
 //! The onnx/nemo bench invocation over a clip set — ONE process for all clips (python model load
 //! is expensive, amortize it); the caller parses per-clip rows out with [[parse_bench_best]].
-def asr_pybench_cmd(tool, handle : string; clips : array<string>; threads, reps : int) : string {
-    let wav_args = build_string() $(w) {
-        for (c in clips) {
-            w |> write(" --wav {asr_corpus_dir()}{c}")
-        }
+//! The onnx rows ALSO land in [[asr_pybench_out_path]] via --out: parakeet-variant loaders
+//! wreck the child's stdout pipe on Windows (~1 byte then EOF while the run continues), so
+//! the caller re-reads the file whenever the captured stream carries no rows.
+def asr_pybench_args(tool, handle : string; clips : array<string>; threads, reps : int) : array<string> {
+    var args <- (tool == "onnx"
+        ? [onnx_py(), "{asr_dir()}/onnx_bench.py", "--variant", handle, "--out", asr_pybench_out_path()]
+        : [nemo_py(), "{asr_dir()}/canary_qwen_bench.py"])
+    args |> push_from(["--threads", "{threads}", "--reps", "{reps}"])
+    for (c in clips) {
+        args |> push_from(["--wav", "{asr_corpus_dir()}{c}"])
     }
-    return (tool == "onnx"
-        ? "{onnx_py()} {asr_dir()}/onnx_bench.py --variant {handle} --threads {threads} --reps {reps}{wav_args}"
-        : "{nemo_py()} {asr_dir()}/canary_qwen_bench.py --threads {threads} --reps {reps}{wav_args}")
+    return <- args
+}
+
+def asr_pybench_out_path() : string {
+    return "{asr_dir()}/_pybench_rows.txt"
 }
 
 // ===== Reference-engine version capture (B4 — never hand-typed) =====
@@ -1202,58 +1404,30 @@ def asr_tool_versions(tool : string) : string {
     return ""
 }
 
-// ===== ASR: baseline TSV I/O (reference tool times the establisher writes, the generator reads) =====
+// ===== ASR: the LibriSpeech dictation set (setup_asr_rig --libri) =====
 
-//! One reference-tool baseline row: the tool, the das display name it references, the clip, its audio
-//! seconds, the best-of-reps transcribe ms, and (mtmd only) the encode+prefill split (-1 = N/A). `kind`
-//! is "corpus" (a named bucket) or "libri" (one of the 25 LibriSpeech dictation clips).
-struct AsrBaseRow {
-    tool : string
-    model : string
-    kind : string
-    wav : string
-    audio_s : double
-    ms : double
-    encode_ms : double
-}
-
-def baseline_asr_path() : string {
-    return "modules/dasLLAMA/performance/baseline_asr_{box_name()}.tsv"
-}
-
-def write_asr_baselines(rows : array<AsrBaseRow>) {
-    fopen(baseline_asr_path(), "wb") $(f) {
-        if (f == null) {
-            return
-        }
-        fwrite(f, "tool\tmodel\tkind\twav\taudio_s\tms\tencode_ms\n")
-        for (r in rows) {
-            fwrite(f, "{r.tool}\t{r.model}\t{r.kind}\t{r.wav}\t{r.audio_s}\t{r.ms}\t{r.encode_ms}\n")
+//! The dictation set's corpus-relative wav paths, sorted — exactly 25 or empty (a partial
+//! fetch would sum a different set on each side of a pair; the legs skip with a warning).
+def libri_wavs() : array<string> {
+    var out : array<string>
+    dir("{asr_corpus_dir()}librispeech") $(name : string) {
+        if (name |> ends_with(".wav")) {
+            out |> push("librispeech/{name}")
         }
     }
+    if (length(out) != 25) {
+        out |> clear()
+        return <- out
+    }
+    sort(out)
+    return <- out
 }
 
-def read_asr_baselines() : array<AsrBaseRow> {
-    var rows : array<AsrBaseRow>
-    let text = fread(baseline_asr_path())
-    var first = true
-    for (line in split(text, "\n")) {
-        if (first) {
-            first = false
-            continue
-        }
-        if (empty(strip(line))) {
-            continue
-        }
-        let col <- split(line, "\t")
-        if (length(col) < 7) {
-            continue
-        }
-        rows |> emplace(AsrBaseRow(
-            tool = col[0], model = col[1], kind = col[2], wav = col[3],
-            audio_s = to_double(col[4]), ms = to_double(col[5]), encode_ms = to_double(col[6])))
-    }
-    return <- rows
+//! The one BenchTest key both sides of the LibriSpeech aggregate record under: total
+//! best-of-reps ms over the 25 clips (+ total audio seconds) — the dictation stat is a
+//! whole-set number, never 25 table rows.
+def libri_test_key() : string {
+    return "asr:librispeech25"
 }
 
 // ===== ASR: profile JSON (the deliverable — full-fidelity: N references/model, per-bucket ms) =====
@@ -1420,9 +1594,10 @@ let private BENCH_ENV_VARS = fixed_array(
     "DASLLAMA_METAL_PF_CAPTURE", "DASLLAMA_METAL_PIPE_DEBUG", "DASLLAMA_METAL_PREFILL_SKIP",
     "DASLLAMA_METAL_SCHED", "DASLLAMA_METAL_SPEC", "DASLLAMA_METAL_UNRETAINED",
     "DASLLAMA_MM_SMALL", "DASLLAMA_MODELS_DIR", "DASLLAMA_MTP_DEBUG", "DASLLAMA_NOISY",
-    "DASLLAMA_OS", "DASLLAMA_PIN_BACKEND", "DASLLAMA_PIN_PREFILL", "DASLLAMA_RAM_GB",
-    "DASLLAMA_THREADS", "DASLLAMA_TRUTH_REFRESH", "DASLLAMA_VK_FA", "DASLLAMA_VK_HAZARD_PARANOID",
-    "DASLLAMA_VK_HAZARD_TRACE", "DASLLAMA_VK_MEMPRIO", "DASLLAMA_VK_REBAR", "DASLLAMA_VK_XFERQ")
+    "DASLLAMA_OS", "DASLLAMA_PIN_BACKEND", "DASLLAMA_PIN_PREFILL", "DASLLAMA_PREFETCH",
+    "DASLLAMA_RAM_GB", "DASLLAMA_THREADS", "DASLLAMA_TRIM", "DASLLAMA_TRUTH_REFRESH",
+    "DASLLAMA_VK_FA", "DASLLAMA_VK_HAZARD_PARANOID", "DASLLAMA_VK_HAZARD_TRACE",
+    "DASLLAMA_VK_IMPORT", "DASLLAMA_VK_MEMPRIO", "DASLLAMA_VK_REBAR", "DASLLAMA_VK_XFERQ")
 
 // quote on anything a shell reads as syntax, not just spaces — full cross-shell escaping is not
 // well-defined (cmd and POSIX disagree on the rules), so widen the trigger rather than pretend
@@ -1620,20 +1795,6 @@ struct LlamaBenchRow {
 
 //! Run a llama-bench command line (must include `-o json`) and parse its rows. False on a run or
 //! parse failure. Stdout only — llama-bench keeps progress on stderr, so the pipe stays clean.
-def run_llama_bench(cmd : string; var rows : array<LlamaBenchRow>) : bool {
-    // _popen hands the string to `cmd /c` verbatim; a command that starts with a quote and
-    // contains more quotes loses its first and last quote to cmd's strip rule (`cmd /?`), breaking
-    // the binary path — one extra outer pair is the documented workaround (safe either way).
-    // Shell-free popen_argv (fio's run_and_capture) would sidestep cmd, but callers hand us a
-    // full shell string here
-    let shell = is_windows() ? "\"{cmd}\"" : cmd
-    var out = ""
-    unsafe {
-        popen(shell) $(f) {
-            if (f != null) {   // popen can hand a null handle on spawn failure (bad binary path)
-                out = fread_to_eof(f)
-            }
-        }
-    }
-    return sscan_json(out, rows)
+def run_llama_bench(args : array<string>; var rows : array<LlamaBenchRow>) : bool {
+    return sscan_json(run_capture_argv(args), rows)
 }
