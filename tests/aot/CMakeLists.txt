@@ -99,6 +99,23 @@ SET(AOT_LIVE_HOST_MODULE_FILES
     modules/dasLiveHost/live/live_vars.das
 )
 
+# AOT for dasSQLITE module library files (required by dasSQLITE tests)
+SET(AOT_DASSQLITE_MODULE_FILES)
+IF(NOT DAS_SQLITE_DISABLED)
+    SET(AOT_DASSQLITE_MODULE_FILES
+        modules/dasSQLITE/daslib/sqlite_boost.das
+        modules/dasSQLITE/daslib/sqlite_linq.das
+    )
+ENDIF()
+
+# AOT for dasSQLITE test files
+SET(AOT_DASSQLITE_FILES)
+IF(NOT DAS_SQLITE_DISABLED)
+    FILE(GLOB AOT_DASSQLITE_FILES RELATIVE ${PROJECT_SOURCE_DIR} "tests/dasSQLITE/*.das")
+    # Exclude expect-error tests (they intentionally fail to compile)
+    list(FILTER AOT_DASSQLITE_FILES EXCLUDE REGEX "failed_")
+ENDIF()
+
 # AOT for strudel/audio module library files (required by strudel tests)
 SET(AOT_STRUDEL_MODULE_FILES)
 IF(NOT DAS_AUDIO_DISABLED)
@@ -220,8 +237,10 @@ FILE(GLOB AOT_JSON_FILES RELATIVE ${PROJECT_SOURCE_DIR} "tests/json/*.das")
 
 # AOT for linq test files
 FILE(GLOB AOT_LINQ_FILES RELATIVE ${PROJECT_SOURCE_DIR} "tests/linq/*.das")
-# Exclude module files (they are compiled via DAS_AOT_LIB below)
-list(FILTER AOT_LINQ_FILES EXCLUDE REGEX "/_")
+# Exclude module files (they are compiled via DAS_AOT_LIB below) and
+# expect-error tests (use `expect` to assert intentional macro_failed
+# diagnostics; AOT cannot compile them)
+list(FILTER AOT_LINQ_FILES EXCLUDE REGEX "/_|_errors\\.das$")
 
 # Linq test module files (libraries required by linq tests)
 SET(AOT_LINQ_MODULE_FILES
@@ -243,6 +262,9 @@ SET(AOT_MATH_MODULE_FILES
 
 # AOT for module_tests test files
 FILE(GLOB AOT_MODULE_TESTS_FILES RELATIVE ${PROJECT_SOURCE_DIR} "tests/module_tests/*.das")
+
+# AOT for option test files (also houses Result<T, E> tests)
+FILE(GLOB AOT_OPTION_FILES RELATIVE ${PROJECT_SOURCE_DIR} "tests/option/*.das")
 
 # AOT for regex test files
 FILE(GLOB AOT_REGEX_FILES RELATIVE ${PROJECT_SOURCE_DIR} "tests/regex/*.das")
@@ -292,6 +314,11 @@ FILE(GLOB AOT_JIT_FILES RELATIVE ${PROJECT_SOURCE_DIR} "tests/jit/*.das")
 
 # AOT for loops test files
 FILE(GLOB AOT_LOOPS_FILES RELATIVE ${PROJECT_SOURCE_DIR} "tests/loops/*.das")
+
+# AOT for daslib test files
+SET(AOT_DASLIB_TEST_FILES
+    tests/daslib/clargs_test.das
+)
 
 # AOT for language test files
 FILE(GLOB AOT_LANGUAGE_TEST_FILES RELATIVE ${PROJECT_SOURCE_DIR} "tests/language/*.das")
@@ -392,6 +419,18 @@ IF(NOT DAS_AUDIO_DISABLED)
     DAS_AOT("${AOT_STRUDEL_FILES}" STRUDEL_AOT_GENERATED_SRC test_aot_strudel daslang)
 ENDIF()
 
+add_custom_target(test_aot_dassqlite_modules)
+SET(DASSQLITE_MODULES_AOT_GENERATED_SRC)
+IF(NOT DAS_SQLITE_DISABLED)
+    DAS_AOT_LIB("${AOT_DASSQLITE_MODULE_FILES}" DASSQLITE_MODULES_AOT_GENERATED_SRC test_aot_dassqlite_modules daslang)
+ENDIF()
+
+add_custom_target(test_aot_dassqlite)
+SET(DASSQLITE_AOT_GENERATED_SRC)
+IF(NOT DAS_SQLITE_DISABLED)
+    DAS_AOT("${AOT_DASSQLITE_FILES}" DASSQLITE_AOT_GENERATED_SRC test_aot_dassqlite daslang)
+ENDIF()
+
 add_custom_target(test_aot_pugixml_modules)
 SET(PUGIXML_MODULES_AOT_GENERATED_SRC)
 IF(NOT DAS_PUGIXML_DISABLED)
@@ -480,6 +519,10 @@ add_custom_target(test_aot_module_tests)
 SET(MODULE_TESTS_AOT_GENERATED_SRC)
 DAS_AOT("${AOT_MODULE_TESTS_FILES}" MODULE_TESTS_AOT_GENERATED_SRC test_aot_module_tests daslang)
 
+add_custom_target(test_aot_option)
+SET(OPTION_AOT_GENERATED_SRC)
+DAS_AOT("${AOT_OPTION_FILES}" OPTION_AOT_GENERATED_SRC test_aot_option daslang)
+
 add_custom_target(test_aot_regex)
 SET(REGEX_AOT_GENERATED_SRC)
 DAS_AOT("${AOT_REGEX_FILES}" REGEX_AOT_GENERATED_SRC test_aot_regex daslang)
@@ -536,6 +579,10 @@ add_custom_target(test_aot_language_modules)
 SET(LANGUAGE_MODULES_AOT_GENERATED_SRC)
 DAS_AOT_LIB("${AOT_LANGUAGE_MODULE_FILES}" LANGUAGE_MODULES_AOT_GENERATED_SRC test_aot_language_modules daslang)
 
+add_custom_target(test_aot_daslib)
+SET(DASLIB_AOT_GENERATED_SRC)
+DAS_AOT("${AOT_DASLIB_TEST_FILES}" DASLIB_AOT_GENERATED_SRC test_aot_daslib daslang)
+
 add_custom_target(test_aot_stbimage)
 SET(STBIMAGE_AOT_GENERATED_SRC)
 DAS_AOT("${AOT_STBIMAGE_FILES}" STBIMAGE_AOT_GENERATED_SRC test_aot_stbimage daslang)
@@ -583,6 +630,7 @@ SOURCE_GROUP_FILES("aot generated" MATCH_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" MATH_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" MATH_MODULES_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" MODULE_TESTS_AOT_GENERATED_SRC)
+SOURCE_GROUP_FILES("aot generated" OPTION_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" REGEX_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" SAFE_ADDR_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" DELEGATE_AOT_GENERATED_SRC)
@@ -599,9 +647,12 @@ SOURCE_GROUP_FILES("aot generated" LANGUAGE_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" LANGUAGE_MODULES_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" DASLIB_MODULES_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" DECS_MODULES_AOT_GENERATED_SRC)
+SOURCE_GROUP_FILES("aot generated" DASLIB_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" STBIMAGE_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" STBIMAGE_MODULES_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" STRUDEL_MODULES_AOT_GENERATED_SRC)
+SOURCE_GROUP_FILES("aot generated" DASSQLITE_MODULES_AOT_GENERATED_SRC)
+SOURCE_GROUP_FILES("aot generated" DASSQLITE_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" PUGIXML_MODULES_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" PUGIXML_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" DASHV_MODULES_AOT_GENERATED_SRC)
@@ -644,6 +695,7 @@ add_executable(test_aot ${DAS_DASCRIPT_MAIN_SRC}
     ${MATH_AOT_GENERATED_SRC}
     ${MATH_MODULES_AOT_GENERATED_SRC}
     ${MODULE_TESTS_AOT_GENERATED_SRC}
+    ${OPTION_AOT_GENERATED_SRC}
     ${REGEX_AOT_GENERATED_SRC}
     ${SAFE_ADDR_AOT_GENERATED_SRC}
     ${DELEGATE_AOT_GENERATED_SRC}
@@ -660,10 +712,13 @@ add_executable(test_aot ${DAS_DASCRIPT_MAIN_SRC}
     ${LANGUAGE_MODULES_AOT_GENERATED_SRC}
     ${DASLIB_MODULES_AOT_GENERATED_SRC}
     ${DECS_MODULES_AOT_GENERATED_SRC}
+    ${DASLIB_AOT_GENERATED_SRC}
     ${STBIMAGE_AOT_GENERATED_SRC}
     ${STBIMAGE_MODULES_AOT_GENERATED_SRC}
     ${STRUDEL_MODULES_AOT_GENERATED_SRC}
     ${STRUDEL_AOT_GENERATED_SRC}
+    ${DASSQLITE_MODULES_AOT_GENERATED_SRC}
+    ${DASSQLITE_AOT_GENERATED_SRC}
     ${PUGIXML_MODULES_AOT_GENERATED_SRC}
     ${PUGIXML_AOT_GENERATED_SRC}
     ${DASHV_MODULES_AOT_GENERATED_SRC}
@@ -685,6 +740,7 @@ ADD_DEPENDENCIES(test_aot libDaScriptAot
     test_aot_linq test_aot_linq_modules
     test_aot_match
     test_aot_math test_aot_math_modules test_aot_module_tests
+    test_aot_option
     test_aot_regex
     test_aot_delegate test_aot_safe_addr test_aot_soa test_aot_spoof test_aot_strings
     test_aot_template test_aot_type_traits test_aot_uri
@@ -693,12 +749,14 @@ ADD_DEPENDENCIES(test_aot libDaScriptAot
     test_aot_loops
     test_aot_language test_aot_language_modules
     test_aot_daslib_modules test_aot_decs_modules
+    test_aot_daslib
     test_aot_stbimage test_aot_stbimage_modules
     test_aot_strudel
+    test_aot_dassqlite test_aot_dassqlite_modules
     test_aot_pugixml test_aot_pugixml_modules
     test_aot_dashv test_aot_dashv_modules
 )
-target_include_directories(test_aot PRIVATE ${NEED_MODULES_PATH} ${PROJECT_SOURCE_DIR}/modules/dasUnitTest ${PROJECT_SOURCE_DIR}/modules/dasLiveHost/src ${AUDIO_INCLUDE_DIR} ${CIPIC_HRTF_INCLUDE_DIR} ${PROJECT_SOURCE_DIR}/modules/dasMinfft/minfft ${PROJECT_SOURCE_DIR}/modules/dasPUGIXML/pugixml ${PROJECT_SOURCE_DIR}/modules/dasHV/hv/include)
+target_include_directories(test_aot PRIVATE ${NEED_MODULES_PATH} ${PROJECT_SOURCE_DIR}/modules/dasUnitTest ${PROJECT_SOURCE_DIR}/modules/dasLiveHost/src ${AUDIO_INCLUDE_DIR} ${CIPIC_HRTF_INCLUDE_DIR} ${PROJECT_SOURCE_DIR}/modules/dasMinfft/minfft ${PROJECT_SOURCE_DIR}/modules/dasPUGIXML/pugixml ${PROJECT_SOURCE_DIR}/modules/dasHV/hv/include ${SQLITE_INCLUDE_DIR})
 target_compile_definitions(test_aot PRIVATE DAS_TEST_AOT MINFFT_SINGLE HRTF_SAMPLE_RATE=${DAS_AUDIO_SAMPLE_RATE})
 SETUP_CPP11(test_aot)
 SETUP_LTO(test_aot)

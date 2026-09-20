@@ -80,6 +80,8 @@ introduced in earlier tutorials.
    tutorials/49_async.rst
    tutorials/50_soa.rst
    tutorials/51_delegate.rst
+   tutorials/52_option_and_result.rst
+   tutorials/53_clargs.rst
 
 .. _tutorials_building_from_sdk:
 
@@ -162,6 +164,7 @@ build all C++ tutorials directly against the SDK — see
    tutorials/integration_cpp_20_standalone_contexts.rst
    tutorials/integration_cpp_21_threading.rst
    tutorials/integration_cpp_22_namespace_integration.rst
+   tutorials/integration_cpp_23_handle_registry.rst
 
 .. _tutorials_macros:
 
@@ -267,6 +270,27 @@ Run any tutorial from the project root::
    tutorials/dasStbImage_03_transforms.rst
    tutorials/dasStbImage_04_pixel_access_and_conversion.rst
    tutorials/dasStbImage_05_drawing_and_blending.rst
+
+.. _tutorials_sql:
+
+dasSQLITE (SQL) Tutorials
+=========================
+
+These tutorials cover the ``daslib/sql`` + ``sqlite/sqlite_boost`` API
+— RAII connection handling, the ``[sql_table]`` structure macro, and
+the typed CRUD helpers built on top of it.  The companion ``.das``
+files are in ``tutorials/sql/``.
+
+Run any tutorial from the project root::
+
+   daslang.exe tutorials/sql/01-version.das
+
+.. toctree::
+   :maxdepth: 1
+
+   tutorials/sql_01_hello.rst
+   tutorials/sql_02_insert_data.rst
+   tutorials/sql_03_last_row_id.rst
 
 .. _tutorials_dasaudio:
 
