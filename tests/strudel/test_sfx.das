@@ -3,7 +3,9 @@ options indenting = 4
 
 require dastest/testing_boost
 require strudel/strudel_sfx
+require daslib/fio
 require math
+require strings
 
 let SR = 44100
 
@@ -104,7 +106,7 @@ def test_link_mirrors_source(t : T?) {
 def test_save_load_roundtrip(t : T?) {
     var sd = 9u
     var doc = Sound()
-    doc.mimic_target = "/tmp/ref.wav"
+    doc.mimic_target = "ref.wav"
     doc.layers |> push(modal_layer("thud", ModalVoice(pitch = 170.0, n_modes = 2)))
     var zap = sfxr_layer("zap", sfxr_pickup_coin(sd))
     zap.gain = 0.5
@@ -112,12 +114,18 @@ def test_save_load_roundtrip(t : T?) {
     zap.solo = true
     doc.layers |> push(zap)
 
-    let path = "/tmp/_sfx_roundtrip_test.sfx"
+    // hermetic, portable temp path (no hard-coded /tmp — fails on Windows CI)
+    let tmp = create_temp_directory_result("sfx_roundtrip")
+    t |> success(tmp is value, "temp dir created")
+    if (!(tmp is value)) {
+        return
+    }
+    let path = path_join(unsafe(tmp.value), "roundtrip.sfx")
     t |> success(save_sound(path, doc), "save ok")
     var back = Sound()
     t |> success(load_sound(path, back), "load ok")
     t |> equal(length(back.layers), 2)
-    t |> equal(back.mimic_target, "/tmp/ref.wav")
+    t |> equal(back.mimic_target, "ref.wav")
     t |> success(back.layers[0].voice is modal, "layer 0 is modal")
     if (back.layers[0].voice is modal) {
         t |> equal((back.layers[0].voice as modal).pitch, 170.0)
@@ -128,4 +136,68 @@ def test_save_load_roundtrip(t : T?) {
     t |> success(back.layers[1].solo, "solo flag round-trips")
     let buf <- render_sound(back.layers)
     t |> success(peak(buf) > 0.02, "loaded sound renders audible")
+}
+
+[test]
+def test_sfx_conform_resample_pad_fade(t : T?) {
+    // 0.1s constant tone, upsampled 44100 -> 48000 at half gain
+    var buf : array<float>
+    buf |> resize(4410)
+    for (i in range(4410)) {
+        buf[i] = 1.0
+    }
+    let DST = 48000
+    let RLEN = 4800   // 4410 * 48000 / 44100, exact
+
+    // duration 0: full natural length (a one-shot rings out — never truncated)
+    let a <- sfx_conform(buf, SR, DST, 0.0, 0.5)
+    t |> equal(length(a), RLEN)
+    t |> success(abs(a[0]) < 1.0e-5, "fade-in zeroes the first sample (no onset click)")
+    t |> success(abs(a[RLEN - 1]) < 1.0e-5, "fade-out zeroes the last natural sample (no release click)")
+    t |> success(abs(a[2400] - 0.5) < 1.0e-3, "interior = const * gain after resample")
+    t |> success(all_finite_in_range(a), "conformed samples in [-1,1]")
+
+    // duration SHORTER than natural must NOT truncate (the cutoff/click bugfix)
+    let short <- sfx_conform(buf, SR, DST, 0.05, 0.5)   // asks for 2400 < 4800 natural
+    t |> equal(length(short), RLEN)
+
+    // duration LONGER than natural extends via zero-pad
+    let long <- sfx_conform(buf, SR, DST, 0.2, 0.5)     // asks for 9600 > 4800 natural
+    t |> equal(length(long), 9600)
+    t |> success(abs(long[9599]) < 1.0e-5, "tail beyond natural length is zero-padded")
+
+    // empty input -> empty output
+    let none : array<float>
+    let e <- sfx_conform(none, SR, DST, 0.1, 1.0)
+    t |> equal(length(e), 0)
+}
+
+[test]
+def test_emit_das_shape(t : T?) {
+    var sd = 5u
+    var doc = Sound()
+    doc.master_gain = 0.8
+    doc.layers |> push(modal_layer("thud", ModalVoice(pitch = 170.0, n_modes = 2)))
+    var zap = sfxr_layer("zap", sfxr_pickup_coin(sd))
+    zap.gain = 0.5
+    doc.layers |> push(zap)
+    doc.post.reverb.enabled = true
+
+    // standard one-shot form: def render_test(duration, gain : float) : array<float>
+    let code = emit_das(doc, "render_test", false)
+    t |> success(find(code, "require strudel/strudel_sfx") >= 0, "emits the require hint")
+    t |> success(find(code, "def render_test(duration, gain : float) : array<float>") >= 0, "standard one-shot signature")
+    t |> success(find(code, "modal_layer(\"thud\"") >= 0, "modal layer ctor")
+    t |> success(find(code, "pitch = 170") >= 0, "emits the non-default modal pitch")
+    t |> success(find(code, "n_modes = 2") >= 0, "emits the non-default mode count")
+    t |> success(find(code, "sfxr_layer(\"zap\"") >= 0, "sfxr layer ctor")
+    t |> success(find(code, ".gain = 0.5") >= 0, "emits the non-default layer gain")
+    t |> success(find(code, "render_sound(layers)") >= 0, "calls the engine")
+    t |> success(find(code, "apply_post(") >= 0, "applies the post chain (reverb enabled)")
+    t |> success(find(code, "sfx_conform(out, 44100, 48000, duration, gain * 0.8") >= 0, "conforms to 48k with master_gain folded in")
+
+    // parametric (tom) form: adds base_freq and scales the modal pitch by it
+    let tom = emit_das(doc, "render_tom", true)
+    t |> success(find(tom, "def render_tom(duration, gain, base_freq : float) : array<float>") >= 0, "parametric signature")
+    t |> success(find(tom, "base_freq") >= 0, "modal pitch scaled by base_freq")
 }

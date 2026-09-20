@@ -1,25 +1,26 @@
 {
   "version":1,
-  "mimic_target":"/Users/borisbatkin/Work/daScript/examples/daStrudel/sfx_lab/drum_refs/tom_low.wav",
+  "mimic_target":"drum_refs/tom_low.wav",
+  "comment":"from render",
   "layers":[
     {
-      "name":"tom body",
+      "name":"body",
       "voice":{
         "modal":{
-          "pitch":207.938644,
-          "spread":1.52478909,
-          "n_modes":2,
-          "ring":0.128465757,
-          "brightness":0.519465685,
-          "damp_skew":0.428027272,
-          "transient":0.35013473,
-          "transient_rate":920.623962,
-          "echo_amount":0.18603994,
-          "echo_delay":0.035797812,
-          "duration":0.398270875
+          "pitch":79.8984604,
+          "spread":1.53521073,
+          "n_modes":3,
+          "ring":0.130796552,
+          "brightness":0.223000005,
+          "damp_skew":0.519471407,
+          "transient":0.446191221,
+          "transient_rate":338.280029,
+          "echo_amount":0.128189072,
+          "echo_delay":0.050528653,
+          "duration":0.65329051
         }
       },
-      "gain":1,
+      "gain":0.374000013,
       "delay":0,
       "enabled":true,
       "solo":false,
@@ -27,36 +28,36 @@
       "link_source":-1
     },
     {
-      "name":"tom sweep",
+      "name":"click",
       "voice":{
         "sfxr":{
-          "wave":"sine",
-          "sound_vol":0.506807864,
-          "env_attack":0.0568114892,
-          "env_sustain":0.0043017813,
-          "env_punch":0.226643905,
-          "env_decay":0.437936872,
-          "base_freq":0.140487656,
-          "freq_limit":0.0521980152,
-          "freq_ramp":-0.133018211,
-          "freq_dramp":0.308557183,
-          "vib_strength":0.161924079,
-          "vib_speed":0.00439893547,
-          "arp_mod":-0.381936282,
-          "arp_speed":0.0116254669,
-          "duty":0.0815438107,
-          "duty_ramp":0.194611192,
-          "repeat_speed":0.0419052243,
-          "pha_offset":0.155901715,
-          "pha_ramp":0.0285445638,
-          "lpf_freq":0.859931946,
-          "lpf_ramp":0.223634988,
-          "lpf_resonance":0.0981165692,
-          "hpf_freq":0,
-          "hpf_ramp":-0.13643533
+          "wave":"noise",
+          "sound_vol":0.680697262,
+          "env_attack":0.0170133188,
+          "env_sustain":0,
+          "env_punch":0.31063506,
+          "env_decay":0.122000001,
+          "base_freq":0.299505293,
+          "freq_limit":0.0344526917,
+          "freq_ramp":-0.0101502687,
+          "freq_dramp":0.116527304,
+          "vib_strength":0.0160137229,
+          "vib_speed":0.229155526,
+          "arp_mod":0.451896757,
+          "arp_speed":0.000810562633,
+          "duty":0.227575958,
+          "duty_ramp":-0.0969072953,
+          "repeat_speed":0.328498453,
+          "pha_offset":0.403564453,
+          "pha_ramp":-0.176177502,
+          "lpf_freq":0.39883548,
+          "lpf_ramp":0.231637597,
+          "lpf_resonance":0.0670418739,
+          "hpf_freq":0.00407451298,
+          "hpf_ramp":0.459686965
         }
       },
-      "gain":0.5,
+      "gain":0.0930000022,
       "delay":0,
       "enabled":true,
       "solo":false,
@@ -84,12 +85,12 @@
       "coarse":0
     },
     "comp":{
-      "enabled":false,
-      "threshold":-18,
-      "ratio":4,
-      "knee":10,
-      "attack":0.00499999989,
-      "release":0.0500000007
+      "enabled":true,
+      "threshold":-11.0623245,
+      "ratio":3.26560354,
+      "knee":12.9651928,
+      "attack":0.00100000005,
+      "release":0.075356558
     },
     "chorus":{
       "enabled":false,
@@ -117,11 +118,12 @@
       "feedback":0.300000012
     },
     "reverb":{
-      "enabled":false,
-      "wet":0.300000012,
-      "decay":0.400000006,
-      "lp_start":12000,
-      "lp_end":2000
+      "enabled":true,
+      "wet":0.189246267,
+      "decay":2.77245641,
+      "lp_start":9273.73438,
+      "lp_end":574.924744
     }
-  }
+  },
+  "master_gain":0.717373252
 }

@@ -147,7 +147,9 @@ find_package(Threads REQUIRED)
 FILE(GLOB DAS_AOT_DASLIB_DEPENDS CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/daslib/*.das")
 
 MACRO(DAS_AOT_EXT input_files genList mainTarget dasAotTool dasAotToolArg)
-    set(all_depends ${dasAotTool} ${PROJECT_SOURCE_DIR}/utils/aot/main.das ${DAS_AOT_DASLIB_DEPENDS})
+    # DAS_AOT_EXTRA_DEPENDS lets a caller add inputs (e.g. the entry file's own
+    # require graph) that this macro can't discover; empty for normal callers.
+    set(all_depends ${dasAotTool} ${PROJECT_SOURCE_DIR}/utils/aot/main.das ${DAS_AOT_DASLIB_DEPENDS} ${DAS_AOT_EXTRA_DEPENDS})
     set(all_outputs "")
     # Per-batch arg buffer; chunked to keep each invocation under Windows'
     # 32K command-line limit when worktree paths are long.
@@ -732,6 +734,16 @@ src/parser/ds2_lexer.cpp
 src/parser/lex2.yy.h
 )
 
+# Funnel the bison/flex generation through ONE custom target. libDaScript
+# AND libDaScriptDyn both list PARSER_GENERATED_SRC, so with MSBuild's per-
+# vcxproj parallelism each library independently triggers the custom commands
+# and they race on the shared output files (ds_parser.hpp / ds_lexer.cpp /
+# ds2_*) -- "Device or resource busy" from bison and C1083 "Permission
+# denied" from cl on the same file. A single parser_generated target both
+# libraries depend on serialises the generation once before either library
+# compiles, while the libraries themselves still compile in parallel.
+add_custom_target(parser_generated DEPENDS ${PARSER_GENERATED_SRC})
+
 SET(PARSER_SRC
 src/parser/ds_parser.ypp
 src/parser/ds_lexer.lpp
@@ -1168,6 +1180,16 @@ SETUP_LIBDASCRIPT(libDaScriptDyn_runtime ON ON LIBDASCRIPT_RUNTIME_SRC DAS_EXPOR
 SETUP_LIBDASCRIPT(libDaScript OFF OFF LIBDASCRIPT_COMPILER_SRC DAS_CC_EXPORTS)
 SETUP_LIBDASCRIPT(libDaScriptDyn ON OFF LIBDASCRIPT_COMPILER_SRC DAS_CC_EXPORTS)
 
+# Make both compiler libraries wait for the single parser_generated target so
+# the bison/flex custom commands run exactly once per build (see definition
+# above PARSER_GENERATED_SRC). Without this both vcxprojs race over the
+# shared ds_parser.hpp / ds_lexer.cpp / ds2_* outputs under MSBuild's
+# per-project parallelism, intermittently failing with "Device or resource
+# busy" (bison can't open the .hpp the other proc is writing) and C1083
+# "Permission denied" (cl can't open the .cpp bison's still writing).
+add_dependencies(libDaScript parser_generated)
+add_dependencies(libDaScriptDyn parser_generated)
+
 # Heap leak tracking: permanently enabled in RelWithDebInfo only.
 # DAS_FREE_LIST=0 forces the reuse cache off so every aligned allocation reaches
 # the tracker and free_list.cpp's global operator new/delete overrides stay inert
@@ -1306,6 +1328,61 @@ if (NOT ${DAS_TOOLS_DISABLED})
         EXPORT DASTargets
         RUNTIME DESTINATION ${DAS_INSTALL_BINDIR}
     )
+
+    # cpp-mcp: standalone AOT C++-only MCP server (gated, OFF by default).
+    # Statically links libDaScript + the AOT-compiled cpp_main.das into one
+    # self-contained binary (no shared modules). The cpp tools still shell out
+    # to ast-grep / cl at runtime (environmental); the ast-grep rules YAML is
+    # read from the SDK tree via getDasRoot(), so the binary lands in bin/.
+    option(DAS_BUILD_CPP_MCP "Build the standalone AOT cpp-only MCP server (cpp-mcp)" OFF)
+    if(DAS_BUILD_CPP_MCP)
+        SET(CPP_MCP_AOT_GENERATED_SRC)
+        add_custom_target(cpp_mcp_dasAotStub)
+        # DAS_AOT only tracks cpp_main.das + daslib/*.das as inputs; cpp_main's own
+        # require graph (protocol_core / registry_cpp / tools/*.das / utils/common)
+        # is invisible to it, so edits there would NOT regenerate the AOT C++.
+        # Feed the graph in via DAS_AOT_EXTRA_DEPENDS BEFORE the DAS_AOT call so it
+        # lands in the generated command's DEPENDS list (clean builds unaffected;
+        # this only fixes local incremental iteration). Scoped: unset right after.
+        # cpp_main's require graph = its (stable) top-level server files, listed
+        # explicitly so the full-server / test / setup peers (main.das,
+        # registry_das.das, test_tools.das, setup.das) don't re-trigger the AOT;
+        # plus the tool modules (GLOB, so a new cpp tool tracks automatically) and
+        # utils/common. NOT GLOB_RECURSE -> tests/ fixtures stay out.
+        file(GLOB CPP_MCP_DAS_DEPS CONFIGURE_DEPENDS
+            ${PROJECT_SOURCE_DIR}/utils/mcp/tools/*.das
+            ${PROJECT_SOURCE_DIR}/utils/common/*.das)
+        list(APPEND CPP_MCP_DAS_DEPS
+            ${PROJECT_SOURCE_DIR}/utils/mcp/cpp_main.das
+            ${PROJECT_SOURCE_DIR}/utils/mcp/protocol_core.das
+            ${PROJECT_SOURCE_DIR}/utils/mcp/registry_cpp.das
+            ${PROJECT_SOURCE_DIR}/utils/mcp/cpp_search_config.das)
+        set(DAS_AOT_EXTRA_DEPENDS ${CPP_MCP_DAS_DEPS})
+        DAS_AOT("utils/mcp/cpp_main.das" CPP_MCP_AOT_GENERATED_SRC cpp_mcp_dasAotStub daslang)
+        unset(DAS_AOT_EXTRA_DEPENDS)
+        add_executable(cpp-mcp
+            ${PROJECT_SOURCE_DIR}/utils/mcp/cpp_mcp_main.cpp
+            ${CPP_MCP_AOT_GENERATED_SRC}
+        )
+        target_sources(cpp-mcp PRIVATE src/misc/alloc_tracker_overrides.cpp)
+        # cpp_main.das requires only daslib + builtin modules (jobque / json /
+        # fio / logger / strings), all of which live in libDaScript. It pulls NO
+        # external module (dasHV / SQLITE / GLFW / ...), so they are deliberately
+        # NOT linked -> a lean, dependency-light binary. For a cpp-mcp-only build,
+        # also pass -DDAS_HV_DISABLED=ON (and friends) so they are never built.
+        TARGET_LINK_LIBRARIES(cpp-mcp libDaScript ${SRC_LIBRARIES})
+        ADD_DEPENDENCIES(cpp-mcp libDaScript daslang cpp_mcp_dasAotStub)
+        target_include_directories(cpp-mcp PRIVATE ${NEED_MODULES_PATH})
+        SETUP_CPP11(cpp-mcp)
+        SETUP_BIN_RPATH(cpp-mcp)
+        SET_TARGET_PROPERTIES(cpp-mcp PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/bin)
+        # Strip the shipped binary (Linux/macOS); on MSVC symbols live in a side PDB.
+        if(NOT MSVC AND CMAKE_BUILD_TYPE STREQUAL "Release")
+            add_custom_command(TARGET cpp-mcp POST_BUILD
+                COMMAND ${CMAKE_STRIP} $<TARGET_FILE:cpp-mcp>
+                COMMENT "Stripping cpp-mcp")
+        endif()
+    endif()
 
     # daslang-live: live-reloading application host
     SET(DAS_LIVE_MAIN_SRC

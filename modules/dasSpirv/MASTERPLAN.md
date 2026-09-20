@@ -1501,15 +1501,22 @@ local-GPU behavioral proof through dasVulkan.
 
 ### Mesh-shader track — gates Tutorial 13
 
-- **PR-D. Mesh/task stage scaffolding.** Add `ShaderStage.Mesh` / `ShaderStage.Task` + `[mesh_shader]` /
-  `[task_shader]` annotations; widen the hardcoded vert/frag/compute exec-model dispatch at
-  `spirv_emit.das:~2911`. Emit `MeshShadingEXT = 5283` capability + `OutputVertices` /
-  `OutputPrimitivesEXT` / `OutputTrianglesEXT` execution modes; `LocalSize` reused.
-- **PR-E. Mesh intrinsics + array-of-builtin classification.** `SetMeshOutputsEXT` →
-  `OpSetMeshOutputsEXT = 5295`; `EmitMeshTasksEXT` → `OpEmitMeshTasksEXT = 5294`. The **novel surface**:
-  per-vertex / per-primitive Output **arrays of builtins** (`gl_MeshVerticesEXT[]` → BuiltIn Position
-  per-vertex; `gl_PrimitiveTriangleIndicesEXT[]` → uvec3 array). Every existing builtin is scalar/vec —
-  this is new ground in `classify_global` / `builtin_info`.
+- **PR-D. Mesh/task stage scaffolding.** *LANDED (2026-06-19, branch `bbatkin/dasspirv-mesh-stage`)*
+  See "PR-D — mesh/task stage scaffolding" entry below. Folded the two **minimum prologue intrinsics**
+  (`SetMeshOutputsEXT` / `EmitMeshTasksEXT`) forward from PR-E so the empty fixtures validate; the
+  per-vertex / per-primitive output **arrays** stay in PR-E.
+- **PR-E. Mesh output configuration (annotation args).** *LANDED (2026-06-19, branch `bbatkin/dasspirv-mesh-output-config`)*
+  See "PR-E — mesh output configuration" entry below. Exposes `max_vertices` / `max_primitives` →
+  `OutputVertices` / `OutputPrimitivesEXT` counts + `output_topology` (`"triangles"` | `"lines"` |
+  `"points"` → `OutputTrianglesEXT` / `OutputLinesEXT` / `OutputPoints`) as `[mesh_shader]` annotation
+  args (PR-D hardcoded 64 / 64 / triangles). Split out of the original PR-E so the **novel**
+  array-of-builtin work below lands on its own reviewable diff.
+- **PR-E2. Array-of-builtin output classification.** The **novel surface**: per-vertex / per-primitive
+  Output **arrays of builtins** (`gl_MeshVerticesEXT[]` → BuiltIn Position per-vertex;
+  `gl_PrimitiveTriangleIndicesEXT[]` → uvec3 array). Every existing builtin is scalar/vec — this is new
+  ground in `classify_global` / `builtin_info`. Consumes PR-E's `max_vertices` / `max_primitives`
+  counts to size the output arrays. The intrinsics (`OpSetMeshOutputsEXT` / `OpEmitMeshTasksEXT`)
+  landed in PR-D; the counts + topology in PR-E. *(next mesh slice)*
 - **PR-F. `PerPrimitiveEXT` decoration + polish.** Grammar has the enumerant; emit on per-primitive
   outputs. Task-shader payload via `TaskPayloadWorkgroupEXT` storage class.
 
@@ -1552,8 +1559,9 @@ PR-A: gl_DrawID + DrawParameters cap                   (smallest, proves the wor
 PR-B: nonuniformEXT + NonUniform decoration            (small)
 PR-C: descriptor arrays                                (medium; unblocks bindless host helper)
        └─ then Tutorial 12 path opens
-PR-D: mesh/task stage scaffolding                      (medium; capability + exec modes)
-PR-E: mesh intrinsics + array-of-builtin classify      (largest; novel surface)
+PR-D: mesh/task stage scaffolding                      (LANDED 2026-06-19; cap + exec modes + intrinsics)
+PR-E: mesh output config (annotation args)             (LANDED 2026-06-19; counts + topology)
+PR-E2: array-of-builtin output classify                (next; novel surface)
 PR-F: PerPrimitiveEXT + polish
        └─ then Tutorial 13 path opens
 PR-G: UBO/SSBO nested struct + array-in-struct         (LANDED 2026-06-18)
@@ -1620,3 +1628,86 @@ census/golden/spirv-val gated; full suite 138/138 green.
   either bind composites manually or extend `bind_uniform` to recurse. Follow-up PR.
 
 Tutorial 11 (HDR+bloom) is independent and can slot in any time — no emitter dependency.
+
+### PR-D — mesh/task stage scaffolding LANDED (2026-06-19, branch `bbatkin/dasspirv-mesh-stage`)
+
+First piece of the mesh-shader sub-arc (Arc PR 10 = D+E+F). Ships the scaffolding for the mesh + task
+shader stages — execution model + capabilities + execution modes + the two minimum prologue intrinsics
+— intentionally minimal: the per-vertex / per-primitive output **array** surface (`gl_MeshVerticesEXT[]`,
+`gl_PrimitiveTriangleIndicesEXT[]`, …) and topology-via-annotation-arg arrive in PR-E, the
+`PerPrimitiveEXT` decoration + payload in PR-F. Full suite 142/142 green, spirv-val (vulkan1.3) clean,
+goldens frozen.
+
+**Surface:**
+- `ShaderStage.Mesh` / `ShaderStage.Task` + `[mesh_shader]` / `[task_shader]` `[function_macro]`
+  annotations (subclasses of `SpirvShader`, inheriting its `local_size_x/y/z`).
+- Module prologue (mesh/task): `OpCapability MeshShadingEXT` (5283) + `OpExtension "SPV_EXT_mesh_shader"`,
+  emit-once via `ensure_mesh_shading` + a `ctx.mesh_shading_cap` flag.
+- Entry model `MeshEXT` (5365) / `TaskEXT` (5364); execution modes — both stages: `LocalSize`; mesh
+  additionally `OutputVertices(64)` + `OutputPrimitivesEXT(64)` + `OutputTrianglesEXT` (all three
+  MANDATORY per the spec; PR-D hardcodes 64/64/triangles).
+- Two prologue intrinsics in `spirv_builtins.das` (folded forward from PR-E so the empty fixtures are
+  valid): `SetMeshOutputsEXT(vertex_count, primitive_count)` → `OpSetMeshOutputsEXT` (mesh-only);
+  `EmitMeshTasksEXT(x, y, z)` → `OpEmitMeshTasksEXT` (task-only, sets `ctx.terminated`). Both fail
+  closed on a bad operand id rather than dropping the required op.
+- `SpirvStageFlags.mesh` / `.task` reflection bits; `REFLECTION_MAGIC` bumped `RFL4 → RFL5`.
+
+**Findings (load-bearing):**
+1. **`SPV_EXT_mesh_shader` requires SPIR-V ≥ 1.4 — surfaced by the spirv-val gate the moment compilation
+   was unblocked.** The emitter hardcoded the 1.3 header word (settled-decision #4 / risk #6). Fix: the
+   header version is now a per-module field (`SpirvModule.version`, default `SPV_VERSION_1_3`); a mesh or
+   task stage bumps it to `SPV_VERSION_1_4` in `generate_spirv`. The other three stages stay 1.3 on
+   purpose — a 1.4 header forces **every** global (not just Input/Output) into the entry-point interface,
+   which would churn every existing golden. The empty mesh/task fixtures have no globals, so the 1.4
+   interface rule is a no-op for them; the version field is the only change PR-D needs. The disassembly
+   dump (`spirv_dis`) doesn't print the header version word, so the byte-identical golden gate was
+   unaffected by the bump.
+2. **The unblock was daslang PR #3216** (`collectDependencies` crash on empty dep list — empty `tfun`/`tvar`
+   left `Array.magic` garbage → `for (v in vvar)` panicked "array magic mismatch on lock"). The empty-body
+   mesh/task fixtures hit exactly that path (no `@ssbo`, no `gl_*` ⇒ empty deps). With #3216 on master they
+   compile; this entry is the resume after the unblock. **Stale-MCP-binary caveat:** the local MCP daslang
+   binary predates #3216, so `mcp__daslang__lint` on any spirv *fixture*-bearing test file (not just the new
+   ones) crashes with the #3216 signature until the MCP binary is rebuilt. Authoritative gate is dastest
+   against the freshly-built `bin/Release/daslang.exe`; CI builds fresh from master so it is unaffected.
+3. **`value_of` returns an SSA result-id (0 = failed-to-emit sentinel), not a literal.** The intrinsic
+   handlers guard `if (id == 0u)` as a fail-closed check (push error, don't drop the op), NOT as a
+   "count is zero" skip — `SetMeshOutputsEXT(0u, 0u)` lowers to `OpSetMeshOutputsEXT %uint_0 %uint_0`
+   (the valid empty-mesh form the fixture relies on).
+
+**Tests/gates:** `mesh_empty` + `task_empty` fixtures in `_spirv_common.das`; `test_mesh.das` asserts cap
+(once) + ext (once) + entry model + the per-stage execution-mode set + the prologue intrinsic + spirv-val
+`--target-env vulkan1.3`. Census extended to `mesh_stage_emitter_opcodes` (= `bindless_nu_emitter_opcodes`
++ `OpSetMeshOutputsEXT` / `OpEmitMeshTasksEXT`); goldens frozen for both fixtures.
+
+**Deferred to PR-E2/F:** per-vertex output block + `gl_MeshVerticesEXT[]`; `gl_PrimitiveTriangleIndicesEXT[]`
+(+ Line/Point variants); task→mesh payload (`TaskPayloadWorkgroupEXT`); `@per_primitive` →
+`PerPrimitiveEXT`; `gl_CullPrimitiveEXT[]`. `OutputVertices`/`OutputPrimitivesEXT`/`output_topology` as
+annotation args landed in PR-E (below). dasVulkan side (`VK_EXT_mesh_shader`, `vkCmdDrawMeshTasks*`) — Arc PR 11.
+
+### PR-E — mesh output configuration (annotation args) LANDED (2026-06-19, branch `bbatkin/dasspirv-mesh-output-config`)
+
+Second piece of the mesh-shader sub-arc. Replaces PR-D's hardcoded `OutputVertices 64` /
+`OutputPrimitivesEXT 64` / `OutputTrianglesEXT` with values driven by `[mesh_shader]` annotation args, so
+a mesh shader can declare its real output budget + primitive topology. The per-vertex / per-primitive
+output **arrays** (`gl_MeshVerticesEXT[]`, …) and the array-of-builtin classifier are the next slice (PR-E2).
+
+**What landed:**
+- `MeshOutputConfig` struct (`max_vertices` / `max_primitives` / `topology`) + `MeshOutputTopology` enum
+  (`triangles` / `lines` / `points`) in `spirv_emit.das`. Defaults 64 / 64 / triangles — byte-identical to
+  PR-D for an arg-less `[mesh_shader]` (the `mesh_empty` golden is unchanged).
+- `generate_spirv` takes a `mesh_config : MeshOutputConfig` param; the mesh exec-mode block emits
+  `OutputVertices` / `OutputPrimitivesEXT` from the counts and one of `OutputTrianglesEXT` /
+  `OutputLinesEXT` / `OutputPoints` from the topology.
+- `[mesh_shader]` args parsed in `SpirvShader::patch` (gated on `shader_stage() == Mesh`): `max_vertices` /
+  `max_primitives` (int, default 64) + `output_topology` (string, default `"triangles"`).
+- **Fail-closed (per #3137):** an unrecognized `output_topology` is rejected in `patch` (the only place the
+  annotation args are visible); a non-positive count is rejected at the emit gate in `generate_spirv`.
+  Both push a clean compile error so the blob is never installed.
+
+**Tests/gates:** `mesh_lines` (96 / 32 / lines) + `mesh_points` (48 / 16 / points) fixtures in
+`_spirv_common.das`; `test_mesh.das::test_mesh_output_config` asserts the `OutputVertices` /
+`OutputPrimitivesEXT` operand counts + the topology execution mode (present + the other two absent) +
+spirv-val `--target-env vulkan1.3`. Goldens frozen for both (the `OpExecutionMode` operands pin the
+config). Two fail-closed fixtures (`_fc_mesh_topology`, `_fc_mesh_count`) in `test_fail_closed.das`.
+Census unchanged — the topology / counts are `OpExecutionMode` operands, not new opcodes. 144/144
+interp + JIT, spirv-val clean.

@@ -13,6 +13,7 @@ let private TWO_PI = 6.28318530717958647692
 let private FFT_N = 4096
 let private STFT_N = 1024            // smaller window for time-resolved analysis
 let private INV_LN10 = 0.43429448190325176
+let private INV_LN2 = 1.4426950408889634
 let private SPEC_FMIN = 30.0         // spectrogram low-frequency edge (log axis)
 
 struct SfxFeatures {
@@ -23,9 +24,24 @@ struct SfxFeatures {
 }
 
 struct FitScore {
-    spectral : float    //!< 0..1 timbre match (cosine of normalized magnitude spectra)
-    envelope : float    //!< 0..1 amplitude-shape + decay-time match
-    overall  : float    //!< 0..1 weighted blend (0.6 spectral + 0.4 envelope)
+    spectral : float    //!< 0..1 timbre match (time-resolved log-magnitude spectral distance)
+    pitch    : float    //!< 0..1 dominant-peak alignment (fundamental / partials, in semitones)
+    texture  : float    //!< 0..1 noisiness match (spectral flatness — tonal "beep" vs noisy "impact")
+    shape    : float    //!< 0..1 temporal-shape match (temporal centroid + effective duration + crest)
+    attack   : float    //!< 0..1 attack-time (log-attack-time) match
+    overall  : float    //!< 0..1 weighted blend per FitWeights
+}
+
+struct FitWeights {
+    //! Nature-based weighting profile for the composite fit. Default = percussive (drums). The terms
+    //! close the three structural holes: a sustained wash can't win on spectral fill (shape), a
+    //! pure-tone "beep" can't pass for a noisy "impact" (texture), and the tonal energy can't sit at
+    //! the wrong pitch (pitch — the dominant peaks must line up with the reference's).
+    spectral : float = 0.30
+    pitch    : float = 0.20
+    texture  : float = 0.15
+    shape    : float = 0.20
+    attack   : float = 0.15
 }
 
 // ===== primitives =====
@@ -190,10 +206,25 @@ def public envelope_fit(a, b : array<float>; rate : int) : float {
     return clamp(1.0 - sad / float(N), 0.0, 1.0)
 }
 
-def public fit(ref, mix : array<float>; rate : int) : FitScore {
-    let sp = spectral_evo_fit(ref, mix, rate)   // dB / log-freq / time-resolved
-    let en = envelope_fit(ref, mix, rate)
-    return FitScore(spectral = sp, envelope = en, overall = 0.6 * sp + 0.4 * en)
+def public fit(ref, mix : array<float>; rate : int; w : FitWeights = FitWeights()) : FitScore {
+    //! Composite fit (research-backed): spectral timbre + temporal shape (anti-wash) + attack.
+    //! The shape + attack terms structurally forbid a sustained noise wash from scoring well
+    //! against a sharp transient — a wash cannot have an early temporal centroid, a short
+    //! effective duration, AND a high crest factor at once. See research/metric_design notes.
+    var f = FitScore()
+    if (empty(ref) || empty(mix)) return f
+    f.spectral = 1.0 - spectral_dist(ref, mix, rate)
+    f.pitch = pitch_match(ref, mix, rate)
+    f.texture = 1.0 - squash(abs(mean_flatness(ref, rate) - mean_flatness(mix, rate)), 0.25)
+    let ra = temporal_shape(ref, rate)
+    let mi = temporal_shape(mix, rate)
+    let d_tc = abs(log((ra.tc + 0.001) / (mi.tc + 0.001)))      // log-ratio (perceptual / relative)
+    let d_ed = abs(log((ra.ed + 0.001) / (mi.ed + 0.001)))
+    let d_cr = abs(log((ra.crest + 0.1) / (mi.crest + 0.1)))
+    f.shape = 1.0 - (squash(d_tc, 0.7) + squash(d_ed, 0.7) + squash(d_cr, 0.7)) / 3.0
+    f.attack = 1.0 - squash(abs(ra.lat - mi.lat), 0.5)          // lat is already log10(seconds)
+    f.overall = w.spectral * f.spectral + w.pitch * f.pitch + w.texture * f.texture + w.shape * f.shape + w.attack * f.attack
+    return f
 }
 
 // ===== time-resolved analysis (energy / centroid over time, spectrogram) =====
@@ -321,4 +352,282 @@ def public spectral_evo_fit(a, b : array<float>; rate : int) : float {
     delete sa
     delete sb
     return clamp(1.0 - acc / float(n) / 45.0, 0.0, 1.0)
+}
+
+// ===== composite-fit components (spectral timbre + temporal shape + attack) =====
+
+// smooth, bounded distance -> dissimilarity [0,1); nonzero gradient everywhere (good for hill-climb)
+def private squash(d, scale : float) : float {
+    return 1.0 - exp(-d / max(scale, 1.0e-6))
+}
+
+struct SpecPeakHz {
+    hz  : float
+    mag : float
+}
+
+struct SeedFeatures {
+    //! Reference features for analysis-driven layer seeding (start the optimizer CLOSE).
+    fundamental : float   //!< Hz, lowest strong partial (0 if no clear pitch)
+    spread      : float   //!< geometric partial ratio (inharmonicity), 1..2.6
+    n_modes     : int     //!< number of detected partials, 1..8
+    flatness    : float   //!< 0 tonal .. 1 noise (drives modal-vs-noise balance)
+    decay_ms    : float   //!< envelope decay (peak to -20 dB), ms
+    centroid    : float   //!< spectral centroid (brightness), Hz
+    crest       : float   //!< peak/RMS (attack sharpness)
+}
+
+// Extract seed features from a reference one-shot: fundamental + partial structure (top_peaks),
+// noisiness (mean_flatness), decay/centroid (analyze), attack sharpness (temporal_shape). The
+// app maps these onto a modal body + noise layer so the optimizer starts in the right basin.
+def public analyze_seed(buf : array<float>; rate : int) : SeedFeatures {
+    var sf = SeedFeatures()
+    if (empty(buf)) return sf
+    let f = analyze(buf, rate)
+    sf.flatness = mean_flatness(buf, rate)
+    sf.decay_ms = f.decay_ms
+    sf.centroid = f.centroid
+    sf.crest = temporal_shape(buf, rate).crest
+    sf.spread = 1.7
+    sf.n_modes = 3
+    var peaks <- top_peaks(buf, rate, 6)
+    if (!empty(peaks)) {
+        // fundamental = lowest-freq peak among the 3 strongest (avoids picking a loud high partial)
+        let top3 = min(3, length(peaks))
+        var fund = peaks[0].hz
+        for (i in range(top3)) {
+            if (peaks[i].hz < fund) {
+                fund = peaks[i].hz
+            }
+        }
+        sf.fundamental = fund
+        sf.n_modes = clamp(length(peaks), 1, 8)
+        peaks |> sort() $(a, b) => a.hz < b.hz
+        var logsum = 0.0
+        var cnt = 0
+        for (i in range(1, length(peaks))) {
+            if (peaks[i - 1].hz > 1.0) {
+                logsum += log(peaks[i].hz / peaks[i - 1].hz)
+                cnt++
+            }
+        }
+        if (cnt > 0) {
+            sf.spread = clamp(exp(logsum / float(cnt)), 1.0, 2.6)
+        }
+    }
+    delete peaks
+    return sf
+}
+
+// Top-K spectral peaks (local maxima above -34 dB rel max) from the onset-window FFT, strongest first.
+def public top_peaks(buf : array<float>; rate, k : int) : array<SpecPeakHz> {
+    var out : array<SpecPeakHz>
+    if (empty(buf)) return <- out
+    let pk = peak_of(buf)
+    let start = onset_index(buf, pk)
+    var mags : array<float>
+    mag_spectrum(buf, start, mags)
+    let mlen = length(mags)
+    var mmax = 0.0
+    for (m in mags) {
+        mmax = max(mmax, m)
+    }
+    if (mmax < 1.0e-9) {
+        delete mags
+        return <- out
+    }
+    let thresh = mmax * 0.02
+    var cand <- [for (i in range(1, mlen - 1));
+        SpecPeakHz(hz = float(i) * float(rate) / float(FFT_N), mag = mags[i]);
+        where mags[i] > thresh && mags[i] > mags[i - 1] && mags[i] > mags[i + 1]]
+    delete mags
+    cand |> sort() $(a, b) => a.mag > b.mag
+    out <- [for (i in range(min(k, length(cand)))); cand[i]]
+    delete cand
+    return <- out
+}
+
+// Dominant-peak alignment [0,1]: for each reference peak (weighted by its magnitude), find the nearest
+// mix peak in log-frequency (semitones) and penalize the gap. Anchors the fundamental + partials so the
+// tonal energy can't drift to the wrong pitch (the snare-body-as-cowbell / rimshot-octave-drop failure).
+def public pitch_match(a, b : array<float>; rate : int) : float {
+    var pa <- top_peaks(a, rate, 6)
+    var pb <- top_peaks(b, rate, 6)
+    if (empty(pa) || empty(pb)) {
+        let both_empty = empty(pa) && empty(pb)
+        delete pa
+        delete pb
+        return both_empty ? 1.0 : 0.0
+    }
+    var num = 0.0
+    var den = 0.0
+    for (p in pa) {
+        var best = 48.0
+        for (q in pb) {
+            let st = abs(12.0 * log(p.hz / q.hz) * INV_LN2)   // semitone distance
+            best = min(best, st)
+        }
+        num += p.mag * squash(best, 3.0)                      // 3 semitones = ~0.63 dissimilarity
+        den += p.mag
+    }
+    delete pa
+    delete pb
+    return den > 1.0e-9 ? 1.0 - num / den : 0.0
+}
+
+// Energy-weighted mean spectral flatness (geometric / arithmetic mean of magnitude per frame),
+// 0 = pure tonal, 1 = noise. Weighting by frame energy ignores the silent tail. This is the term
+// that separates a pure-tone "beep" (low flatness) from a noisy membrane "impact" (high flatness).
+def public mean_flatness(buf : array<float>; rate : int) : float {
+    let n = length(buf)
+    if (n == 0) return 0.0
+    let NF = 16
+    let L = min(n, rate)
+    let hop = max(L / NF, 1)
+    var acc = 0.0
+    var wt = 0.0
+    for (fr in range(NF)) {
+        let start = fr * hop
+        break if (start >= n)
+        var mags : array<float>
+        stft_mag(buf, start, STFT_N, mags)
+        var sum_log = 0.0
+        var sum_lin = 0.0
+        let mlen = length(mags)
+        for (i in range(1, mlen)) {            // skip DC
+            let v = mags[i] + 1.0e-9
+            sum_log += log(v)
+            sum_lin += v
+        }
+        delete mags
+        let m = max(mlen - 1, 1)
+        if (sum_lin > 1.0e-6) {
+            let sfm = exp(sum_log / float(m)) / (sum_lin / float(m))
+            acc += sfm * sum_lin               // weight by frame energy (loud frames dominate)
+            wt += sum_lin
+        }
+    }
+    return wt > 1.0e-9 ? acc / wt : 0.0
+}
+
+// peak-normalized copy: gain-invariance by ONE global scalar per signal (NOT per-cell / per-frame).
+// Per-cell renormalization is exactly what let a sustained wash match a transient — see spectral_dist.
+def private peak_normalized(buf : array<float>) : array<float> {
+    var out : array<float>
+    out := buf
+    let pk = peak_of(out)
+    if (pk > 1.0e-9) {
+        for (s in out) {
+            s /= pk
+        }
+    }
+    return <- out
+}
+
+// raw (un-normalized) RMS energy envelope, npts frames evenly across the whole buffer
+def private rms_env_raw(buf : array<float>; npts : int) : array<float> {
+    var env : array<float>
+    env |> resize(npts)
+    let n = length(buf)
+    if (n == 0) return <- env
+    let win = max(n / npts, 1)
+    for (k in range(npts)) {
+        let c = k * n / npts
+        let lo = max(c - win / 2, 0)
+        let hi = min(c + win / 2, n)
+        var acc = 0.0
+        var cnt = 0
+        for (j in range(lo, hi)) {
+            acc += buf[j] * buf[j]
+            cnt++
+        }
+        env[k] = cnt > 0 ? sqrt(acc / float(cnt)) : 0.0
+    }
+    return <- env
+}
+
+struct TShape {
+    tc    : float    //!< temporal centroid (energy center-of-mass), seconds
+    ed    : float    //!< effective duration (envelope above 40% of max), seconds
+    crest : float    //!< peak / RMS — high for a sharp transient, ~1 for sustained noise
+    lat   : float    //!< log10 attack time (2% -> 80% of peak envelope)
+}
+
+// Temporal-shape descriptors (Timbre Toolbox / MPEG-7). These are the anti-wash terms: a sustained
+// noise wash has a LATE temporal centroid, a LONG effective duration, and a LOW crest factor — it
+// cannot match a sharp transient on all three at once, whatever it does to the spectrum.
+def public temporal_shape(buf : array<float>; rate : int) : TShape {
+    var t = TShape()
+    let n = length(buf)
+    if (n == 0) return t
+    let NP = 200
+    var env <- rms_env_raw(buf, NP)
+    let frame_dur = float(n) / float(NP) / float(rate)
+    var emax = 0.0
+    for (e in env) {
+        emax = max(emax, e)
+    }
+    if (emax < 1.0e-12) {
+        delete env
+        return t
+    }
+    var num = 0.0
+    var den = 0.0
+    var edcnt = 0
+    var t_on = 0.0
+    var found_on = false
+    var t_pk = 0.0
+    var found_pk = false
+    for (k in range(NP)) {
+        let tk = float(k) * frame_dur
+        num += tk * env[k]
+        den += env[k]
+        if (env[k] > 0.4 * emax) {
+            edcnt++
+        }
+        if (!found_on && env[k] > 0.02 * emax) {
+            t_on = tk
+            found_on = true
+        }
+        if (!found_pk && env[k] >= 0.8 * emax) {
+            t_pk = tk
+            found_pk = true
+        }
+    }
+    t.tc = den > 1.0e-12 ? num / den : 0.0
+    t.ed = float(edcnt) * frame_dur
+    var acc = 0.0
+    for (s in buf) {
+        acc += s * s
+    }
+    let rms = sqrt(acc / float(n))
+    t.crest = rms > 1.0e-9 ? peak_of(buf) / rms : 0.0
+    t.lat = log(max(t_pk - t_on, frame_dur)) * INV_LN10
+    delete env
+    return t
+}
+
+// Spectral timbre distance [0,1]: peak-normalized per signal (ONE scalar), time-resolved log-magnitude,
+// clamped per cell to [-80,0] dB, with NO per-spectrogram renormalization — so spurious energy in cells
+// where the reference is quiet is penalized. This is the structural fix for the noise-wash exploit.
+def public spectral_dist(a, b : array<float>; rate : int) : float {
+    if (empty(a) || empty(b)) return 1.0
+    var na <- peak_normalized(a)
+    var nb <- peak_normalized(b)
+    let L = min(min(length(na), length(nb)), rate)
+    let NF = 32
+    let NB = 40
+    let FMAX = 12000.0
+    var sa <- log_spectro(na, L, rate, NF, NB, FMAX)
+    var sb <- log_spectro(nb, L, rate, NF, NB, FMAX)
+    let n = NF * NB
+    var acc = 0.0
+    for (i in range(n)) {
+        acc += abs(clamp(sa[i], -80.0, 0.0) - clamp(sb[i], -80.0, 0.0))
+    }
+    delete na
+    delete nb
+    delete sa
+    delete sb
+    return clamp(acc / float(n) / 40.0, 0.0, 1.0)
 }

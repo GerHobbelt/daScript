@@ -172,5 +172,14 @@ def test_golden_disassembly(t : T?) {
         check(t, "userfn", userfn_words())
         check(t, "userfn_ref", userfn_ref_words())
         check(t, "userfn_global", userfn_global_words())
+        // PR-D mesh + task stage scaffolding fixtures (visitor baseline): cap + ext + execution model
+        // + execution modes + SetMeshOutputsEXT (mesh) / EmitMeshTasksEXT (task). byte-identical
+        // check() pins the opcode AND id-allocation order of the prologue intrinsics.
+        check(t, "mesh_empty", mesh_empty_words())
+        check(t, "task_empty", task_empty_words())
+        // PR-E mesh output config fixtures (visitor baseline): non-default counts + OutputLinesEXT /
+        // OutputPoints topology. byte-identical check() pins the OpExecutionMode operands.
+        check(t, "mesh_lines", mesh_lines_words())
+        check(t, "mesh_points", mesh_points_words())
     }
 }

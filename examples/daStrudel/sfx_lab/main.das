@@ -23,6 +23,7 @@ require live/live_commands
 require daslib/json_boost
 require daslib/fio
 require math
+require strings
 
 let SR = 44100
 let TWO_PI = 6.28318530717958647692
@@ -77,9 +78,15 @@ let DLG_NONE = 0
 let DLG_REF = 1
 let DLG_SAVE = 2
 let DLG_OPEN = 3
+let DLG_EXP_VOICE = 4
+let DLG_IMP_VOICE = 5
+let DLG_EXP_DAS = 6
 var g_dialog_mode = DLG_NONE
 var g_seed = 0x1234567u
 var g_autoplay = true
+var g_match_loudness = true       // match the mix's level to the reference's RMS (audition + baked into export)
+var g_master_gain = 1.0           // export gain (post-render, clip-safe), baked into the saved .sfx as Sound.master_gain
+var g_match_ratio = 1.0           // audition gain: the TRUE mix->reference RMS ratio (uncapped; peak-limited at play time)
 var g_mix_dirty = true
 var g_lyr_dirty = true
 var g_play_pending = false       // autoplay the mix after the next rebuild (set by discrete actions)
@@ -147,11 +154,83 @@ def private play_buf_copy(buf : array<float>) {
     play_sound_from_pcm(SR, 1, tmp)
 }
 
+// RMS over the ACTIVE span only (onset .. last sample above -34 dB of peak), ignoring trailing
+// silence/decay-tail. Full-buffer RMS is distorted by however much dead tail a sound carries, so
+// two sounds of different length can't be loudness-matched by it — this measures energy density of
+// the part you actually hear, consistently for both reference and mix.
+def private active_rms(buf : array<float>) : float {
+    if (empty(buf)) return 0.0
+    var pk = 0.0
+    for (s in buf) {
+        pk = max(pk, abs(s))
+    }
+    if (pk < 1.0e-6) return 0.0
+    let thr = pk * 0.02   // -34 dB
+    var first = -1
+    var last = 0
+    for (i in range(length(buf))) {
+        if (abs(buf[i]) > thr) {
+            if (first < 0) {
+                first = i
+            }
+            last = i
+        }
+    }
+    if (first < 0) return 0.0
+    var acc = 0.0
+    for (i in range(first, last + 1)) {
+        acc += buf[i] * buf[i]
+    }
+    return sqrt(acc / float(last - first + 1))
+}
+
+// Recompute the two loudness gains from the current (post-applied) mix vs the reference:
+//   g_match_ratio  = the TRUE mix->reference RMS ratio (uncapped) — used for AUDITION; play_mix
+//                    applies it then peak-limits, so what you hear always sits at the reference's
+//                    level no matter how the mix is tweaked (both windows stay level-locked).
+//   g_master_gain  = the EXPORT gain baked into the .sfx; capped so the raw render (no limiter in
+//                    render_sound_file) can't clip on playback.
+// Both reset to 1.0 when matching is off / no reference — so "off" is genuinely raw, audition AND
+// export alike.
+def update_levels() {
+    g_match_ratio = 1.0
+    g_master_gain = 1.0
+    if (!g_match_loudness || empty(g_ref) || empty(g_mix)) return
+    let mr = active_rms(g_mix)
+    if (mr <= 1.0e-6) return
+    g_match_ratio = active_rms(g_ref) / mr
+    var pk = 0.0
+    for (s in g_mix) {
+        pk = max(pk, abs(s))
+    }
+    let ceil = pk > 1.0e-6 ? 0.99 / pk : 1.12   // clip-safe ceiling for the baked export gain
+    g_master_gain = min(g_match_ratio, ceil)
+}
+
 def play_mix() {
     if (g_mix_dirty) {
         rebuild_mix()
     }
-    play_buf_copy(g_mix)
+    if (g_match_ratio == 1.0) {
+        play_buf_copy(g_mix)
+        return
+    }
+    var tmp : array<float>
+    tmp := g_mix
+    for (s in tmp) {
+        s *= g_match_ratio
+    }
+    var pk = 0.0
+    for (s in tmp) {
+        pk = max(pk, abs(s))
+    }
+    if (pk > 0.99) {            // matched to reference RMS, but never let the audition clip
+        let lim = 0.99 / pk
+        for (s in tmp) {
+            s *= lim
+        }
+    }
+    play_sound_from_pcm(SR, 1, tmp)
 }
 
 def play_layer(idx : int) {
@@ -189,6 +268,7 @@ def rebuild_mix() {
     compute_spectrum(g_mix, g_mix_spec)
     g_mix_spectro <- spectrogram(g_mix, SR, SPEC_FRAMES, SPEC_BINS, SPEC_FMAX)
     recompute_fit()
+    update_levels()   // re-match the audition + export levels to the reference as the mix changes
     g_mix_dirty = false
 }
 
@@ -255,15 +335,55 @@ def load_reference(path : string) {
     g_show_ref = true
     REF_SHOW.value = true
     recompute_fit()
+    update_levels()   // match the audition + export levels to the freshly-loaded reference
 }
 
 def do_save_sound(path : string) {
     var doc = Sound()
     doc.mimic_target = g_ref_path
+    doc.comment = SOUND_COMMENT.value   // freeform label (which lineage / variant this is)
     doc.layers := g_layers
     doc.post = g_post
+    doc.master_gain = g_master_gain   // bake the audited level so the exported .sfx plays the same
     save_sound(path, doc)
     g_sound_path = path
+}
+
+def do_export_voice(path : string) {
+    if (g_sel < 0 || g_sel >= length(g_layers)) return
+    save_layer(path, g_layers[g_sel])
+}
+
+def do_import_voice(path : string) {
+    var lyr = Layer()
+    if (!load_layer(path, lyr)) return
+    add_layer(lyr)            // selects it at the end
+    g_sel_loaded = -1
+    g_mix_dirty = true
+    g_lyr_dirty = true
+    g_edit_dirty = true       // one undoable step
+    recompute_fit()
+}
+
+// ===== export the current sound as a drop-in .das render function (emit_das lives in strudel_sfx) =====
+
+def private current_sound() : Sound {
+    var doc = Sound()
+    doc.mimic_target = g_ref_path
+    doc.comment = SOUND_COMMENT.value
+    doc.layers := g_layers
+    doc.post = g_post
+    doc.master_gain = g_master_gain
+    return <- doc
+}
+
+def do_export_das(path : string) {
+    var leaf = base_name(path)
+    if (length(leaf) > 4 && leaf |> ends_with(".das")) {
+        leaf = slice(leaf, 0, length(leaf) - 4)
+    }
+    var doc <- current_sound()
+    fwrite(path, emit_das(doc, leaf, false))
 }
 
 def do_open_sound(path : string) {
@@ -272,7 +392,10 @@ def do_open_sound(path : string) {
     g_layers := doc.layers
     g_post = doc.post
     g_post_reload = true
+    g_master_gain = doc.master_gain   // restore the baked level (re-matched live below if a ref loads)
     g_sound_path = path
+    SOUND_COMMENT.pending_value = doc.comment   // push the label into the top-of-panel editor
+    SOUND_COMMENT.has_pending = true
     g_sel = 0
     g_sel_loaded = -1
     g_mix_dirty = true
@@ -281,6 +404,55 @@ def do_open_sound(path : string) {
         load_reference(doc.mimic_target)
     }
     reset_history()
+}
+
+// Analysis-driven seeding: read the reference's fundamental / decay / noisiness / brightness and
+// build a modal body (+ a noise layer for noisy drums) starting CLOSE to the target, so the local
+// optimizer only has to polish instead of climbing from an arbitrary seed. Undoable (one step).
+def seed_from_ref() {
+    if (empty(g_ref)) {
+        g_opt_result = "load a reference first"
+        return
+    }
+    let sf = analyze_seed(g_ref, SR)
+    var mv = ModalVoice()
+    mv.pitch = sf.fundamental > 20.0 ? clamp(sf.fundamental, 20.0, 4000.0) : 200.0
+    mv.spread = clamp(sf.spread, 1.0, 2.6)
+    mv.n_modes = clamp(sf.n_modes, 1, 8)
+    mv.ring = clamp(sf.decay_ms / 1000.0 * 0.6, 0.005, 2.0)
+    mv.brightness = clamp(sf.flatness + 0.3, 0.1, 0.95)
+    mv.damp_skew = 0.7
+    mv.transient = clamp((sf.crest - 2.0) / 12.0, 0.1, 0.9)
+    mv.transient_rate = 800.0
+    mv.echo_delay = 0.04
+    mv.duration = clamp(sf.decay_ms / 1000.0 * 1.8, 0.05, 3.0)
+    var layers : array<Layer>
+    layers |> emplace(modal_layer("body", mv))
+    if (sf.flatness > 0.12) {                       // noisy drum -> add a noise layer (wires / wash)
+        var s = SfxrSound()
+        s.wave = SfxrWave.noise
+        s.base_freq = clamp(sf.centroid / 12000.0, 0.1, 0.9)
+        s.env_attack = 0.0
+        s.env_sustain = clamp(sf.decay_ms / 1000.0 * 0.1, 0.0, 0.3)
+        s.env_punch = 0.2
+        s.env_decay = clamp(sf.decay_ms / 1000.0 * 1.2, 0.02, 0.9)
+        s.hpf_freq = clamp(sf.centroid / 12000.0 * 0.6, 0.0, 0.7)
+        s.lpf_freq = 1.0
+        s.sound_vol = 0.6
+        var nl = sfxr_layer("noise", s)
+        nl.gain = clamp(sf.flatness * 1.3, 0.1, 0.9)
+        layers |> emplace(nl)
+    }
+    g_layers <- layers
+    g_post = PostChain()      // fresh estimate: start with a clean post chain (don't inherit the previous drum's effects)
+    g_post_reload = true
+    g_sel = 0
+    g_sel_loaded = -1
+    g_mix_dirty = true
+    g_lyr_dirty = true
+    g_edit_dirty = true       // one undoable step (Cmd+Z restores the prior layers + post)
+    recompute_fit()
+    g_opt_result = "seeded: {int(mv.pitch)}Hz, {sf.flatness > 0.12 ? "body+noise" : "body"} (flat {int(sf.flatness * 100.0)}%)"
 }
 
 // ===== undo / redo =====
@@ -413,14 +585,14 @@ def private voice_knobs_io(writing : bool; li : int; var i : int&) {
         var v = g_layers[li].voice as modal
         knob(writing, i, v.pitch, 20.0, 4000.0)
         knob(writing, i, v.spread, 1.0, 2.6)
-        knob(writing, i, v.ring, 0.005, 0.4)
+        knob(writing, i, v.ring, 0.005, 2.0)
         knob(writing, i, v.brightness, 0.0, 1.0)
         knob(writing, i, v.damp_skew, 0.0, 1.5)
         knob(writing, i, v.transient, 0.0, 1.0)
         knob(writing, i, v.transient_rate, 100.0, 2000.0)
         knob(writing, i, v.echo_amount, 0.0, 1.0)
         knob(writing, i, v.echo_delay, 0.005, 0.15)
-        knob(writing, i, v.duration, 0.05, 1.0)
+        knob(writing, i, v.duration, 0.05, 3.0)
         if (writing) {
             g_layers[li].voice = VoiceParams(modal = v)
         }
@@ -889,10 +1061,12 @@ def editor_panel() {
     collapsing_header(PREVIEW_H, (text = "layer preview", closable = false, flags = ImGuiTreeNodeFlags.None)) {
         plot(PV_WAVE, (title = "layer waveform", size = float2(-1.0f, 120.0f), flags = ImPlotFlags.None)) {
             setup_axes("sample", "amp", ImPlotAxisFlags.AutoFit, ImPlotAxisFlags.AutoFit)
+            setup_legend(ImPlotLocation.NorthEast)
             plot_line("layer", g_lyr_wave)
         }
         plot(PV_SPEC, (title = "layer spectrum (dB)", size = float2(-1.0f, 120.0f), flags = ImPlotFlags.None)) {
             setup_axes("bin", "dB", ImPlotAxisFlags.AutoFit, ImPlotAxisFlags.AutoFit)
+            setup_legend(ImPlotLocation.NorthEast)
             plot_line("layer", g_lyr_spec)
         }
     }
@@ -977,7 +1151,7 @@ def modal_editor() : bool {
     if (slider_float(M_SPREAD, (text = "spread"))) { ch = true; }
     M_NMODES.bounds = (1, 8)
     if (slider_int(M_NMODES, (text = "modes"))) { ch = true; }
-    M_RING.bounds = (0.005f, 0.4f)
+    M_RING.bounds = (0.005f, 2.0f)
     if (slider_float(M_RING, (text = "ring (s)"))) { ch = true; }
     M_BRIGHT.bounds = (0.0f, 1.0f)
     if (slider_float(M_BRIGHT, (text = "brightness"))) { ch = true; }
@@ -991,7 +1165,7 @@ def modal_editor() : bool {
     if (slider_float(M_ECHOAMT, (text = "echo amount"))) { ch = true; }
     M_ECHODELAY.bounds = (0.005f, 0.15f)
     if (slider_float(M_ECHODELAY, (text = "echo delay (s)"))) { ch = true; }
-    M_DUR.bounds = (0.05f, 1.0f)
+    M_DUR.bounds = (0.05f, 3.0f)
     if (slider_float(M_DUR, (text = "duration (s)"))) { ch = true; }
     return ch
 }
@@ -1003,67 +1177,88 @@ def mix_header() {
     }
     same_line(MIX_SL)
     if (g_have_fit) {
-        text(FIT_TXT, (text = "fit {int(g_fit.overall * 100.0)}%   (timbre {int(g_fit.spectral * 100.0)}%   shape {int(g_fit.envelope * 100.0)}%)"))
-        text(FIT_TXT2, (text = "ref: {int(g_ref_feat.centroid)}Hz / {int(g_ref_feat.decay_ms)}ms    mix: {int(g_mix_feat.centroid)}Hz / {int(g_mix_feat.decay_ms)}ms   (centroid / decay)"))
+        text(FIT_TXT, (text = "fit {int(g_fit.overall * 100.0)}%   (timbre {int(g_fit.spectral * 100.0)}%  pitch {int(g_fit.pitch * 100.0)}%  texture {int(g_fit.texture * 100.0)}%  shape {int(g_fit.shape * 100.0)}%  attack {int(g_fit.attack * 100.0)}%)"))
+        let mdb = 20.0 * log(max(g_match_ratio, 1.0e-6)) * 0.43429448190325176
+        let mtxt = g_match_loudness ? "matched {int(mdb)} dB to reference (audition + export)" : "raw level (audition + export)"
+        text(FIT_TXT2, (text = "ref: {int(g_ref_feat.centroid)}Hz / {int(g_ref_feat.decay_ms)}ms    mix: {int(g_mix_feat.centroid)}Hz / {int(g_mix_feat.decay_ms)}ms   (centroid / decay)    [{mtxt}]"))
     } else {
         text(FIT_TXT, (text = "fit: load a reference to compare"))
     }
 }
 
-def mix_panel() {
-    mix_header()
-    if (g_have_fit) {
-        if (button(OPT_VOICE_BTN, (text = "opt voice"))) {
-            run_optimize(OPT_VOICE)
-        }
-        same_line(OPT_SL1)
-        if (button(OPT_FX_BTN, (text = "opt fx"))) {
-            run_optimize(OPT_POST)
-        }
-        same_line(OPT_SL2)
-        if (button(OPT_ALL_BTN, (text = "opt all"))) {
-            run_optimize(OPT_COMBINED)
-        }
-        same_line(OPT_SL3)
-        if (button(OPT_DISC_BTN, (text = "+ discover modal"))) {
-            run_discover()
-        }
-        same_line(OPT_SL4)
-        OPT_ITERS.bounds = (4, 80)
-        slider_int(OPT_ITERS, (text = "iters"))
-        if (!empty(g_opt_result)) {
-            text(OPT_RESULT, (text = g_opt_result))
-        }
+// shared opt-button row (only meaningful once a reference is loaded)
+def opt_row() {
+    if (button(OPT_SEED_BTN, (text = "seed"))) {
+        seed_from_ref()       // analysis-seed the layers from the reference (start close)
     }
-    plot(MIX_WAVE, (title = "mix waveform", size = float2(-1.0f, 150.0f), flags = ImPlotFlags.None)) {
-        setup_axes("sample", "amp", ImPlotAxisFlags.AutoFit, ImPlotAxisFlags.AutoFit)
-        plot_line("mix", g_mix_wave)
-        if (g_show_ref && !empty(g_ref_wave)) {
-            plot_line("reference", g_ref_wave)
-        }
+    same_line(OPT_SL0)
+    if (button(OPT_VOICE_BTN, (text = "opt voice"))) {
+        run_optimize(OPT_VOICE)
     }
-    plot(MIX_SPEC, (title = "mix spectrum (dB)", size = float2(-1.0f, 150.0f), flags = ImPlotFlags.None)) {
-        setup_axes("bin", "dB", ImPlotAxisFlags.AutoFit, ImPlotAxisFlags.AutoFit)
-        plot_line("mix", g_mix_spec)
-        if (g_show_ref && !empty(g_ref_spec)) {
-            plot_line("reference", g_ref_spec)
-        }
+    same_line(OPT_SL1)
+    if (button(OPT_FX_BTN, (text = "opt fx"))) {
+        run_optimize(OPT_POST)
+    }
+    same_line(OPT_SL2)
+    if (button(OPT_ALL_BTN, (text = "opt all"))) {
+        run_optimize(OPT_COMBINED)
+    }
+    same_line(OPT_SL3)
+    if (button(OPT_DISC_BTN, (text = "+ discover modal"))) {
+        run_discover()
+    }
+    same_line(OPT_SL4)
+    OPT_ITERS.bounds = (4, 80)
+    SetNextItemWidth(120.0f)   // compact, so the "iters" label isn't pushed off the panel edge
+    slider_int(OPT_ITERS, (text = "iters"))
+    if (!empty(g_opt_result)) {
+        text(OPT_RESULT, (text = g_opt_result))
     }
 }
 
-// spectrum-over-time: STFT magnitude (dB) as a color heatmap, time on X, freq on Y (high at top)
-def spectro_panel() {
+// Unified preview: shared play + fit + opt-row on top, the different views in tabs underneath
+// (waveform/spectrum vs spectrum-over-time spectrogram). Replaces the separate Mix + Spectrogram
+// docks, which duplicated the play button and fit readout.
+def preview_panel() {
+    input_text(SOUND_COMMENT, (text = "label"))   // freeform caption at the very top (which variant this is)
     mix_header()
-    plot(SPEC_MIX, (title = "mix - spectrum over time", size = float2(-1.0f, 150.0f), flags = ImPlotFlags.None)) {
-        setup_axes("time", "freq (log)", ImPlotAxisFlags.AutoFit, ImPlotAxisFlags.AutoFit)
-        if (!empty(g_mix_spectro)) {
-            plot_heatmap("mix", g_mix_spectro, SPEC_BINS, SPEC_FRAMES, -90.0lf, -20.0lf, "")
-        }
+    if (g_have_fit) {
+        opt_row()
     }
-    plot(SPEC_REF, (title = "reference - spectrum over time", size = float2(-1.0f, 150.0f), flags = ImPlotFlags.None)) {
-        setup_axes("time", "freq (log)", ImPlotAxisFlags.AutoFit, ImPlotAxisFlags.AutoFit)
-        if (!empty(g_ref_spectro)) {
-            plot_heatmap("ref", g_ref_spectro, SPEC_BINS, SPEC_FRAMES, -90.0lf, -20.0lf, "")
+    tab_bar(PV_TABS, (text = "preview", flags = ImGuiTabBarFlags.None)) {
+        tab_item(PV_TAB_WAVE, (text = "Wave + Spectrum", closable = false, flags = ImGuiTabItemFlags.None)) {
+            plot(MIX_WAVE, (title = "mix waveform", size = float2(-1.0f, 150.0f), flags = ImPlotFlags.None)) {
+                setup_axes("sample", "amp", ImPlotAxisFlags.AutoFit, ImPlotAxisFlags.AutoFit)
+                setup_legend(ImPlotLocation.NorthEast)   // top-right: keep the legend off the onset (left)
+                plot_line("mix", g_mix_wave)
+                if (g_show_ref && !empty(g_ref_wave)) {
+                    plot_line("reference", g_ref_wave)
+                }
+            }
+            plot(MIX_SPEC, (title = "mix spectrum (dB)", size = float2(-1.0f, 150.0f), flags = ImPlotFlags.None)) {
+                setup_axes("bin", "dB", ImPlotAxisFlags.AutoFit, ImPlotAxisFlags.AutoFit)
+                setup_legend(ImPlotLocation.NorthEast)
+                plot_line("mix", g_mix_spec)
+                if (g_show_ref && !empty(g_ref_spec)) {
+                    plot_line("reference", g_ref_spec)
+                }
+            }
+        }
+        tab_item(PV_TAB_SPECTRO, (text = "Spectrogram", closable = false, flags = ImGuiTabItemFlags.None)) {
+            plot(SPEC_MIX, (title = "mix - spectrum over time", size = float2(-1.0f, 150.0f), flags = ImPlotFlags.None)) {
+                setup_axes("time", "freq (log)", ImPlotAxisFlags.AutoFit, ImPlotAxisFlags.AutoFit)
+                setup_legend(ImPlotLocation.NorthEast)
+                if (!empty(g_mix_spectro)) {
+                    plot_heatmap("mix", g_mix_spectro, SPEC_BINS, SPEC_FRAMES, -90.0lf, -20.0lf, "")
+                }
+            }
+            plot(SPEC_REF, (title = "reference - spectrum over time", size = float2(-1.0f, 150.0f), flags = ImPlotFlags.None)) {
+                setup_axes("time", "freq (log)", ImPlotAxisFlags.AutoFit, ImPlotAxisFlags.AutoFit)
+                setup_legend(ImPlotLocation.NorthEast)
+                if (!empty(g_ref_spectro)) {
+                    plot_heatmap("ref", g_ref_spectro, SPEC_BINS, SPEC_FRAMES, -90.0lf, -20.0lf, "")
+                }
+            }
         }
     }
 }
@@ -1198,10 +1393,12 @@ def reference_panel() {
     text(REF_NAME, (text = g_ref_name))
     plot(REF_WAVE, (title = "reference waveform", size = float2(-1.0f, 120.0f), flags = ImPlotFlags.None)) {
         setup_axes("sample", "amp", ImPlotAxisFlags.AutoFit, ImPlotAxisFlags.AutoFit)
+        setup_legend(ImPlotLocation.NorthEast)
         plot_line("ref", g_ref_wave)
     }
     plot(REF_SPEC, (title = "reference spectrum (dB)", size = float2(-1.0f, 120.0f), flags = ImPlotFlags.None)) {
         setup_axes("bin", "dB", ImPlotAxisFlags.AutoFit, ImPlotAxisFlags.AutoFit)
+        setup_legend(ImPlotLocation.NorthEast)
         plot_line("ref", g_ref_spec)
     }
 }
@@ -1223,8 +1420,7 @@ def setup_default_layout(dock_id : uint) {
     DockBuilderDockWindow("Layers", layers_id)
     DockBuilderDockWindow("Editor", editor_id)
     DockBuilderDockWindow("Reference", ref_id)
-    DockBuilderDockWindow("Mix", mix_id)
-    DockBuilderDockWindow("Spectrogram", mix_id)
+    DockBuilderDockWindow("Preview", mix_id)
     DockBuilderDockWindow("Postprocess", editor_id)
     DockBuilderFinish(dock_id)
 }
@@ -1233,6 +1429,7 @@ def start_app() {
     g_started = true
     MB_AUTO.value = true
     g_autoplay = true
+    MB_MATCH.value = true
     REF_SHOW.value = true
     // seed a starter sound: the ball-on-table (thud + click), so the lab opens on a real multi-layer sound
     add_layer(modal_layer("table thud", ModalVoice(pitch = 170.0, spread = 2.4, n_modes = 2, ring = 0.05, brightness = 0.35, transient = 0.2, duration = 0.5)))
@@ -1279,6 +1476,24 @@ def update() {
                 file_dialog_open(FileDialogConfig(title = "Save sound", start_dir = "",
                     filters <- file_filters("Sound (*.sfx)|sfx|All files|"), mode = FileDialogMode.save, max_selection = 1, default_name = "untitled.sfx"))
             }
+            if (menu_item(MI_IMP_VOICE, (text = "Import voice..."))) {
+                MI_IMP_VOICE.value = false
+                g_dialog_mode = DLG_IMP_VOICE
+                file_dialog_open(FileDialogConfig(title = "Import voice", start_dir = "",
+                    filters <- file_filters("Voice (*.voice)|voice|All files|"), mode = FileDialogMode.open, max_selection = 0))
+            }
+            if (menu_item(MI_EXP_VOICE, (text = "Export selected voice..."))) {
+                MI_EXP_VOICE.value = false
+                g_dialog_mode = DLG_EXP_VOICE
+                file_dialog_open(FileDialogConfig(title = "Export voice", start_dir = "",
+                    filters <- file_filters("Voice (*.voice)|voice|All files|"), mode = FileDialogMode.save, max_selection = 1, default_name = "untitled.voice"))
+            }
+            if (menu_item(MI_EXP_DAS, (text = "Export .das render function..."))) {
+                MI_EXP_DAS.value = false
+                g_dialog_mode = DLG_EXP_DAS
+                file_dialog_open(FileDialogConfig(title = "Export .das (filename = function name)", start_dir = "",
+                    filters <- file_filters("daslang (*.das)|das|All files|"), mode = FileDialogMode.save, max_selection = 1, default_name = "render_sound.das"))
+            }
         }
         menu(EDIT_MENU, "Edit", true) {
             if (menu_item(MI_UNDO, (text = "Undo  (Cmd+Z)"))) {
@@ -1296,9 +1511,14 @@ def update() {
                 MI_PLAY.value = false
             }
             checkbox(MB_AUTO, (text = "autoplay"))
+            checkbox(MB_MATCH, (text = "match reference loudness"))
         }
     }
     g_autoplay = MB_AUTO.value
+    if (MB_MATCH.value != g_match_loudness) {   // toggling match must re-level immediately
+        g_match_loudness = MB_MATCH.value
+        g_mix_dirty = true
+    }
 
     // keyboard: Cmd+Z undo, Cmd+Shift+Z redo (skip while a text field has focus)
     let io & = unsafe(GetIO())
@@ -1324,11 +1544,8 @@ def update() {
         dock_window(REFERENCE, (text = "Reference", closable = false, flags = ImGuiWindowFlags.None)) {
             reference_panel()
         }
-        dock_window(MIX, (text = "Mix", closable = false, flags = ImGuiWindowFlags.None)) {
-            mix_panel()
-        }
-        dock_window(SPECTRO, (text = "Spectrogram", closable = false, flags = ImGuiWindowFlags.None)) {
-            spectro_panel()
+        dock_window(PREVIEW, (text = "Preview", closable = false, flags = ImGuiWindowFlags.None)) {
+            preview_panel()
         }
         dock_window(POSTPROC, (text = "Postprocess", closable = false, flags = ImGuiWindowFlags.None)) {
             postprocess_panel()
@@ -1351,6 +1568,12 @@ def update() {
             do_open_sound(picked)
         } elif (g_dialog_mode == DLG_SAVE) {
             do_save_sound(picked)
+        } elif (g_dialog_mode == DLG_EXP_VOICE) {
+            do_export_voice(picked)
+        } elif (g_dialog_mode == DLG_IMP_VOICE) {
+            do_import_voice(picked)
+        } elif (g_dialog_mode == DLG_EXP_DAS) {
+            do_export_das(picked)
         }
         g_dialog_mode = DLG_NONE
     }
@@ -1612,6 +1835,51 @@ def sfx_save(input : JsonValue?) : JsonValue? {
     if (empty(path)) return JV("no path: open or save a sound first, or pass a path arg")
     do_save_sound(path)
     return JV("saved {path}")
+}
+
+[live_command(description = "SFX lab: analysis-seed the layers from the loaded reference (modal body + noise layer), then report fit.")]
+def sfx_seed(_input : JsonValue?) : JsonValue? {
+    seed_from_ref()
+    if (g_mix_dirty) {
+        rebuild_mix()
+    }
+    return make_report()
+}
+
+[live_command(description = "SFX lab: export the selected voice layer to a .voice file. Args: path")]
+def sfx_export_voice(input : JsonValue?) : JsonValue? {
+    let args = from_JV(input, type<LoadRefArgs>)
+    if (empty(args.path)) return JV("pass a path arg")
+    if (g_sel < 0 || g_sel >= length(g_layers)) return JV("no layer selected")
+    do_export_voice(args.path)
+    return JV("exported voice to {args.path}")
+}
+
+struct ExportDasArgs {
+    path : string = ""
+    name : string = "render_sound"
+    pitched : bool = false       //!< add a base_freq param that scales the modal pitch (e.g. render_tom)
+}
+
+[live_command(description = "SFX lab: export the current sound as a drop-in .das render function. Args: path, name, pitched (bool — adds a base_freq pitch-scale param for the tom)")]
+def sfx_export_das(input : JsonValue?) : JsonValue? {
+    let args = from_JV(input, type<ExportDasArgs>)
+    if (empty(args.path)) return JV("pass a path arg")
+    var doc <- current_sound()
+    let src = emit_das(doc, args.name, args.pitched)
+    if (!fwrite(args.path, src)) return JV("write failed: {args.path}")
+    return JV("exported {args.name} ({length(g_layers)} layers) to {args.path}")
+}
+
+[live_command(description = "SFX lab: import a .voice file as a new layer, then report fit. Args: path")]
+def sfx_import_voice(input : JsonValue?) : JsonValue? {
+    let args = from_JV(input, type<LoadRefArgs>)
+    if (empty(args.path)) return JV("pass a path arg")
+    do_import_voice(args.path)
+    if (g_mix_dirty) {
+        rebuild_mix()
+    }
+    return make_report()
 }
 
 struct AddLayerArgs {
