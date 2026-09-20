@@ -8,6 +8,7 @@
 //   - If script only exports `main` → call main() directly (same as daslang.exe)
 
 #include "daScript/daScript.h"
+#include "daScript/daScriptModule.h"
 #include "daScript/das_common.h"
 #include "daScript/simulate/fs_file_info.h"
 #include "daScript/ast/dyn_modules.h"
@@ -525,11 +526,13 @@ static int run_lifecycle(const string & fn) {
 
 static void print_help() {
     tout << "daslang-live — live-reloading application host for daScript\n";
-    tout << "Usage: daslang-live [options] <script.das>\n";
+    tout << "Usage: daslang-live [options] <script.das> [-- script arguments]\n";
     tout << "  -project <file>   — project file (.das_project)\n";
     tout << "  -dasroot <path>   — override DAS_ROOT\n";
     tout << "  -cwd              — change working directory to script's folder\n";
     tout << "  -v1syntax         — use v1 syntax (default: v2)\n";
+    tout << "  --no-dyn-modules  — skip loading dynamic modules\n";
+    tout << "  --                — separator for script arguments\n";
     tout << "  -h, --help        — this help\n";
 }
 
@@ -648,33 +651,7 @@ int main(int argc, char * argv[]) {
     }
 
     // Register modules
-    if (!Module::require("$")) {
-        NEED_MODULE(Module_BuiltIn);
-    }
-    if (!Module::require("math")) {
-        NEED_MODULE(Module_Math);
-    }
-    if (!Module::require("strings")) {
-        NEED_MODULE(Module_Strings);
-    }
-    if (!Module::require("rtti")) {
-        NEED_MODULE(Module_Rtti);
-    }
-    if (!Module::require("ast")) {
-        NEED_MODULE(Module_Ast);
-    }
-    if (!Module::require("jit")) {
-        NEED_MODULE(Module_Jit);
-    }
-    if (!Module::require("debugapi")) {
-        NEED_MODULE(Module_Debugger);
-    }
-    NEED_MODULE(Module_Network);
-    NEED_MODULE(Module_UriParser);
-    NEED_MODULE(Module_JobQue);
-    NEED_MODULE(Module_FIO);
-    NEED_MODULE(Module_DASBIND);
-
+    register_builtin_modules();
     require_project_specific_modules();
 
 #if !defined(DAS_ENABLE_DLL) || !defined(DAS_ENABLE_DYN_INCLUDES)

@@ -4,6 +4,11 @@
 #include "daScript/misc/performance_time.h"
 #include "daScript/misc/sysos.h"
 
+#ifdef DAS_ENABLE_DYN_INCLUDES
+#include "daScript/ast/dyn_modules.h"
+#include "daScript/simulate/fs_file_info.h"
+#endif
+
 #include "daScript/ast/ast.h"                     // astTypeInfo
 #include "daScript/ast/ast_handle.h"              // addConstant
 #include "daScript/ast/ast_interop.h"             // addExtern
@@ -210,11 +215,13 @@ extern "C" {
             policies.debugger = false;
             context.setup(totalVariables, globalStringHeapSize, policies, {});
             context.globalsSize = 32000;
+            context.sharedOwner = true;
             for (int i = 0; i < totalVariables; i++) {
                 globalVariables[i] = GlobalVariable{};
             }
             context.allocateGlobalsAndShared();
             memset(context.globals, 0, context.globalsSize);
+            memset(context.shared, 0, context.sharedSize);
 
             // Instead of copying everything like in standalone contexts
             // Let's add only things we really need.
@@ -321,7 +328,7 @@ extern "C" {
             return true;
         });
         if (!found) {
-            DAS_FATAL_ERROR("Failed to find %s in module %s.", funcMangledName, moduleName);
+            DAS_FATAL_ERROR("Failed to find %s in module %s.\n", funcMangledName, moduleName);
         }
     }
 
@@ -334,7 +341,7 @@ extern "C" {
             return false;
         });
         if (!result) {
-            DAS_FATAL_ERROR("Failed to find annotation %s in module %s.", annName, moduleName);
+            DAS_FATAL_ERROR("Failed to find annotation %s in module %s.\n", annName, moduleName);
         }
         return result;
     }
@@ -640,25 +647,22 @@ extern "C" {
     }
 
     extern "C" {
-        void * get_jit_table_find ( int32_t baseType, Context * context, LineInfoArg * at ) {
+        DAS_API void * get_jit_table_find ( int32_t baseType, Context * context, LineInfoArg * at ) {
             return das_get_jit_table_find(baseType, context, at);
         }
-        void * get_jit_table_at ( int32_t baseType, Context * context, LineInfoArg * at ) {
+        DAS_API void * get_jit_table_at ( int32_t baseType, Context * context, LineInfoArg * at ) {
             return das_get_jit_table_at(baseType, context, at);
         }
-        void * get_jit_table_erase ( int32_t baseType, Context * context, LineInfoArg * at ) {
+        DAS_API void * get_jit_table_erase ( int32_t baseType, Context * context, LineInfoArg * at ) {
             return das_get_jit_table_erase(baseType, context, at);
         }
-
-        void * das_get_jit_new ( TypeAnnotation *annotation ) {
+        DAS_API void * das_get_jit_new ( TypeAnnotation *annotation ) {
             return annotation->jitGetNew();
         }
-
-        void * das_get_jit_delete ( TypeAnnotation *annotation ) {
+        DAS_API void * das_get_jit_delete ( TypeAnnotation *annotation ) {
             return annotation->jitGetDelete();
         }
-
-        void * das_get_jit_clone ( TypeAnnotation *annotation ) {
+        DAS_API void * das_get_jit_clone ( TypeAnnotation *annotation ) {
             return annotation->jitGetClone();
         }
     }
@@ -784,7 +788,7 @@ extern "C" {
         }
     }
 #else
-    void create_shared_library ( const char * , const char * , const char *, const char * ) { }
+    void create_shared_library ( const char * objFilePath, const char * libraryName, [[maybe_unused]] const char * dasLib, const char * customLinker, bool isShared ) { }
 #endif
 
     void jit_set_jit_state(Context & context, void *shared_lib, void *llvm_ee, void *llvm_context) {
@@ -807,8 +811,8 @@ extern "C" {
             DAS_PROFILE_SECTION("Module_Jit");
             ModuleLibrary lib(this);
             lib.addBuiltInModule();
-            addBuiltinDependency(lib, Module::require("rtti"));
-            addBuiltinDependency(lib, Module::require("ast"));
+            addBuiltinDependency(lib, Module::require("rtti_core"));
+            addBuiltinDependency(lib, Module::require("ast_core"));
             addExtern<DAS_BIND_FUN(das_invoke_code)>(*this, lib, "invoke_code",
                 SideEffects::worstDefault, "das_invoke_code")
                     ->args({"code","arguments","cmres","context"})->unsafeOperation = true;
@@ -961,5 +965,12 @@ static void init() {
 extern "C" {
 DAS_API void jit_initialize_modules () {
     init();
+#ifdef DAS_ENABLE_DYN_INCLUDES
+    das::daScriptEnvironment::ensure();
+    auto access = das::make_smart<das::FsFileAccess>();
+    das::TextPrinter tout;
+    das::require_dynamic_modules(access, das::getDasRoot(), "", tout);
+#endif
+    das::Module::Initialize();
 }
 }

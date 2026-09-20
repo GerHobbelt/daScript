@@ -2,6 +2,7 @@
 #include "daScript/ast/ast.h"
 #include "daScript/ast/dyn_modules.h"
 #include "daScript/daScript.h"
+#include "daScript/daScriptModule.h"
 #include "daScript/das_common.h"
 #include "daScript/simulate/fs_file_info.h"
 #include "../dasFormatter/fmt.h"
@@ -259,43 +260,8 @@ int das_aot_main ( int argc, char * argv[] ) {
             }
         }
     }
-    // register modules
-    if (!Module::require("$")) {
-        NEED_MODULE(Module_BuiltIn);
-    }
-    if (!Module::require("math")) {
-        NEED_MODULE(Module_Math);
-    }
-    if (!Module::require("strings")) {
-        NEED_MODULE(Module_Strings);
-    }
-    if (!Module::require("rtti")) {
-        NEED_MODULE(Module_Rtti);
-    }
-    if (!Module::require("ast")) {
-        NEED_MODULE(Module_Ast);
-    }
-    if (!Module::require("jit")) {
-        NEED_MODULE(Module_Jit);
-    }
-    if (!Module::require("debugapi")) {
-        NEED_MODULE(Module_Debugger);
-    }
-    if (!Module::require("network")) {
-        NEED_MODULE(Module_Network);
-    }
-    if (!Module::require("uriparser")) {
-        NEED_MODULE(Module_UriParser);
-    }
-    if (!Module::require("jobque")) {
-        NEED_MODULE(Module_JobQue);
-    }
-    if (!Module::require("fio")) {
-        NEED_MODULE(Module_FIO);
-    }
-    if (!Module::require("dasbind")) {
-        NEED_MODULE(Module_DASBIND);
-    }
+    // register all builtin modules
+    register_builtin_modules();
     require_project_specific_modules();
     #if !defined(DAS_ENABLE_DLL) || !defined(DAS_ENABLE_DYN_INCLUDES)
     // Otherwises search for static modules.
@@ -515,19 +481,24 @@ void print_help() {
     tout
         << "daslang version " << DAS_VERSION_MAJOR << "." << DAS_VERSION_MINOR << "." << DAS_VERSION_PATCH << "\n"
         << "daslang scriptName1 {scriptName2} .. {-main mainFnName} {-log} {-pause} -- {script arguments}\n"
+        << "    -main <fnName> set entry function name (default: main)\n"
         << "    -v2syntax   enable version 2 syntax (uses braces {} for code blocks) [default]\n"
         << "    -v1syntax   enable version 1 syntax (uses Python-style indentation for code blocks)\n"
         << "    -v2makeSyntax enable version 1 syntax with version 2 constructors syntax (for arrays/structures)\n"
         << "    -jit        enable Just-In-Time compilation\n"
+        << "    -exe        JIT compile to standalone executable (implies -dry-run)\n"
+        << "    -output <path> set JIT output path\n"
         << "    -use-aot    enable AOT linking (requires AOT stubs linked into the binary)\n"
+        << "    -aot2 <in_script.das> <out_script.das.cpp> AOT generation (v2, implies -dry-run)\n"
+        << "    -aot_lib    mark AOT output as library module (use with -aot2)\n"
         << "    -project <path.das_project> path to project file\n"
-        << "    -project_root optional path to root directory of the project (used for dyn modules)\n"
-        << "    -run-fmt    <inplace/dry> <v2/v1> <semicolon> run formatter, requires 2 or more arguments\n"
+        << "    -project_root <path> root directory of the project (used for dyn modules)\n"
+        << "    -run-fmt    <-i/-d> <-v2/-v1> {--semicolon} run formatter\n"
         << "    -log        output program code\n"
         << "    -pause      pause after errors and pause again before exiting program\n"
         << "    -dry-run    compile and simulate script without execution\n"
         << "    -compile-only compile script without simulation and execution\n"
-        << "    -dasroot    set path to daslang root folder (with daslib)\n"
+        << "    -dasroot <path> set path to daslang root folder (with daslib)\n"
 #if DAS_SMART_PTR_ID
         << "    -track-smart-ptr <id> track smart pointer with id\n"
 #endif
@@ -538,12 +509,13 @@ void print_help() {
         << "    -das-profiler-manual manual profiler control\n"
         << "    -das-profiler-memory memory profiler\n"
         << "    -no-dynamic-modules  skip loading dynamic modules from dasroot and project root\n"
+        << "    --          separator for script arguments\n"
         << "daslang -aot <in_script.das> <out_script.das.cpp> {-q} {-p}\n"
         << "    -project <path.das_project> path to project file\n"
         << "    -p          paranoid validation of CPP AOT\n"
         << "    -q          suppress all output\n"
         << "    -dry-run    no changes will be written\n"
-        << "    -dasroot    set path to daslang root folder (with daslib)\n"
+        << "    -dasroot <path> set path to daslang root folder (with daslib)\n"
     ;
 }
 
@@ -754,6 +726,9 @@ int MAIN_FUNC_NAME ( int argc, char * argv[] ) {
                 // do nohting, script handles it
             } else if ( cmd=="no-dynamic-modules" ) {
                 noDynamicModules = true;
+            } else if ( cmd=="h" || cmd=="-help" ) {
+                print_help();
+                return 0;
             } else if ( !scriptArgs) {
                 printf("unknown command line option %s\n", cmd.c_str());
                 print_help();
@@ -769,33 +744,7 @@ int MAIN_FUNC_NAME ( int argc, char * argv[] ) {
         return -1;
     }
     // register modules
-    if (!Module::require("$")) {
-        NEED_MODULE(Module_BuiltIn);
-    }
-    if (!Module::require("math")) {
-        NEED_MODULE(Module_Math);
-    }
-    if (!Module::require("strings")) {
-        NEED_MODULE(Module_Strings);
-    }
-    if (!Module::require("rtti")) {
-        NEED_MODULE(Module_Rtti);
-    }
-    if (!Module::require("ast")) {
-        NEED_MODULE(Module_Ast);
-    }
-    if (!Module::require("jit")) {
-        NEED_MODULE(Module_Jit);
-    }
-    if (!Module::require("debugapi")) {
-        NEED_MODULE(Module_Debugger);
-    }
-    NEED_MODULE(Module_Network);
-    NEED_MODULE(Module_UriParser);
-    NEED_MODULE(Module_JobQue);
-    NEED_MODULE(Module_FIO);
-    NEED_MODULE(Module_DASBIND);
-
+    register_builtin_modules();
     require_project_specific_modules();
     #if !defined(DAS_ENABLE_DLL) || !defined(DAS_ENABLE_DYN_INCLUDES)
     // Otherwises search for static modules.

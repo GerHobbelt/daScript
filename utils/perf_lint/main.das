@@ -2,7 +2,7 @@ options gen2
 
 require daslib/perf_lint
 require daslib/ast_boost
-require fio
+require daslib/fio
 require strings
 require daslib/strings_boost
 
@@ -57,6 +57,7 @@ def main() {
                 using() <| $(var cop : CodeOfPolicies) {
                     cop.ignore_shared_modules = true
                     cop.export_all = true
+                    cop.no_optimizations = true
                     compile_file(file, access, unsafe(addr(mg)), cop) <| $(ok; program; issues) {
                         if (!ok) {
                             let issues_str = string(issues)

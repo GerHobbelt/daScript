@@ -400,7 +400,10 @@ ENDFUNCTION()
 
 
 FOREACH(_module ${_modules})
-    INCLUDE(modules/${_module}/CMakeLists.txt OPTIONAL)
+    # Skip daspkg-installed modules that build themselves (standalone CMake)
+    IF(NOT EXISTS "${PROJECT_SOURCE_DIR}/modules/${_module}/.daspkg_standalone")
+        INCLUDE(modules/${_module}/CMakeLists.txt OPTIONAL)
+    ENDIF()
 ENDFOREACH()
 
 # Clean stale .shared_module files. When a module is disabled, its .shared_module
@@ -591,6 +594,7 @@ SET(BUILTIN_SRC
 include/daScript/builtin/ast_gen.inc
 include/daScript/builtin/debugapi_gen.inc
 
+src/builtin/modules.cpp
 src/builtin/module_builtin.h
 src/builtin/module_builtin.cpp
 src/builtin/module_builtin_misc_types.cpp
@@ -600,7 +604,6 @@ src/builtin/module_builtin_runtime_lockcheck.cpp
 src/builtin/module_builtin_vector.cpp
 src/builtin/module_builtin_vector_ctor.cpp
 src/builtin/module_builtin_array.cpp
-src/builtin/module_builtin_das.cpp
 src/builtin/module_builtin_math.cpp
 src/builtin/module_builtin_string.cpp
 src/builtin/module_builtin_rtti.h
@@ -623,27 +626,9 @@ src/builtin/module_builtin_network.cpp
 src/builtin/module_builtin_debugger.cpp
 src/builtin/module_builtin_jobque.cpp
 src/builtin/module_file_access.cpp
-src/builtin/builtin.das.inc
-src/builtin/builtin.das
-src/builtin/fio.das.inc
-src/builtin/fio.das
-src/builtin/rtti.das.inc
-src/builtin/rtti.das
-src/builtin/ast.das.inc
-src/builtin/ast.das
-src/builtin/network.das.inc
-src/builtin/network.das
-src/builtin/debugger.das.inc
-src/builtin/debugger.das
 )
 list(SORT BUILTIN_SRC)
 SOURCE_GROUP_FILES("module builtin" BUILTIN_SRC)
-CMAKE_TEXT_XXD(libDaScript src/builtin/builtin.das)
-CMAKE_TEXT_XXD(libDaScript src/builtin/fio.das)
-CMAKE_TEXT_XXD(libDaScript src/builtin/rtti.das)
-CMAKE_TEXT_XXD(libDaScript src/builtin/ast.das)
-CMAKE_TEXT_XXD(libDaScript src/builtin/network.das)
-CMAKE_TEXT_XXD(libDaScript src/builtin/debugger.das)
 
 SET(MISC_SRC
 include/daScript/misc/enums.h
@@ -1307,6 +1292,7 @@ install(FILES
 
 install(FILES ${PROJECT_SOURCE_DIR}/install/README.md DESTINATION ${DAS_INSTALL_DOCDIR})
 install(FILES ${PROJECT_SOURCE_DIR}/install/CLAUDE.md DESTINATION ${DAS_INSTALL_DOCDIR})
+install(FILES ${PROJECT_SOURCE_DIR}/install/.gitignore DESTINATION ${DAS_INSTALL_DOCDIR})
 install(DIRECTORY ${PROJECT_SOURCE_DIR}/install/skills DESTINATION ${DAS_INSTALL_DOCDIR})
 install(FILES ${PROJECT_SOURCE_DIR}/LICENSE DESTINATION ${DAS_INSTALL_DOCDIR})
 install(FILES ${PROJECT_SOURCE_DIR}/3rdparty/uriparser/COPYING DESTINATION ${DAS_INSTALL_DOCDIR} RENAME URIPARSER.LICENSE)
@@ -1346,12 +1332,14 @@ file(GLOB DAS_BENCHCTL_FILES ${PROJECT_SOURCE_DIR}/utils/benchctl/*.das)
 install(FILES ${DAS_BENCHCTL_FILES} DESTINATION utils/benchctl)
 install(FILES ${PROJECT_SOURCE_DIR}/utils/benchctl/README.md DESTINATION utils/benchctl)
 
+# Install perf_lint (performance linter)
+install(FILES ${PROJECT_SOURCE_DIR}/utils/perf_lint/main.das DESTINATION utils/perf_lint)
+
 # Install daspkg (package manager)
 file(GLOB DAS_DASPKG_FILES ${PROJECT_SOURCE_DIR}/utils/daspkg/*.das)
 install(FILES ${DAS_DASPKG_FILES} DESTINATION utils/daspkg)
 install(FILES
     ${PROJECT_SOURCE_DIR}/utils/daspkg/README.md
-    ${PROJECT_SOURCE_DIR}/utils/daspkg/DESIGN.md
     DESTINATION utils/daspkg
 )
 install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/daspkg/fixtures/

@@ -10,7 +10,7 @@ require daslib/json
 require daslib/json_boost public
 require daslib/jobque_boost
 require strings
-require fio
+require daslib/fio
 
 require tools/compile_check public
 require tools/list_functions public
@@ -33,6 +33,8 @@ require tools/describe_type public
 require tools/grep_usage public
 require tools/outline public
 require tools/aot public
+require tools/perf_lint_tool public
+require tools/lint_tool public
 require tools/live public
 
 let HEAP_COLLECT_THRESHOLD = 1024ul * 1024ul  // 1 MB
@@ -234,7 +236,8 @@ def handle_tools_list(id_json : string) : string {
             "file" => PropertySchema(_type = "string", description = "Path to the .das test file"),
             "timeout" => PropertySchema(_type = "string", description = "Timeout in seconds (default: 120). Process tree is killed if exceeded"),
             "project" => PROJECT_PROP,
-            "json" => PropertySchema(_type = "string", description = "If 'true', return structured JSON (TestSummary with file, tests, total, passed, failed, errors, skipped, success, time)")
+            "json" => PropertySchema(_type = "string", description = "If 'true', return structured JSON (TestSummary with file, tests, total, passed, failed, errors, skipped, success, time)"),
+            "failures_only" => PropertySchema(_type = "string", description = "If 'true', only show failed tests in output")
         },
         ["file"]
     ))
@@ -411,6 +414,24 @@ def handle_tools_list(id_json : string) : string {
         ["file"]
     ))
     result.tools |> emplace(make_tool(
+        "perf_lint",
+        "Run performance lint on daScript file(s). Detects string += in loops, character_at misuse, push without reserve, and other perf anti-patterns (PERF001-006). Supports single file, comma-separated list, or glob pattern.",
+        {
+            "file" => PropertySchema(_type = "string", description = "Path to .das file, comma-separated paths, or glob pattern"),
+            "project" => PROJECT_PROP
+        },
+        ["file"]
+    ))
+    result.tools |> emplace(make_tool(
+        "lint",
+        "Run paranoid lint checks on daScript file(s). Detects unused variables, variables that can be const, unreachable code, and naming issues. Supports single file, comma-separated list, or glob pattern.",
+        {
+            "file" => PropertySchema(_type = "string", description = "Path to .das file, comma-separated paths, or glob pattern"),
+            "project" => PROJECT_PROP
+        },
+        ["file"]
+    ))
+    result.tools |> emplace(make_tool(
         "live_status",
         "Get status of a running daslang-live instance (fps, uptime, paused, dt, has_error). Returns 503 JSON with compilation error if the script failed to compile.",
         { "port" => PropertySchema(_type = "string", description = "Live API port (default: 9090)") },
@@ -506,7 +527,7 @@ def dispatch_tool(tool_name, arg1, arg2, arg3, arg4, arg5, project : string) : s
     } elif (tool_name == "list_types") {
         return do_list_types(arg1, project)
     } elif (tool_name == "run_test") {
-        return do_run_test(arg1, project, arg2, arg3 == "true")
+        return do_run_test(arg1, project, arg2, arg3 == "true", arg4 == "true")
     } elif (tool_name == "format_file") {
         return do_format_file(arg1)
     } elif (tool_name == "run_script") {
@@ -541,6 +562,10 @@ def dispatch_tool(tool_name, arg1, arg2, arg3, arg4, arg5, project : string) : s
         return do_outline(arg1, arg2)
     } elif (tool_name == "aot") {
         return do_aot(arg1, arg2, project)
+    } elif (tool_name == "perf_lint") {
+        return do_perf_lint(arg1, project)
+    } elif (tool_name == "lint") {
+        return do_lint(arg1, project)
     } elif (tool_name == "live_status") {
         return do_live_status(arg1)
     } elif (tool_name == "live_error") {
@@ -621,6 +646,7 @@ def handle_tools_call(id_json : string; params : JsonValue?) : string {
         }
         arg2 = get_string_arg(args, "timeout")
         arg3 = get_string_arg(args, "json")
+        arg4 = get_string_arg(args, "failures_only")
     } elif (name == "convert_to_gen2") {
         arg1 = get_string_arg(args, "file")
         if (empty(arg1)) {
@@ -709,6 +735,11 @@ def handle_tools_call(id_json : string; params : JsonValue?) : string {
             return json_rpc_error(id_json, -32602, "missing 'file' argument")
         }
         arg2 = get_string_arg(args, "function")
+    } elif (name == "perf_lint" || name == "lint") {
+        arg1 = get_string_arg(args, "file")
+        if (empty(arg1)) {
+            return json_rpc_error(id_json, -32602, "missing 'file' argument")
+        }
     } elif (name == "live_status") {
         arg1 = get_string_arg(args, "port")
     } elif (name == "live_error") {

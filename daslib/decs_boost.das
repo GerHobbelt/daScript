@@ -199,7 +199,7 @@ def build_req_from_args(qblk : ExprBlock?) : EcsRequest {
 [macro_function]
 def getter_name(a; const_parent : bool; can_be_optional : bool) {
     var getter = "get_ro"
-    static_if (typeinfo stripped_typename(a) == "ast::FieldDeclaration") {// part of the desc_template
+    static_if (typeinfo stripped_typename(a) == "ast_core::FieldDeclaration") {// part of the desc_template
         if (a.init != null && can_be_optional) {
             getter = "get_default_ro"
         } elif (!const_parent) {
@@ -304,7 +304,7 @@ def private append_index_lookup(arch_name : string; var qblock : smart_ptr<ExprB
         name := "{prefix}{a.name}{suffix}",
         _type <- vtype,
         init <- iget,
-        flags = VariableFlags.can_shadow
+        flags = VariableFlags.can_shadow | VariableFlags.generated
         )
     qblock.list |> emplace(vlet)
     return true

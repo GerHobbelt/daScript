@@ -11,7 +11,7 @@ require llvm/daslib/llvm_jit_common
 require daslib/ast_boost
 require daslib/strings_boost
 
-require fio
+require daslib/fio
 require jit
 
 module llvm_macro shared private
@@ -185,7 +185,7 @@ class JIT_LLVM : AstSimulateMacro {
                     }
                 }
                 if (gen_exe) {
-                    let fn = inject_main(ctx, g_ctx, funcs, prog, exe_main, g_mod, g_prim_t, uids, exe_strict)
+                    let fn = inject_main(ctx, g_ctx, prog, exe_main, g_mod, g_prim_t, uids, exe_strict)
                     if (fn == null) {
                         finalize_jit(use_dll, gen_exe, g_dynamic_lib_handle)
                         // JIT failed. Couldn't create executable.

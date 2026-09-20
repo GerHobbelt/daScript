@@ -19,7 +19,7 @@ options gen2
 //       result |> push(i)          // no reallocs
 //   }
 
-expect 40217:7
+expect 40217:9
 
 require daslib/perf_lint
 
@@ -33,11 +33,12 @@ def bad_push_for_loop() {
     delete result
 }
 
-def bad_emplace_while() {
+// While loops: no warning — loop bound is runtime-dependent, can't reserve meaningfully
+def good_emplace_while() {
     var result : array<int>
     var i = 0
     while (i < 100) {
-        result |> emplace(i)                    // PERF006
+        result |> emplace(i)                    // no warning — while loop
         i++
     }
     delete result
@@ -103,6 +104,36 @@ def bad_push_before_if() {
     delete result
 }
 
+// Bad: for over dynamic array source — known length
+def bad_push_array_source() {
+    var source <- [1, 2, 3]
+    var result : array<int>
+    for (x in source) {
+        result |> push(x * 2)                   // PERF006 — array = known length
+    }
+    delete source
+    delete result
+}
+
+// Bad: for over fixed array source — known length
+def bad_push_fixed_array_source() {
+    let source = fixed_array(1, 2, 3)
+    var result : array<int>
+    for (x in source) {
+        result |> push(x)                       // PERF006 — fixed array = known length
+    }
+    delete result
+}
+
+// Bad: for over string source — known length
+def bad_push_string_source(s : string) {
+    var codes : array<int>
+    for (ch in s) {
+        codes |> push(ch)                       // PERF006 — string = known length
+    }
+    delete codes
+}
+
 // --- Good patterns (no warnings) ---
 
 def good_with_reserve() {
@@ -160,6 +191,40 @@ def good_conditional_else() {
         } else {
             result |> push(i)                   // no warning — else branch
         }
+    }
+    delete result
+}
+
+def good_mixed_source(var it : iterator<int>; source : array<int>) {
+    var result : array<int>
+    for (x, y in it, source) {
+        result |> push(x + y)                   // no warning — mixed source, iterator = unknown
+    }
+    delete result
+}
+
+def good_iterator_source(var it : iterator<int>) {
+    var result : array<int>
+    for (x in it) {
+        result |> push(x)                       // no warning — iterator length unknown
+    }
+    delete result
+}
+
+def make_gen() : iterator<int> {
+    return <- generator<int>() <| $ {
+        for (i in range(5)) {
+            yield i
+        }
+        return false
+    }
+}
+
+def good_generator_source() {
+    var result : array<int>
+    var inscope gen <- make_gen()
+    for (x in gen) {
+        result |> push(x)                       // no warning — generator length unknown
     }
     delete result
 }

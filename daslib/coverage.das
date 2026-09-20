@@ -18,9 +18,9 @@ module coverage shared !inscope
 //! After execution, call `fill_coverage_report` to produce output in LCOV format,
 //! which can be converted to HTML via ``genhtml``.
 
-require ast
-require fio
-require rtti
+require daslib/ast
+require daslib/fio
+require daslib/rtti
 require strings
 
 require daslib/ast_boost
@@ -516,10 +516,14 @@ class CoveragePass : AstPassMacro {
                 }
 
                 // register branches
+                let nbranches = reg_data.allBranches |> length()
                 var blines : array<uint>
                 var block_nums : array<uint>
                 var branch_nums : array<uint>
-                for (i in range(reg_data.allBranches |> length())) {
+                blines |> reserve(nbranches)
+                block_nums |> reserve(nbranches)
+                branch_nums |> reserve(nbranches)
+                for (i in range(nbranches)) {
                     blines |> push(reg_data.allBranches[i]._0)
                     block_nums |> push(reg_data.allBranches[i]._1)
                     branch_nums |> push(reg_data.allBranches[i]._2)
@@ -551,7 +555,7 @@ def get_coverage_summary(cov_data : table<string; CoverageData>;
         }
     }
     if (per_function) {
-        for (file, data in keys(cov_data), values(cov_data)) {
+        for (_file, data in keys(cov_data), values(cov_data)) {
             for (fname in keys(data.func_cov)) {
                 if (fname |> length > max_len) {
                     max_len = fname |> length
@@ -680,7 +684,7 @@ def parse_lcov(lcov_path : string; exclude_prefixes : array<string>) : table<str
                 } elif (line |> starts_with("BRDA:")) {
                     // BRDA:line,block,branch,taken
                     let rest = slice(line, 5)
-                    var last_comma = rfind(rest, ",")
+                    let last_comma = rfind(rest, ",")
                     if (last_comma >= 0) {
                         let taken = slice(rest, last_comma + 1)
                         let hits = taken == "-" ? 0u : uint(to_int(taken))
