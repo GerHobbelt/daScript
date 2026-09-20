@@ -123,8 +123,7 @@ def document_module_math(root : string) {
     var mod = get_module("math")
     var groups <- array<DocGroup>(
         group_by_regex("all numerics (uint*, int*, float*, double)", mod, %regex~(min|max)$%%),
-        group_by_regex("float* and double", mod, %regex~(sign|abs|acos|asin|safe_acos|safe_asin|atan|atan2|cos|sin|tan|exp|log|exp2|
-log2|pow|sqrt|rcp|ceil|floor|abs|saturate|sincos|is_finite|is_nan)$%%),
+        group_by_regex("float* and double", mod, %regex~(sign|abs|acos|asin|safe_acos|safe_asin|atan|atan2|cos|sin|tan|sinh|cosh|tanh|asinh|acosh|atanh|exp|log|exp2|expm1|log2|log10|log1p|pow|sqrt|cbrt|hypot|fmod|remainder|trunc|rcp|ceil|floor|abs|saturate|sincos|is_finite|is_nan)$%%),
         group_by_regex("float* only", mod, %regex~(atan_est|atan2_est|rcp_est|ceili|floori|roundi|trunci|round|rsqrt|rsqrt_est|fract|\-)$%%),
         group_by_regex("float3 only", mod, %regex~(cross|reflect|refract|distance|distance_sq|
 inv_distance|inv_distance_sq)$%%),
@@ -935,7 +934,7 @@ def document_module_linq(root : string) {
         group_by_regex("Aggregation operations", mod, %regex~(count.*|long_count.*|sum.*|min.*|max.*|average.*|aggregate.*)$%%),
         group_by_regex("Filtering data", mod, %regex~(where_.*)$%%),
         group_by_regex("Partitioning data", mod, %regex~(skip.*|take.*|chunk.*)$%%),
-        group_by_regex("Joining", mod, %regex~(join.*|left_join.*|group_join.*)$%%),
+        group_by_regex("Joining", mod, %regex~(join.*|left_join.*|right_join.*|full_outer_join.*|cross_join.*|group_join.*)$%%),
         group_by_regex("Grouping", mod, %regex~(group_by.*|having.*)$%%),
         group_by_regex("Querying data", mod, %regex~(all.*|any.*|contains.*|none.*)$%%),
         group_by_regex("Element operations", mod, %regex~(first.*|last.*|single.*|element_at.*)$%%),

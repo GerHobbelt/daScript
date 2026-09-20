@@ -139,10 +139,19 @@ Use `timeout: 0` (no timeout) for the cmake build — it can take 2-25 minutes.
 - Public functions in `daslib/*.das` (added, removed, renamed, or signature changed)
 - `//!` doc-comments in `daslib/*.das` files
 - C++ bindings in `modules/*/src/*.cpp` or `src/builtin/*.cpp` that add new public functions, types, or struct fields
-- RST files in `doc/source/`
+- RST files in `doc/source/` (handwritten tutorials, reference pages, TOCs)
 - `doc/reflections/das2rst.das` or `doc/reflections/rst.das`
 
-**Steps (run ALL in order):**
+**Which substeps to run** — match what changed, not "all in order":
+
+| Changed | Run |
+|---|---|
+| Only handwritten RST under `doc/source/` (tutorials, TOCs, reference prose) | **4f, 4g** (skip 4a–4e — das2rst is for `daslib` regen, not handwritten pages) |
+| Only `//!` comments / new daslib public functions / C++ bindings | **4a, 4b, 4c, 4d, 4e, 4f, 4g** |
+| Both daslib and handwritten RST | **all of 4a–4g** |
+| `das2rst.das` / `rst.das` itself | **all of 4a–4g** |
+
+CI runs `sphinx-build -W` (warnings-as-errors) for both HTML and LaTeX. **Any** warning fails CI. Step 4f catches every warning class — title underline/overline length, duplicate labels, broken `:ref:`, malformed tables, missing TOC entries, etc. Skipping 4f because "I only added a tutorial page" misses exactly the warnings handwritten RST tends to produce.
 
 ### 4a. Add new functions to groups in `das2rst.das`
 
@@ -197,6 +206,8 @@ grep -iE "warning:|error:" /tmp/sphinx_out.txt
 Must say `build succeeded.` with **zero** warnings and errors. The `grep` must return empty.
 
 Common Sphinx issues:
+- **Title overline/underline too short**: Both `===` lines around a title MUST be at least as long as the title text (Sphinx counts source chars, including backticks and inline-code spans). Easy to miscount when titles include `` ``foo`` ``, em-dashes, or non-ASCII.
+- **Document not in any toctree**: Added a new RST page but forgot to wire it into `tutorials.rst` (or wherever the relevant `.. toctree::` lives). Find the matching TOC and add the page.
 - **Duplicate label**: Two RST files define the same `.. _label:` — rename one
 - **Unknown target**: `:ref:` points to nonexistent label — check spelling
 - **Malformed table**: Grid/simple table column widths don't align
@@ -228,6 +239,12 @@ CI's `extended_checks` job runs `./bin/Release/daslang ./das-fmt/dasfmt.das -- -
 
 **Before pushing:** mentally format named-arg constructor / call sites with spaces around `=`. If CI `extended_checks` fails on a format diff after MCP said "already formatted", fix the spacing and re-push (or amend, on a squashed branch).
 
+## 5.5. `.md` stop-rule — STOP before push if any `.md` changed
+
+If `git diff --name-only origin/master..HEAD` includes ANY `.md` file (CLAUDE.md, `skills/`, `**/README.md`, design docs like `API_REWORK.md`), **STOP before `git push`**. List each modified `.md` with a one-line summary of what changed, and ask the user to review. Do not push until they greenlight.
+
+**Why:** doc edits direct future Claude behavior. Code edits get caught by tests; doc edits don't. Silent .md diffs in a PR are not OK — every .md change in a PR must be acknowledged by the user before it goes live.
+
 ## 6. Create the PR
 
 Stage, commit, push, and create the PR using GitHub MCP tools or `gh` CLI. Follow the commit message conventions from the repository (see recent `git log` for style).
@@ -247,5 +264,6 @@ Stage, commit, push, and create the PR using GitHub MCP tools or `gh` CLI. Follo
 | AOT tests | `test_aot.exe -use-aot dastest/dastest.das -- --use-aot --test tests` | Same as regular tests |
 | Docs | `das2rst.das` + stubs + Sphinx | Only if daslib/C++ bindings/RST changed |
 | Format | MCP `format_file` with comma-separated list or glob of changed `.das` files (single call) | Only changed files |
+| `.md` stop | `git diff --name-only origin/master..HEAD \| grep '\.md$'` | If any match: STOP, list changes, ask user to review BEFORE push |
 | PR | GitHub MCP `create_pull_request` or `gh pr create` | — |
 | Review iter | Follow `skills/pr_review_iteration.md` | One round per Copilot pass; convergence in 1-3 rounds is normal |

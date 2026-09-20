@@ -828,6 +828,87 @@ foundation.
   `failed_register_function.das` (5 errors — struct arg, struct
   return, pointer arg, lambda instead of `@@fn`, > 4 args).
 
+### Tut 39 follow-up — `[sql_function]` auto-registration + chain visibility
+
+`register_function` is per-connection: open a second DB and you have to
+remember to repeat the call. The `[sql_function]` annotation removes
+that ceremony AND makes the function visible inside `_sql(...)` chain
+analysis (so it can be used as a SQL predicate / projection just like
+a built-in scalar, instead of falling through to a per-row daslang
+bind).
+
+- **`[sql_function]` function annotation** in `sqlite_boost.das`. Same
+  validation rails as `register_function` (≤4 args, scalar types only,
+  `sql_fn_tag_for_type`); the auto-registration path uses the soft
+  variant `_try_register_function_check_rc` which returns `SqlError`
+  rather than panicking, so `try_open_sqlite` can surface a failed
+  registration as `err(...)` instead of an unwound stack. Optional args:
+  `name`, `deterministic`, `directonly`.
+- **Compile-time-built lambda registry.** The macro emits a thunk
+  (`@(db : SqlRunner) : SqlError { return _try_register_function_check_rc(
+  db, "name", @@fn, ...) }`) and pipes it into the private
+  `sql_function_registry` array (of `SqlFunctionThunk` entries carrying
+  SQL `name` + `nArgs` alongside the install closure) via the public
+  `_add_sql_function_thunk(name, nArgs, thunk)` adder, all inside an
+  `[init]` block built by `setup_call_list("register`sqlite`functions",
+  at, true, true)` — same mechanism `[live_command]` and `[decs]` use.
+  The registry itself stays module-private; user-module init blocks reach
+  it only through the adder. The install loop deduplicates `(name, arity)`
+  across modules — silent SQLite override is a footgun, surface as err.
+- **Auto-installation hook in `try_open_sqlite`.** After
+  `sqlite3_open` returns OK, `_install_sql_function_registry(db)`
+  walks the registry and registers every thunk against the new
+  connection. Single hook covers `try_open_sqlite`, `open_sqlite`,
+  and `with_sqlite`. ATTACH DATABASE shares the same `sqlite3*`
+  handle so functions stay visible — no second hook needed.
+- **Chain visibility in `fn_call_to_sql` + `analyze_projection`.** New
+  branch at the end of the predicate dispatch table checks
+  `find_annotation(call.func, "sql_function")`; if tagged, emits
+  `<name>(args...)` SQL. The SQL name is taken from the annotation's
+  `name` arg (defaults to the function's daslang name). The same
+  recognizer (`try_recognize_sql_function_proj`) also fires from the
+  single-column and named-tuple branches of `analyze_projection`, so
+  `_select(my_upper(_.Name))` and `_select((Loud = my_upper(_.Name),
+  Id = _.Id))` both push computed-fragment slots through the shared
+  `push_computed_proj_slot` helper (also used by the JSON-path and
+  LEFT JOIN `is_some/is_none` projection paths).
+- **Function-pointer disambiguation via explicit `funcType`.** The
+  emitted thunk uses `new ExprAddr(target, funcType)` rather than the
+  qmacro `@@$c(name)` shape so the typer resolves to the user's
+  `func` even when an imported module exports a same-named function
+  with a different signature (e.g. user `normalize(string)` colliding
+  with `math::normalize(float2)`).
+- **Coexists with manual `register_function`.** Both go through
+  `_register_function_check_rc`. Registry installs first at open;
+  later manual calls override. Use `register_function` for
+  per-connection / one-off; `[sql_function]` for ambient SQL helpers
+  visible to chain analysis.
+- **Failure modes:** generic functions rejected (no concrete name to
+  emit); unsupported arg/return types rejected per-position; >4 args
+  rejected — all surface as 30111 macro-apply failures with the
+  per-position diagnostic from the underlying tag derivation.
+- Tutorial: [tutorials/sql/32-sql_functions.das](../../tutorials/sql/32-sql_functions.das)
+  (extended with `[sql_function]` examples after the manual
+  `register_function` section).
+  Tests: `test_78_sql_function_annotation.das` (14 positive — auto-reg
+  raw SQL, chain visibility 1-arg + 2-arg, `name=` override raw +
+  chain, `deterministic=true` accepted, multiple opened DBs see same
+  function, `directonly=true` works in raw SQL + non-view chain,
+  collision with `math::normalize` resolves via `ExprAddr.funcType`,
+  single-column projection `_select(my_upper(_.Name))` + emit-shape
+  pin, named-tuple projection mixing computed and column-ref slots,
+  named-tuple with two-arg `[sql_function]`),
+  `test_79_sql_function_dup.das` (1 — install-time detection of
+  duplicate `(name, arity)` registrations, isolated file because the
+  dup poisons the registry for the whole context),
+  `failed_sql_function_annotation.das` (9 errors — struct arg,
+  pointer arg, > 4 args, struct return, empty `name=`,
+  invalid-identifier `name=`, non-string `name=`, non-bool
+  `deterministic=`, non-bool `directonly=`),
+  `failed_sql_function_in_view.das` (3 cases — `[sql_function(directonly=true)]`
+  rejected inside `_create_view` body via `pred_fail`: outer WHERE,
+  nested `_in(...)` subquery WHERE, and `_select` projection slot).
+
 ### Cumulative state after chunk 10
 
 381 (chunk 9) + 21 (chunk 10) = ~402 dasSQLITE tests passing.
@@ -860,8 +941,10 @@ foundation.
   audit semantics.
 - **Aggregate / window UDFs** — `xStep` / `xFinal` / `xValue` /
   `xInverse`. v1's `register_function` is scalar-only.
-- **`[sql_function]` annotation macro** — auto-registration on
-  connect, custom-type adapter composition.
+- **`[sql_function]` custom-type adapter composition** — base
+  `[sql_function]` shipped (auto-registration on connect + chain
+  visibility, see Tut 39 follow-up above); custom-type adapter
+  composition for non-scalar return / arg types still deferred.
 - **Updatable views via INSTEAD OF triggers.**
 - **ATTACH DATABASE** (tut 36 — independent SQLite extension).
 - **`_try_each_sql`** — Result-yielding iterator variant.
@@ -1130,6 +1213,166 @@ the inner parameter sidesteps it; the macro recognizes the body as
   `sql_11_take_skip.rst`, `sql_12_distinct.rst`,
   `sql_13_aggregates.rst`, `sql_14_group_by.rst`,
   `sql_18_null_handling.rst`. Sphinx `-W` clean.
+
+## Shipped — multi-Q lowering: F1 resolution (branch `better-docs-and-fixes`)
+
+Pivots `_sql(...)` from a "canonical-order pushdown optimizer" to an
+unconditional "same chain → same answer in all three modes" guarantee
+for the v1 chain shapes.
+
+### Problem
+
+The parity audit (`API_CHECKED.md` F1) surfaced that `_sql` collapsed
+any combination of `take` and `skip` into one `LIMIT/OFFSET` pair
+regardless of chain order. Latent siblings: `take(n) |> _where(p)`
+silently emitted `WHERE p LIMIT n` (filter-then-take) instead of
+linq's "take-then-filter" semantics. Same chain, different answers.
+
+### Solution — multi-Q tree
+
+`SqlQuery` gains four fields:
+
+```das
+innerSql       : string                 // null/empty = base-table FROM; else nested SELECT
+innerBindExprs : array<ExpressionPtr>   // FROM-subquery placeholders, parsed first
+minPhaseSeen   : int = 0x7fffffff       // sentinel; lowest phase added to this Q
+fromRowType    : TypeDeclPtr            // reserved for v2 alias-aware resolution
+```
+
+Each chain op gets a phase number matching SQL eval order
+(0=FROM, 1=JOIN, 2=WHERE, 3=GROUP_BY/DISTINCT/SET_OP, 4=HAVING,
+5=SELECT, 6=ORDER_BY, 7=SKIP, 8=TAKE, 9=TERMINAL). Higher phase =
+later in eval = outer in SQL nesting.
+
+`analyze_chain` walks outermost-first as before. Five peel blocks
+(TAKE / SKIP / ORDER_BY / ORDER_BY_DESC / DISTINCT — the ops where
+chain-order divergence is real with default-row inner) check
+`P > q.minPhaseSeen` and divert via `divert_to_inner` when true.
+WHERE stays commutative (no divert).
+
+`divert_to_inner` allocates a fresh `subQ`, recursively analyzes the
+peeled op + remainder of the chain into it, then snapshots the inner
+SELECT to SQL string + flat bind list on the outer Q. Inner subQ is
+constrained to default-row projection (v1 scope); v2 will lift this
+to support inner with `_select`.
+
+### Emission
+
+`build_sql_select` adds one branch: when `q.innerSql` is non-empty,
+FROM renders as `(<innerSql>) AS "t0"` instead of the base-table.
+Outer Q's WHERE / ORDER / GROUP / HAVING / SELECT clauses reference
+the inner's columns by their original names (default-row projection
+exposes the source struct's field names through the subquery).
+
+`collect_query_binds` centralizes bind ordering across the multi-Q
+tree: `innerBindExprs → joins-ON → bindExprs (WHERE) → havingBindExprs →
+setOpRhsBinds → LIMIT → OFFSET`. Replaces the inline splice in
+`emit_sql_macro_body` / `emit_each_sql_macro_body` / `_create_view`.
+Set-op fold simplified: `setOpRhsBinds` stores RHS's flattened binds
+instead of inline-folding everything into `q.bindExprs`.
+
+### v1 capabilities (parity tests added)
+
+- `take(n) |> skip(m)` — F1 RESOLVED. `max(0, n-m)` rows in all 3 modes.
+- `take(n) |> _where(p)` — outer-where over inner-take subquery.
+- `take(n) |> _order_by(k)` — re-sort the n taken rows.
+- `take(n) |> _order_by(k) |> take(m)` — three-level nesting.
+- `skip(n) |> _where(p)` — outer-where over inner-skip subquery.
+
+Existing canonical-order chains stay flat: `_where |> _order_by |>
+take`, single-join + post-join `_where`, set-ops, all subqueries
+(`_in`/`_any`/`_none`) — no inner subquery pushed, byte-identical SQL.
+
+### v2 — shipped
+
+Both v2 capabilities now ship.
+
+- **Aggregate-then-filter** (`_select(... |> sum) |> _where(_.alias)`):
+  the `_select` peel diverts when the outer chain pinned a WHERE
+  (`q.minPhaseSeen <= PHASE_WHERE`). DISTINCT / TAKE / SKIP / ORDER_BY
+  / set-op don't trigger the divert — they apply to projected output
+  in both SQL and linq positional (same semantics, no wrap needed).
+  `divert_to_inner` accepts NamedTuple / GroupedNamedTuple inner now
+  (SingleColumn / Aggregate still rejected — the outer would have no
+  named row to filter on). Inner SQL forces `AS "<alias>"` on every
+  projected column via `build_sql_string(q, force_aliases=true)` so
+  outer references resolve. Standalone Mode-1 SQL keeps the minimal
+  form (no AS) — snapshot tests are stable. `pred_to_sql` consults
+  `q.fromRowType` (synthesized by `inner_projection_type` from the
+  inner's `selectColTypes`/`groupedSelectTypes` + `projRecordNames`)
+  when `q.rootType` is null. Outer Q's `selectCols` get populated
+  with passthrough `"<alias>"` SQL fragments.
+
+- **Multi-join** (`_join(_join(A, B, …), C, …)`):
+  `process_join_call` now recurses srca into q first, detects
+  multi-join via `q.seenJoin` after recursion, and snapshots q (which
+  carries the inner _join's joins[]/whereSql/projection state) into a
+  subquery via `snapshot_q_to_subquery_wrap`. The reset clears all
+  query state (joins, projection, where, etc.) but preserves
+  context (`dbExpr`, `inView`, `hadError`). `build_sql_select`'s FROM
+  clause gains a branch: when `q.seenJoin && q.innerSql != ""`, emits
+  `FROM (<innerSql>) AS "t0" INNER JOIN ... ON ...` instead of
+  `FROM "Tab" AS "t0"`. The outer `into` projection's
+  `<lhsArg>.<alias>` resolves through `source_rootType_for_idx`'s new
+  fromRowType fallback + `lookup_struct_field_type`'s new tuple
+  branch.
+
+`maybe_divert(q, my_phase, node, prog, at, max_outer_phase)` factors
+the 5 peel-divert sites + the SELECT one (which uses a tighter
+`max_outer_phase = PHASE_WHERE`) into one helper.
+
+### v2.1 shipped
+
+- **Outer WHERE on a JOIN's projected alias** —
+  `_join(...) |> _where(_.outerAlias)` and
+  `_join(_join(A, B, …), C, …) |> _where(_.outerAlias)`. The WHERE peel
+  now snapshots the analyzed q in place (`snapshot_q_to_subquery_wrap`
+  with new `fillPassthrough = true` mode) when
+  `q.seenJoin && q.proj == NamedTuple`. Discriminator skips the
+  `_select |> _where` path (`q.seenJoin` is false there — the SELECT
+  peel already wrapped via `divert_to_inner`). Using the in-place
+  snapshot helper instead of `divert_to_inner` avoids the linq Mode-2/3
+  typer cascade that re-analysis triggers (the deferred-note's
+  hypothesised "first vs passthrough wrap" distinction was a red
+  herring — re-analysis itself was the cascade trigger). The new
+  `fillPassthrough` mode mirrors `divert_to_inner`'s NamedTuple branch:
+  emit passthrough column fragments from the synthesized `fromRowType`
+  so the outer SELECT renders as
+  `SELECT "alias", … FROM (joinSql) AS "t0" WHERE "alias" = ?`.
+  Coverage:
+  - `parity_check_15_join.das parity_join_with_outer_where` — single
+    `_join` + outer WHERE on `_.Spend` (numeric predicate, 4-arg
+    projection tuple `(Buyer, Spend, OrderId, Win)`).
+  - `parity_check_15b_multi_join.das parity_three_table_join_with_outer_where`
+    — 3-table join + outer `_where(_.Sku == "BOOK")`.
+  - `parity_check_15b_multi_join.das parity_three_table_join_with_outer_where_int`
+    — 3-table join + outer `_where(_.Qty >= 2 && _.UserName == "Alice")`
+    (multi-arg AND on numeric + string aliases).
+
+### v2.1 deferred (next follow-up)
+
+- **Daslang typedef in lambda parameter type position works in
+  isolation but fails in the multi-join chain context** — possibly
+  related to nested macro expansion order. Worked around in
+  `parity_check_15b_multi_join.das` by spelling the inner-tuple type
+  inline. Track separately if the typer fix becomes possible.
+
+### Coverage
+
+- 24 existing `parity_check_*.das` files — every previously-passing
+  case still passes, byte-identical SQL for canonical-order chains.
+- New `parity_check_11_take_skip.das` (8 cases — divergence pin removed,
+  3 new equivalence cases added).
+- New `parity_check_11b_take_then_where.das` (5 cases).
+- New `parity_check_11c_take_then_order.das` (3 cases).
+- New `parity_check_11d_skip_then_where.das` (2 cases).
+
+### Tutorial 11
+
+`tutorials/sql/11-take_skip.das` + `doc/source/reference/tutorials/sql_11_take_skip.rst`
+updated: canonical pagination promoted to `skip(m) |> take(n)`
+(flat fast SQL); the reverse `take(n) |> skip(m)` is shown as the
+"honest, slower subquery" form with the row-count change explained.
 
 ## Appendix C — `_sql` translation boundary (cross-reference for tutorial 7)
 
@@ -3684,9 +3927,13 @@ let big = db |> _sql(
 - **Bind expression has no `to_sql_literal` overload.** The
   macro emits `_::to_sql_literal(<bind>)`; if the bind's type
   isn't covered by the default set (numeric / bool / string)
-  and the user has no overload in scope, daslang's typer
-  reports `no matching overload for to_sql_literal`. Fix:
-  add a one-line overload in the user's module.
+  and the user has no overload in scope, the
+  `to_sql_literal(auto(TT))` catch-all in `sqlite_linq.das`
+  emits enums via `int(v)` and otherwise `concept_assert`s
+  (40103) with: *to_sql_literal: unsupported type for
+  `_create_view` body inlining. Define `def to_sql_literal(v
+  : YourType) : string` in YourType's module.* Fix: add the
+  one-line overload in the user's module.
 
 **Deferred / out of scope:**
 
