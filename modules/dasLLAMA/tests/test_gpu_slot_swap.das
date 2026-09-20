@@ -1,10 +1,11 @@
 options gen2
 options persistent_heap   // explicit deletes below — the model frees before the test exits
-options stack = 524288
+options stack = 524288   // every dasLLAMA program root takes this budget (options stack does not unify up from libs)
 
 require dastest/testing_boost public
 require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration
 require dasllama/dasllama_math
+require dasllama/dasllama_gpu_resident   // the residency rail this suite swaps: arm / hydrate / drop
 require daslib/jobque_boost
 require daslib/fio   // nolint:STYLE030 — only used inside the builtin_module_exists(vulkan) static_if; dead on a no-vulkan lint binary
 require _model_tier

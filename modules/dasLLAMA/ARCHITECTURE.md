@@ -37,10 +37,11 @@ Every non-generated file under `dasllama/` appears here. `dasllama_env.das` and
   generate, re-exported names, the doc surface. No engine logic; a function that does work belongs
   in the module that owns the concern, and the facade re-exports it.
 - **`dasllama_common.das`** — the engine: `Model`/`Session`/`Config`, the forward loops, the
-  override registries, the load walk. It is also the module's debt sink (13k lines): the Vulkan
-  bake state machine and the Metal knobs sitting here are debt, **not precedent**. Nothing
-  platform-specific may be added; new shared concerns get their own file rather than another
-  thousand lines here.
+  override registries, the runtime knobs. **Not** the load walk (§1.3) and **not** GPU residency
+  (§1.5) — both left, and the seam each left behind is a registered hook, so neither comes back.
+  It remains the module's debt sink; what sits here that is family-specific or platform-specific is
+  debt, **not precedent**. Nothing platform-specific may be added; new shared concerns get their own
+  file rather than another thousand lines here.
 - **`dasllama_transformer.das`** — the block-composition seam only.
 - **`dasllama_config.das`** — `DlimConfiguration`: every input that changes `.dlim` image BYTES,
   in one struct, plus its identity formatter. A knob that does not change image bytes does not
@@ -91,6 +92,12 @@ often gotten wrong, so each says explicitly where the neighbouring half goes.
   because the two algorithms share no state; a third tokenizer family gets a third file.
 
 ### 1.3 The load and image rail
+
+**`dasllama_load.das`** is the GGUF load walk: metadata to `Config`, the plane layout, disk-format
+detection, the eager and streamed conversion ladders, and the load entry points. It owns nothing the
+forward path touches at run time — a loaded `Model` is the whole handoff — and it requires
+`dasllama_common` back for `Model`/`Session`, so the transformer umbrella requires it `public` and
+breaks the cycle. That re-export is what keeps every consumer on the facade.
 
 - **`dasllama_image.das`** — the prepared-model `.dlim` rail, and it is ONE rail (§2.1). Nothing
   outside this file may read weights into a live carrier, and nothing outside it may release an
@@ -146,6 +153,13 @@ that a question answered for one backend has an obvious address in the other. Th
   route/mark/want/status state, engine-facing forwarders. Vulkan implements it (per-op offload plus
   resident plumbing); Metal deliberately does not, because UMA makes residency moot there and Metal
   integrates as a whole-forward driver through common's override registries.
+- **`dasllama_gpu_resident.das`** — the WHOLE-MODEL residency rail: bake the device layout offline
+  into the flavor image, upload a model's stacks to the tier, and drive decode/prefill entirely on
+  device. It is device-AGNOSTIC — it holds no device call and requires no GPU module, reaching the
+  hardware only through the `dasllama_gpu_tier` SPI and entering the engine only through common's
+  override registries. `"vulkan"` is the tier string it registers under, not a dependency, which is
+  why it compiles on every box. It requires common back for `Model`/`Session`, so like the Metal
+  drivers it is required from the transformer umbrella, never from common.
 - **`dasllama_kernel_access.das`** — the shared body-walk read/write classifier both GPU lenses run
   on. Backend-specific lowering stays in that backend's lens.
 
@@ -272,13 +286,53 @@ fold** (unpacking N fields adds N lines; take the growth and ledger the real sea
 suppress a function you have just argued is reducible** — if it is on the follow-up ledger wanting a
 dedup, it keeps its warning until the dedup lands.
 
-### 2.5 Capability questions and readiness questions are different questions
+### 2.5 There is ONE benchmark rig, and the records are the baseline
+
+`benchmarks/lcpp_bench.das` is the only thing that measures performance. It is a *mirror* of
+llama.cpp's `llama-bench` — the same test shapes, rep counts and timing boundaries, applied to
+our engine — so `pp` is one batched prefill of `-p` tokens from an empty cache per rep and `tg`
+is `-n` single-token forwards with no logit read, each row one untimed warmup plus `-r` timed
+reps. The real `llama-bench` runs only when `--ref <path>` is passed; that is how the llama.cpp
+columns were produced, and they are pinned, not re-measured.
+
+`performance/gen_bench_records.das` sweeps a board by spawning that rig once per cell, and
+writes `performance/records/<box>.json`. `gen_site_records.das` merges those into the file the
+site renders. A stored row carries its own command, sha, version, tune stamp and exec format, so
+a number is self-describing rather than a bare figure in a table.
+
+**Regression checking inverts the same rig:** `gen_bench_records.das --oracle --legs metal`
+takes the store's das rows as the work list, re-measures each once, and gates one-sided against
+its stored mean (fail past 5%, warn past 3%, gains flagged as suspicious). llama.cpp never runs,
+the store is never written, and the child runs `--frozen` so a missing image panics instead of
+minting. A second harness would produce numbers that cannot be compared to any of this, which is
+why writing one is a review defect.
+
+**The tune stamp gates the comparison.** A manifest older than the binary fails every cell, and
+an untuned invocation re-execs into a full retune rather than measuring — so re-mint the box
+manifest and check its winners against the stored rows' `tune` stamps before trusting a delta.
+
+### 2.6 Capability questions and readiness questions are different questions
 
 A predicate that mixes them cannot be reused. `prefill_decline` answers "can metal serve this
 model" (capability) *and* "is this window staged" (readiness — are the rope tables built). A caller
 that runs before the window is staged must ask the capability half only, or it gets "not yet"
 forever and its feature silently never runs. Split such predicates rather than reordering the
 caller; an optimistic capability answer is safe when the late path has a fallback, and here it does.
+
+### 2.7 Every program root declares the same stack budget
+
+`options stack` is main-module-only: it does not unify up from required modules, so no library in
+the forward chain can declare the depth it needs. Every program that drives the engine — each test,
+harness, benchmark, and tool — must therefore declare it, and dasLLAMA's frames are deep enough
+(by-value `Session`s, the forward/prefill chain, the generated kernel tier) that the default is
+never enough.
+
+The budget is **one number in every root**, currently 524288. Per-root numbers do not survive: a
+frame that grows past the smallest declared budget breaks only the program that declared least, so
+the limit is discovered by crashing — and the program that crashes is whichever one is run
+rarest. A measurement rig sized below a test suite is the worst case of this, because the suite
+stays green while the rig dies. The cost of the uniform number is reserved address space per
+context; the cost of per-root numbers is a runtime crash found by the least-covered program.
 
 ---
 

@@ -55,6 +55,13 @@ A kernel no suite reaches is unreviewable.
 **A test suite loads models with `load_model_`, never the image rail.** Image-rail coverage
 belongs to the image suites alone. See `ARCHITECTURE.md` §2.1.
 
+**No new benchmark harness is written.** Performance is measured by
+`modules/dasLLAMA/benchmarks/lcpp_bench.das` — one cell directly, or a whole board through
+`performance/gen_bench_records.das`. A new timing harness, a one-off measurement script, or a
+revived rig is a defect: a number from a second rig cannot be compared against the stored
+records, and those records are the only baseline. `PROFILE.md` carries the two commands; the
+rig's shape is `ARCHITECTURE.md` §2.5.
+
 ---
 
 ## Placement — one file, one rule
@@ -67,11 +74,23 @@ carve-outs.
 **A new file ships with its rule here, its charter in `ARCHITECTURE.md` §1, and its tests, in
 the same change.** A file without its records is a defect.
 
+**A consumer requires the facade, never an engine internal.** Tests, harnesses, benchmarks and
+tools require `dasllama/dasllama` or `dasllama/dasllama_transformer`, which re-export the engine;
+a direct require of an internal module from outside `dasllama/` is a defect. Engine internals may
+require each other. When a split moves a symbol, the facade keeps consumers working — adding
+requires across the tree means the re-export is missing, so fix that instead.
+
+**A new module file is registered in `.das_module` and `CMakeLists.txt` in the same change.**
+A file missing from either resolves for a direct compile and fails as `missing prerequisite` for
+every requirer, so a partial registration reads as working until something else requires it.
+
 ### Engine
 
 - `dasllama.das` — the public API surface and its re-exports.
-- `dasllama_common.das` — engine types, forward loops, override registries, the load walk. No
-  platform-specific code.
+- `dasllama_common.das` — engine types, forward loops, override registries, runtime knobs. No
+  platform-specific code, and no load walk.
+- `dasllama_load.das` — the GGUF load walk: metadata to `Config`, plane layout, format detection,
+  the eager and streamed conversion ladders, and the load entry points.
 - `dasllama_transformer.das` — block composition.
 - `dasllama_config.das` — every input that changes `.dlim` image bytes, and its identity
   formatter.
@@ -126,6 +145,9 @@ A backend is a family of role files, and the role names the contents. `<gpu>` is
 - `dasllama_metal_gemm.das` — the Metal batch-GEMM donor.
 - `dasllama_gpu_tier.das` — the device-cooperation SPI: hook types, install slots, status.
 - `dasllama_kernel_access.das` — the shared body-walk read/write classifier both lenses run on.
+- `dasllama_gpu_resident.das` — the whole-model GPU residency rail: the flavor bake, the stack
+  upload, and the device-resident decode/prefill overrides. No device call and no GPU require
+  belongs here; a device-specific arm is a defect. See `ARCHITECTURE.md` §1.5.
 
 A backend-only capability goes in that backend's matching role file. A new grab-bag file for it
 is a defect.
@@ -204,3 +226,7 @@ shapes that cannot reduce, not for code written oversized.
 
 **Platform backends implement narrow registered contracts.** Platform-specific code in a
 platform-neutral file is a defect.
+
+**Every program root declares the same `options stack` budget.** A test, harness, benchmark, or
+tool that picks its own number — larger or smaller — is a defect, and so is a new root that omits
+the declaration. See `ARCHITECTURE.md` §2.7.
