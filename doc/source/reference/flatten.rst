@@ -136,10 +136,13 @@ reassociates, for float rounding) into one adjacent group the all-const fold the
 The same pass sorts the chain's *variable* terms into a canonical (structural) order, so
 commutative chains converge to one form (``b + a`` and ``a + b`` both become ``a + b``) —
 gated on every term being side-effect-free, and intended to feed a later common-subexpression
-pass. Integer ``+``/``*`` reassociate exactly; integer ``/`` is non-associative and excluded.
+pass. Positive terms sort before subtracted ones, so the rebuilt chain spells ``b - a``
+(one sub node) rather than ``-a + b`` (a negate plus an add — whose uniform ``-a`` the
+preshader pass would hoist into a pass-through ``_preshader_ = -_preshader_`` alias). Integer ``+``/``*`` reassociate exactly; integer ``/`` is non-associative and excluded.
 These are exactly the folds the general compiler leaves for the downstream tiers (it folds
 constant *arithmetic* but not constant *constructors*, and never a runtime-operand identity
-or reassociation), done here under a shader's fast-math assumption (``x*0 → 0`` always fires).
+or reassociation), done here under a shader's fast-math assumption (``x*0 → 0`` fires by
+default; ``options _flatten_no_fast_math`` turns the float forms off — see below).
 
 The fold and the typer's const-fold are *mutually-enabling*, so the fold phase
 **iterates to a fixpoint**. Flattening folds the runtime-operand identities the
@@ -167,10 +170,109 @@ common-subexpression elimination (``flatten_optimize``):
   reassociation pass's canonical operand order is what makes the key match across
   ``a + b`` and ``b + a``; a uniform repeat routes to the preshader
   (``_preshader_cse_``), a varying one stays in the body (``_cse_``).
+* **Alias elimination** then collapses every pure ``let X = <bare var V>`` copy (with
+  neither ``X`` nor ``V`` reassigned) into direct references to ``V`` and drops the ``let``. CSE can
+  leave such copies (a later round rewrites an earlier ``_cse_`` let's whole RHS down to
+  a bare var) and the unroll / fold can leave them (``let p_0 = ro``); both are
+  pass-through graph nodes for nothing. All three passes iterate to a **joint
+  fixpoint**: an eliminated alias can expose a fresh dup, and a CSE share or alias
+  substitution can re-expose *uniform* compute in the varying region (``!_preshader_0``,
+  a ``_cse_`` let whose operands converge to all-preshader references) that only
+  re-extraction hoists to the per-draw group.
 
-Both passes are **value-exact** — they only hoist and share existing subtrees, never
-regroup or round — and both exclude any subtree that reads a **reassigned** variable
-(a live/loop mask or a written global), whose value is not stable across the body.
+Hoisting and sharing are **value-exact** — existing subtrees move, nothing regroups or
+rounds (the one exception is the fast-math division→reciprocal rewrite below) — and both
+passes exclude any subtree that reads a **reassigned** variable
+(a live/loop mask, a written global, or the base of an indexed store — ``G[i] = v``
+makes every ``G[...]`` read unstable), whose value is not stable across the body.
+
+**mad / lerp: disassemble early, re-fuse late.** ``lerp`` and ``mad`` are pure
+arithmetic wearing a call: the fold phase **expands** them in place —
+``mad(a, b, c) → a*b + c``, ``lerp(a, b, t) → (b - a)*t + a`` — so every
+downstream pass sees through them: the existing identity arms collapse the
+constant selectors (``lerp(a, b, 0) → a``, ``lerp(a, b, 1) → b``,
+``lerp(a, a, t) → a``, ``mad(a, 1, c) → a + c``, ``lerp(1.0, d, 1.0) → d``)
+with **no per-builtin identity table**, reassociation canonicalises the exposed
+operands, CSE shares a repeated ``b - a`` across lerps, and preshader extraction
+hoists a uniform ``b - a`` even when ``t`` is varying. Once the optimize pass
+converges, a finishing **fuse** pass (``PHASE_FUSED``) re-packs what survived:
+``a*b + c`` / ``c + a*b`` (and the const-negatable ``a*b - C`` / ``C - a*b``)
+become one ``mad(a, b, c)`` node — including the vector·scalar broadcast form —
+and a mad still carrying the lerp shape, ``mad(b - a, t, a)``, becomes one
+``lerp(a, b, t)`` node. Hand-written ``(b - a)*t + a`` arithmetic that never
+spelled ``lerp`` canonicalises into the lerp node the same way. A leftover
+``(-a) + b`` (the ``0 - x`` / ``*-1`` folds produce bare negates) re-packs into
+``b - a``. Type gates keep
+the rewrites inside the das ``math`` overload set (float / int / uint, scalar +
+vector; lerp with scalar ``t``), and fusion only runs when a 3-argument
+``mad`` / ``lerp`` is visible from the twin's module (``math`` or a backend DSL).
+Fusion is value-exact at the das level (das ``mad`` computes ``a*b + c``); the
+*backend* may contract it to a single-rounding FMA — that is its call.
+
+**Division becomes a reciprocal multiply.** A divide is the most expensive
+arithmetic node a shader carries, and most divisors never change per pixel. The
+fold rewrites ``x / C`` (const ``C``, float family) into ``x * (1/C)`` with the
+reciprocal computed at compile time (a zero lane keeps the division — no ``inf``
+literal is minted), and the optimize pass rewrites a *varying* division by a
+**uniform** scalar, ``x / U``, into ``x * _preshader_N`` with
+``let _preshader_N = 1f / U`` hoisted per draw — deduplicated by structural key,
+so N divisions by the same uniform share ONE reciprocal (raymarch's six
+smooth-min ``/ smoothK`` divides become six muls against one per-draw rcp, and
+the muls then mad-fuse). Both rewrites round (~1 ulp) and are **fast-math gated**.
+
+**Ctor lane algebra.** Per-lane scalar arithmetic wrapped in a vector
+constructor is the manual-vectorization tax shaders pay everywhere; flatten
+re-packs it from both ends:
+
+* **Zero-lane kill** (fold): ``floatN(e0, e1, …) * constVec`` with a zero const
+  lane zeroes the matching ctor lanes *in place* — no distribution — so the
+  dead lane's compute (a ``sin``, a texture-free chain) is eliminated by DSE,
+  and a fully-const product collapses to an embedded constant:
+  ``float2(sin(x)*12.0, 13.0) * float2(0.0, 123.0) → float2(0f, 1599f)``.
+  Float forms are fast-math (inf/NaN class); integer forms are exact.
+* **Splat collapse** (fold): ``v * floatN(s)`` / ``v / floatN(s)`` /
+  ``floatN(s) / v`` use das's native vector·scalar forms — the splat ctor node
+  disappears (``an / float3(sumW) → an / sumW``). Bit-exact, never gated.
+* **Lane re-vectorization** (fuse): same-op lanes whose sides vectorize re-pack
+  into one vector op — ``sin(float3(c.x + 0.1, c.y + 0.2, c.z + 0.3)) →
+  sin(c + float3(0.1, 0.2, 0.3))``: d scalar ops + d component reads collapse
+  to one add, the const gather embeds as a literal. Any component permutation
+  of one base becomes a swizzle (the natural full mask becomes the base
+  itself); an equal-scalar side broadcasts (``*``/``/``) or splats (``+``/``-``).
+  Bit-exact (the same per-lane IEEE ops), never gated.
+* **Shared-factor extraction** (fuse): every lane carrying the same scalar
+  factor or divisor re-packs to a broadcast —
+  ``float3(g*1.08, g*0.86, g*0.66) → float3(1.08, 0.86, 0.66) * g`` (3 muls +
+  ctor → 1 mul against an embedded const). Bit-exact, never gated.
+* **Majority-factor compensation** (fuse): when most lanes share a const factor
+  and the odd lane does not, the odd lane is compensated by the const ratio —
+  ``float3(x*13.0, y*13.0, z*12.0) → float3(x, y, z*(12.0/13.0)) * 13.0`` —
+  fired only when the per-pixel multiply count strictly drops. The ratio
+  rounds → **fast-math gated**.
+
+The fast-math opt-out
+=====================
+
+flatten's default contract is a shader compiler's: fast math. Every
+value-changing rewrite — the float ``x*0 → 0`` / ``x - x → 0`` folds (inf/NaN
+propagation), float reassociation (association order), the ``lerp``
+const-selector short-circuits (they drop an argument), division→reciprocal,
+the float zero-lane kill, and majority-factor compensation — assumes finite
+inputs and tolerates ~1-ulp drift. A module that cannot accept that opts out
+with a user option:
+
+.. code-block:: das
+
+    options _flatten_no_fast_math = true
+
+The option is module-local (it applies to the shaders/twins *written in* that
+module) and turns off exactly the value-changing set; everything bit-exact —
+flattening, predication, unrolling, preshader extraction, CSE, alias
+elimination, the mad/lerp expand/re-fuse round trip, splat collapse, lane
+re-vectorization, shared-factor extraction, and every *integer* fold — stays
+on. Under the option a twin computes bit-identical results to its original.
+The residual oracles take the same flag, so a unit compiled under the option
+validates clean without flagging the deliberately-skipped rewrites.
 
 Supported subset
 ================
@@ -199,6 +301,8 @@ Supported subset
      - flattened in place / unwrapped to its body
    * - copyable value assignment
      - selects support scalars, vectors (``float4`` …), structs and tuples
+   * - bare local decl (``var a : float3``), partially assigned under a branch
+     - the implicit zero-init is materialized, so the predicated select's false path reads a real node
    * - ``void`` functions
      - predicated writes to output globals (the writes-to-globals shader model)
 
@@ -256,7 +360,13 @@ Public API
     their own macro walks the result. Inspect ``.ok`` / ``.err``. The body is
     uninferred afterward — re-infer before reading types.
 
-``flatten_fold(var func) : bool``
+``flatten_no_fast_math : bool``
+    True when the *compiling* module sets ``options _flatten_no_fast_math = true``.
+    Compile-time only (annotation/backend patch code reads it once per cycle and
+    threads the bool into the passes below); a runtime tool driving the passes
+    directly passes its own flag instead.
+
+``flatten_fold(var func, no_fast_math = false) : bool``
     The post-inference fold pass: collapse ``const ? a : b`` selects, drop the
     pure ``lhs = lhs`` self-assigns, strip redundant zero initializers. Run it
     *after* re-inference (the constant conditions must already be folded to
@@ -269,7 +379,7 @@ Public API
     re-inference until it reports no change** — exactly as ``[flatten]``'s own
     patch does (and as the ``[pixel_shader]`` backend now does).
 
-``flatten_fold_residuals(var func) : array<string>``
+``flatten_fold_residuals(var func, no_fast_math = false) : array<string>``
     Test-framework / fuzzer introspection: walks a compiled twin's final body
     and returns a description for each const-foldable residual a complete fold
     should have collapsed — an unconditional algebraic identity (``x*1``,
@@ -282,27 +392,43 @@ Public API
     check — there is no compile-time flag; a missed fold is suboptimal, not an
     error, so it is validated by tests rather than gated in the macro.
 
-``flatten_optimize(var func, barriers : table<string>) : bool``
+``flatten_optimize(var func, barriers : table<string>, no_fast_math = false) : bool``
     The post-fold optimize pass: hoist maximal uniform subtrees to per-draw
-    ``_preshader_`` lets, then CSE-dedup repeated subtrees. Run it **once** after
+    ``_preshader_`` lets, rewrite divisions by a uniform into per-draw
+    reciprocal multiplies (fast-math), CSE-dedup repeated subtrees, then
+    collapse pure-alias ``let`` copies — iterating to a joint fixpoint. Run it **once** after
     the ``flatten_fold`` fixpoint converges (and *not* before — reassociation runs
     in the fold and would reorder a hoisted reference back into a fresh uniform
     subtree). ``barriers`` is the backend's sampler / intrinsic call-name set
     (``{ "tex2d", "noise" }``) — those stay per-pixel. ``[flatten]`` runs it
     automatically; the ``[pixel_shader]`` backend runs it after its fold fixpoint.
 
-``flatten_opt_residuals(var func) : array<string>``
+``flatten_fuse(var func, no_fast_math = false) : bool``
+    The finishing fuse pass: re-pack ctor lane patterns (re-vectorization,
+    shared-factor extraction, majority compensation), ``a*b ± c`` into
+    ``mad(a, b, c)``, and the expanded lerp shape ``mad(b - a, t, a)`` back
+    into ``lerp(a, b, t)``. Run it
+    after ``flatten_optimize``'s re-infer (the type gates need settled types) and
+    **iterate across re-inference while it reports change**, exactly like the
+    fold — each round strictly drops a ``+``/``-`` node, so it converges.
+    ``[flatten]`` runs it automatically; the ``[pixel_shader]`` backend mirrors it.
+
+``flatten_opt_residuals(var func, no_fast_math = false) : array<string>``
     The optimize-completeness oracle (sibling of ``flatten_fold_residuals``):
     walks a compiled twin and returns a description for each missed optimization —
-    a maximal uniform subtree still inline in the varying body, or a pure subtree
-    computed twice or more left un-shared. Empty means complete. Drives the same
+    a maximal uniform subtree still inline in the varying body, an un-rewritten
+    division by a uniform, a pure subtree computed twice or more left un-shared,
+    a pure-alias ``let`` copy left uncollapsed, a fusable mul-add left un-packed,
+    a mad still carrying the lerp shape, or an un-packed ctor lane pattern.
+    Empty means complete. Drives the same
     ``tests/flatten/test_flatten_fold.das`` corpus and the ``flatten-fuzz``
     strict mode.
 
 A backend's typical pipeline is therefore: ``flatten_function`` → re-infer →
 ``flatten_fold`` (to a fixpoint) → re-infer → ``flatten_optimize`` → re-infer →
-walk the now-branchless, call-free twin and emit its dataflow graph (mapping
-``?:`` to a *select* node and the bool masks to a 0/1 selector).
+``flatten_fuse`` (to a fixpoint) → walk the now-branchless, call-free twin and
+emit its dataflow graph (mapping ``?:`` to a *select* node and the bool masks
+to a 0/1 selector).
 
 .. seealso::
 

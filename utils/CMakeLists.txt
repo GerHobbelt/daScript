@@ -47,9 +47,12 @@ file(GLOB DASLIB_SOURCES ${PROJECT_SOURCE_DIR}/daslib/*.das)
 file(GLOB_RECURSE DASLLVM_DASLIB_SOURCES ${PROJECT_SOURCE_DIR}/modules/dasLLVM/*.das)
 
 # daslang -exe appends `.exe` to the output path.
-# On multi-config generators (MSVC), place next to daslang in bin/<Config>/.
-# On single-config generators (Make/Ninja), place in bin/.
-if(MSVC)
+# On multi-config generators (Visual Studio), place next to daslang in
+# bin/<Config>/. On single-config generators (Make/Ninja), place in bin/.
+# Key on the GENERATOR, not the compiler: MSVC+Ninja (release CI) is
+# single-config and its exes land in plain bin/.
+get_property(_DAS_UTILS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(_DAS_UTILS_MULTI_CONFIG)
     set(UTIL_BIN_DIR ${PROJECT_SOURCE_DIR}/bin/${CMAKE_CFG_INTDIR})
 else()
     set(UTIL_BIN_DIR ${PROJECT_SOURCE_DIR}/bin)
@@ -101,13 +104,13 @@ foreach(util ${DAS_UTILS})
 endforeach()
 add_dependencies(all_utils_exe dastest_exe)
 
-# Prewarm the JIT dll cache for the whole test tree, except the gc folder (which
-# dastest also excludes under -jit — it uses runtime quote/qmacro the JIT can't
-# lower). Reuses the jit_exe target built by the foreach above (bin/jit.exe, built
+# Prewarm the JIT dll cache for the whole test tree, except the folders dastest
+# also excludes under -jit (gc, ast_match, no_aot — they use runtime quote/qmacro
+# the JIT can't lower). Reuses the jit_exe target built by the foreach above (bin/jit.exe, built
 # with --jit-register-all-modules). Run explicitly:
 #   ninja jit_cache_all_tests
 add_custom_target(jit_cache_all_tests
-    COMMAND ${UTIL_BIN_DIR}/jit.exe ${PROJECT_SOURCE_DIR}/tests --parallel 0 $<IF:$<CONFIG:Debug>,--jit-opt-level=0,--jit-opt-level=3> --exclude gc --exclude dasHV --exclude dasPUGIXML --exclude dasSQLITE --exclude stbimage --exclude live_host --exclude audio --exclude strudel --exclude ast_match
+    COMMAND ${UTIL_BIN_DIR}/jit.exe ${PROJECT_SOURCE_DIR}/tests --parallel 0 $<IF:$<CONFIG:Debug>,--jit-opt-level=0,--jit-opt-level=3> --exclude gc --exclude dasHV --exclude dasPUGIXML --exclude dasSQLITE --exclude stbimage --exclude live_host --exclude audio --exclude strudel --exclude ast_match --exclude no_aot
     DEPENDS jit_exe
     WORKING_DIRECTORY ${UTIL_BIN_DIR}
     COMMENT "JIT-compiling tests/ into the .jitted_scripts cache"
@@ -138,7 +141,9 @@ ADD_CUSTOM_TARGET(run_utils_tests
 # Install utility executables (OPTIONAL — only present when -exe targets are built).
 # UTIL_BIN_DIR uses CMAKE_CFG_INTDIR which doesn't resolve at install time on
 # multi-config generators. Use install(CODE) with CMAKE_INSTALL_CONFIG_NAME.
-if(MSVC)
+# Same generator-keyed split as UTIL_BIN_DIR above — under MSVC+Ninja the exes
+# are in plain bin/, and bin/${CMAKE_INSTALL_CONFIG_NAME} would miss them all.
+if(_DAS_UTILS_MULTI_CONFIG)
     set(_UTIL_INSTALL_PATTERN "${PROJECT_SOURCE_DIR}/bin/\${CMAKE_INSTALL_CONFIG_NAME}")
 else()
     set(_UTIL_INSTALL_PATTERN "${PROJECT_SOURCE_DIR}/bin")
