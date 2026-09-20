@@ -4,7 +4,7 @@ require dastest/testing_boost public
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // ============================================================================
 // `@sql_column = "<sql_name>"` field annotation. Renames the field's on-disk
@@ -91,8 +91,8 @@ def test_sql_text_group_by_uses_sql_column(t : T?) {
                             |> _select((Kind = _._0, N = _._1 |> length)))
     t |> success(sql |> find("GROUP BY \"type\"") >= 0,
         "_group_by on renamed column emits 'type'")
-    t |> success(sql |> find("\"type\", COUNT(*)") >= 0,
-        "projection of group key emits SQL identifier 'type'")
+    t |> success(sql |> find("\"type\" AS \"Kind\", COUNT(*) AS \"N\"") >= 0,
+        "projection of group key emits SQL identifier 'type' aliased to the tuple field")
 }
 
 [test]

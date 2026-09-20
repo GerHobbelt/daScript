@@ -1,23 +1,38 @@
-# SQL — dasSQLITE
+# SQL — daslib/sql_linq + providers (dasSQLITE / dasDuckDB / dasPostgreSQL)
 
-Read this skill before writing or editing any `.das` code that talks to a SQL database. The companion tutorials live under [tutorials/sql/](../tutorials/sql/) (45 files, numbered by teaching order — `01-version.das` through `44-in_not_in_collections.das`, plus `12b-set_ops.das`); read the relevant ones for runnable examples of every pattern below. Implementation is in [modules/dasSQLITE/daslib/sqlite_boost.das](../modules/dasSQLITE/daslib/sqlite_boost.das) (runtime + `[sql_table]` / `[sql_view]` / `[sql_fts5]` / `[sql_function]` macros), [modules/dasSQLITE/daslib/sqlite_linq.das](../modules/dasSQLITE/daslib/sqlite_linq.das) (the `_sql(...)` family of call macros), and [modules/dasSQLITE/daslib/sqlite_migrate.das](../modules/dasSQLITE/daslib/sqlite_migrate.das) (`[sql_migration]` + `migrate_to_latest` runner). Design notes, decision logs, and the deferred-feature list live next to the implementation in [modules/dasSQLITE/API_REWORK.md](../modules/dasSQLITE/API_REWORK.md), [TUTORIALS.md](../modules/dasSQLITE/TUTORIALS.md), and [API_MIGRATION.md](../modules/dasSQLITE/API_MIGRATION.md).
+Read this skill before writing or editing any `.das` code that talks to a SQL database. The companion tutorials live under [tutorials/sql/](../tutorials/sql/) (45 files, numbered by teaching order — `01-version.das` through `44-in_not_in_collections.das`, plus `12b-set_ops.das`); read the relevant ones for runnable examples of every pattern below. Implementation: the provider-neutral core is [daslib/sql_boost.das](../daslib/sql_boost.das) (`[sql_table]` / `[sql_view]` / `[sql_index]` macros, `add_column` / `create_index` ALTER macros, the `sql_bind`/`sql_extract` adapter rail) and [daslib/sql_linq.das](../daslib/sql_linq.das) (the `_sql(...)` family of call macros), routed through the provider registry in [daslib/sql_provider.das](../daslib/sql_provider.das). The SQLite provider is [modules/dasSQLITE/daslib/sqlite_boost.das](../modules/dasSQLITE/daslib/sqlite_boost.das) (`SqlRunner`, exec/query runtime, runner helpers, `[sql_fts5]`) plus the registration shim [sqlite_provider.das](../modules/dasSQLITE/daslib/sqlite_provider.das); the `[sql_function]` annotation is provider-neutral (in `daslib/sql_boost`), and migrations (`[sql_migration]` + the `migrate_to_latest` runner + `[struct_convert]`) live in the neutral [daslib/sql_migrate.das](../daslib/sql_migrate.das) with per-provider glue ([sqlite_migrate.das](../modules/dasSQLITE/daslib/sqlite_migrate.das) re-exports it). Design notes, decision logs, and the deferred-feature list live next to the provider in [modules/dasSQLITE/API_REWORK.md](../modules/dasSQLITE/API_REWORK.md), [PROVIDER_CONTRACT.md](../modules/dasSQLITE/PROVIDER_CONTRACT.md), [TUTORIALS.md](../modules/dasSQLITE/TUTORIALS.md), and [API_MIGRATION.md](../modules/dasSQLITE/API_MIGRATION.md).
 
-The shipped backend is **SQLite only**. The split between `daslib/sql` (provider-neutral types — `SqlType`, `ColumnInfo`, re-exported `Option`/`Result`) and `sqlite/sqlite_boost` (provider-specific runtime + macros — `SqlRunner`, `SqlError`, `[sql_table]`, …; these migrate up to `daslib/sql` when a second provider lands) keeps user code portable for the day a second backend lands. Until then the names "SQL" and "SQLite" are interchangeable in this skill.
+Three backends implement the provider contract: in-tree **SQLite** (the reference), and the external **[dasDuckDB](https://github.com/borisbat/dasDuckDB)** and **[dasPostgreSQL](https://github.com/borisbat/dasPostgreSQL)** repos (each carries its own CLAUDE.md with dialect divergences). The macro layer (`daslib/sql_boost` + `daslib/sql_linq`) is provider-neutral; everything runner- or dialect-specific lives in the provider's module and its registry entry. This skill's examples are written against SQLite; the `_sql` chain surface is identical across providers — swap the runner (`with_sqlite` / `with_duckdb` / `with_postgres`) and the require lines.
+
+## Providers at a glance
+
+| | SQLite (in-tree) | DuckDB (external) | PostgreSQL (external) |
+|---|---|---|---|
+| Require | `sqlite/sqlite_boost` | `duckdb/duckdb_boost` | `postgres/postgres_boost` |
+| Scoped open | `with_sqlite(path)` | `with_duckdb(path)` | `with_postgres(conninfo)` |
+| `[sql_fts5]` / `text_match` | ✓ | compile error | compile error |
+| `[sql_function]` UDFs | ✓ | ✓ | compile error (no client-side UDFs) |
+| `_distinct_by` lowering | bare-aggregate `GROUP BY` | `DISTINCT ON` | `DISTINCT ON` |
+| Migrations glue | `sqlite/sqlite_migrate` | `duckdb/duckdb_migrate` | `postgres/postgres_migrate` (advisory-lock coordination) |
+| PRAGMA / VACUUM / ATTACH / backup | ✓ (SQLite-specific surface) | engine-specific via `exec` | engine-specific via `exec` |
+
+Capability gates are **compile-time** `macro_error`s naming the provider (`caps` bitfield in the registry — see [PROVIDER_CONTRACT.md](../modules/dasSQLITE/PROVIDER_CONTRACT.md)). Everything else — `[sql_table]` DDL, insert-returns-pk, upsert, transactions (nested composes on all three), placeholder style — is handled per-provider under the same surface; user code doesn't change.
 
 ## `require`
 
 ```das
-require daslib/sql                  // abstract layer — SqlType, ColumnInfo (SqlRunner/SqlError live in sqlite_boost)
-require sqlite/sqlite_boost         // runtime, [sql_table], [sql_view], [sql_fts5], [sql_function]
-require sqlite/sqlite_linq          // _sql / _try_sql / _each_sql / _sql_update / _sql_delete / _sql_upsert / _create_view / _sql_text
-require sqlite/sqlite_migrate          // OPTIONAL — [sql_migration], migrate_to_latest, with_latest_sqlite, baseline
+require sqlite/sqlite_boost         // provider: SqlRunner, exec/query runtime, [sql_fts5], [sql_function]
+require daslib/sql_linq             // _sql / _try_sql / _each_sql / _sql_update / _sql_delete / _sql_upsert / _create_view / _sql_text
+require sqlite/sqlite_migrate       // OPTIONAL — [sql_migration], migrate_to_latest, with_latest_sqlite, baseline
 ```
 
-`sqlite_boost` re-exports the raw `sqlite` C-binding module publicly. **Never `require sqlite` directly** — it's the auto-generated thin C binding (`sqlite3_open`, `sqlite3_prepare_v2`, `sqlite3_step`, …). Going through `sqlite_boost` gets you `SqlRunner` + the typed surface; the raw functions are still reachable when you genuinely need them, but reaching for them is almost always wrong.
+`sqlite_boost` re-exports the raw `sqlite` C binding, `daslib/sql` (`SqlType`, `ColumnInfo`, `SqlError`, `Option`/`Result`), and `daslib/sql_boost` (`[sql_table]` / `[sql_view]` / `[sql_index]`, the adapter rail) publicly — one require covers the whole write-side surface. Add `daslib/sql_linq` for the `_sql` chain macros. **Never `require sqlite` directly** — it's the auto-generated thin C binding (`sqlite3_open`, `sqlite3_prepare_v2`, `sqlite3_step`, …). Going through `sqlite_boost` gets you `SqlRunner` + the typed surface; the raw functions are still reachable when you genuinely need them, but reaching for them is almost always wrong.
+
+The old spellings `require sqlite/sqlite_linq` and `require sqlite/sql_provider` are **hard compile errors** (deprecation stubs) — they moved to `daslib/sql_linq` / `daslib/sql_provider`.
 
 `sqlite/sqlite_migrate` is the only optional sub-module — only require it when the app uses versioned migrations. It transitively brings in `sqlite_boost`, so don't double-require.
 
-The path uses **forward slash** (`require sqlite/sqlite_boost` — not backslash). All four `sqlite/*` paths are wired through the [.das_module](../modules/dasSQLITE/.das_module) descriptor.
+The path uses **forward slash** (`require sqlite/sqlite_boost` — not backslash). The `sqlite/*` paths are wired through the [.das_module](../modules/dasSQLITE/.das_module) descriptor.
 
 ## Pick the right tool first
 
@@ -25,7 +40,7 @@ When writing or reading SQL, the order of preference is fixed. Reach for the sim
 
 | Situation | Use | Why |
 |---|---|---|
-| Open / close a DB for a scoped block | **`with_sqlite(path) <\| $(db) { ... }`** (or `with_latest_sqlite` if migrations) | RAII; closes on panic / early return. Per-provider; future backends ship `with_postgres`, etc. |
+| Open / close a DB for a scoped block | **`with_sqlite(path) <\| $(db) { ... }`** (or `with_latest_sqlite` if migrations) | RAII; closes on panic / early return. Per-provider: `with_duckdb(path)` / `with_postgres(conninfo)` in the external repos |
 | Declare a row shape | **`[sql_table(name="...")]` struct** | Generates CREATE / DROP / INSERT / SELECT-row helpers + adapter dispatch. The struct is the single source of truth |
 | Query a table you own | **`_sql(db \|> select_from(type<T>) \|> _where(...) \|> _select(...))`** | Compile-time SQL emission, captured-vars auto-bound, type-checked column refs. The flagship; every read-side tutorial uses it |
 | Stream millions of rows | **`for (row in _each_sql(...))`** | Generator; `sqlite3_finalize` runs in `finally` on break/exhaustion/panic. Same chain shape as `_sql`, rejects materializing terminals |
@@ -177,11 +192,12 @@ let cars <- _sql(db |> select_from(type<Car>)
 |---|---|
 | **Source** | `select_from(db, type<T>)` where `T` carries `[sql_table]` or `[sql_view]` |
 | **Filter** | `_where(p)` — multiple calls compose with AND |
-| **Project** | `_select(_.Field)` (single column), `_select((A=_.A, B=_.B))` (named-tuple), `_select(_.A + _.B)` (computed scalar → the arithmetic renders into the projection/aggregate), default = full row |
+| **Project** | `_select(_.Field)` (single column), `_select((A=_.A, B=_.B))` (named-tuple), `_select(_.A + _.B)` (computed scalar → the arithmetic renders into the projection/aggregate), default = full row. Renamed/computed named-tuple entries emit `AS "<name>"`, so result columns carry your record names and a later `_order_by(_.Name)` over a projection alias orders correctly on every provider |
 | **Order** | `_order_by(_.Field)`, `_order_by_descending(_.Field)`, tuple-key `_order_by((_.k1, _.k2))` |
 | **Group** | `_group_by(_.Key)`, `_group_by((_.k1, _.k2))`; post-group `_having(p)` |
 | **Page** | `take(n)`, `skip(m)` — canonical fast form is `skip(m) \|> take(n)`. `take`/`skip` BEFORE an aggregate (`take(n) \|> count()`, `_select(_.X) \|> take(n) \|> sum()`) wraps the bounded rows into an inner subquery so the LIMIT applies pre-aggregate |
 | **Distinct** | `distinct()` |
+| **Distinct-by** | `_distinct_by(_.K)` — one row per key: first in pk order; `reverse() \|> _distinct_by(_.K)` picks the last. Terminators: row-returning (`to_array` / `_first`, trailing `_order_by`/`take`/`skip` OK), `count()` (→ `COUNT(DISTINCT K)`), `_count(p)`, `_select(_.X) \|> sum/min/max/average()`. Provider-lowered via `caps.distinct_on`: `DISTINCT ON (K)` (PG, DuckDB) or SQLite's bare-aggregate `GROUP BY`. Requires a single `@sql_primary_key`; composing with `_where`/`_join`/`_group_by`/set ops is a compile error (v1) |
 | **Aggregate** | `count()`, `sum`, `average`, `min`, `max` (terminal) |
 | **Joins** | `_join(other, $(l, r) => l.X == r.Y, $(l, r) => projection)`, `_left_join(...)` (right side flows as `Option<TB>` through `into`) |
 | **Subqueries** | `x._in(subq)`, `x._not_in(subq)`, `subq._any()`, `subq._any(p)`, `subq._none()`, `subq._none(p)` |
@@ -313,15 +329,15 @@ if (r |> is_some) {
 }
 ```
 
-`with_transaction` emits `BEGIN` on entry, `COMMIT` on normal exit, `ROLLBACK` on panic / early return (via `finally`). Nested calls fall back to `SAVEPOINT` / `RELEASE` / `ROLLBACK TO` (savepoint name `das_sp`) so user code composes freely without SQLite's "no nested transactions" rule biting. Bulk `insert(array<T>)` likewise auto-uses a savepoint when nested.
+`with_transaction` emits `BEGIN` on entry, `COMMIT` on normal exit, `ROLLBACK` on early return (a block `return` unwinds non-locally through `finally`). **A panic does NOT roll back** — daslang deliberately skips `finally` on panic (see "Error handling" in CLAUDE.md), so the transaction is left open and its writes are discarded when the connection closes; that's consistent with panic-is-fatal (print diagnostics and exit — don't continue after `recover`). Nested calls fall back to `SAVEPOINT` / `RELEASE` / `ROLLBACK TO` (savepoint name `das_sp`) so user code composes freely without SQLite's "no nested transactions" rule biting. Bulk `insert(array<T>)` likewise auto-uses a savepoint when nested.
 
 Two distinct overloads (one with `mode`, one without) — not one with an optional middle parameter, because the trailing-block convention puts the block last and an optional middle wouldn't resolve from a no-mode call site. Same for `try_transaction`.
 
-`SqliteTxnMode`: `Deferred` (default; lock acquired on first write), `Immediate` (RESERVED lock at BEGIN — avoids the "another writer raced us between read and write" trap), `Exclusive`.
+`SqliteTxnMode`: `Deferred` (default; lock acquired on first write), `Immediate` (RESERVED lock at BEGIN — avoids the "another writer raced us between read and write" trap), `Exclusive`. The mode overload is SQLite-specific; DuckDB / PostgreSQL providers ship the mode-less `with_transaction` / `try_transaction` only (nesting still composes — savepoints on PG, depth tracking on DuckDB).
 
 `db |> in_transaction() : bool` wraps SQLite's autocommit flag — useful for library code that wants "join an ambient transaction if one is active, else start one".
 
-`try_transaction` only converts SQL failures (BEGIN / COMMIT errors) into `some(errmsg)` and returns `none` on success. A panic from inside the block still rolls back and re-propagates — wrap in your own `try / recover` if you want to convert a block panic into a `SqlError`.
+`try_transaction` only converts SQL failures (BEGIN / COMMIT errors) into `some(errmsg)` and returns `none` on success. A panic from inside the block propagates without rolling back (same `finally`-skipped-on-panic rule as `with_transaction`) — a fallible step inside a transaction should use the `try_` API forms and early-return, not panic-and-recover.
 
 ## Custom types — `sql_bind` / `sql_extract`
 
@@ -437,11 +453,11 @@ enum Status { Pending = 1; Shipped = 2 }
 def to_sql_literal(s : Status) : string => "{int(s)}"
 ```
 
-Types without an overload hit the catch-all in `sqlite_linq.das` (enums emit as `int(v)`, otherwise compile error pointing at "define a one-line overload in YourType's module"). The value is **frozen at view-creation time** — changing the captured local later does not update the view; drop and re-create. Runtime `_sql(...)` queries against the view still honor `?` binds normally — it's only DDL that can't.
+Types without an overload hit the catch-all in `sql_linq.das` (enums emit as `int(v)`, otherwise compile error pointing at "define a one-line overload in YourType's module"). The value is **frozen at view-creation time** — changing the captured local later does not update the view; drop and re-create. Runtime `_sql(...)` queries against the view still honor `?` binds normally — it's only DDL that can't.
 
 For window functions, recursive CTEs, custom helpers the chain doesn't translate, drop to raw `db |> exec("CREATE VIEW … AS …")` and declare a matching `[sql_view]` struct for the read side.
 
-## FTS5 — full-text search
+## FTS5 — full-text search (SQLite-only, `caps.fts5`)
 
 ```das
 [sql_fts5(name = "docs_idx")]
@@ -465,7 +481,9 @@ Query-string syntax: whitespace-AND, `*` prefix (`quick*` matches `quicksand`), 
 
 v1 limitations: self-contained mode only (FTS5 holds both content and index); UPDATE / DELETE on FTS5 rows aren't typed (drop and re-insert, or raw `exec`); BM25 weighting / snippet helpers / per-column query filters work via the FTS5 query string but lack typed wrappers.
 
-## User-defined SQL functions — `register_function` / `[sql_function]`
+## User-defined SQL functions — `register_function` / `[sql_function]` (`caps.client_udfs`)
+
+SQLite and DuckDB only — PostgreSQL has no client-side UDFs, so `[sql_function]` use in a chain against a PG runner is a compile-time error (`caps.client_udfs` gate). The annotation itself is provider-neutral (ONE `[sql_function]` in `daslib/sql_boost`): a tagged function lands in a type-erased queue that every UDF-capable provider replays against each connection it opens — tag once, visible on SQLite and DuckDB connections alike.
 
 Two flavors. Per-connection `register_function` for explicit one-off registration; `[sql_function]` annotation for auto-registration on every open + chain visibility.
 
@@ -495,13 +513,20 @@ let strong <- _sql(db |> select_from(type<Enemy>)
 - `deterministic=true` → `SQLITE_DETERMINISTIC` (allows the fn in `CREATE INDEX … ON tbl(myfn(col))` and lets the planner factor it out of inner loops)
 - `directonly=true` → `SQLITE_DIRECTONLY` (blocks invocation from triggers / views / CHECK constraints)
 
-**`[sql_function]` install**: the annotation queues a thunk into a global registry; `try_open_sqlite` / `open_sqlite` / `with_sqlite` install every thunk against the new connection. Duplicate `(name, arity)` registration across modules → install-time `SqlError`. Manual `register_function` after open overrides the registry's binding.
+**`[sql_function]` install**: the annotation queues an entry into the neutral `daslib/sql_boost` registry; every UDF-capable provider's open path (`try_open_sqlite` / `with_sqlite`, `with_duckdb`, …) installs every entry against the new connection. Duplicate `(name, arity)` registration across modules → install-time `SqlError`. Manual `register_function` after open overrides the registry's binding.
 
 `[sql_function]` is the right shape for ambient SQL helpers that should be visible to chain analysis everywhere; `register_function` is for one-off / per-connection registrations.
 
-## Migrations — `daslib/sqlite_migrate`
+## Migrations — `daslib/sql_migrate` + per-provider glue
 
-Versioned, append-only schema evolution. Optional sub-module — `require sqlite/sqlite_migrate` only when needed.
+Versioned, append-only schema evolution, provider-neutral. The engine and the
+`[sql_migration]` / `[struct_convert]` annotations live in `daslib/sql_migrate`; each
+provider ships a glue module that re-exports it — require the glue, never the engine
+directly: `sqlite/sqlite_migrate`, `duckdb/duckdb_migrate`, or `postgres/postgres_migrate`
+(see PROVIDER_CONTRACT.md §Migrations for the glue hook contract). Optional — only require
+it when the app uses versioned migrations. The migration body's runner parameter type
+selects the provider **stream**: versions are unique per stream, so SQLite and PostgreSQL
+migration sets number independently in one program.
 
 ```das
 require sqlite/sqlite_migrate
@@ -543,9 +568,9 @@ def main() : int {
 ### The five rules
 
 1. **Append-only.** Once shipped, a migration is FROZEN. Never edit `migration_002` after release — write `migration_003` that does the additional change. The mechanism: a user whose DB is already at v2 will never re-execute v2 on their machine; edits to v2 wouldn't reach existing users.
-2. **Versions are program-global unique.** Two devs picking `version=2` on parallel branches is a **compile-time error** — the macro tracks a global `[sql_migration]` registry across modules. Resolution: renumber the later branch.
+2. **Versions are unique per provider stream.** Two devs picking `version=2` on parallel branches (for the same runner type) is a **compile-time error** — the macro scans the `[sql_migration]` registry across modules, grouped by the body's runner type. Resolution: renumber the later branch. Migrations for *different* providers (e.g. `db : SqlRunner` from sqlite_boost vs postgres_boost) live in separate streams and may share version numbers.
 3. **Strict-forward pending detection.** Pending = registered versions where `version > MAX(applied)`. Set-difference (EF-style) is **not** how this works.
-4. **One transaction per call (α-shape).** All pending migrations + their audit inserts share one `BEGIN IMMEDIATE / COMMIT`. If any migration fails, the whole call rolls back — re-run replays the entire pending list. Implication: prior successful migrations in the same call get rolled back too. Long-running backfills should live in their own `migrate_to_latest` invocation if replay cost matters.
+4. **One transaction per call (α-shape).** All pending migrations + their audit inserts share one transaction (SQLite: `BEGIN IMMEDIATE`; PostgreSQL: session advisory lock + `BEGIN`; DuckDB: `BEGIN`). If any migration fails, the whole call rolls back — re-run replays the entire pending list. Implication: prior successful migrations in the same call get rolled back too. Long-running backfills should live in their own `migrate_to_latest` invocation if replay cost matters.
 5. **Body is plain daslang.** Raw `db |> exec(...)`, typed DDL (`add_column` / `create_index` / `drop_index_if_exists` / `create_table` / `drop_table_if_exists`), typed DML (`_sql_update` / `insert` / `_sql_upsert` / etc.), reads (`_sql(...)`), arbitrary control flow. No special migration sub-DSL.
 
 ### The struct-vs-migration disconnect
@@ -572,7 +597,7 @@ def migration_history(db) : array<MigrationRecord>   // {version, description (f
 
 ### Audit table
 
-`__schema_version (version INTEGER PRIMARY KEY, description TEXT, applied_at INTEGER)`. Eagerly created. Success-only rows — failed migrations roll back the audit insert atomically with their own body. `description` in `migration_history` is **frozen at apply time** (DB wins); `pending_migrations` reads from the annotation. Editing a description on an already-shipped migration is a no-op for any DB past it.
+`__schema_version (version INTEGER PRIMARY KEY, description TEXT, applied_at BIGINT)`. Eagerly created; `applied_at` is stamped client-side (epoch seconds) so the insert is portable across engines. Success-only rows — failed migrations roll back the audit insert atomically with their own body. `description` in `migration_history` is **frozen at apply time** (DB wins); `pending_migrations` reads from the annotation. Editing a description on an already-shipped migration is a no-op for any DB past it.
 
 ### Annotation parameters
 
@@ -595,7 +620,7 @@ Two layers of help:
 
 ### Concurrent runners
 
-Coordination via SQLite's RESERVED lock. `apply_recommended_pragmas` (called by `with_latest_sqlite`) sets `busy_timeout = 5000ms`, so concurrent migrators block on `BEGIN IMMEDIATE` for 5 seconds before erroring. Three pods racing on startup → one wins, two block briefly, all three end up at the latest version with no special application logic.
+Per-provider coordination behind the same surface. SQLite: the RESERVED lock — `apply_recommended_pragmas` (called by `with_latest_sqlite`) sets `busy_timeout = 5000ms`, so concurrent migrators block on `BEGIN IMMEDIATE` for 5 seconds before erroring. PostgreSQL: a session advisory lock keyed on the current database — `migrate_to_latest` / `baseline` **block indefinitely** waiting for a concurrent migrator (the session lock auto-releases if the holder crashes or disconnects, so there's no stuck-lock failure mode); `try_migrate_to_latest` / `try_baseline` use `pg_try_advisory_lock` and **fail fast** with `err` instead. DuckDB: the engine's single-writer lock covers it. Three pods racing on startup → one wins, the others wait, all end up at the latest version with no special application logic; a re-check under the lock skips work another runner already did.
 
 ### Failure semantics
 
@@ -606,7 +631,7 @@ If migration v5 fails midway through `[v4, v5, v6]`:
 
 Body discipline: **migration bodies should be DB-only**. Anything that touches the outside world (HTTP, file writes, `system(...)`) is NOT rolled back when the migration fails; if the migration retries, those side effects re-execute. For genuinely cross-system migrations, sequence them outside the runner.
 
-## PRAGMA, VACUUM, backup
+## PRAGMA, VACUUM, backup (SQLite-specific surface)
 
 ```das
 db |> set_pragma("journal_mode", "WAL")          // string / int64 / bool overloads
@@ -626,7 +651,7 @@ All have `try_` siblings returning `SqlError` (or `Result<array<string>, string>
 
 `apply_recommended_pragmas` is the canonical "sane defaults" call — WAL enables reader+writer coexistence, busy_timeout gives concurrent runners a wait window, foreign_keys=ON makes `@sql_references` constraints actually fire, synchronous=NORMAL is the WAL-appropriate durability/perf tradeoff.
 
-## ATTACH
+## ATTACH (SQLite-specific surface)
 
 ```das
 db |> attach("other.db", "ext")                  // try_attach for non-panic
@@ -698,5 +723,5 @@ Strings produced by `query` / `_sql` are allocated on the calling context's heap
 ## Reference
 
 - Tutorials — every shipped feature has a runnable file under `tutorials/sql/` (45 files).
-- Implementation — `modules/dasSQLITE/daslib/sqlite_boost.das`, `sqlite_linq.das`, `sqlite_migrate.das`.
+- Implementation — `daslib/sql_boost.das`, `daslib/sql_linq.das`, `daslib/sql_provider.das` (neutral core); `modules/dasSQLITE/daslib/sqlite_boost.das`, `sqlite_provider.das`, `sqlite_migrate.das` (SQLite provider).
 - Related skills — `skills/json.md` (`@sql_json` columns), `skills/linq.md` (`_sql` is LINQ-shaped), `skills/das_macros.md` (`[sql_table]` / `_sql` are macros), `skills/gc_migration.md` (`SqlRunner` is one of the residual smart_ptr types).

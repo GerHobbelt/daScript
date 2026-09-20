@@ -522,6 +522,12 @@ typedef MatmulQ8Q8GroupNFn = function<(var yp : float?; wp : int8 const?; sp : f
 // evenly and Q8 block epilogues stay aligned); same per-row dots as the mm slot — bit-identical.
 typedef MatmulQ8Q8RowsFn = function<(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n : int64; rb : int64; re : int64) : void>
 typedef MatmulMx4GroupNFn = function<(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n : int64; d : int64) : void>
+// Is this backend selectable RIGHT NOW? Evaluated at (load-)select/pin time — NOT at
+// registration ([init]s run before the JIT installs generated code, so a predicate reading a
+// JIT-stamped value answers with its reference tier there). Lets one module register several
+// statically-correct flavors whose applicability depends on runtime state (dasllama_math_gen:
+// which repack layout the stamped tile reads).
+typedef BackendAvailableFn = function<() : bool>
 // Region-list batched MXFP4·Q8 GEMM — the batch analog of MatmulMx4GroupNFn and the llama.cpp
 // mul_mat_id shape: ONE dispatch runs every routed expert's same-shape [d x n] GEMM over its own
 // row range of a shared token-row image. `offs` packs TRIPLES per region: [3r] = the weight-element
@@ -571,6 +577,13 @@ struct KernelBackend {
     // flag (probe/A-B reference) — the flag is the in-model routing decision.
     mx4_native_batch : bool = false
     priority : int
+    // see BackendAvailableFn — selection-time availability; default = always selectable
+    available : BackendAvailableFn = @@backend_always_available
+    // The Q8 interleave (mr) the backend's repack writes and its kernels read. Evaluated at
+    // ACTIVATION time — selection-time truthful like `available`, never at [init] (a JIT-stamped
+    // layout still answers with its reference tier there). The mx4 expand's positional map and
+    // the probes read the cached value via active_q8_layout_mr().
+    q8_layout : function<() : int> = @@q8_layout_grp4
 }
 
 // Active kernels — the hot path reads these directly. A backend must register before any Q8·Q8 matmul
@@ -594,6 +607,7 @@ var g_active_priority = -1          // priority of the active row-major default 
 var g_active_needs_repack = false   // does the active backend need repacked weights?
 var g_active_mx4_expand_interleaved = false   // see KernelBackend.mx4_expand_interleaved
 var g_active_mx4_native_batch = false         // see KernelBackend.mx4_native_batch
+var g_active_q8_layout_mr = 4l                // see KernelBackend.q8_layout (activation-time cache)
 var g_backend_pin = ""              // A/B: force this backend by name; "" = auto-select
 var g_batch_pin = ""                // hybrid: donor backend for the BATCH-shaped slots; "" = whole-backend
 var g_active_batch_backend = ""     // == g_active_backend unless a batch pin overrode the batch slots
@@ -609,6 +623,12 @@ def repack_mx4_identity(var np : uint8?; var ep : uint8?; n, d : int64) {}
 def private no_backend() {
     panic("dasLLAMA: no Q8·Q8 kernel backend registered — require dasllama/dasllama_math_default")
 }
+def private backend_always_available() : bool => true
+def private q8_layout_grp4() : int => 4
+
+//! The Q8 interleave (mr) of the ACTIVE backend's weight layout — cached at activation from
+//! KernelBackend.q8_layout (4 for every hand tier; the stamped mr on the gen backend).
+def active_q8_layout_mr() : int64 => g_active_q8_layout_mr
 [unused_argument(yp, wp, sp, xqp, xsp, n, d)]
 def private q8q8_unset_kernel(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n, d : int64) { no_backend() }
 [unused_argument(yp, wp, sp, xqp, xsp, n, d, ntok)]
@@ -654,6 +674,7 @@ def private activate(be : KernelBackend) {
     g_active_needs_repack = be.needs_repack
     g_active_mx4_expand_interleaved = be.mx4_expand_interleaved
     g_active_mx4_native_batch = be.mx4_native_batch
+    g_active_q8_layout_mr = int64(invoke(be.q8_layout))
     g_active_batch_backend = be.name
     // a standing batch pin survives re-activation (auto-select, load-time select, explicit select)
     if (g_batch_pin != "") {
@@ -710,6 +731,10 @@ def pin_kernel_backend(name : string) {
         to_log(LOG_WARNING, "dasLLAMA: pin_kernel_backend('{name}') — no such backend registered; keeping '{g_active_backend}'\n")
         return
     }
+    if (!invoke(g_kernel_backends[name].available)) {
+        to_log(LOG_WARNING, "dasLLAMA: pin_kernel_backend('{name}') — backend reports itself unavailable in this configuration (stamped layout mismatch?); keeping '{g_active_backend}'\n")
+        return
+    }
     g_backend_pin = name
     select_kernel_backend(name)
 }
@@ -747,7 +772,7 @@ def select_matmul_backend_for_load() : bool {
     var best = ""
     var bestpri = -1
     for (be in values(g_kernel_backends)) {
-        if (be.priority > bestpri) {
+        if (be.priority > bestpri && invoke(be.available)) {
             bestpri = be.priority
             best = be.name
         }
