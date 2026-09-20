@@ -97,9 +97,20 @@ class public Attributes {
     alwaysinline : LLVMOpaqueAttributeRef?
     noinline : LLVMOpaqueAttributeRef?
     hot : LLVMOpaqueAttributeRef?
+    cold : LLVMOpaqueAttributeRef?
+    mustprogress : LLVMOpaqueAttributeRef?
+    minsize : LLVMOpaqueAttributeRef?
+    nofree : LLVMOpaqueAttributeRef?
+    norecurse : LLVMOpaqueAttributeRef?
     noalias : LLVMOpaqueAttributeRef?
     sext : LLVMOpaqueAttributeRef?
     zext : LLVMOpaqueAttributeRef?
+    // memory(inaccessiblemem: readwrite) — for allocator-style runtime calls
+    // LLVM 22 IRMemLocation layout: ArgMem=0(bits 0-1), InaccessibleMem=1(bits 2-3), each ModRef=3 → 3<<2=12
+    memory_inaccessible_rw : LLVMOpaqueAttributeRef?
+    // memory(argmem: readwrite, inaccessiblemem: readwrite) — for deallocator-style runtime calls
+    // 3 | (3 << 2) = 15
+    memory_arg_inaccessible_rw : LLVMOpaqueAttributeRef?
 
     def Attributes(ctx : LLVMContextRef) {
         noreturn = ctx |> LLVMGetEnumAttribute("noreturn")
@@ -111,9 +122,17 @@ class public Attributes {
         alwaysinline = ctx |> LLVMGetEnumAttribute("alwaysinline")
         noinline = ctx |> LLVMGetEnumAttribute("noinline")
         hot = ctx |> LLVMGetEnumAttribute("hot")
+        cold = ctx |> LLVMGetEnumAttribute("cold")
+        mustprogress = ctx |> LLVMGetEnumAttribute("mustprogress")
+        minsize = ctx |> LLVMGetEnumAttribute("minsize")
+        nofree = ctx |> LLVMGetEnumAttribute("nofree")
+        norecurse = ctx |> LLVMGetEnumAttribute("norecurse")
         noalias = ctx |> LLVMGetEnumAttribute("noalias")
         sext = ctx |> LLVMGetEnumAttribute("signext")
         zext = ctx |> LLVMGetEnumAttribute("zeroext")
+        let memory_kind = LLVMGetEnumAttributeKindForName("memory")
+        memory_inaccessible_rw = LLVMCreateEnumAttribute(ctx, memory_kind, 12ul)
+        memory_arg_inaccessible_rw = LLVMCreateEnumAttribute(ctx, memory_kind, 15ul)
     }
 
 }
@@ -337,6 +356,10 @@ def public init_jit(cg_opt_level : uint) {
     assume nounwind = attrs.nounwind
     assume willreturn = attrs.willreturn
     assume nocapture = attrs.nocapture
+    assume cold = attrs.cold
+    assume nofree = attrs.nofree
+    assume memory_inaccessible_rw = attrs.memory_inaccessible_rw
+    assume memory_arg_inaccessible_rw = attrs.memory_arg_inaccessible_rw
     build_jit_types()
 
     // add default functions
@@ -345,6 +368,10 @@ def public init_jit(cg_opt_level : uint) {
             fixed_array<LLVMTypeRef>(g_prim_t.get_type_string(), g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType())))
     LLVMAddGlobalMapping(g_engine, jit_exception, get_jit_exception())
     LLVMAddAttributeToFunction(jit_exception, noreturn)
+    // 'cold' tells opt that any branch ending in a jit_exception call is
+    // unlikely (panic/assert paths). Pairs with noreturn so block-placement
+    // sinks the failure block and keeps the hot path straight.
+    LLVMAddAttributeToFunction(jit_exception, cold)
     LLVMAddAttributeToFunctionArgumentRange(jit_exception, urange(0, 2), nocapture)
     // jit_call_or_fastcall(func,args *,context *)
     var jit_call_or_fastcall = LLVMAddFunctionWithType(g_mod, FN_JIT_CALL_OR_FASTCALL,
@@ -405,21 +432,21 @@ def public init_jit(cg_opt_level : uint) {
         LLVMFunctionType(g_prim_t.LLVMVoidPtrType(),
             fixed_array<LLVMTypeRef>(g_prim_t.t_int32, g_prim_t.LLVMVoidPtrType())))
     LLVMAddGlobalMapping(g_engine, jit_alloc_heap, get_jit_alloc_heap())
-    LLVMAddAttributesToFunction(jit_alloc_heap, fixed_array(nounwind, willreturn))
+    LLVMAddAttributesToFunction(jit_alloc_heap, fixed_array(nounwind, willreturn, nofree, memory_inaccessible_rw))
     LLVMAddAttributeToFunctionArgument(jit_alloc_heap, 1u, nocapture)
     // jit_alloc_persistent ( uint64_t mnh, context * )
     var jit_alloc_persistent = LLVMAddFunctionWithType(g_mod, FN_JIT_ALLOC_PERSISTENT,
         LLVMFunctionType(g_prim_t.LLVMVoidPtrType(),
             fixed_array<LLVMTypeRef>(g_prim_t.t_int32, g_prim_t.LLVMVoidPtrType())))
     LLVMAddGlobalMapping(g_engine, jit_alloc_persistent, get_jit_alloc_persistent())
-    LLVMAddAttributesToFunction(jit_alloc_persistent, fixed_array(nounwind, willreturn))
+    LLVMAddAttributesToFunction(jit_alloc_persistent, fixed_array(nounwind, willreturn, nofree, memory_inaccessible_rw))
     LLVMAddAttributeToFunctionArgument(jit_alloc_persistent, 1u, nocapture)
     // void jit_free_heap ( void * bytes, uint32_t size, Context * context )
     var jit_free_heap = LLVMAddFunctionWithType(g_mod, FN_JIT_FREE_HEAP,
         LLVMFunctionType(g_prim_t.LLVMVoidPtrType(),
             fixed_array<LLVMTypeRef>(g_prim_t.LLVMVoidPtrType(), g_prim_t.t_int32, g_prim_t.LLVMVoidPtrType())))
     LLVMAddGlobalMapping(g_engine, jit_free_heap, get_jit_free_heap())
-    LLVMAddAttributesToFunction(jit_free_heap, fixed_array(nounwind, willreturn))
+    LLVMAddAttributesToFunction(jit_free_heap, fixed_array(nounwind, willreturn, memory_arg_inaccessible_rw))
     LLVMAddAttributeToFunctionArgument(jit_free_heap, 0u, nocapture)
     LLVMAddAttributeToFunctionArgument(jit_free_heap, 2u, nocapture)
     // void jit_free_persistent ( void * bytes, Context * context )
@@ -427,7 +454,7 @@ def public init_jit(cg_opt_level : uint) {
         LLVMFunctionType(g_prim_t.LLVMVoidPtrType(),
             fixed_array<LLVMTypeRef>(g_prim_t.LLVMVoidPtrType(), g_prim_t.LLVMVoidPtrType())))
     LLVMAddGlobalMapping(g_engine, jit_free_persistent, get_jit_free_persistent())
-    LLVMAddAttributesToFunction(jit_free_persistent, fixed_array(nounwind, willreturn))
+    LLVMAddAttributesToFunction(jit_free_persistent, fixed_array(nounwind, willreturn, memory_arg_inaccessible_rw))
     LLVMAddAttributeToFunctionArgumentRange(jit_free_persistent, urange(0, 2), nocapture)
     // void jit_array_lock ( Array & array, Context * context )
     var jit_array_lock = LLVMAddFunctionWithType(g_mod, FN_JIT_ARRAY_LOCK,
