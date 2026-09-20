@@ -1052,6 +1052,7 @@ if(NOT ${DAS_AOT_EXAMPLES_DISABLED})
         daslib/regex_boost.das
         daslib/regex.das
         daslib/strings_boost.das
+        daslib/strings_convert.das
         daslib/templates_boost.das
         daslib/utf8_utils.das
     )
@@ -1485,6 +1486,33 @@ install(FILES ${PROJECT_SOURCE_DIR}/utils/benchctl/README.md DESTINATION utils/b
 # Install lint (unified linter)
 install(FILES ${PROJECT_SOURCE_DIR}/utils/lint/main.das DESTINATION utils/lint)
 
+# Install detect-dupe (cross-file duplicate-function detector)
+file(GLOB DAS_DETECT_DUPE_FILES ${PROJECT_SOURCE_DIR}/utils/detect-dupe/*.das)
+install(FILES ${DAS_DETECT_DUPE_FILES} DESTINATION utils/detect-dupe)
+install(FILES
+    ${PROJECT_SOURCE_DIR}/utils/detect-dupe/README.md
+    DESTINATION utils/detect-dupe
+)
+install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/detect-dupe/fixture/
+    DESTINATION utils/detect-dupe/fixture
+    FILES_MATCHING PATTERN "*.das"
+)
+
+# Install find-dupe (AI judge for detect-dupe clusters via das-claude).
+# Not built into all_utils_exe — it depends on the das-claude daspkg
+# package fetched at runtime, which isn't available at build time.
+file(GLOB DAS_FIND_DUPE_FILES ${PROJECT_SOURCE_DIR}/utils/find-dupe/*.das)
+install(FILES ${DAS_FIND_DUPE_FILES} DESTINATION utils/find-dupe)
+install(FILES
+    ${PROJECT_SOURCE_DIR}/utils/find-dupe/README.md
+    ${PROJECT_SOURCE_DIR}/utils/find-dupe/.das_package
+    DESTINATION utils/find-dupe
+)
+install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/find-dupe/tests/
+    DESTINATION utils/find-dupe/tests
+    FILES_MATCHING PATTERN "*.das"
+)
+
 # Install daspkg (package manager)
 file(GLOB DAS_DASPKG_FILES ${PROJECT_SOURCE_DIR}/utils/daspkg/*.das)
 install(FILES ${DAS_DASPKG_FILES} DESTINATION utils/daspkg)
@@ -1664,6 +1692,14 @@ file(GLOB AUDIO_TUTORIAL_SOURCES
 )
 install(FILES ${AUDIO_TUTORIAL_SOURCES}
     DESTINATION ${DAS_INSTALL_TUTORIALSDIR}/dasAudio
+)
+
+# Install dasSQLITE tutorial .das files
+file(GLOB SQL_TUTORIAL_SOURCES
+    ${PROJECT_SOURCE_DIR}/tutorials/sql/*.das
+)
+install(FILES ${SQL_TUTORIAL_SOURCES}
+    DESTINATION ${DAS_INSTALL_TUTORIALSDIR}/sql
 )
 
 # ── Documentation build (optional) ──────────────────────────────────────────

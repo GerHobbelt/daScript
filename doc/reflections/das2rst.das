@@ -11,6 +11,7 @@ require jobque
 require daslib/ast_boost
 require daslib/rst_comment
 require daslib/strings_boost
+require daslib/strings_convert
 require daslib/rst
 require daslib/functional
 require daslib/json
@@ -322,7 +323,7 @@ def document_module_ast(root : string) {
         group_by_regex("Debug info helpers", mod, %regex~(debug_helper_.*)%%),
         group_by_regex("AOT support", mod, %regex~(aot_require|aot_type_ann_get_field_ptr|aot_need_type_info|aot_previsit_get_field_ptr|aot_previsit_get_field|aot_visit_get_field|write_aot_body|write_aot_suffix|write_aot_macro_suffix|write_aot_macro_prefix|macro_aot_infix|getInitSemanticHashWithDep|get_aot_hash_comment)$%%),
         group_by_regex("String builder writer", mod, %regex~(string_builder_str|string_builder_clear)$%%),
-        group_by_regex("GC", mod, %regex~(ast_gc_guard)$%%),
+        group_by_regex("GC", mod, %regex~(ast_gc_guard|verify_typedecl_gc|verify_expression_gc)$%%),
         hide_group(group_by_regex("Internal ast infrastructure", mod, %regex~(builtin_ast_.*)%%))
     )
     documents("AST manipulation library", mod, "ast.rst", groups)
@@ -378,6 +379,13 @@ def document_module_strings_boost(root : string) {
         group_by_regex("Levenshtein distance", mod, %regex~(levenshtein_distance|levenshtein_distance_fast)$%%),
         group_by_regex("Character traits", mod, %regex~(is_hex|is_tab_or_space)$%%))
     document("Boost package for string manipulation library", mod, "strings_boost.rst", groups)
+}
+
+def document_module_strings_convert(root : string) {
+    var mod = find_module("strings_convert")
+    var groups <- array<DocGroup>(
+        group_by_regex("Soft-failing conversions", mod, %regex~try_to_(int|uint|int8|uint8|int16|uint16|int64|uint64|float|double)$%%))
+    document("Soft-failing string-to-numeric conversions returning Result<T; ConversionError>", mod, "strings_convert.rst", groups)
 }
 
 
@@ -532,7 +540,7 @@ def document_module_option(root : string) {
         group_by_regex("Constructors",  mod, %regex~(some|move_some|none)$%%),
         group_by_regex("Queries",       mod, %regex~(is_some|is_none)$%%),
         group_by_regex("Transforming",  mod, %regex~(map|and_then|filter|or_else|or_value)$%%),
-        group_by_regex("Extraction",    mod, %regex~(unwrap|unwrap_or|unwrap_or_else|unwrap_or_default|expect_value)$%%),
+        group_by_regex("Extraction",    mod, %regex~(unwrap|unwrap_or|unwrap_or_else|unwrap_or_default|expect_value|move_unwrap)$%%),
         group_by_regex("Side effects",  mod, %regex~(if_some|if_none)$%%),
         group_by_regex("Pairing",       mod, %regex~(zip)$%%),
         group_by_regex("Operators",     mod, %regex~(==|!=|\?\?)$%%)
@@ -546,7 +554,7 @@ def document_module_result(root : string) {
         group_by_regex("Constructors",  mod, %regex~(ok|err|move_ok|move_err)$%%),
         group_by_regex("Queries",       mod, %regex~(is_ok|is_err)$%%),
         group_by_regex("Transforming",  mod, %regex~(map|map_err|and_then|or_else)$%%),
-        group_by_regex("Extraction",    mod, %regex~(unwrap|unwrap_or|unwrap_or_else|unwrap_or_default|unwrap_err|expect_value|expect_err)$%%),
+        group_by_regex("Extraction",    mod, %regex~(unwrap|unwrap_or|unwrap_or_else|unwrap_or_default|unwrap_err|expect_value|expect_err|move_unwrap|move_unwrap_err)$%%),
         group_by_regex("Side effects",  mod, %regex~(if_ok|if_err)$%%),
         group_by_regex("Bridges to Option", mod, %regex~(to_option|err_to_option)$%%),
         group_by_regex("Operators",     mod, %regex~(==|!=|\?\?)$%%)
@@ -1653,6 +1661,7 @@ def main {
     document_module_stbimage_ttf(root)
     document_module_stringify(root)
     document_module_strings_boost(root)
+    document_module_strings_convert(root)
     document_module_temp_strings(root)
     document_module_templates_boost(root)
     document_module_templates(root)

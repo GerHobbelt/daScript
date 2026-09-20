@@ -291,6 +291,29 @@ Run any tutorial from the project root::
    tutorials/sql_01_hello.rst
    tutorials/sql_02_insert_data.rst
    tutorials/sql_03_last_row_id.rst
+   tutorials/sql_04_select_all.rst
+   tutorials/sql_05_parametrized.rst
+   tutorials/sql_06_error_handling.rst
+   tutorials/sql_07_anatomy.rst
+   tutorials/sql_08_where.rst
+   tutorials/sql_09_select.rst
+   tutorials/sql_10_order_by.rst
+   tutorials/sql_11_take_skip.rst
+   tutorials/sql_12_distinct.rst
+   tutorials/sql_12b_set_ops.rst
+   tutorials/sql_13_aggregates.rst
+   tutorials/sql_14_group_by.rst
+   tutorials/sql_15_join.rst
+   tutorials/sql_16_left_join.rst
+   tutorials/sql_17_subqueries.rst
+   tutorials/sql_18_null_handling.rst
+   tutorials/sql_19_update.rst
+   tutorials/sql_20_delete.rst
+   tutorials/sql_21_upsert.rst
+   tutorials/sql_22_transactions.rst
+   tutorials/sql_23_foreign_keys.rst
+   tutorials/sql_24_indexes.rst
+   tutorials/sql_25_defaults_computed.rst
 
 .. _tutorials_dasaudio:
 

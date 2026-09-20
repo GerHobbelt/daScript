@@ -93,6 +93,7 @@ Task-specific instructions are split into skill files under `skills/`. You MUST 
 | `skills/das_formatting.md` | Creating or modifying any `.das` file (tutorials, tests, daslib modules, utilities) |
 | `skills/writing_tests.md` | Writing or editing test files under `tests/` |
 | `skills/documentation_rst.md` | Editing RST files in `doc/source/`, editing `//!` doc-comments in `daslib/*.das`, writing tutorial RST pages |
+| `skills/tutorials.md` | Creating, moving, or restructuring tutorial `.das` files. **Always check before editing anything that looks like a tutorial** — tutorials live under `/tutorials/<area>/`, NEVER inside `modules/<X>/tutorial/` (which holds inherited examples) |
 | `skills/cpp_integration.md` | Writing or editing C++ files in `src/`, `modules/`, or `tutorials/integration/cpp/` |
 | `skills/daslib_modules.md` | Working with `daslib/` modules (linq, json, regex, functional, match, etc.), channels, or extending the standard library |
 | `skills/das_macros.md` | Writing compile-time macros, AST manipulation, qmacro/quote code generation, gc_node AST-pointer patterns |
@@ -112,6 +113,12 @@ Task-specific instructions are split into skill files under `skills/`. You MUST 
 | `skills/strudel_port.md` | Copy-pasting a strudel.cc pattern (user-level live-coding expression) into daslang |
 | `skills/gc_use_after_sweep.md` | Debugging crashes in `TypeDecl`/`Expression` copy-ctors (`bad_alloc`, `length_error`, `basic_string::_M_create`) — gc_node use-after-sweep, `DAS_GC_DEBUG`, `DAS_GC_BREAK_ON_ID`, copy-on-mutate fix pattern |
 | `skills/clargs_migration.md` | Editing any in-tree tool that still calls `get_command_line_arguments()` directly — migrate its argv parsing to `daslib/clargs` in the same PR (`utils/lint`, `utils/aot`, `utils/dasFormatter`, `utils/benchctl`, `utils/mcp`, `utils/daslang-live`, `daslib/debug`, `daslib/ansi_colors`, etc.) |
+| `skills/json.md` | Reading or writing JSON in `.das` code — choosing between `sprint_json`/`sscan_json`, `JV`/`from_JV` from `daslib/json_boost`, custom converters, or manual `JsonValue?` |
+| `skills/xml.md` | Reading, building, querying, or serializing XML via `dasPUGIXML` (`PUGIXML_boost`) — RAII parsing, iteration, `tag`/`attr` builder, XPath, struct↔XML round-trip |
+| `skills/filesystem.md` | Any `.das` code that builds, splits, or normalizes a file path, or touches the filesystem (existence, listing, copy/rename/remove, temp files). **Rule:** path & filename operations MUST use `fio` helpers (`base_name`/`dir_name`/`extension`/`stem`/`path_join`/`normalize`/`is_absolute`/`relative`) — never hand-rolled `rfind`/`slice`/string-interp. Filesystem ops use `fio` / `daslib/fio` (`stat`, `dir_rec`, RAII `fopen`, `_result` variants) |
+| `skills/detect_dupe.md` | Detecting duplicate / near-duplicate functions in repo code — building a corpus, asking "did I just write something that already exists?" during PR authoring/review, or wiring a CI gate. Covers both the MCP tools (`export_corpus`, `detect_duplicates`) and the underlying CLI (`utils/detect-dupe/main.das`). Also read before editing/extending the detect-dupe tool itself (adding a pattern matcher, extending the canonicalizer, wiring new MCP parameters) |
+| `skills/find_dupe.md` | AI-judging a detect-dupe report — turning a noisy clusters JSON into actionable real/partial/false-positive verdicts via Claude (`utils/find-dupe/`). Read before invoking the `judge_duplicates` or `find_dupe` MCP tools, before running the CLI on a fresh repo, or when wiring the daspkg `anthropic/anthropic` install. Also covers cost guardrails (`--dry-run`, `--max-clusters`, `--positives-only`) |
+| `skills/linq.md` | Any `.das` code that filters, maps, sorts, groups, aggregates, or otherwise transforms a sequence into another sequence, array, or table. **Preference order:** comprehension (`[for (x in src); expr; where cond]`) when one expression covers the whole transformation → LINQ (`daslib/linq_boost` shorthand `_select` / `_where` / `_to_array`, or pipe-form `arr \|> where_(...) \|> ...`) for chains, lazy iterators, set ops, joins, aggregations → plain `for` loop for side-effecting iteration. **Do not use `daslib/functional`** (`map` / `filter` / `each` / `to_array`) for new code — older surface, less integrated. |
 
 Multiple skill files may apply to a single task. For example, creating a new daslib module requires reading `skills/das_formatting.md`, `skills/daslib_modules.md`, and possibly `skills/documentation_rst.md`.
 
@@ -286,8 +293,12 @@ This is the post-migration state. If you find yourself reading older guidance ab
 - **`is`/`as` on handled types checks EXACT type**, not C++ inheritance — `expr is ExprField` is `false` when `expr` is `ExprSafeField`. `as` on wrong type crashes. Must handle each concrete type explicitly.
 - `#pragma optimize` in AOT-generated code must be wrapped in `#ifdef _MSC_VER` — Clang warns on unknown pragmas
 - **Macro-generated struct variables** need `default<$t(st)>` initialization (not `var x : $t(st)`) — avoids "uninitialized variable" errors for structs without field defaults
-- `print` should not be used in `tests` and in `daslib` folders. `to_log(LOG_INFO)` (or
-other level) should be used instead.
+- `print` should not be used in `tests`, `daslib`, or `utils` folders. `to_log(LOG_INFO)` (or
+other level) should be used instead. CI pipes `to_log` through the same stdout the user
+sees, so there is no behavior loss — the win is consistent log levels (`LOG_INFO`,
+`LOG_WARNING`, `LOG_ERROR`) and the ability to filter / route output later. See
+`utils/detect-dupe/main.das` for the canonical pattern (zero `print()` calls; everything
+flows through `to_log`).
 
 
 ### Code style — prefer idiomatic forms
@@ -305,6 +316,9 @@ other level) should be used instead.
 | `var inscope r <- expr; return <- r` | `return <- expr` | direct return avoids intermediate |
 | `unsafe { (reinterpret<ExprBlock?> blk).list }` | `blk.list` | AST pointers auto-dereference |
 | `unsafe(reinterpret<T?> x)` | make param `var` + plain `x` | `var` param gives non-const access, no reinterpret needed |
+| `let i = max(rfind(p, "/"), rfind(p, "\\")); slice(p, i+1)` | `base_name(p)` | `fio.base_name` is cross-platform; manual `rfind` misses Windows separators or trailing slashes |
+| `slice(p, 0, max(rfind(p, "/"), rfind(p, "\\")))` | `dir_name(p)` | same — use `fio.dir_name`/`parent`, never hand-roll directory splitting |
+| `"{a}/{b}"` for file paths | `path_join(a, b)` | handles separator collisions and platform separators |
 
 **Minimize `unsafe`:** Most `unsafe(reinterpret<T?>)` in macro code exists to strip `const` from raw-pointer field access. Fix the root cause: make the function parameter `var` so field access returns non-const pointers. Reserve `unsafe` for genuinely unsafe operations (pointer arithmetic, `reinterpret` across unrelated types).
 
@@ -322,7 +336,9 @@ other level) should be used instead.
 - `modules/` — External plugin modules
 - `modules/dasLiveHost/` — C++ module for live-reload host lifecycle (dynamic module)
 - `utils/daslang-live/` — Live-reloading application host (`daslang-live.exe`)
-- `utils/mcp/` — MCP server for AI coding assistants (30 tools, stdio transport, no extra deps)
+- `utils/mcp/` — MCP server for AI coding assistants (stdio transport, no extra deps)
+- `utils/detect-dupe/` — Cross-file duplicate-function detector — canonicalizer, MinHash, clusterer, pattern filter (also exposed via the `export_corpus` and `detect_duplicates` MCP tools)
+- `utils/find-dupe/` — AI judge for detect-dupe clusters — partitions duplicate suspects into real / partial / false-positive via Claude. Requires `daspkg install --root utils/find-dupe` (anthropic/anthropic) and `ANTHROPIC_API_KEY`. Also exposed via the `judge_duplicates` and `find_dupe` MCP tools
 - `utils/daspkg/` — Package manager (install, update, build, search packages)
 - `examples/daslive/` — Live-reload examples (hello, triangle, tank_game, etc.)
 - `examples/games/` — Full game examples (arcanoid, sequence) — run under daslang-live or daslang
@@ -361,6 +377,10 @@ The daslang MCP server (`utils/mcp/main.das`) exposes compiler diagnostics, prog
 | `outline` | Manually scanning files for function/struct/enum declarations |
 | `aot` | Manually running AOT generation and extracting function C++ |
 | `lint` | Running lint/perf_lint/style_lint manually or requiring the modules for code quality, performance, and style checks |
+| `export_corpus` | Running `detect-dupe --export-functions` from a shell to build a duplicate-detection corpus |
+| `detect_duplicates` | Running `detect-dupe --against` from a shell to ask "did I just write something that already exists?". Wraps B2 mode end-to-end |
+| `judge_duplicates` | Manually invoking `find-dupe` over a `detect-dupe` JSON report. Returns Claude-judged verdicts (real / partial / false_positive) for each cluster. Requires daspkg-installed `anthropic/anthropic` and `ANTHROPIC_API_KEY` |
+| `find_dupe` | One-shot duplicate-finder + judge. Use when starting fresh on a directory or PR; `detect_duplicates` + `judge_duplicates` separately when you already have a curated corpus |
 | `live_launch` | Manually starting `daslang-live.exe` from shell |
 | `live_status` | `curl http://localhost:9090/status` |
 | `live_error` | `curl http://localhost:9090/error` |

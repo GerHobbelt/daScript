@@ -10,6 +10,7 @@ benchdata.db
 # build artifacts
 build/
 build-track/
+build-rwdi/
 # All build binaries stored here
 bin/
 # JIT stores dll's here
@@ -64,6 +65,7 @@ modules/.daspkg_backup/
 modules/.daspkg_cache/
 modules/.daspkg.log
 examples/**/modules/
+utils/**/modules/
 
 # Claude Code (local settings + runtime state)
 .claude/

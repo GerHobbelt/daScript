@@ -128,10 +128,598 @@ Struct-constructor and named-tuple `_select` projections; `_order_by`,
 `_join`, `_left_join`; `_in`, `_not_in`, `_any`, `_none`; the
 panic-free `_try_sql` variant. All planned, none in this PR.
 
+## Shipped — chunk 3: aggregate framework + _try_sql + tuts 5/6/8/9 (branch `dassqlite-chunk3-sql-framework`)
+
+Builds the discriminator infrastructure that aggregates (chunk 4's tut 13)
+will plug into, and ships the `_sql`-side surface for tutorials 5/6/8/9.
+The framework is proven end-to-end by a `_count` canary; chunk 4 broadens
+to `_sum`/`_avg`/`_min`/`_max` plus tutorials 10–13.
+
+### Framework rework — three discriminators in `analyze_chain`
+
+- **`Materializer`** enum threaded through `SqlQuery`:
+  - `Array` — default, returns `array<T>` via `run_select`
+  - `One` — single row, panics on empty (covers `_first`, `count()`)
+  - `OneOpt` — `Option<T>`, none on empty (covers `_first_opt`)
+- **`ProjectionShape`** enum:
+  - `FullRow` — default, `SELECT cols-of(rootT)`
+  - `SingleColumn` — `_select(_.Field)` (chunk 2)
+  - `NamedTuple` — `_select((Name=_.Name, Price=_.Price))` (new)
+  - `Aggregate` — `SELECT COUNT(*)` (canary) — chunk 4 broadens
+- **Function-call dispatch** in `pred_to_sql`: `(name, arity) -> SQL_template`.
+  Chunk 3 entries: `starts_with`/`ends_with`/`contains` (LIKE patterns),
+  `to_lower`/`to_upper` (case folding), `length`, `abs`. Chunk 4 adds
+  date/time + the aggregate row (`sum`, `avg`, etc.).
+
+### New chain operators
+
+- **`_first()`** — terminal. Plain function in `sqlite_linq.das`; recognized
+  in `analyze_chain`; emits ` LIMIT 1` and uses Materializer.One.
+- **`_first_opt()`** — terminal. Plain function in `sqlite_linq.das`; emits
+  ` LIMIT 1` and uses Materializer.OneOpt.
+- **`count()`** (no underscore — `_count` is reserved by linq_boost as a
+  predicate-form macro). Recognized in `analyze_chain`; sets
+  ProjectionShape.Aggregate and Materializer.One. **Canary** for the
+  framework — chunk 4 will land `_sum` / `_avg` / `_min` / `_max` in the
+  same shape.
+
+### `_try_sql(chain)` macro — non-panicking sibling of `_sql`
+
+Shares the analyzer with `_sql` (the visit body is factored into
+`emit_sql_macro_body(prog, call, isTry : bool)`). Difference: emits
+`try_run_*` runtime helpers wrapping the result in `Result<T, string>`
+(or `Result<Option<T>, string>` for OneOpt). Tut 6 demonstrates the full
+matrix.
+
+### Runtime additions in `sqlite_boost.das`
+
+- **`run_select_one` + `try_run_select_one`** — single-row materializer
+  (errors on 0 rows; one row -> T or Result<T,string>).
+- **`run_select_one_opt` + `try_run_select_one_opt`** — single-row Option
+  variant (0 rows = none).
+- **`query_one` + `try_query_one` + `query_one_opt`** — full-row read
+  with positional bind. 0/1/2/3-arg overloads; 4+ positional args is a
+  follow-up. Pattern mirrors chunk-1's `try_query_scalar` — `try_*` does
+  the work and returns `Result<T, string>`; strict panics on err; `_opt`
+  returns `Option<T>`.
+- **`query_scalar` overloads** for `int`, `int64`, `float`, `double`,
+  `bool`. (Chunk 1 shipped `string` only.) Each with `try_*` and `_opt`
+  siblings.
+
+### Deferred to chunk 4
+
+- **Named-tuple bind for `query_one(sql, type<T>, (id=…, name=…))`.**
+  Needs a `[call_macro]` to walk the trailing tuple's `argNames` at
+  compile time and emit unrolled `sqlite3_bind_parameter_index +
+  sqlite_bind` calls. Pattern is the `qmacro_function`-per-instantiation
+  used by chunk-1's `_sql_bind_row` for `[sql_table]` rows. Tut 5 ships
+  positional-bind only this chunk; the named-tuple form is a follow-up.
+- **Struct-type `_select(type<T2>)` projection.** Project a subset of
+  source fields into a different `[sql_table]` struct. Today users can
+  use named-tuple projection (`_select((A=_.A, B=_.B))`) to get the same
+  result with a tuple instead of a struct.
+- **4+ positional args for `query_one`.** Add overloads or a call_macro
+  in chunk 4 if a real use case shows up (rare in practice).
+- **Tutorial 7 ("Anatomy of `_sql`")** is folded into tuts 8/9 inline
+  comments + Appendix C below — no standalone tutorial.
+
 ### Surface in this PR
 
-- **Tutorial 04** is now real (`tutorial/04-select_all.das`) — first end-to-end
-  exposure to `_sql`.
+- **Tutorials 5, 6, 8, 9** under `tutorials/sql/`.
+- **22 new test files** under `tests/dasSQLITE/`:
+  - test_08 / test_09 — `_first`, `_first_opt`
+  - test_10 / test_11 — `query_one` positional (1/2/3-arg)
+  - test_13 — `query_one_opt`
+  - test_15..test_20 — `query_scalar` int/int64/double/bool + `_opt` + `try_*`
+  - test_21 — `_try_sql` (Result/Option/Result<Option> matrix)
+  - test_22 — `_select` named-tuple projection
+  - test_24..test_29 — `_where` operators (starts_with, ends_with,
+    contains, to_lower/to_upper, length, abs)
+  - test_30 / test_31 — `_count` canary (basic + with `_where`)
+- **151 dasSQLITE tests pass** interpreted (81 chunk-2 + 70 chunk-3).
+- AOT path stays green (CMake glob auto-picks new tests; reconfigure
+  required after adding the first new test of a chunk).
+
+## Shipped — chunk 6: write side — UPDATE / DELETE / Transactions (branch `dassqlite-chunk6-update-delete-tx`)
+
+Chunk 6 ships **tutorials 19 (UPDATE), 20 (DELETE), 22 (Transactions)** —
+the write-side counterpart to chunks 2–5's read-side `_sql(...)` flagship.
+Tut 21 (UPSERT) is deferred to chunk 7 because it carries its own
+substantial new surface (the `_excluded` AST sentinel, multi-column
+conflict targets, `@sql_unique` annotation, four "INSERT OR X" variants,
+bulk overload).
+
+### Naming decision (override of the original mockups)
+
+Macro forms use the `_sql_` prefix:
+`_sql_update`, `_sql_try_update`, `_sql_update_returning`,
+`_sql_try_update_returning`, and the parallel `_sql_delete` set.
+The mockups (15-update.das.mockup / 16-delete.das.mockup) had the bare
+`_update` / `_delete` names — overridden during plan walkthrough so that
+SQL provenance stays visible at the call site and there's no name
+collision with hypothetical future non-SQL macros named `_update` /
+`_delete`. Function siblings stay unprefixed (`update`, `delete_`,
+`delete_by_id`, plus the `try_*` variants). RETURNING is macro-only
+in this chunk — `_sql_update_returning` / `_sql_delete_returning`
+(and the `_sql_try_*_returning` non-panic variants) — backed by the
+generic `run_dml_returning` / `try_run_dml_returning` runtime
+helpers; there are no plain `update_returning` / `delete_returning`
+function wrappers.
+
+### New `[sql_table]` generated helpers
+
+- `_sql_update_by_pk_sql(typ : T) : string` —
+  `UPDATE "T" SET "c1"=?, "c2"=?, ... WHERE "pk"=?`. PK-only or PK-less
+  structs emit a stub that panics at call time with a clear message
+  (concept_assert fires unconditionally during structure-macro apply,
+  so a runtime panic is the workable shape).
+- `_sql_delete_by_pk_sql(typ : T) : string` —
+  `DELETE FROM "T" WHERE "pk"=?`.
+- `_sql_bind_row_for_update(stmt, row)` — binds non-PK columns first
+  (positional 1..N), then the PK column at index N+1 — matches the SET-
+  then-WHERE order in the generated SQL.
+- `_sql_bind_row_pk_only(stmt, row)` — binds just the PK column at
+  index 1, used by `delete_(row)` to execute the by-PK DELETE.
+
+### Runtime additions in `sqlite_boost.das`
+
+- **`changes(db) : int`** — wraps `sqlite3_changes`. Used by raw `exec`
+  callers and by tests for "what did the last DML touch".
+- **By-PK mutators:** `update(row)` / `try_update(row)`,
+  `delete_(row)` / `try_delete_(row)`,
+  `delete_by_id(type<T>, id)` / `try_delete_by_id(...)`.
+  All return `int` rows-affected (1 or 0); `try_*` returns
+  `Result<int, string>`.
+- **Generic DML runners:** `try_run_dml` / `run_dml` (returns int),
+  `try_run_dml_returning` / `run_dml_returning` (returns `array<T>`).
+  Used by the `_sql_update` / `_sql_delete` macros — they take a SQL
+  string + bind block + (for RETURNING) a row-builder block.
+- **Transaction suite:**
+  - `enum SqliteTxnMode { Deferred, Immediate, Exclusive }`.
+  - `with_transaction(db, blk)` and
+    `with_transaction(db, mode, blk)` — two distinct overloads (per
+    tut 22 plan; trailing-block convention forbids an optional middle
+    parameter).
+  - `try_transaction(db, blk)` and `try_transaction(db, mode, blk)` —
+    return `SqlError` (`Option<string>`) rather than `Result<void, E>`
+    because daslang's `Result<T, E>` does not yet support `void`
+    payloads. `none = success`; `some(errmsg) = SQL failure at BEGIN
+    or COMMIT`. Block panics still ROLLBACK and re-propagate.
+  - `in_transaction(db) : bool` — wraps the inverse of
+    `sqlite3_get_autocommit`.
+  - **Savepoint nesting:** when entered while already in a
+    transaction, emits `SAVEPOINT das_sp` / `RELEASE das_sp` /
+    `ROLLBACK TO das_sp; RELEASE das_sp` instead of BEGIN/COMMIT/
+    ROLLBACK. SQLite resolves RELEASE / ROLLBACK TO against the
+    most-recent matching savepoint name, so proper LIFO nesting
+    composes correctly without the runner tracking depth itself.
+- **Bulk insert composability fix:** `try_insert(rows : array<T>)`
+  now branches on `in_transaction()` — uses `BEGIN IMMEDIATE` /
+  `COMMIT` when standalone, `SAVEPOINT das_ins_sp` / `RELEASE` when
+  nested inside an outer `with_transaction`. Without this fix SQLite
+  errored "cannot start a transaction within a transaction" when
+  bulk-insert was nested.
+
+### New macros in `sqlite_linq.das`
+
+Eight new `[call_macro]`s — four for UPDATE and four for DELETE.
+Each pair is `_sql_{verb}` / `_sql_try_{verb}` (with optional
+`_returning` suffix for the four RETURNING variants). All eight set
+`canVisitArgument = false` for everything except `db`, so the WHERE /
+SET expressions arrive as raw AST. Analysis runs on the AST shape
+directly: `_.Col` references → SQL column refs, captured locals /
+literals → `?` placeholders + bind expressions. Bind ordering is SET
+binds first, then WHERE binds (matches placeholder order in
+`UPDATE ... SET ... WHERE ...`).
+
+The named-tuple SET clause `(Col1=val1, Col2=val2)` carries its
+column names in `ExprMakeTuple.recordNames`, populated by the parser
+(no type inference required). Chunk 6 also exposes `recordNames` to
+daslang reflection via a one-line C++ change in
+`module_builtin_ast_annotations_2.cpp` so the macro can read it
+directly without forcing premature type inference on the SET arg.
+
+### Tutorials
+
+- [tutorials/sql/19-update.das](../../tutorials/sql/19-update.das) — by-PK,
+  bulk macro, RETURNING, raw escape hatch, try_ variants.
+- [tutorials/sql/20-delete.das](../../tutorials/sql/20-delete.das) — by-PK
+  via `delete_(row)` / `delete_by_id`, bulk macro, RETURNING, raw escape
+  hatch, try_ variants.
+- [tutorials/sql/22-transactions.das](../../tutorials/sql/22-transactions.das)
+  — 2-arg / 3-arg `with_transaction`, savepoint nesting,
+  `in_transaction()`, `try_transaction`.
+
+### Tests
+
+9 new test files: `test_43_update_by_pk.das`, `test_44_update_bulk.das`,
+`test_45_update_returning.das`, `test_46_delete_by_pk.das`,
+`test_47_delete_bulk.das`, `test_48_delete_returning.das`,
+`test_49_changes.das`, `test_50_with_transaction.das`,
+`test_51_try_transaction.das`. Plus `failed_sql_update_delete.das` for
+malformed-call diagnostics. Total dasSQLITE suite: **271 tests passing**
+(238 pre-chunk-6 + 33 new).
+
+### Deferred to chunk 7+
+
+- **`exec` parameter binding** — `db |> exec(sql, args...)` doesn't
+  exist; users must inline values into the SQL string for raw escape
+  hatch with dynamic data, or stick to the macro forms. Adding
+  parameterized `exec` is a small follow-up that mirrors `query_one`'s
+  variadic shape.
+- **Optimistic concurrency** (`@sql_concurrency_token`) — open question
+  in API_MISSING § 15; defer until a real ask.
+- **Multi-table DELETE** (PG `DELETE … USING` / MySQL JOIN-DELETE) —
+  dialect-divergent, deliberately skipped per API_MISSING § 16.
+- **Projection-side `_select` after `_sql_update_returning`** — for
+  RETURNING column projection, post-process the result with a chain
+  `|> _select(...)` instead of inventing a `update_returning_select`.
+
+## Shipped — chunk 7: UPSERT + schema annotations (branch `dassqlite-chunk7-upsert-schema`)
+
+Chunk 7 ships **tutorials 21 (UPSERT), 23 (foreign keys), 24 (indexes),
+25 (defaults + computed columns)**. UPSERT was deferred from chunk 6
+because it carries its own substantial macro surface; the three schema
+tutorials were already at the front of "Part 5 — schema richness" in the
+plan and naturally co-shipped because the upsert composite-conflict path
+needs `[sql_index(unique = true, ...)]` from tut 24.
+
+### UPSERT macros (`sqlite_linq.das`)
+
+- `_sql_upsert(row, on_conflict, do_update)` — INSERT … ON CONFLICT …
+  DO UPDATE SET …, returns rows-affected `int`.
+- `_sql_try_upsert(...)` — same, returns `Result<int, string>`.
+- `_sql_upsert_returning(...)` / `_sql_try_upsert_returning(...)` —
+  capture the post-merge row(s) as `array<T>` (always one row in
+  practice; the array shape mirrors `_sql_update_returning`).
+- `on_conflict` accepts `_.Col` (single) or `tuple(_.A, _.B, ...)`
+  (composite); validated against the struct's fields at macro-expansion.
+- `do_update` is a named-tuple `(Col = expr, ...)`. `_` is the existing
+  row; `_excluded` is the proposed-row sentinel (added to `pred_to_sql`
+  via the new `SqlQuery.upsertMode` flag). Computed columns and unknown
+  column names are rejected with macro_error; duplicate column names too.
+- Arithmetic operators (`+ - * / %`) added to `pred_to_sql` so the do-
+  update SET clause can express `Hits = _.Hits + 1`.
+
+### Plain "INSERT OR X" functions (`sqlite_boost.das`)
+
+- `insert_or_ignore(row)` / `insert_or_ignore(rows)` — single + bulk;
+  `try_` siblings return `Result<int, string>`.
+- `insert_or_replace(row)` / `insert_or_replace(rows)` — same fan-out.
+- All implemented via runtime substitution of `OR IGNORE` / `OR
+  REPLACE` against the existing `_sql_insert_with_pk_sql` /
+  `_sql_insert_no_pk_sql` strings — no new generated helpers needed.
+
+### Schema annotations on `[sql_table]` (`sqlite_boost.das`)
+
+Per-field decorators (every `@xxx = value` is a separate scalar line):
+
+- **`@sql_unique`** — single-column UNIQUE in the column DDL.
+- **`@sql_default_fn = "FN"`** — whitelisted SQL built-ins
+  (`CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`); emits
+  ` DEFAULT FN`.
+- **Native field initializer for literal defaults** — `Active : bool =
+  true` becomes ` DEFAULT 1`. Supported literals: bool / int / int64 /
+  float / double / string. Non-literal initializers are silently dropped
+  from the DDL but still construct in daslang.
+- **`@sql_computed = "expression"`** — generated column. Default storage
+  VIRTUAL; add **`@sql_stored = true`** for STORED. Computed columns are
+  excluded from INSERT and UPDATE bind paths automatically; SELECT reads
+  them as ordinary columns.
+- **`@sql_references = "Parent"`** + optional **`@sql_on_delete`** /
+  **`@sql_on_update`** — one of `cascade` / `set_null` / `set_default` /
+  `restrict` / `no_action`. Resolves the parent struct's table name and
+  PK column at macro-expansion. `with_sqlite` enables `PRAGMA
+  foreign_keys = ON` so the constraints actually fire.
+
+Validation rules enforced at `[sql_table]` apply (each emits
+`error[30111]`):
+
+- `@sql_primary_key` ≠ `@sql_computed` (SQLite rejects PK on a generated
+  column).
+- `@sql_computed` ≠ field initializer (the SQL expression provides the
+  value).
+- `@sql_computed` ≠ `@sql_default_fn`.
+- field initializer ≠ `@sql_default_fn` (pick one).
+- `@sql_default_fn` value must be in the whitelist.
+- `@sql_on_delete` / `@sql_on_update` value must be in the whitelist.
+- `@sql_on_delete` / `@sql_on_update` without `@sql_references`.
+- `on_delete = "set_null"` requires `Option<T>` column.
+- `on_delete = "set_default"` requires a field initializer or
+  `@sql_default_fn`.
+- `@sql_references` referencing a struct that doesn't exist or has no
+  `@sql_primary_key`.
+
+### `[sql_index]` sibling annotation
+
+- Shape: `[sql_table(name = "..."), sql_index(fields = ..., unique =
+  ..., name = ...)]` (must live in the same bracket as `[sql_table]`,
+  comma-separated, with `[sql_table]` first).
+- `fields` accepts a single string or a tuple of strings. `unique`
+  defaults to `false`. `name` defaults to `idx_<table>_<col1>_<col2>`.
+- `[sql_index]` rewrites the `_sql_create_indexes_sql` helper that
+  `[sql_table]` emits (per Boris's body-rewrite suggestion) — each
+  `[sql_index].apply()` parses the const-string return of the existing
+  helper, appends a new `CREATE INDEX` statement, and replaces the
+  body. This forces source order: `[sql_table]` must precede every
+  `[sql_index]` because the body-rewrite needs the helper to already
+  exist.
+- Unknown field names and missing `fields=` are rejected with
+  `error[30111]`.
+
+### Tutorials
+
+- [tutorials/sql/21-upsert.das](../../tutorials/sql/21-upsert.das) —
+  `insert_or_ignore` / `_or_replace`, single + composite `_sql_upsert`,
+  `_sql_upsert_returning`, `_sql_try_upsert`.
+- [tutorials/sql/23-foreign_keys.das](../../tutorials/sql/23-foreign_keys.das)
+  — CASCADE delete, SET NULL with `Option<T>`, FK violation through
+  `try_insert`.
+- [tutorials/sql/24-indexes.das](../../tutorials/sql/24-indexes.das) —
+  unique + composite + named indexes, query-side transparency, UNIQUE
+  violation through `try_insert`.
+- [tutorials/sql/25-defaults_computed.das](../../tutorials/sql/25-defaults_computed.das)
+  — native init defaults, `@sql_default_fn`, VIRTUAL + STORED computed
+  columns.
+
+### Tests
+
+9 new test files: `test_52_insert_or_ignore.das`,
+`test_53_insert_or_replace.das`, `test_54_upsert_single_col.das`,
+`test_55_upsert_composite.das`, `test_56_upsert_returning.das`,
+`test_57_sql_unique.das`, `test_58_sql_references.das`,
+`test_59_sql_index.das`, `test_60_defaults_computed.das`. Plus three
+new failed-test files: `failed_sql_table_schema.das` (12 [sql_table]
+validation rules), `failed_sql_index.das` (4 [sql_index] validation
+rules), `failed_sql_upsert.das` (10 _sql_upsert macro_errors). Total
+dasSQLITE suite: **309 tests passing** (271 pre-chunk-7 + 38 new).
+
+### Deferred to chunk 8+
+
+- **Bulk `array<T>` upsert** — `_sql_upsert` rejects `array<T>` as the
+  row argument with macro_error; pass single rows in a transaction loop
+  for now. Adding the bulk overload is straightforward but each row
+  needs its own bind cycle plus the same SQL prepared statement reused.
+- **Composite foreign keys** — `@sql_references` resolves a single PK
+  column. Composite PK targets would need a `fields = ("A", "B")`
+  syntax extension. Rare in greenfield SQLite designs.
+- **Partial / expression indexes** — SQLite supports `CREATE INDEX …
+  WHERE …` and `CREATE INDEX … ON T(lower(Email))`. Both are SQLite-
+  specific; users needing them run raw `db |> exec("CREATE INDEX …")`.
+- **Function-reference form for `@sql_computed`** — current shape passes
+  the SQL expression as a string; SQLite validates at CREATE TABLE
+  time. The principled long-term shape uses `@sql_computed(func =
+  @@compute_total)` so a regular daslang function with daslang
+  compile-time validation provides the expression. Punted; SQLite's
+  runtime error message is actionable enough as MVP.
+- **DEFAULT-firing from the macro INSERT path** — the macro INSERT
+  always names every non-computed column, so the SQL DEFAULT clause
+  only fires from raw `exec`. Detecting "user wants the default" from
+  a struct field value is fragile (zero-detection) or verbose (explicit
+  field list). Raw SQL is the escape hatch.
+- **Pre-existing duplicate cleanup pass** — `detect_duplicates` over
+  `sqlite_boost.das` + `sqlite_linq.das` flagged five real merge
+  candidates carried over from chunks 3 / 6, none of which are chunk-7
+  surface but all of which would land cleanly together:
+    1. `validate_outer_update_args` (`sqlite_linq.das:3353`) ≡
+       `validate_outer_delete_args` (`:3367`) — exact dupe; differs
+       only in `length(call.arguments) != 4` vs `!= 3` and the arg-
+       name list in the error message. Collapse to
+       `validate_outer_args(prog, call, rootT, expectedArity, sigText)`.
+    2. `make_insert_with_pk_sql_fn` (`sqlite_boost.das:1951`) vs
+       `make_insert_no_pk_sql_fn` (`:1995`) — 0.96 fuzzy. Both emit
+       `INSERT INTO "T" (...) VALUES (?,?,...)`; the only structural
+       difference is whether the PK column is in the column list.
+       Single helper taking an `include_pk : bool`.
+    3. `find_bool_annotation` (`sqlite_boost.das:1353`) ≡
+       `find_string_annotation` (`:1361`) — identical loops differing
+       only in the typed accessor literal (`bValue` vs `sValue`).
+       Generic `find_annotation<T>(args, name, default)`.
+    4. `try_run_dml_returning` (`sqlite_boost.das:1213`) ≡
+       `try_run_select` (`:1270`) — identical bodies. One should
+       call the other (or share a `run_step_collect` helper).
+    5. **12-way `canVisitArgument` cluster** across
+       `Sql{Update,TryUpdate,UpdateReturning,TryUpdateReturning,
+       Delete,TryDelete,DeleteReturning,TryDeleteReturning,
+       Upsert,TryUpsert,UpsertReturning,TryUpsertReturning}Macro` —
+       every override returns `argIndex == 0`. Class-hierarchy
+       fan-out can't share without a parent class. Introduce
+       `class abstract OuterArgZeroMacro : AstCallMacro` (or
+       similar) and re-parent all 12.
+  Cleanup is independent of any new feature work and can be its own
+  small chunk; targeting it together with chunk 7's `bulk array<T>
+  upsert` (`Sql{Upsert,…}Macro` would change anyway) is one
+  reasonable bundle.
+
+## Shipped — chunk 4: read-side depth — distinct/take/skip/order_by/aggregates/group_by/NULL (branch `dassqlite-chunk4-read-depth`)
+
+Chunk 4 broadens the chunk-3 framework with the rest of the read-side
+operators and ships tutorials 7, 10, 11, 12, 13, 14, 18. Set
+operations (UNION/INTERSECT/EXCEPT — tut 12 second half) and joins +
+subqueries (tuts 15–17) are deferred to chunk 5: they all need the
+same multi-source / multi-stage SqlQuery extension.
+
+### New chain operators (all in `analyze_chain` / `pred_to_sql`)
+
+- **`distinct()`** — sets `q.distinctFlag`; emits `SELECT DISTINCT`.
+- **`take(n)` / `skip(n)`** — bind expressions stashed in
+  `q.limitBindExpr` / `q.offsetBindExpr`; pushed *after* WHERE binds
+  in `emit_sql_macro_body`. Solo `skip(n)` emits `LIMIT -1 OFFSET ?`
+  to satisfy SQLite's OFFSET-requires-LIMIT rule. Single-row
+  terminals (`_first` / `_first_opt`) override `take`'s `LIMIT`.
+- **`_order_by(_.Col)` / `_order_by_descending(_.Col)`** — single-key
+  ASC/DESC. Tuple-key form `_order_by((_.k1, _.k2))` emits each
+  tuple field as its own `ORDER BY` column. Recurse-first on the
+  peel so downstream `seenGroupBy` is known when analyzing the key.
+  Mixed ASC/DESC across columns is **deferred** (D2).
+- **`sum` / `average` / `min` / `max`** — terminal column aggregates
+  via `peel_column_aggregate`. Recurse-first: peel the aggregate,
+  let the inner chain populate `selectCols`, then wrap
+  `selectCols[0]` in the SQL aggregate. AVG promotes to `double`;
+  SUM/MIN/MAX inherit the column type. LIMIT 1 suppressed for
+  aggregate Materializer.
+- **`_group_by(_.Col)` / `_group_by((_.k1, _.k2))`** — single- and
+  multi-key grouping via the existing linq.das `group_by_lazy`
+  lowering. Adds `ProjectionShape.GroupedNamedTuple` with parallel
+  `q.groupedSelectExprs` / `q.groupedSelectTypes`. Macro-side
+  recognition of the IGrouping shape: `_._0` for the group key
+  (single-key), `_._0._N` for multi-key, `_._1` for group rows;
+  `_._1 |> length` / `_._1 |> count` → `COUNT(*)` (result type
+  `int` not `int64` — matches daslang's `length`/`count` returns);
+  `_._1 |> select($(u : T) => u.Field) |> sum/average/min/max` →
+  `SUM("Field")` / etc.
+- **`_having(predicate)`** — recurse-first; rejected if
+  `!seenGroupBy` or wrong order. Bind exprs route to
+  `q.havingBindExprs` and slot in between WHERE and LIMIT in the
+  placeholder index sequence.
+- **NULL handling — Option<T> in `_where` predicates:**
+  `_.Col |> is_some` → `Col IS NOT NULL`;
+  `_.Col |> is_none` → `Col IS NULL`;
+  `_.Col |> unwrap_or(default)` → `COALESCE(Col, ?)` (default routed
+  through `pred_to_sql` so both captured locals and literals are
+  emitted as `?` binds — same default-parameterize behavior as the
+  rest of `_where`).
+
+### `[sql_table]` runtime extensions for `Option<T>`
+
+- `is_option_field_type(td)` recognizes both pre-resolution
+  (`Type.typeMacro` with `dimExpr[0]` ExprConstString = "Option")
+  and post-resolution (`Type.tStructure` with module=="option")
+  forms — structure macro runs before the `[template_structure]`
+  expansion, so the typemacro form is what actually shows up.
+- `sqlite_sql_type` / `sqlite_bind` / `sqlite_read` overloads for
+  `$Option<auto(TT)>`. Bind branches on `_has_value` and binds
+  `sqlite3_bind_null` for `none`. Read branches on
+  `sqlite3_column_type == SQLITE_NULL` and wraps in `some(v)` /
+  `none()`.
+- DDL emitter omits `NOT NULL` for `Option<T>` columns; rejects
+  `@sql_primary_key` on `Option<T>` via `errors:=`.
+- `_sql_read_row` body uses `var row = default<$t(st)>` so
+  Option-bearing user structs default-init cleanly under
+  `strict_smart_pointers`.
+
+### IGrouping shape vs the original mockup (locked 2026-04-26)
+
+The original `19-group_by.das.mockup` used aspirational syntax
+(`_count_all()`, `_sum(_.X)`, `_avg(_.X)`) inside the post-group
+`_select`. After `_group_by` lowers to `group_by_lazy`, the chain
+element is `tuple<KeyType; array<RowType>>`, so the next `_select`
+sees `_:tuple<...>` — `_.X` doesn't typecheck (the tuple has
+`_0`/`_1`, not `X`).
+
+Chunk 4 ships the **IGrouping shape** (matches existing
+`tests/linq/test_linq_group_by.das`):
+
+- `_._0` for the group key (single-key), `_._0._N` for multi-key
+- `_._1` for the group element array
+- `_._1 |> length` / `_._1 |> count` → `COUNT(*)`
+- `_._1 |> select($(u : RowType) => u.X) |> sum/average/min/max` →
+  the matching SQL aggregate
+
+The inner `select` lambda parameter is intentionally **named**
+(`$(u : User)` etc.), not `_` — the outer `_select` lambda already
+binds `_` to the group tuple, and daslang flags a same-name-
+different-type lambda nested inside as a shadowing error. Naming
+the inner parameter sidesteps it; the macro recognizes the body as
+`<param>.<field>` for any parameter name. This aligns with EF Core
+/ C# LINQ shape (`g.Key` ↔ `_._0`, `g.Count()` ↔ `_._1 |> length`,
+`g.Average(u => u.Age)` ↔ `_._1 |> select($(u) => u.Age) |> average`).
+
+### Deferred to chunk 5+
+
+- **Set operations (UNION / INTERSECT / EXCEPT)** — tut 12 second
+  half. Single-source `SqlQuery` today; needs `setOpKind` +
+  `setOpRhsQuery` plus the multi-stage emitter. Bundled with joins
+  and subqueries.
+- **`_join` / `_left_join`** (tuts 15-16) — multi-source FROM,
+  equi-join predicate extraction.
+- **Subqueries — `_in` / `_not_in` / `_any` / `_none`** (tut 17) —
+  nested SqlQuery walker, outer-lambda-param classifier for
+  correlated columns, scalar-subquery embedding in predicates.
+- **`_then_by` and multi-key ordering protocol (D1)** — needs an
+  `IOrderedEnumerable<T>`-equivalent in daslib/linq. Chunk-4
+  workaround: tuple-key `_order_by((_.k1, _.k2))` emits each tuple
+  field as its own `ORDER BY` column.
+- **Mixed ASC/DESC across columns (D2)** — `ORDER BY a ASC, b DESC`
+  in one chain step. Possible future syntax: marker-in-tuple
+  `_order_by(@(x) => (x.a, desc(x.b)))`. Out of chunk 4 scope; raw
+  SQL escape hatch handles it today.
+- **`Option<T> == none()` in `_sql` predicates (D4)** — currently
+  not translated. Lock decision (macro_error with fixit vs silent
+  rewrite to `IS NULL`) when a real test forces it; leaning
+  fixit-with-macro_error for explicit-over-magic.
+- **Projection-side `_.Col |> unwrap_or(d)` in `_select`** — the
+  predicate-side rule lands this chunk; the projection-side
+  COALESCE case requires extending `analyze_projection` beyond
+  plain `_.Field` shape and is deferred.
+
+### Surface in this PR
+
+- **Tutorials 7, 10, 11, 12, 13, 14, 18** under `tutorials/sql/`.
+- **6 new test files** under `tests/dasSQLITE/`:
+  - test_32 — `distinct`
+  - test_33 — `take` / `skip`
+  - test_34 — `_order_by` (single-key, descending, tuple-key)
+  - test_35 — column aggregates (sum/average/min/max)
+  - test_36 — `_group_by` + `_having` (single/multi-key, full reporting query)
+  - test_37 — NULL handling (DDL, round-trip, is_some / is_none /
+    unwrap_or in `_where`, full-row Option pass-through)
+- `failed_sql_macro.das` extended with bad10 (`_having` without
+  `_group_by`) and bad11 (bare scalar projection after `_group_by`).
+- **205/205 dasSQLITE tests pass** interpreted; chunk-2 (81),
+  chunk-3 (70), chunk-4 (54). AOT path stays green; lint clean.
+- New RST: `sql_07_anatomy.rst`, `sql_10_order_by.rst`,
+  `sql_11_take_skip.rst`, `sql_12_distinct.rst`,
+  `sql_13_aggregates.rst`, `sql_14_group_by.rst`,
+  `sql_18_null_handling.rst`. Sphinx `-W` clean.
+
+## Appendix C — `_sql` translation boundary (cross-reference for tutorial 7)
+
+What `_sql(chain)` translates and what it refuses, in one place. The
+macro walks the chain bottom-up after Mode-2 expansion has unfolded
+inner call_macros (`_where` → `where_(it, $(_:T) => body)`, etc.).
+
+**Translates:**
+
+- **Chain root:** `select_from(db, type<T>)` where `T` is a `[sql_table]`
+  struct.
+- **Chain operators:** `_to_array()`, `_first()`, `_first_opt()`,
+  `count()` (chunk 3); `_sum`/`_avg`/`_min`/`_max`/`_order_by`/`_take`/
+  `_skip`/`_distinct`/`_group_by`/`_having`/`_join`/`_left_join`/
+  subqueries (chunk 4+).
+- **Projections (`_select`):** `_.Field` (single column),
+  `(Name=_.Name, Price=_.Price)` (named tuple). Struct-type projection
+  is chunk 4.
+- **Predicates (`_where`):** column refs (`_.Field`), captured vars and
+  literals (auto-bound as `?`), comparisons (`==`, `!=`, `<`, `<=`, `>`,
+  `>=`), logic (`&&`, `||`, `!`), and the appendix-A function calls
+  (`starts_with`, `ends_with`, `contains`, `to_lower`, `to_upper`,
+  `length`, `abs`).
+
+**Refuses with a compile-time `macro_error` pointing at the offending
+node:**
+
+- Unknown function calls in `_where` (anything not in the dispatch table).
+- `_select` projections that aren't `_.Field` or named-tuple.
+- Multiple `_select` calls in one chain.
+- Multiple terminals in one chain (`_to_array() |> _first()` etc.).
+
+**Workarounds:**
+
+- Use `db |> exec(sql)` / `try_exec(sql)` for DDL and arbitrary
+  statements that don't fit the chain.
+- Use `db |> query_one(sql, type<T>, args…)` /
+  `db |> query_scalar(sql, type<T>)` for hand-written SELECT statements
+  that return rows.
+- The `_sql_text(chain)` companion macro returns the exact SQL string
+  that `_sql(chain)` would emit (with `?` placeholders) — useful for
+  inspecting generated SQL while debugging.
+
+### Surface in this PR
+
+- **Tutorial 04** is now real (`tutorials/sql/04-select_all.das` — relocated
+  from `modules/dasSQLITE/tutorial/` to the project-wide tutorials home in
+  chunk 2.5) — first end-to-end exposure to `_sql`.
 - **Tests:** `tests/dasSQLITE/test_05_sql_macro.das` (17 execution cases),
   `tests/dasSQLITE/test_06_sql_text.das` (19 SQL-string-emission cases),
   `tests/dasSQLITE/test_07_sql_composability.das` (10 user-wrapper cases),
