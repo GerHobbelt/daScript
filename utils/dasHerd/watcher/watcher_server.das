@@ -1,0 +1,653 @@
+options gen2
+options rtti
+options persistent_heap
+options gc
+options indenting = 4
+options no_unused_function_arguments = false
+options no_unused_block_arguments = false
+
+module watcher_server shared public
+
+require dashv/dashv_boost public
+require ./watcher_core.das public
+require ./repository_core.das public
+require ./file_inspection.das
+require daslib/json_boost
+require daslib/base64
+require strings
+
+let private MAX_REQUEST_BODY_BYTES = 1024 * 1024
+let private CONTROLLER_HEARTBEAT_TIMEOUT_MS = 5000l
+var private g_watcher_gc_requested = false
+
+def public watcher_request_gc() : bool {
+    let coalesced = g_watcher_gc_requested
+    g_watcher_gc_requested = true
+    return coalesced
+}
+
+def public watcher_take_gc_request() : bool {
+    let requested = g_watcher_gc_requested
+    g_watcher_gc_requested = false
+    return requested
+}
+
+def public watcher_reset_gc_request() {
+    g_watcher_gc_requested = false
+}
+
+struct private WatcherWsMessage {
+    op : string
+    session_id : string
+    command_line : string
+    argv : array<string>
+    cwd : string
+    display_name : string
+    kind : string
+    target_id : string
+    repository_id : string
+    repository_path : string
+    worktree_path : string
+    file_path : string
+    comparison : string
+    diff_context : string
+    request_id : int
+    text : string
+    columns : int
+    rows : int
+    timeout_ms : int64
+    control : bool
+    raw : bool
+}
+
+struct public RepositoryFileInspectionMessage {
+    @rename = "type"
+    _type : string = "file_inspection"
+    request_id : int
+    repository_id : string
+    worktree_path : string
+    file_path : string
+    comparison : string
+    diff_context : string
+    task_session_id : string
+    loading : bool
+    patch : string
+    view_text : string
+    view_base64 : string
+    view_byte_count : int
+    status : string
+    error : string
+}
+
+class private WatcherClient {
+    @safe_when_uninitialized
+    channel : WebSocketChannel = default<WebSocketChannel>
+    id : int
+    session_id : string
+    controls : bool
+    last_heartbeat : int64
+    last_update_key : string
+    raw : bool
+    raw_offset : int64
+    repository_revision : int64 = -1l
+    inspection_request_id : int
+    inspection_repository_id : string
+    inspection_worktree_path : string
+    inspection_file_path : string
+    inspection_comparison : string
+    inspection_diff_context : string
+    inspection_session_id : string
+    inspection_expected_exit_code : int64
+    inspection_delivered : bool = true
+}
+
+struct private WatcherOk {
+    ok : bool = true
+}
+
+struct private WatcherError {
+    ok : bool
+    error : string
+}
+
+def private json_error(message : string) : string {
+    return sprint_json(WatcherError(error = message), false)
+}
+
+def private hex_nibble(value : int) : int {
+    if (is_number(value)) return value - '0'
+    if (value >= 'a' && value <= 'f') return value - 'a' + 10
+    if (value >= 'A' && value <= 'F') return value - 'A' + 10
+    return -1
+}
+
+def private percent_decode(value : string) : string {
+    var inscope decoded : array<uint8>
+    decoded |> reserve(length(value))
+    peek_data(value) $(data) {
+        var index = 0
+        while (index < length(value)) {
+            let byte = int(data[index])
+            if (byte == '%' && index + 2 < length(value)) {
+                let high = hex_nibble(int(data[index + 1]))
+                let low = hex_nibble(int(data[index + 2]))
+                if (high >= 0 && low >= 0) {
+                    decoded |> push(uint8((high << 4) | low))
+                    index += 3
+                    continue
+                }
+            }
+            decoded |> push(uint8(byte == '+' ? ' ' : byte))
+            index++
+        }
+    }
+    return string(decoded)
+}
+
+def private query_value(url, key : string) : string {
+    let query = find(url, "?")
+    if (query < 0) return ""
+    let wanted = key + "="
+    let url_length = length(url)
+    var position = query + 1
+    while (position < url_length) {
+        let amp = find(url, "&", position)
+        let end = amp < 0 ? url_length : amp
+        if (starts_with(slice(url, position, end), wanted)) {
+            return percent_decode(slice(url, position + length(wanted), end))
+        }
+        if (amp < 0) break
+        position = amp + 1
+    }
+    return ""
+}
+
+class DasHerdWatcherServer : HvWebServer {
+    token : string
+    control_html : string
+    xterm_js : string
+    xterm_css : string
+    xterm_fit_js : string
+    xterm_unicode_js : string
+    xterm_web_links_js : string
+    clients : array<WatcherClient?>
+    next_client_id : int
+
+    def authorized(url : string) : bool {
+        return !empty(token) && query_value(url, "token") == token
+    }
+
+    def respond_error(var resp : HttpResponse?; status : http_status; message : string) : http_status {
+        return resp |> JSON(json_error(message), status)
+    }
+
+    def require_auth(var req : HttpRequest?; var resp : HttpResponse?) : bool {
+        if (req != null && authorized(string(req.url))) return true
+        let _ = respond_error(resp, http_status.UNAUTHORIZED, "invalid watcher token")
+        return false
+    }
+
+    def override onInit {
+        GET("/") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            return resp |> SERVE_FILE(self.control_html)
+        }
+        GET("/vendor/xterm.js") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            return resp |> SERVE_FILE(self.xterm_js)
+        }
+        GET("/vendor/xterm.css") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            return resp |> SERVE_FILE(self.xterm_css)
+        }
+        GET("/vendor/addon-fit.js") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            return resp |> SERVE_FILE(self.xterm_fit_js)
+        }
+        GET("/vendor/addon-unicode11.js") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            return resp |> SERVE_FILE(self.xterm_unicode_js)
+        }
+        GET("/vendor/addon-web-links.js") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            return resp |> SERVE_FILE(self.xterm_web_links_js)
+        }
+        GET("/api/v1/health") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            return resp |> JSON("\{\"ok\":true,\"service\":\"dasHerd-watcher\"\}", http_status.OK)
+        }
+        GET("/api/v1/sessions") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            return resp |> JSON(watcher_list_json(), http_status.OK)
+        }
+        GET("/api/v1/repositories") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            return resp |> JSON(repository_list_json(), http_status.OK)
+        }
+        POST("/api/v1/gc") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            let coalesced = watcher_request_gc()
+            return resp |> JSON("\{\"ok\":true,\"scheduled\":true,\"coalesced\":{coalesced}\}",
+                http_status.ACCEPTED)
+        }
+        POST("/api/v1/sessions") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            if (req == null || length(req.body) > MAX_REQUEST_BODY_BYTES) {
+                return self.respond_error(resp, http_status.BAD_REQUEST, "request body is too large")
+            }
+            var inscope launch = WatcherLaunchRequest()
+            if (!sscan_json(string(req.body), launch)) {
+                return self.respond_error(resp, http_status.BAD_REQUEST, "invalid launch JSON")
+            }
+            let result = watcher_launch(launch)
+            return resp |> JSON(sprint_json(result, false),
+                result.ok ? http_status.CREATED : http_status.BAD_REQUEST)
+        }
+        POST("/api/v1/repositories") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            if (req == null || length(req.body) > MAX_REQUEST_BODY_BYTES) {
+                return self.respond_error(resp, http_status.BAD_REQUEST, "request body is too large")
+            }
+            var request = RepositoryAddRequest()
+            if (!sscan_json(string(req.body), request)) {
+                return self.respond_error(resp, http_status.BAD_REQUEST, "invalid repository JSON")
+            }
+            let error = repository_add(request)
+            if (!empty(error)) return self.respond_error(resp, http_status.CONFLICT, error)
+            return resp |> JSON(sprint_json(WatcherOk(), false), http_status.CREATED)
+        }
+        POST("/api/v1/repositories/refresh") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            if (req == null || length(req.body) > MAX_REQUEST_BODY_BYTES) {
+                return self.respond_error(resp, http_status.BAD_REQUEST, "request body is too large")
+            }
+            var request = RepositoryRefreshRequest()
+            if (!sscan_json(string(req.body), request)) {
+                return self.respond_error(resp, http_status.BAD_REQUEST, "invalid refresh JSON")
+            }
+            let error = repository_refresh(request.repository_id)
+            if (!empty(error)) return self.respond_error(resp, http_status.CONFLICT, error)
+            return resp |> JSON(sprint_json(WatcherOk(), false), http_status.ACCEPTED)
+        }
+        POST("/api/v1/input") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            if (req == null || length(req.body) > MAX_REQUEST_BODY_BYTES) {
+                return self.respond_error(resp, http_status.BAD_REQUEST, "request body is too large")
+            }
+            var input : WatcherInputRequest
+            if (!sscan_json(string(req.body), input)) {
+                return self.respond_error(resp, http_status.BAD_REQUEST, "invalid input JSON")
+            }
+            let error = watcher_input(input.session_id, input.text)
+            if (!empty(error)) return self.respond_error(resp, http_status.CONFLICT, error)
+            return resp |> JSON(sprint_json(WatcherOk(), false), http_status.OK)
+        }
+        POST("/api/v1/resize") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            if (req == null || length(req.body) > MAX_REQUEST_BODY_BYTES) {
+                return self.respond_error(resp, http_status.BAD_REQUEST, "request body is too large")
+            }
+            var resize : WatcherResizeRequest
+            if (!sscan_json(string(req.body), resize)) {
+                return self.respond_error(resp, http_status.BAD_REQUEST, "invalid resize JSON")
+            }
+            let error = watcher_resize(resize.session_id, resize.columns, resize.rows, 0)
+            if (!empty(error)) return self.respond_error(resp, http_status.CONFLICT, error)
+            return resp |> JSON(sprint_json(WatcherOk(), false), http_status.OK)
+        }
+        POST("/api/v1/terminate") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!self.require_auth(req, resp)) return http_status.UNAUTHORIZED
+            if (req == null || length(req.body) > MAX_REQUEST_BODY_BYTES) {
+                return self.respond_error(resp, http_status.BAD_REQUEST, "request body is too large")
+            }
+            var request : WatcherSessionRequest
+            if (!sscan_json(string(req.body), request)) {
+                return self.respond_error(resp, http_status.BAD_REQUEST, "invalid terminate JSON")
+            }
+            let error = watcher_terminate(request.session_id)
+            if (!empty(error)) return self.respond_error(resp, http_status.CONFLICT, error)
+            return resp |> JSON(sprint_json(WatcherOk(), false), http_status.OK)
+        }
+    }
+
+    def find_client(channel : WebSocketChannel) : int {
+        for (index in range(length(clients))) {
+            if (clients[index] != null && clients[index].channel == channel) return index
+        }
+        return -1
+    }
+
+    def send_error(channel : WebSocketChannel; message : string) {
+        let body = "\{\"type\":\"error\",\"error\":{sprint_json(message, false)}\}"
+        send(channel, body, ws_opcode.WS_OPCODE_TEXT, true)
+    }
+
+    def send_sessions(channel : WebSocketChannel) {
+        send(channel, "\{\"type\":\"sessions\",\"data\":{watcher_list_json()}\}",
+            ws_opcode.WS_OPCODE_TEXT, true)
+    }
+
+    def send_repositories(var client : WatcherClient?; force : bool = false) {
+        if (client == null) return
+        let revision = repository_revision()
+        if (!force && client.repository_revision == revision) return
+        client.repository_revision = revision
+        send(client.channel, "\{\"type\":\"repositories\",\"data\":{repository_list_json()}\}",
+            ws_opcode.WS_OPCODE_TEXT, true)
+    }
+
+    def send_file_inspection(var client : WatcherClient?;
+                             loading : bool; patch, error : string;
+                             view_text : string = ""; status : string = "";
+                             view_base64 : string = "";
+                             view_byte_count : int = 0) {
+        if (client == null) return
+        let message = RepositoryFileInspectionMessage(
+            request_id = client.inspection_request_id,
+            repository_id = client.inspection_repository_id,
+            worktree_path = client.inspection_worktree_path,
+            file_path = client.inspection_file_path,
+            comparison = client.inspection_comparison,
+            diff_context = client.inspection_diff_context,
+            task_session_id = client.inspection_session_id,
+            loading = loading, patch = patch, view_text = view_text,
+            view_base64 = view_base64, view_byte_count = view_byte_count,
+            status = status, error = error)
+        send(client.channel, sprint_json(message, false),
+            ws_opcode.WS_OPCODE_TEXT, true)
+    }
+
+    def start_file_inspection(var client : WatcherClient?;
+                              incoming : WatcherWsMessage const) {
+        if (client == null) return
+        if (!empty(client.inspection_session_id)
+                && watcher_accepts_input(client.inspection_session_id)) {
+            let _ = watcher_terminate(client.inspection_session_id, "superseded")
+        }
+        client.inspection_request_id = incoming.request_id
+        client.inspection_repository_id = incoming.repository_id
+        client.inspection_worktree_path = incoming.worktree_path
+        client.inspection_file_path = incoming.file_path
+        client.inspection_comparison = incoming.comparison
+        client.inspection_diff_context = incoming.diff_context
+        if (empty(client.inspection_diff_context)) {
+            client.inspection_diff_context = "compact"
+        }
+        client.inspection_session_id = ""
+        client.inspection_delivered = true
+
+        var inscope argv : array<string>
+        var expected_exit_code = 0l
+        let command_error = repository_file_diff_argv(
+            incoming.repository_id, incoming.worktree_path,
+            incoming.file_path, incoming.comparison,
+            argv, expected_exit_code, client.inspection_diff_context)
+        if (!empty(command_error)) {
+            self.send_file_inspection(client, false, "", command_error)
+            return
+        }
+        let _pruned = watcher_prune_completed_sessions(
+            "git-file-diff", incoming.repository_id, incoming.worktree_path)
+        var inscope request = WatcherLaunchRequest(
+            cwd = incoming.worktree_path,
+            display_name = "Git diff: {incoming.file_path}",
+            kind = "git-file-diff", target_id = "local",
+            repository_id = incoming.repository_id,
+            worktree_path = incoming.worktree_path,
+            columns = 80, rows = 25, timeout_ms = 15000l)
+        request.argv := argv
+        let result = watcher_launch(request)
+        client.inspection_session_id = result.session_id
+        client.inspection_expected_exit_code = expected_exit_code
+        if (!result.ok) {
+            self.send_file_inspection(client, false, "", result.error)
+            return
+        }
+        client.inspection_delivered = false
+        self.send_file_inspection(client, true, "", "", "",
+            "Computing {client.inspection_diff_context} Git diff (15 second limit)...")
+    }
+
+    def poll_file_inspection(var client : WatcherClient?) {
+        if (client == null || client.inspection_delivered
+                || empty(client.inspection_session_id)) return
+        var info = WatcherSessionInfo()
+        if (!watcher_get_session_info(client.inspection_session_id, info)
+                || !info.drained) return
+        var truncated = false
+        let patch = watcher_machine_output_text(client.inspection_session_id, truncated)
+        let _compacted = watcher_compact_session(client.inspection_session_id, 80, 25)
+        client.inspection_delivered = true
+        if (truncated) {
+            self.send_file_inspection(client, false, "",
+                "diff exceeded the retained machine-output limit")
+        } elif (info.exit_code != client.inspection_expected_exit_code) {
+            self.send_file_inspection(client, false, "",
+                "git diff exited with {info.exit_code}: {patch}")
+        } else {
+            var view_text = ""
+            var view_base64 = ""
+            var view_byte_count = 0
+            if (client.inspection_comparison == "working") {
+                let binary = git_patch_is_binary(patch)
+                var view_error = ""
+                if (binary) {
+                    var inscope bytes : array<uint8>
+                    view_byte_count = 0
+                    view_error = repository_working_file_bytes(
+                        client.inspection_repository_id,
+                        client.inspection_worktree_path,
+                        client.inspection_file_path,
+                        MAX_BINARY_PREVIEW_RAW_BYTES, bytes, view_byte_count)
+                    if (empty(view_error)) {
+                        if (!empty(bytes)) {
+                            view_base64 = base64_encode(bytes)
+                        }
+                    }
+                } else {
+                    view_error = repository_working_file_text(
+                        client.inspection_repository_id,
+                        client.inspection_worktree_path,
+                        client.inspection_file_path, view_text)
+                }
+                if (!empty(view_error)) {
+                    self.send_file_inspection(client, false, "", view_error)
+                    return
+                }
+            }
+            self.send_file_inspection(client, false, patch, "", view_text,
+                "", view_base64, view_byte_count)
+        }
+    }
+
+    def send_snapshot(var client : WatcherClient?; force : bool = false) {
+        if (client == null || empty(client.session_id)) return
+        let update_key = watcher_update_key(client.session_id)
+        if (!force && update_key == client.last_update_key) return
+        let snapshot = watcher_snapshot_json(client.session_id)
+        if (empty(snapshot)) {
+            send_error(client.channel, "unknown session")
+            return
+        }
+        client.last_update_key = update_key
+        send(client.channel, "\{\"type\":\"snapshot\",\"data\":{snapshot}\}",
+            ws_opcode.WS_OPCODE_TEXT, true)
+    }
+
+    def send_raw_output(var client : WatcherClient?) {
+        if (client == null || !client.raw || empty(client.session_id)) return
+        var inscope chunk <- watcher_output_since(client.session_id, client.raw_offset)
+        if (chunk.reset) {
+            let start_offset = chunk.next_offset - int64(length(chunk.bytes))
+            send(client.channel, "\{\"type\":\"raw_reset\",\"offset\":{start_offset}\}",
+                ws_opcode.WS_OPCODE_TEXT, true)
+        }
+        client.raw_offset = chunk.next_offset
+        if (!empty(chunk.bytes)) {
+            unsafe {
+                send(client.channel, reinterpret<string#>(addr(chunk.bytes[0])), length(chunk.bytes),
+                    ws_opcode.WS_OPCODE_BINARY, true)
+            }
+        }
+    }
+
+    def detach(var client : WatcherClient?; detail : string) {
+        if (client == null) return
+        if (client.controls && !empty(client.session_id)) {
+            watcher_release_controller(client.session_id, client.id, detail)
+        }
+        client.session_id = ""
+        client.controls = false
+        client.last_update_key = ""
+        client.raw = false
+        client.raw_offset = 0l
+    }
+
+    def override onWsOpen(channel : WebSocketChannel; url : string#) {
+        if (!authorized(string(url))) {
+            send_error(channel, "invalid watcher token")
+            close(channel)
+            return
+        }
+        next_client_id++
+        clients |> push(new WatcherClient(channel = channel, id = next_client_id,
+            last_heartbeat = ref_time_ticks()))
+        send(channel, "\{\"type\":\"connected\",\"client_id\":{next_client_id}\}",
+            ws_opcode.WS_OPCODE_TEXT, true)
+        send_sessions(channel)
+        send_repositories(clients[length(clients) - 1], true)
+    }
+
+    def override onWsClose(channel : WebSocketChannel) {
+        let index = find_client(channel)
+        if (index < 0) return
+        var client = clients[index]
+        detach(client, "client_closed")
+        clients |> erase(index)
+        unsafe { delete client }
+    }
+
+    def override onWsMessage(channel : WebSocketChannel; message : string#) {
+        let index = find_client(channel)
+        if (index < 0) return
+        var inscope incoming : WatcherWsMessage
+        if (length(message) > MAX_REQUEST_BODY_BYTES || !sscan_json(string(message), incoming)) {
+            send_error(channel, "invalid WebSocket message")
+            return
+        }
+        var client = clients[index]
+        if (client == null) return
+        client.last_heartbeat = ref_time_ticks()
+        if (incoming.op == "heartbeat") {
+            send(channel, "\{\"type\":\"heartbeat\"\}", ws_opcode.WS_OPCODE_TEXT, true)
+        } elif (incoming.op == "list") {
+            send_sessions(channel)
+            send_repositories(client, true)
+        } elif (incoming.op == "repository_add") {
+            let error = repository_add(RepositoryAddRequest(path = incoming.repository_path,
+                display_name = incoming.display_name, target_id = incoming.target_id))
+            if (!empty(error)) {
+                send_error(channel, error)
+                return
+            }
+            send_repositories(client, true)
+        } elif (incoming.op == "repository_refresh") {
+            let error = repository_refresh(incoming.repository_id)
+            if (!empty(error)) send_error(channel, error)
+            send_repositories(client, true)
+        } elif (incoming.op == "file_inspect") {
+            self.start_file_inspection(client, incoming)
+        } elif (incoming.op == "launch") {
+            var inscope launch = WatcherLaunchRequest(
+                command_line = incoming.command_line, cwd = incoming.cwd,
+                display_name = incoming.display_name, kind = incoming.kind,
+                target_id = incoming.target_id, repository_id = incoming.repository_id,
+                worktree_path = incoming.worktree_path,
+                columns = incoming.columns, rows = incoming.rows,
+                timeout_ms = incoming.timeout_ms)
+            launch.argv := incoming.argv
+            let result = watcher_launch(launch)
+            if (!result.ok) {
+                send_error(channel, result.error)
+                return
+            }
+            send(channel, "\{\"type\":\"launched\",\"session_id\":{sprint_json(result.session_id, false)}\}",
+                ws_opcode.WS_OPCODE_TEXT, true)
+            send_sessions(channel)
+        } elif (incoming.op == "attach") {
+            if (watcher_find_session(incoming.session_id) < 0) {
+                send_error(channel, "unknown session")
+                return
+            }
+            detach(client, "reattach")
+            client.session_id = incoming.session_id
+            let accepts_input = watcher_accepts_input(incoming.session_id)
+            client.controls = incoming.control && accepts_input && watcher_claim_controller(incoming.session_id, client.id)
+            client.raw = incoming.raw
+            client.raw_offset = 0l
+            if (incoming.control && !accepts_input) {
+                send_error(channel, "session is not running; output is replay-only")
+            } elif (incoming.control && !client.controls) {
+                send_error(channel, "controller lease is held by another client")
+            }
+            send(channel, "\{\"type\":\"attached\",\"session_id\":{sprint_json(client.session_id, false)},\"controls\":{client.controls}\}",
+                ws_opcode.WS_OPCODE_TEXT, true)
+            send_snapshot(client, true)
+            send_raw_output(client)
+        } elif (incoming.op == "detach") {
+            detach(client, "client_detached")
+            send(channel, "\{\"type\":\"detached\"\}", ws_opcode.WS_OPCODE_TEXT, true)
+        } elif (incoming.op == "input") {
+            if (!client.controls) {
+                send_error(channel, "client does not hold the controller lease")
+                return
+            }
+            let error = watcher_input(client.session_id, incoming.text, client.id)
+            if (!empty(error)) send_error(channel, error)
+        } elif (incoming.op == "resize") {
+            if (!client.controls) {
+                send_error(channel, "client does not hold the controller lease")
+                return
+            }
+            let error = watcher_resize(client.session_id, incoming.columns, incoming.rows, client.id)
+            if (!empty(error)) send_error(channel, error)
+        } elif (incoming.op == "terminate") {
+            let session_id = !empty(incoming.session_id) ? incoming.session_id : client.session_id
+            let error = watcher_terminate(session_id)
+            if (!empty(error)) send_error(channel, error)
+            send_sessions(channel)
+        } else {
+            send_error(channel, "unknown operation")
+        }
+    }
+
+    def override onTick {
+        watcher_tick()
+        repository_tick()
+        for (index in range(length(clients))) {
+            var client = clients[index]
+            if (client == null) continue
+            if (client.controls && get_time_nsec(client.last_heartbeat) / 1000000l >= CONTROLLER_HEARTBEAT_TIMEOUT_MS) {
+                watcher_release_controller(client.session_id, client.id, "heartbeat_timeout")
+                client.controls = false
+                send_error(client.channel, "controller lease expired")
+            }
+            send_snapshot(client)
+            send_raw_output(client)
+            send_repositories(client)
+            self.poll_file_inspection(client)
+        }
+    }
+
+    def cleanup_clients {
+        for (index in range(length(clients))) {
+            var client = clients[index]
+            if (client != null) {
+                detach(client, "server_shutdown")
+                unsafe { delete client }
+            }
+        }
+        clients |> clear()
+        unsafe { delete clients }
+    }
+}

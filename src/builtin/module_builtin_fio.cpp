@@ -245,7 +245,7 @@ namespace das {
     bool builtin_stat ( const char *, FStat & ) GENERATE_IO_STUB_RET
     bool builtin_chdir ( const char * ) GENERATE_IO_STUB_RET
     bool builtin_mkdir ( const char * ) GENERATE_IO_STUB_RET
-    void builtin_exit ( int32_t ) GENERATE_IO_STUB
+    void builtin_exit ( int32_t, Context *, LineInfoArg * ) GENERATE_IO_STUB
     char * builtin_resolve_this_module_dir ( const char *, bool, Context * ) GENERATE_IO_STUB_RET
     bool builtin_remove_file ( const char * ) GENERATE_IO_STUB_RET
     bool builtin_rename_file ( const char *, const char * ) GENERATE_IO_STUB_RET
@@ -298,10 +298,42 @@ namespace das {
         return mode && strchr("rwa", mode[0]) && mode[1 + strspn(mode + 1, "+btx")] == '\0';
     }
 
+#if defined(_WIN32)
+    static wstring utf8_file_path_to_wide ( const char * path ) {
+        if ( !path || !*path ) return wstring();
+        const int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+            path, -1, nullptr, 0);
+        if ( count <= 0 ) return wstring();
+        wstring result(size_t(count), L'\0');
+        if ( MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                path, -1, result.data(), count) != count ) {
+            return wstring();
+        }
+        result.resize(size_t(count - 1));
+        return result;
+    }
+
+    static FILE * das_fopen_utf8 ( const char * name, const char * mode ) {
+        auto wideName = utf8_file_path_to_wide(name);
+        if ( wideName.empty() ) return nullptr;
+        wchar_t wideMode[8] = {};
+        size_t index = 0;
+        while ( mode[index] && index + 1 < sizeof(wideMode) / sizeof(wideMode[0]) ) {
+            wideMode[index] = wchar_t(uint8_t(mode[index]));
+            ++index;
+        }
+        return _wfopen(wideName.c_str(), wideMode);
+    }
+#else
+    static FILE * das_fopen_utf8 ( const char * name, const char * mode ) {
+        return fopen(name, mode);
+    }
+#endif
+
     const FILE * builtin_fopen  ( const char * name, const char * mode, Context * context, LineInfoArg * at ) {
         if ( !name ) context->throw_error_at(at, "can't fopen NULL name");
         if ( !is_valid_fopen_mode(mode) ) context->throw_error_at(at, "invalid fopen mode '%s'", mode ? mode : "<null>");
-        FILE * f = fopen(name, mode);
+        FILE * f = das_fopen_utf8(name, mode);
         if ( f ) setvbuf(f, NULL, _IOFBF, 65536);
         return f;
     }
@@ -337,7 +369,8 @@ namespace das {
     // stat/fstat truncate st_size to 32 bits and FAIL outright past 2GB.
     static int das_stat64 ( const char * path, das_filestat & st ) {
 #if defined(_WIN32)
-        return _stat64(path, &st);
+        auto widePath = utf8_file_path_to_wide(path);
+        return widePath.empty() ? -1 : _wstat64(widePath.c_str(), &st);
 #else
         return stat(path, &st);
 #endif
@@ -389,7 +422,7 @@ namespace das {
         if ( !size ) context->throw_error_at(at, "fmap_open: null size out-param");
         *size = 0;
         if ( !name ) context->throw_error_at(at, "fmap_open: null path");
-        FILE * f = fopen(name, "rb");
+        FILE * f = das_fopen_utf8(name, "rb");
         if ( !f ) return nullptr;
         das_filestat st;
         int fd = fileno(f);
@@ -715,7 +748,16 @@ namespace das {
         }
     }
 
-    void builtin_exit ( int32_t ec ) {
+    void builtin_exit ( int32_t ec, Context * context, LineInfoArg * at ) {
+        // A script calling exit(1) produced a bare non-zero exit with no message, no stack and no
+        // EXCEPTION -- indistinguishable from every other silent failure. A non-zero exit is a
+        // failure worth naming; exit(0) is a normal shutdown and stays quiet.
+        if ( ec != 0 ) {
+            TextPrinter tp;
+            tp << "exit(" << ec << ") called from " << (at ? at->describe().c_str() : "<unknown>") << "\n";
+            tp.output();
+            if ( context ) context->stackWalk(at, false, false);
+        }
         exit(ec);
     }
 
@@ -1468,12 +1510,24 @@ namespace das {
 
     bool builtin_remove_file ( const char * path ) {
         if ( !path ) return false;
+#if defined(_WIN32)
+        auto widePath = utf8_file_path_to_wide(path);
+        return !widePath.empty() && _wremove(widePath.c_str()) == 0;
+#else
         return remove(path) == 0;
+#endif
     }
 
     bool builtin_rename_file ( const char * old_path, const char * new_path ) {
         if ( !old_path || !new_path ) return false;
+#if defined(_WIN32)
+        auto wideOldPath = utf8_file_path_to_wide(old_path);
+        auto wideNewPath = utf8_file_path_to_wide(new_path);
+        return !wideOldPath.empty() && !wideNewPath.empty()
+            && _wrename(wideOldPath.c_str(), wideNewPath.c_str()) == 0;
+#else
         return rename(old_path, new_path) == 0;
+#endif
     }
 
     bool builtin_rmdir ( const char * path ) {
@@ -2245,7 +2299,7 @@ namespace das {
                 SideEffects::modifyExternal, "getchar_wrapper");
             addExtern<DAS_BIND_FUN(builtin_exit)>(*this, lib, "exit",
                 SideEffects::modifyExternal, "builtin_exit")
-                    ->arg("exitCode")->unsafeOperation = true;
+                    ->args({"exitCode","context","line"})->unsafeOperation = true;
             addExtern<DAS_BIND_FUN(builtin_popen)>(*this, lib, "popen",
                 SideEffects::modifyExternal, "builtin_popen")
                     ->args({"command","scope","context","at"})->unsafeOperation = true;

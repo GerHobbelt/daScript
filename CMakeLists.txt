@@ -1327,7 +1327,6 @@ if (NOT ${DAS_TESTS_DISABLED})
     if(NOT ${DAS_AOT_EXAMPLES_DISABLED})
         include(examples/pathTracer/CMakeLists.txt)
     endif()
-    include(examples/crash/CMakeLists.txt)
     if(NOT ${DAS_AOT_EXAMPLES_DISABLED} AND NOT (WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4))
         include(tests/aot/CMakeLists.txt)
     endif()
@@ -1792,10 +1791,12 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/requirefix/testdata/
 # Install MCP server (stdio transport, no dasHV dependency)
 #   main.das        — full server entry point
 #   cpp_main.das    — cpp/agnostic-subset entry point
+#   mcp_core.das    — transport-neutral core protocol_core requires
 #   protocol_core.das + registry_das.das + registry_cpp.das — shared dispatch + tool registry
 install(FILES
     ${PROJECT_SOURCE_DIR}/utils/mcp/main.das
     ${PROJECT_SOURCE_DIR}/utils/mcp/cpp_main.das
+    ${PROJECT_SOURCE_DIR}/utils/mcp/mcp_core.das
     ${PROJECT_SOURCE_DIR}/utils/mcp/protocol_core.das
     ${PROJECT_SOURCE_DIR}/utils/mcp/registry_das.das
     ${PROJECT_SOURCE_DIR}/utils/mcp/registry_cpp.das
@@ -1806,6 +1807,8 @@ install(FILES
 )
 file(GLOB DAS_MCP_TOOLS ${PROJECT_SOURCE_DIR}/utils/mcp/tools/*.das)
 install(FILES ${DAS_MCP_TOOLS} DESTINATION utils/mcp/tools)
+file(GLOB DAS_MCP_SUBTOOLS ${PROJECT_SOURCE_DIR}/utils/mcp/subtools/*.das)
+install(FILES ${DAS_MCP_SUBTOOLS} DESTINATION utils/mcp/subtools)
 install(FILES
     ${PROJECT_SOURCE_DIR}/utils/mcp/test_tools.das
     DESTINATION utils/mcp
@@ -1982,12 +1985,16 @@ install(FILES
     DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/dasbind
 )
 
-# Install crash example
+# Install crash example. The native failure modes now live in packages/dascrash, installed via
+# `daspkg install` from this local path, so there is no example-specific CMake target to include.
 install(FILES
     ${PROJECT_SOURCE_DIR}/examples/crash/main.das
-    ${PROJECT_SOURCE_DIR}/examples/crash/stack_overflow.das
-    ${PROJECT_SOURCE_DIR}/examples/crash/main.cpp
-    ${PROJECT_SOURCE_DIR}/examples/crash/CMakeLists.txt
+    ${PROJECT_SOURCE_DIR}/examples/crash/crash_kinds.das
+    ${PROJECT_SOURCE_DIR}/examples/crash/README.md
+    ${PROJECT_SOURCE_DIR}/examples/crash/.das_package
+    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/crash
+)
+install(DIRECTORY ${PROJECT_SOURCE_DIR}/examples/crash/packages
     DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/crash
 )
 
