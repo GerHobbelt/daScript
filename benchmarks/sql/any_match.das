@@ -13,7 +13,7 @@ def run_m1(b : B?; n : int) {
     with_sqlite(":memory:") $(db) {
         fixture_db(db, n)
         b |> run("m1_sql/{n}", n) {
-            let opt = _sql(db |> select_from(type<Car>) |> _where(_.price > THRESHOLD) |> _first_opt())
+            let opt = _fold(db |> select_from(type<Car>) |> _where(_.price > THRESHOLD) |> _first_opt())
             b |> accept(opt)
             if (!is_some(opt)) {
                 b->failNow()
@@ -40,23 +40,6 @@ def run_m4(b : B?; n : int) {
         b |> accept(yes)
         if (!yes) {
             b->failNow()
-        }
-    }
-}
-
-def run_m5(b : B?; n : int) {
-    let xml = fixture_xml_string(n)
-    parse_xml(xml) $(doc, ok) {
-        if (!ok) {
-            b->failNow()
-            return
-        }
-        b |> run("m5_xml/{n}", n) {
-            let yes = unsafe(from_xml_node(doc.document_element, type<Car>)) |> _any(_.price > THRESHOLD)
-            b |> accept(yes)
-            if (!yes) {
-                b->failNow()
-            }
         }
     }
 }
@@ -91,11 +74,6 @@ def any_match_m3f(b : B?) {
 [benchmark]
 def any_match_m4(b : B?) {
     run_m4(b, 100000)
-}
-
-[benchmark]
-def any_match_m5(b : B?) {
-    run_m5(b, 100000)
 }
 
 [benchmark]

@@ -14,7 +14,7 @@ def run_m1(b : B?; n : int) {
     with_sqlite(":memory:") $(db) {
         fixture_db(db, n)
         b |> run("m1_sql/{n}", n) {
-            let groups <- _sql(db |> select_from(type<Car>)
+            let groups <- _fold(db |> select_from(type<Car>)
                                   |> _group_by(_.brand)
                                   |> _select((Brand = _._0,
                                               Total = _._1 |> select($(c : Car) => c.price) |> sum()))
@@ -59,28 +59,6 @@ def run_m4(b : B?; n : int) {
     }
 }
 
-def run_m5(b : B?; n : int) {
-    let xml = fixture_xml_string(n)
-    parse_xml(xml) $(doc, ok) {
-        if (!ok) {
-            b->failNow()
-            return
-        }
-        b |> run("m5_xml/{n}", n) {
-            let groups <- (unsafe(from_xml_node(doc.document_element, type<Car>))
-                          |> _group_by(_.brand)
-                          |> _select((Brand = _._0,
-                                      Total = _._1 |> select($(c : Car) => c.price) |> sum()))
-                          |> _order_by(_.Total)
-                          |> to_array())
-            b |> accept(groups)
-            if (empty(groups)) {
-                b->failNow()
-            }
-        }
-    }
-}
-
 def run_m5f(b : B?; n : int) {
     let xml = fixture_xml_string(n)
     parse_xml(xml) $(doc, ok) {
@@ -116,11 +94,6 @@ def groupby_select_order_m3f(b : B?) {
 [benchmark]
 def groupby_select_order_m4(b : B?) {
     run_m4(b, 100000)
-}
-
-[benchmark]
-def groupby_select_order_m5(b : B?) {
-    run_m5(b, 100000)
 }
 
 [benchmark]
