@@ -657,8 +657,8 @@ def public vecarith_words : array<uint> {
 
 // ===== Phase-8.3 GLSL.std.450 math breadth: exercise every reachable ext-inst the emitter maps beyond
 // Phase 3's dot/sqrt/clamp. Keyed on the DASLANG name (lerp -> FMix, rsqrt -> InverseSqrt). Vectors are
-// built from scalar swizzles (multi-component swizzle of a global is a separate, unrelated gap). Each
-// ext-inst is spirv-val'd + asserted by sub-opcode. =====
+// built from scalar swizzles (multi-component swizzle of a global is its own gap, closed in Phase 10.2).
+// Each ext-inst is spirv-val'd + asserted by sub-opcode. =====
 var @in @location = 0 mx_in : float4
 var @out @location = 0 mx_out : float4
 [fragment_shader(name="mathx_spv"), marker(no_coverage)]
@@ -686,6 +686,307 @@ def mathx {
 def public mathx_words : array<uint> {
     var w : array<uint>
     w |> push_from(mathx_spv)
+    return <- w
+}
+
+// ===== Phase-10.1 SSBO std430 vector elements: array<float2/3/4> runtime arrays. The std430 ArrayStride
+// is the element's base size rounded up to its base alignment: float2 -> 8, float3 -> 16 (size 12, align
+// 16), float4 -> 16. Whole-element load/store + component-wise vector add; no new opcodes vs Phase 8. =====
+var @ssbo @set = 0 @binding = 0 sv2 : array<float2>
+var @ssbo @set = 0 @binding = 1 sv3 : array<float3>
+var @ssbo @set = 0 @binding = 2 sv4 : array<float4>
+[compute_shader(local_size_x=64, name="ssbovec_spv"), marker(no_coverage)]
+def ssbovec {
+    let i = gl_GlobalInvocationID.x
+    sv2[i] = sv2[i] + float2(1.0, 0.0)          // float2 element: ArrayStride 8
+    sv3[i] = sv3[i] + float3(0.0, 1.0, 0.0)     // float3 element: ArrayStride 16 (vec3 size 12, align 16)
+    sv4[i] = sv4[i] + float4(0.0, 0.0, 0.0, 1.0) // float4 element: ArrayStride 16
+}
+
+// ===== Phase-10.1 SSBO std430 struct elements: array<Particle> runtime array. The element struct is
+// laid out std430 (pos@0, vel@8, life@16; max member align 8 -> struct size 24 -> ArrayStride 24) and
+// is NOT Block-decorated (only the outer wrapper struct is). Field access particles[i].field chains a
+// second OpAccessChain off the element pointer. The compute-particle tutorial's foundation rail. =====
+struct Particle {
+    pos  : float2   // std430 offset 0
+    vel  : float2   // offset 8
+    life : float    // offset 16 (struct rounds to align 8 -> stride 24)
+}
+var @ssbo @binding = 0 particles : array<Particle>
+[compute_shader(local_size_x=64, name="ssbostruct_spv"), marker(no_coverage)]
+def ssbostruct {
+    let i = gl_GlobalInvocationID.x
+    let v = particles[i].vel                        // chained AccessChain (element + field) + Load
+    particles[i].pos = particles[i].pos + v         // float2 field read + write
+    particles[i].life = particles[i].life - 1.0f    // scalar field read + write
+}
+
+def public ssbovec_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(ssbovec_spv)
+    return <- w
+}
+
+def public ssbostruct_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(ssbostruct_spv)
+    return <- w
+}
+
+// ===== Phase-10.2 composite/global swizzle: multi-component swizzle of a bare global (the Phase-8
+// out-of-scope note). A single-component global swizzle stays an lvalue (AccessChain); a multi-component
+// one loads the whole global and OpVectorShuffle's it. Covers a builtin global (gl_FragCoord.xy), an @in
+// global (contiguous .xyz + reordered .yx), single-component global (.w, still the pointer path), and a
+// swizzle of a local value (regression). No new opcodes vs Phase 4b (VectorShuffle/CompositeExtract). =====
+var @in @location = 0 sw_in : float4
+var @out @location = 0 sw_out : float4
+[fragment_shader(name="gswizzle_spv"), marker(no_coverage)]
+def gswizzle {
+    let fc = gl_FragCoord.xy         // multi-component swizzle of a builtin global -> OpVectorShuffle
+    let rgb = sw_in.xyz              // multi-component swizzle of an @in global -> OpVectorShuffle
+    let yx = sw_in.yx                // reordered multi-component swizzle -> OpVectorShuffle
+    let a = sw_in.w                  // single-component global -> AccessChain (pointer), loaded here
+    let lx = rgb.xy                  // swizzle of a LOCAL value (regression) -> OpVectorShuffle
+    sw_out = float4(rgb, fc.x + yx.x + a + lx.y)
+}
+
+def public gswizzle_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(gswizzle_spv)
+    return <- w
+}
+
+// ===== Phase-10.3 fragment realism: discard (OpKill), screen-space derivatives (OpDPdx/OpDPdy/
+// OpFwidth), textureSize (OpImageQuerySizeLod + the ImageQuery capability), and a gl_FragDepth write
+// (BuiltIn FragDepth Output -> the DepthReplacing execution mode). discard/derivatives/gl_FragDepth are
+// fragment-only; textureSize is stage-agnostic (exercised here in a fragment shader for convenience).
+// discard() sits in an if-branch (it is a block terminator); dFdx/dFdy take the whole float2 global,
+// fwidth a scalar. =====
+var @binding = 0 fx_tex : sampler2D
+var @in @location = 0 fx_uv : float2
+var @out @location = 0 fx_color : float4
+[fragment_shader(name="fragx_spv"), marker(no_coverage)]
+def fragx {
+    if (fx_uv.x < 0.0f) {
+        discard()                       // OpKill (fragment-only terminator)
+    }
+    let dx = dFdx(fx_uv)                 // OpDPdx (float2)
+    let dy = dFdy(fx_uv)                 // OpDPdy (float2)
+    let w = fwidth(fx_uv.x)              // OpFwidth (scalar)
+    let sz = textureSize(fx_tex, 0)      // OpImageQuerySizeLod -> int2 (ImageQuery capability)
+    gl_FragDepth = fx_uv.x               // BuiltIn FragDepth write -> DepthReplacing execution mode
+    fx_color = float4(dx.x + dy.y + w, float(sz.x), float(sz.y), 1.0f)
+}
+
+def public fragx_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(fragx_spv)
+    return <- w
+}
+
+// ===== Phase-10.4 depth-compare (shadow) sampling: a sampler2DShadow sampled via textureCompare
+// (OpImageSampleDrefImplicitLod). The sampler's OpTypeImage carries Depth=1 and the descriptor reflects
+// as a comparison_sampler (not a plain combined_image_sampler). The reference value is the fragment's
+// light-space depth (a runtime @in); the scalar result is the comparison (1 = lit, 0 = shadowed).
+// Implicit LOD -> fragment-only. =====
+var @binding = 0 sh_shadow : sampler2DShadow
+var @in @location = 0 sh_uv : float2
+var @in @location = 1 sh_ref : float
+var @out @location = 0 sh_color : float4
+[fragment_shader(name="fragshadow_spv"), marker(no_coverage)]
+def fragshadow {
+    let lit = textureCompare(sh_shadow, sh_uv, sh_ref)   // OpImageSampleDrefImplicitLod -> scalar in [0,1]
+    sh_color = float4(lit, lit, lit, 1.0f)
+}
+
+def public fragshadow_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(fragshadow_spv)
+    return <- w
+}
+
+// ===== Phase-10.5 compute-tier fixtures: shared memory + barriers + atomics =====
+// cshared: a workgroup-shared scratch array (`@workgroup`, GLSL `shared` -> Workgroup OpVariable),
+// the control + shared-memory sync (barrier() -> OpControlBarrier, memoryBarrierShared() ->
+// OpMemoryBarrier), and an atomicAdd onto an SSBO element (OpAtomicIAdd at Device scope, since the
+// target lives in buffer memory). The canonical tiled-reduction skeleton.
+var @ssbo @binding = 0 rin : array<uint>
+var @ssbo @binding = 1 rout : array<uint>
+var @workgroup rtile : uint[64]
+
+[compute_shader(local_size_x=64, name="cshared_spv"), marker(no_coverage)]
+def cshared {
+    let lid = gl_LocalInvocationID.x
+    let gid = gl_GlobalInvocationID.x
+    rtile[lid] = rin[gid]       // store into shared memory (Workgroup OpAccessChain + OpStore)
+    barrier()                   // OpControlBarrier (execution + shared-memory rendezvous)
+    memoryBarrierShared()       // OpMemoryBarrier (shared-memory ordering)
+    let _o = atomicAdd(rout[0], rtile[lid])   // OpAtomicIAdd onto an SSBO element (Device scope)
+}
+
+// catomics: the rest of the atomic family on @workgroup int + uint scalar counters (Workgroup
+// scope). Both signednesses are present so atomicMin/Max emit BOTH the signed (SMin/SMax) and
+// unsigned (UMin/UMax) opcodes; atomicCompSwap is the OpAtomicCompareExchange CAS. The results feed
+// an SSBO write so they stay live.
+var @workgroup acnt_i : int
+var @workgroup acnt_u : uint
+var @ssbo @binding = 0 aout : array<int>
+
+[compute_shader(local_size_x=64, name="catomics_spv"), marker(no_coverage)]
+def catomics {
+    let gid = gl_GlobalInvocationID.x
+    let v = int(gid)
+    let u = gid
+    let a = atomicMin(acnt_i, v)            // OpAtomicSMin
+    let b = atomicMax(acnt_i, v)            // OpAtomicSMax
+    let c = atomicMin(acnt_u, u)            // OpAtomicUMin
+    let d = atomicMax(acnt_u, u)            // OpAtomicUMax
+    let e = atomicAnd(acnt_i, v)            // OpAtomicAnd
+    let f = atomicOr(acnt_i, v)             // OpAtomicOr
+    let g = atomicXor(acnt_i, v)            // OpAtomicXor
+    let h = atomicExchange(acnt_i, v)       // OpAtomicExchange
+    let kk = atomicCompSwap(acnt_i, 0, v)   // OpAtomicCompareExchange
+    aout[gid] = a + b + e + f + g + h + kk + int(c) + int(d)
+}
+
+def public cshared_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(cshared_spv)
+    return <- w
+}
+
+def public catomics_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(catomics_spv)
+    return <- w
+}
+
+// ===== Phase-10.6 storage-image size query + module-scope shader constants =====
+// imgquery: imageSize(img) -> OpImageQuerySize (the storage image's dimensions in texels, NO LOD --
+// a storage image is Sampled=2 so the no-LOD query is legal, unlike textureSize which needs a LOD).
+// Pulls in the ImageQuery capability. Lets a compute shader size its pixel<->coordinate mapping off
+// the bound image instead of a hardcoded extent (the Mandelbrot-tutorial rail).
+var @binding = 0 qimg : image2D
+[compute_shader(local_size_x=8, local_size_y=8, name="imgquery_spv"), marker(no_coverage)]
+def imgquery {
+    let gid = gl_GlobalInvocationID
+    let dim = imageSize(qimg)                            // OpImageQuerySize -> int2
+    let coord = int2(int(gid.x), int(gid.y))
+    let u = float(gid.x) / float(dim.x)                  // the queried size feeds the mapping
+    let v = float(gid.y) / float(dim.y)
+    imageStore(qimg, coord, float4(u, v, 0.0f, 1.0f))
+}
+
+// modconst: module-scope shader constants. An immutable `let X = <const-expr>` at module scope folds to
+// an OpConstant and references resolve straight to it (no OpVariable / OpLoad) -- so a shader can hoist
+// iteration counts, view rectangles, etc. to module scope and share them with the host. Scalar (float +
+// int) and a folded const-vector module const are all exercised. Counterpart fail-closed case (a mutable
+// `var` global must still be rejected) lives in test_fail_closed.das.
+let MC_LO = -2.0f
+let MC_HI = 1.0f
+let MC_ITER = 16
+let MC_BASE = float2(0.5, 0.5)
+[compute_shader(local_size_x=64, name="modconst_spv"), marker(no_coverage)]
+def modconst {
+    let i = gl_GlobalInvocationID.x
+    var acc = MC_LO + float(MC_ITER)        // module-scope float + int consts as rvalues
+    for (_k in range(MC_ITER)) {            // int const as a loop bound (counter unused)
+        acc += MC_HI
+    }
+    let b = MC_BASE                          // folded const-vector module const
+    fdata[i] = acc + b.x
+}
+
+def public imgquery_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(imgquery_spv)
+    return <- w
+}
+
+def public modconst_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(modconst_spv)
+    return <- w
+}
+
+// ===== Phase-11 user-defined shader functions: OpFunction / OpFunctionCall + ref-param copy-in/out =====
+// Each user function called (transitively) from a shader is emitted as its own OpFunction. A value
+// parameter binds an SSA OpFunctionParameter; a by-reference parameter binds a Function pointer and the
+// caller wraps the argument in a copy-in / copy-out temp (Logical addressing forbids passing an
+// access-chain pointer straight to a call). The only NEW opcodes are OpFunctionCall / OpFunctionParameter
+// / OpReturnValue; everything else reuses already-declared opcodes.
+
+def private uf_add1(x : int) : int {                // scalar value param, scalar return
+    return x + 1
+}
+def private uf_muladd(a, b, c : int) : int {        // multiple value params
+    return a * b + c
+}
+def private uf_double(x : int) : int {              // transitive: calls the shared uf_add1 twice
+    return uf_add1(uf_add1(x))
+}
+def private uf_grade(uv : float2) : float3 {        // vector value param + vector return
+    return float3(uv.x, uv.y, uv.x + uv.y)
+}
+
+// userfn: value-param surface. uf_add1 is shared (called directly AND inside uf_double) -> ONE OpFunction
+// but several OpFunctionCall; uf_grade is the vector-in/vector-out showcase.
+[compute_shader(local_size_x=64, name="userfn_spv"), marker(no_coverage)]
+def userfn {
+    let i = int(gl_GlobalInvocationID.x)
+    let a = uf_add1(idata[i])                       // scalar value call
+    let b = uf_muladd(a, 2, 3)                      // multi-arg value call
+    let c = uf_double(b)                            // transitive (uf_double -> uf_add1 x2)
+    let g = uf_grade(float2(float(a), float(b)))    // vector param + vector return
+    idata[i] = a + b + c + int(g.x + g.y + g.z)
+}
+
+def private uf_accumulate(var acc : float&; x : float) {   // by-reference param (read-modify-write), void
+    acc = acc + x * x
+}
+def private uf_scale_inplace(var v : float&; s : float) {  // a second ref helper (mixed with a value arg)
+    v = v * s
+}
+
+// userfn_ref: by-reference parameter copy-in/copy-out. `acc` is a local var; each call copies its current
+// value into a Function temp, runs the helper through the temp pointer, then copies the temp back into acc.
+[compute_shader(local_size_x=64, name="userfn_ref_spv"), marker(no_coverage)]
+def userfn_ref {
+    let i = int(gl_GlobalInvocationID.x)
+    var acc = 0.0f
+    uf_accumulate(acc, fdata[i])    // ref arg + value arg
+    uf_accumulate(acc, 1.0f)        // shared ref helper, second call site
+    uf_scale_inplace(acc, 0.5f)     // a different ref helper
+    fdata[i] = acc
+}
+
+def private uf_lane_seed() : uint {     // a no-arg helper that READS a builtin global (gl_GlobalInvocationID)
+    return gl_GlobalInvocationID.x * 747796405u + 2891336453u
+}
+
+// userfn_global: a helper with no parameters that reads a module global directly (the global is collected
+// transitively through the helper and classified once for the whole module).
+[compute_shader(local_size_x=64, name="userfn_global_spv"), marker(no_coverage)]
+def userfn_global {
+    let i = gl_GlobalInvocationID.x
+    data[i] = uf_lane_seed()
+}
+
+def public userfn_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(userfn_spv)
+    return <- w
+}
+
+def public userfn_ref_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(userfn_ref_spv)
+    return <- w
+}
+
+def public userfn_global_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(userfn_global_spv)
     return <- w
 }
 
@@ -908,5 +1209,84 @@ def public phase7d_emitter_opcodes : table<uint> {
 def public phase8_emitter_opcodes : table<uint> {
     var s <- phase7d_emitter_opcodes()
     s |> insert(uint(SpvOp.Select))     // cond ? a : b
+    return <- s
+}
+
+// Phase-10.1 SSBO std430 vector/struct elements add NO new opcodes: a vector element is the same
+// OpTypeRuntimeArray (different ArrayStride operand); a struct element is an extra OpTypeStruct
+// (non-Block) read via a chained OpAccessChain/OpLoad — all already declared. The set is unchanged;
+// the new fixtures must still stay within it.
+def public phase10_1_emitter_opcodes : table<uint> {
+    return <- phase8_emitter_opcodes()
+}
+
+// Phase-10.2 multi-component global swizzle adds NO new opcodes: it routes a bare global through the
+// existing load + OpVectorShuffle / OpCompositeExtract path (both declared by Phase 4b). The set is
+// unchanged; the gswizzle fixture must still stay within it.
+def public phase10_2_emitter_opcodes : table<uint> {
+    return <- phase10_1_emitter_opcodes()
+}
+
+// Phase-10.3 fragment realism adds five opcodes: OpKill (discard), OpDPdx/OpDPdy/OpFwidth (derivatives),
+// and OpImageQuerySizeLod (textureSize). gl_FragDepth reuses the existing builtin Variable/Decorate path
+// (DepthReplacing is an ExecutionMode operand, not an opcode), and OpImage was declared by Phase-7.2
+// texelFetch. Phase-10.2 set + these:
+def public phase10_3_emitter_opcodes : table<uint> {
+    var s <- phase10_2_emitter_opcodes()
+    for (op in [
+        SpvOp.Kill,                         // discard()
+        SpvOp.DPdx, SpvOp.DPdy, SpvOp.Fwidth,   // dFdx/dFdy/fwidth
+        SpvOp.ImageQuerySizeLod             // textureSize(s, lod)
+    ]) {
+        s |> insert(uint(op))
+    }
+    return <- s
+}
+
+// Phase-10.4 depth-compare sampling adds one opcode: OpImageSampleDrefImplicitLod (textureCompare on a
+// sampler2DShadow). The Depth=1 image flag is an OpTypeImage operand and the comparison_sampler kind is
+// reflection-only — neither is a new opcode. Phase-10.3 set + this:
+def public phase10_4_emitter_opcodes : table<uint> {
+    var s <- phase10_3_emitter_opcodes()
+    s |> insert(uint(SpvOp.ImageSampleDrefImplicitLod))
+    return <- s
+}
+
+// Phase-10.5 compute tier adds twelve opcodes: the two barriers (OpControlBarrier / OpMemoryBarrier)
+// and the atomic family (IAdd, signed+unsigned Min/Max, And/Or/Xor, Exchange, CompareExchange). The
+// @workgroup shared global reuses the existing OpVariable / OpTypeArray / OpAccessChain path (a
+// Workgroup storage class, not a new opcode). Phase-10.4 set + these:
+def public phase10_5_emitter_opcodes : table<uint> {
+    var s <- phase10_4_emitter_opcodes()
+    for (op in [
+        SpvOp.ControlBarrier, SpvOp.MemoryBarrier,                  // barrier() / memoryBarrierShared()
+        SpvOp.AtomicIAdd,                                           // atomicAdd
+        SpvOp.AtomicSMin, SpvOp.AtomicUMin,                         // atomicMin (int / uint)
+        SpvOp.AtomicSMax, SpvOp.AtomicUMax,                         // atomicMax (int / uint)
+        SpvOp.AtomicAnd, SpvOp.AtomicOr, SpvOp.AtomicXor,           // atomicAnd / atomicOr / atomicXor
+        SpvOp.AtomicExchange, SpvOp.AtomicCompareExchange           // atomicExchange / atomicCompSwap
+    ]) {
+        s |> insert(uint(op))
+    }
+    return <- s
+}
+
+// Phase-10.6 adds the storage-image size query (imageSize -> OpImageQuerySize, the no-LOD sibling of
+// Phase-10.3's OpImageQuerySizeLod). Module-scope shader constants add NO new opcodes: a folded `let`
+// global resolves straight to its already-declared OpConstant/OpConstantComposite. Phase-10.5 set + this:
+def public phase10_6_emitter_opcodes : table<uint> {
+    var s <- phase10_5_emitter_opcodes()
+    s |> insert(uint(SpvOp.ImageQuerySize))     // imageSize(img)
+    return <- s
+}
+
+// Phase-11 user-defined shader functions add three opcodes: OpFunctionCall (the call), OpFunctionParameter
+// (each parameter of an emitted helper), and OpReturnValue (a value return; void helpers keep OpReturn,
+// already declared). OpFunction / OpLabel / OpFunctionEnd were declared back in Phase 1. Phase-10.6 + these:
+def public phase11_fn_emitter_opcodes : table<uint> {
+    var s <- phase10_6_emitter_opcodes()
+    for (op in [SpvOp.FunctionCall, SpvOp.FunctionParameter, SpvOp.ReturnValue]) {
+        s |> insert(uint(op))
+    }
     return <- s
 }

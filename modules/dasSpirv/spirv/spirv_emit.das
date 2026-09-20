@@ -12,6 +12,7 @@ require spirv_builder
 require spirv_types
 require spirv_grammar
 require spirv_reflect
+require math
 require daslib/ast
 require daslib/rtti
 require daslib/ast_boost
@@ -35,6 +36,9 @@ struct GlobalInfo {
     is_storage_image : bool         // a read-write storage image (UniformConstant OpTypeImage); used via imageLoad/imageStore
     is_separate_image : bool        // a standalone sampled image (texture2D, OpTypeImage); combined at the call via OpSampledImage
     is_separate_sampler : bool      // a standalone sampler (OpTypeSampler)
+    elem_type  : uint               // SSBO runtime-array element type-id (vec/struct elements can't go through emit_type)
+    is_constant : bool              // a module-scope `let X = <const>` folded to an OpConstant; references resolve to const_id directly (no OpVariable / OpLoad)
+    const_id   : uint               // the OpConstant result-id (when is_constant)
 }
 
 // A memory-backed local: an OpVariable in Function storage. Mutable locals (`var x`) and loop
@@ -54,6 +58,30 @@ struct EmitCtx {
     terminated    : bool                        // current block already has a terminator
     glsl_ext      : uint                        // OpExtInstImport "GLSL.std.450" set id (0 = not imported yet)
     stage         : ShaderStage                 // the shader stage (texture() implicit-LOD sampling is fragment-only)
+    uses_frag_depth : bool                      // gl_FragDepth referenced (Output-only, so = written) -> emit DepthReplacing
+    image_query_cap : bool                      // OpCapability ImageQuery already emitted (textureSize)
+    user_funcs    : table<uint64; UserFunc>     // intptr(Function) -> emittable user-defined shader function
+    user_order    : array<uint64>               // user_funcs keys in stable emission order (collect_dependencies order)
+    call_temps    : table<uint64; CallTemp>     // intptr(ref-arg Expression) -> its copy-in/out Function-storage temp
+}
+
+// A user-defined daslang function called from a shader: emitted as its own OpFunction. Ids are
+// pre-allocated in a first pass so an OpFunctionCall can forward-reference a not-yet-emitted callee.
+struct UserFunc {
+    fn      : Function const?   // the function (collect_dependencies yields pointee-const pointers)
+    fn_id   : uint          // OpFunction result id (pre-allocated; 0 when !valid)
+    type_id : uint          // OpTypeFunction id
+    ret_type : uint         // result type id (void's type id when is_void)
+    is_void : bool
+    valid   : bool          // false = signature rejected at registration (error already emitted)
+}
+
+// Per ref-argument copy-in/copy-out scratch: a Function-storage OpVariable hoisted into the calling
+// function's entry block. SPIR-V (Logical addressing) forbids passing an access-chain pointer as a
+// call argument, so every by-reference argument goes through one of these temps.
+struct CallTemp {
+    ptr_id     : uint
+    value_type : uint
 }
 
 // break -> branch to `merge`, continue -> branch to `cont`. Pushed per active loop.
@@ -84,6 +112,11 @@ def finalize(var c : EmitCtx) {
     delete c.local_vars
     delete c.interface_ids
     delete c.loop_stack
+    unsafe {
+        delete c.user_funcs   // value type holds a FunctionPtr -> delete needs unsafe
+    }
+    delete c.user_order
+    delete c.call_temps
 }
 
 // ===== builtin name -> SpvBuiltIn + storage class + the stage it's legal in =====
@@ -104,6 +137,7 @@ def private builtin_info(name : string) : tuple<ok : bool; bi : SpvBuiltIn; stor
     if (name == "gl_InstanceIndex") return (ok = true, bi = SpvBuiltIn.InstanceIndex, storage = SpvStorageClass.Input, req = ShaderStage.Vertex)
     // fragment
     if (name == "gl_FragCoord") return (ok = true, bi = SpvBuiltIn.FragCoord, storage = SpvStorageClass.Input, req = ShaderStage.Fragment)
+    if (name == "gl_FragDepth") return (ok = true, bi = SpvBuiltIn.FragDepth, storage = SpvStorageClass.Output, req = ShaderStage.Fragment)
     return (ok = false, bi = SpvBuiltIn.Position, storage = SpvStorageClass.Input, req = ShaderStage.Compute)
 }
 
@@ -131,23 +165,28 @@ def private round_up(off, a : int) : int {
     return ((off + a - 1) / a) * a
 }
 
-// Build a Block-decorated interface struct from a daslang struct's fields, laid out std140. Shared
-// by @uniform and @push_constant blocks. 32-bit scalar/vector/matrix members are supported; nested
-// structs and arrays are not yet. Returns the struct type-id; the caller wraps it in the right
-// storage-class pointer + descriptor decorations.
-def private build_block_struct(var m : SpirvModule; sname : string; st : Structure?; var errors : array<string>) : tuple<ok : bool; type_id : uint; size : int> {
+// Build a laid-out interface struct from a daslang struct's fields. 32-bit scalar/vector/matrix
+// members are supported; nested structs and arrays are not yet. `as_block` toggles the Block decoration
+// (true for @uniform/@push_constant blocks, false for an SSBO runtime-array element struct).
+// Member offsets are identical under std140 and std430 for these flat member kinds — the two layouts
+// only diverge on array/nested-struct members (rejected here) and on the final struct-size rounding,
+// which the caller does via the returned `align` (max member base alignment). `size` is the offset
+// past the last member (the push-constant range size); `align` lets the SSBO caller round it up to
+// the std430 array stride.
+def private build_block_struct(var m : SpirvModule; sname : string; st : Structure?; as_block : bool; var errors : array<string>) : tuple<ok : bool; type_id : uint; size : int; align : int> {
     if (st == null || empty(st.fields)) {
         errors |> push("interface block '{sname}' must be a struct with at least one field")
-        return (ok = false, type_id = 0u, size = 0)
+        return (ok = false, type_id = 0u, size = 0, align = 0)
     }
     var members : array<uint>
     var offsets : array<int>
     var mat_strides : array<int>
     var off = 0
+    var max_align = 0
     for (fld in st.fields) {
         let mi = matrix_info(fld._type)
         if (mi.ok) {
-            // std140 matrix: ColMajor, each column padded to vec4 (MatrixStride 16), align 16,
+            // std140/std430 matrix: ColMajor, each column padded to vec4 (MatrixStride 16), align 16,
             // size = 16 * cols. (daslang float3x3 stores packed columns, so its bytes need
             // repacking host-side before upload; float4x4 columns are already vec4 -> direct.)
             off = round_up(off, 16)
@@ -155,6 +194,7 @@ def private build_block_struct(var m : SpirvModule; sname : string; st : Structu
             offsets |> push(off)
             mat_strides |> push(16)
             off += 16 * mi.cols
+            max_align = max(max_align, 16)
             continue
         }
         let fbt = fld._type.baseType
@@ -166,19 +206,51 @@ def private build_block_struct(var m : SpirvModule; sname : string; st : Structu
             delete members
             delete offsets
             delete mat_strides
-            return (ok = false, type_id = 0u, size = 0)
+            return (ok = false, type_id = 0u, size = 0, align = 0)
         }
-        off = round_up(off, std140_align(fbt))
+        let falign = std140_align(fbt)
+        off = round_up(off, falign)
         members |> push(emit_type(m, fld._type))
         offsets |> push(off)
         mat_strides |> push(0)
         off += std140_size(fbt)
+        max_align = max(max_align, falign)
     }
-    let id = type_struct_block(m, members, offsets, mat_strides)
+    let id = (as_block ? type_struct_block(m, members, offsets, mat_strides)
+                       : type_struct_layout(m, members, offsets, mat_strides))
     delete members
     delete offsets
     delete mat_strides
-    return (ok = true, type_id = id, size = off)
+    return (ok = true, type_id = id, size = off, align = max_align)
+}
+
+// std430 layout of an SSBO runtime-array element. Returns the element SPIR-V type-id + the
+// ArrayStride. A 32-bit scalar/vector element strides by its std430 base size rounded up to its base
+// alignment (vec3 -> 16, vec2 -> 8, scalar -> 4); a struct element is laid out non-Block and strides
+// by its size rounded to the struct alignment. Matrix and nested-array elements are rejected (wrap a
+// matrix in a struct). std140_size/std140_align are reused: they equal the std430 base size/alignment
+// for these flat scalar/vector kinds (std430 differs only on array/struct padding, handled here).
+def private ssbo_element_layout(var m : SpirvModule; sname : string; et : TypeDecl?; var errors : array<string>) : tuple<ok : bool; elem_type : uint; stride : int> {
+    if (et == null) {
+        errors |> push("ssbo '{sname}' has no element type")
+        return (ok = false, elem_type = 0u, stride = 0)
+    }
+    if (matrix_info(et).ok) {
+        errors |> push("ssbo '{sname}' element is a matrix — wrap it in a struct (a bare matrix runtime-array element is not supported)")
+        return (ok = false, elem_type = 0u, stride = 0)
+    }
+    let bt = et.baseType
+    if (bt == Type.tStructure) {
+        let bs = build_block_struct(m, "{sname} element", et.structType, false, errors)
+        if (!bs.ok) return (ok = false, elem_type = 0u, stride = 0)
+        return (ok = true, elem_type = bs.type_id, stride = round_up(bs.size, bs.align))
+    }
+    // 32-bit scalar or its 2/3/4 vector (scalar_class rejects bool and non-numeric base types)
+    if (component_count(bt) >= 1 && scalar_class(bt) >= 0) {
+        return (ok = true, elem_type = emit_type(m, et), stride = round_up(std140_size(bt), std140_align(bt)))
+    }
+    errors |> push("ssbo '{sname}' element type {bt} is not supported (a 32-bit scalar, a vector of those, or a struct of those)")
+    return (ok = false, elem_type = 0u, stride = 0)
 }
 
 // The single SpirvStageFlags bit for one shader stage. A shader module is one stage, so every
@@ -191,15 +263,18 @@ def private stage_flag(stage : ShaderStage) : SpirvStageFlags {
 
 // ===== combined image sampler detection =====
 // sampler globals are recognized by their opaque marker struct name (sampler2D, ...). Returns the
-// SPIR-V image dimensionality so classify_global can build the OpTypeImage / OpTypeSampledImage.
-def private sampler_info(t : TypeDecl?) : tuple<ok : bool; dim : SpvDim; arrayed : uint> {
-    if (t == null || t.baseType != Type.tStructure || t.structType == null) return (ok = false, dim = SpvDim._2D, arrayed = 0u)
+// OpTypeImage operands classify_global needs: dimensionality (dim), the Arrayed flag (arrayed), and
+// the Depth flag (depth, 1 for a sampler2DShadow comparison sampler, else 0).
+def private sampler_info(t : TypeDecl?) : tuple<ok : bool; dim : SpvDim; arrayed : uint; depth : uint> {
+    if (t == null || t.baseType != Type.tStructure || t.structType == null) return (ok = false, dim = SpvDim._2D, arrayed = 0u, depth = 0u)
     let n = "{t.structType.name}"
-    if (n == "sampler2D") return (ok = true, dim = SpvDim._2D, arrayed = 0u)
-    if (n == "sampler3D") return (ok = true, dim = SpvDim._3D, arrayed = 0u)
-    if (n == "samplerCube") return (ok = true, dim = SpvDim.Cube, arrayed = 0u)
-    if (n == "sampler2DArray") return (ok = true, dim = SpvDim._2D, arrayed = 1u)
-    return (ok = false, dim = SpvDim._2D, arrayed = 0u)
+    if (n == "sampler2D") return (ok = true, dim = SpvDim._2D, arrayed = 0u, depth = 0u)
+    if (n == "sampler3D") return (ok = true, dim = SpvDim._3D, arrayed = 0u, depth = 0u)
+    if (n == "samplerCube") return (ok = true, dim = SpvDim.Cube, arrayed = 0u, depth = 0u)
+    if (n == "sampler2DArray") return (ok = true, dim = SpvDim._2D, arrayed = 1u, depth = 0u)
+    // sampler2DShadow: a 2D DEPTH-comparison sampler (Depth=1). Sampled only via textureCompare (Dref).
+    if (n == "sampler2DShadow") return (ok = true, dim = SpvDim._2D, arrayed = 0u, depth = 1u)
+    return (ok = false, dim = SpvDim._2D, arrayed = 0u, depth = 0u)
 }
 
 // Storage-image globals are recognized by their opaque marker struct name (image2D, ...). Returns the
@@ -208,6 +283,17 @@ def private storage_image_info(t : TypeDecl?) : tuple<ok : bool; dim : SpvDim> {
     if (t == null || t.baseType != Type.tStructure || t.structType == null) return (ok = false, dim = SpvDim._2D)
     if ("{t.structType.name}" == "image2D") return (ok = true, dim = SpvDim._2D)
     return (ok = false, dim = SpvDim._2D)
+}
+
+// Exactly the type set emit_type lowers without panicking: a scalar/vector (scalar_class >= 0), bool,
+// a matrix, or a fixed array of those. Lets the @workgroup path reject an unsupported shared type with
+// a clean diagnostic instead of crashing in emit_type (struct/handle/dynamic-array shared vars).
+def private is_emittable_value_type(t : TypeDecl?) : bool {
+    if (t == null) return false
+    if (matrix_info(t).ok) return true
+    let bt = t.baseType
+    if (bt == Type.tFixedArray && t.firstType != null) return is_emittable_value_type(t.firstType)
+    return scalar_class(bt) >= 0 || bt == Type.tBool
 }
 
 // ===== global variable classification + emission =====
@@ -226,6 +312,11 @@ def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : Variable
         emit(m, SEC_DECOR, SpvOp.Decorate, vid, uint(SpvDecoration.BuiltIn), uint(bi.bi))
         ctx.globals |> insert(intptr(v), GlobalInfo(var_id = vid, storage = bi.storage, value_type = vt, is_ssbo = false))
         ctx.interface_ids |> push(vid)   // Input + Output builtins both list in the entry interface
+        // gl_FragDepth is Output-only, so any reference to it is a write -> the shader replaces the
+        // fixed-function depth and must declare DepthReplacing. Flagged here at classification.
+        if (bi.bi == SpvBuiltIn.FragDepth) {
+            ctx.uses_frag_depth = true
+        }
         return
     }
     // stage I/O: @in / @out user variables carry an explicit @location. They become Input/Output
@@ -260,7 +351,7 @@ def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : Variable
     // OpTypeSampledImage + DescriptorSet/Binding. Used only via texture(); not in the entry interface.
     let si = sampler_info(v._type)
     if (si.ok) {
-        let img = type_image(m, type_float(m, 32u), si.dim, si.arrayed)
+        let img = type_image(m, type_float(m, 32u), si.dim, si.arrayed, 1u, SpvImageFormat.Unknown, si.depth)
         let simg = type_sampled_image(m, img)
         let pt = type_pointer(m, SpvStorageClass.UniformConstant, simg)
         let vid = alloc_id(m)
@@ -274,8 +365,11 @@ def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : Variable
         emit(m, SEC_DECOR, SpvOp.Decorate, vid, uint(SpvDecoration.DescriptorSet), uint(set))
         emit(m, SEC_DECOR, SpvOp.Decorate, vid, uint(SpvDecoration.Binding), uint(binding))
         ctx.globals |> insert(intptr(v), GlobalInfo(var_id = vid, storage = SpvStorageClass.UniformConstant, value_type = simg, is_sampler = true))
+        // a Depth=1 sampler is a comparison sampler (sampled via textureCompare/Dref); the host binds a
+        // VkSampler created with compareEnable. Otherwise an ordinary combined image sampler.
+        let kind = si.depth != 0u ? SpirvDescriptorKind.comparison_sampler : SpirvDescriptorKind.combined_image_sampler
         reflection.bindings |> push(SpirvDescriptorBinding(set = set, binding = binding,
-            kind = SpirvDescriptorKind.combined_image_sampler, count = 1, stages = stage_flag(stage)))
+            kind = kind, count = 1, stages = stage_flag(stage)))
         return
     }
     // storage image: a global of an opaque image type (image2D) -> UniformConstant OpTypeImage with a
@@ -330,17 +424,11 @@ def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : Variable
             errors |> push("ssbo '{vname}' must be an array<T>")
             return
         }
-        // std430 array stride == element sizeOf only for scalars; vec3/struct elements need
-        // larger aligned strides we don't compute yet. Reject non-scalars rather than emit a
-        // wrong/non-portable layout (Phase 4 adds real std430 layout).
-        let et = v._type.firstType.baseType
-        if (et != Type.tInt && et != Type.tUInt && et != Type.tFloat) {
-            errors |> push("ssbo '{vname}' element must be a 32-bit scalar (int/uint/float) for now — std430 vector/struct layout is not yet implemented")
-            return
-        }
-        let elem_t = emit_type(m, v._type.firstType)
-        let stride = v._type.firstType.sizeOf
-        let rta = type_runtime_array(m, elem_t, stride)
+        // std430 element layout: 32-bit scalar/vector elements stride by their aligned base size,
+        // struct elements are laid out non-Block and stride by their aligned struct size.
+        let el = ssbo_element_layout(m, vname, v._type.firstType, errors)
+        if (!el.ok) return
+        let rta = type_runtime_array(m, el.elem_type, el.stride)
         var members <- [rta]
         var offsets <- [0]
         let st = type_struct_block(m, members, offsets)
@@ -357,7 +445,7 @@ def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : Variable
         }
         emit(m, SEC_DECOR, SpvOp.Decorate, vid, uint(SpvDecoration.DescriptorSet), uint(set))
         emit(m, SEC_DECOR, SpvOp.Decorate, vid, uint(SpvDecoration.Binding), uint(binding))
-        ctx.globals |> insert(intptr(v), GlobalInfo(var_id = vid, storage = SpvStorageClass.StorageBuffer, value_type = st, is_ssbo = true, is_block = true))
+        ctx.globals |> insert(intptr(v), GlobalInfo(var_id = vid, storage = SpvStorageClass.StorageBuffer, value_type = st, is_ssbo = true, is_block = true, elem_type = el.elem_type))
         reflection.bindings |> push(SpirvDescriptorBinding(set = set, binding = binding,
             kind = SpirvDescriptorKind.storage_buffer, count = 1, stages = stage_flag(stage)))
         return
@@ -369,7 +457,7 @@ def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : Variable
             errors |> push("uniform '{vname}' must be a struct")
             return
         }
-        let bs = build_block_struct(m, vname, v._type.structType, errors)
+        let bs = build_block_struct(m, vname, v._type.structType, true, errors)
         if (!bs.ok) return
         let pt = type_pointer(m, SpvStorageClass.Uniform, bs.type_id)
         let vid = alloc_id(m)
@@ -395,7 +483,7 @@ def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : Variable
             errors |> push("push_constant '{vname}' must be a struct")
             return
         }
-        let bs = build_block_struct(m, vname, v._type.structType, errors)
+        let bs = build_block_struct(m, vname, v._type.structType, true, errors)
         if (!bs.ok) return
         let pt = type_pointer(m, SpvStorageClass.PushConstant, bs.type_id)
         let vid = alloc_id(m)
@@ -404,7 +492,42 @@ def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : Variable
         reflection.push_constants |> push(SpirvPushConstantRange(offset = 0, size = bs.size, stages = stage_flag(stage)))
         return
     }
-    errors |> push("unsupported global '{vname}' (expected gl_* builtin, @ssbo, @uniform, @push_constant, or a sampler type e.g. sampler2D)")
+    // workgroup shared memory: @workgroup global -> Workgroup storage (GLSL `shared`). Not a
+    // descriptor and not in the entry interface (Workgroup is not Input/Output, SPIR-V <= 1.3), so no
+    // set/binding and nothing reflected. Compute-only. Read/written via OpLoad/OpStore; a fixed-array
+    // shared global is indexed by visitExprAt's Workgroup branch. (`shared` is a reserved keyword, so
+    // the annotation is spelled @workgroup, matching the SPIR-V storage class.)
+    if (v.annotation |> find_arg("workgroup") is tBool) {
+        if (stage != ShaderStage.Compute) {
+            errors |> push("shared variable '{vname}': @workgroup memory is only valid in a compute shader")
+            return
+        }
+        if (!is_emittable_value_type(v._type)) {
+            errors |> push("shared variable '{vname}': @workgroup type must be a scalar, vector, matrix, or fixed array of those")
+            return
+        }
+        let vt = emit_type(m, v._type)
+        let pt = type_pointer(m, SpvStorageClass.Workgroup, vt)
+        let vid = alloc_id(m)
+        emit(m, SEC_TYPES, SpvOp.Variable, pt, vid, uint(SpvStorageClass.Workgroup))
+        ctx.globals |> insert(intptr(v), GlobalInfo(var_id = vid, storage = SpvStorageClass.Workgroup, value_type = vt, is_ssbo = false))
+        return
+    }
+    // module-scope constant: an immutable `let X = <const-expr>` referenced by the shader body. Fold the
+    // initializer to an OpConstant and resolve references straight to it (no OpVariable / OpLoad), so a
+    // shader can hoist view rectangles, iteration counts, etc. to module scope and share them with the
+    // host. Gated on a const-qualified type (a `let`, not a `var`) AND a const-foldable initializer;
+    // a mutable `var` global, or a non-const initializer, falls through to the error below.
+    if (v.init != null && v._type != null && v._type.flags.constant) {
+        var probe : array<string>
+        let cc = emit_const(m, v.init, probe)
+        delete probe
+        if (cc.ok) {
+            ctx.globals |> insert(intptr(v), GlobalInfo(value_type = emit_type(m, v._type), is_constant = true, const_id = cc.id))
+            return
+        }
+    }
+    errors |> push("unsupported global '{vname}' (expected gl_* builtin, @ssbo, @uniform, @push_constant, @workgroup, a constant `let`, or a sampler type e.g. sampler2D)")
 }
 
 // ===== member index of a struct field by name =====
@@ -425,6 +548,44 @@ def private global_var_of(e : ExpressionPtr) : Variable const? {
     let ev = e ?as ExprVar
     if (ev == null || ev.varFlags.local || ev.varFlags.argument || ev.varFlags._block) return null
     return ev.variable
+}
+
+// ===== root global of an lvalue chain (for an atomic target's memory scope) =====
+// Peels ExprAt/ExprField/ExprSwizzle/ExprRef2Value down to the underlying ExprVar and returns its
+// global Variable (or null if the chain doesn't root in a global). Lets the atomic handler read the
+// target's storage class to pick Workgroup vs Device memory scope.
+def private root_global_of(e : ExpressionPtr) : Variable const? {
+    if (e == null) return null
+    let ev = e ?as ExprVar
+    if (ev != null) {
+        if (ev.varFlags.local || ev.varFlags.argument || ev.varFlags._block) return null
+        return ev.variable
+    }
+    let at = e ?as ExprAt
+    if (at != null) return root_global_of(at.subexpr)
+    let fld = e ?as ExprField
+    if (fld != null) return root_global_of(fld.value)
+    let sw = e ?as ExprSwizzle
+    if (sw != null) return root_global_of(sw.value)
+    let r2v = e ?as ExprRef2Value
+    if (r2v != null) return root_global_of(r2v.subexpr)
+    return null
+}
+
+// ===== atomic call name + operand class -> SPIR-V opcode =====
+// cls: 0 = signed int, 1 = unsigned int. atomicMin/Max pick the signed (SMin/SMax) or unsigned
+// (UMin/UMax) opcode by the operand's signedness; the rest are sign-agnostic. compswap flags the
+// OpAtomicCompareExchange shape (an extra comparator operand + a second semantics id).
+def private atomic_info(name : string; cls : int) : tuple<ok : bool; op : SpvOp; compswap : bool> {
+    if (name == "atomicAdd") return (ok = true, op = SpvOp.AtomicIAdd, compswap = false)
+    if (name == "atomicMin") return (ok = true, op = cls == 1 ? SpvOp.AtomicUMin : SpvOp.AtomicSMin, compswap = false)
+    if (name == "atomicMax") return (ok = true, op = cls == 1 ? SpvOp.AtomicUMax : SpvOp.AtomicSMax, compswap = false)
+    if (name == "atomicAnd") return (ok = true, op = SpvOp.AtomicAnd, compswap = false)
+    if (name == "atomicOr") return (ok = true, op = SpvOp.AtomicOr, compswap = false)
+    if (name == "atomicXor") return (ok = true, op = SpvOp.AtomicXor, compswap = false)
+    if (name == "atomicExchange") return (ok = true, op = SpvOp.AtomicExchange, compswap = false)
+    if (name == "atomicCompSwap") return (ok = true, op = SpvOp.AtomicCompareExchange, compswap = true)
+    return (ok = false, op = SpvOp.AtomicIAdd, compswap = false)
 }
 
 // ===== arithmetic opcode selection =====
@@ -567,6 +728,14 @@ def private ensure_glsl_ext(var m : SpirvModule; var ctx : EmitCtx) : uint {
     delete ops
     ctx.glsl_ext = id
     return id
+}
+
+// OpImageQuerySizeLod (textureSize) requires the ImageQuery capability. Emit it once into SEC_CAPS
+// (which concatenates ahead of the body), deduped via the ctx flag.
+def private ensure_image_query(var m : SpirvModule; var ctx : EmitCtx) {
+    if (ctx.image_query_cap) return
+    emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.ImageQuery))
+    ctx.image_query_cap = true
 }
 
 // daslang math builtin -> GLSL.std.450 ext-inst opcode. abs/min/max/clamp/sign pick the F/S/U
@@ -936,6 +1105,13 @@ class SpirvEmit : AstVisitor {
     def ptr_of(e : ExpressionPtr) : tuple<id : uint; pty : uint> {
         let k = intptr(e)
         if (key_exists(e2ptr, k)) return (id = e2ptr?[k] ?? 0u, pty = e2pty?[k] ?? 0u)
+        // a swizzle that produced a value (not a pointer) used as a write target: a multi-component
+        // swizzle (`v.xy = …`) or a single-component swizzle of a value. Fail-closed with a clear
+        // message rather than the generic "internal: not an lvalue".
+        if (e is ExprSwizzle) {
+            errs |> push("cannot assign through a swizzle — write-swizzle (e.g. `v.xy = …`) is not supported; assign the whole vector instead")
+            return (id = 0u, pty = 0u)
+        }
         errs |> push("internal: {e.__rtti} is not an lvalue")
         return (id = 0u, pty = 0u)
     }
@@ -1022,25 +1198,28 @@ class SpirvEmit : AstVisitor {
             }
         } else {
             let gi = ctx.globals?[intptr(expr.variable)] ?? GlobalInfo()
-            if (gi.var_id == 0u) {   // referenced global was not classified (unsupported / not collected)
-                errs |> push("global '{expr.name}' is not classified")
+            if (gi.is_constant) {   // module-scope constant let -> the folded OpConstant id directly (no pointer/load)
+                e2id[k] = gi.const_id
+            } else {
+                if (gi.var_id == 0u) {   // referenced global was not classified (unsupported / not collected)
+                    errs |> push("global '{expr.name}' is not classified")
+                }
+                e2ptr[k] = gi.var_id
+                e2pty[k] = gi.value_type
             }
-            e2ptr[k] = gi.var_id
-            e2pty[k] = gi.value_type
         }
         return expr
     }
 
-    // ----- swizzle: global single-component -> pointer (AccessChain); value -> extract/shuffle -----
+    // ----- swizzle: single-component global -> pointer (AccessChain, an lvalue); everything else
+    // (multi-component, or a swizzle of any loaded value: local, UBO/SSBO member, sampler result) ->
+    // value path: load the whole source composite, then CompositeExtract (1) / VectorShuffle (many) -----
     def override visitExprSwizzle(var expr : ExprSwizzle?) : ExpressionPtr {
         var bm & = unsafe(*m)
         let k = intptr(expr)
         let gv = global_var_of(expr.value)
-        if (gv != null) {
-            if (length(expr.fields) != 1) {
-                errs |> push("only single-component swizzle of a global is supported for now")
-                return expr
-            }
+        // single-component global -> AccessChain to that one component (keeps it an lvalue: g.x = …)
+        if (gv != null && length(expr.fields) == 1) {
             let gi = ctx.globals?[intptr(gv)] ?? GlobalInfo()
             if (gi.var_id == 0u) {   // global not classified -> never AccessChain through a 0 base
                 errs |> push("swizzle target global '{gv.name}' is not classified")
@@ -1052,23 +1231,25 @@ class SpirvEmit : AstVisitor {
             emit(bm, SEC_FUNCS, SpvOp.AccessChain, ptr_t, res, gi.var_id, const_uint(bm, uint(expr.fields[0])))
             e2ptr[k] = res
             e2pty[k] = pointee
-        } else {
-            let base = value_of(expr.value)
-            if (base == 0u) return expr   // operand failed to lower (error already pushed) — no 0-operand extract/shuffle
-            let rt = emit_type(bm, expr._type)
-            let res = alloc_id(bm)
-            if (length(expr.fields) == 1) {
-                emit(bm, SEC_FUNCS, SpvOp.CompositeExtract, rt, res, base, uint(expr.fields[0]))
-            } else {
-                var ops <- [rt, res, base, base]
-                for (f in expr.fields) {
-                    ops |> push(uint(f))
-                }
-                emit_n(bm, SEC_FUNCS, SpvOp.VectorShuffle, ops)
-                delete ops
-            }
-            e2id[k] = res
+            return expr
         }
+        // value path. value_of loads the whole composite (a bare global loads its OpVariable -> the
+        // full vector; gl_FragCoord.xy, a_pos.xyz, … all reach here now), then extract / shuffle.
+        let base = value_of(expr.value)
+        if (base == 0u) return expr   // operand failed to lower (error already pushed) — no 0-operand extract/shuffle
+        let rt = emit_type(bm, expr._type)
+        let res = alloc_id(bm)
+        if (length(expr.fields) == 1) {
+            emit(bm, SEC_FUNCS, SpvOp.CompositeExtract, rt, res, base, uint(expr.fields[0]))
+        } else {
+            var ops <- [rt, res, base, base]
+            for (f in expr.fields) {
+                ops |> push(uint(f))
+            }
+            emit_n(bm, SEC_FUNCS, SpvOp.VectorShuffle, ops)
+            delete ops
+        }
+        e2id[k] = res
         return expr
     }
 
@@ -1099,13 +1280,27 @@ class SpirvEmit : AstVisitor {
             return expr
         }
         let gi = ctx.globals?[intptr(bv)] ?? GlobalInfo()
+        // @workgroup shared fixed-array: a BARE array global (not wrapped in a Block struct), so the
+        // access chain is a single index off the variable -- no member-0 indirection like an SSBO.
+        if (gi.storage == SpvStorageClass.Workgroup) {
+            let idx = value_of(expr.index)
+            if (idx == 0u) return expr   // index failed to lower (error already pushed)
+            let pointee = emit_type(bm, expr._type)
+            let res = alloc_id(bm)
+            let ptr_t = type_pointer(bm, SpvStorageClass.Workgroup, pointee)
+            emit(bm, SEC_FUNCS, SpvOp.AccessChain, ptr_t, res, gi.var_id, idx)
+            e2ptr[k] = res
+            e2pty[k] = pointee
+            return expr
+        }
         if (!gi.is_ssbo) {
-            errs |> push("only ssbo array indexing is supported for now")
+            errs |> push("only ssbo or @workgroup array indexing is supported for now")
             return expr
         }
         let idx = value_of(expr.index)
         if (idx == 0u) return expr   // index failed to lower (error already pushed) — no 0-operand access chain
-        let pointee = emit_type(bm, expr._type)
+        // use the classified element type-id: a struct element can't go through emit_type
+        let pointee = gi.elem_type != 0u ? gi.elem_type : emit_type(bm, expr._type)
         let res = alloc_id(bm)
         let ptr_t = type_pointer(bm, gi.storage, pointee)
         var ops <- [ptr_t, res, gi.var_id, const_uint(bm, 0u), idx]
@@ -1298,20 +1493,56 @@ class SpirvEmit : AstVisitor {
     }
 
     // ----- return -----
+    // Valueless (`return` in the void entry / a void helper) -> OpReturn; a value return inside a
+    // user-defined shader function -> OpReturnValue with the loaded subexpression. Either way a block
+    // terminator (sets ctx.terminated).
     def override visitExprReturn(var expr : ExprReturn?) : ExpressionPtr {
         var bm & = unsafe(*m)
-        emit(bm, SEC_FUNCS, SpvOp.Return)
+        if (expr.subexpr != null) {
+            let v = value_of(expr.subexpr)
+            if (v != 0u) {
+                emit(bm, SEC_FUNCS, SpvOp.ReturnValue, v)
+            }
+        } else {
+            emit(bm, SEC_FUNCS, SpvOp.Return)
+        }
         ctx.terminated = true
         return expr
     }
 
     // ----- member of a Block global (ubo.color) -> OpAccessChain by field index -> pointer -----
+    // Two shapes: a direct block global (ubo.color), and a field of an indexed SSBO struct element
+    // (particles[i].pos) where expr.value is the ExprAt's element pointer — chain the field off it.
     def override visitExprField(var expr : ExprField?) : ExpressionPtr {
         var bm & = unsafe(*m)
         let k = intptr(expr)
         let bv = global_var_of(expr.value)
         if (bv == null) {
-            errs |> push("member access '.{expr.name}' is only supported on a @uniform/@ssbo/@push_constant block global for now")
+            if (key_exists(e2ptr, intptr(expr.value))) {
+                let base = ptr_of(expr.value)
+                let est = expr.value._type.structType
+                if (est == null) {
+                    errs |> push("member access '.{expr.name}': base is not a struct value")
+                    return expr
+                }
+                let midx = field_index_by_name(est, "{expr.name}")
+                if (midx < 0) {
+                    errs |> push("member access '.{expr.name}': no such field")
+                    return expr
+                }
+                // chain the field pointer in the element pointer's storage class (StorageBuffer for an SSBO)
+                let av = expr.value ?as ExprAt
+                let rgi = av != null ? (ctx.globals?[intptr(global_var_of(av.subexpr))] ?? GlobalInfo()) : GlobalInfo()
+                let storage = rgi.var_id != 0u ? rgi.storage : SpvStorageClass.StorageBuffer
+                let pointee = emit_type(bm, expr._type)
+                let ptr_t = type_pointer(bm, storage, pointee)
+                let res = alloc_id(bm)
+                emit(bm, SEC_FUNCS, SpvOp.AccessChain, ptr_t, res, base.id, const_uint(bm, uint(midx)))
+                e2ptr[k] = res
+                e2pty[k] = pointee
+                return expr
+            }
+            errs |> push("member access '.{expr.name}' is only supported on a @uniform/@ssbo/@push_constant block global or an indexed ssbo struct element for now")
             return expr
         }
         let gi = ctx.globals?[intptr(bv)] ?? GlobalInfo()
@@ -1333,6 +1564,59 @@ class SpirvEmit : AstVisitor {
         return expr
     }
 
+    // ----- user-defined shader function call: OpFunctionCall + ref-param copy-in/copy-out -----
+    // Value args pass their loaded value directly. Each by-reference arg goes through a Function-storage
+    // temp (pre-allocated into this function's entry block by alloc_call_temps): copy the current value
+    // in before the call, then copy the (mutated) temp back to the original lvalue after — SPIR-V's
+    // Logical addressing forbids handing an access-chain pointer straight to a call.
+    def emit_user_call(var bm : SpirvModule; expr : ExprCall?; uf : UserFunc) {
+        let f = expr.func
+        let res = alloc_id(bm)
+        var ops <- [uf.ret_type, res, uf.fn_id]
+        var ref_temps : array<tuple<temp : uint; orig : uint; vt : uint>>
+        for (arg, i in expr.arguments, count()) {
+            let is_ref = i < length(f.arguments) && f.arguments[i]._type.flags.ref && !f.arguments[i]._type.flags.constant
+            if (is_ref) {
+                let ct = ctx.call_temps?[intptr(arg)] ?? CallTemp()
+                if (ct.ptr_id == 0u) {
+                    errs |> push("internal: missing copy-in/out temp for a by-reference argument to '{f.name}'")
+                    delete ops
+                    delete ref_temps
+                    return
+                }
+                let v = value_of(arg)        // copy-in: current value of the lvalue
+                let p = ptr_of(arg)          // original lvalue, for copy-out
+                if (v == 0u || p.id == 0u) {
+                    delete ops
+                    delete ref_temps
+                    return
+                }
+                emit(bm, SEC_FUNCS, SpvOp.Store, ct.ptr_id, v)
+                ops |> push(ct.ptr_id)
+                ref_temps |> push((temp = ct.ptr_id, orig = p.id, vt = ct.value_type))
+            } else {
+                let v = value_of(arg)
+                if (v == 0u) {
+                    delete ops
+                    delete ref_temps
+                    return
+                }
+                ops |> push(v)
+            }
+        }
+        emit_n(bm, SEC_FUNCS, SpvOp.FunctionCall, ops)
+        delete ops
+        for (rt in ref_temps) {
+            let lv = alloc_id(bm)
+            emit(bm, SEC_FUNCS, SpvOp.Load, rt.vt, lv, rt.temp)
+            emit(bm, SEC_FUNCS, SpvOp.Store, rt.orig, lv)
+        }
+        delete ref_temps
+        if (!uf.is_void) {
+            e2id[intptr(expr)] = res
+        }
+    }
+
     // ----- calls: texture / vector constructors / dot / GLSL.std.450 math (args pre-visited) -----
     // Mirrors emit_call but reads operand ids via value_of (children already visited). for-source
     // range()/urange() calls are consumed by preVisitExprForBody and skipped here.
@@ -1341,6 +1625,194 @@ class SpirvEmit : AstVisitor {
         var bm & = unsafe(*m)
         let name = "{expr.name}"
         let k = intptr(expr)
+        // discard(): abandon the fragment -> OpKill. A block terminator (sets ctx.terminated), so any
+        // following statement on the same path is rejected as unreachable. Fragment-only.
+        if (name == "discard") {
+            if (ctx.stage != ShaderStage.Fragment) {
+                errs |> push("discard() is only valid in a fragment shader")
+                return expr
+            }
+            if (!empty(expr.arguments)) {
+                errs |> push("discard() takes no arguments")
+                return expr
+            }
+            emit(bm, SEC_FUNCS, SpvOp.Kill)
+            ctx.terminated = true
+            return expr
+        }
+        // barrier(): control + shared-memory barrier (OpControlBarrier at Workgroup execution+memory
+        // scope, WorkgroupMemory|AcquireRelease semantics). memoryBarrierShared(): the memory-only
+        // variant (OpMemoryBarrier, same scope/semantics). Both compute-only; not block terminators.
+        if (name == "barrier" || name == "memoryBarrierShared") {
+            if (ctx.stage != ShaderStage.Compute) {
+                errs |> push("{name}() is only valid in a compute shader")
+                return expr
+            }
+            if (!empty(expr.arguments)) {
+                errs |> push("{name}() takes no arguments")
+                return expr
+            }
+            let scope = const_uint(bm, uint(SpvScope.Workgroup))
+            let sem = const_uint(bm, uint(SpvMemorySemantics.WorkgroupMemory) | uint(SpvMemorySemantics.AcquireRelease))
+            if (name == "barrier") {
+                emit(bm, SEC_FUNCS, SpvOp.ControlBarrier, scope, scope, sem)
+            } else {
+                emit(bm, SEC_FUNCS, SpvOp.MemoryBarrier, scope, sem)
+            }
+            return expr
+        }
+        // atomics: atomicAdd/Min/Max/And/Or/Xor/Exchange/CompSwap on a @workgroup or @ssbo lvalue,
+        // returning the OLD value. The mem param is a reference (T&), so the first arg stays an lvalue
+        // and ptr_of recovers its pointer (peel a defensive ExprRef2Value in case daslang loaded it).
+        // Scope = Workgroup for shared memory, Device for buffer memory; Relaxed semantics (glslang's
+        // default for GLSL atomics). 6-operand shape -> emit_n; CompSwap adds a comparator + neq-sem.
+        let acls = empty(expr.arguments) ? -1 : scalar_class(expr.arguments[0]._type.baseType)
+        let ainfo = atomic_info(name, acls)
+        if (ainfo.ok) {
+            let nargs = ainfo.compswap ? 3 : 2
+            if (length(expr.arguments) != nargs) {
+                errs |> push("{name} expects {nargs} arguments")
+                return expr
+            }
+            if (acls != 0 && acls != 1) {
+                errs |> push("{name}: atomic target must be int or uint")
+                return expr
+            }
+            let arg0 = expr.arguments[0]
+            let r2v = arg0 ?as ExprRef2Value
+            let lvexpr = r2v != null ? r2v.subexpr : arg0
+            let rg = root_global_of(lvexpr)
+            if (rg == null) {
+                errs |> push("{name}: target must be a @workgroup or @ssbo global lvalue")
+                return expr
+            }
+            let p = ptr_of(lvexpr)
+            if (p.id == 0u) {
+                errs |> push("{name}: target is not an addressable lvalue")
+                return expr
+            }
+            let rgi = ctx.globals?[intptr(rg)] ?? GlobalInfo()
+            // only @workgroup (Workgroup) and @ssbo (StorageBuffer) are writable atomic targets; a
+            // @uniform/@push_constant/builtin lvalue is read-only storage -> reject cleanly rather than
+            // emit an OpAtomic* on an invalid storage class (fail-closed, not spirv-val-only).
+            if (rgi.storage != SpvStorageClass.Workgroup && rgi.storage != SpvStorageClass.StorageBuffer) {
+                errs |> push("{name}: atomic target must live in @workgroup or @ssbo memory")
+                return expr
+            }
+            let scope = rgi.storage == SpvStorageClass.Workgroup ? SpvScope.Workgroup : SpvScope.Device
+            let sc_id = const_uint(bm, uint(scope))
+            let sem_id = const_uint(bm, uint(SpvMemorySemantics.Relaxed))
+            let rt = emit_type(bm, expr._type)
+            let res = alloc_id(bm)
+            if (ainfo.compswap) {
+                let val = value_of(expr.arguments[2])
+                let cmp = value_of(expr.arguments[1])
+                if (val == 0u || cmp == 0u) return expr
+                // OpAtomicCompareExchange: rt res ptr scope eq-sem neq-sem value comparator
+                var ops <- [rt, res, p.id, sc_id, sem_id, sem_id, val, cmp]
+                emit_n(bm, SEC_FUNCS, SpvOp.AtomicCompareExchange, ops)
+                delete ops
+            } else {
+                let val = value_of(expr.arguments[1])
+                if (val == 0u) return expr
+                var ops <- [rt, res, p.id, sc_id, sem_id, val]
+                emit_n(bm, SEC_FUNCS, ainfo.op, ops)
+                delete ops
+            }
+            e2id[k] = res
+            return expr
+        }
+        // dFdx/dFdy/fwidth: screen-space derivatives over the 2x2 quad (OpDPdx/OpDPdy/OpFwidth).
+        // Fragment-only; one float/floatN operand, same-typed result. No extra capability (the basic
+        // forms need only Shader; the *Fine/*Coarse variants would need DerivativeControl).
+        if (name == "dFdx" || name == "dFdy" || name == "fwidth") {
+            if (length(expr.arguments) != 1) {
+                errs |> push("{name} expects 1 argument")
+                return expr
+            }
+            if (ctx.stage != ShaderStage.Fragment) {
+                errs |> push("{name}: screen-space derivatives are only valid in a fragment shader")
+                return expr
+            }
+            let a = value_of(expr.arguments[0])
+            if (a == 0u) return expr
+            let rt = emit_type(bm, expr._type)
+            let res = alloc_id(bm)
+            let op = (name == "dFdx" ? SpvOp.DPdx : (name == "dFdy" ? SpvOp.DPdy : SpvOp.Fwidth))
+            emit(bm, SEC_FUNCS, op, rt, res, a)
+            e2id[k] = res
+            return expr
+        }
+        // textureSize(sampler, lod): mip-level dimensions in texels (OpImageQuerySizeLod). Extract the
+        // image from the sampled image (OpImage), then query; needs the ImageQuery capability.
+        if (name == "textureSize") {
+            if (length(expr.arguments) != 2) {
+                errs |> push("textureSize expects (sampler, lod)")
+                return expr
+            }
+            let sg = global_var_of(expr.arguments[0])
+            if (sg == null) {
+                errs |> push("textureSize: first argument must be a sampler global")
+                return expr
+            }
+            let gi = ctx.globals?[intptr(sg)] ?? GlobalInfo()
+            if (!gi.is_sampler) {
+                errs |> push("textureSize: '{sg.name}' is not a sampler")
+                return expr
+            }
+            ensure_image_query(bm, *ctx)
+            let simg = alloc_id(bm)
+            emit(bm, SEC_FUNCS, SpvOp.Load, gi.value_type, simg, gi.var_id)
+            let si = sampler_info(sg._type)
+            // reconstruct the SAME image type classify_global built for this sampler so OpImage's
+            // result type matches the sampled image's image type -- depth included (type_image dedups on it)
+            let img_type = type_image(bm, type_float(bm, 32u), si.dim, si.arrayed, 1u, SpvImageFormat.Unknown, si.depth)
+            let img = alloc_id(bm)
+            emit(bm, SEC_FUNCS, SpvOp.Image, img_type, img, simg)
+            let lod = value_of(expr.arguments[1])
+            if (lod == 0u) return expr
+            let rt = emit_type(bm, expr._type)
+            let res = alloc_id(bm)
+            emit(bm, SEC_FUNCS, SpvOp.ImageQuerySizeLod, rt, res, img, lod)
+            e2id[k] = res
+            return expr
+        }
+        // textureCompare(sampler2DShadow, uv, compare): depth-compare sampling. OpLoad the comparison
+        // sampler + OpImageSampleDrefImplicitLod with the reference value as the Dref operand; the
+        // scalar result is the comparison (1 = lit, 0 = shadowed; filtered -> PCF average). Implicit
+        // LOD -> fragment-only.
+        if (name == "textureCompare") {
+            if (length(expr.arguments) != 3) {
+                errs |> push("textureCompare expects (sampler2DShadow, uv, compare)")
+                return expr
+            }
+            if (ctx.stage != ShaderStage.Fragment) {
+                errs |> push("textureCompare: implicit-LOD depth-compare sampling is only valid in a fragment shader")
+                return expr
+            }
+            let sg = global_var_of(expr.arguments[0])
+            if (sg == null) {
+                errs |> push("textureCompare: first argument must be a sampler2DShadow global")
+                return expr
+            }
+            let gi = ctx.globals?[intptr(sg)] ?? GlobalInfo()
+            if (!gi.is_sampler || sampler_info(sg._type).depth == 0u) {
+                errs |> push("textureCompare: '{sg.name}' is not a sampler2DShadow (depth-compare sampler)")
+                return expr
+            }
+            let simg = alloc_id(bm)
+            emit(bm, SEC_FUNCS, SpvOp.Load, gi.value_type, simg, gi.var_id)
+            let uv = value_of(expr.arguments[1])
+            let dref = value_of(expr.arguments[2])
+            if (uv == 0u || dref == 0u) return expr
+            let rt = emit_type(bm, expr._type)
+            let res = alloc_id(bm)
+            var ops <- [rt, res, simg, uv, dref]
+            emit_n(bm, SEC_FUNCS, SpvOp.ImageSampleDrefImplicitLod, ops)
+            delete ops
+            e2id[k] = res
+            return expr
+        }
         // texture(sampler, uv): OpLoad the sampled image + OpImageSampleImplicitLod
         if (name == "texture") {
             if (length(expr.arguments) != 2) {
@@ -1422,7 +1894,9 @@ class SpirvEmit : AstVisitor {
             emit(bm, SEC_FUNCS, SpvOp.Load, gi.value_type, simg, gi.var_id)
             // extract the underlying image (same dedup key classify_global used for the sampler)
             let si = sampler_info(sg._type)
-            let img_type = type_image(bm, type_float(bm, 32u), si.dim, si.arrayed)
+            // reconstruct the SAME image type classify_global built for this sampler so OpImage's
+            // result type matches the sampled image's image type -- depth included (type_image dedups on it)
+            let img_type = type_image(bm, type_float(bm, 32u), si.dim, si.arrayed, 1u, SpvImageFormat.Unknown, si.depth)
             let img = alloc_id(bm)
             emit(bm, SEC_FUNCS, SpvOp.Image, img_type, img, simg)
             let coord = value_of(expr.arguments[1])
@@ -1525,6 +1999,32 @@ class SpirvEmit : AstVisitor {
             let rt = emit_type(bm, expr._type)
             let res = alloc_id(bm)
             emit(bm, SEC_FUNCS, SpvOp.ImageRead, rt, res, imgval, coord)
+            e2id[k] = res
+            return expr
+        }
+        // imageSize(image) : int2: the storage image's dimensions in texels (OpImageQuerySize, no LOD --
+        // a storage image is Sampled=2, so the no-LOD query is legal). Needs the ImageQuery capability.
+        if (name == "imageSize") {
+            if (length(expr.arguments) != 1) {
+                errs |> push("imageSize expects (image)")
+                return expr
+            }
+            let ig = global_var_of(expr.arguments[0])
+            if (ig == null) {
+                errs |> push("imageSize: argument must be a storage-image global")
+                return expr
+            }
+            let gi = ctx.globals?[intptr(ig)] ?? GlobalInfo()
+            if (!gi.is_storage_image) {
+                errs |> push("imageSize: '{ig.name}' is not a storage image")
+                return expr
+            }
+            ensure_image_query(bm, *ctx)
+            let imgval = alloc_id(bm)
+            emit(bm, SEC_FUNCS, SpvOp.Load, gi.value_type, imgval, gi.var_id)
+            let rt = emit_type(bm, expr._type)
+            let res = alloc_id(bm)
+            emit(bm, SEC_FUNCS, SpvOp.ImageQuerySize, rt, res, imgval)
             e2id[k] = res
             return expr
         }
@@ -1655,6 +2155,19 @@ class SpirvEmit : AstVisitor {
             emit_n(bm, SEC_FUNCS, SpvOp.ExtInst, ops)
             delete ops
             e2id[k] = res
+            return expr
+        }
+        // user-defined shader function -> OpFunctionCall (copy-in / copy-out around ref params)
+        if (expr.func != null && key_exists(ctx.user_funcs, intptr(expr.func))) {
+            let uf = ctx.user_funcs?[intptr(expr.func)] ?? UserFunc()
+            if (!uf.valid) return expr   // signature rejected at registration; error already emitted
+            emit_user_call(bm, expr, uf)
+            return expr
+        }
+        // a resolved call we can't lower: a host/extern builtin (print, ...) or a daslang function in
+        // an unsupported module. Fail-closed with a clear message rather than the generic one below.
+        if (expr.func != null) {
+            errs |> push("cannot call '{name}' in a SPIR-V shader — only user-defined shader functions and built-in shader intrinsics (texture/imageStore/dot/math/...) are callable")
             return expr
         }
         errs |> push("unsupported call '{name}' (not a vector constructor, dot, or GLSL.std.450 math builtin)")
@@ -2029,6 +2542,213 @@ def private drive_emit(var m : SpirvModule; var ctx : EmitCtx; fn : FunctionPtr;
     }
 }
 
+// ===== user-defined shader functions =====
+// A dependency function is emitted as its own OpFunction iff it is a real daslang function with a
+// body that we control — not the entry point, not a host/extern builtin, and not a function whose
+// calls are intercepted by name (math -> GLSL.std.450, spirv_builtins -> texture/imageStore/...).
+def private is_user_shader_func(f : Function const?; entry : FunctionPtr) : bool {
+    // `f == null` short-circuits first, so the later field reads never deref a null pointer.
+    if (f == null || intptr(f) == intptr(entry) || f.flags.builtIn || f.body == null) return false
+    // module "" is the user's own root module (a shader written without an explicit `module` line) —
+    // a valid place for helper functions. Host/extern builtins are already excluded by flags.builtIn
+    // above; the named modules below have their calls intercepted by name (math -> GLSL.std.450,
+    // spirv_builtins -> texture/imageStore/...), so they must never be emitted as OpFunctions.
+    let mn = "{f._module.name}"
+    return !(mn == "builtin" || mn == "math" || mn == "math_bits" || mn == "spirv_builtins")
+}
+
+// Validate a user function's signature, allocate its OpFunction id + OpTypeFunction, and record it.
+// Only 32-bit scalar/vector results+params are supported (by value, or by reference for params);
+// anything else is rejected here with a clean error so a later call site doesn't emit invalid SPIR-V.
+def private register_user_func(var m : SpirvModule; var ctx : EmitCtx; f : Function const?; var errors : array<string>) {
+    if (key_exists(ctx.user_funcs, intptr(f))) return
+    var uf = UserFunc(fn = f, valid = true, is_void = false, fn_id = 0u, type_id = 0u, ret_type = 0u)
+    if (f.result.baseType == Type.tVoid) {
+        uf.is_void = true
+        uf.ret_type = type_void(m)
+    } elif (is_emittable_value_type(f.result) && f.result.baseType != Type.tFixedArray) {
+        uf.ret_type = emit_type(m, f.result)
+    } else {
+        errors |> push("shader function '{f.name}': return type {f.result.baseType} is not supported (only void and 32-bit scalar/vector/matrix results)")
+        uf.valid = false
+    }
+    var ptypes : array<uint>
+    for (arg in f.arguments) {
+        let at = arg._type
+        if (!is_emittable_value_type(at) || at.baseType == Type.tFixedArray) {
+            errors |> push("shader function '{f.name}': parameter '{arg.name}' of type {at.baseType} is not supported (only 32-bit scalar/vector/matrix parameters, by value or by reference)")
+            uf.valid = false
+            continue
+        }
+        let vt = emit_type(m, at)
+        if (at.flags.ref && !at.flags.constant) {
+            ptypes |> push(type_pointer(m, SpvStorageClass.Function, vt))
+        } else {
+            ptypes |> push(vt)
+        }
+    }
+    if (uf.valid) {
+        uf.fn_id = alloc_id(m)
+        uf.type_id = type_function(m, uf.ret_type, ptypes)
+    }
+    delete ptypes
+    ctx.user_funcs |> insert(intptr(f), uf)
+    ctx.user_order |> push(intptr(f))
+}
+
+// Mini-visitor: collect the user-function call targets directly invoked from one function body
+// (for the recursion / call-graph check). Only records targets already in ctx.user_funcs.
+class SpirvCalleeScan : AstVisitor {
+    adapter : VisitorAdapter?
+    @do_not_delete ctx : EmitCtx?
+    callees : table<uint64>
+    def override preVisitExprCall(expr : ExprCall?) : void {
+        if (expr.func != null && key_exists(ctx.user_funcs, intptr(expr.func))) {
+            callees |> insert(intptr(expr.func))
+        }
+    }
+}
+
+def private scan_callees(var ctx : EmitCtx; f : Function const?; var out : table<uint64>) {
+    let fnc = unsafe(reinterpret<FunctionPtr>(f))   // read-only walk; strip pointee const for visit
+    var v = new SpirvCalleeScan(ctx = unsafe(addr(ctx)))
+    make_visitor(*v) $(mv_adapter) {
+        v.adapter = mv_adapter
+        visit(fnc.body, v.adapter)
+    }
+    for (k in keys(v.callees)) {
+        out |> insert(k)
+    }
+    unsafe {
+        delete v
+    }
+}
+
+def private has_cycle_from(u : uint64; var adj : table<uint64; array<uint64>>; var color : table<uint64; int>) : bool {
+    color[u] = 1
+    if (key_exists(adj, u)) {
+        for (w in adj[u]) {
+            let c = color?[w] ?? 0
+            if (c == 1 || (c == 0 && has_cycle_from(w, adj, color))) return true   // gray = back-edge -> cycle
+        }
+    }
+    color[u] = 2
+    return false
+}
+
+// SPIR-V (without recursion capability) forbids any function being part of a call cycle. Build the
+// call graph over {entry} + user_funcs and report a clean error on any cycle (direct or mutual).
+def private detect_recursion(var ctx : EmitCtx; entry : FunctionPtr; var errors : array<string>) : bool {
+    var adj : table<uint64; array<uint64>>
+    // entry node
+    {
+        var cs : table<uint64>
+        scan_callees(ctx, entry, cs)
+        adj[intptr(entry)] <- [for (k in keys(cs)); k]
+        delete cs
+    }
+    for (key in ctx.user_order) {
+        let uf = ctx.user_funcs?[key] ?? UserFunc()
+        if (!uf.valid) continue
+        var cs : table<uint64>
+        scan_callees(ctx, uf.fn, cs)
+        adj[key] <- [for (k in keys(cs)); k]
+        delete cs
+    }
+    var color : table<uint64; int>
+    var found = false
+    if (has_cycle_from(intptr(entry), adj, color)) {
+        found = true
+    }
+    for (key in ctx.user_order) {
+        if (found) break
+        if ((color?[key] ?? 0) == 0 && has_cycle_from(key, adj, color)) {
+            found = true
+        }
+    }
+    if (found) {
+        errors |> push("recursion is not supported in SPIR-V shaders (a shader function is part of a call cycle)")
+    }
+    delete color
+    delete adj
+    return found
+}
+
+// Mini-visitor: hoist one Function-storage OpVariable into the current function's entry block for
+// every by-reference argument of every user-function call in its body. Run after collect_locals and
+// before the body walk, so the temps lead the entry block (SPIR-V requires all OpVariable there).
+class SpirvTempAlloc : AstVisitor {
+    adapter : VisitorAdapter?
+    @do_not_delete m   : SpirvModule?
+    @do_not_delete ctx : EmitCtx?
+    def override preVisitExprCall(expr : ExprCall?) : void {
+        let f = expr.func
+        if (f == null || !key_exists(ctx.user_funcs, intptr(f))) return
+        let uf = ctx.user_funcs?[intptr(f)] ?? UserFunc()
+        if (!uf.valid) return
+        var bm & = unsafe(*m)
+        for (arg, i in expr.arguments, count()) {
+            if (i >= length(f.arguments)) break
+            let pt = f.arguments[i]._type
+            if (pt.flags.ref && !pt.flags.constant) {
+                if (key_exists(ctx.call_temps, intptr(arg))) continue
+                let vt = emit_type(bm, pt)
+                let ptr_t = type_pointer(bm, SpvStorageClass.Function, vt)
+                let pid = alloc_id(bm)
+                emit(bm, SEC_FUNCS, SpvOp.Variable, ptr_t, pid, uint(SpvStorageClass.Function))
+                ctx.call_temps |> insert(intptr(arg), CallTemp(ptr_id = pid, value_type = vt))
+            }
+        }
+    }
+}
+
+def private alloc_call_temps(var m : SpirvModule; var ctx : EmitCtx; f : FunctionPtr) {
+    var v = new SpirvTempAlloc(m = unsafe(addr(m)), ctx = unsafe(addr(ctx)))
+    make_visitor(*v) $(mv_adapter) {
+        v.adapter = mv_adapter
+        visit(f.body, v.adapter)
+    }
+    unsafe {
+        delete v
+    }
+}
+
+// Emit one user-defined shader function: OpFunction, its OpFunctionParameters (value params bind an
+// SSA id; ref params bind a Function pointer), the entry block (locals + ref-arg temps), the body,
+// and the trailing return. The result id / type were pre-allocated by register_user_func.
+def private emit_user_function(var m : SpirvModule; var ctx : EmitCtx; uf : UserFunc; var errors : array<string>) {
+    let f = unsafe(reinterpret<FunctionPtr>(uf.fn))   // read-only emission; strip pointee const
+    emit(m, SEC_FUNCS, SpvOp.Function, uf.ret_type, uf.fn_id, 0u, uf.type_id)
+    for (arg in f.arguments) {
+        let at = arg._type
+        let vt = emit_type(m, at)
+        let pid = alloc_id(m)
+        if (at.flags.ref && !at.flags.constant) {
+            let pt = type_pointer(m, SpvStorageClass.Function, vt)
+            emit(m, SEC_FUNCS, SpvOp.FunctionParameter, pt, pid)
+            ctx.local_vars |> insert(intptr(arg), LocalVar(ptr_id = pid, value_type = vt))
+        } else {
+            emit(m, SEC_FUNCS, SpvOp.FunctionParameter, vt, pid)
+            ctx.locals |> insert(intptr(arg), pid)
+        }
+    }
+    let id_label = alloc_id(m)
+    emit(m, SEC_FUNCS, SpvOp.Label, id_label)
+    ctx.terminated = false
+    collect_locals(m, ctx, f.body, errors)
+    alloc_call_temps(m, ctx, f)
+    drive_emit(m, ctx, f, errors)
+    if (!ctx.terminated) {
+        if (uf.is_void) {
+            emit(m, SEC_FUNCS, SpvOp.Return)
+        } else {
+            errors |> push("shader function '{f.name}': not every control-flow path returns a value")
+            emit(m, SEC_FUNCS, SpvOp.Unreachable)
+        }
+    }
+    emit(m, SEC_FUNCS, SpvOp.FunctionEnd)
+}
+
 // ===== entry =====
 def private execution_model(stage : ShaderStage) : SpvExecutionModel {
     if (stage == ShaderStage.Vertex) return SpvExecutionModel.Vertex
@@ -2053,11 +2773,19 @@ def generate_spirv(fn : FunctionPtr; var errors : array<string>; stage : ShaderS
     emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.Shader))
     emit(m, SEC_MEMMODEL, SpvOp.MemoryModel, uint(SpvAddressingModel.Logical), uint(SpvMemoryModel.GLSL450))
 
-    collect_dependencies(fn) $(_vfun, vvar) {
+    collect_dependencies(fn) $(vfun, vvar) {
         for (v in vvar) {
             classify_global(m, ctx, v, stage, reflection, errors)
         }
+        // Register every user-defined dependency function (stable collect_dependencies order) so calls
+        // can forward-reference a not-yet-emitted callee; their bodies are emitted after the entry point.
+        for (uffn in vfun) {
+            if (is_user_shader_func(uffn, fn)) {
+                register_user_func(m, ctx, uffn, errors)
+            }
+        }
     }
+    detect_recursion(ctx, fn, errors)
 
     let t_void = type_void(m)
     let t_fn = type_function_void(m, t_void)
@@ -2081,6 +2809,11 @@ def generate_spirv(fn : FunctionPtr; var errors : array<string>; stage : ShaderS
         delete em
     } elif (stage == ShaderStage.Fragment) {
         emit(m, SEC_EXECMODE, SpvOp.ExecutionMode, id_main, uint(SpvExecutionMode.OriginUpperLeft))
+        // gl_FragDepth referenced (detected by classify_global above; Output-only, so a reference is a
+        // write) -> the shader replaces the fixed-function depth.
+        if (ctx.uses_frag_depth) {
+            emit(m, SEC_EXECMODE, SpvOp.ExecutionMode, id_main, uint(SpvExecutionMode.DepthReplacing))
+        }
     }
 
     emit(m, SEC_FUNCS, SpvOp.Function, t_void, id_main, 0u, t_fn)
@@ -2090,6 +2823,7 @@ def generate_spirv(fn : FunctionPtr; var errors : array<string>; stage : ShaderS
 
     // Function-storage OpVariables must lead the entry block, before any body code.
     collect_locals(m, ctx, fn.body, errors)
+    alloc_call_temps(m, ctx, fn)
     // Body codegen: the SpirvEmit AstVisitor walks fn.body, emitting into m.
     drive_emit(m, ctx, fn, errors)
 
@@ -2097,6 +2831,14 @@ def generate_spirv(fn : FunctionPtr; var errors : array<string>; stage : ShaderS
         emit(m, SEC_FUNCS, SpvOp.Return)
     }
     emit(m, SEC_FUNCS, SpvOp.FunctionEnd)
+
+    // user-defined shader functions, in stable registration order, after the entry point
+    for (key in ctx.user_order) {
+        let uf = ctx.user_funcs?[key] ?? UserFunc()
+        if (uf.valid) {
+            emit_user_function(m, ctx, uf, errors)
+        }
+    }
 
     var words <- module_words(m)
     delete m

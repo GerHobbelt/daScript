@@ -13,55 +13,53 @@ module spirv_reflect shared public
 
 //! Descriptor kind, independent of any graphics API (the host maps it to e.g. VkDescriptorType).
 enum SpirvDescriptorKind {
-    uniform_buffer
-    storage_buffer
-    combined_image_sampler
-    storage_image
-    sampled_image
-    sampler
+    uniform_buffer          //!< a `@uniform` block (UBO)
+    storage_buffer          //!< an `@ssbo` (SSBO)
+    combined_image_sampler  //!< a `sampler2D`/`3D`/`Cube`/`2DArray` (image + sampler in one descriptor)
+    storage_image           //!< an `image2D` (read-write storage image)
+    sampled_image           //!< a standalone `texture2D` (separate-image model)
+    sampler                 //!< a standalone `sampler` (separate-sampler model)
+    comparison_sampler      //!< a `sampler2DShadow` (depth-compare combined sampler, sampled via textureCompare)
 }
 
 //! Stages a binding / push range is used in (the host maps to e.g. VkShaderStageFlags). A single
 //! shader emits one bit; the host ORs the bits when merging reflections that share a (set, binding).
 bitfield SpirvStageFlags {
-    vertex
-    fragment
-    compute
+    vertex      //!< used in the vertex stage
+    fragment    //!< used in the fragment stage
+    compute     //!< used in the compute stage
 }
 
 //! One descriptor binding (a UBO / SSBO / combined image sampler) at a (set, binding) slot.
 struct SpirvDescriptorBinding {
-    set     : int
-    binding : int
-    kind    : SpirvDescriptorKind
+    set     : int                   //!< descriptor-set index (`@set`)
+    binding : int                   //!< binding index within the set (`@binding`)
+    kind    : SpirvDescriptorKind   //!< what kind of descriptor this is
     count   : int                   //!< array size; 1 for a non-array binding
-    stages  : SpirvStageFlags
+    stages  : SpirvStageFlags       //!< stages this binding is used in
 }
 
 //! One push-constant range (offset / size in bytes, both 4-aligned).
 struct SpirvPushConstantRange {
-    offset : int
-    size   : int
-    stages : SpirvStageFlags
+    offset : int             //!< byte offset of the range (4-aligned)
+    size   : int             //!< byte size of the range (4-aligned)
+    stages : SpirvStageFlags //!< stages this range is used in
 }
 
 //! Everything the host needs to build descriptor-set + pipeline layouts for one shader stage.
 struct SpirvReflection {
-    stage          : SpirvStageFlags
-    //! Entry-point name (the host passes this as VkPipelineShaderStageCreateInfo.pName). The emitter
-    //! always names the entry "main", so this is an invariant — NOT serialized by encode_reflection;
-    //! decode_reflection always restores it as "main". Kept in the struct so the host reads one value.
-    entry_point    : string
-    local_size     : int3           //!< compute workgroup size; (1,1,1) for graphics stages
-    bindings       : array<SpirvDescriptorBinding>
-    push_constants : array<SpirvPushConstantRange>
+    stage          : SpirvStageFlags                //!< which stage this reflection describes
+    entry_point    : string                         //!< entry-point name; always "main" (invariant, not serialized — decode restores it)
+    local_size     : int3                           //!< compute workgroup size; (1,1,1) for graphics stages
+    bindings       : array<SpirvDescriptorBinding>  //!< descriptor bindings (UBO / SSBO / image / sampler)
+    push_constants : array<SpirvPushConstantRange>  //!< push-constant ranges
 }
 
-// 'RFL2' — wire-format magic + version. Bump on any layout OR descriptor-kind change to encode/
+// 'RFL3' — wire-format magic + version. Bump on any layout OR descriptor-kind change to encode/
 // decode_reflection, so an older consumer rejects a newer stream loudly instead of mis-mapping an
-// unknown SpirvDescriptorKind (kind_from_int falls back to uniform_buffer). Bumped to RFL2 in Phase 7
-// (added storage_image / sampled_image / sampler kinds).
-let REFLECTION_MAGIC = 0x52464C32u
+// unknown SpirvDescriptorKind (kind_from_int falls back to uniform_buffer). RFL2 = Phase 7
+// (storage_image / sampled_image / sampler); RFL3 = Phase 10.4 (comparison_sampler).
+let REFLECTION_MAGIC = 0x52464C33u
 
 def finalize(var r : SpirvReflection) {
     delete r.bindings
@@ -98,6 +96,7 @@ def private kind_from_int(k : int) : SpirvDescriptorKind {
     if (k == int(SpirvDescriptorKind.storage_image)) return SpirvDescriptorKind.storage_image
     if (k == int(SpirvDescriptorKind.sampled_image)) return SpirvDescriptorKind.sampled_image
     if (k == int(SpirvDescriptorKind.sampler)) return SpirvDescriptorKind.sampler
+    if (k == int(SpirvDescriptorKind.comparison_sampler)) return SpirvDescriptorKind.comparison_sampler
     return SpirvDescriptorKind.uniform_buffer
 }
 

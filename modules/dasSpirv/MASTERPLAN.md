@@ -1214,3 +1214,264 @@ two already partly done:
 
 **This closes the emitter language surface.** Phases 9 (docs/tutorial), 10 (examples/vulkan), 11
 (vulkan_lint) are docs/demos/lint on top of a feature-complete emitter — not plumbing.
+
+### Phase 9 — SPIR-V reference docs LANDED (2026-06-15, daslang PR #3158, merged)
+
+Reference page `doc/source/reference/spirv.rst` (shader-author surface: annotations, builtins, intrinsics,
+type/layout mapping — all `.. list-table::`) + `spirv_reflect` autogen via a `document_module_spirv` hook
+in `das2rst.das` (host reflection API; `//!<` field docs added to every public field/enum value). Tutorials
+deferred to dasVulkan (Phase 11). Plan + the full 9→15 arc captured in `PHASE9_TUTORIALS.md`.
+
+### Phase 10.1 — SSBO std430 vector/struct elements LANDED (2026-06-15, branch `bbatkin/dasspirv-phase10-1-ssbo-std430`)
+
+First foundation rail. Lifts the scalar-only SSBO-element restriction (`array<float4>`, `array<MyStruct>`,
+… now emit valid std430 runtime arrays) — the biggest single unblocker (compute particles + all real
+structured compute data). No new census opcodes: a vector element is the same `OpTypeRuntimeArray` with a
+different `ArrayStride` operand; a struct element is one extra (non-Block) `OpTypeStruct` read via a chained
+`OpAccessChain`/`OpLoad`. spirv-val is the std430 layout oracle (no dasVulkan GPU gate — the Phase-11
+compute-particle tutorial consumes this on a real driver).
+
+- **Builder** (`spirv_builder.das`): `type_struct_layout` (a laid-out `OpTypeStruct` with member Offset +
+  matrix decorations but **no Block**) for the runtime-array element struct; both it and `type_struct_block`
+  route through a shared `type_struct_decorated(..., as_block)` core (the `as_block` flag is in the dedup
+  key, so a Block and a non-Block struct with identical members stay distinct types).
+- **Layout** (`spirv_emit.das`): `build_block_struct` now takes `as_block` and additionally returns the
+  struct's `align` (max member base alignment). New `ssbo_element_layout` computes the element type-id +
+  `ArrayStride`: a 32-bit scalar/vector strides by its base size rounded up to base alignment (float2 → 8,
+  float3 → 16, float4 → 16); a struct element is laid out non-Block and strides by its size rounded to the
+  struct alignment.
+- **Emitter** (`spirv_emit.das`): `GlobalInfo.elem_type` carries the classified element type-id so
+  `visitExprAt` uses it as the pointee (a struct element can't go through `emit_type`, which panics on
+  `tStructure`). `visitExprField` gained a second shape: when the base is an indexed element pointer
+  (`particles[i].field`, `expr.value` already in `e2ptr`), it chains a second `OpAccessChain` off that
+  pointer in the element's storage class — feeding the existing load/store paths for read and write.
+
+**Findings (load-bearing):**
+1. **std140 and std430 member offsets are identical for flat scalar/vector/matrix members.** The two
+   layouts diverge only on array/nested-struct padding (both rejected by `build_block_struct`) and on the
+   final struct-size rounding. So a single offset routine serves both `@uniform` (std140) and SSBO-element
+   (std430) structs; only the runtime-array **stride rounding** (`round_up(size, align)`) and the Block
+   decoration differ. This is why `build_block_struct` could be shared rather than forked.
+2. **`block` is a reserved keyword** (block-type syntax) — a parameter named `block` is a parse error
+   ("expecting $i or name"); used `as_block`.
+3. **Scope guards (fail-closed):** a bare matrix runtime-array element is rejected (wrap it in a struct —
+   keeps the element-layout helper focused); nested-struct and array members inside an SSBO struct are
+   rejected by `build_block_struct` (std430 array/nested padding is a later slice if a tutorial needs it).
+
+Tests: `ssbovec` fixture (float2/3/4 → ArrayStride 8/16/16) + `ssbostruct` fixture (`Particle{pos@0, vel@8,
+life@16}` → element ArrayStride 24, chained field read+write) in `test_ssbo_std430.das`; census wired
+(`phase10_1_emitter_opcodes` = Phase-8 set, unchanged) + both new fixtures added to the union. 92/92 green
+(interp), spirv-val clean on every blob, lint + format clean.
+
+### Phase 10.2 — composite/global swizzle LANDED (2026-06-15, branch `bbatkin/dasspirv-phase10-2-swizzle`)
+
+Foundation rail closing the Phase-8 out-of-scope swizzle note. **Multi-component swizzle of a bare
+global** (`gl_FragCoord.xy`, `a_pos.xyz`, `fin.yx`) now lowers; previously only single-component global
+swizzle + swizzle-of-a-loaded-value existed (the latter already covered `ubo.color.xy` /
+`texture(...).rgb`, since those bases aren't bare globals). No new census opcodes.
+
+**The actual gap (grounded finding):** `visitExprSwizzle` rejected `length(fields) != 1` *only* on the
+bare-global branch. A single-component global swizzle takes the pointer path (`OpAccessChain` to the
+component — keeps it an lvalue, `g.x = …`); a multi-component swizzle can't form one pointer, so it must
+go through the value path (load the whole global `OpVariable` → `OpVectorShuffle`). `visitExprVar` already
+seeds `e2ptr`/`e2pty` for a global, so `value_of(expr.value)` loads the full composite — the fix is a
+one-line guard change (`gv != null && length(fields) == 1` for the pointer path; everything else falls
+through to the existing extract/shuffle value path). `gl_FragCoord.xy` (a common fragment screen-space
+idiom) was the headline previously-broken case.
+
+Fixture `gswizzle` (builtin-global multi-swizzle + @in-global contiguous/reordered swizzle + single-
+component global + local-value swizzle regression) in `test_swizzle.das`; census wired
+(`phase10_2_emitter_opcodes` = Phase-8 set, unchanged). interp + JIT 90/90, spirv-val clean, lint + format
+clean.
+
+### Phase 10.3 — fragment realism LANDED (2026-06-15, branch `bbatkin/dasspirv-phase10-3-fragment`)
+
+Fragment-stage foundation rails — the realism toolkit a real fragment shader needs (alpha-test discard,
+edge-aware antialiasing via derivatives, mip selection / texel math via size queries, depth replacement).
+Five new census opcodes (`Kill`/`DPdx`/`DPdy`/`Fwidth`/`ImageQuerySizeLod`); each its own intrinsic in
+`spirv_builtins.das`, lowered in the emitter's call dispatch. interp + JIT 96/96, spirv-val clean,
+lint + format clean.
+
+- **`discard()` → `OpKill`.** A block terminator: sets `ctx.terminated`, so a statement following it on
+  the same path is rejected as unreachable (the existing dead-code guard) — matches glslang lowering
+  `discard` to `OpKill`. Fragment-only.
+- **`dFdx`/`dFdy`/`fwidth` → `OpDPdx`/`OpDPdy`/`OpFwidth`** (screen-space derivatives over the 2×2 quad).
+  Fragment-only; the basic forms need only the `Shader` capability (not the `DerivativeControl` the
+  `*Fine`/`*Coarse` variants would). Declared as **concrete per-width overloads** (float/float2/3/4),
+  NOT a generic — see finding 1.
+- **`textureSize(sampler, lod)` → `OpImage` (extract image) + `OpImageQuerySizeLod`**, lazily pulling in
+  the `ImageQuery` capability (deduped via a `ctx` flag, emitted into `SEC_CAPS`). int2 for 2D/Cube, int3
+  for 3D / 2D-array. Stage-agnostic.
+- **`gl_FragDepth` write → BuiltIn `FragDepth` Output + the `DepthReplacing` execution mode.** The exec
+  mode is emitted only when the builtin is referenced — `classify_global` sets `ctx.uses_frag_depth` and
+  `generate_spirv` reads it after dependency collection (which runs before the exec-mode section).
+
+**Findings (load-bearing):**
+1. **Generic builtins get mangled instance call-names** (`spirv_builtins`dFdx`5408…`), so the emitter's
+   `name == "dFdx"` dispatch can never match a `def dFdx(p : auto(TT))`. Every existing builtin is a
+   concrete overload for exactly this reason; the derivatives had to follow suit (4 widths × 3 functions).
+   The emitter dispatches by the DASLANG call name, which is clean only for non-generic functions.
+2. **`OpKill` is a terminator, so `discard()` composes with the existing terminated-block machinery for
+   free** — placed in an `if`-branch it skips the trailing `OpBranch merge`; followed by another statement
+   it trips the unreachable-code reject. No new control-flow plumbing.
+
+### Phase 10.4 — depth-compare (shadow) sampling LANDED (2026-06-15, branch `bbatkin/dasspirv-phase10-4-dref`)
+
+The hardware-PCF shadow rail — `sampler2DShadow` sampled via `textureCompare` lowers to
+`OpImageSampleDrefImplicitLod`, the depth-compare sample. One new census opcode
+(`ImageSampleDrefImplicitLod`); the Depth=1 image flag and the `comparison_sampler` reflection kind are
+operand/reflection-only, not opcodes. This is the quality upgrade over the manual-compare shadow that
+already works (sample a depth texture as a plain `sampler2D`, compare with a ternary). interp + JIT
+100/100, spirv-val clean, external `spirv-dis` confirms textbook structure, lint + format clean.
+
+- **`sampler2DShadow` marker + `textureCompare(s, uv, compare) : float`.** A new opaque sampler type;
+  `sampler_info` maps it to a 2D image with the **Depth=1** flag (the operand that distinguishes a
+  comparison sampler from an ordinary one). `textureCompare` is its only sample path (the daslang type
+  system blocks passing it to `texture()`/`textureLod`/… since those overloads don't accept it).
+- **`OpImageSampleDrefImplicitLod`.** Loads the combined comparison sampler, then samples with the
+  reference value as the **Dref** operand; the scalar `float` result is the comparison (1 = lit, 0 =
+  shadowed; a filtered sampler returns the PCF average). Implicit LOD → fragment-only (same stage gate as
+  `texture()`). Emitted via `emit_n` (5 operands: resultType, result, sampledImage, coord, dref).
+- **`type_image` gained a `depth` parameter** (default 0), threaded into both the OpTypeImage Depth
+  operand (index 3) **and the dedup key** — without the key change a `sampler2DShadow` and a `sampler2D`
+  (same dim/arrayed/sampled/format) would collide on one type id.
+- **`comparison_sampler` reflection kind.** `classify_global` picks it (vs `combined_image_sampler`) when
+  the sampler's depth flag is set, so the host binds a `VkSampler` with `compareEnable`. Wire-format magic
+  bumped RFL2 → RFL3 (a descriptor-kind change), with the `kind_from_int` mapping extended.
+
+**Findings (load-bearing):**
+1. **The Depth flag lives on the OpTypeImage, not the sample op.** `OpImageSampleDrefImplicitLod` is the
+   same regardless of image type; what makes a sampler a *comparison* sampler is the `Depth=1` operand on
+   its `OpTypeImage`. So the dedup key MUST include depth (else the shadow sampler aliases a plain one and
+   spirv-val rejects the Dref sample against a non-depth image). External `spirv-dis` verified:
+   `OpTypeImage %float 2D 1 0 0 1 Unknown` + `OpImageSampleDrefImplicitLod %float %img %uv %ref`.
+2. **A dedicated `textureCompare` intrinsic beats overloading `texture()`.** GLSL packs the compare ref
+   into a third coordinate component (`texture(sampler2DShadow, vec3)`); a separate intrinsic with an
+   explicit `compare : float` is clearer, keeps the result type scalar (vs `texture()`'s float4), and
+   fail-closes by construction — the type system prevents the wrong sampler/op pairing without an emitter
+   check.
+
+### Phase 10.5 — compute tier (shared memory + barriers + atomics) LANDED (2026-06-15, branch `bbatkin/dasspirv-phase10-5-compute`)
+
+The cross-thread-compute differentiator: workgroup-shared memory, the barrier sync primitives, and the
+atomic read-modify-write family. Twelve new census opcodes (`OpControlBarrier`/`OpMemoryBarrier` + the
+ten atomics). interp + JIT 104/104, spirv-val clean, external `spirv-dis` confirms textbook lowering,
+lint + format clean.
+
+- **`@workgroup` shared memory → Workgroup storage (GLSL `shared`).** A `@workgroup` global lowers to a
+  Workgroup-class `OpVariable` (scalar, vector, or fixed array). Not a descriptor and not in the entry
+  interface (Workgroup is neither Input nor Output, SPIR-V ≤ 1.3), so no set/binding and nothing
+  reflected; compute-only. A shared fixed-array indexes through `visitExprAt`'s new Workgroup branch — a
+  **bare** array (single-index `OpAccessChain`), with NO member-0 indirection (unlike an SSBO, whose array
+  is wrapped in a Block struct).
+- **`barrier()` → `OpControlBarrier`, `memoryBarrierShared()` → `OpMemoryBarrier`.** Both at Workgroup
+  scope with `WorkgroupMemory | AcquireRelease` (= 264) semantics, matching glslang. `barrier()` is the
+  execution + shared-memory rendezvous (the tiled-reduction sync point); `memoryBarrierShared()` is the
+  memory-only ordering. Compute-only; neither is a block terminator. No extra capability (base `Shader`).
+- **Atomics → `OpAtomic*`.** `atomicAdd`/`Min`/`Max`/`And`/`Or`/`Xor`/`Exchange`/`CompSwap` on a
+  `@workgroup` or `@ssbo` int/uint lvalue, returning the OLD value. `atomicMin`/`Max` pick the signed
+  (`SMin`/`SMax`) or unsigned (`UMin`/`UMax`) opcode by the operand's signedness; `atomicCompSwap` is the
+  `OpAtomicCompareExchange` CAS. Memory scope = Workgroup for shared targets, Device for buffer targets
+  (read off the target's root-global storage class); Relaxed (0) semantics, the glslang default. No extra
+  capability for 32-bit integer atomics (lavapipe-safe).
+
+**Findings (load-bearing):**
+1. **`@shared` is a reserved keyword → the annotation is `@workgroup`.** `var @shared x` is a parse error
+   ("unexpected shared"), same class as the `block` keyword collision in Phase 10.1. `@workgroup` (the
+   SPIR-V storage-class name) parses cleanly and reads well. The shared-memory authoring spelling is
+   `var @workgroup tile : float[64]`.
+2. **The atomic target is a reference parameter (`mem : T&`), NOT by-value.** A by-value `mem : T`
+   workhorse param makes daslang insert an `ExprRef2Value` (a load) around the lvalue arg — a wasted
+   `OpLoad` whose result the atomic ignores. A `T&` ref param keeps the arg an lvalue, so the visitor
+   seeds its `e2ptr` pointer and the emitter recovers it directly (no spurious load). LINT014 then forces
+   dropping `var` (the body only reads `mem`): `mem : int&`, not `var mem : int&`. The emitter still peels
+   a defensive `ExprRef2Value` in case one appears, and `root_global_of` walks the lvalue chain
+   (`ExprAt`/`ExprField`/`ExprSwizzle`/`ExprRef2Value` → root `ExprVar`) to read the storage class for the
+   memory scope. External `spirv-dis` verified: shared scalar atomics at `%uint_2` (Workgroup) scope, the
+   SSBO `atomicAdd` at `%uint_1` (Device).
+
+### Phase 10.6 — imageSize + module-scope shader constants LANDED (2026-06-15, branch `bbatkin/dasspirv-shader-const-imagesize`)
+
+Two small emitter rails surfaced by the Mandelbrot tutorial (Phase 11) — the "gaps show up, we fix at
+the core" pass. One new census opcode (`OpImageQuerySize`); 108/108, spirv-val clean.
+
+- **`imageSize(image2D)` → `OpImageQuerySize`.** The storage image's dimensions in texels, NO LOD — a
+  storage image is `Sampled=2`, so the no-LOD query is legal (unlike `textureSize`, which needs a LOD
+  operand and emits `OpImageQuerySizeLod` on a `Sampled=1` image). Loads the UniformConstant image, then
+  queries; pulls in the `ImageQuery` capability via the shared `ensure_image_query` guard. Lets a compute
+  shader size its pixel↔coordinate mapping off the bound image instead of a hardcoded extent.
+- **Module-scope `let` constants.** An immutable `let X = <const-expr>` at module scope folds (via
+  `emit_const`) to an `OpConstant` / `OpConstantComposite` and references resolve straight to the id (no
+  `OpVariable` / `OpLoad`) — so a shader can hoist iteration counts, view rectangles, etc. to module scope
+  and share them with the host. `GlobalInfo` carries `is_constant` + `const_id`; `visitExprVar`'s global
+  else-branch resolves a constant global to its folded id.
+
+**Findings (load-bearing):**
+1. **The fold gate is `v._type.flags.constant` (an immutable `let`), NOT just "has a const-foldable
+   init".** A mutable `var g : uint = 2u` global has a const initializer too, but folding it would be
+   wrong (it is memory the shader can write). Gating on the const-qualified type keeps `var` globals on
+   the fail-closed `unsupported global` path (the `_fc_global` fixture in test_fail_closed.das proves the
+   rejection), while `let` globals fold. Compilation succeeding at all is the positive fold proof.
+2. **All `spirv_builtins.das` stubs are now `[sideeffects]` — the macro runs POST-infer, so a folded
+   stub call would lower wrong.** `generate_spirv` is called from the annotation's `patch` override (the
+   `patchAnnotations` pass), which runs *after* inference. The stubs have empty/constant bodies +
+   `[unused_argument]`, so the analyzer would see them as pure — a pure constant-returning call
+   (`imageSize` → `int2(0,0)`) or a pure void call (`discard`/`barrier`) is exactly what const-fold /
+   dead-code-elimination target. They survived only because daslang infer doesn't inline-and-fold
+   arbitrary calls and the optimize passes run after patch — pass-ordering luck, not a guarantee.
+   `[sideeffects]` sets `Function::sideEffectFlags`, so `ast_const_folding.cpp` marks every such call
+   `noSideEffects=false` and no pass folds/elides/CSEs it. The declarations are now honest: these stubs
+   model GPU side-effecting operations. (Boris's catch on the imageSize stub in the PR.)
+
+### Phase 11 — user-defined shader function calls (`OpFunctionCall` + ref params) LANDED (2026-06-16, branch `bbatkin/dasspirv-functions`)
+
+The first emitter feature surfaced as a *hard gap* by tutorial authoring: a shader could only call built-in
+intrinsics + the entry point's own straight-line body — no user-defined helper functions. Now every
+daslang function called (transitively) from a shader is emitted as its own `OpFunction`, with proper calls,
+parameters, and value returns. Three new census opcodes (`OpFunctionCall` / `OpFunctionParameter` /
+`OpReturnValue`); 114/114, spirv-val clean, plus a real-GPU behavioral proof.
+
+**Model (glslang-style, Logical addressing ≤ 1.3, no recursion / VariablePointers):**
+- **Two-pass id allocation.** `collect_dependencies` (already used for globals) also yields the dependency
+  functions; `register_user_func` validates each signature and *pre-allocates* its `OpFunction` id +
+  `OpTypeFunction` before the entry body emits, so an `OpFunctionCall` can forward-reference a callee
+  defined later in the module. Helpers are emitted after the entry point in stable `collect_dependencies`
+  order (`ctx.user_order`) → byte-stable output.
+- **Value params by value; ref params by Function pointer.** A by-value parameter binds an SSA
+  `OpFunctionParameter` (recorded in `ctx.locals`, read straight through `visitExprVar`'s `argument` path).
+  A `var x : T&` parameter binds an `OpTypePointer Function` parameter (recorded in `ctx.local_vars`, so it
+  reuses the existing memory-local load/store path verbatim).
+- **Ref args via copy-in / copy-out temps.** SPIR-V forbids handing an access-chain pointer (`arr[i]`,
+  `ubo.f`) straight to a call — the pointer arg must be a *memory object declaration*. So every by-reference
+  argument goes through a fresh `Function`-storage `OpVariable` temp: copy the current lvalue value in
+  before the call, pass the temp, copy the (mutated) temp back to the lvalue after. The temps are hoisted
+  into the calling function's entry block by `alloc_call_temps` (a mini-visitor run after `collect_locals`,
+  before the body walk — SPIR-V requires all `OpVariable` to lead the first block).
+- **Fail-closed.** A call-graph cycle check (`detect_recursion`, 3-colour DFS over {entry} ∪ user_funcs)
+  rejects direct + mutual recursion; unsupported param/return types (double, struct, array, sampler) are
+  rejected at registration; a resolved call to a host/extern builtin (`print`, unmapped math like `tanh`)
+  hits a clean "cannot call '…' in a SPIR-V shader" message rather than a silent or invalid blob.
+
+**Tests:** `test_functions.das` (3 good-path tests — value/multi/vector params, transitive + *shared*
+helper proving single-emission, ref-param copy-in/out, a helper reading a global; exact opcode counts +
+spirv-val) and 5 new `_fail_closed` fixtures (recursion, mutual recursion, bad param, bad return, unmapped
+builtin). The census now declares the three new opcodes and matches exactly. **Real-GPU behavioral gate:**
+temporarily routing dasVulkan's `out[i]=i*i` square through a value-param helper `sq(x)` AND a ref-param
+helper `accumulate_into(acc&, v)` still produced the correct result for all 256 elements on real hardware —
+i.e. the copy-out genuinely lands the value back through the reference.
+
+**Findings (load-bearing):**
+1. **`collect_dependencies` yields pointee-const `Function` pointers, and module `""` is the user's own
+   root module.** The discriminator for "emit as a user `OpFunction`" is: not the entry, not `flags.builtIn`,
+   has a `body`, and not in `{builtin, math, math_bits, spirv_builtins}` (whose calls are intercepted
+   by name). Excluding `""` was the first-cut bug — helpers in a shader written *without* an explicit
+   `module` line live in `""` and must be emitted. The emitter only reads the AST, so the const is stripped
+   once at the registration/emission boundary (`reinterpret<FunctionPtr>`); `UserFunc.fn` stays
+   `Function const?`.
+2. **The entry-block `OpVariable` rule forces the temp pre-pass.** Ref-arg temps can't be emitted inline at
+   the (arbitrarily deep) call site — they must lead the entry block. A pre-pass visitor over the body
+   allocates them up front (mirrors how `collect_locals` already hoists `var`/loop locals). Value args need
+   no temp (they pass their SSA value directly), so the pre-pass only fires for `var …&` parameters.
+3. **`marker(no_coverage)` fixtures still drive the emitter's own LCOV.** The marker suppresses the
+   *shader's* coverage instrumentation (which would corrupt the SPIR-V), not the emitter-side line coverage
+   collected while the fixture compiles — so the function fixtures still exercise the new emit paths.
