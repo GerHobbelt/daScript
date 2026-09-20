@@ -4089,7 +4089,7 @@ class public LlvmJitVisitor : AstVisitor {
         LLVMBuildStore2(g_builder, types, types.t_int32, types.ConstI32(uint64(field_index)), index_ptr)
         let field_ptr = LLVMBuildGEP2(g_builder, types.t_int8, v_ptr, types.ConstI32(uint64(offset + field_offset)), "")
         if (decl.value |> isMakeLocal) {
-            var val = unsafe(reinterpret<ExprMakeLocal?> decl.value)
+            var val = unsafe(reinterpret<ExprMakeLocal?>(decl.value))
             if (!expr.makeFlags.useCMRES) {
                 val.extraOffset = uint(offset + field_offset) // + expr.extraOffset
                 setE(decl.value, v_ptr)
@@ -4286,7 +4286,7 @@ class public LlvmJitVisitor : AstVisitor {
         v_ptr = LLVMBuildPointerCast(g_builder, v_ptr, LLVMPointerType(types.t_int8, 0u), "")
         let field_ptr = LLVMBuildGEP2(g_builder, types.t_int8, v_ptr, types.ConstI32(uint64(offset)), "mks_{decl.name}")
         if (decl.value |> isMakeLocal) {
-            var val = unsafe(reinterpret<ExprMakeLocal?> decl.value)
+            var val = unsafe(reinterpret<ExprMakeLocal?>(decl.value))
             if (!expr.makeFlags.useCMRES) {
                 val.extraOffset = uint(offset) // + expr.extraOffset
                 setE(decl.value, v_ptr)
@@ -4395,7 +4395,7 @@ class public LlvmJitVisitor : AstVisitor {
         verify(v_ptr != null && LLVMIsUndef(v_ptr) == 0, "make array index, but no pointer")
         let record_ptr = LLVMBuildGEP2(g_builder, types.t_int8, v_ptr, types.ConstI32(uint64(offset)), "ema_ind_{index}_{expr.at.line}")
         if (init |> isMakeLocal) {
-            var val = unsafe(reinterpret<ExprMakeLocal?> init)
+            var val = unsafe(reinterpret<ExprMakeLocal?>(init))
             // heap literals set useCMRES (allocate_stack) but, like interp's per-element
             // extraLocalOffset, the element make-local must write at arr.data+offset — so use the
             // same extraOffset+setE placement the non-CMRES path uses instead of a cmres redirect.
@@ -4476,7 +4476,7 @@ class public LlvmJitVisitor : AstVisitor {
         verify(v_ptr != null && LLVMIsUndef(v_ptr) == 0, "make struct field, but no pointer")
         let field_ptr = LLVMBuildGEP2(g_builder, types.t_int8, v_ptr, types.ConstI32(uint64(offset)), "")
         if (init |> isMakeLocal) {
-            var val = unsafe(reinterpret<ExprMakeLocal?> init)
+            var val = unsafe(reinterpret<ExprMakeLocal?>(init))
             if (!expr.makeFlags.useCMRES) {
                 val.extraOffset = uint(offset) // + expr.extraOffset
                 setE(init, v_ptr)
@@ -4528,7 +4528,9 @@ class public LlvmJitVisitor : AstVisitor {
 // ExprPtr2Ref
     def override visitExprPtr2Ref(expr : ExprPtr2Ref?) : ExpressionPtr {
         var tsrc = getE(expr.subexpr)
-        if (thisFunc != null && !thisFunc.flags.unsafeDeref) {
+        // deref of a distinct value is a compile-time relabel - no pointer, no null check
+        let isDistinctDeref = expr.subexpr._type != null && expr.subexpr._type.baseType == Type.tDistinct
+        if (!isDistinctDeref && thisFunc != null && !thisFunc.flags.unsafeDeref) {
             check_ptr_zero(tsrc, expr.at, "dereferencing null pointer, {expr.subexpr.describe()} is null")
         }
         setE(expr, tsrc)
@@ -4844,7 +4846,7 @@ class public LlvmJitVisitor : AstVisitor {
     }
 
     def get_value_for_varinfo(vi : VarInfo?) : LLVMValueRef {
-        var init_values <- get_typeinfo_fields(unsafe(reinterpret<TypeInfo?> vi))
+        var init_values <- get_typeinfo_fields(unsafe(reinterpret<TypeInfo?>(vi)))
 
         var x = types.ConstReal(0f |> double())
         var y = types.ConstReal(0f |> double())
@@ -6315,7 +6317,7 @@ class public LlvmJitVisitor : AstVisitor {
         var impl : LLVMOpaqueValue?
         make_visitor(*astVisitor) $(mv_adapter) {
             astVisitor.adapter = mv_adapter
-            let fmna = (*astVisitor)->pre_make_block(unsafe(reinterpret<ExprBlock?> expr._block), thisFunc, captureType)
+            let fmna = (*astVisitor)->pre_make_block(unsafe(reinterpret<ExprBlock?>(expr._block)), thisFunc, captureType)
             var cblk = (*astVisitor)->before_function_entry()
             var carg = (*astVisitor)->get_capture_param()
             carg = LLVMBuildLoad2(astVisitor.g_builder, captureType, carg, "capture")
@@ -6332,7 +6334,7 @@ class public LlvmJitVisitor : AstVisitor {
             }
             (*astVisitor)->after_function_entry(cblk)
             visit(expr._block, astVisitor.adapter)
-            (*astVisitor)->post_make_block(unsafe(reinterpret<ExprBlock?> expr._block))
+            (*astVisitor)->post_make_block(unsafe(reinterpret<ExprBlock?>(expr._block)))
             result = LLVMGetNamedFunction(g_mod, fmna.publ())
             impl = LLVMGetNamedFunction(g_mod, fmna.impl())
         }
@@ -6466,7 +6468,7 @@ class public LlvmJitVisitor : AstVisitor {
 
 // ExprConstEnumeration
     def override visitExprConstEnumeration(expr : ExprConstEnumeration?) : ExpressionPtr {
-        let value = find_enum_value(unsafe(reinterpret<EnumerationPtr> expr._type.enumType), string(expr.value))
+        let value = find_enum_value(unsafe(reinterpret<EnumerationPtr>(expr._type.enumType)), string(expr.value))
         setE(expr, LLVMConstInt(base_type_to_llvm_type(expr._type.enumType.baseType), uint64(value), 0))
         return expr
     }
@@ -6788,6 +6790,10 @@ class public LlvmJitVisitor : AstVisitor {
     }
 
     def cast_from_vec4f(expr : ExpressionPtr; etype : TypeDeclPtr; v4f : LLVMOpaqueValue?) {
+        // distinct types marshal exactly as their underlying type (ref-ness stays on the head)
+        if (etype.baseType == Type.tDistinct && etype.firstType != null && !etype.isRef) {
+            return cast_from_vec4f(expr, etype.firstType, v4f)
+        }
         var tres : LLVMOpaqueValue?
         if (etype.baseType == Type.anyArgument) {
             tres = v4f
@@ -6836,6 +6842,10 @@ class public LlvmJitVisitor : AstVisitor {
     }
 
     def cast_to_vec4f(etype : TypeDeclPtr; tsrc : LLVMOpaqueValue?) {
+        // distinct types marshal exactly as their underlying type (ref-ness stays on the head)
+        if (etype.baseType == Type.tDistinct && etype.firstType != null && !etype.isRef) {
+            return cast_to_vec4f(etype.firstType, tsrc)
+        }
         // Zero-fill (not undef) the unused lanes: a wrapped scalar return
         // (lane 0 = value) is sometimes consumed as a full vec4f by a vector
         // `icmp` (e.g. block-key comparison in order_by). undef sibling lanes
@@ -7430,7 +7440,7 @@ class public ResolveExternVisitor : AstVisitor {
     }
 
     def override preVisitExprMakeBlock(expr : ExprMakeBlock?) : void {
-        thisBlock |> push <| unsafe(reinterpret<ExprBlock?> expr._block)
+        thisBlock |> push <| unsafe(reinterpret<ExprBlock?>(expr._block))
 
         let annotationData = (expr._block as ExprBlock).annotationData
         if (annotationData != 0 |> uint64()) {
@@ -7460,7 +7470,7 @@ class public ResolveExternVisitor : AstVisitor {
         // String find is fully inline (no glob). Non-string binds the per-type C++ find glob — still
         // used by non-workhorse keys (vectors / structs) that route through build_table_find_call.
         if (t != Type.tString) {
-            dll.set_glob_address(DllName(FN_JIT_TABLE_FIND(t)), get_jit_table_find(unsafe(reinterpret<int> t)))
+            dll.set_glob_address(DllName(FN_JIT_TABLE_FIND(t)), get_jit_table_find(unsafe(reinterpret<int>(t))))
         }
     }
     def bind_jit_table_at_glob(t : Type) {
@@ -7470,7 +7480,7 @@ class public ResolveExternVisitor : AstVisitor {
         } else {
             // Non-string keys are open-addressed: the inline probe handles find/at hits and routes a
             // miss to the regular C++ at (FN_JIT_TABLE_AT) — no packed after-miss helper needed.
-            dll.set_glob_address(DllName(FN_JIT_TABLE_AT(t)), get_jit_table_at(unsafe(reinterpret<int> t)))
+            dll.set_glob_address(DllName(FN_JIT_TABLE_AT(t)), get_jit_table_at(unsafe(reinterpret<int>(t))))
         }
     }
 
@@ -7508,7 +7518,7 @@ class public ResolveExternVisitor : AstVisitor {
 
     def override preVisitExprErase(expr : ExprErase?) {
         let t = get_table_t(expr.arguments[0]._type)
-        dll.set_glob_address(DllName(FN_JIT_TABLE_ERASE(t)), get_jit_table_erase(unsafe(reinterpret<int> t)))
+        dll.set_glob_address(DllName(FN_JIT_TABLE_ERASE(t)), get_jit_table_erase(unsafe(reinterpret<int>(t))))
     }
 
 }
@@ -7521,7 +7531,7 @@ def public get_dll_missing(fns : array<FunctionPtr>; disabled : array<FunctionPt
     var disabled_exists = array<Function?>()
     if (dll.handle == null) {
         for (fn in fns) {
-            missing |> push(unsafe(reinterpret<Function?> fn))
+            missing |> push(unsafe(reinterpret<Function?>(fn)))
         }
     } else {
         for (fn in fns) {
@@ -7529,7 +7539,7 @@ def public get_dll_missing(fns : array<FunctionPtr>; disabled : array<FunctionPt
             var written_hash = dll.get_function_hash(dll_name)
             // debug("dll_function_aot_hash: {dll_function_aot_hash}")
             if (written_hash == null || get_function_aot_hash(fn) != *written_hash) {
-                missing |> push(unsafe(reinterpret<Function?> fn))
+                missing |> push(unsafe(reinterpret<Function?>(fn)))
             }
         }
         for (fn in disabled) {
@@ -7537,7 +7547,7 @@ def public get_dll_missing(fns : array<FunctionPtr>; disabled : array<FunctionPt
             var written_hash = dll.get_function_hash(dll_name)
             // debug("dll_function_aot_hash: {dll_function_aot_hash}")
             if (written_hash != null) {
-                disabled_exists |> push(unsafe(reinterpret<Function?> fn))
+                disabled_exists |> push(unsafe(reinterpret<Function?>(fn)))
             }
         }
     }
@@ -7729,7 +7739,7 @@ def public generate_llvm_code(var dll : DLLHandle?; fmna : DllName; dll_enabled 
         to_log(LOG_ERROR, "Something wrong! Non dll function used in dll mode {fmna.publ()}\n")
     }
     let fn_code = LLVMGetFunctionAddress(g_engine, fmna.publ())
-    code = unsafe(reinterpret<void?> fn_code)
+    code = unsafe(reinterpret<void?>(fn_code))
     if (code == null) {
         to_log(LOG_ERROR, "LLVM JIT FAILED: not generated & not found in dll {fmna.publ()}\n")
     }

@@ -266,7 +266,7 @@ def private get_or_create_table_fn(llvm_module : LLVMOpaqueModule?; var types : 
 }
 
 def public get_table_at(g_builder : LLVMOpaqueBuilder?; llvm_module : LLVMOpaqueModule?; t : Type; var types : PrimitiveTypes?) {
-    assume fn_ptr = get_jit_table_at(unsafe(reinterpret<int> t))
+    assume fn_ptr = get_jit_table_at(unsafe(reinterpret<int>(t)))
     // int32_t jit_table_at ( Table * tab, KeyType key, int32_t valueTypeSize, Context * context )
     assume at_type = LLVMFunctionType(types.t_int32,   // int32_t result
         fixed_array<LLVMTypeRef>(types.LLVMVoidPtrType(), // table ptr
@@ -283,7 +283,7 @@ def public get_table_at(g_builder : LLVMOpaqueBuilder?; llvm_module : LLVMOpaque
 }
 
 def public get_table_find(g_builder : LLVMOpaqueBuilder?; llvm_module : LLVMOpaqueModule?; t : Type; var types : PrimitiveTypes?) {
-    assume fn_ptr = get_jit_table_find(unsafe(reinterpret<int> t))
+    assume fn_ptr = get_jit_table_find(unsafe(reinterpret<int>(t)))
     // int32_t jit_table_find ( Table * tab, KeyType key, int32_t valueTypeSize, Context * context )
     let find_type = LLVMFunctionType(types.t_int32,   // int32_t result
             fixed_array<LLVMTypeRef>(types.LLVMVoidPtrType(),   // table ptr
@@ -353,7 +353,7 @@ def public table_header_llvm_type(var types : PrimitiveTypes?) : LLVMOpaqueType?
 
 def public get_table_erase(g_builder : LLVMOpaqueBuilder?; llvm_module : LLVMOpaqueModule?; t : Type; var types : PrimitiveTypes?) {
     let fn_name = DllName(FN_JIT_TABLE_ERASE(t))
-    assume fn_ptr = get_jit_table_erase(unsafe(reinterpret<int> t))
+    assume fn_ptr = get_jit_table_erase(unsafe(reinterpret<int>(t)))
     // bool jit_table_erase ( Table * tab, KeyType key, int32_t valueTypeSize, Context * context, LineInfoArg * at )
     let erase_type = LLVMFunctionType(types.t_int1,                        // bool result
             fixed_array<LLVMTypeRef>(types.LLVMVoidPtrType(),   // table ptr
@@ -402,6 +402,14 @@ var public g_target_is_x64 = false
 // the TargetMachine). Explicit cross-compile triples get empty features (generic cpu) — no AVX2 there
 // either, so the intrinsics compile their portable fallback bodies: correct, just not fast.
 var public g_target_x64_avx2 = false
+
+// F16C (half<->float convert, VCVTPH2PS/VCVTPS2PH) gate for the f16_cvt intrinsic table — same
+// contract as g_target_x64_avx2, but its OWN cpuid bit, NOT tied to avx2 (Ivy Bridge has F16C
+// without AVX2). Without it, fpext/fptrunc through half on x86-64 lowers to a compiler-rt libcall
+// (__extendhfsf2/__truncsfhf2) the JIT doesn't link — so the gate must stay false there and the
+// calls compile their exact bit-twiddle daslang bodies instead. aarch64 needs no gate: scalar
+// fp16 convert is ARMv8.0 baseline.
+var public g_target_x64_f16c = false
 
 // The AVX kernel-matrix tiers (x64_avx dot32_vnni / dot64_acc16 / mx4_dequant64 families) gate on
 // finer cpuid truth, same contract as g_target_x64_avx2 — each flag guards its own lookup table in
@@ -601,6 +609,7 @@ def public init_jit(cg_opt_level : uint; target_triple : string = "") {
     // which keeps the pre-force cross behavior.
     let x64_cross = g_target_is_x64 && !empty(target_triple)
     g_target_x64_avx2 = g_target_is_x64 && (x64_cross ? x64_forced_feature("avx2") : cpu_supports("avx2"))
+    g_target_x64_f16c = g_target_is_x64 && (x64_cross ? x64_forced_feature("f16c") : cpu_supports("f16c"))
     // Matrix-tier gates (see the declaration comment): cpuid truth OR'd with the
     // DAS_JIT_X64_FORCE_FEATURES emission-only override; forced-only on cross triples.
     g_target_x64_vnni256 = g_target_x64_avx2 && (x64_tier_feature("avxvnni", x64_cross)
@@ -1345,6 +1354,11 @@ def public base_type_to_llvm_type(t : Type) {
 }
 
 def public type_to_llvm_abi_type(t : TypeDeclPtr) {
+    // distinct types are ABI-identical to their underlying type - erased for the JIT,
+    // same boundary as runtime TypeInfo (ref-ness lives on the head, so peel after isRef)
+    if (t.baseType == Type.tDistinct && t.firstType != null && !t.isRef) {
+        return type_to_llvm_abi_type(t.firstType)
+    }
     if (t.baseType == Type.tBlock) {
         return LLVMPointerType(g_t_block, 0u)
     } elif (t.isRef) {
@@ -1385,6 +1399,10 @@ def public type_to_llvm_abi_type(t : TypeDeclPtr) {
 }
 
 def public type_to_llvm_type(t : TypeDeclPtr) {
+    // distinct types are ABI-identical to their underlying type - erased for the JIT
+    if (t.baseType == Type.tDistinct && t.firstType != null) {
+        return type_to_llvm_type(t.firstType)
+    }
     var res : LLVMOpaqueType?
     if (t.baseType == Type.tFixedArray && t.firstType != null) {
         // natural recursion: [outer x [inner x elem]] — same nesting the reversed flat walk built

@@ -107,7 +107,7 @@ When you discover something new about daslang syntax, semantics, or conventions 
 
 ## daslang Language — Gen2 Syntax (REQUIRED)
 
-All code MUST use gen2 syntax (add `options gen2` at the top of every file). Key rules:
+**gen2 is the DEFAULT parser** — every `.das` file parses as gen2 unless it explicitly opts out with `options gen2 = false` (the only gen1 discriminator; the `options gen2` markers around the tree are historical no-ops — NEVER infer gen1 from their absence). All code MUST use gen2 syntax; house style still adds `options gen2` at the top of new files. Key rules:
 
 - **Parentheses** on control flow: `if (x > 0)`, `for (i in range(10))`, `while (running)`
 - **Braces** on all blocks: `def foo() { ... }`, `if (x) { ... }`
@@ -126,6 +126,7 @@ All code MUST use gen2 syntax (add `options gen2` at the top of every file). Key
 - **`typeinfo`:** `typeinfo trait_name(type<T>)` — trait name outside parens
 - **`static_if`:** `static_if (condition) { ... }` — parentheses required
 - **Type function call:** `take(type<int>, 1, 2)` — NOT `take < int > (1, 2)`
+- **Casts require call-style parens:** `cast<T>(x)` / `upcast<T>(x)` / `reinterpret<T>(x)` — the parenthesized operand is mandatory and self-delimiting, so `reinterpret<uint8?>(p) + 1` means `(reinterpret<uint8?>(p)) + 1`, like the call it looks like. The old juxtaposition form `cast<T> x` is a syntax error (it swallowed trailing `<< >> + - * / % ??` into the operand, silently running the arithmetic on `x`'s original type — stride 0 for `void?`, i.e. dropping the add). Related: pointer arithmetic on `void?` is a compile error (30950); do byte math via `intptr` and reinterpret once
 - **Newlines inside `(...)`, `[...]`, `{...}` are free** — long pipe chains, multi-arg calls, array/table literals can wrap freely. Statement-level (no surrounding bracket) still requires one statement per line, so wrap the RHS in `(...)` if a `let x = a |> b |> c` needs to break across lines. **DANGER — silent, no error:** without the parens, a continuation line starting with a *unary-capable* operator (`+`, `-`) parses as a separate statement — `+ b` is unary plus, pure, so the optimizer **silently deletes it**. `let x = a` ⏎ `+ b` ⏎ `+ c` becomes just `let x = a` (the `+ b`/`+ c` lines vanish) — wrong result, no diagnostic (verified: `x` is `a`, not `a+b+c`). A non-unary operator like `|> f()` can't begin a statement, so it errors loudly instead — it's `+`/`-` that bite silently. Always wrap a multi-line arithmetic RHS in `(...)`
 - **Inline literals over temp-var-and-push** — for short arrays consumed in one expression, write `stack([a, b, c])` rather than `var xs : array<T>; xs |> emplace(a); xs |> emplace(b); stack(xs)`. Faster in interpreted mode and easier to read; same applies to table literals and other bracketed constructors. Threshold: while it stays readable
 
@@ -173,6 +174,7 @@ All code MUST use gen2 syntax (add `options gen2` at the top of every file). Key
 - Only **workhorse types** (`int`, `float`, `bool`, `string`, …, `isWorkhorseType` on the C++ side) pass by value.
 - **AST pointers (gc_node) pass by value** — copying the pointer, no refcount, no allocation. `def foo(p : ExpressionPtr)` shares the node; `var p` lets you reassign locally; `var p : ExpressionPtr&` propagates reassignment back. For mutable field access, take the param as `var`.
 - **Lambdas are copyable.** A `lambda<…>` is a fat pointer to a heap-allocated capture frame; `=` and pass-by-value copy the pointer (creates an alias), and `push`/array storage works without `push_clone`. **`delete lam` requires `unsafe`** since other aliases may still be live — same rule as raw pointer / class `delete`. The unsafe-delete rule cascades: `array<lambda<…>>`, structs with a lambda field, tuple/variant containing a lambda — all inherit the unsafe-delete requirement.
+- **`delete` on `array<T?>` (any container of raw pointers) FREES THE POINTEES** — it finalizes and heap-frees every element, then the buffer. On borrowed pointers this is heap corruption: interp reports `deleting <ptr>, which is not a chunk pointer`; Release+JIT corrupts SILENTLY and crashes at some later unrelated alloc/free (probe-verified 2026-07-09). For non-owning pointer containers: struct fields take `@do_not_delete` (canonical: `daslib/aot_cpp.das` `@do_not_delete stack : array<ExprBlock?>` — pointees survive, buffer still freed); locals do `arr |> clear()` before `delete arr` (`clear` does NOT finalize elements — probe-verified).
 - **Strings:** `var s : string` is a writable local copy (no propagation). `var s : string&` propagates. `:=` clones into current context's heap (required across contexts); plain `=` copies the pointer.
 - **Residual `smart_ptr` types** (`ProgramPtr`, `ContextPtr`, `FileAccessPtr`, `DebugAgentPtr`, `VisitorAdapterPtr`) still use refcount semantics — variables holding them need `var inscope`. AST types do NOT — see below.
 
@@ -206,6 +208,7 @@ Full migration table (when reading older docs that say `var inscope` or `<-` for
 - **Variant `as` read access is safe:** `(v as _field).member` works without `unsafe` after an `is` check
 - **Variant field assignment is always unsafe:** `v._field = value` and `set_variant_index(v, N)` require `unsafe`
 - **`reinterpret<T>(expr)`** requires `unsafe` — used for const-stripping on regular pointers: `unsafe(reinterpret<Foo?>(const_ptr))`
+- **`reinterpret` is a PREFIX operator that swallows a following additive expression — silent wrong pointer math.** `reinterpret<float?>(p) + off` parses as `reinterpret<float?>((p) + off)`: the parens around `p` do NOT delimit the operand, so `+ off` executes on `p`'s ORIGINAL type first (byte-scaled for `uint8?`), then the result is cast — no diagnostic (probe-verified 2026-07-09: values landed at byte offsets, not element offsets). Fixes (both verified): bind the cast to a local first (`var d = reinterpret<float?>(p); d + off`), or parenthesize the whole cast (`(reinterpret<float?>(p)) + off`)
 - **`typeinfo is_unsafe_when_uninitialized(type<T>)`** — the trait that gates unsafe-ness per type in generic code. Pairs with field-level `@safe_when_uninitialized` and struct-level `[safe_when_uninitialized]` annotations. Canonical use in `daslib/builtin.das`: declare `var x : TT` inside `static_if (typeinfo is_unsafe_when_uninitialized(type<TT>)) { unsafe { ... } } else { ... }` — the unsafe block needs `// nolint:STYLE025` on the `unsafe {` line because STYLE025 sees only one statement needing unsafe at any instantiation and can't reason across the static_if branches
 
 ### Error handling
@@ -269,9 +272,11 @@ A generic that should accept `array<T>`, `array<array<T>>`, … (any nesting) �
 
 - Lambda params can shadow function params — use distinct names
 - String builder requires `unsafe` or `options persistent_heap` if returned
+- **DANGER — silent JIT miscompile:** a comprehension used **inline** as a `<-` move-init argument inside a struct constructor (`Foo(a <- [for (x in src); expr], b <- local)`) yields an **empty array under `-jit`** (interp is fine; a plain-local `<-` field beside it is unaffected). No diagnostic. **Hoist the comprehension to a `var` local first**, then `Foo(a <- local_comp, b <- local)`. (This is exactly the fix applied in `modules/dasLLAMA/performance/gen_asr_profile.das`.)
 - Tuple field access: `t._0`, `t._1`, `t._2`
 - Annotations: `[export]`, `[test]`; `options no_aot`, `options rtti`
 - **`options` are MODULE-LOCAL for pass-macros** (`[lint_macro]` / `AstPassMacro`). The macro fires once per module in the require chain, reading `prog._options` from THAT module's options table — not the program-root's. So `options _my_lint_off = true` in `foo.das` suppresses YOUR lint in `foo`, but `require foo` from `bar.das` does not inherit the flag — `bar` gets linted unless it sets its own. Don't confuse with runtime options (`gc`, `multiple_contexts`, `persistent_heap`, `rtti`) which DO unify across the program codegen and effectively cascade up to consumers
+- **`options stack` is MAIN-MODULE-ONLY — it does NOT unify up from required modules** (probe-verified 2026-07-09: a 1MB `options stack` in a required shared module left the program's context at the 16K default and it still overflowed). A deep library (dasLLAMA's forward chain, llvm_jit) cannot declare its own stack need — every PROGRAM (test file, example, tool) that drives it must carry `options stack = 65536` (or whatever it needs) itself; `llvm_jit.das`'s 4MB works only because those files run as the program root
 - **Visibility is a prefix keyword, not an annotation:** `def private foo()`, `struct private Foo { ... }`, `enum private E { ... }`, `variable private x = 0`, `alias private X = Y`. There is **no** `[private]` annotation — it's a grammar error
 - **Field/variable annotations use `@name` only:** `@safe_when_uninitialized at : LineInfo`, `@sql_primary_key id : int64`, `@do_not_delete ctx : Context?`. The `[name]` form is reserved for struct/function/global-level annotations and does NOT parse on a struct field
 - `require` uses forward slash: `require daslib/linq` — NOT backslash
@@ -298,7 +303,7 @@ A generic that should accept `array<T>`, `array<array<T>>`, … (any nesting) �
 | 6 qmacro arms differing only in the call target (`if isTry { qmacro(_::try_run_select(…)) } elif … { … }`) | `let fname = (isTry ? "try_run_select" : "run_select") + suffix; qmacro($c(fname)(…))` | `$c(stringVar)` splices a function name; resolution at splice site uses user's `require` chain. Note: `_::$c(…)` is a parse error — drop `_::` |
 | `if (true) { ... }` | `{ ... }` | bare blocks create lexical scope in gen2 |
 | `var inscope r <- expr; return <- r` | `return <- expr` | direct return avoids intermediate |
-| `unsafe { (reinterpret<ExprBlock?> blk).list }` / `unsafe(reinterpret<T?> x)` | make param `var` + plain `x.list` | `var` param gives non-const field access without reinterpret |
+| `unsafe { (reinterpret<ExprBlock?>(blk)).list }` / `unsafe(reinterpret<T?>(x))` | make param `var` + plain `x.list` | `var` param gives non-const field access without reinterpret |
 | `if (cond) { return X }` (or `{ break }` / `{ continue }`) | `if (cond) return X` or postfix `return X if (cond)` | STYLE005: braces around a single-statement early-exit are noise |
 | `for (i in range(length(arr))) { ... arr[i] ... }` where `i` is used only as `arr[i]` | `for (c in arr) { ... c ... }` | PERF018: direct iteration drops the index variable |
 | `from_JV(v, type<int>, 13)` | `v ?? 13` | STYLE020: json_boost provides `operator ??` for every scalar `from_JV` overload |
