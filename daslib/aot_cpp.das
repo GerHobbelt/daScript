@@ -221,7 +221,7 @@ def hex_char(var Ch : int) {
 }
 
 def aotSuffixNameEx(funcName : das_string; suffix : string) {
-    var prefix = false;
+    var prefix = is_cpp_keyword(string(funcName));
 
     let name = build_string() $(var writer) {
         for (ch in string(funcName)) {
@@ -416,16 +416,15 @@ def describeCppTypeEx(typeDecl : TypeDeclPtr;
         if (!cfg.skip_const && typeDecl.flags.constant) {
             write(writer, " const ");
         }
-        // Value-annotation handles (e.g. Handle<T>) are POD and always passed by value,
-        // even when daslang marks the expression result as ref (stack temp). Skip the
-        // & suffix so "var T* = ...; return T&" mismatches don't break the AOT build.
-        // Keep the * suffix when substitute_ref is requested (e.g. iteration variables),
-        // since das_iterator::first(Context*, QQ*&) demands a real pointer regardless.
-        let valueHandle = baseType == Type.tHandle && !typeDecl.isRefType
+        // Reference handling: emit `*` when substitute_ref is requested (iterator
+        // and stack-temp variable emission paths use `T*` storage), otherwise emit
+        // `&` so writable reference parameters (including value-annotation handles
+        // like Handle<T>, EntityId, das::Time used as `var x : T&`) propagate
+        // mutations back to the caller in AOT.
         if (typeDecl.flags.ref && !cfg.skip_ref) {
             if (cfg.substitute_ref) {
                 write(writer, " *");
-            } elif (!valueHandle) {
+            } else {
                 write(writer, " &");
             }
         }
@@ -438,6 +437,19 @@ def public describeCppType(typeDecl : TypeDeclPtr;
     return describeCppTypeEx(typeDecl, cfg, CpptUseAlias.no);
 }
 
+def expectsLocalTemp(expr : ExprMakeLocal?) : bool {
+    if (!expr.makeFlags.doesNotNeedSp && expr.stackTop != 0u) {
+        if (expr is ExprMakeStruct) {
+            let mks = expr as ExprMakeStruct
+            if (mks.makeType.baseType == Type.tHandle
+                    && !mks.makeType.isRefType
+                    && mks.constructor == null) return false
+        }
+        return true
+    }
+    return false
+}
+
 class NoAotMarker : AstVisitor {
     //! AST visitor that marks functions containing non-AOT-compatible types as noAot.
     @do_not_delete func : Function? <- null;
@@ -445,7 +457,7 @@ class NoAotMarker : AstVisitor {
     // type
     def override preVisitTypeDecl(typeDecl : TypeDeclPtr) {
         if (func != null && !typeDecl.canAot) {
-            func.flags |= FunctionFlags.noAot
+            func.flags.noAot = true
         }
     }
     // function
@@ -460,7 +472,7 @@ class NoAotMarker : AstVisitor {
     // any expression
     def override preVisitExpression(expr : ExpressionPtr) {
         if (func != null && expr._type != null && !expr._type.canAot) {
-            func.flags |= FunctionFlags.noAot
+            func.flags.noAot = true
         }
     }
     // looks like call
@@ -469,7 +481,7 @@ class NoAotMarker : AstVisitor {
             if (!empty(call.arguments) && call.arguments[0] is ExprMakeBlock) {
                 let mkb = call.arguments[0] as ExprMakeBlock;
                 var blk = mkb._block as ExprBlock;
-                blk.blockFlags |= ExprBlockFlags.aotSkipMakeBlock;
+                blk.blockFlags.aotSkipMakeBlock = true;
             }
         }
     }
@@ -492,7 +504,7 @@ class public PrologueMarker : AstVisitor {
         if (func != null && func.flags.hasMakeBlock) {
             let blk = expr._block as ExprBlock;
             if (!blk.blockFlags.aotSkipMakeBlock) {
-                func.flags |= FunctionFlags.aotNeedPrologue;
+                func.flags.aotNeedPrologue = true;
             }
         }
     }
@@ -1018,7 +1030,7 @@ class public BlockVariableCollector : AstVisitor {
     }
 
     def handleExpr(var expr : ExprMakeLocal?) {
-        let need_insert = !expr.makeFlags.doesNotNeedSp && expr.stackTop != 0u;
+        let need_insert = expectsLocalTemp(expr);
         if (need_insert) {
             let blk = getCurrentBlock();
             localTemps[blk] |> push(expr);
@@ -1410,7 +1422,7 @@ class public CppAot : AstVisitor {
     }
     def override preVisitExprBlock(var blk : ExprBlock?) {
         push(scopes, blk);
-        blk.blockFlags |= ExprBlockFlags.finallyBeforeBody;
+        blk.blockFlags.finallyBeforeBody = true;
         write(*ss, "\{\n");
         tab ++;
         // pre-declare variables
@@ -1461,8 +1473,8 @@ class public CppAot : AstVisitor {
     def override visitExprBlock(var blk : ExprBlock?) : ExpressionPtr {
         tab --;
         write(*ss, "{tabs()}\}")
-        blk.blockFlags &= ~ExprBlockFlags.finallyBeforeBody
-        blk.blockFlags &= ~ExprBlockFlags.finallyDisabled
+        blk.blockFlags.finallyBeforeBody = false
+        blk.blockFlags.finallyDisabled = false
         scopes |> pop();
         return blk;
     }
@@ -1489,11 +1501,11 @@ class public CppAot : AstVisitor {
         if (variable.init != null && variable.init is ExprMakeBlock) {
             var mkb = variable.init as ExprMakeBlock;
             var blk = mkb._block as ExprBlock;
-            blk.blockFlags |= ExprBlockFlags.aotSkipMakeBlock;
+            blk.blockFlags.aotSkipMakeBlock = true;
             write(*ss, "auto {vname}_TempFunctor = ");
             visit_expression(variable.init, adapter);
             write(*ss, ";\n{tabs()}");
-            blk.blockFlags &= ~ExprBlockFlags.aotSkipMakeBlock;
+            blk.blockFlags.aotSkipMakeBlock = false;
             mkb.aotFunctorName := vname + "_TempFunctor";
         }
         if (!collector.isMoved(variable)) {
@@ -2863,7 +2875,7 @@ class public CppAot : AstVisitor {
     }
 // make variant
     def needTempSrc(expr : ExprMakeLocal?) {
-        return !expr.makeFlags.doesNotNeedSp && expr.stackTop != 0u;
+        return expectsLocalTemp(expr);
     }
     def mkvName(expr : ExprMakeVariant?) {
         if (needTempSrc(expr)) {

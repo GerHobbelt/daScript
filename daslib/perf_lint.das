@@ -31,6 +31,7 @@ module perf_lint shared private
 //!   PERF016 — ternary abs — use abs(x)
 //!   PERF017 — length(s) == 0 / != 0 — use empty(s) / !empty(s)
 //!   PERF018 — for (i in range(length(arr))) where i only indexes arr — use 'for (c in arr)'
+//!   PERF019 — int(T.a) | int(T.b) on bitfield-or-enum-with-operator-| — collapse to int(T.a | T.b)
 
 require daslib/ast_boost
 require strings
@@ -110,7 +111,11 @@ class PerfLintVisitor : AstVisitor {
     collect_warnings : bool = false
     warnings : array<string>
     // dedup: reported (file_hash, line, column) to suppress duplicate warnings from generic instantiations
-    reported_locations : array<uint64>
+    reported_locations : table<uint64>
+    // PERF019: cache of enum-types we've probed for an `operator |` overload.
+    // Keys are intptr(Enumeration?); vals say "yes, has operator|".
+    perf019_enum_or_probed : array<uint64>
+    perf019_enum_or_yes : array<uint64>
     def PerfLintVisitor() {
         pass
     }
@@ -120,20 +125,7 @@ class PerfLintVisitor : AstVisitor {
     }
 
     def is_suppressed(text : string; at : LineInfo) : bool {
-        if (at.fileInfo == null || at.line == 0u) return false
-        // extract PERFxxx code from warning text (e.g. "PERF003: ...")
-        let colon = find(text, ":")
-        if (colon < 0) return false
-        let code = slice(text, 0, colon)
-        var found = false
-        get_file_source_line(at.fileInfo, at.line) $(line) {
-            // look for "// nolint:PERFxxx" or "// nolint(PERFxxx)" in a comment
-            let nolint_pos = find(line, "nolint")
-            if (nolint_pos >= 0) {
-                found = find(line, code, nolint_pos) >= 0
-            }
-        }
-        return found
+        return is_lint_suppressed(at, extract_lint_code(text))
     }
 
     def perf_warning(text : string; at : LineInfo) : void {
@@ -143,8 +135,8 @@ class PerfLintVisitor : AstVisitor {
             || (current_function != null && current_function.flags.generated)) return
         // Deduplicate warnings — same source location reported once, regardless of generic instantiations
         let key = self->location_key(at)
-        if (reported_locations |> has_value(key)) return
-        reported_locations |> push(key)
+        if (key_exists(reported_locations, key)) return
+        reported_locations |> insert(key)
         // Check inline suppression: // PERFxxx on the same line
         if (self->is_suppressed(text, at)) return
         warning_count++
@@ -372,6 +364,64 @@ class PerfLintVisitor : AstVisitor {
         if (call.func == null || call.func.name != "length") return false
         let modname = string(call.func._module.name)
         return modname == "strings" || modname == "$" || modname == "builtin"
+    }
+
+    // --- PERF019: int(T.a) | int(T.b) cast-collapse helpers ---
+
+    def unwrap_int_cast(expr : Expression? const) : Expression? const {
+        //! If `expr` is `int(x)` (single argument, no fake/context args), return x.
+        //! `int()` after inference is a generic call — fromGeneric.name is "int".
+        //! Peels one ExprRef2Value layer first.
+        if (expr == null) return null
+        var inner = expr
+        if (inner is ExprRef2Value) {
+            inner = (inner as ExprRef2Value.subexpr)
+        }
+        if (inner == null || !(inner is ExprCall)) return null
+        let call = inner as ExprCall
+        if (call.func == null || empty(call.arguments)) return null
+        let fname = call.func.fromGeneric != null ? string(call.func.fromGeneric.name) : string(call.func.name)
+        if (fname != "int") return null
+        return call.arguments[0]
+    }
+
+    def enum_has_or_operator(t : TypeDecl?) : bool {
+        //! Returns true if any module in the compiling program defines `def operator |(a, b : T) : ...`
+        //! for the enum represented by `t`. Result is cached on perf019_enum_or_probed / _yes by
+        //! intptr(t.enumType) so repeated checks across a large file don't re-walk the function table.
+        if (t == null || t.enumType == null) return false
+        let key = uint64(intptr(t.enumType))
+        for (idx in range(length(perf019_enum_or_probed))) {
+            return perf019_enum_or_yes |> has_value(key) if (perf019_enum_or_probed[idx] == key)
+        }
+        var found = false
+        program_for_each_module(compiling_program()) $(mod) {
+            return if (found)
+            for_each_function(mod, "|") $(var fn) {
+                if (length(fn.arguments) == 2
+                    && fn.arguments[0]._type != null && fn.arguments[1]._type != null
+                    && (fn.arguments[0]._type |> is_same_type(t, RefMatters.no, ConstMatters.no, TemporaryMatters.no))
+                    && (fn.arguments[1]._type |> is_same_type(t, RefMatters.no, ConstMatters.no, TemporaryMatters.no))) {
+                    found = true
+                }
+            }
+        }
+        perf019_enum_or_probed |> push(key)
+        if (found) {
+            perf019_enum_or_yes |> push(key)
+        }
+        return found
+    }
+
+    def inner_type_supports_or(t : TypeDecl?) : bool {
+        //! True if `T | T` resolves: bitfields always; enums only when an
+        //! `operator |` overload exists. Vectors/ints/etc. don't get here —
+        //! the caller restricts to int-cast inputs whose underlying type is
+        //! either bitfield or enum.
+        if (t == null || !empty(t.dim)) return false
+        if (t.baseType == Type.tBitfield) return true
+        if (t.baseType == Type.tEnumeration) return self->enum_has_or_operator(t)
+        return false
     }
 
     // --- function tracking ---
@@ -848,6 +898,23 @@ class PerfLintVisitor : AstVisitor {
         if (expr.op == "==" || expr.op == "!=" || expr.op == "<" || expr.op == "<=" || expr.op == ">" || expr.op == ">=") {
             self->check_perf017_length_zero(expr)
         }
+        // PERF019: int(T.a) | int(T.b) collapses to int(T.a | T.b) when T natively
+        // supports `|` (bitfield always; enum only when an `operator |` overload exists).
+        if (expr.op == "|") {
+            self->check_perf019_int_cast_or(expr)
+        }
+    }
+
+    def check_perf019_int_cast_or(expr : ExprOp2?) : void {
+        let l = self->unwrap_int_cast(expr.left)
+        let r = self->unwrap_int_cast(expr.right)
+        if (l == null || r == null
+            || l._type == null || r._type == null
+            || !self->inner_type_supports_or(l._type)
+            || !(l._type |> is_same_type(r._type, RefMatters.no, ConstMatters.no, TemporaryMatters.no))) return
+        let bt = l._type.baseType
+        let kind = bt == Type.tBitfield ? "bitfield" : "enum"
+        self->perf_warning("PERF019: int(...) | int(...) on the same {kind} type can collapse to int(L | R) (one cast instead of two)", expr.at)
     }
 
     // --- PERF014: closed-interval char-class range checks ---
