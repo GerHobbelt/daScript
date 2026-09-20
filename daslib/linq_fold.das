@@ -87,6 +87,27 @@ def private fold_linq_cond_peel(var expr : Expression?; var replacement : Expres
     return qmacro(invoke($e(expr), $e(replacement)))
 }
 
+[macro_function]
+def private fold_linq_cond2(var expr : Expression?; arg0Name, arg1Name : string) : Expression? {
+    // 2-arg peel for aggregate's block<(acc, x):AGG>; returns null if non-peelable so caller falls back to invoke.
+    if (expr is ExprMakeBlock) {
+        var mblk = expr as ExprMakeBlock
+        var blk = mblk._block as ExprBlock
+        if (blk.arguments |> length == 2 && blk.list |> length == 1 && blk.list[0] is ExprReturn) {
+            var ret = blk.list[0] as ExprReturn
+            if (ret.subexpr != null) {
+                var res = clone_expression(ret.subexpr)
+                var rules : Template
+                rules |> renameVariable(string(blk.arguments[0].name), arg0Name)
+                rules |> renameVariable(string(blk.arguments[1].name), arg1Name)
+                apply_template(rules, res.at, res)
+                return res
+            }
+        }
+    }
+    return null
+}
+
 struct private LinqCall {
     name : string
     moduleName : string = "linq"
@@ -356,10 +377,16 @@ enum private LinqLane {
 [macro_function]
 def private classify_terminator(name : string) : LinqLane {
     if (name == "count") return LinqLane.COUNTER
-    // take/skip trailing (after to_array strip) → ARRAY lane with implicit materialization.
-    if (name == "where_" || name == "select" || name == "take" || name == "skip") return LinqLane.ARRAY
+    // take/skip/take_while/skip_while trailing (after to_array strip) → ARRAY lane with implicit materialization.
+    if (name == "where_" || name == "select" || name == "take" || name == "skip"
+            || name == "take_while" || name == "skip_while") return LinqLane.ARRAY
     if (name == "sum" || name == "min" || name == "max" || name == "average" || name == "long_count") return LinqLane.ACCUMULATOR
-    if (name == "first" || name == "first_or_default" || name == "any" || name == "all" || name == "contains") return LinqLane.EARLY_EXIT
+    // EARLY_EXIT is also the dispatch lane for full-walk single-return terminators (last/single/element_at/aggregate) — same emit_early_exit_lane shape, different per-op state.
+    if (name == "first" || name == "first_or_default" || name == "any" || name == "all" || name == "contains"
+            || name == "last" || name == "last_or_default"
+            || name == "single" || name == "single_or_default"
+            || name == "element_at" || name == "element_at_or_default"
+            || name == "aggregate") return LinqLane.EARLY_EXIT
     return LinqLane.UNKNOWN
 }
 
@@ -371,7 +398,6 @@ def private is_buffer_required_op(name : string) : bool {
         || name == "distinct" || name == "distinct_by"
         || name == "reverse"
         || name == "group_by" || name == "group_by_lazy"
-        || name == "zip"
         || name == "join" || name == "left_join" || name == "group_join")
 }
 
@@ -468,9 +494,9 @@ def private prepend_precond(var body : Expression?; var preCondStmts : array<Exp
 }
 
 [macro_function]
-def private append_skip_take_prelude(var preludeStmts : array<Expression?>; var skipExpr : Expression?; var takeExpr : Expression?;
-                                     skipName, takeCountName : string) {
-    // Loop-level counters for skip/take. Both live in the outer invoke block, alongside any
+def private append_ranges_prelude(var preludeStmts : array<Expression?>; var skipExpr, takeExpr, skipWhileCond : Expression?;
+                                  skipName, takeCountName, skippingName : string) {
+    // Loop-level state for skip/take counters + skip_while flag (one-way, flips on first false-pred).
     if (skipExpr != null) {
         var skipInit = clone_expression(skipExpr)
         preludeStmts |> push <| qmacro_expr() {
@@ -482,15 +508,20 @@ def private append_skip_take_prelude(var preludeStmts : array<Expression?>; var 
             var $i(takeCountName) = 0
         }
     }
+    if (skipWhileCond != null) {
+        preludeStmts |> push <| qmacro_expr() {
+            var $i(skippingName) = true
+        }
+    }
 }
 
 [macro_function]
-def private wrap_with_skip_take(var stmts : array<Expression?>; var skipExpr : Expression?; var takeExpr : Expression?;
-                                skipName, takeCountName : string) {
-    // Per-match-block wrapping. Order at the head of the block is:
-    if (skipExpr == null && takeExpr == null) return
+def private wrap_with_ranges(var stmts : array<Expression?>; var skipExpr, takeExpr, skipWhileCond, takeWhileCond : Expression?;
+                             skipName, takeCountName, skippingName : string) {
+    // Per-match prefix order: take-guard → skip counter → skip_while flip → take_while break → takeCount++ → body. takeCount++ sits AFTER skip_while/take_while so gated-out elements don't eat the take(N) budget.
+    if (skipExpr == null && takeExpr == null && skipWhileCond == null && takeWhileCond == null) return
     var prefixed : array<Expression?>
-    prefixed |> reserve(length(stmts) + 3)
+    prefixed |> reserve(length(stmts) + 5)
     if (takeExpr != null) {
         var takeLimit = clone_expression(takeExpr)
         // `>=` (not `==`) so non-positive N short-circuits on the first iteration —
@@ -505,6 +536,25 @@ def private wrap_with_skip_take(var stmts : array<Expression?>; var skipExpr : E
             if ($i(skipName) > 0) {
                 $i(skipName) --
                 continue
+            }
+        }
+    }
+    if (skipWhileCond != null) {
+        var swPred = clone_expression(skipWhileCond)
+        prefixed |> push <| qmacro_expr() {
+            if ($i(skippingName)) {
+                if ($e(swPred)) {
+                    continue
+                }
+                $i(skippingName) = false
+            }
+        }
+    }
+    if (takeWhileCond != null) {
+        var twPred = clone_expression(takeWhileCond)
+        prefixed |> push <| qmacro_expr() {
+            if (!($e(twPred))) {
+                break
             }
         }
     }
@@ -529,15 +579,15 @@ def private min_max_compare(workhorse : bool; opName : string; valName, accName 
 }
 
 [macro_function]
-def private emit_counter_lane(var top : Expression?; srcName, accName, itName, skipName, takeCountName : string;
-                              var skipExpr : Expression?; var takeExpr : Expression?;
+def private emit_counter_lane(var top : Expression?; srcName, accName, itName, skipName, takeCountName, skippingName : string;
+                              var skipExpr, takeExpr, skipWhileCond : Expression?;
                               var loopBody : Expression?; at : LineInfo) : Expression? {
     // Counter lane: `[skip/take init]; var acc = 0; for (it in src) { $loopBody }; return acc`
     var topExpr = clone_expression(top)
     topExpr.genFlags.alwaysSafe = true
     var srcParamType = invoke_src_param_type(top)
     var bodyStmts : array<Expression?>
-    append_skip_take_prelude(bodyStmts, skipExpr, takeExpr, skipName, takeCountName)
+    append_ranges_prelude(bodyStmts, skipExpr, takeExpr, skipWhileCond, skipName, takeCountName, skippingName)
     bodyStmts |> push <| qmacro_expr() {
         var $i(accName) = 0
     }
@@ -557,8 +607,8 @@ def private emit_counter_lane(var top : Expression?; srcName, accName, itName, s
 
 [macro_function]
 def private emit_array_lane(var top : Expression?; var expr : Expression?; var loopBody : Expression?; var elementType : TypeDeclPtr;
-                            srcName, accName, itName, skipName, takeCountName : string;
-                            var skipExpr : Expression?; var takeExpr : Expression?;
+                            srcName, accName, itName, skipName, takeCountName, skippingName : string;
+                            var skipExpr, takeExpr, skipWhileCond : Expression?;
                             at : LineInfo) : Expression? {
     // Array lane: `[skip/take init]; var acc : array<T>; [reserve]; for (it in src) { $loopBody }; return <- acc`
     let isIter = expr._type.isIterator
@@ -567,7 +617,7 @@ def private emit_array_lane(var top : Expression?; var expr : Expression?; var l
     topExpr.genFlags.alwaysSafe = true
     var srcParamType = invoke_src_param_type(top)
     var bodyStmts : array<Expression?>
-    append_skip_take_prelude(bodyStmts, skipExpr, takeExpr, skipName, takeCountName)
+    append_ranges_prelude(bodyStmts, skipExpr, takeExpr, skipWhileCond, skipName, takeCountName, skippingName)
     bodyStmts |> push <| qmacro_expr() {
         var $i(accName) : array<$t(elementType)>
     }
@@ -614,8 +664,8 @@ def private emit_accumulator_lane(
                                   var intermediateBinds : array<Expression?>;
                                   var preCondStmts : array<Expression?>;
                                   var elementType : TypeDeclPtr;
-                                  srcName, accName, itName, skipName, takeCountName : string;
-                                  var skipExpr : Expression?; var takeExpr : Expression?;
+                                  srcName, accName, itName, skipName, takeCountName, skippingName : string;
+                                  var skipExpr, takeExpr, skipWhileCond, takeWhileCond : Expression?;
                                   at : LineInfo
                                   ) : Expression? {
     // Ring 1 single-pass accumulator lane: sum / min / max / average / long_count.
@@ -707,12 +757,12 @@ def private emit_accumulator_lane(
         return null
     }
     prepend_binds(perMatchStmts, intermediateBinds)
-    wrap_with_skip_take(perMatchStmts, skipExpr, takeExpr, skipName, takeCountName)
+    wrap_with_ranges(perMatchStmts, skipExpr, takeExpr, skipWhileCond, takeWhileCond, skipName, takeCountName, skippingName)
     var loopBody = prepend_precond(wrap_with_condition(stmts_to_expr(perMatchStmts), whereCond), preCondStmts)
     // Collect all body statements into one list so they share scope when spliced via $b.
     var bodyStmts : array<Expression?>
     bodyStmts |> reserve(length(preludeStmts) + 4)
-    append_skip_take_prelude(bodyStmts, skipExpr, takeExpr, skipName, takeCountName)
+    append_ranges_prelude(bodyStmts, skipExpr, takeExpr, skipWhileCond, skipName, takeCountName, skippingName)
     for (s in preludeStmts) {
         bodyStmts |> push(s)
     }
@@ -754,8 +804,8 @@ def private emit_early_exit_lane(
                                  var preCondStmts : array<Expression?>;
                                  var elementType : TypeDeclPtr;
                                  terminatorCall : ExprCall?;
-                                 srcName, itName, skipName, takeCountName : string;
-                                 var skipExpr : Expression?; var takeExpr : Expression?;
+                                 srcName, itName, skipName, takeCountName, skippingName : string;
+                                 var skipExpr, takeExpr, skipWhileCond, takeWhileCond : Expression?;
                                  at : LineInfo
                                  ) : Expression? {
     // Ring 2 early-exit lane: first / first_or_default / any / all / contains.
@@ -846,16 +896,229 @@ def private emit_early_exit_lane(
         tailStmts |> push <| qmacro_expr() {
             return false
         }
+    } elif (opName == "last" || opName == "last_or_default") {
+        // Full walk; per-match overwrites a single bind; tail returns it after found-check (panic/default for empty).
+        var retType : TypeDeclPtr
+        if (projection != null) {
+            retType = clone_type(projection._type)
+        } else {
+            retType = clone_type(elementType)
+        }
+        if (retType != null) {
+            retType.flags.constant = false
+            retType.flags.ref = false
+        }
+        let foundName = "`found`{at.line}`{at.column}"
+        let lastBindName = "`lst`{at.line}`{at.column}"
+        preludeStmts |> push <| qmacro_expr() {
+            var $i(foundName) = false
+        }
+        preludeStmts |> push <| qmacro_expr() {
+            var $i(lastBindName) : $t(retType)
+        }
+        perMatchStmts |> push <| qmacro_expr() {
+            $i(foundName) = true
+        }
+        perMatchStmts |> push <| qmacro_expr() {
+            $i(lastBindName) := $i(valueName)
+        }
+        if (opName == "last") {
+            tailStmts <- qmacro_block_to_array() {
+                if (!$i(foundName)) {
+                    panic("sequence contains no elements")
+                }
+                return <- $i(lastBindName)
+            }
+        } else {
+            // Bind `d` once at the top (eager, matches linq.das line 2621).
+            let defaultName = "`dval`{at.line}`{at.column}"
+            var defaultExpr = clone_expression(terminatorCall.arguments[1])
+            preludeStmts |> push <| qmacro_expr() {
+                let $i(defaultName) = $e(defaultExpr)
+            }
+            tailStmts <- qmacro_block_to_array() {
+                if (!$i(foundName)) {
+                    return $i(defaultName)
+                }
+                return <- $i(lastBindName)
+            }
+        }
+    } elif (opName == "single" || opName == "single_or_default") {
+        // Full walk; on the SECOND match `single` panics and `single_or_default` returns the default; same for empty source.
+        var retType : TypeDeclPtr
+        if (projection != null) {
+            retType = clone_type(projection._type)
+        } else {
+            retType = clone_type(elementType)
+        }
+        if (retType != null) {
+            retType.flags.constant = false
+            retType.flags.ref = false
+        }
+        let foundName = "`found`{at.line}`{at.column}"
+        let bindName = "`sng`{at.line}`{at.column}"
+        preludeStmts |> push <| qmacro_expr() {
+            var $i(foundName) = false
+        }
+        preludeStmts |> push <| qmacro_expr() {
+            var $i(bindName) : $t(retType)
+        }
+        if (opName == "single") {
+            perMatchStmts |> push <| qmacro_expr() {
+                if ($i(foundName)) {
+                    panic("sequence contains more than one element")
+                }
+            }
+            perMatchStmts |> push <| qmacro_expr() {
+                $i(foundName) = true
+            }
+            perMatchStmts |> push <| qmacro_expr() {
+                $i(bindName) := $i(valueName)
+            }
+            tailStmts <- qmacro_block_to_array() {
+                if (!$i(foundName)) {
+                    panic("sequence contains no elements")
+                }
+                return <- $i(bindName)
+            }
+        } else {
+            let defaultName = "`dval`{at.line}`{at.column}"
+            var defaultExpr = clone_expression(terminatorCall.arguments[1])
+            preludeStmts |> push <| qmacro_expr() {
+                let $i(defaultName) = $e(defaultExpr)
+            }
+            // `single_or_default` early-returns default on the SECOND match (subsequent matches don't matter).
+            perMatchStmts |> push <| qmacro_expr() {
+                if ($i(foundName)) {
+                    return $i(defaultName)
+                }
+            }
+            perMatchStmts |> push <| qmacro_expr() {
+                $i(foundName) = true
+            }
+            perMatchStmts |> push <| qmacro_expr() {
+                $i(bindName) := $i(valueName)
+            }
+            tailStmts <- qmacro_block_to_array() {
+                if (!$i(foundName)) {
+                    return $i(defaultName)
+                }
+                return <- $i(bindName)
+            }
+        }
+    } elif (opName == "element_at" || opName == "element_at_or_default") {
+        // Counter-style early-exit: return the N-th element that survives upstream where/select. Negative index panics or returns default pre-loop.
+        var retType : TypeDeclPtr
+        if (projection != null) {
+            retType = clone_type(projection._type)
+        } else {
+            retType = clone_type(elementType)
+        }
+        if (retType != null) {
+            retType.flags.constant = false
+            retType.flags.ref = false
+        }
+        let idxName = "`idx`{at.line}`{at.column}"
+        let cntName = "`ec`{at.line}`{at.column}"
+        var idxExpr = clone_expression(terminatorCall.arguments[1])
+        preludeStmts |> push <| qmacro_expr() {
+            let $i(idxName) = $e(idxExpr)
+        }
+        if (opName == "element_at") {
+            preludeStmts |> push <| qmacro_expr() {
+                if ($i(idxName) < 0) {
+                    panic("element index out of range")
+                }
+            }
+        } else {
+            preludeStmts |> push <| qmacro_expr() {
+                if ($i(idxName) < 0) {
+                    return default<$t(retType)>
+                }
+            }
+        }
+        preludeStmts |> push <| qmacro_expr() {
+            var $i(cntName) = 0
+        }
+        perMatchStmts |> push <| qmacro_expr() {
+            if ($i(cntName) == $i(idxName)) {
+                return $i(valueName)
+            }
+        }
+        perMatchStmts |> push <| qmacro_expr() {
+            $i(cntName) ++
+        }
+        if (opName == "element_at") {
+            tailStmts <- qmacro_block_to_array() {
+                panic("element index out of range")
+                return default<$t(retType)>
+            }
+        } else {
+            tailStmts |> push <| qmacro_expr() {
+                return default<$t(retType)>
+            }
+        }
+    } elif (opName == "aggregate") {
+        // Peel single-return `block<(acc, x):AGG>` body inline; fall back to invoke on multi-stmt. Workhorse seed picks `=` / `return`; non-workhorse uses `<-` / `return <-` (matches linq.das:1466 static_if).
+        var seedExpr = clone_expression(terminatorCall.arguments[1])
+        var aggFn = clone_expression(terminatorCall.arguments[2])
+        var accType = clone_type(seedExpr._type)
+        if (accType != null) {
+            accType.flags.constant = false
+            accType.flags.ref = false
+        }
+        let aggAccName = "`agg`{at.line}`{at.column}"
+        let aggIsWorkhorse = (seedExpr._type != null && seedExpr._type.isWorkhorseType)
+        if (aggIsWorkhorse) {
+            preludeStmts |> push <| qmacro_expr() {
+                var $i(aggAccName) : $t(accType) = $e(seedExpr)
+            }
+        } else {
+            preludeStmts |> push <| qmacro_expr() {
+                var $i(aggAccName) : $t(accType) <- $e(seedExpr)
+            }
+        }
+        var peeled = fold_linq_cond2(aggFn, aggAccName, valueName)
+        if (peeled != null) {
+            if (aggIsWorkhorse) {
+                perMatchStmts |> push <| qmacro_expr() {
+                    $i(aggAccName) = $e(peeled)
+                }
+            } else {
+                perMatchStmts |> push <| qmacro_expr() {
+                    $i(aggAccName) <- $e(peeled)
+                }
+            }
+        } else {
+            if (aggIsWorkhorse) {
+                perMatchStmts |> push <| qmacro_expr() {
+                    $i(aggAccName) = invoke($e(aggFn), $i(aggAccName), $i(valueName))
+                }
+            } else {
+                perMatchStmts |> push <| qmacro_expr() {
+                    $i(aggAccName) <- invoke($e(aggFn), $i(aggAccName), $i(valueName))
+                }
+            }
+        }
+        if (aggIsWorkhorse) {
+            tailStmts |> push <| qmacro_expr() {
+                return $i(aggAccName)
+            }
+        } else {
+            tailStmts |> push <| qmacro_expr() {
+                return <- $i(aggAccName)
+            }
+        }
     } else {
         return null
     }
     prepend_binds(perMatchStmts, intermediateBinds)
-    wrap_with_skip_take(perMatchStmts, skipExpr, takeExpr, skipName, takeCountName)
+    wrap_with_ranges(perMatchStmts, skipExpr, takeExpr, skipWhileCond, takeWhileCond, skipName, takeCountName, skippingName)
     var loopBody = prepend_precond(wrap_with_condition(stmts_to_expr(perMatchStmts), whereCond), preCondStmts)
     // Single-$b body so all stmts (skip/take counters + prelude + for + tail) share scope
     var bodyStmts : array<Expression?>
     bodyStmts |> reserve(length(preludeStmts) + length(tailStmts) + 3)
-    append_skip_take_prelude(bodyStmts, skipExpr, takeExpr, skipName, takeCountName)
+    append_ranges_prelude(bodyStmts, skipExpr, takeExpr, skipWhileCond, skipName, takeCountName, skippingName)
     for (s in preludeStmts) {
         bodyStmts |> push(s)
     }
@@ -1135,6 +1398,7 @@ def private plan_loop_or_count(var expr : Expression?) : Expression? {
     let accName = "`acc`{at.line}`{at.column}"
     let skipName = "`skip`{at.line}`{at.column}"
     let takeCountName = "`tc`{at.line}`{at.column}"
+    let skippingName = "`skipping`{at.line}`{at.column}"
     var whereCond : Expression?
     var projection : Expression?
     var intermediateBinds : array<Expression?>
@@ -1142,8 +1406,13 @@ def private plan_loop_or_count(var expr : Expression?) : Expression? {
     var preCondStmts : array<Expression?>
     var skipExpr : Expression?
     var takeExpr : Expression?
+    // skip_while / take_while: predicate-driven ranges. Both peel with itName (source elem); seenSelect bails to tier 2.
+    var skipWhileCond : Expression?
+    var takeWhileCond : Expression?
     var seenSelect = false
     var seenSkip = false
+    var seenSkipWhile = false
+    var seenTakeWhile = false
     var seenTake = false
     var allProjectionsPure = true
     var elementType = clone_type(top._type.firstType)
@@ -1152,8 +1421,8 @@ def private plan_loop_or_count(var expr : Expression?) : Expression? {
         var cll & = unsafe(calls[i])
         let opName = cll._1.name
         if (opName == "where_") {
-            // skip/take-after-where is rejected — canonical chain order is
-            if (seenSkip || seenTake) return null
+            // skip/take/skip_while/take_while-after-where is rejected — canonical chain order is
+            if (seenSkip || seenSkipWhile || seenTakeWhile || seenTake) return null
             var predicate : Expression?
             if (seenSelect) {
                 // Phase 3d / single-eval: where-after-select. Bind the current projection
@@ -1180,7 +1449,7 @@ def private plan_loop_or_count(var expr : Expression?) : Expression? {
                 whereCond = qmacro($e(whereCond) && $e(predicate))
             }
         } elif (opName == "select") {
-            if (seenSkip || seenTake) return null
+            if (seenSkip || seenSkipWhile || seenTakeWhile || seenTake) return null
             // Chained selects: bind the previous projection to a fresh local now so the next
             if (projection != null) {
                 if (has_sideeffects(projection)) {
@@ -1196,12 +1465,28 @@ def private plan_loop_or_count(var expr : Expression?) : Expression? {
             elementType = clone_type(cll._0._type.firstType)
             seenSelect = true
         } elif (opName == "skip") {
-            // Canonical chain: at most one skip, before any take. Multiple skips / skip-after-
-            if (seenSkip || seenTake) return null
+            // Canonical chain: at most one skip, before any skip_while/take_while/take.
+            if (seenSkip || seenSkipWhile || seenTakeWhile || seenTake) return null
             var skipArg = cll._0.arguments[1]
             if (skipArg == null || skipArg._type == null || skipArg._type.baseType != Type.tInt) return null
             skipExpr = clone_expression(skipArg)
             seenSkip = true
+        } elif (opName == "skip_while") {
+            // pred uses itName; seenSelect bails (chained-bind peel is a follow-up). Canonical: after skip, before take_while/take.
+            if (seenSelect || seenSkipWhile || seenTakeWhile || seenTake) return null
+            var swArg = cll._0.arguments[1]
+            if (swArg == null) return null
+            skipWhileCond = fold_linq_cond(swArg, itName)
+            if (skipWhileCond == null) return null
+            seenSkipWhile = true
+        } elif (opName == "take_while") {
+            // take_while pred sees source element (itName). Same select-cascade rule as skip_while.
+            if (seenSelect || seenTakeWhile || seenTake) return null
+            var twArg = cll._0.arguments[1]
+            if (twArg == null) return null
+            takeWhileCond = fold_linq_cond(twArg, itName)
+            if (takeWhileCond == null) return null
+            seenTakeWhile = true
         } elif (opName == "take") {
             if (seenTake) return null
             var takeArg = cll._0.arguments[1]
@@ -1218,7 +1503,7 @@ def private plan_loop_or_count(var expr : Expression?) : Expression? {
     if (projection != null && has_sideeffects(projection)) {
         allProjectionsPure = false
     }
-    let noLimits = skipExpr == null && takeExpr == null
+    let noLimits = skipExpr == null && takeExpr == null && skipWhileCond == null && takeWhileCond == null
     // Count-shaped shortcut: when terminator is `count` (→ int) or `long_count` (→ int64),
     let isCountShaped = (lane == LinqLane.COUNTER
         || (lane == LinqLane.ACCUMULATOR && lastName == "long_count"))
@@ -1229,7 +1514,7 @@ def private plan_loop_or_count(var expr : Expression?) : Expression? {
     if (lane == LinqLane.ACCUMULATOR)
         return emit_accumulator_lane(lastName, top, projection, whereCond,
             intermediateBinds, preCondStmts, elementType, srcName, accName, itName, skipName, takeCountName,
-            skipExpr, takeExpr, at)
+            skippingName, skipExpr, takeExpr, skipWhileCond, takeWhileCond, at)
     // Ring 2: early-exit lane — `any` no-pred + no upstream work + no limits + length-bearing
     if (lane == LinqLane.EARLY_EXIT) {
         let terminatorCall = calls.back()._0
@@ -1239,7 +1524,7 @@ def private plan_loop_or_count(var expr : Expression?) : Expression? {
             return emit_any_empty_shortcut(top, srcName, at)
         return emit_early_exit_lane(lastName, top, projection, whereCond,
             intermediateBinds, preCondStmts, elementType, terminatorCall, srcName, itName, skipName,
-            takeCountName, skipExpr, takeExpr, at)
+            takeCountName, skippingName, skipExpr, takeExpr, skipWhileCond, takeWhileCond, at)
     }
     // Build the per-element loop body for COUNTER / ARRAY. Both lanes follow the same shape:
     var loopBody : Expression?
@@ -1256,7 +1541,7 @@ def private plan_loop_or_count(var expr : Expression?) : Expression? {
             $i(accName) ++
         }
         prepend_binds(stmts, intermediateBinds)
-        wrap_with_skip_take(stmts, skipExpr, takeExpr, skipName, takeCountName)
+        wrap_with_ranges(stmts, skipExpr, takeExpr, skipWhileCond, takeWhileCond, skipName, takeCountName, skippingName)
         loopBody = prepend_precond(wrap_with_condition(stmts_to_expr(stmts), whereCond), preCondStmts)
     } else {
         // Array lane. `push_clone` is the safe append everywhere: for workhorse types it's a
@@ -1265,7 +1550,8 @@ def private plan_loop_or_count(var expr : Expression?) : Expression? {
             stmts |> push <| qmacro_expr() {
                 $i(accName) |> push_clone($e(projection))
             }
-        } elif (whereCond != null || skipExpr != null || takeExpr != null) {
+        } elif (whereCond != null || skipExpr != null || takeExpr != null
+                || skipWhileCond != null || takeWhileCond != null) {
             // Identity push: `it` aliases the source element. Reached when chain is bare
             stmts |> push <| qmacro_expr() {
                 $i(accName) |> push_clone($i(itName))
@@ -1275,15 +1561,15 @@ def private plan_loop_or_count(var expr : Expression?) : Expression? {
             return null
         }
         prepend_binds(stmts, intermediateBinds)
-        wrap_with_skip_take(stmts, skipExpr, takeExpr, skipName, takeCountName)
+        wrap_with_ranges(stmts, skipExpr, takeExpr, skipWhileCond, takeWhileCond, skipName, takeCountName, skippingName)
         loopBody = prepend_precond(wrap_with_condition(stmts_to_expr(stmts), whereCond), preCondStmts)
     }
     if (counterLane) {
-        return emit_counter_lane(top, srcName, accName, itName, skipName, takeCountName,
-            skipExpr, takeExpr, loopBody, at)
+        return emit_counter_lane(top, srcName, accName, itName, skipName, takeCountName, skippingName,
+            skipExpr, takeExpr, skipWhileCond, loopBody, at)
     } else {
         return emit_array_lane(top, expr, loopBody, elementType, srcName, accName, itName,
-            skipName, takeCountName, skipExpr, takeExpr, at)
+            skipName, takeCountName, skippingName, skipExpr, takeExpr, skipWhileCond, at)
     }
 }
 
@@ -1408,43 +1694,66 @@ def private plan_reverse(var expr : Expression?) : Expression? {
         // R1-R4 path: buffer + reverse_inplace + optional resize + return buffer.
         let needIterWrap = expr._type.isIterator
         var bufElemType = strip_const_ref(clone_type(reverseCall._type.firstType))
-        var pushExpr : Expression?
-        if (projection != null) {
-            pushExpr = qmacro_expr() {
-                $i(bufName) |> push_clone($e(projection))
-            }
-        } else {
-            pushExpr = qmacro_expr() {
-                $i(bufName) |> push_clone($i(itName))
-            }
-        }
-        pushExpr = wrap_with_condition(pushExpr, whereCond)
-        var reserveStmts : array<Expression?>
-        if (type_has_length(top._type) && whereCond == null) {
-            reserveStmts |> push <| qmacro_expr() {
-                $i(bufName) |> reserve(length($i(srcName)))
-            }
-        }
-        var resizeStmts : array<Expression?>
-        if (takeExpr != null) {
-            // take(N) of reversed-buffer = last N of source reversed. Three clones since no math::min import.
+        let canBackwardIndex = (takeExpr != null && projection == null && whereCond == null
+                && (top._type.isGoodArrayType || top._type.isArray))
+        if (canBackwardIndex) {
+            // R6: visit only the last takeN indices — skips full-source push + O(length) reverse_inplace.
+            let lenName   = "`rlen`{at.line}`{at.column}"
+            let takeNName = "`rtn`{at.line}`{at.column}"
+            let kName     = "`rk`{at.line}`{at.column}"
             var takeA = clone_expression(takeExpr)
             var takeB = clone_expression(takeExpr)
             var takeC = clone_expression(takeExpr)
-            resizeStmts |> push <| qmacro_expr() {
-                $i(bufName) |> resize($e(takeA) <= 0 ? 0 : ($e(takeB) < length($i(bufName)) ? $e(takeC) : length($i(bufName))))
+            var returnExpr = buffer_return(bufName, needIterWrap)
+            body = qmacro_block() {
+                let $i(lenName) = length($i(srcName))
+                let $i(takeNName) = $e(takeA) <= 0 ? 0 : ($e(takeB) < $i(lenName) ? $e(takeC) : $i(lenName))
+                var $i(bufName) : array<$t(bufElemType)>
+                $i(bufName) |> reserve($i(takeNName))
+                for ($i(kName) in 0 .. $i(takeNName)) {
+                    $i(bufName) |> push_clone($i(srcName)[$i(lenName) - 1 - $i(kName)])
+                }
+                $e(returnExpr)
             }
-        }
-        var returnExpr = buffer_return(bufName, needIterWrap)
-        body = qmacro_block() {
-            var $i(bufName) : array<$t(bufElemType)>
-            $b(reserveStmts)
-            for ($i(itName) in $i(srcName)) {
-                $e(pushExpr)
+        } else {
+            var pushExpr : Expression?
+            if (projection != null) {
+                pushExpr = qmacro_expr() {
+                    $i(bufName) |> push_clone($e(projection))
+                }
+            } else {
+                pushExpr = qmacro_expr() {
+                    $i(bufName) |> push_clone($i(itName))
+                }
             }
-            _::reverse_inplace($i(bufName))
-            $b(resizeStmts)
-            $e(returnExpr)
+            pushExpr = wrap_with_condition(pushExpr, whereCond)
+            var reserveStmts : array<Expression?>
+            if (type_has_length(top._type) && whereCond == null) {
+                reserveStmts |> push <| qmacro_expr() {
+                    $i(bufName) |> reserve(length($i(srcName)))
+                }
+            }
+            var resizeStmts : array<Expression?>
+            if (takeExpr != null) {
+                // take(N) of reversed-buffer = last N of source reversed. Three clones since no math::min import.
+                var takeA = clone_expression(takeExpr)
+                var takeB = clone_expression(takeExpr)
+                var takeC = clone_expression(takeExpr)
+                resizeStmts |> push <| qmacro_expr() {
+                    $i(bufName) |> resize($e(takeA) <= 0 ? 0 : ($e(takeB) < length($i(bufName)) ? $e(takeC) : length($i(bufName))))
+                }
+            }
+            var returnExpr = buffer_return(bufName, needIterWrap)
+            body = qmacro_block() {
+                var $i(bufName) : array<$t(bufElemType)>
+                $b(reserveStmts)
+                for ($i(itName) in $i(srcName)) {
+                    $e(pushExpr)
+                }
+                _::reverse_inplace($i(bufName))
+                $b(resizeStmts)
+                $e(returnExpr)
+            }
         }
     }
     return finalize_emission(top, srcName, at, body)
@@ -1681,11 +1990,11 @@ def private is_bucket_reducer_call(expr : Expression?; bindName : string) : tupl
     if ((c.arguments |> length) != 1) return (false, "", null)
     // Bare reducer: `<reducer>(<bind>._1)`
     if (fnName == "length" || fnName == "count" || fnName == "long_count"
-            || fnName == "sum" || fnName == "min" || fnName == "max" || fnName == "first") {
+            || fnName == "sum" || fnName == "min" || fnName == "max" || fnName == "first" || fnName == "average") {
         if (is_bind_field_access(c.arguments[0], bindName, 1)) return (true, fnName, null)
     }
     // Inner-select reducer: `<reducer>(select(<bind>._1, <lambda>))`
-    if (fnName == "sum" || fnName == "min" || fnName == "max" || fnName == "first") {
+    if (fnName == "sum" || fnName == "min" || fnName == "max" || fnName == "first" || fnName == "average") {
         let inner = c.arguments[0]
         if (inner != null && inner is ExprCall) {
             let innerCall = inner as ExprCall
@@ -1711,7 +2020,23 @@ struct private ReducerSpec {
 }
 
 [macro_function]
-def private slot_acc_type(bodyType : TypeDeclPtr; slot : int; isBareForm : bool) : TypeDeclPtr {
+def private is_average_spec(spec : ReducerSpec) : bool {
+    return spec.name == "average" || spec.name == "average_inner_select"
+}
+
+[macro_function]
+def private mk_avg_acc_type(at : LineInfo) : TypeDeclPtr {
+    // tuple<double; uint64> — sum + count, lives in one entry slot for cache locality.
+    var t = new TypeDecl(baseType = Type.tTuple, at = at)
+    t.argTypes |> emplace_new <| new TypeDecl(baseType = Type.tDouble, at = at)
+    t.argTypes |> emplace_new <| new TypeDecl(baseType = Type.tUInt64, at = at)
+    return t
+}
+
+[macro_function]
+def private slot_acc_type(bodyType : TypeDeclPtr; slot : int; isBareForm, isAverage : bool; at : LineInfo) : TypeDeclPtr {
+    // average overrides the user-facing type (double) with the 2-slot tuple acc.
+    if (isAverage) return mk_avg_acc_type(at)
     // Bare form: bodyType IS the reducer's return type. Named-tuple: drill into argTypes[slot].
     if (isBareForm) return strip_const_ref(clone_type(bodyType))
     if (bodyType == null || (bodyType.argTypes |> length) <= slot) return null
@@ -1731,7 +2056,8 @@ def private recognize_reducer_specs(var groupProjBody : Expression?; bindName, i
             innerBody = fold_linq_cond(clone_expression(innerBare), itName)
             if (innerBody == null) return <- (<- specs, false)
         }
-        var accType = slot_acc_type(groupProjBody._type, 1, true)
+        let isAvgBare = rnBare == "average" || rnBare == "average_inner_select"
+        var accType : TypeDeclPtr = slot_acc_type(groupProjBody._type, 1, true, isAvgBare, groupProjBody.at)
         if (accType == null) return <- (<- specs, false)
         var spec = ReducerSpec(slot = 1, name = rnBare, innerBody = innerBody, accType = accType)
         specs |> push(spec)
@@ -1757,7 +2083,8 @@ def private recognize_reducer_specs(var groupProjBody : Expression?; bindName, i
                 return <- (<- specs, false)
             }
         }
-        var accType = slot_acc_type(groupProjBody._type, i, false)
+        let isAvg = rn == "average" || rn == "average_inner_select"
+        var accType : TypeDeclPtr = slot_acc_type(groupProjBody._type, i, false, isAvg, groupProjBody.at)
         if (accType == null) {
             specs |> clear
             return <- (<- specs, false)
@@ -1910,8 +2237,299 @@ def private emit_reducer_branches(spec : ReducerSpec; at : LineInfo; entryName, 
         missInit = qmacro_expr() {
             $e(l1) := $e(b1)
         }
+    } elif (nm == "average") {
+        // 2-slot acc: ._0 = sum (double), ._1 = count (uint64). Source-element cast to double once per side.
+        var lInit = mk_slot_ref(at, entryName, spec.slot)
+        var lSum  = mk_slot_ref(at, entryName, spec.slot)
+        var lCnt  = mk_slot_ref(at, entryName, spec.slot)
+        missInit = qmacro_expr() {
+            $e(lInit) = (double($i(itName)), 1ul)
+        }
+        hitUpdate = qmacro_block() {
+            $e(lSum)._0 += double($i(itName))
+            $e(lCnt)._1 ++
+        }
+    } elif (nm == "average_inner_select") {
+        // Inner projection evaluated once into a temp — matches reference single-eval-per-element.
+        let tmp = "`vavg`{at.line}`{at.column}`{spec.slot}"
+        var lInit = mk_slot_ref(at, entryName, spec.slot)
+        var lSum  = mk_slot_ref(at, entryName, spec.slot)
+        var lCnt  = mk_slot_ref(at, entryName, spec.slot)
+        var bMiss = clone_expression(spec.innerBody)
+        var bHit  = clone_expression(spec.innerBody)
+        missInit = qmacro_block() {
+            let $i(tmp) = $e(bMiss)
+            $e(lInit) = (double($i(tmp)), 1ul)
+        }
+        hitUpdate = qmacro_block() {
+            let $i(tmp) = $e(bHit)
+            $e(lSum)._0 += double($i(tmp))
+            $e(lCnt)._1 ++
+        }
     }
     return (missInit, hitUpdate)
+}
+
+[macro_function]
+def private mk_avg_subfield(at : LineInfo; entryName : string; slot, sub : int) : Expression? {
+    // entry._{slot}._{sub} — 2-level field access into a tuple<double; uint64> avg accumulator.
+    var ev = new ExprVar(at = at)
+    ev.name := entryName
+    var ef1 = new ExprField(at = at)
+    ef1.name := "_{slot}"
+    ef1.value = ev
+    var ef2 = new ExprField(at = at)
+    ef2.name := "_{sub}"
+    ef2.value = ef1
+    return ef2
+}
+
+[macro_function]
+def private mk_avg_divide_expr(at : LineInfo; entryName : string; slot : int) : Expression? {
+    // entry._{slot}._0 / double(entry._{slot}._1) — average from the 2-slot per-key acc. Bucket is non-empty by construction (only keys with ≥1 source element enter the table), so count is always ≥1.
+    var sumRef = mk_avg_subfield(at, entryName, slot, 0)
+    var cntRef = mk_avg_subfield(at, entryName, slot, 1)
+    return qmacro_expr() {
+        $e(sumRef) / double($e(cntRef))
+    }
+}
+
+[macro_function]
+def private mk_slot_output_expr(at : LineInfo; entryName : string; spec : ReducerSpec) : Expression? {
+    // Per-spec output value: divide for average slots, plain field ref otherwise.
+    if (is_average_spec(spec)) return mk_avg_divide_expr(at, entryName, spec.slot)
+    return mk_slot_ref(at, entryName, spec.slot)
+}
+
+[macro_function]
+def private mk_hidden_acc_type(reducerName : string; isInnerSelect : bool;
+                               bucketElemType, innerBodyType : TypeDeclPtr; at : LineInfo) : TypeDeclPtr {
+    // Hidden-slot acc type: like slot_acc_type but takes source types directly (hidden slots have no group_proj body to drill into).
+    if (reducerName == "length" || reducerName == "count") return new TypeDecl(baseType = Type.tInt, at = at)
+    if (reducerName == "long_count") return new TypeDecl(baseType = Type.tInt64, at = at)
+    if (reducerName == "average" || reducerName == "average_inner_select") return mk_avg_acc_type(at)
+    let src = isInnerSelect ? innerBodyType : bucketElemType
+    if (src == null) return null
+    return strip_const_ref(clone_type(src))
+}
+
+[macro_function]
+def private having_reducer_append_if_missing(var expr : Expression?; hbName, itName : string;
+                                             var specs : array<ReducerSpec>; userVisibleSlotCount : int;
+                                             bucketElemType : TypeDeclPtr; at : LineInfo) : bool {
+    // Append a hidden ReducerSpec when `expr` is a bare/inner-select reducer on the having bind that has no name-match in `specs`. Returns false only on inner-select peel failure or on a second same-named hidden inner-select reducer (caller cascades — the splice can't distinguish two different inner lambdas, so we'd silently route both predicate terms to the first hidden slot).
+    if (expr == null || !(expr is ExprCall)) return true
+    let c = expr as ExprCall
+    if (c.func == null || (c.arguments |> length) != 1) return true
+    var fnName = string(c.func.name)
+    if (c.func.fromGeneric != null) {
+        fnName = string(c.func.fromGeneric.name)
+    }
+    let isReducer = (fnName == "length" || fnName == "count" || fnName == "long_count"
+            || fnName == "sum" || fnName == "min" || fnName == "max"
+            || fnName == "first" || fnName == "average")
+    if (!isReducer) return true
+    if (is_bind_field_access(c.arguments[0], hbName, 1)) {
+        for (s in specs) {
+            if (s.innerBody == null && s.name == fnName) return true
+        }
+        var accType = mk_hidden_acc_type(fnName, false, bucketElemType, null, at)
+        if (accType == null) return true
+        let newSlot = (specs |> length) + 1
+        specs |> push <| ReducerSpec(slot = newSlot, name = fnName, innerBody = null, accType = accType)
+        return true
+    }
+    let canInnerSelect = (fnName == "sum" || fnName == "min" || fnName == "max"
+            || fnName == "first" || fnName == "average")
+    if (!canInnerSelect) return true
+    let inner = c.arguments[0]
+    if (inner == null || !(inner is ExprCall)) return true
+    let ic = inner as ExprCall
+    if (ic.func == null || (ic.arguments |> length) != 2 || !is_bind_field_access(ic.arguments[0], hbName, 1)) return true
+    var innerName = string(ic.func.name)
+    if (ic.func.fromGeneric != null) {
+        innerName = string(ic.func.fromGeneric.name)
+    }
+    if (innerName != "select") return true
+    let comboName = "{fnName}_inner_select"
+    for (s in specs) {
+        // Match against a select-side spec (visible slot): v1 trusts the user wrote identical lambdas (pre-existing PR-D limitation, documented in LINQ.md). Match against an already-added hidden spec from this having scan would silently route two different inner lambdas to the same slot — bail to tier 2 instead, where each select() is evaluated separately.
+        if (s.name == comboName) return s.slot <= userVisibleSlotCount
+    }
+    var innerBody = fold_linq_cond(clone_expression(ic.arguments[1]), itName)
+    if (innerBody == null || innerBody._type == null) return false
+    var accType = mk_hidden_acc_type(comboName, true, bucketElemType, innerBody._type, at)
+    if (accType == null) return false
+    let newSlot = (specs |> length) + 1
+    specs |> push <| ReducerSpec(slot = newSlot, name = comboName, innerBody = innerBody, accType = accType)
+    return true
+}
+
+[macro_function]
+def private extend_specs_for_missing_having_reducers(var expr : Expression?; hbName, itName : string;
+                                                     var specs : array<ReducerSpec>; userVisibleSlotCount : int;
+                                                     bucketElemType : TypeDeclPtr; at : LineInfo) : bool {
+    // Pre-rewrite walker that appends hidden ReducerSpecs for having-only reducers; unrecognized shapes leak to rewrite_having_pred (which bails on any surviving raw `<hb>`).
+    if (expr == null) return true
+    while (expr is ExprRef2Value) {
+        expr = (expr as ExprRef2Value).subexpr
+    }
+    if (expr is ExprCall) {
+        var c = expr as ExprCall
+        if (!having_reducer_append_if_missing(expr, hbName, itName, specs, userVisibleSlotCount, bucketElemType, at)) return false
+        for (i in 0 .. (c.arguments |> length)) {
+            if (!extend_specs_for_missing_having_reducers(c.arguments[i], hbName, itName, specs, userVisibleSlotCount, bucketElemType, at)) return false
+        }
+        return true
+    }
+    if (expr is ExprField) {
+        var f = expr as ExprField
+        return extend_specs_for_missing_having_reducers(f.value, hbName, itName, specs, userVisibleSlotCount, bucketElemType, at)
+    }
+    if (expr is ExprOp1) {
+        var op = expr as ExprOp1
+        return extend_specs_for_missing_having_reducers(op.subexpr, hbName, itName, specs, userVisibleSlotCount, bucketElemType, at)
+    }
+    if (expr is ExprOp2) {
+        var op = expr as ExprOp2
+        if (!extend_specs_for_missing_having_reducers(op.left, hbName, itName, specs, userVisibleSlotCount, bucketElemType, at)) return false
+        return extend_specs_for_missing_having_reducers(op.right, hbName, itName, specs, userVisibleSlotCount, bucketElemType, at)
+    }
+    if (expr is ExprOp3) {
+        var op = expr as ExprOp3
+        return (extend_specs_for_missing_having_reducers(op.subexpr, hbName, itName, specs, userVisibleSlotCount, bucketElemType, at)
+                && extend_specs_for_missing_having_reducers(op.left, hbName, itName, specs, userVisibleSlotCount, bucketElemType, at)
+                && extend_specs_for_missing_having_reducers(op.right, hbName, itName, specs, userVisibleSlotCount, bucketElemType, at))
+    }
+    return true
+}
+
+[macro_function]
+def private rewrite_having_pred(var expr : Expression?; hbName, kvName : string; specs : array<ReducerSpec>) : Expression? {
+    // Substitutes `<hb>._0` → `kv._0` and `<reducer>(<hb>._1)` / `<reducer>(select(<hb>._1, <lam>))` → `kv._{slot}` (or divide expr for average) against matching specs; any other use of `<hb>` returns null and cascades.
+    if (expr == null) return expr
+    // Peel typer-inserted ExprRef2Value wrappers (same pattern as is_bind_field_access).
+    while (expr is ExprRef2Value) {
+        expr = (expr as ExprRef2Value).subexpr
+    }
+    if (expr is ExprCall) {
+        var c = expr as ExprCall
+        if (c.func != null && (c.arguments |> length) == 1) {
+            var fnName = string(c.func.name)
+            if (c.func.fromGeneric != null) {
+                fnName = string(c.func.fromGeneric.name)
+            }
+            if (is_bind_field_access(c.arguments[0], hbName, 1)) {
+                for (s in specs) {
+                    if (s.innerBody == null && s.name == fnName) return mk_slot_output_expr(expr.at, kvName, s)
+                }
+                return null
+            }
+            let inner = c.arguments[0]
+            if (inner != null && inner is ExprCall) {
+                let ic = inner as ExprCall
+                if (ic.func != null && (ic.arguments |> length) == 2 && is_bind_field_access(ic.arguments[0], hbName, 1)) {
+                    var innerName = string(ic.func.name)
+                    if (ic.func.fromGeneric != null) {
+                        innerName = string(ic.func.fromGeneric.name)
+                    }
+                    if (innerName == "select") {
+                        let comboName = "{fnName}_inner_select"
+                        for (s in specs) {
+                            if (s.name == comboName) return mk_slot_output_expr(expr.at, kvName, s)
+                        }
+                        return null
+                    }
+                }
+            }
+        }
+        for (i in 0 .. (c.arguments |> length)) {
+            var sub = rewrite_having_pred(c.arguments[i], hbName, kvName, specs)
+            if (sub == null) return null
+            c.arguments[i] = sub
+        }
+        return expr
+    }
+    if (expr is ExprField) {
+        var f = expr as ExprField
+        if (f.value != null && f.value is ExprVar) {
+            let v = f.value as ExprVar
+            if (v.name == hbName) {
+                if (f.name == "_0") return mk_slot_ref(expr.at, kvName, 0)
+                return null
+            }
+        }
+        var sub = rewrite_having_pred(f.value, hbName, kvName, specs)
+        if (sub == null) return null
+        f.value = sub
+        return expr
+    }
+    if (expr is ExprVar) {
+        let v = expr as ExprVar
+        if (v.name == hbName) return null
+        return expr
+    }
+    if (expr is ExprOp1) {
+        var op = expr as ExprOp1
+        var sub = rewrite_having_pred(op.subexpr, hbName, kvName, specs)
+        if (sub == null) return null
+        op.subexpr = sub
+        return expr
+    }
+    if (expr is ExprOp2) {
+        var op = expr as ExprOp2
+        var l = rewrite_having_pred(op.left, hbName, kvName, specs)
+        if (l == null) return null
+        op.left = l
+        var r = rewrite_having_pred(op.right, hbName, kvName, specs)
+        if (r == null) return null
+        op.right = r
+        return expr
+    }
+    if (expr is ExprOp3) {
+        var op = expr as ExprOp3
+        var s = rewrite_having_pred(op.subexpr, hbName, kvName, specs)
+        if (s == null) return null
+        op.subexpr = s
+        var l = rewrite_having_pred(op.left, hbName, kvName, specs)
+        if (l == null) return null
+        op.left = l
+        var r = rewrite_having_pred(op.right, hbName, kvName, specs)
+        if (r == null) return null
+        op.right = r
+        return expr
+    }
+    return expr
+}
+
+class private HbScanner : AstVisitor {
+    // Safety net for rewrite_having_pred — flags any ExprVar reference that survived
+    // the targeted rewrite (e.g., because the predicate contained a node type the walker
+    // doesn't recurse into, like ExprAt or ExprInvoke from a non-peelable lambda).
+    vname : string
+    hit : bool = false
+    def HbScanner(n : string) {
+        vname = n
+    }
+    def override visitExprVar(var expr : ExprVar?) : Expression? {
+        if (expr.name == vname) {
+            hit = true
+        }
+        return expr
+    }
+}
+
+def private expr_uses_var(var e : Expression?; name : string) : bool {
+    if (e == null) return false
+    var astVisitor = new HbScanner(name)
+    make_visitor(*astVisitor) $(astVisitorAdapter) {
+        visit_expression(e, astVisitorAdapter)
+    }
+    let hit = astVisitor.hit
+    unsafe {
+        delete astVisitor
+    }
+    return hit
 }
 
 [macro_function]
@@ -1932,32 +2550,116 @@ def private plan_group_by(var expr : Expression?) : Expression? {
     if (empty(calls) || calls.back()._1.name != "select") return null
     var groupProjCall = calls.back()._0
     calls |> pop
-    // The call immediately before select must be group_by_lazy with a key arg.
+    // Optional: having_ between select and group_by_lazy (SQL HAVING shape) — rewritten below against accumulator slots.
+    var havingCall : ExprCall?
+    if (!empty(calls) && calls.back()._1.name == "having_") {
+        havingCall = calls.back()._0
+        calls |> pop
+    }
+    // The call immediately before must be group_by_lazy with a key arg.
     if (empty(calls) || calls.back()._1.name != "group_by_lazy") return null
     var groupByCall = calls.back()._0
     calls |> pop
     if ((groupByCall.arguments |> length) < 2) return null
     var keyBlock = clone_expression(groupByCall.arguments[1])
-    // v1: only empty upstream segment (no where_/select* between source and group_by).
-    if (!empty(calls)) return null
-    // Recognize the group_proj body's reducer shape.
+    // Setup names + walk upstream segment (where_/select*) for fusion into per-element loop.
     let at = groupByCall.at
-    let srcName  = "`source`{at.line}`{at.column}"
-    let itName   = "`it`{at.line}`{at.column}"
-    let tabName  = "`tab`{at.line}`{at.column}"
-    let kName    = "`k`{at.line}`{at.column}"
-    let ukName   = "`uk`{at.line}`{at.column}"
+    let srcName   = "`source`{at.line}`{at.column}"
+    let srcItName = "`it`{at.line}`{at.column}"
+    let tabName   = "`tab`{at.line}`{at.column}"
+    let kName     = "`k`{at.line}`{at.column}"
+    let ukName    = "`uk`{at.line}`{at.column}"
     let entryName = "`entry`{at.line}`{at.column}"
-    let kvName   = "`kv`{at.line}`{at.column}"
-    let bufName  = "`buf`{at.line}`{at.column}"
-    let bindName = "`gpb`{at.line}`{at.column}"   // group_proj lambda's bound variable
-    // Substitute the lambda's bound var with `bindName` so we can pattern-match.
+    let kvName    = "`kv`{at.line}`{at.column}"
+    let bufName   = "`buf`{at.line}`{at.column}"
+    let bindName  = "`gpb`{at.line}`{at.column}"   // group_proj lambda's bound variable
+    // Walk upstream where_/select into segments. Each where guards everything AFTER it (lazy LINQ semantics) — a select that follows a where gets its bind emitted INSIDE that where's guard.
+    var segBinds : array<array<Expression?>>
+    var segWheres : array<Expression?>
+    var currentBinds : array<Expression?>
+    var currentWhere : Expression?
+    var projection : Expression?
+    var lastBindName = srcItName
+    var elemType = strip_const_ref(clone_type(top._type.firstType))
+    var totalBindCount = 0
+    for (i in 0 .. (calls |> length)) {
+        let opName = calls[i]._1.name
+        if (opName == "where_") {
+            // Bind any pending projection before the where so the predicate references a stable name (no double-eval).
+            if (projection != null) {
+                let bn = "`v`{at.line}`{at.column}`{totalBindCount}"
+                totalBindCount ++
+                currentBinds |> push <| qmacro_expr() {
+                    var $i(bn) := $e(projection)
+                }
+                lastBindName = bn
+                projection = null
+            }
+            var predicate = fold_linq_cond(calls[i]._0.arguments[1], lastBindName)
+            if (predicate == null) return null
+            currentWhere = merge_where_cond(currentWhere, predicate)
+        } elif (opName == "select") {
+            // Select after a where belongs in a NEW segment (must execute INSIDE the where's guard) — flush first.
+            if (currentWhere != null) {
+                segBinds |> emplace(currentBinds)
+                segWheres |> push(currentWhere)
+                currentWhere = null
+            }
+            // Bind previous projection (if any) before computing the next.
+            if (projection != null) {
+                let bn = "`v`{at.line}`{at.column}`{totalBindCount}"
+                totalBindCount ++
+                currentBinds |> push <| qmacro_expr() {
+                    var $i(bn) := $e(projection)
+                }
+                lastBindName = bn
+            }
+            projection = fold_linq_cond(calls[i]._0.arguments[1], lastBindName)
+            if (projection == null) return null
+            elemType = strip_const_ref(clone_type(calls[i]._0._type.firstType))
+        } else {
+            return null
+        }
+    }
+    // Final bind: stable itName for the recognizer/emission to reference.
+    if (projection != null) {
+        let bn = "`v`{at.line}`{at.column}`{totalBindCount}"
+        totalBindCount ++
+        currentBinds |> push <| qmacro_expr() {
+            var $i(bn) := $e(projection)
+        }
+        lastBindName = bn
+    }
+    // Flush trailing segment.
+    segBinds |> emplace(currentBinds)
+    segWheres |> push(currentWhere)
+    let itName = lastBindName
+    // Recognize the group_proj body's reducer shape (uses post-projection itName for inner-select fold).
     var groupProjBody = fold_linq_cond(groupProjCall.arguments[1], bindName)
     if (groupProjBody == null || groupProjBody._type == null) return null
     var (specs, usesNamedTuple) = recognize_reducer_specs(groupProjBody, bindName, itName)
     if (empty(specs)) return null
-    var sourceElemType = strip_const_ref(clone_type(top._type.firstType))
-    var elemType = sourceElemType
+    let userVisibleSlotCount = specs |> length
+    // Rewrite optional having predicate against accumulator slots; bails on anything other than _._0 / reducer(_._1) matched to a select-side slot or a synthesized hidden slot (PR-E).
+    var havingPred : Expression?
+    if (havingCall != null) {
+        let hbName = "`hb`{at.line}`{at.column}"
+        var rawPred = fold_linq_cond(havingCall.arguments[1], hbName)
+        // PR-E: scan first to add hidden slots for reducers referenced by having but absent from select.
+        if (rawPred == null || !extend_specs_for_missing_having_reducers(rawPred, hbName, itName, specs, userVisibleSlotCount, elemType, at)) return null
+        havingPred = rewrite_having_pred(rawPred, hbName, kvName, specs)
+        // Safety net: a node type rewrite_having_pred didn't recurse into would leak hbName through to the splice (compile error at the splice site). Bail.
+        if (havingPred == null || expr_uses_var(havingPred, hbName)) return null
+    }
+    let hasHidden = (specs |> length) > userVisibleSlotCount
+    // Bare form + hidden slot would require extending `tuple<KeyT; AccT>` synthesized inside a qmacro with embedded `typedecl(invoke(...))` for the key type — can't dynamically grow that. Cascade.
+    if (hasHidden && !usesNamedTuple) return null
+    var hasAvg = false
+    for (s in specs) {
+        if (is_average_spec(s)) {
+            hasAvg = true
+        }
+    }
     // Named-tuple wrap reuses the user's body type (preserves field-name hints); bare reducer synthesizes tuple<KeyT; AccT>.
     var keyBlk1 = clone_expression(keyBlock)
     var keyBlk2 = clone_expression(keyBlock)
@@ -1966,7 +2668,29 @@ def private plan_group_by(var expr : Expression?) : Expression? {
     let dummyName = "`dummy`{at.line}`{at.column}"
     // Table + matching dummy. Dummy is bound on miss so first-key-wins is detected via addr-compare (one hash op/elem).
     if (usesNamedTuple) {
-        var tabValueType  = strip_const_ref(clone_type(groupProjBody._type))
+        var tabValueType = strip_const_ref(clone_type(groupProjBody._type))
+        // Average slots store the 2-tuple <sum;count> internally; result-build divides at output.
+        if (hasAvg) {
+            for (s in specs) {
+                if (is_average_spec(s) && s.slot <= userVisibleSlotCount && s.slot < (tabValueType.argTypes |> length)) {
+                    tabValueType.argTypes[s.slot] = mk_avg_acc_type(at)
+                }
+            }
+        }
+        // PR-E: append hidden slots (synthesized for having-only reducers) after the user-visible slots; result-build re-synthesizes the user's tuple shape via ExprMakeTuple, omitting them.
+        if (hasHidden) {
+            let preserveNames = (tabValueType.argNames |> length) == (tabValueType.argTypes |> length)
+            for (s in specs) {
+                if (s.slot > userVisibleSlotCount) {
+                    tabValueType.argTypes |> push <| clone_type(s.accType)
+                    if (preserveNames) {
+                        let nameIdx = tabValueType.argNames |> length
+                        tabValueType.argNames |> resize(nameIdx + 1)
+                        tabValueType.argNames[nameIdx] := "_hidden_{s.slot}"
+                    }
+                }
+            }
+        }
         var tabValueType2 = clone_type(tabValueType)
         stmts |> push <| qmacro_expr() {
             var inscope $i(tabName) : table<typedecl(_::unique_key(invoke($e(keyBlk1), default<$t(elemType)>))); $t(tabValueType)>
@@ -2001,56 +2725,116 @@ def private plan_group_by(var expr : Expression?) : Expression? {
     if (empty(missInitStmts)) return null
     var missInit  = stmts_to_expr(missInitStmts)
     let hasHitUpdate = !empty(hitUpdateStmts)
+    // Per-element table-update splice — variant on hasHitUpdate (first* chains have no else branch).
+    var tableUpdate : Expression?
     if (hasHitUpdate) {
         var hitUpdate = stmts_to_expr(hitUpdateStmts)
-        stmts |> push <| qmacro_expr() {
-            for ($i(itName) in $i(srcName)) {
-                let $i(kName) = invoke($e(keyBlk3), $i(itName))
-                let $i(ukName) = _::unique_key($i(kName))
-                unsafe {
-                    var $i(entryName) & = $i(tabName)?[$i(ukName)] ?? $i(dummyName)
-                    if (addr($i(entryName)) == addr($i(dummyName))) {
-                        $e(missInit)
-                        $i(dummyName)._0 = $i(kName)
-                        $i(tabName)[$i(ukName)] = $i(dummyName)
-                        $i(dummyName) = default<typedecl($i(dummyName))>
-                    } else {
-                        $e(hitUpdate)
-                    }
+        tableUpdate = qmacro_expr() {
+            unsafe {
+                var $i(entryName) & = $i(tabName)?[$i(ukName)] ?? $i(dummyName)
+                if (addr($i(entryName)) == addr($i(dummyName))) {
+                    $e(missInit)
+                    $i(dummyName)._0 = $i(kName)
+                    $i(tabName)[$i(ukName)] = $i(dummyName)
+                    $i(dummyName) = default<typedecl($i(dummyName))>
+                } else {
+                    $e(hitUpdate)
                 }
             }
         }
     } else {
-        // All reducers are first* — no hit update needed.
-        stmts |> push <| qmacro_expr() {
-            for ($i(itName) in $i(srcName)) {
-                let $i(kName) = invoke($e(keyBlk3), $i(itName))
-                let $i(ukName) = _::unique_key($i(kName))
-                unsafe {
-                    var $i(entryName) & = $i(tabName)?[$i(ukName)] ?? $i(dummyName)
-                    if (addr($i(entryName)) == addr($i(dummyName))) {
-                        $e(missInit)
-                        $i(dummyName)._0 = $i(kName)
-                        $i(tabName)[$i(ukName)] = $i(dummyName)
-                        $i(dummyName) = default<typedecl($i(dummyName))>
-                    }
+        tableUpdate = qmacro_expr() {
+            unsafe {
+                var $i(entryName) & = $i(tabName)?[$i(ukName)] ?? $i(dummyName)
+                if (addr($i(entryName)) == addr($i(dummyName))) {
+                    $e(missInit)
+                    $i(dummyName)._0 = $i(kName)
+                    $i(tabName)[$i(ukName)] = $i(dummyName)
+                    $i(dummyName) = default<typedecl($i(dummyName))>
                 }
             }
         }
     }
+    // Per-element core: key derive + unique_key derive + table-update splice.
+    var coreBody = qmacro_block() {
+        let $i(kName) = invoke($e(keyBlk3), $i(itName))
+        let $i(ukName) = _::unique_key($i(kName))
+        $e(tableUpdate)
+    }
+    // Walk segments in reverse, wrapping body inside-out: each where guards everything inside it.
+    var body : Expression? = coreBody
+    var idx = (segBinds |> length) - 1
+    while (idx >= 0) {
+        if (segWheres[idx] != null) {
+            body = wrap_with_condition(body, clone_expression(segWheres[idx]))
+        }
+        if (!empty(segBinds[idx])) {
+            var thisSeg <- segBinds[idx]
+            thisSeg |> push(body)
+            body = stmts_to_expr(thisSeg)
+        }
+        idx --
+    }
+    stmts |> push <| qmacro_block() {
+        for ($i(srcItName) in $i(srcName)) {
+            $e(body)
+        }
+    }
     // Lane: count terminator returns length(tab) directly (number of groups).
     if (terminatorName == "count") {
-        stmts |> push <| qmacro_expr() {
-            return length($i(tabName))
+        if (havingPred != null) {
+            let cntName = "`cnt`{at.line}`{at.column}"
+            stmts |> push <| qmacro_block() {
+                var $i(cntName) = 0
+                for ($i(kvName) in values($i(tabName))) {
+                    if ($e(havingPred)) {
+                        $i(cntName) ++
+                    }
+                }
+                return $i(cntName)
+            }
+        } else {
+            stmts |> push <| qmacro_expr() {
+                return length($i(tabName))
+            }
         }
     } else {
         // to_array lane: build result buffer by walking the table. Each output element
         var outputExpr : Expression?
         if (!usesNamedTuple) {
-            // Whole body was `<bind>._1 |> length`; result element is just acc (int).
-            outputExpr = qmacro_expr() {
-                $i(kvName)._1
+            // Bare reducer: avg slot needs sum/count divide; everything else is the raw acc value.
+            if (hasAvg) {
+                outputExpr = mk_avg_divide_expr(at, kvName, 1)
+            } else {
+                outputExpr = qmacro_expr() {
+                    $i(kvName)._1
+                }
             }
+        } elif (hasAvg || hasHidden) {
+            // Re-synthesize the user's tuple slot-by-slot: avg slots divide, hidden slots are omitted by iterating only user-visible argTypes; recordNames only when argNames are populated.
+            var mt = new ExprMakeTuple(at = at)
+            let slotCount = (groupProjBody._type.argTypes |> length)
+            let hasNames = (groupProjBody._type.argNames |> length) == slotCount
+            if (hasNames) {
+                mt.recordNames |> resize(slotCount)
+            }
+            mt.values |> push(mk_slot_ref(at, kvName, 0))
+            if (hasNames) {
+                mt.recordNames[0] := string(groupProjBody._type.argNames[0])
+            }
+            for (i in 1 .. slotCount) {
+                var v : Expression?
+                for (sp in specs) {
+                    if (sp.slot == i) {
+                        v = mk_slot_output_expr(at, kvName, sp)
+                    }
+                }
+                mt.values |> push(v)
+                if (hasNames) {
+                    mt.recordNames[i] := string(groupProjBody._type.argNames[i])
+                }
+            }
+            outputExpr = mt
         } else {
             // Named-tuple wrap `(K = bind._0, V = bind._1|>length)` — table value type already shaped via tabValueType; emit the entry directly.
             outputExpr = qmacro_expr() {
@@ -2069,14 +2853,280 @@ def private plan_group_by(var expr : Expression?) : Expression? {
         stmts |> push <| qmacro_expr() {
             $i(bufName) |> reserve(length($i(tabName)))
         }
-        stmts |> push <| qmacro_expr() {
-            for ($i(kvName) in values($i(tabName))) {
-                $i(bufName) |> push_clone($e(outputExpr))
+        if (havingPred != null) {
+            stmts |> push <| qmacro_expr() {
+                for ($i(kvName) in values($i(tabName))) {
+                    if ($e(havingPred)) {
+                        $i(bufName) |> push_clone($e(outputExpr))
+                    }
+                }
+            }
+        } else {
+            stmts |> push <| qmacro_expr() {
+                for ($i(kvName) in values($i(tabName))) {
+                    $i(bufName) |> push_clone($e(outputExpr))
+                }
             }
         }
         stmts |> push(buffer_return(bufName, expr._type.isIterator))
     }
     return finalize_emission_stmts(top, srcName, at, stmts)
+}
+
+[macro_function]
+def private plan_zip(var expr : Expression?) : Expression? {
+    // Phase 2 Z1/Z2/Z3: 2-ary lockstep zip splice. Supports bare zip (array/iterator), no-pred count/long_count, and fused where_/select/take/skip/take_while/skip_while chain ops between zip and terminator. Result-selector form (3-arg zip), accumulator terminators (sum/min/max/etc.), and chained selects bail to tier-2 cascade.
+    var (top, calls) = flatten_linq(expr)
+    if (empty(calls) || calls[0]._1.name != "zip") return null
+    var zipCall = calls[0]._0
+    let zipArgCount = zipCall.arguments |> length
+    // Z6 bail: result-selector form (3-arg zip = 2 sources + selector) yields scalar element stream — different splice shape, defer.
+    if (zipArgCount != 2) return null
+    // Identify recognized terminator (count/long_count). Anything else: if it's a recognized chain op, treat as no-terminator (bare); else bail.
+    var lastName = ""
+    var intermediateEnd = length(calls)
+    if (length(calls) > 1) {
+        let candidateName = calls.back()._1.name
+        let candidateCall = calls.back()._0
+        if (candidateName == "count" || candidateName == "long_count") {
+            // No-pred form only (1 arg = the source). Predicate-form bails (would change per-element work).
+            if (candidateCall.arguments |> length != 1) return null
+            lastName = candidateName
+            intermediateEnd = length(calls) - 1
+        }
+    }
+    let at = zipCall.at
+    let srcAName = "`srcA`{at.line}`{at.column}"
+    let srcBName = "`srcB`{at.line}`{at.column}"
+    let bufName  = "`buf`{at.line}`{at.column}"
+    let accName  = "`acc`{at.line}`{at.column}"
+    let skipName = "`skip`{at.line}`{at.column}"
+    let takeCountName = "`tc`{at.line}`{at.column}"
+    let skippingName = "`skipping`{at.line}`{at.column}"
+    // itName binds the tuple `(itA, itB)` at the top of the for-body; chain ops (where_/select/while-family) reference it by name.
+    let itName = "`it`{at.line}`{at.column}"
+    var srcAExpr = peel_each(clone_expression(zipCall.arguments[0]))
+    var srcBExpr = peel_each(clone_expression(zipCall.arguments[1]))
+    if (srcAExpr == null || srcAExpr._type == null || srcBExpr == null || srcBExpr._type == null) return null
+    srcAExpr.genFlags.alwaysSafe = true
+    srcBExpr.genFlags.alwaysSafe = true
+    var srcAType = invoke_src_param_type(srcAExpr)
+    var srcBType = invoke_src_param_type(srcBExpr)
+    // elementType starts as the tuple-of-refs (zip's natural element) and is rebound by `select`.
+    var elementType = clone_type(zipCall._type.firstType)
+    var whereCond : Expression?
+    var projection : Expression?
+    var skipExpr : Expression?
+    var takeExpr : Expression?
+    var skipWhileCond : Expression?
+    var takeWhileCond : Expression?
+    var seenSelect = false
+    var seenSkip = false
+    var seenSkipWhile = false
+    var seenTakeWhile = false
+    var seenTake = false
+    var allProjectionsPure = true
+    // Z3 chain walk: fuse where_/select/take/skip/take_while/skip_while between zip and terminator. Predicates/projections receive the tuple element via fold_linq_cond_peel substitution with `(itA, itB)` — typer collapses `t._0/_1` to the raw iter vars.
+    for (i in 1 .. intermediateEnd) {
+        var cll & = unsafe(calls[i])
+        let opName = cll._1.name
+        if (opName == "where_") {
+            // Canonical chain order: skip/take/while-family come after where_/select. After-select chained where: defer (would require chained-bind dedup, see Phase 3d for single-source analog).
+            if (seenSkip || seenSkipWhile || seenTakeWhile || seenTake || seenSelect) return null
+            var predicate : Expression? = fold_linq_cond(cll._0.arguments[1], itName)
+            if (predicate == null) return null
+            if (whereCond == null) {
+                whereCond = predicate
+            } else {
+                whereCond = qmacro($e(whereCond) && $e(predicate))
+            }
+        } elif (opName == "select") {
+            // Skip/take/while come after select; chained selects on zip stream defer (would mirror plan_loop_or_count `intermediateBinds`).
+            if (seenSkip || seenSkipWhile || seenTakeWhile || seenTake || seenSelect) return null
+            // Pull elementType from the projection block's return expression — the SELECT call's `_type.firstType` is a typedecl(result_selector(...)) formula that doesn't resolve when the chain is wrapped in _fold (call-macro context defers generic typedecl evaluation).
+            var projElemType : TypeDeclPtr
+            var projBody = cll._0.arguments[1]
+            if (projBody is ExprMakeBlock) {
+                var projMblk = projBody as ExprMakeBlock
+                var projBlk = projMblk._block as ExprBlock
+                if (projBlk.list |> length == 1 && projBlk.list[0] is ExprReturn) {
+                    var projRet = projBlk.list[0] as ExprReturn
+                    if (projRet.subexpr != null && projRet.subexpr._type != null) {
+                        projElemType = clone_type(projRet.subexpr._type)
+                    }
+                }
+            }
+            if (projElemType == null) return null
+            // Strip constness: the projection returns an int-valued (or similar) expression typed as `T const`, but `array<T const>` is unwritable.
+            projElemType.flags.constant = false
+            projection = fold_linq_cond(cll._0.arguments[1], itName)
+            if (projection == null) return null
+            elementType = projElemType
+            seenSelect = true
+            if (has_sideeffects(projection)) {
+                allProjectionsPure = false
+            }
+        } elif (opName == "skip") {
+            if (seenSkip || seenSkipWhile || seenTakeWhile || seenTake) return null
+            var skipArg = cll._0.arguments[1]
+            if (skipArg == null || skipArg._type == null || skipArg._type.baseType != Type.tInt) return null
+            skipExpr = clone_expression(skipArg)
+            seenSkip = true
+        } elif (opName == "skip_while") {
+            if (seenSelect || seenSkipWhile || seenTakeWhile || seenTake) return null
+            var swArg = cll._0.arguments[1]
+            if (swArg == null) return null
+            skipWhileCond = fold_linq_cond(swArg, itName)
+            if (skipWhileCond == null) return null
+            seenSkipWhile = true
+        } elif (opName == "take_while") {
+            if (seenSelect || seenTakeWhile || seenTake) return null
+            var twArg = cll._0.arguments[1]
+            if (twArg == null) return null
+            takeWhileCond = fold_linq_cond(twArg, itName)
+            if (takeWhileCond == null) return null
+            seenTakeWhile = true
+        } elif (opName == "take") {
+            if (seenTake) return null
+            var takeArg = cll._0.arguments[1]
+            if (takeArg == null || takeArg._type == null || takeArg._type.baseType != Type.tInt) return null
+            takeExpr = clone_expression(takeArg)
+            seenTake = true
+        } else {
+            // Any other intermediate op (group_by, distinct, order_*, second zip, etc.): bail to tier-2.
+            return null
+        }
+    }
+    let noLimits = skipExpr == null && takeExpr == null && skipWhileCond == null && takeWhileCond == null
+    let noChain = whereCond == null && projection == null && noLimits
+    let bothHaveLength = type_has_length(srcAExpr._type) && type_has_length(srcBExpr._type)
+    let isCounter = lastName == "count" || lastName == "long_count"
+    // Length shortcut: count/long_count, no chain, both length-bearing → return min(lenA, lenB) without entering the loop.
+    if (noChain && bothHaveLength && isCounter) {
+        var bodyStmts : array<Expression?>
+        if (lastName == "count") {
+            bodyStmts |> push <| qmacro_expr() {
+                return int(length($i(srcAName)) < length($i(srcBName)) ? length($i(srcAName)) : length($i(srcBName)))
+            }
+        } else {
+            bodyStmts |> push <| qmacro_expr() {
+                return int64(length($i(srcAName)) < length($i(srcBName)) ? length($i(srcAName)) : length($i(srcBName)))
+            }
+        }
+        return finalize_zip_invoke(bodyStmts, srcAName, srcBName, srcAType, srcBType, srcAExpr, srcBExpr, at)
+    }
+    // Build per-element body inside the for-loop. wrap_with_ranges adds skip/take/while guards; wrap_with_condition wraps with `if (whereCond)`.
+    var perStmts : array<Expression?>
+    if (isCounter) {
+        // Counter lane: if projection has side effects, evaluate it for those effects; then `acc++`.
+        if (seenSelect && !allProjectionsPure) {
+            let finalBindName = "`vfinal`{at.line}`{at.column}"
+            perStmts |> push <| qmacro_expr() {
+                var $i(finalBindName) = $e(projection)
+            }
+        }
+        perStmts |> push <| qmacro_expr() {
+            $i(accName) ++
+        }
+    } else {
+        // Array lane: push projection (if select fused), bound tuple `it` (when any chain op needs it), or raw `(itA, itB)` tuple (bare zip with no chain). needsItBind below decides whether `it` is bound.
+        let needsItBindLocal = whereCond != null || projection != null || skipWhileCond != null || takeWhileCond != null
+        if (projection != null) {
+            perStmts |> push <| qmacro_expr() {
+                $i(bufName) |> push_clone($e(projection))
+            }
+        } elif (needsItBindLocal) {
+            perStmts |> push <| qmacro_expr() {
+                $i(bufName) |> push_clone($i(itName))
+            }
+        } else {
+            perStmts |> push <| qmacro_expr() {
+                $i(bufName) |> push_clone((itA, itB))
+            }
+        }
+    }
+    wrap_with_ranges(perStmts, skipExpr, takeExpr, skipWhileCond, takeWhileCond, skipName, takeCountName, skippingName)
+    var perBody = wrap_with_condition(stmts_to_expr(perStmts), whereCond)
+    // Bind `it = (itA, itB)` ahead of all chain logic when any op (where/projection/while-family) consumes it. Counter/array-identity with no fused ops skip the bind (zero-cost).
+    let needsItBind = whereCond != null || projection != null || skipWhileCond != null || takeWhileCond != null
+    if (needsItBind) {
+        var preStmts : array<Expression?>
+        preStmts |> reserve(2)
+        preStmts |> push <| qmacro_expr() {     // nolint:STYLE012
+            let $i(itName) = (itA, itB)
+        }
+        preStmts |> push(perBody)
+        perBody = stmts_to_expr(preStmts)
+    }
+    // Outer body assembly.
+    var bodyStmts : array<Expression?>
+    if (isCounter) {
+        if (lastName == "count") {
+            bodyStmts |> push <| qmacro_expr() {
+                var $i(accName) = 0
+            }
+        } else {
+            bodyStmts |> push <| qmacro_expr() {
+                var $i(accName) : int64 = 0l
+            }
+        }
+    } else {
+        bodyStmts |> push <| qmacro_expr() {
+            var $i(bufName) : array<$t(elementType)>
+        }
+        // Reserve: only when noChain (no filters/limits) and both sources length-bearing — otherwise size unknown or smaller than min(len).
+        if (noChain && bothHaveLength) {
+            bodyStmts |> push <| qmacro_expr() {
+                $i(bufName) |> reserve(length($i(srcAName)) < length($i(srcBName)) ? length($i(srcAName)) : length($i(srcBName)))
+            }
+        }
+    }
+    append_ranges_prelude(bodyStmts, skipExpr, takeExpr, skipWhileCond, skipName, takeCountName, skippingName)
+    // Underscore-prefix iter vars (LINT002) only when neither needsItBind nor identity-tuple push references them.
+    let bodyReferencesIterVars = needsItBind || !isCounter
+    if (isCounter && !bodyReferencesIterVars) {
+        bodyStmts |> push <| qmacro_expr() {
+            for (_itA, _itB in $i(srcAName), $i(srcBName)) {
+                $e(perBody)
+            }
+        }
+    } else {
+        bodyStmts |> push <| qmacro_expr() {
+            for (itA, itB in $i(srcAName), $i(srcBName)) {
+                $e(perBody)
+            }
+        }
+    }
+    if (isCounter) {
+        bodyStmts |> push <| qmacro_expr() {
+            return $i(accName)
+        }
+    } else {
+        if (expr._type.isIterator) {
+            bodyStmts |> push <| qmacro_expr() {
+                return <- $i(bufName).to_sequence_move()
+            }
+        } else {
+            bodyStmts |> push <| qmacro_expr() {
+                return <- $i(bufName)
+            }
+        }
+    }
+    return finalize_zip_invoke(bodyStmts, srcAName, srcBName, srcAType, srcBType, srcAExpr, srcBExpr, at)
+}
+
+[macro_function]
+def private finalize_zip_invoke(var bodyStmts : array<Expression?>; srcAName, srcBName : string; var srcAType, srcBType : TypeDeclPtr;
+                                var srcAExpr, srcBExpr : Expression?; at : LineInfo) : Expression? {
+    var res = qmacro(invoke($($i(srcAName) : $t(srcAType), $i(srcBName) : $t(srcBType)) {
+        $b(bodyStmts)
+    }, $e(srcAExpr), $e(srcBExpr)))
+    res.force_at(at)
+    res.force_generated(true)
+    let blk = (res as ExprInvoke).arguments[0] as ExprMakeBlock
+    (blk._block as ExprBlock).arguments[0].flags.can_shadow = true
+    (blk._block as ExprBlock).arguments[1].flags.can_shadow = true
+    return res
 }
 
 [call_macro(name="_fold")]
@@ -2092,6 +3142,8 @@ class private LinqFold : AstCallMacro {
         res = plan_distinct(call.arguments[0])
         if (res != null) return res
         res = plan_group_by(call.arguments[0])
+        if (res != null) return res
+        res = plan_zip(call.arguments[0])
         if (res != null) return res
         res = plan_loop_or_count(call.arguments[0])
         if (res != null) return res

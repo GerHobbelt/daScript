@@ -39,6 +39,114 @@ def target_zip_fold() : array<tuple<int; int>> {
     return <- [1, 2, 3]._select(_ * 2).zip([10, 20, 30]._select(_ + 1))._fold()
 }
 
+// Phase 2 Z1 targets — bare zip (no upstream select) hits plan_zip splice.
+[export, marker(no_coverage)]
+def target_zip_bare_arr_fold() : array<tuple<int; int>> {
+    return <- [1, 2, 3].zip([10, 20, 30])._fold()
+}
+
+[export, marker(no_coverage)]
+def target_zip_bare_iter_fold() : array<tuple<int; int>> {
+    return <- zip([1, 2, 3].each(), [10, 20, 30].each()).to_array()._fold()
+}
+
+[export, marker(no_coverage)]
+def target_zip_bare_iter_seq_fold() : iterator<tuple<int; int>> {
+    return <- zip([1, 2, 3].each(), [10, 20, 30].each())._fold()
+}
+
+[export, marker(no_coverage)]
+def target_zip_bare_unequal_fold() : array<tuple<int; int>> {
+    return <- [1, 2, 3, 4, 5].zip([10, 20, 30])._fold()
+}
+
+// Phase 2 Z2 targets — count / long_count terminators on bare zip.
+[export, marker(no_coverage)]
+def target_zip_count_fold() : int {
+    return _fold([1, 2, 3].zip([10, 20, 30]).count())
+}
+
+[export, marker(no_coverage)]
+def target_zip_long_count_fold() : int64 {
+    return _fold([1, 2, 3].zip([10, 20, 30]).long_count())
+}
+
+[export, marker(no_coverage)]
+def target_zip_count_iter_fold() : int {
+    // to_sequence_move yields a real iterator (no peel, no length) → counter loop fallback.
+    return _fold(zip([1, 2, 3, 4, 5].to_sequence_move(), [10, 20, 30].to_sequence_move()).count())
+}
+
+[export, marker(no_coverage)]
+def target_zip_count_unequal_fold() : int {
+    return _fold([1, 2, 3, 4, 5].zip([10, 20, 30]).count())
+}
+
+// Phase 2 Z3 targets — chain ops between zip and terminator (where_/select/take/skip/take_while/skip_while).
+// All use the `$(t : tuple<int;int>)` block form so the typer accepts the chain at the inner-arg level (needed before plan_zip fires).
+[export, marker(no_coverage)]
+def target_zip_where_arr_fold() : array<tuple<int; int>> {
+    return <- [10, 20, 30, 40, 50].zip([1, 2, 3, 4, 5]) |> where_($(t : tuple<int; int>) => t._0 > 20) |> _fold()
+}
+
+[export, marker(no_coverage)]
+def target_zip_select_arr_fold() : array<int> {
+    return <- [10, 20, 30, 40, 50].zip([1, 2, 3, 4, 5]) |> select($(t : tuple<int; int>) => t._0 + t._1) |> _fold()
+}
+
+[export, marker(no_coverage)]
+def target_zip_where_select_fold() : array<int> {
+    return <- [10, 20, 30, 40, 50].zip([1, 2, 3, 4, 5]) |> where_($(t : tuple<int; int>) => t._0 > 20) |> select($(t : tuple<int; int>) => t._0 + t._1) |> _fold()
+}
+
+[export, marker(no_coverage)]
+def target_zip_take_fold() : array<tuple<int; int>> {
+    return <- [10, 20, 30, 40, 50].zip([1, 2, 3, 4, 5]) |> take(2) |> _fold()
+}
+
+[export, marker(no_coverage)]
+def target_zip_skip_fold() : array<tuple<int; int>> {
+    return <- [10, 20, 30, 40, 50].zip([1, 2, 3, 4, 5]) |> skip(3) |> _fold()
+}
+
+[export, marker(no_coverage)]
+def target_zip_take_while_fold() : array<tuple<int; int>> {
+    return <- [10, 20, 30, 40, 50].zip([1, 2, 3, 4, 5]) |> take_while($(t : tuple<int; int>) => t._0 < 30) |> _fold()
+}
+
+[export, marker(no_coverage)]
+def target_zip_skip_while_fold() : array<tuple<int; int>> {
+    return <- [10, 20, 30, 40, 50].zip([1, 2, 3, 4, 5]) |> skip_while($(t : tuple<int; int>) => t._0 < 30) |> _fold()
+}
+
+[export, marker(no_coverage)]
+def target_zip_where_count_fold() : int {
+    return _fold([10, 20, 30, 40, 50].zip([1, 2, 3, 4, 5]) |> where_($(t : tuple<int; int>) => t._0 > 20) |> count())
+}
+
+[export, marker(no_coverage)]
+def target_zip_take_count_fold() : int {
+    return _fold([10, 20, 30, 40, 50].zip([1, 2, 3, 4, 5]) |> take(3) |> count())
+}
+
+[export, marker(no_coverage)]
+def target_zip_select_count_fold() : int {
+    // Pure projection + count: the counter lane skips evaluating projection (no side effect to preserve), so this still beats a per-elem proj eval.
+    return _fold([10, 20, 30, 40, 50].zip([1, 2, 3, 4, 5]) |> select($(t : tuple<int; int>) => t._0 + t._1) |> count())
+}
+
+// Phase 2 Z6 bail target — result-selector zip form. plan_zip bails on zipArgCount != 2; tier-2 cascade (fold_linq_default) handles it. Test only that result is correct end-to-end.
+[export, marker(no_coverage)]
+def target_zip_result_selector_bail() : array<int> {
+    return <- [10, 20, 30, 40, 50].zip([1, 2, 3, 4, 5], $(p : int; q : int) => p + q) |> _fold()
+}
+
+// Phase 2 Z6 bail target — chain op (order) that plan_zip doesn't fuse. Tier-2 cascade handles it.
+[export, marker(no_coverage)]
+def target_zip_order_bail() : array<int> {
+    return <- [30, 10, 40, 20, 50].zip([3, 1, 4, 2, 5]) |> select($(t : tuple<int; int>) => t._0 + t._1) |> order() |> _fold()
+}
+
 [export, marker(no_coverage)]
 def target_zip3_fold() : array<tuple<int; int; int>> {
     return <- [1, 2, 3]._select(_ * 2).zip([10, 20, 30]._select(_ + 1), [100, 200, 300]._select(_ / 10))._fold()
@@ -78,6 +186,342 @@ def test_zip3_predicate_fold_result(t : T?) {
         t |> equal(result[0], 23)
         t |> equal(result[1], 45)
         t |> equal(result[2], 67)
+    }
+}
+
+// Phase 2 Z1 — behavioral + AST-shape coverage for bare zip splice.
+
+[test]
+def test_zip_bare_arr_fold_result(t : T?) {
+    t |> run("bare zip(arr, arr) produces matched tuples") @(t : T?) {
+        let result <- target_zip_bare_arr_fold()
+        t |> equal(length(result), 3)
+        t |> equal(result[0]._0, 1);  t |> equal(result[0]._1, 10)
+        t |> equal(result[1]._0, 2);  t |> equal(result[1]._1, 20)
+        t |> equal(result[2]._0, 3);  t |> equal(result[2]._1, 30)
+    }
+}
+
+[test]
+def test_zip_bare_iter_fold_result(t : T?) {
+    t |> run("bare zip(iter, iter) |> to_array produces matched tuples") @(t : T?) {
+        let result <- target_zip_bare_iter_fold()
+        t |> equal(length(result), 3)
+        t |> equal(result[0]._0, 1);  t |> equal(result[0]._1, 10)
+        t |> equal(result[2]._0, 3);  t |> equal(result[2]._1, 30)
+    }
+}
+
+[test]
+def test_zip_bare_iter_seq_fold_result(t : T?) {
+    t |> run("bare zip(iter, iter) returns iterator that yields matched tuples") @(t : T?) {
+        var n = 0
+        for (pair in target_zip_bare_iter_seq_fold()) {
+            t |> equal(pair._0, n + 1)
+            t |> equal(pair._1, (n + 1) * 10)
+            n ++
+        }
+        t |> equal(n, 3)
+    }
+}
+
+[test]
+def test_zip_bare_unequal_fold_result(t : T?) {
+    t |> run("bare zip truncates to shorter source") @(t : T?) {
+        let result <- target_zip_bare_unequal_fold()
+        t |> equal(length(result), 3)
+        t |> equal(result[0]._0, 1);  t |> equal(result[0]._1, 10)
+        t |> equal(result[2]._0, 3);  t |> equal(result[2]._1, 30)
+    }
+}
+
+[test]
+def test_zip_bare_arr_emits_single_for(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_zip_bare_arr_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected splice invoke wrapper")
+        let n = count_inner_for_loops(body_expr)
+        t |> equal(n, 1, "bare zip splice must emit exactly one (multi-iter) for-loop")
+        let zipCalls = count_call(body_expr, "zip")
+        t |> equal(zipCalls, 0, "zip call must be inlined into the for-loop, not preserved")
+    }
+}
+
+[test]
+def test_zip_bare_iter_emits_single_for(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_zip_bare_iter_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected splice invoke wrapper")
+        let n = count_inner_for_loops(body_expr)
+        t |> equal(n, 1, "iter+iter zip splice must emit exactly one for-loop")
+        let zipCalls = count_call(body_expr, "zip")
+        t |> equal(zipCalls, 0, "zip call must be inlined, not preserved")
+    }
+}
+
+// Phase 2 Z2 — behavioral + AST-shape for count/long_count terminators.
+
+[test]
+def test_zip_count_fold_result(t : T?) {
+    t |> run("zip(arr, arr).count() returns matched length") @(t : T?) {
+        t |> equal(target_zip_count_fold(), 3)
+    }
+}
+
+[test]
+def test_zip_long_count_fold_result(t : T?) {
+    t |> run("zip(arr, arr).long_count() returns int64 matched length") @(t : T?) {
+        t |> equal(target_zip_long_count_fold(), 3l)
+    }
+}
+
+[test]
+def test_zip_count_iter_fold_result(t : T?) {
+    t |> run("zip(iter, iter).count() walks both and returns min length") @(t : T?) {
+        t |> equal(target_zip_count_iter_fold(), 3)
+    }
+}
+
+[test]
+def test_zip_count_unequal_fold_result(t : T?) {
+    t |> run("zip(arr, arr).count() truncates to shorter source") @(t : T?) {
+        t |> equal(target_zip_count_unequal_fold(), 3)
+    }
+}
+
+[test]
+def test_zip_count_uses_length_shortcut(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_zip_count_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected splice invoke wrapper")
+        let n = count_inner_for_loops(body_expr)
+        t |> equal(n, 0, "zip(arr,arr).count() must use length shortcut (no for-loop)")
+    }
+}
+
+[test]
+def test_zip_long_count_uses_length_shortcut(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_zip_long_count_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected splice invoke wrapper")
+        let n = count_inner_for_loops(body_expr)
+        t |> equal(n, 0, "zip(arr,arr).long_count() must use length shortcut (no for-loop)")
+    }
+}
+
+[test]
+def test_zip_count_iter_emits_counter_loop(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_zip_count_iter_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected splice invoke wrapper")
+        let n = count_inner_for_loops(body_expr)
+        t |> equal(n, 1, "iter+iter source: count must walk both via counter loop (1 for)")
+        let zipCalls = count_call(body_expr, "zip")
+        t |> equal(zipCalls, 0, "zip must be inlined")
+        let countCalls = count_call(body_expr, "count")
+        t |> equal(countCalls, 0, "count must be inlined into acc++")
+    }
+}
+
+// ── Phase 2 Z3 behavioral + AST shape tests (chain ops fused into zip splice) ─
+
+[test]
+def test_zip_where_arr_fold_result(t : T?) {
+    t |> run("zip + where_ filters by tuple element") @(t : T?) {
+        let result <- target_zip_where_arr_fold()
+        // a=[10,20,30,40,50], b=[1..5]: pairs where a>20 → [(30,3),(40,4),(50,5)]
+        t |> equal(length(result), 3)
+        t |> equal(result[0]._0, 30)
+        t |> equal(result[0]._1, 3)
+        t |> equal(result[2]._0, 50)
+        t |> equal(result[2]._1, 5)
+    }
+}
+
+[test]
+def test_zip_select_arr_fold_result(t : T?) {
+    t |> run("zip + select projects per element") @(t : T?) {
+        let result <- target_zip_select_arr_fold()
+        // sum each pair: [11, 22, 33, 44, 55]
+        t |> equal(length(result), 5)
+        t |> equal(result[0], 11)
+        t |> equal(result[4], 55)
+    }
+}
+
+[test]
+def test_zip_where_select_fold_result(t : T?) {
+    t |> run("zip + where + select chains predicate and projection") @(t : T?) {
+        let result <- target_zip_where_select_fold()
+        // filter a>20, then sum: [33, 44, 55]
+        t |> equal(length(result), 3)
+        t |> equal(result[0], 33)
+        t |> equal(result[2], 55)
+    }
+}
+
+[test]
+def test_zip_take_fold_result(t : T?) {
+    t |> run("zip + take limits to N pairs") @(t : T?) {
+        let result <- target_zip_take_fold()
+        t |> equal(length(result), 2)
+        t |> equal(result[0]._0, 10)
+        t |> equal(result[1]._0, 20)
+    }
+}
+
+[test]
+def test_zip_skip_fold_result(t : T?) {
+    t |> run("zip + skip drops K pairs from the front") @(t : T?) {
+        let result <- target_zip_skip_fold()
+        t |> equal(length(result), 2)
+        t |> equal(result[0]._0, 40)
+        t |> equal(result[1]._0, 50)
+    }
+}
+
+[test]
+def test_zip_take_while_fold_result(t : T?) {
+    t |> run("zip + take_while yields prefix that matches predicate") @(t : T?) {
+        let result <- target_zip_take_while_fold()
+        // take while a < 30 → [(10,1),(20,2)]
+        t |> equal(length(result), 2)
+        t |> equal(result[0]._0, 10)
+        t |> equal(result[1]._0, 20)
+    }
+}
+
+[test]
+def test_zip_skip_while_fold_result(t : T?) {
+    t |> run("zip + skip_while yields tail after first false") @(t : T?) {
+        let result <- target_zip_skip_while_fold()
+        // skip while a < 30 → [(30,3),(40,4),(50,5)]
+        t |> equal(length(result), 3)
+        t |> equal(result[0]._0, 30)
+        t |> equal(result[2]._0, 50)
+    }
+}
+
+[test]
+def test_zip_where_count_fold_result(t : T?) {
+    t |> run("zip + where + count returns matched count") @(t : T?) {
+        t |> equal(target_zip_where_count_fold(), 3)
+    }
+}
+
+[test]
+def test_zip_take_count_fold_result(t : T?) {
+    t |> run("zip + take + count returns min(N, len)") @(t : T?) {
+        t |> equal(target_zip_take_count_fold(), 3)
+    }
+}
+
+[test]
+def test_zip_select_count_fold_result(t : T?) {
+    t |> run("zip + select + count returns full length (pure projection)") @(t : T?) {
+        t |> equal(target_zip_select_count_fold(), 5)
+    }
+}
+
+[test]
+def test_zip_where_emits_single_for_with_filter(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_zip_where_arr_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected splice invoke wrapper")
+        let n = count_inner_for_loops(body_expr)
+        t |> equal(n, 1, "zip+where must emit exactly one for-loop")
+        let whereCalls = count_call(body_expr, "where_")
+        t |> equal(whereCalls, 0, "where_ call must be inlined into if-wrap, not preserved")
+    }
+}
+
+[test]
+def test_zip_select_emits_inline_projection(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_zip_select_arr_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected splice invoke wrapper")
+        let n = count_inner_for_loops(body_expr)
+        t |> equal(n, 1, "zip+select must emit one for-loop with inline projection")
+        let selectCalls = count_call(body_expr, "select")
+        t |> equal(selectCalls, 0, "select call must be inlined into push_clone(projection)")
+    }
+}
+
+[test]
+def test_zip_take_emits_break_in_loop(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_zip_take_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected splice invoke wrapper")
+        let n = count_inner_for_loops(body_expr)
+        t |> equal(n, 1, "zip+take emits a single for-loop with break-guard")
+        let breaks = count_break_continue(body_expr, true)
+        t |> success(breaks >= 1, "zip+take must splice a `break` into the for-body")
+        let takeCalls = count_call(body_expr, "take")
+        t |> equal(takeCalls, 0, "take call must be inlined as counter+break")
+    }
+}
+
+// Phase 2 Z6 bail behavioral tests — these compile and run through tier-2 cascade (fold_linq_default), not plan_zip. Verify correctness only.
+
+[test]
+def test_zip_result_selector_bail_correct(t : T?) {
+    t |> run("zip(a, b, selector) form bails to tier-2 cascade and computes correct result") @(t : T?) {
+        let result <- target_zip_result_selector_bail()
+        // [10..50].zip([1..5], p+q) = [11, 22, 33, 44, 55]
+        t |> equal(length(result), 5)
+        t |> equal(result[0], 11)
+        t |> equal(result[4], 55)
+    }
+}
+
+[test]
+def test_zip_order_bail_correct(t : T?) {
+    t |> run("zip + select + order bails to tier-2 cascade and produces sorted result") @(t : T?) {
+        let result <- target_zip_order_bail()
+        // a=[30,10,40,20,50] b=[3,1,4,2,5]: pair sums [33,11,44,22,55] sorted ascending → [11,22,33,44,55]
+        t |> equal(length(result), 5)
+        t |> equal(result[0], 11)
+        t |> equal(result[4], 55)
     }
 }
 
@@ -1682,9 +2126,10 @@ def target_reverse_take_to_array_fold() : array<int> {
 }
 
 [test]
-def test_reverse_take_emits_resize(t : T?) {
-    // R4: take(N) after reverse — buffer + reverse_inplace + resize. The resize call
-    // proves we kept the buffer single-pass instead of cascading to a take-iterator.
+def test_reverse_take_emits_backward_index_loop(t : T?) {
+    // R6: array-typed source + reverse |> take(N) — backward index loop instead of
+    // (push all → reverse_inplace → resize). Visits only the last N indices, skipping
+    // the O(length) push and O(length) reverse pass. Closes the m3 lazy-yield regression.
     ast_gc_guard() {
         var func = find_module_function_via_rtti(compiling_module(), @@target_reverse_take_to_array_fold)
         if (func == null) return
@@ -1694,10 +2139,47 @@ def test_reverse_take_emits_resize(t : T?) {
         }
         t |> success(r.matched && body_expr is ExprInvoke, "expected invoke wrapper for splice")
         t |> equal(1, count_inner_for_loops(body_expr), "single fused for-loop")
+        t |> equal(0, count_call(body_expr, "reverse_inplace"),
+            "must NOT emit reverse_inplace (backward index loop replaces it)")
+        t |> equal(0, count_call(body_expr, "resize"),
+            "must NOT emit resize (reserve(takeN) replaces it)")
+        t |> equal(0, count_call(body_expr, "take"),
+            "take runtime helper must NOT be called")
+        t |> success(count_call(body_expr, "reserve") >= 1,
+            "must emit reserve(takeN) to pre-size the buffer")
+        t |> success(count_call(body_expr, "length") >= 1,
+            "must call length(src) to bound the backward walk")
+        t |> equal(3, count_outer_let_vars(body_expr),
+            "three outer vars: source-length, clamped-takeN, buffer")
+    }
+}
+
+[export, marker(no_coverage)]
+def target_reverse_take_iterator_fold() : array<int> {
+    // Iterator source (range) — backward index loop is NOT applicable, falls back
+    // to R1-R4 path (push all → reverse_inplace → resize).
+    return <- _fold(each(range(1, 9)) |> reverse() |> take(3) |> to_array())
+}
+
+[test]
+def test_reverse_take_iterator_source_uses_reverse_inplace(t : T?) {
+    // R6 negative: when source is not indexable (range / iterator), the R1-R4 fallback
+    // path stays in place. Pins the full fallback shape (not just reverse_inplace/resize
+    // presence) so the test catches both directions of drift: (a) R6 starts mis-firing on
+    // iterator sources, (b) the R1-R4 emission shape changes (e.g. cascades to take helper).
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_reverse_take_iterator_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected invoke wrapper for splice")
+        t |> equal(1, count_inner_for_loops(body_expr), "single fused prefilter loop (R1-R4)")
         t |> success(count_call(body_expr, "reverse_inplace") >= 1,
-            "must emit reverse_inplace call")
+            "iterator source must use reverse_inplace fallback")
         t |> success(count_call(body_expr, "resize") >= 1,
-            "must emit resize call for take(N) post-reverse truncation")
+            "iterator source must use resize fallback")
         t |> equal(0, count_call(body_expr, "take"),
             "take runtime helper must NOT be called (resize replaces it)")
         t |> equal(1, count_outer_let_vars(body_expr),
@@ -2195,6 +2677,101 @@ def test_group_by_first_or_default_cascades_to_tier2(t : T?) {
 }
 
 [export, marker(no_coverage)]
+def target_group_by_upstream_where_fold() : array<int> {
+    // G11 (PR-B): upstream where_ fuses into the per-element loop. No runtime where_ call;
+    // body contains `if (predicate) { ... }` guarding the key + table-update splice.
+    return <- _fold([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]._where(_ % 2 == 0)._group_by(_ % 3)._select(_._1 |> length))
+}
+
+[test]
+def test_group_by_upstream_where_no_runtime_where_call(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_group_by_upstream_where_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected invoke wrapper for splice")
+        t |> equal(0, count_call(body_expr, "group_by_lazy"), "must NOT call group_by_lazy runtime")
+        t |> equal(0, count_call(body_expr, "where_"), "upstream where_ must be inlined, not called")
+        t |> success(count_call(body_expr, "unique_key") >= 1, "must call _::unique_key per element")
+        t |> equal(0, count_call(body_expr, "key_exists"), "single-hash hot path: no key_exists")
+        t |> equal(2, count_inner_for_loops(body_expr), "table-update + result-build loops")
+    }
+}
+
+[export, marker(no_coverage)]
+def target_group_by_upstream_select_fold() : array<tuple<K : int; S : int>> {
+    // G12 (PR-B): upstream select_ fuses; the key references the projected value via an
+    // intermediate var bind inside the per-element loop.
+    return <- _fold([10, 20, 30, 11, 21, 31, 12]._select(_ * 2)._group_by(_ % 3)._select((K = _._0, S = _._1 |> sum)))
+}
+
+[test]
+def test_group_by_upstream_select_no_runtime_select_call(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_group_by_upstream_select_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected invoke wrapper for splice")
+        t |> equal(0, count_call(body_expr, "group_by_lazy"), "must NOT call group_by_lazy runtime")
+        t |> equal(0, count_call(body_expr, "select"), "upstream select must be inlined, not called")
+        t |> success(count_call(body_expr, "unique_key") >= 1, "must call _::unique_key per element")
+        t |> equal(0, count_call(body_expr, "key_exists"), "single-hash hot path: no key_exists")
+        t |> equal(2, count_inner_for_loops(body_expr), "table-update + result-build loops")
+    }
+}
+
+[export, marker(no_coverage)]
+def target_group_by_upstream_where_select_fold() : array<tuple<K : int; S : int>> {
+    // G13 (PR-B): chained upstream where_ + select_ fuse together. Where guards, select binds.
+    return <- _fold([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]._where(_ > 3)._select(_ * 10)._group_by(_ % 3)._select((K = _._0, S = _._1 |> sum)))
+}
+
+[test]
+def test_group_by_upstream_where_select_combined(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_group_by_upstream_where_select_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected invoke wrapper for splice")
+        t |> equal(0, count_call(body_expr, "group_by_lazy"), "must NOT call group_by_lazy runtime")
+        t |> equal(0, count_call(body_expr, "where_"), "upstream where_ must be inlined")
+        t |> equal(0, count_call(body_expr, "select"), "upstream select must be inlined")
+        t |> equal(0, count_call(body_expr, "key_exists"), "single-hash hot path: no key_exists")
+        t |> equal(2, count_inner_for_loops(body_expr), "table-update + result-build loops")
+    }
+}
+
+[export, marker(no_coverage)]
+def target_group_by_upstream_distinct_falls_through() : array<int> {
+    // BAIL (PR-B): distinct upstream is NOT where_/select* → plan_group_by rejects; cascades to tier 2.
+    return <- _fold([1, 2, 3, 4, 5, 6, 7].to_sequence().distinct()._group_by(_ % 3)._select(_._1 |> length).to_array())
+}
+
+[test]
+def test_group_by_upstream_distinct_cascades_to_tier2(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_group_by_upstream_distinct_falls_through)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected invoke wrapper from cascade")
+        t |> success(count_outer_let_vars(body_expr) >= 2,
+            "cascade fingerprint: multiple pass_N outer vars")
+    }
+}
+
+[export, marker(no_coverage)]
 def target_group_by_having_falls_through() : array<int> {
     // BAIL: where_ between group_by and select (HAVING clause shape) → cascade to tier 2.
     return <- _fold([1, 2, 3, 4, 5, 6, 7]._group_by(_ % 3)._where(_._1 |> length >= 2)._select(_._1 |> length))
@@ -2220,6 +2797,256 @@ def test_group_by_having_cascades_to_tier2(t : T?) {
     }
 }
 
+[export, marker(no_coverage)]
+def target_group_by_having_length_match_fold() : array<tuple<K : int; N : int>> {
+    // PR-D splice: `_having(_._1|>length>=N)` between group_by_lazy and select where the select
+    // has a matching length slot — predicate rewrites to `kv._{slot}>=N` and wraps push_clone.
+    return <- _fold([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]._group_by_lazy(_ % 3)._having(_._1 |> length >= 4)._select((K = _._0, N = _._1 |> length)))
+}
+
+[test]
+def test_group_by_having_length_match_splices(t : T?) {
+    // Single-hash hot path (no key_exists) + no runtime having_/select call in the splice body.
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_group_by_having_length_match_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched, "expected splice wrapper")
+        t |> equal(0, count_call(body_expr, "key_exists"))
+        t |> success(count_call(body_expr, "unique_key") >= 1, "table-update uses unique_key")
+        t |> equal(0, count_call(body_expr, "having_"))
+        t |> equal(0, count_call(body_expr, "group_by_lazy"))
+    }
+}
+
+[export, marker(no_coverage)]
+def target_group_by_having_count_terminator_fold() : int {
+    // PR-D count terminator: result-build counts only the buckets passing the rewritten predicate.
+    return _fold([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]._group_by_lazy(_ % 3)._having(_._1 |> length >= 4)._select((K = _._0, N = _._1 |> length)) |> count())
+}
+
+[test]
+def test_group_by_having_count_terminator_splices(t : T?) {
+    // count + having: no length(tab) shortcut (we have to inspect each entry); the splice emits
+    // a counter loop instead — `having_` and `group_by_lazy` should still be absent.
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_group_by_having_count_terminator_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched, "expected splice wrapper")
+        t |> equal(0, count_call(body_expr, "having_"))
+        t |> equal(0, count_call(body_expr, "group_by_lazy"))
+        t |> equal(0, count_call(body_expr, "key_exists"))
+    }
+}
+
+[export, marker(no_coverage)]
+def target_group_by_having_hidden_sum_fold() : array<tuple<K : int; N : int>> {
+    // PR-E: having uses sum but select has only length — planner synthesizes a hidden sum slot
+    // in the internal table value type; result-build projects only the user-visible (K, N).
+    return <- _fold([1, 2, 3, 4, 5, 6]._group_by_lazy(_ % 2)._having(_._1 |> sum > 10)._select((K = _._0, N = _._1 |> length)))
+}
+
+[test]
+def test_group_by_having_hidden_sum_splices(t : T?) {
+    // PR-E splice fingerprint: no group_by_lazy or having_ runtime calls; single-hash hot path.
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_group_by_having_hidden_sum_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched, "expected splice wrapper")
+        t |> equal(0, count_call(body_expr, "group_by_lazy"))
+        t |> equal(0, count_call(body_expr, "having_"))
+        t |> equal(0, count_call(body_expr, "sum"), "hidden sum inlined into += hit branch")
+        t |> equal(0, count_call(body_expr, "key_exists"), "single-hash hot path")
+        t |> success(count_call(body_expr, "unique_key") >= 1, "per-element unique_key")
+    }
+}
+
+[export, marker(no_coverage)]
+def target_group_by_having_two_same_named_inner_select_cascades() : array<tuple<K : int; N : int>> {
+    // PR-E bail: two same-named inner-select reducers in the same having clause can't be
+    // distinguished by name alone — splicing would silently conflate the two lambdas onto
+    // one hidden slot. Bail to tier 2 so each select() is evaluated separately.
+    return <- _fold([1, 2, 3, 4, 5, 6, 7, 8]._group_by_lazy(_ % 3)
+                       ._having((_._1 |> select($(x : int) => x * 2) |> sum)
+                           + (_._1 |> select($(x : int) => x * 3) |> sum) > 50)
+                       ._select((K = _._0, N = _._1 |> length)))
+}
+
+[test]
+def test_group_by_having_two_same_named_inner_select_cascades_to_tier2(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_group_by_having_two_same_named_inner_select_cascades)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected invoke wrapper from cascade")
+        t |> success(count_outer_let_vars(body_expr) >= 2,
+            "cascade fingerprint: multiple pass_N outer vars")
+    }
+}
+
+[export, marker(no_coverage)]
+def target_group_by_having_hidden_bare_form_cascades() : array<int> {
+    // PR-E bail: bare-form group_proj (`_._1 |> length`, not a named tuple) combined with a
+    // having reducer that needs a hidden slot — the bare table layout uses `tuple<KeyT; AccT>`
+    // synthesized inside a qmacro with embedded `typedecl(invoke(...))`, which can't be
+    // extended with a dynamic count of additional acc slots. Falls back to tier 2.
+    return <- _fold([1, 2, 3, 4, 5, 6]._group_by_lazy(_ % 2)._having(_._1 |> sum > 10)._select(_._1 |> length))
+}
+
+[test]
+def test_group_by_having_hidden_bare_form_cascades_to_tier2(t : T?) {
+    // Cascade fingerprint: multiple pass_N let-vars (group, having, select all separate).
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_group_by_having_hidden_bare_form_cascades)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected invoke wrapper from cascade")
+        t |> success(count_outer_let_vars(body_expr) >= 2,
+            "cascade fingerprint: multiple pass_N outer vars")
+    }
+}
+
+[export, marker(no_coverage)]
+def target_group_by_having_raw_bucket_cascades() : array<tuple<K : int; N : int>> {
+    // BAIL: predicate touches _._1 outside any matched reducer (raw bucket-array length probe).
+    // is_bind_field_access on _._1 alone (used as condition value) is not in the recognized set.
+    return <- _fold([1, 2, 3, 4, 5, 6]._group_by_lazy(_ % 2)._having(empty(_._1))._select((K = _._0, N = _._1 |> length)))
+}
+
+[test]
+def test_group_by_having_raw_bucket_cascades_to_tier2(t : T?) {
+    // Cascade fingerprint: multiple pass_N let-vars.
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_group_by_having_raw_bucket_cascades)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected invoke wrapper from cascade")
+        t |> success(count_outer_let_vars(body_expr) >= 2,
+            "cascade fingerprint: multiple pass_N outer vars")
+    }
+}
+
+[export, marker(no_coverage)]
+def target_group_by_average_bare_fold() : array<double> {
+    // PR-A2 follow-up: bare `_._1 |> average` splices via tuple<double;uint64> per-key acc.
+    return <- _fold([10, 20, 30, 11, 21, 31, 12]._group_by(_ % 3)._select(_._1 |> average))
+}
+
+[test]
+def test_group_by_average_bare_emits_avg_acc(t : T?) {
+    // Average splice fingerprint: no runtime average call (inlined into += / count loop),
+    // single-hash hot path (no key_exists), per-element unique_key.
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_group_by_average_bare_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected invoke wrapper for splice")
+        t |> equal(0, count_call(body_expr, "group_by_lazy"), "must NOT call group_by_lazy")
+        t |> equal(0, count_call(body_expr, "average"), "reducer inlined; no runtime average call")
+        t |> equal(0, count_call(body_expr, "key_exists"), "single-hash hot path")
+        t |> success(count_call(body_expr, "unique_key") >= 1, "per-element unique_key")
+        t |> equal(2, count_inner_for_loops(body_expr), "table-update + result-build loops")
+    }
+}
+
+[export, marker(no_coverage)]
+def target_group_by_average_named_fold() : array<tuple<K : int; Avg : double>> {
+    return <- _fold([10, 20, 30, 11, 21, 31, 12]._group_by(_ % 3)._select((K = _._0, Avg = _._1 |> average)))
+}
+
+[test]
+def test_group_by_average_named_preserves_field_name(t : T?) {
+    // Named form: table stores tuple<K:int;Avg:tuple<double;uint64>> internally; result-build
+    // synthesizes user-facing tuple<K;Avg:double> with field names preserved (compiler-checked
+    // by the function's declared return type — would fail compilation if shape diverged).
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_group_by_average_named_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected invoke wrapper for splice")
+        t |> equal(0, count_call(body_expr, "group_by_lazy"), "must NOT call group_by_lazy")
+        t |> equal(0, count_call(body_expr, "average"), "reducer inlined; no runtime average call")
+        t |> equal(0, count_call(body_expr, "key_exists"), "single-hash hot path")
+        t |> equal(2, count_inner_for_loops(body_expr), "table-update + result-build loops")
+    }
+}
+
+[export, marker(no_coverage)]
+def target_group_by_average_inner_select_fold() : array<tuple<K : int; Avg : double>> {
+    return <- _fold([10, 20, 30, 11, 21, 31, 12]._group_by(_ % 3)._select(
+        (K = _._0, Avg = _._1 |> select(@(x : int) => x * 2) |> average)))
+}
+
+[test]
+def test_group_by_average_inner_select_inlines_projection(t : T?) {
+    // Inner select inlined — neither inner `select` call nor the reducer survives.
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_group_by_average_inner_select_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected invoke wrapper for splice")
+        t |> equal(0, count_call(body_expr, "group_by_lazy"), "must NOT call group_by_lazy")
+        t |> equal(0, count_call(body_expr, "average"), "reducer inlined")
+        t |> equal(0, count_call(body_expr, "select"), "inner select inlined")
+        t |> equal(0, count_call(body_expr, "key_exists"), "single-hash hot path")
+    }
+}
+
+[export, marker(no_coverage)]
+def target_group_by_multi_reducer_with_avg_fold() : array<tuple<K : int; N : int; S : int; Avg : double>> {
+    return <- _fold([10, 20, 30, 11, 21, 31, 12]._group_by(_ % 3)._select(
+        (K = _._0, N = _._1 |> length, S = _._1 |> sum, Avg = _._1 |> average)))
+}
+
+[test]
+def test_group_by_multi_reducer_with_avg_splices(t : T?) {
+    // 4-slot named tuple combining length + sum + average — single fused pass, no runtime reducer calls.
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_group_by_multi_reducer_with_avg_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected invoke wrapper for splice")
+        t |> equal(0, count_call(body_expr, "group_by_lazy"), "must NOT call group_by_lazy")
+        t |> equal(0, count_call(body_expr, "average"), "reducer inlined")
+        t |> equal(0, count_call(body_expr, "sum"), "reducer inlined")
+        // length(tab) legitimately appears in the reserve hint — don't assert absence.
+        t |> equal(0, count_call(body_expr, "key_exists"), "single-hash hot path")
+        t |> equal(2, count_inner_for_loops(body_expr), "table-update + result-build loops")
+    }
+}
+
 [test]
 def test_reverse_select_pushes_projection_not_source(t : T?) {
     // R3: select before reverse — the loop pushes the projected value, not the
@@ -2242,6 +3069,421 @@ def test_reverse_select_pushes_projection_not_source(t : T?) {
             "projection multiplication must appear inline in push_clone")
         t |> equal(1, count_outer_let_vars(body_expr),
             "single outer var (the buffer) — anti-cascade gate")
+    }
+}
+
+// ── Phase 3+ terminal-walk lane: last / single / element_at / aggregate ─────
+
+[export, marker(no_coverage)]
+def target_last_fold() : int {
+    return _fold(each([1, 2, 3, 4, 5])._where(_ < 4).last())
+}
+
+[export, marker(no_coverage)]
+def target_last_or_default_fold() : int {
+    return _fold(each([1, 2, 3, 4, 5])._where(_ > 99).last_or_default(-1))
+}
+
+[export, marker(no_coverage)]
+def target_single_fold() : int {
+    return _fold(each([1, 2, 3, 4, 5])._where(_ == 3).single())
+}
+
+[export, marker(no_coverage)]
+def target_single_or_default_fold() : int {
+    return _fold(each([1, 2, 3, 4, 5])._where(_ > 99).single_or_default(-1))
+}
+
+[export, marker(no_coverage)]
+def target_element_at_fold() : int {
+    return _fold(each([10, 20, 30, 40, 50]).element_at(3))
+}
+
+[export, marker(no_coverage)]
+def target_element_at_or_default_fold() : int {
+    return _fold(each([10, 20, 30]).element_at_or_default(100))
+}
+
+[export, marker(no_coverage)]
+def target_aggregate_fold() : int {
+    return _fold(each([1, 2, 3, 4, 5]).aggregate(0, $(acc : int, x : int) => acc + x * 2))
+}
+
+[export, marker(no_coverage)]
+def target_aggregate_with_where_fold() : int {
+    return _fold(each([1, 2, 3, 4, 5])._where(_ % 2 == 1).aggregate(0, $(acc : int, x : int) => acc + x * x))
+}
+
+[test]
+def test_last_splices(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_last_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected invoke wrapper")
+        t |> equal(1, count_inner_for_loops(body_expr), "last: one for-loop (full walk)")
+        // `last` tail panics on empty source; verify the splice emitted it.
+        t |> success(count_call(body_expr, "panic") >= 1, "last: panic call in tail for empty case")
+    }
+}
+
+[test]
+def test_last_or_default_no_panic(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_last_or_default_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected invoke wrapper")
+        t |> equal(1, count_inner_for_loops(body_expr), "last_or_default: one for-loop")
+        // `last_or_default` returns the bound default; never panics.
+        t |> equal(0, count_call(body_expr, "panic"), "last_or_default: no panic call")
+    }
+}
+
+[test]
+def test_single_splices(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_single_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected invoke wrapper")
+        t |> equal(1, count_inner_for_loops(body_expr), "single: one for-loop")
+        // `single` panics twice in the splice: once for >1 match (in-loop), once for empty (tail).
+        t |> success(count_call(body_expr, "panic") >= 2, "single: two panic call sites")
+    }
+}
+
+[test]
+def test_single_or_default_no_panic(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_single_or_default_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected invoke wrapper")
+        t |> equal(1, count_inner_for_loops(body_expr), "single_or_default: one for-loop")
+        t |> equal(0, count_call(body_expr, "panic"), "single_or_default: no panic")
+    }
+}
+
+[test]
+def test_element_at_splices(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_element_at_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected invoke wrapper")
+        t |> equal(1, count_inner_for_loops(body_expr), "element_at: one for-loop")
+        // `element_at` emits two panic call sites in the splice (pre-loop for `idx < 0`,
+        // tail for "index out of range"); const-fold may eliminate the pre-loop branch
+        // when the literal index is non-negative, so >= 1 is the guarantee.
+        t |> success(count_call(body_expr, "panic") >= 1, "element_at: at least the tail panic survives")
+        // Counter `++` increments the in-flight match counter.
+        t |> success(count_op1(body_expr, "++") >= 1, "element_at: counter increment present")
+    }
+}
+
+[test]
+def test_element_at_or_default_no_panic(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_element_at_or_default_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected invoke wrapper")
+        t |> equal(1, count_inner_for_loops(body_expr), "element_at_or_default: one for-loop")
+        t |> equal(0, count_call(body_expr, "panic"), "element_at_or_default: no panic")
+    }
+}
+
+// Count ExprInvoke nodes anywhere in the subtree. The outer `_fold` splice wrapper
+// is an ExprInvoke; per-element block calls (when peel fails) also emit ExprInvoke.
+// Peeled aggregate bodies inline the block expression and emit zero inner invokes.
+def count_invoke_nodes(expr : Expression?) : int {
+    if (expr == null) return 0
+    var n = 0
+    if (expr is ExprInvoke) {
+        n ++
+    }
+    if (expr is ExprBlock) {
+        let b = expr as ExprBlock
+        for (s in b.list) {
+            n += count_invoke_nodes(s)
+        }
+        for (s in b.finalList) {
+            n += count_invoke_nodes(s)
+        }
+    } elif (expr is ExprFor) {
+        let f = expr as ExprFor
+        for (s in f.sources) {
+            n += count_invoke_nodes(s)
+        }
+        n += count_invoke_nodes(f.body)
+    } elif (expr is ExprIfThenElse) {
+        let i = expr as ExprIfThenElse
+        n += count_invoke_nodes(i.cond)
+        n += count_invoke_nodes(i.if_true)
+        n += count_invoke_nodes(i.if_false)
+    } elif (expr is ExprOp2) {
+        let o = expr as ExprOp2
+        n += count_invoke_nodes(o.left)
+        n += count_invoke_nodes(o.right)
+    } elif (expr is ExprCall) {
+        let c = expr as ExprCall
+        for (a in c.arguments) {
+            n += count_invoke_nodes(a)
+        }
+    } elif (expr is ExprMakeBlock) {
+        let mb = expr as ExprMakeBlock
+        n += count_invoke_nodes(mb._block)
+    } elif (expr is ExprInvoke) {
+        let inv = expr as ExprInvoke
+        for (a in inv.arguments) {
+            n += count_invoke_nodes(a)
+        }
+    } elif (expr is ExprReturn) {
+        let r = expr as ExprReturn
+        n += count_invoke_nodes(r.subexpr)
+    } elif (expr is ExprOp1) {
+        let o = expr as ExprOp1
+        n += count_invoke_nodes(o.subexpr)
+    } elif (expr is ExprLet) {
+        let l = expr as ExprLet
+        for (v in l.variables) {
+            if (v != null && v.init != null) {
+                n += count_invoke_nodes(v.init)
+            }
+        }
+    }
+    return n
+}
+
+[test]
+def test_aggregate_splices_peeled(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_aggregate_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected invoke wrapper")
+        t |> equal(1, count_inner_for_loops(body_expr), "aggregate: one for-loop")
+        // Single-return block body `acc + x * 2` peeled into `+` and `*` ops; the only
+        // ExprInvoke is the outer `_fold` splice wrapper. A non-peeled splice would emit
+        // a per-element ExprInvoke against the user's block.
+        t |> equal(1, count_invoke_nodes(body_expr),
+            "aggregate: only the outer invoke wrapper, NOT a per-element block invoke")
+        t |> success(count_op2(body_expr, "+") >= 1, "aggregate: `+` from peeled body")
+        t |> success(count_op2(body_expr, "*") >= 1, "aggregate: `*` from peeled body")
+    }
+}
+
+[test]
+def test_aggregate_with_where_fuses(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_aggregate_with_where_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected invoke wrapper")
+        t |> equal(1, count_inner_for_loops(body_expr), "aggregate+where: one for-loop")
+        // Where predicate (`_ % 2 == 1`) inlined alongside peeled aggregate body. The
+        // `where_` library helper must NOT appear as a runtime call.
+        t |> equal(0, count_call(body_expr, "where_"), "aggregate+where: where_ helper inlined")
+        t |> equal(1, count_invoke_nodes(body_expr), "aggregate+where: only outer invoke wrapper")
+    }
+}
+
+// ── take_while / skip_while splice targets (PR-G) ──────────────────────
+
+[export, marker(no_coverage)]
+def target_take_while_array_fold() : array<int> {
+    return <- _fold(each([5, 3, 8, 1, 4])._take_while(_ < 8).to_array())
+}
+
+[export, marker(no_coverage)]
+def target_take_while_count_fold() : int {
+    return _fold(each([5, 3, 8, 1, 4])._take_while(_ < 8).count())
+}
+
+[export, marker(no_coverage)]
+def target_take_while_sum_fold() : int {
+    return _fold(each([5, 3, 8, 1, 4])._take_while(_ < 8).sum())
+}
+
+[export, marker(no_coverage)]
+def target_take_while_first_fold() : int {
+    return _fold(each([5, 3, 8, 1, 4])._take_while(_ < 8).first())
+}
+
+[export, marker(no_coverage)]
+def target_skip_while_array_fold() : array<int> {
+    return <- _fold(each([5, 3, 8, 1, 4])._skip_while(_ > 3).to_array())
+}
+
+[export, marker(no_coverage)]
+def target_skip_while_count_fold() : int {
+    return _fold(each([5, 3, 8, 1, 4])._skip_while(_ > 3).count())
+}
+
+[export, marker(no_coverage)]
+def target_skip_while_then_take_while_fold() : int {
+    return _fold(each([5, 3, 8, 1, 4])._skip_while(_ > 3)._take_while(_ < 8).count())
+}
+
+[export, marker(no_coverage)]
+def target_select_then_take_while_cascades_fold() : array<int> {
+    // Cascade fingerprint: select precedes take_while → splice bails, tier-2 cascade runs.
+    return <- _fold(each([5, 3, 8, 1])._select(_ * 2)._take_while(_ < 16).to_array())
+}
+
+[test]
+def test_take_while_splices(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_take_while_array_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "take_while: expected invoke wrapper")
+        t |> equal(1, count_inner_for_loops(body_expr), "take_while: one for-loop")
+        // take_while is spliced inline as `if (!pred) break` — the library `take_while_impl`
+        // helper must NOT appear as a runtime call.
+        t |> equal(0, count_call(body_expr, "take_while"), "take_while: helper inlined")
+        t |> equal(0, count_call(body_expr, "take_while_impl"), "take_while: impl inlined")
+        t |> equal(0, count_call(body_expr, "take_while_impl_const"), "take_while: impl_const inlined")
+    }
+}
+
+[test]
+def test_take_while_count_splices(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_take_while_count_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "take_while count: invoke wrapper")
+        t |> equal(1, count_inner_for_loops(body_expr), "take_while count: one for-loop")
+        t |> equal(0, count_call(body_expr, "take_while"), "take_while count: helper inlined")
+    }
+}
+
+[test]
+def test_take_while_sum_splices(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_take_while_sum_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "take_while sum: invoke wrapper")
+        t |> equal(1, count_inner_for_loops(body_expr), "take_while sum: one for-loop (accumulator lane)")
+        t |> equal(0, count_call(body_expr, "take_while"), "take_while sum: helper inlined")
+        t |> equal(0, count_call(body_expr, "sum"), "take_while sum: sum_impl inlined")
+    }
+}
+
+[test]
+def test_take_while_first_splices(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_take_while_first_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "take_while first: invoke wrapper")
+        t |> equal(1, count_inner_for_loops(body_expr), "take_while first: one for-loop (early-exit lane)")
+        t |> equal(0, count_call(body_expr, "take_while"), "take_while first: helper inlined")
+        t |> equal(0, count_call(body_expr, "first"), "take_while first: first inlined")
+    }
+}
+
+[test]
+def test_skip_while_splices(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_skip_while_array_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "skip_while: invoke wrapper")
+        t |> equal(1, count_inner_for_loops(body_expr), "skip_while: one for-loop")
+        t |> equal(0, count_call(body_expr, "skip_while"), "skip_while: helper inlined")
+        t |> equal(0, count_call(body_expr, "skip_while_impl"), "skip_while: impl inlined")
+        t |> equal(0, count_call(body_expr, "skip_while_impl_const"), "skip_while: impl_const inlined")
+    }
+}
+
+[test]
+def test_skip_while_count_splices(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_skip_while_count_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "skip_while count: invoke wrapper")
+        t |> equal(1, count_inner_for_loops(body_expr), "skip_while count: one for-loop")
+        t |> equal(0, count_call(body_expr, "skip_while"), "skip_while count: helper inlined")
+    }
+}
+
+[test]
+def test_skip_while_then_take_while_compose_splices(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_skip_while_then_take_while_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "skip_while+take_while: invoke wrapper")
+        t |> equal(1, count_inner_for_loops(body_expr), "skip_while+take_while: one for-loop")
+        t |> equal(0, count_call(body_expr, "skip_while"), "skip_while+take_while: skip_while inlined")
+        t |> equal(0, count_call(body_expr, "take_while"), "skip_while+take_while: take_while inlined")
+    }
+}
+
+[test]
+def test_select_then_take_while_cascades_to_tier2(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_select_then_take_while_cascades_fold)
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return $e(body_expr)
+        }
+        t |> success(r.matched, "select-then-take_while: target found")
+        // Cascade tier-2 fingerprint: multiple outer let-vars from fold_linq_default's
+        // intermediate-pass pipeline. Distinct from the single-invoke splice shape.
+        t |> success(count_outer_let_vars(body_expr) >= 2,
+            "select-then-take_while: tier-2 cascade fingerprint (>=2 outer lets)")
     }
 }
 
