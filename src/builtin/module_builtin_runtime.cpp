@@ -805,6 +805,10 @@ namespace das
         context->stackWalk(lineInfo, args, vars);
     }
 
+    char * builtin_get_stackwalk ( bool args, bool vars, bool outOfScope, bool topOnly, Context * context, LineInfoArg * lineInfo ) {
+        return context->allocateString(context->getStackWalk(lineInfo, args, vars, outOfScope, topOnly), lineInfo);
+    }
+
     void builtin_terminate ( Context * context, LineInfoArg * at ) {
         context->throw_error_at(at, "terminate");
     }
@@ -1665,6 +1669,14 @@ namespace das
         #endif
     }
 
+    bool das_is_exceptions_enabled() {
+        #if DAS_ENABLE_EXCEPTIONS
+        return true;
+        #else
+        return false;
+        #endif
+    }
+
     bool is_in_aot ( ) {
         return daScriptEnvironment::getBound() ? daScriptEnvironment::getBound()->g_isInAot : false;
     }
@@ -2058,6 +2070,13 @@ namespace das
                 ->args({"args","vars","context","lineinfo"});
         fnsw->arguments[0]->init = new ExprConstBool(true);
         fnsw->arguments[1]->init = new ExprConstBool(true);
+        auto fngsw = addExtern<DAS_BIND_FUN(builtin_get_stackwalk)>(*this, lib, "get_stackwalk",
+            SideEffects::accessExternal, "builtin_get_stackwalk")
+                ->args({"args","vars","out_of_scope","top_only","context","lineinfo"});
+        fngsw->arguments[0]->init = new ExprConstBool(true);
+        fngsw->arguments[1]->init = new ExprConstBool(true);
+        fngsw->arguments[2]->init = new ExprConstBool(false);
+        fngsw->arguments[3]->init = new ExprConstBool(false);
         // profiler
         addExtern<DAS_BIND_FUN(resetProfiler)>(*this, lib, "reset_profiler",
             SideEffects::modifyExternal, "resetProfiler")
@@ -2395,6 +2414,8 @@ namespace das
         // migrate data
         addExtern<DAS_BIND_FUN(das_is_dll_build)>(*this, lib, "das_is_dll_build",
             SideEffects::worstDefault, "das_is_dll_build");
+        addExtern<DAS_BIND_FUN(das_is_exceptions_enabled)>(*this, lib, "das_is_exceptions_enabled",
+            SideEffects::worstDefault, "das_is_exceptions_enabled");
         addExtern<DAS_BIND_FUN(is_in_aot)>(*this, lib, "is_in_aot",
             SideEffects::worstDefault, "is_in_aot");
         addExtern<DAS_BIND_FUN(set_aot)>(*this, lib, "set_aot",
