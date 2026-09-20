@@ -56,6 +56,30 @@ node |> for_each_attribute()   $(a)       { ... }
 
 Manual `node.first_child` / `node.next_sibling` walking still works but is rarely the right choice.
 
+## LINQ source — `from_xml_node`
+
+`from_xml_node(root, type<Row>)` is a typed, lazy iterator over `root`'s child elements: each child is materialized into a `Row` by reading **same-named attributes**, so comprehensions and `daslib/linq_boost` queries run straight over an XML document.
+
+```das
+struct Car {
+    id : int
+    make : string
+    price : float
+    year : int = 2000        // default kept when the attribute is absent
+}
+
+for (car in from_xml_node(root, type<Car>)) { ... }                 // all children
+let makes <- [for (car in from_xml_node(root, type<Car>));          // comprehension
+    car.make; where car.price < 30000.0]
+let cars <- unsafe(from_xml_node(root, "car", type<Car>) |> to_array())   // tag-filtered + collect
+```
+
+- **Field mapping (v1):** every struct field reads from an attribute of the same name. Supported scalar types: `int`, `uint`, `float`, `double`, `bool`, `string`. Fields of other types keep their default. Child-element / text mapping (via `@xml_*` field annotations) is a planned growth path.
+- **Defaults:** a missing attribute leaves the field at its declared default (`year : int = 2000` above), because the field value is passed as the accessor's fallback.
+- **Lifetime-safe:** rows are owned values — string fields are cloned out of the document — so results collected with `to_array` / a comprehension stay valid **past** the `parse_xml` / `open_xml` RAII block. (Contrast: a raw `xml_node` must not escape the block.)
+- **`unsafe` outside a `for`:** `from_xml_node` is `[unsafe_outside_of_for]`. A `for` loop and a comprehension are safe; piping it into `to_array` / `linq_boost` outside a `for` needs an `unsafe` block.
+- **Fused `_fold` lane (pass 2a/2b):** `_fold(unsafe(from_xml_node(root, type<Row>))._where(...)._select(...).count()/sum()/min()/max()/average()/any()/first()/take(N)...)` emits an inlined DOM child-walk via `XmlAdapter` (`require ?pugixml pugixml/linq_fold_xml`, gated by `static_if (typeinfo builtin_module_exists(pugixml))` in `daslib/linq_fold`) — no generator, no intermediate array. Pass the node by value (`var root`, not `let root`) since `_fold`'s macro-arg inference skips the const&→value copy. **Field-pruning (pass 2b):** the walk reads only the `Row` fields the chain actually references (via `read_xml_field` into scalar locals) — unread fields, especially `string` fields whose `clone_string` is the alloc cost, are never touched, so a float-only chain is alloc-free and JIT beats the equivalent SQLite query. A whole-row escape (`to_array` / identity `_select(_)` / pass-to-fn) falls back to the full `build_xml_row`. Non-`loop_or_count` shapes (order_by / distinct / group_by / join / reverse) still take the un-fused tier-2 path. See [tutorials/dasPUGIXML/05_linq_over_xml.das](tutorials/dasPUGIXML/05_linq_over_xml.das).
+
 ## Quick accessors (with defaults)
 
 ```das
@@ -169,6 +193,7 @@ Supports nested structs, enums, arrays, tables, tuples, variants, vector types (
   - [tutorials/dasPUGIXML/02_building_xml.das](tutorials/dasPUGIXML/02_building_xml.das) — `with_doc`, `tag`/`attr` EDSL, serialization
   - [tutorials/dasPUGIXML/03_xpath.das](tutorials/dasPUGIXML/03_xpath.das) — XPath queries, compiled XPath
   - [tutorials/dasPUGIXML/04_serialization.das](tutorials/dasPUGIXML/04_serialization.das) — `to_XML`/`from_XML` round-trip
+  - [tutorials/dasPUGIXML/05_linq_over_xml.das](tutorials/dasPUGIXML/05_linq_over_xml.das) — `from_xml_node` LINQ source (typed rows from attributes)
 - daslib helpers (the source of truth for the EDSL): [modules/dasPUGIXML/daslib/PUGIXML_boost.das](modules/dasPUGIXML/daslib/PUGIXML_boost.das)
 - C++ binding (for adding new functions): [modules/dasPUGIXML/src/dasPUGIXML.h](modules/dasPUGIXML/src/dasPUGIXML.h), `dasPUGIXML.cpp`
 - Tests with patterns: [tests/dasPUGIXML/](tests/dasPUGIXML/) — `test_pugixml_core.das`, `test_pugixml_mutation.das`, `test_pugixml_boost.das`, `test_serial_*.das`

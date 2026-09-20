@@ -131,6 +131,9 @@ Source-side entry points
    * - ``from_decs(...)``
      - ``plan_decs_unroll`` etc.
      - Runtime component-name list form. Same decs splices as the template form.
+   * - ``unsafe(from_xml_node(node[, name], type<Row>))``
+     - ``extract_xml_source`` (``XmlAdapter``, ``modules/dasPUGIXML/daslib/linq_fold_xml.das``)
+     - Optional source — only when the ``pugixml`` module is linked (``require ?pugixml`` + ``static_if (typeinfo builtin_module_exists(pugixml))``). Emits an inlined DOM child-element walk replacing the generator, and **field-prunes** the per-element materialization (pass 2b): the chain body is scanned for the ``Row`` fields it reads, and only those attributes are read via ``read_xml_field`` into scalar locals — unread fields (notably ``string`` fields, whose ``clone_string`` is the alloc cost) are never touched, so a float-only chain runs alloc-free and JIT beats the equivalent SQLite query. A whole-row escape (``to_array`` / identity ``_select(_)`` / pass-to-fn) routes to the full ``build_xml_row`` instead. Only the ``loop_or_count_general`` row fuses (count / sum / min / max / average / any / first / take / to-array with ``_where`` / ``_select``); other chain shapes fall back to the unfused tier-2 pipeline. ``unsafe`` is required (the source is ``[unsafe_outside_of_for]``) and the node is passed by value (``var root`` — ``_fold``'s macro-arg inference skips the const&→value copy).
 
 Array-source patterns
 =====================
@@ -520,13 +523,13 @@ site::
     runs on the materialized buffer. Rewrite the chain to a
     recognized decs shape (see
     doc/source/reference/linq_fold_patterns.rst), or suppress with
-    `options _no_decs_perf_warn = true`.
+    `options _no_linq_perf_warn = true`.
 
 The fix is usually to reorder ops so the chain matches a row in the
 Decs section above (e.g. push ``_select`` past ``_skip_while`` /
 ``_take_while`` since their predicates run on the source tuple, not
 the projected value). Suppress per file with ``options
-_no_decs_perf_warn = true`` for tests that intentionally exercise
+_no_linq_perf_warn = true`` for tests that intentionally exercise
 cascade behavior as regression guards.
 
 See also

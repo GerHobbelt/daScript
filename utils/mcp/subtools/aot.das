@@ -1,8 +1,6 @@
 options gen2
 options rtti
 options indenting = 4
-options no_unused_function_arguments = false
-options no_unused_block_arguments = false
 
 require ../tools/common.das public
 require daslib/aot_cpp
@@ -32,7 +30,7 @@ def collect_aot_functions(program : smart_ptr<Program>) : array<AotFuncInfo> {
                     write(w, "; ")
                 }
                 first = false
-                write(w, "{string(fn.arguments[i].name)} : {describe(fn.arguments[i]._type)}")
+                write(w, "{fn.arguments[i].name} : {describe(fn.arguments[i]._type)}")
             }
             write(w, ")")
             if (fn.result != null && !fn.result.isVoid) {
@@ -81,7 +79,7 @@ def run_aot(file, func_name : string; project : string = "") : string {
             }
             return result
         }
-    return compile_and_simulate_ctx(file, project) $(program : smart_ptr<Program>; var ctx : smart_ptr<Context>; issues : string) {
+    return compile_and_simulate_ctx(file, project) $(program : smart_ptr<Program>; var ctx : smart_ptr<Context>; _issues : string) {
         let all_funcs <- collect_aot_functions(program)
         var matches <- [for (i in range(length(all_funcs))); i; where all_funcs[i].name == func_name]
         if (empty(matches)) {
@@ -129,5 +127,10 @@ def main {
     let file = args[0]
     let func_name = args[1]
     let project = args[2]
-    print(run_aot(file, func_name, project))
+    // run_aot -> run_aot_function builds AST during C++ codegen; without this
+    // guard those nodes leak and the GC dumps "GC APP LEAK ..." to stdout on
+    // exit, corrupting the JSON-RPC frame the MCP server sends to the client.
+    ast_gc_guard() {
+        print(run_aot(file, func_name, project))
+    }
 }

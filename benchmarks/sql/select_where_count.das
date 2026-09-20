@@ -48,6 +48,32 @@ def run_m4(b : B?; n : int) {
     }
 }
 
+// m5_xml lane: non-fold baseline — plain iteration over from_xml_node (which
+// materializes a full Car per child element). v1 has no _fold for XML, so this
+// is the reference the fused XML lane (m5f, pass 2) will be measured against.
+def run_m5(b : B?; n : int) {
+    let xml = fixture_xml_string(n)
+    parse_xml(xml) $(doc, ok) {
+        if (!ok) {
+            b->failNow()
+            return
+        }
+        let root = doc.document_element
+        b |> run("m5_xml/{n}", n) {
+            var c = 0
+            for (car in from_xml_node(root, type<Car>)) {
+                if (car.price * 2 > THRESHOLD) {
+                    c++
+                }
+            }
+            b |> accept(c)
+            if (c == 0) {
+                b->failNow()
+            }
+        }
+    }
+}
+
 [benchmark]
 def select_where_count_m1(b : B?) {
     run_m1(b, 100000)
@@ -61,4 +87,34 @@ def select_where_count_m3f(b : B?) {
 [benchmark]
 def select_where_count_m4(b : B?) {
     run_m4(b, 100000)
+}
+
+[benchmark]
+def select_where_count_m5(b : B?) {
+    run_m5(b, 100000)
+}
+
+// m5f_xml_fold lane: fused `_fold` over from_xml_node (pass 2b). XmlAdapter emits an inlined
+// child-element walk and field-prunes the materialization to the attributes the chain reads.
+def run_m5f(b : B?; n : int) {
+    let xml = fixture_xml_string(n)
+    parse_xml(xml) $(doc, ok) {
+        if (!ok) {
+            b->failNow()
+            return
+        }
+        var root = doc.document_element
+        b |> run("m5f_xml_fold/{n}", n) {
+            let c = _fold(unsafe(from_xml_node(root, type<Car>))._select(_.price * 2)._where(_ > THRESHOLD).count())
+            b |> accept(c)
+            if (c == 0) {
+                b->failNow()
+            }
+        }
+    }
+}
+
+[benchmark]
+def select_where_count_m5f(b : B?) {
+    run_m5f(b, 100000)
 }
