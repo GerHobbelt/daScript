@@ -359,7 +359,7 @@ the registry as `auto`). Stamped declarations don't get their own `apply`, so `[
 `sideEffectFlags.userScenario` itself (the P1 const-fold lesson).
 
 **Generator wiring decoupled (post-M3 follow-up, same day):** `llvm_user_modules` now does
-`require ?dasllama_gemm_gen dasllama/dasllama_gemm_register` (a new registration shim that
+`require ?dasllama/dasllama_gemm_gen dasllama/dasllama_gemm_register` (a new registration shim that
 requires the generator implementation). The optional-require guard grew a **target-file
 resolvability fallback** (C++: the collector in `ast_parse.cpp` + the parser statement in
 `parser_impl.cpp`): a guarded require also loads when the target's own file resolves — i.e.
@@ -762,6 +762,28 @@ see below).
 - NT/streaming weight loads for the fat w13/w2 batch streams (the mm_ffn 1.42x note) — now
   expressible as a perm knob on the x64 legs.
 
+**TIGHTEN EMISSION (Boris, 2026-07-04: "the biggest thing" — the follow-up session(s)
+agenda).** The generator wins on structure; the next wins are inside the emitted lattice:
+
+1. **bias128 repack for vpdpbusd** (above) — kills the per-dot VPSIGNB, ~28% of the busd
+   dot-stage µops; layout-companion field, exact. **→ DONE, slice H** (emitted + gated;
+   silicon measurement = next SPR/EPYC session).
+2. **The kstep4@512 collapse** (SPR scout sweep: busd512 kstep2 88.3 vs kstep4_nrsplit2 63.0
+   GMAC/s): diagnose via disasm — spills? scheduling? If it's acc pressure, the budget rail
+   is too permissive at 512; if scheduling, the block-emission order needs a k-interleave.
+   **→ CLOSED, slice H**: no spills, no scheduling — nrsplit2 halves weight-vector token
+   reuse, doubling the sign-trick preamble per dot; bias128 deletes the preamble.
+3. **Broadcast amortization**: one vpbroadcastd per dot today (96/tile) — an 8-byte k-group
+   layout (qword broadcast serving 2 dword-groups) halves them; pairs naturally with the
+   future smmla family's 2-token pairing. Layout-companion territory, new `kgroup` knob.
+4. **Weight-load/dequant fusion on x64 mx4**: the nibble->pshufb->sign chain re-derives |w|
+   per lookup; a biased-LUT variant (bake |lut| + sign plane) could drop abs entirely.
+5. Per-slot perms (M4 open item): the batch tile and the gemv core want different winners
+   already (SPR: gkstep2 helps gemv, kstep2 tile) — one manifest entry per SLOT family.
+6. New dot families when silicon arrives: smmla/i8mm (the parked branch, the other Mac),
+   SME (if that Mac is M4), AMX (the lcpp Intel ceiling — tile ISA, biggest lift, biggest
+   prize), vpdpbssd on Sierra-Forest-class metal.
+
 ## M4 slice G (2026-07-04, Zen2 3990X + M1 Max) — the witness five-function stamp + x64-gen
 
 **The witness closes the stamp** (`q8q8_family_live() : bool`, the fifth companion): reference
@@ -800,9 +822,662 @@ models D:\Work\llama.cpp\models, ssh `zen2`):**
 - arm64 unchanged: grid witness column correct (sdot rows live, x64 rows ref), slot parity
   both stamps, dasLLAMA suite 179/179.
 
-**Still open after G:** the lcpp yardstick on Zen2 (llama-bench.exe) + a fleet pass with the
-zen2 manifest; loop-hint manifest kind; per-slot perms; then the deletion (the hand AVX
-tiers are now beaten on Zen2 — EPYC zvnni is the remaining leg before the x64 matrix goes).
+### Slice G small-fleet yardstick (Zen2 3990X, das x64-gen maddubs-mr8 vs llama.cpp CPU
+### build fdb1db877, -p 512 -n 64, back-to-back per model, pp = 512000/(ttft − 1/emit))
+
+| model | T | das pp | lcpp pp | ratio | das emit | lcpp tg64 | ratio |
+|---|---|--:|--:|:--:|--:|--:|:--:|
+| SmolLM2-135M | 16 | 2193 | 2317 | 0.95 | 103.5 | 219.0 | 0.47 |
+| SmolLM2-135M | 32 | 2413 | 2715 | 0.89 | 104.8 | 193.1 | 0.54 |
+| Qwen3-0.6B | 16 | 874 | 752 | **1.16** | 52.8 | 70.0 | 0.75 |
+| Qwen3-0.6B | 32 | 1157 | 853 | **1.36** | 54.2 | 66.2 | 0.82 |
+| gemma-3-1b | 16 | 614 | 543 | **1.13** | 36.3 | 44.2 | 0.82 |
+| gemma-3-1b | 32 | 779 | 563 | **1.38** | 36.7 | 42.0 | 0.87 |
+| Llama-3.2-1B | 16 | 598 | 424 | **1.41** | 35.7 | 40.1 | 0.89 |
+| Llama-3.2-1B | 32 | 904 | 465 | **1.94** | 37.7 | 40.7 | 0.93 |
+
+**Prefill is the win column on Zen2** — the generated batch tile scales with threads while
+lcpp's Zen2 path stays flat (no zmm engine there; the pre-gen +20%@32C observation,
+amplified). **Decode losses shrink with size (0.47 -> 0.93)** and are the KNOWN
+dispatch-side issue (tiny models single-lane most matmuls under the 2M par threshold — the
+queued per-lane-regime item), not kernels: the registered A/B has our GEMV 1.3–1.5x ahead.
+
+**Still open after G:** the decode dispatch work above; a full-fleet pass with the zen2
+manifest; loop-hint manifest kind; per-slot perms; then the deletion (the hand AVX tiers are
+now beaten on Zen2 — EPYC zvnni is the remaining leg before the x64 matrix goes).
+
+## M4 slice H (2026-07-04, M1 Max) — tighten emission I: the kstep4@512 verdict + bias128
+
+**The kstep4@512 collapse, diagnosed from the scout dump (ledger item 2 — CLOSED).** Both
+variants' machine code is clean: ZERO spills (no stack traffic in either loop), no
+scheduling pathology, memory-operand `vpbroadcastd` splats throughout. The collapse is
+reuse geometry: nrsplit2 halves the tokens per k-pass (4 -> 2), so every weight vector's
+sign-trick preamble (load + VPABSB + VPMOVB2M) amortizes over HALF the dots — per 64-dot
+iteration, kstep2/nrsplit4 spends 16 loads + 16 abs + 16 masks where kstep4_nrsplit2 spends
+32/32/32 (and streams the whole weight plane TWICE per tile call). At width512/mr16 (rq=1)
+there is no register pressure for the split to relieve — 26/32 zmm live at nrsplit4 — so it
+is pure loss: +17% dot-stage µops (339 vs 289 instructions for the same 64 dots), 2x weight
+load traffic ⇒ 88.3 -> 63.0 (port math alone predicts ~0.86x; the doubled weight streaming
+eats the rest). The same knob WINS on arm64 (kstep4_nrsplit2_mr8, 137.5) because sdot has
+no per-weight preamble AND the q-reg budget (2mr + nrsplit·mr/4 + 2·nrsplit + 2 > 32) makes
+nrsplit4 illegal at mr8 — there the split is what unlocks mr8 at all. Verdict: the budget
+rail is correct (nrsplit4@512 is legal and wins; the sweep rejects the loser); the collapse
+is the sign-trick preamble amplified — which bias128 (item 1) deletes.
+
+**bias128 (ledger item 1) — the design.** Bake `w ^ 0x80` into the grp&lt;mr&gt; plane at repack
+(u8 = w+128 ∈ [0,255]); the dot becomes plain `vpdpbusd(acc, w_biased, x)` — no VPABSB, no
+VPMOVB2M/VPSIGNB, no masked VPSUBB. Exact: Σ(w+128)·x = Σw·x + 128·Σx in i32 (|acc| ≤
+~1.6M per block against 2^31), and it REMOVES the x ∈ [-127,127] sign-trick precondition.
+The correction is folded as the ACCUMULATOR INIT: acc starts at −128·Σx(block) instead of
+zero — the correction costs zero ALU (the vpxor zeroing it replaces was free at rename, the
+init is one embedded-broadcast load). Per 64-dot busd512-kstep2 iteration the dot-stage
+SIMD-ALU count drops 192 -> 96 (+8 broadcast loads) — the ALU-bound tile ceiling nearly
+doubles; SPR tile 88.3 should land 120-150 GMAC/s (silicon next SPR/EPYC session).
+vpdpbusd-only: maddubs saturates word pair-sums at biased magnitudes, bssd is native s8·s8.
+
+Transport (where −128·Σx comes from):
+
+- **tile**: a bsums plane `xbsp : int const?` ([ntok x nb] i32, −128·Σx per (token, block))
+  as the tile's 10th parameter — the tile signature is gen-family-internal (batch wrapper +
+  probes only). The batch wrapper computes it once per call before dispatch (O(ntok·n),
+  noise against the O(ntok·n·d) dots) when the stamped family is biased.
+- **gemv**: mm_rows is a SHARED slot typedef invoked with raw activation planes from the
+  fused decode chain — no plane transport. The block's −128·Σx is computed inline (concat
+  the two 16-byte chunks, one `vpdpbusd(0, splat(128u8), x)` at kernel width,
+  `vector.reduce.add`, negate, splat): ~8 µops per (block, group) against the 24·rq the
+  trick removes — and the gemv is bandwidth-bound anyway (SPR: width-insensitive).
+
+Lockstep: a SIXTH companion `q8q8_wbias_gen() : int` (reference 0, generated = the perm's
+bias, same shared decline) drives the runtime repack — schema `Q8RepackType` gains `wbias`,
+`repack_q8q8_grp` biases the group rows in one extra pass (row-major tails stay unbiased
+for the sdot4x4 tail path, which never reads groups). The batch wrapper's generic token
+tail (`q8q8_token_grp_generic`) un-biases scalar-wise (`w − wbias`). The mx4-&gt;Q8 expand
+(gpt-oss MoE grouped prefill) writes the interleaved branch through a BIASED LUT copy when
+the active stamp is biased (tail loop keeps the unbiased LUT); `KernelBackend` carries
+`q8_wbias` next to `q8_layout` for that activation-time read. The mx4 EMITTER itself is
+untouched (nibble planes and LUT unbiased; biased-LUT fusion is ledger item 4, separate).
+
+Grid: +6 rows — busd 256-mr8/512-mr16 × kstep2 × {plain, gkstep2} biased, a biased
+kstep4_nrsplit2@512 (re-tests the collapse with the preamble gone — the weight-stream
+doubling remains, so it should still lose, but by less), and a bias-on-maddubs
+decline-by-design pin. Emission gates: biased tiles = 96 vpdpbusd / 0 vpsignb / 0 vpabsb /
+0 vpmovb2m; biased gemv gk2 = 24 + 3 vpdpbusd (the per-block-instance bsum dots). Zen2
+declines every biased row (no VNNI); arm64 unaffected.
+
+**Gates (this box, 2026-07-04):**
+
+- **Emission, 29/29 green on the first full run** (10 new bias128 gates): biased 256/512
+  tiles = 96 vpdpbusd / 0 vpsignb / 0 vpabsb / 0 vpmovb2m / 0 vpsubb; biased gemv gk2 = 27
+  vpdpbusd (24 dots + 3 inline bsums); every pre-slice gate unchanged.
+- **The biased busd512-kstep2 hot loop is 138 instructions per 64-dot iteration vs 289
+  unbiased (2.09x, same toolchain/signature)** — the sign trick's 96 SIMD-ALU ops are gone
+  AND an unplanned second win landed: with the sign chain no longer separating them, LLVM
+  folds every per-dot activation splat INTO the dot as an EVEX embedded broadcast
+  (`vpdpbusd -0x30(%rbp,%r14,8){1to16}, %zmm9, %zmm8`) — the 64 standalone vpbroadcastd
+  instructions vanish too. Per-iteration SIMD-ALU 192 -> 96 (64 dots + 32 fold ops, nothing
+  else); the only remaining loop ops are 16 weight loads + 8 acc-init broadcasts + fold.
+  The ALU-bound ceiling roughly doubles; silicon number = next SPR/EPYC session.
+- **das rail (interpreted, host-independent):** biased plane == plain plane ^0x80 on group
+  bytes with tails and scales untouched; the generic token tail's un-bias (the int8 +128
+  involution) is BIT-EXACT against the plain pair.
+- **arm64 regression:** grid 35/35 (all six new rows decline to reference; witness/wbias
+  lockstep asserted per row), gen parity 3 shapes maxdiff 0, slot parity all slots maxdiff
+  0, dasLLAMA suite green. No byte-identity claim this slice — the tile stub gained the
+  xbsp parameter (the DLL cache self-invalidates via per-function AST hashes; grid+parity
+  +suite are the proof instead).
+
+**Ledger (new):** hoist the batch wrapper's per-call O(ntok·n) bsum pass into the
+activation quantizer (a bsums plane in RunState next to xq/xs) — saves one re-read of x
+per biased batch matmul and would let a future gen-internal rows core read plane
+corrections instead of inline ones. Only worth it once bias128 proves out on silicon.
+
+## M4 slice H — SPR silicon (2026-07-04 night, AWS c7i.metal-24xl)
+
+Box: Xeon Platinum 8488C metal, 48C/96T, avx512_vnni + avx_vnni + amx_int8, **no
+avx_vnni_int8** (bssd still unproven on silicon — same as the scout VM). Bring-up = the
+EPYC recipe (clang 18, Ninja, DAS_LLVM_DISABLED=OFF), branch tip `b2985e636` via thin
+bundle. The scout's caution about VM absolutes was right in the other direction: metal
+plain busd512-kstep2 is 105.7 GMAC/s where the scout VM said 88.3.
+
+**bias128 first silicon — everything the emission gates predicted, plus margin:**
+
+- **Grid (DAS_TUNE_MODE=test): 35/35 rows, every row maxdiff 0** (tile+gemv+mx4) —
+  first-ever bias128 execution. All five biased rows live+exact; maddubs-bias declines by
+  design; bssd declines per cpuid.
+- **Sweep: biased busd512-kstep2-gkstep2 tile = 157.9 GMAC/s vs 105.7 plain (+49%)** —
+  above the 120-150 prediction. Biased 256 = 120.5 vs 84.6 (+42%). The biased
+  kstep4_nrsplit2@512 diagnostic = 137.0: still loses to kstep2 (weight-stream doubling
+  remains) but by less (−13% vs −17%), exactly the slice H verdict. GEMV hot: 58.3 biased
+  vs 50.1 plain (+16%); stream stays bandwidth-bound ~10.5. Winner
+  `dot_vpdpbusd_width512_mr16_kstep2_gkstep2_bias128` → spr_manifest.json. (The sweep's
+  tile numbers ride the small tune fixture (d=32); real shapes below are higher.)
+- **The first mr16 production stamp caught a real bug:** `q8q8_token_grp_generic`'s
+  scratch was `float[8]` — the batch token tail crashed (`dim index out of range`) at the
+  mr=16 stamp; no prior box ever stamped mr>8 on production slots. Fix = cap 32 (the
+  grid's max stampable mr, busd512-mr32 row), commit `1b4dacddb`. gen_slot_parity_probe
+  caught it exactly as designed (the kernel-level grid was green; the slot layer wasn't).
+- **Post-fix production gates, all green at the biased mr16 stamp:** slot parity 7/7
+  (maxdiff 0 or ~1e-6 fast-math drift, incl. mx4 legs + row/token tails); parity.das
+  GEN_IDS **byte-identical default-vs-stamp on Llama-1B and gpt-oss-20b** (the mx4 biased
+  LUT expand covered).
+- **Registered A/B (gemm_1core, real shapes, 1 core): x64-gen batch 190-200 GMAC/s vs
+  best hand tier avx512vnni 47-49 = 4.0-4.3× on every shape** (kv/qo/w13/w2); hot-shape
+  gemv (kv 2048×512) 84.4 vs 48.8 (+73%); large-d gemv ~30 vs ~28 (DRAM-bound, as
+  expected). The SPR/VNNI hand-tier class (avx512bw/avx512vnni/vnni256*) is now covered
+  on the deletion scoreboard.
+
+**Small-fleet yardstick vs llama.cpp built WITH AMX (the requested ceiling; amx.cpp.o
+compiled under -march=native, amx_int8 live).** Method: emission_bench -p 512 -n 64
+--nprompts 4 back-to-back with llama-bench -p 512 -n 64 -r 1 per model;
+das pp = 512000/(ttft − 1000/emit). das = x64-gen biased-mr16 stamp everywhere
+(proof-of-consumption line checked per run).
+
+| model | T=24 pp das/lcpp (ratio) | T=24 emit (ratio) | T=48 pp (ratio) | T=48 emit (ratio) |
+|---|---|---|---|---|
+| SmolLM2-135M | 5376 / 13324 (0.40) | 105 / 440 (0.24) | 4910 / 13054 (0.38) | 106 / 342 (0.31) |
+| Qwen3-0.6B | 3185 / 3313 (0.96) | 120 / 210 (0.57) | 3127 / 4587 (0.68) | 104 / 176 (0.59) |
+| gemma-3-1b | 1904 / 3233 (0.59) | 62 / 123 (0.51) | 1895 / 3149 (0.60) | 57 / 115 (0.50) |
+| Llama-3.2-1B | 2401 / 2601 (0.92) | **119 / 117 (1.02)** | 2819 / 3584 (0.79) | 109 / 123 (0.88) |
+| Qwen3-4B | **700 / 683 (1.03)** | 32 / 39 (0.84) | 849 / 957 (0.89) | 33 / 39 (0.84) |
+| gpt-oss-20b MoE | **317 / 311 (1.02)** | **54 / 50 (1.09)** | 357 / 459 (0.78) | 53 / 57 (0.94) |
+
+Reading: SPR lcpp is a different animal from Zen2 lcpp — AMX int8 GEMM + zmm-vnni repack
+make its prefill scale where Zen2's stayed flat. At T=24 das is parity-to-win on ≥1B
+dense and the MoE flagship (**gpt-oss: pp 1.02 AND emit 1.09 — we beat the AMX build
+end-to-end at the knee**; Qwen3-4B pp 1.03; Llama-1B emit 1.02). At T=48 lcpp keeps
+scaling while das sits at its knee (the known high-lane regime: das T48 ≈ T24 on every
+model here) — same defaults-vs-knee shape as EPYC, now against a stronger ceiling. Tiny
+models remain the dispatch story (135M: pp 0.40, emit 0.24-0.31; the 2M par threshold
+single-lanes every non-cls matmul — queued per-lane-regime work, NOT kernels: the A/B
+above has gen 4× ahead kernel-to-kernel). gemma-3-1b (0.5-0.6 across the board) is the
+one dense outlier — 262k vocab cls + pre/post-norm gates fused decode off; worth a
+per-op profile next session. AMX as a Tier-3 generator family: the 135M prefill column
+(13.3k t/s) is what AMX tiles buy on cache-resident weights — that's the number a
+dot=amx_int8 family would chase.
+
+## SPR silicon session 2 (2026-07-05, c7i.metal-24xl respin) — dispatch-arc validation + AMX scout
+
+Respin from the baked AMI at `5f3d80928` (work-proportional dispatch + worker limit + per-op
+rank gate). 75-cell paired sweep — 15 models × T{8,16,24,32,48}, gate-on, biased busd512-mr16
+manifest stamp, vs the same lcpp-AMX build, prefill AND emit per cell:
+
+- **Fleet emit mean 0.87 vs the AMX build** (zen2's 1.01 parity was vs plain AVX2). The two
+  dispatch regimes from session 1 moved: 135M emit ratio 0.24 → 0.70–0.92 with the T-collapse
+  gone (peaks T16, T48 ≈ T24); ≥1B dense wins/ties prefill everywhere ≤T24 (Mistral-7B
+  1.02–1.10, Llama-8B 1.03–1.10, Phi-3.5 1.05–1.06); **gpt-oss beats the AMX build outright
+  (pp 1.38 @T8, 1.16 @T16; emit ≥ 1.00 T16–T32)**. Llama-1B reproduces session 1's knee
+  numbers exactly (emit 1.02 @T24).
+- **Rank gate promotion evidence complete**: T48 A/B — 135M **+48%** (317.5 vs 214.2), 1B
+  neutral. With zen2's +10%/neutral: no observed regression on server cores, both boxes.
+- **Affinity/placement exonerated**: pin-one-per-physical-core null (48W lands right by
+  itself), spread-rank NEGATIVE on single-socket SPR → experiment retired (zen2 null + SPR
+  negative). Residual T48-vs-T8 emit tax (~7%) ≈ active-core turbo physics, not scheduling.
+- **AMX scout (single core, userland)**: enable = `arch_prctl(ARCH_REQ_XCOMP_PERM,
+  XTILEDATA)` + `ldtilecfg`, no kernel help needed. TMUL reg-resident **3546 GMAC/s = 22×
+  the biased-busd512 tier**; tile-load-fed 2175 @1MB / 579 @32MB / 196 GMAC/s @512MB
+  zero-reuse. Verdict: **prefill/batch family** (transformative under tile reuse,
+  break-even for zero-reuse GEMV streaming). Emitter path is unblocked das-side:
+  `LLVMX86AMXTypeInContext` is already in bindings/llvm_func.das:374 and llvm_boost has
+  name-based intrinsic lookup — `llvm.x86.tdpbssd.internal` & co. reachable with zero C++.
+- **Per-op decode leads (decode_prof @T24)**: Qwen3-0.6B — attn_chain 50–54% of time vs
+  ~36% traffic share (28 deep-thin layers + per-head QK-norm; dispatch-bound, not
+  bandwidth). gemma-3-1b — the un-fused decode path runs mm_qkv (24% time) + mm_wo (15%)
+  fully INLINE, 0 dispatches (fused-decode gate off for its pre/post-norm pattern);
+  classifier 9% time / 30% traffic. Both are das-side dispatch-shape fixes.
+- Raw logs + results page archived Mac-side; sweep rig `~/spr_sweep.sh` baked into the box
+  home dir (survives in the next AMI if re-baked). gemma-4-12B / Qwen1.5-MoE GGUFs could
+  not be re-fetched byte-exact — provenance hunt is a prerequisite before the AMX session.
+  (RESOLVED 2026-07-05: bartowski/gemma-4-12B-it-GGUF + RichardErkhov/Qwen_-_Qwen1.5-MoE-
+  A2.7B-Chat-gguf, both HEAD-verified byte-exact — the fetches lived in the wave3-gemma4
+  worktree session transcripts.)
+
+## M4 slice I — the AMX tile family (DESIGN, 2026-07-05, off-box)
+
+**Slot scope: the batch tile only.** Scout verdict stands — TMUL is a prefill/batch family
+(reg-resident 3546 GMAC/s = 22× the biased-busd512 tier; 196 GMAC/s at DRAM zero-reuse =
+GEMV break-even). gemv/mm_rows slots stay vector.
+
+**The layout is already ours.** TDPBSSD wants B[k-group][4·n+j] (VNNI 4-byte interleave) —
+that is byte-for-byte the `grp<mr>` plane at mr=16: `repack_q8q8_grp` writes
+`[kg][r][4 bytes]` per row-group, so one 32-k block's 8 k-groups are a contiguous 512-byte
+region per group (`tileloadd64(rows=8, colsb=64, ptr=gbase + b·512, stride=64)`). ZERO new
+repack. The A side tile-loads straight off the activation plane
+(`tileloadd64(rows=ntok_tile, colsb=32, xqp + t0·n + b·32, stride=n)`) — no activation
+repack either. AMX is s8·s8 native: **wbias must be 0** (no sign trick to delete; bias128
+is busd-only).
+
+**Per-block scale fold (the Q8_0 constraint).** Q8's fp32 scale is per 32-k block, so C
+cannot accumulate i32 across blocks. K-step = ONE block (A colsb=32, B 8×64): per block,
+`tdpbssd` then fold `C_i32 → acc_f32` with the rank-1 scale product (per token row t:
+`acc[t][·] += cvt(C[t][·]) · (xs[t][b] ⊗ ws_vec[b])`; ws is already block-interleaved
+mr-contiguous in the grp plane's scale region — one zmm load). Fold cost ≈ 1KB tilestored +
+16 zmm FMAs per C tile per block vs 8192 MACs — ~3-6%. This is the same structure lcpp's
+amx path uses. `tilezero` re-arms C. (Deferred fold via kstep>1 is unsound across scale
+boundaries — kstep stays 1 in perm terms.)
+
+**Macro-kernel = 2×2 tiles, exactly 8 tmm.** A0,A1 (two 16-token tiles) × B0,B1 (two
+adjacent grp16 row-groups, plane offset +16·n) → C00..C11: 4 tdpbssd per 2A+2B loads —
+double weight-tile reuse, 32 tok × 32 rows per k-block. Perm mapping: `dot="amx_int8"`,
+mr=16 (the layout), nrsplit=2 ≙ row-group count, kstep=1 pinned; declines = new cpuid tier
+`amx_int8` (leaf-7 EDX bits 24/25 tile+int8) + geometry (probe fixtures need ntok≥32 rows
+d≥32). Token/row tails ride the existing generic tail machinery (scratch cap 32 holds:
+token tail is per-16-token slabs).
+
+**Enable is part of the witness.** `q8q8_family_live()` for an amx stamp: cpuid amx_int8
+AND `arch_prctl(0x1023, 18) == 0` — call libc's `arch_prctl` as a JIT-resolved external
+symbol (Linux-only by construction; anything else declines). Zero C++ holds:
+`LLVMX86AMXTypeInContext` is bound (bindings/llvm_func.das:374), intrinsics by name via
+`LLVMLookupIntrinsicID` (`llvm.x86.tileloadd64.internal`, `tdpbssd.internal`,
+`tilestored64.internal`, `tilezero.internal`); the `.internal` forms use virtual tile
+values — LLVM's X86 codegen-prep (x86-lower-amx-type + fast tile config) inserts
+`ldtilecfg` itself under `+amx-tile,+amx-int8`. (Assumption to re-verify at emission: the
+dasLLVM JIT pipeline runs codegen-prep exactly like llc — the scout numbers suggest yes.)
+
+**The one real design fork — the plane bias conflict.** One backend = one repack: an amx
+stamp needs the grp plane UNBIASED, but the current SPR winner biases it for the busd512
+gemv (`gkstep2_bias128`). The batch-backend hybrid can't bridge it (biased vs plain planes
+are layout-INcompatible donors). Resolution candidates, in order: (a) amx backend owns the
+box with plain plane + sign-trick busd512 gemv — costs nothing IF SPR gemv is truly
+bandwidth-bound (biased-vs-plain GEMV delta on SPR = **the first measurement of the AMX
+session**, the slice-H logs have both rows); (b) per-slot wbias (grp plane biased, a
+second UNBIASED grp16 copy of only the batch-hot tensors — memory cost); (c) per-slot
+perms manifest split (ledger 5 — AMX is its forcing function either way).
+
+**Emission gates (M1, before any silicon):** `--jit-target=x86_64-…` +
+`DAS_JIT_X64_FORCE_FEATURES=+amx-int8,+amx-tile` → llc/objdump gates in
+`gen_x64_emission_check.sh`: per-block loop = 1 tileloadd(A) + 1 tileloadd(B, cached across
+token tiles) + tdpbssd count = tiles, 1 tilestored + 16 vcvtdq2ps/vfmadd per C per block,
+ldtilecfg present once per kernel entry, ZERO vpsignb/vpabsb anywhere in the tile body.
+Grid rows: amx 1×1 (probe shape) + 2×2, decline-by-design everywhere off-SPR; semantics +
+tune sweep = the AMX respin session (prereq GGUFs now resolved, see above; chase target =
+lcpp-AMX 135M prefill 13.3k t/s cache-resident).
+
+### Slice I RESULTS (2026-07-05, emission M1 Max — silicon = the SPR respin session)
+
+**Shipped as designed, emission-proven.** `dot="amx_int8"` perms (width=512, mr=16, kstep
+pinned 1, bias=0, nrsplit ≙ tiles per macro side ∈ {1,2}): `emit_amx_tile` builds the TMUL
+macro exactly as specified — per 32-k block nt B `tileloadd` straight off the grp16 plane
+(bi·512, stride 64 — zero new repack held), nt A `tileloadd` off the activation rows
+(stride n), nt² `tilezero → tdpbssd → tilestored`-to-scratch, then the 16-row cvt·ws·splat(q)
+fold — with **yp as the k-loop accumulator** (registers can't hold 32×32 f32): the tile
+zero-inits its own y region, which doubles as the idempotence guarantee for the wrapper's
+overlapped token-tail call.
+
+**The call-contract decision the design left open:** the 10-param tile stub is kept, but an
+amx stamp covers 16·nrsplit tokens × nrsplit groups per call — so the stamp gained an
+**EIGHTH companion, `q8q8_tokstep_gen()` (reference 4; amx 16·nrsplit)**, and the batch
+wrapper walks (token, group) space off it: full-macro calls; token tail = ONE overlapped
+macro call at `t0 = tbe−ts` (idempotent per the zero-init); batches shorter than one macro
+and leftover row-groups (d 16-but-not-32-multiples) ride the vector rows-core per token
+(q8q8_gemv_gen — under an amx stamp that is the busd512 lattice, so no scalar-generic cliff);
+TB clamps up to one macro. Probes walk per-variant via the tokstep registry; tile fixtures
+grew to ntok=32 (one full 2×2 macro, divides every other row's step).
+
+**The plane-bias fork resolved as (a) for now:** amx stamps keep the plane UNBIASED and the
+vector companions (gemv/mx4) remap `amx_int8 → vpdpbusd` (`companion_perm`) — the plain
+sign-trick busd512 lattice over the same grp16/kg4 plane. The biased-vs-plain gemv delta on
+SPR (slice-H logs have both rows) stays the first measurement of the silicon session; if
+biased gemv matters, per-slot perms (option c) is the escalation.
+
+**Enable-as-witness:** the amx witness emits `syscall(SYS_arch_prctl=158, 0x1023, 18) == 0`
+(glibc exports no arch_prctl wrapper — libc `syscall(2)` as the JIT-resolved symbol);
+perm_declines gates `g_target_os_linux` (new llvm_jit_common flag: host platform / triple OS
+field) + new tier `g_target_x64_amx` (cpuid names `amx-tile`/`amx-int8` added to
+das_cpu_supports, hyphen-spelled = LLVM feature spelling so force-env and llc -mattr take the
+same names; XCR0 tile bits 17/18 gate them).
+
+**Gates (all green first run, except one symbol-anchor fix):** `gen_x64_emission_check.sh`
+48/48 — amx 2×2 tile = 4 tdpbssd / 4 tileloadd / 4 tilezero / 4 tilestored / 64 vcvtdq2ps /
+0 sign-trick ops; 1×1 = 1/2/16; **ldtilecfg hoisted to entry + tilerelease at exit (NOT
+per-block — the fast-tile-config placement question answered at llc level)**; gemv-under-amx
+= 24 dots/24 abs/0 psign/0 tile ops; mx4-under-amx = 8 pshufb/8 dots; witness = 1 callq
+(zero-arg witnesses carry no mangled-signature suffix — symbol anchor is '>'). All 29
+pre-amx gates unchanged-green (the vector emitters are IR-untouched); arm64 emission script
+unchanged-green; native test grid 44 rows green (amx rows stamp + decline to reference on
+M1); jit_tests 312/312.
+
+**Queued for the SPR respin session:** grid semantics on silicon (maxdiff vs the grp4
+oracle), the enable path (witness syscall on a real kernel), tune sweep (amx vs biased
+busd512 — chase lcpp-AMX 13.3k t/s 135M cache-resident prefill), the biased-vs-plain gemv
+fork measurement, batch-wrapper tail/overlap validation at real prompt lengths, and
+in-proc-JIT ldtilecfg placement confirmation (llc-level is entry/exit; same backend passes
+should hold).
+
+### Slice I SILICON (2026-07-05, SPR session 3, c7i.metal-24xl 8488C) — correct everywhere, kernel-iso win, END-TO-END LOSS
+
+**Correctness: everything green on first silicon.** cpuid names live; test grid 44 rows with
+all 3 amx rows LIVE, tile maxdiff 0 vs the grp4 oracle; slot parity 7/7 maxdiff 0 under an
+amx manifest (incl. the ntok=5 sub-macro gemv path); oracle parity (simple_ids) Llama-1B
+40/40 token-for-token under the amx stamp on BOTH a 5-token prompt (sub-macro) and a
+26-token prompt (full macro + the overlapped tail — the idempotence path); suite 204/204 on
+box. One REAL bug found by silicon (`2c435a39e`): the first-ever amx tune run SIGILL'd on
+its first tdpbssd — tune_mode_run invoked stamped tiles directly, and the witness IS the
+per-process XTILEDATA grant (test mode was green only because its lockstep checks invoke
+every witness). Production is safe (selection evaluates the witness); the harness now
+consumes witnesses up front.
+
+**Tune sweep (single-core, d=512 fixture): amx WINS kernel-iso** — 1×1 macro 191.2 GMAC/s /
+2×2 157.9 vs biased busd512 156.4 (+22% for 1×1; note 191 ≈ the scout's DRAM-fed ceiling
+196, i.e. the fixture regime is memory-fed, not the 3546 ALU regime).
+
+**End-to-end (emission_bench, T24): amx LOSES — badly.** 135M pp 5477 (biased busd512) vs
+3259 (amx 1×1) / 2462 (2×2); 1B pp 2413 vs 979/1080. T8 discriminator (1B): 0.64× vs 0.41×
+at T24 ⇒ the loss is BOTH structural (~1.6× at low T) and scaling-amplified (AMX frequency
+license / memory contention at 24C). The production regime is DRAM-streamed and
+fold-bounded — TMUL's ALU advantage has nothing to cash against (consistent with lcpp-AMX
+shining only cache-resident). **Verdict: the amx leg stays grid-resident; biased busd512
+keeps the SPR manifest.** Do not revisit end-to-end amx on SPR without a structural change
+(deeper B-residency / cache-resident scheduling); next look = a different AMX box class
+(Granite Rapids) or the cache-resident-serving regime.
+
+**The bias fork (first measurement, single bracket, both gkstep2 — the clean A/B):** biased
+busd512 beats plain +2.6% emit / +26% pp (1B), +8.0% emit / +18% pp (0.6B). bias128 pays on
+BOTH sides, so fork option (a) costs real decode under an amx stamp — moot on SPR (amx isn't
+the driver), but per-slot perms remains the escalation if any box ever flips the amx
+end-to-end verdict.
+
+**🔑 TUNE-METHODOLOGY FINDING (needs a decision):** the single-core tile microbench CROWNED
+amx nrsplit1 — `tune_for_this_box` on SPR would write a manifest that loses ~2× end-to-end.
+First-ever divergence between the tune fixture regime (1-core, cache-warm reps) and
+production (multi-core, DRAM-streamed); vector rows never diverged. Candidate fixes:
+a multi-core/streaming tune leg, an end-to-end confirm pass in the tuner, or an eligibility
+rail demoting tile-family rows that need cache residency.
+
+**→ RESOLVED (2026-07-05, Boris picked the e2e confirm pass; SHIPPED same day):**
+`tune_mode_run` no longer writes a divergent crown blind. After the merged winner is picked:
+(1) a compile-only child (`GEN_TUNE_COMPILE_ONLY=1`, `DAS_TUNE_MODE=normal`, no manifest)
+prints the `llvm_tune: q8q8_tile_gen <- … (fallback)` stamp line — the per-ISA fallback this
+box would resolve to; (2) winner == fallback ⇒ write as before (the common case, zero new
+cost beyond the child compile); (3) winner ≠ fallback ⇒ the challenger must BEAT the fallback
+in a real-model prefill A/B — `harness/tune_confirm_prefill.das` children (512-tok synthetic
+prefill, production stamps + box_profile knobs, `_jit_fast_math` parity), interleaved F/W ×2
+best-of, challenger needs > ×1.02, wrong-stamp or crashing child scores 0 (a SIGILL-ing
+manifest-forced stamp = a rejection, by construction) — winner confirmed ⇒ written, else the
+FALLBACK is pinned explicitly (clears stale entries). No `DASLLAMA_CONFIRM_MODEL` env set ⇒
+the divergent crown is NOT written and the run says how to confirm. First live run (M1 Max,
+135M): the microbench crowned `kstep4_nrsplit2_mr8_gkstep4` (the slice-B +3.3% iso shape) but
+e2e it made only +2.0% (4328 vs 4244) — under the bar, kstep2 pinned. The guard bites on its
+first outing: iso wins shrink e2e, and sub-2% doesn't displace a fleet-proven default. On SPR
+this same pass would have rejected the amx crown at ~0.5× emphatically.
+
+**The arch ladder (Boris's ask, same session — full CSV in the session scratchpad):** 4 models
+× 3 ISA tiers × both engines × T{8,24}, both engines genuinely tier-limited (das: explicit
+host-triple + DAS_JIT_X64_FORCE_FEATURES + per-tier manifest — the cross-triple rail executes
+natively, proven; lcpp: per-tier clang builds, amx = native). pp512 @T24, avx2→vnni→amx:
+das 1952→3058→1237 / lcpp 1378→1781→3387 (0.6B); das 1268→2369→1314 / lcpp 861→904→2556 (1B);
+das 1276→1931→897 / lcpp 989→1197→2874 (gemma-3-1b); das 338→688→324 / lcpp 228→259→716 (4B).
+READING: the engines climb in different places — das gains 1.9-2.4× from the VNNI step
+(bias128 busd512) and nothing from amx; lcpp gains 1.1-1.3× from VNNI and 2.3-2.9× ONLY from
+the AMX unit. **das-on-VNNI ≈ lcpp-on-AMX within 8-15% on 3 of 4 models** (gemma = their
+standout amx case, 1.49×); same-tier head-to-head das wins prefill 1.4-2.8× everywhere.
+Decode is tier-insensitive for both (bandwidth-bound); lcpp's amx-build +11-15% emit is the
+packed VNNI weight LAYOUT feeding their m=1 vector fast path, not tile ops. das ladder emit
+carries a ~13% generic-CPU-scheduling handicap (no -mcpu on cross triples) — within-engine
+shape honest, cross-engine decode ratios come from native runs (session-2 sweep: parity-ish).
+
+**lcpp AMX source read (why theirs wins where it wins; mmq.cpp):** same 2×2 macro geometry,
+same per-block C spill + fold — but the fold is SOFTWARE-PIPELINED (double-buffered C scratch,
+block i−1's AVX-512 fold interleaves between block i's TMUL ops, :2015-2105), ldtilecfg is
+thread_local once-per-thread, decode never touches tiles (m=1 = vnni fast path over the
+packed layout), and their GENERIC path chunks matmuls 2-D (out-rows × tokens, rows-fastest
+linearization, ggml-cpu.c:1388-1442) — the chunk-starved-shape remedy now on OUR ledger
+(2-D batch chunk space; amx fold pipelining ledgered as conditional).
+
+**Flash-decode deep-ctx on SPR (the queued zen2 soft-spot check):** Qwen3-0.6B ctx2048 T24
+emit 79.4 fused vs 50.6 per-op = **+57%** — zen2's −5% does not reproduce; SPR follows M1's
+direction with margin. (The env rail toggles the whole chain — a FLASH_DECODE_SLICE env for
+slice-only A/Bs is a ledger nit.)
+
+## M4 slice J — the smmla leg (dot="smmla", i8mm; DESIGN 2026-07-05)
+
+**Slot scope: the batch tile.** SMMLA is a 2×2 MMA — `acc[i][j] += a_row_i · b_row_j` over 8
+k-bytes, 32 MACs/instr, no horizontal reduce; the M3 scout measured 2.21× sdot4 GMAC/s
+register-resident ([[dasllama-m3-air-box]]). The 2×2 shape needs two tokens per A operand, so
+the tile (nrsplit 2/4, both even) is the natural client; the GEMV slot (one token) would waste
+half the MMA and stays on the sdot lattice.
+
+**The layout is NOT ours this time — kgroup=8.** smmla's B operand is a ROW-PAIR × 8 k-bytes
+in one q-reg; the grp<mr> plane's dword groups ([kg4][r][4b]) put those bytes in four places.
+Marshalling in-kernel (zip per weight vector, no reuse across anything but the 2 token pairs)
+costs ≈ the MMA advantage — counted it: mr8 break-even, mr4 worse. So the perm carries a
+second layout axis: **kgroup** — bytes per row per k-group. kg8 = `[kg8][r][8 bytes]`, B
+operands become straight 16-byte loads (the scout probe's exact layout), and the marshalling
+moves to load-time repack where it belongs. `Q8RepackType` gains `kgroup` (4 default), the
+stamp gains a SEVENTH companion (`q8q8_kgroup_gen`, reference body 4), and the runtime repack /
+token-tail generic / mx4→Q8 expand map all branch on it. The batch wrapper's mr==4 laneq token
+tail additionally gates on kgroup==4 (an smmla mr4 stamp's plane is kg8 — the generic tail
+reads it instead).
+
+**The block emitter (emit_block_smmla).** Per 32-k block: 4·(mr/2) straight B loads
+(`bi·mr·32 + g·8·mr + rp·16`); A operands from the token chunk loads via 4 byte-shuffles per
+token pair (zip1/zip2.2d shapes — `[0..7,16..23]` / `[8..15,24..31]` masks, reused across all
+row pairs); MMA lattice `m[tp][rp] = smmla(m[tp][rp], A[tp][g], B[g][rp])`; then a per-block
+2-shuffle i32 transpose per (token pair, row quad) — `[0,1,4,5]`/`[2,3,6,7]` = uzp1/uzp2.2d —
+back into the token-major `a[token][rowquad]` accumulators, so the per-block scale fold and
+the store machinery are byte-for-byte the existing ones (fold order preserved → the one grp4
+oracle still serves). Register budget is the sdot formula unchanged (w 2mr + acc nrsplit·mr/4
++ act 2·nrsplit + 2): smmla admits exactly the sdot (mr, nrsplit) space — mr4/nr4 22,
+mr8/nr2 26 regs. Op-count sizing per mr8/nr2 block: 16 B loads + 4 x loads + 4 zips +
+16 smmla + 4 uzp vs sdot's 20 loads + 32 sdot — ~1.3-1.4× ALU-side expected at the kernel
+(the 2.21× is the no-marshalling ceiling; fold + A-pairing eat the rest). A-side pre-pairing
+at quantize time would drop the 4 zips — ledger, only if silicon says the zips show.
+
+**Companions under an smmla perm.** GEMV: sdot lattice over the kg8 plane — per (kg8 g,
+row quad): two pair-loads + uzp1/uzp2.4s reassemble the two kg4-shaped sdot vectors
+(`[r0k0-3,r1k0-3,r2k0-3,r3k0-3]`), the lattice above the loads untouched; GEMV is DRAM-bound,
+the extra uzp is hidden. mx4: the nibble plane is kgroup-independent ([j][r][4b], its own
+repack) — the mx4 emitter forces the sdot lattice (i8mm implies dotprod), zero change. wbias:
+smmla is s8·s8 native, bias128 declines (vpdpbusd-only rail already says so).
+
+**Declines (the shared predicate, one new leg):** dot="smmla" → aarch64 + width 128 + mr%4==0
+(row-quad transpose + gemv fixup) + bias==0 + **g_target_arm64_i8mm** + smmla intrinsic decl
+(+ tbl1, the mx4 lockstep rail). The new tier flag: host targets read
+`LLVMGetHostCPUFeatures()` for "+i8mm" (populated on Linux aarch64) OR'd with
+DAS_JIT_ARM64_FORCE_FEATURES (the macOS story — LLVM's host-features string is empty there, so
+the env is the rail on Apple silicon, same string on emitter box and target box = DLL cache
+key match, the slice's whole no-linker-on-target recipe). `requires = "i8mm"` eligibility in
+the fallback chain reads both env rails (llvm_tune is macro-context — no cpuid for arm, the
+env IS the truth there).
+
+**Gates.** M1 cannot execute smmla (dotprod only): emission proof =
+`gen_arm64_emission_check.sh` (the slice F script's arm64 twin — native triple + forced
++i8mm, compile-only + --jit-dump → llc -mattr=+dotprod,+i8mm → objdump; per-variant gates:
+tile smmla counts exact (mr8/nr2/kstep2 = 96), zero sdot in the smmla tile body, gemv = sdot
+16 + uzp 16 + zero smmla, mx4 rides tbl). Semantics + tune = the M3 Air (`ssh air`,
+[[dasllama-m3-air-box]] recipe: compile grid on M1 under the forced env, rsync
+.jitted_scripts + sources, cache-hit there). kg8 repack + generic-dot correctness is pure das
+— unit-tested on M1 (no i8mm needed). Fallback-chain promotion (`dot_smmla_…;kstep2` with
+requires="i8mm") waits for the Air tune verdict, same discipline as bias128.
+
+### Slice J RESULTS (2026-07-05, emission M1 Max / silicon M3 Air)
+
+**Shipped as designed**: kgroup axis end-to-end (schema + 7th companion + repack + token
+generic + batch-tail gate + mx4→Q8 expand remap + tune-probe lockstep + KernelBackend cache),
+DOT_SMMLA emitter, kg8 sdot fixup, `g_target_arm64_i8mm`, `GEN_TUNE_COMPILE_ONLY` mint gate.
+M1: emission gates ALL GREEN (tile mr8 = 96 smmla / 0 sdot, mr4 = 48/0; gemv 16 sdot + the
+kg8 fixup folded to **ld2.4s structured de-interleave loads** (7 ld2 + 1 uzp pair = 16
+vectors — better than the predicted 8 uzp pairs, the de-interleave rides the load unit; the
+gate checks the invariant 2·ld2+uzp1+uzp2 == 16); tile body histogram exactly the design
+budget: 96 smmla + 24 zip2.2d + 24 mov.d A-pairs (4/block) + fold). x64 emission gates
+unchanged-green (the emit_block/fold refactor is IR-neutral); suite 204/204 (+4:
+test_kgroup_repack), jit_tests 312/312, gen_tune_probe test grid green with all 5 smmla rows
+declining to ref on M1.
+
+**M3 Air silicon**: grid test — all 5 smmla rows LIVE on kg8 planes, tile maxdiff 0 vs the
+grp4 oracle (kstep2 rows bit-exact), gemv/mx4 in tolerance; the no-linker cache-hit recipe
+worked (one DLL serves test+tune — the grid stamps identically in both modes). Tune table
+(single-core, interleaved best-of-6, no thermal gradient — the ~106 reference rows are flat
+across the run):
+
+| family | tile (n2048 d512 t64) | gemv hot | gemv stream |
+|---|---|---|---|
+| sdot kstep2 (mr4, M1's default) | 159.0 | 85.6 | 59.7 |
+| **sdot kstep2_nrsplit2_mr8 (air winner)** | **162.9** | **91.2** | 59.7 |
+| smmla mr8_kstep2_nrsplit2 (best MMA row) | 130.6 | 84.3 | 59.5 |
+| reference / declined x64 rows | ~106 | ~85.6 | ~59.7 |
+
+**Verdict — M3 runs smmla on ONE NEON pipe.** 130.6 GMAC/s ÷ 32 MACs = 4.08 G MMA/s ≈ 1/cyc
+at the ~4.05 GHz P-core: the tile sits at **100% of the 1-pipe MMA ceiling** (marshalling
+fully hidden — the emitter has nothing left to give), while sdot issues ~2.45/cyc across 4
+pipes. 1 pipe × 32 MACs < 4 pipes × 16 MACs, structurally. The scout's 2.21× was the
+LOAD-BOUND ratio (half the byte traffic per MAC at equal loads), not ALU truth — the tile
+amortizes loads differently and the pipe asymmetry dominates. **No fallback-chain change**
+(sdot keeps arm64; the air box manifest crowned `kstep2_nrsplit2_mr8` — an sdot row). The
+smmla leg stays grid-resident + requires="i8mm"-gated for server arm64 (Neoverse V1/V2 /
+Graviton3+ issue smmla 2-4/cyc — there the same stamp should flip the verdict; the tune
+framework decides per box, which is the whole point).
+
+Air-box operational gotchas recorded in [[dasllama-m3-air-box]]: `modules/dasLLAMA/.das_module`
+is a DOTFILE — a `rsync dir1 dir2` ship misses it and every `dasllama/*` require fails
+"file not found" (ship it explicitly); `-dasroot` doesn't substitute for it.
+
+## M4 slice K — the AMX fair shot (PLANNED 2026-07-05, Boris; build post-/clear)
+
+**The call (Boris): the pipelined fold is THE bet — "if I were to do 1 thing, I would do
+this". Not budget-constrained; the discipline is single-variable clarity over gradient
+search — every item lands as an independently toggleable arm so each on-box number names
+its cause.** Source truth re-read 2026-07-05 (lcpp mmq.cpp); four deltas vs our slice-I leg:
+
+- **I4 — software-pipelined fold (build FIRST, the bet).** lcpp mmq.cpp:2008-2105:
+  double-buffered C scratch (TileC0/C1 swap), block i−1's AVX-512 i32→f32 scale fold
+  interleaved BETWEEN block i's tdpbssd ops — vector ports fold while TMUL crunches. Same
+  fold cadence as ours (their TILE_K=32 = one Q8 block = our kstep 1); ours simply stalls
+  TMUL during every fold. Delivery: additional `[tune_perm]` rows (`…_pipelined`), NOT a
+  rewrite of the serial rows — the grid A/Bs serial-vs-pipelined on-box as a pure
+  single-variable comparison, and the e2e confirm pass guards the crown. Upside is ON TOP
+  of the 1-core win (191 vs 156 already absorbed the serial-fold cost).
+- **I1 — tile-config latch.** lcpp mmq.cpp:204: `thread_local bool done`, ldtilecfg once
+  per thread, NO tilerelease anywhere. Ours: cfg+release per macro call — the release
+  forfeits TMUL state and may bounce the AMX frequency license; invisible at 1 core,
+  compounds at T24. Emitter: thread-local once-latch, drop tilerelease. Small.
+- **I2 — 2-D grid on the amx arm.** lcpp mmq.cpp:2472: MB×NB grid of 32-tok × 32-row
+  blocks, flattened (even balance211 split suffices at that density). Our amx arm is 1-D
+  over ngu=ng/gs — 135M qkv = 18 chunks for 48 lanes, twice as starved as the vector walk
+  the batch_grid_2d work just fixed. Mechanical: extend matmul_grid + cell decode to the
+  ts≠4 walk (ts-token × gs-group cells); rides the same batch_grid_2d pin. Small.
+- **I3 — biased-plane unification (kills the slice-I bias fork).** lcpp packs ONE buffer
+  serving both regimes: s8s8 tiles + per-block compensation row (s8s8_compensation :770)
+  so m=1 rides u8s8 VNNI. Our mirror: plane w^0x80 (bias128), tile fold subtracts 128·bsum
+  in the FOLD STAGE (xbsp is already the tile's 10th param; keep tilezero — pure AVX-512
+  arithmetic on the C scratch), companions remap to BIASED busd. One plane, both slots
+  optimal; the measured plain-busd gemv penalty under an amx stamp (+2.6-8% emit,
+  +18-26% pp on the busd A/B) goes away. Medium.
+- (noted, deferred: lcpp M∈2..15 = tile sub-blocks, M==1 = 64-row VNNI walk; our
+  short-batch per-token gemv fallback is the only remaining gap — minor.)
+
+**Build order: I4 → I1 → I2 → I3, all emission-proven on M1 first** (x64 emission check
+counts + native grid maxdiff + suite + oracle parity — amx rows decline on M1, emission
+gates still prove the asm). **Then the SPR respin (ami-067fe7f4a0b6c2be5), on box until
+we're happy:** P1 frequency probe (turbostat: das-amx / das-vnni / lcpp-amx @T24 — decompose
+the license component of the 1-core-win/e2e-loss inversion); P2 dispatch probe (team-prof +
+per-op on an amx-stamped pp run — quantify the 18-chunk starvation); then the A/B ladder —
+each arm in isolation, then cumulative — re-run the arch-ladder row, flip or permanently
+close the amx verdict with attributable data. Piggyback: vector-walk batch_grid_2d pin A/B
+(zen2 winner = wave-aligned knob 2), the confirm pass's SPR outing, and bake a FRESH AMI at
+session end (box_profile + simple_ids + manifest included — session 3's died with the
+instance).
+
+### Slice K BUILT (2026-07-05, M1 emission-proven — silicon adjudication = the SPR respin)
+
+All four arms landed as independently toggleable perm axes; the serial slice-I rows are
+byte-identical controls. New grid rows: `…nrsplit2_pipe1`, `…nrsplit2_latch1`,
+`…nrsplit2_bias128` (isolation) + `…nrsplit2_pipe1_latch1_bias128` (cumulative). Gates:
+x64 emission 81/81 (llc cross-compile counts), arm64 emission unchanged-green, M1 native
+grid 48 rows lockstep (all 4 new rows decline cleanly off-silicon), suite + 1B parity green.
+
+- **I4 `pipe=1`** — double-buffered C spill (2×nt² tile regions, one alloca), peel block 0
+  compute-only, steady-state loop folds block bi−1 from C[pre] textually between block bi's
+  tile ops (buffer swap via head phis; exit block folds the final spill off the post-swap
+  cPre). Emission: 8 tdpbssd / 8 loads / 8 zero / 8 spill / 128 fold cvts; disasm shows
+  ~115 vector-fold instructions sitting between consecutive tdpbssd chains — the lcpp
+  cadence (mmq.cpp:2008-2105) verbatim.
+- **I1 `latch=1`** — implemented as the RAW immediate-tmm intrinsics (`llvm.x86.tdpbssd`
+  etc.), NOT the `.internal` SSA form: the backend's fast-tile-config insertion
+  (entry ldtilecfg + exit tilerelease) has no C-API off-switch, and raw ops are exactly
+  lcpp's user-managed mode. Fixed register plan C=tmm0-3 (r·nt+ts) / A=tmm4-5 / B=tmm6-7 —
+  bonus over `.internal`: LLVM's RA was serializing all four C chains through one tmm4.
+  Config = NINTH companion `q8q8_amx_cfg_gen` (`() : void`; latch rows emit one LDTILECFG
+  of a 64-byte private-constant palette, every other row a bare ret), called by the batch
+  wrapper ONCE PER CHUNK — per-chunk beats a thread-local latch on plumbing (no TLS-in-JIT
+  risk, no worker identity needed) and amortizes identically. 🔑 harness trap found: an
+  `.internal` amx row TILERELEASEs at exit, so a latch row invoked after it faults with no
+  palette — gen_tune_probe now invokes the row's cfg companion before EVERY direct tile
+  sweep (test + tune legs).
+- **I2** — the amx ts≠4 arm now rides `matmul_grid` (units = ngu, unit_rows = gs·mr,
+  tokq = ts) behind the same batch_grid_2d pin; shared `q8q8_batch_amx_cell_gen` walk
+  (1-D arm = old body verbatim with the full token range). Tail rule made cell-safe: the
+  overlapped tail macro fires only when `tbe − ts >= tb0` (identical to the old absolute
+  check at tb0=0), so an overlap can never reach into a concurrent cell's token range —
+  race-free by construction, no reliance on division proofs.
+- **I3 `bias=128`** — the dot is **TDPBSUD** (signed A tiles × unsigned w^0x80 B plane):
+  feeding biased bytes to TDPBSSD is NOT linearly correctable (s8 reinterpretation of
+  w^0x80 is w±128 piecewise by sign), but SU-order is Σw·x + 128·Σx exactly, and the
+  existing xbsp bsums plane (−128·Σx i32) lands in the FOLD stage as one embedded-broadcast
+  vpaddd per row before the cvt (tilezero untouched). Companions inherit bias through
+  companion_perm → the gemv rides the BIASED busd512 lattice (9 dots = 8 + inline bsum,
+  zero sign ops) — the slice-I fork's measured gemv penalty (+2.6-8% emit, +18-26% pp)
+  is gone. mx4 companion already forces bias=0 internally (nibble plane never biased).
+
+SPR protocol unchanged (P1/P2 probes first, per-arm ladder, cumulative, arch-ladder re-run,
+AMI bake). Note for the ladder: `latch` and `bias` change the GEMV/companion side too — the
+kernel-iso A/B attributes the tile, emission_bench attributes the family.
+
+### Slice K SILICON — SPR session 4 (2026-07-05): the fair shot answered, amx CLOSED
+
+Boris re-shaped the protocol on entry: full pin sweep on the arch-ladder models, one model
+first, sanity before everything. Executed as: pairwise rows added (`c0ff31896` — pipe1_latch1
+/ pipe1_bias128 / latch1_bias128 complete the 2^3 tile lattice; emission gates 100/100, M1
+grid 51 rows decline-clean) → box sanity (suite 213/213, grid 51 rows LIVE incl. all four
+bias128-amx rows at 3.8e-06 = sanctioned fold-order tolerance, slot parity 7/7, oracle parity
+40/40 ×3 incl. amx-cumulative + grid-on) → Llama-1B @T24 full lattice (10 rows × grid{0,2} ×
+2 reps, 40 cells, zero failures, every cell stamp-verified) → condensed lattice on
+Qwen3-0.6B / gemma-3-1b / Qwen3-4B.
+
+**Verdict: amx < vnni everywhere — 0.36–0.55× the biased-busd512 champion across all four
+models; the best cell ever (pipe1_latch1 on Qwen3-0.6B, 0.55×) is below the plain AVX2
+maddubs tier. The family stays grid-resident; spr_manifest unchanged. Arc CLOSED.**
+
+The decomposition (no mysteries left):
+
+- **Codegen exonerated** (Boris's "llvm producing god knows what" check): objdump of the
+  production JIT DLL (the sweep cells' own artifact) shows exactly the designed shape —
+  pipelined 2×2 macro (8 loads / 8 dots / 8 zero / 8 spill), raw tmm on the fixed C=tmm0-3
+  / A=tmm4-5 / B=tmm6-7 plan, ONE ldtilecfg in the whole object (the cfg companion), rolled
+  k-loop (single back-branch), ~115-165 fold insns between dot chains = the lcpp cadence.
+  Box-JIT output ≡ the M1 llc-cross gates.
+- **Frequency license exonerated** (P1 turbostat, bench-phase-anchored): das-amx 3745 MHz ≡
+  das-vnni 3730 MHz @T24 — our tile density never leaves the vector license class. lcpp-amx
+  drops to 3322 MHz (−11%) and still wins 2.7× — they pay the license and win anyway.
+- **Dispatch mostly exonerated** (P2, the new `DASLLAMA_TEAM_PROF` rail in prefill_perf,
+  `0719968ed`): publish 528ns/op (negligible), join-tail 283µs vs vnni's 29µs ≈ 10-15% of op
+  time (coarse 32-token units → ragged waves) — real but secondary.
+- **The bill: serve 2.28×** (1125µs vs 493µs per op, N=512 — the chunk kernels themselves).
+  Structural root = the kstep=1 Q8-scale-boundary fold: every 32-k block spills all four C
+  tiles and folds on vector ports — ~256KB C-spill traffic per 32-row × 32-token unit vs
+  64KB of weight traffic, ~960 instructions per k-iteration wrapping 4 tdpbsud. The TMUL
+  idles behind the fold; no pin reorganizes that away.
+
+Pin attribution: pipe1_latch1 is the one real arm — +15% kernel-iso 1-core (105.5 vs 92.1
+GMAC/s; raw tmm undoes LLVM's serialized-tmm4 chain, THEN pipelining pays — the slice-K bet,
+correct within the family) and +34% e2e on deep-thin Qwen3-0.6B; flat inside the noise band
+on the other three. bias128-on-amx = net e2e LOSS on every model (the fold gains one vpaddd
+per element; the biased gemv side doesn't recoup it) — the slice-I plane-bias fork's option
+(a) stands. amx run-to-run variance ±14% (same stamp, same grid) vs champion ±0.7% — the
+fragility itself is a verdict: the family is hypersensitive to warm-up/claim order, the
+champion is unconditionally robust.
+
+Also this session: **e2e confirm pass first SPR outing** — tune mode 1-core crowned amx
+nrsplit1 (174 GMAC/s on the d=32 fixture), confirm child measured 0.49× e2e, REJECTED,
+fallback pinned — the session-3 methodology hole closed on the box that exposed it.
+**batch_grid_2d SPR verdict: no pin** — 135M @T48 champ interleaved ×2: grid2 within ±1%,
+grid1 −5% (zen2's +8-15% does NOT transfer; SPR's 1-D chunk counts already fill 48 lanes on
+the vector walk). SPR box_profile stays {65536, 48, 0, team_rank_gate:1}. JIT-cache nit for
+the ledger: the artifact GC keeps one DLL per namespace, so alternating stamps recompile
+every run (~60-90s/cell tax on sweeps; correctness unaffected).
+
+Ledger (conditional, not queued): **amx kstep=2 fold** — K=64 tiles folding two scale
+segments per spill halves the C traffic; honest ceiling ≈ 1.6× behind the champion, so it
+only matters if a future box inverts the fold/TMUL cost ratio.
 
 ## Direction (Boris, 2026-07-04, post slice B) — the deletion is the mandate, not a maybe
 

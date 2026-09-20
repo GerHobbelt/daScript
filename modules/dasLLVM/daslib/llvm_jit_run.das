@@ -33,7 +33,7 @@ var LINK_WHOLE_LIB = false // when true, standalone exe links against the whole 
 // invalidates cached DLLs (e.g. edits to llvm_jit.das, llvm_macro.das, llvm_jit_common.das,
 // runtime helper ABI, default target triple). Cache filenames fold this in, so a bump
 // makes every previously written DLL miss the cache on the next run and get GC'd.
-let LLVM_JIT_CODEGEN_VERSION : uint64 = 0x39ul   // dasllama_gemm_gen fold FMF back to blanket fast (tolerance-gated variants)
+let LLVM_JIT_CODEGEN_VERSION : uint64 = 0x3aul   // aarch64_neon::smmla (i8mm) JIT intrinsic
 
 let JIT_FNV_PRIME : uint64 = 1099511628211ul
 
@@ -184,6 +184,12 @@ def jit_dll_basename(funcs : array<FunctionPtr>; opt_level : int; size_level : i
     let forced = get_env_variable("DAS_JIT_X64_FORCE_FEATURES")
     if (!empty(forced)) {
         h = (h ^ hash(forced)) * JIT_FNV_PRIME
+    }
+    // the aarch64 twin (DAS_JIT_ARM64_FORCE_FEATURES, e.g. "i8mm"): a forced artifact must never
+    // cache-hit a normal run — and the same-env run on the TARGET box must hit it exactly
+    let forced_arm = get_env_variable("DAS_JIT_ARM64_FORCE_FEATURES")
+    if (!empty(forced_arm)) {
+        h = (h ^ hash(forced_arm)) * JIT_FNV_PRIME
     }
     // Cross-compile artifacts key on their triple: a --jit-target DLL must never
     // cache-hit a host run of the same program (dlopen of a foreign-arch DLL), and

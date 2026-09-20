@@ -14,16 +14,25 @@ struct Q8RepackType {
     interleave : int
     //! scales pre-converted to f32 at repack time and interleaved per group
     f32_scales : bool
+    //! additive bias baked into every GROUP-row weight byte (`w ^ 0x80` when 128 — the
+    //! vpdpbusd bias128 perms; 0 = plain s8). Row-major tail rows always stay unbiased.
+    wbias : int
+    //! k-bytes per row per interleave group: 4 = the dword-group layout every vector-dot
+    //! perm reads ([kg4][r][4b]); 8 = the smmla row-pair layout ([kg8][r][8b] — a row PAIR's
+    //! 8 k-bytes are one contiguous 16-byte MMA operand, slice J). Tail rows stay row-major
+    //! at any kgroup.
+    kgroup : int
 }
 
 //! The repack layout an mr-row tile perm requires: mr-row block interleave with f32 group
-//! scales. `needs_repack` and every kernel stride derive from this.
-def q8q8_repack_type(mr : int) : Q8RepackType {
-    return Q8RepackType(interleave = mr, f32_scales = true)
+//! scales, group bytes biased by `wbias`, `kgroup` k-bytes per row per group. `needs_repack`
+//! and every kernel stride derive from this.
+def q8q8_repack_type(mr : int; wbias : int = 0; kgroup : int = 4) : Q8RepackType {
+    return Q8RepackType(interleave = mr, f32_scales = true, wbias = wbias, kgroup = kgroup)
 }
 
-//! The mr of the REFERENCE tier's layout (repack_q8q8_neon = the q8q8_repack_type(4)
-//! layout the reference stub bodies read). Non-reference mr runs on the generated pair:
+//! The mr of the REFERENCE tier's layout (the q8q8_repack_type(4) interleave — the old
+//! hand arm64-laneq layout — that the reference stub bodies read). Non-reference mr runs on the generated pair:
 //! the tile generator emits the grp<mr> kernel and the layout companion reports mr to the
 //! runtime repack — stamped from one manifest entry, declining in lockstep (M4).
 let GEMM_REFERENCE_MR = 4
