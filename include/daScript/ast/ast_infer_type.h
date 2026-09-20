@@ -101,6 +101,7 @@ namespace das {
         void pushVarStack();
         void popVarStack();
         void error(const string &err, const string &extra, const string &fixme, const LineInfo &at, CompilationError cerr = CompilationError::unspecified) const;
+        void checkEmptyName(const string &name, const char *nodeKind, const LineInfo &at);
         void reportAstChanged();
         virtual void reportFolding() override;
         string describeType(const TypeDeclPtr &decl) const;
@@ -450,6 +451,11 @@ namespace das {
         bool isVoidOrNothing(const TypeDeclPtr &ptr) const;
         bool canCopyOrMoveType(const TypeDeclPtr &leftType, const TypeDeclPtr &rightType, TemporaryMatters tmatter, Expression *leftExpr,
                                const string &errorText, CompilationError errorCode, const LineInfo &at) const;
+        // Tries to promote a const integer literal (ExprConstInt / ExprConstUInt) to targetType.
+        // Returns non-null on success (new ExprConst* of targetType, with promotedFromInt=true).
+        // Sets rangeError=true and emits exceeds_constant_range when the literal exceeds the target range.
+        // Returns nullptr+rangeError=false when promotion is not applicable.
+        ExpressionPtr tryPromoteConstInt(const ExpressionPtr &expr, const TypeDeclPtr &targetType, bool &rangeError);
         string moveErrorInfo(ExprMove *expr) const;
         virtual void preVisit(ExprMove *expr) override;
         virtual ExpressionPtr visit(ExprMove *expr) override;

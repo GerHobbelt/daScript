@@ -197,6 +197,7 @@ IF(NOT DAS_AUDIO_DISABLED)
         tests/strudel/test_signals.das
         tests/strudel/test_synthesis.das
         tests/strudel/test_vowel.das
+        tests/audio/test_hrtf_budget.das
     )
 ENDIF()
 
@@ -290,6 +291,11 @@ FILE(GLOB AOT_MACRO_BOOST_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS
 # by the actual test file.
 list(FILTER AOT_MACRO_BOOST_FILES EXCLUDE REGEX "/_")
 
+# AOT for with_boost test files
+FILE(GLOB AOT_WITH_BOOST_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/with_boost/*.das")
+# Exclude failed_* expected-failure compile tests — they're not AOT-able.
+list(FILTER AOT_WITH_BOOST_FILES EXCLUDE REGEX "/failed_")
+
 # Macro_boost test module files (probe call_macro required transitively by tests)
 SET(AOT_MACRO_BOOST_MODULE_FILES
     tests/macro_boost/_has_sideeffects_probe.das
@@ -366,12 +372,20 @@ FILE(GLOB AOT_LOOPS_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "test
 # AOT for daslib test files
 SET(AOT_DASLIB_TEST_FILES
     tests/daslib/clargs_test.das
+    tests/daslib/test_toml.das
 )
 
 # AOT for lint test files
 FILE(GLOB AOT_LINT_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/lint/*.das")
 # Exclude _*.das fixture files (consumed at runtime via compile_file, not invoked by dastest)
 list(FILTER AOT_LINT_FILES EXCLUDE REGEX "/_")
+# Exclude failed_*.das fixtures (expect compile errors that AOT codegen can't process)
+list(FILTER AOT_LINT_FILES EXCLUDE REGEX "/failed_")
+
+# AOT for promote test files
+FILE(GLOB AOT_PROMOTE_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/promote/*.das")
+# Exclude expect-error tests (range overflow doesn't AOT)
+list(FILTER AOT_PROMOTE_FILES EXCLUDE REGEX "failed_")
 
 # AOT for rtti test files
 FILE(GLOB AOT_RTTI_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/rtti/*.das")
@@ -584,6 +598,10 @@ add_custom_target(test_aot_macro_boost)
 SET(MACRO_BOOST_AOT_GENERATED_SRC)
 DAS_AOT("${AOT_MACRO_BOOST_FILES}" MACRO_BOOST_AOT_GENERATED_SRC test_aot_macro_boost daslang)
 
+add_custom_target(test_aot_with_boost)
+SET(WITH_BOOST_AOT_GENERATED_SRC)
+DAS_AOT("${AOT_WITH_BOOST_FILES}" WITH_BOOST_AOT_GENERATED_SRC test_aot_with_boost daslang)
+
 add_custom_target(test_aot_macro_boost_modules)
 SET(MACRO_BOOST_MODULES_AOT_GENERATED_SRC)
 DAS_AOT_LIB("${AOT_MACRO_BOOST_MODULE_FILES}" MACRO_BOOST_MODULES_AOT_GENERATED_SRC test_aot_macro_boost_modules daslang)
@@ -635,6 +653,10 @@ DAS_AOT("${AOT_STRINGS_FILES}" STRINGS_AOT_GENERATED_SRC test_aot_strings daslan
 add_custom_target(test_aot_lint)
 SET(LINT_AOT_GENERATED_SRC)
 DAS_AOT("${AOT_LINT_FILES}" LINT_AOT_GENERATED_SRC test_aot_lint daslang)
+
+add_custom_target(test_aot_promote)
+SET(PROMOTE_AOT_GENERATED_SRC)
+DAS_AOT("${AOT_PROMOTE_FILES}" PROMOTE_AOT_GENERATED_SRC test_aot_promote daslang)
 
 add_custom_target(test_aot_rtti)
 SET(RTTI_AOT_GENERATED_SRC)
@@ -724,6 +746,7 @@ SOURCE_GROUP_FILES("aot generated" LINQ_MODULES_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" MACRO_CALL_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" MACRO_BOOST_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" MACRO_BOOST_MODULES_AOT_GENERATED_SRC)
+SOURCE_GROUP_FILES("aot generated" WITH_BOOST_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" MATCH_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" MATH_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" MATH_MODULES_AOT_GENERATED_SRC)
@@ -795,6 +818,7 @@ add_executable(test_aot ${DAS_DASCRIPT_MAIN_SRC}
     ${MACRO_CALL_AOT_GENERATED_SRC}
     ${MACRO_BOOST_AOT_GENERATED_SRC}
     ${MACRO_BOOST_MODULES_AOT_GENERATED_SRC}
+    ${WITH_BOOST_AOT_GENERATED_SRC}
     ${MATCH_AOT_GENERATED_SRC}
     ${MATH_AOT_GENERATED_SRC}
     ${MATH_MODULES_AOT_GENERATED_SRC}
@@ -807,6 +831,7 @@ add_executable(test_aot ${DAS_DASCRIPT_MAIN_SRC}
     ${SPOOF_AOT_GENERATED_SRC}
     ${STRINGS_AOT_GENERATED_SRC}
     ${LINT_AOT_GENERATED_SRC}
+    ${PROMOTE_AOT_GENERATED_SRC}
     ${RTTI_AOT_GENERATED_SRC}
     ${TEMPLATE_AOT_GENERATED_SRC}
     ${TYPE_TRAITS_AOT_GENERATED_SRC}
@@ -847,12 +872,13 @@ ADD_DEPENDENCIES(test_aot libDaScriptAot
     test_aot_linq test_aot_linq_modules
     test_aot_macro_call
     test_aot_macro_boost test_aot_macro_boost_modules
+    test_aot_with_boost
     test_aot_match
     test_aot_math test_aot_math_modules test_aot_module_tests
     test_aot_option
     test_aot_regex
     test_aot_delegate test_aot_safe_addr test_aot_soa test_aot_spoof test_aot_strings
-    test_aot_lint test_aot_rtti
+    test_aot_lint test_aot_promote test_aot_rtti
     test_aot_template test_aot_type_traits test_aot_uri
     test_aot_lpipe
     test_aot_jit

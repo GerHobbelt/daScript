@@ -3,6 +3,7 @@ options gen2
 require daslib/lint
 require daslib/perf_lint
 require daslib/style_lint
+require daslib/lint_config
 require daslib/ast_boost
 require daslib/fio
 require daslib/clargs
@@ -159,7 +160,7 @@ def is_valid_rule_code(code : string) : bool {
     var all_digits = true
     peek_data(digits) $(d) {
         for (c in d) {
-            if (int(c) < int('0') || int(c) > int('9')) {
+            if (int(c) < '0' || int(c) > '9') {
                 all_digits = false
             }
         }
@@ -446,6 +447,13 @@ def main() : int {
     if (!empty(en_bad)) {
         print("error: invalid rule code \"{en_bad}\" in --enable (expected LINT|PERF|STYLE + 3 digits)\n")
         return 1
+    }
+
+    // Layer repo-wide policy on top of CLI flags: default-off rules + .lint_config.
+    // Skipped under --enable (whitelist mode) so the user's explicit pick wins.
+    if (empty(enabled_codes)) {
+        seed_default_disabled(disabled_codes)
+        load_lint_config(disabled_codes)
     }
 
     // Worker mode: lint a pre-resolved list from a paths-from file and emit

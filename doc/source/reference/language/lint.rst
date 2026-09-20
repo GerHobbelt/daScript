@@ -78,6 +78,48 @@ Add a ``// nolint:CODE`` comment on the same line as the flagged expression::
 The suppression is exact: ``// nolint:PERF003`` only suppresses PERF003, not other
 rules. An optional explanation after the code is recommended but not required.
 
+---------------------------
+Repo-level ``.lint_config``
+---------------------------
+
+A ``.lint_config`` file at ``{get_das_root()}/.lint_config`` toggles
+individual rules repository-wide. The three lint pass-macros
+(``daslib/lint``, ``daslib/perf_lint``, ``daslib/style_lint``), the
+standalone runner (``utils/lint/main.das``), and the MCP ``lint`` tool
+all consult the same file.
+
+The file is TOML 1.0, parsed by ``daslib/toml``. Toggles live in a
+single ``[rules]`` table; each entry sets a rule to ``true`` (on) or
+``false`` (off)::
+
+    # Re-enable a default-off rule
+    [rules]
+    STYLE005 = true
+
+    # Disable a default-on rule
+    PERF007  = false
+
+Defaults (applied before the file is read):
+
+- **STYLE005** is **off** by default. Add ``STYLE005 = true`` to a
+  repo's ``.lint_config`` to opt back in.
+- All other rules are on by default.
+
+The file is optional. When missing, unreadable, or syntactically
+malformed the defaults stand — bad TOML is a silent no-op, not a
+compile error. Non-boolean entries under ``[rules]`` are ignored.
+
+CLI ``--enable`` on the standalone runner bypasses the defaults (the
+explicit whitelist wins), so ``daslang utils/lint/main.das -- --enable
+STYLE005 file.das`` always fires STYLE005 regardless of ``.lint_config``.
+
+The ``*_collect()`` APIs (``paranoid_collect``, ``perf_lint_collect``,
+``style_lint_collect``) do **not** read the file — callers pass
+``disabled_codes`` / ``enabled_codes`` tables explicitly. Tools that
+want to honor the repo policy should call
+``daslib/lint_config::seed_default_disabled`` and ``load_lint_config``
+before invoking the collect overload.
+
 ------------------
 Important notes
 ------------------
@@ -328,6 +370,42 @@ bail on the variable to avoid false positives. Bail signals also include
 address-of (``addr(x)``), reference bindings (``var r & = x``), mutable-ref
 parameter passing (``foo(x)`` where ``foo`` takes ``var T&``), and capture-by-
 reference. Suppress structurally-needed dead inits with ``// nolint:LINT010``.
+
+LINT011 — int literal promoted with precision loss
+===================================================
+
+When a bare integer literal flows into a ``float`` or ``double`` target via
+the implicit promotion described in
+:ref:`type_conversions`, the cast can silently lose
+precision: ``float`` exactly represents every integer in ``[-2^24, 2^24]``,
+but above that range only every other integer (and at higher magnitudes,
+only every fourth, eighth, …) is representable. LINT011 flags promotions
+where the integer literal does not survive ``int → float → int`` round-trip
+at compile time. The check is decided at the promotion site, so the lint
+sees a single bit per ``ExprConstFloat`` / ``ExprConstDouble`` and never
+has to redo the math.
+
+``double`` covers integers up to ``2^53`` exactly, and the current promotion
+sources cap at ``uint32`` (``2^32 - 1``). LINT011 therefore never fires on
+``double`` targets today — the rule is wired symmetrically so future broader
+sources stay covered.
+
+.. code-block:: das
+
+    // Bad — float can't represent 2^24 + 1 exactly
+    let inexact : float = 16777217          // LINT011
+
+    // Good — 2^24 itself IS exactly representable
+    let exact : float = 16777216
+
+    // Suppress per call site
+    let intentional : float = 16777219      // nolint:LINT011
+
+    // double is fine for the current promotion sources
+    let big : double = 1000000000           // no warning
+
+Suppress with ``// nolint:LINT011`` on the offending line when the inexact
+value is intentional (a sentinel, a sampled constant, etc.).
 
 .. _perf_lint:
 

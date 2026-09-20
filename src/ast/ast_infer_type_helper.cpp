@@ -46,6 +46,12 @@ namespace das {
             program->error(err, extra, fixme, at, cerr);
         }
     }
+    void InferTypes::checkEmptyName(const string &name, const char *nodeKind, const LineInfo &at) {
+        if (!name.empty()) return;
+        string msg = string(nodeKind) + " has empty name";
+        error(msg, "", "this is usually caused by a macro emitting an AST node without a name (e.g. $i(\"\") or `field := value` in a named-arg ctor)",
+              at, CompilationError::invalid_empty_name);
+    }
     void InferTypes::reportAstChanged() {
         needRestart = true;
         if (func)
@@ -1000,6 +1006,17 @@ namespace das {
                 error("expecting a return value", "", "",
                       expr->at, CompilationError::missing_result);
             } else {
+                {
+                    bool rangeError = false;
+                    if (auto promoted = tryPromoteConstInt(expr->subexpr, resType, rangeError)) {
+                        reportAstChanged();
+                        expr->subexpr = promoted;
+                        return false; // next pass re-checks with promoted type
+                    }
+                    if (rangeError) {
+                        return false; // suppress downstream invalid_return_type
+                    }
+                }
                 if (!canCopyOrMoveType(resType, expr->subexpr->type, TemporaryMatters::yes, expr->subexpr,
                                        "incompatible return type", CompilationError::invalid_return_type, expr->at)) {
                 }

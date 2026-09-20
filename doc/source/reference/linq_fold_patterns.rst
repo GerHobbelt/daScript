@@ -22,37 +22,46 @@ How dispatch works
 ==================
 
 ``_fold`` walks the chain inside-out (terminator first), flattens the
-``ExprCall`` spine via ``flatten_linq``, and hands the whole thing to
-each ``plan_*`` function below in turn. Each ``plan_*`` either returns
-a specialized expression (the splice) or ``null`` (defer to the next).
-The first non-null wins.
+``ExprCall`` spine via ``flatten_linq``, normalizes adjacent
+where/select pairs and ``order |> reverse`` shapes via the pre-passes
+described below, and hands the result to ``try_splice_patterns`` in
+``daslib/linq_fold.das``. That dispatcher walks a single global
+``splice_patterns`` table (17 rows, one per arm listed in this
+document) twice:
 
-The dispatch order in ``LinqFold.visit`` (``daslib/linq_fold.das``) is:
+1. **Decs adapter pass.** Runs only when
+   ``extract_decs_bridge(top) != null`` (i.e. the source is
+   ``from_decs_template(...)``). Each row's ``requires`` predicates
+   gate the match; rows with an ``array_source`` predicate fail
+   here and fall through. First emit that returns non-null wins.
+2. **Array adapter pass.** Runs only when ``extract_decs_bridge(top)
+   == null``, i.e. the source is **not** a decs eager bridge. Top is
+   first ``peel_each``-unwrapped. Decs chains never reach this pass:
+   if the Decs pass above cascades on every row, control falls
+   through to ``fold_linq_default`` instead. (This is deliberate —
+   ``peel_each`` does not strip the eager-bridge ``ExprInvoke``, so
+   without this gate the ``decs_source`` predicate would still
+   succeed on a decs source in the Array pass and decs-only rows
+   could match and emit via ``SourceAdapter::Array``, silently
+   dropping adapter-specific captures like ``upstream_join``.)
 
-1. ``plan_decs_order_family`` — decs source with order family.
-2. ``plan_order_family`` — array source with order family.
-3. ``plan_decs_reverse`` — decs source with ``reverse``.
-4. ``plan_reverse`` — array source with ``reverse``.
-5. ``plan_decs_distinct`` — decs source with ``distinct``/``distinct_by``.
-6. ``plan_distinct`` — array source with ``distinct``/``distinct_by``.
-7. ``plan_decs_group_by`` — decs source with ``group_by`` (dispatches
-   to the shared ``plan_group_by_core``).
-8. ``plan_group_by`` — array source with ``group_by`` (same shared core).
-9. ``plan_decs_unroll`` — generic decs walk
-   (``where``/``select``/``skip``/``take`` + counter / accumulator /
-   early-exit / walk lane).
-10. ``plan_zip`` — ``zip(a, b)`` source.
-11. ``plan_loop_or_count`` — generic array walk
-    (``where``/``select``/``skip``/``take`` + counter / accumulator /
-    early-exit terminator).
-12. ``fold_linq_default`` — fallback, no splice.
+If neither pass emits, the Theme 6 perf-warn fires for
+``from_decs_template`` chains (telling the user the bridge will
+materialize and tier-2 will run on the buffer), then control falls
+through to ``fold_linq_default`` (the iterator-materializing tier-2
+path) and finally to a raw passthrough.
 
-The decs and array variants are interleaved (each decs plan runs
-before its array counterpart) because a chain starting with
-``from_decs_template(...)`` must hit the decs splice — falling through
-to the array plan would not match and would force the default. The
-generic decs walk (``plan_decs_unroll``) runs after the specialized
-decs plans so it doesn't shadow them.
+.. note::
+
+   Labels of the form ``plan_<X>`` (e.g. ``plan_distinct``,
+   ``plan_decs_reverse``) in the catalog below refer to the
+   pre-PR-E per-planner stubs that were collapsed into the unified
+   dispatcher. Each label now corresponds to a row (or pair of rows)
+   in ``splice_patterns`` whose ``requires`` predicates and ``emit``
+   function carry the same logic. The names are kept here because
+   they read more naturally than row names like
+   ``order_buffer_helper_dispatch`` — see ``daslib/linq_fold.das``
+   for the precise row each catalog entry maps to.
 
 Pre-dispatch normalizations
 ===========================
@@ -76,8 +85,9 @@ what would otherwise be many lookalike chains:
 - ``_select(f) |> _select(g)`` (N consecutive) → ``_select(g(f(_)))``.
   Applied by ``collapse_chained_selects``, called from
   ``plan_zip``, ``plan_distinct``, ``plan_decs_distinct``,
-  ``plan_reverse``, ``plan_decs_reverse``, ``plan_decs_join``, and
-  defensively from ``plan_order_family`` / ``plan_decs_order_family``
+  ``plan_reverse``, ``plan_decs_reverse``, ``plan_decs_join`` (also
+  ``collapse_chained_wheres`` per PR D2), and defensively from
+  ``plan_order_family`` / ``plan_decs_order_family``
   (which don't currently accept any leading ``_select`` but would
   inherit collapse if they ever did). Mirrors how chained ``_where``
   already compose via ``&&``. Composition takes the INNER lambda's
@@ -113,7 +123,7 @@ Source-side entry points
      - ``peel_each``
      - Strips the ``each`` wrapper; subsequent chain plans see the raw ``array<T>`` source.
    * - ``zip(a, b)`` / ``zip(a, b, sel)``
-     - ``plan_zip``
+     - pattern ``zip_general`` (emit fn ``emit_zip``)
      - Two-source zip. The three-argument form ``zip(a, b, sel)`` is pre-lowered to ``zip(a, b) |> _select(sel-as-tuple)`` so the standard zip+select fusion fires (closes the dot-product idiom).
    * - ``from_decs_template(type<T>)``
      - ``plan_decs_unroll`` etc.
@@ -184,16 +194,16 @@ Array-source patterns
      - ``plan_order_family`` (fused-loop + set-gate)
      - Theme 8 (audit 3b). The where_+order fused-loop path generalizes: when upstream ``distinct[_by]`` is present, declare ``var order_dset : table<...>`` and wrap the per-element ``push_clone`` with a set-gated ``if (!key_exists(...))`` block. Single source pass + in-place sort, no ``distinct_by_to_array`` intermediate iterator setup. Composes with ``where_`` (filter before distinct gate) and terminal ``_select`` (project at return). **Bails** (cascades) on ``distinct[_by] + order_by + first[_or_default]`` (streaming-min path has no dset hook) and on chains where ``take(N)`` is present (use the bounded-heap path via Theme 3 Phase 3 instead).
    * - ``._group_by(K)._select(reduce).to_array()``
-     - ``plan_group_by_core`` → ``emit_reducer_branches``
-     - Per-key bucket reducer; single hash, one entry per group.
+     - pattern ``group_by_array`` (sub-codegen ``plan_group_by_core`` → ``reducer_emitters`` lookup)
+     - Per-key bucket reducer; single hash, one entry per group. PR D1: reducer dispatch is now a ``table<string; ReducerEmitterFn>`` lookup into named ``mk_reducer_*`` fns.
    * - ``._group_by(K)._having(P)._select(...).to_array()``
-     - ``plan_group_by`` → ``plan_group_by_core``
+     - pattern ``group_by_array`` (sub-codegen ``plan_group_by_core``)
      - HAVING filter on the bucket reference (pre-aggregate); can lift hidden reducer slots referenced by ``P`` but absent from the select.
    * - ``._group_by(K)._select(reduce)._where(P).to_array()`` / ``.count()``
-     - ``plan_group_by`` → ``plan_group_by_core`` (trailing ``where`` as HAVING)
+     - pattern ``group_by_array`` (sub-codegen ``plan_group_by_core``, trailing ``where`` as HAVING)
      - HAVING filter on the constructed post-aggregate tuple (predicate references ``_.AggField`` by name). Distinct from ``_having(P)`` and orthogonal — both can fire on the same chain.
    * - ``._group_by(K)._select(reduce)._order_by(K2).to_array()`` / ``._order_by_descending(K2).to_array()``
-     - ``plan_group_by`` → ``plan_group_by_core`` (trailing ``order_by`` as ORDER BY)
+     - pattern ``group_by_array`` (sub-codegen ``plan_group_by_core``, trailing ``order_by`` as ORDER BY)
      - Theme 3 Phase 2 (audit C2). Inline-cmp ``sort(buf, ...)`` after the bucket-fill mutates the same output buffer in place — vs the tier-2 cascade's separate ``order_by_inplace`` over a fresh allocation. v1: ``_order_by(K2)`` / ``_order_by_descending(K2)`` with inline-able key only; non-inline keys (side-effects, multi-stmt body) cascade. Composes with HAVING / ``_having(P)``.
    * - ``.reverse().take(N).to_array()`` (with no ``where`` / ``select``)
      - ``plan_reverse`` (two-pass)
@@ -211,6 +221,44 @@ Decs-source patterns
 Every array pattern above has a decs mirror that walks each archetype
 of ``T``'s template instead of iterating the array. The body shape is
 identical — only the source iteration changes.
+
+.. note::
+
+   As of PR C, the four ``plan_decs_*`` planners (``_reverse`` /
+   ``_distinct`` / ``_order_family`` / ``_unroll``) are thin pattern-table
+   stubs that reuse the same pattern rows as their array-side siblings
+   (``plan_reverse_patterns`` / ``plan_distinct_patterns`` /
+   ``plan_order_family_patterns`` / ``plan_loop_or_count_patterns``)
+   with a ``SourceAdapter::Decs`` adapter swap. The 7 array-side emit
+   archetypes consume the adapter (``adapter_bind_name`` selects
+   ``it`` vs ``decs_tup`` for lambda peeling; ``adapter_wrap_source_loop``
+   dispatches ``for (it in src)`` vs ``for_each_archetype + build_decs_inner_for_pruned``;
+   ``adapter_wrap_invoke`` dispatches the outer invoke wrap). For
+   ``plan_decs_unroll`` (which feeds ``emit_loop_or_count_lane``), the
+   Decs-arm dispatch (``emit_loop_or_count_lane_decs``) reconstructs a
+   calls array from captures and routes to the existing
+   ``emit_decs_*`` lane fns unchanged (state hoist above
+   ``for_each_archetype`` stays per-adapter; see masterplan D1).
+
+   Two decs-specific fast paths preserved: ``emit_decs_count_archsize``
+   (bare ``count()``) and ``emit_decs_reverse_skip_into_tail``
+   (``reverse |> take(N) |> to_array``). Row 4 of
+   ``plan_order_family_patterns`` (``buffer_helper_dispatch``) is gated
+   to Array adapter via ``array_source`` — decs cascades to Row 3
+   (``fused_prefilter``) which materializes the buffer, matching the
+   imperative decs behavior. ``reverse |> distinct[_by]`` on decs
+   sources cascades to tier-2 (no decs equivalent of the array
+   backward-walk dset gate; deferred per masterplan D6).
+
+   As of PR D3, the ``GroupBySourceAdapter`` shim (a parallel adapter
+   used only by ``plan_group_by_core``) is gone — group_by's three
+   source shapes (``Array`` / ``Decs`` / ``DecsJoin``) all flow
+   through the same ``SourceAdapter`` variant as every other planner.
+   ``plan_group_by_core`` calls ``adapter_wrap_source_loop`` and
+   ``adapter_wrap_invoke`` directly. The decs-join branch of
+   ``adapter_wrap_source_loop`` carries the inline hash-collect +
+   probe + per-pair result-lam bind body shared with
+   ``emit_decs_join``.
 
 .. list-table::
    :header-rows: 1
@@ -265,17 +313,17 @@ identical — only the source iteration changes.
      - ``plan_decs_reverse`` (terminal ``_select``)
      - Decs mirror of ``plan_reverse``'s terminal ``_select``. Skip-into-tail fast path is gated off when ``_select`` is present.
    * - ``from_decs_template(...)._group_by(K)._select(reduce).to_array()``
-     - ``plan_decs_group_by`` → ``plan_group_by_core``
+     - pattern ``group_by_decs`` (sub-codegen ``plan_group_by_core``)
      - Shared bucket-reducer with the array path; differs only in the per-element source.
    * - ``from_decs_template(...)._group_by(K)._select(reduce)._where(P).to_array()`` / ``.count()``
-     - ``plan_decs_group_by`` → ``plan_group_by_core`` (trailing ``where`` as HAVING)
+     - pattern ``group_by_decs`` (sub-codegen ``plan_group_by_core``, trailing ``where`` as HAVING)
      - Decs mirror of the array-side post-aggregate HAVING. Same predicate-on-output-tuple semantics.
    * - ``from_decs_template(...)._group_by(K)._select(reduce)._order_by(K2).to_array()`` / ``._order_by_descending(K2).to_array()``
-     - ``plan_decs_group_by`` → ``plan_group_by_core`` (trailing ``order_by`` as ORDER BY)
+     - pattern ``group_by_decs`` (sub-codegen ``plan_group_by_core``, trailing ``order_by`` as ORDER BY)
      - Decs mirror of the array-side ORDER BY splice (Theme 3 Phase 2 C2). Shares the same in-place inline-cmp sort tail; only the bucket-fill source differs.
    * - ``from_decs_template(A)._join(from_decs_template(B), ka, kb, result)._group_by(K)._select(reduce).to_array()`` / ``.count()``
-     - ``plan_decs_group_by`` (``isDecsJoin`` adapter; cross-arm — see *Decs-decs equi-join*)
-     - Theme 3 Phase 1 cross-arm composition. ``plan_decs_join``'s hashB-collect + srcA-probe feeds ``plan_group_by_core``'s bucket update directly — one pass, no intermediate join array. Composes with the C2 trailing ``order_by`` extension above when applied to the join+group_by output.
+     - pattern ``group_by_decs`` with ``upstream_join`` slot (``isDecsJoin`` adapter; cross-arm — see *Decs-decs equi-join*)
+     - Theme 3 Phase 1 cross-arm composition. ``emit_decs_join``'s hashB-collect + srcA-probe feeds ``plan_group_by_core``'s bucket update directly — one pass, no intermediate join array. Composes with the C2 trailing ``order_by`` extension above when applied to the join+group_by output.
    * - ``from_decs_template(...)._take_while(P).<...>`` / ``._skip_while(P).<...>``
      - ``plan_decs_unroll`` (predicate-driven ranges)
      - Hoists ``skippingName`` state across archetypes.
@@ -298,16 +346,16 @@ primitive (``int*`` / ``uint*`` / ``float`` / ``double`` / ``bool`` /
      - Splice arm
      - Notes
    * - ``from_decs_template(A) |> _join(from_decs_template(B), ka, kb, result) |> count()``
-     - ``plan_decs_join``
+     - pattern ``decs_join_general`` (emit fn ``emit_decs_join``)
      - Hash-fill + probe; ``count`` bumped by bucket length per hit. No per-pair invoke.
    * - ``from_decs_template(A) |> _join(...) |> to_array()``
-     - ``plan_decs_join``
+     - pattern ``decs_join_general`` (emit fn ``emit_decs_join``)
      - Hash-fill + probe; ``result`` lambda inlined at the push site (no per-pair invoke into ``join_impl``).
    * - ``from_decs_template(A) |> _join(...) |> _select(F) |> to_array()``
-     - ``plan_decs_join`` (terminal ``_select``)
+     - pattern ``decs_join_general`` (terminal ``_select``)
      - Single bind of the join result per matched pair, then projection.
    * - ``from_decs_template(A) |> _join(...) |> _where(P) |> count() / to_array()``
-     - ``plan_decs_join`` (trailing ``_where``)
+     - pattern ``decs_join_general`` (trailing ``_where``)
      - Bind join result, evaluate predicate, gate ``count++`` / ``push_clone``. Composes with the trailing ``_select`` form (filter then project, single bind per pair).
    * - ``from_decs_template(A) |> _join(...) |> _group_by(K) |> _select(reduce) |> count() / to_array()``
      - ``plan_decs_group_by`` (``isDecsJoin`` adapter, Theme 3 C3)
@@ -333,25 +381,25 @@ Zip patterns
      - Splice arm
      - Notes
    * - ``zip(a, b)._select(F).sum()`` / ``.count()`` / ``.average()``
-     - ``plan_zip``
+     - pattern ``zip_general`` (emit fn ``emit_zip``)
      - Fuses to a single index-loop over the shorter side.
    * - ``zip(a, b, c)._select(F).<terminator>``
-     - ``plan_zip``
+     - pattern ``zip_general`` (emit fn ``emit_zip``)
      - Three-source zip; same loop shape with three reads per iteration.
    * - ``zip(a, b, sel).<terminator>`` (3-arg, with selector lambda)
-     - ``plan_zip`` (pre-lowered)
+     - pattern ``zip_general`` (3-arg pre-lowered)
      - Theme 1 (audit 7a). The 3-arg form ``zip(a, b, sel)`` is pre-lowered by ``plan_zip`` to ``zip(a, b) |> _select(sel-as-tuple)`` before per-arm matching, so the standard zip+select fusion fires — the natural ``zip(xs, ys, $(x, y) => x * y) |> sum()`` dot-product idiom splices instead of cascading.
    * - ``zip(a, b)._where(P)._select(F).<terminator>``
-     - ``plan_zip`` (chain ops)
+     - pattern ``zip_general`` (chain ops via head c_chain + range slots)
      - ``where`` / ``select`` / ``take`` / ``skip`` / ``take_while`` / ``skip_while`` between zip and the terminator are all fused.
    * - ``zip(a, b).first()`` / ``.first_or_default()`` / ``.aggregate(...)``
-     - ``plan_zip`` (early-exit / accumulator)
+     - pattern ``zip_general`` (early-exit / accumulator lanes delegate to emit_early_exit_lane / emit_accumulator_lane)
      - Early-exit terminator on the zipped pair.
    * - ``zip(a, b)._select(F).count(P)`` / ``.long_count(P)``
-     - ``plan_zip`` (counter with separate predicate gate)
+     - pattern ``zip_general`` (counter with separate predicate gate)
      - The 2-arg ``count(P)`` / ``long_count(P)`` form is captured into a dedicated counter-predicate gate emitted around ``acc++`` *inside* the upstream where/select wrap, so eager ``where(W).select(F).count(P)`` ordering is preserved (W filters first, then F runs once per surviving element, then P decides whether to count). With ``_select``, the predicate peels against the projected value via a ``vproj`` bind. Length-shortcut is suppressed when ``P`` is present (the counter loop runs).
    * - ``zip(a, b)[._select(F)|._where(P)|...].reverse().<terminator>``
-     - ``plan_zip`` (trailing ``reverse``)
+     - pattern ``zip_general`` (trailing ``reverse`` slot)
      - Theme 8 (audit C4). ``reverse`` accepted as the last chain op between zip's chain and the terminator. Array lane emits ``_::reverse_inplace($i(bufName))`` before return; counter / accumulator (sum/min/max/avg) / ``any`` / ``all`` / ``contains`` lanes treat reverse as a no-op (mathematical identity). **Bails** (cascades) on ``first`` / ``first_or_default`` (NOT identity under reverse) and when ``reverse`` is not the last chain op (anything after would see the reversed stream and change semantics vs cascade).
 
 What falls back
