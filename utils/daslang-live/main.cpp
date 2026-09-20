@@ -27,6 +27,12 @@
 #include <dlfcn.h>
 #endif
 
+#if defined(__APPLE__)
+#include <objc/objc.h>
+#include <objc/runtime.h>
+#include <objc/message.h>
+#endif
+
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -67,6 +73,7 @@ static BoolFn  dll_files_changed = nullptr;
 static SetFloatFn dll_set_dt = nullptr;
 static SetFloatFn dll_set_uptime = nullptr;
 static SetFloatFn dll_set_fps = nullptr;
+static SetFloatFn dll_advance_clock = nullptr;
 static SetBoolFn  dll_set_is_reload = nullptr;
 static SetBoolFn  dll_set_paused = nullptr;
 static VoidFn  dll_clear_reload_flags = nullptr;
@@ -107,6 +114,7 @@ static bool load_live_host_functions() {
     dll_set_dt            = (SetFloatFn)get_dll_symbol("live_host_set_dt");
     dll_set_uptime        = (SetFloatFn)get_dll_symbol("live_host_set_uptime");
     dll_set_fps           = (SetFloatFn)get_dll_symbol("live_host_set_fps");
+    dll_advance_clock     = (SetFloatFn)get_dll_symbol("live_host_advance_clock");
     dll_set_is_reload     = (SetBoolFn)get_dll_symbol("live_host_set_is_reload");
     dll_set_paused        = (SetBoolFn)get_dll_symbol("live_host_set_paused");
     dll_clear_reload_flags = (VoidFn)get_dll_symbol("live_host_clear_reload_flags");
@@ -392,12 +400,19 @@ static int run_lifecycle(const string & fn) {
     // Main loop
     while (!(dll_exit_requested && dll_exit_requested())) {
         double now = get_time_sec();
-        float dt = float(now - lastTime);
-        float uptime = float(now - startTime);
+        float wall_dt = float(now - lastTime);
         lastTime = now;
 
-        if (dll_set_dt) dll_set_dt(dt);
-        if (dll_set_uptime) dll_set_uptime(uptime);
+        // Single source of truth for the frame clock. advance_clock applies the
+        // recorder's fixed-dt lockstep when set, wall-clock otherwise, and owns the
+        // uptime accumulator — so capture, animation, and convert share one grid.
+        // Fall back to the legacy set_dt/set_uptime pair on an older DLL.
+        if (dll_advance_clock) {
+            dll_advance_clock(wall_dt);
+        } else {
+            if (dll_set_dt) dll_set_dt(wall_dt);
+            if (dll_set_uptime) dll_set_uptime(float(now - startTime));
+        }
 
         // FPS calculation
         frameCount++;
@@ -737,6 +752,36 @@ static void release_single_instance() {
 
 // --- Entry point ---
 
+#if defined(__APPLE__)
+// Disable macOS App Nap for this process. On a headless / offscreen CI runner the
+// daslang-live window is unfocused, so macOS throttles the process during input-less
+// recording holds — the render loop stalls and frame capture flatlines (dasImgui #190).
+// beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep keeps the process
+// at full scheduling for its lifetime (idle *system* sleep is still permitted). Driven via
+// the objc runtime so main.cpp stays plain C++ (no .mm); Foundation is linked on Apple in
+// CMakeLists. No-op if Foundation / NSProcessInfo can't be resolved.
+static void disable_app_nap_macos() {
+    Class piClass = objc_getClass("NSProcessInfo");
+    if (!piClass) return;
+    id processInfo = ((id(*)(Class, SEL))objc_msgSend)(piClass, sel_registerName("processInfo"));
+    if (!processInfo) return;
+    Class strClass = objc_getClass("NSString");
+    if (!strClass) return;
+    id reason = ((id(*)(Class, SEL, const char*))objc_msgSend)(
+        strClass, sel_registerName("stringWithUTF8String:"),
+        "daslang-live: continuous render for recording capture (#190)");
+    const unsigned long long NSActivityUserInitiatedAllowingIdleSystemSleep = 0x00FFFFFFULL;
+    id activity = ((id(*)(id, SEL, unsigned long long, id))objc_msgSend)(
+        processInfo, sel_registerName("beginActivityWithOptions:reason:"),
+        NSActivityUserInitiatedAllowingIdleSystemSleep, reason);
+    if (activity) {
+        // Retain for the process lifetime (no ARC); intentionally never released.
+        ((id(*)(id, SEL))objc_msgSend)(activity, sel_registerName("retain"));
+        tout << "daslang-live: macOS App Nap disabled (NSActivityUserInitiatedAllowingIdleSystemSleep)\n";
+    }
+}
+#endif
+
 int main(int argc, char * argv[]) {
 #if defined(_WIN32) && defined(_DEBUG)
     _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
@@ -744,6 +789,10 @@ int main(int argc, char * argv[]) {
 
     install_das_crash_handler();
     das::arm_alloc_tracking();
+
+#if defined(__APPLE__)
+    disable_app_nap_macos();
+#endif
 
     // Forward full argv so scripts can read get_user_args() (post-`--` slice).
     // Matches daslang.exe's behavior — daslang-live ignores everything after
