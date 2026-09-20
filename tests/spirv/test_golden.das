@@ -126,10 +126,14 @@ def test_golden_disassembly(t : T?) {
         check_iso(t, "tri_vert", tri_vert_words())
         check_iso(t, "tri_frag", tri_frag_words())
         check_iso(t, "vindex", vindex_words())
+        check_iso(t, "draw_id", draw_id_words())
+        check_iso(t, "nuext", nuext_words())
+        check_iso(t, "darr", darr_words())
         check_iso(t, "raster_math", raster_math_words())
         check_iso(t, "catri", catri_words())
         check_iso(t, "ubo_frag", ubo_frag_words())
         check_iso(t, "pc_frag", pc_frag_words())
+        check_iso(t, "ubo_nested", ubo_nested_words())
         // mvp_vert + tex_frag: the visitor schedules independent access-chains/loads in post-order
         // (chain,chain,load,load) where the hand-walker interleaved per operand (chain,load,chain,load)
         // — a benign instruction reorder the order-sensitive golden can't absorb. Their goldens are the

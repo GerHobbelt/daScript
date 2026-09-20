@@ -20,11 +20,27 @@ var gl_Position             : float4    // BuiltIn Position (Output)
 var gl_PointSize            : float     // BuiltIn PointSize (Output) — point size in pixels when rasterising POINT_LIST; needs the largePoints device feature for values > 1
 var gl_VertexIndex          : int       // BuiltIn VertexIndex (Input)
 var gl_InstanceIndex        : int       // BuiltIn InstanceIndex (Input)
+var gl_DrawID               : int       // BuiltIn DrawIndex (Input) — multi-draw draw call ordinal; needs the DrawParameters capability (in core in SPIR-V 1.3)
 
 // fragment
 var gl_FragCoord            : float4    // BuiltIn FragCoord (Input)
 var gl_FragDepth            : float     // BuiltIn FragDepth (Output) — writing it forces DepthReplacing
 var gl_PointCoord           : float2    // BuiltIn PointCoord (Input) — UV within the rasterised point primitive, [0,1]^2; valid only when POINT_LIST topology is rendered
+
+// ===== descriptor indexing =====
+// nonuniformEXT marks an index value as varying across invocations within a wavefront/subgroup
+// (Vulkan's VK_EXT_descriptor_indexing semantics). Required when indexing a descriptor array
+// (sampler[], image[], SSBO[]) with a value the compiler can't prove uniform across the wave —
+// without it the driver may serialise the access incorrectly. Lowers to an OpCopyObject (fresh
+// result id) + OpDecorate <id> NonUniform on the new id; OpCapability ShaderNonUniform +
+// OpExtension "SPV_EXT_descriptor_indexing" land once per module on first use. The descriptor-array
+// indexing path itself (sampler2D[] etc.) is a separate slice — this just ships the marker, so the
+// test exercises only the decoration + cap + extension. Identity passthrough; the stub body never
+// runs, only the call AST is read.
+[unused_argument(x), sideeffects]
+def public nonuniformEXT(x : int) : int { return x }
+[unused_argument(x), sideeffects]
+def public nonuniformEXT(x : uint) : uint { return x }
 
 // ===== combined image samplers =====
 // sampler2D is an opaque marker type: a global of this type lowers to an OpTypeSampledImage in

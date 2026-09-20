@@ -1475,3 +1475,148 @@ i.e. the copy-out genuinely lands the value back through the reference.
 3. **`marker(no_coverage)` fixtures still drive the emitter's own LCOV.** The marker suppresses the
    *shader's* coverage instrumentation (which would corrupt the SPIR-V), not the emitter-side line coverage
    collected while the fixture compiles — so the function fixtures still exercise the new emit paths.
+
+---
+
+## Active backlog — frontend prerequisites for the remaining tutorial arc (audited 2026-06-18)
+
+After Tutorial 10 (deferred shading) landed, an emitter audit (MASTERPLAN + PHASE6/7/8/9.md +
+dasVulkan/ROADMAP.md cross-referenced against `spirv_emit.das`/`spirv_grammar.das`/`spirv_builtins.das`)
+identified the **hard prerequisites** for the unbuilt tutorials (#11 HDR+bloom, #12 GPU-driven, #13 mesh).
+Listed smallest-first; each PR ships with its golden + census + spirv-val gate and, where relevant, a
+local-GPU behavioral proof through dasVulkan.
+
+### Bindless track — gates Tutorial 12 (GPU-driven)
+
+- **PR-A. `gl_DrawID` builtin + `DrawParameters` capability.** Single `builtin_info` row + capability
+  emission. `OpenCL` / Vulkan `BuiltIn DrawIndex = 4426`; grammar already has the enumerant. Smallest
+  piece; proves the workflow before the bigger ones.
+- **PR-B. `nonuniformEXT()` intrinsic + `NonUniform` decoration.** `spirv_grammar.das` already has
+  `Decoration.NonUniform = 5300` and `Capability.RuntimeDescriptorArray = 5302`; never emitted today.
+  Add a `nonuniformEXT(x)` intrinsic in `spirv_builtins.das` + a `visitExprCall` interception that
+  emits the `NonUniform` decoration on the underlying access-chain result id.
+- **PR-C. Descriptor arrays (`sampler2D[]` etc.).** Classify in `classify_global`; reflection plumbing
+  for variable-count bindings (`descriptorBindingVariableDescriptorCount`); host-side handler.
+  Unblocks the dasVulkan bindless descriptor helper (ROADMAP Arc PR 8) and Tutorial 12.
+
+### Mesh-shader track — gates Tutorial 13
+
+- **PR-D. Mesh/task stage scaffolding.** Add `ShaderStage.Mesh` / `ShaderStage.Task` + `[mesh_shader]` /
+  `[task_shader]` annotations; widen the hardcoded vert/frag/compute exec-model dispatch at
+  `spirv_emit.das:~2911`. Emit `MeshShadingEXT = 5283` capability + `OutputVertices` /
+  `OutputPrimitivesEXT` / `OutputTrianglesEXT` execution modes; `LocalSize` reused.
+- **PR-E. Mesh intrinsics + array-of-builtin classification.** `SetMeshOutputsEXT` →
+  `OpSetMeshOutputsEXT = 5295`; `EmitMeshTasksEXT` → `OpEmitMeshTasksEXT = 5294`. The **novel surface**:
+  per-vertex / per-primitive Output **arrays of builtins** (`gl_MeshVerticesEXT[]` → BuiltIn Position
+  per-vertex; `gl_PrimitiveTriangleIndicesEXT[]` → uvec3 array). Every existing builtin is scalar/vec —
+  this is new ground in `classify_global` / `builtin_info`.
+- **PR-F. `PerPrimitiveEXT` decoration + polish.** Grammar has the enumerant; emit on per-primitive
+  outputs. Task-shader payload via `TaskPayloadWorkgroupEXT` storage class.
+
+### Independent — shipped-surface gaps surfaced by the audit (no tutorial dependency, fold in opportunistically)
+
+- **PR-G. UBO / SSBO nested struct + array-in-struct.** *LANDED (2026-06-18, branch `bbatkin/dasspirv-ubo-nested`)*
+  See "PR-G — UBO/SSBO nested struct + array-in-struct" entry below.
+- **Storage-image formats beyond `Rgba8`.** Currently hardcoded in `storage_image_info`. No current
+  blocker; queue for any HDR-compute pipeline.
+- **Image sampling — `Gather` / `Proj` / offset operand / `OpImageQueryLevels` / `OpImageQueryLod` /
+  `OpImageQuerySamples`.** Wishlist; no current blocker.
+- **Atomics — 64-bit (`Int64Atomics`), float (`AtomicFloat32AddEXT`).** Wishlist.
+- **Missing sampler types — `sampler2DMS`, `samplerCubeShadow`, `sampler2DArrayShadow`.** Declare in
+  `spirv_builtins.das` when a tutorial needs them.
+- **Wider numeric types — 16-bit (`Float16`/`Int16` caps) and 64-bit (`Float64`/`Int64`).** `double`
+  rejected for shader function params (`spirv_emit.das:~2730`); `var d : double` rejected. No tutorial
+  blocker.
+- **Interpolation qualifiers beyond `@flat`** — `noperspective` / `centroid` / `sample`. No blocker.
+
+### Explicit non-goals (clarified by the audit, do not plan)
+
+- **Geometry / tessellation stages.** Obviated by mesh shaders; explicitly out of scope.
+- **`OpSwitch`.** daslang has no `switch`/`case` keyword. Out of scope at the language level.
+- **`PhysicalStorageBuffer` (BDA).** Requires SPIR-V > 1.3; defer until a `spirv_version` annotation
+  arg lands (the existing version-knob plan).
+- **`PHASE6_VISITOR_PORT.md` / `PHASE7_TEXTURES.md` / `PHASE8_LANGUAGE.md` / `PHASE9_TUTORIALS.md`.**
+  Fully shipped; content captured in the Implementation log above. Standalone files are stale and
+  superseded by this section + the LANDED entries. Candidate for a hygiene-PR archival pass.
+
+### Tutorial-11 (HDR + bloom)
+
+ROADMAP confirms **zero emitter prerequisite** — HDR is a runtime render-target format choice on the
+dasVulkan side (float16/32 color attachments + additive blending), and the bloom blur passes use
+already-shipped storage-image read/write + sampling. Can ship between tracks as a pure dasVulkan PR.
+
+### Suggested ordering
+
+```
+PR-A: gl_DrawID + DrawParameters cap                   (smallest, proves the workflow)
+PR-B: nonuniformEXT + NonUniform decoration            (small)
+PR-C: descriptor arrays                                (medium; unblocks bindless host helper)
+       └─ then Tutorial 12 path opens
+PR-D: mesh/task stage scaffolding                      (medium; capability + exec modes)
+PR-E: mesh intrinsics + array-of-builtin classify      (largest; novel surface)
+PR-F: PerPrimitiveEXT + polish
+       └─ then Tutorial 13 path opens
+PR-G: UBO/SSBO nested struct + array-in-struct         (LANDED 2026-06-18)
+PR-H: plan-doc archival sweep                          (no code; deletes PHASE6/7/8/9.md)
+```
+
+### PR-G — UBO/SSBO nested struct + array-in-struct LANDED (2026-06-18, branch `bbatkin/dasspirv-ubo-nested`)
+
+Three composite shapes that pre-PR-G `compute_block_layout` / `build_block_struct` rejected (single-level
+walk) now lay out and emit correctly: **fixed-array of scalar/vector** (std140 `ArrayStride 16`), **nested
+struct** (recursive non-Block `OpTypeStruct` with its own Offset cascade, base alignment rounded up to 16),
+and **array of struct** (combines both: outer ArrayStride = laid-out struct size rounded to struct
+alignment). New fixture `ubo_nested` (UBO with `float4[3]`, an `NMaterial` substruct, and `NLight[2]`) is
+census/golden/spirv-val gated; full suite 138/138 green.
+
+**Where it sits in the emitter:**
+- `BlockField` (`spirv_emit.das`): backwards-compatible extension with `is_array` / `array_count` /
+  `array_stride` / `is_struct` / `is_composite` markers. Host-side bind macros (e.g. dasVulkan's
+  `SpirvVulkanShader`) can detect composites via `is_composite` and either recurse field-by-field using
+  the published offset/stride or skip with a clear "manual bind required" message. Old-style consumers
+  reading only `name` + `offset` for scalar/vector/matrix fields are unaffected.
+- `compute_block_layout` recurses through nested structs (Block-rule struct alignment: max-member-align
+  rounded up to 16, size rounded up to the struct alignment) and walks fixed-array fields (scalar/vector
+  element stride rounds up to 16; struct element stride is the laid-out struct size rounded to its
+  alignment). Matrix-of-array and array-of-array stay out of scope (rejected with a clean diagnostic).
+- `build_block_struct` dispatches per top-level field shape — composite branches call
+  `type_array_strided(elem, count, stride)` (new builder helper that emits `OpTypeArray` + the
+  `OpDecorate ArrayStride` it must carry as a Block member) and recurses into nested structs as
+  non-Block laid-out structs.
+- The visitor side bridges two long-standing footguns:
+  1. **`visitExprField`'s chained branch used `ExprAt`-only storage detection**, defaulting everything
+     else to `StorageBuffer` — wrong for Uniform / PushConstant. Now walks the chain via
+     `root_global_of` to inherit the root global's storage class regardless of intermediate shape.
+  2. **The block-member access pointee was computed via `emit_type(expr._type)`**, which panics on
+     `tStructure` and produces an undecorated `OpTypeArray` for fixed-array members. New helper
+     `field_pointee_type` recurses through `build_block_struct` for struct/array members (idempotent
+     under the type-dedup pool, so no duplicate types or decorations).
+- New `visitExprAt` branch handles indexing a chained pointer (`ubo.lights[i]` /
+  `ubo.material.kernel[i]`): the array's element pointer chains off the field pointer in the root
+  global's storage class.
+
+**Findings (load-bearing):**
+1. **The `e2ptr` chain only works when each level's pointee type is the *decorated* one.** A naive
+   `emit_type` on the member returns a Block-incompatible type id (no Offset cascade for a nested
+   struct, no ArrayStride for a fixed array), which makes the recursive `OpAccessChain`'s declared
+   pointer type mismatch the base struct's actual member type — caught by spirv-val. Routing the
+   pointee through `build_block_struct` (which is idempotent under the dedup pools) makes the chain
+   self-consistent without any side-cache of laid-out type ids.
+2. **`field_pointee_type` doesn't add new census opcodes.** `OpTypeArray` / `OpMemberDecorate Offset` /
+   `OpDecorate ArrayStride` / `OpAccessChain` / `OpLoad` were all already declared by earlier
+   fixtures (sampler descriptor arrays, SSBO runtime arrays, UBO matrices). The PR-G feature is
+   purely a layout + dispatch widening — the existing census set unchanged.
+
+**Out of scope (queued):**
+- **std430 nested layout for SSBO element structs containing composite fields.** Today's
+  `ssbo_element_layout` still goes through `build_block_struct` (std140 padding); for flat
+  scalar/vector + matrix elements std140 and std430 agree, so the fix-in-place is correct for
+  existing fixtures and only diverges when an SSBO element struct itself contains a nested array or
+  struct (a path no in-tree fixture exercises today).
+- **Matrix-of-array fields.** Need per-element MatrixStride 16; clean rejection until added.
+- **Downstream `dasVulkan/SpirvVulkanShader.bind_uniform`.** The current host walker emits
+  `write_field(ptr, offset, ubo.field)` per BlockField, which will fail to compile for a `BlockField`
+  whose value type has no `write_field` overload — a clean macro-time error pointing the user to
+  either bind composites manually or extend `bind_uniform` to recurse. Follow-up PR.
+
+Tutorial 11 (HDR+bloom) is independent and can slot in any time — no emitter dependency.

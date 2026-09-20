@@ -19,6 +19,12 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 #set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Emit build/compile_commands.json (per-TU compiler flags). Honored by the
+# Ninja and Makefile generators; the Visual Studio generator ignores it (use a
+# side Ninja dir on Windows). Powers the MCP cpp_compile_check / cpp_build_info
+# tools (utils/mcp/tools/cpp_compile_check.das).
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 option(DAS_FLEX_BISON_DISABLED "Disable FLEX/BISON stage" OFF)
 option(DAS_CLANG_BIND_DISABLED "Disable dasClangBind (libclang bindings, C/C++ parsing)" ON)
 option(DAS_LLVM_DISABLED "Disable dasLLVM (llvm bindings)" ON)
@@ -1633,10 +1639,17 @@ install(FILES ${PROJECT_SOURCE_DIR}/include/vecmath/LICENSE DESTINATION ${DAS_IN
 install(FILES ${PROJECT_SOURCE_DIR}/utils/aot/main.das DESTINATION utils/aot)
 
 # Install MCP server (stdio transport, no dasHV dependency)
+#   main.das        — full server entry point
+#   cpp_main.das    — cpp/agnostic-subset entry point
+#   protocol_core.das + registry_das.das + registry_cpp.das — shared dispatch + tool registry
 install(FILES
     ${PROJECT_SOURCE_DIR}/utils/mcp/main.das
-    ${PROJECT_SOURCE_DIR}/utils/mcp/protocol.das
+    ${PROJECT_SOURCE_DIR}/utils/mcp/cpp_main.das
+    ${PROJECT_SOURCE_DIR}/utils/mcp/protocol_core.das
+    ${PROJECT_SOURCE_DIR}/utils/mcp/registry_das.das
+    ${PROJECT_SOURCE_DIR}/utils/mcp/registry_cpp.das
     ${PROJECT_SOURCE_DIR}/utils/mcp/cpp_search_config.das
+    ${PROJECT_SOURCE_DIR}/utils/mcp/daslang-mcp-msvc.cmd
     ${PROJECT_SOURCE_DIR}/utils/mcp/README.md
     DESTINATION utils/mcp
 )

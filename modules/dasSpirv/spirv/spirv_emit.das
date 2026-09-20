@@ -37,7 +37,9 @@ struct GlobalInfo {
     is_separate_image : bool        // a standalone sampled image (texture2D, OpTypeImage); combined at the call via OpSampledImage
     is_separate_sampler : bool      // a standalone sampler (OpTypeSampler)
     is_subpass_input : bool         // a subpass-input attachment (UniformConstant OpTypeImage Dim=SubpassData); used via subpassLoad
-    elem_type  : uint               // SSBO runtime-array element type-id (vec/struct elements can't go through emit_type)
+    is_sampler_array : bool         // a fixed-count descriptor array of combined image samplers (sampler2D[N], etc.) -- UniformConstant OpTypeArray of OpTypeSampledImage; accessed via samplers[idx] -> OpAccessChain
+    arr_count  : int                // descriptor-array element count (when is_sampler_array; > 0); 0 for non-array
+    elem_type  : uint               // SSBO runtime-array element type-id (vec/struct elements can't go through emit_type) OR descriptor-array element type-id (sampled-image / image / sampler)
     is_constant : bool              // a module-scope `let X = <const>` folded to an OpConstant; references resolve to const_id directly (no OpVariable / OpLoad)
     const_id   : uint               // the OpConstant result-id (when is_constant)
 }
@@ -62,6 +64,10 @@ struct EmitCtx {
     uses_frag_depth : bool                      // gl_FragDepth referenced (Output-only, so = written) -> emit DepthReplacing
     image_query_cap : bool                      // OpCapability ImageQuery already emitted (textureSize)
     input_attachment_cap : bool                 // OpCapability InputAttachment already emitted (subpassLoad)
+    draw_parameters_cap : bool                  // OpCapability DrawParameters already emitted (gl_DrawID)
+    descriptor_indexing_cap : bool              // OpCapability ShaderNonUniform + OpExtension "SPV_EXT_descriptor_indexing" already emitted (nonuniformEXT, descriptor arrays)
+    sampled_image_nu_cap : bool                 // OpCapability SampledImageArrayNonUniformIndexing already emitted (NonUniform-indexed sampler descriptor array)
+    nonuniform_ids : table<uint>                // set of result ids that carry the NonUniform decoration (nonuniformEXT marker + cascade through OpAccessChain / OpLoad on descriptor arrays)
     user_funcs    : table<uint64; UserFunc>     // intptr(Function) -> emittable user-defined shader function
     user_order    : array<uint64>               // user_funcs keys in stable emission order (collect_dependencies order)
     call_temps    : table<uint64; CallTemp>     // intptr(ref-arg Expression) -> its copy-in/out Function-storage temp
@@ -119,6 +125,7 @@ def finalize(var c : EmitCtx) {
     }
     delete c.user_order
     delete c.call_temps
+    delete c.nonuniform_ids
 }
 
 // ===== builtin name -> SpvBuiltIn + storage class + the stage it's legal in =====
@@ -138,6 +145,7 @@ def private builtin_info(name : string) : tuple<ok : bool; bi : SpvBuiltIn; stor
     if (name == "gl_PointSize") return (ok = true, bi = SpvBuiltIn.PointSize, storage = SpvStorageClass.Output, req = ShaderStage.Vertex)
     if (name == "gl_VertexIndex") return (ok = true, bi = SpvBuiltIn.VertexIndex, storage = SpvStorageClass.Input, req = ShaderStage.Vertex)
     if (name == "gl_InstanceIndex") return (ok = true, bi = SpvBuiltIn.InstanceIndex, storage = SpvStorageClass.Input, req = ShaderStage.Vertex)
+    if (name == "gl_DrawID") return (ok = true, bi = SpvBuiltIn.DrawIndex, storage = SpvStorageClass.Input, req = ShaderStage.Vertex)
     // fragment
     if (name == "gl_FragCoord") return (ok = true, bi = SpvBuiltIn.FragCoord, storage = SpvStorageClass.Input, req = ShaderStage.Fragment)
     if (name == "gl_FragDepth") return (ok = true, bi = SpvBuiltIn.FragDepth, storage = SpvStorageClass.Output, req = ShaderStage.Fragment)
@@ -177,20 +185,43 @@ def private round_up(off, a : int) : int {
 //! works; for float3x3 / float3x4 the daslang storage is packed (3-wide columns) while std140 pads
 //! each column to vec4, so bind code must repack per-column. **Use `matrix_width` to choose**:
 //! `matrix_width == 4` → safe to memcpy the field; `matrix_width < 4` → repack per column.
+//!
+//! **Composite fields** (`is_array` / `is_struct`) carry the std140 layout of nested data but
+//! cannot be written by a single host-side `write_field(ptr, offset, value)` call. Host bind
+//! macros should detect `is_composite` and either recurse member-by-member using the published
+//! `offset` + `array_stride` / nested layout, or skip with a clear "manual bind required" message.
 struct public BlockField {
-    name         : string //!< field name as declared in the daslang struct
-    offset       : int    //!< std140 byte offset from the block base
-    size         : int    //!< std140 base size of the field (matrices: 16 * cols)
-    is_matrix    : bool   //!< true if this field is a matrix (MatrixStride 16 in SPIR-V); see struct docstring re: repack
-    matrix_width : int    //!< matrix column-vector width — 4 for float4x4 (memcpy-safe); 3 for float3x3/3x4 (per-column repack)
-    matrix_cols  : int    //!< matrix column count (only valid when is_matrix); 0 otherwise
+    name              : string //!< field name as declared in the daslang struct
+    offset            : int    //!< std140 byte offset from the block base
+    size              : int    //!< std140 base size of the field (matrices: 16 * cols; composites: total laid-out bytes)
+    is_matrix         : bool   //!< true if this field is a matrix (MatrixStride 16 in SPIR-V); see struct docstring re: repack
+    matrix_width      : int    //!< matrix column-vector width — 4 for float4x4 (memcpy-safe); 3 for float3x3/3x4 (per-column repack)
+    matrix_cols       : int    //!< matrix column count (only valid when is_matrix); 0 otherwise
+    is_array          : bool   //!< true if this field is a fixed-array (scalar / vector / nested-struct elements)
+    array_count       : int    //!< number of array elements (only valid when is_array)
+    array_stride      : int    //!< per-element byte stride (std140 rounds each element up to 16); 0 otherwise
+    is_struct         : bool   //!< the struct-element marker. True when the field is a nested struct (`is_array=false`) OR a fixed-array whose elements are nested structs (`is_array=true` — disambiguate via is_array). Host bind macros that handle composites recurse into the inner Structure via compute_block_layout in either case.
+    is_composite      : bool   //!< convenience flag — true when is_array OR is_struct (host bind macros can't write this with a flat overload)
+}
+
+// std140 element stride for a fixed-array element type. Scalars/vectors round up to vec4 (16 bytes);
+// nested-struct elements take their std140 struct-size rounded up to the struct alignment (which is
+// already a multiple of 16 by std140's struct rule). Matrix elements and nested-array elements are
+// out of PR-G scope and rejected by the caller before reaching here.
+def private std140_array_element_stride(bt : Type) : int {
+    return round_up(std140_size(bt), 16)
 }
 
 //! Compute the std140 layout of one interface block. Pure: takes a Structure?, fills `fields` with
-//! per-field offsets / sizes / matrix flags, returns the block total size and max member alignment.
-//! Used by build_block_struct (SPIR-V type emit) and by host-side bind macros. Rejects bool and
-//! non-numeric fields fail-closed (no physical std140 layout). `sname` is only used in error messages.
-//! `fields` is cleared at entry so reuse across calls and partial-failure returns can't bleed.
+//! per-field offsets / sizes / matrix and composite flags, returns the block total size and max
+//! member alignment. Used by build_block_struct (SPIR-V type emit) and by host-side bind macros.
+//! Rejects bool and non-numeric fields fail-closed (no physical std140 layout). `sname` is only used
+//! in error messages. `fields` is cleared at entry so reuse across calls and partial-failure returns
+//! can't bleed. Supported field shapes (PR-G complete): 32-bit scalar / vector / matrix; nested
+//! struct (recursive); fixed-array of scalar / vector (std140 ArrayStride = element-size rounded to
+//! 16); fixed-array of nested struct (ArrayStride = laid-out struct size rounded to struct
+//! alignment). Out of scope (clean rejection): matrix-of-array, array-of-array, runtime arrays
+//! (use `@ssbo` for those).
 //! [macro_function]: callable from a backend's bind-gen macro at compile time, mirrors generate_spirv.
 [macro_function]
 def public compute_block_layout(sname : string; st : Structure?; var fields : array<BlockField>; var errors : array<string>) : tuple<ok : bool; size : int; align : int> {
@@ -202,6 +233,7 @@ def public compute_block_layout(sname : string; st : Structure?; var fields : ar
     var off = 0
     var max_align = 0
     for (fld in st.fields) {
+        // matrix field (terminal)
         let mi = matrix_info(fld._type)
         if (mi.ok) {
             off = round_up(off, 16)
@@ -211,9 +243,89 @@ def public compute_block_layout(sname : string; st : Structure?; var fields : ar
             max_align = max(max_align, 16)
             continue
         }
+        // nested struct field (PR-G): recurse. Base alignment = round_up(inner_align, 16);
+        // size = round_up(inner_size, base_align). The inner field list isn't propagated up
+        // (host bind macros that recurse must re-invoke compute_block_layout on the nested
+        // Structure?). is_composite=true signals "no flat write_field overload exists".
+        if (fld._type != null && fld._type.baseType == Type.tStructure && fld._type.structType != null) {
+            var inner : array<BlockField>
+            let inner_layout = compute_block_layout("{sname}.{fld.name}", fld._type.structType, inner, errors)
+            delete inner
+            if (!inner_layout.ok) {
+                fields |> clear
+                return (ok = false, size = 0, align = 0)
+            }
+            let struct_align = round_up(inner_layout.align, 16)
+            off = round_up(off, struct_align)
+            let struct_size = round_up(inner_layout.size, struct_align)
+            fields |> emplace(BlockField(name := string(fld.name), offset = off, size = struct_size,
+                is_matrix = false, matrix_width = 0, matrix_cols = 0,
+                is_array = false, array_count = 0, array_stride = 0,
+                is_struct = true, is_composite = true))
+            off += struct_size
+            max_align = max(max_align, struct_align)
+            continue
+        }
+        // fixed-array field (PR-G): element kind decides stride. Scalar/vector elements stride by
+        // their size rounded up to 16 (the std140 array padding rule — every array slot is at
+        // least vec4-wide). Nested-struct elements stride by their laid-out struct size. Matrix
+        // elements and nested-array elements (array of array) are rejected; wrap in a struct.
+        if (fld._type != null && fld._type.baseType == Type.tFixedArray && fld._type.firstType != null) {
+            let et = fld._type.firstType
+            let nelem = fld._type.fixedDim
+            if (nelem <= 0) {
+                errors |> push("interface block '{sname}' field '{fld.name}': array must have positive count (got {nelem})")
+                fields |> clear
+                return (ok = false, size = 0, align = 0)
+            }
+            // scalar / vector element
+            if (et.baseType != Type.tStructure && et.baseType != Type.tFixedArray && !matrix_info(et).ok) {
+                let ebt = et.baseType
+                if (scalar_class(ebt) < 0) {
+                    errors |> push("interface block '{sname}' field '{fld.name}': array element type {ebt} is not supported (only 32-bit int/uint/float scalars, their vectors, or nested structs of those)")
+                    fields |> clear
+                    return (ok = false, size = 0, align = 0)
+                }
+                let stride = std140_array_element_stride(ebt)
+                off = round_up(off, 16)        // std140 array base alignment is 16
+                let total = stride * nelem
+                fields |> emplace(BlockField(name := string(fld.name), offset = off, size = total,
+                    is_matrix = false, matrix_width = 0, matrix_cols = 0,
+                    is_array = true, array_count = nelem, array_stride = stride,
+                    is_struct = false, is_composite = true))
+                off += total
+                max_align = max(max_align, 16)
+                continue
+            }
+            // array-of-struct element
+            if (et.baseType == Type.tStructure && et.structType != null) {
+                var inner : array<BlockField>
+                let inner_layout = compute_block_layout("{sname}.{fld.name}[]", et.structType, inner, errors)
+                delete inner
+                if (!inner_layout.ok) {
+                    fields |> clear
+                    return (ok = false, size = 0, align = 0)
+                }
+                let struct_align = round_up(inner_layout.align, 16)
+                let stride = round_up(inner_layout.size, struct_align)
+                off = round_up(off, struct_align)
+                let total = stride * nelem
+                fields |> emplace(BlockField(name := string(fld.name), offset = off, size = total,
+                    is_matrix = false, matrix_width = 0, matrix_cols = 0,
+                    is_array = true, array_count = nelem, array_stride = stride,
+                    is_struct = true, is_composite = true))
+                off += total
+                max_align = max(max_align, struct_align)
+                continue
+            }
+            errors |> push("interface block '{sname}' field '{fld.name}': array element type {et.baseType} is not supported (only scalar/vector or nested-struct elements; matrix-of-array and array-of-array are out of scope)")
+            fields |> clear
+            return (ok = false, size = 0, align = 0)
+        }
+        // terminal scalar / vector field
         let fbt = fld._type.baseType
         if (scalar_class(fbt) < 0) {
-            errors |> push("interface block '{sname}' field '{fld.name}': type {fbt} is not supported (only 32-bit int/uint/float scalars, their vectors, and matrices; bool has no physical interface-block layout in Vulkan)")
+            errors |> push("interface block '{sname}' field '{fld.name}': type {fbt} is not supported (only 32-bit int/uint/float scalars, their vectors, matrices, fixed-arrays of those, and nested structs of those; bool has no physical interface-block layout in Vulkan)")
             fields |> clear
             return (ok = false, size = 0, align = 0)
         }
@@ -227,14 +339,14 @@ def public compute_block_layout(sname : string; st : Structure?; var fields : ar
     return (ok = true, size = off, align = max_align)
 }
 
-// Build a laid-out interface struct from a daslang struct's fields. 32-bit scalar/vector/matrix
-// members are supported; nested structs and arrays are not yet. `as_block` toggles the Block decoration
-// (true for @uniform/@push_constant blocks, false for an SSBO runtime-array element struct).
-// Member offsets are identical under std140 and std430 for these flat member kinds — the two layouts
-// only diverge on array/nested-struct members (rejected here) and on the final struct-size rounding,
-// which the caller does via the returned `align` (max member base alignment). `size` is the offset
-// past the last member (the push-constant range size); `align` lets the SSBO caller round it up to
-// the std430 array stride.
+// Build a laid-out interface struct from a daslang struct's fields. Supported member shapes:
+// 32-bit scalar / vector / matrix; fixed-array of scalar / vector / nested struct (std140
+// ArrayStride decoration on the OpTypeArray); nested struct (recursive non-Block OpTypeStruct with
+// its own Offset cascade). `as_block` toggles the Block decoration on the *outer* struct (true for
+// @uniform/@push_constant blocks, false for an SSBO runtime-array element struct); recursively-built
+// nested structs are always emitted non-Block. Returns the OpTypeStruct id plus the std140 size
+// (offset past the last member) and the struct's max-member alignment (which the SSBO caller rounds
+// the struct size up to before using it as the OpTypeRuntimeArray's stride).
 def private build_block_struct(var m : SpirvModule; sname : string; st : Structure?; as_block : bool; var errors : array<string>) : tuple<ok : bool; type_id : uint; size : int; align : int> {
     var fields : array<BlockField>
     let layout = compute_block_layout(sname, st, fields, errors)
@@ -248,6 +360,41 @@ def private build_block_struct(var m : SpirvModule; sname : string; st : Structu
     var fi = 0
     for (fld in st.fields) {
         let f = fields[fi]
+        // composite field: fixed-array or nested struct — build its SPIR-V type recursively. Plain
+        // emit_type(fld._type) doesn't lower tStructure (would panic) and would emit a strideless
+        // OpTypeArray for a fixed-array member (invalid in a Block). Layout was already validated
+        // by compute_block_layout above; here we just construct the matching type ids.
+        if (f.is_array) {
+            let et = fld._type.firstType
+            var elem_type : uint = 0u
+            if (et.baseType == Type.tStructure && et.structType != null) {
+                let inner = build_block_struct(m, "{sname}.{f.name}[]", et.structType, false, errors)
+                if (!inner.ok) {
+                    delete members; delete offsets; delete mat_strides; delete fields
+                    return (ok = false, type_id = 0u, size = 0, align = 0)
+                }
+                elem_type = inner.type_id
+            } else {
+                elem_type = emit_type(m, et)
+            }
+            members |> push(type_array_strided(m, elem_type, f.array_count, f.array_stride))
+            offsets |> push(f.offset)
+            mat_strides |> push(0)
+            fi++
+            continue
+        }
+        if (f.is_struct) {
+            let inner = build_block_struct(m, "{sname}.{f.name}", fld._type.structType, false, errors)
+            if (!inner.ok) {
+                delete members; delete offsets; delete mat_strides; delete fields
+                return (ok = false, type_id = 0u, size = 0, align = 0)
+            }
+            members |> push(inner.type_id)
+            offsets |> push(f.offset)
+            mat_strides |> push(0)
+            fi++
+            continue
+        }
         members |> push(emit_type(m, fld._type))
         offsets |> push(f.offset)
         // std140 matrix: ColMajor, each column padded to vec4 (MatrixStride 16) — see BlockField docs.
@@ -365,6 +512,11 @@ def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : Variable
         if (bi.bi == SpvBuiltIn.FragDepth) {
             ctx.uses_frag_depth = true
         }
+        // gl_DrawID -> BuiltIn DrawIndex pulls in the DrawParameters capability (the multi-draw
+        // draw-call ordinal isn't part of the base Shader cap).
+        if (bi.bi == SpvBuiltIn.DrawIndex) {
+            ensure_draw_parameters(m, ctx)
+        }
         return
     }
     // stage I/O: @in / @out user variables carry an explicit @location. They become Input/Output
@@ -406,6 +558,50 @@ def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : Variable
         ctx.globals |> insert(intptr(v), GlobalInfo(var_id = vid, storage = storage, value_type = vt, is_ssbo = false))
         ctx.interface_ids |> push(vid)
         return
+    }
+    // descriptor array of combined image samplers (sampler2D[N], samplerCube[N], etc.) -- the
+    // VK_EXT_descriptor_indexing surface that lets one shader index a pool of resources by a
+    // per-invocation value. Lowers to UniformConstant OpTypeArray of OpTypeSampledImage, sampled via
+    // texture(arr[i], uv) -> OpAccessChain + OpLoad + OpImageSample*. PR-C scope is fixed-count only;
+    // runtime-sized arrays (sampler2D[]) need RuntimeDescriptorArray + variable-descriptor-count
+    // binding plumbing and ship in a follow-up. Other resource-array flavours (image2D[N], texture2D
+    // [N], sampler[N], subpassInput[N]) likewise follow.
+    if (v._type != null && v._type.baseType == Type.tFixedArray && v._type.firstType != null) {
+        let esi = sampler_info(v._type.firstType)
+        if (esi.ok) {
+            // post-0.6.3 tFixedArray is structural: one node per dim, fixedDim is THIS level's count.
+            // Multi-dim sampler arrays are not a Vulkan thing (descriptors are 1-D), so reject any
+            // outer fixed-array whose element is itself a fixed-array.
+            if (v._type.firstType.baseType == Type.tFixedArray) {
+                errors |> push("sampler descriptor array '{vname}' must be single-dimensional; got nested fixed-arrays")
+                return
+            }
+            if (v._type.fixedDim <= 0) {
+                errors |> push("sampler descriptor array '{vname}' must have positive count (got {v._type.fixedDim})")
+                return
+            }
+            let n = v._type.fixedDim
+            let img = type_image(m, type_float(m, 32u), esi.dim, esi.arrayed, 1u, SpvImageFormat.Unknown, esi.depth)
+            let simg = type_sampled_image(m, img)
+            let arr = type_array(m, simg, n)
+            let pt = type_pointer(m, SpvStorageClass.UniformConstant, arr)
+            let vid = alloc_id(m)
+            emit(m, SEC_TYPES, SpvOp.Variable, pt, vid, uint(SpvStorageClass.UniformConstant))
+            let set = v.annotation |> find_arg("set") ?as tInt ?? 0
+            let binding = v.annotation |> find_arg("binding") ?as tInt ?? 0
+            if (set < 0 || binding < 0) {
+                errors |> push("sampler descriptor array '{vname}' set/binding must be non-negative (got set={set}, binding={binding})")
+                return
+            }
+            emit(m, SEC_DECOR, SpvOp.Decorate, vid, uint(SpvDecoration.DescriptorSet), uint(set))
+            emit(m, SEC_DECOR, SpvOp.Decorate, vid, uint(SpvDecoration.Binding), uint(binding))
+            ctx.globals |> insert(intptr(v), GlobalInfo(var_id = vid, storage = SpvStorageClass.UniformConstant,
+                value_type = arr, is_sampler_array = true, arr_count = n, elem_type = simg))
+            let kind = esi.depth != 0u ? SpirvDescriptorKind.comparison_sampler : SpirvDescriptorKind.combined_image_sampler
+            reflection.bindings |> push(SpirvDescriptorBinding(set = set, binding = binding,
+                kind = kind, count = n, stages = stage_flag(stage)))
+            return
+        }
     }
     // combined image sampler: a global of an opaque sampler type (sampler2D) -> UniformConstant
     // OpTypeSampledImage + DescriptorSet/Binding. Used only via texture(); not in the entry interface.
@@ -845,6 +1041,38 @@ def private ensure_input_attachment(var m : SpirvModule; var ctx : EmitCtx) {
     ctx.input_attachment_cap = true
 }
 
+// gl_DrawID -> BuiltIn DrawIndex requires the DrawParameters capability (in SPIR-V core at 1.3, no
+// extension needed at our target). Emit-once + ctx-flag dedupe.
+def private ensure_draw_parameters(var m : SpirvModule; var ctx : EmitCtx) {
+    if (ctx.draw_parameters_cap) return
+    emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.DrawParameters))
+    ctx.draw_parameters_cap = true
+}
+
+// Descriptor indexing (Vulkan VK_EXT_descriptor_indexing): nonuniformEXT() emits the NonUniform
+// decoration, and descriptor arrays index OpAccessChain into a runtime-sized resource pool. Both
+// flavours require the ShaderNonUniform capability and the SPV_EXT_descriptor_indexing extension at
+// SPIR-V <= 1.4 (in core at 1.5). Emit-once + ctx-flag dedupe; OpExtension goes to SEC_EXT (which
+// concatenates between SEC_CAPS and the body).
+def private ensure_descriptor_indexing(var m : SpirvModule; var ctx : EmitCtx) {
+    if (ctx.descriptor_indexing_cap) return
+    emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.ShaderNonUniform))
+    var nm <- string_words("SPV_EXT_descriptor_indexing")
+    emit_n(m, SEC_EXT, SpvOp.Extension, nm)
+    delete nm
+    ctx.descriptor_indexing_cap = true
+}
+
+// A NonUniform-indexed sampler descriptor array additionally requires the per-resource-type
+// capability. SampledImageArrayNonUniformIndexing covers combined image samplers (the sampler2D[N]
+// surface PR-C ships). Other descriptor-array flavours (storage images, SSBOs, UBOs, input
+// attachments) carry their own per-resource caps -- they will land alongside their array surface.
+def private ensure_sampled_image_array_nonuniform(var m : SpirvModule; var ctx : EmitCtx) {
+    if (ctx.sampled_image_nu_cap) return
+    emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.SampledImageArrayNonUniformIndexing))
+    ctx.sampled_image_nu_cap = true
+}
+
 // daslang math builtin -> GLSL.std.450 ext-inst opcode. abs/min/max/clamp/sign pick the F/S/U
 // variant by operand class; the rest are float-only. Operand class comes from arg 0 (vectors
 // classify by lane kind, so length/normalize/cross/etc. read as float-class). ok=false => not a
@@ -1219,6 +1447,67 @@ class SpirvEmit : AstVisitor {
         errs |> push("internal: no rvalue available for {e.__rtti}")
         return 0u
     }
+    // Resolve a sampler/sampler-array argument to a loaded sampled-image SSA id. Handles BOTH
+    // the scalar form `texture(my_sampler, uv)` (gi.is_sampler) AND the descriptor-array form
+    // `texture(my_arr[idx], uv)` (gi.is_sampler_array): emits OpAccessChain + OpLoad and cascades
+    // the NonUniform decoration when the index value carries it (PR-C bindless rail). Returns
+    // `sg_type` resolved to the ELEMENT sampler type so downstream sampler_info(sg_type) gets the
+    // right Dim / Arrayed / Depth -- the caller does not need to know array vs scalar.
+    def resolve_sampler_arg(arg : ExpressionPtr; intrinsic_name : string) : tuple<sg : Variable const?; sg_type : TypeDecl?; simg : uint; ok : bool> {
+        var bm & = unsafe(*m)
+        let direct = global_var_of(arg)
+        if (direct != null) {
+            let gi = ctx.globals?[intptr(direct)] ?? GlobalInfo()
+            if (gi.is_sampler) {
+                let simg_id = alloc_id(bm)
+                emit(bm, SEC_FUNCS, SpvOp.Load, gi.value_type, simg_id, gi.var_id)
+                return (sg = direct, sg_type = direct._type, simg = simg_id, ok = true)
+            }
+            if (gi.is_sampler_array) {
+                errs |> push("{intrinsic_name}: '{direct.name}' is a descriptor array; index into it with [idx]")
+                return (sg = null, sg_type = null, simg = 0u, ok = false)
+            }
+            errs |> push("{intrinsic_name}: '{direct.name}' is not a sampler")
+            return (sg = null, sg_type = null, simg = 0u, ok = false)
+        }
+        let at = arg ?as ExprAt
+        if (at == null) {
+            errs |> push("{intrinsic_name}: first argument must be a sampler global or a descriptor-array element (samplers[idx])")
+            return (sg = null, sg_type = null, simg = 0u, ok = false)
+        }
+        let arr_g = global_var_of(at.subexpr)
+        if (arr_g == null) {
+            errs |> push("{intrinsic_name}: descriptor-array index must target a sampler-array global")
+            return (sg = null, sg_type = null, simg = 0u, ok = false)
+        }
+        let gi = ctx.globals?[intptr(arr_g)] ?? GlobalInfo()
+        if (!gi.is_sampler_array) {
+            errs |> push("{intrinsic_name}: '{arr_g.name}' is not a sampler descriptor array")
+            return (sg = null, sg_type = null, simg = 0u, ok = false)
+        }
+        let idx = value_of(at.index)
+        if (idx == 0u) return (sg = null, sg_type = null, simg = 0u, ok = false)
+        let elem_ptr_t = type_pointer(bm, SpvStorageClass.UniformConstant, gi.elem_type)
+        let elem_ptr = alloc_id(bm)
+        emit(bm, SEC_FUNCS, SpvOp.AccessChain, elem_ptr_t, elem_ptr, gi.var_id, idx)
+        // NonUniform cascade: NonUniform on the index propagates to the access-chain pointer AND
+        // the loaded sampler value. The per-resource SampledImageArrayNonUniformIndexing cap rides
+        // along; the base ShaderNonUniform cap + SPV_EXT_descriptor_indexing extension already
+        // arrived with the nonuniformEXT marker (PR-B).
+        let idx_nu = ctx.nonuniform_ids |> key_exists(idx)
+        if (idx_nu) {
+            ensure_sampled_image_array_nonuniform(bm, *ctx)
+            emit(bm, SEC_DECOR, SpvOp.Decorate, elem_ptr, uint(SpvDecoration.NonUniform))
+            ctx.nonuniform_ids |> insert(elem_ptr)
+        }
+        let simg_id = alloc_id(bm)
+        emit(bm, SEC_FUNCS, SpvOp.Load, gi.elem_type, simg_id, elem_ptr)
+        if (idx_nu) {
+            emit(bm, SEC_DECOR, SpvOp.Decorate, simg_id, uint(SpvDecoration.NonUniform))
+            ctx.nonuniform_ids |> insert(simg_id)
+        }
+        return (sg = arr_g, sg_type = arr_g._type.firstType, simg = simg_id, ok = true)
+    }
     def ptr_of(e : ExpressionPtr) : tuple<id : uint; pty : uint> {
         let k = intptr(e)
         if (key_exists(e2ptr, k)) return (id = e2ptr?[k] ?? 0u, pty = e2pty?[k] ?? 0u)
@@ -1393,7 +1682,30 @@ class SpirvEmit : AstVisitor {
         }
         let bv = global_var_of(expr.subexpr)
         if (bv == null) {
-            errs |> push("indexing is only supported on a global ssbo array or a local fixed array for now")
+            // PR-G: indexing a fixed-array field inside a Block (ubo.lights[i] / ubo.material.kernel[i]).
+            // The subexpr is a chained ExprField whose e2ptr is a pointer to the array. Chain a
+            // single index off it; the storage class is inherited from the root global. For a
+            // struct element, plain emit_type would panic (it doesn't lower tStructure) and would
+            // also not return the laid-out (deduped) type — so re-acquire it via build_block_struct,
+            // which is idempotent under the type/decoration dedup pools.
+            if (key_exists(e2ptr, intptr(expr.subexpr))) {
+                let idx = value_of(expr.index)
+                if (idx == 0u) return expr   // index failed to lower (error already pushed)
+                let base = ptr_of(expr.subexpr)
+                let rv = root_global_of(expr.subexpr)
+                let rgi = rv != null ? (ctx.globals?[intptr(rv)] ?? GlobalInfo()) : GlobalInfo()
+                let storage = rgi.var_id != 0u ? rgi.storage : SpvStorageClass.StorageBuffer
+                let rname = rv != null ? string(rv.name) : "(?)"
+                let pointee = field_pointee_type(bm, expr._type, "{rname}[]")
+                if (pointee == 0u) return expr
+                let ptr_t = type_pointer(bm, storage, pointee)
+                let res = alloc_id(bm)
+                emit(bm, SEC_FUNCS, SpvOp.AccessChain, ptr_t, res, base.id, idx)
+                e2ptr[k] = res
+                e2pty[k] = pointee
+                return expr
+            }
+            errs |> push("indexing is only supported on a global ssbo array, a local fixed array, or an array field inside a @uniform/@push_constant/@ssbo block")
             return expr
         }
         let gi = ctx.globals?[intptr(bv)] ?? GlobalInfo()
@@ -1410,8 +1722,17 @@ class SpirvEmit : AstVisitor {
             e2pty[k] = pointee
             return expr
         }
+        // descriptor array of samplers (sampler2D[N], etc.): the ExprAt is read STRUCTURALLY by the
+        // texture/textureLod/textureCompare/textureSize/texelFetch handler (resolve_sampler_arg),
+        // which emits the OpAccessChain + OpLoad and cascades NonUniform when warranted. Skip
+        // emission here -- leaving no e2id/e2ptr entry is fine because the call-site walks the AST
+        // directly; any other consumer (which doesn't exist for an opaque sampler value) would
+        // surface a clean "no rvalue available" fail-closed.
+        if (gi.is_sampler_array) {
+            return expr
+        }
         if (!gi.is_ssbo) {
-            errs |> push("only ssbo or @workgroup array indexing is supported for now")
+            errs |> push("only ssbo, @workgroup, or sampler descriptor-array indexing is supported for now")
             return expr
         }
         let idx = value_of(expr.index)
@@ -1630,9 +1951,60 @@ class SpirvEmit : AstVisitor {
         return expr
     }
 
+    // Compute the OpAccessChain pointee type-id for a Block-member access. Scalars/vectors/matrices
+    // pass through emit_type. Nested structs and fixed-arrays need their LAID-OUT type ids (with
+    // Offset / MatrixStride / ArrayStride decorations) — produced by recursing through
+    // build_block_struct (idempotent under the type/decoration dedup pools). Used by both
+    // visitExprField (direct + chained branches) and any other site that needs a Block-member
+    // pointee type. `sname` is only used in error messages emitted by the recursion.
+    def field_pointee_type(var bm : SpirvModule; ft : TypeDecl?; sname : string) : uint {
+        if (ft == null) {
+            errs |> push("internal: null field type at {sname}")
+            return 0u
+        }
+        // matrices come back through emit_type -> type_matrix correctly; only tStructure and
+        // tFixedArray need the layout-aware path.
+        if (ft.baseType == Type.tStructure && ft.structType != null) {
+            let inner = build_block_struct(bm, sname, ft.structType, false, errs)
+            if (!inner.ok) return 0u
+            return inner.type_id
+        }
+        if (ft.baseType == Type.tFixedArray && ft.firstType != null) {
+            let et = ft.firstType
+            let nelem = ft.fixedDim
+            var elem_type : uint = 0u
+            if (et.baseType == Type.tStructure && et.structType != null) {
+                let inner = build_block_struct(bm, "{sname}[]", et.structType, false, errs)
+                if (!inner.ok) return 0u
+                elem_type = inner.type_id
+            } else {
+                elem_type = emit_type(bm, et)
+            }
+            // std140 element stride: scalar/vector rounds up to vec4; struct element strides by its
+            // laid-out size rounded to the struct alignment. matrix-of-array is out of PR-G scope.
+            // The struct-element probe routes its diagnostics through the visitor's `errs` so a
+            // layout failure here surfaces the same detailed message a direct classify_global path
+            // would (was a local array that swallowed errors).
+            var stride = 0
+            if (et.baseType == Type.tStructure && et.structType != null) {
+                var probe : array<BlockField>
+                let pl = compute_block_layout("{sname}[]", et.structType, probe, errs)
+                delete probe
+                if (!pl.ok) return 0u
+                let salign = round_up(pl.align, 16)
+                stride = round_up(pl.size, salign)
+            } else {
+                stride = round_up(std140_size(et.baseType), 16)
+            }
+            return type_array_strided(bm, elem_type, nelem, stride)
+        }
+        return emit_type(bm, ft)
+    }
+
     // ----- member of a Block global (ubo.color) -> OpAccessChain by field index -> pointer -----
-    // Two shapes: a direct block global (ubo.color), and a field of an indexed SSBO struct element
-    // (particles[i].pos) where expr.value is the ExprAt's element pointer — chain the field off it.
+    // Two shapes: a direct block global (ubo.color), and a field of an indexed / nested chain (e.g.
+    // particles[i].pos, or ubo.outer.inner under PR-G) where expr.value is the previous step's
+    // pointer — chain the field off it in the *root global's* storage class.
     def override visitExprField(var expr : ExprField?) : ExpressionPtr {
         var bm & = unsafe(*m)
         let k = intptr(expr)
@@ -1650,11 +2022,16 @@ class SpirvEmit : AstVisitor {
                     errs |> push("member access '.{expr.name}': no such field")
                     return expr
                 }
-                // chain the field pointer in the element pointer's storage class (StorageBuffer for an SSBO)
-                let av = expr.value ?as ExprAt
-                let rgi = av != null ? (ctx.globals?[intptr(global_var_of(av.subexpr))] ?? GlobalInfo()) : GlobalInfo()
+                // chain the field pointer in the root global's storage class (StorageBuffer for an
+                // SSBO, Uniform for a UBO, PushConstant for @push_constant). Walking the whole chain
+                // via root_global_of catches deeply nested forms (ubo.outer.inner under PR-G); the
+                // pre-PR-G code only handled ExprAt-rooted chains and defaulted everything else to
+                // StorageBuffer, which mismatched the base pointer's type for Uniform/PushConstant.
+                let rv = root_global_of(expr.value)
+                let rgi = rv != null ? (ctx.globals?[intptr(rv)] ?? GlobalInfo()) : GlobalInfo()
                 let storage = rgi.var_id != 0u ? rgi.storage : SpvStorageClass.StorageBuffer
-                let pointee = emit_type(bm, expr._type)
+                let pointee = field_pointee_type(bm, expr._type, "{est.name}.{expr.name}")
+                if (pointee == 0u) return expr
                 let ptr_t = type_pointer(bm, storage, pointee)
                 let res = alloc_id(bm)
                 emit(bm, SEC_FUNCS, SpvOp.AccessChain, ptr_t, res, base.id, const_uint(bm, uint(midx)))
@@ -1675,7 +2052,8 @@ class SpirvEmit : AstVisitor {
             errs |> push("member access '.{expr.name}': no such field on '{bv.name}'")
             return expr
         }
-        let pointee = emit_type(bm, expr._type)
+        let pointee = field_pointee_type(bm, expr._type, "{bv.name}.{expr.name}")
+        if (pointee == 0u) return expr
         let ptr_t = type_pointer(bm, gi.storage, pointee)
         let res = alloc_id(bm)
         emit(bm, SEC_FUNCS, SpvOp.AccessChain, ptr_t, res, gi.var_id, const_uint(bm, uint(midx)))
@@ -1842,6 +2220,28 @@ class SpirvEmit : AstVisitor {
             e2id[k] = res
             return expr
         }
+        // nonuniformEXT(x): the VK_EXT_descriptor_indexing marker. Emits OpCopyObject to give the
+        // value a fresh result id, then OpDecorate <new_id> NonUniform so the marker scopes to this
+        // use only (decorating the input id would leak NonUniform onto every other consumer of the
+        // same SSA value). The marked id is recorded in ctx.nonuniform_ids so the descriptor-array
+        // access path (texture(arr[i], uv)) can detect the marker on its index value and cascade
+        // the NonUniform decoration onto the access-chain pointer + the loaded sampler.
+        if (name == "nonuniformEXT") {
+            if (length(expr.arguments) != 1) {
+                errs |> push("nonuniformEXT expects 1 argument")
+                return expr
+            }
+            let v = value_of(expr.arguments[0])
+            if (v == 0u) return expr
+            ensure_descriptor_indexing(bm, *ctx)
+            let rt = emit_type(bm, expr._type)
+            let res = alloc_id(bm)
+            emit(bm, SEC_FUNCS, SpvOp.CopyObject, rt, res, v)
+            emit(bm, SEC_DECOR, SpvOp.Decorate, res, uint(SpvDecoration.NonUniform))
+            ctx.nonuniform_ids |> insert(res)
+            e2id[k] = res
+            return expr
+        }
         // dFdx/dFdy/fwidth: screen-space derivatives over the 2x2 quad (OpDPdx/OpDPdy/OpFwidth).
         // Fragment-only; one float/floatN operand, same-typed result. No extra capability (the basic
         // forms need only Shader; the *Fine/*Coarse variants would need DerivativeControl).
@@ -1870,25 +2270,15 @@ class SpirvEmit : AstVisitor {
                 errs |> push("textureSize expects (sampler, lod)")
                 return expr
             }
-            let sg = global_var_of(expr.arguments[0])
-            if (sg == null) {
-                errs |> push("textureSize: first argument must be a sampler global")
-                return expr
-            }
-            let gi = ctx.globals?[intptr(sg)] ?? GlobalInfo()
-            if (!gi.is_sampler) {
-                errs |> push("textureSize: '{sg.name}' is not a sampler")
-                return expr
-            }
+            let rs = resolve_sampler_arg(expr.arguments[0], "textureSize")
+            if (!rs.ok) return expr
             ensure_image_query(bm, *ctx)
-            let simg = alloc_id(bm)
-            emit(bm, SEC_FUNCS, SpvOp.Load, gi.value_type, simg, gi.var_id)
-            let si = sampler_info(sg._type)
+            let si = sampler_info(rs.sg_type)
             // reconstruct the SAME image type classify_global built for this sampler so OpImage's
             // result type matches the sampled image's image type -- depth included (type_image dedups on it)
             let img_type = type_image(bm, type_float(bm, 32u), si.dim, si.arrayed, 1u, SpvImageFormat.Unknown, si.depth)
             let img = alloc_id(bm)
-            emit(bm, SEC_FUNCS, SpvOp.Image, img_type, img, simg)
+            emit(bm, SEC_FUNCS, SpvOp.Image, img_type, img, rs.simg)
             let lod = value_of(expr.arguments[1])
             if (lod == 0u) return expr
             let rt = emit_type(bm, expr._type)
@@ -1910,30 +2300,26 @@ class SpirvEmit : AstVisitor {
                 errs |> push("textureCompare: implicit-LOD depth-compare sampling is only valid in a fragment shader")
                 return expr
             }
-            let sg = global_var_of(expr.arguments[0])
-            if (sg == null) {
-                errs |> push("textureCompare: first argument must be a sampler2DShadow global")
+            let rs = resolve_sampler_arg(expr.arguments[0], "textureCompare")
+            if (!rs.ok) return expr
+            if (sampler_info(rs.sg_type).depth == 0u) {
+                errs |> push("textureCompare: '{rs.sg.name}' is not a sampler2DShadow (depth-compare sampler)")
                 return expr
             }
-            let gi = ctx.globals?[intptr(sg)] ?? GlobalInfo()
-            if (!gi.is_sampler || sampler_info(sg._type).depth == 0u) {
-                errs |> push("textureCompare: '{sg.name}' is not a sampler2DShadow (depth-compare sampler)")
-                return expr
-            }
-            let simg = alloc_id(bm)
-            emit(bm, SEC_FUNCS, SpvOp.Load, gi.value_type, simg, gi.var_id)
             let uv = value_of(expr.arguments[1])
             let dref = value_of(expr.arguments[2])
             if (uv == 0u || dref == 0u) return expr
             let rt = emit_type(bm, expr._type)
             let res = alloc_id(bm)
-            var ops <- [rt, res, simg, uv, dref]
+            var ops <- [rt, res, rs.simg, uv, dref]
             emit_n(bm, SEC_FUNCS, SpvOp.ImageSampleDrefImplicitLod, ops)
             delete ops
             e2id[k] = res
             return expr
         }
-        // texture(sampler, uv): OpLoad the sampled image + OpImageSampleImplicitLod
+        // texture(sampler, uv): OpLoad the sampled image + OpImageSampleImplicitLod. Descriptor-array
+        // form texture(arr[idx], uv) goes through resolve_sampler_arg, which emits the OpAccessChain +
+        // OpLoad and cascades NonUniform when the index carries it (PR-C bindless rail).
         if (name == "texture") {
             if (length(expr.arguments) != 2) {
                 errs |> push("texture expects (sampler, uv)")
@@ -1943,23 +2329,13 @@ class SpirvEmit : AstVisitor {
                 errs |> push("texture() implicit-LOD sampling is only valid in a fragment shader")
                 return expr
             }
-            let sg = global_var_of(expr.arguments[0])
-            if (sg == null) {
-                errs |> push("texture: first argument must be a sampler global")
-                return expr
-            }
-            let gi = ctx.globals?[intptr(sg)] ?? GlobalInfo()
-            if (!gi.is_sampler) {
-                errs |> push("texture: '{sg.name}' is not a sampler")
-                return expr
-            }
-            let simg = alloc_id(bm)
-            emit(bm, SEC_FUNCS, SpvOp.Load, gi.value_type, simg, gi.var_id)
+            let rs = resolve_sampler_arg(expr.arguments[0], "texture")
+            if (!rs.ok) return expr
             let uv = value_of(expr.arguments[1])
             if (uv == 0u) return expr
             let rt = emit_type(bm, expr._type)
             let res = alloc_id(bm)
-            emit(bm, SEC_FUNCS, SpvOp.ImageSampleImplicitLod, rt, res, simg, uv)
+            emit(bm, SEC_FUNCS, SpvOp.ImageSampleImplicitLod, rt, res, rs.simg, uv)
             e2id[k] = res
             return expr
         }
@@ -1970,24 +2346,14 @@ class SpirvEmit : AstVisitor {
                 errs |> push("textureLod expects (sampler, uv, lod)")
                 return expr
             }
-            let sg = global_var_of(expr.arguments[0])
-            if (sg == null) {
-                errs |> push("textureLod: first argument must be a sampler global")
-                return expr
-            }
-            let gi = ctx.globals?[intptr(sg)] ?? GlobalInfo()
-            if (!gi.is_sampler) {
-                errs |> push("textureLod: '{sg.name}' is not a sampler")
-                return expr
-            }
-            let simg = alloc_id(bm)
-            emit(bm, SEC_FUNCS, SpvOp.Load, gi.value_type, simg, gi.var_id)
+            let rs = resolve_sampler_arg(expr.arguments[0], "textureLod")
+            if (!rs.ok) return expr
             let uv = value_of(expr.arguments[1])
             let lod = value_of(expr.arguments[2])
             if (uv == 0u || lod == 0u) return expr
             let rt = emit_type(bm, expr._type)
             let res = alloc_id(bm)
-            var ops <- [rt, res, simg, uv, uint(SpvImageOperands.Lod), lod]
+            var ops <- [rt, res, rs.simg, uv, uint(SpvImageOperands.Lod), lod]
             emit_n(bm, SEC_FUNCS, SpvOp.ImageSampleExplicitLod, ops)
             delete ops
             e2id[k] = res
@@ -2000,25 +2366,15 @@ class SpirvEmit : AstVisitor {
                 errs |> push("texelFetch expects (sampler, coord, lod)")
                 return expr
             }
-            let sg = global_var_of(expr.arguments[0])
-            if (sg == null) {
-                errs |> push("texelFetch: first argument must be a sampler global")
-                return expr
-            }
-            let gi = ctx.globals?[intptr(sg)] ?? GlobalInfo()
-            if (!gi.is_sampler) {
-                errs |> push("texelFetch: '{sg.name}' is not a sampler")
-                return expr
-            }
-            let simg = alloc_id(bm)
-            emit(bm, SEC_FUNCS, SpvOp.Load, gi.value_type, simg, gi.var_id)
+            let rs = resolve_sampler_arg(expr.arguments[0], "texelFetch")
+            if (!rs.ok) return expr
             // extract the underlying image (same dedup key classify_global used for the sampler)
-            let si = sampler_info(sg._type)
+            let si = sampler_info(rs.sg_type)
             // reconstruct the SAME image type classify_global built for this sampler so OpImage's
             // result type matches the sampled image's image type -- depth included (type_image dedups on it)
             let img_type = type_image(bm, type_float(bm, 32u), si.dim, si.arrayed, 1u, SpvImageFormat.Unknown, si.depth)
             let img = alloc_id(bm)
-            emit(bm, SEC_FUNCS, SpvOp.Image, img_type, img, simg)
+            emit(bm, SEC_FUNCS, SpvOp.Image, img_type, img, rs.simg)
             let coord = value_of(expr.arguments[1])
             let lod = value_of(expr.arguments[2])
             if (coord == 0u || lod == 0u) return expr

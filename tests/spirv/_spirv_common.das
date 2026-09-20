@@ -371,6 +371,27 @@ def point_size {
     gl_PointSize = 4.0f                              // BuiltIn PointSize write -> screen-space splat width
 }
 
+// vertex: gl_DrawID (BuiltIn DrawIndex Input) — the multi-draw draw-call ordinal: 0 for the first
+// vkCmdDraw / vkCmdDrawIndirect entry, 1 for the second, etc. Lets one vertex shader pick per-draw
+// data (e.g. a per-draw transform out of an SSBO) without rebinding pipeline state. Triggers the
+// DrawParameters capability emission (in core in SPIR-V 1.3).
+[vertex_shader(name="draw_id_spv"), marker(no_coverage)]
+def draw_id_vs {
+    let x = float(gl_DrawID) * 0.1f                  // BuiltIn DrawIndex read -> per-draw offset
+    gl_Position = float4(x, 0.0f, 0.0f, 1.0f)
+}
+
+// vertex: nonuniformEXT(idx) — VK_EXT_descriptor_indexing marker. Lowers to OpCopyObject (fresh result
+// id) + OpDecorate NonUniform on the new id; triggers the OpCapability ShaderNonUniform + the
+// OpExtension "SPV_EXT_descriptor_indexing" once-per-module. The descriptor-array indexing path that
+// actually consumes the marked value lands in a separate slice; this fixture just exercises the marker
+// emission + cap + extension.
+[vertex_shader(name="nuext_spv"), marker(no_coverage)]
+def nuext_vs {
+    let i = nonuniformEXT(gl_VertexIndex)            // identity passthrough -> OpCopyObject + NonUniform decoration
+    gl_Position = float4(float(i), 0.0f, 0.0f, 1.0f)
+}
+
 // fragment: gl_PointCoord (BuiltIn PointCoord Input) — the UV inside a rasterised point primitive,
 // [0,1]^2 with (0.5, 0.5) at the centre of the sprite. Lets a fragment shader compute a circular
 // mask + soft falloff for "pretty point sprites" without uploading a texture; valid only when the
@@ -428,6 +449,18 @@ def public tri_vert_words : array<uint> {
 def public point_size_words : array<uint> {
     var w : array<uint>
     w |> push_from(point_size_spv)
+    return <- w
+}
+
+def public draw_id_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(draw_id_spv)
+    return <- w
+}
+
+def public nuext_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(nuext_spv)
     return <- w
 }
 
@@ -572,6 +605,44 @@ def public pc_frag_words : array<uint> {
     return <- w
 }
 
+// ===== PR-G nested-block fixture: a UBO whose fields span the THREE composite shapes the pre-PR-G
+// emitter rejected — a fixed-array of vec4 (ArrayStride 16), a nested struct (laid out non-Block at
+// offset 48 / aligned to 16), and an array of struct (per-element ArrayStride 32). Every composite
+// is read in the body so the OpAccessChain cascades (block -> field -> element -> sub-field) all
+// land, including the ubo.lights[i].field shape that exercises both the storage-class fix in
+// visitExprField and the chained-pointer branch in visitExprAt. =====
+struct NMaterial {
+    base_color : float4     // offset 0
+    roughness  : float      // offset 16
+    metallic   : float      // offset 20
+}                           // size 24, std140 align 16, padded to 32
+
+struct NLight {
+    pos   : float4          // offset 0
+    color : float4          // offset 16
+}                           // size 32, std140 align 16
+
+struct NestedUBO {
+    palette  : float4[3]    // offset 0,  ArrayStride 16, total 48
+    material : NMaterial    // offset 48 (aligned to 16), laid-out size 32
+    lights   : NLight[2]    // offset 80, ArrayStride 32, total 64
+}
+var @uniform @binding = 0 nubo : NestedUBO
+var @out @location = 0 nu_out : float4
+[fragment_shader(name="ubo_nested_spv"), marker(no_coverage)]
+def ubo_nested_frag {
+    let p = nubo.palette[0]                                 // array-of-vec4 element
+    let m = nubo.material.base_color * nubo.material.roughness  // nested-struct member
+    let l = nubo.lights[1].pos + nubo.lights[1].color       // array-of-struct member chain
+    nu_out = p + m + l
+}
+
+def public ubo_nested_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(ubo_nested_spv)
+    return <- w
+}
+
 // ===== Phase-4d combined image sampler fixture: a sampler2D global -> OpTypeImage +
 // OpTypeSampledImage in UniformConstant storage + DescriptorSet/Binding; texture(tex, uv) ->
 // OpLoad the sampled image + OpImageSampleImplicitLod (fragment-only, uses derivatives). =====
@@ -586,6 +657,30 @@ def tex_frag {
 def public tex_frag_words : array<uint> {
     var w : array<uint>
     w |> push_from(tex_frag_spv)
+    return <- w
+}
+
+// ===== PR-C descriptor array fixture: a sampler2D[8] global -> UniformConstant OpTypeArray of
+// OpTypeSampledImage + DescriptorSet/Binding with count=8; texture(samplers[i], uv) ->
+// OpAccessChain + OpLoad + OpImageSampleImplicitLod. nonuniformEXT on the index pulls in
+// SampledImageArrayNonUniformIndexing cap + cascades NonUniform decoration onto the access-chain
+// pointer + loaded sampler (the SPIR-V propagation rule for divergent descriptor indexing).
+struct DarrPush {
+    idx : int      // offset 0; the per-invocation descriptor index
+}
+var @set = 0 @binding = 0 samplers : sampler2D[8]
+var @push_constant darr_pc : DarrPush
+var @in @location = 0 darr_uv : float2
+var @out @location = 0 darr_out : float4
+[fragment_shader(name="darr_spv"), marker(no_coverage)]
+def darr_fs {
+    let i = nonuniformEXT(darr_pc.idx)    // OpCopyObject + NonUniform decoration on the marker id
+    darr_out = texture(samplers[i], darr_uv)  // OpAccessChain (NonUniform-cascaded) + OpLoad + sample
+}
+
+def public darr_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(darr_spv)
     return <- w
 }
 
@@ -1398,6 +1493,18 @@ def public phase10_6_emitter_opcodes : table<uint> {
 def public phase11_fn_emitter_opcodes : table<uint> {
     var s <- phase10_6_emitter_opcodes()
     for (op in [SpvOp.FunctionCall, SpvOp.FunctionParameter, SpvOp.ReturnValue]) {
+        s |> insert(uint(op))
+    }
+    return <- s
+}
+
+// PR-B (bindless prereq: nonuniformEXT + NonUniform decoration) adds two opcodes: OpExtension (the
+// SPV_EXT_descriptor_indexing declaration; the first non-cap module-prologue extension we emit) and
+// OpCopyObject (the fresh-id alias the marker decorates so NonUniform doesn't leak onto every other
+// consumer of the same input SSA value). NonUniform itself rides on the existing OpDecorate.
+def public bindless_nu_emitter_opcodes : table<uint> {
+    var s <- phase11_fn_emitter_opcodes()
+    for (op in [SpvOp.Extension, SpvOp.CopyObject]) {
         s |> insert(uint(op))
     }
     return <- s
