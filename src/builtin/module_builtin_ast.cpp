@@ -408,6 +408,44 @@ namespace das {
         das_invoke<void>::invoke(context,at,block);
     }
 
+    // Build fn->body inside `block` on a fresh scoped gc root; on exit, promote the body's
+    // subtree to the enclosing root and sweep the rest (the lowering intermediates). For
+    // macros that rebuild fn->body wholesale (e.g. [flatten]) and want their transient AST
+    // reclaimed immediately instead of waiting for the end-of-module sweep. We start the walk
+    // at fn->body, not fn: fn already lives on the enclosing root, so fn->gc_collect would hit
+    // the gc_owner==target early-out and collect nothing.
+    void ast_gc_collect_scope ( FunctionPtr fn, const TBlock<void> & block, Context * context, LineInfoArg * at ) {
+        gc_guard scope;
+        das_invoke<void>::invoke(context,at,block);
+        if ( fn && fn->body ) {
+            fn->body->gc_collect(scope.saved_thread_root, &scope.guard_root);
+        }
+    }
+
+    // Free a SINGLE orphaned AST expression node mid-compile, instead of waiting for the
+    // enclosing gc_guard to sweep it. gc nodes live flat on a root list, so this frees
+    // only `expr` itself — its children stay on the root (a caller-side reclaim walker
+    // deletes them one by one). We must NOT use gc_collect here: that traversal follows
+    // shared cross-references (ExprVar->Variable, TypeDecl->Structure/Enumeration) and
+    // would sweep live module entities. gc_unlink first so ~gc_node doesn't re-unlink
+    // (and so DAS_GC_DEBUG's "deleted outside gc_sweep" assert stays quiet).
+    // UNSAFE: the caller must own `expr` exclusively.
+    void delete_expression ( ExpressionPtr expr ) {
+        if ( !expr ) return;
+        expr->gc_unlink();
+        delete expr;
+    }
+
+    // Free a SINGLE orphaned TypeDecl node (sibling of delete_expression). Only the node
+    // itself — sub-types (firstType/argTypes/...) are separate gc_nodes a reclaim walker
+    // deletes individually. Does NOT touch shared structType/enumType (those are pointers
+    // the dtor never follows). UNSAFE: caller must own the node.
+    void delete_type ( TypeDeclPtr typ ) {
+        if ( !typ ) return;
+        typ->gc_unlink();
+        delete typ;
+    }
+
     void for_each_module ( Program * prog, const TBlock<void,Module *> & block, Context * context, LineInfoArg * at ) {
         prog->library.foreach_in_order([&](auto mod){
             das_invoke<void>::invoke<Module *>(context,at,block,mod);
@@ -1142,6 +1180,9 @@ namespace das {
         addExtern<DAS_BIND_FUN(ast_gc_guard)>(*this, lib,  "ast_gc_guard",
             SideEffects::modifyExternal, "ast_gc_guard")
                 ->args({"block","context","line"});
+        addExtern<DAS_BIND_FUN(ast_gc_collect_scope)>(*this, lib,  "ast_gc_collect_scope",
+            SideEffects::modifyExternal, "ast_gc_collect_scope")
+                ->args({"function","block","context","line"});
         addExtern<DAS_BIND_FUN(for_each_module)>(*this, lib,  "for_each_module",
             SideEffects::accessExternal, "for_each_module")
                 ->args({"program","block","context","line"});
@@ -1271,6 +1312,12 @@ namespace das {
         addExtern<DAS_BIND_FUN(clone_expression)>(*this, lib,  "clone_expression",
             SideEffects::none, "clone_expression")
                 ->arg("expression");
+        addExtern<DAS_BIND_FUN(delete_expression)>(*this, lib,  "delete_expression",
+            SideEffects::modifyExternal, "delete_expression")
+                ->arg("expression")->unsafeOperation = true;
+        addExtern<DAS_BIND_FUN(delete_type)>(*this, lib,  "delete_type",
+            SideEffects::modifyExternal, "delete_type")
+                ->arg("type")->unsafeOperation = true;
         addExtern<DAS_BIND_FUN(clone_function)>(*this, lib,  "clone_function",
             SideEffects::none, "clone_function")
                 ->arg("function");

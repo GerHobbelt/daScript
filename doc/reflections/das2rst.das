@@ -357,7 +357,7 @@ def document_module_ast(_root : string) {
         group_by_regex("Debug info helpers", mod, %regex~(debug_helper_.*)%%),
         group_by_regex("AOT support", mod, %regex~(aot_require|aot_type_ann_get_field_ptr|aot_need_type_info|aot_previsit_get_field_ptr|aot_previsit_get_field|aot_visit_get_field|write_aot_body|write_aot_suffix|write_aot_macro_suffix|write_aot_macro_prefix|macro_aot_infix|getInitSemanticHashWithDep|get_aot_hash_comment)$%%),
         group_by_regex("String builder writer", mod, %regex~(string_builder_str|string_builder_clear)$%%),
-        group_by_regex("GC", mod, %regex~(ast_gc_guard|verify_typedecl_gc|verify_expression_gc)$%%),
+        group_by_regex("GC", mod, %regex~(ast_gc_guard|ast_gc_collect_scope|verify_typedecl_gc|verify_expression_gc|delete_expression|delete_type)$%%),
         hide_group(group_by_regex("Internal ast infrastructure", mod, %regex~(builtin_ast_.*)%%))
     )
     documents("AST manipulation library", mod, "ast.rst", groups)
@@ -441,6 +441,7 @@ def document_module_json(_root : string) {
     var groups <- array<DocGroup>(
         group_by_regex("Value conversion", mod, %regex~(JV|JVNull)$%%),
         group_by_regex("Read and write", mod, %regex~(read_json|write_json)$%%),
+        group_by_regex("Memory management", mod, %regex~(delete_json|update|json_null_sentinel)$%%),
         group_by_regex("JSON properties", mod, %regex~(set_no_trailing_zeros|set_no_empty_arrays|set_allow_duplicate_keys)$%%),
         group_by_regex("Broken JSON", mod, %regex~(try_fixing_broken_json)$%%)
     )

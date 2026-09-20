@@ -82,10 +82,12 @@ core rules:
   lowered recursively. Inlining is transitive.
 - A **whitelisted leaf primitive** (see below) is kept, its arguments lowered.
 
-**Loop unrolling** turns a fixed-count ``for`` (over a constant ``range`` or an
-array literal) into straight-line copies — the loop variable is substituted by
-each iteration's constant and each copy is lowered under the same predicate.
-Per-iteration locals are renamed so the copies don't collide.
+**Loop unrolling** turns a fixed-count ``for`` (over a constant ``range`` /
+``urange`` or an array literal) into straight-line copies — the loop variable is
+substituted by each iteration's constant and each copy is lowered under the same
+predicate. Per-iteration locals are renamed so the copies don't collide. Parallel
+multi-source loops (``for (a, b in xs, ys)``) unroll in lockstep — every source
+must have the same constant length — substituting each loop variable per copy.
 
 **break / continue** lower to predication, not jumps:
 
@@ -123,6 +125,14 @@ downstream tiers (it folds constant *arithmetic* but not constant *constructors*
 and never a runtime-operand identity), done here under a shader's fast-math
 assumption (scalar ``x*0 → 0`` always fires).
 
+The fold and the typer's const-fold are *mutually-enabling*, so the fold phase
+**iterates to a fixpoint**. Flattening folds the runtime-operand identities the
+typer will not (``0*b → 0``); the re-infer between passes then const-folds the
+freshly-constant operands the fold does not touch (``24 >> (24 & 31) → 0``),
+which can expose a fresh identity (``x - 0``) for the next pass. A single pass is
+therefore not enough — the fold re-runs until nothing changes before the twin is
+handed to the backend.
+
 Supported subset
 ================
 
@@ -139,7 +149,9 @@ Supported subset
    * - user function call
      - inlined transitively; parameters bound to value temps
    * - fixed-count ``for``
-     - unrolled — ``range(CONST)``, ``range(A, B)``, or an array literal ``[a, b, c]``
+     - unrolled — ``range(CONST)``, ``range(A, B)``, ``urange(…)``, or an array literal ``[a, b, c]``
+   * - parallel multi-source ``for (a, b in xs, ys)``
+     - unrolled in lockstep; every source must share one constant length
    * - ``break`` / ``continue``
      - loop-scoped (persistent) / per-iteration (per-copy) bool masks
    * - ``+=`` ``-=`` ``*=`` … and ``++`` / ``--``
@@ -166,7 +178,9 @@ Everything outside the supported subset is rejected with a specific
    * - ``while`` loops
      - no compile-time iteration count — not unrollable
    * - ``for`` over a non-constant range
-     - same — the bound must be a constant ``range`` or an array literal
+     - same — the bound must be a constant ``range`` / ``urange`` or an array literal
+   * - parallel ``for`` sources of unequal length
+     - lockstep unroll needs one shared count; mismatched lengths are rejected
    * - move ``<-`` / clone ``:=``
      - predication is copy-only; a move/clone cannot be predicated
    * - recursion

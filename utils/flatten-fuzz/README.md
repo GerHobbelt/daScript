@@ -4,7 +4,8 @@ A metamorphic differential fuzzer for [`daslib/flatten`](../../daslib/flatten.da
 
 It generates random daslang functions, compiles them **in-process** (the
 integrated compiler — no subprocess), and checks the flattened twin against the
-pristine original over many integer inputs:
+pristine original over many inputs — random integers, or (with `--bool`) the
+**complete bool truth table**:
 
 ```
 f(x) == f_flat(x)   for all generated f, for all x
@@ -31,6 +32,7 @@ daslang utils/flatten-fuzz/main.das -- [flags]
 | `-f, --strict-fold` | enable the `strict_fold` structural oracle + const-density bias |
 | `-k, --keep` | keep the generated temp source (don't delete) |
 | `-L, --log-infer` | emit `options log_infer_passes` in generated source (dump the compiler's per-infer-pass AST) |
+| `-B, --bool` | pure-bool domain: bool params/locals/return, **exhaustive** 2³ truth-table oracle (ignores `-n`/`--inputs`) |
 | `-?, --show-help` | help |
 
 `--log-infer` makes the fuzzer a probe for the **compiler** too, not just flatten:
@@ -52,27 +54,62 @@ offending unit is bisected out and dumped as a standalone reproducer
   *missed* constant fold becomes a compile error. This is the "did the fold
   fire" half that value equivalence can't see.
 
+## Domains
+
+Two value domains, selected by `--bool`:
+
+- **Integer** (default) — random `int` inputs sampled per unit; the differential
+  is *exact* (no float epsilon). Trap-free: no `/`, `%`, or array indexing; shift
+  counts masked to `& 31` (predication executes *both* arms, so a trapping op in
+  an untaken branch would panic the twin but not the original — inherent to
+  predication, and the shader backends flatten targets are trap-free anyway).
+- **Bool** (`--bool`) — every value is `bool` (params, locals, return), the
+  grammar is bool algebra (`&& || == != !`), and the oracle is **exhaustive**: a
+  3-bool-input function has only 2³ = 8 possible inputs, so each generated
+  function is verified over its *complete* input space, not a sample. Bool is
+  also where flatten's machinery lives — the live / break / continue masks are
+  bools — so bool data stresses the mask algebra head-on, and bool loop bodies
+  (often pure dead computation) readily DSE to empty, exercising paths integers
+  don't. Trap-free for free (no division / overflow / shift UB).
+
 ## Design
 
-- **Integer domain only** — the differential is then *exact* (no float epsilon).
-- **Trap-free** — no `/`, `%`, or array indexing; shift counts masked to `& 31`.
-  Predication executes *both* arms, so a trapping op in an untaken branch would
-  panic in the twin but not the original — an inherent property of predication,
-  not a flatten bug (and the shader backends flatten targets are trap-free
-  anyway).
-- **Mask-biased grammar** — if/elif/else, early return, `range`/const-array
-  loops, break/continue, nested loops, helper inlining, compound assignment.
-  That combinatorial surface is where flatten bugs live.
+- **Mask-biased grammar** — if/elif/else, early return, loops over
+  `range`/`urange`/const-array sources (single-source and parallel multi-source
+  `for (a, b in xs, ys)`, unrolled in lockstep), break/continue, nested loops,
+  helper inlining, compound assignment. That combinatorial surface is where
+  flatten bugs live.
 - **Pure-functional** — params + locals + return value; no globals (yet).
+- **Domain-agnostic harness** — the in-process compile → simulate → invoke →
+  bisect → reproducer-dump pipeline is identical for both domains; a bool
+  candidate marshals through an `int` driver (`!= 0` in, `? 1 : 0` out) so the
+  differential machinery never changes.
 
 ## Found
 
 - The inlined-callee-local shadowing bug (`inline_call` not uniquifying callee
   locals across multiple inline sites) — fixed in the same change that added
   this tool.
-- At `--depth 4+`, deeply-nested constant `for` loops unroll without any
-  expansion cap, so the flattened twin grows exponentially → very slow compiles
-  and a heap-layout-dependent SIGSEGV during the macro. Diagnosis: `lower_for`
-  has no unroll-size guard; the flatten opt passes are bounded but super-linear
-  in body size. The compiler's own `max_infer_passes` (default 50) bounds infer,
-  so this is blowup, not an infinite loop. Default depth is 3 (clean at scale).
+- Unbounded loop unrolling: deeply-nested constant `for` loops unroll
+  multiplicatively (`range(20)^4` = 160k body copies) with no expansion cap, so
+  the flattened twin blows the heap to multiple GB. **Fixed** — `lower_for` now
+  caps the product of nested iteration counts (`FLATTEN_MAX_UNROLL`, default 4096;
+  `[flatten(max_unroll=N)]` overrides), bailing with a clean error before cloning.
+- A deterministic compiler crash (the SIGSEGV/SIGBUS whose faulting address was
+  always ASCII bytes of a flatten-generated name like `__flat_loop` / `v46_0`).
+  Root cause was **not** in flatten: an incomplete 64-bit migration of the core
+  shoe allocator (`MemoryModel::Deck`) — `total * size` (entry count × element
+  size) overflowed `uint32_t` once a string-heap size-class grew past 4 GB, so
+  `das_aligned_alloc16(0)` returned a degenerate pointer the next string
+  overwrote. **Fixed** by widening the allocator's byte/count fields to 64-bit
+  (regression: `tests-cpp/big/memory_model_4gb`). flatten amplified it via a
+  per-`ExprVar` `"{name}"` string built inside the O(n²) opt-pass tree walks;
+  that churn is now allocation-free (`das_string` compares). Default depth is 3.
+- *(bool domain)* A compile-time SIGSEGV: an empty-body `for`-over-array loop
+  inside a pure, foldable-result function null-derefs when the const-folder
+  (`RunFolding`) simulates and evaluates it — `SimNode_ForGoodArray1<1>::eval`
+  reads `list[0]` with `list == null` (no `total == 0` guard for an empty body).
+  Surfaced on the very first `--bool` sweep (the integer domain never hit it; bool
+  loop bodies DSE to empty and bool functions are pure + const-arg + foldable —
+  exactly what `RunFolding` const-folds). **Fix in a follow-up** — guard
+  `total == 0` in the for-node `eval` family.

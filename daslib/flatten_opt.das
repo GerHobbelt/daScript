@@ -17,7 +17,7 @@ require daslib/macro_boost
 require daslib/rtti
 require strings
 
-def private is_flat_temp(name : string) : bool {
+def private is_flat_temp(name : das_string) : bool {
     return name |> starts_with("__flat_")
 }
 
@@ -31,11 +31,10 @@ def private is_flat_temp(name : string) : bool {
 // exactly the live-mask kills (`__flat_live = false`, per-frame mask updates).
 
 class private FlatScan : AstVisitor {
-    reads : table<string>
+    reads : table<uint64>
     risky : bool
     def override preVisitExprVar(expr : ExprVar?) : void {
-        let nm = "{expr.name}"
-        if (is_flat_temp(nm)) reads |> insert(nm)
+        if (is_flat_temp(expr.name)) reads |> insert(hash(expr.name))
     }
     def override preVisitExprCall(expr : ExprCall?) : void {
         risky = true
@@ -52,7 +51,7 @@ class private FlatScan : AstVisitor {
 
 // Scan a subtree for the `__flat_*` names it reads and whether it carries a
 // fault-capable / side-effecting node (call, index, division).
-def private scan_flat(var e : ExpressionPtr; var reads : table<string>; var risky : bool&) {
+def private scan_flat(var e : ExpressionPtr; var reads : table<uint64>; var risky : bool&) {
     if (e == null) return
     var v = new FlatScan()
     make_visitor(*v) $(adapter) {
@@ -86,22 +85,22 @@ def private const_bool(e : ExpressionPtr; var val : bool&) : bool {
     return false
 }
 
-def private fold_const(e : ExpressionPtr; constmap : table<string; bool>) : ExpressionPtr {
+def private fold_const(e : ExpressionPtr; constmap : table<uint64; bool>) : ExpressionPtr {
     if (e == null) return null
     if (e is ExprVar) {
-        let nm = "{(e as ExprVar).name}"
-        if (key_exists(constmap, nm)) return new ExprConstBool(at = e.at, value = constmap?[nm] ?? false)
+        let h = hash((e as ExprVar).name)
+        if (key_exists(constmap, h)) return new ExprConstBool(at = e.at, value = constmap?[h] ?? false)
         return clone_expression(e)
     }
     if (e is ExprOp1) {
-        var sub = fold_const((e as ExprOp1).subexpr, constmap)
+        let o = e as ExprOp1
+        var sub = fold_const(o.subexpr, constmap)
         var bv = false
-        if ((e as ExprOp1).op == "!" && const_bool(sub, bv)) {
+        if (o.op == "!" && const_bool(sub, bv)) {
             return new ExprConstBool(at = e.at, value = !bv)
         }
-        var n = clone_expression(e)
-        (n as ExprOp1).subexpr = sub
-        return n
+        return new ExprOp1(at = e.at, atEnclosure = o.atEnclosure, genFlags = o.genFlags,
+            op := o.op, subexpr = sub)
     }
     if (e is ExprOp2) {
         let o = e as ExprOp2
@@ -113,27 +112,25 @@ def private fold_const(e : ExpressionPtr; constmap : table<string; bool>) : Expr
         let rc = const_bool(r, rb)
         if (o.op == "&&") {
             if (lc) {
-                if (lb) return r
+                return r if (lb)
                 return new ExprConstBool(at = e.at, value = false)
             }
             if (rc) {
-                if (rb) return l
+                return l if (rb)
                 return new ExprConstBool(at = e.at, value = false)
             }
         } elif (o.op == "||") {
             if (lc) {
-                if (lb) return new ExprConstBool(at = e.at, value = true)
+                return new ExprConstBool(at = e.at, value = true) if (lb)
                 return r
             }
             if (rc) {
-                if (rb) return new ExprConstBool(at = e.at, value = true)
+                return new ExprConstBool(at = e.at, value = true) if (rb)
                 return l
             }
         }
-        var n = clone_expression(e)
-        (n as ExprOp2).left = l
-        (n as ExprOp2).right = r
-        return n
+        return new ExprOp2(at = e.at, atEnclosure = o.atEnclosure, genFlags = o.genFlags,
+            op := o.op, left = l, right = r)
     }
     if (e is ExprOp3) {
         let o = e as ExprOp3
@@ -142,18 +139,16 @@ def private fold_const(e : ExpressionPtr; constmap : table<string; bool>) : Expr
         if (const_bool(c, cb)) {
             return cb ? fold_const(o.left, constmap) : fold_const(o.right, constmap)
         }
-        var n = clone_expression(e)
-        (n as ExprOp3).subexpr = c
-        (n as ExprOp3).left = fold_const(o.left, constmap)
-        (n as ExprOp3).right = fold_const(o.right, constmap)
-        return n
+        return new ExprOp3(at = e.at, atEnclosure = o.atEnclosure, genFlags = o.genFlags,
+            op := o.op, subexpr = c,
+            left = fold_const(o.left, constmap),
+            right = fold_const(o.right, constmap))
     }
     if (e is ExprCall) {
         let o = e as ExprCall
-        var n = clone_expression(e)
-        var nc = n as ExprCall
+        var n = new ExprCall(at = e.at, atEnclosure = o.atEnclosure, genFlags = o.genFlags, name := o.name)
         for (ai in range(length(o.arguments))) {
-            nc.arguments[ai] = fold_const(o.arguments[ai], constmap)
+            emplace_new(n.arguments) <| fold_const(o.arguments[ai], constmap)
         }
         return n
     }
@@ -163,14 +158,14 @@ def private fold_const(e : ExpressionPtr; constmap : table<string; bool>) : Expr
 def public const_prop_pass(var out : array<ExpressionPtr>) {
     // A `__flat_*` bool temp is constant when it is declared with a const-foldable
     // init and never reassigned. Reassigned temps (early-return live masks) stay.
-    var reassigned : table<string>
+    var reassigned : table<uint64>
     for (s in out) {
         if (s is ExprCopy && (s as ExprCopy).left is ExprVar) {
-            let nm = "{((s as ExprCopy).left as ExprVar).name}"
-            if (is_flat_temp(nm)) reassigned |> insert(nm)
+            let lv = (s as ExprCopy).left as ExprVar
+            if (is_flat_temp(lv.name)) reassigned |> insert(hash(lv.name))
         }
     }
-    var constmap : table<string; bool>
+    var constmap : table<uint64; bool>
     var changed = true
     while (changed) {
         changed = false
@@ -179,18 +174,24 @@ def public const_prop_pass(var out : array<ExpressionPtr>) {
             let lc = s as ExprLet
             if (length(lc.variables) != 1) continue
             let v = lc.variables[0]
-            let nm = "{v.name}"
-            if (!is_flat_temp(nm) || key_exists(reassigned, nm) || key_exists(constmap, nm) || v.init == null) {
+            let h = hash(v.name)
+            if (!is_flat_temp(v.name) || key_exists(reassigned, h) || key_exists(constmap, h) || v.init == null) {
                 continue
             }
             var bv = false
-            if (const_bool(fold_const(v.init, constmap), bv)) {
-                constmap[nm] = bv
+            var probe = fold_const(v.init, constmap)
+            let isConst = const_bool(probe, bv)
+            if (isConst) {
+                constmap[h] = bv
                 changed = true
             }
         }
     }
-    if (empty(constmap)) return
+    delete reassigned
+    if (empty(constmap)) {
+        delete constmap
+        return
+    }
     var i = 0
     while (i < length(out)) {
         var s = out[i]
@@ -214,6 +215,7 @@ def public const_prop_pass(var out : array<ExpressionPtr>) {
         }
         i ++
     }
+    delete constmap
 }
 
 // ===== Copy propagation of single-assignment flatten temps =====
@@ -231,7 +233,10 @@ class private FlatVarRef : AstVisitor {
     name  : string
     count : int
     def override preVisitExprVar(expr : ExprVar?) : void {
-        if ("{expr.name}" == name) count ++
+        // das_string compares with string directly — never build a temp string here:
+        // count_refs walks the whole tree per candidate, so a per-ExprVar allocation
+        // is O(n^2) persistent strings on large bodies (the heap-overflow amplifier).
+        if (expr.name == name) count ++
     }
 }
 
@@ -249,10 +254,10 @@ def private count_refs(var e : ExpressionPtr; name : string) : int {
 }
 
 class private FlatScanAll : AstVisitor {
-    reads : table<string>
+    reads : table<uint64>
     risky : bool
     def override preVisitExprVar(expr : ExprVar?) : void {
-        reads |> insert("{expr.name}")
+        reads |> insert(hash(expr.name))
     }
     def override preVisitExprCall(expr : ExprCall?) : void {
         risky = true
@@ -269,7 +274,7 @@ class private FlatScanAll : AstVisitor {
 
 // Collect every variable name read by `e` (not just flatten temps) and whether it
 // carries a fault-capable / re-evaluation-sensitive node.
-def private scan_src(var e : ExpressionPtr; var reads : table<string>; var risky : bool&) {
+def private scan_src(var e : ExpressionPtr; var reads : table<uint64>; var risky : bool&) {
     if (e == null) return
     var v = new FlatScanAll()
     make_visitor(*v) $(adapter) {
@@ -286,55 +291,86 @@ def private scan_src(var e : ExpressionPtr; var reads : table<string>; var risky
     }
 }
 
+// Per-pass reference index: name-hash -> the statement indices that reference it
+// (deduped per statement) plus the total occurrence count. Built once per copy_prop
+// pass in a single walk, replacing the old per-candidate count_refs sweep that made
+// the pass O(n^3) on large bodies (one full-body walk per candidate per fold-restart).
+class private FlatUsesBuilder : AstVisitor {
+    nameUses : table<uint64; array<int>>
+    nameCount : table<uint64; int>
+    seen : table<uint64>
+    j : int
+    def override preVisitExprVar(expr : ExprVar?) : void {
+        let h = hash(expr.name)
+        nameCount[h] ++
+        if (!key_exists(seen, h)) {
+            seen |> insert(h)
+            nameUses[h] |> push(j)
+        }
+    }
+}
+
 def public copy_prop_pass(var out : array<ExpressionPtr>) {
     var changed = true
     while (changed) {
         changed = false
         let n = length(out)
-        // Map every assignment target to its store indices. A source reading var V
-        // is only unsafe if V is reassigned BETWEEN this temp's def and a use — a
-        // reassignment fully before the def (e.g. an accumulator finalized into the
-        // return temp) leaves the captured value intact, so it must not block.
-        var storeIdx : table<string; array<int>>
+        // Precompute once per pass (not per candidate): every store target's indices,
+        // and a name -> (referencing statements, occurrence count) index. A source
+        // reading var V is only unsafe if V is reassigned BETWEEN this temp's def and a
+        // use — a reassignment fully before the def leaves the captured value intact.
+        var storeIdx : table<uint64; array<int>>
         for (j in range(n)) {
             if (out[j] is ExprCopy && (out[j] as ExprCopy).left is ExprVar) {
-                storeIdx["{((out[j] as ExprCopy).left as ExprVar).name}"] |> push(j)
+                storeIdx[hash(((out[j] as ExprCopy).left as ExprVar).name)] |> push(j)
             }
         }
+        var ub = new FlatUsesBuilder()
+        make_visitor(*ub) $(adapter) {
+            for (j in range(n)) {
+                ub.j = j
+                clear(ub.seen)
+                visit(out[j], adapter)
+            }
+        }
+        var srcReads : table<uint64>
+        var useJs : array<int>   // hoisted: cleared per candidate, freed once per pass
         for (k in range(n)) {
             if (!(out[k] is ExprLet)) continue
-            let lc = out[k] as ExprLet
-            if (length(lc.variables) != 1) continue
-            let nm = "{lc.variables[0].name}"
-            if (!is_flat_temp(nm)) continue
-            // Single definition: decl-init + no stores, OR no-init decl + one store.
-            let stores <- [for (j in range(n)); j;
-                where out[j] is ExprCopy && (out[j] as ExprCopy).left is ExprVar &&
-                    "{((out[j] as ExprCopy).left as ExprVar).name}" == nm]
+            var lc = out[k] as ExprLet
+            if (length(lc.variables) != 1 || !is_flat_temp(lc.variables[0].name)) continue
+            let hk = hash(lc.variables[0].name)
+            let nStores = key_exists(storeIdx, hk) ? length(storeIdx[hk]) : 0
+            // Single definition: decl-init + no stores, OR no-init decl + one store. Use the
+            // ORIGINAL source (no clone) — apply_template clones it per use, and the original
+            // lives in out[k]/out[si], reclaimed when we drop them. Cloning here would orphan a
+            // copy on every non-folding candidate (re-examined each while-restart → millions).
             var src : ExpressionPtr = null
             var si = -1
-            if (lc.variables[0].init != null && empty(stores)) {
-                src = clone_expression(lc.variables[0].init)   // decl-init is the single definition
-            } elif (lc.variables[0].init == null && length(stores) == 1) {
-                si = stores[0]
-                src = clone_expression((out[si] as ExprCopy).right)   // no-init decl + single store
+            if (lc.variables[0].init != null && nStores == 0) {
+                src = lc.variables[0].init                    // decl-init is the single definition
+            } elif (lc.variables[0].init == null && nStores == 1) {
+                si = storeIdx[hk][0]
+                var cp = out[si] as ExprCopy
+                src = cp.right                                // no-init decl + single store
             } else {
-                continue                                   // multi-def (e.g. early-return mask) — leave it
+                continue                                      // multi-def (e.g. early-return mask) — leave it
             }
             let defIdx = si >= 0 ? si : k
-            var srcReads : table<string>
+            clear(srcReads)
             var srcRisky = false
             scan_src(src, srcReads, srcRisky)
-            if (key_exists(srcReads, nm)) continue         // self-referential source — never fold
-            // Uses must follow the def; track the last one for the reassignment window.
-            var refCount = 0
+            if (key_exists(srcReads, hk)) continue            // self-referential source — never fold
+            // Uses (excluding def k and store si) straight from the precomputed index.
+            // nameCount includes the store's lvalue occurrence (1), which is not a use.
+            let refCount = (key_exists(ub.nameCount, hk) ? ub.nameCount[hk] : 0) - (si >= 0 ? 1 : 0)
             var firstRef = n
             var maxUseIdx = -1
-            for (j in range(n)) {
-                if (j == k || j == si) continue
-                let c = count_refs(out[j], nm)
-                if (c > 0) {
-                    refCount += c
+            clear(useJs)
+            if (key_exists(ub.nameUses, hk)) {
+                for (j in ub.nameUses[hk]) {
+                    if (j == k || j == si) continue
+                    useJs |> push(j)
                     if (j < firstRef) {
                         firstRef = j
                     }
@@ -359,18 +395,22 @@ def public copy_prop_pass(var out : array<ExpressionPtr>) {
             }
             if (blocked) continue
             // Inline the source at every use, then drop the def (+ store).
+            let nm = "{lc.variables[0].name}"
             var rules : Template
-            rules |> replaceVariable(nm, clone_expression(src))
-            for (j in range(n)) {
-                if (j == k || j == si) continue
-                out[j] = apply_template(rules, out[j].at, out[j], false)
+            rules |> replaceVariable(nm, src)   // store src directly; apply_template clones per use
+            for (j in useJs) {
+                out[j] = apply_template(rules, out[j].at, out[j], false)   // only statements that reference nm
             }
-            var dead : table<int>
-            dead |> insert(k)
-            if (si >= 0) dead |> insert(si)
-            out <- [for (j in range(n)); out[j]; where !key_exists(dead, j)]
+            unsafe { delete rules }
+            out <- [for (j in range(n)); out[j]; where j != k && j != si]
             changed = true
             break
+        }
+        delete srcReads
+        delete storeIdx
+        delete useJs
+        unsafe {
+            delete ub
         }
     }
 }
@@ -379,31 +419,32 @@ def public dse_pass(var out : array<ExpressionPtr>) {
     let n = length(out)
     // Names that are ever an assignment target: their decl must stay even if the
     // init value is dead (only fully-unreferenced decls are removable).
-    var storeTargets : table<string>
+    var storeTargets : table<uint64>
     for (s in out) {
         if (s is ExprCopy && (s as ExprCopy).left is ExprVar) {
-            let nm = "{((s as ExprCopy).left as ExprVar).name}"
-            if (is_flat_temp(nm)) storeTargets |> insert(nm)
+            let lv = (s as ExprCopy).left as ExprVar
+            if (is_flat_temp(lv.name)) storeTargets |> insert(hash(lv.name))
         }
     }
-    var live : table<string>
+    var live : table<uint64>
     var dead : table<int>
+    var reads : table<uint64>   // hoisted: one scratch table, cleared per statement (was n allocations)
     var i = n - 1
     while (i >= 0) {
         var stmt = out[i]
         var handled = false
+        clear(reads)
         if (stmt is ExprCopy) {
             var cp = stmt as ExprCopy
-            if (cp.left is ExprVar && is_flat_temp("{(cp.left as ExprVar).name}")) {
+            if (cp.left is ExprVar && is_flat_temp((cp.left as ExprVar).name)) {
                 handled = true
-                let lnm = "{(cp.left as ExprVar).name}"
-                var reads : table<string>
+                let lh = hash((cp.left as ExprVar).name)
                 var risky = false
                 scan_flat(cp.right, reads, risky)
-                if (!key_exists(live, lnm) && !risky) {
+                if (!key_exists(live, lh) && !risky) {
                     dead |> insert(i)   // target not live afterward, RHS pure → dead
                 } else {
-                    live |> erase(lnm)
+                    live |> erase(lh)
                     for (nm in keys(reads)) {
                         live |> insert(nm)
                     }
@@ -412,16 +453,15 @@ def public dse_pass(var out : array<ExpressionPtr>) {
         }
         if (!handled && stmt is ExprLet) {
             var lc = stmt as ExprLet
-            if (length(lc.variables) == 1 && is_flat_temp("{lc.variables[0].name}")) {
+            if (length(lc.variables) == 1 && is_flat_temp(lc.variables[0].name)) {
                 handled = true
-                let dnm = "{lc.variables[0].name}"
-                var reads : table<string>
+                let dh = hash(lc.variables[0].name)
                 var risky = false
                 scan_flat(lc.variables[0].init, reads, risky)
-                if (!key_exists(live, dnm) && !key_exists(storeTargets, dnm) && !risky) {
+                if (!key_exists(live, dh) && !key_exists(storeTargets, dh) && !risky) {
                     dead |> insert(i)   // declared temp fully unreferenced, init pure → dead
                 } else {
-                    live |> erase(dnm)
+                    live |> erase(dh)
                     for (nm in keys(reads)) {
                         live |> insert(nm)
                     }
@@ -431,7 +471,6 @@ def public dse_pass(var out : array<ExpressionPtr>) {
         if (!handled) {
             // Decl / return / global write / bare expr — over-approximate: every
             // flat var it mentions becomes live (never wrongly removes a store).
-            var reads : table<string>
             var risky = false
             scan_flat(stmt, reads, risky)
             for (nm in keys(reads)) {
@@ -440,8 +479,15 @@ def public dse_pass(var out : array<ExpressionPtr>) {
         }
         i --
     }
-    if (empty(dead)) return
+    delete storeTargets
+    delete live
+    delete reads
+    if (empty(dead)) {
+        delete dead
+        return
+    }
     out <- [for (j in range(n)); out[j]; where !key_exists(dead, j)]
+    delete dead
 }
 
 // ===== SSA-rename of reassigned user locals =====
@@ -466,29 +512,37 @@ def private rename_reads(var e : ExpressionPtr; current : table<string; string>)
         any = true
     }
     if (!any) return e
-    return apply_template(tmpl, e.at, e, false)
+    var res = apply_template(tmpl, e.at, e, false)
+    unsafe { delete tmpl }
+    return res
 }
 
 def public ssa_rename_pass(var out : array<ExpressionPtr>) {
     // (1) user locals declared (single-var) with an initializer
-    var declaredInit : table<string>
+    var declaredInit : table<uint64>
     for (s in out) {
         if (s is ExprLet && length((s as ExprLet).variables) == 1) {
             let v = (s as ExprLet).variables[0]
-            let nm = "{v.name}"
-            if (!is_flat_temp(nm) && v.init != null) declaredInit |> insert(nm)
+            if (!is_flat_temp(v.name) && v.init != null) declaredInit |> insert(hash(v.name))
         }
     }
-    if (empty(declaredInit)) return
+    if (empty(declaredInit)) {
+        delete declaredInit
+        return
+    }
     // (2) of those, the ones reassigned via a plain `var = ...` (multi-def)
-    var ssaNames : table<string>
+    var ssaNames : table<uint64>
     for (s in out) {
         if (s is ExprCopy && (s as ExprCopy).left is ExprVar) {
-            let nm = "{((s as ExprCopy).left as ExprVar).name}"
-            if (key_exists(declaredInit, nm)) ssaNames |> insert(nm)
+            let h = hash(((s as ExprCopy).left as ExprVar).name)
+            if (key_exists(declaredInit, h)) ssaNames |> insert(h)
         }
     }
-    if (empty(ssaNames)) return
+    delete declaredInit
+    if (empty(ssaNames)) {
+        delete ssaNames
+        return
+    }
     // (3) forward rename: each read maps to the current version; each write mints a new
     // version (after resolving the RHS reads, so a self-ref reads the prior version).
     var current : table<string; string>
@@ -497,7 +551,7 @@ def public ssa_rename_pass(var out : array<ExpressionPtr>) {
     while (i < length(out)) {
         var s = out[i]
         if (s is ExprLet && length((s as ExprLet).variables) == 1 &&
-                key_exists(ssaNames, "{(s as ExprLet).variables[0].name}")) {
+                key_exists(ssaNames, hash((s as ExprLet).variables[0].name))) {
             let orig = "{(s as ExprLet).variables[0].name}"
             let newInit = rename_reads((s as ExprLet).variables[0].init, current)
             counter ++
@@ -505,7 +559,7 @@ def public ssa_rename_pass(var out : array<ExpressionPtr>) {
             out[i] = qmacro_expr(${ var $i(vn) = $e(newInit); })
             current[orig] = vn
         } elif (s is ExprCopy && (s as ExprCopy).left is ExprVar &&
-                key_exists(ssaNames, "{((s as ExprCopy).left as ExprVar).name}")) {
+                key_exists(ssaNames, hash(((s as ExprCopy).left as ExprVar).name))) {
             let orig = "{((s as ExprCopy).left as ExprVar).name}"
             let newRhs = rename_reads((s as ExprCopy).right, current)
             counter ++
@@ -517,6 +571,8 @@ def public ssa_rename_pass(var out : array<ExpressionPtr>) {
         }
         i ++
     }
+    delete ssaNames
+    delete current
 }
 
 class private FoldVisitor : AstVisitor {
@@ -804,10 +860,15 @@ def private subst_consts(var e : ExpressionPtr; constmap : table<string; Express
     if (e == null) return null
     var tmpl : Template
     for (nm in keys(constmap)) {
-        let ex = unsafe(constmap?[nm]) ?? null     // non-inserting read (keys() locks the table)
-        tmpl |> replaceVariable(nm, clone_expression(ex))
+        // ?[] yields a const view (non-inserting; keys() locks the table) but the pointed-to
+        // node is genuinely mutable. apply_template clones it per use, so const-strip the raw
+        // pointer instead of pre-cloning (which would orphan a copy every substitution).
+        var ex = unsafe(reinterpret<Expression? -const>(constmap?[nm] ?? null))
+        tmpl |> replaceVariable(nm, ex)
     }
-    return apply_template(tmpl, e.at, e, false)
+    var res = apply_template(tmpl, e.at, e, false)
+    unsafe { delete tmpl }
+    return res
 }
 
 def private body_read_count(var blk : ExprBlock?; nm : string) : int {
@@ -834,12 +895,14 @@ def private const_prop_locals(var blk : ExprBlock?) : bool {
         var s = blk.list[i]
         if (s is ExprLet && length((s as ExprLet).variables) == 1) {
             var lc = s as ExprLet
-            let nm = "{lc.variables[0].name}"
-            if (!is_flat_temp(nm) && lc.variables[0].init != null && is_all_const(lc.variables[0].init)) {
-                var folded = eval_to_const(clone_expression(lc.variables[0].init))
-                if (folded |> is_expr_const()) {
+            if (!is_flat_temp(lc.variables[0].name) && lc.variables[0].init != null && is_all_const(lc.variables[0].init)) {
+                // eval_single_expression only READS the tree (throwaway context), so fold the
+                // init in place — no defensive clone.
+                var oldInit = lc.variables[0].init
+                var folded = eval_to_const(oldInit)
+                if (folded |> is_expr_const() && folded != oldInit) {
                     lc.variables[0].init = folded
-                    constmap[nm] = folded
+                    constmap["{lc.variables[0].name}"] = folded
                     changed = true
                 }
             }
@@ -869,6 +932,7 @@ def private const_prop_locals(var blk : ExprBlock?) : bool {
             }
             changed = true
         }
+        delete dead
     }
     return changed
 }

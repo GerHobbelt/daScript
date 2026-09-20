@@ -22,7 +22,7 @@ require daslib/templates_boost
 require daslib/macro_boost
 require daslib/rtti
 require strings
-require flatten_opt
+require daslib/flatten_opt
 
 // Phase token carried as the "phase" argument of the [flatten] annotation on
 // the ORIGINAL function (which we own and may mutate in place). Cycle 1 lowers
@@ -98,6 +98,26 @@ def private get_flatten_strict(func : FunctionPtr) : bool {
     return false
 }
 
+//! Default cap on the product of nested constant-loop iteration counts a twin may
+//! unroll to. Unrolling multiplies across nesting (`range(20)^4` = 160k body copies),
+//! so without a bound deep nests blow the heap. 4096 is generous for real shader
+//! unrolling yet far below the blowup zone; `[flatten(max_unroll=N)]` overrides it
+//! per-function, and direct `flatten_function` callers pass their own.
+let public FLATTEN_MAX_UNROLL = 4096
+
+def private get_flatten_max_unroll(func : FunctionPtr) : int {
+    //! Reads the opt-in `[flatten(max_unroll=N)]` argument: the cap on the product of
+    //! nested constant-loop iteration counts the twin may unroll to. Exceeding it is a
+    //! clean compile error, not an exponential-expansion blowup. Default FLATTEN_MAX_UNROLL.
+    for (ann in func.annotations) {
+        if (ann.annotation.name == "flatten") {
+            let mv = find_arg(ann.arguments, "max_unroll")
+            if (mv is tInt) return mv as tInt
+        }
+    }
+    return FLATTEN_MAX_UNROLL
+}
+
 // ===== Predicated lowering (return-elim + if-conversion + call inlining) =====
 //
 // Shared state lives on FlatCtx (one instance per twin, threaded by pointer so
@@ -123,6 +143,8 @@ class private FlatCtx {
     worklist  : array<string>
     loopMasks : array<LoopMask>   // enclosing loops' break/continue masks (innermost last)
     whitelist : table<string>     // leaf-builtin names allowed to survive (backend-supplied)
+    unrollFactor : int            // running product of enclosing loop iteration counts (1 at top)
+    maxUnroll : int               // cap on unrollFactor*count before bailing (FLATTEN_MAX_UNROLL default)
     ok        : bool
     err      : string
 }
@@ -611,28 +633,19 @@ def private scan_break_continue(body : ExpressionPtr; var hasBreak : bool&; var 
     }
 }
 
-// Fixed-count loop unrolling (M4). A `for` over a constant `range(N)` or an array
-// literal has a compile-time-known iteration count: clone the body once per
-// iteration, substitute the loop variable with that iteration's constant, and lower
-// each unrolled copy under the SAME predicate (an unrolled body always executes).
-// Per-iteration locals are renamed (`o` → `o_0`, `o_1`, …) so the copies don't
-// shadow each other in the flattened scope. Mirrors daslib/unroll.das. break /
-// continue (M4.1) allocate runtime masks — loopLive (persists across copies) for
-// break, a per-copy iterLive for continue — pushed on ctx.loopMasks for the body to
-// narrow; absent both, the loop is byte-identical to the pre-M4.1 output. while
-// loops and non-constant sources error.
-def private lower_for(var ctx : FlatCtx?; efor : ExprFor?; structPred : ExpressionPtr; var out : array<ExpressionPtr>) {
-    if (length(efor.iterators) != 1 || length(efor.sources) != 1) {
-        ctx.ok = false
-        ctx.err = "flatten: only single-variable, single-source for loops can be flattened"
-        return
-    }
-    let src = efor.sources[0]
-    // Build one substitution expression per iteration (the loop var's value).
+// Build one substitution expression per iteration for a single for-source — a
+// constant `range`/`urange` (the index) or an array literal (each element). Sets
+// ctx.ok=false + ctx.err and returns an empty list on an unrollable source.
+def private for_source_substs(var ctx : FlatCtx?; src : Expression?; at : LineInfo) : array<ExpressionPtr> {
     var substs : array<ExpressionPtr>
     if (src is ExprConstRange) {
         for (i in (src as ExprConstRange).value) {
-            var e : ExpressionPtr = new ExprConstInt(at = efor.at, value = i)
+            var e : ExpressionPtr = new ExprConstInt(at = at, value = i)
+            substs |> push(e)   // nolint:PERF006 -- macro-time, count is the (small) unroll bound
+        }
+    } elif (src is ExprConstURange) {
+        for (i in (src as ExprConstURange).value) {
+            var e : ExpressionPtr = new ExprConstUInt(at = at, value = i)
             substs |> push(e)   // nolint:PERF006 -- macro-time, count is the (small) unroll bound
         }
     } else {
@@ -648,12 +661,63 @@ def private lower_for(var ctx : FlatCtx?; efor : ExprFor?; structPred : Expressi
         }
         if (mk == null) {
             ctx.ok = false
-            ctx.err = "flatten: for loop source must be a constant range(N) or an array literal"
-            return
+            ctx.err = "flatten: for loop source must be a constant range(N)/urange(N) or an array literal"
+            return <- substs
         }
         substs <- [for (v in mk.values); clone_expression(v)]
     }
-    let van = "{efor.iterators[0]}"
+    return <- substs
+}
+
+// Fixed-count loop unrolling (M4). A `for` over a constant `range(N)` or an array
+// literal has a compile-time-known iteration count: clone the body once per
+// iteration, substitute the loop variable with that iteration's constant, and lower
+// each unrolled copy under the SAME predicate (an unrolled body always executes).
+// Per-iteration locals are renamed (`o` → `o_0`, `o_1`, …) so the copies don't
+// shadow each other in the flattened scope. Mirrors daslib/unroll.das. break /
+// continue (M4.1) allocate runtime masks — loopLive (persists across copies) for
+// break, a per-copy iterLive for continue — pushed on ctx.loopMasks for the body to
+// narrow; absent both, the loop is byte-identical to the pre-M4.1 output. while
+// loops and non-constant sources error.
+def private lower_for(var ctx : FlatCtx?; efor : ExprFor?; structPred : ExpressionPtr; var out : array<ExpressionPtr>) {
+    let nIter = length(efor.iterators)
+    if (nIter == 0 || length(efor.sources) != nIter) {
+        ctx.ok = false
+        ctx.err = "flatten: a for loop needs one source per iterator"
+        return
+    }
+    // Build the per-iteration value list for each source. Multiple iterators
+    // (`for (a, b in [...], [...])`) unroll in lockstep, so every source must
+    // yield the same count. perSource[v][k] is iterator v's value for copy k.
+    var perSource : array<array<ExpressionPtr>>
+    perSource |> reserve(nIter)
+    var count = -1
+    for (si in range(nIter)) {
+        var s <- for_source_substs(ctx, efor.sources[si], efor.at)
+        if (!ctx.ok) {
+            return
+        }
+        if (count >= 0 && length(s) != count) {
+            ctx.ok = false
+            ctx.err = "flatten: parallel for sources must all have the same length ({count} vs {length(s)})"
+            return
+        }
+        count = length(s)
+        perSource |> emplace(s)
+    }
+    // `count` is the (shared) iteration count of every source.
+    // Unrolling multiplies across nesting: this loop emits `count` body copies
+    // per enclosing iteration, so the running product (int64, overflow-safe) is the true
+    // expansion. Bail BEFORE the clones if it exceeds the cap — converts a heap blowup
+    // into a clean error. Restore the factor on exit so sibling loops start fresh.
+    let projected = int64(ctx.unrollFactor) * int64(count)
+    if (projected > int64(ctx.maxUnroll)) {
+        ctx.ok = false
+        ctx.err = "flatten: loop unrolling exceeds max_unroll={ctx.maxUnroll} (would expand to {projected} iterations); reduce the range/nesting or raise [flatten(max_unroll=N)]"
+        return
+    }
+    let savedFactor = ctx.unrollFactor
+    ctx.unrollFactor = int(projected)
     let localNames <- collect_let_names(efor.body)
     // Allocate break/continue masks only if THIS loop uses them (depth-0 scan).
     var hasBreak = false
@@ -669,7 +733,7 @@ def private lower_for(var ctx : FlatCtx?; efor : ExprFor?; structPred : Expressi
         ctx.loopMasks |> push(LoopMask(loopLive = loopName, iterLive = ""))
         pushed = true
     }
-    for (k in range(length(substs))) {
+    for (k in range(count)) {
         if (pushed && hasContinue) {
             // Fresh per-copy continue mask, reset to true at this copy's head.
             let iterName = fresh(ctx, "__flat_iter")
@@ -677,9 +741,14 @@ def private lower_for(var ctx : FlatCtx?; efor : ExprFor?; structPred : Expressi
             ctx.loopMasks[length(ctx.loopMasks) - 1].iterLive = iterName
         }
         var iblk = clone_expression(efor.body)
-        remove_deref(van, iblk)               // strip ExprRef2Value around the workhorse loop var
         var rules : Template
-        rules |> replaceVariable(van) <| substs[k]
+        // Substitute every iterator with its value for copy k (one iterator for a
+        // plain loop, several for `for (a, b in [...], [...])` unrolled in lockstep).
+        for (vi in range(nIter)) {
+            let van = "{efor.iterators[vi]}"
+            remove_deref(van, iblk)            // strip ExprRef2Value around the workhorse loop var
+            rules |> replaceVariable(van) <| perSource[vi][k]
+        }
         // Rename this copy's locals uniquely so the unrolled bodies don't shadow
         // each other once flattened into one scope.
         for (ln in localNames) {
@@ -691,54 +760,62 @@ def private lower_for(var ctx : FlatCtx?; efor : ExprFor?; structPred : Expressi
             if (pushed) {
                 ctx.loopMasks |> pop()
             }
+            ctx.unrollFactor = savedFactor
             return
         }
     }
     if (pushed) {
         ctx.loopMasks |> pop()
     }
+    ctx.unrollFactor = savedFactor
 }
 
 [macro_function]
-def public flatten_function(var func : FunctionPtr; whitelist : table<string>) : FlatCtx? {
+def public flatten_function(var func : FunctionPtr; whitelist : table<string>; maxUnroll : int = FLATTEN_MAX_UNROLL) : FlatCtx? {
     //! Flatten `func`'s body in place to branchless, call-free form: every user
     //! call inlined, all control flow lowered to predicated `?:` selects, early
     //! `return` to a runtime live mask. `whitelist` is the set of leaf-builtin
     //! names permitted to survive into the output (must be pure / branch-safe /
-    //! backend-expressible). Returns the FlatCtx — inspect `.ok` and `.err`.
+    //! backend-expressible). `maxUnroll` caps the product of nested constant-loop
+    //! iteration counts (exceeding it is a clean error, not a heap blowup). Returns
+    //! the FlatCtx — inspect `.ok` and `.err`.
     //!
     //! Backends call this directly with their own primitive set, before their own
     //! macro walks the result; `[flatten]` calls it with the std default. The
     //! body is uninferred after this — re-infer (e.g. via patch + astChanged)
     //! before reading types or running the shape check.
     var ctx = new FlatCtx(counter = 0, liveName = "__flat_live", retName = "__flat_ret",
-        hasRet = !func.result.isVoid, ok = true)
+        hasRet = !func.result.isVoid, unrollFactor = 1, maxUnroll = maxUnroll, ok = true)
     ctx.whitelist := whitelist
     if (!(func.body is ExprBlock)) return ctx
     let bodyBlk = func.body as ExprBlock
-    var out : array<ExpressionPtr>
-    out |> push <| qmacro_expr(${ var $i(ctx.liveName) = true; })
-    if (ctx.hasRet) {
-        var rt = clone_type(func.result)
-        rt.flags.constant = false
-        out |> push <| qmacro_expr(${ var $i(ctx.retName) : $t(rt); })
+    // Build the lowered body on a scoped gc root: the unroll/fold intermediates are swept on
+    // scope exit, only the live twin body (func.body) is promoted to the enclosing root.
+    ast_gc_collect_scope(func) {
+        var out : array<ExpressionPtr>
+        out |> push <| qmacro_expr(${ var $i(ctx.liveName) = true; })
+        if (ctx.hasRet) {
+            var rt = clone_type(func.result)
+            rt.flags.constant = false
+            out |> push <| qmacro_expr(${ var $i(ctx.retName) : $t(rt); })
+        }
+        lower_list(ctx, bodyBlk, null, out)
+        if (ctx.hasRet) {
+            out |> push <| qmacro_expr(${ return $i(ctx.retName); })
+        }
+        if (ctx.ok) {
+            dse_pass(out)          // drop dead mask-kills (`__flat_live = false`) first…
+            const_prop_pass(out)   // …so an unreassigned `__flat_live` reads as const true → collapse
+            copy_prop_pass(out)    // inline single-def temps (`__flat_ret = c; return __flat_ret` → `return c`)
+            dse_pass(out)          // remove anything left dead (collapsed mask decls, folded temps)
+            ssa_rename_pass(out)   // single-def-ify reassigned user locals → fold_body const-props the chain
+        }
+        var newBody = new ExprBlock(at = func.body.at)
+        for (s in out) {
+            newBody.list |> emplace(s)
+        }
+        func.body = newBody
     }
-    lower_list(ctx, bodyBlk, null, out)
-    if (ctx.hasRet) {
-        out |> push <| qmacro_expr(${ return $i(ctx.retName); })
-    }
-    if (ctx.ok) {
-        dse_pass(out)          // drop dead mask-kills (`__flat_live = false`) first…
-        const_prop_pass(out)   // …so an unreassigned `__flat_live` reads as const true → collapse
-        copy_prop_pass(out)    // inline single-def temps (`__flat_ret = c; return __flat_ret` → `return c`)
-        dse_pass(out)          // remove anything left dead (collapsed mask decls, folded temps)
-        ssa_rename_pass(out)   // single-def-ify reassigned user locals → fold_body const-props the chain
-    }
-    var newBody = new ExprBlock(at = func.body.at)
-    for (s in out) {
-        newBody.list |> emplace(s)
-    }
-    func.body = newBody
     return ctx
 }
 
@@ -880,7 +957,7 @@ class FlattenAnnotation : AstFunctionAnnotation {
             // Cycle 1: lower the twin with the std whitelist, then re-infer so
             // call.func resolves. (Backends call flatten_function directly with
             // their own primitive set instead of going through this annotation.)
-            var ctx = flatten_function(twin, STD_WHITELIST)
+            var ctx = flatten_function(twin, STD_WHITELIST, get_flatten_max_unroll(func))
             if (!ctx.ok) {
                 errors := ctx.err
                 return false
@@ -889,17 +966,23 @@ class FlattenAnnotation : AstFunctionAnnotation {
             astChanged = true
             return true
         }
-        if (ph == PHASE_LOWERED) {
-            // Cycle 2: the twin is inferred — collapse const-condition selects and
-            // drop the resulting pure self-assigns. Re-infer if anything changed so
-            // the verify scan and codegen see clean types.
+        if (ph == PHASE_LOWERED || ph == PHASE_FOLDED) {
+            // Cycle 2+: the twin is inferred — collapse const-condition selects, fold
+            // algebraic identities, and drop the resulting pure self-assigns. Re-infer
+            // if anything changed so the verify scan and codegen see clean types.
+            //
+            // Iterate to a fixpoint: flatten_fold folds runtime-operand identities the
+            // typer will not (`0*b → 0`, `x*-1 → -x`); the re-infer between passes then
+            // const-folds the freshly-constant operands (`24 >> (24 & 31) → 0`), which
+            // can expose a new identity (`x - 0`) for the next pass. A single fold pass
+            // is therefore not enough — re-run until nothing folds.
             let folded = flatten_fold(twin)
             set_flatten_phase(func, PHASE_FOLDED)
             if (folded) {
                 astChanged = true
                 return true
             }
-            // Nothing to fold — fall through to the shape check this cycle.
+            // Nothing left to fold — fall through to the shape check this cycle.
         }
         // Final cycle: verify the twin is branchless and call-free (and, under
         // strict_fold, free of const-foldable residuals).
