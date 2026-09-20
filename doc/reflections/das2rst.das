@@ -163,7 +163,7 @@ def document_module_builtin(_root : string) {
         hide_group(group_by_regex("Internal finalize infrastructure", mod, %regex~finalize%%)),
         group_by_regex("Containers", mod, %regex~(capacity|clear|length|resize|resize_no_init|reserve|each|emplace|emplace_from|erase|find|
 find_for_edit|find_if_exists|find_index|find_index_if|has_value|key_exists|keys|values|get_key|lock|each_enum|each_ref|
-find_for_edit_if_exists|lock_forever|next|nothing|pop|push|push_from|push_clone|push_clone_from|back|sort|to_array|to_table|to_array_move|
+find_for_edit_if_exists|lock_forever|next|nothing|pop|push|push_from|push_clone|push_clone_from|back|sort|stable_sort|to_array|to_table|to_array_move|
 to_table_move|empty|subarray|insert|move_to_ref|copy_to_local|move_to_local|get|remove_value|erase_if|resize_and_init|
 get_value|insert_clone|emplace_new|insert_default|emplace_default|get_with_default|modify|long_length|long_capacity|long_find_index)$%%),
         group_by_regex("Character set groups", mod, %regex~(is_alpha|is_number|is_white_space|is_char_in_set)$%%),
@@ -651,7 +651,7 @@ def document_module_templates_boost(_root : string) {
     var mod = find_module("templates_boost")
     var groups <- array<DocGroup>(
         group_by_regex("Template rules", mod, %regex~(kaboomVarField|replaceVariable|renameVariable|replaceType|replaceAnnotationArgument|replaceBlockArgument|replaceVarTag|replaceArgumentWithList|replaceVariableWithList|renameField|replaceStructWithTypeDecl|replaceTypeWithTypeDecl|renameCall)$%%),
-        group_by_regex("Template application", mod, %regex~(apply_template)$%%),
+        group_by_regex("Template application", mod, %regex~(apply_template|clone_and_rename_var)$%%),
         group_by_regex("Expression helpers", mod, %regex~(remove_deref|visit_expression|expression_at)$%%),
         group_by_regex("Expression generation", mod, %regex~(make_expression_block)$%%),
         group_by_regex("Block helpers", mod, %regex~(unquote_block|move_unquote_block|push_block_list)$%%),
@@ -1611,9 +1611,9 @@ def document_module_strudel_pattern(_root : string) {
     var groups <- array<DocGroup>(
         group_by_regex("Pattern construction", mod, %regex~(pure|silence|atom|querySpan|queryArc|patternType)$%%),
         group_by_regex("Time manipulation", mod, %regex~(fast|slow|stack|cat|fastcat|weighted_fastcat|fmap)$%%),
-        group_by_regex("Combinators", mod, %regex~(rev|jux|off|layer|superimpose|euclid|palindrome|ply|iter|iterBack|when_cycle|linger|hurry|compress|chunk|striate|struct_|mask|choose|wchoose|randcat|chooseCycles|shuffle|scramble|echo|stut|transpose|add|innerJoin|combineWith|combineWithStr|degrade|degradeBy|every|bjorklund|sometimes|often|sometimesby)$%%),
+        group_by_regex("Combinators", mod, %regex~(rev|jux|off|layer|superimpose|euclid|euclidRot|palindrome|ply|iter|iterBack|when_cycle|linger|hurry|compress|chunk|striate|chop|slice|struct_|mask|choose|wchoose|randcat|chooseCycles|shuffle|scramble|echo|stut|transpose|add|innerJoin|combineWith|combineWithStr|degrade|degradeBy|every|bjorklund|sometimes|often|sometimesby)$%%),
         group_by_regex("Setter primitives", mod, %regex~set_.*$%%),
-        group_by_regex("Fluent control: dynamics and routing", mod, %regex~(gain|velocity|vel|pan|speed|note|sound|cut|orbit|begin|end_pos)$%%),
+        group_by_regex("Fluent control: dynamics and routing", mod, %regex~(gain|velocity|vel|pan|speed|note|freq|sound|cut|orbit|begin|end_pos)$%%),
         group_by_regex("Fluent control: 3D positioning (HRTF)", mod, %regex~(hrtf|hrtf_azimuth|hrtf_elevation)$%%),
         group_by_regex("Fluent control: effects sends", mod, %regex~(room|roomsize|size|delay|delaytime|dt|delayfeedback|dfb|delaysync|chorus)$%%),
         group_by_regex("Fluent control: filters", mod, %regex~(lpf|lp|hpf|hp|lpq|resonance|hpq|bpf|bpq|djf)$%%),
@@ -1621,7 +1621,10 @@ def document_module_strudel_pattern(_root : string) {
         group_by_regex("Fluent control: synthesis and shaping", mod, %regex~(fm|fmh|crush|coarse|shape)$%%),
         group_by_regex("Fluent control: modulation FX", mod, %regex~(phaser|ph|phaserdepth|phd|phasercenter|phc|phasersweep|phs|tremolo|trem|tremolodepth|tremdepth|compressor.*)$%%),
         group_by_regex("Fluent control: SF2", mod, %regex~sf2.*$%%),
-        group_by_regex("Signals", mod, %regex~(signal|signal_.*|sine|cosine|saw|tri|perlin|range|square|isaw|itri|sine2|cosine2|saw2|tri2|square2|isaw2|itri2|rand|rand2|irand|run)$%%)
+        group_by_regex("Signals", mod, %regex~(signal|signal_.*|sine|cosine|saw|tri|perlin|range|square|isaw|itri|sine2|cosine2|saw2|tri2|square2|isaw2|itri2|rand|rand2|irand|run)$%%),
+        // public only so union-widened combinators' captured lambdas resolve them
+        // cross-module — not user-facing API
+        hide_group(group_by_regex("Internal", mod, %regex~(strudel_hash01|strudel_hash32)$%%))
     )
     document("Pattern algebra, combinators, and fluent control API", mod, "strudel_pattern.rst", groups)
 }

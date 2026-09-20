@@ -75,6 +75,19 @@ def test_xml_orderby_descending(t : T?) {
 }
 
 [test]
+def test_xml_orderby_multi_key(t : T?) {
+    parse_xml(XML) $(doc, ok) {
+        t |> success(ok)
+        // brand asc, price desc → Ford(id1@100, id3@50) then Honda(id2@300) → ids 1, 3, 2
+        let ids <- %linq! from c : Car in doc.document_element orderby c.brand, c.price descending select c.id %%
+        t |> equal(length(ids), 3)
+        t |> equal(ids[0], 1)   // Ford, 100
+        t |> equal(ids[1], 3)   // Ford, 50
+        t |> equal(ids[2], 2)   // Honda, 300
+    }
+}
+
+[test]
 def test_xml_group_by(t : T?) {
     parse_xml(XML) $(doc, ok) {
         t |> success(ok)
@@ -175,5 +188,23 @@ def test_xml_multifrom_pre_where(t : T?) {
         // pre-from where prunes the DOM walk (price > 99 → car1, car2) before the cross
         let rows <- %linq! from c : Car in doc.document_element where c.price > 99.0 from b in brands select (Id = c.id, Country = b.country) %%
         t |> equal(length(rows), 4, "2 filtered XML cars × 2 brands")
+    }
+}
+
+// ===== let bindings over an XML source (inlined computed expression over the row attributes) =====
+
+[test]
+def test_xml_let(t : T?) {
+    parse_xml(XML) $(doc, ok) {
+        t |> success(ok)
+        // half = price/2 → 50, 150, 25 → orderby asc → ids 3, 1, 2; the `let` is inlined into both
+        // the order key and the projection.
+        let rows <- %linq! from c : Car in doc.document_element let half = c.price / 2.0
+            orderby half select (Id = c.id, Half = half) %%
+        t |> equal(length(rows), 3)
+        t |> equal(rows[0].Id, 3)         // 25
+        t |> equal(rows[0].Half, 25.0)
+        t |> equal(rows[2].Id, 2)         // 150
+        t |> equal(rows[2].Half, 150.0)
     }
 }

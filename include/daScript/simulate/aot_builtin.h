@@ -22,7 +22,6 @@ namespace das {
     DAS_API uint64_t get_context_share_counter ( Context * context );
 
     DAS_API char * builtin_das_root ( Context * context, LineInfoArg * at );
-    DAS_API char * builtin_resolve_this_module_dir ( const char * baked_path, Context * context );
     DAS_API char * builtin_get_das_version ( Context * context, LineInfoArg * at );
     DAS_API void builtin_throw ( char * text, Context * context, LineInfoArg * at );
     DAS_API void builtin_print ( char * text, Context * context, LineInfoArg * at );
@@ -137,6 +136,8 @@ namespace das {
     DAS_API void builtin_sort_string ( void * data, int32_t length );
     DAS_API void builtin_sort_any_cblock ( void * anyData, int32_t elementSize, int32_t length, const Block & cmp, Context * context, LineInfoArg * lineinfo );
     DAS_API void builtin_sort_any_ref_cblock ( void * anyData, int32_t elementSize, int32_t length, const Block & cmp, Context * context, LineInfoArg * lineinfo );
+    DAS_API void builtin_stable_sort_any_cblock ( void * anyData, int32_t elementSize, int32_t length, const Block & cmp, Context * context, LineInfoArg * lineinfo );
+    DAS_API void builtin_stable_sort_any_ref_cblock ( void * anyData, int32_t elementSize, int32_t length, const Block & cmp, Context * context, LineInfoArg * lineinfo );
 
     // Sort-family extensions: partial_sort / nth_element / heap ops.
     // Mirrors builtin_sort<TT> for the typed default-comparator path; uses

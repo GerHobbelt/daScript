@@ -30,14 +30,25 @@ Clauses
 -------
 
 A query is ``from <var> [ : <Row> ] in <src> [ where <pred> ] [ ( join <var2>
-[ : <Row2> ] in <src2> on <keyA> equals <keyB> | from <var2> [ : <Row2> ] in
-<src2> ) ] [ where <pred> ] [ orderby <expr> [descending] ] ( select <proj> |
-group <var> by <key> ) [ iterator ]`` — a second range variable comes from
-**either** a ``join`` **or** a second ``from`` (never both), and at most one of
-the two ``where`` slots may appear (before *or* after that clause, never both):
+[ : <Row2> ] in <src2> on <keyA> equals <keyB> [ into <g> ] | from <var2> [ : <Row2> ] in
+<src2> ) ] [ where <pred> ] [ orderby <expr> [ascending|descending] (, <expr> [ascending|descending])* ] ( select <proj> |
+group <var> by <key> ) [ into <var> <continuation> ] [ iterator ]`` — a second
+range variable comes from **either** a ``join`` **or** a second ``from`` (never
+both), and at most one of the two ``where`` slots may appear (before *or* after
+that clause, never both). ``into`` has two forms: ``join … equals … into <g>`` is
+a **group join** (``g`` = the array of matching right rows, in scope with the
+left variable — see :ref:`linq_das_join`), while a trailing ``into <var>`` after
+the terminal is a **query continuation** that rebinds the stage's output and
+continues from there (single-source only — see :ref:`linq_das_into`).
+Separately, a ``let <name> = <expr>`` binding may appear **any number of times
+between body clauses** — it is inlined away before the rest is parsed (see
+:ref:`linq_das_let`):
 
 - ``from <var> in <source>`` — the element bind ``<var>`` names the per-row
   value. With no type annotation, ``<source>`` is an ``array<T>``.
+- ``let <name> = <expr>`` — optional, repeatable, and free to appear between any
+  body clauses; binds a computed value reused in the clauses that follow it (see
+  :ref:`linq_das_let`).
 - ``where <predicate>`` — optional. A ``where`` **before** the ``join`` / second
   ``from`` filters the left source (single range var); a ``where`` **after** it
   sees both range variables. At most one ``where`` per query.
@@ -47,14 +58,17 @@ the two ``where`` slots may appear (before *or* after that clause, never both):
   range variable — SelectMany: an **independent** source is the cross product, a
   source that is a field of the first range variable (``from l in o.lines``) is
   the correlated flatten (see :ref:`linq_das_multifrom`).
-- ``orderby <expr> [descending]`` — optional, a **single** sort key (see
-  :ref:`linq_das_ordering`). Omitted when absent.
+- ``orderby <expr> [descending], …`` — optional; one or more comma-separated sort
+  keys, each with its own direction (see :ref:`linq_das_ordering`). Omitted when absent.
 - ``select <projection>`` — ``select <var>`` (the identity projection) returns
   the rows unchanged; any other projection emits ``_select(...)``.
 - ``group <var> by <key>`` — the alternative terminal to ``select`` (see
   :ref:`linq_das_grouping`).
+- ``into <var>`` — optional query continuation after the terminal: rebinds the
+  prior stage's output to ``<var>`` and continues with more clauses, all on the
+  same fused chain (see :ref:`linq_das_into`).
 
-A query ends with **either** ``select`` **or** ``group … by`` — exactly one.
+Each stage ends with **either** ``select`` **or** ``group … by`` — exactly one.
 Clauses may span multiple lines inside the ``%linq! … %%`` body.
 
 Sources
@@ -102,6 +116,46 @@ placeholder ``_``; the macro normalizes the single-source lambda parameter to
 ``_`` internally, so the C# variable name is still spliced verbatim at the
 surface.
 
+.. _linq_das_let:
+
+Let bindings
+------------
+
+``let <name> = <expr>`` introduces a computed value (a new range variable in C#)
+that is reused in the clauses that follow it:
+
+.. code-block:: das
+
+    var rows <- %linq! from c in cars
+        let net = c.price - tax(c)
+        where net < 100
+        orderby net
+        select (Name = c.name, Net = net) %%
+
+The binding is **inlined textually**: every later reference to ``net`` is
+replaced with ``(c.price - tax(c))``, so the query is exactly equivalent to
+writing the expression out at each use site. Bindings are repeatable and chain —
+a later ``let`` may reference an earlier one — and they may appear in any body
+context (a single ``from``, after a ``join`` referencing both range variables,
+or in a ``from … from`` SelectMany):
+
+.. code-block:: das
+
+    // chained — `net` uses the earlier `disc`
+    var rows <- %linq! from c in cars
+        let disc = c.price / 10
+        let net  = c.price - disc
+        orderby net descending select (N = c.name, Net = net) %%
+
+Because the binding is inlined, a ``let`` over a **SQL** source pushes its
+computed expression down: a binding used in ``where`` / ``orderby`` / ``select``
+becomes the computed predicate / key / column ``_sql`` renders directly (the
+whole query stays a single ``SELECT``). The binding name must differ from every
+range variable (including a second one from a ``join`` / second ``from``) and
+from any earlier binding, a ``let`` must precede the ``select`` / ``group``
+terminal, and an inlined expression is re-evaluated at each use site (a textual
+inline, not a cached temporary).
+
 .. _linq_das_projections:
 
 Projections
@@ -140,23 +194,30 @@ projection forms are supported:
 Ordering
 --------
 
-``orderby <expr> [descending]`` sorts by a **single** key, emitting
-``_order_by($(c) => <expr>)`` (or ``_order_by_descending(...)``) between the
-``where`` and the ``select``. ``descending`` (and the default-explicit
-``ascending``) are recognized as trailing keywords:
+``orderby <expr> [descending|ascending], …`` sorts by one **or more** keys, each
+with its own direction. A single key emits ``_order_by($(c) => <expr>)`` (or
+``_order_by_descending(...)``); **multiple** comma-separated keys emit one
+``_order_by_keys($(c) => (k1, k2, …), <descMask>)`` — a single composite **stable**
+sort, where ``descMask`` bit *i* (LSB = first key) marks key *i* descending.
+``descending`` (and the default-explicit ``ascending``) are recognized as trailing
+keywords per key:
 
 .. code-block:: das
 
-    // ascending (default)
+    // single key, ascending (default)
     var byPrice <- %linq! from c in cars orderby c.price select c.name %%
 
-    // descending, after a where
+    // single key, descending, after a where
     var top <- %linq! from c in cars where c.price > 100 orderby c.price descending select c.name %%
 
-Works over all four sources (SQL emits ``ORDER BY … [DESC]``; array / decs / XML
-sort the materialized rows). **Multi-key** ordering (``orderby a, b descending``)
-is not yet supported — there is no ``_then_by`` operator; use a single key for
-now.
+    // multi-key with mixed directions: brand ascending, then price descending
+    var rows <- %linq! from c in cars orderby c.brand, c.price descending select c %%
+
+Works over all four sources: SQL emits ``ORDER BY c1, c2 DESC, …``; array / decs / XML
+sort the materialized rows. Multi-key ordering is **stable** (C# ``OrderBy`` / ``ThenBy``
+parity — rows equal on every key keep input order) and supports **at most four keys**.
+Single-key ordering is unchanged — it keeps its existing (unstable) sort, so there is
+no performance regression on the common single-key case.
 
 .. _linq_das_grouping:
 
@@ -175,17 +236,65 @@ the group's elements as ``._1``:
         print("{g._0}: {g._1 |> length} cars\n")   // key, then count of that bucket
     }
 
-A ``where`` may precede the ``group``; ``orderby`` may not (ordering the groups
-needs the deferred ``into`` continuation). The group element must be the range
-variable (``group c by …``) — element selectors are not yet supported.
+A ``where`` may precede the ``group``; ``orderby`` may not directly (order the
+groups in an ``into`` continuation instead — see :ref:`linq_das_into`). The group
+element must be the range variable (``group c by …``) — element selectors are not
+yet supported.
 
-**Grouping is an in-memory feature** (array / decs / XML). Over a **SQL** source
-it is rejected at compile time: SQL ``GROUP BY`` has no all-rows-per-group form,
-only aggregates. Use the aggregate pipe form for SQL grouping —
-``db |> select_from(type<Car>) |> _group_by(_.brand) |> _select((B = _._0, N = _._1 |> count())) |> _sql()``
-— until the ``group … into`` continuation lands. (Over decs these minimal
-``orderby`` / ``group`` chains currently materialize rather than fuse — correct,
-but a ``_fold`` perf advisory fires; a decs-adapter gap, not a query-syntax one.)
+A **bare** ``group … by`` (no continuation) keeps the whole ``(key, [rows])``
+group, so it is an **in-memory feature** (array / decs / XML); over a **SQL**
+source it is rejected (SQL ``GROUP BY`` has no all-rows-per-group form). To
+aggregate per group — the common case — add an ``into`` continuation
+(``group c by k into g select (…, g |> length, g |> select(…) |> sum)``), which
+**does** push down to SQL ``GROUP BY`` (see :ref:`linq_das_into`). (Over decs
+these minimal ``orderby`` / ``group`` chains currently materialize rather than
+fuse — correct, but a ``_fold`` perf advisory fires; a decs-adapter gap, not a
+query-syntax one.)
+
+.. _linq_das_into:
+
+Query continuation (``into``)
+-----------------------------
+
+``into <var>`` rebinds the prior stage's output to a new range variable and
+continues the query with more clauses — all on the **same** fused ``_fold``
+chain, with no materialization between stages. It is supported on single-source
+queries. C# uses it for grouped aggregation and to chain query stages.
+
+**Group continuation** — after ``group c by k into g``, the new range variable
+``g`` is the group. With the *A2* convention, ``g.key`` is the key and a bare
+``g`` is the member collection:
+
+.. code-block:: das
+
+    var report <- %linq! from c in cars
+                         group c by c.brand into g
+                         select (brand = g.key,
+                                 count = g |> length,
+                                 total = g |> select($(u : Car) => u.price) |> sum) %%
+
+A continuation may itself contain ``where`` / ``orderby`` / ``select`` / ``group``
+over the groups — e.g. ``where g |> length > 1`` (drop singleton buckets) or
+``orderby g |> select($(u : Car) => u.price) |> sum descending`` (order buckets by
+total).
+
+**Select continuation** — ``select <proj> into n`` rebinds the projected value to
+``n`` and continues:
+
+.. code-block:: das
+
+    var kept <- %linq! from c in cars select c.price into p where p > 100 select p %%
+
+Continuations chain (``… into x … into y …``), so a query can group, aggregate,
+then filter/order the aggregated rows in one fused pass.
+
+**SQL pushdown.** A group continuation whose select is **aggregate-only** —
+``g.key`` plus ``g |> length`` (→ ``COUNT(*)``), ``g |> select(…) |> sum/average/min/max``
+(→ ``SUM/AVG/MIN/MAX``), or ``g |> first()`` — pushes down to a SQL ``GROUP BY``
+over a SQL source, exactly like the hand-written ``_group_by`` pipe form. A
+**member-keeping** continuation (identity ``select g``, which keeps the whole
+``(key, [rows])`` group) has no SQL form and is **in-memory only** (array / decs /
+XML) — over a SQL source it is rejected, like a bare ``group … by``.
 
 .. _linq_das_join:
 
@@ -239,9 +348,35 @@ select-terminal join, or filter pre-join, to push down):
     var byCountry <- %linq! from c in cars join b in brands on c.brand equals b.brand
                             group c by b.country %%
 
+**Group join** (``join … equals … into <g>``) — C# ``GroupJoin``. ``into g``
+binds ``g`` to the *array of matching right rows* alongside the left range
+variable; the terminal ``select`` reads both. It is **outer** — every left row
+surfaces, an unmatched one paired with an **empty** group. The reader emits
+``_group_join``, which fuses through the same join splice (a pre-join ``where``
+included), so the per-group aggregate runs in one hash-build + probe with no
+intermediate:
+
+.. code-block:: das
+
+    // every brand with how many cars it has — a carless brand surfaces with 0
+    var perBrand <- %linq! from b in brands join c in cars on b.brand equals c.brand into g
+                           select (Brand = b.brand, N = g |> length) %%
+
+    // aggregate over the group (sum of the matching cars' prices)
+    var totals <- %linq! from b in brands join c in cars on b.brand equals c.brand into g
+                         select (Brand = b.brand, Total = g |> select($(c : Car) => c.price) |> sum) %%
+
+``join … into`` is **select-terminal + a pre-join ``where`` + a trailing
+``iterator``** only, and **array sources only**: ``_group_join`` has no SQL
+push-down (over a SQL source it rejects — write the aggregate in raw SQL
+instead), and decs / XML group-joins are not yet fused. A post-``into`` ``where``
+/ ``orderby`` / ``group`` over the ``(left, g)`` pair is rejected — ``g`` is a
+non-copyable array that can't ride the transparent-identifier carry; materialize
+then transform, or drop to the pipe-form ``_group_join``.
+
 Only a **single equi-key** is supported — composite keys (``a equals b && c
-equals d``), group-joins (``join … into g``), multiple joins, and ``orderby``
-before ``group`` are rejected at compile time.
+equals d``), multiple joins, and ``orderby`` before ``group`` are rejected at
+compile time.
 
 .. _linq_das_multifrom:
 
@@ -383,4 +518,5 @@ The following are not yet supported:
   **uncorrelated** form (independent second source → cross product) is supported
   on all sources (see :ref:`linq_das_multifrom`). N-ary ``from … from … from`` and
   ``from … from`` combined with ``join`` are also rejected.
-- **``let`` bindings** and ``into`` continuations — not yet supported.
+- **``into`` continuations** — not yet supported (``let`` bindings *are*
+  supported; see :ref:`linq_das_let`).

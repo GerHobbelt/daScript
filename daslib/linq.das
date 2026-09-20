@@ -69,7 +69,7 @@ Partitioning data (*)
      chunk, chunk_to_array - Splits an iterable into chunks of a specified size
 Join and group operations (*)
      join, join_to_array - Joins two iterables based on a key (inner join)
-     group_join, group_join_to_array - Joins two iterables based on a key, passing a sequence of the second iterable to the result (group join)
+     group_join, group_join_to_array - Group-joins two iterables on a key (C# GroupJoin / outer): every left element surfaces, paired with the sequence of matching right elements — an empty sequence when none match
      group_by, group_by_to_array - Groups elements in an iterable by a key
 Querying data (*)
      any - Returns true if the iterable has at least one element (or at least one element which satisfies the predicate)
@@ -417,6 +417,46 @@ def less(a, b : tuple<auto(TT), auto(UU), auto(VV), auto(WW)>) : bool {
     return a._3 < b._3
 }
 
+// One-key compare with direction: desc flips the operand order. Backs less_masked / the order_by_keys
+// eager fallback; the fold inline path builds an if-chain with scalar _::less instead and never calls this.
+def private key_less(a, b; desc : bool) : bool {
+    return desc ? b < a : a < b
+}
+
+def private less_masked(a, b : tuple<auto(TT)>; mask : uint) : bool {
+    return key_less(a._0, b._0, (mask & 1u) != 0u)
+}
+
+def private less_masked(a, b : tuple<auto(TT), auto(UU)>; mask : uint) : bool {
+    let d0 = (mask & 1u) != 0u
+    return true if (key_less(a._0, b._0, d0))
+    return false if (key_less(b._0, a._0, d0))
+    return key_less(a._1, b._1, (mask & 2u) != 0u)
+}
+
+def private less_masked(a, b : tuple<auto(TT), auto(UU), auto(VV)>; mask : uint) : bool {
+    let d0 = (mask & 1u) != 0u
+    return true if (key_less(a._0, b._0, d0))
+    return false if (key_less(b._0, a._0, d0))
+    let d1 = (mask & 2u) != 0u
+    return true if (key_less(a._1, b._1, d1))
+    return false if (key_less(b._1, a._1, d1))
+    return key_less(a._2, b._2, (mask & 4u) != 0u)
+}
+
+def private less_masked(a, b : tuple<auto(TT), auto(UU), auto(VV), auto(WW)>; mask : uint) : bool {
+    let d0 = (mask & 1u) != 0u
+    return true if (key_less(a._0, b._0, d0))
+    return false if (key_less(b._0, a._0, d0))
+    let d1 = (mask & 2u) != 0u
+    return true if (key_less(a._1, b._1, d1))
+    return false if (key_less(b._1, a._1, d1))
+    let d2 = (mask & 4u) != 0u
+    return true if (key_less(a._2, b._2, d2))
+    return false if (key_less(b._2, a._2, d2))
+    return key_less(a._3, b._3, (mask & 8u) != 0u)
+}
+
 def order_by_inplace(var buffer : array<auto(TT)>; key) {
     //! Sorts an array in place
     sort(buffer, $(v1, v2) => _::less(key(v1), key(v2)))
@@ -466,6 +506,32 @@ def order_by_descending_to_array(var a : iterator<auto(TT)>; key) : array<TT -co
     //! Sorts an iterator in descending order and returns an array
     var arr <- to_array(a)
     sort(arr, $(v1, v2) => _::less(key(v2), key(v1)))
+    return <- arr
+}
+
+def order_by_keys_inplace(var buffer : array<auto(TT)>; key; mask : uint) {
+    //! Sorts an array in place by a composite (tuple) key; bit ``i`` of ``mask`` → key ``i`` descending. Stable.
+    stable_sort(buffer, $(v1, v2) => less_masked(key(v1), key(v2), mask))
+}
+
+def order_by_keys(var a : iterator<auto(TT)>; key; mask : uint) : iterator<TT -const -&> {
+    //! Sorts an iterator by a composite (tuple) key with per-key direction (``mask``). Stable.
+    var arr <- to_array(a)
+    stable_sort(arr, $(v1, v2) => less_masked(key(v1), key(v2), mask))
+    return to_sequence_move(arr)
+}
+
+def order_by_keys(a : array<auto(TT)>; key; mask : uint) : array<TT -const -&> {
+    //! Sorts an array by a composite (tuple) key with per-key direction (``mask``). Stable.
+    var b := a
+    stable_sort(b, $(v1, v2) => less_masked(key(v1), key(v2), mask))
+    return <- b
+}
+
+def order_by_keys_to_array(var a : iterator<auto(TT)>; key; mask : uint) : array<TT -const -&> {
+    //! Sorts an iterator by a composite (tuple) key with per-key direction (``mask``); returns an array. Stable.
+    var arr <- to_array(a)
+    stable_sort(arr, $(v1, v2) => less_masked(key(v1), key(v2), mask))
     return <- arr
 }
 
@@ -1760,9 +1826,14 @@ def private group_join_impl(var srca; var srcb; ta : auto(TA); tb : auto(TB); ke
     var buffer : array<typedecl(result(type<TA>, type<array<TB -const -&>>)) -const -&>
     for (ita in srca) {
         let k = _::unique_key(keya(ita))
-        tableb.get(k, $(var arr){
+        // C# GroupJoin semantics: every left row surfaces. `get` returns false when the key is absent — then
+        // the left row pairs with an empty group (matching LEFT JOIN … GROUP BY, not an inner join).
+        if (!tableb.get(k, $(var arr){
             buffer.push_clone(result(ita, arr))
-        })
+        })) {
+            var empty : array<TB -const -&>
+            buffer.push_clone(result(ita, empty))
+        }
     }
     return <- buffer
 }
@@ -1773,7 +1844,7 @@ def private group_join_impl_const(srca : auto(ARGTA); srcb : auto(ARGTB); ta : a
 }
 
 def group_join(var srca : iterator<auto(TA)>; var srcb : iterator<auto(TB)>; keya, keyb; result) : iterator<typedecl(result(type<TA>, type<array<TB -const -&>>)) -const -&> {
-    //! we pass TA, and sequence of TB to 'result'
+    //! C# GroupJoin (outer): `result` receives every TA paired with the array of matching TB — an empty array when none match.
     return <- group_join_impl(srca, srcb, type<TA -const -&>, type<TB -const -&>, keya, keyb, result).to_sequence_move()
 }
 
@@ -1788,12 +1859,12 @@ def group_join(srca : array<auto(TA)>; var srcb : iterator<auto(TB) const>; keya
 }
 
 def group_join(srca : array<auto(TA)>; srcb : array<auto(TB)>; keya, keyb; result) : array<typedecl(result(type<TA>, type<array<TB -const -&>>)) -const -&> {
-    //! we pass TA, and sequence of TB to 'result'
+    //! C# GroupJoin (outer): `result` receives every TA paired with the array of matching TB — empty when none match.
     return <- group_join_impl_const(srca, srcb, type<TA -const -&>, type<TB -const -&>, keya, keyb, result)
 }
 
 def group_join_to_array(var srca : iterator<auto(TA)>; var srcb : iterator<auto(TB)>; keya, keyb; result) : array<typedecl(result(type<TA>, type<array<TB -const -&>>)) -const -&> {
-    //! we pass TA, and sequence of TB to 'result'
+    //! C# GroupJoin (outer), returning an array: every TA paired with the array of matching TB — empty when none match.
     return <- group_join_impl(srca, srcb, type<TA -const -&>, type<TB -const -&>, keya, keyb, result)
 }
 
@@ -3355,7 +3426,9 @@ def select_many_to_array(var src : iterator<auto(TT)>; collection_selector; resu
 [unused_argument(tt)]
 def private select_many_pair_impl(var src; tt : auto(TT); collection_selector; result_selector) : array<typedecl(result_selector(type<TT>, iter_type(collection_selector(type<TT>)))) -const -&> {
     var buffer : array<typedecl(result_selector(type<TT>, iter_type(collection_selector(type<TT>)))) -const -&>
-    // Lower-bound reserve when the outer source is length-bearing — flat-map produces ≥ length(src) elements.
+    // Capacity hint when the outer source is length-bearing — one slot per outer row. The true count is the
+    // sum of the inner collection lengths (so it may be more, or fewer when some inner collections are empty);
+    // `length(src)` is just a reasonable starting capacity that avoids reallocating from zero.
     static_if (typeinfo is_array(src) || typeinfo is_dim(src)) {
         buffer |> reserve(length(src))
     }

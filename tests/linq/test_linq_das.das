@@ -222,6 +222,75 @@ def test_decs_orderby(t : T?) {
     t |> equal(names[2], "car0")   // price 100
 }
 
+// ===== multi-key orderby (per-key direction; >1 key → _order_by_keys composite stable sort) =====
+
+def private mk_cars_ties() : array<Car> {
+    // duplicate (brand, price) pairs exercise secondary keys + stability of equal composite keys
+    return <- [Car(name = "a", price = 100, brand = "eco"),
+               Car(name = "b", price = 200, brand = "eco"),
+               Car(name = "c", price = 100, brand = "lux"),
+               Car(name = "d", price = 100, brand = "eco"),
+               Car(name = "e", price = 200, brand = "lux")]
+}
+
+[test]
+def test_array_orderby_multi_asc(t : T?) {
+    let cars <- mk_cars_ties()
+    let rows <- %linq! from c in cars orderby c.brand, c.price select c.name %%
+    t |> equal(length(rows), 5)
+    // brand asc (eco<lux), then price asc; equal (eco, 100) keeps input order: a before d
+    t |> equal(rows[0], "a")
+    t |> equal(rows[1], "d")
+    t |> equal(rows[2], "b")
+    t |> equal(rows[3], "c")
+    t |> equal(rows[4], "e")
+}
+
+[test]
+def test_array_orderby_mixed_dir(t : T?) {
+    let cars <- mk_cars_ties()
+    let rows <- %linq! from c in cars orderby c.brand, c.price descending select c.name %%
+    // brand asc, price desc; equal (eco, 100) stable: a before d
+    t |> equal(rows[0], "b")
+    t |> equal(rows[1], "a")
+    t |> equal(rows[2], "d")
+    t |> equal(rows[3], "e")
+    t |> equal(rows[4], "c")
+}
+
+[test]
+def test_array_orderby_3key(t : T?) {
+    // all tie on (brand, price); the 3rd key (name asc) reorders vs input order z, a, m
+    let cars <- [Car(name = "z", price = 100, brand = "eco"),
+                 Car(name = "a", price = 100, brand = "eco"),
+                 Car(name = "m", price = 100, brand = "eco")]
+    let rows <- %linq! from c in cars orderby c.brand, c.price, c.name select c.name %%
+    t |> equal(rows[0], "a")
+    t |> equal(rows[1], "m")
+    t |> equal(rows[2], "z")
+}
+
+[test]
+def test_array_orderby_keys_op_direct(t : T?) {
+    // hand-written fold-op form (brand asc, price desc) — exercises _order_by_keys directly
+    let cars <- mk_cars_ties()
+    let rows <- _fold(each(cars)._order_by_keys((_.brand, _.price), 2u).to_array())
+    t |> equal(length(rows), 5)
+    t |> equal(rows[0].name, "b")
+    t |> equal(rows[4].name, "c")
+}
+
+[test]
+def test_decs_orderby_multi(t : T?) {
+    seed_decs()
+    // brand asc, price desc; decs: car0(100,a) car1(200,a) car2(300,b)
+    let names <- %linq! from c : CarComp in decs orderby c.brand, c.price descending select c.name %%
+    t |> equal(length(names), 3)
+    t |> equal(names[0], "car1")   // brand a, price 200
+    t |> equal(names[1], "car0")   // brand a, price 100
+    t |> equal(names[2], "car2")   // brand b
+}
+
 // ===== group … by (terminal; IGrouping `(key, [elems])` per bucket; in-memory sources) =====
 
 [test]
@@ -355,6 +424,72 @@ def test_join_group_after(t : T?) {
         if (g._0 == "USA") { t |> equal(length(g._1), 2, "USA: cheap+mid") }
         if (g._0 == "Italy") { t |> equal(length(g._1), 1, "Italy: lux") }
     }
+}
+
+// ===== join … into g (group-join, C# GroupJoin / outer) =====
+// `into g` binds the array of matching right rows alongside the left row; the terminal `select` reads both.
+// Outer: every left row surfaces — an unmatched left pairs with an empty group. Select-terminal + a pre-join
+// `where` (filters the left source); post-`into` where/orderby/group is rejected (see failed_linq_das). SQL
+// sources reject (group-join is in-memory). brands has a carless "sport" to exercise the empty group.
+
+def private mk_brands3() : array<BrandHQ> {
+    return <- [BrandHQ(brand = "eco", country = "USA"),
+               BrandHQ(brand = "lux", country = "Italy"),
+               BrandHQ(brand = "sport", country = "Germany")]   // no car → outer empty group
+}
+
+[test]
+def test_join_into_group_count(t : T?) {
+    let cars <- mk_cars()
+    let brands <- mk_brands3()
+    let rows <- %linq! from b in brands
+                       join c in cars on b.brand equals c.brand into g
+                       select (brand = b.brand, n = g |> length) %%
+    t |> equal(length(rows), 3, "every brand surfaces, including the carless one (outer GroupJoin)")
+    for (r in rows) {
+        if (r.brand == "eco") { t |> equal(r.n, 2, "cheap + mid") }
+        if (r.brand == "lux") { t |> equal(r.n, 1) }
+        if (r.brand == "sport") { t |> equal(r.n, 0, "unmatched left → empty group") }
+    }
+}
+
+[test]
+def test_join_into_group_sum(t : T?) {
+    let cars <- mk_cars()
+    let brands <- mk_brands()
+    let rows <- %linq! from b in brands
+                       join c in cars on b.brand equals c.brand into g
+                       select (brand = b.brand, total = g |> select($(c : Car) => c.price) |> sum) %%
+    t |> equal(length(rows), 2)
+    for (r in rows) {
+        if (r.brand == "eco") { t |> equal(r.total, 200, "cheap 50 + mid 150") }
+        if (r.brand == "lux") { t |> equal(r.total, 300) }
+    }
+}
+
+[test]
+def test_join_into_pre_where(t : T?) {
+    let cars <- mk_cars()
+    let brands <- mk_brands3()
+    // pre-join `where` filters the left source (brands) before the group-join fuses.
+    let rows <- %linq! from b in brands
+                       where b.country != "Germany"
+                       join c in cars on b.brand equals c.brand into g
+                       select (brand = b.brand, n = g |> length) %%
+    t |> equal(length(rows), 2, "the carless German brand is filtered out before the join")
+    for (r in rows) {
+        if (r.brand == "eco") { t |> equal(r.n, 2) }
+        if (r.brand == "lux") { t |> equal(r.n, 1) }
+    }
+}
+
+[test]
+def test_join_into_iterator(t : T?) {
+    let cars <- mk_cars()
+    let brands <- mk_brands3()
+    var n = 0
+    for (_r in %linq! from b in brands join c in cars on b.brand equals c.brand into g select (brand = b.brand, k = g |> length) iterator %%) { n++ }
+    t |> equal(n, 3, "iterator over every brand (outer)")
 }
 
 [test]
@@ -633,4 +768,106 @@ def test_correlated_iterator_output(t : T?) {
     var n = 0
     for (_s in %linq! from o in orders from l in o.lines select l.sku iterator %%) { n++ }
     t |> equal(n, 4)
+}
+
+// ===== let bindings (Approach A — textual inlining) =====
+// `let n = <expr>` introduces a computed range variable; every downstream reference is inlined as
+// `(<expr>)`, so the chain is identical to writing the expression out by hand. Works in every context and,
+// for SQL, the inlined computed column/key pushes down (see tests/dasSQLITE/test_linq_das_sql.das).
+
+[test]
+def test_let_where_and_select(t : T?) {
+    let cars <- mk_cars()
+    // `net` is reused in both the where predicate and the projection — inlined at each site.
+    let rows <- %linq! from c in cars let net = c.price - 10 where net < 150 select (Name = c.name, Net = net) %%
+    t |> equal(length(rows), 2, "net<150 keeps cheap(40), mid(140)")
+    t |> equal(rows[0].Name, "cheap")
+    t |> equal(rows[0].Net, 40)
+    t |> equal(rows[1].Name, "mid")
+    t |> equal(rows[1].Net, 140)
+}
+
+[test]
+def test_let_chained(t : T?) {
+    let cars <- mk_cars()
+    // `net` references the earlier `disc` — chained lets resolve in order.
+    let rows <- %linq! from c in cars let disc = c.price / 10 let net = c.price - disc
+        orderby net descending select (N = c.name, Net = net) %%
+    t |> equal(length(rows), 3)
+    t |> equal(rows[0].N, "lux")     // 300 - 30 = 270
+    t |> equal(rows[0].Net, 270)
+    t |> equal(rows[2].N, "cheap")   // 50 - 5 = 45
+    t |> equal(rows[2].Net, 45)
+}
+
+[test]
+def test_let_computed_select_only(t : T?) {
+    let cars <- mk_cars()
+    let rows <- %linq! from c in cars let tax = c.price / 5 select (N = c.name, Tax = tax) %%
+    t |> equal(length(rows), 3)
+    t |> equal(rows[0].Tax, 10)   // 50/5
+    t |> equal(rows[2].Tax, 60)   // 300/5
+}
+
+[test]
+def test_let_in_group_key(t : T?) {
+    let cars <- mk_cars()
+    let groups <- %linq! from c in cars let b = c.brand group c by b %%
+    t |> equal(length(groups), 2, "let key feeds group..by")
+    for (g in groups) {
+        if (g._0 == "eco") { t |> equal(length(g._1), 2) }
+        if (g._0 == "lux") { t |> equal(length(g._1), 1) }
+    }
+}
+
+[test]
+def test_let_decs(t : T?) {
+    seed_decs()
+    let names <- %linq! from c : CarComp in decs let hi = c.price * 2 orderby hi descending select c.name %%
+    t |> equal(length(names), 3)
+    t |> equal(names[0], "car2")   // 300*2 highest
+    t |> equal(names[2], "car0")   // 100*2 lowest
+}
+
+[test]
+def test_let_join_both_vars(t : T?) {
+    let cars <- mk_cars()
+    let brands <- mk_brands()
+    // a `let` after the join references BOTH range variables; inlined into the select-terminal.
+    let tags <- %linq! from c in cars join b in brands on c.brand equals b.brand
+        let tag = "{c.name}:{b.country}" select tag %%
+    t |> equal(length(tags), 3)
+    t |> equal(tags[0], "cheap:USA")
+    t |> equal(tags[2], "lux:Italy")
+}
+
+[test]
+def test_let_cross(t : T?) {
+    let cars <- mk_cars()
+    let brands <- mk_brands()
+    let pairs <- %linq! from c in cars from b in brands let pair = "{c.name}/{b.country}" select pair %%
+    t |> equal(length(pairs), 6, "3 cars × 2 brands")
+    t |> equal(pairs[0], "cheap/USA")
+}
+
+[test]
+def test_let_correlated(t : T?) {
+    let orders <- mk_orders()
+    // a `let` over a correlated (flatten) query references the outer and inner range vars.
+    let labels <- %linq! from o in orders from l in o.lines let label = "{o.id}-{l.sku}" select label %%
+    t |> equal(length(labels), 4)
+    t |> equal(labels[0], "1-a")
+    t |> equal(labels[3], "3-d")
+}
+
+[test]
+def test_let_forward_scope_no_clobber(t : T?) {
+    let cars <- mk_cars()
+    let lux = "eco"   // OUTER var; the `where` references it BEFORE the same-named `let` is introduced
+    // C# forward-only `let` scoping: the `where`'s `lux` is the outer ("eco") — it must NOT be rewritten
+    // to the later binding. So the filter keeps the two eco cars, then `select lux` uses the let (c.brand).
+    let brands <- %linq! from c in cars where c.brand == lux let lux = c.brand select lux %%
+    t |> equal(length(brands), 2, "where uses OUTER lux (eco), not the let")
+    t |> equal(brands[0], "eco")
+    t |> equal(brands[1], "eco")
 }

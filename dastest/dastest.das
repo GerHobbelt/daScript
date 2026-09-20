@@ -180,8 +180,25 @@ def private build_iso_cmd(filesList : array<string>; prefix, suffix : string) : 
 // Run one subprocess and parse its streamed per-file JSON reports.
 def private run_iso_subprocess(cmd : string; timeoutSec : float; var br : BatchRun) {
     var pending : array<string>
+    // popen_timeout's stderr handling is timeout-dependent: with timeout<=0 it
+    // falls back to plain _popen (stdout only — stderr DROPPED), which is the
+    // path isolated mode hits since per-test test_timeout defaults to 0; with
+    // timeout>0 it routes stderr into the captured pipe, interleaved with the
+    // ##dastest## JSON markers. Either way a hard crash (AV / abort / __fastfail)
+    // writes its diagnostic — the crash-handler C++ stack + the daslang call
+    // stack — to stderr. Redirect stderr to a temp file (overrides both paths,
+    // and avoids the timeout>0 interleave) and, on abnormal exit, fold it into
+    // the crashed file's log so the stack is surfaced under the failing test.
+    let tfRes = create_temp_file_result("dastest_stderr_", ".txt")
+    let errPath = (tfRes is value) ? (tfRes as value) : ""
+    if (empty(errPath)) {
+        // The point of this is to NOT silently lose crash diagnostics, so make
+        // the temp-file failure visible rather than quietly dropping stderr.
+        br.err |> push("dastest: could not create a temp file for subprocess stderr capture ({tfRes as error}); stderr (crash stacks, etc.) will not be surfaced")
+    }
+    let runCmd = empty(errPath) ? cmd : "{cmd} 2>\"{errPath}\""
     unsafe {
-        br.exitCode = popen_timeout(cmd, timeoutSec) $(f) {
+        br.exitCode = popen_timeout(runCmd, timeoutSec) $(f) {
             if (f == null) {
                 br.err |> push("Internal error: Failed to execute cmd > {cmd}")
                 return
@@ -228,6 +245,41 @@ def private run_iso_subprocess(cmd : string; timeoutSec : float; var br : BatchR
                 }
             }
         }
+    }
+    if (!empty(errPath)) {
+        // Folded in on ANY abnormal exit (crash, panic, compile error, timeout),
+        // not just hard crashes — so the header stays neutral and carries the
+        // exit code rather than asserting "crash". A clean run's stderr (e.g.
+        // libhv logs) is noise we don't attribute to the test.
+        if (br.exitCode != 0) {
+            var folded : array<string>
+            fopen(errPath, "rb") $(ef) {
+                if (ef != null) {
+                    while (!feof(ef)) {
+                        let ln = fgets(ef)
+                        continue if (empty(ln))
+                        folded |> push(ln)
+                    }
+                }
+            }
+            if (!empty(folded)) {
+                let header = "----- worker subprocess stderr (abnormal exit {br.exitCode}; batch>1 may include other files in the worker) -----\n"
+                // A caught panic emits a JSON result, so `pending` was already moved into
+                // that result's log above — fold the captured stderr into the last result's
+                // log so the at-throw stack (--stack-on-exception) surfaces under the
+                // failing test. A hard crash emits no result, so fall back to `pending`
+                // (the trailing log attributed to the dead file).
+                if (empty(br.results)) {
+                    pending |> push(header)
+                    pending |> push_from(folded)
+                } else {
+                    let li = length(br.results) - 1
+                    br.results[li].log |> push(header)
+                    br.results[li].log |> push_from(folded)
+                }
+            }
+        }
+        remove_result(errPath)
     }
     br.pendingLog <- pending
 }
@@ -581,8 +633,11 @@ def main() : int {
         let jitstr = jit_enabled() ? "-jit" : ""
         let aotstr = is_in_aot() ? "-use-aot" : ""
         let benchstr = ctx.bench_enabled ? "--bench" : ""
+        // Forward --stack-on-exception to each worker: the flag sets the test
+        // context's at-throw stack walk, and the tests run in the worker, not here.
+        let stackExcFlag = test_args.stack_on_exception ? " --stack-on-exception" : ""
         let cmdPrefix = "{launchPrefix} {jitstr} {aotstr} --"
-        let cmdSuffix = " {benchstr}{log::useTtyColors ? " --color" : ""}{headlessFlag}"
+        let cmdSuffix = " {benchstr}{log::useTtyColors ? " --color" : ""}{headlessFlag}{stackExcFlag}"
         let batchSize = max(1, test_args.batch)
         // Group files into batches of batchSize. Each batch is run by one worker
         // subprocess (batchCmd); per-file singleCmds are kept so a crash can be
