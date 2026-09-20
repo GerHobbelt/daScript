@@ -165,6 +165,64 @@ def private round_up(off, a : int) : int {
     return ((off + a - 1) / a) * a
 }
 
+//! One std140-laid-out field of a @uniform / @push_constant interface block. Returned by
+//! compute_block_layout and consumed by host-side bind macros (e.g. dasVulkan's SpirvVulkanShader)
+//! to emit one write per field at the right byte offset. `is_matrix` just means "this field IS a
+//! matrix" (and gets MatrixStride 16 in SPIR-V) — it does NOT by itself imply the daslang storage
+//! and std140 layout differ. For float4x4 the columns are already vec4-wide so a single memcpy
+//! works; for float3x3 / float3x4 the daslang storage is packed (3-wide columns) while std140 pads
+//! each column to vec4, so bind code must repack per-column. **Use `matrix_width` to choose**:
+//! `matrix_width == 4` → safe to memcpy the field; `matrix_width < 4` → repack per column.
+struct public BlockField {
+    name         : string //!< field name as declared in the daslang struct
+    offset       : int    //!< std140 byte offset from the block base
+    size         : int    //!< std140 base size of the field (matrices: 16 * cols)
+    is_matrix    : bool   //!< true if this field is a matrix (MatrixStride 16 in SPIR-V); see struct docstring re: repack
+    matrix_width : int    //!< matrix column-vector width — 4 for float4x4 (memcpy-safe); 3 for float3x3/3x4 (per-column repack)
+    matrix_cols  : int    //!< matrix column count (only valid when is_matrix); 0 otherwise
+}
+
+//! Compute the std140 layout of one interface block. Pure: takes a Structure?, fills `fields` with
+//! per-field offsets / sizes / matrix flags, returns the block total size and max member alignment.
+//! Used by build_block_struct (SPIR-V type emit) and by host-side bind macros. Rejects bool and
+//! non-numeric fields fail-closed (no physical std140 layout). `sname` is only used in error messages.
+//! `fields` is cleared at entry so reuse across calls and partial-failure returns can't bleed.
+//! [macro_function]: callable from a backend's bind-gen macro at compile time, mirrors generate_spirv.
+[macro_function]
+def public compute_block_layout(sname : string; st : Structure?; var fields : array<BlockField>; var errors : array<string>) : tuple<ok : bool; size : int; align : int> {
+    fields |> clear
+    if (st == null || empty(st.fields)) {
+        errors |> push("interface block '{sname}' must be a struct with at least one field")
+        return (ok = false, size = 0, align = 0)
+    }
+    var off = 0
+    var max_align = 0
+    for (fld in st.fields) {
+        let mi = matrix_info(fld._type)
+        if (mi.ok) {
+            off = round_up(off, 16)
+            fields |> emplace(BlockField(name := string(fld.name), offset = off, size = 16 * mi.cols,
+                is_matrix = true, matrix_width = mi.width, matrix_cols = mi.cols))
+            off += 16 * mi.cols
+            max_align = max(max_align, 16)
+            continue
+        }
+        let fbt = fld._type.baseType
+        if (scalar_class(fbt) < 0) {
+            errors |> push("interface block '{sname}' field '{fld.name}': type {fbt} is not supported (only 32-bit int/uint/float scalars, their vectors, and matrices; bool has no physical interface-block layout in Vulkan)")
+            fields |> clear
+            return (ok = false, size = 0, align = 0)
+        }
+        let falign = std140_align(fbt)
+        off = round_up(off, falign)
+        fields |> emplace(BlockField(name := string(fld.name), offset = off, size = std140_size(fbt),
+            is_matrix = false, matrix_width = 0, matrix_cols = 0))
+        off += std140_size(fbt)
+        max_align = max(max_align, falign)
+    }
+    return (ok = true, size = off, align = max_align)
+}
+
 // Build a laid-out interface struct from a daslang struct's fields. 32-bit scalar/vector/matrix
 // members are supported; nested structs and arrays are not yet. `as_block` toggles the Block decoration
 // (true for @uniform/@push_constant blocks, false for an SSBO runtime-array element struct).
@@ -174,54 +232,31 @@ def private round_up(off, a : int) : int {
 // past the last member (the push-constant range size); `align` lets the SSBO caller round it up to
 // the std430 array stride.
 def private build_block_struct(var m : SpirvModule; sname : string; st : Structure?; as_block : bool; var errors : array<string>) : tuple<ok : bool; type_id : uint; size : int; align : int> {
-    if (st == null || empty(st.fields)) {
-        errors |> push("interface block '{sname}' must be a struct with at least one field")
+    var fields : array<BlockField>
+    let layout = compute_block_layout(sname, st, fields, errors)
+    if (!layout.ok) {
+        delete fields
         return (ok = false, type_id = 0u, size = 0, align = 0)
     }
     var members : array<uint>
     var offsets : array<int>
     var mat_strides : array<int>
-    var off = 0
-    var max_align = 0
+    var fi = 0
     for (fld in st.fields) {
-        let mi = matrix_info(fld._type)
-        if (mi.ok) {
-            // std140/std430 matrix: ColMajor, each column padded to vec4 (MatrixStride 16), align 16,
-            // size = 16 * cols. (daslang float3x3 stores packed columns, so its bytes need
-            // repacking host-side before upload; float4x4 columns are already vec4 -> direct.)
-            off = round_up(off, 16)
-            members |> push(emit_type(m, fld._type))
-            offsets |> push(off)
-            mat_strides |> push(16)
-            off += 16 * mi.cols
-            max_align = max(max_align, 16)
-            continue
-        }
-        let fbt = fld._type.baseType
-        // only 32-bit int/uint/float scalars + their vectors. scalar_class rejects bool (and any
-        // non-numeric): OpTypeBool has no physical size in a std140/std430 interface block, so a
-        // bool member would emit an invalid layout — reject it fail-closed rather than emit it.
-        if (scalar_class(fbt) < 0) {
-            errors |> push("interface block '{sname}' field '{fld.name}': type {fbt} is not supported (only 32-bit int/uint/float scalars, their vectors, and matrices; bool has no physical interface-block layout in Vulkan)")
-            delete members
-            delete offsets
-            delete mat_strides
-            return (ok = false, type_id = 0u, size = 0, align = 0)
-        }
-        let falign = std140_align(fbt)
-        off = round_up(off, falign)
+        let f = fields[fi]
         members |> push(emit_type(m, fld._type))
-        offsets |> push(off)
-        mat_strides |> push(0)
-        off += std140_size(fbt)
-        max_align = max(max_align, falign)
+        offsets |> push(f.offset)
+        // std140 matrix: ColMajor, each column padded to vec4 (MatrixStride 16) — see BlockField docs.
+        mat_strides |> push(f.is_matrix ? 16 : 0)
+        fi++
     }
     let id = (as_block ? type_struct_block(m, members, offsets, mat_strides)
                        : type_struct_layout(m, members, offsets, mat_strides))
     delete members
     delete offsets
     delete mat_strides
-    return (ok = true, type_id = id, size = off, align = max_align)
+    delete fields
+    return (ok = true, type_id = id, size = layout.size, align = layout.align)
 }
 
 // std430 layout of an SSBO runtime-array element. Returns the element SPIR-V type-id + the
@@ -744,8 +779,7 @@ def private ensure_image_query(var m : SpirvModule; var ctx : EmitCtx) {
 // GLSL.std.450 builtin (or wrong class) -> caller emits a clean error. NOTE: keyed on the DASLANG name,
 // which differs from the GLSL spelling for two: daslang `lerp` -> FMix, daslang `rsqrt` -> InverseSqrt.
 // Only dependency-free builtin `math` functions appear here (no dead branches). Excluded on purpose:
-// daslang has no mix/step/smoothstep; radians/degrees live in daslib/math_boost as das functions whose
-// bodies reference a PI global the dependency walker can't lower (a shader writes the multiply inline).
+// daslang has no mix.
 def private glsl_ext_op(name : string; cls : int) : tuple<ok : bool; op : GLSLstd450> {
     if (name == "abs") {
         if (cls == 2) return (ok = true, op = GLSLstd450.FAbs)
@@ -785,6 +819,15 @@ def private glsl_ext_op(name : string; cls : int) : tuple<ok : bool; op : GLSLst
     if (name == "acos") return (ok = true, op = GLSLstd450.Acos)
     if (name == "atan") return (ok = true, op = GLSLstd450.Atan)
     if (name == "atan2") return (ok = true, op = GLSLstd450.Atan2)
+    if (name == "sinh") return (ok = true, op = GLSLstd450.Sinh)
+    if (name == "cosh") return (ok = true, op = GLSLstd450.Cosh)
+    if (name == "tanh") return (ok = true, op = GLSLstd450.Tanh)
+    if (name == "asinh") return (ok = true, op = GLSLstd450.Asinh)
+    if (name == "acosh") return (ok = true, op = GLSLstd450.Acosh)
+    if (name == "atanh") return (ok = true, op = GLSLstd450.Atanh)
+    if (name == "mad") return (ok = true, op = GLSLstd450.Fma)
+    if (name == "radians") return (ok = true, op = GLSLstd450.Radians)
+    if (name == "degrees") return (ok = true, op = GLSLstd450.Degrees)
     if (name == "pow") return (ok = true, op = GLSLstd450.Pow)
     if (name == "exp") return (ok = true, op = GLSLstd450.Exp)
     if (name == "log") return (ok = true, op = GLSLstd450.Log)
@@ -795,6 +838,8 @@ def private glsl_ext_op(name : string; cls : int) : tuple<ok : bool; op : GLSLst
     if (name == "round") return (ok = true, op = GLSLstd450.Round)
     if (name == "trunc") return (ok = true, op = GLSLstd450.Trunc)
     if (name == "fract") return (ok = true, op = GLSLstd450.Fract)
+    if (name == "step") return (ok = true, op = GLSLstd450.Step)
+    if (name == "smoothstep") return (ok = true, op = GLSLstd450.SmoothStep)
     if (name == "lerp") return (ok = true, op = GLSLstd450.FMix)            // daslang lerp == GLSL mix
     if (name == "length") return (ok = true, op = GLSLstd450.Length)
     if (name == "distance") return (ok = true, op = GLSLstd450.Distance)
@@ -1494,19 +1539,22 @@ class SpirvEmit : AstVisitor {
 
     // ----- return -----
     // Valueless (`return` in the void entry / a void helper) -> OpReturn; a value return inside a
-    // user-defined shader function -> OpReturnValue with the loaded subexpression. Either way a block
-    // terminator (sets ctx.terminated).
+    // user-defined shader function -> OpReturnValue with the loaded subexpression. ctx.terminated is
+    // ONLY set when an actual terminator was emitted — if value_of() failed (e.g. an upstream error
+    // already pushed onto errs), leaving terminated=false lets the function-end fallback close the
+    // block with OpUnreachable so the blob stays structurally valid (one terminator per block).
     def override visitExprReturn(var expr : ExprReturn?) : ExpressionPtr {
         var bm & = unsafe(*m)
         if (expr.subexpr != null) {
             let v = value_of(expr.subexpr)
             if (v != 0u) {
                 emit(bm, SEC_FUNCS, SpvOp.ReturnValue, v)
+                ctx.terminated = true
             }
         } else {
             emit(bm, SEC_FUNCS, SpvOp.Return)
+            ctx.terminated = true
         }
-        ctx.terminated = true
         return expr
     }
 
@@ -2118,6 +2166,21 @@ class SpirvEmit : AstVisitor {
             }
             emit_n(bm, SEC_FUNCS, SpvOp.CompositeConstruct, cons)
             delete cons
+            e2id[k] = res
+            return expr
+        }
+        // fmod: core OpFRem (C fmod semantics — sign-of-dividend). NOT a GLSL.std.450 ext-inst.
+        if (name == "fmod") {
+            if (length(expr.arguments) != 2) {
+                errs |> push("fmod expects 2 arguments")
+                return expr
+            }
+            let a = value_of(expr.arguments[0])
+            let b = value_of(expr.arguments[1])
+            if (a == 0u || b == 0u) return expr
+            let rt = emit_type(bm, expr._type)
+            let res = alloc_id(bm)
+            emit(bm, SEC_FUNCS, SpvOp.FRem, rt, res, a, b)
             e2id[k] = res
             return expr
         }
