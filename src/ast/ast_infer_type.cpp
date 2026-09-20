@@ -1287,7 +1287,7 @@ namespace das {
         // infer
         expr->type = new TypeDecl(Type::tPointer);
         expr->type->firstType = new TypeDecl(Type::tHandle);
-        expr->type->firstType->annotation = (TypeAnnotation *)Module::require("ast_core")->findAnnotation("Expression").get();
+        expr->type->firstType->annotation = (TypeAnnotation *)Module::require("ast_core")->findAnnotation("Expression");
         // mark quote as noAot
         if (func) {
             if (!program->policies.aot_macros) {
@@ -2441,7 +2441,7 @@ namespace das {
                     error("typeinfo(" + expr->trait + " ...) is undefined, " + describeType(expr->typeexpr), "", "",
                           expr->at, CompilationError::typeinfo_undefined);
                 } else {
-                    expr->macro = mtis.back().get();
+                    expr->macro = mtis.back();
                     string errors;
                     auto cexpr = expr->macro->getAstChange(expr, errors);
                     if (cexpr) {
@@ -4583,7 +4583,7 @@ namespace das {
             }
             pVar->type->constant |= src->type->isConst();
             pVar->type->temporary |= src->type->isTemp();
-            pVar->source = src;
+            pVar->loop_source = src;
             pVar->can_shadow = expr->canShadow;
             for (auto &al : assume) {
                 if (al.expr->alias == pVar->name) {
@@ -5335,7 +5335,7 @@ namespace das {
                       expr->at, CompilationError::invalid_cast);
                 return Visitor::visit(expr);
             }
-            auto ecast = new ExprCast(expr->at, expr->clone(), expr->aliasSubstitution);
+            auto ecast = new ExprCast(expr->at, expr->clone(), new TypeDecl(*expr->aliasSubstitution));
             ecast->reinterpret = true;
             ecast->alwaysSafe = true;
             expr->aliasSubstitution = nullptr;
@@ -5481,7 +5481,7 @@ namespace das {
         if (expr->func) {
             for (const auto &ann : expr->func->annotations) {
                 if (ann->annotation->rtti_isFunctionAnnotation()) {
-                    auto fnAnn = static_pointer_cast<FunctionAnnotation>(ann->annotation);
+                    auto fnAnn = static_cast<FunctionAnnotation*>(ann->annotation);
                     string err;
                     auto fexpr = fnAnn->transformCall(expr, err);
                     if (!err.empty()) {

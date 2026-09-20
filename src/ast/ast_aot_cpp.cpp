@@ -1204,7 +1204,7 @@ namespace das {
             ss << "namespace " << aotModuleName(that->module) << " {\n";
             for ( auto & ann : that->annotations ) {
                 if ( ann->annotation->rtti_isStructureAnnotation() ) {
-                    static_pointer_cast<StructureAnnotation>(ann->annotation)->aotPrefix(that, ann->arguments, ss);
+                    static_cast<StructureAnnotation*>(ann->annotation)->aotPrefix(that, ann->arguments, ss);
                 }
             }
             ss << "\nstruct " << aotStructName(that);
@@ -1214,7 +1214,7 @@ namespace das {
             ss << " {\n";
             for ( auto & ann : that->annotations ) {
                 if ( ann->annotation->rtti_isStructureAnnotation() ) {
-                    static_pointer_cast<StructureAnnotation>(ann->annotation)->aotBody(that, ann->arguments, ss);
+                    static_cast<StructureAnnotation*>(ann->annotation)->aotBody(that, ann->arguments, ss);
                 }
             }
         }
@@ -1248,7 +1248,7 @@ namespace das {
             }
             for ( auto & ann : that->annotations ) {
                 if ( ann->annotation->rtti_isStructureAnnotation() ) {
-                    static_pointer_cast<StructureAnnotation>(ann->annotation)->aotSuffix(that, ann->arguments, ss);
+                    static_cast<StructureAnnotation*>(ann->annotation)->aotSuffix(that, ann->arguments, ss);
                 }
             }
             ss << "}\n";    // namespace
@@ -3435,7 +3435,6 @@ namespace das {
         }
         virtual ExpressionPtr visitLooksLikeCallArg ( ExprLooksLikeCall * call, Expression * arg, bool last ) override {
             if ( call->name=="invoke" ) {
-                auto argType = arg->type;
                 if ( arg->type->isRefType() ) {
                     if ( needsArgPass(arg) ) {
                         ss << ")";
@@ -3575,7 +3574,7 @@ namespace das {
             string aotName = call->func->getAotName(call);
             for ( auto & ann : call->func->annotations ) {
                 if ( ann->annotation->rtti_isFunctionAnnotation() ) {
-                    auto pAnn = static_pointer_cast<FunctionAnnotation>(ann->annotation);
+                    auto pAnn = static_cast<FunctionAnnotation*>(ann->annotation);
                     if ( aotPrefix.find(aotName)==aotPrefix.end() ) {
                         pAnn->aotPrefix(stg, call);
                         aotPrefix.insert(aotName);
@@ -4240,7 +4239,7 @@ namespace das {
                     var->init = var->init->visit(*this);
                     var->init = visitGlobalLetInit(var, var->init);
                 }
-                auto varn = visitGlobalLet(var);
+                visitGlobalLet(var);
             }
             tab --;
             ss << "}\n";

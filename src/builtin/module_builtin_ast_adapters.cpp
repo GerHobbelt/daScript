@@ -1162,7 +1162,7 @@ namespace das {
     }
 
 
-    struct AstVisitorAdapterAnnotation : ManagedStructureAnnotation<VisitorAdapter,false,true> {
+    struct AstVisitorAdapterAnnotation : ManagedStructureAnnotation<VisitorAdapter,false,false> {
         AstVisitorAdapterAnnotation(ModuleLibrary & ml)
             : ManagedStructureAnnotation ("VisitorAdapter", ml) {
         }
@@ -1504,7 +1504,7 @@ namespace das {
         Context *   context;
     };
 
-    struct AstPassMacroAnnotation : ManagedStructureAnnotation<PassMacro,false,true> {
+    struct AstPassMacroAnnotation : ManagedStructureAnnotation<PassMacro,false,false> {
         AstPassMacroAnnotation(ModuleLibrary & ml)
             : ManagedStructureAnnotation ("PassMacro", ml) {
             addField<DAS_BIND_MANAGED_FIELD(name)>("name");
@@ -1553,7 +1553,7 @@ namespace das {
         Context *   context;
     };
 
-    struct AstVariantMacroAnnotation : ManagedStructureAnnotation<VariantMacro,false,true> {
+    struct AstVariantMacroAnnotation : ManagedStructureAnnotation<VariantMacro,false,false> {
         AstVariantMacroAnnotation(ModuleLibrary & ml)
             : ManagedStructureAnnotation ("VariantMacro", ml) {
             addField<DAS_BIND_MANAGED_FIELD(name)>("name");
@@ -1580,7 +1580,7 @@ namespace das {
         Context *   context;
     };
 
-    struct AstForLoopMacroAnnotation : ManagedStructureAnnotation<ForLoopMacro,false,true> {
+    struct AstForLoopMacroAnnotation : ManagedStructureAnnotation<ForLoopMacro,false,false> {
         AstForLoopMacroAnnotation(ModuleLibrary & ml)
             : ManagedStructureAnnotation ("ForLoopMacro", ml) {
             addField<DAS_BIND_MANAGED_FIELD(name)>("name");
@@ -1641,14 +1641,14 @@ namespace das {
         Context *   context;
     };
 
-    struct AstCaptureMacroAnnotation : ManagedStructureAnnotation<CaptureMacro,false,true> {
+    struct AstCaptureMacroAnnotation : ManagedStructureAnnotation<CaptureMacro,false,false> {
         AstCaptureMacroAnnotation(ModuleLibrary & ml)
             : ManagedStructureAnnotation ("CaptureMacro", ml) {
             addField<DAS_BIND_MANAGED_FIELD(name)>("name");
         }
     };
 
-    struct AstTypeMacroAnnotation : ManagedStructureAnnotation<TypeMacro,false,true> {
+    struct AstTypeMacroAnnotation : ManagedStructureAnnotation<TypeMacro,false,false> {
         AstTypeMacroAnnotation(ModuleLibrary & ml)
             : ManagedStructureAnnotation ("TypeMacro", ml) {
             addField<DAS_BIND_MANAGED_FIELD(name)>("name");
@@ -1686,7 +1686,7 @@ namespace das {
         Context *   context;
     };
 
-    struct AstSimulateMacroAnnotation : ManagedStructureAnnotation<SimulateMacro,false,true> {
+    struct AstSimulateMacroAnnotation : ManagedStructureAnnotation<SimulateMacro,false,false> {
         AstSimulateMacroAnnotation(ModuleLibrary & ml)
             : ManagedStructureAnnotation ("SimulateMacro", ml) {
             addField<DAS_BIND_MANAGED_FIELD(name)>("name");
@@ -1736,7 +1736,7 @@ namespace das {
         Context *   context;
     };
 
-    struct AstReaderMacroAnnotation : ManagedStructureAnnotation<ReaderMacro,false,true> {
+    struct AstReaderMacroAnnotation : ManagedStructureAnnotation<ReaderMacro,false,false> {
         AstReaderMacroAnnotation(ModuleLibrary & ml)
             : ManagedStructureAnnotation ("ReaderMacro", ml) {
             addField<DAS_BIND_MANAGED_FIELD(name)>("name");
@@ -2104,7 +2104,7 @@ namespace das {
         Context *   context;
     };
 
-    struct AstCommentReaderAnnotation : ManagedStructureAnnotation<CommentReader,false,true> {
+    struct AstCommentReaderAnnotation : ManagedStructureAnnotation<CommentReader,false,false> {
         AstCommentReaderAnnotation(ModuleLibrary & ml)
             : ManagedStructureAnnotation ("CommentReader", ml) {
         }
@@ -2159,7 +2159,7 @@ namespace das {
         Context *   context;
     };
 
-    struct AstCallMacroAnnotation : ManagedStructureAnnotation<CallMacro,false,true> {
+    struct AstCallMacroAnnotation : ManagedStructureAnnotation<CallMacro,false,false> {
         AstCallMacroAnnotation(ModuleLibrary & ml)
             : ManagedStructureAnnotation ("CallMacro", ml) {
             addField<DAS_BIND_MANAGED_FIELD(name)>("name");
@@ -2200,29 +2200,27 @@ namespace das {
     };
 
     ReaderMacroPtr makeReaderMacro ( const char * name, const void * pClass, const StructInfo * info, Context * context ) {
-        return make_smart<ReaderMacroAdapter>(name,(char *)pClass,info,context);
+        return new ReaderMacroAdapter(name,(char *)pClass,info,context);
     }
 
-    void addModuleReaderMacro ( Module * module, ReaderMacroPtr & _newM, Context * context, LineInfoArg * at ) {
-        ReaderMacroPtr newM = das::move(_newM);
+    void addModuleReaderMacro ( Module * module, ReaderMacroPtr newM, Context * context, LineInfoArg * at ) {
         if ( !module->addReaderMacro(newM, true) ) {
             context->throw_error_at(at, "can't add reader macro %s to module %s", newM->name.c_str(), module->name.c_str());
         }
     }
 
     CommentReaderPtr makeCommentReader ( const void * pClass, const StructInfo * info, Context * context ) {
-        return make_smart<CommentReaderAdapter>((char *)pClass,info,context);
+        return new CommentReaderAdapter((char *)pClass,info,context);
     }
 
-    void addModuleCommentReader ( Module * module, CommentReaderPtr & _newM, Context * context, LineInfoArg * at ) {
-        CommentReaderPtr newM = das::move(_newM);
+    void addModuleCommentReader ( Module * module, CommentReaderPtr newM, Context * context, LineInfoArg * at ) {
         if ( !module->addCommentReader(newM, true) ) {
             context->throw_error_at(at, "can't add comment reader to module %s", module->name.c_str());
         }
     }
 
     CallMacroPtr makeCallMacro ( const char * name, const void * pClass, const StructInfo * info, Context * context ) {
-        return make_smart<CallMacroAdapter>(name,(char *)pClass,info,context);
+        return new CallMacroAdapter(name,(char *)pClass,info,context);
     }
 
     CallMacro *findModuleCallMacro ( Module * module, const char *name, Context * /*context*/, LineInfoArg * at ) {
@@ -2232,11 +2230,11 @@ namespace das {
         return res;
     }
 
-    void addModuleCallMacro ( Module * module, CallMacroPtr & _newM, Context * context, LineInfoArg * at ) {
-        CallMacroPtr newM = das::move(_newM);
+    void addModuleCallMacro ( Module * module, CallMacroPtr newM, Context * context, LineInfoArg * at ) {
+        module->ownedCallMacros.push_back(unique_ptr<CallMacro>(newM));
         if ( ! module->addCallMacro(newM->name, [=](const LineInfo & at) -> ExprLooksLikeCall * {
             auto ecm = new ExprCallMacro(at, newM->name);
-            ecm->macro = newM.get();
+            ecm->macro = newM;
             newM->module = module;
             return ecm;
         }) ) {
@@ -2249,100 +2247,95 @@ namespace das {
     }
 
     TypeInfoMacroPtr makeTypeInfoMacro ( const char * name, const void * pClass, const StructInfo * info, Context * context ) {
-        return make_smart<TypeInfoMacroAdapter>(name,(char *)pClass,info,context);
+        return new TypeInfoMacroAdapter(name,(char *)pClass,info,context);
     }
 
-    void addModuleTypeInfoMacro ( Module * module, TypeInfoMacroPtr & _newM, Context * context, LineInfoArg * at ) {
-        TypeInfoMacroPtr newM = das::move(_newM);
+    void addModuleTypeInfoMacro ( Module * module, TypeInfoMacroPtr newM, Context * context, LineInfoArg * at ) {
         if ( ! module->addTypeInfoMacro(newM,true) ) {
             context->throw_error_at(at, "can't add type info macro %s to module %s", newM->name.c_str(), module->name.c_str());
         }
     }
 
-    smart_ptr<VisitorAdapter> makeVisitor ( const void * pClass, const StructInfo * info, Context * context ) {
-        return make_smart<VisitorAdapter>((char *)pClass,info,context);
+    void makeVisitor ( const void * pClass, const StructInfo * info,
+            const TBlock<void,VisitorAdapter*> & blk, Context * context, LineInfoArg * at ) {
+        auto adapter = new VisitorAdapter((char *)pClass,info,context);
+        vec4f args[1];
+        args[0] = cast<VisitorAdapter*>::from(adapter);
+        context->invoke(blk, args, nullptr, at);
+        delete adapter;
     }
 
     PassMacroPtr makePassMacro ( const char * name, const void * pClass, const StructInfo * info, Context * context ) {
-        return make_smart<PassMacroAdapter>(name,(char *)pClass,info,context);
+        return new PassMacroAdapter(name,(char *)pClass,info,context);
     }
 
     VariantMacroPtr makeVariantMacro ( const char * name, const void * pClass, const StructInfo * info, Context * context ) {
-        return make_smart<VariantMacroAdapter>(name,(char *)pClass,info,context);
+        return new VariantMacroAdapter(name,(char *)pClass,info,context);
     }
 
-    void addModuleVariantMacro ( Module * module, VariantMacroPtr & _newM, Context * ) {
-        VariantMacroPtr newM = das::move(_newM);
-        module->variantMacros.push_back(newM);
+    void addModuleVariantMacro ( Module * module, VariantMacroPtr newM, Context * ) {
+        module->variantMacros.push_back(unique_ptr<VariantMacro>(newM));
     }
 
     ForLoopMacroPtr makeForLoopMacro ( const char * name, const void * pClass, const StructInfo * info, Context * context ) {
-        return make_smart<ForLoopMacroAdapter>(name,(char *)pClass,info,context);
+        return new ForLoopMacroAdapter(name,(char *)pClass,info,context);
     }
 
-    void addModuleForLoopMacro ( Module * module, ForLoopMacroPtr & _newM, Context * ) {
-        ForLoopMacroPtr newM = das::move(_newM);
-        module->forLoopMacros.push_back(newM);
+    void addModuleForLoopMacro ( Module * module, ForLoopMacroPtr newM, Context * ) {
+        module->forLoopMacros.push_back(unique_ptr<ForLoopMacro>(newM));
     }
 
     CaptureMacroPtr makeCaptureMacro ( const char * name, const void * pClass, const StructInfo * info, Context * context ) {
-        return make_smart<CaptureMacroAdapter>(name,(char *)pClass,info,context);
+        return new CaptureMacroAdapter(name,(char *)pClass,info,context);
     }
 
-    void addModuleCaptureMacro ( Module * module, CaptureMacroPtr & _newM, Context * ) {
-        CaptureMacroPtr newM = das::move(_newM);
-        module->captureMacros.push_back(newM);
+    void addModuleCaptureMacro ( Module * module, CaptureMacroPtr newM, Context * ) {
+        module->captureMacros.push_back(unique_ptr<CaptureMacro>(newM));
     }
 
     TypeMacroPtr makeTypeMacro ( const char * name, const void * pClass, const StructInfo * info, Context * context ) {
-        return make_smart<TypeMacroAdapter>(name,(char *)pClass,info,context);
+        return new TypeMacroAdapter(name,(char *)pClass,info,context);
     }
 
-    void addModuleTypeMacro ( Module * module, TypeMacroPtr & _newM, Context * ctx, LineInfoArg * at ) {
-        auto it = module->typeMacros.find(_newM->name);
+    void addModuleTypeMacro ( Module * module, TypeMacroPtr newM, Context * ctx, LineInfoArg * at ) {
+        auto it = module->typeMacros.find(newM->name);
         if ( it != module->typeMacros.end() ) {
-            ctx->throw_error_at(at, "type macro %s already exists in module %s", _newM->name.c_str(), module->name.c_str());
+            ctx->throw_error_at(at, "type macro %s already exists in module %s", newM->name.c_str(), module->name.c_str());
         }
-        string name = _newM->name;
-        module->typeMacros[name] = das::move(_newM);
+        string name = newM->name;
+        module->typeMacros[name] = unique_ptr<TypeMacro>(newM);
     }
 
     SimulateMacroPtr makeSimulateMacro ( const char * name, const void * pClass, const StructInfo * info, Context * context ) {
-        return make_smart<SimulateMacroAdapter>(name,(char *)pClass,info,context);
+        return new SimulateMacroAdapter(name,(char *)pClass,info,context);
     }
 
-    void addModuleSimulateMacro ( Module * module, SimulateMacroPtr & _newM, Context * ) {
-        SimulateMacroPtr newM = das::move(_newM);
-        module->simulateMacros.push_back(newM);
+    void addModuleSimulateMacro ( Module * module, SimulateMacroPtr newM, Context * ) {
+        module->simulateMacros.push_back(unique_ptr<SimulateMacro>(newM));
     }
 
-    void addModuleInferMacro ( Module * module, PassMacroPtr & _newM, Context * ) {
-        PassMacroPtr newM = das::move(_newM);
-        module->macros.push_back(newM);
+    void addModuleInferMacro ( Module * module, PassMacroPtr newM, Context * ) {
+        module->macros.push_back(unique_ptr<PassMacro>(newM));
     }
 
-    void addModuleInferDirtyMacro ( Module * module, PassMacroPtr & _newM, Context * ) {
-        PassMacroPtr newM = das::move(_newM);
-        module->inferMacros.push_back(newM);
+    void addModuleInferDirtyMacro ( Module * module, PassMacroPtr newM, Context * ) {
+        module->inferMacros.push_back(unique_ptr<PassMacro>(newM));
     }
 
-    void addModuleLintMacro ( Module * module, PassMacroPtr & _newM, Context * ) {
-        PassMacroPtr newM = das::move(_newM);
-        module->lintMacros.push_back(newM);
+    void addModuleLintMacro ( Module * module, PassMacroPtr newM, Context * ) {
+        module->lintMacros.push_back(unique_ptr<PassMacro>(newM));
     }
 
-    void addModuleGlobalLintMacro ( Module * module, PassMacroPtr & _newM, Context * ) {
-        PassMacroPtr newM = das::move(_newM);
-        module->globalLintMacros.push_back(newM);
+    void addModuleGlobalLintMacro ( Module * module, PassMacroPtr newM, Context * ) {
+        module->globalLintMacros.push_back(unique_ptr<PassMacro>(newM));
     }
 
-    void addModuleOptimizationMacro ( Module * module, PassMacroPtr & _newM, Context * ) {
-        PassMacroPtr newM = das::move(_newM);
-        module->optimizationMacros.push_back(newM);
+    void addModuleOptimizationMacro ( Module * module, PassMacroPtr newM, Context * ) {
+        module->optimizationMacros.push_back(unique_ptr<PassMacro>(newM));
     }
 
     EnumerationAnnotationPtr makeEnumerationAnnotation ( const char * name, void * pClass, const StructInfo * info, Context * context ) {
-        return make_smart<EnumerationAnnotationAdapter>(name,(char *)pClass,info,context);
+        return new EnumerationAnnotationAdapter(name,(char *)pClass,info,context);
     }
 
     void addModuleEnumerationAnnotation ( Module * module, EnumerationAnnotationPtr & _ann, Context * context, LineInfoArg * at ) {
@@ -2367,7 +2360,7 @@ namespace das {
     }
 
     StructureAnnotationPtr makeStructureAnnotation ( const char * name, void * pClass, const StructInfo * info, Context * context ) {
-        return make_smart<StructureAnnotationAdapter>(name,(char *)pClass,info,context);
+        return new StructureAnnotationAdapter(name,(char *)pClass,info,context);
     }
 
     void addModuleStructureAnnotation ( Module * module, StructureAnnotationPtr & _ann, Context * context, LineInfoArg * at ) {
@@ -2386,17 +2379,17 @@ namespace das {
             context->throw_error_at(at, "annotation %s failed to apply to structure %s",
                 ann->name.c_str(), st->name.c_str());
         }
-        auto annDecl = make_smart<AnnotationDeclaration>();
+        auto annDecl = new AnnotationDeclaration();
         annDecl->annotation = ann;
         st->annotations.push_back(annDecl);
     }
 
     FunctionAnnotationPtr makeBlockAnnotation ( const char * name, void * pClass, const StructInfo * info, Context * context ) {
-        return make_smart<BlockAnnotationAdapter>(name,(char *)pClass,info,context);
+        return new BlockAnnotationAdapter(name,(char *)pClass,info,context);
     }
 
     FunctionAnnotationPtr makeFunctionAnnotation ( const char * name, void * pClass, const StructInfo * info, Context * context ) {
-        return make_smart<FunctionAnnotationAdapter>(name,(char *)pClass,info,context);
+        return new FunctionAnnotationAdapter(name,(char *)pClass,info,context);
     }
 
     void addModuleFunctionAnnotation ( Module * module, FunctionAnnotationPtr & _ann, Context * context, LineInfoArg * at ) {
@@ -2415,7 +2408,7 @@ namespace das {
             context->throw_error_at(at, "annotation %s failed to apply to function %s",
                 ann->name.c_str(), func->name.c_str());
         }
-        auto annDecl = make_smart<AnnotationDeclaration>();
+        auto annDecl = new AnnotationDeclaration();
         annDecl->annotation = ann;
         func->annotations.push_back(annDecl);
     }
@@ -2428,18 +2421,18 @@ namespace das {
             context->throw_error_at(at, "annotation %s failed to apply to block %s",
                 ann->name.c_str(), blk->at.describe().c_str());
         }
-        auto annDecl = make_smart<AnnotationDeclaration>();
+        auto annDecl = new AnnotationDeclaration();
         annDecl->annotation = ann;
         blk->annotations.push_back(annDecl);
     }
 
-    void addAndApplyFunctionAnnotation ( Function * func, smart_ptr_raw<AnnotationDeclaration> & ann, Context * context, LineInfoArg * at ) {
+    void addAndApplyFunctionAnnotation ( Function * func, AnnotationDeclarationPtr & ann, Context * context, LineInfoArg * at ) {
         string err;
         if (!ann->annotation->rtti_isFunctionAnnotation()) {
             context->throw_error_at(at, "annotation %s failed to apply to function %s, not a FunctionAnnotation",
                 ann->annotation->name.c_str(), func->name.c_str());
         }
-        auto fAnn = (FunctionAnnotation*)ann->annotation.get();
+        auto fAnn = (FunctionAnnotation*)ann->annotation;
         auto program = daScriptEnvironment::getBound()->g_Program;
         if ( !fAnn->apply(func, *program->thisModuleGroup, ann->arguments, err) ) {
             context->throw_error_at(at, "annotation %s failed to apply to function %s",
@@ -2448,13 +2441,13 @@ namespace das {
         func->annotations.push_back(ann);
     }
 
-    void addAndApplyBlockAnnotation ( ExprBlock * blk, smart_ptr_raw<AnnotationDeclaration> & ann, Context * context, LineInfoArg * at ) {
+    void addAndApplyBlockAnnotation ( ExprBlock * blk, AnnotationDeclarationPtr & ann, Context * context, LineInfoArg * at ) {
         string err;
         if (!ann->annotation->rtti_isFunctionAnnotation()) {
             context->throw_error_at(at, "annotation %s failed to apply to block %s, not a FunctionAnnotation",
                 ann->annotation->name.c_str(), blk->at.describe().c_str());
         }
-        auto fAnn = (FunctionAnnotation*)ann->annotation.get();
+        auto fAnn = (FunctionAnnotation*)ann->annotation;
         auto program = daScriptEnvironment::getBound()->g_Program;
         if ( !fAnn->apply(blk, *program->thisModuleGroup, ann->arguments, err) ) {
             context->throw_error_at(at, "annotation %s failed to apply to block %s",
@@ -2463,13 +2456,13 @@ namespace das {
         blk->annotations.push_back(ann);
     }
 
-    void addAndApplyStructAnnotation ( Structure * st, smart_ptr_raw<AnnotationDeclaration> & ann, Context * context, LineInfoArg * at ) {
+    void addAndApplyStructAnnotation ( Structure * st, AnnotationDeclarationPtr & ann, Context * context, LineInfoArg * at ) {
         string err;
         if (!ann->annotation->rtti_isStructureAnnotation()) {
             context->throw_error_at(at, "annotation %s failed to apply to struct %s, not a StructureAnnotation",
                 ann->annotation->name.c_str(), st->name.c_str());
         }
-        auto stAnn = (StructureAnnotation*)ann->annotation.get();
+        auto stAnn = (StructureAnnotation*)ann->annotation;
         auto program = daScriptEnvironment::getBound()->g_Program;
         if ( !stAnn->touch(st, *program->thisModuleGroup, ann->arguments, err) ) {
             context->throw_error_at(at, "annotation %s failed to apply to struct %s",
@@ -2478,7 +2471,7 @@ namespace das {
         st->annotations.push_back(ann);
     }
 
-    void astVisit ( smart_ptr_raw<Program> program, smart_ptr_raw<VisitorAdapter> adapter, Context * context, LineInfoArg * line_info ) {
+    void astVisit ( smart_ptr_raw<Program> program, VisitorAdapter * adapter, Context * context, LineInfoArg * line_info ) {
         if (!adapter)
             context->throw_error_at(line_info, "adapter is required");
         if (!program)
@@ -2486,7 +2479,7 @@ namespace das {
         program->visit(*adapter);
     }
 
-    void astVisitGenerics ( smart_ptr_raw<Program> program, smart_ptr_raw<VisitorAdapter> adapter, Context * context, LineInfoArg * line_info ) {
+    void astVisitGenerics ( smart_ptr_raw<Program> program, VisitorAdapter * adapter, Context * context, LineInfoArg * line_info ) {
         if (!adapter)
             context->throw_error_at(line_info, "adapter is required");
         if (!program)
@@ -2494,7 +2487,7 @@ namespace das {
         program->visit(*adapter, true);
     }
 
-    void astVisitWithSort ( smart_ptr_raw<Program> program, smart_ptr_raw<VisitorAdapter> adapter, bool sortStructures, Context * context, LineInfoArg * line_info ) {
+    void astVisitWithSort ( smart_ptr_raw<Program> program, VisitorAdapter * adapter, bool sortStructures, Context * context, LineInfoArg * line_info ) {
         if (!adapter)
             context->throw_error_at(line_info, "adapter is required");
         if (!program)
@@ -2502,7 +2495,7 @@ namespace das {
         program->visit(*adapter, false, sortStructures);
     }
 
-    void astVisitModule ( smart_ptr_raw<Program> program, smart_ptr_raw<VisitorAdapter> adapter,
+    void astVisitModule ( smart_ptr_raw<Program> program, VisitorAdapter * adapter,
                           Module* module, Context * context, LineInfoArg * line_info ) {
         if (!adapter)
             context->throw_error_at(line_info, "adapter is required");
@@ -2511,7 +2504,7 @@ namespace das {
         program->visitModule(*adapter, module);
     }
 
-    void astVisitModulesInOrder ( smart_ptr_raw<Program> program, smart_ptr_raw<VisitorAdapter> adapter, Context * context, LineInfoArg * line_info ) {
+    void astVisitModulesInOrder ( smart_ptr_raw<Program> program, VisitorAdapter * adapter, Context * context, LineInfoArg * line_info ) {
         if (!adapter)
             context->throw_error_at(line_info, "adapter is required");
         if (!program)
@@ -2519,7 +2512,7 @@ namespace das {
         program->visitModulesInOrder(*adapter);
     }
 
-    void astVisitFunction ( Function * func, smart_ptr_raw<VisitorAdapter> adapter, Context * context, LineInfoArg * line_info ) {
+    void astVisitFunction ( Function * func, VisitorAdapter * adapter, Context * context, LineInfoArg * line_info ) {
         if (!adapter)
             context->throw_error_at(line_info, "adapter is required");
         if (!func)
@@ -2527,7 +2520,7 @@ namespace das {
         func->visit(*adapter);
     }
 
-    TypeDecl * astVisitTypeDecl ( TypeDecl * expr, smart_ptr_raw<VisitorAdapter> adapter, Context * context, LineInfoArg * line_info ) {
+    TypeDecl * astVisitTypeDecl ( TypeDecl * expr, VisitorAdapter * adapter, Context * context, LineInfoArg * line_info ) {
         if (!adapter)
             context->throw_error_at(line_info, "adapter is required");
         if (!expr)
@@ -2538,15 +2531,15 @@ namespace das {
         return res;
     }
 
-    void visitEnumeration ( ProgramPtr program, Enumeration * enumeration, smart_ptr_raw<VisitorAdapter> adapter, Context * , LineInfoArg * ) {
+    void visitEnumeration ( ProgramPtr program, Enumeration * enumeration, VisitorAdapter * adapter, Context * , LineInfoArg * ) {
         program->visitEnumeration(*adapter, enumeration);
     }
 
-    void visitStructure ( ProgramPtr program, Structure * structure, smart_ptr_raw<VisitorAdapter> adapter, Context * , LineInfoArg *  ) {
+    void visitStructure ( ProgramPtr program, Structure * structure, VisitorAdapter * adapter, Context * , LineInfoArg *  ) {
         program->visitStructure(*adapter, structure);
     }
 
-    Expression * astVisitExpression ( Expression * expr, smart_ptr_raw<VisitorAdapter> adapter, Context * context, LineInfoArg * line_info ) {
+    Expression * astVisitExpression ( Expression * expr, VisitorAdapter * adapter, Context * context, LineInfoArg * line_info ) {
         if (!adapter)
             context->throw_error_at(line_info, "adapter is required");
         if (!expr)
@@ -2555,7 +2548,7 @@ namespace das {
         return res;
     }
 
-    void astVisitBlockFinally ( ExprBlock * expr, smart_ptr_raw<VisitorAdapter> adapter, Context * context, LineInfoArg * line_info ) {
+    void astVisitBlockFinally ( ExprBlock * expr, VisitorAdapter * adapter, Context * context, LineInfoArg * line_info ) {
         if (!adapter)
             context->throw_error_at(line_info, "adapter is required");
         if (!expr)
@@ -2565,10 +2558,10 @@ namespace das {
 
     void Module_Ast::registerAdapterAnnotations(ModuleLibrary & lib) {
         // visitor
-        addAnnotation(make_smart<AstVisitorAdapterAnnotation>(lib));
+        addAnnotation(new AstVisitorAdapterAnnotation(lib));
         addExtern<DAS_BIND_FUN(makeVisitor)>(*this, lib,  "make_visitor",
             SideEffects::modifyExternal, "makeVisitor")
-                ->args({"class","info","context"});
+                ->args({"class","info","blk","context","at"})->unsafeOperation = true;
         addExtern<DAS_BIND_FUN(astVisit)>(*this, lib,  "visit",
             SideEffects::accessExternal, "astVisit")
                 ->args({"program","adapter","context","line"});
@@ -2603,7 +2596,7 @@ namespace das {
             SideEffects::accessExternal, "astVisitBlockFinally")
                 ->args({"expression","adapter","context","line"});
         // function annotation
-        addAnnotation(make_smart<AstFunctionAnnotationAnnotation>(lib));
+        addAnnotation(new AstFunctionAnnotationAnnotation(lib));
         addExtern<DAS_BIND_FUN(makeFunctionAnnotation)>(*this, lib,  "make_function_annotation",
             SideEffects::modifyExternal, "makeFunctionAnnotation")
                 ->args({"name","class","info","context"});
@@ -2627,7 +2620,7 @@ namespace das {
             SideEffects::modifyExternal, "addAndApplyBlockAnnotation")
                 ->args({"block","annotation","context","at"});
         // structure annotation
-        addAnnotation(make_smart<AstStructureAnnotationAnnotation>(lib));
+        addAnnotation(new AstStructureAnnotationAnnotation(lib));
         addExtern<DAS_BIND_FUN(makeStructureAnnotation)>(*this, lib,  "make_structure_annotation",
             SideEffects::modifyExternal, "makeStructureAnnotation")
                 ->args({"name","class","info","context"});
@@ -2641,7 +2634,7 @@ namespace das {
             SideEffects::modifyExternal, "addAndApplyStructAnnotation")
                 ->args({"structure","annotation","context","at"});
         // enumeration annotation
-        addAnnotation(make_smart<AstEnumerationAnnotationAnnotation>(lib));
+        addAnnotation(new AstEnumerationAnnotationAnnotation(lib));
         addExtern<DAS_BIND_FUN(makeEnumerationAnnotation)>(*this, lib,  "make_enumeration_annotation",
             SideEffects::modifyExternal, "makeEnumerationAnnotation")
                 ->args({"name","class","info","context"});
@@ -2652,7 +2645,7 @@ namespace das {
             SideEffects::modifyExternal, "addEnumerationEntry")
                 ->args({"enum","name"});
         // pass macro
-        addAnnotation(make_smart<AstPassMacroAnnotation>(lib));
+        addAnnotation(new AstPassMacroAnnotation(lib));
         addExtern<DAS_BIND_FUN(makePassMacro)>(*this, lib,  "make_pass_macro",
             SideEffects::modifyExternal, "makePassMacro")
                 ->args({"name","class","info","context"});
@@ -2674,7 +2667,7 @@ namespace das {
             SideEffects::modifyExternal, "addModuleOptimizationMacro")
                 ->args({"module","annotation","context"});
         // reader macro
-        addAnnotation(make_smart<AstReaderMacroAnnotation>(lib));
+        addAnnotation(new AstReaderMacroAnnotation(lib));
         addExtern<DAS_BIND_FUN(makeReaderMacro)>(*this, lib,  "make_reader_macro",
             SideEffects::modifyExternal, "makeReaderMacro")
                 ->args({"name","class","info","context"});
@@ -2682,7 +2675,7 @@ namespace das {
             SideEffects::modifyExternal, "addModuleReaderMacro")
                 ->args({"module","annotation","context","at"});
         // comment reader
-        addAnnotation(make_smart<AstCommentReaderAnnotation>(lib));
+        addAnnotation(new AstCommentReaderAnnotation(lib));
         addExtern<DAS_BIND_FUN(makeCommentReader)>(*this, lib,  "make_comment_reader",
             SideEffects::modifyExternal, "makeCommentReader")
                 ->args({"class","info","context"});
@@ -2690,7 +2683,7 @@ namespace das {
             SideEffects::modifyExternal, "addModuleCommentReader")
                 ->args({"module","reader","context","at"});
         // call macro
-        addAnnotation(make_smart<AstCallMacroAnnotation>(lib));
+        addAnnotation(new AstCallMacroAnnotation(lib));
         addExtern<DAS_BIND_FUN(makeCallMacro)>(*this, lib,  "make_call_macro",
             SideEffects::modifyExternal, "makeCallMacro")
                 ->args({"name","class","info","context"});
@@ -2708,7 +2701,7 @@ namespace das {
             SideEffects::modifyExternal, "addModuleTypeInfoMacro")
                 ->args({"module","annotation","context","at"});
         // variant macro
-        addAnnotation(make_smart<AstVariantMacroAnnotation>(lib));
+        addAnnotation(new AstVariantMacroAnnotation(lib));
         addExtern<DAS_BIND_FUN(makeVariantMacro)>(*this, lib,  "make_variant_macro",
             SideEffects::modifyExternal, "makeVariantMacro")
                 ->args({"name","class","info","context"});
@@ -2716,7 +2709,7 @@ namespace das {
             SideEffects::modifyExternal, "addModuleVariantMacro")
                 ->args({"module","annotation","context"});
         // for loop macro
-        addAnnotation(make_smart<AstForLoopMacroAnnotation>(lib));
+        addAnnotation(new AstForLoopMacroAnnotation(lib));
         addExtern<DAS_BIND_FUN(makeForLoopMacro)>(*this, lib,  "make_for_loop_macro",
             SideEffects::modifyExternal, "makeForLoopMacro")
                 ->args({"name","class","info","context"});
@@ -2724,7 +2717,7 @@ namespace das {
             SideEffects::modifyExternal, "addModuleForLoopMacro")
                 ->args({"module","annotation","context"});
         // capture macro
-        addAnnotation(make_smart<AstCaptureMacroAnnotation>(lib));
+        addAnnotation(new AstCaptureMacroAnnotation(lib));
         addExtern<DAS_BIND_FUN(makeCaptureMacro)>(*this, lib,  "make_capture_macro",
             SideEffects::modifyExternal, "makeCaptureMacro")
                 ->args({"name","class","info","context"});
@@ -2732,7 +2725,7 @@ namespace das {
             SideEffects::modifyExternal, "addModuleCaptureMacro")
                 ->args({"module","annotation","context"});
         // type macro
-        addAnnotation(make_smart<AstTypeMacroAnnotation>(lib));
+        addAnnotation(new AstTypeMacroAnnotation(lib));
         addExtern<DAS_BIND_FUN(makeTypeMacro)>(*this, lib,  "make_type_macro",
             SideEffects::modifyExternal, "makeTypeMacro")
                 ->args({"name","class","info","context"});
@@ -2740,7 +2733,7 @@ namespace das {
             SideEffects::modifyExternal, "addModuleTypeMacro")
                 ->args({"module","annotation","context","at"});
         // simulate macro macro
-        addAnnotation(make_smart<AstSimulateMacroAnnotation>(lib));
+        addAnnotation(new AstSimulateMacroAnnotation(lib));
         addExtern<DAS_BIND_FUN(makeSimulateMacro)>(*this, lib,  "make_simulate_macro",
             SideEffects::modifyExternal, "makeSimulateMacro")
                 ->args({"name","class","info","context"});

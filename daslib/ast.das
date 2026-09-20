@@ -21,19 +21,19 @@ typedef FunctionPtr = Function?
 typedef VariablePtr = Variable?
 typedef MakeFieldDeclPtr = MakeFieldDecl?
 typedef ExprMakeBlockPtr = ExprMakeBlock?
-typedef FunctionAnnotationPtr = smart_ptr<FunctionAnnotation>
-typedef StructureAnnotationPtr = smart_ptr<StructureAnnotation>
-typedef EnumerationAnnotationPtr = smart_ptr<EnumerationAnnotation>
-typedef PassMacroPtr = smart_ptr<PassMacro>
-typedef VariantMacroPtr = smart_ptr<VariantMacro>
-typedef ReaderMacroPtr = smart_ptr<ReaderMacro>
-typedef CommentReaderPtr = smart_ptr<CommentReader>
-typedef CallMacroPtr = smart_ptr<CallMacro>
-typedef TypeInfoMacroPtr = smart_ptr<TypeInfoMacro>
-typedef ForLoopMacroPtr = smart_ptr<ForLoopMacro>
-typedef CaptureMacroPtr = smart_ptr<CaptureMacro>
-typedef TypeMacroPtr = smart_ptr<TypeMacro>
-typedef SimulateMacroPtr = smart_ptr<SimulateMacro>
+typedef FunctionAnnotationPtr = FunctionAnnotation?
+typedef StructureAnnotationPtr = StructureAnnotation?
+typedef EnumerationAnnotationPtr = EnumerationAnnotation?
+typedef PassMacroPtr = PassMacro?
+typedef VariantMacroPtr = VariantMacro?
+typedef ReaderMacroPtr = ReaderMacro?
+typedef CommentReaderPtr = CommentReader?
+typedef CallMacroPtr = CallMacro?
+typedef TypeInfoMacroPtr = TypeInfoMacro?
+typedef ForLoopMacroPtr = ForLoopMacro?
+typedef CaptureMacroPtr = CaptureMacro?
+typedef TypeMacroPtr = TypeMacro?
+typedef SimulateMacroPtr = SimulateMacro?
 
 // proxy wrappers for ast_core functions
 [generic]
@@ -653,10 +653,10 @@ def make_function_annotation(name : string; var someClassPtr) : FunctionAnnotati
     static_if (typeinfo is_pointer(someClassPtr) && typeinfo is_class(*someClassPtr)) {
         gc_root_AstFunctionAnnotation |> push(someClassPtr)
         let classInfo = class_info(*someClassPtr)
-        return <- make_function_annotation(name, someClassPtr, classInfo)
+        return make_function_annotation(name, someClassPtr, classInfo)
     } else {
         concept_assert(false, "expecting pointer to class")
-        return <- FunctionAnnotationPtr()
+        return null
     }
 }
 
@@ -667,10 +667,10 @@ def make_block_annotation(name : string; var someClassPtr) : FunctionAnnotationP
     static_if (typeinfo is_pointer(someClassPtr) && typeinfo is_class(*someClassPtr)) {
         gc_root_AstBlockAnnotation |> push(someClassPtr)
         let classInfo = class_info(*someClassPtr)
-        return <- make_block_annotation(name, someClassPtr, classInfo)
+        return make_block_annotation(name, someClassPtr, classInfo)
     } else {
         concept_assert(false, "expecting pointer to class")
-        return <- FunctionAnnotationPtr()
+        return null
     }
 }
 
@@ -681,10 +681,10 @@ def make_structure_annotation(name : string; var someClassPtr) : StructureAnnota
     static_if (typeinfo is_pointer(someClassPtr) && typeinfo is_class(*someClassPtr)) {
         gc_root_AstStructureAnnotation |> push(someClassPtr)
         let classInfo = class_info(*someClassPtr)
-        return <- make_structure_annotation(name, someClassPtr, classInfo)
+        return make_structure_annotation(name, someClassPtr, classInfo)
     } else {
         concept_assert(false, "expecting pointer to class")
-        return <- StructureAnnotationPtr()
+        return null
     }
 }
 
@@ -695,23 +695,22 @@ def make_enumeration_annotation(name : string; var someClassPtr) : EnumerationAn
     static_if (typeinfo is_pointer(someClassPtr) && typeinfo is_class(*someClassPtr)) {
         gc_root_AstEnumerationAnnotation |> push(someClassPtr)
         let classInfo = class_info(*someClassPtr)
-        return <- make_enumeration_annotation(name, someClassPtr, classInfo)
+        return make_enumeration_annotation(name, someClassPtr, classInfo)
     } else {
         concept_assert(false, "expecting pointer to class")
-        return <- EnumerationAnnotationPtr()
+        return null
     }
 }
 
-def make_visitor(someClass) : smart_ptr<VisitorAdapter> {
+def make_visitor(someClass; blk : block<(var adapter : VisitorAdapter?) : void>) {
     static_if (typeinfo is_class(someClass)) {
         unsafe {
             let classPtr = addr(someClass)
             let classInfo = class_info(someClass)
-            return <- make_visitor(classPtr, classInfo)
+            make_visitor(classPtr, classInfo, blk)
         }
     } else {
         concept_assert(false, "can't make visitor of non-class")
-        return <- default<smart_ptr<VisitorAdpater>>
     }
 }
 
@@ -722,10 +721,10 @@ def make_reader_macro(name : string; var someClassPtr) : ReaderMacroPtr {
     static_if (typeinfo is_pointer(someClassPtr) && typeinfo is_class(*someClassPtr)) {
         gc_root_AstReaderMacro |> push(someClassPtr)
         let classInfo = class_info(*someClassPtr)
-        return <- make_reader_macro(name, someClassPtr, classInfo)
+        return make_reader_macro(name, someClassPtr, classInfo)
     } else {
         concept_assert(false, "expecting pointer to class")
-        return <- ReaderMacroPtr()
+        return null
     }
 }
 
@@ -736,10 +735,10 @@ def make_comment_reader(name : string; var someClassPtr) : CommentReaderPtr {
     static_if (typeinfo is_pointer(someClassPtr) && typeinfo is_class(*someClassPtr)) {
         gc_root_AstCommentReader |> push(someClassPtr)
         let classInfo = class_info(*someClassPtr)
-        return <- make_comment_reader(someClassPtr, classInfo)
+        return make_comment_reader(someClassPtr, classInfo)
     } else {
         concept_assert(false, "expecting pointer to class")
-        return <- ReaderMacroPtr()
+        return null
     }
 }
 
@@ -750,10 +749,10 @@ def make_call_macro(name : string; var someClassPtr) : CallMacroPtr {
     static_if (typeinfo is_pointer(someClassPtr) && typeinfo is_class(*someClassPtr)) {
         gc_root_AstCallMacro |> push(someClassPtr)
         let classInfo = class_info(*someClassPtr)
-        return <- make_call_macro(name, someClassPtr, classInfo)
+        return make_call_macro(name, someClassPtr, classInfo)
     } else {
         concept_assert(false, "expecting pointer to class")
-        return <- CallMacroPtr()
+        return null
     }
 }
 
@@ -764,10 +763,10 @@ def make_typeinfo_macro(name : string; var someClassPtr) : TypeInfoMacroPtr {
     static_if (typeinfo is_pointer(someClassPtr) && typeinfo is_class(*someClassPtr)) {
         gc_root_AstTypeInfoMacro |> push(someClassPtr)
         let classInfo = class_info(*someClassPtr)
-        return <- make_typeinfo_macro(name, someClassPtr, classInfo)
+        return make_typeinfo_macro(name, someClassPtr, classInfo)
     } else {
         concept_assert(false, "expecting pointer to class")
-        return <- TypeInfoMacroPtr()
+        return null
     }
 }
 
@@ -778,10 +777,10 @@ def make_pass_macro(name : string; var someClassPtr) : PassMacroPtr {
     static_if (typeinfo is_pointer(someClassPtr) && typeinfo is_class(*someClassPtr)) {
         gc_root_AstPassMacro |> push(someClassPtr)
         let classInfo = class_info(*someClassPtr)
-        return <- make_pass_macro(name, someClassPtr, classInfo)
+        return make_pass_macro(name, someClassPtr, classInfo)
     } else {
         concept_assert(false, "expecting pointer to class")
-        return <- PassMacroPtr()
+        return null
     }
 }
 
@@ -792,10 +791,10 @@ def make_variant_macro(name : string; var someClassPtr) : VariantMacroPtr {
     static_if (typeinfo is_pointer(someClassPtr) && typeinfo is_class(*someClassPtr)) {
         gc_root_AstVariantMacro |> push(someClassPtr)
         let classInfo = class_info(*someClassPtr)
-        return <- make_variant_macro(name, someClassPtr, classInfo)
+        return make_variant_macro(name, someClassPtr, classInfo)
     } else {
         concept_assert(false, "expecting pointer to class")
-        return <- VariantMacroPtr()
+        return null
     }
 }
 
@@ -806,10 +805,10 @@ def make_for_loop_macro(name : string; var someClassPtr) : ForLoopMacroPtr {
     static_if (typeinfo is_pointer(someClassPtr) && typeinfo is_class(*someClassPtr)) {
         gc_root_AstForLoopMacro |> push(someClassPtr)
         let classInfo = class_info(*someClassPtr)
-        return <- make_for_loop_macro(name, someClassPtr, classInfo)
+        return make_for_loop_macro(name, someClassPtr, classInfo)
     } else {
         concept_assert(false, "expecting pointer to class")
-        return <- ForLoopMacroPtr()
+        return null
     }
 }
 
@@ -820,10 +819,10 @@ def make_capture_macro(name : string; var someClassPtr) : CaptureMacroPtr {
     static_if (typeinfo is_pointer(someClassPtr) && typeinfo is_class(*someClassPtr)) {
         gc_root_AstCaptureMacro |> push(someClassPtr)
         let classInfo = class_info(*someClassPtr)
-        return <- make_capture_macro(name, someClassPtr, classInfo)
+        return make_capture_macro(name, someClassPtr, classInfo)
     } else {
         concept_assert(false, "expecting pointer to class")
-        return <- CaptureMacroPtr()
+        return null
     }
 }
 
@@ -831,10 +830,10 @@ def make_capture_macro(name : string; var someClassPtr) : CaptureMacroPtr {
 def make_type_macro(name : string; var someClassPtr) : TypeMacroPtr {
     static_if (typeinfo is_pointer(someClassPtr) && typeinfo is_class(*someClassPtr)) {
         let classInfo = class_info(*someClassPtr)
-        return <- make_type_macro(name, someClassPtr, classInfo)
+        return make_type_macro(name, someClassPtr, classInfo)
     } else {
         concept_assert(false, "expecting pointer to class")
-        return <- TypeMacroPtr()
+        return null
     }
 }
 
@@ -845,123 +844,123 @@ def make_simulate_macro(name : string; var someClassPtr) : SimulateMacroPtr {
     static_if (typeinfo is_pointer(someClassPtr) && typeinfo is_class(*someClassPtr)) {
         gc_root_AstSimulateMacro |> push(someClassPtr)
         let classInfo = class_info(*someClassPtr)
-        return <- make_simulate_macro(name, someClassPtr, classInfo)
+        return make_simulate_macro(name, someClassPtr, classInfo)
     } else {
         concept_assert(false, "expecting pointer to class")
-        return <- SimulateMacroPtr()
+        return null
     }
 }
 
 [macro_function]
 def add_new_block_annotation(name : string; var someClassPtr) {
-    var inscope ann <- make_block_annotation(name, someClassPtr)
+    var ann = make_block_annotation(name, someClassPtr)
     this_module() |> add_function_annotation(ann)
 }
 
 [macro_function]
 def add_new_function_annotation(name : string; var someClassPtr) {
-    var inscope ann <- make_function_annotation(name, someClassPtr)
+    var ann = make_function_annotation(name, someClassPtr)
     this_module() |> add_function_annotation(ann)
 }
 
 [macro_function]
 def add_new_contract_annotation(name : string; var someClassPtr) {
-    var inscope ann <- make_function_annotation(name, someClassPtr)
+    var ann = make_function_annotation(name, someClassPtr)
     this_module() |> add_function_annotation(ann)
 }
 
 [macro_function]
 def add_new_structure_annotation(name : string; var someClassPtr) {
-    var inscope ann <- make_structure_annotation(name, someClassPtr)
+    var ann = make_structure_annotation(name, someClassPtr)
     this_module() |> add_structure_annotation(ann)
 }
 
 [macro_function]
 def add_new_enumeration_annotation(name : string; var someClassPtr) {
-    var inscope ann <- make_enumeration_annotation(name, someClassPtr)
+    var ann = make_enumeration_annotation(name, someClassPtr)
     this_module() |> add_enumeration_annotation(ann)
 }
 
 [macro_function]
 def add_new_variant_macro(name : string; var someClassPtr) {
-    var inscope ann <- make_variant_macro(name, someClassPtr)
+    var ann = make_variant_macro(name, someClassPtr)
     this_module() |> add_variant_macro(ann)
 }
 
 [macro_function]
 def add_new_for_loop_macro(name : string; var someClassPtr) {
-    var inscope ann <- make_for_loop_macro(name, someClassPtr)
+    var ann = make_for_loop_macro(name, someClassPtr)
     this_module() |> add_for_loop_macro(ann)
 }
 
 [macro_function]
 def add_new_capture_macro(name : string; var someClassPtr) {
-    var inscope ann <- make_capture_macro(name, someClassPtr)
+    var ann = make_capture_macro(name, someClassPtr)
     this_module() |> add_capture_macro(ann)
 }
 
 [macro_function]
 def add_new_type_macro(name : string; var someClassPtr) {
-    var inscope ann <- make_type_macro(name, someClassPtr)
+    var ann = make_type_macro(name, someClassPtr)
     this_module() |> add_type_macro(ann)
 }
 
 [macro_function]
 def add_new_simulate_macro(name : string; var someClassPtr) {
-    var inscope ann <- make_simulate_macro(name, someClassPtr)
+    var ann = make_simulate_macro(name, someClassPtr)
     this_module() |> add_simulate_macro(ann)
 }
 
 [macro_function]
 def add_new_reader_macro(name : string; var someClassPtr) {
-    var inscope ann <- make_reader_macro(name, someClassPtr)
+    var ann = make_reader_macro(name, someClassPtr)
     this_module() |> add_reader_macro(ann)
 }
 
 def add_new_comment_reader(name : string; var someClassPtr) {
-    var inscope ann <- make_comment_reader(name, someClassPtr)
+    var ann = make_comment_reader(name, someClassPtr)
     this_module() |> add_comment_reader(ann)
 }
 
 [macro_function]
 def add_new_call_macro(name : string; var someClassPtr) {
-    var inscope ann <- make_call_macro(name, someClassPtr)
+    var ann = make_call_macro(name, someClassPtr)
     this_module() |> add_call_macro(ann)
 }
 
 [macro_function]
 def add_new_typeinfo_macro(name : string; var someClassPtr) {
-    var inscope ann <- make_typeinfo_macro(name, someClassPtr)
+    var ann = make_typeinfo_macro(name, someClassPtr)
     this_module() |> add_typeinfo_macro(ann)
 }
 
 [macro_function]
 def add_new_infer_macro(name : string; var someClassPtr) {
-    var inscope ann <- make_pass_macro(name, someClassPtr)
+    var ann = make_pass_macro(name, someClassPtr)
     this_module() |> add_infer_macro(ann)
 }
 
 [macro_function]
 def add_new_dirty_infer_macro(name : string; var someClassPtr) {
-    var inscope ann <- make_pass_macro(name, someClassPtr)
+    var ann = make_pass_macro(name, someClassPtr)
     this_module() |> add_dirty_infer_macro(ann)
 }
 
 [macro_function]
 def add_new_lint_macro(name : string; var someClassPtr) {
-    var inscope ann <- make_pass_macro(name, someClassPtr)
+    var ann = make_pass_macro(name, someClassPtr)
     this_module() |> add_lint_macro(ann)
 }
 
 [macro_function]
 def add_new_global_lint_macro(name : string; var someClassPtr) {
-    var inscope ann <- make_pass_macro(name, someClassPtr)
+    var ann = make_pass_macro(name, someClassPtr)
     this_module() |> add_global_lint_macro(ann)
 }
 
 [macro_function]
 def add_new_optimization_macro(name : string; var someClassPtr) {
-    var inscope ann <- make_pass_macro(name, someClassPtr)
+    var ann = make_pass_macro(name, someClassPtr)
     this_module() |> add_optimization_macro(ann)
 }
 

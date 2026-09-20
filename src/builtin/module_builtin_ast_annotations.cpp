@@ -223,7 +223,7 @@ namespace das {
         }
         __forceinline char * compute(Context &) {
             DAS_PROFILE_NODE
-            return (char *) typeExpr;
+            return (char *) new TypeDecl(*typeExpr);
         }
         TypeDecl *  typeExpr;   // requires RTTI
         char *      descr;
@@ -313,12 +313,12 @@ namespace das {
         addEnumeration(new EnumerationSideEffects());
         addEnumeration(new EnumerationCaptureMode());
         // THE MAGNIFICENT TWO
-        addTypeInfoMacro(make_smart<AstTypeDeclMacro>());
-        addTypeInfoMacro(make_smart<AstFunctionMacro>());
+        addTypeInfoMacro(new AstTypeDeclMacro());
+        addTypeInfoMacro(new AstFunctionMacro());
     }
 
     void Module_Ast::registerMacroExpressions(ModuleLibrary & lib){
-        addExpressionAnnotation(make_smart<AstExprReaderAnnotation>(lib))->from("Expression");
-        addExpressionAnnotation(make_smart<AstExprCallMacroAnnotation>(lib))->from("ExprLooksLikeCall");
+        addExpressionAnnotation(new AstExprReaderAnnotation(lib))->from("Expression");
+        addExpressionAnnotation(new AstExprCallMacroAnnotation(lib))->from("ExprLooksLikeCall");
     }
 }

@@ -20,10 +20,6 @@ namespace das
 
     #define DAS_CALL_METHOD(mname)              DAS_BIND_FUN(mname::invoke)
 
-    #ifndef DAS_ENABLE_SMART_PTR_TRACKING
-    #define DAS_ENABLE_SMART_PTR_TRACKING   0
-    #endif
-
     #ifndef DAS_ENABLE_STACK_WALK
     #define DAS_ENABLE_STACK_WALK   1
     #endif
@@ -295,11 +291,10 @@ namespace das
         virtual bool onAfterCall ( Prologue * ) { return true; }
         virtual void onCorruptStack ( Prologue * ) { }
     };
-    typedef smart_ptr<StackWalker> StackWalkerPtr;
+    typedef StackWalker * StackWalkerPtr;
 
     void dapiStackWalk ( StackWalkerPtr walker, Context & context, const LineInfo & at );
     int32_t dapiStackDepth ( Context & context );
-    void dumpTrackingLeaks();
     void dapiReportContextState ( Context & ctx, const char * category, const char * name, const TypeInfo * info, void * data );
     void dapiSimulateContext ( Context & ctx );
     void dapiUserCommand ( const char * command );
@@ -361,7 +356,7 @@ namespace das
 
         __forceinline char * allocateIterator ( uint32_t size, const char * iterName, const LineInfo * at ) {
             auto aptr = heap->impl_allocateIterator(size, iterName);
-            if ( !aptr ) throw_out_of_memory(true, size + 16, at);
+            if ( !aptr ) throw_out_of_memory(false, size + 16, at);
             if ( instrumentAllocations ) onAllocate(aptr - 16, size + 16, at ? *at : LineInfo());
             return aptr;
         }
@@ -373,14 +368,14 @@ namespace das
 
         __forceinline char * allocate ( uint32_t size, const LineInfo * at = nullptr ) {
             auto aptr = heap->impl_allocate(size);
-            if ( !aptr && size ) throw_out_of_memory(true, size, at);
+            if ( !aptr && size ) throw_out_of_memory(false, size, at);
             if ( instrumentAllocations ) onAllocate(aptr, size, at ? *at : LineInfo());
             return aptr;
         }
 
         __forceinline char * reallocate ( char * ptr, uint32_t oldSize, uint32_t size, const LineInfo * at ) {
             auto aptr = heap->impl_reallocate(ptr, oldSize, size);
-            if ( !aptr && size ) throw_out_of_memory(true, size, at);
+            if ( !aptr && size ) throw_out_of_memory(false, size, at);
             if ( instrumentAllocations ) onReallocate(ptr, oldSize, aptr, size, at ? *at : LineInfo());
             return aptr;
         }
@@ -804,8 +799,8 @@ namespace das
             }
         }
     public:
-        smart_ptr<StringHeapAllocator>  stringHeap;
-        smart_ptr<AnyHeapAllocator>     heap;
+        unique_ptr<StringHeapAllocator>  stringHeap;
+        unique_ptr<AnyHeapAllocator>     heap;
         shared_ptr<ConstStringAllocator> constStringHeap;
         shared_ptr<NodeAllocator>       code;
         shared_ptr<DebugInfoAllocator>  debugInfo;
@@ -883,9 +878,6 @@ namespace das
     public:
         int32_t         fnDepth = 0;
     public:
-#if DAS_ENABLE_SMART_PTR_TRACKING
-        static vector<smart_ptr<ptr_ref_count>> sptrAllocations;
-#endif
         // It's better to use shared memory + finalize for things like this.
         struct JitContext {
             void *shared_lib;

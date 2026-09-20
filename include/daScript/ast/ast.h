@@ -1,6 +1,5 @@
 #pragma once
 
-#include "daScript/simulate/simulate.h"
 #include "daScript/misc/string_writer.h"
 #include "daScript/misc/safebox.h"
 #include "daScript/misc/vectypes.h"
@@ -37,41 +36,41 @@ namespace das
     typedef smart_ptr<Program> ProgramPtr;
 
     struct FunctionAnnotation;
-    typedef smart_ptr<FunctionAnnotation> FunctionAnnotationPtr;
+    typedef FunctionAnnotation * FunctionAnnotationPtr;
 
     struct Expression;
     typedef Expression * ExpressionPtr;
 
     struct PassMacro;
-    typedef smart_ptr<PassMacro> PassMacroPtr;
+    typedef PassMacro * PassMacroPtr;
 
     struct VariantMacro;
-    typedef smart_ptr<VariantMacro> VariantMacroPtr;
+    typedef VariantMacro * VariantMacroPtr;
 
     struct ReaderMacro;
-    typedef smart_ptr<ReaderMacro> ReaderMacroPtr;
+    typedef ReaderMacro * ReaderMacroPtr;
 
     struct CommentReader;
-    typedef smart_ptr<CommentReader> CommentReaderPtr;
+    typedef CommentReader * CommentReaderPtr;
 
     struct CallMacro;
-    typedef smart_ptr<CallMacro> CallMacroPtr;
+    typedef CallMacro * CallMacroPtr;
 
     struct ForLoopMacro;
-    typedef smart_ptr<ForLoopMacro> ForLoopMacroPtr;
+    typedef ForLoopMacro * ForLoopMacroPtr;
 
     struct CaptureMacro;
-    typedef smart_ptr<CaptureMacro> CaptureMacroPtr;
+    typedef CaptureMacro * CaptureMacroPtr;
 
     struct SimulateMacro;
-    typedef smart_ptr<SimulateMacro> SimulateMacroPtr;
+    typedef SimulateMacro * SimulateMacroPtr;
 
     struct TypeMacro;
-    typedef smart_ptr<TypeMacro> TypeMacroPtr;
+    typedef TypeMacro * TypeMacroPtr;
 
     struct AnnotationArgumentList;
     struct AnnotationDeclaration;
-    typedef smart_ptr<AnnotationDeclaration> AnnotationDeclarationPtr;
+    typedef AnnotationDeclaration * AnnotationDeclarationPtr;
 
     enum class LogicAnnotationOp { And, Or, Xor, Not };
     AnnotationPtr newLogicAnnotation ( LogicAnnotationOp op );
@@ -137,12 +136,13 @@ namespace das
         string getMangledName() const;
         virtual void log ( TextWriter & ss, const AnnotationDeclaration & decl ) const;
         virtual void serialize( AstSerializer & ) { }
-        virtual void gc_collect ( gc_root * /*target*/, gc_root * /*from*/ ) { }
+        virtual void gc_collect ( gc_root * target, gc_root * from );
+        virtual void visitTypeDecls ( const function<void(TypeDecl *)> & ) {}
         Module *    module = nullptr;
     };
 
-    struct DAS_API AnnotationDeclaration : ptr_ref_count {
-        AnnotationPtr           annotation;
+    struct DAS_API AnnotationDeclaration : gc_node {
+        AnnotationPtr           annotation = nullptr;
         AnnotationArgumentList  arguments;
         LineInfo                at;
         union {
@@ -153,6 +153,7 @@ namespace das
         };
         string getMangledName() const;
         void serialize( AstSerializer & ser );
+        virtual void gc_collect ( gc_root * target, gc_root * from );
     };
 
     typedef vector<AnnotationDeclarationPtr> AnnotationList;
@@ -353,6 +354,7 @@ namespace das
         TypeDeclPtr     type = nullptr;
         ExpressionPtr   init = nullptr;
         ExpressionPtr   source = nullptr;     // if its interator variable, this is where the source is
+        Expression *    loop_source = nullptr; // weak ref to ExprFor::sources[i], used for read/write propagation
         LineInfo        at;
         int             index = -1;
         uint32_t        stackTop = 0;
@@ -605,7 +607,7 @@ namespace das
         virtual void aotBody   ( const StructurePtr &, const AnnotationArgumentList &, TextWriter & ) { }
         virtual void aotSuffix ( const StructurePtr &, const AnnotationArgumentList &, TextWriter & ) { }
     };
-    typedef smart_ptr<StructureAnnotation> StructureAnnotationPtr;
+    typedef StructureAnnotation * StructureAnnotationPtr;
 
     struct EnumerationAnnotation : Annotation {
         EnumerationAnnotation ( const string & n ) : Annotation(n) {}
@@ -613,7 +615,7 @@ namespace das
         virtual bool touch ( const EnumerationPtr & st, ModuleGroup & libGroup,
                             const AnnotationArgumentList & args, string & err ) = 0;    // this one happens before infer. u can change enum here
     };
-    typedef smart_ptr<EnumerationAnnotation> EnumerationAnnotationPtr;
+    typedef EnumerationAnnotation * EnumerationAnnotationPtr;
 
 
     // annotated structure
@@ -632,7 +634,7 @@ namespace das
             return true;
         }
         virtual TypeAnnotationPtr clone ( const TypeAnnotationPtr & p = nullptr ) const override {
-            smart_ptr<StructureTypeAnnotation> cp =  p ? static_pointer_cast<StructureTypeAnnotation>(p) : make_smart<StructureTypeAnnotation>(name);
+            StructureTypeAnnotation * cp =  p ? static_cast<StructureTypeAnnotation*>(p) : new StructureTypeAnnotation(name);
             cp->structureType = structureType;
             return TypeAnnotation::clone(cp);
         }
@@ -648,8 +650,6 @@ namespace das
         virtual ExpressionPtr visit(Visitor & /*vis*/ )  { DAS_ASSERT(0); return this; };
         virtual ExpressionPtr clone( ExpressionPtr expr = nullptr ) const;
         static ExpressionPtr autoDereference ( ExpressionPtr expr );
-        virtual SimNode * simulate (Context & /*context*/ ) const { DAS_ASSERT(0); return nullptr; };
-        virtual SimNode * trySimulate (Context & context, uint32_t extraOffset, const TypeDeclPtr & r2vType ) const;
         virtual void markNoDiscard() { }
         virtual bool rtti_isAssume() const { return false; }
         virtual bool rtti_isSequence() const { return false; }
@@ -765,7 +765,6 @@ namespace das
         ExprConst ( ) : baseType(Type::none) { __rtti = "ExprConst"; }
         ExprConst ( Type t ) : baseType(t) { __rtti = "ExprConst"; }
         ExprConst ( const LineInfo & a, Type t ) : Expression(a), baseType(t) { __rtti = "ExprConst"; }
-        virtual SimNode * simulate (Context & context) const override;
         virtual bool rtti_isConstant() const override { return true; }
         template <typename QQ> QQ & cvalue() { return *((QQ *)&value); }
         template <typename QQ> const QQ & cvalue() const { return *((const QQ *)&value); }
@@ -1072,10 +1071,11 @@ namespace das
         return { makeType<RetT>(lib), makeArgumentType<Args>(lib)... };
     }
 
-    struct TypeInfoMacro : public ptr_ref_count {
+    struct TypeInfoMacro {
         TypeInfoMacro ( const string & n )
             : name(n) {
         }
+        virtual ~TypeInfoMacro() = default;
         virtual void seal( Module * m ) { module = m; }
         virtual ExpressionPtr getAstChange ( ExpressionPtr, string & ) { return nullptr; }
         virtual TypeDeclPtr getAstType ( ModuleLibrary &, ExpressionPtr, string & ) { return nullptr; }
@@ -1088,7 +1088,7 @@ namespace das
         string name;
         Module * module = nullptr;
     };
-    typedef smart_ptr<TypeInfoMacro> TypeInfoMacroPtr;
+    typedef TypeInfoMacro * TypeInfoMacroPtr;
 
     struct Error {
         Error () {}
@@ -1154,12 +1154,12 @@ namespace das
         bool addFunction ( const FunctionPtr & fn, bool canFail = false );
         bool replaceFunction ( const FunctionPtr & fn );
         bool addGeneric ( const FunctionPtr & fn, bool canFail = false );
-        bool addAnnotation ( const AnnotationPtr & ptr, bool canFail = false );
-        void registerAnnotation ( const AnnotationPtr & ptr );
-        bool addTypeInfoMacro ( const TypeInfoMacroPtr & ptr, bool canFail = false );
-        bool addReaderMacro ( const ReaderMacroPtr & ptr, bool canFail = false );
-        bool addTypeMacro ( const TypeMacroPtr & ptr, bool canFail = false );
-        bool addCommentReader ( const CommentReaderPtr & ptr, bool canFail = false );
+        bool addAnnotation ( AnnotationPtr ptr, bool canFail = false );
+        void registerAnnotation ( AnnotationPtr ptr );
+        bool addTypeInfoMacro ( TypeInfoMacro * ptr, bool canFail = false );
+        bool addReaderMacro ( ReaderMacro * ptr, bool canFail = false );
+        bool addTypeMacro ( TypeMacro * ptr, bool canFail = false );
+        bool addCommentReader ( CommentReader * ptr, bool canFail = false );
         bool addKeyword ( const string & kwd, bool needOxfordComma, bool canFail = false );
         bool addTypeFunction ( const string & name, bool canFail = false );
         TypeDeclPtr findAlias ( const string & name ) const;
@@ -1173,8 +1173,8 @@ namespace das
         AnnotationPtr findAnnotation ( const string & name ) const;
         EnumerationPtr findEnum ( const string & name ) const;
         EnumerationPtr findEnumByMangledNameHash ( uint64_t hash ) const;
-        ReaderMacroPtr findReaderMacro ( const string & name ) const;
-        TypeInfoMacroPtr findTypeInfoMacro ( const string & name ) const;
+        ReaderMacro * findReaderMacro ( const string & name ) const;
+        TypeInfoMacro * findTypeInfoMacro ( const string & name ) const;
         ExprCallFactory * findCall ( const string & name ) const;
         __forceinline bool isVisibleDirectly ( Module * objModule ) const {
             if ( objModule==this ) return true;
@@ -1204,7 +1204,7 @@ namespace das
         void gc_collect ( gc_root * from = nullptr );  // move reachable TypeDecl from 'from' root to module_gc_root
     public:
         template <typename RecAnn>
-        void initRecAnnotation ( const smart_ptr<RecAnn> & rec, ModuleLibrary & lib ) {
+        void initRecAnnotation ( RecAnn * rec, ModuleLibrary & lib ) {
             rec->mlib = &lib;
             rec->init();
             rec->mlib = nullptr;
@@ -1229,7 +1229,7 @@ namespace das
     public:
         smart_ptr<Context>                          macroContext;
         safebox<TypeDecl, TypeDeclPtr>                           aliasTypes;
-        safebox<Annotation>                         handleTypes;
+        das_hash_map<uint64_t, Annotation *>            handleTypes;
         safebox<Structure, StructurePtr>             structures;
         safebox<Enumeration, EnumerationPtr>        enumerations;
         safebox<Variable, VariablePtr>              globals;
@@ -1238,21 +1238,22 @@ namespace das
         safebox<Function, FunctionPtr>              generics;           // mangled name 2 generic name
         fragile_hash<vector<Function*>>             genericsByName;     // all generics of the same name
         mutable das_map<string, ExprCallFactory>    callThis;
-        das_map<string, TypeInfoMacroPtr>           typeInfoMacros;
+        das_map<string, unique_ptr<TypeInfoMacro>>   typeInfoMacros;
         das_map<uint64_t, uint64_t>                 annotationData;
         das_hash_map<Module *,bool>                 requireModule;      // visibility modules
-        vector<PassMacroPtr>                        macros;             // infer macros (clean infer, assume no errors)
-        vector<PassMacroPtr>                        inferMacros;        // infer macros (dirty infer, assume half-way-there tree)
-        vector<PassMacroPtr>                        optimizationMacros; // optimization macros
-        vector<PassMacroPtr>                        lintMacros;         // lint macros (assume read-only)
-        vector<PassMacroPtr>                        globalLintMacros;   // lint macros which work everywhere
-        vector<VariantMacroPtr>                     variantMacros;      //  X is Y, X as Y expression handler
-        vector<ForLoopMacroPtr>                     forLoopMacros;      // for loop macros (for every for loop)
-        vector<CaptureMacroPtr>                     captureMacros;      // lambda capture macros
-        vector<SimulateMacroPtr>                    simulateMacros;     // simulate macros (every time we simulate context)
-        das_map<string,TypeMacroPtr>                typeMacros;         // type macros (every time we infer type)
-        das_map<string,ReaderMacroPtr>              readMacros;         // %foo "blah"
-        CommentReaderPtr                            commentReader;      // /* blah */ or // blah
+        vector<unique_ptr<PassMacro>>               macros;             // infer macros (clean infer, assume no errors)
+        vector<unique_ptr<PassMacro>>               inferMacros;        // infer macros (dirty infer, assume half-way-there tree)
+        vector<unique_ptr<PassMacro>>               optimizationMacros; // optimization macros
+        vector<unique_ptr<PassMacro>>               lintMacros;         // lint macros (assume read-only)
+        vector<unique_ptr<PassMacro>>               globalLintMacros;   // lint macros which work everywhere
+        vector<unique_ptr<VariantMacro>>            variantMacros;      //  X is Y, X as Y expression handler
+        vector<unique_ptr<ForLoopMacro>>            forLoopMacros;      // for loop macros (for every for loop)
+        vector<unique_ptr<CaptureMacro>>            captureMacros;      // lambda capture macros
+        vector<unique_ptr<SimulateMacro>>           simulateMacros;     // simulate macros (every time we simulate context)
+        das_map<string,unique_ptr<TypeMacro>>       typeMacros;         // type macros (every time we infer type)
+        das_map<string,unique_ptr<ReaderMacro>>     readMacros;         // %foo "blah"
+        unique_ptr<CommentReader>                   commentReader;      // /* blah */ or // blah
+        vector<unique_ptr<CallMacro>>               ownedCallMacros;    // call macros (owned here, referenced from callThis lambdas)
         vector<pair<string,bool>>                   keywords;           // keywords (and if they need oxford comma)
         vector<string>                              typeFunctions;      // type functions
         das_hash_map<string,Type>                   options;            // options
@@ -1353,7 +1354,7 @@ namespace das
         void findAnnotation ( vector<AnnotationPtr> & ptr, Module * pm, const string & annotationName, Module * inWhichModule ) const;
         vector<AnnotationPtr> findAnnotation ( const string & name, Module * inWhichModule ) const;
         vector<AnnotationPtr> findStaticAnnotation ( const string & name ) const;
-        vector<TypeInfoMacroPtr> findTypeInfoMacro ( const string & name, Module * inWhichModule ) const;
+        vector<TypeInfoMacro*> findTypeInfoMacro ( const string & name, Module * inWhichModule ) const;
         void findEnum ( vector<EnumerationPtr> & ptr, Module * pm, const string & enumName, Module * inWhichModule ) const;
         vector<EnumerationPtr> findEnum ( const string & name, Module * inWhichModule ) const;
         void findStructure ( vector<StructurePtr> & ptr, Module * pm, const string & funcName, Module * inWhichModule ) const;
@@ -1393,15 +1394,17 @@ namespace das
     };
     template <> struct isCloneable<ModuleGroup> : false_type {};
 
-    struct PassMacro : ptr_ref_count {
+    struct PassMacro {
         PassMacro ( const string na = "" ) : name(na) {}
+        virtual ~PassMacro() = default;
         virtual bool apply( Program *, Module * ) { return false; }
         string name;
     };
 
     struct ExprReader;
-    struct ReaderMacro : ptr_ref_count {
+    struct ReaderMacro {
         ReaderMacro ( const string na = "" ) : name(na) {}
+        virtual ~ReaderMacro() = default;
         virtual bool accept ( Program *, Module *, ExprReader *, int, const LineInfo & ) { return false; }
         virtual char * suffix ( Program *, Module *, ExprReader *, int &, FileInfo * &, const LineInfo & ) { return nullptr; }
         virtual ExpressionPtr visit (  Program *, Module *, ExprReader * ) { return nullptr; }
@@ -1411,8 +1414,9 @@ namespace das
     };
 
     struct ExprCallMacro;
-    struct CallMacro : ptr_ref_count {
+    struct CallMacro {
         CallMacro ( const string & na = "" ) : name(na) {}
+        virtual ~CallMacro() = default;
         virtual void preVisit (  Program *, Module *, ExprCallMacro * ) { }
         virtual ExpressionPtr visit (  Program *, Module *, ExprCallMacro * ) { return nullptr; }
         virtual void seal( Module * m ) { module = m; }
@@ -1423,22 +1427,25 @@ namespace das
     };
 
     struct ExprFor;
-    struct ForLoopMacro : ptr_ref_count {
+    struct ForLoopMacro {
         ForLoopMacro ( const string & na = "" ) : name(na) {}
+        virtual ~ForLoopMacro() = default;
         virtual ExpressionPtr visit ( Program *, Module *, ExprFor * ) { return nullptr; }
         string name;
     };
 
-    struct CaptureMacro : ptr_ref_count {
+    struct CaptureMacro {
         CaptureMacro ( const string & na = "" ) : name(na) {}
+        virtual ~CaptureMacro() = default;
         virtual ExpressionPtr captureExpression ( Program *, Module *, Expression *, TypeDecl * ) { return nullptr; }
         virtual void captureFunction ( Program *, Module *, Structure *, Function * ) { }
         virtual void releaseFunction ( Program *, Module *, Structure *, Function * ) { }
         string name;
     };
 
-    struct TypeMacro : ptr_ref_count {
+    struct TypeMacro {
         TypeMacro ( const string & na = "" ) : name(na) {}
+        virtual ~TypeMacro() = default;
         virtual TypeDeclPtr visit ( Program *, Module *, const TypeDeclPtr &, const TypeDeclPtr & ) { return nullptr; }
         string name;
     };
@@ -1446,22 +1453,24 @@ namespace das
     struct ExprIsVariant;
     struct ExprAsVariant;
     struct ExprSafeAsVariant;
-    struct VariantMacro : ptr_ref_count {
+    struct VariantMacro {
         VariantMacro ( const string na = "" ) : name(na) {}
+        virtual ~VariantMacro() = default;
         virtual ExpressionPtr visitIs     (  Program *, Module *, ExprIsVariant * ) { return nullptr; }
         virtual ExpressionPtr visitAs     (  Program *, Module *, ExprAsVariant * ) { return nullptr; }
         virtual ExpressionPtr visitSafeAs (  Program *, Module *, ExprSafeAsVariant * ) { return nullptr; }
         string name;
     };
 
-    struct SimulateMacro : ptr_ref_count {
+    struct SimulateMacro {
         SimulateMacro ( const string na = "" ) : name(na) {}
+        virtual ~SimulateMacro() = default;
         virtual bool preSimulate ( Program *, Context * ) { return true; }
         virtual bool simulate ( Program *, Context * ) { return true; }
         string name;
     };
 
-    class DAS_API DebugInfoHelper : public ptr_ref_count {
+    class DAS_API DebugInfoHelper {
     public:
         DebugInfoHelper () { debugInfo = make_shared<DebugInfoAllocator>(); }
         DebugInfoHelper ( const shared_ptr<DebugInfoAllocator> & di ) : debugInfo(di) {}
@@ -1498,6 +1507,7 @@ namespace das
         bool        aot_module = false;                 // this is how AOT tool knows module is module, and not an entry point
         bool        aot_macros = false;                 // enables aot of macro code (like 'qmacro_block')
         bool        paranoid_validation = false;        // todo
+        bool        validate_ast = false;               // validate AST after compilation (uniqueness, etc.)
         bool        cross_platform = false;             // aot supports platform independent mode
         string      aot_result;                         // Path where to store cpp-result of aot
     // End aot config
@@ -1607,7 +1617,8 @@ namespace das
         /*option*/ bool temp_table_lint_warning = false;
     };
 
-    struct CommentReader : public ptr_ref_count {
+    struct CommentReader {
+        virtual ~CommentReader() = default;
         virtual void open ( bool cppStyle, const LineInfo & at ) = 0;
         virtual void accept ( int Ch, const LineInfo & at ) = 0;
         virtual void close ( const LineInfo & at ) = 0;
@@ -1654,7 +1665,7 @@ namespace das
         friend DAS_API StringWriter& operator<< (StringWriter& stream, const Program & program);
         vector<StructurePtr> findStructure ( const string & name ) const;
         vector<AnnotationPtr> findAnnotation ( const string & name ) const;
-        vector<TypeInfoMacroPtr> findTypeInfoMacro ( const string & name ) const;
+        vector<TypeInfoMacro*> findTypeInfoMacro ( const string & name ) const;
         vector<EnumerationPtr> findEnum ( const string & name ) const;
         vector<TypeDeclPtr> findAlias ( const string & name ) const;
         bool addAlias ( const TypeDeclPtr & at );
@@ -1685,6 +1696,7 @@ namespace das
         void fusion ( Context & context, TextWriter & logs );
         void buildAccessFlags(TextWriter & logs);
         bool verifyAndFoldContracts();
+        void validateAst();
         void optimize(TextWriter & logs, ModuleGroup & libGroup);
         bool inScopePodAnalysis(TextWriter & logs);
         void markSymbolUse(bool builtInSym, bool forceAll, bool initThis, Module * macroModule, TextWriter * logs = nullptr);
@@ -1725,7 +1737,7 @@ namespace das
         bool getProfiler() const;
         Module *getThisModule() const { return thisModule.get(); }
         void makeMacroModule( TextWriter & logs );
-        vector<ReaderMacroPtr> getReaderMacro ( const string & markup ) const;
+        vector<ReaderMacro*> getReaderMacro ( const string & markup ) const;
         void serialize ( AstSerializer & ser );
     protected:
         // this is no longer the way to link AOT
@@ -1762,6 +1774,7 @@ namespace das
         uint32_t                    globalInitStackSize = 0;
         uint32_t                    globalStringHeapSize = 0;
         bool                        folding = false;
+        bool                        visitBuiltinFunctions = false;
         bool                        reportingInferErrors = false;
         uint64_t                    initSemanticHashWithDep = 0;
         union {

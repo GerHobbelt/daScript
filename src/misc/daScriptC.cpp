@@ -479,10 +479,10 @@ void das_module_bind_enumeration ( das_module * mod, das_enumeration * en ) {
 }
 
 das_structure * das_structure_make ( das_module_group * lib, const char * name, const char * cppname, int sz, int al ) {
-    auto st = make_smart<CStructureAnnotation>(name,cppname,(ModuleLibrary *)lib);
+    auto st = new CStructureAnnotation(name,cppname,(ModuleLibrary *)lib);
     st->sizeOf = sz;
     st->alignOf = al;
-    return (das_structure *) st.orphan();
+    return (das_structure *) st;
 }
 
 void das_structure_add_field ( das_structure * st, das_module * mod, das_module_group * lib,  const char * name, const char * cppname, int offset, const char * tname ) {
@@ -510,6 +510,8 @@ char * das_allocate_string ( das_context * context, char * str ) {
 
 int    das_argument_int ( vec4f arg ) { return cast<int>::to(arg); }
 unsigned int   das_argument_uint ( vec4f arg ) { return cast<unsigned int>::to(arg); }
+long long das_argument_int64 ( vec4f arg ) { return cast<long long>::to(arg); }
+unsigned long long das_argument_uint64 ( vec4f arg ) { return cast<unsigned long long>::to(arg); }
 int    das_argument_bool ( vec4f arg ) { return cast<bool>::to(arg) ? 1 : 0; }
 float  das_argument_float ( vec4f arg ) { return cast<float>::to(arg); }
 double  das_argument_double ( vec4f arg ) { return cast<double>::to(arg); }

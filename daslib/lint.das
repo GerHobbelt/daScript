@@ -33,10 +33,12 @@ class LintVisitor : AstVisitor {
     //!   - LINT002: unused variable
     //!   - LINT003: variable can be made const (var→let)
     //!   - LINT004: underscore-prefixed variable is actually used
-    astVisitorAdapter : smart_ptr<ast::VisitorAdapter>
+    //!   - LINT005: redundant reinterpret<T>(x) where T matches source type
+    astVisitorAdapter : VisitorAdapter?
     exprForTerminator : array<uint64>
     compile_time_errors : bool
     noLint : bool = false
+    genericDepth : int = 0
     // collection mode — when true, errors are appended to `errors` instead of error()
     collect_errors : bool = false
     errors : array<string>
@@ -78,6 +80,9 @@ class LintVisitor : AstVisitor {
     }
     def override preVisitFunction(fun : FunctionPtr) : void {
         noLint = false
+        if (fun.fromGeneric != null || fun.flags.generated) {
+            genericDepth++
+        }
         if (fun.moreFlags.isTemplate) {
             noLint = true
             return
@@ -91,6 +96,9 @@ class LintVisitor : AstVisitor {
     }
     def override visitFunction(var fun : FunctionPtr) : FunctionPtr {
         noLint = false
+        if (fun.fromGeneric != null || fun.flags.generated) {
+            genericDepth--
+        }
         return <- fun
     }
     def override preVisitExprBlock(blk : ExprBlock?) : void {
@@ -135,6 +143,26 @@ class LintVisitor : AstVisitor {
             exprForTerminator |> push(intptr(expr))
         }
     }
+    // --- LINT005: redundant reinterpret cast ---
+
+    def override preVisitExprCast(expr : ExprCast?) : void {
+        if (noLint || genericDepth > 0) {
+            return
+        }
+        if (!expr.castFlags.reinterpretCast) {
+            return
+        }
+        if (expr.subexpr == null || expr.subexpr._type == null || expr.castType == null) {
+            return
+        }
+        if (expr.castType.isVoidPointer != expr.subexpr._type.isVoidPointer) {
+            return
+        }
+        if (is_same_type(expr.castType, expr.subexpr._type, false, true, true, false)) {
+            self->lint_error("LINT005: redundant reinterpret cast; target type is the same as source type", expr.at)
+        }
+    }
+
     def override preVisitExprForVariable(expr : ExprFor?; v : VariablePtr; last : bool) : void {
         if (expr.canShadow) {
             return
@@ -207,11 +235,10 @@ class LintVisitor : AstVisitor {
 def public paranoid(prog : ProgramPtr; compile_time_errors : bool) {
     //! Runs the paranoid lint visitor on the program to check for common coding issues.
     var astVisitor = new LintVisitor(compile_time_errors = compile_time_errors)
-    unsafe {
-        astVisitor.astVisitorAdapter <- make_visitor(*astVisitor)
+    make_visitor(*astVisitor) $(adapter) {
+        astVisitor.astVisitorAdapter = adapter
+        visit(prog, astVisitor.astVisitorAdapter)
     }
-    visit(prog, astVisitor.astVisitorAdapter)
-    astVisitor.astVisitorAdapter := null
     unsafe {
         delete astVisitor
     }
@@ -221,16 +248,15 @@ def public paranoid_collect(prog : ProgramPtr; var errors : array<string>) : int
     //! Runs the paranoid lint visitor and collects errors as strings.
     //! Returns the number of lint issues found.
     var astVisitor = new LintVisitor(compile_time_errors = false, collect_errors = true)
-    unsafe {
-        astVisitor.astVisitorAdapter <- make_visitor(*astVisitor)
+    make_visitor(*astVisitor) $(adapter) {
+        astVisitor.astVisitorAdapter = adapter
+        visit(prog, astVisitor.astVisitorAdapter)
     }
-    visit(prog, astVisitor.astVisitorAdapter)
     let count = length(astVisitor.errors)
     errors |> reserve(count)
     for (e in astVisitor.errors) {
         errors |> push(e)
     }
-    astVisitor.astVisitorAdapter := null
     unsafe {
         delete astVisitor
     }

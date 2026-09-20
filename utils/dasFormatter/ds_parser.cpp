@@ -5752,11 +5752,11 @@ yydestruct (const char *yymsg,
         break;
 
     case YYSYMBOL_annotation_declaration_basic: /* annotation_declaration_basic  */
-            { delete ((*yyvaluep).fa); }
+            { /* gc owns AnnotationDeclaration */ }
         break;
 
     case YYSYMBOL_annotation_declaration: /* annotation_declaration  */
-            { delete ((*yyvaluep).fa); }
+            { /* gc owns AnnotationDeclaration */ }
         break;
 
     case YYSYMBOL_annotation_list: /* annotation_list  */
@@ -6726,7 +6726,7 @@ yyreduce:
             das_yyerror(scanner,"expecting ~ after the reader macro", tokAt(scanner,(yylsp[0])),
                 CompilationError::syntax_error);
         } else {
-            yyextra->g_ReaderMacro = macros.back().get();
+            yyextra->g_ReaderMacro = macros.back();
             yyextra->g_ReaderExpr = new ExprReader(tokAt(scanner,(yylsp[-1])),yyextra->g_ReaderMacro);
             yyclearin ;
             das_yybegin_reader(scanner);
@@ -7249,7 +7249,7 @@ yyreduce:
 
   case 131: /* annotation_declaration: '!' annotation_declaration  */
                                               {
-        if ( !(yyvsp[0].fa)->annotation->rtti_isFunctionAnnotation() || !((FunctionAnnotation *)((yyvsp[0].fa)->annotation.get()))->isSpecialized() ) {
+        if ( !(yyvsp[0].fa)->annotation->rtti_isFunctionAnnotation() || !((FunctionAnnotation *)((yyvsp[0].fa)->annotation))->isSpecialized() ) {
             das_yyerror(scanner,"can only run logical operations on contracts", tokAt(scanner, (yylsp[0])),
                 CompilationError::invalid_annotation); }
         (yyval.fa) = new AnnotationDeclaration();
@@ -7260,10 +7260,10 @@ yyreduce:
 
   case 132: /* annotation_declaration: annotation_declaration "&&" annotation_declaration  */
                                                                               {
-        if ( !(yyvsp[-2].fa)->annotation->rtti_isFunctionAnnotation() || !((FunctionAnnotation *)((yyvsp[-2].fa)->annotation.get()))->isSpecialized() ) {
+        if ( !(yyvsp[-2].fa)->annotation->rtti_isFunctionAnnotation() || !((FunctionAnnotation *)((yyvsp[-2].fa)->annotation))->isSpecialized() ) {
             das_yyerror(scanner,"can only run logical operations on contracts", tokAt(scanner, (yylsp[-2])),
                 CompilationError::invalid_annotation); }
-        if ( !(yyvsp[0].fa)->annotation->rtti_isFunctionAnnotation() || !((FunctionAnnotation *)((yyvsp[0].fa)->annotation.get()))->isSpecialized() ) {
+        if ( !(yyvsp[0].fa)->annotation->rtti_isFunctionAnnotation() || !((FunctionAnnotation *)((yyvsp[0].fa)->annotation))->isSpecialized() ) {
             das_yyerror(scanner,"can only run logical operations on contracts", tokAt(scanner, (yylsp[0])),
                 CompilationError::invalid_annotation); }
         (yyval.fa) = new AnnotationDeclaration();
@@ -7274,10 +7274,10 @@ yyreduce:
 
   case 133: /* annotation_declaration: annotation_declaration "||" annotation_declaration  */
                                                                             {
-        if ( !(yyvsp[-2].fa)->annotation || !(yyvsp[-2].fa)->annotation->rtti_isFunctionAnnotation() || !((FunctionAnnotation *)((yyvsp[-2].fa)->annotation.get()))->isSpecialized() ) {
+        if ( !(yyvsp[-2].fa)->annotation || !(yyvsp[-2].fa)->annotation->rtti_isFunctionAnnotation() || !((FunctionAnnotation *)((yyvsp[-2].fa)->annotation))->isSpecialized() ) {
             das_yyerror(scanner,"can only run logical operations on contracts", tokAt(scanner, (yylsp[-2])),
                 CompilationError::invalid_annotation); }
-        if ( !(yyvsp[0].fa)->annotation || !(yyvsp[0].fa)->annotation->rtti_isFunctionAnnotation() || !((FunctionAnnotation *)((yyvsp[0].fa)->annotation.get()))->isSpecialized() ) {
+        if ( !(yyvsp[0].fa)->annotation || !(yyvsp[0].fa)->annotation->rtti_isFunctionAnnotation() || !((FunctionAnnotation *)((yyvsp[0].fa)->annotation))->isSpecialized() ) {
             das_yyerror(scanner,"can only run logical operations on contracts", tokAt(scanner, (yylsp[0])),
                 CompilationError::invalid_annotation); }
         (yyval.fa) = new AnnotationDeclaration();
@@ -7288,10 +7288,10 @@ yyreduce:
 
   case 134: /* annotation_declaration: annotation_declaration "^^" annotation_declaration  */
                                                                               {
-        if ( !(yyvsp[-2].fa)->annotation->rtti_isFunctionAnnotation() || !((FunctionAnnotation *)((yyvsp[-2].fa)->annotation.get()))->isSpecialized() ) {
+        if ( !(yyvsp[-2].fa)->annotation->rtti_isFunctionAnnotation() || !((FunctionAnnotation *)((yyvsp[-2].fa)->annotation))->isSpecialized() ) {
             das_yyerror(scanner,"can only run logical operations on contracts", tokAt(scanner, (yylsp[-2])),
                 CompilationError::invalid_annotation); }
-        if ( !(yyvsp[0].fa)->annotation->rtti_isFunctionAnnotation() || !((FunctionAnnotation *)((yyvsp[0].fa)->annotation.get()))->isSpecialized() ) {
+        if ( !(yyvsp[0].fa)->annotation->rtti_isFunctionAnnotation() || !((FunctionAnnotation *)((yyvsp[0].fa)->annotation))->isSpecialized() ) {
             das_yyerror(scanner,"can only run logical operations on contracts", tokAt(scanner, (yylsp[0])),
                 CompilationError::invalid_annotation); }
         (yyval.fa) = new AnnotationDeclaration();

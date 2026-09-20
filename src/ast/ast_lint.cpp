@@ -4,6 +4,7 @@
 #include "daScript/ast/ast_generate.h"
 #include "daScript/ast/ast_expressions.h"
 #include "daScript/ast/ast_visitor.h"
+#include "daScript/simulate/aot_builtin_ast.h"
 
 namespace das {
 
@@ -34,25 +35,6 @@ namespace das {
     };
 
 
-    das::unordered_set<string> g_cpp_keywords = {
-        /* reserved C++ names*/
-        "alignas","alignof","and","and_eq","asm","atomic_cancel","atomic_commit","atomic_noexcept","auto"
-        ,"bitand","bitor","bool","break","case","catch","char","char8_t","char16_t","char32_t","class"
-        ,"compl","concept","const","consteval","constexpr","constinit","const_cast","continue","co_await"
-        ,"co_return","co_yield","decltype","default","delete","do","double","dynamic_cast","else","enum"
-        ,"explicit","export","extern","false","float","for","friend","goto","if","inline","int","long"
-        ,"mutable","namespace","new","noexcept","not","not_eq","nullptr","operator","or","or_eq","private"
-        ,"protected","public","reflexpr","register","reinterpret_cast","requires","return","short","signed"
-        ,"sizeof","static","static_assert","static_cast","struct","switch","synchronized","template","this"
-        ,"thread_local","throw","true","try","typedef","typeid","typename","union","unsigned","using"
-        ,"virtual","void","volatile","wchar_t","while","xor","xor_eq"
-        /* extra */
-        ,"override","final","import","module","transaction_safe","transaction_safe_dynamic","super"
-    };
-
-    bool isCppKeyword(const string & str) {
-        return g_cpp_keywords.find(str) != g_cpp_keywords.end();
-    }
 
     bool hasLabels ( const ExprBlock * block ) {
         for ( auto & be : block->list ) {
@@ -268,7 +250,7 @@ namespace das {
             }
         }
         bool isValidModuleName(const string & str) const {
-            return !isCppKeyword(str);
+            return !isCppKeyword(str.c_str());
         }
         virtual void preVisitModule ( Module * mod ) override {
             Visitor::preVisitModule(mod);
@@ -278,10 +260,10 @@ namespace das {
             }
         }
         bool isValidEnumName(const string & str) const {
-            return !isCppKeyword(str);
+            return !isCppKeyword(str.c_str());
         }
         bool isValidEnumValueName(const string & str) const {
-            return !isCppKeyword(str);
+            return !isCppKeyword(str.c_str());
         }
         void lintType ( TypeDecl * td ) {
             for ( auto & name : td->argNames ) {
@@ -322,7 +304,7 @@ namespace das {
             }
         }
         bool isValidStructureName(const string & str) const {
-            return !isCppKeyword(str);
+            return !isCppKeyword(str.c_str());
         }
         virtual bool canVisitStructure ( Structure * st ) override {
             return !st->isTemplate;     // not a thing with templates
@@ -364,7 +346,7 @@ namespace das {
             }
         }
         bool isValidVarName(const string & str) const {
-            return !isCppKeyword(str);
+            return !isCppKeyword(str.c_str());
         }
         virtual void preVisitStructureField ( Structure * var, Structure::FieldDeclaration & decl, bool last ) override {
             Visitor::preVisitStructureField(var, decl, last);
@@ -463,6 +445,13 @@ namespace das {
             Visitor::preVisit(expr);
             // macro generated invisible variable
             // DAS_ASSERT(expr->visibility.line);
+            for ( size_t i=0, sz=expr->iteratorVariables.size(); i<sz; i++ ) {
+                auto & var = expr->iteratorVariables[i];
+                if (!isValidVarName(var->name)) {
+                    program->error("invalid variable name '" + var->name + "'", "", "",
+                        var->at, CompilationError::invalid_name );
+                }
+            }
         }
         virtual void preVisit(ExprDelete * expr) override {
             Visitor::preVisit(expr);
@@ -596,7 +585,7 @@ namespace das {
                 string message = "";
                 for ( auto & ann : expr->func->annotations ) {
                     if ( ann->annotation->rtti_isFunctionAnnotation() ) {
-                        auto fnAnn = static_pointer_cast<FunctionAnnotation>(ann->annotation);
+                        auto fnAnn = static_cast<FunctionAnnotation*>(ann->annotation);
                         if ( fnAnn->name=="deprecated" ) {
                             for ( auto & arg : ann->arguments ) {
                                 if ( arg.name=="message" && arg.type==Type::tString ) {
@@ -613,7 +602,7 @@ namespace das {
             for ( const auto & annDecl : expr->func->annotations ) {
                 auto ann = annDecl->annotation;
                 if ( ann->rtti_isFunctionAnnotation() ) {
-                    auto fnAnn = static_pointer_cast<FunctionAnnotation>(ann);
+                    auto fnAnn = static_cast<FunctionAnnotation*>(ann);
                     string err;
                     if ( !fnAnn->verifyCall(expr, annDecl->arguments, program->options, err) ) {
                         program->error("call annotated by " + fnAnn->name + " failed", err, "",
@@ -857,7 +846,7 @@ namespace das {
             }
         }
         bool isValidFunctionName(const string & str) const {
-            return !isCppKeyword(str);
+            return !isCppKeyword(str.c_str());
         }
         virtual bool canVisitFunction ( Function * fun ) override {
             return !fun->stub && !fun->isTemplate;    // we don't do a thing with templates
@@ -897,7 +886,7 @@ namespace das {
             }
             for ( auto & ann : fn->annotations ) {
                 if ( ann->annotation->rtti_isFunctionAnnotation() ) {
-                    auto fann = static_pointer_cast<FunctionAnnotation>(ann->annotation);
+                    auto fann = static_cast<FunctionAnnotation*>(ann->annotation);
                     string err;
                     if ( !fann->lint(fn, *program->thisModuleGroup, ann->arguments, program->options, err) ) {
                         program->error("function annotation lint failed\n", err, "", fn->at, CompilationError::annotation_failed );

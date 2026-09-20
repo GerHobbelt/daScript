@@ -70,8 +70,8 @@ def public clone(var a : dasvector`LineInfo; b : array<LineInfoInitData>) {
     }
 }
 
-def public clone(var args : rtti::AnnotationList; var nargs : array<smart_ptr<rtti::AnnotationDeclaration>>) {
-    //! Clones an array of AnnotationDeclaration smart pointers into an AnnotationList.
+def public clone(var args : rtti::AnnotationList; var nargs : array<rtti::AnnotationDeclaration?>) {
+    //! Clones an array of AnnotationDeclaration pointers into an AnnotationList.
     _::clear(args)
     for (narg in nargs) {
         _::emplace(args, narg)
@@ -438,8 +438,9 @@ class QuotePass : AstPassMacro {
             return false // nothing to do
         }
         var astVisitor = new QuoteConverter()
-        var inscope astVisitorAdapter <- make_visitor(*astVisitor)
-        visit(prog, astVisitorAdapter)
+        make_visitor(*astVisitor) $(astVisitorAdapter) {
+            visit(prog, astVisitorAdapter)
+        }
         let result = astVisitor.astChanged
         unsafe {
             delete astVisitor

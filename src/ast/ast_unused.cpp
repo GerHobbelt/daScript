@@ -141,8 +141,8 @@ namespace das {
             if ( expr->rtti_isVar() ) {
                 auto var = (ExprVar *) expr;
                 var->r2cr = true;
-                if ( var->variable->source ) {
-                    propagateRead(var->variable->source);
+                if ( var->variable->loop_source ) {
+                    propagateRead(var->variable->loop_source);
                 }
             } else if ( expr->rtti_isField() || expr->rtti_isSafeField()
                        || expr->rtti_isAsVariant() || expr->rtti_isIsVariant()
@@ -195,8 +195,8 @@ namespace das {
             if ( expr->rtti_isVar() ) {
                 auto var = (ExprVar *) expr;
                 var->write = true;
-                if ( var->variable->source ) {
-                    propagateWrite(var->variable->source);
+                if ( var->variable->loop_source ) {
+                    propagateWrite(var->variable->loop_source);
                 }
             } else if ( expr->rtti_isField() || expr->rtti_isSafeField()
                        || expr->rtti_isAsVariant() || expr->rtti_isSafeAsVariant() ) {
@@ -248,8 +248,8 @@ namespace das {
             if ( expr->rtti_isVar() ) {
                 auto var = (ExprVar *) expr;
                 var->write = true;
-                if ( var->variable->source ) {
-                    propagateWrite(var->variable->source);    /// this went to variable, we done via copy or move
+                if ( var->variable->loop_source ) {
+                    propagateWrite(var->variable->loop_source);    /// this went to variable, we done via copy or move
                 }
             } else if ( expr->rtti_isField() || expr->rtti_isSafeField()
                        || expr->rtti_isAsVariant() || expr->rtti_isSafeAsVariant() ) {
@@ -691,12 +691,12 @@ namespace das {
         virtual bool canVisitFunction ( Function * fun ) override {
             return funcIsDirty(fun) && !fun->stub && !fun->isTemplate;    // we don't do a thing with templates
         }
-        virtual bool canVisitStructure ( Structure * st ) override { return false; }
-        virtual bool canVisitStructureFieldInit ( Structure * ) override { return false; }
-        virtual bool canVisitArgumentInit ( Function * , const VariablePtr &, Expression * ) override { return false; }
-        virtual bool canVisitQuoteSubexpression ( ExprQuote * ) override { return false; }
-        virtual bool canVisitGlobalVariable ( Variable * fun ) override { return false; }
-        virtual bool canVisitEnumeration ( Enumeration * en ) override { return false; }
+        virtual bool canVisitStructure ( Structure * /*st*/ ) override { return false; }
+        virtual bool canVisitStructureFieldInit ( Structure * /*var*/ ) override { return false; }
+        virtual bool canVisitArgumentInit ( Function * /*fun*/, const VariablePtr & /*var*/, Expression * /*init*/ ) override { return false; }
+        virtual bool canVisitQuoteSubexpression ( ExprQuote * /*expr*/ ) override { return false; }
+        virtual bool canVisitGlobalVariable ( Variable * /*fun*/ ) override { return false; }
+        virtual bool canVisitEnumeration ( Enumeration * /*en*/ ) override { return false; }
 
     // ExprLet
         virtual VariablePtr visitLet ( ExprLet * let, const VariablePtr & var, bool last ) override {

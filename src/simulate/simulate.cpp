@@ -967,6 +967,7 @@ namespace das
     }
 
     Context::Context(uint32_t stackSize, bool ph) : stack(stackSize) {
+        ref_count_magic = TRACK_PTR_CONTEXT;
         code = make_shared<NodeAllocator>();
         constStringHeap = make_shared<ConstStringAllocator>();
         debugInfo = make_shared<DebugInfoAllocator>();
@@ -980,11 +981,11 @@ namespace das
         gcEnabled = options.getBoolOption("gc", false);
         persistent = options.getBoolOption("persistent_heap", policies.persistent_heap);
         if ( persistent ) {
-            heap = make_smart<PersistentHeapAllocator>();
-            stringHeap = make_smart<PersistentStringAllocator>();
+            heap = make_unique<PersistentHeapAllocator>();
+            stringHeap = make_unique<PersistentStringAllocator>();
         } else {
-            heap = make_smart<LinearHeapAllocator>();
-            stringHeap = make_smart<LinearStringAllocator>();
+            heap = make_unique<LinearHeapAllocator>();
+            stringHeap = make_unique<LinearStringAllocator>();
         }
         heap->setInitialSize ( options.getIntOption("heap_size_hint", policies.heap_size_hint) );
         heap->setLimit ( options.getUInt64OptionEx("heap_size_limit", "max_heap_allocated", policies.max_heap_allocated) );
@@ -1177,6 +1178,7 @@ namespace das
 
     Context::Context(const Context & ctx, const CopyOptions & opts)
         : stack(opts.stackSize ? opts.stackSize : ctx.stack.size()) {
+        ref_count_magic = TRACK_PTR_CONTEXT;
         verySafeContext = ctx.verySafeContext;
         persistent = ctx.persistent;
         gcEnabled = ctx.gcEnabled;
@@ -1189,11 +1191,11 @@ namespace das
         category.value = opts.category;
         ownStack = (ctx.stack.size() != 0);
         if ( persistent ) {
-            heap = make_smart<PersistentHeapAllocator>();
-            stringHeap = make_smart<PersistentStringAllocator>();
+            heap = make_unique<PersistentHeapAllocator>();
+            stringHeap = make_unique<PersistentStringAllocator>();
         } else {
-            heap = make_smart<LinearHeapAllocator>();
-            stringHeap = make_smart<LinearStringAllocator>();
+            heap = make_unique<LinearHeapAllocator>();
+            stringHeap = make_unique<LinearStringAllocator>();
         }
         // heap
         heap->setInitialSize(ctx.heap->getInitialSize());
@@ -1628,12 +1630,12 @@ namespace das
         char * sp = stack.ap();
         ssw << "CALL STACK (sp=" << (stack.top() - stack.ap())
             << ",sptr=0x" << HEX  << intptr_t(sp) << DEC << "):\n";
-        auto walker = make_smart<StackWalkerTextWriter> ( ssw, this );
-        walker->showArguments = showArguments;
-        walker->showLocalVariables =  showLocalVariables;
-        walker->showOutOfScope = showOutOfScope;
-        walker->stackTopOnly = stackTopOnly;
-        dapiStackWalk ( walker, *this, at ? *at : LineInfo() );
+        StackWalkerTextWriter walker ( ssw, this );
+        walker.showArguments = showArguments;
+        walker.showLocalVariables =  showLocalVariables;
+        walker.showOutOfScope = showOutOfScope;
+        walker.stackTopOnly = stackTopOnly;
+        dapiStackWalk ( &walker, *this, at ? *at : LineInfo() );
         ssw << "\n";
     #else
         ssw << "\nCALL STACK TRACKING DISABLED:\n\n";

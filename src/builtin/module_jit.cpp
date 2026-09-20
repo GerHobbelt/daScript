@@ -360,7 +360,7 @@ extern "C" {
         Annotation *result = nullptr;
         Module::foreach([&](Module * module) -> bool {
             if ( module->name != moduleName ) return true;
-            result = module->findAnnotation(annName).get();
+            result = module->findAnnotation(annName);
             return false;
         });
         if (!result) {
@@ -585,7 +585,7 @@ extern "C" {
             context->throw_error_at(at, "can't find ast_typeinfo for hash %" PRIx64, hash);
         }
         auto info = ti->second;
-        return (void*) info;
+        return (void*) new TypeDecl(*info);
     }
 }
 

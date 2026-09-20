@@ -12,8 +12,9 @@ require math
 // A sample: interleaved float data + channel count.
 [safe_when_uninitialized]
 struct Sample {
-    data     : array<float>   // interleaved PCM
-    channels : int = 1
+    data        : array<float>   // interleaved PCM
+    channels    : int = 1
+    sample_rate : int = 48000
 }
 
 // A sample bank: sound name → array of variations.
@@ -35,6 +36,7 @@ def load_audio_file(path : string) : Sample {
         return <- result
     }
     result.channels = int(decoder.outputChannels)
+    result.sample_rate = int(decoder.outputSampleRate)
     let totalFrames = int(ma_decoder_get_length_in_pcm_frames(decoder))
     if (totalFrames > 0) {
         result.data |> resize(totalFrames * result.channels)
@@ -54,22 +56,30 @@ def is_audio_file(name : string) : bool {
 }
 
 // Load a single sound from a directory of audio files.
+// Files are sorted alphabetically to match strudel sample indexing.
 def load_sound(path : string; name : string; var bank : SampleBank) {
-    var variations : array<Sample>
+    var files : array<string>
     dir(path) $(file) {
         if (file == "." || file == "..") {
             return
         }
         if (is_audio_file(file)) {
-            var sample <- load_audio_file("{path}/{file}")
-            if (length(sample.data) > 0) {
-                variations |> emplace <| sample
-            }
+            files |> push(file)
+        }
+    }
+    sort(files)
+    var variations : array<Sample>
+    for (file in files) {
+        var sample <- load_audio_file("{path}/{file}")
+        if (length(sample.data) > 0) {
+            variations |> emplace <| sample
         }
     }
     if (length(variations) > 0) {
         let soundName = to_lower(name)
         bank.sounds[soundName] <- variations
+    } else {
+        to_log(LOG_WARNING, "load_sound: no audio files found in '{path}' for '{name}'\n")
     }
 }
 
@@ -116,6 +126,7 @@ def load_audio_memory(data : array<uint8>) : Sample {
         return <- result
     }
     result.channels = int(decoder.outputChannels)
+    result.sample_rate = int(decoder.outputSampleRate)
     let totalFrames = int(ma_decoder_get_length_in_pcm_frames(decoder))
     if (totalFrames > 0) {
         result.data |> resize(totalFrames * result.channels)
@@ -138,8 +149,10 @@ def load_sound_memory(data : array<uint8>; name : string; var bank : SampleBank)
 }
 
 // Render a sample with speed control via miniaudio resampler + channel converter.
+// begin/end_pos are normalized slice bounds (0.0–1.0) — striate, chop, loop_at use these.
 // Returns interleaved stereo, no gain/pan applied.
-def render_sample(bank : SampleBank; name : string; variation : int; speed : float) : array<float> {
+def render_sample(bank : SampleBank; name : string; variation : int; speed : float;
+                  begin : float = 0.0; end_pos : float = 1.0) : array<float> {
     var stereo : array<float>
     bank.sounds |> get(name) $(variations) {
         if (length(variations) == 0) {
@@ -152,25 +165,35 @@ def render_sample(bank : SampleBank; name : string; variation : int; speed : flo
         if (srcFrames == 0) {
             return
         }
+        // clamp begin/end to [0,1], compute slice frame range
+        let b = clamp(begin, 0.0, 1.0)
+        let e = clamp(end_pos, 0.0, 1.0)
+        let sliceStart = int(b * float(srcFrames))
+        let sliceStop = min(srcFrames, max(sliceStart + 1, int(e * float(srcFrames))))
+        let sliceFrames = sliceStop - sliceStart
+        if (sliceFrames <= 0) {
+            return
+        }
         // resample: source rate * speed → target rate (MA_SAMPLE_RATE)
         // e.g. speed=2.0 means play at double speed = half the output frames
+        let srcRate = variations[idx].sample_rate
         var resampler : ma_resampler
         var resampler_config <- ma_resampler_config_init(
             ma_format.ma_format_f32,
             srcChannels,
-            uint(float(MA_SAMPLE_RATE) * abs(speed)),
+            uint(float(srcRate) * abs(speed)),
             uint(MA_SAMPLE_RATE),
             ma_resample_algorithm.ma_resample_algorithm_linear
         )
         ma_resampler_init(unsafe(addr(resampler_config)), unsafe(addr(resampler)))
-        var outFrames = uint64(ma_resampler_get_expected_output_frame_count(unsafe(addr(resampler)), uint64(srcFrames)))
+        var outFrames = uint64(ma_resampler_get_expected_output_frame_count(unsafe(addr(resampler)), uint64(sliceFrames)))
         var resampled : array<float>
         resampled |> resize(int(outFrames) * int(srcChannels))
-        var inFrames = uint64(srcFrames)
+        var inFrames = uint64(sliceFrames)
         unsafe {
             ma_resampler_process_pcm_frames(
                 addr(resampler),
-                addr(variations[idx].data[0]),
+                addr(variations[idx].data[sliceStart * int(srcChannels)]),
                 addr(inFrames),
                 addr(resampled[0]),
                 addr(outFrames)

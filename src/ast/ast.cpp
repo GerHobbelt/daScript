@@ -684,7 +684,7 @@ namespace das {
     AnnotationList cloneAnnotationList ( const AnnotationList & list ) {
         AnnotationList clist;
         for ( auto & ann : list ) {
-            auto decl = make_smart<AnnotationDeclaration>();
+            auto decl = new AnnotationDeclaration();
             decl->annotation = ann->annotation;
             decl->arguments = ann->arguments;
             decl->at = ann->at;
@@ -791,7 +791,7 @@ namespace das {
         }
         for ( auto & ann : annotations ) {
             if (ann->annotation && ann->annotation->rtti_isFunctionAnnotation() ) {
-                auto fna = static_pointer_cast<FunctionAnnotation>(ann->annotation);
+                auto fna = static_cast<FunctionAnnotation*>(ann->annotation);
                 string mname;
                 fna->appendToMangledName((Function *)this, *ann, mname);
                 if ( !mname.empty() ) {
@@ -849,7 +849,7 @@ namespace das {
     bool Function::isGeneric() const {
         for ( const auto & ann : annotations ) {
             if (ann->annotation) {
-                auto fna = static_pointer_cast<FunctionAnnotation>(ann->annotation);
+                auto fna = static_cast<FunctionAnnotation*>(ann->annotation);
                 if (fna->isGeneric()) {
                     return true;
                 }
@@ -866,7 +866,7 @@ namespace das {
     string Function::getAotArgumentPrefix(ExprCallFunc * call, int argIndex) const {
         for ( auto & ann : annotations ) {
             if ( ann->annotation->rtti_isFunctionAnnotation() ) {
-                auto pAnn = static_pointer_cast<FunctionAnnotation>(ann->annotation);
+                auto pAnn = static_cast<FunctionAnnotation*>(ann->annotation);
                 return pAnn->aotArgumentPrefix(call, argIndex);
             }
         }
@@ -876,7 +876,7 @@ namespace das {
     string Function::getAotArgumentSuffix(ExprCallFunc * call, int argIndex) const {
         for ( auto & ann : annotations ) {
             if ( ann->annotation->rtti_isFunctionAnnotation() ) {
-                auto pAnn = static_pointer_cast<FunctionAnnotation>(ann->annotation);
+                auto pAnn = static_cast<FunctionAnnotation*>(ann->annotation);
                 return pAnn->aotArgumentSuffix(call, argIndex);
             }
         }
@@ -886,7 +886,7 @@ namespace das {
     string Function::getAotName(ExprCallFunc * call) const {
         for ( auto & ann : annotations ) {
             if ( ann->annotation->rtti_isFunctionAnnotation() ) {
-                auto pAnn = static_pointer_cast<FunctionAnnotation>(ann->annotation);
+                auto pAnn = static_cast<FunctionAnnotation*>(ann->annotation);
                 return pAnn->aotName(call);
             }
         }
@@ -1112,6 +1112,7 @@ namespace das {
    // Reader
 
     ExpressionPtr ExprReader::visit(Visitor & vis) {
+        if ( !vis.canVisitReader(this) ) return this;
         vis.preVisit(this);
         return vis.visit(this);
     }
@@ -1127,6 +1128,7 @@ namespace das {
     // Label
 
     ExpressionPtr ExprLabel::visit(Visitor & vis) {
+        if ( !vis.canVisitLabel(this) ) return this;
         vis.preVisit(this);
         return vis.visit(this);
     }
@@ -2926,8 +2928,8 @@ namespace das {
 
     // program
 
-    vector<ReaderMacroPtr> Program::getReaderMacro ( const string & name ) const {
-        vector<ReaderMacroPtr> macros;
+    vector<ReaderMacro*> Program::getReaderMacro ( const string & name ) const {
+        vector<ReaderMacro*> macros;
         string moduleName, markupName;
         splitTypeName(name, moduleName, markupName);
         auto tmod = thisModule.get();
@@ -2935,7 +2937,7 @@ namespace das {
             if ( thisModule->isVisibleDirectly(mod) && mod!=tmod ) {
                 auto it = mod->readMacros.find(markupName);
                 if ( it != mod->readMacros.end() ) {
-                    macros.push_back(it->second);
+                    macros.push_back(it->second.get());
                 }
             }
             return true;
@@ -2960,7 +2962,7 @@ namespace das {
         return library.findAnnotation(name,thisModule.get());
     }
 
-    vector<TypeInfoMacroPtr> Program::findTypeInfoMacro ( const string & name ) const {
+    vector<TypeInfoMacro*> Program::findTypeInfoMacro ( const string & name ) const {
         return library.findTypeInfoMacro(name,thisModule.get());
     }
 
@@ -3022,7 +3024,7 @@ namespace das {
 
     bool Program::addStructureHandle ( const StructurePtr & st, const TypeAnnotationPtr & ann, const AnnotationArgumentList & arg ) {
         if ( ann->rtti_isStructureTypeAnnotation() ) {
-            auto annotation = static_pointer_cast<StructureTypeAnnotation>(ann->clone());
+            auto annotation = static_cast<StructureTypeAnnotation*>(ann->clone());
             annotation->name = st->name;
             string err;
             if ( annotation->create(st,arg,err) ) {
@@ -3038,6 +3040,7 @@ namespace das {
     }
 
     Program::Program() {
+        ref_count_magic = TRACK_PTR_PROGRAM;
         thisModule = make_unique<ModuleDas>();
         library.addBuiltInModule();
         library.addModule(thisModule.get());
@@ -3078,7 +3081,7 @@ namespace das {
             if ( handles.size()==1 ) {
                 if ( handles.back()->rtti_isHandledTypeAnnotation() ) {
                     auto pTD = new TypeDecl(Type::tHandle);
-                    pTD->annotation = static_cast<TypeAnnotation *>(handles.back().get());
+                    pTD->annotation = static_cast<TypeAnnotation *>(handles.back());
                     pTD->at = at;
                     return pTD;
                 } else {
@@ -3446,7 +3449,7 @@ namespace das {
         // generics
         if ( visitGenerics ) {
             thatModule->generics.foreach([&](auto & fn){
-                if ( !fn->builtIn ) {
+                if ( !fn->builtIn || visitBuiltinFunctions ) {
                     auto nfn = fn->visit(vis);
                     if ( fn != nfn ) {
                         thatModule->generics.replace(fn->getMangledName(), nfn);
@@ -3458,7 +3461,7 @@ namespace das {
         }
         // functions
         thatModule->functions.foreach([&](auto & fn){
-            if ( !fn->builtIn ) {
+            if ( !fn->builtIn || visitBuiltinFunctions ) {
                 if ( vis.canVisitFunction(fn) ) {
                     auto nfn = fn->visit(vis);
                     if ( fn != nfn ) {

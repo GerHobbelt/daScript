@@ -884,8 +884,12 @@ namespace das
     }
 
     void TypeDecl::clone ( TypeDeclPtr & dest, const TypeDeclPtr & src ) {
+        // this only works when there are no duplicated types whatsoever
+        // there is CodeOfPolicies::validate_ast that checks for that, but its off by default (slow)
+        // if you suspect this is whats causing a problem, disable the optimization, enable the validation and find the duplicated type
+#if 0
         dest = new TypeDecl(*src);
-/*
+#else
         if ( src==nullptr ) {
             dest = nullptr;
             return;
@@ -918,7 +922,7 @@ namespace das
             clone(dest->argTypes[i], src->argTypes[i]);
         }
         dest->argNames = src->argNames;
-*/
+#endif
     }
 
     void TypeDecl::gc_collect ( gc_root * target, gc_root * from ) {
@@ -3504,7 +3508,7 @@ namespace das
                     }
                 }
                 if ( ann.size()!=1 ) error("unresolved annotation '" + annName + "'", ch);
-                pt->annotation = (TypeAnnotation *) ann.back().get();
+                pt->annotation = (TypeAnnotation *) ann.back();
                 if ( !pt->annotation->rtti_isHandledTypeAnnotation() ) error("'" + annName + "' is not a handled type", ch);
                 return pt;
             };

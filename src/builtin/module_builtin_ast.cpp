@@ -6,7 +6,7 @@
 #include "daScript/ast/ast_policy_types.h"
 #include "daScript/ast/ast_expressions.h"
 #include "daScript/ast/ast_generate.h"
-#include "daScript/ast/ast_visitor.h"
+#include "daScript/ast/ast_simulate.h"
 #include "daScript/das_common.h"
 #include "daScript/simulate/aot_builtin_ast.h"
 #include "daScript/simulate/aot_builtin_string.h"
@@ -63,6 +63,42 @@ namespace das {
         if ( !module ) context->throw_error_at(lineInfo, "expecting module, not null");
         if ( !kwd || kwd[0]==0 ) context->throw_error_at(lineInfo, "expecting type function name, not empty string");
         return module->addTypeFunction(kwd, true);
+    }
+
+    bool isCppKeyword ( const char * str ) {
+        static das_hash_set<string> cpp_kw = {
+            "alignas","alignof","and","and_eq","asm","atomic_cancel","atomic_commit","atomic_noexcept","auto"
+            ,"bitand","bitor","bool","break","case","catch","char","char8_t","char16_t","char32_t","class"
+            ,"compl","concept","const","consteval","constexpr","constinit","const_cast","continue","co_await"
+            ,"co_return","co_yield","decltype","default","delete","do","double","dynamic_cast","else","enum"
+            ,"explicit","export","extern","false","float","for","friend","goto","if","inline","int","long"
+            ,"mutable","namespace","new","noexcept","not","not_eq","nullptr","operator","or","or_eq","private"
+            ,"protected","public","reflexpr","register","reinterpret_cast","requires","return","short","signed"
+            ,"sizeof","static","static_assert","static_cast","struct","switch","synchronized","template","this"
+            ,"thread_local","throw","true","try","typedef","typeid","typename","union","unsigned","using"
+            ,"virtual","void","volatile","wchar_t","while","xor","xor_eq"
+            ,"override","final","import","module","transaction_safe","transaction_safe_dynamic","super"
+        };
+        if ( !str ) return false;
+        return cpp_kw.find(str) != cpp_kw.end();
+    }
+
+    bool isDasKeyword ( const char * str ) {
+        static das_hash_set<string> das_kw = {
+            "include","capture","for","while","if","static_if","elif","static_elif","else","finally"
+            ,"def","with","aka","assume","let","var","uninitialized","struct","class","enum","try"
+            ,"recover","typedef","typedecl","label","goto","module","public","options","operator"
+            ,"require","block","function","lambda","generator","tuple","variant","const","continue"
+            ,"where","cast","upcast","pass","reinterpret","override","sealed","template","abstract"
+            ,"expect","table","array","fixed_array","default","iterator","in","implicit","explicit"
+            ,"shared","private","smart_ptr","unsafe","inscope","static","as","is","deref","addr"
+            ,"null","return","yield","break","typeinfo","type","new","delete","true","false","auto"
+            ,"bool","void","string","range64","urange64","range","urange","int","int8","int16","int64"
+            ,"int2","int3","int4","uint","bitfield","uint8","uint16","uint64","uint2","uint3","uint4"
+            ,"double","float","float2","float3","float4"
+        };
+        if ( !str ) return false;
+        return das_kw.find(str) != das_kw.end();
     }
 
     void forEachFunction ( Module * module, const char * name, const TBlock<void,FunctionPtr> & block, Context * context, LineInfoArg * lineInfo ) {
@@ -213,15 +249,13 @@ namespace das {
         return found ? found : Module::require(name);
     }
 
-    smart_ptr_raw<Annotation> module_find_annotation ( const Module* module, const char *name ) {
-        auto ann = module->findAnnotation(name);
-        ann->addRef();
-        return ann;
+    AnnotationPtr module_find_annotation ( const Module* module, const char *name ) {
+        return module->findAnnotation(name);
     }
 
     TypeAnnotation* module_find_type_annotation ( const Module* module, const char *name ) {
         auto ann = module->findAnnotation(name);
-        return static_cast<TypeAnnotation*>(ann.get());
+        return static_cast<TypeAnnotation*>(ann);
     }
 
     Function * findRttiFunction ( Module * mod, Func func, Context * context, LineInfoArg * line_info ) {
@@ -442,25 +476,25 @@ namespace das {
 
     void for_each_variant_macro ( Module * mod, const TBlock<void,VariantMacroPtr> & block, Context * context, LineInfoArg * at ) {
         for ( auto & td : mod->variantMacros ) {
-            das_invoke<void>::invoke<VariantMacroPtr>(context,at,block,td);
+            das_invoke<void>::invoke<VariantMacroPtr>(context,at,block,td.get());
         }
     }
 
     void for_each_for_loop_macro ( Module * mod, const TBlock<void,ForLoopMacroPtr> & block, Context * context, LineInfoArg * at ) {
         for ( auto & td : mod->forLoopMacros ) {
-            das_invoke<void>::invoke<ForLoopMacroPtr>(context,at,block,td);
+            das_invoke<void>::invoke<ForLoopMacroPtr>(context,at,block,td.get());
         }
     }
 
     void for_each_typeinfo_macro ( Module * mod, const TBlock<void,TypeInfoMacroPtr> & block, Context * context, LineInfoArg * at ) {
         for ( auto & td : mod->typeInfoMacros ) {
-            das_invoke<void>::invoke<TypeInfoMacroPtr>(context,at,block,td.second);
+            das_invoke<void>::invoke<TypeInfoMacroPtr>(context,at,block,td.second.get());
         }
     }
 
     void for_each_typemacro ( Module * mod, const TBlock<void,TypeMacroPtr> & block, Context * context, LineInfoArg * at ) {
         for ( auto & td : mod->typeMacros ) {
-            das_invoke<void>::invoke<TypeMacroPtr>(context,at,block,td.second);
+            das_invoke<void>::invoke<TypeMacroPtr>(context,at,block,td.second.get());
         }
     }
 
@@ -582,7 +616,7 @@ namespace das {
     float4 evalSingleExpression ( ExpressionPtr expr, bool & ok ) {
         ok = true;
         das::Context ctx;
-        auto node = expr->simulate(ctx);
+        auto node = simulateExpression(ctx, expr);
         ctx.restart();
         vec4f result = ctx.evalWithCatch(node);
         if ( ctx.getException() ) ok = false;
@@ -670,7 +704,7 @@ namespace das {
         if ( !expr ) return nullptr;
         if ( !daScriptEnvironment::getBound() ) context->throw_error_at(at, "expecting bound environment");
         auto mod = Module::require("ast_core");
-        return mod->findAnnotation(expr->__rtti).get();
+        return mod->findAnnotation(expr->__rtti);
     }
 
     void addModuleOption ( Module * mod, char * option, Type type, Context * context, LineInfoArg * at ) {
@@ -686,13 +720,13 @@ namespace das {
         return type->annotation->makeValueType();
     }
 
-    TypeInfo * getHandledTypeFieldType ( smart_ptr_raw<TypeAnnotation> annotation, char * name, Context * context, LineInfoArg * at ) {
+    TypeInfo * getHandledTypeFieldType ( TypeAnnotationPtr annotation, char * name, Context * context, LineInfoArg * at ) {
         if ( !name ) context->throw_error_at(at, "expecting field name");
         if ( !annotation ) context->throw_error_at(at, "expecting type annotation");
         return annotation->getFieldType(name);
     }
 
-    TypeDeclPtr getHandledTypeFieldTypeDecl ( smart_ptr_raw<TypeAnnotation> annotation, char * name, bool isConst, Context * context, LineInfoArg * at ) {
+    TypeDeclPtr getHandledTypeFieldTypeDecl ( TypeAnnotationPtr annotation, char * name, bool isConst, Context * context, LineInfoArg * at ) {
         if ( !name ) context->throw_error_at(at, "expecting field name");
         if ( !annotation ) context->throw_error_at(at, "expecting type annotation");
         return annotation->makeFieldType(name,isConst);
@@ -705,13 +739,7 @@ namespace das {
 
     template <typename F>
     static auto apply_to_vec(void* vec, string_view tstr, F apply) {
-        if (tstr == "smart_ptr<ast::Expression>") {
-            return apply(static_cast<vector<Expression *>*>(vec));
-        } else if (tstr == "smart_ptr<ast::Variable>") {
-            return apply(static_cast<vector<Variable *>*>(vec));
-        } else if (tstr == "smart_ptr<ast::TypeDecl>") {
-            return apply(static_cast<vector<TypeDecl *>*>(vec));
-        } else if (tstr == "string") {
+        if (tstr == "string") {
             return apply(static_cast<vector<const char *>*>(vec));
         } else if (tstr == "$::das_string") {
             return apply(static_cast<vector<string>*>(vec));
@@ -723,8 +751,6 @@ namespace das {
             return apply(static_cast<vector<uint8_t>*>(vec));
         } else if (tstr == "tuple<uint;uint>") {
             return apply(static_cast<vector<pair<unsigned int, unsigned int>>*>(vec));
-        } else if (tstr == "smart_ptr<rtti::AnnotationDeclaration>") {
-            return apply(static_cast<vector<smart_ptr<AnnotationDeclaration>>*>(vec));
         } else if (tstr == "rtti_core::AnnotationArgument") {
             return apply(static_cast<vector<AnnotationArgument>*>(vec));
         } else if (tstr == "rtti_core::LineInfo") {
@@ -756,7 +782,7 @@ namespace das {
         return (int) apply_to_vec(vec, type->describe(), get_size);
     }
 
-    uint32_t getHandledTypeFieldOffset ( smart_ptr_raw<TypeAnnotation> annotation, char * name, Context * context, LineInfoArg * at ) {
+    uint32_t getHandledTypeFieldOffset ( TypeAnnotationPtr annotation, char * name, Context * context, LineInfoArg * at ) {
         if ( !name ) context->throw_error_at(at, "expecting field name");
         if ( !annotation ) context->throw_error_at(at, "expecting type annotation");
         return annotation->getFieldOffset(name);
@@ -871,31 +897,31 @@ namespace das {
 
 // debugInfoHelper
 
-    TypeInfo * makeTypeInfo ( smart_ptr<DebugInfoHelper> helper, TypeInfo * info, const TypeDeclPtr & type ) {
+    TypeInfo * makeTypeInfo ( DebugInfoHelper * helper, TypeInfo * info, const TypeDeclPtr & type ) {
         return helper->makeTypeInfo(info, type);
     }
 
-    VarInfo * makeVariableDebugInfo ( smart_ptr<DebugInfoHelper> helper, Variable *var ) {
+    VarInfo * makeVariableDebugInfo ( DebugInfoHelper * helper, Variable *var ) {
         return helper->makeVariableDebugInfo(*var);
     }
 
-    VarInfo * makeStructVariableDebugInfo ( smart_ptr<DebugInfoHelper> helper, const Structure * st, const Structure::FieldDeclaration * var ) {
+    VarInfo * makeStructVariableDebugInfo ( DebugInfoHelper * helper, const Structure * st, const Structure::FieldDeclaration * var ) {
         return helper->makeVariableDebugInfo(*st, *var);
     }
 
-    StructInfo * makeStructureDebugInfo ( smart_ptr<DebugInfoHelper> helper, const Structure * st ) {
+    StructInfo * makeStructureDebugInfo ( DebugInfoHelper * helper, const Structure * st ) {
         return helper->makeStructureDebugInfo(*st);
     }
 
-    FuncInfo * makeFunctionDebugInfo ( smart_ptr<DebugInfoHelper> helper, const Function * fn ) {
+    FuncInfo * makeFunctionDebugInfo ( DebugInfoHelper * helper, const Function * fn ) {
         return helper->makeFunctionDebugInfo(*fn);
     }
 
-    EnumInfo * makeEnumDebugInfo ( smart_ptr<DebugInfoHelper> helper, const Enumeration * en ) {
+    EnumInfo * makeEnumDebugInfo ( DebugInfoHelper * helper, const Enumeration * en ) {
         return helper->makeEnumDebugInfo(*en);
     }
 
-    FuncInfo * makeInvokeableTypeDebugInfo ( smart_ptr<DebugInfoHelper> helper, TypeDeclPtr blk, const LineInfo & at ) {
+    FuncInfo * makeInvokeableTypeDebugInfo ( DebugInfoHelper * helper, TypeDeclPtr blk, const LineInfo & at ) {
         return helper->makeInvokeableTypeDebugInfo(blk, at);
     }
 
@@ -912,32 +938,32 @@ namespace das {
         }
     }
 
-    void debug_helper_iter_structs(smart_ptr<DebugInfoHelper> helper, const DebugBlockT<StructInfo*> & block, Context * context, LineInfoArg * at) {
+    void debug_helper_iter_structs(DebugInfoHelper * helper, const DebugBlockT<StructInfo*> & block, Context * context, LineInfoArg * at) {
         call_each(ordered(helper->smn2s), block, context, at);
     }
 
-    void debug_helper_iter_types(smart_ptr<DebugInfoHelper> helper, const DebugBlockT<TypeInfo*> & block, Context * context, LineInfoArg * at) {
+    void debug_helper_iter_types(DebugInfoHelper * helper, const DebugBlockT<TypeInfo*> & block, Context * context, LineInfoArg * at) {
         call_each(ordered(helper->tmn2t), block, context, at);
     }
 
-    void debug_helper_iter_vars(smart_ptr<DebugInfoHelper> helper, const DebugBlockT<VarInfo*> & block, Context * context, LineInfoArg * at) {
+    void debug_helper_iter_vars(DebugInfoHelper * helper, const DebugBlockT<VarInfo*> & block, Context * context, LineInfoArg * at) {
         call_each(ordered(helper->vmn2v), block, context, at);
     }
 
-    void debug_helper_iter_funcs(smart_ptr<DebugInfoHelper> helper, const DebugBlockT<FuncInfo*> & block, Context * context, LineInfoArg * at) {
+    void debug_helper_iter_funcs(DebugInfoHelper * helper, const DebugBlockT<FuncInfo*> & block, Context * context, LineInfoArg * at) {
         call_each(ordered(helper->fmn2f), block, context, at);
     }
 
-    void debug_helper_iter_enums(smart_ptr<DebugInfoHelper> helper, const DebugBlockT<EnumInfo*> & block, Context * context, LineInfoArg * at) {
+    void debug_helper_iter_enums(DebugInfoHelper * helper, const DebugBlockT<EnumInfo*> & block, Context * context, LineInfoArg * at) {
         call_each(ordered(helper->emn2e), block, context, at);
     }
 
-    const char *debug_helper_find_type_cppname(const smart_ptr<DebugInfoHelper> &helper, TypeInfo *info, Context * context, LineInfoArg * at) {
+    const char *debug_helper_find_type_cppname(DebugInfoHelper * helper, TypeInfo *info, Context * context, LineInfoArg * at) {
         DAS_ASSERT(helper->t2cppTypeName.find(info) != helper->t2cppTypeName.end());
         return context->allocateString(helper->t2cppTypeName.find(info)->second, at);
     }
 
-    const char *debug_helper_find_struct_cppname(const smart_ptr<DebugInfoHelper> &helper, StructInfo *info, Context * context, LineInfoArg * at) {
+    const char *debug_helper_find_struct_cppname(DebugInfoHelper * helper, StructInfo *info, Context * context, LineInfoArg * at) {
         DAS_ASSERT(helper->s2cppTypeName.find(info) != helper->s2cppTypeName.end());
         return context->allocateString(helper->s2cppTypeName.find(info)->second, at);
     }
@@ -1534,6 +1560,12 @@ namespace das {
         addExtern<DAS_BIND_FUN(findCompilingFunctionByMangledNameHash)>(*this, lib,  "find_compiling_function_by_mangled_name_hash",
             SideEffects::accessExternal, "findCompilingFunctionByMangledNameHash")
                 ->args({"moduleName","mangledNameHash","context","at"});
+        addExtern<DAS_BIND_FUN(isCppKeyword)>(*this, lib, "is_cpp_keyword",
+            SideEffects::none, "isCppKeyword")
+                ->args({"str"});
+        addExtern<DAS_BIND_FUN(isDasKeyword)>(*this, lib, "is_das_keyword",
+            SideEffects::none, "isDasKeyword")
+                ->args({"str"});
     }
 
     ModuleAotType Module_Ast::aotRequire ( TextWriter & tw ) const {

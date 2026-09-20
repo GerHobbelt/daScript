@@ -118,7 +118,7 @@ namespace das {
             for ( auto pm = bound->modules; pm!=nullptr; pm=pm->next ) {
                 if ( pm->name == moduleName ) {
                     if ( auto annT = pm->findAnnotation(annName) ) {
-                        resolve = (TypeAnnotation *) annT.get();
+                        resolve = (TypeAnnotation *) annT;
                     }
                     break;
                 }
@@ -333,9 +333,9 @@ namespace das {
             if ( td ) td->gc_collect(target, from);
         });
         // collect types in handle/annotation types
-        handleTypes.foreach([&](auto & ann) {
-            ann->gc_collect(target, from);
-        });
+        for ( auto & [key, ann] : handleTypes ) {
+            if ( ann ) ann->gc_collect(target, from);
+        }
         // collect types in structures (full recursive walk via virtual gc_collect)
         structures.foreach([&](auto & st) {
             st->gc_collect(target, from);
@@ -390,17 +390,24 @@ namespace das {
         }
     }
 
-    void Module::registerAnnotation ( const AnnotationPtr & ptr ) {
-        if ( handleTypes.find(ptr->name)==nullptr ) {
-            handleTypes.insert(ptr->name, ptr);
+    void Module::registerAnnotation ( AnnotationPtr ptr ) {
+        auto key = hash64z(ptr->name.c_str());
+        if ( handleTypes.find(key)==handleTypes.end() ) {
             ptr->module = this;
+            handleTypes[key] = ptr;
         }
     }
 
-    bool Module::addAnnotation ( const AnnotationPtr & ptr, bool canFail ) {
-        auto pptr = handleTypes.find(ptr->name);
-        if ( pptr==ptr || handleTypes.insert(ptr->name, ptr)  ) {
+    bool Module::addAnnotation ( AnnotationPtr ptr, bool canFail ) {
+        auto key = hash64z(ptr->name.c_str());
+        auto it = handleTypes.find(key);
+        if ( it!=handleTypes.end() && it->second==ptr ) {
             ptr->seal(this);
+            return true;
+        }
+        if ( it==handleTypes.end() ) {
+            ptr->seal(this);
+            handleTypes[key] = ptr;
             return true;
         } else {
             if ( !canFail ) {
@@ -410,8 +417,8 @@ namespace das {
         }
     }
 
-    bool Module::addTypeInfoMacro ( const TypeInfoMacroPtr & ptr, bool canFail ) {
-        if ( typeInfoMacros.insert(make_pair(ptr->name, ptr)).second ) {
+    bool Module::addTypeInfoMacro ( TypeInfoMacro * ptr, bool canFail ) {
+        if ( typeInfoMacros.insert(make_pair(ptr->name, unique_ptr<TypeInfoMacro>(ptr))).second ) {
             ptr->seal(this);
             return true;
         } else {
@@ -422,8 +429,8 @@ namespace das {
         }
     }
 
-    bool Module::addTypeMacro ( const TypeMacroPtr & ptr, bool canFail ) {
-        if ( typeMacros.insert(make_pair(ptr->name, ptr)).second ) {
+    bool Module::addTypeMacro ( TypeMacro * ptr, bool canFail ) {
+        if ( typeMacros.insert(make_pair(ptr->name, unique_ptr<TypeMacro>(ptr))).second ) {
             return true;
         } else {
             if ( !canFail ) {
@@ -433,8 +440,8 @@ namespace das {
         }
     }
 
-    bool Module::addReaderMacro ( const ReaderMacroPtr & ptr, bool canFail ) {
-        if ( readMacros.insert(make_pair(ptr->name, ptr)).second ) {
+    bool Module::addReaderMacro ( ReaderMacro * ptr, bool canFail ) {
+        if ( readMacros.insert(make_pair(ptr->name, unique_ptr<ReaderMacro>(ptr))).second ) {
             ptr->seal(this);
             return true;
         } else {
@@ -445,14 +452,14 @@ namespace das {
         }
     }
 
-    bool Module::addCommentReader ( const CommentReaderPtr & ptr, bool canFail ) {
+    bool Module::addCommentReader ( CommentReader * ptr, bool canFail ) {
         if ( commentReader ) {
             if ( !canFail ) {
                 DAS_FATAL_ERROR("can't add 2nd comment reader to module %s\n", name.c_str() );
             }
             return false;
         }
-        commentReader = ptr;
+        commentReader.reset(ptr);
         return true;
     }
 
@@ -649,17 +656,18 @@ namespace das {
     }
 
     AnnotationPtr Module::findAnnotation ( const string & na ) const {
-        return handleTypes.find(na);
+        auto it = handleTypes.find(hash64z(na.c_str()));
+        return it != handleTypes.end() ? it->second : nullptr;
     }
 
-    ReaderMacroPtr Module::findReaderMacro ( const string & na ) const {
+    ReaderMacro * Module::findReaderMacro ( const string & na ) const {
         auto it = readMacros.find(na);
-        return it != readMacros.end() ? it->second : nullptr;
+        return it != readMacros.end() ? it->second.get() : nullptr;
     }
 
-    TypeInfoMacroPtr Module::findTypeInfoMacro ( const string & na ) const {
+    TypeInfoMacro * Module::findTypeInfoMacro ( const string & na ) const {
         auto it = typeInfoMacros.find(na);
-        return it != typeInfoMacros.end() ? it->second : nullptr;
+        return it != typeInfoMacros.end() ? it->second.get() : nullptr;
     }
 
     EnumerationPtr Module::findEnumByMangledNameHash ( uint64_t hash ) const {
@@ -716,26 +724,27 @@ namespace das {
         auto ptm = program->thisModule.get();
         if ( ptm->macroContext ) {
             swap ( target->macroContext, ptm->macroContext );
-            ptm->handleTypes.foreach([&](auto fna){
+            for ( auto & [key, fna] : ptm->handleTypes ) {
                 target->addAnnotation(fna);
-            });
+            }
         }
-        target->simulateMacros.insert(target->simulateMacros.end(), ptm->simulateMacros.begin(), ptm->simulateMacros.end());
-        target->captureMacros.insert(target->captureMacros.end(), ptm->captureMacros.begin(), ptm->captureMacros.end());
-        target->forLoopMacros.insert(target->forLoopMacros.end(), ptm->forLoopMacros.begin(), ptm->forLoopMacros.end());
-        target->variantMacros.insert(target->variantMacros.end(), ptm->variantMacros.begin(), ptm->variantMacros.end());
-        target->macros.insert(target->macros.end(), ptm->macros.begin(), ptm->macros.end());
-        target->inferMacros.insert(target->inferMacros.end(), ptm->inferMacros.begin(), ptm->inferMacros.end());
-        target->optimizationMacros.insert(target->optimizationMacros.end(), ptm->optimizationMacros.begin(), ptm->optimizationMacros.end());
-        target->lintMacros.insert(target->lintMacros.end(), ptm->lintMacros.begin(), ptm->lintMacros.end());
-        target->globalLintMacros.insert(target->globalLintMacros.end(), ptm->globalLintMacros.begin(), ptm->globalLintMacros.end());
+        for (auto & m : ptm->simulateMacros) target->simulateMacros.push_back(std::move(m));
+        for (auto & m : ptm->captureMacros) target->captureMacros.push_back(std::move(m));
+        for (auto & m : ptm->forLoopMacros) target->forLoopMacros.push_back(std::move(m));
+        for (auto & m : ptm->variantMacros) target->variantMacros.push_back(std::move(m));
+        for (auto & m : ptm->macros) target->macros.push_back(std::move(m));
+        for (auto & m : ptm->inferMacros) target->inferMacros.push_back(std::move(m));
+        for (auto & m : ptm->optimizationMacros) target->optimizationMacros.push_back(std::move(m));
+        for (auto & m : ptm->lintMacros) target->lintMacros.push_back(std::move(m));
+        for (auto & m : ptm->globalLintMacros) target->globalLintMacros.push_back(std::move(m));
         for ( auto & rm : ptm->readMacros ) {
-            target->addReaderMacro(rm.second);
+            rm.second->seal(target);
+            target->readMacros[rm.first] = std::move(rm.second);
         }
         for ( auto & tm : ptm->typeMacros ) {
-            target->addTypeMacro(tm.second);
+            target->typeMacros[tm.first] = std::move(tm.second);
         }
-        target->commentReader = ptm->commentReader;
+        target->commentReader = std::move(ptm->commentReader);
         for ( auto & op : ptm->options) {
             DAS_ASSERTF(target->options.find(op.first)==target->options.end(),"duplicate option %s", op.first.c_str());
             target->options[op.first] = op.second;
@@ -796,12 +805,12 @@ namespace das {
             });
         }
         if ( flags & VerifyBuiltinFlags::verifyHandleTypes ) {
-            handleTypes.foreach([&](auto annPtr){
+            for ( auto & [key, annPtr] : handleTypes ) {
                 if ( !isValidBuiltinName(annPtr->name) ) {
                     DAS_FATAL_LOG("%s - annotation has incorrect name. expecting snake_case\n", annPtr->name.c_str());
                     failed = true;
                 }
-            });
+            }
         }
         if ( flags & VerifyBuiltinFlags::verifyGlobals ) {
             globals.foreach([&](auto var){
@@ -997,8 +1006,8 @@ namespace das {
         return ptr;
     }
 
-    vector<TypeInfoMacroPtr> ModuleLibrary::findTypeInfoMacro ( const string & name, Module * inWhichModule ) const {
-        vector<TypeInfoMacroPtr> ptr;
+    vector<TypeInfoMacro*> ModuleLibrary::findTypeInfoMacro ( const string & name, Module * inWhichModule ) const {
+        vector<TypeInfoMacro*> ptr;
         string moduleName, annName;
         splitTypeName(name, moduleName, annName);
         if ( moduleName!="_" && moduleName!="__") {
@@ -1127,7 +1136,7 @@ namespace das {
             }
 #endif
             if ( handles.back()->rtti_isHandledTypeAnnotation() ) {
-                t->annotation = static_cast<TypeAnnotation*>(handles.back().get());
+                t->annotation = static_cast<TypeAnnotation*>(handles.back());
             } else {
                 DAS_FATAL_ERROR("makeHandleType(%s) failed, not a handle type\n", name.c_str());
                 return nullptr;

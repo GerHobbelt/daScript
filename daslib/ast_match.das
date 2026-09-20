@@ -372,7 +372,11 @@ def qm_convert_local_function(var expr : Expression?) : Expression? {
     if (ea.func == null || !ea.func.flags.generated) {
         return null
     }
-    if (find(string(ea.func.name), "`function") < 0) {
+    var found_function = false
+    peek(ea.func.name) $(fn) {
+        found_function = find(fn, "`function") >= 0
+    }
+    if (!found_function) {
         return null
     }
     let fn = ea.func
@@ -1637,7 +1641,7 @@ def private generate_match(pattern : Expression?; actual_var : string; var body 
         let inner_ann_name = bt == Type.tPointer && xtype.firstType != null && xtype.firstType.annotation != null ? string(xtype.firstType.annotation.name) : ""
         if (inner_ann_name == "TypeDecl" || inner_ann_name == "Expression") {
             if (inner_ann_name == "TypeDecl") {
-                // smart_ptr<TypeDecl> field — use generate_type_match
+                // TypeDecl? field — use generate_type_match
                 let pv = unsafe(reinterpret<TypeDeclPtr?> p8)
                 if (*pv != null) {
                     let child_td = *pv

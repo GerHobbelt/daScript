@@ -5,6 +5,25 @@
 
 namespace das {
 
+    // ---- annotation ----
+
+    void Annotation::gc_collect ( gc_root * target, gc_root * from ) {
+        if ( gc_owner == target ) return;
+        if ( from && gc_owner != from ) return;
+        if ( !from && gc_owner == nullptr ) return;
+        gc_assign(target);
+    }
+
+    // ---- annotation declaration ----
+
+    void AnnotationDeclaration::gc_collect ( gc_root * target, gc_root * from ) {
+        if ( gc_owner == target ) return;
+        if ( from && gc_owner != from ) return;
+        if ( !from && gc_owner == nullptr ) return;
+        gc_assign(target);
+        if ( annotation ) annotation->gc_collect(target, from);
+    }
+
     // ---- base classes ----
 
     void Expression::gc_collect ( gc_root * target, gc_root * from ) {
@@ -23,6 +42,7 @@ namespace das {
         if ( type ) type->gc_collect(target, from);
         if ( init ) init->gc_collect(target, from);
         if ( source ) source->gc_collect(target, from);
+        // note: loop_source is a weak pointer to ExprFor::sources[i], not owned
     }
 
     void Enumeration::gc_collect ( gc_root * target, gc_root * from ) {
@@ -33,6 +53,7 @@ namespace das {
         for ( auto & val : list ) {
             if ( val.value ) val.value->gc_collect(target, from);
         }
+        for ( auto & ann : annotations ) if ( ann ) ann->gc_collect(target, from);
     }
 
     void Structure::gc_collect ( gc_root * target, gc_root * from ) {
@@ -48,6 +69,7 @@ namespace das {
             if ( td ) td->gc_collect(target, from);
         });
         if ( parent ) parent->gc_collect(target, from);
+        for ( auto & ann : annotations ) if ( ann ) ann->gc_collect(target, from);
     }
 
     void Function::gc_collect ( gc_root * target, gc_root * from ) {
@@ -58,6 +80,7 @@ namespace das {
         if ( result ) result->gc_collect(target, from);
         for ( auto & arg : arguments ) if ( arg ) arg->gc_collect(target, from);
         if ( body ) body->gc_collect(target, from);
+        for ( auto & ann : annotations ) if ( ann ) ann->gc_collect(target, from);
     }
 
     // ---- leaf expressions (no extra fields beyond Expression) ----
@@ -210,6 +233,7 @@ namespace das {
     void ExprField::gc_collect ( gc_root * target, gc_root * from ) {
         Expression::gc_collect(target, from);
         if ( value ) value->gc_collect(target, from);
+        if ( annotation ) annotation->gc_collect(target, from);
     }
 
     // ExprIsVariant : ExprField
@@ -430,6 +454,7 @@ namespace das {
         for ( auto & e : finalList ) if ( e ) e->gc_collect(target, from);
         if ( returnType ) returnType->gc_collect(target, from);
         for ( auto & arg : arguments ) if ( arg ) arg->gc_collect(target, from);
+        for ( auto & ann : annotations ) if ( ann ) ann->gc_collect(target, from);
     }
 
     // ---- ExprStringBuilder ----

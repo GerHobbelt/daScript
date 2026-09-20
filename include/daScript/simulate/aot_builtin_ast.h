@@ -67,24 +67,24 @@ namespace das {
     DAS_API TypeDeclPtr makeBlockType(ExprBlock *blk);
     // Note: it will be removed once DebugInfoHelper rewritten in das
 
-    DAS_API TypeInfo * makeTypeInfo ( smart_ptr<DebugInfoHelper> helper, TypeInfo * info, const TypeDeclPtr & type );
-    DAS_API VarInfo * makeVariableDebugInfo ( smart_ptr<DebugInfoHelper> helper, Variable *var );
-    DAS_API VarInfo * makeStructVariableDebugInfo ( smart_ptr<DebugInfoHelper> helper, const Structure * st, const Structure::FieldDeclaration * var );
-    DAS_API StructInfo * makeStructureDebugInfo ( smart_ptr<DebugInfoHelper> helper, const Structure * st );
-    DAS_API FuncInfo * makeFunctionDebugInfo ( smart_ptr<DebugInfoHelper> helper, const Function * fn );
-    DAS_API EnumInfo * makeEnumDebugInfo ( smart_ptr<DebugInfoHelper> helper, const Enumeration * en );
-    DAS_API FuncInfo * makeInvokeableTypeDebugInfo ( smart_ptr<DebugInfoHelper> helper, TypeDeclPtr blk, const LineInfo & at );
+    DAS_API TypeInfo * makeTypeInfo ( DebugInfoHelper * helper, TypeInfo * info, const TypeDeclPtr & type );
+    DAS_API VarInfo * makeVariableDebugInfo ( DebugInfoHelper * helper, Variable *var );
+    DAS_API VarInfo * makeStructVariableDebugInfo ( DebugInfoHelper * helper, const Structure * st, const Structure::FieldDeclaration * var );
+    DAS_API StructInfo * makeStructureDebugInfo ( DebugInfoHelper * helper, const Structure * st );
+    DAS_API FuncInfo * makeFunctionDebugInfo ( DebugInfoHelper * helper, const Function * fn );
+    DAS_API EnumInfo * makeEnumDebugInfo ( DebugInfoHelper * helper, const Enumeration * en );
+    DAS_API FuncInfo * makeInvokeableTypeDebugInfo ( DebugInfoHelper * helper, TypeDeclPtr blk, const LineInfo & at );
 
     template <typename T>
     using DebugBlockT = TBlock<void,const char *, T>;
 
-    DAS_API void debug_helper_iter_structs(smart_ptr<DebugInfoHelper> helper, const DebugBlockT<StructInfo*> & block, Context * context, LineInfoArg * at);
-    DAS_API void debug_helper_iter_types(smart_ptr<DebugInfoHelper> helper, const DebugBlockT<TypeInfo*> & block, Context * context, LineInfoArg * at);
-    DAS_API void debug_helper_iter_vars(smart_ptr<DebugInfoHelper> helper, const DebugBlockT<VarInfo*> & block, Context * context, LineInfoArg * at);
-    DAS_API void debug_helper_iter_funcs(smart_ptr<DebugInfoHelper> helper, const DebugBlockT<FuncInfo*> & block, Context * context, LineInfoArg * at);
-    DAS_API void debug_helper_iter_enums(smart_ptr<DebugInfoHelper> helper, const DebugBlockT<EnumInfo*> & block, Context * context, LineInfoArg * at);
-    DAS_API const char *debug_helper_find_type_cppname(const smart_ptr<DebugInfoHelper> &helper, TypeInfo *info, Context * context, LineInfoArg * at);
-    DAS_API const char *debug_helper_find_struct_cppname(const smart_ptr<DebugInfoHelper> &helper, StructInfo *info, Context * context, LineInfoArg * at);
+    DAS_API void debug_helper_iter_structs(DebugInfoHelper * helper, const DebugBlockT<StructInfo*> & block, Context * context, LineInfoArg * at);
+    DAS_API void debug_helper_iter_types(DebugInfoHelper * helper, const DebugBlockT<TypeInfo*> & block, Context * context, LineInfoArg * at);
+    DAS_API void debug_helper_iter_vars(DebugInfoHelper * helper, const DebugBlockT<VarInfo*> & block, Context * context, LineInfoArg * at);
+    DAS_API void debug_helper_iter_funcs(DebugInfoHelper * helper, const DebugBlockT<FuncInfo*> & block, Context * context, LineInfoArg * at);
+    DAS_API void debug_helper_iter_enums(DebugInfoHelper * helper, const DebugBlockT<EnumInfo*> & block, Context * context, LineInfoArg * at);
+    DAS_API const char *debug_helper_find_type_cppname(DebugInfoHelper * helper, TypeInfo *info, Context * context, LineInfoArg * at);
+    DAS_API const char *debug_helper_find_struct_cppname(DebugInfoHelper * helper, StructInfo *info, Context * context, LineInfoArg * at);
     DAS_API bool macro_aot_infix(TypeInfoMacro *macro, StringBuilderWriter *ss, ExpressionPtr expr);
     DAS_API FileInfo *clone_file_info(const char *name, int tabSize, Context * context, LineInfoArg * at);
     DAS_API void for_each_module_function(Module *module, const TBlock<void,FunctionPtr> &blk, Context * context, LineInfoArg * at);
@@ -443,32 +443,33 @@ namespace das {
     DAS_API DebugAgentPtr makeDebugAgent ( const void * pClass, const StructInfo * info, Context * context );
     DAS_API Module * thisModule ( Context * context, LineInfoArg * lineinfo );
     DAS_API smart_ptr_raw<Program> thisProgram ( Context * context );
-    DAS_API void astVisit ( smart_ptr_raw<Program> program, smart_ptr_raw<VisitorAdapter> adapter, Context * context, LineInfoArg * line_info );
-    DAS_API void astVisitGenerics ( smart_ptr_raw<Program> program, smart_ptr_raw<VisitorAdapter> adapter, Context * context, LineInfoArg * line_info );
-    DAS_API void astVisitModule ( smart_ptr_raw<Program> program, smart_ptr_raw<VisitorAdapter> adapter,
+    DAS_API void astVisit ( smart_ptr_raw<Program> program, VisitorAdapter * adapter, Context * context, LineInfoArg * line_info );
+    DAS_API void astVisitGenerics ( smart_ptr_raw<Program> program, VisitorAdapter * adapter, Context * context, LineInfoArg * line_info );
+    DAS_API void astVisitModule ( smart_ptr_raw<Program> program, VisitorAdapter * adapter,
                       Module* module, Context * context, LineInfoArg * line_info );
-    DAS_API void astVisitModulesInOrder ( smart_ptr_raw<Program> program, smart_ptr_raw<VisitorAdapter> adapter, Context * context, LineInfoArg * line_info );
-    DAS_API void astVisitFunction ( Function * func, smart_ptr_raw<VisitorAdapter> adapter, Context * context, LineInfoArg * line_info);
-    DAS_API Expression * astVisitExpression ( Expression * expr, smart_ptr_raw<VisitorAdapter> adapter, Context * context, LineInfoArg * line_info);
-    DAS_API TypeDecl * astVisitTypeDecl ( TypeDecl * type, smart_ptr_raw<VisitorAdapter> adapter, Context * context, LineInfoArg * line_info);
-    DAS_API void astVisitBlockFinally ( ExprBlock * expr, smart_ptr_raw<VisitorAdapter> adapter, Context * context, LineInfoArg * line_info );
+    DAS_API void astVisitModulesInOrder ( smart_ptr_raw<Program> program, VisitorAdapter * adapter, Context * context, LineInfoArg * line_info );
+    DAS_API void astVisitFunction ( Function * func, VisitorAdapter * adapter, Context * context, LineInfoArg * line_info);
+    DAS_API Expression * astVisitExpression ( Expression * expr, VisitorAdapter * adapter, Context * context, LineInfoArg * line_info);
+    DAS_API TypeDecl * astVisitTypeDecl ( TypeDecl * type, VisitorAdapter * adapter, Context * context, LineInfoArg * line_info);
+    DAS_API void astVisitBlockFinally ( ExprBlock * expr, VisitorAdapter * adapter, Context * context, LineInfoArg * line_info );
     DAS_API PassMacroPtr makePassMacro ( const char * name, const void * pClass, const StructInfo * info, Context * context );
-    DAS_API smart_ptr<VisitorAdapter> makeVisitor ( const void * pClass, const StructInfo * info, Context * context );
-    DAS_API void addModuleInferMacro ( Module * module, PassMacroPtr & _newM, Context * );
-    DAS_API void addModuleInferDirtyMacro ( Module * module, PassMacroPtr & newM, Context * context );
-    DAS_API void addModuleLintMacro ( Module * module, PassMacroPtr & _newM, Context * );
-    DAS_API void addModuleGlobalLintMacro ( Module * module, PassMacroPtr & _newM, Context * );
-    DAS_API void addModuleOptimizationMacro ( Module * module, PassMacroPtr & _newM, Context * );
+    DAS_API void makeVisitor ( const void * pClass, const StructInfo * info,
+            const TBlock<void,VisitorAdapter*> & blk, Context * context, LineInfoArg * at );
+    DAS_API void addModuleInferMacro ( Module * module, PassMacroPtr _newM, Context * );
+    DAS_API void addModuleInferDirtyMacro ( Module * module, PassMacroPtr newM, Context * context );
+    DAS_API void addModuleLintMacro ( Module * module, PassMacroPtr _newM, Context * );
+    DAS_API void addModuleGlobalLintMacro ( Module * module, PassMacroPtr _newM, Context * );
+    DAS_API void addModuleOptimizationMacro ( Module * module, PassMacroPtr _newM, Context * );
     DAS_API VariantMacroPtr makeVariantMacro ( const char * name, const void * pClass, const StructInfo * info, Context * context );
-    DAS_API void addModuleVariantMacro ( Module * module, VariantMacroPtr & newM, Context * context );
+    DAS_API void addModuleVariantMacro ( Module * module, VariantMacroPtr newM, Context * context );
     DAS_API ForLoopMacroPtr makeForLoopMacro ( const char * name, const void * pClass, const StructInfo * info, Context * context );
-    DAS_API void addModuleForLoopMacro ( Module * module, ForLoopMacroPtr & _newM, Context * );
+    DAS_API void addModuleForLoopMacro ( Module * module, ForLoopMacroPtr _newM, Context * );
     DAS_API CaptureMacroPtr makeCaptureMacro ( const char * name, const void * pClass, const StructInfo * info, Context * context );
-    DAS_API void addModuleCaptureMacro ( Module * module, CaptureMacroPtr & _newM, Context * );
+    DAS_API void addModuleCaptureMacro ( Module * module, CaptureMacroPtr _newM, Context * );
     DAS_API TypeMacroPtr makeTypeMacro ( const char * name, const void * pClass, const StructInfo * info, Context * context );
-    DAS_API void addModuleTypeMacro ( Module * module, TypeMacroPtr & _newM, Context *, LineInfoArg * );
+    DAS_API void addModuleTypeMacro ( Module * module, TypeMacroPtr _newM, Context *, LineInfoArg * );
     DAS_API SimulateMacroPtr makeSimulateMacro ( const char * name, const void * pClass, const StructInfo * info, Context * context );
-    DAS_API void addModuleSimulateMacro ( Module * module, SimulateMacroPtr & _newM, Context * );
+    DAS_API void addModuleSimulateMacro ( Module * module, SimulateMacroPtr _newM, Context * );
     DAS_API void addModuleFunctionAnnotation ( Module * module, FunctionAnnotationPtr & ann, Context * context, LineInfoArg * at );
     DAS_API FunctionAnnotationPtr makeFunctionAnnotation ( const char * name, void * pClass, const StructInfo * info, Context * context );
     DAS_API StructureAnnotationPtr makeStructureAnnotation ( const char * name, void * pClass, const StructInfo * info, Context * context );
@@ -491,21 +492,21 @@ namespace das {
     DAS_API void ast_error ( ProgramPtr prog, const LineInfo & at, const char * message, Context * context, LineInfoArg * lineInfo );
     DAS_API void ast_performance_warning ( ProgramPtr prog, const LineInfo & at, const char * message, Context * context, LineInfoArg * lineInfo );
     DAS_API void ast_style_warning ( ProgramPtr prog, const LineInfo & at, const char * message, Context * context, LineInfoArg * lineInfo );
-    DAS_API void addModuleReaderMacro ( Module * module, ReaderMacroPtr & newM, Context * context, LineInfoArg * lineInfo );
+    DAS_API void addModuleReaderMacro ( Module * module, ReaderMacroPtr newM, Context * context, LineInfoArg * lineInfo );
     DAS_API ReaderMacroPtr makeReaderMacro ( const char * name, const void * pClass, const StructInfo * info, Context * context );
     DAS_API CommentReaderPtr makeCommentReader ( const void * pClass, const StructInfo * info, Context * context );
-    DAS_API void addModuleCommentReader ( Module * module, CommentReaderPtr & _newM, Context * context, LineInfoArg * lineInfo );
-    DAS_API void addModuleCallMacro ( Module * module, CallMacroPtr & newM, Context * context, LineInfoArg * lineInfo );
+    DAS_API void addModuleCommentReader ( Module * module, CommentReaderPtr _newM, Context * context, LineInfoArg * lineInfo );
+    DAS_API void addModuleCallMacro ( Module * module, CallMacroPtr newM, Context * context, LineInfoArg * lineInfo );
     DAS_API CallMacroPtr makeCallMacro ( const char * name, const void * pClass, const StructInfo * info, Context * context );
     DAS_API TypeInfoMacroPtr makeTypeInfoMacro ( const char * name, const void * pClass, const StructInfo * info, Context * context );
-    DAS_API void addModuleTypeInfoMacro ( Module * module, TypeInfoMacroPtr & _newM, Context * context, LineInfoArg * at );
+    DAS_API void addModuleTypeInfoMacro ( Module * module, TypeInfoMacroPtr _newM, Context * context, LineInfoArg * at );
     DAS_API void addFunctionFunctionAnnotation(Function * func, FunctionAnnotationPtr & ann, Context* context, LineInfoArg* at);
-    DAS_API void addAndApplyFunctionAnnotation ( Function * func, smart_ptr_raw<AnnotationDeclaration> & ann, Context * context, LineInfoArg * at );
+    DAS_API void addAndApplyFunctionAnnotation ( Function * func, AnnotationDeclarationPtr & ann, Context * context, LineInfoArg * at );
     DAS_API void addBlockBlockAnnotation ( ExprBlock * block, FunctionAnnotationPtr & _ann, Context * context, LineInfoArg * at );
-    DAS_API void addAndApplyBlockAnnotation ( ExprBlock * blk, smart_ptr_raw<AnnotationDeclaration> & ann, Context * context, LineInfoArg * at );
-    DAS_API void addAndApplyStructAnnotation ( Structure * st, smart_ptr_raw<AnnotationDeclaration> & ann, Context * context, LineInfoArg * at );
-    DAS_API void visitEnumeration ( ProgramPtr program, Enumeration * enumeration, smart_ptr_raw<VisitorAdapter> adapter, Context * context, LineInfoArg * line_info );
-    DAS_API void visitStructure ( ProgramPtr program, Structure * structure, smart_ptr_raw<VisitorAdapter> adapter, Context * context, LineInfoArg * line_info );
+    DAS_API void addAndApplyBlockAnnotation ( ExprBlock * blk, AnnotationDeclarationPtr & ann, Context * context, LineInfoArg * at );
+    DAS_API void addAndApplyStructAnnotation ( Structure * st, AnnotationDeclarationPtr & ann, Context * context, LineInfoArg * at );
+    DAS_API void visitEnumeration ( ProgramPtr program, Enumeration * enumeration, VisitorAdapter * adapter, Context * context, LineInfoArg * line_info );
+    DAS_API void visitStructure ( ProgramPtr program, Structure * structure, VisitorAdapter * adapter, Context * context, LineInfoArg * line_info );
     __forceinline ExpressionPtr clone_expression ( ExpressionPtr value ) { return value ?value->clone() : nullptr; }
     __forceinline FunctionPtr clone_function ( FunctionPtr value ) { return value ? value->clone() : nullptr; }
     __forceinline TypeDeclPtr clone_type ( TypeDeclPtr value ) { return value ? new TypeDecl(*value) : nullptr; }
@@ -529,7 +530,7 @@ namespace das {
     DAS_API bool builtin_hasField ( TypeDeclPtr ptr, const char * field, bool constant );
     DAS_API TypeDeclPtr builtin_fieldType ( TypeDeclPtr ptr, const char * field, bool constant );
     DAS_API Module * findRttiModule ( smart_ptr<Program> THAT_PROGRAM, const char * name, Context *, LineInfoArg *);
-    DAS_API smart_ptr_raw<Annotation> module_find_annotation ( const Module* module, const char *name );
+    DAS_API AnnotationPtr module_find_annotation ( const Module* module, const char *name );
     DAS_API TypeAnnotation* module_find_type_annotation ( const Module* module, const char *name );
     DAS_API Function * findRttiFunction ( Module * mod, Func func, Context * context, LineInfoArg * line_info );
     DAS_API void ast_gc_guard ( const TBlock<void> & block, Context * context, LineInfoArg * at );
@@ -561,11 +562,11 @@ namespace das {
                                             const TBlock<void,char *,char*,TypeDecl *,uint32_t> & block, Context * context, LineInfoArg * at );
     DAS_API void addModuleOption ( Module * mod, char * option, Type type, Context * context, LineInfoArg * at );
     DAS_API TypeDeclPtr getUnderlyingValueType ( TypeDecl * type, Context * context, LineInfoArg * at );
-    DAS_API uint32_t getHandledTypeFieldOffset ( smart_ptr_raw<TypeAnnotation> type, char * name, Context * context, LineInfoArg * at );
+    DAS_API uint32_t getHandledTypeFieldOffset ( TypeAnnotationPtr type, char * name, Context * context, LineInfoArg * at );
     DAS_API void builtin_structure_for_each_field ( const BasicStructureAnnotation & ann,
                                         const TBlock<void,char *,char*,TypeDecl *,uint32_t> & block, Context * context, LineInfoArg * at );
-    DAS_API TypeInfo * getHandledTypeFieldType ( smart_ptr_raw<TypeAnnotation> annotation, char * name, Context * context, LineInfoArg * at );
-    DAS_API TypeDeclPtr getHandledTypeFieldTypeDecl ( smart_ptr_raw<TypeAnnotation> annotation, char * name, bool isConst, Context * context, LineInfoArg * at );
+    DAS_API TypeInfo * getHandledTypeFieldType ( TypeAnnotationPtr annotation, char * name, Context * context, LineInfoArg * at );
+    DAS_API TypeDeclPtr getHandledTypeFieldTypeDecl ( TypeAnnotationPtr annotation, char * name, bool isConst, Context * context, LineInfoArg * at );
     DAS_API TypeDeclPtr getHandledTypeIndexTypeDecl ( TypeAnnotation *annotation, Expression *src, Expression *idx, Context * context, LineInfoArg * at );
     DAS_API void* getVectorPtrAtIndex(void* vec, TypeDecl *type, int idx, Context * context, LineInfoArg * at);
     DAS_API int32_t getVectorLength(void* vec, TypeDecl * type, Context * context, LineInfoArg * at);
@@ -584,6 +585,8 @@ namespace das {
     DAS_API void for_each_structure_alias ( Structure * structure, const TBlock<void,TypeDecl *> & block, Context * context, LineInfoArg * at );
     DAS_API TypeDeclPtr get_structure_alias ( Structure * structure, const char * aliasName, Context * context, LineInfoArg * at );
     DAS_API Function * findCompilingFunctionByMangledNameHash(char * module_name, uint64_t mnh, Context * context, LineInfoArg * at);
+    DAS_API bool isCppKeyword ( const char * str );
+    DAS_API bool isDasKeyword ( const char * str );
 
     template <>
     struct das_iterator <AnnotationArgumentList> : das_iterator<vector<AnnotationArgument>> {

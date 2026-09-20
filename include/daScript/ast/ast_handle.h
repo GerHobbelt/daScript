@@ -2,6 +2,7 @@
 
 #include "daScript/ast/ast.h"
 #include "daScript/ast/ast_interop.h"
+#include "daScript/ast/ast_simulate.h"
 #include "daScript/simulate/interop.h"
 #include "daScript/simulate/aot.h"
 #include "daScript/simulate/simulate_nodes.h"
@@ -104,9 +105,16 @@ namespace das
         virtual bool canSubstitute(TypeAnnotation * ann) const override;
         virtual bool hasStringData(das_set<void *> & dep) const override;
         virtual void gc_collect ( gc_root * target, gc_root * from ) override {
+            Annotation::gc_collect(target, from);
             for ( auto & fp : fields ) {
                 if ( fp.second.decl ) fp.second.decl->gc_collect(target, from);
                 if ( fp.second.constDecl ) fp.second.constDecl->gc_collect(target, from);
+            }
+        }
+        virtual void visitTypeDecls ( const function<void(TypeDecl *)> & callback ) override {
+            for ( auto & fp : fields ) {
+                if ( fp.second.decl ) callback(fp.second.decl);
+                if ( fp.second.constDecl ) callback(fp.second.constDecl);
             }
         }
         StructureField & addFieldEx(const string & na, const string & cppNa, off_t offset, const TypeDeclPtr & pT);
@@ -464,29 +472,29 @@ namespace das
         virtual SimNode * simulateGetAt ( Context & context, const LineInfo & at, const TypeDeclPtr &,
                                          ExpressionPtr rv, ExpressionPtr idx, uint32_t ofs ) const override {
             return context.code->makeNode<SimNode_AtStdVector>(at,
-                                                               rv->simulate(context),
-                                                               idx->simulate(context),
+                                                               simulateExpression(context, rv),
+                                                               simulateExpression(context, idx),
                                                                ofs);
         }
         virtual SimNode * simulateGetAtR2V ( Context & context, const LineInfo & at, const TypeDeclPtr & type,
                                             ExpressionPtr rv, ExpressionPtr idx, uint32_t ofs ) const override {
             if ( type->isHandle() ) {
                 auto expr = context.code->makeNode<SimNode_AtStdVector>(at,
-                                                                rv->simulate(context),
-                                                                idx->simulate(context),
+                                                                simulateExpression(context, rv),
+                                                                simulateExpression(context, idx),
                                                                 ofs);
-                return ExprRef2Value::GetR2V(context, at, type, expr);
+                return GetR2V(context, at, type, expr);
             } else {
                 return context.code->makeValueNode<SimNode_AtStdVectorR2V>(type->baseType,
                                                                 at,
-                                                                rv->simulate(context),
-                                                                idx->simulate(context),
+                                                                simulateExpression(context, rv),
+                                                                simulateExpression(context, idx),
                                                                 ofs);
             }
         }
 
         virtual SimNode * simulateGetIterator ( Context & context, const LineInfo & at, ExpressionPtr src ) const override {
-            auto rv = src->simulate(context);
+            auto rv = simulateExpression(context, src);
             return context.code->makeNode<SimNode_AnyIterator<VectorType,StdVectorIterator<VectorType>>>(at, rv);
         }
         virtual void walk ( DataWalker & walker, void * vec ) override {
@@ -513,7 +521,11 @@ namespace das
             return hb.getHash();
         }
         virtual void gc_collect ( gc_root * target, gc_root * from ) override {
+            Annotation::gc_collect(target, from);
             if ( vecType ) vecType->gc_collect(target, from);
+        }
+        virtual void visitTypeDecls ( const function<void(TypeDecl *)> & callback ) override {
+            if ( vecType ) callback(vecType);
         }
         TypeDeclPtr                vecType = nullptr;
         DebugInfoHelper            helpA;
@@ -724,7 +736,7 @@ namespace das
             string declN = typeName<VT>::name();
             if ( library.findAnnotation(declN,nullptr).size()==0 ) {
                 auto declT = makeType<TT>(library);
-                auto ann = make_smart<ManagedVectorAnnotation<VT>>(declN,const_cast<ModuleLibrary &>(library));
+                auto ann = new ManagedVectorAnnotation<VT>(declN,const_cast<ModuleLibrary &>(library));
                 ann->cppName = "das::vector<" + describeCppType(declT, CpptSubstitureRef::no,
                                                                 CpptSkipRef::no, CpptSkipConst::no,
                                                                 CpptRedundantConst::yes, ChooseSmartPtr::yes) + ">";
@@ -751,7 +763,7 @@ namespace das
 
     template <typename TT>
     __forceinline void addVectorAnnotation(Module * mod, ModuleLibrary & lib, const string & name ) {
-        return addVectorAnnotation<TT>(mod,lib,make_smart<ManagedVectorAnnotation<TT>>(name,lib));
+        return addVectorAnnotation<TT>(mod,lib,new ManagedVectorAnnotation<TT>(name,lib));
     }
 
     template <typename OT>
@@ -801,7 +813,11 @@ namespace das
             return hb.getHash();
         }
         virtual void gc_collect ( gc_root * target, gc_root * from ) override {
+            Annotation::gc_collect(target, from);
             if ( valueType ) valueType->gc_collect(target, from);
+        }
+        virtual void visitTypeDecls ( const function<void(TypeDecl *)> & callback ) override {
+            if ( valueType ) callback(valueType);
         }
         TypeDeclPtr valueType = nullptr;
     };

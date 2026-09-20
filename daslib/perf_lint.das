@@ -24,6 +24,7 @@ module perf_lint shared private
 //!   PERF009 — redundant move-init variable immediately returned
 //!   PERF010 — unnecessary get_ptr() for null comparison
 //!   PERF011 — unnecessary get_ptr() for field access
+//!   PERF012 — string(das_string) passed to strings module function
 
 require daslib/ast_boost
 require strings
@@ -655,6 +656,15 @@ class PerfLintVisitor : AstVisitor {
                 }
             }
         }
+        // PERF012: string(das_string) passed to strings module function
+        if (expr.func._module.name == "strings" && expr.func.name != "string") {
+            for (arg in expr.arguments) {
+                if (self->is_string_of_das_string(arg)) {
+                    self->perf_warning("PERF012: string(das_string) passed to strings function; use peek(das_string) instead", expr.at)
+                    break
+                }
+            }
+        }
         return <- expr if (in_closure > 0)
         if (expr.func.name == "length" && expr.func._module.name == "strings") {
             if (in_length_while_call > 0) {
@@ -746,8 +756,9 @@ def public perf_lint(prog : ProgramPtr; compile_time_errors : bool) : int {
     //! Runs the performance lint visitor on the compiled program.
     //! Returns the number of warnings found.
     var astVisitor = new PerfLintVisitor(compile_time_errors = compile_time_errors)
-    var inscope astVisitorAdapter <- make_visitor(*astVisitor)
-    visit(prog, astVisitorAdapter)
+    make_visitor(*astVisitor) $(astVisitorAdapter) {
+        visit(prog, astVisitorAdapter)
+    }
     let count = astVisitor.warning_count
     unsafe { delete astVisitor; }
     return count
@@ -757,8 +768,9 @@ def public perf_lint_collect(prog : ProgramPtr; var warnings : array<string>) : 
     //! Runs the performance lint visitor and collects warnings as strings.
     //! Returns the number of warnings found.
     var astVisitor = new PerfLintVisitor(compile_time_errors = false, collect_warnings = true)
-    var inscope astVisitorAdapter <- make_visitor(*astVisitor)
-    visit(prog, astVisitorAdapter)
+    make_visitor(*astVisitor) $(astVisitorAdapter) {
+        visit(prog, astVisitorAdapter)
+    }
     let count = astVisitor.warning_count
     warnings |> reserve(length(astVisitor.warnings))
     for (w in astVisitor.warnings) {

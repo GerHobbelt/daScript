@@ -20,7 +20,7 @@ namespace das {
 #pragma clang diagnostic ignored "-Wunused-parameter"
 #endif
 
-    class Visitor : public ptr_ref_count {
+    class Visitor {
     protected:
         virtual ~Visitor() {}
     public:
@@ -42,6 +42,8 @@ namespace das {
         virtual bool canVisitCall ( ExprCall * expr ) { return true; }
         virtual bool canVisitNamedCall ( ExprNamedCall * /*expr*/ ) { return true; }
         virtual bool canVisitLooksLikeCall ( ExprLooksLikeCall * /*expr*/ ) { return true; }
+        virtual bool canVisitLabel ( ExprLabel * ) { return true; }
+        virtual bool canVisitReader ( ExprReader * ) { return true; }
         // WHOLE PROGRAM
         virtual void preVisitProgram ( Program * prog ) {}
         virtual void visitProgram ( Program * prog ) {}
@@ -104,10 +106,10 @@ namespace das {
         virtual ExpressionPtr visitGlobalLetInit ( const VariablePtr & var, Expression * that ) { return that; }
         virtual void visitGlobalLetBody ( Program * prog ) {}
         // STRING BUILDER
-        virtual void preVisit ( ExprStringBuilder * expr ) {}
+        virtual void preVisit ( ExprStringBuilder * expr ) { preVisitExpression(expr); }
         virtual void preVisitStringBuilderElement ( ExprStringBuilder * sb, Expression * expr, bool last ) {}
         virtual ExpressionPtr visitStringBuilderElement ( ExprStringBuilder * sb, Expression * expr, bool last ) { return expr; }
-        virtual ExpressionPtr visit ( ExprStringBuilder * expr ) { return expr; }
+        virtual ExpressionPtr visit ( ExprStringBuilder * expr ) { return visitExpression(expr); }
         // NEW
         virtual void preVisitNewArg ( ExprNew * call, Expression * arg, bool last ) {}
         virtual ExpressionPtr visitNewArg ( ExprNew * call, Expression * arg , bool last ) { return arg; }
@@ -341,8 +343,8 @@ namespace das {
             : PassVisitor(round), ctx(prog->getContextStackSize()), helper(ctx.debugInfo) {
             ctx.thisProgram = prog.get();
             ctx.thisHelper = &helper;
-            ctx.heap = make_smart<LinearHeapAllocator>();
-            ctx.stringHeap = make_smart<LinearStringAllocator>();
+            ctx.heap = make_unique<LinearHeapAllocator>();
+            ctx.stringHeap = make_unique<LinearStringAllocator>();
             ctx.category = uint32_t(ContextCategory::folding_context);
             helper.rtti = true;
         }
