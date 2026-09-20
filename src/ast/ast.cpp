@@ -13,7 +13,7 @@ namespace das {
             return ev->local || !(ev->argument || ev->block);
         } else if ( expr->rtti_isAt() ) {
             auto ea = static_cast<ExprAt*>(expr);
-            if ( ea->subexpr && ea->subexpr->type && ea->subexpr->type->dim.size() ) {
+            if ( ea->subexpr && ea->subexpr->type && ea->subexpr->type->baseType==Type::tFixedArray ) {
                 return isLocalOrGlobal(ea->subexpr);
             }
         } else if ( expr->rtti_isField() ) {
@@ -337,6 +337,26 @@ namespace das {
         if ( auto kv = module->genericsByName.find(hName) ) {
             for ( auto * fn : kv->second ) {
                 if ( matches(fn) ) return true;
+            }
+        }
+        return false;
+    }
+
+    // True if this class has a non-generated finalizer method. Class finalizers keep
+    // the plain name "finalize" (parser: ast_structVarDef), so the registry lookup is
+    // by that name with the classParent identity check filtering out other classes'
+    // finalizers and free-function struct finalizers.
+    bool Structure::hasUserFinalizer() const {
+        if ( !module ) return false;
+        uint64_t hName = hash64z("finalize");
+        if ( auto kv = module->functionsByName.find(hName) ) {
+            for ( auto * fn : kv->second ) {
+                if ( !fn->generated && fn->classParent == this ) return true;
+            }
+        }
+        if ( auto kv = module->genericsByName.find(hName) ) {
+            for ( auto * fn : kv->second ) {
+                if ( !fn->generated && fn->classParent == this ) return true;
             }
         }
         return false;
@@ -1381,9 +1401,9 @@ namespace das {
     }
 
     string TypeDecl::typeMacroName() const {
-        if ( dimExpr.size()<1 ) return "";
-        if ( dimExpr[0]->rtti_isStringConstant() ) {
-            return ((ExprConstString *)dimExpr[0])->text;
+        if ( typeMacroExpr.size()<1 ) return "";
+        if ( typeMacroExpr[0]->rtti_isStringConstant() ) {
+            return ((ExprConstString *)typeMacroExpr[0])->text;
         } else {
             return "";
         }

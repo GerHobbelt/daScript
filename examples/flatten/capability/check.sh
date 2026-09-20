@@ -73,6 +73,17 @@
 #  18. cap_ctor.shader (ctor lane algebra) -> the zero-lane product collapses to an embedded
 #      constant (its sin lane dies) and the per-component adds re-vectorize into one vector
 #      add feeding one sin: exactly 1 sin + 1 add node in the whole graph.
+#
+#  19. cap_dot.shader (horizontal adds) -> dot nodes. Each lane read is a full splat node, so
+#      `c.x+c.y+c.z` costs 5 nodes; the finishing pass folds it (and the weighted luma form)
+#      into ONE dot each, the lane weights riding as a free const mask: 2 dots, 0 splats.
+#
+#  20. cap_regroup.shader (a `1 - mask` feeding two outputs) -> one shared sub. Reassoc's
+#      canonical sum order splits the alpha copy apart; the regroup re-pairs it toward the
+#      albedo's grouped twin so CSE shares the node: exactly 1 sub in the graph.
+#
+#  21. cap_swizzle.shader (`float4(rgb, 1f).xyz` after inlining) -> the swizzle lane fold
+#      collapses the combine + extract + dead alpha const back to the float3: 0 combine nodes.
 
 set -u
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -356,6 +367,50 @@ if [[ "$errs" -eq 0 && "$sins" -eq 1 && "$adds" -eq 1 ]]; then
     echo "   ok — 1 sin + 1 add (zero-lane product folded; adds re-vectorized)"
 else
     echo "   FAIL — errors=$errs sins=$sins adds=$adds (expected 1 and 1)"
+    echo "$out" | grep -i error | head
+    fail=1
+fi
+
+echo "19. cap_dot.shader (horizontal adds -> dot nodes, no splat chains)"
+out="$(compile "$here/cap_dot.shader")"
+dots="$(echo "$out" | grep '^node ' | grep -cw 'dot_f3')"
+splats="$(echo "$out" | grep '^node ' | grep -c 'splat')"
+errs="$(echo "$out" | grep -ci error)"
+# `c.x+c.y+c.z` and the weighted luma spelling each fuse into ONE dot with a const mask;
+# un-fused each costs 3 splat nodes + 2 adds (lane reads are full graph nodes).
+if [[ "$errs" -eq 0 && "$dots" -eq 2 && "$splats" -eq 0 ]]; then
+    echo "   ok — 2 dot nodes, 0 splats (lane sums fused)"
+else
+    echo "   FAIL — errors=$errs dots=$dots splats=$splats (expected 2 and 0)"
+    echo "$out" | grep -i error | head
+    fail=1
+fi
+
+echo "20. cap_regroup.shader (alpha sum re-paired toward the albedo's '1 - mask' -> one sub)"
+out="$(compile "$here/cap_regroup.shader")"
+subs="$(echo "$out" | grep '^node ' | grep -cw 'sub')"
+errs="$(echo "$out" | grep -ci error)"
+# reassoc canonicalizes alpha to `(edge - mask) + 1` (a second sub); the regroup re-pairs it as
+# `(1 - mask) + edge` so CSE shares the albedo's sub node — exactly ONE sub in the graph.
+if [[ "$errs" -eq 0 && "$subs" -eq 1 ]]; then
+    echo "   ok — 1 shared sub node (the regrouped '1 - mask')"
+else
+    echo "   FAIL — errors=$errs subs=$subs (expected 1)"
+    echo "$out" | grep -i error | head
+    fail=1
+fi
+
+echo "21. cap_swizzle.shader (float4(rgb, 1f).xyz -> the float3 itself, combine + extract die)"
+out="$(compile "$here/cap_swizzle.shader")"
+combines="$(echo "$out" | grep '^node ' | grep -c 'combine')"
+dots="$(echo "$out" | grep '^node ' | grep -cw 'dot_f3')"
+errs="$(echo "$out" | grep -ci error)"
+# the inlined helper returns float4(baseColor * d, 1f); the caller's .xyz selects the whole
+# leading float3 arg, so the lane fold hands back `baseColor * d` — no combine survives
+if [[ "$errs" -eq 0 && "$combines" -eq 0 && "$dots" -eq 1 ]]; then
+    echo "   ok — 0 combine nodes (the swizzled ctor collapsed to its float3 arg)"
+else
+    echo "   FAIL — errors=$errs combines=$combines dots=$dots (expected 0 and 1)"
     echo "$out" | grep -i error | head
     fail=1
 fi

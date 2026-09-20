@@ -115,11 +115,77 @@ def test_flatten_fold(t : T?) {
     }
     t |> run("optimize corpus folds clean (test_flatten_opt.das twins)") @(t : T?) {
         let n = check_unit(t, "", "{root}/tests/flatten/test_flatten_opt.das")
-        t |> success(n >= 7, "expected >=7 twins, checked {n}")
+        t |> success(n >= 14, "expected >=14 twins, checked {n}")
+        // regroup-to-share FIRED proof: reassoc canonicalizes alpha to `(e - b) + 1f`, so a
+        // shared `_cse_` let only appears when the regroup re-paired `1f - b` for the CSE
+        var bodies <- twin_bodies(t, "{root}/tests/flatten/test_flatten_opt.das")
+        let rg = bodies?["r_oneminus_flat"] ?? ""
+        t |> success(rg |> find("_cse_") >= 0, "regrouped '1 - b' must CSE-share with the albedo use: {rg}")
+        let ra = bodies?["r_anyconst_flat"] ?? ""
+        t |> success(ra |> find("_cse_") >= 0, "regrouped '0.5 - b' must CSE-share: {ra}")
+        delete bodies
+    }
+    t |> run("dot corpus fuses clean (test_flatten_dot.das twins)") @(t : T?) {
+        let n = check_unit(t, "", "{root}/tests/flatten/test_flatten_dot.das")
+        t |> success(n >= 12, "expected >=12 twins, checked {n}")
+        // weighted + negated lanes in one chain land in the mask: dot(a, (2, 3, -4))
+        // the hadd must come back as a dot call (symmetric-oracle guard: fuser and residual
+        // share dot_chain_groups, so only a POSITIVE assert catches a matcher break blinding both)
+        var bodies <- twin_bodies(t, "{root}/tests/flatten/test_flatten_dot.das")
+        let h4 = bodies?["d_hadd4_flat"] ?? ""
+        t |> success(h4 |> find("dot(") >= 0, "v.x+v.y+v.z+v.w must fuse to dot: {h4}")
+        let lu = bodies?["d_luma_flat"] ?? ""
+        t |> success(lu |> find("dot(") >= 0, "weighted lanes must fuse to dot: {lu}")
+        let ne = bodies?["d_nested_flat"] ?? ""
+        t |> success(ne |> find("dot(") >= 0, "lane sum inside a call arg must fuse: {ne}")
+        let wn = bodies?["d_wneg_flat"] ?? ""
+        t |> success(wn |> find("float3(2f,3f,-4f)") >= 0, "weighted/negated lanes must land in the mask: {wn}")
+        delete bodies
+    }
+    t |> run("swizzle corpus folds clean (test_flatten_swizzle.das twins)") @(t : T?) {
+        let n = check_unit(t, "", "{root}/tests/flatten/test_flatten_swizzle.das")
+        t |> success(n >= 14, "expected >=14 twins, checked {n}")
+        // the FIRED proof (symmetric-oracle guard: fold arm and residual share
+        // swizzle_fold_classify, so only a POSITIVE assert catches a matcher break blinding both)
+        var bodies <- twin_bodies(t, "{root}/tests/flatten/test_flatten_swizzle.das")
+        let c3 = bodies?["s_ctor3_flat"] ?? ""
+        t |> success(c3 |> find("float4") < 0, "float4(v,1f).xyz must collapse to v: {c3}")
+        let nx = bodies?["s_nestedxz_flat"] ?? ""
+        t |> success(nx |> find("v.zx") >= 0, "float4(v.zyx,1f).xz must compose to v.zx: {nx}")
+        let dd = bodies?["s_dropdead_flat"] ?? ""
+        t |> success(dd |> find("sin") < 0 && dd |> find("float2(x,3f)") >= 0,
+            "dropped lanes' compute must die with the re-pack: {dd}")
+        // the cost-gate control: a partial base run must survive UN-folded (and un-flagged)
+        let pt = bodies?["s_partial_flat"] ?? ""
+        t |> success(pt |> find(".yz") >= 0, "a partial base run must stay put: {pt}")
+        delete bodies
     }
     t |> run("mad/lerp corpus fuses clean (test_flatten_mad.das twins)") @(t : T?) {
         let n = check_unit(t, "", "{root}/tests/flatten/test_flatten_mad.das")
         t |> success(n >= 20, "expected >=20 twins, checked {n}")
+        // default mode: a plain lerp survives as the call (no expansion), and organic
+        // (b-a)*t + a arithmetic still canonicalizes INTO the lerp node via the fuser
+        var bodies <- twin_bodies(t, "{root}/tests/flatten/test_flatten_mad.das")
+        let lr = bodies?["l_round_flat"] ?? ""
+        t |> success(lr |> find("lerp") >= 0, "plain lerp must survive whole by default: {lr}")
+        let lm = bodies?["l_manual_flat"] ?? ""
+        t |> success(lm |> find("lerp") >= 0, "organic (b-a)*t+a must still re-fuse to lerp: {lm}")
+        delete bodies
+    }
+    t |> run("expand-lerp corpus folds clean (test_flatten_lerp_expand.das twins)") @(t : T?) {
+        let n = check_unit(t, "", "{root}/tests/flatten/test_flatten_lerp_expand.das")
+        t |> success(n >= 6, "expected >=6 twins, checked {n}")
+        var bodies <- twin_bodies(t, "{root}/tests/flatten/test_flatten_lerp_expand.das")
+        // the expand -> re-fuse round trip must come back (the symmetric-oracle guard:
+        // fuser and residual oracle share match_lerp, so only a POSITIVE assert catches
+        // a matcher break blinding both)
+        let rt = bodies?["le_round_flat"] ?? ""
+        t |> success(rt |> find("lerp") >= 0, "lerp must round-trip under _flatten_expand_lerp: {rt}")
+        // uniform bounds preshade ONLY when expansion exposes G_B - G_A — the FIRED proof
+        // (kept whole, the bounds ride as plain operands and nothing extracts)
+        let pre = bodies?["le_preshader_flat"] ?? ""
+        t |> success(pre |> find("_preshader_") >= 0, "expanded uniform bounds must preshade: {pre}")
+        delete bodies
     }
     t |> run("rcp corpus rewrites clean (test_flatten_rcp.das twins)") @(t : T?) {
         let n = check_unit(t, "", "{root}/tests/flatten/test_flatten_rcp.das")
@@ -150,7 +216,7 @@ def test_flatten_fold(t : T?) {
         let reas = bodies?["nf_reassoc_flat"] ?? ""
         t |> success(reas |> find("0.75") < 0 && reas |> find("0.25") >= 0, "float consts must stay scattered: {reas}")
         let lrp = bodies?["nf_lerp0_flat"] ?? ""
-        t |> success(lrp |> find("lerp") >= 0, "lerp(a,b,0) must round-trip back to lerp: {lrp}")
+        t |> success(lrp |> find("lerp") >= 0, "lerp(a,b,0) must survive as lerp (selector is fast-math gated): {lrp}")
         let imul0 = bodies?["nf_imul0_flat"] ?? ""
         t |> success(imul0 |> find("* 0") < 0, "int n*0 must STILL fold: {imul0}")
         let ire = bodies?["nf_ireassoc_flat"] ?? ""

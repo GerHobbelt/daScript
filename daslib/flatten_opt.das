@@ -14,8 +14,10 @@ module flatten_opt shared private
 
 require daslib/ast
 require daslib/ast_boost
+require daslib/ast_match
 require daslib/templates_boost
 require daslib/macro_boost
+require daslib/match
 require daslib/rtti
 require strings
 
@@ -525,6 +527,7 @@ def public ssa_rename_pass(var out : array<ExpressionPtr>) {
 class private FoldVisitor : AstVisitor {
     changed : bool
     noFastMath : bool
+    expandLerp : bool
     def override visitExprOp2(var that : ExprOp2?) : ExpressionPtr {
         // A fully-constant ExprOp2 the typer left unfolded — it folds scalar const arithmetic but
         // leaves vector const (`float3(2)+float3(3)`), what reassoc's gathered groups become. Fold
@@ -536,93 +539,100 @@ class private FoldVisitor : AstVisitor {
         // Algebraic identities over the scalar + vector (float/int/uint) family, under fast-math.
         // `*1`/`*-1` return the non-const operand and gate on `same_base_type` (scalar*vector
         // broadcast must not mistype to scalar); `*0` returns a RESULT-typed zero via zero_const_of.
-        if (that.op == "*") {
-            if (is_one_const_op(that.right) && same_base_type(that, that.left)) { changed = true; return that.left }
-            if (is_one_const_op(that.left) && same_base_type(that, that.right)) { changed = true; return that.right }
-            if (is_neg_one_const_op(that.right) && same_base_type(that, that.left)) { changed = true; return negate(that.left) }
-            if (is_neg_one_const_op(that.left) && same_base_type(that, that.right)) { changed = true; return negate(that.right) }
-            // `*0` changes inf/NaN propagation — float forms are fast-math only (int exact)
-            if (is_zero_const_op(that.right) && !has_sideeffects(that.left) && (!noFastMath || !is_float_valued(that))) {
-                var z = zero_const_of(that._type, that.at)
-                if (z != null) { changed = true; return z }
-            }
-            if (is_zero_const_op(that.left) && !has_sideeffects(that.right) && (!noFastMath || !is_float_valued(that))) {
-                var z = zero_const_of(that._type, that.at)
-                if (z != null) { changed = true; return z }
-            }
-            // ctor-lane kill: a zero lane of a const vector factor zeroes the matching lane of a
-            // full-arity ctor factor IN PLACE — the lane compute dies (DSE) without distributing
-            // the multiply. Same inf/NaN class as scalar `*0` → float forms are fast-math only.
-            if (!noFastMath || !is_float_valued(that)) {
-                if (ctor_lane_kill(that.left, that.right) || ctor_lane_kill(that.right, that.left)) {
+        match (that.op) {
+            if ("*") {
+                if (is_one_const_op(that.right) && same_base_type(that, that.left)) { changed = true; return that.left }
+                if (is_one_const_op(that.left) && same_base_type(that, that.right)) { changed = true; return that.right }
+                if (is_neg_one_const_op(that.right) && same_base_type(that, that.left)) { changed = true; return negate(that.left) }
+                if (is_neg_one_const_op(that.left) && same_base_type(that, that.right)) { changed = true; return negate(that.right) }
+                // `*0` changes inf/NaN propagation — float forms are fast-math only (int exact)
+                if (is_zero_const_op(that.right) && !has_sideeffects(that.left) && (!noFastMath || !is_float_valued(that))) {
+                    var z = zero_const_of(that._type, that.at)
+                    if (z != null) { changed = true; return z }
+                }
+                if (is_zero_const_op(that.left) && !has_sideeffects(that.right) && (!noFastMath || !is_float_valued(that))) {
+                    var z = zero_const_of(that._type, that.at)
+                    if (z != null) { changed = true; return z }
+                }
+                // ctor-lane kill: a zero lane of a const vector factor zeroes the matching lane of a
+                // full-arity ctor factor IN PLACE — the lane compute dies (DSE) without distributing
+                // the multiply. Same inf/NaN class as scalar `*0` → float forms are fast-math only.
+                if (!noFastMath || !is_float_valued(that)) {
+                    if (ctor_lane_kill(that.left, that.right) || ctor_lane_kill(that.right, that.left)) {
+                        changed = true
+                        return that
+                    }
+                }
+                // splat collapse: `v * floatN(s) → v * s` (either side) — das vec×scalar is native, the
+                // splat ctor node disappears. Bit-exact (same per-lane product), so never gated.
+                var spm = splat_scalar_arg(that.right)
+                if (spm != null && is_float_vec(expr_bt(that.left))) {
                     changed = true
+                    that.right = spm
+                    return that
+                }
+                spm = splat_scalar_arg(that.left)
+                if (spm != null && is_float_vec(expr_bt(that.right))) {
+                    changed = true
+                    that.left = spm
                     return that
                 }
             }
-            // splat collapse: `v * floatN(s) → v * s` (either side) — das vec×scalar is native, the
-            // splat ctor node disappears. Bit-exact (same per-lane product), so never gated.
-            var spm = splat_scalar_arg(that.right)
-            if (spm != null && is_float_vec(expr_bt(that.left))) {
-                changed = true
-                that.right = spm
-                return that
+            if ("+") {
+                if (is_zero_const_op(that.right)) { changed = true; return that.left }
+                if (is_zero_const_op(that.left)) { changed = true; return that.right }
             }
-            spm = splat_scalar_arg(that.left)
-            if (spm != null && is_float_vec(expr_bt(that.right))) {
-                changed = true
-                that.left = spm
-                return that
-            }
-        } elif (that.op == "+") {
-            if (is_zero_const_op(that.right)) { changed = true; return that.left }
-            if (is_zero_const_op(that.left)) { changed = true; return that.right }
-        } elif (that.op == "-") {
-            if (is_zero_const_op(that.right)) { changed = true; return that.left }
-            if (is_zero_const_op(that.left)) { changed = true; return negate(that.right) }
-            // `x - x → 0` — purity-gated like `*0` (and like it, inf/NaN operands aside:
-            // fast-math charter). Identical describe ⇒ identical purity, so one check.
-            if (describe(that.left) == describe(that.right) && !has_sideeffects(that.left) &&
-                    (!noFastMath || !is_float_valued(that))) {
-                var z = zero_const_of(that._type, that.at)
-                if (z != null) { changed = true; return z }
-            }
-        } elif (that.op == "/") {
-            // `x / C → x * (1/C)` — a mul instead of a div; the reciprocal rounds (fast-math).
-            // Float-family only (int division has no reciprocal); zero lanes keep the div.
-            if (!noFastMath && is_float_valued(that)) {
-                var rec = recip_const(that.right)
-                if (rec != null) {
-                    changed = true
-                    return new ExprOp2(at = that.at, op := "*", left = that.left, right = rec)
+            if ("-") {
+                if (is_zero_const_op(that.right)) { changed = true; return that.left }
+                if (is_zero_const_op(that.left)) { changed = true; return negate(that.right) }
+                // `x - x → 0` — purity-gated like `*0` (and like it, inf/NaN operands aside:
+                // fast-math charter). Identical describe ⇒ identical purity, so one check.
+                if (describe(that.left) == describe(that.right) && !has_sideeffects(that.left) &&
+                        (!noFastMath || !is_float_valued(that))) {
+                    var z = zero_const_of(that._type, that.at)
+                    if (z != null) { changed = true; return z }
                 }
             }
-            // splat collapse for division: `v / floatN(s) → v / s`, `floatN(s) / v → s / v` —
-            // both vec÷scalar forms are native das. Bit-exact, never gated.
-            var spd = splat_scalar_arg(that.right)
-            if (spd != null && is_float_vec(expr_bt(that.left))) {
-                changed = true
-                that.right = spd
-                return that
+            if ("/") {
+                // `x / C → x * (1/C)` — a mul instead of a div; the reciprocal rounds (fast-math).
+                // Float-family only (int division has no reciprocal); zero lanes keep the div.
+                if (!noFastMath && is_float_valued(that)) {
+                    var rec = recip_const(that.right)
+                    if (rec != null) {
+                        changed = true
+                        return new ExprOp2(at = that.at, op := "*", left = that.left, right = rec)
+                    }
+                }
+                // splat collapse for division: `v / floatN(s) → v / s`, `floatN(s) / v → s / v` —
+                // both vec÷scalar forms are native das. Bit-exact, never gated.
+                var spd = splat_scalar_arg(that.right)
+                if (spd != null && is_float_vec(expr_bt(that.left))) {
+                    changed = true
+                    that.right = spd
+                    return that
+                }
+                spd = splat_scalar_arg(that.left)
+                if (spd != null && is_float_vec(expr_bt(that.right))) {
+                    changed = true
+                    that.left = spd
+                    return that
+                }
             }
-            spd = splat_scalar_arg(that.left)
-            if (spd != null && is_float_vec(expr_bt(that.right))) {
-                changed = true
-                that.left = spd
-                return that
+            if ("&&") {
+                // Short-circuit `&&`: `false && x` never evaluates x, so dropping x is
+                // safe; `x && false` DOES evaluate x, so that drop is gated on purity.
+                if (is_bool_val(that.left, true)) { changed = true; return that.right }
+                if (is_bool_val(that.right, true)) { changed = true; return that.left }
+                if (is_bool_val(that.left, false)) { changed = true; return that.left }
+                if (is_bool_val(that.right, false) && !has_sideeffects(that.left)) { changed = true; return that.right }
             }
-        } elif (that.op == "&&") {
-            // Short-circuit `&&`: `false && x` never evaluates x, so dropping x is
-            // safe; `x && false` DOES evaluate x, so that drop is gated on purity.
-            if (is_bool_val(that.left, true)) { changed = true; return that.right }
-            if (is_bool_val(that.right, true)) { changed = true; return that.left }
-            if (is_bool_val(that.left, false)) { changed = true; return that.left }
-            if (is_bool_val(that.right, false) && !has_sideeffects(that.left)) { changed = true; return that.right }
-        } elif (that.op == "||") {
-            // Mirror of `&&`: `true || x` never evaluates x; `x || true` does.
-            if (is_bool_val(that.left, false)) { changed = true; return that.right }
-            if (is_bool_val(that.right, false)) { changed = true; return that.left }
-            if (is_bool_val(that.left, true)) { changed = true; return that.left }
-            if (is_bool_val(that.right, true) && !has_sideeffects(that.left)) { changed = true; return that.right }
+            if ("||") {
+                // Mirror of `&&`: `true || x` never evaluates x; `x || true` does.
+                if (is_bool_val(that.left, false)) { changed = true; return that.right }
+                if (is_bool_val(that.right, false)) { changed = true; return that.left }
+                if (is_bool_val(that.left, true)) { changed = true; return that.left }
+                if (is_bool_val(that.right, true) && !has_sideeffects(that.left)) { changed = true; return that.right }
+            }
         }
         return that
     }
@@ -671,9 +681,9 @@ class private FoldVisitor : AstVisitor {
                 return folded
             }
         }
-        // DISASSEMBLE lerp/mad into raw arithmetic so the identity/const folds, reassoc and CSE
-        // see through them; the PHASE_FUSED finishing pass re-packs survivors. Type-gated to the
-        // das math overload set — a loose DSL-stub instantiation must not expand into ill-typed ops.
+        // DISASSEMBLE mad (and, under `expandLerp`, lerp) into raw arithmetic so the folds,
+        // reassoc and CSE see through them; PHASE_FUSED re-packs survivors. Type-gated to the
+        // das math overload set — a loose DSL-stub instantiation must not expand ill-typed.
         if (that.func != null && length(that.arguments) == 3) {
             let fname = psh_simple_name("{that.func.name}")
             let ta = expr_bt(that.arguments[0])
@@ -683,7 +693,7 @@ class private FoldVisitor : AstVisitor {
                 var aArg = that.arguments[0]
                 var bArg = that.arguments[1]
                 var tArg = that.arguments[2]
-                // const-selector short-circuits — no expand/refuse round trip. They DROP an
+                // const-selector short-circuits — no expand/re-fuse round trip. They DROP an
                 // argument (`(b-a)*0` would still propagate b's inf/NaN) → fast-math only.
                 if (!noFastMath) {
                     if (is_zero_const_op(tArg) && !has_sideeffects(bArg)) { changed = true; return aArg }
@@ -693,6 +703,7 @@ class private FoldVisitor : AstVisitor {
                         return aArg
                     }
                 }
+                if (!expandLerp) return that
                 changed = true
                 var sub = new ExprOp2(at = that.at, op := "-", left = bArg, right = clone_expression(aArg))
                 var mul = new ExprOp2(at = that.at, op := "*", left = sub, right = tArg)
@@ -703,6 +714,14 @@ class private FoldVisitor : AstVisitor {
                 var mul = new ExprOp2(at = that.at, op := "*", left = that.arguments[0], right = that.arguments[1])
                 return new ExprOp2(at = that.at, op := "+", left = mul, right = that.arguments[2])
             }
+        }
+        return that
+    }
+    def override visitExprSwizzle(var that : ExprSwizzle?) : ExpressionPtr {
+        var r = swizzle_fold_rewrite(that)
+        if (r != null) {
+            changed = true
+            return r
         }
         return that
     }
@@ -853,26 +872,27 @@ def private negate(var e : ExpressionPtr) : ExpressionPtr {
 // Keying on the result type lets both `v * 0.0` and `v * float3(0)` fold width-matched.
 def public zero_const_of(t : TypeDeclPtr; at : LineInfo) : ExpressionPtr {
     if (t == null) return null
-    let bt = t.baseType
-    if (bt == Type.tInt) return new ExprConstInt(at = at, value = 0)
-    if (bt == Type.tInt8) return new ExprConstInt8(at = at, value = int8(0))
-    if (bt == Type.tInt16) return new ExprConstInt16(at = at, value = int16(0))
-    if (bt == Type.tInt64) return new ExprConstInt64(at = at, value = 0l)
-    if (bt == Type.tUInt) return new ExprConstUInt(at = at, value = 0u)
-    if (bt == Type.tUInt8) return new ExprConstUInt8(at = at, value = uint8(0))
-    if (bt == Type.tUInt16) return new ExprConstUInt16(at = at, value = uint16(0))
-    if (bt == Type.tUInt64) return new ExprConstUInt64(at = at, value = 0ul)
-    if (bt == Type.tFloat) return new ExprConstFloat(at = at, value = 0.0f)
-    if (bt == Type.tDouble) return new ExprConstDouble(at = at, value = 0.0lf)
-    if (bt == Type.tFloat2) return new ExprConstFloat2(at = at, value = float2(0.0))
-    if (bt == Type.tFloat3) return new ExprConstFloat3(at = at, value = float3(0.0))
-    if (bt == Type.tFloat4) return new ExprConstFloat4(at = at, value = float4(0.0))
-    if (bt == Type.tInt2) return new ExprConstInt2(at = at, value = int2(0))
-    if (bt == Type.tInt3) return new ExprConstInt3(at = at, value = int3(0))
-    if (bt == Type.tInt4) return new ExprConstInt4(at = at, value = int4(0))
-    if (bt == Type.tUInt2) return new ExprConstUInt2(at = at, value = uint2(0u))
-    if (bt == Type.tUInt3) return new ExprConstUInt3(at = at, value = uint3(0u))
-    if (bt == Type.tUInt4) return new ExprConstUInt4(at = at, value = uint4(0u))
+    match (t.baseType) {
+        if (Type.tInt) { return new ExprConstInt(at = at, value = 0) }
+        if (Type.tInt8) { return new ExprConstInt8(at = at, value = int8(0)) }
+        if (Type.tInt16) { return new ExprConstInt16(at = at, value = int16(0)) }
+        if (Type.tInt64) { return new ExprConstInt64(at = at, value = 0l) }
+        if (Type.tUInt) { return new ExprConstUInt(at = at, value = 0u) }
+        if (Type.tUInt8) { return new ExprConstUInt8(at = at, value = uint8(0)) }
+        if (Type.tUInt16) { return new ExprConstUInt16(at = at, value = uint16(0)) }
+        if (Type.tUInt64) { return new ExprConstUInt64(at = at, value = 0ul) }
+        if (Type.tFloat) { return new ExprConstFloat(at = at, value = 0.0f) }
+        if (Type.tDouble) { return new ExprConstDouble(at = at, value = 0.0lf) }
+        if (Type.tFloat2) { return new ExprConstFloat2(at = at, value = float2(0.0)) }
+        if (Type.tFloat3) { return new ExprConstFloat3(at = at, value = float3(0.0)) }
+        if (Type.tFloat4) { return new ExprConstFloat4(at = at, value = float4(0.0)) }
+        if (Type.tInt2) { return new ExprConstInt2(at = at, value = int2(0)) }
+        if (Type.tInt3) { return new ExprConstInt3(at = at, value = int3(0)) }
+        if (Type.tInt4) { return new ExprConstInt4(at = at, value = int4(0)) }
+        if (Type.tUInt2) { return new ExprConstUInt2(at = at, value = uint2(0u)) }
+        if (Type.tUInt3) { return new ExprConstUInt3(at = at, value = uint3(0u)) }
+        if (Type.tUInt4) { return new ExprConstUInt4(at = at, value = uint4(0u)) }
+    }
     return null
 }
 
@@ -1438,10 +1458,10 @@ class private ReassocVisitor : AstVisitor {
     }
 }
 
-def public fold_body(var func : FunctionPtr; no_fast_math : bool = false) : bool {
-    //! Post-infer fold over a flattened body: const-propagate single-def locals, reassociate
-    //! scattered consts, collapse `const ? a : b`, fold identities/const ctors, drop pure self-assigns.
-    //! SINGLE pass (caller re-infers and loops); `no_fast_math = true` skips the value-changing arms.
+def public fold_body(var func : FunctionPtr; no_fast_math : bool = false; expand_lerp : bool = false) : bool {
+    //! Post-infer fold over a flattened body: const-propagate single-def locals, reassociate scattered
+    //! consts, collapse `const ? a : b`, fold identities/const ctors, drop pure self-assigns. SINGLE pass
+    //! (caller loops); `no_fast_math` skips value-changing arms, `expand_lerp` disassembles `lerp` calls.
     if (!(func.body is ExprBlock)) return false
     let nfm = no_fast_math
     var changed = const_prop_locals(func.body as ExprBlock)
@@ -1459,8 +1479,7 @@ def public fold_body(var func : FunctionPtr; no_fast_math : bool = false) : bool
     unsafe {
         delete rv
     }
-    var v = new FoldVisitor()
-    v.noFastMath = nfm
+    var v = new FoldVisitor(noFastMath = nfm, expandLerp = expand_lerp)
     make_visitor(*v) $(adapter) {
         visit(func.body, adapter)
     }
@@ -1506,6 +1525,324 @@ def public fold_body(var func : FunctionPtr; no_fast_math : bool = false) : bool
         }
     }
     return changed
+}
+
+// ===== Swizzle lane fold =====
+// `ctor(args…).mask` pays a combine + an extract for separable lanes: resolve each output lane's
+// provenance, re-emit the cheapest form (base / swizzle / scalar / splat / narrower ctor).
+
+struct private LaneSrc {
+    lane : int          // -1: e itself is the lane; >= 0: lane of e
+    e : ExpressionPtr   // scalar expr when lane < 0, else the (opaque) float-vector base
+}
+
+def private lane_letter(i : int) : string {
+    if (i == 0) return "x"
+    if (i == 1) return "y"
+    if (i == 2) return "z"
+    return "w"
+}
+
+// float2/3/4 ctor call of ANY arity (full per-lane, mixed vector+scalar, splat); null otherwise.
+def private float_ctor_of(e : ExpressionPtr) : ExprCall? {
+    if (e == null || !(e is ExprCall)) return null
+    var c = e as ExprCall
+    let nm = psh_simple_name("{c.name}")
+    if (nm != "float2" && nm != "float3" && nm != "float4") return null
+    return c
+}
+
+def private r2v_unwrap(var e : ExpressionPtr) : ExpressionPtr {
+    return e is ExprRef2Value ? (e as ExprRef2Value).subexpr : e
+}
+
+// The fold arm's firing gate (and the residual oracle's): a value resolve_lanes can see through.
+def private swizzle_decomposable(e : ExpressionPtr) : bool {
+    if (e == null) return false
+    if (e is ExprRef2Value) return swizzle_decomposable((e as ExprRef2Value).subexpr)
+    if (e is ExprConstFloat2 || e is ExprConstFloat3 || e is ExprConstFloat4) return true
+    if (e is ExprSwizzle) return float_vec_dim(expr_bt((e as ExprSwizzle).value)) > 0
+    return float_ctor_of(e) != null
+}
+
+// Per-output-lane provenance of a float-vector expr. Sees through float ctors of any arity,
+// vector const literals, nested swizzles, component-read scalar args and Ref2Value wraps; an
+// opaque vector contributes (e, 0..d-1). False only when something isn't a typed float vector.
+def private resolve_lanes(var e : ExpressionPtr; var out : array<LaneSrc>) : bool {
+    if (e == null) return false
+    if (e is ExprRef2Value) return resolve_lanes((e as ExprRef2Value).subexpr, out)
+    let d = float_vec_dim(expr_bt(e))
+    if (d == 0) return false
+    if (e is ExprConstFloat2) {
+        let v = (e as ExprConstFloat2).value
+        out |> push(LaneSrc(lane = -1, e = new ExprConstFloat(at = e.at, value = v.x)))
+        out |> push(LaneSrc(lane = -1, e = new ExprConstFloat(at = e.at, value = v.y)))
+        return true
+    }
+    if (e is ExprConstFloat3) {
+        let v = (e as ExprConstFloat3).value
+        out |> push(LaneSrc(lane = -1, e = new ExprConstFloat(at = e.at, value = v.x)))
+        out |> push(LaneSrc(lane = -1, e = new ExprConstFloat(at = e.at, value = v.y)))
+        out |> push(LaneSrc(lane = -1, e = new ExprConstFloat(at = e.at, value = v.z)))
+        return true
+    }
+    if (e is ExprConstFloat4) {
+        let v = (e as ExprConstFloat4).value
+        out |> push(LaneSrc(lane = -1, e = new ExprConstFloat(at = e.at, value = v.x)))
+        out |> push(LaneSrc(lane = -1, e = new ExprConstFloat(at = e.at, value = v.y)))
+        out |> push(LaneSrc(lane = -1, e = new ExprConstFloat(at = e.at, value = v.z)))
+        out |> push(LaneSrc(lane = -1, e = new ExprConstFloat(at = e.at, value = v.w)))
+        return true
+    }
+    if (e is ExprSwizzle) {
+        var sw = e as ExprSwizzle
+        var inner : array<LaneSrc>
+        var ok = resolve_lanes(sw.value, inner)
+        if (ok) {
+            for (f in sw.fields) {
+                if (int(f) >= length(inner)) {
+                    ok = false
+                } else {
+                    out |> push(inner[int(f)])
+                }
+            }
+        }
+        unsafe {
+            delete inner
+        }
+        return ok && length(sw.fields) == d
+    }
+    var c = float_ctor_of(e)
+    if (c != null) {
+        // splat: the one scalar arg fills every lane (emitters clone the duplicate references)
+        if (length(c.arguments) == 1 && expr_bt(c.arguments[0]) == Type.tFloat) {
+            for (_i in range(d)) {
+                out |> push(LaneSrc(lane = -1, e = c.arguments[0]))
+            }
+            return true
+        }
+        var total = 0
+        for (i in range(length(c.arguments))) {
+            var a = c.arguments[i]
+            let abt = expr_bt(a)
+            if (abt == Type.tFloat) {
+                var bk = ""
+                var base : ExpressionPtr
+                var comp = ""
+                if (component_read_of(a, bk, base, comp)) {
+                    out |> push(LaneSrc(lane = lane_index(comp), e = base))
+                } else {
+                    out |> push(LaneSrc(lane = -1, e = a))
+                }
+                total ++
+            } elif (float_vec_dim(abt) > 0) {
+                if (!resolve_lanes(a, out)) return false
+                total += float_vec_dim(abt)
+            } else {
+                return false
+            }
+        }
+        return total == d
+    }
+    // opaque float vector — contributes its own lanes
+    for (i in range(d)) {
+        out |> push(LaneSrc(lane = i, e = e))
+    }
+    return true
+}
+
+let private SWF_NONE = 0
+let private SWF_VALUE = 1      // identity selection — drop the swizzle, keep the value
+let private SWF_BASE = 2       // single base, full in-order width — the base itself
+let private SWF_SWIZZLE = 3    // single base — one re-masked swizzle
+let private SWF_SCALAR = 4     // one scalar lane — the scalar expr
+let private SWF_SPLAT = 5      // every lane the same non-const scalar — splat ctor
+let private SWF_CTOR = 6       // re-pack whole bases + scalars into a narrower/permuted ctor
+
+// Maximal consecutive same-base groups of a selection ((start, len) each); scalar lanes are
+// singleton runs. Shared by classify (validity) and the rewrite (emission) so they cannot drift.
+def private swizzle_sel_runs(sel : array<LaneSrc>; var runs : array<int2>) {
+    var i = 0
+    while (i < length(sel)) {
+        if (sel[i].lane < 0) {
+            runs |> push(int2(i, 1))
+            i ++
+        } else {
+            let bk = describe(sel[i].e)
+            var j = i + 1
+            while (j < length(sel) && sel[j].lane >= 0 && describe(sel[j].e) == bk) {
+                j ++
+            }
+            runs |> push(int2(i, j - i))
+            i = j
+        }
+    }
+}
+
+// Decide which rewrite a swizzle's resolved selection admits and fill `sel` for the builder.
+// Shared by the fold arm and the residual oracle — ONE gate, so a survivor is always a fold miss.
+def private swizzle_fold_classify(var that : ExprSwizzle?; var sel : array<LaneSrc>) : int {
+    if (that == null || that.fieldFlags.write) return SWF_NONE
+    let nOut = length(that.fields)
+    if (nOut < 1 || nOut > 4 || !swizzle_decomposable(that.value)) return SWF_NONE
+    var lanes : array<LaneSrc>
+    var ok = resolve_lanes(that.value, lanes)
+    let nLanes = length(lanes)
+    if (ok) {
+        for (f in that.fields) {
+            if (int(f) >= nLanes) {
+                ok = false
+            }
+        }
+    }
+    if (ok) {
+        for (f in that.fields) {
+            sel |> push(lanes[int(f)])
+        }
+    }
+    unsafe {
+        delete lanes
+    }
+    if (!ok) return SWF_NONE
+    var nScalar = 0
+    for (s in sel) {
+        if (s.lane < 0) {
+            nScalar ++
+        }
+    }
+    // single-base arms: every lane a component of one (describe-equal) base
+    if (nScalar == 0) {
+        let k0 = describe(sel[0].e)
+        var same = true
+        for (s in sel) {
+            if (describe(s.e) != k0) {
+                same = false
+            }
+        }
+        if (same) {
+            var ident = nOut == float_vec_dim(expr_bt(sel[0].e))
+            for (i in range(nOut)) {
+                if (sel[i].lane != i) {
+                    ident = false
+                }
+            }
+            return ident ? SWF_BASE : SWF_SWIZZLE
+        }
+    }
+    if (nOut == 1) return SWF_SCALAR    // the single component-lane case returned above
+    // identity selection over the whole value — just drop the swizzle node
+    var ident = nOut == nLanes
+    if (ident) {
+        for (i in range(nOut)) {
+            if (int(that.fields[i]) != i) {
+                ident = false
+            }
+        }
+    }
+    if (ident) return SWF_VALUE
+    // every lane the same non-const scalar — splat (all-const packs to a literal via SWF_CTOR)
+    if (nScalar == nOut) {
+        let k0 = describe(sel[0].e)
+        var same = true
+        for (s in sel) {
+            if (describe(s.e) != k0) {
+                same = false
+            }
+        }
+        var cv = 0.0
+        if (same && !scalar_float_const(sel[0].e, cv)) return SWF_SPLAT
+    }
+    // ctor re-pack: only whole in-order bases ride free (a partial run would pay fresh extracts)
+    if (nOut > nLanes) return SWF_NONE
+    var runs : array<int2>
+    swizzle_sel_runs(sel, runs)
+    var bad = false
+    for (r in runs) {
+        if (sel[r.x].lane >= 0) {
+            if (r.y != float_vec_dim(expr_bt(sel[r.x].e))) {
+                bad = true
+            } else {
+                for (k in range(r.y)) {
+                    if (sel[r.x + k].lane != k) {
+                        bad = true
+                    }
+                }
+            }
+        }
+    }
+    // rebuilding the value's own arg list is churn, not a fold (e.g. `float2(a, a).yx`)
+    if (!bad) {
+        var vc = float_ctor_of(r2v_unwrap(that.value))
+        if (vc != null && length(vc.arguments) == length(runs)) {
+            var same = true
+            for (idx in range(length(runs))) {
+                if (describe(sel[runs[idx].x].e) != describe(vc.arguments[idx])) {
+                    same = false
+                }
+            }
+            bad = same
+        }
+    }
+    delete runs
+    return bad ? SWF_NONE : SWF_CTOR
+}
+
+// Oracle mirror for the swizzle fold arm (FoldResidualVisitor in flatten.das).
+def public is_unfolded_swizzle_lanes(var e : ExprSwizzle?) : bool {
+    var sel : array<LaneSrc>
+    let k = swizzle_fold_classify(e, sel)
+    unsafe {
+        delete sel
+    }
+    return k != SWF_NONE
+}
+
+// Build the replacement classify picked. Source nodes are reused (the old tree is discarded
+// whole); only a source landing in a second output lane gets cloned.
+def private swizzle_fold_rewrite(var that : ExprSwizzle?) : ExpressionPtr {
+    var sel : array<LaneSrc>
+    let kind = swizzle_fold_classify(that, sel)
+    var res : ExpressionPtr
+    if (kind == SWF_VALUE) {
+        res = that.value
+    } elif (kind == SWF_BASE || kind == SWF_SCALAR) {
+        res = sel[0].e
+    } elif (kind == SWF_SWIZZLE) {
+        var mask = ""
+        for (s in sel) {
+            mask += lane_letter(s.lane)     // nolint:PERF001 (a mask is at most 4 letters)
+        }
+        res = new ExprSwizzle(at = that.at, value = sel[0].e, mask := mask)
+    } elif (kind == SWF_SPLAT) {
+        var sc = sel[0].e
+        res = make_float_splat(length(sel), that.at, sc)
+    } elif (kind == SWF_CTOR) {
+        var runs : array<int2>
+        swizzle_sel_runs(sel, runs)
+        var args : array<ExpressionPtr>
+        args |> reserve(length(runs))
+        var seen : table<string>
+        for (r in runs) {
+            var a = sel[r.x].e
+            let k = describe(a)
+            if (key_exists(seen, k)) {
+                a = clone_expression(a)
+            } else {
+                seen |> insert(k)
+            }
+            args |> push(a)
+        }
+        res = make_float_ctor(length(sel), that.at, args)
+        delete runs
+        delete seen
+        unsafe {
+            delete args
+        }
+    }
+    unsafe {
+        delete sel
+    }
+    return res
 }
 
 // ===== Preshader extraction + CSE =====
@@ -2130,6 +2467,153 @@ def private cse_body(var blk : ExprBlock?; var counter : int&) : bool {
     return anyChange
 }
 
+// ===== Regroup-to-share (const-minus) =====
+// Reassoc's canonical sum order splits a `C - x` idiom out of a sum another expression carries whole
+// (`1 - mask` × two outputs), killing the describe-match CSE needs; re-emit as `(C - x) + rest`.
+
+def private cm_key(l, r : ExpressionPtr) : string {
+    return "{describe(l)}\t-\t{describe(r)}"
+}
+
+class private CmTally : AstVisitor {
+    counts : table<string; int>
+    mutableVars : table<string>
+    def override preVisitExprOp2(var expr : ExprOp2?) : void {
+        if (expr.op == "-" && is_all_const(expr.left) && !is_all_const(expr.right) &&
+                !reads_mutable(expr.right, mutableVars)) {
+            let k = cm_key(expr.left, expr.right)
+            counts[k] = (counts?[k] ?? 0) + 1
+        }
+    }
+}
+
+// A grouped `C - x` node already on the chain's spine — collect_add re-splits it into {+C, -x},
+// so without this check a regrouped chain would re-fire (and spin the fixpoint) forever.
+def private chain_has_grouped(e : ExpressionPtr; key : string) : bool {
+    if (e == null) return false
+    if (e is ExprOp2) {
+        let o = e as ExprOp2
+        if (o.op == "+" || o.op == "-") {
+            if (o.op == "-" && is_all_const(o.left) && !is_all_const(o.right) && cm_key(o.left, o.right) == key) {
+                return true
+            }
+            return chain_has_grouped(o.left, key) || chain_has_grouped(o.right, key)
+        }
+    } elif (e is ExprOp1) {
+        let o = e as ExprOp1
+        if (o.op == "-") return chain_has_grouped(o.subexpr, key)
+    }
+    return false
+}
+
+// Fill `terms` + the (const, negated-var) indices to regroup, gated on a live `C - x` twin in
+// `cm`. ONE gate for the pass and the residual oracle. A ≥2-const chain is reassoc's business
+// (gather pending), and a mutable-reading x can't CSE-share, so neither is a candidate.
+def private regroup_candidate(var that : ExprOp2?; cm : table<string; int>; mutableVars : table<string>;
+                              no_fast_math : bool; var terms : array<ReTerm>; var ci : int&; var xi : int&) : bool {
+    if (that == null || !(that.op == "+" || that.op == "-") || (no_fast_math && is_float_valued(that))) {
+        return false
+    }
+    collect_add(that, false, terms)
+    ci = -1
+    for (i in range(length(terms))) {
+        if (is_all_const(terms[i].e)) {
+            if (ci >= 0) return false
+            ci = i
+        }
+    }
+    if (ci < 0 || terms[ci].neg) return false
+    for (i in range(length(terms))) {
+        if (i == ci || !terms[i].neg || reads_mutable(terms[i].e, mutableVars)) {
+            continue
+        }
+        let k = cm_key(terms[ci].e, terms[i].e)
+        if ((cm?[k] ?? 0) >= 1 && !chain_has_grouped(that, k)) {
+            xi = i
+            return true
+        }
+    }
+    return false
+}
+
+class private RegroupShareVisitor : AstVisitor {
+    changed : bool
+    noFastMath : bool
+    cm : table<string; int>
+    mutableVars : table<string>
+    def override visitExprOp2(var that : ExprOp2?) : ExpressionPtr {
+        var terms : array<ReTerm>
+        var ci = -1
+        var xi = -1
+        if (!regroup_candidate(that, cm, mutableVars, noFastMath, terms, ci, xi)) {
+            unsafe {
+                delete terms
+            }
+            return that
+        }
+        var newTerms : array<ReTerm>
+        newTerms |> push(ReTerm(neg = false,
+            e = new ExprOp2(at = that.at, op := "-", left = terms[ci].e, right = terms[xi].e)))
+        for (i in range(length(terms))) {
+            if (i != ci && i != xi) {
+                newTerms |> push(terms[i])
+            }
+        }
+        changed = true
+        var r = build_chain(newTerms, that.at, "+", "-")
+        unsafe {
+            delete terms
+            delete newTerms
+        }
+        return r
+    }
+}
+
+class private RegroupResidualVisitor : AstVisitor {
+    found : bool
+    noFastMath : bool
+    cm : table<string; int>
+    mutableVars : table<string>
+    def override preVisitExprOp2(var expr : ExprOp2?) : void {
+        var terms : array<ReTerm>
+        var ci = -1
+        var xi = -1
+        if (regroup_candidate(expr, cm, mutableVars, noFastMath, terms, ci, xi)) {
+            found = true
+        }
+        unsafe {
+            delete terms
+        }
+    }
+}
+
+def private regroup_to_share(var blk : ExprBlock?; no_fast_math : bool) : bool {
+    var mutableVars <- collect_mutable(blk)
+    var ct = new CmTally()
+    ct.mutableVars := mutableVars
+    make_visitor(*ct) $(a) {
+        visit(blk, a)
+    }
+    var ch = false
+    if (!empty(ct.counts)) {
+        var rv = new RegroupShareVisitor(noFastMath = no_fast_math)
+        rv.cm := ct.counts
+        rv.mutableVars := mutableVars
+        make_visitor(*rv) $(a) {
+            visit(blk, a)
+        }
+        ch = rv.changed
+        unsafe {
+            delete rv
+        }
+    }
+    unsafe {
+        delete ct
+    }
+    delete mutableVars
+    return ch
+}
+
 // ===== Pure-alias elimination =====
 // Collapse `let X = <bare var V>` copies (V not reassigned) into direct refs to V and drop the let —
 // clears CSE's `_cse_a = _cse_b` leftovers and unroll/fold's `p_0 = ro`. General, not CSE-specific.
@@ -2361,6 +2845,30 @@ def public opt_residuals(var func : FunctionPtr; barriers : table<string>; no_fa
             break
         }
     }
+    // Regroup residual: a sum still splitting {+C, -x} apart while a grouped `C - x` twin lives
+    // elsewhere in the body — regroup_to_share should have re-paired it for the CSE.
+    var cmt = new CmTally()
+    cmt.mutableVars := pe.mutableVars
+    make_visitor(*cmt) $(a) {
+        visit(blk, a)
+    }
+    if (!empty(cmt.counts)) {
+        var rr = new RegroupResidualVisitor(noFastMath = no_fast_math)
+        rr.cm := cmt.counts
+        rr.mutableVars := pe.mutableVars
+        make_visitor(*rr) $(a) {
+            visit(blk, a)
+        }
+        if (rr.found) {
+            res |> push("a sum splitting a 'C - x' apart from its grouped twin (regroup-to-share miss)")
+        }
+        unsafe {
+            delete rr
+        }
+    }
+    unsafe {
+        delete cmt
+    }
     // Alias residual: a pure single-def `let X = <bare var V>` copy (neither X nor V reassigned)
     // the cleanup should collapse. A reassigned X (`var X = V` reused across copies) is a real var.
     for (s in blk.list) {
@@ -2378,7 +2886,8 @@ def public opt_residuals(var func : FunctionPtr; barriers : table<string>; no_fa
     // `mad` (or a mad still carrying the lerp shape) — gated on the same module visibility —
     // plus an un-packed ctor lane pattern (re-vectorize / shared factor), which needs no callable.
     let cm = fuse_callable(func._module, "mad")
-    var fr = new FuseResidualVisitor(checkMad = cm, checkLerp = cm && fuse_callable(func._module, "lerp"), noFastMath = no_fast_math)
+    var fr = new FuseResidualVisitor(checkMad = cm, checkLerp = cm && fuse_callable(func._module, "lerp"),
+        checkDot = !no_fast_math && fuse_callable(func._module, "dot", 2), noFastMath = no_fast_math)
     make_visitor(*fr) $(a) {
         visit(func.body, a)
     }
@@ -2394,6 +2903,9 @@ def public opt_residuals(var func : FunctionPtr; barriers : table<string>; no_fa
     if (fr.foundCtor) {
         res |> push("an un-packed ctor lane pattern (should re-vectorize / extract the shared factor)")
     }
+    if (fr.foundDot) {
+        res |> push("an un-fused lane sum ('v.x + v.y + …' should be dot(v, mask))")
+    }
     unsafe {
         delete fr
     }
@@ -2404,15 +2916,66 @@ def public opt_residuals(var func : FunctionPtr; barriers : table<string>; no_fa
     return <- res
 }
 
-def public flatten_preshade_cse(var func : FunctionPtr; barriers : table<string>; no_fast_math : bool = false) : bool {
+// The CSE value-number cache (per-region pure-subtree tally, count ≥1) plus the const-minus shape
+// table — the raw material for grouping/variation decisions, dumped under `_flatten_log_cse`.
+def private log_cse_cache(func : FunctionPtr; var blk : ExprBlock?) {
+    var mutableVars <- collect_mutable(blk)
+    var counts : table<string; int>
+    for (i in range(length(blk.list))) {
+        var ct = new CseTally()
+        ct.mutableVars := mutableVars
+        make_visitor(*ct) $(a) {
+            cse_tally_stmt(blk.list[i], a)
+        }
+        for (k in keys(ct.counts)) {
+            counts[k] = (counts?[k] ?? 0) + (ct.counts?[k] ?? 0)
+        }
+        unsafe {
+            delete ct
+        }
+    }
+    var cm = new CmTally()
+    cm.mutableVars := mutableVars
+    make_visitor(*cm) $(a) {
+        visit(blk, a)
+    }
+    var ks <- [for (k in keys(counts)); k]
+    sort(ks) $(a, b : string) : bool {
+        let ca = counts?[a] ?? 0
+        let cb = counts?[b] ?? 0
+        if (ca != cb) {
+            return ca > cb
+        }
+        return a < b
+    }
+    to_log(LOG_INFO, "flatten cse cache [{func.name}]: {length(ks)} pure subtrees\n")
+    for (k in ks) {
+        to_log(LOG_INFO, "    {counts?[k] ?? 0}x  {k}\n")
+    }
+    var cks <- [for (k in keys(cm.counts)); k]
+    sort(cks)
+    to_log(LOG_INFO, "  const-minus shapes: {length(cks)}\n")
+    for (k in cks) {
+        to_log(LOG_INFO, "    {cm.counts?[k] ?? 0}x  {k}\n")
+    }
+    unsafe {
+        delete cm
+    }
+    delete counts
+    delete ks
+    delete cks
+    delete mutableVars
+}
+
+def public flatten_preshade_cse(var func : FunctionPtr; barriers : table<string>; no_fast_math : bool = false; log_cse : bool = false) : bool {
     //! Post-fold optimize pass: hoist uniform (globals+literals) subtrees to top-of-body
-    //! `_preshader_N` lets, CSE-dedup repeats, collapse pure aliases — a joint fixpoint.
-    //! `barriers` = sampler/noise names that stay per-pixel. Post-fold, once; caller re-infers.
+    //! `_preshader_N` lets, regroup const-minus sums toward live `C - x` twins, CSE-dedup repeats,
+    //! collapse pure aliases — a joint fixpoint. `log_cse` dumps the final value-number cache.
     if (!(func.body is ExprBlock)) return false
     var blk = func.body as ExprBlock
-    // The passes enable each other — an alias subst / CSE share can re-expose uniform compute in
-    // the varying region (`!_preshader_0`) that only re-extraction hoists, so iterate the triple
-    // to a fixpoint. An exhausted guard means an oscillation regression — warn, never hang.
+    // The passes enable each other — an alias subst / CSE share can re-expose uniform compute only
+    // re-extraction hoists, and a regroup creates the very dup CSE shares, so iterate the set to a
+    // fixpoint. An exhausted guard means an oscillation regression — warn, never hang.
     var changed = false
     var guard = 0
     var cseCounter = 0
@@ -2421,6 +2984,9 @@ def public flatten_preshade_cse(var func : FunctionPtr; barriers : table<string>
         guard ++
         var round = false
         if (extract_preshader(func, blk, barriers, preCounter, no_fast_math)) {
+            round = true
+        }
+        if (regroup_to_share(blk, no_fast_math)) {
             round = true
         }
         if (cse_body(blk, cseCounter)) {
@@ -2436,6 +3002,9 @@ def public flatten_preshade_cse(var func : FunctionPtr; barriers : table<string>
     }
     if (guard >= 16) {
         to_log(LOG_WARNING, "flatten: cse/alias loop guard exhausted in {func.name} (oscillation?)\n")
+    }
+    if (log_cse) {
+        log_cse_cache(func, blk)
     }
     return changed
 }
@@ -2498,27 +3067,27 @@ def private negate_const(e : ExpressionPtr) : ExpressionPtr {
     return null
 }
 
-def private has_3arg_named(mod : Module?; fname : string) : bool {
+def private has_arity_named(mod : Module?; fname : string; argc : int) : bool {
     var found = false
     for_each_function(mod, fname) $(fn) {
-        if (length(fn.arguments) == 3) {
+        if (length(fn.arguments) == argc) {
             found = true
         }
     }
     for_each_generic(mod, fname) $(fn) {
-        if (length(fn.arguments) == 3) {
+        if (length(fn.arguments) == argc) {
             found = true
         }
     }
     return found
 }
 
-def private fuse_callable(mod : Module?; fname : string) : bool {
+def private fuse_callable(mod : Module?; fname : string; argc : int = 3) : bool {
     if (mod == null) return false
-    if (has_3arg_named(mod, fname)) return true
+    if (has_arity_named(mod, fname, argc)) return true
     var found = false
     module_for_each_dependency(mod) $(dep, _isPub) {
-        if (!found && has_3arg_named(dep, fname)) {
+        if (!found && has_arity_named(dep, fname, argc)) {
             found = true
         }
     }
@@ -2530,24 +3099,20 @@ def private fuse_callable(mod : Module?; fname : string) : bool {
 // residual; no purity gate — flat-body calls are pure by contract (and has_sideeffects is timing-dependent).
 def private match_mad(var that : ExprOp2?; var ma, mb, mc : ExpressionPtr&) : bool {
     if (that == null) return false
-    var mul : ExprOp2?
-    var other : ExpressionPtr
+    var fa, fb, other : ExpressionPtr
     var negOther = false        // `m - C`  → c = -C
     var negFactor = false       // `C - m`  → negate a const factor of m
-    if (that.op == "+" || that.op == "-") {
-        if (that.left is ExprOp2 && (that.left as ExprOp2).op == "*") {
-            mul = that.left as ExprOp2
-            other = that.right
-            negOther = that.op == "-"
-        } elif (that.right is ExprOp2 && (that.right as ExprOp2).op == "*") {
-            mul = that.right as ExprOp2
-            other = that.left
-            negFactor = that.op == "-"
-        }
+    if (qmatch(that, $e(fa) * $e(fb) + $e(other)).matched) {
+        pass
+    } elif (qmatch(that, $e(other) + $e(fa) * $e(fb)).matched) {
+        pass
+    } elif (qmatch(that, $e(fa) * $e(fb) - $e(other)).matched) {
+        negOther = true
+    } elif (qmatch(that, $e(other) - $e(fa) * $e(fb)).matched) {
+        negFactor = true
+    } else {
+        return false
     }
-    if (mul == null) return false
-    var fa = mul.left
-    var fb = mul.right
     // types captured BEFORE negation — a fresh negated literal is untyped until re-infer
     var bta = expr_bt(fa)
     var btb = expr_bt(fb)
@@ -2586,46 +3151,25 @@ def private match_mad(var that : ExprOp2?; var ma, mb, mc : ExpressionPtr&) : bo
 // the form (positives-first canonical order), so this catches the other producers — the `0 - x`
 // and `*-1` fold arms. Shared by fuser AND residual.
 def private match_neg_add(var that : ExprOp2?; var pos, neg : ExpressionPtr&) : bool {
-    if (that == null || that.op != "+" || !is_mad_elem(expr_bt(that))) return false
-    if (that.left is ExprOp1 && (that.left as ExprOp1).op == "-") {
-        pos = that.right
-        neg = (that.left as ExprOp1).subexpr
-        return true
-    }
-    if (that.right is ExprOp1 && (that.right as ExprOp1).op == "-") {
-        pos = that.left
-        neg = (that.right as ExprOp1).subexpr
-        return true
-    }
-    return false
+    if (that == null || !is_mad_elem(expr_bt(that))) return false
+    return (qmatch(that, -$e(neg) + $e(pos)).matched ||    // nolint:STYLE016 (qmatch macro expansion)
+        qmatch(that, $e(pos) + -$e(neg)).matched)           // nolint:STYLE016 (qmatch macro expansion)
 }
 
 // `mad(b - a, t, a)` → `lerp(a, b, t)`: the re-packed expansion shape, `a` matched by
 // describe-equality. The neg-add form is matched too (defense — reassoc no longer emits it).
 // Deliberately misses a CSE-shared `b - a` (behind a `_cse_` var — keeping the share IS the win).
 def private match_lerp(var cll : ExprCall?; var la, lb, lt : ExpressionPtr&) : bool {
-    if (cll == null || length(cll.arguments) != 3 ||
-        psh_simple_name("{cll.name}") != "mad" || !(cll.arguments[0] is ExprOp2)) return false
-    var diff = cll.arguments[0] as ExprOp2
-    var db : ExpressionPtr      // b — the minuend
-    var da : ExpressionPtr      // a — the subtrahend
-    if (diff.op == "-") {
-        db = diff.left
-        da = diff.right
-    } elif (diff.op == "+") {
-        if (diff.left is ExprOp1 && (diff.left as ExprOp1).op == "-") {
-            da = (diff.left as ExprOp1).subexpr
-            db = diff.right
-        } elif (diff.right is ExprOp1 && (diff.right as ExprOp1).op == "-") {
-            da = (diff.right as ExprOp1).subexpr
-            db = diff.left
-        }
-    }
-    if (da == null || describe(da) != describe(cll.arguments[2]) ||
-        !lerp_shape(expr_bt(da), expr_bt(db), expr_bt(cll.arguments[1]))) return false
-    la = cll.arguments[2]
+    if (cll == null) return false
+    var da, db, aa, tt : ExpressionPtr
+    if (!qmatch(cll, mad($e(db) - $e(da), $e(tt), $e(aa))).matched &&     // nolint:STYLE016 (qmatch macro expansion)
+        !qmatch(cll, mad(-$e(da) + $e(db), $e(tt), $e(aa))).matched &&    // nolint:STYLE016 (qmatch macro expansion)
+        !qmatch(cll, mad($e(db) + -$e(da), $e(tt), $e(aa))).matched) return false  // nolint:STYLE016 (qmatch macro expansion)
+    if (describe(da) != describe(aa) ||
+        !lerp_shape(expr_bt(da), expr_bt(db), expr_bt(tt))) return false
+    la = aa
     lb = db
-    lt = cll.arguments[1]
+    lt = tt
     return true
 }
 
@@ -2636,7 +3180,8 @@ def private make_float_ctor(d : int; at : LineInfo; var lanes : array<Expression
     var c1 = 0.0
     var c2 = 0.0
     var c3 = 0.0
-    if (scalar_float_const(lanes[0], c0) && scalar_float_const(lanes[1], c1) &&
+    // const-collapse needs one scalar arg per lane — the swizzle re-pack passes mixed-arity lists
+    if (length(lanes) == d && scalar_float_const(lanes[0], c0) && scalar_float_const(lanes[1], c1) &&
             (d < 3 || scalar_float_const(lanes[2], c2)) && (d < 4 || scalar_float_const(lanes[3], c3))) {
         if (d == 2) return new ExprConstFloat2(at = at, value = float2(c0, c1))
         if (d == 3) return new ExprConstFloat3(at = at, value = float3(c0, c1, c2))
@@ -2657,18 +3202,18 @@ def private component_read_of(var e : ExpressionPtr; var baseKey : string&; var 
     if (e is ExprRef2Value) return component_read_of((e as ExprRef2Value).subexpr, baseKey, base, comp)
     var v : ExpressionPtr
     var nm = ""
-    if (e is ExprSwizzle) {
-        var sw = e as ExprSwizzle
-        nm = "{sw.mask}"
-        v = sw.value
-    } elif (e is ExprField) {
-        var fl = e as ExprField
-        nm = "{fl.name}"
-        v = fl.value
-    } else {
-        return false
+    match (e) {
+        if (ExprSwizzle(mask = $v(swMask), value = $v(swValue))) {
+            nm = "{swMask}"
+            v = swValue
+        }
+        if (ExprField(name = $v(flName), value = $v(flValue))) {
+            nm = "{flName}"
+            v = flValue
+        }
     }
-    if ((nm != "x" && nm != "y" && nm != "z" && nm != "w") ||
+    if (v == null ||
+        (nm != "x" && nm != "y" && nm != "z" && nm != "w") ||
         !is_float_vec(expr_bt(v)) || expr_bt(e) != Type.tFloat) return false
     base = v
     baseKey = describe(v)
@@ -2938,6 +3483,251 @@ def private ctor_fuse_rewrite(var that : ExprCall?; no_fast_math : bool) : Expre
     return new ExprOp2(at = that.at, op := "*", left = nc, right = new ExprConstFloat(at = that.at, value = bestC))
 }
 
+// ===== horizontal add → dot re-pack =====
+// `v.x + v.y (+ v.z + v.w)` — and weighted/negated lanes `v.x * c` — collapse into `dot(v, mask)`: one
+// node where every lane read is an instruction. Fast-math (reorders adds, ×0 a dead-lane inf/NaN).
+
+def private float_vec_dim(bt : Type) : int {
+    if (bt == Type.tFloat2) return 2
+    if (bt == Type.tFloat3) return 3
+    if (bt == Type.tFloat4) return 4
+    return 0
+}
+
+def private lane_index(comp : string) : int {
+    if (comp == "x") return 0
+    if (comp == "y") return 1
+    if (comp == "z") return 2
+    return 3
+}
+
+struct private DotGroup {
+    base : ExpressionPtr        // first lane's base node, reused as the dot's vector arg
+    dim : int
+    weights : float4
+    nterms : int
+}
+
+// One additive term as a (possibly const-weighted) lane read: `v.x`, `v.x * c`, `c * v.x`.
+def private dot_term_lane(var e : ExpressionPtr; var baseKey : string&; var base : ExpressionPtr&;
+                          var lane : int&; var w : float&) : bool {
+    var comp = ""
+    if (component_read_of(e, baseKey, base, comp)) {
+        lane = lane_index(comp)
+        w = 1.0
+        return true
+    }
+    var l, r : ExpressionPtr
+    if (!qmatch(e, $e(l) * $e(r)).matched) return false    // nolint:STYLE016 (qmatch macro expansion)
+    var c = 0.0
+    if (scalar_float_const(r, c) && component_read_of(l, baseKey, base, comp)) {
+        lane = lane_index(comp)
+        w = c
+        return true
+    }
+    if (scalar_float_const(l, c) && component_read_of(r, baseKey, base, comp)) {
+        lane = lane_index(comp)
+        w = c
+        return true
+    }
+    return false
+}
+
+// Bucket a chain's terms into per-base lane groups; `tKey[i]` carries term i's group key ("" for
+// a non-lane term). Shared by the fuser and the residual oracle — ONE gate, so a survivor is
+// always a fuser miss.
+def private dot_chain_groups(var terms : array<ReTerm>; var groups : table<string; DotGroup>;
+                             var tKey : array<string>) : bool {
+    tKey |> resize(length(terms))
+    for (i in range(length(terms))) {
+        var baseKey = ""
+        var base : ExpressionPtr
+        var lane = 0
+        var w = 0.0
+        if (!dot_term_lane(terms[i].e, baseKey, base, lane, w)) {
+            continue
+        }
+        tKey[i] = baseKey
+        if (terms[i].neg) {
+            w = -w
+        }
+        if (!key_exists(groups, baseKey)) {
+            groups[baseKey] = DotGroup(base = base, dim = float_vec_dim(expr_bt(base)))
+        }
+        groups[baseKey].weights[lane] += w
+        groups[baseKey].nterms ++
+    }
+    var any = false
+    for (g in values(groups)) {
+        if (g.nterms >= 2) {
+            any = true
+        }
+    }
+    return any
+}
+
+def private has_unfused_lane_dot(var that : ExprOp2?) : bool {
+    if (that == null || !(that.op == "+" || that.op == "-") || expr_bt(that) != Type.tFloat) return false
+    var terms : array<ReTerm>
+    collect_add(that, false, terms)
+    var groups : table<string; DotGroup>
+    var tKey : array<string>
+    let any = dot_chain_groups(terms, groups, tKey)
+    unsafe {
+        delete terms
+        delete groups
+    }
+    delete tKey
+    return any
+}
+
+// Rebuild the chain with every ≥2-lane group collapsed to `dot(base, mask)` — emitted at the
+// group's first term, term order otherwise preserved; null when no group qualifies. Operand
+// nodes are reused (each lands in one slot); the fused lane reads just drop.
+def private dot_fold_chain(var that : ExpressionPtr; var terms : array<ReTerm>) : ExpressionPtr {
+    var groups : table<string; DotGroup>
+    var tKey : array<string>
+    if (!dot_chain_groups(terms, groups, tKey)) {
+        unsafe {
+            delete groups
+        }
+        delete tKey
+        return null
+    }
+    var emitted : table<string>
+    var newTerms : array<ReTerm>
+    for (i in range(length(terms))) {
+        let k = tKey[i]
+        if (k == "") {
+            newTerms |> push(terms[i])
+            continue
+        }
+        var g = groups?[k] ?? default<DotGroup>
+        if (g.nterms < 2) {
+            newTerms |> push(terms[i])
+            continue
+        }
+        if (key_exists(emitted, k)) {
+            continue
+        }
+        emitted |> insert(k)
+        var lanes : array<ExpressionPtr>
+        lanes |> reserve(g.dim)
+        for (li in range(g.dim)) {
+            lanes |> push(new ExprConstFloat(at = that.at, value = g.weights[li]))
+        }
+        var cll = new ExprCall(at = that.at, name := "dot")
+        emplace(cll.arguments, g.base)
+        var mask = make_float_ctor(g.dim, that.at, lanes)
+        emplace(cll.arguments, mask)
+        newTerms |> push(ReTerm(neg = false, e = cll))
+        unsafe {
+            delete lanes
+        }
+    }
+    var r = build_chain(newTerms, that.at, "+", "-")
+    unsafe {
+        delete groups
+        delete newTerms
+    }
+    delete tKey
+    delete emitted
+    return r
+}
+
+// Top-down rewrite over the closed post-flatten node set: fold each maximal `+`/`-` chain once
+// (a bottom-up visitor would fold a sub-chain first and strand the outer lanes), recursing into
+// chain leaves and every other child slot.
+def private dot_fold_expr(var e : ExpressionPtr; var changed : bool&) : ExpressionPtr {
+    if (e == null) return null
+    if (e is ExprOp2) {
+        var o = e as ExprOp2
+        if ((o.op == "+" || o.op == "-") && expr_bt(o) == Type.tFloat) {
+            var terms : array<ReTerm>
+            collect_add(e, false, terms)
+            for (t in terms) {
+                // a chain leaf is never itself a chain, so the result is always `t.e` back
+                dot_fold_expr(t.e, changed)
+            }
+            var r = dot_fold_chain(e, terms)
+            unsafe {
+                delete terms
+            }
+            if (r != null) {
+                changed = true
+                return r
+            }
+            return e
+        }
+        o.left = dot_fold_expr(o.left, changed)
+        o.right = dot_fold_expr(o.right, changed)
+    } elif (e is ExprOp1) {
+        var o = e as ExprOp1
+        o.subexpr = dot_fold_expr(o.subexpr, changed)
+    } elif (e is ExprOp3) {
+        var o = e as ExprOp3
+        o.subexpr = dot_fold_expr(o.subexpr, changed)
+        o.left = dot_fold_expr(o.left, changed)
+        o.right = dot_fold_expr(o.right, changed)
+    } elif (e is ExprCall) {
+        var c = e as ExprCall
+        for (i in range(length(c.arguments))) {
+            c.arguments[i] = dot_fold_expr(c.arguments[i], changed)
+        }
+    } elif (e is ExprField) {
+        var o = e as ExprField
+        o.value = dot_fold_expr(o.value, changed)
+    } elif (e is ExprSwizzle) {
+        var o = e as ExprSwizzle
+        o.value = dot_fold_expr(o.value, changed)
+    } elif (e is ExprRef2Value) {
+        var o = e as ExprRef2Value
+        o.subexpr = dot_fold_expr(o.subexpr, changed)
+    } elif (e is ExprCast) {
+        var o = e as ExprCast
+        o.subexpr = dot_fold_expr(o.subexpr, changed)
+    } elif (e is ExprPtr2Ref) {
+        var o = e as ExprPtr2Ref
+        o.subexpr = dot_fold_expr(o.subexpr, changed)
+    } elif (e is ExprAt) {
+        var o = e as ExprAt
+        o.subexpr = dot_fold_expr(o.subexpr, changed)
+        o.index = dot_fold_expr(o.index, changed)
+    } elif (e is ExprMakeTuple) {
+        var o = e as ExprMakeTuple
+        for (vi in range(length(o.values))) {
+            o.values[vi] = dot_fold_expr(o.values[vi], changed)
+        }
+    } elif (e is ExprMakeStruct) {
+        var ms = e as ExprMakeStruct
+        for (si in range(length(ms.structs))) {
+            for (fld in *(ms.structs[si])) {
+                fld.value = dot_fold_expr(fld.value, changed)
+            }
+        }
+    }
+    return e
+}
+
+def private dot_fold_stmt(var s : ExpressionPtr; var changed : bool&) {
+    if (s is ExprLet) {
+        var lc = s as ExprLet
+        for (lv in lc.variables) {
+            if (lv.init != null) {
+                lv.init = dot_fold_expr(lv.init, changed)
+            }
+        }
+    } elif (s is ExprCopy) {
+        var cp = s as ExprCopy
+        cp.right = dot_fold_expr(cp.right, changed)
+    } elif (s is ExprReturn) {
+        var rt = s as ExprReturn
+        if (rt.subexpr != null) {
+            rt.subexpr = dot_fold_expr(rt.subexpr, changed)
+        }
+    }
+}
+
 class private CtorFuseVisitor : AstVisitor {
     changed : bool
     noFastMath : bool
@@ -2998,12 +3788,17 @@ class private LerpFuseVisitor : AstVisitor {
 class private FuseResidualVisitor : AstVisitor {
     checkMad : bool
     checkLerp : bool
+    checkDot : bool
     noFastMath : bool
     foundMad : bool
     foundLerp : bool
     foundNegAdd : bool
     foundCtor : bool
+    foundDot : bool
     def override preVisitExprOp2(var expr : ExprOp2?) : void {
+        if (checkDot && has_unfused_lane_dot(expr)) {
+            foundDot = true
+        }
         if (!checkMad) {
             return
         }
@@ -3035,12 +3830,23 @@ class private FuseResidualVisitor : AstVisitor {
 }
 
 def public fuse_body(var func : FunctionPtr; no_fast_math : bool = false) : bool {
-    //! PHASE_FUSED finishing pass: re-pack ctor lane patterns (re-vectorize / shared factor),
-    //! `a*b ± c` into `mad(a,b,c)`, and the expanded lerp shape `mad(b - a, t, a)` back into
-    //! `lerp(a, b, t)` over the optimized, re-inferred body. Caller re-infers after each round.
+    //! PHASE_FUSED finishing pass: collapse same-vector lane sums into `dot(v, mask)`, re-pack
+    //! ctor lane patterns (re-vectorize / shared factor), `a*b ± c` into `mad(a,b,c)`, and the
+    //! expanded lerp shape back into `lerp(a, b, t)`. Caller re-infers after each round.
     if (!(func.body is ExprBlock)) return false
     var changed = false
-    // ctor re-pack first — its `ctor * s` / vector-op output feeds the mad walk this same round
+    // hadd → dot first — the mad walk would otherwise steal a weighted lane (`v.x * w + rest`)
+    if (!no_fast_math && fuse_callable(func._module, "dot", 2)) {
+        var blk = func.body as ExprBlock
+        var dchanged = false
+        for (s in blk.list) {
+            dot_fold_stmt(s, dchanged)
+        }
+        if (dchanged) {
+            changed = true
+        }
+    }
+    // ctor re-pack next — its `ctor * s` / vector-op output feeds the mad walk this same round
     var cv = new CtorFuseVisitor()
     cv.noFastMath = no_fast_math
     make_visitor(*cv) $(adapter) {
