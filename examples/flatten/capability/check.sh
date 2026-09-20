@@ -415,6 +415,53 @@ else
     fail=1
 fi
 
+echo "22. cap_helper_swizzle.shader (helper swizzles a by-value vector param -> inlined cleanly)"
+out="$(compile "$here/cap_helper_swizzle.shader")"
+nodes="$(echo "$out" | grep -c '^node ')"
+errs="$(echo "$out" | grep -ci error)"
+# the helper reads p.x/p.y/p.z; flatten inlines it and copy-prop substitutes the (value) argument
+# into the swizzle base. Before the typer folded ref2value-of-a-value this failed with error[30921]
+# "can only dereference a reference". A clean compile proves the swizzled-param helper inlined.
+if [[ "$errs" -eq 0 && "$nodes" -gt 0 ]]; then
+    echo "   ok — compiles ($nodes nodes); the swizzled-param helper inlined cleanly"
+else
+    echo "   FAIL — errors=$errs nodes=$nodes"
+    echo "$out" | grep -i error | head
+    fail=1
+fi
+
+echo "23. cap_inline_accumulator.shader (var accumulator in an inlined helper + parallel loop)"
+out="$(compile "$here/cap_inline_accumulator.shader")"
+nodes="$(echo "$out" | grep -c '^node ')"
+errs="$(echo "$out" | grep -ci error)"
+# the helper's `var threshold` accumulator is uniquified to __flat_loc_N when inlined; ssa_rename
+# must SSA-rename it like a user accumulator. Before that, it stayed a self-referential var whose
+# live init a later DSE stripped -> error[50503] undefined __flat_loc_N. (The dithering shader.)
+if [[ "$errs" -eq 0 && "$nodes" -gt 0 ]]; then
+    echo "   ok — compiles ($nodes nodes); the inlined-helper accumulator was SSA-renamed"
+else
+    echo "   FAIL — errors=$errs nodes=$nodes"
+    echo "$out" | grep -i error | head
+    fail=1
+fi
+
+echo "24. cap_rcp_shared.shader (uniform divisor also used as a multiplier -> still rcp'd)"
+out="$(FLATTEN_DUMP_DAS=1 compile "$here/cap_rcp_shared.shader")"
+rcps="$(echo "$out" | grep -c 'let _preshader_.*1f /')"
+divs="$(echo "$out" | grep -v 'let _preshader_' | grep -c '/ _preshader')"
+errs="$(echo "$out" | grep -ci error)"
+# `slice` is used as BOTH divisor and multiplier, so its value is CSE'd into a uniform _preshader_
+# let; the rcp-rewrite must still see through that freshly-hoisted (un-typed) divisor. With the fix
+# one shared `_preshader_N = 1f / slice` reciprocal exists and the per-pixel body has no `/ _preshader`
+# division — before it, the un-typed divisor read as `none` so the rcp gate skipped it (residual divide).
+if [[ "$errs" -eq 0 && "$rcps" -ge 1 && "$divs" -eq 0 ]]; then
+    echo "   ok — shared reciprocal preshader let; no per-pixel division by the CSE'd uniform"
+else
+    echo "   FAIL — errors=$errs rcp_lets=$rcps residual_divs=$divs (expected >=1 and 0)"
+    echo "$out" | grep -i error | head
+    fail=1
+fi
+
 echo
 if [[ "$fail" -eq 0 ]]; then echo "capability: all checks passed"; else echo "capability: FAILED"; fi
 exit $fail

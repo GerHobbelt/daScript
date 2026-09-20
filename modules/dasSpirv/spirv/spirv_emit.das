@@ -507,6 +507,18 @@ def private storage_image_info(t : TypeDecl?) : tuple<ok : bool; dim : SpvDim> {
     return (ok = false, dim = SpvDim._2D)
 }
 
+// Map a GLSL-style storage-image format qualifier (`@format = "r32f"`) to its SpvImageFormat. Only the
+// float-sampled formats are supported -- integer formats (r32i/r32ui/...) would need int/uint
+// imageLoad/imageStore overloads, a separate scope. ok=false -> caller emits a fail-closed error.
+def private parse_storage_image_format(s : string) : tuple<ok : bool; fmt : SpvImageFormat> {
+    if (s == "" || s == "rgba8") return (ok = true, fmt = SpvImageFormat.Rgba8)
+    if (s == "rgba8_snorm") return (ok = true, fmt = SpvImageFormat.Rgba8Snorm)
+    if (s == "rgba16f") return (ok = true, fmt = SpvImageFormat.Rgba16f)
+    if (s == "rgba32f") return (ok = true, fmt = SpvImageFormat.Rgba32f)
+    if (s == "r32f") return (ok = true, fmt = SpvImageFormat.R32f)
+    return (ok = false, fmt = SpvImageFormat.Rgba8)
+}
+
 // subpassInput is the opaque marker for a Vulkan subpass input attachment. Same recognition pattern
 // as sampler/image globals -- a tStructure named "subpassInput" -> Dim=SubpassData OpTypeImage in
 // UniformConstant storage (sampled=2, no format), decorated with InputAttachmentIndex, sampled via
@@ -852,11 +864,18 @@ def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : Variable
         return
     }
     // storage image: a global of an opaque image type (image2D) -> UniformConstant OpTypeImage with a
-    // KNOWN format (Rgba8, sampled=2) so no without-format capability is required. DescriptorSet/Binding;
-    // read/written via imageLoad/imageStore. Not in the entry interface (UniformConstant, SPIR-V <= 1.3).
+    // KNOWN format (default Rgba8, or @format = "r32f"/"rgba16f"/...; sampled=2) so no without-format
+    // capability is required. DescriptorSet/Binding; read/written via imageLoad/imageStore. Not in the
+    // entry interface (UniformConstant, SPIR-V <= 1.3).
     let ii = storage_image_info(v._type)
     if (ii.ok) {
-        let img = type_image(m, type_float(m, 32u), ii.dim, 0u, 2u, SpvImageFormat.Rgba8)
+        let fmt_str = v.annotation |> find_arg("format") ?as tString ?? "rgba8"
+        let pf = parse_storage_image_format(fmt_str)
+        if (!pf.ok) {
+            errors |> push("storage image '{vname}': unsupported @format '{fmt_str}' (supported: rgba8, rgba8_snorm, rgba16f, rgba32f, r32f)")
+            return
+        }
+        let img = type_image(m, type_float(m, 32u), ii.dim, 0u, 2u, pf.fmt)
         let pt = type_pointer(m, SpvStorageClass.UniformConstant, img)
         let vid = alloc_id(m)
         emit(m, SEC_TYPES, SpvOp.Variable, pt, vid, uint(SpvStorageClass.UniformConstant))
@@ -1418,6 +1437,19 @@ def private glsl_ext_op(name : string; cls : int) : tuple<ok : bool; op : GLSLst
     return (ok = false, op = GLSLstd450.Round)
 }
 
+//! GLSL.std.450 ops where a scalar operand is allowed against a vector result and the SPIR-V spec
+//! requires it to match the result type — mix/clamp/min/max/step/smoothstep. SPIR-V has no implicit
+//! scalar broadcast, so the emitter must splat such a scalar to the result width (e.g. daslang
+//! lerp(vec, vec, float) -> FMix wants a vector t). Ops NOT here (pow, atan2, distance, …) require
+//! their operands to match exactly and must not be touched.
+def private ext_op_broadcasts_scalar(op : GLSLstd450) : bool {
+    return (op == GLSLstd450.FMix
+        || op == GLSLstd450.FClamp || op == GLSLstd450.SClamp || op == GLSLstd450.UClamp
+        || op == GLSLstd450.FMin   || op == GLSLstd450.SMin   || op == GLSLstd450.UMin
+        || op == GLSLstd450.FMax   || op == GLSLstd450.SMax   || op == GLSLstd450.UMax
+        || op == GLSLstd450.Step   || op == GLSLstd450.SmoothStep)
+}
+
 // ===== compile-time constants: scalars, all-const vector constructors, const arrays =====
 // Produces a deduped OpConstant / OpConstantComposite for a fully-constant expression. Used for
 // array literals (which must be constant initializers for now) and their constituents. ok=false =>
@@ -1431,6 +1463,8 @@ def private emit_const(var m : SpirvModule; e : ExpressionPtr; var errors : arra
     if (ci != null) return (ok = true, id = const_int(m, ci.value))
     let cf = e ?as ExprConstFloat
     if (cf != null) return (ok = true, id = const_float(m, cf.value))
+    let cb = e ?as ExprConstBool
+    if (cb != null) return (ok = true, id = const_bool(m, cb.value))
     // unary minus on a constant: depending on fold state `-0.6` can arrive as ExprOp1("-", const)
     // rather than a folded negative literal. Fold it here so both shapes produce the same constant.
     let neg = e ?as ExprOp1
@@ -1550,14 +1584,30 @@ def private emit_const(var m : SpirvModule; e : ExpressionPtr; var errors : arra
     return (ok = false, id = 0u)
 }
 
+// Splat a scalar id to a vector of `n` lanes (OpCompositeConstruct of n copies of the scalar) ->
+// the splatted vector id. SPIR-V has no implicit scalar->vector broadcast, so an integer vec*scalar
+// must build the vector explicitly before the component-wise OpIMul.
+def private splat_to_vec(var m : SpirvModule; vec_type : uint; scalar_id : uint; n : int) : uint {
+    let res = alloc_id(m)
+    var cons <- [vec_type, res]
+    cons |> reserve(2 + n)
+    for (_k in range(n)) {
+        cons |> push(scalar_id)
+    }
+    emit_n(m, SEC_FUNCS, SpvOp.CompositeConstruct, cons)
+    delete cons
+    return res
+}
+
 // ===== `*` over matrices / vectors / scalars =====
 // SPIR-V splits multiplication by operand shape: OpMatrixTimesMatrix / OpMatrixTimesVector /
 // OpVectorTimesScalar. Plain component-wise FMul/IMul (the scalar binop path) only works when both
 // operands have the SAME shape, so the mixed cases are routed here first. Returns handled=false for
 // same-shape operands (let binop_code emit FMul/IMul); handled=true with id=0 on an unsupported mix
-// (error already pushed). Operands l/r are pre-emitted result-ids. Only the daslang-defined matrix
-// operators are handled (matrix*matrix, matrix*vector, and float vector*scalar either order);
-// daslang has no matrix*scalar or vector*matrix operator, so those SPIR-V ops are intentionally absent.
+// (error already pushed). Operands l/r are pre-emitted result-ids. Handled: matrix*matrix,
+// matrix*vector, float vector*scalar (OpVectorTimesScalar, either order), and integer vector*scalar
+// (splat + OpIMul, either order). daslang has no matrix*scalar or vector*matrix operator, so those
+// SPIR-V ops are intentionally absent.
 def private emit_mul(var m : SpirvModule; op2 : ExprOp2?; e : ExpressionPtr; l, r : uint; var errors : array<string>) : tuple<handled : bool; id : uint> {
     let lmat = matrix_info(op2.left._type)
     let rmat = matrix_info(op2.right._type)
@@ -1577,8 +1627,14 @@ def private emit_mul(var m : SpirvModule; op2 : ExprOp2?; e : ExpressionPtr; l, 
         emit(m, SEC_FUNCS, SpvOp.VectorTimesScalar, rt, res, l, r)
     } elif (rcc > 1 && lcc == 1 && lcls == 2 && rcls == 2) {
         emit(m, SEC_FUNCS, SpvOp.VectorTimesScalar, rt, res, r, l)   // SPIR-V wants the vector first
+    } elif (lcc > 1 && rcc == 1 && lcls == rcls && lcls >= 0 && lcls != 2) {
+        // integer vector * integer scalar: there is no OpVectorTimesScalar for ints, so splat the
+        // scalar to the vec width and do a component-wise OpIMul (sign-agnostic, valid for int + uint).
+        emit(m, SEC_FUNCS, SpvOp.IMul, rt, res, l, splat_to_vec(m, rt, r, lcc))
+    } elif (rcc > 1 && lcc == 1 && lcls == rcls && lcls >= 0 && lcls != 2) {
+        emit(m, SEC_FUNCS, SpvOp.IMul, rt, res, splat_to_vec(m, rt, l, rcc), r)
     } else {
-        errors |> push("unsupported '*' between {op2.left._type.baseType} and {op2.right._type.baseType} (integer vector/scalar mixes need a splat)")
+        errors |> push("unsupported '*' between {op2.left._type.baseType} and {op2.right._type.baseType}")
         return (handled = true, id = 0u)
     }
     return (handled = true, id = res)
@@ -1804,6 +1860,11 @@ class SpirvEmit : AstVisitor {
     def override visitExprConstFloat(var expr : ExprConstFloat?) : ExpressionPtr {
         var bm & = unsafe(*m)
         e2id[intptr(expr)] = const_float(bm, expr.value)
+        return expr
+    }
+    def override visitExprConstBool(var expr : ExprConstBool?) : ExpressionPtr {
+        var bm & = unsafe(*m)
+        e2id[intptr(expr)] = const_bool(bm, expr.value)
         return expr
     }
 
@@ -2330,7 +2391,34 @@ class SpirvEmit : AstVisitor {
                 e2pty[k] = pointee
                 return expr
             }
-            errs |> push("member access '.{expr.name}' is only supported on a @uniform/@ssbo/@push_constant block global or an indexed ssbo struct element for now")
+            // member of a local struct VALUE (e.g. `let inst = instances[i]; inst.pos_scale`): the let
+            // holds the loaded composite (value_of in visitExprLetVariable), so extract the member by
+            // index -- the value-path twin of the e2ptr access-chain branch above. Reads only (a `let`).
+            // Gate on the base having actually lowered to a value id (e2id): a struct-typed base that did
+            // NOT lower (e.g. an unsupported struct-returning call `foo().field`) falls through to the
+            // clean "not supported" error below, rather than a confusing "internal: no rvalue" out of value_of.
+            let lest = expr.value._type.structType
+            if (lest != null && key_exists(e2id, intptr(expr.value))) {
+                let lmidx = field_index_by_name(lest, "{expr.name}")
+                if (lmidx < 0) {
+                    errs |> push("member access '.{expr.name}': no such field on '{lest.name}'")
+                    return expr
+                }
+                // A nested struct / fixed-array member would need its laid-out type to match the loaded
+                // composite -- not handled here; fail closed rather than emit a mismatched extract.
+                if (expr._type != null && (expr._type.baseType == Type.tStructure || expr._type.baseType == Type.tFixedArray)) {
+                    errs |> push("member access '.{expr.name}': struct/array members of a local struct value are not yet supported; read the member directly from its source block element/field instead of copying the struct into a local")
+                    return expr
+                }
+                let lbase = value_of(expr.value)
+                if (lbase == 0u) return expr   // base failed to lower (error already pushed)
+                let lrt = emit_type(bm, expr._type)
+                let lres = alloc_id(bm)
+                emit(bm, SEC_FUNCS, SpvOp.CompositeExtract, lrt, lres, lbase, uint(lmidx))
+                e2id[k] = lres
+                return expr
+            }
+            errs |> push("member access '.{expr.name}' is only supported on a @uniform/@ssbo/@push_constant block global, an indexed ssbo struct element, or a local struct value for now")
             return expr
         }
         let gi = ctx.globals?[intptr(bv)] ?? GlobalInfo()
@@ -3020,11 +3108,28 @@ class SpirvEmit : AstVisitor {
             let rt = emit_type(bm, expr._type)
             let res = alloc_id(bm)
             var ops <- [rt, res, set, uint(ge.op)]
+            // SPIR-V has no implicit scalar->vector broadcast. For the ops that allow a scalar operand
+            // against a vector result (mix/clamp/min/max/step/smoothstep), splat any scalar operand to
+            // the result width via OpCompositeConstruct so the OpExtInst is valid. This is what makes
+            // daslang lerp(vec, vec, float) emit correctly instead of an invalid (scalar-t) FMix.
+            let result_n = component_count(expr._type.baseType)
+            let broadcast = result_n > 1 && ext_op_broadcasts_scalar(ge.op)
             for (a in expr.arguments) {
-                let aid = value_of(a)
+                var aid = value_of(a)
                 if (aid == 0u) {
                     delete ops
                     return expr
+                }
+                if (broadcast && component_count(a._type.baseType) == 1) {
+                    let sres = alloc_id(bm)
+                    var cons <- [rt, sres]
+                    cons |> reserve(2 + result_n)
+                    for (_l in range(result_n)) {
+                        cons |> push(aid)
+                    }
+                    emit_n(bm, SEC_FUNCS, SpvOp.CompositeConstruct, cons)
+                    delete cons
+                    aid = sres
                 }
                 ops |> push(aid)
             }

@@ -658,6 +658,45 @@ def public storimg_words : array<uint> {
     return clone_to_move(storimg_spv)
 }
 
+// ===== storage-image @format qualifier: a bare image2D stays Rgba8 (default, back-compat); an
+// @format = "r32f" image2D lowers to OpTypeImage format R32f (the Hi-Z depth-pyramid storage format).
+// imageLoad/imageStore emit is format-agnostic (format lives on OpTypeImage), so the same ops serve both.
+// Two distinct-format images -> two distinct OpTypeImage. spirv-val'd. =====
+var @binding = 0 @format = "r32f" fmt_hzb : image2D
+var @binding = 1 fmt_dst : image2D
+[compute_shader(local_size_x=8, local_size_y=8, name="imgfmt_spv"), marker(no_coverage)]
+def imgfmt {
+    let gid = gl_GlobalInvocationID
+    let coord = int2(int(gid.x), int(gid.y))
+    let d = imageLoad(fmt_hzb, coord)                            // OpImageRead on the R32f image
+    imageStore(fmt_dst, coord, float4(d.x, 0.0f, 0.0f, 1.0f))    // OpImageWrite on the default Rgba8 image
+}
+
+def public imgfmt_words : array<uint> {
+    return clone_to_move(imgfmt_spv)
+}
+
+// ===== local struct value member access: `let e = ssbo[i]; e.field` copies an SSBO struct element into
+// an immutable local, then reads members off it. The let holds the loaded composite (OpLoad of the whole
+// struct), so each member access lowers to OpCompositeExtract -- the value-path twin of the indexed
+// access-chain form (`ssbo[i].field`). Reads only. spirv-val'd. =====
+struct LsvElem {
+    a : float4
+    b : float4
+}
+var @ssbo @binding = 0 lsv_in : array<LsvElem>
+var @ssbo @binding = 1 lsv_out : array<float4>
+[compute_shader(local_size_x=64, name="lsvmember_spv"), marker(no_coverage)]
+def lsvmember {
+    let i = int(gl_GlobalInvocationID.x)
+    let e = lsv_in[i]              // local copy of an SSBO struct element (OpLoad of the whole composite)
+    lsv_out[i] = e.a + e.b         // two member reads -> exactly two OpCompositeExtract (no swizzles)
+}
+
+def public lsvmember_words : array<uint> {
+    return clone_to_move(lsvmember_spv)
+}
+
 // ===== Phase-7.2 explicit-LOD + texel fetch: textureLod -> OpImageSampleExplicitLod (Lod operand),
 // texelFetch -> OpImage (extract image from the sampled image) + OpImageFetch. Both are derivative-free,
 // so this fixture samples in a COMPUTE shader -- proving the stage lift (texture() is fragment-only). =====
