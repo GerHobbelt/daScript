@@ -19,7 +19,7 @@ namespace das {
         template<typename T>
         __forceinline bool read ( T & data ) {
             if ( bufferPos + sizeof(T) < buffer.size() ) {
-                data = *(T*)(buffer.data() + bufferPos);
+                memcpy((void*)&data, buffer.data() + bufferPos, sizeof(T));  // buffer offsets are arbitrary — no aligned punning
                 bufferPos += sizeof(T);
                 return true;
             }
@@ -221,10 +221,10 @@ namespace das {
         AstSerializer & serializeModule ( Module & module, bool already_exists );
 
         static constexpr uint32_t getVersion () {
-            return 101;   // 101: 16/8-bit type lattice tags (100: tune_frozen, 99: distinct types)
+            return 102;   // 102: auto_inline_functions/auto_inline_cost policies + neverInline flag (101: 16/8-bit lattice, 100: tune_frozen)
         }
 
-        void serializeProgram ( ProgramPtr program, ModuleGroup & libGroup ) noexcept;
+        void serializeProgram ( ProgramPtr program, ModuleGroup & libGroup );
         bool serializeScript ( ProgramPtr program ) noexcept;
 
         template <uint64_t n>
