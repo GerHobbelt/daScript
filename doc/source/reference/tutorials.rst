@@ -262,6 +262,8 @@ Run from the project root, always with ``-jit``::
    tutorials/dasLLAMA_04_sessions_and_memory.rst
    tutorials/dasLLAMA_05_performance.rst
    tutorials/dasLLAMA_06_add_an_arch.rst
+   tutorials/dasLLAMA_07_speech_to_text.rst
+   tutorials/dasLLAMA_08_audio_chat.rst
 
 .. _tutorials_dasopenai:
 
@@ -430,6 +432,7 @@ Run any tutorial from the project root::
    tutorials/dasAudio_08_midi.rst
    tutorials/dasAudio_09_playback_status.rst
    tutorials/dasAudio_10_global_controls.rst
+   tutorials/dasAudio_11_recording.rst
 
 .. _tutorials_dasminfft:
 
