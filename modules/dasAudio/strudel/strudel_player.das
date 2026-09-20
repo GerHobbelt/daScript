@@ -17,6 +17,7 @@ require strudel/strudel_scheduler
 require strudel/strudel_sf2
 require audio/audio_boost
 require audio
+require daslib/rtti
 require daslib/jobque_boost
 require daslib/archive
 require daslib/fio
@@ -668,7 +669,10 @@ def public strudel_play(cmd_fn : function<(cmd : string) : void> = @@strudel_noo
         g_wall_time = double(g_wall_samples) / double(SAMPLE_RATE)
         // update playback time for main thread
         if (g_playback_box != null) {
-            g_playback_box |> set(PlaybackTime(wall_time = g_wall_time, cps = g_cps))
+            g_playback_box |> update() $(var pt : PlaybackTime#) {
+                pt.wall_time = g_wall_time
+                pt.cps = g_cps
+            }
         }
         // buffer level feedback
         var que_len = 0
@@ -690,19 +694,6 @@ def public strudel_play(cmd_fn : function<(cmd : string) : void> = @@strudel_noo
             to_log(0, "strudel mem: heap {mem_heap_cur/1024ul}kb / str {mem_str_cur/1024ul}kb (max heap {mem_heap_max/1024ul}kb / str {mem_str_max/1024ul}kb)\n")
         }
     }
-    if (total_samples > 0ul) {
-        let SPEED = total_time / double(total_samples)
-        let SPEED_OF_LIGHT = 1000.lf / 48000.lf
-        let UTILIZATION = int(SPEED / SPEED_OF_LIGHT * 1000.lf)
-        let chunk_budget_usec = double(CHUNK_SEC) * 1000000.lf
-        let MAX_UTIL = int(max_chunk_usec / chunk_budget_usec * 1000.lf)
-        let delta_heap = int64(mem_heap_max) - int64(mem_heap_base)
-        let delta_str = int64(mem_str_max) - int64(mem_str_base)
-        to_log(0, "strudel {UTILIZATION/10}.{UTILIZATION%10}% avg, {MAX_UTIL/10}.{MAX_UTIL%10}% peak util, heap {mem_heap_max/1024ul}kb (delta {delta_heap}), str {mem_str_max/1024ul}kb (delta {delta_str})\n")
-        if (delta_heap > LEAK_WARN_THRESHOLD || delta_str > LEAK_WARN_THRESHOLD) {
-            to_log(0, "strudel WARNING: potential memory leak detected (delta heap={delta_heap}, str={delta_str})\n")
-        }
-    }
     pcm_box |> join()
     unsafe(lock_box_remove(pcm_box))
     ma_volume_mixer_uninit(unsafe(addr(mixer)))
@@ -710,6 +701,33 @@ def public strudel_play(cmd_fn : function<(cmd : string) : void> = @@strudel_noo
     clear_status(status_box)
     status_box |> join()
     unsafe(lock_box_remove(status_box))
+    delete output
+    // release thread-local tracks so sample voices and orbit buses are freed
+    // before the leak-check below (and before the context dies).
+    for (i in range(length(g_tracks))) {
+        if (g_tracks[i] != null) {
+            shutdown_scheduler(g_tracks[i].sched)
+            unsafe { delete g_tracks[i]; }
+            g_tracks[i] = null
+        }
+    }
+    delete g_tracks
+    if (total_samples > 0ul) {
+        let SPEED = total_time / double(total_samples)
+        let SPEED_OF_LIGHT = 1000.lf / 48000.lf
+        let UTILIZATION = int(SPEED / SPEED_OF_LIGHT * 1000.lf)
+        let chunk_budget_usec = double(CHUNK_SEC) * 1000000.lf
+        let MAX_UTIL = int(max_chunk_usec / chunk_budget_usec * 1000.lf)
+        // leak = heap after cleanup minus baseline; peak is just informational.
+        let mem_heap_final = heap_bytes_allocated()
+        let mem_str_final = string_heap_bytes_allocated()
+        let leak_heap = int64(mem_heap_final) - int64(mem_heap_base)
+        let leak_str = int64(mem_str_final) - int64(mem_str_base)
+        to_log(0, "strudel {UTILIZATION/10}.{UTILIZATION%10}% avg, {MAX_UTIL/10}.{MAX_UTIL%10}% peak util, heap peak {mem_heap_max/1024ul}kb final {mem_heap_final/1024ul}kb (leak {leak_heap}), str peak {mem_str_max/1024ul}kb final {mem_str_final/1024ul}kb (leak {leak_str})\n")
+        if (leak_heap > LEAK_WARN_THRESHOLD || leak_str > LEAK_WARN_THRESHOLD) {
+            to_log(0, "strudel WARNING: potential memory leak detected (leak heap={leak_heap}, str={leak_str})\n")
+        }
+    }
 }
 
 def public strudel_init(fn : function<() : void>; cmd_fn : function<(cmd : string) : void> = @@strudel_noop_cmd) {
@@ -741,6 +759,8 @@ def public strudel_init(fn : function<() : void>; cmd_fn : function<(cmd : strin
     let cps = g_cps
     let la = g_look_ahead
     new_thread() <| @capture(= fn, = bank_ptr, = sf2_ptr, = audio_ch, = cmd_st, = done_st, = pb_box, = wt, = cps, = la, = thread_sid) {
+        // name it
+        this_context().name := "strudel_thread"
         // inject shared resources into thread context
         g_bank_ptr = bank_ptr
         unsafe {
@@ -754,9 +774,8 @@ def public strudel_init(fn : function<() : void>; cmd_fn : function<(cmd : strin
         g_wall_time = wt
         g_cps = cps
         g_look_ahead = la
-        // run user setup + play loop
+        // run user setup + play loop (strudel_play releases thread-local tracks on exit)
         invoke(fn)
-        // cleanup
         unsafe {
             set_audio_thread_command_stream(null)
         }
@@ -816,6 +835,8 @@ def public strudel_shutdown() {
         g_sf2 = null
         g_sf2_path := ""
     }
+    // release sample bank (each Sample owns a large array<float>; table finalizer drops all variations)
+    delete g_bank.sounds
     // utilization stats
     if (g_tick_total_samples > 0ul) {
         let SPEED = g_tick_total_time / double(g_tick_total_samples)

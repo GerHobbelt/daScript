@@ -19,6 +19,7 @@ require daslib/jobque_boost
 require daslib/archive
 require strudel/strudel_player
 require daslib/fio
+require daslib/rtti
 require math
 
 // ─── GM Instrument Presets ───
@@ -1048,6 +1049,7 @@ def public midi_init() {
     let audio_ch = get_audio_command_stream()
     let vis_ptr = g_midi_audio_vis_ptr
     new_thread() <| @capture(= sid, = cmd_st, = done_st, = audio_ch, = vis_ptr) {
+        this_context().name := "midi_thread"
         midi_thread_main(sid, cmd_st, done_st, audio_ch, vis_ptr)
         cmd_st = null
         done_st = null
@@ -1171,6 +1173,9 @@ def public midi_shutdown() {
         }
         g_midi_sf2 = null
     }
+    // release sample bank and parsed MIDI files
+    delete g_midi_bank.sounds
+    delete g_midi_files
 }
 
 def public midi_is_playing() : bool {

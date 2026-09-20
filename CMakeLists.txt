@@ -26,6 +26,7 @@ option(DAS_AOT_EXAMPLES_DISABLED "Disable dasAOT examples" OFF)
 option(DAS_TUTORIAL_DISABLED "Disable dasTutorial" OFF)
 option(DAS_TESTS_DISABLED "Disable dasTests" OFF)
 option(DAS_BUILD_DOCUMENTATION "Build HTML documentation via Sphinx during install" OFF)
+option(DAS_ENABLE_PIC "Build static libs as position-independent code (UNIX, required to link into shared objects)" ON)
 # RelWithDebInfo is permanently our heap-leak tracking / audit build.
 # DAS_TRACK_ALLOC=1 (and the global new/delete override) are auto-enabled below
 # via generator expressions; tracker source files are #if DAS_TRACK_ALLOC-gated
@@ -97,6 +98,11 @@ endif()
 ENDIF()
 
 SETUP_COMPILER()
+
+IF(UNIX AND DAS_ENABLE_PIC)
+    # On windows PIC is noop.
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+ENDIF()
 
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
@@ -750,12 +756,14 @@ include/daScript/misc/debug_break.h
 include/daScript/misc/instance_debugger.h
 include/daScript/misc/gc_node.h
 include/daScript/misc/job_que.h
+include/daScript/misc/handle_registry.h
 include/daScript/misc/uric.h
 src/misc/gc_node.cpp
 src/misc/sysos.cpp
 src/misc/string_writer.cpp
 src/misc/memory_model.cpp
 src/misc/job_que.cpp
+src/misc/handle_registry.cpp
 src/misc/free_list.cpp
 src/misc/alloc_tracker.cpp
 src/misc/alloc_tracker_fast_stack.cpp
@@ -905,10 +913,10 @@ include/dag_noise/dag_uint_noise.h
 )
 SOURCE_GROUP_FILES("dag_noise" DAGOR_NOISE_SRC)
 
-SET(FLAT_HASH_MAP_SRC
-include/ska/flat_hash_map.hpp
+SET(DAS_HASH_MAP_SRC
+include/das_hash_map/das_hash_map.h
 )
-SOURCE_GROUP_FILES("flat_hash_map" FLAT_HASH_MAP_SRC)
+SOURCE_GROUP_FILES("das_hash_map" DAS_HASH_MAP_SRC)
 
 SET(FAST_FLOAT_SRC
 include/fast_float/fast_float.h
@@ -984,7 +992,7 @@ SET(LIBDASCRIPT_RUNTIME_SRC
     ${PARSER_GENERATED_SRC}
     ${PARSER_SRC} ${VECMATH_SRC} ${AST_SRC} ${SIMULATE_SRC} ${BUILTIN_SRC}
     ${MISC_SRC} ${MAIN_SRC}
-    ${DAGOR_NOISE_SRC} ${FLAT_HASH_MAP_SRC} ${FAST_FLOAT_SRC} ${DASCRIPT_FMT_SRC}
+    ${DAGOR_NOISE_SRC} ${DAS_HASH_MAP_SRC} ${FAST_FLOAT_SRC} ${DASCRIPT_FMT_SRC}
 )
 
 SET(LIBDASCRIPT_COMPILER_SRC
@@ -1269,6 +1277,7 @@ SET(DAS_RELEASE_MISC_INCLUDE
     include/daScript/misc/hash.h
     include/daScript/misc/instance_debugger.h
     include/daScript/misc/job_que.h
+    include/daScript/misc/handle_registry.h
     include/daScript/misc/macro.h
     include/daScript/misc/memory_model.h
     include/daScript/misc/network.h
@@ -1371,8 +1380,8 @@ install(FILES
 )
 
 install(FILES
-    ${FLAT_HASH_MAP_SRC}
-    DESTINATION include/ska
+    ${DAS_HASH_MAP_SRC}
+    DESTINATION include/das_hash_map
 )
 
 install(FILES
@@ -1438,7 +1447,6 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/install/skills DESTINATION ${DAS_INSTALL
 install(FILES ${PROJECT_SOURCE_DIR}/LICENSE DESTINATION ${DAS_INSTALL_DOCDIR})
 install(FILES ${PROJECT_SOURCE_DIR}/3rdparty/uriparser/COPYING DESTINATION ${DAS_INSTALL_DOCDIR} RENAME URIPARSER.LICENSE)
 install(FILES ${PROJECT_SOURCE_DIR}/include/dag_noise/LICENSE DESTINATION ${DAS_INSTALL_DOCDIR} RENAME DAG_NOISE.LICENSE)
-install(FILES ${PROJECT_SOURCE_DIR}/include/ska/LICENSE_1_0.txt DESTINATION ${DAS_INSTALL_DOCDIR} RENAME SKA.LICENSE)
 install(FILES ${PROJECT_SOURCE_DIR}/include/vecmath/LICENSE DESTINATION ${DAS_INSTALL_DOCDIR} RENAME VEC_MATH.LICENSE)
 
 # Install utility scripts

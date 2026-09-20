@@ -107,13 +107,13 @@ namespace das
         virtual bool hasStringData(das_set<void *> & dep) const override;
         virtual void gc_collect ( gc_root * target, gc_root * from ) override {
             Annotation::gc_collect(target, from);
-            for ( auto & fp : fields ) {
+            for ( auto && fp : fields ) {
                 if ( fp.second.decl ) fp.second.decl->gc_collect(target, from);
                 if ( fp.second.constDecl ) fp.second.constDecl->gc_collect(target, from);
             }
         }
         virtual void visitTypeDecls ( const function<void(TypeDecl *)> & callback ) override {
-            for ( auto & fp : fields ) {
+            for ( auto && fp : fields ) {
                 if ( fp.second.decl ) callback(fp.second.decl);
                 if ( fp.second.constDecl ) callback(fp.second.constDecl);
             }
@@ -921,10 +921,28 @@ namespace das
     template <typename T> bool das_handle_nequ ( Handle<T> a, Handle<T> b ) { return a != b; }
 
     template <typename T>
+    void dumpHandleLeaks () {
+        auto & reg = HandleRegistry<T>::instance();
+        if ( reg.live_count() == 0 ) return;
+        TextPrinter tp;
+        string tn = typeName<T>::name();
+        int total = 0;
+        reg.for_each_live([&](Handle<T> h, const shared_ptr<T> & p){
+            uint32_t idx = uint32_t(h.value & 0xFFFFFFFFu) - 1;
+            uint32_t gen = uint32_t(h.value >> 32);
+            tp << "  Handle<" << tn << "> idx=" << idx << " gen=" << gen
+               << " (rc=" << int(p.use_count()) << ")\n";
+            total++;
+        });
+        if ( total ) tp << "total " << total << " leaked handles of type " << tn << "\n";
+    }
+
+    template <typename T>
     void addHandleAnnotation ( Module * mod, ModuleLibrary & lib,
                                const string & name,
                                const string & destroyFnName = string(),
                                const string & cppTypeName = string() ) {
+        handleRegistry_registerDump(&dumpHandleLeaks<T>);
         mod->addAnnotation(new ManagedHandleAnnotation<T>(lib, name, cppTypeName));
         addExtern<decltype(&das_handle_equ<T>),  das_handle_equ<T>>
             (*mod, lib, "==", SideEffects::none, "das_handle_equ");

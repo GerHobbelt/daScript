@@ -231,6 +231,8 @@ int das_wsc_send ( Handle<hv::WebSocketClient> h, const char* msg ) {
 int das_wsc_send_buf ( Handle<hv::WebSocketClient> h, const char* msg, int32_t len, ws_opcode opcode ) {
     auto p = HandleRegistry<hv::WebSocketClient>::instance().lookup(h);
     if ( !p ) return -1;
+    if ( len < 0 ) return -1;
+    if ( !msg && len != 0 ) return -1;
     return p->send(msg ? msg : "", len, opcode);
 }
 
@@ -551,9 +553,6 @@ static WebServer_Adapter * lookup_server ( Handle<hv::WebSocketServer> h ) {
 }
 
 Handle<hv::WebSocketServer> makeWebSocketServer ( int port, int httpsPort, const char * pathToCert, const void * pClass, const StructInfo * info, Context * context, LineInfoArg * at ) {
-    auto adapter = new WebServer_Adapter((char *)pClass,info,context);
-    adapter->port = port;
-    adapter->https_port = httpsPort;
     if ( httpsPort ) {
         hssl_ctx_init_param_t param;
         memset(&param, 0, sizeof(param));
@@ -567,6 +566,9 @@ Handle<hv::WebSocketServer> makeWebSocketServer ( int port, int httpsPort, const
             context->throw_error_at(at, "libHV: hssl_ctx_init failed! Please check the certificate files `%s` and `%s`.", crt_file.c_str(), key_file.c_str());
         }
     }
+    auto adapter = new WebServer_Adapter((char *)pClass,info,context);
+    adapter->port = port;
+    adapter->https_port = httpsPort;
     shared_ptr<hv::WebSocketServer> sp(adapter);
     return HandleRegistry<hv::WebSocketServer>::instance().acquire(sp);
 }
@@ -580,12 +582,16 @@ int das_wss_send ( Handle<hv::WebSocketChannel> h, const char * msg, ws_opcode o
 int das_wss_send_buf ( Handle<hv::WebSocketChannel> h, const char * buf, int32_t len, ws_opcode opcode, bool fin ) {
     auto p = HandleRegistry<hv::WebSocketChannel>::instance().lookup(h);
     if ( !p ) return -1;
+    if ( len < 0 ) return -1;
+    if ( !buf && len != 0 ) return -1;
     return p->send(buf, len, opcode, fin);
 }
 
 int das_wss_send_fragment ( Handle<hv::WebSocketChannel> h, const char * buf, int32_t len, int32_t fragment, ws_opcode opcode ) {
     auto p = HandleRegistry<hv::WebSocketChannel>::instance().lookup(h);
     if ( !p ) return -1;
+    if ( len < 0 || fragment < 0 ) return -1;
+    if ( !buf && len != 0 ) return -1;
     return p->send(buf, len, fragment, opcode);
 }
 

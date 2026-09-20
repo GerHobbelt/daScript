@@ -571,6 +571,8 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | failed_structure_field_already_declared.das | Duplicate struct field name | **expect** `30115` |
 | failed_structure_not_found_ambiguous.das | Ambiguous struct name — same name in two modules | **expect** `30302` |
 | super.das | `super` keyword — parent constructor calls, parent method calls, 3-level hierarchy | |
+| super_finalize.das | `delete super.self` — base-class finalizer chain (class, 3-level, free struct finalizer) | |
+| cant_delete_super_self.das | `delete super.self` misuse — outside finalizer, no base, wrong arg shape | **expect** `31002:6` `30305:6` `30503:6` |
 | table.das | Table tombstone handling and iteration | |
 | table_operations.das | Table find, insert, delete, key_exists, erase collision, lock panic, defaults, modify | |
 | test_value_table_key.das | `table<EntityId; string>` — value-type table key ops, set operations | |
@@ -654,8 +656,9 @@ Coverage of per-iteration `finally` semantics across every loop form. Each cell 
 
 | File | Description | Expects errors |
 |---|---|---|
-| test_modules.das | Module system integration — compiles and runs 7 module scenarios via compile_file + make_file_access | |
+| test_modules.das | Module system integration — compiles and runs 9 module scenarios via compile_file + make_file_access (incl. file-path requires `./`, `../`, `%/`) | |
 | _modules/ | *(helper directory)* Module source files for test_modules.das (dastest skips `_`-prefixed dirs) | |
+| _modules/filepath/ | *(helper)* Fixture for file-path require tests — main.das exercises `./`, `../`, `%/` plus dedup; main_missing.das exercises the failure path | |
 
 ## math/
 
