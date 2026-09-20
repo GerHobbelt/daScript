@@ -6,16 +6,20 @@ module dasllama_common shared public
 require daslib/fio
 require dasllama/dasllama_env  // the shared typed env readers + the knob registry
 require dasllama/dasllama_config  // DlimConfiguration — this module registers the cpu/metal sources
+require dasllama/dasllama_kqformat public   // KqFmt + kq_sb + the stride truth — re-exported so every requirer keeps seeing the enum
+require dasllama/dasllama_rope       // the RoPE angle/table generation (Model-facing wrappers below pass config params in)
+require dasllama/dasllama_gpu_tier   // the device-cooperation seam (hooks the loader/dispatch arms call)
 require daslib/array_boost // nolint:STYLE030 — temp_array is [template]; STYLE030 misses template-fn refs and false-flags this as unused
 require dasllama/dasllama_math
+require dasllama/dasllama_kv_codec  // the KV-cache codec families — kv_store_row/kv_load_row/kv_dot/kv_axpy dispatch into them
+require dasllama/dasllama_convert   // cvt_f32_to_f16/cvt_f16_to_f32 — the f16 rows (wscale plane + the f16 KV codec)
 require dasllama/dasllama_math_default  // registers the portable Q8·Q8 backend at [init] (the fallback everywhere)
 require dasllama/dasllama_math_aarch64_neon  // registers the arm64 SDOT Q8·Q8 backend at [init]; no-op off-ARM
 require ?llvm/daslib/llvm_tune dasllama/dasllama_math_gen  // nolint:STYLE030 — [init]-only: registers "arm64-gen" (the generated GEMM family, arm64 load-select tier). PATH guard: the module hard-requires llvm_tune, so it loads exactly when dasLLVM is mounted
 require ?llvm/daslib/llvm_tune llvm/daslib/llvm_tune public  // re-export ONLY llvm_tune (not math_gen's whole public surface — its jobque_boost would flood requirers with ambiguities): the auto-policy pass and tune_status reach every app that requires this module
-require ?das_metal dasllama/dasllama_math_metal  // nolint:STYLE030 — [init]-only: registers "metal" (the GPU prefill-GEMM batch donor). STRICT guard: the C++ das_metal module exists on Apple builds only, so non-Apple lanes never compile the Metal driver
+require ?das_metal dasllama/dasllama_metal_gemm  // nolint:STYLE030 — [init]-only: registers "metal" (the GPU prefill-GEMM batch donor). STRICT guard: the C++ das_metal module exists on Apple builds only, so non-Apple lanes never compile the Metal driver
 require ?das_accelerate dasllama/dasllama_math_accelerate  // nolint:STYLE030 — [init]-only: arms the "+AMX" float-batch override when DASLLAMA_ACCEL=1. Same Apple-only guard shape as the metal driver
 require ?vulkan dasllama/dasllama_math_vulkan  // nolint:STYLE030 — [init]-only: registers "vulkan" (the GPU tier; stage-0 skeleton, kernels land with the offload rail). STRICT guard: the C++ vulkan module is linked only where the dasVulkan package is installed, so CI lanes without it never compile the Vulkan driver
-require dasllama/dasllama_quant
 require dasllama/dasllama_gguf
 require dasllama/dasllama_gemm_schema  // kq_qsb/kq_ssb — the fmt-id plane strides
 require dasllama/dasllama_tokenizer  // Model owns its tokenizer; load_model populates it
@@ -42,24 +46,6 @@ enum QuantMode {
     q8
     q4_0
 }
-
-//! Per-weight storage format under a q8-mode load with native planes: q8 = qblob/qscales;
-//! k4/k5/k6/q40 = superblock plane pairs (mixed PER TENSOR); q51 = native Q5_1 per-32 planes;
-//! q8n = q8 as gguf-native 34B interleaved blocks (ONE plane, the cm2 GPU-tier tag, never disk).
-enum KqFmt : uint8 {
-    q8
-    k4
-    k5
-    k6
-    q40
-    q51
-    q8n
-}
-
-// The superblock-lattice formats (Q8_K-form activations, % 256 rows, repack + stamped kq
-// kernels). q51 deliberately fails this: it rides per-32 planes with Q8_0-form activations —
-// a `fmt != KqFmt.q8` test no longer implies the kq lattice; branch on kq_sb where it does.
-def private kq_sb(f : KqFmt) : bool => f == KqFmt.k4 || f == KqFmt.k5 || f == KqFmt.k6 || f == KqFmt.q40
 
 //! FFN gate activation: silu = SwiGLU (Llama family), gelu = GeGLU (Gemma), swiglu_oai = the
 //! clamped SwiGLU with +1 on the up branch (gpt-oss).
@@ -1097,15 +1083,70 @@ struct Model {
     embq : array<uint8>
     embs : array<uint8>
     // prepared-model image backing (dasllama_image): when set, every locked array field above
-    // is a borrowed VIEW into this mapping (zero-copy) and the finalizer below unmaps it.
+    // is a borrowed VIEW into this image (zero-copy) and the finalizer below releases it.
     // Both fields are skipped by the image save/load field walk.
     image_map : void?
     image_bytes : uint64
 }
 
+// ===== prepared-image backing =====
+
+// A carrier's planes borrow either a mapped .dlim or a chunk this process built. Owned chunks
+// live here, keyed by the ALIGNED base image_map holds, so telling the two apart is one lookup
+// and no carrier needs a second field: a miss means "mapping".
+var private g_image_chunks : table<uint64; array<uint8>>
+
+def private ptr_key(p : void?) : uint64 {
+    return unsafe(reinterpret<uint64>(p))
+}
+
+//! Allocate an image chunk of `bytes`, its base aligned to `align` — the in-memory twin of
+//! ``fmap_open``. Uninitialized by design: a multi-GB image is fully overwritten by the build
+//! walk (padding gaps zero-fill explicitly), and pre-touching it would commit every page twice.
+def image_chunk_alloc(bytes : uint64; align : uint64) : void? {
+    var raw : array<uint8>
+    let total = int64(bytes + align)
+    raw |> resize_no_init(total)
+    if (long_length(raw) != total) {
+        delete raw
+        return null
+    }
+    var base : void?
+    unsafe {
+        let a = reinterpret<uint64>(addr(raw[0]))
+        base = reinterpret<void?>((a + align - 1ul) / align * align)
+    }
+    g_image_chunks[ptr_key(base)] <- raw
+    return base
+}
+
+//! Release an owned image chunk by base; false = not one of ours, i.e. the caller holds a mapping
+//! and unmaps instead. This is how every carrier's finalizer tells the two backings apart.
+def image_chunk_free(base : void?) : bool {
+    let key = ptr_key(base)
+    if (base == null || !key_exists(g_image_chunks, key)) {
+        return false
+    }
+    var raw <- g_image_chunks[key]
+    g_image_chunks |> erase(key)
+    delete raw
+    return true
+}
+
+//! Let go of a carrier's image backing, chunk or mapping — the ONE release. Every weight
+//! carrier's finalizer routes here; nothing else may call ``fmap_close`` on an image.
+def image_backing_release(map : void?; bytes : uint64) {
+    if (map == null || image_chunk_free(map)) {
+        return
+    }
+    unsafe {
+        fmap_close(map, bytes)
+    }
+}
+
 // Model's finalizer (every `delete model` lowers to _::finalize and lands here): image-backed
-// models hold locked BORROWED views over the mapping — those must be forgotten (reset without
-// freeing) before the mapping unmaps; everything owned deletes as usual.
+// models hold locked BORROWED views over the image — those must be forgotten (reset without
+// freeing) before the backing goes; everything owned deletes as usual.
 def finalize(var t : Model) {
     apply(t) $ [unused_argument(name)] (name : string; var field) {
         static_if (typeinfo is_array(field)) {
@@ -1121,11 +1162,9 @@ def finalize(var t : Model) {
         }
     }
     if (t.image_map != null) {
-        // imported device memory over this mapping (P2 mirrors) must release BEFORE the unmap
+        // imported device memory over this image (P2 mirrors) must release BEFORE the backing does
         moe_gpu_unmap_notify(t.image_map, t.image_bytes)
-        unsafe {
-            fmap_close(t.image_map, t.image_bytes)
-        }
+        image_backing_release(t.image_map, t.image_bytes)
         t.image_map = null
         t.image_bytes = 0ul
     }
@@ -1673,9 +1712,6 @@ def set_conv_profile(on : bool) {
     g_conv |> clear()
 }
 
-//! Current state of the [[set_conv_profile]] gate.
-def get_conv_profile() : bool => g_conv_prof
-
 def private conv_note(kind : string; t0, n : int64) {
     if (!g_conv_prof) {
         return
@@ -1735,6 +1771,8 @@ struct StreamReg {
 
 typedef StreamCollectFn = function<(t : Model; var regs : array<StreamReg>) : void>
 typedef StreamRepackFn = function<(fmt : int; qp, sp : void?; n, d : int64) : void>
+typedef BlobEligibleFn = function<(t : Model) : bool>
+typedef BlobScalePlaneFn = function<(var t : Model; name : string) : bool>
 
 [unused_argument(t, regs)]
 def private stream_no_collect(t : Model; var regs : array<StreamReg>) {
@@ -1750,17 +1788,39 @@ var private g_stream_collect_q8 = @@stream_no_collect
 var private g_stream_collect_kq = @@stream_no_collect
 var private g_stream_collect_q51 = @@stream_no_collect
 var private g_stream_repack = @@stream_no_repack
+var private g_blob_eligible : BlobEligibleFn
+var private g_blob_scale_plane : BlobScalePlaneFn
+var private g_blob_hooks_set = false
 
 //! dasllama_layout registers the streaming-fill collaborators at [init]: the three region
-//! collectors (the repack walkers' build halves) and the single-region repack dispatcher.
-def register_stream_layout(cq8, ckq, cq51 : StreamCollectFn; rr : StreamRepackFn) {
+//! collectors (the repack walkers' build halves), the single-region repack dispatcher, and the
+//! metal-blob pair the streamed build consults to mint the blob flavor straight off the gguf.
+def register_stream_layout(cq8, ckq, cq51 : StreamCollectFn; rr : StreamRepackFn;
+                           be : BlobEligibleFn; bsp : BlobScalePlaneFn) {
     g_stream_collect_q8 = cq8
     g_stream_collect_kq = ckq
     g_stream_collect_q51 = cq51
     g_stream_repack = rr
+    g_blob_eligible = be
+    g_blob_scale_plane = bsp
+    g_blob_hooks_set = true
+}
+
+//! Can this model's streamed build mint the metal blob flavor? False on an unregistered layout
+//! module too — a caller without the hooks takes the planar rail rather than a wrong image.
+def blob_stream_eligible(t : Model) : bool {
+    return g_blob_hooks_set && invoke(g_blob_eligible, t)
+}
+
+//! Put one kq scale plane into its device form during a blob build (see metal_blob_scale_plane).
+def blob_stream_scale_plane(var t : Model; name : string) : bool {
+    return g_blob_hooks_set && invoke(g_blob_scale_plane, t, name)
 }
 
 var private g_fill_plan_mode = false
+// the streamed build should mint the METAL BLOB flavor, not the planar one. Set for the length of
+// one load_gguf_streaming call; the sizing pass turns it into t.metal_blob once offsets exist.
+var private g_stream_want_blob = false
 var private g_fill_plan : array<FillJob>
 // field -> the plane's LAYOUT byte total, recorded at sizing: a layout can hold allocated-but-
 // never-written holes (glm4moe's dense-lead shexp slices), so the streamed plane must be sized
@@ -1770,7 +1830,9 @@ var private g_stream_plane_total : table<string; int64>
 //! The regions the eager repack stage WOULD build for `t` — same gates, same walkers (the
 //! collector halves), so the streamed fill's per-job repack cannot drift from the eager one.
 def stream_collect_regions(t : Model; var regs : array<StreamReg>) {
-    if (t.quant != QuantMode.q8 || !select_matmul_backend_for_load()) {
+    // metal_blob first, and short-circuiting: the blob flavor is device-layout bytes, so a CPU
+    // repack has no place in it and the backend must not even be selected for one
+    if (t.metal_blob || t.quant != QuantMode.q8 || !select_matmul_backend_for_load()) {
         return
     }
     invoke(g_stream_collect_q8, t, regs)
@@ -1795,40 +1857,31 @@ def private stream_field_of(t : Model; fmt : KqFmt) : string {
     } elif (fmt == KqFmt.q51) {
         return "q51q"
     } elif (t.quant == QuantMode.q8) {
-        return "qblob"
+        // the blob flavor carries q8 as gguf-native 34B blocks in ONE plane, never the split pair
+        return t.metal_blob ? "mblob" : "qblob"
     }
     return ""
 }
 
-// (q plane bytes, scale plane bytes, region fmt id) for one streamed job
-[unused_argument(t)]
+// (q plane bytes, scale plane bytes, region fmt id) for one streamed job — pure taxonomy reads
 def private stream_job_shape(t : Model; j : FillJob) : tuple<qb : int64; sb : int64; rfmt : int> {
-    if (j.fmt == KqFmt.k4) {
-        return (qb = (j.n / 256l) * K4_QSB, sb = (j.n / 256l) * K4_SSB, rfmt = 4)
-    } elif (j.fmt == KqFmt.k5) {
-        return (qb = (j.n / 256l) * K5_QSB, sb = (j.n / 256l) * K5_SSB, rfmt = 5)
-    } elif (j.fmt == KqFmt.k6) {
-        return (qb = (j.n / 256l) * K6_QSB, sb = (j.n / 256l) * K6_SSB, rfmt = 6)
-    } elif (j.fmt == KqFmt.q40) {
-        return (qb = (j.n / 256l) * Q40_QSB, sb = (j.n / 256l) * Q40_SSB, rfmt = 40)
-    } elif (j.fmt == KqFmt.q51) {
-        return (qb = (j.n / 32l) * Q51_QB, sb = (j.n / 32l) * Q51_SB, rfmt = 2)
+    if (kq_sb(j.fmt) || j.fmt == KqFmt.q51) {
+        let e = kq_elems(j.fmt)
+        return (qb = (j.n / e) * kq_qsb(j.fmt), sb = (j.n / e) * kq_ssb(j.fmt), rfmt = kq_stream_code(j.fmt))
+    }
+    if (t.metal_blob) {   // scale and quants land interleaved, so there is no separate scale half
+        return (qb = (j.n / Q8_BLOCK_ELEMS) * (Q8_QPB + Q8_SPB), sb = 0l, rfmt = 0)
     }
     return (qb = j.n, sb = 0l, rfmt = 0)   // q8: 1 byte/elem quants; scales handled as floats
 }
 
-// a job's byte offset within its plane (woff is elems; kq/q51 planes stride per superblock)
-def private stream_job_qoff(j : FillJob) : int64 {
-    if (j.fmt == KqFmt.k4) {
-        return (j.woff / 256l) * K4_QSB
-    } elif (j.fmt == KqFmt.k5) {
-        return (j.woff / 256l) * K5_QSB
-    } elif (j.fmt == KqFmt.k6) {
-        return (j.woff / 256l) * K6_QSB
-    } elif (j.fmt == KqFmt.q40) {
-        return (j.woff / 256l) * Q40_QSB
-    } elif (j.fmt == KqFmt.q51) {
-        return (j.woff / 32l) * Q51_QB
+// a job's byte offset within its plane (woff is elems; kq/q51 planes stride per superblock/block)
+def private stream_job_qoff(t : Model; j : FillJob) : int64 {
+    if (kq_sb(j.fmt) || j.fmt == KqFmt.q51) {
+        return (j.woff / kq_elems(j.fmt)) * kq_qsb(j.fmt)
+    }
+    if (t.metal_blob) {
+        return (j.woff / Q8_BLOCK_ELEMS) * (Q8_QPB + Q8_SPB)
     }
     return j.woff
 }
@@ -1886,59 +1939,26 @@ def fill_stream_plane(m : GGUFMeta; bytes : array<uint8> | #; var t : Model; fie
     var temp_q8 : array<int8>   // the q8 family's quant temp (qblob is int8)
     var temp_s : array<uint8>
     var temp_sf : array<float>
+    var temp_m : array<uint8>   // the blob flavor's interleaved 34B blocks
+    var temp_s16 : array<uint16>
     var scratch : array<float>
     var zeros : array<uint8>
     var cursor = 0l   // plane bytes appended so far — layout holes between jobs zero-fill
     for (j in mine) {
         let sh = stream_job_shape(t, j)
-        stream_zero_fill(stream_job_qoff(j) - cursor, zeros, append)
-        cursor = stream_job_qoff(j) + sh.qb
+        stream_zero_fill(stream_job_qoff(t, j) - cursor, zeros, append)
+        cursor = stream_job_qoff(t, j) + sh.qb
         temp_q |> resize(int(sh.qb))
         let t0 = g_conv_prof ? ref_time_ticks() : 0l
-        var kind = "q8 transcode (Q8_0 verbatim)"
-        if (j.fmt == KqFmt.k4) {
+        var kind = ""
+        if (kq_sb(j.fmt) || j.fmt == KqFmt.q51) {
             temp_s |> resize(int(sh.sb))
-            gguf_transcode_q4k(m, bytes, j.name, temp_q, temp_s, 0l, j.n, j.src_off)
-            kind = "k4 transcode (Q4_K)"
-        } elif (j.fmt == KqFmt.k5) {
-            temp_s |> resize(int(sh.sb))
-            if (gguf_tensor_type(m, j.name) == GGML_TYPE_Q5_K) {
-                gguf_transcode_q5k(m, bytes, j.name, temp_q, temp_s, 0l, j.n, j.src_off)
-                kind = "k5 transcode (Q5_K)"
-            } else {
-                scratch |> resize(int(j.n))
-                gguf_read_tensor_f32(m, bytes, j.name, scratch, 0l, j.n, j.src_off)
-                quantize_k5_plane(scratch, j.n, temp_q, temp_s, 0l)
-                kind = "k5 RE-ENCODE (Q5_0 dequant+quant)"
-            }
-        } elif (j.fmt == KqFmt.k6) {
-            temp_s |> resize(int(sh.sb))
-            gguf_transcode_q6k(m, bytes, j.name, temp_q, temp_s, 0l, j.n, j.src_off)
-            kind = "k6 transcode (Q6_K)"
-        } elif (j.fmt == KqFmt.q40) {
-            temp_s |> resize(int(sh.sb))
-            gguf_transcode_q40(m, bytes, j.name, temp_q, temp_s, 0l, j.n, j.src_off)
-            kind = "q40 transcode (Q4_0)"
-        } elif (j.fmt == KqFmt.q51) {
-            temp_s |> resize(int(sh.sb))
-            gguf_transcode_q51(m, bytes, j.name, temp_q, temp_s, 0l, j.n, j.src_off)
-            kind = "q51 transcode (Q5_1)"
+            kind = transcode_kq_tensor(m, bytes, j.name, j.fmt, temp_q, temp_s, 0l, j.n, j.src_off, scratch)
         } else {
             // q8 family: scales are FLOATS; the epilogue converts the whole plane at the end
             temp_q8 |> resize(int(j.n))
             temp_sf |> resize(int(j.n / 32l))
-            let gt = gguf_tensor_type(m, j.name)
-            if (gt == GGML_TYPE_Q8_0) {
-                gguf_transcode_q8_0(m, bytes, j.name, temp_q8, temp_sf, 0l, 0l, j.n, j.src_off)
-            } elif (gt == GGML_TYPE_Q5_0) {
-                gguf_transcode_q5_0_to_q8(m, bytes, j.name, temp_q8, temp_sf, 0l, 0l, j.n, j.src_off)
-                kind = "q8 transcode (Q5_0 exact)"
-            } else {
-                scratch |> resize(int(j.n))
-                gguf_read_tensor_f32(m, bytes, j.name, scratch, 0l, j.n, j.src_off)
-                quantize_q8_0_into(scratch, j.n, temp_q8, temp_sf, 0l, 0l)
-                kind = "q8 REQUANT (dequant+quant)"
-            }
+            kind = transcode_q8_tensor(m, bytes, j.name, temp_q8, temp_sf, 0l, 0l, j.n, j.src_off, scratch)
         }
         conv_note(kind, t0, j.n)
         // land the scale half at its real offset (RAM-resident plane)
@@ -1953,7 +1973,7 @@ def fill_stream_plane(m : GGUFMeta; bytes : array<uint8> | #; var t : Model; fie
                 memcpy(addr<void?>(t.q40s[(j.woff / 256l) * Q40_SSB]), addr<void?>(temp_s[0]), sh.sb)
             } elif (j.fmt == KqFmt.q51) {
                 memcpy(addr<void?>(t.q51s[(j.woff / 32l) * Q51_SB]), addr<void?>(temp_s[0]), sh.sb)
-            } elif (sh.sb == 0l && j.n > 0l) {
+            } elif (sh.sb == 0l && j.n > 0l && !t.metal_blob) {
                 memcpy(addr<void?>(t.qscales[j.woff / 32l]), addr<void?>(temp_sf[0]), (j.n / 32l) * 4l)
             }
         }
@@ -1986,10 +2006,13 @@ def fill_stream_plane(m : GGUFMeta; bytes : array<uint8> | #; var t : Model; fie
             }
         }
         unsafe {
-            if (sh.rfmt == 0) {
-                invoke(append, addr<void?>(temp_q8[0]), uint64(sh.qb))
-            } else {
+            if (sh.rfmt != 0) {
                 invoke(append, addr<void?>(temp_q[0]), uint64(sh.qb))
+            } elif (t.metal_blob) {
+                blob_pack_job(temp_q8, temp_sf, j.n / Q8_BLOCK_ELEMS, temp_m, temp_s16)
+                invoke(append, addr<void?>(temp_m[0]), uint64(sh.qb))
+            } else {
+                invoke(append, addr<void?>(temp_q8[0]), uint64(sh.qb))
             }
         }
     }
@@ -2005,9 +2028,40 @@ def fill_stream_plane(m : GGUFMeta; bytes : array<uint8> | #; var t : Model; fie
     delete temp_q8
     delete temp_s
     delete temp_sf
+    delete temp_m
+    delete temp_s16
     delete scratch
     delete zeros
     return true
+}
+
+// One job's q8 temps -> the gguf-native 34B blocks the blob plane carries. Scales convert through
+// cvt_f32_to_f16, the same kernel wscale_convert_f16 uses, so a streamed blob plane is bit-equal
+// to one the in-RAM transform builds from an already-converted qscales16.
+def private blob_pack_job(q : array<int8>; s : array<float>; nblk : int64;
+                          var dst : array<uint8>; var s16 : array<uint16>) {
+    if (nblk <= 0l) {
+        return
+    }
+    let mbb = Q8_QPB + Q8_SPB
+    dst |> resize_no_init(nblk * mbb)
+    s16 |> resize_no_init(nblk)
+    unsafe {
+        cvt_f32_to_f16(addr(s16[0]), addr < float const? >(s[0]), nblk)
+        var dp = addr(dst[0])
+        let qp = addr < int8 const? >(q[0])
+        let sp = addr < uint16 const? >(s16[0])
+        let nch = int(clamp(nblk / 262144l, 1l, 64l))
+        maybe_parallel_for(0, int(nblk / 32l) + (nblk % 32l != 0l ? 1 : 0), is_job_que_available() ? nch : 1) $(cb, ce) {
+            unsafe {
+                for (b in range64(int64(cb) * 32l, min(int64(ce) * 32l, nblk))) {
+                    var ph = reinterpret<uint16?>(dp + b * mbb)
+                    ph[0] = sp[b]
+                    memcpy(reinterpret<void?>(dp + b * mbb + Q8_SPB), reinterpret<void const?>(qp + b * Q8_QPB), 32)
+                }
+            }
+        }
+    }
 }
 
 //! Arm plan recording: subsequent load_big calls append FillJobs instead of transcoding
@@ -2023,6 +2077,54 @@ def fill_plan_take(var out : array<FillJob>) {
     out <- g_fill_plan
 }
 
+// ONE source for the (fmt, disk type) -> kq transcode decision. load_big and fill_stream_plane
+// used to carry this tree as two independent copies that could drift; both now dispatch here.
+// Destinations are caller-picked (Model planes at eloff=woff, or stream temps at eloff=0).
+def private transcode_kq_tensor(m : GGUFMeta; bytes : array<uint8> | #; name : string; fmt : KqFmt;
+                                var kq : array<uint8>; var ks : array<uint8>; eloff, n, src_off : int64;
+                                var scratch : array<float>) : string {
+    if (fmt == KqFmt.k4) {
+        gguf_transcode_q4k(m, bytes, name, kq, ks, eloff, n, src_off)
+        return "k4 transcode (Q4_K)"
+    } elif (fmt == KqFmt.k5) {
+        if (gguf_tensor_type(m, name) == GGML_TYPE_Q5_K) {
+            gguf_transcode_q5k(m, bytes, name, kq, ks, eloff, n, src_off)
+            return "k5 transcode (Q5_K)"
+        }
+        // Q5_0 source: no exact embedding exists, so dequant and re-encode (lossy)
+        scratch |> resize(int(n))
+        gguf_read_tensor_f32(m, bytes, name, scratch, 0l, n, src_off)
+        quantize_k5_plane(scratch, n, kq, ks, eloff)
+        return "k5 RE-ENCODE (Q5_0 dequant+quant)"
+    } elif (fmt == KqFmt.k6) {
+        gguf_transcode_q6k(m, bytes, name, kq, ks, eloff, n, src_off)
+        return "k6 transcode (Q6_K)"
+    } elif (fmt == KqFmt.q40) {
+        gguf_transcode_q40(m, bytes, name, kq, ks, eloff, n, src_off)
+        return "q40 transcode (Q4_0)"
+    }
+    gguf_transcode_q51(m, bytes, name, kq, ks, eloff, n, src_off)
+    return "q51 transcode (Q5_1)"
+}
+
+// The q8-family half of the same tree: verbatim Q8_0, exact Q5_0->Q8, or dequant+requant.
+def private transcode_q8_tensor(m : GGUFMeta; bytes : array<uint8> | #; name : string;
+                                var q : array<int8>; var s : array<float>; qoff, soff, n, src_off : int64;
+                                var scratch : array<float>) : string {
+    let gt = gguf_tensor_type(m, name)
+    if (gt == GGML_TYPE_Q8_0) {
+        gguf_transcode_q8_0(m, bytes, name, q, s, qoff, soff, n, src_off)
+        return "q8 transcode (Q8_0 verbatim)"
+    } elif (gt == GGML_TYPE_Q5_0) {
+        gguf_transcode_q5_0_to_q8(m, bytes, name, q, s, qoff, soff, n, src_off)
+        return "q8 transcode (Q5_0 exact)"
+    }
+    scratch |> resize(int(n))
+    gguf_read_tensor_f32(m, bytes, name, scratch, 0l, n, src_off)
+    quantize_q8_0_into(scratch, n, q, s, qoff, soff)
+    return "q8 REQUANT (dequant+quant)"
+}
+
 def private load_big(m : GGUFMeta; bytes : array<uint8> | #; name : string; var t : Model; woff, n : int64; var scratch : array<float>; src_off : int64 = 0l; fmt : KqFmt = KqFmt.q8) {
     if (g_fill_plan_mode) {
         g_fill_plan |> push(FillJob(name = name, woff = woff, n = n, src_off = src_off, fmt = fmt))
@@ -2031,41 +2133,17 @@ def private load_big(m : GGUFMeta; bytes : array<uint8> | #; name : string; var 
     let t0 = g_conv_prof ? ref_time_ticks() : 0l
     var kind = "f32 read (no quant)"
     if (fmt == KqFmt.k4) {
-        gguf_transcode_q4k(m, bytes, name, t.k4q, t.k4s, woff, n, src_off)
-        kind = "k4 transcode (Q4_K)"
+        kind = transcode_kq_tensor(m, bytes, name, fmt, t.k4q, t.k4s, woff, n, src_off, scratch)
     } elif (fmt == KqFmt.k5) {
-        if (gguf_tensor_type(m, name) == GGML_TYPE_Q5_K) {
-            gguf_transcode_q5k(m, bytes, name, t.k5q, t.k5s, woff, n, src_off)
-            kind = "k5 transcode (Q5_K)"
-        } else {   // Q5_0 source: no exact embedding exists, so dequant and re-encode (lossy)
-            scratch |> resize(n)
-            gguf_read_tensor_f32(m, bytes, name, scratch, 0l, n, src_off)
-            quantize_k5_plane(scratch, n, t.k5q, t.k5s, woff)
-            kind = "k5 RE-ENCODE (Q5_0 dequant+quant)"
-        }
+        kind = transcode_kq_tensor(m, bytes, name, fmt, t.k5q, t.k5s, woff, n, src_off, scratch)
     } elif (fmt == KqFmt.k6) {
-        gguf_transcode_q6k(m, bytes, name, t.k6q, t.k6s, woff, n, src_off)
-        kind = "k6 transcode (Q6_K)"
+        kind = transcode_kq_tensor(m, bytes, name, fmt, t.k6q, t.k6s, woff, n, src_off, scratch)
     } elif (fmt == KqFmt.q40) {
-        gguf_transcode_q40(m, bytes, name, t.q40q, t.q40s, woff, n, src_off)
-        kind = "q40 transcode (Q4_0)"
+        kind = transcode_kq_tensor(m, bytes, name, fmt, t.q40q, t.q40s, woff, n, src_off, scratch)
     } elif (fmt == KqFmt.q51) {
-        gguf_transcode_q51(m, bytes, name, t.q51q, t.q51s, woff, n, src_off)
-        kind = "q51 transcode (Q5_1)"
+        kind = transcode_kq_tensor(m, bytes, name, fmt, t.q51q, t.q51s, woff, n, src_off, scratch)
     } elif (t.quant == QuantMode.q8) {
-        let gt = gguf_tensor_type(m, name)
-        if (gt == GGML_TYPE_Q8_0) {
-            gguf_transcode_q8_0(m, bytes, name, t.qblob, t.qscales, woff, woff / 32l, n, src_off)
-            kind = "q8 transcode (Q8_0 verbatim)"
-        } elif (gt == GGML_TYPE_Q5_0) {
-            gguf_transcode_q5_0_to_q8(m, bytes, name, t.qblob, t.qscales, woff, woff / 32l, n, src_off)
-            kind = "q8 transcode (Q5_0 exact)"
-        } else {
-            scratch |> resize(n)
-            gguf_read_tensor_f32(m, bytes, name, scratch, 0l, n, src_off)
-            quantize_q8_0_into(scratch, n, t.qblob, t.qscales, woff, woff / 32l)
-            kind = "q8 REQUANT (dequant+quant)"
-        }
+        kind = transcode_q8_tensor(m, bytes, name, t.qblob, t.qscales, woff, woff / 32l, n, src_off, scratch)
     } elif (t.quant == QuantMode.q4_0) {
         if (gguf_tensor_type(m, name) == GGML_TYPE_Q4_0) {
             gguf_transcode_q4_0(m, bytes, name, t.q4blob, t.q4scales, woff / 2l, woff / 32l, n, src_off)
@@ -2548,10 +2626,9 @@ def private wscale_convert_f16(var t : Model) {
 
 // ===== GPU MoE tier upload (post-prepare, loader-agnostic) =====
 
-def private moe_gpu_fmt_kq(f : KqFmt) : bool => f == KqFmt.k4 || f == KqFmt.k5 || f == KqFmt.k6 || f == KqFmt.q40
 
 // a plane the dense rail can serve: a format the tier has kernels for, repacked if native-kq
-def private dense_plane_ok(t : Model; f : KqFmt) : bool => (f == KqFmt.q8 || moe_gpu_fmt_kq(f)) && kq_servable(t, f)
+def private dense_plane_ok(t : Model; f : KqFmt) : bool => (f == KqFmt.q8 || kq_sb(f)) && kq_servable(t, f)
 
 // layer l carries a parallel-dense shared expert whose whole w1/w3/w2 triple the tier can serve
 def private dense_shexp_uploadable(t : Model; l : int64) : bool {
@@ -2579,9 +2656,7 @@ def private moe_gpu_gather_upload(t : Model; f : KqFmt; woff : int64; n, rows, s
         moe_gpu_gather_stack_q8n(t, woff, n, rows, slice_rows, mr, kgroup, wbias, wq)
         ws |> resize(0)   // no scale plane — the tier takes an EMPTY ws for fmt 6
     } else {
-        let kmr = t.kq_repacked ? (f == KqFmt.k4 ? t.kq_repack_mr4
-            : (f == KqFmt.k5 ? t.kq_repack_mr5
-            : (f == KqFmt.k6 ? t.kq_repack_mr6 : t.kq_repack_mr40))) : 1l
+        let kmr = kq_active_mr(t, f)
         moe_gpu_gather_stack_kq(t, f, woff, n, rows, slice_rows, t.kq_repacked, kmr, wq, ws)
     }
     let ok = moe_gpu_upload_stack(wq, ws, woff, n, rows, int(f), stream)
@@ -2712,9 +2787,7 @@ def private resident_place(t : Model; f : KqFmt; woff : int64; n, rows : int64;
     } elif (f == KqFmt.q8) {
         moe_gpu_gather_stack(t, woff, n, rows, rows, mr, kgroup, wbias, wq, ws)
     } else {
-        let kmr = t.kq_repacked ? (f == KqFmt.k4 ? t.kq_repack_mr4
-            : (f == KqFmt.k5 ? t.kq_repack_mr5
-            : (f == KqFmt.k6 ? t.kq_repack_mr6 : t.kq_repack_mr40))) : 1l
+        let kmr = kq_active_mr(t, f)
         moe_gpu_gather_stack_kq(t, f, woff, n, rows, rows, t.kq_repacked, kmr, wq, ws)
     }
     let blk = rdec_place(wq, ws, n, rows, int(f))
@@ -2891,6 +2964,22 @@ def resident_upload(t : Model; seq_cap : int64) : bool {
     return true
 }
 
+// One position's packed rope row for the resident device kernels (see build_rope_row_packed —
+// the one source for every resident-override rope row).
+[unused_argument(half)]
+def private rdec_rope_row(t : Model; pos, hs, half : int64; var dst : array<float>; base : int64) {
+    let c = t.config
+    build_rope_row_packed(dst, base, pos, hs, c.rope_freq_base, c.rope_freq_scale, c.rope_mscale, t.rope_freqs)
+}
+
+// the active grp<mr> interleave of a repacked kq plane (1 = disk order / not repacked)
+def private kq_active_mr(t : Model; f : KqFmt) : int64 {
+    if (!t.kq_repacked) {
+        return 1l
+    }
+    return f == KqFmt.k4 ? t.kq_repack_mr4 : (f == KqFmt.k5 ? t.kq_repack_mr5 : (f == KqFmt.k6 ? t.kq_repack_mr6 : t.kq_repack_mr40))
+}
+
 //! The resident whole-stack decode override (registered as "vulkan"): embeds the token, builds this
 //! position's rope row, runs the whole forward on device, produces s.logits. Decode-from-scratch
 //! for now — the mirror builds as positions arrive (prefix-KV sync is a follow-up).
@@ -2926,16 +3015,7 @@ def private vulkan_resident_decode(t : Model; var s : Session; token, pos : int6
     let half = hs / 2l
     var cossin : array<float>
     cossin |> resize(int(hs))
-    let theta = c.rope_freq_base
-    for (j in range64(half)) {
-        var freq = 1.0 / pow(theta, float(2l * j) / float(hs))
-        if (!empty(t.rope_freqs)) {
-            freq /= t.rope_freqs[j]
-        }
-        let ang = float(pos) * freq * c.rope_freq_scale
-        cossin[int(j)] = cos(ang) * c.rope_mscale
-        cossin[int(half + j)] = sin(ang) * c.rope_mscale
-    }
+    rdec_rope_row(t, pos, hs, half, cossin, 0l)
     let cnt = pos + 1l
     rdec_token(x, cossin, pos, cnt, s.logits)
     delete x
@@ -2943,45 +3023,6 @@ def private vulkan_resident_decode(t : Model; var s : Session; token, pos : int6
     g_rdec_cnt = pos + 1l   // mirror continuity: rows [0, pos] are now live
     s.rdec_hydrated = false   // the mirror advanced past any earlier hydration
     decode_override_logits_done()   // logits produced on device
-    return true
-}
-
-//! Resident prefill: embed all `npos` prompt tokens, build per-position rope rows, run the batched
-//! forward on device -> the LAST token's logits in s.logits, and the mirror filled for [0, npos).
-//! Returns false when the driver isn't armed (caller keeps the CPU prefill path).
-def resident_prefill(t : Model; var s : Session; tokens : array<int64>; npos : int64) : bool {
-    if (!g_rdec_active) {
-        return false
-    }
-    let c = t.config
-    let dim = c.dim
-    let hs = layer_head_size(c, 0l)
-    let half = hs / 2l
-    var xb : array<float>
-    xb |> resize(int(npos * dim))
-    var cb : array<float>
-    cb |> resize(int(npos * hs))
-    for (p in range64(npos)) {
-        unsafe {
-            embed_row(t, tokens[p], addr(xb[p * dim]))
-        }
-        if (c.embed_scale != 1.0) {
-            scale_inplace(unsafe(addr(xb[p * dim])), c.embed_scale, dim)
-        }
-        let theta = c.rope_freq_base
-        for (j in range64(half)) {
-            var freq = 1.0 / pow(theta, float(2l * j) / float(hs))
-            if (!empty(t.rope_freqs)) {
-                freq /= t.rope_freqs[j]
-            }
-            let ang = float(p) * freq * c.rope_freq_scale
-            cb[int(p * hs + j)] = cos(ang) * c.rope_mscale
-            cb[int(p * hs + half + j)] = sin(ang) * c.rope_mscale
-        }
-    }
-    rdec_prefill(xb, cb, npos, s.logits)
-    delete xb
-    delete cb
     return true
 }
 
@@ -3011,16 +3052,7 @@ def private vulkan_resident_prefill(t : Model; var s : Session; npos, start_pos 
     var cb : array<float>
     cb |> resize(int(npos * hs))
     for (p in range64(npos)) {
-        let theta = c.rope_freq_base
-        for (j in range64(half)) {
-            var freq = 1.0 / pow(theta, float(2l * j) / float(hs))
-            if (!empty(t.rope_freqs)) {
-                freq /= t.rope_freqs[j]
-            }
-            let ang = float(p) * freq * c.rope_freq_scale
-            cb[int(p * hs + j)] = cos(ang) * c.rope_mscale
-            cb[int(p * hs + half + j)] = sin(ang) * c.rope_mscale
-        }
+        rdec_rope_row(t, p, hs, half, cb, p * hs)
     }
     rdec_prefill(s.x_b, cb, npos, s.logits)
     delete cb
@@ -3074,16 +3106,7 @@ def private vulkan_resident_batch_decode(t : Model; var ws : BatchWorkspace; var
         for (k in range64(dim)) {
             x[int(k)] = ws.scr.x_b[i * dim + k]
         }
-        let theta = c.rope_freq_base
-        for (j in range64(half)) {
-            var freq = 1.0 / pow(theta, float(2l * j) / float(hs))
-            if (!empty(t.rope_freqs)) {
-                freq /= t.rope_freqs[j]
-            }
-            let ang = float(pos) * freq * c.rope_freq_scale
-            cossin[int(j)] = cos(ang) * c.rope_mscale
-            cossin[int(half + j)] = sin(ang) * c.rope_mscale
-        }
+        rdec_rope_row(t, pos, hs, half, cossin, 0l)
         rdec_token(x, cossin, pos, pos + 1l, tmp)
         // write the new token's K/V back to this session's cache at pos, then scatter logits
         for (l in range64(c.n_layers)) {
@@ -3297,7 +3320,7 @@ def moe_gpu_upload_resident(t : Model) {
     // every token). One slice: the repack groups the plane globally, tail rows disk-order.
     // DASLLAMA_GPU_CLS=0 keeps it on the CPU (A/B lever).
     let cls_fmt = t.config.shared_weights ? t.emb_fmt : t.wcls_fmt
-    let cls_servable = cls_fmt == KqFmt.q8 ? (t.cls_q8 || !t.config.shared_weights) : moe_gpu_fmt_kq(cls_fmt)
+    let cls_servable = cls_fmt == KqFmt.q8 ? (t.cls_q8 || !t.config.shared_weights) : kq_sb(cls_fmt)
     vulkan_bake_role(VkBakeRole.cls)
     if (cls_servable && gpu_want_cls_upload()
             && moe_gpu_gather_upload(t, cls_fmt, t.wcls_off, dim, t.config.vocab_size, t.config.vocab_size, mr, kgroup, wbias, wq, ws)) {
@@ -3325,7 +3348,7 @@ def moe_gpu_upload_resident(t : Model) {
                 let fq = fmt_at(t.wq_fmt, l)
                 let fo = fmt_at(t.wo_fmt, l)
                 if (gpu_want_dense_attn() && t.wq_offs[l] >= 0l && t.wo_offs[l] >= 0l
-                        && (fq == KqFmt.q8 || moe_gpu_fmt_kq(fq)) && (fo == KqFmt.q8 || moe_gpu_fmt_kq(fo))
+                        && (fq == KqFmt.q8 || kq_sb(fq)) && (fo == KqFmt.q8 || kq_sb(fo))
                         && kq_servable(t, fq) && kq_servable(t, fo)) {
                     uploads |> push((f = fq, woff = t.wq_offs[l], n = dim, rows = t.config.q_gated ? 2l * qd : qd))
                     uploads |> push((f = fo, woff = t.wo_offs[l], n = qd, rows = dim))
@@ -3461,7 +3484,7 @@ def moe_gpu_upload_resident(t : Model) {
             let kq_cls = fq != KqFmt.q8
             var fmts_ok = (fk != KqFmt.q8) == kq_cls && (fv != KqFmt.q8) == kq_cls
             for (f in [fq, fk, fv, fo]) {
-                fmts_ok = fmts_ok && (f == KqFmt.q8 || moe_gpu_fmt_kq(f)) && kq_servable(t, f)
+                fmts_ok = fmts_ok && (f == KqFmt.q8 || kq_sb(f)) && kq_servable(t, f)
             }
             continue if (!fmts_ok || !(hs == 128l || hs == 256l) || qd > 8192l || kvd > 1024l
                 || c.n_heads > 64l || rot % 2l != 0l || rot > hs || kvd % 32l != 0l
@@ -3548,8 +3571,8 @@ def moe_gpu_upload_resident(t : Model) {
         // recipe bumps ffn_down_exps to Q5_0/Q8_0, so k4/k4/q8 is the COMMON shape (glm4moe,
         // gemma). The walk stops on refusal so the resident set stays contiguous from the end.
         let gu_ok = ((f1 == KqFmt.q8) == (f3 == KqFmt.q8)
-            && (f1 == KqFmt.q8 || (moe_gpu_fmt_kq(f1) && moe_gpu_fmt_kq(f3))))
-        let dn_ok = f2 == KqFmt.q8 || moe_gpu_fmt_kq(f2)
+            && (f1 == KqFmt.q8 || (kq_sb(f1) && kq_sb(f3))))
+        let dn_ok = f2 == KqFmt.q8 || kq_sb(f2)
         if (l < t.config.n_layer_dense_lead || t.we1_offs[l] < 0l || !(gu_ok && dn_ok)) {
             break
         }
@@ -3589,8 +3612,8 @@ def moe_gpu_upload_resident(t : Model) {
         let f3 = fmt_at(t.we3_fmt, l)
         // same rule as the resident walk: gate/up share one activation image, down is free
         let gu_ok = ((f1 == KqFmt.q8) == (f3 == KqFmt.q8)
-            && (f1 == KqFmt.q8 || (moe_gpu_fmt_kq(f1) && moe_gpu_fmt_kq(f3))))
-        if (!(gu_ok && (f2 == KqFmt.q8 || moe_gpu_fmt_kq(f2)))) {
+            && (f1 == KqFmt.q8 || (kq_sb(f1) && kq_sb(f3))))
+        if (!(gu_ok && (f2 == KqFmt.q8 || kq_sb(f2)))) {
             break
         }
         var got = 0
@@ -3661,14 +3684,16 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
 //! mapping STILL ALIVE — the caller streams the save inside. Fails open (unstreamable models
 //! materialize + save eagerly through the same blk); split shards return false pre-blk.
 def load_gguf_streaming(path : string; mode : QuantMode; var t : Model; var jobs : array<FillJob>;
+                        want_blob : bool = false;
                         blk : block<(m : GGUFMeta; bytes : array<uint8>) : bool>) : bool {
     if (!is_job_que_available()) {
         var okj = false
         with_job_que() {
-            okj = load_gguf_streaming(path, mode, t, jobs, blk)
+            okj = load_gguf_streaming(path, mode, t, jobs, want_blob, blk)
         }
         return okj
     }
+    g_stream_want_blob = want_blob
     g_weights_epoch++
     t.quant = mode
     if (has_env_variable("DASLLAMA_CONV_PROF")) {
@@ -3712,6 +3737,7 @@ def load_gguf_streaming(path : string; mode : QuantMode; var t : Model; var jobs
         delete bases
         delete sizes
         delete shards
+        g_stream_want_blob = false
         return sok
     }
     delete shards
@@ -3741,6 +3767,7 @@ def load_gguf_streaming(path : string; mode : QuantMode; var t : Model; var jobs
         }
     }
     fclose(f)
+    g_stream_want_blob = false
     return ok
 }
 
@@ -4313,6 +4340,17 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
         }
         // streaming: big q-halves never materialize (jobs stream them to the writer); scale
         // halves are small (6-16%) and stay in RAM. Unstreamable features disarmed above.
+        // the blob flavor decides HERE: offsets exist (the bind gate reads them), nothing is sized
+        // yet. A refusal disarms streaming outright — a planar image is the wrong metal artifact
+        if (g_fill_plan_mode && g_stream_want_blob) {
+            // both gates the eager rail applies: metal can serve this shape, AND the blob layout
+            // holds (bind alignment, no repack). Pure config/fmt reads, so they answer here
+            t.metal_blob = metal_model_servable(t) && blob_stream_eligible(t)
+            if (!t.metal_blob) {
+                to_log(LOG_INFO, "dasLLAMA: streaming plan disarmed — the metal blob flavor is unavailable for this model; converting eagerly\n")
+                g_fill_plan_mode = false
+            }
+        }
         let stream_q = g_fill_plan_mode
         if (stream_q) {
             // the streamed save sizes each q-plane from the LAYOUT (holes included), not the job sum
@@ -4322,7 +4360,9 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
             g_stream_plane_total["k6q"] = (sz.k6_n / 256l) * K6_QSB
             g_stream_plane_total["q40q"] = (sz.q40_n / 256l) * Q40_QSB
             g_stream_plane_total["q51q"] = (sz.q51_n / 32l) * Q51_QB
-            g_stream_plane_total["qblob"] = mode == QuantMode.q8 ? sz.wblob_n : 0l
+            let wb = mode == QuantMode.q8 ? sz.wblob_n : 0l
+            g_stream_plane_total[t.metal_blob ? "mblob" : "qblob"] = (t.metal_blob
+                ? (wb / Q8_BLOCK_ELEMS) * (Q8_QPB + Q8_SPB) : wb)
         }
         if (sz.k4_n > 0l) {
             if (!stream_q) {
@@ -4369,8 +4409,10 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
                 t.qblob |> reserve(sz.wblob_n)
                 t.qblob |> resize(sz.wblob_n)
             }
-            t.qscales |> reserve(sz.wblob_n / 32l)
-            t.qscales |> resize(sz.wblob_n / 32l)
+            if (!t.metal_blob) {   // blob: scales ride inside mblob, so the split plane never exists
+                t.qscales |> reserve(sz.wblob_n / 32l)
+                t.qscales |> resize(sz.wblob_n / 32l)
+            }
         } elif (mode == QuantMode.q4_0) {
             t.q4blob |> reserve(sz.wblob_n / 2l)
             t.q4blob |> resize(sz.wblob_n / 2l)
@@ -4674,8 +4716,11 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
         if (mode == QuantMode.q8 && g_wscale_f16) {
             if (g_fill_plan_mode) {
                 // streaming: the epilogue converts after qblob fills; pre-mark for the meta,
-                // mirroring the convert's own outcome (empty scales = nothing converts, no flag)
-                t.wscale_f16 = !empty(t.qscales) && kernel_backend_has_wscale16()
+                // mirroring the convert's own outcome (empty scales = nothing converts, no flag).
+                // A blob build has no scale plane, so it mirrors what the EAGER metal rail ends
+                // with — the drivers read this flag, so the two rails must not disagree
+                let have_q8 = t.metal_blob ? g_stream_plane_total?["mblob"] ?? 0l : long_length(t.qscales)
+                t.wscale_f16 = have_q8 > 0l && kernel_backend_has_wscale16()
             } else {
                 wscale_convert_f16(t)
             }
@@ -5462,28 +5507,8 @@ def private rope_batch(var q_b : array<float>; var k_b : array<float>; t : Model
 // sin likewise. freq[j] is position-independent (hoisted out of the position loop); mscale folds
 // in here. Built once before the layer loop, reused across all heads/layers. Bit-identical to classic.
 def private build_rope_table(@scratch var cos_tab : array<float>; @scratch var sin_tab : array<float>; t : Model; theta, fscale : float; start_pos, npos, head_size : int64; use_ff : bool = true) {
-    let c = t.config
-    let half = head_size / 2l
-    let scale = c.rope_mscale   // scales cos/sin — ggml applies mscale to NORM and NEOX alike (mistral3 YaRN)
-    let has_ff = use_ff && !empty(t.rope_freqs)
-    cos_tab |> resize(npos * half)   // nolint:PERF026 — session scratch; same size every decode step, so this allocates once
-    sin_tab |> resize(npos * half)   // nolint:PERF026 — see above
-    unsafe {
-        var cp = addr(cos_tab[0])
-        var sp = addr(sin_tab[0])
-        let ffp = has_ff ? addr < float const? >(t.rope_freqs[0]) : null
-        for (j in range64(half)) {
-            var freq = 1.0 / pow(theta, float(2l * j) / float(head_size))
-            if (has_ff) {
-                freq /= ffp[j]
-            }
-            for (pi in range64(npos)) {
-                let angle = float(start_pos + pi) * fscale * freq
-                cp[pi * half + j] = cos(angle) * scale
-                sp[pi * half + j] = sin(angle) * scale
-            }
-        }
-    }
+    build_rope_tabs(cos_tab, sin_tab, theta, fscale, t.config.rope_mscale, t.rope_freqs, use_ff,
+                    start_pos, npos, head_size)
 }
 
 // build_rope_table's batched-decode twin: row pi's angle uses positions[pi] instead of start_pos+pi
@@ -5492,29 +5517,8 @@ def private build_rope_table(@scratch var cos_tab : array<float>; @scratch var s
 def private build_rope_table_rows(@scratch var cos_tab : array<float>; @scratch var sin_tab : array<float>; t : Model;
                                   theta, fscale : float; positions : array<int64>; nrows, head_size : int64;
                                   use_ff : bool = true) {
-    let c = t.config
-    let half = head_size / 2l
-    let scale = c.rope_mscale
-    let has_ff = use_ff && !empty(t.rope_freqs)
-    cos_tab |> resize(nrows * half)
-    sin_tab |> resize(nrows * half)
-    unsafe {
-        var cp = addr(cos_tab[0])
-        var sp = addr(sin_tab[0])
-        let pp = addr < int64 const? >(positions[0])
-        let ffp = has_ff ? addr < float const? >(t.rope_freqs[0]) : null
-        for (j in range64(half)) {
-            var freq = 1.0 / pow(theta, float(2l * j) / float(head_size))
-            if (has_ff) {
-                freq /= ffp[j]
-            }
-            for (pi in range64(nrows)) {
-                let angle = float(pp[pi]) * fscale * freq
-                cp[pi * half + j] = cos(angle) * scale
-                sp[pi * half + j] = sin(angle) * scale
-            }
-        }
-    }
+    build_rope_tabs_rows(cos_tab, sin_tab, theta, fscale, t.config.rope_mscale, t.rope_freqs, use_ff,
+                         positions, nrows, head_size)
 }
 
 // Table-driven prefill RoPE: rope q_b[p*qd..] and k_b[p*kv_dim..] in place using the precomputed
@@ -6747,46 +6751,16 @@ def private mm(var y : array<float>; t : Model; woff : int64; x : array<float>; 
 // independent per position, so thread it (was the largest serial bucket once attention + GEMM
 // threaded). Same per-row quants as the single-row quantize_q8_0_into.
 def private requant_rows_q8(x : array<float>; n, npos : int64; var xqb : array<int8>; var xsb : array<float>) {
-    let nb = n / 32l
     let ts_rq = ref_time_ticks()
-    unsafe {
-        let xp = addr < float const? >(x[0])
-        var qp = addr(xqb[0])
-        var sp = addr(xsb[0])
-        let rq_par = n * npos >= g_requant_par_threshold
-        maybe_parallel_for(rq_par, 0, int(npos), get_dispatch_lanes()) $(rb, re) {
-            unsafe {
-                for (p in range(rb, re)) {
-                    let pp = int64(p)
-                    quantize_q8_0_into_ptr(xp + pp * n, n, qp, sp, pp * n, pp * nb)
-                }
-            }
-        }
-    }
+    requant_rows_q8(x, n, npos, xqb, xsb, n * npos >= g_requant_par_threshold)
     prof_add("mm_requant", ts_rq)
 }
 
 // Q8_K-form batch requant (kq v2): per-256 scales + per-16 sums of the per-256-scaled
 // quants. k4-weight batch matmuls and MoE gathers consume these rows.
 def private requant_rows_q8k_bs(x : array<float>; n, npos : int64; var xqb : array<int8>; var xsb : array<float>; var xbsb : array<int>) {
-    let nsb = n / 256l
-    let nh = n / 16l
     let ts_rq = ref_time_ticks()
-    unsafe {
-        let xp = addr < float const? >(x[0])
-        var qp = addr(xqb[0])
-        var sp = addr(xsb[0])
-        var bp = addr(xbsb[0])
-        let rq_par = n * npos >= g_requant_par_threshold
-        maybe_parallel_for(rq_par, 0, int(npos), get_dispatch_lanes()) $(rb, re) {
-            unsafe {
-                for (p in range(rb, re)) {
-                    let pp = int64(p)
-                    quantize_q8_k_into_ptr(xp + pp * n, n, qp, sp, bp, pp * n, pp * nsb, pp * nh)
-                }
-            }
-        }
-    }
+    requant_rows_q8k_bs(x, n, npos, xqb, xsb, xbsb, n * npos >= g_requant_par_threshold)
     prof_add("mm_requant", ts_rq)
 }
 
@@ -8472,13 +8446,6 @@ def heat_report(verbose : bool = false) {
     to_log(LOG_INFO, "heat MEAN hit {double(hits) * 100.0lf / double(picks):.1f}% ({hits}/{picks} picks over {nl} layers)\n")
 }
 
-def heat_report_reset() {
-    for (h in g_heat) {
-        h.hits = 0l
-        h.picks = 0l
-    }
-}
-
 [cold_path]   // one-time env resolution; heat_armed is a global test after the first call
 def private load_heat_want() {
     g_heat_want = max(gpu_want_heat(), 0l)
@@ -8497,8 +8464,8 @@ def private heat_advise_layer(t : Model; l : int64; h : HeatLayer) {
     let hf1 = fmt_at(t.we1_fmt, l)
     let hf2 = fmt_at(t.we2_fmt, l)
     let hf3 = fmt_at(t.we3_fmt, l)
-    if (!((hf1 == KqFmt.q8 || moe_gpu_fmt_kq(hf1)) && (hf2 == KqFmt.q8 || moe_gpu_fmt_kq(hf2))
-            && (hf3 == KqFmt.q8 || moe_gpu_fmt_kq(hf3)))) {
+    if (!((hf1 == KqFmt.q8 || kq_sb(hf1)) && (hf2 == KqFmt.q8 || kq_sb(hf2))
+            && (hf3 == KqFmt.q8 || kq_sb(hf3)))) {
         return
     }
     var ids <- [for (i in range(length(h.cnt))); int64(i)]
@@ -8673,24 +8640,6 @@ def expert_reuse_report(verbose : bool = true) {
 //! Drop all accumulated expert-reuse data (phase separation in probes).
 def expert_reuse_reset() {
     delete g_reuse
-}
-
-//! Top-``n`` expert ids for layer ``li`` by recorded pick frequency — the pinning candidate set.
-def expert_reuse_top(li : int; n : int) : array<int64> {
-    var res : array<int64>
-    if (li < 0 || li >= length(g_reuse)) {
-        return <- res
-    }
-    let r & = unsafe(g_reuse[li])
-    var ids <- [for (i in range(length(r.freq))); int64(i)]
-    ids |> sort() $(a, b) => r.freq[a] > r.freq[b]
-    for (i in range(min(n, length(ids)))) {
-        if (r.freq[ids[i]] > 0l) {
-            res |> push(ids[i])
-        }
-    }
-    delete ids
-    return <- res
 }
 
 // Can the routed mx4 experts run as the fused 2-stage chain? Q8 pre-quant, mx4 expert planes,
@@ -9542,9 +9491,7 @@ def private embed_row(t : Model; token : int64; var dst : float?) {
             dequant_q8_row(t, t.emb_q8_off + token * dim, dim, dst)
         }
     } elif (cls_kq(t)) {
-        let mr = (t.emb_fmt == KqFmt.k4 ? t.kq_repack_mr4
-            : (t.emb_fmt == KqFmt.k5 ? t.kq_repack_mr5
-            : (t.emb_fmt == KqFmt.k6 ? t.kq_repack_mr6 : t.kq_repack_mr40)))
+        let mr = kq_active_mr(t, t.emb_fmt)   // 1 when not repacked — unread past the guard then
         if (t.kq_repacked && token < (t.config.vocab_size / mr) * mr) {
             // repacked plane: gather via the grp<mr> layout (tail rows below stay disk-order, verbatim)
             unsafe {

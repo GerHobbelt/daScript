@@ -13,7 +13,7 @@ require daslib/archive
 require dasllama/dasllama_math
 require dasllama/dasllama_par
 require dasllama/dasllama_gguf
-require dasllama/dasllama_quant
+require dasllama/dasllama_convert
 require dasllama/dasllama_common   // apply_box_profile_runtime for the tower-image identity
 require dasllama/dasllama_image
 
@@ -802,23 +802,10 @@ def layernorm_batch(var out : array<float>; src : array<float>; blob : array<flo
     }
 }
 
-//! Threaded per-row Q8_0 requant of a token-major activation image — the audio-side twin of the
-//! decoder's requant_rows_q8 (private to dasllama_common). Feeds matmul_q8q8_batch/group3.
+//! Threaded per-row Q8_0 requant of a token-major activation image — the shared
+//! dasllama_convert requant, always thread-eligible here. Feeds matmul_q8q8_batch/group3.
 def asr_requant_rows_q8(x : array<float>; n, npos : int64; var xqb : array<int8>; var xsb : array<float>) {
-    let nb = n / 32l
-    unsafe {
-        let xp = addr<float const?>(x[0])
-        var qp = addr(xqb[0])
-        var sp = addr(xsb[0])
-        maybe_parallel_for(0, int(npos), get_dispatch_lanes()) $(rb, re) {
-            unsafe {
-                for (p in range(rb, re)) {
-                    let pp = int64(p)
-                    quantize_q8_0_into_ptr(xp + pp * n, n, qp, sp, pp * n, pp * nb)
-                }
-            }
-        }
-    }
+    requant_rows_q8(x, n, npos, xqb, xsb, true)
 }
 
 //! y[p] += blob[b_off .. b_off+d) for every row (projection bias). float4 bulk + scalar
@@ -996,12 +983,11 @@ def load_audio_tower(path : string; q8 : bool = false) : AudioTower {
             return <- t
         }
         var m <- load_audio_tower_(path, q8)
-        let ts_save = ref_time_ticks()
-        if (save_image(m, img, tag)) {
-            to_log(LOG_INFO, "dasLLAMA: prepared tower image saved in {get_time_usec(ts_save) / 1000} ms — {img}\n")
-        }
+        var built = AudioTower()
+        cache_via_image(m, built, img, tag)
+        delete m
         dlim_gc_stale(path)   // the fresh bake proves version-stale siblings dead
-        return <- m
+        return <- built
     }
     return <- load_audio_tower_(path, q8)
 }

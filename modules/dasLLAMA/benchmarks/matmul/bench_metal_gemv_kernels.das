@@ -5,8 +5,8 @@ require dastest/testing_boost
 require dasllama/dasllama_env  // env_int: the shared typed readers + the knob registry
 require metal/msl_shader
 require ?das_metal metal/das_metal_boost  // nolint:STYLE030 — GPU driver half, Apple builds only
-require ?das_metal dasllama/dasllama_math_metal  // nolint:STYLE030 — the production 32x32 GEMM MSL (the batch-crossover row)
-require dasllama/dasllama_metal_prefill  // nolint:STYLE030 — the production GEMV MSL (v0 baseline)
+require ?das_metal dasllama/dasllama_metal_gemm  // nolint:STYLE030 — the production 32x32 GEMM MSL (the batch-crossover row)
+require dasllama/dasllama_metal_kernels  // nolint:STYLE030 — the production GEMV MSL (v0 baseline)
 require llvm/daslib/f16_cvt  // f16 bit converts for the K-quant superblock fills
 require daslib/fio
 require math  // nolint:STYLE030 — used only inside the Apple static_if half
@@ -581,7 +581,7 @@ class MetalGemvLabB4C8 {
     }
 }
 
-// X-staged batched gemv (the API_REWORK ledger's candidate (a)): the tg's 4 rows all dot the SAME
+// X-staged batched gemv (the PERF_LEDGER candidate (a)): the tg's 4 rows all dot the SAME
 // B x-vectors, so stage a k-chunk of the X panel in threadgroup memory ONCE per tg (cooperative
 // 128-thread load, 4x fewer device x loads) and the per-lane inner-loop x reads become tgmem hits.
 // W stays strided/coalesced. Chunk = 64 float4s per stream (4KB tgmem at B=4). Barrier-safe by

@@ -200,6 +200,54 @@ bin/daslang modules/dasLLAMA/performance/gen_bench_records.das -- --workload all
 - The store (`performance/records/<box>.json`) persists after every cell — a crash costs at
   most the in-flight cell. Re-runs upsert in place.
 
+### Oracle mode — the tables as a regression tripwire
+
+```sh
+# per refactor step on this box (das-only, minutes): re-verify the stored metal rows
+bin/daslang modules/dasLLAMA/performance/gen_bench_records.das -- --oracle --legs metal
+```
+
+`--oracle` inverts the sweep into a pure check: the work list is the STORE's das LLM rows for
+this box (a stored row whose model or `.dlim` is gone is a loud FAIL, not a skip), each row
+re-measures ONCE and gates one-sided against its stored mean — drop past `--oracle-fail`
+(default 5%) fails, past `--oracle-warn` (default 3%) warns, gains report (flagged past the
+fail bar as "suspicious — verify"). Exit is nonzero on any FAIL.
+
+- GATE 1 — llama.cpp never re-measures: no ref runs, ref binaries not even required.
+- GATE 2 — one das pass per row. The >3% cv warm-retry stays: it REPLACES a bad cold measure.
+- GATE 3 — frozen artifacts: the child runs `lcpp_bench --frozen` (a missing `.dlim` panics
+  instead of minting), step-zero GC is skipped, and the store is never written.
+- Default is stop-at-first-FAIL (fail fast mid-refactor); `--oracle-keep-going` runs the full
+  board. `-o substr` narrows to one model; ASR legs are excluded (their das cells are CPU-path).
+- A FAIL auto-triggers ONE solo re-run of that cell after `--oracle-retry-settle` seconds
+  (default 60; 0 disables), and the RETRY verdict stands — the board shows both attempts. This
+  is the tail-cell discipline (below) as tool behavior; a FAIL that survives its solo retry is
+  a real regression.
+- The tune gate applies unchanged: a manifest older than the binary fails every cell — re-mint
+  (`DAS_TUNE_MODE=tune DAS_TUNE_MANIFEST=<box manifest> bin/daslang -jit
+  modules/dasLLAMA/harness/dasllama_tuner.das`) and check the fresh winners against the stored
+  rows' `tune` stamps before trusting deltas.
+- ⚠ If a rig model FAILs a cell with "cell did not measure" and its `.dlim` is missing, the
+  image was purged by a foreign-identity mint's GC pass: `dlim_identity` folds `cpu.backend`
+  and the box knobs, and any rail load under a different pin set mints its own flavor, then
+  removes every foreign-identity sibling as dead (the frozen bench child refuses to re-mint,
+  by design). Test suites no longer ride the image rail (CODEREVIEW rule 20), which removes
+  the routine trigger; the recovery stands for any other cause: re-mint with a minimal
+  unfrozen run per model (`bin/daslang -jit modules/dasLLAMA/benchmarks/lcpp_bench.das --
+  -m <gguf> --ngl 99 -p 16 -n 4 -r 1`), then re-run the cells with `-o <substr>`.
+- **A verdict on a long board's tail cells is not evidence — re-run the cell solo.** Three
+  times observed on the m1 (2026-07-30): the last cell of an 8-cell keep-going sweep under-read
+  −6.5% pp (solo re-run: dead-on the store); the last model of the hours-long Jul-28 rig
+  sweep stored tg absolutes ~20-25% low on BOTH engines (the adjacent pairing kept the ratio
+  honest; the oracle later read the das side as a +20% "suspicious gain"); and the M1-refactor
+  gate's 8th cell read −34% RELATIVE TO TRUE (a hard oracle FAIL at −15/−21% vs store — the
+  solo re-run landed dead-on the same morning's pre-refactor fresh reads). The phantom can
+  exceed the fail bar by 4×; a tail FAIL is a re-run instruction, never a verdict.
+  Discriminating an
+  anomaly: probe the stored row's `sha` (code), the `.dlim` mtimes (artifacts), the `tune`
+  stamps, and re-run the stored `cmd` of the ADJACENT ref on a quiet chip — if the ref moved
+  too, the state was environmental and only the absolutes are stale.
+
 ## 5. Publish
 
 ```sh

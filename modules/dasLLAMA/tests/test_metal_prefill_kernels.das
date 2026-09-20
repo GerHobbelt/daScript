@@ -2,7 +2,7 @@ options gen2
 
 require dastest/testing_boost public
 require dasllama/dasllama_math
-require dasllama/dasllama_quant  // nolint:STYLE030 — used only inside the Apple static_if half; off-Apple lint sees the branch compiled out
+require dasllama/dasllama_convert  // nolint:STYLE030 — used only inside the Apple static_if half; off-Apple lint sees the branch compiled out
 require ?das_metal dasllama/dasllama_metal_prefill  // nolint:STYLE030 — the Phase-6 prefill kernel set (Apple builds)
 require ?das_metal dasllama/dasllama_metal_kernels  // nolint:STYLE030 — the Wave C MoE routing kernel set (Apple builds)
 require ?das_metal metal/das_metal_boost  // nolint:STYLE030 — device/pipeline/buffer plumbing + the leak gate
@@ -1300,16 +1300,17 @@ def private moe_mulmm_q51_gate(t : T?; dev, queue; kdim, ndim : int; counts : ar
         metal_set_threadgroup_memory_length(enc, metal_moe_mulmm_q51_msl_tgmem, 0)
         metal_set_buffer(enc, bs, 0ul, 0)
         metal_set_buffer(enc, bw, 0ul, 1)
-        metal_set_buffer(enc, bx, 0ul, 2)
-        metal_set_buffer(enc, by, 0ul, 3)
-        metal_set_buffer(enc, bkdim, 0ul, 4)
-        metal_set_buffer(enc, bndim, 0ul, 5)
-        metal_set_buffer(enc, bcnt, 0ul, 6)
-        metal_set_buffer(enc, bbase, 0ul, 7)
-        metal_set_buffer(enc, bbkt, 0ul, 8)
-        metal_set_buffer(enc, beblk, 0ul, 9)
-        metal_set_buffer(enc, bnk, 0ul, 10)
-        metal_set_buffer(enc, bgather, 0ul, 11)
+        // the MetalMoeMulMmBase family's shared numbering — 2 is the k-quant third weight view
+        metal_set_buffer(enc, bx, 0ul, 3)
+        metal_set_buffer(enc, by, 0ul, 4)
+        metal_set_buffer(enc, bkdim, 0ul, 5)
+        metal_set_buffer(enc, bndim, 0ul, 6)
+        metal_set_buffer(enc, bcnt, 0ul, 7)
+        metal_set_buffer(enc, bbase, 0ul, 8)
+        metal_set_buffer(enc, bbkt, 0ul, 9)
+        metal_set_buffer(enc, beblk, 0ul, 10)
+        metal_set_buffer(enc, bnk, 0ul, 11)
+        metal_set_buffer(enc, bgather, 0ul, 12)
         metal_dispatch_threadgroups(enc, uint3(uint(tiles), uint(ndim / 64), uint(ne)), uint3(128u, 1u, 1u))
     }
     t |> success(ran, "moe q51 mulmm dispatch kdim={kdim} ndim={ndim} ne={ne} pad={pad}: {err}")
