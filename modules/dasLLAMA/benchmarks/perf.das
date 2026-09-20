@@ -1,4 +1,5 @@
 options gen2
+options _jit_fast_math = true   // ggml-parity FP laxity (non-bit-exact, ~+10%); tests stay bit-exact
 
 require dasllama/dasllama_transformer
 require daslib/jobque_boost
@@ -28,6 +29,10 @@ def run_once(t : Transformer; c : Config; tag : string) : double {
 
 [export]
 def main {
+    if (!jit_enabled()) {
+        print("This benchmark is JIT-only — run with: daslang -jit <file>\n")
+        return
+    }
     var t <- load_checkpoint(MODEL_PATH)
     let c = t.config
 

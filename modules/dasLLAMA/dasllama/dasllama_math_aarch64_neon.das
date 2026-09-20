@@ -6,17 +6,29 @@ require dasllama/dasllama_math
 require llvm/daslib/aarch64_neon  // sdot4: JIT-emitted ARM SDOT, scalar fallback elsewhere
 require daslib/jobque_boost public  // kernels expand parallel_for; consumers need its symbols
 require dasllama/dasllama_par  // maybe_parallel_for
+require math  // min/max in the token-block bounds
 
 // arm64 SDOT backend for the Q8·Q8 matmuls. dasllama_math owns the public matmul wrappers + the
-// portable kernels (the default); this module supplies the NEON kernels and, on an arm64 host,
-// registers them as the active backend at [init] (use_q8q8_kernels). On every other host
-// get_architecture_name() != "arm64" so the portable kernels stay selected — and dot_q8q8_sdot4x4's
-// sdot4 calls would hit their scalar fallback anyway. Under JIT each sdot4 lowers to one
-// @llvm.aarch64.neon.sdot (see llvm/daslib/aarch64_neon + g_aarch64_intrin_lookup in llvm_jit_intrin).
+// portable kernels (the default); this module supplies the NEON kernels and, on an arm64 JIT host,
+// registers them as the active backend at [init] (use_q8q8_kernels). The registration is gated on
+// `jit_enabled()`: only under JIT does each sdot4 lower to one @llvm.aarch64.neon.sdot (see
+// llvm/daslib/aarch64_neon + g_aarch64_intrin_lookup in llvm_jit_intrin). Off-JIT (interpreter or
+// AOT) sdot4 hits its scalar fallback — slower than the portable dot_q8q8 — so the portable kernels
+// stay selected there, as they do on every non-arm64 host (get_architecture_name() != "arm64").
 //
 // The kernels mirror the portable ones in dasllama_math (same raw-pointer signatures = the
 // MatmulQ8Q8*Fn typedefs, same 1N threading) and differ only in the inner dot. They are free to
 // diverge in threading/tiling per-platform since dispatch is at the whole-matmul level.
+
+// Batched-GEMM token-block width: the laneq batch kernel tiles tokens into TB-sized blocks (outer),
+// looping weight groups inside, so a TB×n activation slice stays L2-resident and is reused across a
+// thread's groups instead of re-streaming the whole activation per group. 128 is the tuned default
+// (Llama-3.2-1B, M1 Max — pipeline best-of-5 @2048); exposed as a runtime knob for per-model tuning
+// (larger n wants a smaller TB to stay in L2). Clamped to >= 1: the kernel advances `tb += TB`, so a
+// non-positive block width would never make progress (infinite loop).
+var g_q8_token_block = 128l
+def public set_q8_token_block(tb : int64) { g_q8_token_block = max(tb, 1l) }
+def public get_q8_token_block() : int64 { return g_q8_token_block }
 
 //! ARM SDOT dot: 4 blocks/iter, 4 independent int4 accumulators (each block = 2 sdot4 of 16 int8),
 //! hsum + dual-scale flushed per block into 4 separate float accumulators. Bit-for-bit close to
@@ -177,7 +189,7 @@ def dot_q8q8_laneq4x4(var yp : float?; wg : int8 const?; sg : float const?; xqp 
         let xs1 = xsp + (t0 + 1l) * nb
         let xs2 = xsp + (t0 + 2l) * nb
         let xs3 = xsp + (t0 + 3l) * nb
-        for (bi in range64(nb)) {
+        for [unroll_count = 2] (bi in range64(nb)) {
             let wb = bi * 128l
             let xb = bi * 32l
             var a0 = int4(0, 0, 0, 0)
@@ -294,27 +306,36 @@ def private q8q8_kernel_neon_laneq(var yp : float?; wp : int8 const?; sp : float
 def private q8q8_batch_kernel_neon_laneq(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n, d, ntok : int64) {
     let nb = n / 32l
     let ng = d / 4l
-    let nt4 = (ntok / 4l) * 4l   // tokens covered by full 4-token tiles
     var myp = yp
+    // Token-blocked: TB tokens outer, groups inner — the TB×n activation slice stays L2-resident and is
+    // reused across this thread's groups, instead of re-streaming the whole activation once per group
+    // (which goes DRAM-bound at large ntok, e.g. the FFN-down n=8192, ntok=2048 = 16MB restreamed d/4×).
+    let TB = g_q8_token_block
     maybe_parallel_for(n * d * ntok >= MATMUL_PAR_THRESHOLD, 0, int(ng), get_total_hw_jobs()) $(rb, re) {
         unsafe {
-            for (gi in range(rb, re)) {
-                let g = int64(gi)
-                let wgp = wp + g * 4l * n
-                let sgp = sp + g * 4l * nb
-                var tk = 0l
-                while (tk < nt4) {     // 4-row × 4-token tiles (the throughput path)
-                    dot_q8q8_laneq4x4(myp, wgp, sgp, xqp, xsp, n, d, g, tk)
-                    tk += 4l
+            var tb = 0l
+            while (tb < ntok) {
+                let tbe = min(tb + TB, ntok)
+                let tb4 = tb + ((tbe - tb) / 4l) * 4l
+                for (gi in range(rb, re)) {
+                    let g = int64(gi)
+                    let wgp = wp + g * 4l * n
+                    let sgp = sp + g * 4l * nb
+                    var tk = tb
+                    while (tk < tb4) {     // 4-row × 4-token tiles (the throughput path)
+                        dot_q8q8_laneq4x4(myp, wgp, sgp, xqp, xsp, n, d, g, tk)
+                        tk += 4l
+                    }
+                    while (tk < tbe) {    // token tail within this block: one token at a time
+                        let f = dot_q8q8_laneq4(wgp, sgp, xqp + tk * n, xsp + tk * nb, n)
+                        myp[tk * d + g * 4l + 0l] = f.x
+                        myp[tk * d + g * 4l + 1l] = f.y
+                        myp[tk * d + g * 4l + 2l] = f.z
+                        myp[tk * d + g * 4l + 3l] = f.w
+                        tk++
+                    }
                 }
-                while (tk < ntok) {    // token tail (ntok % 4): one token at a time
-                    let f = dot_q8q8_laneq4(wgp, sgp, xqp + tk * n, xsp + tk * nb, n)
-                    myp[tk * d + g * 4l + 0l] = f.x
-                    myp[tk * d + g * 4l + 1l] = f.y
-                    myp[tk * d + g * 4l + 2l] = f.z
-                    myp[tk * d + g * 4l + 3l] = f.w
-                    tk++
-                }
+                tb += TB
             }
         }
     }
@@ -383,7 +404,10 @@ def private q8q8_group3_kernel_neon_laneq(var y0p : float?; var y1p : float?; va
 
 [init]
 def dasllama_math_aarch64_neon_register() {
-    if (get_architecture_name() == "arm64") {
+    // Only register the SDOT backend under JIT on arm64. Off-JIT (interpreter or AOT) sdot4/sdot4_laneq
+    // run their SCALAR fallback body — slower than the portable dot_q8q8, which the vectorizer handles —
+    // so leaving the portable kernels active is faster everywhere the hardware SDOT isn't emitted.
+    if (get_architecture_name() == "arm64" && jit_enabled()) {
         // default active backend: sdot4x4 on row-major weights (direct callers — tests, benchmarks)
         use_q8q8_kernels(@@q8q8_kernel_neon_sdot4x4, @@q8q8_batch_kernel_neon_sdot4x4, @@q8q8_group3_kernel_neon_sdot4x4, @@repack_q8q8_identity)
         // alternate backend: laneq + interleaved repack, activated by enable_q8q8_laneq at Q8 model load

@@ -1,4 +1,5 @@
 options gen2
+options _jit_fast_math = true   // ggml-parity FP laxity (non-bit-exact, ~+10%); tests stay bit-exact
 
 require dasllama/dasllama_transformer
 require dasllama/dasllama_tokenizer
@@ -62,6 +63,10 @@ def decode_ids(tok : Tokenizer; ids : array<int64>; limit : int) : string {
 
 [export]
 def main {
+    if (!jit_enabled()) {
+        print("This benchmark is JIT-only — run with: daslang -jit <file>\n")
+        return
+    }
     var path = MODEL
     let args = get_command_line_arguments()
     if (!empty(args)) {

@@ -1,4 +1,5 @@
 options gen2
+options _jit_fast_math = true   // ggml-parity FP laxity (non-bit-exact, ~+10%); tests stay bit-exact
 
 require dasllama/dasllama_transformer
 require daslib/jobque_boost
@@ -32,6 +33,10 @@ def argmax_logits(s : RunState; vocab : int64) : int64 {
 
 [export]
 def main {
+    if (!jit_enabled()) {
+        print("This benchmark is JIT-only — run with: daslang -jit <file>\n")
+        return
+    }
     var path = DEFAULT_MODEL
     let args = get_command_line_arguments()
     if (!empty(args) && ends_with(args[length(args) - 1], ".gguf")) {

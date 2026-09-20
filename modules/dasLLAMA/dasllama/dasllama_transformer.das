@@ -757,8 +757,35 @@ def private kv_store_batch(var key_cache : array<float>; var value_cache : array
     }
 }
 
+// Fused activation + gate multiply: hb[p] = act(W1·x[p]) * (W3·x[p]) in place, threaded per position.
+// One memory pass (vs silu-then-mul), and the transcendental is vectorized via exp4 unless g_act_vec is
+// off. Each element is independent (no cross-position reduce), so threading never changes the result;
+// the only non-bit-exactness is exp4's ~2 ulp. Fork workers touch raw base pointers; self-gates on
+// ACT_PAR_THRESHOLD so small prompts (and decode, npos=1) run inline.
+def private gate_batch(var g : array<float>; u : array<float>; act : FfnAct; hidden, npos : int64) {
+    let is_gelu = act == FfnAct.gelu
+    let vec = g_act_vec
+    unsafe {
+        var gp = addr(g[0])
+        var up = reinterpret<float const?>(addr(u[0]))
+        maybe_parallel_for(hidden * npos >= ACT_PAR_THRESHOLD, 0, int(npos), get_total_hw_jobs()) $(rb, re) {
+            unsafe {
+                for (p in range(rb, re)) {
+                    let off = int64(p) * hidden
+                    if (vec) {
+                        if (is_gelu) { geglu4(gp + off, up + off, hidden) } else { swiglu4(gp + off, up + off, hidden) }
+                    } else {
+                        if (is_gelu) { geglu(gp + off, up + off, hidden) } else { swiglu(gp + off, up + off, hidden) }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // Add a projection bias (Qwen2): y[yoff + i] += b[boff + i]. yoff is 0 for the single-token forward,
 // p*stride for the batched prefill; boff is the per-layer slice into bq/bk/bv.
+[hint(unsafe_range_check)]
 def private add_bias(var y : array<float>; yoff : int64; b : array<float>; boff, n : int64) {
     for (i in range64(n)) {
         y[yoff + i] += b[boff + i]
@@ -833,7 +860,7 @@ def private mm_b(var y : array<float>; t : Transformer; woff : int64; x : array<
         let ts_rq = ref_time_ticks()
         // quantize each of the npos activation columns into xqb/xsb — independent per position, so
         // thread it (it was the largest serial bucket once attention + GEMM threaded). Fork workers
-        // touch raw addresses only; quantize_q8_0_into_ptr un-consts the captured destinations.
+        // touch raw addresses only; the captured destinations bind straight through as `var int8?`/`var float?`.
         unsafe {
             let xp = reinterpret<float const?>(addr(x[0]))
             var qp = addr(xqb[0])
@@ -910,10 +937,8 @@ def forward(t : Transformer; var s : RunState; token, pos : int64) {
         rope_apply(s.k, pos, head_size, kv_dim, c.rope_freq_base, t.rope_freqs, c.rope_neox, c.rope_mscale)
         // store k, v for this position into the KV cache
         let kvoff = loff + pos * kv_dim
-        for (i in range64(kv_dim)) {
-            s.key_cache[kvoff + i] = s.k[i]
-            s.value_cache[kvoff + i] = s.v[i]
-        }
+        copy_floats(unsafe(addr(s.key_cache[kvoff])), unsafe(addr(s.k[0])), kv_dim)
+        copy_floats(unsafe(addr(s.value_cache[kvoff])), unsafe(addr(s.v[0])), kv_dim)
         // multi-head attention. att[0..cnt) holds the scores for keys kstart..pos (kstart=0 unless
         // a sliding-window layer past the window), scaled by 1/sqrt(head_size).
         for (h in range64(n_heads)) {
@@ -941,30 +966,19 @@ def forward(t : Transformer; var s : RunState; token, pos : int64) {
         if (c.pre_post_norm) {  // Gemma2: post-attention RMSNorm before the residual add
             rms_at(s.xb2, t, t.rms_post_att_off + l * dim, s.xb2, dim)
         }
-        for (i in range64(dim)) {
-            s.x[i] += s.xb2[i]
-        }
+        add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.xb2[0])), dim)
         // ffn rmsnorm
         rms_at(s.xb, t, t.rms_ffn_off + l * dim, s.x, dim)
         // gated FFN: hb = act(W1·xb) * (W3·xb) — silu (SwiGLU) or gelu (GeGLU, Gemma2)
         mm(s.hb, t, t.w1_off + l * dim * hidden, s.xb, s.xq, s.xs, dim, hidden)
         mm(s.hb2, t, t.w3_off + l * dim * hidden, s.xb, s.xq, s.xs, dim, hidden)
-        if (c.ffn_act == FfnAct.gelu) {
-            gelu(s.hb, hidden)
-        } else {
-            silu(s.hb, hidden)
-        }
-        for (i in range64(hidden)) {
-            s.hb[i] *= s.hb2[i]
-        }
+        gate_batch(s.hb, s.hb2, c.ffn_act, hidden, 1l)   // fused act*gate; same kernel as prefill (npos=1 → inline)
         // down projection, optional post-FFN norm, residual
         mm(s.xb, t, t.w2_off + l * hidden * dim, s.hb, s.xq, s.xs, hidden, dim)
         if (c.pre_post_norm) {  // Gemma2: post-FFN RMSNorm before the residual add
             rms_at(s.xb, t, t.rms_post_ffn_off + l * dim, s.xb, dim)
         }
-        for (i in range64(dim)) {
-            s.x[i] += s.xb[i]
-        }
+        add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.xb[0])), dim)
     }
 
     // final rmsnorm (into xb to avoid aliasing x as both in/out), then classifier
@@ -995,6 +1009,9 @@ let NORM_PAR_THRESHOLD = 256_000l
 let ROPE_PAR_THRESHOLD = 100_000l
 // Thread the KV-cache store once kv_dim × npos clears this (it's a memory-bound contiguous copy).
 let KV_STORE_PAR_THRESHOLD = 256_000l
+// Thread the per-position FFN activation (silu/gelu) once hidden × npos clears this. Lower than the
+// memory-bound passes — each element pays a transcendental (exp/tanh), so the compute justifies threading sooner.
+let ACT_PAR_THRESHOLD = 100_000l
 // Query-block width for the blocked prefill attention (each K/V tile is reused across this many queries).
 let ATTN_BLOCK_Q = 8l
 // Tile dims for the flash prefill attention (Q rows × KV cols processed per GEMM tile). The flash
@@ -1027,6 +1044,22 @@ def set_rope_table_mode(on : bool) {
 //! Whether prefill RoPE uses the precomputed cos/sin table.
 def get_rope_table_mode() : bool {
     return g_use_rope_table
+}
+
+// FFN gate activation: when true (default) use the vectorized exp4 fused kernels (swiglu4/geglu4,
+// ~2 ulp, non-bit-exact); when false the scalar libm swiglu/geglu (bit-exact reference). The oracle
+// tests flip this off for their token-for-token gate; production leaves it on. Same fusion either way.
+var g_act_vec = true
+
+//! Select the FFN gate transcendental: vectorized exp4 (default true, fast, ~2 ulp) vs scalar libm
+//! (bit-exact). Off is the reference path the token-for-token oracle tests pin.
+def set_act_vec(on : bool) {
+    g_act_vec = on
+}
+
+//! Whether the FFN gate uses the vectorized exp4 kernels.
+def get_act_vec() : bool {
+    return g_act_vec
 }
 
 var g_prefill_prof_acc : table<string; int64>
@@ -1122,40 +1155,49 @@ def private attn_head_flash(qp, kcp, vcp : float const?; var xbp : float?;
                     kqp[i] = 0.0
                 }
                 gemm_f32(kqp, qpk, kpk, tile_rows, head_size, KV)
-                // scale + softcap + causal/sliding mask, then online-softmax fold per query row
+                // ggml-style decomposition (ops.cpp:8771): scale — then soft-cap — the whole score tile
+                // in one vectorized sweep each, replacing the scalar per-element multiply in the mask branch.
+                scale_inplace(kqp, scale, tile_rows * KV)
+                if (attn_softcap > 0.0) {   // Gemma2: soft-cap scores before softmax
+                    softcap4(kqp, tile_rows * KV, attn_softcap)
+                }
+                // online-softmax fold per query row. The causal + sliding mask is a CONTIGUOUS column
+                // span [lo, hi] (cached keys kstart_p..ap), so masking is two boundary fills (no
+                // per-element branch) and the row max is hand-vectorized (hmax).
                 for (qt in range64(tile_rows)) {
                     let ap = ap0 + qt
                     let kstart_p = (is_sliding && ap + 1l > sliding_window) ? (ap + 1l - sliding_window) : 0l
                     let row = qt * KV
-                    var tmax = -1.0e30
-                    for (kt in range64(KV)) {
-                        let kabs = kt0 + kt
-                        if (kt < kvalid && kabs <= ap && kabs >= kstart_p) {
-                            var sc = kqp[row + kt] * scale
-                            if (attn_softcap > 0.0) {  // Gemma2: soft-cap scores before softmax
-                                sc = attn_softcap * tanh(sc / attn_softcap)
-                            }
-                            kqp[row + kt] = sc
-                            tmax = max(tmax, sc)
-                        } else {
-                            kqp[row + kt] = -1.0e30   // masked → exp() to 0 below
-                        }
+                    let lo = max(0l, kstart_p - kt0)              // first valid tile-local column
+                    let hi = min(kvalid - 1l, ap - kt0)           // last valid tile-local column (causal)
+                    if (hi < lo) {                                // no valid keys here → contributes nothing
+                        for (kt in range64(KV)) { kqp[row + kt] = 0.0 }
+                        continue
                     }
+                    for (kt in range64(0l, lo))      { kqp[row + kt] = -1.0e30 }   // below the sliding window
+                    for (kt in range64(hi + 1l, KV)) { kqp[row + kt] = -1.0e30 }   // above causal / zero-padded
+                    let tmax = hmax(kqp + row, KV)
                     let mold = mrun[int(qt)]
                     let mnew = max(mold, tmax)
                     if (mnew > mold) {                 // new running max → rescale this row's accumulator
                         let ms = exp(mold - mnew)
-                        for (d in range64(head_size)) {
-                            vkqp[qt * head_size + d] *= ms
-                        }
+                        scale_inplace(vkqp + qt * head_size, ms, head_size)
                         srun[int(qt)] *= ms
                     }
                     mrun[int(qt)] = mnew
-                    for (kt in range64(KV)) {          // kq row becomes the (un-normalized) prob row
-                        let pe = kqp[row + kt] <= -1.0e29 ? 0.0 : exp(kqp[row + kt] - mnew)
-                        kqp[row + kt] = pe
-                        srun[int(qt)] += pe
+                    // kq row becomes the (un-normalized) prob row — vectorized exp4 over KV (mult of 4).
+                    // Masked entries (-1e30) clamp to -80 so exp4's fast path stays in range and yields ~0
+                    // (1.8e-35, negligible vs the real probs); flash is already non-bit-exact (online reorder).
+                    let mnew4 = float4(mnew, mnew, mnew, mnew)
+                    let floor4 = float4(-80.0, -80.0, -80.0, -80.0)
+                    var sum4 = float4(0.0, 0.0, 0.0, 0.0)
+                    var prow = reinterpret<float4?>(kqp + row)
+                    for (kc in range64(KV / 4l)) {
+                        let pe4 = exp4(max(prow[kc] - mnew4, floor4))
+                        prow[kc] = pe4
+                        sum4 += pe4
                     }
+                    srun[int(qt)] += sum4.x + sum4.y + sum4.z + sum4.w
                 }
                 // accumulate output: vkq[tile_rows × head_size] += P[tile_rows × KV] · V[KV × head_size]
                 gemm_f32(vkqp, kqp, vpk, tile_rows, KV, head_size)
@@ -1265,7 +1307,7 @@ def private prefill_attention(var s : RunState; loff, npos, start_pos, head_size
                                     let ap = start_pos + p
                                     let kstart_p = (is_sliding && ap + 1l > sliding_window) ? (ap + 1l - sliding_window) : 0l
                                     let qbase = p * qd + qoff
-                                    vaxpy(xbp + qbase, vcp + voff, attp[hblock + bi * maxctx + (kk - kstart_p)], head_size)
+                                    axpy(xbp + qbase, vcp + voff, attp[hblock + bi * maxctx + (kk - kstart_p)], head_size)
                                 }
                             }
                             p0 += ATTN_BLOCK_Q
@@ -1299,7 +1341,7 @@ def private prefill_attention(var s : RunState; loff, npos, start_pos, head_size
                             }
                             for (j in range64(cnt)) {   // output += Σ att[j]·V[j]
                                 let voff = loff + (kstart + j) * kv_dim + kvhoff
-                                vaxpy(xbp + qbase, vcp + voff, attp[abase + j], head_size)
+                                axpy(xbp + qbase, vcp + voff, attp[abase + j], head_size)
                             }
                         }
                     }
@@ -1445,13 +1487,8 @@ def forward_prefill(t : Transformer; var s : RunState; tokens : array<int64>; np
         mm_b(s.hb2_b, t, t.w3_off + l * dim * hidden, s.xb_b, s.xqb, s.xsb, dim, hidden, npos)
         prof_add("mm_ffn", ts_ffn)
         let ts_act = ref_time_ticks()
-        if (c.ffn_act == FfnAct.gelu) {
-            gelu(s.hb_b, npos * hidden)
-        } else {
-            silu(s.hb_b, npos * hidden)
-        }
-        mul_inplace(unsafe(addr(s.hb_b[0])), unsafe(addr(s.hb2_b[0])), npos * hidden)
-        prof_add("act_resid", ts_act)
+        gate_batch(s.hb_b, s.hb2_b, c.ffn_act, hidden, npos)   // fused act*gate (exp4 unless act_vec off)
+        prof_add("act", ts_act)
         // down projection (batched) + optional post-FFN norm + residual
         let ts_ffn2 = ref_time_ticks()
         mm_b(s.xb_b, t, t.w2_off + l * hidden * dim, s.hb_b, s.xqb, s.xsb, hidden, dim, npos)

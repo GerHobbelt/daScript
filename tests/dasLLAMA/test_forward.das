@@ -29,6 +29,10 @@ def same(a, b : array<int64>) : bool {
 [test]
 def test_forward_end_to_end(t : T?) {
     t |> run("forward + tokenizer match llama2.c (needs stories15M.bin)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
         if (!stat(MODEL_PATH).is_valid || !stat(TOKENIZER_PATH).is_valid) {
             t |> success(true, "skipped: stories15M.bin / tokenizer.bin not present")
             return
@@ -40,18 +44,25 @@ def test_forward_end_to_end(t : T?) {
         let pt <- encode(tk, "Once upon a time", true, false)
         t |> success(same(pt, PROMPT_ORACLE), "encode prompt tokens")
         // full forward + greedy decode, token-for-token (threads the classifier)
+        let prev_act = get_act_vec()
+        set_act_vec(false)   // token-exact oracle => bit-exact scalar act (exp4 tolerance: test_silu)
         with_job_que() {
             var s <- make_run_state(c)
             let bos_only <- encode(tk, "", true, false)
             let ids <- generate(tr, s, bos_only, length(ORACLE))
             t |> success(same(ids, ORACLE), "empty-prompt greedy token-for-token")
         }
+        set_act_vec(prev_act)
     }
 }
 
 [test]
 def test_forward_q8(t : T?) {
     t |> run("all-weights Q8 forward matches fp32 oracle (needs stories15M.bin)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
         if (!stat(MODEL_PATH).is_valid || !stat(TOKENIZER_PATH).is_valid) {
             t |> success(true, "skipped: stories15M.bin / tokenizer.bin not present")
             return
@@ -61,18 +72,25 @@ def test_forward_q8(t : T?) {
         let tk <- load_tokenizer(TOKENIZER_PATH, c.vocab_size)
         quantize_weights(tr)  // all 2D weights -> Q8_0, tr.quant = q8
         // Q8 is effectively lossless at greedy decode on stories15M: still token-for-token.
+        let prev_act = get_act_vec()
+        set_act_vec(false)   // token-exact oracle => bit-exact scalar act (exp4 tolerance: test_silu)
         with_job_que() {
             var s <- make_run_state(c)
             let bos_only <- encode(tk, "", true, false)
             let ids <- generate(tr, s, bos_only, length(ORACLE))
             t |> success(same(ids, ORACLE), "Q8 empty-prompt greedy token-for-token")
         }
+        set_act_vec(prev_act)
     }
 }
 
 [test]
 def test_forward_q8_pooled(t : T?) {
     t |> run("Q8 forward with pooled fork contexts still matches the oracle (needs stories15M.bin)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
         if (!stat(MODEL_PATH).is_valid || !stat(TOKENIZER_PATH).is_valid) {
             t |> success(true, "skipped: stories15M.bin / tokenizer.bin not present")
             return
@@ -83,6 +101,8 @@ def test_forward_q8_pooled(t : T?) {
         quantize_weights(tr)
         // pool + skip-init the per-job fork contexts: same result, exercised across many tokens'
         // classifier parallel_for so a stale/misreset pooled fork would corrupt the stream.
+        let prev_act = get_act_vec()
+        set_act_vec(false)   // token-exact oracle => bit-exact scalar act (exp4 tolerance: test_silu)
         with_job_que() {
             set_jobque_fork_pool(true, true)
             var s <- make_run_state(c)
@@ -90,12 +110,17 @@ def test_forward_q8_pooled(t : T?) {
             let ids <- generate(tr, s, bos_only, length(ORACLE))
             t |> success(same(ids, ORACLE), "pooled-fork Q8 greedy token-for-token")
         }
+        set_act_vec(prev_act)
     }
 }
 
 [test]
 def test_forward_q4(t : T?) {
     t |> run("all-weights Q4 forward matches the fp32 oracle prefix (needs stories15M.bin)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
         if (!stat(MODEL_PATH).is_valid || !stat(TOKENIZER_PATH).is_valid) {
             t |> success(true, "skipped: stories15M.bin / tokenizer.bin not present")
             return
@@ -106,11 +131,14 @@ def test_forward_q4(t : T?) {
         quantize_weights_q4(tr)  // all 2D weights -> Q4_0, tr.quant = q4
         // Q4 is lossier than Q8 — greedy diverges from fp32 around token ~19 — but the per-step
         // loss hasn't flipped an argmax yet over the 12-token ORACLE prefix, so it still matches.
+        let prev_act = get_act_vec()
+        set_act_vec(false)   // token-exact oracle => bit-exact scalar act (exp4 tolerance: test_silu)
         with_job_que() {
             var s <- make_run_state(c)
             let bos_only <- encode(tk, "", true, false)
             let ids <- generate(tr, s, bos_only, length(ORACLE))
             t |> success(same(ids, ORACLE), "Q4 empty-prompt greedy matches oracle prefix")
         }
+        set_act_vec(prev_act)
     }
 }
