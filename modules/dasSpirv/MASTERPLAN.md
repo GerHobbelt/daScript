@@ -653,3 +653,564 @@ textbook OpTypeArray/OpConstantComposite/OpAccessChain, lint + format clean.
 argument in the lint/macro-patch compile. `emit_const` must handle BOTH (and the unary-minus fold), or
 the shader compiles in one context and errors in another. Both shapes produce the identical
 `OpConstantComposite`, so the census stays stable across tiers.
+
+### Phase 4a — UBO struct foundation LANDED (2026-06-14, branch `bbatkin/dasspirv-phase4`)
+
+First Phase-4 (resource breadth) slice: uniform buffer objects. A `@uniform` struct global lowers to a
+Uniform-storage, Block-decorated `OpTypeStruct` with std140 member offsets, read through member access
+(`ubo.field` → `OpAccessChain` by field index → `OpLoad`). All three tiers green (interp/JIT/AOT 40/40),
+spirv-val clean, external `spirv-dis` confirms textbook std140 layout, lint + format clean.
+
+- **std140 layout** (`std140_align`/`std140_size`/`round_up`/`build_block_struct` in `spirv_emit`): scalar
+  align 4, vec2 align 8, vec3/vec4 align 16; the vec3 base *size* is 12 (not 16), so a scalar packs into a
+  vec3's (or vec2's) trailing slot. The fixture struct exercises both packing edge cases — `flags@24` after
+  a vec2, `bias@44` after a vec3. Members + offsets feed the existing `type_struct_block` builder (it already
+  emits `Block` + per-member `Offset` decorations). Scalar/vector members only for now (matrices/nested
+  structs/arrays → 4b+, rejected with a clean error).
+- **`@uniform` classify_global branch** — mirrors the `@ssbo` branch: `Uniform` storage pointer + the
+  Block struct + `DescriptorSet`/`Binding` decorations (defaults 0/0, non-negative-checked). `GlobalInfo`
+  gained `is_block` (set for both ssbo and ubo) so member access knows the global is an AccessChain target.
+- **`ExprField` member access** in `emit_ptr` — `OpAccessChain(var, const(memberIndex))`, pointee =
+  `emit_type(field._type)`, storage from the global's class; `emit_value`'s ref path then `OpLoad`s it.
+- **Tests:** `tests/spirv/test_ubo.das` — a `[fragment_shader]` reading every member of a 6-field UBO;
+  asserts the Uniform OpVariable, DescriptorSet/Binding, Block, and EVERY std140 offset (0/16/24/28/32/44)
+  + AccessChain/Load/CompositeConstruct + spirv-val. The `Uniforms`/`ubo_frag` fixture lives in
+  `_spirv_common`; census unions it under `phase4a_emitter_opcodes` (= const-array set; UBOs add NO new
+  opcodes — Uniform storage + DescriptorSet/Binding are operands, not opcodes).
+
+**Finding (load-bearing):** `ExprField.fieldIndex` is **still -1 at the annotation's patch (pre-fold)
+stage** (member-access resolution hasn't run yet), so the member index must be resolved by **name** from
+the struct type (`field_index_by_name` over `bv._type.structType.fields`), not read off the node. Same
+fold-state class as the Phase-1 `ExprRef2Value` and const-array `float2` findings: the patch-stage AST is
+less resolved than the fixup-stage one.
+
+### Phase 4b — matrices + matrix/vector arithmetic + local swizzle LANDED (2026-06-14, branch `bbatkin/dasspirv-phase4`)
+
+Second Phase-4 slice: matrices (the MVP transform) + the linear-algebra products + local-value swizzles.
+All three tiers green (interp/JIT/AOT 42/42), spirv-val clean, external `spirv-dis` confirms a textbook
+MVP vertex shader, lint + format clean.
+
+- **Matrices are `tHandle` types** (`MatrixAnnotation<floatW, C>`, named `float4x4`/`float3x3`/`float3x4`),
+  NOT a distinct `Type` enum member. `matrix_info(t)` reads `t.annotation.name` → (width, cols);
+  `emit_type` lowers to `type_matrix` = `OpTypeMatrix(vector(float, W), C)`.
+- **Column-major maps directly — no transpose.** daslang stores matrices column-major (`m[i]` is column
+  `i`: `float3x3_mul` builds `va.col0 = a.m[0]`; `float4x4_mul_vec4` is `v_mat44_mul_vec4`, standard
+  M·v), which is SPIR-V's **default** `ColMajor`. So daslang `M * v` → `OpMatrixTimesVector`, `M * N` →
+  `OpMatrixTimesMatrix`, with the matrix uploaded as-is. (Caveat: `float4x4` columns are vec4 = std140's
+  MatrixStride 16, so it uploads byte-for-byte; `float3x3` stores packed 12-byte columns and would need
+  host repacking before a std140 upload — emitter SPIR-V is correct either way.)
+- **std140 matrix layout** (in `build_block_struct`): a matrix member gets align 16, size `16*cols`,
+  ColMajor + `MatrixStride 16` member decorations. `type_struct_block` gained a 3rd `mat_strides` arg
+  (folded into the dedup key) so the matrix decorations are part of the one deduped type emission; the
+  2-arg form delegates with zeros.
+- **`emit_mul`** routes `*` by operand shape BEFORE the scalar binop path (component-wise FMul only works
+  for same-shape operands): `OpMatrixTimesMatrix`, `OpMatrixTimesVector`, `OpVectorTimesScalar` (either
+  order). Only the daslang-defined operators are handled — daslang has **no** `matrix*scalar` or
+  `vector*matrix` operator, so those SPIR-V ops are intentionally absent (no dead, untestable emit path);
+  an unsupported mix (e.g. integer vector×scalar) is a clean error.
+- **Local-value swizzle** in `emit_value`: a swizzle of a local/computed VALUE (`clip.xy`, `clip.w` on a
+  `let`) → `OpVectorShuffle` (multi-component) / `OpCompositeExtract` (single). A swizzle of a *global*
+  lvalue stays the Phase-1 emit_ptr + `OpAccessChain` path (guarded by `global_var_of(sw.value) == null`),
+  closing the Phase-3 "local swizzles not supported" gap.
+- **Tests:** `tests/spirv/test_matrix.das` — a `[vertex_shader]` MVP (`cam.proj * cam.view`,
+  `mvp * float4(in_pos,1)`, `clip * 0.5`, `clip.xy` / `clip.w`); asserts TypeMatrix + the three products +
+  both swizzle ops + ColMajor/MatrixStride/std140 offsets (proj@0, view@64) + spirv-val. Census extended
+  to `phase4b_emitter_opcodes` (= 4a set + TypeMatrix/MatrixTimesMatrix/MatrixTimesVector/VectorTimesScalar/
+  VectorShuffle/CompositeExtract), unioned over the `mvp_vert` fixture.
+
+**Finding:** `float4 * float` (vector×scalar) and `M * v` both arrive as **`ExprOp2`** (not `ExprCall`) —
+`ExprOp2 : ExprOp : ExprCallFunc`, so the operator resolves to a `.func` but the node stays `ExprOp2` with
+`.left`/`.right`. So matrix/vector `*` is intercepted in the emitter's existing `ExprOp2` path, before the
+scalar-class `binop_code` (which returns ok=false on the `tHandle`/mismatched-shape operands).
+
+### Phase 4c — push constants LANDED (2026-06-14, branch `bbatkin/dasspirv-phase4`)
+
+Third Phase-4 slice: push constants. A `@push_constant` struct global lowers to a PushConstant-storage,
+Block-decorated `OpTypeStruct` — the same struct machinery as a UBO (`build_block_struct` layout +
+`ExprField` member access), but with **no DescriptorSet/Binding** (push constants are not descriptors)
+and not listed in the entry interface (SPIR-V ≤ 1.3). All three tiers green (interp/JIT/AOT 44/44),
+spirv-val clean, external `spirv-dis` confirms PushConstant storage with no descriptor decorations,
+lint + format clean.
+
+- **`@push_constant` classify_global branch** — mirrors `@uniform` minus the descriptor decorations:
+  `PushConstant` storage pointer + the Block struct, `GlobalInfo.is_block = true` so member access reuses
+  the `ExprField` → `OpAccessChain` path verbatim. Layout reuses `build_block_struct` (std140 == std430
+  for the scalar/vector/matrix members we support — they differ only on arrays/nested-struct alignment).
+- **Tests:** `tests/spirv/test_push_constant.das` — a `[fragment_shader]` reading a `@push_constant`
+  block (`pc.tint * pc.gamma`); asserts the PushConstant OpVariable, Block + offsets (tint@0, gamma@16),
+  the **absence** of DescriptorSet/Binding, AccessChain + VectorTimesScalar, + spirv-val. Census set is
+  unchanged (`phase4c_emitter_opcodes` = 4b set — PushConstant is a storage-class operand, not an opcode);
+  the `pc_frag` fixture is unioned in and must stay within the declared set.
+
+### Phase 4d — combined image samplers LANDED (2026-06-14, branch `bbatkin/dasspirv-phase4`)
+
+Fourth (final) Phase-4 slice: combined image samplers — the last resource kind. A `sampler2D` global
+lowers to an `OpTypeImage` + `OpTypeSampledImage` in UniformConstant storage with DescriptorSet/Binding;
+`texture(tex, uv)` lowers to `OpLoad` (the sampled image) + `OpImageSampleImplicitLod`. All three tiers
+green (interp/JIT/AOT 46/46), spirv-val clean, external `spirv-dis` confirms a textbook textured fragment
+shader, lint + format clean.
+
+- **Sampler authoring surface (no native daslang type).** daslang has no sampler type, so `spirv_builtins`
+  declares an **opaque marker struct `sampler2D {}`** + a stub `texture(s : sampler2D; uv : float2) : float4`
+  (body never runs — only the AST is read). Shaders write `var @binding = 0 tex : sampler2D` and
+  `texture(tex, uv)`; the emitter recognizes both by name.
+- **`type_image` / `type_sampled_image`** builders. For a sampled 2D float texture:
+  `OpTypeImage %float 2D 0 0 0 1 Unknown` then `OpTypeSampledImage`.
+- **classify_global sampler branch** (detected by the `sampler2D` struct name, not an annotation):
+  UniformConstant pointer + OpVariable + DescriptorSet/Binding, `GlobalInfo.is_sampler`. Not in the entry
+  interface (UniformConstant excluded for SPIR-V ≤ 1.3).
+- **`texture()` in emit_call**: `OpLoad` the sampled image (via the global's var-id) + `OpImageSampleImplicitLod`.
+  Implicit-LOD uses screen-space derivatives, so it is **fragment-only** — `ctx` gained a `stage` field
+  (set in `generate_spirv`) and a non-fragment `texture()` is a clean error (fail-closed).
+- **AOT emitter fix (`daslib/aot_cpp.das`).** A struct used **only as a global variable's type** (never
+  field-accessed) was dropped by `UseTypeMarker` to a forward declaration, so `das_global_zero<sampler2D>`
+  failed with C2027 "use of undefined type" (needs `sizeof`). `UseTypeMarker` now overrides
+  `preVisitGlobalLetVariable` to `mark(variable._type)` — a strictly emit-MORE direction (can only add a
+  struct definition, never remove one), so it cannot regress existing AOT. This is a general AOT codegen
+  correctness fix surfaced by the empty-marker-struct global, not dasSpirv-specific.
+- **Tests:** `tests/spirv/test_sampler.das` — a textured `[fragment_shader]` (`texture(tex, ti_uv)`);
+  asserts OpTypeImage/OpTypeSampledImage, the UniformConstant OpVariable, DescriptorSet/Binding, OpLoad +
+  OpImageSampleImplicitLod, + spirv-val. Census extended to `phase4d_emitter_opcodes` (= 4c set +
+  TypeImage/TypeSampledImage/ImageSampleImplicitLod), unioned over the `tex_frag` fixture.
+
+**Phase 4 (resource breadth) COMPLETE** — UBOs (4a) + matrices (4b) + push constants (4c) + combined image
+samplers (4d). The emitter now covers the full descriptor model. The cross-repo GPU gate (a dasVulkan
+UBO/MVP and/or textured example, regressed on lavapipe + the local GPU — the real-hardware proof of the
+column-major matrix mapping) is the follow-on dasVulkan PR, mirroring the Phase-1/Phase-3 GPU gates.
+
+### Phase 4 GPU gate LANDED (2026-06-14, dasVulkan PR #5, merged)
+
+A single combined textured-quad render — UBO column-major MVP + combined image sampler (2×2 checkerboard) +
+push-constant tint — drawn on lavapipe (CI) and the local GPU. The MVP translates x +0.4 in column 3 (the
+transpose-detector spirv-val cannot see); the tint (1,1,0) zeroes blue (the unambiguous push-constant proof:
+a white texel can only go yellow if the constant was delivered). Five sampled pixels assert clear-outside +
+four correctly-tinted quadrants. Files: `tests/integration/{phase4_shaders,test_phase4}.das` + scene helpers.
+**This closes the original masterplan: Phases 0–4 + all three GPU gates (compute, triangle, textured-quad)
+are merged, and dasVulkan now has ZERO GLSL, ZERO committed `.spv`, and no glslang/SDK dependency — the
+project thesis (one language, no external SDK, no committed binaries, code shared with the host) is realized.**
+
+---
+
+## Phases 5+ — beyond resource breadth (planned 2026-06-14)
+
+The next arc deepens the payoff (single-source code-sharing with the host), broadens the shader surface to
+real-engine needs, and makes the capability discoverable + exercised by real demos. Boris's ordering:
+**reflection → emitter-to-AstVisitor port → textures → control flow**, then docs, then the example apps + the
+lint expansion. The Visitor port lands *before* textures/control-flow on purpose: those two phases add the
+most new node-handling, and the port changes the base they're written against.
+
+### Phase 5 — reflection: single source of truth for descriptor layouts
+
+The motivating wart, exposed by the Phase-4 gate: the host (dasVulkan) **hand-declares** the
+`VkDescriptorSetLayout` / push-constant ranges / `VkPipelineLayout` that must exactly mirror the shader's
+`@set`/`@binding`/type/`@push_constant`. Same facts, two places, silent drift if they disagree (validation
+error at best, garbage reads at worst). The shader AST already knows all of it — `classify_global` extracts
+every set/binding today.
+
+**Decision:** dasSpirv emits a **typed reflection companion** next to the SPIR-V blob, and dasVulkan consumes
+it to **auto-build** layouts.
+
+- **Producer (dasSpirv).** `generate_spirv` already walks every global; have it also accumulate a
+  `ShaderReflection` (new `spirv/spirv_reflect.das`, `shared public`). The shader macro captures it into a
+  second module global `{name}_reflect` exactly as the blob is captured into `{name}` (same `apply`-declares /
+  `patch`-fills dance in `spirv_shader.das`). **Encoding decision (settled in impl):** a versioned `array<uint>`
+  encoding (`encode_reflection`) + a typed `decode_reflection` on the host, NOT a typed `ExprMakeStruct`
+  literal. Rationale: the encoded form reuses the existing `build_uint_array_literal` verbatim (the blob's own
+  capture path), so the producer adds ~no macro surface; the host gets the identical typed `SpirvReflection`
+  via one cheap decode at layout-build time. Hand-synthesizing nested `ExprMakeStruct`/`ExprMakeArray`/
+  `MakeFieldDecl` trees + bitfield/struct-TypeDecl lookups was meaningfully more macro risk for a marginal
+  (host avoids one decode call) benefit. Single-source is preserved either way — reflection is still computed
+  exactly once, inside `classify_global`, alongside the SPIR-V emission.
+- **Neutral vocabulary.** dasSpirv must NOT depend on dasVulkan, so reflection uses its own enums:
+  `SpirvDescriptorKind { uniform_buffer; storage_buffer; combined_image_sampler; … }` + a `SpirvStageFlags`
+  bitfield. `ShaderReflection = { stage; entry_point; local_size : int3; bindings : array<DescriptorBinding>;
+  push_constants : array<PushConstantRange>; inputs/outputs : array<IoVar> }`, with
+  `DescriptorBinding = { set; binding; kind; count; stages }`, `PushConstantRange = { offset; size; stages }`.
+- **Consumer (dasVulkan).** New `vulkan_reflect.das` boost: map `SpirvDescriptorKind`→`VkDescriptorType`,
+  `SpirvStageFlags`→`VkShaderStageFlags`; `build_descriptor_set_layouts(reflections…)` (merges per-set across
+  stages, OR-ing stage flags for bindings shared by multiple stages) + `build_pipeline_layout(device,
+  reflections…)`. The Phase-4 textured-quad gate is **rewritten** to build its layout from the two captured
+  reflections instead of hand-declaring it — the regression that reflection equals the hand-written truth (and
+  still renders the same pixels).
+- **Tests.** main-tree `tests/spirv/test_reflect.das` asserts each fixture's reflection (sets/bindings/kinds/
+  push-range/local_size). dasVulkan: the rewritten gate + a `build_descriptor_set_layouts` unit (two stages
+  sharing set 0 merge correctly).
+
+### Phase 6 — emitter → AstVisitor (clean, behavior-preserving port)
+
+**Why.** dasSpirv's emitter is the only daslang backend that *walks* the AST by hand (manual
+`emit_value`/`emit_ptr` recursion). llvm_jit, the AOT C++ emitter (`daslib/aot_cpp.das`), dasGlsl's
+`GlslExport`, and the C++ interpreter are all **`AstVisitor`s that emit**. The hand-walker is defensible
+today but carries a standing liability: when the AST gains a new `Expression`/`Statement` subtype or the
+`Visitor` interface gains a method/`canVisit*` gate, every Visitor-based backend gets a compile error or an
+unhandled-gate that *forces* the author of the AST change to deal with it — **except dasSpirv**, which
+silently walks past the new node and emits wrong (or no) SPIR-V. That breaks the codegen-fail-closed
+principle and means dasSpirv needs a *separate* manual refactor on someone else's unrelated AST change —
+discovered at the worst possible time. The port makes dasSpirv participate in the same fail-closed contract
+as every other emitter.
+
+**The objection it was hand-rolled to avoid is already solved.** SPIR-V is SSA: a subexpression must thread
+its result-id *up*, which is awkward in a push-based (preVisit/visit) Visitor — that's why the two-function
+recursion felt natural. But **llvm_jit faces the identical problem** (LLVM is SSA too) and solves it with a
+result side-map populated post-order: `visit()` reads children's already-computed ids out of the map. So
+`llvm_jit.das` is a near-exact template (same IR shape, same value-threading, same basic-block emission for
+control flow) — model `SpirvEmit` on it rather than inventing.
+
+**The one genuine ergonomic cost to get right.** The clean value/pointer duality (`emit_ptr` for lvalues —
+store targets, OpAccessChain bases) becomes parent-driven in a Visitor: lvalue-ness is learned from the
+parent (an assignment computes LHS-as-pointer, RHS-as-value) or a "want pointer" flag, not a dedicated
+function. llvm_jit lives with exactly this for GEP-on-store; it's where a naive port would regress, so it's
+the part to design carefully.
+
+**Scope discipline (hard rule, Boris).** A **100% clean port — zero new features.** No "while I'm here"
+additions. The only additions allowed are **tests**: when porting a construct reveals it wasn't covered,
+add the test. The census + spirv-val + interp/AOT + GPU gates are the proof of behavior-preservation; the
+target is **same opcode census + spirv-val-clean + GPU-passing, ideally byte-identical blobs**. That
+existing harness is exactly what makes a core-codegen rewrite safe.
+
+**Shape.** `SpirvEmit : AstVisitor` with: a result-id side-map (`Expression? -> uint`), the existing builder
++ section buffers (unchanged — walk strategy is independent of SPIR-V section ordering), lvalue handling via
+parent context / want-pointer flag, control-flow block + terminator emission in the if/while/for Visitor
+hooks (mirroring llvm_jit), and **`canVisit*` gates wired to hard-error on any unhandled node kind** so
+future AST additions surface as a clean dasSpirv compile error (the fail-closed win, for free). Deliverable
+ordering: write the conversion plan first (every current `emit_*` mapped to its Visitor hook, the result-id
+map, the lvalue strategy, control-flow emission, the `canVisit*` gates) for review *before* touching code.
+
+### Phase 6 — emitter → AstVisitor LANDED (2026-06-14, branch `bbatkin/dasspirv-phase6-visitor`)
+
+The conversion plan (`PHASE6_VISITOR_PORT.md`) was written and reviewed first, then executed in five
+behavior-preserving sub-phases, each keeping the suite green:
+
+- **6.0 spike (GO).** A read-only probe confirmed an `AstVisitor` runs cleanly at the annotation's `patch()`
+  stage and the pre-fold node shapes (`ExprRef2Value` present, `fieldIndex == -1`) are walkable as designed.
+- **6.1 leaf + arithmetic; 6.2 control flow; 6.3 resources + composites.** Ported construct-by-construct
+  onto `SpirvEmit : AstVisitor` (llvm_jit's SSA side-map model: `e2id` rvalue ids, `e2ptr`/`e2pty` lvalue
+  pointers; `ExprRef2Value` is the load marker, `value_of`/`ptr_of` coerce on demand). Control flow uses
+  multi-phase hooks (preVisit*IfBlock/ElseBlock/WhileBody/ForBody + visit*) with block-label ids allocated in
+  the hand-walker's linear order to keep output **byte-identical**; resource/composite fixtures legitimately
+  renumber ids post-order and are gated **id-isomorphic** (role-aware canonicalizer
+  `spirv_dis::op_operand_is_literal`). Added the §7-A normalized-disassembly golden gate up front, plus §7-B
+  coverage fixtures the hand-walker left unexercised (nested loops, elif chain, early-return-in-loop,
+  runtime-bound `urange(0u,n)`, bool local).
+- **6.4 fail-closed.** Added the explicit-rejection half of the contract: a `preVisit*` override for every
+  shader-illegal construct (`new`/`delete`/`with`/`try`/variants/tuples/closures/table-ops/`yield`/
+  `typeinfo`/`memzero`/named-call/deref/safe-field/…) records a clean error, complementing the
+  `value_of`/`ptr_of` "no rvalue/lvalue" backstop (which catches a walked-but-unlowered node, including a
+  future AST node type with no hook). §7-C negative tests (`tests/spirv/_fail_closed/`, compiled via
+  `compile_file`) prove clean rejection of an unsupported CALL / GLOBAL / LOCAL TYPE / STATEMENT; fixtures sit
+  in a non-globbed subdir so the `tests/spirv/*.das` AOT glob never compiles them (`options no_aot` skips only
+  emission, not the failing compile) and carry `expect 50501` so lint skips them.
+- **6.5 prove + clean up.** Flipped `visitor_handles` to always-true, ran the dasVulkan GPU gate **9/9 green**
+  through the visitor (compute `i*i`, offscreen triangle pixel check, textured-quad UBO-matrix+sampler+
+  push-constant pixel check), then deleted the entire hand-walker (`emit_body`/`emit_stmt`/`emit_value`/
+  `emit_ptr`/`emit_call`/`emit_if`/`emit_while`/`emit_for`/`emit_load_op_store`, −648 lines). The stateless
+  lowering helpers (`emit_const`, `emit_mul`, `binop/cmp/unop_code`, `vector_ctor`, `glsl_ext_op`,
+  `build_block_struct`, std140, `field_index_by_name`, …) and the `collect_locals` pre-pass are reused verbatim.
+
+**Finding (folded into the design):** at `patch` the body nodes arrive **const** to each hook; declaring the
+hook parameter `var` (`def override visitExprX(var expr : ExprX?)`) binds a non-const view directly — no
+`reinterpret` const-strip, and `return expr` type-checks against the non-const `ExpressionPtr` slot. Sound
+because the visitor only reads the AST and emits into a side module.
+
+**Proof at landing:** 72/72 spirv tests green (byte/iso golden both ways, opcode census both directions,
+spirv-val clean, reflection), dasVulkan integration **9/9 on the local GPU**, lint clean, no GC leak. dasSpirv
+now participates in the same fail-closed `AstVisitor` contract as every other daslang backend.
+
+### Phase 7 — texture / resource breadth
+
+> Working plan: `PHASE7_TEXTURES.md` (slices + per-slice oracle + the new harness API), written and
+> approved before code. Full coverage in one phase (all four slices, separate-image-sampler included).
+
+**Testing-strategy decision (Boris, 2026-06-14).** Generating valid SPIR-V (spirv-val) is not proof it
+*works* — for images the only real oracle is render/compute → read back → compare. The existing graphics
+gates compare *loosely* (sample ~5 pixels, assert per-channel inequalities); that is the debt. Phase 7
+adopts an **exact analytic oracle** as the backbone: Phase-7 content is procedural, so the expected pixel is
+CPU-computable in daslang — a *stronger* check than a golden image, no committed reference. New dasVulkan
+harness: `compute_image_rgba8` (image-readback analog of `run_compute_spirv`) + `assert_pixels_exact`
+(full-frame exact compare, first-mismatch report). Golden-image diff (`save/load_ppm` + `images_close(tol)`)
+is a *fallback*, added only when a filtered-LOD case needs it. Storage images emit a **known format (Rgba8)**
+so no without-format capability/feature is required (lavapipe-safe). Debt paid down: retrofit the
+textured-quad gate to `assert_pixels_exact` (NEAREST + integer MVP → analyzable); triangle centroid stays
+loose (genuinely fuzzy). Full rationale + the today-vs-debt analysis live in `PHASE7_TEXTURES.md`.
+
+Current sampler surface is **combined 2D only**:
+- **Storage images** — `OpTypeImage … 2` (read-write), `image2D` marker, `imageLoad`/`imageStore` →
+  `OpImageRead`/`OpImageWrite`, the `StorageImageRead/WriteWithoutFormat` caps + format decoration. New
+  descriptor kind `storage_image`.
+- **Explicit LOD / fetch** — `textureLod(s,uv,lod)` → `OpImageSampleExplicitLod` (lifts the fragment-only
+  limit → usable in vertex/compute); `texelFetch(s,coord,lod)` → `OpImageFetch`.
+- **More dims** — `sampler3D` / `samplerCube` / `sampler2DArray` (Dim 3D/Cube/2D+Arrayed), each a marker
+  struct + the matching OpTypeImage dim.
+- **Separate image + sampler** (end of phase, optional) — distinct `texture2D` + `sampler` globals,
+  `OpSampledImage` to combine at the call. Defer if it complicates the marker-struct rail.
+- Reflection (Phase 5) extends to the new descriptor kinds. Tests: one fixture per new resource/op; census
+  extends; spirv-val each; a dasVulkan storage-image compute gate (write a gradient, read it back) on
+  lavapipe + local.
+
+### Phase 8 — language completeness (last plumbing phase)
+
+> Working plan: `PHASE8_LANGUAGE.md`, written + approved before code.
+
+**Grammar reconciliation (Boris, 2026-06-15).** The earlier draft of this section named `OpSwitch`,
+`do { } while`, and labeled break/continue. **daslang has none of these, by design** — the only
+loop/branch keywords are `while`/`for`/`break`/`continue` (Phase 2), the ternary `?:`, and
+unstructured `goto`+numeric `label:` (already fail-closed-rejected; can't lower to structured SPIR-V).
+Those three bullets have no source construct and are dropped (not deferred — they will never exist).
+The real Phase-8 content is four items:
+
+- **Ternary `cond ? a : b` → `OpSelect`** (branchless, scalar/vector). Parses to `ExprOp3("?", …)`;
+  add the missing `visitExprOp3` handler. Eager both-arm eval is correct (side-effect-free shader
+  operands, same as `&&`/`||`).
+- **Vector arithmetic** (Phase-7 deferred gap A): `+ - / %` (and unary `-`) on vectors. `visitExprOp2`
+  derives the operand class from the scalar base type, returning -1 for a vector → rejected; derive the
+  *component* class so the binop emits component-wise on the vector result type. `*` already routed via
+  `emit_mul`.
+- **Folded const-vector operand** (Phase-7 deferred gap B): `float2(0.5,0.5)` as an arg folds to
+  `ExprConstFloat2`, which `value_of` doesn't lower; wire `value_of` → `emit_const` (which already emits
+  the right `OpConstantComposite`) for folded `ExprConst{Float,Int,UInt}{2,3,4}`.
+- **Broaden GLSL.std.450 math** beyond Phase 3: `mix`/`step`/`smoothstep`/`pow`/`exp`/`log`/`exp2`/
+  `log2`/`fract`/`mod`/`atan2`/`reflect`/`refract`/`length`/`distance`/`normalize`/`cross`/`inversesqrt`
+  (+ `dot`→`OpDot`, already core). Tests + census per op; spirv-val is the real oracle.
+
+### Phase 9 — SPIR-V reference docs (main tree)
+
+> Working plan: `PHASE9_TUTORIALS.md` (covers the whole docs+rails+tutorials arc), approved before code.
+
+Mechanical RST reference under `doc/source/`. **Autogen = hook into `doc/reflections/das2rst.das`** (the
+existing module auto-doc generator: per-module `document_module_X` groups public symbols by regex and
+emits `.rst` from RTTI). Phase 9 is mostly "add a `document_module_spirv`" (the `[*_shader]` annotations,
+`spirv_reflect` types/functions, grammar enums) the same way `document_module_pugixml`/`_stbimage` do,
+plus two hand pages: (2) an **overview** (daslang→SPIR-V-direct pitch, "drivers optimize; we emit naive
+valid SPIR-V", reflection-as-single-source) and (3) the **mapping** page — daslang type → SPIR-V
+type/layout (std140/std430, ColMajor matrices, vec3 align), builtin → opcode. The supported-opcode matrix
+sources from the per-phase census set (can't drift). Each Phase-10 rail appends a mapping row; the autogen
+self-updates. dasVulkan keeps its own `vulkan2rst`; the dasSpirv reference links out to its tutorials.
+
+### Phase 10 — emitter foundation rails (main-tree gated)
+
+> Working plan: `PHASE9_TUTORIALS.md` (rail-gap map grounded in the emitter source). **Tutorials-as-rail-
+> detector** (Boris, 2026-06-15): the language surface is complete, but not every GPU *feature* has a
+> rail. The tutorial set surfaces the gaps; foundation rails land first as gated emitter PRs, then the
+> tutorials consume a finished surface. Most rails also need a **daslang intrinsic** (a name the emitter
+> intercepts, like `texture`/`dot`) declared in `spirv_builtins.das`.
+
+- **10.1 SSBO std430 vec/struct** — lift the scalar-only SSBO-element restriction (ArrayStride + struct
+  member offsets). The biggest single unblocker (particles + all real compute data).
+- **10.2 Composite/global swizzle** — swizzle on a *loaded* composite (UBO/SSBO/sampler result), not just
+  locals (`OpCompositeExtract`/`OpVectorShuffle`). Closes the Phase-8 out-of-scope note.
+- **10.3 Fragment realism** — `discard` (`OpKill`/demote), derivatives (`dFdx/dFdy/fwidth`),
+  `textureSize` (`OpImageQuerySizeLod`), `gl_FragDepth` write. Batchable (same stage, small).
+- **10.4 Depth-compare sampling** — `sampler2DShadow` + compare-sample intrinsic → `OpImageSampleDref*`,
+  Depth image flag, comparison-sampler reflection kind. (Manual-compare shadow works without this; this
+  is the hardware-PCF upgrade.)
+- **10.5 Compute tier** — `@shared` Workgroup-storage globals; `barrier()`/`memoryBarrier()` →
+  `OpControlBarrier`/`OpMemoryBarrier`; atomics → `OpAtomic*`. The differentiator (cross-thread compute).
+
+Each slice: its own PR, all three tiers + census + spirv-val + LCOV green, one fixture per op, a
+mapping-page row. RT-tier rails (ray tracing, mesh/task, geometry/tess, subgroup, 64/16-bit) are **not**
+here — none block the tutorial set; scope per demand (RT = Phase 14).
+
+### Phase 11 — tutorials (dasVulkan repo)
+
+> Working plan: `PHASE9_TUTORIALS.md` (the ladder + the feature→demo→rail table).
+
+SDK-quality runnable tutorials in **dasVulkan's `tutorials/`** (the only place with the GPU runtime +
+lavapipe CI + offscreen readback — the main tree can't take a daspkg dep). Feature → canonical demo
+(depth-fetch → a real shadowmap, not a synthetic probe), each **renders and captures its own image** that
+is *both* the doc figure *and* the regression oracle (exact-analytic on procedural content — the Phase-7
+oracle; self-verifying-tutorial ethos). **Recording: PNG (static) / APNG (animated, not GIF), reusing the
+shared `stbimage` APNG writer + dasGlfw windowing; mp4 via the existing dasImgui ffmpeg process; optional
+voiced narrative or reusable strudel music bed per video** (Boris). Confirmed ladder: triangle, compute
+Mandelbrot, SDF raymarch, textured cube, shadow map, compute particles; plus procedural-noise, parallel-
+reduction/tiled-blur, histogram, instanced field, cubemap skybox, post-fx ping-pong. Ordering follows
+rail availability (full table in `PHASE9_TUTORIALS.md`). The main-tree reference (Phase 9) links to these.
+
+### Phase 12 — `/examples/vulkan` in the main repo (demo-scene + imgui-on-vulkan)
+
+Runnable apps under `examples/vulkan/` in the **main daslang tree** (each its own folder; all need
+`daspkg install dasVulkan`, so they ship as source + README, not in mandatory CI):
+- **`scene/`** — a small demo-scene: a lit, textured, MVP-animated mesh (UBO matrices + sampler + push-constant
+  + Phase-7 textures), shaders authored in daslang, layouts auto-built from Phase-5 reflection. The showcase of
+  the whole stack in one file. Wants the finished Phase-10 rail surface.
+- **`pathtracer/`** — a Vulkan port of the existing `examples/pathTracer/` toy path tracer (today it has GL
+  variants: `toy_path_tracer_opengl*.das`). A compute path tracer first (Phase-10 compute-tier + SSBO-struct);
+  a hardware-RT variant later folds into the Phase-14 RT track. Separate daspkg-install folder like the others.
+- **`imgui/`** — imgui rendered on a Vulkan backend, which requires **resurrecting the dasImgui Vulkan
+  backend**: `dasImgui/src/module_imgui_vulkan.*` exists but is NOT in dasImgui's CMake (unbuilt); the only
+  reference is a gen1 `dasBox/.../example/imgui_vulkan.das` against an obsolete bundled `vulkan_simple_app`.
+  Work: (a) wire `module_imgui_vulkan` into dasImgui's build + register it; (b) bridge it to the **current**
+  dasVulkan boost (InitInfo wants raw `VkInstance`/`Device`/`Queue`/`DescriptorPool`/`RenderPass` via
+  `boost_value_to_vk`); (c) a gen2 example app driving an imgui frame over a dasVulkan swapchain. This is a
+  **dasImgui-repo PR** (third repo, own CI); the main-repo example consumes the result.
+- **CI decision.** The main daslang repo cannot make its mandatory CI depend on an external daspkg package
+  (dasVulkan depends on daslang — wrong direction). So `examples/vulkan/` ships as **source + a README
+  requiring `daspkg install dasVulkan` (+ dasImgui)** and is **NOT wired into main-tree mandatory CI**. The
+  real regression gates stay where lavapipe runs: dasVulkan's integration tests. (A future "examples smoke
+  with daspkg packages present" lane could slot in here — until then, local + dasVulkan-side CI.)
+
+### Phase 13 — vulkan_lint expansion
+
+`daslib/vulkan_lint.das` today is a single rule — **VK001** (prefer the boost wrapper over a raw `vk*` call;
+map generated by the binding generator). Add reflection- and resource-aware rules:
+- **VK002** — a shader global's `@set`/`@binding` collides with another global at the same set+binding in the
+  same stage (caught at shader-compile from the reflection).
+- **VK003** — descriptor declared in the shader has no matching layout binding when the host builds layouts by
+  hand (nudges toward the Phase-5 auto-build path).
+- **VK004** — push-constant range exceeds the guaranteed 128-byte minimum without a documented opt-out.
+- (candidate) raw `vkCmd*` inside a recorded block where a `record_*` boost helper exists.
+- Each rule: opt-out option + test fixture, mirroring VK001.
+
+### Phase 14 — ray tracing (own track, last, local-GPU-only)
+
+> Working plan: a dedicated `PHASE14_RAYTRACING.md` when it starts (own masterplan section).
+
+Ray tracing is a **track, not a rail** (Boris, 2026-06-15 — "way after" everything else): new stages
+(raygen/closest-hit/miss/any-hit/intersection/callable), new storage classes (`RayPayloadKHR`/
+`HitAttributeKHR`/`IncomingRayPayloadKHR`), the `accelerationStructureKHR` type, `OpTraceRayKHR`, ray
+payloads + hit attributes, plus a large dasVulkan-side lift (RT pipeline creation + acceleration-
+structure build + shader-binding-table). Capstone tutorial: raytraced reflections/shadows. **lavapipe
+does not do RT** — so this track has **no CI gate, local-GPU-only** (the one place the no-CI-gate rule
+gives), which is why it is parked last.
+
+### Phase 15 — intrinsic unification + OpenGL cleanup (think-about)
+
+Not scoped — a future-direction note (Boris, 2026-06-15). dasSpirv's Phase-10 shader intrinsics (`discard`/
+`dFdx`/`barrier`/`atomicAdd`/… in `spirv_builtins.das`) parallel a set dasOpenGL/dasGlsl already carries.
+Once both backends are mature, a **shared shader-intrinsic surface** (one set of names + signatures the
+GLSL *and* SPIR-V emitters both intercept) removes the duplication and lets a single shader source target
+either backend. Pairs with a dasOpenGL cleanup pass. Sequenced after the SPIR-V intrinsic set has settled
+(post Phase 10/11), so we unify against a known-good surface rather than a moving one.
+
+**Sequencing & dependencies.** 5 → 6 → 7 → 8 is the spine (Boris's order). The Phase-6 Visitor port goes
+*before* textures (7) and control-flow (8) because those add the most new node-handling and the port changes
+the base they're written against — porting first avoids writing emit-code we'd immediately rewrite, and
+Phase 8's ternary/vector-op handlers drop into the Visitor's expression hooks naturally.
+
+The post-plumbing arc (9 → 14) is **tutorials-as-rail-detector** (`PHASE9_TUTORIALS.md`): Phase 9
+reference docs land first against the 0–8 surface (auto-gen matrix self-updates); Phase 10 foundation
+rails land as gated emitter PRs (10.1 SSBO-std430 unblocks the most); Phase 11 tutorials follow rail
+availability (#1/#2/#4/#10–12 need no new rail and start at once; #3 after 10.2; #6 after 10.1;
+#5-hardware after 10.4; #7 after 10.3; #8/#9 after 10.5). Phase 12's `scene/` consumes the finished
+surface; its `imgui/` sub-task is independent and can land any time after the dasImgui Vulkan-backend
+resurrection. Phase 13's VK002+ want Phase-5 reflection. Phase 14 (ray tracing) is last and
+local-GPU-only. Each phase is its own PR (daslang master, dasVulkan, and dasImgui all PR-protected) with
+the standing gates: opcode tests + census + spirv-val + LCOV (main tree), offscreen self-screenshot +
+exact/tolerance pixel oracle on lavapipe + local-GPU regression (dasVulkan tutorials), lint + format,
+Copilot-to-dry, no GC leak.
+
+---
+
+### Phase 7 — texture / resource breadth LANDED (2026-06-15, branch `bbatkin/dasspirv-phase7-textures`)
+
+Full image/resource coverage, four slices, each its own commit keeping all three tiers green. Plan +
+exact-analytic testing-strategy decision written first (`PHASE7_TEXTURES.md`). All three tiers green
+(interp/JIT/AOT **82/82**), spirv-val clean, lint + format clean, no GC leak. dasVulkan integration **13/13**
+on the local GPU (branch `bbatkin/dasspirv-phase7-storage-image`).
+
+- **7.1 storage images (+ scalar conversions prereq).** `float/int/uint(...)` → `OpConvertSToF/UToF/FToS/
+  FToU` + `OpBitcast` (an unsupported gap the gradient needed; same-class casts pass through, vectors
+  rejected). `image2D` → read-write `OpTypeImage` with a **known Rgba8 format** (so NO StorageImageRead/
+  WriteWithoutFormat capability/feature — lavapipe-safe) + DescriptorSet/Binding; `imageLoad`→`OpImageRead`,
+  `imageStore`→`OpImageWrite`. `type_image` gained `(arrayed, sampled, format)` params (defaults keep the
+  combined-sampler caller byte-identical). Reflection kind `storage_image`. GPU gate: a compute shader writes
+  a coordinate gradient `(x,y,0,255)` to a storage image, read back, **every pixel asserted exact** — the
+  new exact-analytic oracle, the centerpiece of the testing-strategy decision.
+- **7.2 explicit-LOD + texel fetch.** `textureLod`→`OpImageSampleExplicitLod` (Lod operand), `texelFetch`→
+  `OpImage` (extract image from the sampled image) + `OpImageFetch`. Both derivative-free → **stage-agnostic**
+  (the fixture samples in a compute shader, proving the lift off fragment-only). GPU gate: texelFetch-copy a
+  known 64×64 texture into a storage image, assert every pixel equals the source.
+- **7.3 sampler dimensionalities.** `sampler3D`/`samplerCube`/`sampler2DArray` markers; `sampler_info` maps
+  each to image Dim (3D/Cube/2D) + Arrayed; all sample via `texture()` (the handler is dimension-agnostic).
+  No new opcodes — only different OpTypeImage Dim/Arrayed operands. GPU gate (agreed scope): a **sampler2DArray**
+  exact gate (4 solid-color layers, per-quadrant selection, set-compare). Cube/3D covered structurally
+  (spirv-val + the Dim/Arrayed opcode asserts); their behavioral GPU gates deferred (the
+  OpImageSampleImplicitLod sampling opcode is already GPU-proven on 2D in Phase 4).
+- **7.4 separate image + sampler.** `texture2D` → standalone `OpTypeImage`, `sampler` → standalone
+  `OpTypeSampler` (new `type_sampler` builder) — two independent UniformConstant descriptors;
+  `sampleTexture(tex, smp, uv)` combines them at the call via `OpSampledImage` → `OpImageSampleImplicitLod`.
+  Reflection kinds `sampled_image` + `sampler`. GPU gate: a 2×2 checkerboard sampled through the split
+  descriptors, per-quadrant texel assert.
+
+**Testing-strategy upgrade delivered.** The loose pixel-inequality spot-checks are replaced as the Phase-7
+backbone by an **exact analytic oracle**: new dasVulkan harness `compute_image_rgba8` (image-readback analog
+of `run_compute_spirv`) + `assert_pixels_exact` (full-frame exact compare, first-mismatch report) +
+`texelfetch_copy_rgba8`. Every Phase-7 GPU gate asserts exact pixels, not inequalities.
+
+**Findings (load-bearing):**
+1. **The golden gate's resource/composite goldens are the *hand-walker* baseline (Phase-6 frozen).** The
+   visitor allocates call/composite result ids post-order, so regenerating those goldens produces an
+   id-permuted (but `check_iso`-equivalent) text — DON'T overwrite them; add only the new fixtures' goldens.
+   (Six goldens churn on every `_gen_golden` run and must be reverted each slice.)
+2. **Two real lowering gaps surfaced (out of Phase-7 scope, deferred):** float4+float4 **vector add** (the
+   `+` ExprOp2 path is scalar/component-wise only — vector add not wired) and a **folded all-const vector
+   operand** (`float2(0.5,0.5)` as a call arg folds to `ExprConstFloat2`, which `value_of` doesn't lower) —
+   the first texlod fixture leaned on both; rewritten to scalar ops on a runtime uv. These are Phase-8
+   (language completeness) work, not 7.x.
+3. **Scalar conversions were entirely unsupported before 7.1** (the cast handler rejected, and `float(x)` as
+   a workhorse-cast ExprCall hit the fail-closed "unsupported call"). Added minimally as the gradient prereq.
+
+**NEXT:** push both branches, open the daslang PR (emitter + main-tree tests) and the dasVulkan PR (GPU gates
++ exact-analytic harness), Copilot-to-dry. Then Phase 8 (control-flow / language completeness) — which is also
+where the two deferred gaps (vector arithmetic, folded const-vector operands) belong.
+
+---
+
+### Phase 8 — language completeness LANDED (2026-06-15, branch `bbatkin/dasspirv-phase8-language`)
+
+The last emitter-plumbing phase. Plan written first (`PHASE8_LANGUAGE.md`). All three tiers green
+(interp/JIT/AOT **88/88**), spirv-val clean, golden id-isomorphic, opcode census both directions,
+lint + format clean, no GC leak. Single daslang PR — no dasVulkan GPU gate required (this is
+language-surface; spirv-val + census are the oracle, and ternary/vector-math run in the existing GPU
+shaders implicitly).
+
+**Grammar reconciliation (the load-bearing scope finding).** The earlier masterplan Phase-8 list named
+`OpSwitch`, `do { } while`, and labeled break/continue. **daslang has none of these, by design** (Boris)
+— the only loop/branch keywords are `while`/`for`/`break`/`continue` (Phase 2), the ternary `?:`, and
+unstructured `goto`+numeric `label:` (already fail-closed-rejected; not structured-CFG lowerable). Those
+three bullets have no source construct and were dropped, not deferred. Real Phase-8 content = four items,
+two already partly done:
+
+- **8.1 ternary `?:` -> OpSelect.** `?:` parses to `ExprOp3("?", cond, a, b)`; added the missing
+  `visitExprOp3`. Branchless OpSelect (both arms eager — correct for side-effect-free shader operands,
+  same rule as `&&`/`||`). A vector result with a scalar bool condition splats the condition to a bvecN
+  via OpCompositeConstruct first (SPIR-V < 1.4 requires the OpSelect condition width to match the result).
+  New census opcode: `Select` (the only new opcode in all of Phase 8).
+- **8.2 folded const-vector operand (the real Phase-7 gap A/B reconciliation).** **Finding: "vector add
+  not wired" (the Phase-7 note) was a mischaracterization** — `scalar_class` already maps `tFloatN -> 2`,
+  so `binop_code` emits component-wise `OpFAdd`/`OpFSub`/`OpFDiv` on the vector result type, and unary `-`
+  emits `OpFNegate`. Verified by probe; locked in with the `vecarith` fixture. The ACTUAL gap was only the
+  **folded const vector** (`float2(0.5,0.5)` as an operand folds to `ExprConstFloat2`): scalar consts get
+  a `visitExprConst*` registration but the 9 vector-const node types didn't, so `value_of` failed.
+  `emit_const` already lowers them to `OpConstantComposite`; added the 9
+  `visitExprConst{Float,Int,UInt}{2,3,4}` overrides (via `register_vec_const`). No new census opcodes.
+- **8.3 GLSL.std.450 math = a fail-closed name-correctness audit.** The ext-inst table was keyed on GLSL
+  spellings, but `visitExprCall` dispatches by the DASLANG call name — so several entries were unreachable
+  dead branches and two real builtins were missing/misnamed. Fixed: `mix` -> `lerp`, `inversesqrt` ->
+  `rsqrt` (daslang's names), added `refract`; **removed `step`/`smoothstep`** (no daslang function — dead
+  branches) and **`radians`/`degrees`** (daslib/math_boost das functions whose bodies reference a `PI`
+  global the dependency walker can't lower — they compiled in the test context but errored under lint, a
+  context-dependent success that violates the no-fragility rule; a shader writes the multiply inline). The
+  table now holds only dependency-free builtin `math`. The `mathx` fixture exercises every reachable
+  ext-inst beyond Phase 3's dot/sqrt/clamp; `test_math` pins each by its GLSLstd450 **sub-opcode**
+  (the census tracks `OpExtInst` as one opcode, so it cannot enforce per-function coverage) + spirv-val
+  (the real per-function operand oracle). No new census opcodes.
+
+**Findings (load-bearing):**
+1. **daslang `math` names != GLSL names** for two: `lerp` (GLSL `mix`) and `rsqrt` (GLSL `inversesqrt`).
+   The emitter dispatches by daslang call name, so the table must use daslang spellings. `step`/
+   `smoothstep`/`mix` have no daslang function at all.
+2. **`radians`/`degrees` are NOT builtins** — they live in daslib/math_boost as das functions that
+   reference a `PI` global. The emitter maps them by name, but `collect_dependencies` still pulls `PI`,
+   which `classify_global` rejects. Excluded for that reason. The general rule: the ext-inst table should
+   list only **dependency-free builtin** math (no das body, no global deps), else a shader's compile
+   success becomes context-dependent.
+3. **The OpExtInst census gap.** The opcode census counts `OpExtInst` as a single opcode, so it cannot
+   enforce that each GLSLstd450 sub-function is actually exercised. `test_math` closes this by asserting
+   the sub-opcode at OpExtInst operand index 3 — the test-per-instruction discipline applied to ext-inst.
+4. **Two unrelated gaps surfaced, out of Phase-8 scope (NOT deferred work for 8.x):** multi-component
+   swizzle of a *global* (`fin.xyz` — only single-component global swizzle + local-value swizzle exist),
+   and that's the residual swizzle gap. Phase-8 fixtures build vectors from scalar swizzles, the existing
+   idiom.
+
+**This closes the emitter language surface.** Phases 9 (docs/tutorial), 10 (examples/vulkan), 11
+(vulkan_lint) are docs/demos/lint on top of a feature-complete emitter — not plumbing.

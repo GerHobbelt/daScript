@@ -214,6 +214,115 @@ def public floop_words : array<uint> {
     return <- w
 }
 
+// ===== Phase-6 control-flow coverage fixtures (added during the AstVisitor port). Each targets a
+// construct the Phase-2 fixtures left unexercised; all are byte-identical between the hand-walker and
+// the visitor (golden gate) and spirv-val-clean — the structured-CFG validity oracle. =====
+
+// nested loops (for inside while) + the full break/continue cross-product: continue+break in the
+// inner for AND continue+break in the outer while (Phase-2 had break only in while, continue only in
+// for). The loop_stack push/pop nesting is the #1 port risk; spirv-val rejects a misrouted target.
+[compute_shader(local_size_x=64, name="nloop_spv"), marker(no_coverage)]
+def nloop {
+    let i = gl_GlobalInvocationID.x
+    var acc = 0u
+    var outer = data[i]
+    while (outer > 0u) {
+        outer--
+        if (outer == 7u) {
+            continue                    // continue in the OUTER while
+        }
+        for (j in range(4)) {
+            if (j == 2) {
+                continue                // continue in the INNER for
+            }
+            acc += outer
+            if (acc > 5000u) {
+                break                   // break out of the INNER for
+            }
+        }
+        if (outer == 1u) {
+            break                       // break out of the OUTER while
+        }
+    }
+    data[i] = acc
+}
+
+// elif chain: if / elif / elif / else lowers to nested ExprIfThenElse in each if_false — exercises
+// the recursive selection-merge nesting (Phase-2 only had single if and if/else).
+[compute_shader(local_size_x=64, name="echain_spv"), marker(no_coverage)]
+def echain {
+    let i = gl_GlobalInvocationID.x
+    var acc = idata[i]
+    if (acc < 0) {
+        acc = 0
+    } elif (acc < 10) {
+        acc++
+    } elif (acc < 20) {
+        acc += 2
+    } else {
+        acc = 100
+    }
+    idata[i] = acc
+}
+
+// early return inside a loop: the then-block terminates with OpReturn while the loop/merge blocks
+// continue — the classic structured-CFG trap (a block already terminated + correct merge handling).
+[compute_shader(local_size_x=64, name="eret_spv"), marker(no_coverage)]
+def eret {
+    let i = gl_GlobalInvocationID.x
+    var acc = 0
+    for (j in range(8)) {
+        acc += idata[i] + j
+        if (acc > 100) {
+            idata[i] = acc
+            return                      // early return from inside the for-loop
+        }
+    }
+    idata[i] = acc
+}
+
+// runtime-bound for + bool local: `urange(0u, n)` with n a loaded SSBO value exercises the ExprCall
+// (non-ExprConstRange) for-source path — endpoints come from emitted Loads, not folded constants
+// (all Phase-2 ranges were constant). `var flag : bool` adds the bool Function-OpVariable store/load.
+[compute_shader(local_size_x=64, name="rfor_spv"), marker(no_coverage)]
+def rfor {
+    let i = gl_GlobalInvocationID.x
+    let n = data[i]                     // runtime upper bound
+    var acc = 0u
+    for (j in urange(0u, n)) {
+        acc += j
+    }
+    var flag = acc > 50u               // nolint:LINT003 -- must stay `var`: the point is to exercise the bool Function OpVariable Store/Load path (a `let` would be an SSA value, not memory-backed)
+    if (flag) {
+        acc = 0u
+    }
+    data[i] = acc
+}
+
+def public nloop_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(nloop_spv)
+    return <- w
+}
+
+def public echain_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(echain_spv)
+    return <- w
+}
+
+def public eret_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(eret_spv)
+    return <- w
+}
+
+def public rfor_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(rfor_spv)
+    return <- w
+}
+
 // ===== Phase-3 vertex/fragment fixtures: stage I/O (@in/@out + Location), rasterizer builtins
 // (gl_Position/gl_VertexIndex/gl_InstanceIndex/gl_FragCoord), vector constructors
 // (OpCompositeConstruct), dot (OpDot), and GLSL.std.450 math (OpExtInst). Each emitted blob is
@@ -302,6 +411,281 @@ def catri {
 def public catri_words : array<uint> {
     var w : array<uint>
     w |> push_from(catri_spv)
+    return <- w
+}
+
+// ===== Phase-4a UBO fixture: a @uniform struct read through OpAccessChain by field index. The
+// struct's std140 layout exercises both packing edge cases — a scalar packing after a vec2
+// (uv@16,flags@24,scale@28) and after a vec3 (dir@32,bias@44). Every field is read; member loads
+// feed CompositeConstruct + scalar arithmetic + an int compare. No NEW opcodes vs const-arrays
+// (member access is AccessChain/Load over a Block struct) — it broadens the resource surface. =====
+struct Uniforms {
+    color : float4      // std140 offset 0
+    uv    : float2      // offset 16
+    flags : int         // offset 24 (vec2 size 8 -> 24; int aligns to 4)
+    scale : float       // offset 28
+    dir   : float3      // offset 32 (vec3 aligns to 16)
+    bias  : float       // offset 44 (packs into the vec3's trailing slot: vec3 size 12 -> 44)
+}
+var @uniform @binding = 0 ubo : Uniforms
+var @out @location = 0 u_out : float4
+[fragment_shader(name="ubo_frag_spv"), marker(no_coverage)]
+def ubo_frag {
+    var a = ubo.scale + ubo.bias            // FAdd: two scalar members (off 28 + 44)
+    if (ubo.flags > 0) {                    // int member load + SGreaterThan
+        a = a + 1.0f
+    }
+    let dir4 = float4(ubo.dir, a)           // CompositeConstruct: vec3 member + scalar
+    let uv4 = float4(ubo.uv, a, a)          // CompositeConstruct: vec2 member + 2 scalars
+    u_out = ubo.color                       // vec4 member load
+    if (a > 0.0f) {
+        u_out = dir4
+    }
+    if (a > 1.0f) {
+        u_out = uv4
+    }
+}
+
+def public ubo_frag_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(ubo_frag_spv)
+    return <- w
+}
+
+// ===== Phase-4b matrix fixture: a UBO with two float4x4 -> MVP transform. Matrices are tHandle
+// types lowered to OpTypeMatrix (4 float4 columns); daslang stores them column-major (m[i] is
+// column i) so they map to SPIR-V's default ColMajor (+ MatrixStride 16 in std140). Exercises
+// OpMatrixTimesMatrix, OpMatrixTimesVector, OpVectorTimesScalar, and local-value swizzles
+// (OpVectorShuffle for .xy, OpCompositeExtract for .w). =====
+struct Camera {
+    proj : float4x4     // std140 offset 0  (ColMajor, MatrixStride 16, size 64)
+    view : float4x4     // std140 offset 64
+}
+var @uniform @binding = 0 cam : Camera
+var @in @location = 0 in_pos : float3
+var @out @location = 0 mv_color : float4
+[vertex_shader(name="mvp_vert_spv"), marker(no_coverage)]
+def mvp_vert {
+    let mvp = cam.proj * cam.view           // OpMatrixTimesMatrix
+    let world = float4(in_pos, 1.0f)        // OpCompositeConstruct
+    let clip = mvp * world                  // OpMatrixTimesVector
+    gl_Position = clip * 0.5f               // OpVectorTimesScalar (float4 * float)
+    let xy = clip.xy                        // OpVectorShuffle (float2 from a local float4)
+    let w = clip.w                          // OpCompositeExtract (float from a local float4)
+    mv_color = float4(xy, w, 1.0f)          // OpCompositeConstruct from the swizzles
+}
+
+def public mvp_vert_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(mvp_vert_spv)
+    return <- w
+}
+
+// ===== Phase-4c push-constant fixture: a @push_constant struct -> PushConstant storage + Block,
+// laid out like a UBO (std140 offsets) but with NO DescriptorSet/Binding (push constants are not
+// descriptors) and not in the entry interface. Member access is the same OpAccessChain/OpLoad. =====
+struct PushData {
+    tint  : float4      // offset 0
+    gamma : float       // offset 16
+}
+var @push_constant pc : PushData
+var @out @location = 0 pc_out : float4
+[fragment_shader(name="pc_frag_spv"), marker(no_coverage)]
+def pc_frag {
+    pc_out = pc.tint * pc.gamma     // PushConstant member loads -> VectorTimesScalar
+}
+
+def public pc_frag_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(pc_frag_spv)
+    return <- w
+}
+
+// ===== Phase-4d combined image sampler fixture: a sampler2D global -> OpTypeImage +
+// OpTypeSampledImage in UniformConstant storage + DescriptorSet/Binding; texture(tex, uv) ->
+// OpLoad the sampled image + OpImageSampleImplicitLod (fragment-only, uses derivatives). =====
+var @binding = 0 tex : sampler2D
+var @in @location = 0 ti_uv : float2
+var @out @location = 0 tex_out : float4
+[fragment_shader(name="tex_frag_spv"), marker(no_coverage)]
+def tex_frag {
+    tex_out = texture(tex, ti_uv)       // OpLoad sampler + OpImageSampleImplicitLod
+}
+
+def public tex_frag_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(tex_frag_spv)
+    return <- w
+}
+
+// ===== Phase-7.1a scalar conversions: float(int/uint), int(float/uint), uint(float/int) ->
+// OpConvertSToF/UToF/FToS/FToU + OpBitcast (int<->uint same-width reinterpret). Reuses the existing
+// int/uint/float SSBOs; every conversion opcode is exercised exactly once. =====
+[compute_shader(local_size_x=64, name="conv_spv"), marker(no_coverage)]
+def conv {
+    let i = gl_GlobalInvocationID.x
+    let s = idata[i]                    // int
+    let u = data[i]                     // uint
+    let f = fdata[i]                    // float
+    fdata[i] = float(s) + float(u)      // ConvertSToF + ConvertUToF
+    idata[i] = int(f) + int(u)          // ConvertFToS + Bitcast (uint -> int)
+    data[i] = uint(f) + uint(s)         // ConvertFToU + Bitcast (int -> uint)
+}
+
+def public conv_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(conv_spv)
+    return <- w
+}
+
+// ===== Phase-7.1b storage image: an image2D global -> UniformConstant OpTypeImage (Rgba8, sampled=2)
+// + DescriptorSet/Binding; imageLoad -> OpImageRead, imageStore -> OpImageWrite. A 2D dispatch writes a
+// coordinate-derived gradient (the GPU gate proves the coordinate mapping; here it just emits valid SPIR-V). =====
+var @binding = 0 img : image2D
+[compute_shader(local_size_x=8, local_size_y=8, name="storimg_spv"), marker(no_coverage)]
+def storimg {
+    let gid = gl_GlobalInvocationID
+    let coord = int2(int(gid.x), int(gid.y))
+    let prev = imageLoad(img, coord)                                            // OpImageRead
+    imageStore(img, coord, float4(float(gid.x), float(gid.y), prev.z, 1.0f))    // OpImageWrite
+}
+
+def public storimg_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(storimg_spv)
+    return <- w
+}
+
+// ===== Phase-7.2 explicit-LOD + texel fetch: textureLod -> OpImageSampleExplicitLod (Lod operand),
+// texelFetch -> OpImage (extract image from the sampled image) + OpImageFetch. Both are derivative-free,
+// so this fixture samples in a COMPUTE shader -- proving the stage lift (texture() is fragment-only). =====
+var @binding = 1 cs_tex : sampler2D
+[compute_shader(local_size_x=64, name="texlod_spv"), marker(no_coverage)]
+def texlod {
+    let i = gl_GlobalInvocationID.x
+    let uv = float2(float(i) / 64.0f, 0.5f)                 // runtime uv (not a folded constant)
+    let a = textureLod(cs_tex, uv, 1.0f)                    // OpImageSampleExplicitLod (in compute)
+    let b = texelFetch(cs_tex, int2(int(i), 0), 0)          // OpImage + OpImageFetch
+    fdata[i] = a.x + b.x                                    // scalar swizzles + FAdd
+}
+
+def public texlod_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(texlod_spv)
+    return <- w
+}
+
+// ===== Phase-7.3 additional sampler dimensionalities: samplerCube (Dim Cube), sampler3D (Dim 3D),
+// sampler2DArray (Dim 2D + Arrayed). All sample via texture() with a float3 coordinate. These add NO
+// new opcodes -- only different OpTypeImage Dim/Arrayed operands -- so they must stay within phase7b. =====
+var @binding = 0 cube_tex : samplerCube
+var @binding = 1 vol_tex : sampler3D
+var @binding = 2 arr_tex : sampler2DArray
+var @in @location = 0 dims_dir : float3
+var @out @location = 0 dims_out : float4
+[fragment_shader(name="dims_spv"), marker(no_coverage)]
+def dims_frag {
+    let c = texture(cube_tex, dims_dir)     // samplerCube -> OpTypeImage Dim Cube
+    let v = texture(vol_tex, dims_dir)      // sampler3D   -> OpTypeImage Dim 3D
+    let a = texture(arr_tex, dims_dir)      // sampler2DArray -> OpTypeImage Dim 2D, Arrayed 1
+    dims_out = float4(c.x, v.y, a.z, 1.0f)  // scalar swizzles + CompositeConstruct
+}
+
+def public dims_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(dims_spv)
+    return <- w
+}
+
+// ===== Phase-7.4 separate image + sampler: a texture2D (standalone OpTypeImage) and a sampler
+// (standalone OpTypeSampler) are two independent descriptors; sampleTexture combines them at the call
+// site (OpSampledImage) before sampling. The Vulkan split model, distinct from the combined sampler2D. =====
+var @binding = 0 sep_img : texture2D
+var @binding = 1 sep_smp : sampler
+var @in @location = 0 sep_uv : float2
+var @out @location = 0 sep_out : float4
+[fragment_shader(name="septex_spv"), marker(no_coverage)]
+def septex_frag {
+    sep_out = sampleTexture(sep_img, sep_smp, sep_uv)   // OpSampledImage + OpImageSampleImplicitLod
+}
+
+def public septex_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(septex_spv)
+    return <- w
+}
+
+// ===== Phase-8.1 ternary cond ? a : b -> OpSelect (branchless). A scalar select uses the scalar bool
+// condition directly; a vector select with a scalar condition splats the bool to a bvecN first
+// (SPIR-V < 1.4 requires the OpSelect condition width to match the result). =====
+[compute_shader(local_size_x=64, name="tern_spv"), marker(no_coverage)]
+def tern {
+    let i = gl_GlobalInvocationID.x
+    let a = fdata[i]
+    let b = fdata[i + 1u]
+    let s = a > b ? a : b                                        // scalar OpSelect // nolint:PERF015
+    let v = a > b ? float4(a, a, a, a) : float4(b, b, b, b)      // vector OpSelect (splatted condition)
+    fdata[i] = s + v.x
+}
+
+def public tern_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(tern_spv)
+    return <- w
+}
+
+// ===== Phase-8.2 vector arithmetic + a folded const-vector operand. Component-wise +/-/ lower to
+// OpFAdd/OpFSub/OpFDiv on the vector result type (scalar_class reads the lane kind); unary - is
+// OpFNegate. float2(0.5,0.5) as an operand folds to ExprConstFloat2 -> OpConstantComposite (the gap
+// Phase 7 deferred: a folded const vector used as an rvalue, not only inside a const-array init). =====
+var @in @location = 0 va_in : float2
+var @out @location = 0 va_out : float2
+[fragment_shader(name="vecarith_spv"), marker(no_coverage)]
+def vecarith {
+    let a = va_in
+    let b = va_in + float2(0.5, 0.5)    // folded const-vector operand + component-wise OpFAdd
+    let c = a - b                       // component-wise OpFSub
+    let d = c / b                       // component-wise OpFDiv
+    va_out = -d                         // component-wise OpFNegate
+}
+
+def public vecarith_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(vecarith_spv)
+    return <- w
+}
+
+// ===== Phase-8.3 GLSL.std.450 math breadth: exercise every reachable ext-inst the emitter maps beyond
+// Phase 3's dot/sqrt/clamp. Keyed on the DASLANG name (lerp -> FMix, rsqrt -> InverseSqrt). Vectors are
+// built from scalar swizzles (multi-component swizzle of a global is a separate, unrelated gap). Each
+// ext-inst is spirv-val'd + asserted by sub-opcode. =====
+var @in @location = 0 mx_in : float4
+var @out @location = 0 mx_out : float4
+[fragment_shader(name="mathx_spv"), marker(no_coverage)]
+def mathx {
+    let x = mx_in.x
+    let y = mx_in.y
+    let v = float3(x, y, x)
+    let w = float3(y, x, y)
+    var r = 0.0f
+    r += sin(x) + cos(x) + tan(x)
+    r += asin(x) + acos(x) + atan(x) + atan2(y, x)
+    r += pow(x, y) + exp(x) + log(x) + exp2(x) + log2(x)
+    r += floor(x) + ceil(x) + round(x) + trunc(x) + fract(x)
+    r += rsqrt(x)
+    r += abs(x) + sign(x) + min(x, y) + max(x, y)
+    r += lerp(x, y, 0.5f)                       // GLSL mix -> FMix
+    r += length(v) + distance(v, w)
+    let n = normalize(v)
+    let cr = cross(v, w)
+    let rf = reflect(v, w)
+    let rr = refract(v, w, 0.5f)
+    mx_out = float4(r + n.x + cr.x + rf.x + rr.x, 0.0f, 0.0f, 1.0f)
+}
+
+def public mathx_words : array<uint> {
+    var w : array<uint>
+    w |> push_from(mathx_spv)
     return <- w
 }
 
@@ -430,5 +814,99 @@ def public const_array_emitter_opcodes : table<uint> {
     for (op in [SpvOp.TypeArray, SpvOp.ConstantComposite]) {
         s |> insert(uint(op))
     }
+    return <- s
+}
+
+// Phase-4a UBOs add NO new opcodes: @uniform member access is OpAccessChain/OpLoad over a Block-
+// decorated OpTypeStruct, all already in the set (Uniform storage + DescriptorSet/Binding are
+// operands, not opcodes). The declared set is unchanged — the UBO fixture must still stay within it.
+def public phase4a_emitter_opcodes : table<uint> {
+    return <- const_array_emitter_opcodes()
+}
+
+// Phase-4b adds matrices + matrix/vector arithmetic + local-value swizzles. Phase-4a set + these:
+def public phase4b_emitter_opcodes : table<uint> {
+    var s <- phase4a_emitter_opcodes()
+    for (op in [
+        SpvOp.TypeMatrix,                                   // float4x4 -> OpTypeMatrix
+        SpvOp.MatrixTimesMatrix, SpvOp.MatrixTimesVector,   // proj*view, mvp*world
+        SpvOp.VectorTimesScalar,                            // clip * 0.5
+        SpvOp.VectorShuffle, SpvOp.CompositeExtract         // clip.xy / clip.w (local swizzle)
+    ]) {
+        s |> insert(uint(op))
+    }
+    return <- s
+}
+
+// Phase-4c push constants add NO new opcodes: a @push_constant block is the same Block-decorated
+// OpTypeStruct read via OpAccessChain/OpLoad — only the storage class (PushConstant) differs, and
+// that is an operand, not an opcode. The declared set is unchanged.
+def public phase4c_emitter_opcodes : table<uint> {
+    return <- phase4b_emitter_opcodes()
+}
+
+// Phase-4d combined image samplers add the image type pair + the sample op. Phase-4c set + these:
+def public phase4d_emitter_opcodes : table<uint> {
+    var s <- phase4c_emitter_opcodes()
+    for (op in [
+        SpvOp.TypeImage, SpvOp.TypeSampledImage,    // sampler2D -> OpTypeImage + OpTypeSampledImage
+        SpvOp.ImageSampleImplicitLod                // texture(tex, uv)
+    ]) {
+        s |> insert(uint(op))
+    }
+    return <- s
+}
+
+// Phase-7.1 adds scalar conversions + storage images. Phase-4d set + these:
+def public phase7a_emitter_opcodes : table<uint> {
+    var s <- phase4d_emitter_opcodes()
+    for (op in [
+        // scalar conversions
+        SpvOp.ConvertSToF, SpvOp.ConvertUToF, SpvOp.ConvertFToS, SpvOp.ConvertFToU, SpvOp.Bitcast,
+        // storage image read/write (OpTypeImage already declared by Phase-4d samplers)
+        SpvOp.ImageRead, SpvOp.ImageWrite
+    ]) {
+        s |> insert(uint(op))
+    }
+    return <- s
+}
+
+// Phase-7.2 adds explicit-LOD sampling + texel fetch. Phase-7.1 set + these:
+def public phase7b_emitter_opcodes : table<uint> {
+    var s <- phase7a_emitter_opcodes()
+    for (op in [
+        SpvOp.ImageSampleExplicitLod,   // textureLod(s, uv, lod)
+        SpvOp.Image, SpvOp.ImageFetch   // texelFetch(s, coord, lod)
+    ]) {
+        s |> insert(uint(op))
+    }
+    return <- s
+}
+
+// Phase-7.3 (sampler3D / samplerCube / sampler2DArray) adds NO new opcodes -- only different
+// OpTypeImage Dim/Arrayed operands. The declared set is unchanged; the dims fixture must stay within it.
+def public phase7c_emitter_opcodes : table<uint> {
+    return <- phase7b_emitter_opcodes()
+}
+
+// Phase-7.4 separate image + sampler adds the standalone sampler type + the call-site combine. 7.3 + these:
+def public phase7d_emitter_opcodes : table<uint> {
+    var s <- phase7c_emitter_opcodes()
+    for (op in [
+        SpvOp.TypeSampler,      // a standalone sampler global
+        SpvOp.SampledImage      // sampleTexture combines image + sampler at the call
+    ]) {
+        s |> insert(uint(op))
+    }
+    return <- s
+}
+
+// Phase-8.1 adds the ternary -> OpSelect (the bvecN splat reuses OpCompositeConstruct, already declared
+// by Phase 3). Phase-8.2 (vector arithmetic + folded const-vector operands) and Phase-8.3 (broader
+// GLSL.std.450 math, all via the already-declared OpExtInst) add NO new opcodes. So the Phase-8 declared
+// set is 7.4 + OpSelect. 7.4 set + this:
+def public phase8_emitter_opcodes : table<uint> {
+    var s <- phase7d_emitter_opcodes()
+    s |> insert(uint(SpvOp.Select))     // cond ? a : b
     return <- s
 }
