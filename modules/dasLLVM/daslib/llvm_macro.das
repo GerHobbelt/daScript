@@ -26,7 +26,7 @@ var LINK_WHOLE_LIB = false // when true, standalone exe links against the whole 
 // invalidates cached DLLs (e.g. edits to llvm_jit.das, llvm_macro.das, llvm_jit_common.das,
 // runtime helper ABI, default target triple). Cache filenames fold this in, so a bump
 // makes every previously written DLL miss the cache on the next run and get GC'd.
-let LLVM_JIT_CODEGEN_VERSION : uint64 = 0x09ul
+let LLVM_JIT_CODEGEN_VERSION : uint64 = 0x0aul
 
 let JIT_FNV_PRIME : uint64 = 1099511628211ul
 
@@ -149,6 +149,14 @@ struct JitCliOptions {
     @clarg_name = "jit-runtime-lib"
     @clarg_doc = "JIT: explicit path to libDaScript_runtime.a (wasm cross-compile); overrides auto-locate under web/output/lib/"
     runtime_lib : Option<string>
+
+    @clarg_name = "jit-linker-string"
+    @clarg_doc = "JIT: extra args inserted verbatim into the host linker cmd (e.g. -fsanitize=undefined)"
+    linker_string : Option<string>
+
+    @clarg_name = "jit-path-to-linker"
+    @clarg_doc = "JIT: explicit linker binary (overrides default c++/clang-cl). Match the compiler daslang was built with to avoid sanitizer runtime mismatch."
+    path_to_linker : Option<string>
 }
 
 
@@ -186,7 +194,8 @@ class JIT_LLVM : AstSimulateMacro {
         assume config_out_path = string(prog.policies.jit_output_path)
         var output_path = config_out_path |> empty() ? ".jitted_scripts/{prog.thisNamespace}" : config_out_path
         assume path_to_shared_lib = string(prog.policies.jit_path_to_shared_lib)
-        assume path_to_linker = string(prog.policies.jit_path_to_linker)
+        // CLI --jit-path-to-linker wins over the script-level policy.
+        let path_to_linker = cli_opts.path_to_linker |> unwrap_or(string(prog.policies.jit_path_to_linker))
         // Cross-compile triple: --jit-target=<triple> CLI wins over the
         // script-level `options jit_target = "..."`.
         let opt_target = (prog._options |> find_arg("jit_target")) ?as tString ?? ""
@@ -196,6 +205,8 @@ class JIT_LLVM : AstSimulateMacro {
         // back to `options jit_runtime_lib = "..."` then write_wasm's
         // find_runtime_lib() auto-locate under web/output/lib/.
         let runtime_lib_override = cli_opts.runtime_lib |> unwrap_or((prog._options |> find_arg("jit_runtime_lib")) ?as tString ?? "")
+        // Extra args appended verbatim to the host linker cmd. CLI > script option.
+        let linker_string = cli_opts.linker_string |> unwrap_or((prog._options |> find_arg("jit_linker_string")) ?as tString ?? "")
 
         // Set global options
         LLVM_JIT_ALLOW_UNALIGNED_VECTOR_READ_OUT_OF_BOUNDS = prog._options |> find_arg("jit_vec3_ldu") ?as tBool ?? LLVM_JIT_ALLOW_UNALIGNED_VECTOR_READ_OUT_OF_BOUNDS_DEFAULT
@@ -337,10 +348,10 @@ class JIT_LLVM : AstSimulateMacro {
                     write_wasm(g_mod, output_path, target_triple, path_to_linker, jit_has_externals, runtime_lib_override)
                 } elif (gen_exe) {
                     mkdir_rec(dir_name(output_path))
-                    write_exe(g_mod, output_path, path_to_shared_lib, path_to_linker, LINK_WHOLE_LIB)
+                    write_exe(g_mod, output_path, path_to_shared_lib, path_to_linker, linker_string, LINK_WHOLE_LIB)
                 } elif (use_dll) {
                     mkdir_rec(dir_name(output_path))
-                    write_dll(g_mod, output_path, path_to_shared_lib, path_to_linker, LINK_WHOLE_LIB)
+                    write_dll(g_mod, output_path, path_to_shared_lib, path_to_linker, linker_string, LINK_WHOLE_LIB)
 
                     // Open just stored DLL, so we can keep working.
                     g_dynamic_lib_handle.reset()

@@ -2681,3 +2681,417 @@ def test_wave4_pruned_groupby_count_splice_shape(t : T?) {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// from_decs($(args){...}) lambda-arg form — splice + pruning coverage.
+//
+// Both from_decs (lambda-arg) and from_decs_template (type<T>) expand to the same
+// invoke-block shape: `invoke($() { var res : array<tuple>; query(...); return
+// res.to_sequence() })`. extract_decs_bridge pattern-matches the expanded shape, not
+// the call macro, so it recognizes both. This block proves that empirically: every
+// chain shape the type-arg form supports also works on the lambda-arg form, with the
+// same emitted AST and the same Wave 4 component pruning.
+//
+// Tests are intentionally lean — the type-arg form is already covered exhaustively
+// above; here we hit one representative case per planner family + the pruning gate.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ----- Parity: lambda-arg form returns the same answer as the type-arg form -----
+
+[export, marker(no_coverage)]
+def target_lambda_count_fold() : int {
+    return _fold(from_decs($(unroll_val : int) {}).count())
+}
+
+[export, marker(no_coverage)]
+def target_lambda_where_count_fold() : int {
+    return _fold(from_decs($(unroll_val : int) {})._where(_.unroll_val >= 3).count())
+}
+
+[export, marker(no_coverage)]
+def target_lambda_select_sum_fold() : int {
+    return _fold(from_decs($(unroll_val : int) {})._select(_.unroll_val).sum())
+}
+
+[export, marker(no_coverage)]
+def target_lambda_take_count_fold() : int {
+    return _fold(from_decs($(unroll_val : int) {}).take(3).count())
+}
+
+[export, marker(no_coverage)]
+def target_lambda_distinct_count_fold() : int {
+    return _fold(from_decs($(unroll_val : int) {})._select(_.unroll_val).distinct().count())
+}
+
+[export, marker(no_coverage)]
+def target_lambda_to_array_fold() : array<tuple<unroll_val : int>> {
+    return <- _fold(from_decs($(unroll_val : int) {}).to_array())
+}
+
+[export, marker(no_coverage)]
+def target_lambda_groupby_count_fold() : array<tuple<Bucket : int; N : int>> {
+    return <- _fold(from_decs($(unroll_val : int) {})._group_by(_.unroll_val % 3)._select((Bucket = _._0, N = _._1 |> length)).to_array())
+}
+
+def private populate_unroll(n : int) {
+    restart()
+    for (i in range(n)) {
+        create_entity() @(eid, cmp) {
+            cmp.eid := eid
+            cmp.unroll_val := i
+        }
+    }
+    commit()
+}
+
+[test]
+def test_lambda_count_parity(t : T?) {
+    populate_unroll(7)
+    t |> equal(target_lambda_count_fold(), 7, "lambda-arg count matches type-arg")
+}
+
+[test]
+def test_lambda_where_count_parity(t : T?) {
+    populate_unroll(7)
+    // vals 0..6, _where(_>=3) → 3,4,5,6 → 4 matches
+    t |> equal(target_lambda_where_count_fold(), 4, "lambda-arg where+count matches type-arg")
+}
+
+[test]
+def test_lambda_select_sum_parity(t : T?) {
+    populate_unroll(7)
+    // sum(0..6) = 21
+    t |> equal(target_lambda_select_sum_fold(), 21, "lambda-arg select+sum matches type-arg")
+}
+
+[test]
+def test_lambda_take_count_parity(t : T?) {
+    populate_unroll(7)
+    // take(3).count() — early-exit at 3, regardless of source size
+    t |> equal(target_lambda_take_count_fold(), 3, "lambda-arg take+count matches type-arg")
+}
+
+[test]
+def test_lambda_distinct_count_parity(t : T?) {
+    populate_unroll(7)
+    // 7 unique vals → 7 distinct
+    t |> equal(target_lambda_distinct_count_fold(), 7, "lambda-arg select+distinct+count matches type-arg")
+}
+
+[test]
+def test_lambda_to_array_parity(t : T?) {
+    populate_unroll(5)
+    let got <- target_lambda_to_array_fold()
+    t |> equal(got |> length, 5, "lambda-arg to_array preserves whole tuple")
+    var sum = 0
+    for (item in got) {
+        sum += item.unroll_val
+    }
+    t |> equal(sum, 0 + 1 + 2 + 3 + 4, "lambda-arg to_array element values match")
+}
+
+[test]
+def test_lambda_groupby_count_parity(t : T?) {
+    populate_unroll(10)
+    // vals 0..9, key = val % 3 → buckets {0:[0,3,6,9], 1:[1,4,7], 2:[2,5,8]} → 3 buckets sized 4,3,3
+    let got <- target_lambda_groupby_count_fold()
+    t |> equal(got |> length, 3, "lambda-arg group_by yields 3 distinct keys")
+    var total = 0
+    for (b in got) {
+        total += b.N
+    }
+    t |> equal(total, 10, "lambda-arg group_by buckets sum to source count")
+}
+
+// ----- AST splice-shape gates: lambda-arg emits the same shape as type-arg -----
+
+[test]
+def test_lambda_count_splice_shape(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_lambda_count_fold)
+        t |> success(func != null, "RTTI resolves count target")
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched, "qmatch captures body")
+        // bare count goes through the arch.size shortcut: one for_each_archetype, no inner
+        // per-entity for-loop, no eager-bridge to_sequence. Identical to the type-arg form.
+        t |> equal(describe_count(body_expr, "for_each_archetype"), 1, "lambda-arg count emits one for_each_archetype")
+        t |> equal(describe_count(body_expr, "to_sequence"), 0, "lambda-arg count does NOT eager-bridge")
+        t |> equal(count_expr_for(body_expr), 0, "lambda-arg count has no inner per-entity for")
+        t |> equal(describe_count(body_expr, ".size"), 1, "lambda-arg count reads arch.size")
+    }
+}
+
+[test]
+def test_lambda_where_count_splice_shape(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_lambda_where_count_fold)
+        t |> success(func != null, "RTTI resolves where+count target")
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched, "qmatch captures body")
+        // where+count emits one for_each_archetype with an inner multi-iter for-loop;
+        // the predicate's matching counter accumulates inline. NO to_sequence.
+        t |> equal(describe_count(body_expr, "for_each_archetype"), 1, "lambda-arg where+count emits one for_each_archetype")
+        t |> equal(describe_count(body_expr, "to_sequence"), 0, "lambda-arg where+count does NOT eager-bridge")
+    }
+}
+
+// ----- Wave 4 component pruning fires on lambda-arg form too -----
+
+[export, marker(no_coverage)]
+def target_lambda_pruned_select_sum_fold() : int {
+    // Multi-component query, but chain only references `wave4_price`. Pruning must
+    // drop wave4_brand + wave4_year get_ros to match the type-arg pruning behavior.
+    return _fold(from_decs($(wave4_brand : int; wave4_price : int; wave4_year : int) {})._select(_.wave4_price).sum())
+}
+
+[test]
+def test_lambda_pruned_select_sum_parity(t : T?) {
+    fixture_wave4(10)
+    // i*10 for i in 0..9 = 0+10+20+...+90 = 450
+    t |> equal(target_lambda_pruned_select_sum_fold(), 450, "lambda-arg pruning preserves sum semantics")
+}
+
+[test]
+def test_lambda_pruned_select_sum_splice_shape(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_lambda_pruned_select_sum_fold)
+        t |> success(func != null, "RTTI resolves pruned target")
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched, "qmatch captures body")
+        // Lambda-arg declared 3 components but chain reads only wave4_price → pruning
+        // keeps a single get_ro slot. Same gate the type-arg Wave 4 tests assert.
+        t |> equal(describe_count(body_expr, "get_ro"), 1, "lambda-arg pruning drops unused get_ros (3 declared → 1 emitted)")
+        t |> success(describe_count(body_expr, "wave4_price") >= 1, "wave4_price retained")
+        t |> equal(describe_count(body_expr, "wave4_brand"), 0, "wave4_brand pruned")
+        t |> equal(describe_count(body_expr, "wave4_year"), 0, "wave4_year pruned")
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slice 5f: walk terminators (last / single / aggregate) + element_at
+//          — the 4 outliers from PR #2812's m4 bench snapshot
+// ─────────────────────────────────────────────────────────────────────────────
+
+[export, marker(no_coverage)]
+def target_unroll_last_fold() : int {
+    return _fold(from_decs_template(type<UnrollChainRow>)._select(_.val).last())
+}
+
+[export, marker(no_coverage)]
+def target_unroll_last_or_default_fold() : int {
+    return _fold(from_decs_template(type<UnrollChainRow>)._where(_.val > 1000)._select(_.val).last_or_default(-9))
+}
+
+[export, marker(no_coverage)]
+def target_unroll_single_fold() : int {
+    return _fold(from_decs_template(type<UnrollChainRow>)._where(_.val == 3)._select(_.val).single())
+}
+
+[export, marker(no_coverage)]
+def target_unroll_single_or_default_fold() : int {
+    return _fold(from_decs_template(type<UnrollChainRow>)._where(_.val > 1000)._select(_.val).single_or_default(-7))
+}
+
+[export, marker(no_coverage)]
+def target_unroll_aggregate_fold() : int {
+    return _fold(from_decs_template(type<UnrollChainRow>)._select(_.val).aggregate(0) <| $(a, x) => a + x * x)
+}
+
+[export, marker(no_coverage)]
+def target_unroll_element_at_fold() : int {
+    return _fold(from_decs_template(type<UnrollChainRow>)._select(_.val).element_at(3))
+}
+
+[export, marker(no_coverage)]
+def target_unroll_element_at_or_default_fold() : int {
+    // element_at_or_default returns default<int> (0) on out-of-range; no user-supplied default.
+    return _fold(from_decs_template(type<UnrollChainRow>)._select(_.val).element_at_or_default(999))
+}
+
+[test]
+def test_unroll_last_parity(t : T?) {
+    fixture_unroll2(5)
+    // vals 0..4 → last is 4
+    t |> equal(target_unroll_last_fold(), 4, "last splice parity")
+}
+
+[test]
+def test_unroll_last_or_default_empty(t : T?) {
+    fixture_unroll2(5)
+    // val>1000 → none → default -9
+    t |> equal(target_unroll_last_or_default_fold(), -9, "last_or_default empty source")
+}
+
+[test]
+def test_unroll_single_parity(t : T?) {
+    fixture_unroll2(5)
+    // val==3 matches exactly once → 3
+    t |> equal(target_unroll_single_fold(), 3, "single splice parity")
+}
+
+[test]
+def test_unroll_single_or_default_empty(t : T?) {
+    fixture_unroll2(5)
+    // val>1000 → none → default -7
+    t |> equal(target_unroll_single_or_default_fold(), -7, "single_or_default empty source")
+}
+
+[export, marker(no_coverage)]
+def target_unroll_single_or_default_multi_fold() : int {
+    return _fold(from_decs_template(type<UnrollChainRow>)._where(_.val < 100)._select(_.val).single_or_default(-7))
+}
+
+[test]
+def test_unroll_single_or_default_multi(t : T?) {
+    fixture_unroll2(5)
+    // 5 rows match → single_or_default returns default on 2nd match
+    t |> equal(target_unroll_single_or_default_multi_fold(), -7, "single_or_default returns default when >1 match")
+}
+
+[test]
+def test_unroll_aggregate_parity(t : T?) {
+    fixture_unroll2(5)
+    // 0^2 + 1^2 + 2^2 + 3^2 + 4^2 = 30
+    t |> equal(target_unroll_aggregate_fold(), 30, "aggregate sum-of-squares splice parity")
+}
+
+[test]
+def test_unroll_aggregate_empty(t : T?) {
+    fixture_unroll2(0)
+    // empty source → returns seed
+    t |> equal(target_unroll_aggregate_fold(), 0, "aggregate empty returns seed")
+}
+
+[test]
+def test_unroll_element_at_parity(t : T?) {
+    fixture_unroll2(5)
+    // vals 0..4, element_at(3) → 3
+    t |> equal(target_unroll_element_at_fold(), 3, "element_at splice parity")
+}
+
+[test]
+def test_unroll_element_at_or_default_out_of_range(t : T?) {
+    fixture_unroll2(5)
+    // idx 999 way past end → default<int> == 0
+    t |> equal(target_unroll_element_at_or_default_fold(), 0, "element_at_or_default out-of-range → default<int>")
+}
+
+// Range interaction: take + last / take + aggregate
+[export, marker(no_coverage)]
+def target_unroll_take_last_fold() : int {
+    return _fold(from_decs_template(type<UnrollChainRow>)._select(_.val).take(3).last())
+}
+
+[test]
+def test_unroll_take_last_parity(t : T?) {
+    fixture_unroll2(10)
+    // take(3) of 0..9 → 0,1,2 → last is 2
+    t |> equal(target_unroll_take_last_fold(), 2, "take+last interaction")
+}
+
+[export, marker(no_coverage)]
+def target_unroll_where_aggregate_fold() : int {
+    return _fold(from_decs_template(type<UnrollChainRow>)._where(_.flag == 1)._select(_.val).aggregate(0) <| $(a, x) => a + x)
+}
+
+[test]
+def test_unroll_where_aggregate_parity(t : T?) {
+    fixture_unroll2(5)
+    // flag==1 rows: vals 1,3 → 1+3 = 4
+    t |> equal(target_unroll_where_aggregate_fold(), 4, "where+aggregate interaction")
+}
+
+// Splice-shape gates: emit must not hit to_sequence; exact for_each_archetype{,_find} dispatch
+[test]
+def test_unroll_last_splice_shape(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_unroll_last_fold)
+        t |> success(func != null, "RTTI must resolve target_unroll_last_fold")
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected splice invoke wrapper")
+        t |> equal(describe_count(body_expr, "to_sequence"), 0, "last splice must NOT call to_sequence")
+        t |> equal(describe_count(body_expr, "for_each_archetype"), 1, "last (no range) uses plain for_each_archetype")
+        t |> equal(describe_count(body_expr, "for_each_archetype_find"), 0, "last (no range) does NOT need _find")
+    }
+}
+
+[test]
+def test_unroll_single_or_default_splice_shape(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_unroll_single_or_default_multi_fold)
+        t |> success(func != null, "RTTI must resolve target_unroll_single_or_default_multi_fold")
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected splice invoke wrapper")
+        t |> equal(describe_count(body_expr, "to_sequence"), 0, "single_or_default splice must NOT call to_sequence")
+        t |> equal(describe_count(body_expr, "for_each_archetype_find"), 1, "single_or_default uses _find for early-exit on 2nd match")
+    }
+}
+
+[test]
+def test_unroll_aggregate_splice_shape(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_unroll_aggregate_fold)
+        t |> success(func != null, "RTTI must resolve target_unroll_aggregate_fold")
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected splice invoke wrapper")
+        t |> equal(describe_count(body_expr, "to_sequence"), 0, "aggregate splice must NOT call to_sequence")
+        t |> equal(describe_count(body_expr, "for_each_archetype"), 1, "aggregate (no range) uses plain for_each_archetype")
+    }
+}
+
+[test]
+def test_unroll_element_at_splice_shape(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_unroll_element_at_fold)
+        t |> success(func != null, "RTTI must resolve target_unroll_element_at_fold")
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected splice invoke wrapper")
+        t |> equal(describe_count(body_expr, "to_sequence"), 0, "element_at splice must NOT call to_sequence")
+        t |> equal(describe_count(body_expr, "for_each_archetype_find"), 1, "element_at uses _find for counter early-exit")
+    }
+}
+
+[test]
+def test_unroll_take_last_splice_shape(t : T?) {
+    ast_gc_guard() {
+        var func = find_module_function_via_rtti(compiling_module(), @@target_unroll_take_last_fold)
+        t |> success(func != null, "RTTI must resolve target_unroll_take_last_fold")
+        if (func == null) return
+        var body_expr : ExpressionPtr
+        let r = qmatch_function(func) $() {
+            return <- $e(body_expr)
+        }
+        t |> success(r.matched && body_expr is ExprInvoke, "expected splice invoke wrapper")
+        t |> equal(describe_count(body_expr, "to_sequence"), 0, "take+last splice must NOT call to_sequence")
+        // take present → bool-lambda dispatch (for_each_archetype_find) so the range's `return true` exits the walk
+        t |> equal(describe_count(body_expr, "for_each_archetype_find"), 1, "take+last uses _find when range present")
+    }
+}
+
