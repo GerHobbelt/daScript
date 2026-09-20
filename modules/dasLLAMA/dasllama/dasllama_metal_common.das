@@ -63,6 +63,8 @@ enum MetalDecodeDecline {
     gpu_error           // dispatch failed at execution time
     planar              // weights not in the blob-image form (the drivers are blob-only —
                         // load_model under metal mode transforms/maps the metal flavor)
+    dn_state            // deltanet recurrent state not GPU-resident for this position (state is
+                        // forward-only and NOT re-derivable — no watermark repair exists)
 }
 
 //! Layer-stack features a model's graph needs beyond the base llama dense block — ONE derivation
@@ -558,6 +560,19 @@ def blob_of(dev : MetalDevice?; t : Model; off : int64) : tuple<buf : MetalBuffe
     }
 }
 
+//! The native-MXFP4 expert planes (gpt-oss) + one stack's byte offsets within them: nibble
+//! bytes at off/2, E8M0 scale bytes at off/32 (disk order — the mx4_repacked gate keeps the
+//! CPU laneq repack out). Region-relative uint32 indices stay safe per layer stack.
+def mx4_of(dev : MetalDevice?; t : Model; off : int64) : tuple<qbuf : MetalBuffer?; qoff : uint64; sbuf : MetalBuffer?; soff : uint64> {
+    assert(t.metal_blob)
+    unsafe {
+        return (qbuf = plane_buffer(dev, addr < void? >(t.mxq[0]), uint64(long_length(t.mxq)), t.image_map != null),
+                qoff = uint64(off / 2l),
+                sbuf = plane_buffer(dev, addr < void? >(t.mxs[0]), uint64(long_length(t.mxs)), t.image_map != null),
+                soff = uint64(off / 32l))
+    }
+}
+
 // the kq formats the Metal kernels implement — anything else (the q4_0 QAT tier, future
 // formats) must DECLINE kquant_native instead of falling into a wrong-layout kernel branch
 // (the dispatchers below treat "not k4/k6" as k5)
@@ -916,6 +931,99 @@ def mirror_prepare(t : Model; var s : Session; pos : int64) : tuple<ok : bool; k
 }
 
 
+// Wave D serve gate for the deltanet kernel set: fixed d_state 128 (the scan/l2/gate lane math
+// bakes 32 lanes x 4), conv taps <= 8 (hist registers). β/α projections: q8 planes ride the
+// site GEMVs; f32-on-disk (dn_ba_f32) rides the router-slab f32 GEMV off the fblob offsets.
+def dn_metal_ok(t : Model) : bool {
+    let c = t.config
+    return c.ssm_d_state == 128l && c.ssm_d_conv >= 2l && c.ssm_d_conv <= 8l
+}
+
+// ===== deltanet recurrent-state mirrors (Wave D) — per-session GPU S + conv state =====
+// Forward-only, NOT re-derivable: pos 0 zeroes, s.dn_pos == pos syncs from CPU, else decline;
+// own buffers (KV-arena rebuild re-uploads from CPU — impossible for state); layout == Session's.
+
+struct DnMirror {
+    uid : uint64
+    @do_not_delete buf : MetalBuffer?   // [state planes f32][conv planes f32]
+    conv_off : uint64                   // byte offset of the conv-history region
+    bytes : uint64
+    pos : int64                         // next position the GPU state expects (forward-only)
+    tick : int64
+}
+var g_dn_mirrors : table<uint64; DnMirror>
+let DN_MIRRORS_MAX = 4      // per-session state is big (35B: ~60MB) — oldest evicts; a returning
+                            // evicted session declines unless it restarts at pos 0 or off CPU state
+
+def dn_mirror_release(mr : DnMirror) {
+    if (mr.buf != null) {
+        metal_release(mr.buf)
+    }
+}
+
+def dn_mirror_prepare(var s : Session; pos : int64) : tuple<ok : bool; buf : MetalBuffer?; conv_off : uint64> {
+    let sbytes = uint64(length(s.dn_state)) * 4ul
+    let cbytes = uint64(length(s.dn_conv_state)) * 4ul
+    if (sbytes == 0ul) {
+        return (ok = false, buf = null, conv_off = 0ul)
+    }
+    if (key_exists(g_dn_mirrors, s.uid) && g_dn_mirrors[s.uid].bytes != sbytes + cbytes) {
+        dn_mirror_release(g_dn_mirrors[s.uid])
+        g_dn_mirrors |> erase(s.uid)
+    }
+    let have = key_exists(g_dn_mirrors, s.uid)
+    let cpu_prefix = s.dn_pos == pos
+    if (!have && pos != 0l && !cpu_prefix) {
+        return (ok = false, buf = null, conv_off = 0ul)
+    }
+    if (!have) {
+        while (length(g_dn_mirrors) >= DN_MIRRORS_MAX) {
+            var victim = 0ul
+            var vtick = 0l
+            for (uid, mr in keys(g_dn_mirrors), values(g_dn_mirrors)) {
+                if (victim == 0ul || mr.tick < vtick) {
+                    victim = uid
+                    vtick = mr.tick
+                }
+            }
+            dn_mirror_release(g_dn_mirrors[victim])
+            g_dn_mirrors |> erase(victim)
+        }
+        g_dn_mirrors[s.uid] = DnMirror(uid = s.uid, buf = metal_new_buffer(g_dev, sbytes + cbytes),
+            conv_off = sbytes, bytes = sbytes + cbytes, pos = -1l)
+    }
+    if (pos == 0l) {
+        // fresh conversation: zero both regions (dn_reset's GPU half). Safe on unified memory —
+        // no step of this session is in flight at pos 0 (spec is clipped for recurrent models)
+        unsafe {
+            memset8(metal_buffer_contents(g_dn_mirrors[s.uid].buf), uint8(0), int(sbytes + cbytes))
+        }
+        g_dn_mirrors[s.uid].pos = 0l
+    } elif (g_dn_mirrors[s.uid].pos != pos) {
+        if (!cpu_prefix) {
+            return (ok = false, buf = null, conv_off = 0ul)
+        }
+        // the CPU ran positions [0, pos) — its state is the source of truth; sync it up
+        unsafe {
+            var dst = reinterpret<uint8?>(metal_buffer_contents(g_dn_mirrors[s.uid].buf))
+            memcpy(reinterpret<void?>(dst), addr<void?>(s.dn_state[0]), int(sbytes))
+            memcpy(reinterpret<void?>(dst + sbytes), addr<void?>(s.dn_conv_state[0]), int(cbytes))
+        }
+        g_dn_mirrors[s.uid].pos = pos
+    }
+    g_tick++
+    g_dn_mirrors[s.uid].tick = g_tick
+    var mr = g_dn_mirrors[s.uid]   // cheap copy — one lookup per statement (table re-hash safety)
+    return (ok = true, buf = mr.buf, conv_off = mr.conv_off)
+}
+
+// the step served and its command buffer completed — the GPU state now holds position pos's update
+def dn_mirror_advance(uid : uint64; pos : int64) {
+    if (key_exists(g_dn_mirrors, uid)) {
+        g_dn_mirrors[uid].pos = pos + 1l
+    }
+}
+
 def signs_buffer() : MetalBuffer? {
     if (g_signs == null) {
         var signs : array<float>
@@ -932,6 +1040,107 @@ def signs_buffer() : MetalBuffer? {
 // tq4-mirror rope+store: one threadgroup per head (the FWHT spans it); mirror rows bind twice
 // each (half-scale + byte views at the same row offset)
 
+def private moe_fmt_at(a : array<KqFmt>; l : int64) : KqFmt => empty(a) ? KqFmt.q8 : a[l]
+
+// one MoE weight stack's (fmt, offset) serve check: base offset = the format's BIND alignment
+// (q8/k4/k5 %256, k6's d-plane pair %512); per-expert stride = the in-kernel index unit
+// (q8 32-blocks, kq 256-superblocks — the expert shift is index math, no base multiple)
+def moe_site_ok(fmt : KqFmt; off, ege : int64) : bool {
+    if (fmt == KqFmt.q8) {
+        return off >= 0l && (off % 256l) == 0l && (ege % 32l) == 0l
+    }
+    if (fmt == KqFmt.k4 || fmt == KqFmt.k5) {
+        return off >= 0l && (off % 256l) == 0l && (ege % 256l) == 0l
+    }
+    if (fmt == KqFmt.k6) {
+        return off >= 0l && (off % 512l) == 0l && (ege % 256l) == 0l
+    }
+    return false
+}
+
+// The MoE serve gate — covered graph shapes: plain routed FFN (qwen3moe, silu, no biases)
+// + optional sigmoid-gated shared expert (qwen35moe), gemma4's dense-shared dual branch, and
+// gpt-oss's mx4 experts (softmax_weight, biases, disk-order). No dense-lead / selection bias.
+def moe_metal_ok(t : Model) : bool {
+    let c = t.config
+    if (!c.moe || c.n_layer_dense_lead > 0l || c.moe_exp_probs ||
+            (c.expert_weights_scale != 0.0 && c.expert_weights_scale != 1.0)) {
+        return false
+    }
+    if (t.experts_mx4) {
+        // gpt-oss: softmax_weight top-k on raw logits, router + per-expert biases, clamped
+        // swiglu, disk-order mx4 stacks (the CPU laneq repack has no GPU carry)
+        if (c.moe_gate != MoeGate.softmax_weight || c.ffn_act != FfnAct.swiglu_oai ||
+                !c.moe_router_bias || !c.moe_exps_bias || c.moe_dense_shexp || c.n_ff_shexp > 0l ||
+                t.mx4_repacked ||
+                t.router_b_off < 0l || t.web1_off < 0l || t.web2_off < 0l || t.web3_off < 0l) {
+            return false
+        }
+    } elif (c.moe_dense_shexp) {
+        if (c.moe_gate != MoeGate.softmax || !c.norm_topk_prob ||
+                c.moe_router_bias || c.moe_exps_bias || c.n_ff_shexp > 0l ||
+                c.ffn_act != FfnAct.gelu || t.moe_router_scale_off < 0l || t.moe_down_scale_off < 0l ||
+                t.rms_pre_ffn2_off < 0l || t.rms_post_ffn1_off < 0l || t.rms_post_ffn2_off < 0l ||
+                int64(length(t.w1_offs)) < c.n_layers) {
+            return false
+        }
+    } elif (c.moe_gate != MoeGate.softmax ||
+            c.moe_router_bias || c.moe_exps_bias || c.ffn_act != FfnAct.silu) {
+        // norm_topk_prob both ways: renorm = select gmode 0 (qwen3moe/qwen35moe), no-renorm =
+        // gmode 2 (qwen2moe)
+        return false
+    } elif (c.n_ff_shexp > 0l) {
+        // sigmoid-gated shared expert (qwen35moe): q8 wsh planes at base + l*she ride the
+        // dense site kernels — base + stride %256 (bind), nsh %64 (prefill C tiles)
+        let she = c.dim * c.n_ff_shexp
+        if (!c.moe_shexp_gated ||
+                (c.n_ff_shexp % 64l) != 0l || (she % 256l) != 0l ||
+                (t.wsh1_off % 256l) != 0l || (t.wsh2_off % 256l) != 0l || (t.wsh3_off % 256l) != 0l) {
+            return false
+        }
+    }
+    let ne = c.n_expert
+    let k = c.n_expert_used
+    let nfe = c.n_ff_exp
+    let ege = c.dim * nfe
+    // select holds 8 logits per lane (ne <= 256); %64 dims = the gathered mul_mm C tiles
+    if (ne < 1l || ne > 256l || k < 1l || k > 16l || k > ne || nfe <= 0l ||
+            (c.dim % 64l) != 0l || (nfe % 64l) != 0l ||
+            ne * ege > 3800000000l ||   // uint32 in-kernel indices (q8 byte view = elements * 34/32)
+            t.router_off < 0l || empty(t.we1_offs) || empty(t.we2_offs) || empty(t.we3_offs)) {
+        return false
+    }
+    if (t.experts_mx4) {
+        // mx4 binds: nibble bytes at off/2 (%4 => off %8), E8M0 at off/32 (%4 => off %128)
+        if ((ege % 32l) != 0l) {
+            return false
+        }
+        for (l in range64(c.n_layers)) {
+            if (t.we1_offs[l] < 0l || (t.we1_offs[l] % 128l) != 0l ||
+                    t.we2_offs[l] < 0l || (t.we2_offs[l] % 128l) != 0l ||
+                    t.we3_offs[l] < 0l || (t.we3_offs[l] % 128l) != 0l) {
+                return false
+            }
+        }
+        return true
+    }
+    for (l in range64(c.n_layers)) {
+        let f1 = moe_fmt_at(t.we1_fmt, l)
+        let f2 = moe_fmt_at(t.we2_fmt, l)
+        let f3 = moe_fmt_at(t.we3_fmt, l)
+        // per-site alignment + (kq kernels iterate whole superblock rows) reduction dims %256
+        if (!moe_site_ok(f1, t.we1_offs[l], ege) ||
+                !moe_site_ok(f2, t.we2_offs[l], ege) ||
+                !moe_site_ok(f3, t.we3_offs[l], ege) ||
+                ((f1 != KqFmt.q8 || f3 != KqFmt.q8) && (c.dim % 256l) != 0l) ||
+                (f2 != KqFmt.q8 && (nfe % 256l) != 0l)) {
+            return false
+        }
+    }
+    return true
+}
+
+
 let HZ_BX     = 1u
 let HZ_BXB    = 2u
 let HZ_BXB2   = 4u
@@ -943,6 +1152,13 @@ let HZ_ARENA  = 128u
 let HZ_BPSK   = 256u
 let HZ_BXF    = 512u
 let HZ_BLOG   = 1024u
+let HZ_BMLG   = 2048u   // MoE router logits (Wave C)
+let HZ_BMSEL  = 4096u   // MoE selection rows
+let HZ_BMDN   = 8192u   // MoE per-slot down outputs
+let HZ_BMG4X  = 16384u  // gemma4 MoE: the pre_ffn2 expert-input panel
+let HZ_BMRT   = 32768u  // gemma4 MoE: router-input / routed-acc panel
+let HZ_BMGH   = 65536u  // gemma4 MoE: expert gate panel (dense branch keeps bhb)
+let HZ_BMGH2  = 131072u // gemma4 MoE: expert up panel
 
 struct HazTrack {
     on : bool
@@ -1156,6 +1372,12 @@ def metal_common_release {
     unsafe {
         delete g_mirrors
     }
+    for (dmr in values(g_dn_mirrors)) {
+        dn_mirror_release(dmr)
+    }
+    unsafe {
+        delete g_dn_mirrors
+    }
     g_mirror_bytes = 0ul
     if (g_arena != null) {
         metal_release(g_arena)
@@ -1217,6 +1439,7 @@ enum MetalPrefillDecline {
     device              // metal_prefill_init failed (no device / PSO build failure)
     gpu_error           // dispatch failed at execution time
     planar              // weights not in the blob-image form (the drivers are blob-only)
+    dn_state            // recurrent state not GPU-resident and no CPU prefix to sync from
 }
 
 var g_prefill_declines = 0l

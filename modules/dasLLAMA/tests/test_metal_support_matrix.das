@@ -55,7 +55,10 @@ require _model_tier
 // (stage 3: two attention classes, hs 512, V-from-K, v_norm, out_scale, suppress) serves
 // ALL THREE paths token-exact (stage 3d: per-class batch uniforms + prefix `lay`). mistral3
 // (empty config = the llama shape) serves by construction; no <= 35B mistral3-arch GGUF
-// exists to validate against, so its real-model row waits on a fixture. MoE/deltanet = C-D.
+// exists to validate against, so its real-model row waits on a fixture. qwen3moe +
+// gemma4moe-26B + gptoss (wave C): GPU MoE routing — expert-indexed GEMV twins (decode/batch)
+// + CSR-gathered mul_mm prefill; gemma4's parallel-dense form; gpt-oss mx4 experts + sinks +
+// softmax_weight + biases + swiglu_oai. qwen2moe (sigmoid shexp) parked. deltanet = wave D.
 
 def private counting_prompt(start, last : int) : string {
     return build_string() $(var w) {
@@ -649,6 +652,368 @@ def private family_cells(t : T?; path, family, tag : string; expect_needs : uint
     }
 }
 
+[unused_argument(t, path, family, tag, expect_needs, cont_tol)]   // off-Apple the gated body is empty
+def private qwen35_row(t : T?; path, family, tag : string; expect_needs : uint; cont_tol : float) {
+    // qwen3.5/3.6 hybrid (Wave D): 3-in-4 Gated-DeltaNet layers + gated attention. Prefill +
+    // decode ENGAGE on the blob twin; batch has NO metal arm by design — eval_batch CPU-declines
+    // hybrids (attn_is_std false) into per-row forward, which rides the metal DECODE override.
+    // The batch cell therefore asserts the FALLBACK shape: metal batch steps stay 0 while the
+    // single-decode counter serves both rows.
+    static_if (typeinfo builtin_module_exists(das_metal)) {
+        if (!family_on(t, family) || !arm_on(t, "fam-{family}") || !model_available(t, path)) {
+            return
+        }
+        var tr <- load_model(path, QuantMode.q8)
+        tr.config.seq_len = min(tr.config.seq_len, 512l)
+        let derived = metal_needs(tr)
+        let expected = MetalNeed(expect_needs)   // nolint:LINT005 — uint→named-bitfield relabel so the message prints bit NAMES
+        t |> success((uint(derived) & expect_needs) == expect_needs,
+            "{tag}: metal_needs derives {expected} (got {derived})")
+        var trg <- blob_twin(t, path, 512l)
+        let c = trg.config
+        let vocab = c.vocab_size
+        let pf0 = metal_prefill_stats().prefills
+        let de0 = metal_decode_stats().decodes
+        let ba0 = metal_batch_decode_stats().steps
+        with_job_que() {
+            setup_dasllama_jobque()
+            var sa = make_run_state(c, KVDtype.f16, KVDtype.f16)
+            var sb = make_run_state(c, KVDtype.f16, KVDtype.f16)
+            let pa <- encode(trg, counting_prompt(1, 40), true, false)
+            let pb <- encode(trg, counting_prompt(5, 44), true, false)
+            t |> success(select_prefill_override("metal"), "{tag}: prefill override registered")
+            t |> success(select_decode_override("metal"), "{tag}: decode override registered")
+            set_metal_prefill_min_npos(1l)
+            eval_(trg, sa, pa)
+            eval_(trg, sb, pb)
+            var cura = greedy_top(sa.logits, vocab)
+            let curb = greedy_top(sb.logits, vocab)
+            for (_i in range(2)) {
+                var one <- [cura]
+                eval_(trg, sa, one)
+                delete one
+                cura = greedy_top(sa.logits, vocab)
+            }
+            let de1 = metal_decode_stats().decodes
+            var ws <- create_batch_workspace_(trg)
+            var sess : array<Session?>
+            unsafe {
+                sess |> push(addr(sa))
+                sess |> push(addr(sb))
+            }
+            var cur <- [cura, curb]
+            eval_batch_(trg, ws, sess, cur)
+            t |> success(metal_decode_stats().decodes - de1 >= 2l,
+                "{tag} batch: per-row fallback serves each row on the GPU decode path")
+            select_decode_override("")
+            select_prefill_override("")
+            set_metal_prefill_min_npos(64l)
+            sess |> clear()   // drop the borrowed handles: delete of array<T?> cascades to the pointees
+            unsafe {
+                delete ws
+                delete sess
+            }
+            delete cur
+            delete sa
+            delete sb
+        }
+        t |> success(metal_prefill_stats().prefills - pf0 > 0l, "{tag} prefill: ENGAGES on the GPU")
+        t |> success(metal_decode_stats().decodes - de0 > 0l, "{tag} decode: ENGAGES on the GPU")
+        t |> equal(metal_batch_decode_stats().steps - ba0, 0l)
+        let prompt <- encode(tr, counting_prompt(1, 30), true, false)
+        var cpu_ids : array<int64>
+        var gpu_ids : array<int64>
+        with_job_que() {
+            setup_dasllama_jobque()
+            var s = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
+            let ids <- generate(tr, s, prompt, length(prompt) + 8)
+            cpu_ids := ids
+            delete s
+            select_decode_override("metal")
+            select_prefill_override("metal")
+            set_metal_prefill_min_npos(1l)
+            var s2 = make_run_state(trg.config, KVDtype.f16, KVDtype.f16)
+            let ids2 <- generate(trg, s2, prompt, length(prompt) + 8)
+            gpu_ids := ids2
+            delete s2
+            set_metal_prefill_min_npos(64l)
+            select_decode_override("")
+            select_prefill_override("")
+        }
+        t |> success(same(cpu_ids, gpu_ids),
+            "{tag}: metal-overrides generate matches the CPU truth token-for-token")
+        delete cpu_ids
+        delete gpu_ids
+        if (cont_tol > 0.0) {
+            cont_logits_cell(t, tr, trg, tag, cont_tol)
+        }
+        delete trg
+        delete tr
+    }
+}
+
+[unused_argument(t, path)]   // off-Apple the gated body is empty
+def private qwen2moe_row(t : T?; path : string) {
+    // qwen2moe (Qwen1.5-MoE-A2.7B): std attention + softmax-no-renorm select (gmode 2) + the
+    // sigmoid-gated shared expert. Decode + prefill ENGAGE; batch DECLINES by design (shexp
+    // has no batch arm) — the decline cell runs on the PLANAR model: the blob twin's CPU
+    // batch fallback would trip the blob-only panic (std attention runs the CPU batch stack).
+    static_if (typeinfo builtin_module_exists(das_metal)) {
+        if (!family_on(t, "qwen2moe") || !arm_on(t, "fam-qwen2moe") || !model_available(t, path)) {
+            return
+        }
+        var tr <- load_model(path, QuantMode.q8)
+        tr.config.seq_len = min(tr.config.seq_len, 512l)
+        let derived = metal_needs(tr)
+        t |> success((uint(derived) & uint(MetalNeed.neox | MetalNeed.qkv_bias)) == uint(MetalNeed.neox | MetalNeed.qkv_bias),
+            "qwen2moe: metal_needs derives neox|qkv_bias (got {derived})")
+        var trg <- blob_twin(t, path, 512l)
+        let c = trg.config
+        let vocab = c.vocab_size
+        let pf0 = metal_prefill_stats().prefills
+        let de0 = metal_decode_stats().decodes
+        let ba0 = metal_batch_decode_stats().steps
+        var bad0 <- metal_batch_decode_declines()
+        with_job_que() {
+            setup_dasllama_jobque()
+            var sa = make_run_state(c, KVDtype.f16, KVDtype.f16)
+            var sb = make_run_state(c, KVDtype.f16, KVDtype.f16)
+            let pa <- encode(trg, counting_prompt(1, 40), true, false)
+            let pb <- encode(trg, counting_prompt(5, 44), true, false)
+            t |> success(select_prefill_override("metal"), "qwen2moe: prefill override registered")
+            t |> success(select_decode_override("metal"), "qwen2moe: decode override registered")
+            set_metal_prefill_min_npos(1l)
+            eval_(trg, sa, pa)
+            eval_(trg, sb, pb)
+            var cura = greedy_top(sa.logits, vocab)
+            for (_i in range(2)) {
+                var one <- [cura]
+                eval_(trg, sa, one)
+                delete one
+                cura = greedy_top(sa.logits, vocab)
+            }
+            // batch decline cell on the PLANAR model: the gate records `graph`, CPU serves
+            var sc = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
+            var sd = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
+            eval_(tr, sc, pa)
+            eval_(tr, sd, pb)
+            var ws <- create_batch_workspace_(tr)
+            var sess : array<Session?>
+            unsafe {
+                sess |> push(addr(sc))
+                sess |> push(addr(sd))
+            }
+            var cur <- [greedy_top(sc.logits, vocab), greedy_top(sd.logits, vocab)]
+            eval_batch_(tr, ws, sess, cur)
+            select_decode_override("")
+            select_prefill_override("")
+            set_metal_prefill_min_npos(64l)
+            sess |> clear()   // drop the borrowed handles: delete of array<T?> cascades to the pointees
+            unsafe {
+                delete ws
+                delete sess
+            }
+            delete cur
+            delete sa
+            delete sb
+            delete sc
+            delete sd
+        }
+        t |> success(metal_prefill_stats().prefills - pf0 > 0l, "qwen2moe prefill: ENGAGES on the GPU")
+        t |> success(metal_decode_stats().decodes - de0 > 0l, "qwen2moe decode: ENGAGES on the GPU")
+        var bad <- metal_batch_decode_declines()
+        t |> equal(metal_batch_decode_stats().steps - ba0, 0l)
+        t |> success((bad?["graph"] ?? 0l) - (bad0?["graph"] ?? 0l) > 0l,
+            "qwen2moe batch: declines with reason 'graph' (no shexp batch arm)")
+        delete bad0
+        delete bad
+        let prompt <- encode(tr, counting_prompt(1, 30), true, false)
+        var cpu_ids : array<int64>
+        var gpu_ids : array<int64>
+        with_job_que() {
+            setup_dasllama_jobque()
+            var s = make_run_state(tr.config, KVDtype.f16, KVDtype.f16)
+            let ids <- generate(tr, s, prompt, length(prompt) + 8)
+            cpu_ids := ids
+            delete s
+            select_decode_override("metal")
+            select_prefill_override("metal")
+            set_metal_prefill_min_npos(1l)
+            var s2 = make_run_state(trg.config, KVDtype.f16, KVDtype.f16)
+            let ids2 <- generate(trg, s2, prompt, length(prompt) + 8)
+            gpu_ids := ids2
+            delete s2
+            set_metal_prefill_min_npos(64l)
+            select_decode_override("")
+            select_prefill_override("")
+        }
+        t |> success(same(cpu_ids, gpu_ids),
+            "qwen2moe: metal-overrides generate matches the CPU truth token-for-token")
+        delete cpu_ids
+        delete gpu_ids
+        cont_logits_cell(t, tr, trg, "qwen2moe-a2.7b/q8/f16", 4.0)
+        delete trg
+        delete tr
+    }
+}
+
+[unused_argument(t, path)]   // off-Apple the gated body is empty
+def private gemma4moe_row(t : T?; path : string) {
+    // gemma4-26B-A4B (Wave C stage 3): the parallel dense-shared + routed MoE graph. TOKEN
+    // parity is NOT a valid instrument here (wave ruling): the CPU router's double norm is an
+    // inverse TEMPERATURE on the expert softmax and the model amplifies ANY float-class
+    // difference to ~2.5 logits/step (the CPU's own f32-router run differs identically) — so
+    // the cells are ENGAGE + shallow logits TOLERANCES (measured noise 2.1 / 5.7; bars ~3x).
+    // Serial two-phase: CPU truths on the planar load, then the blob twin (27GB x2 resident
+    // would flirt with the box) — 26.9GB > the 6GiB tier, DASLLAMA_PARITY_FULL-gated.
+    static_if (typeinfo builtin_module_exists(das_metal)) {
+        if (!family_on(t, "gemma4moe") || !arm_on(t, "fam-gemma4moe") || !model_available(t, path)) {
+            return
+        }
+        var tr <- load_model(path, QuantMode.q8)
+        tr.config.seq_len = min(tr.config.seq_len, 512l)
+        let c = tr.config
+        t |> success(c.moe && c.moe_dense_shexp && c.n_expert == 128l && c.n_expert_used == 8l,
+            "gemma4moe-26b: MoE geometry loads (ne={c.n_expert} k={c.n_expert_used} nfe={c.n_ff_exp})")
+        let derived = metal_needs(tr)
+        let expected = MetalNeed.neox | MetalNeed.qk_norm | MetalNeed.sliding | MetalNeed.v_norm
+        t |> success((derived & expected) == expected,
+            "gemma4moe-26b: metal_needs derives {expected} (got {derived})")
+        let vocab = c.vocab_size
+        var prompt <- encode(tr, counting_prompt(1, 20), true, false)
+        var lg0 : array<float>
+        var lg1 : array<float>
+        var t0 = 0l
+        with_job_que() {
+            setup_dasllama_jobque()
+            var s = make_run_state(c, KVDtype.f16, KVDtype.f16)
+            eval_(tr, s, prompt)
+            lg0 := s.logits
+            t0 = greedy_top(s.logits, vocab)
+            var one <- [t0]
+            eval_(tr, s, one)
+            delete one
+            lg1 := s.logits
+            delete s
+        }
+        delete tr
+        var trg <- blob_twin(t, path, 512l)
+        matrix_cell(t, trg, KVDtype.f16, "gemma4moe-26b/q8/f16", "", "", "")
+        var mpf = 0.0
+        var m1 = 0.0
+        var served = 0l
+        with_job_que() {
+            setup_dasllama_jobque()
+            select_prefill_override("metal")
+            select_decode_override("metal")
+            set_metal_prefill_min_npos(1l)
+            let pf0 = metal_prefill_stats().prefills
+            let d0 = metal_decode_stats().decodes
+            var s = make_run_state(trg.config, KVDtype.f16, KVDtype.f16)
+            eval_(trg, s, prompt)
+            for (v in range64(vocab)) {
+                mpf = max(mpf, abs(lg0[v] - s.logits[v]))
+            }
+            var one <- [t0]
+            eval_(trg, s, one)
+            delete one
+            for (v in range64(vocab)) {
+                m1 = max(m1, abs(lg1[v] - s.logits[v]))
+            }
+            served = (metal_prefill_stats().prefills - pf0) + (metal_decode_stats().decodes - d0)
+            set_metal_prefill_min_npos(64l)
+            select_prefill_override("")
+            select_decode_override("")
+            delete s
+        }
+        t |> success(served == 2l, "gemma4moe-26b: GPU prefill + forced step both served ({served}/2)")
+        t |> success(mpf <= 8.0, "gemma4moe-26b: post-prefill logits within 8.0 of the CPU truth (measured {mpf})")
+        t |> success(m1 <= 16.0, "gemma4moe-26b: one forced step within 16.0 of the CPU truth (measured {m1})")
+        to_log(LOG_INFO, "gemma4moe-26b tolerance cells: post-prefill maxd={mpf} (tol 8), forced step maxd={m1} (tol 16)\n")
+        delete lg0
+        delete lg1
+        delete prompt
+        delete trg
+    }
+}
+
+[unused_argument(t, path)]   // off-Apple the gated body is empty
+def private gptoss_row(t : T?; path : string) {
+    // gpt-oss-20b (Wave C stage 4): MXFP4 expert stacks + attention sinks + softmax_weight
+    // routing + router/expert biases + swiglu_oai + wo out-bias. ENGAGE cells + shallow
+    // logits tolerances (measured noise 0.23/0.29 — the tightest MoE envelope; bars ~8x).
+    // 12GB > the 6GiB tier — DASLLAMA_PARITY_FULL-gated; serial two-phase like the 26B row.
+    static_if (typeinfo builtin_module_exists(das_metal)) {
+        if (!family_on(t, "gptoss") || !arm_on(t, "fam-gptoss") || !model_available(t, path)) {
+            return
+        }
+        var tr <- load_model(path, QuantMode.q8)
+        tr.config.seq_len = min(tr.config.seq_len, 512l)
+        let c = tr.config
+        t |> success(c.moe && tr.experts_mx4 && c.attn_sinks && c.n_expert == 32l && c.n_expert_used == 4l,
+            "gptoss-20b: MoE geometry loads (mx4={tr.experts_mx4} sinks={c.attn_sinks} ne={c.n_expert} k={c.n_expert_used})")
+        let derived = metal_needs(tr)
+        let expected = MetalNeed.neox | MetalNeed.sliding | MetalNeed.sinks | MetalNeed.out_bias
+        t |> success((derived & expected) == expected,
+            "gptoss-20b: metal_needs derives {expected} (got {derived})")
+        let vocab = c.vocab_size
+        var prompt <- encode(tr, counting_prompt(1, 20), true, false)
+        var lg0 : array<float>
+        var lg1 : array<float>
+        var t0 = 0l
+        with_job_que() {
+            setup_dasllama_jobque()
+            var s = make_run_state(c, KVDtype.f16, KVDtype.f16)
+            eval_(tr, s, prompt)
+            lg0 := s.logits
+            t0 = greedy_top(s.logits, vocab)
+            var one <- [t0]
+            eval_(tr, s, one)
+            delete one
+            lg1 := s.logits
+            delete s
+        }
+        delete tr
+        var trg <- blob_twin(t, path, 512l)
+        matrix_cell(t, trg, KVDtype.f16, "gptoss-20b/mx4/f16", "", "", "")
+        var mpf = 0.0
+        var m1 = 0.0
+        var served = 0l
+        with_job_que() {
+            setup_dasllama_jobque()
+            select_prefill_override("metal")
+            select_decode_override("metal")
+            set_metal_prefill_min_npos(1l)
+            let pf0 = metal_prefill_stats().prefills
+            let d0 = metal_decode_stats().decodes
+            var s = make_run_state(trg.config, KVDtype.f16, KVDtype.f16)
+            eval_(trg, s, prompt)
+            for (v in range64(vocab)) {
+                mpf = max(mpf, abs(lg0[v] - s.logits[v]))
+            }
+            var one <- [t0]
+            eval_(trg, s, one)
+            delete one
+            for (v in range64(vocab)) {
+                m1 = max(m1, abs(lg1[v] - s.logits[v]))
+            }
+            served = (metal_prefill_stats().prefills - pf0) + (metal_decode_stats().decodes - d0)
+            set_metal_prefill_min_npos(64l)
+            select_prefill_override("")
+            select_decode_override("")
+            delete s
+        }
+        t |> success(served == 2l, "gptoss-20b: GPU prefill + forced step both served ({served}/2)")
+        t |> success(mpf <= 2.0, "gptoss-20b: post-prefill logits within 2.0 of the CPU truth (measured {mpf})")
+        t |> success(m1 <= 4.0, "gptoss-20b: one forced step within 4.0 of the CPU truth (measured {m1})")
+        to_log(LOG_INFO, "gptoss-20b tolerance cells: post-prefill maxd={mpf} (tol 2), forced step maxd={m1} (tol 4)\n")
+        delete lg0
+        delete lg1
+        delete prompt
+        delete trg
+    }
+}
+
 [unused_argument(t, path)]   // off-Apple the gated body is empty
 def private gemma2_window_row(t : T?; path : string) {
     // sliding-window masking parity: shrink the window post-load (config-driven everywhere —
@@ -1056,6 +1421,32 @@ def test_metal_family_matrix(t : T?) {
             // the q8 twin drives the hetero fixed-B mul_mv rail (a class the k4 row never
             // dispatches); 12.5GB — DASLLAMA_PARITY_FULL-gated like the row above
             gemma4_hetero_q8_row(t, path_join(models_dir(), "gemma-4-12B-it-Q8_0.gguf"))
+            // qwen3moe (Wave C): qwen3 attention + GPU MoE routing — router + top-k select +
+            // expert-indexed GEMVs (decode/batch) + gathered mul_mm prefill (k4 gate/up, k6
+            // down). All three paths ENGAGE; 18.5GB > the 6GiB tier — DASLLAMA_PARITY_FULL-gated.
+            family_cells(t, path_join(models_dir(), "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf"), "qwen3moe",
+                "qwen3moe-30b/k4/f16", uint(MetalNeed.neox | MetalNeed.qk_norm | MetalNeed.qd_neq_dim),
+                "", KVDtype.f16, 6.0)
+            // gemma4-26B-A4B (Wave C stage 3): the parallel dense-shared + routed graph —
+            // ENGAGE cells + shallow logits tolerances (see the row's ruling comment)
+            gemma4moe_row(t, path_join(models_dir(), "gemma-4-26B-A4B-it-Q8_0.gguf"))
+            // gpt-oss-20b (Wave C stage 4): mx4 experts + sinks + softmax_weight + biases
+            gptoss_row(t, path_join(models_dir(), "gpt-oss-20b-mxfp4.gguf"))
+            // qwen35 (Wave D): the Gated-DeltaNet hybrid — 3-in-4 recurrent layers (state
+            // mirror, fused sequential scan) + gated attention (2x-wide Q, partial rope 64/256,
+            // σ out-gate). Decode + prefill serve; batch = per-row fallback (see qwen35_row).
+            qwen35_row(t, path_join(models_dir(), "Qwen3.5-0.8B-Q8_0.gguf"), "qwen35",
+                "qwen35-0.8b/q8/f16", uint(MetalNeed.neox | MetalNeed.qk_norm | MetalNeed.qd_neq_dim |
+                    MetalNeed.partial_rope | MetalNeed.q_gated), 4.0)
+            // qwen35moe (Wave D stage 3): deltanet + grouped MoE + the sigmoid-gated shared
+            // expert + f32-on-disk β/α — the whole-surface hybrid MoE. 22GB > the 6GiB tier —
+            // DASLLAMA_PARITY_FULL-gated.
+            qwen35_row(t, path_join(models_dir(), "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"), "qwen35moe",
+                "qwen35moe-35b/k4/f16", uint(MetalNeed.neox | MetalNeed.qk_norm | MetalNeed.qd_neq_dim |
+                    MetalNeed.partial_rope | MetalNeed.q_gated), 6.0)
+            // qwen2moe (Wave D ride-along): softmax-no-renorm select + sigmoid shexp on std
+            // attention; batch declines by design. 15GB — DASLLAMA_PARITY_FULL-gated.
+            qwen2moe_row(t, path_join(models_dir(), "Qwen1.5-MoE-A2.7B-Chat.Q8_0.gguf"))
             metal_decode_shutdown()
             metal_prefill_shutdown()
             t |> equal(metal_live_object_count(), 0l)
