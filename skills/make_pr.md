@@ -196,12 +196,13 @@ Must return empty. If not, go back to step 4a and add the missing function to a 
 MUST delete cache — cached builds hide errors:
 
 ```bash
-cd d:/Work/daScript/doc
-rm -rf sphinx-build ../site/doc
-d:/Work/daScript/.venv/Scripts/sphinx-build.exe -b html -d sphinx-build source ../site/doc 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | tee /tmp/sphinx_out.txt
+rm -rf doc/sphinx-build site/doc
+sphinx-build -b html -d doc/sphinx-build doc/source site/doc 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | tee /tmp/sphinx_out.txt
 tail -3 /tmp/sphinx_out.txt
 grep -iE "warning:|error:" /tmp/sphinx_out.txt
 ```
+
+Use `sphinx-build` from PATH. If unavailable, install with `pip install sphinx` (or `python -m pip install sphinx`) and re-run. The repo `.venv/` is not maintained — don't rely on it.
 
 Must say `build succeeded.` with **zero** warnings and errors. The `grep` must return empty.
 
@@ -239,11 +240,26 @@ CI's `extended_checks` job runs `./bin/Release/daslang ./das-fmt/dasfmt.das -- -
 
 **Before pushing:** mentally format named-arg constructor / call sites with spaces around `=`. If CI `extended_checks` fails on a format diff after MCP said "already formatted", fix the spacing and re-push (or amend, on a squashed branch).
 
-## 5.5. `.md` stop-rule — STOP before push if any `.md` changed
+## 5.5. Review the blind-mouse query log
 
-If `git diff --name-only origin/master..HEAD` includes ANY `.md` file (CLAUDE.md, `skills/`, `**/README.md`, design docs like `API_REWORK.md`), **STOP before `git push`**. List each modified `.md` with a one-line summary of what changed, and ask the user to review. Do not push until they greenlight.
+If you use blind-mouse, take 60 seconds to close the loop before pushing — work is final, you know what was learned, diff is locked. Skip if you don't keep a personal Q&A cache.
 
-**Why:** doc edits direct future Claude behavior. Code edits get caught by tests; doc edits don't. Silent .md diffs in a PR are not OK — every .md change in a PR must be acknowledged by the user before it goes live.
+```bash
+bin/Release/daslang.exe utils/mouse/main.das -- log --misses
+```
+
+For each recent miss:
+- **Did this PR (or your session research) answer it?** If yes — `mouse__add` it now (or `mouse add` from CLI). Next session won't redo the work.
+- **Did you _almost_ ask mouse this session but didn't?** Try asking now — misses-you-skipped don't show up in `--misses`. If the work you just did has the answer, add it.
+
+```bash
+bin/Release/daslang.exe utils/mouse/main.das -- log
+```
+
+For recent hits:
+- **Did this PR invalidate a cached answer?** If yes, edit `mouse-data/docs/<slug>.md` directly and bump `last_verified` (or delete if no longer relevant).
+
+This is curation, not verification — the PR doesn't depend on it. Goal: keep the personal cache aligned with what just shipped.
 
 ## 6. Create the PR
 
@@ -264,6 +280,7 @@ Stage, commit, push, and create the PR using GitHub MCP tools or `gh` CLI. Follo
 | AOT tests | `test_aot.exe -use-aot dastest/dastest.das -- --use-aot --test tests` | Same as regular tests |
 | Docs | `das2rst.das` + stubs + Sphinx | Only if daslib/C++ bindings/RST changed |
 | Format | MCP `format_file` with comma-separated list or glob of changed `.das` files (single call) | Only changed files |
+| Mouse log | `mouse log --misses` / `mouse log` | Optional. Add answers for misses, edit cached answers this PR invalidated |
 | `.md` stop | `git diff --name-only origin/master..HEAD \| grep '\.md$'` | If any match: STOP, list changes, ask user to review BEFORE push |
 | PR | GitHub MCP `create_pull_request` or `gh pr create` | — |
 | Review iter | Follow `skills/pr_review_iteration.md` | One round per Copilot pass; convergence in 1-3 rounds is normal |

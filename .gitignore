@@ -13,6 +13,8 @@ build-track/
 build-rwdi/
 build-asan/
 build-ubsan/
+build-linux-asan/
+build-linux/
 # All build binaries stored here
 bin/
 # JIT stores dll's here
@@ -24,6 +26,15 @@ examples/**/*.shared_module
 _aot_generated/
 .vscode/
 .cache/
+
+opencoede.json
+
+# blind-mouse — ignore the regenerable SQLite index, but check in the .md
+# corpus under mouse-data/docs/ so curated answers ship in PRs.
+mouse-data/index.db
+mouse-data/index.db-journal
+mouse-data/*.db-wal
+mouse-data/*.db-shm
 
 modules/dasSFML/libsfml/
 site/
@@ -46,6 +57,7 @@ web/output/.idea/
 yzg.code-workspace
 
 examples/wip.das
+examples/wip_macro.das
 
 utils/dasFormatter/ds_parser.output
 src/parser/ds2_parser.output
@@ -97,3 +109,4 @@ modules/dasStdDlg/dasModuleStdDlg_debug.pdb
 modules/dasUnitTest/dasModuleUnitTest_debug.pdb
 build-ubsan/.ninja_log
 doc/sphinx-build-latex/environment.pickle
+opencode.json

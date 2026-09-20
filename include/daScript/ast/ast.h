@@ -1159,6 +1159,9 @@ namespace das
         static void Initialize();
         static void CollectFileInfo(das::vector<FileInfoPtr> &accesses);
         static void Shutdown( bool dumpHandleLeaks = true );
+        // Runtime-only shutdown — for standalone exes built with `daslang -exe`,
+        // which link libDaScript*_runtime without the fusion engine. See issue #2583.
+        static void ShutdownStandalone( bool dumpHandleLeaks = false );
         static uint64_t CountHandleLeaks();
         static void Reset(bool debAg);
         static void ClearSharedModules();
@@ -1255,6 +1258,7 @@ namespace das
         Module * next = nullptr;
         unique_ptr<FileInfo>    ownFileInfo;
         FileAccessPtr           promotedAccess;
+        static void shutdownInternal ( bool dumpHandleLeaks, bool resetFusion );
     };
 
     #define REGISTER_MODULE(ClassName) \
@@ -1697,6 +1701,7 @@ namespace das
         bool simulate ( Context & context, TextWriter & logs, StackAllocator * sharedStack = nullptr );
         uint64_t getInitSemanticHashWithDep( uint64_t initHash );
         void error ( const string & str, const string & extra, const string & fixme, const LineInfo & at, CompilationError cerr = CompilationError::unspecified );
+        void deduplicateErrors ();
         bool failed() const { return failToCompile || macroException; }
         static ExpressionPtr makeConst ( const LineInfo & at, const TypeDeclPtr & type, vec4f value );
         ExprLooksLikeCall * makeCall ( const LineInfo & at, const string & name );

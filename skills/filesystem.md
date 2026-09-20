@@ -185,6 +185,28 @@ let free_gb = info.free / (1ul << 30ul)
 
 Fields: `capacity`, `free`, `available` (all `uint64`).
 
+## Finding bundled asset files at runtime
+
+For loading data files (fonts, SVGs, configs) that ship next to your `.das` source, use `get_this_module_dir()` from `daslib/module_path` — **never** `dir_name(get_module_file_name(name))`. The latter returns the path baked at compile time, which is wrong in a relocated daspkg-release standalone bundle (`get_module_file_name` returns empty for some standalone exe lookups).
+
+```das
+require daslib/module_path
+
+def load_assets() {
+    let dir = get_this_module_dir()
+    let svg = path_join(dir, "cards.svg")
+    // ...
+}
+```
+
+The macro captures the call-site source-file path at expansion, then a 3-tier resolver walks `<exe_dir>/<rel>` → `<das_root>/<rel>` → `dir_name(baked)`. `<rel>` is the suffix starting at the last `/modules/` segment.
+
+**Project-local code (no `/modules/` in source path)** — e.g. `get_this_module_dir()` called from a user's `main.das` — skips tiers 1+2 (no `<rel>`) and goes to tier 3, which returns `dir_name(baked)` if it still exists on disk (dev) or `<exe_dir>` if it doesn't (relocated bundle). Either way you get an existing directory. Ship project-local assets next to the exe and `path_join(get_this_module_dir(), "asset.png")` works in both dev and shipped bundles.
+
+See [skills/daspkg.md](skills/daspkg.md#L224) for the bundle-shipping side of the same topic.
+
+**Don't call from a top-level `let` initializer** — `-exe` JIT-bakes function pointers in module-init code and ASLR breaks them in standalone exes (issue #2582). Inside any `def` body it's fine.
+
 ## Common gotchas
 
 - **Never split paths with `rfind("/")` and `rfind("\\")` followed by `slice`.** Always `base_name` / `dir_name` / `parent`. The manual form misses Windows backslashes, mishandles trailing separators, and returns the wrong slice when no separator is present. Exception: when the substring you're searching for is a **named component** (e.g. `/modules/`, `/.git/`), normalize once via `to_generic_path(p)` and search for forward slashes only: `rfind(to_generic_path(p), "/modules/")`. The normalize step is what makes the rule "search for `/` only" safe; never search for both `/X/` and `\X\` separately.
@@ -201,10 +223,6 @@ Fields: `capacity`, `free`, `available` (all `uint64`).
 ## Reference
 
 - [daslib/fio.das](daslib/fio.das) — daslang wrapper layer (RAII `fopen`, `_result` variants, `mkdir_rec`, `disk_space`, whole-file `fread`/`fwrite` by path, glob bundle)
-- [src/builtin/module_builtin_fio.cpp:1218-1457](src/builtin/module_builtin_fio.cpp#L1218-L1457) — C++ registrations (the `fio_core` layer)
 - [include/daScript/simulate/aot_builtin_fio.h](include/daScript/simulate/aot_builtin_fio.h) — `FStat`, `DiskSpaceInfo` structs
-- [doc/source/stdlib/handmade/module-fio.rst](doc/source/stdlib/handmade/module-fio.rst) — auto-generated module reference
-- [tests/fio/fio_utils.das](tests/fio/fio_utils.das) — read/write by path, recursive `rmdir`, `_result` variants
-- [tests/fio/glob_test.das](tests/fio/glob_test.das) and [tests/fio/expand_glob_test.das](tests/fio/expand_glob_test.das) — glob primitives + expander/parser tests
 - [tutorials/dasAudio/02_playing_files.das](tutorials/dasAudio/02_playing_files.das) — `fopen` + `fmap` for binary data
 - [skills/glob.md](skills/glob.md) — pathname glob matching, when to use `match_glob` vs `glob_match`, full `expand_glob` / `parse_file_list` cookbook

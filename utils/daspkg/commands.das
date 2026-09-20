@@ -9,11 +9,13 @@ module commands shared public
 
 require daslib/fio
 require strings
+require daslib/strings_boost
 require daslib/json
 require daslib/json_boost
 
 require daslib/ansi_colors
 require daslib/clargs public
+require pugixml/PUGIXML_boost
 
 require lockfile
 require utils
@@ -61,6 +63,9 @@ struct DaspkgArgs {
     @clarg_mutex_group = "color"
     @clarg_doc = "Disable colored output"
     no_color : bool
+
+    @clarg_doc = "Output directory for `release` (default: current directory)"
+    out : string = "."
 }
 
 // Apply parsed flags that flip module-level globals.  Called by main after
@@ -1297,5 +1302,491 @@ def cmd_cleanup(root : string; force : bool; is_global : bool = false) : int {
         }
     }
     log("Cleaned: {removed_dirs} directories, {removed_files} files\n")
+    return 0
+}
+
+// ── release ────────────────────────────────────────────────────────────
+
+// JSON shape produced by `daslang -exe --list-shared-modules <path>` — see
+// `modules/dasLLVM/daslib/llvm_exe.das write_release_deps()`. Field names +
+// types must stay in sync with the writer's structs.
+
+struct private SharedModuleEntry {
+    rel : string                    //!< relative bundle path (modules/<X>/<X>.shared_module); "" if path lacks /modules/
+    abs : string                    //!< absolute path on the build machine
+    das_name : string               //!< daslang-side module name
+}
+
+struct private DasModuleEntry {
+    name : string                   //!< daslang module name
+    file : string                   //!< absolute path to the .das source file
+    package_dir : string            //!< absolute path to the enclosing daspkg package
+}
+
+struct private ReleaseDeps {
+    shared_modules : array<SharedModuleEntry>
+    das_modules : array<DasModuleEntry>
+}
+
+def private read_release_deps(path : string; var deps : ReleaseDeps) : bool {
+    if (!fexist(path)) {
+        return false
+    }
+    var content : string
+    fopen(path, "rb") $(f) {
+        if (f != null) {
+            content = fread(f)
+        }
+    }
+    var error : string
+    var parsed = read_json(content, error)
+    if (parsed == null) {
+        to_log(LOG_ERROR, "release: cannot parse deps JSON: {error}\n")
+        return false
+    }
+    deps = from_JV(parsed, type<ReleaseDeps>)
+    return true
+}
+
+// Bundle path for the standalone exe (daslang -exe appends `.exe` itself).
+def private bundle_exe_path(bundle_dir, bundle_name : string) : string {
+    return path_join(bundle_dir, bundle_name)
+}
+
+// Sanitize one component of a derived CFBundleIdentifier so it satisfies
+// Apple's [A-Za-z0-9.-] rule. Lowercases, replaces every other byte with
+// `-`, collapses runs of `-`, strips leading/trailing `-`. Returns "x"
+// for inputs that yield nothing salvageable so the final id stays valid.
+// Only used for the derived `com.<author>.<name>` default — user-supplied
+// `release_bundle_id()` passes through untouched.
+def private sanitize_bundle_id_part(s : string) : string {
+    let lower = to_lower(s)
+    let raw = build_string() $(var writer) {
+        var prev_dash = false
+        peek_data(lower) $(arr) {
+            for (i in range(length(arr))) {
+                let b = int(arr[i])
+                let is_alnum = (b >= '0' && b <= '9') || (b >= 'a' && b <= 'z')
+                if (is_alnum) {
+                    write_char(writer, b)
+                    prev_dash = false
+                } elif (!prev_dash) {
+                    write_char(writer, '-')
+                    prev_dash = true
+                }
+            }
+        }
+    }
+    var result = raw
+    if (!empty(result) && result |> ends_with("-")) {
+        result = slice(result, 0, length(result) - 1)
+    }
+    if (!empty(result) && result |> starts_with("-")) {
+        result = slice(result, 1)
+    }
+    return empty(result) ? "x" : result
+}
+
+// Minimal macOS .app Info.plist. Built with dasPUGIXML so values are
+// XML-escaped automatically — inputs (bundle_name, exe, bundle_id) are
+// otherwise unrestricted on the XML side. CFPropertyList accepts plist
+// without a DOCTYPE, so we omit it.
+def private build_info_plist(name, exe, bundle_id : string) : string {
+    var out = ""
+    with_doc() $(doc) {
+        doc |> tag("plist") $(var pl) {
+            pl |> attr("version", "1.0")
+            pl |> tag("dict") $(var d) {
+                d |> tag("key", "CFBundleName")
+                d |> tag("string", name)
+                d |> tag("key", "CFBundleExecutable")
+                d |> tag("string", exe)
+                d |> tag("key", "CFBundleIdentifier")
+                d |> tag("string", bundle_id)
+                d |> tag("key", "CFBundlePackageType")
+                d |> tag("string", "APPL")
+                d |> tag("key", "CFBundleVersion")
+                d |> tag("string", "1.0")
+                d |> tag("key", "CFBundleShortVersionString")
+                d |> tag("string", "1.0")
+                d |> tag("key", "NSPrincipalClass")
+                d |> tag("string", "NSApplication")
+                d |> tag("key", "NSHighResolutionCapable")
+                d |> tag("true")
+                d |> tag("key", "NSSupportsAutomaticGraphicsSwitching")
+                d |> tag("true")
+            }
+        }
+        out = to_string(doc)
+    }
+    return out
+}
+
+// Run release() on a dep package and copy its release_include files into the
+// bundle at `<bundle>/modules/<DepName>/<rel>`. Returns 0 on success, non-zero
+// on copy failure (missing release() is NOT an error — dep just contributes nothing).
+def private ship_dep_assets(pkg_dir, bundle_modules_dir : string) : int {
+    let dep_pkg_file = "{pkg_dir}/.das_package"
+    if (!fexist(dep_pkg_file)) {
+        return 0
+    }
+    var dep_spec : PackageReleaseInfo
+    if (!run_das_package_release(dep_pkg_file, dep_spec)) {
+        return 0
+    }
+    if (empty(dep_spec.include_globs) && empty(dep_spec.native_dlls)) {
+        return 0
+    }
+    let dep_name = base_name(pkg_dir)
+    let dep_dst_dir = "{bundle_modules_dir}/{dep_name}"
+    var dep_files : array<string>
+    glob_filtered(pkg_dir, dep_spec.include_globs, dep_spec.exclude_globs) $(rel_path, is_dir) {
+        if (!is_dir) {
+            dep_files |> push_clone(rel_path)
+        }
+    }
+    for (rel in dep_files) {
+        let src = path_join(pkg_dir, rel)
+        let dst = path_join(dep_dst_dir, rel)
+        mkdir_rec(dir_name(dst))
+        var err : string
+        if (!copy_file(src, dst, true, err)) {
+            to_log(LOG_ERROR, "release: copy_file({src} -> {dst}) failed: {err}\n")
+            return 1
+        }
+    }
+    if (!empty(dep_files)) {
+        log("  ship dep `{dep_name}`: {length(dep_files)} file(s)\n")
+    }
+    if (!empty(dep_spec.native_dlls)) {
+        let rc = ship_native_dlls(dep_name, dep_dst_dir, dep_spec.native_dlls)
+        if (rc != 0) {
+            return rc
+        }
+    }
+    return 0
+}
+
+// Copy each declared native shared library from the daslang install tree
+// (`<das_root>/bin/` on Windows, `<das_root>/lib/` on POSIX) into `dst_dir`.
+// Authors declared these via `release_include_dll(...)`; missing files are an
+// error — usually a typo or an out-of-sync install.
+//
+// Resolution order (deterministic so multi-config build trees can't ship the
+// wrong binary nondeterministically):
+//   1. Exact match at `<search_root>/<name>` (an installed layout has this).
+//   2. Build-tree config dirs in fixed preference: Release > RelWithDebInfo >
+//      MinSizeRel > Debug, e.g. `<search_root>/Release/<name>`.
+//   3. Fall through to `**/<name>` and pick the first match.
+def private ship_native_dlls(dep_name, dst_dir : string; native_dlls : array<string>) : int {
+    let platform = get_platform_name()
+    let search_root = (platform == "windows"
+        ? "{get_das_root()}/bin"
+        : "{get_das_root()}/lib")
+    mkdir_rec(dst_dir)
+    for (name in native_dlls) {
+        var found_src = ""
+        // 1. exact path under search_root
+        let exact = path_join(search_root, name)
+        if (fexist(exact)) {
+            found_src = exact
+        }
+        // 2. preferred config dirs
+        if (empty(found_src)) {
+            for (cfg in ["Release", "RelWithDebInfo", "MinSizeRel", "Debug"]) {
+                let candidate = "{search_root}/{cfg}/{name}"
+                if (fexist(candidate)) {
+                    found_src = candidate
+                    break
+                }
+            }
+        }
+        // 3. fall through to a recursive glob (handles nested layouts)
+        if (empty(found_src)) {
+            glob(search_root, "**/{name}") <| $(rel_path, is_dir) {
+                if (!is_dir && empty(found_src)) {
+                    found_src = path_join(search_root, rel_path)
+                }
+            }
+        }
+        if (empty(found_src)) {
+            to_log(LOG_ERROR, "release: dep `{dep_name}` declared release_include_dll(\"{name}\") but no match under `{search_root}` (tried {search_root}/{name}, {search_root}/<config>/{name}, and **/{name})\n")
+            return 1
+        }
+        // dir_name(dst) so a `name` like `subdir/lib.so` still works -- defensive,
+        // not endorsed by the API docs which imply a leaf filename.
+        let dst = path_join(dst_dir, name)
+        mkdir_rec(dir_name(dst))
+        var err : string
+        if (!copy_file(found_src, dst, true, err)) {
+            to_log(LOG_ERROR, "release: copy_file({found_src} -> {dst}) failed: {err}\n")
+            return 1
+        }
+        log("  ship dep `{dep_name}` native: {name}\n")
+    }
+    return 0
+}
+
+// Copy of `daslib/command_line.get_das_exe()`. We can't require command_line
+// here because `commands` is a shared module and command_line is not.
+// Returns the absolute path to the daslang interpreter, derived from argv[0]
+// (works whether daspkg runs interpreted or as a future standalone exe).
+def private get_daslang_path() : string {
+    let args <- get_command_line_arguments()
+    if (empty(args)) {
+        return ""
+    }
+    var exe = replace(args[0], "\\", "/")
+    if (find(exe, ":") < 0 && first_character(exe) != '/') {
+        exe = "{get_das_root()}/{exe}"
+    }
+    let last_slash = rfind(exe, "/")
+    let dir = last_slash >= 0 ? slice(exe, 0, last_slash + 1) : ""
+    let interpreter = get_platform_name() == "windows" ? "daslang.exe" : "daslang"
+    let joined = "{dir}{interpreter}"
+    return get_platform_name() == "windows" ? replace(joined, "/", "\\") : joined
+}
+
+def cmd_release(root : string; out_dir : string) : int {
+    let das_package = "{root}/.das_package"
+    if (!fexist(das_package)) {
+        to_log(LOG_ERROR, "release: no .das_package in {root}\n")
+        return 1
+    }
+    var spec : PackageReleaseInfo
+    if (!run_das_package_release(das_package, spec)) {
+        to_log(LOG_ERROR, "release: cannot run release() in {das_package}\n")
+        return 1
+    }
+    if (empty(spec.main_script)) {
+        // run_das_package_release returns true with an empty spec both when
+        // release() is missing entirely and when it's present but never calls
+        // release_main(). Phrase the error to cover both.
+        to_log(LOG_ERROR, "release: {das_package} has no release() hook, or release() didn't call release_main(<script.das>)\n")
+        return 1
+    }
+
+    // Pick bundle name: explicit release_name() > package_name() > root dir name.
+    var pkg : PackageMeta
+    let have_pkg = run_das_package_meta(das_package, pkg)
+    var bundle_name = spec.name
+    if (empty(bundle_name)) {
+        if (have_pkg && !empty(pkg.pkg_name)) {
+            bundle_name = pkg.pkg_name
+        } else {
+            bundle_name = base_name(get_full_file_name(root))
+        }
+    }
+    // bundle_name flows from .das_package metadata (release_name() /
+    // package_name()) — possibly authored by a downloaded dep. Reject path
+    // separators / `..` so a hostile or typo'd name can't escape out_dir
+    // when path_join + force_rmdir run below.
+    if (!is_safe_pkg_name(bundle_name)) {
+        to_log(LOG_ERROR, "Error: unsafe bundle name `{bundle_name}` (must not contain path separators or be `.` / `..`)\n")
+        return 1
+    }
+    // macOS: emit a clickable .app bundle. The exe + dylibs + modules go into
+    // Contents/MacOS/, so all subsequent ship logic uses bundle_dir unchanged
+    // and the rpath / module resolver still see the same <exe_dir> layout.
+    let is_mac_app = get_platform_name() == "darwin"
+    var app_root = ""
+    if (is_mac_app) {
+        app_root = path_join(out_dir, "{bundle_name}.app")
+    }
+    var bundle_dir = ""
+    if (is_mac_app) {
+        bundle_dir = path_join(app_root, "Contents/MacOS")
+    } else {
+        bundle_dir = path_join(out_dir, bundle_name)
+    }
+    var cleanup_target = bundle_dir
+    if (is_mac_app) {
+        cleanup_target = app_root
+    }
+    if (fexist(cleanup_target)) {
+        force_rmdir(cleanup_target)
+    }
+    mkdir_rec(bundle_dir)
+
+    // 1. Build the standalone exe; `--list-shared-modules` writes the deps JSON
+    //    (auto-detected dylibs + transitive .das_package list) as a side effect.
+    //    `--force-shared-module <name>` passes each release_shared_module(name)
+    //    to daslang; lookup happens there so the full registry is available
+    //    (when daspkg itself is compiled standalone, its registry would only
+    //    contain dylibs daspkg's own code references — too narrow).
+    let exe_path = bundle_exe_path(bundle_dir, bundle_name)
+    run_cmd_counter ++
+    let deps_file = "{get_das_root()}/_daspkg_release_deps_{run_cmd_counter}.json"
+    let main_path = path_join(root, spec.main_script)
+    var output : string
+    let daslang = get_daslang_path()
+    let force_args = build_string() $(var writer) {
+        for (name in spec.forced_modules) {
+            writer |> write(" --force-shared-module \"")
+            writer |> write(name)
+            writer |> write("\"")
+        }
+    }
+    let cmd = "\"{daslang}\" -exe -output \"{exe_path}\" --list-shared-modules \"{deps_file}\"{force_args} \"{main_path}\""
+    let rc = run_cmd(cmd, output)
+    if (rc != 0) {
+        to_log(LOG_ERROR, "release: daslang -exe failed (rc={rc}):\n{output}\n")
+        if (fexist(deps_file)) {
+            remove(deps_file)
+        }
+        return 1
+    }
+    // daslang -exe writes <exe_path>.exe (the runnable binary) and <exe_path>.o
+    // (a build-time object file). Drop the .o — it's not needed at runtime.
+    let obj_path = "{exe_path}.o"
+    if (fexist(obj_path)) {
+        remove(obj_path)
+    }
+    // macOS .app: drop the .exe extension (Mac convention). Info.plist's
+    // CFBundleExecutable matches the renamed binary.
+    if (is_mac_app) {
+        let actual_exe = "{exe_path}.exe"
+        var rerr : string
+        if (!rename(actual_exe, exe_path, rerr)) {
+            to_log(LOG_ERROR, "release: cannot rename {actual_exe} -> {exe_path}: {rerr}\n")
+            return 1
+        }
+    }
+
+    // 2. Parse deps JSON, ship dylibs at the relative path the exe expects.
+    //    The writer has already merged force-included modules into shared_modules,
+    //    so we just iterate.
+    var deps : ReleaseDeps
+    if (!read_release_deps(deps_file, deps)) {
+        to_log(LOG_ERROR, "release: cannot read deps file at {deps_file}\n")
+        remove(deps_file)
+        return 1
+    }
+    remove(deps_file)
+    for (e in deps.shared_modules) {
+        if (empty(e.rel)) {
+            to_log(LOG_WARNING, "release: skipping module `{e.das_name}` (no /modules/ in `{e.abs}`)\n")
+            continue
+        }
+        let dst = path_join(bundle_dir, e.rel)
+        mkdir_rec(dir_name(dst))
+        var err : string
+        if (!copy_file(e.abs, dst, true, err)) {
+            to_log(LOG_ERROR, "release: copy_file({e.abs} -> {dst}) failed: {err}\n")
+            return 1
+        }
+        log("  ship: {e.rel}\n")
+    }
+
+    // 2.5 Ship daslang runtime dylibs next to the exe. Without these the bundle
+    //     dyld-loads via the build-machine fallback rpath and crashes on relocation.
+    //     The exe's primary rpath is @executable_path / $ORIGIN, so any .{dylib,so,dll}
+    //     named libDaScriptDyn* (or its libliblib... cmake variant) shipped here
+    //     resolves at runtime. CMake puts the RUNTIME artifact (Windows .dll) in
+    //     `<das_root>/bin`, while LIBRARY artifacts (.dylib / .so) go in
+    //     `<das_root>/lib` — search the correct dir per platform.
+    let platform = get_platform_name()
+    let runtime_lib_dir = (platform == "windows"
+        ? "{get_das_root()}/bin"
+        : "{get_das_root()}/lib")
+    // Patterns are `**/...` so the recursive walk crosses config subdirs
+    // (Visual Studio / Xcode put the artifact in `bin/Release/`, not `bin/`).
+    let runtime_glob = (platform == "windows" ? "**/libDaScriptDyn*.dll"
+        : platform == "darwin" ? "**/*libDaScriptDyn*.dylib"
+        : "**/*libDaScriptDyn*.so")
+    var runtime_copy_failed = false
+    var runtime_copies = 0
+    glob(runtime_lib_dir, runtime_glob) $(rel_path, is_dir) {
+        if (is_dir) {
+            return
+        }
+        let src = path_join(runtime_lib_dir, rel_path)
+        let dst = path_join(bundle_dir, base_name(rel_path))
+        var err : string
+        if (!copy_file(src, dst, true, err)) {
+            to_log(LOG_ERROR, "release: copy_file({src} -> {dst}) failed: {err}\n")
+            runtime_copy_failed = true
+            return
+        }
+        runtime_copies += 1
+        log("  ship runtime: {base_name(rel_path)}\n")
+    }
+    if (runtime_copy_failed) {
+        return 1
+    }
+    if (runtime_copies == 0) {
+        to_log(LOG_ERROR, "release: no daslang runtime libs matched `{runtime_glob}` under `{runtime_lib_dir}`; bundle would not load on a relocated machine\n")
+        return 1
+    }
+
+    // 3. Transitive dep traversal — for each unique dep .das_package (excluding
+    //    the project's own root), run release() and copy its release_include
+    //    files to <bundle>/modules/<DepName>/<rel>.
+    let project_root_abs = get_full_file_name(root)
+    var seen_pkg_dirs : table<string; bool>
+    seen_pkg_dirs[project_root_abs] = true
+    let bundle_modules_dir = path_join(bundle_dir, "modules")
+    for (dm in deps.das_modules) {
+        let pkg_abs = get_full_file_name(dm.package_dir)
+        if (key_exists(seen_pkg_dirs, pkg_abs)) {
+            continue
+        }
+        seen_pkg_dirs[pkg_abs] = true
+        let rc2 = ship_dep_assets(pkg_abs, bundle_modules_dir)
+        if (rc2 != 0) {
+            return rc2
+        }
+    }
+
+    // 4. Glob the project's own assets per spec, copy preserving relative paths.
+    var asset_files : array<string>
+    glob_filtered(root, spec.include_globs, spec.exclude_globs) $(rel_path, is_dir) {
+        if (!is_dir) {
+            asset_files |> push_clone(rel_path)
+        }
+    }
+    for (rel_path in asset_files) {
+        let src = path_join(root, rel_path)
+        let dst = path_join(bundle_dir, rel_path)
+        mkdir_rec(dir_name(dst))
+        var err : string
+        if (!copy_file(src, dst, true, err)) {
+            to_log(LOG_ERROR, "release: copy_file({src} -> {dst}) failed: {err}\n")
+            return 1
+        }
+    }
+    if (!empty(asset_files)) {
+        log("  shipped {length(asset_files)} project asset file(s)\n")
+    }
+    // Project-declared native deps land next to the exe (the project has no
+    // .shared_module to colocate with — its deps are loaded directly by the exe).
+    if (!empty(spec.native_dlls)) {
+        let rc3 = ship_native_dlls(bundle_name, bundle_dir, spec.native_dlls)
+        if (rc3 != 0) {
+            return rc3
+        }
+    }
+
+    // 5. macOS .app: write Contents/Info.plist. Bundle ID source priority:
+    //    explicit release_bundle_id() > derived com.<sanitized-author>.<sanitized-name>
+    //    > com.daspkg.<sanitized-name>. Apple requires CFBundleIdentifier to use
+    //    only [A-Za-z0-9.-], so the derived default sanitizes both pieces;
+    //    user-supplied release_bundle_id() passes through untouched.
+    if (is_mac_app) {
+        var bundle_id = spec.bundle_id
+        if (empty(bundle_id)) {
+            let author_raw = (have_pkg && !empty(pkg.author)) ? pkg.author : "daspkg"
+            bundle_id = "com.{sanitize_bundle_id_part(author_raw)}.{sanitize_bundle_id_part(bundle_name)}"
+        }
+        let plist_path = path_join(app_root, "Contents/Info.plist")
+        if (!fwrite(plist_path, build_info_plist(bundle_name, bundle_name, bundle_id))) {
+            to_log(LOG_ERROR, "release: cannot write {plist_path}\n")
+            return 1
+        }
+        log("  wrote: Contents/Info.plist (CFBundleIdentifier={bundle_id})\n")
+        log("Released to: {app_root}\n")
+    } else {
+        log("Released to: {bundle_dir}\n")
+    }
     return 0
 }

@@ -342,10 +342,15 @@ def describeCppTypeEx(typeDecl : TypeDeclPtr;
             }
         } elif (baseType == Type.tStructure) {
             if (typeDecl.structType != null) {
+                // Elaborated-type-specifier (`struct X`) keeps GCC's -Wchanges-meaning
+                // happy when a field name shadows the struct name in the same scope —
+                // e.g. `struct User { TTuple<...,struct Profile> Profile; }`. Valid in
+                // every C++ context where a bare struct name is, including template args
+                // and qualified names.
                 if (typeDecl.structType._module.name.empty()) {
-                    write(writer, "{aotStructName(typeDecl.structType)}")
+                    write(writer, "struct {aotStructName(typeDecl.structType)}")
                 } else {
-                    write(writer, "{aotModuleName(typeDecl.structType._module)}::{aotStructName(typeDecl.structType)}")
+                    write(writer, "struct {aotModuleName(typeDecl.structType._module)}::{aotStructName(typeDecl.structType)}")
                 }
             } else {
                 write(writer, "DAS_COMMENT(unspecified structure) ");
@@ -2935,7 +2940,7 @@ class public CppAot : AstVisitor {
         tab ++;
         if (!expr.makeStructFlags.isNewHandle) {
             if (!needTempSrc(expr)) {
-                let expr_type = describeCppType(expr._type, DescribeConfig(skip_ref = true, cross_platform = cross_platform));
+                let expr_type = describeCppType(expr._type, DescribeConfig(skip_ref = true, skip_const = true, cross_platform = cross_platform));
                 write(*ss, "{tabs()}{expr_type} {mksName(expr)}");
                 if (expr.constructor != null) {
                     write(*ss, " = ");
@@ -3990,11 +3995,12 @@ def public compile_and_simulate(input : string, var access; var mg : ModuleGroup
     set_aot();
     compile_file(input, access, mg, cop) $(ok; var program : smart_ptr<Program>; issues) {
         if (!ok) {
-            print("failed to compile {input}\n{issues}\n")
+            to_log(LOG_ERROR, "failed to compile {input}\n{issues}\n")
             return
         }
         simulate(program) $(sok; var pctx : smart_ptr<Context>; serrors) {
             if (!sok) {
+                to_log(LOG_ERROR, "failed to simulate {input}\n{serrors}\n")
                 panic("Failed to simulate {serrors}")
             }
             blk(program, pctx)

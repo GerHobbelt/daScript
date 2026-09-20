@@ -153,6 +153,9 @@ part re-uses the same [sql_table] from Part 1.
     NOT EXISTS / IN / NOT IN, correlated and uncorrelated. Introduces:
     why negated names exist (`!expr` isn't AST-walkable — see
     API_REWORK pattern note). Mockup: [24-subqueries.das](tutorial-mockup/24-subqueries.das.mockup).
+    The captured-runtime-collection form of `_in` / `_not_in` (lowering
+    to `IN (SELECT value FROM json_each(?))`) ships as a separate
+    tutorial — see #42 below.
 18. **NULL handling — `Option<T>` everywhere** — nullable columns typed
     as `Option<T>` in the struct, `_.Col |> is_some()` / `is_none()` in
     predicates emit IS NOT NULL / IS NULL, `|> unwrap_or(x)` emits
@@ -310,12 +313,13 @@ Everything a real app needs once it leaves the developer's machine.
     type<T>)` + `[sql_table(legacy=true)]` + `name=` overloads on
     `create_table` / `insert_to`. Concurrency via SQLite RESERVED lock
     (one transaction per call, α-shape). Permanent NO on rollback /
-    migrate-to-version. Ships in **optional** `daslib/sql_migrate`
+    migrate-to-version. Ships in **optional** `daslib/sqlite_migrate`
     sub-module. **Walk locked 2026-05-04;** see
     [API_MIGRATION.md](API_MIGRATION.md). Mockup refreshed:
     [30-migrations.das.mockup](tutorial-mockup/30-migrations.das.mockup).
-    Implementation split into chunks 14a (core + adoption), 14b
-    (typed ALTER), 14c (rebuild).
+    Implementation split into chunks 14a (core + adoption — shipped
+    2026-05-06), 14b (typed ALTER — shipped 2026-05-06), 14c (rebuild
+    — pending).
 33. **PRAGMA tuning** — WAL mode, `busy_timeout`, `foreign_keys`,
     `synchronous`. Ad-hoc `db |> set_pragma(name, value)` /
     `try_set_pragma`, the batch shortcut
@@ -364,6 +368,11 @@ Niche, but tractable once the base is down.
 41. **Triggers** — DB-level callbacks via raw SQL inside migrations.
     Deliberately *no* daslang-side trigger DSL. Per API_REWORK §41.
     Mockup: **no API impact — concept tutorial**.
+42. **`_in` / `_not_in` — captured-collection form** — bind a runtime
+    `array<T>` and lower to `WHERE Col IN (SELECT value FROM json_each(?))`
+    via SQLite's table-valued JSON1. Single bind, any size, plan-cache-
+    friendly (matches EF Core 8's default). NULL-correct `_not_in` on
+    nullable columns via the defensive `OR Col IS NULL` form.
 
 ---
 
@@ -433,7 +442,7 @@ E. **Forward-looking: `dasSQL` abstraction layer** — the roadmap beyond
 | 29 | Column metadata | `29-column_names.das` | **Shipped** (chunk 9); Band 1 `column_info(type<T>) : array<ColumnInfo>` (compile-time walk) + abstract `SqlType` enum + `sqlite_sql_type` dialect renderer; Band 3 raw `PRAGMA table_info` via the typed `query` family |
 | 30 | Listing tables | `30-list_tables.das` | **Shipped** (chunk 9); raw `query` against `sqlite_master`; no abstract `list_tables` helper (catalog spelling diverges per backend) |
 | 31 | Views | `31-views.das` | **Shipped** (chunk 10); `[sql_view(name=...)]` annotation + `_create_view` macro + `drop_view_if_exists`; mutation-path rejection at compile time (predicate form) and runtime (row form) |
-| 32 | Migrations | `30-migrations.das` (refreshed 2026-05-04) | Walk locked 2026-05-04 — see [API_MIGRATION.md](API_MIGRATION.md); chunks 14a/14b/14c queued |
+| 32 | Migrations | `tutorials/sql/43-migrations.das` | **Shipped 14a + 14b** (2026-05-06); spine + typed ALTER (`add_column` / `create_index` / `create_unique_index` / `drop_index_if_exists`). See [API_MIGRATION.md](API_MIGRATION.md). Chunk 14c (struct rebuild) pending. |
 | 33 | PRAGMA tuning | `33-pragma.das` | **Shipped** (chunk 10); `set_pragma` / `try_set_pragma` (string/int64/bool overloads) + `apply_recommended_pragmas` (WAL + busy_timeout + foreign_keys + synchronous=NORMAL) |
 | 34 | Backup + VACUUM | `34-backup_vacuum.das` | **Shipped** (chunk 10); `vacuum` / `vacuum_into` / `optimize` / `integrity_check` / `quick_check` + `backup_to(dest)` / `backup_to(path)` (online Backup API with SQLITE_BUSY/LOCKED retry) |
 | 35 | Streaming results | `35-streaming.das` | **Shipped** (chunk 10); `_each_sql(chain)` returning `iterator<T>`, generator-based; rejects materializing terminals (`_to_array`, `_first`, aggregates); `sqlite3_finalize` runs in `finally` so stmt is released on break/exhaustion/panic |
@@ -443,12 +452,14 @@ E. **Forward-looking: `dasSQL` abstraction layer** — the roadmap beyond
 | 39 | UD SQL functions | `32-sql_functions.das` | **Shipped** (chunk 10); `register_function(db, name, @@fn[, deterministic[, directonly]])` call macro; arity 0..4; arg/return tags derived from function-pointer type; NULL short-circuit; panic recovery via `Context::runWithCatch` |
 | 40 | FTS5 | `39-fts5.das` | Has mockup |
 | 41 | Triggers | — | No-API — concept tutorial |
+| 42 | `_in` / `_not_in` — captured-collection form | `tutorials/sql/44-in_not_in_collections.das` | **Shipped** (2026-05-08); JSON-bridge lowering to `IN (SELECT value FROM json_each(?))` for runtime `array<T>`; defensive `OR IS NULL` for `_not_in` on `Option<T>` columns; subquery form of `_in` / `_not_in` (tutorial 17) unchanged |
 
 **Mockup coverage:** 27 tutorials have a mockup already. 7 need a new mockup
 (mostly in Part 3 — the `_sql` chain deep-dives — plus BLOB round-trip and
 two introspection tutorials). 4 are no-API concept tutorials and don't get
 a mockup by design. 5 concept appendices (A-E) are prose-only reference
-docs.
+docs. Tutorial 42 (captured-collection `_in` / `_not_in`) shipped without
+a prior mockup — extends the subquery form from tutorial 17.
 
 **Inherited-file cross-reference:** see [API_REWORK.md](API_REWORK.md)'s
 per-section headers (`### NN-topic` prefix) for the decision log behind

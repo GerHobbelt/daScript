@@ -798,13 +798,22 @@ extern "C" {
                 : fmt::format_to(cmd, FMT_STRING("\"\"{}\" \"{}\" \"{}\" \"{}\" msvcrt.lib -link {} -OUT:\"{}\" 2>&1\""), linker, objFilePath, runtimeLibrary, compilerLibrary, linkerParam, libraryName);
         #elif defined(__APPLE__)
             const auto linkerParam = isShared ? "-shared " : "";
-            const auto rpath = "-Wl,-rpath," + get_prefix(runtimeLibrary);
+            // @executable_path first → relocated bundle finds dylibs next to the exe;
+            // build-tree path second → dev workflow keeps working without copying dylibs.
+            // The embedded `\" \"` splits the format-string's outer quotes so the linker
+            // sees two distinct -Wl,-rpath flags, not one with an embedded space.
+            const auto rpath = "-Wl,-rpath,@executable_path\" \"-Wl,-rpath," + get_prefix(runtimeLibrary);
             auto result = compilerLibrary.empty()
                 ? fmt::format_to(cmd, FMT_STRING("\"{}\" {} \"{}\" -o \"{}\" \"{}\" \"{}\" 2>&1"), linker, linkerParam, rpath, libraryName, runtimeLibrary, objFilePath)
                 : fmt::format_to(cmd, FMT_STRING("\"{}\" {} \"{}\" -o \"{}\" \"{}\" \"{}\" \"{}\" 2>&1"), linker, linkerParam, rpath, libraryName, runtimeLibrary, compilerLibrary, objFilePath);
         #else
             const auto linkerParam = isShared ? "-shared" : "";
-            const auto rpath = "-Wl,-rpath," + get_prefix(runtimeLibrary);
+            // $ORIGIN first → relocated bundle finds .so next to the exe;
+            // build-tree path second → dev workflow keeps working without copying.
+            // \$ escapes the dollar so popen's shell passes $ORIGIN to ld unexpanded.
+            // The embedded `\" \"` splits the format-string's outer quotes so the linker
+            // sees two distinct -Wl,-rpath flags, not one with an embedded space.
+            const auto rpath = "-Wl,-rpath,\\$ORIGIN\" \"-Wl,-rpath," + get_prefix(runtimeLibrary);
             auto result = compilerLibrary.empty()
                 ? fmt::format_to(cmd, FMT_STRING("\"{}\" {} \"{}\" -o \"{}\" \"{}\" \"{}\" 2>&1"),
                                         linker, linkerParam, rpath, libraryName, objFilePath, runtimeLibrary)
@@ -1039,6 +1048,14 @@ DAS_API void jit_initialize_modules () {
 
 DAS_API void jit_initialize_modules_done () {
     das::Module::Initialize();
+}
+
+// Standalone-exe teardown. Emitted by inject_main right before main returns,
+// so debug agents and modules drain while the runtime is alive. Without this,
+// the static g_DebugAgents map dtor races ref_count_mutex during
+// __cxa_finalize_ranges and terminate() fires (issue #2583).
+DAS_API void jit_shutdown () {
+    das::Module::ShutdownStandalone();
 }
 
 DAS_API void * jit_register_dynamic_module ( const char * path, const char * mod_name ) {

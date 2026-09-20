@@ -42,27 +42,14 @@ def _first_opt(arr : array<auto(TT)>) : Option<TT -const -#> {
 }
 
 def _first(arr : array<auto(TT)>) : TT -const -& {
-    //! Compat-mode fallback: delegates to ``daslib/linq.das`` ``first``,
-    //! which panics with "sequence contains no elements" on empty and
-    //! handles non-copyable ``TT`` via ``clone_to_move``. Inside `_sql(...)`
-    //! the macro intercepts this call before evaluation and emits ` LIMIT 1`
-    //! with the One materializer.
+    //! Compat-mode fallback to ``linq.first`` (panics on empty). Inside ``_sql(...)``
+    //! the macro intercepts and emits ``LIMIT 1`` with the One materializer.
     return first(arr)
 }
 
-
 // ===== to_sql_literal — runtime stringifier for `_create_view` body inlining =====
-//
-// SQLite stores view bodies as text in `sqlite_schema` and rejects `?` placeholders
-// inside `CREATE VIEW`, so any value referenced by a view body must be inlined as a
-// SQL literal at view-creation time. `_create_view` emits `_::to_sql_literal(<expr>)`
-// per bound expression; `_::` resolves at the user's call site, so a user can extend
-// the set with their own one-liner overload (`def to_sql_literal(s : Status) : string => "{int(s)}"`).
-//
-// Defaults cover all numeric primitives, bool, and string. Enums are handled by
-// the `to_sql_literal(auto(TT))` catch-all below (emitted as their underlying
-// integer); other types hit the catch-all's `concept_assert` with a "define a
-// one-line overload in YourType's module" pointer.
+// `_::` resolution lets users extend with a one-line overload in their own module
+// (`def to_sql_literal(s : Status) : string => "{int(s)}"`).
 
 def to_sql_literal(v : int)    : string => "{v}"
 def to_sql_literal(v : int8)   : string => "{v}"
@@ -88,7 +75,6 @@ def to_sql_literal(value : auto(TT)) : string {
         return ""
     }
 }
-
 
 // ===== SqlQuery — accumulator for chain analysis =====
 
@@ -202,9 +188,9 @@ struct private SqlQuery {
     argSourceIdx : array<int>
     dbExpr      : ExpressionPtr
     upsertMode  : bool
-    inView      : bool     //! `_create_view` body context — rejects `[sql_function(directonly=true)]` UDF calls
+    inView      : bool
     hadError    : bool
-    lastError   : string   //! First `pred_fail` message, re-emitted by call_macros if their deeper macro_error gets eaten by AST cascade
+    lastError   : string
     // Multi-Q lowering: phase-order conflict (e.g. `take(n) |> _where(p)`) snapshots
     // the inner subtree's SQL+binds here; outer FROM renders as `(<innerSql>) AS t0`.
     innerSql       : string                 // null/empty = base-table FROM; else nested SELECT body
@@ -503,6 +489,122 @@ def private lookup_arg_source(q : SqlQuery; argName : string) : int {
         }
     }
     return -1
+}
+
+[macro_function]
+def private call_resolved_name(var call : ExprCall?) : string {
+    if (call == null || call.func == null) {
+        return ""
+    }
+    if (call.func.fromGeneric != null) {
+        return string(call.func.fromGeneric.name)
+    }
+    return string(call.func.name)
+}
+
+[macro_function]
+def private emit_in_collection_json_bridge(var collArg : ExpressionPtr; var q : SqlQuery&;
+                                           xSql : string; negated : bool; nullable : bool) : string {
+    // Captured-collection lowering for `_in` / `_not_in`: encode arr as JSON TEXT,
+    // single bind, query via SQLite's table-valued json_each. EF Core 8's default.
+    var rawArg : ExpressionPtr = clone_expression(collArg)
+    var wrapped : ExpressionPtr = qmacro(_::write_json(_::JV($e(rawArg))))
+    if (q.inHaving) {
+        q.havingBindExprs |> push(wrapped)
+    } else {
+        q.bindExprs |> push(wrapped)
+    }
+    if (negated) {
+        // Three-valued logic: `x != NULL` is unknown, so naive NOT IN drops rows
+        // whose column is NULL. Defensive form preserves them on nullable columns.
+        if (nullable) {
+            return "({xSql} NOT IN (SELECT value FROM json_each(?)) OR {xSql} IS NULL)"
+        }
+        return "{xSql} NOT IN (SELECT value FROM json_each(?))"
+    }
+    return "{xSql} IN (SELECT value FROM json_each(?))"
+}
+
+[macro_function]
+def private looks_like_subquery_chain(var arg : ExpressionPtr) : bool {
+    // Walks `arg.arguments[0]` repeatedly; chain shape bottoms out at `select_from(...)`.
+    // Captured arrays / inline literals / user functions returning array<T> never reach it.
+    // Handles both expanded ExprCall (e.g. `select(...)`) and unexpanded ExprCallMacro
+    // (`_select(...)`, `_where(...)`) on intermediate chain links — Mode-2 doesn't deep-walk
+    // into `_in`'s arguments, so we may see either form depending on local expansion order.
+    var cur = arg
+    let max_depth = 32
+    for (_ in range(max_depth)) {
+        if (cur == null) {
+            return false
+        }
+        if (cur is ExprCall) {
+            var call = cur as ExprCall
+            if (call_resolved_name(call) == "select_from") {
+                return true
+            }
+            if (length(call.arguments) == 0) {
+                return false
+            }
+            cur = call.arguments[0]
+        } elif (cur is ExprCallMacro) {
+            var mcall = cur as ExprCallMacro
+            if (mcall.name == "select_from") {
+                return true
+            }
+            if (length(mcall.arguments) == 0) {
+                return false
+            }
+            cur = mcall.arguments[0]
+        } else {
+            return false
+        }
+    }
+    return false
+}
+
+[macro_function]
+def private is_nullable_column_ref(var node : ExpressionPtr; var q : SqlQuery&) : bool {
+    // Matches `_.<Field>` / `<alias>._.<Field>` (mirrors the column-ref qmatch arm in
+    // pred_to_sql) and consults is_option_field_type on the matching struct field.
+    // Returns true on shapes we don't recognize so the caller emits the safer NOT IN
+    // form by default.
+    if (node is ExprRef2Value) {
+        node = (node as ExprRef2Value).subexpr
+    }
+    if (node == null) {
+        return true
+    }
+    var receiver : ExpressionPtr
+    var fieldName : string
+    if (!qmatch(node, $e(receiver).$f(fieldName)).matched
+            || receiver == null || !(receiver is ExprVar)) {
+        return true
+    }
+    let argName = string((receiver as ExprVar).name)
+    var srcIdx = -1
+    if (!empty(q.rootAlias)) {
+        srcIdx = lookup_arg_source(q, argName)
+        if (srcIdx < 0 && argName == "_") {
+            srcIdx = 0
+        }
+    } elif (argName == "_") {
+        srcIdx = 0
+    }
+    if (srcIdx < 0) {
+        return true
+    }
+    let rootT = source_rootType_for_idx(q, srcIdx)
+    if (rootT == null || rootT.structType == null) {
+        return true
+    }
+    var st = rootT.structType
+    for (field in st.fields) {
+        if (field.name == fieldName) {
+            return is_option_field_type(field._type)
+        }
+    }
+    return true
 }
 
 // ===== Chain analysis (walk pipe-composed chain backwards) =====
@@ -2527,6 +2629,13 @@ def private pred_to_sql(var node : ExpressionPtr; var q : SqlQuery&; prog : Prog
                     var firstT = icall.arguments[0]._type
                     if (firstT != null && (firstT.isIterator || firstT.isGoodArrayType)) {
                         let xSql = pred_to_sql(icall.arguments[1], q, prog, at)
+                        return "" if (q.hadError)
+                        // Captured-collection form: arg1 is `array<T>` and not a chain → JSON bridge.
+                        if (!looks_like_subquery_chain(icall.arguments[0])
+                                && firstT.isGoodArrayType) {
+                            let nullable = is_nullable_column_ref(icall.arguments[1], q)
+                            return emit_in_collection_json_bridge(icall.arguments[0], q, xSql, true, nullable)
+                        }
                         var binds : array<ExpressionPtr>
                         let subSql = analyze_subquery(icall.arguments[0], binds, prog, at, true, q.inView)
                         if (empty(subSql)) {
@@ -2752,12 +2861,46 @@ def private pred_to_sql(var node : ExpressionPtr; var q : SqlQuery&; prog : Prog
         var mcall = node as ExprCallMacro
         let mname = string(mcall.name)
         if ((mname == "_in" || mname == "_not_in") && length(mcall.arguments) == 2) {
-            // arg order: (element, subquery)
+            // arg order: (element, collection-or-subquery)
             let xSql = pred_to_sql(mcall.arguments[0], q, prog, at)
+            return "" if (q.hadError)
+            var collArg : ExpressionPtr = mcall.arguments[1]
+            // Subquery form first: `select_from(...) |> ...` chains have array type
+            // post-typer, so isGoodArrayType alone can't distinguish them from a
+            // captured runtime array — pick by AST shape (chain bottoms out at
+            // `select_from`).
+            if (looks_like_subquery_chain(collArg)) {
+                var binds : array<ExpressionPtr>
+                let subSql = analyze_subquery(collArg, binds, prog, at, true, q.inView)
+                if (empty(subSql)) {
+                    q.hadError = true   // analyze_subquery emitted macro_error
+                    return ""
+                }
+                for (b in binds) {
+                    if (q.inHaving) {
+                        q.havingBindExprs |> push <| clone_expression(b)
+                    } else {
+                        q.bindExprs |> push <| clone_expression(b)
+                    }
+                }
+                if (mname == "_not_in") {
+                    return "{xSql} NOT IN ({subSql})"
+                }
+                return "{xSql} IN ({subSql})"
+            }
+            // Captured-collection form: arg2 is `array<T>` (variable, function result,
+            // literal). Bind JSON-encoded TEXT and use SQLite's table-valued json_each —
+            // single bind, any size, plan-cache-friendly (matches EF Core 8's default).
+            if (collArg._type != null && collArg._type.isGoodArrayType) {
+                let negated = mname == "_not_in"
+                let nullable = negated && is_nullable_column_ref(mcall.arguments[0], q)
+                return emit_in_collection_json_bridge(collArg, q, xSql, negated, nullable)
+            }
+            // Neither shape — let the existing subquery analyzer surface the diagnostic.
             var binds : array<ExpressionPtr>
-            let subSql = analyze_subquery(mcall.arguments[1], binds, prog, at, true, q.inView)
+            let subSql = analyze_subquery(collArg, binds, prog, at, true, q.inView)
             if (empty(subSql)) {
-                q.hadError = true   // analyze_subquery emitted macro_error
+                q.hadError = true
                 return ""
             }
             for (b in binds) {
@@ -3091,6 +3234,12 @@ def private fn_call_to_sql(var call : ExprCall?; var q : SqlQuery&; prog : Progr
     if (fname == "contains" && argc == 2) {
         let xSql = pred_to_sql(call.arguments[1], q, prog, at)
         return "" if (q.hadError)
+        // Captured-collection form: arg0 is `array<T>` and not a chain → JSON bridge.
+        var firstT = call.arguments[0]._type
+        if (firstT != null && firstT.isGoodArrayType
+                && !looks_like_subquery_chain(call.arguments[0])) {
+            return emit_in_collection_json_bridge(call.arguments[0], q, xSql, false, false)
+        }
         var binds : array<ExpressionPtr>
         let subSql = analyze_subquery(call.arguments[0], binds, prog, at, true, q.inView)
         if (empty(subSql)) {

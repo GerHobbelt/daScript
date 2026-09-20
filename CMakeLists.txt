@@ -1,4 +1,4 @@
-cmake_minimum_required (VERSION 3.16)
+cmake_minimum_required (VERSION 3.17)
 project (DAS VERSION 0.6.2)
 # enable_testing() must live at the top-level scope of the top-level
 # CMakeLists.txt for `ninja test` / ctest to work from the build root.
@@ -22,7 +22,7 @@ option(DAS_AUDIO_DISABLED "Disable dasAudio (Miniaudio sound library)" OFF)
 option(DAS_STDDLG_DISABLED "Disable dasStdDlg (File new,open,save etc dialogs)" OFF)
 option(DAS_STBIMAGE_DISABLED "Disable dasStbImage (StbImage bindings, image loading and saving)" OFF)
 
-option(DAS_PUGIXML_DISABLED "Disable dasPUGIXML (xml parsing library)" ON)
+option(DAS_PUGIXML_DISABLED "Disable dasPUGIXML (xml parsing library)" OFF)
 option(DAS_SQLITE_DISABLED "Disable dasSQLITE (sqlite3 library)" ON)
 option(DAS_TOOLS_DISABLED "Disable dasTools" OFF)
 option(DAS_TREE_SITTER_DISABLED "Disable tree-sitter-daslang grammar (no dependencies)" OFF)
@@ -345,6 +345,26 @@ MACRO(ADD_DAS_SHARED_MODULE_LIB module_name)
     )
     # Debug builds use _debug suffix so Debug and Release .shared_module can coexist
     SET_PROPERTY(TARGET ${module_name} PROPERTY OUTPUT_NAME_DEBUG "${module_name}_debug")
+    # Make the .shared_module's own directory the first place its native deps are
+    # searched at load time (e.g. modules/dasGlfw/libglfw.so.3 next to
+    # modules/dasGlfw/dasModuleGlfw.shared_module). On Windows the equivalent is
+    # done at runtime via LoadLibraryEx flags in src/misc/sysos.cpp. Use APPEND
+    # so per-module CMakeLists.txt that adds extra rpaths doesn't clobber this.
+    if(APPLE)
+        SET_PROPERTY(TARGET ${module_name} APPEND PROPERTY
+            BUILD_RPATH "@loader_path"
+        )
+        SET_PROPERTY(TARGET ${module_name} APPEND PROPERTY
+            INSTALL_RPATH "@loader_path"
+        )
+    elseif(UNIX)
+        SET_PROPERTY(TARGET ${module_name} APPEND PROPERTY
+            BUILD_RPATH "\$ORIGIN"
+        )
+        SET_PROPERTY(TARGET ${module_name} APPEND PROPERTY
+            INSTALL_RPATH "\$ORIGIN"
+        )
+    endif()
     # Ignore tutorial, profile, test.
     if(NOT "${FOLDER_NAME}" STREQUAL "tutorial" AND
        NOT "${FOLDER_NAME}" STREQUAL "profile" AND
@@ -664,6 +684,7 @@ src/ast/ast_typedecl.cpp
 src/ast/ast_match.cpp
 src/ast/ast_module.cpp
 src/ast/ast_print.cpp
+src/ast/ast_program.cpp
 src/ast/ast_infer_type.cpp
 src/ast/ast_infer_type_report.cpp
 src/ast/ast_infer_type_function.cpp
@@ -869,6 +890,7 @@ src/simulate/data_walker.cpp
 include/daScript/simulate/data_walker.h
 src/simulate/debug_print.cpp
 src/simulate/json_print.cpp
+src/runtime/context.cpp
 src/simulate/json_scan.cpp
 include/daScript/simulate/debug_print.h
 include/daScript/simulate/for_each.h
@@ -1449,7 +1471,23 @@ install(FILES
 install(FILES ${PROJECT_SOURCE_DIR}/install/README.md DESTINATION ${DAS_INSTALL_DOCDIR})
 install(FILES ${PROJECT_SOURCE_DIR}/install/CLAUDE.md DESTINATION ${DAS_INSTALL_DOCDIR})
 install(FILES ${PROJECT_SOURCE_DIR}/install/.gitignore DESTINATION ${DAS_INSTALL_DOCDIR})
-install(DIRECTORY ${PROJECT_SOURCE_DIR}/install/skills DESTINATION ${DAS_INSTALL_DOCDIR})
+
+# Skills shipped to the SDK — the manifest install/skills.list names which
+# files from skills/ get copied into the install tree under skills/. Keeps
+# top-level skills/ as the single source of truth (no install/skills/ mirror).
+file(STRINGS ${PROJECT_SOURCE_DIR}/install/skills.list SHIPPED_SKILLS_RAW)
+set(SHIPPED_SKILLS "")
+foreach(LINE IN LISTS SHIPPED_SKILLS_RAW)
+    string(STRIP "${LINE}" LINE)
+    if(LINE AND NOT LINE MATCHES "^#")
+        set(SKILL_PATH "${PROJECT_SOURCE_DIR}/skills/${LINE}")
+        if(NOT EXISTS "${SKILL_PATH}")
+            message(FATAL_ERROR "install/skills.list references missing file: skills/${LINE}")
+        endif()
+        list(APPEND SHIPPED_SKILLS "${SKILL_PATH}")
+    endif()
+endforeach()
+install(FILES ${SHIPPED_SKILLS} DESTINATION ${DAS_INSTALL_DOCDIR}/skills)
 install(FILES ${PROJECT_SOURCE_DIR}/LICENSE DESTINATION ${DAS_INSTALL_DOCDIR})
 install(FILES ${PROJECT_SOURCE_DIR}/3rdparty/uriparser/COPYING DESTINATION ${DAS_INSTALL_DOCDIR} RENAME URIPARSER.LICENSE)
 install(FILES ${PROJECT_SOURCE_DIR}/include/dag_noise/LICENSE DESTINATION ${DAS_INSTALL_DOCDIR} RENAME DAG_NOISE.LICENSE)
@@ -1521,6 +1559,20 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/find-dupe/tests/
     FILES_MATCHING PATTERN "*.das"
 )
 
+# Install blind-mouse (personal Q&A cache MCP server).
+file(GLOB DAS_MOUSE_FILES ${PROJECT_SOURCE_DIR}/utils/mouse/*.das)
+install(FILES ${DAS_MOUSE_FILES} DESTINATION utils/mouse)
+install(FILES
+    ${PROJECT_SOURCE_DIR}/utils/mouse/README.md
+    ${PROJECT_SOURCE_DIR}/utils/mouse/OVERVIEW.md
+    ${PROJECT_SOURCE_DIR}/utils/mouse/.das_package
+    DESTINATION utils/mouse
+)
+install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/mouse/tests/
+    DESTINATION utils/mouse/tests
+    FILES_MATCHING PATTERN "*.das" PATTERN "*.md"
+)
+
 # Install daspkg (package manager)
 file(GLOB DAS_DASPKG_FILES ${PROJECT_SOURCE_DIR}/utils/daspkg/*.das)
 install(FILES ${DAS_DASPKG_FILES} DESTINATION utils/daspkg)
@@ -1531,6 +1583,16 @@ install(FILES
 install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/daspkg/fixtures/
     DESTINATION utils/daspkg/fixtures
     FILES_MATCHING PATTERN "*.das_package"
+)
+
+# Install das-fmt (daslang formatter)
+file(GLOB DAS_FMT_FILES ${PROJECT_SOURCE_DIR}/utils/das-fmt/*.das)
+install(FILES ${DAS_FMT_FILES} DESTINATION utils/das-fmt)
+install(FILES
+    ${PROJECT_SOURCE_DIR}/utils/das-fmt/README.md
+    ${PROJECT_SOURCE_DIR}/utils/das-fmt/LICENSE
+    ${PROJECT_SOURCE_DIR}/utils/das-fmt/pre-commit
+    DESTINATION utils/das-fmt
 )
 
 # Install daspkg examples
