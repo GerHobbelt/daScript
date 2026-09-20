@@ -28,7 +28,6 @@
 #include "misc/include_fmt.h"
 
 #include "module_builtin_rtti.h"
-#include "module_builtin_ast.h"
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -447,6 +446,14 @@ extern "C" {
         builtin_array_unlock_mutable(arr, context, at);
     }
 
+    DAS_API void jit_table_lock ( Table & tab, Context * context, LineInfoArg * at ) {
+        builtin_table_lock(tab, context, at);
+    }
+
+    DAS_API void jit_table_unlock ( Table & tab, Context * context, LineInfoArg * at ) {
+        builtin_table_unlock(tab, context, at);
+    }
+
     DAS_API int32_t jit_str_cmp ( char * a, char * b ) {
         return strcmp(a ? a : "",b ? b : "");
     }
@@ -581,36 +588,6 @@ extern "C" {
         reinterpret_cast<FileInfo*>(dummy)->~FileInfo();
     }
 
-    struct JitAnnotationArgPod {
-        const char * name;
-        const char * sValue;
-        int32_t      type;
-        int32_t      iValue;  // covers bool/int/float (union bit-cast)
-    };
-
-    DAS_API void jit_initialize_varinfo_annotations ( void * varinfo_ptr, int32_t nArgs, JitAnnotationArgPod * args ) {
-        auto vi = (VarInfo *) varinfo_ptr;
-        auto aa = new AnnotationArguments();
-        aa->reserve(nArgs);
-        for ( int32_t i = 0; i < nArgs; i++ ) {
-            AnnotationArgument arg;
-            arg.type   = (Type) args[i].type;
-            arg.name   = args[i].name   ? args[i].name   : "";
-            arg.sValue = args[i].sValue ? args[i].sValue : "";
-            arg.iValue = args[i].iValue;
-            aa->push_back(std::move(arg));
-        }
-        vi->annotation_arguments = aa;
-    }
-
-    DAS_API void jit_free_varinfo_annotations ( void * varinfo_ptr ) {
-        auto vi = (VarInfo *) varinfo_ptr;
-        if ( vi->annotation_arguments ) {
-            delete (AnnotationArguments *) vi->annotation_arguments;
-            vi->annotation_arguments = nullptr;
-        }
-    }
-
     DAS_API void * jit_ast_typedecl ( uint64_t hash, Context * context, LineInfoArg * at ) {
         if ( !context->thisProgram ) context->throw_error_at(at, "can't get ast_typeinfo, no program. is 'options rtti' missing?");
         auto ti = context->thisProgram->astTypeInfo.find(hash);
@@ -639,6 +616,8 @@ extern "C" {
     void *das_get_jit_free_persistent() { return (void *)&jit_free_persistent; }
     void *das_get_jit_array_lock() { return (void *)&builtin_array_lock; }
     void *das_get_jit_array_unlock() { return (void *)&builtin_array_unlock; }
+    void *das_get_jit_table_lock() { return (void *)&builtin_table_lock; }
+    void *das_get_jit_table_unlock() { return (void *)&builtin_table_unlock; }
     void *das_get_jit_str_cmp() { return (void *)&jit_str_cmp; }
     void *das_get_jit_prologue() { return (void *)&jit_prologue; }
     void *das_get_jit_epilogue() { return (void *)&jit_epilogue; }
@@ -655,8 +634,6 @@ extern "C" {
     void *das_get_jit_debug_line() { return (void *)&jit_debug_line; }
     void *das_get_jit_initialize_fileinfo () { return (void*)&jit_initialize_fileinfo; }
     void *das_get_jit_free_fileinfo () { return (void*)&jit_free_fileinfo; }
-    void *jit_get_initialize_varinfo_annotations () { return (void*)&jit_initialize_varinfo_annotations; }
-    void *jit_get_free_varinfo_annotations () { return (void*)&jit_free_varinfo_annotations; }
     void *das_get_jit_ast_typedecl () { return (void*)&jit_ast_typedecl; }
 
     template <typename KeyType>
@@ -1178,6 +1155,10 @@ extern "C" {
                 SideEffects::none, "das_get_jit_array_lock");
             addExtern<DAS_BIND_FUN(das_get_jit_array_unlock)>(*this, lib, "get_jit_array_unlock",
                 SideEffects::none, "das_get_jit_array_unlock");
+            addExtern<DAS_BIND_FUN(das_get_jit_table_lock)>(*this, lib, "get_jit_table_lock",
+                SideEffects::none, "das_get_jit_table_lock");
+            addExtern<DAS_BIND_FUN(das_get_jit_table_unlock)>(*this, lib, "get_jit_table_unlock",
+                SideEffects::none, "das_get_jit_table_unlock");
             addExtern<DAS_BIND_FUN(das_get_jit_table_at)>(*this, lib, "get_jit_table_at",
                 SideEffects::none, "das_get_jit_table_at");
             addExtern<DAS_BIND_FUN(das_get_jit_table_erase)>(*this, lib, "get_jit_table_erase",
@@ -1236,10 +1217,6 @@ extern "C" {
                 SideEffects::none, "das_get_jit_initialize_fileinfo");
             addExtern<DAS_BIND_FUN(das_get_jit_free_fileinfo)>(*this, lib,  "get_jit_free_fileinfo",
                 SideEffects::none, "das_get_jit_free_fileinfo");
-            addExtern<DAS_BIND_FUN(jit_get_initialize_varinfo_annotations)>(*this, lib,  "get_initialize_varinfo_annotations",
-                SideEffects::none, "jit_get_initialize_varinfo_annotations");
-            addExtern<DAS_BIND_FUN(jit_get_free_varinfo_annotations)>(*this, lib,  "get_free_varinfo_annotations",
-                SideEffects::none, "jit_get_free_varinfo_annotations");
             addExtern<DAS_BIND_FUN(das_recreate_fileinfo_name)>(*this, lib,  "recreate_fileinfo_name",
                 SideEffects::worstDefault, "das_recreate_fileinfo_name");
             addExtern<DAS_BIND_FUN(loadDynamicLibrary)>(*this, lib,  "load_dynamic_library",

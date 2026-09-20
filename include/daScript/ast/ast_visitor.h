@@ -306,7 +306,7 @@ namespace das {
         vector<ExpressionPtr>   with;
     };
 
-    AstContext generateAstContext( const ProgramPtr & prog, Expression * expr );
+    DAS_API AstContext generateAstContext( const ProgramPtr & prog, Expression * expr );
 
     class PassVisitor : public Visitor {
     public:
@@ -346,7 +346,6 @@ namespace das {
             ctx.heap = make_unique<LinearHeapAllocator>();
             ctx.stringHeap = make_unique<LinearStringAllocator>();
             ctx.category = uint32_t(ContextCategory::folding_context);
-            helper.rtti = true;
         }
     protected:
         Context         ctx;

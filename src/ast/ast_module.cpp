@@ -119,34 +119,26 @@ namespace das {
         if ( info->type != Type::tHandle ) {
             return nullptr;
         }
-        intptr_t ann = (intptr_t) (info->annotation_or_name);
-        if ( ann & 1 ) {
-            auto bound = daScriptEnvironment::getBound();
-            DAS_VERIFYF(bound && bound->modules,"missing bound environment");
-            // we add ~ at the beginning of the name for padding
-            // if name is allocated by the compiler, it does not guarantee that it is aligned
-            // we check if there is a ~ at the beginning of the name, and if it is - we skip it
-            // that way we can accept both aligned and unaligned names
-            auto cvtbuf = (char *) ann;
-            if ( cvtbuf[0]=='~' ) cvtbuf++;
-            string moduleName, annName;
-            splitTypeName(cvtbuf, moduleName, annName);
-            TypeAnnotation * resolve = nullptr;
-            for ( auto pm = bound->modules; pm!=nullptr; pm=pm->next ) {
-                if ( pm->name == moduleName ) {
-                    if ( auto annT = pm->findAnnotation(annName) ) {
-                        resolve = (TypeAnnotation *) annT;
-                    }
-                    break;
-                }
+        return (TypeAnnotation *) resolveAnnotation(info->annotation_info);
+    }
+
+    Annotation * Module::resolveAnnotation ( const AnnotationInfo * info ) {
+        if ( !info ) return nullptr;
+        if ( info->resolved ) return info->resolved;
+        auto bound = daScriptEnvironment::getBound();
+        DAS_VERIFYF(bound && bound->modules,"missing bound environment");
+        Annotation * resolve = nullptr;
+        for ( auto pm = bound->modules; pm!=nullptr; pm=pm->next ) {
+            if ( pm->name == info->module_name ) {
+                resolve = pm->findAnnotation(info->name);
+                break;
             }
-            if ( bound->g_resolve_annotations ) {
-                info->annotation_or_name = resolve;
-            }
-            return resolve;
-        } else {
-            return info->annotation_or_name;
         }
+        // only cache successful lookups - a miss may be a not-yet-registered module
+        if ( resolve && bound->g_resolve_annotations ) {
+            info->resolved = resolve;
+        }
+        return resolve;
     }
 
     atomic<int> g_envTotal(0);
@@ -741,7 +733,7 @@ namespace das {
         return it != callThis.end() ? &it->second : nullptr;
     }
 
-    static bool appendBuiltinModuleContent ( Module * target, ProgramPtr program, const string & modName ) {
+    DAS_API bool appendBuiltinModuleContent ( Module * target, ProgramPtr program, const string & modName ) {
         if ( !program ) {
             DAS_FATAL_ERROR("builtin module did not parse %s\n", modName.c_str());
             return false;
@@ -809,20 +801,6 @@ namespace das {
         }
         SubstituteBuiltinModuleRefs( program, program->thisModule.get(), target );
         return true;
-    }
-
-    bool Module::compileBuiltinModule ( const string & modName, const unsigned char * const str, unsigned int str_len ) {
-        TextWriter issues;
-        auto access = make_smart<FileAccess>();
-        auto fileInfo = make_unique<TextFileInfo>((char *) str, uint32_t(str_len), false);
-        access->setFileInfo(modName, das::move(fileInfo));
-        ModuleGroup dummyLibGroup;
-        auto program = parseDaScript(modName, "", access, issues, dummyLibGroup, true);
-        ownFileInfo = access->letGoOfFileInfo(modName);
-        DAS_ASSERTF(ownFileInfo,"something went wrong and FileInfo for builtin module can not be obtained");
-        auto result = appendBuiltinModuleContent(this, program, modName);
-        program->thisModule->module_gc_root->gc_dump_to_thread_root();
-        return result;
     }
 
     bool isValidBuiltinName ( const string & name, bool canPunkt ) {

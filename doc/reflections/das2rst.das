@@ -161,7 +161,7 @@ def document_module_builtin(_root : string) {
         hide_group(group_by_regex("Internal pointer arithmetics", mod, %regex~i_das_%%)),
         hide_group(group_by_regex("Internal clone infrastructure", mod, %regex~clone%%)),
         hide_group(group_by_regex("Internal finalize infrastructure", mod, %regex~finalize%%)),
-        group_by_regex("Containers", mod, %regex~(capacity|clear|length|resize|resize_no_init|reserve|each|emplace|emplace_from|erase|find|
+        group_by_regex("Containers", mod, %regex~(capacity|clear|length|resize|resize_no_init|reserve|each|each_kv|emplace|emplace_from|erase|find|
 find_for_edit|find_if_exists|find_index|find_index_if|has_value|key_exists|keys|values|get_key|lock|each_enum|each_ref|
 find_for_edit_if_exists|lock_forever|next|nothing|pop|push|push_from|push_clone|push_clone_from|back|sort|stable_sort|to_array|to_table|to_array_move|
 to_table_move|empty|subarray|insert|move_to_ref|copy_to_local|move_to_local|get|remove_value|erase_if|resize_and_init|
@@ -314,7 +314,7 @@ def document_module_rtti(_root : string) {
         group_by_regex("Rtti context access", mod, %regex~(get_total_functions|get_total_variables|get_function_info|get_variable_info|get_variable_value|get_function_by_mnh|get_line_info|this_context|context_for_each_function|context_for_each_variable|class_info|type_info)$%%),
         group_by_regex("Program access", mod, %regex~(program_for_each_module|program_for_each_registered_module|get_this_module|get_module|has_module)$%%),
         group_by_regex("Module access", mod, %regex~(module_for_each_structure|module_for_each_enumeration|module_for_each_function|module_for_each_generic|module_for_each_global|module_for_each_annotation|module_for_each_dependency)$%%),
-        group_by_regex("Annotation access", mod, %regex~(get_annotation_argument_value|add_annotation_argument)$%%),
+        group_by_regex("Annotation access", mod, %regex~(get_annotation_argument_value|add_annotation_argument|get_annotation|get_annotation_argument|resolve_annotation|each_annotation|each_annotation_argument)$%%),
         group_by_regex("Compilation and simulation", mod, %regex~(compile|compile_file|for_each_expected_error|for_each_require_declaration|simulate|create_ast_serializer|create_ast_deserializer|delete_ast_serializer|serialize_program|deserialize_program|ast_serializer_get_data)$%%),
         group_by_regex("File access", mod, %regex~(make_file_access|set_file_source|add_file_access_root|add_extra_module)$%%),
         group_by_regex("Structure access", mod, %regex~(rtti_builtin_structure_for_each_annotation|basic_struct_for_each_field|structure_for_each_annotation|basic_struct_for_each_parent)$%%),
@@ -333,6 +333,7 @@ def document_module_rtti(_root : string) {
 def document_module_ast(_root : string) {
     var mod = [get_module("ast_core"), find_module("ast")]
     var groups <- array<DocGroup>(
+        group_by_regex("Compilation and file access", mod, %regex~(compile|compile_file|make_file_access)$%%),
         group_by_regex("Call generation", mod, %regex~(make_call)$%%),
         group_by_regex("Visitor pattern", mod, %regex~visit.*%%),
         group_by_regex("Expression generation", mod, %regex~(force_generated|get_expression_annotation|make_type_info_structure)%%),
@@ -374,7 +375,7 @@ def document_module_ast_boost(_root : string) {
         group_by_regex("Annotations", mod, %regex~(append.*|add.*)%%),
         group_by_regex("Expression generation", mod, %regex~(override_method|panic_expr_as|make_static_assert_false|convert_to_expression)%%),
         group_by_regex("Visitors", mod, %regex~(visit.*)%%),
-        group_by_regex("Type generation", mod, %regex~(function_to_type)%%),
+        group_by_regex("Type generation", mod, %regex~(function_to_type|make_fixed_array_type)%%),
         group_by_regex("Type casts", mod, %regex~(`is`|`as`|walk_and_convert)%%),
         hide_group(group_by_regex("Clonning", mod, %regex~(clone)%%)),
         group_by_regex("Setup", mod, %regex~setup.*$%%)
