@@ -25,8 +25,10 @@ require daslib/clargs
 require daslib/toml
 require daslib/json_boost
 require daslib/module_path
+require daslib/logger
 require daslib/fio
 require math
+require strings                 // to_lower / starts_with (pick_quant's file-quant spellings)
 
 [CommandLineArgs]
 struct ServerArgs {
@@ -43,7 +45,7 @@ struct ServerArgs {
     port : int
 
     @clarg_short = "q"
-    @clarg_doc = "Weight quantization: fp32 | q8 | q4 (default q8)"
+    @clarg_doc = "Weight serving mode: fp32 | q8 | q4 (default q8); file-format spellings q4_k | q5_k | q6_k | mxfp4 | f16 | bf16 select q8, where those planes serve natively"
     quant : string
 
     @clarg_doc = "KV cache codec: f32 | f16 | q8_0 | tq4 (default f16)"
@@ -67,6 +69,9 @@ struct ServerArgs {
     @clarg_doc = "Worker-lane cap for the matmul dispatch (default 16; -1 = all cores)"
     threads : int
 
+    @clarg_doc = "Worker CPU affinity: 0 = off (default), 1 = ideal-CPU hint, 2 = hard mask (DAS_JOBQUE_AFFINITY env overrides)"
+    affinity : int
+
     @clarg_doc = "Prefill chunk in tokens: decode stalls at most this many per tick (default 64)"
     chunk : int
 
@@ -89,13 +94,14 @@ struct ServerArgs {
 }
 
 def pick_kv_dtype(s : string) : KVDtype {
-    if (s == "f32") {
+    let l = to_lower(s)   // same normalization as pick_quant — F16/Q8_0/TQ4 spellings accepted
+    if (l == "f32") {
         return KVDtype.f32
-    } elif (s == "q8_0") {
+    } elif (l == "q8_0") {
         return KVDtype.q8_0
-    } elif (s == "tq4") {
+    } elif (l == "tq4") {
         return KVDtype.tq4
-    } elif (!empty(s) && s != "f16") {
+    } elif (!empty(l) && l != "f16") {
         to_log(LOG_WARNING, "dasllama-server: unknown --kv-dtype '{s}', using f16 (valid: f32 | f16 | q8_0 | tq4)\n")
     }
     return KVDtype.f16
@@ -161,6 +167,9 @@ def apply_config(var cfg : ServerArgs) : bool {
     if (cfg.threads == 0 && !cli_has_flag("--threads")) {
         cfg.threads = int(root?["threads"] ?? 0l)
     }
+    if (cfg.affinity == 0 && !cli_has_flag("--affinity")) {
+        cfg.affinity = int(root?["affinity"] ?? 0l)
+    }
     // --prefix is the one flag where 0 is a meaningful EXPLICIT value (auto-sizing), so the
     // zero-sentinel isn't enough: only fill from TOML when the flag is truly absent from argv
     if (cfg.prefix == 0 && !cli_has_flag("--prefix")) {
@@ -175,13 +184,20 @@ def apply_config(var cfg : ServerArgs) : bool {
     return true
 }
 
+// Besides the serving modes (fp32 | q8 | q4), the FILE formats the gguf loader reads are
+// first-class spellings too: q4_k / q5_k / q6_k (any case, _M/_S suffixes fine), mxfp4,
+// f16 / bf16, q8_0 — all of those serve under QuantMode.q8 (K-quant and mx4 planes run
+// NATIVELY on the kq tier). "q4" stays the legacy q4_0 requant tier — do not use it for
+// K-quant files (per-row fallback paths, the 14x prefill stall).
 def pick_quant(s : string) : QuantMode {
-    if (s == "fp32") {
+    let l = to_lower(s)
+    if (l == "fp32" || l == "f32") {
         return QuantMode.fp32
-    } elif (s == "q4") {
+    } elif (l == "q4" || l == "q4_0") {
         return QuantMode.q4
-    } elif (!empty(s) && s != "q8") {
-        to_log(LOG_WARNING, "dasllama-server: unknown --quant '{s}', using q8 (valid: fp32 | q8 | q4)\n")
+    } elif (!empty(l) && l != "q8" && l != "q8_0" && l != "mxfp4" && l != "f16" && l != "bf16"
+            && !(starts_with(l, "q4_k") || starts_with(l, "q5_k") || starts_with(l, "q6_k"))) {
+        to_log(LOG_WARNING, "dasllama-server: unknown --quant '{s}', using q8 (valid: fp32 | q8 | q4 | q4_k | q5_k | q6_k | mxfp4 | f16 | bf16)\n")
     }
     return QuantMode.q8
 }
@@ -240,8 +256,13 @@ def main : int {
     // counts, and an uncapped dispatch fights every other process on the box. -1 = all cores.
     let threads = cfg.threads > 0 ? cfg.threads : (cfg.threads < 0 ? 0 : 16)
     set_dispatch_worker_limit(threads)
+    // worker CPU affinity — must land before the jobque exists (applied at worker spawn)
+    set_jobque_affinity(cfg.affinity)
     let lanes_desc = threads > 0 ? "{threads}" : "all"
-    print("dispatch: {lanes_desc} worker lanes\n")
+    print("dispatch: {lanes_desc} worker lanes, affinity {cfg.affinity}\n")
+    // tee every to_log/print to logs/dasllama-server.log (timestamped ndjson) AND the console
+    logger_init_tee("dasllama-server")
+    to_log(LOG_INFO, "dasllama-server: logging to {get_das_root()}/logs/dasllama-server.log\n")
 
     log_tune_status("dasllama-server")
     print("loading {cfg.model} ...\n")

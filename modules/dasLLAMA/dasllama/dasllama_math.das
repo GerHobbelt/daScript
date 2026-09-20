@@ -36,8 +36,8 @@ def dot(a, b : float const?; n : int64) : float {}
 
 // The elementwise kernels below share dot's tuning rig: each `<name>_template` holds the `[tune=1]`
 // hot loop (single source of truth) and `[tuned]` reconstitutes `<name>` with the per-box permutation
-// from box_profile.json — default `vec8_u2` = the original `[vectorize_width=8, unroll_count=2]`, so
-// each migrated kernel is bit-identical until the profiler picks a different perm for this box.
+// from the app tune sidecar — default `vec8_u2` = the original `[vectorize_width=8, unroll_count=2]`,
+// so each migrated kernel is bit-identical until the profiler picks a different perm for this box.
 
 //! AXPY: d[j] += scale * s[j] over n elements, auto-vectorized. Used single-threaded AND as the
 //! V-accumulate in threaded prefill attention — `d` (output) and `s` (value-cache) never overlap, so
@@ -541,7 +541,7 @@ def public trace_tag(t : int) {
 }
 
 //! Configure the job queue for dasLLAMA's pure fork/join matmul dispatch: pooled fork contexts,
-//! batched dispatch, the spin-before-park window (box_profile.json "runtime" `jobque_spin_us`
+//! batched dispatch, the spin-before-park window (the tune sidecar's "runtime" `jobque_spin_us`
 //! overrides the shipped 30000us; 0 disables the spin), and the join-poll level ("jobque_join_poll",
 //! shipped 50 = ggml's default; 0 parks). Call INSIDE `with_job_que` (or after `create_job_que`) —
 //! the queue must exist, which is why apply_box_profile_runtime cannot apply these knobs itself
@@ -1371,6 +1371,9 @@ struct KernelBackend {
     // layout still answers with its reference tier there). The mx4 expand's positional map and
     // the probes read the cached value via active_q8_layout_mr().
     q8_layout : function<() : int> = @@q8_layout_grp4
+    // per-FORMAT kq plane interleave (kq v2: the k4/k5/k6 families tune separately, so their
+    // grp layouts can differ from the q8 family's and from each other)
+    kq_layout : function<(fmt : int) : int> = @@kq_layout_grp4_fmt
     // The additive bias the backend's repack bakes into GROUP-row weight bytes (128 for a
     // bias128 gen stamp, 0 everywhere else). Same activation-time contract as q8_layout;
     // the mx4->Q8 expand reads the cached value via active_q8_wbias().
@@ -1422,6 +1425,7 @@ var g_active_needs_repack = false   // does the active backend need repacked wei
 var g_active_mx4_expand_interleaved = false   // see KernelBackend.mx4_expand_interleaved
 var g_active_mx4_native_batch = false         // see KernelBackend.mx4_native_batch
 var g_active_q8_layout_mr = 4l                // see KernelBackend.q8_layout (activation-time cache)
+var g_active_kq_layout = @@kq_layout_grp4_fmt // see KernelBackend.kq_layout (activation-time cache)
 var g_active_q8_wbias = 0l                    // see KernelBackend.q8_wbias (activation-time cache)
 var g_active_q8_kgroup = 4l                   // see KernelBackend.q8_kgroup (activation-time cache)
 var g_backend_pin = ""              // A/B: force this backend by name; "" = auto-select
@@ -1445,12 +1449,19 @@ def private no_backend() {
 }
 def private backend_always_available() : bool => true
 def private q8_layout_grp4() : int => 4
+
+[unused_argument(fmt)]
+def private kq_layout_grp4_fmt(fmt : int) : int => 4
 def private q8_wbias_zero() : int => 0
 def private q8_kgroup_four() : int => 4
 
 //! The Q8 interleave (mr) of the ACTIVE backend's weight layout — cached at activation from
 //! KernelBackend.q8_layout (4 for every hand tier; the stamped mr on the gen backend).
 def active_q8_layout_mr() : int64 => g_active_q8_layout_mr
+
+//! The active backend's kq plane interleave for `fmt` (4/5/6) — per-format since the kq v2
+//! family split; the loader freezes these onto the Model at repack time.
+def active_kq_layout_mr(fmt : int) : int64 => int64(invoke(g_active_kq_layout, fmt))
 
 //! The weight-plane bias of the ACTIVE backend's Q8 layout — cached at activation from
 //! KernelBackend.q8_wbias (0 for every hand tier; 128 on a bias128 gen stamp). The mx4->Q8
@@ -1570,6 +1581,7 @@ def private activate(be : KernelBackend) {
     g_active_mx4_expand_interleaved = be.mx4_expand_interleaved
     g_active_mx4_native_batch = be.mx4_native_batch
     g_active_q8_layout_mr = int64(invoke(be.q8_layout))
+    g_active_kq_layout = be.kq_layout
     g_active_q8_wbias = int64(invoke(be.q8_wbias))
     g_active_q8_kgroup = int64(invoke(be.q8_kgroup))
     g_active_batch_backend = be.name
@@ -1787,7 +1799,7 @@ def matmul_kq_groupn_active(fmt : int; var y : array<float> | #; kq : array<uint
 def matmul_kq_batch(fmt : int; var y : array<float> | #; kq : array<uint8> | #; ks : array<uint8> | #; woff : int64; xq : array<int8> | #; xs : array<float> | #; xbs : array<int> | #; n, d, ntok : int64) {
     let sb = woff / 256l
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
-    let ssb = fmt == 6 ? 18l : 32l
+    let ssb = fmt == 6 ? 18l : 20l
     unsafe {
         invoke(g_mm_kq_batch, fmt, addr(y[0]),
             reinterpret<uint8 const?>(addr(kq[sb * qsb])), reinterpret<uint8 const?>(addr(ks[sb * ssb])),
@@ -1802,7 +1814,7 @@ def matmul_kq_batch(fmt : int; var y : array<float> | #; kq : array<uint8> | #; 
 def matmul_kq_active(fmt : int; var y : array<float> | #; kq : array<uint8> | #; ks : array<uint8> | #; woff : int64; xq : array<int8> | #; xs : array<float> | #; xbs : array<int> | #; n, d : int64; yoff : int64 = 0l) {
     let sb = woff / 256l
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
-    let ssb = fmt == 6 ? 18l : 32l
+    let ssb = fmt == 6 ? 18l : 20l
     unsafe {
         invoke(g_mm_kq, fmt, addr(y[yoff]),
             reinterpret<uint8 const?>(addr(kq[sb * qsb])), reinterpret<uint8 const?>(addr(ks[sb * ssb])),
@@ -1817,7 +1829,7 @@ def matmul_kq_active(fmt : int; var y : array<float> | #; kq : array<uint8> | #;
 def repack_kq_weight(fmt : int; var kq : array<uint8>; var ks : array<uint8>; woff, n, d : int64) {
     let sb = woff / 256l
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
-    let ssb = fmt == 6 ? 18l : 32l
+    let ssb = fmt == 6 ? 18l : 20l
     unsafe {
         invoke(g_repack_kq, fmt, addr(kq[sb * qsb]), addr(ks[sb * ssb]), n, d)
     }
@@ -1826,6 +1838,17 @@ def repack_kq_weight(fmt : int; var kq : array<uint8>; var ks : array<uint8>; wo
 //! Registered backend names (diagnostics / tests).
 def kernel_backend_names() : array<string> {
     return <- [for (k in keys(g_kernel_backends)); k]
+}
+
+//! Backend `name`'s f32 batch kernel (a batch-only donor's small-ntok / unsupported-shape
+//! fallback rail — the metal backend delegates to "portable" through this). The panic stub
+//! when unknown.
+def kernel_backend_batch_fn(name : string) : MatmulQ8Q8BatchFn {
+    var r = @@q8q8_unset_batch
+    g_kernel_backends |> get(name) $(be) {
+        r = be.batch
+    }
+    return r
 }
 
 //! Repack one Q8 weight tensor (region at element offset woff in qblob, shape [d rows x n cols]) into
@@ -2441,6 +2464,29 @@ def silu(var x : array<float> | #; size : int64) {
     silu(unsafe(addr(x[0])), size)
 }
 
+//! Softplus, matching ggml's op_softplus exactly: x > 20 → x, else log(1 + exp(x)).
+def softplus(x : float) : float => x > 20.0 ? x : log(1.0 + exp(x))
+
+//! Row-wise L2 normalization in place (ggml_l2_norm): scale = 1 / max(sqrt(Σx²), eps), the
+//! square-sum accumulated in double like ggml's ggml_float. Used on the deltanet q/k heads.
+[hint(noalias = v)]
+def l2_norm_rows(var v : float?; rows, row_size : int64; eps : float) {
+    unsafe {
+        for (r in range64(rows)) {
+            let base = r * row_size
+            var sum = 0.0lf
+            for (i in range64(row_size)) {
+                let x = v[base + i]
+                sum += double(x * x)
+            }
+            let scale = 1.0 / max(sqrt(float(sum)), eps)
+            for (i in range64(row_size)) {
+                v[base + i] *= scale
+            }
+        }
+    }
+}
+
 //! GELU, tanh approximation (HF's gelu_pytorch_tanh): the GeGLU gate nonlinearity (Gemma2).
 //! gelu(x) = 0.5x(1 + tanh(sqrt(2/pi)(x + 0.044715 x^3))). In place over the first `size`
 //! elements. ggml's LLM_FFN_GELU approximates this same form via an fp16 lookup table; we
@@ -2824,6 +2870,55 @@ def template rope_scaled_neox_tab_template(var v : float ?; head_size, n : int64
 //! can't do this: its interleaved (2j, 2j+1) layout is stride-2 and the JIT won't emit vld2/vst2 for it.
 [hint(noalias = v, noalias = cosrow, noalias = sinrow), tuned]
 def rope_scaled_neox_tab(var v : float?; head_size, n : int64; cosrow : float const?; sinrow : float const?) {}
+
+//! NEOX RoPE over only the FIRST `rot` dims of each head (partial rotary — qwen35: 64 of 256).
+//! Pairs are (base+j, base+j+rot/2) and frequencies run over `rot` (ggml_rope_multi's n_rot),
+//! so this matches rope_scaled_neox with head_size = rot except heads stride by the real
+//! head_size and dims >= rot pass through untouched. Text-only M-RoPE degenerates to exactly
+//! this (see the qwen3vl precedent in dasllama_arch_qwen3.das).
+[hint(noalias = v, noalias = ff)]
+def rope_scaled_neox_part(var v : float?; pos, head_size, rot, n : int64; theta, fscale : float; has_ff : bool; ff : float const?; mscale : float = 1.0) {
+    unsafe {
+        let half = rot / 2l
+        let posf = float(pos) * fscale
+        for (h in range64(n / head_size)) {
+            let base = h * head_size
+            for (j in range64(half)) {
+                var freq = 1.0 / pow(theta, float(2l * j) / float(rot))
+                if (has_ff) {
+                    freq /= ff[j]
+                }
+                let angle = posf * freq
+                let fcr = cos(angle) * mscale
+                let fci = sin(angle) * mscale
+                let v0 = v[base + j]
+                let v1 = v[base + j + half]
+                v[base + j] = v0 * fcr - v1 * fci
+                v[base + j + half] = v0 * fci + v1 * fcr
+            }
+        }
+    }
+}
+
+//! Table form of rope_scaled_neox_part: cosrow/sinrow are one position's rot/2-wide row of a
+//! table built by build_rope_table with head_size = rot. Bit-identical to the direct form.
+[hint(noalias = v, noalias = cosrow, noalias = sinrow)]
+def rope_scaled_neox_tab_part(var v : float?; head_size, rot, n : int64; cosrow : float const?; sinrow : float const?) {
+    unsafe {
+        let half = rot / 2l
+        for (h in range64(n / head_size)) {
+            let base = h * head_size
+            for (j in range64(half)) {
+                let fcr = cosrow[j]
+                let fci = sinrow[j]
+                let v0 = v[base + j]
+                let v1 = v[base + j + half]
+                v[base + j] = v0 * fcr - v1 * fci
+                v[base + j + half] = v0 * fci + v1 * fcr
+            }
+        }
+    }
+}
 
 //! Dispatch RoPE by the model's convention: NEOX (Qwen2/Phi3/Gemma2) or the default NORM (Llama).
 //! mscale is the LongRoPE magnitude factor (1.0 for everything but Phi3); only the NEOX path uses it.
