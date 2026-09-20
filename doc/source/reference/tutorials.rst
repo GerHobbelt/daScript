@@ -85,6 +85,8 @@ introduced in earlier tutorials.
    tutorials/54_glob.rst
    tutorials/55_linq_decs.rst
    tutorials/56_linq_query.rst
+   tutorials/57_toml.rst
+   tutorials/58_logger.rst
 
 .. _tutorials_building_from_sdk:
 
@@ -206,6 +208,7 @@ Run any tutorial from the project root::
    tutorials/macros/16_template_type_macro.rst
    tutorials/macros/17_qmacro.rst
    tutorials/macros/18_with_boost.rst
+   tutorials/macros/19_add_module_option.rst
 
 .. _tutorials_dashv:
 
@@ -230,6 +233,7 @@ Run any tutorial from the project root::
    tutorials/dasHV_05_cookies_and_forms.rst
    tutorials/dasHV_06_websockets.rst
    tutorials/dasHV_07_sse_and_streaming.rst
+   tutorials/dasHV_08_https_wss.rst
 
 .. _tutorials_dasopenai:
 
@@ -257,6 +261,10 @@ Run any tutorial from the project root::
    tutorials/dasOPENAI_05_embeddings_and_models.rst
    tutorials/dasOPENAI_06_audio.rst
    tutorials/dasOPENAI_07_streaming_chat.rst
+   tutorials/dasOPENAI_08_vision.rst
+   tutorials/dasOPENAI_09_image_generation.rst
+   tutorials/dasOPENAI_10_moderations.rst
+   tutorials/dasOPENAI_11_completions.rst
 
 .. _tutorials_daspugixml:
 
@@ -303,6 +311,8 @@ Run any tutorial from the project root::
    tutorials/dasStbImage_03_transforms.rst
    tutorials/dasStbImage_04_pixel_access_and_conversion.rst
    tutorials/dasStbImage_05_drawing_and_blending.rst
+   tutorials/dasStbImage_06_truetype_fonts.rst
+   tutorials/dasStbImage_07_hdr.rst
 
 .. _tutorials_sql:
 
@@ -390,6 +400,8 @@ Run any tutorial from the project root::
    tutorials/dasAudio_06_streaming.rst
    tutorials/dasAudio_07_wav_io.rst
    tutorials/dasAudio_08_midi.rst
+   tutorials/dasAudio_09_playback_status.rst
+   tutorials/dasAudio_10_global_controls.rst
 
 .. _tutorials_dastrudel:
 
