@@ -4,7 +4,6 @@ options _comment_hygiene = true
 module dasllama_math shared public
 
 require math
-require strings  // to_int: DASLLAMA_CALLER_PRIO env override in setup_dasllama_jobque_
 require daslib/fio  // has_env_variable: DAS_JOBQUE_TEAM_RANK_GATE suppresses the profile's team_rank_gate knob
 require dasllama/dasllama_env  // env_flag/env_int64: the shared typed readers + the knob registry
 require daslib/jobque_boost public  // matmul's threaded path expands parallel_for; consumers need its symbols
@@ -1221,6 +1220,9 @@ typedef MatmulQ8Q8GroupNFn = function<(var yp : float?; wp : int8 const?; sp : f
 // inside its own stage lambdas. rb/re must be multiples of 32; bit-identical to the mm slot.
 typedef MatmulQ8Q8RowsFn = function<(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n : int64; rb : int64; re : int64) : void>
 typedef MatmulMx4GroupNFn = function<(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n : int64; d : int64) : void>
+// Row-range MXFP4·Q8 GEMV core — the mx4 twin of MatmulQ8Q8RowsFn (wn/we are the REGION's
+// nibble/exponent plane bases; same rb/re-multiples-of-32, no-internal-dispatch contract).
+typedef MatmulMx4RowsFn = function<(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n : int64; rb : int64; re : int64) : void>
 // f16-weight-scale twins (the wscale_f16 rail): identical contracts to the Fn above them, except
 // the per-32-block WEIGHT scale plane is raw binary16 halfwords (Model.qscales16) instead of f32 —
 // llama.cpp byte parity, 34 vs 36 B per 32 weights. Activation scales (xsp) stay f32 everywhere.
@@ -1292,6 +1294,9 @@ struct KernelBackend {
     // Optional row-range GEMV core (see MatmulQ8Q8RowsFn) — backends without one keep the panic
     // stub, and the fused multi-stage decode falls back to the per-op dispatch path.
     mm_rows : MatmulQ8Q8RowsFn = @@q8q8_unset_rows
+    // Optional mx4 row-range GEMV core (see MatmulMx4RowsFn) — the fused MoE expert chain gates
+    // on it the same way the dense chains gate on mm_rows.
+    mx4_rows : MatmulMx4RowsFn = @@mx4q8_unset_rows
     // Optional f16-scale twins (the wscale_f16 rail). All-or-nothing per backend: the loader's
     // plane convert gates on kernel_backend_has_wscale16(), keyed off mm_s16 alone.
     mm_s16 : MatmulQ8Q8FnS16 = @@q8q8_unset_kernel_s16
@@ -1355,6 +1360,8 @@ var g_mm_q51q8_groupn = @@q51q8_groupn_kernel
 var g_mm_q51q8_batch_groupn = @@q51q8_batch_groupn_kernel
 var g_mm_q8q8_rows = @@q8q8_unset_rows
 var g_active_has_rows = false       // does the active backend carry a row-range GEMV core?
+var g_mm_mx4q8_rows = @@mx4q8_unset_rows
+var g_active_has_mx4_rows = false   // ... and the mx4 row-range core (the fused MoE chain's gate)?
 var g_mm_q8q8_s16 = @@q8q8_unset_kernel_s16
 var g_mm_q8q8_batch_s16 = @@q8q8_unset_batch_s16
 var g_mm_q8q8_group3_s16 = @@q8q8_unset_group3_s16
@@ -2112,6 +2119,12 @@ def public gpu_want_qkv : bool
 def public gpu_want_cls : bool
     => env_flag("DASLLAMA_GPU_CLS", false)
 
+//! The classifier UPLOAD gate (opt-OUT, default on when the tier is armed) — distinct from
+//! [[gpu_want_cls]], the opt-IN arm signal. One definition, shared by the upload walk and the
+//! DlimConfiguration identity, so the two can never disagree on the default again.
+def public gpu_want_cls_upload : bool
+    => env_flag("DASLLAMA_GPU_CLS", true)
+
 //! A GPU backend registers its arm probe here at ``[init]`` so config-driven arming works
 //! after module init (the env path arms at ``[init]`` directly).
 def public set_moe_gpu_arm(name : string; f : function<() : bool>) {
@@ -2146,6 +2159,31 @@ def public set_moe_gpu_budget_hooks(budget : function<() : int64>; plane : funct
 //! Device-local bytes the armed tier may spend on resident weights (0 = no tier).
 def public moe_gpu_weight_budget() : int64 => invoke(g_moe_gpu_budget_report)
 
+def private moe_gpu_no_q8n : bool => false
+var private g_moe_gpu_expert_q8n = @@moe_gpu_no_q8n
+
+//! The tier asks the loader to gather q8 EXPERT stacks as gguf-native q8n blocks (fmt 6, the
+//! cm2 decode-in-load layout, no scale plane). Registered beside the budget hooks; the probe
+//! may create the device — it must answer before the first gather.
+def public set_moe_gpu_expert_q8n_probe(f : function<() : bool>) {
+    g_moe_gpu_expert_q8n = f
+}
+
+def private moe_gpu_no_bake_tag : string => ""
+
+var private g_moe_gpu_bake_tag = @@moe_gpu_no_bake_tag
+
+//! The GPU tier's config-identity tag for the vulkan-flavor image ("" = tier absent/unarmed —
+//! no flavor). Everything that shapes the load-time GPU walk must fold in: a config switch
+//! must miss the flavor's identity and rebake.
+def public set_moe_gpu_bake_tag(f : function<() : string>) {
+    g_moe_gpu_bake_tag = f
+}
+
+def public moe_gpu_bake_tag : string => invoke(g_moe_gpu_bake_tag)
+
+def public moe_gpu_expert_q8n() : bool => invoke(g_moe_gpu_expert_q8n)
+
 //! Device-layout bytes one [rows x n] plane of `fmt` occupies (quants + scales). 0 = no tier.
 def public moe_gpu_plane_bytes(n, rows : int64; fmt : int) : int64 => invoke(g_moe_gpu_plane_bytes_fn, n, rows, fmt)
 
@@ -2157,6 +2195,17 @@ def public moe_gpu_tier_installed : bool {
 def public set_moe_gpu_total_layers(n : int64) {
     g_moe_gpu_total_layers = n
 }
+
+var private g_moe_gpu_stream_need = 0l
+
+//! Loader contract: worst-case streamed-slot bytes of THIS model (2x gate/up + down device
+//! planes of the largest expert layer, via moe_gpu_plane_bytes). The tier carves its stream
+//! reserve from this instead of a fixed guess; 0 = unknown (tier falls back to its constant).
+def public set_moe_gpu_stream_need(bytes : int64) {
+    g_moe_gpu_stream_need = bytes
+}
+
+def public moe_gpu_stream_need() : int64 => g_moe_gpu_stream_need
 
 //! Loader contract: "" = the loaded model rides the armed tier; otherwise the human reason it
 //! cannot (reset per load; meaningless while the tier is unarmed).
@@ -2193,9 +2242,9 @@ def public gpu_tier_status : GpuTierStatus {
         reason = g_moe_gpu_unsupported,
         resident_layers = resident,
         streamed_layers = streamed,
-        dn_layers = int64(length(g_moe_gpu_dn_layers)),
-        attn_layers = int64(length(g_moe_gpu_attn_layers)),
-        dense_planes = int64(length(g_moe_gpu_dense_offs)),
+        dn_layers = long_length(g_moe_gpu_dn_layers),
+        attn_layers = long_length(g_moe_gpu_attn_layers),
+        dense_planes = long_length(g_moe_gpu_dense_offs),
         cls_resident = g_moe_gpu_cls_off >= 0l,
         vram_bytes = invoke(g_moe_gpu_vram_report))
 }
@@ -2207,8 +2256,12 @@ def public moe_gpu_upload_stack(wq : array<uint8> | #; ws : array<uint8> | #; wo
     if (!g_moe_gpu_installed) {
         return false
     }
+    var wsp : uint8 const?   // q8n stacks carry no scale plane — an empty ws hands the tier null
+    if (!empty(ws)) {
+        wsp = unsafe(addr<uint8 const?>(ws[0]))
+    }
     unsafe {
-        return invoke(g_moe_gpu_upload, addr<uint8 const?>(wq[0]), addr<uint8 const?>(ws[0]), woff, n, rows, fmt, stream)
+        return invoke(g_moe_gpu_upload, addr<uint8 const?>(wq[0]), wsp, woff, n, rows, fmt, stream)
     }
 }
 
@@ -2623,6 +2676,11 @@ def private q8q8_unset_rows(var yp : float?; wp : int8 const?; sp : float const?
 }
 [unused_argument(yp, wn, we, offs, nregions, xqp, xsp, bp, boffs, n, d)]
 def private mx4q8_unset_groupn(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) { no_backend() }
+[unused_argument(yp, wn, we, xqp, xsp, n, rb, re)]
+def private mx4q8_unset_rows(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n, rb, re : int64) {
+    // reachable with a registered backend: the slot is optional — gate on kernel_backend_has_mx4_rows()
+    panic("dasLLAMA: the active kernel backend '{g_active_backend}' provides no mx4 row-range GEMV core (mx4_rows)")
+}
 // The f16-scale stubs are reachable with a registered backend (the twins are optional) — a
 // wscale_f16 model must never activate a backend without them; the loader gates the convert.
 [unused_argument(yp, wp, sp, xqp, xsp, n, d)]
@@ -2682,6 +2740,8 @@ def private activate(be : KernelBackend) {
     g_mm_q51q8_batch_groupn = be.q51_batch_groupn
     g_mm_q8q8_rows = be.mm_rows
     g_active_has_rows = !(be.mm_rows == @@q8q8_unset_rows)
+    g_mm_mx4q8_rows = be.mx4_rows
+    g_active_has_mx4_rows = !(be.mx4_rows == @@mx4q8_unset_rows)
     g_mm_q8q8_s16 = be.mm_s16
     g_mm_q8q8_batch_s16 = be.batch_s16
     g_mm_q8q8_group3_s16 = be.group3_s16
@@ -2842,6 +2902,18 @@ def kernel_backend_has_rows() : bool {
 //! MAIN context and capture that in worker lambdas — same rule as every kernel-pointer read.
 def mm_q8q8_rows_fn() : MatmulQ8Q8RowsFn {
     return g_mm_q8q8_rows
+}
+
+//! Does the active backend carry the mx4 row-range GEMV core (mx4_rows)? The fused MoE expert
+//! chain gates on this and falls back to the per-op groupn dispatch path when false.
+def kernel_backend_has_mx4_rows() : bool {
+    return g_active_has_mx4_rows
+}
+
+//! The active backend's mx4 row-range GEMV core (see MatmulMx4RowsFn) — the MoE chain's twin of
+//! mm_q8q8_rows_fn. Same read-into-a-local-then-capture rule.
+def mx4_rows_fn() : MatmulMx4RowsFn {
+    return g_mm_mx4q8_rows
 }
 
 //! Does the active backend carry the f16-scale kernel twins (the wscale_f16 rail)? The loader's

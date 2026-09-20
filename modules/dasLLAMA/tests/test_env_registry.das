@@ -17,6 +17,7 @@ require daslib/strings_boost
 let SCAN_ROOTS = [
     "modules/dasLLAMA",
     "utils/dasllama-server",
+    "utils/dasllama-convert",
     "examples/dasLLAMA",
     "tutorials/dasLLAMA"
 ]
@@ -116,6 +117,8 @@ let BANNED_HELPERS = [
     "def env_or(",
     "def private pf_env_int(",
     "def private win_env_int(",
+    "def env_int64(",
+    "def private env_int64(",
     "def env_int(",
     "def private env_int(",
     "def env_str(",
@@ -157,6 +160,21 @@ def test_no_ad_hoc_env_helpers(t : T?) {
         t |> success(empty(offenders),
             "re-declared env helper(s): {join(offenders, "; ")} — call env_flag/env_int/env_int64/env_str from dasllama_env instead")
         delete offenders
+    }
+}
+
+[test]
+def test_environment_md_is_current(t : T?) {
+    t |> run("the checked-in ENVIRONMENT.md matches what the registry renders") @(t : T?) {
+        let path = "{get_das_root()}/modules/dasLLAMA/ENVIRONMENT.md"
+        let onDisk = fread(path)
+        t |> success(!empty(onDisk), "cannot read {path}")
+        // \r\n on a Windows checkout: the file has no .gitattributes eol rule, and the comparison
+        // is about content, not line endings
+        let want = replace(env_markdown(), "\r\n", "\n")
+        let got = replace(onDisk, "\r\n", "\n")
+        t |> success(want == got,
+            "ENVIRONMENT.md is stale — regenerate with `daslang modules/dasLLAMA/harness/gen_env_doc.das`")
     }
 }
 

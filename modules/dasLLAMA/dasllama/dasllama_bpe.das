@@ -36,9 +36,9 @@ def load_bpe_tokenizer_gguf(path : string) : BpeTokenizer {
         panic("dasLLAMA: cannot open gguf '{path}'")
     }
     fmap(f) $(var bytes : array<uint8>#) {
-        let m <- parse_gguf_meta(bytes)
-        let toks <- gguf_str_array(m, bytes, "tokenizer.ggml.tokens")
-        let merges <- gguf_str_array(m, bytes, "tokenizer.ggml.merges")
+        var inscope m <- parse_gguf_meta(bytes)
+        var inscope toks <- gguf_str_array(m, bytes, "tokenizer.ggml.tokens")
+        var inscope merges <- gguf_str_array(m, bytes, "tokenizer.ggml.merges")
         let n = length(toks)
         tk.vocab |> reserve(n)
         for (i in range(n)) {
@@ -628,7 +628,7 @@ def byte_token_val(piece : string) : int {
 //! <|eot_id|>, header markers) render as empty — callers detect them by id, not text.
 def bpe_decode(tk : BpeTokenizer; id : int64) : string {
     // out of range, or a control token (BOS/EOS/<|eot_id|>/headers, GGUF type 3) — render nothing
-    if (id < 0l || id >= int64(length(tk.vocab)) || tk.token_type[id] == 3l) {
+    if (id < 0l || id >= long_length(tk.vocab) || tk.token_type[id] == 3l) {
         return ""
     }
     if (tk.spm_space) {

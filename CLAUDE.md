@@ -78,6 +78,7 @@ Task-specific instructions are split into skill files under `skills/`. You MUST 
 | `skills/daslang_lsp.md` | Working on `utils/lsp/` (the LSP server for Claude Code / stdio clients) — locked architecture, coordinate conventions, CC wire facts, headless dev rig, protocol tests |
 | `utils/dasHerd/dasherder.md` | Running INSIDE a dasHerd-managed agent session (any `DASHERD_SESSION_ID` env var set) — the session cooperation contract: inbox/outbox mailbox, declaring participating repositories, Review Bundles, the `dasherd.ps1` CLI |
 | `skills/imgui_ui_debugging.md` | **CRITICAL UI SKILL** — diagnosing/fixing ANY dasImgui UI or interaction bug. The discipline: reproduce + screenshot → make it observable in `imgui_snapshot` (fix the inspection if it isn't) → fix → prove via snapshot + test → 'after' screenshot. UI is hard; **never claim a UI fix works from logic or a screenshot — only from structured snapshot state.** |
+| `skills/environment_variables.md` | Reading or ADDING any environment variable — the full daslang set, plus the read-once/typed-default rules a new one must follow. dasLLAMA's own ~130 knobs are generated into `modules/dasLLAMA/ENVIRONMENT.md` |
 | `skills/perf_lint.md` | Adding rules to `daslib/perf_lint.das` — **and before declaring any hot path off-limits to allocation**: `[hot_path]` / `[no_alloc]` / `[no_env]` / `[no_io]` contracts (PERF026-028), `[cold_path]` to prune, `@scratch` to declare a reused buffer |
 | `skills/style_lint.md` | Adding rules to `daslib/style_lint.das` |
 | `skills/strings.md` | Any `.das` string operation — `find`/`replace`/`split`/parsing/`build_string`/`peek_data` (covers `strings`, `daslib/strings_boost`, `daslib/strings_convert`) |
@@ -213,9 +214,9 @@ AST types (TypeDecl, Expression, Function, Structure, Enumeration, Variable, Mak
 
 Quick rules:
 - AST nodes have **unique ownership** — don't insert the same pointer into two parents; use `clone_type` / `clone_expression` / `clone_function` / `clone_variable` / `clone_structure` to duplicate.
-- AST pointers use plain `=` and pass-by-value. **No `var inscope`, no `<-`** for them. `var inscope` is only for the residual smart_ptr types.
+- AST pointers use plain `=` and pass-by-value. **No `var inscope`, no `<-`** for them. `var inscope` is for OWNED locals that should finalize at scope exit (smart_ptr types, plain arrays/structs) — never for gc_node AST pointers.
 - Tools that build AST at runtime (outside the compile pipeline) must wrap their scope in `ast_gc_guard() { ... }` from `daslib/ast`, or the leak detector reports `GC APP LEAK` at exit.
-- daslang has garbage collection, but plain `var arr : array<T>` does NOT finalize on scope exit. Either declare with `var inscope` (smart_ptr only), call `delete` explicitly, or move out via `<-`. Per-frame leaks in hot paths usually trace to a local `var arr` never deleted.
+- daslang has garbage collection, but plain `var arr : array<T>` does NOT finalize on scope exit. Either declare with `var inscope` (finalize-at-scope-exit — serves plain arrays/structs as well as the smart_ptr types; Boris-confirmed + compile-verified 2026-07-26), call `delete` explicitly, or move out via `<-`. Per-frame leaks in hot paths usually trace to a local `var arr` never deleted.
 
 Full migration table (when reading older docs that say `var inscope` or `<-` for AST types): **`skills/gc_migration.md`**.
 

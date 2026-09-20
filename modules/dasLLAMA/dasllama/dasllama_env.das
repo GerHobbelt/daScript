@@ -110,6 +110,10 @@ def private reg_engine(var o : array<EnvKnob>) {
       "A/B rail for the dispatch caller's thread priority, -2..2; unset claims the top notch.")
     k(o, "DASLLAMA_TRUTH_REFRESH", EnvKind.flag, EnvArea.engine, "off",
       "Regenerate the stored parity truth files instead of comparing against them.")
+    k(o, "DASLLAMA_CONV_PROF", EnvKind.flag, EnvArea.engine, "off",
+      "Bucket gguf -> image conversion time by kind over the weight walk; one clock pair per tensor.")
+    k(o, "DASLLAMA_ALLOW_INTERP_LOAD", EnvKind.flag, EnvArea.engine, "off",
+      "Permit a big gguf load without -jit; the transforms run interpreted, so expect minutes per GB.")
 }
 
 def private reg_gpu_tier(var o : array<EnvKnob>) {
@@ -219,6 +223,14 @@ def private reg_vulkan(var o : array<EnvKnob>) {
       "Cooperative-matrix mode; the flash-attention twin needs it even when the GEMM runs sdot4.")
     k(o, "DASLLAMA_MM_SMALL", EnvKind.number, EnvArea.vulkan, "32",
       "Small-batch tier: 32 = sdot4 (default, beats both coopmat tiles below the crossover), 64 = coopmat M, 128 = always-L.")
+    k(o, "DASLLAMA_MM_SMALLD", EnvKind.number, EnvArea.vulkan, "64",
+      "Small-d cutoff routing narrow roles (k/v) to the small tier; widening measured worse, so this is an instrument.")
+    k(o, "DASLLAMA_VK_FUSE", EnvKind.flag, EnvArea.vulkan, "on",
+      "Fused decode tail (add+rms+requant, qk-norm+rope); 0 pins the split dispatches for a same-build A/B.")
+    k(o, "DASLLAMA_VK_XFERQ", EnvKind.flag, EnvArea.vulkan, "on",
+      "Stream expert uploads on the dedicated transfer queue, overlapped via a timeline semaphore; 0 keeps the single-queue rail.")
+    k(o, "DASLLAMA_VK_MEMPRIO", EnvKind.flag, EnvArea.vulkan, "on",
+      "Tag allocations high-priority (VK_EXT_memory_priority) so the driver demotes desktop memory, not ours.")
     k(o, "DASLLAMA_VK_FA", EnvKind.flag, EnvArea.vulkan, "on",
       "Vulkan flash-attention kernel; 0 falls back to the chunked path.")
     k(o, "DASLLAMA_VK_REBAR", EnvKind.flag, EnvArea.vulkan, "on",
@@ -302,6 +314,10 @@ def private reg_benchmark(var o : array<EnvKnob>) {
       "Simdgroups per threadgroup in the Metal attention lab.")
     k(o, "DASMETAL_LAB_DUMP_MSL", EnvKind.flag, EnvArea.benchmark, "off",
       "Dump generated MSL from the Metal labs instead of running it.")
+    k(o, "PROBE_PATH", EnvKind.path, EnvArea.benchmark, "_wcliff.bin",
+      "Scratch file the write-cliff probe writes, cwd-relative by default; point it at the drive under test.")
+    k(o, "PROBE_GB", EnvKind.number, EnvArea.benchmark, "50",
+      "Gigabytes the write-cliff probe writes before reporting.")
 }
 
 def private reg_profiling(var o : array<EnvKnob>) {
@@ -356,6 +372,8 @@ def private reg_test(var o : array<EnvKnob>) {
       "Directory of audio corpus files for the transcription tests.")
     k(o, "TMPDIR", EnvKind.path, EnvArea.test, "/tmp",
       "Scratch directory for test artifacts; set by the OS on macOS.")
+    k(o, "TEMP", EnvKind.path, EnvArea.test, "",
+      "Windows scratch-directory fallback when TMPDIR is unset (the test runner's log dir).")
 }
 
 def private reg_example(var o : array<EnvKnob>) {
@@ -365,7 +383,7 @@ def private reg_example(var o : array<EnvKnob>) {
 
 def private reg_core(var o : array<EnvKnob>) {
     k(o, "DAS_JOBQUE_THREADS", EnvKind.number, EnvArea.core, "conservative default",
-      "Total compute lanes for job queues. Overrides set_jobque_threads_cap; see skills/llvm_tune.md.")
+      "Total compute lanes for job queues (N-1 workers plus the caller). Overrides set_jobque_threads_cap; see skills/environment_variables.md.")
     k(o, "DAS_JOBQUE_AFFINITY", EnvKind.number, EnvArea.core, "0",
       "Worker affinity: 0 off, 1 ideal-processor hint, 2 hard mask. Matters on big SMT boxes.")
     k(o, "DAS_JOBQUE_TEAM_RANK_GATE", EnvKind.number, EnvArea.core, "profile-driven",
@@ -373,9 +391,9 @@ def private reg_core(var o : array<EnvKnob>) {
     k(o, "DAS_TUNE_MANIFEST", EnvKind.path, EnvArea.core, "<app>.tune.json",
       "Kernel-tuning sidecar to read/write. Point it somewhere writable when the app dir is read-only.")
     k(o, "DAS_TUNE_MODE", EnvKind.text, EnvArea.core, "",
-      "Kernel-tuning mode; see skills/llvm_tune.md.")
+      "Kernel-tuning mode. The [tune] framework owns these; see skills/tune.md.")
     k(o, "DAS_TUNE_POLICY", EnvKind.text, EnvArea.core, "",
-      "Kernel-tuning policy override; see skills/llvm_tune.md.")
+      "Kernel-tuning policy override. The [tune] framework owns these; see skills/tune.md.")
     k(o, "DAS_TUNE_COMPILE_FALLBACKS", EnvKind.text, EnvArea.core, "",
       "Semicolon-separated kernel fallbacks for the generated tune probe.")
 }
@@ -398,6 +416,76 @@ def public env_registry() : array<EnvKnob> {
     reg_example(out)
     reg_core(out)
     return <- out
+}
+
+def private kind_name(k : EnvKind) : string {
+    if (k == EnvKind.flag) return "flag"
+    if (k == EnvKind.number) return "number"
+    if (k == EnvKind.path) return "path"
+    return "text"
+}
+
+def private area_title(a : EnvArea) : string {
+    if (a == EnvArea.engine) return "Engine"
+    if (a == EnvArea.metal) return "Metal backend"
+    if (a == EnvArea.vulkan) return "Vulkan backend"
+    if (a == EnvArea.accelerate) return "Accelerate / AMX backend"
+    if (a == EnvArea.harness) return "Harness — tuner and probes"
+    if (a == EnvArea.benchmark) return "Benchmarks"
+    if (a == EnvArea.profiling) return "Profiling and baselines"
+    if (a == EnvArea.test) return "Tests"
+    if (a == EnvArea.example) return "Examples and tutorials"
+    return "daslang core knobs dasLLAMA honours"
+}
+
+def private area_note(a : EnvArea) : string {
+    if (a == EnvArea.engine) return "Read by the inference engine itself, so these affect any program that loads a model."
+    if (a == EnvArea.metal) return "Apple GPU backend. Absent on non-Apple builds, where setting them does nothing."
+    if (a == EnvArea.vulkan) return "Vulkan GPU backend. Present only where the dasVulkan package is installed."
+    if (a == EnvArea.accelerate) return "Apple Accelerate / AMX float lane. `DASLLAMA_ACCEL` arms the whole group."
+    if (a == EnvArea.core) return "Owned by daslang, not by dasLLAMA — listed because dasLLAMA's behaviour depends on them. `DAS_TUNE_*` is covered in `skills/tune.md`."
+    return ""
+}
+
+//! Renders the whole registry as the `ENVIRONMENT.md` body, grouped by area. `modules/dasLLAMA/
+//! ENVIRONMENT.md` is this output verbatim — `harness/gen_env_doc.das` writes it and
+//! `tests/test_env_registry.das` fails when the checked-in file drifts from it.
+def public env_markdown() : string {
+    var reg <- env_registry()
+    let areas <- [EnvArea.engine, EnvArea.metal, EnvArea.vulkan, EnvArea.accelerate,
+                  EnvArea.harness, EnvArea.benchmark, EnvArea.profiling, EnvArea.test,
+                  EnvArea.example, EnvArea.core]
+    let out = build_string() $(var w) {
+        w |> write("# dasLLAMA environment variables\n\n")
+        w |> write("GENERATED from `env_registry()` in `dasllama/dasllama_env.das` — do not edit by hand.\n")
+        w |> write("Regenerate with `daslang modules/dasLLAMA/harness/gen_env_doc.das`; a knob read anywhere\n")
+        w |> write("in the tree without a registry entry fails `tests/test_env_registry.das`.\n\n")
+        w |> write("Types: **flag** is unset-means-default, `0`/`false`/`off`/`no`/empty is false and\n")
+        w |> write("anything else true; **number** falls back to the default when unset or unparseable;\n")
+        w |> write("**text** and **path** are taken verbatim. Every read goes through `env_flag` /\n")
+        w |> write("`env_int` / `env_int64` / `env_str`, so the rules are the same everywhere.\n\n")
+        w |> write("A knob is read ONCE, at init or behind a one-time gate — reading the environment on a\n")
+        w |> write("per-token path is what PERF027 exists to catch (see `skills/perf_lint.md`).\n")
+        for (a in areas) {
+            var any = false
+            for (e in reg) {
+                if (e.area != a) continue
+                if (!any) {
+                    w |> write("\n## {area_title(a)}\n\n")
+                    let note = area_note(a)
+                    if (!empty(note)) {
+                        w |> write("{note}\n\n")
+                    }
+                    w |> write("| Variable | Type | Default | Effect |\n|---|---|---|---|\n")
+                    any = true
+                }
+                let dflt = empty(e.dflt) ? "unset" : e.dflt
+                w |> write("| `{e.name}` | {kind_name(e.kind)} | {dflt} | {e.doc} |\n")
+            }
+        }
+    }
+    delete reg
+    return out
 }
 
 //! True when `name` is a registered knob.
