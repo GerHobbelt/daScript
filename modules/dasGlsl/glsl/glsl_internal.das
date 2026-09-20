@@ -400,7 +400,7 @@ class GlslExport : AstVisitor {
             pass
         } elif (fun._module.name == "builtin") {
             pass
-        } elif (fun._module.name == "glsl_common") {
+        } elif (fun._module.name == "glsl_common" || fun._module.name == "shader_lingua_franca") {
             pass
         } elif (fun._module.name == "math" || fun._module.name == "math_bits") {
             pass
@@ -534,7 +534,7 @@ class GlslExport : AstVisitor {
         for_each_function(mod, "") $(fun) {
             if (depFun |> key_exists(intptr(fun))) {
                 if (!isMainFunction(fun)) {
-                    if (fun._module.name != "glsl_common") {
+                    if (fun._module.name != "glsl_common" && fun._module.name != "shader_lingua_franca") {
                         let ss = describe_glsl_function(fun)
                         *writer |> write("{ss};")
                         newLine(1)
@@ -707,7 +707,7 @@ class GlslExport : AstVisitor {
 // structure
     def override canVisitStructure(str : Structure?) {
         if (!(depStruct |> key_exists(intptr(str)))) return false
-        return !(str._module.name == "glsl_common")
+        return !(str._module.name == "glsl_common" || str._module.name == "shader_lingua_franca")
     }
     def override preVisitStructure(str : StructurePtr) {
         if (str.flags.isClass) {
@@ -762,7 +762,7 @@ class GlslExport : AstVisitor {
     }
 // function
     def override canVisitFunction(arg : Function?) : bool {
-        if (!depFun |> key_exists(intptr(arg)) || arg._module.name == "glsl_common") return false
+        if (!depFun |> key_exists(intptr(arg)) || arg._module.name == "glsl_common" || arg._module.name == "shader_lingua_franca") return false
         return !(arg._module.name == "math" || arg._module.name == "math_bits")
     }
     def override preVisitFunction(fun : FunctionPtr) {
@@ -883,7 +883,7 @@ class GlslExport : AstVisitor {
 // global let
     def override canVisitGlobalVariable(arg : Variable?) : bool {
         if (!depVar |> key_exists(intptr(arg))) return false
-        return !("{arg._module.name}" |> find("glsl_") != -1)
+        return !("{arg._module.name}" |> find("glsl_") != -1 || arg._module.name == "shader_lingua_franca")
     }
     def checkUniformType(typ : TypeDeclPtr) {
         if (!caps.restrict_uniform_types || typ.baseType == Type.tFloat4) return
@@ -967,8 +967,13 @@ class GlslExport : AstVisitor {
             if (arg.annotation |> find_arg("groupshared") ?as tBool ?? false) {
                 needInit = false
             }
+            // The Vulkan rail authors UBOs as @uniform and per-frame constants as @push_constant; GL
+            // has no push constants, so a @push_constant block maps to a plain GL uniform (bound loose
+            // by the host). Both lower to `uniform ...` here. (harmonization arc, Phase 2 / D4.)
+            let isUniform = ((arg.annotation |> find_arg("uniform") is tBool) ||
+                (arg.annotation |> find_arg("push_constant") is tBool))
             if (shaderType == ShaderType.vertex) {
-                if (arg.annotation |> find_arg("uniform") is tBool) {
+                if (isUniform) {
                     checkUniformType(arg._type)
                     if (outputSamplerMacro(arg)) return
                     *writer |> write("uniform "); needInit = false
@@ -980,11 +985,13 @@ class GlslExport : AstVisitor {
                 if (arg.annotation |> find_arg("in") is tBool) {
                     *writer |> write("in "); needInit = false
                 }
-                if (arg.annotation |> find_arg("inout") is tBool) {
+                // @inout and (Vulkan-style) @out are both vertex-stage outputs -> `out`.
+                if (arg.annotation |> find_arg("inout") is tBool ||
+                    arg.annotation |> find_arg("out") is tBool) {
                     *writer |> write("out "); needInit = false
                 }
             } elif (shaderType == ShaderType.fragment) {
-                if (arg.annotation |> find_arg("uniform") is tBool) {
+                if (isUniform) {
                     checkUniformType(arg._type)
                     if (outputSamplerMacro(arg)) return
                     *writer |> write("uniform "); needInit = false
@@ -1006,7 +1013,7 @@ class GlslExport : AstVisitor {
                         *writer |> write("shared ")
                     }
                 }
-                if (arg.annotation |> find_arg("uniform") is tBool) {
+                if (isUniform) {
                     checkUniformType(arg._type)
                     if (outputSamplerMacro(arg) || outputImageMacro(arg)) return
                     *writer |> write("uniform "); needInit = false
@@ -1164,6 +1171,12 @@ class GlslExport : AstVisitor {
     }
 // call
     def override preVisitExprCall(expr : ExprCall?) {
+        if (is_shadow_compare_call(expr)) {
+            // GL has no textureCompare(): a sampler2DShadow samples with texture(s, vec3(uv, ref)).
+            // The vec3() wrap of (uv, compare) is emitted around args 1+2 in visitExprCallArgument.
+            *writer |> write("texture(")
+            return
+        }
         var fnName : string
         unsafe {
             fnName = glsl_function_name(reinterpret<FunctionPtr> expr.func)
@@ -1183,6 +1196,17 @@ class GlslExport : AstVisitor {
         return expr
     }
     def override visitExprCallArgument(expr : ExprCall?; arg : ExpressionPtr; last : bool) {
+        if (is_shadow_compare_call(expr)) {
+            // args: 0=sampler, 1=uv (float2), 2=compare (float) -> texture(s, vec3(uv, compare))
+            if (arg == expr.arguments[0]) {
+                *writer |> write(",vec3(")
+            } elif (arg == expr.arguments[1]) {
+                *writer |> write(",")
+            } elif (arg == expr.arguments[2]) {
+                *writer |> write(")")
+            }
+            return arg
+        }
         if (!last) {
             *writer |> write(",")
         }
@@ -1263,9 +1287,15 @@ class GlslExport : AstVisitor {
     def override preVisitExprCloneRight(expr : ExprClone?; right : ExpressionPtr) {
         error("clone is not supported", expr.at)
     }
-// with
+// with — the optimizer's BlockFolding normally inlines the with-body and drops the subject before
+// the shader-emit patch runs; a no-optimization compile (e.g. lint) keeps `with` alive to here. Emit
+// the body as a transparent scope (its field accesses are already resolved to subject.field by infer)
+// and preprocess the subject expression out, mirroring daslib/aot_cpp's #if 0 handling.
     def override preVisitExprWith(expr : ExprWith?) {
-        error("with is not supported", expr.at)
+        *writer |> write("\n#if 0 // with: subject (optimizations off)\n")
+    }
+    def override preVisitExprWithBody(expr : ExprWith?; body : ExpressionPtr) {
+        *writer |> write("\n#endif\n")
     }
 // while
     def override preVisitExprWhile(expr : ExprWhile?) {
@@ -1558,7 +1588,20 @@ class GlslExport : AstVisitor {
                 return
             }
         }
-        *writer |> write("{expr.name}")
+        // shader_lingua_franca carries the unified (Vulkan) builtin spelling; the few names that
+        // diverge from GLSL get renamed here on the way out: gl_VertexIndex -> gl_VertexID and
+        // gl_InstanceIndex -> gl_InstanceID (the GLSL desktop-core / ES names for the per-vertex /
+        // per-instance index). Gated on the shared module so a user variable that happens to share
+        // the name is never rewritten.
+        if (en == "gl_VertexIndex" && expr.variable != null && expr.variable._module.name == "shader_lingua_franca") {
+            *writer |> write("gl_VertexID")
+            return
+        }
+        if (en == "gl_InstanceIndex" && expr.variable != null && expr.variable._module.name == "shader_lingua_franca") {
+            *writer |> write("gl_InstanceID")
+            return
+        }
+        *writer |> write(en)
     }
 // field
     def override visitExprField(expr : ExprField?) : ExpressionPtr {
@@ -1868,9 +1911,17 @@ def bind_uniform_function_name(fnMain : FunctionPtr) {
 [macro_function]
 def is_glsl_structure(arg; name : string) {
     if (arg._type.baseType == Type.tStructure) {
-        if (arg._type.structType._module.name == "glsl_common" && arg._type.structType.name == name) return true
+        if ((arg._type.structType._module.name == "glsl_common" || arg._type.structType._module.name == "shader_lingua_franca") && arg._type.structType.name == name) return true
     }
     return false
+}
+
+// A shader_lingua_franca textureCompare(sampler2DShadow, uv, ref) call — GL spells shadow sampling as
+// texture(s, vec3(uv, ref)), so preVisitExprCall / visitExprCallArgument rewrite it on the way out.
+[macro_function]
+def is_shadow_compare_call(expr : ExprCall?) : bool {
+    return (expr != null && expr.name == "textureCompare" &&
+        expr.func != null && expr.func._module != null && expr.func._module.name == "shader_lingua_franca")
 }
 
 [macro_function]

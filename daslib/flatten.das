@@ -21,7 +21,6 @@ require daslib/ast
 require daslib/ast_boost
 require daslib/templates_boost
 require daslib/rtti
-require strings
 require daslib/flatten_opt
 
 // Phase token carried as the "phase" argument of the [flatten] annotation on
@@ -52,6 +51,7 @@ let private STD_WHITELIST : table<string> <- {
     "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sincos",
     "radians", "degrees",   // lowered to `x * K` by flatten_opt (no opcode needed)
     "dot", "cross", "length", "normalize", "distance", "reflect", "refract",
+    "hmin", "hmax", "hadd",   // horizontal reduces emitted by pack_map_reduce (flatten_opt_pack)
     "lerp", "mix", "step", "smooth_step", "rcp", "mad",
     "float2", "float3", "float4", "int2", "int3", "int4", "uint2", "uint3", "uint4"
 }
@@ -141,17 +141,6 @@ def private contains(a : array<string>; s : string) : bool {
         if (x == s) return true
     }
     return false
-}
-
-// Strip a monomorphized generic's mangling to the bare function name: an OR-type
-// instance is named `<scope>`<name>`<hash>` (backtick = char 96). Used so the
-// caller-supplied whitelist can match by simple name regardless of instantiation.
-def private simple_name(fullname : string) : string {
-    let t1 = find(fullname, 96, 0)
-    if (t1 < 0) return fullname
-    let t2 = find(fullname, 96, t1 + 1)
-    let endp = t2 < 0 ? length(fullname) : t2
-    return slice(fullname, t1 + 1, endp)
 }
 
 def private p_and(a, b : ExpressionPtr) : ExpressionPtr {
@@ -359,6 +348,14 @@ def private lift_expr(var ctx : FlatCtx?; e : ExpressionPtr; structPred : Expres
     if (e is ExprMakeTuple) {
         var n = clone_expression(e)
         var o = n as ExprMakeTuple
+        for (vi in range(length(o.values))) {
+            o.values[vi] = lift_expr(ctx, o.values[vi], structPred, out)
+        }
+        return n
+    }
+    if (e is ExprMakeArray) {
+        var n = clone_expression(e)
+        var o = n as ExprMakeArray
         for (vi in range(length(o.values))) {
             o.values[vi] = lift_expr(ctx, o.values[vi], structPred, out)
         }
@@ -753,6 +750,15 @@ def public flatten_expand_lerp : bool {
 }
 
 [macro_function]
+def public flatten_hadd_pack_pairs : bool {
+    //! True when the COMPILING module sets `options _flatten_hadd_pack_pairs = true` — pack width-2
+    //! horizontal sums (`a + b`) into `hadd2` too. The default packs width >=3 only: a width-2 pack is
+    //! +1 node on a node-graph backend (a `combine2` with no offsetting add saved), but a win in cycles
+    //! on a SIMD CPU backend. COMPILE-TIME ONLY: patch code reads it once, runtime tools pass their flag.
+    return compiling_program()._options |> find_arg("_flatten_hadd_pack_pairs") ?as tBool ?? false
+}
+
+[macro_function]
 def public flatten_fold(var func : FunctionPtr; no_fast_math : bool = false; expand_lerp : bool = false) : bool {
     //! Post-infer fold pass (delegates to `fold_body`): collapse `const ? a : b`, fold identities,
     //! drop pure self-assigns. Run AFTER re-inference; returns true if anything changed. Compile-time
@@ -777,11 +783,20 @@ def public flatten_optimize(var func : FunctionPtr; barriers : table<string>; no
 }
 
 [macro_function]
-def public flatten_fuse(var func : FunctionPtr; no_fast_math : bool = false) : bool {
+def public flatten_pack(var func : FunctionPtr; no_fast_math : bool = false) : bool {
+    //! Scalar-packing map-reduce re-roll (delegates to `pack_map_reduce`): recognize an unrolled
+    //! min/max reduction's N isomorphic scalar lanes and pack them into width-W vector ops + one
+    //! horizontal reduce. Run PRE-fold (before `flatten_fold`); re-infer after. no_fast_math skips it.
+    return pack_map_reduce(func, no_fast_math)
+}
+
+[macro_function]
+def public flatten_fuse(var func : FunctionPtr; no_fast_math : bool = false; hadd_min_width : int = 3) : bool {
     //! PHASE_FUSED finishing pass (delegates to `fuse_body`): collapse same-vector lane sums into
-    //! `dot(v, mask)`, re-pack ctor lane patterns, `a*b ± c` into mad, and the expanded lerp shape
-    //! back into lerp. Call on the optimized, re-inferred body; repeat until it returns false.
-    return fuse_body(func, no_fast_math)
+    //! `dot(v, mask)`, independent scalar sums into `hadd` (groups of width [hadd_min_width..4]),
+    //! re-pack ctor lane patterns, `a*b ± c` into mad, and the expanded lerp shape back into lerp.
+    //! Call on the optimized, re-inferred body; repeat until it returns false.
+    return fuse_body(func, no_fast_math, hadd_min_width)
 }
 
 def public flatten_opt_residuals(var func : FunctionPtr; no_fast_math : bool = false) : array<string> {
@@ -975,7 +990,7 @@ class FlattenAnnotation : AstFunctionAnnotation {
             // `lerp`, re-inferring to resolve the new calls; iterates (each round strictly
             // drops a `+`/`-`, so it converges), a clean round falls through to the shape check.
             set_flatten_phase(func, PHASE_FUSED)
-            if (flatten_fuse(twin, flatten_no_fast_math())) {
+            if (flatten_fuse(twin, flatten_no_fast_math(), flatten_hadd_pack_pairs() ? 2 : 3)) {
                 astChanged = true
                 return true
             }

@@ -78,6 +78,7 @@ let HINT_WHITELIST : table<string> <- {
     "abs", "min", "max", "clamp", "saturate", "frac", "floor", "ceil", "mad", "lerp",
     "sqrt", "pow", "sin", "cos", "atan2", "log", "exp", "sign", "radians", "degrees",
     "dot", "cross", "length", "normalize", "fresnel",
+    "hmin", "hmax", "hadd",
     "remap", "one_minus", "step", "smooth_step", "unpack_normal",
     "float", "int",
     "float2", "float3", "float4", "int2", "int3", "int4",
@@ -1544,6 +1545,23 @@ def private shader_annotation_arg(func : FunctionPtr; argName : string) : bool {
     return false
 }
 
+// `[pixel_shader(flatten=false)]` -> emit IR for the source VERBATIM: no inline / fold / optimize /
+// fuse. The source must already be flat (the backend bans if/else, loops, helper calls). Lets us
+// A/B a hand-vectorized shader against its scalar twin with the backend producing exactly what is
+// written. Presence-aware (a missing `flatten` arg means flatten stays ON).
+def private flatten_is_off(func : FunctionPtr) : bool {
+    for (ann in func.annotations) {
+        if (ann.annotation.name == "pixel_shader") {
+            for (a in ann.arguments) {
+                if ("{a.name}" == "flatten" && a.basicType == Type.tBool) {
+                    return !a.bValue
+                }
+            }
+        }
+    }
+    return false
+}
+
 [macro_function]
 def private set_shader_annotation_flag(var func : FunctionPtr; argName : string) {
     for (ann in func.annotations) {
@@ -1583,11 +1601,22 @@ class PixelShaderMacro : AstFunctionAnnotation {
     def override patch(var func : FunctionPtr; var group : ModuleGroup;
                        args, progArgs : AnnotationArgumentList; var errors : das_string;
                        var astChanged : bool&) : bool {
-        // Skip during lint (the twin is irrelevant to linting source).
-        if (is_in_lint_check() || shader_annotation_arg(func, "folded")) {
+        // Skip during lint (the twin is irrelevant to linting source); flatten=off also skips ALL
+        // passes — finish() then builds IR on the source verbatim (which must already be flat).
+        if (is_in_lint_check() || shader_annotation_arg(func, "folded") || flatten_is_off(func)) {
             return true
         }
         if (shader_annotation_arg(func, "flattened")) {
+            // Scalar packing runs FIRST (pre-fold): the unrolled lane bodies are still isomorphic
+            // and un-CSE'd, so a min/max reduction re-rolls cleanly into width-W vector ops; the
+            // fold/optimize/fuse stages below then clean the boundary combine/splat glue.
+            if (!shader_annotation_arg(func, "packed")) {
+                set_shader_annotation_flag(func, "packed")
+                if (flatten_pack(func, flatten_no_fast_math())) {
+                    astChanged = true
+                    return true
+                }
+            }
             // Cycle 2+ (re-inferred after flattening): collapse const-condition selects
             // and drop the resulting pure self-assigns (`acc = acc`) — without this a
             // loop-var-gated accumulate leaves a self-referential accumulator the IR
