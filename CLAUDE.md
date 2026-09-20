@@ -22,6 +22,16 @@ daslang was created at Gaijin Entertainment to solve a concrete problem: **inter
 
 See `doc/source/reference/design_philosophy.rst` for the full design philosophy document.
 
+## Designing with macros — the quantum advantage
+
+Other languages have macros (Rust, C++, Lisp). What daslang combines that they don't is full AST + type access at compile time, gen2 syntax that already reads like the target domain, qmacro/quote sugar for AST construction, and zero-runtime-cost expansion. The mix makes a different class of EDSL viable. Every flagship win in this codebase falls out of that — `[sql_table]`, `_sql`, `linq_boost`, `text_match`, `[sql_index]`, the AOT codegen itself — each one collapses 20+ lines of user-side ceremony into a single declarative form *and* keeps the library implementation smaller than the hand-rolled equivalent. Macros are not a "fancy template" — they are how daslang competes.
+
+**Use macros as a design lens.** Before writing an API or its implementation, ask: *would a macro collapse this?* If the user's call site is mechanical — derivable from a smaller declarative form — the macro is probably the answer. The win compounds: a typed surface saves boilerplate at the call site (`add_column(type<T>, .Field)` vs hand-typed `ALTER TABLE … ADD COLUMN …` strings), and the macro generates the codegen at the library layer. Two boilerplates collapsed at once.
+
+**Don't stop at one meta level.** When a macro itself has mechanical patterns — qmatch templates, repeated AST shape walks, parallel arm-per-form blocks — write a sub-macro. `linq_boost`'s pattern-matchers, dasSQLITE's shared walker, qmacro-built ExprMakeStruct helpers — all macro-on-macro. If macro-on-macro buys an order-of-magnitude reduction in either user code or library code, do it. The compile-time cost is a few ms per expansion; the maintenance cost saved is ongoing.
+
+Read `skills/das_macros.md` before reaching for a hand-rolled solution that a macro would have collapsed.
+
 ## Build & Run
 
 CMake-based build, supported on Windows / Linux / macOS / iOS / Android / WASM (CI runs the full matrix). Quick start: `cmake --build build --config Release -j 64`, then run `bin/Release/daslang path/to/script.das` (Windows MSVC layout) or `build/daslang ...` (single-config Make/Ninja). Builds are slow (15-25 min clean, 2-10 min incremental) — always pass `timeout: 0` to long `cmake --build` commands, do NOT assume "no output" means failure.
@@ -58,7 +68,9 @@ Task-specific instructions are split into skill files under `skills/`. You MUST 
 | `skills/daslang_live.md` | `daslang-live`, live-reload lifecycle, `[live_command]`, `[before_reload]`/`[after_reload]` |
 | `skills/perf_lint.md` | Adding rules to `daslib/perf_lint.das` |
 | `skills/style_lint.md` | Adding rules to `daslib/style_lint.das` |
+| `skills/strings.md` | Any `.das` string operation — `find`/`replace`/`split`/parsing/`build_string`/`peek_data` (covers `strings`, `daslib/strings_boost`, `daslib/strings_convert`) |
 | `skills/regex.md` | Writing regular expressions in `.das` code |
+| `skills/glob.md` | Writing or reviewing any glob/wildcard pattern handling — file selection, include/exclude masks, pattern-match-on-paths (`*` / `?` / `**` / `[abc]`) |
 | `skills/gc_migration.md` | Migrating external/archived code from `smart_ptr<T>` AST patterns to gc_node (in-tree migration is complete) |
 | `skills/version_update.md` | Bumping the daslang version number |
 | `skills/jobque_debugging.md` | Channel/LockBox/JobStatus/Feature leaks (`--track-job-status`, `DumpJobQueLeaks`) |

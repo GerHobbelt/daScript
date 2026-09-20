@@ -4,6 +4,8 @@
 
 Every `.das` file in this directory tree is listed below, grouped by subdirectory. Files marked **expect** use `expect` directives and are expected to produce specific compile errors. Helper/module files that are not standalone tests are marked *(helper)*.
 
+**Naming convention for expected-failure tests:** Files that are expected to *fail compilation* use one of three filename prefixes: `failed_`, `cant_`, or `invalid_`. Tools that need to skip files with no compilable AST (e.g. `--ser` serialization passes) should filter on these three prefixes.
+
 ## live_host/
 
 > **Note:** These tests require the dasLiveHost module. Skipped automatically via `.das_test` when the module is not available. Run separately: `dastest -- --test tests/live_host/`
@@ -361,6 +363,7 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | fio_errors.das | Path manipulation and error handling — extension, dir_name, base_name, normalize, mkdir/rmdir edge cases | |
 | fio_file.das | File I/O — fopen, fread, fwrite with fuzzing | |
 | fio_utils.das | File utilities — fexist, rmdir, rmdir_rec, fread/fwrite by path, get_das_version | |
+| glob_test.das | Pathname glob — `match_glob` (literal, `*`, `**`, `?`, `[a-z]`, `[!abc]`, edge cases), `glob`, `glob_filtered` walk, `is_glob_pattern` | |
 | popen_argv.das | `popen_argv` — basic invocation, non-zero exit on unknown flag, exit code capture | |
 
 ## functional/

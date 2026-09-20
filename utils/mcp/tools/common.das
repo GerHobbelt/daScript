@@ -300,7 +300,7 @@ def run_and_capture(args : array<string>; var output : string&; timeout_sec : fl
 
 // Returns a unique temp .das file path that won't collide with concurrent processes.
 def make_temp_das_file() : string {
-    return "{get_das_root()}/_mcp_stub_{ref_time_ticks()}.das"
+    return path_join(get_das_root(), "_mcp_stub_{ref_time_ticks()}.das")
 }
 
 // ── File path utilities ──────────────────────────────────────────────
@@ -309,73 +309,20 @@ def resolve_path(path : string) : string {
     if (empty(path)) {
         return get_das_root()
     }
-    if (length(path) > 0 && first_character(path) != '/' && find(path, ":") < 0) {
-        return "{get_das_root()}/{path}"
+    if (is_absolute(path)) {
+        return path
     }
-    return path
+    // Preserve Windows drive-relative paths (`C:foo`). std::filesystem
+    // doesn't classify them as absolute (no trailing separator), so they'd
+    // otherwise be joined under das_root and produce an invalid path.
+    if (find(path, ":") == 1) {
+        return path
+    }
+    return path_join(get_das_root(), path)
 }
 
 def make_relative_path(path, root : string) : string {
-    var result = path
-    if (find(result, root) == 0) {
-        result = slice(result, length(root) + 1)
-    }
-    return replace(result, "\\", "/")
-}
-
-// Expand a glob pattern (e.g. "utils/mcp/tools/*.das") into a list of file paths
-def expand_glob(pattern : string; var result : array<string>) {
-    let last_slash = max(rfind(pattern, "/"), rfind(pattern, "\\"))
-    var dir_part = "."
-    var file_pattern = pattern
-    if (last_slash >= 0) {
-        dir_part = slice(pattern, 0, last_slash)
-        file_pattern = slice(pattern, last_slash + 1)
-    }
-    var matches : array<string>
-    dir(dir_part) $(fname) {
-        if (fname == "." || fname == "..") {
-            return
-        }
-        if (glob_match(file_pattern, fname)) {
-            if (dir_part == ".") {
-                matches |> push(fname)
-            } else {
-                matches |> push("{dir_part}/{fname}")
-            }
-        }
-    }
-    sort(matches)
-    result |> reserve(length(result) + length(matches))
-    for (m in matches) {
-        result |> push(m)
-    }
-}
-
-// Parse file argument: comma- or newline-separated list of files, dirs, and
-// globs (any part may contain `*` / `?` wildcards, expanded via expand_glob).
-def parse_file_list(file : string; var result : array<string>) {
-    if (find(file, ",") < 0 && find(file, "\n") < 0) {
-        let part = strip(file)
-        if (empty(part)) {
-            return
-        }
-        if (find(part, "*") >= 0 || find(part, "?") >= 0) {
-            expand_glob(part, result)
-        } else {
-            result |> push(part)
-        }
-        return
-    }
-    for (raw in split_by_chars(file, ",\n")) {
-        let part = strip(raw)
-        if (empty(part)) {
-            continue
-        }
-        if (find(part, "*") >= 0 || find(part, "?") >= 0) {
-            expand_glob(part, result)
-        } else {
-            result |> push(part)
-        }
-    }
+    var err : string
+    let rel = relative(path, root, err)
+    return to_generic_path(empty(rel) ? path : rel)
 }
