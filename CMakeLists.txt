@@ -28,6 +28,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(DAS_FLEX_BISON_DISABLED "Disable FLEX/BISON stage" OFF)
 option(DAS_CLANG_BIND_DISABLED "Disable dasClangBind (libclang bindings, C/C++ parsing)" ON)
 option(DAS_LLVM_DISABLED "Disable dasLLVM (llvm bindings)" ON)
+option(DAS_SMT_DISABLED "Disable dasSMT (Z3 SMT solver bindings)" ON)
 option(DAS_HV_DISABLED "Disable dasHV (websokets,http server and client)" OFF)
 option(DAS_GLFW_DISABLED "Disable dasGLFW (GLFW window for graphics apps)" OFF)
 option(DAS_AUDIO_DISABLED "Disable dasAudio (Miniaudio sound library)" OFF)
@@ -2022,12 +2023,12 @@ install(FILES ${DAS_UNCATEGORIZED_EXAMPLES}
     DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/uncategorized
 )
 
-# Install telegram example
+# Install telegram echo-bot example
 install(FILES
-    ${PROJECT_SOURCE_DIR}/examples/telegram/.das_package
-    ${PROJECT_SOURCE_DIR}/examples/telegram/README.md
-    ${PROJECT_SOURCE_DIR}/examples/telegram/echo_bot.das
-    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/telegram
+    ${PROJECT_SOURCE_DIR}/examples/telegram/echo-bot/.das_package
+    ${PROJECT_SOURCE_DIR}/examples/telegram/echo-bot/README.md
+    ${PROJECT_SOURCE_DIR}/examples/telegram/echo-bot/echo_bot.das
+    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/telegram/echo-bot
 )
 
 # Install claude example
