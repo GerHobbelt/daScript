@@ -579,9 +579,10 @@ namespace das
         virtual bool isYetAnotherVectorTemplate() const { return false; }   // has [], there is length(x), data is linear in memory
         // factory
         virtual void * factory () const { return nullptr; }
-        // new and delete, jit versions
+        // new, delete, and clone, jit versions
         virtual void * jitGetNew () const { return nullptr; }
         virtual void * jitGetDelete () const { return nullptr; }
+        virtual void * jitGetClone () const { return nullptr; }
         uint64_t ownSemanticHash = 0;
     };
 
@@ -1585,6 +1586,9 @@ namespace das
         string jit_path_to_linker;               // Path to linker. Optional, we'll use clang-cl from LLVM on Windows and cc otherwise.
     // dll loading
         vector<string> dll_search_paths;          // additional search paths for dll loading
+    // one-liners
+        /*option*/ bool temp_one_liner_warning = false;
+        /*option*/ bool temp_table_lint_warning = false;
     };
 
     struct CommentReader : public ptr_ref_count {

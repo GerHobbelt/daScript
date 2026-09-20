@@ -1961,10 +1961,10 @@ namespace das {
             if ( nc->type->aotAlias ) {
                 ss << "das_alias<" << nc->type->alias << ">::from(";
             }
-            ss << "das_null_coalescing<" << describeCppType(nc->defaultValue->type,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no)
+            ss << "das_null_coalescing<" << describeCppType(nc->type,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no)
                 << ">::get(";
             if ( nc->subexpr->type->isAotAlias() ) {
-                ss << "(" << describeCppType(nc->defaultValue->type,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no) << " *)";
+                ss << "(" << describeCppType(nc->type,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no) << " *)";
             }
         }
         virtual void preVisitNullCoaelescingDefault ( ExprNullCoalescing * nc, Expression * expr ) override {
@@ -2289,6 +2289,9 @@ namespace das {
             const auto & seT = isPtr ? expr->subexpr->type->firstType : expr->subexpr->type;
             if ((seT->dim.size() || seT->isGoodArrayType() || seT->isGoodTableType())) {
                 ss << describeCppType(seT,CpptSubstitureRef::no,CpptSkipRef::yes,CpptSkipConst::yes) << "::safe_index(";
+            } else if (isPtr && !seT->isVectorType()) {
+                ss << "das_index<" << describeCppType(expr->subexpr->type,CpptSubstitureRef::no,CpptSkipRef::yes,CpptSkipConst::no)
+                    << ">::safe_at(";
             } else {
                 ss << "das_index<" << describeCppType(seT,CpptSubstitureRef::no,CpptSkipRef::yes,CpptSkipConst::no)
                     << ">::safe_at(";
@@ -4010,7 +4013,7 @@ namespace das {
         }
 
         if (!fnn.empty()) {
-            logs << "\n#pragma optimize(\"\", off)\n"; // Let's disable any optimizations. It helps on MSVC to compile faster
+            logs << "\n#ifdef _MSC_VER\n#pragma optimize(\"\", off)\n#endif\n"; // Let's disable any optimizations. It helps on MSVC to compile faster
             // We should duplicate fields of AotFactory to reduce comptime.
             logs << "struct AotFunction { uint64_t hash; bool is_cmres; void * fn; vec4f (*wrappedFn)(Context*); };\n";
             logs << "static AotFunction functions[] = {\n";
@@ -4021,7 +4024,7 @@ namespace das {
                      << "(void*)&" << aotFuncName(fn) << ", &__wrap_" << aotFuncName(fn) << " },\n";
             }
             logs << "};\n";
-            logs << "#pragma optimize(\"\", on)\n"; // Enable optimizations back
+            logs << "#ifdef _MSC_VER\n#pragma optimize(\"\", on)\n#endif\n"; // Enable optimizations back
         }
         if ( headers ) {
             logs << "\nvoid registerAot ( AotLibrary & aotLib ) \n{\n";

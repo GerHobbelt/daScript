@@ -28,6 +28,7 @@ See `doc/source/reference/design_philosophy.rst` for the full design philosophy 
 - **Generate:** `generate_msvc_2022.bat` → creates `build/DAS.sln`
 - **Build:** `cmake --build build --config Release`
 - **Compiler binary:** `bin/Release/daslang.exe`
+- **Live-reload host:** `bin/Release/daslang-live.exe` — same script runs in both; see `utils/daslang-live/main.cpp`
 - **Run a script:** `bin/Release/daslang.exe path/to/script.das`
 - **Run tests:** `bin/Release/daslang.exe dastest/dastest.das -- --test path/to/test.das`
 - **AOT tests:** `cmake --build build --config Release --target test_aot` then `bin/Release/test_aot.exe dastest/dastest.das -- --test tests/aot`
@@ -96,6 +97,7 @@ Task-specific instructions are split into skill files under `skills/`. You MUST 
 | `skills/install_instructions.md` | Creating or updating AI instruction files (`install/CLAUDE.md`, `install/skills/`) for the installed SDK |
 | `skills/aot_testing.md` | Adding AOT test files, working with the `test_aot` binary, `Module::aotRequire()`, CMake AOT macros, **debugging AOT hash mismatches** |
 | `skills/visitor_gen_bind.md` | Adding or modifying `Visitor` virtual methods, `canVisit*` gates, running `gen_bind.das`, updating adapter bindings in `ast_gen.inc` |
+| `skills/daslang_live.md` | Working with `daslang-live.exe`, live-reload lifecycle, REST API, `[live_command]`, `[before_reload]`/`[after_reload]`, persistent store, `live/glfw_live`, `live/live_api` |
 
 Multiple skill files may apply to a single task. For example, creating a new daslib module requires reading `skills/das_formatting.md`, `skills/daslib_modules.md`, and possibly `skills/documentation_rst.md`.
 
@@ -207,6 +209,8 @@ All code MUST use gen2 syntax (add `options gen2` at the top of every file). Key
 - Blocks cannot be stored/returned/captured — use lambdas or function pointers
 - Class methods: `def const`, `def abstract const`, `def static`; call syntax `obj.method()`, `obj->method()`, `obj |> method()`
 - **`is`/`as` on handled types checks EXACT type**, not C++ inheritance — `expr is ExprField` is `false` when `expr` is `ExprSafeField`. `as` on wrong type crashes. Must handle each concrete type explicitly.
+- `#pragma optimize` in AOT-generated code must be wrapped in `#ifdef _MSC_VER` — Clang warns on unknown pragmas
+- **Macro-generated struct variables** need `default<$t(st)>` initialization (not `var x : $t(st)`) — avoids "uninitialized variable" errors for structs without field defaults
 
 ## Key Directories
 
@@ -220,10 +224,14 @@ All code MUST use gen2 syntax (add `options gen2` at the top of every file). Key
 - `tutorials/language/` — Language tutorial `.das` files
 - `tutorials/integration/cpp/` — C++ integration tutorials
 - `modules/` — External plugin modules
+- `modules/dasLiveHost/` — C++ module for live-reload host lifecycle (dynamic module)
+- `utils/daslang-live/` — Live-reloading application host (`daslang-live.exe`)
 - `utils/mcp/` — MCP server for AI coding assistants (20 tools, stdio transport, no extra deps)
 - `utils/daspkg/` — Package manager (install, update, build, search packages)
+- `examples/daslive/` — Live-reload examples (hello, triangle, tank_game, etc.)
 - `examples/daspkg/` — Package manager example projects
 - `examples/crash/` — Crash handler example (native + daslang stack traces)
+- `tests/live_host/` — Unit tests for dasLiveHost module (lifecycle, commands, store)
 - `include/daScript/misc/crash_handler.h` — Crash handler with daslang stack walk support
 
 ## MCP Server (AI Tool Integration)
