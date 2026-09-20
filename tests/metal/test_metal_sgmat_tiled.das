@@ -105,7 +105,7 @@ def test_sgmat_tiled_gpu_vs_cpu(t : T?) {
                 var bufs <- [bxa, bwb, byo, bk, bn]
                 var rerr : string
                 // (M/8)*(N/8) = 4 threadgroups of one simdgroup each — 128 threads
-                let ran = run_compute_1d(queue, pso, bufs, uint((M / 8) * (N / 8)) * TPG, TPG, rerr)
+                let ran = run_compute_1d(queue, pso, bufs, uint((M / 8) * (N / 8)) * TPG, TPG, rerr, sgmat_tiled_gpu_msl_tgmem)
                 t |> success(ran, "run_compute_1d: {rerr}")
                 if (ran) {
                     gpu_bad = buf_mismatch_exact(byo, want)

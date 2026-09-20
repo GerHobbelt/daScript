@@ -6,6 +6,7 @@ require math
 require strings  // to_int: DASLLAMA_CALLER_PRIO env override in setup_dasllama_jobque_
 require daslib/fio  // has_env_variable: DAS_JOBQUE_TEAM_RANK_GATE suppresses the profile's team_rank_gate knob
 require daslib/jobque_boost public  // matmul's threaded path expands parallel_for; consumers need its symbols
+require daslib/jobque_profile  // named trace categories + unit markers (set_trace_tags registers them)
 require dasllama/dasllama_par  // maybe_parallel_for: thread-or-inline a kernel body on a runtime size flag
 require dasllama/dasllama_tune  // [tuned]: reconstitute dot from dot_template with per-box loop hints
 require llvm/daslib/f16_cvt  // f16<->f32 converts: JIT half intrinsics on aarch64 / x64+F16C, exact bit-twiddle elsewhere
@@ -523,7 +524,12 @@ def public get_team_rank_gate() : int { return g_team_rank_gate }
 // by OP rather than stage-count. Gated — set_trace_tags(true) rides with jobque_trace_start in
 // the profiling harness; production dispatches never pay the extern call.
 var g_trace_tags = false
-def public set_trace_tags(on : bool) { g_trace_tags = on }
+def public set_trace_tags(on : bool) {
+    g_trace_tags = on
+    if (on && is_job_que_available()) {   // registries live on the que; stay que-independent like trace_tag
+        register_trace_categories()
+    }
+}
 let public TRACE_TAG_ATTN_CHAIN = 1
 let public TRACE_TAG_ATTN_STD = 2
 let public TRACE_TAG_FFN_CHAIN = 3
@@ -534,10 +540,31 @@ let public TRACE_TAG_SHEXP = 7
 let public TRACE_TAG_PLE = 8
 let public TRACE_TAG_ROUTE = 9   // MoE router GEMM + select/bucket (prefill section split)
 let public TRACE_TAG_PARK = 10   // MoE park/reduce bookkeeping around the expert GEMMs
+let public TRACE_TAG_DN = 11   // Gated DeltaNet layers (qwen35 hybrid) — separates dn from gated attn
 def public trace_tag(t : int) {
     if (g_trace_tags) {
         jobque_trace_tag(t)
     }
+}
+def public trace_marker(name : string; arg : int) {
+    // instant unit boundary ("token", "layer", "step") on the caller lane; same gate as trace_tag
+    if (g_trace_tags && is_job_que_available()) {
+        profile_marker(name, arg)
+    }
+}
+// names/colors match the lane-timeline viewer's dark-theme palette, so saved traces carry
+// the exact legend the artifact hardcoded
+def private register_trace_categories() {
+    profile_category(TRACE_TAG_ATTN_CHAIN, "attn chain", 0x5E96DEu)
+    profile_category(TRACE_TAG_ATTN_STD, "attn std", 0x5E96DEu)
+    profile_category(TRACE_TAG_FFN_CHAIN, "ffn chain", 0x43B08Au)
+    profile_category(TRACE_TAG_FFN_STD, "ffn per-op", 0x43B08Au)
+    profile_category(TRACE_TAG_CLS, "classifier", 0xAC82E4u)
+    profile_category(TRACE_TAG_MOE, "moe experts", 0xE08563u)
+    profile_category(TRACE_TAG_SHEXP, "shexp", 0xC39536u)
+    profile_category(TRACE_TAG_PLE, "ple", 0xC39536u)
+    profile_category(TRACE_TAG_ROUTE, "router", 0x4FC3D0u)
+    profile_category(TRACE_TAG_PARK, "park/reduce", 0xD678B4u)
 }
 
 //! Configure the job queue for dasLLAMA's pure fork/join matmul dispatch: pooled fork contexts,
@@ -1320,9 +1347,11 @@ struct KernelBackend {
     repack : RepackQ8Q8Fn
     mm_mx4 : MatmulMx4Q8Fn = @@mx4q8_unset_kernel
     // The mx4 BATCH kernels are optional (unlike mm_mx4): they are only dispatched when
-    // mx4_native_batch is set, so backends without them (arm64 — the laneq plane interleave makes a
-    // generic row-major fallback read garbage, not just run slow) keep the panic stubs and the
-    // expansion path instead. A backend that sets the flag must supply BOTH forms.
+    // mx4_native_batch is set, so backends without them keep the panic stubs (a generic row-major
+    // fallback over an interleaved plane would read garbage, not just run slow) and the expansion
+    // path instead. A backend that sets the flag must supply BOTH forms. The gen backends stamp
+    // them on both ISAs (the mx4 tile companion); portable carries row-major reference forms
+    // unflagged (probe/A-B only).
     mx4_batch : MatmulMx4Q8BatchFn = @@mx4q8_unset_batch
     mx4_batch_groupn : MatmulMx4Q8BatchGroupNFn = @@mx4q8_unset_batch_groupn
     repack_mx4 : RepackMx4Fn = @@repack_mx4_identity
@@ -1753,6 +1782,14 @@ def kq_rows_fn(fmt : int) : MatmulKqRowsFn {
 //! batched dispatch gates on it and falls back to serial per-position GEMVs when down.
 def kernel_backend_has_kq_batch() : bool {
     return g_active_has_kq_batch
+}
+
+//! A/B override for the grouped-MoE-prefill mx4 route: native mx4 batch GEMMs (the backend's
+//! mx4_native_batch default) vs the expand-to-Q8 + Q8 batch path. Safe to flip after load —
+//! both routes read the same repacked planes. Forcing `true` on a backend without the mx4
+//! batch slots hits their panic stubs; benchmark knob only.
+def set_mx4_native_batch(on : bool) {
+    g_active_mx4_native_batch = on
 }
 
 //! Does the active backend carry the region-list kq GEMV (kq_groupn — MoE expert dispatch)?
@@ -2678,6 +2715,54 @@ def silu4_batch(var x : array<float> | #; d, npos : int64) {
         var xp = addr(x[0])
         maybe_parallel_for(0, int(npos), lanes_for_work(npos * d * 16l, 0)) $(rb, re) {
             silu4(unsafe(xp + int64(rb) * d), int64(re - rb) * d)
+        }
+    }
+}
+
+//! Sigmoid gate: x[i] *= σ(g[i]) over the first `size` elements — the gated-attention out-gate
+//! shape (qwen35). Scalar reference form; the exp4 twin below is the production path.
+def sigmoid_gate(var x : float?; g : float const?; size : int64) {
+    unsafe {
+        for (i in range64(size)) {
+            x[i] *= 1.0 / (1.0 + exp(-g[i]))
+        }
+    }
+}
+
+//! Vectorized sigmoid gate: float4 with exp4, scalar tail. ~2 ulp, NOT bit-exact vs the scalar form.
+def sigmoid_gate4(var x : float?; g : float const?; size : int64) {
+    let one = float4(1.0, 1.0, 1.0, 1.0)
+    unsafe {
+        var x4 = reinterpret<float4?>(x)
+        let g4 = reinterpret<float4 const?>(g)
+        let n4 = size / 4l
+        for (k in range64(n4)) {
+            let arg = clamp(-g4[k], EXP4_LO, EXP4_HI)
+            x4[k] = x4[k] / (one + exp4(arg))
+        }
+        for (i in range64(n4 * 4l, size)) {
+            x[i] *= 1.0 / (1.0 + exp(-g[i]))
+        }
+    }
+}
+
+//! Fused SiLU gate into a destination: o[i] = a[i] · silu(z[i]), float4 with exp4, scalar tail.
+//! ~2 ulp, NOT bit-exact. The deltanet chunked z-gated out-norm shape (o must not alias a/z).
+def silu_mul4(var o : float?; a, z : float const?; size : int64) {
+    let one = float4(1.0, 1.0, 1.0, 1.0)
+    unsafe {
+        var o4 = reinterpret<float4?>(o)
+        let a4 = reinterpret<float4 const?>(a)
+        let z4 = reinterpret<float4 const?>(z)
+        let n4 = size / 4l
+        for (k in range64(n4)) {
+            let zv = z4[k]
+            let arg = clamp(-zv, EXP4_LO, EXP4_HI)
+            o4[k] = a4[k] * (zv / (one + exp4(arg)))
+        }
+        for (i in range64(n4 * 4l, size)) {
+            let zv = z[i]
+            o[i] = a[i] * (zv / (1.0 + exp(-zv)))
         }
     }
 }

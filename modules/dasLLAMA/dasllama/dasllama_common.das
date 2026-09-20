@@ -204,7 +204,8 @@ typedef FfnPrefillFn  = function<(t : Model; var s : Session; l : int64; npos : 
 //! A whole-prefill override (e.g. the dasMetal GPU-resident path): claims the ENTIRE per-layer
 //! stack of one prefill — rope tables are already built, x_b holds the embedded rows; on true the
 //! KV cache is filled for every position and x_b holds the final residual stream (the final norm +
-//! classifier stay with the caller). false = declined (unsupported shape/config) — the caller runs
+//! classifier stay with the caller UNLESS the override calls prefill_override_logits_done after
+//! filling s.logits itself). false = declined (unsupported shape/config) — the caller runs
 //! the ordinary per-layer CPU loop. Same pin discipline as the batch-slot donors: registered by
 //! name at [init], activated only via select_prefill_override (env rail: DASLLAMA_PIN_PREFILL).
 typedef PrefillOverrideFn = function<(t : Model; var s : Session; npos : int64; start_pos : int64) : bool>
@@ -236,6 +237,16 @@ def select_prefill_override(name : string) : bool {
 
 def active_prefill_override : string {
     return g_prefill_override_name
+}
+
+// set by an override that ALSO produced the last position's logits; reset before every invocation
+var private g_prefill_logits_done = false
+
+//! A whole-prefill override that computed s.logits for the LAST position itself (final norm +
+//! classifier on its device, softcap/suppression semantics preserved or declined) calls this
+//! from inside its forward — forward_prefill_body then skips the CPU final-norm/classifier step.
+def prefill_override_logits_done {
+    g_prefill_logits_done = true
 }
 
 //! The copyable hot-path block pointers, resolved onto the Model at load and called per layer.
@@ -445,6 +456,9 @@ struct Model {
     dn_ba_f32 : bool = false
     dn_betaf_off : int64        // fblob: layers x (dim x dt_rank), valid when dn_ba_f32
     dn_alphaf_off : int64
+    // qwen3next-layout file (detected via fused ssm_ba): v-indexed tensors ship in HF GROUPED
+    // v-head order; the loader permutes them to the TILED order the kernels (and qwen35 files) use
+    dn_grouped : bool = false
 }
 
 // ===== Arch registry: per-architecture blocks + chat template =====
@@ -945,6 +959,67 @@ def private load_big(m : GGUFMeta; bytes : array<uint8> | #; name : string; var 
     }
 }
 
+// qwen3next-layout deltanet big weights: same planes as the qwen35 arm at the callsite, but the
+// file's v-indexed rows arrive GROUPED by k-head — sub-slice reads land each v-head chunk at its
+// TILED position (tiled j*nk+g <- grouped g*nvpk+j), ssm_ba splits into the beta/alpha planes, and
+// ssm_out (an INPUT-column permute, never block-aligned) round-trips through f32.
+def private load_dn_grouped(m : GGUFMeta; bytes : array<uint8> | #; var t : Model; l, dim : int64; var scratch : array<float>) {
+    let nk = t.config.ssm_n_group
+    let nvh = t.config.ssm_dt_rank
+    let nvpk = nvh / nk
+    let hv = t.config.ssm_d_inner / nvh
+    let qkr = 2l * nk * t.config.ssm_d_state    // fused qkv: the q+k rows stay put, v rows permute
+    load_big(m, bytes, "blk.{l}.attn_qkv.weight", t, t.dnqkv_offs[l], dim * qkr, scratch)
+    for (g in range64(nk)) {
+        for (j in range64(nvpk)) {
+            let vg = g * nvpk + j
+            let vt = j * nk + g
+            load_big(m, bytes, "blk.{l}.attn_qkv.weight", t, t.dnqkv_offs[l] + (qkr + vt * hv) * dim, hv * dim, scratch, (qkr + vg * hv) * dim)
+            load_big(m, bytes, "blk.{l}.attn_gate.weight", t, t.dngate_offs[l] + vt * hv * dim, hv * dim, scratch, vg * hv * dim)
+            if (!t.dn_ba_f32) {   // fused ba rows per k-head group: [beta j.. ; alpha j..]
+                load_big(m, bytes, "blk.{l}.ssm_ba.weight", t, t.dnbeta_offs[l] + vt * dim, dim, scratch, (g * 2l * nvpk + j) * dim)
+                load_big(m, bytes, "blk.{l}.ssm_ba.weight", t, t.dnalpha_offs[l] + vt * dim, dim, scratch, ((g * 2l + 1l) * nvpk + j) * dim)
+            }
+        }
+    }
+    let n = t.config.ssm_d_inner * dim
+    var raw : array<float>
+    raw |> resize(n)
+    gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_out.weight", raw, 0l, n)
+    scratch |> resize(n)
+    let din = t.config.ssm_d_inner
+    unsafe {   // column-permute threaded over output rows (disjoint writes per row)
+        let rawp = reinterpret<float const?>(addr(raw[0]))
+        var scrp = addr(scratch[0])
+        maybe_parallel_for(0, int(dim), is_job_que_available() ? 16 : 1) $(rb, re) {
+            unsafe {
+                for (r in range64(int64(rb), int64(re))) {
+                    for (g in range64(nk)) {
+                        for (j in range64(nvpk)) {
+                            let src = r * din + (g * nvpk + j) * hv
+                            let dst = r * din + (j * nk + g) * hv
+                            for (x in range64(hv)) {
+                                scrp[dst + x] = rawp[src + x]
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    delete raw
+    let woff = t.dnout_offs[l]
+    if (t.quant == QuantMode.q8) {
+        quantize_q8_0_into(scratch, n, t.qblob, t.qscales, woff, woff / 32l)
+    } elif (t.quant == QuantMode.q4) {
+        quantize_q4_0_into(scratch, n, t.q4blob, t.q4scales, woff / 2l, woff / 32l)
+    } else {
+        for (i in range64(n)) {
+            t.wblob[woff + i] = scratch[i]
+        }
+    }
+}
+
 // ===== Arch registry =====
 // Each architecture self-registers its config setter, block kernels, and chat template at [init]
 // (see the register_arch_* functions after the forward pass). load_gguf looks the arch up by its
@@ -1151,7 +1226,19 @@ def private wscale_convert_f16(var t : Model) {
     }
     t.qscales16 |> resize(int(n))
     unsafe {
-        cvt_f32_to_f16(addr(t.qscales16[0]), addr(t.qscales[0]), n)
+        var dp = addr(t.qscales16[0])
+        let sp = reinterpret<float const?>(addr(t.qscales[0]))
+        // 32-aligned chunks keep any vectorized cvt kernel on whole groups
+        let nch = int(clamp(n / 1048576l, 1l, 64l))
+        maybe_parallel_for(0, int(n / 32l), is_job_que_available() ? nch : 1) $(rb, re) {
+            unsafe {
+                cvt_f32_to_f16(dp + int64(rb) * 32l, sp + int64(rb) * 32l, int64(re - rb) * 32l)
+            }
+        }
+        if (n % 32l != 0l) {
+            let t0 = (n / 32l) * 32l
+            cvt_f32_to_f16(dp + t0, sp + t0, n - t0)
+        }
     }
     delete t.qscales
     t.wscale_f16 = true
@@ -1159,6 +1246,80 @@ def private wscale_convert_f16(var t : Model) {
 }
 
 //! Load a llama-architecture GGUF into the split layout at the requested precision. The big weights
+// A repack work item: one mr-aligned row-chunk of a weight region. fmt: 0 = q8 (qblob/qscales),
+// 1 = mx4 (mxq/mxs), 4/5/6 = the kq plane pairs. Chunking splits huge regions (the classifier) for
+// load balance; 1024 is a multiple of every backend mr, so row groups never straddle a boundary.
+struct private RepackReg {
+    off : int64
+    n : int64
+    d : int64
+    fmt : int
+}
+
+def private push_repack(var regs : array<RepackReg>; fmt : int; off, n, d : int64) {
+    var r0 = 0l
+    while (r0 < d) {
+        let rc = min(1024l, d - r0)
+        regs |> push(RepackReg(off = off + r0 * n, n = n, d = rc, fmt = fmt))
+        r0 += rc
+    }
+}
+
+// Run every collected repack across the jobque — regions are disjoint, so any lane count is
+// bit-exact. Workers touch hoisted raw pointers + the hoisted backend fn values only.
+def private repack_regions(var t : Model; regs : array<RepackReg>) {
+    if (empty(regs)) {
+        return
+    }
+    let rq8 = g_repack_q8q8
+    let rkq = g_repack_kq
+    let rmx = g_repack_mx4
+    unsafe {
+        var qbp : int8? = null
+        var qsp : float? = null
+        var mxqp : uint8? = null
+        var mxsp : uint8? = null
+        var k4qp : uint8? = null
+        var k4sp : uint8? = null
+        var k5qp : uint8? = null
+        var k5sp : uint8? = null
+        var k6qp : uint8? = null
+        var k6sp : uint8? = null
+        if (!empty(t.qblob)) { qbp = addr(t.qblob[0]) }
+        if (!empty(t.qscales)) { qsp = addr(t.qscales[0]) }
+        if (!empty(t.mxq)) { mxqp = addr(t.mxq[0]) }
+        if (!empty(t.mxs)) { mxsp = addr(t.mxs[0]) }
+        if (!empty(t.k4q)) { k4qp = addr(t.k4q[0]) }
+        if (!empty(t.k4s)) { k4sp = addr(t.k4s[0]) }
+        if (!empty(t.k5q)) { k5qp = addr(t.k5q[0]) }
+        if (!empty(t.k5s)) { k5sp = addr(t.k5s[0]) }
+        if (!empty(t.k6q)) { k6qp = addr(t.k6q[0]) }
+        if (!empty(t.k6s)) { k6sp = addr(t.k6s[0]) }
+        let rp = reinterpret<RepackReg const?>(addr(regs[0]))
+        let nr = length(regs)
+        let njobs = is_job_que_available() ? min(nr, 4 * (get_total_hw_jobs() + 1)) : 1
+        maybe_parallel_for(0, nr, njobs) $(rb, re) {
+            unsafe {
+                for (i in range(rb, re)) {
+                    let f = rp[i].fmt
+                    if (f == 0) {
+                        invoke(rq8, qbp + rp[i].off, qsp + rp[i].off / 32l, rp[i].n, rp[i].d)
+                    } elif (f == 1) {
+                        invoke(rmx, mxqp + rp[i].off / 2l, mxsp + rp[i].off / 32l, rp[i].n, rp[i].d)
+                    } else {
+                        let sb = rp[i].off / 256l
+                        let qsb = f == 4 ? 128l : (f == 5 ? 160l : 192l)
+                        let ssb = f == 6 ? 18l : 20l
+                        var kqp = f == 4 ? k4qp : (f == 5 ? k5qp : k6qp)
+                        var ksp = f == 4 ? k4sp : (f == 5 ? k5sp : k6sp)
+                        invoke(rkq, f, kqp + sb * qsb, ksp + sb * ssb, rp[i].n, rp[i].d)
+                    }
+                }
+            }
+        }
+    }
+}
+
 // Repack every Q8 2D weight tensor in qblob/qscales into the active backend's interleaved layout, IN
 // PLACE, once at load. Mirrors forward()'s per-tensor offsets/shapes exactly; the embedding + norms
 // live in fblob and are never touched. Called only after select_matmul_backend_for_load() picks a
@@ -1168,6 +1329,7 @@ def private repack_q8_weights(var t : Model) {
     let c = t.config
     let dim = c.dim
     let hidden = c.hidden_dim
+    var regs : array<RepackReg>
     for (l in range64(c.n_layers)) {
         let kv = layer_kv_dim(c, l)
         let qd = layer_qd(c, l)
@@ -1176,92 +1338,94 @@ def private repack_q8_weights(var t : Model) {
         // Recurrent (deltanet) layers carry no attention projections (offsets -1) — their own
         // matrices repack below.
         if (t.wq_offs[l] >= 0l && fmt_at(t.wq_fmt, l) == KqFmt.q8) {
-            repack_q8q8_weight(t.qblob, t.qscales, t.wq_offs[l], dim, qd * (c.q_gated ? 2l : 1l))
+            push_repack(regs, 0, t.wq_offs[l], dim, qd * (c.q_gated ? 2l : 1l))
         }
         if (t.wk_offs[l] >= 0l && fmt_at(t.wk_fmt, l) == KqFmt.q8) {   // absent on E-series shared-KV layers
-            repack_q8q8_weight(t.qblob, t.qscales, t.wk_offs[l], dim, kv)
+            push_repack(regs, 0, t.wk_offs[l], dim, kv)
         }
         if (t.wv_offs[l] >= 0l && fmt_at(t.wv_fmt, l) == KqFmt.q8) {
-            repack_q8q8_weight(t.qblob, t.qscales, t.wv_offs[l], dim, kv)
+            push_repack(regs, 0, t.wv_offs[l], dim, kv)
         }
         if (t.wo_offs[l] >= 0l && fmt_at(t.wo_fmt, l) == KqFmt.q8) {
-            repack_q8q8_weight(t.qblob, t.qscales, t.wo_offs[l], qd, dim)
+            push_repack(regs, 0, t.wo_offs[l], qd, dim)
         }
         if (layer_is_recurrent(c, l)) {  // deltanet projections (all q8 in v1 — no kq tags)
             let cd = dn_conv_dim(c)
-            repack_q8q8_weight(t.qblob, t.qscales, t.dnqkv_offs[l], dim, cd)
-            repack_q8q8_weight(t.qblob, t.qscales, t.dngate_offs[l], dim, c.ssm_d_inner)
+            push_repack(regs, 0, t.dnqkv_offs[l], dim, cd)
+            push_repack(regs, 0, t.dngate_offs[l], dim, c.ssm_d_inner)
             if (t.dnbeta_offs[l] >= 0l) {   // -1 when beta/alpha ship F32 (fblob, no repack)
-                repack_q8q8_weight(t.qblob, t.qscales, t.dnbeta_offs[l], dim, c.ssm_dt_rank)
-                repack_q8q8_weight(t.qblob, t.qscales, t.dnalpha_offs[l], dim, c.ssm_dt_rank)
+                push_repack(regs, 0, t.dnbeta_offs[l], dim, c.ssm_dt_rank)
+                push_repack(regs, 0, t.dnalpha_offs[l], dim, c.ssm_dt_rank)
             }
-            repack_q8q8_weight(t.qblob, t.qscales, t.dnout_offs[l], c.ssm_d_inner, dim)
+            push_repack(regs, 0, t.dnout_offs[l], c.ssm_d_inner, dim)
         }
         if (has_ple(c)) {  // gemma-4 E-series per-layer PLE gate/proj (the emb table stays linear, unpacked)
             let ple = c.n_embd_per_layer
-            repack_q8q8_weight(t.qblob, t.qscales, t.ple_gate_off + l * dim * ple, dim, ple)
-            repack_q8q8_weight(t.qblob, t.qscales, t.ple_proj_off + l * ple * dim, ple, dim)
+            push_repack(regs, 0, t.ple_gate_off + l * dim * ple, dim, ple)
+            push_repack(regs, 0, t.ple_proj_off + l * ple * dim, ple, dim)
         }
         if (c.n_expert > 0l) {   // MoE: each expert slice is its own 2D tensor, repacked per its shape
             let ege = dim * c.n_ff_exp
             if (!t.experts_mx4) {   // native-MXFP4 stacks live in mxq/mxs, row-major (no Q8 repack)
                 for (e in range64(c.n_expert)) {
                     if (fmt_at(t.we1_fmt, l) == KqFmt.q8) {
-                        repack_q8q8_weight(t.qblob, t.qscales, t.we1_offs[l] + e * ege, dim, c.n_ff_exp)
+                        push_repack(regs, 0, t.we1_offs[l] + e * ege, dim, c.n_ff_exp)
                     }
                     if (fmt_at(t.we2_fmt, l) == KqFmt.q8) {
-                        repack_q8q8_weight(t.qblob, t.qscales, t.we2_offs[l] + e * ege, c.n_ff_exp, dim)
+                        push_repack(regs, 0, t.we2_offs[l] + e * ege, c.n_ff_exp, dim)
                     }
                     if (fmt_at(t.we3_fmt, l) == KqFmt.q8) {
-                        repack_q8q8_weight(t.qblob, t.qscales, t.we3_offs[l] + e * ege, dim, c.n_ff_exp)
+                        push_repack(regs, 0, t.we3_offs[l] + e * ege, dim, c.n_ff_exp)
                     }
                 }
             }
             if (c.n_ff_shexp > 0l) {
                 let she = dim * c.n_ff_shexp
-                repack_q8q8_weight(t.qblob, t.qscales, t.wsh1_off + l * she, dim, c.n_ff_shexp)
-                repack_q8q8_weight(t.qblob, t.qscales, t.wsh2_off + l * she, c.n_ff_shexp, dim)
-                repack_q8q8_weight(t.qblob, t.qscales, t.wsh3_off + l * she, dim, c.n_ff_shexp)
+                push_repack(regs, 0, t.wsh1_off + l * she, dim, c.n_ff_shexp)
+                push_repack(regs, 0, t.wsh2_off + l * she, c.n_ff_shexp, dim)
+                push_repack(regs, 0, t.wsh3_off + l * she, dim, c.n_ff_shexp)
             }
             if (c.moe_dense_shexp) {  // gemma4: the dense parallel shared expert repacks like a plain FFN
                 if (fmt_at(t.w1_fmt, l) == KqFmt.q8) {
-                    repack_q8q8_weight(t.qblob, t.qscales, t.w1_offs[l], dim, hidden)
+                    push_repack(regs, 0, t.w1_offs[l], dim, hidden)
                 }
                 if (fmt_at(t.w2_fmt, l) == KqFmt.q8) {
-                    repack_q8q8_weight(t.qblob, t.qscales, t.w2_offs[l], hidden, dim)
+                    push_repack(regs, 0, t.w2_offs[l], hidden, dim)
                 }
                 if (fmt_at(t.w3_fmt, l) == KqFmt.q8) {
-                    repack_q8q8_weight(t.qblob, t.qscales, t.w3_offs[l], dim, hidden)
+                    push_repack(regs, 0, t.w3_offs[l], dim, hidden)
                 }
             }
         } else {
             let h = layer_hidden(t, l)
             if (fmt_at(t.w1_fmt, l) == KqFmt.q8) {
-                repack_q8q8_weight(t.qblob, t.qscales, t.w1_offs[l], dim, h)
+                push_repack(regs, 0, t.w1_offs[l], dim, h)
             }
             if (fmt_at(t.w2_fmt, l) == KqFmt.q8) {
-                repack_q8q8_weight(t.qblob, t.qscales, t.w2_offs[l], h, dim)
+                push_repack(regs, 0, t.w2_offs[l], h, dim)
             }
             if (fmt_at(t.w3_fmt, l) == KqFmt.q8) {
-                repack_q8q8_weight(t.qblob, t.qscales, t.w3_offs[l], dim, h)
+                push_repack(regs, 0, t.w3_offs[l], dim, h)
             }
         }
     }
     if ((!c.shared_weights && t.wcls_fmt == KqFmt.q8) || t.cls_q8) {
         // the linear copy at emb_q8_off is deliberately NOT repacked — embedding-row dequant
         // indexes it directly. K-quant classifiers (either tying) stay in their plane, unpacked.
-        repack_q8q8_weight(t.qblob, t.qscales, t.wcls_off, dim, c.vocab_size)
+        push_repack(regs, 0, t.wcls_off, dim, c.vocab_size)
     }
+    repack_regions(t, regs)
+    delete regs
 }
 
 // route one kq-tagged tensor to its format's plane pair (q8 tags no-op — those live in qblob)
-def private repack_kq_tensor(var t : Model; fmt : KqFmt; woff, n, d : int64) {
+def private push_repack_kq(var regs : array<RepackReg>; fmt : KqFmt; woff, n, d : int64) {
     if (fmt == KqFmt.k4) {
-        repack_kq_weight(4, t.k4q, t.k4s, woff, n, d)
+        push_repack(regs, 4, woff, n, d)
     } elif (fmt == KqFmt.k5) {
-        repack_kq_weight(5, t.k5q, t.k5s, woff, n, d)
+        push_repack(regs, 5, woff, n, d)
     } elif (fmt == KqFmt.k6) {
-        repack_kq_weight(6, t.k6q, t.k6s, woff, n, d)
+        push_repack(regs, 6, woff, n, d)
     }
 }
 
@@ -1272,47 +1436,50 @@ def private repack_kq_tensor(var t : Model; fmt : KqFmt; woff, n, d : int64) {
 def private repack_kq_weights(var t : Model) {
     let c = t.config
     let dim = c.dim
+    var regs : array<RepackReg>
     for (l in range64(c.n_layers)) {
         let kv = layer_kv_dim(c, l)
         let qd = layer_qd(c, l)
         // recurrent (deltanet) layers carry no attention projections (offsets -1); their own
         // matrices are untagged q8 in v1, so there is nothing kq to repack on them
         if (t.wq_offs[l] >= 0l) {
-            repack_kq_tensor(t, fmt_at(t.wq_fmt, l), t.wq_offs[l], dim, qd * (c.q_gated ? 2l : 1l))
+            push_repack_kq(regs, fmt_at(t.wq_fmt, l), t.wq_offs[l], dim, qd * (c.q_gated ? 2l : 1l))
         }
         if (t.wk_offs[l] >= 0l) {
-            repack_kq_tensor(t, fmt_at(t.wk_fmt, l), t.wk_offs[l], dim, kv)
+            push_repack_kq(regs, fmt_at(t.wk_fmt, l), t.wk_offs[l], dim, kv)
         }
         if (t.wv_offs[l] >= 0l) {
-            repack_kq_tensor(t, fmt_at(t.wv_fmt, l), t.wv_offs[l], dim, kv)
+            push_repack_kq(regs, fmt_at(t.wv_fmt, l), t.wv_offs[l], dim, kv)
         }
         if (t.wo_offs[l] >= 0l) {
-            repack_kq_tensor(t, fmt_at(t.wo_fmt, l), t.wo_offs[l], qd, dim)
+            push_repack_kq(regs, fmt_at(t.wo_fmt, l), t.wo_offs[l], qd, dim)
         }
         if (c.n_expert > 0l) {
             if (!t.experts_mx4) {   // each expert slice grp-repacks independently, like the Q8 loop
                 let ege = dim * c.n_ff_exp
                 for (e in range64(c.n_expert)) {
-                    repack_kq_tensor(t, fmt_at(t.we1_fmt, l), t.we1_offs[l] + e * ege, dim, c.n_ff_exp)
-                    repack_kq_tensor(t, fmt_at(t.we2_fmt, l), t.we2_offs[l] + e * ege, c.n_ff_exp, dim)
-                    repack_kq_tensor(t, fmt_at(t.we3_fmt, l), t.we3_offs[l] + e * ege, dim, c.n_ff_exp)
+                    push_repack_kq(regs, fmt_at(t.we1_fmt, l), t.we1_offs[l] + e * ege, dim, c.n_ff_exp)
+                    push_repack_kq(regs, fmt_at(t.we2_fmt, l), t.we2_offs[l] + e * ege, c.n_ff_exp, dim)
+                    push_repack_kq(regs, fmt_at(t.we3_fmt, l), t.we3_offs[l] + e * ege, dim, c.n_ff_exp)
                 }
             }
             if (c.moe_dense_shexp) {
-                repack_kq_tensor(t, fmt_at(t.w1_fmt, l), t.w1_offs[l], dim, c.hidden_dim)
-                repack_kq_tensor(t, fmt_at(t.w2_fmt, l), t.w2_offs[l], c.hidden_dim, dim)
-                repack_kq_tensor(t, fmt_at(t.w3_fmt, l), t.w3_offs[l], dim, c.hidden_dim)
+                push_repack_kq(regs, fmt_at(t.w1_fmt, l), t.w1_offs[l], dim, c.hidden_dim)
+                push_repack_kq(regs, fmt_at(t.w2_fmt, l), t.w2_offs[l], c.hidden_dim, dim)
+                push_repack_kq(regs, fmt_at(t.w3_fmt, l), t.w3_offs[l], dim, c.hidden_dim)
             }
         } else {
             let h = layer_hidden(t, l)
-            repack_kq_tensor(t, fmt_at(t.w1_fmt, l), t.w1_offs[l], dim, h)
-            repack_kq_tensor(t, fmt_at(t.w2_fmt, l), t.w2_offs[l], h, dim)
-            repack_kq_tensor(t, fmt_at(t.w3_fmt, l), t.w3_offs[l], dim, h)
+            push_repack_kq(regs, fmt_at(t.w1_fmt, l), t.w1_offs[l], dim, h)
+            push_repack_kq(regs, fmt_at(t.w2_fmt, l), t.w2_offs[l], h, dim)
+            push_repack_kq(regs, fmt_at(t.w3_fmt, l), t.w3_offs[l], dim, h)
         }
     }
     if ((!c.shared_weights && t.wcls_fmt != KqFmt.q8) || cls_kq(t)) {
-        repack_kq_tensor(t, c.shared_weights ? t.emb_fmt : t.wcls_fmt, t.wcls_off, dim, c.vocab_size)
+        push_repack_kq(regs, c.shared_weights ? t.emb_fmt : t.wcls_fmt, t.wcls_off, dim, c.vocab_size)
     }
+    repack_regions(t, regs)
+    delete regs
 }
 
 // Repack the native-MXFP4 expert stacks into the active backend's interleaved mx layout, IN PLACE
@@ -1322,14 +1489,17 @@ def private repack_mx4_stacks(var t : Model) {
     let c = t.config
     let dim = c.dim
     let ege = dim * c.n_ff_exp
+    var regs : array<RepackReg>
     for (l in range64(c.n_layers)) {
         for (e in range64(c.n_expert)) {
             let base = e * ege
-            repack_mx4_weight(t.mxq, t.mxs, t.we1_offs[l] + base, dim, c.n_ff_exp)
-            repack_mx4_weight(t.mxq, t.mxs, t.we2_offs[l] + base, c.n_ff_exp, dim)
-            repack_mx4_weight(t.mxq, t.mxs, t.we3_offs[l] + base, dim, c.n_ff_exp)
+            push_repack(regs, 1, t.we1_offs[l] + base, dim, c.n_ff_exp)
+            push_repack(regs, 1, t.we2_offs[l] + base, c.n_ff_exp, dim)
+            push_repack(regs, 1, t.we3_offs[l] + base, dim, c.n_ff_exp)
         }
     }
+    repack_regions(t, regs)
+    delete regs
 }
 
 //! go straight into `mode`'s storage (pre-quantized tensors transcode block-for-block with no fp32
@@ -1337,8 +1507,23 @@ def private repack_mx4_stacks(var t : Model) {
 //! load never holds the dense fp32 weights. The embedding + norms stay fp32 in fblob regardless.
 //! Config comes from metadata; vocab is derived from token_embd (some files omit llama.vocab_size).
 def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
+    //! The conversion passes (transcode/repack/wscale) thread across the jobque; spin a scoped one
+    //! for the load when the caller hasn't (the server/tools start theirs after the model loads).
+    if (is_job_que_available()) {
+        return <- load_gguf_impl(path, mode)
+    }
+    var t = Model()
+    with_job_que() {
+        t <- load_gguf_impl(path, mode)
+    }
+    return <- t
+}
+
+def private load_gguf_impl(path : string; mode : QuantMode) : Model {
     var t = Model()
     t.quant = mode
+    let ts_load = ref_time_ticks()
+    var ts_stage = ref_time_ticks()
     let f = fopen(path, "rb")
     if (f == null) {
         panic("dasLLAMA: cannot open gguf '{path}'")
@@ -1688,7 +1873,9 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
             while (!layer_is_recurrent(t.config, frl)) {
                 frl++
             }
-            t.dn_ba_f32 = gguf_tensor_type(m, "blk.{frl}.ssm_beta.weight") == GGML_TYPE_F32
+            t.dn_grouped = gguf_find_tensor(m, "blk.{frl}.ssm_ba.weight") >= 0
+            let ba0 = t.dn_grouped ? "blk.{frl}.ssm_ba.weight" : "blk.{frl}.ssm_beta.weight"
+            t.dn_ba_f32 = gguf_tensor_type(m, ba0) == GGML_TYPE_F32
         }
         // logit soft-caps from metadata when present (gemma2: 50/30, gemma4: final 30 only);
         // configure()'s values stay as the fallback for files without the keys
@@ -1799,13 +1986,35 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
             if (layer_is_recurrent(t.config, l)) {  // qwen35 deltanet fp32 smalls
                 let cd = dn_conv_dim(t.config)
                 let nvh = t.config.ssm_dt_rank
-                gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_conv1d.weight", t.fblob, t.dn_conv_off + l * t.config.ssm_d_conv * cd, t.config.ssm_d_conv * cd)
-                gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_dt.bias", t.fblob, t.dn_dt_off + l * nvh, nvh)
-                gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_a", t.fblob, t.dn_a_off + l * nvh, nvh)
                 gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_norm.weight", t.fblob, t.dn_norm_off + l * t.config.ssm_d_state, t.config.ssm_d_state)
-                if (t.dn_ba_f32) {  // F32-on-disk beta/alpha stay fp32
-                    gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_beta.weight", t.fblob, t.dn_betaf_off + l * dim * nvh, dim * nvh)
-                    gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_alpha.weight", t.fblob, t.dn_alphaf_off + l * dim * nvh, dim * nvh)
+                if (t.dn_grouped) {  // permute v-indexed smalls grouped->tiled (see load_dn_grouped)
+                    let nk = t.config.ssm_n_group
+                    let nvpk = nvh / nk
+                    let hv = t.config.ssm_d_inner / nvh
+                    let dc = t.config.ssm_d_conv
+                    let qkch = 2l * nk * t.config.ssm_d_state   // conv qk channels stay put
+                    gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_conv1d.weight", t.fblob, t.dn_conv_off + l * dc * cd, qkch * dc)
+                    for (g in range64(nk)) {
+                        for (j in range64(nvpk)) {
+                            let vg = g * nvpk + j
+                            let vt = j * nk + g
+                            gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_conv1d.weight", t.fblob, t.dn_conv_off + l * dc * cd + (qkch + vt * hv) * dc, hv * dc, (qkch + vg * hv) * dc)
+                            gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_dt.bias", t.fblob, t.dn_dt_off + l * nvh + vt, 1l, vg)
+                            gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_a", t.fblob, t.dn_a_off + l * nvh + vt, 1l, vg)
+                            if (t.dn_ba_f32) {
+                                gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_ba.weight", t.fblob, t.dn_betaf_off + l * dim * nvh + vt * dim, dim, (g * 2l * nvpk + j) * dim)
+                                gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_ba.weight", t.fblob, t.dn_alphaf_off + l * dim * nvh + vt * dim, dim, ((g * 2l + 1l) * nvpk + j) * dim)
+                            }
+                        }
+                    }
+                } else {
+                    gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_conv1d.weight", t.fblob, t.dn_conv_off + l * t.config.ssm_d_conv * cd, t.config.ssm_d_conv * cd)
+                    gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_dt.bias", t.fblob, t.dn_dt_off + l * nvh, nvh)
+                    gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_a", t.fblob, t.dn_a_off + l * nvh, nvh)
+                    if (t.dn_ba_f32) {  // F32-on-disk beta/alpha stay fp32
+                        gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_beta.weight", t.fblob, t.dn_betaf_off + l * dim * nvh, dim * nvh)
+                        gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_alpha.weight", t.fblob, t.dn_alphaf_off + l * dim * nvh, dim * nvh)
+                    }
                 }
             }
             if (t.config.layer_out_scale) {  // gemma4: one output scalar per layer
@@ -1841,6 +2050,8 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
             }
             gguf_read_tensor_f32(m, bytes, "per_layer_proj_norm.weight", t.fblob, t.ple_pnorm_off, ple)
         }
+        to_log(LOG_INFO, "dasLLAMA: load stage meta+config+smalls: {get_time_usec(ts_stage) / 1000} ms\n")
+        ts_stage = ref_time_ticks()
         // big 2D weights -> active precision. ggml stores them row-major [out x in] = our convention.
         var scratch : array<float>
         for (l in range64(layers)) {
@@ -1849,14 +2060,18 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
             if (layer_is_recurrent(t.config, l)) {
                 // qwen35 deltanet projections: fused [q;k;v] + z gate + per-v-head beta/alpha + out
                 // (beta/alpha skip the big-weight path when they ship F32 — read into fblob above)
-                let cd = dn_conv_dim(t.config)
-                load_big(m, bytes, "blk.{l}.attn_qkv.weight", t, t.dnqkv_offs[l], dim * cd, scratch)
-                load_big(m, bytes, "blk.{l}.attn_gate.weight", t, t.dngate_offs[l], dim * t.config.ssm_d_inner, scratch)
-                if (!t.dn_ba_f32) {
-                    load_big(m, bytes, "blk.{l}.ssm_beta.weight", t, t.dnbeta_offs[l], dim * t.config.ssm_dt_rank, scratch)
-                    load_big(m, bytes, "blk.{l}.ssm_alpha.weight", t, t.dnalpha_offs[l], dim * t.config.ssm_dt_rank, scratch)
+                if (t.dn_grouped) {
+                    load_dn_grouped(m, bytes, t, l, dim, scratch)
+                } else {
+                    let cd = dn_conv_dim(t.config)
+                    load_big(m, bytes, "blk.{l}.attn_qkv.weight", t, t.dnqkv_offs[l], dim * cd, scratch)
+                    load_big(m, bytes, "blk.{l}.attn_gate.weight", t, t.dngate_offs[l], dim * t.config.ssm_d_inner, scratch)
+                    if (!t.dn_ba_f32) {
+                        load_big(m, bytes, "blk.{l}.ssm_beta.weight", t, t.dnbeta_offs[l], dim * t.config.ssm_dt_rank, scratch)
+                        load_big(m, bytes, "blk.{l}.ssm_alpha.weight", t, t.dnalpha_offs[l], dim * t.config.ssm_dt_rank, scratch)
+                    }
+                    load_big(m, bytes, "blk.{l}.ssm_out.weight", t, t.dnout_offs[l], t.config.ssm_d_inner * dim, scratch)
                 }
-                load_big(m, bytes, "blk.{l}.ssm_out.weight", t, t.dnout_offs[l], t.config.ssm_d_inner * dim, scratch)
             } elif (t.config.fused_qkv) {
                 // Phi3: attn_qkv rows are [q (qd) ; k (kv) ; v (kv)], ffn_up rows are [gate ; up] (hidden each).
                 // src_off slices the fused tensor, preserving its Q8 blocks (no fp32 requantize); K-quant
@@ -1980,6 +2195,8 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
             }
         }
         delete scratch
+        to_log(LOG_INFO, "dasLLAMA: load stage weights: {get_time_usec(ts_stage) / 1000} ms\n")
+        ts_stage = ref_time_ticks()
         // arm64: switch to the laneq backend and repack the just-loaded Q8 weights into its interleaved
         // layout. Returns false off-ARM (portable stays, weights stay row-major).
         if (mode == QuantMode.q8 && select_matmul_backend_for_load()) {
@@ -1996,9 +2213,12 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
                 to_log(LOG_INFO, "dasLLAMA: K-quant planes repacked to the '{active_kernel_backend()}' layouts (k4 grp{t.kq_repack_mr4}, k5 grp{t.kq_repack_mr5}, k6 grp{t.kq_repack_mr6})\n")
             }
         }
+        to_log(LOG_INFO, "dasLLAMA: load stage repack: {get_time_usec(ts_stage) / 1000} ms\n")
+        ts_stage = ref_time_ticks()
         if (mode == QuantMode.q8 && g_wscale_f16) {
             wscale_convert_f16(t)
         }
+        to_log(LOG_INFO, "dasLLAMA: load stage wscale: {get_time_usec(ts_stage) / 1000} ms, total {get_time_usec(ts_load) / 1000} ms\n")
     }
     fclose(f)
     return <- t
@@ -5242,7 +5462,34 @@ def private attention_qwen35_gated_decode(t : Model; var s : Session; l : int64;
         }
     }
     prof_add("rope", ts_rope)
-    if (s.kv_dtype_k == KVDtype.q8_0) {
+    let ktq4 = s.kv_dtype_k == KVDtype.tq4
+    let vtq4 = s.kv_dtype_v == KVDtype.tq4
+    if (ktq4 || vtq4) {
+        // tq4 basis change at the RoPE seam (attention_std_decode's twin): attention runs in the
+        // rotated basis; xb un-rotates per head after — the sigmoid out-gate lives in the original
+        let ts_rot = ref_time_ticks()
+        unsafe {
+            let sgp = reinterpret<float const?>(addr(s.kv_signs[0]))
+            if (ktq4) {
+                var qrp = addr(s.q[0])
+                for (hh in range64(qd / head_size)) {
+                    fwht_signs_row(qrp + hh * head_size, sgp, head_size)
+                }
+                var krp = addr(s.k[0])
+                for (hh in range64(kv_dim / head_size)) {
+                    fwht_signs_row(krp + hh * head_size, sgp, head_size)
+                }
+            }
+            if (vtq4) {
+                var vrp = addr(s.v[0])
+                for (hh in range64(kv_dim / head_size)) {
+                    fwht_signs_row(vrp + hh * head_size, sgp, head_size)
+                }
+            }
+        }
+        prof_add("tq4_rot", ts_rot)
+    }
+    if (s.kv_dtype_k == KVDtype.q8_0 || ktq4) {
         quantize_q8_0_into(s.q, qd, s.attq, s.atts, 0l, 0l)
     }
     let ts_kv = ref_time_ticks()
@@ -5261,9 +5508,10 @@ def private attention_qwen35_gated_decode(t : Model; var s : Session; l : int64;
     let vdt = s.kv_dtype_v
     let nrun = kv_runs(s, kstart, pos + 1l, s.kv_runs)
     unsafe {
+        let kplanes = kdt == KVDtype.q8_0 || kdt == KVDtype.tq4
         let qp = reinterpret<float const?>(addr(s.q[0]))
-        let qqp = kdt == KVDtype.q8_0 ? reinterpret<int8 const?>(addr(s.attq[0])) : null
-        let qsp = kdt == KVDtype.q8_0 ? reinterpret<float const?>(addr(s.atts[0])) : null
+        let qqp = kplanes ? reinterpret<int8 const?>(addr(s.attq[0])) : null
+        let qsp = kplanes ? reinterpret<float const?>(addr(s.atts[0])) : null
         let runsp = reinterpret<KVRun const?>(addr(s.kv_runs[0]))
         var xbp = addr(s.xb[0])
         var attp = addr(s.att[0])
@@ -5280,13 +5528,24 @@ def private attention_qwen35_gated_decode(t : Model; var s : Session; l : int64;
         }
     }
     prof_add("attn", ts_attn)
-    // per-head sigmoid output gate on the attention output, before the out projection
+    if (vtq4) {   // tq4 V: xb accumulated in the rotated basis — un-rotate before the out-gate
+        unsafe {
+            let sgp = reinterpret<float const?>(addr(s.kv_signs[0]))
+            var xrp = addr(s.xb[0])
+            for (hh in range64(n_heads)) {
+                fwht_unsign_row(xrp + hh * head_size, sgp, head_size)
+            }
+        }
+    }
+    // per-head sigmoid output gate on the attention output, before the out projection (exp4)
     let ts_wo = ref_time_ticks()
     unsafe {
         var xbp2 = addr(s.xb[0])
         let gp2 = reinterpret<float const?>(addr(s.dn_qgate[0]))
-        for (i in range64(qd)) {
-            xbp2[i] *= 1.0 / (1.0 + exp(-gp2[i]))
+        if (g_act_vec) {
+            sigmoid_gate4(xbp2, gp2, qd)
+        } else {
+            sigmoid_gate(xbp2, gp2, qd)
         }
     }
     mm_f(s.xb2, t, fmt_at(t.wo_fmt, l), t.wo_offs[l], s.xb, s.xq, s.xs, s.xbs, qd, dim)
@@ -5430,12 +5689,20 @@ def private ffn_dense_decode(t : Model; var s : Session; l : int64) {
 // top-k knockout consumes the row). The selected ids/weights land at idx[off..]/w[off..] — off is 0
 // for decode, p*k for the grouped prefill router. One body for both, so routing is bit-identical.
 def private moe_select(c : Config; var lg : float?; var idx : array<int64>; var w : array<float>; off : int64) {
-    let ne = c.n_expert
-    let k = c.n_expert_used
+    unsafe {
+        moe_select_core(c.moe_gate, c.n_expert, c.n_expert_used, c.norm_topk_prob, c.expert_weights_scale,
+            lg, addr(idx[0]), addr(w[0]), off)
+    }
+}
+
+// pointer core — the threaded prefill router runs this in fork workers (scalars + raw pointers
+// only; Config/Session stay on the caller)
+def private moe_select_core(gate : MoeGate; ne, k : int64; norm_topk : bool; wscale : float;
+                            var lg : float?; var idx : int64?; var w : float?; off : int64) {
     unsafe {   // the whole body indexes the logit-row pointer (in-place gate + top-k knockout)
     // probs — softmax_weight routes on the RAW biased logits and softmaxes only the selected
     // top-k afterwards (gpt-oss)
-    if (c.moe_gate == MoeGate.sigmoid) {
+    if (gate == MoeGate.sigmoid) {
         var i = 0l
         while (i + 4l <= ne) {
             let e = exp4(clamp(-float4(lg[i], lg[i + 1l], lg[i + 2l], lg[i + 3l]), EXP4_LO, EXP4_HI))
@@ -5449,7 +5716,7 @@ def private moe_select(c : Config; var lg : float?; var idx : array<int64>; var 
             lg[i] = 1.0 / (1.0 + exp(clamp(-lg[i], -80.0, 80.0)))
             i++
         }
-    } elif (c.moe_gate == MoeGate.softmax) {
+    } elif (gate == MoeGate.softmax) {
         var mx = lg[0]
         for (i in range64(ne)) {
             mx = max(mx, lg[i])
@@ -5491,10 +5758,10 @@ def private moe_select(c : Config; var lg : float?; var idx : array<int64>; var 
         w[off + j] = lg[best]
         lg[best] = -FLT_MAX
     }
-    if (c.moe_gate == MoeGate.softmax_weight) {  // gpt-oss: softmax over just the selected k logits
-        softmax(unsafe(addr(w[off])), k)
+    if (gate == MoeGate.softmax_weight) {  // gpt-oss: softmax over just the selected k logits
+        softmax(w + off, k)
     }
-    if (c.norm_topk_prob) {   // renormalize the selected weights to sum 1 (llama.cpp clamps at f16-min)
+    if (norm_topk) {   // renormalize the selected weights to sum 1 (llama.cpp clamps at f16-min)
         var ws = 0.0
         for (j in range64(k)) {
             ws += w[off + j]
@@ -5504,9 +5771,9 @@ def private moe_select(c : Config; var lg : float?; var idx : array<int64>; var 
             w[off + j] /= ws
         }
     }
-    if (c.expert_weights_scale != 0.0 && c.expert_weights_scale != 1.0) {
+    if (wscale != 0.0 && wscale != 1.0) {
         for (j in range64(k)) {
-            w[off + j] *= c.expert_weights_scale
+            w[off + j] *= wscale
         }
     }
     }
@@ -5544,9 +5811,13 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
     if (pre_q8) {
         let ts_rq = ref_time_ticks()
         if (layer_kq && moe_pair_kform(fmt_at(t.we1_fmt, l), fmt_at(t.we3_fmt, l))) {
-            // kq v2: kq gate/up stacks read the Q8_K-form scratch (the q8 image has no consumer
-            // — a q8/kq gate-up mix panics in moe_pair_kform)
+            // kq v2: kq gate/up stacks read the Q8_K-form scratch
             quantize_q8_k_into(s.xb, dim, s.kxq, s.kxs, s.kxbs, 0l, 0l, 0l)
+            if (c.n_ff_shexp > 0l && !c.moe_dense_shexp) {
+                // the q8 shexp downstream (moe_ffn_core) reads the hoisted moe_xq image — without
+                // this its quants are stale/zero and the shared expert silently drops out (#3450)
+                quantize_q8_0_into(s.xb, dim, s.moe_xq, s.moe_xs, 0l, 0l)
+            }
         } else {
             quantize_q8_0_into(s.xb, dim, s.moe_xq, s.moe_xs, 0l, 0l)
         }
@@ -7291,7 +7562,7 @@ def private dn_chunked_head(conv : float const?; qoff, koff, voff, cd : int64;
                             bp, gp : float const?; bg_stride : int64;
                             zp : float const?; var op : float?; o_stride : int64;
                             var stp : float?; var ws : float?; wnorm : float const?;
-                            aa, dtb, eps : float; npos, ds : int64) {
+                            aa, dtb, eps : float; vec : bool; npos, ds : int64) {
     let CS = DN_CHUNK
     unsafe {
         var qc = ws                         // CS x ds: q rows, scaled to q ⊙ e^{gcum} after the KQ GEMM
@@ -7336,17 +7607,32 @@ def private dn_chunked_head(conv : float const?; qoff, koff, voff, cd : int64;
             gemm_f32(kq, qc, kcT, cl, ds, cl)
             for (i in range64(cl)) {
                 let gi = gcum[i]
-                for (j in range64(cl)) {
-                    if (j < i) {
-                        let d = exp(gi - gcum[j])
-                        tm[i * cl + j] = -tm[i * cl + j] * d
-                        kq[i * cl + j] *= d
-                    } elif (j == i) {
-                        tm[i * cl + j] = 0.0
-                    } else {
-                        tm[i * cl + j] = 0.0
-                        kq[i * cl + j] = 0.0
+                var j = 0l
+                if (vec) {   // exp4 over the strictly-lower row (args <= 0; clamp = flash-fold convention)
+                    let gi4 = float4(gi, gi, gi, gi)
+                    while (j + 4l <= i) {
+                        let d = exp4(max(gi4 - float4(gcum[j], gcum[j + 1l], gcum[j + 2l], gcum[j + 3l]), EXP4_LO))
+                        tm[i * cl + j] = -tm[i * cl + j] * d.x
+                        tm[i * cl + j + 1l] = -tm[i * cl + j + 1l] * d.y
+                        tm[i * cl + j + 2l] = -tm[i * cl + j + 2l] * d.z
+                        tm[i * cl + j + 3l] = -tm[i * cl + j + 3l] * d.w
+                        kq[i * cl + j] *= d.x
+                        kq[i * cl + j + 1l] *= d.y
+                        kq[i * cl + j + 2l] *= d.z
+                        kq[i * cl + j + 3l] *= d.w
+                        j += 4l
                     }
+                }
+                while (j < i) {
+                    let d = exp(gi - gcum[j])
+                    tm[i * cl + j] = -tm[i * cl + j] * d
+                    kq[i * cl + j] *= d
+                    j++
+                }
+                tm[i * cl + i] = 0.0
+                for (ju in range64(i + 1l, cl)) {   // upper: tm zeroed, kq zeroed (diagonal kept)
+                    tm[i * cl + ju] = 0.0
+                    kq[i * cl + ju] = 0.0
                 }
             }
             // forward substitution in place: T[i][j] = -A[i][j] - sum_t A[i][t] T[t][j]; row i
@@ -7380,14 +7666,19 @@ def private dn_chunked_head(conv : float const?; qoff, koff, voff, cd : int64;
             }
             gemm_f32(och, qc, stp, cl, ds, ds)
             gemm_f32(och, kq, vnew, cl, cl, ds)
-            // gated out-norm straight into the batched output rows
+            // gated out-norm straight into the batched output rows (z-gate exp4: the scalar loop
+            // was the largest exp population of the whole prefill — npos·nvh·ds per layer)
             for (i in range64(cl)) {
                 rmsnorm(och + i * ds, reinterpret<float const?>(och + i * ds), wnorm, ds, eps)
                 var orow = op + (c0 + i) * o_stride
                 let zrow = zp + (c0 + i) * o_stride
-                for (j in range64(ds)) {
-                    let zv = zrow[j]
-                    orow[j] = och[i * ds + j] * (zv / (1.0 + exp(-zv)))
+                if (vec) {
+                    silu_mul4(orow, och + i * ds, zrow, ds)
+                } else {
+                    for (j in range64(ds)) {
+                        let zv = zrow[j]
+                        orow[j] = och[i * ds + j] * (zv / (1.0 + exp(-zv)))
+                    }
                 }
             }
             // state advance, once per chunk: S = e^{g_last} S + (k ⊙ e^{g_last - gcum})^T d
@@ -7443,6 +7734,7 @@ def private deltanet_prefill_chunked(t : Model; var s : Session; l : int64; npos
         dtb0 = reinterpret<float const?>(addr(t.fblob[t.dn_dt_off + l * nvh]))
     }
     let wssz = dn_cws_head_size(c)
+    let vec = g_act_vec   // read on the caller, captured — fork workers must not read globals
     maybe_parallel_for(0, int(nvh), min(int(nvh), get_dispatch_lanes())) $(rb, re) {
         unsafe {
             for (hh in range(rb, re)) {
@@ -7451,7 +7743,7 @@ def private deltanet_prefill_chunked(t : Model; var s : Session; l : int64; npos
                 dn_chunked_head(conv0, kh * ds, kd + kh * ds, 2l * kd + h * ds, cd,
                     bp0 + h, gp0 + h, nvh, zp0 + h * ds, op0 + h * ds, di,
                     st0 + h * ds * ds, ws0 + h * wssz, wnorm0,
-                    ab0[h], dtb0[h], c.norm_eps, npos, ds)
+                    ab0[h], dtb0[h], c.norm_eps, vec, npos, ds)
             }
         }
     }
@@ -7460,6 +7752,7 @@ def private deltanet_prefill_chunked(t : Model; var s : Session; l : int64; npos
 // qwen35 deltanet prefill: batched projections, then the inherently sequential per-token core
 // (state carried across positions), then one batched ssm_out projection + residual.
 def private deltanet_prefill(t : Model; var s : Session; l : int64; npos : int64) {
+    trace_tag(TRACE_TAG_DN)   // override the loop's attn_std stamp: dn layers color separately
     let c = t.config
     let dim = c.dim
     let cd = dn_conv_dim(c)
@@ -7525,18 +7818,23 @@ def private attention_qwen35_gated_prefill(t : Model; var s : Session; l : int64
     mm_b_f(s, s.dn_qg_b, t, fmt_at(t.wq_fmt, l), t.wq_offs[l], s.xb_b, dim, 2l * qd, npos)
     mm_b_f(s, s.k_b, t, fmt_at(t.wk_fmt, l), t.wk_offs[l], s.xb_b, dim, kv_dim, npos)
     mm_b_f(s, s.v_b, t, fmt_at(t.wv_fmt, l), t.wv_offs[l], s.xb_b, dim, kv_dim, npos)
-    // deinterleave per position: head h's q at 2h·hs, its gate at (2h+1)·hs
+    // deinterleave per position: head h's q at 2h·hs, its gate at (2h+1)·hs. Threaded row copies:
+    // the serial scalar loop moved 2·npos·qd floats (16.8MB @pp512) on the caller — a ~3ms
+    // all-lane hole per attention layer in the lane trace. Pure copy — bit-exact at any lane count.
     unsafe {
         let qgp = reinterpret<float const?>(addr(s.dn_qg_b[0]))
         var qp = addr(s.q_b[0])
         var gp = addr(s.dn_qgate_b[0])
-        for (p in range64(npos)) {
-            for (h in range64(n_heads)) {
-                let sb = p * 2l * qd + h * 2l * head_size
-                let db = p * qd + h * head_size
-                for (i in range64(head_size)) {
-                    qp[db + i] = qgp[sb + i]
-                    gp[db + i] = qgp[sb + head_size + i]
+        maybe_parallel_for(npos * qd >= g_act_par_threshold, 0, int(npos), get_dispatch_lanes()) $(rb, re) {
+            unsafe {
+                for (pp in range(rb, re)) {
+                    let p = int64(pp)
+                    for (h in range64(n_heads)) {
+                        let sb = p * 2l * qd + h * 2l * head_size
+                        let db = p * qd + h * head_size
+                        copy_floats(qp + db, qgp + sb, head_size)
+                        copy_floats(gp + db, qgp + sb + head_size, head_size)
+                    }
                 }
             }
         }
@@ -7566,6 +7864,22 @@ def private attention_qwen35_gated_prefill(t : Model; var s : Session; l : int64
         }
     }
     prof_add("rope", ts_rope)
+    let ktq4 = s.kv_dtype_k == KVDtype.tq4
+    let vtq4 = s.kv_dtype_v == KVDtype.tq4
+    if (ktq4 || vtq4) {   // tq4 basis change (attention_std_prefill's twin); xb_b un-rotates below
+        let ts_rot = ref_time_ticks()
+        unsafe {
+            let sgp = reinterpret<float const?>(addr(s.kv_signs[0]))
+            if (ktq4) {
+                tq4_rotate_batch(s.q_b, npos, qd, head_size, sgp)
+                tq4_rotate_batch(s.k_b, npos, kv_dim, head_size, sgp)
+            }
+            if (vtq4) {
+                tq4_rotate_batch(s.v_b, npos, kv_dim, head_size, sgp)
+            }
+        }
+        prof_add("tq4_rot", ts_rot)
+    }
     let ts_kv = ref_time_ticks()
     let store_nrun = kv_runs(s, start_pos, start_pos + npos, s.kv_runs)
     unsafe {
@@ -7577,14 +7891,33 @@ def private attention_qwen35_gated_prefill(t : Model; var s : Session; l : int64
     prefill_attention(s, kcl, vcl, npos, start_pos, head_size, qd, kv_dim, n_heads, kv_mul, scale,
                       false, 0l, c.attn_logit_softcap, null)
     prof_add("attn", ts_attn)
-    // per-head sigmoid output gate on every position's attention output, before the out projection
+    if (vtq4) {   // un-rotate every position's xb before the out-gate (gate is in the original basis)
+        unsafe {
+            tq4_unrotate_batch(s.xb_b, npos, qd, head_size, reinterpret<float const?>(addr(s.kv_signs[0])))
+        }
+    }
+    // per-head sigmoid output gate on every position's attention output, before the out projection.
+    // Threaded + exp4: the serial scalar loop was npos·qd (2.1M @pp512) libm exps on the caller —
+    // a ~10ms all-lane hole per attention layer in the lane trace. qd % 4 == 0 keeps the float4
+    // grouping split-invariant, so lane count never changes the result.
+    let ts_gate = ref_time_ticks()
     unsafe {
         var xbp = addr(s.xb_b[0])
         let gbp = reinterpret<float const?>(addr(s.dn_qgate_b[0]))
-        for (i in range64(npos * qd)) {
-            xbp[i] *= 1.0 / (1.0 + exp(-gbp[i]))
+        let vec = g_act_vec
+        maybe_parallel_for(npos * qd >= g_act_par_threshold, 0, int(npos), get_dispatch_lanes()) $(rb, re) {
+            unsafe {
+                let off = int64(rb) * qd
+                let cnt = int64(re - rb) * qd
+                if (vec) {
+                    sigmoid_gate4(xbp + off, gbp + off, cnt)
+                } else {
+                    sigmoid_gate(xbp + off, gbp + off, cnt)
+                }
+            }
         }
     }
+    prof_add("act", ts_gate)
     attn_out_suffix(t, s, l, npos)
 }
 
@@ -7870,13 +8203,36 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
     trace_tag(TRACE_TAG_ROUTE)
     let ts_route = ref_time_ticks()
     mm_fblob_b(s.moe_rlog, t, t.router_off + l * ne * dim, s.xb_b, dim, ne, npos)
-    for (p in range64(npos)) {
-        if (c.moe_router_bias) {
-            add_bias(s.moe_rlog, p * ne, t.fblob, t.router_b_off + l * ne, ne)
-        }
-        moe_select(c, unsafe(addr(s.moe_rlog[p * ne])), s.moe_idx_b, s.moe_w_b, p * k)
-        if (nsh > 0l) {
-            s.moe_gl_b[p] = moe_shexp_gate(t, l, unsafe(addr(s.xb_b[p * dim])))
+    // per-row bias + select + shexp gate dot, threaded over positions (disjoint logit/idx/w/gate
+    // rows, bit-identical per row) — the serial loop was ~2-3ms of every-lane-idle per layer
+    // between the router GEMM and the gather in the pp512 lane trace
+    unsafe {
+        var rlp = addr(s.moe_rlog[0])
+        var idxp = addr(s.moe_idx_b[0])
+        var wp = addr(s.moe_w_b[0])
+        var glp = nsh > 0l ? addr(s.moe_gl_b[0]) : null
+        let xbp = reinterpret<float const?>(addr(s.xb_b[0]))
+        let rbp = c.moe_router_bias ? reinterpret<float const?>(addr(t.fblob[t.router_b_off + l * ne])) : null
+        let gvp = nsh > 0l ? reinterpret<float const?>(addr(t.fblob[t.shexp_gate_off + l * dim])) : null
+        let gate = c.moe_gate
+        let norm_topk = c.norm_topk_prob
+        let wscale = c.expert_weights_scale
+        maybe_parallel_for(npos > 1l, 0, int(npos), get_dispatch_lanes()) $(pb, pe) {
+            unsafe {
+                for (pp in range(pb, pe)) {
+                    let p = int64(pp)
+                    var lgp = rlp + p * ne
+                    if (rbp != null) {
+                        for (i in range64(ne)) {
+                            lgp[i] += rbp[i]
+                        }
+                    }
+                    moe_select_core(gate, ne, k, norm_topk, wscale, lgp, idxp, wp, p * k)
+                    if (glp != null) {
+                        glp[p] = 1.0 / (1.0 + exp(-dot(gvp, xbp + p * dim, dim)))
+                    }
+                }
+            }
         }
     }
     // bucket the (position, slot) pairs by expert — CSR with the in-place cursor trick: counts
@@ -8390,8 +8746,8 @@ def private ffn_moe_prefill(t : Model; var s : Session; l : int64; npos : int64)
     // Native-MXFP4 experts pay a per-touched-expert Q8 expansion in the grouped path (~120MB of
     // traffic per expert incl. the repack), so it only wins once buckets average enough rows to
     // amortize it — under ~8 rows/expert (short chat turns) the per-position mx4 GEMVs are cheaper.
-    // A native mx4-batch backend (x64) has no expansion tax, so its crossover sits lower (per-fork
-    // overhead only) — the 8-rows/expert gate is kept until re-measured there.
+    // A native mx4-batch backend (the gen family) has no expansion tax, so its crossover sits
+    // lower (per-fork overhead only) — the 8-rows/expert gate is kept until re-measured there.
     let mx4_grouped_pays = !t.experts_mx4 || npos * c.n_expert_used >= 8l * c.n_expert
     // kq-expert layers ride the grouped buckets through the kq batch tile; without it (portable /
     // no-kq backend) they take the per-position reference path (the decode groupn serves them)
@@ -8424,8 +8780,10 @@ def forward_prefill(t : Model; var s : Session; tokens : array<int64>; npos, sta
         }
         return
     }
+    let ts_alloc = ref_time_ticks()
     kv_ensure(s, start_pos + npos)   // paged sessions: grow the block table BEFORE any cache-pointer hoist
     forward_prefill_alloc(t, s, npos, start_pos)
+    prof_add("alloc", ts_alloc)
 
     // token embeddings -> residual stream x_b [npos x dim]
     let dim = c.dim
@@ -8560,6 +8918,16 @@ def embed_(m : Model; text : string) : array<float> {
 }
 
 // batched-prefill scratch sizing, shared by the token and embedding entries
+// grow-only, contents-DISCARDING, no-init scratch sizing: the batched scratch is stage output —
+// old bytes are garbage, new bytes are fully written before any read. `delete` on grow skips
+// both the realloc's old-block copy and the zero-fill (together ~5ms on a first 512-row prefill).
+def private scratch_resize(var a : array<auto(numT)>; need : int64) {
+    if (int64(length(a)) < need) {
+        delete a
+    }
+    a |> resize_no_init(need)
+}
+
 def private forward_prefill_alloc(t : Model; var s : Session; npos, start_pos : int64) {
     let c = t.config
     let dim = c.dim
@@ -8570,17 +8938,20 @@ def private forward_prefill_alloc(t : Model; var s : Session; npos, start_pos : 
     let qd = n_heads * head_size       // query / attention-output width (== dim except Gemma2/gemma4)
     let xdim = max(dim, qd)            // xb_b holds the norm output (dim) then the attn output (qd)
     let maxn = max(xdim, hidden)
-    // size the batched scratch to this prompt
-    s.x_b |> resize(npos * dim)
-    s.xb_b |> resize(npos * xdim)
-    s.xb2_b |> resize(npos * dim)
-    s.q_b |> resize(npos * qd)
-    s.k_b |> resize(npos * kv_dim)
-    s.v_b |> resize(npos * kv_dim)
-    s.hb_b |> resize(npos * hidden)
-    s.hb2_b |> resize(npos * hidden)
-    s.xqb |> resize(npos * maxn)
-    s.xsb |> resize(npos * maxn / 32l)
+    // size the batched scratch to this prompt — no-init: every array here is stage output,
+    // fully written before the next stage reads it (embed fills x_b; each block writes its
+    // whole [npos x width] result), so the grow-time zero-fill was ~5ms of pure waste on a
+    // first 512-row prefill (~70 MB of scratch)
+    s.x_b |> scratch_resize(npos * dim)
+    s.xb_b |> scratch_resize(npos * xdim)
+    s.xb2_b |> scratch_resize(npos * dim)
+    s.q_b |> scratch_resize(npos * qd)
+    s.k_b |> scratch_resize(npos * kv_dim)
+    s.v_b |> scratch_resize(npos * kv_dim)
+    s.hb_b |> scratch_resize(npos * hidden)
+    s.hb2_b |> scratch_resize(npos * hidden)
+    s.xqb |> scratch_resize(npos * maxn)
+    s.xsb |> scratch_resize(npos * maxn / 32l)
     if (t.kquant_native) {   // kq batch tile: per-16 sums beside the batch quants
         s.xbsb |> resize(npos * maxn / 16l)
     }
@@ -8654,11 +9025,13 @@ def private forward_prefill_body(t : Model; var s : Session; npos, start_pos : i
     // block. An active whole-prefill override (select_prefill_override) may claim the entire stack;
     // it returns false to decline (unsupported shape/config), which falls back to the CPU loop.
     var stack_done = false
+    g_prefill_logits_done = false
     if (!empty(g_prefill_override_name)) {
         stack_done = invoke(g_prefill_override, t, s, npos, start_pos)
     }
     if (!stack_done) {
         for (l in range64(c.n_layers)) {
+            trace_marker("layer", int(l))   // unit boundary for the timeline viewer (no-op untraced)
             trace_tag(TRACE_TAG_ATTN_STD)   // per-lane trace: color the prefill attention section
             t.blocks.attn_prefill(t, s, l, npos, start_pos)
             trace_tag(TRACE_TAG_FFN_STD)
@@ -8667,6 +9040,7 @@ def private forward_prefill_body(t : Model; var s : Session; npos, start_pos : i
     }
 
     // final rmsnorm + classifier on the LAST position only (that's what we sample next)
+    return if (stack_done && g_prefill_logits_done)   // the override already produced s.logits
     let ts_final = ref_time_ticks()
     let last = npos - 1l
     rms_at(s.xb, t, t.rms_final_off, s.x_b, last * dim, dim)
