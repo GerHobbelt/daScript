@@ -2721,34 +2721,38 @@ namespace das {
     }
 
     ExpressionPtr ExprMakeStruct::visit(Visitor & vis) {
-        vis.preVisit(this);
-        if ( makeType ) {
-            vis.preVisit(makeType.get());
-            makeType = makeType->visit(vis);
-            makeType = vis.visit(makeType.get());
-        }
-        if ( vis.canVisitMakeStructureBody(this) ) {
-            for ( int index=0; index != int(structs.size()); ++index ) {
-                vis.preVisitMakeStructureIndex(this, index, index==int(structs.size()-1));
-                auto & fields = structs[index];
-                for ( auto it = fields->begin(); it != fields->end(); ) {
-                    auto & field = *it;
-                    vis.preVisitMakeStructureField(this, index, field.get(), field==fields->back());
-                    field->value = field->value->visit(vis);
-                    if ( field ) {
-                        field = vis.visitMakeStructureField(this, index, field.get(), field==fields->back());
-                    }
-                    if ( field ) ++it; else it = fields->erase(it);
-                }
-                vis.visitMakeStructureIndex(this, index, index==int(structs.size()-1));
+        if ( vis.canVisitMakeStructure(this) ) {
+            vis.preVisit(this);
+            if ( makeType ) {
+                vis.preVisit(makeType.get());
+                makeType = makeType->visit(vis);
+                makeType = vis.visit(makeType.get());
             }
+            if ( vis.canVisitMakeStructureBody(this) ) {
+                for ( int index=0; index != int(structs.size()); ++index ) {
+                    vis.preVisitMakeStructureIndex(this, index, index==int(structs.size()-1));
+                    auto & fields = structs[index];
+                    for ( auto it = fields->begin(); it != fields->end(); ) {
+                        auto & field = *it;
+                        vis.preVisitMakeStructureField(this, index, field.get(), field==fields->back());
+                        field->value = field->value->visit(vis);
+                        if ( field ) {
+                            field = vis.visitMakeStructureField(this, index, field.get(), field==fields->back());
+                        }
+                        if ( field ) ++it; else it = fields->erase(it);
+                    }
+                    vis.visitMakeStructureIndex(this, index, index==int(structs.size()-1));
+                }
+            }
+            if ( block && vis.canVisitMakeStructureBlock(this, block.get()) ) {
+                vis.preVisitMakeStructureBlock(this, block.get());
+                block = block->visit(vis);
+                if ( block ) block = vis.visitMakeStructureBlock(this, block.get());
+            }
+            return vis.visit(this);
+        } else {
+            return this;
         }
-        if ( block && vis.canVisitMakeStructureBlock(this, block.get()) ) {
-            vis.preVisitMakeStructureBlock(this, block.get());
-            block = block->visit(vis);
-            if ( block ) block = vis.visitMakeStructureBlock(this, block.get());
-        }
-        return vis.visit(this);
     }
 
     void ExprMakeStruct::markNoDiscard() {
@@ -3481,24 +3485,25 @@ namespace das {
         bool logPass = options.getBoolOption("log_optimization_passes",false);
         bool log = logOpt || logPass;
         bool any, last;
+        int optimizationRound = 1;
         if (log) {
             logs << *this << "\n";
         }
         do {
-            if ( log ) logs << "OPTIMIZE:\n"; if ( logPass ) logs << *this;
+            if ( log ) logs << "OPTIMIZE " << optimizationRound << ":\n"; if ( logPass ) logs << *this;
             any = false;
-            last = optimizationRefFolding();    if ( failed() ) break;  any |= last;
+            last = optimizationRefFolding(optimizationRound);    if ( failed() ) break;  any |= last;
             if ( log ) logs << "REF FOLDING: " << (last ? "optimized" : "nothing") << "\n"; if ( logPass ) logs << *this;
-            last = optimizationUnused(logs);    if ( failed() ) break;  any |= last;
+            last = optimizationUnused(logs, optimizationRound);    if ( failed() ) break;  any |= last;
             if ( log ) logs << "REMOVE UNUSED:" << (last ? "optimized" : "nothing") << "\n"; if ( logPass ) logs << *this;
-            last = optimizationConstFolding();  if ( failed() ) break;  any |= last;
+            last = optimizationConstFolding(optimizationRound);  if ( failed() ) break;  any |= last;
             if ( log ) logs << "CONST FOLDING:" << (last ? "optimized" : "nothing") << "\n"; if ( logPass ) logs << *this;
-            last = optimizationCondFolding();  if ( failed() ) break;  any |= last;
+            last = optimizationCondFolding(optimizationRound);  if ( failed() ) break;  any |= last;
             if ( log ) logs << "COND FOLDING:" << (last ? "optimized" : "nothing") << "\n"; if ( logPass ) logs << *this;
-            last = optimizationBlockFolding();  if ( failed() ) break;  any |= last;
+            last = optimizationBlockFolding(optimizationRound);  if ( failed() ) break;  any |= last;
             if ( log ) logs << "BLOCK FOLDING:" << (last ? "optimized" : "nothing") << "\n"; if ( logPass ) logs << *this;
             // this is here again for a reason
-            last = optimizationUnused(logs);    if ( failed() ) break;  any |= last;
+            last = optimizationUnused(logs, optimizationRound);    if ( failed() ) break;  any |= last;
             if ( log ) logs << "REMOVE UNUSED:" << (last ? "optimized" : "nothing") << "\n"; if ( logPass ) logs << *this;
             // now, user macros
             last = false;
@@ -3521,6 +3526,7 @@ namespace das {
             if ( failed() ) break;
             any |= last;
             if ( log ) logs << "MACROS:" << (last ? "optimized" : "nothing") << "\n"; if ( logPass ) logs << *this;
+            optimizationRound++;
         } while ( any );
     }
 }

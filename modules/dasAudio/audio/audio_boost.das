@@ -43,6 +43,7 @@ enum public AudioChannelState {
 struct public AudioChannelStatus {
     state : AudioChannelState
     playback_position : uint64
+    consumed_position : uint64  // frames of actual audio consumed (excludes silence padding)
     stream_que_length : int
 }
 
@@ -352,6 +353,7 @@ struct StreamChunk {
 
 class AudioSourcePCMStream : AudioSource {
     chunks : array<StreamChunk>
+    consumed : uint64 = 0ul  // frames of actual audio consumed (excludes silence)
     def AudioSourcePCMStream(ch, rate : int) {
         bitrate = rate
         channels = ch
@@ -384,10 +386,12 @@ class AudioSourcePCMStream : AudioSource {
                 break
             }
         }
+        consumed += uint64(ofs / channels)
         return <- data
     }
     def override update_status(var status : AudioChannelStatus#) {
         status.stream_que_length = length(chunks)
+        status.consumed_position = consumed
     }
 }
 
@@ -889,7 +893,7 @@ def finalize_mixer {
         let SPEED = g_mixer_total_time / double(g_mixer_total_samples)
         let SPEED_OF_LIGHT = 1000.lf / 48000.lf
         let UTILIZATION = int(SPEED / SPEED_OF_LIGHT * 1000.lf)
-        print("mixer {UTILIZATION/10}.{UTILIZATION%10}% utilization\n")
+        to_log(0, "mixer {UTILIZATION/10}.{UTILIZATION%10}% utilization\n")
     }
 }
 

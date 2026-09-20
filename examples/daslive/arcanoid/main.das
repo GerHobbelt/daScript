@@ -21,6 +21,10 @@ require daslib/math_boost
 require daslib/archive
 require opengl/opengl_ttf
 require audio/audio_boost
+require strudel/strudel
+require strudel/strudel_player
+require strudel/strudel_live
+require daslib/strings_boost
 require live_host
 
 // --- Constants ---
@@ -172,6 +176,136 @@ def play_sfx(samples : array<float>) {
     if (!audio_initialized) { return ; }
     var copy <- clone(samples)
     play_sound_from_pcm(AUDIO_RATE, AUDIO_CHANNELS, copy)
+}
+
+// --- Music (daStrudel) ---
+
+var g_music_tracks : table<string; int>
+
+def setup_menu_music() {
+    // Title screen — mysterious, anticipatory, classic arcade title vibe
+    g_music_tracks["drums"] = strudel_add_track(s("<bd ~ [~ hh] ~> <bd ~ [~ hh] [hh?0.3 ~]> <bd ~ [~ hh] ~> <bd ~ [~ cp?0.4] [hh?0.3 ~]>"), 0.45)
+    g_music_tracks["bass"] = strudel_add_track(note_pattern("<[a2 a2] ~ [e2 e2] ~> <[a2 a2] ~ [f2 f2] ~> <[a2 a2] ~ [g2 g2] ~> <[a2 a2] ~ [e2 e2] [f2 e2]>", "sine"), 0.35)
+    g_music_tracks["lead"] = strudel_add_track(note_pattern("<a4 c5 e5 c5> <a4 b4 c5 e5> <f5 e5 c5 a4> <e5?0.7 d5 c5 b4>", "triangle"), 0.2)
+    g_music_tracks["arp"] = strudel_add_track(note_pattern("<[a4 c5 e5 a5]> <[a4 c5 e5 c5]> <[f4 a4 c5 f5?0.5]> <[e4 g4 b4 e5?0.5]>", "triangle"), 0.1)
+}
+
+def strudel_music_cmd(cmd : string) {
+    let parts <- split(cmd, ":")
+    if (length(parts) < 2) {
+        return
+    }
+    let action = parts[0]
+    let name = parts[1]
+    if (action == "play" && length(parts) >= 3) {
+        let gain = length(parts) >= 4 ? float(to_double(parts[3])) : 1.0
+        if (key_exists(g_music_tracks, name)) {
+            strudel_remove_track(g_music_tracks[name])
+        }
+        g_music_tracks[name] = strudel_add_track(s(parts[2]), gain)
+    } elif (action == "note" && length(parts) >= 4) {
+        let synth = parts[3]
+        let gain = length(parts) >= 5 ? float(to_double(parts[4])) : 0.4
+        if (key_exists(g_music_tracks, name)) {
+            strudel_remove_track(g_music_tracks[name])
+        }
+        g_music_tracks[name] = strudel_add_track(note_pattern(parts[2], synth), gain)
+    } elif (action == "stop") {
+        if (key_exists(g_music_tracks, name)) {
+            let fade_time = length(parts) >= 3 ? float(to_double(parts[2])) : 0.5
+            strudel_fade_track(g_music_tracks[name], 0.0, fade_time)
+        }
+    } elif (action == "fade" && length(parts) >= 4) {
+        if (key_exists(g_music_tracks, name)) {
+            let gain = float(to_double(parts[2]))
+            let time = float(to_double(parts[3]))
+            strudel_fade_track(g_music_tracks[name], gain, time)
+        }
+    }
+}
+
+def strudel_music_main() {
+    strudel_set_bpm(118.0lf)
+    setup_menu_music()
+    strudel_play(@@strudel_music_cmd)
+}
+
+def stop_all_tracks(fade : float) {
+    strudel_command("stop:drums:{fade}")
+    strudel_command("stop:bass:{fade}")
+    strudel_command("stop:lead:{fade}")
+    strudel_command("stop:arp:{fade}")
+}
+
+def start_menu_music() {
+    strudel_set_bpm(118.0lf)
+    strudel_command("play:drums:<bd ~ [~ hh] ~> <bd ~ [~ hh] [hh?0.3 ~]> <bd ~ [~ hh] ~> <bd ~ [~ cp?0.4] [hh?0.3 ~]>:0.45")
+    strudel_command("note:bass:<[a2 a2] ~ [e2 e2] ~> <[a2 a2] ~ [f2 f2] ~> <[a2 a2] ~ [g2 g2] ~> <[a2 a2] ~ [e2 e2] [f2 e2]>:sine:0.35")
+    strudel_command("note:lead:<a4 c5 e5 c5> <a4 b4 c5 e5> <f5 e5 c5 a4> <e5?0.7 d5 c5 b4>:triangle:0.2")
+    strudel_command("note:arp:<[a4 c5 e5 a5]> <[a4 c5 e5 c5]> <[f4 a4 c5 f5?0.5]> <[e4 g4 b4 e5?0.5]>:triangle:0.1")
+}
+
+def start_play_music() {
+    // Stage theme — driving, energetic, classic arcade action in A minor
+    strudel_set_bpm(142.0lf)
+    strudel_command("play:drums:<bd [hh hh] sd [hh hh]> <bd [hh hh] sd [hh cp]> <bd [hh hh] sd [hh hh]> <bd [hh hh] [sd sd] [hh hh]> <bd [hh hh] sd [hh hh]> <bd [hh cp?0.5] sd [hh hh]> <bd [hh hh] sd [hh?0.6 hh]> <bd [hh hh] [sd?0.4 sd] [cp?0.5 hh]>:0.6")
+    strudel_command("note:bass:<[a2 a2] [a2 a2] [f2 f2] [g2 g2]> <[a2 a2] [a2 g2] [f2 f2] [e2 e2]> <[a2 a2] [a2 a2] [f2 f2] [g2 g2]> <[a2 a2] [c3 c3] [d3 d3] [e3 e3]> <[a2 a2] [a2 a2] [f2 f2] [g2 g2]> <[a2 a2] [g2 f2] [e2 e2] [e2 f2]> <[a2 a2] [a2 a2] [d3 d3] [c3 c3]> <[a2 a2] [f2?0.7 f2] [g2 g2] [a2 b2]>:square:0.3")
+    strudel_command("note:lead:<a4 c5 e5 a5> <g5 e5 c5 ~> <a4 c5 e5 a5> <f5 e5 d5 c5> <a4 ~ [c5 d5] e5> <g5 e5 c5 a4> <[a4 b4] c5 e5 ~> <b4?0.7 c5 [d5 e5?0.8] a5>:sawtooth:0.25")
+    strudel_command("note:arp:<[a4 c5 e5 a5 c6 a5 e5 c5]> <[e5 a5 c6 e6 c6 a5 e5 a4]> <[a4 c5 e5 a5?0.6 c6?0.6 a5 e5 c5]> <[f4 a4 c5 f5 c5 a4 f4 a4]> <[a4 c5 e5 a5 c6 a5 e5 c5]> <[e4 g4 b4 e5 b4 g4?0.7 e4 g4]> <[a4 e5?0.6 c5 a5?0.6 e5 c5?0.6 a4 e5]> <[f4 a4 c5 f5?0.5 c5 a4?0.7 f4 a4]>:triangle:0.12")
+}
+
+def start_win_music() {
+    // Victory — triumphant C major fanfare, fast arpeggios
+    strudel_set_bpm(152.0lf)
+    strudel_command("play:drums:<bd sd bd [sd sd]> <bd [sd cp] bd sd> <bd sd [bd bd] [sd cp]> <bd [cp cp] bd [sd?0.7 sd?0.7]>:0.6")
+    strudel_command("note:bass:<[c3 c3] [e3 e3] [g3 g3] [c4 c4]> <[c3 c3] [d3 d3] [e3 e3] [g3 g3]> <[e3 e3] [g3 g3] [c4 c4] [e4 e4]> <[c4 c4] [g3 g3] [e3 e3] [c3 c3]>:square:0.3")
+    strudel_command("note:lead:<c5 e5 g5 c6> <e5 g5 c6 e6> <g5 e5 c6 g5> <c6 b5 a5 g5>:sawtooth:0.3")
+    strudel_command("note:arp:<[c5 e5 g5 c6 e6 c6 g5 e5]> <[e5 g5 c6 e6 g6?0.7 e6 c6 g5]> <[g5 c6 e6 g6 e6 c6 g5 c6]> <[c6 g5 e5 c5 e5 g5 c6?0.8 e6?0.8]>:triangle:0.18")
+}
+
+def start_gameover_music() {
+    strudel_set_bpm(85.0lf)
+    strudel_command("play:drums:<bd ~ ~ ~> <bd ~ [~ hh?0.3] ~> <bd ~ ~ [~ bd?0.3]> <bd ~ ~ ~>:0.25")
+    strudel_command("note:bass:<c3 bb2 ab2 g2> <c3 ~ ab2 ~> <bb2 ab2 g2 f2> <g2 ~ ab2 ~>:sine:0.3")
+    strudel_command("note:lead:<eb4 ~ d4 ~> <~ d4 ~ c4> <eb4 d4?0.5 c4 ~> <~ ~ d4?0.5 ~>:triangle:0.2")
+}
+
+def update_music() {
+    if (game_state == prev_music_state) {
+        return
+    }
+    let FADE_OUT = 0.8
+    let FADE_IN = 0.5
+    // Pause: fade down existing tracks, keep them alive
+    if (game_state == GameState.paused) {
+        strudel_command("fade:drums:0.15:{FADE_OUT}")
+        strudel_command("fade:bass:0.15:{FADE_OUT}")
+        strudel_command("fade:lead:0.1:{FADE_OUT}")
+        strudel_command("fade:arp:0.0:{FADE_OUT}")
+        prev_music_state = game_state
+        return
+    }
+    // Unpause: fade tracks back up
+    if (prev_music_state == GameState.paused && game_state == GameState.playing) {
+        strudel_command("fade:drums:0.6:{FADE_IN}")
+        strudel_command("fade:bass:0.3:{FADE_IN}")
+        strudel_command("fade:lead:0.25:{FADE_IN}")
+        strudel_command("fade:arp:0.15:{FADE_IN}")
+        prev_music_state = game_state
+        return
+    }
+    // Full transition: fade out everything, start new music
+    stop_all_tracks(FADE_OUT)
+    if (game_state == GameState.menu) {
+        start_menu_music()
+    } elif (game_state == GameState.playing) {
+        start_play_music()
+    } elif (game_state == GameState.win_state) {
+        start_win_music()
+    } elif (game_state == GameState.game_over_state) {
+        start_gameover_music()
+    }
+    prev_music_state = game_state
 }
 
 // --- Shaders ---
@@ -388,6 +522,8 @@ var space_was_pressed = false
 var esc_was_pressed = false
 var @live god_mode = false
 var @live game_speed = 1.0
+var @live prev_music_state = GameState.menu
+var music_initialized = false
 
 
 // --- Bonuses ---
@@ -1101,6 +1237,18 @@ def cmd_slow_motion(input : JsonValue?) : JsonValue? {
     return JV(args)
 }
 
+struct CmdMusicVolumeArgs {
+    volume : float = 0.4
+    time : float = 0.3
+}
+
+[live_command(description="Set music volume (0.0-1.0) with optional fade time in seconds")]
+def cmd_music_volume(input : JsonValue?) : JsonValue? {
+    let args = from_JV(input, type<CmdMusicVolumeArgs>)
+    strudel_set_volume(args.volume, args.time)
+    return JV(args)
+}
+
 // --- HUD ---
 
 def draw_text(text : string; x, y : int; tint : float3 = float3(1.0)) {
@@ -1173,6 +1321,11 @@ def init() {
         audio_initialized = true
         init_audio_samples()
     }
+    if (!music_initialized) {
+        strudel_init(@@strudel_music_main)
+        strudel_set_volume(0.4, 0.0)
+        music_initialized = true
+    }
     if (!is_reload()) {
         decs::restart()
         spawn_bricks()
@@ -1230,6 +1383,7 @@ def update() {
         game_state = GameState.playing
         reset_powerups()
     }
+    update_music()
     if (game_state == GameState.playing) {
         update_paddle(dt)
         update_powerup_timers(tick_dt)
@@ -1334,6 +1488,7 @@ def update() {
 
 [export]
 def shutdown() {
+    strudel_shutdown()
     delete_gl_objects()
     live_destroy_window()
 }

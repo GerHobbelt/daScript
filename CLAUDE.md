@@ -101,6 +101,7 @@ Task-specific instructions are split into skill files under `skills/`. You MUST 
 | `skills/daslang_live.md` | Working with `daslang-live.exe`, live-reload lifecycle, REST API, `[live_command]`, `[before_reload]`/`[after_reload]`, persistent store, `live/glfw_live`, `live/live_api` |
 | `skills/perf_lint.md` | Adding new performance lint rules to `daslib/perf_lint.das` |
 | `skills/version_update.md` | Bumping the daslang version number (all files that need updating) |
+| `skills/make_pr.md` | Creating a pull request (lint, test, AOT build+test, format checklist) |
 
 Multiple skill files may apply to a single task. For example, creating a new daslib module requires reading `skills/das_formatting.md`, `skills/daslib_modules.md`, and possibly `skills/documentation_rst.md`.
 
@@ -168,6 +169,16 @@ All code MUST use gen2 syntax (add `options gen2` at the top of every file). Key
 - daslang has garbage collection — `delete` is not required in most code
 - `var inscope` declares automatic cleanup; struct fields need defaults or `@safe_when_uninitialized`
 - `<-` is memcpy+memset(0), NOT smart_ptr-aware — see `skills/das_macros.md` for smart_ptr patterns
+
+### Context heaps and threading
+
+- **`new Foo()` allocates on the current context's heap** — each context has its own heap
+- **Contexts cannot retain data from other contexts** — only copy. A pointer into context A's heap is invalid in context B
+- **Threads run in separate contexts** — `new_thread() <| @{ ... }` creates a new context. Data must be copied/cloned when crossing thread boundaries
+- `clone_string(s)` clones a string into the current context's heap — required when passing strings across contexts
+- `:=` on strings does a clone (new allocation in current context); `=` copies the pointer (unsafe across contexts)
+- **Channel data**: when sending data through channels, the receiving context gets a temporary reference (`#`) — clone/copy what you need before the callback returns
+- **Implication for threaded audio**: parsed data (arrays, structs) created on the main thread cannot be referenced by pointer from the audio thread. Either clone into the audio thread's context, or use C++-side shared memory that lives outside any daScript context
 
 ### Unsafe
 
