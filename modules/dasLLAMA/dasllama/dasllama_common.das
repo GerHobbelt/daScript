@@ -11,6 +11,7 @@ require dasllama/dasllama_math_aarch64_neon  // registers the arm64 SDOT Q8·Q8 
 require ?llvm/daslib/llvm_tune dasllama/dasllama_math_gen  // nolint:STYLE030 — [init]-only: registers "arm64-gen" (the generated GEMM family, arm64 load-select tier). PATH guard: the module hard-requires llvm_tune, so it loads exactly when dasLLVM is mounted
 require ?llvm/daslib/llvm_tune llvm/daslib/llvm_tune public  // re-export ONLY llvm_tune (not math_gen's whole public surface — its jobque_boost would flood requirers with ambiguities): the auto-policy pass and tune_status reach every app that requires this module
 require ?das_metal dasllama/dasllama_math_metal  // nolint:STYLE030 — [init]-only: registers "metal" (the GPU prefill-GEMM batch donor). STRICT guard: the C++ das_metal module exists on Apple builds only, so non-Apple lanes never compile the Metal driver
+require ?das_accelerate dasllama/dasllama_math_accelerate  // nolint:STYLE030 — [init]-only: arms the "+AMX" float-batch override when DASLLAMA_ACCEL=1. Same Apple-only guard shape as the metal driver
 require ?vulkan dasllama/dasllama_math_vulkan  // nolint:STYLE030 — [init]-only: registers "vulkan" (the GPU tier; stage-0 skeleton, kernels land with the offload rail). STRICT guard: the C++ vulkan module is linked only where the dasVulkan package is installed, so CI lanes without it never compile the Vulkan driver
 require dasllama/dasllama_quant
 require dasllama/dasllama_gguf
@@ -233,6 +234,18 @@ def select_prefill_override(name : string) : bool {
 
 def active_prefill_override : string {
     return g_prefill_override_name
+}
+
+//! The GPU-PLE pre-step gate: a prefill override that can ALSO build the E-series PLE side input
+//! on its device registers a probe here. On true, forward_prefill stashes the token rows and skips
+//! the CPU gather+finish; the override consumes the stash (ple_pre_prefill = late-decline fallback).
+typedef PleGpuGateFn = function<(t : Model; s : Session; npos : int64; start_pos : int64) : bool>
+var private g_ple_gpu_gate : PleGpuGateFn
+var private g_ple_gpu_gate_set = false
+
+def register_ple_gpu_gate(fn : PleGpuGateFn) {
+    g_ple_gpu_gate = fn
+    g_ple_gpu_gate_set = true
 }
 
 // set by an override that ALSO produced the last position's logits; reset before every invocation
@@ -2052,6 +2065,14 @@ def private rdec_hydrate_host(t : Model; var s : Session) {
 }
 let private RDEC_MIN_CTX = 4096l        // smallest ctx worth arming a capped mirror at
 
+// the auto-cap floor, env-overridable: DASLLAMA_GPU_MIN_CTX lets a short-context session arm a
+// model whose capped mirror lands under the default floor (e.g. a 3B on an 8GB card fits at 3429)
+def private rdec_min_ctx : int64 {
+    let e = get_env_variable("DASLLAMA_GPU_MIN_CTX")
+    let v = int64(to_int(e))   // non-numeric -> 0 -> treated as unset (keep the default floor)
+    return v > 0l ? max(v, 256l) : RDEC_MIN_CTX
+}
+
 // gather one prepared plane into device-layout bytes and place it in its format's arena; returns
 // the arena block index. Same gather the per-op tier uses (moe_gpu_gather_stack / _kq), then place
 // instead of upload_stack.
@@ -2089,10 +2110,11 @@ def resident_upload(var t : Model; seq_cap : int64) : bool {
         return false
     }
     let c = t.config
-    // only the plain llama std shape for now — no bias, no sinks, no qk-norm (qwen3), no shared-KV,
-    // no softcap (gemma), no partial rotary. These decline cleanly and fall back to the CPU loop.
+    // the plain llama std shape + qk-norm (qwen3) — no bias, sinks, gated attention (its wq is
+    // 2x qd rows, and it rode the old qk_norm decline), shared-KV, softcap, or partial rotary.
+    // These decline cleanly and fall back to the CPU loop.
     if (c.attn_qkv_bias || c.attn_out_bias || c.v_norm || c.attn_sinks || c.moe_dense_shexp
-            || c.n_layer_nextn > 0l || c.qk_norm || c.attn_logit_softcap != 0.0
+            || c.n_layer_nextn > 0l || c.q_gated || c.attn_logit_softcap != 0.0
             || c.final_logit_softcap != 0.0 || c.pre_post_norm
             || (c.rope_dim > 0l && c.rope_dim != c.head_size)) {
         return false
@@ -2151,7 +2173,7 @@ def resident_upload(var t : Model; seq_cap : int64) : bool {
     let kg = repacked ? active_q8_kgroup() : 4l
     let wb = repacked ? active_q8_wbias() : 0l
     if (!rdec_prepare(c.n_layers, dim, qd, kvd, hs, c.n_heads, hid0, c.vocab_size, seq_cap, neox,
-                      c.norm_eps, c.attn_scale > 0.0 ? c.attn_scale : 1.0 / sqrt(float(hs)))) {
+                      c.norm_eps, c.attn_scale > 0.0 ? c.attn_scale : 1.0 / sqrt(float(hs)), c.qk_norm)) {
         return false
     }
     // place every plane, wire each layer
@@ -2178,9 +2200,10 @@ def resident_upload(var t : Model; seq_cap : int64) : bool {
         return false
     }
     rdec_set_cls(bcls, int(cls_fmt))
-    // upload the norm rows: [rms_att[l], rms_ffn[l]] x L, then rms_final
+    // upload the norm rows: [rms_att[l], rms_ffn[l]] x L, then rms_final; qk_norm appends the
+    // per-head [rms_q[l], rms_k[l]] x L rows (hs floats each) past the fixed layout
     var norms : array<float>
-    norms |> resize(int(c.n_layers * 2l * dim + dim))
+    norms |> resize(int(c.n_layers * 2l * dim + dim + (c.qk_norm ? c.n_layers * 2l * hs : 0l)))
     for (l in range64(c.n_layers)) {
         for (i in range64(dim)) {
             norms[int(l * 2l * dim + i)] = t.fblob[t.rms_att_off + l * dim + i]
@@ -2189,6 +2212,15 @@ def resident_upload(var t : Model; seq_cap : int64) : bool {
     }
     for (i in range64(dim)) {
         norms[int(c.n_layers * 2l * dim + i)] = t.fblob[t.rms_final_off + i]
+    }
+    if (c.qk_norm) {
+        let qkw = c.n_layers * 2l * dim + dim
+        for (l in range64(c.n_layers)) {
+            for (i in range64(hs)) {
+                norms[int(qkw + l * 2l * hs + i)] = t.fblob[t.rms_q_offs[l] + i]
+                norms[int(qkw + (l * 2l + 1l) * hs + i)] = t.fblob[t.rms_k_offs[l] + i]
+            }
+        }
     }
     rdec_upload_norms(norms)
     delete norms
@@ -2538,7 +2570,7 @@ def moe_gpu_upload_resident(var t : Model) {
             // weights are fixed, the KV mirror is not: retry at the context that fits (the plan's
             // own remedy), as long as it stays a usable window. The driver guards decode past the cap.
             let fit_ctx = (plan.budget_bytes - plan.weight_bytes) / (plan.kv_bytes / seq_cap)
-            if (fit_ctx >= RDEC_MIN_CTX) {
+            if (fit_ctx >= rdec_min_ctx()) {
                 seq_cap = fit_ctx
                 plan = resident_plan(t, seq_cap, KVDtype.f32, KVDtype.f32)
             }
@@ -4520,6 +4552,8 @@ struct Session {
     ple_inp : array<float>      // the built per-(position, layer) side input (npos x n_layers x ple)
     ple_proj : array<float>     // model-proj scratch for the pre-step (npos x n_layers x ple)
     ple_gate : array<float>     // per-(position) gate vector for the layer block (npos x ple)
+    ple_gpu_tokens : array<int64>  // stashed token rows for a driver-owned pre-step (see register_ple_gpu_gate)
+    ple_gpu_pending : bool      // forward_prefill skipped the CPU pre-step — the engaged driver builds it
     // qwen35 deltanet recurrent state (persists across tokens; zeroed at position 0) + scratch.
     // Empty unless config.recr_mask != 0. State is forward-only — dn_pos guards against rewind.
     dn_pos : int64                 // the next position the deltanet stack expects
@@ -8644,8 +8678,9 @@ def private ple_pre_decode(t : Model; var s : Session; token : int64) {
     ple_pre_finish(t, s, s.x, 1l)
 }
 
-// Prefill pre-step: gather every position's per-layer embedding row, then finish (batched).
-def private ple_pre_prefill(t : Model; var s : Session; tokens : array<int64>; npos : int64) {
+//! Prefill pre-step: gather every position's per-layer embedding row, then finish (batched).
+//! Public as the late-decline fallback for a driver that claimed the pre-step via the gate.
+def ple_pre_prefill(t : Model; var s : Session; tokens : array<int64>; npos : int64) {
     let all = t.config.n_layers * t.config.n_embd_per_layer
     for (p in range64(npos)) {
         ple_gather_row(t, tokens[p], s.ple_inp, p * all)
@@ -8680,6 +8715,8 @@ def private ple_block_decode(t : Model; var s : Session; l : int64) {
 // Per-layer block (prefill, batched over npos). ple_inp is position-major so the layer-l side vector
 // of position p sits at p*(layers*ple) + l*ple.
 def private ple_block_prefill(t : Model; var s : Session; l : int64; npos : int64) {
+    // a broken gate promise would read an empty/stale ple_inp here — fail loud, never mismeasure
+    if (s.ple_gpu_pending) panic("ple_block_prefill: GPU pre-step promised but the CPU body engaged")
     let c = t.config
     let dim = c.dim
     let ple = c.n_embd_per_layer
@@ -8726,7 +8763,9 @@ def private gemma4_moe_ffn(t : Model; var s : Session; l : int64) {
     let ne = c.n_expert
     let k = c.n_expert_used
     // routed branch — input, custom router, select, per-expert down scale, experts, post-norm
+    let ts_norm0 = ref_time_ticks()
     rms_at(s.xb, t, t.rms_pre_ffn2_off + l * dim, s.moe_ao, dim)
+    prof_add("norm", ts_norm0)
     trace_tag(TRACE_TAG_ROUTE)   // decode router GEMV — without this it rides the stale attn tag in traces
     let ts_route = ref_time_ticks()
     gemma4_router_tmp(t, s, l)
@@ -8737,7 +8776,9 @@ def private gemma4_moe_ffn(t : Model; var s : Session; l : int64) {
     }
     prof_add("moe_route", ts_route)
     moe_experts_apply(t, s, l)
+    let ts_norm1 = ref_time_ticks()
     rms_at(s.moe_acc, t, t.rms_post_ffn2_off + l * dim, s.moe_acc, dim)
+    prof_add("norm", ts_norm1)
     // dense parallel shared expert (its own pre/post norms), into s.xb
     let ts_sh = ref_time_ticks()
     trace_tag(TRACE_TAG_SHEXP)
@@ -8746,8 +8787,12 @@ def private gemma4_moe_ffn(t : Model; var s : Session; l : int64) {
     rms_at(s.xb, t, t.rms_post_ffn1_off + l * dim, s.xb, dim)
     prof_add("mm_shexp", ts_sh)
     // combine then the shared post_ffw_norm on the sum
+    let ts_comb = ref_time_ticks()
     add_inplace(unsafe(addr(s.moe_acc[0])), unsafe(addr(s.xb[0])), dim)
+    prof_add("act_resid", ts_comb)
+    let ts_norm2 = ref_time_ticks()
     rms_at(s.moe_acc, t, t.rms_post_ffn_off + l * dim, s.moe_acc, dim)
+    prof_add("norm", ts_norm2)
 }
 
 // gemma4 FFN decode: dense (12B/31B) or the parallel dense-shared + routed MoE (26B-A4B) by expert count.
@@ -8766,7 +8811,9 @@ def private ffn_gemma4_decode(t : Model; var s : Session; l : int64) {
         return
     }
     let dim = c.dim
+    let ts_copy = ref_time_ticks()
     copy_floats(s.x, 0l, s.moe_ao, 0l, dim)
+    prof_add("act_resid", ts_copy)
     gemma4_moe_ffn(t, s, l)
     let ts_resid = ref_time_ticks()
     if (c.layer_out_scale) {
@@ -9084,8 +9131,12 @@ def forward(t : Model; var s : Session; token, pos : int64) {
     if (!stack_done) {
         blob_only_panic(t, "decode stack")
         for (l in range64(c.n_layers)) {
+            let ts_blk_attn = ref_time_ticks()
             t.blocks.attn_decode(t, s, l, pos)
+            prof_add("blk_attn", ts_blk_attn)
+            let ts_blk_ffn = ref_time_ticks()
             t.blocks.ffn_decode(t, s, l)
+            prof_add("blk_ffn", ts_blk_ffn)
         }
     }
 
@@ -11952,7 +12003,15 @@ def forward_prefill(t : Model; var s : Session; tokens : array<int64>; npos, sta
     prof_add("embed", ts_embed)
     if (has_ple(c)) {  // gemma-4 E-series: build each position's per-(layer) side input before the stack
         let ts_ple = ref_time_ticks()
-        ple_pre_prefill(t, s, tokens, npos)
+        if (g_ple_gpu_gate_set && invoke(g_ple_gpu_gate, t, s, npos, start_pos)) {
+            s.ple_gpu_tokens |> resize(int(npos))
+            for (p in range64(npos)) {
+                s.ple_gpu_tokens[p] = tokens[p]
+            }
+            s.ple_gpu_pending = true
+        } else {
+            ple_pre_prefill(t, s, tokens, npos)
+        }
         prof_add("ple", ts_ple)
     }
 

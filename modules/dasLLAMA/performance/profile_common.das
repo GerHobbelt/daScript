@@ -231,6 +231,18 @@ def model_exec_fmt(t : Model) : string {
         exec_fmt_add(seen, t.we2_fmt)
         exec_fmt_add(seen, t.we3_fmt)
     }
+    // deltanet hybrids carry their own projection tags (kq-native since IMAGE_VERSION 5) — walk
+    // the recurrent rows only (others hold resize defaults) or the receipt hides dn plane
+    // formats (27B: k5 ssm_out ran unlisted). Empty arrays = not a deltanet model, add nothing.
+    if (!empty(t.dnqkv_fmt) || !empty(t.dngate_fmt) || !empty(t.dnout_fmt)) {
+        for (l in range64(t.config.n_layers)) {
+            if (layer_is_recurrent(t.config, l)) {
+                if (!empty(t.dnqkv_fmt)) { seen |> insert("{t.dnqkv_fmt[l]}") }
+                if (!empty(t.dngate_fmt)) { seen |> insert("{t.dngate_fmt[l]}") }
+                if (!empty(t.dnout_fmt)) { seen |> insert("{t.dnout_fmt[l]}") }
+            }
+        }
+    }
     seen |> insert("{t.config.shared_weights ? t.emb_fmt : t.wcls_fmt}")
     var names <- [for (k in keys(seen)); k]
     sort(names)
@@ -872,7 +884,7 @@ struct BenchTest {
 struct BenchRun {
     engine : string          // "das" | "llama.cpp"
     backend : string         // "cpu" | "metal" | "vulkan"
-    flavor : string          // das: "tuned"; llama.cpp build flavor: "stock" | "clean-cpu"
+    flavor : string          // das: "tuned" | "accel" (+AMX tier); llama.cpp build flavor: "stock" | "clean-cpu"
     box : string
     threads : int
     date : string            // YYYY-MM-DD

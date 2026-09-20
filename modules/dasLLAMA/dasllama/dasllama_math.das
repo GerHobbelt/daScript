@@ -556,7 +556,7 @@ def setup_dasllama_jobque_() {
     set_jobque_batch_dispatch(true)
     // team dispatch (#3368) as the runner default: fifo fork/join costs ~10us PER JOB, so a
     // 96-lane dispatch is ~1ms x ~160 dispatches/decoded token — EPYC 9654 measured Llama-1B
-    // decode 7.6 -> 43 t/s (5.7x) and prefill-512 2x from this one switch (epyc9654_measurements.md)
+    // decode 7.6 -> 43 t/s (5.7x) and prefill-512 2x from this one switch (history/dasLLAMA/epyc9654_measurements.md)
     set_jobque_team_mode(true)
     set_jobque_worker_spin(int(min(g_jobque_spin_us, 2147483647l)))
     set_jobque_join_spin(int(min(g_jobque_join_poll, 2147483647l)))
@@ -902,10 +902,50 @@ def private matmul_batch_core(var yp : float?; wp : float const?; xp : float con
     }
 }
 
+// ===== float-plane batch override (the "+AMX"/accelerate tier) =====
+// fp32/bf16 BATCH slots only (quant stays NEON — crossover verdict in the accelerate driver
+// header). false = fall through to the portable body; off by default (raw tier bit-unchanged).
+typedef FpBatchOverrideFn = function<(var yp : float?; wp : float const?; xp : float const?; n : int64; d : int64; ntok : int64) : bool>
+typedef Bf16BatchOverrideFn = function<(var yp : float?; wp : uint16 const?; xp : float const?; n : int64; d : int64; ntok : int64) : bool>
+
+[unused_argument(yp, wp, xp, n, d, ntok)]
+def private fp_batch_override_unset(var yp : float?; wp : float const?; xp : float const?; n, d, ntok : int64) : bool => false
+
+[unused_argument(yp, wp, xp, n, d, ntok)]
+def private bf16_batch_override_unset(var yp : float?; wp : uint16 const?; xp : float const?; n, d, ntok : int64) : bool => false
+
+var private g_mm_fp_batch_override : FpBatchOverrideFn = @@fp_batch_override_unset
+var private g_mm_bf16_batch_override : Bf16BatchOverrideFn = @@bf16_batch_override_unset
+var private g_fp_override_active = false
+var private g_fp_override_min_ntok = 32l
+
+//! Install the float-plane batch override (the accelerate driver). min_ntok gates the donor to
+//! batch shapes; 1 arms it for decode GEMV too (the M4/M5-SME applicability probe lane).
+def set_float_batch_override(fp : FpBatchOverrideFn; bf16 : Bf16BatchOverrideFn; min_ntok : int64) {
+    g_mm_fp_batch_override = fp
+    g_mm_bf16_batch_override = bf16
+    g_fp_override_min_ntok = min_ntok
+    g_fp_override_active = true
+}
+
+def clear_float_batch_override() {
+    g_mm_fp_batch_override = @@fp_batch_override_unset
+    g_mm_bf16_batch_override = @@bf16_batch_override_unset
+    g_fp_override_active = false
+}
+
+def float_batch_override_active() : bool => g_fp_override_active
+
 //! Blob+offset form of matmul_batch (see the matmul woff overload).
 def matmul_batch(var y : array<float>; w : array<float>; woff : int64; x : array<float>; n, d, ntok : int64) {
     unsafe {
-        matmul_batch_core(addr(y[0]), addr<float const?>(w[woff]), addr<float const?>(x[0]), n, d, ntok)
+        var yp = addr(y[0])
+        let wp = addr<float const?>(w[woff])
+        let xp = addr<float const?>(x[0])
+        if (g_fp_override_active && ntok >= g_fp_override_min_ntok && invoke(g_mm_fp_batch_override, yp, wp, xp, n, d, ntok)) {
+            return
+        }
+        matmul_batch_core(yp, wp, xp, n, d, ntok)
     }
 }
 
@@ -917,6 +957,9 @@ def matmul_bf16_batch(var y : array<float>; w : array<uint16>; woff : int64; x :
         var yp = addr(y[0])
         let wp = addr<uint16 const?>(w[woff])
         let xp = addr<float const?>(x[0])
+        if (g_fp_override_active && ntok >= g_fp_override_min_ntok && invoke(g_mm_bf16_batch_override, yp, wp, xp, n, d, ntok)) {
+            return
+        }
         let nch = ntok == 1l ? matmul_chunks_gemv(int(d), 1, n * d) : matmul_chunks(int(d), get_q8_batch_chunks_per_job(), n * d * ntok)
         maybe_parallel_for(0, int(d), nch) $(rb, re) {
             unsafe {
@@ -1433,7 +1476,7 @@ var g_moe_gpu_attn_route = true        // runtime routing gate over the attentio
 // symbol. reserve/place fill the arenas; prepare/norms/set_layer/set_cls build it; token runs one forward.
 typedef RdecReserveFn = function<(fmt : int; cap_blocks : int64) : bool>
 typedef RdecPlaceFn = function<(wq : array<uint8>; ws : array<uint8>; n : int64; rows : int64; fmt : int) : int64>
-typedef RdecPrepareFn = function<(n_layers : int64; dim : int64; qd : int64; kv_dim : int64; head_size : int64; n_heads : int64; hidden : int64; vocab : int64; seq_cap : int64; neox : bool; eps : float; scale : float) : bool>
+typedef RdecPrepareFn = function<(n_layers : int64; dim : int64; qd : int64; kv_dim : int64; head_size : int64; n_heads : int64; hidden : int64; vocab : int64; seq_cap : int64; neox : bool; eps : float; scale : float; qk_norm : bool) : bool>
 typedef RdecNormsFn = function<(norms : array<float>) : void>
 typedef RdecSetLayerFn = function<(l : int64; bq : int64; bk : int64; bv : int64; bo : int64; b1 : int64; b3 : int64; b2 : int64; fq : int; fk : int; fv : int; fo : int; f1 : int; f3 : int; f2 : int) : void>
 typedef RdecSetClsFn = function<(cls_block : int64; cls_fmt : int) : void>
@@ -1447,8 +1490,8 @@ typedef RdecReadKvBulkFn = function<(l : int64; kp : float?; vp : float?; npos :
 def private rdec_unset_reserve(fmt : int; cap_blocks : int64) : bool => false
 [unused_argument(wq, ws, n, rows, fmt)]
 def private rdec_unset_place(wq : array<uint8>; ws : array<uint8>; n, rows : int64; fmt : int) : int64 => -1l
-[unused_argument(n_layers, dim, qd, kv_dim, head_size, n_heads, hidden, vocab, seq_cap, neox, eps, scale)]
-def private rdec_unset_prepare(n_layers, dim, qd, kv_dim, head_size, n_heads, hidden, vocab, seq_cap : int64; neox : bool; eps, scale : float) : bool => false
+[unused_argument(n_layers, dim, qd, kv_dim, head_size, n_heads, hidden, vocab, seq_cap, neox, eps, scale, qk_norm)]
+def private rdec_unset_prepare(n_layers, dim, qd, kv_dim, head_size, n_heads, hidden, vocab, seq_cap : int64; neox : bool; eps, scale : float; qk_norm : bool) : bool => false
 [unused_argument(norms)]
 def private rdec_unset_norms(norms : array<float>) {}
 [unused_argument(l, bq, bk, bv, bo, b1, b3, b2, fq, fk, fv, fo, f1, f3, f2)]
@@ -1508,7 +1551,7 @@ def public install_moe_gpu_resident(reserve : RdecReserveFn; place : RdecPlaceFn
 def public moe_gpu_resident_installed() : bool => g_rdec_installed
 def public rdec_reserve(fmt : int; cap_blocks : int64) : bool => invoke(g_rdec_reserve, fmt, cap_blocks)
 def public rdec_place(wq : array<uint8>; ws : array<uint8>; n, rows : int64; fmt : int) : int64 => invoke(g_rdec_place, wq, ws, n, rows, fmt)
-def public rdec_prepare(n_layers, dim, qd, kv_dim, head_size, n_heads, hidden, vocab, seq_cap : int64; neox : bool; eps, scale : float) : bool => invoke(g_rdec_prepare, n_layers, dim, qd, kv_dim, head_size, n_heads, hidden, vocab, seq_cap, neox, eps, scale)
+def public rdec_prepare(n_layers, dim, qd, kv_dim, head_size, n_heads, hidden, vocab, seq_cap : int64; neox : bool; eps, scale : float; qk_norm : bool) : bool => invoke(g_rdec_prepare, n_layers, dim, qd, kv_dim, head_size, n_heads, hidden, vocab, seq_cap, neox, eps, scale, qk_norm)
 def public rdec_upload_norms(norms : array<float>) { invoke(g_rdec_norms, norms) }
 def public rdec_set_layer(l, bq, bk, bv, bo, b1, b3, b2 : int64; fq, fk, fv, fo, f1, f3, f2 : int) { invoke(g_rdec_set_layer, l, bq, bk, bv, bo, b1, b3, b2, fq, fk, fv, fo, f1, f3, f2) }
 def public rdec_set_cls(cls_block : int64; cls_fmt : int) { invoke(g_rdec_set_cls, cls_block, cls_fmt) }

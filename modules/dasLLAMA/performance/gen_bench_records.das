@@ -7,11 +7,14 @@ require daslib/fio
 require math
 
 // The official record driver (modules/dasLLAMA/PUBLIC_BENCH_PLAN.md, step 3): loops the public
-// catalog x backends, runs lcpp_bench as a CHILD per cell (one model process at a time), and
+// catalog x pair legs, runs lcpp_bench as a CHILD per cell (one model process at a time), and
 // upserts the --json-path records into the per-box store — written after EVERY cell, so a crash
-// never costs a measured cell. Ref rows ride along: the cpu cell carries the clean-cpu ref, the
-// metal cell the stock ref (-ngl 99), and a direct stock -ngl 0 pass adds the stock CPU row.
-//   bin/daslang modules/dasLLAMA/performance/gen_bench_records.das -- [-o substr] [--backend cpu|metal|all]
+// never costs a measured cell. Each board ratio is one das cell + its matched ref run ADJACENT:
+//   metal : das metal            vs stock -ngl 99          ("as shipped")
+//   neon  : das cpu              vs clean-cpu -ngl 0       ("generic neon-64", kernel vs kernel)
+//   amx   : das cpu --accel      vs stock -ngl 0 -nopo 1   ("cpu + AMX" — -nopo keeps lcpp's Metal
+//           op-offload from serving 'CPU' rows on the GPU; nopo == nometal-build, window-proven)
+//   bin/daslang modules/dasLLAMA/performance/gen_bench_records.das -- [-o substr] [--legs neon,amx,metal]
 // Ref binaries come from setup_lcpp_ref: --ref-clean/--ref-stock or LLAMA_BENCH_CLEAN/LLAMA_BENCH_STOCK.
 
 [CommandLineArgs]
@@ -22,6 +25,12 @@ struct Args {
 
     @clarg_doc = "Backends to measure: cpu | metal | all (default: all — metal on Apple boxes only)"
     backend : string = "all"
+
+    @clarg_doc = "Comma list of pair legs to run: neon | amx | metal (default: every leg --backend implies; cpu = neon,amx)"
+    legs : string
+
+    @clarg_doc = "Seconds to idle between passes (default: 12) — a dead child's 10-20GB map reclaims ASYNC after exit, and short cells bench right into that churn (12B pp ±33 at 0s settle, ±3 at 12s)"
+    settle : int = 12
 
     @clarg_name = "ref-clean"
     @clarg_doc = "clean-cpu llama-bench binary (default: env LLAMA_BENCH_CLEAN)"
@@ -106,6 +115,116 @@ def private stamp_note(var models : array<BenchModel>; gguf, note : string) {
     }
 }
 
+// idle gap before every pass — lets the kernel finish reclaiming the previous child's map
+def private settle(cfg : Args) {
+    if (cfg.settle > 0) {
+        sleep(uint(cfg.settle * 1000))
+    }
+}
+
+def private das_cell(file, path, be : string; accel : bool; cfg : Args; threads : int; cellPath, note, store : string;
+                     var models : array<BenchModel>; var failed : array<string>) {
+    let t0 = ref_time_ticks()
+    let tag = accel ? "{be} accel" : be
+    to_log(LOG_INFO, "gen_bench_records: START {file} das {tag}\n")
+    var args <- [daslang_bin(), "-jit", "modules/dasLLAMA/benchmarks/lcpp_bench.das", "--",
+                 "-m", path, "-p", "{cfg.plen}", "-n", "{cfg.ngen}", "-r", "{cfg.reps}",
+                 "-t", "{threads}", "-o", "json", "--json-path", cellPath]
+    if (be == "metal") {
+        args |> push("--ngl")
+        args |> push("99")
+    }
+    if (accel) {
+        args |> push("--accel")
+    }
+    var cell : array<BenchModel>
+    for (attempt in range(2)) {
+        var out = ""
+        let rc = run_and_capture(args, out)
+        cell |> clear()
+        if (rc != 0 || !read_bench_records(cellPath, cell)) {
+            let tail = slice(out, max(0, length(out) - 400))
+            to_log(LOG_ERROR, "gen_bench_records: FAILED {file} das {tag} rc={rc} ({elapsed_ms(t0)} ms) — tail: {tail}\n")
+            failed |> push("{file} das {tag}")
+            return
+        }
+        // variance tripwire, self-healing: the FIRST das process on a cold/churned .dlim map
+        // warms across its reps (2026-07-24 35B: 150->198 monotone, mean 177 ± 21, while the
+        // next process reads a flat 212 ± 1.7 — one in-process warmup pass cannot absorb a
+        // 19GB map fighting page-cache eviction). A >3% cv cell is that signature: re-run the
+        // child once — its predecessor just became the warmer — and keep the retry.
+        var worst = 0.0lf
+        for (c in cell) {
+            for (r in c.runs) {
+                if (r.engine != "das") {
+                    continue
+                }
+                for (tv in values(r.tests)) {
+                    if (tv.tok_s > 0.0lf) {
+                        worst = max(worst, tv.stddev / tv.tok_s)
+                    }
+                }
+            }
+        }
+        if (worst <= 0.03lf) {
+            break
+        }
+        if (attempt == 0) {
+            to_log(LOG_WARNING, "gen_bench_records: HIGH VARIANCE {file} das {tag} (cv {worst * 100.0lf:.1f}%) — cold-map warming suspect, re-running the cell warm\n")
+            settle(cfg)
+        } else {
+            to_log(LOG_WARNING, "gen_bench_records: STILL HIGH VARIANCE {file} das {tag} (cv {worst * 100.0lf:.1f}%) after a warm re-run — keeping it, treat with suspicion\n")
+        }
+    }
+    absorb_cell(models, cell, store, note)
+    remove(cellPath)
+    to_log(LOG_INFO, "gen_bench_records: DONE {file} das {tag} ({elapsed_ms(t0)} ms)\n")
+}
+
+def private ref_pass(file, path, bin, flavor : string; ngl : int; nopo : bool; cfg : Args; threads : int;
+                     hw : HardwareInfo; box, date, note, store : string;
+                     var models : array<BenchModel>; var failed : array<string>) {
+    if (empty(bin)) {
+        return
+    }
+    let backend = ngl != 0 ? "metal" : "cpu"
+    let t0 = ref_time_ticks()
+    let aff = ngl == 0 && affinity_on() ? lcpp_affinity_args(threads) : ""
+    // -nopo 1 = --no-op-offload: without it a stock build at -ngl 0 still ships big-batch ops
+    // with host weights to Metal (26B: MTL0 193MB, +33% pp) — not a CPU number
+    let np = nopo ? " -nopo 1" : ""
+    let cmd = "\"{bin}\" -m \"{path}\" -ngl {ngl}{np} -t {threads}{aff} -p {cfg.plen} -n {cfg.ngen} -r {cfg.reps} -o json"
+    to_log(LOG_INFO, "gen_bench_records: START {file} ref {flavor} {backend}\n")
+    var rows : array<LlamaBenchRow>
+    if (!run_llama_bench(cmd, rows) || empty(rows)) {
+        to_log(LOG_ERROR, "gen_bench_records: FAILED {file} ref {flavor} {backend} ({elapsed_ms(t0)} ms)\n")
+        failed |> push("{file} ref {flavor} {backend}")
+        return
+    }
+    var rr = BenchRun(
+        engine = "llama.cpp",
+        backend = backend,
+        flavor = flavor,
+        box = box,
+        threads = threads,
+        date = date,
+        cmd = cmd,
+        sha = rows[0].build_commit,
+        source = "official",
+        exec_fmt = lcpp_exec_fmt(backend),
+        hardware = hw)
+    for (row in rows) {
+        let tag = row.n_gen == 0 ? "pp{row.n_prompt}" : "tg{row.n_gen}"
+        rr.tests |> insert(tag, BenchTest(tok_s = row.avg_ts, stddev = row.stddev_ts))
+    }
+    var bm = BenchModel(gguf = file, params_b = double(rows[0].model_n_params) / 1.0e9lf, note = note)
+    bm.runs |> emplace(rr)
+    upsert_bench_model(models, bm)
+    stamp_note(models, file, note)
+    write_bench_records(store, models)
+    to_log(LOG_INFO, "gen_bench_records: DONE {file} ref {flavor} {backend} ({elapsed_ms(t0)} ms)\n")
+}
+
 [export]
 def main : int {
     var r <- parse_args(type<Args>)
@@ -124,21 +243,42 @@ def main : int {
         to_log(LOG_ERROR, "gen_bench_records: --backend metal requested on a non-Apple box — Metal is macOS-only\n")
         return 1
     }
-    var backends : array<string>
-    if (cfg.backend == "cpu" || cfg.backend == "all") {
-        backends |> push("cpu")
+    // pair legs: --legs wins outright; otherwise --backend implies its legs (amx is Apple-only —
+    // both its sides need Accelerate)
+    var legNeon = false
+    var legAmx = false
+    var legMetal = false
+    if (!empty(cfg.legs)) {
+        for (l in split(cfg.legs, ",")) {
+            let tok = trim(l)
+            if (tok == "neon") {
+                legNeon = true
+            } elif (tok == "amx") {
+                legAmx = true
+            } elif (tok == "metal") {
+                legMetal = true
+            } elif (!empty(tok)) {
+                to_log(LOG_ERROR, "gen_bench_records: unknown leg `{tok}` (expected neon | amx | metal)\n")
+                return 1
+            }
+        }
+    } else {
+        legNeon = cfg.backend == "cpu" || cfg.backend == "all"
+        legAmx = legNeon && apple
+        legMetal = cfg.backend == "metal" || (cfg.backend == "all" && apple)
     }
-    if (cfg.backend == "metal" || (cfg.backend == "all" && apple)) {
-        backends |> push("metal")
+    if ((legMetal || legAmx) && !apple) {
+        to_log(LOG_ERROR, "gen_bench_records: legs metal/amx need an Apple box\n")
+        return 1
     }
-    if (empty(backends)) {
-        to_log(LOG_ERROR, "gen_bench_records: no backends selected (--backend {cfg.backend})\n")
+    if (!(legNeon || legAmx || legMetal)) {
+        to_log(LOG_ERROR, "gen_bench_records: no legs selected (--backend {cfg.backend} --legs {cfg.legs})\n")
         return 1
     }
     var refClean = empty(cfg.ref_clean) ? get_env_variable("LLAMA_BENCH_CLEAN") : cfg.ref_clean
     var refStock = empty(cfg.ref_stock) ? get_env_variable("LLAMA_BENCH_STOCK") : cfg.ref_stock
     if (!empty(refClean) && !stat(refClean).is_valid) {
-        to_log(LOG_WARNING, "gen_bench_records: clean-cpu ref `{refClean}` not found — cpu cells run das-only\n")
+        to_log(LOG_WARNING, "gen_bench_records: clean-cpu ref `{refClean}` not found — neon cells run das-only\n")
         refClean = ""
     }
     if (!empty(refStock) && !stat(refStock).is_valid) {
@@ -154,7 +294,6 @@ def main : int {
     let box = box_name()
     let threads = cfg.threads > 0 ? cfg.threads : profile_threads()
     let cellPath = "modules/dasLLAMA/performance/records/_cell_{box}.json"
-    let hasMetal = !empty(backends) && backends[length(backends) - 1] == "metal"
     var failed : array<string>
     var cat <- pub_catalog()
     for (ent in cat) {
@@ -167,71 +306,29 @@ def main : int {
             to_log(LOG_WARNING, "gen_bench_records: SKIP {file} — not on this box\n")
             continue
         }
-        for (be in backends) {
-            let t0 = ref_time_ticks()
-            to_log(LOG_INFO, "gen_bench_records: START {file} das {be}\n")
-            var args <- [daslang_bin(), "-jit", "modules/dasLLAMA/benchmarks/lcpp_bench.das", "--",
-                         "-m", path, "-p", "{cfg.plen}", "-n", "{cfg.ngen}", "-r", "{cfg.reps}",
-                         "-t", "{threads}", "-o", "json", "--json-path", cellPath]
-            if (be == "metal") {
-                args |> push("--ngl")
-                args |> push("99")
-            }
-            var out = ""
-            let rc = run_and_capture(args, out)
-            var cell : array<BenchModel>
-            if (rc != 0 || !read_bench_records(cellPath, cell)) {
-                let tail = slice(out, max(0, length(out) - 400))
-                to_log(LOG_ERROR, "gen_bench_records: FAILED {file} das {be} rc={rc} ({elapsed_ms(t0)} ms) — tail: {tail}\n")
-                failed |> push("{file} das {be}")
-                continue
-            }
-            absorb_cell(models, cell, store, ent.note)
-            remove(cellPath)
-            to_log(LOG_INFO, "gen_bench_records: DONE {file} das {be} ({elapsed_ms(t0)} ms)\n")
+        // thermal-fair pass order: each ratio's das cell and its ref run ADJACENT (the
+        // measurement protocol's interleave rule at the pass level), and the metal pair goes
+        // FIRST — the old [das cpu, das metal, refs...] order ran das metal straight off the
+        // das-cpu heat soak while the lcpp metal ref ran minutes later on a different chip
+        // state (27B: das 110.7 soaked vs 138.1 quiet — a phantom 0.91 board red). Refs still
+        // run independently of das-cell failures.
+        if (legMetal) {
+            settle(cfg)
+            das_cell(file, path, "metal", false, cfg, threads, cellPath, ent.note, store, models, failed)
+            settle(cfg)
+            ref_pass(file, path, refStock, "stock", 99, false, cfg, threads, hw, box, date, ent.note, store, models, failed)
         }
-        // reference rows run independently of the das cells — a das capability gap must not cost
-        // the board its llama.cpp rows (or vice versa)
-        for (rp in range(3)) {
-            let bin = rp == 0 ? refClean : refStock
-            let ngl = rp == 2 ? 99 : 0
-            let flavor = rp == 0 ? "clean-cpu" : "stock"
-            if (empty(bin) || (ngl != 0 && !hasMetal)) {
-                continue
-            }
-            let backend = ngl != 0 ? "metal" : "cpu"
-            let t0 = ref_time_ticks()
-            let aff = ngl == 0 && affinity_on() ? lcpp_affinity_args(threads) : ""
-            let cmd = "\"{bin}\" -m \"{path}\" -ngl {ngl} -t {threads}{aff} -p {cfg.plen} -n {cfg.ngen} -r {cfg.reps} -o json"
-            to_log(LOG_INFO, "gen_bench_records: START {file} ref {flavor} {backend}\n")
-            var rows : array<LlamaBenchRow>
-            if (!run_llama_bench(cmd, rows) || empty(rows)) {
-                to_log(LOG_ERROR, "gen_bench_records: FAILED {file} ref {flavor} {backend} ({elapsed_ms(t0)} ms)\n")
-                failed |> push("{file} ref {flavor} {backend}")
-                continue
-            }
-            var rr = BenchRun(
-                engine = "llama.cpp",
-                backend = backend,
-                flavor = flavor,
-                box = box,
-                threads = threads,
-                date = date,
-                cmd = cmd,
-                sha = rows[0].build_commit,
-                source = "official",
-                exec_fmt = lcpp_exec_fmt(backend),
-                hardware = hw)
-            for (row in rows) {
-                let tag = row.n_gen == 0 ? "pp{row.n_prompt}" : "tg{row.n_gen}"
-                rr.tests |> insert(tag, BenchTest(tok_s = row.avg_ts, stddev = row.stddev_ts))
-            }
-            var bm = BenchModel(gguf = file, params_b = double(rows[0].model_n_params) / 1.0e9lf, note = ent.note)
-            bm.runs |> emplace(rr)
-            upsert_bench_model(models, bm)
-            stamp_note(models, file, ent.note)
-            write_bench_records(store, models)
-            to_log(LOG_INFO, "gen_bench_records: DONE {file} ref {flavor} {backend} ({elapsed_ms(t0)} ms)\n")
+        if (legNeon) {
+            settle(cfg)
+            das_cell(file, path, "cpu", false, cfg, threads, cellPath, ent.note, store, models, failed)
+            settle(cfg)
+            ref_pass(file, path, refClean, "clean-cpu", 0, false, cfg, threads, hw, box, date, ent.note, store, models, failed)
+        }
+        if (legAmx) {
+            settle(cfg)
+            das_cell(file, path, "cpu", true, cfg, threads, cellPath, ent.note, store, models, failed)
+            settle(cfg)
+            ref_pass(file, path, refStock, "stock", 0, true, cfg, threads, hw, box, date, ent.note, store, models, failed)
         }
     }
     if (!empty(failed)) {

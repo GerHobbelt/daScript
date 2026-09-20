@@ -4,6 +4,7 @@ options _comment_hygiene = true
 module dasllama_metal_prefill shared public
 
 require math
+require daslib/math_bits   // uint_bits_to_float in the mx4 GEMV (msl_emit as_type)
 require strings
 require daslib/fio
 require metal/msl_shader
@@ -84,10 +85,10 @@ class MetalRmsNorm {
 // interleaved 34B q8 blocks, raw f32 activations. Rolled [unroll_full] math over simdgroup-matrix
 // arrays. Requires out-dim % 64, M padded to 64. Beats llama.cpp's equivalent 2-3% on M1 Max.
 class MetalQ8MulMm {
-    @ssbo @binding = 0 wsh : array<float16> // 34B-block W blob, HALF-SCALE view: scale of block b at 17*b
-    @ssbo @binding = 1 wqb : array<int8>    // the SAME blob buffer, BYTE view: quants of block b at 34*b + 2
-    @ssbo @binding = 2 xf : array<float4>   // raw f32 activations, float4 view
-    @ssbo @binding = 3 y : array<float>
+    @ssbo @binding = 0 @role = "weight" wsh : array<float16> // 34B-block W blob, HALF-SCALE view: scale of block b at 17*b
+    @ssbo @binding = 1 @role = "weight" wqb : array<int8>    // the SAME blob buffer, BYTE view: quants of block b at 34*b + 2
+    @ssbo @binding = 2 @role = "read" xf : array<float4>   // raw f32 activations, float4 view
+    @ssbo @binding = 3 @role = "write" y : array<float>
     @uniform @binding = 4 kdim : uint
     @uniform @binding = 5 ndim : uint
     @workgroup ta : float16[2048]           // W: 4 k-tiles x 8 row-tiles of 8x8, each tile (k row, wrow col)
@@ -171,16 +172,165 @@ class MetalQ8MulMm {
     }
 }
 
+// MetalQ8MulMm with the A stage swapped to native BF16 rows (no dequant: widen = exact bit
+// shift, then RNE to the f16 tile). Serves the E-series per_layer_model_proj GEMM straight off
+// the kept-bf16 blob — no resident f32 copy. Same %64 shape gates, kdim % 32.
+class MetalBf16MulMm {
+    @ssbo @binding = 0 @role = "weight" wbh : array<ushort4> // bf16 W rows, ushort4 view (row r elem k at (r*kdim+k)/4)
+    @ssbo @binding = 2 @role = "read" xf : array<float4>   // raw f32 activations, float4 view
+    @ssbo @binding = 3 @role = "write" y : array<float>
+    @uniform @binding = 4 kdim : uint
+    @uniform @binding = 5 ndim : uint
+    @workgroup ta : float16[2048]
+    @workgroup tb : float16[1024]
+
+    [metal_kernel(name="metal_bf16_mulmm_msl")]
+    def metal_bf16_mulmm {
+        let lid = gl_LocalInvocationID.x
+        let sg = gl_SubgroupID
+        let mBase = gl_WorkGroupID.x * 32u
+        let nBase = gl_WorkGroupID.y * 64u
+        var mc : simdgroup_float8x8[8]
+        var ma : simdgroup_half8x8[4]
+        var mb : simdgroup_half8x8[2]
+        var va : float16[16]
+        let kdim4 = kdim / 4u
+        let nkb = kdim / 32u
+        let lr0 = lid / 2u
+        let il0 = lid % 2u
+        let syA = lr0 / 8u
+        let lxA = lr0 % 8u
+        let tA0 = (il0 * 2u * 8u + syA) * 64u + lxA
+        let lr1 = lid / 4u
+        let iy = (lid % 4u) * 8u
+        let ibB = ((lid % 4u) * 4u + lr1 / 8u) * 64u + (lr1 % 8u) * 8u
+        let aB = (sg % 2u) * 256u
+        let bB = (sg / 2u) * 128u
+        var wcur = unsafe(addr(wbh[((nBase + lr0) * kdim + il0 * 16u) / 4u]))
+        var xcur = unsafe(addr(xf[(mBase + lr1) * kdim4 + iy / 4u]))
+        var kb = 0u
+        while (kb < nkb) {
+            let b0 = unsafe(xcur[0])
+            let b1 = unsafe(xcur[1])
+            for [unroll_full] (q in range(4)) {
+                let u4 = unsafe(wcur[q])
+                va[q * 4 + 0] = float16(uint_bits_to_float(uint(u4.x) << 16u))
+                va[q * 4 + 1] = float16(uint_bits_to_float(uint(u4.y) << 16u))
+                va[q * 4 + 2] = float16(uint_bits_to_float(uint(u4.z) << 16u))
+                va[q * 4 + 3] = float16(uint_bits_to_float(uint(u4.w) << 16u))
+            }
+            barrier()
+            for [unroll_full] (i in range(16)) {
+                ta[tA0 + uint(i / 8) * 512u + uint(i % 8) * 8u] = va[i]
+            }
+            tg_store_half4(tb, ibB, b0)
+            tg_store_half4(tb, ibB + 4u, b1)
+            barrier()
+            var acur = unsafe(addr(ta[aB]))
+            var bcur = unsafe(addr(tb[bB]))
+            for [unroll_full] (_ik in range(4)) {
+                for [unroll_full] (i in range(4)) {
+                    simdgroup_load(ma[i], acur, uint(i) * 64u, 8u)
+                }
+                for [unroll_full] (i in range(2)) {
+                    simdgroup_load(mb[i], bcur, uint(i) * 64u, 8u)
+                }
+                for [unroll_full] (i in range(8)) {
+                    simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i])
+                }
+                acur = unsafe(acur + 512)
+                bcur = unsafe(bcur + 256)
+            }
+            wcur = unsafe(wcur + 8)
+            xcur = unsafe(xcur + 8)
+            kb++
+        }
+        let row0 = mBase + (sg / 2u) * 16u
+        let col0 = nBase + (sg % 2u) * 32u
+        for [unroll_full] (i in range(8)) {
+            simdgroup_store(mc[i], y, (row0 + uint(i / 4) * 8u) * ndim + col0 + uint(i % 4) * 8u, ndim)
+        }
+    }
+}
+
+// E-series PLE gather (GPU pre-step, stage 1): dequant token row slices of the Q8_0
+// per_layer_token_embd region straight into the LAYER-major side-input panel, sqrt(ple) folded.
+// One tg per (layer, position) slice; binds ride blob_of's q8 pair at the region base.
+class MetalPleGatherQ8 {
+    @ssbo @binding = 0 @role = "weight" wsh : array<float16> // ple_emb q8 region, half-scale view (block b at 17*b)
+    @ssbo @binding = 1 @role = "weight" wqb : array<int8>    // the SAME region, byte view (quants at 34*b + 2)
+    @ssbo @binding = 2 @role = "read" tok : array<uint>    // [npos] token ids
+    @ssbo @binding = 3 @role = "write" y : array<float>     // [n_layers x npos x ple] layer-major side input
+    @uniform @binding = 4 npos : uint
+    @uniform @binding = 5 ple : uint
+    @uniform @binding = 6 nlayers : uint
+    @uniform @binding = 7 sc0 : float       // sqrt(ple)
+
+    [metal_kernel(name="metal_ple_gather_q8_msl")]
+    def metal_ple_gather_q8 {
+        let l = gl_WorkGroupID.x
+        let p = gl_WorkGroupID.y
+        let i = gl_LocalInvocationID.x      // tg = ple threads (gate: ple % 32 == 0, <= 1024)
+        let el = tok[p] * (nlayers * ple) + l * ple + i
+        let blk = el / 32u
+        let sc = float(wsh[blk * 17u])
+        let q = float(int(wqb[blk * 34u + 2u + (el % 32u)]))
+        y[(l * npos + p) * ple + i] = q * sc * sc0
+    }
+}
+
+// E-series PLE finish (GPU pre-step, stage 2): per (layer, position) ple-slice, mirror of
+// ple_pre_finish's tail — v = proj/sqrt(dim); side = (side + pnorm·(v·rsqrt(mean(v²)+eps)))/sqrt(2),
+// in place on the layer-major panel the gather wrote. proj arrives position-major off the GEMM.
+class MetalPleFinish {
+    @ssbo @binding = 0 @role = "read" proj : array<float>  // [mp x n_layers*ple] position-major model_proj·embd
+    @ssbo @binding = 1 @role = "weight" pnorm : array<float> // [ple] proj-norm weight
+    @ssbo @binding = 2 @role = "readwrite" y : array<float>     // [n_layers x npos x ple] side input, in place
+    @uniform @binding = 3 npos : uint
+    @uniform @binding = 4 ple : uint
+    @uniform @binding = 5 nlayers : uint
+    @uniform @binding = 6 inv_sd : float    // 1/sqrt(dim)
+    @uniform @binding = 7 eps : float
+    @uniform @binding = 8 inv_s2 : float    // 1/sqrt(2)
+    @workgroup partial : float[32]
+    @workgroup inv_sh : float
+
+    [metal_kernel(name="metal_ple_finish_msl")]
+    def metal_ple_finish {
+        let l = gl_WorkGroupID.x
+        let p = gl_WorkGroupID.y
+        let i = gl_LocalInvocationID.x      // tg = ple threads (gate: ple % 32 == 0, <= 1024)
+        let v = proj[p * (nlayers * ple) + l * ple + i] * inv_sd
+        let ss = simd_sum(v * v)
+        if (gl_SubgroupInvocationID == 0u) {
+            partial[gl_SubgroupID] = ss
+        }
+        barrier()
+        if (i == 0u) {
+            var tot = 0.0
+            var sgi = 0u
+            while (sgi < gl_NumSubgroups) {
+                tot += partial[sgi]
+                sgi++
+            }
+            inv_sh = rsqrt(tot / float(ple) + eps)
+        }
+        barrier()
+        let yi = (l * npos + p) * ple + i
+        y[yi] = (y[yi] + pnorm[i] * (v * inv_sh)) * inv_s2
+    }
+}
+
 // ===== K-quant mul_mm twins (format-matrix W4 / M2) — MetalQ8MulMm with the A-tile stage
 // swapped to superblock dequant. The 32-elem k-block kb IS sub-block kb%8 of superblock kb/8,
 // so each thread's 16-elem half decodes ONE (scale, min) pair. Same %64 shape gates, M padded 32/64.
 
 class MetalKqMulMmK4 {
-    @ssbo @binding = 0 ksh : array<float16> // 16B compact scale blocks, half view (d at 8*blk, dmin at 8*blk+1)
-    @ssbo @binding = 1 ks4 : array<uint4>   // the same buffer, uint4 view
-    @ssbo @binding = 2 kqu : array<uint>    // k4 quant plane, uint view (qs of blk at 32*blk)
-    @ssbo @binding = 3 xf : array<float4>
-    @ssbo @binding = 4 y : array<float>
+    @ssbo @binding = 0 @role = "weight" ksh : array<float16> // 16B compact scale blocks, half view (d at 8*blk, dmin at 8*blk+1)
+    @ssbo @binding = 1 @role = "weight" ks4 : array<uint4>   // the same buffer, uint4 view
+    @ssbo @binding = 2 @role = "weight" kqu : array<uint>    // k4 quant plane, uint view (qs of blk at 32*blk)
+    @ssbo @binding = 3 @role = "read" xf : array<float4>
+    @ssbo @binding = 4 @role = "write" y : array<float>
     @uniform @binding = 5 kdim : uint
     @uniform @binding = 6 ndim : uint
     @workgroup ta : float16[2048]
@@ -275,11 +425,11 @@ class MetalKqMulMmK4 {
 }
 
 class MetalKqMulMmK5 {
-    @ssbo @binding = 0 ksh : array<float16> // 16B compact scale blocks (the Q4_K form)
-    @ssbo @binding = 1 ks4 : array<uint4>
-    @ssbo @binding = 2 kqu : array<uint>    // k5 quant plane, uint view (qs at 40*blk, qh at 40*blk+32)
-    @ssbo @binding = 3 xf : array<float4>
-    @ssbo @binding = 4 y : array<float>
+    @ssbo @binding = 0 @role = "weight" ksh : array<float16> // 16B compact scale blocks (the Q4_K form)
+    @ssbo @binding = 1 @role = "weight" ks4 : array<uint4>
+    @ssbo @binding = 2 @role = "weight" kqu : array<uint>    // k5 quant plane, uint view (qs at 40*blk, qh at 40*blk+32)
+    @ssbo @binding = 3 @role = "read" xf : array<float4>
+    @ssbo @binding = 4 @role = "write" y : array<float>
     @uniform @binding = 5 kdim : uint
     @uniform @binding = 6 ndim : uint
     @workgroup ta : float16[2048]
@@ -376,11 +526,11 @@ class MetalKqMulMmK5 {
 }
 
 class MetalKqMulMmK6 {
-    @ssbo @binding = 0 kdh : array<float16> // the d plane — the scale buffer bound at byte nsb*16
-    @ssbo @binding = 1 ksc : array<uint4>   // 16B sub-scale blocks (16 int8 at blk), same buffer at 0
-    @ssbo @binding = 2 kqu : array<uint>    // k6 quant plane, uint view (ql at 48*blk, qh at 48*blk+32)
-    @ssbo @binding = 3 xf : array<float4>
-    @ssbo @binding = 4 y : array<float>
+    @ssbo @binding = 0 @role = "weight" kdh : array<float16> // the d plane — the scale buffer bound at byte nsb*16
+    @ssbo @binding = 1 @role = "weight" ksc : array<uint4>   // 16B sub-scale blocks (16 int8 at blk), same buffer at 0
+    @ssbo @binding = 2 @role = "weight" kqu : array<uint>    // k6 quant plane, uint view (ql at 48*blk, qh at 48*blk+32)
+    @ssbo @binding = 3 @role = "read" xf : array<float4>
+    @ssbo @binding = 4 @role = "write" y : array<float>
     @uniform @binding = 5 kdim : uint
     @uniform @binding = 6 ndim : uint
     @workgroup ta : float16[2048]
@@ -531,13 +681,13 @@ class MetalMoeRouter {
 // weight load — slab SLC traffic /8 (the prefill router's entire cost); tails clamp, stores gate.
 // Per-lane k stride and per-position dot order match MetalMoeRouter, so logits stay bit-identical.
 class MetalMoeRouterB {
-    @ssbo @binding = 0 w : array<float4>    // [ne x dim] router weights, float4 view
-    @ssbo @binding = 1 x : array<float4>    // [streams x dim] activations, float4 view
-    @ssbo @binding = 2 y : array<float>     // [streams x ne] logits out
+    @ssbo @binding = 0 @role = "weight" w : array<float4>    // [ne x dim] router weights, float4 view
+    @ssbo @binding = 1 @role = "read" x : array<float4>    // [streams x dim] activations, float4 view
+    @ssbo @binding = 2 @role = "write" y : array<float>     // [streams x ne] logits out
     @uniform @binding = 3 ndim : uint       // dim (% 32)
     @uniform @binding = 4 ddim : uint       // ne
     @uniform @binding = 5 xs : uint         // per-stream x stride, elements
-    @ssbo @binding = 6 rb : array<float>    // [ne] router bias row (hasb models — gpt-oss)
+    @ssbo @binding = 6 @role = "weight" rb : array<float>    // [ne] router bias row (hasb models — gpt-oss)
     @uniform @binding = 7 hasb : uint
     @uniform @binding = 8 ns : uint         // stream count (npos)
 
@@ -693,13 +843,13 @@ class MetalMoeSelect {
 // the blob binds at the layer's expert STACK base, the kernel adds sel[slot] * eblk to the
 // block index, reads x at slot * xs (0 = shared activation), writes y at slot * ddim.
 class MetalMoeGemvQ8 {
-    @ssbo @binding = 0 wsh : array<float16> // the expert stack's blob slice, half-scale view
-    @ssbo @binding = 1 wqb : array<int8>    // the same blob buffer, byte view
-    @ssbo @binding = 2 x : array<float4>
-    @ssbo @binding = 3 y : array<float>
+    @ssbo @binding = 0 @role = "weight" wsh : array<float16> // the expert stack's blob slice, half-scale view
+    @ssbo @binding = 1 @role = "weight" wqb : array<int8>    // the same blob buffer, byte view
+    @ssbo @binding = 2 @role = "read" x : array<float4>
+    @ssbo @binding = 3 @role = "write" y : array<float>
     @uniform @binding = 4 ndim : uint
     @uniform @binding = 5 ddim : uint
-    @ssbo @binding = 6 sel : array<uint>    // [streams x 2k] selection rows (idx section read)
+    @ssbo @binding = 6 @role = "read" sel : array<uint>    // [streams x 2k] selection rows (idx section read)
     @uniform @binding = 7 eblk : uint       // 34B blocks per expert plane (ege / 32)
     @uniform @binding = 8 xs : uint         // per-slot x stride, elements (0 = shared)
     @uniform @binding = 9 ss : uint         // per-stream sel row stride, uints (2k; 0 single)
@@ -761,14 +911,14 @@ class MetalMoeGemvQ8 {
 // x rides a float4 view: the 32-scalar-x-load form was load-issue-bound at the routed expert
 // shapes (nfe-row planes) — the vector view is 2.25x there (lab: bench_metal_moe_lab, 142→321 wGB/s).
 class MetalMoeGemvK4 {
-    @ssbo @binding = 0 ksh : array<float16> // 16B scale blocks, half view (d at 8*blk, dmin at +1)
-    @ssbo @binding = 1 ks4 : array<uint4>   // the same buffer, uint4 view (whole block at blk)
-    @ssbo @binding = 2 kqu : array<uint>    // k4 quant plane, uint view (qs of blk at 32*blk)
-    @ssbo @binding = 3 x4 : array<float4>   // activations, float4 view (every x stride is % 4)
-    @ssbo @binding = 4 y : array<float>
+    @ssbo @binding = 0 @role = "weight" ksh : array<float16> // 16B scale blocks, half view (d at 8*blk, dmin at +1)
+    @ssbo @binding = 1 @role = "weight" ks4 : array<uint4>   // the same buffer, uint4 view (whole block at blk)
+    @ssbo @binding = 2 @role = "weight" kqu : array<uint>    // k4 quant plane, uint view (qs of blk at 32*blk)
+    @ssbo @binding = 3 @role = "read" x4 : array<float4>   // activations, float4 view (every x stride is % 4)
+    @ssbo @binding = 4 @role = "write" y : array<float>
     @uniform @binding = 5 ndim : uint
     @uniform @binding = 6 ddim : uint
-    @ssbo @binding = 7 sel : array<uint>    // [streams x 2k] selection rows (idx section read)
+    @ssbo @binding = 7 @role = "read" sel : array<uint>    // [streams x 2k] selection rows (idx section read)
     @uniform @binding = 8 esb : uint        // superblocks per expert plane (ege / 256)
     @uniform @binding = 9 xs : uint         // per-slot x stride, elements (0 = shared)
     @uniform @binding = 10 ss : uint        // per-stream sel row stride, uints (2k; 0 single)
@@ -874,14 +1024,14 @@ class MetalMoeGemvK4 {
 
 // Expert-indexed Q5_K GEMV — MetalKqGemvK5's dot with the expert superblock shift.
 class MetalMoeGemvK5 {
-    @ssbo @binding = 0 ksh : array<float16> // 16B scale blocks, half view
-    @ssbo @binding = 1 ks4 : array<uint4>   // the same buffer, uint4 view
-    @ssbo @binding = 2 kqb : array<uint8>   // k5 quant plane, byte view (qs at 160*blk, qh at +128)
-    @ssbo @binding = 3 x : array<float>
-    @ssbo @binding = 4 y : array<float>
+    @ssbo @binding = 0 @role = "weight" ksh : array<float16> // 16B scale blocks, half view
+    @ssbo @binding = 1 @role = "weight" ks4 : array<uint4>   // the same buffer, uint4 view
+    @ssbo @binding = 2 @role = "weight" kqb : array<uint8>   // k5 quant plane, byte view (qs at 160*blk, qh at +128)
+    @ssbo @binding = 3 @role = "read" x : array<float>
+    @ssbo @binding = 4 @role = "write" y : array<float>
     @uniform @binding = 5 ndim : uint
     @uniform @binding = 6 ddim : uint
-    @ssbo @binding = 7 sel : array<uint>    // [streams x 2k] selection rows (idx section read)
+    @ssbo @binding = 7 @role = "read" sel : array<uint>    // [streams x 2k] selection rows (idx section read)
     @uniform @binding = 8 esb : uint        // superblocks per expert plane (ege / 256)
     @uniform @binding = 9 xs : uint         // per-slot x stride, elements (0 = shared)
     @uniform @binding = 10 ss : uint        // per-stream sel row stride, uints (2k; 0 single)
@@ -964,14 +1114,14 @@ class MetalMoeGemvK5 {
 // Expert-indexed Q6_K GEMV — MetalKqGemvK6's dot; the expert shift covers sub-scales AND the
 // trailing f16 d plane (both indexed by the same region-relative superblock).
 class MetalMoeGemvK6 {
-    @ssbo @binding = 0 kdh : array<float16> // the d plane — the scale buffer bound at byte nsb*16
-    @ssbo @binding = 1 kscb : array<uint8>  // 16B sub-scale blocks, byte view (same buffer at 0)
-    @ssbo @binding = 2 kqb : array<uint8>   // k6 quant plane, byte view (ql at 192*blk, qh at +128)
-    @ssbo @binding = 3 x : array<float>
-    @ssbo @binding = 4 y : array<float>
+    @ssbo @binding = 0 @role = "weight" kdh : array<float16> // the d plane — the scale buffer bound at byte nsb*16
+    @ssbo @binding = 1 @role = "weight" kscb : array<uint8>  // 16B sub-scale blocks, byte view (same buffer at 0)
+    @ssbo @binding = 2 @role = "weight" kqb : array<uint8>   // k6 quant plane, byte view (ql at 192*blk, qh at +128)
+    @ssbo @binding = 3 @role = "read" x : array<float>
+    @ssbo @binding = 4 @role = "write" y : array<float>
     @uniform @binding = 5 ndim : uint
     @uniform @binding = 6 ddim : uint
-    @ssbo @binding = 7 sel : array<uint>    // [streams x 2k] selection rows (idx section read)
+    @ssbo @binding = 7 @role = "read" sel : array<uint>    // [streams x 2k] selection rows (idx section read)
     @uniform @binding = 8 esb : uint        // superblocks per expert plane (ege / 256)
     @uniform @binding = 9 xs : uint         // per-slot x stride, elements (0 = shared)
     @uniform @binding = 10 ss : uint        // per-stream sel row stride, uints (2k; 0 single)
@@ -1042,30 +1192,33 @@ class MetalMoeGemvK6 {
 // b LOW / b+16 HIGH — the split-half layout) + one E8M0 scale byte; value = doubled-e2m1
 // magnitude x halved scale (2^(e-128)). Optional per-expert bias rows — gpt-oss's biased MoE.
 class MetalMoeGemvMx4 {
-    @ssbo @binding = 0 mxu : array<uint>    // nibble plane, uint view (block at 4*blk; off/2 % 4)
-    @ssbo @binding = 1 mxe : array<uint8>   // E8M0 plane, bound at off/32
-    @ssbo @binding = 2 xf : array<float4>   // activations, float4 view (xoff always % 4)
-    @ssbo @binding = 3 y : array<float>
+    @ssbo @binding = 0 @role = "weight" mxu2 : array<uint2>  // nibble plane, uint2 view (block at 2*blk; off/2 % 8)
+    @ssbo @binding = 1 @role = "weight" mxe : array<uint8>   // E8M0 plane, bound at off/32
+    @ssbo @binding = 2 @role = "read" xf : array<float4>   // activations, float4 view (xoff always % 4)
+    @ssbo @binding = 3 @role = "write" y : array<float>
     @uniform @binding = 4 ndim : uint
     @uniform @binding = 5 ddim : uint
-    @ssbo @binding = 6 sel : array<uint>    // [streams x 2k] selection rows (idx section read)
+    @ssbo @binding = 6 @role = "read" sel : array<uint>    // [streams x 2k] selection rows (idx section read)
     @uniform @binding = 7 eblk : uint       // 32-elem blocks per expert plane (ege / 32)
     @uniform @binding = 8 xs : uint         // per-slot x stride, elements (0 = shared)
     @uniform @binding = 9 ss : uint         // per-stream sel row stride, uints (2k; 0 single)
     @uniform @binding = 10 bxs : uint       // per-stream x stride, elements (0 single)
     @uniform @binding = 11 bys : uint       // per-stream y stride, elements (0 single)
-    @ssbo @binding = 12 wb : array<float>   // [ne x ddim] per-expert bias rows (hasb models)
+    @ssbo @binding = 12 @role = "weight" wb : array<float>   // [ne x ddim] per-expert bias rows (hasb models)
     @uniform @binding = 13 hasb : uint
-    @ssbo @binding = 14 etab : array<float> // [256] exact e8m0_half scales (host-built)
-    @ssbo @binding = 15 vtab : array<float> // [16] signed doubled-e2m1 values (host-built)
+    @ssbo @binding = 15 @role = "weight" vtab : array<float> // [16] signed doubled-e2m1 values (host-built)
+    @workgroup vt : float[32]
 
     [metal_kernel(name="metal_moe_gemv_mx4_msl")]
     def metal_moe_gemv_mx4 {
-        // the q51 GEMV shape (2 rows per sg off one shared float4 x load) — the 1-row scalar-x
-        // form was the gpt-oss 0.40x decode red; the value LUT replaces the per-nibble csel chain
+        // the lcpp mul_mv_mxfp4 shape (moe-lab lcppe rung, 239->301 wGB/s at gpt-oss shapes):
+        // 16 blocks in flight x 2 threads/block, yl[4] float4 x prefetch shared across both rows,
+        // uint2 weight loads, tgmem value LUT, e8m0 scale computed in ALU (no dependent etab load)
         let lane = gl_SubgroupInvocationID
-        let ix = lane / 8u    // 4-way block stride
-        let it = lane % 8u    // 8 threads per block, one float4 (4 elems) each
+        vt[lane] = vtab[lane % 16u]
+        barrier()
+        let ix = lane / 2u   // 16-way block stride
+        let it = lane % 2u   // 2 threads per block, 8 nibble bytes (one uint2) each
         let nb = ndim / 32u
         let slot = gl_WorkGroupID.y
         let st = gl_WorkGroupID.z
@@ -1074,23 +1227,29 @@ class MetalMoeGemvMx4 {
         let xoff = st * bxs + slot * xs
         let y0 = st * bys + slot * ddim
         let first_row = (gl_WorkGroupID.x * 2u + gl_SubgroupID) * 2u
-        let half = it / 4u
-        let ku = it % 4u
-        let nsh = half * 4u
         var sumf : float[2]
         var ib = ix
         while (ib < nb) {
-            let xv = xf[(xoff + ib * 32u) / 4u + it]
+            let x4 = (xoff + ib * 32u + it * 8u) / 4u
+            let yl0 = xf[x4]
+            let yl1 = xf[x4 + 4u]
+            let yl2 = xf[x4 + 1u]
+            let yl3 = xf[x4 + 5u]
             for [unroll_full] (r in range(2)) {
                 let blk = eb + (first_row + uint(r)) * nb + ib
-                let u = mxu[blk * 4u + ku]
-                var qx = vtab[(u >> nsh) & 15u] * xv.x
-                qx += vtab[(u >> (8u + nsh)) & 15u] * xv.y
-                qx += vtab[(u >> (16u + nsh)) & 15u] * xv.z
-                qx += vtab[(u >> (24u + nsh)) & 15u] * xv.w
-                sumf[r] += etab[uint(mxe[blk])] * qx
+                let u2 = mxu2[blk * 2u + it]
+                let u0 = u2.x
+                let u1 = u2.y
+                let acc1 = yl0 * float4(vt[u0 & 15u], vt[(u0 >> 8u) & 15u], vt[(u0 >> 16u) & 15u], vt[(u0 >> 24u) & 15u])
+                let acc2 = yl1 * float4(vt[(u0 >> 4u) & 15u], vt[(u0 >> 12u) & 15u], vt[(u0 >> 20u) & 15u], vt[u0 >> 28u])
+                let acc3 = yl2 * float4(vt[u1 & 15u], vt[(u1 >> 8u) & 15u], vt[(u1 >> 16u) & 15u], vt[(u1 >> 24u) & 15u])
+                let acc4 = yl3 * float4(vt[(u1 >> 4u) & 15u], vt[(u1 >> 12u) & 15u], vt[(u1 >> 20u) & 15u], vt[u1 >> 28u])
+                let am = (acc1 + acc3) + (acc2 + acc4)
+                let ex = uint(mxe[blk])
+                let sc = uint_bits_to_float(ex < 2u ? (0x00200000u << ex) : ((ex - 1u) << 23u))
+                sumf[r] += sc * ((am.x + am.y) + (am.z + am.w))
             }
-            ib += 4u
+            ib += 16u
         }
         for [unroll_full] (r in range(2)) {
             let sr = simd_sum(sumf[r])
@@ -1109,13 +1268,13 @@ class MetalMoeGemvMx4 {
 // k/k+16 split-half pairing + the qh u32; 4B scales = f16 d, m). value = d*q + m with
 // q = nibble | qh_bit << 4, folded as acc += d*Σ(q·x) + m*Σx per block (f32 activations).
 class MetalMoeGemvQ51 {
-    @ssbo @binding = 0 wqu : array<uint>    // quant plane, uint view (block at 5*blk; qh at +4)
-    @ssbo @binding = 1 wsh : array<float16> // scale plane (d at 2*blk, m at 2*blk+1)
-    @ssbo @binding = 2 xf : array<float4>   // activations, float4 view (xoff always % 4)
-    @ssbo @binding = 3 y : array<float>
+    @ssbo @binding = 0 @role = "weight" wqu : array<uint>    // quant plane, uint view (block at 5*blk; qh at +4)
+    @ssbo @binding = 1 @role = "weight" wsh : array<float16> // scale plane (d at 2*blk, m at 2*blk+1)
+    @ssbo @binding = 2 @role = "read" xf : array<float4>   // activations, float4 view (xoff always % 4)
+    @ssbo @binding = 3 @role = "write" y : array<float>
     @uniform @binding = 4 ndim : uint
     @uniform @binding = 5 ddim : uint
-    @ssbo @binding = 6 sel : array<uint>    // [streams x 2k] selection rows (idx section read)
+    @ssbo @binding = 6 @role = "read" sel : array<uint>    // [streams x 2k] selection rows (idx section read)
     @uniform @binding = 7 eblk : uint       // 32-elem blocks per expert plane (ege / 32)
     @uniform @binding = 8 xs : uint         // per-slot x stride, elements (0 = shared)
     @uniform @binding = 9 ss : uint         // per-stream sel row stride, uints (2k; 0 single)
@@ -1173,22 +1332,22 @@ class MetalMoeGemvQ51 {
 // Gathered MXFP4 mul_mm — the gathered-GEMM shape with the mx4 A stage: each thread's 16-elem
 // half IS one nibble half of the 32-block (il0 = 0 low, 1 high). Bias rides MetalMoeBiasRows.
 class MetalMoeMulMmMx4 {
-    @ssbo @binding = 0 mxn : array<uint8>
-    @ssbo @binding = 1 mxe : array<uint8>
-    @ssbo @binding = 2 xf : array<float4>
-    @ssbo @binding = 3 y : array<float>
+    @ssbo @binding = 0 @role = "weight" mxq4 : array<uint4>  // nibble plane, uint4 view (one block = one load)
+    @ssbo @binding = 1 @role = "weight" mxe : array<uint8>
+    @ssbo @binding = 2 @role = "read" xf : array<float4>
+    @ssbo @binding = 3 @role = "write" y : array<float>
     @uniform @binding = 4 kdim : uint
     @uniform @binding = 5 ndim : uint
-    @ssbo @binding = 6 cnt : array<uint>
-    @ssbo @binding = 7 basep : array<uint>
-    @ssbo @binding = 8 bkt : array<uint>
+    @ssbo @binding = 6 @role = "read" cnt : array<uint>
+    @ssbo @binding = 7 @role = "read" basep : array<uint>
+    @ssbo @binding = 8 @role = "read" bkt : array<uint>
     @uniform @binding = 9 eblk : uint       // 32-elem blocks per expert plane (ege / 32)
     @uniform @binding = 10 nk : uint
     @uniform @binding = 11 gather : uint
-    @ssbo @binding = 12 etab : array<float> // [256] exact e8m0_half scales (host-built)
-    @ssbo @binding = 13 vtab : array<float> // [16] signed doubled-e2m1 values (host-built)
+    @ssbo @binding = 13 @role = "weight" vtab : array<float> // [16] signed doubled-e2m1 values (host-built)
     @workgroup ta : float16[2048]
     @workgroup tb : float16[1024]
+    @workgroup vt : float[32]
 
     [metal_kernel(name="metal_moe_mulmm_mx4_msl")]
     def metal_moe_mulmm_mx4 {
@@ -1200,6 +1359,10 @@ class MetalMoeMulMmMx4 {
         }
         let rbase = basep[e]
         let lid = gl_LocalInvocationID.x
+        if (lid < 32u) {
+            vt[lid] = vtab[lid % 16u]
+        }
+        barrier()
         let sg = gl_SubgroupID
         let nBase = gl_WorkGroupID.y * 64u
         var mc : simdgroup_float8x8[8]
@@ -1230,11 +1393,14 @@ class MetalMoeMulMmMx4 {
             let b0 = unsafe(xcur[0])
             let b1 = unsafe(xcur[1])
             let sc = uint(mxe[blk])
-            let d = etab[sc]   // host-built exact e8m0_half table (incl. the denormal e < 2)
-            let qb = blk * 16u
-            for [unroll_full] (i in range(16)) {
-                let nby = uint(mxn[qb + uint(i)])
-                va[i] = float16(vtab[il0 == 0u ? (nby & 15u) : (nby >> 4u)] * d)
+            let d = uint_bits_to_float(sc < 2u ? (0x00200000u << sc) : ((sc - 1u) << 23u))   // exact e8m0_half, denormal e < 2 included
+            let u4 = mxq4[blk]
+            for [unroll_full] (w in range(4)) {
+                let uw = w == 0 ? u4.x : (w == 1 ? u4.y : (w == 2 ? u4.z : u4.w))
+                for [unroll_full] (c in range(4)) {
+                    let nby = (uw >> (uint(c) * 8u)) & 255u
+                    va[w * 4 + c] = float16(vt[il0 == 0u ? (nby & 15u) : (nby >> 4u)] * d)
+                }
             }
             barrier()
             for [unroll_full] (i in range(16)) {
@@ -1272,10 +1438,10 @@ class MetalMoeMulMmMx4 {
 // gpt-oss expert bias over the padded bucket rows (grid (cols, rows, experts)): rows past the
 // expert's live count exit — ggml_add_id order (bias precedes the routing-weight reduce).
 class MetalMoeBiasRows {
-    @ssbo @binding = 0 y : array<float>     // [padded rows x d] bucket-ordered panel
-    @ssbo @binding = 1 wb : array<float>    // [ne x d] this layer's per-expert bias rows
-    @ssbo @binding = 2 cnt : array<uint>
-    @ssbo @binding = 3 basep : array<uint>
+    @ssbo @binding = 0 @role = "readwrite" y : array<float>     // [padded rows x d] bucket-ordered panel
+    @ssbo @binding = 1 @role = "weight" wb : array<float>    // [ne x d] this layer's per-expert bias rows
+    @ssbo @binding = 2 @role = "read" cnt : array<uint>
+    @ssbo @binding = 3 @role = "read" basep : array<uint>
     @uniform @binding = 4 d : uint
 
     [metal_kernel(name="metal_moe_bias_rows_msl")]
@@ -1325,20 +1491,21 @@ class MetalMoeCombine {
 
 // gpt-oss clamped swiglu (stage 4): x = min(g, 7), y = clamp(u, -7, 7),
 // g = (x / (1 + exp(-1.702 x))) * (y + 1) — the clamps and the +1 are trained weights' contract.
+// float4 lanes, per-element math identical to the scalar form it replaced (bit-exact).
 class MetalSwigluOai {
-    @ssbo @binding = 0 g : array<float>
-    @ssbo @binding = 1 u : array<float>
-    @uniform @binding = 2 total : uint
+    @ssbo @binding = 0 @role = "readwrite" g : array<float4>
+    @ssbo @binding = 1 @role = "read" u : array<float4>
+    @uniform @binding = 2 total : uint      // scalar element count
 
     [metal_kernel(name="metal_swiglu_oai_msl")]
     def metal_swiglu_oai {
         let gid = gl_GlobalInvocationID.x
-        if (gid >= total) {
+        if (gid * 4u >= total) {
             return
         }
-        let x = min(g[gid], 7.0)
-        let y = min(max(u[gid], -7.0), 7.0)   // nolint:STYLE019 — the MSL emitter doesn't lower clamp
-        g[gid] = (x / (1.0 + exp(-1.702 * x))) * (y + 1.0)
+        let x = min(g[gid], float4(7.0))
+        let y = min(max(u[gid], float4(-7.0)), float4(7.0))   // nolint:STYLE019 — the MSL emitter doesn't lower clamp
+        g[gid] = (x / (float4(1.0) + exp(-1.702 * x))) * (y + float4(1.0))
     }
 }
 
@@ -1426,8 +1593,8 @@ class MetalMoeWScale {
 // thread-0 serial walk in row order = the CPU moe_bkt order); buckets PAD to 32-row tiles.
 
 class MetalMoeCount {
-    @ssbo @binding = 0 seli : array<uint>   // [npos x 2k] selection rows (idx section)
-    @ssbo @binding = 1 cnt : array<uint>    // [ne] out
+    @ssbo @binding = 0 @role = "read" seli : array<uint>   // [npos x 2k] selection rows (idx section)
+    @ssbo @binding = 1 @role = "write" cnt : array<uint>    // [ne] out
     @uniform @binding = 2 total : uint      // npos * k entries
     @uniform @binding = 3 nk : uint
 
@@ -1455,8 +1622,8 @@ class MetalMoeCount {
 }
 
 class MetalMoePrefix {
-    @ssbo @binding = 0 cnt : array<uint>
-    @ssbo @binding = 1 basep : array<uint>  // [ne] exclusive prefix over the PADDED counts
+    @ssbo @binding = 0 @role = "read" cnt : array<uint>
+    @ssbo @binding = 1 @role = "write" basep : array<uint>  // [ne] exclusive prefix over the PADDED counts
     @uniform @binding = 2 ne : uint
 
     [metal_kernel(name="metal_moe_prefix_msl")]
@@ -1475,10 +1642,10 @@ class MetalMoePrefix {
 }
 
 class MetalMoeBucket {
-    @ssbo @binding = 0 seli : array<uint>
-    @ssbo @binding = 1 basep : array<uint>
-    @ssbo @binding = 2 bkt : array<uint>    // [padded rows] bucket -> entry (row*k + slot)
-    @ssbo @binding = 3 inv : array<uint>    // [npos*k] entry -> padded bucket row
+    @ssbo @binding = 0 @role = "read" seli : array<uint>
+    @ssbo @binding = 1 @role = "read" basep : array<uint>
+    @ssbo @binding = 2 @role = "write" bkt : array<uint>    // [padded rows] bucket -> entry (row*k + slot)
+    @ssbo @binding = 3 @role = "write" inv : array<uint>    // [npos*k] entry -> padded bucket row
     @uniform @binding = 4 total : uint
     @uniform @binding = 5 nk : uint
 
@@ -1524,10 +1691,10 @@ class MetalMoeBucket {
 // the ordered weighted reduce: per (position, dim slice), the k slots in slot order via inv —
 // bit-stable vs the CPU park-and-accumulate; pad bucket rows are never referenced
 class MetalMoeReduce {
-    @ssbo @binding = 0 dn : array<float>    // [padded rows x dim] bucket-ordered down outputs
-    @ssbo @binding = 1 selw : array<float>  // selection rows, float view (w of row r at r*2k + k)
-    @ssbo @binding = 2 inv : array<uint>
-    @ssbo @binding = 3 y : array<float>     // [npos x dim]
+    @ssbo @binding = 0 @role = "read" dn : array<float>    // [padded rows x dim] bucket-ordered down outputs
+    @ssbo @binding = 1 @role = "read" selw : array<float>  // selection rows, float view (w of row r at r*2k + k)
+    @ssbo @binding = 2 @role = "read" inv : array<uint>
+    @ssbo @binding = 3 @role = "write" y : array<float>     // [npos x dim]
     @uniform @binding = 4 dim : uint
     @uniform @binding = 5 nk : uint
 
@@ -1552,15 +1719,15 @@ class MetalMoeReduce {
 // via bkt (gather=1: src row = entry/k; gather=0: contiguous bucket rows — the down site),
 // C tiles land at the expert's padded bucket rows; tiles past the padded count exit.
 class MetalMoeMulMmQ8 {
-    @ssbo @binding = 0 wsh : array<float16> // the expert STACK's blob slice, half-scale view
-    @ssbo @binding = 1 wqb : array<int8>    // the same blob buffer, byte view
-    @ssbo @binding = 2 xf : array<float4>
-    @ssbo @binding = 3 y : array<float>
+    @ssbo @binding = 0 @role = "weight" wsh : array<float16> // the expert STACK's blob slice, half-scale view
+    @ssbo @binding = 1 @role = "weight" wqb : array<int8>    // the same blob buffer, byte view
+    @ssbo @binding = 2 @role = "read" xf : array<float4>
+    @ssbo @binding = 3 @role = "write" y : array<float>
     @uniform @binding = 4 kdim : uint
     @uniform @binding = 5 ndim : uint
-    @ssbo @binding = 6 cnt : array<uint>
-    @ssbo @binding = 7 basep : array<uint>
-    @ssbo @binding = 8 bkt : array<uint>
+    @ssbo @binding = 6 @role = "read" cnt : array<uint>
+    @ssbo @binding = 7 @role = "read" basep : array<uint>
+    @ssbo @binding = 8 @role = "read" bkt : array<uint>
     @uniform @binding = 9 eblk : uint       // 34B blocks per expert plane (ege / 32)
     @uniform @binding = 10 nk : uint
     @uniform @binding = 11 gather : uint    // 1 = bkt-indirect X (gate/up), 0 = contiguous (down)
@@ -1648,16 +1815,16 @@ class MetalMoeMulMmQ8 {
 
 // Gathered Q4_K mul_mm — MetalKqMulMmK4's A stage with the expert superblock shift.
 class MetalMoeMulMmK4 {
-    @ssbo @binding = 0 ksh : array<float16>
-    @ssbo @binding = 1 ks4 : array<uint4>
-    @ssbo @binding = 2 kqu : array<uint>
-    @ssbo @binding = 3 xf : array<float4>
-    @ssbo @binding = 4 y : array<float>
+    @ssbo @binding = 0 @role = "weight" ksh : array<float16>
+    @ssbo @binding = 1 @role = "weight" ks4 : array<uint4>
+    @ssbo @binding = 2 @role = "weight" kqu : array<uint>
+    @ssbo @binding = 3 @role = "read" xf : array<float4>
+    @ssbo @binding = 4 @role = "write" y : array<float>
     @uniform @binding = 5 kdim : uint
     @uniform @binding = 6 ndim : uint
-    @ssbo @binding = 7 cnt : array<uint>
-    @ssbo @binding = 8 basep : array<uint>
-    @ssbo @binding = 9 bkt : array<uint>
+    @ssbo @binding = 7 @role = "read" cnt : array<uint>
+    @ssbo @binding = 8 @role = "read" basep : array<uint>
+    @ssbo @binding = 9 @role = "read" bkt : array<uint>
     @uniform @binding = 10 esb : uint       // superblocks per expert plane (ege / 256)
     @uniform @binding = 11 nk : uint
     @uniform @binding = 12 gather : uint
@@ -1764,16 +1931,16 @@ class MetalMoeMulMmK4 {
 
 // Gathered Q5_K mul_mm — MetalKqMulMmK5's A stage with the expert superblock shift.
 class MetalMoeMulMmK5 {
-    @ssbo @binding = 0 ksh : array<float16>
-    @ssbo @binding = 1 ks4 : array<uint4>
-    @ssbo @binding = 2 kqu : array<uint>
-    @ssbo @binding = 3 xf : array<float4>
-    @ssbo @binding = 4 y : array<float>
+    @ssbo @binding = 0 @role = "weight" ksh : array<float16>
+    @ssbo @binding = 1 @role = "weight" ks4 : array<uint4>
+    @ssbo @binding = 2 @role = "weight" kqu : array<uint>
+    @ssbo @binding = 3 @role = "read" xf : array<float4>
+    @ssbo @binding = 4 @role = "write" y : array<float>
     @uniform @binding = 5 kdim : uint
     @uniform @binding = 6 ndim : uint
-    @ssbo @binding = 7 cnt : array<uint>
-    @ssbo @binding = 8 basep : array<uint>
-    @ssbo @binding = 9 bkt : array<uint>
+    @ssbo @binding = 7 @role = "read" cnt : array<uint>
+    @ssbo @binding = 8 @role = "read" basep : array<uint>
+    @ssbo @binding = 9 @role = "read" bkt : array<uint>
     @uniform @binding = 10 esb : uint
     @uniform @binding = 11 nk : uint
     @uniform @binding = 12 gather : uint
@@ -1883,15 +2050,15 @@ class MetalMoeMulMmK5 {
 // Gathered Q5_1 mul_mm — the k5 skeleton with the per-32 A stage: each thread's 16-elem half is
 // one nibble half of the 32-block (il0), value = d*q + m folded into the f16 A tile.
 class MetalMoeMulMmQ51 {
-    @ssbo @binding = 0 wsh : array<float16> // scale plane (d at 2*blk, m at 2*blk+1)
-    @ssbo @binding = 1 wqu : array<uint>    // quant plane, uint view (block at 5*blk; qh at +4)
-    @ssbo @binding = 2 xf : array<float4>
-    @ssbo @binding = 3 y : array<float>
+    @ssbo @binding = 0 @role = "weight" wsh : array<float16> // scale plane (d at 2*blk, m at 2*blk+1)
+    @ssbo @binding = 1 @role = "weight" wqu : array<uint>    // quant plane, uint view (block at 5*blk; qh at +4)
+    @ssbo @binding = 2 @role = "read" xf : array<float4>
+    @ssbo @binding = 3 @role = "write" y : array<float>
     @uniform @binding = 4 kdim : uint
     @uniform @binding = 5 ndim : uint
-    @ssbo @binding = 6 cnt : array<uint>
-    @ssbo @binding = 7 basep : array<uint>
-    @ssbo @binding = 8 bkt : array<uint>
+    @ssbo @binding = 6 @role = "read" cnt : array<uint>
+    @ssbo @binding = 7 @role = "read" basep : array<uint>
+    @ssbo @binding = 8 @role = "read" bkt : array<uint>
     @uniform @binding = 9 eblk : uint       // 32-elem blocks per expert plane (ege / 32)
     @uniform @binding = 10 nk : uint
     @uniform @binding = 11 gather : uint
@@ -1986,16 +2153,16 @@ class MetalMoeMulMmQ51 {
 
 // Gathered Q6_K mul_mm — MetalKqMulMmK6's A stage with the expert superblock shift.
 class MetalMoeMulMmK6 {
-    @ssbo @binding = 0 kdh : array<float16>
-    @ssbo @binding = 1 ksc : array<uint4>
-    @ssbo @binding = 2 kqu : array<uint>
-    @ssbo @binding = 3 xf : array<float4>
-    @ssbo @binding = 4 y : array<float>
+    @ssbo @binding = 0 @role = "weight" kdh : array<float16>
+    @ssbo @binding = 1 @role = "weight" ksc : array<uint4>
+    @ssbo @binding = 2 @role = "weight" kqu : array<uint>
+    @ssbo @binding = 3 @role = "read" xf : array<float4>
+    @ssbo @binding = 4 @role = "write" y : array<float>
     @uniform @binding = 5 kdim : uint
     @uniform @binding = 6 ndim : uint
-    @ssbo @binding = 7 cnt : array<uint>
-    @ssbo @binding = 8 basep : array<uint>
-    @ssbo @binding = 9 bkt : array<uint>
+    @ssbo @binding = 7 @role = "read" cnt : array<uint>
+    @ssbo @binding = 8 @role = "read" basep : array<uint>
+    @ssbo @binding = 9 @role = "read" bkt : array<uint>
     @uniform @binding = 10 esb : uint
     @uniform @binding = 11 nk : uint
     @uniform @binding = 12 gather : uint
@@ -2174,11 +2341,11 @@ class MetalQ8Gemv {
 // Q4_K: lane owns 32 elems of every 4th superblock; lcpp's kmask halfword scale decode +
 // nibble-mask acc folds (x16/x256 groups folded by pow2 constants).
 class MetalKqGemvK4 {
-    @ssbo @binding = 0 ksh : array<float16> // 16B scale blocks, half view (d at 8*blk, dmin at 8*blk+1)
-    @ssbo @binding = 1 ks4 : array<uint4>   // the same buffer, uint4 view (whole block at blk)
-    @ssbo @binding = 2 kqu : array<uint>    // k4 quant plane, uint view (qs of blk at 32*blk)
-    @ssbo @binding = 3 x : array<float>
-    @ssbo @binding = 4 y : array<float>
+    @ssbo @binding = 0 @role = "weight" ksh : array<float16> // 16B scale blocks, half view (d at 8*blk, dmin at 8*blk+1)
+    @ssbo @binding = 1 @role = "weight" ks4 : array<uint4>   // the same buffer, uint4 view (whole block at blk)
+    @ssbo @binding = 2 @role = "weight" kqu : array<uint>    // k4 quant plane, uint view (qs of blk at 32*blk)
+    @ssbo @binding = 3 @role = "read" x : array<float>
+    @ssbo @binding = 4 @role = "write" y : array<float>
     @uniform @binding = 5 ndim : uint
     @uniform @binding = 6 ddim : uint
 
@@ -2261,11 +2428,11 @@ class MetalKqGemvK4 {
 // Q5_K: int-composed q5 (nibble | qh bit << 4) — one fma per element; same kmask scale decode.
 // The quant plane is [qs 128][qh 32] per superblock, read through the byte view.
 class MetalKqGemvK5 {
-    @ssbo @binding = 0 ksh : array<float16> // 16B scale blocks, half view
-    @ssbo @binding = 1 ks4 : array<uint4>   // the same buffer, uint4 view
-    @ssbo @binding = 2 kqb : array<uint8>   // k5 quant plane, byte view (qs at 160*blk, qh at +128)
-    @ssbo @binding = 3 x : array<float>
-    @ssbo @binding = 4 y : array<float>
+    @ssbo @binding = 0 @role = "weight" ksh : array<float16> // 16B scale blocks, half view
+    @ssbo @binding = 1 @role = "weight" ks4 : array<uint4>   // the same buffer, uint4 view
+    @ssbo @binding = 2 @role = "weight" kqb : array<uint8>   // k5 quant plane, byte view (qs at 160*blk, qh at +128)
+    @ssbo @binding = 3 @role = "read" x : array<float>
+    @ssbo @binding = 4 @role = "write" y : array<float>
     @uniform @binding = 5 ndim : uint
     @uniform @binding = 6 ddim : uint
 
@@ -2341,11 +2508,11 @@ class MetalKqGemvK5 {
 // map, qh via mask-selects. Wins at n < 3072 at EVERY d (-9..-11% vs b2r) and the small-d kv
 // shape (b2r under-occupied); b2r keeps n >= 3072. enc_kq_gemv picks per site.
 class MetalKqGemvK5C {
-    @ssbo @binding = 0 ksh : array<float16> // 16B scale blocks, half view (d at 8*blk, dmin at 8*blk+1)
-    @ssbo @binding = 1 ks4 : array<uint4>   // the same buffer, uint4 view (whole block at blk)
-    @ssbo @binding = 2 kqb : array<uint8>   // k5 quant plane, byte view (qs at 160*blk, qh at +128)
-    @ssbo @binding = 3 x : array<float>
-    @ssbo @binding = 4 y : array<float>
+    @ssbo @binding = 0 @role = "weight" ksh : array<float16> // 16B scale blocks, half view (d at 8*blk, dmin at 8*blk+1)
+    @ssbo @binding = 1 @role = "weight" ks4 : array<uint4>   // the same buffer, uint4 view (whole block at blk)
+    @ssbo @binding = 2 @role = "weight" kqb : array<uint8>   // k5 quant plane, byte view (qs at 160*blk, qh at +128)
+    @ssbo @binding = 3 @role = "read" x : array<float>
+    @ssbo @binding = 4 @role = "write" y : array<float>
     @uniform @binding = 5 ndim : uint
     @uniform @binding = 6 ddim : uint
 
@@ -2426,11 +2593,11 @@ class MetalKqGemvK5C {
 // Q6_K: 6-bit q = nibble | 2 qh bits, minus 32; per-16-element SIGNED sub-scales as 4 scattered
 // byte loads (the uint4+select form costs 2 resident simdgroups); d off the trailing f16 plane.
 class MetalKqGemvK6 {
-    @ssbo @binding = 0 kdh : array<float16> // the d plane — the scale buffer bound at byte nsb*16
-    @ssbo @binding = 1 kscb : array<uint8>  // 16B sub-scale blocks, byte view (same buffer at 0)
-    @ssbo @binding = 2 kqb : array<uint8>   // k6 quant plane, byte view (ql at 192*blk, qh at +128)
-    @ssbo @binding = 3 x : array<float>
-    @ssbo @binding = 4 y : array<float>
+    @ssbo @binding = 0 @role = "weight" kdh : array<float16> // the d plane — the scale buffer bound at byte nsb*16
+    @ssbo @binding = 1 @role = "weight" kscb : array<uint8>  // 16B sub-scale blocks, byte view (same buffer at 0)
+    @ssbo @binding = 2 @role = "weight" kqb : array<uint8>   // k6 quant plane, byte view (ql at 192*blk, qh at +128)
+    @ssbo @binding = 3 @role = "read" x : array<float>
+    @ssbo @binding = 4 @role = "write" y : array<float>
     @uniform @binding = 5 ndim : uint
     @uniform @binding = 6 ddim : uint
 
@@ -2494,11 +2661,11 @@ class MetalKqGemvK6 {
 // thread per output row; y binds at the site's column byte offset, grid.y = column groups of R.
 
 class MetalKqMvB2K4 {
-    @ssbo @binding = 0 ksh : array<float16> // 16B scale blocks, half view (d at 8*blk, dmin at +1)
-    @ssbo @binding = 1 ks4 : array<uint4>   // the same buffer, uint4 view
-    @ssbo @binding = 2 kqu : array<uint>    // k4 quant plane, uint view (qs of blk at 32*blk)
-    @ssbo @binding = 3 x : array<float4>
-    @ssbo @binding = 4 y : array<float>
+    @ssbo @binding = 0 @role = "weight" ksh : array<float16> // 16B scale blocks, half view (d at 8*blk, dmin at +1)
+    @ssbo @binding = 1 @role = "weight" ks4 : array<uint4>   // the same buffer, uint4 view
+    @ssbo @binding = 2 @role = "weight" kqu : array<uint>    // k4 quant plane, uint view (qs of blk at 32*blk)
+    @ssbo @binding = 3 @role = "read" x : array<float4>
+    @ssbo @binding = 4 @role = "write" y : array<float>
     @uniform @binding = 5 ndim : uint
     @uniform @binding = 6 ddim : uint
     @uniform @binding = 7 ys : uint         // y row stride, elements
@@ -2567,11 +2734,11 @@ class MetalKqMvB2K4 {
 }
 
 class MetalKqMvB4K4 {
-    @ssbo @binding = 0 ksh : array<float16>
-    @ssbo @binding = 1 ks4 : array<uint4>
-    @ssbo @binding = 2 kqu : array<uint>
-    @ssbo @binding = 3 x : array<float4>
-    @ssbo @binding = 4 y : array<float>
+    @ssbo @binding = 0 @role = "weight" ksh : array<float16>
+    @ssbo @binding = 1 @role = "weight" ks4 : array<uint4>
+    @ssbo @binding = 2 @role = "weight" kqu : array<uint>
+    @ssbo @binding = 3 @role = "read" x : array<float4>
+    @ssbo @binding = 4 @role = "write" y : array<float>
     @uniform @binding = 5 ndim : uint
     @uniform @binding = 6 ddim : uint
     @uniform @binding = 7 ys : uint
@@ -2641,11 +2808,11 @@ class MetalKqMvB4K4 {
 }
 
 class MetalKqMvB2K6 {
-    @ssbo @binding = 0 kdh : array<float16> // the d plane — the scale buffer bound at byte nsb*16
-    @ssbo @binding = 1 kscb : array<uint8>  // 16B sub-scale blocks, byte view (same buffer at 0)
-    @ssbo @binding = 2 kqu : array<uint>    // k6 quant plane, uint view (ql at 48*blk, qh at 48*blk+32)
-    @ssbo @binding = 3 x : array<float4>
-    @ssbo @binding = 4 y : array<float>
+    @ssbo @binding = 0 @role = "weight" kdh : array<float16> // the d plane — the scale buffer bound at byte nsb*16
+    @ssbo @binding = 1 @role = "weight" kscb : array<uint8>  // 16B sub-scale blocks, byte view (same buffer at 0)
+    @ssbo @binding = 2 @role = "weight" kqu : array<uint>    // k6 quant plane, uint view (ql at 48*blk, qh at 48*blk+32)
+    @ssbo @binding = 3 @role = "read" x : array<float4>
+    @ssbo @binding = 4 @role = "write" y : array<float>
     @uniform @binding = 5 ndim : uint
     @uniform @binding = 6 ddim : uint
     @uniform @binding = 7 ys : uint
@@ -2714,11 +2881,11 @@ class MetalKqMvB2K6 {
 }
 
 class MetalKqMvB4K6 {
-    @ssbo @binding = 0 kdh : array<float16>
-    @ssbo @binding = 1 kscb : array<uint8>
-    @ssbo @binding = 2 kqu : array<uint>
-    @ssbo @binding = 3 x : array<float4>
-    @ssbo @binding = 4 y : array<float>
+    @ssbo @binding = 0 @role = "weight" kdh : array<float16>
+    @ssbo @binding = 1 @role = "weight" kscb : array<uint8>
+    @ssbo @binding = 2 @role = "weight" kqu : array<uint>
+    @ssbo @binding = 3 @role = "read" x : array<float4>
+    @ssbo @binding = 4 @role = "write" y : array<float>
     @uniform @binding = 5 ndim : uint
     @uniform @binding = 6 ddim : uint
     @uniform @binding = 7 ys : uint
@@ -2789,11 +2956,11 @@ class MetalKqMvB4K6 {
 // block) + the qh 5th-bit overlay. The 160B plane rides the SAME uint view (40 uints/blk: qs at
 // 40*blk, qh at 40*blk+32) — the overlay bit equals its kmask pair index, so scale indexing serves it too.
 class MetalKqMvB2K5 {
-    @ssbo @binding = 0 ksh : array<float16> // 16B scale blocks, half view (d at 8*blk, dmin at +1)
-    @ssbo @binding = 1 ks4 : array<uint4>   // the same buffer, uint4 view
-    @ssbo @binding = 2 kqu : array<uint>    // k5 plane, uint view (qs at 40*blk, qh at 40*blk+32)
-    @ssbo @binding = 3 x : array<float4>
-    @ssbo @binding = 4 y : array<float>
+    @ssbo @binding = 0 @role = "weight" ksh : array<float16> // 16B scale blocks, half view (d at 8*blk, dmin at +1)
+    @ssbo @binding = 1 @role = "weight" ks4 : array<uint4>   // the same buffer, uint4 view
+    @ssbo @binding = 2 @role = "weight" kqu : array<uint>    // k5 plane, uint view (qs at 40*blk, qh at 40*blk+32)
+    @ssbo @binding = 3 @role = "read" x : array<float4>
+    @ssbo @binding = 4 @role = "write" y : array<float>
     @uniform @binding = 5 ndim : uint
     @uniform @binding = 6 ddim : uint
     @uniform @binding = 7 ys : uint         // y row stride, elements
@@ -2869,11 +3036,11 @@ class MetalKqMvB2K5 {
 }
 
 class MetalKqMvB4K5 {
-    @ssbo @binding = 0 ksh : array<float16>
-    @ssbo @binding = 1 ks4 : array<uint4>
-    @ssbo @binding = 2 kqu : array<uint>
-    @ssbo @binding = 3 x : array<float4>
-    @ssbo @binding = 4 y : array<float>
+    @ssbo @binding = 0 @role = "weight" ksh : array<float16>
+    @ssbo @binding = 1 @role = "weight" ks4 : array<uint4>
+    @ssbo @binding = 2 @role = "weight" kqu : array<uint>
+    @ssbo @binding = 3 @role = "read" x : array<float4>
+    @ssbo @binding = 4 @role = "write" y : array<float>
     @uniform @binding = 5 ndim : uint
     @uniform @binding = 6 ddim : uint
     @uniform @binding = 7 ys : uint
@@ -2954,11 +3121,11 @@ class MetalKqMvB4K5 {
 // A/B decides, DASLLAMA_METAL_KQ_B8=0 falls back). REQUIRES mp == 8 (nlive >= 5): stage reads all 8 rows, stores gate on nr.
 
 class MetalKqMvB8K4 {
-    @ssbo @binding = 0 ksh : array<float16> // 16B scale blocks, half view (d at 8*blk, dmin at +1)
-    @ssbo @binding = 1 ks4 : array<uint4>   // the same buffer, uint4 view
-    @ssbo @binding = 2 kqu : array<uint>    // k4 quant plane, uint view (qs of blk at 32*blk)
-    @ssbo @binding = 3 x : array<float4>
-    @ssbo @binding = 4 y : array<float>
+    @ssbo @binding = 0 @role = "weight" ksh : array<float16> // 16B scale blocks, half view (d at 8*blk, dmin at +1)
+    @ssbo @binding = 1 @role = "weight" ks4 : array<uint4>   // the same buffer, uint4 view
+    @ssbo @binding = 2 @role = "weight" kqu : array<uint>    // k4 quant plane, uint view (qs of blk at 32*blk)
+    @ssbo @binding = 3 @role = "read" x : array<float4>
+    @ssbo @binding = 4 @role = "write" y : array<float>
     @uniform @binding = 5 ndim : uint
     @uniform @binding = 6 ddim : uint
     @uniform @binding = 7 ys : uint         // y row stride, elements
@@ -3035,11 +3202,11 @@ class MetalKqMvB8K4 {
 }
 
 class MetalKqMvB8K5 {
-    @ssbo @binding = 0 ksh : array<float16>
-    @ssbo @binding = 1 ks4 : array<uint4>
-    @ssbo @binding = 2 kqu : array<uint>    // k5 plane, uint view (qs at 40*blk, qh at 40*blk+32)
-    @ssbo @binding = 3 x : array<float4>
-    @ssbo @binding = 4 y : array<float>
+    @ssbo @binding = 0 @role = "weight" ksh : array<float16>
+    @ssbo @binding = 1 @role = "weight" ks4 : array<uint4>
+    @ssbo @binding = 2 @role = "weight" kqu : array<uint>    // k5 plane, uint view (qs at 40*blk, qh at 40*blk+32)
+    @ssbo @binding = 3 @role = "read" x : array<float4>
+    @ssbo @binding = 4 @role = "write" y : array<float>
     @uniform @binding = 5 ndim : uint
     @uniform @binding = 6 ddim : uint
     @uniform @binding = 7 ys : uint
@@ -3122,11 +3289,11 @@ class MetalKqMvB8K5 {
 }
 
 class MetalKqMvB8K6 {
-    @ssbo @binding = 0 kdh : array<float16> // the d plane — the scale buffer bound at byte nsb*16
-    @ssbo @binding = 1 kscb : array<uint8>  // 16B sub-scale blocks, byte view (same buffer at 0)
-    @ssbo @binding = 2 kqu : array<uint>    // k6 quant plane, uint view (ql at 48*blk, qh at 48*blk+32)
-    @ssbo @binding = 3 x : array<float4>
-    @ssbo @binding = 4 y : array<float>
+    @ssbo @binding = 0 @role = "weight" kdh : array<float16> // the d plane — the scale buffer bound at byte nsb*16
+    @ssbo @binding = 1 @role = "weight" kscb : array<uint8>  // 16B sub-scale blocks, byte view (same buffer at 0)
+    @ssbo @binding = 2 @role = "weight" kqu : array<uint>    // k6 quant plane, uint view (ql at 48*blk, qh at 48*blk+32)
+    @ssbo @binding = 3 @role = "read" x : array<float4>
+    @ssbo @binding = 4 @role = "write" y : array<float>
     @uniform @binding = 5 ndim : uint
     @uniform @binding = 6 ddim : uint
     @uniform @binding = 7 ys : uint
@@ -3203,9 +3370,9 @@ class MetalKqMvB8K6 {
 // mode uniform, matching rope_scaled_tab / rope_scaled_neox_tab exactly via the position's
 // precomputed table row. One kernel serves q (n = qd) and k (n = kv_dim) as two dispatches.
 class MetalRope {
-    @ssbo @binding = 0 v : array<float>     // [ntok x n], roped in place
-    @ssbo @binding = 1 tcos : array<float>  // [ntok x head_size/2]
-    @ssbo @binding = 2 tsin : array<float>
+    @ssbo @binding = 0 @role = "readwrite" v : array<float>     // [ntok x n], roped in place
+    @ssbo @binding = 1 @role = "weight" tcos : array<float>  // [ntok x head_size/2]
+    @ssbo @binding = 2 @role = "weight" tsin : array<float>
     @uniform @binding = 3 n : uint          // row width (qd or kv_dim), % head_size
     @uniform @binding = 4 head_size : uint
     @uniform @binding = 5 npairs : uint     // ntok * n/2 — grid guard
@@ -3242,8 +3409,8 @@ class MetalRope {
 // Additive per-row bias (x[r*n + i] += b[i]) — the QKV bias epilogue for the prefill panels
 // (decode folds it into rope-store; prefill is GEMM-bound, so a plain elementwise pass is free).
 class MetalAddBiasRows {
-    @ssbo @binding = 0 x : array<float>     // [nrows x n], updated in place (bound at the panel offset)
-    @ssbo @binding = 1 b : array<float>     // [n]
+    @ssbo @binding = 0 @role = "readwrite" x : array<float>     // [nrows x n], updated in place (bound at the panel offset)
+    @ssbo @binding = 1 @role = "weight" b : array<float>     // [n]
     @uniform @binding = 2 n : uint
     @uniform @binding = 3 total : uint      // nrows * n — grid guard
 
@@ -3311,9 +3478,9 @@ class MetalQkNorm {
 // causal diagonal exit early. Q staging folds `scale` in; K stages transposed, rows >= npos
 // zeroed (pads can carry NaN). head_size walks in 64-wide K-SLABS — hs 64 is one slab, 128 two.
 class MetalAttnQK {
-    @ssbo @binding = 0 q : array<float>     // [mp x qd], roped
-    @ssbo @binding = 1 k : array<float>     // [nk64 x kv_dim], roped (existing rows + the chunk)
-    @ssbo @binding = 2 att : array<float>   // [n_heads x qrows x np32] raw scores out
+    @ssbo @binding = 0 @role = "read" q : array<float>     // [mp x qd], roped
+    @ssbo @binding = 1 @role = "read" k : array<float>     // [nk64 x kv_dim], roped (existing rows + the chunk)
+    @ssbo @binding = 2 @role = "write" att : array<float>   // [n_heads x qrows x np32] raw scores out
     @uniform @binding = 3 qd : uint
     @uniform @binding = 4 kv_dim : uint
     @uniform @binding = 5 head_size : uint
@@ -3392,13 +3559,13 @@ class MetalAttnQK {
 // softmax via a width-32 simd_shuffle_xor butterfly; the tail (cnt, np32) is ZEROED so the AV
 // GEMM can run whole blocks. A continuation chunk sees qoff existing keys: cnt = qoff + qi + 1.
 class MetalAttnSoftmax {
-    @ssbo @binding = 0 att : array<float>   // [n_heads x qrows x np32], normalized in place
+    @ssbo @binding = 0 @role = "readwrite" att : array<float>   // [n_heads x qrows x np32], normalized in place
     @uniform @binding = 1 np32 : uint
     @uniform @binding = 2 qoff : uint       // the chunk's first GLOBAL position (0 = fresh start)
     @uniform @binding = 3 qrows : uint      // padded query rows — the slab's row extent
     @uniform @binding = 4 window : uint     // > 0 = sliding span: keys < cnt - window are masked
     @uniform @binding = 5 softcap : float   // > 0 = attention-logit soft cap (gemma2)
-    @ssbo @binding = 20 sink : array<float> // [nheads] this layer's attention sinks (hass models)
+    @ssbo @binding = 20 @role = "weight" sink : array<float> // [nheads] this layer's attention sinks (hass models)
     @uniform @binding = 21 hass : uint
     @workgroup red : float[4]               // one per simdgroup
     @workgroup bcast : float
@@ -3492,9 +3659,9 @@ class MetalAttnSoftmax {
 // 32-blocks up to the causal limit qi0+32 (P's zeroed tail keeps whole blocks exact). V rows
 // >= npos stage as 0 (pad rows can carry NaN; 0*NaN would still poison). hs % 32 == 0 required.
 class MetalAttnAV {
-    @ssbo @binding = 0 att : array<float>   // [n_heads x qrows x np32] normalized P
-    @ssbo @binding = 1 v : array<float>     // [nk64 x kv_dim] raw V (existing rows + the chunk)
-    @ssbo @binding = 2 xb : array<float>    // [mp x qd] attention output
+    @ssbo @binding = 0 @role = "read" att : array<float>   // [n_heads x qrows x np32] normalized P
+    @ssbo @binding = 1 @role = "read" v : array<float>     // [nk64 x kv_dim] raw V (existing rows + the chunk)
+    @ssbo @binding = 2 @role = "write" xb : array<float>    // [mp x qd] attention output
     @uniform @binding = 3 qd : uint
     @uniform @binding = 4 kv_dim : uint
     @uniform @binding = 5 head_size : uint
@@ -3563,9 +3730,9 @@ class MetalAttnAV {
 // 32x32 scalar-f32-staged kernels ran ~60x below mul_mm rate, owning 24ms of the 3B window).
 // QK: S[h] = scale * Q_h . K_h^T, 32x64 C tiles; DASLLAMA_METAL_ATTN=0 pins the trio (hs % 64 != 0 too).
 class MetalAttnQKMm {
-    @ssbo @binding = 0 q : array<float4>    // [mp x qd/4], roped
-    @ssbo @binding = 1 k : array<float4>    // [nk64 x kv_dim/4], roped (existing rows + the chunk)
-    @ssbo @binding = 2 att : array<float>   // [n_heads x qrows x np32] raw scores out
+    @ssbo @binding = 0 @role = "read" q : array<float4>    // [mp x qd/4], roped
+    @ssbo @binding = 1 @role = "read" k : array<float4>    // [nk64 x kv_dim/4], roped (existing rows + the chunk)
+    @ssbo @binding = 2 @role = "write" att : array<float>   // [n_heads x qrows x np32] raw scores out
     @uniform @binding = 3 qd : uint
     @uniform @binding = 4 kv_dim : uint
     @uniform @binding = 5 head_size : uint
@@ -3676,9 +3843,9 @@ class MetalAttnQKMm {
 // axis in 32-blocks. V stages contiguous float4 loads, position rows >= npos ZEROED (causal
 // softmax zeroes P columns >= npos EXACTLY; 0 * NaN from a pad V row would poison the tile).
 class MetalAttnAVMm {
-    @ssbo @binding = 0 att : array<float4>  // [n_heads x qrows x np32/4] normalized P
-    @ssbo @binding = 1 v : array<float4>    // [nk64 x kv_dim/4] raw V (existing rows + the chunk)
-    @ssbo @binding = 2 xb : array<float>    // [mp x qd] attention output
+    @ssbo @binding = 0 @role = "read" att : array<float4>  // [n_heads x qrows x np32/4] normalized P
+    @ssbo @binding = 1 @role = "read" v : array<float4>    // [nk64 x kv_dim/4] raw V (existing rows + the chunk)
+    @ssbo @binding = 2 @role = "write" xb : array<float>    // [mp x qd] attention output
     @uniform @binding = 3 qd : uint
     @uniform @binding = 4 kv_dim : uint
     @uniform @binding = 5 head_size : uint
@@ -3765,8 +3932,8 @@ class MetalAttnAVMm {
 // Fused SwiGLU gate, one thread per element: g = silu(g) * u — swiglu exactly (the CPU side's
 // exp4 polynomial vs the GPU exp differ inside the shared tolerance envelope).
 class MetalSwiglu {
-    @ssbo @binding = 0 g : array<float>     // [ntok x hidden] W1 gate, in place
-    @ssbo @binding = 1 u : array<float>     // [ntok x hidden] W3 up
+    @ssbo @binding = 0 @role = "readwrite" g : array<float>     // [ntok x hidden] W1 gate, in place
+    @ssbo @binding = 1 @role = "read" u : array<float>     // [ntok x hidden] W3 up
     @uniform @binding = 2 total : uint      // ntok * hidden — grid guard
 
     [metal_kernel(name="metal_swiglu_msl")]
@@ -3784,8 +3951,8 @@ class MetalSwiglu {
 // 0.5*v*(1+tanh(sqrt(2/pi)*(v + 0.044715*v^3)))); GPU tanh vs the CPU exp identity differ inside
 // the shared tolerance envelope, same as swiglu's exp.
 class MetalGeglu {
-    @ssbo @binding = 0 g : array<float>     // [ntok x hidden] W1 gate, in place
-    @ssbo @binding = 1 u : array<float>     // [ntok x hidden] W3 up
+    @ssbo @binding = 0 @role = "readwrite" g : array<float>     // [ntok x hidden] W1 gate, in place
+    @ssbo @binding = 1 @role = "read" u : array<float>     // [ntok x hidden] W3 up
     @uniform @binding = 2 total : uint      // ntok * hidden — grid guard
 
     [metal_kernel(name="metal_geglu_msl")]
@@ -3804,8 +3971,8 @@ class MetalGeglu {
 
 // Residual add, one thread per element: x += y (add_inplace).
 class MetalAdd {
-    @ssbo @binding = 0 x : array<float>
-    @ssbo @binding = 1 y : array<float>
+    @ssbo @binding = 0 @role = "readwrite" x : array<float>
+    @ssbo @binding = 1 @role = "read" y : array<float>
     @uniform @binding = 2 total : uint      // grid guard
     @uniform @binding = 3 ascale : float    // (x + y) * ascale — gemma4 layer_out_scale scales
                                             // the WHOLE layer output; every other site binds 1.0
@@ -3824,8 +3991,8 @@ class MetalAdd {
 // layers reuse the pre-norm/pre-rope K projection as V (mm_qkv's copy half; the ones-plane
 // norm follows when v_norm is on — bit-identical to the CPU's fused copy+norm).
 class MetalPfCopy {
-    @ssbo @binding = 0 y : array<float>
-    @ssbo @binding = 1 x : array<float>
+    @ssbo @binding = 0 @role = "write" y : array<float>
+    @ssbo @binding = 1 @role = "read" x : array<float>
     @uniform @binding = 2 total : uint      // grid guard
 
     [metal_kernel(name="metal_pf_copy_msl")]
@@ -3841,9 +4008,9 @@ class MetalPfCopy {
 // Interleave two [npos x d] panels into the [npos x 2d] MTP eh_proj input — the draft-warm
 // cat rows [enorm(embed) ; hnorm(hidden)]; one thread per source element.
 class MetalPfCat2 {
-    @ssbo @binding = 0 y : array<float>
-    @ssbo @binding = 1 a : array<float>
-    @ssbo @binding = 2 b : array<float>
+    @ssbo @binding = 0 @role = "write" y : array<float>
+    @ssbo @binding = 1 @role = "read" a : array<float>
+    @ssbo @binding = 2 @role = "read" b : array<float>
     @uniform @binding = 3 d : uint
     @uniform @binding = 4 total : uint      // grid guard: npos * d
 
@@ -4152,8 +4319,8 @@ class MetalDnDeint {
 // Per-head sigmoid output gate (sigmoid_gate): x ⊙ σ(g) in place — the gated-attention
 // epilogue between the attention output and the out projection.
 class MetalSigmul {
-    @ssbo @binding = 0 x : array<float>
-    @ssbo @binding = 1 g : array<float>
+    @ssbo @binding = 0 @role = "readwrite" x : array<float>
+    @ssbo @binding = 1 @role = "read" g : array<float>
     @uniform @binding = 2 total : uint      // grid guard
 
     [metal_kernel(name="metal_sigmul_msl")]
@@ -4189,10 +4356,10 @@ class MetalAxpySig {
 // Batched narrow q8 GEMV for the β/α projections (d = dt_rank, 16..64 — under every GEMM
 // N tile): one simdgroup per (output row, position), the MetalQ8Gemv stream walk per row.
 class MetalDnBa {
-    @ssbo @binding = 0 wsh : array<float16> // 34B-block W blob, half-scale view (block b at 17*b)
-    @ssbo @binding = 1 wqb : array<int8>    // the same blob buffer, byte view (quants at 34*b + 2)
-    @ssbo @binding = 2 x : array<float4>    // [npos x n] f32 rows, float4 view
-    @ssbo @binding = 3 y : array<float>     // [npos x d]
+    @ssbo @binding = 0 @role = "weight" wsh : array<float16> // 34B-block W blob, half-scale view (block b at 17*b)
+    @ssbo @binding = 1 @role = "weight" wqb : array<int8>    // the same blob buffer, byte view (quants at 34*b + 2)
+    @ssbo @binding = 2 @role = "read" x : array<float4>    // [npos x n] f32 rows, float4 view
+    @ssbo @binding = 3 @role = "write" y : array<float>     // [npos x d]
     @uniform @binding = 4 ndim : uint       // n (reduction dim, % 32)
     @uniform @binding = 5 ddim : uint       // d (output rows per position)
 
@@ -4293,6 +4460,9 @@ var private g_pf_pso_copy : MetalComputePipeline?
 var private g_pf_pso_cat2 : MetalComputePipeline?
 var private g_pf_pso_add : MetalComputePipeline?
 var private g_pf_pso_mm : MetalComputePipeline?    // the production das mul_mm (34B q8 blocks + f32 X)
+var private g_pf_pso_bf16_mm : MetalComputePipeline?   // native-BF16 A twin (E-series model_proj)
+var private g_pf_pso_ple_gather : MetalComputePipeline?   // PLE pre-step: q8 token-row gather
+var private g_pf_pso_ple_finish : MetalComputePipeline?   // PLE pre-step: rms + combine, in place
 var private g_pso_qkmm : MetalComputePipeline?
 var private g_pso_avmm : MetalComputePipeline?
 var private g_pf_pso_gemv : MetalComputePipeline?
@@ -4319,13 +4489,12 @@ var private g_pf_pso_swiglu_oai : MetalComputePipeline?
 var private g_pf_pso_moe_mm_mx4 : MetalComputePipeline?
 var private g_pf_pso_moe_mm_q51 : MetalComputePipeline?
 var private g_pf_pso_moe_bias_rows : MetalComputePipeline?
-var private g_pf_e8m0_tab : MetalBuffer?
 var private g_pf_mx4_vtab : MetalBuffer?
 var private g_mm_legacy = false             // set_metal_prefill_mulmm_legacy — tests' exact-parity rail
 var private g_pf_logits_cpu = false            // set_metal_prefill_logits_cpu — the logits A/B rail
 // timing-attribution knockout (DASLLAMA_METAL_PREFILL_SKIP=attn|gemm|ew|nongemm|moe|moe_mm|
-// moe_act|moe_reduce|moe_only_router|moe_only_route|moe_no_mm_act): skips encoding that stage
-// family; consumers of skipped stages always skip too (no garbage OOB). Output GARBAGE, debug only.
+// moe_act|moe_bias|moe_reduce|moe_only_router|moe_only_route|moe_no_mm_act): skips encoding that
+// stage family; consumers of skipped stages always skip too (no garbage OOB). Output GARBAGE, debug only.
 var private g_pf_skip = ""
 
 // composite skip predicates for the MoE stages (moe_only_* isolate the route chain per-kernel)
@@ -4361,6 +4530,42 @@ def public set_metal_prefill_logits_cpu(v : bool) {
 //! forward — the tests' exact-parity rail. `DASLLAMA_METAL_MULMM=0` pins it process-wide.
 def public set_metal_prefill_mulmm_legacy(v : bool) {
     g_mm_legacy = v
+}
+
+//! The prefill knockout rail as an in-process setter (timing attribution — served output is
+//! GARBAGE while non-empty): the `DASLLAMA_METAL_PREFILL_SKIP` families above; `""` restores
+//! full math. Switchable between measurement windows, same contract as `set_metal_decode_skip`.
+def public set_metal_prefill_skip(v : string) {
+    g_pf_skip = v
+}
+
+// cumulative per-stage prefill wall since load/reset — the pp chase harness's numbers rail
+var private g_pf_stage_prefills = 0l
+var private g_pf_stage_setup_us = 0l
+var private g_pf_stage_encwait_us = 0l
+var private g_pf_stage_encode_ms = 0.0lf
+var private g_pf_stage_gpu_ms = 0.0lf
+var private g_pf_stage_rb_us = 0l
+
+//! Zero the cumulative prefill stage timers + the served-prefill counter — windows a chase run's
+//! stage stats to one measurement loop (mirrors `metal_decode_stage_reset`).
+def public metal_prefill_stage_reset {
+    g_pf_stage_prefills = 0l
+    g_pf_stage_setup_us = 0l
+    g_pf_stage_encwait_us = 0l
+    g_pf_stage_encode_ms = 0.0lf
+    g_pf_stage_gpu_ms = 0.0lf
+    g_pf_stage_rb_us = 0l
+}
+
+//! Cumulative per-stage prefill wall since load/reset — (prefills served, CPU setup us, encode us,
+//! commit+wait us minus encode, GPU-timestamp us within the window, kv+readback us). Mirrors
+//! `metal_decode_stage_stats`.
+def public metal_prefill_stage_stats() : tuple<prefills : int64; setup_us : int64; encode_us : int64; wait_us : int64; gpu_us : double; readback_us : int64> {
+    let enc_us = int64(g_pf_stage_encode_ms * 1000.0lf)
+    return (prefills = g_pf_stage_prefills, setup_us = g_pf_stage_setup_us,
+        encode_us = enc_us, wait_us = g_pf_stage_encwait_us - enc_us,
+        gpu_us = g_pf_stage_gpu_ms * 1000.0lf, readback_us = g_pf_stage_rb_us)
 }
 
 //! (gpu prefills served, declines to the CPU path) since load — diagnostics / tests. The decline
@@ -4500,6 +4705,18 @@ def public metal_prefill_shutdown {
         metal_release(g_pf_pso_mm)
         g_pf_pso_mm = null
     }
+    if (g_pf_pso_bf16_mm != null) {
+        metal_release(g_pf_pso_bf16_mm)
+        g_pf_pso_bf16_mm = null
+    }
+    if (g_pf_pso_ple_gather != null) {
+        metal_release(g_pf_pso_ple_gather)
+        g_pf_pso_ple_gather = null
+    }
+    if (g_pf_pso_ple_finish != null) {
+        metal_release(g_pf_pso_ple_finish)
+        g_pf_pso_ple_finish = null
+    }
     for (pso in [g_pso_kq_mm4, g_pso_kq_mm5, g_pso_kq_mm6, g_pf_pso_kq4, g_pf_pso_kq5, g_pf_pso_kq6,
                  g_pf_pso_moe_router, g_pf_pso_moe_router_b, g_pf_pso_moe_select, g_pf_pso_moe_count, g_pf_pso_moe_prefix,
                  g_pf_pso_moe_bucket, g_pf_pso_moe_reduce, g_pf_pso_moe_mm_q8, g_pf_pso_moe_mm_k4,
@@ -4535,10 +4752,6 @@ def public metal_prefill_shutdown {
     if (g_pf_mx4_vtab != null) {
         metal_release(g_pf_mx4_vtab)
         g_pf_mx4_vtab = null
-    }
-    if (g_pf_e8m0_tab != null) {
-        metal_release(g_pf_e8m0_tab)
-        g_pf_e8m0_tab = null
     }
     if (g_pso_qkmm != null) {
         metal_release(g_pso_qkmm)
@@ -4615,6 +4828,9 @@ def private metal_prefill_init : bool {
     g_pf_pso_cat2 = pf_compile_pso(metal_pf_cat2_msl, metal_pf_cat2_msl_entry, metal_pf_cat2_msl_fastmath, ok)
     g_pf_pso_add = pf_compile_pso(metal_add_msl, metal_add_msl_entry, metal_add_msl_fastmath, ok)
     g_pf_pso_mm = pf_compile_pso(metal_q8_mulmm_msl, metal_q8_mulmm_msl_entry, metal_q8_mulmm_msl_fastmath, ok)
+    g_pf_pso_bf16_mm = pf_compile_pso(metal_bf16_mulmm_msl, metal_bf16_mulmm_msl_entry, metal_bf16_mulmm_msl_fastmath, ok)
+    g_pf_pso_ple_gather = pf_compile_pso(metal_ple_gather_q8_msl, metal_ple_gather_q8_msl_entry, metal_ple_gather_q8_msl_fastmath, ok)
+    g_pf_pso_ple_finish = pf_compile_pso(metal_ple_finish_msl, metal_ple_finish_msl_entry, metal_ple_finish_msl_fastmath, ok)
     g_pso_kq_mm4 = pf_compile_pso(metal_kq_mulmm_k4_msl, metal_kq_mulmm_k4_msl_entry, metal_kq_mulmm_k4_msl_fastmath, ok)
     g_pso_kq_mm5 = pf_compile_pso(metal_kq_mulmm_k5_msl, metal_kq_mulmm_k5_msl_entry, metal_kq_mulmm_k5_msl_fastmath, ok)
     g_pso_kq_mm6 = pf_compile_pso(metal_kq_mulmm_k6_msl, metal_kq_mulmm_k6_msl_entry, metal_kq_mulmm_k6_msl_fastmath, ok)
@@ -4650,13 +4866,6 @@ def private metal_prefill_init : bool {
     g_pf_pso_dn_ba = pf_compile_pso(metal_dn_ba_msl, metal_dn_ba_msl_entry, metal_dn_ba_msl_fastmath, ok)
     g_pf_pso_sigmul = pf_compile_pso(metal_sigmul_msl, metal_sigmul_msl_entry, metal_sigmul_msl_fastmath, ok)
     g_pf_pso_axpy_sig = pf_compile_pso(metal_axpy_sig_msl, metal_axpy_sig_msl_entry, metal_axpy_sig_msl_fastmath, ok)
-    g_pf_e8m0_tab = metal_new_buffer(g_pf_dev, 1024ul)
-    unsafe {
-        var ep = reinterpret<uint?>(metal_buffer_contents(g_pf_e8m0_tab))
-        for (ei in range(256)) {
-            ep[ei] = ei < 2 ? (0x00200000u << uint(ei)) : (uint(ei - 1) << 23u)
-        }
-    }
     g_pf_mx4_vtab = metal_new_buffer(g_pf_dev, 64ul)
     unsafe {
         var vp = reinterpret<float?>(metal_buffer_contents(g_pf_mx4_vtab))
@@ -4692,6 +4901,10 @@ def private pf_upload_region(src : void?; bytes : uint64) : MetalBuffer? {
 // one tensor's slice of the whole-model blob on THIS driver's device (blob_of's pf twin)
 def private pf_blob_of(t : Model; off : int64) : tuple<buf : MetalBuffer?; boff : uint64> {
     return blob_of(g_pf_dev, t, off)
+}
+
+def private pf_bf16_of(t : Model; off : int64) : tuple<buf : MetalBuffer?; boff : uint64> {
+    return bf16_of(g_pf_dev, t, off)
 }
 
 def private pf_uniform_u32(v : uint) : MetalBuffer? {
@@ -4793,15 +5006,18 @@ def private prefill_decline(t : Model; s : Session; npos, start_pos : int64) : M
 // grid (mp/32 token tiles, d/64 output tiles). Requires d % 64 == 0 and mp % 64 == 0.
 // yoff places the K/V outputs past a continuation's existing panel rows.
 def private enc_gemm_mm(enc : MetalComputeEncoder?; bwblob : MetalBuffer?; wboff : uint64; bx, by, bk, bn : MetalBuffer?; mp, d : int64; yoff : uint64 = 0ul) {
-    metal_set_pipeline(enc, g_pf_pso_mm)
-    metal_set_threadgroup_memory_length(enc, metal_q8_mulmm_msl_tgmem, 0)
-    metal_set_buffer(enc, bwblob, wboff, 0)
-    metal_set_buffer(enc, bwblob, wboff, 1)
-    metal_set_buffer(enc, bx, 0ul, 2)
-    metal_set_buffer(enc, by, yoff, 3)
-    metal_set_buffer(enc, bk, 0ul, 4)
-    metal_set_buffer(enc, bn, 0ul, 5)
-    metal_dispatch_threadgroups(enc, uint3(uint(mp / 32l), uint(d / 64l), 1u), uint3(128u, 1u, 1u))
+    kn_pipeline(enc, g_pf_pso_mm)
+    kn_tgmem(enc, metal_q8_mulmm_msl_tgmem, 0)
+    kn_buffer(enc, bwblob, wboff, 0)
+    kn_buffer(enc, bwblob, wboff, 1)
+    kn_buffer(enc, bx, 0ul, 2)
+    kn_buffer(enc, by, yoff, 3)
+    kn_buffer(enc, bk, 0ul, 4)
+    kn_buffer(enc, bn, 0ul, 5)
+    hz_read(bx)
+    hz_write(by, yoff, uint64(mp * d * 4l))
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint(mp / 32l), uint(d / 64l), 1u), uint3(128u, 1u, 1u))
 }
 
 def private pf_fmt_at(a : array<KqFmt>; l : int64) : KqFmt => empty(a) ? KqFmt.q8 : a[l]
@@ -4814,21 +5030,24 @@ def private pf_enc_kq_site_mm(enc : MetalComputeEncoder?; t : Model; fmt : KqFmt
     let bq = kq_quants_of(g_pf_dev, t, fmt, woff)
     let bs = kq_scales_of(g_pf_dev, t, fmt, woff)
     if (fmt == KqFmt.k6) {
-        metal_set_pipeline(enc, g_pso_kq_mm6)
-        metal_set_threadgroup_memory_length(enc, metal_kq_mulmm_k6_msl_tgmem, 0)
-        metal_set_buffer(enc, bs.buf, bs.doff, 0)
+        kn_pipeline(enc, g_pso_kq_mm6)
+        kn_tgmem(enc, metal_kq_mulmm_k6_msl_tgmem, 0)
+        kn_buffer(enc, bs.buf, bs.doff, 0)
     } else {
-        metal_set_pipeline(enc, fmt == KqFmt.k4 ? g_pso_kq_mm4 : g_pso_kq_mm5)
-        metal_set_threadgroup_memory_length(enc, fmt == KqFmt.k4 ? metal_kq_mulmm_k4_msl_tgmem : metal_kq_mulmm_k5_msl_tgmem, 0)
-        metal_set_buffer(enc, bs.buf, bs.soff, 0)
+        kn_pipeline(enc, fmt == KqFmt.k4 ? g_pso_kq_mm4 : g_pso_kq_mm5)
+        kn_tgmem(enc, fmt == KqFmt.k4 ? metal_kq_mulmm_k4_msl_tgmem : metal_kq_mulmm_k5_msl_tgmem, 0)
+        kn_buffer(enc, bs.buf, bs.soff, 0)
     }
-    metal_set_buffer(enc, bs.buf, bs.soff, 1)
-    metal_set_buffer(enc, bq.buf, bq.qoff, 2)
-    metal_set_buffer(enc, bx, 0ul, 3)
-    metal_set_buffer(enc, by, yoff, 4)
-    metal_set_buffer(enc, bk, 0ul, 5)
-    metal_set_buffer(enc, bn, 0ul, 6)
-    metal_dispatch_threadgroups(enc, uint3(uint(mp / 32l), uint(rows / 64l), 1u), uint3(128u, 1u, 1u))
+    kn_buffer(enc, bs.buf, bs.soff, 1)
+    kn_buffer(enc, bq.buf, bq.qoff, 2)
+    kn_buffer(enc, bx, 0ul, 3)
+    kn_buffer(enc, by, yoff, 4)
+    kn_buffer(enc, bk, 0ul, 5)
+    kn_buffer(enc, bn, 0ul, 6)
+    hz_read(bx)
+    hz_write(by, yoff, uint64(mp * rows * 4l))
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint(mp / 32l), uint(rows / 64l), 1u), uint3(128u, 1u, 1u))
 }
 
 // the kq classifier GEMV (one f32 row against the [vocab x dim] kq plane) — the moved decode
@@ -4838,56 +5057,68 @@ def private pf_enc_kq_gemv(enc : MetalComputeEncoder?; t : Model; fmt : KqFmt; w
     let bq = kq_quants_of(g_pf_dev, t, fmt, woff)
     let bs = kq_scales_of(g_pf_dev, t, fmt, woff)
     if (fmt == KqFmt.k6) {
-        metal_set_pipeline(enc, g_pf_pso_kq6)
-        metal_set_buffer(enc, bs.buf, bs.doff, 0)
+        kn_pipeline(enc, g_pf_pso_kq6)
+        kn_buffer(enc, bs.buf, bs.doff, 0)
     } else {
-        metal_set_pipeline(enc, fmt == KqFmt.k4 ? g_pf_pso_kq4 : g_pf_pso_kq5)
-        metal_set_buffer(enc, bs.buf, bs.soff, 0)
+        kn_pipeline(enc, fmt == KqFmt.k4 ? g_pf_pso_kq4 : g_pf_pso_kq5)
+        kn_buffer(enc, bs.buf, bs.soff, 0)
     }
-    metal_set_buffer(enc, bs.buf, bs.soff, 1)
-    metal_set_buffer(enc, bq.buf, bq.qoff, 2)
-    metal_set_buffer(enc, bx, xoff, 3)
-    metal_set_buffer(enc, by, 0ul, 4)
-    metal_set_buffer(enc, bn, 0ul, 5)
-    metal_set_buffer(enc, bd, 0ul, 6)
-    metal_dispatch_threadgroups(enc, uint3(uint((rows + 3l) / 4l), 1u, 1u), uint3(64u, 1u, 1u))
+    kn_buffer(enc, bs.buf, bs.soff, 1)
+    kn_buffer(enc, bq.buf, bq.qoff, 2)
+    kn_buffer(enc, bx, xoff, 3)
+    kn_buffer(enc, by, 0ul, 4)
+    kn_buffer(enc, bn, 0ul, 5)
+    kn_buffer(enc, bd, 0ul, 6)
+    hz_read(bx)
+    hz_write(by, 0ul, uint64(rows * 4l))
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint((rows + 3l) / 4l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
 
 def private pf_enc_rms(enc : MetalComputeEncoder?; bx, bw, by, bdim, beps : MetalBuffer?; nrows : int64) {
-    metal_set_pipeline(enc, g_pf_pso_rms)
-    metal_set_threadgroup_memory_length(enc, metal_rmsnorm_msl_tgmem, 0)
-    metal_set_buffer(enc, bx, 0ul, 0)
-    metal_set_buffer(enc, bw, 0ul, 1)
-    metal_set_buffer(enc, by, 0ul, 2)
-    metal_set_buffer(enc, bdim, 0ul, 3)
-    metal_set_buffer(enc, beps, 0ul, 4)
-    metal_dispatch_threadgroups(enc, uint3(uint(nrows), 1u, 1u), uint3(256u, 1u, 1u))
+    kn_pipeline(enc, g_pf_pso_rms)
+    kn_tgmem(enc, metal_rmsnorm_msl_tgmem, 0)
+    kn_buffer(enc, bx, 0ul, 0)
+    kn_buffer(enc, bw, 0ul, 1)
+    kn_buffer(enc, by, 0ul, 2)
+    kn_buffer(enc, bdim, 0ul, 3)
+    kn_buffer(enc, beps, 0ul, 4)
+    hz_read(bx)
+    hz_write(by)
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint(nrows), 1u, 1u), uint3(256u, 1u, 1u))
 }
 
 // the final rmsnorm on ONE row: bx bound at the last position's byte offset (one threadgroup)
 def private enc_rms_last(enc : MetalComputeEncoder?; bx : MetalBuffer?; xoff : uint64; bw, by, bdim, beps : MetalBuffer?) {
-    metal_set_pipeline(enc, g_pf_pso_rms)
-    metal_set_threadgroup_memory_length(enc, metal_rmsnorm_msl_tgmem, 0)
-    metal_set_buffer(enc, bx, xoff, 0)
-    metal_set_buffer(enc, bw, 0ul, 1)
-    metal_set_buffer(enc, by, 0ul, 2)
-    metal_set_buffer(enc, bdim, 0ul, 3)
-    metal_set_buffer(enc, beps, 0ul, 4)
-    metal_dispatch_threadgroups(enc, uint3(1u, 1u, 1u), uint3(256u, 1u, 1u))
+    kn_pipeline(enc, g_pf_pso_rms)
+    kn_tgmem(enc, metal_rmsnorm_msl_tgmem, 0)
+    kn_buffer(enc, bx, xoff, 0)
+    kn_buffer(enc, bw, 0ul, 1)
+    kn_buffer(enc, by, 0ul, 2)
+    kn_buffer(enc, bdim, 0ul, 3)
+    kn_buffer(enc, beps, 0ul, 4)
+    hz_read(bx)
+    hz_write(by)
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(1u, 1u, 1u), uint3(256u, 1u, 1u))
 }
 
 // the classifier GEMV: d rows of logits, 4 rows (one simdgroup each) per threadgroup — the
 // blob slice binds through both views at the classifier's byte offset
 def private pf_enc_gemv(enc : MetalComputeEncoder?; bw : MetalBuffer?; boff : uint64; bx, by, bn, bd : MetalBuffer?; d : int64) {
-    metal_set_pipeline(enc, g_pf_pso_gemv)
-    metal_set_buffer(enc, bw, boff, 0)   // half-scale view
-    metal_set_buffer(enc, bw, boff, 1)   // byte view
-    metal_set_buffer(enc, bx, 0ul, 2)
-    metal_set_buffer(enc, by, 0ul, 3)
-    metal_set_buffer(enc, bn, 0ul, 4)
-    metal_set_buffer(enc, bd, 0ul, 5)
-    metal_dispatch_threadgroups(enc, uint3(uint((d + 3l) / 4l), 1u, 1u), uint3(128u, 1u, 1u))
+    kn_pipeline(enc, g_pf_pso_gemv)
+    kn_buffer(enc, bw, boff, 0)   // half-scale view
+    kn_buffer(enc, bw, boff, 1)   // byte view
+    kn_buffer(enc, bx, 0ul, 2)
+    kn_buffer(enc, by, 0ul, 3)
+    kn_buffer(enc, bn, 0ul, 4)
+    kn_buffer(enc, bd, 0ul, 5)
+    hz_read(bx)
+    hz_write(by, 0ul, uint64(d * 4l))
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint((d + 3l) / 4l), 1u, 1u), uint3(128u, 1u, 1u))
 }
 
 // ===== MoE prefill encoders (Wave C stage 2b) =====
@@ -4897,46 +5128,63 @@ def private pf_enc_moe_route(enc : MetalComputeEncoder?; t : Model; l : int64;
                              bx, blg, bsel, bcnt, bbase, bbkt, binv, bdim, bne, bnk, bgm, brb, bhasb, btot, bnp : MetalBuffer?; npos : int64) {
     let c = t.config
     var bw_rt = pf_upload_region(unsafe(addr < void? >(t.fblob[t.router_off + l * c.n_expert * c.dim])), uint64(c.n_expert * c.dim * 4l))
-    metal_set_pipeline(enc, g_pf_pso_moe_router_b)
-    metal_set_buffer(enc, bw_rt, 0ul, 0)
-    metal_set_buffer(enc, bx, 0ul, 1)
-    metal_set_buffer(enc, blg, 0ul, 2)
-    metal_set_buffer(enc, bdim, 0ul, 3)
-    metal_set_buffer(enc, bne, 0ul, 4)
-    metal_set_buffer(enc, bdim, 0ul, 5)   // per-position x stride = dim
-    metal_set_buffer(enc, brb, 0ul, 6)
-    metal_set_buffer(enc, bhasb, 0ul, 7)
-    metal_set_buffer(enc, bnp, 0ul, 8)
-    metal_dispatch_threadgroups(enc, uint3(uint((c.n_expert + 3l) / 4l), uint((npos + 7l) / 8l), 1u), uint3(128u, 1u, 1u))
+    kn_pipeline(enc, g_pf_pso_moe_router_b)
+    kn_buffer(enc, bw_rt, 0ul, 0)
+    kn_buffer(enc, bx, 0ul, 1)
+    kn_buffer(enc, blg, 0ul, 2)
+    kn_buffer(enc, bdim, 0ul, 3)
+    kn_buffer(enc, bne, 0ul, 4)
+    kn_buffer(enc, bdim, 0ul, 5)   // per-position x stride = dim
+    kn_buffer(enc, brb, 0ul, 6)
+    kn_buffer(enc, bhasb, 0ul, 7)
+    kn_buffer(enc, bnp, 0ul, 8)
+    hz_read(bx)
+    hz_write(blg)
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint((c.n_expert + 3l) / 4l), uint((npos + 7l) / 8l), 1u), uint3(128u, 1u, 1u))
     return if (g_pf_skip == "moe_only_router")   // attribution: router GEMV alone, no select/CSR
-    metal_set_pipeline(enc, g_pf_pso_moe_select)
-    metal_set_buffer(enc, blg, 0ul, 0)
-    metal_set_buffer(enc, bsel, 0ul, 1)
-    metal_set_buffer(enc, bsel, 0ul, 2)
-    metal_set_buffer(enc, bne, 0ul, 3)
-    metal_set_buffer(enc, bnk, 0ul, 4)
-    metal_set_buffer(enc, bgm, 0ul, 5)
-    metal_dispatch_threadgroups(enc, uint3(uint(npos), 1u, 1u), uint3(32u, 1u, 1u))
+    kn_pipeline(enc, g_pf_pso_moe_select)
+    kn_buffer(enc, blg, 0ul, 0)
+    kn_buffer(enc, bsel, 0ul, 1)
+    kn_buffer(enc, bsel, 0ul, 2)
+    kn_buffer(enc, bne, 0ul, 3)
+    kn_buffer(enc, bnk, 0ul, 4)
+    kn_buffer(enc, bgm, 0ul, 5)
+    hz_read(blg)
+    hz_write(bsel)
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint(npos), 1u, 1u), uint3(32u, 1u, 1u))
     return if (g_pf_skip == "moe_only_sel")   // attribution: router + select, no CSR
-    metal_set_pipeline(enc, g_pf_pso_moe_count)
-    metal_set_buffer(enc, bsel, 0ul, 0)
-    metal_set_buffer(enc, bcnt, 0ul, 1)
-    metal_set_buffer(enc, btot, 0ul, 2)
-    metal_set_buffer(enc, bnk, 0ul, 3)
-    metal_dispatch_threadgroups(enc, uint3(uint(c.n_expert), 1u, 1u), uint3(32u, 1u, 1u))
-    metal_set_pipeline(enc, g_pf_pso_moe_prefix)
-    metal_set_buffer(enc, bcnt, 0ul, 0)
-    metal_set_buffer(enc, bbase, 0ul, 1)
-    metal_set_buffer(enc, bne, 0ul, 2)
-    metal_dispatch_threadgroups(enc, uint3(1u, 1u, 1u), uint3(32u, 1u, 1u))
-    metal_set_pipeline(enc, g_pf_pso_moe_bucket)
-    metal_set_buffer(enc, bsel, 0ul, 0)
-    metal_set_buffer(enc, bbase, 0ul, 1)
-    metal_set_buffer(enc, bbkt, 0ul, 2)
-    metal_set_buffer(enc, binv, 0ul, 3)
-    metal_set_buffer(enc, btot, 0ul, 4)
-    metal_set_buffer(enc, bnk, 0ul, 5)
-    metal_dispatch_threadgroups(enc, uint3(uint(c.n_expert), 1u, 1u), uint3(32u, 1u, 1u))
+    kn_pipeline(enc, g_pf_pso_moe_count)
+    kn_buffer(enc, bsel, 0ul, 0)
+    kn_buffer(enc, bcnt, 0ul, 1)
+    kn_buffer(enc, btot, 0ul, 2)
+    kn_buffer(enc, bnk, 0ul, 3)
+    hz_read(bsel)
+    hz_write(bcnt)
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint(c.n_expert), 1u, 1u), uint3(32u, 1u, 1u))
+    kn_pipeline(enc, g_pf_pso_moe_prefix)
+    kn_buffer(enc, bcnt, 0ul, 0)
+    kn_buffer(enc, bbase, 0ul, 1)
+    kn_buffer(enc, bne, 0ul, 2)
+    hz_read(bcnt)
+    hz_write(bbase)
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(1u, 1u, 1u), uint3(32u, 1u, 1u))
+    kn_pipeline(enc, g_pf_pso_moe_bucket)
+    kn_buffer(enc, bsel, 0ul, 0)
+    kn_buffer(enc, bbase, 0ul, 1)
+    kn_buffer(enc, bbkt, 0ul, 2)
+    kn_buffer(enc, binv, 0ul, 3)
+    kn_buffer(enc, btot, 0ul, 4)
+    kn_buffer(enc, bnk, 0ul, 5)
+    hz_read(bsel)
+    hz_read(bbase)
+    hz_write(bbkt)
+    hz_write(binv)
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint(c.n_expert), 1u, 1u), uint3(32u, 1u, 1u))
 }
 
 // one gathered expert mul_mm site: grid (ceil(npos/32) tiles, rows/64, ne experts); the twin
@@ -4947,67 +5195,85 @@ def private pf_enc_moe_mm(enc : MetalComputeEncoder?; t : Model; fmt : KqFmt; st
     let ne = t.config.n_expert
     if (fmt == KqFmt.q8) {
         let bw = pf_blob_of(t, stack_off)
-        metal_set_pipeline(enc, g_pf_pso_moe_mm_q8)
-        metal_set_threadgroup_memory_length(enc, metal_moe_mulmm_q8_msl_tgmem, 0)
-        metal_set_buffer(enc, bw.buf, bw.boff, 0)
-        metal_set_buffer(enc, bw.buf, bw.boff, 1)
-        metal_set_buffer(enc, bx, 0ul, 2)
-        metal_set_buffer(enc, by, 0ul, 3)
-        metal_set_buffer(enc, bkdim, 0ul, 4)
-        metal_set_buffer(enc, bndim, 0ul, 5)
-        metal_set_buffer(enc, bcnt, 0ul, 6)
-        metal_set_buffer(enc, bbase, 0ul, 7)
-        metal_set_buffer(enc, bbkt, 0ul, 8)
-        metal_set_buffer(enc, bes, 0ul, 9)
-        metal_set_buffer(enc, bnk, 0ul, 10)
-        metal_set_buffer(enc, bgather, 0ul, 11)
-        metal_dispatch_threadgroups(enc, uint3(uint(tiles), uint(rows / 64l), uint(ne)), uint3(128u, 1u, 1u))
+        kn_pipeline(enc, g_pf_pso_moe_mm_q8)
+        kn_tgmem(enc, metal_moe_mulmm_q8_msl_tgmem, 0)
+        kn_buffer(enc, bw.buf, bw.boff, 0)
+        kn_buffer(enc, bw.buf, bw.boff, 1)
+        kn_buffer(enc, bx, 0ul, 2)
+        kn_buffer(enc, by, 0ul, 3)
+        kn_buffer(enc, bkdim, 0ul, 4)
+        kn_buffer(enc, bndim, 0ul, 5)
+        kn_buffer(enc, bcnt, 0ul, 6)
+        kn_buffer(enc, bbase, 0ul, 7)
+        kn_buffer(enc, bbkt, 0ul, 8)
+        kn_buffer(enc, bes, 0ul, 9)
+        kn_buffer(enc, bnk, 0ul, 10)
+        kn_buffer(enc, bgather, 0ul, 11)
+        hz_read(bx)
+        hz_read(bcnt)
+        hz_read(bbase)
+        hz_read(bbkt)
+        hz_write(by)
+        hz_gate(enc)
+        kn_dispatch(enc, uint3(uint(tiles), uint(rows / 64l), uint(ne)), uint3(128u, 1u, 1u))
     } elif (fmt == KqFmt.q51) {
         let qp = q51_planes_of(g_pf_dev, t, stack_off)
-        metal_set_pipeline(enc, g_pf_pso_moe_mm_q51)
-        metal_set_threadgroup_memory_length(enc, metal_moe_mulmm_q51_msl_tgmem, 0)
-        metal_set_buffer(enc, qp.sbuf, qp.soff, 0)
-        metal_set_buffer(enc, qp.qbuf, qp.qoff, 1)
-        metal_set_buffer(enc, bx, 0ul, 2)
-        metal_set_buffer(enc, by, 0ul, 3)
-        metal_set_buffer(enc, bkdim, 0ul, 4)
-        metal_set_buffer(enc, bndim, 0ul, 5)
-        metal_set_buffer(enc, bcnt, 0ul, 6)
-        metal_set_buffer(enc, bbase, 0ul, 7)
-        metal_set_buffer(enc, bbkt, 0ul, 8)
-        metal_set_buffer(enc, bes, 0ul, 9)
-        metal_set_buffer(enc, bnk, 0ul, 10)
-        metal_set_buffer(enc, bgather, 0ul, 11)
-        metal_dispatch_threadgroups(enc, uint3(uint(tiles), uint(rows / 64l), uint(ne)), uint3(128u, 1u, 1u))
+        kn_pipeline(enc, g_pf_pso_moe_mm_q51)
+        kn_tgmem(enc, metal_moe_mulmm_q51_msl_tgmem, 0)
+        kn_buffer(enc, qp.sbuf, qp.soff, 0)
+        kn_buffer(enc, qp.qbuf, qp.qoff, 1)
+        kn_buffer(enc, bx, 0ul, 2)
+        kn_buffer(enc, by, 0ul, 3)
+        kn_buffer(enc, bkdim, 0ul, 4)
+        kn_buffer(enc, bndim, 0ul, 5)
+        kn_buffer(enc, bcnt, 0ul, 6)
+        kn_buffer(enc, bbase, 0ul, 7)
+        kn_buffer(enc, bbkt, 0ul, 8)
+        kn_buffer(enc, bes, 0ul, 9)
+        kn_buffer(enc, bnk, 0ul, 10)
+        kn_buffer(enc, bgather, 0ul, 11)
+        hz_read(bx)
+        hz_read(bcnt)
+        hz_read(bbase)
+        hz_read(bbkt)
+        hz_write(by)
+        hz_gate(enc)
+        kn_dispatch(enc, uint3(uint(tiles), uint(rows / 64l), uint(ne)), uint3(128u, 1u, 1u))
     } else {
         let bq = kq_quants_of(g_pf_dev, t, fmt, stack_off)
         let bs = kq_scales_of(g_pf_dev, t, fmt, stack_off)
         if (fmt == KqFmt.k6) {
-            metal_set_pipeline(enc, g_pf_pso_moe_mm_k6)
-            metal_set_threadgroup_memory_length(enc, metal_moe_mulmm_k6_msl_tgmem, 0)
-            metal_set_buffer(enc, bs.buf, bs.doff, 0)
+            kn_pipeline(enc, g_pf_pso_moe_mm_k6)
+            kn_tgmem(enc, metal_moe_mulmm_k6_msl_tgmem, 0)
+            kn_buffer(enc, bs.buf, bs.doff, 0)
         } elif (fmt == KqFmt.k4) {
-            metal_set_pipeline(enc, g_pf_pso_moe_mm_k4)
-            metal_set_threadgroup_memory_length(enc, metal_moe_mulmm_k4_msl_tgmem, 0)
-            metal_set_buffer(enc, bs.buf, bs.soff, 0)
+            kn_pipeline(enc, g_pf_pso_moe_mm_k4)
+            kn_tgmem(enc, metal_moe_mulmm_k4_msl_tgmem, 0)
+            kn_buffer(enc, bs.buf, bs.soff, 0)
         } else {
-            metal_set_pipeline(enc, g_pf_pso_moe_mm_k5)
-            metal_set_threadgroup_memory_length(enc, metal_moe_mulmm_k5_msl_tgmem, 0)
-            metal_set_buffer(enc, bs.buf, bs.soff, 0)
+            kn_pipeline(enc, g_pf_pso_moe_mm_k5)
+            kn_tgmem(enc, metal_moe_mulmm_k5_msl_tgmem, 0)
+            kn_buffer(enc, bs.buf, bs.soff, 0)
         }
-        metal_set_buffer(enc, bs.buf, bs.soff, 1)
-        metal_set_buffer(enc, bq.buf, bq.qoff, 2)
-        metal_set_buffer(enc, bx, 0ul, 3)
-        metal_set_buffer(enc, by, 0ul, 4)
-        metal_set_buffer(enc, bkdim, 0ul, 5)
-        metal_set_buffer(enc, bndim, 0ul, 6)
-        metal_set_buffer(enc, bcnt, 0ul, 7)
-        metal_set_buffer(enc, bbase, 0ul, 8)
-        metal_set_buffer(enc, bbkt, 0ul, 9)
-        metal_set_buffer(enc, bes, 0ul, 10)
-        metal_set_buffer(enc, bnk, 0ul, 11)
-        metal_set_buffer(enc, bgather, 0ul, 12)
-        metal_dispatch_threadgroups(enc, uint3(uint(tiles), uint(rows / 64l), uint(ne)), uint3(128u, 1u, 1u))
+        kn_buffer(enc, bs.buf, bs.soff, 1)
+        kn_buffer(enc, bq.buf, bq.qoff, 2)
+        kn_buffer(enc, bx, 0ul, 3)
+        kn_buffer(enc, by, 0ul, 4)
+        kn_buffer(enc, bkdim, 0ul, 5)
+        kn_buffer(enc, bndim, 0ul, 6)
+        kn_buffer(enc, bcnt, 0ul, 7)
+        kn_buffer(enc, bbase, 0ul, 8)
+        kn_buffer(enc, bbkt, 0ul, 9)
+        kn_buffer(enc, bes, 0ul, 10)
+        kn_buffer(enc, bnk, 0ul, 11)
+        kn_buffer(enc, bgather, 0ul, 12)
+        hz_read(bx)
+        hz_read(bcnt)
+        hz_read(bbase)
+        hz_read(bbkt)
+        hz_write(by)
+        hz_gate(enc)
+        kn_dispatch(enc, uint3(uint(tiles), uint(rows / 64l), uint(ne)), uint3(128u, 1u, 1u))
     }
 }
 
@@ -5018,104 +5284,129 @@ def private pf_enc_moe_mm_mx4(enc : MetalComputeEncoder?; t : Model; stack_off, 
     let tiles = (npos + 31l) / 32l
     let ne = t.config.n_expert
     let mp = mx4_of(g_pf_dev, t, stack_off)
-    metal_set_pipeline(enc, g_pf_pso_moe_mm_mx4)
-    metal_set_threadgroup_memory_length(enc, metal_moe_mulmm_mx4_msl_tgmem, 0)
-    metal_set_buffer(enc, mp.qbuf, mp.qoff, 0)
-    metal_set_buffer(enc, mp.sbuf, mp.soff, 1)
-    metal_set_buffer(enc, bx, 0ul, 2)
-    metal_set_buffer(enc, by, 0ul, 3)
-    metal_set_buffer(enc, bkdim, 0ul, 4)
-    metal_set_buffer(enc, bndim, 0ul, 5)
-    metal_set_buffer(enc, bcnt, 0ul, 6)
-    metal_set_buffer(enc, bbase, 0ul, 7)
-    metal_set_buffer(enc, bbkt, 0ul, 8)
-    metal_set_buffer(enc, beblk, 0ul, 9)
-    metal_set_buffer(enc, bnk, 0ul, 10)
-    metal_set_buffer(enc, bgather, 0ul, 11)
-    metal_set_buffer(enc, g_pf_e8m0_tab, 0ul, 12)
-    metal_set_buffer(enc, g_pf_mx4_vtab, 0ul, 13)
-    metal_dispatch_threadgroups(enc, uint3(uint(tiles), uint(rows / 64l), uint(ne)), uint3(128u, 1u, 1u))
+    kn_pipeline(enc, g_pf_pso_moe_mm_mx4)
+    kn_tgmem(enc, metal_moe_mulmm_mx4_msl_tgmem, 0)
+    kn_buffer(enc, mp.qbuf, mp.qoff, 0)
+    kn_buffer(enc, mp.sbuf, mp.soff, 1)
+    kn_buffer(enc, bx, 0ul, 2)
+    kn_buffer(enc, by, 0ul, 3)
+    kn_buffer(enc, bkdim, 0ul, 4)
+    kn_buffer(enc, bndim, 0ul, 5)
+    kn_buffer(enc, bcnt, 0ul, 6)
+    kn_buffer(enc, bbase, 0ul, 7)
+    kn_buffer(enc, bbkt, 0ul, 8)
+    kn_buffer(enc, beblk, 0ul, 9)
+    kn_buffer(enc, bnk, 0ul, 10)
+    kn_buffer(enc, bgather, 0ul, 11)
+    kn_buffer(enc, g_pf_mx4_vtab, 0ul, 13)
+    hz_read(bx)
+    hz_read(bcnt)
+    hz_read(bbase)
+    hz_read(bbkt)
+    hz_write(by)
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint(tiles), uint(rows / 64l), uint(ne)), uint3(128u, 1u, 1u))
 }
 
 // the per-expert bias over the padded bucket rows (ggml_add_id order — before the reduce)
 def private pf_enc_moe_bias_rows(enc : MetalComputeEncoder?; by, bwb, bcnt, bbase, bd : MetalBuffer?; d, npos, ne : int64) {
-    metal_set_pipeline(enc, g_pf_pso_moe_bias_rows)
-    metal_set_buffer(enc, by, 0ul, 0)
-    metal_set_buffer(enc, bwb, 0ul, 1)
-    metal_set_buffer(enc, bcnt, 0ul, 2)
-    metal_set_buffer(enc, bbase, 0ul, 3)
-    metal_set_buffer(enc, bd, 0ul, 4)
-    metal_dispatch_threadgroups(enc, uint3(uint((d + 255l) / 256l), uint(npos), uint(ne)), uint3(256u, 1u, 1u))
+    kn_pipeline(enc, g_pf_pso_moe_bias_rows)
+    kn_buffer(enc, by, 0ul, 0)
+    kn_buffer(enc, bwb, 0ul, 1)
+    kn_buffer(enc, bcnt, 0ul, 2)
+    kn_buffer(enc, bbase, 0ul, 3)
+    kn_buffer(enc, bd, 0ul, 4)
+    hz_read(bcnt)
+    hz_read(bbase)
+    hz_write(by)
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint((d + 255l) / 256l), uint(npos), uint(ne)), uint3(256u, 1u, 1u))
 }
 
 def private pf_enc_g4_router_norm(enc : MetalComputeEncoder?; bx, brs, by, bdim, beps, binvd : MetalBuffer?; npos : int64) {
-    metal_set_pipeline(enc, g_pf_pso_g4rnorm)
-    metal_set_threadgroup_memory_length(enc, metal_g4_router_norm_msl_tgmem, 0)
-    metal_set_buffer(enc, bx, 0ul, 0)
-    metal_set_buffer(enc, brs, 0ul, 1)
-    metal_set_buffer(enc, by, 0ul, 2)
-    metal_set_buffer(enc, bdim, 0ul, 3)
-    metal_set_buffer(enc, beps, 0ul, 4)
-    metal_set_buffer(enc, binvd, 0ul, 5)
-    metal_dispatch_threadgroups(enc, uint3(uint(npos), 1u, 1u), uint3(256u, 1u, 1u))
+    kn_pipeline(enc, g_pf_pso_g4rnorm)
+    kn_tgmem(enc, metal_g4_router_norm_msl_tgmem, 0)
+    kn_buffer(enc, bx, 0ul, 0)
+    kn_buffer(enc, brs, 0ul, 1)
+    kn_buffer(enc, by, 0ul, 2)
+    kn_buffer(enc, bdim, 0ul, 3)
+    kn_buffer(enc, beps, 0ul, 4)
+    kn_buffer(enc, binvd, 0ul, 5)
+    hz_read(bx)
+    hz_write(by)
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint(npos), 1u, 1u), uint3(256u, 1u, 1u))
 }
 
 // gemma4 per-expert down-scale fold over the selection rows
 def private pf_enc_moe_wscale(enc : MetalComputeEncoder?; bsel, bds, bnk : MetalBuffer?; npos : int64) {
-    metal_set_pipeline(enc, g_pf_pso_moe_wscale)
-    metal_set_buffer(enc, bsel, 0ul, 0)
-    metal_set_buffer(enc, bsel, 0ul, 1)
-    metal_set_buffer(enc, bds, 0ul, 2)
-    metal_set_buffer(enc, bnk, 0ul, 3)
-    metal_dispatch_threadgroups(enc, uint3(uint(npos), 1u, 1u), uint3(32u, 1u, 1u))
+    kn_pipeline(enc, g_pf_pso_moe_wscale)
+    kn_buffer(enc, bsel, 0ul, 0)
+    kn_buffer(enc, bsel, 0ul, 1)
+    kn_buffer(enc, bds, 0ul, 2)
+    kn_buffer(enc, bnk, 0ul, 3)
+    hz_write(bsel)
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint(npos), 1u, 1u), uint3(32u, 1u, 1u))
 }
 
 def private pf_enc_moe_reduce(enc : MetalComputeEncoder?; bdn, bsel, binv, by, bdim, bnk : MetalBuffer?; dim, npos : int64) {
-    metal_set_pipeline(enc, g_pf_pso_moe_reduce)
-    metal_set_buffer(enc, bdn, 0ul, 0)
-    metal_set_buffer(enc, bsel, 0ul, 1)   // the float w view — row layout in-kernel
-    metal_set_buffer(enc, binv, 0ul, 2)
-    metal_set_buffer(enc, by, 0ul, 3)
-    metal_set_buffer(enc, bdim, 0ul, 4)
-    metal_set_buffer(enc, bnk, 0ul, 5)
-    metal_dispatch_threadgroups(enc, uint3(uint((dim + 255l) / 256l), uint(npos), 1u), uint3(256u, 1u, 1u))
+    kn_pipeline(enc, g_pf_pso_moe_reduce)
+    kn_buffer(enc, bdn, 0ul, 0)
+    kn_buffer(enc, bsel, 0ul, 1)   // the float w view — row layout in-kernel
+    kn_buffer(enc, binv, 0ul, 2)
+    kn_buffer(enc, by, 0ul, 3)
+    kn_buffer(enc, bdim, 0ul, 4)
+    kn_buffer(enc, bnk, 0ul, 5)
+    hz_read(bdn)
+    hz_read(bsel)
+    hz_read(binv)
+    hz_write(by)
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint((dim + 255l) / 256l), uint(npos), 1u), uint3(256u, 1u, 1u))
 }
 
 def private enc_add_bias_rows(enc : MetalComputeEncoder?; bx, bb, bn, btotal : MetalBuffer?; total : int64; off : uint64 = 0ul) {
-    metal_set_pipeline(enc, g_pso_addbias)
-    metal_set_buffer(enc, bx, off, 0)
-    metal_set_buffer(enc, bb, 0ul, 1)
-    metal_set_buffer(enc, bn, 0ul, 2)
-    metal_set_buffer(enc, btotal, 0ul, 3)
-    metal_dispatch_threadgroups(enc, uint3(uint((total + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
+    kn_pipeline(enc, g_pso_addbias)
+    kn_buffer(enc, bx, off, 0)
+    kn_buffer(enc, bb, 0ul, 1)
+    kn_buffer(enc, bn, 0ul, 2)
+    kn_buffer(enc, btotal, 0ul, 3)
+    hz_write(bx, off, uint64(total * 4l))
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint((total + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
 def private enc_qk_norm_pf(enc : MetalComputeEncoder?; bx, bw, bnq, bkoffe, brstride, bhs, bwoffe, beps, bsoffe : MetalBuffer?; ntg, nrows, hs : int64; off : uint64 = 0ul) {
-    metal_set_pipeline(enc, g_pf_pso_qknorm)
-    metal_set_threadgroup_memory_length(enc, metal_qk_norm_msl_tgmem, 0)
-    metal_set_buffer(enc, bx, off, 0)
-    metal_set_buffer(enc, bw, 0ul, 1)
-    metal_set_buffer(enc, bnq, 0ul, 2)
-    metal_set_buffer(enc, bkoffe, 0ul, 3)
-    metal_set_buffer(enc, brstride, 0ul, 4)
-    metal_set_buffer(enc, bhs, 0ul, 5)
-    metal_set_buffer(enc, bwoffe, 0ul, 6)
-    metal_set_buffer(enc, beps, 0ul, 7)
-    metal_set_buffer(enc, bsoffe, 0ul, 8)
-    metal_dispatch_threadgroups(enc, uint3(uint(ntg), uint(nrows), 1u), uint3(uint(hs), 1u, 1u))
+    kn_pipeline(enc, g_pf_pso_qknorm)
+    kn_tgmem(enc, metal_qk_norm_msl_tgmem, 0)
+    kn_buffer(enc, bx, off, 0)
+    kn_buffer(enc, bw, 0ul, 1)
+    kn_buffer(enc, bnq, 0ul, 2)
+    kn_buffer(enc, bkoffe, 0ul, 3)
+    kn_buffer(enc, brstride, 0ul, 4)
+    kn_buffer(enc, bhs, 0ul, 5)
+    kn_buffer(enc, bwoffe, 0ul, 6)
+    kn_buffer(enc, beps, 0ul, 7)
+    kn_buffer(enc, bsoffe, 0ul, 8)
+    hz_write(bx)
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint(ntg), uint(nrows), 1u), uint3(uint(hs), 1u, 1u))
 }
 
 def private enc_rope(enc : MetalComputeEncoder?; bv, bcos, bsin, bn, bhs, bnpairs, bneox : MetalBuffer?; npairs : int64; off : uint64 = 0ul; brot : MetalBuffer? = null) {
-    metal_set_pipeline(enc, g_pso_rope)
-    metal_set_buffer(enc, bv, off, 0)
-    metal_set_buffer(enc, bcos, 0ul, 1)
-    metal_set_buffer(enc, bsin, 0ul, 2)
-    metal_set_buffer(enc, bn, 0ul, 3)
-    metal_set_buffer(enc, bhs, 0ul, 4)
-    metal_set_buffer(enc, bnpairs, 0ul, 5)
-    metal_set_buffer(enc, bneox, 0ul, 6)
-    metal_set_buffer(enc, brot != null ? brot : bhs, 0ul, 7)   // rot defaults to head_size (full rope)
-    metal_dispatch_threadgroups(enc, uint3(uint((npairs + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
+    kn_pipeline(enc, g_pso_rope)
+    kn_buffer(enc, bv, off, 0)
+    kn_buffer(enc, bcos, 0ul, 1)
+    kn_buffer(enc, bsin, 0ul, 2)
+    kn_buffer(enc, bn, 0ul, 3)
+    kn_buffer(enc, bhs, 0ul, 4)
+    kn_buffer(enc, bnpairs, 0ul, 5)
+    kn_buffer(enc, bneox, 0ul, 6)
+    kn_buffer(enc, brot != null ? brot : bhs, 0ul, 7)   // rot defaults to head_size (full rope)
+    hz_write(bv)
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint((npairs + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
 
@@ -5125,89 +5416,107 @@ def private enc_rope(enc : MetalComputeEncoder?; bv, bcos, bsin, bn, bhs, bnpair
 // The key grid spans nk64 (= np32's value — existing rows + the chunk on a continuation);
 // bqoff/bqrows carry the causal shift and the score slab's row extent.
 def private enc_qk_mm(enc : MetalComputeEncoder?; bq, bk, batt, bqd, bkvd, bhs, bkvm, bnp, bnp32, bscale, bqoff, bqrows, bwin : MetalBuffer?; mp, nk64, heads : int64) {
-    metal_set_pipeline(enc, g_pso_qkmm)
-    metal_set_threadgroup_memory_length(enc, metal_attn_qk_mm_msl_tgmem, 0)
-    metal_set_buffer(enc, bq, 0ul, 0)
-    metal_set_buffer(enc, bk, 0ul, 1)
-    metal_set_buffer(enc, batt, 0ul, 2)
-    metal_set_buffer(enc, bqd, 0ul, 3)
-    metal_set_buffer(enc, bkvd, 0ul, 4)
-    metal_set_buffer(enc, bhs, 0ul, 5)
-    metal_set_buffer(enc, bkvm, 0ul, 6)
-    metal_set_buffer(enc, bnp, 0ul, 7)
-    metal_set_buffer(enc, bnp32, 0ul, 8)
-    metal_set_buffer(enc, bscale, 0ul, 9)
-    metal_set_buffer(enc, bqoff, 0ul, 10)
-    metal_set_buffer(enc, bqrows, 0ul, 11)
-    metal_set_buffer(enc, bwin, 0ul, 12)
-    metal_dispatch_threadgroups(enc, uint3(uint(mp / 32l), uint(nk64 / 64l), uint(heads)), uint3(128u, 1u, 1u))
+    kn_pipeline(enc, g_pso_qkmm)
+    kn_tgmem(enc, metal_attn_qk_mm_msl_tgmem, 0)
+    kn_buffer(enc, bq, 0ul, 0)
+    kn_buffer(enc, bk, 0ul, 1)
+    kn_buffer(enc, batt, 0ul, 2)
+    kn_buffer(enc, bqd, 0ul, 3)
+    kn_buffer(enc, bkvd, 0ul, 4)
+    kn_buffer(enc, bhs, 0ul, 5)
+    kn_buffer(enc, bkvm, 0ul, 6)
+    kn_buffer(enc, bnp, 0ul, 7)
+    kn_buffer(enc, bnp32, 0ul, 8)
+    kn_buffer(enc, bscale, 0ul, 9)
+    kn_buffer(enc, bqoff, 0ul, 10)
+    kn_buffer(enc, bqrows, 0ul, 11)
+    kn_buffer(enc, bwin, 0ul, 12)
+    hz_read(bq)
+    hz_read(bk)
+    hz_write(batt)
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint(mp / 32l), uint(nk64 / 64l), uint(heads)), uint3(128u, 1u, 1u))
 }
 
 def private enc_av_mm(enc : MetalComputeEncoder?; batt, bv, bxb, bqd, bkvd, bhs, bkvm, bnp, bnp32, bqoff, bqrows : MetalBuffer?; mp, heads, head_size : int64) {
-    metal_set_pipeline(enc, g_pso_avmm)
-    metal_set_threadgroup_memory_length(enc, metal_attn_av_mm_msl_tgmem, 0)
-    metal_set_buffer(enc, batt, 0ul, 0)
-    metal_set_buffer(enc, bv, 0ul, 1)
-    metal_set_buffer(enc, bxb, 0ul, 2)
-    metal_set_buffer(enc, bqd, 0ul, 3)
-    metal_set_buffer(enc, bkvd, 0ul, 4)
-    metal_set_buffer(enc, bhs, 0ul, 5)
-    metal_set_buffer(enc, bkvm, 0ul, 6)
-    metal_set_buffer(enc, bnp, 0ul, 7)
-    metal_set_buffer(enc, bnp32, 0ul, 8)
-    metal_set_buffer(enc, bqoff, 0ul, 9)
-    metal_set_buffer(enc, bqrows, 0ul, 10)
-    metal_dispatch_threadgroups(enc, uint3(uint(mp / 32l), uint(head_size / 64l), uint(heads)), uint3(128u, 1u, 1u))
+    kn_pipeline(enc, g_pso_avmm)
+    kn_tgmem(enc, metal_attn_av_mm_msl_tgmem, 0)
+    kn_buffer(enc, batt, 0ul, 0)
+    kn_buffer(enc, bv, 0ul, 1)
+    kn_buffer(enc, bxb, 0ul, 2)
+    kn_buffer(enc, bqd, 0ul, 3)
+    kn_buffer(enc, bkvd, 0ul, 4)
+    kn_buffer(enc, bhs, 0ul, 5)
+    kn_buffer(enc, bkvm, 0ul, 6)
+    kn_buffer(enc, bnp, 0ul, 7)
+    kn_buffer(enc, bnp32, 0ul, 8)
+    kn_buffer(enc, bqoff, 0ul, 9)
+    kn_buffer(enc, bqrows, 0ul, 10)
+    hz_read(batt)
+    hz_read(bv)
+    hz_write(bxb)
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint(mp / 32l), uint(head_size / 64l), uint(heads)), uint3(128u, 1u, 1u))
 }
 
 def private enc_qk(enc : MetalComputeEncoder?; bq, bk, batt, bqd, bkvd, bhs, bkvm, bnp, bnp32, bscale, bqoff, bqrows, bwin : MetalBuffer?; mp, nk64, heads : int64) {
-    metal_set_pipeline(enc, g_pso_qk)
-    metal_set_threadgroup_memory_length(enc, metal_attn_qk_msl_tgmem, 0)
-    metal_set_buffer(enc, bq, 0ul, 0)
-    metal_set_buffer(enc, bk, 0ul, 1)
-    metal_set_buffer(enc, batt, 0ul, 2)
-    metal_set_buffer(enc, bqd, 0ul, 3)
-    metal_set_buffer(enc, bkvd, 0ul, 4)
-    metal_set_buffer(enc, bhs, 0ul, 5)
-    metal_set_buffer(enc, bkvm, 0ul, 6)
-    metal_set_buffer(enc, bnp, 0ul, 7)
-    metal_set_buffer(enc, bnp32, 0ul, 8)
-    metal_set_buffer(enc, bscale, 0ul, 9)
-    metal_set_buffer(enc, bqoff, 0ul, 10)
-    metal_set_buffer(enc, bqrows, 0ul, 11)
-    metal_set_buffer(enc, bwin, 0ul, 12)
-    metal_dispatch_threadgroups(enc, uint3(uint(mp / 32l), uint(nk64 / 32l), uint(heads)), uint3(128u, 1u, 1u))
+    kn_pipeline(enc, g_pso_qk)
+    kn_tgmem(enc, metal_attn_qk_msl_tgmem, 0)
+    kn_buffer(enc, bq, 0ul, 0)
+    kn_buffer(enc, bk, 0ul, 1)
+    kn_buffer(enc, batt, 0ul, 2)
+    kn_buffer(enc, bqd, 0ul, 3)
+    kn_buffer(enc, bkvd, 0ul, 4)
+    kn_buffer(enc, bhs, 0ul, 5)
+    kn_buffer(enc, bkvm, 0ul, 6)
+    kn_buffer(enc, bnp, 0ul, 7)
+    kn_buffer(enc, bnp32, 0ul, 8)
+    kn_buffer(enc, bscale, 0ul, 9)
+    kn_buffer(enc, bqoff, 0ul, 10)
+    kn_buffer(enc, bqrows, 0ul, 11)
+    kn_buffer(enc, bwin, 0ul, 12)
+    hz_read(bq)
+    hz_read(bk)
+    hz_write(batt)
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint(mp / 32l), uint(nk64 / 32l), uint(heads)), uint3(128u, 1u, 1u))
 }
 
 def private enc_softmax(enc : MetalComputeEncoder?; batt, bnp32, bqoff, bqrows, bwin, bcap : MetalBuffer?; npos, heads : int64; bsink : MetalBuffer? = null; bhass : MetalBuffer? = null) {
-    metal_set_pipeline(enc, g_pso_softmax)
-    metal_set_threadgroup_memory_length(enc, metal_attn_softmax_msl_tgmem, 0)
-    metal_set_buffer(enc, batt, 0ul, 0)
-    metal_set_buffer(enc, bnp32, 0ul, 1)
-    metal_set_buffer(enc, bqoff, 0ul, 2)
-    metal_set_buffer(enc, bqrows, 0ul, 3)
-    metal_set_buffer(enc, bwin, 0ul, 4)
-    metal_set_buffer(enc, bcap, 0ul, 5)
-    metal_set_buffer(enc, bsink != null ? bsink : g_pf_one, 0ul, 20)
-    metal_set_buffer(enc, bhass != null ? bhass : g_pf_zero, 0ul, 21)
-    metal_dispatch_threadgroups(enc, uint3(uint(npos), uint(heads), 1u), uint3(128u, 1u, 1u))
+    kn_pipeline(enc, g_pso_softmax)
+    kn_tgmem(enc, metal_attn_softmax_msl_tgmem, 0)
+    kn_buffer(enc, batt, 0ul, 0)
+    kn_buffer(enc, bnp32, 0ul, 1)
+    kn_buffer(enc, bqoff, 0ul, 2)
+    kn_buffer(enc, bqrows, 0ul, 3)
+    kn_buffer(enc, bwin, 0ul, 4)
+    kn_buffer(enc, bcap, 0ul, 5)
+    kn_buffer(enc, bsink != null ? bsink : g_pf_one, 0ul, 20)
+    kn_buffer(enc, bhass != null ? bhass : g_pf_zero, 0ul, 21)
+    hz_write(batt)
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint(npos), uint(heads), 1u), uint3(128u, 1u, 1u))
 }
 
 def private enc_av(enc : MetalComputeEncoder?; batt, bv, bxb, bqd, bkvd, bhs, bkvm, bnp, bnp32, bqoff, bqrows : MetalBuffer?; mp, heads, head_size : int64) {
-    metal_set_pipeline(enc, g_pso_av)
-    metal_set_threadgroup_memory_length(enc, metal_attn_av_msl_tgmem, 0)
-    metal_set_buffer(enc, batt, 0ul, 0)
-    metal_set_buffer(enc, bv, 0ul, 1)
-    metal_set_buffer(enc, bxb, 0ul, 2)
-    metal_set_buffer(enc, bqd, 0ul, 3)
-    metal_set_buffer(enc, bkvd, 0ul, 4)
-    metal_set_buffer(enc, bhs, 0ul, 5)
-    metal_set_buffer(enc, bkvm, 0ul, 6)
-    metal_set_buffer(enc, bnp, 0ul, 7)
-    metal_set_buffer(enc, bnp32, 0ul, 8)
-    metal_set_buffer(enc, bqoff, 0ul, 9)
-    metal_set_buffer(enc, bqrows, 0ul, 10)
-    metal_dispatch_threadgroups(enc, uint3(uint(mp / 32l), uint(head_size / 32l), uint(heads)), uint3(128u, 1u, 1u))
+    kn_pipeline(enc, g_pso_av)
+    kn_tgmem(enc, metal_attn_av_msl_tgmem, 0)
+    kn_buffer(enc, batt, 0ul, 0)
+    kn_buffer(enc, bv, 0ul, 1)
+    kn_buffer(enc, bxb, 0ul, 2)
+    kn_buffer(enc, bqd, 0ul, 3)
+    kn_buffer(enc, bkvd, 0ul, 4)
+    kn_buffer(enc, bhs, 0ul, 5)
+    kn_buffer(enc, bkvm, 0ul, 6)
+    kn_buffer(enc, bnp, 0ul, 7)
+    kn_buffer(enc, bnp32, 0ul, 8)
+    kn_buffer(enc, bqoff, 0ul, 9)
+    kn_buffer(enc, bqrows, 0ul, 10)
+    hz_read(batt)
+    hz_read(bv)
+    hz_write(bxb)
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint(mp / 32l), uint(head_size / 32l), uint(heads)), uint3(128u, 1u, 1u))
 }
 
 // swiglu and add share the (a, b, total) elementwise shape
@@ -5216,130 +5525,182 @@ def private enc_av(enc : MetalComputeEncoder?; batt, bv, bxb, bqd, bkvd, bhs, bk
 
 def private pf_enc_dn_conv(enc : MetalComputeEncoder?; bx, bhist : MetalBuffer?; hoff : uint64;
                            bw, by, bcd, bdconv, bnp : MetalBuffer?; cd, npos : int64) {
-    metal_set_pipeline(enc, g_pf_pso_dn_conv)
-    metal_set_buffer(enc, bx, 0ul, 0)
-    metal_set_buffer(enc, bhist, hoff, 1)
-    metal_set_buffer(enc, bw, 0ul, 2)
-    metal_set_buffer(enc, by, 0ul, 3)
-    metal_set_buffer(enc, bcd, 0ul, 4)
-    metal_set_buffer(enc, bdconv, 0ul, 5)
-    metal_set_buffer(enc, bnp, 0ul, 6)
-    metal_dispatch_threadgroups(enc, uint3(uint((cd + 255l) / 256l), uint(npos), 1u), uint3(256u, 1u, 1u))
+    kn_pipeline(enc, g_pf_pso_dn_conv)
+    kn_buffer(enc, bx, 0ul, 0)
+    kn_buffer(enc, bhist, hoff, 1)
+    kn_buffer(enc, bw, 0ul, 2)
+    kn_buffer(enc, by, 0ul, 3)
+    kn_buffer(enc, bcd, 0ul, 4)
+    kn_buffer(enc, bdconv, 0ul, 5)
+    kn_buffer(enc, bnp, 0ul, 6)
+    hz_read(bx)
+    hz_read(bhist)
+    hz_write(by)
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint((cd + 255l) / 256l), uint(npos), 1u), uint3(256u, 1u, 1u))
 }
 
 def private pf_enc_dn_conv_hist(enc : MetalComputeEncoder?; bx, bhist : MetalBuffer?; hoff : uint64;
                                 bcd, bdconv, bnp : MetalBuffer?; cd : int64; bmid : MetalBuffer?) {
-    metal_set_pipeline(enc, g_pf_pso_dn_hist)
-    metal_set_buffer(enc, bx, 0ul, 0)
-    metal_set_buffer(enc, bhist, hoff, 1)
-    metal_set_buffer(enc, bcd, 0ul, 2)
-    metal_set_buffer(enc, bdconv, 0ul, 3)
-    metal_set_buffer(enc, bnp, 0ul, 4)
-    metal_set_buffer(enc, bhist, hoff, 5)
-    metal_set_buffer(enc, bmid, 0ul, 6)
-    metal_dispatch_threadgroups(enc, uint3(uint((cd + 255l) / 256l), 1u, 1u), uint3(256u, 1u, 1u))
+    kn_pipeline(enc, g_pf_pso_dn_hist)
+    kn_buffer(enc, bx, 0ul, 0)
+    kn_buffer(enc, bhist, hoff, 1)
+    kn_buffer(enc, bcd, 0ul, 2)
+    kn_buffer(enc, bdconv, 0ul, 3)
+    kn_buffer(enc, bnp, 0ul, 4)
+    kn_buffer(enc, bhist, hoff, 5)
+    kn_buffer(enc, bmid, 0ul, 6)
+    hz_read(bx)
+    hz_write(bhist)
+    hz_write(bmid)
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint((cd + 255l) / 256l), 1u, 1u), uint3(256u, 1u, 1u))
 }
 
 def private pf_enc_dn_l2norm(enc : MetalComputeEncoder?; by, bcd, bkd, bds, beps, bqscale : MetalBuffer?; nblk, npos : int64) {
-    metal_set_pipeline(enc, g_pf_pso_dn_l2)
-    metal_set_buffer(enc, by, 0ul, 0)
-    metal_set_buffer(enc, bcd, 0ul, 1)
-    metal_set_buffer(enc, bkd, 0ul, 2)
-    metal_set_buffer(enc, bds, 0ul, 3)
-    metal_set_buffer(enc, beps, 0ul, 4)
-    metal_set_buffer(enc, bqscale, 0ul, 5)
-    metal_dispatch_threadgroups(enc, uint3(uint((nblk + 7l) / 8l), uint(npos), 1u), uint3(256u, 1u, 1u))
+    kn_pipeline(enc, g_pf_pso_dn_l2)
+    kn_buffer(enc, by, 0ul, 0)
+    kn_buffer(enc, bcd, 0ul, 1)
+    kn_buffer(enc, bkd, 0ul, 2)
+    kn_buffer(enc, bds, 0ul, 3)
+    kn_buffer(enc, beps, 0ul, 4)
+    kn_buffer(enc, bqscale, 0ul, 5)
+    hz_write(by)
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint((nblk + 7l) / 8l), uint(npos), 1u), uint3(256u, 1u, 1u))
 }
 
 def private pf_enc_dn_scan(enc : MetalComputeEncoder?; bcv, bst : MetalBuffer?; stoff : uint64;
                            bbraw, bgraw, baa, bdtb, bo, bcd, bkd, bds, bnvh, bnkh, bdi, bnp : MetalBuffer?; ds, nvh : int64;
                            bmid : MetalBuffer?) {
-    metal_set_pipeline(enc, g_pf_pso_dn_scan)
-    metal_set_buffer(enc, bcv, 0ul, 0)
-    metal_set_buffer(enc, bst, stoff, 1)
-    metal_set_buffer(enc, bbraw, 0ul, 2)
-    metal_set_buffer(enc, bgraw, 0ul, 3)
-    metal_set_buffer(enc, baa, 0ul, 4)
-    metal_set_buffer(enc, bdtb, 0ul, 5)
-    metal_set_buffer(enc, bo, 0ul, 6)
-    metal_set_buffer(enc, bcd, 0ul, 7)
-    metal_set_buffer(enc, bkd, 0ul, 8)
-    metal_set_buffer(enc, bds, 0ul, 9)
-    metal_set_buffer(enc, bnvh, 0ul, 10)
-    metal_set_buffer(enc, bnkh, 0ul, 11)
-    metal_set_buffer(enc, bdi, 0ul, 12)
-    metal_set_buffer(enc, bnp, 0ul, 13)
-    metal_set_buffer(enc, bst, stoff, 14)
-    metal_set_buffer(enc, bmid, 0ul, 15)
-    metal_dispatch_threadgroups(enc, uint3(uint(ds / 4l), uint(nvh), 1u), uint3(128u, 1u, 1u))
+    kn_pipeline(enc, g_pf_pso_dn_scan)
+    kn_buffer(enc, bcv, 0ul, 0)
+    kn_buffer(enc, bst, stoff, 1)
+    kn_buffer(enc, bbraw, 0ul, 2)
+    kn_buffer(enc, bgraw, 0ul, 3)
+    kn_buffer(enc, baa, 0ul, 4)
+    kn_buffer(enc, bdtb, 0ul, 5)
+    kn_buffer(enc, bo, 0ul, 6)
+    kn_buffer(enc, bcd, 0ul, 7)
+    kn_buffer(enc, bkd, 0ul, 8)
+    kn_buffer(enc, bds, 0ul, 9)
+    kn_buffer(enc, bnvh, 0ul, 10)
+    kn_buffer(enc, bnkh, 0ul, 11)
+    kn_buffer(enc, bdi, 0ul, 12)
+    kn_buffer(enc, bnp, 0ul, 13)
+    kn_buffer(enc, bst, stoff, 14)
+    kn_buffer(enc, bmid, 0ul, 15)
+    hz_read(bcv)
+    hz_read(bbraw)
+    hz_read(bgraw)
+    hz_read(baa)
+    hz_read(bdtb)
+    hz_write(bo)
+    hz_write(bst)
+    hz_write(bmid)
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint(ds / 4l), uint(nvh), 1u), uint3(128u, 1u, 1u))
 }
 
 def private pf_enc_dn_gate(enc : MetalComputeEncoder?; bo, bz, bwn, bds, bdi, beps : MetalBuffer?; nvh, npos : int64) {
-    metal_set_pipeline(enc, g_pf_pso_dn_gate)
-    metal_set_buffer(enc, bo, 0ul, 0)
-    metal_set_buffer(enc, bz, 0ul, 1)
-    metal_set_buffer(enc, bwn, 0ul, 2)
-    metal_set_buffer(enc, bds, 0ul, 3)
-    metal_set_buffer(enc, bdi, 0ul, 4)
-    metal_set_buffer(enc, beps, 0ul, 5)
-    metal_dispatch_threadgroups(enc, uint3(uint((nvh + 7l) / 8l), uint(npos), 1u), uint3(256u, 1u, 1u))
+    kn_pipeline(enc, g_pf_pso_dn_gate)
+    kn_buffer(enc, bo, 0ul, 0)
+    kn_buffer(enc, bz, 0ul, 1)
+    kn_buffer(enc, bwn, 0ul, 2)
+    kn_buffer(enc, bds, 0ul, 3)
+    kn_buffer(enc, bdi, 0ul, 4)
+    kn_buffer(enc, beps, 0ul, 5)
+    hz_read(bz)
+    hz_write(bo)
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint((nvh + 7l) / 8l), uint(npos), 1u), uint3(256u, 1u, 1u))
 }
 
 def private pf_enc_dn_deint(enc : MetalComputeEncoder?; bqg, bq, bgt, bhs, bqd, bqs : MetalBuffer?; qd, npos : int64) {
-    metal_set_pipeline(enc, g_pf_pso_dn_deint)
-    metal_set_buffer(enc, bqg, 0ul, 0)
-    metal_set_buffer(enc, bq, 0ul, 1)
-    metal_set_buffer(enc, bgt, 0ul, 2)
-    metal_set_buffer(enc, bhs, 0ul, 3)
-    metal_set_buffer(enc, bqd, 0ul, 4)
-    metal_set_buffer(enc, bqs, 0ul, 5)
-    metal_dispatch_threadgroups(enc, uint3(uint((qd + 255l) / 256l), uint(npos), 1u), uint3(256u, 1u, 1u))
+    kn_pipeline(enc, g_pf_pso_dn_deint)
+    kn_buffer(enc, bqg, 0ul, 0)
+    kn_buffer(enc, bq, 0ul, 1)
+    kn_buffer(enc, bgt, 0ul, 2)
+    kn_buffer(enc, bhs, 0ul, 3)
+    kn_buffer(enc, bqd, 0ul, 4)
+    kn_buffer(enc, bqs, 0ul, 5)
+    hz_read(bqg)
+    hz_write(bq)
+    hz_write(bgt)
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint((qd + 255l) / 256l), uint(npos), 1u), uint3(256u, 1u, 1u))
 }
 
 def private pf_enc_dn_ba(enc : MetalComputeEncoder?; bw : MetalBuffer?; boff : uint64; bx, by, bn, bd : MetalBuffer?; d, npos : int64) {
-    metal_set_pipeline(enc, g_pf_pso_dn_ba)
-    metal_set_buffer(enc, bw, boff, 0)   // half-scale view
-    metal_set_buffer(enc, bw, boff, 1)   // byte view — the same blob slice
-    metal_set_buffer(enc, bx, 0ul, 2)
-    metal_set_buffer(enc, by, 0ul, 3)
-    metal_set_buffer(enc, bn, 0ul, 4)
-    metal_set_buffer(enc, bd, 0ul, 5)
-    metal_dispatch_threadgroups(enc, uint3(uint((d + 7l) / 8l), uint(npos), 1u), uint3(256u, 1u, 1u))
+    kn_pipeline(enc, g_pf_pso_dn_ba)
+    kn_buffer(enc, bw, boff, 0)   // half-scale view
+    kn_buffer(enc, bw, boff, 1)   // byte view — the same blob slice
+    kn_buffer(enc, bx, 0ul, 2)
+    kn_buffer(enc, by, 0ul, 3)
+    kn_buffer(enc, bn, 0ul, 4)
+    kn_buffer(enc, bd, 0ul, 5)
+    hz_read(bx)
+    hz_write(by)
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint((d + 7l) / 8l), uint(npos), 1u), uint3(256u, 1u, 1u))
 }
 
 // batched f32-slab GEMV riding MetalMoeRouterB: d rows per position (dn_ba_f32 β/α d = dt_rank;
 // the shexp gate d = 1); y[p*d + row] — the pf_enc_dn_ba layout
 def private pf_enc_slab_gemv_b(enc : MetalComputeEncoder?; bw, bx, by, bn, bd, bnp : MetalBuffer?; d, npos : int64) {
-    metal_set_pipeline(enc, g_pf_pso_moe_router_b)
-    metal_set_buffer(enc, bw, 0ul, 0)
-    metal_set_buffer(enc, bx, 0ul, 1)
-    metal_set_buffer(enc, by, 0ul, 2)
-    metal_set_buffer(enc, bn, 0ul, 3)
-    metal_set_buffer(enc, bd, 0ul, 4)
-    metal_set_buffer(enc, bn, 0ul, 5)   // per-position x stride = dim
-    metal_set_buffer(enc, g_pf_one, 0ul, 6)
-    metal_set_buffer(enc, g_pf_zero, 0ul, 7)
-    metal_set_buffer(enc, bnp, 0ul, 8)
-    metal_dispatch_threadgroups(enc, uint3(uint((d + 3l) / 4l), uint((npos + 7l) / 8l), 1u), uint3(128u, 1u, 1u))
+    kn_pipeline(enc, g_pf_pso_moe_router_b)
+    kn_buffer(enc, bw, 0ul, 0)
+    kn_buffer(enc, bx, 0ul, 1)
+    kn_buffer(enc, by, 0ul, 2)
+    kn_buffer(enc, bn, 0ul, 3)
+    kn_buffer(enc, bd, 0ul, 4)
+    kn_buffer(enc, bn, 0ul, 5)   // per-position x stride = dim
+    kn_buffer(enc, g_pf_one, 0ul, 6)
+    kn_buffer(enc, g_pf_zero, 0ul, 7)
+    kn_buffer(enc, bnp, 0ul, 8)
+    hz_read(bx)
+    hz_write(by)
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint((d + 3l) / 4l), uint((npos + 7l) / 8l), 1u), uint3(128u, 1u, 1u))
 }
 
 def private pf_enc_axpy_sig(enc : MetalComputeEncoder?; by, bx, bg, btot, bdim : MetalBuffer?; total : int64) {
-    metal_set_pipeline(enc, g_pf_pso_axpy_sig)
-    metal_set_buffer(enc, by, 0ul, 0)
-    metal_set_buffer(enc, bx, 0ul, 1)
-    metal_set_buffer(enc, bg, 0ul, 2)
-    metal_set_buffer(enc, btot, 0ul, 3)
-    metal_set_buffer(enc, bdim, 0ul, 4)
-    metal_dispatch_threadgroups(enc, uint3(uint((total + 255l) / 256l), 1u, 1u), uint3(256u, 1u, 1u))
+    kn_pipeline(enc, g_pf_pso_axpy_sig)
+    kn_buffer(enc, by, 0ul, 0)
+    kn_buffer(enc, bx, 0ul, 1)
+    kn_buffer(enc, bg, 0ul, 2)
+    kn_buffer(enc, btot, 0ul, 3)
+    kn_buffer(enc, bdim, 0ul, 4)
+    hz_read(bx)
+    hz_read(bg)
+    hz_write(by)
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint((total + 255l) / 256l), 1u, 1u), uint3(256u, 1u, 1u))
 }
 
 def private pf_enc_ew2(enc : MetalComputeEncoder?; pso : MetalComputePipeline?; ba, bb, btot : MetalBuffer?; total : int64; bascale : MetalBuffer? = null; boff : uint64 = 0ul) {
-    metal_set_pipeline(enc, pso)
-    metal_set_buffer(enc, ba, 0ul, 0)
-    metal_set_buffer(enc, bb, boff, 1)
-    metal_set_buffer(enc, btot, 0ul, 2)
-    metal_set_buffer(enc, bascale != null ? bascale : g_pf_one, 0ul, 3)   // the add's ascale slot (unused by swiglu/geglu)
-    metal_dispatch_threadgroups(enc, uint3(uint((total + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
+    kn_pipeline(enc, pso)
+    kn_buffer(enc, ba, 0ul, 0)
+    kn_buffer(enc, bb, boff, 1)
+    kn_buffer(enc, btot, 0ul, 2)
+    kn_buffer(enc, bascale != null ? bascale : g_pf_one, 0ul, 3)   // the add's ascale slot (unused by swiglu/geglu)
+    hz_read(bb)
+    hz_write(ba)
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint((total + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
+}
+
+// the float4-lane twin (swiglu_oai): grid over total/4 threads — total % 4 == 0 by the callers'
+// 32-row-padded panel contract
+def private pf_enc_ew2_v4(enc : MetalComputeEncoder?; pso : MetalComputePipeline?; ba, bb, btot : MetalBuffer?; total : int64) {
+    kn_pipeline(enc, pso)
+    kn_buffer(enc, ba, 0ul, 0)
+    kn_buffer(enc, bb, 0ul, 1)
+    kn_buffer(enc, btot, 0ul, 2)
+    hz_read(bb)
+    hz_write(ba)
+    hz_gate(enc)
+    kn_dispatch(enc, uint3(uint((total / 4l + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
 }
 
 // the prefill half of the weights-epoch guard (see dasllama_metal_common): flush the module's
@@ -5363,6 +5724,21 @@ def private pf_weight_caches_flush_on_reload {
     g_pf_cache_epoch = weights_epoch()
 }
 
+// GPU-PLE gate (register_ple_gpu_gate): true iff THIS window's metal prefill will engage AND
+// the pre-step kernels cover the model — q8 emb table, kept-bf16 model_proj, slice/shape gates.
+def private metal_ple_pre_gpu_gate(t : Model; s : Session; npos, start_pos : int64) : bool {
+    if (active_prefill_override() != "metal" ||
+            !t.metal_blob || t.ple_emb_fmt != KqFmt.q8 || !t.ple_model_bf16) {
+        return false
+    }
+    let ple = t.config.n_embd_per_layer
+    if (ple % 32l != 0l || ple > 1024l || (t.config.n_layers * ple) % 64l != 0l ||
+            prefill_decline(t, s, npos, start_pos) != MetalPrefillDecline.none) {
+        return false
+    }
+    return metal_prefill_init()
+}
+
 def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) : bool {
     pf_weight_caches_flush_on_reload()
     var why = prefill_decline(t, s, npos, start_pos)
@@ -5370,6 +5746,10 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
         why = MetalPrefillDecline.device
     }
     if (why != MetalPrefillDecline.none) {
+        if (s.ple_gpu_pending) {   // the gate promised a device pre-step — build it on CPU first
+            ple_pre_prefill(t, s, s.ple_gpu_tokens, npos)
+            s.ple_gpu_pending = false
+        }
         if (why == MetalPrefillDecline.feature) {
             decline(why, metal_missing_needs(t, PF_NEEDS_OK))
         } else {
@@ -5515,22 +5895,38 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     // block at one offset); gate outputs pad to mp rows like every GEMM panel
     let plef = has_ple(c)
     let ple_n = c.n_embd_per_layer
+    let ple_all = c.n_layers * ple_n
     let bytes_ple_side = uint64(c.n_layers * npos * ple_n * 4l)
     let bytes_ple_g = uint64(mp * ple_n * 4l)
+    let bytes_ple_proj = uint64(mp * ple_all * 4l)
+    let ple_gpu = plef && s.ple_gpu_pending   // the gate stashed tokens — build the side input on device
     var bple : MetalBuffer?
     var bpleg : MetalBuffer?
+    var bple_proj : MetalBuffer?
+    var bple_tok : MetalBuffer?
     if (plef) {
-        bple = pool_acquire_untracked(g_pf_upool, g_pf_dev, bytes_ple_side)
         bpleg = pool_acquire(g_pf_pool, g_pf_dev, bytes_ple_g)
-        unsafe {
-            // transpose s.ple_inp (position-major, p*all + l*ple) into layer-major blocks
-            var dst = reinterpret<float?>(metal_buffer_contents(bple))
-            let src = addr < float const? >(s.ple_inp[0])
-            let all = c.n_layers * ple_n
-            for (l in range64(c.n_layers)) {
+        if (ple_gpu) {
+            bple = pool_acquire(g_pf_pool, g_pf_dev, bytes_ple_side)
+            bple_proj = pool_acquire(g_pf_pool, g_pf_dev, bytes_ple_proj)
+            bple_tok = pool_acquire_untracked(g_pf_upool, g_pf_dev, uint64(npos * 4l))
+            unsafe {
+                var tp = reinterpret<uint?>(metal_buffer_contents(bple_tok))
                 for (p in range64(npos)) {
-                    memcpy(reinterpret<void?>(dst + (l * npos + p) * ple_n),
-                        reinterpret<void const?>(src + p * all + l * ple_n), int(ple_n * 4l))
+                    tp[p] = uint(s.ple_gpu_tokens[p])
+                }
+            }
+        } else {
+            bple = pool_acquire_untracked(g_pf_upool, g_pf_dev, bytes_ple_side)
+            unsafe {
+                // transpose s.ple_inp (position-major, p*all + l*ple) into layer-major blocks
+                var dst = reinterpret<float?>(metal_buffer_contents(bple))
+                let src = addr < float const? >(s.ple_inp[0])
+                for (l in range64(c.n_layers)) {
+                    for (p in range64(npos)) {
+                        memcpy(reinterpret<void?>(dst + (l * npos + p) * ple_n),
+                            reinterpret<void const?>(src + p * ple_all + l * ple_n), int(ple_n * 4l))
+                    }
                 }
             }
         }
@@ -5638,6 +6034,12 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     // E-series PLE: gate/proj widths + the per-layer geglu ⊙ span
     var u_ple = plef ? pf_uniform_u32(uint(ple_n)) : null
     var u_ple_tot = plef ? pf_uniform_u32(uint(npos * ple_n)) : null
+    var u_ple_np = ple_gpu ? pf_uniform_u32(uint(npos)) : null
+    var u_ple_nl = ple_gpu ? pf_uniform_u32(uint(c.n_layers)) : null
+    var u_ple_all = ple_gpu ? pf_uniform_u32(uint(ple_all)) : null
+    var u_ple_sc0 = ple_gpu ? pf_uniform_f32(sqrt(float(ple_n))) : null
+    var u_ple_isd = ple_gpu ? pf_uniform_f32(1.0 / sqrt(float(dim))) : null
+    var u_ple_is2 = ple_gpu ? pf_uniform_f32(1.0 / sqrt(2.0)) : null
     // the SLIDING-class uniform twins (hetero models — uniform models leave these null and
     // every layer binds the base set)
     var u_qd_sw = hetero ? pf_uniform_u32(uint(qd_sw)) : null
@@ -5721,6 +6123,10 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     let ncb = clamp(int64(pf_env_int("DASLLAMA_METAL_NCB", int((n_enc_layers + 3l) / 4l))), 1l, n_enc_layers)
     let unret = get_env_variable("DASLLAMA_METAL_UNRETAINED") == "1"
     let layers_per_cb = (n_enc_layers + ncb - 1l) / ncb
+    // the capture rail: kn_* record each chunk as a step graph, graph_flush_sched replays on a
+    // CONCURRENT encoder (auto-schedule + hz barriers at real hazards). DASLLAMA_METAL_SCHED=0
+    // keeps capture order; DASLLAMA_METAL_PF_CAPTURE=0 = the direct serial-encode rollback.
+    let cap = get_env_variable("DASLLAMA_METAL_PF_CAPTURE") != "0"
     var cbs : array<MetalCommandBuffer?>
     cbs |> reserve(int(ncb))
     var cb : MetalCommandBuffer?
@@ -5730,37 +6136,98 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
         for (l in range64(n_enc_layers)) {
             if (l % layers_per_cb == 0l) {
                 if (enc != null) {
+                    if (cap) {
+                        graph_flush_sched(enc)
+                    }
                     metal_end_encoding(enc)
                     metal_release(enc)
                     metal_commit(cb)
                     cbs |> push(cb)
                 }
                 cb = unret ? metal_new_command_buffer_unretained(g_pf_queue) : metal_new_command_buffer(g_pf_queue)
-                enc = metal_new_compute_encoder(cb)
+                enc = cap ? metal_new_compute_encoder_concurrent(cb) : metal_new_compute_encoder(cb)
+                if (cap) {
+                    gr_arm(true)
+                }
+            }
+            if (l == 0l && ple_gpu) {
+                // PLE pre-step on device (the serial encoder orders the three stages): q8 token-row
+                // gather (layer-major, sqrt(ple) folded) -> bf16 model_proj GEMM off bx -> rms+combine
+                unsafe {
+                    let bemb = pf_blob_of(t, t.ple_emb_off)
+                    kn_pipeline(enc, g_pf_pso_ple_gather)
+                    kn_buffer(enc, bemb.buf, bemb.boff, 0)
+                    kn_buffer(enc, bemb.buf, bemb.boff, 1)
+                    kn_buffer(enc, bple_tok, 0ul, 2)
+                    kn_buffer(enc, bple, 0ul, 3)
+                    kn_buffer(enc, u_ple_np, 0ul, 4)
+                    kn_buffer(enc, u_ple, 0ul, 5)
+                    kn_buffer(enc, u_ple_nl, 0ul, 6)
+                    kn_buffer(enc, u_ple_sc0, 0ul, 7)
+                    hz_write(bple)
+                    hz_gate(enc)
+                    kn_dispatch(enc, uint3(uint(c.n_layers), uint(npos), 1u), uint3(uint(ple_n), 1u, 1u))
+                    let bwp = pf_bf16_of(t, t.ple_model_off)
+                    kn_pipeline(enc, g_pf_pso_bf16_mm)
+                    kn_tgmem(enc, metal_bf16_mulmm_msl_tgmem, 0)
+                    kn_buffer(enc, bwp.buf, bwp.boff, 0)
+                    kn_buffer(enc, bx, 0ul, 2)
+                    kn_buffer(enc, bple_proj, 0ul, 3)
+                    kn_buffer(enc, u_dim, 0ul, 4)
+                    kn_buffer(enc, u_ple_all, 0ul, 5)
+                    hz_read(bx)
+                    hz_write(bple_proj)
+                    hz_gate(enc)
+                    kn_dispatch(enc, uint3(uint(mp / 32l), uint(ple_all / 64l), 1u), uint3(128u, 1u, 1u))
+                    var bw_pn = pf_upload_region(addr < void? >(t.fblob[t.ple_pnorm_off]), uint64(ple_n * 4l))
+                    kn_pipeline(enc, g_pf_pso_ple_finish)
+                    kn_tgmem(enc, metal_ple_finish_msl_tgmem, 0)
+                    kn_buffer(enc, bple_proj, 0ul, 0)
+                    kn_buffer(enc, bw_pn, 0ul, 1)
+                    kn_buffer(enc, bple, 0ul, 2)
+                    kn_buffer(enc, u_ple_np, 0ul, 3)
+                    kn_buffer(enc, u_ple, 0ul, 4)
+                    kn_buffer(enc, u_ple_nl, 0ul, 5)
+                    kn_buffer(enc, u_ple_isd, 0ul, 6)
+                    kn_buffer(enc, u_eps, 0ul, 7)
+                    kn_buffer(enc, u_ple_is2, 0ul, 8)
+                    hz_read(bple_proj)
+                    hz_write(bple)
+                    hz_gate(enc)
+                    kn_dispatch(enc, uint3(uint(c.n_layers), uint(npos), 1u), uint3(uint(ple_n), 1u, 1u))
+                }
+                s.ple_gpu_pending = false
             }
             if (warm && l == c.n_layers) {
                 // trunk done — save the residual panel (x_b readback + cls read it), then swap
                 // bx to the draft block's eh_proj input; the body below runs the draft layer
                 // verbatim (same uniforms, npos rows, K/V panel + weight arrays at index l)
                 unsafe {
-                    metal_set_pipeline(enc, g_pf_pso_copy)
-                    metal_set_buffer(enc, bwm_res, 0ul, 0)
-                    metal_set_buffer(enc, bx, 0ul, 1)
-                    metal_set_buffer(enc, u_wm_tot, 0ul, 2)
-                    metal_dispatch_threadgroups(enc, uint3(uint((npos * dim + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
+                    kn_pipeline(enc, g_pf_pso_copy)
+                    kn_buffer(enc, bwm_res, 0ul, 0)
+                    kn_buffer(enc, bx, 0ul, 1)
+                    kn_buffer(enc, u_wm_tot, 0ul, 2)
+                    hz_read(bx)
+                    hz_write(bwm_res)
+                    hz_gate(enc)
+                    kn_dispatch(enc, uint3(uint((npos * dim + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
                     var bw_en = pf_upload_region(addr < void? >(t.fblob[t.mtp_enorm_off]), uint64(dim * 4l))
                     pf_enc_rms(enc, bwm_emb, bw_en, bxb, u_dim, u_eps, npos)
                     var bw_fin = pf_upload_region(addr < void? >(t.fblob[t.rms_final_off]), uint64(dim * 4l))
                     pf_enc_rms(enc, bx, bw_fin, bwm_tmp, u_dim, u_eps, npos)
                     var bw_hn = pf_upload_region(addr < void? >(t.fblob[t.mtp_hnorm_off]), uint64(dim * 4l))
                     pf_enc_rms(enc, bwm_tmp, bw_hn, bxb2, u_dim, u_eps, npos)
-                    metal_set_pipeline(enc, g_pf_pso_cat2)
-                    metal_set_buffer(enc, bwm_cat, 0ul, 0)
-                    metal_set_buffer(enc, bxb, 0ul, 1)
-                    metal_set_buffer(enc, bxb2, 0ul, 2)
-                    metal_set_buffer(enc, u_dim, 0ul, 3)
-                    metal_set_buffer(enc, u_wm_tot, 0ul, 4)
-                    metal_dispatch_threadgroups(enc, uint3(uint((npos * dim + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
+                    kn_pipeline(enc, g_pf_pso_cat2)
+                    kn_buffer(enc, bwm_cat, 0ul, 0)
+                    kn_buffer(enc, bxb, 0ul, 1)
+                    kn_buffer(enc, bxb2, 0ul, 2)
+                    kn_buffer(enc, u_dim, 0ul, 3)
+                    kn_buffer(enc, u_wm_tot, 0ul, 4)
+                    hz_read(bxb)
+                    hz_read(bxb2)
+                    hz_write(bwm_cat)
+                    hz_gate(enc)
+                    kn_dispatch(enc, uint3(uint((npos * dim + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
                     if (t.mtp_ehproj_fmt == KqFmt.q8) {
                         let behp = pf_blob_of(t, t.mtp_ehproj_off)
                         enc_gemm_mm(enc, behp.buf, behp.boff, bwm_cat, bx, u_dim2, u_dim, mp, dim)
@@ -5900,11 +6367,14 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                     // panel; v_norm then runs the weightless per-head RMS (ones plane) in place —
                     // the CPU mm_qkv order exactly, BEFORE qk_norm touches k
                     if (!has_wv) {
-                        metal_set_pipeline(enc, g_pf_pso_copy)
-                        metal_set_buffer(enc, bvs[l], koff, 0)
-                        metal_set_buffer(enc, bks[l], koff, 1)
-                        metal_set_buffer(enc, het ? u_vtot_sw : u_vtot, 0ul, 2)
-                        metal_dispatch_threadgroups(enc, uint3(uint((npos * kvd_l + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
+                        kn_pipeline(enc, g_pf_pso_copy)
+                        kn_buffer(enc, bvs[l], koff, 0)
+                        kn_buffer(enc, bks[l], koff, 1)
+                        kn_buffer(enc, het ? u_vtot_sw : u_vtot, 0ul, 2)
+                        hz_read(bks[l])
+                        hz_write(bvs[l], koff, uint64(npos * kvd_l * 4l))
+                        hz_gate(enc)
+                        kn_dispatch(enc, uint3(uint((npos * kvd_l + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
                     }
                     if (c.v_norm) {
                         // MAX-width ones upload: the region cache is address-keyed and both
@@ -6036,8 +6506,10 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                                 u_dim, u_moe_nfe, bmcnt, bmbase, bmbkt, u_moe_eblk, u_moe_nk, u_moe_g1)
                             pf_enc_moe_mm_mx4(enc, t, t.we3_offs[l], c.n_ff_exp, npos, g4moe ? bxb2 : bxb, bmg2,
                                 u_dim, u_moe_nfe, bmcnt, bmbase, bmbkt, u_moe_eblk, u_moe_nk, u_moe_g1)
-                            pf_enc_moe_bias_rows(enc, bmg, bwb1, bmcnt, bmbase, u_moe_nfe, c.n_ff_exp, npos, c.n_expert)
-                            pf_enc_moe_bias_rows(enc, bmg2, bwb3, bmcnt, bmbase, u_moe_nfe, c.n_ff_exp, npos, c.n_expert)
+                            if (g_pf_skip != "moe_bias") {
+                                pf_enc_moe_bias_rows(enc, bmg, bwb1, bmcnt, bmbase, u_moe_nfe, c.n_ff_exp, npos, c.n_expert)
+                                pf_enc_moe_bias_rows(enc, bmg2, bwb3, bmcnt, bmbase, u_moe_nfe, c.n_ff_exp, npos, c.n_expert)
+                            }
                         } else {
                             pf_enc_moe_mm(enc, t, fe1, t.we1_offs[l], c.n_ff_exp, npos, g4moe ? bxb2 : bxb, bmg,
                                 u_dim, u_moe_nfe, bmcnt, bmbase, bmbkt, fe1 == KqFmt.q8 || fe1 == KqFmt.q51 ? u_moe_eblk : u_moe_esb, u_moe_nk, u_moe_g1)
@@ -6054,8 +6526,11 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                     }
                 }
                 if (moe && g_pf_skip != "ew" && g_pf_skip != "nongemm" && g_pf_skip != "moe" && !pf_skip_moe_act()) {
-                    let pso_act = c.ffn_act == FfnAct.swiglu_oai ? g_pf_pso_swiglu_oai : (g4moe ? g_pf_pso_geglu : g_pf_pso_swiglu)
-                    pf_enc_ew2(enc, pso_act, bmg, bmg2, u_moe_ptot, mpad * c.n_ff_exp)
+                    if (c.ffn_act == FfnAct.swiglu_oai) {
+                        pf_enc_ew2_v4(enc, g_pf_pso_swiglu_oai, bmg, bmg2, u_moe_ptot, mpad * c.n_ff_exp)
+                    } else {
+                        pf_enc_ew2(enc, g4moe ? g_pf_pso_geglu : g_pf_pso_swiglu, bmg, bmg2, u_moe_ptot, mpad * c.n_ff_exp)
+                    }
                     if (nsh > 0l) {
                         pf_enc_ew2(enc, g_pf_pso_swiglu, bhb, bhb2, u_moe_shtot, npos * nsh)
                     }
@@ -6067,7 +6542,9 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                             var bwb2 = pf_upload_region(unsafe(addr < void? >(t.fblob[t.web2_off + l * c.n_expert * dim])), uint64(c.n_expert * dim * 4l))
                             pf_enc_moe_mm_mx4(enc, t, t.we2_offs[l], dim, npos, bmg, bmdn,
                                 u_moe_nfe, u_dim, bmcnt, bmbase, bmbkt, u_moe_eblk, u_moe_nk, u_moe_g0)
-                            pf_enc_moe_bias_rows(enc, bmdn, bwb2, bmcnt, bmbase, u_dim, dim, npos, c.n_expert)
+                            if (g_pf_skip != "moe_bias") {
+                                pf_enc_moe_bias_rows(enc, bmdn, bwb2, bmcnt, bmbase, u_dim, dim, npos, c.n_expert)
+                            }
                         } else {
                             pf_enc_moe_mm(enc, t, fe2, t.we2_offs[l], dim, npos, bmg, bmdn,
                                 u_moe_nfe, u_dim, bmcnt, bmbase, bmbkt, fe2 == KqFmt.q8 || fe2 == KqFmt.q51 ? u_moe_eblk : u_moe_esb, u_moe_nk, u_moe_g0)
@@ -6185,21 +6662,28 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                 }
                 if (u_flcap != null) {
                     // final-logit soft cap (gemma2): cap*tanh over the classifier row in place
-                    metal_set_pipeline(enc, g_pf_pso_softcap)
-                    metal_set_buffer(enc, blog, 0ul, 0)
-                    metal_set_buffer(enc, u_vocab, 0ul, 1)
-                    metal_set_buffer(enc, u_flcap, 0ul, 2)
-                    metal_dispatch_threadgroups(enc, uint3(uint((c.vocab_size + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
+                    kn_pipeline(enc, g_pf_pso_softcap)
+                    kn_buffer(enc, blog, 0ul, 0)
+                    kn_buffer(enc, u_vocab, 0ul, 1)
+                    kn_buffer(enc, u_flcap, 0ul, 2)
+                    hz_write(blog)
+                    hz_gate(enc)
+                    kn_dispatch(enc, uint3(uint((c.vocab_size + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
                 }
                 if (bsupp != null) {
                     // gemma4 suppressed ids pin to -1e30 AFTER the cap (the CPU classifier's order)
-                    metal_set_pipeline(enc, g_pf_pso_suppress)
-                    metal_set_buffer(enc, blog, 0ul, 0)
-                    metal_set_buffer(enc, bsupp, 0ul, 1)
-                    metal_set_buffer(enc, u_nsupp, 0ul, 2)
-                    metal_dispatch_threadgroups(enc, uint3(uint((nsupp + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
+                    kn_pipeline(enc, g_pf_pso_suppress)
+                    kn_buffer(enc, blog, 0ul, 0)
+                    kn_buffer(enc, bsupp, 0ul, 1)
+                    kn_buffer(enc, u_nsupp, 0ul, 2)
+                    hz_write(blog)
+                    hz_gate(enc)
+                    kn_dispatch(enc, uint3(uint((nsupp + 63l) / 64l), 1u, 1u), uint3(64u, 1u, 1u))
                 }
             }
+        }
+        if (cap) {
+            graph_flush_sched(enc)
         }
         metal_end_encoding(enc)
         metal_release(enc)
@@ -6378,7 +6862,19 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
         pool_release(g_pf_pool, bvs[l], bytes_kv_l)
     }
     if (plef) {
-        pool_release(g_pf_upool, bple, bytes_ple_side)
+        if (ple_gpu) {
+            pool_release(g_pf_pool, bple, bytes_ple_side)
+            pool_release(g_pf_pool, bple_proj, bytes_ple_proj)
+            pool_release(g_pf_upool, bple_tok, uint64(npos * 4l))
+            pool_release(g_pf_upool, u_ple_np, 4ul)
+            pool_release(g_pf_upool, u_ple_nl, 4ul)
+            pool_release(g_pf_upool, u_ple_all, 4ul)
+            pool_release(g_pf_upool, u_ple_sc0, 4ul)
+            pool_release(g_pf_upool, u_ple_isd, 4ul)
+            pool_release(g_pf_upool, u_ple_is2, 4ul)
+        } else {
+            pool_release(g_pf_upool, bple, bytes_ple_side)
+        }
         pool_release(g_pf_pool, bpleg, bytes_ple_g)
         pool_release(g_pf_upool, u_ple, 4ul)
         pool_release(g_pf_upool, u_ple_tot, 4ul)
@@ -6468,6 +6964,12 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
         pool_release(g_pf_upool, u_flcap, 4ul)
     }
     if (ok) {
+        g_pf_stage_prefills++
+        g_pf_stage_setup_us += int64(setup_us)
+        g_pf_stage_encwait_us += int64(encwait_us)
+        g_pf_stage_encode_ms += encode_ms
+        g_pf_stage_gpu_ms += gpu_ms
+        g_pf_stage_rb_us += readback_us
         let total_us = get_time_usec(ts_all)
         to_log(LOG_INFO, "dasLLAMA metal prefill: npos={npos} gemm=mulmm total={float(total_us) / 1000.0}ms setup={float(setup_us) / 1000.0}ms encode+wait={float(encwait_us) / 1000.0}ms (encode {encode_ms}ms, gpu {gpu_ms}ms) kv+readback={float(readback_us) / 1000.0}ms dispatches={17l * c.n_layers + (gpu_logits ? 2l : 0l)} logits={gpu_logits ? "gpu" : "cpu"}\n")
     }
@@ -6479,6 +6981,7 @@ def dasllama_metal_prefill_register() {
     // registered but dormant: only select_prefill_override("metal") (env rail
     // DASLLAMA_PIN_PREFILL) activates it, and unsupported shapes decline per call
     register_prefill_override("metal", @@metal_prefill_forward)
+    register_ple_gpu_gate(@@metal_ple_pre_gpu_gate)
     if (has_env_variable("DASLLAMA_METAL_PREFILL_SKIP")) {
         g_pf_skip = get_env_variable("DASLLAMA_METAL_PREFILL_SKIP")
         to_log(LOG_WARNING, "dasLLAMA metal prefill: SKIP={g_pf_skip} — timing-attribution mode, output is GARBAGE\n")

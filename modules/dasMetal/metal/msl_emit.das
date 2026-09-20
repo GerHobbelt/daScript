@@ -739,7 +739,12 @@ def private sgmat_zero_fill(sgname : string) : string {
 // float-family (abs also signed-int); min/max take any numeric class. Fastmath is a kernel-level
 // property; single ops stay correctly rounded under MTLMathModeSafe (Phase-4 measured fact).
 let private MSL_MATH_UNARY : table<string> <- {
-    "exp", "log", "sqrt", "rsqrt", "sin", "cos", "tanh", "abs", "saturate", "round"
+    "exp", "log", "exp2", "log2", "sqrt", "rsqrt", "sin", "cos", "tanh", "abs", "saturate", "round"
+}
+
+// daslib/math_bits' same-size bit reinterprets (scalar + 2/3/4-lane) — MSL as_type<T>(x)
+let private MSL_BITCASTS : table<string> <- {
+    "uint_bits_to_float", "int_bits_to_float", "float_bits_to_uint", "float_bits_to_int"
 }
 
 // simdgroup intrinsics, the math whitelist, + the ctor/convert/saturating-narrow family are the
@@ -765,6 +770,18 @@ def private emit_call_value(var ctx : MslCtx; ec : ExprCall?) : string {
         let v = emit_value(ctx, ec.arguments[0])
         note(ctx, "call.math.{cname}.{acls}")
         return "{cname}({v})"
+    }
+    if (key_exists(MSL_BITCASTS, cname)) {
+        if (na != 1) {
+            err(ctx, ec.at, "{cname} takes exactly one argument")
+            return "/*call {cname}*/"
+        }
+        if (reject_cpu_only_width(ctx, ec.at, ec._type)) {
+            return "/*call {cname}*/"
+        }
+        let v = emit_value(ctx, ec.arguments[0])
+        note(ctx, "call.bitcast.{census_class(ec.arguments[0]._type)}.{census_class(ec._type)}")
+        return "as_type<{msl_type_name(ec._type)}>({v})"
     }
     if (cname == "min" || cname == "max") {
         if (na != 2) {
@@ -1048,6 +1065,33 @@ def private emit_tg_store_half4(var ctx : MslCtx; ec : ExprCall?; indent : strin
     lines |> push("{indent}*(threadgroup half4*)({m.msl_name} + ({idx})) = half4({v});")
 }
 
+// tg_store_float4(dst, idx, v): the float twin — `*(threadgroup float4*)(dst + idx) = v;`
+// (idx % 4 == 0 by contract; 16-byte alignment)
+def private emit_tg_store_float4(var ctx : MslCtx; ec : ExprCall?; indent : string; var lines : array<string>) {
+    if (length(ec.arguments) != 3) {
+        err(ctx, ec.at, "tg_store_float4 takes (workgroup array, index, float4)")
+        return
+    }
+    let mem = member_lookup(ctx, ec.arguments[0])
+    if (empty(mem)) {
+        err(ctx, ec.at, "tg_store_float4 destination must be a @workgroup member")
+        return
+    }
+    let m = ctx.members[mem]
+    if (!m.workgroup) {
+        err(ctx, ec.at, "tg_store_float4 destination must be a @workgroup member")
+        return
+    }
+    if (m.elem != "float") {
+        err(ctx, ec.at, "tg_store_float4 destination must be a float workgroup array (got {m.elem})")
+        return
+    }
+    let idx = emit_value(ctx, ec.arguments[1])
+    let v = emit_value(ctx, ec.arguments[2])
+    note(ctx, "call.tg_store_float4")
+    lines |> push("{indent}*(threadgroup float4*)({m.msl_name} + ({idx})) = {v};")
+}
+
 // simdgroup_multiply_accumulate(d, a, b, c) / simdgroup_multiply(d, a, b) — argument-type combos
 // are enforced upstream by the das overload set (all-f32, all-f16, and mac's mixed f32-acc/f16-ab)
 def private emit_sgmat_multiply(var ctx : MslCtx; ec : ExprCall?; indent : string; var lines : array<string>) {
@@ -1261,6 +1305,8 @@ def private emit_stmt(var ctx : MslCtx; e : Expression?; indent : string; var li
             emit_sgmat_load_store(ctx, ec, indent, lines)
         } elif (cname == "tg_store_half4") {
             emit_tg_store_half4(ctx, ec, indent, lines)
+        } elif (cname == "tg_store_float4") {
+            emit_tg_store_float4(ctx, ec, indent, lines)
         } elif (cname == "simdgroup_multiply_accumulate" || cname == "simdgroup_multiply") {
             emit_sgmat_multiply(ctx, ec, indent, lines)
         } else {
