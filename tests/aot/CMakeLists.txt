@@ -94,11 +94,14 @@ FILE(GLOB AOT_DASPEG_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tes
 
 # AOT for dasLLAMA test files
 FILE(GLOB AOT_DASLLAMA_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/dasLLAMA/*.das")
+# _*.das are shared fixture modules (AOT'd via AOT_DASLLAMA_MODULE_FILES below), not scripts
+list(FILTER AOT_DASLLAMA_FILES EXCLUDE REGEX "/_")
 
 # dasLLAMA shared-module library files (required by the tests; AOT'd as a lib so the
 # shared-module functions get one canonical AOT registration matching the runtime).
 # Leaf modules first so cross-module deps resolve.
 SET(AOT_DASLLAMA_MODULE_FILES
+    tests/dasLLAMA/_model_tier.das
     modules/dasLLVM/daslib/aarch64_neon.das
     modules/dasLLVM/daslib/x64_avx.das
     modules/dasLLAMA/dasllama/dasllama_math.das
@@ -124,6 +127,7 @@ SET(AOT_DASLLAMA_MODULE_FILES
     modules/dasLLAMA/dasllama/dasllama_arch_gemma3.das
     modules/dasLLAMA/dasllama/dasllama_arch_gemma4.das
     modules/dasLLAMA/dasllama/dasllama_arch_qwen2moe.das
+    modules/dasLLAMA/dasllama/dasllama_arch_qwen3moe.das
     modules/dasLLAMA/dasllama/dasllama_arch_gptoss.das
     modules/dasLLAMA/dasllama/dasllama_transformer.das
     modules/dasLLAMA/dasllama/dasllama_asr.das
@@ -550,6 +554,8 @@ SET(AOT_LANGUAGE_MODULE_FILES
     tests/language/_glob.das
     tests/language/_helper_foo.das
     tests/language/_inline_unsafe_helper.das
+    tests/language/_lambda_vis_inner.das
+    tests/language/_lambda_vis_mid.das
     tests/language/_operators_derived.das
     tests/language/_operators_parent.das
 )

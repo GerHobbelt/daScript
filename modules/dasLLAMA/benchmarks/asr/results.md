@@ -77,58 +77,79 @@ TSV (all sides): `results_pk_zen2_t16_v3.tsv`. onnx = ORT `intra_op=16`.
 
 TSVs: das `results_pk_ls_m1_t8_jo.tsv`, cli/onnx `results_pk_ls_m1_t8_p0.tsv`.
 
+### Apple M1 Max, 8 threads, whisper tiny — das 2026-07-08 @ `cab95ee9c`; cli/onnx TSV 2026-07-08
+
+| side | mean ms | p50 | p95 |
+|---|---|---|---|
+| das tiny | **117** | **117** | **139** |
+| cli tiny | 129 | 129 | 167 |
+| onnx tiny-int8 | 431 | 421 | 528 |
+
+TSVs: das `results_wh_ls_m1_t8_attnidx.tsv` (best-of-2), cli/onnx sides of
+`results_wh_ls_m1_t8.tsv`. das now leads AMX whisper-cli on short-clip latency (p50 0.91x,
+p95 0.83x), 3.6x faster than onnx-int8. (whisper-tiny p50 117 vs parakeet v2 183 — tiny is
+the quicker dictation model, parakeet the stronger one.)
+
 ## Whisper — das vs whisper-cli (`-bs 1 -bo 1 -nf -ng`)
 
-das = tower q8 + threaded gelu table (`d25a46542`) + decoder q8 (`cb20e2954`: self/cross
-attn + mlp + tied-te logits GEMV + cross_kv). Remaining profiled levers: tower attention
-head-unit raggedness (tiny 6 / turbo 20 units vs lane count — dominates encode), fc1/fc2
-q8 rate gap, mel.
+das = tower q8 + threaded gelu table (`d25a46542`) + decoder q8 (`cb20e2954`) + the
+parakeet-parity opt pass (`8c10b930e`: per-frame threaded mel, threaded f4 cross_kv
+scatters, zero-alloc sessions, hmax+exp4 decode passes) + threaded bias/residual row
+passes (`cb26a05d0`) + flattened tower attention (`cab95ee9c`: (head × query-block)
+units over the slot-indexed team dispatch — killed the head-unit raggedness that
+dominated encode; bit-exact, fingerprints byte-identical).
 
-### Apple M1 Max, 8 threads — both sides 2026-07-07 @ `da4254be9`, interleaved, best-of-2
-
-das rows predate decoder q8 (`cb20e2954`) — re-sweep pending a Parsec-off window.
-
-| model | file | audio s | das ms | cli ms | das/cli |
-|---|---|---|---|---|---|
-| tiny | jfk.wav | 11 | 193 | 122 | 1.58x |
-| tiny | jfk3.wav | 33 | 451 | 298 | 1.52x |
-| tiny | gb1.wav | 199 | 2336 | 1672 | 1.40x |
-| tiny | hp0.wav | 273 | 2972 | 2102 | 1.41x |
-| tiny | hp0x2.wav | 547 | 5932 | 4836 | 1.23x |
-| large-v3-turbo | jfk.wav | 11 | 3311 | 2150 | 1.54x |
-| large-v3-turbo | jfk3.wav | 33 | 6972 | 4494 | 1.55x |
-| large-v3-turbo | gb1.wav | 199 | 29782 | 25415 | 1.17x |
-| large-v3-turbo | hp0.wav | 273 | 41934 | 32878 | 1.28x |
-| large-v3-turbo | hp0x2.wav | 547 | 80689 | 64621 | 1.25x |
-
-TSV (both sides): `results_wh_m1_t8.tsv`.
-
-### AMD EPYC Zen 2, 16 threads — das 2026-07-08 @ `cb20e2954` (decoder q8); cli TSV 2026-07-07
+### Apple M1 Max, 8 threads — das 2026-07-08 @ `cab95ee9c` (flattened tower attention, Parsec off); cli TSV 2026-07-07
 
 | model | file | audio s | das ms | cli ms | onnx ms | das/cli | das/onnx |
 |---|---|---|---|---|---|---|---|
-| tiny | jfk.wav | 11 | 358 | 213 | 643 | 1.68x | **0.56x** |
-| tiny | jfk3.wav | 33 | 828 | 500 | - | 1.66x | - |
-| tiny | gb1.wav | 199 | 4256 | 2845 | - | 1.50x | - |
-| tiny | hp0.wav | 273 | 5366 | 3546 | - | 1.51x | - |
-| tiny | hp0x2.wav | 547 | 10758 | 7327 | - | 1.47x | - |
-| large-v3-turbo | jfk.wav | 11 | 4783 | 6728 | 3730 | **0.71x** | 1.28x |
-| large-v3-turbo | jfk3.wav | 33 | 10015 | 13657 | - | **0.73x** | - |
-| large-v3-turbo | gb1.wav | 199 | 43552 | 76720 | - | **0.57x** | - |
-| large-v3-turbo | hp0.wav | 273 | 62500 | 100852 | - | **0.62x** | - |
-| large-v3-turbo | hp0x2.wav | 547 | 120378 | 189313 | - | **0.64x** | - |
+| tiny | jfk.wav | 11 | 112 | 122 | 463 | **0.92x** | **0.24x** |
+| tiny | jfk3.wav | 33 | 246 | 298 | - | **0.82x** | - |
+| tiny | gb1.wav | 199 | 1173 | 1672 | - | **0.70x** | - |
+| tiny | hp0.wav | 273 | 1523 | 2102 | - | **0.72x** | - |
+| tiny | hp0x2.wav | 547 | 3001 | 4836 | - | **0.62x** | - |
+| large-v3-turbo | jfk.wav | 11 | 2629 | 2150 | 2406 | 1.22x | 1.09x |
+| large-v3-turbo | jfk3.wav | 33 | 5331 | 4494 | - | 1.19x | - |
+| large-v3-turbo | gb1.wav | 199 | 21891 | 25415 | - | **0.86x** | - |
+| large-v3-turbo | hp0.wav | 273 | 32420 | 32878 | - | **0.99x** | - |
+| large-v3-turbo | hp0x2.wav | 547 | 62128 | 64621 | - | **0.96x** | - |
 
-TSVs: das `results_wh_zen2_t16_dq8.tsv`, cli side of `results_wh_zen2_t16.tsv`, onnx
-`results_wh_zen2_t16_onnx.tsv` (2026-07-08). onnx = onnx-community exports, int8, ORT
+TSVs: das `results_wh_m1_t8_attnidx.tsv` (best-of-2), cli side of `results_wh_m1_t8.tsv`,
+onnx `results_wh_m1_t8_onnx.tsv` (jfk-only — single-window adapter). The flattened tower
+attention took the das side another ~9-10% on every row: **tiny now beats AMX cli on ALL
+FIVE rows** (jfk was the last holdout at 1.03x) and turbo wins every row past jfk3
+(hp0 0.99x, hp0x2 0.96x — both were cli's). Clean-window stage (per rep, jfk): tiny
+encode 81.7 (attn_heads 40.4 — the 6-units-on-8-lanes floor is gone; 1.30x on the bucket
+vs the 1.33x theoretical), decode 23.3, cross_kv 5.6; turbo encode 2540 (attn_heads 1048,
+1.22x on the bucket), decode 107, cross_kv 41.
+
+### AMD EPYC Zen 2, 16 threads — das 2026-07-08 @ `cab95ee9c` (flattened tower attention); cli TSV 2026-07-07
+
+| model | file | audio s | das ms | cli ms | onnx ms | das/cli | das/onnx |
+|---|---|---|---|---|---|---|---|
+| tiny | jfk.wav | 11 | 216 | 213 | 643 | 1.01x | **0.34x** |
+| tiny | jfk3.wav | 33 | 520 | 500 | - | 1.04x | - |
+| tiny | gb1.wav | 199 | 2782 | 2845 | - | **0.98x** | - |
+| tiny | hp0.wav | 273 | 3398 | 3546 | - | **0.96x** | - |
+| tiny | hp0x2.wav | 547 | 6841 | 7327 | - | **0.93x** | - |
+| large-v3-turbo | jfk.wav | 11 | 3693 | 6728 | 3730 | **0.55x** | **0.99x** |
+| large-v3-turbo | jfk3.wav | 33 | 7908 | 13657 | - | **0.58x** | - |
+| large-v3-turbo | gb1.wav | 199 | 34182 | 76720 | - | **0.45x** | - |
+| large-v3-turbo | hp0.wav | 273 | 48737 | 100852 | - | **0.48x** | - |
+| large-v3-turbo | hp0x2.wav | 547 | 93820 | 189313 | - | **0.50x** | - |
+
+TSVs: das `results_wh_zen2_t16_attnidx.tsv` (best-of-2), cli side of `results_wh_zen2_t16.tsv`,
+onnx `results_wh_zen2_t16_onnx.tsv` (2026-07-08). onnx = onnx-community exports, int8, ORT
 `intra_op=16` — the adapter is a SINGLE 30 s window (no long-form chunking; >30 s clips
-return truncated/empty text — skipped, `63e2ac191`), so jfk is its only valid row. Decoder q8
-is net-neutral end-to-end on this box (stage A/B, tiny/jfk: logits GEMV 3.8x + cross_kv
-1.6x faster, but the cache-resident per-layer decoder GEMVs run +7-21% SLOWER q8 — AVX2
-int8 dot + requant loses to plain FMA on L2/L3-hot weights without VNNI; decode is ~15% of
-tiny anyway). tiny's real wall = encoder attn head-units (72% of encode at 6 units on 16
-lanes); without AMX the q8 tower wins turbo outright. On the one onnx-comparable row, das
-wins tiny 1.8x while onnx-int8 leads turbo jfk 1.28x (short-clip; no long-file column
-exists to compare).
+return truncated/empty text — skipped, `63e2ac191`), so jfk is its only valid row. The
+flattened tower attention (`cab95ee9c` — (head × query-block) units, slot-indexed score
+scratch, chunk-per-unit team self-serve) took the das side another 12-24% on this box:
+stage probe attn_heads tiny 151 → 66 ms/rep (2.3x; encode 200 → 114) and turbo
+2495 → 1492 ms/rep (1.67x; encode 4361 → 3297). tiny now sits at cli parity short and
+LEADS long (0.93-0.98x, was 1.09-1.33x); turbo's lead widens to 0.45-0.58x and its jfk
+row now edges onnx-int8 (0.99x). das beats onnx-int8 3.0x on the comparable tiny row.
+tiny's next wall is decode (~59 ms/rep vs encode 114); decoder q8 stays net-neutral here
+(logits/cross_kv wins vs cache-hot per-layer GEMV losses — no VNNI).
 
 ## Correctness
 
@@ -142,6 +163,23 @@ exists to compare).
 
 ## Changelog
 
+- 2026-07-08 `cab95ee9c`: flattened tower attention over (head × query-block) units via the
+  new slot-indexed team dispatch (jobque `team_parallel_for_indexed` `9f7b10288` +
+  `maybe_parallel_for_indexed` `3800b2aa4`) — bit-exact (pre/post fingerprints
+  byte-identical, 6 model×wav combos, q8+fp32). zen2 das re-sweep: tiny -14-24%
+  (cli parity short, leads long), turbo -12-14% (0.45-0.58x). M1 re-sweep (Parsec off):
+  das -9-10% every row — whisper tiny beats AMX cli on all five corpus rows + LibriSpeech
+  (p50 117 vs 129), turbo wins everything past jfk3.
+- 2026-07-08 (Parsec-off window): M1 whisper das re-sweep @ `cb26a05d0` (-35-45% vs the
+  07-07 rows — tiny beats AMX cli on 4 of 5 rows) + NEW baselines: M1 whisper onnx-int8
+  jfk columns, LibriSpeech whisper-tiny 3-way. Parakeet das re-check: within noise of the
+  standing 07-07 rows (no table change).
+- 2026-07-08 `cb26a05d0`: threaded bias/residual row passes (the "fc1/fc2 q8 rate gap" —
+  sub-buckets showed single-threaded bias bandwidth, not requant); zen2 turbo -3-5%.
+- 2026-07-08 `8c10b930e`: whisper parakeet-parity opt pass (per-frame threaded mel `a19a9d5ec`,
+  threaded f4 cross_kv scatters `dec9f8656`, phase-0 zero-alloc `3c31be3a0`, decode
+  hmax+exp4 `8c10b930e`); zen2 das re-sweep — tiny -22-25%, turbo -6-8%. M1 whisper table
+  still @ `a97881dfb` pending a Parsec window.
 - 2026-07-08 `cb20e2954`: whisper decoder q8; zen2 das re-sweep — end-to-end neutral there
   (logits/cross_kv wins vs cache-hot GEMV losses), M1 re-sweep pending Parsec window.
 - 2026-07-08 `63e2ac191`: zen2 onnx whisper columns (jfk-only — the onnx-asr whisper
