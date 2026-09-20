@@ -7,6 +7,7 @@ module linq shared public
 
 require math
 require daslib/option public
+require daslib/sort_boost
 
 //! LINQ-style query operations on iterators and arrays.
 //!
@@ -448,6 +449,66 @@ def order_by_descending_to_array(var a : iterator<auto(TT)>; key) : array<TT -co
     return <- arr
 }
 
+// ============================================================================
+// top_n / top_n_by — return the N smallest elements in ascending order.
+//
+// Array source: partial_sort on a clone, then resize to N. O(M log N).
+// Iterator source: bounded heap of size N maintained during scan, then sort.
+// Iteratively O(M log N), max N elements ever resident.
+//
+// For workhorse keys / element types the heap ops route to std::push_heap /
+// std::pop_heap. For user-defined types they route to das_push_heap_r /
+// das_pop_heap_r (byte-pointer heap on the any-cblock path).
+// ============================================================================
+
+def top_n_by(arr : array<auto(TT)>; n : int; key) : array<TT -const -&> {
+    //! Returns the ``n`` smallest elements of ``arr`` by ``key(element)``,
+    //! sorted ascending. ``n <= 0`` or empty ``arr`` yields an empty result.
+    var buf : array<TT -const -&>
+    if (n <= 0 || empty(arr)) return <- buf
+    let take_count = min(n, length(arr))
+    buf |> reserve(length(arr))
+    for (it in arr) {
+        buf |> push_clone(it)
+    }
+    sort_boost::partial_sort(buf, take_count, $(v1, v2) => _::less(key(v1), key(v2)))
+    buf |> resize(take_count)
+    return <- buf
+}
+
+def top_n_by(var a : iterator<auto(TT)>; n : int; key) : array<TT -const -&> {
+    //! Returns the ``n`` smallest elements of an iterator by ``key(element)``,
+    //! sorted ascending. Uses a bounded heap of size ``n`` during the scan;
+    //! at most ``n`` elements resident.
+    var buf : array<TT -const -&>
+    if (n <= 0) return <- buf
+    // No reserve(n) — iterator cardinality is unknown; a caller passing
+    // n >> iter_size would force a large upfront allocation for no win.
+    // Geometric growth during the O(log n) fill phase is amortized O(1).
+    for (it in a) {
+        if (length(buf) < n) {
+            buf |> push_clone(it)
+            sort_boost::push_heap(buf, $(v1, v2) => _::less(key(v1), key(v2)))
+        } elif (_::less(key(it), key(buf[0]))) {
+            sort_boost::pop_heap(buf, $(v1, v2) => _::less(key(v1), key(v2)))
+            buf[length(buf) - 1] := it
+            sort_boost::push_heap(buf, $(v1, v2) => _::less(key(v1), key(v2)))
+        }
+    }
+    sort(buf, $(v1, v2) => _::less(key(v1), key(v2)))
+    return <- buf
+}
+
+def top_n(arr : array<auto(TT)>; n : int) : array<TT -const -&> {
+    //! Returns the ``n`` smallest elements of ``arr`` (by ``<``), sorted ascending.
+    return <- top_n_by(arr, n, $(v : TT -&) => v)
+}
+
+def top_n(var a : iterator<auto(TT)>; n : int) : array<TT -const -&> {
+    //! Returns the ``n`` smallest elements of an iterator (by ``<``), ascending.
+    return <- top_n_by(a, n, $(v : TT -&) => v)
+}
+
 def unique_key(a) {
     //! generates unique key of workhorse type for the value
     static_if (typeinfo is_workhorse(a)) {
@@ -681,7 +742,7 @@ def count(a : array<auto(TT)>; predicate : block<(arg : TT -&) : bool>) : int {
 def long_count(var a : iterator<auto(TT)>) : int64 {
     //! Counts elements in an iterator, using a long integer
     var count = 0l
-    for (it in a) {
+    for (_ in a) {
         count ++
     }
     return count
@@ -1949,8 +2010,12 @@ def private all_impl_const(src : auto(ARGT); tt : auto(TT); predicate : block<(a
     return all_impl(unsafe(reinterpret<ARGT -const>(src)), type<TT -const -&>, predicate)
 }
 
-def all(var src : iterator<auto(TT)>; predicate : block<(arg : TT -&) : bool>) : bool {
+def all(var src : iterator<auto(TT) const>; predicate : block<(arg : TT -&) : bool>) : bool {
     //! Returns true if all elements in the iterator satisfy the predicate
+    //! `const` on the inner element collapses mut-ref and const-ref iterator sources
+    //! (`each(arr)` vs iterator comprehensions) into a single generic instance, sidestepping
+    //! the generic-mangler hash collision (error[50609]) that fires when both flavors
+    //! arise in one module. Full fix lives in the mangler itself (follow-up PR).
     return all_impl(src, type<TT -const -&>, predicate)
 }
 
@@ -2160,8 +2225,9 @@ def private contains_impl_const(src : auto(ARGT); tt : auto(TT); element : TT -&
     return contains_impl(unsafe(reinterpret<ARGT -const>(src)), type<TT -const -&>, element)
 }
 
-def contains(var src : iterator<auto(TT)>; element : TT -&) : bool {
+def contains(var src : iterator<auto(TT) const>; element : TT -&) : bool {
     //! Returns true if the element is present in the iterator
+    //! `const` on the inner element — see comment on `all()` above for the rationale.
     return contains_impl(src, type<TT -const -&>, element)
 }
 
@@ -2738,11 +2804,16 @@ def private chunk_impl(var src; tt : auto(TT); size : int) : array<array<TT -con
     //! Splits an array into chunks of a specified size
     panic("chunk size must be greater than 0") if (size <= 0)
     var buffer : array<array<TT -const -&>>
+    static_if (typeinfo is_array(src) || typeinfo is_dim(src)) {
+        buffer |> reserve((length(src) + size - 1) / size)
+    }
     var inscope chunk : array<TT -const -&>
+    chunk |> reserve(size)
     for (it in src) {
         chunk.push_clone(it)
         if (chunk.length() == size) {
             buffer.emplace(chunk)
+            chunk |> reserve(size)
         }
     }
     if (!empty(chunk)) {
@@ -2885,6 +2956,9 @@ def zip_to_array(var a : iterator<auto(TT)>; var b : iterator<auto(UU)>) : array
 [unused_argument(tt, uu)]
 def private zip_impl(var a; tt : auto(TT); var b; uu : auto(UU); result_selector : block<(l : TT -&; r : UU -&) : auto>) : array<typedecl(result_selector(type<TT>, type<UU>)) -const -&> {
     var buffer : array<typedecl(result_selector(type<TT>, type<UU>)) -const -&>
+    static_if ((typeinfo is_array(a) || typeinfo is_dim(a)) && (typeinfo is_array(b) || typeinfo is_dim(b))) {
+        buffer |> reserve(min(length(a), length(b)))
+    }
     for (itA, itB in a, b) {
         buffer.push_clone(result_selector(itA, itB))
     }

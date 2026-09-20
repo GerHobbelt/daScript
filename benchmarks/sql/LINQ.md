@@ -23,8 +23,13 @@ See `~/.claude/plans/keen-hopping-balloon.md` for the long-form plan.
 | 0 | Rename `_fold` → `_old_fold` in linq_boost; extract `_fold` and `_old_fold` into new `daslib/linq_fold.das` module; `linq_boost` `require linq_fold public` for re-export | ✅ done |
 | 1 | Benchmark suite: 24 files under `benchmarks/sql/`, each 4-way (m1 `_sql` / m3 plain linq / m3f_old `_old_fold` / m3f `_fold`) at 100K rows; baseline numbers captured | ✅ done |
 | 2A | Loop planner — `_fold` emits explicit for-loops for `[where_*][select?]` (array lane) and `[where_*][select?] |> count` (counter lane); anything else falls through unfolded. No comprehensions, no dispatch back to `_old_fold`. | ✅ done |
-| 2B | Aggregate accumulators: `sum`, `min`, `max`, `average`, `first`, `any`, `all`, `long_count`. Also `take`/`skip` in counter/array lane and chained-`_select|_select` fusion (needs `ExprRef2Value`-aware projection substitution) | ⏳ next |
-| 3+ | Buffer-required operators: `distinct`, `sort`, `reverse`, `groupby`, `zip`, `join`. Once we go array, we stay array | ⏳ |
+| 2B Ring 1 | Accumulator lane: `sum`, `min`, `max`, `average`, `long_count` with workhorse `<` / `>` for min/max scalars and `_::less` fallback for tuples/user types. `long_count` shares the count-length shortcut. | ✅ done |
+| 2B Ring 2 | Early-exit lane: `first`, `first_or_default`, `any`, `all`, `contains` via `invoke($block { ... return val })`. Predicate-free `any` gets a `length(src) > 0` shortcut. | ✅ done |
+| 2C Ring 3 | `take(N)` / `skip(N)` in counter/array/accumulator/early-exit lanes. Canonical chain order `[where_*][select*][skip?][take?] |> terminator`. Trailing take/skip (no explicit aggregator) → ARRAY lane with implicit `to_array`. Range-form `take(start..end)` falls through (slice operator, different semantics). Buffer-required ops (`order_by`, `distinct`, `reverse`, `group_by`, `zip`, `join`, `left_join`, `group_join`) recognized by name and emit silent fallback with future-mode markers (BufferTopN / BufferDistinct / BufferReverse / BufferGroupBy / MultiSourceZip / BufferedJoin). | ✅ done |
+| 2C Ring 4 | Non-workhorse chained selects via `:=`-clone. | ✅ done |
+| 2D | Fail-loudly contract — see "Planned" section below | ⏳ |
+| 3 Phase 0 | `<algorithm>` sort-family bindings — `partial_sort`, `nth_element`, `make_heap`/`push_heap`/`pop_heap`. Both typed (19 workhorse types) and any-cblock paths (user structs via `das_qsort_r.h` introselect + binary-heap templates). `daslib/sort_boost.das` user-facing wrappers + `q*` dispatcher macros. `daslib/linq.das` `top_n` / `top_n_by` family (array + iterator sources). C++ tests, daslang tests (53/53), 6 benchmarks, doc grouping, `33_algorithm` tutorial expansion. Unblocks BufferTopN. | ✅ done |
+| 3+ | Buffer-required emit modes: BufferTopN (sort/order_by/take), BufferDistinct, BufferGroupBy, BufferReverse, MultiSourceZip, BufferedJoin. Once we go array, we stay array | ⏳ |
 | 4 | Final coverage pass + docs; full 4-way comparison table refresh; parity-test sweep | ⏳ |
 
 ## Baselines (100K rows, INTERP mode)
@@ -84,10 +89,10 @@ Notation: `—` means the variant is not applicable for this benchmark (operator
 
 | Benchmark | Shape | m3f_old | m3f (Phase 2A) | Delta |
 |---|---|---:|---:|---|
-| count_aggregate | `where → count` | 5 | 5 | parity (same counter loop) |
-| chained_where | `where → where → count` | 17 | 8 | **2.1× faster** (fuses chained wheres into single `&&` predicate) |
-| select_count | `select → count` | 15 | 2 | **7.5× faster** (counter lane evaluates projection per iteration to preserve side effects; optimizer DCEs pure projections, no array materialization) |
-| to_array_filter | `where → select → to_array` | 11 | 11 | parity (after `each(<array>)` peel + reserve + workhorse `push`) |
+| count_aggregate | `where → count` | 5 | 4 | parity-ish (1ns improvement from `each(<array>)` peel) |
+| chained_where | `where → where → count` | 17 | 6 | **2.8× faster** (fuses chained wheres into single `&&` predicate; small gain from peel + const-ref param) |
+| select_count | `select → count` | 15 | 0 | **∞ faster** — when the projection is pure (`has_sideeffects == false`) and the source has length, the counter lane shortcuts to `length(src)` and elides the loop entirely. See [macro_boost::has_sideeffects](../../daslib/macro_boost.das) and `linq_fold.das:plan_loop_or_count` |
+| to_array_filter | `where → select → to_array` | 11 | 10 | parity (after `each(<array>)` peel + reserve + workhorse `push`) |
 
 Shapes outside Phase 2A scope now compile to plain linq (`m3f ≈ m3`). This is an intentional regression vs the historical `_old_fold` numbers — Boris's call ("we let it fall through unfolded, and we see performance issues. im ok being slower until we fix") as the forcing function for Phase 2B+. The previous "m3f = m3f_old (identical by construction)" baseline assumed `_fold` would dispatch to `_old_fold` on the unmatched path; Phase 2A drops that dispatch.
 
@@ -101,6 +106,155 @@ The first cut was 18% slower than the comprehension. Three independent fixes bro
 
 A fourth simplification dropped `emplace` from the emission entirely. emplace **moves** out of its argument and can corrupt the source when the projection returns a ref into it (e.g. `_._field`). The safe pattern is `push` for workhorse (cheap copy) and `push_clone` for non-workhorse (deep clone). No intermediate `var v = projection; emplace(v)` is needed in either case — the planner pushes the projection expression directly.
 
+## Phase 2B Ring 1 — Accumulator lane (2026-05-16)
+
+`_fold` now recognizes `[where_*][select*] |> {sum,min,max,average,long_count}` and emits a single-pass loop with a typed accumulator. New private dispatch infrastructure: `LinqLane` enum + `classify_terminator(name)` route each terminator to per-lane emit helpers (`emit_counter_lane`, `emit_array_lane`, `emit_length_shortcut`, **`emit_accumulator_lane`**); `plan_loop_or_count` is now an analyzer that builds the shared `whereCond` / `intermediateBinds` / `projection` state then dispatches.
+
+**Per-op shapes:**
+- `sum` — `var acc : T = default<T>; for { ...; acc += v }; return acc`. T = projection type (or element type).
+- `long_count` — `var acc : int64 = 0l; for { ...; acc++ }; return acc`. Length shortcut: `int64(length(src))` when no predicate + all pure.
+- `min` / `max` — `var first_iter = true; var best : T; for { ...; let v = ...; if (first_iter) { best := v; first_iter = false } elif (compare) { best := v } }; return best`.
+  - **Workhorse branch** (Boris's call: best perf > emission simplicity, see `feedback_linq_fold_perf_max`): T workhorse → direct `<` / `>`; non-workhorse → `_::less(...)` to preserve user/tuple comparator overloads.
+- `average` — `var sum_acc : T = default<T>; var cnt = 0; for { ...; sum_acc += v; cnt++ }; return double(sum_acc) / double(cnt)`. Returns `double` (matches linq.das line 1358); empty source → NaN.
+
+**Empty-source semantics** match linq.das exactly: sum/long_count → 0; min/max → `default<T>` (never assigned via the first-iter flag); average → div-by-zero NaN.
+
+**Modifier strip on accumulator type.** The element/projection type often carries `const &` (e.g. `int const &` for array elements). The accumulator must be a mutable value, so the planner strips both `flags.constant` and `flags.ref` on the cloned `accType` before emission. Without this, `var acc : int const = ...; acc += x` fails ("numeric operator '+=' left side can't be constant").
+
+### Phase 2B Ring 1 deltas (100K rows, INTERP)
+
+All Ring 1 ops hit single-digit ns/op with **zero allocations** (counter-lane parity).
+
+| Benchmark | Shape | m3f_old | m3f (Ring 1) | Delta |
+|---|---|---:|---:|---|
+| sum_aggregate | `select → sum` | 16 | **2** | **8× faster** |
+| sum_where | `where → select → sum` | 12 | **4** | **3× faster** |
+| min_aggregate | `select → min` | 25 | **6** | **4.2× faster** |
+| max_aggregate | `select → max` | 23 | **6** | **3.8× faster** |
+| average_aggregate | `select → average` | 20 | **5** | **4× faster** |
+| long_count_aggregate (new) | `where → long_count` | 15 | **4** | **3.75× faster** |
+
+The workhorse-branch decision is decisive for min/max: emitting `v < best` directly instead of dispatching through `_::less` cuts the per-element cost roughly in half on int columns. The non-workhorse path (tuples, user types) still goes through `_::less` to preserve overload semantics — see `test_min_non_workhorse_uses_less` in `tests/linq/test_linq_fold_ast.das`.
+
+## Phase 2B Ring 2 — Early-exit lane (2026-05-16)
+
+`_fold` now recognizes `[where_*][select*] |> {first,first_or_default,any,all,contains}` and emits a loop wrapped in `invoke($block { for { ...; return X }; tail }, src)`. The block-level `return` yields the invoke's value as an expression without escaping the user's enclosing function (Boris confirmed the idiom: `$() { ... }` is stack-allocated, no heap). New emit helper `emit_early_exit_lane` and a separate `emit_any_empty_shortcut` for the predicate-free `any` length-bearing shortcut.
+
+**Per-op shapes:**
+- `first` — `for { ...; return val }; panic("sequence contains no elements"); return default<T>` (matches linq.das line 2383; sentinel return makes the typer happy on the post-panic line).
+- `first_or_default(d)` — `let d_bound = d; for { ...; return val }; return d_bound` — eager evaluation of `d` matches linq.das line 2397 (no lazy-vs-eager divergence on observable side effects).
+- `any` — loop emission with `return true` on match, `return false` in tail. Shortcut: `length(src) > 0` when no upstream where + no per-element work + length-bearing source.
+- `all(pred)` — loop with `if (!pred) return false`, tail returns `true` (vacuously true on empty source).
+- `contains(v)` — `let v_bound = v; for { ...; if (it == v_bound) return true }; return false` — `v` bound once at top to avoid re-evaluating an expensive argument.
+
+**Workhorse branch deferred for `contains`**: daslang's `==` already handles tuples and user-defined `operator ==`, so no separate non-workhorse path is needed.
+
+### Phase 2B Ring 2 deltas (100K rows, INTERP)
+
+All Ring 2 ops hit single-digit ns/op with **zero allocations**. Early-exit cases (first hit near the front) collapse to sub-ns per element — true O(1) behavior at scale.
+
+| Benchmark | Shape | m3f_old | m3f (Ring 2) | Delta |
+|---|---|---:|---:|---|
+| first_match | `where → first` | 15 | **0** | early-exit at first hit |
+| first_or_default_match (new) | `where → first_or_default(d)` | 15 | **0** | same |
+| any_match | `where → first_opt`/`any` | 0 | **0** | parity (already sub-ns) |
+| all_match | `count(where ¬p)==0` / `all` | 24 | **3** | **8× faster** |
+| contains_match (new) | `select → contains(v)` | 15 | **2** | **7.5× faster** |
+
+`first` / `first_or_default` collapse to sub-ns/op because the where matches near the front of the array; the early-exit returns at the first hit and per-element timing measures the loop overhead per the chunk_size (100K), not per actual iteration. The same is why `any_match` was already at 0 ns/op pre-Phase-2B — `_old_fold` and m3 also bail early on first match.
+
+## Phase 2C Ring 3 — splice-mode take/skip (2026-05-17)
+
+`_fold` now recognizes the chain shape `[where_*][select*][skip?][take?] |> terminator` and emits the per-element work wrapped with bounded-loop counters. Skip and take guards are spliced into the per-match block (after the optional `where` filter, before the lane-specific work and intermediate projection binds). Counters live alongside the lane's accumulator in the outer invoke block.
+
+**Emission shape (counter lane example, `where(p).skip(K).take(N).count()`):**
+
+```
+invoke($($i(src) : ...) {
+    var <skipRem> = K
+    var <takenCount> = 0
+    var <acc> = 0
+    for (<it> in <src>) {
+        if (p(<it>)) {
+            if (<takenCount> == N) break          // take guard
+            if (<skipRem> > 0) { <skipRem>--; continue }   // skip guard
+            <takenCount>++                         // before lane work — keeps reachable
+                                                   // even for early-exit terminators that
+                                                   // `return X` from per-match
+            <acc>++
+        }
+    }
+    return <acc>
+}, <topExpr>)
+```
+
+Same skeleton across all four lanes — the per-match payload (acc++ / push_clone / `acc += val` / `return X`) is the only thing that varies.
+
+**Chain-shape detection.** New planner state machine on `(seenSelect, seenSkip, seenTake)` accepts the canonical order and rejects reversed forms (`where` after select/skip/take, etc.) — those return null and the chain falls through to plain linq. At most one skip and one take per chain in this phase; multiple of either is a fall-through.
+
+**Take/skip as terminator.** When `take(N).to_array()` or `skip(K).take(N).to_array()` is the chain tail, the `to_array` strip (LinqCall `skip = true` in `linqCalls`) makes the last visible call `take` or `skip`. `classify_terminator` now routes those to ARRAY lane, with the trailing take/skip captured into `takeExpr`/`skipExpr` and the lane emitting implicit-to_array.
+
+**Buffer-required marker arms.** `is_buffer_required_op` recognizes `order_by`/`order`/`order_descending`/`order_by_descending`, `distinct`/`distinct_by`, `reverse`, `group_by`/`group_by_lazy`, `zip`, `join`/`left_join`/`group_join`. These all return null (silent fallback) with a `// TODO Phase 2X: <FutureMode>` comment naming the future emit mode. Future PRs replace each return-null with a dedicated emit path without re-walking the chain-recognition logic. AST tests `test_order_by_take_falls_through` and `test_distinct_falls_through` pin this behavior.
+
+**Range-form `take(start..end)` falls through.** The slice-style overload has different semantics (yield elements at indices `[start, end)`); decomposing to `skip(start).take(end-start)` is correct but introduces an arithmetic dependency the planner doesn't model today. Phase 2C handles only the int-form (`takeArg._type.baseType == Type.tInt`); range form drops to plain linq.
+
+**Reserve refinement.** When `take(N)` is present on a length-bearing source, the array-lane reserve hint tightens from `length(src)` to `min(N, length(src))` (inline `?:` — no `math::min` dep at the user's call site). Prevents over-allocating millions of slots when take cap is small.
+
+### Phase 2C Ring 3 deltas (100K rows, INTERP)
+
+| Benchmark | Shape | m3f_old | m3f (Phase 2C) | Delta |
+|---|---|---:|---:|---|
+| take_count | `take(N).to_array` (N=1000) | 0 | 0 | parity (`_old_fold`'s take iterator already bails early at N) |
+| skip_take | `skip(K).take(N).to_array` (K=10, N=1000) | 23 | **0** | bounded-loop exits after K+N iterations (small vs 100K source) |
+| take_sum_aggregate (new) | `select.take(N).sum` | 14 | **0** | accumulator-lane take splice |
+| take_count_filtered (new) | `where.take(N).count` | 11 | **0** | counter-lane take + where splice |
+
+Sub-ns/op on the three improved benchmarks reflects the bounded-loop nature: per-element timing normalizes to `chunk_size = 100000`, but the actual loop runs ≤ K+N times (≤ 1010 here). The win is asymptotic — `_fold` is O(K+N), `_old_fold` is O(K+N) per inner iterator + N×O(1) wrapper push.
+
+`_old_fold`'s `take_count` at 0 ns/op already reflects iterator-fusion at the linq-runtime layer; the Phase 2C delta there is allocation count (`_fold`: 1 alloc for the result array, `_old_fold`: same with extra take-iterator wrapper). The functional Phase 2C win for that shape is structural — the splice path now emits a single fused loop where `_old_fold` chains iterator instances.
+
+## Phase 2C Ring 4 — chained-select clone via `:=` (2026-05-17)
+
+Pre-Ring-4, the planner rejected any chained `_select|_select|...` chain whose previous projection had a non-workhorse type. Reason given in the source: `<-` (move) corrupts source for lvalue projections like `_._field`. The rejection guard (`prevWorkhorse=false → return null`) was a Phase 2B placeholder.
+
+Resolution in Ring 4 follows from a Boris correctness observation: **`:=` is safe on every type** — byte copy on workhorse, deep-clone on non-workhorse — so a single emission shape (`var $i(bind) := $e(projection)`) covers both cases. The workhorse / non-workhorse branch in chained-bind emission is removed entirely; chained selects of any type now splice through one path.
+
+Concretely: `each(arr)._select(ComplexType(a = [_*2]))._select(_.a[0]).sum()` previously fell through to plain linq (iterator chain + allocation); now splices to a single fused for-loop.
+
+### Workhorse-branch audit
+
+After Ring 4, two workhorse-type branches remain in `linq_fold.das`. Both are intentional:
+
+1. **`fold_select_where` (line ~392), `static_if (typeinfo is_workhorse($e(selectExpr)))`** — used exclusively by `_old_fold`'s frozen baseline path via `g_foldSeq`. Not touched here; changing it would alter the frozen `_old_fold` output and invalidate the `m3f_old` benchmark column.
+2. **`min_max_compare` (line ~746) + caller (line ~933)** — perf-critical. Workhorse types use `<` / `>` directly (single-instruction compare); non-workhorse falls back to `_::less` so user/tuple comparator overloads still apply. Boris's design directive 2026-05-16 explicitly mandates keeping this branch (≈2× per-element on int columns; see PR #2696 numbers).
+
+No further workhorse branches in the splice path.
+
+### Ring 4 deltas
+
+Ring 4 is a correctness gate (chained non-workhorse selects now splice instead of falling through), not a per-benchmark improvement on the existing 100K suite. Coverage tracked via test `test_chained_non_workhorse_select` in `tests/linq/test_linq_fold.das` (3 subtests: int → ComplexType → int → sum / where + ComplexType chain + sum / workhorse → ComplexType → workhorse → max).
+
+## Planned: fail-loudly contract
+
+The current contract: when `_fold` can't splice a chain (out-of-scope terminator, buffer-required op, multiple take/skip, range-form take/skip, etc.), it falls through to plain linq — same as today's master. This is **temporary**. The planned contract (Boris design directive 2026-05-17): `_fold` will emit `macro_error("_fold: cannot splice — <reason>")` for any unsupported shape, mirroring the sqlite_linq `_sql(...)` "splice or error" contract.
+
+When the switch lands, every `m3f` variant currently relying on silent fallback breaks. Approximate accounting from the current benchmark suite (8 affected `m3f` variants), grouped by future emit mode that would resolve each:
+
+| Benchmark | Future mode |
+|---|---|
+| `distinct_count` | BufferDistinct (hash set) |
+| `sort_first` | BufferTopN (order_by + early-exit) |
+| `sort_take` | BufferTopN (order_by + take/skip) |
+| `select_where_order_take` | BufferTopN with predicate prefix |
+| `groupby_count` | BufferGroupBy (hash multi-bucket) |
+| `groupby_sum` | BufferGroupBy + nested fold inside select |
+| `zip_dot_product` | MultiSourceZip (2 cursors advanced lockstep) |
+| `join_count` | BufferedJoin (hash-build + probe) |
+
+The fail-loudly PR will either (a) comment out `m3f` in the affected benchmarks until the corresponding emit mode lands, or (b) deliver one or more emit modes alongside the switch. Decision deferred to that PR.
+
+Tracking issue: the planner's `is_buffer_required_op` recognition + the named-arm `// TODO Phase 2X: <FutureMode>` markers are the in-code TODOs.
+
 ## Operator-coverage checklist (parity tests)
 
 The 24 benchmarks above cover the most common shapes. The end-game target is one benchmark per `_fold`-applicable scenario in the broader `tests/linq/` operator suite. Tracking the long-tail coverage below; PRs that add splice support for new operators should add a benchmark here if not already present.
@@ -108,15 +262,15 @@ The 24 benchmarks above cover the most common shapes. The end-game target is one
 | Source test file | Operator group | Covered by benchmark | Status |
 |---|---|---|---|
 | `test_linq.das` | comprehension basics | count_aggregate, sum_aggregate | ✅ |
-| `test_linq_aggregation.das` | count/sum/min/max/avg/aggregate | count/sum/min/max/average_aggregate, sum_where | ✅ core; `aggregate(seed, fn)` ⏳ |
-| `test_linq_querying.das` | any/all/contains | any_match, all_match | ✅ core; `contains` ⏳ |
+| `test_linq_aggregation.das` | count/sum/min/max/avg/aggregate | count/sum/min/max/average_aggregate, sum_where, long_count_aggregate | ✅ core; `aggregate(seed, fn)` ⏳ |
+| `test_linq_querying.das` | any/all/contains | any_match, all_match, contains_match | ✅ core |
 | `test_linq_transform.das` | select/select_many/zip | to_array_filter, zip_dot_product | ✅ select/zip; `select_many` ⏳ |
 | `test_linq_sorting.das` | order/order_by/reverse | sort_first, sort_take, select_where_order_take | ✅ ascending; `order_descending` + `reverse` ⏳ |
 | `test_linq_group_by.das` | group_by/group_by_lazy/having | groupby_count, groupby_sum | ✅ basic; `having_` ⏳ |
 | `test_linq_join.das` | join/left_join/right_join/full_outer/cross | join_count | ✅ inner; outer joins + cross ⏳ |
-| `test_linq_partition.das` | take/skip/take_while/skip_while/chunk | take_count, skip_take | ✅ take/skip; `_while` + `chunk` ⏳ |
+| `test_linq_partition.das` | take/skip/take_while/skip_while/chunk | take_count, skip_take, take_sum_aggregate, take_count_filtered | ✅ take/skip in splice lanes; `_while` + `chunk` ⏳ |
 | `test_linq_set.das` | distinct/union/except/intersect/unique | distinct_count | ✅ distinct; set ops ⏳ |
-| `test_linq_element.das` | first/last/single/element_at + _or_default | first_match | ✅ first; last/single/element_at ⏳ |
+| `test_linq_element.das` | first/last/single/element_at + _or_default | first_match, first_or_default_match | ✅ first/first_or_default; last/single/element_at ⏳ |
 | `test_linq_concat.das` | concat/prepend/append | — | ⏳ |
 | `test_linq_generation.das` | range/repeat/etc. | — | ⏳ |
 | `test_linq_bugs.das` | regression cases | — | ⏳ as bugs surface |
