@@ -104,24 +104,33 @@ typedef struct {
 
 typedef struct {
     char *      data;
-    uint32_t    size;
-    uint32_t    capacity;
+    uint64_t    size;
+    uint64_t    capacity;
     uint32_t    magic;
     uint32_t    lock;
     uint32_t    flags;
+    // 4 bytes of trailing pad. The C++ Array struct has uint64_t members so its alignment is 8,
+    // and on every supported ABI sizeof(Array) is rounded to 40. Without an explicit pad here,
+    // 32-bit C compilers might tail-pack a following member into this slot and produce a
+    // different sizeof from the C++ side — see the static_asserts in src/misc/daScriptC.cpp.
+    uint32_t    _pad_after_flags;
 } das_array;
 
 // Layout MUST mirror das::Table exactly (Table : Array, then keys/hashes/tombstones).
+// In C++, Table : Array places `keys` at sizeof(Array)==40 because the derived class cannot
+// reuse the base's trailing padding (MSVC convention, and standard layout for non-POD bases).
+// The flat C mirror needs the same _pad_after_flags so `keys` lands at offset 40 on 32-bit too.
 typedef struct {
     char *      data;
-    uint32_t    size;
-    uint32_t    capacity;
+    uint64_t    size;
+    uint64_t    capacity;
     uint32_t    magic;
     uint32_t    lock;
     uint32_t    flags;
+    uint32_t    _pad_after_flags;
     char *      keys;
     uint32_t *  hashes;
-    uint32_t    tombstones;
+    uint64_t    tombstones;
 } das_table;
 
 typedef vec4f (das_interop_function) ( das_context * ctx, das_node * node, vec4f * arguments );
@@ -427,6 +436,15 @@ DAS_CC_API void * das_context_reallocate ( das_context * context, void * ptr, ui
 // 'size' must match the allocation, not that the heap will silently
 // accept it). Passing ptr==NULL is a no-op.
 DAS_CC_API void   das_context_free ( das_context * context, void * ptr, uint32_t size );
+
+// 64-bit-size variants of the context allocators. Behavior identical to the
+// uint32_t entries above, but the byte-count argument is uint64_t so callers
+// can request > 4GB allocations on platforms with a wide enough address space.
+// The uint32_t entries above remain ABI-stable and forward to the same
+// internal allocator after a zero-extending upcast.
+DAS_CC_API void * das_context_allocate_i64 ( das_context * context, uint64_t size );
+DAS_CC_API void * das_context_reallocate_i64 ( das_context * context, void * ptr, uint64_t old_size, uint64_t new_size );
+DAS_CC_API void   das_context_free_i64 ( das_context * context, void * ptr, uint64_t size );
 
 // --- Arrays ---
 // Helpers to construct, populate and pass `array<T>` values from C code.

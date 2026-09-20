@@ -675,6 +675,103 @@ uses runtime operands; the constant case is covered by the CI lint gate.
         return int(m1 | m2)
     }
 
+PERF020 — redundant same-type cast
+====================================
+
+``T(x)`` where ``x`` is already of workhorse type ``T`` is a no-op. The
+cast produces a real ``ExprCall`` node — the parser/typer does NOT elide
+it — so it costs source noise and one call dispatch for zero work.
+
+Fires for the 15 workhorse cast names: ``int``, ``int8``, ``int16``,
+``int64``, ``uint``, ``uint8``, ``uint16``, ``uint64``, ``float``,
+``double``, ``string``, ``bitfield``, ``bitfield8``, ``bitfield16``,
+``bitfield64``. The match is on the call's ``func.name`` /
+``fromGeneric.name`` (so generic instantiations of the cast still
+trigger) combined with a strict ``arg._type.baseType`` equality check
+against the cast's target type. Const / reference / temporary qualifiers
+on the argument are ignored — only ``baseType`` matters.
+
+.. code-block:: das
+
+    // Bad — a is already int64
+    def widen(a : int64) : int64 {
+        return int64(a)                                     // PERF020
+    }
+
+    def field_read(s : SomeStruct) : int64 {
+        return int64(s.value)                               // PERF020 — s.value is int64
+    }
+
+    // Good
+    def widen(a : int64) : int64 {
+        return a
+    }
+
+The rule deliberately does NOT cover:
+
+- User-named bitfield/enum constructors (``MyBitfield(x)``, ``MyEnum(x)``).
+  These are parser-synthesized constructors named after the user type, not
+  the bare workhorse name in the table above; ``MyBitfield(modeVar)``
+  does not match.
+- Vector constructors (``int2``, ``float3``, …). They primarily take
+  componentwise arguments and are excluded by the single-argument gate.
+- ``string(das_string)`` — covered by PERF007 (in comparisons) and
+  PERF012 (passed to ``strings`` functions). ``das_string`` has a
+  distinct ``baseType``, so it does not collide with this rule.
+
+Cross-type casts (widening, narrowing, signedness change, float ↔ int)
+are genuine work and do NOT fire.
+
+PERF021 — hoist common workhorse cast out of ternary
+======================================================
+
+``cond ? T(a) : T(b)`` where both branches apply the **same** workhorse
+cast ``T`` emits two ``ExprCall`` nodes that do identical work regardless
+of which branch is taken. Hoisting the cast outside the ternary collapses
+them to one: ``T(cond ? a : b)``.
+
+Uses the same 15-name workhorse cast set as PERF020. The rule fires only
+when:
+
+- Both ternary branches are calls to the same workhorse cast name (after
+  peeling ``ExprRef2Value``).
+- Both calls share the same target ``Type``.
+- Both arguments share the same ``baseType`` — so the hoisted
+  ``T(cond ? a : b)`` typechecks without an intermediate cast.
+
+If the argument base types differ (e.g. ``cond ? string(intV) :
+string(int64V)``), the rule does NOT fire; the rewrite would need a
+manual widen on one branch and that is left to the author.
+
+.. code-block:: das
+
+    // Bad
+    def to_str(c : bool; a, b : int) : string {
+        return c ? string(a) : string(b)                    // PERF021
+    }
+
+    def widen(c : bool; a, b : int) : int64 {
+        return c ? int64(a) : int64(b)                      // PERF021
+    }
+
+    // Good
+    def to_str(c : bool; a, b : int) : string {
+        return string(c ? a : b)
+    }
+
+    def widen(c : bool; a, b : int) : int64 {
+        return int64(c ? a : b)
+    }
+
+The rewrite is unconditionally safe: the original ternary evaluates
+exactly one of ``a`` / ``b``, and so does the hoisted form — argument
+evaluation count is unchanged. Only the per-branch cast dispatch is
+eliminated.
+
+User-named struct / enum / bitfield constructors (``MyEnum(x)``,
+``Foo(v=x)``) and multi-argument vector constructors (``float2(x, y)``)
+do not match the workhorse cast set and are intentionally out of scope.
+
 .. _style_lint:
 
 -----------

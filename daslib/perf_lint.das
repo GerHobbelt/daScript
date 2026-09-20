@@ -32,6 +32,8 @@ module perf_lint shared private
 //!   PERF017 — length(s) == 0 / != 0 — use empty(s) / !empty(s)
 //!   PERF018 — for (i in range(length(arr))) where i only indexes arr — use 'for (c in arr)'
 //!   PERF019 — int(T.a) | int(T.b) on bitfield-or-enum-with-operator-| — collapse to int(T.a | T.b)
+//!   PERF020 — T(x) where x is already T (workhorse type) — drop the redundant cast
+//!   PERF021 — cond ? T(a) : T(b) on workhorse cast T — hoist to T(cond ? a : b)
 
 require daslib/ast_boost
 require strings
@@ -380,7 +382,7 @@ class PerfLintVisitor : AstVisitor {
         if (inner == null || !(inner is ExprCall)) return null
         let call = inner as ExprCall
         if (call.func == null || empty(call.arguments)) return null
-        let fname = call.func.fromGeneric != null ? string(call.func.fromGeneric.name) : string(call.func.name)
+        let fname = string(call.func.fromGeneric != null ? call.func.fromGeneric.name : call.func.name)
         if (fname != "int") return null
         return call.arguments[0]
     }
@@ -390,7 +392,7 @@ class PerfLintVisitor : AstVisitor {
         //! for the enum represented by `t`. Result is cached on perf019_enum_or_probed / _yes by
         //! intptr(t.enumType) so repeated checks across a large file don't re-walk the function table.
         if (t == null || t.enumType == null) return false
-        let key = uint64(intptr(t.enumType))
+        let key = intptr(t.enumType)
         for (idx in range(length(perf019_enum_or_probed))) {
             return perf019_enum_or_yes |> has_value(key) if (perf019_enum_or_probed[idx] == key)
         }
@@ -422,6 +424,32 @@ class PerfLintVisitor : AstVisitor {
         if (t.baseType == Type.tBitfield) return true
         if (t.baseType == Type.tEnumeration) return self->enum_has_or_operator(t)
         return false
+    }
+
+    // --- PERF020: redundant same-name workhorse cast helpers ---
+
+    def perf020_target_basetype(fname : string) : Type {
+        //! Map a workhorse cast-function name to the Type it produces.
+        //! Returns Type.none for names that are not in the workhorse-cast set.
+        //! Set: 11 numeric scalars + string + 4 bitfield flavours (15 total).
+        //! Source of truth: ADD_NUMERIC_CASTS / ADD_BITFIELD_CASTS in
+        //! src/builtin/module_builtin.cpp plus das_lexical_cast_* externs.
+        if (fname == "int") return Type.tInt
+        if (fname == "int8") return Type.tInt8
+        if (fname == "int16") return Type.tInt16
+        if (fname == "int64") return Type.tInt64
+        if (fname == "uint") return Type.tUInt
+        if (fname == "uint8") return Type.tUInt8
+        if (fname == "uint16") return Type.tUInt16
+        if (fname == "uint64") return Type.tUInt64
+        if (fname == "float") return Type.tFloat
+        if (fname == "double") return Type.tDouble
+        if (fname == "string") return Type.tString
+        if (fname == "bitfield") return Type.tBitfield
+        if (fname == "bitfield8") return Type.tBitfield8
+        if (fname == "bitfield16") return Type.tBitfield16
+        if (fname == "bitfield64") return Type.tBitfield64
+        return Type.none
     }
 
     // --- function tracking ---
@@ -917,6 +945,75 @@ class PerfLintVisitor : AstVisitor {
         self->perf_warning("PERF019: int(...) | int(...) on the same {kind} type can collapse to int(L | R) (one cast instead of two)", expr.at)
     }
 
+    // --- PERF020: T(x) where x is already T — redundant workhorse cast ---
+
+    def check_perf020_redundant_cast(call : ExprCall?) : void {
+        if (call == null || call.func == null || length(call.arguments) != 1) return
+        let fname = string(call.func.fromGeneric != null ? call.func.fromGeneric.name : call.func.name)
+        let target = self->perf020_target_basetype(fname)
+        if (target == Type.none) return
+        var arg = call.arguments[0]
+        if (arg is ExprRef2Value) {
+            arg = (arg as ExprRef2Value.subexpr)
+        }
+        if (arg == null || arg._type == null || arg._type.baseType != target) return
+        self->perf_warning("PERF020: redundant {fname}(...) cast — argument is already {fname}", call.at)
+    }
+
+    // --- PERF021: cond ? T(a) : T(b) — hoist common workhorse cast out of ternary ---
+
+    def cast_call_workhorse_target(e : Expression?; var fname_out : string&) : Type {
+        //! If `e` is a workhorse cast call (after peeling ExprRef2Value), return
+        //! its target Type and write the cast name to `fname_out`. Otherwise
+        //! return Type.none. Accepts any argument count — `string(int)` is bound
+        //! with `value,hex,context,at` (4 daslang args), other casts use 1.
+        var ee = e
+        if (ee != null && ee is ExprRef2Value) {
+            ee = (ee as ExprRef2Value.subexpr)
+        }
+        if (ee == null || !(ee is ExprCall)) return Type.none
+        let c = ee as ExprCall
+        if (c.func == null || empty(c.arguments)) return Type.none
+        let n = string(c.func.fromGeneric != null ? c.func.fromGeneric.name : c.func.name)
+        let t = self->perf020_target_basetype(n)
+        if (t == Type.none) return Type.none
+        fname_out = n
+        return t
+    }
+
+    def cast_call_arg_basetype(e : Expression?) : Type {
+        //! Peel ExprRef2Value, take call.arguments[0], peel ExprRef2Value, return its baseType
+        //! (or Type.none if anything along the chain is null).
+        var ee = e
+        if (ee != null && ee is ExprRef2Value) {
+            ee = (ee as ExprRef2Value.subexpr)
+        }
+        if (ee == null || !(ee is ExprCall)) return Type.none
+        let c = ee as ExprCall
+        if (empty(c.arguments)) return Type.none
+        var arg = c.arguments[0]
+        if (arg is ExprRef2Value) {
+            arg = (arg as ExprRef2Value.subexpr)
+        }
+        if (arg == null || arg._type == null) return Type.none
+        return arg._type.baseType
+    }
+
+    def check_perf021_ternary_cast_hoist(expr : ExprOp3?) : void {
+        if (expr == null || expr.op != "?"
+            || expr.left == null || expr.right == null) return
+        var lname = ""
+        var rname = ""
+        let lt = self->cast_call_workhorse_target(expr.left, lname)
+        if (lt == Type.none) return
+        let rt = self->cast_call_workhorse_target(expr.right, rname)
+        if (rt == Type.none || lt != rt || lname != rname) return
+        let la = self->cast_call_arg_basetype(expr.left)
+        let ra = self->cast_call_arg_basetype(expr.right)
+        if (la == Type.none || la != ra) return
+        self->perf_warning("PERF021: redundant per-branch {lname}(...) cast in ternary — hoist as {lname}(cond ? a : b)", expr.at)
+    }
+
     // --- PERF014: closed-interval char-class range checks ---
 
     def parse_range_leg(leg : Expression?; var v_out : Expression?&; var bound_out : int&; var is_hi_out : bool&) : bool {
@@ -1077,6 +1174,9 @@ class PerfLintVisitor : AstVisitor {
     // --- PERF015 / PERF016: ternary min/max/abs ---
 
     def override preVisitExprOp3(expr : ExprOp3?) : void {
+        // PERF021: fires anywhere, including in closures — a redundant per-branch cast
+        // is redundant regardless of where the ternary lives.
+        self->check_perf021_ternary_cast_hoist(expr)
         if (in_closure > 0 || expr.op != "?"
             || expr.subexpr == null || !(expr.subexpr is ExprOp2)) return
         var cmp = expr.subexpr as ExprOp2
@@ -1193,7 +1293,11 @@ class PerfLintVisitor : AstVisitor {
     // --- PERF002 + PERF003: character_at (counter-based) ---
 
     def override preVisitExprCall(var expr : ExprCall?) : void {
-        if (in_closure > 0 || expr.func == null) return
+        if (expr.func == null) return
+        // PERF020: redundant same-type cast — fires anywhere, including in closures
+        self->check_perf020_redundant_cast(expr)
+        // Loop/while-aware rules below skip closure bodies (they run later, not in the loop)
+        if (in_closure > 0) return
         if (expr.func.name == "character_at" && expr.func._module.name == "strings") {
             var ecall = expr
             // PERF002: start tracking — any loop var inside this call triggers warning
