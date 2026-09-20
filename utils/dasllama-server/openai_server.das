@@ -8,18 +8,23 @@ require dasllama/dasllama       // the public facade — the main dasLLAMA surfa
 require llm_scheduler           // continuous-batching scheduler (sibling — bare require, hyphenated dir)
 require dashv/dashv_boost public
 require daslib/json_boost
+require daslib/toml             // write_toml: POST /config persists the authoritative config
+require dasllama/dasllama_math  // gpu_tier_status: the GET /config GPU badge
 require daslib/defer            // defer() { delete js } — free the parsed request JSON on every exit path
 require daslib/jobque_boost
 require daslib/rtti             // this_context().last_exception inside ASR worker recovery
 require daslib/strings_boost    // join()
 require daslib/fio              // sleep(), path_join, base_name, remove, get_env_variable
+require daslib/module_path      // get_this_module_dir: control.html ships beside the server sources
 require strings
 require math
 require dasllama/dasllama_audio_io   // load_audio_16k_mono: any uploaded audio format -> 16 kHz mono f32
+require dasllama/dasllama_vad        // POST /vad: silero speech spans for the page's waveform overlay
 
-// An OpenAI-compatible HTTP server over the dasLLAMA facade. It reaches only public facade verbs —
-// no engine internals — which is the acceptance test for the API: if a full OpenAI surface builds
-// without reaching into the engine, the facade is complete.
+// An OpenAI-compatible HTTP server over the dasLLAMA facade. The SERVING paths reach only public
+// facade verbs — no engine internals — which is the acceptance test for the API: if a full OpenAI
+// surface builds without reaching into the engine, the facade is complete. (The dashboard-only
+// surfaces additionally read dasllama_math's tier-status getters — see the require above.)
 // Chat and completion requests batch continuously: handlers parse + render + register and return;
 // run_server's loop drives llm_scheduler (one eval_batch decode step over every live stream + one
 // bounded prefill chunk per tick) and routes SchedEvents back to each request's writer. Streaming
@@ -61,6 +66,8 @@ struct private StreamWire {
 
 var g_wires : table<int64; StreamWire>
 var g_default_max_new = 256l
+var private g_started_at = 0l   // ref_time_ticks at init_server; /v1/stats derives uptime_s from it
+                                // (created_ts is a per-request monotone stand-in, NOT a clock)
 
 //! Move a loaded model into the server (call once, before run_server). ``name`` is the id reported
 //! by ``/v1/models`` and echoed back in responses.
@@ -88,6 +95,265 @@ def configure_asr_workers(path, mmproj : string; workers : int = 1) {
 //! ``POST /shutdown``.
 def request_stop() {
     g_shutdown_requested = true
+}
+
+var private g_restart_requested = false
+var private g_config_surface_json = ""   // main's pre-serialized {config, sources, ...} object
+var private g_config_save_path = ""
+var private g_config_model_path = ""
+
+//! Register the ``/config`` surface (call before run_server): the launcher's pre-serialized
+//! effective-config object, the path ``POST /config`` saves to, and the served model file
+//! (its directory feeds the model picker).
+def set_config_surface(surface_json : string; save_path : string; model_path : string) {
+    g_config_surface_json = surface_json
+    g_config_save_path = save_path
+    g_config_model_path = model_path
+}
+
+//! True when the drain was started by ``POST /restart`` — the lifecycle host exits with the
+//! watchdog's config-restart code (4) instead of 0 so it relaunches with the saved config.
+def server_restart_requested : bool {
+    return g_restart_requested
+}
+
+//! True while POST /bench's worker runs its child benchmarks.
+def server_bench_running : bool {
+    return g_bench_state == "running"
+}
+
+// ===== benchmark button (the llama.cpp A/B) =====
+// POST /bench runs, QUIESCED ONLY, our lcpp_bench (a child daslang process — same model, same
+// thread budget, llama-bench methodology) then llama-bench itself, on a worker thread; progress
+// and results flow back over a channel the tick loop drains. GET /bench serves state/log/result.
+
+var private g_lcpp_bin = ""
+var private g_daslang_bin = ""
+var private g_bench_state = "idle"        // idle | running | done | failed
+var private g_bench_log : array<string>
+var private g_bench_result_json = ""      // "" until a run completes
+var private g_bench_events : Channel?
+
+struct private BenchEvent {
+    kind : int         // 0 = log line, 1 = result (text = result json), 2 = failed (text = reason)
+    text : string
+}
+
+//! Register the benchmark configuration (call before run_server): ``lcpp_bin`` is the llama-bench
+//! binary (config key; empty disables the button), ``daslang_bin`` the running daslang used to
+//! spawn our bench child ("" in a standalone-exe deployment — also disables).
+def set_bench_config(lcpp_bin : string; daslang_bin : string) {
+    g_lcpp_bin = lcpp_bin
+    g_daslang_bin = daslang_bin
+}
+
+def private bench_emit(events : Channel?; kind : int; text : string) {
+    events |> push_clone(BenchEvent(kind = kind, text = text))
+}
+
+// parse "pp512: 202.54 ± 1.23 tok/s (3 reps)" (ours) — the number after "<tag>:"
+def private parse_ours_row(out : string; tag : string) : float {
+    for (ln in split(out, "\n")) {
+        if (ln |> starts_with("{tag}:")) {
+            return to_float(strip(slice(ln, length(tag) + 1)))
+        }
+    }
+    return 0.0
+}
+
+// parse llama-bench's markdown table — the row whose test cell equals `tag`, value = next cell
+def private parse_theirs_row(out : string; tag : string) : float {
+    for (ln in split(out, "\n")) {
+        continue if (find(ln, "|") < 0)
+        var cells <- split(ln, "|")
+        var found = 0.0
+        for (i in range(length(cells) - 1)) {
+            if (strip(cells[i]) == tag) {
+                found = to_float(strip(cells[i + 1]))
+                break
+            }
+        }
+        delete cells
+        if (found > 0.0) {
+            return found
+        }
+    }
+    return 0.0
+}
+
+// argv joined into a copy-pasteable shell line (quotes only where a space demands one)
+def private cmdline(args : array<string>) : string {
+    var parts <- [for (a in args); find(a, " ") >= 0 ? "\"{a}\"" : a]
+    let line = join(parts, " ")
+    delete parts
+    return line
+}
+
+def private bench_worker(daslang_bin, lcpp_bin, model_path : string; threads : int; var events : Channel?&) {
+    // release nulls the lambda's captured pointer — the capture teardown guard
+    // (release_capture_jobque_channel) panics on a still-held channel, and a panic on a
+    // catch-less new_thread worker is std::terminate -> silent fail-fast (the "S8
+    // second-spawn crash": it was this defer missing, detonating at worker EXIT)
+    defer() {
+        events |> release
+    }
+    let t0 = ref_time_ticks()
+    bench_emit(events, 0, "our bench: lcpp_bench pp512/tg128 x 3 reps (llama-bench methodology) — minutes-class, hold on")
+    var ours = ""
+    var args <- [daslang_bin, "-jit", path_join(get_das_root(), "modules/dasLLAMA/benchmarks/lcpp_bench.das"), "--",
+                 "-m", model_path, "-r", "3"]
+    bench_emit(events, 0, "$ {cmdline(args)}")
+    var rc1 = run_and_capture(args, ours, 3600.0)
+    if (rc1 == 3 && find(ours, "restart to apply") >= 0) {
+        // [tune] bootstrap: the child tuned this box's kernels and exited with the restart code
+        // (the watchdog convention) — relaunch once to run with the winners
+        bench_emit(events, 0, "bench child tuned this box's kernels first — relaunching with the winners")
+        ours = ""
+        rc1 = run_and_capture(args, ours, 3600.0)
+    }
+    delete args
+    let ours_pp = parse_ours_row(ours, "pp512")
+    let ours_tg = parse_ours_row(ours, "tg128")
+    if (rc1 != 0 || ours_pp <= 0.0 || ours_tg <= 0.0) {
+        bench_emit(events, 2, "our bench failed (rc={rc1}) — tail: {slice(ours, max(0, length(ours) - 300))}")
+        return
+    }
+    bench_emit(events, 0, "ours: pp512 {ours_pp} tok/s · tg128 {ours_tg} tok/s")
+    var theirs = ""
+    var targs <- [lcpp_bin, "-m", model_path, "-p", "512", "-n", "128", "-r", "3", "-t", "{threads}"]
+    bench_emit(events, 0, "$ {cmdline(targs)}")
+    let rc2 = run_and_capture(targs, theirs, 3600.0)
+    delete targs
+    let theirs_pp = parse_theirs_row(theirs, "pp512")
+    let theirs_tg = parse_theirs_row(theirs, "tg128")
+    if (rc2 != 0 || theirs_pp <= 0.0 || theirs_tg <= 0.0) {
+        bench_emit(events, 2, "llama-bench failed (rc={rc2}) — tail: {slice(theirs, max(0, length(theirs) - 300))}")
+        return
+    }
+    bench_emit(events, 0, "theirs: pp512 {theirs_pp} tok/s · tg128 {theirs_tg} tok/s")
+    let elapsed = int64(get_time_usec(t0)) / 1000000l
+    bench_emit(events, 1,
+        "\{\"ours_pp\":{ours_pp},\"ours_tg\":{ours_tg},\"theirs_pp\":{theirs_pp},\"theirs_tg\":{theirs_tg},\"pp_ratio\":{ours_pp / theirs_pp},\"tg_ratio\":{ours_tg / theirs_tg},\"threads\":{threads},\"elapsed_s\":{elapsed},\"ts\":{created_ts()}}")
+}
+
+def private drain_bench_events() {
+    if (g_bench_events == null) {
+        return
+    }
+    var more = true
+    while (more) {
+        more = g_bench_events |> try_pop_clone() $(ev : BenchEvent#) {
+            if (ev.kind == 0) {
+                g_bench_log |> push(clone_string(ev.text))
+                to_log(LOG_INFO, "dasllama-server: bench: {ev.text}\n")
+            } elif (ev.kind == 1) {
+                g_bench_result_json = clone_string(ev.text)
+                g_bench_state = "done"
+                to_log(LOG_INFO, "dasllama-server: bench complete\n")
+            } else {
+                g_bench_log |> push(clone_string(ev.text))
+                g_bench_state = "failed"
+                to_log(LOG_WARNING, "dasllama-server: bench failed: {ev.text}\n")
+            }
+        }
+    }
+}
+
+def private handle_bench_start(var resp : HttpResponse?) : http_status {
+    if (g_bench_state == "running") {
+        return resp |> JSON(error_body("a benchmark is already running", "invalid_request_error"), http_status.CONFLICT)
+    }
+    if (empty(g_lcpp_bin) || empty(g_daslang_bin)) {
+        return resp |> JSON(
+            error_body(empty(g_lcpp_bin) ? "set lcpp_bin in the config to enable benchmarking" : "benchmarking needs a source-tree daslang (standalone exe cannot spawn the bench child)", "invalid_request_error"),
+            http_status.BAD_REQUEST)
+    }
+    if (n_active(g_sched) > 0l || n_queued(g_sched) > 0l || g_asr_pending > 0) {
+        return resp |> JSON(
+            error_body("streams are active — contended numbers are misleading; drain first, then bench", "invalid_request_error"),
+            http_status.CONFLICT)
+    }
+    g_bench_state = "running"
+    delete g_bench_log
+    g_bench_result_json = ""
+    let daslang_bin = g_daslang_bin
+    let lcpp_bin = g_lcpp_bin
+    let model_path = g_config_model_path
+    let threads = get_dispatch_worker_limit() > 0 ? get_dispatch_worker_limit() : 16
+    var events_capture = g_bench_events
+    new_thread() <| @capture(= daslang_bin, = lcpp_bin, = model_path, = threads, = events_capture) {
+        bench_worker(daslang_bin, lcpp_bin, model_path, threads, events_capture)
+    }
+    to_log(LOG_INFO, "dasllama-server: benchmark started (quiesced) — ours then {lcpp_bin}\n")
+    return resp |> JSON("\{\"ok\":true,\"state\":\"running\"}", http_status.ACCEPTED)
+}
+
+def private handle_bench_get(var resp : HttpResponse?) : http_status {
+    var log_doc = JV(g_bench_log)
+    let log_json = write_json_compact(log_doc)
+    unsafe {
+        delete log_doc
+    }
+    let result = empty(g_bench_result_json) ? "null" : g_bench_result_json
+    return resp |> JSON(
+        "\{\"state\":{json_str(g_bench_state)},\"log\":{log_json},\"result\":{result},\"hardware\":{json_str(g_hardware_line)}}",
+        http_status.OK)
+}
+
+var private g_hardware_line = ""   // "<cpu> · N worker lanes · <gpu>" — composed once at init_server
+
+// The CPU marketing name: registry on Windows, /proc/cpuinfo on Linux, sysctl on macOS.
+def private cpu_brand : string {
+    var out = ""
+    if (get_env_variable("OS") == "Windows_NT") {
+        var args <- ["reg", "query", "HKLM\\HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+                     "/v", "ProcessorNameString"]
+        run_and_capture(args, out, 10.0)
+        delete args
+        for (ln in split(out, "\n")) {
+            let i = find(ln, "REG_SZ")
+            if (i >= 0 && find(ln, "ProcessorNameString") >= 0) {
+                return strip(slice(ln, i + length("REG_SZ")))
+            }
+        }
+        return ""
+    }
+    let cpuinfo = fread("/proc/cpuinfo")
+    if (!empty(cpuinfo)) {
+        for (ln in split(cpuinfo, "\n")) {
+            if (ln |> starts_with("model name")) {
+                let c = find(ln, ":")
+                return c >= 0 ? strip(slice(ln, c + 1)) : ""
+            }
+        }
+    }
+    var args <- ["sysctl", "-n", "machdep.cpu.brand_string"]
+    run_and_capture(args, out, 10.0)
+    delete args
+    return strip(out)
+}
+
+def private compose_hardware_line {
+    var cpu = cpu_brand()
+    if (empty(cpu)) {
+        cpu = "unknown cpu"
+    }
+    // real lane count (jobque workers + the calling thread) — the dispatch cap only ever
+    // narrows it. The old rendering printed the cap sentinel 0 as "all", which next to a
+    // 64-core brand string read as "uses all 64 cores" on a 16-lane run.
+    let lanes = is_job_que_available() ? get_total_hw_jobs() + 1 : 1
+    let cap = get_dispatch_worker_limit()
+    let lanes_desc = (cap > 0 && cap < lanes) ? "{cap} of {lanes}" : "{lanes}"
+    let aff = get_jobque_affinity()
+    let aff_desc = aff == 1 ? " · affinity: ideal-cpu hint" : (aff == 2 ? " · affinity: hard mask" : "")
+    let tier = gpu_tier_status()
+    var gpu_part = ""
+    if (!empty(tier.device)) {
+        gpu_part = " · {tier.device}"
+    } elif (get_metal_mode() != MetalMode.off) {
+        gpu_part = " · metal"
+    }
+    g_hardware_line = "{cpu} · {lanes_desc} worker lanes{aff_desc}{gpu_part}"
 }
 
 //! Consume a coalesced request from POST /gc. The lifecycle loop calls this only after update()
@@ -261,12 +527,28 @@ struct private AsrEvent {
     status : int
     content_type : string
     body : string
+    audio_s : float      // completed: decoded clip length in seconds (0 on failures)
+}
+
+//! One ASR job on the poll surface: running while the worker holds it, then done/failed with
+//! its wall time and RTF (audio seconds per wall second) — lingers ~30 s like finished streams.
+struct private AsrJobInfo {
+    id : int64
+    state : string       // "running" | "done" | "failed"
+    audio_s : float
+    wall_ms : float
+    rtf : float
+    started_at : int64   // ref_time_ticks at the started event
+    done_at : int64      // 0 while running
 }
 
 struct private AsrWire {
     @do_not_delete writer : HttpResponseWriter?
 }
 
+var g_asr_recent : array<AsrJobInfo>   // running + lingering done jobs for the poll surface
+var g_asr_done_jobs = 0l               // cumulative completed transcriptions
+var g_asr_audio_s = 0.0                // cumulative audio seconds transcribed
 var g_asr_jobs : Channel?
 var g_asr_events : Channel?
 var g_asr_wires : table<int64; AsrWire>
@@ -842,8 +1124,8 @@ def private render_chat_suffix(msgs_v : JsonValue?; system : string; tools : arr
     prompt <- rendered
     stop_ids <- chat.stop_ids
     close <- render_close(g_model, chat)
-    call_open := chat.tmpl.tool_call_open
-    call_close := chat.tmpl.tool_call_close
+    call_open = chat.tmpl.tool_call_open
+    call_close = chat.tmpl.tool_call_close
     return ""
 }
 
@@ -1158,6 +1440,10 @@ def private flush_events(srv : WebSocketServer) {
 
 // /v1/stats: the scheduler's counters as JSON (buffered — cheap enough to run in-handler).
 struct private OaiStatsResponse {
+    model : string
+    ctx : int64
+    uptime_s : int64
+    draining : bool
     active : int64
     queued : int64
     peak_active : int64
@@ -1177,10 +1463,23 @@ struct private OaiStatsResponse {
     asr_pending : int
     mtp_drafted : int64
     mtp_accepted : int64
+    prefill_tokens : int64
+    ttft_avg_ms : float
+    ttft_last_ms : float
+    weights_bytes : int64
+    kv_bytes : int64
+    heap_bytes : int64
+    string_heap_bytes : int64
+    hardware : string
+    asr_done_jobs : int64
+    asr_audio_s : float
 }
 
 def private handle_stats(var resp : HttpResponse?) : http_status {
     let out = OaiStatsResponse(
+        model = g_model_name, ctx = g_model.config.seq_len,
+        uptime_s = g_started_at > 0l ? get_time_nsec(g_started_at) / 1_000_000_000l : 0l,
+        draining = g_shutdown_requested,
         active = n_active(g_sched), queued = n_queued(g_sched), peak_active = g_sched.peak_active,
         admitted = g_sched.n_admitted, finished = g_sched.n_finished, evicted = g_sched.n_evicted,
         decode_steps = g_sched.decode_steps, gen_tokens = g_sched.gen_tokens,
@@ -1189,8 +1488,296 @@ def private handle_stats(var resp : HttpResponse?) : http_status {
         max_streams = g_sched.max_streams, chunk_tokens = g_sched.chunk_tokens,
         asr_workers = g_asr_worker_count, asr_ready = g_asr_ready,
         asr_active = g_asr_active, asr_pending = g_asr_pending,
-        mtp_drafted = g_sched.mtp_drafted, mtp_accepted = g_sched.mtp_accepted)
+        mtp_drafted = g_sched.mtp_drafted, mtp_accepted = g_sched.mtp_accepted,
+        prefill_tokens = g_sched.prefill_tokens,
+        ttft_avg_ms = g_sched.ttft_count > 0l ? float(g_sched.ttft_sum_us / g_sched.ttft_count) / 1000.0 : 0.0,
+        ttft_last_ms = float(g_sched.last_ttft_us) / 1000.0,
+        weights_bytes = model_weights_bytes(g_model),
+        kv_bytes = kv_pool_bytes(g_sched.pool),
+        heap_bytes = int64(heap_bytes_allocated()),
+        string_heap_bytes = int64(string_heap_bytes_allocated()),
+        hardware = g_hardware_line,
+        asr_done_jobs = g_asr_done_jobs, asr_audio_s = g_asr_audio_s)
     return resp |> JSON(sprint_json(out, false), http_status.OK)
+}
+
+// /v1/streams: the poll surface behind the page's swimlane + stream cards — per-stream state,
+// token counts, TTFT, and capped text tails. Finished streams linger ~10 s flagged "finished".
+struct private OaiStreamInfo {
+    id : int64
+    state : string       // "queued" | "prefilling" | "decoding" | "finished"
+    finish : string      // finished only: "stop" | "length" | "evicted"
+    age_s : float
+    n_prompt : int64
+    n_cached : int64
+    n_prefilled : int64
+    n_gen : int64
+    max_new : int64
+    ttft_ms : float
+    prompt_head : string
+    gen_tail : string
+}
+
+// One prefix-cache donation chain: what a re-sent conversation would reuse.
+struct private OaiCacheEntry {
+    tokens : int64
+    pages : int64
+    hits : int64
+    age_s : float
+    idle_s : float       // since the last hit (age when never hit)
+    preview : string
+}
+
+// One ASR job row on the poll surface (drain-side tracking; RTF = audio s per wall s).
+struct private OaiAsrRow {
+    id : int64
+    state : string
+    audio_s : float
+    wall_ms : float
+    rtf : float
+    age_s : float
+}
+
+struct private OaiStreamsResponse {
+    max_streams : int64
+    streams : array<OaiStreamInfo>
+    cache : array<OaiCacheEntry>
+    asr : array<OaiAsrRow>
+}
+
+// Age of a ref_time_ticks stamp in seconds, wrap-safe: get_time_usec returns int and wraps at
+// ~35.8 min — poison for prefix-cache chains and anything else that lives hours.
+def private age_seconds(t : int64) : float {
+    return float(double(get_time_nsec(t)) * 1e-9lf)
+}
+
+def private handle_streams(var resp : HttpResponse?) : http_status {
+    var out = OaiStreamsResponse(max_streams = g_sched.max_streams)
+    out.streams |> reserve(length(g_sched.streams) + length(g_sched.queue) + length(g_sched.recent_done))
+    for (st in g_sched.streams) {
+        out.streams |> push(OaiStreamInfo(
+            id = st.id,
+            state = st.state == StreamState.prefilling ? "prefilling" : "decoding",
+            age_s = age_seconds(st.t_admit),
+            n_prompt = int64(length(st.prompt)), n_cached = st.n_cached,
+            n_prefilled = st.n_prefilled, n_gen = st.n_gen, max_new = st.max_new,
+            ttft_ms = float(st.ttft_us) / 1000.0,
+            prompt_head = st.prompt_head, gen_tail = utf8_trim_partial_end(string(st.gen_tail_bytes))))
+    }
+    for (q in g_sched.queue) {
+        out.streams |> push(OaiStreamInfo(
+            id = q.id, state = "queued",
+            age_s = q.t_submit != 0l ? age_seconds(q.t_submit) : 0.0,
+            n_prompt = int64(length(q.prompt)), max_new = q.max_new))
+    }
+    for (d in g_sched.recent_done) {
+        out.streams |> push(OaiStreamInfo(
+            id = d.id, state = "finished", finish = d.finish,
+            n_prompt = d.n_prompt, n_cached = d.n_cached, n_prefilled = d.n_prompt, n_gen = d.n_gen,
+            ttft_ms = float(d.ttft_us) / 1000.0,
+            prompt_head = d.prompt_head, gen_tail = utf8_trim_partial_end(d.gen_tail)))
+    }
+    var chains <- prefix_chain_list(g_sched.prefix)
+    out.cache |> reserve(length(chains))
+    for (c in chains) {
+        let age = age_seconds(c.born_at)
+        out.cache |> push(OaiCacheEntry(
+            tokens = c.n_tokens, pages = c.pages_live, hits = c.hits, age_s = age,
+            idle_s = c.last_hit_at != 0l ? age_seconds(c.last_hit_at) : age,
+            preview = c.preview))
+    }
+    delete chains
+    out.asr |> reserve(length(g_asr_recent))
+    for (j in g_asr_recent) {
+        out.asr |> push(OaiAsrRow(
+            id = j.id, state = j.state, audio_s = j.audio_s, wall_ms = j.wall_ms, rtf = j.rtf,
+            age_s = age_seconds(j.started_at)))
+    }
+    let body = sprint_json(out, false)
+    delete out
+    return resp |> JSON(body, http_status.OK)
+}
+
+// key -> expected JSON kind for POST /config bodies: "s"tring | "i"nteger | "b"ool. The one
+// schema the save endpoint validates against — mirrors ServerArgs (main.das CONFIG_KEYS).
+let private CONFIG_KEY_KINDS <- {
+    "model" => "s", "port" => "i", "quant" => "s", "kv_dtype" => "s", "metal" => "s",
+    "gpu" => "s", "gpu_layers" => "i", "gpu_stream" => "i", "gpu_dn" => "b", "gpu_attn" => "b",
+    "gpu_dense" => "b", "gpu_vram_mb" => "i", "asr" => "s", "mmproj" => "s", "asr_workers" => "i",
+    "ctx" => "i", "max_tokens" => "i", "streams" => "i", "threads" => "i", "team_dispatch" => "s",
+    "affinity" => "i", "chunk" => "i", "page_rows" => "i", "prefix" => "i", "flat" => "b",
+    "mtp" => "b", "lcpp_bin" => "s"
+}
+
+// POST /vad: the page's waveform-overlay preview — silero speech spans over an uploaded clip.
+// Buffered + in-handler: silero is a tiny RNN, preview clips are capped, no worker needed.
+var private g_vad_loaded = false
+var private g_vad = VadModel()
+let private VAD_PREVIEW_CAP_S = 120
+
+def private handle_vad(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+    if (!g_vad_loaded) {
+        let path = path_join(get_das_root(), "modules/dasLLAMA/models/silero_vad.bin")
+        if (!stat(path).is_valid) {
+            return resp |> JSON(
+                error_body("silero_vad.bin not found ({path}) — the VAD preview needs a source tree", "server_error"),
+                http_status.NOT_IMPLEMENTED)
+        }
+        g_vad <- load_vad_model(path)
+        g_vad_loaded = true
+    }
+    var fname = ""
+    each_form_field(req) $(name, _content, filename) {
+        if (name == "file" && !empty(filename)) {
+            fname = filename
+        }
+    }
+    if (empty(fname)) {
+        return resp |> JSON(
+            error_body("multipart form must include a 'file' audio upload", "invalid_request_error"),
+            http_status.BAD_REQUEST)
+    }
+    let temppath = path_join(tmpdir(), "dasllama_vad_{next_id()}_{base_name(fname)}")
+    save_form_file(req, "file", temppath)
+    var samples <- load_audio_16k_mono(temppath)
+    remove(temppath)
+    defer() {
+        delete samples
+    }
+    if (empty(samples)) {
+        return resp |> JSON(
+            error_body("could not decode the uploaded audio", "invalid_request_error"),
+            http_status.BAD_REQUEST)
+    }
+    if (length(samples) > 16000 * VAD_PREVIEW_CAP_S) {
+        return resp |> JSON(
+            error_body("clip too long for the VAD preview (cap {VAD_PREVIEW_CAP_S} s)", "invalid_request_error"),
+            http_status.BAD_REQUEST)
+    }
+    var segs <- find_speech_timestamps(g_vad, samples, default_vad_opts())
+    var parts : array<string>
+    parts |> reserve(length(segs))
+    for (sg in segs) {
+        parts |> push("\{\"start\":{float(sg.start) / 16000.0},\"end\":{float(sg.end) / 16000.0}}")
+    }
+    let body = "\{\"duration\":{float(length(samples)) / 16000.0},\"segments\":[{join(parts, ",")}]}"
+    delete segs
+    delete parts
+    return resp |> JSON(body, http_status.OK)
+}
+
+def private json_str(s : string) : string {
+    return sprint_json(s, false)   // a bare string serializes as its quoted+escaped JSON literal
+}
+
+def private kind_name(kind : string) : string {
+    if (kind == "s") {
+        return "string"
+    }
+    return kind == "i" ? "whole number" : "bool"
+}
+
+// GET /config: the launcher-registered surface (effective values + per-key provenance) plus
+// live status — model files beside the served one, the active rail, and the GPU tier badge.
+def private handle_config_get(var resp : HttpResponse?) : http_status {
+    var entries : array<JsonValue?>
+    let mdir = dir_name(g_config_model_path)
+    if (!empty(mdir)) {
+        dir(mdir) $(fname) {
+            let lower = to_lower(fname)
+            if (ends_with(lower, ".gguf") || ends_with(lower, ".dlim")) {
+                let st = stat(path_join(mdir, fname))
+                entries |> push(JV((name = fname, size = int64(st.size),
+                    kind = ends_with(lower, ".dlim") ? "dlim" : "gguf")))
+            }
+        }
+    }
+    let tier = gpu_tier_status()
+    var extras <- {
+        "model_files" => JV(entries),
+        "active_model" => JV(base_name(g_config_model_path)),
+        "dlim_rail" => JV(g_model.image_map != null),
+        "metal" => JV("{get_metal_mode()}"),
+        "gpu" => JV((
+            backend = tier.backend, supported = tier.supported, reason = tier.reason,
+            resident_layers = tier.resident_layers, streamed_layers = tier.streamed_layers,
+            dn_layers = tier.dn_layers, attn_layers = tier.attn_layers,
+            dense_planes = tier.dense_planes, cls_resident = tier.cls_resident,
+            vram_bytes = tier.vram_bytes))
+    }
+    var extras_doc = JV(extras)
+    let extras_json = write_json_compact(extras_doc)
+    unsafe {
+        delete extras_doc
+    }
+    let surface = empty(g_config_surface_json) ? "null" : g_config_surface_json
+    return resp |> JSON("\{\"surface\":{surface},\"status\":{extras_json}}", http_status.OK)
+}
+
+// POST /config: validate a {key: value} JSON body against the schema, rebuild it as an
+// explicitly-typed tree + `authoritative = true`, and write it as TOML to the save path.
+// The running server keeps its config — POST /restart applies the saved one.
+def private handle_config_save(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+    var jerr = ""
+    var body = read_json(string(req.body), jerr)
+    defer() {
+        unsafe {
+            delete body
+        }
+    }
+    if (body == null || !(body.value is _object)) {
+        return resp |> JSON(
+            error_body("config body must be a JSON object: {jerr}", "invalid_request_error"),
+            http_status.BAD_REQUEST)
+    }
+    var out_tab : table<string; JsonValue?>
+    var verr = ""
+    for (k, v in keys(body.value as _object), values(body.value as _object)) {
+        let kind = CONFIG_KEY_KINDS?[k] ?? ""
+        if (empty(kind)) {
+            continue if (k == "authoritative")   // server-owned marker; re-added below
+            verr = "unknown config key '{k}'"
+            break
+        }
+        if (v == null) {
+            verr = "config key '{k}' is null"
+            break
+        }
+        if (kind == "s" && (v.value is _string)) {
+            out_tab |> insert(k, JV(v.value as _string))
+        } elif (kind == "i" && (v.value is _longint)) {
+            out_tab |> insert(k, JV(v.value as _longint))
+        } elif (kind == "i" && (v.value is _number) && (v.value as _number) == floor(v.value as _number)) {
+            out_tab |> insert(k, JV(int64(v.value as _number)))
+        } elif (kind == "b" && (v.value is _bool)) {
+            out_tab |> insert(k, JV(v.value as _bool))
+        } else {
+            verr = "config key '{k}' must be a {kind_name(kind)}"
+            break
+        }
+    }
+    if (!empty(verr)) {
+        var junk = JV(out_tab)
+        unsafe {
+            delete junk
+        }
+        return resp |> JSON(error_body(verr, "invalid_request_error"), http_status.BAD_REQUEST)
+    }
+    out_tab |> insert("authoritative", JV(true))
+    var doc = JV(out_tab)
+    var werr = ""
+    let toml = write_toml(doc, werr)
+    unsafe {
+        delete doc
+    }
+    if (!empty(werr)) {
+        return resp |> JSON(error_body("config not TOML-representable: {werr}", "invalid_request_error"), http_status.BAD_REQUEST)
+    }
+    if (!fwrite(g_config_save_path, toml)) {
+        return resp |> JSON(error_body("could not write '{g_config_save_path}'", "server_error"), http_status.INTERNAL_SERVER_ERROR)
+    }
+    to_log(LOG_INFO, "dasllama-server: authoritative config saved to {g_config_save_path} ({length(toml)} bytes)\n")
+    return resp |> JSON("\{\"saved\":{json_str(g_config_save_path)},\"restart_required\":true}", http_status.OK)
 }
 
 def private emit_asr_event(events : Channel?; event : AsrEvent) {
@@ -1258,7 +1845,8 @@ def private process_asr_job(
         vt.language = session.detected_lang
         emit_asr_event(events, AsrEvent(
             kind = AsrEventKind.completed, id = job.id, status = int(http_status.OK),
-            content_type = "application/json", body = sprint_json(vt, false)))
+            content_type = "application/json", body = sprint_json(vt, false),
+            audio_s = float(length(samples)) / 16000.0))
         delete full
         delete vt
         return
@@ -1268,7 +1856,8 @@ def private process_asr_job(
     let body = job.response_format == "text" ? text : sprint_json(OaiTranscription(text = text), false)
     emit_asr_event(events, AsrEvent(
         kind = AsrEventKind.completed, id = job.id, status = int(http_status.OK),
-        content_type = content_type, body = body))
+        content_type = content_type, body = body,
+        audio_s = float(length(samples)) / 16000.0))
 }
 
 def private asr_worker_main(
@@ -1406,9 +1995,24 @@ def private drain_asr_events(srv : WebSocketServer) {
         draining = g_asr_events |> try_pop_clone() $(event : AsrEvent#) {
             if (event.kind == AsrEventKind.started) {
                 g_asr_active++
+                g_asr_recent |> push(AsrJobInfo(id = event.id, state = "running", started_at = ref_time_ticks()))
             } elif (event.kind == AsrEventKind.completed) {
                 g_asr_active = max(g_asr_active - 1, 0)
                 g_asr_pending = max(g_asr_pending - 1, 0)
+                for (i in range(length(g_asr_recent))) {
+                    continue if (g_asr_recent[i].id != event.id)
+                    let wall_ms = float(double(get_time_nsec(g_asr_recent[i].started_at)) * 1e-6lf)   // wrap-safe: clips can run > 35 min
+                    g_asr_recent[i].state = event.status == int(http_status.OK) ? "done" : "failed"
+                    g_asr_recent[i].audio_s = event.audio_s
+                    g_asr_recent[i].wall_ms = wall_ms
+                    g_asr_recent[i].rtf = wall_ms > 0.0 ? event.audio_s * 1000.0 / wall_ms : 0.0
+                    g_asr_recent[i].done_at = ref_time_ticks()
+                    break
+                }
+                if (event.status == int(http_status.OK)) {
+                    g_asr_done_jobs ++
+                    g_asr_audio_s += event.audio_s
+                }
                 var wire = unsafe(g_asr_wires?[event.id])
                 if (wire != null) {
                     if (is_writer_connected(srv, wire.writer)) {
@@ -1422,6 +2026,19 @@ def private drain_asr_events(srv : WebSocketServer) {
                 }
                 to_log(LOG_INFO, "[req {event.id}] asr: completed (pending={g_asr_pending}, active={g_asr_active})\n")
             }
+        }
+    }
+    // finished jobs linger ~30 s on the poll surface, then drop (bounded backstop at 16).
+    // Index sweep, not a head-gated loop: a long-RUNNING job at the head must not block the
+    // expiry of finished jobs behind it. Wrap-safe nsec compare (clips can run > 35 min).
+    var i = 0
+    while (i < length(g_asr_recent)) {
+        if (g_asr_recent[i].done_at != 0l
+                && (get_time_nsec(g_asr_recent[i].done_at) > 30_000_000_000l || length(g_asr_recent) > 16)) {
+            delete g_asr_recent[i]
+            g_asr_recent |> erase(i)
+        } else {
+            i ++
         }
     }
 }
@@ -1475,6 +2092,38 @@ class OpenAiServer : HvWebServer {
         GET("/v1/stats") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             return handle_stats(resp)
         }
+        GET("/v1/streams") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            return handle_streams(resp)
+        }
+        GET("/") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            // the control page ships beside the server sources; libhv sets text/html from the extension
+            return resp |> SERVE_FILE(path_join(get_this_module_dir(), "control.html"))
+        }
+        GET("/config") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            return handle_config_get(resp)
+        }
+        POST("/vad") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            return handle_vad(req, resp)
+        }
+        POST("/config") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            return handle_config_save(req, resp)
+        }
+        POST("/bench") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            return handle_bench_start(resp)
+        }
+        GET("/bench") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            return handle_bench_get(resp)
+        }
+        POST("/restart") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!g_shutdown_requested) {
+                to_log(
+                    LOG_INFO,
+                    "dasllama-server: restart requested; draining llm_active={n_active(g_sched)}, llm_queued={n_queued(g_sched)}, asr_pending={g_asr_pending}\n")
+            }
+            g_shutdown_requested = true
+            g_restart_requested = true
+            return resp |> JSON("\{\"ok\":true,\"draining\":true,\"restarting\":true}", http_status.OK)
+        }
         POST("/shutdown") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             if (!g_shutdown_requested) {
                 to_log(
@@ -1526,6 +2175,7 @@ def init_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; c
         return false
     }
     g_shutdown_requested = false   // reset so a restart in the same context after /shutdown doesn't drain at once
+    g_restart_requested = false    // NOT reset in shutdown_server — the lifecycle host reads it after
     g_gc_requested = false
     create_job_que()
     g_jobque_owned = true
@@ -1536,6 +2186,9 @@ def init_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; c
     to_log(LOG_INFO, "dasllama-server: jobque compute dispatch = {dispatch_mode}\n")
     g_asr_jobs = unsafe(channel_create())
     g_asr_events = unsafe(channel_create())
+    g_bench_events = unsafe(channel_create())
+    g_bench_state = "idle"
+    g_bench_result_json = ""
     start_asr_worker_threads()
     var pfx = prefix_groups
     if (page_rows > 0l && pfx == 0l) {   // auto: retain up to one full context per stream slot
@@ -1561,6 +2214,8 @@ def init_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; c
         return false
     }
     g_server_started = true
+    g_started_at = ref_time_ticks()
+    compose_hardware_line()
     let pfx_desc = pfx > 0l ? "{pfx}" : "unbounded"
     let kv_mode = page_rows > 0l ? "{kv_dtype} paged P={page_rows}, prefix cache {pfx_desc} pages" : "{kv_dtype} flat"
     let spec_desc = spec ? ", mtp: on" : ""
@@ -1576,6 +2231,7 @@ def update_server() : bool {
     }
     g_server->tick()   // drains queued handlers: requests parse + render + submit here
     drain_asr_events(g_server.server)
+    drain_bench_events()
     reap_disconnected(g_server.server)
     let t_step = ref_time_ticks()
     let busy = scheduler_step(g_model, g_sched, g_events)
@@ -1623,8 +2279,10 @@ def shutdown_server() {
     delete g_asr_wires
     var asr_jobs = g_asr_jobs
     var asr_events = g_asr_events
+    var bench_events = g_bench_events
     g_asr_jobs = null
     g_asr_events = null
+    g_bench_events = null
     unsafe {
         if (asr_jobs != null) {
             asr_jobs |> channel_remove
@@ -1632,7 +2290,11 @@ def shutdown_server() {
         if (asr_events != null) {
             asr_events |> channel_remove
         }
+        if (bench_events != null) {
+            bench_events |> channel_remove
+        }
     }
+    delete g_bench_log
     if (g_mtp_spec_changed) {
         set_mtp_spec(g_prev_mtp_spec)   // a /shutdown + restart in the same context starts from a clean gate
         g_mtp_spec_changed = false

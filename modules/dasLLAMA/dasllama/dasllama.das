@@ -40,8 +40,8 @@ def setup_dasllama_jobque() {
 
 def load_model(path : string; mode : QuantMode = QuantMode.fp32) : Model {
     //! Load a model AND its tokenizer from a GGUF file — architecture and tokenizer backend are
-    //! auto-selected from GGUF metadata; ``mode`` picks the weight quantization. Q8 loads cache a
-    //! PREPARED IMAGE beside the gguf (box-specific, ``DASLLAMA_IMAGE=0`` disables) for millisecond reloads.
+    //! auto-selected from metadata; ``mode`` picks the weight quantization. Q8 loads cache a PREPARED
+    //! IMAGE beside the gguf for millisecond reloads (``DASLLAMA_IMAGE=0`` disables); under an active Metal mode the image is the BLOB-ONLY metal flavor (CPU inference against it panics).
     return <- load_model_cached(path, mode)
 }
 
@@ -87,11 +87,17 @@ def prefix_attach(var cache : PrefixCache; var pool : KVPool; var session : Sess
     return prefix_attach_(cache, pool, session, prompt)
 }
 
-def prefix_insert(var cache : PrefixCache; var pool : KVPool; session : Session; tokens : array<int64>) {
+def prefix_insert(var cache : PrefixCache; var pool : KVPool; session : Session; tokens : array<int64>; preview : string = "") {
     //! Donate a finished session's KV pages to the cache. ``tokens`` is the session's full EVALED
-    //! history (only the first ``n_past`` rows exist); every full page not already cached is
-    //! registered and survives ``release_kv_pages``. Call right before releasing.
-    prefix_insert_(cache, pool, session, tokens)
+    //! history (only the first ``n_past`` rows exist); every full page not already cached survives
+    //! ``release_kv_pages``. ``preview`` labels the chain on the ``prefix_chain_list`` surface.
+    prefix_insert_(cache, pool, session, tokens, preview)
+}
+
+def prefix_chain_list(cache : PrefixCache) : array<PrefixChain> {
+    //! Snapshot of the cache's donated chains for dashboards: per donation — page-covered token
+    //! count, live pages, hit count, born/last-hit ticks, and the caller-provided preview.
+    return <- prefix_chain_list_(cache)
 }
 
 def prefix_release(var cache : PrefixCache; var pool : KVPool) {
