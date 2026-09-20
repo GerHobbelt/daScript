@@ -1095,11 +1095,7 @@ def public apply_qblock_to_array(var expr : Expression?; blk : block<(var rules 
     var res = apply_template(expr, blk)
     assert(res is ExprMakeBlock)
     var qblk = move_unquote_block(res)
-    var arr : array<Expression?>
-    for (e in qblk.list) {
-        arr |> push(clone_expression(e))
-    }
-    return <- arr
+    return <- [for (e in qblk.list); clone_expression(e)]
 }
 
 def public apply_qblock_expr(var expr : Expression?; blk : block<(var rules : Template) : void>) : Expression? {
@@ -1109,6 +1105,21 @@ def public apply_qblock_expr(var expr : Expression?; blk : block<(var rules : Te
     var qblk = move_unquote_block(res)
     assert(qblk.list |> length == 1)
     return clone_to_move(qblk.list[0])
+}
+
+def public push_block_list(var stmts : array<Expression?>; var blockExpr : Expression?) {
+    //! Splice every statement from a ``qmacro_block(...) { ... }`` result into ``stmts``, cloning
+    //! each. Use in place of a cluster of ``stmts |> push <| qmacro_expr() { single_stmt }`` calls
+    //! when emitting multi-statement snippets.
+    //!
+    //! Typical usage: ``stmts |> push_block_list(qmacro_block() { ... })``.
+    if (blockExpr == null) return
+    assert(blockExpr is ExprBlock, "push_block_list: expected ExprBlock from qmacro_block")
+    var blk = blockExpr as ExprBlock
+    stmts |> reserve(long_length(stmts) + int64(blk.list |> length))
+    for (e in blk.list) {
+        stmts |> push(clone_expression(e))
+    }
 }
 
 def public apply_qtype(var expr : Expression?; blk : block<(var rules : Template) : void>) : TypeDeclPtr {

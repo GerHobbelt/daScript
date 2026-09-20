@@ -101,10 +101,7 @@ struct Config {
 def resolve_against_files(against : array<string>; from_stdin : bool;
                           var out_set : table<string; void?>) {
     var raw : array<string>
-    raw |> reserve(length(against))
-    for (p in against) {
-        raw |> push(p)
-    }
+    raw |> push_from(against)
     if (from_stdin) {
         read_path_lines(fstdin(), raw)
     }
@@ -389,10 +386,7 @@ def main() {
         }
     } else {
         var seeds : array<string>
-        seeds |> reserve(length(cfg.path))
-        for (p in cfg.path) {
-            seeds |> push(p)
-        }
+        seeds |> push_from(cfg.path)
         if (!empty(cfg.paths_from)) {
             var perr : string
             if (!read_path_lines_from_file(cfg.paths_from, seeds, perr)) {
@@ -507,10 +501,7 @@ def main() {
         // deterministic across runs — `keys(table)` iteration order is
         // unspecified, which would make the per-candidate output (and the
         // exit-code-driven CI behavior of `--check`) non-reproducible.
-        var against_files_sorted : array<string>
-        for (k in keys(against_files)) {
-            against_files_sorted |> push(k)
-        }
+        var against_files_sorted <- [for (k in keys(against_files)); k]
         sort(against_files_sorted)
         for (af in against_files_sorted) {
             // Skip files already extracted (either via `-p` or, post-drop,

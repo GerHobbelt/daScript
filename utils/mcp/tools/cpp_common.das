@@ -551,17 +551,11 @@ def cpp_run_scan(search_dirs : array<string>; glob_filter : string; var err_mess
     if (empty(search_dirs)) {
         dirs_to_scan <- cpp_default_search_dirs()
     } else {
-        dirs_to_scan |> reserve(length(search_dirs))
-        for (d in search_dirs) {
-            dirs_to_scan |> push(d)
-        }
+        dirs_to_scan |> push_from(search_dirs)
     }
     var args <- [sg, "scan", "-r", rules_path, "--json"]
     cpp_push_glob_args(args, dirs_to_scan, glob_filter)
-    args |> reserve(length(args) + length(dirs_to_scan))
-    for (d in dirs_to_scan) {
-        args |> push(d)
-    }
+    args |> push_from(dirs_to_scan)
     var raw : string
     let rc = run_and_capture(args, raw, 60.0)
     if (rc != 0 && empty(raw)) {
@@ -670,12 +664,7 @@ def cpp_extend_class_ranges(var entries : array<CppMatch>) {
 // Returns the modified `entries` (move-out). `entries` is left empty on the caller side.
 def cpp_filter_entries(var entries : array<CppMatch>) : array<CppMatch> {
     // Build a set of (file, start_line) pairs that have a class/struct match.
-    var class_struct_at : table<string; bool>
-    for (e in entries) {
-        if (e.kind == "class" || e.kind == "struct") {
-            class_struct_at["{e.file}:{e.line}"] = true
-        }
-    }
+    let class_struct_at <- {for (e in entries); "{e.file}:{e.line}" => true; where e.kind == "class" || e.kind == "struct"}
     // Walk forward, write the survivors to a write_idx; truncate at the end.
     var write_idx = 0
     for (read_idx in range(length(entries))) {

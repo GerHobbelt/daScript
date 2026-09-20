@@ -337,10 +337,7 @@ def cmd_search_all(root : string; json : bool = false) : int {
         return 0
     }
     // collect and sort by name
-    var names : array<string>
-    for (name in keys(index)) {
-        names |> push_clone(name)
-    }
+    var names <- [for (name in keys(index)); name]
     sort(names) $(a, b : string) : bool {
         return a < b
     }
@@ -398,10 +395,7 @@ def read_manifest(pkg_dir : string; var manifest : PackageManifest) : bool {
     manifest.author = meta.author
     manifest.license = meta.license
     manifest.min_sdk = meta.min_sdk
-    manifest.tags |> reserve(length(meta.tags))
-    for (tag in meta.tags) {
-        manifest.tags |> push_clone(tag)
-    }
+    manifest.tags |> push_clone_from(meta.tags)
     if (empty(manifest.name)) {
         to_log(LOG_ERROR, "Error: .das_package missing package_name()\n")
         return false
@@ -512,14 +506,8 @@ def private manifest_to_entry(manifest : PackageManifest; url : string) : IndexE
         license = manifest.license,
         min_sdk = manifest.min_sdk,
         has_native = manifest.has_native)
-    entry.tags |> reserve(length(manifest.tags))
-    for (t in manifest.tags) {
-        entry.tags |> push_clone(t)
-    }
-    entry.dependencies |> reserve(length(manifest.dependencies))
-    for (d in manifest.dependencies) {
-        entry.dependencies |> push_clone(d)
-    }
+    entry.tags |> push_clone_from(manifest.tags)
+    entry.dependencies |> push_clone_from(manifest.dependencies)
     return <- entry
 }
 
@@ -595,10 +583,7 @@ def generate_index_readme_from_index(index : table<string; IndexEntry>) : string
                 }
             }
         }
-        var tag_names : array<string>
-        for (t in keys(all_tags)) {
-            tag_names |> push_clone(t)
-        }
+        var tag_names <- [for (t in keys(all_tags)); t]
         sort(tag_names) $(a, b : string) : bool {
             return a < b
         }
@@ -933,18 +918,12 @@ def cmd_update_index(root : string) : int {
                 }
                 if (!empty(manifest.tags)) {
                     delete index[name].tags
-                    index[name].tags |> reserve(length(manifest.tags))
-                    for (t in manifest.tags) {
-                        index[name].tags |> push_clone(t)
-                    }
+                    index[name].tags |> push_clone_from(manifest.tags)
                 }
                 index[name].has_native = manifest.has_native
                 if (!empty(manifest.dependencies)) {
                     delete index[name].dependencies
-                    index[name].dependencies |> reserve(length(manifest.dependencies))
-                    for (d in manifest.dependencies) {
-                        index[name].dependencies |> push_clone(d)
-                    }
+                    index[name].dependencies |> push_clone_from(manifest.dependencies)
                 }
             }
 

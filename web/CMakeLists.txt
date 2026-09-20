@@ -138,6 +138,11 @@ ExternalProject_Add(host_daslang
                      -DCMAKE_BUILD_TYPE:STRING=Release
                      -DDAS_LLVM_DISABLED:BOOL=OFF
                      -DDAS_PUGIXML_DISABLED:BOOL=OFF
+                     # dasGlfw pulls find_package(OpenGL REQUIRED) at configure
+                     # time. The pages.yml runner doesn't apt-install OpenGL
+                     # dev libs, and this sub-build is tooling-only (drives
+                     # .das→wasm codegen via dasLLVM — no graphics needed).
+                     -DDAS_GLFW_DISABLED:BOOL=ON
     BUILD_COMMAND    ${CMAKE_COMMAND} --build <BINARY_DIR> --target daslang --parallel)
 
 # Cross-compile web playground example scripts to wasm32 via host daslang.
@@ -148,7 +153,24 @@ set(_web_ex_out ${DAS_WEB_OUTPUT_DIR}/samples/examples)
 
 add_custom_target(all_wasm)
 set(_wasm_run_cmds)
-foreach(ex hello loop func)
+# Each name maps to web/examples/ui/samples/examples/<name>.das. Names match
+# the bench `name` slug emitted by dasProfile (and the playground `?example=`
+# URL param), with hyphens replaced by underscores (`spectral-norm` →
+# `spectral_norm`) so they're valid CMake target stems.
+#
+# `table_sort` + `f2s` + `tree` are intentionally excluded from the
+# cross-compile foreach — they each fail wasm_cross in a way that doesn't
+# affect playground UX (the playground runs them through the embedded daslang
+# interpreter, not via cross-compile). Tracked at
+# GaijinEntertainment/daScript#2805:
+#   * table_sort.wasm — wasm-ld error: undefined symbol `jit_register_fusion`
+#   * f2s.wasm        — wasmtime runtime trap (Wasm exception)
+#   * tree.wasm       — wasmtime runtime trap (Wasm exception) — treap impl
+#                       with recursive merge/split + explicit `delete` under
+#                       wasm-exceptions ABI
+foreach(ex hello loop func
+        dict sha256 exp f2i fib_loop fib_recursive mandelbrot
+        nbodies particles primes queen spectral_norm)
     add_custom_command(OUTPUT ${_web_ex_out}/${ex}.wasm
         COMMAND ${CMAKE_COMMAND} -E make_directory ${_web_ex_out}
         COMMAND ${DAS_HOST_DASLANG} -exe -output ${_web_ex_out}/${ex}
