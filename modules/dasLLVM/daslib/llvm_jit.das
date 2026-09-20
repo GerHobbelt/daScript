@@ -100,6 +100,7 @@ def get_file_info_global(g_builder : LLVMOpaqueBuilder?; types : PrimitiveTypes?
         set_private_linkage(fileInfo)
         var zero = LLVMConstInt(types.t_int8, 0 |> uint64(), 0)
         var zeros : array<LLVMValueRef>
+        zeros |> reserve(sz)
         for (i in range(sz)) {
             zeros |> push(zero)
         }
@@ -2714,6 +2715,10 @@ class public LlvmJitVisitor : AstVisitor {
         LLVMPositionBuilderAtEnd(g_builder, blk.if_end)
         if (blk.if_true_terminates && blk.if_false_terminates) {
             LLVMBuildUnreachable(g_builder)
+            // Dead code after fully-terminating if-else still gets visited.
+            // Position builder at a dummy block to avoid a CE.
+            var dead_block = append_basic_block("dead_at_line_{int(expr.at.line)}_")
+            LLVMPositionBuilderAtEnd(g_builder, dead_block)
         }
         return expr
     }
@@ -3712,6 +3717,7 @@ class public LlvmJitVisitor : AstVisitor {
 
     def create_enumvalueinfo_global_array(ei : EnumValueInfo ??; len : uint) {
         var array_init : array<LLVMValueRef>
+        array_init |> reserve(int(len))
         let ty = get_llvm_type_for_enumvalueinfo()
         for (i in range(len)) {
             assume evi = unsafe(ei[i])
@@ -3767,6 +3773,7 @@ class public LlvmJitVisitor : AstVisitor {
     def create_struct_fields_global_array(ei : VarInfo ??; len : uint) {
         // not cached, probably don't need it
         var array_init : array<LLVMValueRef>
+        array_init |> reserve(int(len))
         let ty = get_llvm_type_for_varinfo()
         for (i in range(len)) {
             let varinfo = g_mod |> LLVMAddGlobal(ty, "varinfo")
@@ -3783,7 +3790,7 @@ class public LlvmJitVisitor : AstVisitor {
                         get_string_constant_ptr(g_builder, string(arg.sValue)),
                         types.ConstI32(uint64(int(arg.basicType))),
                         types.ConstI32(uint64(uint(arg.iValue))))
-                    ann_vals |> push <| LLVMConstNamedStruct(ann_ty, array_data_ptr(fields), 4u)
+                    ann_vals |> push <| LLVMConstNamedStruct(ann_ty, array_data_ptr(fields), 4u) // nolint:PERF006 annotation count unknown
                 }
                 if (!(ann_vals |> empty())) {
                     let n = ann_vals |> length() |> uint()
@@ -3868,6 +3875,7 @@ class public LlvmJitVisitor : AstVisitor {
         if (len == 0u) {
             return LLVMConstPointerNull(LLVMPointerType(types.t_int8, 0u))
         }
+        array_init |> reserve(int(len))
         for (i in range(len)) {
             let evi = unsafe(argtypes[i]) |> create_type_info_global()
             array_init |> push <| unsafe(reinterpret<LLVMValueRef>(evi))
@@ -3885,6 +3893,7 @@ class public LlvmJitVisitor : AstVisitor {
             return LLVMConstPointerNull(LLVMPointerType(types.t_int8, 0u))
         }
         var array_init : array<LLVMValueRef>
+        array_init |> reserve(int(len))
         var ty = LLVMPointerType(types.t_int8, 0u)
         for (i in range(len)) {
             array_init |> push <| get_string_constant_ptr(g_builder, unsafe(argnames[i]))
@@ -3950,6 +3959,7 @@ class public LlvmJitVisitor : AstVisitor {
         // Fill dim pointer (slot 5), needed for fixed-size arrays like int[3].
         if (info.dimSize > 0u) {
             var dim_vals : array<LLVMValueRef>
+            dim_vals |> reserve(int(info.dimSize))
             for (i in range(info.dimSize)) {
                 dim_vals |> push <| types.ConstI32(unsafe(info.dim[i]) |> uint64())
             }
@@ -5059,6 +5069,11 @@ class public LlvmJitVisitor : AstVisitor {
                 // return <- blah // where blah is string and such
                 var lres = LLVMBuildLoadData2Aligned(g_builder, type_to_llvm_type(expr.subexpr._type), getE(expr.subexpr), expr.subexpr._type.alignOf, "")
                 expr_res = lres
+            } elif (expr.subexpr._type.flags.ref && expr.returnFlags.moveSemantics) {
+                // return <- blah // where blah is lambda, smart_ptr, or other non-workhorse ref
+                var src = getE(expr.subexpr)
+                expr_res = LLVMBuildLoadData2Aligned(g_builder, type_to_llvm_abi_type(returnType), src, expr.subexpr._type.alignOf, "result_before_move")
+                LLVMBuildStore(g_builder, LLVMConstNull(type_to_llvm_abi_type(returnType)), src)
             } else {
                 expr_res = getE(expr.subexpr)
             }
@@ -5231,6 +5246,7 @@ class public LlvmJitVisitor : AstVisitor {
         // build block type
         var blk_fields <- build_block_type()
         blk_fields |> push(LLVMArrayType(types.LLVMFloat4Type(), 10u))
+        blk_fields |> reserve(length(blk_fields) + length(captured))
         var first_field_index = length(blk_fields)
         for (c in captured) {
             blk_fields |> push(LLVMPointerType(type_to_llvm_type(c.variable._type), 0u))
@@ -5965,6 +5981,7 @@ class public LlvmJitVisitor : AstVisitor {
 [macro_function]
 def private get_llvm_function_type(func : FunctionPtr; types : PrimitiveTypes?) {
     var arg_types : array<LLVMOpaqueType?>
+    arg_types |> reserve(length(func.arguments) + 3)
     var res_type : LLVMOpaqueType?
     res_type = type_to_llvm_type(func.result)
     if (func.result.flags.ref) {
@@ -5998,11 +6015,16 @@ def private add_ctor_dtor_function(ctor_dtor : array<tuple<LLVMOpaqueValue?, LLV
     let ctorStructType = StructType(types, ctorTypes)
     let dtorStructType = StructType(types, dtorTypes)
 
+    let n_entries = length(ctor_dtor)
     var ctorFields : array<LLVMOpaqueValue?>
     var dtorFields : array<LLVMOpaqueValue?>
+    ctorFields |> reserve(n_entries * 3)
+    dtorFields |> reserve(n_entries * 3)
 
     var ctor_entries = array<LLVMOpaqueValue?>()
     var dtor_entries = array<LLVMOpaqueValue?>()
+    ctor_entries |> reserve(n_entries)
+    dtor_entries |> reserve(n_entries)
 
     var i = 0
     for ((ctor, dtor) in ctor_dtor) {
@@ -6250,6 +6272,7 @@ def public get_dll_missing(fns : array<FunctionPtr>; disabled : array<FunctionPt
     verify(!(is_in_completion() || is_compiling_macros() || is_folding()))
 
     var missing = array<Function?>()
+    missing |> reserve(length(fns))
     var disabled_exists = array<Function?>()
     if (dll.handle == null) {
         for (fn in fns) {
