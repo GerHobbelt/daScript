@@ -89,6 +89,17 @@ def private kv_blob_max_diff(blob : array<uint8>; refb : array<uint8>; pref : ar
                     for (e in range64(kvd)) {
                         maxd = max(maxd, abs(f16_to_f32(uint(hb[e])) - f16_to_f32(uint(hr[e]))))
                     }
+                } elif (dt == KVDtype.q8_0) {
+                    let qb = bp + base + row * rowb
+                    let qr = rp + base + row * rowb
+                    for (bi in range64(kvd / 32l)) {
+                        let bb = bi * 34l
+                        let db = f16_to_f32(uint(qb[bb]) | (uint(qb[bb + 1l]) << 8u))
+                        let dr = f16_to_f32(uint(qr[bb]) | (uint(qr[bb + 1l]) << 8u))
+                        for (k in range64(32l)) {
+                            maxd = max(maxd, abs(float(int8(qb[bb + 2l + k])) * db - float(int8(qr[bb + 2l + k])) * dr))
+                        }
+                    }
                 } else {
                     let fb = reinterpret<float const?>(bp + base + row * rowb)
                     let fr = reinterpret<float const?>(rp + base + row * rowb)
@@ -198,6 +209,10 @@ def test_batch_decode_q8(t : T?) {
         if (model_missing(t)) {
             return
         }
+        // strict parity needs same-dot kernels on both paths: portable's batch and GEMV kernels
+        // share dot_q8q8, so batch == sequential holds at 1e-6 under any tune stamp; a tiled
+        // backend's batch GEMM accumulates in a different order (covered by test_batch_decode_tuned)
+        pin_kernel_backend("portable")
         var tr <- load_checkpoint(MODEL_PATH)
         quantize_weights(tr)  // all 2D weights -> Q8_0, tr.quant = q8
         let prev_fused = get_fused_decode()
@@ -206,6 +221,7 @@ def test_batch_decode_q8(t : T?) {
             batch_vs_ref(t, tr, KVDtype.f32, 8l, 1.0e-6, "q8")
         }
         set_fused_decode(prev_fused)
+        clear_kernel_backend_pin()
         delete tr
     }
 }
@@ -216,12 +232,42 @@ def test_batch_decode_f16_kv(t : T?) {
         if (model_missing(t)) {
             return
         }
+        pin_kernel_backend("portable")   // same-dot parity — see test_batch_decode_q8
         var tr <- load_checkpoint(MODEL_PATH)
         quantize_weights(tr)
         let prev_fused = get_fused_decode()
         set_fused_decode(false)
         with_job_que() {
             batch_vs_ref(t, tr, KVDtype.f16, 8l, 1.0e-6, "f16kv")
+        }
+        set_fused_decode(prev_fused)
+        clear_kernel_backend_pin()
+        delete tr
+    }
+}
+
+[test]
+def test_batch_decode_q8_kv(t : T?) {
+    t |> run("batched decode == sequential under the q8_0 KV codec (needs SmolLM2-135M)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        // stories15M's head_size 48 is rejected by the q8_0 32-block check (by design) — this arm
+        // runs the SmolLM2 GGUF carrier instead, same rail as test_fused_decode
+        let env = get_env_variable("DASLLAMA_MODELS_DIR")
+        let mdir = empty(env) ? "/Users/borisbatkin/Work/llama.cpp/models/" : env
+        let path = path_join(mdir, "SmolLM2-135M-Instruct-Q8_0.gguf")
+        if (!stat(path).is_valid) {
+            t |> success(true, "skipped: {path} not present")
+            return
+        }
+        var tr <- load_gguf(path, QuantMode.q8)
+        tr.config.seq_len = min(tr.config.seq_len, 64l)
+        let prev_fused = get_fused_decode()
+        set_fused_decode(false)
+        with_job_que() {
+            batch_vs_ref(t, tr, KVDtype.q8_0, 8l, 1.0e-6, "q8_0kv")
         }
         set_fused_decode(prev_fused)
         delete tr
@@ -302,6 +348,7 @@ def test_batch_decode_shrink(t : T?) {
         if (model_missing(t)) {
             return
         }
+        pin_kernel_backend("portable")   // same-dot parity — see test_batch_decode_q8
         var tr <- load_checkpoint(MODEL_PATH)
         quantize_weights(tr)
         let c = tr.config
@@ -364,6 +411,27 @@ def test_batch_decode_shrink(t : T?) {
             delete p0
             delete p1
             delete p2
+        }
+        set_fused_decode(prev_fused)
+        clear_kernel_backend_pin()
+        delete tr
+    }
+}
+
+[test]
+def test_batch_decode_tuned(t : T?) {
+    t |> run("active-backend batch kernels: tokens match sequential within the FP budget (needs stories15M.bin)") @(t : T?) {
+        if (model_missing(t)) {
+            return
+        }
+        // no pin: the load picks the box's best backend, whose batch GEMM tiles may accumulate in
+        // a different order than the GEMV path — tokens must still match, numerics within budget
+        var tr <- load_checkpoint(MODEL_PATH)
+        quantize_weights(tr)
+        let prev_fused = get_fused_decode()
+        set_fused_decode(false)
+        with_job_que() {
+            batch_vs_ref(t, tr, KVDtype.f32, 8l, 1.0e-3, "tuned")
         }
         set_fused_decode(prev_fused)
         delete tr

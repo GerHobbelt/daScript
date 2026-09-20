@@ -1202,6 +1202,29 @@ namespace das {
             case tFloat4:
             case tDouble:
             case tString:
+            case tFloat16:
+            case tHalf2:
+            case tHalf3:
+            case tHalf4:
+            case tHalf8:
+            case tShort2:
+            case tShort3:
+            case tShort4:
+            case tShort8:
+            case tUShort2:
+            case tUShort3:
+            case tUShort4:
+            case tUShort8:
+            case tByte2:
+            case tByte3:
+            case tByte4:
+            case tByte8:
+            case tByte16:
+            case tUByte2:
+            case tUByte3:
+            case tUByte4:
+            case tUByte8:
+            case tUByte16:
                 ser << alias;
                 DAS_VERIFYF_MULTI(!annotation, !structType, !enumType, !firstType, !secondType,
                                 argTypes.empty(), argNames.empty());
@@ -2567,6 +2590,7 @@ namespace das {
         *this << value.aot
               << value.aot_module
               << value.aot_macros
+              << value.tune_frozen
               << value.completion
               << value.export_all
               << value.serialize_main_module
@@ -2656,6 +2680,18 @@ namespace das {
     // Used in eden
     void AstSerializer::serializeProgram ( ProgramPtr program, ModuleGroup & libGroup ) noexcept {
         auto & ser = *this;
+        // version gate — the module-cache path (trySerializeProgramModule) checks only
+        // mtime+filename before this; a cache written by a different serializer version must
+        // fail cleanly here (the caller falls back to a full parse on ser.failed), not misparse
+        // every field after the first layout difference
+        uint32_t version = getVersion();
+        ser << version;
+        if ( !ser.writing && version != getVersion() ) {
+            LOG(LogLevel::warning) << "das: deserialize: module cache version " << version
+                << " does not match serializer version " << getVersion() << "\n";
+            ser.failed = true;
+            return;
+        }
         // Bump epoch so reused pointer addresses across program boundaries
         // get distinct SerializeNodeIds on this persistent serializer.
         ser.epoch++;
@@ -2780,6 +2816,16 @@ namespace das {
 
     // Used in daNetGame currently
     void Program::serialize ( AstSerializer & ser ) {
+        // version gate: any layout change shifts every subsequent field, so a stale stream must
+        // fail cleanly here — not misparse into a patch() throw thousands of fields later
+        uint32_t version = AstSerializer::getVersion();
+        ser << version;
+        if ( !ser.writing && version != AstSerializer::getVersion() ) {
+            LOG(LogLevel::warning) << "das: deserialize: stream version " << version
+                << " does not match serializer version " << AstSerializer::getVersion() << "\n";
+            failToCompile = true;
+            return;
+        }
         // Bump epoch so reused pointer addresses across program boundaries
         // get distinct SerializeNodeIds on this persistent serializer.
         ser.epoch++;
@@ -2935,7 +2981,14 @@ namespace das {
         auto prog = make_smart<Program>();
         {
             gc_guard deserialize_gc_scope;
-            prog->serialize(*state->serializer);
+            // same-version streams can still be truncated/corrupt: the stream readers throw
+            // dasException — turn it into the clean failToCompile path (mirrors serializeScript)
+            try {
+                prog->serialize(*state->serializer);
+            } catch ( const dasException & r ) {
+                prog->failToCompile = true;
+                LOG(LogLevel::warning) << "das: deserialize: " << r.what() << "\n";
+            }
             /*
             // THIS ONES ARE FROM THE "already exist" MODULES
             auto leftover = deserialize_gc_scope.guard_root.gc_count;

@@ -82,6 +82,22 @@ def template axpy_f16_template(var d : float ?; s : uint16 const ?; scale : floa
 [hint(unsafe_range_check, noalias = d, noalias = s), tuned]
 def axpy_f16(var d : float?; s : uint16 const?; scale : float; n : int64) {}
 
+//! Dot of an f32 row against a bfloat16 (bf16-in-uint16) row. The widen is the exact high-half
+//! bit shift, so the dots are bit-identical to pre-expanding the weight to fp32 — at half the
+//! weight bandwidth (llama.cpp's AVX2 ggml_vec_dot_bf16 widens the same way, but it also
+//! truncates the ACTIVATION to bf16; keeping ours f32 is strictly more precise).
+[hint(unsafe_range_check, noalias = a, noalias = b)]
+def template dot_bf16_template(a : float const ?; b : uint16 const ?; n : int64) : float {
+    var acc = 0.0
+    for [tune = 1] (j in range64(n)) {
+        acc = mad(unsafe(a[j]), unsafe(reinterpret<float>(uint(unsafe(b[j])) << 16u)), acc)
+    }
+    return acc
+}
+
+[hint(unsafe_range_check, noalias = a, noalias = b), tuned]
+def dot_bf16(a : float const?; b : uint16 const?; n : int64) : float {}
+
 //! f32 -> f16 row convert (the codec store). Clamps to ±65504 so inf can NEVER enter the cache —
 //! O(kv_dim) per token, free next to the reads.
 [hint(unsafe_range_check, noalias = d, noalias = s)]
@@ -107,6 +123,135 @@ def template cvt_f16_to_f32_template(var d : float ?; s : uint16 const ?; n : in
 [hint(unsafe_range_check, noalias = d, noalias = s), tuned]
 def cvt_f16_to_f32(var d : float?; s : uint16 const?; n : int64) {}
 
+// The q8_0 KV-codec kernels: the cache side is ggml block_q8_0 — 32 int8 quants sharing one f16
+// scale, INTERLEAVED {f16 d; int8 qs[32]} = 34 bytes per block (llama.cpp -ctk/-ctv q8_0 layout,
+// so the oracle cross-checks stay honest). Rows are whole blocks (kv_dim % 32 == 0, validated at
+// session create), so a row is n/32 blocks and the scale sits 2-byte aligned at each 34-byte step
+// (17 uint16s). n is always a multiple of 32.
+
+//! Dot of an f32 query row against a q8_0 cache row: the block scale factors out —
+//! d * Σ a[j]·q[j] per 32-block (the prefill read; decode uses the int8×int8 twin below).
+[hint(unsafe_range_check, noalias = a, noalias = b)]
+def template dot_q8kv_template(a : float const ?; b : uint8 const ?; n : int64) : float {
+    var acc = 0.0
+    unsafe {
+        let b16 = reinterpret<uint16 const?>(b)
+        let bq = reinterpret<int8 const?>(b)
+        for (bi in range64(n / 32l)) {
+            let base = bi * 32l
+            let qb = bi * 34l + 2l
+            var facc = 0.0
+            for [tune = 1] (k in range64(32l)) {
+                facc = mad(a[base + k], float(bq[qb + k]), facc)
+            }
+            acc = mad(facc, f16_to_f32(uint(b16[bi * 17l])), acc)
+        }
+    }
+    return acc
+}
+[hint(unsafe_range_check, noalias = a, noalias = b), tuned]
+def dot_q8kv(a : float const?; b : uint8 const?; n : int64) : float {}
+
+//! THE q8_0 decode hot path: a Q8-quantized query (int8 quants + f32 scales per 32, the
+//! quantize_q8_0_into planes) against a q8_0 cache row. The inner loop is pure int8·int8
+//! multiply-accumulate — the same SDOT/VNNI shape as dot_q8q8 — with both block scales
+//! multiplying in once per 32-block.
+[hint(unsafe_range_check, noalias = q, noalias = qs, noalias = b)]
+def template dot_q8q8kv_template(q : int8 const ?; qs : float const ?; b : uint8 const ?; n : int64) : float {
+    var acc = 0.0
+    unsafe {
+        let b16 = reinterpret<uint16 const?>(b)
+        let bq = reinterpret<int8 const?>(b)
+        for (bi in range64(n / 32l)) {
+            let base = bi * 32l
+            let qb = bi * 34l + 2l
+            var iacc = 0
+            for [tune = 1] (k in range64(32l)) {
+                iacc += int(q[base + k]) * int(bq[qb + k])
+            }
+            acc += float(iacc) * qs[bi] * f16_to_f32(uint(b16[bi * 17l]))
+        }
+    }
+    return acc
+}
+[hint(unsafe_range_check, noalias = q, noalias = qs, noalias = b), tuned(fallback = "vec16")]
+def dot_q8q8kv(q : int8 const?; qs : float const?; b : uint8 const?; n : int64) : float {}
+
+//! AXPY from a q8_0 cache row: d[j] += scale * (q[j] * d_block) — the V-accumulate under the
+//! q8_0 codec; scale * d_block hoists per 32-block.
+[hint(unsafe_range_check, noalias = d, noalias = s)]
+def template axpy_q8kv_template(var d : float ?; s : uint8 const ?; scale : float; n : int64) : void {
+    unsafe {
+        let s16 = reinterpret<uint16 const?>(s)
+        let sq = reinterpret<int8 const?>(s)
+        for (bi in range64(n / 32l)) {
+            let base = bi * 32l
+            let qb = bi * 34l + 2l
+            let c = scale * f16_to_f32(uint(s16[bi * 17l]))
+            for [tune = 1] (k in range64(32l)) {
+                d[base + k] = mad(c, float(sq[qb + k]), d[base + k])
+            }
+        }
+    }
+}
+[hint(unsafe_range_check, noalias = d, noalias = s), tuned]
+def axpy_q8kv(var d : float?; s : uint8 const?; scale : float; n : int64) {}
+
+//! q8_0 -> f32 row convert (the flash pack's bulk dequant): d[j] = q[j] * d_block.
+[hint(unsafe_range_check, noalias = d, noalias = s)]
+def template cvt_q8kv_to_f32_template(var d : float ?; s : uint8 const ?; n : int64) : void {
+    unsafe {
+        let s16 = reinterpret<uint16 const?>(s)
+        let sq = reinterpret<int8 const?>(s)
+        for (bi in range64(n / 32l)) {
+            let base = bi * 32l
+            let qb = bi * 34l + 2l
+            let db = f16_to_f32(uint(s16[bi * 17l]))
+            for [tune = 1] (k in range64(32l)) {
+                d[base + k] = float(sq[qb + k]) * db
+            }
+        }
+    }
+}
+[hint(unsafe_range_check, noalias = d, noalias = s), tuned]
+def cvt_q8kv_to_f32(var d : float?; s : uint8 const?; n : int64) {}
+
+//! Quantize n f32s (a whole number of 32-blocks) into q8_0 blocks at dst — the codec store.
+//! ggml's exact quantize_row_q8_0 semantics: per block d = amax/127 stored as f16, quants
+//! round with the UN-rounded f32 1/d — which makes the codec idempotent (re-quantizing a
+//! dequantized row is byte-identical: the max element quantizes to ±127, so the recovered
+//! d equals the stored f16 exactly). amax uses quantize_q8_0_into_ptr's two-lane float4 max
+//! (exact — max is order-free on finite input).
+[hint(unsafe_range_check, noalias = dst, noalias = src)]
+def template quantize_q8kv_row_template(var dst : uint8 ?; src : float const ?; n : int64) : void {
+    unsafe {
+        let p4 = reinterpret<float4 const?>(src)
+        var d16 = reinterpret<uint16?>(dst)
+        var dq = reinterpret<int8?>(dst)
+        for (bi in range64(n / 32l)) {
+            let base = bi * 32l
+            let f4 = base / 4l
+            var m0 = abs(p4[f4])
+            var m1 = abs(p4[f4 + 1l])
+            for (k in range64(1l, 4l)) {
+                m0 = max(m0, abs(p4[f4 + 2l * k]))
+                m1 = max(m1, abs(p4[f4 + 2l * k + 1l]))
+            }
+            let m = max(m0, m1)
+            let amax = max(max(m.x, m.y), max(m.z, m.w))
+            let d = amax / 127.0
+            let id = d != 0.0 ? 1.0 / d : 0.0
+            d16[bi * 17l] = uint16(f32_to_f16(d))
+            let qb = bi * 34l + 2l
+            for [tune = 1] (i in range64(32l)) {
+                dq[qb + i] = int8(round(src[base + i] * id))
+            }
+        }
+    }
+}
+[hint(unsafe_range_check, noalias = dst, noalias = src), tuned(fallback = "plain")]
+def quantize_q8kv_row(var dst : uint8?; src : float const?; n : int64) {}
+
 //! d[j] += s[j], width-8 vectorized (the residual-stream update). The plain `for k; a[k]+=b[k]`
 //! over bounds-checked arrays does NOT vectorize under the JIT — this pointer form is ~5x faster.
 [hint(unsafe_range_check, noalias = d, noalias = s)]
@@ -119,6 +264,20 @@ def template add_inplace_template(var d : float ?; s : float const ?; n : int64)
 }
 [hint(unsafe_range_check, noalias = d, noalias = s), tuned]
 def add_inplace(var d : float?; s : float const?; n : int64) {}
+
+//! d[j] = (d[j] + s[j]) * scale in ONE pass — the residual add fused with the per-layer output
+//! scale (gemma4 layer_out_scale, the PLE 1/sqrt(2) fold). Bit-identical to add_inplace followed
+//! by scale_inplace (same two fp ops per element, same order) at one RMW walk instead of two.
+[hint(unsafe_range_check, noalias = d, noalias = s)]
+def template add_scale_inplace_template(var d : float ?; s : float const ?; scale : float; n : int64) : void {
+    for [tune = 1] (j in range64(n)) {
+        unsafe {
+            d[j] = (d[j] + s[j]) * scale
+        }
+    }
+}
+[hint(unsafe_range_check, noalias = d, noalias = s), tuned]
+def add_scale_inplace(var d : float?; s : float const?; scale : float; n : int64) {}
 
 //! d[j] *= s[j], width-8 vectorized — the SwiGLU/GeGLU gate multiply (act(W1·x) * (W3·x)).
 [hint(unsafe_range_check, noalias = d, noalias = s)]
@@ -196,6 +355,25 @@ def public get_dispatch_worker_limit() : int { return g_dispatch_worker_limit }
 var g_team_rank_gate = -1
 def public set_team_rank_gate(v : int) { g_team_rank_gate = clamp(v, -1, 1) }
 def public get_team_rank_gate() : int { return g_team_rank_gate }
+
+// Trace op tags (jobque_trace_tag): stamped before dispatches so the lane-timeline viewer colors
+// by OP rather than stage-count. Gated — set_trace_tags(true) rides with jobque_trace_start in
+// the profiling harness; production dispatches never pay the extern call.
+var g_trace_tags = false
+def public set_trace_tags(on : bool) { g_trace_tags = on }
+let public TRACE_TAG_ATTN_CHAIN = 1
+let public TRACE_TAG_ATTN_STD = 2
+let public TRACE_TAG_FFN_CHAIN = 3
+let public TRACE_TAG_FFN_STD = 4
+let public TRACE_TAG_CLS = 5
+let public TRACE_TAG_MOE = 6
+let public TRACE_TAG_SHEXP = 7
+let public TRACE_TAG_PLE = 8
+def public trace_tag(t : int) {
+    if (g_trace_tags) {
+        jobque_trace_tag(t)
+    }
+}
 
 //! Configure the job queue for dasLLAMA's pure fork/join matmul dispatch: pooled fork contexts,
 //! batched dispatch, the spin-before-park window (box_profile.json "runtime" `jobque_spin_us`
@@ -294,11 +472,11 @@ def private assert_wave_aligned(chunks, lanes : int) {
 // ===== work-proportional dispatch (lanes sized to the matmul, not the box) =====
 
 // MACs of work that justify one dispatch chunk: lanes_for_work invites one lane per this much
-// work, so a tiny matmul stays inline (1 lane ⇔ work < 2×target — at the 1M default this is
-// exactly the old 2M binary par-threshold boundary) and a mid-size one invites only the lanes
-// it can feed. Runtime knob: tracks the box's per-chunk dispatch overhead (team_probe measures
-// it), not the kernel.
-var g_target_chunk_work = 1_000_000l
+// work; the chunk shapers' grain floors keep genuinely tiny matmuls inline regardless. Default 1
+// = dispatch everything the grains admit — the old 1M default left every per-layer attn matmul
+// of a ≤4B model single-lane (5-model curve A/B 2026-07-10: −5..−17% tok/s). Per-box runtime
+// knob for boxes where per-chunk dispatch overhead bites (team_probe suggests a value).
+var g_target_chunk_work = 1l
 def public set_target_chunk_work(v : int64) { g_target_chunk_work = max(v, 1l) }
 def public get_target_chunk_work() : int64 { return g_target_chunk_work }
 
@@ -413,6 +591,15 @@ var g_matmul_min_chunk_rows_gemv = 64
 def public set_matmul_min_chunk_rows_gemv(v : int) { g_matmul_min_chunk_rows_gemv = max(v, 0) }
 def public get_matmul_min_chunk_rows_gemv() : int { return g_matmul_min_chunk_rows_gemv }
 
+// GEMV tail A/B (per-lane trace, 3990X 2026-07-10): the one-chunk-per-lane equal split leaves
+// the join waiting out the SLOWEST lane's whole chunk — the median lane idles the last 14-24%
+// of every GEMV stage. >1 publishes up to this many wave-aligned chunks per lane (grain-floored)
+// so finished lanes keep serving and the tail shrinks to one small chunk. Default 8 (5-model
+// curve A/B 2026-07-10); 1 = the historical equal split.
+var g_gemv_chunks_per_lane = 8
+def public set_gemv_chunks_per_lane(v : int) { g_gemv_chunks_per_lane = max(v, 1) }
+def public get_gemv_chunks_per_lane() : int { return g_gemv_chunks_per_lane }
+
 // Wave fill: when the grain-derived count lands in [lanes/2, lanes), round UP to one full wave —
 // chunks shrink but stay >= grain/2 (the grain is chosen halvable), and no lane idles. Counts
 // below lanes/2 stay grain-limited (filling would shred chunks below the halvable bound).
@@ -434,10 +621,34 @@ def public matmul_chunks_gemv(rows : int; oversplit : int; work : int64) : int {
     if (g_matmul_min_chunk_rows_gemv <= 0) {
         return L * max(oversplit, 1)
     }
+    if (g_gemv_chunks_per_lane > 1) {
+        let waves = min(rows / (g_matmul_min_chunk_rows_gemv * L), g_gemv_chunks_per_lane)
+        if (waves >= 1) {
+            let chunks = waves * L
+            assert_wave_aligned(chunks, L)
+            return chunks
+        }
+        // fewer than one grain-sized chunk per lane — the grain-limited split below applies
+    }
     let n = clamp(rows / g_matmul_min_chunk_rows_gemv, 1, L)
     let chunks = (g_gemv_wave_fill && n < L && 2 * n >= L) ? L : n
     assert_wave_aligned(chunks, L)
     return chunks
+}
+
+//! Chunk count for a fused-chain stage over `groups` 32-row quant groups: the GEMV shaper's
+//! count, except fine-grain mode (gemv_chunks_per_lane > 1) splits at GROUP granularity (capped
+//! at lanes × fine) — chain chunks self-serve, so a ragged last wave costs one 32-row chunk,
+//! not one lane's whole share. Narrow (dim-sized) stages sit under the 64-row-grain × lane
+//! floor and kept a ~25% join tail otherwise (per-lane trace, 3990X).
+def public chain_stage_chunks(groups : int; rows : int; work : int64) : int {
+    if (g_gemv_chunks_per_lane > 1) {
+        let L = lanes_for_work(work, g_gemv_lane_cap)
+        if (L > 1) {
+            return min(groups, L * g_gemv_chunks_per_lane)
+        }
+    }
+    return matmul_chunks_gemv(rows, 1, work)
 }
 
 //! y = W·x — matrix-vector product, the dominant LLM compute kernel.
@@ -449,6 +660,24 @@ def matmul(var y : array<float>; w : array<float> | #; x : array<float>; n, d : 
     unsafe {
         var yp = addr(y[0])                              // var: stays a writable pointer when captured
         let wp = reinterpret<float const?>(addr(w[0]))   // strip the `#` if w is a view
+        let xp = addr(x[0])
+        maybe_parallel_for(0, int(d), matmul_chunks_gemv(int(d), 1, n * d)) $(rb, re) {
+            unsafe {
+                for (i in range(rb, re)) {
+                    yp[i] = dot(wp + int64(i) * n, xp, n)
+                }
+            }
+        }
+    }
+}
+
+//! Blob+offset form: the weight is rows [d x n] at element offset `woff` inside `w` — no
+//! array_view (the view's block invoke is an LLVM optimization boundary; the kernel only ever
+//! wanted the base pointer).
+def matmul(var y : array<float>; w : array<float>; woff : int64; x : array<float>; n, d : int64) {
+    unsafe {
+        var yp = addr(y[0])
+        let wp = reinterpret<float const?>(addr(w[woff]))
         let xp = addr(x[0])
         maybe_parallel_for(0, int(d), matmul_chunks_gemv(int(d), 1, n * d)) $(rb, re) {
             unsafe {
@@ -475,6 +704,48 @@ def matmul_batch(var y : array<float>; w : array<float> | #; x : array<float>; n
                     let wrow = wp + int64(i) * n
                     for (tk in range64(ntok)) {
                         yp[tk * d + int64(i)] = dot(wrow, xp + tk * n, n)
+                    }
+                }
+            }
+        }
+    }
+}
+
+//! Blob+offset form of matmul_batch (see the matmul woff overload).
+def matmul_batch(var y : array<float>; w : array<float>; woff : int64; x : array<float>; n, d, ntok : int64) {
+    unsafe {
+        var yp = addr(y[0])
+        let wp = reinterpret<float const?>(addr(w[woff]))
+        let xp = reinterpret<float const?>(addr(x[0]))
+        maybe_parallel_for(0, int(d), matmul_chunks(int(d), 1, n * d * ntok)) $(rb, re) {
+            unsafe {
+                for (i in range(rb, re)) {
+                    let wrow = wp + int64(i) * n
+                    for (tk in range64(ntok)) {
+                        yp[tk * d + int64(i)] = dot(wrow, xp + tk * n, n)
+                    }
+                }
+            }
+        }
+    }
+}
+
+//! Batched matvec against a native-BF16 weight [d x n] at halfword offset woff: Y [ntok x d]
+//! token-major. Per-row dot order matches matmul_batch on the fp32 expand and dot_bf16's widen
+//! is exact, so this is bit-for-bit the same Y at half the weight read. Decode (ntok == 1)
+//! takes the GEMV chunk shaper — fine-grain self-serve splits apply.
+def matmul_bf16_batch(var y : array<float>; w : array<uint16>; woff : int64; x : array<float>; n, d, ntok : int64) {
+    unsafe {
+        var yp = addr(y[0])
+        let wp = reinterpret<uint16 const?>(addr(w[woff]))
+        let xp = reinterpret<float const?>(addr(x[0]))
+        let nch = ntok == 1l ? matmul_chunks_gemv(int(d), 1, n * d) : matmul_chunks(int(d), 1, n * d * ntok)
+        maybe_parallel_for(0, int(d), nch) $(rb, re) {
+            unsafe {
+                for (i in range(rb, re)) {
+                    let wrow = wp + int64(i) * n
+                    for (tk in range64(ntok)) {
+                        yp[tk * d + int64(i)] = dot_bf16(xp + tk * n, wrow, n)
                     }
                 }
             }
@@ -630,6 +901,24 @@ def dot_q8(wq : int8 const?; ws : float const?; x : float const?; n : int64) : f
 //! Q8_0 matmul: y = W·x with W stored as int8 quants `wq` [d x n] + per-block scales
 //! `ws` [d x n/32]. Same auto-dispatch as the fp32 matmul; large matmuls thread the output
 //! rows (2x the worker count — Q8 is compute-bound and threads better than fp32). n % 32 == 0.
+//! Blob+offset form: weight region at element offset `woff` (scales at woff/32) — no array_view.
+def matmul_q8(var y : array<float>; wq : array<int8>; ws : array<float>; woff : int64; x : array<float>; n, d : int64) {
+    let nb = n / 32l
+    unsafe {
+        var yp = addr(y[0])
+        let wp = reinterpret<int8 const?>(addr(wq[woff]))
+        let sp = reinterpret<float const?>(addr(ws[woff / 32l]))
+        let xp = addr(x[0])
+        maybe_parallel_for(0, int(d), matmul_chunks_gemv(int(d), g_q8_chunks_per_job, n * d)) $(rb, re) {
+            unsafe {
+                for (i in range(rb, re)) {
+                    yp[i] = dot_q8(wp + int64(i) * n, sp + int64(i) * nb, xp, n)
+                }
+            }
+        }
+    }
+}
+
 def matmul_q8(var y : array<float>; wq : array<int8> | #; ws : array<float> | #; x : array<float>; n, d : int64) {
     let nb = n / 32l
     unsafe {
@@ -969,10 +1258,17 @@ def register_kernel_backend(be : KernelBackend) {
 }
 
 //! Activate a registered backend by name (explicit control / A/B benchmarking). No-op if unknown.
+//! Runs the availability witness first — for some backends it doubles as the runtime enable
+//! (amx = XTILEDATA arch_prctl); activating past it would SIGILL on the first tile op.
 def select_kernel_backend(name : string) {
-    if (key_exists(g_kernel_backends, name)) {
-        activate(g_kernel_backends[name])
+    if (!key_exists(g_kernel_backends, name)) {
+        return
     }
+    if (!invoke(g_kernel_backends[name].available)) {
+        to_log(LOG_WARNING, "dasLLAMA: select_kernel_backend('{name}') — backend reports itself unavailable in this configuration; keeping '{g_active_backend}'\n")
+        return
+    }
+    activate(g_kernel_backends[name])
 }
 
 //! Pin the active backend to `name` (forces it; suppresses auto-select on later registrations). For A/B
@@ -1098,6 +1394,16 @@ def matmul_q8q8(var y : array<float>; wq : array<int8> | #; ws : array<float> | 
     }
 }
 
+//! Blob+offset form: the weight region at element offset `woff` in the whole quantized blob
+//! (scales at woff/32) — no array_view (see the matmul woff overload).
+def matmul_q8q8(var y : array<float>; wq : array<int8>; ws : array<float>; woff : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
+    unsafe {
+        invoke(g_mm_q8q8, addr(y[0]),
+            reinterpret<int8 const?>(addr(wq[woff])), reinterpret<float const?>(addr(ws[woff / 32l])),
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d)
+    }
+}
+
 //! Batched Q8·Q8 GEMM for prefill: same weight-stationary nest as matmul_batch over the SDOT kernel.
 //! Activations PRE-quantized per token into (xq [ntok x n], xs [ntok x n/32]). Y token-major
 //! [ntok x d]. Bit-for-bit ntok× matmul_q8q8. Dispatches to the active backend. n % 32 == 0.
@@ -1105,6 +1411,15 @@ def matmul_q8q8_batch(var y : array<float>; wq : array<int8> | #; ws : array<flo
     unsafe {
         invoke(g_mm_q8q8_batch, addr(y[0]),
             reinterpret<int8 const?>(addr(wq[0])), reinterpret<float const?>(addr(ws[0])),
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d, ntok)
+    }
+}
+
+//! Blob+offset form (weights at woff, scales at woff/32) — no array_view.
+def matmul_q8q8_batch(var y : array<float>; wq : array<int8>; ws : array<float>; woff : int64; xq : array<int8>; xs : array<float>; n, d, ntok : int64) {
+    unsafe {
+        invoke(g_mm_q8q8_batch, addr(y[0]),
+            reinterpret<int8 const?>(addr(wq[woff])), reinterpret<float const?>(addr(ws[woff / 32l])),
             reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d, ntok)
     }
 }
@@ -1163,6 +1478,16 @@ def matmul_mx4q8(var y : array<float>; wn : array<uint8> | #; we : array<uint8> 
     }
 }
 
+//! Blob+offset form: weight region at ELEMENT offset `woff` in the whole nibble/exponent planes
+//! (nibbles at woff/2, E8M0 at woff/32) — no array_view.
+def matmul_mx4q8(var y : array<float>; wn : array<uint8>; we : array<uint8>; woff : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
+    unsafe {
+        invoke(g_mm_mx4q8, addr(y[0]),
+            reinterpret<uint8 const?>(addr(wn[woff / 2l])), reinterpret<uint8 const?>(addr(we[woff / 32l])),
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d)
+    }
+}
+
 //! Batched MXFP4·Q8 GEMM for prefill — the batch analog of matmul_mx4q8 (Y token-major [ntok x d],
 //! activations PRE-quantized per token into xq [ntok x n] / xs [ntok x n/32]). Dispatches to the
 //! active backend (g_mm_mx4q8_batch); only backends flagged mx4_native_batch provide one (the stub
@@ -1171,6 +1496,15 @@ def matmul_mx4q8_batch(var y : array<float>; wn : array<uint8> | #; we : array<u
     unsafe {
         invoke(g_mm_mx4q8_batch, addr(y[0]),
             reinterpret<uint8 const?>(addr(wn[0])), reinterpret<uint8 const?>(addr(we[0])),
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d, ntok)
+    }
+}
+
+//! Blob+offset form (nibbles at woff/2, E8M0 at woff/32) — no array_view.
+def matmul_mx4q8_batch(var y : array<float>; wn : array<uint8>; we : array<uint8>; woff : int64; xq : array<int8>; xs : array<float>; n, d, ntok : int64) {
+    unsafe {
+        invoke(g_mm_mx4q8_batch, addr(y[0]),
+            reinterpret<uint8 const?>(addr(wn[woff / 2l])), reinterpret<uint8 const?>(addr(we[woff / 32l])),
             reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d, ntok)
     }
 }
@@ -1281,6 +1615,26 @@ def dot_q4(wq : uint8 const?; ws : float const?; x : float const?; n : int64) : 
 //! Q4_0 matmul: y = W·x with W as 4-bit quants `wq` [d x n/2 bytes] + per-block scales `ws`
 //! [d x n/32]. Large matmuls thread the output rows at 4 chunks per hw job (4N — the heavy nibble
 //! unpack is compute-bound, so finer splitting balances better); small ones stay single. n % 32 == 0.
+//! Blob+offset form: weight region at ELEMENT offset `woff` (bytes at woff/2, scales at woff/32)
+//! — no array_view.
+def matmul_q4(var y : array<float>; wq : array<uint8>; ws : array<float>; woff : int64; x : array<float>; n, d : int64) {
+    let nb = n / 32l
+    let nh = n / 2l
+    unsafe {
+        var yp = addr(y[0])
+        let wp = reinterpret<uint8 const?>(addr(wq[woff / 2l]))
+        let sp = reinterpret<float const?>(addr(ws[woff / 32l]))
+        let xp = addr(x[0])
+        maybe_parallel_for(0, int(d), matmul_chunks_gemv(int(d), g_q4_chunks_per_job, n * d)) $(rb, re) {
+            unsafe {
+                for (i in range(rb, re)) {
+                    yp[i] = dot_q4(wp + int64(i) * nh, sp + int64(i) * nb, xp, n)
+                }
+            }
+        }
+    }
+}
+
 def matmul_q4(var y : array<float>; wq : array<uint8> | #; ws : array<float> | #; x : array<float>; n, d : int64) {
     let nb = n / 32l
     let nh = n / 2l
@@ -1370,15 +1724,29 @@ def template softmax_template(var x : float ?; size : int64) : void {
     if (size <= 0) return   // seeds the reduction with x[0]; size<=0 must be a no-op (same contract as the array overload)
     unsafe {
         let maxv = hmax(x, size)   // hand-vectorized max reduction (see hmax)
-        var sum = 0.0
-        for [tune = 1] (i in range64(size)) {
-            let e = exp(x[i] - maxv)
+        // exp4 fold (like the flash softmax folds): clamp underflow to -80 (exp -> ~0, negligible)
+        let m4 = float4(maxv, maxv, maxv, maxv)
+        var sum4 = float4(0.0)
+        var i = 0l
+        while (i + 4l <= size) {
+            let e = exp4(max(float4(x[i], x[i + 1l], x[i + 2l], x[i + 3l]) - m4, EXP4_LO))
+            x[i] = e.x
+            x[i + 1l] = e.y
+            x[i + 2l] = e.z
+            x[i + 3l] = e.w
+            sum4 += e
+            i += 4l
+        }
+        var sum = sum4.x + sum4.y + sum4.z + sum4.w
+        while (i < size) {
+            let e = exp(max(x[i] - maxv, -80.0))
             x[i] = e
             sum += e
+            i++
         }
         let inv_sum = 1.0 / sum   // scale by the reciprocal (matches ggml_vec_scale_f32), not a per-element /=
-        for [tune = 1] (i in range64(size)) {
-            x[i] *= inv_sum
+        for [tune = 1] (j in range64(size)) {
+            x[j] *= inv_sum
         }
     }
 }
@@ -1397,16 +1765,30 @@ def template softmax_sink_template(var x : float ?; size : int64; sink : float) 
     if (size <= 0) return
     unsafe {
         let maxv = max(hmax(x, size), sink)
-        var sum = 0.0
-        for [tune = 1] (i in range64(size)) {
-            let e = exp(x[i] - maxv)
+        // exp4 fold — same shape (and clamp convention) as softmax_template
+        let m4 = float4(maxv, maxv, maxv, maxv)
+        var sum4 = float4(0.0)
+        var i = 0l
+        while (i + 4l <= size) {
+            let e = exp4(max(float4(x[i], x[i + 1l], x[i + 2l], x[i + 3l]) - m4, EXP4_LO))
+            x[i] = e.x
+            x[i + 1l] = e.y
+            x[i + 2l] = e.z
+            x[i + 3l] = e.w
+            sum4 += e
+            i += 4l
+        }
+        var sum = sum4.x + sum4.y + sum4.z + sum4.w
+        while (i < size) {
+            let e = exp(max(x[i] - maxv, -80.0))
             x[i] = e
             sum += e
+            i++
         }
-        sum += exp(sink - maxv)
+        sum += exp(max(sink - maxv, -80.0))
         let inv_sum = 1.0 / sum
-        for [tune = 1] (i in range64(size)) {
-            x[i] *= inv_sum
+        for [tune = 1] (j in range64(size)) {
+            x[j] *= inv_sum
         }
     }
 }
@@ -1445,6 +1827,71 @@ def exp4(x : float4) : float4 {
         let k = reinterpret<float4>((zbits << 23) + uint4(0x3f800000u, 0x3f800000u, 0x3f800000u, 0x3f800000u))
         return mad(p, k, k)                                          // 2^n * (1 + poly(b))
     }
+}
+
+//! Index of the max element, first-index-wins on ties — the greedy-decode argmax. Chunked team
+//! scan (per-lane trace: the serial 151-262k-vocab scan idled every lane for 210-284us per token,
+//! the only all-lanes-blank band left in a decode token); the combine folds candidates in index
+//! order with strict >, so the result is bit-identical to the serial loop for ANY split.
+def public parallel_argmax(x : float const?; n : int64) : int64 {
+    if (n <= 1l) {
+        return 0l
+    }
+    let nch = int(min(int64(get_dispatch_lanes()) * 2l, n / 4096l))
+    unsafe {
+        if (nch <= 1) {
+            var best = 0l
+            for (i in range64(1l, n)) {
+                if (x[i] > x[best]) {
+                    best = i
+                }
+            }
+            return best
+        }
+        var cm : array<float>
+        var ci : array<int64>
+        cm |> resize(nch)
+        ci |> resize(nch)
+        var cmp = addr(cm[0])
+        var cip = addr(ci[0])
+        let nn = n
+        let nc = int64(nch)
+        maybe_parallel_for(0, nch, nch) $(cb, ce) {
+            unsafe {
+                for (c in range(cb, ce)) {
+                    let r0 = int64(c) * nn / nc
+                    let r1 = (int64(c) + 1l) * nn / nc
+                    var b = r0
+                    for (i in range64(r0 + 1l, r1)) {
+                        if (x[i] > x[b]) {
+                            b = i
+                        }
+                    }
+                    cmp[c] = x[b]
+                    cip[c] = b
+                }
+            }
+        }
+        var best = ci[0]
+        var bm = cm[0]
+        for (c in range(1, nch)) {
+            if (cm[c] > bm) {
+                bm = cm[c]
+                best = ci[c]
+            }
+        }
+        delete cm
+        delete ci
+        return best
+    }
+}
+
+//! Array overload — forwards to the pointer core.
+def public parallel_argmax(x : array<float> | #; n : int64) : int64 {
+    if (n <= 0l) {
+        return 0l
+    }
+    return parallel_argmax(unsafe(addr(x[0])), n)
 }
 
 //! SiLU (a.k.a. swish) activation: silu(x) = x * sigmoid(x) = x / (1 + exp(-x)).
@@ -1677,7 +2124,8 @@ def softcap(var x : array<float> | #; size : int64; cap : float) {
 
 //! Vectorized logit soft-capping: x = cap * tanh(x/cap), float4 with exp4 via the same identity as
 //! geglu4 (tanh(a) = 1 - 2/(1+exp(2a))). ~2 ulp, NOT bit-exact vs the scalar libm-tanh softcap. Flash
-//! attention soft-caps the whole Q×KV score tile in one sweep. Tail runs the scalar form.
+//! attention soft-caps the whole Q×KV score tile in one sweep; the final classifier logits use it too
+//! (a 256k-vocab scalar-tanh pass was 2-4ms of every-lane-idle per token). Tail runs the scalar form.
 def softcap4(var x : float?; size : int64; cap : float) {
     let one = float4(1.0, 1.0, 1.0, 1.0)
     let two = float4(2.0, 2.0, 2.0, 2.0)
@@ -1696,6 +2144,9 @@ def softcap4(var x : float?; size : int64; cap : float) {
             x[i] = cap * tanh(x[i] * inv)
         }
     }
+}
+def softcap4(var x : array<float> | #; size : int64; cap : float) {
+    softcap4(unsafe(addr(x[0])), size, cap)
 }
 
 //! RoPE — rotary position embedding. Rotates each adjacent coordinate pair (2j, 2j+1)

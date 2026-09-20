@@ -41,7 +41,13 @@ struct Args {
     @clarg_doc = "KV cache dtype (default: f32)"
     kv : KVDtype = KVDtype.f32
 
-    @clarg_doc = "Override target_chunk_work (MACs per dispatch chunk; 1 = thread everything, -1 = keep default)"
+    @clarg_doc = "Page the KV cache through a KVPool instead of the flat slabs"
+    paged : bool
+
+    @clarg_doc = "Positions per page when --paged (default: 64)"
+    page_rows : int = 64
+
+    @clarg_doc = "Override target_chunk_work (MACs per dispatch chunk; default 1 = thread everything; 1000000 = the old coarse threshold; -1 = keep default)"
     target_work : int = -1
 
     @clarg_doc = "Override the GEMV lane cap (0 = uncapped, -1 = keep default)"
@@ -56,6 +62,12 @@ struct Args {
     @clarg_doc = "Team dispatch: workers self-serve chunks off one published atomic instead of per-chunk fifo jobs"
     team : bool
 
+    @clarg_doc = "Save a per-lane jobque event trace of the FIRST decode window to this path (Perfetto/chrome-tracing JSON)"
+    trace : string
+
+    @clarg_doc = "GEMV chunks per lane (fine-grain self-serve tail; default 8; 1 = the old equal split; -1 = keep default)"
+    fine : int = -1
+
     @clarg_doc = "A/B: size chunk counts to workers only (the pre-fix split), not workers + caller lane"
     legacy_lanes : bool
 
@@ -69,15 +81,7 @@ def private build_prompt(n : int64) : array<int64> {
 }
 
 def private greedy_top(s : Session; vocab : int64) : int64 {
-    var best = 0l
-    var bestv = s.logits[0]
-    for (i in range64(vocab)) {
-        if (s.logits[i] > bestv) {
-            bestv = s.logits[i]
-            best = i
-        }
-    }
-    return best
+    return parallel_argmax(s.logits, vocab)   // team-scanned; bit-identical to the serial loop
 }
 
 // Bytes read per weight for a quant mode (quants + fp32 block scales at 1 per 32).
@@ -98,7 +102,6 @@ def private mb(v : double) : double => v / (1024.0lf * 1024.0lf)
 def private print_traffic_table(t : Model; pos : int64; kvdt : KVDtype) {
     let c = t.config
     let wb = wbytes(t.quant)
-    let kv_esize = double(kv_elem_bytes(kvdt))
     let dim = c.dim
     var attn = 0.0lf
     var kv_read = 0.0lf
@@ -108,7 +111,7 @@ def private print_traffic_table(t : Model; pos : int64; kvdt : KVDtype) {
         let wv = t.wv_offs[l] >= 0l ? double(dim * kvd) : 0.0lf
         attn += (double(dim * qd) + double(dim * kvd) + wv + double(qd * dim)) * wb
         let cnt = layer_is_sliding(c, l) ? min(pos, c.sliding_window) : pos
-        kv_read += double(cnt * kvd) * 2.0lf * kv_esize
+        kv_read += double(cnt * kv_row_bytes(kvdt, kvd)) * 2.0lf   // row bytes: codec-exact (q8_0 incl. block scales)
     }
     var ffn = 0.0lf
     var moe = 0.0lf
@@ -164,9 +167,16 @@ def private profile_window(t : Model; var s : Session; p, n : int64; tok0 : int6
     return tok
 }
 
-def private run_profile(var t : Model; p, n, p2 : int64; team : bool; kvdt : KVDtype) {
+def private run_profile(var t : Model; p, n, p2 : int64; team : bool; kvdt : KVDtype; paged : bool; page_rows : int64; trace : string) {
     let c = t.config
-    var s <- make_run_state(c, kvdt, kvdt)
+    var pool <- create_kv_pool_(c, page_rows, kvdt, kvdt)   // empty (no groups) unless --paged
+    var s : Session
+    if (paged) {
+        s <- make_run_state_paged(c, pool)
+        print("paged KV: page_rows={page_rows}\n")
+    } else {
+        s <- make_run_state(c, kvdt, kvdt)
+    }
     with_job_que() {
         setup_dasllama_jobque_()   // pooled forks + batched dispatch + spin window + join poll (the engine standard)
         if (team) {   // needs the live job que — must sit inside with_job_que
@@ -183,7 +193,20 @@ def private run_profile(var t : Model; p, n, p2 : int64; team : bool; kvdt : KVD
         let prompt <- build_prompt(p)
         forward_prefill(t, s, prompt, p, 0l)
         var tok = greedy_top(s, c.vocab_size)
+        if (!empty(trace)) {
+            jobque_trace_start(1 << 17)
+            set_trace_tags(true)
+        }
         tok = profile_window(t, s, p, n, tok)
+        if (!empty(trace)) {
+            set_trace_tags(false)
+            jobque_trace_stop()
+            if (jobque_trace_save(trace)) {
+                print("jobque trace saved: {trace}\n")
+            } else {
+                print("jobque trace: nothing recorded\n")
+            }
+        }
         if (p2 > p + n) {   // second window, deeper into the context, off the same load
             let fill = p2 - (p + n)
             let more <- build_prompt(fill)
@@ -247,6 +270,10 @@ def main() {
         set_dispatch_caller_lane(false)
         print("dispatch lanes: workers only (legacy)\n")
     }
+    if (cfg.fine >= 1) {
+        set_gemv_chunks_per_lane(cfg.fine)
+        print("gemv_chunks_per_lane override: {cfg.fine}\n")
+    }
     // A/B the fused per-block decode chains (default on; 0 = per-op dispatches) — same rail
     // as emission_bench
     if (has_env_variable("DASLLAMA_FUSED_DECODE")) {
@@ -256,5 +283,5 @@ def main() {
     if (cfg.kv != KVDtype.f32) {
         print("kv cache dtype: {cfg.kv}\n")
     }
-    run_profile(t, p, n, p2, cfg.team, cfg.kv)
+    run_profile(t, p, n, p2, cfg.team, cfg.kv, cfg.paged, int64(cfg.page_rows), cfg.trace)
 }
