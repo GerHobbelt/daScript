@@ -21,16 +21,17 @@ call-free code.
 
 | Path | What |
 |---|---|
-| `shaders/user_shader/`, `shaders/user_shader_2d/` | The real EdenSpark sample shaders (3D + 2D post-fx), **unedited**. |
+| `shaders/user_shaders/`, `shaders/user_shaders_2d/` | The real EdenSpark sample shaders (3D + 2D post-fx), **unedited**. |
+| `shaders/features/` | Loop-unroll feature fixtures (array-literal / parallel multi-iterator / `urange` sources). The backend bans `ExprFor`, so these compile **only** because flatten unrolls them — flatten is load-bearing, not transparent. |
 | `backend/shader_dsl_primitives.das` | The `[hint]`/`[stub]` leaf primitives + I/O contract structs (`PbrInput`/`PbrOutput`). |
-| `backend/shader_dsl_boost.das` | The validator + graph IR builder + the `[shader(stage=,type=)]` annotation. **This is where flatten is wired in.** |
+| `backend/shader_dsl_boost.das` | The validator + graph IR builder + the `[pixel_shader]` annotation. **This is where flatten is wired in.** |
 | `backend/shader_graph_ir_builder.das` | Print-only stand-in for the engine's native `sg_ir_*` graph sink — dumps human-readable opcodes. |
 | `backend/shader_dsl.das` | Re-exporter: `require engine.render.shader_dsl` pulls in the two modules above. |
 | `flatten_shaders.das_project` | Module resolver aliasing `engine.render.shader_dsl` → `backend/`, so the real shaders compile with **zero edits**. |
 
 ## How flatten plugs in
 
-The `[shader]` annotation's `patch` hook calls `flatten_function(func, HINT_WHITELIST)`
+The `[pixel_shader]` annotation's `patch` hook calls `flatten_function(func, HINT_WHITELIST)`
 *before* validation (`backend/shader_dsl_boost.das`). `HINT_WHITELIST` is the set of
 backend primitive names — flatten keeps those calls as leaves and inlines/lowers
 everything else. The backend then walks the branchless result. For the capability
@@ -39,10 +40,13 @@ consume flatten's `?:` output.
 
 ## Two tiers
 
-- **Regression** — all 61 real shaders are already 100% branchless dataflow (there is
-  no control-flow primitive in the DSL *yet* — flatten is what adds one). flatten must
+- **Regression** — the real `user_shaders*` are already 100% branchless dataflow (there
+  is no control-flow primitive in the DSL *yet* — flatten is what adds one). flatten must
   be **transparent** on them: the emitted graph is the same one the backend produces
-  without flatten. `./run.sh` checks every shader compiles clean and emits a graph.
+  without flatten. The `shaders/features/` fixtures additionally exercise the loop-unroll
+  source forms (`for…in` array literal, parallel `(a, b in xs, ys)`, `urange`) — there
+  flatten is load-bearing, but the same compile-clean check covers them. `./run.sh`
+  checks every shader compiles clean and emits a graph.
 - **Capability** *(`capability/check.sh`)* — shaders written with constructs the
   backend rejects today, made to compile by flatten. This is the feature flatten
   exists to deliver:

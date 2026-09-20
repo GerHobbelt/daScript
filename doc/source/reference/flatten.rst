@@ -89,6 +89,12 @@ predicate. Per-iteration locals are renamed so the copies don't collide. Paralle
 multi-source loops (``for (a, b in xs, ys)``) unroll in lockstep — every source
 must have the same constant length — substituting each loop variable per copy.
 
+**Generated locals are reserved-namespaced.** Every flatten-introduced local takes a
+``__``-prefixed name — ``__flat_*`` for the lowering scaffold (live masks, value temps,
+unrolled-loop locals) and ``__ssa_*`` for the single-assignment versions of reassigned
+user locals. The language reserves the ``__`` prefix (a user cannot declare such a name),
+so the generated names never collide with anything in the source.
+
 **break / continue** lower to predication, not jumps:
 
 - ``break`` narrows a **loop-scoped mask** that is declared once and *persists
@@ -112,18 +118,28 @@ arm and drops the pure self-assigns a folded false-select leaves behind.
 **Constant folding.** Because the branchless target has no downstream optimizer,
 the twin is reduced as far as possible *before* the backend sees it. The
 post-inference fold applies algebraic identities — ``x*1``, ``x+0``, ``x-0`` and
-``x*-1`` over int / float / vectors (each keeps the non-constant operand, so the
-vector type survives), plus a **scalar-only** ``x*0`` (it returns the zero
-literal, so it is gated to a scalar result — a runtime ``vec*0`` is left intact
-and folds only when the vector operand is itself constant, via full-const eval),
-and the boolean ``true && x``, ``c ? true : false``, ``!const``. It also collapses
-constant vector constructors (``float3(1, 2, 3)``) and const-argument pure
-builtins (``float(7)``, ``min(2, 3)``) to literals, and constant-propagates
-single-definition locals — so a fully-constant accumulator loop reduces to its
-final constant. These are exactly the folds the general compiler leaves for the
-downstream tiers (it folds constant *arithmetic* but not constant *constructors*,
-and never a runtime-operand identity), done here under a shader's fast-math
-assumption (scalar ``x*0 → 0`` always fires).
+``x*-1`` — over the full **scalar + vector (float / int / uint)** family, with the
+constant operand either a scalar or an all-lanes-equal vector literal (``x * float3(1)``,
+``v + int3(0)``, ``uint3(0) - w``). Each returns the non-constant operand, gated on a
+matching result type so a scalar-broadcast ``s * float3(1)`` (which is ``float3(s,s,s)``,
+not ``s``) is left intact rather than collapsing to the scalar. ``x*0`` returns a zero of
+the **result type**, so both ``v * 0`` and ``v * float3(0)`` fold to a width-matched vector
+zero (``*-1`` is signed-only — an unsigned "-1" is not a negation factor). It also folds
+the boolean ``true && x``, ``c ? true : false``, ``!const``; collapses constant vector
+constructors (``float3(1, 2, 3)``, ``uint3(1, 2, 3)``) and const-argument pure builtins
+(``float(7)``, ``min(2, 3)``) to literals; and constant-propagates single-definition
+locals — so a fully-constant accumulator loop reduces to its final constant. It also
+**reassociates** scattered constants in commutative ``+``/``-`` and ``*`` chains —
+``0.5 + x + 0.6 → x + 1.1``, ``2 * x * 3 → x * 6`` — gathering the constant operands the
+general compiler leaves non-adjacent (it folds only *adjacent* constant arithmetic and never
+reassociates, for float rounding) into one adjacent group the all-const fold then collapses.
+The same pass sorts the chain's *variable* terms into a canonical (structural) order, so
+commutative chains converge to one form (``b + a`` and ``a + b`` both become ``a + b``) —
+gated on every term being side-effect-free, and intended to feed a later common-subexpression
+pass. Integer ``+``/``*`` reassociate exactly; integer ``/`` is non-associative and excluded.
+These are exactly the folds the general compiler leaves for the downstream tiers (it folds
+constant *arithmetic* but not constant *constructors*, and never a runtime-operand identity
+or reassociation), done here under a shader's fast-math assumption (``x*0 → 0`` always fires).
 
 The fold and the typer's const-fold are *mutually-enabling*, so the fold phase
 **iterates to a fixpoint**. Flattening folds the runtime-operand identities the
@@ -132,6 +148,29 @@ freshly-constant operands the fold does not touch (``24 >> (24 & 31) → 0``),
 which can expose a fresh identity (``x - 0``) for the next pass. A single pass is
 therefore not enough — the fold re-runs until nothing changes before the twin is
 handed to the backend.
+
+**Preshader extraction and CSE.** Once the fold fixpoint converges, a final
+optimize pass runs **once** on the canonical body — preshader extraction then
+common-subexpression elimination (``flatten_optimize``):
+
+* **Preshader extraction** colours each subtree *uniform* (it reads only material
+  props / shader globals + literals) or *varying* (it transitively reads a function
+  parameter). Every maximal uniform subtree is hoisted to a top-of-body
+  ``_preshader_N`` ``let``; a backend recognises the name prefix and routes the node
+  to the **per-draw preshader**, so uniform work the general compiler would re-run
+  per pixel runs once per draw. Sampler / procedural intrinsics (``tex2d``, ``noise``)
+  are *barriers* — they cannot run in a preshader, so a subtree containing one stays
+  per-pixel even when its inputs are uniform.
+* **CSE** value-numbers the (now-canonical) body by structural key and shares any
+  pure subtree computed twice or more into one ``let`` before its first use, so the
+  backend emits one graph node and *N* links instead of *N* recomputations. The
+  reassociation pass's canonical operand order is what makes the key match across
+  ``a + b`` and ``b + a``; a uniform repeat routes to the preshader
+  (``_preshader_cse_``), a varying one stays in the body (``_cse_``).
+
+Both passes are **value-exact** — they only hoist and share existing subtrees, never
+regroup or round — and both exclude any subtree that reads a **reassigned** variable
+(a live/loop mask or a written global), whose value is not stable across the body.
 
 Supported subset
 ================
@@ -211,15 +250,6 @@ Public API
     The thin annotation. Generates ``<name>_flat`` with the standard whitelist.
     Use it when you just want a flattened twin to call.
 
-``[flatten(strict_fold = true)]``
-    Opt-in verification. The final shape check additionally rejects any
-    const-foldable residual the fold should have collapsed — an unconditional
-    algebraic identity, an all-const foldable call, a const-condition select, or
-    ``!const`` — turning a *missed* fold into a compile error. Default off (a
-    missed fold is suboptimal, not wrong); turn it on in tests to prove the
-    reduction actually happened, since a differential check alone cannot see a
-    fold that failed to fire.
-
 ``flatten_function(var func, whitelist : table<string>) : FlatCtx?``
     Flattens ``func``'s body in place using the caller-supplied primitive set.
     Backends call this directly with their own ``[hint]`` primitives, before
@@ -232,12 +262,47 @@ Public API
     *after* re-inference (the constant conditions must already be folded to
     ``ExprConstBool``). ``[flatten]`` runs it automatically; a backend calling
     ``flatten_function`` runs it after its own re-infer, before consuming the
-    twin.
+    twin. A single call is **one shallow pass — it is not self-converging**.
+    A multi-step *reveal* cascade (a folded ``0*s → 0`` makes a local constant
+    that the next re-infer settles for const-prop, exposing a fresh ``v + 0``
+    identity) only fully collapses if the backend **re-enters the fold across
+    re-inference until it reports no change** — exactly as ``[flatten]``'s own
+    patch does (and as the ``[pixel_shader]`` backend now does).
+
+``flatten_fold_residuals(var func) : array<string>``
+    Test-framework / fuzzer introspection: walks a compiled twin's final body
+    and returns a description for each const-foldable residual a complete fold
+    should have collapsed — an unconditional algebraic identity (``x*1``,
+    ``x+0``, …), an all-const foldable call, a const-condition select, or
+    ``!const``. Empty means clean. It runs over the *compiled* output (not at
+    transform time), so it covers backend paths such as ``[pixel_shader]`` and
+    is the fold-completeness oracle for both ``tests/flatten/test_flatten_fold.das``
+    (the ``[flatten]`` + const-identity corpus and every example shader) and the
+    ``flatten-fuzz`` ``--strict-fold`` mode. This is the *only* fold-completeness
+    check — there is no compile-time flag; a missed fold is suboptimal, not an
+    error, so it is validated by tests rather than gated in the macro.
+
+``flatten_optimize(var func, barriers : table<string>) : bool``
+    The post-fold optimize pass: hoist maximal uniform subtrees to per-draw
+    ``_preshader_`` lets, then CSE-dedup repeated subtrees. Run it **once** after
+    the ``flatten_fold`` fixpoint converges (and *not* before — reassociation runs
+    in the fold and would reorder a hoisted reference back into a fresh uniform
+    subtree). ``barriers`` is the backend's sampler / intrinsic call-name set
+    (``{ "tex2d", "noise" }``) — those stay per-pixel. ``[flatten]`` runs it
+    automatically; the ``[pixel_shader]`` backend runs it after its fold fixpoint.
+
+``flatten_opt_residuals(var func) : array<string>``
+    The optimize-completeness oracle (sibling of ``flatten_fold_residuals``):
+    walks a compiled twin and returns a description for each missed optimization —
+    a maximal uniform subtree still inline in the varying body, or a pure subtree
+    computed twice or more left un-shared. Empty means complete. Drives the same
+    ``tests/flatten/test_flatten_fold.das`` corpus and the ``flatten-fuzz``
+    strict mode.
 
 A backend's typical pipeline is therefore: ``flatten_function`` → re-infer →
-``flatten_fold`` → re-infer → walk the now-branchless, call-free twin and emit
-its dataflow graph (mapping ``?:`` to a *select* node and the bool masks to a
-0/1 selector).
+``flatten_fold`` (to a fixpoint) → re-infer → ``flatten_optimize`` → re-infer →
+walk the now-branchless, call-free twin and emit its dataflow graph (mapping
+``?:`` to a *select* node and the bool masks to a 0/1 selector).
 
 .. seealso::
 
