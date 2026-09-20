@@ -471,3 +471,101 @@ jobs:
     - name: "Smoke-test installed bundle"
       run: bash ci/smoke_test_bundle.sh ./daslang_bundle
 
+  ###########################################################
+  build_windows_mingw:
+  ###########################################################
+  # Catches clang-mingw64 toolchain regressions at PR time. The mingw path
+  # diverges from MSVC in src/hal/debug_break.cpp, src/hal/project_specific_crash_handler.cpp,
+  # and src/builtin/module_jit.cpp (PR #2838). Without this job, a Windows-touching
+  # change that compiles under MSVC but breaks mingw would only surface when a
+  # maintainer rebuilds locally. Same runner pool as the MSVC matrix
+  # (windows-latest-fat), separate top-level job so mingw churn doesn't risk
+  # the much-larger MSVC entries.
+  #
+  # dasClangBind is enabled here — find_package(Clang 22.1) matches msys2's
+  # libclang 22.1.x and POST_BUILD copies the libclang+libLLVM+libc++ chain
+  # next to daslang.exe so the .shared_module dlopen resolves at runtime.
+  ###########################################################
+    needs: pre_job
+    if: needs.pre_job.outputs.should_skip != 'true'
+    runs-on: windows-latest-fat
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+    - name: "SCM Checkout"
+      uses: actions/checkout@v4
+
+    - name: "Install MSYS2 + clang-mingw64 toolchain"
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: CLANG64
+        update: true
+        cache: true
+        install: >-
+          mingw-w64-clang-x86_64-toolchain
+          mingw-w64-clang-x86_64-cmake
+          mingw-w64-clang-x86_64-ninja
+          mingw-w64-clang-x86_64-openssl
+          mingw-w64-clang-x86_64-glfw
+          bison
+          git
+
+    - name: "Build: Daslang (clang-mingw64)"
+      run: |
+        set -eux
+        mkdir -p build-mingw
+        cmake --no-warn-unused-cli -B./build-mingw -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_C_COMPILER=clang \
+          -DCMAKE_CXX_COMPILER=clang++ \
+          -DDAS_CLANG_BIND_DISABLED=OFF \
+          -DDAS_LLVM_DISABLED=OFF
+        cmake --build ./build-mingw --parallel
+
+    - name: "Test: interpreter sweep"
+      run: |
+        set -eux
+        cd bin
+        ./daslang _dasroot_/dastest/dastest.das -- --color --failures-only --timeout 900 --test ../tests \
+          || ./daslang _dasroot_/dastest/dastest.das -- --color --failures-only --isolated-mode --timeout 3600 --test ../tests
+
+    - name: "Test: JIT sweep"
+      run: |
+        set -eux
+        cd bin
+        ./daslang _dasroot_/dastest/dastest.das -jit -- --color --failures-only --timeout 900 --test ../tests \
+          || ./daslang _dasroot_/dastest/dastest.das -jit -- --color --failures-only --isolated-mode --timeout 3600 --test ../tests
+
+    - name: "Small C++ Tests"
+      run: |
+        set -eux
+        cd build-mingw
+        ctest -L small --output-on-failure
+
+    - name: "Slow Release Tests (AOT)"
+      run: |
+        set -eux
+        cd bin
+        ./test_aot -use-aot _dasroot_/dastest/dastest.das -- --use-aot --color --failures-only --timeout 900 --test ../tests
+
+    # bind_clangbind self-binder lives here (not on linux extended_checks)
+    # because dasClangBind on linux pulls libclang.so → libLLVM-22.so.1,
+    # which collides with dasLLVM in the same process (shared pass
+    # registry, double-init breaks JIT). msys2 clang64 ships libclang as
+    # a separate SO chain, and the mingw worker doesn't exercise JIT-uses-
+    # dasClangBind paths, so they coexist cleanly.
+    #
+    # TODO: bind_llvm.das self-binder doesn't run on mingw — libclang as
+    # library doesn't find <cstddef> via msys2's libcxx auto-detection.
+    # Needs explicit -resource-dir / -isystem injection. Tracked as a
+    # follow-up; we lose master's previous bind_llvm.das CI coverage in
+    # the meantime.
+    - name: "Run self-binder (bind_clangbind.das)"
+      run: |
+        set -eux
+        CLANG_INCLUDE="$(cygpath -w "${MSYSTEM_PREFIX}/include")"
+        ./bin/daslang.exe modules/dasClangBind/bind/bind_clangbind.das -- --clang_path "${CLANG_INCLUDE}/"
+        git diff --exit-code -- modules/dasClangBind/src/ \
+          || (echo "ERROR: dasClangBind generated files are out of date. Run './bin/daslang modules/dasClangBind/bind/bind_clangbind.das -- --clang_path <libclang-include-path>' locally and commit the result." && exit 1)
+
