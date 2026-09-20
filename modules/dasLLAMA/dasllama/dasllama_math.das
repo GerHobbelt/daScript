@@ -509,6 +509,35 @@ def gemm_f32(var cp : float?; ap, bp : float const?; M, K, N : int64) {
     }
 }
 
+//! gemm_f32 with the tile walk COLUMN-BLOCKS OUTER (jj outer, ii inner): the K×16 B strip stays
+//! L1-hot across all row blocks, so a big-M call streams B from L2/fabric once instead of M/4
+//! times. Same tiles, same per-element kk-order fma chains — numerically identical to gemm_f32;
+//! only the tile visit order differs. The win is multi-thread on big-B shapes: parakeet's
+//! attention chunks (M ≈ tt/lanes rows, B = Kᵀ/pos/V at 1.3-2.5 MB) stop multiplying their B
+//! traffic, which is what saturates the fabric when 8 lanes stream concurrently (gb1 attn
+//! blocks −20%, clean-window). Callers whose B is L1-small or reused back-to-back keep
+//! gemm_f32 — its streaming-B walk prefetches better single-thread.
+[hint(noalias = cp, noalias = ap, noalias = bp)]
+def gemm_f32_jo(var cp : float?; ap, bp : float const?; M, K, N : int64) {
+    let m4 = M - M % 4l
+    let n16 = N - N % 16l
+    var jj = 0l
+    while (jj < n16) {
+        var ii = 0l
+        while (ii < m4) {
+            gemm_f32_uk_4x16(cp, ap, bp, ii, jj, K, N)
+            ii += 4l
+        }
+        jj += 16l
+    }
+    if (n16 < N) {                                   // right strip: rows [0,m4) × cols [n16,N)
+        gemm_f32_region(cp, ap, bp, 0l, m4, n16, N, K, N)
+    }
+    if (m4 < M) {                                    // bottom strip: rows [m4,M) × all cols
+        gemm_f32_region(cp, ap, bp, m4, M, 0l, N, K, N)
+    }
+}
+
 //! Q8_0 dequant-in-dot: weights are int8 quants `wq` + one fp32 scale `ws` per 32-block,
 //! activations `x` stay fp32. A float4 accumulator is carried across the blocks (scale
 //! applied per block as a broadcast fma), with a single horizontal reduce at the end —
@@ -1521,6 +1550,48 @@ def swiglu_oai4(var g : float?; u : float const?; size : int64) {
             let x = min(g[i], SWIGLU_OAI_LIMIT)
             let y = clamp(u[i], -SWIGLU_OAI_LIMIT, SWIGLU_OAI_LIMIT)
             g[i] = (x / (1.0 + exp(-SWIGLU_OAI_ALPHA * x))) * (y + 1.0)
+        }
+    }
+}
+
+//! Vectorized SiLU: x[i] = x[i] · σ(x[i]) in place, float4 with exp4; ~4x the scalar silu
+//! (which pays a libm expf per element). ~2 ulp, NOT bit-exact — scalar silu stays the
+//! reference the chat-model oracles pin; ungated conformer FFNs (parakeet) call this form.
+def silu4(var x : float?; size : int64) {
+    let one = float4(1.0, 1.0, 1.0, 1.0)
+    unsafe {
+        var x4 = reinterpret<float4?>(x)
+        let n4 = size / 4l
+        for (k in range64(n4)) {
+            let v = x4[k]
+            let arg = clamp(-v, EXP4_LO, EXP4_HI)
+            x4[k] = v / (one + exp4(arg))
+        }
+        for (i in range64(n4 * 4l, size)) {
+            let v = x[i]
+            x[i] = v / (1.0 + exp(-v))
+        }
+    }
+}
+def silu4(var x : array<float> | #; size : int64) {
+    if (size <= 0) return
+    silu4(unsafe(addr(x[0])), size)
+}
+
+//! Threaded silu4 over a token-major image (npos rows x d columns): rows split across lanes.
+//! Row length a multiple of 4 keeps every chunk start 4-aligned, so the float4 grouping matches
+//! the whole-image call element-for-element — bit-identical at any lane count. Work weight 16:
+//! an exp4 element costs tens of MAC-equivalents, so the per-element invite is cost-honest
+//! (measured M1 8 lanes: 3.6x at the parakeet jfk ffn image, 6.9x at gb1).
+def silu4_batch(var x : array<float> | #; d, npos : int64) {
+    if (d % 4l != 0l || npos <= 1l) {   // odd row length would shift the float4 grouping per chunk
+        silu4(x, d * npos)
+        return
+    }
+    unsafe {
+        var xp = addr(x[0])
+        maybe_parallel_for(0, int(npos), lanes_for_work(npos * d * 16l, 0)) $(rb, re) {
+            silu4(unsafe(xp + int64(rb) * d), int64(re - rb) * d)
         }
     }
 }
