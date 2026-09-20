@@ -42,6 +42,7 @@ struct ChatSession {
     pending_is_tool : bool = false  // pending is a tool-results block: marker-split at render
     first : bool = true             // first turn emits add_bos + the system turn
     max_new : int64 = 256l          // per-reply token budget
+    enable_thinking : bool = true   // false + a template with a think_suppress form => instruct mode
     history : array<Message>
     tower : AudioTower = AudioTower()     // d_model == 0 => text-only chat
     enc : EncoderState = EncoderState()   // encoder scratch (sized once at create)
@@ -112,8 +113,12 @@ def private detect_chat_template(m : Model; var out : ChatTemplate) : bool {
         out <- arch_chat("phi3")
     } elif (contains(src, "v7-tekken")) {         // Mistral v7-tekken BY NAME (Voxtral GGUFs store
         out <- mistral_v7_tekken_template()       // the llama.cpp template alias, not Jinja)
+    } elif (contains(src, "[SYSTEM_PROMPT]")) {   // Mistral v7-tekken SHAPE by Jinja source (Medium 3.5):
+        out <- mistral_v7_tekken_template()       // [SYSTEM_PROMPT] system role, unspaced [INST]
     } elif (contains(src, "[INST]")) {            // Mistral instruct
         out <- mistral_instruct_template()
+    } elif (contains(src, "[gMASK]<sop>")) {      // GLM-4.5 family (spells <|user|> too — before Zephyr)
+        out <- arch_chat("glm4moe")
     } elif (contains(src, "<|user|>")) {          // Zephyr / TinyLlama-chat
         out <- zephyr_chat_template()
     } else {
@@ -239,6 +244,9 @@ def private render_prompt(m : Model; c : ChatSession; var out : array<int64>) {
     if (c.first && c.tmpl.add_bos) {
         out |> push(bos_id(m))
     }
+    if (c.first && !empty(c.tmpl.prelude.parts)) {   // conversation-start prelude (glm4moe: [gMASK]<sop>)
+        render_parts(m, c.tmpl.prelude.parts, "", out)
+    }
     var user_content = c.pending
     if (c.first) {
         let sys = system_content(c)
@@ -278,6 +286,9 @@ def private render_prompt(m : Model; c : ChatSession; var out : array<int64>) {
 def private render_prompt_audio(m : Model; c : ChatSession; var head : array<int64>; var tail : array<int64>) {
     if (c.first && c.tmpl.add_bos) {
         head |> push(bos_id(m))
+    }
+    if (c.first && !empty(c.tmpl.prelude.parts)) {   // conversation-start prelude (glm4moe: [gMASK]<sop>)
+        render_parts(m, c.tmpl.prelude.parts, "", head)
     }
     var user_content = c.pending
     if (c.first) {
@@ -395,11 +406,28 @@ def add_user_audio_(var c : ChatSession; samples : array<float> | #) {
     c.n_audio_rows += int64(length(chunks)) * rows
 }
 
+// The empty think block that turns a hybrid thinking model into an instruct model (the Qwen3
+// family's enable_thinking=false). GENERATION prompt only — replayed history turns carry no think
+// blocks, matching the family's Jinja. Skips silently when thinking is on, the template declares
+// no suppress form, or the vocab lacks the think specials (nothing to suppress).
+def private render_think_suppress(m : Model; c : ChatSession; var out : array<int64>) {
+    if (c.enable_thinking || empty(c.tmpl.think_suppress.parts)) {
+        return
+    }
+    for (p in c.tmpl.think_suppress.parts) {
+        if (p.kind == ChatPartKind.special && special_id(m, p.s) < 0l) {
+            return
+        }
+    }
+    render_parts(m, c.tmpl.think_suppress.parts, "", out)
+}
+
 //! Render the next turn's prefill token ids — BOS + system on the first turn, then the user turn and
 //! the generation prompt — WITHOUT running the model. For inspection, token counting, and tests.
 def render_turn_(m : Model; c : ChatSession) : array<int64> {
     var out : array<int64>
     render_prompt(m, c, out)
+    render_think_suppress(m, c, out)
     return <- out
 }
 
@@ -426,6 +454,13 @@ def render_assistant_(m : Model; var c : ChatSession; text : string; var out : a
     consume_pending_(c)
     render_parts(m, c.close_parts, "", out)
     c.history |> push(Message(role = Role.assistant, content = text))
+}
+
+//! Toggle reasoning for a hybrid thinking model: `false` renders the template's think_suppress
+//! block on every generation prompt (the Jinja enable_thinking=false form); a no-op for templates
+//! with no suppress form or vocabs without the think specials.
+def set_thinking_(var c : ChatSession; on : bool) {
+    c.enable_thinking = on
 }
 
 //! Queue a user message for the next respond().
@@ -544,6 +579,7 @@ def respond_(m : Model; var c : ChatSession; params : SamplingParams;
         var head : array<int64>
         var tail : array<int64>
         render_prompt_audio(m, c, head, tail)
+        render_think_suppress(m, c, tail)
         let dim = m.config.dim
         let n_head = int64(length(head))
         let n_tail = int64(length(tail))
@@ -567,6 +603,7 @@ def respond_(m : Model; var c : ChatSession; params : SamplingParams;
     } else {
         var pre : array<int64>
         render_prompt(m, c, pre)
+        render_think_suppress(m, c, pre)
         generate_(m, c.session, pre, params, c.max_new) $(id, piece) {
             for (sid in stops) {
                 return false if (id == sid)

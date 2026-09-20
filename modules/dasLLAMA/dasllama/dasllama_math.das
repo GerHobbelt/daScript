@@ -9,6 +9,7 @@ require daslib/jobque_boost public  // matmul's threaded path expands parallel_f
 require daslib/jobque_profile  // named trace categories + unit markers (set_trace_tags registers them)
 require dasllama/dasllama_par  // maybe_parallel_for: thread-or-inline a kernel body on a runtime size flag
 require dasllama/dasllama_tune  // [tuned]: reconstitute dot from dot_template with per-box loop hints
+require dasllama/dasllama_gemm_schema  // kq_qsb/kq_ssb — the fmt-id kq plane strides
 require llvm/daslib/f16_cvt  // f16<->f32 converts: JIT half intrinsics on aarch64 / x64+F16C, exact bit-twiddle elsewhere
 
 // dasLLAMA numeric primitives — naive fp32 baseline (curriculum step 1).
@@ -1375,6 +1376,7 @@ struct KernelBackend {
     kq_rows_k4 : MatmulKqRowsFn = @@kq_unset_rows
     kq_rows_k5 : MatmulKqRowsFn = @@kq_unset_rows
     kq_rows_k6 : MatmulKqRowsFn = @@kq_unset_rows
+    kq_rows_q40 : MatmulKqRowsFn = @@kq_unset_rows
     kq_batch : MatmulKqBatchFn = @@kq_unset_batch
     kq_groupn : MatmulKqGroupNFn = @@kq_unset_groupn
     kq_batch_groupn : MatmulKqBatchGroupNFn = @@kq_unset_batch_groupn
@@ -1436,6 +1438,7 @@ var g_mm_kq = @@kq_unset_kernel
 var g_kq_rows_k4 = @@kq_unset_rows
 var g_kq_rows_k5 = @@kq_unset_rows
 var g_kq_rows_k6 = @@kq_unset_rows
+var g_kq_rows_q40 = @@kq_unset_rows
 var g_mm_kq_batch = @@kq_unset_batch
 var g_mm_kq_groupn = @@kq_unset_groupn
 var g_mm_kq_batch_groupn = @@kq_unset_batch_groupn
@@ -1595,6 +1598,7 @@ def private activate(be : KernelBackend) {
     g_kq_rows_k4 = be.kq_rows_k4
     g_kq_rows_k5 = be.kq_rows_k5
     g_kq_rows_k6 = be.kq_rows_k6
+    g_kq_rows_q40 = be.kq_rows_q40
     g_mm_kq_batch = be.kq_batch
     g_mm_kq_groupn = be.kq_groupn
     g_mm_kq_batch_groupn = be.kq_batch_groupn
@@ -1770,12 +1774,15 @@ def kernel_backend_has_kq() : bool {
     return g_active_has_kq
 }
 
-//! The active backend's K-quant rows core for `fmt` (4/5/6) — the chains' kq twin of
-//! mm_q8q8_rows_fn. Same read-into-a-local-then-capture rule.
+//! The active backend's K-quant rows core for `fmt` (4/5/6/40) — the chains' kq twin of
+//! mm_q8q8_rows_fn. Same read-into-a-local-then-capture rule. Any other id (kq_fi's q8
+//! poison 0 included) gets the panic stub — never a silently-wrong format's core.
 def kq_rows_fn(fmt : int) : MatmulKqRowsFn {
     if (fmt == 4) return g_kq_rows_k4
     if (fmt == 5) return g_kq_rows_k5
-    return g_kq_rows_k6
+    if (fmt == 6) return g_kq_rows_k6
+    if (fmt == 40) return g_kq_rows_q40
+    return @@kq_unset_rows
 }
 
 //! Does the active backend carry the batched kq GEMM (kq_batch — the prefill tile)? The
@@ -1835,8 +1842,8 @@ def matmul_kq_groupn_active(fmt : int; var y : array<float> | #; kq : array<uint
 //! matmul_kq_active. Callers guard with kq_repacked && kernel_backend_has_kq_batch().
 def matmul_kq_batch(fmt : int; var y : array<float> | #; kq : array<uint8> | #; ks : array<uint8> | #; woff : int64; xq : array<int8> | #; xs : array<float> | #; xbs : array<int> | #; n, d, ntok : int64) {
     let sb = woff / 256l
-    let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
-    let ssb = fmt == 6 ? 18l : 20l
+    let qsb = kq_qsb(fmt)
+    let ssb = kq_ssb(fmt)
     unsafe {
         invoke(g_mm_kq_batch, fmt, addr(y[0]),
             addr<uint8 const?>(kq[sb * qsb]), addr<uint8 const?>(ks[sb * ssb]),
@@ -1850,8 +1857,8 @@ def matmul_kq_batch(fmt : int; var y : array<float> | #; kq : array<uint8> | #; 
 //! to the active backend's mm_kq; callers guard with the model's kq_repacked record.
 def matmul_kq_active(fmt : int; var y : array<float> | #; kq : array<uint8> | #; ks : array<uint8> | #; woff : int64; xq : array<int8> | #; xs : array<float> | #; xbs : array<int> | #; n, d : int64; yoff : int64 = 0l) {
     let sb = woff / 256l
-    let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
-    let ssb = fmt == 6 ? 18l : 20l
+    let qsb = kq_qsb(fmt)
+    let ssb = kq_ssb(fmt)
     unsafe {
         invoke(g_mm_kq, fmt, addr(y[yoff]),
             addr<uint8 const?>(kq[sb * qsb]), addr<uint8 const?>(ks[sb * ssb]),
@@ -1865,8 +1872,8 @@ def matmul_kq_active(fmt : int; var y : array<float> | #; kq : array<uint8> | #;
 //! backend is active. n % 256 == 0 (the ggml K-quant row invariant).
 def repack_kq_weight(fmt : int; var kq : array<uint8>; var ks : array<uint8>; woff, n, d : int64) {
     let sb = woff / 256l
-    let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
-    let ssb = fmt == 6 ? 18l : 20l
+    let qsb = kq_qsb(fmt)
+    let ssb = kq_ssb(fmt)
     unsafe {
         invoke(g_repack_kq, fmt, addr(kq[sb * qsb]), addr(ks[sb * ssb]), n, d)
     }
@@ -2838,7 +2845,7 @@ def rope(var vec : array<float> | #; pos, head_size, n : int64) {
 //! Pointer core (see softmax) — the threaded prefill ropes q_b/k_b in fork contexts on raw addresses.
 //! `has_ff` gates the `ff` freq-factors pointer (empty() can't test a pointer); pass null when false.
 [hint(noalias = v, noalias = ff)]
-def rope_scaled(var v : float?; pos, head_size, n : int64; theta, fscale : float; has_ff : bool; ff : float const?) {
+def rope_scaled(var v : float?; pos, head_size, n : int64; theta, fscale : float; has_ff : bool; ff : float const?; mscale : float = 1.0) {
     unsafe {
         let posf = float(pos) * fscale
         for (p in range64(n / 2l)) {
@@ -2849,8 +2856,10 @@ def rope_scaled(var v : float?; pos, head_size, n : int64; theta, fscale : float
                 freq /= ff[head_dim / 2l]
             }
             let angle = posf * freq
-            let fcr = cos(angle)
-            let fci = sin(angle)
+            // mscale (YaRN/LongRoPE attn_factor) scales cos/sin — ggml applies it to NORM and NEOX
+            // alike (mistral3 YaRN = 1.416); the 1.0 default multiplies out bit-exactly elsewhere
+            let fcr = cos(angle) * mscale
+            let fci = sin(angle) * mscale
             let v0 = v[i]
             let v1 = v[i + 1]
             v[i] = v0 * fcr - v1 * fci
@@ -2858,11 +2867,11 @@ def rope_scaled(var v : float?; pos, head_size, n : int64; theta, fscale : float
         }
     }
 }
-def rope_scaled(var vec : array<float> | #; pos, head_size, n : int64; theta, fscale : float; freq_factors : array<float> | #) {
+def rope_scaled(var vec : array<float> | #; pos, head_size, n : int64; theta, fscale : float; freq_factors : array<float> | #; mscale : float = 1.0) {
     let has_ff = !empty(freq_factors)
     unsafe {
         let ff = has_ff ? addr<float const?>(freq_factors[0]) : null
-        rope_scaled(addr<float?>(vec[0]), pos, head_size, n, theta, fscale, has_ff, ff)
+        rope_scaled(addr<float?>(vec[0]), pos, head_size, n, theta, fscale, has_ff, ff, mscale)
     }
 }
 
@@ -3006,13 +3015,14 @@ def rope_scaled_neox_tab_part(var v : float?; head_size, rot, n : int64; cosrow 
 }
 
 //! Dispatch RoPE by the model's convention: NEOX (Qwen2/Phi3/Gemma2) or the default NORM (Llama).
-//! mscale is the LongRoPE magnitude factor (1.0 for everything but Phi3); only the NEOX path uses it.
+//! mscale is the YaRN/LongRoPE magnitude factor (1.0 outside Phi3 LongRoPE and YaRN models); both
+//! paths apply it — ggml scales cos/sin for NORM and NEOX alike (mistral3 = NORM + YaRN mscale).
 //! Pointer core (see rope_scaled) — fork-callable rope dispatch on a raw address.
 def rope_apply(var vec : float?; pos, head_size, n : int64; theta, fscale : float; has_ff : bool; ff : float const?; neox : bool; mscale : float = 1.0) {
     if (neox) {
         rope_scaled_neox(vec, pos, head_size, n, theta, fscale, has_ff, ff, mscale)
     } else {
-        rope_scaled(vec, pos, head_size, n, theta, fscale, has_ff, ff)
+        rope_scaled(vec, pos, head_size, n, theta, fscale, has_ff, ff, mscale)
     }
 }
 //! `use_ff = false` drops the freq-factors for this call even when they're loaded — p-RoPE arches

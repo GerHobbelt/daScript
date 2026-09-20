@@ -13,7 +13,7 @@ reach into engine internals, the facade is complete.
 
 ```sh
 bin/daslang -jit utils/dasllama-server/main.das -- --model <model.gguf> [--port 8080] [--quant q8] \
-                                                    [--asr <asr.bin>] [--mmproj <mmproj.gguf>] [--ctx 4096] \
+                                                    [--asr <asr.bin>] [--asr-workers 2] [--mmproj <mmproj.gguf>] [--ctx 4096] \
                                                     [--streams 4] [--chunk 64] [--page-rows 64] [--prefix N]
 ```
 
@@ -27,15 +27,18 @@ Run under `-jit` — interpreted inference is far too slow. Flags:
 | `--quant` | `-q` | `q8` | Weight quantization: `fp32` \| `q8` \| `q4` — plus the loader's file-format spellings `q4_k` \| `q5_k` \| `q6_k` \| `mxfp4` \| `f16` \| `bf16` (all serve on the `q8` kquant-native tier) |
 | `--kv-dtype` | — | `f16` | KV-cache codec: `f32` \| `f16` \| `q8_0` \| `tq4` (rotated 4-bit; needs pow2 head_size) |
 | `--asr` | `-a` | — | ASR model (whisper/parakeet/qwen3-asr) — enables the `/v1/audio/*` routes |
+| `--asr-workers` | — | `1` | Long-lived ASR request threads; each owns a model and reusable session. Set `2` for two parallel transcriptions |
 | `--mmproj` | — | — | mmproj GGUF for the Qwen3-ASR route (paired with `--asr`) |
 | `--ctx` | — | *model* | Context-length cap in tokens (default: the model's trained `context_length`; set it to bound `--flat` KV or trim RAM) |
 | `--max-tokens` | — | `256` | Default reply token budget when a request omits `max_tokens` (clamped to `--ctx` per request) |
 | `--streams` | `-s` | `4` | Max concurrent generation streams |
 | `--threads` | `-t` | `16` | Worker-lane cap for the matmul dispatch (`-1` = all cores) — decode is bandwidth-bound, so an uncapped dispatch just fights the rest of the box |
+| `--team-dispatch` | — | `hybrid` | `hybrid`: LLM uses the worker team while ASR callers run inline; `team`: all callers use serialized team publishes; `inline`: every caller runs independently |
 | `--chunk` | — | `64` | Prefill quantum in tokens — decode stalls at most this per tick |
 | `--page-rows` | — | `64` | KV page size in positions for paged serving |
 | `--prefix` | — | *auto* | Prefix-cache retention cap in pages (auto: one full context per stream; `-1` = unbounded) |
 | `--flat` | — | — | Flat preallocated KV sessions — disables paged serving and the prefix cache |
+| `--mtp` | — | — | MTP/NextN self-speculative decode for greedy requests (`temperature: 0`, no repetition penalty) — needs a model with an in-file NextN head (the `-MTP-` GGUFs). Output-invariant; ~2× decode on the dense qwen35/qwen3.6 models, ~nothing on the MoEs. `/v1/stats` reports `mtp_drafted`/`mtp_accepted` |
 | `--help` | `-?` | — | Show help and exit |
 
 A config file replaces long command lines; keys are the long flag names with underscores.
@@ -51,6 +54,8 @@ ctx = 4096
 max_tokens = 4096  # default reply budget for clients that omit max_tokens (e.g. `llm chat`)
 streams = 4
 threads = 16       # matmul dispatch lane cap; -1 = all cores
+team_dispatch = "hybrid" # LLM team dispatch + independent inline ASR caller threads
+asr_workers = 2    # two independent transcription requests; each worker owns an ASR model
 ```
 
 Chat and completion requests **batch continuously** (`llm_scheduler.das`): up to `--streams`
@@ -60,10 +65,58 @@ one chunk. Requests beyond `--streams` queue (up to 32; then 503). KV is **paged
 cache memory tracks each stream's actual context, and finished streams donate their pages to a
 **prefix cache**, so a repeated prompt prefix (a shared system prompt, the next turn of the same
 conversation) attaches instead of re-prefilling — time-to-first-token collapses on warm prompts.
-Clients whose connection drops mid-generation are evicted within a tick. The buffered endpoints
-(`/v1/models`, `/v1/embeddings`, `/v1/audio/*`) still run to completion in-handler and pause
-generation for their duration. OpenAI is stateless — the client resends the full transcript each
-turn.
+Clients whose connection drops mid-generation are evicted within a tick. Audio uploads queue to
+long-lived `new_thread` ASR workers and do not block chat generation; `--asr-workers 2` permits two
+transcriptions at once. Each worker owns its model/context and reuses language-specific session
+scratch, so memory settles at the workers' high-water mark. OpenAI is stateless — the client
+resends the full transcript each turn.
+
+## Supervised release executable
+
+`daspkg release` ships `watchdog.py` beside `dasllama-server.exe`. Relative watchdog paths resolve
+against `--cwd`, so the release directory owns its logs, PID file, dumps, crash bundles, config,
+and tune sidecar:
+
+```powershell
+Set-Location E:/dasllama-server
+
+# Run once from an elevated PowerShell for this executable name.
+python ./watchdog.py --program ./dasllama-server.exe --install-local-dumps
+
+# Normal day-to-day launch. dasllama-server.toml is auto-loaded from this directory.
+$env:DAS_JOBQUE_THREADS = "16"
+python ./watchdog.py --program ./dasllama-server.exe --require-dumps
+```
+
+The watchdog polls `/v1/models`, records process memory once a minute, shows a Windows notification
+after a crash, collects the executable's WER minidump plus the exact executable, compact `.map`,
+optional `.pdb`, and `dasllama-server.tune.json`, then restarts with bounded exponential backoff.
+Exit 0, including a drained `POST /shutdown`, stops the watchdog. Use `--health-url` and
+`--shutdown-url` when serving on a non-default port.
+
+## Supervised `.das` canary
+
+For a long-running diagnostic deployment, supervise the JIT script directly instead of using the
+released executable:
+
+```powershell
+# Run once from an elevated PowerShell. This installs an app-specific WER normal-minidump policy;
+# it does not dump the model weights/private heap.
+python utils/dasllama-server/watchdog.py --install-local-dumps
+
+# The day-to-day watchdog does not need elevation.
+python utils/dasllama-server/watchdog.py --jit-stack --require-dumps -- `
+  --config E:/dictation-bot/release/dasllama-server/dasllama-server.toml
+```
+
+The first JIT start on an untuned box writes the tune sidecar and exits with code 3; the watchdog
+recognizes that bootstrap exit and launches the script again. It writes rotating JSON-line logs to
+`logs/dasllama-watchdog.log`, samples process memory once a minute, and polls `/v1/models`.
+`--jit-stack` records every generated daslang call in the logical stack; Windows JIT links also
+retain a compact `.map` beside the `.dll/.o`. After a crash, the watchdog waits for the WER
+minidump, copies it together with the matching JIT artifacts, tune manifest, metadata, and log into
+`logs/crashes/`, displays a Windows notification, and restarts with bounded exponential backoff.
+The ten newest bundles are retained by default.
 
 ## Deploying (daspkg release)
 
@@ -71,11 +124,12 @@ turn.
 bin/daslang utils/daspkg/main.das -- release --root utils/dasllama-server --out <target>
 ```
 
-Produces `<target>/dasllama-server/` — the standalone exe, the shared-module dylibs (dasHV,
-dasAudio), the runtime DLLs, and the `[tune]` sidecar (`dasllama-server.tune.json`; incomplete
-scopes are tuned and baked during the release build). Re-releasing over an existing bundle is the
-upgrade path: a `dasllama-server.toml` living in the bundle is NOT part of the release manifest,
-so the deployed config survives. Stop a running server first — Windows locks the exe.
+Produces `<target>/dasllama-server/` — the standalone exe, `watchdog.py`, the shared-module dylibs
+(dasHV, dasAudio), the runtime DLLs, and the `[tune]` sidecar
+(`dasllama-server.tune.json`; incomplete scopes are tuned and baked during the release build).
+Re-releasing over an existing bundle is the upgrade path: a `dasllama-server.toml` living in the
+bundle is NOT part of the release manifest, so the deployed config survives. Stop a running server
+first — Windows locks the exe.
 
 ## Endpoints
 
@@ -87,17 +141,55 @@ so the deployed config survives. Stop a running server first — Windows locks t
 | `POST` | `/v1/embeddings` | Mean-pooled, L2-normalized sentence embeddings |
 | `POST` | `/v1/audio/transcriptions` | Speech→text (multipart upload; needs `--asr`) |
 | `POST` | `/v1/audio/translations` | Speech→English text (needs `--asr`) |
-| `GET`  | `/v1/stats` | Scheduler counters: active/queued/peak_active, decode_steps, avg_batch, evicted, cached_tokens, prefix_pages, … |
-| `POST` | `/shutdown` | Graceful stop |
+| `GET`  | `/v1/stats` | Scheduler counters plus `asr_workers`, `asr_ready`, `asr_active`, and `asr_pending` |
+| `POST` | `/gc` | Schedule a validated collection at the next lifecycle safe point; concurrent requests coalesce |
+| `POST` | `/shutdown` | Stop admitting new LLM/ASR work, drain accepted work, then exit |
 
 ### Chat
 
 ```sh
 curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "messages": [{"role": "user", "content": "Say hello in one word."}],
-  "max_tokens": 16, "stream": false
+  "max_tokens": 16, "stream": false, "truncation": "auto"
 }'
 ```
+
+### Sampling parameters
+
+Both completion routes accept the OpenAI sampling fields plus the llama.cpp-style extensions —
+absent fields keep the greedy default (`temperature: 0`):
+
+| Field | Default | Meaning |
+|---|---|---|
+| `temperature` | 0 | `<= 0` = greedy argmax |
+| `top_k` | 0 (off) | keep only the k highest logits |
+| `top_p` | 1 (off) | nucleus: keep the smallest probability mass `>= top_p` |
+| `min_p` | 0 (off) | drop tokens with probability `< min_p * max_prob` |
+| `repeat_penalty` | 1 (off) | multiplicative repetition penalty over the recent window, applied once per unique token (llama.cpp semantics) |
+| `presence_penalty` | 0 | flat logit subtraction for every distinct token in the recent window |
+| `frequency_penalty` | 0 | per-occurrence logit subtraction (OpenAI semantics) |
+| `seed` | 0 (default seed) | non-zero overrides the stream's RNG seed; sessions start from a fixed default seed, so identical no-seed requests already reproduce |
+
+The cutoffs (`top_k` / `top_p` / `min_p`) shape the sampled distribution, so they only take
+effect with `temperature > 0` — greedy short-circuits to argmax; the penalties apply in greedy
+mode too. E.g. Qwen3.6's instruct-mode card settings: `"temperature": 0.7, "top_p": 0.8,
+"presence_penalty": 1.5`.
+
+### Thinking control
+
+Hybrid thinking models (the Qwen3/Qwen3.6 family) reason in a `<think>` block by default. Set
+`"enable_thinking": false` (top-level, or the llama.cpp spelling
+`"chat_template_kwargs": {"enable_thinking": false}`) and the server appends the template's
+empty think block (`<think>\n\n</think>\n\n`) to the generation prompt — the model answers
+directly, matching the family Jinja's `enable_thinking=false` form. A no-op for models whose
+vocab has no think tokens.
+
+### Context truncation
+
+By default, an over-context rendered prompt returns HTTP 400. Set `truncation: "auto"` to preserve
+system messages and tools while dropping the oldest complete user-led turns until the prompt plus
+the requested `max_tokens` output budget fits. If the system/tools/latest turn cannot fit, the
+request still returns 400. `finish_reason: "length"` means generation consumed its output budget.
 
 ### Tool / function calling
 
@@ -139,6 +231,10 @@ similarity), not a substitute for a dedicated embedding model.
 curl http://127.0.0.1:8080/v1/audio/transcriptions \
   -F file=@audio.wav -F response_format=verbose_json
 ```
+
+ASR work is asynchronous with respect to the HTTP tick and LLM scheduler. Requests beyond the
+worker count wait in a bounded queue (32 uploads; further requests receive 503). Use one importer
+request thread per ASR worker to keep the workers occupied without duplicating database work.
 
 ## Testing
 

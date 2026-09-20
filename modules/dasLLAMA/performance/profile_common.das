@@ -112,6 +112,10 @@ def llm_catalog() : array<LlmModel> {
         LlmModel(file="Meta-Llama-3.1-8B-Instruct-Q8_0.gguf", display="Llama-3.1-8B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
         LlmModel(file="gpt-oss-20b-mxfp4.gguf", display="gpt-oss-20b", quant=QuantMode.q8, quant_label="mxfp4", prefill_ctx=512, emission_ctx=128),
         LlmModel(file="gemma-4-26B-A4B-it-Q8_0.gguf", display="gemma-4-26B-A4B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
+        LlmModel(file="gemma-4-26B-A4B-it-Q4_K_M.gguf", display="gemma-4-26B-A4B-q4k", quant=QuantMode.q8, quant_label="q4_k_m", prefill_ctx=512, emission_ctx=128),
+        // the QAT file rides the q40 KqFmt tier (native Q4_0 planes on the kq rails) — quant is
+        // the loader mode (q8), the label the on-disk format, like the Q4_K_M rows
+        LlmModel(file="gemma-4-26B_q4_0-it.gguf", display="gemma-4-26B-A4B-q40", quant=QuantMode.q8, quant_label="q4_0", prefill_ctx=512, emission_ctx=128),
         LlmModel(file="Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf", display="Qwen3-30B-A3B", quant=QuantMode.q8, quant_label="q4_k_m", prefill_ctx=512, emission_ctx=128),
         LlmModel(file="Qwen3.6-35B-A3B-UD-Q4_K_M.gguf", display="Qwen3.6-35B-A3B", quant=QuantMode.q8, quant_label="q4_k_m", prefill_ctx=512, emission_ctx=128),
         LlmModel(file="Qwen3-Coder-30B-A3B-Instruct-Q8_0.gguf", display="Qwen3-Coder-30B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
@@ -122,7 +126,9 @@ def llm_catalog() : array<LlmModel> {
         // reads siblings natively) — shard 1 is metadata-only (~10MB), so use -t all + --only, never
         // the size tier gate, to select these
         LlmModel(file="Qwen3.5-122B-A10B/Q8_0/Qwen3.5-122B-A10B-Q8_0-00001-of-00004.gguf", display="Qwen3.5-122B-A10B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
-        LlmModel(file="Qwen3.5-122B-A10B/Q4_K_M/Qwen3.5-122B-A10B-Q4_K_M-00001-of-00003.gguf", display="Qwen3.5-122B-A10B-q4k", quant=QuantMode.q8, quant_label="q4_k_m", prefill_ctx=512, emission_ctx=128)
+        LlmModel(file="Qwen3.5-122B-A10B/Q4_K_M/Qwen3.5-122B-A10B-Q4_K_M-00001-of-00003.gguf", display="Qwen3.5-122B-A10B-q4k", quant=QuantMode.q8, quant_label="q4_k_m", prefill_ctx=512, emission_ctx=128),
+        LlmModel(file="Mistral-Medium-3.5-128B/Q8_0/Mistral-Medium-3.5-128B-Q8_0-00001-of-00004.gguf", display="Mistral-Medium-3.5-128B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
+        LlmModel(file="Mistral-Medium-3.5-128B/Q4_K_M/Mistral-Medium-3.5-128B-Q4_K_M-00001-of-00003.gguf", display="Mistral-Medium-3.5-128B-q4k", quant=QuantMode.q8, quant_label="q4_k_m", prefill_ctx=512, emission_ctx=128)
     ]
 }
 
