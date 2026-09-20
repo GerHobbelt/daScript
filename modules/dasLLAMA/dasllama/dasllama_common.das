@@ -578,6 +578,11 @@ struct Model {
     we1_fmt : array<KqFmt>
     we2_fmt : array<KqFmt>
     we3_fmt : array<KqFmt>
+    // deltanet projection tags (recurrent layers; empty = all q8). CPU rail only: detect keeps
+    // these q8 whenever Metal or the GPU dn/dense tier could claim the planes (both bind dn q8)
+    dnqkv_fmt : array<KqFmt>
+    dngate_fmt : array<KqFmt>
+    dnout_fmt : array<KqFmt>
     wcls_fmt : KqFmt = KqFmt.q8
     emb_fmt : KqFmt = KqFmt.q8
     // gemma4 E-series PLE token table (per_layer_token_embd) — gather-only (whole superblock-
@@ -1033,18 +1038,18 @@ def private layout_offsets(var t : Model) : LayoutSizes {
             t.wo_offs |> push(kq_take(cur, fmt_at(t.wo_fmt, l), layer_qd(c, l) * dim))
         }
     }
-    if (c.recr_mask != 0ul) {  // deltanet big weights (recurrent layers only; kind-major regions, q8 planes)
+    if (c.recr_mask != 0ul) {  // deltanet big weights (recurrent layers only; kind-major regions; beta/alpha stay q8)
         let cd = dn_conv_dim(c)
         t.dnqkv_offs |> clear(); t.dnqkv_offs |> reserve(layers)
-        for (l in range64(layers)) { t.dnqkv_offs |> push(layer_is_recurrent(c, l) ? kq_take(cur, KqFmt.q8, dim * cd) : -1l) }
+        for (l in range64(layers)) { t.dnqkv_offs |> push(layer_is_recurrent(c, l) ? kq_take(cur, fmt_at(t.dnqkv_fmt, l), dim * cd) : -1l) }
         t.dngate_offs |> clear(); t.dngate_offs |> reserve(layers)
-        for (l in range64(layers)) { t.dngate_offs |> push(layer_is_recurrent(c, l) ? kq_take(cur, KqFmt.q8, dim * c.ssm_d_inner) : -1l) }
+        for (l in range64(layers)) { t.dngate_offs |> push(layer_is_recurrent(c, l) ? kq_take(cur, fmt_at(t.dngate_fmt, l), dim * c.ssm_d_inner) : -1l) }
         t.dnbeta_offs |> clear(); t.dnbeta_offs |> reserve(layers)
         for (l in range64(layers)) { t.dnbeta_offs |> push(layer_is_recurrent(c, l) && !t.dn_ba_f32 ? kq_take(cur, KqFmt.q8, dim * c.ssm_dt_rank) : -1l) }
         t.dnalpha_offs |> clear(); t.dnalpha_offs |> reserve(layers)
         for (l in range64(layers)) { t.dnalpha_offs |> push(layer_is_recurrent(c, l) && !t.dn_ba_f32 ? kq_take(cur, KqFmt.q8, dim * c.ssm_dt_rank) : -1l) }
         t.dnout_offs |> clear(); t.dnout_offs |> reserve(layers)
-        for (l in range64(layers)) { t.dnout_offs |> push(layer_is_recurrent(c, l) ? kq_take(cur, KqFmt.q8, c.ssm_d_inner * dim) : -1l) }
+        for (l in range64(layers)) { t.dnout_offs |> push(layer_is_recurrent(c, l) ? kq_take(cur, fmt_at(t.dnout_fmt, l), c.ssm_d_inner * dim) : -1l) }
     }
     var mx = 0l
     if (c.n_expert > 0l) {
@@ -1595,6 +1600,22 @@ def private detect_kq_formats(var t : Model; m : GGUFMeta) {
         t.mtp_ehproj_fmt = kq_fmt_row_ok(kq_fmt_of(gguf_tensor_type(m, "blk.{t.config.n_layers}.nextn.eh_proj.weight")), 2l * t.config.dim)
         any ||= t.mtp_ehproj_fmt != KqFmt.q8
     }
+    // deltanet dn tags: CPU rail only — Metal/GPU tiers bind dn q8; grouped files have no exact transcode
+    if (t.config.recr_mask != 0ul && !t.dn_grouped
+            && get_metal_mode() == MetalMode.off
+            && !(moe_gpu_tier_installed() && (gpu_want_dense() || gpu_want_dn() || gpu_want_dnd()))) {
+        t.dnqkv_fmt |> resize(layers)
+        t.dngate_fmt |> resize(layers)
+        t.dnout_fmt |> resize(layers)
+        for (l in range64(layers)) {
+            if (layer_is_recurrent(t.config, l)) {
+                t.dnqkv_fmt[l] = kq_fmt_row_ok(kq_fmt_of(gguf_tensor_type(m, "blk.{l}.attn_qkv.weight")), t.config.dim)
+                t.dngate_fmt[l] = kq_fmt_row_ok(kq_fmt_of(gguf_tensor_type(m, "blk.{l}.attn_gate.weight")), t.config.dim)
+                t.dnout_fmt[l] = kq_fmt_row_ok(kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ssm_out.weight")), t.config.ssm_d_inner)
+                any ||= t.dnqkv_fmt[l] != KqFmt.q8 || t.dngate_fmt[l] != KqFmt.q8 || t.dnout_fmt[l] != KqFmt.q8
+            }
+        }
+    }
     // E-series PLE token table: gather-only whole rows; row length must be superblock-aligned
     if (has_ple(t.config) && (t.config.n_layers * t.config.n_embd_per_layer) % 256l == 0l) {
         t.ple_emb_fmt = kq_fmt_of(gguf_tensor_type(m, "per_layer_token_embd.weight"))
@@ -1611,6 +1632,9 @@ def private detect_kq_formats(var t : Model; m : GGUFMeta) {
         delete t.we1_fmt
         delete t.we2_fmt
         delete t.we3_fmt
+        delete t.dnqkv_fmt
+        delete t.dngate_fmt
+        delete t.dnout_fmt
     }
     t.kquant_native = any
 }
@@ -1618,6 +1642,11 @@ def private detect_kq_formats(var t : Model; m : GGUFMeta) {
 // Any K-quant-tagged expert stack in layer `l`? (The MoE dispatch and prefill gates branch on this.)
 def private moe_layer_kq(t : Model; l : int64) : bool {
     return fmt_at(t.we1_fmt, l) != KqFmt.q8 || fmt_at(t.we2_fmt, l) != KqFmt.q8 || fmt_at(t.we3_fmt, l) != KqFmt.q8
+}
+
+// Are layer l's deltanet projection planes all q8? (Metal and the GPU tiers bind/upload dn q8 only.)
+def private dn_layer_q8(t : Model; l : int64) : bool {
+    return fmt_at(t.dnqkv_fmt, l) == KqFmt.q8 && fmt_at(t.dngate_fmt, l) == KqFmt.q8 && fmt_at(t.dnout_fmt, l) == KqFmt.q8
 }
 
 // Any expert stack on the SUPERBLOCK kq lattice? (q51 excluded — its grouped-prefill kernels are
@@ -1997,6 +2026,31 @@ def resident_plan(t : Model; seq_cap : int64; kdt, vdt : KVDtype) : ResidentPlan
 
 var private g_rdec_active = false       // this loaded model runs the resident decode driver
 var private g_rdec_cnt = 0l             // cached positions in the device KV mirror (built as we decode)
+var private g_rdec_cap = 0l             // mirror context the driver armed at (<= model ctx when VRAM-capped)
+var private g_rdec_gen = 0l             // mirror ownership generation (bumped per resident prefill)
+var private g_resident_prefill_allowed = true   // multi-stream schedulers pin this off (see set_resident_prefill_allowed)
+
+//! Allow/forbid the whole-prefill resident override. A multi-stream scheduler (dasllama-server)
+//! pins it OFF: the single shared mirror + chunked prefill would leave device-only KV that a
+//! second stream's steal strands. Single-session tools keep the fast path (default on).
+def set_resident_prefill_allowed(allowed : bool) {
+    g_resident_prefill_allowed = allowed
+}
+
+// Bulk-hydrate the session's host KV from the device mirror rows [0, g_rdec_cnt) — the rail that
+// keeps host KV authoritative at rest after device-resident prefills/decodes.
+def private rdec_hydrate_host(t : Model; var s : Session) {
+    let c = t.config
+    for (l in range64(c.n_layers)) {
+        unsafe {
+            rdec_read_kv_bulk(l, reinterpret<float?>(kv_layer_kbase(s, l, c.seq_len)),
+                reinterpret<float?>(kv_layer_vbase(s, l, c.seq_len)), g_rdec_cnt)
+        }
+    }
+    s.rdec_hydrated = true
+    to_log(LOG_INFO, "dasLLAMA: resident KV hydrated to host ({g_rdec_cnt} positions x {c.n_layers} layers)\n")
+}
+let private RDEC_MIN_CTX = 4096l        // smallest ctx worth arming a capped mirror at
 
 // gather one prepared plane into device-layout bytes and place it in its format's arena; returns
 // the arena block index. Same gather the per-op tier uses (moe_gpu_gather_stack / _kq), then place
@@ -2028,6 +2082,12 @@ def resident_upload(var t : Model; seq_cap : int64) : bool {
     if (!moe_gpu_resident_installed() || t.quant != QuantMode.q8 || t.config.n_expert > 0l) {
         return false
     }
+    // the driver is all-or-nothing across prefill AND decode (the KV lives in the device mirror
+    // only), so a pin away from it declines BEFORE any upload — the per-op rails take over
+    let pin = get_env_variable("DASLLAMA_PIN_PREFILL")
+    if ((!empty(pin) && pin != "vulkan") || !empty(active_prefill_override())) {
+        return false
+    }
     let c = t.config
     // only the plain llama std shape for now — no bias, no sinks, no qk-norm (qwen3), no shared-KV,
     // no softcap (gemma), no partial rotary. These decline cleanly and fall back to the CPU loop.
@@ -2042,6 +2102,10 @@ def resident_upload(var t : Model; seq_cap : int64) : bool {
     let hs = layer_head_size(c, 0l)
     let qd = layer_qd(c, 0l)
     let kvd = layer_kv_dim(c, 0l)
+    // the prefill Q-tile attention kernel's geometry (da_attn_b: 32-dim lanes, hs-strided staging)
+    if (hs % 32l != 0l || hs > 256l) {
+        return false
+    }
     let neox = c.rope_neox
     let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
     // reject non-uniform per-layer geometry (the recorder assumes fixed dims across layers)
@@ -2130,8 +2194,11 @@ def resident_upload(var t : Model; seq_cap : int64) : bool {
     delete norms
     g_rdec_active = true
     g_rdec_cnt = 0l
+    g_rdec_cap = seq_cap
+    // prefill + decode select together — the device prefill fills the mirror the decode reads
+    select_prefill_override("vulkan")
     select_decode_override("vulkan")
-    to_log(LOG_INFO, "dasLLAMA: resident decode driver armed ({c.n_layers} layers, dim {dim}, ctx {seq_cap})\n")
+    to_log(LOG_INFO, "dasLLAMA: resident driver armed ({c.n_layers} layers, dim {dim}, ctx {seq_cap}, device prefill + decode)\n")
     return true
 }
 
@@ -2139,7 +2206,20 @@ def resident_upload(var t : Model; seq_cap : int64) : bool {
 //! position's rope row, runs the whole forward on device, produces s.logits. Decode-from-scratch
 //! for now — the mirror builds as positions arrive (prefix-KV sync is a follow-up).
 def private vulkan_resident_decode(t : Model; var s : Session; token, pos : int64) : bool {
-    if (!g_rdec_active) {
+    // continuity guard: a gap in the mirror means an earlier position took the CPU path — decline too
+    if (!g_rdec_active || pos > g_rdec_cnt) {
+        return false
+    }
+    // ownership guard: the single mirror holds ONE session's rows (superseded => host has ours)
+    if (s.rdec_gen != g_rdec_gen) {
+        if (s.rdec_gen != 0l && !s.rdec_hydrated) {
+            panic("dasLLAMA resident decode: session's mirror rows were superseded before hydration — engine bug (the steal path must hydrate first)")
+        }
+        return false
+    }
+    if (pos + 1l > g_rdec_cap) {
+        // capacity exhausted: hydrate host KV from the mirror, then the CPU rails take over
+        rdec_hydrate_host(t, s)
         return false
     }
     let c = t.config
@@ -2171,6 +2251,8 @@ def private vulkan_resident_decode(t : Model; var s : Session; token, pos : int6
     rdec_token(x, cossin, pos, cnt, s.logits)
     delete x
     delete cossin
+    g_rdec_cnt = pos + 1l   // mirror continuity: rows [0, pos] are now live
+    s.rdec_hydrated = false   // the mirror advanced past any earlier hydration
     decode_override_logits_done()   // logits produced on device
     return true
 }
@@ -2211,6 +2293,53 @@ def resident_prefill(t : Model; var s : Session; tokens : array<int64>; npos : i
     rdec_prefill(xb, cb, npos, s.logits)
     delete xb
     delete cb
+    return true
+}
+
+// The "vulkan" whole-prefill override (PrefillOverrideFn): one-submit device prefill via the
+// resident driver. The mirror gets the rows; host KV is hydrated back on demand (continuation,
+// cap exhaustion) so the CPU rails always take over from a valid host authority.
+def private vulkan_resident_prefill(t : Model; var s : Session; npos, start_pos : int64) : bool {
+    // gates: armed + embedder-allowed + the hydratable flat-f32 shape (else device would hold the only KV copy)
+    if (!g_rdec_active || !g_resident_prefill_allowed
+            || s.kv_dtype_k != KVDtype.f32 || s.kv_dtype_v != KVDtype.f32 || s.kv_pool != null) {
+        return false
+    }
+    if (start_pos != 0l) {
+        // continuation over OUR device-held history: hydrate host KV, then decline to the CPU loop
+        if (g_rdec_cnt > 0l && s.rdec_gen == g_rdec_gen && !s.rdec_hydrated) {
+            rdec_hydrate_host(t, s)
+        }
+        return false
+    }
+    if (npos > g_rdec_cap) {
+        return false
+    }
+    // a DIFFERENT session's re-prefill steals the single mirror — fine for serial flows; a stranded owner's decode fails LOUD via the ownership guard
+    let c = t.config
+    let hs = layer_head_size(c, 0l)
+    let half = hs / 2l
+    var cb : array<float>
+    cb |> resize(int(npos * hs))
+    for (p in range64(npos)) {
+        let theta = c.rope_freq_base
+        for (j in range64(half)) {
+            var freq = 1.0 / pow(theta, float(2l * j) / float(hs))
+            if (!empty(t.rope_freqs)) {
+                freq /= t.rope_freqs[j]
+            }
+            let ang = float(p) * freq * c.rope_freq_scale
+            cb[int(p * hs + j)] = cos(ang) * c.rope_mscale
+            cb[int(p * hs + half + j)] = sin(ang) * c.rope_mscale
+        }
+    }
+    rdec_prefill(s.x_b, cb, npos, s.logits)
+    delete cb
+    g_rdec_cnt = npos   // the mirror now holds [0, npos) — the decode's continuity witness
+    g_rdec_gen ++
+    s.rdec_gen = g_rdec_gen
+    s.rdec_hydrated = false
+    prefill_override_logits_done()
     return true
 }
 
@@ -2287,6 +2416,89 @@ def private vulkan_resident_batch_decode(t : Model; var ws : BatchWorkspace; var
 def resident_driver_register() {
     register_decode_override("vulkan", @@vulkan_resident_decode)
     register_batch_decode_override("vulkan", @@vulkan_resident_batch_decode)
+    register_prefill_override("vulkan", @@vulkan_resident_prefill)
+}
+
+// ===== multi-model GPU slot switch (marks swap + whole-model drop/re-arm) =====
+
+//! One model's complete per-model tier state for a multi-model host: the loader-contract marks
+//! plus the resident driver's activation. Save after the model's load (or arm), restore before
+//! stepping that model — two models' offset-keyed marks must never be installed together.
+struct GpuModelMarks {
+    marks : MoeGpuMarks <- MoeGpuMarks()
+    rdec_active : bool
+    rdec_cnt : int64
+    rdec_cap : int64
+}
+
+//! Move the INSTALLED per-model tier state out into `st`; the globals read as no-model after.
+def moe_gpu_model_marks_save(var st : GpuModelMarks) {
+    moe_gpu_marks_save(st.marks)
+    st.rdec_active = g_rdec_active
+    st.rdec_cnt = g_rdec_cnt
+    st.rdec_cap = g_rdec_cap
+    g_rdec_active = false
+    g_rdec_cnt = 0l
+    g_rdec_cap = 0l
+}
+
+//! Install `st` as the per-model tier state (the save's inverse; `st` reads as no-model after).
+def moe_gpu_model_marks_restore(var st : GpuModelMarks) {
+    moe_gpu_marks_restore(st.marks)
+    g_rdec_active = st.rdec_active
+    g_rdec_cnt = st.rdec_cnt
+    g_rdec_cap = st.rdec_cap
+    st.rdec_active = false
+    st.rdec_cnt = 0l
+    st.rdec_cap = 0l
+}
+
+//! Is the resident whole-stack decode driver active for the INSTALLED model? (The arm-outcome
+//! discriminator status surfaces read: resident beats rails beats cpu.)
+def moe_gpu_resident_active() : bool => g_rdec_active
+
+//! Hydrate `s`'s host KV from the device mirror when `s` owns live mirror rows (no-op
+//! otherwise). Call over every live session of the outgoing model before ``moe_gpu_drop_model``
+//! — the drop destroys the mirror, and an unhydrated owner's rows exist nowhere else.
+def moe_gpu_hydrate_session(t : Model; var s : Session) {
+    if (g_rdec_active && g_rdec_cnt > 0l && s.rdec_gen == g_rdec_gen && !s.rdec_hydrated) {
+        rdec_hydrate_host(t, s)
+    }
+}
+
+//! Drop the INSTALLED model's whole GPU state (every model-owned device object + the routing
+//! marks); the model keeps serving on the CPU rails, and re-arm = the same three calls a load
+//! runs. Caller guarantees quiescence: no step in flight, sessions hydrated first.
+def moe_gpu_drop_model() {
+    if (!moe_gpu_tier_installed()) {
+        return
+    }
+    moe_gpu_dn_invalidate()
+    g_rdec_active = false
+    g_rdec_cnt = 0l
+    g_rdec_cap = 0l
+    // resident_upload selected the "vulkan" overrides; deselect so (a) a later re-arm's
+    // resident_upload passes its no-active-override gate (the warm re-arm decline), and (b) a
+    // dropped model's prefill/decode take the plain CPU path without consulting dead state
+    if (active_prefill_override() == "vulkan") {
+        select_prefill_override("")
+    }
+    if (active_decode_override() == "vulkan") {
+        select_decode_override("")
+    }
+    moe_gpu_drop_model_state()
+    // loader-contract reset — the same clean slate moe_gpu_upload_resident starts from
+    set_moe_gpu_layer_count(0l)
+    set_moe_gpu_from_layer(1000000l)
+    set_moe_gpu_stream_from(1000000l)
+    set_moe_gpu_total_layers(0l)
+    set_moe_gpu_cls_off(-1l)
+    reset_moe_gpu_dense_offs()
+    reset_moe_gpu_dn_layers()
+    reset_moe_gpu_attn_layers()
+    reset_moe_gpu_shexp_layers()
+    reset_moe_gpu_qkv_layers()
+    set_moe_gpu_model_support("")
 }
 
 // Upload the offloaded layers' expert stacks to the GPU tier from the PREPARED planes. Called at
@@ -2315,6 +2527,29 @@ def moe_gpu_upload_resident(var t : Model) {
             || (moe_gpu_layer_count() == 0l && nstream <= 0l && !dn_want && !at_want
                 && !gpu_want_shexp() && !gpu_want_qkv() && !gpu_want_cls())) {
         return   // tier absent or nothing requested
+    }
+    // dense models that fully fit: try the whole-stack resident driver FIRST — it subsumes every
+    // rail below (all planes + classifier resident, one-submit device prefill + mirror decode).
+    // Any decline (shape, fit, placement) falls through to the per-op rails unchanged.
+    if (moe_gpu_resident_installed() && gpu_want_auto() && t.config.n_expert == 0l) {
+        var seq_cap = t.config.seq_len
+        var plan = resident_plan(t, seq_cap, KVDtype.f32, KVDtype.f32)
+        if (!plan.fits && plan.weight_bytes > 0l && plan.kv_bytes > 0l) {
+            // weights are fixed, the KV mirror is not: retry at the context that fits (the plan's
+            // own remedy), as long as it stays a usable window. The driver guards decode past the cap.
+            let fit_ctx = (plan.budget_bytes - plan.weight_bytes) / (plan.kv_bytes / seq_cap)
+            if (fit_ctx >= RDEC_MIN_CTX) {
+                seq_cap = fit_ctx
+                plan = resident_plan(t, seq_cap, KVDtype.f32, KVDtype.f32)
+            }
+        }
+        if (plan.fits) {
+            if (resident_upload(t, seq_cap)) {
+                return
+            }
+        } elif (!empty(plan.reason)) {
+            to_log(LOG_INFO, "dasLLAMA: resident driver declined — {plan.reason}\n")
+        }
     }
     // capability guard: the tier needs q8 serving mode — record WHY for the status surface when it
     // is armed but this model cannot ride it. Dense archs pass: every non-expert rail (cls, dense
@@ -2368,7 +2603,9 @@ def moe_gpu_upload_resident(var t : Model) {
         for (l in range64(layers)) {
             var uploads : array<tuple<f : KqFmt; woff : int64; n : int64; rows : int64>>
             if (layer_is_recurrent(t.config, l)) {
-                if (t.dnqkv_offs[l] >= 0l && t.dngate_offs[l] >= 0l && t.dnout_offs[l] >= 0l) {
+                // kq-tagged dn planes (CPU-rail loads) are not tier-servable — the dn chain reads q8
+                if (t.dnqkv_offs[l] >= 0l && t.dngate_offs[l] >= 0l && t.dnout_offs[l] >= 0l
+                        && dn_layer_q8(t, l)) {
                     uploads |> push((f = KqFmt.q8, woff = t.dnqkv_offs[l], n = dim, rows = dn_conv_dim(t.config)))
                     uploads |> push((f = KqFmt.q8, woff = t.dngate_offs[l], n = dim, rows = t.config.ssm_d_inner))
                     uploads |> push((f = KqFmt.q8, woff = t.dnout_offs[l], n = t.config.ssm_d_inner, rows = dim))
@@ -2448,7 +2685,8 @@ def moe_gpu_upload_resident(var t : Model) {
         var dn_stop = false
         for (l in range64(layers)) {
             if (!layer_is_recurrent(t.config, l)
-                    || t.dnqkv_offs[l] < 0l || t.dngate_offs[l] < 0l || t.dnout_offs[l] < 0l) {
+                    || t.dnqkv_offs[l] < 0l || t.dngate_offs[l] < 0l || t.dnout_offs[l] < 0l
+                    || !dn_layer_q8(t, l)) {   // kq-tagged dn planes stay on the CPU rail
                 continue
             }
             if (moe_gpu_dense_on_gpu(int(KqFmt.q8), t.dnqkv_offs[l])) {
@@ -2704,9 +2942,10 @@ def private metal_blob_layout_ok(t : Model) : bool {
         return false
     }
     for (l in range64(c.n_layers)) {
-        // recurrent layers (Wave D): no attention tensors (offs -1, off_ok true), q8 dn planes instead
+        // recurrent layers (Wave D): no attention tensors (offs -1, off_ok true); dn planes must be q8
         let dn_bad = (has_dn && layer_is_recurrent(c, l) &&
-            (!metal_blob_off_ok(t.dnqkv_offs[l], KqFmt.q8) ||
+            (!dn_layer_q8(t, l) ||
+             !metal_blob_off_ok(t.dnqkv_offs[l], KqFmt.q8) ||
              !metal_blob_off_ok(t.dngate_offs[l], KqFmt.q8) ||
              !metal_blob_off_ok(t.dnbeta_offs[l], KqFmt.q8) ||
              !metal_blob_off_ok(t.dnalpha_offs[l], KqFmt.q8) ||
@@ -2945,15 +3184,21 @@ def private repack_q8_weights(var t : Model) {
         if (t.wo_offs[l] >= 0l && fmt_at(t.wo_fmt, l) == KqFmt.q8) {
             push_repack(regs, 0, t.wo_offs[l], qd, dim)
         }
-        if (layer_is_recurrent(c, l)) {  // deltanet projections (all q8 in v1 — no kq tags)
+        if (layer_is_recurrent(c, l)) {  // deltanet projections (kq-tagged planes repack in the kq walk)
             let cd = dn_conv_dim(c)
-            push_repack(regs, 0, t.dnqkv_offs[l], dim, cd)
-            push_repack(regs, 0, t.dngate_offs[l], dim, c.ssm_d_inner)
+            if (fmt_at(t.dnqkv_fmt, l) == KqFmt.q8) {
+                push_repack(regs, 0, t.dnqkv_offs[l], dim, cd)
+            }
+            if (fmt_at(t.dngate_fmt, l) == KqFmt.q8) {
+                push_repack(regs, 0, t.dngate_offs[l], dim, c.ssm_d_inner)
+            }
             if (t.dnbeta_offs[l] >= 0l) {   // -1 when beta/alpha ship F32 (fblob, no repack)
                 push_repack(regs, 0, t.dnbeta_offs[l], dim, c.ssm_dt_rank)
                 push_repack(regs, 0, t.dnalpha_offs[l], dim, c.ssm_dt_rank)
             }
-            push_repack(regs, 0, t.dnout_offs[l], c.ssm_d_inner, dim)
+            if (fmt_at(t.dnout_fmt, l) == KqFmt.q8) {
+                push_repack(regs, 0, t.dnout_offs[l], c.ssm_d_inner, dim)
+            }
         }
         if (has_ple(c)) {  // gemma-4 E-series per-layer PLE gate/proj (the emb table stays linear, unpacked)
             let ple = c.n_embd_per_layer
@@ -3041,7 +3286,13 @@ def private repack_kq_weights(var t : Model) {
     for (l in range64(c.n_layers + c.n_layer_nextn)) {   // + the MTP/NextN block at index n_layers
         let kv = layer_kv_dim(c, l)
         let qd = layer_qd(c, l)
-        // recurrent (deltanet) layers carry no attention projections; nothing kq to repack on them
+        // recurrent (deltanet) layers carry no attention projections — their kq planes are the dn triple
+        if (layer_is_recurrent(c, l)) {
+            let cd = dn_conv_dim(c)
+            push_repack_kq(regs, fmt_at(t.dnqkv_fmt, l), t.dnqkv_offs[l], dim, cd)
+            push_repack_kq(regs, fmt_at(t.dngate_fmt, l), t.dngate_offs[l], dim, c.ssm_d_inner)
+            push_repack_kq(regs, fmt_at(t.dnout_fmt, l), t.dnout_offs[l], c.ssm_d_inner, dim)
+        }
         if (t.wq_offs[l] >= 0l) {
             push_repack_kq(regs, fmt_at(t.wq_fmt, l), t.wq_offs[l], dim, qd * (c.q_gated ? 2l : 1l))
         }
@@ -3603,11 +3854,9 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
         // fp32 path (a requantized classifier would drift from the oracle for no parity gain).
         t.cls_q8 = (t.config.shared_weights && mode == QuantMode.q8
             && gguf_tensor_type(m, "token_embd.weight") == GGML_TYPE_Q8_0)
-        // per-tensor K-quant format tags (kquant_native rail; no-op when the knob is off or the
-        // file has no K-quant tensors) — must precede layout_offsets, which walks the tags
-        detect_kq_formats(t, m)
         // ssm_beta/ssm_alpha disk type routes their matmul (must precede layout_offsets): F32
-        // files keep them fp32 in fblob (llama.cpp matmuls f32); quantized files ride qblob
+        // files keep them fp32 in fblob (llama.cpp matmuls f32); quantized files ride qblob.
+        // Also before detect_kq_formats — the dn tags demote on grouped (qwen3next) files.
         if (t.config.recr_mask != 0ul) {
             var frl = 0l
             while (!layer_is_recurrent(t.config, frl)) {
@@ -3617,6 +3866,9 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
             let ba0 = t.dn_grouped ? "blk.{frl}.ssm_ba.weight" : "blk.{frl}.ssm_beta.weight"
             t.dn_ba_f32 = gguf_tensor_type(m, ba0) == GGML_TYPE_F32
         }
+        // per-tensor K-quant format tags (kquant_native rail; no-op when the knob is off or the
+        // file has no K-quant tensors) — must precede layout_offsets, which walks the tags
+        detect_kq_formats(t, m)
         // logit soft-caps from metadata when present (gemma2: 50/30, gemma4: final 30 only);
         // configure()'s values stay as the fallback for files without the keys
         if (gguf_has(m, "{arch}.attn_logit_softcapping")) {
@@ -3820,13 +4072,13 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
                     load_dn_grouped(m, bytes, t, l, dim, scratch)
                 } else {
                     let cd = dn_conv_dim(t.config)
-                    load_big(m, bytes, "blk.{l}.attn_qkv.weight", t, t.dnqkv_offs[l], dim * cd, scratch)
-                    load_big(m, bytes, "blk.{l}.attn_gate.weight", t, t.dngate_offs[l], dim * t.config.ssm_d_inner, scratch)
+                    load_big(m, bytes, "blk.{l}.attn_qkv.weight", t, t.dnqkv_offs[l], dim * cd, scratch, 0l, fmt_at(t.dnqkv_fmt, l))
+                    load_big(m, bytes, "blk.{l}.attn_gate.weight", t, t.dngate_offs[l], dim * t.config.ssm_d_inner, scratch, 0l, fmt_at(t.dngate_fmt, l))
                     if (!t.dn_ba_f32) {
                         load_big(m, bytes, "blk.{l}.ssm_beta.weight", t, t.dnbeta_offs[l], dim * t.config.ssm_dt_rank, scratch)
                         load_big(m, bytes, "blk.{l}.ssm_alpha.weight", t, t.dnalpha_offs[l], dim * t.config.ssm_dt_rank, scratch)
                     }
-                    load_big(m, bytes, "blk.{l}.ssm_out.weight", t, t.dnout_offs[l], t.config.ssm_d_inner * dim, scratch)
+                    load_big(m, bytes, "blk.{l}.ssm_out.weight", t, t.dnout_offs[l], t.config.ssm_d_inner * dim, scratch, 0l, fmt_at(t.dnout_fmt, l))
                 }
             } elif (t.config.fused_qkv) {
                 // Phi3: attn_qkv rows are [q (qd) ; k (kv) ; v (kv)], ffn_up rows are [gate ; up] (hidden each).
@@ -4156,6 +4408,10 @@ struct Session {
     // their source layer's slab (same prefix value).
     kv_dtype_k : KVDtype      // key codec, snapshotted from the module knob in make_run_state
     kv_dtype_v : KVDtype      // value codec (independent of K by design)
+    // resident-driver mirror ownership: gen stamps which session's rows the device KV mirror
+    // holds (0 = never resident-prefilled); hydrated = host KV has been read back since
+    rdec_gen : int64
+    rdec_hydrated : bool
     kv_signs : array<float>   // tq4 rotation signs (±1, max head_size; smaller heads use a prefix)
     key_cache : array<uint8>
     value_cache : array<uint8>
@@ -7237,8 +7493,8 @@ def private deltanet_decode(t : Model; var s : Session; l : int64) {
     rms_at(s.xb, t, t.rms_att_off + l * dim, s.x, dim)
     prof_add("norm", ts_norm0)
     let ts_qkv = ref_time_ticks()
-    mm_f(s.dn_qkv, t, KqFmt.q8, t.dnqkv_offs[l], s.xb, s.xq, s.xs, s.xbs, dim, cd)
-    mm_f(s.dn_z, t, KqFmt.q8, t.dngate_offs[l], s.xb, s.xq, s.xs, s.xbs, dim, di)
+    mm_f(s.dn_qkv, t, fmt_at(t.dnqkv_fmt, l), t.dnqkv_offs[l], s.xb, s.xq, s.xs, s.xbs, dim, cd)
+    mm_f(s.dn_z, t, fmt_at(t.dngate_fmt, l), t.dngate_offs[l], s.xb, s.xq, s.xs, s.xbs, dim, di)
     if (t.dn_ba_f32) {   // F32-on-disk beta/alpha matmul fp32, like llama.cpp
         mm_fblob(s.dn_beta, t, t.dn_betaf_off + l * dim * nvh, s.xb, dim, nvh)
         mm_fblob(s.dn_g, t, t.dn_alphaf_off + l * dim * nvh, s.xb, dim, nvh)
@@ -7254,7 +7510,7 @@ def private deltanet_decode(t : Model; var s : Session; l : int64) {
     }
     prof_add("attn", ts_attn)
     let ts_wo = ref_time_ticks()
-    mm_f(s.xb2, t, KqFmt.q8, t.dnout_offs[l], s.dn_o, s.xq, s.xs, s.xbs, di, dim)
+    mm_f(s.xb2, t, fmt_at(t.dnout_fmt, l), t.dnout_offs[l], s.dn_o, s.xq, s.xs, s.xbs, di, dim)
     prof_add("mm_wo", ts_wo)
     let ts_resid = ref_time_ticks()
     add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.xb2[0])), dim)
@@ -7490,7 +7746,7 @@ def private dense_ffn_inplace(t : Model; var s : Session; l : int64) {
             quantize_q8_k_into(s.hb, hidden, s.kxq, s.kxs, s.kxbs, 0l, 0l, 0l)
         }
         mm_pre_f(s.xb, t, f2, t.w2_offs[l], s.xq, s.xs, s.kxq, s.kxs, s.kxbs, hidden, dim)
-        prof_add("mm_ffn", ts_down)
+        prof_add("mm_ffn_down", ts_down)
     } elif (t.quant == QuantMode.q8) {
         // gate+up share the activation: ONE quantize + ONE region-list dispatch into ffn_gu's halves
         quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)
@@ -7509,7 +7765,7 @@ def private dense_ffn_inplace(t : Model; var s : Session; l : int64) {
         let ts_down = ref_time_ticks()
         quantize_q8_0_into(s.ffn_gu, hidden, s.xq, s.xs, 0l, 0l)
         mm_at_q8_pre(s.xb, t, t.w2_offs[l], s.xq, s.xs, hidden, dim)
-        prof_add("mm_ffn", ts_down)
+        prof_add("mm_ffn_down", ts_down)
     } else {
         mm(s.hb, t, t.w1_offs[l], s.xb, s.xq, s.xs, dim, hidden)
         mm(s.hb2, t, t.w3_offs[l], s.xb, s.xq, s.xs, dim, hidden)
@@ -7519,7 +7775,7 @@ def private dense_ffn_inplace(t : Model; var s : Session; l : int64) {
         prof_add("act", ts_act)
         let ts_ffn2 = ref_time_ticks()
         mm(s.xb, t, t.w2_offs[l], s.hb, s.xq, s.xs, hidden, dim)
-        prof_add("mm_ffn", ts_ffn2)
+        prof_add("mm_ffn_down", ts_ffn2)
     }
 }
 
@@ -10545,8 +10801,8 @@ def private deltanet_prefill(t : Model; var s : Session; l : int64; npos : int64
     rms_batch(s.xb_b, s.x_b, t, t.rms_att_off + l * dim, dim, npos)
     prof_add("dn_norm", ts_norm0)
     let ts_qkv = ref_time_ticks()
-    mm_b_f(s, s.dn_qkv_b, t, KqFmt.q8, t.dnqkv_offs[l], s.xb_b, dim, cd, npos)
-    mm_b_f(s, s.dn_z_b, t, KqFmt.q8, t.dngate_offs[l], s.xb_b, dim, di, npos)
+    mm_b_f(s, s.dn_qkv_b, t, fmt_at(t.dnqkv_fmt, l), t.dnqkv_offs[l], s.xb_b, dim, cd, npos)
+    mm_b_f(s, s.dn_z_b, t, fmt_at(t.dngate_fmt, l), t.dngate_offs[l], s.xb_b, dim, di, npos)
     if (t.dn_ba_f32) {   // F32-on-disk beta/alpha matmul fp32, like llama.cpp
         mm_fblob_b(s.dn_beta_b, t, t.dn_betaf_off + l * dim * nvh, s.xb_b, dim, nvh, npos)
         mm_fblob_b(s.dn_g_b, t, t.dn_alphaf_off + l * dim * nvh, s.xb_b, dim, nvh, npos)
@@ -10572,7 +10828,7 @@ def private deltanet_prefill(t : Model; var s : Session; l : int64; npos : int64
         prof_add("dn_core", ts_core)
     }
     let ts_wo = ref_time_ticks()
-    mm_b_f(s, s.xb2_b, t, KqFmt.q8, t.dnout_offs[l], s.dn_o_b, di, dim, npos)
+    mm_b_f(s, s.xb2_b, t, fmt_at(t.dnout_fmt, l), t.dnout_offs[l], s.dn_o_b, di, dim, npos)
     prof_add("dn_mm_out", ts_wo)
     let ts_resid = ref_time_ticks()
     add_inplace(unsafe(addr(s.x_b[0])), unsafe(addr(s.xb2_b[0])), npos * dim)
@@ -10740,7 +10996,7 @@ def private ffn_dense_prefill(t : Model; var s : Session; l : int64; npos : int6
     // down projection (batched) + optional post-FFN norm + residual
     let ts_ffn2 = ref_time_ticks()
     mm_b_f(s, s.xb_b, t, fmt_at(t.w2_fmt, l), t.w2_offs[l], s.hb_b, hidden, dim, npos)
-    prof_add("mm_ffn", ts_ffn2)
+    prof_add("mm_ffn_down", ts_ffn2)   // own bucket: down is long-K + often a different format (Q4_K_M keeps it q6_K)
     let ts_resid1 = ref_time_ticks()
     if (c.pre_post_norm) {  // Gemma2: post-FFN RMSNorm per position before residual
         rms_batch(s.xb_b, s.xb_b, t, t.rms_post_ffn_off + l * dim, dim, npos)

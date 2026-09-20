@@ -109,4 +109,11 @@ def main {
     emit_golden(dir, "q8blk", q8blk_words())
     // packed integer dot product: sdot4 -> OpSDot + PackedVectorFormat4x8Bit literal
     emit_golden(dir, "sdot", sdot_words())
+    // cooperative matrix: OpTypeCooperativeMatrixKHR + Load/Store/MulAddKHR, the Vulkan memory model,
+    // SPIR-V 1.6 header
+    emit_golden(dir, "coopmat", coopmat_words())
+    // coopmat int8: the s8 x s8 -> s32 tile + the signed-components MulAdd operands mask
+    emit_golden(dir, "coopmat_i8", coopmat_i8_words())
+    // coopmat from @workgroup shared memory (the tiled-GEMM staging path)
+    emit_golden(dir, "coopmat_sm", coopmat_sm_words())
 }

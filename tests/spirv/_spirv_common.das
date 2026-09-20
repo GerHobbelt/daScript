@@ -2032,12 +2032,110 @@ def public q8blk_words : array<uint> {
     return clone_to_move(q8blk_spv)
 }
 
+// ===== cooperative matrix (SPV_KHR_cooperative_matrix): an f16 x f16 -> f32 GEMM tile. Loads a 16x16 A
+// (row-major) and B (column-major) from f16 SSBOs into subgroup tiles, one MulAdd into a zero-initialized
+// (OpConstantNull) f32 accumulator, stores the 16x16 result column-major. Exercises
+// OpTypeCooperativeMatrixKHR + CooperativeMatrix{Load,Store,MulAdd}KHR + the CooperativeMatrixKHR
+// capability + SPV_KHR_cooperative_matrix extension + the SPIR-V 1.6 version floor. =====
+var @ssbo @binding = 0 cm_a : array<float16>
+var @ssbo @binding = 1 cm_b : array<float16>
+var @ssbo @binding = 2 cm_c : array<float>
+
+[compute_shader(local_size_x=32, name="coopmat_spv"), marker(no_coverage)]
+def coopmat_kernel {
+    var a : coopmatA_f16_16x16
+    var b : coopmatB_f16_16x16
+    var acc : coopmatAcc_f32_16x16
+    coopmatLoad(a, cm_a, 0, 16, 0)   // A: 16x16 row-major, stride 16
+    coopmatLoad(b, cm_b, 0, 16, 1)   // B: 16x16 column-major, stride 16
+    acc = coopmatMulAdd(a, b, acc)
+    coopmatStore(acc, cm_c, 0, 16, 1)   // C: 16x16 column-major, stride 16
+}
+
+def public coopmat_words : array<uint> {
+    return clone_to_move(coopmat_spv)
+}
+
+// ===== cooperative matrix INT8 path (SPV_KHR_cooperative_matrix): the native s8 x s8 -> s32 tile
+// (16x16x32 — the Q8-weight path, no dequant). A is 16x32 (row-major) and B is 32x16 (column-major),
+// both int8 SSBOs; an s32 accumulator (16x16). The integer MulAdd carries a CooperativeMatrixOperands
+// mask declaring A/B/C/Result signed (0xF). Reuses the four coopmat opcodes + the StorageBuffer8BitAccess
+// capability (from the 8/16-bit storage wave) — no NEW opcodes over the f16 coopmat fixture. =====
+var @ssbo @binding = 0 cmi_a : array<int8>
+var @ssbo @binding = 1 cmi_b : array<int8>
+var @ssbo @binding = 2 cmi_c : array<int>
+
+[compute_shader(local_size_x=32, name="coopmat_i8_spv"), marker(no_coverage)]
+def coopmat_i8_kernel {
+    var a : coopmatA_s8_16x32
+    var b : coopmatB_s8_32x16
+    var acc : coopmatAcc_s32_16x16
+    coopmatLoad(a, cmi_a, 0, 32, 0)   // A: 16x32 row-major, stride 32
+    coopmatLoad(b, cmi_b, 0, 32, 1)   // B: 32x16 column-major, stride 32
+    acc = coopmatMulAdd(a, b, acc)
+    coopmatStore(acc, cmi_c, 0, 16, 1)   // C: 16x16 column-major, stride 16
+}
+
+def public coopmat_i8_words : array<uint> {
+    return clone_to_move(coopmat_i8_spv)
+}
+
+// ===== coopmat from @workgroup SHARED memory: the real-GEMM prerequisite. A tiled GEMM stages a block of
+// A/B into shared, then coopMatLoads the tiles from SHARED (coalesced, reused) rather than straight from
+// the @ssbo global (memory-bound). This fixture stages an f16 tile into @workgroup and coopMatLoads it
+// from there — exercising the Workgroup-storage OpAccessChain path in coop_buf_ptr. No new opcodes. =====
+var @ssbo @binding = 0 sm_a : array<float16>
+var @ssbo @binding = 1 sm_c : array<float>
+var @workgroup sm_tile_a : float16[256]
+var @workgroup sm_tile_b : float16[256]
+
+[compute_shader(local_size_x=32, name="coopmat_sm_spv"), marker(no_coverage)]
+def coopmat_sm_kernel {
+    var i = int(gl_LocalInvocationID.x)
+    while (i < 256) {
+        sm_tile_a[i] = sm_a[i]
+        sm_tile_b[i] = sm_a[i]
+        i += 32
+    }
+    barrier()
+    var a : coopmatA_f16_16x16
+    var b : coopmatB_f16_16x16
+    var acc : coopmatAcc_f32_16x16
+    coopmatLoad(a, sm_tile_a, 0, 16, 0)   // load the tile from SHARED memory (not the @ssbo)
+    coopmatLoad(b, sm_tile_b, 0, 16, 1)
+    acc = coopmatMulAdd(a, b, acc)
+    coopmatStore(acc, sm_c, 0, 16, 1)
+}
+
+def public coopmat_sm_words : array<uint> {
+    return clone_to_move(coopmat_sm_spv)
+}
+
 // ===== packed integer dot product: sdot4 -> OpSDot with the PackedVectorFormat4x8Bit literal.
 // The DotProduct / DotProductInput4x8BitPacked caps + SPV_KHR_integer_dot_product ride the
 // declared Capability/Extension opcodes. =====
 def public sdot_emitter_opcodes : table<uint> {
     var s <- storage816_emitter_opcodes()
     s |> insert(uint(SpvOp.SDot))
+    return <- s
+}
+
+// The coopmat GEMM-tile fixture adds the four KHR cooperative-matrix opcodes plus OpConstantNull (every
+// bare `var` coopmat local — A, B and the accumulator — zero-inits with one; no earlier fixture zero-inits
+// a value type). The CooperativeMatrixKHR / VulkanMemoryModel capabilities + SPV_KHR_cooperative_matrix
+// extension ride the already-declared Capability / Extension opcodes; the Vulkan memory model rides the
+// already-declared MemoryModel opcode.
+def public coopmat_emitter_opcodes : table<uint> {
+    var s <- sdot_emitter_opcodes()
+    for (op in [
+        SpvOp.ConstantNull,
+        SpvOp.TypeCooperativeMatrixKHR,
+        SpvOp.CooperativeMatrixLoadKHR,
+        SpvOp.CooperativeMatrixStoreKHR,
+        SpvOp.CooperativeMatrixMulAddKHR
+    ]) {
+        s |> insert(uint(op))
+    }
     return <- s
 }
 
