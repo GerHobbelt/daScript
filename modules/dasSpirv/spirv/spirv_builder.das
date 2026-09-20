@@ -154,11 +154,13 @@ def private ensure_width_cap(var m : SpirvModule; is_float : bool; width : uint)
     }
     let key = is_float ? "cap_f{width}" : "cap_i{width}"
     return if ((m.type_pool?[key] ?? 0u) != 0u)
-    if (is_float && width == 16u) {
-        emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.Float16))
-    } elif (!is_float && width == 16u) {
+    if (is_float) {
+        emit(m, SEC_CAPS, SpvOp.Capability, uint(width == 64u ? SpvCapability.Float64 : SpvCapability.Float16))
+    } elif (width == 64u) {
+        emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.Int64))
+    } elif (width == 16u) {
         emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.Int16))
-    } elif (!is_float && width == 8u) {
+    } elif (width == 8u) {
         emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.Int8))
     }
     m.type_pool |> insert(key, 1u)
@@ -278,6 +280,18 @@ def public type_acceleration_structure(var m : SpirvModule) : uint {
     return id
 }
 
+// OpTypeRayQueryKHR — the opaque ray-query object type (SPV_KHR_ray_query). A Function-storage
+// LOCAL (not a descriptor), passed by pointer to the rayQuery*EXT intrinsics. Deduped (no operands).
+def public type_ray_query(var m : SpirvModule) : uint {
+    let key = "rayquery"
+    let ex = m.type_pool?[key] ?? 0u
+    return ex if (ex != 0u)
+    let id = alloc_id(m)
+    emit(m, SEC_TYPES, SpvOp.TypeRayQueryKHR, id)
+    m.type_pool |> insert(key, id)
+    return id
+}
+
 // OpTypeSampledImage wrapping an image type — the type of a combined image+sampler descriptor.
 def public type_sampled_image(var m : SpirvModule; image_type : uint) : uint {
     let key = "simg{image_type}"
@@ -342,6 +356,20 @@ def public type_runtime_array(var m : SpirvModule; elem : uint; stride : int) : 
     let id = alloc_id(m)
     emit(m, SEC_TYPES, SpvOp.TypeRuntimeArray, id, elem)
     emit(m, SEC_DECOR, SpvOp.Decorate, id, uint(SpvDecoration.ArrayStride), uint(stride))
+    m.type_pool |> insert(key, id)
+    return id
+}
+
+// A runtime-sized array of an OPAQUE element (an image / sampled image / sampler) -- the descriptor
+// array a variable-descriptor-count binding exposes. Opaque types have no byte layout, so unlike the
+// SSBO form above this one carries NO ArrayStride; decorating it would be invalid SPIR-V. Deduped on
+// the element alone, in its own key space so it never collides with a strided array of the same id.
+def public type_runtime_array_opaque(var m : SpirvModule; elem : uint) : uint {
+    let key = "rtao{elem}"
+    let ex = m.type_pool?[key] ?? 0u
+    return ex if (ex != 0u)
+    let id = alloc_id(m)
+    emit(m, SEC_TYPES, SpvOp.TypeRuntimeArray, id, elem)
     m.type_pool |> insert(key, id)
     return id
 }
@@ -481,6 +509,19 @@ def public const_uint(var m : SpirvModule; v : uint) : uint {
     return id
 }
 
+// The zero of ANY type, whatever its shape -- OpConstantNull takes the type id and needs no
+// per-component constituents, so one entry serves scalars, vectors, matrices and arrays alike.
+// Keyed by that type id, which the type pool has already made unique.
+def public const_null(var m : SpirvModule; t : uint) : uint {
+    let key = "cn_{t}"
+    let ex = m.const_pool?[key] ?? 0u
+    return ex if (ex != 0u)
+    let id = alloc_id(m)
+    emit(m, SEC_TYPES, SpvOp.ConstantNull, t, id)
+    m.const_pool |> insert(key, id)
+    return id
+}
+
 // Signed-int and float OpConstants. The literal word is the raw 32-bit pattern: uint(v) carries an
 // int's two's-complement bits; reinterpret carries a float's IEEE-754 bits. Keyed separately from
 // const_uint so int 2 and uint 2 (distinct types) don't collide in the pool.
@@ -495,6 +536,7 @@ def public const_int(var m : SpirvModule; v : int) : uint {
     return id
 }
 
+
 def public const_float(var m : SpirvModule; v : float) : uint {
     // Key by the raw IEEE-754 bits, NOT the stringified float: stringifying would collapse distinct
     // bit patterns (-0.0 vs 0.0, NaN payloads, rounding-equal values) into one pool entry and reuse
@@ -506,6 +548,21 @@ def public const_float(var m : SpirvModule; v : float) : uint {
     let ft = type_float(m, 32u)
     let id = alloc_id(m)
     emit(m, SEC_TYPES, SpvOp.Constant, ft, id, bits)
+    m.const_pool |> insert(key, id)
+    return id
+}
+
+// The 64-bit float OpConstant. Unlike every other constant here the literal spans TWO words, low-order
+// first (SPIR-V 2.2.1), so a 64-bit value is the one case the 4-operand emit is spent in full. Keyed on
+// the bits, for the reason const_float spells out above.
+def public const_double(var m : SpirvModule; v : double) : uint {
+    let bits = unsafe(reinterpret<uint64>(v))
+    let key = "cd_{bits}"
+    let ex = m.const_pool?[key] ?? 0u
+    return ex if (ex != 0u)
+    let ft = type_float(m, 64u)
+    let id = alloc_id(m)
+    emit(m, SEC_TYPES, SpvOp.Constant, ft, id, uint(bits & 0xfffffffful), uint(bits >> 32ul))
     m.const_pool |> insert(key, id)
     return id
 }

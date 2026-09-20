@@ -85,7 +85,7 @@ captured global (default ``<func>`spirv``). The entry point is always emitted as
      - reads ``gl_VertexIndex`` / ``gl_InstanceIndex``, writes ``gl_Position``
    * - ``[fragment_shader]``
      - ``Fragment``
-     - reads ``gl_FragCoord``; ``OriginUpperLeft``
+     - reads ``gl_FragCoord``; ``OriginUpperLeft``; ``early_fragment_tests=true`` → ``EarlyFragmentTests`` (depth/stencil before the shader)
 
 
 Resources and stage I/O
@@ -119,8 +119,9 @@ take an integer value (``@binding = 0``); ``@in`` / ``@out`` / ``@ssbo`` / ``@un
      - — (graphics I/O)
 
 ``@uniform`` / ``@push_constant`` globals must be a ``struct`` (32-bit scalar / vector / matrix
-members); ``@ssbo`` must be an ``array<T>``. Member access (``ubo.field``) lowers to ``OpAccessChain``
-+ ``OpLoad``.
+members, plus ``int64`` / ``uint64`` scalars — the ``Int64`` capability, GLSL's
+``GL_ARB_gpu_shader_int64``, packed std140 like a ``double``: base align 8, size 8); ``@ssbo`` must be
+an ``array<T>``. Member access (``ubo.field``) lowers to ``OpAccessChain`` + ``OpLoad``.
 
 
 Built-in variables
@@ -156,6 +157,10 @@ Declared in ``spirv_builtins`` and recognized by name; available only in the sta
      - ``uint3``
      - ``NumWorkgroups``
      - compute
+   * - ``gl_WorkGroupSize``
+     - ``uint3``
+     - ``WorkgroupSize``
+     - compute
    * - ``gl_VertexIndex``
      - ``int``
      - ``VertexIndex``
@@ -172,6 +177,11 @@ Declared in ``spirv_builtins`` and recognized by name; available only in the sta
      - ``float4``
      - ``FragCoord``
      - fragment
+
+Every builtin above is an ``OpVariable`` except ``gl_WorkGroupSize``, which is the shader's own
+``local_size``: it folds to a ``BuiltIn WorkgroupSize``-decorated ``OpConstantComposite`` (no
+variable, no entry-point interface entry). That is what lets a module shared by several shaders --
+each compiled with its own ``local_size`` -- read the size of whichever one is compiling it.
 
 
 Textures and storage images
@@ -229,6 +239,9 @@ Type and layout mapping
    * - ``int`` / ``uint`` / ``float``
      - ``OpTypeInt 32`` / ``OpTypeFloat 32``
      - 4 bytes
+   * - ``int64`` / ``uint64``
+     - ``OpTypeInt 64`` (``Int64`` capability)
+     - 8 bytes, base align 8 (std140/std430, like a ``double``)
    * - ``bool``
      - ``OpTypeBool``
      - no physical interface-block layout
@@ -247,6 +260,9 @@ Type and layout mapping
    * - ``struct`` (in ``@uniform``)
      - ``OpTypeStruct`` + ``Block``
      - std140 member ``Offset``\ s
+   * - ``struct`` (local / parameter / result)
+     - ``OpTypeStruct``, undecorated
+     - none — a value, not an interface block
 
 Matrix · vector and matrix · matrix use SPIR-V's default column-major convention, so a daslang
 ``M * v`` is ``OpMatrixTimesVector`` with the matrix uploaded as-is.
@@ -263,7 +279,9 @@ string builders / ``goto`` — these are not shader constructs.
   (``OpLoopMerge``), ``break`` / ``continue``, early ``return``, and the ternary ``?:`` (``OpSelect``,
   branchless).
 * **Operators:** full scalar and vector arithmetic (``+ - * / %``, unary ``-``), comparisons
-  (``== != < > <= >=``), logical ``&&`` / ``||``, and matrix/vector products.
+  (``== != < > <= >=``), logical ``&&`` / ``||``, and matrix/vector products. A whole-vector
+  ``==`` / ``!=`` yields a single ``bool`` (like GLSL): the component-wise compare is reduced with
+  ``OpAll`` / ``OpAny``.
 * **Math:** ``dot`` (``OpDot``) plus the GLSL.std.450 set — ``sin`` / ``cos`` / ``tan`` / ``pow`` /
   ``exp`` / ``log`` / ``sqrt`` / ``rsqrt`` / ``floor`` / ``ceil`` / ``fract`` / ``abs`` / ``min`` /
   ``max`` / ``lerp`` / ``length`` / ``distance`` / ``normalize`` / ``cross`` / ``reflect`` /

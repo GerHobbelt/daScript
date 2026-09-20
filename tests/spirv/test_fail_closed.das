@@ -48,17 +48,34 @@ def test_fail_closed_rejections(t : T?) {
         check_rejects(t, "_fc_global", "unsupported global 'g_scale'")
         check_rejects(t, "_fc_image_format", "unsupported @format")
         check_rejects(t, "_fc_local_struct_nested", "struct/array members of a local struct value are not yet supported")
-        check_rejects(t, "_fc_localtype", "type tDouble is not supported")
+        // the same nested shape on the MEMORY path: a `var` struct local's undecorated OpTypeStruct
+        // has no recursive plain-struct builder, so the field is refused rather than guessed at
+        check_rejects(t, "_fc_local_struct_var_nested", "nested-struct fields are not yet supported")
+        check_rejects(t, "_fc_localtype", "type tInt64 is not supported")
         check_rejects(t, "_fc_stmt", "memzero is not supported in SPIR-V shaders")
         check_rejects(t, "_fc_deadcode", "unreachable code after a block terminator")
-        check_rejects(t, "_fc_wswz", "cannot assign through a swizzle")
+        // a write-swizzle chains a component pointer off its base, so the base needs an OpVariable; a
+        // swizzle of a swizzle has only a loaded value, and there is nothing to store through
+        check_rejects(t, "_fc_wswz", "write-swizzle target must be addressable")
         check_rejects(t, "_fc_wgtype", "@workgroup type must be a scalar, vector, matrix, or fixed array")
         check_rejects(t, "_fc_atomicmem", "atomic target must live in @workgroup or @ssbo memory")
+        // atomicAdd is the only float-capable atomic; the rest of the family declares no float
+        // overload, so a float atomicMax is rejected at the call rather than lowered to OpAtomicSMax
+        check_rejects(t, "_fc_atomicfloat", "no matching functions or generics: atomicMax")
+        // a buffer image has no mips and SPIR-V forbids a Lod operand on Dim=Buffer, so textureBuffer
+        // declares only the two-argument texelFetch: the sampler-shaped 3-arg call is rejected at the call
+        check_rejects(t, "_fc_texel_buffer_lod", "no matching functions or generics: texelFetch")
+        // @ssbo array<array<T>> is a descriptor array of buffers; a third array level has no
+        // descriptor meaning and no byte layout, so it is rejected rather than given a made-up stride
+        check_rejects(t, "_fc_ssbo_array_nested", "element type tArray is not supported")
+        // a matrix column read is an OpCompositeExtract, whose index is a literal, and a matrix value
+        // has no OpVariable to chain a dynamic index through -- so m[i] needs a compile-time i
+        check_rejects(t, "_fc_matrix_dyn_col", "indexing a matrix with a non-constant column index")
         // user-defined function call rejections (Phase: shader functions)
         check_rejects(t, "_fc_recursion", "recursion is not supported")
         check_rejects(t, "_fc_mutual", "recursion is not supported")
-        check_rejects(t, "_fc_badparam", "is not supported (only 32-bit scalar/vector/matrix parameters")
-        check_rejects(t, "_fc_badret", "return type tDouble is not supported")
+        check_rejects(t, "_fc_badparam", "parameter 'x' of type tInt64 is not supported")
+        check_rejects(t, "_fc_badret", "return type tInt64 is not supported")
         // subpass input attachments + subpassLoad are fragment-only
         check_rejects(t, "_fc_subpass_stage", "subpassInput 'fc_subpass' is fragment-only")
         // mesh-shader output config: bad topology string (parsed in patch) + non-positive count (emit gate)
@@ -70,22 +87,25 @@ def test_fail_closed_rejections(t : T?) {
         check_rejects(t, "_fc_mesh_indices_topology", "requires output_topology")
         // gl_PrimitiveID is a fragment Input builtin (+ closest-hit); reading it in a vertex shader is rejected
         check_rejects(t, "_fc_primid_stage", "is not available in the vertex stage")
-        // a mesh @out array<T> with an unsupported element type (double) fails closed, not crash emit_type
+        // a mesh @out array<T> with an unsupported element type (int64) fails closed, not crash emit_type
         check_rejects(t, "_fc_mesh_out_badtype", "not a supported varying type")
         // @task_payload outside a task/mesh stage, and a payload with a nested-struct field
         check_rejects(t, "_fc_payload_stage", "is only valid in a task or mesh shader")
-        check_rejects(t, "_fc_payload_nested", "nested-struct payload fields are not yet supported")
+        check_rejects(t, "_fc_payload_nested", "nested-struct fields are not yet supported")
         // ray tracing: builtins / the traceRayEXT intrinsic / the TLAS descriptor / the RT storage
         // classes are all RT-pipeline-stage-gated, and the trace payload must be a payload GLOBAL
         check_rejects(t, "_fc_rt_builtin_stage", "is not available in the compute stage")
         check_rejects(t, "_fc_rt_trace_stage", "traceRayEXT is only valid in a raygen / miss / closest-hit shader")
         check_rejects(t, "_fc_rt_accel_stage", "accelerationStructureEXT 'fc_rta_tlas' is only valid in a raygen / miss / closest-hit shader")
+        check_rejects(t, "_fc_ray_query_committed", "the committed argument must be a bool literal")
         check_rejects(t, "_fc_rt_payload_stage", "@ray_payload 'fc_rtp_payload' is only valid in a raygen / miss / closest-hit shader")
         check_rejects(t, "_fc_rt_incoming_stage", "@incoming_ray_payload 'fc_rti_prd' is only valid in a miss or closest-hit shader")
         check_rejects(t, "_fc_rt_hitattr_stage", "@hit_attribute 'fc_rth_bary' is only valid in a closest-hit shader")
         check_rejects(t, "_fc_rt_trace_payload", "the payload argument must be a @ray_payload / @incoming_ray_payload global")
-        // subgroup ops are compute-only (v1)
-        check_rejects(t, "_fc_subgroup_stage", "subgroupAdd is only valid in a compute shader")
+        // subgroup: a clustered reduction's ClusterSize must be a constant power of two, and the
+        // workgroup-scoped builtins are illegal outside a workgroup-dispatched stage
+        check_rejects(t, "_fc_subgroup_cluster", "cluster_size must be a compile-time constant power of two")
+        check_rejects(t, "_fc_subgroup_id_stage", "is not available in the fragment stage")
         // spec constants: 32-bit scalar only, literal default required, unique SpecIds (incl. the
         // local_size_*_id axes), and read-only in the shader body
         check_rejects(t, "_fc_spec_type", "must be a 32-bit scalar")
@@ -93,5 +113,10 @@ def test_fail_closed_rejections(t : T?) {
         check_rejects(t, "_fc_spec_dupid", "duplicate @constant_id 8")
         check_rejects(t, "_fc_spec_write", "are read-only in a shader")
         check_rejects(t, "_fc_spec_axis_dup", "duplicates another SpecId")
+        // gl_WorkGroupSize is the declared LocalSize: only the workgroup-dispatched stages have one
+        check_rejects(t, "_fc_wgsize_stage", "builtin 'gl_WorkGroupSize' is not available in the fragment stage")
+        // a storage image's access qualifier is binding: no read of a @writeonly, no write to a @readonly
+        check_rejects(t, "_fc_image_writeonly_load", "is @writeonly (NonReadable)")
+        check_rejects(t, "_fc_image_readonly_store", "is @readonly (NonWritable)")
     }
 }

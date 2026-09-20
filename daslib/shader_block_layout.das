@@ -80,14 +80,49 @@ def public component_count(bt : Type) : int {
     return 0
 }
 
+// Type -> (class, component bit WIDTH, lanes), extending the 32-bit classifiers above to the 64-bit
+// scalars they exclude (int64/uint64/double, which lay out as block members but carry no arithmetic).
+// Width travels with the class so a 32-bit-only consumer can test width, not just class.
+def public numeric_info(bt : Type) : tuple<ok : bool; cls : int; width : int; lanes : int> {
+    if (bt == Type.tInt64) return (ok = true, cls = 0, width = 64, lanes = 1)
+    if (bt == Type.tUInt64) return (ok = true, cls = 1, width = 64, lanes = 1)
+    if (bt == Type.tDouble) return (ok = true, cls = 2, width = 64, lanes = 1)
+    let c = scalar_class(bt)
+    if (c < 0) return (ok = false, cls = -1, width = 0, lanes = 0)
+    return (ok = true, cls = c, width = scalar_width(bt), lanes = component_count(bt))
+}
+
 // ===== interface-block layout rules =====
 enum public BlockLayoutRules {
     std140
     std430
 }
 
+// The widths the ARITHMETIC rail lowers: the 16/32-bit families (a native OpIAdd on OpTypeInt 16,
+// as glslang gives i16vec2) plus the 64-bit FLOAT (OpFAdd on OpTypeFloat 64, GLSL's double). A
+// 64-bit INT is excluded -- it lays out as a block member only, so it fails closed before an opcode.
+def public arith_width_ok(cls, width : int) : bool {
+    return width <= 32 || (width == 64 && cls == 2)
+}
+
+// Class and lane count for the arithmetic rail, gated on arith_width_ok rather than a 32-bit width
+// (it carries no byte layout). The 32-bit-only scalar_class / component_count stay as they are, so
+// no 16-bit component or double can slip into the std140 layout whose sizes are hardcoded 4-byte.
+def public arith_class(bt : Type) : int {
+    let ni = numeric_info(bt)
+    return ni.ok && arith_width_ok(ni.cls, ni.width) ? ni.cls : -1
+}
+
+def public arith_lanes(bt : Type) : int {
+    if (bt == Type.tBool) return 1
+    let ni = numeric_info(bt)
+    return ni.ok && arith_width_ok(ni.cls, ni.width) ? ni.lanes : 0
+}
+
 // ===== std140 layout for a UBO interface block =====
+// A 64-bit scalar (int64/uint64, GL_ARB_gpu_shader_int64) lays out like a double: align and size 8.
 def public std140_align(bt : Type) : int {
+    if (bt == Type.tInt64 || bt == Type.tUInt64) return 8
     let cc = component_count(bt)
     if (cc == 1) return 4
     if (cc == 2) return 8
@@ -95,16 +130,19 @@ def public std140_align(bt : Type) : int {
 }
 
 def public std140_size(bt : Type) : int {
+    if (bt == Type.tInt64 || bt == Type.tUInt64) return 8
     return component_count(bt) * 4
 }
 
 // Width-aware base size / alignment — the std430 generalization of std140_size/std140_align (identical values for 32-bit types). Size = lanes x bytes-per-lane; alignment = scalar -> 1 lane, vec2 -> 2 lanes, vec3/vec4 -> 4 lanes, scaled by the lane width (half3 -> size 6, align 8;
 def public block_scalar_size(bt : Type) : int {
+    if (bt == Type.tInt64 || bt == Type.tUInt64) return 8
     return component_count(bt) * (scalar_width(bt) / 8)
 }
 
 def public block_scalar_align(bt : Type; rules : BlockLayoutRules) : int {
     if (rules == BlockLayoutRules.std140) return std140_align(bt)
+    if (bt == Type.tInt64 || bt == Type.tUInt64) return 8
     let cc = component_count(bt)
     let lanes = cc == 1 ? 1 : (cc == 2 ? 2 : 4)
     return lanes * (scalar_width(bt) / 8)
@@ -230,10 +268,11 @@ def public compute_block_layout(sname : string; st : Structure?; var fields : ar
             fields |> clear
             return (ok = false, size = 0, align = 0)
         }
-        // terminal scalar / vector field
+        // terminal scalar / vector field (32-bit numerics, or a 64-bit int64/uint64 scalar)
         let fbt = fld._type.baseType
-        if (scalar_class(fbt) < 0 || (rules == BlockLayoutRules.std140 && scalar_width(fbt) != 32)) {
-            errors |> push("interface block '{sname}' field '{fld.name}': type {fbt} is not supported (only 32-bit int/uint/float scalars, their vectors, matrices, fixed-arrays of those, and nested structs of those; bool has no physical interface-block layout in Vulkan)")
+        let is_int64 = fbt == Type.tInt64 || fbt == Type.tUInt64
+        if (!is_int64 && (scalar_class(fbt) < 0 || (rules == BlockLayoutRules.std140 && scalar_width(fbt) != 32))) {
+            errors |> push("interface block '{sname}' field '{fld.name}': type {fbt} is not supported (only 32-bit int/uint/float scalars, their vectors, matrices, fixed-arrays of those, 64-bit int64/uint64 scalars, and nested structs of those; bool has no physical interface-block layout in Vulkan)")
             fields |> clear
             return (ok = false, size = 0, align = 0)
         }
