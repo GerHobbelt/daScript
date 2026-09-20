@@ -78,6 +78,7 @@ introduced in earlier tutorials.
    tutorials/48_apply.rst
    tutorials/49_async.rst
    tutorials/50_soa.rst
+   tutorials/51_delegate.rst
 
 .. _tutorials_building_from_sdk:
 
@@ -264,3 +265,28 @@ Run any tutorial from the project root::
    tutorials/dasStbImage_03_transforms.rst
    tutorials/dasStbImage_04_pixel_access_and_conversion.rst
    tutorials/dasStbImage_05_drawing_and_blending.rst
+
+.. _tutorials_dasaudio:
+
+dasAudio (Audio) Tutorials
+==========================
+
+These tutorials cover the ``audio_boost`` module — audio playback,
+3D spatial audio, effects, WAV I/O, and MIDI.  The companion
+``.das`` files are in ``tutorials/dasAudio/``.
+
+Run any tutorial from the project root::
+
+   daslang.exe tutorials/dasAudio/01_hello_sound.das
+
+.. toctree::
+   :maxdepth: 1
+
+   tutorials/dasAudio_01_hello_sound.rst
+   tutorials/dasAudio_02_playing_files.rst
+   tutorials/dasAudio_03_sound_control.rst
+   tutorials/dasAudio_04_spatial_audio.rst
+   tutorials/dasAudio_05_reverb.rst
+   tutorials/dasAudio_06_streaming.rst
+   tutorials/dasAudio_07_wav_io.rst
+   tutorials/dasAudio_08_midi.rst

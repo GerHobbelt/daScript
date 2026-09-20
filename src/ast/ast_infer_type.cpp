@@ -40,7 +40,7 @@ namespace das {
 
     InferTypes::InferTypes(const ProgramPtr &prog, TextWriter *logs_) : FoldingVisitor(prog), logs(logs_) {
         debugInferFlag = prog->options.getBoolOption("debug_infer_flag", prog->policies.debug_infer_flag);
-        enableInferTimeFolding = prog->options.getBoolOption("infer_time_folding", true);
+        enableInferTimeFolding = prog->options.getBoolOption("infer_time_folding", !prog->policies.no_infer_time_folding);
         disableAot = prog->options.getBoolOption("no_aot", false);
         multiContext = prog->options.getBoolOption("multiple_contexts", prog->policies.multiple_contexts);
         standaloneContext = prog->options.getBoolOption("standalone_context", prog->policies.standalone_context);
@@ -4224,6 +4224,17 @@ namespace das {
         Visitor::preVisit(expr);
         if (expr->cond)
             markNoDiscard(expr->cond.get());
+        // static_if needs infer-time folding for its condition (e.g. typeinfo && typeinfo),
+        // even when no_infer_time_folding is set
+        if (expr->isStatic && !enableInferTimeFolding) {
+            enableInferTimeFolding = true;
+        }
+    }
+    void InferTypes::preVisitIfBlock(ExprIfThenElse *expr, Expression *) {
+        // restore folding state after visiting the static_if condition
+        if (expr->isStatic && program->policies.no_infer_time_folding) {
+            enableInferTimeFolding = false;
+        }
     }
     ExpressionPtr InferTypes::visit(ExprIfThenElse *expr) {
         if (!expr->cond->type) {
@@ -5353,6 +5364,15 @@ namespace das {
                     mks->useInitializer = true;
                     mks->alwaysUseInitializer = true;
                     return mks;
+                } else if (aliasT->isStructure() && aliasT->structType) {
+                    // this is Blah(args...) where Blah is a typedef for a struct — promote to StructName(args...)
+                    auto structName = aliasT->structType->name;
+                    if (structName != expr->name) {
+                        reportAstChanged();
+                        auto newCall = expr->clone();
+                        static_cast<ExprCall *>(newCall.get())->name = structName;
+                        return newCall;
+                    }
                 }
             }
         }

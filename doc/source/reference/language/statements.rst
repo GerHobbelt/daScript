@@ -157,9 +157,9 @@ from the compiled output, and do not need to be valid for the given types:
 .. code-block:: das
 
     def describe(a) {
-        static_if ( typeinfo(is_pointer type<a>) ) {
+        static_if ( typeinfo is_pointer(type<a>) ) {
             print("pointer\n")
-        } static_elif ( typeinfo(is_ref_type type<a>) ) {
+        } static_elif ( typeinfo is_ref_type(type<a>) ) {
             print("reference type\n")
         } else {
             print("value type\n")
@@ -362,7 +362,7 @@ Output a value from a generator and suspend its execution until the next iterati
 
 .. code-block:: das
 
-    var gen <- generator<int>() <| $ {
+    var gen <- generator<int>{
         yield 0
         yield 1
         return false    // end of generation

@@ -15,7 +15,7 @@ jobs:
   pre_job:
     ###########################################################
     # continue-on-error: true # Uncomment once integration is finished
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-fat
     # Map a step output to a job output
     outputs:
       should_skip: ${{ steps.skip_check.outputs.should_skip }}
@@ -47,31 +47,31 @@ jobs:
           - target: linux
             release_target: linux
             release_arch: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-latest-fat
             archive_ext: tar.gz
 
           - target: linux_arm
             release_target: linux
             release_arch: arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-24.04-arm-fat
             archive_ext: tar.gz
 
           - target: darwin26
             release_target: darwin26
             release_arch: arm64
-            runner: macos-26 # arm64
+            runner: macos-26-xlarge # Apple Silicon arm64
             architecture_string: arm64
             archive_ext: tar.gz
 
           - target: darwin15
             release_target: darwin15
             release_arch: x86_64
-            runner: macos-15-intel # x64
+            runner: macos-15-large # Intel x86_64
             architecture_string: x86_64
             archive_ext: tar.gz
 
           - target: windows
-            runner: windows-latest
+            runner: windows-latest-fat
             archive_ext: zip
 
           - target: windows
@@ -93,12 +93,6 @@ jobs:
           - target: linux_arm
             build_system: cmake
             cmake_generator: Ninja
-
-          - target: windows
-            release_target: windows
-            release_arch: x86
-            architecture: 32
-            architecture_string: Win32
 
           - target: windows
             release_target: windows
@@ -133,6 +127,9 @@ jobs:
 
           - target: windows
             architecture: arm64
+
+          - target: windows
+            architecture: 32
 
     steps:
       - name: "SCM Checkout"
@@ -201,8 +198,7 @@ jobs:
                 linux64)
                   cmake --no-warn-unused-cli -B./build -DCMAKE_BUILD_TYPE:STRING=${{ matrix.cmake_preset }} \
                     -G "${{ matrix.cmake_generator }}" $ACTIVE_MODULES
-                  cd build
-                  ninja daslang daslang_static
+                  cmake --build ./build --config ${{ matrix.cmake_preset }} --parallel
                   ;;
                 *)
                   export CXXFLAGS="-Wno-elaborated-enum-base" # glfw module fails due to mac-os includes
@@ -211,8 +207,7 @@ jobs:
                     -DCMAKE_BUILD_TYPE:STRING=${{ matrix.cmake_preset }} -DCMAKE_CXX_FLAGS="$CXXFLAGS" \
                     -G "${{ matrix.cmake_generator }}" $ACTIVE_MODULES
 
-                  cd build
-                  ninja daslang daslang_static
+                  cmake --build ./build --config ${{ matrix.cmake_preset }} --parallel
                   ;;
               esac
               ;;
@@ -229,7 +224,7 @@ jobs:
             cmake)
               cmake --no-warn-unused-cli -B./build -G "${{ matrix.cmake_generator }}" -T host=${{ matrix.architecture == 32 && 'x86' || 'x64' }} -A ${{ matrix.architecture_string }} \
                 $ACTIVE_MODULES -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
-              cmake --build ./build --config ${{ matrix.cmake_preset }} --target daslang --target daslang_static --parallel
+              cmake --build ./build --config ${{ matrix.cmake_preset }} --parallel
               ;;
           esac
 
@@ -255,13 +250,8 @@ jobs:
           mkdir artifacts
           cmake --install ./build --prefix ./daslang_bundle --config ${{ matrix.cmake_preset }} --strip
           7z a artifacts/daslang-bundle-${{ matrix.release_target }}-${{ matrix.release_arch }}.zip ./daslang_bundle
-      - name: "Create release"
+      - name: "Upload release asset"
         if: github.event_name == 'release' && (github.event.action == 'published' || github.event.action == 'prereleased') && matrix.cmake_preset == 'Release'
-        uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: artifacts/daslang-bundle-${{ matrix.release_target }}-${{ matrix.release_arch }}.zip
-          asset_name: daslang-bundle-${{ matrix.release_target }}-${{ matrix.release_arch }}.zip
-          asset_content_type: application/zip
+        run: gh release upload "${{ github.event.release.tag_name }}" artifacts/daslang-bundle-${{ matrix.release_target }}-${{ matrix.release_arch }}.zip --clobber

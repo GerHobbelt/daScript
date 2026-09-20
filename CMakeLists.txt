@@ -14,7 +14,7 @@ option(DAS_CLANG_BIND_DISABLED "Disable dasClangBind (libclang bindings, C/C++ p
 option(DAS_LLVM_DISABLED "Disable dasLLVM (llvm bindings)" ON)
 option(DAS_HV_DISABLED "Disable dasHV (websokets,http server and client)" ON)
 option(DAS_GLFW_DISABLED "Disable dasGLFW (GLFW window for graphics apps)" OFF)
-option(DAS_AUDIO_DISABLED "Disable dasAudio (Miniaudio sound library)" ON)
+option(DAS_AUDIO_DISABLED "Disable dasAudio (Miniaudio sound library)" OFF)
 option(DAS_STDDLG_DISABLED "Disable dasStdDlg (File new,open,save etc dialogs)" OFF)
 option(DAS_STBIMAGE_DISABLED "Disable dasStbImage (StbImage bindings, image loading and saving)" OFF)
 
@@ -389,9 +389,15 @@ ENDMACRO()
 # Modules call this from their CMakeLists.txt for examples that
 # can run without GUI, audio, or user interaction.
 MACRO(ADD_EXAMPLE_RUN das_file)
-    MESSAGE("EXAMPLE_RUN ${das_file}")
-    LIST(APPEND DAS_EXAMPLES_TO_RUN ${das_file})
+    SET(_exe TRUE)
+    IF("${ARGN}" STREQUAL "FALSE")
+        SET(_exe FALSE)
+    ENDIF()
+    MESSAGE("EXAMPLE_RUN ${das_file} (exe=${_exe})")
+    LIST(APPEND DAS_EXAMPLES_TO_RUN "${das_file}|${_exe}")
 ENDMACRO()
+
+ADD_EXAMPLE_RUN("${PROJECT_SOURCE_DIR}/examples/dasbind/dasbind_example.das")
 
 FUNCTION(ADD_MODULE_CPP cpp)
     FILE(APPEND ${DAS_MODULES_NEED_INC}.temp "NEED_MODULE(Module_${cpp});\n")
@@ -437,11 +443,28 @@ ENDFOREACH()
 # Each example is executed with `daslang <file>` and must exit cleanly.
 IF(DAS_EXAMPLES_TO_RUN)
     SET(_run_example_commands)
-    FOREACH(_das ${DAS_EXAMPLES_TO_RUN})
+    FOREACH(_entry ${DAS_EXAMPLES_TO_RUN})
+        STRING(REPLACE "|" ";" _pair "${_entry}")
+        LIST(GET _pair 0 _das)
+        LIST(GET _pair 1 _do_exe)
+        STRING(MD5 _path_hash ${_das})
+        SET(_exe_dir $<TARGET_FILE_DIR:daslang>)
+        GET_FILENAME_COMPONENT(_example_name ${_das} NAME)
+        # Examples binaries are forced to be stored here to find
+        # `libDaScript.dll` on Windows.
+        SET(_out_path "${_exe_dir}/${_path_hash}_${_example_name}")
+
         LIST(APPEND _run_example_commands
             COMMAND ${CMAKE_COMMAND} -E echo "Running ${_das}"
             COMMAND $<TARGET_FILE:daslang> ${_das}
         )
+        IF(_do_exe)
+            LIST(APPEND _run_example_commands
+                COMMAND ${CMAKE_COMMAND} -E echo "Compiling to ${_out_path}"
+                COMMAND $<TARGET_FILE:daslang> -exe ${_das} -output ${_out_path}
+                COMMAND ${_out_path}.exe
+            )
+        ENDIF()
     ENDFOREACH()
     ADD_CUSTOM_TARGET(run_examples
         ${_run_example_commands}
@@ -1362,6 +1385,9 @@ install(FILES ${PROJECT_SOURCE_DIR}/utils/benchctl/README.md DESTINATION utils/b
 # Install perf_lint (performance linter)
 install(FILES ${PROJECT_SOURCE_DIR}/utils/perf_lint/main.das DESTINATION utils/perf_lint)
 
+# Install style_lint (style linter)
+install(FILES ${PROJECT_SOURCE_DIR}/utils/style_lint/main.das DESTINATION utils/style_lint)
+
 # Install daspkg (package manager)
 file(GLOB DAS_DASPKG_FILES ${PROJECT_SOURCE_DIR}/utils/daspkg/*.das)
 install(FILES ${DAS_DASPKG_FILES} DESTINATION utils/daspkg)
@@ -1413,12 +1439,7 @@ install(FILES
     DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/crash
 )
 
-# Install minfft example
-install(FILES
-    ${PROJECT_SOURCE_DIR}/examples/minfft/main.das
-    ${PROJECT_SOURCE_DIR}/examples/minfft/.das_package
-    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/minfft
-)
+# Install minfft example (install rule is in modules/dasMinfft/CMakeLists.txt)
 
 file(GLOB DAS_DEBUGAPI_EXAMPLES
     ${PROJECT_SOURCE_DIR}/examples/debugapi/*.das
@@ -1538,6 +1559,14 @@ file(GLOB STBIMAGE_TUTORIAL_SOURCES
 )
 install(FILES ${STBIMAGE_TUTORIAL_SOURCES}
     DESTINATION ${DAS_INSTALL_TUTORIALSDIR}/dasStbImage
+)
+
+# Install dasAudio tutorial .das files
+file(GLOB AUDIO_TUTORIAL_SOURCES
+    ${PROJECT_SOURCE_DIR}/tutorials/dasAudio/*.das
+)
+install(FILES ${AUDIO_TUTORIAL_SOURCES}
+    DESTINATION ${DAS_INSTALL_TUTORIALSDIR}/dasAudio
 )
 
 # ── Documentation build (optional) ──────────────────────────────────────────

@@ -1549,7 +1549,8 @@ namespace das
         /*option*/ bool no_writing_to_nameless = true;             // if true, then writing to nameless variables (intermediate on the stack) is not allowed
         /*option*/ bool always_call_super = false;                  // if true, then super() needs to be called from every class constructor
     // environment
-        /*options*/ bool no_optimizations = false;                  // disable optimizations, regardless of settings
+        /*option*/ bool no_optimizations = false;                  // disable optimizations, regardless of settings
+        /*option*/ bool no_infer_time_folding = false;             // disable infer-time constant folding
         bool fail_on_no_aot = true;                     // AOT link failure is error
         bool fail_on_lack_of_aot_export = false;        // remove_unused_symbols = false is missing in the module, which is passed to AOT
         /*option*/ bool log_compile_time = false;                  // if true, then compile time will be printed at the end of the compilation
@@ -1662,11 +1663,11 @@ namespace das
         void inferLint(TextWriter & logs);
         void checkSideEffects();
         void foldUnsafe();
-        bool optimizationRefFolding(int round);
-        bool optimizationConstFolding(int round);
-        bool optimizationBlockFolding(int round);
-        bool optimizationCondFolding(int round);
-        bool optimizationUnused(TextWriter & logs, int round);
+        bool optimizationRefFolding(int32_t round);
+        bool optimizationConstFolding(int32_t round);
+        bool optimizationBlockFolding(int32_t round);
+        bool optimizationCondFolding(int32_t round);
+        bool optimizationUnused(TextWriter & logs, int32_t round);
         void fusion ( Context & context, TextWriter & logs );
         void buildAccessFlags(TextWriter & logs);
         bool verifyAndFoldContracts();

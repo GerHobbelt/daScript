@@ -62,7 +62,7 @@ class TemplateMacro : AstFunctionAnnotation {
     //!
     //!     [template (a), sideeffects]
     //!     def boo ( x : int; a : auto(TT) )   // when boo(1,type<int>)
-    //!         return "{x}_{typeinfo(typename type<TT>)}"
+    //!         return "{x}_{typeinfo typename(type<TT>)}"
     //!     ...
     //!     boo(1,type<int>) // will be replaced with boo(1). instace will print "1_int"
     //!
@@ -114,7 +114,7 @@ class TemplateMacro : AstFunctionAnnotation {
         }
         fclone.annotations |> erase(taidx)
         // name it — build extra from collected hashes
-        var extra = build_string() <| $(var w) {
+        var extra = build_string() $(var w) {
             for (h in hashes) {
                 w |> write("`{h}")
             }

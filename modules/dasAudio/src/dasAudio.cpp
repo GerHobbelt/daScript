@@ -42,6 +42,10 @@
 
 #include "dasAudio.h"
 
+#ifndef HRTF_SAMPLE_RATE
+#define HRTF_SAMPLE_RATE 48000
+#endif
+
 MAKE_EXTERNAL_TYPE_FACTORY(Context,Context);
 
 das::Context* get_clone_context( das::Context * ctx, uint32_t category );//link time resolved dependencies
@@ -311,6 +315,10 @@ MA_API ma_uint64 dasAudio_ma_resampler_get_expected_output_frame_count(const ma_
     return outputFrameCount;
 }
 
+MA_API ma_result dasAudio_ma_decoder_init_memory(const void* pData, ma_uint64 dataSize, const ma_decoder_config* pConfig, ma_decoder* pDecoder) {
+    return ma_decoder_init_memory(pData, (size_t)dataSize, pConfig, pDecoder);
+}
+
 MA_API ma_uint64 dasAudio_ma_decoder_get_length_in_pcm_frames(ma_decoder* pDecoder) {
     ma_uint64 frameCount = 0;
     ma_decoder_get_length_in_pcm_frames(pDecoder, &frameCount);
@@ -459,6 +467,7 @@ struct MASF2VoiceAnnotation : ManagedStructureAnnotation<ma_sf2_voice> {
         addField<DAS_BIND_MANAGED_FIELD(vol_env)>("vol_env","vol_env");
         addField<DAS_BIND_MANAGED_FIELD(mod_env)>("mod_env","mod_env");
         addField<DAS_BIND_MANAGED_FIELD(filter)>("filter","filter");
+        addField<DAS_BIND_MANAGED_FIELD(filter_r)>("filter_r","filter_r");
         addField<DAS_BIND_MANAGED_FIELD(initial_filter_fc)>("initial_filter_fc","initial_filter_fc");
         addField<DAS_BIND_MANAGED_FIELD(initial_filter_q)>("initial_filter_q","initial_filter_q");
         addField<DAS_BIND_MANAGED_FIELD(mod_env_to_pitch)>("mod_env_to_pitch","mod_env_to_pitch");
@@ -548,15 +557,12 @@ struct MAHrtfAnnotation : ManagedStructureAnnotation<ma_hrtf> {
     MAHrtfAnnotation ( ModuleLibrary & mlib )
         : ManagedStructureAnnotation("ma_hrtf", mlib, "ma_hrtf") {
         addField<DAS_BIND_MANAGED_FIELD(taps)>("taps","taps");
-        addField<DAS_BIND_MANAGED_FIELD(left)>("left","left");
-        addField<DAS_BIND_MANAGED_FIELD(right)>("right","right");
         addField<DAS_BIND_MANAGED_FIELD(azimuth)>("azimuth","azimuth");
         addField<DAS_BIND_MANAGED_FIELD(elevation)>("elevation","elevation");
         addField<DAS_BIND_MANAGED_FIELD(sampleRate)>("sampleRate","sampleRate");
-        addField<DAS_BIND_MANAGED_FIELD(mixbuffer)>("mixbuffer","mixbuffer");
-        addField<DAS_BIND_MANAGED_FIELD(mixsize)>("mixsize","mixsize");
         addField<DAS_BIND_MANAGED_FIELD(leftfip)>("leftfip","leftfip");
         addField<DAS_BIND_MANAGED_FIELD(rightfip)>("rightfip","rightfip");
+        addField<DAS_BIND_MANAGED_FIELD(fft_size)>("fft_size","fft_size");
     }
 };
 
@@ -611,6 +617,8 @@ public:
         ModuleLibrary lib(this);
         lib.addBuiltInModule();
         addBuiltinDependency(lib, Module::require("rtti_core"));
+        // audio constants
+        addConstant<int>(*this, "MA_SAMPLE_RATE", HRTF_SAMPLE_RATE);
         // reverb
         addEnumeration(make_smart<EnumerationI3DL2Preset>());
         addAnnotation(make_smart<I3DL2ReverbPropertiesAnnotation>(lib));
@@ -732,8 +740,8 @@ public:
             SideEffects::none, "ma_decoder_config_init")->args({"outputFormat", "outputChannels", "outputSampleRate"});
         addExtern<DAS_BIND_FUN(ma_decoder_config_init_default),SimNode_ExtFuncCallAndCopyOrMove>(*this, lib, "ma_decoder_config_init_default",
             SideEffects::none, "ma_decoder_config_init_default");
-        addExtern<DAS_BIND_FUN(ma_decoder_init_memory)>(*this, lib, "ma_decoder_init_memory",
-            SideEffects::modifyArgumentAndExternal, "ma_decoder_init_memory")->args({"pData", "dataSize", "config", "decoder"});
+        addExtern<DAS_BIND_FUN(dasAudio_ma_decoder_init_memory)>(*this, lib, "ma_decoder_init_memory",
+            SideEffects::modifyArgumentAndExternal, "dasAudio_ma_decoder_init_memory")->args({"pData", "dataSize", "config", "decoder"});
         addExtern<DAS_BIND_FUN(ma_decoder_init_file)>(*this, lib, "ma_decoder_init_file",
             SideEffects::modifyArgumentAndExternal, "ma_decoder_init_file")->args({"pFilePath", "config", "decoder"});
         addExtern<DAS_BIND_FUN(ma_decoder_uninit)>(*this, lib, "ma_decoder_uninit",
