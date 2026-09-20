@@ -1543,9 +1543,10 @@ expr_call_pipe_no_bracket
             pCall->pipedCallArgument = true;
             $$ = $call;
         } else if ( $call->rtti_isNamedCall() ) {
-            // piped block on a named call: the block becomes the trailing positional argument
+            // piped block on a named call: pad-aware resolution lands it on the block param
             auto nc = (ExprNamedCall *) $call;
             nc->nonNamedArguments.push_back($block);
+            nc->pipedCallArgument = true;
             $$ = $call;
         } else {
             das2_yyerror(scanner,"piped block requires a function call",tokAt(scanner,@block),
@@ -1560,9 +1561,10 @@ expr_call_pipe_no_bracket
             pCall->pipedCallArgument = true;
             $$ = $call;
         } else if ( $call->rtti_isNamedCall() ) {
-            // piped block on a named call: the block becomes the trailing positional argument
+            // piped block on a named call: pad-aware resolution lands it on the block param
             auto nc = (ExprNamedCall *) $call;
             nc->nonNamedArguments.push_back($block);
+            nc->pipedCallArgument = true;
             $$ = $call;
         } else {
             das2_yyerror(scanner,"piped block requires a function call",tokAt(scanner,@block),
@@ -1577,9 +1579,10 @@ expr_call_pipe_no_bracket
             pCall->pipedCallArgument = true;
             $$ = $call;
         } else if ( $call->rtti_isNamedCall() ) {
-            // piped block on a named call: the block becomes the trailing positional argument
+            // piped block on a named call: pad-aware resolution lands it on the block param
             auto nc = (ExprNamedCall *) $call;
             nc->nonNamedArguments.push_back($block);
+            nc->pipedCallArgument = true;
             $$ = $call;
         } else {
             das2_yyerror(scanner,"piped block requires a function call",tokAt(scanner,@block),
@@ -1588,9 +1591,10 @@ expr_call_pipe_no_bracket
         }
     }
     | expr_named_call[call] expr_full_block_assumed_piped[block] {
-        // free-function named call + piped block: the block becomes the trailing positional argument
+        // free-function named call + piped block: pad-aware resolution lands it on the block param
         auto nc = (ExprNamedCall *) $call;
         nc->nonNamedArguments.push_back($block);
+        nc->pipedCallArgument = true;
         $$ = $call;
     }
     ;
@@ -2050,6 +2054,34 @@ expr_method_call_no_bracket
         delete $method_name;
         $$ = pInvoke;
     }
+    |   expr_no_bracket[left] RARROW[loc] NAME[method_name] '(' '[' make_struct_fields[list] ']' ')' {
+        auto nc = new ExprNamedCall(tokAt(scanner,@method_name),*$method_name);
+        nc->methodCall = true;
+        nc->arguments = $list;
+        nc->nonNamedArguments.push_back($left);
+        delete $method_name;
+        $$ = nc;
+    }
+    |   expr_no_bracket[left] RARROW[loc] NAME[method_name] '(' expr_list[arguments] ',' make_struct_fields[list] ')' {
+        // bracket-less mixed named method call: a->m(pos..., name = value)
+        auto nc = new ExprNamedCall(tokAt(scanner,@method_name),*$method_name);
+        nc->methodCall = true;
+        nc->arguments = $list;
+        nc->nonNamedArguments.push_back($left);
+        auto callArgs = sequenceToList($arguments);
+        nc->nonNamedArguments.insert ( nc->nonNamedArguments.end(), callArgs.begin(), callArgs.end() );
+        delete $method_name;
+        $$ = nc;
+    }
+    |   expr_no_bracket[left] RARROW[loc] NAME[method_name] '(' make_struct_fields[list] ')' {
+        // bracket-less all-named method call, no positional: a->m(name = value)
+        auto nc = new ExprNamedCall(tokAt(scanner,@method_name),*$method_name);
+        nc->methodCall = true;
+        nc->arguments = $list;
+        nc->nonNamedArguments.push_back($left);
+        delete $method_name;
+        $$ = nc;
+    }
     ;
 
 func_addr_name
@@ -2123,6 +2155,15 @@ expr_field_no_bracket
         nc->nonNamedArguments.push_back($left);
         auto callArgs = sequenceToList($arguments);
         nc->nonNamedArguments.insert ( nc->nonNamedArguments.end(), callArgs.begin(), callArgs.end() );
+        delete $method_name;
+        $$ = nc;
+    }
+    |   expr_no_bracket[left] '.'[loc] NAME[method_name] '(' make_struct_fields[list] ')' {
+        // bracket-less all-named method call, no positional: a.m(name = value)
+        auto nc = new ExprNamedCall(tokAt(scanner,@method_name),*$method_name);
+        nc->methodCall = true;
+        nc->arguments = $list;
+        nc->nonNamedArguments.push_back($left);
         delete $method_name;
         $$ = nc;
     }
