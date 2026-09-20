@@ -915,14 +915,13 @@ def private emit_early_exit_lane(
                 return <- $i(lastBindName)
             }
         } else {
-            // Bind `d` once at the top (eager, matches linq.das line 2621).
+            // Bind `d` once at the top (eager, matches linq.das line 2621); copy/move probe matches linq.das can_copy/clone_to_move branch.
             let defaultName = qn("dval", at)
-            preludeStmts |> push <| qmacro_expr() {
-                let $i(defaultName) = $e(terminatorCall.arguments[1])
-            }
+            let dvCanCopy = (terminatorCall.arguments[1]._type != null && terminatorCall.arguments[1]._type.canCopy)
+            preludeStmts |> push(emit_default_bind(defaultName, terminatorCall.arguments[1], dvCanCopy))
             tailStmts <- qmacro_block_to_array() {
                 if (!$i(foundName)) {
-                    return $i(defaultName)
+                    $e(emit_default_return(defaultName, dvCanCopy))
                 }
                 return <- $i(lastBindName)
             }
@@ -961,20 +960,19 @@ def private emit_early_exit_lane(
             }
         } else {
             let defaultName = qn("dval", at)
-            preludeStmts |> push <| qmacro_expr() {
-                let $i(defaultName) = $e(terminatorCall.arguments[1])
-            }
+            let dvCanCopy = (terminatorCall.arguments[1]._type != null && terminatorCall.arguments[1]._type.canCopy)
+            preludeStmts |> push(emit_default_bind(defaultName, terminatorCall.arguments[1], dvCanCopy))
             // `single_or_default` early-returns default on the SECOND match (subsequent matches don't matter).
             perMatchStmts |> push_from <| qmacro_block_to_array() {
                 if ($i(foundName)) {
-                    return $i(defaultName)
+                    $e(emit_default_return(defaultName, dvCanCopy))
                 }
                 $i(foundName) = true
                 $i(bindName) := $i(valueName)
             }
             tailStmts <- qmacro_block_to_array() {
                 if (!$i(foundName)) {
-                    return $i(defaultName)
+                    $e(emit_default_return(defaultName, dvCanCopy))
                 }
                 return <- $i(bindName)
             }
@@ -1003,9 +1001,12 @@ def private emit_early_exit_lane(
                 }
             }
         } else {
-            preludeStmts |> push <| qmacro_expr() {
+            // `var t : TT; return <- t` (move-init) works for both copyable and non-copyable element types; matches linq.das line 2547.
+            let tName = qn("emptyT", at)
+            preludeStmts |> push_from <| qmacro_block_to_array() {
                 if ($i(idxName) < 0) {
-                    return default<$t(retType)>
+                    var $i(tName) : $t(retType)
+                    return <- $i(tName)
                 }
             }
         }
@@ -1019,13 +1020,17 @@ def private emit_early_exit_lane(
             $i(cntName) ++
         }
         if (opName == "element_at") {
+            let tName = qn("emptyT", at)
             tailStmts <- qmacro_block_to_array() {
                 panic("element index out of range")
-                return default<$t(retType)>
+                var $i(tName) : $t(retType)
+                return <- $i(tName)
             }
         } else {
-            tailStmts |> push <| qmacro_expr() {
-                return default<$t(retType)>
+            let tName = qn("emptyT", at)
+            tailStmts |> push_from <| qmacro_block_to_array() {
+                var $i(tName) : $t(retType)
+                return <- $i(tName)
             }
         }
     } elif (opName == "aggregate") {
@@ -1195,10 +1200,33 @@ def private try_make_inline_cmp(orderKey : Expression?; orderName : string;
     } else {
         cmpExpr = qmacro(_::less($e(b1), $e(b2)))
     }
-    // Emit untyped block args (`$(v1, v2) { ... }`). The typer infers v1/v2 types from
+    // Emit untyped block args (`$(v1, v2) { ... }`); typer infers v1/v2 types from the call site (top_n_by_with_cmp / order_inplace cmp-param signatures).
     return qmacro($(v1, v2) {
         return $e(cmpExpr)
     })
+}
+
+def private make_inline_less_call(orderKey : Expression?; orderName : string;
+                                  var lhsExpr, rhsExpr : Expression?; at : LineInfo) : Expression? {
+    // Direct-call mirror of try_make_inline_cmp: builds `less(KEY_BODY[lhsExpr], KEY_BODY[rhsExpr])` (or flipped for descending) for inline use without a block dispatch — needed for the bounded-heap less-test where invoking a block on a 100K-element hot path costs ~5ns/op extra.
+    if (orderKey == null || !(orderKey is ExprMakeBlock)) return null
+    var mblk = orderKey as ExprMakeBlock
+    var blk = mblk._block as ExprBlock
+    if (blk.arguments |> length != 1 || blk.list |> length != 1
+            || !(blk.list[0] is ExprReturn)) return null
+    var ret = blk.list[0] as ExprReturn
+    if (ret.subexpr == null || has_sideeffects(ret.subexpr)) return null
+    let argName = string(blk.arguments[0].name)
+    var b1 = clone_expression(ret.subexpr)
+    var b2 = clone_expression(ret.subexpr)
+    var r1 : Template
+    r1 |> replaceVariable(argName, lhsExpr)
+    var r2 : Template
+    r2 |> replaceVariable(argName, rhsExpr)
+    apply_template(r1, b1.at, b1)
+    apply_template(r2, b2.at, b2)
+    return qmacro(_::less($e(b2), $e(b1))) if (orderName == "order_by_descending")
+    return qmacro(_::less($e(b1), $e(b2)))
 }
 
 [macro_function]
@@ -1924,9 +1952,7 @@ def private plan_distinct(var expr : Expression?) : Expression? {
     }
     var keyExpr : Expression?
     if (isDistinctBy) {
-        keyExpr = qmacro_expr() {
-            invoke($e(distinctKeyBlock), $e(pushExpr))
-        }
+        keyExpr = peel_lambda_replace_var(distinctKeyBlock, pushExpr)
     } else {
         keyExpr = clone_expression(pushExpr)
     }
@@ -2782,9 +2808,10 @@ def private plan_group_by_core(var calls : array<tuple<ExprCall?; LinqCall?>>;
             }
         }
     }
-    // Per-element core: key derive + unique_key derive + table-update splice.
+    // Peel keyBlock so `_.field` becomes a direct field read on itName, eliminating per-element invoke + (on decs) freeing the pruner to drop unused tuple slots that the whole-tup lambda arg otherwise pins.
+    var keyExpr = peel_lambda_rename_var(keyBlock, itName)
     var coreBody = qmacro_block() {
-        let $i(kName) = invoke($e(keyBlock), $i(itName))
+        let $i(kName) = $e(keyExpr)
         let $i(ukName) = _::unique_key($i(kName))
         $e(tableUpdate)
     }
@@ -3074,14 +3101,16 @@ def private build_decs_inner_for(bridge : DecsBridgeShape?; var tupBind : Expres
     return clonedForExpr
 }
 
-// Walks a chain body to collect which fields of the decs_tup named-tuple bind are actually referenced. allFieldsUsed flips when the bind is referenced as a whole-var (not via field access) — e.g. push_clone(decs_tup) in a bare to_array, or pass-to-user-fn — so the helper falls back to unpruned emission and preserves the user-visible output shape.
+// Walks a chain body to collect which fields of the decs_tup named-tuple bind are actually referenced. allFieldsUsed flips when the bind is referenced as a whole-var (not via field access) — e.g. push_clone(decs_tup) in a bare to_array, or pass-to-user-fn — so the helper falls back to unpruned emission and preserves the user-visible output shape. Also picks up bare iter-var refs (when `iterToUser` is non-empty) so the trivial-let-elision path — which rewrites `decs_sel_N`-bound projections to the iter var directly, bypassing `decs_tup` entirely — still hits the pruned arm instead of falling through to unpruned-default.
 class private DecsTupUsageScanner : AstVisitor {
     tupName       : string
+    iterToUser    : table<string; string>
     usedFields    : table<string>
     allFieldsUsed : bool = false
     inTargetField : bool = false
-    def DecsTupUsageScanner(n : string) {
+    def DecsTupUsageScanner(n : string; var i2u : table<string; string>) {
         tupName = n
+        iterToUser <- i2u
     }
     def override preVisitExprField(expr : ExprField?) : void {
         var v = expr.value
@@ -3100,17 +3129,23 @@ class private DecsTupUsageScanner : AstVisitor {
     def override preVisitExprVar(expr : ExprVar?) : void {
         if (expr.name == tupName && !inTargetField) {
             allFieldsUsed = true
+            return
+        }
+        let nm = string(expr.name)
+        if (key_exists(iterToUser, nm)) {
+            usedFields |> insert(iterToUser[nm])
         }
     }
 }
 
 [macro_function]
-def private collect_decs_tup_usage(var e : Expression?; tupName : string) : tuple<bool; array<string>> {
-    // Returns (allFieldsUsed, usedFieldNames). usedFieldNames is unordered — caller filters bridge.userNames in original order to preserve get_ro emission order.
+def private collect_decs_tup_usage(var e : Expression?; tupName : string; bridge : DecsBridgeShape?) : tuple<bool; array<string>> {
+    // Returns (allFieldsUsed, usedFieldNames). usedFieldNames is unordered — caller filters bridge.userNames in original order to preserve get_ro emission order. The bridge feeds an iter-var → user-name reverse map so bare iter-var refs (from trivial-let elision) count as field usage too.
     var allUsed = false
     var used : array<string>
     if (e == null) return (allUsed, used)
-    var sc = new DecsTupUsageScanner(tupName)
+    var iterToUser <- {for (i in 0 .. length(bridge.iterNames)); bridge.iterNames[i] => bridge.userNames[i]}
+    var sc = new DecsTupUsageScanner(tupName, iterToUser)
     make_visitor(*sc) $(astVisitorAdapter) {
         visit_expression(e, astVisitorAdapter)
     }
@@ -3124,14 +3159,108 @@ def private collect_decs_tup_usage(var e : Expression?; tupName : string) : tupl
     return (allUsed, used)
 }
 
+// Rewrites every whole-var ref to `decs_tup` into a freshly synthesized `(userName1 = iterVar1, ...)` named-tuple literal — same shape build_decs_tup_bind produces, but inlined at each use site. Lets emitters that store the whole element (last/single/aggregate seed of element type, min_by/max_by, to_array push_clone) avoid forcing the unpruned bind path: after rewrite the body contains only `decs_tup.<field>` refs (flattenable) plus iter-var refs in the synthesized literals (picked up by the usage scanner). build_decs_inner_for_pruned then flattens + drops the bind entirely. Inside ExprField the inner ExprVar is left alone so the field path still matches.
+class private DecsTupWholeRewriter : AstVisitor {
+    tupName       : string
+    userNames     : array<string>
+    iterNames     : array<string>
+    inTargetField : bool = false
+    rewroteAny    : bool = false
+    def DecsTupWholeRewriter(t : string; var un, in_ : array<string>) {
+        tupName = t
+        userNames <- un
+        iterNames <- in_
+    }
+    def override preVisitExprField(expr : ExprField?) : void {
+        var v = expr.value
+        if (v is ExprRef2Value) {
+            v = (v as ExprRef2Value).subexpr
+        }
+        if (v is ExprVar && (v as ExprVar).name == tupName) {
+            inTargetField = true
+        }
+    }
+    def override visitExprField(var expr : ExprField?) : ExpressionPtr {
+        inTargetField = false
+        return expr
+    }
+    def override visitExprVar(var expr : ExprVar?) : ExpressionPtr {
+        if (expr.name != tupName || inTargetField) return expr
+        var mkTup = new ExprMakeTuple(at = expr.at)
+        mkTup.recordNames |> resize(length(userNames))
+        for (i in 0 .. length(userNames)) {
+            mkTup.recordNames[i] := userNames[i]
+            mkTup.values |> emplace_new(new ExprVar(at = expr.at, name := iterNames[i]))
+        }
+        rewroteAny = true
+        return mkTup
+    }
+}
+
+[macro_function]
+def private rewrite_decs_tup_wholes(var body : Expression?; tupName : string; bridge : DecsBridgeShape?) : bool {
+    if (body == null) return false
+    var unCopy <- [for (n in bridge.userNames); n]
+    var inCopy <- [for (n in bridge.iterNames); n]
+    var rw = new DecsTupWholeRewriter(tupName, unCopy, inCopy)
+    make_visitor(*rw) $(astVisitorAdapter) {
+        visit_expression(body, astVisitorAdapter)
+    }
+    let any = rw.rewroteAny
+    unsafe {
+        delete rw
+    }
+    return any
+}
+
+// When the body only references `decs_tup` via field access (no whole-var refs), the named-tuple wrap plus every per-element `decs_tup.<field>` read are pure overhead — rewrite each field access to the matching iter var directly and skip the bind. Drops one tuple-make + one field-read per kept field per iteration.
+class private DecsTupFieldFlattener : AstVisitor {
+    tupName     : string
+    fieldToIter : table<string; string>
+    def DecsTupFieldFlattener(t : string; var f : table<string; string>) {
+        tupName = t
+        fieldToIter <- f
+    }
+    def override visitExprField(var expr : ExprField?) : ExpressionPtr {
+        var v = expr.value
+        if (v is ExprRef2Value) {
+            v = (v as ExprRef2Value).subexpr
+        }
+        if (v is ExprVar && (v as ExprVar).name == tupName) {
+            let fname = string(expr.name)
+            if (key_exists(fieldToIter, fname)) return new ExprVar(at = expr.at, name := fieldToIter[fname])
+        }
+        return expr
+    }
+}
+
+[macro_function]
+def private flatten_decs_tup_to_iter(var body : Expression?; tupName : string; var fieldToIter : table<string; string>) : void {
+    if (body == null) return
+    var fl = new DecsTupFieldFlattener(tupName, fieldToIter)
+    make_visitor(*fl) $(astVisitorAdapter) {
+        visit_expression(body, astVisitorAdapter)
+    }
+    unsafe {
+        delete fl
+    }
+}
+
 [macro_function]
 def private build_decs_inner_for_pruned(bridge : DecsBridgeShape?;
                                         tupName : string;
                                         var body : Expression?;
                                         at : LineInfo) : Expression? {
     // Walks body for `tupName.<field>` references; when pruning is safe + beneficial, emits the inner multi-iter for with unused get_ro slots dropped and a matching shrunk named-tuple bind. Otherwise falls through to the unpruned path so user-visible shape stays intact (bare to_array, push_clone(decs_tup), pass-to-user-fn).
-    let (allUsed, usedNames) = collect_decs_tup_usage(body, tupName)
-    if (allUsed || empty(usedNames) || length(usedNames) == length(bridge.userNames)) {
+    var (allUsed, usedNames) = collect_decs_tup_usage(body, tupName, bridge)
+    // Whole-var refs (`lst := decs_tup`, `push_clone(buf, decs_tup)`, etc) would force the unpruned bind path — but they're all semantically equivalent to a synthesized `(userName1=iter1, ...)` literal. Rewrite them inline so the flatten + bind-elision path unlocks; saves the per-iteration `var decs_tup = (...)` wrap (~12 ns/op on last/single/select_where 100K-row benches).
+    if (allUsed && rewrite_decs_tup_wholes(body, tupName, bridge)) {
+        var (allUsed2, usedNames2) = collect_decs_tup_usage(body, tupName, bridge)
+        allUsed = allUsed2
+        usedNames <- usedNames2
+    }
+    // Fallback to the unpruned bind ONLY for whole-var refs that survived rewrite (pass-to-user-fn) or the edge case where the body never touches decs_tup at all. The "all fields used via field access" case still benefits from flatten + bind elision — no slots dropped, but the per-iter tuple-make and field reads disappear.
+    if (allUsed || empty(usedNames)) {
         var tupBind = build_decs_tup_bind(bridge, tupName, at)
         return build_decs_inner_for(bridge, tupBind, body, at)
     }
@@ -3139,24 +3268,16 @@ def private build_decs_inner_for_pruned(bridge : DecsBridgeShape?;
     for (n in usedNames) {
         usedSet |> insert(n)
     }
-    var prunedUserNames : array<string>
-    var prunedIterNames : array<string>
-    for (i in 0 .. length(bridge.userNames)) {
-        if (key_exists(usedSet, bridge.userNames[i])) {
-            prunedUserNames |> push(bridge.userNames[i])
-            prunedIterNames |> push(bridge.iterNames[i])
-        }
+    var fieldToIter <- {for (i in 0 .. length(bridge.userNames));
+        bridge.userNames[i] => bridge.iterNames[i];
+        where key_exists(usedSet, bridge.userNames[i])}
+    // Diagnostic-friendly fallback when some `usedNames` entry has no bridge match. Today the typer pipeline checks user `_.<field>` lambdas before plan_decs_unroll runs, so this is unreachable in practice — but if a future macro ever synthesizes `decs_tup.<unknownField>`, the unpruned bind keeps the typer's "unknown field of <named-tuple>" diagnostic intact instead of degrading it to "unknown identifier decs_tup".
+    if (length(fieldToIter) < length(usedSet)) {
+        var tupBind = build_decs_tup_bind(bridge, tupName, at)
+        return build_decs_inner_for(bridge, tupBind, body, at)
     }
-    // Pruned named-tuple bind — mirrors build_decs_tup_bind on the kept subset.
-    var mkTup = new ExprMakeTuple(at = at)
-    mkTup.recordNames |> resize(length(prunedUserNames))
-    for (i in 0 .. length(prunedUserNames)) {
-        mkTup.recordNames[i] := prunedUserNames[i]
-        mkTup.values |> emplace_new(new ExprVar(at = at, name := prunedIterNames[i]))
-    }
-    var tupBind = qmacro_expr() {
-        var $i(tupName) = $e(mkTup)
-    }
+    // Pruned path: no whole-var ref → no need for the named tuple. Rewrite every `decs_tup.<userName>` in the body to the matching iter var, then drop the bind entirely. Eliminates one tuple-make + N per-element field reads per iter.
+    flatten_decs_tup_to_iter(body, tupName, fieldToIter)
     // Clone forExpr; drop the iter slots not in usedSet from all 5 parallel dasvectors (sources/iterators/iteratorsAt/iteratorsAka/iteratorsTags). iteratorVariables is cleared so the typer rebuilds it during re-type — same pattern as daslib/soa.das:381.
     var clonedForExpr = clone_expression(bridge.forExpr)
     var clonedFor = clonedForExpr as ExprFor
@@ -3172,17 +3293,16 @@ def private build_decs_inner_for_pruned(bridge : DecsBridgeShape?;
         }
     }
     clonedFor.iteratorVariables |> clear()
-    // Install body — same layering as build_decs_inner_for.
-    var forBodyStmts <- [tupBind, body]
-    var forBody = stmts_to_expr(forBodyStmts)
+    // Install body — body now references iter vars directly; no tupBind needed.
     var newForBody = new ExprBlock(at = at)
-    newForBody.list |> push(forBody)
+    newForBody.list |> push(body)
     clonedFor.body = newForBody
     return clonedForExpr
 }
 
 struct private DecsChainInfo {
     bindAt      : array<string>    // bind name visible at each chain position
+    elidedAt    : array<bool>      // true when the select at position i was elided (peeled to a single decs_tup field access → reused iter var as next bind, no `let decs_sel_N = ...` emit needed)
     finalBind   : string            // bind name AFTER full chain — what terminator references
     finalType   : TypeDeclPtr       // element type AFTER full chain (constant + ref stripped)
     selectCount : int               // number of `select` ops in chain; 0 means finalBind == tupName
@@ -3201,17 +3321,47 @@ def private compute_decs_chain_info(var calls : array<tuple<ExprCall?; LinqCall?
         selectCount = 0
     )
     info.bindAt |> reserve(intermediateEnd)
+    info.elidedAt |> reserve(intermediateEnd)
     var curBind = tupName
     var curType : TypeDeclPtr = clone_type(bridge.elementType)
     for (i in 0 .. intermediateEnd) {
         info.bindAt |> push(curBind)
+        info.elidedAt |> push(false)
         var cll & = unsafe(calls[i])
         let opName = cll._1.name
         if (opName == "select") {
             info.selectCount ++
-            curBind = "`decs_sel`{at.line}`{at.column}`{info.selectCount}"
             var peeled = peel_lambda_rename_var(cll._0.arguments[1], info.bindAt[i])
             if (peeled == null || peeled._type == null) return null
+            // Trivial-let elision: `_select(_.userName)` against decs_tup → iter var directly. The pruned-for keeps the iter var (its name = bridge.iterNames[idx]) and the flattener would otherwise rewrite the synthetic `let decs_sel_N = decs_tup.userName` to `let decs_sel_N = <iterVar>` — a pure copy. Renaming finalBind to the iter var name skips the binding entirely and the action references it natively. Typer wraps both the projection root (`peeled` may be ExprRef2Value) AND the ExprVar inside the ExprField in ExprRef2Value — peel both.
+            var elided = false
+            if (curBind == tupName) {
+                var top = peeled
+                if (top is ExprRef2Value) {
+                    top = (top as ExprRef2Value).subexpr
+                }
+                if (top is ExprField) {
+                    var pf = top as ExprField
+                    var pv = pf.value
+                    if (pv is ExprRef2Value) {
+                        pv = (pv as ExprRef2Value).subexpr
+                    }
+                    if (pv is ExprVar && (pv as ExprVar).name == tupName) {
+                        let fname = string(pf.name)
+                        for (ui in 0 .. length(bridge.userNames)) {
+                            if (bridge.userNames[ui] == fname) {
+                                curBind = bridge.iterNames[ui]
+                                elided = true
+                                info.elidedAt[i] = true
+                                break
+                            }
+                        }
+                    }
+                }
+            }
+            if (!elided) {
+                curBind = "`decs_sel`{at.line}`{at.column}`{info.selectCount}"
+            }
             curType = clone_type(peeled._type)
         } elif (opName != "where_") return null
     }
@@ -3246,6 +3396,8 @@ def private wrap_decs_chain(var action : Expression?;
                 }
             }
         } elif (opName == "select") {
+            // Skip emission entirely when this select was elided in compute_decs_chain_info — the next bind is already the iter var the flattener would have produced for `let nextBind = decs_tup.userName`. No copy needed; downstream `current` already references the iter var by the elided name.
+            continue if (chainInfo.elidedAt[i])
             var proj = peel_lambda_rename_var(cll._0.arguments[1], bindHere)
             if (proj == null) return null
             let nextBind = (i + 1 < intermediateEnd) ? chainInfo.bindAt[i + 1] : chainInfo.finalBind
@@ -3431,6 +3583,38 @@ def private decs_range_prelude(rangeInfo : DecsRangeInfo?; names : DecsRangeStat
         }
     }
     return <- stmts
+}
+
+[macro_function]
+def private emit_default_bind(name : string; argExpr : Expression?; canCopy : bool) : Expression? {
+    // Bind user-supplied default once. Non-copyable uses `var dv <- clone_to_move(arg)` — fully-owned local so multiple return-default sites can each clone-out without consuming.
+    var out : Expression?
+    if (canCopy) {
+        out = qmacro_expr() {
+            let $i(name) = $e(argExpr)
+        }
+    } else {
+        out = qmacro_expr() {
+            var $i(name) <- clone_to_move($e(argExpr))
+        }
+    }
+    return out
+}
+
+[macro_function]
+def private emit_default_return(name : string; canCopy : bool) : Expression? {
+    // Non-copyable uses `return <- clone_to_move(name)` (safe repeated calls — clone_to_move does NOT consume).
+    var out : Expression?
+    if (canCopy) {
+        out = qmacro_expr() {
+            return $i(name)
+        }
+    } else {
+        out = qmacro_expr() {
+            return <- clone_to_move($i(name))
+        }
+    }
+    return out
 }
 
 [macro_function]
@@ -3938,11 +4122,12 @@ def private emit_decs_walk_lane(bridge : DecsBridgeShape?;
             }
         } else {
             let defaultName = qn("decs_dv", at)
-            preludeStmts |> push <| qmacro_expr() {
-                let $i(defaultName) = $e(terminatorCall.arguments[1])
-            }
+            let dvCanCopy = (terminatorCall.arguments[1]._type != null && terminatorCall.arguments[1]._type.canCopy)
+            preludeStmts |> push(emit_default_bind(defaultName, terminatorCall.arguments[1], dvCanCopy))
             tailStmts |> push_from <| qmacro_block_to_array() {
-                if (!$i(foundName)) return $i(defaultName)
+                if (!$i(foundName)) {
+                    $e(emit_default_return(defaultName, dvCanCopy))
+                }
                 return <- $i(bindName)
             }
         }
@@ -3970,14 +4155,13 @@ def private emit_decs_walk_lane(bridge : DecsBridgeShape?;
         let stopName = qn("decs_stop", at)
         let bindName = qn("decs_sng", at)
         let defaultName = qn("decs_dv", at)
+        let dvCanCopy = (terminatorCall.arguments[1]._type != null && terminatorCall.arguments[1]._type.canCopy)
         preludeStmts |> push_from <| qmacro_block_to_array() {
             var $i(foundName) = false
             var $i(stopName) = false
             var $i(bindName) : $t(retType)
         }
-        preludeStmts |> push <| qmacro_expr() {
-            let $i(defaultName) = $e(terminatorCall.arguments[1])
-        }
+        preludeStmts |> push(emit_default_bind(defaultName, terminatorCall.arguments[1], dvCanCopy))
         // 2nd match → set stop, return true (exits inner lambda); for_each_archetype_find then stops the walk.
         perElement = qmacro_block() {
             if ($i(foundName)) {
@@ -3988,7 +4172,9 @@ def private emit_decs_walk_lane(bridge : DecsBridgeShape?;
             $i(bindName) := $i(finalBind)
         }
         tailStmts |> push_from <| qmacro_block_to_array() {
-            if ($i(stopName) || !$i(foundName)) return $i(defaultName)
+            if ($i(stopName) || !$i(foundName)) {
+                $e(emit_default_return(defaultName, dvCanCopy))
+            }
             return <- $i(bindName)
         }
         earlyExitFind = true
@@ -4110,12 +4296,19 @@ def private emit_decs_element_at(bridge : DecsBridgeShape?;
             return <- $i(resultName)
         }
     } else {
-        // element_at_or_default has no user-supplied default arg; returns default<TT>.
-        preludeStmts |> push <| qmacro_expr() {
-            if ($i(idxName) < 0) return default<$t(retType)>
+        // element_at_or_default has no user-supplied default; mirrors linq.das via `var t : TT; return <- t` (move-init, works for both copyable and non-copyable element types).
+        let tName = qn("decs_emptyT", at)
+        preludeStmts |> push_from <| qmacro_block_to_array() {
+            if ($i(idxName) < 0) {
+                var $i(tName) : $t(retType)
+                return <- $i(tName)
+            }
         }
         tailStmts |> push_from <| qmacro_block_to_array() {
-            if (!$i(foundName)) return default<$t(retType)>
+            if (!$i(foundName)) {
+                var $i(tName) : $t(retType)
+                return <- $i(tName)
+            }
             return <- $i(resultName)
         }
     }
@@ -4314,6 +4507,99 @@ def private plan_decs_order_family(var expr : Expression?) : Expression? {
     if (hasKey) {
         inlineCmp = try_make_inline_cmp(orderKey, orderName, elemType, at)
     }
+    // Bounded-heap / streaming-min fast paths: when the key is inline-able, skip the materialize-all + min_by/top_n pattern in favor of a per-walk state (single best for first[_or_default], heap of size N for take). Slashes 100K push_clones to ~N — the rest of the elements only pay a cmp.
+    let useBoundedHeap = takeExpr != null && inlineCmp != null && firstName == ""
+    let useStreamingMin = firstName != "" && inlineCmp != null
+    let archName = bridge.archName
+    let needIterWrap = expr._type.isIterator
+    var emission : Expression?
+    if (useStreamingMin) {
+        let bestName = qn("decs_best", at)
+        let seenName = qn("decs_seen", at)
+        var lessTest = make_inline_less_call(orderKey, orderName,
+            qmacro($i(tupName)), qmacro($i(bestName)), at)
+        var perElement : Expression? = qmacro_expr() {
+            if (!$i(seenName)) {
+                $i(bestName) := $i(tupName)
+                $i(seenName) = true
+            } elif ($e(lessTest)) {
+                $i(bestName) := $i(tupName)
+            }
+        }
+        if (whereCond != null) {
+            perElement = qmacro_expr() {
+                if ($e(whereCond)) {
+                    $e(perElement)
+                }
+            }
+        }
+        var forExprNode = build_decs_inner_for_pruned(bridge, tupName, perElement, at)
+        if (firstName == "first") {
+            emission = qmacro(invoke($() : $t(elemType) {
+                var $i(bestName) = default<$t(elemType)>
+                var $i(seenName) = false
+                for_each_archetype($e(bridge.reqHashExpr), $e(bridge.erqExpr), $($i(archName) : Archetype) {
+                    $e(forExprNode)
+                })
+                panic("sequence contains no elements") if (!$i(seenName))
+                return $i(bestName)
+            }))
+        } else {
+            let dBindName = qn("order_d", at)
+            emission = qmacro(invoke($() : $t(elemType) {
+                let $i(dBindName) = $e(firstDefaultExpr)
+                var $i(bestName) = default<$t(elemType)>
+                var $i(seenName) = false
+                for_each_archetype($e(bridge.reqHashExpr), $e(bridge.erqExpr), $($i(archName) : Archetype) {
+                    $e(forExprNode)
+                })
+                return $i(bestName) if ($i(seenName))
+                return $i(dBindName)
+            }))
+        }
+        return finalize_decs_emission(emission, at, false)
+    }
+    if (useBoundedHeap) {
+        let takeNName = qn("decs_take_n", at)
+        // Direct less-test on the hot path: `less(KEY[decs_tup], KEY[buf[0]])` inlined, no block dispatch.
+        var lessTest = make_inline_less_call(orderKey, orderName,
+            qmacro($i(tupName)), qmacro($i(bufName)[0]), at)
+        var perElement : Expression? = qmacro_expr() {
+            if (length($i(bufName)) < $i(takeNName)) {
+                $i(bufName) |> push_clone($i(tupName))
+                _::spliced_push_heap($i(bufName), $e(inlineCmp))
+            } elif ($e(lessTest)) {
+                _::spliced_pop_heap($i(bufName), $e(inlineCmp))
+                $i(bufName)[length($i(bufName)) - 1] := $i(tupName)
+                _::spliced_push_heap($i(bufName), $e(inlineCmp))
+            }
+        }
+        if (whereCond != null) {
+            perElement = qmacro_expr() {
+                if ($e(whereCond)) {
+                    $e(perElement)
+                }
+            }
+        }
+        var forExprNode = build_decs_inner_for_pruned(bridge, tupName, perElement, at)
+        var bhStmts : array<Expression?>
+        bhStmts |> reserve(7)
+        // No `reserve(takeN)` on the bounded buf — matches the policy in linq.das top_n_by_with_cmp iterator variant. Caller may pass takeN >> actual source size, and the decs cardinality is unknown ahead of the walk; pre-reserving N slots would risk a large upfront allocation for no win (fill phase grows geometrically to min(N, M) in O(log) reallocs anyway).
+        bhStmts |> push_from <| qmacro_block_to_array() {
+            let $i(takeNName) = $e(takeExpr)
+            var $i(bufName) : array<$t(elemType)>
+            return <- $i(bufName) if ($i(takeNName) <= 0)
+            for_each_archetype($e(bridge.reqHashExpr), $e(bridge.erqExpr), $($i(archName) : Archetype) {
+                $e(forExprNode)
+            })
+            _::order_inplace($i(bufName), $e(inlineCmp))
+            return <- $i(bufName)
+        }
+        emission = qmacro(invoke($() : array<$t(elemType)> {
+            $b(bhStmts)
+        }))
+        return finalize_decs_emission(emission, at, needIterWrap)
+    }
     var perElement : Expression? = qmacro_expr() {
         $i(bufName) |> push_clone($i(tupName))
     }
@@ -4325,7 +4611,6 @@ def private plan_decs_order_family(var expr : Expression?) : Expression? {
         }
     }
     var forExprNode = build_decs_inner_for_pruned(bridge, tupName, perElement, at)
-    let archName = bridge.archName
     var bodyStmts : array<Expression?>
     bodyStmts |> reserve(5)
     bodyStmts |> push_from <| qmacro_block_to_array() {
@@ -4334,8 +4619,6 @@ def private plan_decs_order_family(var expr : Expression?) : Expression? {
             $e(forExprNode)
         })
     }
-    let needIterWrap = expr._type.isIterator
-    var emission : Expression?
     if (firstName == "first") {
         // order + first → min/max on buffer. Empty buf must panic to match eager `first()` semantics.
         bodyStmts |> push <| qmacro_expr() {
@@ -4565,6 +4848,63 @@ def private plan_decs_reverse(var expr : Expression?) : Expression? {
     let bufName = qn("decs_buf", at)
     let needIterWrap = expr._type.isIterator
     var bufElemType = strip_const_ref(clone_type(projection != null ? projection._type : bridge.elementType))
+    // Skip-into-tail fast path: `reverse |> take(N) |> to_array` with no where/select. Walk archetypes once to sum `arch.size` (cheap, no entity load), compute skip = total - takeN, then for_each_archetype_find skips whole archetypes whose size still fits below the skip threshold and short-circuits once the buffer reaches takeN. `where` would invalidate the size-based skip (count after filter is unknown without iterating); `select` would only affect element shape, not count, but is skipped here to keep v1 minimal.
+    if (takeExpr != null && whereCond == null && projection == null) {
+        let takeNName = qn("take_n", at)
+        let totalName = qn("decs_total", at)
+        let actualName = qn("decs_actual", at)
+        let skipName = qn("decs_skip", at)
+        let seenName = qn("decs_seen", at)
+        let skipsLeftName = qn("decs_skips", at)
+        let tupBind = build_decs_tup_bind(bridge, tupName, at)
+        // Inner-for body: skip-counter early-out before the named-tuple wrap (so skipped iters pay no per-component load); push + break-on-quota after.
+        var innerBody : Expression? = qmacro_block() {
+            if ($i(skipsLeftName) > 0_l) {
+                $i(skipsLeftName) --
+                continue
+            }
+            $e(tupBind)
+            $i(bufName) |> push_clone($i(tupName))
+            if (int64(length($i(bufName))) >= $i(actualName)) {
+                break
+            }
+        }
+        var clonedForExpr = clone_expression(bridge.forExpr)
+        var clonedFor = clonedForExpr as ExprFor
+        var newForBody = new ExprBlock(at = at)
+        newForBody.list |> push(innerBody)
+        clonedFor.body = newForBody
+        var emission : Expression? = qmacro(invoke($() : array<$t(bufElemType)> {
+            // Pass 1: arch.size sum — no entity walk, just archetype-header iteration.
+            var $i(totalName) = 0_l
+            for_each_archetype($e(bridge.reqHashExpr), $e(bridge.erqExpr), $($i(archName) : Archetype) {
+                $i(totalName) += $i(archName).size
+            })
+            let $i(takeNName) = $e(takeExpr)
+            let $i(actualName) = ($i(takeNName) <= 0) ? 0_l : ((int64($i(takeNName)) < $i(totalName)) ? int64($i(takeNName)) : $i(totalName))
+            let $i(skipName) = $i(totalName) - $i(actualName)
+            var $i(bufName) : array<$t(bufElemType)>
+            if ($i(actualName) == 0_l) {
+                return <- $i(bufName)
+            }
+            $i(bufName) |> reserve(int($i(actualName)))
+            // Pass 2: skip whole archetypes via size sum; partial archetype uses skip-counter; subsequent archetypes feed directly. Returns true once buf reaches actualTake to stop iteration across remaining archetypes.
+            var $i(seenName) = 0_l
+            for_each_archetype_find($e(bridge.reqHashExpr), $e(bridge.erqExpr), $($i(archName) : Archetype) : bool {
+                if ($i(seenName) + $i(archName).size <= $i(skipName)) {
+                    $i(seenName) += $i(archName).size
+                    return false
+                }
+                var $i(skipsLeftName) = ($i(skipName) > $i(seenName)) ? ($i(skipName) - $i(seenName)) : 0_l
+                $e(clonedForExpr)
+                $i(seenName) += $i(archName).size
+                return int64(length($i(bufName))) >= $i(actualName)
+            })
+            _::reverse_inplace($i(bufName))
+            return <- $i(bufName)
+        }))
+        return finalize_decs_emission(emission, at, needIterWrap)
+    }
     var pushExpr : Expression?
     if (projection != null) {
         pushExpr = qmacro_expr() {
@@ -4721,9 +5061,7 @@ def private plan_decs_distinct(var expr : Expression?) : Expression? {
     }
     var keyExpr : Expression?
     if (isDistinctBy) {
-        keyExpr = qmacro_expr() {
-            invoke($e(distinctKeyBlock), $e(pushExpr))
-        }
+        keyExpr = peel_lambda_replace_var(distinctKeyBlock, pushExpr)
     } else {
         keyExpr = clone_expression(pushExpr)
     }

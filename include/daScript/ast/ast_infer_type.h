@@ -60,6 +60,9 @@ namespace das {
         const Structure *cppLayoutParent = nullptr;
         bool needRestart = false;
         bool enableInferTimeFolding = true;
+        bool savedFoldingForEnum = true;        // preVisitEnumerationValue / visitEnumerationValue save-restore
+        bool savedFoldingForStaticIf = true;    // preVisit(ExprIfThenElse) / visit(ExprIfThenElse) save-restore (block hooks skipped for static_if)
+        bool savedFoldingForStaticAssert = true; // preVisit(ExprStaticAssert) / visit(ExprStaticAssert) save-restore
         bool disableAot = false;
         bool multiContext = false;
         bool standaloneContext = false;
@@ -259,6 +262,8 @@ namespace das {
         // enumeration
 
         ExpressionPtr makeEnumConstValue(Enumeration *enu, int64_t nextInt) const;
+
+        virtual void preVisitEnumerationValue(Enumeration *enu, const string &name, Expression *value, bool last) override;
 
         virtual ExpressionPtr visitEnumerationValue(Enumeration *enu, const string &name, Expression *value, bool last) override;
 
@@ -476,7 +481,6 @@ namespace das {
         ExpressionPtr getConstExpr(Expression *expr);
         virtual bool canVisitIfSubexpr(ExprIfThenElse *expr) override;
         virtual void preVisit(ExprIfThenElse *expr) override;
-        virtual void preVisitIfBlock(ExprIfThenElse *expr, Expression *) override;
         virtual ExpressionPtr visit(ExprIfThenElse *expr) override;
         // ExprAssume
         virtual void preVisit(ExprAssume *expr) override;

@@ -233,10 +233,9 @@ def from_JV(v : JsonValue const explicit?; ent : auto(EnumT); defV : EnumT = def
     if (v == null || !((v.value is _string) || (v.value is _number) || (v.value is _longint))) return defV
     if (v.value is _string) {
         let name = v.value as _string
-        var res : auto(EnumTT) = default<EnumT>
         let ti = typeinfo rtti_typeinfo(type<EnumT>)
         for (ef in *ti.enumType) {
-            return unsafe(reinterpret<EnumTT>(ef.value)) if (name == ef.name)
+            return unsafe(reinterpret<EnumT>(ef.value)) if (name == ef.name)
         }
         panic("not a valid enumeration {name} in {typeinfo typename(type<EnumT>)}")
     } else {
@@ -474,7 +473,7 @@ def from_JV(v : JsonValue const explicit?; anything : auto(TT)) {
             let arr & = v.value as _array
             ret |> reserve(arr |> long_length)
             for (a in arr) {
-                if (typeinfo can_copy(anything[0])) {
+                static_if (typeinfo can_copy(anything[0])) {
                     ret |> push_clone <| _::from_JV(a, decltype_noref(anything[0]))
                 } else {
                     ret |> emplace <| _::from_JV(a, decltype_noref(anything[0]))
