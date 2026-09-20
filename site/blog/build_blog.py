@@ -329,6 +329,9 @@ def render_index(posts: list[Entry], md) -> str:
                 Design rationale, refactor stories, and the occasional shipping
                 announcement. Newest first.
             </p>
+            <p style="max-width:640px; margin:8px 0 0; font-family:var(--font-mono); font-size:11.5px; text-transform:uppercase; letter-spacing:1.4px;">
+                <a href="feed.xml" style="color:var(--amber);">RSS</a>
+            </p>
             <div class="forge-blog-list">
 {chr(10).join(items)}
             </div>
@@ -405,6 +408,7 @@ def render_atom_feed(posts: list[Entry], site_url: str) -> str:
 <link href="{site_url}/blog/"/>
 <updated>{updated}T00:00:00Z</updated>
 <id>{site_url}/blog/</id>
+<author><name>Boris Batkin</name></author>
 {chr(10).join(entries)}
 </feed>
 """

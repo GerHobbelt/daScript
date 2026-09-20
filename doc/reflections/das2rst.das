@@ -16,6 +16,7 @@ require daslib/rst
 require daslib/functional
 require daslib/json
 require daslib/json_boost
+require daslib/jsonrpc
 require daslib/regex
 require daslib/regex_boost
 require daslib/apply
@@ -62,6 +63,7 @@ require daslib/fuzzer
 require daslib/match
 require daslib/linq
 require daslib/linq_boost
+require daslib/linq_fold
 require daslib/flat_hash_table
 require daslib/cuckoo_hash_table
 require daslib/macro_boost
@@ -424,6 +426,19 @@ def document_module_json_boost(root : string) {
         group_by_regex("Annotation parsing", mod, %regex~(parse_json_annotation)$%%)
     )
     document("Boost package for JSON", mod, "json_boost.rst", groups)
+}
+
+def document_module_jsonrpc(root : string) {
+    var mod = find_module("jsonrpc")
+    var groups <- array<DocGroup>(
+        group_by_regex("Envelope builders", mod, %regex~(response|error|error_with_data|serialize_id)$%%),
+        group_by_regex("Server-side parsers", mod, %regex~(parse_request|parse_batch)$%%),
+        group_by_regex("Outgoing request builders", mod, %regex~(make_request|make_notification|make_batch)$%%),
+        group_by_regex("Response parsers", mod, %regex~(parse_response|parse_response_batch)$%%),
+        group_by_regex("Framing helper", mod, %regex~(compact_json_whitespace)$%%),
+        group_by_regex("High-level dispatch", mod, %regex~(dispatch_line)$%%)
+    )
+    document("JSON-RPC 2.0 envelope + parser, transport-agnostic", mod, "jsonrpc.rst", groups)
 }
 
 def document_module_regex(root : string) {
@@ -953,6 +968,12 @@ def document_module_linq_boost(root : string) {
         hide_group(group_by_regex("Implementation details", mod, %regex~(match_type|match_expr)$%%))
     )
     document("Boost module for LINQ", mod, "linq_boost.rst", groups)
+}
+
+def document_module_linq_fold(root : string) {
+    var mod = find_module("linq_fold")
+    var groups : array<DocGroup>
+    document("LINQ fold macros (_fold / _old_fold)", mod, "linq_fold.rst", groups)
 }
 
 def document_module_command_line(root : string) {
@@ -1635,9 +1656,11 @@ def main {
     document_module_jobque_boost(root)
     document_module_json_boost(root)
     document_module_json(root)
+    document_module_jsonrpc(root)
     // document_module_linked_list(root)         // spoof template, not documentable
     document_module_linq(root)
     document_module_linq_boost(root)
+    document_module_linq_fold(root)
     document_module_lint(root)
     // document_module_lint_everything(root)       // global_lint_macro causes lint errors in other modules
     // document_module_live(root)                  // uses multiple_contexts
