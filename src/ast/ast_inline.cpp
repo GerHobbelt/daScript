@@ -235,18 +235,32 @@ namespace das {
             void scopeNeed ( const string & name ) {
                 if ( verdict.scope.empty() ) verdict.scope = name;
             }
-            void checkName ( const string & name ) {
+            void checkName ( const string & name, bool generatedNode, Function * fn ) {
                 if ( !verdict.hard.empty() || underscoreExempt ) return;
                 size_t ofs = 0;
                 if ( name.compare(0,4,"__::")==0 ) ofs = 4;
                 else if ( name.compare(0,3,"_::")==0 ) ofs = 3;
                 if ( !ofs ) return;
-                if ( name.find('`', ofs)!=string::npos ) return;    // locked/manufactured mangled name
+                // locked instance names ("__::mod`fn`hash") re-resolve through the
+                // locked-name origin fallback and stay exempt. "_::" has no such
+                // fallback: a mangled _:: name (a [template] product, class-method
+                // dispatch) binds the program module before AND after the splice -
+                // it stops the splice exactly like a user-spelled escape (proven:
+                // sqlite_boost's ok() template products, sql tutorial dry-runs)
+                if ( ofs==4 && name.find('`', ofs)!=string::npos ) return;
+                // machinery-manufactured _:: whose target re-resolves identically from
+                // the destination stays exempt: public, non-generic, module visible
+                // (coverage instrumentation - _::add_func_coverage in every body - is
+                // the canonical case). compiler-emitted _::finalize / _::clone dispatch
+                // resolves against the calling module's overloads BY DESIGN and gates
+                // like a user escape (proven: templates_boost finalize, sql tutorials)
+                if ( generatedNode && fn && !fn->privateFunction && !fn->fromGeneric
+                    && fn->module && dest && dest->isVisibleDirectly(fn->module) ) return;
                 verdict.hard = name;
                 verdict.hardWhy = "body dispatches '" + name + "' at the call site's module";
             }
-            void checkFunc ( Function * fn, const string & callName ) {
-                checkName(callName);
+            void checkFunc ( Function * fn, const string & callName, bool generatedNode ) {
+                checkName(callName, generatedNode, fn);
                 if ( !fn || !verdict.hard.empty() ) return;
                 auto origin = fn->fromGeneric ? fn->fromGeneric : fn;
                 if ( fn->fromGeneric ) {
@@ -272,28 +286,28 @@ namespace das {
             virtual bool canVisitQuoteSubexpression ( ExprQuote * ) override { return false; }
             virtual void preVisit ( ExprCall * expr ) override {
                 Visitor::preVisit(expr);
-                checkFunc(expr->func, expr->name);
+                checkFunc(expr->func, expr->name, expr->generated);
             }
             virtual void preVisit ( ExprOp1 * expr ) override {
                 Visitor::preVisit(expr);
-                checkFunc(expr->func, "");
+                checkFunc(expr->func, "", true);
             }
             virtual void preVisit ( ExprOp2 * expr ) override {
                 Visitor::preVisit(expr);
-                checkFunc(expr->func, "");
+                checkFunc(expr->func, "", true);
             }
             virtual void preVisit ( ExprOp3 * expr ) override {
                 Visitor::preVisit(expr);
-                checkFunc(expr->func, "");
+                checkFunc(expr->func, "", true);
             }
             virtual void preVisit ( ExprAddr * expr ) override {
                 Visitor::preVisit(expr);
-                checkFunc(expr->func, expr->target);
+                checkFunc(expr->func, expr->target, expr->generated);
             }
             virtual void preVisit ( ExprVar * expr ) override {
                 Visitor::preVisit(expr);
                 if ( !expr->variable || !verdict.hard.empty() ) return;
-                checkName(expr->name);
+                checkName(expr->name, expr->generated, nullptr);
                 if ( expr->variable->private_variable ) {
                     if ( expr->variable->module!=dest ) scopeNeed(expr->variable->name);
                 } else if ( dest && expr->isGlobalVariable() && expr->variable->module

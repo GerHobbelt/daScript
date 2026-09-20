@@ -48,12 +48,14 @@ require daslib/strings_convert
 
 let n = to_int(s)              // silent — returns 0 for "foo", 12 for "12abc"
 let r = try_to_int(s)          // Result<int; ConversionError>
-if (r is value) {
-    use(r as value)
+if (r._is_ok) {
+    use(r._value)
 } else {
-    bail("bad input: {s} ({r as error})")
+    bail("bad input: {s} ({r._error})")
 }
 ```
+
+`Result<T; E>` (daslib/result) is a **structural tuple** `tuple<_is_ok : bool; _value : T; _error : E>` — access via `r._is_ok` / `r._value` / `r._error`, NOT variant `is value`/`as value` (that's `error[30190] is value only allowed for variants`; the variant form belongs to fio's `fs_result_*` types, which are real variants).
 
 - **`to_int(s)` / `to_float(s)`** silently return `0` / `0.0` for unparseable input and partial-parse for `"12abc"`. Fine for trusted internal data; **never** for user input, env vars, file contents, command-line args, or anything that flows into a shell call, file path, or system call. `";rm -rf;"` parses as `0` with `to_int`.
 - **`try_to_int` / `try_to_float`** in `daslib/strings_convert` return a `Result<T; ConversionError>` distinguishing `invalid_argument` (no digits), `out_of_range` (overflow), and `trailing_garbage` (`"12abc"`). The whole `try_to_*` family covers `int8`/`uint8`/.../`int64`/`uint64`/`float`/`double`.
@@ -88,7 +90,7 @@ let result = build_string() $(var writer) {
 
 `perf_lint` flags some bad patterns here (PERF002 string concat in loops, PERF005 unnecessary `string(das_string)` casts) — see `skills/perf_lint.md`.
 
-If the result must outlive the calling block (returned, stored), `build_string` requires `unsafe(...)` or `options persistent_heap`. Most call sites use `unsafe(build_string()) $(var writer) { ... }`.
+`persistent_heap` is the daslang default, and `build_string` copies the assembled result into the context string heap. Returning or storing that result is therefore safe and needs no `unsafe(...)` wrapper. Do not infer a dangling-string bug from a direct `return build_string() $(...) { ... }` call.
 
 ## Char-level access — `peek_data` and `modify_data`
 
@@ -163,14 +165,14 @@ Use for "did you mean" suggestions. The `_fast` variant is meaningfully faster f
 - **`find(s, '*')` accepts a char (int) directly** — no need to wrap as `"*"`. Same for `rfind`. Mixing the int and string overloads is fine.
 - **`find` returns `int`, not `int?`** — `< 0` means not found, **never** compare `find(...) == false`.
 - **`split` (boost) returns `array<string>`** — non-copyable, so move-receive: `let parts <- split(s, ",")`. The `split_by_chars` block-form generic is the no-allocation choice when you only need to iterate.
-- **`replace_multiple` (boost) does ONE pass** — replacements don't see each other's output. `replace_multiple(s, [("a","b"),("b","a")])` swaps `a`↔`b`; nested `replace` calls would not.
+- **`replace_multiple` (boost) does ONE pass** — replacements don't see each other's output. Its replacement array uses named tuples: `replace_multiple(s, [(text="a", replacement="b"), (text="b", replacement="a")])` swaps `a`↔`b`; nested `replace` calls would not.
 - **`to_lower` / `to_upper` allocate**; `to_lower_in_place` / `to_upper_in_place` mutate the input string buffer (still O(n), but no extra alloc). Pick by whether you still need the original.
 - **`character_at(s, i)` is O(n)**, not O(1). The compiler does not memoize. CLAUDE.md flags this; perf_lint may catch it (PERF003).
 - **String comparison with `das_string`** works directly — `if (das_str == "foo")`, `if (empty(das_str))`. Don't write `string(das_str)`.
 - **Hex literals are `uint`** — `int(0x3F)` for int. Same for `to_int("0x3F", true)` (the `accept_hex` bool).
 - **`int(s)` / `float(s)` are the silent parsers** — same caveat as `to_int`/`to_float`. Always use `try_to_*` from `strings_convert` for external input.
 - **`peek_data("")` does not call the block.** Empty-input checks go at the top of any wrapping function.
-- **String-builder result must escape unsafe gates if it outlives the block** — `unsafe(build_string()) $(...) { ... }` or `options persistent_heap` is the standard pattern when returning a built string.
+- **`build_string` results can be returned or stored directly** — `persistent_heap` is the default, and the result is copied into the context string heap. A direct `return build_string() $(...) { ... }` is not a dangling-string bug and does not require `unsafe(...)`.
 - **Never compare `find(s, sub) == false`** — `find` returns an `int` (offset or `-1`), not a bool. `find >= 0` for "found".
 
 ## Cross-references
