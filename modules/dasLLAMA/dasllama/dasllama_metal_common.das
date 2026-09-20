@@ -1,4 +1,5 @@
 options gen2
+options _comment_hygiene = true
 
 module dasllama_metal_common shared public
 
@@ -39,10 +40,15 @@ enum MetalDecodeDecline {
     none                // supported — the step runs on the GPU
     quant_mode          // weights not loaded under QuantMode.q8
     kquant_native       // per-tensor K-quant planes: not readable as qblob offsets (kernels = W4)
-    arch                // not the llama family graph
+    arch                // RETIRED (family waves A): the arch-name check is gone — non-std block
+                        // sets decline `graph`, feature-flag configs decline `feature` per bit
     backend_repack      // repack backend: interleaved weight layout unreadable by the GPU kernels
     rope_mode           // rope tables off
-    config              // feature-flag config the kernels don't implement (neox/bias/qk-norm/softcap/...)
+    config              // RETIRED (family waves A): split into `feature` + the per-need
+                        // `need_*` keys in the declines-by-reason table
+    graph               // block set is not the std dense stack (MoE / recurrent / custom attn)
+    feature             // the model needs layer-stack features this path's kernels don't
+                        // implement — each missing bit records a `need_*` key alongside
     shape               // head/dim alignment outside the kernel grids
     layers              // per-layer non-uniformity (kv_dim/head_size/hidden/sliding/missing wv)
     kv_dtype            // session KV codec not uniform f16/f32 (the mirror moves raw row bytes)
@@ -55,6 +61,79 @@ enum MetalDecodeDecline {
     device              // metal_decode_init failed (no device / PSO build failure)
     mirror              // the mirror arena cannot hold the KV slice
     gpu_error           // dispatch failed at execution time
+}
+
+//! Layer-stack features a model's graph needs beyond the base llama dense block — ONE derivation
+//! (`metal_needs`) feeds every GPU gate; each path (single decode / batch decode / prefill) holds
+//! its own implemented-set mask and declines `feature` on the difference, recording a `need_*`
+//! key per missing bit. Flags the drivers implement move into the path masks wave by wave.
+bitfield MetalNeed {
+    neox            // NEOX rope pairing (j, j+hs/2) — qwen2/qwen3/phi3/gemma/gptoss
+    qkv_bias        // additive bias on the Q/K/V projections — qwen2/glm4moe/gptoss
+    qk_norm         // per-head RMSNorm on Q/K before rope — qwen3/gemma3+/qwen35
+    v_norm          // weightless per-head RMSNorm on V — gemma4
+    partial_rope    // rope_dim < head_size rotates only the first rope_dim dims — qwen35/glm4moe
+    q_gated         // 2x-wide Q, out ⊙ σ(gate) before wo — qwen35
+    attn_scale      // attention-score scale override (not 1/sqrt(hs)) — gemma4
+    softcap         // attention-logit soft cap — gemma2
+    sliding         // sliding-window attention span — gemma2/3/4, gptoss
+    sinks           // per-head sink logit in the softmax denominator — gptoss
+    out_bias        // additive bias on the attention output projection — gptoss
+    pre_post_norm   // extra post-attention / post-FFN norms — gemma2/3/4
+    out_scale       // per-layer scalar on the layer output — gemma4
+    geglu           // GeGLU FFN activation (gelu, not silu) — gemma2/3/4
+    ple             // per-layer embeddings — gemma4 E-series
+    qd_neq_dim      // n_heads*head_size != dim (query width differs from the residual) — qwen3
+}
+
+//! The feature set model `t` needs from a resident GPU driver — derived from the loaded config
+//! (per-file truth: loader-detected flags included). Graph-shape needs (MoE routing, recurrent
+//! layers, custom attention) are NOT bits here — the block set declares those (`attn_is_std` /
+//! `ffn_is_dense`) and the gates decline `graph` before consulting the feature mask.
+def metal_needs(t : Model) : MetalNeed {
+    let c = t.config
+    var n : MetalNeed
+    n.neox = c.rope_neox
+    n.qkv_bias = c.attn_qkv_bias
+    n.qk_norm = c.qk_norm
+    n.v_norm = c.v_norm
+    n.partial_rope = c.rope_dim > 0l && c.rope_dim != c.head_size
+    n.q_gated = c.q_gated
+    n.attn_scale = c.attn_scale > 0.0
+    n.softcap = c.attn_logit_softcap > 0.0
+    n.sliding = c.sliding_window > 0l
+    n.sinks = c.attn_sinks
+    n.out_bias = c.attn_out_bias
+    n.pre_post_norm = c.pre_post_norm
+    n.out_scale = c.layer_out_scale
+    n.geglu = c.ffn_act != FfnAct.silu
+    n.ple = c.n_embd_per_layer > 0l
+    n.qd_neq_dim = c.n_heads * c.head_size != c.dim
+    return n
+}
+
+def metal_missing_needs(t : Model; ok : MetalNeed) : MetalNeed {
+    return metal_needs(t) & ~ok
+}
+
+// one `need_*` key per missing bit — the support-matrix cells assert these names as strings
+def record_needs(var tab : table<string; int64>; missing : MetalNeed) {
+    if (missing.neox) { tab["need_neox"]++ }
+    if (missing.qkv_bias) { tab["need_qkv_bias"]++ }
+    if (missing.qk_norm) { tab["need_qk_norm"]++ }
+    if (missing.v_norm) { tab["need_v_norm"]++ }
+    if (missing.partial_rope) { tab["need_partial_rope"]++ }
+    if (missing.q_gated) { tab["need_q_gated"]++ }
+    if (missing.attn_scale) { tab["need_attn_scale"]++ }
+    if (missing.softcap) { tab["need_softcap"]++ }
+    if (missing.sliding) { tab["need_sliding"]++ }
+    if (missing.sinks) { tab["need_sinks"]++ }
+    if (missing.out_bias) { tab["need_out_bias"]++ }
+    if (missing.pre_post_norm) { tab["need_pre_post_norm"]++ }
+    if (missing.out_scale) { tab["need_out_scale"]++ }
+    if (missing.geglu) { tab["need_geglu"]++ }
+    if (missing.ple) { tab["need_ple"]++ }
+    if (missing.qd_neq_dim) { tab["need_qd_neq_dim"]++ }
 }
 
 var g_dev : MetalDevice?
@@ -91,11 +170,28 @@ var g_gpu_b_ms = 0.0lf
 var g_sched_b_ms = 0.0lf                     // driver scheduling span (kernelStart..kernelEnd)
 var g_handoff_b_ms = 0.0lf                   // kernelEnd -> GPUStart gap
 
-// per-session logical KV mirror record (see the module header). Mirrors are SLICES of one shared
-// arena buffer (g_arena) so the batched-attention kernel can reach every row's KV through one
-// bind + a per-row element-offset table; the single-stream path binds the same arena at byte
-// offsets. All fields copyable — the slice is returned to the free list (mirror_release) before
-// any table erase.
+//! One retired single-stream decode step in the per-step trace (metal_decode_trace_arm) — host
+//! stamps are us on the arm clock; the cb stamps are Metal host-time SECONDS on one shared
+//! timeline across steps (gs - previous step's ge = GPU idle between the two cbs).
+struct MetalDecodeStepTrace {
+    pos : int64
+    mode : int64        // 0 = slow (encode-now), 1 = poked pre-encode, 2 = spec chain
+    commit_us : int64   // host stamp at this step's cb commit (spec: during the PREVIOUS step)
+    finish_us : int64   // host stamp at step retire (wait + readback done)
+    wait_us : int64     // the retire wait: commit-to-drain as the CPU saw it
+    ks : double         // cb kernelStart/EndTime — the driver scheduling span
+    ke : double
+    gs : double         // cb GPUStart/EndTime — the execution window
+    ge : double
+}
+
+var g_step_trace : array<MetalDecodeStepTrace>
+var g_step_trace_cap = 0l
+var g_step_trace_t0 = 0l
+
+// per-session logical KV mirror record (see module header). Mirrors are SLICES of one shared
+// arena buffer (g_arena): the batched kernel reaches every row via a per-row offset table; the
+// single-stream path binds at byte offsets. Fields copyable — slice returns to free list first.
 struct KVMirror {
     uid : uint64
     kdt : KVDtype
@@ -162,11 +258,9 @@ def arena_free_slice(off : uint64; size : uint64) {
     }
 }
 
-//! The KV-mirror cap (M2.7), one knob with two readers: the arena's grow-on-demand CEILING
-//! (256MB start; the value clamps to 64..4096MB there — 4096 is the batch row table's uint32
-//! hard max) and the RAW resident-bytes target for LRU eviction of idle sessions' mirrors
-//! (tiny values are legitimate evict-aggressively policy). Negative restores the env default
-//! (`DASLLAMA_METAL_KV_MIRROR_MB`, else 4096).
+//! The KV-mirror cap (M2.7): the arena's grow-on-demand CEILING (clamps to 64..4096MB) AND the
+//! RAW resident-bytes target for LRU eviction (tiny values = legitimate evict-aggressively policy).
+//! Negative restores the env default (`DASLLAMA_METAL_KV_MIRROR_MB`, else 4096).
 def public set_metal_decode_mirror_cap_mb(v : int) {
     g_mirror_cap_mb = v
 }
@@ -193,10 +287,25 @@ def decline(why : MetalDecodeDecline) {
     require_or_panic("decode", "{why}")
 }
 
+// the `feature` flavor: records a need_* key per missing bit, and the required-mode panic names them
+def decline(why : MetalDecodeDecline; missing : MetalNeed) {
+    g_declines++
+    g_declines_by_reason["{why}"]++
+    record_needs(g_declines_by_reason, missing)
+    require_or_panic("decode", "{why} {missing}")
+}
+
 def batch_decline(why : MetalDecodeDecline) {
     g_batch_declines++
     g_batch_declines_by_reason["{why}"]++
     require_or_panic("batch decode", "{why}")
+}
+
+def batch_decline(why : MetalDecodeDecline; missing : MetalNeed) {
+    g_batch_declines++
+    g_batch_declines_by_reason["{why}"]++
+    record_needs(g_batch_declines_by_reason, missing)
+    require_or_panic("batch decode", "{why} {missing}")
 }
 
 //! (gpu decode steps served, declines to the CPU path) since load — diagnostics / tests.
@@ -221,10 +330,8 @@ def public metal_batch_decode_declines() : table<string; int64> {
 }
 
 // speculative-chain state: the pre-encoded next step may open with GPU argmax + embed gather off
-// the CURRENT step's logits (no CPU poke — the chain never leaves the GPU). A greedy caller
-// never misses (same bytes, same tie-break); forced-token phases (warmup loops, tiny prompts
-// through per-token forward) and non-greedy samplers miss every step, so adaptive mode backs
-// off exponentially (skip 1, 2, 4 … 256 steps) and re-arms fully on any hit.
+// the current step's logits (no CPU poke). A greedy caller never misses; forced/non-greedy
+// samplers miss every step, so adaptive mode backs off exponentially and re-arms on any hit.
 var g_spec_mode = -1        // -1 adaptive (default), 0 off, 1 forced
 var g_spec_cooldown = 0     // adaptive: served steps left before the next attempt
 var g_spec_backoff = 1      // the next cooldown length
@@ -302,6 +409,23 @@ def public metal_decode_stage_stats() : tuple<steps : int64; setup_us : int64; e
 //! (live KV mirrors, resident mirror bytes) — the churn / LRU-cap gates read this.
 def public metal_decode_mirror_stats() : tuple<mirrors : int64; bytes : uint64> {
     return (mirrors = int64(length(g_mirrors)), bytes = g_mirror_bytes)
+}
+
+//! Arm the per-step single-stream decode trace for the next `cap` retired steps (0 disarms) —
+//! the bimodality diagnostic. Capacity is reserved here; recording stops when full, batch and
+//! prefill steps are never recorded, and a spec mispredict retires TWICE at the same pos
+//! (the wrong-token spec entry, then the slow rerun).
+def public metal_decode_trace_arm(cap : int64) {
+    g_step_trace |> clear()
+    g_step_trace |> reserve(int(cap))
+    g_step_trace_cap = cap
+    g_step_trace_t0 = ref_time_ticks()
+}
+
+//! Move out the recorded per-step trace and disarm.
+def public metal_decode_trace_take() : array<MetalDecodeStepTrace> {
+    g_step_trace_cap = 0l
+    return <- g_step_trace
 }
 
 // " reason=count reason=count" — the declines-by-reason tail of a report line
@@ -461,13 +585,8 @@ def kq_load_gpu_supported(t : Model) : bool {
 }
 
 // ===== zero-copy logits: bytesNoCopy wrappers over session-owned storage =====
-// The classifier (single-stream) or the copy-row scatter (batch) writes STRAIGHT into
-// s.logits — that row's landing memcpy disappears. The wrapper borrows the session's memory
-// (no deallocator): releasing it never frees anything, a dead session's storage dies with the
-// session, and the flush-before-delete contract keeps in-flight steps off dead sessions.
-// Gated per session on 16KB page alignment + page-rounded capacity (make_run_state reserves
-// it); a null entry caches the decline. The data pointer is revalidated on every lookup — a
-// session whose logits array moved re-registers.
+// Writes land straight into s.logits (no landing memcpy); borrowed, no deallocator. Gated on
+// 16KB page alignment + page-rounded capacity; the pointer is revalidated on every lookup.
 var g_nc_logits : table<uint64; tuple<buf : MetalBuffer?; ptr : uint64>>
 
 def nc_logits_for(dev : MetalDevice?; s : Session) : MetalBuffer? {
@@ -537,10 +656,9 @@ def private kq_region(dev : MetalDevice?; src : void?; bytes : uint64) : MetalBu
     return buf
 }
 
-// One kq tensor's GPU-form scale buffer (the gemv lab's layout verdicts): k4/k5 = 16B compact
-// blocks (the production 20B block minus its pad — the 20B stride's varying mod-16 phase defeats
-// the compiler's vector-load merge); k6 = [16B sub-scale blocks][packed f16 d plane] in ONE
-// buffer, the d plane at byte nsb*16 (the kernel binds the buffer twice with offsets).
+// One kq tensor's GPU-form scale buffer: k4/k5 = 16B compact blocks (20B production block minus
+// pad — its varying mod-16 phase defeats vector-load merge); k6 = [16B sub-scale][packed f16 d]
+// in ONE buffer, d plane at byte nsb*16 (kernel binds the buffer twice with offsets).
 def kq_upload_scales(dev : MetalDevice?; t : Model; fmt : KqFmt; off, rows, n : int64) : MetalBuffer? {
     let sb0 = off / 256l
     let nsb = (rows * n) / 256l
@@ -612,19 +730,33 @@ def mirror_evict_to_cap(cap_bytes : uint64; keep : uint64) {
     }
 }
 
+// Hetero-safe per-layer mirror addressing (gemma4's two kv-head classes): every KV codec is
+// linear bytes-per-element for kvd % 32 == 0, so the layout_offsets element prefix scales
+// straight to bytes. Uniform models reduce to the old l * cap * rowb addresses exactly.
+def mirror_row_total(t : Model) : int64 {
+    let c = t.config
+    var tot = 0l
+    for (l in range64(c.n_layers)) {
+        tot += layer_kv_dim(c, l)   // the GPU gate pins kv_src[l] == l, so every layer owns rows
+    }
+    return tot
+}
+
+//! layer l's slab base (bytes) within a mirror K or V plane of cap rows
+def mirror_lbase(t : Model; dt : KVDtype; cap, l : int64) : int64 => cap * kv_row_bytes(dt, t.kv_row_prefix[l])
+
 // the slice mirror_prepare would build for (s, pos): chunked high-water cap (pow2 from 256,
 // never past the session's own seq cap) and the K/V plane sizes
 def private mirror_slice_shape(t : Model; s : Session; pos : int64) : tuple<cap : int64; kbytes : uint64; vbytes : uint64> {
-    let c = t.config
-    let kv_dim = layer_kv_dim(c, 0l)
     let needed = pos + 1l
     var cap = 256l
     while (cap < needed) {
         cap *= 2l
     }
-    cap = clamp(cap, needed, c.seq_len)
-    return (cap = cap, kbytes = uint64(c.n_layers * cap * kv_row_bytes(s.kv_dtype_k, kv_dim)),
-            vbytes = uint64(c.n_layers * cap * kv_row_bytes(s.kv_dtype_v, kv_dim)))
+    cap = clamp(cap, needed, t.config.seq_len)
+    let total = mirror_row_total(t)
+    return (cap = cap, kbytes = uint64(cap * kv_row_bytes(s.kv_dtype_k, total)),
+            vbytes = uint64(cap * kv_row_bytes(s.kv_dtype_v, total)))
 }
 
 def private mirror_ceiling_bytes : uint64 {
@@ -707,14 +839,10 @@ def mirror_defrag(total : uint64) : bool {
 }
 
 // Ensure s.uid's mirror exists, is big enough, and holds logical rows [0, pos) — the watermark
-// contract (module header). Returns (ok, koff, voff, cap_rows) — arena byte offsets; the caller
-// writes row `pos` GPU-side and advances the watermark to pos + 1 only after the step + writeback
-// complete. ok = false ⇒ the arena cannot hold the slice (decline the step to the CPU path).
+// contract (module header). Returns arena byte offsets; caller writes row `pos` GPU-side and
+// advances the watermark only after the step + writeback complete. ok=false ⇒ decline to CPU.
 def mirror_prepare(t : Model; var s : Session; pos : int64) : tuple<ok : bool; koff : uint64; voff : uint64; cap : int64> {
     let c = t.config
-    let kv_dim = layer_kv_dim(c, 0l)
-    let krow = kv_row_bytes(s.kv_dtype_k, kv_dim)
-    let vrow = kv_row_bytes(s.kv_dtype_v, kv_dim)
     let needed = pos + 1l
     if (key_exists(g_mirrors, s.uid)) {
         // uid is never reused, so dtype can't legitimately change — a mismatch means a stale
@@ -726,11 +854,9 @@ def mirror_prepare(t : Model; var s : Session; pos : int64) : tuple<ok : bool; k
         }
     }
     if (!key_exists(g_mirrors, s.uid)) {
-        // the mirror cap is a CEILING (M2.7): the arena starts small and grows on demand up to
-        // clamp(cap, 64, 4096)MB — 4096MB is a HARD max (the batch row table's uint32 arena
-        // offsets rely on arena size <= 2^32). Growth releases every mirror and reallocates;
-        // the watermark contract re-uploads from the CPU cache, so a rebuild only costs the
-        // next steps' re-mirror. Growth never runs while a batch step holds pinned rows.
+        // the mirror cap is a CEILING (M2.7): grows on demand to clamp(cap, 64, 4096)MB — 4096 is a
+        // HARD max (the batch row table's uint32 arena offsets need arena size <= 2^32). Growth
+        // releases every mirror and rebuilds (re-mirror cost only); never runs while pins are held.
         let ceil_bytes = mirror_ceiling_bytes()
         if (g_arena == null) {
             g_arena_bytes = min(256ul * 1024ul * 1024ul, ceil_bytes)
@@ -791,15 +917,20 @@ def mirror_prepare(t : Model; var s : Session; pos : int64) : tuple<ok : bool; k
             var kdst = reinterpret<uint8?>(metal_buffer_contents(g_arena)) + koff
             var vdst = reinterpret<uint8?>(metal_buffer_contents(g_arena)) + voff
             for (l in range64(c.n_layers)) {
+                let kvd_l = layer_kv_dim(c, l)
+                let krow = kv_row_bytes(s.kv_dtype_k, kvd_l)
+                let vrow = kv_row_bytes(s.kv_dtype_v, kvd_l)
+                let klb = mirror_lbase(t, s.kv_dtype_k, cap, l)
+                let vlb = mirror_lbase(t, s.kv_dtype_v, cap, l)
                 let kbase = kv_layer_kbase(s, l, c.seq_len)
                 let vbase = kv_layer_vbase(s, l, c.seq_len)
                 for (r in range64(nrun)) {
                     let j0 = s.kv_runs[r].j0
                     let nrows = s.kv_runs[r].j1 - j0
                     let prow = s.kv_runs[r].row0
-                    memcpy(reinterpret<void?>(kdst + (l * cap + j0) * krow),
+                    memcpy(reinterpret<void?>(kdst + klb + j0 * krow),
                         reinterpret<void?>(kbase + prow * krow), int(nrows * krow))
-                    memcpy(reinterpret<void?>(vdst + (l * cap + j0) * vrow),
+                    memcpy(reinterpret<void?>(vdst + vlb + j0 * vrow),
                         reinterpret<void?>(vbase + prow * vrow), int(nrows * vrow))
                 }
             }
@@ -929,13 +1060,15 @@ var g_lp_nrows = 0l
 var g_lp_layers = 0l
 var g_lp_seq = 0l
 var g_lp_vocab = 0l
-var g_lp_rowb = 0l
+// hetero (gemma4): per-layer row bytes + slab bases within a mirror plane (uniform models:
+// lbase_l == l * cap * rowb_l — captured at encode, one array per step)
+var g_lp_lrowb : array<int64>
+var g_lp_lkbase : array<int64>   // per (row i, layer l) flattened i * n_layers + l (caps differ per row)
+var g_lp_lvbase : array<int64>
 var g_lp_prev_gpu_end = 0.0lf   // last finished step's gpu_end — the handoff stat's anchor
 
-// wait + read back + release the pending step. x_b writes back only on the sync CPU-classifier
-// path (g_lp_xb set): with gpu-logits the caller never reads it, and in pipe mode it would
-// clobber the next step's freshly written embeds. A dispatch error raises g_lp_err (sync callers
-// consume it and rerun on the CPU; a pipelined step is simply lost — logged + counted).
+// wait + read back + release the pending step; x_b writes back only on the sync CPU-classifier
+// path (pipe mode skips it — stale). A dispatch error sets g_lp_err (sync reruns on CPU; a pipelined step is lost).
 def finish_pending_step {
     if (!g_lp_active) {
         return
@@ -981,12 +1114,13 @@ def finish_pending_step {
                 var sp = g_lp_sessions[i]
                 let pos = g_lp_positions[i]
                 let prow = kv_phys_row(*sp, pos)
-                let cap = g_lp_caps[i]
                 for (l in range64(g_lp_layers)) {
-                    memcpy(reinterpret<void?>(kv_layer_kbase(*sp, l, g_lp_seq) + prow * g_lp_rowb),
-                        reinterpret<void?>(ab + (g_lp_koffs[i] + uint64((l * cap + pos) * g_lp_rowb))), int(g_lp_rowb))
-                    memcpy(reinterpret<void?>(kv_layer_vbase(*sp, l, g_lp_seq) + prow * g_lp_rowb),
-                        reinterpret<void?>(ab + (g_lp_voffs[i] + uint64((l * cap + pos) * g_lp_rowb))), int(g_lp_rowb))
+                    let rowb_l = g_lp_lrowb[l]
+                    let fb = i * g_lp_layers + l
+                    memcpy(reinterpret<void?>(kv_layer_kbase(*sp, l, g_lp_seq) + prow * rowb_l),
+                        reinterpret<void?>(ab + (g_lp_koffs[i] + uint64(g_lp_lkbase[fb] + pos * rowb_l))), int(rowb_l))
+                    memcpy(reinterpret<void?>(kv_layer_vbase(*sp, l, g_lp_seq) + prow * rowb_l),
+                        reinterpret<void?>(ab + (g_lp_voffs[i] + uint64(g_lp_lvbase[fb] + pos * rowb_l))), int(rowb_l))
                 }
                 if (lgp != null) {
                     memcpy(addr < void? >(sp.logits[0]),
@@ -1060,14 +1194,9 @@ def metal_common_init : bool {
     return true
 }
 
-//! Release the shared state (blob/cat-blob/region caches, mirrors, arena, pools, signs, queue,
-//! device). Callers land in-flight work first (finish_pending_step) and release PSOs before the
-//! device goes (metal_kernels_release) — metal_decode_shutdown is the public rail.
 // ===== the weights-epoch guard =====
-// g_regions / g_cat_blobs / the shared blob cache all key by host address; see weights_epoch's
-// doc for why a model reload makes those keys lie. Drivers call the flush at their entry points
-// when the epoch has moved (after quiescing any in-flight step — its unretained cb may
-// reference cached buffers).
+// g_regions/g_cat_blobs key by host address; a model reload makes those keys lie (see
+// weights_epoch). Drivers flush at entry when the epoch moved, after quiescing in-flight work.
 var g_weight_cache_epoch = -1l
 
 def weight_caches_stale() : bool {
@@ -1166,9 +1295,14 @@ enum MetalPrefillDecline {
     quant_mode          // weights not loaded under QuantMode.q8
     kquant_native       // per-tensor K-quant planes: not readable as qblob offsets (kernels = W4)
     wscale_f16          // f16 scale plane (the load DEFAULT) — GPU prefill needs the s16 path (W2)
-    arch                // not the llama family graph
+    arch                // RETIRED (family waves A): the arch-name check is gone — non-std block
+                        // sets decline `graph`, feature-flag configs decline `feature` per bit
     backend_repack      // repack backend: interleaved weight layout unreadable by the GEMM kernel
-    config              // feature-flag config the kernels don't implement (neox/bias/qk-norm/softcap/...)
+    config              // RETIRED (family waves A): split into `feature` + the per-need
+                        // `need_*` keys in the declines-by-reason table
+    graph               // block set is not the std dense stack (MoE / recurrent / custom attn)
+    feature             // the model needs layer-stack features this path's kernels don't
+                        // implement — each missing bit records a `need_*` key alongside
     shape               // head/dim alignment outside the kernel grids
     layers              // per-layer non-uniformity (kv_dim/head_size/hidden/sliding/missing wv)
     rope_rows           // the window's rope table not built
@@ -1185,6 +1319,13 @@ def decline(why : MetalPrefillDecline) {
     if (why != MetalPrefillDecline.npos_window) {   // the one POLICY decline — see require_or_panic
         require_or_panic("prefill", "{why}")
     }
+}
+
+def decline(why : MetalPrefillDecline; missing : MetalNeed) {
+    g_prefill_declines++
+    g_prefill_declines_by_reason["{why}"]++
+    record_needs(g_prefill_declines_by_reason, missing)
+    require_or_panic("prefill", "{why} {missing}")
 }
 
 //! Declines-by-reason since load — reason name -> count (the first failing gate clause per
@@ -1213,11 +1354,9 @@ def public metal_blob_regions_release {
     g_repack_us = 0l
 }
 
-//! Resident block_q8_0 blob for one weight region (planar quants + scale plane) — llama.cpp's
-//! mul_mm layout: 34-byte blocks of half scale + 32 int8 quants. One-time CPU repack per region,
-//! cached by the quant base address and SHARED across the prefill and batch-decode drivers.
-//! `s16` reads the plane as raw f16 bits (wscale_f16 models); the f32 -> f16 narrowing is exact
-//! for GGUF-q8_0-sourced weights (the loader widened the file's native f16 scales).
+//! Resident block_q8_0 blob for one weight region — llama.cpp's mul_mm layout (34B blocks: half
+//! scale + 32 int8 quants), cached by quant base address, shared across prefill/batch-decode.
+//! `s16` reads raw f16 bits; f32->f16 narrowing is exact for GGUF-q8_0-sourced weights.
 def public metal_blob_region(dev : MetalDevice?; qsrc, ssrc : void?; rows, k : int64; s16 : bool) : MetalBuffer? {
     // the scale encoding is part of the identity: the same quant region blobbed under f32 vs raw
     // f16 scales must not share a cache slot (the top bit is never set in a user-space address)

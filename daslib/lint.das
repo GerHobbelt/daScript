@@ -46,28 +46,12 @@ def private is_block_terminator(expr : ExpressionPtr) : bool {
 
 class LintVisitor : AstVisitor {
     //! AST visitor that performs lint checks.
-    //!
-    //! Rule codes (for ``// nolint:LINTxxx`` suppression):
-    //!   - LINT001: unreachable code
-    //!   - LINT002: unused variable
-    //!   - LINT003: variable can be made const (var→let)
-    //!   - LINT004: underscore-prefixed variable is actually used (locals only)
-    //!   - LINT005: redundant reinterpret<T>(x) where T matches source type
-    //!   - LINT006: division by zero (constant 0 divisor)
-    //!   - LINT007: left and right operands of binary operator are identical
-    //!   - LINT008: both branches of ternary ``?:`` are equivalent
-    //!   - LINT009: ``then`` branch equals ``else`` branch of ``if``
-    //!   - LINT010: dead store — local variable written but value never read
-    //!   - LINT011: int literal promoted to float/double with precision loss
-    //!   - LINT012: unused function argument (class-method and [extern] args skipped — signature is dictated externally)
-    //!   - LINT013: unused block argument
-    //!   - LINT014: mutable (var) function argument is never written — drop the var
-    //!   - LINT015: free-floating unary +/- expression statement — value discarded; a continuation line missing its parens
     astVisitorAdapter : VisitorAdapter?
     exprForTerminator : array<uint64>
     compile_time_errors : bool
     noLint : bool = false
     genericDepth : int = 0
+    multiple_contexts : bool = false
     // collection mode — when true, errors are appended to `errors` instead of error()
     collect_errors : bool = false
     errors : array<string>
@@ -93,9 +77,7 @@ class LintVisitor : AstVisitor {
         return is_lint_suppressed(at, code)
     }
     def lint_error(text : string; at : LineInfo) : void {
-        // a node carrying another file's lineinfo (an inliner splice from a required
-        // module, macro-manufactured code) gets its diagnostics from that file's own
-        // compile — reporting it here would fail modules on idioms they cannot edit
+        // a node carrying another file's lineinfo (an inliner splice from a required module, macro-manufactured code) gets its diagnostics from that file's own compile — reporting it here would fail modules on idioms they cannot edit
         if (noLint || is_suppressed(text, at)
                 || (at.fileInfo != null && !empty(funcFile) && at.fileInfo.name != funcFile)) return
         if (compile_time_errors) {
@@ -106,6 +88,122 @@ class LintVisitor : AstVisitor {
         } else {
             error("{text} at {describe(at)}\n")
         }
+    }
+    def private source_operator_is_clone(at : LineInfo) : bool {
+        //! Inference lowers a string ExprClone to ExprCopy in ordinary mode, but preserves the clone operator's LineInfo. Check that source token so a regular '=' copy stays silent.
+        if (at.fileInfo == null || at.line == 0u || at.line != at.last_line) return false
+        var found = false
+        get_file_source_line(at.fileInfo, at.line) $(line) {
+            var start = int(at.column) - 1
+            if (start < 0) {
+                start = 0
+            }
+            var finish = int(at.last_column) + 1
+            if (finish < start + 3) {
+                finish = start + 3
+            }
+            if (finish > length(line)) {
+                finish = length(line)
+            }
+            if (finish > start) {
+                found = find(slice(line, start, finish), ":=") >= 0
+            }
+        }
+        return found
+    }
+    def private root_generic(fn : Function const?) : Function const? {
+        var root = fn
+        while (root != null && root.fromGeneric != null) {
+            root = root.fromGeneric
+        }
+        return root
+    }
+    def private is_temporary_string_source(expr : Expression?) : bool {
+        if (expr == null) return false
+        if (expr._type != null && expr._type.flags.temporary) return true
+        var inner = expr
+        if (inner is ExprRef2Value) {
+            inner = (inner as ExprRef2Value).subexpr
+        }
+        if (inner is ExprVar) {
+            let variable = (inner as ExprVar).variable
+            return variable != null && variable._type != null && variable._type.flags.temporary
+        }
+        return false
+    }
+    def private is_inferred_temp_string_clone(expr : Expression?; clone_at : LineInfo) : bool {
+        //! InferTypes rewrites `dst := string#_expr` to `dst = clone_string(string#_expr)` and gives the injected call the original := token location. A source-written clone_string call keeps its own location.
+        if (expr == null || !(expr is ExprCall)) return false
+        let call = expr as ExprCall
+        return (call.func != null && call.func.name == "clone_string"
+            && call.at.line == clone_at.line && call.at.column == clone_at.column)
+    }
+    def private is_inferred_temp_string_init(expr : Expression?; init_at : LineInfo) : bool {
+        //! InferTypes rewrites `var dst := string#_expr` through clone_string. The wrapper result is a regular string, so inspect its source argument to preserve the temporary-string exception.
+        if (expr == null || !(expr is ExprCall)) return false
+        let call = expr as ExprCall
+        let root = root_generic(call.func)
+        return (root != null && root.name == "clone_string"
+            && root._module != null && root._module.name == "builtin"
+            && call.at.line == init_at.line && call.at.column == init_at.column
+            && !empty(call.arguments) && is_temporary_string_source(call.arguments[0]))
+    }
+    def private source_variable_init_is_clone(v : VariablePtr) : bool {
+        //! String clone initialization is lowered before lint runs. Search only between the source variable name and its initializer, so another declaration or := inside the RHS cannot produce a false positive.
+        if (v == null || v.init == null || v.at.fileInfo == null || v.at.line == 0u) return false
+        var found = false
+        get_file_source_line(v.at.fileInfo, v.at.line) $(line) {
+            var start = int(v.at.column) - 1
+            if (start < 0) {
+                start = 0
+            }
+            var finish = length(line)
+            if (v.init.at.line == v.at.line && int(v.init.at.column) > start) {
+                finish = int(v.init.at.column) + 1
+                if (finish > length(line)) {
+                    finish = length(line)
+                }
+            }
+            if (finish > start) {
+                found = find(slice(line, start, finish), ":=") >= 0
+            }
+        }
+        return found
+    }
+    def private check_string_clone_init(v : VariablePtr) : void {
+        if (v == null || multiple_contexts || noLint || genericDepth > 0
+                || v.flags.generated || v._type == null || v.init == null
+                || v._type.baseType != Type.tString
+                || is_temporary_string_source(v.init)
+                || is_inferred_temp_string_init(v.init, v.at)
+                || !source_variable_init_is_clone(v)) return
+        lint_error("LINT016: ':=' does not clone a string variable without 'options multiple_contexts'; use '=' for same-context storage, or did you mean '= clone_string(value)' for a cross-context copy", v.at)
+    }
+    def private check_string_clone_assign(expr : ExprCopy?) : void {
+        if (expr == null || multiple_contexts || noLint || genericDepth > 0 || expr.genFlags.generated
+                || expr.left == null || expr.right == null
+                || expr.left._type == null || expr.right._type == null
+                || expr.left._type.baseType != Type.tString
+                || expr.right._type.baseType != Type.tString
+                || is_temporary_string_source(expr.right)
+                || is_inferred_temp_string_clone(expr.right, expr.at)
+                || !source_operator_is_clone(expr.at)) return
+        lint_error("LINT016: ':=' does not clone a string without 'options multiple_contexts'; use '=' for same-context storage, or did you mean 'clone_string(value)' for a cross-context copy", expr.at)
+    }
+    def private check_string_push_clone(expr : ExprCall?) : void {
+        if (expr == null || multiple_contexts || noLint || genericDepth > 0 || expr.genFlags.generated
+                || expr.func == null || length(expr.arguments) < 2) return
+        let root = root_generic(expr.func)
+        if (root == null || root.name != "push_clone"
+                || root._module == null || root._module.name != "builtin") return
+        let dst = expr.arguments[0]
+        let value = expr.arguments[1]
+        if (dst == null || value == null || dst._type == null || value._type == null
+                || dst._type.baseType != Type.tArray || dst._type.firstType == null
+                || dst._type.firstType.baseType != Type.tString
+                || value._type.baseType != Type.tString
+                || is_temporary_string_source(value)) return
+        lint_error("LINT016: 'push_clone' does not clone a string without 'options multiple_contexts'; use 'push(value)' for same-context storage, or did you mean 'push(clone_string(value))' for a cross-context copy", expr.at)
     }
     def override preVisitFunction(fun : FunctionPtr) : void {
         noLint = false
@@ -145,10 +243,7 @@ class LintVisitor : AstVisitor {
     }
     def override preVisitExprBlock(blk : ExprBlock?) : void {
         exprForTerminator |> push(0ul)
-        // LINT010: a block passed as a closure / lambda body / generator body
-        // executes deferred or conditionally — treat it as a branch so writes
-        // inside don't kill pending stores outside and reads inside don't keep
-        // an outside-init "live" (the callback may never fire).
+        // LINT010: a block passed as a closure / lambda body / generator body executes deferred or conditionally — treat it as a branch so writes inside don't kill pending stores outside and reads inside don't keep an outside-init "live" (the callback may never fire).
         let bf = blk.blockFlags
         if (!noLint && genericDepth == 0 && (bf.isClosure || bf.isLambdaBlock || bf.isGeneratorBlock)) {
             branch_depth++
@@ -170,13 +265,7 @@ class LintVisitor : AstVisitor {
         if (lb != 0ul) {
             lint_error("LINT001: unreachable code", expr.at)
         }
-        // LINT015: a free-floating unary +/- subexpression used as a statement — a
-        // continuation line that lost its wrapping parens (`let x = a` ⏎ `+ b`,
-        // which re-parses as a unary `+b` whose value is discarded; if the operand
-        // is pure the optimizer drops the whole statement silently). Only `+`/`-`
-        // qualify: they are the only operators that are both binary and unary, so a
-        // split binary `a + b` orphans as a valid unary statement (`~`/`!` aren't
-        // binary, `*`/`|>`/etc. can't start a statement → loud error).
+        // LINT015: a free-floating unary +/- subexpression used as a statement — a continuation line that lost its wrapping parens (`let x = a` ⏎ `+ b`, which re-parses as a unary `+b` whose value is discarded; if the operand is pure the optimizer drops the whole statement silently). Only `+`/`-` qualify: they are the only operators that are both binary and unary, so a split binary `a + b` orphans as a valid unary statement (`~`/`!` aren't binary, `*`/`|>`/etc. can't start a statement → loud error).
         if (!noLint && genericDepth == 0 && expr is ExprOp1 && !expr.genFlags.generated) {
             let op1 = expr as ExprOp1
             if (op1.op == "+" || op1.op == "-") {
@@ -184,10 +273,6 @@ class LintVisitor : AstVisitor {
             }
         }
         // Mark this block as terminated only when `expr` IS a direct-child terminator.
-        // Tracking from preVisitExprReturn/preVisitExprCall(panic) was incorrect: it
-        // fired for returns nested in braceless `if/elif <terminator>` whose then-body
-        // is an ExprReturn directly under ExprIf (no synthetic block), poisoning the
-        // ENCLOSING block's slot.
         if (is_block_terminator(expr)) {
             exprForTerminator |> pop()
             exprForTerminator |> push(intptr(expr))
@@ -252,8 +337,6 @@ class LintVisitor : AstVisitor {
             return
         }
         // inScope variables can't be const — delete/finalize at scope exit requires mutability.
-        // access_info_pass_mutable: passed to a mutable-ref slot whose callee never writes —
-        // access_ref stays false, but a `let` no longer matches the signature (issue #3090)
         if (can_make_const && (v.flags.inScope || v.access_info.access_info_pass_mutable)) return
         if (can_make_const && v._type.baseType != Type.tPointer && !v._type.flags.constant && !v.access_flags.access_ref && v._type.canCloneFromConst) {// && !v._type.flags.smartPtr
             lint_error("LINT003: variable {v.name}: {describe(v._type)} can be made const (declare with 'let')", v.at)
@@ -269,10 +352,7 @@ class LintVisitor : AstVisitor {
         // skip template/generic/[no_lint] context, generated vars, and [unused_argument(name)] (marked_used)
         if (noLint || genericDepth > 0 || v.flags.generated || v.flags.marked_used) return
         let name = string(v.name)
-        // A leading underscore on an argument means "leave it alone": intentionally unused, or
-        // dodging a reserved keyword / shadow (e.g. `_in`). Unlike locals, we do NOT raise LINT004
-        // for a used `_arg` — a parameter name is often constrained and can't drop the underscore.
-        // Backtick names are compiler-generated.
+        // A leading underscore on an argument means "leave it alone": intentionally unused, or dodging a reserved keyword / shadow (e.g. `_in`). Unlike locals, we do NOT raise LINT004 for a used `_arg` — a parameter name is often constrained and can't drop the underscore.
         if (name |> starts_with("_") || find(name, "`") >= 0) return
         if (v.isAccessUnused) {
             lint_error("{code}: unused {kind} {v.name}: {describe(v._type)} (add an underscore prefix or [unused_argument({v.name})] if intentional)", v.at)
@@ -282,12 +362,7 @@ class LintVisitor : AstVisitor {
     def validate_unwritten_var_argument(fun : FunctionPtr; v : VariablePtr) {
         if (noLint || genericDepth > 0 || v.flags.generated || v.flags.marked_used) return
         let name = string(v.name)
-        // skips, in order: leave-it-alone names; `finalize` overloads (the delete protocol
-        // dictates var) and address-taken functions (signature conforms to a function-pointer
-        // type); by-value parameters (a mutable copy is not a caller burden); written params
-        // (access_ref) and params whose mutability a callee's signature demands transitively
-        // (access_info_pass_mutable — the leaf callee gets flagged first; fixing it re-exposes
-        // this one); entirely-unused params (LINT012's report)
+        // skips, in order: leave-it-alone names; `finalize` overloads (the delete protocol dictates var) and address-taken functions (signature conforms to a function-pointer type); by-value parameters (a mutable copy is not a caller burden); written params (access_ref) and params whose mutability a callee's signature demands transitively (access_info_pass_mutable — the leaf callee gets flagged first; fixing it re-exposes this one); entirely-unused params (LINT012's report)
         if ((name |> starts_with("_")) || find(name, "`") >= 0
                 || fun.name == "finalize" || fun.moreFlags.addressTaken
                 || v._type == null || v._type.flags.constant
@@ -300,9 +375,7 @@ class LintVisitor : AstVisitor {
     }
 
     def override preVisitFunctionArgument(fun : FunctionPtr; arg : VariablePtr; _lastArg : bool) : void {
-        // class-method signatures are dictated by the base class / interface, and
-        // [extern] stubs by the bound C function — unused params there are
-        // structural, not a mistake
+        // class-method signatures are dictated by the base class / interface, and [extern] stubs by the bound C function — unused params there are structural, not a mistake
         if (fun.flags.isClassMethod) return
         for (ann in fun.annotations) {
             if (ann.annotation.name == "extern") return
@@ -313,6 +386,10 @@ class LintVisitor : AstVisitor {
 
     def override preVisitExprBlockArgument(_blk : ExprBlock?; arg : VariablePtr; _lastArg : bool) : void {
         validate_argument(arg, "LINT013", "block argument")
+    }
+
+    def override preVisitExprCall(expr : ExprCall?) : void {
+        check_string_push_clone(expr)
     }
 
     // `assume name = <block>` keeps a template block at the alias-definition site; every use of
@@ -344,9 +421,7 @@ class LintVisitor : AstVisitor {
     def expr_equal(a : ExpressionPtr; b : ExpressionPtr; require_pure : bool = true) : bool {
         if (a == null || b == null
             || (require_pure && (!a.flags.noSideEffects || !b.flags.noSideEffects))) return false
-        // daslang AST nodes are not shared — each Expression has exactly one parent, so
-        // pointer-equality between sibling operands (left vs right) is effectively never
-        // true. Structural compare via describe() is the only correct option here.
+        // daslang AST nodes are not shared — each Expression has exactly one parent, so pointer-equality between sibling operands (left vs right) is effectively never true. Structural compare via describe() is the only correct option here.
         return describe(a) == describe(b)
     }
 
@@ -366,8 +441,7 @@ class LintVisitor : AstVisitor {
             op == "&"  || op == "|"  || op == "^" ||
             op == "-=" || op == "/=" || op == "%="
         )
-        // identical constants are macro-splice residue (`$v(n) > 1` with n == 1),
-        // const-fold food rather than a copy-paste typo
+        // identical constants are macro-splice residue (`$v(n) > 1` with n == 1), const-fold food rather than a copy-paste typo
         if (op_same_suspicious && expr_equal(expr.left, expr.right, false)
                 && !(expr.left.__rtti |> starts_with("ExprConst"))) {
             lint_error("LINT007: left and right operands of '{op}' are the same", expr.at)
@@ -411,11 +485,8 @@ class LintVisitor : AstVisitor {
     }
 
     def override preVisitExprLetVariable(_let : ExprLet?; v : VariablePtr; _last : bool) : void {
-        // Skip reference bindings (`var r & = x`) and inscope smart_ptr vars —
-        // these have aliasing or scope-exit semantics we don't reason about.
-        // Skip constant-folded vars (their reads were inlined to use sites,
-        // so no ExprVar reference remains for us to observe) and vars whose
-        // whole-variable unusedness is already LINT002's territory.
+        check_string_clone_init(v)
+        // Skip reference bindings (`var r & = x`) and inscope smart_ptr vars — these have aliasing or scope-exit semantics we don't reason about.
         if (noLint || genericDepth > 0
             || (v._type != null && v._type.flags.ref)
             || v.flags.inScope
@@ -432,21 +503,21 @@ class LintVisitor : AstVisitor {
         ))
     }
 
+    def override preVisitGlobalLetVariable(v : VariablePtr; _last : bool) : void {
+        check_string_clone_init(v)
+    }
+
     def override preVisitExprVar(expr : ExprVar?) : void {
         if (noLint || genericDepth > 0) return
         let i = ds_find(expr.variable)
         if (i < 0 || ds_entries[i].skip) return
         let vf = expr.varFlags
-        // Any reference inside a branch/loop/lambda body, OR a write under an
-        // aliasing context (addr-of, ref-bind, mutable-ref-arg, compound op),
-        // means we can't reason about this var — bail.
+        // Any reference inside a branch/loop/lambda body, OR a write under an aliasing context (addr-of, ref-bind, mutable-ref-arg, compound op), means we can't reason about this var — bail.
         if (branch_depth > 0 || (vf.write && !vf.under_clone)) {
             ds_entries[i].skip = true
             return
         }
-        // Pure store — handled in postVisit for ExprCopy/Clone/Move so the
-        // RHS reads have been observed first. preVisit of the LHS fires
-        // BEFORE the RHS is walked, so we do nothing here.
+        // Pure store — handled in postVisit for ExprCopy/Clone/Move so the RHS reads have been observed first. preVisit of the LHS fires BEFORE the RHS is walked, so we do nothing here.
         if (vf.write) return
         // Read — kills any pending dead store on this var.
         ds_entries[i].has_pending = false
@@ -467,6 +538,7 @@ class LintVisitor : AstVisitor {
     }
 
     def override visitExprCopy(var expr : ExprCopy?) : ExpressionPtr {
+        check_string_clone_assign(expr)
         ds_handle_store(expr.left, expr.right, expr)
         return <- expr
     }
@@ -503,11 +575,6 @@ class LintVisitor : AstVisitor {
         return <- expr
     }
     // NOTE on lambda capture: by-copy/clone captures (the daslang default) read
-    // the local at capture time and place a copy into the lambda's struct
-    // frame — subsequent writes to the local don't reach the lambda. So the
-    // capture site is just a read for our purposes (clears pending), and
-    // later writes that aren't read again ARE dead. By-ref captures and
-    // addr-of are caught by the `write && !under_clone` check above.
 
     // --- LINT011: int-literal-to-float precision loss ---
     def override visitExprConstFloat(var expr : ExprConstFloat?) : ExpressionPtr {
@@ -534,7 +601,9 @@ def public paranoid(prog : ProgramPtr; compile_time_errors : bool; disabled_code
     //! Filter-aware compile-time variant. ``disabled_codes`` suppresses
     //! the listed rule IDs (e.g. "LINT003") alongside the usual
     //! ``// nolint:CODE`` directives.
-    var astVisitor = new LintVisitor(compile_time_errors = compile_time_errors)
+    var astVisitor = new LintVisitor(
+        compile_time_errors = compile_time_errors,
+        multiple_contexts = prog._options |> find_arg("multiple_contexts") ?as tBool ?? prog.policies.multiple_contexts)
     astVisitor.disabled_codes := disabled_codes
     make_visitor(*astVisitor) $(adapter) {
         astVisitor.astVisitorAdapter = adapter
@@ -556,7 +625,10 @@ def public paranoid_collect(prog : ProgramPtr; var errors : array<string>;
                             disabled_codes, enabled_codes : table<string>) : int {
     //! Filter-aware overload. `disabled_codes` is a denylist; `enabled_codes`
     //! is a whitelist (empty == all). Codes use the bare form (e.g. "LINT002").
-    var astVisitor = new LintVisitor(compile_time_errors = false, collect_errors = true)
+    var astVisitor = new LintVisitor(
+        compile_time_errors = false,
+        collect_errors = true,
+        multiple_contexts = prog._options |> find_arg("multiple_contexts") ?as tBool ?? prog.policies.multiple_contexts)
     astVisitor.disabled_codes := disabled_codes
     astVisitor.enabled_codes := enabled_codes
     make_visitor(*astVisitor) $(adapter) {
@@ -575,7 +647,10 @@ def public paranoid_collect_issues(prog : ProgramPtr; var issues : array<LintIss
                                    disabled_codes, enabled_codes : table<string>) : int {
     //! Structured twin of ``paranoid_collect`` — same filters, but emits
     //! ``LintIssue`` records (rule code + position) instead of display strings.
-    var astVisitor = new LintVisitor(compile_time_errors = false, collect_errors = true)
+    var astVisitor = new LintVisitor(
+        compile_time_errors = false,
+        collect_errors = true,
+        multiple_contexts = prog._options |> find_arg("multiple_contexts") ?as tBool ?? prog.policies.multiple_contexts)
     astVisitor.disabled_codes := disabled_codes
     astVisitor.enabled_codes := enabled_codes
     make_visitor(*astVisitor) $(adapter) {

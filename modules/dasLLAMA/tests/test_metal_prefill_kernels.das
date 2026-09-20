@@ -121,6 +121,9 @@ def private attn_trio_gate(t : T?; dev, queue; head_size, n_heads, n_kv_heads, n
     // qrows = np32 (the score slab's row extent == the padded query count here)
     var bqoff = buf_u32(dev, 0u)
     var bqrows = buf_u32(dev, uint(np32))
+    // the wave-B gemma uniforms at their llama-shape values: no sliding window, no soft cap
+    var bwin0 = buf_u32(dev, 0u)
+    var bcap0 = buf_f32(dev, 0.0)
     let aran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
         metal_set_pipeline(enc, pso_sc)
         metal_set_threadgroup_memory_length(enc, mm ? metal_attn_qk_mm_msl_tgmem : metal_attn_qk_msl_tgmem, 0)
@@ -136,6 +139,7 @@ def private attn_trio_gate(t : T?; dev, queue; head_size, n_heads, n_kv_heads, n
         metal_set_buffer(enc, bscale, 0ul, 9)
         metal_set_buffer(enc, bqoff, 0ul, 10)
         metal_set_buffer(enc, bqrows, 0ul, 11)
+        metal_set_buffer(enc, bwin0, 0ul, 12)
         metal_dispatch_threadgroups(enc, uint3(uint(np32 / 32), uint(np32 / (mm ? 64 : 32)), uint(n_heads)), uint3(128u, 1u, 1u))
         metal_set_pipeline(enc, pso_sm)
         metal_set_threadgroup_memory_length(enc, metal_attn_softmax_msl_tgmem, 0)
@@ -143,6 +147,8 @@ def private attn_trio_gate(t : T?; dev, queue; head_size, n_heads, n_kv_heads, n
         metal_set_buffer(enc, bnp32, 0ul, 1)
         metal_set_buffer(enc, bqoff, 0ul, 2)
         metal_set_buffer(enc, bqrows, 0ul, 3)
+        metal_set_buffer(enc, bwin0, 0ul, 4)
+        metal_set_buffer(enc, bcap0, 0ul, 5)
         metal_dispatch_threadgroups(enc, uint3(uint(npos), uint(n_heads), 1u), uint3(128u, 1u, 1u))
         metal_set_pipeline(enc, pso_av)
         metal_set_threadgroup_memory_length(enc, mm ? metal_attn_av_mm_msl_tgmem : metal_attn_av_msl_tgmem, 0)
@@ -177,6 +183,8 @@ def private attn_trio_gate(t : T?; dev, queue; head_size, n_heads, n_kv_heads, n
     metal_release(bscale)
     metal_release(bqoff)
     metal_release(bqrows)
+    metal_release(bwin0)
+    metal_release(bcap0)
     metal_release(pso_sc)
     metal_release(pso_sm)
     metal_release(pso_av)
@@ -335,7 +343,8 @@ def test_metal_prefill_kernels(t : T?) {
                 var brn = buf_u32(dev, uint(QD))
                 var brhs = buf_u32(dev, uint(HEAD_SIZE))
                 var brnp = buf_u32(dev, uint(NPOS * QD / 2))
-                var ropebufs <- [brv, brc, brs, brn, brhs, brnp]
+                var brnx = buf_u32(dev, 0u)
+                var ropebufs <- [brv, brc, brs, brn, brhs, brnp, brnx]
                 let roperan = run_compute_1d(queue, pso_rope, ropebufs, uint(NPOS * QD / 2), 64u, err)
                 t |> success(roperan, "rope dispatch: {err}")
                 t |> equal(buf_mismatch_approx(brv, rvwant), 0)
@@ -344,6 +353,31 @@ def test_metal_prefill_kernels(t : T?) {
                     delete ropebufs
                 }
                 metal_release(brv)
+                metal_release(brnx)
+
+                // ===== the same kernel, NEOX pairing (j, j+half) — vs rope_scaled_neox_tab =====
+                for (k in range(NPOS * QD)) {
+                    rv[k] = 0.13 * float(k % 37) - 1.9
+                    rvwant[k] = rv[k]
+                }
+                unsafe {
+                    for (p in range(NPOS)) {
+                        rope_scaled_neox_tab(addr(rvwant[p * QD]), int64(HEAD_SIZE), int64(QD),
+                            addr<float const?>(rcos[p * half]), addr<float const?>(rsin[p * half]))
+                    }
+                }
+                var brv2 = buf_upload(dev, rv)
+                var brnx1 = buf_u32(dev, 1u)
+                var ropebufs2 <- [brv2, brc, brs, brn, brhs, brnp, brnx1]
+                let roperan2 = run_compute_1d(queue, pso_rope, ropebufs2, uint(NPOS * QD / 2), 64u, err)
+                t |> success(roperan2, "rope NEOX dispatch: {err}")
+                t |> equal(buf_mismatch_approx(brv2, rvwant), 0)
+                ropebufs2 |> clear()
+                unsafe {
+                    delete ropebufs2
+                }
+                metal_release(brv2)
+                metal_release(brnx1)
                 metal_release(brc)
                 metal_release(brs)
                 metal_release(brn)
@@ -400,7 +434,8 @@ def test_metal_prefill_kernels(t : T?) {
                 for (k in range(total)) {
                     add_want[k] = sg_gpu[k] + su[k]
                 }
-                var addbufs <- [bsg, bsu, btot]
+                var bone_add = buf_f32(dev, 1.0)   // the wave-B ascale slot at its identity (exact: *1.0)
+                var addbufs <- [bsg, bsu, btot, bone_add]
                 let addran = run_compute_1d(queue, pso_add, addbufs, uint(total), 64u, err)
                 t |> success(addran, "add dispatch: {err}")
                 t |> equal(buf_mismatch_exact(bsg, add_want), 0)
@@ -408,9 +443,24 @@ def test_metal_prefill_kernels(t : T?) {
                 unsafe {
                     delete addbufs
                 }
+                // flat copy (the gemma4 V-from-K panel copy): y = x, bit-exact
+                var pso_cp = pipeline_from_source(dev, metal_pf_copy_msl, metal_pf_copy_msl_entry, metal_pf_copy_msl_fastmath, err)
+                t |> success(pso_cp != null, "pf_copy pipeline: {err}")
+                var bcp = buf_upload(dev, su)   // pre-filled — fully overwritten by the copy
+                var cpbufs <- [bcp, bsg, btot]
+                let cpran = run_compute_1d(queue, pso_cp, cpbufs, uint(total), 64u, err)
+                t |> success(cpran, "pf_copy dispatch: {err}")
+                t |> equal(buf_mismatch_exact(bcp, add_want), 0)
+                cpbufs |> clear()
+                unsafe {
+                    delete cpbufs
+                }
+                metal_release(bcp)
+                metal_release(pso_cp)
                 metal_release(bsg)
                 metal_release(bsu)
                 metal_release(btot)
+                metal_release(bone_add)
                 metal_release(pso_sw)
                 metal_release(pso_add)
 

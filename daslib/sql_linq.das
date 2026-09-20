@@ -58,10 +58,7 @@ def _first(arr : array<auto(TT)>) : TT -const -& {
 }
 
 def _aggregate_rows(rows : array<auto(TT)>; aggregate_block : block<(rows : array<TT>) : auto(RR)>) {
-    //! Compute several global aggregates from one source. In ordinary in-memory
-    //! chains the block runs over ``rows`` directly. Inside ``_sql(...)`` the
-    //! terminal lowers a named tuple of ``count`` / ``long_count`` / ``sum`` /
-    //! ``average`` / ``min`` / ``max`` expressions into one SQL SELECT row.
+    //! Compute several global aggregates from one source. In ordinary in-memory chains the block runs over ``rows`` directly. Inside ``_sql(...)`` the terminal lowers a named tuple of ``count`` / ``long_count`` / ``sum`` / ``average`` / ``min`` / ``max`` expressions into one SQL SELECT row.
     static_if (typeinfo can_copy(default<RR -const -#>)) {
         return invoke(aggregate_block, rows)
     } else {
@@ -663,10 +660,10 @@ def private finalize_distinct_by_count_wrap(var q : SqlQuery&; isLong : bool; pr
         q.hadError = true
         return
     }
-    q.innerSql := build_distinct_by_inner_subquery(q, pkField, false)
+    q.innerSql = build_distinct_by_inner_subquery(q, pkField, false)
     q.fromRowType = q.rootType
-    q.whereSql := predSql
-    q.aggregateExpr := "COUNT(*)"
+    q.whereSql = predSql
+    q.aggregateExpr = "COUNT(*)"
     let countBaseType = isLong ? Type.tInt64 : Type.tInt
     q.aggregateType = new TypeDecl(at = at, baseType = countBaseType)
     q.proj = ProjectionShape.Aggregate
@@ -683,9 +680,9 @@ def private finalize_distinct_by_aggregate_wrap(var q : SqlQuery&; sqlOp : strin
         q.hadError = true
         return
     }
-    q.innerSql := build_distinct_by_inner_subquery(q, pkField, false)
+    q.innerSql = build_distinct_by_inner_subquery(q, pkField, false)
     q.fromRowType = q.rootType
-    q.aggregateExpr := "{sqlOp}(\"{sqlCol}\")"
+    q.aggregateExpr = "{sqlOp}(\"{sqlCol}\")"
     q.aggregateType = aggregateType
     q.proj = ProjectionShape.Aggregate
     q.matr = Materializer.One
@@ -700,7 +697,7 @@ def private finalize_distinct_by_passthrough_wrap(var q : SqlQuery&; prog : Prog
         q.hadError = true
         return
     }
-    q.innerSql := build_distinct_by_inner_subquery(q, pkField, q.distinctByLast)
+    q.innerSql = build_distinct_by_inner_subquery(q, pkField, q.distinctByLast)
     q.fromRowType = q.rootType
 }
 
@@ -960,7 +957,7 @@ def private snapshot_q_to_subquery_wrap(var q : SqlQuery&; prog : ProgramPtr; at
     let savedSeenTerminal = q.seenTerminal
     let savedSeenToArray = q.seenToArray
     // Aggregate state save: inner subquery emits projection cols, outer renders COUNT/SUM.
-    let savedAggExpr := q.aggregateExpr
+    let savedAggExpr = q.aggregateExpr
     var savedAggType = q.aggregateType
     // Clear them on q so the inner SQL emits without outer-only clauses.
     q.matr = Materializer.Array
@@ -975,7 +972,7 @@ def private snapshot_q_to_subquery_wrap(var q : SqlQuery&; prog : ProgramPtr; at
     q.seenDistinct = false
     q.seenTerminal = false
     q.seenToArray = false
-    q.aggregateExpr := ""
+    q.aggregateExpr = ""
     q.aggregateType = null
     if (savedAggExpr != "") {
         if (keepLimitInner) {
@@ -1003,29 +1000,29 @@ def private snapshot_q_to_subquery_wrap(var q : SqlQuery&; prog : ProgramPtr; at
     // Reset q to wrap state. Clear all join/where/projection state so outer can re-fill.
     q.rootType = null
     q.projectedRowType = null
-    q.tableName := ""
-    q.rootAlias := ""
+    q.tableName = ""
+    q.rootAlias = ""
     q.selectCols |> clear
     q.selectColAliases |> clear
     q.selectColTypes |> clear
     q.selectColSqlFragments |> clear
     q.projRecordNames |> clear
-    q.aggregateExpr := ""
+    q.aggregateExpr = ""
     q.aggregateType = null
-    q.whereSql := ""
+    q.whereSql = ""
     q.bindExprs |> clear
     q.projBindExprs |> clear
     q.limitBindExpr = null
     q.offsetBindExpr = null
     q.distinctFlag = false
-    q.distinctByCol := ""
+    q.distinctByCol = ""
     q.distinctByLast = false
     q.orderByCols |> clear
     q.orderByInlineExprs |> clear
     q.groupByCols |> clear
     q.groupByKeyExprs |> clear
     q.groupByKeyTypes |> clear
-    q.havingSql := ""
+    q.havingSql = ""
     q.havingBindExprs |> clear
     q.groupedSelectExprs |> clear
     q.groupedSelectTypes |> clear
@@ -1044,7 +1041,7 @@ def private snapshot_q_to_subquery_wrap(var q : SqlQuery&; prog : ProgramPtr; at
     q.seenJoin = false
     q.joins |> clear
     q.setOpKind = SetOpKind.None
-    q.setOpRhsSql := ""
+    q.setOpRhsSql = ""
     q.setOpRhsBinds |> clear
     q.seenSetOp = false
     q.argNames |> clear
@@ -1052,7 +1049,7 @@ def private snapshot_q_to_subquery_wrap(var q : SqlQuery&; prog : ProgramPtr; at
     q.upsertMode = false
     q.minPhaseSeen = INT_MAX_PHASE
     // Install wrap state.
-    q.innerSql := innerSql
+    q.innerSql = innerSql
     q.innerBindExprs <- innerBinds
     q.fromRowType = projType
     q.dbExpr = savedDb
@@ -1074,7 +1071,7 @@ def private snapshot_q_to_subquery_wrap(var q : SqlQuery&; prog : ProgramPtr; at
     q.seenDistinct = savedSeenDistinct
     q.seenTerminal = savedSeenTerminal
     q.seenToArray = savedSeenToArray
-    q.aggregateExpr := savedAggExpr
+    q.aggregateExpr = savedAggExpr
     q.aggregateType = savedAggType
     if (savedAggExpr != "") {
         // Override FullRow installed by reset; aggregate outer ignores fillPassthrough.
@@ -1235,12 +1232,12 @@ def private process_join_call(var jCall : ExprCall?; var q : SqlQuery&;
         // SELECT * propagates underlying column names; outer references t1.<col> by name.
         // Inner AS "t1" is required because subQ.whereSql may carry refs like `"t1"."Total"`
         // built when subQ.rootAlias was "t1". Outer-most "t1" shadows inner via parens-scope.
-        rhsTableName := "(SELECT * FROM \"{subQ.tableName}\" AS \"t1\" WHERE {subQ.whereSql})"
-        rhsRightWhereSql := ""
+        rhsTableName = "(SELECT * FROM \"{subQ.tableName}\" AS \"t1\" WHERE {subQ.whereSql})"
+        rhsRightWhereSql = ""
         rhsTableSqlIsRaw = true
     } else {
-        rhsTableName := subQ.tableName
-        rhsRightWhereSql := subQ.whereSql
+        rhsTableName = subQ.tableName
+        rhsRightWhereSql = subQ.whereSql
     }
     var spec <- JoinSpec(
         kind = kind,
@@ -1283,7 +1280,7 @@ def private process_join_call(var jCall : ExprCall?; var q : SqlQuery&;
     // nolint:STYLE015 — save/restore explanation: analyze_projection clobbers proj=Aggregate
     // set by outer-peeled `_count`/`_sum`/etc. We still need it to populate selectCols for
     // the inner subquery, so run normally then restore. Invariant: aggregateExpr non-empty ⇒ proj=Aggregate.
-    let savedAggExpr := q.aggregateExpr
+    let savedAggExpr = q.aggregateExpr
     var savedAggType = q.aggregateType
     let savedAggProj = q.proj == ProjectionShape.Aggregate
     let projOk = analyze_projection(iret.subexpr, q, prog, at)
@@ -1291,7 +1288,7 @@ def private process_join_call(var jCall : ExprCall?; var q : SqlQuery&;
     q.argSourceIdx |> clear
     if (!projOk) return false
     if (savedAggExpr != "") {
-        q.aggregateExpr := savedAggExpr
+        q.aggregateExpr = savedAggExpr
         q.aggregateType = savedAggType
         if (savedAggProj) {
             q.proj = ProjectionShape.Aggregate
@@ -1396,9 +1393,9 @@ def private process_cross_join_call(var jCall : ExprCall?; var q : SqlQuery&;
     // Hoist any RHS WHERE into the outer q.whereSql — Cross has no ON clause to attach it to.
     if (!empty(subQ.whereSql)) {
         if (empty(q.whereSql)) {
-            q.whereSql := subQ.whereSql
+            q.whereSql = subQ.whereSql
         } else {
-            q.whereSql := "({q.whereSql}) AND ({subQ.whereSql})"
+            q.whereSql = "({q.whereSql}) AND ({subQ.whereSql})"
         }
         q.bindExprs |> reserve(q.bindExprs |> length + length(subQ.bindExprs))
         for (b in subQ.bindExprs) {
@@ -1425,7 +1422,7 @@ def private process_cross_join_call(var jCall : ExprCall?; var q : SqlQuery&;
     q.argSourceIdx |> push(0)
     q.argNames |> push(arg1Name)
     q.argSourceIdx |> push(1)
-    let savedAggExpr := q.aggregateExpr
+    let savedAggExpr = q.aggregateExpr
     var savedAggType = q.aggregateType
     let savedAggProj = q.proj == ProjectionShape.Aggregate
     let projOk = analyze_projection(iret.subexpr, q, prog, at)
@@ -1433,7 +1430,7 @@ def private process_cross_join_call(var jCall : ExprCall?; var q : SqlQuery&;
     q.argSourceIdx |> clear
     if (!projOk) return false
     if (savedAggExpr != "") {
-        q.aggregateExpr := savedAggExpr
+        q.aggregateExpr = savedAggExpr
         q.aggregateType = savedAggType
         if (savedAggProj) {
             q.proj = ProjectionShape.Aggregate
@@ -1588,11 +1585,11 @@ def private divert_to_inner(var node : ExpressionPtr; var q : SqlQuery&;
     let innerSql = build_sql_string(subQ, true)
     var innerBinds : array<ExpressionPtr>
     collect_query_binds(subQ, innerBinds)
-    q.innerSql := innerSql
+    q.innerSql = innerSql
     q.innerBindExprs <- innerBinds
     q.fromRowType = inner_projection_type(subQ, at)
     if (empty(q.tableName)) {
-        q.tableName := subQ.tableName
+        q.tableName = subQ.tableName
     }
     if (q.dbExpr == null) {
         q.dbExpr = subQ.dbExpr
@@ -1600,8 +1597,6 @@ def private divert_to_inner(var node : ExpressionPtr; var q : SqlQuery&;
     }
     if (subQ.proj == ProjectionShape.FullRow) {
         // FullRow inner: outer treats the wrapped subquery as its exact projected struct.
-        // Usually this is the original table type; a whole-source join projection may instead
-        // return one joined source (`$(l, r) => r`).
         if (q.rootType == null) {
             q.rootType = q.fromRowType
         }
@@ -1702,8 +1697,7 @@ def private analyze_chain(var node : ExpressionPtr; var q : SqlQuery&; prog : Pr
             return analyze_chain(foCall.arguments[0], q, prog, at)
         }
     }
-    // Peel `_aggregate(prev, block)` — one named row containing several
-    // global aggregates, all evaluated by one SQL source scan.
+    // Peel `_aggregate(prev, block)` — one named row containing several global aggregates, all evaluated by one SQL source scan.
     {
         var gaCall = match_call_in_module(node, "_aggregate_rows", "sql_linq")
         if (gaCall != null) {
@@ -1715,8 +1709,7 @@ def private analyze_chain(var node : ExpressionPtr; var q : SqlQuery&; prog : Pr
                 macro_error(prog, at, "_sql: `_aggregate` expects `(source, aggregate_block)`")
                 return false
             }
-            // Pre-set terminal state so a join source does not mistake this
-            // outer terminal for a terminal embedded in its own LHS/RHS.
+            // Pre-set terminal state so a join source does not mistake this outer terminal for a terminal embedded in its own LHS/RHS.
             q.matr = Materializer.One
             q.seenTerminal = true
             if (!analyze_chain(gaCall.arguments[0], q, prog, at)) return false
@@ -2371,9 +2364,7 @@ def private analyze_projection_impl(var body : ExpressionPtr; var q : SqlQuery&;
         }
     }
     q.projectedRowType = null
-    // A join's bare source variable projects that exact source struct. Expand it to the
-    // source's qualified columns and reconstruct the nominal struct in build_row_builder.
-    // Single-source identity and scalar identity remain unsupported.
+    // A join's bare source variable projects that exact source struct. Expand it to the source's qualified columns and reconstruct the nominal struct in build_row_builder.
     if (body is ExprVar) {
         let argName = string((body as ExprVar).name)
         if (!q.seenJoin) {
@@ -4146,9 +4137,9 @@ def private next_placeholder(sql : string) : tuple<int; uint8> {
         var i = 0
         var in_quote = false
         while (i < n) {
-            let ch = bytes[i]
-            if (ch == uint8('\'')) {
-                if (in_quote && i + 1 < n && bytes[i + 1] == uint8('\'')) {
+            let ch = int(bytes[i])
+            if (ch == '\'') {
+                if (in_quote && i + 1 < n && int(bytes[i + 1]) == '\'') {
                     i += 2
                     continue
                 }
@@ -4156,9 +4147,9 @@ def private next_placeholder(sql : string) : tuple<int; uint8> {
                 i++
                 continue
             }
-            if (!in_quote && (ch == uint8('?') || ch == uint8(0x01))) {
+            if (!in_quote && (ch == '?' || ch == 0x01)) {
                 found_pos = i
-                found_ch = ch
+                found_ch = uint8(ch)
                 return
             }
             i++
@@ -4584,8 +4575,7 @@ class private SqlCreateViewMacro : AstCallMacro {
         if (!empty(pending)) {
             sb.elements |> push <| new ExprConstString(at = call.at, value := pending)
         }
-        // Pipe-rewrite turns `db |> _create_view(...)` into `_create_view(db, ...)` —
-        // arg 0 is exactly what the user wrote.
+        // Pipe-rewrite turns `db |> _create_view(...)` into `_create_view(db, ...)` — arg 0 is exactly what the user wrote.
         var res = qmacro(_::exec($e(call.arguments[0]), $e(sb)))
         res.force_at(call.at)
         return res
@@ -5731,8 +5721,7 @@ def private emit_upsert_body(prog : ProgramPtr; var call : ExprCallMacro?;
     var setSqlClauses : array<string>
     var setBindExprs : array<ExpressionPtr>
     if (!analyze_upsert_set_clause(doUpdateE, rootT, tableName, provIdx, setSqlClauses, setBindExprs, prog, call.at)) return null
-    // 3) Build both INSERT spellings. An unset integer primary key must be
-    // omitted so each provider's auto-assignment mechanism can run.
+    // 3) Build both INSERT spellings. An unset integer primary key must be omitted so each provider's auto-assignment mechanism can run.
     var nWithoutPk = 0
     let sqlWithoutPk = build_upsert_sql(rootT, tableName, conflictCols, setSqlClauses,
         false, isReturning, nWithoutPk)
