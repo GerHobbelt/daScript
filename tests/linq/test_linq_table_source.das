@@ -210,8 +210,9 @@ def private bump_key(var c : int&) : int {
     return 2
 }
 
-// Point-lookup folds: `where(kv.key == X)` + terminator → O(1) key probe (key_exists / `tab?[X]`).
-// Probes must agree with the scan on hit AND miss; non-probe shapes must keep riding the scan.
+// Point-lookup folds: `where(kv.key == X [&& residual])` + terminator → O(1) key probe (key_exists /
+// `tab?[X]`), residual conjuncts evaluated on the probed element only. Probes must agree with the scan
+// on hit AND miss; non-probe shapes (key-eq not the leftmost conjunct) must keep riding the scan.
 
 [test]
 def test_table_point_lookup(t : T?) {
@@ -251,7 +252,46 @@ def test_table_point_lookup(t : T?) {
         t |> equal(_fold(keys(s).contains("z")), false)
         delete s
     }
-    t |> run("first probe panics on a missing key, like the scan") @(t : T?) {
+    t |> run("residual conjuncts route to the probed element only") @(t : T?) {
+        var tab <- make_int_table(10)
+        let h = _fold(each_kv(tab)._where(_.key == 5 && _.value > 0).first_or_default(default<IKV>))
+        t |> equal(h.key, 5)
+        t |> equal(h.value, 50)
+        let rf = _fold(each_kv(tab)._where(_.key == 5 && _.value > 500).first_or_default(default<IKV>))
+        t |> equal(rf.key, 0, "residual-false on a hit routes to the miss path")
+        let ms = _fold(each_kv(tab)._where(_.key == 99 && _.value > 0).first_or_default(default<IKV>))
+        t |> equal(ms.key, 0)
+        t |> equal(_fold(each_kv(tab)._any(_.key == 3 && _.value == 30)), true)
+        t |> equal(_fold(each_kv(tab)._any(_.key == 3 && _.value == 31)), false)
+        t |> equal(_fold(each_kv(tab)._count(_.key == 3 && _.value == 30)), 1)
+        t |> equal(_fold(each_kv(tab)._count(_.key == 3 && _.value == 31)), 0)
+        // three conjuncts AND-rebuild in order; trailing select projects the probed element
+        t |> equal(_fold(each_kv(tab)._where(_.key == 6 && _.value > 0 && _.value < 100)._select(_.value).first_or_default(-1)), 60)
+        // `key == 2 && key == 3` probes 2, then the residual re-check fails — agrees with the scan
+        t |> equal(_fold(each_kv(tab)._where(_.key == 2 && _.key == 3).count()), 0)
+        delete tab
+    }
+    t |> run("consecutive wheres AND-merge before conjunct extraction") @(t : T?) {
+        var tab <- make_int_table(10)
+        t |> equal(_fold(each_kv(tab)._where(_.key == 5)._where(_.value > 0).any()), true)
+        t |> equal(_fold(each_kv(tab)._where(_.key == 5)._where(_.value > 500).any()), false)
+        t |> equal(_fold(each_kv(tab)._where(_.key == 4)._where(_.value > 0)._select(_.value).first()), 40)
+        delete tab
+    }
+    t |> run("keys lane residual") @(t : T?) {
+        var tab <- make_int_table(10)
+        t |> equal(_fold(keys(tab)._where(_ == 8 && _ % 2 == 0).first_or_default(-1)), 8)
+        t |> equal(_fold(keys(tab)._where(_ == 7 && _ % 2 == 0).first_or_default(-1)), -1)
+        delete tab
+    }
+    t |> run("residual evaluates once, like the scan (keys are unique)") @(t : T?) {
+        var tab <- make_int_table(4)
+        var evals = 0
+        t |> equal(_fold(each_kv(tab)._where(_.key == 2 && bump_key(evals) > 0).count()), 1)
+        t |> equal(evals, 1, "residual must run once, on the probed element")
+        delete tab
+    }
+    t |> run("first probe panics on a missing key or a failed residual, like the scan") @(t : T?) {
         var tab <- make_int_table(4)
         var panicked = false
         try {
@@ -260,13 +300,20 @@ def test_table_point_lookup(t : T?) {
             panicked = true
         }
         t |> equal(panicked, true)
+        panicked = false
+        try {
+            let _r = _fold(each_kv(tab)._where(_.key == 2 && _.value > 999).first())
+        } recover {
+            panicked = true
+        }
+        t |> equal(panicked, true)
         delete tab
     }
     t |> run("non-probe shapes stay scans and stay correct") @(t : T?) {
         var tab <- make_int_table(10)
-        t |> equal(_fold(each_kv(tab)._where(_.key != 5).count()), 9)                      // wrong operator
-        t |> equal(_fold(each_kv(tab)._where(_.key == _.value / 10).count()), 10)          // X references the binder
-        t |> equal(_fold(each_kv(tab)._where(_.key == 5)._where(_.value > 0).any()), true) // collapses to a compound && predicate
+        t |> equal(_fold(each_kv(tab)._where(_.key != 5).count()), 9)                       // wrong operator
+        t |> equal(_fold(each_kv(tab)._where(_.key == _.value / 10).count()), 10)           // X references the binder
+        t |> equal(_fold(each_kv(tab)._where(_.value > 0)._where(_.key == 5).any()), true)  // key-eq not leftmost
         delete tab
     }
     t |> run("impure X stays a scan — per-element evaluation preserved") @(t : T?) {
@@ -617,5 +664,115 @@ def test_to_table_sink(t : T?) {
         t |> equal(got?[3] ?? -1, 30)
         delete got
         delete arr
+    }
+}
+
+[test]
+def test_table_group_by(t : T?) {
+    t |> run("kv lane: count + sum per group agrees with a hand loop") @(t : T?) {
+        var tab <- make_int_table(20)
+        let groups <- _fold(each_kv(tab)
+                            ._group_by(_.key % 3)
+                            ._select((K = _._0, N = _._1 |> count(), S = _._1 |> select($(kv : IKV) => kv.value) |> sum()))
+                            .to_array())
+        var expN : table<int; int>
+        var expS : table<int; int>
+        for (k, v in keys(tab), values(tab)) {
+            expN[k % 3] ++
+            expS[k % 3] += v
+        }
+        t |> equal(length(groups), length(expN))
+        for (g in groups) {
+            t |> equal(g.N, expN?[g.K] ?? -1)
+            t |> equal(g.S, expS?[g.K] ?? -1)
+        }
+        delete expN
+        delete expS
+        delete tab
+    }
+    t |> run("values lane: group key + reducer over struct values") @(t : T?) {
+        var tab <- make_pt_table()
+        let groups <- _fold(values(tab)
+                            ._group_by(_.x % 2)
+                            ._select((K = _._0, MaxY = _._1 |> select($(p : Pt) => p.y) |> max()))
+                            .to_array())
+        t |> equal(length(groups), 2)
+        for (g in groups) {
+            t |> equal(g.MaxY, g.K == 0 ? 40 : 30)
+        }
+        delete tab
+    }
+    t |> run("keys lane: group over raw keys") @(t : T?) {
+        var tab <- make_int_table(10)
+        let groups <- _fold(keys(tab)._group_by(_ % 4)._select((K = _._0, N = _._1 |> length)).to_array())
+        t |> equal(length(groups), 4)
+        var total = 0
+        for (g in groups) {
+            total += g.N
+        }
+        t |> equal(total, 10)
+        delete tab
+    }
+    t |> run("upstream where + select segments feed the bucket fill") @(t : T?) {
+        var tab <- make_int_table(20)
+        let groups <- _fold(each_kv(tab)
+                            ._where(_.key % 2 == 0)
+                            ._select(_.value)
+                            ._group_by(_ % 40)
+                            ._select((K = _._0, N = _._1 |> length))
+                            .to_array())
+        // even keys 0..18 -> values 0,20,..,180; % 40 buckets {0, 20}, 5 each
+        t |> equal(length(groups), 2)
+        for (g in groups) {
+            t |> equal(g.N, 5)
+        }
+        delete tab
+    }
+    t |> run("having + trailing where + order") @(t : T?) {
+        var tab <- make_int_table(12)
+        let groups <- _fold(each_kv(tab)
+                            ._group_by(_.key % 5)
+                            ._having(_._1 |> length >= 2)
+                            ._select((K = _._0, S = _._1 |> select($(kv : IKV) => kv.value) |> sum()))
+                            ._where(_.S > 60)
+                            ._order_by(_.S)
+                            .to_array())
+        // buckets 0..4 sizes 3,3,2,2,2; sums 150,180,90,110,130 -> having keeps all, where keeps S>60
+        t |> equal(length(groups), 5)
+        var prev = -1
+        for (g in groups) {
+            t |> success(g.S > 60 && g.S >= prev)
+            prev = g.S
+        }
+        delete tab
+    }
+    t |> run("count terminator counts groups") @(t : T?) {
+        var tab <- make_int_table(10)
+        t |> equal(_fold(each_kv(tab)._group_by(_.key % 3)._select((K = _._0, N = _._1 |> length)).count()), 3)
+        delete tab
+    }
+    t |> run("empty table yields no groups") @(t : T?) {
+        let e : table<int; int>
+        let groups <- _fold(each_kv(e)._group_by(_.key)._select((K = _._0, N = _._1 |> length)).to_array())
+        t |> equal(length(groups), 0)
+    }
+    t |> run("fused agrees with the tier-2 iterator path") @(t : T?) {
+        var tab <- make_int_table(15)
+        let fused <- _fold(each_kv(tab)
+                           ._group_by(_.key % 4)
+                           ._select((K = _._0, N = _._1 |> count()))
+                           .to_array())
+        var tier2 <- unsafe(each_kv(tab)) |> _group_by(_.key % 4) |> _select((K = _._0, N = _._1 |> length)) |> to_array()
+        t |> equal(length(fused), length(tier2))
+        var t2 : table<int; int>
+        for (g in tier2) {
+            t2[g.K] = g.N
+        }
+        for (g in fused) {
+            t |> equal(g.N, t2?[g.K] ?? -1)
+        }
+        delete t2
+        delete tier2
+        delete tab
     }
 }

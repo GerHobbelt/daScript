@@ -6,8 +6,15 @@ was an **oracle mismatch** — a gate CI enforces that no local step mirrored �
 not a wrong change. This file maps every PR-triggered lane to its exact local
 mirror, or says honestly that there isn't one.
 
-A `utils/preflight` tool automating the common tiers is planned
-(`COVERAGE_GAP.md` Stage 2); until it lands, these are the manual commands.
+**`utils/preflight` automates these gates.** `daslang utils/preflight/main.das`
+runs the fast tier (format + lint + clang frontend pass on changed C++ —
+escalating to a full src+tests-cpp sweep when a header changed; seconds);
+`-- --full` adds dasgen freshness, the CI-only-das compile sweep, the six doc
+gates, ctest, the interp/JIT/AOT suites, and the sequence smoke. `--list-gates`
+shows the menu; `--only <names>` / `--skip <names>` select subsets. Gates whose
+host tool or module is missing report `SKIP` with an install/rebuild hint. The
+tables below remain the reference for what each gate mirrors and for running
+any step by hand.
 
 **Conventions.** `<daslang>` = your compiler binary: `bin/Release/daslang.exe`
 (Windows MSVC multi-config), `bin/daslang` (Ninja single-config — what CI's
@@ -24,7 +31,7 @@ the CI ref, never a working-tree copy.
 | `extended_checks.yml` | every PR | linux + darwin15-arm64 + windows, ALL release modules ON |
 | `wasm_build.yml` | every PR | emscripten build of `web/` on 3 OSes + `wasm_cross` |
 | `build_eastl.yml` | every PR | EASTL shadow-config build + no-fileio build (linux clang) |
-| `doc.yml` | only if `doc/**`, `daslib/**`, or `src/builtin/**` changed | six doc gates |
+| `doc.yml` | only if `doc/**`, `daslib/**`, or `src/builtin/**` changed | seven doc gates |
 | `playground-e2e.yml` | only if `site/**` / `web/examples/ui/**` changed | Playwright on the web playground |
 
 ## build.yml — the build matrix
@@ -38,7 +45,7 @@ Per-lane steps: build → JIT prewarm → JIT test sweep → interpreter sweep �
 | JIT sweep | `<daslang> dastest/dastest.das -jit -- --jit-opt-level=3 --color --failures-only --timeout 900 --test tests` | Windows-local `clang-cl` link failures are env noise — the catchable class is LLVM verifier errors; full end-to-end JIT needs WSL/mac. See `skills/make_pr.md` §2.5 for the 2-test smoke version |
 | Small C++ tests | `ctest --test-dir build --build-config Release -L small --output-on-failure` | drop `--build-config` on single-config generators. **Run this after touching `tests-cpp/`** — and remember MSVC tolerates C++ that clang/gcc reject (the doctest bit-field incident); see `skills/writing_cpp_tests.md` |
 | AOT sweep | `cmake --build build --config Release --target test_aot`, then `bin/Release/test_aot.exe -use-aot dastest/dastest.das -- --use-aot --color --failures-only --timeout 900 --test tests` | Release lanes only in CI |
-| Debug lanes | same suite against a **Debug build** | Debug bypasses the fused interpreter permutations — a fix that lands only in the fused path passes Release everywhere and trips Debug; conversely fused-path bugs need Release. If you touched `src/simulate/simulate_fusion_*`, run both configs |
+| Debug lanes | `cmake --build build --config Debug --target daslang`, then the sweep against `bin/Debug/daslang.exe` — safe in-checkout: Debug coexists with Release by design (`bin/Debug/`, `_debug.shared_module` suffix) | Debug bypasses the fused interpreter permutations — a fix that lands only in the fused path passes Release everywhere and trips Debug; conversely fused-path bugs need Release. If you touched `src/simulate/simulate_fusion_*`, run both configs |
 | Sanitizer lanes (linux Release asan/tsan/ubsan) | WSL: `CC=clang CXX=clang++ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDAS_USE_SANITIZER=<asan\|tsan\|ubsan>`, then the JIT sweep on `tests/language` | not mirrorable on Windows/mac. CI applies LSan suppressions (`format_error`, `uriParseSingleUriA`, `uriMakeOwner`) — see the workflow's Test step |
 | linux_arm / darwin lanes | mac: same commands as linux. From Windows: not mirrorable | ARM-specific reds (LLVM SelectionDAG, alignment) are CI-only signals |
 
@@ -61,22 +68,36 @@ dasClangBind bindings, run the self-binder locally per `skills/clang_bind_build.
 
 ## build.yml — build_windows_clangcl
 
-Fully mirrorable on a Windows dev box, in a separate (gitignored) build dir:
+The preflight `cpp-syntax` gate mirrors this lane's frontend: a clang-cl `/Zs`
+pass (parse + semantic analysis + template instantiation — no codegen) on your
+changed C++, escalating to ALL ~160 src+tests-cpp TUs (~15-30 s) when any core
+header changed, since a header edit can break template instantiation in TUs
+the diff never touched. What it cannot catch — link-stage divergence and
+codegen-only issues — is rare, arrives batched in one CI log, and is cheap to
+fix post-CI.
+
+A full local mirror is possible but **destructive in the main checkout**: all
+build dirs of one source tree share `bin/`, `lib/`, and the
+`modules/<X>/*.shared_module` outputs (only Debug gets a `_debug` suffix), so
+CI's verbatim configure+build below overwrites your MSVC Release binaries and
+Release shared modules. Run it in a separate clone or worktree only:
 
 ```powershell
+# SEPARATE clone/worktree only — clobbers bin/Release + Release .shared_modules otherwise
 cmake -B build-clangcl -G "Visual Studio 17 2022" -A x64 -T ClangCL -DCMAKE_BUILD_TYPE=Release
 cmake --build build-clangcl --config Release --parallel
 ```
 
-The cheap tier — seconds, catches most MSVC-vs-clang diagnostics without a
-full build — is a syntax-only pass on just the files you changed:
+Manual single-file check (what the gate automates):
 
 ```powershell
-# from a VS dev prompt (clang-cl on PATH); add -I flags for daScript includes
-clang-cl /Zs /std:c++17 -Iinclude -I3rdparty/fmt-10.1.0/include <changed>.cpp
+# from a VS dev prompt (clang-cl on PATH)
+clang-cl /Zs /EHsc /std:c++17 -Iinclude -I3rdparty/fmt/include -I3rdparty/uriparser/include -Itests-cpp/3rdparty -Ibuild/include <changed>.cpp
 ```
 
-(mac/WSL equivalent: `clang -fsyntax-only -std=c++17 -Iinclude ... <changed>.cpp`.)
+(mac/WSL equivalent: `clang -fsyntax-only -std=c++17 ...`.) `-Ibuild/include`
+matters — the configure-generated `modules/external_*.inc` headers live there,
+and TUs like `src/simulate/fs_file_info.cpp` include them.
 
 ## extended_checks.yml
 
@@ -108,10 +129,10 @@ cmake -B build -DDAS_HV_DISABLED=OFF -DDAS_LLVM_DISABLED=OFF -DDAS_AUDIO_DISABLE
 | dasImgui install | `<daslang> utils/daspkg/main.das -- install dasImgui --branch master` | **the externals-coupling gate**: CI builds external dasImgui from ITS master against YOUR branch — an ABI break vs externals reds this on an unrelated-looking step. See `skills/abi_break_sweep.md` |
 | Coverage | `<daslang> dastest/dastest.das -- --cov-path coverage.lcov --color --test tests/language --timeout 1800` + `dascov` | rarely needed locally |
 
-## doc.yml — the six gates
+## doc.yml — the seven gates
 
 Only triggered when `doc/**`, `daslib/**`, or `src/builtin/**` changed — but
-`daslib/**` means **any daslib edit** runs all six. CI stops at the FIRST
+`daslib/**` means **any daslib edit** runs all seven. CI stops at the FIRST
 das2rst panic, so one CI round can hide N-1 further issues — loop gate 1
 locally until clean. Needs a daslang built with `DAS_HV_DISABLED=OFF` and
 `DAS_PUGIXML_DISABLED=OFF` (das2rst documents those modules). Step-by-step
@@ -125,8 +146,16 @@ workflow: `skills/make_pr.md` §4; conventions: `skills/documentation_rst.md`.
 | 4 | no untracked generated RST | `git ls-files --others --exclude-standard doc/source/stdlib/` → must be empty; `git add` the new files |
 | 5 | LaTeX sphinx, warnings-as-errors | `sphinx-build -W --keep-going -b latex -d doc/sphinx-build doc/source build/latex` |
 | 6 | HTML sphinx, warnings-as-errors | `sphinx-build -W --keep-going -b html -d doc/sphinx-build doc/source build/site` — delete `doc/sphinx-build` first; cached builds hide errors |
+| 7 | both PDFs compile (latexmk, mirrors CI's latex-action) | `latexmk -pdf -interaction=nonstopmode -halt-on-error -cd build/latex/daslangstdlib.tex` then `…/daslang.tex` |
 
-(The PDF compile after gate 6 is `continue_on_error` — not a gate.)
+Gate 7 is **stricter than CI on purpose**: CI marks the PDF compiles
+`continue_on_error`, so an undeclared unicode char (the U+2261 incident)
+ships broken release PDFs without ever going red. The fix is always one
+line — `\DeclareUnicodeCharacter{XXXX}{…}` in `doc/source/conf.py`
+`latex_elements['preamble']` (sphinx's bundled set covers most common chars;
+only stragglers need declaring). Tool discovery: preflight probes PATH, then
+`~/Library/Python/*/bin` + `~/.local/bin` for sphinx-build and
+`/Library/TeX/texbin` for latexmk (mac: `brew install --cask basictex`).
 
 ## wasm_build.yml
 

@@ -67,15 +67,86 @@ Process: per-stage plan → implement → review, same as FIXED_ARRAY_REWORK.md.
 - CI-only das surface list (dasOpenGL, sequence, release tooling …) compiled
   via `compile_check` with proper mounts.
 
-## Stage 3 — local build matrix
+## Stage 3 — local build matrix (downscoped by decision, 2026-06-11)
 
-- clang-cl CMake preset in a gitignored alt build dir, wired into
-  `preflight --full` (compile-focused; full builds affordable but rarely needed).
-- mingw preset: deferred unless a mingw-specific failure class appears.
-- Debug-config build target for the fused-path divergence family.
+No local clang-cl/mingw build dirs. The preset idea died on two facts:
+(a) the only recorded incident in this family (the doctest bit-field) is
+frontend-level — the Stage 2 syntax pass catches it; the residual classes
+(link divergence, codegen-only issues) are rare and arrive batched in one
+cheap-to-iterate CI log; (b) all build dirs of one source tree share `bin/`,
+`lib/`, and `modules/<X>/*.shared_module` outputs (only Debug gets a
+`_debug` suffix), so a local clang-cl Release build clobbers the primary
+MSVC artifacts — isolating it would need a root-CMakeLists output knob,
+upstream complexity for speculative benefit.
 
-## Stage 4 — CI
+What shipped instead (measured: full `/Zs` frontend sweep of all 157
+src+tests-cpp TUs = 5-7 s warm, ~30 s cold):
 
-- Nightly cron on daspkg-index building every index package against daslang
-  master — external ABI breakage surfaces as a nightly signal instead of
-  inside an unrelated PR's extended_checks.
+- `cpp-syntax` escalates to the full src+tests-cpp sweep whenever a core
+  header (`.h`/`.hpp`/`.inc`) changed — closes the header-ripple /
+  template-instantiation gap, the one real class a full clang build would
+  have added over the syntax pass.
+- `-I{build_dir}/include` added to the gate — latent false-FAIL for TUs
+  including configure-generated `modules/external_*.inc`
+  (e.g. `src/simulate/fs_file_info.cpp`).
+- skills/preflight.md: the verbatim clang-cl mirror is marked
+  separate-clone-only (the clobber); the Debug-config recipe for the
+  fused-path family is documented as safe in-checkout (`bin/Debug/`,
+  `_debug.shared_module` coexist with Release by design). Recipes, not
+  standing gates.
+
+## Stage 4 — CI (shipped 2026-06-12)
+
+`.github/workflows/nightly_daspkg_index.yml`: nightly cron (+ dispatch) in
+THIS repo — fat runners, in-tree `utils/daspkg`, signal lands where daslang
+devs look. Builds daslang master (extended_checks' linux recipe, sccache
+restore-only), then daspkg-installs every package in
+`borisbat/daspkg-index/packages.json` at its **default-branch HEAD**
+(resolved per repo via anonymous `git ls-remote --symref` — 5 of 9 use
+`main`, not `master`; release tags deliberately NOT used, they lag
+legitimately after an ABI sweep).
+The list is fetched at run time, so new packages need no workflow edit; the
+one future-edit case is a native package needing a system lib outside the
+extended_checks apt set — v2 answer is an optional `"apt"` field in
+packages.json. Other v2 follow-up: per-package smoke/require-probe metadata
+so the sweep loads what it installs, not just builds it.
+
+## Stage 2 follow-ups (found while building utils/preflight, 2026-06-11)
+
+- **`.das_package` examples need a CLEAN daspkg install to be testable.**
+  `examples/games/sequence` resolves requires against a gitignored local
+  install (`modules/das-cards`) that only the smoke script refreshes — a
+  stale copy produced phantom compile errors (missing `card_mesh_ttf_path`)
+  against a green master. Options, discussable: (a) preflight scans for
+  `.das_package`, daspkg-installs fresh, then compile-checks — makes a
+  verify tool mutate + hit the network; (b) keep install-then-test inside
+  each example's smoke script (status quo, sequence only); (c) a separate
+  CI job that fresh-installs and tests every `.das_package`-bearing example
+  — pairs naturally with the Stage 4 nightly index cron. Leaning (c) with
+  preflight staying read-only.
+- **JIT-to-exe BUNDLE exes fail to load locally while master CI is green.**
+  Two data points, same family: `exe_paths_module_resolve` ctest
+  (`uses_sqlite.exe`, 0xC0000135 DLL-not-found, bundle layout) and the
+  sequence smoke's bundled `sequence.exe --smoke` (0xC0000139
+  entrypoint-not-found, fresh daspkg install + release, all artifacts
+  shipped). Triage so far: a trivial `daslang -exe` probe links AND runs
+  clean with the Dyn DLLs colocated; clearing `.jitted_scripts` changes
+  nothing; and a fully fresh one-shot rebuild (runtime DLLs + all shipped
+  modules + exe relinked together) still loads 0xC0000139 — so it is NOT
+  artifact staleness. Remaining suspect: the DLL-flavor daslang config
+  (local `.vscode` build) vs CI's static daslang, in the bundle exe's
+  load-time import chain. Chase both together.
+- **Binary-staleness warning.** A `bin/.../daslang` older than the tree
+  produces convincing-but-wrong gate output (a stale binary's das2rst
+  regenerated handmade stubs under pre-rename `rtti` names). preflight
+  could compare the binary mtime against the newest `src/` commit and
+  WARN before running binary-derived gates.
+- **Gate-duration baseline + regression warning.** Persist per-gate wall
+  times locally (gitignored) after each run; on the next run compare
+  against the recorded baseline and WARN when a gate is far off — ~10%
+  drift is noise, ~2x is indicative of a regression (compiler slowdown,
+  a lint rule gone pathological, doc-build growth). Care: per-changed-
+  file gates (lint, cpp-syntax) scale with the diff size, so normalize
+  per file or baseline only the fixed-cost gates (format sweep, dasgen,
+  docs, test suites). Pairs with the binary-staleness warning — both
+  are "preflight sanity-checks its own run" features.

@@ -3389,6 +3389,11 @@ class public LlvmJitVisitor : AstVisitor {
         unsupported(expr, "try-catch")
     }
 
+// ExprQuote
+    def override preVisitExprQuote(expr : ExprQuote?) : void {
+        unsupported(expr, "raw quote( ) is not jit-able — daslib/quote lowering (jit_enabled / aot_macros gates) did not run for this module")
+    }
+
 // ExprIfThenElse
     /*
     if_cond_at:
@@ -4665,8 +4670,8 @@ class public LlvmJitVisitor : AstVisitor {
         let ann_ty = get_llvm_type_for_annotation_argument_info()
         var fields = fixed_array(
             types.ConstI32(uint64(int(arg.basicType))),
-            get_string_constant_ptr(g_builder, "{arg.name}"),
-            arg.basicType == Type.tString ? get_string_constant_ptr(g_builder, "{arg.sValue}") : LLVMConstPointerNull(types.LLVMVoidPtrType()),
+            get_string_constant_ptr(g_builder, arg.name),
+            arg.basicType == Type.tString ? get_string_constant_ptr(g_builder, arg.sValue) : LLVMConstPointerNull(types.LLVMVoidPtrType()),
             types.ConstI32(uint64(uint(arg.iValue))))
         return LLVMConstNamedStruct(ann_ty, array_data_ptr(fields), 4u)
     }
@@ -4708,8 +4713,8 @@ class public LlvmJitVisitor : AstVisitor {
             args_ptr = g_builder |> LLVMBuildPointerCast(args_global, types.LLVMVoidPtrType(), "")
         }
         var fields = fixed_array(
-            get_string_constant_ptr(g_builder, "{ann.name}"),
-            get_string_constant_ptr(g_builder, "{ann.module_name}"),
+            get_string_constant_ptr(g_builder, ann.name),
+            get_string_constant_ptr(g_builder, ann.module_name),
             args_ptr,
             types.ConstI32(ann.count |> uint64()),
             LLVMConstPointerNull(types.LLVMVoidPtrType()))
@@ -7638,6 +7643,14 @@ class public DisableJitVisitor : AstVisitor {
             to_log(LOG_WARNING, "LLVM JIT: unsupported typeinfo trait `{expr.trait}` at {expr.at}, falling back to interpreter. Please report at https://github.com/GaijinEntertainment/daScript/issues\n")
             disable = true
         }
+    }
+
+    def override preVisitExprQuote(expr : ExprQuote?) : void {
+        // jit_enabled programs get quotes lowered by daslib/quote's QuotePass before we
+        // ever run; a raw one means lowering didn't fire for the defining module (macro
+        // modules stay raw by design) — skip the function instead of failing the file
+        to_log(LOG_WARNING, "LLVM JIT: raw quote( ) — daslib/quote lowering (jit_enabled / aot_macros gates) did not run for this module at {expr.at}, falling back to interpreter.\n")
+        disable = true
     }
 
     def override preVisitExprForBody(expr : ExprFor?) : void {
