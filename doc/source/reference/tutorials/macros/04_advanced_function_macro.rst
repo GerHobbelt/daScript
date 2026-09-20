@@ -172,7 +172,7 @@ Step 1 — clone the original function
 
 .. code-block:: das
 
-       var inscope originalCopy <- clone_function(fn)
+       var originalCopy <- clone_function(fn)
        originalCopy.name := originalCopyName
        originalCopy.flags |= FunctionFlags.generated | FunctionFlags.privateFunction
        // Remove [memoize] from the clone to prevent infinite transform loop
@@ -182,7 +182,10 @@ Step 1 — clone the original function
        if (memoizeIdx >= 0) {
            originalCopy.annotations |> erase(memoizeIdx)
        }
-       compiling_module() |> add_function(originalCopy)
+       if (!(compiling_module() |> add_function(originalCopy))) {
+           errors := "failed to add original copy '{originalCopyName}'"
+           return false
+       }
 
 The wrapper needs to call the *real* implementation.  But ``transform()``
 redirects *all* calls to the annotated function — including calls inside
@@ -195,59 +198,57 @@ Step 2 — create the cache variable
 
 .. code-block:: das
 
-       var inscope retType <- clone_type(fn.result)
+       var retType = clone_type(fn.result)
        retType.flags &= ~TypeDeclFlags.constant
        retType.flags &= ~TypeDeclFlags.ref
-       var inscope wrapperRetType <- clone_type(retType)
+       var wrapperRetType = clone_type(retType)
 
-       var inscope keyType <- new TypeDecl(baseType = Type.tUInt64, at = fn.at)
-       var inscope cacheType <- new TypeDecl(baseType = Type.tTable, at = fn.at)
-       move(cacheType.firstType) <| keyType
-       move(cacheType.secondType) <| retType
+       var keyType = new TypeDecl(baseType = Type.tUInt64, at = fn.at)
+       var cacheType = new TypeDecl(baseType = Type.tTable, at = fn.at)
+       cacheType.firstType = keyType
+       cacheType.secondType = retType
        add_global_var(compiling_module(), cacheName, clone_type(cacheType), fn.at, true)
 
 The table type ``table<uint64; RetType>`` is built manually because
 ``$t()`` splicing doesn't work inside ``typeinfo ast_typedecl`` for table
 value types.  ``clone_type(cacheType)`` is required because
-``add_global_var`` takes ownership of the ``TypeDeclPtr`` without cloning
-it — if you pass an ``inscope`` variable directly, it gets deleted at
-scope exit and the compiler crashes on the next inference pass.
+``add_global_var`` takes ownership of the type without cloning it.
 
 Step 4 — hash key computation
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 .. code-block:: das
 
-       var inscope hashExprs : array<ExpressionPtr>
+       var hashExprs : array<ExpressionPtr>
        for (arg in fn.arguments) {
-           hashExprs |> emplace_new <| qmacro(hash($i(arg.name)))
+           hashExprs |> push <| qmacro(hash($i(arg.name)))
        }
 
        // Combine hashes with XOR
-       var inscope keyExpr <- hashExprs[0]
+       var keyExpr = hashExprs[0]
        for (i in range(1, length(hashExprs))) {
-           if (true) {
-               var inscope xorExpr <- qmacro($e(keyExpr) ^ $e(hashExprs[i]))
-               unsafe { keyExpr <- xorExpr; }
+           {
+               var xorExpr = qmacro($e(keyExpr) ^ $e(hashExprs[i]))
+               keyExpr = xorExpr
            }
        }
 
 For multiple arguments, the cache key is ``hash(a) ^ hash(b) ^ ...``.
 In daslang, every type has a ``hash()`` function, so this works for
-strings, floats, structs, etc.  The ``if (true)`` wrapper is a workaround
-for ``var inscope`` not being allowed directly in loop bodies.
+strings, floats, structs, etc.  The bare block wrapper provides a
+lexical scope for the intermediate variable inside the loop.
 
 Step 6 — assemble the wrapper body
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 .. code-block:: das
 
-       var inscope bodyExprs : array<ExpressionPtr>
-       bodyExprs |> emplace_new <| qmacro_expr(${ let key = $e(keyExpr); })
-       bodyExprs |> emplace_new <| qmacro_expr(${ if (key_exists($i(cacheName), key)) { unsafe { return $i(cacheName)[key]; } } })
-       bodyExprs |> emplace_new <| qmacro_expr(${ let result = $c(originalCopyName)($a(callArgs)); })
-       bodyExprs |> emplace_new <| qmacro_expr(${ $i(cacheName) |> insert_clone(key, result); })
-       bodyExprs |> emplace_new <| qmacro_expr(${ return result; })
+       var bodyExprs : array<ExpressionPtr>
+       bodyExprs |> push <| qmacro_expr(${ let key = $e(keyExpr); })
+       bodyExprs |> push <| qmacro_expr(${ if (key_exists($i(cacheName), key)) { unsafe { return $i(cacheName)[key]; } } })
+       bodyExprs |> push <| qmacro_expr(${ let result = $c(originalCopyName)($a(callArgs)); })
+       bodyExprs |> push <| qmacro_expr(${ $i(cacheName) |> insert_clone(key, result); })
+       bodyExprs |> push <| qmacro_expr(${ return result; })
 
 Each ``qmacro_expr`` generates one statement.  The splicing operators:
 
@@ -262,12 +263,15 @@ Step 7–8 — create and add the wrapper function
 
 .. code-block:: das
 
-       var inscope wrapperFn <- qmacro_function(wrapperName) $($a(wrapperArgs)) : $t(wrapperRetType) {
+       var wrapperFn <- qmacro_function(wrapperName) $($a(wrapperArgs)) : $t(wrapperRetType) {
            $b(bodyExprs)
        }
        wrapperFn.flags |= FunctionFlags.generated | FunctionFlags.privateFunction
        wrapperFn.body |> force_at(fn.body.at)
-       compiling_module() |> add_function(wrapperFn)
+       if (!(compiling_module() |> add_function(wrapperFn))) {
+           errors := "failed to add memoize wrapper function '{wrapperName}'"
+           return false
+       }
 
        // Store the wrapper name for transform() to read
        for (ann in fn.annotations) {
@@ -287,20 +291,20 @@ transform() — call-site redirection
 
 .. code-block:: das
 
-   def override transform(var call : smart_ptr<ExprCallFunc>;
+   def override transform(var call : ExprCallFunc?;
                           var errors : das_string) : ExpressionPtr {
        for (ann in call.func.annotations) {
            if (ann.annotation.name == "memoize") {
                let wrapperArg = find_arg(ann.arguments, "wrapper")
                if (wrapperArg is tString) {
                    let wrapperName = wrapperArg as tString
-                   var inscope newCall <- clone_expression(call)
+                   var newCall = clone_expression(call)
                    (newCall as ExprCall).name := wrapperName
-                   return <- newCall
+                   return newCall
                }
            }
        }
-       return <- default<ExpressionPtr>
+       return default<ExpressionPtr>
    }
 
 ``transform()`` is called for every call to the annotated function.  It
@@ -404,7 +408,7 @@ Key techniques summary
 | ``clone_function``           | Deep-clones a function with all annotations  |
 +------------------------------+----------------------------------------------+
 | ``add_global_var``           | Creates module-level variables at compile    |
-|                              | time (pass ``clone_type``, not ``inscope``)  |
+|                              | time (pass ``clone_type`` for the type arg)  |
 +------------------------------+----------------------------------------------+
 | ``qmacro_function``          | Reification: builds a function from spliced  |
 |                              | arguments, body, and return type             |

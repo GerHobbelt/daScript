@@ -57,7 +57,7 @@ class TracedBlockMacro : AstBlockAnnotation {
     //   - append a print("<< tag\n") to the block's finalList, so
     //     the exit-message prints on block exit (like a finally block)
     // ------------------------------------------------------------------
-    def override apply(var blk : smart_ptr<ExprBlock>; var group : ModuleGroup;
+    def override apply(var blk : ExprBlock?; var group : ModuleGroup;
                        args : AnnotationArgumentList; var errors : das_string) : bool {
         // Validate: require a 'tag' string argument
         let labelArg = find_arg(args, "tag")
@@ -69,13 +69,13 @@ class TracedBlockMacro : AstBlockAnnotation {
 
         // Prepend enter-print at position 0 (before any user code).
         // emplace(vec, val, index) inserts at a specific position.
-        var inscope enterExpr <- qmacro(print($v(">> {lbl}\n")))
+        var enterExpr = qmacro(print($v(">> {lbl}\n")))
         blk.list |> emplace(enterExpr, 0)
 
         // Append exit-print to finalList.  The finalList acts like a
         // `finally` block — it runs when the block exits, even on
         // early return.  This guarantees the exit message always prints.
-        var inscope exitExpr <- qmacro(print($v("<< {lbl}\n")))
+        var exitExpr = qmacro(print($v("<< {lbl}\n")))
         blk.finalList |> emplace(exitExpr)
 
         return true
@@ -92,7 +92,7 @@ class TracedBlockMacro : AstBlockAnnotation {
     // Everything that needs AST modification must happen in apply().
     // finish() is read-only — use it for diagnostics and reporting.
     // ------------------------------------------------------------------
-    def override finish(var blk : smart_ptr<ExprBlock>; var group : ModuleGroup;
+    def override finish(var blk : ExprBlock?; var group : ModuleGroup;
                         args, progArgs : AnnotationArgumentList; var errors : das_string) : bool {
         // Recover the tag
         let labelArg = find_arg(args, "tag")
@@ -104,7 +104,7 @@ class TracedBlockMacro : AstBlockAnnotation {
         // Count original user statements (subtract 1 for the injected
         // enter-print that apply() prepended)
         var numStmts = 0
-        for (s in blk.list) {
+        for (_s in blk.list) {
             numStmts++
         }
         if (numStmts > 0) {
@@ -117,7 +117,7 @@ class TracedBlockMacro : AstBlockAnnotation {
         // Show typed arguments — types are fully resolved after inference,
         // so describe() returns proper type names like "int", "string", etc.
         var numArgs = 0
-        for (a in blk.arguments) {
+        for (_a in blk.arguments) {
             numArgs++
         }
         if (numArgs > 0) {

@@ -19,7 +19,7 @@ namespace das {
         string          name;
         string          aka;
         LineInfo        at;
-        ExpressionPtr   tag;
+        ExpressionPtr   tag = nullptr;
         bool            isTupleExpansion = false;
         VariableNameAndPosition ( const string & n, const string & a, const LineInfo & At, Expression * t = nullptr )
             : name(n), aka(a), at(At), tag(t) {}
@@ -47,8 +47,8 @@ namespace das {
             : pNameList(n), pTypeDecl(t), pInit(i) {}
         virtual ~VariableDeclaration () {
             if ( pNameList ) delete pNameList;
-            if ( pTypeDecl ) delete pTypeDecl;
-            if ( pInit ) delete pInit;
+            // if ( pTypeDecl ) delete pTypeDecl;
+            // if ( pInit ) delete pInit;
             if ( annotation ) delete annotation;
         }
         vector<VariableNameAndPosition>   *pNameList;

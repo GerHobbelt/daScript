@@ -16,7 +16,12 @@ IF(NOT DAS_PEG_INCLUDED)
         DESTINATION ${DAS_INSTALL_MODULESDIR}/dasPEG
     )
 
-    ADD_EXAMPLE_RUN(modules/dasPEG/examples/csv.das)
-    ADD_EXAMPLE_RUN(modules/dasPEG/examples/declarations.das)
+    ADD_EXAMPLE_RUN(tutorials/dasPEG/01_hello_parser.das)
+    ADD_EXAMPLE_RUN(tutorials/dasPEG/02_calculator.das)
+    ADD_EXAMPLE_RUN(tutorials/dasPEG/03_csv_parser.das)
+    ADD_EXAMPLE_RUN(tutorials/dasPEG/04_email_validator.das)
+    ADD_EXAMPLE_RUN(tutorials/dasPEG/05_json_parser.das)
+    ADD_EXAMPLE_RUN(tutorials/dasPEG/06_debugging.das)
+    ADD_EXAMPLE_RUN(tutorials/dasPEG/07_basic.das)
 
 ENDIF()

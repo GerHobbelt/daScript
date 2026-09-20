@@ -53,13 +53,13 @@ struct template Pair {
 [typemacro_function]
 def pair(macroArgument, passArgument : TypeDeclPtr; T1, T2 : TypeDeclPtr) : TypeDeclPtr {
     // Get the TypeDecl that points to our template struct.
-    var inscope template_type <- typeinfo ast_typedecl(type<Pair>)
+    var template_type = typeinfo ast_typedecl(type<Pair>)
 
     // Describe the template arguments — names must match the alias
     // names used in the struct fields (T1, T2).
-    var inscope template_arguments <- [
-        TypeMacroTemplateArgument(name = "T1", argument_type <- clone_type(T1)),
-        TypeMacroTemplateArgument(name = "T2", argument_type <- clone_type(T2))
+    var template_arguments <- [
+        TypeMacroTemplateArgument(name = "T1", argument_type = clone_type(T1)),
+        TypeMacroTemplateArgument(name = "T2", argument_type = clone_type(T2))
     ]
 
     // No extra (non-type) arguments for this macro.
@@ -97,7 +97,7 @@ def pair(macroArgument, passArgument : TypeDeclPtr; T1, T2 : TypeDeclPtr) : Type
     }
 
     // Build a mangled name like "Pair<int,float>" for deduplication.
-    var struct_name = template_structure_name(template_type.structType, template_arguments, extra_template_arguments)
+    let struct_name = template_structure_name(template_type.structType, template_arguments, extra_template_arguments)
 
     // If this exact instantiation already exists, reuse it.
     var existing_struct = compiling_program().find_unique_structure(struct_name)
@@ -107,7 +107,7 @@ def pair(macroArgument, passArgument : TypeDeclPtr; T1, T2 : TypeDeclPtr) : Type
 
     // Clone the template struct, rename it, clear the template flag,
     // and apply substitution rules so field types resolve correctly.
-    var inscope resType <- qmacro_template_class(struct_name, type<Pair>)
+    var resType = qmacro_template_class(struct_name, type<Pair>)
 
     // Annotate the new struct so `is_typemacro_template_instance`
     // can identify it as an instance of Pair later (for generics).

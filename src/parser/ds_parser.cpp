@@ -1119,58 +1119,58 @@ static const yytype_int16 yyrline[] =
     1959,  1960,  1961,  1962,  1963,  1964,  1965,  1966,  1967,  1968,
     1972,  1973,  1974,  1975,  1980,  1981,  1982,  1983,  1984,  1985,
     1986,  1987,  1988,  1989,  1990,  1991,  1992,  1993,  1994,  1995,
-    1996,  2001,  2008,  2020,  2026,  2037,  2041,  2048,  2051,  2051,
-    2051,  2056,  2056,  2056,  2069,  2073,  2077,  2083,  2091,  2100,
-    2106,  2114,  2114,  2114,  2121,  2125,  2134,  2142,  2150,  2154,
-    2157,  2163,  2164,  2165,  2166,  2167,  2168,  2169,  2170,  2171,
-    2172,  2173,  2174,  2175,  2176,  2177,  2178,  2179,  2180,  2181,
-    2182,  2183,  2184,  2185,  2186,  2187,  2188,  2189,  2190,  2191,
-    2192,  2193,  2194,  2195,  2196,  2197,  2198,  2204,  2205,  2206,
-    2207,  2208,  2221,  2230,  2231,  2232,  2233,  2234,  2235,  2236,
-    2237,  2238,  2239,  2240,  2241,  2244,  2247,  2248,  2251,  2251,
-    2251,  2254,  2259,  2263,  2267,  2267,  2267,  2272,  2275,  2279,
-    2279,  2279,  2284,  2287,  2288,  2289,  2290,  2291,  2292,  2293,
-    2294,  2295,  2297,  2301,  2302,  2307,  2311,  2312,  2313,  2314,
-    2315,  2316,  2317,  2321,  2325,  2329,  2333,  2337,  2341,  2345,
-    2349,  2353,  2360,  2361,  2362,  2366,  2367,  2368,  2372,  2373,
-    2377,  2378,  2379,  2383,  2384,  2388,  2399,  2402,  2405,  2405,
-    2409,  2409,  2428,  2427,  2443,  2442,  2456,  2465,  2477,  2486,
-    2496,  2497,  2498,  2499,  2500,  2504,  2507,  2516,  2517,  2521,
-    2524,  2527,  2542,  2551,  2552,  2556,  2559,  2562,  2575,  2576,
-    2580,  2586,  2592,  2601,  2604,  2611,  2614,  2620,  2621,  2622,
-    2626,  2627,  2631,  2638,  2643,  2652,  2658,  2669,  2672,  2677,
-    2682,  2690,  2701,  2704,  2707,  2707,  2727,  2728,  2732,  2733,
-    2734,  2738,  2741,  2741,  2760,  2763,  2766,  2781,  2800,  2801,
-    2802,  2807,  2807,  2833,  2834,  2838,  2839,  2839,  2843,  2844,
-    2845,  2849,  2859,  2864,  2859,  2876,  2881,  2876,  2896,  2897,
-    2901,  2902,  2906,  2912,  2913,  2914,  2915,  2919,  2920,  2921,
-    2925,  2928,  2934,  2939,  2934,  2959,  2966,  2971,  2980,  2986,
-    2997,  2998,  2999,  3000,  3001,  3002,  3003,  3004,  3005,  3006,
-    3007,  3008,  3009,  3010,  3011,  3012,  3013,  3014,  3015,  3016,
-    3017,  3018,  3019,  3020,  3021,  3022,  3023,  3027,  3028,  3029,
-    3030,  3031,  3032,  3033,  3034,  3038,  3049,  3053,  3060,  3072,
-    3079,  3085,  3094,  3099,  3102,  3112,  3125,  3126,  3127,  3128,
-    3129,  3133,  3137,  3137,  3137,  3151,  3152,  3156,  3160,  3167,
-    3171,  3178,  3179,  3180,  3181,  3182,  3197,  3203,  3203,  3203,
-    3207,  3212,  3219,  3219,  3226,  3230,  3234,  3239,  3244,  3249,
-    3254,  3258,  3262,  3267,  3271,  3275,  3280,  3280,  3280,  3286,
-    3293,  3293,  3293,  3298,  3298,  3298,  3304,  3304,  3304,  3309,
-    3314,  3314,  3314,  3319,  3319,  3319,  3328,  3333,  3333,  3333,
-    3338,  3338,  3338,  3347,  3352,  3352,  3352,  3357,  3357,  3357,
-    3366,  3366,  3366,  3372,  3372,  3372,  3381,  3384,  3395,  3411,
-    3411,  3416,  3421,  3411,  3446,  3446,  3451,  3457,  3446,  3482,
-    3482,  3487,  3492,  3482,  3532,  3533,  3534,  3535,  3536,  3540,
-    3547,  3554,  3560,  3566,  3573,  3580,  3586,  3595,  3598,  3604,
-    3612,  3617,  3624,  3629,  3636,  3641,  3647,  3648,  3652,  3653,
-    3658,  3659,  3663,  3664,  3668,  3669,  3673,  3674,  3675,  3679,
-    3680,  3681,  3685,  3686,  3690,  3696,  3703,  3711,  3718,  3726,
-    3735,  3735,  3735,  3743,  3743,  3743,  3750,  3750,  3750,  3761,
-    3761,  3761,  3772,  3775,  3781,  3795,  3801,  3807,  3813,  3813,
-    3813,  3827,  3832,  3839,  3858,  3863,  3870,  3870,  3870,  3880,
-    3880,  3880,  3894,  3894,  3894,  3908,  3917,  3917,  3917,  3937,
-    3944,  3944,  3944,  3954,  3959,  3966,  3969,  3975,  3994,  4003,
-    4011,  4031,  4056,  4057,  4061,  4062,  4067,  4070,  4073,  4076,
-    4079,  4082
+    1996,  2001,  2007,  2018,  2024,  2035,  2039,  2046,  2049,  2049,
+    2049,  2054,  2054,  2054,  2067,  2071,  2075,  2081,  2089,  2097,
+    2103,  2111,  2111,  2111,  2118,  2122,  2131,  2139,  2147,  2151,
+    2154,  2160,  2161,  2162,  2163,  2164,  2165,  2166,  2167,  2168,
+    2169,  2170,  2171,  2172,  2173,  2174,  2175,  2176,  2177,  2178,
+    2179,  2180,  2181,  2182,  2183,  2184,  2185,  2186,  2187,  2188,
+    2189,  2190,  2191,  2192,  2193,  2194,  2195,  2201,  2202,  2203,
+    2204,  2205,  2218,  2227,  2228,  2229,  2230,  2231,  2232,  2233,
+    2234,  2235,  2236,  2237,  2238,  2241,  2244,  2245,  2248,  2248,
+    2248,  2251,  2256,  2260,  2264,  2264,  2264,  2269,  2272,  2276,
+    2276,  2276,  2281,  2284,  2285,  2286,  2287,  2288,  2289,  2290,
+    2291,  2292,  2294,  2298,  2299,  2304,  2308,  2309,  2310,  2311,
+    2312,  2313,  2314,  2318,  2322,  2326,  2330,  2334,  2338,  2342,
+    2346,  2350,  2357,  2358,  2359,  2363,  2364,  2365,  2369,  2370,
+    2374,  2375,  2376,  2380,  2381,  2385,  2396,  2399,  2402,  2402,
+    2406,  2406,  2425,  2424,  2440,  2439,  2453,  2462,  2474,  2483,
+    2493,  2494,  2495,  2496,  2497,  2501,  2504,  2513,  2514,  2518,
+    2521,  2524,  2539,  2548,  2549,  2553,  2556,  2559,  2572,  2573,
+    2577,  2583,  2589,  2598,  2601,  2608,  2611,  2617,  2618,  2619,
+    2623,  2624,  2628,  2635,  2640,  2649,  2655,  2666,  2669,  2674,
+    2679,  2687,  2698,  2701,  2704,  2704,  2724,  2725,  2729,  2730,
+    2731,  2735,  2738,  2738,  2757,  2760,  2763,  2778,  2797,  2798,
+    2799,  2804,  2804,  2830,  2831,  2835,  2836,  2836,  2840,  2841,
+    2842,  2846,  2856,  2861,  2856,  2873,  2878,  2873,  2893,  2894,
+    2898,  2899,  2903,  2909,  2910,  2911,  2912,  2916,  2917,  2918,
+    2922,  2925,  2931,  2936,  2931,  2956,  2963,  2968,  2977,  2983,
+    2994,  2995,  2996,  2997,  2998,  2999,  3000,  3001,  3002,  3003,
+    3004,  3005,  3006,  3007,  3008,  3009,  3010,  3011,  3012,  3013,
+    3014,  3015,  3016,  3017,  3018,  3019,  3020,  3024,  3025,  3026,
+    3027,  3028,  3029,  3030,  3031,  3035,  3046,  3050,  3057,  3069,
+    3076,  3082,  3091,  3096,  3099,  3109,  3122,  3123,  3124,  3125,
+    3126,  3130,  3134,  3134,  3134,  3148,  3149,  3153,  3157,  3164,
+    3168,  3175,  3176,  3177,  3178,  3179,  3193,  3199,  3199,  3199,
+    3203,  3208,  3215,  3215,  3222,  3226,  3230,  3235,  3240,  3245,
+    3250,  3254,  3258,  3263,  3267,  3271,  3276,  3276,  3276,  3282,
+    3289,  3289,  3289,  3294,  3294,  3294,  3300,  3300,  3300,  3305,
+    3310,  3310,  3310,  3315,  3315,  3315,  3324,  3329,  3329,  3329,
+    3334,  3334,  3334,  3343,  3348,  3348,  3348,  3353,  3353,  3353,
+    3362,  3362,  3362,  3368,  3368,  3368,  3377,  3380,  3391,  3407,
+    3407,  3412,  3417,  3407,  3442,  3442,  3447,  3453,  3442,  3478,
+    3478,  3483,  3488,  3478,  3528,  3529,  3530,  3531,  3532,  3536,
+    3543,  3550,  3556,  3562,  3569,  3576,  3582,  3591,  3594,  3600,
+    3608,  3613,  3620,  3625,  3632,  3637,  3643,  3644,  3648,  3649,
+    3654,  3655,  3659,  3660,  3664,  3665,  3669,  3670,  3671,  3675,
+    3676,  3677,  3681,  3682,  3686,  3692,  3699,  3707,  3714,  3722,
+    3731,  3731,  3731,  3739,  3739,  3739,  3746,  3746,  3746,  3757,
+    3757,  3757,  3768,  3771,  3777,  3791,  3797,  3803,  3809,  3809,
+    3809,  3823,  3828,  3835,  3854,  3859,  3866,  3866,  3866,  3876,
+    3876,  3876,  3890,  3890,  3890,  3904,  3913,  3913,  3913,  3933,
+    3940,  3940,  3940,  3950,  3955,  3962,  3965,  3971,  3990,  3999,
+    4007,  4027,  4052,  4053,  4057,  4058,  4063,  4066,  4069,  4072,
+    4075,  4078
 };
 #endif
 
@@ -5782,15 +5782,15 @@ yydestruct (const char *yymsg,
         break;
 
     case YYSYMBOL_string_builder_body: /* string_builder_body  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_string_builder: /* string_builder  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expr_reader: /* expr_reader  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_keyword_or_name: /* keyword_or_name  */
@@ -5802,47 +5802,47 @@ yydestruct (const char *yymsg,
         break;
 
     case YYSYMBOL_expression_label: /* expression_label  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expression_goto: /* expression_goto  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expression_else: /* expression_else  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expression_else_one_liner: /* expression_else_one_liner  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expression_if_one_liner: /* expression_if_one_liner  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expression_if_then_else: /* expression_if_then_else  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expression_for_loop: /* expression_for_loop  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expression_unsafe: /* expression_unsafe  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expression_while_loop: /* expression_while_loop  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expression_with: /* expression_with  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expression_with_alias: /* expression_with_alias  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_annotation_argument_value: /* annotation_argument_value  */
@@ -5894,7 +5894,7 @@ yydestruct (const char *yymsg,
         break;
 
     case YYSYMBOL_optional_function_type: /* optional_function_type  */
-            { delete ((*yyvaluep).pTypeDecl); }
+            { /* gc owns TypeDecl */ }
         break;
 
     case YYSYMBOL_function_name: /* function_name  */
@@ -5910,47 +5910,47 @@ yydestruct (const char *yymsg,
         break;
 
     case YYSYMBOL_expression_block: /* expression_block  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expr_call_pipe: /* expr_call_pipe  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expression_any: /* expression_any  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expressions: /* expressions  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expr_keyword: /* expr_keyword  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_optional_expr_list: /* optional_expr_list  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_optional_expr_list_in_braces: /* optional_expr_list_in_braces  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_optional_expr_map_tuple_list: /* optional_expr_map_tuple_list  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_type_declaration_no_options_list: /* type_declaration_no_options_list  */
-            { deleteTypeDeclarationList(((*yyvaluep).pTypeDeclList)); }
+            { /* gc owns TypeDecl */ }
         break;
 
     case YYSYMBOL_expression_keyword: /* expression_keyword  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expr_pipe: /* expr_pipe  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_name_in_namespace: /* name_in_namespace  */
@@ -5958,43 +5958,43 @@ yydestruct (const char *yymsg,
         break;
 
     case YYSYMBOL_expression_delete: /* expression_delete  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_new_type_declaration: /* new_type_declaration  */
-            { delete ((*yyvaluep).pTypeDecl); }
+            { /* gc owns TypeDecl */ }
         break;
 
     case YYSYMBOL_expr_new: /* expr_new  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expression_break: /* expression_break  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expression_continue: /* expression_continue  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expression_return_no_pipe: /* expression_return_no_pipe  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expression_return: /* expression_return  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expression_yield_no_pipe: /* expression_yield_no_pipe  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expression_yield: /* expression_yield  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expression_try_catch: /* expression_try_catch  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_tuple_expansion: /* tuple_expansion  */
@@ -6006,27 +6006,27 @@ yydestruct (const char *yymsg,
         break;
 
     case YYSYMBOL_expression_let: /* expression_let  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expr_cast: /* expr_cast  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expr_type_decl: /* expr_type_decl  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expr_type_info: /* expr_type_info  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expr_list: /* expr_list  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_block_or_simple_block: /* block_or_simple_block  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_capture_entry: /* capture_entry  */
@@ -6042,63 +6042,63 @@ yydestruct (const char *yymsg,
         break;
 
     case YYSYMBOL_expr_block: /* expr_block  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expr_full_block: /* expr_full_block  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expr_full_block_assumed_piped: /* expr_full_block_assumed_piped  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expr_numeric_const: /* expr_numeric_const  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expr_assign: /* expr_assign  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expr_assign_pipe_right: /* expr_assign_pipe_right  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expr_assign_pipe: /* expr_assign_pipe  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expr_named_call: /* expr_named_call  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expr_method_call: /* expr_method_call  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_func_addr_name: /* func_addr_name  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_func_addr_expr: /* func_addr_expr  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expr_field: /* expr_field  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expr_call: /* expr_call  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expr: /* expr  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expr_mtag: /* expr_mtag  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_optional_field_annotation: /* optional_field_annotation  */
@@ -6174,7 +6174,7 @@ yydestruct (const char *yymsg,
         break;
 
     case YYSYMBOL_enum_list: /* enum_list  */
-            { delete ((*yyvaluep).pEnumList); }
+            { /* gc owns Enumeration */ }
         break;
 
     case YYSYMBOL_enum_name: /* enum_name  */
@@ -6194,11 +6194,11 @@ yydestruct (const char *yymsg,
         break;
 
     case YYSYMBOL_structure_type_declaration: /* structure_type_declaration  */
-            { delete ((*yyvaluep).pTypeDecl); }
+            { /* gc owns TypeDecl */ }
         break;
 
     case YYSYMBOL_auto_type_declaration: /* auto_type_declaration  */
-            { delete ((*yyvaluep).pTypeDecl); }
+            { /* gc owns TypeDecl */ }
         break;
 
     case YYSYMBOL_bitfield_bits: /* bitfield_bits  */
@@ -6210,103 +6210,103 @@ yydestruct (const char *yymsg,
         break;
 
     case YYSYMBOL_bitfield_type_declaration: /* bitfield_type_declaration  */
-            { delete ((*yyvaluep).pTypeDecl); }
+            { /* gc owns TypeDecl */ }
         break;
 
     case YYSYMBOL_table_type_pair: /* table_type_pair  */
-            { delete ((*yyvaluep).aTypePair).firstType; delete ((*yyvaluep).aTypePair).secondType; }
+            { /* gc owns TypeDecl */ }
         break;
 
     case YYSYMBOL_dim_list: /* dim_list  */
-            { delete ((*yyvaluep).pTypeDecl); }
+            { /* gc owns TypeDecl */ }
         break;
 
     case YYSYMBOL_type_declaration_no_options: /* type_declaration_no_options  */
-            { delete ((*yyvaluep).pTypeDecl); }
+            { /* gc owns TypeDecl */ }
         break;
 
     case YYSYMBOL_type_declaration: /* type_declaration  */
-            { delete ((*yyvaluep).pTypeDecl); }
+            { /* gc owns TypeDecl */ }
         break;
 
     case YYSYMBOL_make_decl: /* make_decl  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_make_struct_fields: /* make_struct_fields  */
-            { delete ((*yyvaluep).pMakeStruct); }
+            { /* gc owns MakeStruct */ }
         break;
 
     case YYSYMBOL_make_variant_dim: /* make_variant_dim  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_make_struct_single: /* make_struct_single  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_make_struct_dim: /* make_struct_dim  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_make_struct_dim_list: /* make_struct_dim_list  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_make_struct_dim_decl: /* make_struct_dim_decl  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_optional_make_struct_dim_decl: /* optional_make_struct_dim_decl  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_optional_block: /* optional_block  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_make_struct_decl: /* make_struct_decl  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_make_tuple: /* make_tuple  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_make_map_tuple: /* make_map_tuple  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_make_tuple_call: /* make_tuple_call  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_make_dim: /* make_dim  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_make_dim_decl: /* make_dim_decl  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_make_table: /* make_table  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_expr_map_tuple_list: /* expr_map_tuple_list  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_make_table_decl: /* make_table_decl  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_array_comprehension_where: /* array_comprehension_where  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
     case YYSYMBOL_array_comprehension: /* array_comprehension  */
-            { delete ((*yyvaluep).pExpression); }
+            { /* gc_node; */ }
         break;
 
       default:
@@ -6651,7 +6651,7 @@ yyreduce:
 
   case 17: /* top_level_reader_macro: expr_reader semicolon  */
                                    {
-        delete (yyvsp[-1].pExpression);    // we do nothing, we don't even attemp to 'visit'
+        (void)(yyvsp[-1].pExpression); // gc_node — Expression, don't delete
     }
     break;
 
@@ -6759,7 +6759,7 @@ yyreduce:
         bool err;
         auto esconst = unescapeString(*(yyvsp[0].s),&err);
         if ( err ) das_yyerror(scanner,"invalid escape sequence",tokAt(scanner,(yylsp[-1])), CompilationError::invalid_escape_sequence);
-        auto sc = make_smart<ExprConstString>(tokAt(scanner,(yylsp[0])),esconst);
+        auto sc = new ExprConstString(tokAt(scanner,(yylsp[0])),esconst);
         delete (yyvsp[0].s);
         static_cast<ExprStringBuilder *>((yyvsp[-1].pExpression))->elements.push_back(sc);
         (yyval.pExpression) = (yyvsp[-1].pExpression);
@@ -6771,7 +6771,7 @@ yyreduce:
         auto se = (yyvsp[-2].pExpression);
         if ( !(yyvsp[-1].s)->empty() ) {
             auto call_fmt = new ExprCall(tokAt(scanner,(yylsp[-1])), "_::fmt");
-            call_fmt->arguments.push_back(make_smart<ExprConstString>(tokAt(scanner,(yylsp[-1])),":" + *(yyvsp[-1].s)));
+            call_fmt->arguments.push_back(new ExprConstString(tokAt(scanner,(yylsp[-1])),":" + *(yyvsp[-1].s)));
             call_fmt->arguments.push_back(se);
             se = call_fmt;
         }
@@ -6786,11 +6786,11 @@ yyreduce:
         auto strb = static_cast<ExprStringBuilder *>((yyvsp[-1].pExpression));
         if ( strb->elements.size()==0 ) {
             (yyval.pExpression) = new ExprConstString(tokRangeAt(scanner,(yylsp[-2]),(yylsp[0])),"");
-            delete (yyvsp[-1].pExpression);
+            // gc_node — don't delete $sb
         } else if ( strb->elements.size()==1 && strb->elements[0]->rtti_isStringConstant() ) {
-            auto sconst = static_pointer_cast<ExprConstString>(strb->elements[0]);
+            auto sconst = static_cast<ExprConstString*>(strb->elements[0]);
             (yyval.pExpression) = new ExprConstString(tokRangeAt(scanner,(yylsp[-2]),(yylsp[0])),sconst->text);
-            delete (yyvsp[-1].pExpression);
+            // gc_node — don't delete $sb
         } else {
             (yyval.pExpression) = (yyvsp[-1].pExpression);
         }
@@ -7980,7 +7980,7 @@ yyreduce:
             (yyval.pExpression) = (yyvsp[-1].pExpression);
         } else {
             (yyval.pExpression) = (yyvsp[-1].pExpression);
-            delete (yyvsp[0].pExpression);
+            // gc_node — don't delete Expression
         }
     }
     break;
@@ -7992,7 +7992,7 @@ yyreduce:
             (yyval.pExpression) = (yyvsp[-1].pExpression);
         } else {
             (yyval.pExpression) = (yyvsp[-1].pExpression);
-            delete (yyvsp[0].pExpression);
+            // gc_node — don't delete Expression
         }
     }
     break;
@@ -8106,7 +8106,7 @@ yyreduce:
 
   case 294: /* expressions: expressions error  */
                                  {
-        delete (yyvsp[-1].pExpression); (yyval.pExpression) = nullptr; YYABORT;
+        (void)(yyvsp[-1].pExpression); /* gc_node — don't delete Expression */ (yyval.pExpression) = nullptr; YYABORT;
     }
     break;
 
@@ -8650,7 +8650,7 @@ yyreduce:
             if ( (yyvsp[-1].pExpression)->rtti_isTypeDecl() ) {
                 auto ptd = (ExprTypeDecl *)(yyvsp[-1].pExpression);
                 (yyval.pExpression) = new ExprTypeInfo(tokAt(scanner,(yylsp[-4])),*(yyvsp[-2].s),ptd->typeexpr);
-                delete (yyvsp[-1].pExpression);
+                // gc_node — don't delete Expression
             } else {
                 (yyval.pExpression) = new ExprTypeInfo(tokAt(scanner,(yylsp[-4])),*(yyvsp[-2].s),(yyvsp[-1].pExpression));
             }
@@ -8663,7 +8663,7 @@ yyreduce:
             if ( (yyvsp[-1].pExpression)->rtti_isTypeDecl() ) {
                 auto ptd = (ExprTypeDecl *)(yyvsp[-1].pExpression);
                 (yyval.pExpression) = new ExprTypeInfo(tokAt(scanner,(yylsp[-7])),*(yyvsp[-5].s),ptd->typeexpr,*(yyvsp[-3].s));
-                delete (yyvsp[-1].pExpression);
+                // gc_node — don't delete Expression
             } else {
                 (yyval.pExpression) = new ExprTypeInfo(tokAt(scanner,(yylsp[-7])),*(yyvsp[-5].s),(yyvsp[-1].pExpression),*(yyvsp[-3].s));
             }
@@ -8677,7 +8677,7 @@ yyreduce:
             if ( (yyvsp[-1].pExpression)->rtti_isTypeDecl() ) {
                 auto ptd = (ExprTypeDecl *)(yyvsp[-1].pExpression);
                 (yyval.pExpression) = new ExprTypeInfo(tokAt(scanner,(yylsp[-9])),*(yyvsp[-7].s),ptd->typeexpr,*(yyvsp[-5].s),*(yyvsp[-3].s));
-                delete (yyvsp[-1].pExpression);
+                // gc_node — don't delete Expression
             } else {
                 (yyval.pExpression) = new ExprTypeInfo(tokAt(scanner,(yylsp[-9])),*(yyvsp[-7].s),(yyvsp[-1].pExpression),*(yyvsp[-5].s),*(yyvsp[-3].s));
             }
@@ -8692,7 +8692,7 @@ yyreduce:
             if ( (yyvsp[-1].pExpression)->rtti_isTypeDecl() ) {
                 auto ptd = (ExprTypeDecl *)(yyvsp[-1].pExpression);
                 (yyval.pExpression) = new ExprTypeInfo(tokAt(scanner,(yylsp[-4])),*(yyvsp[-3].s),ptd->typeexpr);
-                delete (yyvsp[-1].pExpression);
+                // gc_node — don't delete Expression
             } else {
                 (yyval.pExpression) = new ExprTypeInfo(tokAt(scanner,(yylsp[-4])),*(yyvsp[-3].s),(yyvsp[-1].pExpression));
             }
@@ -8705,7 +8705,7 @@ yyreduce:
             if ( (yyvsp[-1].pExpression)->rtti_isTypeDecl() ) {
                 auto ptd = (ExprTypeDecl *)(yyvsp[-1].pExpression);
                 (yyval.pExpression) = new ExprTypeInfo(tokAt(scanner,(yylsp[-7])),*(yyvsp[-6].s),ptd->typeexpr,*(yyvsp[-4].s));
-                delete (yyvsp[-1].pExpression);
+                // gc_node — don't delete Expression
             } else {
                 (yyval.pExpression) = new ExprTypeInfo(tokAt(scanner,(yylsp[-7])),*(yyvsp[-6].s),(yyvsp[-1].pExpression),*(yyvsp[-4].s));
             }
@@ -8719,7 +8719,7 @@ yyreduce:
             if ( (yyvsp[-1].pExpression)->rtti_isTypeDecl() ) {
                 auto ptd = (ExprTypeDecl *)(yyvsp[-1].pExpression);
                 (yyval.pExpression) = new ExprTypeInfo(tokAt(scanner,(yylsp[-9])),*(yyvsp[-8].s),ptd->typeexpr,*(yyvsp[-6].s),*(yyvsp[-4].s));
-                delete (yyvsp[-1].pExpression);
+                // gc_node — don't delete Expression
             } else {
                 (yyval.pExpression) = new ExprTypeInfo(tokAt(scanner,(yylsp[-9])),*(yyvsp[-8].s),(yyvsp[-1].pExpression),*(yyvsp[-6].s),*(yyvsp[-4].s));
             }
@@ -8747,7 +8747,7 @@ yyreduce:
 
   case 384: /* block_or_simple_block: "=>" expr  */
                                         {
-            auto retE = make_smart<ExprReturn>(tokAt(scanner,(yylsp[-1])), (yyvsp[0].pExpression));
+            auto retE = new ExprReturn(tokAt(scanner,(yylsp[-1])), (yyvsp[0].pExpression));
             auto blkE = new ExprBlock();
             blkE->at = tokAt(scanner,(yylsp[-1]));
             blkE->list.push_back(retE);
@@ -8757,7 +8757,7 @@ yyreduce:
 
   case 385: /* block_or_simple_block: "=>" "<-" expr  */
                                                {
-            auto retE = make_smart<ExprReturn>(tokAt(scanner,(yylsp[-2])), (yyvsp[0].pExpression));
+            auto retE = new ExprReturn(tokAt(scanner,(yylsp[-2])), (yyvsp[0].pExpression));
             retE->moveSemantics = true;
             auto blkE = new ExprBlock();
             blkE->at = tokAt(scanner,(yylsp[-2]));
@@ -8830,7 +8830,7 @@ yyreduce:
                                             {
         ExprBlock * closure = (ExprBlock *) (yyvsp[0].pExpression);
         (yyval.pExpression) = new ExprMakeBlock(tokAt(scanner,(yylsp[0])),(yyvsp[0].pExpression));
-        closure->returnType = make_smart<TypeDecl>(Type::autoinfer);
+        closure->returnType = new TypeDecl(Type::autoinfer);
     }
     break;
 
@@ -9047,8 +9047,7 @@ yyreduce:
   case 451: /* expr_named_call: name_in_namespace '(' '[' make_struct_fields ']' ')'  */
                                                                          {
         auto nc = new ExprNamedCall(tokAt(scanner,(yylsp[-5])),*(yyvsp[-5].s));
-        nc->arguments = *(yyvsp[-2].pMakeStruct);
-        delete (yyvsp[-2].pMakeStruct);
+        nc->arguments = (yyvsp[-2].pMakeStruct);
         delete (yyvsp[-5].s);
         (yyval.pExpression) = nc;
     }
@@ -9058,8 +9057,7 @@ yyreduce:
                                                                                                   {
         auto nc = new ExprNamedCall(tokAt(scanner,(yylsp[-7])),*(yyvsp[-7].s));
         nc->nonNamedArguments = sequenceToList((yyvsp[-5].pExpression));
-        nc->arguments = *(yyvsp[-2].pMakeStruct);
-        delete (yyvsp[-2].pMakeStruct);
+        nc->arguments = (yyvsp[-2].pMakeStruct);
         delete (yyvsp[-7].s);
         (yyval.pExpression) = nc;
     }
@@ -9115,7 +9113,7 @@ yyreduce:
 
   case 460: /* func_addr_expr: '@' '@' '<' $@24 type_declaration_no_options '>' $@25 func_addr_name  */
                                                                                                                                                        {
-        auto expr = (ExprAddr *) ((yyvsp[0].pExpression)->rtti_isAddr() ? (yyvsp[0].pExpression) : (((ExprTag *) (yyvsp[0].pExpression))->value.get()));
+        auto expr = (ExprAddr *) ((yyvsp[0].pExpression)->rtti_isAddr() ? (yyvsp[0].pExpression) : (((ExprTag *) (yyvsp[0].pExpression))->value));
         expr->funcType = (yyvsp[-3].pTypeDecl);
         (yyval.pExpression) = (yyvsp[0].pExpression);
     }
@@ -9131,11 +9129,11 @@ yyreduce:
 
   case 463: /* func_addr_expr: '@' '@' '<' $@26 optional_function_argument_list optional_function_type '>' $@27 func_addr_name  */
                                                                                                                                                                                      {
-        auto expr = (ExprAddr *) ((yyvsp[0].pExpression)->rtti_isAddr() ? (yyvsp[0].pExpression) : (((ExprTag *) (yyvsp[0].pExpression))->value.get()));
-        expr->funcType = make_smart<TypeDecl>(Type::tFunction);
+        auto expr = (ExprAddr *) ((yyvsp[0].pExpression)->rtti_isAddr() ? (yyvsp[0].pExpression) : (((ExprTag *) (yyvsp[0].pExpression))->value));
+        expr->funcType = new TypeDecl(Type::tFunction);
         expr->funcType->firstType = (yyvsp[-3].pTypeDecl);
         if ( (yyvsp[-4].pVarDeclList) ) {
-            varDeclToTypeDecl(scanner, expr->funcType.get(), (yyvsp[-4].pVarDeclList));
+            varDeclToTypeDecl(scanner, expr->funcType, (yyvsp[-4].pVarDeclList));
             deleteVariableDeclarationList((yyvsp[-4].pVarDeclList));
         }
         (yyval.pExpression) = (yyvsp[0].pExpression);
@@ -9180,9 +9178,8 @@ yyreduce:
                                                                                        {
         auto nc = new ExprNamedCall(tokAt(scanner,(yylsp[-5])),*(yyvsp[-5].s));
         nc->methodCall = true;
-        nc->arguments = *(yyvsp[-2].pMakeStruct);
+        nc->arguments = (yyvsp[-2].pMakeStruct);
         nc->nonNamedArguments.push_back((yyvsp[-7].pExpression));
-        delete (yyvsp[-2].pMakeStruct);
         delete (yyvsp[-5].s);
         (yyval.pExpression) = nc;
     }
@@ -9471,7 +9468,7 @@ yyreduce:
             mkt->values.push_back(arg->value);
             mkt->recordNames.push_back(arg->name);
         }
-        delete (yyvsp[-1].pExpression);
+        // gc_node — don't delete Expression
         (yyval.pExpression) = mkt;
     }
     break;
@@ -11020,7 +11017,6 @@ yyreduce:
         (yyvsp[-1].pTypeDecl)->removeDim = false;
         (yyval.pTypeDecl) = (yyvsp[-1].pTypeDecl);
         (yyvsp[0].pTypeDecl)->dimExpr.clear();
-        delete (yyvsp[0].pTypeDecl);
     }
     break;
 
@@ -11191,7 +11187,7 @@ yyreduce:
                                                  {
         (yyval.pTypeDecl) = new TypeDecl(Type::tPointer);
         (yyval.pTypeDecl)->at = tokAt(scanner,(yylsp[-1]));
-        (yyval.pTypeDecl)->firstType = make_smart<TypeDecl>(Type::tPointer);
+        (yyval.pTypeDecl)->firstType = new TypeDecl(Type::tPointer);
         (yyval.pTypeDecl)->firstType->at = tokAt(scanner,(yylsp[-1]));
         (yyval.pTypeDecl)->firstType->firstType = (yyvsp[-1].pTypeDecl);
     }
@@ -11249,7 +11245,7 @@ yyreduce:
   case 809: /* type_declaration_no_options: "block"  */
                         {
         (yyval.pTypeDecl) = new TypeDecl(Type::tBlock);
-        (yyval.pTypeDecl)->firstType = make_smart<TypeDecl>(Type::tVoid);
+        (yyval.pTypeDecl)->firstType = new TypeDecl(Type::tVoid);
         (yyval.pTypeDecl)->at = tokAt(scanner,(yylsp[0]));
     }
     break;
@@ -11293,7 +11289,7 @@ yyreduce:
   case 816: /* type_declaration_no_options: "function"  */
                            {
         (yyval.pTypeDecl) = new TypeDecl(Type::tFunction);
-        (yyval.pTypeDecl)->firstType = make_smart<TypeDecl>(Type::tVoid);
+        (yyval.pTypeDecl)->firstType = new TypeDecl(Type::tVoid);
         (yyval.pTypeDecl)->at = tokAt(scanner,(yylsp[0]));
     }
     break;
@@ -11337,7 +11333,7 @@ yyreduce:
   case 823: /* type_declaration_no_options: "lambda"  */
                          {
         (yyval.pTypeDecl) = new TypeDecl(Type::tLambda);
-        (yyval.pTypeDecl)->firstType = make_smart<TypeDecl>(Type::tVoid);
+        (yyval.pTypeDecl)->firstType = new TypeDecl(Type::tVoid);
         (yyval.pTypeDecl)->at = tokAt(scanner,(yylsp[0]));
     }
     break;
@@ -11436,13 +11432,13 @@ yyreduce:
                                              {
         if ( (yyvsp[-2].pTypeDecl)->baseType==Type::option ) {
             (yyval.pTypeDecl) = (yyvsp[-2].pTypeDecl);
-            (yyval.pTypeDecl)->argTypes.push_back(make_smart<TypeDecl>(*(yyvsp[-2].pTypeDecl)->argTypes.back()));
+            (yyval.pTypeDecl)->argTypes.push_back(new TypeDecl(*(yyvsp[-2].pTypeDecl)->argTypes.back()));
             (yyvsp[-2].pTypeDecl)->argTypes.back()->temporary ^= true;
         } else {
             (yyval.pTypeDecl) = new TypeDecl(Type::option);
             (yyval.pTypeDecl)->at = tokRangeAt(scanner,(yylsp[-2]),(yylsp[0]));
             (yyval.pTypeDecl)->argTypes.push_back((yyvsp[-2].pTypeDecl));
-            (yyval.pTypeDecl)->argTypes.push_back(make_smart<TypeDecl>(*(yyvsp[-2].pTypeDecl)));
+            (yyval.pTypeDecl)->argTypes.push_back(new TypeDecl(*(yyvsp[-2].pTypeDecl)));
             (yyval.pTypeDecl)->argTypes.back()->temporary ^= true;
         }
     }
@@ -11481,11 +11477,11 @@ yyreduce:
 
   case 843: /* tuple_alias_declaration: "tuple" optional_public_or_private_alias $@79 "name" $@80 open_block $@81 tuple_alias_type_list $@82 close_block  */
                   {
-        auto vtype = make_smart<TypeDecl>(Type::tTuple);
+        auto vtype = new TypeDecl(Type::tTuple);
         vtype->alias = *(yyvsp[-6].s);
         vtype->at = tokAt(scanner,(yylsp[-6]));
         vtype->isPrivateAlias = !(yyvsp[-8].b);
-        varDeclToTypeDecl(scanner, vtype.get(), (yyvsp[-2].pVarDeclList), true);
+        varDeclToTypeDecl(scanner, vtype, (yyvsp[-2].pVarDeclList), true);
         deleteVariableDeclarationList((yyvsp[-2].pVarDeclList));
         if ( !yyextra->g_Program->addAlias(vtype) ) {
             das_yyerror(scanner,"type alias is already defined "+*(yyvsp[-6].s),tokAt(scanner,(yylsp[-6])),
@@ -11533,11 +11529,11 @@ yyreduce:
 
   case 848: /* variant_alias_declaration: "variant" optional_public_or_private_alias $@83 "name" $@84 open_block $@85 variant_alias_type_list $@86 close_block  */
                   {
-        auto vtype = make_smart<TypeDecl>(Type::tVariant);
+        auto vtype = new TypeDecl(Type::tVariant);
         vtype->alias = *(yyvsp[-6].s);
         vtype->at = tokAt(scanner,(yylsp[-6]));
         vtype->isPrivateAlias = !(yyvsp[-8].b);
-        varDeclToTypeDecl(scanner, vtype.get(), (yyvsp[-2].pVarDeclList), true);
+        varDeclToTypeDecl(scanner, vtype, (yyvsp[-2].pVarDeclList), true);
         deleteVariableDeclarationList((yyvsp[-2].pVarDeclList));
         if ( !yyextra->g_Program->addAlias(vtype) ) {
             das_yyerror(scanner,"type alias is already defined "+*(yyvsp[-6].s),tokAt(scanner,(yylsp[-6])),
@@ -11584,7 +11580,7 @@ yyreduce:
 
   case 853: /* bitfield_alias_declaration: "bitfield" optional_public_or_private_alias $@87 "name" $@88 bitfield_basic_type_declaration open_block $@89 bitfield_alias_bits $@90 close_block  */
                   {
-        auto btype = make_smart<TypeDecl>((yyvsp[-5].type));
+        auto btype = new TypeDecl((yyvsp[-5].type));
         btype->alias = *(yyvsp[-7].s);
         btype->at = tokAt(scanner,(yylsp[-7]));
         btype->isPrivateAlias = !(yyvsp[-9].b);
@@ -11638,7 +11634,7 @@ yyreduce:
 
   case 859: /* make_struct_fields: "name" copy_or_move expr  */
                                                {
-        auto mfd = make_smart<MakeFieldDecl>(tokAt(scanner,(yylsp[-2])),*(yyvsp[-2].s),(yyvsp[0].pExpression),(yyvsp[-1].b),false);
+        auto mfd = new MakeFieldDecl(tokAt(scanner,(yylsp[-2])),*(yyvsp[-2].s),(yyvsp[0].pExpression),(yyvsp[-1].b),false);
         delete (yyvsp[-2].s);
         auto msd = new MakeStruct();
         msd->push_back(mfd);
@@ -11648,7 +11644,7 @@ yyreduce:
 
   case 860: /* make_struct_fields: "name" ":=" expr  */
                                       {
-        auto mfd = make_smart<MakeFieldDecl>(tokAt(scanner,(yylsp[-2])),*(yyvsp[-2].s),(yyvsp[0].pExpression),false,true);
+        auto mfd = new MakeFieldDecl(tokAt(scanner,(yylsp[-2])),*(yyvsp[-2].s),(yyvsp[0].pExpression),false,true);
         delete (yyvsp[-2].s);
         auto msd = new MakeStruct();
         msd->push_back(mfd);
@@ -11658,7 +11654,7 @@ yyreduce:
 
   case 861: /* make_struct_fields: make_struct_fields ',' "name" copy_or_move expr  */
                                                                            {
-        auto mfd = make_smart<MakeFieldDecl>(tokAt(scanner,(yylsp[-2])),*(yyvsp[-2].s),(yyvsp[0].pExpression),(yyvsp[-1].b),false);
+        auto mfd = new MakeFieldDecl(tokAt(scanner,(yylsp[-2])),*(yyvsp[-2].s),(yyvsp[0].pExpression),(yyvsp[-1].b),false);
         delete (yyvsp[-2].s);
         ((MakeStruct *)(yyvsp[-4].pMakeStruct))->push_back(mfd);
         (yyval.pMakeStruct) = (yyvsp[-4].pMakeStruct);
@@ -11667,7 +11663,7 @@ yyreduce:
 
   case 862: /* make_struct_fields: make_struct_fields ',' "name" ":=" expr  */
                                                                   {
-        auto mfd = make_smart<MakeFieldDecl>(tokAt(scanner,(yylsp[-2])),*(yyvsp[-2].s),(yyvsp[0].pExpression),false,true);
+        auto mfd = new MakeFieldDecl(tokAt(scanner,(yylsp[-2])),*(yyvsp[-2].s),(yyvsp[0].pExpression),false,true);
         delete (yyvsp[-2].s);
         ((MakeStruct *)(yyvsp[-4].pMakeStruct))->push_back(mfd);
         (yyval.pMakeStruct) = (yyvsp[-4].pMakeStruct);
@@ -11676,7 +11672,7 @@ yyreduce:
 
   case 863: /* make_struct_fields: "$f" '(' expr ')' copy_or_move expr  */
                                                                    {
-        auto mfd = make_smart<MakeFieldDecl>(tokAt(scanner,(yylsp[-3])),"``MACRO``TAG``FIELD``",(yyvsp[0].pExpression),(yyvsp[-1].b),false);
+        auto mfd = new MakeFieldDecl(tokAt(scanner,(yylsp[-3])),"``MACRO``TAG``FIELD``",(yyvsp[0].pExpression),(yyvsp[-1].b),false);
         mfd->tag = (yyvsp[-3].pExpression);
         auto msd = new MakeStruct();
         msd->push_back(mfd);
@@ -11686,7 +11682,7 @@ yyreduce:
 
   case 864: /* make_struct_fields: "$f" '(' expr ')' ":=" expr  */
                                                           {
-        auto mfd = make_smart<MakeFieldDecl>(tokAt(scanner,(yylsp[-3])),"``MACRO``TAG``FIELD``",(yyvsp[0].pExpression),false,true);
+        auto mfd = new MakeFieldDecl(tokAt(scanner,(yylsp[-3])),"``MACRO``TAG``FIELD``",(yyvsp[0].pExpression),false,true);
         mfd->tag = (yyvsp[-3].pExpression);
         auto msd = new MakeStruct();
         msd->push_back(mfd);
@@ -11696,7 +11692,7 @@ yyreduce:
 
   case 865: /* make_struct_fields: make_struct_fields ',' "$f" '(' expr ')' copy_or_move expr  */
                                                                                                {
-        auto mfd = make_smart<MakeFieldDecl>(tokAt(scanner,(yylsp[-3])),"``MACRO``TAG``FIELD``",(yyvsp[0].pExpression),(yyvsp[-1].b),false);
+        auto mfd = new MakeFieldDecl(tokAt(scanner,(yylsp[-3])),"``MACRO``TAG``FIELD``",(yyvsp[0].pExpression),(yyvsp[-1].b),false);
         mfd->tag = (yyvsp[-3].pExpression);
         ((MakeStruct *)(yyvsp[-7].pMakeStruct))->push_back(mfd);
         (yyval.pMakeStruct) = (yyvsp[-7].pMakeStruct);
@@ -11705,7 +11701,7 @@ yyreduce:
 
   case 866: /* make_struct_fields: make_struct_fields ',' "$f" '(' expr ')' ":=" expr  */
                                                                                       {
-        auto mfd = make_smart<MakeFieldDecl>(tokAt(scanner,(yylsp[-3])),"``MACRO``TAG``FIELD``",(yyvsp[0].pExpression),false,true);
+        auto mfd = new MakeFieldDecl(tokAt(scanner,(yylsp[-3])),"``MACRO``TAG``FIELD``",(yyvsp[0].pExpression),false,true);
         mfd->tag = (yyvsp[-3].pExpression);
         ((MakeStruct *)(yyvsp[-7].pMakeStruct))->push_back(mfd);
         (yyval.pMakeStruct) = (yyvsp[-7].pMakeStruct);
@@ -11989,7 +11985,7 @@ yyreduce:
                                                                     {
         auto mkt = new ExprMakeTuple(tokAt(scanner,(yylsp[-4])));
         mkt->values = sequenceToList((yyvsp[-2].pExpression));
-        mkt->makeType = make_smart<TypeDecl>(Type::autoinfer);
+        mkt->makeType = new TypeDecl(Type::autoinfer);
         (yyval.pExpression) = mkt;
     }
     break;
@@ -12034,9 +12030,9 @@ yyreduce:
   case 923: /* make_dim_decl: '[' optional_expr_list ']'  */
                                                     {
         if ( (yyvsp[-1].pExpression) ) {
-            auto mka = make_smart<ExprMakeArray>(tokAt(scanner,(yylsp[-2])));
+            auto mka = new ExprMakeArray(tokAt(scanner,(yylsp[-2])));
             mka->values = sequenceToList((yyvsp[-1].pExpression));
-            mka->makeType = make_smart<TypeDecl>(Type::autoinfer);
+            mka->makeType = new TypeDecl(Type::autoinfer);
             mka->gen2 = true;
             auto tam = yyextra->g_Program->makeCall(tokAt(scanner,(yylsp[-2])),"to_array_move");
             tam->arguments.push_back(mka);
@@ -12044,8 +12040,8 @@ yyreduce:
         } else {
             auto mks = new ExprMakeStruct();
             mks->at = tokAt(scanner,(yylsp[-2]));
-            mks->makeType = make_smart<TypeDecl>(Type::tArray);
-            mks->makeType->firstType = make_smart<TypeDecl>(Type::autoinfer);
+            mks->makeType = new TypeDecl(Type::tArray);
+            mks->makeType->firstType = new TypeDecl(Type::autoinfer);
             mks->useInitializer = true;
             mks->alwaysUseInitializer = true;
             (yyval.pExpression) = mks;
@@ -12144,9 +12140,9 @@ yyreduce:
 
   case 935: /* make_dim_decl: "array" '(' expr_list optional_comma ')'  */
                                                                    {
-        auto mka = make_smart<ExprMakeArray>(tokAt(scanner,(yylsp[-4])));
+        auto mka = new ExprMakeArray(tokAt(scanner,(yylsp[-4])));
         mka->values = sequenceToList((yyvsp[-2].pExpression));
-        mka->makeType = make_smart<TypeDecl>(Type::autoinfer);
+        mka->makeType = new TypeDecl(Type::autoinfer);
         mka->gen2 = true;
         auto tam = yyextra->g_Program->makeCall(tokAt(scanner,(yylsp[-4])),"to_array_move");
         tam->arguments.push_back(mka);
@@ -12165,7 +12161,7 @@ yyreduce:
   case 938: /* make_dim_decl: "array" '<' $@107 type_declaration_no_options '>' $@108 '(' optional_expr_list ')'  */
                                                                                                                                                                         {
         if ( (yyvsp[-1].pExpression) ) {
-            auto mka = make_smart<ExprMakeArray>(tokAt(scanner,(yylsp[-8])));
+            auto mka = new ExprMakeArray(tokAt(scanner,(yylsp[-8])));
             mka->values = sequenceToList((yyvsp[-1].pExpression));
             mka->makeType = (yyvsp[-5].pTypeDecl);
             mka->gen2 = true;
@@ -12175,7 +12171,7 @@ yyreduce:
         } else {
             auto msd = new ExprMakeStruct();
             msd->at = tokAt(scanner,(yylsp[-8]));
-            msd->makeType = make_smart<TypeDecl>(Type::tArray);
+            msd->makeType = new TypeDecl(Type::tArray);
             msd->makeType->firstType = (yyvsp[-5].pTypeDecl);
             msd->at = tokAt(scanner,(yylsp[-5]));
             msd->useInitializer = true;
@@ -12189,7 +12185,7 @@ yyreduce:
                                                                          {
         auto mka = new ExprMakeArray(tokAt(scanner,(yylsp[-4])));
         mka->values = sequenceToList((yyvsp[-2].pExpression));
-        mka->makeType = make_smart<TypeDecl>(Type::autoinfer);
+        mka->makeType = new TypeDecl(Type::autoinfer);
         mka->gen2 = true;
         (yyval.pExpression) = mka;
     }
@@ -12243,18 +12239,18 @@ yyreduce:
   case 947: /* make_table_decl: "begin of code block" optional_expr_map_tuple_list "end of code block"  */
                                                               {
         if ( (yyvsp[-1].pExpression) ) {
-            auto mka = make_smart<ExprMakeArray>(tokAt(scanner,(yylsp[-2])));
+            auto mka = new ExprMakeArray(tokAt(scanner,(yylsp[-2])));
             mka->values = sequenceToList((yyvsp[-1].pExpression));
-            mka->makeType = make_smart<TypeDecl>(Type::autoinfer);
+            mka->makeType = new TypeDecl(Type::autoinfer);
             auto ttm = yyextra->g_Program->makeCall(tokAt(scanner,(yylsp[-2])),"to_table_move");
             ttm->arguments.push_back(mka);
             (yyval.pExpression) = ttm;
         } else {
             auto mks = new ExprMakeStruct();
             mks->at = tokAt(scanner,(yylsp[-2]));
-            mks->makeType = make_smart<TypeDecl>(Type::tTable);
-            mks->makeType->firstType = make_smart<TypeDecl>(Type::autoinfer);
-            mks->makeType->secondType = make_smart<TypeDecl>(Type::autoinfer);
+            mks->makeType = new TypeDecl(Type::tTable);
+            mks->makeType->firstType = new TypeDecl(Type::autoinfer);
+            mks->makeType->secondType = new TypeDecl(Type::autoinfer);
             mks->useInitializer = true;
             mks->alwaysUseInitializer = true;
             (yyval.pExpression) = mks;
@@ -12264,7 +12260,7 @@ yyreduce:
 
   case 948: /* make_table_decl: "{{" make_table optional_trailing_semicolon_cur_cur  */
                                                                           {
-        auto mkt = make_smart<TypeDecl>(Type::autoinfer);
+        auto mkt = new TypeDecl(Type::autoinfer);
         mkt->dim.push_back(TypeDecl::dimAuto);
         ((ExprMakeArray *)(yyvsp[-1].pExpression))->makeType = mkt;
         (yyvsp[-1].pExpression)->at = tokAt(scanner,(yylsp[-2]));
@@ -12276,9 +12272,9 @@ yyreduce:
 
   case 949: /* make_table_decl: "table" '(' optional_expr_map_tuple_list ')'  */
                                                                        {
-        auto mka = make_smart<ExprMakeArray>(tokAt(scanner,(yylsp[-3])));
+        auto mka = new ExprMakeArray(tokAt(scanner,(yylsp[-3])));
         mka->values = sequenceToList((yyvsp[-1].pExpression));
-        mka->makeType = make_smart<TypeDecl>(Type::autoinfer);
+        mka->makeType = new TypeDecl(Type::autoinfer);
         auto ttm = yyextra->g_Program->makeCall(tokAt(scanner,(yylsp[-3])),"to_table_move");
         ttm->arguments.push_back(mka);
         (yyval.pExpression) = ttm;
@@ -12288,7 +12284,7 @@ yyreduce:
   case 950: /* make_table_decl: "table" '<' type_declaration_no_options '>' '(' optional_expr_map_tuple_list ')'  */
                                                                                                                  {
         if ( (yyvsp[-1].pExpression) ) {
-            auto mka = make_smart<ExprMakeArray>(tokAt(scanner,(yylsp[-6])));
+            auto mka = new ExprMakeArray(tokAt(scanner,(yylsp[-6])));
             mka->values = sequenceToList((yyvsp[-1].pExpression));
             mka->makeType = (yyvsp[-4].pTypeDecl);
             auto ttm = yyextra->g_Program->makeCall(tokAt(scanner,(yylsp[-6])),"to_table_move");
@@ -12297,9 +12293,9 @@ yyreduce:
         } else {
             auto msd = new ExprMakeStruct();
             msd->at = tokAt(scanner,(yylsp[-6]));
-            msd->makeType = make_smart<TypeDecl>(Type::tTable);
+            msd->makeType = new TypeDecl(Type::tTable);
             msd->makeType->firstType = (yyvsp[-4].pTypeDecl);
-            msd->makeType->secondType = make_smart<TypeDecl>(Type::tVoid);
+            msd->makeType->secondType = new TypeDecl(Type::tVoid);
             msd->at = tokAt(scanner,(yylsp[-6]));
             msd->useInitializer = true;
             msd->alwaysUseInitializer = true;
@@ -12311,9 +12307,9 @@ yyreduce:
   case 951: /* make_table_decl: "table" '<' type_declaration_no_options c_or_s type_declaration_no_options '>' '(' optional_expr_map_tuple_list ')'  */
                                                                                                                                                              {
         if ( (yyvsp[-1].pExpression) ) {
-            auto mka = make_smart<ExprMakeArray>(tokAt(scanner,(yylsp[-8])));
+            auto mka = new ExprMakeArray(tokAt(scanner,(yylsp[-8])));
             mka->values = sequenceToList((yyvsp[-1].pExpression));
-            mka->makeType = make_smart<TypeDecl>(Type::tTuple);
+            mka->makeType = new TypeDecl(Type::tTuple);
             mka->makeType->argTypes.push_back((yyvsp[-6].pTypeDecl));
             mka->makeType->argTypes.push_back((yyvsp[-4].pTypeDecl));
             auto ttm = yyextra->g_Program->makeCall(tokAt(scanner,(yylsp[-8])),"to_table_move");
@@ -12322,7 +12318,7 @@ yyreduce:
         } else {
             auto msd = new ExprMakeStruct();
             msd->at = tokAt(scanner,(yylsp[-8]));
-            msd->makeType = make_smart<TypeDecl>(Type::tTable);
+            msd->makeType = new TypeDecl(Type::tTable);
             msd->makeType->firstType = (yyvsp[-6].pTypeDecl);
             msd->makeType->secondType = (yyvsp[-4].pTypeDecl);
             msd->at = tokAt(scanner,(yylsp[-8]));

@@ -39,6 +39,8 @@ var public {
     group_function_overloads = true
 }
 
+var private seen_function_labels : table<string; uint>
+
 
 
 def PANIC(message : string) {
@@ -72,24 +74,12 @@ def global_label_name(value : Variable?) {
     return "global-{module_name(value._module)}-{value.name}"
 }
 
-def global_label_name(value : VariablePtr) {
-    return global_label_name(get_ptr(value))
-}
-
 def enum_label_name(value : Enumeration?) {
     return "enum-{module_name(value._module)}-{value.name}"
 }
 
-def enum_label_name(value : EnumerationPtr) {
-    return enum_label_name(get_ptr(value))
-}
-
 def struct_label_name(value : Structure?) {
     return "struct-{module_name(value._module)}-{value.name}"
-}
-
-def struct_label_name(value : StructurePtr) {
-    return struct_label_name(get_ptr(value))
 }
 
 def handle_label_name(value) {
@@ -124,9 +114,9 @@ def public safe_function_name(name : string) : string {
         ("|", "")])
 }
 
-def public function_label_file(value : FunctionPtr | Function?; drop_args : int = 0) {
+def public function_label_file(value : FunctionPtr; drop_args : int = 0) {
     //! Generates a unique RST label for a function based on its name and argument types.
-    var mn = build_string() $(var w) {
+    let mn = build_string() $(var w) {
         w |> write(value.name)
         var drop = drop_args
         for (arg in value.arguments) {
@@ -174,9 +164,9 @@ def public function_label_file(value : FunctionPtr | Function?; drop_args : int 
     return "{safe_function_name(string(value.name))}-{hash(mn)}"
 }
 
-def public function_label_file(name; value : smart_ptr<TypeDecl>&; drop_args : int = 0) {
+def public function_label_file(name; value : TypeDecl?&; drop_args : int = 0) {
     //! Generates a unique RST label for a function type based on its name and argument types.
-    var mn = build_string() $(var w) {
+    let mn = build_string() $(var w) {
         w |> write(name)
         var drop = drop_args
         for (arg in value.argTypes) {
@@ -190,7 +180,7 @@ def public function_label_file(name; value : smart_ptr<TypeDecl>&; drop_args : i
     return "{safe_function_name(string(name))}-{hash(mn)}"
 }
 
-def function_short_mangled_name(value : FunctionPtr | Function?) {
+def function_short_mangled_name(value : FunctionPtr) {
     return build_string() $(var w) {
         if (value._module != null) {
             w |> write(module_name(value._module))
@@ -210,7 +200,7 @@ def function_short_mangled_name(value : FunctionPtr | Function?) {
     }
 }
 
-def function_label_name(value : FunctionPtr | Function?) {
+def function_label_name(value : FunctionPtr) {
     let mn = function_short_mangled_name(value)
     let res = "function-{safe_function_name(mn)}"
     // For generic functions, append a line suffix to disambiguate overloads
@@ -232,15 +222,18 @@ def function_label_name(value : FunctionPtr | Function?) {
             return "{res}_{value.at.line}"
         }
     }
+    // Detect label collisions (e.g. smart_ptr<T> vs T? producing same label)
+    // and disambiguate with line number. Same function seen twice (TOC + def) is not a collision.
+    let lower_res = to_lower(res)
+    if (key_exists(seen_function_labels, lower_res)) {
+        if (seen_function_labels[lower_res] != value.at.line) {
+            return "{res}_{value.at.line}"
+        }
+    }
+    seen_function_labels[lower_res] = value.at.line
     return res
 }
 
-
-def describe_type_short(td : TypeDecl?) {
-    unsafe {
-        return describe_type_short(reinterpret<TypeDeclPtr> td)
-    }
-}
 
 def cleanup_type_short(name : string) {
     var res = name
@@ -364,7 +357,7 @@ def describe_type_short(td : TypeDeclPtr) {
     return cleanup_type_short(res)
 }
 
-def public describe_short(expr : Expression? | smart_ptr<Expression>&) {
+def public describe_short(expr : Expression? | Expression?&) {
     //! Returns a short description of an expression, using empty parentheses for empty make-structs.
     if (expr is ExprMakeStruct) {
         let str = expr as ExprMakeStruct
@@ -375,7 +368,7 @@ def public describe_short(expr : Expression? | smart_ptr<Expression>&) {
             }
         }
         if (count == 0) {
-            var res = describe_type_short(str.makeType) + "()"
+            let res = describe_type_short(str.makeType) + "()"
             return res
         }
     }
@@ -383,7 +376,7 @@ def public describe_short(expr : Expression? | smart_ptr<Expression>&) {
     return describe(expr)
 }
 
-def rst_describe_function_short(func : FunctionPtr | Function?) {
+def rst_describe_function_short(func : FunctionPtr) {
     var inscope args : array<string>
     for (x in func.arguments) {
         continue if (x._type.baseType == Type.fakeContext)
@@ -404,12 +397,6 @@ def rst_describe_function_short(func : FunctionPtr | Function?) {
 }
 
 def describe_type(td : TypeDecl?) {
-    unsafe {
-        return describe_type(reinterpret<TypeDeclPtr> td)
-    }
-}
-
-def describe_type(td : TypeDeclPtr) {
     return build_string() $(var writer) {
         if (!empty(td.alias) && !td.isAuto && !td.isAlias) {
             write(writer, make_ref(alias_label_name(td), string(td.alias)))
@@ -433,13 +420,17 @@ def describe_type(td : TypeDeclPtr) {
                 write(writer, "vector<smart_ptr<")
                 write(writer, hname |> slice(20))
                 write(writer, ">>")
+            } elif (hname |> starts_with("dasvector`ptr`")) {// 14 characters
+                write(writer, "vector<")
+                write(writer, hname |> slice(14))
+                write(writer, "*>")
             } elif (hname |> starts_with("dasvector`")) {// 10 characters
                 write(writer, "vector<")
                 write(writer, hname |> slice(10))
                 write(writer, ">")
             } elif (hname |> starts_with("pair`")) {// 5 characters
                 write(writer, "pair<")
-                var parts <- split(hname, "`")
+                let parts <- split(hname, "`")
                 write(writer, parts[1])
                 write(writer, ",")
                 write(writer, parts[2])
@@ -687,7 +678,6 @@ def make_table(title : string; tab : array<array<string>>) {
 
 def make_table_(tab : array<array<string>>; withHeader : bool = false) {
     return build_string() $(writer) {
-        let rows = length(tab)
         var cols = 0
         for (c in tab) {
             cols = max(cols, length(c))
@@ -764,7 +754,7 @@ def document_topic(doc_file : file; topic, content : string implicit) {
     }
 }
 
-def document_function_topic(doc_file : file; resType : smart_ptr<TypeDecl>&; topic, content : string implicit; var args : array<array<string>>) {
+def document_function_topic(doc_file : file; resType : TypeDecl?&; topic, content : string implicit; var args : array<array<string>>) {
 
     var paramsIdx = -1
     var returnsIdx = -1
@@ -778,8 +768,8 @@ def document_function_topic(doc_file : file; resType : smart_ptr<TypeDecl>&; top
             let l = lines[lineIdx]
             var found = false
             if (l |> starts_with(":param")) {
-                var parts <- l |> slice(7) |> split(":")
-                var name = parts[0] |> trim()
+                let parts <- l |> slice(7) |> split(":")
+                let name = parts[0] |> trim()
                 for (arg, idx in args, count()) {
                     continue if (idx == 0)
                     if (arg[0] == name) {
@@ -962,7 +952,7 @@ def document_bitfield(mod : Module?; doc_file : file; name : string; value : Typ
     for_each_global(mod) $(glob) {
         if (glob.flags.bitfield_constant && glob._type.describe_type_short() == shortType) {
             var line : array<string>
-            var parts <- split(string(glob.name), "`")
+            let parts <- split(string(glob.name), "`")
             push(line, parts.length() > 2 ? parts[2] : parts[0])
             push(line, "{(glob.init as ExprConstBitfield).value}")
             emplace(tab, line)
@@ -1221,8 +1211,8 @@ def document_class_method(doc_file : file; mod : Module?; value; var fld) {
     fwrite(doc_file, make_label(function_label_name(func)))
 
     let argNames <- [for (arg in func.arguments); string(arg.name)]
-    let argTypes <- [for (arg in func.arguments); get_ptr(arg._type)]
-    let argInits <- [for (arg in func.arguments); get_ptr(arg.init)]
+    let argTypes <- [for (arg in func.arguments); arg._type]
+    let argInits <- [for (arg in func.arguments); arg.init]
     (document_function_declaration(doc_file, "das:function", "{value.name}.{fld.name}",
         argNames, argTypes, argInits, fld._type.firstType, /*drop args*/1))
     // if fld._type.firstType != null && !fld._type.firstType.isVoid
@@ -1244,8 +1234,8 @@ def document_struct_method(doc_file : file; mod : Module?; value; var func) {
     fwrite(doc_file, make_label(function_label_name(func)))
 
     let argNames <- [for (arg in func.arguments); string(arg.name)]
-    let argTypes <- [for (arg in func.arguments); get_ptr(arg._type)]
-    let argInits <- [for (arg in func.arguments); get_ptr(arg.init)]
+    let argTypes <- [for (arg in func.arguments); arg._type]
+    let argInits <- [for (arg in func.arguments); arg.init]
     (document_function_declaration(doc_file, "das:function", "{value.name}.{fname}",
         argNames, argTypes, argInits, func.result, /*drop args*/1))
 
@@ -1263,7 +1253,7 @@ def document_struct_method(doc_file : file; mod : Module?; value; var func) {
     //   non-static methods (isStaticClassMethod=false): self NOT in args (added during inference) → skip 1 for hash
     //   static methods (isStaticClassMethod=true): self IS in args (explicit) → skip 0 for hash
     let hash_drop = is_static ? 0 : 1
-    var mn = build_string() $(var w) {
+    let mn = build_string() $(var w) {
         w |> write(fname)
         var drop = hash_drop
         for (arg in func.arguments) {
@@ -1278,7 +1268,7 @@ def document_struct_method(doc_file : file; mod : Module?; value; var func) {
     document_function_topic(doc_file, func.result, topic("function", mod, "{value.name}-{file_label}"), "def {value.name}.{fname}", args)
 }
 
-def make_requirements_list(value : smart_ptr<ast::Structure>) {
+def make_requirements_list(value : ast::Structure?) {
     var inscope requiredComps : array<string>
     for (ann in value.annotations) {
         if (ann.annotation.name == "require") {
@@ -1287,7 +1277,7 @@ def make_requirements_list(value : smart_ptr<ast::Structure>) {
             }
         }
     }
-    var compsCount = length(requiredComps)
+    let compsCount = length(requiredComps)
     if (compsCount == 0) {
         return ""
     }
@@ -1390,7 +1380,7 @@ def document_classes(doc_file : file; mods : array<Module?>) {
                 }
             }
             var first = true
-            var inscope annT <- new TypeDecl(baseType = Type.tStructure, structType = get_ptr(value))
+            var annT = new TypeDecl(baseType = Type.tStructure, structType = value)
             for_each_function(mod, "") $(func) {
                 if (func.flags.isClassMethod && func.classParent == value && func.name == value.name && !is_trivial_ctor(func)) {
                     // ctor
@@ -1556,7 +1546,7 @@ def document_structure(doc_file : file; mod : Module?; var value : StructurePtr)
         document_struct_method(doc_file, mod, value, func)
     }
 
-    var inscope annT <- new TypeDecl(baseType = Type.tStructure, structType = get_ptr(value))
+    var annT = new TypeDecl(baseType = Type.tStructure, structType = value)
     var first = true
     for_each_function(mod, "") $(func) {
         if (func.flags.isClassMethod && func.classParent == value && func.name == value.name && !is_trivial_ctor(func)) {// ctor
@@ -1615,7 +1605,7 @@ def document_structure_annotation(doc_file : file; mod : Module?; value) {
 
     var props : array<array<string>>
     props |> emplace(array<string>("field", "type"))
-    var inscope annT <- new TypeDecl(baseType = Type.tHandle,
+    var annT = new TypeDecl(baseType = Type.tHandle,
         annotation = unsafe(reinterpret<TypeAnnotation?> value))
     for_each_function(mod, "") $(func) {
         if (!func.moreFlags.propertyFunction) {
@@ -1942,7 +1932,7 @@ def document_typeinfo_macros(doc_file : file; mods : array<Module?>) {
     }
 }
 
-def function_needs_documenting(func : FunctionPtr | Function?) {
+def function_needs_documenting(func : FunctionPtr) {
     if (func.flags.generated) {
         return false
     }
@@ -2010,7 +2000,7 @@ def document_warning(doc_file : file; issue : string) {
     fwrite(doc_file, "\n  {issue}\n\n")
 }
 
-def function_name(func : FunctionPtr | Function?) {
+def function_name(func : FunctionPtr) {
     let name = "{func.name}"
     if (!empty(func.name)) {
         let ch = first_character(name)
@@ -2055,10 +2045,10 @@ def function_name(func : FunctionPtr | Function?) {
     return name
 }
 
-def document_function(doc_file : file; mod : Module?; var func : FunctionPtr | Function?; drop_args : int = 0; prefix : string = ""; objType : string = "das:function"; skip_body : bool = false) {
+def document_function(doc_file : file; mod : Module?; var func : FunctionPtr; drop_args : int = 0; prefix : string = ""; objType : string = "das:function"; skip_body : bool = false) {
     let argNames <- [for (arg in func.arguments); string(arg.name)]
-    let argTypes <- [for (arg in func.arguments); get_ptr(arg._type)]
-    let argInits <- [for (arg in func.arguments); get_ptr(arg.init)]
+    let argTypes <- [for (arg in func.arguments); arg._type]
+    let argInits <- [for (arg in func.arguments); arg.init]
     fwrite(doc_file, make_label(function_label_name(func)))
     let funcSafeName = function_name(func)
     (document_function_declaration(doc_file, objType, funcSafeName,
@@ -2097,7 +2087,7 @@ def document_functions(doc_file : file; mods : array<Module?>; var groups : arra
                 for (func in grp.func) {
                     if (!key_exists(tab, func.fn)) {
                         let descr = rst_describe_function_short(func.fn)
-                        var labn = function_label_name(func.fn)
+                        let labn = function_label_name(func.fn)
                         fwrite(doc_file, "  * {make_ref(labn,descr)}\n")
                     }
                 }
@@ -2163,7 +2153,7 @@ def document_functions(doc_file : file; mods : array<Module?>; var groups : arra
             if (!function_needs_documenting(func)) {
                 return
             }
-            var pfunc = get_ptr(func)
+            var pfunc = func
             if (tab.key_exists(pfunc)) {
                 return
             }
@@ -2178,7 +2168,7 @@ def document_functions(doc_file : file; mods : array<Module?>; var groups : arra
             if (!function_needs_documenting(func)) {
                 return
             }
-            var pfunc = get_ptr(func)
+            var pfunc = func
             if (tab.key_exists(pfunc)) {
                 return
             }
@@ -2213,14 +2203,14 @@ def public append_to_group_by_regex(var group : DocGroup; var mod : Module?; var
     for_each_function(mod, "") $(func) {
         if (function_needs_documenting(func)) {
             if (regex_match(reg, string(func.name)) != -1) {
-                push(group.func, (get_ptr(func), mod))
+                push(group.func, (func, mod))
             }
         }
     }
     for_each_generic(mod) $(func) {
         if (function_needs_documenting(func)) {
             if (regex_match(reg, string(func.name)) != -1) {
-                push(group.func, (get_ptr(func), mod))
+                push(group.func, (func, mod))
             }
         }
     }
@@ -2261,7 +2251,7 @@ def private generate_topic_stub(var tab : table<string>; doc_file : file; topic 
 }
 
 def private generate_substitute_stub(mod : Module?; substname : string) {
-    var st : FStat
+    var _st : FStat
     // if stat(substname,st)   // this is actually 'see if it exists'
     //     return
     mkdir_rec(dir_name(substname))
@@ -2326,7 +2316,7 @@ def public document(name : string; var mod : Module?; fname : string; var groups
     //! Document single module given list of `DocGropus`.
     //! This will generate RST file with documentation for the module.
     //! Functions which do not match any `DocGroup` will be placed in the `Uncategorized` group.
-    var mods : array<Module?> = [mod]
+    let mods : array<Module?> = [mod]
     documents(name, mods, fname, groups, hook)
 }
 
@@ -2339,6 +2329,7 @@ struct public DocsHook {
 
 def public documents(name : string; mods : array<Module?>; fname : string; var groups : array<DocGroup>; var hook : DocsHook = DocsHook()) {
     //! Generates complete RST documentation for a set of modules into the specified file.
+    clear(seen_function_labels)
     static_if (log_documentation) {
         print("Documenting {name} into {fname}\n")
     }

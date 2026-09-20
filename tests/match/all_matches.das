@@ -522,16 +522,16 @@ def test_all_match(t : T?) {
     }
     t |> run("match handle ptr") @@(t : T?) {
         t |> equal("null", match_handle_ptr(default<TypeDeclPtr>))
-        var inscope tp <- new TypeDecl(baseType = Type.tPointer)
+        var tp = new TypeDecl(baseType = Type.tPointer)
         t |> equal("pointer", match_handle_ptr(tp))
-        var inscope tnp <- new TypeDecl(baseType = Type.tInt)
+        var tnp = new TypeDecl(baseType = Type.tInt)
         t |> equal("anything", match_handle_ptr(tnp))
     }
     t |> run("match ast expression ptr") @@(t : T?) {
         t |> equal("null", match_ast_expr_ptr(default<ExpressionPtr>))
-        var inscope ep <- new ExprConstInt(value = 13)
+        var ep <- new ExprConstInt(value = 13)
         t |> equal("int 13", match_ast_expr_ptr(ep))
-        var inscope fp <- new ExprConstFloat(value = 13.0)
+        var fp <- new ExprConstFloat(value = 13.0)
         t |> equal("anything", match_ast_expr_ptr(fp))
     }
     t |> run("match as is") @@(t : T?) {

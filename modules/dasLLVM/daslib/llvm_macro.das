@@ -1,6 +1,7 @@
 options gen2
 options indenting = 4
 options strict_smart_pointers = false
+options stack = 4_194_304
 
 require llvm/daslib/llvm_boost
 require llvm/daslib/llvm_dll_utils
@@ -28,7 +29,7 @@ struct JitState {
 def public free_jit_context {
     // Free everything only if it's the last one context.
     if (get_context_share_counter() == 1ul) {
-        get_jit_state() <| $(dll, ee, ctx : void?) {
+        get_jit_state() $(dll, ee, ctx : void?) {
             if (dll != null) {
                 close_dynamic_library(dll)
             } elif (ee != null || ctx != null) {
@@ -112,9 +113,9 @@ class JIT_LLVM : AstSimulateMacro {
         // Set global options
         LLVM_JIT_ALLOW_UNALIGNED_VECTOR_READ_OUT_OF_BOUNDS = prog._options |> find_arg("jit_vec3_ldu") ?as tBool ?? LLVM_JIT_ALLOW_UNALIGNED_VECTOR_READ_OUT_OF_BOUNDS_DEFAULT
 
-        prog |> for_each_module <| $(mod) {
-            mod |> for_each_function("") <| $(fun) {
-                var rqj = fun.moreFlags.requestJit
+        prog |> for_each_module() $(mod) {
+            mod |> for_each_function("") $(fun) {
+                let rqj = fun.moreFlags.requestJit
                 fun.moreFlags &= ~MoreFunctionFlags.requestJit
                 if (fun.flags.used && (jit_all_functions || rqj)) {
                     if (!fun.moreFlags.requestNoJit) {
@@ -147,8 +148,10 @@ class JIT_LLVM : AstSimulateMacro {
             let attrs = new Attributes(g_ctx)
             var uids = create_uid_nodes(prog, funcs)
             var fake_visitor = new LlvmJitVisitor(ctx, g_prim_t, uids, jit_flags, null, attrs)
-            for (fun in funcs) {
-                fake_visitor->add_llvm_functions(fun)
+            ast_gc_guard() {
+                for (fun in funcs) {
+                    fake_visitor->add_llvm_functions(fun)
+                }
             }
             unsafe {
                 delete fake_visitor
@@ -193,7 +196,7 @@ class JIT_LLVM : AstSimulateMacro {
                     g_failed = true
                 }
                 if (g_failed) {
-                    var fn_names = join([ for (fn in funcs); "{fn.name}" ], ",")
+                    let fn_names = join([ for (fn in funcs); "{fn.name}" ], ",")
                     panic("Internal jit error. Failed to get IR for functions {fn_names}.\n")
                 }
                 generate_global_ctors_dtors(g_prim_t, !(use_dll || gen_exe))
@@ -213,7 +216,7 @@ class JIT_LLVM : AstSimulateMacro {
                     g_failed = true
                 }
                 if (g_failed) {
-                    var fn_names = join([ for (fn in funcs); "{fn.name}" ], ",")
+                    let fn_names = join([ for (fn in funcs); "{fn.name}" ], ",")
                     panic("Internal jit error. Failed to get IR for functions {fn_names}.\n")
                 }
                 if (gen_exe) {
@@ -240,9 +243,9 @@ class JIT_LLVM : AstSimulateMacro {
             }
             if (!gen_exe) {
                 for (fun in funcs) {
-                    var mangled_name = get_mangled_name(fun)
+                    let mangled_name = get_mangled_name(fun)
                     let MNH = hash(mangled_name)
-                    var simfun = get_function_by_mangled_name_hash(MNH, *ctx)
+                    let simfun = get_function_by_mangled_name_hash(MNH, *ctx)
                     var gen = generate_llvm_code(g_dynamic_lib_handle, uids.get_dll_fn_name(fun), use_dll)
                     if (gen != null) {
                         gen |> unsafe(instrument_jit(simfun, fun.at, *ctx))

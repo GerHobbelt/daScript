@@ -210,7 +210,8 @@ extern "C" {
     public:
         ~JitContext() = default;
         JitContext(size_t totalVariables, size_t totalFunctions, size_t globalStringHeapSize,
-                  size_t globSize, size_t shrSize, bool pinvoke) {
+                  size_t globSize, size_t shrSize, bool pinvoke, uint32_t stackSize = 16*1024)
+            : Context(stackSize) {
             auto &context = *this;
             CodeOfPolicies policies;
             policies.debugger = false;
@@ -224,10 +225,9 @@ extern "C" {
             context.allocateGlobalsAndShared();
             memset(context.globals, 0, context.globalsSize);
             memset(context.shared, 0, context.sharedSize);
-
-            // Instead of copying everything like in standalone contexts
-            // Let's add only things we really need.
-            // And apparently now we need nothing.
+            if ( pinvoke ) {
+                context.contextMutex = new recursive_mutex;
+            }
         }
 
         void allocFunctions ( uint64_t count ) {
@@ -249,7 +249,7 @@ extern "C" {
 
         void *registerJitFunction ( uint64_t index, const char * name, const char * mangledName,
                                    uint64_t mnh, uint32_t stackSize, void * fnPtr,
-                                   bool cmres, bool fastcall, bool pinvoke ) {
+                                   bool cmres, bool fastcall, bool pinvoke, uint32_t nArguments ) {
             DAS_ASSERT(index < (uint64_t) totalFunctions);
             auto & fn = functions[index];
             fn.name = code->allocateName(name);
@@ -265,6 +265,7 @@ extern "C" {
             memset(finfo, 0, sizeof(FuncInfo));
             finfo->name = fn.name;
             finfo->stackSize = stackSize;
+            finfo->count = nArguments;
             fn.debugInfo = finfo;
             auto node = code->makeNode<SimNode_Jit>(LineInfo{}, (JitFunction) fnPtr);
             fn.code = node;
@@ -289,9 +290,11 @@ extern "C" {
                                                   uint64_t globalStringHeapSize,
                                                   uint64_t globalsSize,
                                                   uint64_t sharedSize,
-                                                  bool pinvoke) {
+                                                  bool pinvoke,
+                                                  uint64_t stackSize) {
         Context *context = new JitContext(totalVariables, totalFunctions, globalStringHeapSize,
-                                         globalsSize, sharedSize, pinvoke);
+                                         globalsSize, sharedSize, pinvoke,
+                                         stackSize ? (uint32_t)stackSize : 16*1024);
         static_cast<JitContext *>(context)->allocFunctions(totalFunctions);
         return context;
     }
@@ -300,9 +303,10 @@ extern "C" {
                                              const char * name, const char * mangledName,
                                              uint64_t mnh, uint32_t stackSize,
                                              void * fnPtr,
-                                             bool cmres, bool fastcall, bool pinvoke ) {
+                                             bool cmres, bool fastcall, bool pinvoke,
+                                             uint32_t nArguments ) {
         return static_cast<JitContext *>(ctx)->registerJitFunction(index, name, mangledName, mnh, stackSize,
-                                                            fnPtr, cmres, fastcall, pinvoke);
+                                                            fnPtr, cmres, fastcall, pinvoke, nArguments);
     }
 
     DAS_API void jit_register_standalone_variable ( Context * ctx, uint64_t mangledNameHash, uint64_t offset ) {
@@ -325,7 +329,7 @@ extern "C" {
             if ( module->name != moduleName ) return true;
             auto fn = module->findFunction(funcMangledName);
             if ( fn && fn->builtIn ) {
-                *dllGlobal = static_cast<BuiltInFunction *>(fn.get())->getBuiltinAddress();
+                *dllGlobal = static_cast<BuiltInFunction *>(fn)->getBuiltinAddress();
                 found = *dllGlobal != nullptr;
                 return !found;
             }
@@ -337,7 +341,7 @@ extern "C" {
                 auto resolverFn = module->findUniqueFunction("__dasbind_resolve");
                 if ( resolverFn && resolverFn->builtIn ) {
                     auto resolver = (void * (*)(const char *))
-                        static_cast<BuiltInFunction *>(resolverFn.get())->getBuiltinAddress();
+                        static_cast<BuiltInFunction *>(resolverFn)->getBuiltinAddress();
                     if ( resolver ) {
                         *dllGlobal = resolver(funcMangledName);
                         found = *dllGlobal != nullptr;
@@ -581,7 +585,6 @@ extern "C" {
             context->throw_error_at(at, "can't find ast_typeinfo for hash %" PRIx64, hash);
         }
         auto info = ti->second;
-        info->addRef();
         return (void*) info;
     }
 }
@@ -746,7 +749,7 @@ extern "C" {
     }
 
 #if (defined(_MSC_VER) || defined(__linux__) || defined(__APPLE__)) && !defined(_GAMING_XBOX) && !defined(_DURANGO)
-    void create_shared_library ( const char * objFilePath, const char * libraryName, [[maybe_unused]] const char * dasLib, const char * customLinker, bool isShared ) {
+    void create_shared_library ( const char * objFilePath, const char * libraryName, [[maybe_unused]] const char * dasLib, const char * customLinker, bool isShared, Context *context ) {
         char cmd[1024];
         const auto [linker, dasLibrary] = get_real_lib_linker_paths(dasLib, customLinker);
 
@@ -807,15 +810,19 @@ extern "C" {
             }
         }
 
+        auto li = LineInfo();
         if ( int status = pclose(fp); status != 0 ) {
-            LOG(LogLevel::error) << "Failed to make shared library " << libraryName << ", command '" << cmd << "'\n";
-            printf("Output:\n%s", output);
+            string msg = string("Failed to make shared library ") + libraryName + ", command '" + cmd + "'\n";
+            context->to_out(&li, LogLevel::error, msg.c_str());
+            string err = string("Output:\n") + output;
+            context->to_out(&li, LogLevel::error, err.c_str());
         } else {
-            LOG(LogLevel::debug) << "Library " << libraryName << " made - ok\n";
+            string msg = string("Library ") + libraryName + " made - ok\n";
+            context->to_out(&li, LogLevel::info, msg.c_str());
         }
     }
 #else
-    void create_shared_library ( const char * objFilePath, const char * libraryName, [[maybe_unused]] const char * dasLib, const char * customLinker, bool isShared ) { }
+    void create_shared_library ( const char * objFilePath, const char * libraryName, [[maybe_unused]] const char * dasLib, const char * customLinker, bool isShared, Context *context ) { }
 #endif
 
     void jit_set_jit_state(Context & context, void *shared_lib, void *llvm_ee, void *llvm_context) {
@@ -962,7 +969,7 @@ extern "C" {
                     ->args({"library"});
             addExtern<DAS_BIND_FUN(create_shared_library)>(*this, lib,  "create_shared_library",
                 SideEffects::worstDefault, "create_shared_library")
-                    ->args({"objFilePath","libraryName","dasLib","customLinker", "isShared"});
+                    ->args({"objFilePath","libraryName","dasLib","customLinker", "isShared", "context"});
             addExtern<DAS_BIND_FUN(jit_set_jit_state)>(*this, lib,  "set_jit_state",
                 SideEffects::worstDefault, "jit_set_jit_state")
                     ->args({"context","shared_lib","llvm_ee","llvm_ctx"});

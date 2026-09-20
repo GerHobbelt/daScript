@@ -22,7 +22,7 @@ require stbimage/stbimage_boost
 
 def make_gradient(w, h : int) : Image {
     var img = make_image(w, h, 4)
-    img |> with_pixels() <| $(var pixels : array<uint8>#) {
+    img |> with_pixels() $(var pixels : array<uint8>#) {
         for (i in range(w * h)) {
             let x = i % w
             let y = i / w
@@ -37,7 +37,7 @@ def make_gradient(w, h : int) : Image {
 
 def make_solid(w, h : int; r, g, b, a : uint8) : Image {
     var img = make_image(w, h, 4)
-    img |> with_pixels() <| $(var pixels : array<uint8>#) {
+    img |> with_pixels() $(var pixels : array<uint8>#) {
         for (i in range(w * h)) {
             pixels[i * 4 + 0] = r
             pixels[i * 4 + 1] = g
@@ -88,8 +88,8 @@ def example_flip() {
     print_img("Flipped horizontal", flipped_h)
     // Verify: top-left pixel of original should be bottom-left of flipped_v
     var match_v = false
-    img |> with_pixels() <| $(var orig : array<uint8>#) {
-        flipped_v |> with_pixels() <| $(var flip : array<uint8>#) {
+    img |> with_pixels() $(var orig : array<uint8>#) {
+        flipped_v |> with_pixels() $(var flip : array<uint8>#) {
             let last_row = (32 - 1) * 32 * 4
             match_v = orig[0] == flip[last_row] && orig[1] == flip[last_row + 1]
         }
@@ -148,16 +148,16 @@ def example_blit() {
 
 def example_make_image() {
     // Standard 8-bit RGBA
-    var rgba = make_image(100, 100, 4)
+    let rgba = make_image(100, 100, 4)
     print_img("RGBA uint8", rgba)
     // HDR float image
-    var hdr = make_image(100, 100, 3, 4)
+    let hdr = make_image(100, 100, 3, 4)
     print_img("RGB float", hdr)
     // Single-channel grayscale
-    var grey = make_image(100, 100, 1)
+    let grey = make_image(100, 100, 1)
     print_img("Greyscale", grey)
     // 16-bit image
-    var img16 = make_image(100, 100, 4, 2)
+    let img16 = make_image(100, 100, 4, 2)
     print_img("RGBA uint16", img16)
 }
 

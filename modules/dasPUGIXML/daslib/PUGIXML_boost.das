@@ -68,7 +68,7 @@ def each(node_set : xpath_node_set?) : iterator<xpath_node> {
     //! Because the iterator is named ``each``, the call can be omitted:
     //!
     //!   ``for (xn in node_set) { ... }``
-    return <- generator<xpath_node>() <| $ {
+    return <- generator<xpath_node> {
         let n = node_set.size
         for (i in range(n)) {
             yield at(node_set, i)
@@ -83,7 +83,7 @@ def each_child(node : xml_node) : iterator<xml_node> {
     //! Intended for use in ``for`` loops:
     //!
     //!   ``for (ch in each_child(node)) { ... }``
-    return <- generator<xml_node>() <| $ {
+    return <- generator<xml_node> {
         var ch = node.first_child
         while (ch.ok) {
             var next = ch.next_sibling   // capture before yield (user may mutate)
@@ -100,7 +100,7 @@ def each_child(node : xml_node; name : string) : iterator<xml_node> {
     //! matches *name*. Intended for use in ``for`` loops:
     //!
     //!   ``for (ch in each_child(node, "item")) { ... }``
-    return <- generator<xml_node>() <| $ {
+    return <- generator<xml_node> {
         var ch = child(node, name)
         while (ch.ok) {
             var next = next_sibling(ch, name)   // capture before yield
@@ -117,7 +117,7 @@ def each_attribute(node : xml_node) : iterator<xml_attribute> {
     //! Intended for use in ``for`` loops:
     //!
     //!   ``for (a in each_attribute(node)) { ... }``
-    return <- generator<xml_attribute>() <| $ {
+    return <- generator<xml_attribute> {
         var a = node.first_attribute
         while (a.ok) {
             var next = a.next_attribute   // capture before yield
@@ -262,7 +262,7 @@ def tag(var node : xml_node; name : string; blk : block<(var child : xml_node) :
     //! Appends a child element with *name*, invokes *blk* with it, and
     //! returns the new child. Use with pipe+block for nested XML:
     //!
-    //!   ``node |> tag("book") <| $(var book) { book |> tag("title", "...") }``
+    //!   ``node |> tag("book") $(var book) { book |> tag("title", "...") }``
     var ch = append_child(node, name)
     invoke(blk, ch)
     return ch
@@ -285,7 +285,7 @@ def tag(var node : xml_node; name : string) : xml_node {
 
 def tag(doc : xml_document?; name : string; blk : block<(var child : xml_node) : void>) : xml_node {
     //! Appends a child element to a document, invokes *blk*, returns it.
-    //! Allows ``doc |> tag("root") <| $(var root) { ... }`` without manual
+    //! Allows ``doc |> tag("root") $(var root) { ... }`` without manual
     //! ``doc as xml_node``.
     var dnode = doc as xml_node
     var ch = append_child(dnode, name)
@@ -630,7 +630,7 @@ def from_XML(node : xml_node; anything : auto(TT)) {
         var ch = node.first_child
         for (i in 0..typeinfo dim(anything)) {
             if (ch.ok) {
-                var next_ch = ch.next_sibling
+                let next_ch = ch.next_sibling
                 move_to_ref(ret[i], _::from_XML(ch, decltype_noref(anything[0])))
                 ch = next_ch
             }
@@ -679,7 +679,7 @@ def from_XML(node : xml_node; anything : auto(TT)) {
         var ret : TT
         var ch = node.first_child
         while (ch.ok) {
-            var next_ch = ch.next_sibling
+            let next_ch = ch.next_sibling
             static_if (typeinfo can_copy(anything[0])) {
                 ret |> push_clone <| _::from_XML(ch, decltype_noref(anything[0]))
             } else {
@@ -718,12 +718,12 @@ def from_XML(node : xml_node; anything : auto(TT)) {
 def from_XML(node : xml_node; ent : auto(VecT); defV : VecT = VecT()) : VecT {
     //! Deserializes an XML node into a vector or range value.
     //! Each component (``x``, ``y``, ``z``, ``w``) is a child element.
-    let VecV : auto(VecTT) = VecT()
-    static_if (typeinfo vector_dim(VecV) == 2) {
+    let _VecV : auto(VecTT) = VecT()
+    static_if (typeinfo vector_dim(_VecV) == 2) {
         return VecTT(_::from_XML(child(node, "x"), decltype_noref(defV.x), defV.x), _::from_XML(child(node, "y"), decltype_noref(defV.y), defV.y))
-    } static_elif (typeinfo vector_dim(VecV) == 3) {
+    } static_elif (typeinfo vector_dim(_VecV) == 3) {
         return VecTT(_::from_XML(child(node, "x"), decltype_noref(defV.x), defV.x), _::from_XML(child(node, "y"), decltype_noref(defV.y), defV.y), _::from_XML(child(node, "z"), decltype_noref(defV.z), defV.z))
-    } static_elif (typeinfo vector_dim(VecV) == 4) {
+    } static_elif (typeinfo vector_dim(_VecV) == 4) {
         return VecTT(_::from_XML(child(node, "x"), decltype_noref(defV.x), defV.x), _::from_XML(child(node, "y"), decltype_noref(defV.y), defV.y), _::from_XML(child(node, "z"), decltype_noref(defV.z), defV.z), _::from_XML(child(node, "w"), decltype_noref(defV.w), defV.w))
     }
 }
@@ -735,7 +735,7 @@ def from_XML(node : xml_node; anything : table<auto(KT); auto(VT)>) {
     var ret : table<KT; VT>
     var ch = node.first_child
     while (ch.ok) {
-        var next_ch = ch.next_sibling
+        let next_ch = ch.next_sibling
         let key_ch = child(ch, "_key")
         let val_ch = child(ch, "_val")
         unsafe {

@@ -10,8 +10,8 @@ The `style_lint` module detects non-idiomatic patterns in daslang code at compil
 - **Entry point:** `[lint_macro] class StyleLintMacro : AstPassMacro` calls `style_lint(prog, true)`
 - **Visitor:** `class StyleLintVisitor : AstVisitor` — walks the AST with source-line inspection
 - **Error reporting:** `macro_style_warning(compiling_program(), at, message)` — reports as error code 40218
-- **Utility:** `utils/style_lint/main.das` — standalone batch checker (compile-only, no simulation)
-- **Tests:** `utils/style_lint/tests/` — one file per rule
+- **Utility:** `utils/lint/main.das` — unified lint checker (all 3 passes: paranoid, perf, style)
+- **Tests:** `utils/lint/tests/` — one file per rule
 
 ## Rules
 
@@ -30,6 +30,8 @@ Note: `get_ptr()` related patterns (null comparison, field access) are in `perf_
 ### Source-line inspection (STYLE001-003)
 
 The `<|` pipe and `$()` are desugared during parsing — in the compiled AST, `foo() <| $(a) { body }` and `foo() $(a) { body }` produce identical `ExprCall` nodes. The visitor uses `get_file_source_line()` to read the original source text and check for `<|` or `$` between the call and the block argument.
+
+**Generators:** `generator<T>() <| $ { ... }` is fully lowered before the lint pass — `ExprMakeGenerator` becomes `ExprMakeStruct` + builtin `each` call. Detection uses `preVisitExprMakeStruct` with column-precise source line check: verifies the `ExprMakeStruct` at position starts with `generator<` in the source, then checks for `<|` pipe after it.
 
 ### Pure AST (STYLE005-006)
 
@@ -62,10 +64,10 @@ self->style_warning("STYLExxx: description; suggested fix", expr.at)
 
 ### 4. Write the test file
 
-Create `utils/style_lint/tests/styleXXX_rule_name.das` with a bad example and a good example. Test through the standalone runner:
+Create `utils/lint/tests/styleXXX_rule_name.das` with a bad example and a good example. Test through the standalone runner:
 
 ```bash
-bin/Release/daslang.exe utils/style_lint/main.das -- utils/style_lint/tests/styleXXX_rule_name.das
+bin/Release/daslang.exe utils/lint/main.das -- utils/lint/tests/styleXXX_rule_name.das --style-only
 ```
 
 ### 5. Suppression
@@ -89,7 +91,7 @@ The MCP `lint` tool (`utils/mcp/tools/lint_tool.das`) calls `style_lint_collect(
 ## Standalone Usage
 
 ```bash
-bin/Release/daslang.exe utils/style_lint/main.das -- file1.das [file2.das ...] [--quiet] [--postfix-conditionals]
+bin/Release/daslang.exe utils/lint/main.das -- file1.das [file2.das ...] [--quiet] [--style-only] [--postfix-conditionals]
 ```
 
 ## Known Limitations

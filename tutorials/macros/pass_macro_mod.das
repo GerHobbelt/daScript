@@ -39,7 +39,7 @@ class CodeStatsLint : AstPassMacro {
         // this macro (pass_macro_mod).
         let cm = compiling_module()
         let WARN_THRESHOLD = 4
-        cm |> for_each_function("") <| $(var func : FunctionPtr) {
+        cm |> for_each_function("") $(var func : FunctionPtr) {
             if (func.body == null || !(func.body is ExprBlock)) {
                 return
             }
@@ -65,11 +65,11 @@ class TraceCallsVisitor : AstVisitor {
     astChanged : bool = false
     @do_not_delete func : Function?
     def override preVisitFunction(var fun : FunctionPtr) {
-        func = get_ptr(fun)
+        func = fun
     }
     def override visitFunction(var fun : FunctionPtr) : FunctionPtr {
         // Skip our own helper to avoid infinite recursion at runtime.
-        if (string(fun.name) == "_trace_enter") {
+        if (fun.name == "_trace_enter") {
             func = null
             return <- fun
         }
@@ -89,7 +89,7 @@ class TraceCallsVisitor : AstVisitor {
         }
         // Insert _trace_enter("function_name") at the beginning of the body.
         let fname = string(fun.name)
-        var inscope expr <- qmacro(_trace_enter($v(fname)))
+        var expr = qmacro(_trace_enter($v(fname)))
         body.list |> emplace(expr, 0)
         astChanged = true
         func.not_inferred()
@@ -105,7 +105,7 @@ class TraceCallsPass : AstPassMacro {
         var astVisitor = new TraceCallsVisitor()
         var inscope astVisitorAdapter <- make_visitor(*astVisitor)
         visit(prog, astVisitorAdapter)
-        var result = astVisitor.astChanged
+        let result = astVisitor.astChanged
         unsafe {
             delete astVisitor
         }

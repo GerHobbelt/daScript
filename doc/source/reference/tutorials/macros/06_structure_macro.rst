@@ -149,17 +149,10 @@ Step 2 — Add a field
        qmacro($v(version)))
 
 ``add_structure_field`` appends a new field to the struct's field
-list.  It **moves** both the ``TypeDeclPtr`` and ``ExpressionPtr``
-arguments, so they must be either temporaries or clones.
+list.  It takes a ``TypeDecl?`` and ``ExpressionPtr`` for the field
+type and default value.
 
-.. warning::
-
-   Never pass a ``var inscope`` variable directly to
-   ``add_structure_field`` — it will be moved *and* destroyed at
-   scope exit, causing a double-free crash.  Always pass
-   ``clone_type(...)`` or an inline temporary.
-
-``qmacro_type(type<int>)`` creates a ``TypeDeclPtr`` for ``int``.
+``qmacro_type(type<int>)`` creates a ``TypeDecl?`` for ``int``.
 ``qmacro($v(version))`` creates an integer constant expression.
 
 
@@ -169,13 +162,13 @@ Step 3 — Generate a stub describe function
 .. code-block:: das
 
    let funcName = "describe_{st.name}"
-   var inscope bodyExprs : array<ExpressionPtr>
+   var bodyExprs : array<ExpressionPtr>
 
-   bodyExprs |> emplace_new <| qmacro(print($v("{st.name} (version ")))
-   bodyExprs |> emplace_new <| qmacro(print("{obj._version}"))
-   bodyExprs |> emplace_new <| qmacro(print($v("):\n")))
+   bodyExprs |> push <| qmacro(print($v("{st.name} (version ")))
+   bodyExprs |> push <| qmacro(print("{obj._version}"))
+   bodyExprs |> push <| qmacro(print($v("):\n")))
 
-   var inscope fn <- qmacro_function(funcName) $(obj : $t(st)) {
+   var fn = qmacro_function(funcName) $(obj : $t(st)) {
        $b(bodyExprs)
    }
    fn.flags |= FunctionFlags.generated
@@ -242,10 +235,10 @@ Step 2 — Find the stub function
 .. code-block:: das
 
    let funcName = "describe_{st.name}"
-   var inscope fn <- st._module |> find_unique_function(funcName)
+   var fn = st._module |> find_unique_function(funcName)
 
 ``find_unique_function`` (from ``daslib/ast_boost``) searches a
-module for a function by name.  It returns a ``smart_ptr<Function>``
+module for a function by name.  It returns a ``FunctionPtr``
 pointing to the same object in the module — modifications through
 this pointer affect the actual function.
 
@@ -280,6 +273,7 @@ Step 4 — Append field-printing statements
            blk.list |> emplace_new <| qmacro(print($v("  {fld.name} = ")))
            blk.list |> emplace_new <| qmacro(print("{obj.$f(fld.name)}"))
            blk.list |> emplace_new <| qmacro(print($v("\n")))
+
        }
    }
 
@@ -371,10 +365,10 @@ The usage file
 
    [export]
    def main() {
-       var c = Color(r = 0.2, g = 0.7, b = 1.0)
+       let c = Color(r = 0.2, g = 0.7, b = 1.0)
        describe_Color(c)
 
-       var p = Player(name = "Alice", health = 100, score = 42.5)
+       let p = Player(name = "Alice", health = 100, score = 42.5)
        describe_Player(p)
 
        print("Color version: {c._version}\n")
@@ -467,7 +461,7 @@ Key takeaways
    * - ``add_structure_field``
      - Appends a field to a struct; moves both type and init expression
    * - ``clone_type``
-     - Deep-clones a ``TypeDeclPtr``; required before move operations
+     - Deep-clones a ``TypeDecl?``
    * - ``qmacro_function``
      - Builds a complete function from reification splices
    * - ``$v(value)``
@@ -475,7 +469,7 @@ Key takeaways
    * - ``$f(name)``
      - Splice a string as a field-access name
    * - ``$t(type)``
-     - Splice a ``TypeDeclPtr`` into parameter/return types
+     - Splice a ``TypeDecl?`` into parameter/return types
    * - ``$b(stmts)``
      - Splice ``array<ExpressionPtr>`` as a statement list
    * - ``find_arg``

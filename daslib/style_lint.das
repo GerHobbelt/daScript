@@ -116,7 +116,57 @@ class StyleLintVisitor : AstVisitor {
     // --- function tracking ---
 
     def override preVisitFunction(var fn : FunctionPtr) : void {
-        current_function = get_ptr(fn)
+        current_function = fn
+        self->check_defer_pipe(fn)
+    }
+
+    // --- STYLE001/002 for defer <| (macro erases AST, scan source lines) ---
+
+    def check_defer_pipe(fn : FunctionPtr) : void {
+        if (fn.body == null || fn.at.fileInfo == null || fn.at.line == 0u) {
+            return
+        }
+        let body_at = fn.body.at
+        for (ln in range(int(body_at.line), int(body_at.last_line) + 1)) {
+            var src = ""
+            get_file_source_line(fn.at.fileInfo, uint(ln)) $(line) {
+                src := line
+            }
+            let comment_pos = find(src, "//")
+            let defer_pos = find(src, "defer")
+            if (defer_pos < 0 || (comment_pos >= 0 && comment_pos < defer_pos)) {
+                continue
+            }
+            if (defer_pos > 0) {
+                var preceding_ok = false
+                peek_data(src) $(data) {
+                    let ch = int(data[defer_pos - 1])
+                    preceding_ok = ch == ' ' || ch == '\t'
+                }
+                if (!preceding_ok) {
+                    continue
+                }
+            }
+            let pipe_pos = find(src, "<|", defer_pos + 5)
+            if (pipe_pos < 0) {
+                continue
+            }
+            let after_pipe = strip_left(slice(src, pipe_pos + 2))
+            let pipes_block = starts_with(after_pipe, "$(") || starts_with(after_pipe, "$ ") || starts_with(after_pipe, "$\{") || starts_with(after_pipe, "@") || starts_with(after_pipe, "\{")
+            if (!pipes_block) {
+                continue
+            }
+            var at = fn.at
+            at.line = uint(ln)
+            at.column = uint(defer_pos)
+            at.last_line = uint(ln)
+            at.last_column = uint(defer_pos + 5)
+            if (starts_with(after_pipe, "$()")) {
+                self->style_warning("STYLE002: remove <| pipe and $() for parameterless block; use direct trailing block", at)
+            } else {
+                self->style_warning("STYLE001: remove <| pipe before block argument; use direct trailing block syntax", at)
+            }
+        }
     }
 
     def override visitFunction(var fn : FunctionPtr) : FunctionPtr {
@@ -126,17 +176,17 @@ class StyleLintVisitor : AstVisitor {
 
     // --- STYLE001/002/003/011: pipe and redundant $() on block arguments ---
 
-    def check_block_pipe(call_at : LineInfo; var arguments : dasvector`smart_ptr`Expression) : void {
+    def check_block_pipe(call_at : LineInfo; var arguments : dasvector`ptr`Expression) : void {
         let nargs = length(arguments)
         if (nargs == 0) {
             return
         }
         // Find ExprMakeBlock among arguments (may not be last due to ExprFakeContext/ExprFakeLineInfo)
         for (i in range(nargs)) {
-            var arg = get_ptr(arguments[i])
+            var arg = arguments[i]
             if (arg is ExprMakeBlock) {
                 var mkblk = arg as ExprMakeBlock
-                var blk = get_ptr(mkblk._block)
+                var blk = mkblk._block
                 if (blk is ExprBlock) {
                     var eblk = blk as ExprBlock
                     if (eblk.blockFlags.isClosure) {
@@ -173,18 +223,61 @@ class StyleLintVisitor : AstVisitor {
         }
     }
 
-    def override preVisitExprCall(var expr : smart_ptr<ExprCall>) : void {
+    def override preVisitExprCall(var expr : ExprCall?) : void {
         self->check_block_pipe(expr.at, expr.arguments)
     }
 
-    def override preVisitExprMakeGenerator(var expr : smart_ptr<ExprMakeGenerator>) : void {
+    def override preVisitExprInvoke(var expr : ExprInvoke?) : void {
         self->check_block_pipe(expr.at, expr.arguments)
+    }
+
+
+    def override preVisitExprMakeGenerator(var expr : ExprMakeGenerator?) : void {
+        self->check_block_pipe(expr.at, expr.arguments)
+    }
+
+    // --- STYLE001/002 for desugared generators ---
+
+    def override preVisitExprMakeStruct(var expr : ExprMakeStruct?) : void {
+        // generator<T>() <| $ { ... } is lowered before lint runs — ExprMakeGenerator
+        // is replaced by ExprMakeStruct. Detect via source line inspection.
+        if (expr.at.fileInfo == null || expr.at.line == 0u) {
+            return
+        }
+        var src = ""
+        get_file_source_line(expr.at.fileInfo, expr.at.line) $(line) {
+            src := line
+        }
+        let col = int(expr.at.column)
+        if (col >= length(src) || !starts_with(slice(src, col), "generator<")) {
+            return
+        }
+        let pipe_pos = find(src, "<|", col + 10)
+        if (pipe_pos < 0) {
+            return
+        }
+        let after_pipe = strip_left(slice(src, pipe_pos + 2))
+        let pipes_block = starts_with(after_pipe, "$(") || starts_with(after_pipe, "$ ") || starts_with(after_pipe, "$\{") || starts_with(after_pipe, "@") || starts_with(after_pipe, "\{")
+        if (!pipes_block) {
+            return
+        }
+        let arrow_pos = find(after_pipe, "=>")
+        let brace_pos = find(after_pipe, "\{")
+        let is_lambda_shorthand = arrow_pos >= 0 && (brace_pos < 0 || arrow_pos < brace_pos)
+        if (is_lambda_shorthand) {
+            return
+        }
+        if (starts_with(after_pipe, "$()")) {
+            self->style_warning("STYLE002: remove <| pipe and $() for parameterless block; use direct trailing block", expr.at)
+        } else {
+            self->style_warning("STYLE001: remove <| pipe before block argument; use direct trailing block syntax", expr.at)
+        }
     }
 
     // --- STYLE003: redundant $() on parameterless blocks (all contexts) ---
 
-    def override preVisitExprMakeBlock(var expr : smart_ptr<ExprMakeBlock>) : void {
-        var blk = get_ptr(expr._block)
+    def override preVisitExprMakeBlock(var expr : ExprMakeBlock?) : void {
+        var blk = expr._block
         if (!(blk is ExprBlock)) {
             return
         }
@@ -211,11 +304,11 @@ class StyleLintVisitor : AstVisitor {
 
     // --- STYLE006: string(__rtti) == "..." should use `is` ---
 
-    def override preVisitExprOp2(expr : smart_ptr<ExprOp2>) : void {
+    def override preVisitExprOp2(expr : ExprOp2?) : void {
         if (expr.op != "==") {
             return
         }
-        if (self->is_string_rtti_comparison(get_ptr(expr.left)) || self->is_string_rtti_comparison(get_ptr(expr.right))) {
+        if (self->is_string_rtti_comparison(expr.left) || self->is_string_rtti_comparison(expr.right)) {
             self->style_warning("STYLE006: string(__rtti) comparison should use `is` operator; e.g. expr is ExprFoo", expr.at)
         }
     }
@@ -223,12 +316,12 @@ class StyleLintVisitor : AstVisitor {
     // --- STYLE005: postfix conditionals (configurable) ---
     // --- STYLE010: if (true) should be bare block ---
 
-    def override preVisitExprIfThenElse(ifte : smart_ptr<ExprIfThenElse>) : void {
+    def override preVisitExprIfThenElse(ifte : ExprIfThenElse?) : void {
         if (ifte.if_flags.isStatic) {
             return
         }
         // STYLE010: if (true) { ... }
-        var cond = get_ptr(ifte.cond)
+        var cond = ifte.cond
         if (cond is ExprConstBool) {
             var cbool = cond as ExprConstBool
             if (cbool.value && ifte.if_false == null) {
@@ -236,11 +329,11 @@ class StyleLintVisitor : AstVisitor {
             }
         }
         if (postfix_conditionals && ifte.if_false == null) {
-            var then_expr = get_ptr(ifte.if_true)
+            var then_expr = ifte.if_true
             if (then_expr is ExprBlock) {
                 var blk = then_expr as ExprBlock
                 if (length(blk.list) == 1 && length(blk.finalList) == 0) {
-                    var stmt = get_ptr(blk.list[0])
+                    var stmt = blk.list[0]
                     if (stmt is ExprReturn || stmt is ExprBreak || stmt is ExprContinue) {
                         // Skip if already on one line (already postfix or one-liner)
                         if (ifte.at.line != stmt.at.line) {
@@ -259,16 +352,16 @@ class StyleLintVisitor : AstVisitor {
         return false if (expr == null)
         var inner = expr
         if (inner is ExprRef2Value) {
-            inner = get_ptr((inner as ExprRef2Value).subexpr)
+            inner = (inner as ExprRef2Value.subexpr)
         }
         return false if (inner == null || !(inner is ExprCall))
         var call = inner as ExprCall
         if (call.name != "string" || length(call.arguments) < 1) {
             return false
         }
-        var arg = get_ptr(call.arguments[0])
+        var arg = call.arguments[0]
         if (arg is ExprRef2Value) {
-            arg = get_ptr((arg as ExprRef2Value).subexpr)
+            arg = (arg as ExprRef2Value.subexpr)
         }
         if (arg is ExprField) {
             var field = arg as ExprField

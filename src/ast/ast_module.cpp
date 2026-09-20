@@ -178,6 +178,12 @@ namespace das {
             }
             DAS_FATAL_ERROR("Unable to initialize some modules:%s\n", error.c_str());
         }
+        // Collect reachable TypeDecl from thread root into module roots, sweep the rest.
+        auto & threadRoot = gc_root::gc_get_thread_root();
+        for ( auto m = daScriptEnvironment::getBound()->modules; m ; m = m->next ) {
+            m->gc_collect(&threadRoot);
+        }
+        threadRoot.gc_sweep();
     }
 
     void Module::CollectFileInfo(das::vector<FileInfoPtr> &finfos) {
@@ -318,6 +324,37 @@ namespace das {
             }
             DAS_ASSERTF(0, "failed to unlink. was builtIn field assigned after the fact?");
         }
+    }
+
+    void Module::gc_collect ( gc_root * from ) {
+        auto target = &module_gc_root;
+        // collect alias types
+        aliasTypes.foreach([&](auto td) {
+            if ( td ) td->gc_collect(target, from);
+        });
+        // collect types in handle/annotation types
+        handleTypes.foreach([&](auto & ann) {
+            ann->gc_collect(target, from);
+        });
+        // collect types in structures (full recursive walk via virtual gc_collect)
+        structures.foreach([&](auto & st) {
+            st->gc_collect(target, from);
+        });
+        // collect types in functions (full recursive walk via virtual gc_collect)
+        functions.foreach([&](auto & fn) {
+            fn->gc_collect(target, from);
+        });
+        generics.foreach([&](auto & fn) {
+            fn->gc_collect(target, from);
+        });
+        // collect types in globals
+        globals.foreach([&](auto & var) {
+            var->gc_collect(target, from);
+        });
+        // collect types in enumerations
+        enumerations.foreach([&](auto & en) {
+            en->gc_collect(target, from);
+        });
     }
 
     void Module::CollectSharedModules() {
@@ -519,7 +556,7 @@ namespace das {
             }
         }
         if ( functions.insert(mangledName, fn) ) {
-            functionsByName[hash64z(fn->name.c_str())].push_back(fn.get());
+            functionsByName[hash64z(fn->name.c_str())].push_back(fn);
             fn->module = this;
             return true;
         } else {
@@ -530,12 +567,42 @@ namespace das {
         }
     }
 
+    bool Module::replaceFunction ( const FunctionPtr & fn ) {
+        fn->module = this;
+        auto mangledName = fn->getMangledName();
+        auto mangledHash = hash64z(mangledName.c_str());
+        auto nameHashX = hash64z(fn->name.c_str());
+        // get old function pointer before replacing (avoid touching stale types)
+        auto oldFn = functions.find(mangledHash);
+        if ( !oldFn ) return false;
+        auto oldFnPtr = oldFn;
+        // replace in safebox objects map
+        functions.replace(mangledHash, fn);
+        // replace in objectsInOrder (compare by pointer, not by mangled name)
+        functions.foreach([&](auto & ofn){
+            if ( ofn == oldFnPtr ) {
+                ofn = fn;
+            }
+        });
+        // replace in functionsByName
+        auto kv = functionsByName.find(nameHashX);
+        if ( kv ) {
+            for ( auto & fp : kv->second ) {
+                if ( fp == oldFnPtr ) {
+                    fp = fn;
+                    break;
+                }
+            }
+        }
+        return true;
+    }
+
     bool Module::addGeneric ( const FunctionPtr & fn, bool canFail ) {
         fn->module = this;
         auto mangledName = fn->getMangledName();
         fn->module = nullptr;
         if ( generics.insert(mangledName, fn) ) {
-            genericsByName[hash64z(fn->name.c_str())].push_back(fn.get());
+            genericsByName[hash64z(fn->name.c_str())].push_back(fn);
             fn->module = this;
             return true;
         } else {
@@ -686,7 +753,9 @@ namespace das {
         auto program = parseDaScript(modName, "", access, issues, dummyLibGroup, true);
         ownFileInfo = access->letGoOfFileInfo(modName);
         DAS_ASSERTF(ownFileInfo,"something went wrong and FileInfo for builtin module can not be obtained");
-        return appendBuiltinModuleContent(this, program, modName);
+        auto result = appendBuiltinModuleContent(this, program, modName);
+        program->thisModule->module_gc_root.gc_dump_to_thread_root();
+        return result;
     }
 
     bool isValidBuiltinName ( const string & name, bool canPunkt ) {
@@ -799,7 +868,7 @@ namespace das {
         bool failed = false;
         functions.foreach([&](auto fun){
             if ( fun->builtIn ) {
-                auto bif = (BuiltInFunction *) fun.get();
+                auto bif = (BuiltInFunction *) fun;
                 if ( !bif->policyBased && bif->cppName.empty() ) {
                     DAS_FATAL_LOG("builtin function %s is missing cppName\n", fun->describe().c_str());
                     failed = true;
@@ -843,7 +912,10 @@ namespace das {
                     }
                 }
                 modules.push_back(module);
-                DAS_VERIFYF(moduleLookupByHash.find(module->nameHash)==moduleLookupByHash.end(), "duplicate module hash %s", module->name.c_str());
+                if ( moduleLookupByHash.find(module->nameHash)!=moduleLookupByHash.end() ) {
+                    modules.pop_back();
+                    return false;
+                }
                 moduleLookupByHash[module->nameHash] = module;
                 module->addPrerequisits(*this);
                 return true;
@@ -1014,10 +1086,10 @@ namespace das {
     }
 
     TypeDeclPtr ModuleLibrary::makeStructureType ( const string & name ) const {
-        auto t = make_smart<TypeDecl>(Type::tStructure);
+        auto t = new TypeDecl(Type::tStructure);
         auto structs = findStructure(name,nullptr);
         if ( structs.size()==1 ) {
-            t->structType = structs.back().get();
+            t->structType = structs.back();
         } else {
             DAS_FATAL_ERROR("makeStructureType(%s) failed\n", name.c_str());
             return nullptr;
@@ -1038,7 +1110,7 @@ namespace das {
     }
 
     TypeDeclPtr ModuleLibrary::makeHandleType ( const string & name ) const {
-        auto t = make_smart<TypeDecl>(Type::tHandle);
+        auto t = new TypeDecl(Type::tHandle);
         auto handles = findAnnotation(name,nullptr);
 #if DAS_ALLOW_ANNOTATION_LOOKUP
         bool need_require = false;

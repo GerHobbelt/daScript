@@ -101,6 +101,7 @@ Task-specific instructions are split into skill files under `skills/`. You MUST 
 | `skills/daslang_live.md` | Working with `daslang-live.exe`, live-reload lifecycle, REST API, `[live_command]`, `[before_reload]`/`[after_reload]`, persistent store, `live/glfw_live`, `live/live_api` |
 | `skills/perf_lint.md` | Adding new performance lint rules to `daslib/perf_lint.das` |
 | `skills/style_lint.md` | Adding new style lint rules to `daslib/style_lint.das` |
+| `skills/gc_migration.md` | Migrating `.das` or C++ code from `smart_ptr<T>` to gc_node for AST types (TypeDecl, Expression, Function, Structure, Enumeration, Variable, MakeFieldDecl) |
 | `skills/version_update.md` | Bumping the daslang version number (all files that need updating) |
 | `skills/make_pr.md` | Creating a pull request (lint, test, AOT build+test, format checklist) |
 
@@ -239,6 +240,9 @@ All code MUST use gen2 syntax (add `options gen2` at the top of every file). Key
 - **`is`/`as` on handled types checks EXACT type**, not C++ inheritance — `expr is ExprField` is `false` when `expr` is `ExprSafeField`. `as` on wrong type crashes. Must handle each concrete type explicitly.
 - `#pragma optimize` in AOT-generated code must be wrapped in `#ifdef _MSC_VER` — Clang warns on unknown pragmas
 - **Macro-generated struct variables** need `default<$t(st)>` initialization (not `var x : $t(st)`) — avoids "uninitialized variable" errors for structs without field defaults
+- `print` should not be used in `tests` and in `daslib` folders. `to_log(LOG_INFO)` (or
+other level) should be used instead.
+
 
 ### Code style — prefer idiomatic forms
 

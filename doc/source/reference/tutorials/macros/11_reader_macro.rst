@@ -119,16 +119,16 @@ to embed the resulting string array in the AST:
 .. code-block:: das
 
    def override visit(prog : ProgramPtr; mod : Module?;
-           expr : smart_ptr<ExprReader>) : ExpressionPtr {
+           expr : ExprReader?) : ExpressionPtr {
        if (is_in_completion()) {
-           return <- default<ExpressionPtr>
+           return default<ExpressionPtr>
        }
        let seq = string(expr.sequence)
        var items <- split(seq, ",")
        for (i in range(length(items))) {
            items[i] = strip(items[i])
        }
-       return <- convert_to_expression(items, expr.at)
+       return convert_to_expression(items, expr.at)
    }
 
 ``convert_to_expression`` takes any daslang value and converts it into
@@ -173,10 +173,11 @@ tiny BASIC dialect and returns the equivalent daslang source code:
                    stmts |> push("print(\"\{{arg}\}\\n\")")
                }
            } elif (starts_with(after_num, "LET ")) {
-               stmts |> push("var {strip(slice(after_num, 4))}")
+               let assignment = strip(slice(after_num, 4))
+               stmts |> push("let {assignment}")
            }
        }
-       return build_string() <| $(var w) {
+       return build_string() $(var w) {
            w |> write("def {func_name}() \{\n")
            for (stmt in stmts) {
                w |> write("    {stmt}\n")

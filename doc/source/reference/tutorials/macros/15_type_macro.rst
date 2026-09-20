@@ -23,7 +23,7 @@ inference.
    ``td`` is the ``TypeDecl`` node representing the macro invocation —
    its ``dimExpr`` array carries the arguments.
    ``passT`` is non-null only in a generic context (see below).
-   Return the resolved ``TypeDeclPtr``, or an empty pointer on error.
+   Return the resolved ``TypeDeclPtr``, or null on error.
 
 The annotation ``[type_macro(name="…")]`` registers a class as a type
 macro.  The name string determines the identifier used in type

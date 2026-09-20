@@ -16,7 +16,7 @@ namespace das {
     template <>
     struct typeFactory<Point3> {
         static TypeDeclPtr make(const ModuleLibrary &) {
-            auto t = make_smart<TypeDecl>(Type::tFloat3);
+            auto t = new TypeDecl(Type::tFloat3);
             t->alias = "Point3";
             t->aotAlias = true;
             return t;
@@ -47,7 +47,7 @@ namespace das {
   template <>
   struct typeFactory<SampleVariant> {
       static TypeDeclPtr make(const ModuleLibrary & library ) {
-          auto vtype = make_smart<TypeDecl>(Type::tVariant);
+          auto vtype = new TypeDecl(Type::tVariant);
           vtype->alias = "SampleVariant";
           vtype->aotAlias = true;
           vtype->addVariant("i_value", typeFactory<decltype(SampleVariant::i_value)>::make(library));
@@ -140,7 +140,7 @@ struct CheckRange : StructureAnnotation {
         // this is here for the 'example' purposes
         // lets add a sample 'dummy' field
         if (args.getBoolOption("dummy",false) && !st->findField("dummy")) {
-            st->fields.emplace_back("dummy", make_smart<TypeDecl>(Type::tInt),
+            st->fields.emplace_back("dummy", new TypeDecl(Type::tInt),
                 nullptr /*init*/, AnnotationArgumentList(), false /*move_to_init*/, LineInfo());
             st->fieldLookup.clear();
         }
@@ -156,7 +156,7 @@ struct CheckRange : StructureAnnotation {
                     int32_t minVal = INT32_MIN;
                     int32_t maxVal = INT32_MAX;
                     if (fd.init && fd.init->rtti_isConstant()) {
-                        val = static_pointer_cast<ExprConstInt>(fd.init)->getValue();
+                        val = static_cast<ExprConstInt*>(fd.init)->getValue();
                     }
                     if (auto minA = fd.annotation.find("min", Type::tInt)) {
                         minVal = minA->iValue;
@@ -224,13 +224,13 @@ struct CheckEidFunctionAnnotation : TransformFunctionAnnotation {
     virtual ExpressionPtr transformCall ( ExprCallFunc * call, string & err ) override {
         auto arg = call->arguments[1];
         if ( arg->type && arg->type->isString() && arg->type->isConst() && arg->rtti_isConstant() ) {
-            auto starg = static_pointer_cast<ExprConstString>(arg);
+            auto starg = static_cast<ExprConstString*>(arg);
             if (!starg->getValue().empty()) {
                 auto hv = hash_blockz64((uint8_t *)starg->text.c_str());
-                auto hconst = make_smart<ExprConstUInt64>(arg->at, hv);
-                hconst->type = make_smart<TypeDecl>(Type::tUInt64);
+                auto hconst = new ExprConstUInt64(arg->at, hv);
+                hconst->type = new TypeDecl(Type::tUInt64);
                 hconst->type->constant = true;
-                auto newCall = static_pointer_cast<ExprCallFunc>(call->clone());
+                auto newCall = static_cast<ExprCallFunc*>(call->clone());
                 newCall->arguments.insert(newCall->arguments.begin() + 2, hconst);
                 return newCall;
             } else {
@@ -277,11 +277,11 @@ struct EventRegistrator : StructureAnnotation {
     EventRegistrator() : StructureAnnotation("event") {}
     bool touch ( const StructurePtr & st, ModuleGroup & /*libGroup*/,
         const AnnotationArgumentList & /*args*/, string & /*err*/ ) override {
-        st->fields.emplace(st->fields.begin(), "eventFlags", make_smart<TypeDecl>(Type::tUInt16),
+        st->fields.emplace(st->fields.begin(), "eventFlags", new TypeDecl(Type::tUInt16),
             ExpressionPtr(), AnnotationArgumentList(), false, st->at);
-        st->fields.emplace(st->fields.begin(), "eventSize", make_smart<TypeDecl>(Type::tUInt16),
+        st->fields.emplace(st->fields.begin(), "eventSize", new TypeDecl(Type::tUInt16),
             ExpressionPtr(), AnnotationArgumentList(), false, st->at);
-        st->fields.emplace(st->fields.begin(), "eventType", make_smart<TypeDecl>(Type::tUInt64),
+        st->fields.emplace(st->fields.begin(), "eventType", new TypeDecl(Type::tUInt64),
             ExpressionPtr(), AnnotationArgumentList(), false, st->at);
         return true;
     }
@@ -677,7 +677,7 @@ Module_UnitTest::Module_UnitTest() : Module("UnitTest") {
     addExtern<DAS_BIND_FUN(__create_scene_node)>(*this, lib, "__create_scene_node",
         SideEffects::none, "__create_scene_node");
     // byte code interpreter
-    addEnumeration(make_smart<EnumerationOpCode>());
+    addEnumeration(new EnumerationOpCode());
     addAnnotation(make_smart<ByteCodeAnnotation>(lib));
     addExtern<DAS_BIND_FUN(evalByteCode)>(*this, lib, "evalByteCode",
         SideEffects::modifyArgumentAndAccessExternal, "evalByteCode");

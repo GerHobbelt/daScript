@@ -130,7 +130,7 @@ def instance_spoof(temp : string; passed_arguments : array<string>) : tuple<resu
         if (Ch == SPOOF_SPEFICAL) {
             var ident : string
             if (next_ident(it, Ch, ident)) {
-                var index = args |> find_index_if() $(k) {
+                let index = args |> find_index_if() $(k) {
                     return k.argName == ident
                 }
                 if (index != -1) {
@@ -174,7 +174,7 @@ class SpoofTemplateReader : AstReaderMacro {
         }
     }
 
-    def override visit(prog : ProgramPtr; mod : Module?; expr : smart_ptr<ExprReader>) : ExpressionPtr {
+    def override visit(prog : ProgramPtr; mod : Module?; expr : ExprReader?) : ExpressionPtr {
         return <- new ExprConstString(at = expr.at, value := expr.sequence)
     }
 }
@@ -268,7 +268,7 @@ class SpoofInstanceReader : AstReaderMacro {
         }
         return "" if (failed)
         // lets find the variable for the template
-        var inscope vptr : VariablePtr
+        var vptr : VariablePtr
         find_matching_variable(get_ptr(prog), null, iargs.varName, false) $(vars) {
             if (vars |> length == 0) {
                 prog |> macro_error(info, "no matching variable found for {iargs.varName}")
@@ -299,7 +299,7 @@ class SpoofInstanceReader : AstReaderMacro {
         // now, lets spoof the instance
         outLine = int(vptr.init.at.line) + 1
         outFile = vptr.init.at.fileInfo
-        var result <- instance_spoof(string(vstr), iargs.args)
+        let result <- instance_spoof(string(vstr), iargs.args)
         if (!result.ok) {
             prog |> macro_error(info, "spoof instance error {result.result}")
             return ""

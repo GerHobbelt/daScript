@@ -165,6 +165,7 @@ def test_file(file_name : string; var ctx : SuiteCtx; var file_ctx : FileCtx) : 
     var res : SuiteResult
     var inscope access <- make_file_access(ctx.projectPath)
     access |> add_file_access_root("dastest", ctx.dastestRoot)
+    let gc_before = gc_thread_root_count()
     using() $(var mg : ModuleGroup) {
         using() $(var cop : CodeOfPolicies) {
             ctx.queued_benchmarks |> clear
@@ -190,7 +191,7 @@ def test_file(file_name : string; var ctx : SuiteCtx; var file_ctx : FileCtx) : 
                 }
                 var failed = !ok
                 if (ok) {
-                    if (!empty(output)) {
+                    if (!empty(output) && !log::failuresOnly) {
                         log::info("{output}")
                     }
                 } elif (program != null) {
@@ -260,7 +261,7 @@ def test_file(file_name : string; var ctx : SuiteCtx; var file_ctx : FileCtx) : 
                             unsafe(invoke_in_context(*context, "fill_coverage_report", unsafe(addr(report)), ""))
                             // Clone to current context.
                             report := report
-                            fopen(ctx.cov_path, "ab") <| $(fw) {
+                            fopen(ctx.cov_path, "ab") $(fw) {
                                 if (fw != null) {
                                     to_log(LOG_INFO, "Coverage to {ctx.cov_path}\n")
                                     fwrite(fw, report)
@@ -293,6 +294,14 @@ def test_file(file_name : string; var ctx : SuiteCtx; var file_ctx : FileCtx) : 
             }
         }
     }
+    let gc_after = gc_thread_root_count()
+    // Small bounded leaks (< 10) are expected from RTTI type walks in test_module.
+    // Report only significant leaks that suggest a real gc_collect gap.
+    if (gc_after > gc_before + 10ul) {
+        let delta = int64(gc_after) - int64(gc_before)
+        to_log(LOG_WARNING, "GC LEAK: {file_name} — {delta} new TypeDecl nodes on thread root\n")
+        gc_thread_root_report_detailed(uint64(delta))
+    }
     return res
 }
 
@@ -320,7 +329,7 @@ def test_module(var mod : rtti::Module; var context : rtti::Context; var suite_c
             return
         }
         let func = context |> get_function_by_mnh(f.hash)
-        var inscope fn <- modPtr |> find_module_function_via_rtti(func)
+        var fn = modPtr |> find_module_function_via_rtti(func)
         if (fn == null) {
             return
         }
@@ -434,7 +443,7 @@ def private test_any(name : string; func; args_num : int; var context : FileCtx;
     var testLocation : string
     let t0 = ref_time_ticks()
     var testing : T?
-    defer <| $ {
+    defer() {
         unsafe {
             delete testing
         }

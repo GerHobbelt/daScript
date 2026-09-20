@@ -6,6 +6,7 @@
 #include "daScript/misc/sysos.h"
 #include "daScript/ast/ast_serializer.h"
 #include "daScript/misc/free_list.h"
+#include "daScript/misc/gc_node.h"
 
 using namespace das;
 
@@ -241,11 +242,18 @@ int das_program_context_stack_size ( das_program * program ) {
 }
 
 int das_program_simulate ( das_program * program, das_context * ctx, das_text_writer * tout ) {
-    if ( ((Program *) program)->simulate(*((Context *)ctx), *((TextWriter *)tout)) ) {
-        return 1;
-    } else {
-        return 0;
+    auto prog = (Program *) program;
+    bool ok;
+    {
+        gc_guard simulate_gc_scope;
+        ok = prog->simulate(*((Context *)ctx), *((TextWriter *)tout));
+        for ( auto mod : prog->library.getModules() ) {
+            if ( !mod->builtIn ) {
+                mod->gc_collect(&simulate_gc_scope.guard_root);
+            }
+        }
     }
+    return ok ? 1 : 0;
 }
 
 das_error * das_program_get_error ( das_program * program, int index ) {
@@ -424,7 +432,7 @@ das_module * das_module_find ( const char * name ) {
 }
 
 void das_module_bind_interop_function ( das_module * mod, das_module_group * lib, das_interop_function * fun, char * name, char * cppName, uint32_t sideffects, char* args ) {
-    auto fn = make_smart<CFunction>(name, *(ModuleLibrary *)lib, cppName, fun);
+    auto fn = new CFunction(name, *(ModuleLibrary *)lib, cppName, fun);
     fn->setSideEffects((das::SideEffects) sideffects);
     vector <TypeDeclPtr> arguments;
     MangledNameParser parser;
@@ -439,7 +447,7 @@ void das_module_bind_interop_function ( das_module * mod, das_module_group * lib
 }
 
 void das_module_bind_interop_function_unaligned ( das_module * mod, das_module_group * lib, das_interop_function_unaligned * fun, char * name, char * cppName, uint32_t sideffects, char* args ) {
-    auto fn = make_smart<CFunction_Unaligned>(name, *(ModuleLibrary *)lib, cppName, fun);
+    auto fn = new CFunction_Unaligned(name, *(ModuleLibrary *)lib, cppName, fun);
     fn->setSideEffects((das::SideEffects) sideffects);
     vector <TypeDeclPtr> arguments;
     MangledNameParser parser;
@@ -485,10 +493,10 @@ void das_structure_add_field ( das_structure * st, das_module * mod, das_module_
 }
 
 das_enumeration * das_enumeration_make ( const char * name, const char * cppname, int ext ) {
-    auto pEnum = make_smart<Enumeration>(name);
+    auto pEnum = new Enumeration(name);
     pEnum->cppName = cppname;
     pEnum->external = ext;
-    return (das_enumeration *) pEnum.orphan();
+    return (das_enumeration *) pEnum;
 }
 
 void das_enumeration_add_value ( das_enumeration * enu, const char * name, const char * cppName, int value ) {

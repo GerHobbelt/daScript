@@ -58,7 +58,7 @@ def get_shader_const_name(arg : ExpressionPtr; var errors : das_string) {
 
 [tag_function_macro(tag="compile_shader_tag")]
 class BgfxCompileShaderFunctionAnnotation : AstFunctionAnnotation {
-    def override transform(var call : smart_ptr<ExprCallFunc>; var errors : das_string) : ExpressionPtr {
+    def override transform(var call : ExprCallFunc?; var errors : das_string) : ExpressionPtr {
         // see if there
         if (call.arguments[0]._type == null || call.arguments[1]._type == null) {
             return default<ExpressionPtr>
@@ -80,7 +80,7 @@ class BgfxCompileShaderFunctionAnnotation : AstFunctionAnnotation {
 
 [tag_function_macro(tag="compile_compute_shader_tag")]
 class BgfxCompileComputeShaderFunctionAnnotation : AstFunctionAnnotation {
-    def override transform(var call : smart_ptr<ExprCallFunc>; var errors : das_string) : ExpressionPtr {
+    def override transform(var call : ExprCallFunc?; var errors : das_string) : ExpressionPtr {
         // see if there
         if (call.arguments[0]._type == null) {
             return default<ExpressionPtr>
@@ -90,7 +90,7 @@ class BgfxCompileComputeShaderFunctionAnnotation : AstFunctionAnnotation {
             return default<ExpressionPtr>
         }
         let func <- (call.arguments[0] as ExprAddr).func
-        let target = func._module.name != "" ? "{func._module.name}::{func.name}" : "{func.name}"
+        let _target = func._module.name != "" ? "{func._module.name}::{func.name}" : "{func.name}"
         var cll <- new ExprCall(at = call.at, name := "create_compute_shader_program")
         cll.arguments |> emplace_new <| new ExprVar(at = call.at, name := cs_name)
         return <- cll
@@ -103,7 +103,7 @@ class GlslVertexBuffer : AstStructureAnnotation {
         // [template(self)] bind_vertex_buffer(vbo:uint; self:VertexType; vindex:uint=0u)
         var fn <- new Function(at = st.at, atDecl = st.at, name := "bind_vertex_buffer")
         fn.flags |= FunctionFlags.generated
-        fn.result <- new TypeDecl(baseType = Type.tVoid, at = st.at)
+        fn.result = new TypeDecl(baseType = Type.tVoid, at = st.at)
         fn.arguments |> emplace_new() <| new Variable(at = st.at,
             name := "ptrd",
             _type <- new TypeDecl(at = st.at, baseType = Type.tPointer,
@@ -113,7 +113,7 @@ class GlslVertexBuffer : AstStructureAnnotation {
             name := "self",
             _type <- new TypeDecl(at = st.at,
                 baseType = Type.tStructure,
-                structType = get_ptr(st)
+                structType = st
             )
         )
         fn.arguments |> emplace_new() <| new Variable(at = st.at,
@@ -123,7 +123,7 @@ class GlslVertexBuffer : AstStructureAnnotation {
         )
         var blk <- new ExprBlock(at = st.at)
         // for each field
-        var stype <- new TypeDecl(baseType = Type.tStructure, structType = get_ptr(st), at = st.at)
+        var stype <- new TypeDecl(baseType = Type.tStructure, structType = st, at = st.at)
         for (fld, attri in st.fields, count()) {
             // attri+vindex
             var vattr_i <- new ExprOp2(at = fld.at,
@@ -135,7 +135,7 @@ class GlslVertexBuffer : AstStructureAnnotation {
             var cll_evaa <- new ExprCall(at = fld.at, name := "glEnableVertexAttribArray")
             cll_evaa.arguments |> emplace_new() <| clone_expression(vattr_i)
             blk.list |> emplace(cll_evaa)
-            var dinfo = get_decl_info(fld._type, fld.annotation)
+            let dinfo = get_decl_info(fld._type, fld.annotation)
             if (!dinfo.ok) {
                 errors := "field {fld.name} is missing type information"
                 return false

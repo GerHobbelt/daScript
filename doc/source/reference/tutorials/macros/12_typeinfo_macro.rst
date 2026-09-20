@@ -36,7 +36,7 @@ The ``expr`` parameter exposes several fields:
 ===============  ====================  =======================================
 Field            Type                  Description
 ===============  ====================  =======================================
-``typeexpr``     ``TypeDeclPtr``       The type argument (from ``type<T>``)
+``typeexpr``     ``TypeDecl?``         The type argument (from ``type<T>``)
 ``subexpr``      ``ExpressionPtr``     The expression argument (if used)
 ``subtrait``     ``string``            The ``<name>`` in ``typeinfo X<name>``
 ``extratrait``   ``string``            The second ``<a;b>`` parameter
@@ -82,17 +82,17 @@ time:
 
     [typeinfo_macro(name="struct_info")]
     class TypeInfoGetStructInfo : AstTypeInfoMacro {
-        def override getAstChange(expr : smart_ptr<ExprTypeInfo>;
+        def override getAstChange(expr : ExprTypeInfo?;
                                   var errors : das_string) : ExpressionPtr {
             if (expr.typeexpr == null) {
                 errors := "type is missing or not inferred"
-                return <- default<ExpressionPtr>
+                return default<ExpressionPtr>
             }
             if (!expr.typeexpr.isStructure) {
                 errors := "expecting structure type"
-                return <- default<ExpressionPtr>
+                return default<ExpressionPtr>
             }
-            var result = build_string() <| $(var w) {
+            let result = build_string() $(var w) {
                 w |> write("{expr.typeexpr.structType.name}(")
                 var first = true
                 for (i in iter_range(expr.typeexpr.structType.fields)) {
@@ -108,7 +108,7 @@ time:
                 }
                 w |> write(")")
             }
-            return <- new ExprConstString(at = expr.at, value := result)
+            return new ExprConstString(at = expr.at, value := result)
         }
     }
 
@@ -117,7 +117,7 @@ Key points:
 - ``expr.typeexpr.isStructure`` validates that the type is a structure.
 - ``expr.typeexpr.structType.fields`` iterates all field declarations.
 - ``fld.flags.classMethod`` skips class methods (only data fields appear).
-- ``describe(fld._type, ...)`` converts a ``TypeDeclPtr`` to a human-readable
+- ``describe(fld._type, ...)`` converts a ``TypeDecl?`` to a human-readable
   type name.
 - The result is an ``ExprConstString`` — a compile-time string constant.
 
@@ -132,21 +132,28 @@ enum value names:
 
     [typeinfo_macro(name="enum_value_strings")]
     class TypeInfoGetEnumValueStrings : AstTypeInfoMacro {
-        def override getAstChange(expr : smart_ptr<ExprTypeInfo>;
+        def override getAstChange(expr : ExprTypeInfo?;
                                   var errors : das_string) : ExpressionPtr {
-            // ... validation ...
-            var inscope arr <- new ExprMakeArray(
+            if (expr.typeexpr == null) {
+                errors := "type is missing or not inferred"
+                return default<ExpressionPtr>
+            }
+            if (!expr.typeexpr.isEnum) {
+                errors := "expecting enumeration type"
+                return default<ExpressionPtr>
+            }
+            var arr = new ExprMakeArray(
                 at = expr.at,
                 makeType <- typeinfo ast_typedecl(type<string>))
             for (i in iter_range(expr.typeexpr.enumType.list)) {
-                if (true) {
+                {
                     assume entry = expr.typeexpr.enumType.list[i]
-                    var inscope nameExpr <- new ExprConstString(
+                    var nameExpr = new ExprConstString(
                         at = expr.at, value := entry.name)
-                    arr.values |> emplace <| nameExpr
+                    arr.values |> emplace(nameExpr)
                 }
             }
-            return <- arr
+            return arr
         }
     }
 
@@ -156,8 +163,8 @@ Key points:
   ast_typedecl(type<string>)`` to get the AST representation of
   ``string``.
 - ``expr.typeexpr.enumType.list`` iterates all ``EnumEntry`` nodes.
-- The ``if (true)`` block is needed for ``var inscope`` lifetime scoping
-  (each loop iteration creates and consumes a new ``inscope`` smart pointer).
+- The bare block provides a lexical scope for the intermediate variable
+  inside the loop.
 - The result is a **fixed-size array** (``string[N]``), not a dynamic
   ``array<string>``.
 
@@ -173,12 +180,19 @@ via the ``subtrait`` parameter:
 
     [typeinfo_macro(name="has_non_static_method")]
     class TypeInfoHasNonStaticMethod : AstTypeInfoMacro {
-        def override getAstChange(expr : smart_ptr<ExprTypeInfo>;
+        def override getAstChange(expr : ExprTypeInfo?;
                                   var errors : das_string) : ExpressionPtr {
-            // ... validation ...
+            if (expr.typeexpr == null) {
+                errors := "type is missing or not inferred"
+                return default<ExpressionPtr>
+            }
+            if (!expr.typeexpr.isStructure) {
+                errors := "expecting structure or class type"
+                return default<ExpressionPtr>
+            }
             if (empty(expr.subtrait)) {
-                errors := "expecting method name as subtrait"
-                return <- default<ExpressionPtr>
+                errors := "expecting method name as subtrait: typeinfo has_non_static_method<method_name>(type<T>)"
+                return default<ExpressionPtr>
             }
             var found = false
             for (i in iter_range(expr.typeexpr.structType.fields)) {
@@ -188,7 +202,7 @@ via the ``subtrait`` parameter:
                     break
                 }
             }
-            return <- new ExprConstBool(at = expr.at, value = found)
+            return new ExprConstBool(at = expr.at, value = found)
         }
     }
 

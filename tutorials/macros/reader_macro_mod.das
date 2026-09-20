@@ -59,11 +59,11 @@ class CsvReader : AstReaderMacro {
         }
     }
 
-    def override visit(prog : ProgramPtr; mod : Module?; expr : smart_ptr<ExprReader>) : ExpressionPtr {
+    def override visit(prog : ProgramPtr; mod : Module?; expr : ExprReader?) : ExpressionPtr {
         //! Parse the collected CSV text at compile time and embed
         //! the resulting string array directly in the AST.
         if (is_in_completion()) {
-            return <- default<ExpressionPtr>
+            return default<ExpressionPtr>
         }
         let seq = string(expr.sequence)
         var items <- split(seq, ",")
@@ -72,7 +72,7 @@ class CsvReader : AstReaderMacro {
         }
         // convert_to_expression turns any daScript value into AST nodes.
         // Here it produces an ExprMakeArray of ExprConstString values.
-        return <- convert_to_expression(items, expr.at)
+        return convert_to_expression(items, expr.at)
     }
 }
 
@@ -144,14 +144,14 @@ class BasicReader : AstReaderMacro {
                     stmts |> push("print(\"\{{arg}\}\\n\")")
                 }
             } elif (starts_with(after_num, "LET ")) {
-                // LET x = 42 → var x = 42
+                // LET x = 42 → let x = 42
                 let assignment = strip(slice(after_num, 4))
-                stmts |> push("var {assignment}")
+                stmts |> push("let {assignment}")
             }
         }
         // Build the daScript function definition (gen2 syntax — braces required).
         // \{ and \} produce literal braces in the output, avoiding interpolation.
-        return build_string() <| $(var w) {
+        return build_string() $(var w) {
             w |> write("def {func_name}() \{\n")
             for (stmt in stmts) {
                 w |> write("    {stmt}\n")

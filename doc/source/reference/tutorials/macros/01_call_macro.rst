@@ -51,10 +51,10 @@ A call macro is a class that extends ``AstCallMacro``, annotated with
    [call_macro(name="hello")]
    class HelloMacro : AstCallMacro {
        def override visit(prog : ProgramPtr; mod : Module?;
-               var expr : smart_ptr<ExprCallMacro>) : ExpressionPtr {
+               var expr : ExprCallMacro?) : ExpressionPtr {
            macro_verify(length(expr.arguments) == 0, prog, expr.at,
                "hello() takes no arguments")
-           return <- qmacro(print("hello, call macro!\n"))
+           return qmacro(print("hello, call macro!\n"))
        }
    }
 
@@ -84,18 +84,18 @@ interpolation expression:
    [call_macro(name="greet")]
    class GreetMacro : AstCallMacro {
        def override visit(prog : ProgramPtr; mod : Module?;
-               var expr : smart_ptr<ExprCallMacro>) : ExpressionPtr {
+               var expr : ExprCallMacro?) : ExpressionPtr {
            macro_verify(length(expr.arguments) == 1, prog, expr.at,
                "greet() requires exactly one string argument")
            macro_verify(expr.arguments[0] is ExprConstString, prog, expr.at,
                "greet() argument must be a string literal")
-           var inscope sbuilder <- new ExprStringBuilder(at = expr.at)
+           var sbuilder = new ExprStringBuilder(at = expr.at)
            sbuilder.elements |> emplace_new <| new ExprConstString(
                value := "hello, ", at = expr.at)
            sbuilder.elements |> emplace_new <| clone_expression(expr.arguments[0])
            sbuilder.elements |> emplace_new <| new ExprConstString(
                value := "!\n", at = expr.at)
-           return <- qmacro(print($e(sbuilder)))
+           return qmacro(print($e(sbuilder)))
        }
    }
 
@@ -149,18 +149,18 @@ looking for ``(`` ... ``)`` pairs.  For each placeholder it:
    [call_macro(name="printf")]
    class PrintfMacro : AstCallMacro {
        def override visit(prog : ProgramPtr; mod : Module?;
-               var expr : smart_ptr<ExprCallMacro>) : ExpressionPtr {
+               var expr : ExprCallMacro?) : ExpressionPtr {
            macro_verify(length(expr.arguments) >= 1, prog, expr.at,
                "printf requires at least a format string argument")
            macro_verify(expr.arguments[0] is ExprConstString, prog, expr.at,
                "first argument to printf must be a constant string")
            let totalArgs = length(expr.arguments)
-           var inscope sbuilder <- new ExprStringBuilder(at = expr.at)
+           var sbuilder = new ExprStringBuilder(at = expr.at)
            let format = string((expr.arguments[0] as ExprConstString).value)
            var pos = 0
            let format_len = length(format)
            while (pos < format_len) {
-               var open = find(format, '(', pos)
+               let open = find(format, '(', pos)
                if (open == -1) {
                    let tail = format.chop(pos, format_len - pos)
                    sbuilder.elements |> emplace_new <| new ExprConstString(
@@ -172,20 +172,20 @@ looking for ``(`` ... ``)`` pairs.  For each placeholder it:
                    sbuilder.elements |> emplace_new <| new ExprConstString(
                        value := text, at = expr.at)
                }
-               var close = find(format, ')', open + 1)
+               let close = find(format, ')', open + 1)
                macro_verify(close != -1, prog, expr.at,
                    "unmatched '(' in format string")
-               var argNumStr = format.chop(open + 1, close - open - 1)
-               var argNum = to_int(argNumStr)
+               let argNumStr = format.chop(open + 1, close - open - 1)
+               let argNum = to_int(argNumStr)
                macro_verify(argNum >= 1, prog, expr.at,
-                   "argument number must be >= 1")
+                   "argument number must be >= 1, got '({argNumStr})'")
                macro_verify(argNum < totalArgs, prog, expr.at,
-                   "argument index out of range")
+                   "argument index ({argNum}) out of range, printf has {totalArgs - 1} argument(s)")
                sbuilder.elements |> emplace_new <| clone_expression(
                    expr.arguments[argNum])
                pos = close + 1
            }
-           return <- qmacro(print($e(sbuilder)))
+           return qmacro(print($e(sbuilder)))
        }
    }
 

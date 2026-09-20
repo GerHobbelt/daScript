@@ -3,18 +3,19 @@
 #include "daScript/ast/ast_typefactory.h"
 #include "daScript/simulate/jit_abi.h"
 #include "daScript/misc/free_list.h"
+#include "daScript/misc/gc_node.h"
 #include <limits.h> // ULONG_MAX
 
 namespace das {
 
     struct TypeDecl;
-    typedef smart_ptr<TypeDecl> TypeDeclPtr;
+    typedef TypeDecl * TypeDeclPtr;
 
     class Structure;
-    typedef smart_ptr<Structure> StructurePtr;
+    typedef Structure * StructurePtr;
 
     class Enumeration;
-    typedef smart_ptr<Enumeration> EnumerationPtr;
+    typedef Enumeration * EnumerationPtr;
 
     struct Annotation;
     typedef smart_ptr<Annotation> AnnotationPtr;
@@ -23,7 +24,7 @@ namespace das {
     typedef smart_ptr<TypeAnnotation> TypeAnnotationPtr;
 
     struct Expression;
-    typedef smart_ptr<Expression> ExpressionPtr;
+    typedef Expression * ExpressionPtr;
 
     typedef das_map<string,TypeDeclPtr> AliasMap;
     typedef das_map<TypeDecl *,int> OptionsMap;
@@ -38,7 +39,7 @@ namespace das {
 
     struct AstSerializer;
 
-    struct DAS_API TypeDecl : ptr_ref_count {
+    struct DAS_API TypeDecl : gc_node {
         enum {
             dimAuto = -1,
             dimConst = -2,
@@ -50,13 +51,12 @@ namespace das {
             gcFlag_heap = (1<<0),
             gcFlag_stringHeap = (1<<1)
         };
-        TypeDecl() = default;
+        TypeDecl() { gc_magic = GC_MAGIC_TYPEDECL; }
         TypeDecl(const TypeDecl & decl);
         TypeDecl & operator = (const TypeDecl & decl) = delete;
-        TypeDecl(Type tt) : baseType(tt) {}
-        TypeDecl(Structure * sp) : baseType(Type::tStructure), structType(sp) {}
-        TypeDecl(const StructurePtr & sp) : baseType(Type::tStructure), structType(sp.get()) {}
-        TypeDecl(const EnumerationPtr & ep);
+        TypeDecl(Type tt) : baseType(tt) { gc_magic = GC_MAGIC_TYPEDECL; }
+        TypeDecl(Structure * sp) : baseType(Type::tStructure), structType(sp) { gc_magic = GC_MAGIC_TYPEDECL; }
+        TypeDecl(Enumeration * ep);
         TypeDeclPtr visit ( Visitor & vis );
         friend StringWriter& operator<< (StringWriter& stream, const TypeDecl & decl);
         string getMangledName ( bool fullName=false ) const;
@@ -232,6 +232,7 @@ namespace das {
         void collectAliasing ( TypeAliasMap & aliases, das_set<Structure *> & dep, bool viaPointer ) const;
         void collectContainerAliasing ( TypeAliasMap & aliases, das_set<Structure *> & dep, bool viaPointer ) const;
         void serialize ( AstSerializer & ser );
+        void gc_collect ( gc_root * target, gc_root * from = nullptr );
         string typeMacroName() const;
         uint64_t getOwnSemanticHash() const;
         uint64_t getMangledNameHash() const;
@@ -248,8 +249,8 @@ namespace das {
         Structure *             structType = nullptr;
         Enumeration *           enumType = nullptr;
         TypeAnnotation *        annotation = nullptr;
-        TypeDeclPtr             firstType;      // map.first or array, or pointer
-        TypeDeclPtr             secondType;     // map.second
+        TypeDeclPtr             firstType = nullptr;      // map.first or array, or pointer
+        TypeDeclPtr             secondType = nullptr;     // map.second
         vector<TypeDeclPtr>     argTypes;       // block arguments
         vector<string>          argNames;
         vector<int32_t>         dim;
@@ -289,9 +290,9 @@ namespace das {
     };
 
     struct MatchingOptionError {
-        TypeDeclPtr optionType;
-        TypeDeclPtr option1;
-        TypeDeclPtr option2;
+        TypeDeclPtr optionType = nullptr;
+        TypeDeclPtr option1 = nullptr;
+        TypeDeclPtr option2 = nullptr;
     };
 
     void findMatchingOptions ( const TypeDeclPtr & type, vector<MatchingOptionError> & matching );
@@ -376,7 +377,7 @@ namespace das {
     template <typename TT>
     struct typeFactory {
         static ___noinline TypeDeclPtr make(const ModuleLibrary &) {
-            auto t = make_smart<TypeDecl>();
+            auto t = new TypeDecl();
             t->baseType = Type( ToBasicType<TT>::type );
             t->constant = is_const<TT>::value;
             return t;
@@ -386,7 +387,7 @@ namespace das {
     template <>
     struct typeFactory<char *> {
         static ___noinline TypeDeclPtr make(const ModuleLibrary &) {
-            auto t = make_smart<TypeDecl>(Type::tString);
+            auto t = new TypeDecl(Type::tString);
             return t;
         }
     };
@@ -394,7 +395,7 @@ namespace das {
     template <>
     struct typeFactory<const char *> {
         static ___noinline TypeDeclPtr make(const ModuleLibrary &) {
-            auto t = make_smart<TypeDecl>(Type::tString);
+            auto t = new TypeDecl(Type::tString);
             t->constant = true;
             return t;
         }
@@ -403,7 +404,7 @@ namespace das {
     template <typename TT>
     struct typeFactory<smart_ptr<TT>> {
         static ___noinline TypeDeclPtr make(const ModuleLibrary & lib) {
-            auto t = make_smart<TypeDecl>(Type::tPointer);
+            auto t = new TypeDecl(Type::tPointer);
             t->firstType = typeFactory<TT>::make(lib);
             t->smartPtr = true;
             t->smartPtrNative = true;
@@ -414,7 +415,7 @@ namespace das {
     template <typename TT>
     struct typeFactory<smart_ptr_raw<TT>> {
         static ___noinline TypeDeclPtr make(const ModuleLibrary & lib) {
-            auto t = make_smart<TypeDecl>(Type::tPointer);
+            auto t = new TypeDecl(Type::tPointer);
             t->firstType = typeFactory<TT>::make(lib);
             t->smartPtr = true;
             return t;
@@ -424,7 +425,7 @@ namespace das {
     template <>
     struct typeFactory<Array *> {
         static ___noinline TypeDeclPtr make(const ModuleLibrary &) {
-            auto t = make_smart<TypeDecl>(Type::tArray);
+            auto t = new TypeDecl(Type::tArray);
             return t;
         }
     };
@@ -432,7 +433,7 @@ namespace das {
     template <>
     struct typeFactory<Iterator *> {
         static ___noinline TypeDeclPtr make(const ModuleLibrary &) {
-            auto t = make_smart<TypeDecl>(Type::tIterator);
+            auto t = new TypeDecl(Type::tIterator);
             return t;
         }
     };
@@ -440,7 +441,7 @@ namespace das {
     template <>
     struct typeFactory<const Iterator *> {
         static ___noinline TypeDeclPtr make(const ModuleLibrary &) {
-            auto t = make_smart<TypeDecl>(Type::tIterator);
+            auto t = new TypeDecl(Type::tIterator);
             t->constant = true;
             return t;
         }
@@ -449,7 +450,7 @@ namespace das {
     template <>
     struct typeFactory<Table *> {
         static ___noinline TypeDeclPtr make(const ModuleLibrary &) {
-            auto t = make_smart<TypeDecl>(Type::tTable);
+            auto t = new TypeDecl(Type::tTable);
             return t;
         }
     };
@@ -457,21 +458,21 @@ namespace das {
     template <>
     struct typeFactory<Context *> {
         static ___noinline TypeDeclPtr make(const ModuleLibrary &) {
-            return make_smart<TypeDecl>(Type::fakeContext);
+            return new TypeDecl(Type::fakeContext);
         }
     };
 
     template <>
     struct typeFactory<LineInfoArg *> {
         static ___noinline TypeDeclPtr make(const ModuleLibrary &) {
-            return make_smart<TypeDecl>(Type::fakeLineInfo);
+            return new TypeDecl(Type::fakeLineInfo);
         }
     };
 
     template <typename ResultType, typename ...Args>
     struct typeFactory<TBlock<ResultType,Args...>> {
         static ___noinline TypeDeclPtr make(const ModuleLibrary & lib) {
-            auto t = make_smart<TypeDecl>(Type::tBlock);
+            auto t = new TypeDecl(Type::tBlock);
             t->firstType = typeFactory<ResultType>::make(lib);
             t->argTypes = { typeFactory<Args>::make(lib)... };
             return t;
@@ -480,7 +481,7 @@ namespace das {
     template <typename ResultType, typename ...Args>
     struct typeFactory<TFunc<ResultType,Args...>> {
         static ___noinline TypeDeclPtr make(const ModuleLibrary & lib) {
-            auto t = make_smart<TypeDecl>(Type::tFunction);
+            auto t = new TypeDecl(Type::tFunction);
             t->firstType = typeFactory<ResultType>::make(lib);
             t->argTypes = { typeFactory<Args>::make(lib)... };
             return t;
@@ -490,7 +491,7 @@ namespace das {
     template <typename ResultType, typename ...Args>
     struct typeFactory<TLambda<ResultType,Args...>> {
         static ___noinline TypeDeclPtr make(const ModuleLibrary & lib) {
-            auto t = make_smart<TypeDecl>(Type::tLambda);
+            auto t = new TypeDecl(Type::tLambda);
             t->firstType = typeFactory<ResultType>::make(lib);
             t->argTypes = { typeFactory<Args>::make(lib)... };
             return t;
@@ -533,7 +534,7 @@ namespace das {
     template <typename TT>
     struct typeFactory<TArray<TT>> {
         static ___noinline TypeDeclPtr make(const ModuleLibrary & lib) {
-            auto t = make_smart<TypeDecl>(Type::tArray);
+            auto t = new TypeDecl(Type::tArray);
             t->firstType = typeFactory<TT>::make(lib);
             return t;
         }
@@ -557,7 +558,7 @@ namespace das {
     template <typename TK, typename TV>
     struct typeFactory<TTable<TK,TV>> {
         static ___noinline TypeDeclPtr make(const ModuleLibrary & lib) {
-            auto t = make_smart<TypeDecl>(Type::tTable);
+            auto t = new TypeDecl(Type::tTable);
             t->firstType = typeFactory<TK>::make(lib);
             t->secondType = typeFactory<TV>::make(lib);
             return t;
@@ -570,7 +571,7 @@ namespace das {
     template <typename TT>
     struct typeFactory<TSequence<TT>> {
         static ___noinline TypeDeclPtr make(const ModuleLibrary & lib) {
-            auto t = make_smart<TypeDecl>(Type::tIterator);
+            auto t = new TypeDecl(Type::tIterator);
             t->firstType = typeFactory<TT>::make(lib);
             return t;
         }
@@ -591,7 +592,7 @@ namespace das {
     template <typename TT>
     struct typeFactory<TT *> {
         static ___noinline TypeDeclPtr make(const ModuleLibrary & lib) {
-            auto pt = make_smart<TypeDecl>(Type::tPointer);
+            auto pt = new TypeDecl(Type::tPointer);
             if ( !is_void<TT>::value ) {
                 pt->firstType = typeFactory<TT>::make(lib);
             }
@@ -602,7 +603,7 @@ namespace das {
     template <typename TT>
     struct typeFactory<const TT *> {
         static ___noinline TypeDeclPtr make(const ModuleLibrary & lib) {
-            auto pt = make_smart<TypeDecl>(Type::tPointer);
+            auto pt = new TypeDecl(Type::tPointer);
             if ( !is_void<TT>::value ) {
                 pt->firstType = typeFactory<TT>::make(lib);
                 pt->firstType->constant = true;
@@ -643,7 +644,7 @@ namespace das {
     template <typename FT, typename ST>
     struct typeFactory<pair<FT,ST>> {
         static ___noinline TypeDeclPtr make(const ModuleLibrary & lib) {
-            auto t = make_smart<TypeDecl>(Type::tTuple);
+            auto t = new TypeDecl(Type::tTuple);
             t->argTypes.push_back(typeFactory<FT>::make(lib));
             t->argTypes.push_back(typeFactory<ST>::make(lib));
             return t;
@@ -683,7 +684,7 @@ namespace das {
     enum class CpptRedundantConst { no, yes };
     enum class ChooseSmartPtr { no, yes };
 
-    string DAS_API describeCppType(const smart_ptr_raw<TypeDecl> & type,
+    string DAS_API describeCppType(const TypeDecl * type,
                            CpptSubstitureRef substituteRef = CpptSubstitureRef::no,
                            CpptSkipRef skipRef = CpptSkipRef::no,
                            CpptSkipConst skipConst = CpptSkipConst::no,
