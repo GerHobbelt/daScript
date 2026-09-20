@@ -1,6 +1,14 @@
-# Benchmarks — SQL / Array / Decs / XML comparison
+# Benchmarks — SQL / Array / Decs / XML / JSON comparison
 
-Updated 2026-06-03 (branch `bbatkin/linq-das-group-join`): **`group_join` is now C# GroupJoin (outer) and the `_fold` join splice fuses it.** `group_join_impl` keeps every left row — an unmatched left pairs with an empty group (was inner, silently dropping unmatched). The `join_general` splice slot now accepts `group_join` as well as `join` (an `isGroupJoin` flag threads through `build_join_standalone_pieces`: push `result(a, bucket)` once + `if (!get(...)) push result(a, empty)`), so a `%linq! … join … into g select (…, g |> length / g |> select(…) |> sum)` fuses — including a pre-join `where` — into one hash-build + probe with no intermediate. Array sources only (`_group_join` has no SQL push-down — it rejects; decs/xml route group joins to tier-2). The new **`group_join_count`** family isolates the outer cost with two same-sized lanes — `matched` (every left row matched) vs `unmatched` (all left rows miss → empty groups): they are **within noise** (INTERP 29.1 vs 28.9, JIT 18.2 vs 18.3 ns/op) — the outer-empty emit costs the same as a matched bucket-length read, so outer semantics is effectively free (the hash build over n=100k dominates). Existing join families are **byte-identical** — the splice change is guarded by `isGroupJoin`, so regular-join codegen is unchanged (the `test_linq_fold_ast` shape assertions confirm); not re-swept (no codegen delta).
+Updated 2026-06-04 (branch `bbatkin/decs-reverse-random-index`): **the DecsAdapter now random-indexes the boundary archetype tail.** Bare `last()` / `last_or_default()` (no `where` / `select` / range) read the last non-empty archetype's `[size-1]` directly via `get_ro(arch, comp, def)[idx]` (`emit_decs_last_random_index`, O(num_archetypes)); `reverse |> take(K)` random-indexes the boundary archetype's tail `[size-K .. size)` instead of `continue`-walking its head (`build_decs_index_collect`). **`reverse_take` / `reverse_take_select` m4 9.2/9.3 → 0.2 INTERP (1.1 → 0.0 JIT), and the new `bare_last` m4 is 0.0** (the O(*n*) walk it replaces cost ~17 ns/elem INTERP / ~1.2 JIT — `benchmarks/micro/bare_last_decs_shapes.das`) — decs is now level with the XML backward-DOM path (m5f 0.0) and below array's still-walking `last()` (m3f 4.2). **Indexable sources only** — a `[decs_template]` field with a default-init compiles to `get_default_ro` (an iterator), so `decs_can_random_index` returns false and the chain falls back to the per-entity walk (behavior-identical); predicated / `_select`'d `last` likewise keeps the walk (the last-match position is unknown). Only the decs (m4) `bare_last` + `reverse_take[_select]` cells moved; all other cells are stable within long-sweep thermal noise.
+
+Earlier (branch `bbatkin/xml-reverse-emission`): **the XmlAdapter now walks the DOM backward for bounded-reverse shapes.** `reverse |> take(K) [|> select]` and a **no-predicate** `last()` / `reverse |> first` fuse to an O(K) backward walk via pugixml's O(1) `last_child()` / `previous_sibling()` — visiting only the kept tail instead of scanning all *n* forward then reversing. This closes the gap JSON's array-backed random access used to hold: **`reverse_take` m5f 85.8 → 0.0, `reverse_take_select` m5f 84.6 → 0.0 INTERP** (71.0 / 69.1 → 0.0 JIT), now level with the array / JSON tail walk. **Predicated `[where] |> last` deliberately stays on the forward walk** — reverse DOM traversal is ~2× cache-hostile per node (pugixml lays nodes out in forward document order, so `previous_sibling` defeats the prefetcher; profiled `count.backward` 119 vs `count.forward` 63 ns/elem INTERP), so a match far from the end would regress ~2.6× — `last_match` m5f is unchanged (66.3). **This sweep also captures the deferred apply-hybrid (#3008) read-path inline** that landed after the previous sweep: the `from_xml_node` field/row materializer now inlines its per-field `apply` block instead of routing each field through a per-field `invoke`, so XML m5f field-reading lanes drop broadly vs the previous (pre-#3008) sweep — `select_where` 253.3 → **196.0**, `bare_order_where` 332.5 → **303.8** INTERP, and the single-field reduce / aggregate lanes settle at ~16.5 ns under JIT (`count_aggregate` 27.2 → **16.5**, `sum_aggregate` 23.6 → **16.8**, `max_aggregate` 24.6 → **16.7**). Only the XML read-path (m5f) and the two reverse lanes moved; m1 / m3f / m4 / m6f cells are stable within long-sweep thermal noise.
+
+Earlier (branch `bbatkin/linq-json-self-materialize`): **`from_json` is now a by-name flat query source (Option B)** — the fused `JsonAdapter` and `from_json` / `read_json_field` materialize each JSON object the way `from_xml_node` does (top-level fields read by key, via `apply_imm` over the struct fields reading each `JsValue` straight off the variant), and **never honor a whole-row `from_JV(Row)` override** (the escape hatch is an explicit `[for (e in jv.value as _array); from_JV(e, type<Row>)]` first). Two wins compound. **(1) By-name materialize** removes the old per-result-row `from_JV` allocation (`select_where` 405 → 21 B/op) that ran ~n times on **lanes that build a large result set** — a full projection-to-array or a sort-everything. **(2) A direct per-field read** then attacks the per-field floor that (1) left untouched: `read_json_field` now reads a `table<string; JsonValue?>` slot pointer via `(jv ?as _object)?[key]` (null ⇔ key absent) instead of routing through the `operator ?[]` call frame + a `JVNull()`-sentinel `_null`-tag round-trip, and `from_json_row` reads each basic value straight off the `JsValue` variant — probing the `TT`-matching tag first (JSON ints land in `_longint`, reals in `_number` — a `static_if`, no runtime branch) — instead of the `from_JV` scalar wrapper. That drops a per-field interpreter call frame (plus the absent-key allocation), so **every field-reading lane falls ~15–31% INTERP**, not just the big-materialize ones: `select_where` 697.3 → **192.1** (−72%), `bare_order_where` 780.6 → **302.8** (−61%), and the reduce / count / group lanes that the by-name pass left flat now drop too (`count_aggregate` 214.0 → **156.3**, `sum_aggregate` 198.4 → **144.5**, `groupby_sum` 276.0 → **201.6**). Lanes that read **no field** are unchanged (`select_count` 2.2, `reverse_take` 25.2 — the array-backed O(K) tail walk). **Under JIT the per-field path is already inlined, so m6f is flat** (`aggregate_match` 38.3 → 41.4, `select_where` 38.0 → 37.4 — jitter). **Net vs XML:** the big-materialize lanes that trailed XML ~3× in INTERP now reach roughly parity (`select_where` 192.1 vs XML ~226–253, `bare_order_where` 302.8 vs 332.5), and **under JIT stay JSON-faster** (`select_where` 37.4 vs 95.2 = 0.39×, `bare_order_where` 58.3 vs 123.8 = 0.47×) — the das-side by-name build compiles to native while XML's per-row C++ assembly is fixed. The single-field-int **reduce** lanes still trail XML in INTERP (`count_aggregate` 156.3 vs 64.6 ≈ 2.4×, down from ~3×) and ~1.2× under JIT — the irreducible string-hashed `table` lookup vs XML's C++ pointer read. Only the m6f (JSON) path changed; every m1 / m3f / m4 / m5f cell is stable within long-sweep thermal noise (the `select_where` m5f 226.5 → 253.3 jitter is one such — XML is untouched here).
+
+Earlier (branch `bbatkin/linq-json-bench`): **JSON is now the 5th lane — `m6f` (`_fold` over `from_json(jv, type<Car>)`) lands on all 74 families that carry an XML `m5f` lane**, so the `JsonAdapter` (`daslib/linq_fold_json`) is now directly comparable to the `XmlAdapter`. The two adapters are near-1:1 (same fused families, same field-pruning, same materialize-under-guard, same fused join + `join |> group_by`); the bench isolates where the *cost* differs, and it splits cleanly along **two axes**. **(1) Per-element loop step:** XML advances its child list with a **C++ pugixml call per element** (`next_sibling` + a `node_element` kind-check — visible in the `select_count` codegen, a bare `++acc` walk that still costs 69.4 ns/elem INTERP), while JSON iterates a flat das `array<JsonValue?>` at 2.2 ns/elem. **(2) Per-field read:** XML reads an attribute by C++ pointer (cheap on top of the already-paid loop step), while JSON's `read_json_field` does a string-hashed `table<string; JsonValue?>` lookup + `from_JV` unwrap per field — the heavy part of the JSON lane (the `sum_aggregate` − `select_count` INTERP delta, ~196 ns, is essentially one JSON field read). **Neither path has an O(1) count/length shortcut — both walk every element.** So **field-heavy shapes favor XML, field-light shapes favor JSON.** On bulk reduce / group-by / full-row materialize (many field reads/element) JSON trails XML **~3.3× in INTERP** (median; `count_aggregate` 64.2→214.0, `sum_aggregate` 53.9→198.4) — JSON's ~200 ns reducer matches the Phase-0 hand-optimal *shape A*, so this is XML's cheap-field-read advantage, not adapter overhead. **Under JIT the das-side table lookups compile to native while XML's C++ boundary is fixed, so the gap closes to 1.80× median and JSON flips to faster on 9 families** (XML m5f / JSON m6f JIT), all field-light: `select_count` **0.03×** (INTERP 69.4→2.2 — zero field reads, so only the flat-walk-vs-C++-walk loop-step gap shows), the predicate-gated early-exits `single_match` 0.73× / `contains_match` 0.84× / `skip_while_match` 0.75× / `take_while_match` 0.85× / `indexed_lookup` 0.81× / `chained_where` 0.56×, `join_groupby_to_array` 0.57×, and `reverse_take` / `reverse_take_select` **0.05×** (66.9→3.7). **The `reverse_take` win is an adapter gap, not a DOM limit:** JSON random-indexes the last K from its backing array (O(K)) where the XmlAdapter walks all n forward then reverses — even though pugixml exposes O(1) `last_child()` + `previous_sibling()`, so a backward O(K) XML walk is a latent optimization left on the table. JSON also does **zero `string` clones** — a JSON string is already a heap-owned das string so `from_JV` aliases the pointer (`0 SB/op` / `0 strings/op` where XML clones ~n `name` strings out of the C++ document). Net: XML wins bulk reduce / materialize / sort even under JIT (its per-field C++ read is unbeatable for throughput), JSON wins anything field-light — a count, an early-exit gate, or a take its `array`-backed random access serves in O(K). No engine codegen changed — the only `.das` deltas are `fixture_json` + 74 `run_m6f` lanes + the `_update_results.das` lane list, so every existing m1/m3f/m4/m5f cell is stable within long-sweep thermal noise.
+
+Earlier (branch `bbatkin/linq-das-group-join`): **`group_join` is now C# GroupJoin (outer) and the `_fold` join splice fuses it.** `group_join_impl` keeps every left row — an unmatched left pairs with an empty group (was inner, silently dropping unmatched). The `join_general` splice slot now accepts `group_join` as well as `join` (an `isGroupJoin` flag threads through `build_join_standalone_pieces`: push `result(a, bucket)` once + `if (!get(...)) push result(a, empty)`), so a `%linq! … join … into g select (…, g |> length / g |> select(…) |> sum)` fuses — including a pre-join `where` — into one hash-build + probe with no intermediate. Array sources only (`_group_join` has no SQL push-down — it rejects; decs/xml route group joins to tier-2). The new **`group_join_count`** family isolates the outer cost with two same-sized lanes — `matched` (every left row matched) vs `unmatched` (all left rows miss → empty groups): they are **within noise** (INTERP 29.1 vs 28.9, JIT 18.2 vs 18.3 ns/op) — the outer-empty emit costs the same as a matched bucket-length read, so outer semantics is effectively free (the hash build over n=100k dominates). Existing join families are **byte-identical** — the splice change is guarded by `isGroupJoin`, so regular-join codegen is unchanged (the `test_linq_fold_ast` shape assertions confirm); not re-swept (no codegen delta).
 
 Earlier (branch `bbatkin/linq-das-multi-key-orderby`): **multi-key `orderby` — `from c in src orderby c.k1, c.k2 descending …` now emits one `_order_by_keys((k1, k2, …), descMask)` op** (compile-time `uint` mask; bit *i* → key *i* descending, LSB = first key). A multi-key order lowers to a **single composite-comparator `stable_sort`** (C# `OrderBy`/`ThenBy` parity — equal full-composite-key rows keep input order); the SQL lane pushes `ORDER BY c1, c2 DESC, …` down to SQLite. **Single-key `orderby` is byte-identical — it keeps the cheaper *unstable* `sort`, so there is no regression**: `bare_order_where` / `order_take_desc` / `sort_take` are all stable within noise vs the prior sweep. The new **`order_by_multi_key`** family measures the worst case for the stable algorithm — `_where(price > T) |> _order_by_keys((_.brand, _.price), 0u)`, a full sort with NO `take` (`brand` has 5 values, so the first key produces dense ties the second resolves). Its delta vs the single-key `bare_order_where` baseline combines two effects — the 1-key→2-key comparator *and* unstable→stable — so it is not a pure stability tax: INTERP 339.9/271.1/280.3/483.5 vs 274.6/117.0/125.8/332.8 (SQL/array/decs/XML), JIT 250.8/53.5/54.8/143.0 vs 186.1/34.0/35.3/125.5. SQL's increase is SQLite's own 2-column `ORDER BY` (still pushed down, no in-memory sort). All other families are stable within long-sweep thermal noise — the `order_by_keys` path is new, so no existing family routes through it.
 
@@ -33,6 +41,11 @@ catalogued in `doc/source/reference/linq_fold_patterns.rst`.
   per-archetype walk.
 - **XML fold (m5f)** — `_fold` over a `from_xml_node(root, type<Car>)` source. The
   `XmlAdapter` (`pugixml/linq_fold_xml`) fuses + field-prunes where it can.
+- **JSON fold (m6f)** — `_fold` over a `from_json(jv, type<Car>)` source where `jv` is a
+  pre-built `JsonValue?` array of objects (`fixture_json`). The `JsonAdapter`
+  (`daslib/linq_fold_json`) fuses + field-prunes the same shapes as the XML lane — same
+  `SourceAdapter` machinery, swapping the DOM walk for a `jsrc.value as _array` walk and
+  `read_json_field` / `from_JV` for the attribute reads.
 
 Sub-nanosecond cells (`0.00`) reflect early-exit terminators that exit
 before the timer resolution can measure them — they should be read as
@@ -63,179 +76,217 @@ materialization to just the fields the chain reads. What it covers:
 - **String-clone floor.** Whole-row escapes with no field-only gate (`reverse |> to_array`,
   un-filtered `sort` / `order_by`) keep the full per-element clone — only the intermediate
   array is elided.
+- **Bounded-reverse backward walk.** `reverse |> take(K) [|> select]` and a no-predicate
+  `last()` / `reverse |> first` walk the DOM backward (`last_child` / `previous_sibling`, O(1)
+  each) and stop after K elements — O(K), not the old O(*n*)-forward-then-reverse-then-resize. So
+  `reverse_take` / `reverse_take_select` m5f are now sub-resolution (0.0). Backward is
+  **unnamed-only** (no last-named-child primitive); a named `from_xml_node(root, "tag", …)`
+  reverse falls back to the buffer-all path. Predicated `[where] |> last` keeps the forward walk
+  (reverse traversal is ~2× cache-hostile per node — a far-from-end match would regress).
 
 (The absolute XML numbers stay above the array/decs lanes either way — XML carries
 DOM-parse + per-element attribute reads + `string` clones the in-memory lanes never pay.)
 
+### Reading the JSON fold lane (m6f)
+
+The `JsonAdapter` is a near-1:1 mirror of `XmlAdapter` — same fused families, same
+field-pruning, same materialize-under-guard, same fused join (incl. `join |> group_by`).
+The cost difference is a **two-axis split** — per-element loop step vs per-field read — and the
+two lanes sit on opposite corners:
+
+- **Loop step: JSON cheap, XML costly.** JSON iterates a flat das `array<JsonValue?>` (a plain
+  index advance, ~2.2 ns/elem). XML advances its child list with a **C++ pugixml call per element**
+  (`next_sibling` + a `node_element` kind-check) — ~60–69 ns/elem *before any field is read*. The
+  `select_count` family isolates this: a bare element count (no field read) is JSON 2.2 vs XML 69.4
+  INTERP, **0.03×**, purely the loop-step gap.
+- **Field read: JSON costly, XML cheap.** Each JSON field read is a `read_json_field` →
+  `(jv ?as _object)?[key]` string-hashed `table<string; JsonValue?>` lookup + a direct `JsValue`-variant
+  read (~142 ns/field INTERP — the `sum_aggregate` − `select_count` delta is essentially one such read;
+  was ~190 before `read_json_field` dropped the `operator ?[]` frame + `from_JV` wrapper). XML reads an
+  attribute by C++ pointer, nearly free on top of the loop step it already paid. So **field-light
+  shapes** (count, predicate-gated early-exit) favor JSON; **field-heavy shapes** (bulk reduce,
+  whole-row `to_array` with its 6 lookups/row) favor XML.
+- **No string clones (JSON).** A JSON string value is already a heap-owned das string in the same
+  context as the fold output, so `from_JV(…, type<string>)` aliases the pointer rather than copying.
+  The whole-row materialize shapes that make XML clone ~n `name` strings cost JSON **zero** string
+  allocations (`0 SB/op`, `0 strings/op`).
+- **Reverse: now at parity.** `reverse |> take(K)` was JSON's biggest win — its array-backed source
+  random-indexes the last K (O(K)). As of `bbatkin/xml-reverse-emission` the XmlAdapter matches it
+  with an O(K) backward DOM walk (`last_child()` + `previous_sibling()`, both O(1) in pugixml — see the
+  XML lane notes above), so `reverse_take` / `reverse_take_select` m5f are now 0.0 on both lanes. (`count`,
+  by contrast, is genuinely structural — pugixml has no `child_count()` and no `operator[]` on
+  `xml_node`, so XML can't shortcut it.)
+- **No parse step in the measured block.** Like XML (which parses the document outside `run`), the
+  JSON tree is built by `fixture_json` outside the timer; both lanes measure only the
+  walk + materialize + fold, so the m5f/m6f cells are directly comparable.
+
 
 <!-- BENCH:TABLES BEGIN -->
-*Generated 2026-06-03 by `benchmarks/sql/_update_results.das` — ns/op; `—` = absent lane. Edit the prose around the markers, not the tables.*
+*Generated 2026-06-04 by `benchmarks/sql/_update_results.das` — ns/op; `—` = absent lane. Edit the prose around the markers, not the tables.*
 
 ## INTERP
 
-| Benchmark | SQL (m1) | Array (m3f) | Decs (m4) | XML fold (m5f) |
-|---|---:|---:|---:|---:|
-| `aggregate_match` | 34.5 | 6.0 | 6.1 | 58.4 |
-| `all_match` | 27.4 | 3.5 | 3.5 | 67.7 |
-| `any_match` | 0.0 | 0.0 | 0.0 | 0.0 |
-| `average_aggregate` | 29.8 | 5.9 | 8.8 | 58.4 |
-| `bare_order_where` | 274.6 | 117.0 | 125.8 | 332.8 |
-| `chained_select_collapse` | — | 18.0 | 17.7 | 71.4 |
-| `chained_where` | 36.3 | 6.7 | 7.3 | 103.3 |
-| `contains_match` | 0.0 | 2.3 | 1.4 | 29.2 |
-| `count_aggregate` | 29.1 | 4.2 | 4.2 | 64.7 |
-| `cross_join` | 12710.8 | 3729.6 | — | 4167.4 |
-| `decs_count_bare_pred` | — | — | 4.2 | — |
-| `distinct_by_count` | 41.5 | 15.9 | 16.1 | 90.0 |
-| `distinct_by_order_take` | 242.7 | 22.0 | 23.2 | 126.6 |
-| `distinct_by_order_to_array` | 240.3 | 21.9 | 23.4 | 126.5 |
-| `distinct_count` | 41.4 | 15.7 | 15.9 | 70.7 |
-| `distinct_count_pred` | 295.4 | 15.8 | 15.8 | 111.6 |
-| `distinct_take` | 0.0 | 0.0 | 0.0 | 0.0 |
-| `element_at_match` | 0.0 | 0.0 | 0.0 | 0.5 |
-| `first_match` | 0.0 | 0.0 | 0.0 | 0.0 |
-| `first_or_default_match` | 0.0 | 0.0 | 0.0 | 0.0 |
-| `group_join_count_matched` | — | 29.1 | — | — |
-| `group_join_count_unmatched` | — | 28.9 | — | — |
-| `groupby_average` | 172.4 | 30.5 | 30.1 | 125.7 |
-| `groupby_count` | 142.0 | 19.2 | 19.3 | 76.8 |
-| `groupby_first` | 250.4 | 18.5 | 19.2 | 72.0 |
-| `groupby_having_count` | 141.5 | 19.2 | 19.2 | 79.5 |
-| `groupby_having_hidden_sum` | 175.8 | 23.8 | 24.1 | 123.6 |
-| `groupby_having_post_where` | 172.8 | 18.8 | 18.6 | 116.2 |
-| `groupby_max` | 173.1 | 25.0 | 25.1 | 120.9 |
-| `groupby_min` | 172.5 | 25.0 | 28.9 | 121.5 |
-| `groupby_multi_reducer` | 189.4 | 31.9 | 32.6 | 126.4 |
-| `groupby_select_order` | 169.9 | 18.8 | 18.7 | 117.7 |
-| `groupby_select_sum` | 205.0 | 36.2 | 36.1 | 103.1 |
-| `groupby_sum` | 170.5 | 18.6 | 18.6 | 114.4 |
-| `groupby_where_count` | 76.0 | 14.4 | 14.9 | 119.4 |
-| `groupby_where_sum` | 86.9 | 14.2 | 14.7 | 117.8 |
-| `indexed_lookup` | 1462.2 | 205420.4 | 491.9 | 5849551.8 |
-| `join_count` | 38.5 | 51.4 | 64.4 | 112.6 |
-| `join_groupby_count` | 158.1 | 78.3 | 90.6 | 179.9 |
-| `join_groupby_to_array` | 190.8 | 78.2 | 90.3 | 215.1 |
-| `join_select` | 150.0 | 72.4 | 85.6 | 192.0 |
-| `join_where_count` | 39.3 | 62.0 | 75.1 | 160.4 |
-| `last_match` | 0.0 | 5.8 | 14.0 | 65.8 |
-| `long_count_aggregate` | 30.0 | 4.1 | 4.1 | 64.4 |
-| `max_aggregate` | 31.1 | 6.2 | 6.8 | 58.0 |
-| `min_aggregate` | 31.1 | 6.0 | 6.8 | 58.1 |
-| `order_by_multi_key` | 339.9 | 271.1 | 280.3 | 483.5 |
-| `order_distinct_take` | 137.5 | 15.7 | 93.6 | 73.2 |
-| `order_reverse_normalized` | 38.6 | 16.3 | 20.1 | 69.7 |
-| `order_take_desc` | 38.6 | 16.2 | 20.0 | 69.6 |
-| `reverse_distinct_by` | 297.7 | 21.9 | 28.8 | 74.3 |
-| `reverse_take` | 0.1 | 0.0 | 9.2 | 90.3 |
-| `reverse_take_select` | 0.0 | 0.0 | 9.2 | 90.3 |
-| `select_count` | 0.1 | 0.0 | 2.2 | 70.2 |
-| `select_many` | — | 191.2 | — | — |
-| `select_where` | 199.6 | 11.1 | 19.3 | 225.1 |
-| `select_where_count` | 32.9 | 5.2 | 7.5 | 62.2 |
-| `select_where_order_take` | 37.0 | 12.4 | 15.0 | 70.5 |
-| `select_where_sum` | 37.5 | 7.4 | 7.6 | 64.1 |
-| `single_match` | 0.0 | 2.8 | 5.5 | 57.6 |
-| `skip_take` | 0.5 | 0.1 | 0.2 | 3.9 |
-| `skip_while_match` | 3.4 | 5.3 | 5.4 | 59.2 |
-| `sort_first` | 38.3 | 11.1 | 13.3 | 64.4 |
-| `sort_take` | 38.5 | 16.4 | 20.1 | 68.8 |
-| `sort_take_select` | 38.3 | 16.3 | 20.1 | 70.4 |
-| `sum_aggregate` | 30.3 | 2.1 | 2.1 | 54.0 |
-| `sum_where` | 33.2 | 4.3 | 4.3 | 61.4 |
-| `take_count` | 3.6 | 0.2 | 0.4 | 3.5 |
-| `take_count_filtered` | 1.1 | 0.2 | 0.2 | 1.3 |
-| `take_sum_aggregate` | 0.8 | 0.1 | 0.1 | 0.6 |
-| `take_where_count` | 0.9 | 0.1 | 0.1 | 0.7 |
-| `take_while_match` | 7.9 | 2.4 | 2.4 | 29.8 |
-| `to_array_filter` | 71.0 | 11.7 | 11.8 | 72.5 |
-| `where_join_count` | 41.7 | 30.0 | 41.5 | 136.0 |
-| `zip_count_pred` | 39.3 | 15.2 | — | 375.1 |
-| `zip_dot_product` | 46.9 | 12.6 | 10.9 | 369.9 |
-| `zip_dot_product_3arg` | 47.3 | 12.8 | — | 374.4 |
-| `zip_reverse_to_array` | — | 31.0 | — | 400.9 |
+| Benchmark | SQL (m1) | Array (m3f) | Decs (m4) | XML fold (m5f) | JSON fold (m6f) |
+|---|---:|---:|---:|---:|---:|
+| `aggregate_match` | 35.3 | 6.0 | 5.9 | 58.7 | 163.8 |
+| `all_match` | 27.9 | 3.6 | 3.4 | 55.7 | 154.1 |
+| `any_match` | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| `average_aggregate` | 30.7 | 5.8 | 8.8 | 59.8 | 165.6 |
+| `bare_last` | — | 4.2 | 0.0 | 0.0 | 4.2 |
+| `bare_order_where` | 283.0 | 116.8 | 126.1 | 304.2 | 301.5 |
+| `chained_select_collapse` | — | 17.9 | 17.8 | 70.5 | 169.7 |
+| `chained_where` | 36.9 | 6.6 | 7.3 | 103.0 | 204.8 |
+| `contains_match` | 0.0 | 2.3 | 1.4 | 31.1 | 74.1 |
+| `count_aggregate` | 30.1 | 4.1 | 4.1 | 64.5 | 157.4 |
+| `cross_join` | 12765.7 | 3724.1 | — | 4040.5 | 4111.5 |
+| `decs_count_bare_pred` | — | — | 4.1 | — | — |
+| `distinct_by_count` | 42.0 | 15.8 | 16.1 | 72.8 | 170.3 |
+| `distinct_by_order_take` | 240.2 | 21.7 | 23.6 | 127.1 | 170.1 |
+| `distinct_by_order_to_array` | 241.2 | 21.9 | 23.6 | 127.9 | 168.8 |
+| `distinct_count` | 41.8 | 15.8 | 15.9 | 70.8 | 172.6 |
+| `distinct_count_pred` | 253.8 | 16.0 | 16.2 | 113.4 | 188.4 |
+| `distinct_take` | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| `element_at_match` | 0.0 | 0.0 | 0.0 | 0.4 | 0.4 |
+| `first_match` | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| `first_or_default_match` | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| `groupby_average` | 171.5 | 30.4 | 29.7 | 125.2 | 222.9 |
+| `groupby_count` | 140.9 | 20.5 | 20.5 | 76.9 | 176.5 |
+| `groupby_first` | 252.3 | 19.8 | 20.5 | 72.3 | 170.9 |
+| `groupby_having_count` | 142.5 | 20.6 | 20.5 | 78.2 | 176.0 |
+| `groupby_having_hidden_sum` | 175.9 | 24.0 | 24.1 | 123.6 | 214.3 |
+| `groupby_having_post_where` | 172.3 | 19.9 | 19.9 | 115.6 | 208.0 |
+| `groupby_max` | 175.1 | 25.1 | 25.2 | 122.2 | 213.4 |
+| `groupby_min` | 174.2 | 25.4 | 25.3 | 122.7 | 213.4 |
+| `groupby_multi_reducer` | 190.8 | 32.7 | 32.3 | 126.8 | 220.6 |
+| `groupby_select_order` | 171.9 | 19.9 | 19.8 | 117.8 | 209.2 |
+| `groupby_select_sum` | 199.9 | 37.3 | 36.7 | 99.3 | 216.8 |
+| `groupby_sum` | 171.9 | 19.9 | 19.8 | 116.2 | 207.6 |
+| `groupby_where_count` | 76.1 | 14.5 | 14.9 | 117.8 | 207.2 |
+| `groupby_where_sum` | 88.8 | 14.2 | 14.6 | 117.0 | 208.1 |
+| `indexed_lookup` | 1458.7 | 205928.9 | 473.7 | 5827978.4 | 15265537.5 |
+| `join_count` | 38.5 | 51.4 | 64.7 | 113.0 | 187.3 |
+| `join_groupby_count` | 158.0 | 78.6 | 92.4 | 179.5 | 254.6 |
+| `join_groupby_to_array` | 191.0 | 78.6 | 91.4 | 220.1 | 223.4 |
+| `join_select` | 151.4 | 72.7 | 84.8 | 192.5 | 238.4 |
+| `join_where_count` | 39.6 | 62.2 | 75.2 | 161.8 | 211.3 |
+| `last_match` | 0.0 | 5.9 | 13.9 | 65.6 | 160.6 |
+| `long_count_aggregate` | 30.3 | 4.1 | 4.1 | 64.3 | 157.8 |
+| `max_aggregate` | 31.1 | 6.2 | 6.8 | 58.5 | 164.2 |
+| `min_aggregate` | 31.4 | 6.1 | 6.7 | 58.5 | 165.6 |
+| `order_by_multi_key` | 343.5 | 273.0 | 281.3 | 460.6 | 460.6 |
+| `order_distinct_take` | 138.8 | 15.8 | 94.4 | 72.9 | 173.5 |
+| `order_reverse_normalized` | 38.8 | 16.1 | 20.0 | 69.6 | 182.1 |
+| `order_take_desc` | 38.5 | 16.1 | 20.2 | 69.0 | 181.3 |
+| `reverse_distinct_by` | 297.0 | 21.9 | 34.0 | 74.5 | 170.7 |
+| `reverse_take` | 0.1 | 0.0 | 0.2 | 0.0 | 25.7 |
+| `reverse_take_select` | 0.0 | 0.0 | 0.2 | 0.0 | 25.4 |
+| `select_count` | 0.1 | 0.0 | 2.2 | 67.6 | 2.2 |
+| `select_many` | — | 191.8 | — | — | — |
+| `select_where` | 196.6 | 11.2 | 19.5 | 196.6 | 193.0 |
+| `select_where_count` | 32.8 | 5.2 | 7.4 | 62.2 | 161.4 |
+| `select_where_order_take` | 37.0 | 12.3 | 15.0 | 70.9 | 168.4 |
+| `select_where_sum` | 37.4 | 7.5 | 7.4 | 64.0 | 164.9 |
+| `single_match` | 0.0 | 2.8 | 5.4 | 57.3 | 149.5 |
+| `skip_take` | 0.5 | 0.1 | 0.2 | 3.1 | 3.1 |
+| `skip_while_match` | 3.5 | 5.3 | 5.4 | 58.7 | 154.1 |
+| `sort_first` | 38.2 | 11.1 | 13.4 | 64.5 | 178.4 |
+| `sort_take` | 38.5 | 16.4 | 20.1 | 69.1 | 182.6 |
+| `sort_take_select` | 38.6 | 16.3 | 20.5 | 70.5 | 184.3 |
+| `sum_aggregate` | 30.4 | 2.1 | 2.1 | 54.3 | 150.8 |
+| `sum_where` | 33.3 | 4.3 | 4.3 | 61.2 | 157.6 |
+| `take_count` | 3.6 | 0.2 | 0.4 | 3.0 | 3.0 |
+| `take_count_filtered` | 1.1 | 0.2 | 0.2 | 1.3 | 1.1 |
+| `take_sum_aggregate` | 0.8 | 0.1 | 0.1 | 0.6 | 0.6 |
+| `take_where_count` | 0.9 | 0.1 | 0.1 | 0.7 | 0.6 |
+| `take_while_match` | 7.8 | 2.4 | 2.4 | 29.6 | 76.3 |
+| `to_array_filter` | 70.7 | 12.3 | 12.4 | 72.3 | 168.8 |
+| `where_join_count` | 41.7 | 29.6 | 41.5 | 135.5 | 177.3 |
+| `zip_count_pred` | 39.4 | 15.0 | — | 320.7 | 341.4 |
+| `zip_dot_product` | 47.2 | 12.6 | 10.5 | 318.6 | 338.9 |
+| `zip_dot_product_3arg` | 47.0 | 12.9 | — | 314.9 | 337.9 |
+| `zip_reverse_to_array` | — | 31.0 | — | 344.9 | 372.0 |
 
 ## JIT
 
-| Benchmark | SQL (m1) | Array (m3f) | Decs (m4) | XML fold (m5f) |
-|---|---:|---:|---:|---:|
-| `aggregate_match` | 35.0 | 0.3 | 0.6 | 17.1 |
-| `all_match` | 27.9 | 0.3 | 0.2 | 16.4 |
-| `any_match` | 0.0 | 0.0 | 0.0 | 0.0 |
-| `average_aggregate` | 30.5 | 1.0 | 3.6 | 17.8 |
-| `bare_order_where` | 186.1 | 34.0 | 35.3 | 125.5 |
-| `chained_select_collapse` | — | 2.1 | 2.1 | 21.3 |
-| `chained_where` | 36.5 | 0.6 | 0.8 | 36.0 |
-| `contains_match` | 0.0 | 0.2 | 0.1 | 17.6 |
-| `count_aggregate` | 29.6 | 0.3 | 0.6 | 16.5 |
-| `cross_join` | 5947.4 | 730.1 | — | 884.6 |
-| `decs_count_bare_pred` | — | — | 0.6 | — |
-| `distinct_by_count` | 42.1 | 2.1 | 2.1 | 21.8 |
-| `distinct_by_order_take` | 240.4 | 2.6 | 3.2 | 46.7 |
-| `distinct_by_order_to_array` | 240.4 | 2.7 | 3.3 | 47.6 |
-| `distinct_count` | 41.6 | 2.1 | 2.1 | 21.5 |
-| `distinct_count_pred` | 251.7 | 2.1 | 2.3 | 39.5 |
-| `distinct_take` | 0.0 | 0.0 | 0.0 | 0.1 |
-| `element_at_match` | 0.0 | 0.0 | 0.0 | 0.2 |
-| `first_match` | 0.0 | 0.0 | 0.0 | 0.0 |
-| `first_or_default_match` | 0.0 | 0.0 | 0.0 | 0.0 |
-| `group_join_count_matched` | — | 18.2 | — | — |
-| `group_join_count_unmatched` | — | 18.3 | — | — |
-| `groupby_average` | 171.2 | 2.6 | 2.9 | 36.4 |
-| `groupby_count` | 142.0 | 2.4 | 2.5 | 21.4 |
-| `groupby_first` | 251.1 | 2.2 | 3.1 | 21.8 |
-| `groupby_having_count` | 142.7 | 2.4 | 2.5 | 22.4 |
-| `groupby_having_hidden_sum` | 175.6 | 2.5 | 2.8 | 37.6 |
-| `groupby_having_post_where` | 169.9 | 2.4 | 2.7 | 35.7 |
-| `groupby_max` | 174.2 | 2.4 | 2.7 | 37.9 |
-| `groupby_min` | 174.7 | 2.4 | 2.7 | 36.0 |
-| `groupby_multi_reducer` | 190.0 | 2.7 | 3.0 | 36.2 |
-| `groupby_select_order` | 171.1 | 2.4 | 2.7 | 35.7 |
-| `groupby_select_sum` | 202.4 | 3.2 | 3.9 | 32.7 |
-| `groupby_sum` | 170.5 | 2.4 | 2.7 | 35.7 |
-| `groupby_where_count` | 76.3 | 1.5 | 1.8 | 36.5 |
-| `groupby_where_sum` | 87.3 | 1.5 | 1.8 | 37.0 |
-| `indexed_lookup` | 1246.1 | 33112.3 | 108.4 | 4689740.5 |
-| `join_count` | 38.5 | 11.8 | 12.8 | 47.1 |
-| `join_groupby_count` | 157.9 | 19.6 | 21.9 | 68.9 |
-| `join_groupby_to_array` | 189.9 | 19.6 | 21.8 | 80.8 |
-| `join_select` | 93.3 | 20.2 | 22.7 | 74.0 |
-| `join_where_count` | 39.5 | 19.6 | 22.0 | 65.9 |
-| `last_match` | 0.0 | 0.5 | 1.4 | 21.0 |
-| `long_count_aggregate` | 30.2 | 0.3 | 0.6 | 16.6 |
-| `max_aggregate` | 31.2 | 0.3 | 0.5 | 24.6 |
-| `min_aggregate` | 31.3 | 0.3 | 0.5 | 16.8 |
-| `order_by_multi_key` | 250.8 | 53.5 | 54.8 | 143.0 |
-| `order_distinct_take` | 138.7 | 2.1 | 75.5 | 21.3 |
-| `order_reverse_normalized` | 38.5 | 0.7 | 1.4 | 16.9 |
-| `order_take_desc` | 38.5 | 0.7 | 1.4 | 16.9 |
-| `reverse_distinct_by` | 301.6 | 2.6 | 5.0 | 22.0 |
-| `reverse_take` | 0.0 | 0.0 | 1.1 | 70.4 |
-| `reverse_take_select` | 0.0 | 0.0 | 1.1 | 70.4 |
-| `select_count` | 0.1 | 0.0 | 0.0 | 67.8 |
-| `select_many` | — | 62.9 | — | — |
-| `select_where` | 107.6 | 4.2 | 5.5 | 96.2 |
-| `select_where_count` | 33.1 | 0.3 | 0.6 | 16.5 |
-| `select_where_order_take` | 36.9 | 0.7 | 1.4 | 17.5 |
-| `select_where_sum` | 37.7 | 0.4 | 0.6 | 18.5 |
-| `single_match` | 0.0 | 0.4 | 1.1 | 46.6 |
-| `skip_take` | 0.3 | 0.0 | 0.0 | 1.6 |
-| `skip_while_match` | 3.5 | 0.4 | 0.4 | 46.9 |
-| `sort_first` | 38.2 | 0.4 | 1.3 | 16.6 |
-| `sort_take` | 39.6 | 0.7 | 1.3 | 18.1 |
-| `sort_take_select` | 38.6 | 0.7 | 1.4 | 16.9 |
-| `sum_aggregate` | 30.5 | 0.3 | 0.1 | 17.8 |
-| `sum_where` | 33.2 | 0.3 | 0.6 | 16.5 |
-| `take_count` | 1.8 | 0.1 | 0.1 | 1.6 |
-| `take_count_filtered` | 1.1 | 0.0 | 0.0 | 0.5 |
-| `take_sum_aggregate` | 0.8 | 0.0 | 0.0 | 0.2 |
-| `take_where_count` | 0.9 | 0.0 | 0.0 | 0.2 |
-| `take_while_match` | 7.8 | 0.2 | 0.3 | 17.7 |
-| `to_array_filter` | 48.6 | 3.3 | 3.4 | 20.2 |
-| `where_join_count` | 41.6 | 6.4 | 7.4 | 48.3 |
-| `zip_count_pred` | 39.5 | 0.1 | — | 152.0 |
-| `zip_dot_product` | 46.7 | 0.1 | 0.1 | 153.1 |
-| `zip_dot_product_3arg` | 46.8 | 0.1 | — | 151.7 |
-| `zip_reverse_to_array` | — | 4.5 | — | 161.1 |
+| Benchmark | SQL (m1) | Array (m3f) | Decs (m4) | XML fold (m5f) | JSON fold (m6f) |
+|---|---:|---:|---:|---:|---:|
+| `aggregate_match` | 35.1 | 0.3 | 0.7 | 16.6 | 35.6 |
+| `all_match` | 28.1 | 0.3 | 0.2 | 16.6 | 35.2 |
+| `any_match` | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| `average_aggregate` | 30.6 | 1.0 | 3.5 | 16.5 | 36.1 |
+| `bare_last` | — | 0.4 | 0.0 | 0.0 | 0.0 |
+| `bare_order_where` | 186.0 | 34.2 | 35.4 | 106.4 | 60.4 |
+| `chained_select_collapse` | — | 2.1 | 2.1 | 21.4 | 39.7 |
+| `chained_where` | 36.6 | 0.6 | 0.8 | 40.7 | 18.6 |
+| `contains_match` | 0.0 | 0.2 | 0.1 | 17.6 | 13.6 |
+| `count_aggregate` | 29.9 | 0.3 | 0.6 | 16.7 | 36.3 |
+| `cross_join` | 5969.5 | 723.3 | — | 856.9 | 779.2 |
+| `decs_count_bare_pred` | — | — | 0.6 | — | — |
+| `distinct_by_count` | 41.6 | 2.1 | 2.1 | 21.4 | 50.1 |
+| `distinct_by_order_take` | 239.8 | 2.6 | 3.2 | 45.6 | 52.4 |
+| `distinct_by_order_to_array` | 239.7 | 2.7 | 3.3 | 48.2 | 53.2 |
+| `distinct_count` | 41.9 | 2.1 | 2.1 | 21.3 | 40.5 |
+| `distinct_count_pred` | 251.9 | 2.1 | 2.3 | 39.4 | 47.4 |
+| `distinct_take` | 0.0 | 0.0 | 0.0 | 0.1 | 0.2 |
+| `element_at_match` | 0.0 | 0.0 | 0.0 | 0.1 | 0.0 |
+| `first_match` | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| `first_or_default_match` | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| `groupby_average` | 174.4 | 2.6 | 2.9 | 35.8 | 66.0 |
+| `groupby_count` | 142.8 | 2.3 | 2.5 | 21.3 | 40.1 |
+| `groupby_first` | 262.9 | 2.2 | 3.1 | 21.3 | 40.7 |
+| `groupby_having_count` | 144.5 | 2.3 | 2.5 | 21.4 | 40.4 |
+| `groupby_having_hidden_sum` | 179.0 | 2.5 | 2.8 | 38.2 | 66.6 |
+| `groupby_having_post_where` | 175.9 | 2.4 | 2.7 | 35.7 | 65.7 |
+| `groupby_max` | 178.0 | 2.4 | 2.7 | 36.0 | 66.1 |
+| `groupby_min` | 177.4 | 2.4 | 2.7 | 38.2 | 65.6 |
+| `groupby_multi_reducer` | 202.6 | 2.7 | 3.0 | 36.2 | 66.6 |
+| `groupby_select_order` | 174.6 | 2.4 | 2.7 | 38.2 | 65.3 |
+| `groupby_select_sum` | 200.1 | 3.2 | 3.7 | 33.9 | 49.7 |
+| `groupby_sum` | 170.7 | 2.4 | 2.7 | 35.8 | 66.1 |
+| `groupby_where_count` | 75.8 | 1.5 | 1.8 | 37.8 | 62.1 |
+| `groupby_where_sum` | 86.5 | 1.5 | 1.8 | 35.4 | 60.3 |
+| `indexed_lookup` | 1248.1 | 33115.9 | 105.5 | 4525953.3 | 3080167.2 |
+| `join_count` | 38.6 | 11.8 | 12.9 | 48.1 | 68.9 |
+| `join_groupby_count` | 157.2 | 19.6 | 22.0 | 68.3 | 85.8 |
+| `join_groupby_to_array` | 190.6 | 19.7 | 21.9 | 80.6 | 40.8 |
+| `join_select` | 93.2 | 20.2 | 22.6 | 74.9 | 103.5 |
+| `join_where_count` | 39.3 | 19.8 | 21.6 | 66.0 | 68.2 |
+| `last_match` | 0.0 | 0.5 | 1.4 | 20.2 | 36.2 |
+| `long_count_aggregate` | 29.7 | 0.3 | 0.6 | 16.7 | 35.9 |
+| `max_aggregate` | 31.2 | 0.3 | 0.5 | 16.9 | 35.8 |
+| `min_aggregate` | 31.1 | 0.3 | 0.5 | 16.9 | 35.7 |
+| `order_by_multi_key` | 250.0 | 53.6 | 54.8 | 125.7 | 79.3 |
+| `order_distinct_take` | 139.2 | 2.1 | 76.3 | 21.4 | 40.2 |
+| `order_reverse_normalized` | 38.5 | 0.7 | 1.3 | 20.9 | 35.7 |
+| `order_take_desc` | 38.3 | 0.7 | 1.4 | 21.3 | 35.4 |
+| `reverse_distinct_by` | 295.3 | 2.6 | 5.0 | 22.0 | 44.0 |
+| `reverse_take` | 0.0 | 0.0 | 0.0 | 0.0 | 3.7 |
+| `reverse_take_select` | 0.0 | 0.0 | 0.0 | 0.0 | 3.8 |
+| `select_count` | 0.1 | 0.0 | 0.0 | 65.5 | 0.0 |
+| `select_many` | — | 63.0 | — | — | — |
+| `select_where` | 108.0 | 4.2 | 5.5 | 76.7 | 28.9 |
+| `select_where_count` | 32.9 | 0.3 | 0.6 | 16.7 | 35.3 |
+| `select_where_order_take` | 37.0 | 0.7 | 1.4 | 20.4 | 37.3 |
+| `select_where_sum` | 37.1 | 0.4 | 0.6 | 16.6 | 35.7 |
+| `single_match` | 0.0 | 0.4 | 1.1 | 45.1 | 37.9 |
+| `skip_take` | 0.3 | 0.0 | 0.0 | 1.3 | 0.3 |
+| `skip_while_match` | 3.5 | 0.4 | 0.4 | 46.3 | 30.2 |
+| `sort_first` | 38.1 | 0.4 | 1.3 | 19.6 | 35.0 |
+| `sort_take` | 38.4 | 0.7 | 1.3 | 21.3 | 35.4 |
+| `sort_take_select` | 38.4 | 0.7 | 1.4 | 20.3 | 35.5 |
+| `sum_aggregate` | 30.4 | 0.3 | 0.1 | 16.8 | 35.8 |
+| `sum_where` | 33.3 | 0.3 | 0.6 | 16.6 | 35.8 |
+| `take_count` | 1.8 | 0.1 | 0.1 | 1.3 | 0.4 |
+| `take_count_filtered` | 1.1 | 0.0 | 0.0 | 0.4 | 0.2 |
+| `take_sum_aggregate` | 0.8 | 0.0 | 0.0 | 0.2 | 0.1 |
+| `take_where_count` | 0.9 | 0.0 | 0.0 | 0.2 | 0.1 |
+| `take_while_match` | 7.8 | 0.2 | 0.3 | 16.5 | 13.4 |
+| `to_array_filter` | 48.5 | 3.3 | 3.4 | 20.2 | 44.1 |
+| `where_join_count` | 41.6 | 6.4 | 7.4 | 48.1 | 52.5 |
+| `zip_count_pred` | 39.2 | 0.1 | — | 115.1 | 37.4 |
+| `zip_dot_product` | 47.0 | 0.1 | 0.1 | 114.6 | 37.8 |
+| `zip_dot_product_3arg` | 46.8 | 0.1 | — | 116.0 | 36.7 |
+| `zip_reverse_to_array` | — | 4.6 | — | 123.1 | 49.1 |
 <!-- BENCH:TABLES END -->
 
 ## Notes on missing lanes (the `—` cells)
@@ -247,6 +298,11 @@ whether the gap is window-function / surface-limitation / by-design,
 and which gaps could land in a single PR — see
 [`sqlite_linq_gaps.md`](sqlite_linq_gaps.md).
 
+- **`bare_last` SQL (m1)** — bare `.last()` has no SQL analog: SQLite has no
+  inherent row ordering, so `_sql` rejects bare `reverse()` / `last()` (use
+  `_order_by_descending(...)` for sort reversal). Bare last is only meaningful for
+  sources with a natural order — array (index), decs (archetype storage order),
+  XML (document order), JSON (array order). By design.
 - **`chained_select_collapse` SQL** — `_sql` rejects `distinct() |> count()`
   as non-translatable. The equivalent SQL `COUNT(DISTINCT computed-expr)`
   isn't currently emitted by sqlite_linq's surface. By design — no follow-up.
@@ -254,21 +310,22 @@ and which gaps could land in a single PR — see
   anonymous row tuples, so there is no clean typed-lambda cross form
   (`_cross_join` requires typed lambdas and is not `_fold`-integrated yet). The
   decs lane arrives with the cross-join `_fold` engine integration; SQL / array /
-  XML only for now.
-- **`select_many` SQL (m1) / Decs (m4) / XML (m5f)** — the correlated flatten
-  needs a per-element nested collection (an `array<…>` field). SQL has no
+  XML / JSON only for now (the JSON lane runs the same UNFUSED `cross_join_to_array`
+  library call as the array/XML lanes — there is no `_fold` cross splice yet).
+- **`select_many` SQL (m1) / Decs (m4) / XML (m5f) / JSON (m6f)** — the correlated
+  flatten needs a per-element nested collection (an `array<…>` field). SQL has no
   nested-collection flatten (correlated select_many over SQL is rejected); a decs
-  component has no `array<…>` field; and the XML linq source `from_xml_node`
-  materializes rows from flat attributes only (`build_xml_row`), so it cannot
-  populate a nested field. Array-only — a source-shape gap, by design for these
-  backends.
-- **`decs_count_bare_pred` SQL / Array / XML (m5f)** — covers a Theme 4
+  component has no `array<…>` field; the XML linq source `from_xml_node`
+  materializes rows from flat attributes only (`build_xml_row`); and `from_json`
+  likewise reads the flat `Car` schema, so neither can populate a nested field.
+  Array-only — a source-shape gap, by design for these backends.
+- **`decs_count_bare_pred` SQL / Array / XML (m5f) / JSON (m6f)** — covers a Theme 4
   root-cause fix specific to the decs lane (bare `from_decs_template(...).count(P)`
   with no upstream where/select previously bailed because
   `forExpr.iteratorVariables` was unpopulated). Array-side bare `count(P)`
   was always reachable; SQL `count(P)` is covered by `count_aggregate.das`
-  with a where shape. Both XML lanes are absent because the family is
-  decs-only (it exists to exercise a decs-walk root cause — no array/XML/SQL
+  with a where shape. The XML / JSON lanes are absent because the family is
+  decs-only (it exists to exercise a decs-walk root cause — no array/XML/JSON/SQL
   analog is meaningful). By design.
 - **`indexed_lookup` m3f vs m4** — array's lane measures the unspliced
   linear scan (~204k ns/op), while decs uses `query(eid)` for O(1) lookup.
@@ -297,11 +354,12 @@ and which gaps could land in a single PR — see
 - **`zip_reverse_to_array` SQL / Decs** — `reverse()` has no SQL order key
   (relational rows are unordered without an `ORDER BY`), and zip is not
   naturally expressible over a single archetype walk. By design, no follow-up.
-- **`zip_*` XML lane (m5f)** — each zip
-  bench zips the XML `Car` price-stream against a synthetic int array via the
-  mixed `zip(iterator, array)` overload; the zip splice partially fuses over XML,
-  still paying the unpruned `Car` materialization. The remaining `—` zip cells are
-  **SQL (m1)** and **Decs (m4)**: `zip` is not a relational op and not expressible
+- **`zip_*` XML lane (m5f) / JSON lane (m6f)** — each zip
+  bench zips the `Car` price-stream against a synthetic int array via the
+  mixed `zip(iterator, array)` overload; the zip splice partially fuses over both XML
+  and JSON, still paying the unpruned `Car` materialization (so both lanes are lit, JSON
+  trading XML's string clones for object-key lookups as elsewhere). The remaining `—` zip
+  cells are **SQL (m1)** and **Decs (m4)**: `zip` is not a relational op and not expressible
   over a single archetype walk (see the two bullets above).
 
 ## Accepted architectural floors (m4 vs m3f)
@@ -347,9 +405,12 @@ srcElem-typed scratch buffer during the backward loop, then a post-loop
 typed output buffer (K projection push_clones). Two-buffer/two-pass
 mirrors the decs sibling and R1-R4 catch-all discipline (all source
 reads complete before any projection runs — impure `_select` semantics
-match across the three paths). Both m3f and m4 are now sub-resolution
-per-op (the 2K push_clones for K=10 amortize over chunk_size=100K and
-round to 0.0 ns/op in INTERP and JIT).
+match across the three paths). m3f went sub-resolution then (the 2K
+push_clones for K=10 amortize over chunk_size=100K and round to 0.0).
+m4 followed only once the boundary archetype was **random-indexed**
+rather than `continue`-walked (`reverse_take[_select]` m4 9.3 → 0.2
+INTERP, 1.1 → 0.0 JIT — see the header note); the projection amortizes
+to 0.0 on both.
 
 ## How to re-run
 

@@ -79,6 +79,16 @@ class SourceAdapter {
     def emit_reverse_skip_into_tail(var takeArg : Expression?; isIter : bool; var termLam : Expression?; termElemType : TypeDeclPtr; at : LineInfo) : Expression? {
         return null
     }
+    // nolint:STYLE014 — No-predicate `last` / `reverse |> first`: a backward-walking source returns the
+    // last element in ONE step. Only for the no-where case — a predicated last scans backward to unknown
+    // depth, and reverse DOM traversal is ~2x cache-hostile per node (profiled), so predicated last keeps
+    // the forward path. valueExpr = peeled pre-reverse projection (refs bindName) / null = whole element;
+    // termSelLam = raw post-reverse _select / null; defaultExpr non-null = *_or_default / null = panic.
+    def emit_reverse_last_backward(bindName : string; var valueExpr : Expression?; var termSelLam : Expression?;
+                                   var defaultExpr : Expression?; rowType : TypeDeclPtr;
+                                   outElemType : TypeDeclPtr; at : LineInfo) : Expression? {
+        return null
+    }
     def emit_distinct_take_loop(bindName : string; takenName : string; takeLimName : string; var perElement : Expression?; at : LineInfo) : Expression? {
         return null
     }
@@ -151,6 +161,110 @@ class ProjectedSourceAdapter : SourceAdapter {
     def override wrap_invoke(var stmts : array<Expression?>; retType : TypeDeclPtr; wrapIter : bool; at : LineInfo) : Expression? {
         return inner->wrap_invoke(stmts, retType, wrapIter, at)
     }
+}
+
+// ===== Field-pruning row-usage scanner (shared by the XML / JSON source adapters) =====
+// Scan a chain body for which Row fields it reads, so a deferred source's per-element materialization
+// reads only those fields. Pure AST (bind name → field reads); each adapter keeps its own per-field read
+// / full-row build. A whole-`it` ref (to_array push_clone, identity select, pass-to-fn) sets
+// allFieldsUsed → the caller falls back to full materialization.
+
+class RowUsageScanner : AstVisitor {
+    bindName      : string
+    usedFields    : table<string>
+    allFieldsUsed : bool = false
+    inTargetField : bool = false
+    def RowUsageScanner(n : string) {
+        bindName = n
+    }
+    def override preVisitExprField(expr : ExprField?) : void {
+        var v = expr.value
+        if (v is ExprRef2Value) {
+            v = (v as ExprRef2Value).subexpr
+        }
+        if (v is ExprVar && (v as ExprVar).name == bindName) {
+            usedFields |> insert(string(expr.name))
+            inTargetField = true
+        }
+    }
+    def override visitExprField(var expr : ExprField?) : ExpressionPtr {
+        inTargetField = false
+        return expr
+    }
+    def override preVisitExprVar(expr : ExprVar?) : void {
+        if (expr.name == bindName && !inTargetField) {
+            allFieldsUsed = true
+        }
+    }
+}
+
+[macro_function]
+def collect_row_usage(var body : Expression?; bindName : string) : tuple<bool; array<string>> {
+    var allUsed = false
+    var used : array<string>
+    if (body == null) return (allUsed, used)
+    var sc = new RowUsageScanner(bindName)
+    make_visitor(*sc) $(astVisitorAdapter) {
+        visit_expression(body, astVisitorAdapter)
+    }
+    allUsed = sc.allFieldsUsed
+    for (k in keys(sc.usedFields)) {
+        used |> push(k)
+    }
+    unsafe {
+        delete sc
+    }
+    return (allUsed, used)
+}
+
+class RowFieldFlattener : AstVisitor {
+    bindName     : string
+    fieldToLocal : table<string; string>
+    def RowFieldFlattener(b : string; var f : table<string; string>) {
+        bindName = b
+        fieldToLocal <- f
+    }
+    def override visitExprField(var expr : ExprField?) : ExpressionPtr {
+        var v = expr.value
+        if (v is ExprRef2Value) {
+            v = (v as ExprRef2Value).subexpr
+        }
+        if (v is ExprVar && (v as ExprVar).name == bindName) {
+            let fname = string(expr.name)
+            if (key_exists(fieldToLocal, fname)) return new ExprVar(at = expr.at, name := fieldToLocal[fname])
+        }
+        return expr
+    }
+}
+
+// Rewrites every `bind.<field>` read in `body` to its `fieldToLocal` local, returning the (possibly
+// replaced) root — needed when `body` is itself a bare field access (`where(_.flag)`).
+[macro_function]
+def flatten_row_to_locals(var body : Expression?; bindName : string; var fieldToLocal : table<string; string>) : Expression? {
+    if (body == null) return body
+    var fl = new RowFieldFlattener(bindName, fieldToLocal)
+    make_visitor(*fl) $(astVisitorAdapter) {
+        visit_expression(body, astVisitorAdapter)
+    }
+    unsafe {
+        delete fl
+    }
+    return body
+}
+
+// Hoist the materializer prelude (the hoisted default-row decl, prune path only) as a FLAT sibling before
+// the walk — a `$b(prelude)` splice would nest it in its own scope, hiding it from the per-element reads.
+[macro_function]
+def hoist_prelude(var prelude : array<Expression?>; var loop : Expression?; at : LineInfo) : Expression? {
+    if (empty(prelude)) return loop
+    var outBlk = new ExprBlock(at = at)
+    for (s in prelude) {
+        outBlk.list |> push(s)
+    }
+    for (s in (loop as ExprBlock).list) {
+        outBlk.list |> push(s)
+    }
+    return outBlk
 }
 
 variant SlotMatcher {
@@ -1776,6 +1890,19 @@ def emit_early_exit_lane(
         var retType = mut_result_type(projection, elementType)
         let foundName = qn("found", at)
         let lastBindName = qn("lst", at)
+        // No-predicate `last` via the source's backward fast path: a bare `source.last()` (no where / range /
+        // projection) is the last element, reachable in one backward DOM step. Predicated/ranged last stays
+        // forward — reverse DOM traversal is ~2x cache-hostile per node and a deep match would regress (profiled).
+        if (adapter != null && whereCond == null && postTakeWhereCond == null && skipExpr == null
+                && takeExpr == null && skipWhileCond == null && takeWhileCond == null
+                && empty(intermediateBinds) && empty(preCondStmts) && projection == null) {
+            var lastDefault : Expression?
+            if (opName == "last_or_default") {
+                lastDefault = clone_expression(terminatorCall.arguments[1])
+            }
+            var back = adapter->emit_reverse_last_backward(itName, null, null, lastDefault, elementType, retType, at)
+            if (back != null) return back
+        }
         // Deferred materialization (XML): a full walk clones the whole row on EVERY match, but only the LAST
         // survives. Store the node HANDLE per match; build the full row once, at the tail.
         let deferLast = (adapter != null && adapter->defers_materialization()
@@ -2207,11 +2334,10 @@ def emit_loop_or_count_lane(var c : Captures; var ctx : EmitCtx; at : LineInfo) 
         var sc = ctx.src->count_shortcut(lastName, at)   // source owns its O(1) applicability; null → walk
         if (sc != null) return sc
     }
-    if (lane == LinqLane.ACCUMULATOR && !counting) {     // value reducers only; long_count rides the counter lane
+    if (lane == LinqLane.ACCUMULATOR && !counting)     // value reducers only; long_count rides the counter lane
         return emit_accumulator_lane(lastName, ctx.src, projection, whereCond, postTakeWhereCond,
             intermediateBinds, preCondStmts, elementType, accName, itName, names,
             skipExpr, takeExpr, skipWhileCond, takeWhileCond, at)
-    }
     if (lane == LinqLane.EARLY_EXIT) {
         let terminatorCall = c.single["term"]
         let isAnyNoPred = lastName == "any" && length(terminatorCall.arguments) == 1
@@ -2450,7 +2576,7 @@ def make_inline_less_call(orderKey : Expression?; orderName : string;
 
 [macro_function]
 def private renamed_key_clone(body : Expression?; argName, newName : string) : Expression? {
-    // Clone a key-element body and rename its single block param (the C# range var) to v1 / v2.
+    // Clone a key-element body and rename its single block param (the query's range var) to v1 / v2.
     return clone_and_rename_var(body, argName, newName)
 }
 
@@ -2855,9 +2981,8 @@ def private build_surrogate_type(keyType : TypeDeclPtr; handleType : TypeDeclPtr
 // comparator over surrogate keys (._0); flipped for descending. Reused across heap push/pop + order_inplace.
 [macro_function, unused_argument(at)]
 def private build_surrogate_cmp(descending : bool; at : LineInfo) : Expression? {
-    if (descending) {
+    if (descending)
         return qmacro($(v1, v2) { return _::less(v2._0, v1._0) })
-    }
     return qmacro($(v1, v2) { return _::less(v1._0, v2._0) })
 }
 
@@ -3403,6 +3528,20 @@ def emit_reverse_walk_overwrite_scalar(var c : Captures; var ctx : EmitCtx; at :
     }
     // outElemType drives the invoke retType; terminal _select projects the survivor at return so the lane returns post-select shape.
     var outElemType = (terminalSelectLam != null) ? terminalSelectElemType : lastType
+    // No-predicate `reverse |> first` over a backward-walking source (XML): the first of the reversed
+    // sequence is the last element — one backward DOM step. Predicated reverse|first keeps the forward
+    // walk (reverse DOM traversal is ~2x cache-hostile per node; a deep match would regress — profiled).
+    if (whereCond == null) {
+        var rowT = ctx.src->element_type()
+        if (rowT != null) {
+            var firstDefault : Expression?
+            if (terminatorName == "first_or_default") {
+                firstDefault = clone_expression(terminatorCall.arguments[1])
+            }
+            var back = ctx.src->emit_reverse_last_backward(bindName, projection, terminalSelectLam, firstDefault, rowT, outElemType, at)
+            if (back != null) return back
+        }
+    }
     var valueExpr : Expression?
     if (projection != null) {
         valueExpr = clone_expression(projection)
@@ -4494,9 +4633,8 @@ def emit_reducer_branches(spec : ReducerSpec; at : LineInfo; entryName, itName :
                           var adapter : SourceAdapter? = null) : tuple<Expression?; Expression?> {
     // (missInit, hitUpdate); hitUpdate null for first* (subsequent same-key elements ignored).
     // Whole-element `first` over a deferring source materializes from the handle in the miss-branch.
-    if (spec.name == "first" && adapter != null && adapter->handle_type() != null) {
+    if (spec.name == "first" && adapter != null && adapter->handle_type() != null)
         return mk_reducer_first_deferred(spec, at, entryName, itName, adapter)
-    }
     let emitter = reducer_emitters?[spec.name] ?? default<ReducerEmitterFn>
     return (null, null) if (emitter == null)
     return invoke(emitter, spec, at, entryName, itName)

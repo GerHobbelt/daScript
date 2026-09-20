@@ -13,105 +13,14 @@ module linq_fold_xml shared public
 //! ``static_if (typeinfo builtin_module_exists(pugixml))``. See daslib/linq_fold.md.
 
 require pugixml public
-require pugixml/PUGIXML_boost
+require pugixml/PUGIXML_boost   // nolint:STYLE030 — build_xml_row / read_xml_field / peek_xml_field are emitted via qmacro, invisible to the require-usage scan
 require daslib/ast_boost
 require daslib/ast_match
 require daslib/templates_boost
-require strings
 require daslib/linq_fold_common public
 
-// ===== Field-pruning (pass 2b) =====
-// Walk the chain body to learn which Row fields it reads, so the per-element materialization can read
-// only those attributes — skipping `clone_string` for unread string fields (zero allocs when no kept
-// field is a string). Mirrors linq_fold_decs's DecsTupUsageScanner / DecsTupFieldFlattener, specialized
-// to a single struct bind (no iter-var reverse-map; no whole-tuple rewriter — a whole-`it` escape just
-// routes to full build_xml_row).
-
-class private XmlRowUsageScanner : AstVisitor {
-    bindName      : string
-    usedFields    : table<string>
-    allFieldsUsed : bool = false
-    inTargetField : bool = false
-    def XmlRowUsageScanner(n : string) {
-        bindName = n
-    }
-    def override preVisitExprField(expr : ExprField?) : void {
-        var v = expr.value
-        if (v is ExprRef2Value) {
-            v = (v as ExprRef2Value).subexpr
-        }
-        if (v is ExprVar && (v as ExprVar).name == bindName) {
-            usedFields |> insert(string(expr.name))
-            inTargetField = true
-        }
-    }
-    def override visitExprField(var expr : ExprField?) : ExpressionPtr {
-        inTargetField = false
-        return expr
-    }
-    def override preVisitExprVar(expr : ExprVar?) : void {
-        // A whole-var `it` ref (not the inner value of a matched field access) means the whole row
-        // escapes (to_array push_clone, identity select, pass-to-user-fn) — fall back to full materialization.
-        if (expr.name == bindName && !inTargetField) {
-            allFieldsUsed = true
-        }
-    }
-}
-
-[macro_function]
-def private collect_xml_row_usage(var body : Expression?; bindName : string) : tuple<bool; array<string>> {
-    var allUsed = false
-    var used : array<string>
-    if (body == null) return (allUsed, used)
-    var sc = new XmlRowUsageScanner(bindName)
-    make_visitor(*sc) $(astVisitorAdapter) {
-        visit_expression(body, astVisitorAdapter)
-    }
-    allUsed = sc.allFieldsUsed
-    for (k in keys(sc.usedFields)) {
-        used |> push(k)
-    }
-    unsafe {
-        delete sc
-    }
-    return (allUsed, used)
-}
-
-class private XmlRowFieldFlattener : AstVisitor {
-    bindName     : string
-    fieldToLocal : table<string; string>
-    def XmlRowFieldFlattener(b : string; var f : table<string; string>) {
-        bindName = b
-        fieldToLocal <- f
-    }
-    def override visitExprField(var expr : ExprField?) : ExpressionPtr {
-        var v = expr.value
-        if (v is ExprRef2Value) {
-            v = (v as ExprRef2Value).subexpr
-        }
-        if (v is ExprVar && (v as ExprVar).name == bindName) {
-            let fname = string(expr.name)
-            if (key_exists(fieldToLocal, fname)) return new ExprVar(at = expr.at, name := fieldToLocal[fname])
-        }
-        return expr
-    }
-}
-
-// Rewrites every `bind.<field>` read in `body` to its `fieldToLocal` local, returning the (possibly
-// replaced) root — needed when `body` is itself a bare field access (`where(_.flag)`): visit_expression
-// updates its `Expression?&` argument in place, but our by-value copy wouldn't propagate the new root back.
-[macro_function]
-def private flatten_xml_row_to_locals(var body : Expression?; bindName : string; var fieldToLocal : table<string; string>) : Expression? {
-    if (body == null) return body
-    var fl = new XmlRowFieldFlattener(bindName, fieldToLocal)
-    make_visitor(*fl) $(astVisitorAdapter) {
-        visit_expression(body, astVisitorAdapter)
-    }
-    unsafe {
-        delete fl
-    }
-    return body
-}
+// Field-pruning row-usage scanning (RowUsageScanner / collect_row_usage / RowFieldFlattener /
+// flatten_row_to_locals / hoist_prelude) is shared with the JSON adapter — see daslib/linq_fold_common.das.
 
 // Materialize-under-guard: when the whole row escapes only inside a bare `if (fieldCond) { ... }`, read
 // just the predicate's fields cheaply and build the full row (its `name` clone) only for matching elements.
@@ -123,7 +32,7 @@ def private try_xml_under_guard_materialize(var body : Expression?; bindName : s
     if (!(body is ExprIfThenElse)) return false
     var ite = body as ExprIfThenElse
     if (ite.if_false != null || ite.cond == null || ite.if_true == null) return false
-    var (condAllUsed, condFields) = collect_xml_row_usage(ite.cond, bindName)
+    var (condAllUsed, condFields) = collect_row_usage(ite.cond, bindName)
     if (condAllUsed || empty(condFields)) return false   // whole-`it` in the guard, or no field to prune
     sort(condFields)
     var fieldToLocal <- {for (f in condFields); f => qn("xf_{f}", at)}
@@ -138,7 +47,7 @@ def private try_xml_under_guard_materialize(var body : Expression?; bindName : s
             let $i(local) = peek_xml_field($i(chName), $v(f), $i(defName).$f(f))
         }
     }
-    ite.cond = flatten_xml_row_to_locals(ite.cond, bindName, fieldToLocal)
+    ite.cond = flatten_row_to_locals(ite.cond, bindName, fieldToLocal)
     // Prepend the full materialize to the guarded branch so only matching elements pay build_xml_row.
     var guarded : array<Expression?>   // nolint:STYLE012 — array-literal-of-qmacro_expr is parse-fragile
     guarded |> push <| qmacro_expr() {
@@ -160,7 +69,7 @@ def private try_xml_under_guard_materialize(var body : Expression?; bindName : s
 def private build_xml_materializer(var body : Expression?; bindName : string; declT : TypeDeclPtr;
                                    defName, chName : string; at : LineInfo;
                                    var prelude : array<Expression?>; var inner : array<Expression?>) {
-    var (allUsed, usedFields) = collect_xml_row_usage(body, bindName)
+    var (allUsed, usedFields) = collect_row_usage(body, bindName)
     if (allUsed) {
         if (try_xml_under_guard_materialize(body, bindName, declT, defName, chName, at, prelude, inner)) {
             return
@@ -190,16 +99,18 @@ def private build_xml_materializer(var body : Expression?; bindName : string; de
             let $i(local) = read_xml_field($i(chName), $v(f), $i(defName).$f(f))
         }
     }
-    body = flatten_xml_row_to_locals(body, bindName, fieldToLocal)
+    body = flatten_row_to_locals(body, bindName, fieldToLocal)
     inner |> push(body)
 }
 
-// Build the DOM child-element walk shared by wrap_source_loop and emit_distinct_take_loop. `xch` advances
-// before the body so a `continue` (skip/skip_while) lands on the next sibling; the body reads the captured
-// `xcur`. Non-null breakGuard emits `break if (guard)` first (distinct+take early-exit); nameArg null = 2-arg overload, non-null = 3-arg named.
+// nolint:STYLE014 — Build the DOM child-element walk shared by wrap_source_loop and emit_distinct_take_loop.
+// `xch` advances before the body so a `continue` (skip/skip_while) lands on the next sibling; the body reads
+// the captured `xcur`. Non-null breakGuard emits `break if (guard)` first (distinct+take early-exit); nameArg
+// null = 2-arg overload, non-null = 3-arg named. `backward` walks last_child / previous_sibling instead of
+// first_child / next_sibling — unnamed-only (no last-named-child primitive), so callers pass nameArg == null.
 [macro_function]
 def private build_xml_dom_walk(sn : string; var nameArg : Expression?; curName, chName : string;
-                               var inner : array<Expression?>; var breakGuard : Expression?; at : LineInfo) : Expression? {
+                               var inner : array<Expression?>; var breakGuard : Expression?; backward : bool; at : LineInfo) : Expression? {
     var elemBody : array<Expression?>
     if (breakGuard != null) {
         elemBody |> push <| qmacro_expr() {
@@ -208,6 +119,18 @@ def private build_xml_dom_walk(sn : string; var nameArg : Expression?; curName, 
     }
     elemBody |> push_from(inner)
     if (nameArg == null) {
+        if (backward) {
+            return qmacro_block() {
+                var $i(chName) = $i(sn).last_child
+                while ($i(chName).ok) {
+                    let $i(curName) = $i(chName)
+                    $i(chName) = $i(curName).previous_sibling
+                    if ($i(curName)._type == xml_node_type.node_element) {
+                        $b(elemBody)
+                    }
+                }
+            }
+        }
         return qmacro_block() {
             var $i(chName) = $i(sn).first_child
             while ($i(chName).ok) {
@@ -229,21 +152,6 @@ def private build_xml_dom_walk(sn : string; var nameArg : Expression?; curName, 
             $b(elemBody)
         }
     }
-}
-
-// Hoist the materializer prelude (`let xdef`, flatten path only) as a FLAT sibling before the walk — a
-// `$b(prelude)` splice would nest it in its own scope, hiding it from the per-element reads.
-[macro_function]
-def private hoist_prelude(var prelude : array<Expression?>; var loop : Expression?; at : LineInfo) : Expression? {
-    if (empty(prelude)) return loop
-    var outBlk = new ExprBlock(at = at)
-    for (s in prelude) {
-        outBlk.list |> push(s)
-    }
-    for (s in (loop as ExprBlock).list) {
-        outBlk.list |> push(s)
-    }
-    return outBlk
 }
 
 // 2-source invoke binding the XML node (param 1, named `srcName` so the DOM walk in bodyStmts reads it)
@@ -290,7 +198,7 @@ def private build_pruned_dom_walk(srcName : string; var nameArg : Expression?; e
     var prelude : array<Expression?>
     var inner : array<Expression?>
     build_xml_materializer(body, bindName, declT, defName, curName, at, prelude, inner)
-    var loop = build_xml_dom_walk(srcName, nameArg, curName, qn("xch", at), inner, breakGuard, at)
+    var loop = build_xml_dom_walk(srcName, nameArg, curName, qn("xch", at), inner, breakGuard, false, at)
     return hoist_prelude(prelude, loop, at)
 }
 
@@ -436,6 +344,102 @@ class XmlAdapter : SourceAdapter {
         // taken (perElement's distinct gate bumps `taken`).
         var breakGuard = qmacro($i(takenName) >= $i(takeLimName))
         return build_pruned_dom_walk(srcName, nameArg, elemType, bindName, perElement, breakGuard, at)
+    }
+    def override emit_reverse_skip_into_tail(var takeArg : Expression?; isIter : bool; var termLam : Expression?; termElemType : TypeDeclPtr; at : LineInfo) : Expression? {
+        // nolint:STYLE014 — `reverse() |> take(N) [|> _select(F)] |> to_array` over XML: a backward DOM
+        // walk (last_child / previous_sibling) visiting only the last N element children, building each row
+        // directly. Backward yields elements last-first — already reverse order — so no reverse_inplace and
+        // no full forward buffer. Profiled win: m5f reverse_take 87.8 -> 0.0 ns/op. Named 3-arg form has no
+        // last-named-child primitive, so defer to emit_reverse_buffer_inplace's buffer path (return null).
+        if (nameArg != null) return null
+        let sn = srcName
+        let chName     = qn("xch", at)
+        let curName    = qn("xcur", at)
+        let takeNName  = qn("rev_takeN", at)
+        let outBufName = qn("rev_out_buf", at)
+        let matItName  = qn("rev_mat_it", at)
+        var rowType = clone_type(elemType)
+        var pushItem = (termLam != null
+            ? peel_lambda_replace_var(termLam, qmacro($i(matItName)))
+            : qmacro($i(matItName)))
+        if (pushItem == null) return null
+        let outElemT = termLam != null ? clone_type(termElemType) : clone_type(rowType)
+        // per-element body: build the full row, project, push — buf is filled in reverse order already.
+        var inner : array<Expression?>   // nolint:STYLE012 — array-literal-of-qmacro_expr is parse-fragile
+        inner |> push <| qmacro_expr() {
+            var $i(matItName) = default<$t(rowType)>
+        }
+        inner |> push <| qmacro_expr() {
+            build_xml_row($i(curName), $i(matItName))
+        }
+        inner |> push <| qmacro_expr() {
+            $i(outBufName) |> push_clone($e(pushItem))
+        }
+        var breakGuard = qmacro(length($i(outBufName)) >= $i(takeNName))
+        var loop = build_xml_dom_walk(sn, nameArg, curName, chName, inner, breakGuard, true, at)
+        var bodyStmts : array<Expression?>   // nolint:STYLE012 — array-literal-of-qmacro_expr is parse-fragile
+        bodyStmts |> push <| qmacro_expr() {
+            let $i(takeNName) = $e(takeArg)
+        }
+        bodyStmts |> push <| qmacro_expr() {
+            var $i(outBufName) : array<$t(outElemT)>
+        }
+        bodyStmts |> push <| qmacro_expr() {
+            $i(outBufName) |> reserve($i(takeNName) > 0 ? $i(takeNName) : 0)
+        }
+        bodyStmts |> push(loop)
+        bodyStmts |> push <| qmacro_expr() {
+            return <- $i(outBufName)
+        }
+        return wrap_invoke(bodyStmts, null, isIter, at)
+    }
+    def override emit_reverse_last_backward(bindName : string; var valueExpr : Expression?; var termSelLam : Expression?;
+                                            var defaultExpr : Expression?; rowType : TypeDeclPtr;
+                                            outElemType : TypeDeclPtr; at : LineInfo) : Expression? {
+        // No-predicate `last()` / `reverse |> first`: the last element is the first one the backward walk
+        // reaches, so build that one row and return immediately — one DOM step, no full walk. Named 3-arg
+        // form has no last-named-child primitive → null (keeps the forward deferLast path).
+        if (nameArg != null) return null
+        let sn = srcName
+        let chName  = qn("xch", at)
+        let curName = qn("xcur", at)
+        var declT = strip_const_ref(clone_type(rowType))
+        var outT = clone_type(outElemType)
+        var inner : array<Expression?>   // nolint:STYLE012 — array-literal-of-qmacro_expr is parse-fragile
+        inner |> push <| qmacro_expr() {
+            var $i(bindName) = default<$t(declT)>
+        }
+        inner |> push <| qmacro_expr() {
+            build_xml_row($i(curName), $i(bindName))
+        }
+        if (valueExpr == null && termSelLam == null) {
+            inner |> push <| qmacro_expr() {
+                return <- $i(bindName)             // whole element — move it out (like the forward deferLast)
+            }
+        } else {
+            var baseExpr = (valueExpr != null ? valueExpr : qmacro($i(bindName)))
+            var retExpr = (termSelLam != null ? peel_lambda_replace_var(termSelLam, baseExpr) : baseExpr)
+            if (retExpr == null) return null
+            inner |> push <| qmacro_expr() {
+                return $e(retExpr)                 // projected value — copy out
+            }
+        }
+        var loop = build_xml_dom_walk(sn, nameArg, curName, chName, inner, null, true, at)
+        var bodyStmts : array<Expression?>
+        bodyStmts |> push(loop)
+        if (defaultExpr != null) {
+            bodyStmts |> push <| qmacro_expr() {
+                return $e(defaultExpr)
+            }
+        } else {
+            bodyStmts |> push <| qmacro_expr() {
+                panic("sequence contains no elements")
+            }
+            bodyStmts |> push <| qmacro_expr() {
+                return default<$t(outT)>           // unreachable; satisfies all-paths-return after panic
+            }
+        }
+        return wrap_invoke(bodyStmts, clone_type(outElemType), false, at)
     }
     def override wrap_invoke(var stmts : array<Expression?>; retType : TypeDeclPtr; wrapIter : bool; at : LineInfo) : Expression? {
         var nodeType = strip_const_ref(clone_type(nodeExpr._type))

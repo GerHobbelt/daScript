@@ -9,10 +9,10 @@ require uriparser
 require strings
 require jobque
 require daslib/ast_boost
-require daslib/rst_comment
 require daslib/strings_boost
 require daslib/strings_convert
 require daslib/rst
+require daslib/rst_comment
 require daslib/functional
 require daslib/json
 require daslib/json_boost
@@ -353,7 +353,7 @@ def document_module_ast(_root : string) {
         group_by_regex("Removal", mod, %regex~(remove.*)%%),
         group_by_regex("Properties", mod, %regex~(is|has|get|can)_.*%%),
         group_by_regex("Infer", mod, %regex~(infer_generic_type|update_alias_map)$%%),
-        group_by_regex("Module queries", mod, %regex~(module_find_annotation|module_find_type_annotation|module_find_structure|not_inferred)$%%),
+        group_by_regex("Module queries", mod, %regex~(module_find_annotation|module_find_type_annotation|module_find_structure|module_has_comment_reader|not_inferred)$%%),
         group_by_regex("Debug info helpers", mod, %regex~(debug_helper_.*)%%),
         group_by_regex("AOT support", mod, %regex~(aot_require|aot_type_ann_get_field_ptr|aot_need_type_info|aot_previsit_get_field_ptr|aot_previsit_get_field|aot_visit_get_field|write_aot_body|write_aot_suffix|write_aot_macro_suffix|write_aot_macro_prefix|macro_aot_infix|getInitSemanticHashWithDep|get_aot_hash_comment)$%%),
         group_by_regex("String builder writer", mod, %regex~(string_builder_str|string_builder_clear)$%%),
@@ -451,6 +451,7 @@ def document_module_json_boost(_root : string) {
     var mod = find_module("json_boost")
     var groups <- array<DocGroup>(
         group_by_regex("Value conversion", mod, %regex~(JV|from_JV)$%%),
+        group_by_regex("LINQ source builders", mod, %regex~(from_json|from_json_row|read_json_field)$%%),
         group_by_regex("Element access operators", mod, %regex~(\[\]|\?\[\]|\?\.|\.)$%%),
         group_by_regex("Null coalescing operators", mod, %regex~(\?\?)$%%),
         group_by_regex("Value extraction", mod, %regex~(\?\.)?`value$%%),
@@ -845,8 +846,8 @@ def document_module_PUGIXML_boost(_root : string) {
     var r_type_conv : Regex
     regex_compile(r_type_conv, ".*(`is`|`as`|\\[\\])")
     var groups <- array<DocGroup>(
-        group_by_regex("Block-based iteration", mod, %regex~.*(for_each_child|for_each_attribute|for_each)$%%),
-        group_by_regex("Iterator-based iteration", mod, %regex~.*(each|each_child|each_attribute)$%%),
+        group_by_regex("Block-based iteration", mod, %regex~.*(for_each_child_reverse|for_each_child|for_each_attribute|for_each)$%%),
+        group_by_regex("Iterator-based iteration", mod, %regex~.*(each_child_reverse|each|each_child|each_attribute)$%%),
         group_by_regex("LINQ source", mod, %regex~.*(from_xml_node|build_xml_row|read_xml_field|peek_xml_field)$%%),
         group_by_regex("RAII document handling", mod, %regex~.*(open_xml|parse_xml|with_doc)$%%),
         group_by_regex("Quick accessors", mod, %regex~.*(node_text|node_attr|node_attr_int|node_attr_float|node_attr_bool)$%%),

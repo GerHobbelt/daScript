@@ -147,7 +147,10 @@ Source-side entry points
      - Runtime component-name list form. Same decs splices as the template form.
    * - ``unsafe(from_xml_node(node[, name], type<Row>))``
      - ``extract_xml_source`` (``XmlAdapter``, ``modules/dasPUGIXML/daslib/linq_fold_xml.das``)
-     - Optional source — only when the ``pugixml`` module is linked (``require ?pugixml`` + ``static_if (typeinfo builtin_module_exists(pugixml))``). Emits an inlined DOM child-element walk replacing the generator, and **field-prunes** the per-element materialization (pass 2b): the chain body is scanned for the ``Row`` fields it reads, and only those attributes are read via ``read_xml_field`` into scalar locals — unread fields (notably ``string`` fields, whose ``clone_string`` is the alloc cost) are never touched, so a float-only chain runs alloc-free and JIT beats the equivalent SQLite query. A whole-row escape (``to_array`` / identity ``_select(_)`` / pass-to-fn) routes to the full ``build_xml_row`` instead. Only the ``loop_or_count_general`` row fuses (count / sum / min / max / average / any / first / take / to-array with ``_where`` / ``_select``); other chain shapes fall back to the unfused tier-2 pipeline. ``unsafe`` is required (the source is ``[unsafe_outside_of_for]``) and the node is passed by value (``var root`` — ``_fold``'s macro-arg inference skips the const&→value copy).
+     - Optional source — only when the ``pugixml`` module is linked (``require ?pugixml`` + ``static_if (typeinfo builtin_module_exists(pugixml))``). Emits an inlined DOM child-element walk replacing the generator, and **field-prunes** the per-element materialization (pass 2b): the chain body is scanned for the ``Row`` fields it reads, and only those attributes are read via ``read_xml_field`` into scalar locals — unread fields (notably ``string`` fields, whose ``clone_string`` is the alloc cost) are never touched, so a float-only chain runs alloc-free and JIT beats the equivalent SQLite query. A whole-row escape (``to_array`` / identity ``_select(_)`` / pass-to-fn) routes to the full ``build_xml_row`` instead. The ``XmlAdapter`` **rides every pattern row** (``try_splice_patterns`` runs with no ``onlyRow`` restriction); per-row ``requires`` predicates and the adapter's capability hooks (``can_join`` / ``can_group_by`` / ``defers_materialization`` / the ``non_array_source`` gate) decide what fuses, and a shape it can't fuse cascades to tier-2 — see :ref:`linq_fold_xml_patterns` for the full fuse/defer breakdown. ``unsafe`` is required (the source is ``[unsafe_outside_of_for]``) and the node is passed by value (``var root`` — ``_fold``'s macro-arg inference skips the const&→value copy).
+   * - ``unsafe(from_json(jv, type<Row>))``
+     - ``extract_json_source`` (``JsonAdapter``, ``daslib/linq_fold_json.das``)
+     - In-tree source — the adapter is compiled in unconditionally (no ``static_if`` gate, unlike XML's pugixml one), but a program only pulls JSON into scope by requiring ``json`` / ``json_boost`` itself. ``extract_json_source`` matches a ``from_json`` whose first argument is a ``json::JsonValue?``, so a JSON-less program returns null and the chain falls to the array tier. The adapter pulls in **no** json dependency — it emits ``from_json`` / ``read_json_field`` by name (resolved at the user's splice site, like ``linq_fold_decs`` emits ``for_each_archetype``; ``from_JV`` is emitted only for a non-struct element type). Emits an inlined ``for (e in jv.value as _array)`` walk replacing the generator, and **field-prunes** the per-element materialization (pass 2b): only the keys the chain reads are pulled via ``read_json_field`` by name — unread keys (notably ``string`` fields whose materialization clones) are never touched, so a scalar-only chain skips ~all of the full per-row build (3.6× over the full materialize — see ``benchmarks/micro/json_source_shapes.das``). A whole-row escape reads **every** top-level field by name (``emit_full_row_by_name``), so a custom whole-row ``from_JV(Row)`` override is **not** honored (Option B — this is a flat query source, not a deserializer; materialize the array with an explicit ``from_JV`` first for that). ``unsafe`` is required (the source is ``[unsafe_outside_of_for]``). Deferred materialization mirrors XML: order/distinct/take buffer a cheap ``(orderKey, JsonValue?)`` surrogate and materialize only the K survivors — by name (``emit_full_row_by_name``), so a struct survivor reads each field by key; only a non-struct ``Row`` falls back to ``outBind <- from_JV(handle, type<Row>)``. The ``JsonAdapter`` also fuses ``join`` / ``join |> group_by`` (``emit_join_hook`` + ``JsonJoinAdapter`` off ``build_group_by_adapter``'s upstream-join arm), reusing the array-join machinery (``build_join_standalone_pieces`` / ``build_join_adapter_pieces``): srcB is collected into a ``table<KEY; array<TUPB>>`` and the field-pruned array walk is the probe side, so the join key reads only its own field per element (e.g. ``read_json_field(jcur, "brand", …)``). Standalone ``group_join`` and a trailing ``where`` / ``select`` / ``count`` over group-join rows defer to tier-2, mirroring XML.
 
 Array-source patterns
 =====================
@@ -187,31 +190,31 @@ Array-source patterns
      - ``plan_loop_or_count`` (predicate-driven ranges)
      - ``take_while`` exits on first non-match; ``skip_while`` toggles state.
    * - ``._order_by(K).first()`` / ``.first_or_default()``
-     - ``plan_order_family`` (streaming-min)
+     - ``plan_order_family`` (streaming-min) → ``emit_streaming_min``
      - Single ``var best`` + ``var seen``, no buffer; one comparison per element.
    * - ``._order_by(K).take(N).to_array()``
-     - ``plan_order_family`` (bounded-heap)
+     - ``plan_order_family`` (bounded-heap) → ``emit_bounded_heap``
      - ``spliced_push_heap`` fill + replace, ``spliced_pop_heap`` on replace, ``order_inplace`` at end. Buffer of size N.
    * - ``._distinct_by(K1)._order_by(K2).take(N).to_array()`` / ``._order_by(K2).distinct().take(N).to_array()`` (plain ``distinct()`` mirror order accepted)
-     - ``plan_order_family`` (bounded-heap + set-gate)
+     - ``plan_order_family`` (bounded-heap + set-gate) → ``emit_bounded_heap``
      - Theme 3 Phase 3 (audit C1/C5). The bounded-heap path gains a leading or middle ``distinct[_by]`` recognizer; per-element push/pop is gated by a set-insert on the distinct key (or whole element for plain ``distinct``). Single source pass, no full distinct materialization. Position of ``distinct`` in the chain (before vs after ``_order_by``) has no bearing on emission for the safe shapes — the set just gates the same heap update. **Bails** (cascades) on ``_order_by(K2).distinct_by(K1)`` because cascade semantics ("min-K2 per K1" — first K1 occurrence in sort order) cannot be honored by a source-walk set-gate, which would keep an arbitrary K1 representative; on ``distinct[_by]`` without ``take`` (would be silently dropped); and on ``take(N).distinct[_by]()`` (would dedup pre-take instead of post-take). Inline-able order key required (cascades otherwise). Composes with ``where_`` (filter before distinct gate) and terminal ``_select`` (project ≤N heap survivors at return).
    * - ``._order_by(K).take(N)._select(F).to_array()`` / ``.first()._select(F)`` / ``.first_or_default()._select(F)``
-     - ``plan_order_family`` (terminal ``_select``)
+     - ``plan_order_family`` (terminal ``_select``) → ``emit_bounded_heap`` / ``emit_streaming_min``
      - Bounded-heap / streaming-min holds the raw element; projection ``F`` runs ≤K times at return. Closes the natural "take top-K then project" idiom.
    * - ``._order_by(K).to_array()`` / ``.order_by_descending(K).to_array()`` / ``.order(K).to_array()`` / ``.order_descending(K).to_array()``
-     - ``plan_order_family`` (full-sort fallback)
+     - ``plan_order_family`` (full-sort fallback) → ``emit_buffer_helper_dispatch``
      - Materializes + sorts. No bounded-heap shortcut.
    * - ``._order_by_keys((K1, K2, …), descMask).to_array()`` / ``._where(P)._order_by_keys((K1, K2), m).to_array()``
      - ``plan_order_family`` (multi-key composite stable sort)
      - Multi-key orderby with per-key direction (``descMask`` bit *i* → key *i* DESC; LSB = first key). With an inline-able tuple key + an upstream ``where`` (no ``take``/``first``/``distinct``), ``emit_fused_prefilter`` builds one composite if-chain comparator (``try_make_inline_cmp_keys``) and emits a **single** ``stable_sort(buf, cmp)`` on the fused buffer — C# ``OrderBy`` / ``ThenBy`` parity, stable on full ties. Bare ``order_by_keys`` (no ``where``) cascades to the eager ``order_by_keys`` op (also ``stable_sort``-backed). **Single-key ``_order_by`` is unchanged** — it keeps the unstable ``order_inplace`` / ``sort`` path (no regression). ``take`` / ``first`` over a multi-key chain cascade to the eager op (multi-key is gated out of the bounded-heap and streaming-min rows, whose min/max-by-first-key collapse is wrong for a composite key). Capped at 4 keys (eager ``less_masked`` ≤ 4-arity).
    * - ``._distinct()`` / ``._distinct_by(K)`` followed by ``.count()`` / ``.to_array()``
-     - ``plan_distinct``
+     - ``plan_distinct`` → ``emit_hashtable_dedup``
      - Single-hash set lane; ``count`` reads ``length(set)``.
    * - ``._distinct()`` / ``._distinct_by(K)`` followed by ``.count(P)`` / ``.long_count(P)``
-     - ``plan_distinct`` (predicate counter)
+     - ``plan_distinct`` (predicate counter) → ``emit_hashtable_dedup``
      - Dedup table is built unconditionally so ``distinct_by`` semantics keep FIRST occurrence per key; a separate ``var acc`` increments only when ``P`` matches that first occurrence. Mirrors tier-2 ``distinct.count(P)`` semantics (distinct-then-filter, not filter-then-distinct).
    * - ``._distinct[_by](K1)._order_by[_descending](K2).to_array()`` / ``._where(P)._distinct[_by](K1)._order_by(K2).to_array()``
-     - ``plan_order_family`` (fused-loop + set-gate)
+     - ``plan_order_family`` (fused-loop + set-gate) → ``emit_fused_prefilter``
      - Theme 8 (audit 3b). The where_+order fused-loop path generalizes: when upstream ``distinct[_by]`` is present, declare ``var order_dset : table<...>`` and wrap the per-element ``push_clone`` with a set-gated ``if (!key_exists(...))`` block. Single source pass + in-place sort, no ``distinct_by_to_array`` intermediate iterator setup. Composes with ``where_`` (filter before distinct gate) and terminal ``_select`` (project at return). **Bails** (cascades) on ``distinct[_by] + order_by + first[_or_default]`` (streaming-min path has no dset hook) and on chains where ``take(N)`` is present (use the bounded-heap path via Theme 3 Phase 3 instead).
    * - ``._group_by(K)._select(reduce).to_array()``
      - pattern ``group_by_array`` (sub-codegen ``plan_group_by_core`` → ``reducer_emitters`` lookup)
@@ -226,17 +229,20 @@ Array-source patterns
      - pattern ``group_by_array`` (sub-codegen ``plan_group_by_core``, trailing ``order_by`` as ORDER BY)
      - Theme 3 Phase 2 (audit C2). Inline-cmp ``sort(buf, ...)`` after the bucket-fill mutates the same output buffer in place — vs the tier-2 cascade's separate ``order_by_inplace`` over a fresh allocation. v1: ``_order_by(K2)`` / ``_order_by_descending(K2)`` with inline-able key only; non-inline keys (side-effects, multi-stmt body) cascade. Composes with HAVING / ``_having(P)``.
    * - ``.reverse().take(N)[._select(F)].to_array()`` (with no pre-reverse ``where`` / ``select``)
-     - ``plan_reverse`` R6 (backward-index walk)
+     - ``plan_reverse`` R6 (backward-index walk) → ``emit_reverse_backward_index_walk``
      - Single loop ``for k in 0..K`` indexes ``arr[len-1-k]`` and K push_clones into a srcElem-typed scratch buffer. When ``_select(F)`` is captured, ``build_terminal_select_tail`` then performs a post-loop projection pass into a separate projElem-typed output buffer (K projection push_clones). Two-buffer/two-pass mirrors the decs sibling ``emit_decs_reverse_skip_into_tail`` (PR #2915) and the R1-R4 catch-all: all source reads complete before any projection-side-effect runs, so impure ``_select`` behaves identically across the three paths. Skips the catch-all's full-source ``push_clone`` walk (N → K raws) + ``reverse_inplace`` + ``resize``. Fast path bails (cascades to R1-R4) when termsel's call-result element type is unresolved at macro stage.
    * - ``[._where(P)][._select(f)].reverse().take(N)._select(F).to_array()`` / ``.reverse()._select(F).first()``
-     - ``plan_reverse`` R1-R4 (terminal ``_select`` on catch-all) / Rb (walk-and-overwrite scalar)
+     - ``plan_reverse`` R1-R4 (terminal ``_select`` on catch-all) → ``emit_reverse_buffer_inplace`` / Rb (walk-and-overwrite scalar) → ``emit_reverse_walk_overwrite_scalar``
      - Catch-all path for chains with pre-reverse ``_where`` / ``_select`` (R6 doesn't accept those slots, cascades here). Projection runs ≤K times at return on the R1-R4 buffer or on the surviving ``last`` value. NOT accepted: ``reverse._select.take`` — user must reorder to ``reverse.take._select``.
    * - ``each(arr).reverse()._distinct[_by](K).to_array()`` (array source)
-     - ``plan_reverse`` R-2a (backward index walk + set-gate)
+     - ``plan_reverse`` R-2a (backward index walk + set-gate) → ``emit_reverse_backward_walk_dset_gate``
      - Theme 8 (audit 2a). Array source only (``array_source`` predicate). Walks source backward via index (``arr[len-1-k]``), maintains ``var rev_dset : table<...>`` and gates push by set-insert on the dedup key (or whole element for plain ``distinct``). LAST-per-key semantics preserved: backward walk picks first-seen-in-reversed-order = last-in-source occurrence, matching tier-2 ``reverse.distinct_by``. Saves cascade's ``reverse_to_array`` allocation AND second ``distinct_by_inplace`` pass. v1 implicit ``to_array`` only; pre-reverse ``_where`` / ``_select`` / ``take`` bail to cascade. Non-array (forward) sources take R-2b below.
    * - ``src.reverse()._distinct[_by](K).to_array()`` (XML / decs / iterator source)
-     - ``plan_reverse`` R-2b (forward keep-last table-overwrite)
+     - ``plan_reverse`` R-2b (forward keep-last table-overwrite) → ``emit_reverse_distinct_forward_keeplast``
      - The exact complement of R-2a (``non_array_source`` predicate): forward-only sources have no random index for the backward walk. One forward pass OVERWRITES ``var rdb_tab : table<key; (seq, val)>`` per element (so the slot ends at the last forward occurrence + its monotonic seq), then sorts survivors by **descending seq** and emits — output-identical to R-2a (descending forward-index of each last occurrence). Source-generic via ``emit_terminator_lane`` + ``wrap_source_loop``: an XML source **defers** (``val`` is the ``xml_node`` handle; ``build_xml_row`` runs only for the K survivors, field-pruned to the key), while decs / iterator store the full element and still win single-pass over the cascade's reverse-buffer + second walk. Closes the decs ``m4`` cell for this shape (D6).
+   * - ``[._where(P)][._select(F)].reverse().count()``
+     - ``plan_reverse`` Ra (counter) → ``emit_reverse_counter``
+     - Reverse is identity for a count, so one forward pass increments a counter — no buffer, no reverse. The projection still fires per match (side-effect parity). Works on iterator and array sources (for-loop body, no indexed access).
 
 Decs-source patterns
 ====================
@@ -303,7 +309,10 @@ identical — only the source iteration changes.
      - Per-archetype accumulator; pruner keeps only the components read by ``F``.
    * - ``from_decs_template(...).first()`` / ``.first_or_default()`` / ``.last()`` / ``.last_or_default()`` / ``.single()`` / ``.single_or_default()`` / ``.element_at(N)`` / ``.element_at_or_default(N)`` / ``.aggregate(...)``
      - ``plan_decs_unroll`` → ``emit_decs_walk_lane`` / ``emit_decs_element_at``
-     - Walk lane reads one component per loop iteration; element_at uses cumulative-size short-circuit.
+     - Walk lane reads one component per loop iteration; element_at uses cumulative-size short-circuit. Bare ``.last()`` / ``.last_or_default()`` (no ``_where`` / ``_select`` / range) over indexable sources take the random-index row below instead of this walk.
+   * - ``from_decs_template(...).last()`` / ``.last_or_default(D)`` — **bare** (no ``_where`` / ``_select`` / range)
+     - ``emit_decs_last_random_index``
+     - Reads the last non-empty archetype's ``[size-1]`` directly (``get_ro(arch, comp, def)[idx]``) — O(num_archetypes), no per-entity walk. ``for_each_archetype`` visits in order + skips empties, so the last overwrite is the global-last; behavior-identical to the walk lane. **Indexable sources only** — a ``[decs_template]`` field with a default-init compiles to ``get_default_ro`` (an iterator), so ``decs_can_random_index`` returns false and the chain cascades to the ``emit_decs_walk_lane`` row above.
    * - ``from_decs_template(...).any()`` / ``.all(P)`` / ``.contains(V)``
      - ``plan_decs_unroll`` → ``emit_decs_early_exit``
      - Boolean fast-path; walks until first match or end.
@@ -332,8 +341,8 @@ identical — only the source iteration changes.
      - ``plan_decs_distinct`` (predicate counter)
      - Decs mirror of the array-side predicate-distinct splice. Same dedup-unconditional / counter-gated-on-P shape across archetypes.
    * - ``from_decs_template(...).reverse().take(N)[._select(F)].to_array()``
-     - ``plan_decs_reverse`` (skip-into-tail; extended for terminal ``_select`` in PR #2915)
-     - Whole-archetype skip + partial-archetype skip-counter + early-exit. When trailing ``_select(F)`` is captured (no pre-reverse ``_where`` / ``_select``), the K reversed survivors are projected into a separate buffer typed by termsel's call-result element type — saves the catch-all's N push_clones + full reverse_inplace + project pass. Bails (cascades to R1-R4) when termsel's call-result element type is unresolved at macro stage.
+     - ``plan_decs_reverse`` (skip-into-tail; extended for terminal ``_select`` in PR #2915; boundary random-index added later)
+     - Whole-archetype skip + early-exit. For **indexable** sources the boundary archetype is **random-indexed** (``get_ro(arch, comp, def)[idx]`` over ``[skipsLeft .. size)`` via ``build_decs_index_collect``) instead of continue-walking its head — O(K) on a single archetype, not O(N). **Iterator** sources (a ``[decs_template]`` field with a default-init → ``get_default_ro``) fall back to the partial-archetype skip-counter walk. When trailing ``_select(F)`` is captured (no pre-reverse ``_where`` / ``_select``), the K reversed survivors are projected into a separate buffer typed by termsel's call-result element type — saves the catch-all's N push_clones + full reverse_inplace + project pass. Bails (cascades to R1-R4) when termsel's call-result element type is unresolved at macro stage.
    * - ``from_decs_template(...).reverse()._select(F).first()``
      - ``plan_decs_reverse`` (Rb walk-and-overwrite scalar with terminal ``_select``)
      - Decs mirror of ``plan_reverse``'s Rb walk-and-overwrite scalar. Projection applies to the surviving ``last`` value at return.
@@ -455,7 +464,7 @@ equi-key gate as the decs side; non-primitive keys cascade to
        ``lead_where`` slot precedes the ``join`` slot; a ``where`` after
        ``join`` is the separate trailing slot. Composes with the trailing
        ``_where`` / ``_select`` forms. Wrapping lives in the shared
-       ``build_join_standalone_pieces``, so decs / XML inherit it.
+       ``build_join_standalone_pieces``, so decs / XML / JSON inherit it.
    * - ``arrA |> _group_join(arrB, on, into)`` (+ optional leading ``_where``)
      - pattern ``join_general`` with the ``group_join`` literal (``isGroupJoin``)
      - C# GroupJoin (**outer**): one result row per srcA row — ``result(a,
@@ -465,7 +474,7 @@ equi-key gate as the decs side; non-primitive keys cascade to
        "group_join"]``; ``isGroupJoin`` threads through
        ``build_join_standalone_pieces``, which rebinds the result lambda's 2nd
        param to the whole bucket (``array<TUPB>``) so the per-group aggregate
-       runs inside the result. **Array sources only** — decs / XML group joins
+       runs inside the result. **Array sources only** — decs / XML / JSON group joins
        defer to tier-2 (their ``emit_join_hook`` returns ``null`` for
        ``group_join``); a trailing ``where`` / ``select`` / ``count`` over the
        group rows also defers.
@@ -479,6 +488,110 @@ equi-key gate as the decs side; non-primitive keys cascade to
        Same v1 constraints as the decs-side cross-arm: primitive
        equi-key, no segments between ``join`` and ``group_by_lazy``,
        HAVING defers to v2.
+
+.. _linq_fold_xml_patterns:
+
+XML-source patterns
+===================
+
+An ``unsafe(from_xml_node(node[, name], type<Row>))`` source folds through
+``XmlAdapter`` (``modules/dasPUGIXML/daslib/linq_fold_xml.das``), loaded only when
+the ``pugixml`` module is linked. Unlike a hard-coded source row, the adapter
+**rides every pattern row** the array / decs planners expose — ``try_splice_patterns``
+runs with no ``onlyRow`` restriction, and per-row ``requires`` predicates plus the
+adapter's capability hooks decide what fuses. Three mechanics make the emitted loop
+differ from the array and decs lanes.
+
+**Single flat DOM walk, forward-only.** The adapter emits one ``while`` over the
+node's child elements (``first_child`` / ``next_sibling``, or ``child(node, name)``
+for the 3-arg named overload), like the array lane and unlike decs's two-level
+archetype walk. But an XML node has **no random index**, so XML matches the
+``non_array_source`` rows (e.g. the R-2b forward keep-last reverse-distinct) and is
+**excluded** from the ``array_source``-only rows (Row 5 ``buffer_helper_dispatch``
+direct-helper, R-2a backward-index reverse-distinct). Bare ``order_by`` / ``order``
+therefore cascades to the ``fused_prefilter`` row (materialized buffer), not the
+direct daslib helper — the same fall-through decs takes.
+
+**Field-pruning (pass 2b).** Before emitting the per-element body the chain is
+scanned (``XmlRowUsageScanner``) for the ``Row`` fields it actually reads. Only
+those attributes are read — each via ``read_xml_field`` into a scalar local, with
+the body's ``it.<field>`` rewritten to that local and the ``Row`` struct dropped
+entirely. Unread fields are never touched, so a chain that reads only numeric
+fields runs **alloc-free** (the per-string ``clone_string`` is the materialization
+cost). Three outcomes:
+
+- **Pruned** — body reads only ``it.<field>`` scalars: one ``let xf_<f> =
+  read_xml_field(...)`` per referenced field, struct dropped.
+- **Whole-row escape** — body references the bind ``it`` as a whole value
+  (``to_array``, identity ``_select(_)``, pass-to-user-fn): falls back to the full
+  ``build_xml_row``.
+- **Guarded escape** — the whole row escapes only inside a bare ``if (cond) { … }``:
+  the predicate's fields are read cheaply via ``peek_xml_field`` (borrowed
+  ``string#``, no clone) and the full ``build_xml_row`` runs **only for matching
+  elements**.
+
+**Deferred materialization.** A buffered reducer (order / take, ``distinct_by``)
+holds ``(key, xml_node)`` *handle surrogates* rather than built rows, and runs
+``build_xml_row`` only for the K survivors at return — ``defers_materialization()``
+is true, ``current_handle_expr`` is the per-element ``xcur`` node, and
+``materialize_handle`` emits the deferred ``build_xml_row``. A 1000-element document
+feeding ``order_by(K).take(10)`` builds 10 rows, not 1000.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 25 40
+
+   * - Chain shape (XML source)
+     - Splice arm
+     - Notes
+   * - ``…<terminator>`` with ``_where`` / ``_select`` (count / long_count / sum / average / min / max / any / all / contains / first / last / single / element_at / take / take_while / skip_while / to_array)
+     - ``loop_or_count_general`` (``XmlAdapter`` swap)
+     - The base lane — the same emit archetypes as the array side, over the field-pruned DOM walk. ``take`` / ``where`` / ``select`` fuse into the body.
+   * - ``._order_by(K).first()`` / ``.first_or_default()``
+     - ``plan_order_family`` (streaming-min) + deferral
+     - One handle held in ``var best``; ``build_xml_row`` runs once at return.
+   * - ``._order_by(K).take(N).to_array()`` / ``…._select(F).to_array()``
+     - ``plan_order_family`` (bounded-heap) + deferral
+     - Heap of N ``(key, node)`` surrogates; ``build_xml_row`` (and any terminal ``_select``) runs ≤N times at return.
+   * - ``._order_by(K).to_array()`` / ``._where(P)._order_by(K).to_array()``
+     - ``plan_order_family`` (``fused_prefilter``) + deferral
+     - ``array_source`` Row 5 excludes XML, so bare order cascades to the materialized-buffer row — the buffer holds node handles, rows built for survivors only.
+   * - ``._distinct_by(K).to_array()`` / ``._distinct_by(K)._order_by(K2)…``
+     - ``plan_distinct`` / ``plan_order_family`` + deferral
+     - Dedup set over the key; the kept slot stores the node handle (``distinct_by`` defers; plain ``distinct`` over the whole row materializes per element).
+   * - ``.reverse()._distinct[_by](K).to_array()``
+     - ``plan_reverse`` R-2b (``non_array_source``) → ``emit_reverse_distinct_forward_keeplast``
+     - Forward keep-last table-overwrite (no backward index); the slot stores the ``xml_node`` handle, ``build_xml_row`` (field-pruned to the key) runs for the K survivors. The one row shared by decs / iterators / XML.
+   * - ``.reverse().take(N) [._select(F)].to_array()``
+     - ``plan_reverse`` skip-into-tail → ``XmlAdapter.emit_reverse_skip_into_tail``
+     - **Backward DOM walk** (``last_child`` / ``previous_sibling``, both O(1) in pugixml): collects only the last N element children — already in reverse order, so no ``reverse_inplace`` and no full forward buffer of all N handles. The forward-source analog of the array R6 backward-index walk. Profiled win: m5f ``reverse_take`` 88.9 → 0.0 ns/op. The named 3-arg ``from_xml_node(root, "tag", …)`` form has no last-named-child primitive, so it falls back to the buffer-all path (``emit_reverse_buffer_inplace`` deferred materialize).
+   * - bare ``.last()`` / ``.last_or_default(d)`` / ``.reverse().first[_or_default]()`` (no ``where`` / range)
+     - ``emit_early_exit_lane`` last branch / ``emit_reverse_walk_overwrite_scalar`` (Rb) → ``XmlAdapter.emit_reverse_last_backward``
+     - The last element is the first the backward walk reaches: one ``last_child`` step, build that row, return — no forward scan. Pre-/post-reverse ``_select`` projects the single survivor. **Predicated ``[where] |> last`` deliberately keeps the forward walk** — reverse DOM traversal is ~2× cache-hostile per node (profiled), so a match far from the end would regress. (Pre-existing, orthogonal: a row struct with a *default-bearing field* routes bare ``last()`` to tier-2 ``linq.das`` before reaching this hook.)
+   * - ``from_xml_node(…) |> _join(arrB, ka, kb, result)`` (+ optional leading / trailing ``_where``, trailing ``_select``; count / to_array / iterator)
+     - pattern ``join_general`` → ``XmlAdapter.emit_join_hook``
+     - Hashed equi-join: srcB (an **in-memory array**) collected into ``table<KEY; array<TUPB>>``, probed from the field-pruned DOM walk. Primitive equi-key only. Mirrors ``emit_array_join`` with srcA = the XML node.
+   * - ``from_xml_node(…) |> _join(arrB, …) |> _group_by(K) |> _select(reduce) |> to_array()`` / ``.count()``
+     - ``plan_group_by_core`` via ``XmlJoinAdapter``
+     - Cross-arm: the join's per-pair result feeds the bucket update directly — one pass, no intermediate join array. Same v1 constraints as the array / decs cross-arm (primitive key, no segments between ``join`` and ``group_by``, HAVING defers to v2).
+   * - ``from_xml_node(…) |> _group_by(K) |> _select(reduce) |> to_array()`` (+ HAVING / trailing ``order_by``)
+     - ``plan_group_by_core`` (``XmlAdapter`` via ``build_group_by_adapter``)
+     - Per-key bucket reducer over the DOM walk; shares the array path's reducer dispatch and the trailing HAVING / ORDER BY extensions.
+   * - ``source |> _select(f) |> <order/distinct/take>``
+     - leading-``_select`` absorption (``ProjectedSourceAdapter`` wrap)
+     - The leading projection is absorbed into the source walk and **field-pruning is preserved** — ``f``'s ``it.<field>`` reads still reach the materializer (see *Pre-dispatch normalizations*).
+
+**Defers to tier-2** (the ``XmlAdapter`` hook returns null, so the chain cascades):
+
+- **Group join** (``_group_join`` / ``join … into``) — ``emit_join_hook`` returns
+  null for the ``group_join`` literal.
+- **Non-primitive join keys** / **non-array srcB** — the same gate as the array /
+  decs join (tuple keys cascade to ``join_impl``).
+- **Correlated nested-collection flatten** (``from o … from l in o.lines``) —
+  ``from_xml_node`` reads scalar attributes only; there is no nested collection to
+  flatten.
+- **Mixed-source operators** (``union`` / ``except`` / ``intersect`` / ``concat``)
+  — fall back exactly as for array / decs sources.
 
 Zip patterns
 ============

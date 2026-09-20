@@ -39,6 +39,18 @@ Every `.das` benchmark file in this directory tree is listed below, grouped by s
 |---|---|
 | `test01.das` | `get_key(tab, v)` vs `keys(tab)+values(tab)` — single iterator with pointer arithmetic vs two parallel iterators (1K, 10K, 100K entries) |
 
+## core/small_table/
+
+Small-table regime micro-benchmarks (N from 1 to 64) — the load profile the large-table `core/hash/` suite does not cover. Used to locate the linear-vs-hashed crossover (`maxLinearCapacity`) and to measure the string-key and constant-key paths.
+
+| File | Description |
+|---|---|
+| `test01.das` | Integer-keyed small tables — build (insert+alloc), positive lookup (hit), negative lookup (miss), swept across N |
+| `test02.das` | String-keyed small tables — build/hit/miss sweep; hit queries with distinct-pointer keys (strcmp fires, realistic), keys pre-built outside the measured block |
+| `test03.das` | Constant string-literal keys (`const_*`) vs runtime-array keys (`var_*`) — baseline for item 4 (precomputed-hash specialization of constant keys) |
+| `test04.das` | Many small tables (decs/per-entity shape) — thousands of independent N-element tables, build (watch B/op for item 1 memory) and cold-sweep query (cache locality) |
+| `test05.das` | Crossover prototype — inlined hash-only linear scan (`lin_*`) vs real open-addressed `?[]` (`hash_*`) over N, short and long keys; predicts `maxLinearCapacity` before packed mode exists |
+
 ## core/array/
 
 | File | Description |
@@ -60,14 +72,15 @@ Every `.das` benchmark file in this directory tree is listed below, grouped by s
 
 ## sql/
 
-Multi-lane comparison over the same `Car` schema: `_sql` macro over `:memory:` SQLite vs in-memory `array<Car>` linq splice vs decs (`[decs_template]`) linq splice vs XML (`from_xml_node`). Each bench builds the same data several ways via `_common.das` fixtures and runs the same query expression through each lane. See `benchmarks/sql/results.md` for the current ns/op numbers across both INTERP and JIT.
+Multi-lane comparison over the same `Car` schema: `_sql` macro over `:memory:` SQLite vs in-memory `array<Car>` linq splice vs decs (`[decs_template]`) linq splice vs XML (`from_xml_node`) vs JSON (`from_json`). Each bench builds the same data several ways via `_common.das` fixtures and runs the same query expression through each lane. See `benchmarks/sql/results.md` for the current ns/op numbers across both INTERP and JIT.
 
 | Lane | Source | Form |
 |---|---|---|
 | `m1` (SQL) | `:memory:` SQLite | `_sql` macro — compile-time SQL emission, work pushed to the engine |
 | `m3f` (Array) | pre-populated `array<Car>` | `_fold` over `each(arr).chain()` — fuses the chain into a single pass |
 | `m4` (Decs) | decs entities via `[decs_template]` | `_fold` over `from_decs_template(type<DecsCar>).chain()` — fuses into a per-archetype walk |
-| `m5` (XML) | in-memory XML doc (`fixture_xml_string`) | plain loop over `from_xml_node(root, type<Car>)` — **un-fused** v1 baseline; fused `m5f` lands in pass 2. Only 5 files carry this lane so far. |
+| `m5f` (XML) | in-memory XML doc (`fixture_xml_string`) | `_fold` over `from_xml_node(root, type<Car>)` — `XmlAdapter` fuses + field-prunes the chain into one DOM walk |
+| `m6f` (JSON) | pre-built `JsonValue?` array (`fixture_json`) | `_fold` over `from_json(jv, type<Car>)` — `JsonAdapter` fuses + field-prunes into one array walk (mirror of m5f; aliases heap strings instead of cloning) |
 
 The `m3` lane (eager linq, no `_fold` splice) was dropped on 2026-05-23; the splice ladder closed the gap between m3f and m4 across the corpus, and m3 was no longer a useful comparison point.
 
@@ -135,4 +148,7 @@ Standalone micro-benchmarks — self-contained (no `_common`), kept out of `sql/
 | File | Description |
 |------|-------------|
 | `join_select_shapes.das` | `join \|> select` output shapes over XML: C tier-2 (materialize tuples) vs A fused-materialize vs B streaming generator — A wins in every config; streaming is slower (generator overhead), string clone is a flat orthogonal cost |
+| `json_source_shapes.das` | `from c : Car in jv where … select c.name` over a JSON array: A hand field-pruned vs B hand full-row `from_JV` vs C the shipped JsonAdapter via `_fold` — field-pruning wins 3.7× (A vs B: INTERP 177 vs 650 ns/op; JIT 49 vs 183). C (the macro) fuses to A's shape and slightly beats it (157/37). Validated the field-pruning design; now also a regression check that the adapter matches hand-optimal |
 | `single_last_shapes.das` | `where(pred) \|> single/last` over XML: C full-materialize-per-element vs A materialize-under-guard (read predicate field cheaply, build the full row only for matching elements) — A wins (single 6.1× INTERP / 100k→1 clone; last 1.66× / clones only matching rows) |
+| `apply_vs_apply_imm.das` | `apply` (inline ref-local `let/var field &`) vs `apply_imm` (assume-aliased) over a struct field walk — both inline (no per-field invoke), but assume carries no per-field local so it is ~25% faster INTERP (54 vs 41 ns/op), identical JIT (2.0). vs the old per-field-invoke `apply` (113 ns/op) both are ~2× faster. Justifies keeping `apply_imm` as the struct-only hot path |
+| `serialize_apply.das` | `JV(struct)` serialization — regression guard for dropping the function-escaping `return` from `to_JV(struct)` so its `apply` block inlines instead of falling to the per-field invoke fallback. Inline 1161/579 ns/op (INTERP/JIT) vs invoke-fallback 2083/1424 = **1.79× / 2.46× faster, −2 allocs/op**. `to_XML(struct)` got the same rewrite (build-gated, not benched here) |
