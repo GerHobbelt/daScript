@@ -869,12 +869,6 @@ namespace das
     struct WrapType<Handle<T>> { enum { value = true }; typedef uint64_t type; typedef uint64_t rettype; };
 
     template <typename T>
-    struct WrapArgType<Handle<T>> { typedef uint64_t type; };
-
-    template <typename T>
-    struct WrapRetType<Handle<T>> { typedef uint64_t type; };
-
-    template <typename T>
     struct typeName<Handle<T>> {
         static string name() {
             return string("Handle<") + typeName<T>::name() + ">";

@@ -1126,7 +1126,7 @@ namespace das {
     vector<pair<string,Type>> getCodeOfPolicyOptions();
 
     void Program::lint ( TextWriter & /*logs*/, ModuleGroup & libGroup ) {
-        if (!options.getBoolOption("lint", true)) {
+        if (!options.getBoolOption("lint", !policies.no_lint)) {
             return;
         }
         // note: build access flags is now called before patchAnnotations, and is no longer needed in lint
@@ -1177,8 +1177,13 @@ namespace das {
                       + "', expecting '" + das_to_string(optT) + "'", "", "",
                         LineInfo(), CompilationError::invalid_option);
             } else if ( optT==Type::none ){
-                error("invalid option '" + opt.name + "'",  "", "",
-                    LineInfo(), CompilationError::invalid_option);
+                if ( opt.name[0]!='_' ) {
+                    error("invalid option '" + opt.name + "'",  "", "",
+                        LineInfo(), CompilationError::invalid_option);
+                } else {
+                    // custom user option (name starts with '_'), we don't care what's in there
+                    continue;
+                }
             }
         }
         set<Module *> lints;

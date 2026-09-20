@@ -1495,6 +1495,7 @@ namespace das
     // End aot config
         bool        completion = false;                 // this code is being compiled for 'completion' mode
         bool        lint_check = false;                 // this code is being compiled for lint/style checking
+        bool        no_lint = false;                    // skip Program::lint() entirely
         bool        export_all = false;                 // when user compiles, export all (public?) functions
         bool        serialize_main_module = true;       // if false, then we recompile main module each time
         bool        keep_alive = false;                 // produce keep-alive noodes
@@ -1546,7 +1547,7 @@ namespace das
         /*option*/ bool no_aliasing = false;                       // if true, aliasing will be reported as error, otherwise will turn off optimization
         /*option*/ bool strict_smart_pointers = true;              // collection of tests for smart pointers, like van inscope for any local, etc
         /*option*/ bool no_init = false;                           // if true, then no [init] is allowed in any shape or form
-        /*option*/ bool strict_unsafe_delete = false;              // if true, delete of type which contains 'unsafe' delete is unsafe // TODO: enable when need be
+        /*option*/ bool strict_unsafe_delete = true;              // if true, delete of type which contains 'unsafe' delete is unsafe // TODO: enable when need be
         bool no_members_functions_in_struct = false;    // structures can't have member functions
         /*option*/ bool no_local_class_members = true;             // members of the class can't be classes
         /*option*/ bool report_invisible_functions = true;         // report invisible functions (report functions not visible from current module)
@@ -1899,5 +1900,27 @@ namespace das
 
         daScriptEnvironmentGuard(das::daScriptEnvironment *bound = nullptr, das::daScriptEnvironment *owned = nullptr);
         ~daScriptEnvironmentGuard();
+    };
+
+    typedef void (*daScriptCompilationCallback)(const string & moduleName, const string & fileName, const string & status);
+
+    DAS_API void setCompilationCallback(daScriptCompilationCallback callback);
+    DAS_API void callCompilationCallback(const string & moduleName, const string & fileName, const string & status);
+
+    struct CompilationCallbackGuard {
+        CompilationCallbackGuard(const string & _moduleName, const string & _fileName, const string & _prefix = "compilation")
+        : moduleName(_moduleName), fileName(_fileName), prefix(_prefix) {
+            callCompilationCallback(moduleName, fileName, prefix + " start");
+        }
+        CompilationCallbackGuard(const CompilationCallbackGuard &) = delete;
+        CompilationCallbackGuard & operator = (const CompilationCallbackGuard &) = delete;
+        CompilationCallbackGuard(CompilationCallbackGuard &&) = delete;
+        CompilationCallbackGuard & operator = (CompilationCallbackGuard &&) = delete;
+        ~CompilationCallbackGuard() {
+            callCompilationCallback(moduleName, fileName, prefix + " end");
+        }
+        string moduleName;
+        string fileName;
+        string prefix;
     };
 }
