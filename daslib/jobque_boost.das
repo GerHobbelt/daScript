@@ -525,8 +525,10 @@ def _parallel_for(range_begin, range_end : int; num_jobs : int; blk : block<(job
     //! Partitions ``[range_begin..range_end)`` into ``num_jobs`` chunks and invokes ``blk`` once per chunk
     //! on the calling thread with ``(chunk_begin, chunk_end, wg)``. The block is expected to dispatch work
     //! via ``new_job`` and call ``wg |> notify_and_release`` when each job finishes.
-    //! ``parallel_for`` blocks until all notifications are received (via internal ``with_wait_group``).
-    //! Requires ``with_job_que`` context.
+    //! After dispatch the CALLING thread participates: it pops queued jobs off the fifo and executes
+    //! them inline (same cloned-closure jobs the workers run — full capture semantics) until its own
+    //! wait group is satisfiable, so the dispatching core computes chunks instead of sleeping through
+    //! the fork. Blocks until all notifications are received. Requires ``with_job_que`` context.
     let total = range_end - range_begin
     if (total <= 0 || num_jobs <= 0) return
     let actual_jobs = min(num_jobs, total)
@@ -540,6 +542,11 @@ def _parallel_for(range_begin, range_end : int; num_jobs : int; blk : block<(job
             let job_end = offset + this_chunk
             offset = job_end
             invoke(blk, job_begin, job_end, wg)
+        }
+        // main participates: flush the batch, then keep executing queued jobs on this thread until
+        // the wait group is ready (or the fifo drains — the workers then finish their in-flight tail)
+        while (!wg.isReady) {
+            break if (!jobque_try_run_one())
         }
     }
 }
@@ -568,13 +575,67 @@ class private ParallelForJobMacro : AstFunctionAnnotation {
     }
 }
 
+[tag_function(tag_team_parallel_for), unused_argument(num_jobs)]
+def team_parallel_for(range_begin, range_end : int; num_jobs : int; var l : lambda<(job_begin : int; job_end : int) : void>) {
+    //! Team-mode ``parallel_for`` (see ``set_jobque_team_mode``): partitions ``[range_begin..range_end)``
+    //! into ``num_jobs`` chunks with the same split as ``parallel_for``, but instead of one fifo job per
+    //! chunk the lambda is cloned once per WORKER and the workers self-serve chunk indices off a single
+    //! atomic — no fifo, no wait group; the caller participates and spin-joins. Falls back to one inline
+    //! invoke over the whole range when team mode is off (or the range/pool is trivial).
+    invoke(l, range_begin, range_end)   // note, this is never called if job-que is there.
+}
+
+[tag_function_macro(tag="tag_team_parallel_for")]
+class private TeamParallelForMacro : AstFunctionAnnotation {
+    //! Rewrites ``team_parallel_for`` into ``team_parallel_for_invoke``, generating the same lambda
+    //! cloning infrastructure as ``new_job`` (the per-worker cloning itself happens on the C++ side).
+    def override transform(var call : ExprCallFunc?; var errors : das_string) : ExpressionPtr {
+        macro_verify(call.arguments[3] is ExprAscend, compiling_program(), call.at, "expecting lambda declaration, ExprAscend")
+        var asc = call.arguments[3] as ExprAscend
+        macro_verify(asc.subexpr is ExprMakeStruct, compiling_program(), call.at, "expecting lambda declaration, ExprMakeStruct")
+        var mks = asc.subexpr as ExprMakeStruct
+        macro_verify(!(mks._type == null || mks._type.baseType != Type.tStructure), compiling_program(), call.at, "expecting lambda declaration, not a structure")
+        // clone structure type. make fields non-constant, so that they can be cloned
+        var stype <- clone_structure(mks._type.structType)
+        stype.name := "{stype.name}_team_pfor_clone"
+        var stype_ptr = stype
+        var sttype = new TypeDecl(at = call.at, baseType = Type.tStructure, structType = stype_ptr)
+        for (fld in stype.fields) {
+            fld._type.flags.constant = false
+            fld.flags.capturedConstant = false
+        }
+        var pclone = make_clone_structure(stype_ptr)
+        let const_clone = pclone.arguments[1]._type.flags.constant
+        compiling_module() |> add_function(pclone)
+        compiling_module() |> add_structure(stype)
+        // make an @@<function<(var L;L):void> type or @@<function<(var L;var L):void> type - depending on how the capture went
+        var ftype = new TypeDecl(at = call.at, baseType = Type.tFunction)
+        ftype.firstType = new TypeDecl(at = call.at, baseType = Type.tVoid)
+        ftype.argTypes |> emplace_new <| clone_type(sttype)
+        ftype.argTypes |> emplace <| sttype
+        if (const_clone) {
+            ftype.argTypes[1].flags.constant = true
+        }
+        // make a team_parallel_for_invoke call
+        var ncall = new ExprCall(at = call.at, name := "team_parallel_for_invoke")
+        ncall.arguments |> emplace_new <| clone_expression(call.arguments[0])
+        ncall.arguments |> emplace_new <| clone_expression(call.arguments[1])
+        ncall.arguments |> emplace_new <| clone_expression(call.arguments[2])
+        ncall.arguments |> emplace_new <| clone_expression(call.arguments[3])
+        ncall.arguments |> emplace_new <| new ExprAddr(at = call.at, target := "clone", funcType <- ftype)
+        ncall.arguments |> emplace_new <| new ExprConstInt(at = call.at, value = mks._type.sizeOf)
+        return <- ncall
+    }
+}
+
 def _parallel_for_each(arr : array<auto(TT)>; num_jobs : int; blk : block<(job_begin : int; job_end : int; var wg : JobStatus?) : void>) {
     //! Runtime implementation for ``parallel_for_each``.
     //! Partitions array indices ``[0..length(arr))`` into ``num_jobs`` chunks and invokes ``blk``
     //! with ``(chunk_begin_idx, chunk_end_idx, wg)`` on the calling thread.
     //! The block should dispatch ``new_job`` calls that process ``arr[i]`` for ``i`` in ``[chunk_begin_idx..chunk_end_idx)``,
     //! then call ``wg |> notify_and_release``.
-    //! Blocks until all jobs finish. Requires ``with_job_que`` context.
+    //! Blocks until all jobs finish (the caller executes queued chunks too — see ``_parallel_for``).
+    //! Requires ``with_job_que`` context.
     _parallel_for(0, length(arr), num_jobs, blk)
 }
 

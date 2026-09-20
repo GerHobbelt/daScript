@@ -1,15 +1,23 @@
 options gen2
+options persistent_heap   // + explicit deletes below: each test frees its model/session before the next loads, so multi-GB weights never accumulate in the process
+options stack = 65536   // dastest harness + forward chain + by-value Session sits near the default 16KB; 4x headroom (test_sampling does the same)
 
 require dastest/testing_boost public
 require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration; load_checkpoint resolves "llama" from the registry
 require dasllama/dasllama_tokenizer
 require daslib/jobque_boost
 require daslib/fio
+require dasllama/dasllama_math  // setup_dasllama_jobque_ + the runtime knob setters (engine-level, not re-exported)
 
 // End-to-end oracle: needs llama2.c's stories15M.bin + tokenizer.bin (gitignored, 60MB).
 // Skips cleanly when absent (e.g. in CI), so it's a real regression locally and a no-op elsewhere.
-let MODEL_PATH = "/Users/borisbatkin/Work/llama2.c/stories15M.bin"
-let TOKENIZER_PATH = "/Users/borisbatkin/Work/llama2.c/tokenizer.bin"
+// override the machine-local llama2.c checkout with DASLLAMA_LLAMA2C_DIR (e.g. on the x64 handoff box)
+def private llama2c_dir() : string {
+    let env = get_env_variable("DASLLAMA_LLAMA2C_DIR")
+    return empty(env) ? "/Users/borisbatkin/Work/llama2.c" : env
+}
+let MODEL_PATH = path_join(llama2c_dir(), "stories15M.bin")
+let TOKENIZER_PATH = path_join(llama2c_dir(), "tokenizer.bin")
 // llama2.c greedy (-t 0.0): empty-prompt IDs, and encode("Once upon a time", bos).
 let ORACLE <- [9038l, 2501l, 263l, 931l, 29892l, 727l, 471l, 263l, 2217l, 7826l, 4257l, 365l]
 let PROMPT_ORACLE <- [1l, 9038l, 2501l, 263l, 931l]
@@ -37,9 +45,9 @@ def test_forward_end_to_end(t : T?) {
             t |> success(true, "skipped: stories15M.bin / tokenizer.bin not present")
             return
         }
-        let tr <- load_checkpoint(MODEL_PATH)
+        var tr <- load_checkpoint(MODEL_PATH)
         let c = tr.config
-        let tk <- load_tokenizer(TOKENIZER_PATH, c.vocab_size)
+        var tk <- load_tokenizer(TOKENIZER_PATH, c.vocab_size)
         // BPE encoder vs llama2.c tokenization
         let pt <- encode(tk, "Once upon a time", true, false)
         t |> success(same(pt, PROMPT_ORACLE), "encode prompt tokens")
@@ -51,7 +59,10 @@ def test_forward_end_to_end(t : T?) {
             let bos_only <- encode(tk, "", true, false)
             let ids <- generate(tr, s, bos_only, length(ORACLE))
             t |> success(same(ids, ORACLE), "empty-prompt greedy token-for-token")
+            delete s
         }
+        delete tk
+        delete tr
         set_act_vec(prev_act)
     }
 }
@@ -69,7 +80,7 @@ def test_forward_q8(t : T?) {
         }
         var tr <- load_checkpoint(MODEL_PATH)
         let c = tr.config
-        let tk <- load_tokenizer(TOKENIZER_PATH, c.vocab_size)
+        var tk <- load_tokenizer(TOKENIZER_PATH, c.vocab_size)
         quantize_weights(tr)  // all 2D weights -> Q8_0, tr.quant = q8
         // Q8 is effectively lossless at greedy decode on stories15M: still token-for-token.
         let prev_act = get_act_vec()
@@ -79,7 +90,10 @@ def test_forward_q8(t : T?) {
             let bos_only <- encode(tk, "", true, false)
             let ids <- generate(tr, s, bos_only, length(ORACLE))
             t |> success(same(ids, ORACLE), "Q8 empty-prompt greedy token-for-token")
+            delete s
         }
+        delete tk
+        delete tr
         set_act_vec(prev_act)
     }
 }
@@ -97,19 +111,22 @@ def test_forward_q8_pooled(t : T?) {
         }
         var tr <- load_checkpoint(MODEL_PATH)
         let c = tr.config
-        let tk <- load_tokenizer(TOKENIZER_PATH, c.vocab_size)
+        var tk <- load_tokenizer(TOKENIZER_PATH, c.vocab_size)
         quantize_weights(tr)
         // pool + skip-init the per-job fork contexts: same result, exercised across many tokens'
         // classifier parallel_for so a stale/misreset pooled fork would corrupt the stream.
         let prev_act = get_act_vec()
         set_act_vec(false)   // token-exact oracle => bit-exact scalar act (exp4 tolerance: test_silu)
         with_job_que() {
-            set_jobque_fork_pool(true, true)
+            setup_dasllama_jobque_()
             var s <- make_run_state(c)
             let bos_only <- encode(tk, "", true, false)
             let ids <- generate(tr, s, bos_only, length(ORACLE))
             t |> success(same(ids, ORACLE), "pooled-fork Q8 greedy token-for-token")
+            delete s
         }
+        delete tk
+        delete tr
         set_act_vec(prev_act)
     }
 }
@@ -127,7 +144,7 @@ def test_forward_q4(t : T?) {
         }
         var tr <- load_checkpoint(MODEL_PATH)
         let c = tr.config
-        let tk <- load_tokenizer(TOKENIZER_PATH, c.vocab_size)
+        var tk <- load_tokenizer(TOKENIZER_PATH, c.vocab_size)
         quantize_weights_q4(tr)  // all 2D weights -> Q4_0, tr.quant = q4
         // Q4 is lossier than Q8 — greedy diverges from fp32 around token ~19 — but the per-step
         // loss hasn't flipped an argmax yet over the 12-token ORACLE prefix, so it still matches.
@@ -138,7 +155,52 @@ def test_forward_q4(t : T?) {
             let bos_only <- encode(tk, "", true, false)
             let ids <- generate(tr, s, bos_only, length(ORACLE))
             t |> success(same(ids, ORACLE), "Q4 empty-prompt greedy matches oracle prefix")
+            delete s
         }
+        delete tk
+        delete tr
         set_act_vec(prev_act)
+    }
+}
+
+[test]
+def test_forward_threaded_decode_attention(t : T?) {
+    t |> run("threaded decode attention is bit-exact vs inline (needs stories15M.bin)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        if (!stat(MODEL_PATH).is_valid) {
+            t |> success(true, "skipped: stories15M.bin not present")
+            return
+        }
+        var tr <- load_checkpoint(MODEL_PATH)
+        let c = tr.config
+        var s_thr <- make_run_state(c)
+        var s_inl <- make_run_state(c)
+        let prev_thr = get_decode_attn_par_threshold()
+        with_job_que() {
+            // same token sequence through both sessions; heads write disjoint att/xb slices, so the
+            // threaded head loop must be BIT-exact vs inline — any diff is a race, not a tolerance
+            set_decode_attn_par_threshold(0l)   // always thread
+            for (p, tok in count(), PROMPT_ORACLE) {
+                forward(tr, s_thr, tok, int64(p))
+            }
+            set_decode_attn_par_threshold(1l << 60l)   // never thread
+            for (p, tok in count(), PROMPT_ORACLE) {
+                forward(tr, s_inl, tok, int64(p))
+            }
+        }
+        set_decode_attn_par_threshold(prev_thr)
+        var exact = true
+        for (i in range64(c.vocab_size)) {
+            if (s_thr.logits[i] != s_inl.logits[i]) {
+                exact = false
+            }
+        }
+        t |> success(exact, "logits bit-exact after 5 positions, threaded vs inline")
+        delete s_thr
+        delete s_inl
+        delete tr
     }
 }

@@ -10,7 +10,7 @@ This section provides hands-on tutorials organized by topic:
 * **C Integration Tutorials** — embed daslang in a C host using the ``daScriptC.h`` API
 * **C++ Integration Tutorials** — embed daslang in a C++ host using the native ``daScript.h`` API
 * **Macro Tutorials** — write compile-time code transformations using the daslang macro system
-* **Module Tutorials** — dasHV (HTTP), dasOPENAI (LLM / OpenAI-compatible API), dasPUGIXML (XML), dasStbImage, dasAudio, dasMinfft (FFT / DCT), dasPEG (parser generator)
+* **Module Tutorials** — dasHV (HTTP), dasLLAMA (local LLM inference), dasOPENAI (LLM / OpenAI-compatible API), dasPUGIXML (XML), dasStbImage, dasAudio, dasMinfft (FFT / DCT), OpenGL / WebGL2 (graphics), dasPEG (parser generator)
 
 .. _tutorials_language:
 
@@ -234,6 +234,34 @@ Run any tutorial from the project root::
    tutorials/dasHV_06_websockets.rst
    tutorials/dasHV_07_sse_and_streaming.rst
    tutorials/dasHV_08_https_wss.rst
+
+.. _tutorials_dasllama:
+
+dasLLAMA (CPU LLM Inference) Tutorials
+======================================
+
+These tutorials cover the ``dasllama`` module — CPU large-language-model
+inference in pure daslang: loading GGUF models, tokenization, streaming
+generation, chat with templates, sampling, sessions and memory, performance,
+and the architecture registry. Everything is written against the public
+``dasllama/dasllama`` facade.
+
+You'll need a GGUF model file on disk (models are not shipped with the repo) —
+a good tiny one is `SmolLM2-135M-Instruct Q8_0
+<https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF>`_ (~145 MB).
+Run from the project root, always with ``-jit``::
+
+   daslang.exe -jit tutorials/dasLLAMA/01_hello_generate.das -- path/to/model.gguf
+
+.. toctree::
+   :maxdepth: 1
+
+   tutorials/dasLLAMA_01_hello_generate.rst
+   tutorials/dasLLAMA_02_chat.rst
+   tutorials/dasLLAMA_03_sampling.rst
+   tutorials/dasLLAMA_04_sessions_and_memory.rst
+   tutorials/dasLLAMA_05_performance.rst
+   tutorials/dasLLAMA_06_add_an_arch.rst
 
 .. _tutorials_dasopenai:
 
@@ -462,6 +490,52 @@ For the strudel-to-strudel.cc feature comparison, see
    tutorials/daStrudel_17_hrtf_position.rst
    tutorials/daStrudel_18_sfx_lab.rst
    tutorials/daStrudel_19_one_shots.rst
+
+.. _tutorials_opengl:
+
+OpenGL / WebGL2 Tutorials
+=========================
+
+A ladder of runnable OpenGL tutorials that mirror the
+`dasVulkan <https://github.com/borisbat/dasVulkan>`_ series shader-for-shader, to
+the degree the WebGL2 portable floor allows. Every shader is written in
+**daslang** -- the same shared shader builtins (``shader_lingua_franca``) the
+Vulkan rail uses -- and lowered to GLSL (GLSL ES 3.00 on the web) at compile time
+by dasGlsl. The same daslang shader language, lowered to a third backend.
+
+Each tutorial is **one homogeneous program**: ``init`` / ``update`` /
+``shutdown`` plus a ``main`` driver. On the desktop ``main()`` runs the loop in a
+GLFW window; on the web the wasm run path drives the three lifecycle functions
+from the browser's animation frame (the daslang ``Context`` persists across
+frames), so the very same ``.das`` runs live in the playground. That live,
+click-to-run version in the browser is what the OpenGL rail offers over the
+Vulkan tutorials' recorded video.
+
+The series builds **graphics → fragment compute → 3D scene → instancing →
+environment → multi-pass → modern post**. WebGL2 has no compute / SSBO / indirect
+draw / mesh shaders, so the Vulkan rungs that depend on those (gpu-driven,
+mesh-shader) have no WebGL2 mirror -- and drawing that boundary explicitly is part
+of the harmonization story: one shader language, one ladder, three backends, with
+the portable floor made visible.
+
+Run any tutorial from the project root::
+
+   daslang.exe tutorials/opengl/01_triangle/01_triangle.das
+
+.. toctree::
+   :maxdepth: 1
+
+   tutorials/opengl/01_triangle.rst
+   tutorials/opengl/02_mandelbrot.rst
+   tutorials/opengl/03_sdf.rst
+   tutorials/opengl/04_cube.rst
+   tutorials/opengl/05_instancing.rst
+   tutorials/opengl/06_skybox.rst
+   tutorials/opengl/07_particles.rst
+   tutorials/opengl/08_shadow.rst
+   tutorials/opengl/09_msaa.rst
+   tutorials/opengl/10_deferred.rst
+   tutorials/opengl/11_hdr.rst
 
 .. _tutorials_jsonrpc:
 

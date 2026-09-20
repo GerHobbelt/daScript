@@ -12,6 +12,45 @@
 #include <emscripten/threading.h>   // emscripten_num_logical_cores
 #endif
 
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <emmintrin.h>  // _mm_pause
+#elif defined(_MSC_VER) && defined(_M_ARM64)
+#include <intrin.h>     // __yield
+#endif
+
+namespace das {
+    // A single CPU spin-wait hint — the poll-loop relax (one PAUSE/YIELD, the ggml
+    // ggml_thread_cpu_relax shape; the loop itself is a counted number of these).
+    static inline void jobque_spin_relax() {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+        _mm_pause();
+#elif defined(_MSC_VER) && defined(_M_ARM64)
+        __yield();
+#elif defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#elif defined(__aarch64__)
+        __asm__ __volatile__("yield");
+#else
+        ;
+#endif
+    }
+
+    // One short burst of the CPU's spin-wait hint (worker spin-before-park, see JobQue::job).
+    static inline void jobque_spin_pause() {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+        for ( int i = 0; i != 64; ++i ) _mm_pause();
+#elif defined(_MSC_VER) && defined(_M_ARM64)
+        for ( int i = 0; i != 64; ++i ) __yield();
+#elif defined(__x86_64__) || defined(__i386__)
+        for ( int i = 0; i != 64; ++i ) __builtin_ia32_pause();
+#elif defined(__aarch64__)
+        for ( int i = 0; i != 64; ++i ) __asm__ __volatile__("yield");
+#else
+        this_thread::yield();
+#endif
+    }
+}
+
 // Feature tracking statics
 das::Feature *  das::Feature::sTrackHead = nullptr;
 das::mutex      das::Feature::sTrackMutex;
@@ -30,20 +69,22 @@ namespace das {
     }
 #endif
 
-    // Worker count. Generic rule: logical cores - 1, capped at DAS_MAX_HW_JOBS — parallel_for has the
-    // CALLING (main) thread run a chunk and then wait, so it occupies a core; cores-1 workers + main ==
-    // cores avoids the oversubscription that otherwise makes the surplus worker "trickle in" over the
-    // first ~37% of every matmul. DAS_MAX_HW_JOBS (default 4; raise via -DDAS_MAX_HW_JOBS=N) keeps a
-    // wasm build from spawning one Web Worker per logical core. On heterogeneous Apple Silicon we
-    // instead run one worker per PERFORMANCE core (no -1, no cap): the efficiency cores absorb the main
-    // thread + OS, whereas cores-1 (logical) spills a worker onto a slow E-core that stalls every
-    // parallel_for on the straggler — measured ~1.6x slower on an M-series 8P+2E prefill. DAS_JOBQUE_THREADS
-    // is an explicit override that bypasses everything (0/unset = the default).
+    // Worker count. Generic rule: logical cores - 1, capped at DAS_MAX_HW_JOBS — parallel_for's
+    // CALLING (main) thread now executes queued chunks itself (jobque_try_run_one), so it IS a
+    // compute thread and occupies a core; cores-1 workers + main == cores avoids the oversubscription
+    // that otherwise makes the surplus thread "trickle in" over the first ~37% of every matmul.
+    // DAS_MAX_HW_JOBS (4 on wasm so a web build doesn't spawn one Web Worker per logical core;
+    // effectively uncapped elsewhere). On heterogeneous Apple Silicon the same -1 applies to the
+    // PERFORMANCE-core count: P-1 workers + the computing main == P. Landing any compute thread on a
+    // slow E-core stalls every parallel_for on its straggler chunk (measured ~1.6x slower on an
+    // M-series 8P+2E prefill vs P-only) — pre-main-steal that ruled out logical cores-1 here; now
+    // that the main thread computes too, the -1 is what keeps every compute thread on a P-core.
+    // DAS_JOBQUE_THREADS is an explicit override that bypasses everything (0/unset = the default).
     static int jobque_thread_count(int hw) {
         static int forced = []{ const char * e = getenv("DAS_JOBQUE_THREADS"); return e ? atoi(e) : 0; }();
         if ( forced > 0 ) return forced;
 #if defined(__APPLE__)
-        if ( int good = apple_perf_core_count() ) return good;
+        if ( int good = apple_perf_core_count() ) return max(1, good - 1);
 #endif
         return max(1, min(DAS_MAX_HW_JOBS, hw - 1));
     }
@@ -173,6 +214,7 @@ namespace das {
         auto  it = lower_bound(mFifo.begin(), mFifo.end(), priority, [](const JobEntry& lhs, JobPriority priority) {
             return lhs.priority >= priority; });
         mFifo.emplace(it, das::move(job), category, priority);
+        mFifoCount.fetch_add(1, std::memory_order_relaxed);
     }
 
     void JobQue::push(Job && job, JobCategory category, JobPriority priority) {
@@ -181,10 +223,96 @@ namespace das {
         mCond.notify_one();
     }
 
+    void JobQue::pushBatch(vector<Job> && jobs, JobCategory category, JobPriority priority) {
+        {
+            lock_guard<mutex> lock(mFifoMutex);
+            for ( auto & j : jobs ) {
+                submit(das::move(j), category, priority);
+            }
+        }
+        // ONE wake, not notify_all: waking N parked threads is ~N serialized OS wakes (~5-8us each)
+        // no matter who calls it. Workers propagate instead — every worker that pops and leaves work
+        // behind wakes the next (see job()), so the wake tree fans out with log depth and the wake
+        // syscalls are paid by the (parallel) workers, not the flushing thread.
+        mCond.notify_one();
+        jobs.clear();
+    }
+
+    bool JobQue::tryRunOneJob() {
+        // Dispatcher-side work stealing: a thread sitting at a fork/join (parallel_for) pops queued
+        // jobs and runs them itself instead of sleeping — the job closures are thread-agnostic (the
+        // same closures any worker would run), so the only difference is who executes. Wake
+        // propagation mirrors job(): if our pop left work behind, kick parked workers.
+        Job job;
+        size_t moreWork = 0;
+        {
+            lock_guard<mutex> lock(mFifoMutex);
+            if ( mFifo.empty() ) return false;
+            job = das::move(mFifo.front().function);
+            mFifo.pop_front();
+            mFifoCount.fetch_sub(1, std::memory_order_relaxed);
+            mJobsRunning++;
+            moreWork = mFifo.size();
+        }
+        if ( moreWork >= 1 ) mCond.notify_one();
+        if ( moreWork >= 2 ) mCond.notify_one();
+        job();
+        --mJobsRunning;
+        return true;
+    }
+
     void JobQue::job(int threadIndex) {
+        uint32_t teamSeqSeen = mTeamSeq.load(std::memory_order_relaxed);
         while (!mShutdown) {
             Job job;
-            {
+            bool gotJob = false;
+            size_t moreWork = 0;    // work left behind by our pop → wake-propagate (see pushBatch)
+            // Spin-before-park (opt-in via setWorkerSpin): poll the fifo for mSpinUs before blocking
+            // on the condvar. notify_one to a PARKED worker costs the DISPATCHING thread an OS
+            // thread-wake (~3-4.5us, serially per job — the dominant term of the fork/join tax); to
+            // a spinning worker it's a ~0.1us no-waiter check. A fork/join burst (LLM decode token =
+            // dozens of back-to-back parallel_for matmuls) keeps workers in the spin window the whole
+            // time, so only the burst's first dispatch pays the wakes.
+            // Team mode extends the same window: poll the team slot too. The window stays BOUNDED
+            // (the ggml hybrid poll/park shape) — after it expires the worker parks, and a team
+            // publish that finds parked workers notifies (see teamParallelFor's wake gate).
+            int spinUs = mSpinUs.load(std::memory_order_relaxed);
+            bool teamMode = mTeamMode.load(std::memory_order_relaxed) != 0;
+            if ( (spinUs > 0 || teamMode) && !mShutdown.load(std::memory_order_relaxed) ) {
+                auto deadline = chrono::steady_clock::now() + chrono::microseconds(spinUs);
+                for (;;) {
+                    if ( mShutdown.load(std::memory_order_relaxed) ) break;
+                    teamMode = mTeamMode.load(std::memory_order_relaxed) != 0;
+                    if ( teamMode && runTeamChunks(threadIndex, teamSeqSeen) ) {
+                        // served team chunks — fresh spin window, same as a fifo raid restarting the loop
+                        deadline = chrono::steady_clock::now() + chrono::microseconds(spinUs);
+                    }
+                    // try_lock, NOT lock: every spinner that sees the same count blip races here, and
+                    // blocking losers would queue on the mutex — a convoy the dispatcher's next push
+                    // waits behind (measured 45us push stalls). try_lock losers just keep spinning,
+                    // and a raided worker resumes the SAME spin window rather than parking, so the
+                    // rest of the burst still finds it awake.
+                    if ( mFifoCount.load(std::memory_order_relaxed) != 0 && mFifoMutex.try_lock() ) {
+                        {
+                            lock_guard<mutex> lock(mFifoMutex, std::adopt_lock);
+                            if ( !mFifo.empty() ) {
+                                job = das::move(mFifo.front().function);
+                                mThreads[threadIndex].currentPriority = mFifo.front().priority;
+                                mThreads[threadIndex].currentCategory = mFifo.front().category;
+                                mFifo.pop_front();
+                                mFifoCount.fetch_sub(1, std::memory_order_relaxed);
+                                mJobsRunning++;
+                                gotJob = true;
+                                moreWork = mFifo.size();
+                            }
+                        }
+                        if ( gotJob ) break;
+                    }
+                    jobque_spin_pause();
+                    if ( chrono::steady_clock::now() >= deadline ) break;
+                }
+            }
+            if ( !gotJob ) {
                 unique_lock<mutex> lock(mFifoMutex);
                 // Block until a job is available or we're shutting down. A plain wait (no periodic
                 // timeout) means idle workers stay parked instead of waking every mSleepMs to grab
@@ -192,15 +320,33 @@ namespace das {
                 // dispatch path needs, throttling parallel_for when most workers are idle between
                 // a token's many small matmuls. push()/parallel_for already notify, so latency is
                 // unaffected; join() sets mShutdown under the lock and notifies to wake all workers.
-                mCond.wait(lock, [&]() { return mFifo.size() != 0 || mShutdown.load(); });
+                // A team publish notifies only when it sees us parked (the seq_cst parked++ /
+                // seq-check pair below vs the publisher's seq-bump / parked-check closes the
+                // sleep/wake race), hence the team clause in the predicate + the empty-fifo continue.
+                mParkedWorkers.fetch_add(1, std::memory_order_seq_cst);
+                mCond.wait(lock, [&]() {
+                    return mFifo.size() != 0 || mShutdown.load()
+                        || mTeamSeq.load(std::memory_order_seq_cst) != teamSeqSeen;
+                });
+                mParkedWorkers.fetch_sub(1, std::memory_order_relaxed);
                 if ( mShutdown ) break;
-                DAS_VERIFYF(mFifo.size() > 0, "There must be at least one job available");
+                if ( mFifo.empty() ) continue;      // team wake, no fifo work → back to the spin/team poll
                 job = das::move(mFifo.front().function);
                 mThreads[threadIndex].currentPriority = mFifo.front().priority;
                 mThreads[threadIndex].currentCategory = mFifo.front().category;
                 mFifo.pop_front();
+                mFifoCount.fetch_sub(1, std::memory_order_relaxed);
                 mJobsRunning++;
+                moreWork = mFifo.size();
             }
+            // Wake propagation (outside the lock so the wakee doesn't bounce off it): if our pop left
+            // work behind, wake up to TWO more workers before running the job. A batch flush wakes
+            // only one worker; each wakee doubling the wake front fans the backlog out as a binary
+            // tree (log2 depth ≈ 5 wake latencies for 32 jobs, vs 32 serialized wakes for a
+            // notify_all), paid in parallel by the workers instead of serially by the dispatcher.
+            // No-op when no one is parked (spinners pick work up themselves).
+            if ( moreWork >= 1 ) mCond.notify_one();
+            if ( moreWork >= 2 ) mCond.notify_one();
             // Only touch the OS thread priority when it actually changes — every job otherwise pays
             // a pthread_setschedparam syscall, and a parallel_for fires the same priority on every
             // chunk (~thousands of redundant syscalls per LLM token). Only this worker writes its own
@@ -217,6 +363,60 @@ namespace das {
             }
         }
         mThreadCount--;
+    }
+
+    void JobQue::setTeamMode ( bool on ) {
+        // no wake needed: parked workers are woken by the first publish's wake gate
+        mTeamMode.store(on ? 1 : 0, std::memory_order_relaxed);
+    }
+
+    bool JobQue::runTeamChunks ( int threadIndex, uint32_t & seqSeen ) {
+        uint32_t seq = mTeamSeq.load(std::memory_order_acquire);
+        if ( seq == seqSeen ) return false;
+        seqSeen = seq;
+        bool ran = false;
+        for (;;) {
+            // acq_rel pairs with the publisher's release-store(0): a straggler still in this loop
+            // when the NEXT op publishes crosses over cleanly — it claims a fresh chunk index and
+            // sees that op's work/numChunks. Every chunk of every op runs exactly once regardless.
+            int c = mTeamChunkNext.fetch_add(1, std::memory_order_acq_rel);
+            if ( c >= mTeamNumChunks ) break;
+            (*mTeamWork)(c, threadIndex);
+            mTeamRemaining.fetch_sub(1, std::memory_order_release);
+            ran = true;
+        }
+        return ran;
+    }
+
+    void JobQue::teamParallelFor ( int numChunks, const JobChunk & work ) {
+        int nW = mThreadCount.load();
+        if ( numChunks <= 1 || nW == 0 || !getTeamMode() ) {
+            for ( int c = 0; c != numChunks; ++c ) work(c, nW);
+            return;
+        }
+        mTeamWork = &work;
+        mTeamNumChunks = numChunks;
+        mTeamRemaining.store(numChunks, std::memory_order_relaxed);
+        mTeamChunkNext.store(0, std::memory_order_release);
+        // seq_cst bump + parked check: the Dekker pair with the worker's parked++ / seq-check —
+        // either the parking worker sees this op, or we see it parked and pay the wake. No mutex
+        // touched while everyone spins (ggml's kickoff locks unconditionally; it can afford to at
+        // one publish per graph — we publish per op).
+        mTeamSeq.fetch_add(1, std::memory_order_seq_cst);
+        if ( mParkedWorkers.load(std::memory_order_seq_cst) > 0 ) {
+            lock_guard<mutex> lock(mFifoMutex);
+            mCond.notify_all();
+        }
+        for (;;) {
+            int c = mTeamChunkNext.fetch_add(1, std::memory_order_acq_rel);
+            if ( c >= numChunks ) break;
+            work(c, nW);
+            mTeamRemaining.fetch_sub(1, std::memory_order_release);
+        }
+        // join: acquire pairs with the workers' release decrements, so their chunk writes are
+        // visible here. Unbounded spin — the tail is at most one chunk per worker.
+        while ( mTeamRemaining.load(std::memory_order_acquire) != 0 ) jobque_spin_relax();
+        mTeamWork = nullptr;
     }
 
     void JobQue::parallel_for ( JobStatus & status, int from, int to, const JobChunk & chunk,
@@ -399,6 +599,29 @@ namespace das {
         // cannot make progress while we block, so there is nothing to wait for.)
         return;
 #else
+        // Join spin-before-park (opt-in via set_jobque_join_spin, default 0 = park immediately):
+        // poll the counter before blocking — the ggml hybrid-poll shape verbatim
+        // (ggml_graph_compute_poll_for_work): a COUNTED loop of one relaxed load + one cpu-relax
+        // per round, no clock anywhere in the loop (a steady_clock read per round costs more than
+        // the pause and caps the poll rate). level*1024*128 rounds, level 50 ≈ ggml's default
+        // window. The final seq_cst load reading 0 synchronizes with every notifier's decrement
+        // (RMW release sequence), so the workers' results are visible without taking mCompleteMutex.
+        int level = sJoinSpin.load(std::memory_order_relaxed);
+        if ( level > 0 ) {
+            const uint64_t nRounds = uint64_t(level) * 1024ull * 128ull;
+            for ( uint64_t i = 0; mRemaining.load(std::memory_order_relaxed) != 0 && i < nRounds; ++i ) {
+                jobque_spin_relax();
+            }
+            if ( mRemaining.load() == 0 ) {
+                // Lifetime handshake: the last notifier decrements under mCompleteMutex and can
+                // still be inside notify_all/unlock ON THIS OBJECT when the lock-free load sees 0.
+                // Callers destroy the JobStatus right after Wait returns (with_wait_group holds it
+                // on the stack), so take the lock once to wait the notifier out of its locked
+                // region. Uncontended in the common case — the notifier is nanoseconds from done.
+                lock_guard<mutex> guard(mCompleteMutex);
+                return;
+            }
+        }
         unique_lock<mutex> lock(mCompleteMutex);
         mCond.wait(lock, [this] {
             return mRemaining==0;

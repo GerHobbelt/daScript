@@ -5,6 +5,7 @@ IF(NOT DAS_LLAMA_INCLUDED)
     ADD_MODULE_DAS(dasllama dasllama dasllama_math)
     ADD_MODULE_DAS(dasllama dasllama dasllama_math_default)
     ADD_MODULE_DAS(dasllama dasllama dasllama_math_aarch64_neon)
+    ADD_MODULE_DAS(dasllama dasllama dasllama_math_x64_avx)
     ADD_MODULE_DAS(dasllama dasllama dasllama_quant)
     ADD_MODULE_DAS(dasllama dasllama dasllama_gguf)
     ADD_MODULE_DAS(dasllama dasllama dasllama_unicode)
@@ -18,8 +19,11 @@ IF(NOT DAS_LLAMA_INCLUDED)
     ADD_MODULE_DAS(dasllama dasllama dasllama_arch_gemma2)
     ADD_MODULE_DAS(dasllama dasllama dasllama_arch_gemma3)
     ADD_MODULE_DAS(dasllama dasllama dasllama_arch_gemma4)
+    ADD_MODULE_DAS(dasllama dasllama dasllama_arch_qwen2moe)
+    ADD_MODULE_DAS(dasllama dasllama dasllama_arch_gptoss)
     ADD_MODULE_DAS(dasllama dasllama dasllama_transformer)
     ADD_MODULE_DAS(dasllama dasllama dasllama_chat)
+    ADD_MODULE_DAS(dasllama dasllama dasllama)
 
     install(DIRECTORY ${PROJECT_SOURCE_DIR}/modules/dasLLAMA/dasllama
         DESTINATION ${DAS_INSTALL_MODULESDIR}/dasLLAMA
@@ -27,6 +31,14 @@ IF(NOT DAS_LLAMA_INCLUDED)
         PATTERN "*.das"
     )
     install(FILES ${PROJECT_SOURCE_DIR}/modules/dasLLAMA/.das_module
+        DESTINATION ${DAS_INSTALL_MODULESDIR}/dasLLAMA
+    )
+    # per-box tuning: the profile producer ([tuned] in the module is the consumer) + its doc
+    install(FILES ${PROJECT_SOURCE_DIR}/modules/dasLLAMA/harness/tune_kernels.das
+        ${PROJECT_SOURCE_DIR}/modules/dasLLAMA/harness/tune_tb.das
+        DESTINATION ${DAS_INSTALL_MODULESDIR}/dasLLAMA/harness
+    )
+    install(FILES ${PROJECT_SOURCE_DIR}/modules/dasLLAMA/tune_for_this_box.md
         DESTINATION ${DAS_INSTALL_MODULESDIR}/dasLLAMA
     )
 ENDIF()

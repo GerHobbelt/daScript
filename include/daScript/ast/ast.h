@@ -1131,7 +1131,7 @@ namespace das
     class DAS_API Module {
     public:
         Module ( const string & n = "" );
-        void promoteToBuiltin(const FileAccessPtr & access);
+        void promoteToBuiltin(const FileAccessPtr & access, const string & requireName = string());
         virtual ~Module();
         virtual void addPrerequisits ( ModuleLibrary & ) const {}
         virtual ModuleAotType aotRequire ( TextWriter & ) const { return ModuleAotType::no_aot; }
@@ -1174,7 +1174,7 @@ namespace das
         }
         friend DAS_CC_API bool compileBuiltinModule ( Module * module, const string & name, const unsigned char * const str, unsigned int str_len );
         static Module * require ( const string & name );
-        static Module * requireEx ( const string & name, bool allowPromoted, const string & expectedFileName = string() );
+        static Module * requireEx ( const string & name, bool allowPromoted, const string & requireName = string() );
         static void Initialize();
         static void CollectFileInfo(das::vector<FileInfoPtr> &accesses);
         static void Shutdown( bool dumpHandleLeaks = true );
@@ -1259,6 +1259,7 @@ namespace das
         string                                      cppClassName;       // C++ class name (e.g. "Module_Math"), set by REGISTER_MODULE
         uint64_t                                    nameHash = 0;
         string                                      fileName;           // where the module was found, if not built-in
+        string                                      promotedRequire;    // canonical require string a shared module was promoted with (e.g. "daslib/fio"); identity-matched in requireEx so a cross-directory `require` resolves it, while a mis-qualified one (bare `require fio`) does not
         union {
             struct {
                 bool    builtIn : 1;
@@ -1631,7 +1632,7 @@ namespace das
         int32_t jit_opt_level = 3u;              // Opt level for LLVM to codegen and IR optimizations
         int32_t jit_size_level = 0u;             // Opt level for LLVM for binary size
         string jit_path_to_shared_lib;           // Path to libDaScript. Optional, we'll try to find it in _das_root_/lib/ if not provided.
-        string jit_path_to_linker;               // Path to linker. Optional, we'll use clang-cl from LLVM on Windows and cc otherwise.
+        string jit_path_to_linker;               // Path to linker. Optional, we'll use lld-link from LLVM on Windows (MSVC), clang on mingw, c++ otherwise.
     // dll loading
         vector<string> dll_search_paths;          // additional search paths for dll loading
     // one-liners

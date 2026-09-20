@@ -6,6 +6,7 @@ require dasllama/dasllama_tokenizer
 require daslib/jobque_boost
 require strings
 require math
+require dasllama/dasllama_math  // setup_dasllama_jobque_ + the runtime knob setters (engine-level, not re-exported)
 
 // Step 7.3 — the quant payoff on a REAL bandwidth-bound model. Self-quantize TinyLlama's
 // fp32 GGUF weights to Q8_0 / Q4_0 (all-weights) and A/B the throughput against fp32 on the
@@ -79,7 +80,7 @@ def main {
     print("config: dim={c.dim} layers={c.n_layers} heads={c.n_heads}/{c.n_kv_heads} vocab={c.vocab_size}\n")
 
     with_job_que() {
-        set_jobque_fork_pool(true, true)  // pool per-job fork contexts + skip their init (pure-data matmul jobs)
+        setup_dasllama_jobque_()
         var fp = 0.0lf
         var q8 = 0.0lf
         var q4 = 0.0lf

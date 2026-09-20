@@ -1,7 +1,7 @@
 options gen2
 options _jit_fast_math = true   // ggml-parity FP laxity (non-bit-exact, ~+10%); tests stay bit-exact
 
-require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration; requiring dasllama_common directly would drop them
+require dasllama/dasllama   // the public facade: engine + every arch registration + chat layer
 require daslib/jobque_boost
 require daslib/fio
 require strings
@@ -35,7 +35,7 @@ def main {
     let prompt <- encode(m, PROMPT, true, false)
     print("{PROMPT}")
     with_job_que() {
-        set_jobque_fork_pool(true, true)  // pool per-job fork contexts + skip their init (pure-data matmul jobs)
+        setup_dasllama_jobque()   // pooled forks + batched dispatch + spin window (box-profile tunable)
         var s = create_session(m)
         generate(m, s, prompt, SamplingParams(), N_GEN) $(_id, piece) {
             fprint(fstdout(), piece)

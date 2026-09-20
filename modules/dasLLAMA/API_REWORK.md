@@ -1,6 +1,6 @@
 # dasLLAMA API Rework — Plan
 
-**Status:** Phases 1-7 done — core API, arch registry + physical arch/kernel seams (6a/6b), chat layer, and the P7 kernel auto-tuner (grid emission + `[tuned]` reconstitution + TB cliff-guard). Design locked 2026-07-01. **In progress: the T1/T2 model-support waves** (see [Model-support plan](#model-support-plan--the-t1t2-waves-agreed-2026-07-01)) — waves 0 (Mistral/SmolLM2 + chat-template detection), 1 (Qwen3 QK-norm), and 2 (Gemma-3 per-layer SWA pattern + dual RoPE θ) landed.
+**Status:** Phases 1-7 done — core API, arch registry + physical arch/kernel seams (6a/6b), chat layer, and the P7 kernel auto-tuner (grid emission + `[tuned]` reconstitution + TB cliff-guard). Design locked 2026-07-01. All seven T1/T2 model-support waves landed (see [Model-support plan](#model-support-plan--the-t1t2-waves-agreed-2026-07-01)), and the [facade + docs wave](#the-facade--dasllamadasllamadas-landed-2026-07-02) landed 2026-07-02, followed by the [tutorials wave](#the-tutorials-wave--tutorialsdasllama-landed-2026-07-02) the same day. **Next: the performance-ledger pass.**
 
 This is the design record for unifying the dasLLAMA user-facing API and making the
 backend extensible. It carries the **why**; the code carries the how. Keep it current
@@ -256,9 +256,9 @@ are Q8_0 GGUFs into `~/Work/llama.cpp/models/` unless noted.
 | **1** | QK-norm — Config flag + per-layer `attn_q_norm`/`attn_k_norm` weights, per-head RMSNorm pre-RoPE in the shared attn blocks (a flag like `ffn_act`, not a block swap); `<think>`-stripping in chat history | Qwen3-0.6B (fast iteration), Qwen3-4B-Instruct-2507 (fixture) | 0.7 + 4.3 |
 | **2** | per-layer attention patterns — generalize the hardcoded `l % 2` SWA alternation to `sliding_window_pattern` (gemma2 = 2, gemma3 = 6), per-layer RoPE θ (dual rope tables); SmolLM3's NoPE layers = same machinery | gemma-3-1b-it, gemma-3-4b-it (opt: SmolLM3-3B) | 1.1 + 4.5 |
 | **3** ✅ | **Gemma 4** — GGUF ground truth revised the plan: the 12B has NO shared KV and NO PLE (`shared_kv_layers = 0`, `embedding_length_per_layer_input = 0` — both are E-series features; the loader now panics honestly on either). What it DOES need, all shipped: heterogeneous per-layer geometry (sliding 16Q/8KV×256 vs global 16Q/1KV×512 — per-layer weight-offset arrays, class-max scratch, per-layer KV-cache packing), explicit bool-array SWA pattern (`swa_mask`), p-RoPE freq factors on global layers only (full rotation, `dimension_count` == head size per class — pruning is a loader panic), weightless V-norm, V-from-K on the no-`attn_v` global layers, unit attention scale, per-layer `layer_output_scale`, final softcap, `suppress_tokens` logit bias, and the new `gemma4` SPM-style-BPE tokenizer (metaspace + newline-only pre-split + byte fallback; 46/46 on the official corpus). Shared-KV + PLE move to a follow-up E-series wave (E2B ~2GB oracle) | gemma-4-12b-it — 40/40 counting + 40/40 window-engaged ~1490-token prompt | 12.7 |
-| **4** | **MoE FFN block** via the ArchBlocks seam (proves Phase 4) — router → top-k, pluggable gating (softmax now, sigmoid slot, `norm_topk_prob`), routed experts + **shared expert(+gate)**; loader handles 3D stacked `ffn_*_exps`, expert-major Q8 so the existing kernels apply per expert. Decode first; prefill naive per-token, expert-bucketed grouped GEMM as a separate perf PR | Qwen1.5-MoE-A2.7B-Chat; stretch: gemma-4-26B-A4B @ Q4_0, Qwen3-30B-A3B | 15 (+14) |
-| **5** | attention sinks (per-head sink logit in the softmax — classic + flash cores) + MXFP4 GGUF decode (dequant → self-Q8 at load) | gpt-oss-20b | 12.1 |
-| **6** | *(infra, last)* lift the linear-allocator 4GB limit — `LinearChunkAllocator`'s per-chunk `uint32` cap breaks any context holding a >4GB single array, which today forces `options persistent_heap` on model-loading tests (Mistral-7B's Q8 blob is 7.1GB) and the `seq_len` cap before `create_session` (Llama-3/Phi native 131072 ⇒ >4GB KV arrays). Fix the allocator (64-bit chunk sizing), then remove both workarounds | none — regression = existing suite minus the workarounds | — |
+| **4** ✅ | **MoE FFN block** via the ArchBlocks seam (proves Phase 4 — the forward loops were untouched; qwen2moe registers `moe_blocks()`). Shipped: router → top-k over probs-before-selection, pluggable gating (`MoeGate.softmax\|sigmoid` from `{arch}.expert_gating_func`), `norm_topk_prob` + `expert_weights_scale` slots, routed experts + sigmoid-gated **shared expert**; expert-major layout (expert e of layer l = a plain 2D matrix at `we*_off + (l·n_expert+e)·dim·n_ff_exp`) so every existing kernel incl. the arm64 repack applies per expert; 3D `ffn_*_exps` transcode in one contiguous read; honest panics for grouped routing / gating-func 3 / `exp_probs_b` / expert biases. Decode fused; prefill naive per-token (grouped GEMM → ledger). Stretch models not pursued this wave: gemma-4-26B-A4B @ Q4_0, Qwen3-30B-A3B (qwen3moe = QK-norm + `norm_topk_prob`, no shared expert — a thin arch file when wanted) | Qwen1.5-MoE-A2.7B-Chat — 40/40 counting AND 40/40 prose, both prompts token-for-token | 15 |
+| **5** ✅ | **gpt-oss** — everything the plan row named plus what the GGUF ground truth added. Shipped: attention sinks (per-head sink logit joins the softmax max + denominator, no V contribution — decode `softmax_sink` + all three prefill cores; flash seeds its online softmax with max = sink, sum = 1); MXFP4 decode (E8M0 half-scale + doubled-e2m1 nibble LUT, one new `gguf_read_tensor_f32` arm → the existing dequant→self-Q8 path covers it); YaRN rope with ZERO engine change — the NTK-by-parts ramp is a per-pair effective position scale, so the loader synthesizes `rope_freqs[j] = 1/(fscale + ramp_j·(1−fscale))` and folds the 1 + 0.1·ln(factor) magnitude into `rope_mscale`; `MoeGate.softmax_weight` (top-k on raw biased logits, softmax over the selected k; knockout sentinel → −FLT_MAX); router + per-expert biases (fblob stacks, expert-major) + attention output-projection bias; `FfnAct.swiglu_oai` (clamped, +1 up branch, scalar + exp4 float4); pre-FFN norm under the `post_attention_norm` name; gpt-4o/o200k pre-tokenizer (llama.cpp's exact case-class approximation: contraction suffixes, upper*/lower+ letter runs, `/` in punct tails, no-BOS default) + Harmony-lite chat template with `<|channel|>` detection sniff | gpt-oss-20b — 40/40 counting + 40/40 window-engaged 449-token prompt (encoded in-test), both FIRST TRY; tokenizer id-for-id vs llama.cpp on counting/contraction/whitespace probes | 12.1 |
+| **6** ✅ | *(infra, last)* lifted the linear-allocator 4GB limit — `HeapChunk` `size`/`offset` went `uint64` and `LinearChunkAllocator` dropped every `UINT32_MAX` cap (`allocate`/`free`/`setInitialSize`, the `reset` clamp; virtual `grow` is 64-bit — one override, `DebugInfoAllocator`). Regression tests in `tests-cpp/small/test_heap_64bit.cpp`: an ungated >4GB `setInitialSize` probe plus gated (`DASLANG_HUGE_HEAP_TESTS=1`) >4GB single-chunk and default-context-heap tests. End-to-end on the default heap: Mistral-7B's 7.1GB Q8 blob loads and matches its fixture token-for-token (`harness/parity.das` dropped its `options persistent_heap`), and Llama-3.2-1B at native `seq_len` 131072 allocates two exactly-4GiB single KV arrays and generates. Workaround disposition, re-justified honestly: the tests **keep** `options persistent_heap` — since the explicit-delete discipline landed, it's what makes `delete` really free between fixtures (linear free is a mid-context no-op, so multi-GB weights would accumulate) — and the `seq_len` caps **stay as RAM savers** (native 131072 KV is 8–64GB of fp32); both kinds of comment now state the real reason instead of the vanished cap | none — regression = existing suite + the new tests-cpp cases | — |
 
 Out of scope, and why: Qwen3.5/3.6 (Gated-DeltaNet hybrid linear attention → Tier 3),
 Llama-4 (109B+), DeepSeek V3+/GLM-5 (MLA / bespoke sparse → Tier 3), Mixtral (superseded,
@@ -272,6 +272,66 @@ llama.cpp "minja" route, executes the embedded template directly) — is deliber
 until the named registry stops scaling; the realistic forcing function is gpt-oss's
 channel-based Harmony format at wave 5. Chat remains layer 2 throughout.
 
+## The facade — `dasllama/dasllama.das` *(landed 2026-07-02)*
+
+One require is the public API: `require dasllama/dasllama` re-exports the engine
+(`dasllama_transformer public` — which also fires every arch `[init]`) and the chat layer
+(`dasllama_chat public`), and defines the **documented, curated surface** — the three layers above
+as 14 `//!`-documented stubs (`load_model` / `create_session` / `encode` / `decode` / `piece` /
+`eval` / `sample` / `set_seed` / `stats` / `generate` / `create_chat` / `add_user` / `render_turn`
+/ `respond`). Everything else stays reachable through the re-export, deliberately undocumented.
+
+- **Naming:** wherever the facade takes the good name, the engine spelling carries a trailing
+  underscore (`load_model_`, `eval_`, …) — a same-name stub plus a public re-export would be an
+  ambiguous overload at every call site. The raw greedy `generate(t, s, prompt, steps)` keeps its
+  name (different arity, no ambiguity — the token-exact oracle path). Public-path consumers
+  (examples, `test_parity`/`test_facade`/`test_chat`/`test_sampling`/…) require the facade and use
+  the good names; internal/kernel tests and the chat engine's internals use the `_` spellings.
+- **Examples are the completeness gate:** `run.das` / `chat.das` require ONLY `dasllama/dasllama`
+  from the module — if a demo needs something the facade lacks, the facade grows, not the require
+  list. Both verified end-to-end after the switch (TinyLlama completion + chat smoke).
+- **Docs:** das2rst registers ONLY the facade module (new stdlib section `sec_ai.rst`,
+  `generated/dasllama.rst`; `doc.yml` path filters now include `modules/dasLLAMA/dasllama/**`).
+  Engine modules stay undocumented by design — Model's ~40 offset fields are not API. The types the
+  facade signatures mention (`Model`, `Session`, `QuantMode`, `SamplingParams`, `Stats`,
+  `ChatSession`) get hand-written opaque stanzas emitted by `document_module_dasllama`'s
+  `DocsHook.afterEnums` under the exact `:ref:` labels the signature renderer produces, so
+  cross-references resolve without documenting internals. The module header
+  (`handmade/module-dasllama.rst`) carries the supported-model-family list (and, later, tutorial
+  links).
+- **🔑 `//!` placement:** the doc extractor (`daslib/rst_comment`) attaches a docstring only when
+  the `//!` block is the FIRST thing *inside* the function body — an above-def `//!` is silently
+  discarded (this is why no engine docstring ever extracted; the engine's above-def `//!` remain as
+  source comments only).
+- **Drift detector** (`tests/dasLLAMA/test_facade_docs.das`): every facade def has a body-leading
+  `//!` (and no inert above-def `//!` exists); facade stubs ↔ engine `_` spellings stay 1:1 in both
+  directions; the examples stay facade-only. Negative-probed: an undocumented extra stub fails it.
+
+## The tutorials wave — `tutorials/dasLLAMA/` *(landed 2026-07-02)*
+
+Six tutorials written strictly against the facade, each a runnable single-file
+`main()` (project convention: `tutorials/<area>/`, never `modules/<X>/tutorial/`), with paired
+RST pages under `doc/source/reference/tutorials/` and a toctree section, plus tutorial links on
+the stdlib module page. The teaching model is SmolLM2-135M-Instruct Q8_0 (~145MB llama-arch
+GGUF; models aren't shipped — path via CLI arg or `DASLLAMA_MODEL`):
+
+1. **hello_generate** — load_model / encode / decode / piece / generate / stats.
+2. **chat** — create_chat / add_user / respond, multi-turn KV memory, history, render_turn
+   (specials are atomic ids, invisible to decode).
+3. **sampling** — greedy determinism + the 135M repetition loop, penalty breaking it,
+   temp / top-k / set_seed reproducibility.
+4. **sessions_and_memory** — KV sizing + the cap-seq_len-BEFORE-create_session rule, session
+   independence, manual eval/sample loop, persistent_heap + delete discipline.
+5. **performance** — jit_enabled, job-queue requirement + `DAS_JOBQUE_THREADS`, prefill-vs-gen
+   physics, fp32/q8/q4 measured table, `_jit_fast_math`.
+6. **add_an_arch** — registry walkthrough (arch_names / ArchDesc / std_blocks / chat parts /
+   register_arch), no model needed.
+
+Tutorials joined the CMake install + `dry_run_tutorials` compile gate. One durable lesson baked
+into 04's structure: a fat `main()` frame plus the forward-pass call chain overflows the default
+16KB context stack (das frames are statically sized for all locals) — model-driving mains stay
+lean, one function per section.
+
 ### Performance ledger (living — address after the model waves)
 
 Standing rule (Boris, 2026-07-01): any performance possibility spotted while doing wave work
@@ -279,20 +339,147 @@ gets a note HERE instead of being acted on mid-wave — the model waves optimize
 and coverage; this ledger is the backlog for the perf pass that follows them. Every entry says
 what it costs today and what the fix would change.
 
-- **Tied classifier reads the fp32 embedding — the single biggest decode lever on big-vocab
-  models.** `shared_weights` models (Gemma family, Qwen small) route the classifier matmul
-  through the fp32 `token_embd` in fblob: vocab × dim × 4B of traffic per token — on
-  gemma-4-12B (262144 × 3840) that is ~4GB/token, roughly a quarter of its ~5 tok/s decode
-  roofline; llama.cpp matmuls the Q8 embedding directly. Same fix also cuts RESIDENT memory
-  (the fp32 table costs 4GB vs ~1GB at Q8; today only the per-token embedding-row read needs
-  fp32, and that could dequant one row on demand). Changes numerics vs today's fp32 classifier
-  → every tied-model parity fixture needs refreezing in the same PR. (Spotted wave 3.)
-- **V-from-K layers: fuse the K→V copy with the weightless V-norm.** gemma4 global layers copy
-  the K projection into V, then rms_batch it — two passes over npos × kv_dim where one fused
-  pass would do. Small (kv_dim = 512 on those layers) but free. (Spotted wave 3.)
-- **No llama.cpp A/B on gemma-4-12B yet.** Wave 3 verified tokens, not speed — prefill 62 t/s /
-  gen 5 t/s on the M1 are uncalibrated against llama.cpp on the same box. Run the interleaved
-  A/B (kernel-opt method) before drawing any conclusions or optimizing. (Spotted wave 3.)
+- **DONE (perf pass, 2026-07-02): tied classifier matmuls the Q8 disk quants (`Model.cls_q8`).**
+  Tied Q8 loads of a Q8_0 embedding (every tied model we run — probed all 11) transcode
+  `token_embd` twice into qblob — a classifier copy at wcls_off (repacked with the other 2D
+  weights) and a LINEAR copy at emb_q8_off that embedding rows dequant from on demand (the laneq
+  repack interleaves wcls in place, so row reads need their own un-repacked copy; on a no-repack
+  box the two could alias — noted x64 follow-up) — and drop the fp32 table: on gemma-4-12B,
+  classifier traffic 4.03GB → 1.13GB/token and resident 4.03GB → 2.26GB. Rows are bit-identical
+  (same Q8_0 data the fblob decode used; gated by test_parity_tied_cls_q8_rows); the classifier
+  quants are exactly what llama.cpp matmuls. 8 of 9 tied-model fixtures held token-for-token
+  unchanged; gemma2's "Once upon a time" flipped a near-tie under the PINNED classic+libm test
+  kernels only (default kernels still matched the oracle 24/24) → moved to the counting prompt
+  like Qwen2.5/Phi, oracle-refrozen. fp32/q4 loads and non-Q8_0 embeddings keep the exact old
+  path. (Spotted wave 3.)
+- **DONE (perf pass, 2026-07-02): V-from-K layers fuse the K→V copy with the weightless V-norm.**
+  Decode (mm_qkv) and prefill both rmsnorm k→v out-of-place when v_norm is on (bit-identical to
+  copy + in-place norm; the block's v_norm step skips those layers). (Spotted wave 3.)
+- **DONE (perf pass, 2026-07-02): llama.cpp A/Bs run (quiet box, CPU `-ngl 0`, llama-bench
+  pp512/tg64 vs our matched driver, ggml-parity fast-math).** gemma-4-12B: prefill us 75-80 t/s
+  vs llama.cpp 74.4±0.5 (parity to +5%); decode us ~7.3 vs 8.74 (~84% — the remaining decode gap
+  is the next lever). gpt-oss-20b: prefill us ~219 vs 117 (~1.9× FASTER — the grouped MoE GEMM);
+  decode us ~19 vs ~39-42 (~0.47× — exactly the MXFP4→Q8 doubled expert-weight-traffic asymmetry
+  quantified: the native-MXFP4/Q4_0 entry below is now the headline gpt-oss decode lever).
+  POST-JOBQUE (#3361 wake propagation + batch dispatch + worker spin, same-window anchors):
+  12B decode 7.3 → 7.9 t/s vs 8.63 (gap 84% → ~92%); gpt-oss decode 19.2 → 22.0 vs 39.9
+  (0.47× → 0.55×) — the dispatch-latency share of the decode gap is banked; what remains on
+  gpt-oss is the weight-format asymmetry. (Spotted waves 3/5.)
+- **DONE (perf pass, 2026-07-02): MoE prefill runs expert-bucketed grouped GEMMs — bit-exact.**
+  `ffn_moe_prefill_grouped` routes every position (one batched router GEMM + the shared
+  `moe_select`), CSR-buckets the (position, slot) pairs by expert, runs one batched GEMM chain
+  per touched expert off a single whole-batch requant, and reduces the parked outputs in exactly
+  the decode accumulation order (k slots then shared expert) — so it is bit-identical to the
+  per-position path: the batch GEMM/requant/gate kernels are bit-for-bit their single-token
+  forms per row. Proven on both MoE models (all logits identical after a 300-token prefill,
+  grouped vs reference) and pinned by the qwen2moe fixture running through BOTH paths
+  (`set_moe_grouped_prefill` A/B). Decode unchanged (one token = no bucketing win).
+  Measured (M1 Max, interleaved in-process A/B): Qwen1.5-MoE 512-tok prefill 31 → ~270 t/s
+  (~8.7×); gpt-oss-20b 256-tok prefill 27 → ~186 t/s (~6.8×). (Spotted wave 4.)
+- **DONE (perf pass, 2026-07-02): MoE decode re-quantized the same activation per expert.**
+  `moe_ffn_core` now quantizes xb once per layer into dedicated `moe_xq/moe_xs` (the
+  down-projections quantize s.hb into the shared xq/xs, which would clobber a hoisted image
+  there) and routes every gate/up matmul through `mm_at_q8_pre`. Bit-identical (same quants).
+  (Spotted wave 4.)
+- **DONE (MXFP4 arc, 2026-07-02): native-MXFP4 expert stacks + repacked TBL/SDOT kernels + the
+  MoE dispatch fuse.** Was: gpt-oss-20b's 4.25-bit expert stacks ran as Q8 (2× resident, 2×
+  decode traffic). Now: the stacks stay as raw nibble + E8M0 planes (mxq/mxs, exact disk bits —
+  the old dequant→requant amax error is gone), decoded in-register by new aarch64_neon
+  intrinsics (tbl16_lo/tbl16_hi = vqtbl1q_s8 of the doubled-e2m1 LUT; sdot4_w / sdot4_laneq_w
+  take the tbl result as a VALUE) through dot_mx4q8 ([tuned], row-major) and dot_mx4q8_laneq4
+  (interleaved 4-row repack, the block_mxfp4x4 twin). Grouped prefill expands each touched
+  expert to EXACT Q8 (lossless: q = LUT int, scale = e8m0_half), writing the interleaved form
+  directly on a repack backend; short prompts route per-position (npos·k ≥ 8·n_expert guard).
+  On top, the MoE decode dispatch fuse: region-list groupn/groupn_mx4 kernels run all k
+  experts' gates (ups, downs) in ONE fork/join — 288 → ~72 mm dispatches/token, bit-exact.
+  Measured (QUIET box, 2026-07-02, same-window anchors): decode 22.0 → **31.8 t/s** @ ctx 8
+  (30.7 @ ctx 512) vs llama-bench tg64 41.1 — **0.55× → 0.77×**; per-op profile: mm_moe 50%
+  measured vs 47.9% theoretical share (the 66/66 format asymmetry is GONE), MoE mms sustain
+  ~77GB/s vs the dense mms' ~99 (the remaining MoE-efficiency gap = the next lever); 12B decode
+  7.98 vs anchor 8.67 (92%, unchanged — dense path untouched); resident 26 → 13.2GB; every
+  fixture token-for-token unchanged (no refreeze — the counting fixtures absorbed all
+  kernel-order changes). Cost paid: gpt-oss pp512 ~186 → ~121-149 t/s (the per-expert
+  expansion) vs llama.cpp's 119.9 — still ≥ parity; the native mx4 batch GEMM in the expansion
+  entry below reclaims it. (Spotted wave 5; the Q4_0 halfway house was skipped — native landed
+  directly.)
+- **q4 has no batched prefill kernel — prefill collapses to decode rate.** The q4 path serves
+  everything through the scalar fp32-activation `dot_q4`/`matmul_q4` (no q8-style token-blocked
+  batch GEMM, no NEON arm, no repack backend), so a q4 prefill runs at generation speed:
+  measured on SmolLM2-135M, q8 prefill 1391 t/s vs q4 prefill 70 t/s ≈ its own 69 t/s decode.
+  A q4 batch kernel (or the load-time q4→q8 transcode as the cheap fix) closes it.
+  (Spotted tutorials wave.) **LOW PRIORITY (2026-07-02):** the path is cold — every model we
+  test/ship parity for is Q8_0 on disk (plus gpt-oss MXFP4→Q8); no Q4_0 GGUF anywhere in the
+  fixture set. q4 only fires when a user opts into `QuantMode q4` for footprint. Priority rises
+  only if the MXFP4→Q4_0 halfway house above lands (q4 becomes the resident format of a real
+  20B model).
+- **LOW PRIORITY: f32 projection GEMM is untiled — dot-per-token, no token block.**
+  `matmul_batch` (dasllama_math.das) is the exact pre-#3315 shape the Q8 path had: weight-
+  stationary nest with one horizontal-reduce `dot()` per (row, token), zero register reuse
+  across rows/tokens, and no L2 token-blocking (long-prefill X re-streams from DRAM per weight
+  row). The SDOT-era fix transfers verbatim since it's dtype-agnostic: a 4-row × 4-token
+  register tile with float4 `mad` chains and per-tile reduces (the fp32 twin of
+  `dot_q8q8_sdot4x4` — keeps W row-major, no repack, decode GEMV untouched; do NOT reuse the
+  broadcast-A `gemm_f32` form, it needs a transposed W copy) plus an `effective_token_block`
+  at ~¼ the Q8 block (fp32 activations are 4× fatter). Expected kernel win ~2-3.5× (what the
+  attention tile measured), ceiling below Q8 (fmla = 4 MACs/instr vs SDOT 16; 4B/weight vs
+  ~1.06B). LOW because the f32 arm only fires for f32 GGUF tensors — in practice the tiny
+  teaching models; attention's fp32 GEMMs already have the register tile (`gemm_f32_uk_4x16`).
+  (Spotted post-#3354, 2026-07-02.)
+- **DONE (perf pass, 2026-07-02): `kv_cache_off` prefix-summed per call.** `Model.kv_row_prefix`
+  (filled by layout_offsets, seq_len-independent) × the LIVE seq_len at call time — the O(1)
+  Model overload serves both hot call sites; the Config walking form stays as the definitional
+  reference. (Spotted post-wave-3 review, per Copilot on #3346.)
+- **DONE (perf pass, 2026-07-02): decode attention threads over heads — crossover measured,
+  default re-set.** `attention_std_decode` maybe_parallel_fors the head loop (disjoint per-head
+  rows ⇒ bit-exact vs inline, gated by test_forward), behind `g_decode_attn_par_threshold`
+  (profile `runtime.decode_attn_par_threshold`). Quiet-box sweep (M1 Max, inline-vs-threaded
+  interleaved at 32..2048 ctx on Llama-3.2-1B and gemma-4-12B): crossover at ~200-260K work on
+  BOTH; below it threading costs ≤2%, above it wins reach +74% (1B) / +89% (12B) at 2048 ctx —
+  the derived 4M default was ~15× too conservative (the 12B ran inline below ctx 512). Default
+  is now the measured 262144. (Spotted tune audit, 2026-07-02.)
+- **LOW PRIORITY: `sample_` top-k is O(top_k × vocab) scalar selection.** Each of the top_k
+  rounds rescans the whole vocab (dasllama_common.das sample_) — top_k=40 on gemma-4's 262144
+  vocab is ~10M compares per sampled token. Cold today (SamplingParams defaults are greedy /
+  top_k=0, and all parity fixtures are greedy), but it's the sampling path the tutorials teach.
+  Fix = single-pass partial selection (bounded min-heap of size top_k, or threshold-and-count).
+  (Spotted tune audit, 2026-07-02.)
+- **DONE (MXFP4 arc follow-up, 2026-07-02): the mm_moe bandwidth-gap profile + the bias fold.**
+  Iso-benched the exact decode dispatch shape (4× [2880 x 2880] regions, DRAM-rotating):
+  the fused mx4 groupn GEMV sustains **~101 GB/s — bandwidth parity with the q8 dense kernels**
+  (the "77 GB/s" in-decode reading was largely single-window wobble: same build re-measured
+  90 GB/s an hour later; METHOD: only round-robin interleaved cells within one process are
+  trustworthy on this box, single-window absolutes swing ±10-15%). The pre-fuse 4×1 dispatch
+  shape measures 63-72 GB/s — the dispatch fuse was worth ~30% and is confirmed load-bearing.
+  Follow-up landed: **expert bias vectors fold into the groupn workers' stores** (bp/boffs on the
+  groupn contract; bit-identical to the post-pass add_bias, minus its serial ~36us/layer) —
+  decode 34.7 → **35.2 t/s @ ctx 8 / 33.8 @ ctx 512** (llama.cpp same-window anchor 41.1 →
+  0.86×). Also swept: decode-attn threshold 0-vs-262144 under the spinner at ctx 8/512 —
+  a WASH at both depths (the low-ctx attention is memory-latency-bound; threading's dispatch
+  cost ≈ its serial cost), so the measured default stands; moe_reduce/rope threading rejected
+  (~8us/layer each, below dispatch cost). What remains vs llama.cpp is their continuous-polling
+  threadpool (the bus never idles between ops) — picked up by the x64 arc's jobque work, not
+  patchable here. (Profiling session, 2026-07-02.)
+- **MXFP4 grouped prefill pays a per-touched-expert Q8 expansion (~120MB of traffic each, half of
+  it the repack scratch copy).** `expand_mx4_region_q8` writes exact row-major Q8 then runs the
+  load-time `repack_q8q8_weight` (temp copy + interleave) so the laneq batch GEMM applies. Levers,
+  in effort order: (a) expand DIRECTLY into the interleaved layout (folds the repack's copy away —
+  needs a backend-provided expand-repack, not a layout hardcode in common); (b) a native MXFP4
+  batch GEMM (mx4 twin of the laneq 4x4 tile — halves the GEMM's weight streaming too, likely wins
+  outright); (c) the `npos * k >= 8 * n_expert` tiny-batch guard is an ESTIMATED breakeven
+  (4-tok-prompt ttft 1895ms -> 114ms) — sweep it when the mx4 A/B rig exists. (Spotted MXFP4 arc,
+  2026-07-02.)
+- **Flash-attention tile shape is a frozen compile-time constant — deferred x64 tuning axis.**
+  `ATTN_FLASH_QT/KV = 64×64` (dasllama_common.das) was chosen on M1 and never swept; tile shape
+  is the classic per-box cache parameter, and x64's small private L2 differs in kind from M1's
+  big shared L2. QT is compile-time-coupled to the `float[64]` running max/sum fixed arrays and
+  the fa_* scratch sizing, so this is a compile-time axis à la `[tuned]` (profile-keyed), not a
+  runtime setter. DEFERRED until an x64 box exists to measure on — do not solve the coupling
+  speculatively. (Spotted tune audit, 2026-07-02.)
+- **DONE (perf pass, 2026-07-02): decode-path micros.** (a) `forward_prefill` no longer sizes
+  `att_b` in flash mode (flash packs into the fa_* tiles instead). (b) Decode `layer_out_scale`
+  and the embedding-row copy now use `scale_inplace`/`copy_floats`. The MoE weighted accumulate
+  deliberately STAYS a plain loop — `axpy`'s fused-FMA kernel would perturb the frozen fixtures
+  for a negligible win. (Spotted tune audit, 2026-07-02.)
 
 ## What collapsed (done — Phase 5)
 

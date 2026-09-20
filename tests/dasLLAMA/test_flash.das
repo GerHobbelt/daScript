@@ -1,4 +1,6 @@
 options gen2
+options persistent_heap   // + explicit deletes below: each test frees its model/session before the next loads, so multi-GB weights never accumulate in the process
+options stack = 65536   // dastest harness + forward chain + by-value Session sits near the default 16KB; 4x headroom (test_sampling does the same)
 
 require dastest/testing_boost public
 require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration; requiring dasllama_common directly would drop them
@@ -6,14 +8,20 @@ require dasllama/dasllama_tokenizer
 require daslib/jobque_boost
 require daslib/fio
 require math
+require dasllama/dasllama_math  // setup_dasllama_jobque_ + the runtime knob setters (engine-level, not re-exported)
 
 // Flash prefill attention is online-softmax (NOT bit-exact vs classic — the FP sums reorder), so it
 // is gated on (a) the predicted next token matching classic on a confident prompt and (b) the full
 // logit vector staying within a small relative tolerance of classic. The token-for-token oracle for
 // flash is covered by test_parity / test_forward, which run through flash as the default mode.
 // Needs llama2.c's stories15M.bin (gitignored); skips cleanly when absent.
-let MODEL_PATH = "/Users/borisbatkin/Work/llama2.c/stories15M.bin"
-let TOKENIZER_PATH = "/Users/borisbatkin/Work/llama2.c/tokenizer.bin"
+// override the machine-local llama2.c checkout with DASLLAMA_LLAMA2C_DIR (e.g. on the x64 handoff box)
+def private llama2c_dir() : string {
+    let env = get_env_variable("DASLLAMA_LLAMA2C_DIR")
+    return empty(env) ? "/Users/borisbatkin/Work/llama2.c" : env
+}
+let MODEL_PATH = path_join(llama2c_dir(), "stories15M.bin")
+let TOKENIZER_PATH = path_join(llama2c_dir(), "tokenizer.bin")
 
 def private maxdiff(a, b : array<float>) : float {
     var m = 0.0
@@ -50,7 +58,7 @@ def check_flash(t : T?; tr : Model; prompt : array<int64>; start_pos : int64; co
     let n = int64(length(prompt))
     let REL_TOL = 0.05
     with_job_que() {
-        set_jobque_fork_pool(true, true)
+        setup_dasllama_jobque_()
         set_prefill_attn_mode(AttnPrefillMode.classic)
         var sc <- make_run_state(c)
         for (p in range64(start_pos)) {
@@ -71,6 +79,8 @@ def check_flash(t : T?; tr : Model; prompt : array<int64>; start_pos : int64; co
         if (confident) {
             t |> success(argmax(sf.logits) == argmax(sc.logits), "flash predicts the same next token as classic")
         }
+        delete sc
+        delete sf
     }
 }
 
@@ -94,9 +104,11 @@ def test_flash_fp32(t : T?) {
             t |> success(true, "skipped: stories15M.bin not present")
             return
         }
-        let tr <- load_checkpoint(MODEL_PATH)
-        let tk <- load_tokenizer(TOKENIZER_PATH, tr.config.vocab_size)
+        var tr <- load_checkpoint(MODEL_PATH)
+        var tk <- load_tokenizer(TOKENIZER_PATH, tr.config.vocab_size)
         run_all(t, tr, tk)
+        delete tk
+        delete tr
     }
 }
 
@@ -113,7 +125,7 @@ def test_flash_q8(t : T?) {
         }
         var tr <- load_checkpoint(MODEL_PATH)
         quantize_weights(tr)
-        let tk <- load_tokenizer(TOKENIZER_PATH, tr.config.vocab_size)
+        var tk <- load_tokenizer(TOKENIZER_PATH, tr.config.vocab_size)
         run_all(t, tr, tk)
         // exercise the flash sliding-window key-range bounds (Gemma2-style SWA)
         var trs <- load_checkpoint(MODEL_PATH)
@@ -121,5 +133,8 @@ def test_flash_q8(t : T?) {
         trs.config.sliding_window = 8l
         let lng <- [for (i in range64(200l)); i % 200l + 1l]
         check_flash(t, trs, lng, 0l, false)
+        delete tk
+        delete tr
+        delete trs
     }
 }

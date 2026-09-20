@@ -33,7 +33,7 @@ var LINK_WHOLE_LIB = false // when true, standalone exe links against the whole 
 // invalidates cached DLLs (e.g. edits to llvm_jit.das, llvm_macro.das, llvm_jit_common.das,
 // runtime helper ABI, default target triple). Cache filenames fold this in, so a bump
 // makes every previously written DLL miss the cache on the next run and get GC'd.
-let LLVM_JIT_CODEGEN_VERSION : uint64 = 0x2ful   // uwtable on all emitted functions (EH through JIT frames)
+let LLVM_JIT_CODEGEN_VERSION : uint64 = 0x34ul   // x64_avx dot32/dot32_ps/dot32_acc8 family + aarch64 sdot4_laneq_w/tbl16 (two arcs merged; 0x34 sits above both lineages' 0x31-0x33)
 
 let JIT_FNV_PRIME : uint64 = 1099511628211ul
 
@@ -130,6 +130,9 @@ def jit_dll_basename(funcs : array<FunctionPtr>; opt_level : int; size_level : i
     // EH hosts get uwtable on every function, longjmp hosts don't — a table-less DLL
     // cached by a longjmp host must never cache-hit on an EH host (panic would crash).
     h = (h ^ (das_is_exceptions_enabled() ? 1ul : 0ul)) * JIT_FNV_PRIME
+    // AVX2 gates the x64 intrinsic table (g_target_x64_avx2): a DLL jitted with AVX2 emission must
+    // never cache-hit on an AVX2-less host sharing the cache dir (illegal instruction), and vice versa.
+    h = (h ^ (cpu_supports("avx2") ? 1ul : 0ul)) * JIT_FNV_PRIME
     return "{h}"
 }
 
@@ -423,8 +426,8 @@ def public run_jit(prog : Program?; var ctx : Context?) : bool {
             if (gen_wasm) {
                 mkdir_rec(dir_name(output_path))
                 // path_to_linker is reused as the optional emcc override
-                // for the wasm link (mirrors how it's used for clang-cl
-                // on the host path).
+                // for the wasm link (mirrors how it's used for the host
+                // linker, lld-link/clang/c++, on the host path).
                 write_wasm(g_mod, output_path, target_triple, path_to_linker, jit_has_externals, runtime_lib_override, emit_object)
             } elif (gen_exe) {
                 mkdir_rec(dir_name(output_path))

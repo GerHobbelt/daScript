@@ -1,7 +1,8 @@
 options gen2
+options persistent_heap   // + explicit deletes below: each test frees its model/session before the next loads, so multi-GB weights never accumulate in the process
 
 require dastest/testing_boost public
-require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration; requiring dasllama_common directly would drop them
+require dasllama/dasllama   // the public facade — public-path tests exercise the API through it (engine + arch registrations + chat)
 require dasllama/dasllama_tokenizer
 require dasllama/dasllama_bpe
 require daslib/fio
@@ -10,7 +11,11 @@ require daslib/fio
 // exactly what a caller writes today against the raw backend — so migrating onto it is a no-op.
 // GGUF models are gitignored multi-GB files; each case skips cleanly when its model is absent.
 
-let MODELS_DIR = "/Users/borisbatkin/Work/llama.cpp/models/"
+// override the machine-local model root with DASLLAMA_MODELS_DIR (e.g. on the x64 handoff box)
+def private models_dir() : string {
+    let env = get_env_variable("DASLLAMA_MODELS_DIR")
+    return empty(env) ? "/Users/borisbatkin/Work/llama.cpp/models/" : env
+}
 
 def private same(a, b : array<int64>) : bool {
     if (length(a) != length(b)) {
@@ -43,35 +48,38 @@ def test_spm_encode_respects_model_bos_eos(t : T?) {
 [test]
 def test_facade_spm(t : T?) {
     t |> run("SPM facade auto-dispatch matches raw SentencePiece") @(t : T?) {
-        let path = "{MODELS_DIR}tinyllama-1.1b-chat-v1.0.Q8_0.gguf"
+        let path = path_join(models_dir(), "tinyllama-1.1b-chat-v1.0.Q8_0.gguf")
         if (!stat(path).is_valid) {
             t |> success(true, "skipped: {path} not present")
             return
         }
-        let v <- load_tokenizer_auto(path)
-        let raw <- load_tokenizer_gguf(path)
+        var v <- load_tokenizer_auto(path)
+        var raw <- load_tokenizer_gguf(path)
         let text = "Once upon a time"
         let ok = (v.kind == TokKind.spm &&
             same(encode(v, text, true, false), encode(raw, text, true, false)) &&
             same(encode(v, text, false, false), encode(raw, text, false, false)))
         t |> success(ok, "spm dispatch + encode parity (with/without BOS)")
+        delete raw
+        delete v
     }
 }
 
 [test]
 def test_facade_bpe(t : T?) {
     t |> run("BPE facade auto-dispatch matches raw byte-level BPE") @(t : T?) {
-        let path = "{MODELS_DIR}Qwen2.5-0.5B-Instruct-Q8_0.gguf"
+        let path = path_join(models_dir(), "Qwen2.5-0.5B-Instruct-Q8_0.gguf")
         if (!stat(path).is_valid) {
             t |> success(true, "skipped: {path} not present")
             return
         }
-        let v <- load_tokenizer_auto(path)
-        let raw <- load_bpe_tokenizer_gguf(path)
+        var v <- load_tokenizer_auto(path)
+        var raw <- load_bpe_tokenizer_gguf(path)
         let text = "Once upon a time"
-        // add_special=false is exactly bpe_encode; add_special=true prepends bos_id (when present)
+        // add_special=false is exactly bpe_encode; add_special=true prepends bos_id only when the
+        // model wants one (tokenizer.ggml.add_bos_token / per-pre default — Qwen ships false)
         var want : array<int64>
-        if (raw.bos_id >= 0l) {
+        if (raw.bos_id >= 0l && raw.add_bos) {
             want |> push(raw.bos_id)
         }
         want |> push_from(bpe_encode(raw, text))
@@ -81,18 +89,20 @@ def test_facade_bpe(t : T?) {
             same(encode(v, text, true, false), want) &&
             decode(v, ids) == text)   // byte-level BPE round-trips ASCII exactly
         t |> success(ok, "bpe dispatch + encode/decode parity")
+        delete raw
+        delete v
     }
 }
 
 [test]
 def test_facade_model(t : T?) {
     t |> run("load_model owns the tokenizer; model facade delegates") @(t : T?) {
-        let path = "{MODELS_DIR}Qwen2.5-0.5B-Instruct-Q8_0.gguf"
+        let path = path_join(models_dir(), "Qwen2.5-0.5B-Instruct-Q8_0.gguf")
         if (!stat(path).is_valid) {
             t |> success(true, "skipped: {path} not present")
             return
         }
-        let m <- load_model(path, QuantMode.q8)
+        var m <- load_model(path, QuantMode.q8)
         let text = "Hello, world"
         let via_model <- encode(m, text, true, false)
         let via_tok <- encode(m.tok, text, true, false)
@@ -101,5 +111,6 @@ def test_facade_model(t : T?) {
             same(via_model, via_tok) &&
             piece(m, last) == piece(m.tok, last))
         t |> success(ok, "model.tok populated + encode/piece delegate")
+        delete m
     }
 }

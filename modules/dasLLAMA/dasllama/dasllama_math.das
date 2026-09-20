@@ -107,7 +107,67 @@ def copy_floats(var d : float?; s : float const?; n : int64) {}
 // n*d above this -> split the output rows across worker threads. Below it, the per-call
 // job-dispatch overhead (~90us) dwarfs the gain, so stay single-thread. (Measured on M1 Max:
 // classifier 32000x288 = 9.2M threads to ~2x; ffn 768x288 = 0.22M would be ~5x slower.)
-let MATMUL_PAR_THRESHOLD = 2_000_000l
+// Runtime knob: the crossover tracks the box's job-dispatch latency and core count, not the kernel.
+var g_matmul_par_threshold = 2_000_000l
+def public set_matmul_par_threshold(v : int64) { g_matmul_par_threshold = max(v, 0l) }
+def public get_matmul_par_threshold() : int64 { return g_matmul_par_threshold }
+
+// Spin-before-park window for the jobque workers (see setup_dasllama_jobque). Runtime knob:
+// the useful window tracks the box's serial-gap lengths and burn tolerance, not the kernel.
+// 30ms covers the between-call gaps of a decode/prefill dispatch loop (with main-steal +
+// join-poll the workers stay hot through a whole token instead of parking between matmuls).
+var g_jobque_spin_us = 30000l
+def public set_jobque_spin_us(v : int64) { g_jobque_spin_us = max(v, 0l) }
+def public get_jobque_spin_us() : int64 { return g_jobque_spin_us }
+
+// Join-poll level for fork/join joins (see setup_dasllama_jobque) — ggml's --poll denomination:
+// level*1024*128 relax-rounds on the joining thread before it parks (0 = park immediately).
+// 50 is ggml's shipped default; the poll burns only the calling thread and is bounded (~100ms).
+var g_jobque_join_poll = 50l
+def public set_jobque_join_poll(v : int64) { g_jobque_join_poll = max(v, 0l) }
+def public get_jobque_join_poll() : int64 { return g_jobque_join_poll }
+
+//! Configure the job queue for dasLLAMA's pure fork/join matmul dispatch: pooled fork contexts,
+//! batched dispatch, the spin-before-park window (box_profile.json "runtime" `jobque_spin_us`
+//! overrides the shipped 30000us; 0 disables the spin), and the join-poll level ("jobque_join_poll",
+//! shipped 50 = ggml's default; 0 parks). Call INSIDE `with_job_que` (or after `create_job_que`) —
+//! the queue must exist, which is why apply_box_profile_runtime cannot apply these knobs itself
+//! (load_model may run outside a queue, same as the advisory "threads").
+//! Engine spelling — the facade re-exports it as `setup_dasllama_jobque`.
+def setup_dasllama_jobque_() {
+    set_jobque_fork_pool(true, true)
+    set_jobque_batch_dispatch(true)
+    set_jobque_worker_spin(int(min(g_jobque_spin_us, 2147483647l)))
+    set_jobque_join_spin(int(min(g_jobque_join_poll, 2147483647l)))
+}
+
+// Chunks-per-hw-job for the quantized matmuls' row split (the fp32 kernels use 1). Q8's
+// dequant-in-dot is compute-bound and balances better at 2 chunks/job; Q4's heavy nibble
+// unpack at 4 (both measured M1 Max). Per-box knobs; clamped to >= 1.
+var g_q8_chunks_per_job = 2
+var g_q4_chunks_per_job = 4
+def public set_q8_chunks_per_job(v : int) { g_q8_chunks_per_job = max(v, 1) }
+def public get_q8_chunks_per_job() : int { return g_q8_chunks_per_job }
+def public set_q4_chunks_per_job(v : int) { g_q4_chunks_per_job = max(v, 1) }
+def public get_q4_chunks_per_job() : int { return g_q4_chunks_per_job }
+
+// Oversplit factor for the quantized BATCH matmuls (prefill GEMM): chunks = hw_jobs * this.
+// More chunks than workers lets awake workers pop a late-woken worker's remaining chunks off the
+// fifo, so a straggler strands one small chunk instead of a whole 1/K row range (measured on the
+// 3990X @32 workers: fork/join bill -41% -> -15% at x4; x8 is past the per-chunk-overhead knee).
+var g_q8_batch_chunks_per_job = 4
+def public set_q8_batch_chunks_per_job(v : int) { g_q8_batch_chunks_per_job = max(v, 1) }
+def public get_q8_batch_chunks_per_job() : int { return g_q8_batch_chunks_per_job }
+
+// Dispatch lanes for a fork/join chunk split: the worker threads PLUS the calling thread, which
+// serves chunks too (team mode by design; fifo via the dispatcher work-steal). Chunk counts sized
+// to workers alone leave the last wave short — 7 workers x4 = 28 chunks on 8 lanes = 87.5%
+// utilization; sizing to lanes took the decode GEMV from ~109 to ~118 GB/s on M1 Max, llama.cpp's
+// exact repack-path rate (bench_gemv_decode). Knob for A/B: false = the old workers-only split.
+var g_dispatch_caller_lane = true
+def public set_dispatch_caller_lane(v : bool) { g_dispatch_caller_lane = v }
+def public get_dispatch_caller_lane() : bool { return g_dispatch_caller_lane }
+def public get_dispatch_lanes() : int { return get_total_hw_jobs() + (g_dispatch_caller_lane ? 1 : 0) }
 
 //! y = W·x — matrix-vector product, the dominant LLM compute kernel.
 //! W is row-major [d rows x n cols], x is [n], y is [d]; each y[i] is one dot
@@ -119,7 +179,7 @@ def matmul(var y : array<float>; w : array<float> | #; x : array<float>; n, d : 
         var yp = addr(y[0])                              // var: stays a writable pointer when captured
         let wp = reinterpret<float const?>(addr(w[0]))   // strip the `#` if w is a view
         let xp = addr(x[0])
-        maybe_parallel_for(n * d >= MATMUL_PAR_THRESHOLD, 0, int(d), get_total_hw_jobs()) $(rb, re) {
+        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), get_dispatch_lanes()) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     yp[i] = dot(wp + int64(i) * n, xp, n)
@@ -138,7 +198,7 @@ def matmul_batch(var y : array<float>; w : array<float> | #; x : array<float>; n
         var yp = addr(y[0])
         let wp = reinterpret<float const?>(addr(w[0]))
         let xp = reinterpret<float const?>(addr(x[0]))
-        maybe_parallel_for(n * d * ntok >= MATMUL_PAR_THRESHOLD, 0, int(d), get_total_hw_jobs()) $(rb, re) {
+        maybe_parallel_for(n * d * ntok >= g_matmul_par_threshold, 0, int(d), get_dispatch_lanes()) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     let wrow = wp + int64(i) * n
@@ -176,8 +236,9 @@ def private gemm_f32_region(var cp : float?; ap, bp : float const?; i0, i1, j0, 
 
 // 4-row × 16-col tile: 16 float4 accumulators, broadcast-A FMA, no horizontal reduce. C += (cols
 // [j0,j0+16) of rows [i0,i0+4)). N is the row stride of C/B; K the row stride / inner dim of A/B.
+// Template public (not private): the tuner harness's cross-module [dasllama_grid] scan must see it.
 [hint(noalias = cp, noalias = ap, noalias = bp)]
-def private gemm_f32_uk_4x16(var cp : float?; ap, bp : float const?; i0, j0, K, N : int64) {
+def template gemm_f32_uk_4x16_template(var cp : float ?; ap, bp : float const ?; i0, j0, K, N : int64) : void {
     unsafe {
         let o0 = (i0 + 0l) * N + j0; let o1 = (i0 + 1l) * N + j0
         let o2 = (i0 + 2l) * N + j0; let o3 = (i0 + 3l) * N + j0
@@ -189,7 +250,7 @@ def private gemm_f32_uk_4x16(var cp : float?; ap, bp : float const?; i0, j0, K, 
         var r2c = *reinterpret<float4?>(cp + o2 + 8l);  var r2d = *reinterpret<float4?>(cp + o2 + 12l)
         var r3a = *reinterpret<float4?>(cp + o3);       var r3b = *reinterpret<float4?>(cp + o3 + 4l)
         var r3c = *reinterpret<float4?>(cp + o3 + 8l);  var r3d = *reinterpret<float4?>(cp + o3 + 12l)
-        for [unroll_count = 2] (kk in range64(K)) {     // ~3% over the rolled loop; same accumulation order
+        for [tune = 1] (kk in range64(K)) {             // fallback u2: ~3% over the rolled loop; same accumulation order
             let bo = kk * N + j0
             let b0 = *reinterpret<float4 const?>(bp + bo);      let b1 = *reinterpret<float4 const?>(bp + bo + 4l)
             let b2 = *reinterpret<float4 const?>(bp + bo + 8l); let b3 = *reinterpret<float4 const?>(bp + bo + 12l)
@@ -212,6 +273,9 @@ def private gemm_f32_uk_4x16(var cp : float?; ap, bp : float const?; i0, j0, K, 
         *reinterpret<float4?>(cp + o3 + 8l) = r3c;  *reinterpret<float4?>(cp + o3 + 12l) = r3d
     }
 }
+
+[hint(noalias = cp, noalias = ap, noalias = bp), tuned(fallback = "u2")]
+def private gemm_f32_uk_4x16(var cp : float?; ap, bp : float const?; i0, j0, K, N : int64) {}
 
 //! Register-tiled fp32 GEMM, C[M x N] += A[M x K] · B[K x N]. 4×16 tile over the bulk; the
 //! L-shaped remainder (cols N%16, rows M%4) falls back to scalar. General over M/K/N. C must be
@@ -273,8 +337,8 @@ def matmul_q8(var y : array<float>; wq : array<int8> | #; ws : array<float> | #;
         let wp = reinterpret<int8 const?>(addr(wq[0]))
         let sp = reinterpret<float const?>(addr(ws[0]))
         let xp = addr(x[0])
-        // 2N (2 chunks per hw job): Q8 dequant-in-dot is compute-bound and threads better than fp32
-        maybe_parallel_for(n * d >= MATMUL_PAR_THRESHOLD, 0, int(d), 2 * get_total_hw_jobs()) $(rb, re) {
+        // default 2 chunks per hw job (knob): Q8 dequant-in-dot is compute-bound and threads better than fp32
+        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), g_q8_chunks_per_job * get_dispatch_lanes()) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     yp[i] = dot_q8(wp + int64(i) * n, sp + int64(i) * nb, xp, n)
@@ -283,6 +347,17 @@ def matmul_q8(var y : array<float>; wq : array<int8> | #; ws : array<float> | #;
         }
     }
 }
+
+// ===== Token-block width (shared, ISA-agnostic) =====
+// Batched-GEMM token-block width: a token-blocked batch kernel (arm64 laneq, x64 grp4) tiles tokens
+// into TB-sized blocks (outer), looping weight groups inside, so a TB×n activation slice stays
+// L2-resident and is reused across a thread's groups instead of re-streaming the whole activation per
+// group. 128 is the tuned default (Llama-3.2-1B, M1 Max — pipeline best-of-5 @2048); exposed as a
+// runtime knob for per-model tuning (larger n wants a smaller TB to stay in L2). Clamped to >= 1:
+// the kernels advance `tb += TB`, so a non-positive block width would never make progress.
+var g_q8_token_block = 128l
+def public set_q8_token_block(tb : int64) { g_q8_token_block = max(tb, 1l) }
+def public get_q8_token_block() : int64 { return g_q8_token_block }
 
 // ===== Token-block L2 budget (shared, ISA-agnostic) =====
 // A token-blocked Q8·Q8 GEMM keeps a TB×n activation slice L2-resident and reuses it across the weight
@@ -301,6 +376,24 @@ def public get_q8_l2_budget() : int64 { return g_q8_l2_budget }
 def public effective_token_block(tb, n : int64) : int64 {
     return clamp(tb, 1l, max(1l, g_q8_l2_budget / max(n, 1l)))   // floor 1 (a 0 block width infinite-loops the kernel)
 }
+
+// ===== dispatch observability (jobs-per-section profiling) =====
+// maybe_parallel_for's macro emits these on every decision; the forward profiler attributes the
+// deltas to its sections, so a side-by-side vs llama.cpp can compare dispatch counts and chunk
+// granularity, not just time. Counters live on the MAIN context (dispatch happens caller-side).
+var g_disp_count = 0l    // parallel_for dispatches taken
+var g_disp_chunks = 0l   // chunks (jobs) pushed across those dispatches
+var g_disp_inline = 0l   // maybe_parallel_for calls that ran inline instead
+def count_parallel_dispatch(njobs : int) {
+    g_disp_count++
+    g_disp_chunks += int64(njobs)
+}
+def count_inline_run() {
+    g_disp_inline++
+}
+def get_disp_count() : int64 => g_disp_count
+def get_disp_chunks() : int64 => g_disp_chunks
+def get_disp_inline() : int64 => g_disp_inline
 
 // ===== Q8·Q8 matmul: pluggable kernel-backend registry =====
 // The three public matmuls (matmul_q8q8 / _batch / _group3) extract raw pointers ONCE in the main
@@ -324,16 +417,42 @@ typedef MatmulQ8Q8Group3Fn = function<(var y0p : float?; var y1p : float?; var y
 // In-place repack of one Q8 weight region [d rows x n cols] (raw pointers at the region start) into
 // the active backend's preferred layout. Default = no-op (row-major). n % 32 == 0.
 typedef RepackQ8Q8Fn = function<(var wp : int8?; var sp : float?; n : int64; d : int64) : void>
+// MXFP4·Q8 GEMV: W kept in its native 4-bit form as two planes — `wn` packed nibbles (16 bytes per
+// 32-block, row stride n/2) + `we` RAW E8M0 scale bytes (1 per block, row stride n/32) — against a
+// pre-quantized Q8 activation. Native half-traffic path for MoE expert stacks (gpt-oss decode).
+typedef MatmulMx4Q8Fn = function<(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n : int64; d : int64) : void>
+// In-place repack of one MXFP4 region [d rows x n cols] (raw plane pointers at the region start)
+// into the active backend's preferred layout. Default = no-op (row-major). n % 32 == 0.
+typedef RepackMx4Fn = function<(var np : uint8?; var ep : uint8?; n : int64; d : int64) : void>
+// Region-list GEMV, ONE dispatch for N same-shape [d x n] projections (the MoE decode fuse: all k
+// routed experts' gates — or ups, or downs — in one fork/join instead of k). `offs` packs PAIRS
+// per region: [2r] = the weight-element offset of region r's rows (into the blob the wp/sp — or
+// wn/we — pointers base), [2r+1] = the activation-element offset (into xqp/xsp; xsp offset =
+// element/32) — so regions may share one activation (gates/ups) or each bring their own (downs).
+// Region r's d outputs land at yp + r*d. A non-null `bp` adds a per-region bias vector at the
+// store — region r's row `row` gets + bp[boffs[r] + row], done by the worker that owns the row
+// (the alternative is a serial caller-side add_bias pass, ~36us/layer on gpt-oss); bit-identical
+// to add-after (same add, same chain point). Bit-exact vs the per-region loop: the same per-row
+// dots, only scheduled in one parallel_for.
+typedef MatmulQ8Q8GroupNFn = function<(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n : int64; d : int64) : void>
+typedef MatmulMx4GroupNFn = function<(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n : int64; d : int64) : void>
 
 //! One kernel backend: the three Q8·Q8 matmul kernels + the weight repack, plus selection metadata.
-//! needs_repack = the kernels read an interleaved weight layout, so the loader must repack first.
+//! needs_repack = the kernels read an interleaved weight layout, so the loader must repack first
+//! (mm_mx4 and repack_mx4 follow the same flag — one layout decision per backend).
 //! priority = higher wins the auto-select (portable 0; arm64 sdot 10 / laneq 20; x64 vnni 20 later).
+//! mm_mx4 = the MXFP4·Q8 GEMV (native 4-bit expert weights); every backend supplies one (the portable
+//! scalar form at minimum) so the mx4 path dispatches exactly like the Q8 one.
 struct KernelBackend {
     name : string
     mm : MatmulQ8Q8Fn
     batch : MatmulQ8Q8BatchFn
     group3 : MatmulQ8Q8Group3Fn
     repack : RepackQ8Q8Fn
+    mm_mx4 : MatmulMx4Q8Fn = @@mx4q8_unset_kernel
+    repack_mx4 : RepackMx4Fn = @@repack_mx4_identity
+    groupn : MatmulQ8Q8GroupNFn = @@q8q8_unset_groupn
+    groupn_mx4 : MatmulMx4GroupNFn = @@mx4q8_unset_groupn
     needs_repack : bool
     priority : int
 }
@@ -343,7 +462,11 @@ struct KernelBackend {
 var g_mm_q8q8 = @@q8q8_unset_kernel
 var g_mm_q8q8_batch = @@q8q8_unset_batch
 var g_mm_q8q8_group3 = @@q8q8_unset_group3
+var g_mm_mx4q8 = @@mx4q8_unset_kernel
+var g_mm_q8q8_groupn = @@q8q8_unset_groupn
+var g_mm_mx4q8_groupn = @@mx4q8_unset_groupn
 var g_repack_q8q8 = @@repack_q8q8_identity   // no-op until a repack backend is selected
+var g_repack_mx4 = @@repack_mx4_identity     // no-op until a repack backend is selected
 
 var g_kernel_backends : table<string; KernelBackend>
 var g_active_backend = ""           // name of the active backend ("" = the unset stub)
@@ -355,6 +478,10 @@ var g_backend_pin = ""              // A/B: force this backend by name; "" = aut
 [unused_argument(wp, sp, n, d)]
 def repack_q8q8_identity(var wp : int8?; var sp : float?; n, d : int64) {}
 
+//! Default MXFP4 repack: no-op — the planes stay row-major for the portable / row-major kernels.
+[unused_argument(np, ep, n, d)]
+def repack_mx4_identity(var np : uint8?; var ep : uint8?; n, d : int64) {}
+
 def private no_backend() {
     panic("dasLLAMA: no Q8·Q8 kernel backend registered — require dasllama/dasllama_math_default")
 }
@@ -364,12 +491,22 @@ def private q8q8_unset_kernel(var yp : float?; wp : int8 const?; sp : float cons
 def private q8q8_unset_batch(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n, d, ntok : int64) { no_backend() }
 [unused_argument(y0p, y1p, y2p, wp, sp, woff0, woff1, woff2, xqp, xsp, n, d0, d1, d2)]
 def private q8q8_unset_group3(var y0p : float?; var y1p : float?; var y2p : float?; wp : int8 const?; sp : float const?; woff0, woff1, woff2 : int64; xqp : int8 const?; xsp : float const?; n, d0, d1, d2 : int64) { no_backend() }
+[unused_argument(yp, wn, we, xqp, xsp, n, d)]
+def private mx4q8_unset_kernel(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n, d : int64) { no_backend() }
+[unused_argument(yp, wp, sp, offs, nregions, xqp, xsp, bp, boffs, n, d)]
+def private q8q8_unset_groupn(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) { no_backend() }
+[unused_argument(yp, wn, we, offs, nregions, xqp, xsp, bp, boffs, n, d)]
+def private mx4q8_unset_groupn(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) { no_backend() }
 
 def private activate(be : KernelBackend) {
     g_mm_q8q8 = be.mm
     g_mm_q8q8_batch = be.batch
     g_mm_q8q8_group3 = be.group3
+    g_mm_mx4q8 = be.mm_mx4
+    g_mm_q8q8_groupn = be.groupn
+    g_mm_mx4q8_groupn = be.groupn_mx4
     g_repack_q8q8 = be.repack
+    g_repack_mx4 = be.repack_mx4
     g_active_backend = be.name
     g_active_needs_repack = be.needs_repack
 }
@@ -449,6 +586,26 @@ def repack_q8q8_weight(var qblob : array<int8>; var qscales : array<float>; woff
     }
 }
 
+//! Repack one native-MXFP4 weight tensor (region at weight-element offset woff in the mxq/mxs
+//! planes, shape [d rows x n cols]) into the active backend's layout, IN PLACE. No-op unless a
+//! repack backend is enabled. n % 32 == 0.
+def repack_mx4_weight(var mxq : array<uint8>; var mxs : array<uint8>; woff, n, d : int64) {
+    unsafe {
+        invoke(g_repack_mx4, addr(mxq[woff / 2l]), addr(mxs[woff / 32l]), n, d)
+    }
+}
+
+//! Does backend `name` read an interleaved (repacked) weight layout? false for unknown names.
+//! Lets tests / direct callers skip layout-mismatched A/Bs (a repack backend cannot run on
+//! row-major buffers).
+def kernel_backend_needs_repack(name : string) : bool {
+    var r = false
+    g_kernel_backends |> get(name) $(be) {
+        r = be.needs_repack
+    }
+    return r
+}
+
 //! Q8·Q8 matmul: y = W·x with W as int8 quants `wq` [d x n] + scales `ws` [d x n/32] and the
 //! activation PRE-quantized to (xq [n], xs [n/32]) by the caller (it's shared across all d rows, so
 //! quantizing once amortizes). Dispatches to the active backend (g_mm_q8q8). n % 32 == 0.
@@ -488,13 +645,96 @@ def matmul_q8q8_group3(var y0 : array<float>; var y1 : array<float>; var y2 : ar
     }
 }
 
-//! Q4_0 dequant-in-dot: weights are 4-bit quants `wq` in GGML split-half packing (per 32-block,
-//! byte j holds element j low / j+16 high) + one fp32 scale `ws` per block; activations `x` fp32.
-//! Per block: the inner for[vectorize] widens nibbles to float at width 4 (M1 native NEON lane —
-//! the heavy Q4 unpack loses ~7% at width 8 from cross-lane shuffles), then one scaled reduce per
-//! block. This won the kernel bench (see matmul_variants). n must be a multiple of 32.
+// ===== MXFP4·Q8: native 4-bit weights (MoE expert stacks) =====
+// A 32-elem MXFP4 block is 16 packed nibble bytes (low nibble = elem j, high = elem j+16) + one RAW
+// E8M0 scale byte, held in two separate planes so the nibble stream is 16-byte-regular for TBL. The
+// nibbles index the DOUBLED e2m1 table (ggml kvalues_mxfp4); the scale byte converts via e8m0_half
+// (2^(e-128), the half compensating the doubling). Kernels dispatch through g_mm_mx4q8 exactly like
+// the Q8 ones.
+
+//! E8M0 scale byte -> fp32 * 0.5 = 2^(e-128) — pairs with the DOUBLED e2m1 nibble values
+//! (mxfp4_fill_lut). e < 2 lands in fp32-denormal territory -> precomputed bit patterns (mirrors
+//! ggml_e8m0_to_fp32_half; dasllama_gguf keeps a private twin so the generic GGUF reader stays
+//! dependency-free).
+def e8m0_half(e : uint) : float {
+    let bits = e < 2u ? (0x00200000u << e) : ((e - 1u) << 23u)
+    return unsafe(reinterpret<float>(bits))
+}
+
+//! Fill a 16-byte LUT with the MXFP4 e2m1 magnitudes DOUBLED (nibble -> ±{0,.5,1,1.5,2,3,4,6}×2,
+//! OCP MX spec via ggml kvalues_mxfp4) as int8 — the table `tbl16_lo`/`tbl16_hi` and the scalar
+//! kernels index; the halved E8M0 scale (e8m0_half) compensates.
+def mxfp4_fill_lut(var lut : int8[16]) {
+    let kv = fixed_array(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12)
+    for (i in range(16)) {
+        lut[i] = int8(kv[i])
+    }
+}
+
+//! MXFP4·Q8 GEMV: y = W·x with W native 4-bit — `wn` packed nibbles [d x n/2 bytes] + `we` raw E8M0
+//! scale bytes [d x n/32] — and the activation PRE-quantized to (xq [n], xs [n/32]) by the caller.
+//! Dispatches to the active backend (g_mm_mx4q8). n % 32 == 0.
+def matmul_mx4q8(var y : array<float>; wn : array<uint8> | #; we : array<uint8> | #; xq : array<int8>; xs : array<float>; n, d : int64) {
+    unsafe {
+        invoke(g_mm_mx4q8, addr(y[0]),
+            reinterpret<uint8 const?>(addr(wn[0])), reinterpret<uint8 const?>(addr(we[0])),
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d)
+    }
+}
+
+//! Region-list Q8·Q8 GEMV: ONE dispatch for `nregions` same-shape [d x n] projections (see the
+//! MatmulQ8Q8GroupNFn doc for the packed `offs` pairs). wq/ws are the WHOLE blob (offsets are
+//! absolute); xq/xs hold the activation row(s) the offs pairs index. Region r -> y[r*d .. r*d+d).
+def matmul_q8q8_groupn(var y : array<float>; wq : array<int8> | #; ws : array<float> | #; offs : array<int64>; nregions : int64;
+                       xq : array<int8>; xs : array<float>; n, d : int64) {
+    unsafe {
+        invoke(g_mm_q8q8_groupn, addr(y[0]),
+            reinterpret<int8 const?>(addr(wq[0])), reinterpret<float const?>(addr(ws[0])),
+            reinterpret<int64 const?>(addr(offs[0])), nregions,
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
+            null, null, n, d)
+    }
+}
+
+//! Biased form: adds bias[boffs[r] + row] at the store (see the MatmulQ8Q8GroupNFn doc).
+def matmul_q8q8_groupn(var y : array<float>; wq : array<int8> | #; ws : array<float> | #; offs : array<int64>; nregions : int64;
+                       xq : array<int8>; xs : array<float>; bias : array<float> | #; boffs : array<int64>; n, d : int64) {
+    unsafe {
+        invoke(g_mm_q8q8_groupn, addr(y[0]),
+            reinterpret<int8 const?>(addr(wq[0])), reinterpret<float const?>(addr(ws[0])),
+            reinterpret<int64 const?>(addr(offs[0])), nregions,
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
+            reinterpret<float const?>(addr(bias[0])), reinterpret<int64 const?>(addr(boffs[0])), n, d)
+    }
+}
+
+//! Region-list MXFP4·Q8 GEMV — the native-4-bit twin of matmul_q8q8_groupn (offsets in weight
+//! elements into the whole nibble/scale planes; the kernels derive the /2 and /32 byte positions).
+def matmul_mx4q8_groupn(var y : array<float>; wn : array<uint8> | #; we : array<uint8> | #; offs : array<int64>; nregions : int64;
+                        xq : array<int8>; xs : array<float>; n, d : int64) {
+    unsafe {
+        invoke(g_mm_mx4q8_groupn, addr(y[0]),
+            reinterpret<uint8 const?>(addr(wn[0])), reinterpret<uint8 const?>(addr(we[0])),
+            reinterpret<int64 const?>(addr(offs[0])), nregions,
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
+            null, null, n, d)
+    }
+}
+
+//! Biased form: adds bias[boffs[r] + row] at the store (see the MatmulQ8Q8GroupNFn doc).
+def matmul_mx4q8_groupn(var y : array<float>; wn : array<uint8> | #; we : array<uint8> | #; offs : array<int64>; nregions : int64;
+                        xq : array<int8>; xs : array<float>; bias : array<float> | #; boffs : array<int64>; n, d : int64) {
+    unsafe {
+        invoke(g_mm_mx4q8_groupn, addr(y[0]),
+            reinterpret<uint8 const?>(addr(wn[0])), reinterpret<uint8 const?>(addr(we[0])),
+            reinterpret<int64 const?>(addr(offs[0])), nregions,
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
+            reinterpret<float const?>(addr(bias[0])), reinterpret<int64 const?>(addr(boffs[0])), n, d)
+    }
+}
+
 [hint(unsafe_range_check, noalias = x, noalias = wq, noalias = ws)]
-def dot_q4(wq : uint8 const?; ws : float const?; x : float const?; n : int64) : float {
+def template dot_q4_template(wq : uint8 const ?; ws : float const ?; x : float const ?; n : int64) : float {
     var acc = 0.0
     let nb = n / 32l
     for (bi in range64(nb)) {
@@ -502,7 +742,7 @@ def dot_q4(wq : uint8 const?; ws : float const?; x : float const?; n : int64) : 
         let bbyte = bi * 16l
         let s = unsafe(ws[bi])
         var bs = 0.0
-        for [vectorize, vectorize_width = 4, unroll_count = 4] (j in range64(16l)) {
+        for [tune = 1] (j in range64(16l)) {
             let byte = int(unsafe(wq[bbyte + j]))
             bs += float((byte & 0x0F) - 8) * unsafe(x[base + j]) + float((byte >> 4) - 8) * unsafe(x[base + 16l + j])
         }
@@ -510,6 +750,14 @@ def dot_q4(wq : uint8 const?; ws : float const?; x : float const?; n : int64) : 
     }
     return acc
 }
+
+//! Q4_0 dequant-in-dot: weights are 4-bit quants `wq` in GGML split-half packing (per 32-block,
+//! byte j holds element j low / j+16 high) + one fp32 scale `ws` per block; activations `x` fp32.
+//! Per block: the inner loop widens nibbles to float at width 4 (M1 native NEON lane — the heavy
+//! Q4 unpack loses ~7% at width 8 from cross-lane shuffles, hence fallback vec4_u4), then one
+//! scaled reduce per block. This won the kernel bench (see matmul_variants). n % 32 == 0.
+[hint(unsafe_range_check, noalias = x, noalias = wq, noalias = ws), tuned(fallback = "vec4_u4")]
+def dot_q4(wq : uint8 const?; ws : float const?; x : float const?; n : int64) : float {}
 
 //! Q4_0 matmul: y = W·x with W as 4-bit quants `wq` [d x n/2 bytes] + per-block scales `ws`
 //! [d x n/32]. Large matmuls thread the output rows at 4 chunks per hw job (4N — the heavy nibble
@@ -522,9 +770,9 @@ def matmul_q4(var y : array<float>; wq : array<uint8> | #; ws : array<float> | #
         let wp = reinterpret<uint8 const?>(addr(wq[0]))
         let sp = reinterpret<float const?>(addr(ws[0]))
         let xp = addr(x[0])
-        // 4N (4 chunks per hw job): the heavy nibble unpack makes each row compute-bound, so finer
+        // default 4 chunks per hw job (knob): the heavy nibble unpack makes each row compute-bound, so finer
         // splitting balances better (esp. the classifier) — more than the compute-light Q8 path.
-        maybe_parallel_for(n * d >= MATMUL_PAR_THRESHOLD, 0, int(d), 4 * get_total_hw_jobs()) $(rb, re) {
+        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), g_q4_chunks_per_job * get_dispatch_lanes()) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     yp[i] = dot_q4(wp + int64(i) * nh, sp + int64(i) * nb, xp, n)
@@ -534,27 +782,33 @@ def matmul_q4(var y : array<float>; wq : array<uint8> | #; ws : array<float> | #
     }
 }
 
-//! RMSNorm — root-mean-square normalization (no mean subtraction, no bias).
-//! o[i] = weight[i] * x[i] / sqrt(mean(x^2) + eps). eps defaults to 1e-5 (Llama-2/3);
-//! Qwen2 / Gemma2 pass 1e-6 from the model's metadata.
-//! Pointer core — the batched prefill norm threads over positions in fork contexts (raw addresses
-//! only). `o`/`x` may alias (in-place post-norms): the sum over x completes before any write to o.
-// noalias only on `weight` — `o` and `x` alias in-place for the Gemma2 post-norms (rms_at(buf,…,buf)).
+// noalias only on `weight` — `o` and `x` alias in-place for the Gemma2 post-norms (rms_at(buf,…,buf)),
+// so a vectorize perm pays a runtime alias check and falls back to scalar exactly when they alias.
 [hint(noalias = weight)]
-def rmsnorm(var o : float?; x : float const?; weight : float const?; size : int64; eps : float = 1.0e-5) {
+def template rmsnorm_template(var o : float ?; x : float const ?; weight : float const ?; size : int64; eps : float = 1.0e-5) : void {
     unsafe {
         var ss = 0.0
-        for (j in range64(size)) {
+        for [tune = 1] (j in range64(size)) {
             ss += x[j] * x[j]
         }
         ss /= float(size)
         ss += eps
         ss = 1.0 / sqrt(ss)
-        for (j in range64(size)) {
+        for [tune = 1] (j in range64(size)) {
             o[j] = weight[j] * (x[j] * ss)
         }
     }
 }
+
+//! RMSNorm — root-mean-square normalization (no mean subtraction, no bias).
+//! o[i] = weight[i] * x[i] / sqrt(mean(x^2) + eps). eps defaults to 1e-5 (Llama-2/3);
+//! Qwen2 / Gemma2 pass 1e-6 from the model's metadata.
+//! Pointer core — the batched prefill norm threads over positions in fork contexts (raw addresses
+//! only). `o`/`x` may alias (in-place post-norms): the sum over x completes before any write to o.
+//! fallback "plain" = the shipped unhinted loops, byte-identical; a box profile can vectorize it
+//! (the square-sum is an fadd reduction, which LLVM vectorizes under the hint — reorders low bits).
+[hint(noalias = weight), tuned(fallback = "plain")]
+def rmsnorm(var o : float?; x : float const?; weight : float const?; size : int64; eps : float = 1.0e-5) {}
 def rmsnorm(var o : array<float> | #; x : array<float> | #; weight : array<float> | #; size : int64; eps : float = 1.0e-5) {
     // reinterpret strips the temporary (#) qualifier — rms_at passes array_view (#) slices. Output `o`
     // keeps a non-const pointer (it's written); the read-only x/weight add const.
@@ -574,7 +828,7 @@ def rmsnorm(var o : array<float> | #; x : array<float> | #; weight : array<float
 //! finite). Two accumulators hide the fmax latency (~9x over scalar). Seeds with x[0] (idempotent) and
 //! never reads past the buffer, so it is safe for n < 8. Returns -FLT_MAX for n <= 0.
 def hmax(x : float const?; n : int64) : float {
-    if (n <= 0l) return -3.4028235e38
+    if (n <= 0l) return -FLT_MAX
     unsafe {
         let pf4 = reinterpret<float4 const?>(x)
         let n8 = n / 8l
@@ -593,28 +847,60 @@ def hmax(x : float const?; n : int64) : float {
     }
 }
 
-//! Pointer core — the threaded prefill attention runs in fork contexts and can only touch raw
-//! addresses; the array overload forwards here, so both are bit-identical. Output `x` is a `var
-//! float?` written in place (a hoisted/captured fork pointer binds directly — no const-strip).
-def softmax(var x : float?; size : int64) {
+def template softmax_template(var x : float ?; size : int64) : void {
     if (size <= 0) return   // seeds the reduction with x[0]; size<=0 must be a no-op (same contract as the array overload)
     unsafe {
         let maxv = hmax(x, size)   // hand-vectorized max reduction (see hmax)
         var sum = 0.0
-        for [vectorize, vectorize_width = 8, unroll_count = 2] (i in range64(size)) {
+        for [tune = 1] (i in range64(size)) {
             let e = exp(x[i] - maxv)
             x[i] = e
             sum += e
         }
         let inv_sum = 1.0 / sum   // scale by the reciprocal (matches ggml_vec_scale_f32), not a per-element /=
-        for [vectorize, vectorize_width = 8, unroll_count = 2] (i in range64(size)) {
+        for [tune = 1] (i in range64(size)) {
             x[i] *= inv_sum
         }
     }
 }
+
+//! Pointer core — the threaded prefill attention runs in fork contexts and can only touch raw
+//! addresses; the array overload forwards here, so both are bit-identical. Output `x` is a `var
+//! float?` written in place (a hoisted/captured fork pointer binds directly — no const-strip).
+[tuned]
+def softmax(var x : float?; size : int64) {}
 def softmax(var x : array<float> | #; size : int64) {
     if (size <= 0) return   // empty array: addr(x[0]) would index out of range; old loop form no-op'd
     softmax(unsafe(addr(x[0])), size)
+}
+
+def template softmax_sink_template(var x : float ?; size : int64; sink : float) : void {
+    if (size <= 0) return
+    unsafe {
+        let maxv = max(hmax(x, size), sink)
+        var sum = 0.0
+        for [tune = 1] (i in range64(size)) {
+            let e = exp(x[i] - maxv)
+            x[i] = e
+            sum += e
+        }
+        sum += exp(sink - maxv)
+        let inv_sum = 1.0 / sum
+        for [tune = 1] (i in range64(size)) {
+            x[i] *= inv_sum
+        }
+    }
+}
+
+//! Softmax with an attention-sink logit (gpt-oss): `sink` joins the max and the denominator as one
+//! extra virtual score with NO value contribution — x sums to sum/(sum+e^(sink-max)) < 1 by design
+//! (ggml soft_max sinks correction). Pointer core + array overload, same contract as softmax.
+//! Shares softmax's loop shape, so the tuner mirrors softmax's winning perm onto its profile key.
+[tuned]
+def softmax_sink(var x : float?; size : int64; sink : float) {}
+def softmax_sink(var x : array<float> | #; size : int64; sink : float) {
+    if (size <= 0) return
+    softmax_sink(unsafe(addr(x[0])), size, sink)
 }
 
 //! Vectorized expf, 4 lanes — ggml_v_expf (ARM optimized-routines): a degree-4 poly on the
@@ -711,6 +997,27 @@ def geglu(var g : array<float> | #; u : array<float> | #; size : int64) {
     geglu(unsafe(addr(g[0])), unsafe(addr(u[0])), size)
 }
 
+// gpt-oss clamped-SwiGLU constants (llama.cpp hardcodes both in build_moe_ffn's SWIGLU_OAI arm)
+let SWIGLU_OAI_ALPHA = 1.702
+let SWIGLU_OAI_LIMIT = 7.0
+
+//! Fused clamped SwiGLU (gpt-oss, ggml_swiglu_oai): x = min(g, 7), y = clamp(u, -7, 7),
+//! g = (x · sigmoid(1.702·x)) · (y + 1). The clamps and the +1 on the up branch are part of the
+//! trained activation, not an optimization. Same fusion contract as swiglu.
+def swiglu_oai(var g : float?; u : float const?; size : int64) {
+    unsafe {
+        for (i in range64(size)) {
+            let x = min(g[i], SWIGLU_OAI_LIMIT)
+            let y = clamp(u[i], -SWIGLU_OAI_LIMIT, SWIGLU_OAI_LIMIT)
+            g[i] = (x / (1.0 + exp(-SWIGLU_OAI_ALPHA * x))) * (y + 1.0)
+        }
+    }
+}
+def swiglu_oai(var g : array<float> | #; u : array<float> | #; size : int64) {
+    if (size <= 0) return
+    swiglu_oai(unsafe(addr(g[0])), unsafe(addr(u[0])), size)
+}
+
 // exp4 valid range (fast-path, no overflow guard) — clamp the exp argument here so an outlier
 // gate value can never feed exp4 out of range (silu saturates to 0/v, gelu to ±1 there anyway).
 let EXP4_LO = float4(-80.0, -80.0, -80.0, -80.0)
@@ -761,6 +1068,32 @@ def geglu4(var g : float?; u : float const?; size : int64) {
         for (i in range64(n4 * 4l, size)) {
             let v = g[i]
             g[i] = (0.5 * v * (1.0 + tanh(kk * (v + 0.044715 * v * v * v)))) * u[i]
+        }
+    }
+}
+
+//! Vectorized fused clamped SwiGLU (gpt-oss), float4 with exp4. A very negative gate makes
+//! -alpha·x large-positive; the EXP4_HI clamp keeps exp4 in range (exp4(80) ≈ 5.5e34 is finite in
+//! fp32 and drives the sigmoid to ~0, matching the true limit). ~2 ulp, NOT bit-exact (scalar
+//! swiglu_oai is the opt-in reference). Tail (<4 elems) runs the scalar form.
+def swiglu_oai4(var g : float?; u : float const?; size : int64) {
+    let one = float4(1.0, 1.0, 1.0, 1.0)
+    let lim = float4(SWIGLU_OAI_LIMIT)
+    let nalpha = float4(-SWIGLU_OAI_ALPHA)
+    unsafe {
+        var g4 = reinterpret<float4?>(g)
+        var u4 = reinterpret<float4 const?>(u)
+        let n4 = size / 4l
+        for (k in range64(n4)) {
+            let x = min(g4[k], lim)
+            let y = clamp(u4[k], -lim, lim)
+            let arg = clamp(nalpha * x, EXP4_LO, EXP4_HI)
+            g4[k] = (x / (one + exp4(arg))) * (y + one)
+        }
+        for (i in range64(n4 * 4l, size)) {
+            let x = min(g[i], SWIGLU_OAI_LIMIT)
+            let y = clamp(u[i], -SWIGLU_OAI_LIMIT, SWIGLU_OAI_LIMIT)
+            g[i] = (x / (1.0 + exp(-SWIGLU_OAI_ALPHA * x))) * (y + 1.0)
         }
     }
 }
@@ -923,19 +1256,13 @@ def rope_scaled_tab(var v : float?; head_size, n : int64; cosrow : float const?;
     }
 }
 
-//! Table-driven NEOX RoPE (pair offset by head_size/2). Same table as rope_scaled_tab; the NEOX
-//! mscale magnitude factor is baked into cosrow/sinrow by build_rope_table. Bit-identical to rope_scaled_neox.
-//! The NEOX split layout (v0 in [base..base+half), v1 in [base+half..)) is four contiguous arrays, so
-//! the inner loop vectorizes width-8 natively (~5-10% over scalar) — measured Δ=0, i.e. plain mul/sub
-//! under [vectorize] does NOT contract to fma, so it stays bit-exact (no `mad`). The NORM leaf above
-//! can't do this: its interleaved (2j, 2j+1) layout is stride-2 and the JIT won't emit vld2/vst2 for it.
 [hint(noalias = v, noalias = cosrow, noalias = sinrow)]
-def rope_scaled_neox_tab(var v : float?; head_size, n : int64; cosrow : float const?; sinrow : float const?) {
+def template rope_scaled_neox_tab_template(var v : float ?; head_size, n : int64; cosrow : float const ?; sinrow : float const ?) : void {
     unsafe {
         let half = head_size / 2l
         for (h in range64(n / head_size)) {
             let base = h * head_size
-            for [vectorize, vectorize_width = 8, unroll_count = 2] (j in range64(half)) {
+            for [tune = 1] (j in range64(half)) {
                 let fcr = cosrow[j]
                 let fci = sinrow[j]
                 let v0 = v[base + j]
@@ -946,6 +1273,15 @@ def rope_scaled_neox_tab(var v : float?; head_size, n : int64; cosrow : float co
         }
     }
 }
+
+//! Table-driven NEOX RoPE (pair offset by head_size/2). Same table as rope_scaled_tab; the NEOX
+//! mscale magnitude factor is baked into cosrow/sinrow by build_rope_table. Bit-identical to rope_scaled_neox.
+//! The NEOX split layout (v0 in [base..base+half), v1 in [base+half..)) is four contiguous arrays, so
+//! the inner loop vectorizes width-8 natively (~5-10% over scalar) — measured Δ=0, i.e. plain mul/sub
+//! under [vectorize] does NOT contract to fma, so it stays bit-exact (no `mad`). The NORM leaf above
+//! can't do this: its interleaved (2j, 2j+1) layout is stride-2 and the JIT won't emit vld2/vst2 for it.
+[hint(noalias = v, noalias = cosrow, noalias = sinrow), tuned]
+def rope_scaled_neox_tab(var v : float?; head_size, n : int64; cosrow : float const?; sinrow : float const?) {}
 
 //! Dispatch RoPE by the model's convention: NEOX (Qwen2/Phi3/Gemma2) or the default NORM (Llama).
 //! mscale is the LongRoPE magnitude factor (1.0 for everything but Phi3); only the NEOX path uses it.

@@ -35,6 +35,12 @@ let GGML_TYPE_F32 = 0
 let GGML_TYPE_F16 = 1
 let GGML_TYPE_Q4_0 = 2
 let GGML_TYPE_Q8_0 = 8
+let GGML_TYPE_MXFP4 = 39
+
+// MXFP4 e2m1 magnitudes DOUBLED (nibble -> ±{0,.5,1,1.5,2,3,4,6}×2, OCP MX spec via ggml
+// kvalues_mxfp4); the E8M0 block scale below is halved to compensate.
+let private MXFP4_KVALUES = fixed_array(0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0,
+                                        0.0, -1.0, -2.0, -3.0, -4.0, -6.0, -8.0, -12.0)
 
 // ===== little-endian byte readers =====
 
@@ -90,6 +96,13 @@ def f16_to_f32(h : uint) : float {
     } else {  // normal: rebias exponent 15 -> 127 (+112), widen mantissa 10 -> 23 bits
         bits = sign | ((exp + 112u) << 23u) | (mant << 13u)
     }
+    return unsafe(reinterpret<float>(bits))
+}
+
+// E8M0 block scale -> fp32 * 0.5 = 2^(e-128) (the half matches the doubled MXFP4_KVALUES).
+// e < 2 lands in fp32 denormal territory -> precomputed bit patterns (ggml_e8m0_to_fp32_half).
+def private e8m0_to_f32_half(e : uint) : float {
+    let bits = e < 2u ? (0x00200000u << e) : ((e - 1u) << 23u)
     return unsafe(reinterpret<float>(bits))
 }
 
@@ -461,8 +474,23 @@ def gguf_read_tensor_f32(m : GGUFMeta; bytes : array<uint8> | #; name : string; 
             }
             bo += 16l
         }
+    } elif (gtype == GGML_TYPE_MXFP4) {
+        // block of 32: 1 E8M0 scale byte + 16 nibble bytes (low nibbles = elems 0..15, high = 16..31);
+        // x = e2m1[nibble] * scale — both sides carry the ×2/÷2 ggml convention (see MXFP4_KVALUES)
+        let nb = expect_n / 32l
+        var bo = base + (src_off / 32l) * 17l
+        for (blk in range64(nb)) {
+            let d = e8m0_to_f32_half(uint(bytes[bo]))
+            bo++
+            for (k in range64(16l)) {
+                let b = int(bytes[bo + k])
+                dst[dst_off + blk * 32l + k] = MXFP4_KVALUES[b & 15] * d
+                dst[dst_off + blk * 32l + k + 16l] = MXFP4_KVALUES[b >> 4] * d
+            }
+            bo += 16l
+        }
     } else {
-        panic("gguf: tensor '{name}' type {gtype} not supported (have F32/F16/Q8_0/Q4_0)")
+        panic("gguf: tensor '{name}' type {gtype} not supported (have F32/F16/Q8_0/Q4_0/MXFP4)")
     }
 }
 
@@ -525,6 +553,35 @@ def gguf_transcode_q4_0(m : GGUFMeta; bytes : array<uint8> | #; name : string; v
         bo += 2l
         for (j in range64(16l)) {
             qdst[qoff_bytes + blk * 16l + j] = bytes[bo + j]
+        }
+        bo += 16l
+    }
+}
+
+//! Transcode an MXFP4 tensor straight from disk into split native planes — the RAW bits, no dequant
+//! round-trip: the 16 packed-nibble bytes per 32-block copy verbatim to ndst[noff_bytes..]
+//! (noff_bytes = weight-element-offset / 2) and the 1 RAW E8M0 scale byte to edst[eoff..]
+//! (eoff = offset / 32). Exact by construction (vs the old dequant->requantize-to-Q8 path, which
+//! paid an amax error) and reads 17 bytes/block instead of writing 33+. Requires the tensor to be
+//! MXFP4 on disk (check gguf_tensor_type first).
+def gguf_transcode_mx4(m : GGUFMeta; bytes : array<uint8> | #; name : string; var ndst : array<uint8>; var edst : array<uint8>; noff_bytes, eoff, expect_n : int64; src_off : int64 = 0l) {
+    let ti = gguf_find_tensor(m, name)
+    if (ti < 0) {
+        panic("gguf: tensor '{name}' not found")
+    }
+    if (m.tensors[ti].ggml_type != GGML_TYPE_MXFP4) {
+        panic("gguf: tensor '{name}' is not MXFP4 (type {m.tensors[ti].ggml_type})")
+    }
+    if (src_off + expect_n > m.tensors[ti].n_elem) {
+        panic("gguf: tensor '{name}' slice [{src_off}, {src_off + expect_n}) exceeds {m.tensors[ti].n_elem} elems")
+    }
+    let nb = expect_n / 32l
+    var bo = m.data_offset + m.tensors[ti].offset + (src_off / 32l) * 17l
+    for (blk in range64(nb)) {
+        edst[eoff + blk] = bytes[bo]
+        bo++
+        for (j in range64(16l)) {
+            ndst[noff_bytes + blk * 16l + j] = bytes[bo + j]
         }
         bo += 16l
     }

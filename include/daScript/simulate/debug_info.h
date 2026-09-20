@@ -196,6 +196,7 @@ namespace das
         string  fileName;
         string  importName;
         bool extraDepModule = false;
+        string  requireName;    // the require string that produced this info (e.g. "daslib/fio"); carried so a promoted shared module records its canonical, directory-independent require identity
     };
 
     struct BaseRequireRecord {
@@ -372,6 +373,7 @@ namespace das
             flag_heapGC = 1<<13,
             flag_stringHeapGC = 1<<14,
             flag_private = 1<<15,
+            flag_classMethod = 1<<16,   // struct field is a class method (set on the field VarInfo)
         };
         union {
             StructInfo *                structType;

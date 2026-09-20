@@ -1,8 +1,8 @@
 options gen2
+options persistent_heap   // + explicit deletes below: each test frees its model/session before the next loads, so multi-GB weights never accumulate in the process
 
 require dastest/testing_boost public
-require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration; requiring dasllama_common directly would drop them
-require dasllama/dasllama_chat
+require dasllama/dasllama   // the public facade — public-path tests exercise the API through it (engine + arch registrations + chat)
 require dasllama/dasllama_tokenizer
 require dasllama/dasllama_bpe
 require daslib/jobque_boost
@@ -14,7 +14,11 @@ require math
 // tokens. Each case rebuilds the old demo's first-turn prefill against the RAW tokenizer backend and
 // compares it to render_turn(). GGUF models are gitignored, so each case skips cleanly when absent.
 
-let MODELS_DIR = "/Users/borisbatkin/Work/llama.cpp/models/"
+// override the machine-local model root with DASLLAMA_MODELS_DIR (e.g. on the x64 handoff box)
+def private models_dir() : string {
+    let env = get_env_variable("DASLLAMA_MODELS_DIR")
+    return empty(env) ? "/Users/borisbatkin/Work/llama.cpp/models/" : env
+}
 let SYS = "You are a helpful, friendly assistant. Keep answers concise."
 let USR = "Once upon a time"
 
@@ -42,19 +46,21 @@ def private load_capped(path : string) : Model {
 def private engine_prefill(m : Model; system, user : string) : array<int64> {
     var c = create_chat(m, system)
     add_user(c, user)
-    return <- render_turn(m, c)
+    var out <- render_turn(m, c)
+    delete c
+    return <- out
 }
 
 [test]
 def test_chat_tinyllama_zephyr(t : T?) {
     t |> run("TinyLlama (arch=llama + SPM) renders the Zephyr prefill") @(t : T?) {
-        let path = "{MODELS_DIR}tinyllama-1.1b-chat-v1.0.Q8_0.gguf"
+        let path = path_join(models_dir(), "tinyllama-1.1b-chat-v1.0.Q8_0.gguf")
         if (!stat(path).is_valid) {
             t |> success(true, "skipped: {path} not present")
             return
         }
-        let m <- load_capped(path)
-        let raw <- load_tokenizer_gguf(path)
+        var m <- load_capped(path)
+        var raw <- load_tokenizer_gguf(path)
         // old chat.das: BOS, "<|system|>\n{sys}", </s>, "\n<|user|>\n{usr}", </s>, "\n<|assistant|>\n"
         var want : array<int64>
         want |> push(1l)
@@ -64,19 +70,21 @@ def test_chat_tinyllama_zephyr(t : T?) {
         want |> push(2l)
         want |> push_from(encode(raw, "\n<|assistant|>\n", false, false))
         t |> success(same(engine_prefill(m, SYS, USR), want), "zephyr prefill token-for-token")
+        delete raw
+        delete m
     }
 }
 
 [test]
 def test_chat_gemma(t : T?) {
     t |> run("Gemma-2 (SPM, no system role) folds system into the first user turn") @(t : T?) {
-        let path = "{MODELS_DIR}gemma-2-2b-it-Q8_0.gguf"
+        let path = path_join(models_dir(), "gemma-2-2b-it-Q8_0.gguf")
         if (!stat(path).is_valid) {
             t |> success(true, "skipped: {path} not present")
             return
         }
-        let m <- load_capped(path)
-        let raw <- load_tokenizer_gguf(path)
+        var m <- load_capped(path)
+        var raw <- load_tokenizer_gguf(path)
         // old gemma_chat.das: BOS=2, SOT=106, "user\n{sys}\n\n{usr}", EOT=107, "\n", SOT, "model\n"
         var want : array<int64>
         want |> push(2l)
@@ -87,19 +95,21 @@ def test_chat_gemma(t : T?) {
         want |> push(106l)
         want |> push_from(encode(raw, "model\n", false, false))
         t |> success(same(engine_prefill(m, SYS, USR), want), "gemma folded prefill token-for-token")
+        delete raw
+        delete m
     }
 }
 
 [test]
 def test_chat_phi(t : T?) {
     t |> run("Phi-3.5 (SPM) renders the Phi-3 prefill") @(t : T?) {
-        let path = "{MODELS_DIR}Phi-3.5-mini-instruct-Q8_0.gguf"
+        let path = path_join(models_dir(), "Phi-3.5-mini-instruct-Q8_0.gguf")
         if (!stat(path).is_valid) {
             t |> success(true, "skipped: {path} not present")
             return
         }
-        let m <- load_capped(path)
-        let raw <- load_tokenizer_gguf(path)
+        var m <- load_capped(path)
+        var raw <- load_tokenizer_gguf(path)
         // old phi_chat.das: SYS=32006, "\n{sys}", END=32007, "\n", USR=32010, "\n{usr}", END, "\n", ASST=32001, "\n"
         var want : array<int64>
         want |> push(32006l)
@@ -113,19 +123,21 @@ def test_chat_phi(t : T?) {
         want |> push(32001l)
         want |> push_from(encode(raw, "\n", false, false))
         t |> success(same(engine_prefill(m, SYS, USR), want), "phi prefill token-for-token")
+        delete raw
+        delete m
     }
 }
 
 [test]
 def test_chat_qwen(t : T?) {
     t |> run("Qwen2.5 (BPE) renders the ChatML prefill") @(t : T?) {
-        let path = "{MODELS_DIR}Qwen2.5-1.5B-Instruct-Q8_0.gguf"
+        let path = path_join(models_dir(), "Qwen2.5-1.5B-Instruct-Q8_0.gguf")
         if (!stat(path).is_valid) {
             t |> success(true, "skipped: {path} not present")
             return
         }
-        let m <- load_capped(path)
-        let raw <- load_bpe_tokenizer_gguf(path)
+        var m <- load_capped(path)
+        var raw <- load_bpe_tokenizer_gguf(path)
         let ims = special_id(raw, "<|im_start|>")
         let ime = special_id(raw, "<|im_end|>")
         // old qwen_chat.das: ims, "system\n{sys}", ime, "\n", ims, "user\n{usr}", ime, "\n", ims, "assistant\n"
@@ -141,19 +153,21 @@ def test_chat_qwen(t : T?) {
         want |> push(ims)
         want |> push_from(bpe_encode(raw, "assistant\n"))
         t |> success(same(engine_prefill(m, SYS, USR), want), "qwen chatml prefill token-for-token")
+        delete raw
+        delete m
     }
 }
 
 [test]
 def test_chat_llama3(t : T?) {
     t |> run("Llama-3 (arch=llama + BPE) renders the Llama-3 header prefill") @(t : T?) {
-        let path = "{MODELS_DIR}Llama-3.2-1B-Instruct-Q8_0.gguf"
+        let path = path_join(models_dir(), "Llama-3.2-1B-Instruct-Q8_0.gguf")
         if (!stat(path).is_valid) {
             t |> success(true, "skipped: {path} not present")
             return
         }
-        let m <- load_capped(path)
-        let raw <- load_bpe_tokenizer_gguf(path)
+        var m <- load_capped(path)
+        var raw <- load_bpe_tokenizer_gguf(path)
         let sh = special_id(raw, "<|start_header_id|>")
         let eh = special_id(raw, "<|end_header_id|>")
         let eot = special_id(raw, "<|eot_id|>")
@@ -169,6 +183,8 @@ def test_chat_llama3(t : T?) {
         want |> push(sh); want |> push_from(bpe_encode(raw, "assistant")); want |> push(eh)
         want |> push_from(bpe_encode(raw, "\n\n"))
         t |> success(same(engine_prefill(m, SYS, USR), want), "llama3 header prefill token-for-token")
+        delete raw
+        delete m
     }
 }
 
@@ -179,7 +195,7 @@ def test_chat_end_to_end(t : T?) {
             t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
-        let path = "{MODELS_DIR}gemma-2-2b-it-Q8_0.gguf"
+        let path = path_join(models_dir(), "gemma-2-2b-it-Q8_0.gguf")
         if (!stat(path).is_valid) {
             t |> success(true, "skipped: {path} not present")
             return
@@ -189,7 +205,7 @@ def test_chat_end_to_end(t : T?) {
         var reply = ""
         var ntok = 0l
         with_job_que() {
-            set_jobque_fork_pool(true, true)
+            setup_dasllama_jobque()
             var c = create_chat(m, "", 24l)   // no system prompt, short budget
             add_user(c, "Say hello in one short sentence.")
             reply = respond(m, c, SamplingParams()) $(piece) {   // greedy
@@ -202,7 +218,9 @@ def test_chat_end_to_end(t : T?) {
             let st = stats(c.session)
             t |> success(st.n_gen == ntok && st.n_gen > 0l, "stats.n_gen matches streamed tokens")
             t |> success(st.n_prompt > 0l, "stats recorded the prefill")
+            delete c
         }
+        delete m
     }
 }
 

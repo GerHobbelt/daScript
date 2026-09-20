@@ -625,6 +625,62 @@ namespace das {
         context->forkSkipHeapReset = skip;
     }
 
+    void set_jobque_worker_spin ( int32_t usec, Context * context, LineInfoArg * at ) {
+        // Idle workers spin-poll the fifo for `usec` before parking on the condvar (0 = park
+        // immediately, the default). See JobQue::setWorkerSpin for the why. Opt in for fork/join-
+        // heavy compute (LLM decode); leave off where idle CPU matters (wasm, audio, low-core).
+        if ( !g_jobQue ) context->throw_error_at(at, "need to be in a 'with_job_que' block, or call create_job_que() first");
+        g_jobQue->setWorkerSpin(usec);
+    }
+
+    // Batched fork-job dispatch (opt-in, per DISPATCHING thread): new_job keeps the finished job
+    // closures locally and join() publishes the whole batch under ONE fifo lock + one notify —
+    // the woken worker wake-propagates to the rest (JobQue::job), so the fan-out is log-depth.
+    // Removes the per-job push/wake interleaving that stalls a fork/join dispatch loop: every
+    // notify_one to a parked worker costs the dispatcher an OS thread-wake (~3-4.5us) serially, and
+    // with spinning workers the per-push lock acquisition contends with every consumer's pop.
+    // Only safe for pure fork/join use — every new_job on this thread must be joined via its
+    // JobStatus (join is the flush point); a job whose results are consumed BEFORE join would stall.
+    static thread_local bool g_batchForkJobs = false;
+    static thread_local vector<Job> g_pendingForkJobs;
+
+    void set_jobque_batch_dispatch ( bool batch, Context *, LineInfoArg * ) {
+        g_batchForkJobs = batch;
+    }
+
+    static void flushPendingForkJobs () {
+        if ( !g_pendingForkJobs.empty() && g_jobQue ) {
+            g_jobQue->pushBatch(das::move(g_pendingForkJobs), 0, JobPriority::Default);
+            g_pendingForkJobs.clear();  // moved-from — make the reuse explicit
+        }
+    }
+
+    void flush_jobque_batch ( Context *, LineInfoArg * ) {
+        // Publish this thread's pending batched fork jobs NOW instead of at join — pair with
+        // jobque_try_run_one when the dispatching thread participates in the work.
+        flushPendingForkJobs();
+    }
+
+    bool jobque_try_run_one ( Context * context, LineInfoArg * at ) {
+        // Dispatcher-side work stealing: flush any pending batch, then pop ONE queued job and run
+        // it on the calling thread (the same cloned-closure job a worker would run — full capture
+        // semantics). parallel_for loops this until its wait group is ready, so the dispatching
+        // core computes chunks instead of sleeping through the fork. False = fifo empty.
+        if ( !g_jobQue ) context->throw_error_at(at, "need to be in a 'with_job_que' block, or call create_job_que() first");
+        flushPendingForkJobs();
+        return g_jobQue->tryRunOneJob();
+    }
+
+    void set_jobque_join_spin ( int32_t level, Context *, LineInfoArg * ) {
+        // JobStatus::Wait (the fork/join `join`) polls the remaining-counter for level*1024*128
+        // relax-rounds before parking on the condvar (0 = park immediately, the default) — the
+        // ggml hybrid-poll shape and denomination (their --poll 0..100, 50 = their default). With
+        // parallel_for executing chunks on the calling thread, the join wait is just the workers'
+        // tail — the poll removes the last OS park/wake of the fork/join path. Opt in for
+        // fork/join-heavy compute (LLM decode/prefill); leave off where idle CPU matters.
+        JobStatus::sJoinSpin.store(level, std::memory_order_relaxed);
+    }
+
     void new_job_invoke ( Lambda lambda, Func fn, int32_t lambdaSize, Context * context, LineInfoArg * lineinfo ) {
         if ( !g_jobQue ) context->throw_error_at(lineinfo, "need to be in a 'with_job_que' block, or call create_job_que() first");
         if ( context->keepForkContexts ) {
@@ -638,13 +694,15 @@ namespace das {
             das_delete<Lambda>::clear(context, lambda);
             auto bound = daScriptEnvironment::getBound();
             Context * parent = context;
-            g_jobQue->push([=]() mutable {
+            Job jobFn = [=]() mutable {
                 daScriptEnvironment::setBound(bound);
                 Lambda flambda(ptr);
                 das_invoke_lambda<void>::invoke(forkContext, lineinfo, flambda);
                 das_delete<Lambda>::clear(forkContext, flambda);
                 parent->releaseForkContext(forkContext);
-            }, 0, JobPriority::Default);
+            };
+            if ( g_batchForkJobs ) g_pendingForkJobs.emplace_back(das::move(jobFn));
+            else g_jobQue->push(das::move(jobFn), 0, JobPriority::Default);
             return;
         }
         shared_ptr<Context> forkContext;
@@ -657,12 +715,89 @@ namespace das {
         das_invoke_function<void>::invoke(forkContext.get(), lineinfo, fn, ptr, lambda.capture);
         das_delete<Lambda>::clear(context, lambda);
         auto bound = daScriptEnvironment::getBound();
-        g_jobQue->push([=]() mutable {
+        Job jobFn = [=]() mutable {
             daScriptEnvironment::setBound(bound);
             Lambda flambda(ptr);
             das_invoke_lambda<void>::invoke(forkContext.get(), lineinfo, flambda);
             das_delete<Lambda>::clear(forkContext.get(), flambda);
-        }, 0, JobPriority::Default);
+        };
+        if ( g_batchForkJobs ) g_pendingForkJobs.emplace_back(das::move(jobFn));
+        else g_jobQue->push(das::move(jobFn), 0, JobPriority::Default);
+    }
+
+    void set_jobque_team_mode ( bool on, Context * context, LineInfoArg * at ) {
+        // Sticky team dispatch (see JobQue::setTeamMode): workers poll a published team op
+        // alongside the fifo; team_parallel_for then costs one seq bump instead of a per-chunk
+        // fifo push + wait group. Hybrid poll/park (the ggml --poll shape): workers spin for the
+        // set_jobque_worker_spin window then park, and a publish that finds parked workers pays
+        // the wake — pair with a worker spin window for back-to-back dispatch bursts. Opt in for
+        // fork/join-heavy compute (LLM decode).
+        if ( !g_jobQue ) context->throw_error_at(at, "need to be in a 'with_job_que' block, or call create_job_que() first");
+        g_jobQue->setTeamMode(on);
+    }
+
+    bool get_jobque_team_mode ( Context *, LineInfoArg * ) {
+        return g_jobQue && g_jobQue->getTeamMode();
+    }
+
+    void team_parallel_for_invoke ( int32_t rangeBegin, int32_t rangeEnd, int32_t numChunks, Lambda lambda, Func fn, int32_t lambdaSize, Context * context, LineInfoArg * lineinfo ) {
+        if ( !g_jobQue ) context->throw_error_at(lineinfo, "need to be in a 'with_job_que' block, or call create_job_que() first");
+        int total = rangeEnd - rangeBegin;
+        if ( total <= 0 || numChunks <= 0 ) {
+            das_delete<Lambda>::clear(context, lambda);
+            return;
+        }
+        int actualChunks = numChunks < total ? numChunks : total;
+        int nW = g_jobQue->getNumWorkers();
+        if ( actualChunks == 1 || nW == 0 || !g_jobQue->getTeamMode() ) {
+            das_invoke_lambda<void>::invoke(context, lineinfo, lambda, rangeBegin, rangeEnd);
+            das_delete<Lambda>::clear(context, lambda);
+            return;
+        }
+        int chunkSz = total / actualChunks;
+        int rem = total % actualChunks;
+        // one lambda clone per WORKER (the fifo path clones per chunk); the caller runs the original
+        vector<Context *> forkCtx(nW);
+        vector<char *> clonePtr(nW);
+        vector<shared_ptr<Context>> ownedCtx;   // non-pooled path: keep clones alive till the join
+        bool pooled = context->keepForkContexts;
+        if ( !pooled ) ownedCtx.resize(nW);
+        for ( int w = 0; w != nW; ++w ) {
+            Context * fc;
+            if ( pooled ) {
+                fc = context->acquireForkContext(uint32_t(ContextCategory::job_clone));
+            } else {
+                ownedCtx[w].reset(get_clone_context(context, uint32_t(ContextCategory::job_clone)));
+                ownedCtx[w]->sharedPtrContext = true;
+                fc = ownedCtx[w].get();
+            }
+            auto ptr = fc->allocate(lambdaSize + 16, lineinfo);
+            fc->heap->mark_comment(ptr, "new [[ ]] in team_parallel_for");
+            memset(ptr, 0, lambdaSize + 16);
+            ptr += 16;
+            das_invoke_function<void>::invoke(fc, lineinfo, fn, ptr, lambda.capture);
+            forkCtx[w] = fc;
+            clonePtr[w] = ptr;
+        }
+        auto bound = daScriptEnvironment::getBound();
+        JobChunk work = [&](int chunkIdx, int slot) {
+            int rb = rangeBegin + chunkIdx * chunkSz + (chunkIdx < rem ? chunkIdx : rem);
+            int re = rb + chunkSz + (chunkIdx < rem ? 1 : 0);
+            if ( slot == nW ) {
+                das_invoke_lambda<void>::invoke(context, lineinfo, lambda, rb, re);
+            } else {
+                daScriptEnvironment::setBound(bound);
+                Lambda flambda(clonePtr[slot]);
+                das_invoke_lambda<void>::invoke(forkCtx[slot], lineinfo, flambda, rb, re);
+            }
+        };
+        g_jobQue->teamParallelFor(actualChunks, work);
+        for ( int w = 0; w != nW; ++w ) {
+            Lambda flambda(clonePtr[w]);
+            das_delete<Lambda>::clear(forkCtx[w], flambda);
+            if ( pooled ) context->releaseForkContext(forkCtx[w]);
+        }
+        das_delete<Lambda>::clear(context, lambda);
     }
 
     static atomic<int32_t> g_jobQueAvailable{0};
@@ -742,6 +877,11 @@ namespace das {
             shared_ptr<JobQue> jq = g_jobQue;
             context->invoke(block, nullptr, nullptr, lineInfo);
         }
+        // Batch dispatch is a thread-local, block-scoped contract: flush any stragglers and reset the
+        // flag so it cannot leak into unrelated jobque users later on this thread (e.g. the next test
+        // in a dastest process, whose consume-before-join pattern would stall on unflushed jobs).
+        flushPendingForkJobs();
+        g_batchForkJobs = false;
         {
             lock_guard<mutex> guard(g_jobQueMutex);
             if ( g_jobQue.use_count()==1 ) g_jobQue.reset();
@@ -758,6 +898,8 @@ namespace das {
     }
 
     void destroyJobQue ( Context *, LineInfoArg * ) {
+        flushPendingForkJobs();     // batch-dispatch stragglers (see withJobQue) — flush before the drain below
+        g_batchForkJobs = false;
         lock_guard<mutex> guard(g_jobQueMutex);
         g_persistentJobQue.reset();
         if ( g_jobQue.use_count()==1 ) g_jobQue.reset();  // ~JobQue drains/joins the pool
@@ -799,6 +941,7 @@ namespace das {
 
     void waitForJob ( JobStatus * status, Context * context, LineInfoArg * at ) {
         if ( !status ) context->throw_error_at(at, "waitForJob: status is null");
+        flushPendingForkJobs();     // batched dispatch publishes at the join point
         status->Wait();
     }
 
@@ -1030,6 +1173,30 @@ namespace das {
             addExtern<DAS_BIND_FUN(set_jobque_fork_skip_heap_reset)>(*this, lib,  "set_jobque_fork_skip_heap_reset",
                 SideEffects::modifyExternal, "set_jobque_fork_skip_heap_reset")
                     ->args({"skip","context","line"});
+            addExtern<DAS_BIND_FUN(set_jobque_worker_spin)>(*this, lib,  "set_jobque_worker_spin",
+                SideEffects::modifyExternal, "set_jobque_worker_spin")
+                    ->args({"usec","context","line"});
+            addExtern<DAS_BIND_FUN(set_jobque_batch_dispatch)>(*this, lib,  "set_jobque_batch_dispatch",
+                SideEffects::modifyExternal, "set_jobque_batch_dispatch")
+                    ->args({"batch","context","line"});
+            addExtern<DAS_BIND_FUN(flush_jobque_batch)>(*this, lib,  "flush_jobque_batch",
+                SideEffects::modifyExternal, "flush_jobque_batch")
+                    ->args({"context","line"});
+            addExtern<DAS_BIND_FUN(jobque_try_run_one)>(*this, lib,  "jobque_try_run_one",
+                SideEffects::modifyExternal, "jobque_try_run_one")
+                    ->args({"context","line"});
+            addExtern<DAS_BIND_FUN(set_jobque_join_spin)>(*this, lib,  "set_jobque_join_spin",
+                SideEffects::modifyExternal, "set_jobque_join_spin")
+                    ->args({"level","context","line"});
+            addExtern<DAS_BIND_FUN(set_jobque_team_mode)>(*this, lib,  "set_jobque_team_mode",
+                SideEffects::modifyExternal, "set_jobque_team_mode")
+                    ->args({"on","context","line"});
+            addExtern<DAS_BIND_FUN(get_jobque_team_mode)>(*this, lib,  "get_jobque_team_mode",
+                SideEffects::accessExternal, "get_jobque_team_mode")
+                    ->args({"context","line"});
+            addExtern<DAS_BIND_FUN(team_parallel_for_invoke)>(*this, lib,  "team_parallel_for_invoke",
+                SideEffects::modifyExternal, "team_parallel_for_invoke")
+                    ->args({"range_begin","range_end","num_chunks","lambda","function","lambdaSize","context","line"});
             addExtern<DAS_BIND_FUN(withJobQue)>(*this, lib,  "with_job_que",
                 SideEffects::modifyExternal, "withJobQue")
                     ->args({"block","context","line"});

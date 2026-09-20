@@ -389,6 +389,20 @@ var public g_target_is_wasm = false
 // this is true; on every other target the intrinsic's daslang fallback body is emitted instead.
 var public g_target_is_aarch64 = false
 
+// Set by init_jit when the JIT target is x86-64. Gates the g_x64_intrin_lookup platform-intrinsic
+// table in llvm_jit_intrin — same contract as g_target_is_aarch64 above.
+var public g_target_is_x64 = false
+
+// The x64 intrinsic table additionally requires AVX2 on the TARGET — unlike aarch64 (where every
+// daslang JIT host has dotprod, force-appended to the feature set), AVX2 is not universal on x86-64
+// (pre-Haswell, pre-Gracemont Pentium/Celeron/Atom). Emitting llvm.x86.avx2.* against a TargetMachine
+// whose cpuid-derived features lack +avx2 is a FATAL "Cannot select" at codegen — and the JIT compiles
+// the whole program up-front, so one reachable dot32 body would kill the program on such a box.
+// Host path: cpu_supports("avx2") (cpuid + OSXSAVE truth, matching what LLVMGetHostCPUFeatures feeds
+// the TargetMachine). Explicit cross-compile triples get empty features (generic cpu) — no AVX2 there
+// either, so the intrinsics compile their portable fallback bodies: correct, just not fast.
+var public g_target_x64_avx2 = false
+
 // Cross-compile a wasm object compatible with a -pthread (SharedArrayBuffer)
 // runtime: add +atomics,+bulk-memory to the target_features section so wasm-ld
 // links it into a --shared-memory build. Set from the --jit-threads CLI flag in
@@ -492,6 +506,12 @@ def public init_jit(cg_opt_level : uint; target_triple : string = "") {
     g_target_is_aarch64 = (empty(target_triple)
         ? get_architecture_name() == "arm64"
         : (starts_with(target_triple, "aarch64") || starts_with(target_triple, "arm64")))
+    g_target_is_x64 = (empty(target_triple)
+        ? get_architecture_name() == "x86_64"
+        : (starts_with(target_triple, "x86_64") || starts_with(target_triple, "amd64")))
+    // AVX2 gate for the x64 intrinsic table (see the declaration comment): host targets take the
+    // running box's cpuid truth; cross targets get empty features, so no AVX2 emission there.
+    g_target_x64_avx2 = g_target_is_x64 && empty(target_triple) && cpu_supports("avx2")
     if (!(target_triple |> empty())) {
         // wasm32 target isn't always part of LLVMInitializeAllTargets in
         // prebuilt LLVM.dll — call the explicit wasm initializer when needed.
@@ -1023,8 +1043,8 @@ def public with_default_target_machine(opt_level : uint; use_host_cpu : bool;
 // @mod - module to dump to dll
 // @out_path - folder and name of file, without extension
 // @path_to_dascript_lib - path to library, required on Windows. Has no effect on Linux.
-// @path_to_linker - path to clang-cl on Windows. By default we'll use clang-cl from LLVM package
-// on Windows, default otherwise.
+// @path_to_linker - linker override. Windows-MSVC defaults to lld-link from the LLVM package
+// (link.exe-flavored cmd), c++/clang default elsewhere.
 def public write_dll(mod : LLVMOpaqueModule?; out_path : string; path_to_dascript_lib, path_to_linker, linker_string : string; link_whole_lib : bool) {
     // JIT DLL cache: emitted artifact only ever runs on this host.
     with_default_target_machine(3u, true) $(targetMachine : LLVMTargetMachineRef) {
