@@ -60,6 +60,7 @@ struct GlobalInfo {
     is_separate_sampler : bool      // a standalone sampler (OpTypeSampler)
     is_subpass_input : bool         // a subpass-input attachment (UniformConstant OpTypeImage Dim=SubpassData); used via subpassLoad
     is_sampler_array : bool         // a fixed-count descriptor array of combined image samplers (sampler2D[N], etc.) -- UniformConstant OpTypeArray of OpTypeSampledImage; accessed via samplers[idx] -> OpAccessChain
+    is_mesh_output : bool           // a mesh per-vertex / per-primitive Output array (gl_MeshVerticesEXT / gl_PrimitiveTriangleIndicesEXT); a BARE Output array indexed by a single AccessChain (no member-0 SSBO indirection), pointee from elem_type
     arr_count  : int                // descriptor-array element count (when is_sampler_array; > 0); 0 for non-array
     elem_type  : uint               // SSBO runtime-array element type-id (vec/struct elements can't go through emit_type) OR descriptor-array element type-id (sampled-image / image / sampler)
     is_constant : bool              // a module-scope `let X = <const>` folded to an OpConstant; references resolve to const_id directly (no OpVariable / OpLoad)
@@ -90,6 +91,10 @@ struct EmitCtx {
     descriptor_indexing_cap : bool              // OpCapability ShaderNonUniform + OpExtension "SPV_EXT_descriptor_indexing" already emitted (nonuniformEXT, descriptor arrays)
     sampled_image_nu_cap : bool                 // OpCapability SampledImageArrayNonUniformIndexing already emitted (NonUniform-indexed sampler descriptor array)
     mesh_shading_cap : bool                     // OpCapability MeshShadingEXT + OpExtension "SPV_EXT_mesh_shader" already emitted (mesh / task stages)
+    mesh_max_vertices : int                     // mesh-output array sizing (from MeshOutputConfig): gl_MeshVerticesEXT length
+    mesh_max_primitives : int                   // mesh-output array sizing: gl_PrimitiveTriangleIndicesEXT length
+    mesh_topology : MeshOutputTopology          // declared output topology; the index-array builtin must match it (triangles -> gl_PrimitiveTriangleIndicesEXT)
+    task_payload_id : uint                      // the @task_payload TaskPayloadWorkgroupEXT variable id (0 = none); EmitMeshTasksEXT appends it as the 4th operand
     nonuniform_ids : table<uint>                // set of result ids that carry the NonUniform decoration (nonuniformEXT marker + cascade through OpAccessChain / OpLoad on descriptor arrays)
     user_funcs    : table<uint64; UserFunc>     // intptr(Function) -> emittable user-defined shader function
     user_order    : array<uint64>               // user_funcs keys in stable emission order (collect_dependencies order)
@@ -173,6 +178,10 @@ def private builtin_info(name : string) : tuple<ok : bool; bi : SpvBuiltIn; stor
     if (name == "gl_FragCoord") return (ok = true, bi = SpvBuiltIn.FragCoord, storage = SpvStorageClass.Input, req = ShaderStage.Fragment)
     if (name == "gl_FragDepth") return (ok = true, bi = SpvBuiltIn.FragDepth, storage = SpvStorageClass.Output, req = ShaderStage.Fragment)
     if (name == "gl_PointCoord") return (ok = true, bi = SpvBuiltIn.PointCoord, storage = SpvStorageClass.Input, req = ShaderStage.Fragment)
+    // gl_PrimitiveID: fragment Input (the per-primitive id a mesh shader wrote via gl_MeshPrimitivesEXT).
+    // In a mesh pipeline it is NOT fixed-function-generated, so reading it pulls in the MeshShadingEXT
+    // capability on the fragment module (handled at classification).
+    if (name == "gl_PrimitiveID") return (ok = true, bi = SpvBuiltIn.PrimitiveId, storage = SpvStorageClass.Input, req = ShaderStage.Fragment)
     return (ok = false, bi = SpvBuiltIn.Position, storage = SpvStorageClass.Input, req = ShaderStage.Compute)
 }
 
@@ -518,12 +527,136 @@ def private is_emittable_value_type(t : TypeDecl?) : bool {
     return scalar_class(bt) >= 0 || bt == Type.tBool
 }
 
+// gl_MeshVerticesEXT / gl_PrimitiveTriangleIndicesEXT — the mesh per-vertex / per-primitive Output
+// arrays (VK_EXT_mesh_shader). Unlike the scalar builtins these are ARRAYS of a builtin, sized from
+// the [mesh_shader] output config (stashed on ctx):
+//   gl_MeshVerticesEXT             -> Output array[max_vertices] of a Block { vec4 } whose member 0 is
+//                                     BuiltIn Position (so gl_MeshVerticesEXT[i].gl_Position writes clip pos)
+//   gl_PrimitiveTriangleIndicesEXT -> Output array[max_primitives] of uvec3, BuiltIn-decorated on the var
+// Both are BARE Output arrays (is_mesh_output): an `[i]` index is a single AccessChain off the variable
+// (no member-0 SSBO indirection), and the per-vertex block's gl_Position field chains member 0 via the
+// generic visitExprField path. The daslang `array<>` decls in spirv_builtins exist only so the indexing
+// + field access typecheck; the real SPIR-V sizing comes from the config, not the (empty) daslang array.
+def private classify_mesh_output(var m : SpirvModule; var ctx : EmitCtx; v : VariablePtr; vname : string; stage : ShaderStage; var errors : array<string>) {
+    if (stage != ShaderStage.Mesh) {
+        errors |> push("mesh output '{vname}' is only available in a mesh shader, not {stage_name(stage)}")
+        return
+    }
+    if (vname == "gl_MeshVerticesEXT") {
+        let n = ctx.mesh_max_vertices
+        if (n <= 0) {
+            errors |> push("gl_MeshVerticesEXT: max_vertices must be > 0 (got {n})")
+            return
+        }
+        // per-vertex Block { gl_Position : vec4 } — member 0 = BuiltIn Position, Block-decorated.
+        let f4 = type_vector(m, type_float(m, 32u), 4)
+        let blk = alloc_id(m)
+        emit(m, SEC_TYPES, SpvOp.TypeStruct, blk, f4)
+        emit(m, SEC_DECOR, SpvOp.Decorate, blk, uint(SpvDecoration.Block))
+        emit(m, SEC_DECOR, SpvOp.MemberDecorate, blk, 0u, uint(SpvDecoration.BuiltIn), uint(SpvBuiltIn.Position))
+        let arr = type_array(m, blk, n)
+        let pt = type_pointer(m, SpvStorageClass.Output, arr)
+        let vid = alloc_id(m)
+        emit(m, SEC_TYPES, SpvOp.Variable, pt, vid, uint(SpvStorageClass.Output))
+        ctx.globals |> insert(intptr(v), GlobalInfo(var_id = vid, storage = SpvStorageClass.Output, value_type = arr, elem_type = blk, is_mesh_output = true))
+        ctx.interface_ids |> push(vid)
+        return
+    }
+    if (vname == "gl_PrimitiveTriangleIndicesEXT") {
+        // PR-E2 ships triangles only; the line (uvec2) / point (uint) index arrays + their topology
+        // arrive in a follow-up. Reject a mismatch fail-closed rather than emit indices the declared
+        // topology can't consume.
+        if (ctx.mesh_topology != MeshOutputTopology.triangles) {
+            errors |> push("gl_PrimitiveTriangleIndicesEXT requires output_topology=\"triangles\" (lines / points index arrays land in a follow-up)")
+            return
+        }
+        let n = ctx.mesh_max_primitives
+        if (n <= 0) {
+            errors |> push("gl_PrimitiveTriangleIndicesEXT: max_primitives must be > 0 (got {n})")
+            return
+        }
+        let u3 = type_vector(m, type_uint(m), 3)
+        let arr = type_array(m, u3, n)
+        let pt = type_pointer(m, SpvStorageClass.Output, arr)
+        let vid = alloc_id(m)
+        emit(m, SEC_TYPES, SpvOp.Variable, pt, vid, uint(SpvStorageClass.Output))
+        emit(m, SEC_DECOR, SpvOp.Decorate, vid, uint(SpvDecoration.BuiltIn), uint(SpvBuiltIn.PrimitiveTriangleIndicesEXT))
+        ctx.globals |> insert(intptr(v), GlobalInfo(var_id = vid, storage = SpvStorageClass.Output, value_type = arr, elem_type = u3, is_mesh_output = true))
+        ctx.interface_ids |> push(vid)
+        return
+    }
+    if (vname == "gl_MeshPrimitivesEXT") {
+        // per-primitive builtin Block (the per-primitive analog of gl_MeshVerticesEXT). PR-F ships just
+        // gl_PrimitiveID; gl_Layer / gl_ViewportIndex / gl_CullPrimitiveEXT are follow-up members.
+        let n = ctx.mesh_max_primitives
+        if (n <= 0) {
+            errors |> push("gl_MeshPrimitivesEXT: max_primitives must be > 0 (got {n})")
+            return
+        }
+        // Block { gl_PrimitiveID : int } — member 0 = BuiltIn PrimitiveId + PerPrimitiveEXT (a Builtin
+        // PrimitiveId in a mesh shader MUST carry PerPrimitiveEXT, VUID-PrimitiveId-PrimitiveId-07040;
+        // in a Block both ride as MEMBER decorations alongside the BuiltIn).
+        let i32 = type_int(m, 32u, 1u)
+        let blk = alloc_id(m)
+        emit(m, SEC_TYPES, SpvOp.TypeStruct, blk, i32)
+        emit(m, SEC_DECOR, SpvOp.Decorate, blk, uint(SpvDecoration.Block))
+        emit(m, SEC_DECOR, SpvOp.MemberDecorate, blk, 0u, uint(SpvDecoration.BuiltIn), uint(SpvBuiltIn.PrimitiveId))
+        ensure_per_primitive(m, ctx)
+        emit(m, SEC_DECOR, SpvOp.MemberDecorate, blk, 0u, uint(SpvDecoration.PerPrimitiveEXT))
+        let arr = type_array(m, blk, n)
+        let pt = type_pointer(m, SpvStorageClass.Output, arr)
+        let vid = alloc_id(m)
+        emit(m, SEC_TYPES, SpvOp.Variable, pt, vid, uint(SpvStorageClass.Output))
+        ctx.globals |> insert(intptr(v), GlobalInfo(var_id = vid, storage = SpvStorageClass.Output, value_type = arr, elem_type = blk, is_mesh_output = true))
+        ctx.interface_ids |> push(vid)
+        return
+    }
+}
+
+// Emit a PLAIN struct type (each field via emit_type, NO Block / Offset / ArrayStride decorations) for a
+// logical storage class. Used for the @task_payload (TaskPayloadWorkgroupEXT) struct, which -- unlike a
+// UBO/SSBO Block -- has natural layout. Member type-ids come from emit_type so they match the
+// field_pointee_type the is_block member-access path uses. Fields must be emittable (scalar / vector /
+// matrix / fixed array); returns 0 + a pushed error otherwise.
+def private build_plain_struct(var m : SpirvModule; sname : string; st : Structure?; var errors : array<string>) : uint {
+    if (st == null || empty(st.fields)) {
+        errors |> push("@task_payload '{sname}' must be a struct with at least one field")
+        return 0u
+    }
+    var members : array<uint>
+    for (fld in st.fields) {
+        // Scalar / vector / matrix / fixed-array-of-those all lower plainly via emit_type (no Block /
+        // Offset / ArrayStride). Nested-struct fields would need a recursive PLAIN struct (build_block_struct
+        // adds offsets, which TaskPayloadWorkgroupEXT must not have), so reject those fail-closed for now.
+        if (!is_emittable_value_type(fld._type)) {
+            errors |> push("@task_payload '{sname}': field '{fld.name}' must be a scalar / vector / matrix / fixed array of those (nested-struct payload fields are not yet supported)")
+            delete members
+            return 0u
+        }
+        members |> push(emit_type(m, fld._type))
+    }
+    let id = alloc_id(m)
+    var ops <- [id]
+    ops |> push_from(members)
+    emit_n(m, SEC_TYPES, SpvOp.TypeStruct, ops)
+    delete ops
+    delete members
+    return id
+}
+
 // ===== global variable classification + emission =====
 def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : VariablePtr; stage : ShaderStage; var reflection : SpirvReflection; var errors : array<string>) {
     let vname = "{v.name}"
     let bi = builtin_info(vname)
     if (bi.ok) {
-        if (bi.req != stage) {
+        // The workgroup-grid builtins (gl_GlobalInvocationID / gl_LocalInvocationID / gl_WorkGroupID /
+        // gl_NumWorkGroups / gl_LocalInvocationIndex, all req=Compute in builtin_info) are equally valid
+        // in MESH and TASK shaders -- those stages are workgroup-dispatched (LocalSize) too, and a real
+        // mesh/task shader needs them to index its slice of the work (e.g. the payload survivor-list).
+        let workgroup_builtin = bi.req == ShaderStage.Compute
+        let stage_ok = (bi.req == stage ||
+            (workgroup_builtin && (stage == ShaderStage.Mesh || stage == ShaderStage.Task)))
+        if (!stage_ok) {
             errors |> push("builtin '{vname}' is only available in the {stage_name(bi.req)} stage, not {stage_name(stage)}")
             return
         }
@@ -544,6 +677,20 @@ def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : Variable
         if (bi.bi == SpvBuiltIn.DrawIndex) {
             ensure_draw_parameters(m, ctx)
         }
+        // gl_PrimitiveID in a fragment of a mesh pipeline: the id is not fixed-function-generated, so
+        // reading it pulls in MeshShadingEXT + SPV_EXT_mesh_shader (→ SPIR-V 1.4), same as the mesh stage.
+        // It is an integer fragment Input, so it MUST be Flat (no interpolation for ints; VUID-…-Flat-04744).
+        if (bi.bi == SpvBuiltIn.PrimitiveId) {
+            ensure_per_primitive(m, ctx)
+            emit(m, SEC_DECOR, SpvOp.Decorate, vid, uint(SpvDecoration.Flat))
+        }
+        return
+    }
+    // mesh per-vertex / per-primitive Output arrays (gl_MeshVerticesEXT / gl_PrimitiveTriangleIndicesEXT):
+    // recognized by name BEFORE the @ssbo array path below (their daslang type is array<...>, which the
+    // SSBO path would otherwise claim). Sized from the [mesh_shader] output config on ctx.
+    if (vname == "gl_MeshVerticesEXT" || vname == "gl_PrimitiveTriangleIndicesEXT" || vname == "gl_MeshPrimitivesEXT") {
+        classify_mesh_output(m, ctx, v, vname, stage, errors)
         return
     }
     // stage I/O: @in / @out user variables carry an explicit @location. They become Input/Output
@@ -565,11 +712,60 @@ def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : Variable
             return
         }
         let storage = is_in ? SpvStorageClass.Input : SpvStorageClass.Output
+        let is_per_prim = v.annotation |> find_arg("per_primitive") is tBool
+        // Mesh per-vertex / per-primitive USER output: in a mesh shader an @out varying is declared as
+        // an ARRAY (out array<float3> v_color, written v_color[i] = …) and lowers to a bare Output
+        // array sized by max_vertices (per-vertex) or max_primitives (@per_primitive), Location-decorated
+        // (+ PerPrimitiveEXT). The matching fragment @in is the per-fragment scalar — the rasteriser
+        // expands the array. Same is_mesh_output access path as gl_MeshVerticesEXT[i].
+        if (is_out && stage == ShaderStage.Mesh && v._type.baseType == Type.tArray) {
+            // Fail-closed: the element must be an emittable varying type (scalar / vector / matrix), or
+            // emit_type would panic on it (e.g. array<double> / array<SomeStruct>) -- mirror the
+            // @workgroup guard so an unsupported element type is a clean compile error, not a crash.
+            if (!is_emittable_value_type(v._type.firstType)) {
+                errors |> push("mesh output '{vname}': array element type is not a supported varying type (scalar / vector / matrix)")
+                return
+            }
+            let count = is_per_prim ? ctx.mesh_max_primitives : ctx.mesh_max_vertices
+            if (count <= 0) {
+                errors |> push("mesh output '{vname}': max_{is_per_prim ? "primitives" : "vertices"} must be > 0 (got {count})")
+                return
+            }
+            let elem_t = emit_type(m, v._type.firstType)
+            let arr = type_array(m, elem_t, count)
+            let apt = type_pointer(m, SpvStorageClass.Output, arr)
+            let avid = alloc_id(m)
+            emit(m, SEC_TYPES, SpvOp.Variable, apt, avid, uint(SpvStorageClass.Output))
+            emit(m, SEC_DECOR, SpvOp.Decorate, avid, uint(SpvDecoration.Location), uint(loc))
+            if (is_per_prim) {
+                ensure_per_primitive(m, ctx)
+                emit(m, SEC_DECOR, SpvOp.Decorate, avid, uint(SpvDecoration.PerPrimitiveEXT))
+            }
+            // Same Flat rule as scalar stage I/O, keyed on the ELEMENT type: an int/uint varying (or an
+            // explicit @flat) must be Flat so it matches the fragment-side scalar input (where Flat is
+            // auto-applied for integers); without it the output/input interface decorations mismatch.
+            let elem_bt = v._type.firstType.baseType
+            let elem_is_int = scalar_class(elem_bt) >= 0 && scalar_class(elem_bt) <= 1
+            if (elem_is_int || (v.annotation |> find_arg("flat") is tBool)) {
+                emit(m, SEC_DECOR, SpvOp.Decorate, avid, uint(SpvDecoration.Flat))
+            }
+            ctx.globals |> insert(intptr(v), GlobalInfo(var_id = avid, storage = SpvStorageClass.Output, value_type = arr, elem_type = elem_t, is_mesh_output = true))
+            ctx.interface_ids |> push(avid)
+            return
+        }
         let vt = emit_type(m, v._type)
         let pt = type_pointer(m, storage, vt)
         let vid = alloc_id(m)
         emit(m, SEC_TYPES, SpvOp.Variable, pt, vid, uint(storage))
         emit(m, SEC_DECOR, SpvOp.Decorate, vid, uint(SpvDecoration.Location), uint(loc))
+        // A fragment @per_primitive @in is the per-fragment side of a mesh per-primitive output: it must
+        // carry the matching PerPrimitiveEXT decoration so the rasteriser feeds it per-primitive. The
+        // fragment stage doesn't otherwise enable mesh-shading, so a @per_primitive @in alone must pull in
+        // the MeshShadingEXT capability (-> SPIR-V 1.4) that PerPrimitiveEXT requires.
+        if (is_in && is_per_prim) {
+            ensure_per_primitive(m, ctx)
+            emit(m, SEC_DECOR, SpvOp.Decorate, vid, uint(SpvDecoration.PerPrimitiveEXT))
+        }
         // Flat decoration. Vulkan mandates Flat on any integer/uint varying (no valid interpolation
         // mode exists for integers — the driver returns garbage without it), so emit it automatically
         // for those. Floats default to perspective-correct smooth interpolation; honour an explicit
@@ -833,6 +1029,31 @@ def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : Variable
         let vid = alloc_id(m)
         emit(m, SEC_TYPES, SpvOp.Variable, pt, vid, uint(SpvStorageClass.Workgroup))
         ctx.globals |> insert(intptr(v), GlobalInfo(var_id = vid, storage = SpvStorageClass.Workgroup, value_type = vt, is_ssbo = false))
+        return
+    }
+    // task -> mesh payload: @task_payload struct -> a TaskPayloadWorkgroupEXT OpVariable (a logical
+    // storage class, plain struct, no Block / Offset). The TASK shader writes it and EmitMeshTasksEXT
+    // carries its id to the dispatched mesh workgroups; the MESH shader declares the same struct and reads
+    // it. Member access reuses the is_block path (OpAccessChain by field index in the payload's storage).
+    // Mesh + task stages only; one payload per shader (the last @task_payload wins ctx.task_payload_id,
+    // which is fine -- a shader declares exactly one).
+    if (v.annotation |> find_arg("task_payload") is tBool) {
+        if (stage != ShaderStage.Task && stage != ShaderStage.Mesh) {
+            errors |> push("@task_payload '{vname}' is only valid in a task or mesh shader")
+            return
+        }
+        if (v._type.baseType != Type.tStructure || v._type.structType == null) {
+            errors |> push("@task_payload '{vname}' must be a struct")
+            return
+        }
+        let st = build_plain_struct(m, vname, v._type.structType, errors)
+        if (st == 0u) return
+        let pt = type_pointer(m, SpvStorageClass.TaskPayloadWorkgroupEXT, st)
+        let vid = alloc_id(m)
+        emit(m, SEC_TYPES, SpvOp.Variable, pt, vid, uint(SpvStorageClass.TaskPayloadWorkgroupEXT))
+        ctx.globals |> insert(intptr(v), GlobalInfo(var_id = vid, storage = SpvStorageClass.TaskPayloadWorkgroupEXT, value_type = st, is_block = true))
+        ctx.interface_ids |> push(vid)
+        ctx.task_payload_id = vid
         return
     }
     // module-scope constant: an immutable `let X = <const-expr>` referenced by the shader body. Fold the
@@ -1110,6 +1331,14 @@ def private ensure_mesh_shading(var m : SpirvModule; var ctx : EmitCtx) {
     emit_n(m, SEC_EXT, SpvOp.Extension, nm)
     delete nm
     ctx.mesh_shading_cap = true
+}
+
+// Emitting a PerPrimitiveEXT decoration requires the MeshShadingEXT capability + SPV_EXT_mesh_shader,
+// which require SPIR-V >= 1.4. The mesh stage already enables both, but a FRAGMENT reading a
+// @per_primitive @in (or gl_PrimitiveID) does not — so every PerPrimitiveEXT site routes through here.
+def private ensure_per_primitive(var m : SpirvModule; var ctx : EmitCtx) {
+    ensure_mesh_shading(m, ctx)
+    m.version = SPV_VERSION_1_4
 }
 
 // daslang math builtin -> GLSL.std.450 ext-inst opcode. abs/min/max/clamp/sign pick the F/S/U
@@ -1735,7 +1964,7 @@ class SpirvEmit : AstVisitor {
                 let rgi = rv != null ? (ctx.globals?[intptr(rv)] ?? GlobalInfo()) : GlobalInfo()
                 let storage = rgi.var_id != 0u ? rgi.storage : SpvStorageClass.StorageBuffer
                 let rname = rv != null ? string(rv.name) : "(?)"
-                let pointee = field_pointee_type(bm, expr._type, "{rname}[]")
+                let pointee = field_pointee_type(bm, expr._type, "{rname}[]", storage)
                 if (pointee == 0u) return expr
                 let ptr_t = type_pointer(bm, storage, pointee)
                 let res = alloc_id(bm)
@@ -1748,14 +1977,18 @@ class SpirvEmit : AstVisitor {
             return expr
         }
         let gi = ctx.globals?[intptr(bv)] ?? GlobalInfo()
-        // @workgroup shared fixed-array: a BARE array global (not wrapped in a Block struct), so the
-        // access chain is a single index off the variable -- no member-0 indirection like an SSBO.
-        if (gi.storage == SpvStorageClass.Workgroup) {
+        // BARE array global (not wrapped in a Block struct), so the access chain is a single index off
+        // the variable -- no member-0 indirection like an SSBO. Two flavours: @workgroup shared arrays
+        // and the mesh per-vertex / per-primitive Output arrays (gl_MeshVerticesEXT[i] /
+        // gl_PrimitiveTriangleIndicesEXT[i]). The mesh per-vertex element is a Block struct that
+        // emit_type can't lower, so use the classified elem_type; @workgroup scalar/vector elements
+        // lower fine via emit_type.
+        if (gi.storage == SpvStorageClass.Workgroup || gi.is_mesh_output) {
             let idx = value_of(expr.index)
             if (idx == 0u) return expr   // index failed to lower (error already pushed)
-            let pointee = emit_type(bm, expr._type)
+            let pointee = (gi.is_mesh_output && gi.elem_type != 0u) ? gi.elem_type : emit_type(bm, expr._type)
             let res = alloc_id(bm)
-            let ptr_t = type_pointer(bm, SpvStorageClass.Workgroup, pointee)
+            let ptr_t = type_pointer(bm, gi.storage, pointee)
             emit(bm, SEC_FUNCS, SpvOp.AccessChain, ptr_t, res, gi.var_id, idx)
             e2ptr[k] = res
             e2pty[k] = pointee
@@ -1842,18 +2075,31 @@ class SpirvEmit : AstVisitor {
         var bm & = unsafe(*m)
         let op = "{expr.op}"
         if (expr._type.baseType == Type.tVoid) {        // compound assignment: dst <op>= rhs
-            let bo = binop_code(compound_base(op), scalar_class(expr.left._type.baseType))
-            if (!bo.ok) {
-                errs |> push("unsupported compound assignment '{expr.op}'")
-                return expr
-            }
             let rhs = value_of(expr.right)
             let p = ptr_of(expr.left)
             if (p.id != 0u && rhs != 0u) {
                 let cur = alloc_id(bm)
                 emit(bm, SEC_FUNCS, SpvOp.Load, p.pty, cur, p.id)
-                let res = alloc_id(bm)
-                emit(bm, SEC_FUNCS, bo.code, p.pty, res, cur, rhs)
+                var res = 0u
+                // `*=` over mixed shapes (vector *= scalar, matrix *= …) needs OpVectorTimesScalar /
+                // OpMatrixTimes* exactly like the `*` binop — a component-wise OpFMul(vec, scalar) is
+                // illegal SPIR-V. Route multiply through emit_mul; same-shape falls back to bo.code below.
+                if (compound_base(op) == "*") {
+                    let mr = emit_mul(bm, expr, expr.left, cur, rhs, errs)
+                    if (mr.handled) {
+                        if (mr.id == 0u) return expr      // unsupported mix; error already pushed
+                        res = mr.id
+                    }
+                }
+                if (res == 0u) {
+                    let bo = binop_code(compound_base(op), scalar_class(expr.left._type.baseType))
+                    if (!bo.ok) {
+                        errs |> push("unsupported compound assignment '{expr.op}'")
+                        return expr
+                    }
+                    res = alloc_id(bm)
+                    emit(bm, SEC_FUNCS, bo.code, p.pty, res, cur, rhs)
+                }
                 emit(bm, SEC_FUNCS, SpvOp.Store, p.id, res)
             }
             return expr
@@ -1996,10 +2242,16 @@ class SpirvEmit : AstVisitor {
     // build_block_struct (idempotent under the type/decoration dedup pools). Used by both
     // visitExprField (direct + chained branches) and any other site that needs a Block-member
     // pointee type. `sname` is only used in error messages emitted by the recursion.
-    def field_pointee_type(var bm : SpirvModule; ft : TypeDecl?; sname : string) : uint {
+    def field_pointee_type(var bm : SpirvModule; ft : TypeDecl?; sname : string; storage : SpvStorageClass) : uint {
         if (ft == null) {
             errs |> push("internal: null field type at {sname}")
             return 0u
+        }
+        // TaskPayloadWorkgroupEXT is a PLAIN logical storage class (no Block / Offset / ArrayStride), so a
+        // field type lowers via emit_type -- the SAME id build_plain_struct used for the member, so the
+        // OpAccessChain types match. (Block storages below take the std140/std430 strided path.)
+        if (storage == SpvStorageClass.TaskPayloadWorkgroupEXT) {
+            return emit_type(bm, ft)
         }
         // matrices come back through emit_type -> type_matrix correctly; only tStructure and
         // tFixedArray need the layout-aware path.
@@ -2069,7 +2321,7 @@ class SpirvEmit : AstVisitor {
                 let rv = root_global_of(expr.value)
                 let rgi = rv != null ? (ctx.globals?[intptr(rv)] ?? GlobalInfo()) : GlobalInfo()
                 let storage = rgi.var_id != 0u ? rgi.storage : SpvStorageClass.StorageBuffer
-                let pointee = field_pointee_type(bm, expr._type, "{est.name}.{expr.name}")
+                let pointee = field_pointee_type(bm, expr._type, "{est.name}.{expr.name}", storage)
                 if (pointee == 0u) return expr
                 let ptr_t = type_pointer(bm, storage, pointee)
                 let res = alloc_id(bm)
@@ -2091,7 +2343,7 @@ class SpirvEmit : AstVisitor {
             errs |> push("member access '.{expr.name}': no such field on '{bv.name}'")
             return expr
         }
-        let pointee = field_pointee_type(bm, expr._type, "{bv.name}.{expr.name}")
+        let pointee = field_pointee_type(bm, expr._type, "{bv.name}.{expr.name}", gi.storage)
         if (pointee == 0u) return expr
         let ptr_t = type_pointer(bm, gi.storage, pointee)
         let res = alloc_id(bm)
@@ -2225,7 +2477,14 @@ class SpirvEmit : AstVisitor {
                 errs |> push("EmitMeshTasksEXT: could not evaluate a group-count operand")
                 return expr
             }
-            emit(bm, SEC_FUNCS, SpvOp.EmitMeshTasksEXT, gx, gy, gz)
+            // SPV_EXT_mesh_shader: OpEmitMeshTasksEXT takes an OPTIONAL 4th operand, the
+            // TaskPayloadWorkgroupEXT variable handed to the dispatched mesh workgroups. Append it when
+            // the task shader declared a @task_payload; otherwise the 3-operand form (no payload).
+            if (ctx.task_payload_id != 0u) {
+                emit(bm, SEC_FUNCS, SpvOp.EmitMeshTasksEXT, gx, gy, gz, ctx.task_payload_id)
+            } else {
+                emit(bm, SEC_FUNCS, SpvOp.EmitMeshTasksEXT, gx, gy, gz)
+            }
             ctx.terminated = true
             return expr
         }
@@ -3403,6 +3662,13 @@ def generate_spirv(fn : FunctionPtr; var errors : array<string>; stage : ShaderS
         m.version = SPV_VERSION_1_4
         ensure_mesh_shading(m, ctx)
     }
+    // Mesh per-vertex / per-primitive Output arrays (gl_MeshVerticesEXT, gl_PrimitiveTriangleIndicesEXT)
+    // are sized from the [mesh_shader] output config; classify_global reads these off ctx when it
+    // emits the array types. Only the mesh stage has these outputs (task dispatches, it doesn't emit
+    // geometry).
+    ctx.mesh_max_vertices = mesh_config.max_vertices
+    ctx.mesh_max_primitives = mesh_config.max_primitives
+    ctx.mesh_topology = mesh_config.topology
 
     collect_dependencies(fn) $(vfun, vvar) {
         for (v in vvar) {
@@ -3421,6 +3687,22 @@ def generate_spirv(fn : FunctionPtr; var errors : array<string>; stage : ShaderS
     let t_void = type_void(m)
     let t_fn = type_function_void(m, t_void)
     let id_main = alloc_id(m)
+
+    // SPIR-V >= 1.4: the EntryPoint interface must list EVERY global the entry point references --
+    // not only Input/Output (the <= 1.3 rule, already pushed by classify_global) but also Uniform /
+    // StorageBuffer / PushConstant / UniformConstant / Workgroup. Append the globals not already
+    // listed, ordered by var-id (= emission order) so the blob stays byte-reproducible.
+    if (m.version >= SPV_VERSION_1_4) {
+        var listed : table<uint>
+        for (iid in ctx.interface_ids) {
+            listed |> insert(iid)
+        }
+        var extra <- [for (gi in values(ctx.globals)); gi.var_id; where gi.var_id != 0u && !key_exists(listed, gi.var_id)]
+        sort(extra)
+        ctx.interface_ids |> push_from(extra)
+        delete extra
+        delete listed
+    }
 
     var ep <- [uint(execution_model(stage)), id_main]
     var nm <- string_words("main")

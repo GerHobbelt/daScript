@@ -86,4 +86,14 @@ def main {
     // PR-E mesh output config: non-default counts + lines / points topology.
     emit_golden(dir, "mesh_lines", mesh_lines_words())
     emit_golden(dir, "mesh_points", mesh_points_words())
+    // PR-E2 array-of-builtin output: one-triangle per-vertex Position + triangle index array.
+    emit_golden(dir, "mesh_tri", mesh_tri_words())
+    // PR-F mesh user + per-primitive-builtin outputs + the fragment gl_PrimitiveID read.
+    emit_golden(dir, "mesh_outs", mesh_outs_words())
+    emit_golden(dir, "prim_frag", prim_frag_words())
+    emit_golden(dir, "pp_frag", pp_frag_words())
+    // PR-G task -> mesh payload (TaskPayloadWorkgroupEXT): the task writes + EmitMeshTasksEXT 4-operand
+    // form, the mesh reads its survivor-list slice.
+    emit_golden(dir, "task_payload", task_payload_words())
+    emit_golden(dir, "mesh_payload", mesh_payload_words())
 }

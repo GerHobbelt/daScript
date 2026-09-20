@@ -58,6 +58,44 @@ def private has_execution_mode(words : array<uint>; mode : SpvExecutionMode) : b
     return op_has_operand_at(words, SpvOp.ExecutionMode, 1, uint(mode))
 }
 
+// Operand count (excluding word0) of the FIRST instruction with opcode `op`, or -1 if none.
+// Used to tell OpEmitMeshTasksEXT's 4-operand payload form (gx, gy, gz, payload) from the 3-operand
+// no-payload form.
+def private inst_operand_count(words : array<uint>; op : SpvOp) : int {
+    var cnt = -1
+    foreach_inst(words) $(opcode : uint; _w : array<uint>; _s, n : int) {
+        if (cnt >= 0 || opcode != uint(op)) return
+        cnt = n
+    }
+    return cnt
+}
+
+// Result id (operand 1) of the FIRST OpVariable whose storage class (operand 2) is
+// TaskPayloadWorkgroupEXT -- i.e. the @task_payload variable's id.
+def private task_payload_variable_id(words : array<uint>) : tuple<ok : bool; value : uint> {
+    var res = (ok = false, value = 0u)
+    foreach_inst(words) $(opcode : uint; w : array<uint>; s, n : int) {
+        if (res.ok || opcode != uint(SpvOp.Variable)) return
+        if (n > 2 && w[s + 2] == uint(SpvStorageClass.TaskPayloadWorkgroupEXT)) {
+            res = (ok = true, value = w[s + 1])
+        }
+    }
+    return res
+}
+
+// The payload id carried by OpEmitMeshTasksEXT: its optional 4th operand (index 3), present only in the
+// payload form. Returns ok=false when the terminator is the 3-operand (no-payload) form.
+def private emit_mesh_tasks_payload_id(words : array<uint>) : tuple<ok : bool; value : uint> {
+    var res = (ok = false, value = 0u)
+    foreach_inst(words) $(opcode : uint; w : array<uint>; s, n : int) {
+        if (res.ok || opcode != uint(SpvOp.EmitMeshTasksEXT)) return
+        if (n > 3) {
+            res = (ok = true, value = w[s + 3])
+        }
+    }
+    return res
+}
+
 // Read the operand at `opIdx` (0-based operand index, after word0 — same convention as
 // op_has_operand_at) of the OpExecutionMode whose mode literal (operand 1) equals `mode`. The count
 // for OutputVertices / OutputPrimitivesEXT sits at operand index 2 (operand 0 is the entry-point id,
@@ -71,6 +109,31 @@ def private exec_mode_operand(words : array<uint>; mode : SpvExecutionMode; opId
         }
     }
     return res
+}
+
+// Count the EntryPoint's interface ids (the trailing operands after the null-terminated entry name).
+// OpEntryPoint operands: 0 = execution model, 1 = entry-point id, 2.. = the name string (packed
+// LSB-first, NUL-terminated, so the first operand word carrying a zero byte is the terminator), then
+// one operand per interface variable. Used to assert the mesh outputs are listed (SPIR-V 1.4 requires
+// every referenced global in the interface).
+def private entry_point_interface_count(words : array<uint>) : int {
+    var count = -1
+    foreach_inst(words) $(opcode : uint; w : array<uint>; s, n : int) {
+        if (count >= 0 || opcode != uint(SpvOp.EntryPoint)) return
+        var i = 2
+        var name_done = false
+        while (i < n && !name_done) {
+            let wd = w[s + i]
+            for (b in range(4)) {
+                if (((wd >> uint(b * 8)) & 0xFFu) == 0u) {
+                    name_done = true
+                }
+            }
+            i++
+        }
+        count = n - i
+    }
+    return count
 }
 
 [test]
@@ -170,5 +233,153 @@ def test_mesh_output_config(t : T?) {
         t |> success(!has_execution_mode(pwords, SpvExecutionMode.OutputLinesEXT), "mesh_points: NO OutputLinesEXT")
         validate(t, pwords, "mesh_points")
         delete pwords
+    }
+}
+
+[test]
+def test_mesh_output_arrays(t : T?) {
+    t |> run("[mesh_shader] per-vertex/per-primitive output arrays: gl_MeshVerticesEXT + gl_PrimitiveTriangleIndicesEXT") <| @(t : T?) {
+        var words <- mesh_tri_words()
+        // per-vertex output block: an OpTypeStruct decorated Block whose member 0 is BuiltIn Position.
+        t |> success(op_has_operand_pair(words, SpvOp.MemberDecorate, uint(SpvDecoration.BuiltIn), uint(SpvBuiltIn.Position)),
+            "mesh_tri: per-vertex block member 0 is BuiltIn Position")
+        t |> success(op_has_operand_at(words, SpvOp.Decorate, 1, uint(SpvDecoration.Block)),
+            "mesh_tri: per-vertex block is Block-decorated")
+        // per-primitive index array: the variable itself is BuiltIn PrimitiveTriangleIndicesEXT.
+        t |> success(op_has_operand_pair(words, SpvOp.Decorate, uint(SpvDecoration.BuiltIn), uint(SpvBuiltIn.PrimitiveTriangleIndicesEXT)),
+            "mesh_tri: index array is BuiltIn PrimitiveTriangleIndicesEXT")
+        // output sizing matches the [mesh_shader] args (3 vertices, 1 primitive, triangles).
+        let mv = exec_mode_operand(words, SpvExecutionMode.OutputVertices, 2)
+        t |> success(mv.found && mv.value == 3u, "mesh_tri: OutputVertices == 3 (found={mv.found} value={mv.value})")
+        let mp = exec_mode_operand(words, SpvExecutionMode.OutputPrimitivesEXT, 2)
+        t |> success(mp.found && mp.value == 1u, "mesh_tri: OutputPrimitivesEXT == 1 (found={mp.found} value={mp.value})")
+        t |> success(has_execution_mode(words, SpvExecutionMode.OutputTrianglesEXT), "mesh_tri: ExecutionMode OutputTrianglesEXT")
+        // prologue + the four stores (3 per-vertex positions + 1 per-primitive index triple).
+        t |> success(has_op(words, SpvOp.SetMeshOutputsEXT), "mesh_tri: emits OpSetMeshOutputsEXT")
+        t |> success(count_op(words, SpvOp.Store) >= 4,
+            "mesh_tri: >= 4 OpStore (3 positions + 1 index, got {count_op(words, SpvOp.Store)})")
+        // mesh entry point + both mesh outputs listed in its interface (SPIR-V 1.4 requires every
+        // referenced global in the interface; the shader references exactly the two mesh-output arrays).
+        t |> success(op_has_operand_at(words, SpvOp.EntryPoint, 0, uint(SpvExecutionModel.MeshEXT)),
+            "mesh_tri: OpEntryPoint MeshEXT")
+        let niface = entry_point_interface_count(words)
+        t |> success(niface == 2, "mesh_tri: OpEntryPoint interface lists both mesh outputs (got {niface})")
+        validate(t, words, "mesh_tri")
+        delete words
+    }
+}
+
+[test]
+def test_mesh_user_outputs(t : T?) {
+    t |> run("[mesh_shader] user + per-primitive-builtin outputs: per-vertex varying + @per_primitive + gl_MeshPrimitivesEXT") <| @(t : T?) {
+        var words <- mesh_outs_words()
+        // per-vertex @out varying mo_vcolor: a Location-decorated Output array (Location 0).
+        t |> success(op_has_operand_pair(words, SpvOp.Decorate, uint(SpvDecoration.Location), 0u),
+            "mesh_outs: per-vertex varying has Location 0")
+        // per-primitive @out mo_pcolor: Location 1 + PerPrimitiveEXT on the variable.
+        t |> success(op_has_operand_pair(words, SpvOp.Decorate, uint(SpvDecoration.Location), 1u),
+            "mesh_outs: per-primitive output has Location 1")
+        t |> success(op_has_operand_at(words, SpvOp.Decorate, 1, uint(SpvDecoration.PerPrimitiveEXT)),
+            "mesh_outs: per-primitive output variable is PerPrimitiveEXT")
+        // gl_MeshPrimitivesEXT block: member 0 = BuiltIn PrimitiveId + PerPrimitiveEXT (both member decos).
+        t |> success(op_has_operand_pair(words, SpvOp.MemberDecorate, uint(SpvDecoration.BuiltIn), uint(SpvBuiltIn.PrimitiveId)),
+            "mesh_outs: gl_MeshPrimitivesEXT member 0 is BuiltIn PrimitiveId")
+        t |> success(op_has_operand_at(words, SpvOp.MemberDecorate, 2, uint(SpvDecoration.PerPrimitiveEXT)),
+            "mesh_outs: gl_MeshPrimitivesEXT member 0 is PerPrimitiveEXT")
+        // a per-vertex int varying (mo_id) must be Flat — matches the auto-Flat fragment-side int input.
+        t |> success(op_has_operand_at(words, SpvOp.Decorate, 1, uint(SpvDecoration.Flat)),
+            "mesh_outs: per-vertex int varying is Flat")
+        // six outputs in the interface: gl_MeshVerticesEXT, gl_PrimitiveTriangleIndicesEXT,
+        // gl_MeshPrimitivesEXT, mo_vcolor, mo_pcolor, mo_id.
+        let niface = entry_point_interface_count(words)
+        t |> success(niface == 6, "mesh_outs: OpEntryPoint interface lists all 6 outputs (got {niface})")
+        validate(t, words, "mesh_outs")
+        delete words
+        // pp_frag: a fragment reading a @per_primitive @in WITHOUT gl_PrimitiveID — the PerPrimitiveEXT
+        // decoration alone must still pull in the MeshShadingEXT cap (-> 1.4), else the blob is invalid.
+        var ppwords <- pp_frag_words()
+        t |> success(ppwords[1] == SPV_VERSION_1_4, "pp_frag: SPIR-V header version is 1.4 (PerPrimitiveEXT needs MeshShadingEXT)")
+        t |> success(op_has_operand_at(ppwords, SpvOp.Capability, 0, uint(SpvCapability.MeshShadingEXT)),
+            "pp_frag: OpCapability MeshShadingEXT")
+        t |> success(op_has_operand_at(ppwords, SpvOp.Decorate, 1, uint(SpvDecoration.PerPrimitiveEXT)),
+            "pp_frag: @per_primitive @in is PerPrimitiveEXT-decorated")
+        validate(t, ppwords, "pp_frag")
+        delete ppwords
+        // prim_frag: the fragment side reads gl_PrimitiveID — BuiltIn PrimitiveId + Flat (int input) +
+        // the MeshShadingEXT capability (-> SPIR-V 1.4).
+        var fwords <- prim_frag_words()
+        t |> success(fwords[1] == SPV_VERSION_1_4, "prim_frag: SPIR-V header version is 1.4 (MeshShadingEXT)")
+        t |> success(op_has_operand_at(fwords, SpvOp.Capability, 0, uint(SpvCapability.MeshShadingEXT)),
+            "prim_frag: OpCapability MeshShadingEXT")
+        t |> success(op_has_operand_pair(fwords, SpvOp.Decorate, uint(SpvDecoration.BuiltIn), uint(SpvBuiltIn.PrimitiveId)),
+            "prim_frag: gl_PrimitiveID is BuiltIn PrimitiveId")
+        t |> success(op_has_operand_at(fwords, SpvOp.Decorate, 1, uint(SpvDecoration.Flat)),
+            "prim_frag: gl_PrimitiveID is Flat (mandatory for an int fragment input)")
+        validate(t, fwords, "prim_frag")
+        delete fwords
+    }
+}
+
+[test]
+def test_mesh_task_payload(t : T?) {
+    t |> run("[task_shader]/[mesh_shader] @task_payload: TaskPayloadWorkgroupEXT + EmitMeshTasksEXT 4-operand + mesh read") <| @(t : T?) {
+        // task half: writes the payload (count + tint + survivor list) and dispatches `count` mesh
+        // workgroups, carrying the payload id as EmitMeshTasksEXT's optional 4th operand.
+        var twords <- task_payload_words()
+        t |> success(op_has_operand_at(twords, SpvOp.EntryPoint, 0, uint(SpvExecutionModel.TaskEXT)),
+            "task_payload: OpEntryPoint TaskEXT")
+        // @task_payload -> exactly one TaskPayloadWorkgroupEXT (5402) OpVariable (operand 2 = storage class).
+        t |> success(op_has_operand_at(twords, SpvOp.Variable, 2, uint(SpvStorageClass.TaskPayloadWorkgroupEXT)),
+            "task_payload: @task_payload -> TaskPayloadWorkgroupEXT OpVariable (storage 5402)")
+        let ntp = count_op_operand_at(twords, SpvOp.Variable, 2, uint(SpvStorageClass.TaskPayloadWorkgroupEXT))
+        t |> success(ntp == 1, "task_payload: exactly one TaskPayloadWorkgroupEXT variable (got {ntp})")
+        // the dispatch terminator carries the payload: OpEmitMeshTasksEXT in its 4-operand form
+        // (gx, gy, gz, payload) rather than the 3-operand no-payload form.
+        t |> success(has_op(twords, SpvOp.EmitMeshTasksEXT), "task_payload: emits OpEmitMeshTasksEXT")
+        let nops = inst_operand_count(twords, SpvOp.EmitMeshTasksEXT)
+        t |> success(nops == 4, "task_payload: OpEmitMeshTasksEXT is the 4-operand payload form (got {nops})")
+        // the payload variable id (operand 1 of OpVariable) is exactly the 4th operand (index 3) of the
+        // terminator -- i.e. the dispatch really carries THIS payload, not some other id.
+        let pvar = task_payload_variable_id(twords)
+        let pterm = emit_mesh_tasks_payload_id(twords)
+        t |> success(pvar.ok && pterm.ok && pvar.value == pterm.value,
+            "task_payload: EmitMeshTasksEXT 4th operand == the payload variable id (var={pvar.value} term={pterm.value})")
+        validate(t, twords, "task_payload")
+        delete twords
+        // mesh half: declares the SAME struct and reads its slice (survivors[gl_LocalInvocationIndex]) +
+        // the scalar/vector fields. A workgroup-grid builtin (LocalInvocationIndex) in a MESH shader is the
+        // gap PR-G closed; the read is an OpAccessChain into the TaskPayloadWorkgroupEXT variable + OpLoad.
+        var mwords <- mesh_payload_words()
+        t |> success(op_has_operand_at(mwords, SpvOp.EntryPoint, 0, uint(SpvExecutionModel.MeshEXT)),
+            "mesh_payload: OpEntryPoint MeshEXT")
+        t |> success(op_has_operand_at(mwords, SpvOp.Variable, 2, uint(SpvStorageClass.TaskPayloadWorkgroupEXT)),
+            "mesh_payload: @task_payload -> TaskPayloadWorkgroupEXT OpVariable (storage 5402)")
+        // the workgroup-grid builtin used to index the survivor list (was compute-only; now valid in mesh).
+        t |> success(op_has_operand_pair(mwords, SpvOp.Decorate, uint(SpvDecoration.BuiltIn), uint(SpvBuiltIn.LocalInvocationIndex)),
+            "mesh_payload: gl_LocalInvocationIndex -> BuiltIn LocalInvocationIndex (workgroup builtin in mesh)")
+        // member access into the payload: OpAccessChain (member/element select) + OpLoad (read).
+        t |> success(has_op(mwords, SpvOp.AccessChain), "mesh_payload: payload read emits OpAccessChain")
+        t |> success(has_op(mwords, SpvOp.Load), "mesh_payload: payload read emits OpLoad")
+        validate(t, mwords, "mesh_payload")
+        delete mwords
+    }
+}
+
+[test]
+def test_mesh_ubo_interface(t : T?) {
+    t |> run("[mesh_shader] reading a UBO: the Uniform variable is listed in the OpEntryPoint interface (SPIR-V 1.4)") <| @(t : T?) {
+        var words <- mesh_ubo_words()
+        t |> success(op_has_operand_at(words, SpvOp.EntryPoint, 0, uint(SpvExecutionModel.MeshEXT)),
+            "mesh_ubo: OpEntryPoint MeshEXT")
+        // the @uniform -> a Uniform-storage OpVariable (operand 2 = storage class).
+        t |> success(op_has_operand_at(words, SpvOp.Variable, 2, uint(SpvStorageClass.Uniform)),
+            "mesh_ubo: @uniform -> Uniform OpVariable")
+        // SPIR-V >= 1.4 requires every referenced global in the interface, so it lists the three outputs
+        // (gl_MeshVerticesEXT, gl_PrimitiveTriangleIndicesEXT, mu_col) AND the UBO -> 4. Before the fix the
+        // UBO was omitted (count 3) and the blob was invalid; spirv-val (below) is the other half of the guard.
+        let niface = entry_point_interface_count(words)
+        t |> success(niface == 4, "mesh_ubo: interface lists the UBO too (3 outputs + UBO = 4, got {niface})")
+        validate(t, words, "mesh_ubo")
+        delete words
     }
 }

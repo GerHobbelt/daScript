@@ -26,6 +26,7 @@ var gl_DrawID               : int       // BuiltIn DrawIndex (Input) — multi-d
 var gl_FragCoord            : float4    // BuiltIn FragCoord (Input)
 var gl_FragDepth            : float     // BuiltIn FragDepth (Output) — writing it forces DepthReplacing
 var gl_PointCoord           : float2    // BuiltIn PointCoord (Input) — UV within the rasterised point primitive, [0,1]^2; valid only when POINT_LIST topology is rendered
+var gl_PrimitiveID          : int       // BuiltIn PrimitiveId (Input, fragment) — the per-primitive id a mesh shader wrote via gl_MeshPrimitivesEXT[i].gl_PrimitiveID
 
 // ===== descriptor indexing =====
 // nonuniformEXT marks an index value as varying across invocations within a wavefront/subgroup
@@ -245,3 +246,28 @@ def public SetMeshOutputsEXT(vertex_count : uint; primitive_count : uint) : void
 // call on the same control-flow path is unreachable. Task-stage-only; stub body never runs.
 [unused_argument(x, y, z), sideeffects]
 def public EmitMeshTasksEXT(x : uint; y : uint; z : uint) : void {}
+
+// ===== mesh per-vertex / per-primitive output arrays (VK_EXT_mesh_shader) =====
+// gl_MeshVerticesEXT is the per-vertex output: an array (sized by the [mesh_shader] max_vertices arg)
+// of a block whose gl_Position lands in clip space. gl_PrimitiveTriangleIndicesEXT is the per-primitive
+// connectivity: an array (sized by max_primitives) of uint3, each a triangle's three indices into the
+// vertex array. The emitter recognizes BOTH by name in classify_global and emits the real Output arrays
+// (sized from the config, BuiltIn-decorated); the daslang `array<>` decls exist only so
+// `gl_MeshVerticesEXT[i].gl_Position = ...` and `gl_PrimitiveTriangleIndicesEXT[i] = uint3(...)`
+// typecheck. Mesh-stage-only; never executed — only the AST is read.
+struct gl_MeshPerVertexEXT {
+    gl_Position : float4
+}
+var gl_MeshVerticesEXT             : array<gl_MeshPerVertexEXT>
+var gl_PrimitiveTriangleIndicesEXT : array<uint3>
+
+// gl_MeshPrimitivesEXT is the per-primitive builtin output block (the per-primitive analog of
+// gl_MeshVerticesEXT): an array (sized by max_primitives) of a block whose gl_PrimitiveID the fragment
+// can read (`in int gl_PrimitiveID`). Written `gl_MeshPrimitivesEXT[i].gl_PrimitiveID = …`. The emitter
+// recognizes it by name and emits the real PerPrimitiveEXT-decorated Output array; the daslang decls
+// exist only so the indexing + field access typecheck. (gl_Layer / gl_ViewportIndex / gl_CullPrimitiveEXT
+// join the block in a follow-up.) gl_PrimitiveID is also a fragment Input builtin (read per fragment).
+struct gl_MeshPerPrimitiveEXT {
+    gl_PrimitiveID : int
+}
+var gl_MeshPrimitivesEXT : array<gl_MeshPerPrimitiveEXT>

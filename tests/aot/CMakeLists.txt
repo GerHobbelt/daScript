@@ -199,6 +199,7 @@ IF(NOT DAS_AUDIO_DISABLED)
         tests/strudel/test_integration.das
         tests/strudel/test_memory.das
         tests/strudel/test_orbits.das
+        tests/strudel/test_orbit_gain.das
         tests/strudel/test_reverb.das
         tests/strudel/test_scales.das
         tests/strudel/test_setters.das
@@ -209,6 +210,7 @@ IF(NOT DAS_AUDIO_DISABLED)
         tests/strudel/test_modal.das
         tests/strudel/test_sfx.das
         tests/audio/test_hrtf_budget.das
+        tests/audio/test_wav.das
     )
 ENDIF()
 

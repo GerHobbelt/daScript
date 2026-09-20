@@ -62,5 +62,16 @@ def test_fail_closed_rejections(t : T?) {
         // mesh-shader output config: bad topology string (parsed in patch) + non-positive count (emit gate)
         check_rejects(t, "_fc_mesh_topology", "output_topology must be")
         check_rejects(t, "_fc_mesh_count", "max_vertices must be > 0")
+        // mesh-output arrays: a per-vertex/per-primitive output outside a mesh stage, and a triangle
+        // index array under a non-triangle output topology
+        check_rejects(t, "_fc_mesh_vertices_stage", "is only available in a mesh shader")
+        check_rejects(t, "_fc_mesh_indices_topology", "requires output_topology")
+        // gl_PrimitiveID is a fragment-only Input builtin (reading it in a vertex shader is rejected)
+        check_rejects(t, "_fc_primid_stage", "is only available in the fragment stage")
+        // a mesh @out array<T> with an unsupported element type (double) fails closed, not crash emit_type
+        check_rejects(t, "_fc_mesh_out_badtype", "not a supported varying type")
+        // @task_payload outside a task/mesh stage, and a payload with a nested-struct field
+        check_rejects(t, "_fc_payload_stage", "is only valid in a task or mesh shader")
+        check_rejects(t, "_fc_payload_nested", "nested-struct payload fields are not yet supported")
     }
 }

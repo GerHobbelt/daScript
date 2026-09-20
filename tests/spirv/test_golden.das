@@ -181,5 +181,18 @@ def test_golden_disassembly(t : T?) {
         // OutputPoints topology. byte-identical check() pins the OpExecutionMode operands.
         check(t, "mesh_lines", mesh_lines_words())
         check(t, "mesh_points", mesh_points_words())
+        // PR-E2 array-of-builtin output (visitor baseline): per-vertex gl_Position Block + triangle
+        // index array. byte-identical check() pins the Block struct + two-level access-chain id order.
+        check(t, "mesh_tri", mesh_tri_words())
+        // PR-F mesh user + per-primitive-builtin outputs (visitor baseline): per-vertex varying +
+        // per-primitive output + gl_MeshPrimitivesEXT block; prim_frag = the fragment gl_PrimitiveID read.
+        check(t, "mesh_outs", mesh_outs_words())
+        check(t, "prim_frag", prim_frag_words())
+        check(t, "pp_frag", pp_frag_words())
+        // PR-G task -> mesh payload (visitor baseline): the @task_payload TaskPayloadWorkgroupEXT variable,
+        // the task writes + EmitMeshTasksEXT 4-operand form, and the mesh survivor-list read. byte-identical
+        // check() pins the plain-struct member ids + the payload access-chain order.
+        check(t, "task_payload", task_payload_words())
+        check(t, "mesh_payload", mesh_payload_words())
     }
 }
