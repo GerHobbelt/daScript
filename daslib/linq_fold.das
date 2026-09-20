@@ -415,23 +415,60 @@ def private peel_each(var top : Expression?) : Expression? {
 
 [macro_function]
 def private finalize_invoke(var res : Expression?; at : LineInfo) : Expression? {
-    // Post-emit cleanup: stamp loc+generated for diagnostics; set can_shadow so gensym src coexists with user scope.
+    // Post-emit cleanup: stamp loc+generated for diagnostics; set can_shadow on every block arg so gensym sources coexist with user scope. Loop handles 1-source single planners and N-source zip emission uniformly.
     res.force_at(at)
     res.force_generated(true)
     let blk = (res as ExprInvoke).arguments[0] as ExprMakeBlock
-    (blk._block as ExprBlock).arguments[0].flags.can_shadow = true
+    var blkBlock = blk._block as ExprBlock
+    for (i in 0 .. length(blkBlock.arguments)) {
+        blkBlock.arguments[i].flags.can_shadow = true
+    }
     return res
 }
 
 [macro_function]
+def private finalize_lane_emission(var topExprs : array<Expression?>; srcNames : array<string>;
+                                   var bodyStmts : array<Expression?>; at : LineInfo) : Expression? {
+    // Multi-source-aware invoke wrap used by emit_accumulator_lane / emit_early_exit_lane. 1-source clones top + derives param type + emits 1-arg invoke; 2-source (zip) does both sides + emits 2-arg invoke. Caller has already pushed the for-loop into bodyStmts.
+    let nSrcs = length(srcNames)
+    if (nSrcs != 1 && nSrcs != 2) panic("finalize_lane_emission: only 1- or 2-source supported (got {nSrcs}); higher-arity zip planners must extend this branch (or build the invoke wrap directly)")
+    if (length(topExprs) != nSrcs) panic("finalize_lane_emission: topExprs length {length(topExprs)} != srcNames length {nSrcs}")
+    if (nSrcs == 1) {
+        var topExpr = clone_expression(topExprs[0])
+        topExpr.genFlags.alwaysSafe = true
+        var srcParamType = invoke_src_param_type(topExprs[0])
+        var res = qmacro(invoke($($i(srcNames[0]) : $t(srcParamType)) {
+            $b(bodyStmts)
+        }, $e(topExpr)))
+        return finalize_invoke(res, at)
+    }
+    var topAExpr = clone_expression(topExprs[0])
+    topAExpr.genFlags.alwaysSafe = true
+    var topBExpr = clone_expression(topExprs[1])
+    topBExpr.genFlags.alwaysSafe = true
+    var srcAType = invoke_src_param_type(topExprs[0])
+    var srcBType = invoke_src_param_type(topExprs[1])
+    var res = qmacro(invoke($($i(srcNames[0]) : $t(srcAType), $i(srcNames[1]) : $t(srcBType)) {
+        $b(bodyStmts)
+    }, $e(topAExpr), $e(topBExpr)))
+    return finalize_invoke(res, at)
+}
+
+[macro_function]
 def private emit_length_shortcut(opName : string; var top : Expression?; srcName : string; at : LineInfo) : Expression? {
-    // Count-shaped shortcut: emit `length(src)` (count) or `int64(length(src))` (long_count)
+    // Count-shaped shortcut: emit `length(src)` (count, int) or `int64(length(src))` (long_count). length returns int, so the int() cast on count would be redundant — interp doesn't fold it and PERF020 fires.
     var topExpr = clone_expression(top)
     topExpr.genFlags.alwaysSafe = true
-    let castName = opName == "long_count" ? "int64" : "int"
-    var res = qmacro(invoke($($i(srcName) : typedecl($e(topExpr))) {
-        return $c(castName)(length($i(srcName)))
-    }, $e(topExpr)))
+    var res : Expression?
+    if (opName == "long_count") {
+        res = qmacro(invoke($($i(srcName) : typedecl($e(topExpr))) {
+            return int64(length($i(srcName)))
+        }, $e(topExpr)))
+    } else {
+        res = qmacro(invoke($($i(srcName) : typedecl($e(topExpr))) {
+            return length($i(srcName))
+        }, $e(topExpr)))
+    }
     return finalize_invoke(res, at)
 }
 
@@ -658,13 +695,14 @@ def private emit_array_lane(var top : Expression?; var expr : Expression?; var l
 [macro_function]
 def private emit_accumulator_lane(
                                   opName : string;
-                                  var top : Expression?;
+                                  var topExprs : array<Expression?>;
                                   var projection : Expression?;
                                   var whereCond : Expression?;
                                   var intermediateBinds : array<Expression?>;
                                   var preCondStmts : array<Expression?>;
                                   var elementType : TypeDeclPtr;
-                                  srcName, accName, itName, skipName, takeCountName, skippingName : string;
+                                  srcNames : array<string>;
+                                  accName, itName, skipName, takeCountName, skippingName : string;
                                   var skipExpr, takeExpr, skipWhileCond, takeWhileCond : Expression?;
                                   at : LineInfo
                                   ) : Expression? {
@@ -722,16 +760,24 @@ def private emit_accumulator_lane(
             $i(accName)
         }
     } elif (opName == "average") {
+        // Matches linq.das:1545 average(iterator) — always-double accumulator, uint64 counter, empty source returns 0.0lf instead of NaN. Source-element cast lifted out at macro time to avoid PERF020 redundant-cast trip when the input is already double.
         preludeStmts <- qmacro_block_to_array() {
-            var $i(accName) : $t(accType) = default<$t(accType)>
-            var $i(cntName) = 0
+            var $i(accName) : double = 0lf
+            var $i(cntName) : uint64 = 0ul
         }
-        perMatchStmts <- qmacro_block_to_array() {
-            $i(accName) += $e(valueExpr)
-            $i(cntName) ++
+        if (accType != null && accType.baseType == Type.tDouble) {
+            perMatchStmts <- qmacro_block_to_array() {
+                $i(accName) += $e(valueExpr)
+                $i(cntName) ++
+            }
+        } else {
+            perMatchStmts <- qmacro_block_to_array() {
+                $i(accName) += double($e(valueExpr))
+                $i(cntName) ++
+            }
         }
         returnExpr = qmacro_expr() {
-            double($i(accName)) / double($i(cntName))
+            $i(cntName) != 0ul ? $i(accName) / double($i(cntName)) : 0lf
         }
     } elif (opName == "min" || opName == "max") {
         preludeStmts <- qmacro_block_to_array() {
@@ -766,21 +812,24 @@ def private emit_accumulator_lane(
     for (s in preludeStmts) {
         bodyStmts |> push(s)
     }
-    bodyStmts |> push <| qmacro_expr() {
-        for ($i(itName) in $i(srcName)) {
-            $e(loopBody)
+    // For-loop emission: single-source uses one iter var (itName); 2-source (zip) uses literal `itA, itB` parallel iter vars (qmacro for-loop iter-var position doesn't accept $i(...) splice). Caller (plan_zip) threads `let it = (itA, itB)` via preCondStmts so itName resolves inside the loop body.
+    if (length(srcNames) == 1) {
+        bodyStmts |> push <| qmacro_expr() {
+            for ($i(itName) in $i(srcNames[0])) {
+                $e(loopBody)
+            }
+        }
+    } else {
+        bodyStmts |> push <| qmacro_expr() {
+            for (itA, itB in $i(srcNames[0]), $i(srcNames[1])) {
+                $e(loopBody)
+            }
         }
     }
     bodyStmts |> push <| qmacro_expr() {
         return $e(returnExpr)
     }
-    var topExpr = clone_expression(top)
-    topExpr.genFlags.alwaysSafe = true
-    var srcParamType = invoke_src_param_type(top)
-    var res = qmacro(invoke($($i(srcName) : $t(srcParamType)) {
-        $b(bodyStmts)
-    }, $e(topExpr)))
-    return finalize_invoke(res, at)
+    return finalize_lane_emission(topExprs, srcNames, bodyStmts, at)
 }
 
 [macro_function]
@@ -797,14 +846,15 @@ def private emit_any_empty_shortcut(var top : Expression?; srcName : string; at 
 [macro_function]
 def private emit_early_exit_lane(
                                  opName : string;
-                                 var top : Expression?;
+                                 var topExprs : array<Expression?>;
                                  var projection : Expression?;
                                  var whereCond : Expression?;
                                  var intermediateBinds : array<Expression?>;
                                  var preCondStmts : array<Expression?>;
                                  var elementType : TypeDeclPtr;
                                  terminatorCall : ExprCall?;
-                                 srcName, itName, skipName, takeCountName, skippingName : string;
+                                 srcNames : array<string>;
+                                 itName, skipName, takeCountName, skippingName : string;
                                  var skipExpr, takeExpr, skipWhileCond, takeWhileCond : Expression?;
                                  at : LineInfo
                                  ) : Expression? {
@@ -1122,21 +1172,24 @@ def private emit_early_exit_lane(
     for (s in preludeStmts) {
         bodyStmts |> push(s)
     }
-    bodyStmts |> push <| qmacro_expr() {
-        for ($i(itName) in $i(srcName)) {
-            $e(loopBody)
+    // For-loop emission: 1-source uses itName; 2-source (zip) uses literal `itA, itB` (qmacro for-iter-var position doesn't accept $i splice). Caller (plan_zip) threads `let it = (itA, itB)` via preCondStmts.
+    if (length(srcNames) == 1) {
+        bodyStmts |> push <| qmacro_expr() {
+            for ($i(itName) in $i(srcNames[0])) {
+                $e(loopBody)
+            }
+        }
+    } else {
+        bodyStmts |> push <| qmacro_expr() {
+            for (itA, itB in $i(srcNames[0]), $i(srcNames[1])) {
+                $e(loopBody)
+            }
         }
     }
     for (s in tailStmts) {
         bodyStmts |> push(s)
     }
-    var topExpr = clone_expression(top)
-    topExpr.genFlags.alwaysSafe = true
-    var srcParamType = invoke_src_param_type(top)
-    var res = qmacro(invoke($($i(srcName) : $t(srcParamType)) {
-        $b(bodyStmts)
-    }, $e(topExpr)))
-    return finalize_invoke(res, at)
+    return finalize_lane_emission(topExprs, srcNames, bodyStmts, at)
 }
 
 [macro_function]
@@ -1195,6 +1248,13 @@ def private order_top_n_call_name(orderName : string) : string {
     return ""
 }
 
+def private order_min_call_name(orderName : string; hasKey : bool) : string {
+    // `order + first` collapses to min/max — asc → min, desc → max. Keyed forms route to min_by/max_by.
+    let isDesc = orderName == "order_descending" || orderName == "order_by_descending"
+    if (hasKey) return isDesc ? "max_by" : "min_by"
+    return isDesc ? "max" : "min"
+}
+
 [macro_function]
 def private try_make_inline_cmp(orderKey : Expression?; orderName : string;
                                 elemType : TypeDeclPtr; at : LineInfo) : Expression? {
@@ -1236,6 +1296,8 @@ def private plan_order_family(var expr : Expression?) : Expression? {
     var orderKey : Expression?
     var orderElemType : TypeDeclPtr
     var takeExpr : Expression?
+    var firstName : string
+    var firstDefaultExpr : Expression?
     var hasOrder = false
     let at = calls[0]._0.at
     let itName = "`it`{at.line}`{at.column}"
@@ -1253,17 +1315,28 @@ def private plan_order_family(var expr : Expression?) : Expression? {
         } elif (name == "order" || name == "order_descending"
                 || name == "order_by" || name == "order_by_descending") {
             if (hasOrder) return null
+            // bail on `order(arr, cmp)` / `order_descending(arr, cmp)` — splice helpers (min/max/top_n) can't honor a user-supplied comparator and would silently drop it.
+            let argCount = cll._0.arguments |> length
+            if ((name == "order" || name == "order_descending") && argCount >= 2) return null
             hasOrder = true
             orderName = name
-            if ((cll._0.arguments |> length) >= 2) {
+            if (argCount >= 2) {
                 orderKey = clone_expression(cll._0.arguments[1])
             }
             orderElemType = clone_type(cll._0._type.firstType)
         } elif (name == "take") {
-            if (!hasOrder || takeExpr != null) return null
+            if (!hasOrder || takeExpr != null || firstName != "") return null
             var arg = cll._0.arguments[1]
             if (arg == null || arg._type == null || arg._type.baseType != Type.tInt) return null
             takeExpr = clone_expression(arg)
+        } elif (name == "first" || name == "first_or_default") {
+            // order + first → min/max (O(N) instead of sort + index). Must be terminal.
+            if (!hasOrder || takeExpr != null || firstName != "" || i != length(calls) - 1) return null
+            firstName = name
+            if (name == "first_or_default") {
+                if ((cll._0.arguments |> length) < 2) return null
+                firstDefaultExpr = clone_expression(cll._0.arguments[1])
+            }
         } else {
             return null
         }
@@ -1278,12 +1351,51 @@ def private plan_order_family(var expr : Expression?) : Expression? {
     if (hasKey) {
         inlineCmp = try_make_inline_cmp(orderKey, orderName, orderElemType, at)
     }
+    let minMaxName = order_min_call_name(orderName, hasKey)
     if (whereCond == null) {
         // No prefilter — direct call to daslib helper.
         var topExpr = clone_expression(top)
         topExpr.genFlags.alwaysSafe = true
         var emission : Expression?
-        if (takeExpr == null) {
+        if (firstName == "first") {
+            // order + first → preserve eager `first()` panic-on-empty. min/max return an uninitialized ref on empty, so wrap in an empty-guard for arrays (zero alloc, O(N) min scan), or use top_n*(_, 1, _) |> first() for iterators (n=1 bounded heap; first() panics on empty).
+            if (top._type.isGoodArrayType) {
+                var srcParamType = invoke_src_param_type(top)
+                let firstSrcName = "`first_src`{at.line}`{at.column}"
+                var minMaxCall : Expression?
+                if (hasKey) {
+                    minMaxCall = qmacro($c(minMaxName)($i(firstSrcName), $e(orderKey)))
+                } else {
+                    minMaxCall = qmacro($c(minMaxName)($i(firstSrcName)))
+                }
+                emission = qmacro(invoke($($i(firstSrcName) : $t(srcParamType)) {
+                    panic("sequence contains no elements") if (empty($i(firstSrcName)))
+                    return $e(minMaxCall)
+                }, $e(topExpr)))
+                emission = finalize_invoke(emission, at)
+            } else {
+                var topNCall : Expression?
+                if (inlineCmp != null) {
+                    topNCall = qmacro(_::top_n_by_with_cmp($e(topExpr), 1, $e(inlineCmp)))
+                } elif (hasKey) {
+                    topNCall = qmacro($c(topNName)($e(topExpr), 1, $e(orderKey)))
+                } else {
+                    topNCall = qmacro($c(topNName)($e(topExpr), 1))
+                }
+                emission = qmacro(_::first($e(topNCall)))
+            }
+        } elif (firstName == "first_or_default") {
+            // No min_by_or_default exists; route through top_n*(_, 1, _) which returns an array (empty or single-element), then first_or_default supplies the default.
+            var topNCall : Expression?
+            if (inlineCmp != null) {
+                topNCall = qmacro(_::top_n_by_with_cmp($e(topExpr), 1, $e(inlineCmp)))
+            } elif (hasKey) {
+                topNCall = qmacro($c(topNName)($e(topExpr), 1, $e(orderKey)))
+            } else {
+                topNCall = qmacro($c(topNName)($e(topExpr), 1))
+            }
+            emission = qmacro(_::first_or_default($e(topNCall), $e(firstDefaultExpr)))
+        } elif (takeExpr == null) {
             // Bare order family — emit the direct call. Same shape as plain LINQ, but via
             if (inlineCmp != null) {
                 // Inlined comparator dispatches to the asc `order(src, block)` overload —
@@ -1304,7 +1416,7 @@ def private plan_order_family(var expr : Expression?) : Expression? {
             }
         }
         // Wrap with to_sequence_move only when emission is array-shaped: take dispatches to
-        let emissionIsArray = takeExpr != null || top._type.isGoodArrayType
+        let emissionIsArray = takeExpr != null || (firstName == "" && top._type.isGoodArrayType)
         if (needIterWrap && emissionIsArray) {
             emission = qmacro($e(emission).to_sequence_move())
         }
@@ -1337,7 +1449,34 @@ def private plan_order_family(var expr : Expression?) : Expression? {
             $e(loopBody)
         }
     }
-    if (takeExpr == null) {
+    if (firstName == "first") {
+        // where + order + first → min/max on prefilter buffer. Empty buf must panic to match eager `first()` semantics; min/max return uninitialized refs on empty.
+        stmts |> push <| qmacro_expr() {
+            panic("sequence contains no elements") if (empty($i(bufName)))
+        }
+        var minMaxCall : Expression?
+        if (hasKey) {
+            minMaxCall = qmacro($c(minMaxName)($i(bufName), $e(orderKey)))
+        } else {
+            minMaxCall = qmacro($c(minMaxName)($i(bufName)))
+        }
+        stmts |> push <| qmacro_expr() {
+            return $e(minMaxCall)
+        }
+    } elif (firstName == "first_or_default") {
+        // No min_by_or_default helper exists; route through top_n*(_, 1, _) + first_or_default for the empty-buf case.
+        var topNCall : Expression?
+        if (inlineCmp != null) {
+            topNCall = qmacro(_::top_n_by_with_cmp($i(bufName), 1, $e(inlineCmp)))
+        } elif (hasKey) {
+            topNCall = qmacro($c(topNName)($i(bufName), 1, $e(orderKey)))
+        } else {
+            topNCall = qmacro($c(topNName)($i(bufName), 1))
+        }
+        stmts |> push <| qmacro_expr() {
+            return _::first_or_default($e(topNCall), $e(firstDefaultExpr))
+        }
+    } elif (takeExpr == null) {
         // Sort the prefilter buffer in place and return it. order*_inplace is void
         var sortCall : Expression?
         if (inlineCmp != null) {
@@ -1511,10 +1650,15 @@ def private plan_loop_or_count(var expr : Expression?) : Expression? {
             && type_has_length(top._type))
         return emit_length_shortcut(lastName, top, srcName, at)
     // Ring 1: accumulator lane builds its own per-op loop body (typed accumulator, optional
-    if (lane == LinqLane.ACCUMULATOR)
-        return emit_accumulator_lane(lastName, top, projection, whereCond,
-            intermediateBinds, preCondStmts, elementType, srcName, accName, itName, skipName, takeCountName,
+    if (lane == LinqLane.ACCUMULATOR) {
+        var laneTops : array<Expression?>
+        laneTops |> push(top)
+        var laneSrcs : array<string>
+        laneSrcs |> push(srcName)
+        return emit_accumulator_lane(lastName, laneTops, projection, whereCond,
+            intermediateBinds, preCondStmts, elementType, laneSrcs, accName, itName, skipName, takeCountName,
             skippingName, skipExpr, takeExpr, skipWhileCond, takeWhileCond, at)
+    }
     // Ring 2: early-exit lane — `any` no-pred + no upstream work + no limits + length-bearing
     if (lane == LinqLane.EARLY_EXIT) {
         let terminatorCall = calls.back()._0
@@ -1522,8 +1666,12 @@ def private plan_loop_or_count(var expr : Expression?) : Expression? {
         if (isAnyNoPred && whereCond == null && allProjectionsPure && noLimits
                 && type_has_length(top._type))
             return emit_any_empty_shortcut(top, srcName, at)
-        return emit_early_exit_lane(lastName, top, projection, whereCond,
-            intermediateBinds, preCondStmts, elementType, terminatorCall, srcName, itName, skipName,
+        var laneTops : array<Expression?>
+        laneTops |> push(top)
+        var laneSrcs : array<string>
+        laneSrcs |> push(srcName)
+        return emit_early_exit_lane(lastName, laneTops, projection, whereCond,
+            intermediateBinds, preCondStmts, elementType, terminatorCall, laneSrcs, itName, skipName,
             takeCountName, skippingName, skipExpr, takeExpr, skipWhileCond, takeWhileCond, at)
     }
     // Build the per-element loop body for COUNTER / ARRAY. Both lanes follow the same shape:
@@ -2882,6 +3030,7 @@ struct private DecsBridgeShape {
     forExpr     : ExpressionPtr     // cloned ExprFor — inner multi-iter for-loop; body replaced when splicing
     iterNames   : array<string>     // bridge's iter var names (prefixed component names)
     userNames   : array<string>     // user-facing field names from the push tuple — feed the named-tuple bind that lets the user's `_.userName` chain access work
+    elementType : TypeDeclPtr       // named-tuple type (from resVar._type.firstType) — used by to_array/first when no projection
 }
 
 [macro_function]
@@ -2973,9 +3122,120 @@ def private extract_decs_bridge(var top : Expression?) : DecsBridgeShape? {
         archName := archName,
         forExpr = clone_expression(forExpr),
         iterNames <- iterNames,
-        userNames <- userNames
+        userNames <- userNames,
+        elementType = clone_type(resVar._type.firstType)
     )
     return info
+}
+
+[macro_function]
+def private build_decs_tup_bind(bridge : DecsBridgeShape?; tupName : string; at : LineInfo) : Expression? {
+    // Named-tuple bind: `var tup = (n1=iter1, n2=iter2, ...)` — fold_linq_cond peels user lambdas substituting `_.userName` → `tup.userName`.
+    var mkTup = new ExprMakeTuple(at = at)
+    mkTup.recordNames |> resize(length(bridge.userNames))
+    for (i in 0 .. length(bridge.userNames)) {
+        mkTup.recordNames[i] := bridge.userNames[i]
+        mkTup.values |> emplace_new(new ExprVar(at = at, name := bridge.iterNames[i]))
+    }
+    return qmacro_expr() {
+        var $i(tupName) = $e(mkTup)
+    }
+}
+
+[macro_function]
+def private build_decs_inner_for(bridge : DecsBridgeShape?; var tupBind : Expression?; var body : Expression?; at : LineInfo) : Expression? {
+    // Clone bridge's inner multi-iter for-loop; substitute body with [tupBind, body]. Reuses bridge.archName so cloned get_ro sources stay valid.
+    var forBodyStmts <- [tupBind, body]
+    var forBody = stmts_to_expr(forBodyStmts)
+    var clonedForExpr = clone_expression(bridge.forExpr)
+    var clonedFor = clonedForExpr as ExprFor
+    var newForBody = new ExprBlock(at = at)
+    newForBody.list |> push(forBody)
+    clonedFor.body = newForBody
+    return clonedForExpr
+}
+
+struct private DecsChainInfo {
+    bindAt      : array<string>    // bind name visible at each chain position
+    finalBind   : string            // bind name AFTER full chain — what terminator references
+    finalType   : TypeDeclPtr       // element type AFTER full chain (constant + ref stripped)
+    selectCount : int               // number of `select` ops in chain; 0 means finalBind == tupName
+}
+
+[macro_function]
+def private compute_decs_chain_info(var calls : array<tuple<ExprCall?; LinqCall?>>;
+                                    intermediateEnd : int;
+                                    tupName : string;
+                                    bridge : DecsBridgeShape?;
+                                    at : LineInfo) : DecsChainInfo? {
+    // Each select introduces a fresh `decs_sel{N}` bind; subsequent ops peel against it. Returns null on any non-where_/select op.
+    var info = new DecsChainInfo(
+        finalBind := tupName,
+        finalType = clone_type(bridge.elementType),
+        selectCount = 0
+    )
+    info.bindAt |> reserve(intermediateEnd)
+    var curBind = tupName
+    var curType : TypeDeclPtr = clone_type(bridge.elementType)
+    for (i in 0 .. intermediateEnd) {
+        info.bindAt |> push(curBind)
+        var cll & = unsafe(calls[i])
+        let opName = cll._1.name
+        if (opName == "select") {
+            info.selectCount ++
+            curBind = "`decs_sel`{at.line}`{at.column}`{info.selectCount}"
+            var peeled = fold_linq_cond(cll._0.arguments[1], info.bindAt[i])
+            if (peeled == null || peeled._type == null) return null
+            curType = clone_type(peeled._type)
+        } elif (opName != "where_") return null
+    }
+    info.finalBind := curBind
+    info.finalType = curType
+    if (info.finalType != null) {
+        info.finalType.flags.constant = false
+        info.finalType.flags.ref = false
+    }
+    return info
+}
+
+[macro_function]
+def private wrap_decs_chain(var action : Expression?;
+                            chainInfo : DecsChainInfo?;
+                            var calls : array<tuple<ExprCall?; LinqCall?>>;
+                            intermediateEnd : int;
+                            at : LineInfo) : Expression? {
+    // Reverse-walk chain, wrapping action with `if (pred) { ... }` for where_ and `let bindN+1 = proj; ...` for select.
+    var current = action
+    for (rev in 0 .. intermediateEnd) {
+        let i = intermediateEnd - 1 - rev
+        var cll & = unsafe(calls[i])
+        let opName = cll._1.name
+        let bindHere = chainInfo.bindAt[i]
+        if (opName == "where_") {
+            var pred = fold_linq_cond(cll._0.arguments[1], bindHere)
+            if (pred == null) return null
+            current = qmacro_expr() {
+                if ($e(pred)) {
+                    $e(current)
+                }
+            }
+        } elif (opName == "select") {
+            var proj = fold_linq_cond(cll._0.arguments[1], bindHere)
+            if (proj == null) return null
+            let nextBind = (i + 1 < intermediateEnd) ? chainInfo.bindAt[i + 1] : chainInfo.finalBind
+            var letStmt = qmacro_expr() {
+                let $i(nextBind) = $e(proj)
+            }
+            var stmts : array<Expression?>
+            stmts |> reserve(2)
+            stmts |> push(letStmt)
+            stmts |> push(current)
+            current = stmts_to_expr(stmts)
+        } else {
+            return null
+        }
+    }
+    return current
 }
 
 [macro_function]
@@ -2985,10 +3245,13 @@ def private emit_decs_count_archsize(bridge : DecsBridgeShape?; at : LineInfo) :
     let archName = "`decs_arch`{at.line}`{at.column}"
     var reqExpr = clone_expression(bridge.reqHashExpr)
     var erqExpr = clone_expression(bridge.erqExpr)
+    // arch.size is int64 (decs PR-C); count() surface returns int, so cast at
+    // the += site. Past INT_MAX entities the cast silently truncates; users
+    // who need the int64-safe total chain `long_count()` instead.
     var emission : Expression? = qmacro(invoke($() : int {
         var $i(accName) = 0
         for_each_archetype($e(reqExpr), $e(erqExpr), $($i(archName) : Archetype) {
-            $i(accName) += $i(archName).size
+            $i(accName) += int($i(archName).size)
         })
         return $i(accName)
     }))
@@ -3000,52 +3263,72 @@ def private emit_decs_count_archsize(bridge : DecsBridgeShape?; at : LineInfo) :
 [macro_function]
 def private emit_decs_accumulator(bridge : DecsBridgeShape?;
                                   opName : string;
-                                  var projection : Expression?;
-                                  var whereCond : Expression?;
+                                  chainInfo : DecsChainInfo?;
+                                  var calls : array<tuple<ExprCall?; LinqCall?>>;
+                                  intermediateEnd : int;
+                                  terminatorCall : ExprCall?;
                                   var accType : TypeDeclPtr;
                                   at : LineInfo) : Expression? {
-    // Slice 2 accumulator emission: count / long_count / sum with optional _where + single _select chain ops.
+    // Slice 2/3a/4 accumulator emission: count / long_count / sum / min / max / average with chained _select + interleaved _where + optional _count(pred).
     let accName = "`decs_acc`{at.line}`{at.column}"
     let tupName = "`decs_tup`{at.line}`{at.column}"
-    // Per-element body: acc += <value> for sum, acc++ for count/long_count.
+    let cntName = "`decs_cnt`{at.line}`{at.column}"
+    let firstName = "`decs_first`{at.line}`{at.column}"
+    let valBindName = "`decs_val`{at.line}`{at.column}"
+    let finalBind = chainInfo.finalBind
     var perElement : Expression?
     if (opName == "sum") {
         perElement = qmacro_expr() {
-            $i(accName) += $e(projection)
+            $i(accName) += $i(finalBind)
         }
-    } elif (opName == "long_count") {
-        perElement = qmacro_expr() {
-            $i(accName) ++
+    } elif (opName == "average") {
+        // Matches linq.das:1545 average() — always-double accumulator, uint64 counter, empty source returns 0.0lf. Cast lifted out at macro time so already-double chains don't trip PERF020.
+        if (chainInfo.finalType != null && chainInfo.finalType.baseType == Type.tDouble) {
+            perElement = qmacro_block() {
+                $i(accName) += $i(finalBind)
+                $i(cntName) ++
+            }
+        } else {
+            perElement = qmacro_block() {
+                $i(accName) += double($i(finalBind))
+                $i(cntName) ++
+            }
+        }
+    } elif (opName == "min" || opName == "max") {
+        let workhorse = (chainInfo.finalType != null && chainInfo.finalType.isWorkhorseType)
+        var compareExpr = min_max_compare(workhorse, opName, valBindName, accName)
+        perElement = qmacro_block() {
+            let $i(valBindName) = $i(finalBind)
+            if ($i(firstName)) {
+                $i(accName) := $i(valBindName)
+                $i(firstName) = false
+            } elif ($e(compareExpr)) {
+                $i(accName) := $i(valBindName)
+            }
         }
     } else {
+        // count, long_count
         perElement = qmacro_expr() {
             $i(accName) ++
         }
     }
-    // Wrap with where filter.
-    var body = wrap_with_condition(perElement, whereCond)
-    // Named-tuple bind: fold_linq_cond(lambda, tupName) rebinds `_.userName` → `tup.userName`, so chain ops see a real named tuple.
-    var mkTup = new ExprMakeTuple(at = at)
-    mkTup.recordNames |> resize(length(bridge.userNames))
-    for (i in 0 .. length(bridge.userNames)) {
-        mkTup.recordNames[i] := bridge.userNames[i]
-        mkTup.values |> emplace_new(new ExprVar(at = at, name := bridge.iterNames[i]))
+    // _count(pred): count/long_count with extra predicate — wrap perElement with `if (pred) {...}`. Predicate peels against finalBind so it sees the post-chain element.
+    if ((opName == "count" || opName == "long_count") && length(terminatorCall.arguments) > 1) {
+        var predExpr = fold_linq_cond(clone_expression(terminatorCall.arguments[1]), finalBind)
+        if (predExpr == null) return null
+        perElement = qmacro_expr() {
+            if ($e(predExpr)) {
+                $e(perElement)
+            }
+        }
     }
-    var tupBind : Expression? = qmacro_expr() {
-        var $i(tupName) = $e(mkTup)
-    }
-    var forBodyStmts <- [tupBind, body]
-    var forBody = stmts_to_expr(forBodyStmts)
-    // Cloned for retains the bridge's iter vars + get_ro sources (which reference archName); reuse archName below.
-    var clonedForExpr = clone_expression(bridge.forExpr)
-    var clonedFor = clonedForExpr as ExprFor
-    var newForBody = new ExprBlock(at = at)
-    newForBody.list |> push(forBody)
-    clonedFor.body = newForBody
+    var body = wrap_decs_chain(perElement, chainInfo, calls, intermediateEnd, at)
+    if (body == null) return null
+    var tupBind = build_decs_tup_bind(bridge, tupName, at)
+    var forExprNode = build_decs_inner_for(bridge, tupBind, body, at)
     let archName = bridge.archName
     var reqExpr = clone_expression(bridge.reqHashExpr)
     var erqExpr = clone_expression(bridge.erqExpr)
-    var forExprNode : Expression? = clonedForExpr
     var emission : Expression?
     if (opName == "long_count") {
         emission = qmacro(invoke($() : int64 {
@@ -3071,6 +3354,25 @@ def private emit_decs_accumulator(bridge : DecsBridgeShape?;
             })
             return $i(accName)
         }))
+    } elif (opName == "average") {
+        emission = qmacro(invoke($() : double {
+            var $i(accName) : double = 0lf
+            var $i(cntName) : uint64 = 0ul
+            for_each_archetype($e(reqExpr), $e(erqExpr), $($i(archName) : Archetype) {
+                $e(forExprNode)
+            })
+            return $i(cntName) != 0ul ? $i(accName) / double($i(cntName)) : 0lf
+        }))
+    } elif (opName == "min" || opName == "max") {
+        // No empty-panic — matches non-decs emit_accumulator_lane (returns default-initialized acc).
+        emission = qmacro(invoke($() : $t(accType) {
+            var $i(firstName) = true
+            var $i(accName) : $t(accType)
+            for_each_archetype($e(reqExpr), $e(erqExpr), $($i(archName) : Archetype) {
+                $e(forExprNode)
+            })
+            return $i(accName)
+        }))
     } else {
         return null
     }
@@ -3080,73 +3382,309 @@ def private emit_decs_accumulator(bridge : DecsBridgeShape?;
 }
 
 [macro_function]
+def private emit_decs_early_exit(bridge : DecsBridgeShape?;
+                                 opName : string;
+                                 chainInfo : DecsChainInfo?;
+                                 var calls : array<tuple<ExprCall?; LinqCall?>>;
+                                 intermediateEnd : int;
+                                 terminatorCall : ExprCall?;
+                                 at : LineInfo) : Expression? {
+    // Slice 3b/4 early-exit: first / first_or_default / any / all / contains via for_each_archetype_find (block returns true to stop archetype walk). Supports chained _select + interleaved _where via wrap_decs_chain.
+    let tupName = "`decs_tup`{at.line}`{at.column}"
+    let foundName = "`decs_found`{at.line}`{at.column}"
+    let resultName = "`decs_result`{at.line}`{at.column}"
+    let containsValName = "`decs_cv`{at.line}`{at.column}"
+    let defaultName = "`decs_dv`{at.line}`{at.column}"
+    let finalBind = chainInfo.finalBind
+    var elemType = clone_type(chainInfo.finalType)
+    var perElement : Expression?
+    var preludeStmts : array<Expression?>
+    var tailStmts : array<Expression?>
+    if (opName == "first" || opName == "first_or_default") {
+        preludeStmts |> push <| qmacro_expr() {
+            var $i(foundName) = false
+        }
+        preludeStmts |> push <| qmacro_expr() {
+            var $i(resultName) : $t(elemType)
+        }
+        if (opName == "first_or_default") {
+            var defaultExpr = clone_expression(terminatorCall.arguments[1])
+            preludeStmts |> push <| qmacro_expr() {
+                let $i(defaultName) = $e(defaultExpr)
+            }
+        }
+        perElement = qmacro_block() {
+            $i(resultName) := $i(finalBind)
+            $i(foundName) = true
+            return true
+        }
+        if (opName == "first") {
+            tailStmts |> push <| qmacro_expr() {
+                if (!$i(foundName)) panic("sequence contains no elements")
+            }
+            tailStmts |> push <| qmacro_expr() {
+                return $i(resultName)
+            }
+        } else {
+            tailStmts |> push <| qmacro_expr() {
+                if (!$i(foundName)) return $i(defaultName)
+            }
+            tailStmts |> push <| qmacro_expr() {
+                return $i(resultName)
+            }
+        }
+    } elif (opName == "any") {
+        let argCount = length(terminatorCall.arguments)
+        if (argCount > 1) {
+            var predExpr = fold_linq_cond(clone_expression(terminatorCall.arguments[1]), finalBind)
+            if (predExpr == null) return null
+            perElement = qmacro_expr() {
+                if ($e(predExpr)) return true
+            }
+        } else {
+            perElement = qmacro_expr() {
+                return true
+            }
+        }
+    } elif (opName == "all") {
+        var predExpr = fold_linq_cond(clone_expression(terminatorCall.arguments[1]), finalBind)
+        if (predExpr == null) return null
+        perElement = qmacro_expr() {
+            if (!$e(predExpr)) return true
+        }
+    } elif (opName == "contains") {
+        var valExpr = clone_expression(terminatorCall.arguments[1])
+        preludeStmts |> push <| qmacro_expr() {
+            let $i(containsValName) = $e(valExpr)
+        }
+        perElement = qmacro_expr() {
+            if ($i(finalBind) == $i(containsValName)) return true
+        }
+    } else {
+        return null
+    }
+    var body = wrap_decs_chain(perElement, chainInfo, calls, intermediateEnd, at)
+    if (body == null) return null
+    var tupBind = build_decs_tup_bind(bridge, tupName, at)
+    var forExprNode = build_decs_inner_for(bridge, tupBind, body, at)
+    let archName = bridge.archName
+    var reqExpr = clone_expression(bridge.reqHashExpr)
+    var erqExpr = clone_expression(bridge.erqExpr)
+    // Combine prelude + invocation + tail into ONE bodyStmts list — multiple $b splices in the same qmacro fragment isolate variable scope.
+    var bodyStmts : array<Expression?>
+    bodyStmts |> reserve(length(preludeStmts) + length(tailStmts) + 1)
+    for (s in preludeStmts) {
+        bodyStmts |> push(s)
+    }
+    if (opName == "any" || opName == "contains") {
+        bodyStmts |> push <| qmacro_expr() {
+            return for_each_archetype_find($e(reqExpr), $e(erqExpr), $($i(archName) : Archetype) : bool {
+                $e(forExprNode)
+                return false
+            })
+        }
+    } elif (opName == "all") {
+        // `all` is "no counterexample found" — inner returns true on FAIL, so negate.
+        bodyStmts |> push <| qmacro_expr() {
+            return !for_each_archetype_find($e(reqExpr), $e(erqExpr), $($i(archName) : Archetype) : bool {
+                $e(forExprNode)
+                return false
+            })
+        }
+    } else {
+        bodyStmts |> push <| qmacro_expr() {
+            for_each_archetype_find($e(reqExpr), $e(erqExpr), $($i(archName) : Archetype) : bool {
+                $e(forExprNode)
+                return false
+            })
+        }
+        for (s in tailStmts) {
+            bodyStmts |> push(s)
+        }
+    }
+    var emission : Expression?
+    if (opName == "first" || opName == "first_or_default") {
+        emission = qmacro(invoke($() : $t(elemType) {
+            $b(bodyStmts)
+        }))
+    } else {
+        emission = qmacro(invoke($() : bool {
+            $b(bodyStmts)
+        }))
+    }
+    emission.force_at(at)
+    emission.force_generated(true)
+    return emission
+}
+
+[macro_function]
+def private emit_decs_to_array(bridge : DecsBridgeShape?;
+                               chainInfo : DecsChainInfo?;
+                               var calls : array<tuple<ExprCall?; LinqCall?>>;
+                               intermediateEnd : int;
+                               at : LineInfo) : Expression? {
+    // Slice 3c/4 to_array: hoist `var buf` above outer for_each_archetype; per-element push_clone of post-chain value at chainInfo.finalBind.
+    let tupName = "`decs_tup`{at.line}`{at.column}"
+    let bufName = "`decs_buf`{at.line}`{at.column}"
+    let finalBind = chainInfo.finalBind
+    var elemType = clone_type(chainInfo.finalType)
+    var perElement : Expression? = qmacro_expr() {
+        $i(bufName) |> push_clone($i(finalBind))
+    }
+    var body = wrap_decs_chain(perElement, chainInfo, calls, intermediateEnd, at)
+    if (body == null) return null
+    var tupBind = build_decs_tup_bind(bridge, tupName, at)
+    var forExprNode = build_decs_inner_for(bridge, tupBind, body, at)
+    let archName = bridge.archName
+    var reqExpr = clone_expression(bridge.reqHashExpr)
+    var erqExpr = clone_expression(bridge.erqExpr)
+    var emission : Expression? = qmacro(invoke($() : array<$t(elemType)> {
+        var $i(bufName) : array<$t(elemType)>
+        for_each_archetype($e(reqExpr), $e(erqExpr), $($i(archName) : Archetype) {
+            $e(forExprNode)
+        })
+        return <- $i(bufName)
+    }))
+    emission.force_at(at)
+    emission.force_generated(true)
+    return emission
+}
+
+[macro_function]
+def private emit_decs_min_max_by(bridge : DecsBridgeShape?;
+                                 opName : string;
+                                 chainInfo : DecsChainInfo?;
+                                 var calls : array<tuple<ExprCall?; LinqCall?>>;
+                                 intermediateEnd : int;
+                                 terminatorCall : ExprCall?;
+                                 at : LineInfo) : Expression? {
+    // Slice 4: min_by / max_by — track best (key, element) pair across archetypes. Element retained via `:=`, matches min_by_impl's empty→default semantics.
+    let tupName = "`decs_tup`{at.line}`{at.column}"
+    let firstName = "`decs_first`{at.line}`{at.column}"
+    let bestKeyName = "`decs_bkey`{at.line}`{at.column}"
+    let bestElemName = "`decs_belem`{at.line}`{at.column}"
+    let keyBindName = "`decs_key`{at.line}`{at.column}"
+    let finalBind = chainInfo.finalBind
+    var elemType = clone_type(chainInfo.finalType)
+    var keyExpr = fold_linq_cond(clone_expression(terminatorCall.arguments[1]), finalBind)
+    if (keyExpr == null || keyExpr._type == null) return null
+    var keyType = clone_type(keyExpr._type)
+    keyType.flags.constant = false
+    keyType.flags.ref = false
+    let workhorse = keyType.isWorkhorseType
+    let opCmp = (opName == "min_by") ? "min" : "max"
+    var compareExpr = min_max_compare(workhorse, opCmp, keyBindName, bestKeyName)
+    var perElement = qmacro_block() {
+        let $i(keyBindName) = $e(keyExpr)
+        if ($i(firstName)) {
+            $i(bestKeyName) := $i(keyBindName)
+            $i(bestElemName) := $i(finalBind)
+            $i(firstName) = false
+        } elif ($e(compareExpr)) {
+            $i(bestKeyName) := $i(keyBindName)
+            $i(bestElemName) := $i(finalBind)
+        }
+    }
+    var body = wrap_decs_chain(perElement, chainInfo, calls, intermediateEnd, at)
+    if (body == null) return null
+    var tupBind = build_decs_tup_bind(bridge, tupName, at)
+    var forExprNode = build_decs_inner_for(bridge, tupBind, body, at)
+    let archName = bridge.archName
+    var reqExpr = clone_expression(bridge.reqHashExpr)
+    var erqExpr = clone_expression(bridge.erqExpr)
+    var emission = qmacro(invoke($() : $t(elemType) {
+        var $i(firstName) = true
+        var $i(bestKeyName) : $t(keyType)
+        var $i(bestElemName) : $t(elemType)
+        for_each_archetype($e(reqExpr), $e(erqExpr), $($i(archName) : Archetype) {
+            $e(forExprNode)
+        })
+        return $i(bestElemName)
+    }))
+    emission.force_at(at)
+    emission.force_generated(true)
+    return emission
+}
+
+[macro_function]
 def private plan_decs_unroll(var expr : Expression?) : Expression? {
     var (top, calls) = flatten_linq(expr)
     let bridge = extract_decs_bridge(top)
-    if (bridge == null || empty(calls)) return null
-    let lastName = calls.back()._1.name
+    if (bridge == null) return null
     let at = expr.at
     // Slice 1: bare count → arch.size shortcut.
-    if (lastName == "count" && length(calls) == 1) return emit_decs_count_archsize(bridge, at)
-    // Slice 2: chain-aware count/long_count/sum with _where + single _select.
-    if (lastName != "count" && lastName != "long_count" && lastName != "sum") return null
+    if (length(calls) == 1 && calls.back()._1.name == "count" && length(calls.back()._0.arguments) == 1) return emit_decs_count_archsize(bridge, at)
+    // to_array is `skip = true` in linqCalls so it's already peeled — "no recognized terminator" means implicit to_array.
+    let lastName = empty(calls) ? "" : calls.back()._1.name
+    let isAccum = (lastName == "count" || lastName == "long_count" || lastName == "sum"
+        || lastName == "min" || lastName == "max" || lastName == "average")
+    let isEarlyExit = (lastName == "first" || lastName == "first_or_default"
+        || lastName == "any" || lastName == "all" || lastName == "contains")
+    let isMinMaxBy = (lastName == "min_by" || lastName == "max_by")
+    let isTerminator = isAccum || isEarlyExit || isMinMaxBy
     let tupName = "`decs_tup`{at.line}`{at.column}"
-    let intermediateEnd = length(calls) - 1
-    var whereCond : Expression?
-    var projection : Expression?
-    var seenSelect = false
-    for (i in 0 .. intermediateEnd) {
-        var cll & = unsafe(calls[i])
-        let opName = cll._1.name
-        if (opName == "where_") {
-            // After-select where: defer to follow-up; canonical order is where-then-select.
-            if (seenSelect) return null
-            var pred = fold_linq_cond(cll._0.arguments[1], tupName)
-            if (pred == null) return null
-            if (whereCond == null) {
-                whereCond = pred
-            } else {
-                whereCond = qmacro($e(whereCond) && $e(pred))
-            }
-        } elif (opName == "select") {
-            // Chained selects: defer to follow-up.
-            if (seenSelect) return null
-            projection = fold_linq_cond(cll._0.arguments[1], tupName)
-            if (projection == null) return null
-            seenSelect = true
-        } else {
-            return null
+    let intermediateEnd = isTerminator ? length(calls) - 1 : length(calls)
+    let chainInfo = compute_decs_chain_info(calls, intermediateEnd, tupName, bridge, at)
+    if (chainInfo == null) return null
+    if (isAccum) {
+        // sum/min/max/average need a scalar element — selectCount==0 keeps finalType = bridge.elementType (a tuple) which can't be summed/compared.
+        var accType : TypeDeclPtr
+        if (lastName == "sum" || lastName == "min" || lastName == "max" || lastName == "average") {
+            if (chainInfo.selectCount == 0 || chainInfo.finalType == null) return null
+            accType = clone_type(chainInfo.finalType)
         }
+        return emit_decs_accumulator(bridge, lastName, chainInfo, calls, intermediateEnd, calls.back()._0, accType, at)
     }
-    // sum requires a scalar projection (tuple sources can't sum directly).
-    var accType : TypeDeclPtr
-    if (lastName == "sum") {
-        if (projection == null || projection._type == null) return null
-        accType = clone_type(projection._type)
-        accType.flags.constant = false
-        accType.flags.ref = false
-    }
-    return emit_decs_accumulator(bridge, lastName, projection, whereCond, accType, at)
+    if (isEarlyExit) return emit_decs_early_exit(bridge, lastName, chainInfo, calls, intermediateEnd, calls.back()._0, at)
+    if (isMinMaxBy) return emit_decs_min_max_by(bridge, lastName, chainInfo, calls, intermediateEnd, calls.back()._0, at)
+    // Iterator-typed chains cascade to tier-2; only fire to_array when expr is array-typed (user wrote `.to_array()`, peeled by skip=true).
+    if (expr._type == null || !expr._type.isGoodArrayType) return null
+    return emit_decs_to_array(bridge, chainInfo, calls, intermediateEnd, at)
 }
 
 [macro_function]
 def private plan_zip(var expr : Expression?) : Expression? {
-    // Phase 2 Z1/Z2/Z3: 2-ary lockstep zip splice. Supports bare zip (array/iterator), no-pred count/long_count, and fused where_/select/take/skip/take_while/skip_while chain ops between zip and terminator. Result-selector form (3-arg zip), accumulator terminators (sum/min/max/etc.), and chained selects bail to tier-2 cascade.
+    // Phase 2 Z1/Z2/Z3 + accumulator/early-exit: 2-ary lockstep zip splice. Supports bare zip (array/iterator), no-pred count/long_count + accumulator (sum/min/max/average) + early-exit (first/first_or_default/any/all/contains) terminators, and fused where_/select/take/skip/take_while/skip_while chain ops between zip and terminator. Result-selector form (3-arg zip) and chained selects bail to tier-2 cascade.
     var (top, calls) = flatten_linq(expr)
     if (empty(calls) || calls[0]._1.name != "zip") return null
     var zipCall = calls[0]._0
     let zipArgCount = zipCall.arguments |> length
     // Z6 bail: result-selector form (3-arg zip = 2 sources + selector) yields scalar element stream — different splice shape, defer.
     if (zipArgCount != 2) return null
-    // Identify recognized terminator (count/long_count). Anything else: if it's a recognized chain op, treat as no-terminator (bare); else bail.
+    // Identify recognized terminator. Counter: count/long_count. Accumulator: sum/min/max/average. Early-exit: first/first_or_default/any/all/contains. Anything else: treat as no-terminator (bare → ARRAY lane); unrecognized chain op bails inside the chain walk.
     var lastName = ""
     var intermediateEnd = length(calls)
     if (length(calls) > 1) {
         let candidateName = calls.back()._1.name
         let candidateCall = calls.back()._0
+        let candidateArgs = candidateCall.arguments |> length
         if (candidateName == "count" || candidateName == "long_count") {
             // No-pred form only (1 arg = the source). Predicate-form bails (would change per-element work).
-            if (candidateCall.arguments |> length != 1) return null
+            if (candidateArgs != 1) return null
+            lastName = candidateName
+            intermediateEnd = length(calls) - 1
+        } elif (candidateName == "sum" || candidateName == "min" || candidateName == "max" || candidateName == "average") {
+            // Accumulator: no-arg form only (1 arg = the source).
+            if (candidateArgs != 1) return null
+            lastName = candidateName
+            intermediateEnd = length(calls) - 1
+        } elif (candidateName == "first") {
+            if (candidateArgs != 1) return null
+            lastName = candidateName
+            intermediateEnd = length(calls) - 1
+        } elif (candidateName == "first_or_default" || candidateName == "contains") {
+            // first_or_default(d): 1 default arg. contains(v): 1 value arg.
+            if (candidateArgs != 2) return null
+            lastName = candidateName
+            intermediateEnd = length(calls) - 1
+        } elif (candidateName == "any") {
+            // any(): no pred. any(p): 1 predicate arg. Both forms recognized.
+            if (candidateArgs != 1 && candidateArgs != 2) return null
+            lastName = candidateName
+            intermediateEnd = length(calls) - 1
+        } elif (candidateName == "all") {
+            // all(p): must have predicate.
+            if (candidateArgs != 2) return null
             lastName = candidateName
             intermediateEnd = length(calls) - 1
         }
@@ -3259,12 +3797,42 @@ def private plan_zip(var expr : Expression?) : Expression? {
     let isCounter = lastName == "count" || lastName == "long_count"
     // Semantic guard: impure `select` projection AHEAD of a range op (skip/take/skip_while/take_while). The eager `select(proj)|>skip(K)` pipeline runs proj on every element; our spliced order (skip-then-push) would drop the side effects on skipped items. Bail to tier-2 which preserves eager semantics. Plan_loop_or_count has the analogous gap (see PR #2741 review thread #r3269663361); fixing both planners uniformly is a separate follow-up.
     if (seenSelect && !allProjectionsPure && !noLimits) return null
+    // Accumulator + early-exit lane dispatch: reuses the generalized emit_*_lane helpers (parallel-array form). preCondStmts threads `let it = (itA, itB)` so itName resolves inside the loop body when the where/projection/predicate/value references the tuple element. `long_count` is classified ACCUMULATOR but routes through the COUNTER path locally (existing length-shortcut + counter loop already cover it); `!isCounter` excludes it from this branch.
+    let lane = classify_terminator(lastName)
+    if (lane == LinqLane.ACCUMULATOR && !isCounter) {
+        // sum/min/max/average without projection: elementType is tuple<...>, accumulator op would not typecheck — bail to tier-2 (typer rejects anyway, but explicit bail keeps the error inside linq's normal cascade rather than the splice).
+        if (projection == null) return null
+        var preCondStmts : array<Expression?>
+        preCondStmts |> push <| qmacro_expr() {     // nolint:STYLE012
+            let $i(itName) = (itA, itB)
+        }
+        var intermediateBinds : array<Expression?>
+        var laneTops <- [srcAExpr, srcBExpr]
+        let laneSrcs <- [srcAName, srcBName]
+        return emit_accumulator_lane(lastName, laneTops, projection, whereCond,
+            intermediateBinds, preCondStmts, elementType, laneSrcs, accName, itName, skipName, takeCountName,
+            skippingName, skipExpr, takeExpr, skipWhileCond, takeWhileCond, at)
+    }
+    if (lane == LinqLane.EARLY_EXIT) {
+        var preCondStmts : array<Expression?>
+        preCondStmts |> push <| qmacro_expr() {     // nolint:STYLE012
+            let $i(itName) = (itA, itB)
+        }
+        var intermediateBinds : array<Expression?>
+        let terminatorCall = calls.back()._0
+        var laneTops <- [srcAExpr, srcBExpr]
+        let laneSrcs <- [srcAName, srcBName]
+        return emit_early_exit_lane(lastName, laneTops, projection, whereCond,
+            intermediateBinds, preCondStmts, elementType, terminatorCall, laneSrcs, itName, skipName,
+            takeCountName, skippingName, skipExpr, takeExpr, skipWhileCond, takeWhileCond, at)
+    }
     // Length shortcut: count/long_count, no chain, both length-bearing → return min(lenA, lenB) without entering the loop.
     if (noChain && bothHaveLength && isCounter) {
         var bodyStmts : array<Expression?>
         if (lastName == "count") {
+            // length returns int already; bare `length(...)` matches return type — no cast (PERF020).
             bodyStmts |> push <| qmacro_expr() {
-                return int(length($i(srcAName)) < length($i(srcBName)) ? length($i(srcAName)) : length($i(srcBName)))
+                return length($i(srcAName)) < length($i(srcBName)) ? length($i(srcAName)) : length($i(srcBName))
             }
         } else {
             bodyStmts |> push <| qmacro_expr() {

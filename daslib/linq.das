@@ -854,6 +854,28 @@ def long_count(a : array<auto(TT)>) : int64 {
     return int64(length(a))
 }
 
+def long_count(var a : iterator<auto(TT)>; predicate : block<(arg : TT -&) : bool>) : int64 {
+    //! Counts elements in an iterator that satisfy a predicate, using a long integer
+    var count = 0l
+    for (it in a) {
+        if (predicate(it)) {
+            count ++
+        }
+    }
+    return count
+}
+
+def long_count(a : array<auto(TT)>; predicate : block<(arg : TT -&) : bool>) : int64 {
+    //! Counts elements in an array that satisfy a predicate, using a long integer
+    var count = 0l
+    for (it in a) {
+        if (predicate(it)) {
+            count ++
+        }
+    }
+    return count
+}
+
 [unused_argument(tt)]
 def private where_impl(var src; tt : auto(TT); len : int; predicate : block<(arg : TT -&) : bool>) : array<TT -& -const> {
     //! Filters elements in an iterator based on a predicate
@@ -1526,7 +1548,11 @@ def average(var src : iterator<auto(TT)>) : double {
     var total : double = 0lf
     var count : uint64 = 0ul
     for (x in src) {
-        total += double(x)
+        static_if (typeinfo stripped_typename(x) == typeinfo stripped_typename(default<double>)) {
+            total += x
+        } else {
+            total += double(x)
+        }
         count ++
     }
     return count != 0ul ? total / double(count) : 0lf
@@ -1538,7 +1564,11 @@ def average(src : array<auto(TT)>) : double {
     var total : double = 0lf
     var count : uint64 = 0ul
     for (x in src) {
-        total += double(x)
+        static_if (typeinfo stripped_typename(x) == typeinfo stripped_typename(default<double>)) {
+            total += x
+        } else {
+            total += double(x)
+        }
         count ++
     }
     return count != 0ul ? total / double(count) : 0lf
