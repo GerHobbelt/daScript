@@ -7,11 +7,12 @@ options gen2
 // analyzer ever runs — e.g. `_select(_.Name) |> _select(_.Price)` is a
 // genuine type bug (string has no `Price` field) and `some_unknown_func(_)`
 // hits the unresolved function. Those cascades are expected.
-expect 40104:21, 30304:2, 30503:3
+expect 40104:22, 30304:2, 30503:2
 
 require daslib/sql
 require sqlite/sqlite_boost
 require sqlite/sqlite_linq
+require daslib/fts5_query   // for the bad22 case
 
 [sql_table(name="Cars")]
 struct Car {
@@ -52,11 +53,9 @@ def main() {
     // 7. _sql_text with non-chain
     let bad7 = _sql_text(42)
 
-    // 8. _to_array() buried under _where — must be outermost terminal
-    let bad8 <- _sql(db |> select_from(type<Car>) |> _to_array() |> _where(_.Id == 1))
-
-    // 9. _to_array() after _select — must be outermost terminal
-    let bad9 <- _sql(db |> select_from(type<Car>) |> _select(_.Name) |> _to_array() |> _where(_.Id == 1))
+    // _to_array() ordering is unchecked — it's a materializer-mode flag that
+    // doesn't change emitted SQL, so any chain position is valid (see
+    // sqlite_linq.das comment by the _to_array peel).
 
     // 10. _having without _group_by — HAVING is meaningless without aggregation
     let bad10 <- _sql(db |> select_from(type<Car>) |> _having(_._1 |> length > 1))
@@ -126,6 +125,22 @@ def main() {
     //     valid in unparenthesized compound query.
     let bad19 <- _sql((db |> select_from(type<Car>) |> _select(_.Price))
                        |> union(db |> select_from(type<Car>) |> _select(_.Price) |> take(5)))
+
+    // 20. `_.Col == none()` — fixit error redirects to is_none(). The
+    //     locked decision (chunk-4 D4) is "explicit-over-magic": the
+    //     compiler refuses to translate the equality and points at the
+    //     correct spelling. See pred_to_sql `==` handler.
+    var nullable_owner = Owner(Id = 0, CarId = 0, Name = "")
+    let bad20 <- _sql(db |> select_from(type<Owner>) |> _where(_.CarId == none(type<int>)))
+
+    // 21. `_.Col != none()` — same fixit; the inverse is `is_some()`.
+    let bad21 <- _sql(db |> select_from(type<Owner>) |> _where(_.CarId != none(type<int>)))
+
+    // 22. `text_match` on a non-FTS5 struct. The translator refuses to
+    //     emit MATCH against a regular [sql_table] column — SQLite would
+    //     accept the syntax but match on nothing useful. The fixit
+    //     suggests `contains` (LIKE-based) or `[sql_fts5]`.
+    let bad22 <- _sql(db |> select_from(type<Car>) |> _where(_.Name |> text_match("foo")))
     // (Note: the "_in subquery without _select(_.Col)" diagnostic added in
     //  this round is also belt-and-suspenders — a daslang `contains` type-
     //  check rejects mismatched element types before sqlite_linq even sees

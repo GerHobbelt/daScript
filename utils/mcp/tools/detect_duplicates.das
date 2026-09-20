@@ -5,6 +5,8 @@ options no_unused_block_arguments = false
 
 require common public
 require daslib/fio
+require daslib/strings_convert
+require daslib/result
 
 
 // `detect_duplicates` shells out to `daslang utils/detect-dupe/main.das`
@@ -15,7 +17,6 @@ require daslib/fio
 
 struct DetectDuplicatesEnvelope {
     exit_code : int
-    json_path : string
     @embed report : string           //!< raw per-candidate JSON from --json
     stdout : string                  //!< captured subprocess output (diagnostics)
 }
@@ -25,8 +26,7 @@ def public do_detect_duplicates(paths : string; corpus : string;
                                 threshold_str : string;
                                 min_tokens_str : string;
                                 top_str : string;
-                                keep_str : string;
-                                project : string) : string {
+                                keep_str : string) : string {
     let exe = get_daslang_exe()
     if (empty(exe)) {
         return make_tool_result("Cannot determine daslang executable path", true)
@@ -53,28 +53,64 @@ def public do_detect_duplicates(paths : string; corpus : string;
         return make_tool_result("detect_duplicates: corpus file not found: {resolved_corpus}", true)
     }
     let json_out = "{get_das_root()}/_mcp_detect_duplicates_{ref_time_ticks()}.json"
-    var cmd = "\"{exe}\" \"{detect_dupe_main}\" -- --import-functions \"{resolved_corpus}\" --json \"{json_out}\""
+    var argv <- [exe, detect_dupe_main, "--",
+                 "--import-functions", resolved_corpus,
+                 "--json", json_out]
+    argv |> reserve(length(argv) + 2 * length(files))
     for (f in files) {
-        cmd += " --against \"{resolve_path(f)}\""
+        argv |> push("--against")
+        argv |> push(resolve_path(f))
     }
     if (!empty(threshold_str)) {
-        cmd += " -t {threshold_str}"
+        let parsed = try_to_float(threshold_str)
+        if (is_err(parsed)) {
+            return make_tool_result("detect_duplicates: 'threshold' must be a number in [0, 1] (got '{threshold_str}')", true)
+        }
+        let t = unwrap(parsed)
+        if (t < 0.0 || t > 1.0) {
+            return make_tool_result("detect_duplicates: 'threshold' must be in [0, 1] (got {t})", true)
+        }
+        argv |> push("-t")
+        argv |> push("{t}")
     }
     if (!empty(min_tokens_str)) {
-        cmd += " --min-tokens {min_tokens_str}"
+        let parsed = try_to_int(min_tokens_str)
+        if (is_err(parsed)) {
+            return make_tool_result("detect_duplicates: 'min_tokens' must be a non-negative integer (got '{min_tokens_str}')", true)
+        }
+        let n = unwrap(parsed)
+        if (n < 0) {
+            return make_tool_result("detect_duplicates: 'min_tokens' must be >= 0 (got {n})", true)
+        }
+        argv |> push("--min-tokens")
+        argv |> push("{n}")
     }
     if (!empty(top_str)) {
-        cmd += " -n {top_str}"
+        let parsed = try_to_int(top_str)
+        if (is_err(parsed)) {
+            return make_tool_result("detect_duplicates: 'top' must be a positive integer (got '{top_str}')", true)
+        }
+        let n = unwrap(parsed)
+        if (n < 1) {
+            return make_tool_result("detect_duplicates: 'top' must be >= 1 (got {n})", true)
+        }
+        argv |> push("-n")
+        argv |> push("{n}")
     }
     if (!empty(keep_str)) {
         for (k in split_by_chars(keep_str, ", \t\n")) {
-            if (!empty(k)) {
-                cmd += " -k {k}"
+            if (empty(k)) {
+                continue
             }
+            if (!(k == "all" || k == "visitor" || k == "dispatch" || k == "emit")) {
+                return make_tool_result("detect_duplicates: 'keep' token must be one of all/visitor/dispatch/emit (got '{k}')", true)
+            }
+            argv |> push("-k")
+            argv |> push(k)
         }
     }
     var output : string
-    let exit_code = run_and_capture(cmd, output, 0.0)
+    let exit_code = run_and_capture(argv, output, 0.0)
     if (exit_code != 0) {
         remove(json_out)
         return make_tool_result("detect-dupe failed (exit code {exit_code}):\n{output}", true)
@@ -85,7 +121,6 @@ def public do_detect_duplicates(paths : string; corpus : string;
     }
     var envelope : DetectDuplicatesEnvelope
     envelope.exit_code = exit_code
-    envelope.json_path := json_out
     envelope.report := fread(json_out)
     envelope.stdout := output
     remove(json_out)

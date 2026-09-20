@@ -250,9 +250,12 @@ new syntax to teach.
     [tutorials/sql/25-defaults_computed.das](../../tutorials/sql/25-defaults_computed.das)
     (chunk 7). Original mockup:
     [28-defaults_computed.das.mockup](tutorial-mockup/28-defaults_computed.das.mockup).
-26. **Custom type adapters** — name-based `bind_X` / `extract_X` pair;
-    no registration step; `DateTime`, enums, GUIDs via this rail.
-    Mockup: [29-custom_types.das](tutorial-mockup/29-custom_types.das.mockup).
+26. **Custom type adapters** — name-based `_::sql_bind` / `_::sql_extract`
+    overload pair, no registration step; four primitive storage types
+    (INTEGER / REAL / TEXT / BLOB) selected by the `sql_bind` return
+    type; `DateTime`, enums, GUIDs via this rail. Tutorial:
+    [26-custom_types.das](../../tutorials/sql/26-custom_types.das).
+    Original mockup: [29-custom_types.das](tutorial-mockup/29-custom_types.das.mockup).
 
 ## Part 6 — Non-scalar columns
 
@@ -261,25 +264,34 @@ here because by now the reader understands custom-type adapters.
 
 27. **BLOB round-trip** — insert a binary file, read it back. Merges
     inherited tutorials 07 + 08 since the API makes them a single
-    round-trip story. Introduces the `@sql_blob` field annotation (for
-    byte-sequence columns that shouldn't go through the custom-type
-    adapter rail). Mockup: **none yet — write new** (derived from
-    `tutorial/07-insert_image.das` + `tutorial/08-read_image.das`).
-28. **JSON columns** — `@sql_json` field annotation, `_sql` JSON-path
-    walker rule, round-tripping daslang types through SQLite JSON1.
-    Mockup: [37-json.das](tutorial-mockup/37-json.das.mockup).
+    round-trip story. `array<uint8>` is one of the four primitive
+    storage types from the tut-26 adapter rail, so a `[sql_table]`
+    field of that type round-trips through a BLOB column with no
+    extra annotation. Tutorial:
+    [27-blob.das](../../tutorials/sql/27-blob.das). The
+    `@sql_blob` annotation for opaque struct serialization is a
+    different concept and lands with tut 28 (JSON / serialization).
+28. **JSON columns** — `@sql_json` and `@sql_blob` field annotations,
+    `_sql` walker descent into JSON paths (pred-side and projection-
+    side, arbitrary depth), opaque archive round-trip for `@sql_blob`.
+    **Shipped:** [tutorials/sql/28-json.das](../../tutorials/sql/28-json.das).
+    Original mockup: [37-json.das](tutorial-mockup/37-json.das.mockup).
 
 ## Part 7 — Introspection
 
 Schema inspection is late on purpose: most app code doesn't need it, and it
 makes more sense once you know what a `[sql_table]` is.
 
-29. **Column names** — `db |> schema("Cars")` returns a typed schema
-    description. Mockup: **none yet — write new** (derived from
-    `tutorial/09-column_names.das`).
-30. **Listing tables** — `db |> tables()` returns the set of user tables.
-    Mockup: **none yet — write new** (derived from
-    `tutorial/10-list_tables.das`).
+29. **Column metadata** — Band 1 `column_info(type<T>)` returns
+    `array<ColumnInfo>` baked at `[sql_table]` expansion time;
+    `sqlite_sql_type` renders the abstract `SqlType` enum to the
+    SQLite dialect. Band 3 covers raw `PRAGMA table_info` via the
+    typed `query` family for genuinely-dynamic introspection.
+    **Shipped:** [tutorials/sql/29-column_names.das](../../tutorials/sql/29-column_names.das).
+30. **Listing tables** — raw `query("SELECT … FROM sqlite_master …",
+    type<MasterRow>)` for catalog inspection. No new abstract API
+    (catalog spelling is genuinely provider-specific). **Shipped:**
+    [tutorials/sql/30-list_tables.das](../../tutorials/sql/30-list_tables.das).
 
 ## Part 8 — Operations
 
@@ -394,28 +406,28 @@ E. **Forward-looking: `dasSQL` abstraction layer** — the roadmap beyond
 | 15 | `_join` — inner equi-join | `23-joins.das` | Has mockup |
 | 16 | `_left_join` — outer | `23-joins.das` | Has mockup (shared) |
 | 17 | Subqueries | `24-subqueries.das` | Has mockup |
-| 18 | NULL handling — `Option<T>` | `18-null_handling.das` (`25-null_handling.das.mockup` shipped largely as designed; `_.Col == none()` diagnostic + projection-side `unwrap_or` deferred) | **Shipped** (chunk 4) |
-| 19 | UPDATE | `15-update.das` | **Shipped** (chunk 6); macros named `_sql_update` / `_sql_try_update` / `_sql_update_returning` / `_sql_try_update_returning`; raw `exec` parameter binding deferred to a later chunk |
+| 18 | NULL handling — `Option<T>` | `18-null_handling.das` (`25-null_handling.das.mockup` shipped largely as designed; `_.Col == none()` diagnostic shipped chunk 8; projection-side `unwrap_or` deferred) | **Shipped** (chunk 4); `_.Col == none()` fixit added in chunk 8 |
+| 19 | UPDATE | `15-update.das` | **Shipped** (chunk 6); macros named `_sql_update` / `_sql_try_update` / `_sql_update_returning` / `_sql_try_update_returning`; raw `exec` parameter binding shipped in chunk 8 |
 | 20 | DELETE | `16-delete.das` | **Shipped** (chunk 6); macros named `_sql_delete` / `_sql_try_delete` / `_sql_delete_returning` / `_sql_try_delete_returning`; CASCADE FK example deferred to tut 23 |
 | 21 | UPSERT | `21-upsert.das` | **Shipped** (chunk 7); `_sql_upsert` / `_sql_try_upsert` / `_sql_upsert_returning` / `_sql_try_upsert_returning`, `_excluded` sentinel, single + composite conflict targets via `tuple(_.A, _.B)`, plain-fn `insert_or_ignore` / `insert_or_replace` (single + bulk + `try_` for both) |
 | 22 | Transactions | `14-transaction.das` | **Shipped** (chunk 6); two-arity overload, `SqliteTxnMode` enum (Deferred/Immediate/Exclusive), savepoint nesting via `das_sp` name |
 | 23 | Foreign keys | `23-foreign_keys.das` | **Shipped** (chunk 7); `@sql_references = "Parent"` + optional `@sql_on_delete` / `@sql_on_update` (cascade / set_null / set_default / restrict / no_action); `with_sqlite` enables `PRAGMA foreign_keys = ON` |
 | 24 | Indexes | `24-indexes.das` | **Shipped** (chunk 7); `[sql_table, sql_index(fields = ..., unique = ..., name = ...)]` sibling annotation, single + composite, auto-name `idx_<table>_<col1>_<col2>` |
 | 25 | Defaults + computed | `25-defaults_computed.das` | **Shipped** (chunk 7); native field init for literal defaults (`Active : bool = true`), `@sql_default_fn` for SQL built-ins (CURRENT_TIMESTAMP / CURRENT_DATE / CURRENT_TIME), `@sql_computed = "expr"` (+ optional `@sql_stored = true`) |
-| 26 | Custom type adapters | `29-custom_types.das` | Has mockup |
-| 27 | BLOB round-trip | — | **Needs mockup** (merges inherited 07+08) |
-| 28 | JSON columns | `37-json.das` | Has mockup |
-| 29 | Column names | — | **Needs mockup** (from inherited 09) |
-| 30 | Listing tables | — | **Needs mockup** (from inherited 10) |
-| 31 | Views | `31-views.das` | Has mockup |
-| 32 | Migrations | `30-migrations.das` | Has mockup |
-| 33 | PRAGMA tuning | `33-pragma.das` | Has mockup |
-| 34 | Backup + VACUUM | `34-backup_vacuum.das` | Has mockup |
-| 35 | ATTACH DATABASE | `36-attach.das` | Has mockup |
-| 36 | Streaming results | — | No-API — concept tutorial |
+| 26 | Custom type adapters | `26-custom_types.das` | **Shipped** (chunk 8); `_::sql_bind` / `_::sql_extract` adapter pair, four primitive storage types (INTEGER / REAL / TEXT / BLOB), enum auto-roundtrip, return-type-driven DDL, `Option<T>` over a custom adapter; per-field `@sql_as(type<P>)` override deferred |
+| 27 | BLOB round-trip | `27-blob.das` | **Shipped** (chunk 8); `array<uint8>` is one of the four adapter primitives — falls out of tut 26 |
+| 28 | JSON + BLOB columns | `28-json.das` | **Shipped** (chunk 9); `@sql_json` (TEXT via daslib/json + json_boost) + `@sql_blob` (BLOB via daslib/archive); `_sql` walker JSON-path descent (pred + projection, arbitrary depth) emits `json_extract`; `@sql_blob` opaque to walker (compile error on descent); adapter dedup across tables; mockup was 37-json |
+| 29 | Column metadata | `29-column_names.das` | **Shipped** (chunk 9); Band 1 `column_info(type<T>) : array<ColumnInfo>` (compile-time walk) + abstract `SqlType` enum + `sqlite_sql_type` dialect renderer; Band 3 raw `PRAGMA table_info` via the typed `query` family |
+| 30 | Listing tables | `30-list_tables.das` | **Shipped** (chunk 9); raw `query` against `sqlite_master`; no abstract `list_tables` helper (catalog spelling diverges per backend) |
+| 31 | Views | `31-views.das` | **Shipped** (chunk 10); `[sql_view(name=...)]` annotation + `_create_view` macro + `drop_view_if_exists`; mutation-path rejection at compile time (predicate form) and runtime (row form) |
+| 32 | Migrations | `30-migrations.das` | Has mockup — deferred to last chunk |
+| 33 | PRAGMA tuning | `33-pragma.das` | **Shipped** (chunk 10); `set_pragma` / `try_set_pragma` (string/int64/bool overloads) + `apply_recommended_pragmas` (WAL + busy_timeout + foreign_keys + synchronous=NORMAL) |
+| 34 | Backup + VACUUM | `34-backup_vacuum.das` | **Shipped** (chunk 10); `vacuum` / `vacuum_into` / `optimize` / `integrity_check` / `quick_check` + `backup_to(dest)` / `backup_to(path)` (online Backup API with SQLITE_BUSY/LOCKED retry) |
+| 35 | Streaming results | `35-streaming.das` | **Shipped** (chunk 10); `_each_sql(chain)` returning `iterator<T>`, generator-based; rejects materializing terminals (`_to_array`, `_first`, aggregates); `sqlite3_finalize` runs in `finally` so stmt is released on break/exhaustion/panic |
+| 36 | ATTACH DATABASE | `36-attach.das` | Has mockup |
 | 37 | Bulk operations | — | No-API — concept tutorial |
 | 38 | Concurrency | — | No-API — concept tutorial |
-| 39 | UD SQL functions | `32-sql_functions.das` | Has mockup |
+| 39 | UD SQL functions | `32-sql_functions.das` | **Shipped** (chunk 10); `register_function(db, name, @@fn[, deterministic[, directonly]])` call macro; arity 0..4; arg/return tags derived from function-pointer type; NULL short-circuit; panic recovery via `Context::runWithCatch` |
 | 40 | FTS5 | `39-fts5.das` | Has mockup |
 | 41 | Triggers | — | No-API — concept tutorial |
 

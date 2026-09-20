@@ -1,5 +1,9 @@
 cmake_minimum_required (VERSION 3.16)
 project (DAS VERSION 0.6.1)
+# enable_testing() must live at the top-level scope of the top-level
+# CMakeLists.txt for `ninja test` / ctest to work from the build root.
+# The actual add_test() calls live under tests-cpp/.
+enable_testing()
 include(GNUInstallDirs)
 
 # for now we gonna run with exceptions enabled
@@ -107,7 +111,7 @@ ENDIF()
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
-FILE(GLOB DAS_AOT_DASLIB_DEPENDS "${PROJECT_SOURCE_DIR}/daslib/*.das")
+FILE(GLOB DAS_AOT_DASLIB_DEPENDS CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/daslib/*.das")
 
 MACRO(DAS_AOT_EXT input_files genList mainTarget dasAotTool dasAotToolArg)
     set(all_depends ${dasAotTool} ${PROJECT_SOURCE_DIR}/utils/aot/main.das ${DAS_AOT_DASLIB_DEPENDS})
@@ -319,7 +323,7 @@ SET(DAS_MODULES_LIBS)
 
 SET(DAS_ALL_EXAMPLES)
 SET(DAS_EXAMPLES_TO_RUN)
-FILE(GLOB _modules RELATIVE "${PROJECT_SOURCE_DIR}/modules" "modules/*")
+FILE(GLOB _modules RELATIVE "${PROJECT_SOURCE_DIR}/modules" CONFIGURE_DEPENDS "modules/*")
 
 # Every dynamic module should pass through this macro.
 MACRO(ADD_DAS_SHARED_MODULE_LIB module_name)
@@ -450,7 +454,7 @@ ENDFOREACH()
 # Clean stale .shared_module files. When a module is disabled, its .shared_module
 # from a previous build may remain and cause crashes at startup (the dynamic module
 # loader tries to load them even though the module code is no longer linked).
-FILE(GLOB_RECURSE _all_shared_modules "${PROJECT_SOURCE_DIR}/modules/*.shared_module")
+FILE(GLOB_RECURSE _all_shared_modules CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/modules/*.shared_module")
 FOREACH(_sm ${_all_shared_modules})
     GET_FILENAME_COMPONENT(_sm_name "${_sm}" NAME_WE)
     IF(NOT TARGET ${_sm_name})
@@ -738,7 +742,6 @@ SET(MISC_SRC
 include/daScript/misc/enums.h
 include/daScript/misc/hal.h
 include/daScript/misc/fpe.h
-include/daScript/misc/copy_bytes.h
 include/daScript/misc/platform.h
 include/daScript/misc/vectypes.h
 include/daScript/misc/arraytype.h
@@ -759,6 +762,7 @@ include/daScript/misc/gc_node.h
 include/daScript/misc/job_que.h
 include/daScript/misc/handle_registry.h
 include/daScript/misc/uric.h
+include/daScript/misc/lexer_alloc_track.h
 src/misc/gc_node.cpp
 src/misc/sysos.cpp
 src/misc/string_writer.cpp
@@ -768,6 +772,7 @@ src/misc/handle_registry.cpp
 src/misc/free_list.cpp
 src/misc/alloc_tracker.cpp
 src/misc/alloc_tracker_fast_stack.cpp
+src/misc/lexer_alloc_track.cpp
 src/misc/uric.cpp
 src/misc/format.cpp
 )
@@ -1216,18 +1221,9 @@ get_target_property(DAS_FMT_LIBS das-fmt LINK_LIBRARIES)
     #      MACOSX_BUNDLE_INFO_PLIST ${CMAKE_SOURCE_DIR}/utils/daScript/MacOSXBundleInfo.plist.in)
     #ENDIF()
 
-    # Thread-safety test (issue #2027) — static link
-    add_executable(test_concurrent_init ${PROJECT_SOURCE_DIR}/tests/threading/test_concurrent_init.cpp)
-    TARGET_LINK_LIBRARIES(test_concurrent_init libDaScript ${SRC_LIBRARIES} ${DAS_MODULES_LIBS})
-    target_include_directories(test_concurrent_init PRIVATE ${NEED_MODULES_PATH})
-    SETUP_CPP11(test_concurrent_init)
-
-    # Thread-safety test (issue #2027) — dynamic link (DLL)
-    add_executable(test_concurrent_init_dyn ${PROJECT_SOURCE_DIR}/tests/threading/test_concurrent_init.cpp)
-    TARGET_LINK_LIBRARIES(test_concurrent_init_dyn libDaScriptDyn ${SRC_LIBRARIES})
-    ADD_DEPENDENCIES(test_concurrent_init_dyn libDaScriptDyn ${DAS_DYN_MODULES_LIBS})
-    target_include_directories(test_concurrent_init_dyn PRIVATE ${NEED_MODULES_PATH})
-    SETUP_CPP11(test_concurrent_init_dyn)
+    # C++ test infrastructure (doctest under tests-cpp/, plus big-test executables).
+    # Owns ALL C++-test-related CMake. enable_testing() lives at the top of this file.
+    add_subdirectory(tests-cpp)
 
     # Build daslang utilities as standalone executables (-exe mode)
     add_subdirectory(utils)
@@ -1270,7 +1266,6 @@ SET(DAS_RELEASE_MISC_INCLUDE
     include/daScript/misc/anyhash.h
     include/daScript/misc/arraytype.h
     include/daScript/misc/callable.h
-    include/daScript/misc/copy_bytes.h
     include/daScript/misc/debug_break.h
     include/daScript/misc/enums.h
     include/daScript/misc/fpe.h

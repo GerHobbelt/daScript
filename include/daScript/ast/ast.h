@@ -463,6 +463,7 @@ namespace das
         virtual bool isCompatible ( const FunctionPtr &, const vector<TypeDeclPtr> &, const AnnotationDeclaration &, string &  ) const { return true; }
         virtual bool isSpecialized() const { return false; }
         virtual void appendToMangledName( const FunctionPtr &, const AnnotationDeclaration &, string & /* mangledName */ ) const { }
+        virtual bool isAppliedToGeneric() const { return false; }
     };
 
     struct TransformFunctionAnnotation : FunctionAnnotation {
@@ -1157,6 +1158,7 @@ namespace das
         static void Initialize();
         static void CollectFileInfo(das::vector<FileInfoPtr> &accesses);
         static void Shutdown( bool dumpHandleLeaks = true );
+        static uint64_t CountHandleLeaks();
         static void Reset(bool debAg);
         static void ClearSharedModules();
         static void CollectSharedModules();
@@ -1594,7 +1596,6 @@ namespace das
     // dll loading
         vector<string> dll_search_paths;          // additional search paths for dll loading
     // one-liners
-        /*option*/ bool temp_one_liner_warning = false;
         /*option*/ bool temp_table_lint_warning = false;
     };
 

@@ -531,6 +531,459 @@ dasSQLITE suite: **309 tests passing** (271 pre-chunk-7 + 38 new).
   upsert` (`Sql{Upsert,…}Macro` would change anyway) is one
   reasonable bundle.
 
+## Shipped — chunk 8: custom-types adapter rail + BLOB + backlog drain (branch `dassqlite-chunk8-custom-types`)
+
+Chunk 8 ships **tutorial 26 (custom type adapters)** and **tutorial 27
+(BLOB round-trip)**, plus two small deferred features and the dupe
+cleanup carried over from chunk 7. Tut 28 (JSON) was cut from this
+chunk — its `_sql` JSON-path walker rule deserves its own attention.
+
+### Custom-types adapter rail (`sqlite_boost.das`)
+
+- **Two-function name-based pair** — `_::sql_bind(value : T) : P` and
+  `_::sql_extract(stored : P; type<T>) : T`, where `P` is one of four
+  primitive storage types (`int64`, `double`, `string`, `array<uint8>`)
+  selected at macro-expansion from `_::sql_bind`'s return type.
+- **Module-scope overloads** for the four primitives (passthrough),
+  stdlib widenings (`int`/`int8`/`int16`/`uint`/`uint8`/`uint16`/
+  `uint64`/`float`/`bool` → primitives), and a single enum generic
+  guarded by `static_if (typeinfo is_enum(default<TT>))`. Users add
+  their own overloads at any module scope to register `DateTime`,
+  `Guid`, etc.
+- **Macro emission migrated** — the `[sql_table]` codegen routes
+  through the new `sql_bind_to_stmt(stmt, idx, v)` and
+  `read_via_adapter(stmt, col, type<T>)` helpers, plus a
+  `sql_storage_type_for(type<T>)` DDL emitter that derives the
+  column type from `_::sql_bind`'s return type via `typedecl`. Runtime
+  paths (`query_one` / `query_scalar` / raw `_sql` positional binds)
+  also route through these so user-defined adapters work uniformly.
+- **`Option<T>` over a custom adapter** — the bind/read sites unwrap
+  `Option<T>` to `T` and recurse, so `Option<DateTime>` Just Works as
+  long as `_::sql_bind`/`_::sql_extract` are defined for `DateTime`.
+- **Legacy rail removed** — `sqlite_bind` / `sqlite_read` /
+  `sqlite_sql_type` overload tables are gone.
+
+### Tut 27 — BLOB round-trip
+
+`array<uint8>` is one of the four adapter primitives, so a struct
+field of that type round-trips through a BLOB column with no extra
+annotation. No new core macro work was needed.
+
+### Backlog drain — small features
+
+- **`exec` / `try_exec` parameter binding** — 0/1/2/3-arg overloads
+  mirror the `query_one` shape (chunk 6 deferred). Routes through a
+  new private `try_exec_with_binds` helper.
+- **`_.Col == none()` → fixit `macro_error`** — `pred_to_sql`'s
+  equality handler detects `none()` on either side (both pre-typer
+  qmatch and post-typer `operator==(...)` shapes) and emits a
+  `macro_error` pointing the user at `is_none()` (chunk 4 D4 deferred).
+
+### Side bug fixes
+
+- **`sqlite3_bind_blob` wrapper had a hardcoded `index = 1`** —
+  pre-existing; never noticed because nothing tested BLOB from
+  `[sql_table]` before. Now uses the caller's `index` parameter.
+- **Empty `array<uint8>` bind** — guarded with
+  `length == 0 → sqlite3_bind_zeroblob(stmt, index, 0)` to avoid
+  `addr(data[0])` panic on zero-length arrays.
+- **`is_const_or_captured_var` missed enum / bitfield literals** —
+  `_where(_.Status == OrderStatus.Paid)` was emitting incomplete SQL
+  (`WHERE "Status" = ` with no bind). Added `ExprConstEnumeration`,
+  `ExprConstBitfield`, and the missing int8/16 / uint8/16 forms to
+  the recognizer.
+
+### Pre-existing dupe cleanup (5 items, all from chunk-7 deferred list)
+
+1. **`validate_outer_args(prog, call, rootT, expected_arity, sig_text)`**
+   — collapses `validate_outer_update_args` /
+   `validate_outer_delete_args`. All 8 callers updated.
+2. **`make_insert_sql_fn(st, name, fields, include_pk : bool)`** —
+   collapses `make_insert_with_pk_sql_fn` / `make_insert_no_pk_sql_fn`.
+   Emitted helper names stay stable
+   (`_sql_insert_with_pk_sql` / `_sql_insert_no_pk_sql`).
+3. **`find_annotation(args, argn, default_value : auto(TT)) : TT`** —
+   collapses `find_bool_annotation` / `find_string_annotation` via
+   `static_if (typeinfo is_string(default_value))` dispatch on
+   `tString` / `tBool`. ~20 call sites updated.
+4. **`try_run_dml_returning` ≡ `try_run_select`** — flagged by the
+   dupe agent but already factored: both are 1-line wrappers around
+   `try_collect_rows` with different `err_prefix`. The existing
+   factoring IS the dedupe; no code change needed.
+5. **`OuterArgZeroMacro` / `OuterArgTwoMacro` parents** —
+   `class private OuterArgZeroMacro : AstCallMacro` (overrides
+   `canVisitArgument` → `argIndex == 0`) and
+   `class private OuterArgTwoMacro : AstCallMacro`
+   (`argIndex < 2`). The 8 update/delete macros and 4 upsert macros
+   re-parent to these and drop their local `canVisitArgument`
+   overrides; each subclass keeps its own `[call_macro(name=...)]`
+   annotation since annotations don't inherit. Net: 12 × 3-line
+   override deletions, 2 × 4-line parent-class additions.
+
+### Tutorials
+
+- [tutorials/sql/26-custom_types.das](../../tutorials/sql/26-custom_types.das)
+  — `DateTime` via INTEGER, `Guid` via BLOB, enum auto-roundtrip,
+  `query_scalar` through adapters, `Option<DateTime>`, enum-in-where
+  predicate, DDL storage-type derivation.
+- [tutorials/sql/27-blob.das](../../tutorials/sql/27-blob.das) —
+  `array<uint8>` round-trip; derived from inherited
+  `tutorial/07-insert_image.das` + `08-read_image.das`.
+
+### Tests
+
+3 new test files: `test_61_custom_types.das` (7 tests),
+`test_62_blob.das` (6 tests), `test_63_exec_params.das` (6 tests).
+Plus 2 new entries in `failed_sql_macro.das` (`bad20` / `bad21` —
+the `_.Col == none()` fixit). Total dasSQLITE suite: **328 tests
+passing** (309 pre-chunk-8 + 19 new).
+
+### Deferred to chunk 9+
+
+- **Tut 28 — JSON columns** (`@sql_json` / `@sql_blob` annotations
+  + `_sql` JSON-path walker rule) — was cut from this chunk; ships
+  as its own headline.
+- **Per-field `@sql_as(type<P>)` override** — pick a non-default
+  storage primitive for a custom-type column when multiple
+  `_::sql_bind` overloads exist. Locked shape; awaiting user demand.
+- **Struct-type `_select(type<T2>)` projection** — needs a
+  `[sql_table]`-emitted compile-time field-list metadata helper.
+- **Bulk `array<T>` upsert** — carried from chunk 7 deferred.
+- **Composite foreign keys**, **partial / expression indexes**,
+  **function-reference `@sql_computed`**, **DEFAULT-firing from the
+  macro INSERT path** — all carried from chunk 7 deferred.
+- **Optimistic concurrency token, multi-table DELETE, named-tuple
+  bind for `query_one` / `exec`** — carried from earlier chunks.
+
+## Shipped — chunk 10: operational SQLite (branch `dassqlite-chunk10-operational-sqlite`)
+
+Chunk 10 ships **tut 31 (views)**, **tut 33 (PRAGMA tuning)**, **tut 34
+(backup + VACUUM)**, **tut 35 (streaming `_each_sql`)**, and **tut 39
+(user-defined SQL scalar functions)** — five tutorials covering the
+"operational" surface of SQLite that wasn't yet in the daslang rail.
+Migrations (originally listed as tut 30) deferred to the last chunk. No
+new language prerequisites; chunk 10 sits entirely on the chunk-2..9
+foundation.
+
+### Tut 31 — `[sql_view]` + `_create_view`
+
+- **`[sql_view(name="...")]` structure annotation.** Read-only sibling
+  of `[sql_table]`. Generates the same `_sql_table_name` /
+  `_sql_select_all_sql` / `_sql_read_row` / `_sql_column_info` /
+  `_sql_drop_view_if_exists_sql` helpers under the same names so
+  `select_from(type<V>)` and the `_sql(...)` rail dispatch on view
+  types without case-splitting.
+- **Field annotations:** `@sql_column` (rename), `@sql_json`,
+  `@sql_blob` accepted; six DDL-flavored annotations rejected
+  (`@sql_primary_key`, `@sql_unique`, `@sql_computed`/`@sql_stored`,
+  `@sql_default_fn`, `@sql_references`/`@sql_on_delete`/`@sql_on_update`).
+  Sibling `[sql_index]` rejected too.
+- **JSON/BLOB adapter codegen factored** out of `[sql_table]`'s body
+  into a shared `emit_json_blob_adapters_for_struct(st, fields, tag,
+  errors)` helper — `[sql_view]` reuses the exact same adapter
+  machinery for transparent JSON/BLOB-typed view columns.
+- **Mutation-path rejection:** predicate-form (`_sql_update` /
+  `_sql_delete` / `_sql_upsert` and try / returning siblings) caught at
+  compile time inside `validate_outer_args`'s view check; row-form
+  (`insert(viewRow)` / `update(viewRow)` / `delete_(viewRow)` /
+  `upsert(viewRow)`) caught at compile time via macro-emitted
+  `concept_assert(false, ...)` stubs that fire on first reference.
+- **`_create_view(db, type<V>, chain)` call macro.** Validates: `type<V>`
+  carries `[sql_view]`; chain projection's column count matches V's
+  field count; per-position type matches V's field type (compared via
+  `describe()`); chain has no bound-parameter expressions (SQLite
+  rejects `?` placeholders inside CREATE VIEW). Emits `db |> exec(...)`
+  with the view's column list using V's field names (and `@sql_column`
+  renames) authoritative.
+- **Literal-inlining** for `_create_view`: chain bind-exprs that are
+  `ExprConst*` (Int/Bool/Float/Double/String with `'` doubling) are
+  formatted into the SQL text; captured locals rejected with a clear
+  pointer at the literal-only requirement. Acknowledged as a hack for
+  this chunk; replacement design is the SQL-fragment refactor
+  (deferred — see "Carried" below).
+- **`drop_view_if_exists(type<V>)` / `try_drop_view_if_exists`** template
+  wrappers.
+- Tutorial: [tutorials/sql/31-views.das](../../tutorials/sql/31-views.das).
+  Tests: `test_72_view_basic.das` (5 positive),
+  `failed_sql_view_schema.das` (9 errors),
+  `failed_sql_view_mutations.das` (8 errors),
+  `failed_create_view.das` (6 errors).
+
+### Tut 33 — Pragma tuning
+
+- **`set_pragma` / `try_set_pragma`** with three typed overloads
+  (string / int64 / bool with ON/OFF). Inlined into `PRAGMA "..." = ...`
+  since SQLite parses pragma values at prepare time (no `?` binds).
+- **`apply_recommended_pragmas` / `try_apply_recommended_pragmas`**:
+  WAL + busy_timeout=5000 + foreign_keys=ON + synchronous=NORMAL.
+  Errors short-circuit through `Result`-style early return so the
+  caller learns which pragma failed.
+- Tutorial: [tutorials/sql/33-pragma.das](../../tutorials/sql/33-pragma.das).
+  Tests: `test_80_pragma_basic.das` (6 cases incl. PRAGMA-in-tx
+  rejection).
+
+### Tut 34 — Vacuum / optimize / integrity / backup
+
+- **`vacuum` / `try_vacuum`** — rejects active transactions before
+  reaching SQLite (the strict form would surface SQLite's error
+  message; the wrapper-side preflight is friendlier).
+- **`vacuum_into(path)` / `try_vacuum_into`** — `''`-doubling
+  single-quote escape on `path` (SQLite rejects `?` binds for VACUUM).
+- **`optimize` / `try_optimize`** — thin `PRAGMA optimize` wrapper.
+- **`integrity_check` / `quick_check` / `try_*`** — `array<string>`
+  return; healthy DB returns `["ok"]`, corruption returns one row per
+  detected issue. Backed by a private `try_check_impl` using
+  `try_run_select` with `read_via_adapter` (NOT `try_query`, which
+  expects a struct + `_sql_read_row`).
+- **`backup_to(dest)` / `backup_to(path)` + `try_*` siblings** — online
+  Backup API (`sqlite3_backup_init` / `_step` / `_finish`). C++ shim
+  `sqlite3_backup_run` lives in `dasSQLITE.backup.cpp`; loops with
+  100-page steps and falls back to a 50 ms `sqlite3_sleep` on
+  transient SQLITE_BUSY/LOCKED responses. Path overload opens the
+  destination internally and finalizes via `var inscope`. The C++ shim
+  returns `SQLITE_OK` on a fully-completed backup and any other rc on
+  failure; the daslang side maps that to `SqlError`.
+- Tutorial: [tutorials/sql/34-backup_vacuum.das](../../tutorials/sql/34-backup_vacuum.das).
+  Tests: `test_85_vacuum.das` (5 cases) +
+  `test_83_backup_to.das` (3 cases — memory-runner snapshot, on-disk
+  round-trip, destination overwrite).
+
+### Tut 35 — Streaming (`_each_sql`)
+
+- **`_each_sql(chain)` call macro** returning `iterator<T>` via
+  `run_each_select` runtime helper. Same chain shape as `_sql`;
+  rejects materializing terminals (`_to_array`, `_first`, `_first_opt`,
+  aggregates) at compile time, pointing at `_sql` for the
+  materializing form.
+- **Generator pattern that worked** (after debugging "can't yield from
+  inside the block" + "implicit capture by move"): explicit
+  `capture(<- name1, <- name2)` with `<-` on every captured name;
+  `var row_lam : lambda<...>` in the runtime helper signature;
+  `for (_ in range(0x7FFFFFFF))` with `break` on `SQLITE_DONE`
+  (daslang generators reject `while`); yield as the LAST statement in
+  the for body.
+- **Cleanup via `finally`:** the generator's `finally { sqlite3_finalize(stmt) }`
+  runs on normal exhaustion, early `break`, outer return, and panic —
+  no leaked stmt blocks subsequent writes on the same connection.
+  Captured-local binds work (CREATE-VIEW-style inlining is NOT needed
+  since `?` placeholders are honored at run time).
+- **API_REWORK §35 revision:** §35 originally said streaming was a
+  "behavior of existing iterator-based `for (row in _sql(...))`" — but
+  that iterator form was never shipped. Streaming is therefore real
+  new API: a new `_each_sql` macro returning `iterator<T>`.
+- Tutorial: [tutorials/sql/35-streaming.das](../../tutorials/sql/35-streaming.das).
+  Tests: `test_90_each_sql_basic.das` (5 positive incl. break +
+  stmt-cleanup proof), `failed_each_sql_terminals.das` (4 errors).
+
+### Tut 39 — `register_function`
+
+- **`register_function(db, name, @@fn[, deterministic[, directonly]])`
+  call macro.** Inspects the function pointer's static type at compile
+  time (`_type.argTypes` + `_type.firstType`), derives an `SqlFnTag`
+  per arg + return, and emits a call to a C++ trampoline-registration
+  shim with per-position tags. Up to 4 arguments supported in v1.
+- **Supported scalar set** (compile error otherwise, with per-position
+  diagnostic naming the offender): `int`, `int64`, `float`, `double`,
+  `bool`, `string`. Pointer types, structs, arrays, lambdas, classes
+  rejected.
+- **C++ trampoline** in `dasSQLITE.userfn.cpp`. `RegisteredScalarFn`
+  user-data struct stores `(Context*, Func, retTag, nArgs, argTags[4])`;
+  freed by SQLite-managed `xDestroy` callback (registered via
+  `sqlite3_create_function_v2`'s last param) on connection close /
+  function replacement / explicit drop.
+- **NULL handling (v1):** any SQLITE_NULL argument short-circuits to
+  `sqlite3_result_null` without invoking the daslang function — the
+  idiomatic SQL behavior of built-in scalars (`abs(NULL)` → NULL).
+  Explicit `Option<T>` arg types for in-function NULL handling are
+  deferred to a follow-up.
+- **Panic recovery:** `Context::runWithCatch` wraps the daslang
+  invocation. On panic, the message is read via `getException()`, the
+  context's `exception` / `stopFlags` are cleared (matching the
+  recovery shape from `simulate_exceptions.cpp:217`), and the panic is
+  surfaced via `sqlite3_result_error`. The connection itself is
+  unaffected — subsequent statements on the same connection run
+  normally.
+- **`deterministic=true`** maps to `SQLITE_DETERMINISTIC` (allows the
+  fn in `CREATE INDEX … ON tbl(myfn(col))` and lets the planner
+  factor it out of inner loops). **`directonly=true`** maps to
+  `SQLITE_DIRECTONLY` (blocks invocation from triggers / views /
+  CHECK constraints).
+- **Tag transport:** four scalar `uint8_t` slots (`tag0..tag3`) on the
+  C++ binding instead of a `TArray<uint8_t>`, sidestepping the
+  array-construction overhead in the macro emit. Unused slots
+  ignored according to nArgs.
+- Tutorial: [tutorials/sql/32-sql_functions.das](../../tutorials/sql/32-sql_functions.das).
+  Tests: `test_74_register_function_basic.das` (10 — every supported
+  type and arity), `test_75_register_function_null_panic.das`
+  (3 — NULL short-circuit, panic recovery, post-panic connection
+  health), `test_76_register_function_use_in_chains.das`
+  (3 — UDF in WHERE / ORDER BY / projection),
+  `test_77_register_function_lifetime.das` (3 — replacement,
+  per-connection scope, no-survive-reopen),
+  `failed_register_function.das` (5 errors — struct arg, struct
+  return, pointer arg, lambda instead of `@@fn`, > 4 args).
+
+### Cumulative state after chunk 10
+
+381 (chunk 9) + 21 (chunk 10) = ~402 dasSQLITE tests passing.
+
+### Carried / deferred to chunk 11+
+
+- **SQL-fragment refactor** — SHIPPED in chunk 11 (`SqlFrag` variant +
+  `fold_to_string` / `fold_to_builder` consumers in sqlite_linq.das).
+  All 13 macro emissions route through `fold_to_builder`; const-folding
+  collapses all-text/all-bind chains to a single `ExprConstString` so
+  AOT codegen is byte-identical to the previous `$v(sql)` baking path.
+  PR-B follow-on adds `_sql_pragma(db, name, value)` and
+  `_sql_vacuum_into(db, path)` macros that exercise the
+  `inline_id` / `inline_lit` SqlFrag kinds — both fold to literal SQL
+  when args are compile-time constants, falling back to a builder
+  with `sql_quote_id` / `sql_quote_lit` calls otherwise. PR-C extends
+  `_order_by` / `_order_by_descending` to accept a `string`-typed
+  expression (single col or tuple element) — the SQL build emits a
+  `\x01` placeholder consumed by `sql_to_frags_ex`, which routes the
+  expression through `fold_to_builder` as an `inline_id` frag. Const
+  strings still fold to compile-time-quoted SQL; runtime variables emit
+  `sql_quote_id(<expr>)` so embedded `"` is doubled safely. Mixed
+  tuples (e.g. `(_.Price, runtimeName)`) work — each entry independently
+  picks the compile-time `_.Field` or runtime-string path. `_create_view`
+  rejects runtime ORDER BY (DDL is run-once; runtime column would bake at
+  view-creation time).
+- **Migrations (last chunk)** — `daslib/sql_migrate` module,
+  `[sql_migration]` annotation collected across translation units,
+  `migrate_to_latest` runner, `__schema_version` table, multi-row
+  audit semantics.
+- **Aggregate / window UDFs** — `xStep` / `xFinal` / `xValue` /
+  `xInverse`. v1's `register_function` is scalar-only.
+- **`[sql_function]` annotation macro** — auto-registration on
+  connect, custom-type adapter composition.
+- **Updatable views via INSTEAD OF triggers.**
+- **ATTACH DATABASE** (tut 36 — independent SQLite extension).
+- **`_try_each_sql`** — Result-yielding iterator variant.
+- **Backup progress callback** — `sqlite3_backup_step(bp, N)` +
+  `remaining` / `pagecount` surfaced to a daslang block.
+- **Compile-time enum surface for pragmas** — `set_journal_mode(JournalMode.WAL)`
+  rather than the stringly-typed name.
+- **Open-time named-tuple pragma bundle** — `with_sqlite(path,
+  pragmas=(...))`.
+- **Option<T> args / blob args / blob return** for `register_function`.
+
+## Shipped — chunk 9: JSON / BLOB columns + column metadata + raw `query` family (branch `dassqlite-chunk9-json-introspection`)
+
+Chunk 9 ships the headline JSON / opaque-blob feature plus the
+schema-introspection cluster: tuts 28 (JSON / BLOB columns), 29 (column
+metadata), 30 (listing tables). All three sit on top of the chunk-8
+adapter rail and the existing `[sql_table]` field-walking machinery.
+No new architecture decisions — designs locked in §37-json (8 locks),
+§09-column_names, and §10-list_tables.
+
+### Pre-step refactor: factor the executor functions, add `query` family
+
+- **A1.** Factored `try_one_row` / `try_one_row_opt` / `try_step_dml` /
+  `try_collect_rows` into shared `try_with_stmt` helper. ~80 lines of
+  duplicated prepare/finalize boilerplate → ~20.
+- **A2.** Added `try_query` / `query` (4 overloads each, 0/1/2/3 bind
+  args). The missing fourth member of the `query_*` family — multi-row
+  typed raw-SQL read. Backs tut 29 Band 3 + tut 30.
+
+### Tut 28 — `@sql_json` + `@sql_blob`
+
+- **`@sql_json` field annotation** — TEXT-backed via `daslib/json` +
+  `daslib/json_boost`. `[sql_table]` generates the `sql_bind` /
+  `sql_extract` adapter pair at module scope: `write_json(JV(v))` /
+  `from_JV(read_json(...))`. DDL emits `TEXT`.
+- **`@sql_blob` field annotation** — BLOB-backed via `daslib/archive`.
+  Adapter codegen: `mem_archive_save` / `mem_archive_load`. DDL emits
+  `BLOB`.
+- **Validation** — `[sql_table]` rejects: both annotations on one
+  field; either annotation on `@sql_primary_key`; either on
+  `@sql_computed`. Adapter dedup is per-`(T, kind)`, keyed off the
+  return type of any existing `sql_bind(T)` (string for `@sql_json`,
+  `array<uint8>` for `@sql_blob`) so two `[sql_table]`s sharing a
+  JSON-typed field don't double-generate. Using the same `T` with
+  different kinds (across structs in the module, or across fields in
+  one struct) is rejected at compile time — silent miscompile would
+  otherwise route a BLOB column through the JSON adapter or vice
+  versa. Wrap in a typedef when two storage views of the same payload
+  are genuinely needed.
+- **`_sql` walker JSON-path descent (pred-side AND projection-side)**
+  — `_.<json_col>.<path…>` lowers to `json_extract("<col>",
+  '$.<path…>')`. Arbitrary depth. Multi-source SELECT (joins) emits
+  `json_extract("<alias>"."<col>", '$.…')`. `@sql_blob` columns are a
+  compile error on descent — the walker reads field annotations off
+  the source struct, not off the type.
+- Tutorial: [tutorials/sql/28-json.das](../../tutorials/sql/28-json.das).
+  Tests: `test_64_json_columns.das` (18 tests — round-trip, DDL,
+  adapter dedup, pred-side and projection-side walker descent),
+  `test_65_blob_struct.das` (5 tests — multiple `@sql_blob` fields,
+  array/table/nested archive payloads, mixed plain + JSON + BLOB).
+
+### Tut 29 — `column_info(type<T>)` + `sqlite_sql_type`
+
+- **Abstract types** in `daslib/sql`: `enum SqlType { Integer; Real;
+  Text; Blob; Null }` and `struct ColumnInfo { name; data_type; is_pk;
+  is_nullable; default_expr }`. `SqlType` lives in the abstract layer
+  so the same `ColumnInfo` round-trips across providers.
+- **Witness machinery** in `sqlite_boost`: `sql_storage_enum_witness`
+  (mirror of `sql_storage_type_witness`) + `sql_storage_enum_for(type<T>)`
+  resolves the enum at infer time via `_::sql_bind`'s return type.
+- **Provider helper** `sqlite_sql_type(t : SqlType) : string` —
+  `INTEGER`/`REAL`/`TEXT`/`BLOB`/`NULL`. Future
+  `postgres_sql_type`, `mysql_sql_type` ship next to their respective
+  boost modules.
+- **`[sql_table]` codegen** — `make_column_info_fn` synthesizes a
+  per-struct `_sql_column_info(typ : T) : array<ColumnInfo>` helper
+  that pushes one `ColumnInfo` per field. `@sql_json` / `@sql_blob`
+  fields short-circuit to `SqlType.Text` / `SqlType.Blob`; other
+  fields call `sql_storage_enum_for` for infer-time resolution.
+  `default_expr` is the SQL-form expression with the leading
+  `" DEFAULT "` prefix stripped.
+- **User-facing dispatcher** `column_info(t : type<auto(TT)>) :
+  array<ColumnInfo>` — calls `_::_sql_column_info(default<TT>)`.
+- Tutorial: [tutorials/sql/29-column_names.das](../../tutorials/sql/29-column_names.das).
+  Tests: `test_66_column_info.das` (21 tests — cardinality, ordering,
+  PK/nullable/data_type/default_expr per column, computed inclusion,
+  JSON+BLOB short-circuit, `sqlite_sql_type` for all 5 enum values,
+  composability with linq comprehensions).
+
+### Tut 30 — Listing tables
+
+No new API. Tutorial-only — falls out of `query("SELECT … FROM
+sqlite_master …", type<MasterRow>)`. Decision (locked § 10-list_tables):
+no abstract `list_tables` helper; catalog spelling is genuinely
+provider-specific. Tutorial:
+[tutorials/sql/30-list_tables.das](../../tutorials/sql/30-list_tables.das).
+The existing `test_67_query_raw.das` `test_query_sqlite_master_lists_user_tables`
+test already covers the path end-to-end.
+
+### Cumulative state after chunk 9
+
+381 dasSQLITE tests passing (328 pre-chunk-8 + 27 chunk-8 +
+26 chunk-9). New tests: `test_64_json_columns.das` (+18),
+`test_65_blob_struct.das` (+5), `test_66_column_info.das` (+21).
+
+### Deferred to chunk 10+
+
+- **`@sql_json_index("$.path")`** — typed expression index on a JSON
+  path. Cross-provider DDL diverges; raw `CREATE INDEX` until a second
+  backend lands.
+- **`_json_extract<T>(col, path)`** — explicit escape for paths the
+  walker can't reach (array subscripts, custom JSON operators).
+- **`@sql_json(fast)`** — `json_sprint` / `json_sscan` fast path.
+- **JSON patch / merge inside `_update`** — `json_set` / `json_patch`
+  in chain-form updates.
+- **JSONB binary storage** (SQLite 3.45+) via `@sql_json(binary)`.
+- **`@sql_blob` compression** (zstd / lz4) and versioned-format header.
+- **Cross-provider JSON-path emitter** — PG `->>`, MSSQL `JSON_VALUE`.
+- **`@sql_blob` field-descent compile-error negative test** — first
+  attempt hit an unrelated archive codegen issue for string-only
+  inner structs. Track separately.
+- **Carried from chunk 8+:** per-field `@sql_as(type<P>)`, struct-type
+  `_select(type<T2>)`, bulk `array<T>` upsert, composite FKs, partial /
+  expression indexes, function-reference `@sql_computed`, DEFAULT-firing
+  from the macro INSERT path, optimistic concurrency token, multi-table
+  DELETE, named-tuple bind for `query_one` / `exec`.
+
 ## Shipped — chunk 4: read-side depth — distinct/take/skip/order_by/aggregates/group_by/NULL (branch `dassqlite-chunk4-read-depth`)
 
 Chunk 4 broadens the chunk-3 framework with the rest of the read-side
@@ -1211,8 +1664,11 @@ checks rc, frees errmsg, closes DB. Two rc-check/close/return cycles.
   compile time.
 - **Field metadata syntax: `@name` only.** Per ds2 grammar, field
   annotations use `@sql_primary_key`, `@sql_default(expr)`,
-  `@sql_column(name="...")`, etc. — not `[...]`. Struct/function-level
-  still `[...]` (`[sql_table(name="Cars")]`).
+  `@sql_column = "<name>"`, etc. — not `[...]`. Struct/function-level
+  still `[...]` (`[sql_table(name="Cars")]`). The shipped form for
+  `@sql_column` is the bare-string form (`@sql_column = "type"`),
+  matching `@sql_default_fn = "FN"` / `@sql_references = "Parent"` /
+  `@sql_on_delete = "cascade"` precedent.
 - **What `[sql_table]` generates** (aspirational, grows as tutorials
   demand):
   - `create_table(db, type<T>)` / `drop_table(db, type<T>)` /
@@ -1431,10 +1887,16 @@ with_sqlite("test.db") <| $(db) {
 
 - **Keyword / invalid-ident column names.** If a column name is a
   daslang keyword (`for`, `if`, `var`), the daslang struct field
-  already has to rename via `@sql_column(name="for")` — the field
-  carries a legal ident. Projection via `(If=_.for_column)` uses
-  the daslang field name; DB name is never typed in user code.
-  Resolution: no special handling needed.
+  renames via `@sql_column = "for"` — the field carries a legal
+  ident. Projection via `(If=_.for_column)` uses the daslang field
+  name; DB name is never typed in user code. **SHIPPED** in chunk 9
+  round 4: rename flows through DDL, `_sql` predicates / projections /
+  `_order_by` / `_group_by`, `column_info(type<T>).name`, INSERT /
+  UPDATE / DELETE / upsert SQL, RETURNING clauses, `[sql_index]`, and
+  `@sql_references` to a renamed parent PK. `[sql_table]` rejects
+  empty values, embedded `"`/`\` (SQL identifier hygiene), and
+  cross-field collisions where two fields produce the same SQL
+  column name.
 - **Column aliasing in projection.** Trivial under the new design:
   `._select((CarName=_.Name, Cost=_.Price))` — the tuple field
   name IS the alias. Removes this as an open issue.
@@ -1736,7 +2198,8 @@ out of the raw-SQL escape hatch already specified for 05:
 struct PragmaColumn {
     cid        : int
     name       : string
-    @sql_column(name="type") col_type : string   // "type" is a keyword
+    @sql_column = "type"
+    col_type   : string                          // "type" is a keyword
     notnull    : int
     dflt_value : string
     pk         : int
@@ -1791,7 +2254,8 @@ Core doesn't surface it.
 
    ```das
    struct MasterRow {
-       @sql_column(name="type") row_type : string
+       @sql_column = "type"
+       row_type    : string
        name     : string
        tbl_name : string
        rootpage : int
@@ -4075,15 +4539,23 @@ struct User {
 def sql_bind    (v : T) : string          { return write_json(JV(v)) }
 def sql_extract (v : string; type<T>) : T {
     var err = ""
-    return from_JV(read_json(v, err), default<T>)
+    let jv = read_json(v, err)
+    if (err != "") { panic(err) }
+    return from_JV(jv, default<T>)
 }
 
-// for @sql_blob T:
-def sql_bind    (var v : T) : array<uint8> { return <- mem_archive_save(v) }
+// for @sql_blob T (const param + clone_to_move because the chunk-8
+// catch-all binder passes `v` non-`var`, and mem_archive_* need a
+// mutable reference):
+def sql_bind    (v : T) : array<uint8> {
+    var v_local <- clone_to_move(v)
+    return <- mem_archive_save(v_local)
+}
 def sql_extract (v : array<uint8>; type<T>) : T {
     var r = default<T>
-    mem_archive_load(v, r)                 // panics on failure
-    return r
+    var v_local <- clone_to_move(v)
+    mem_archive_load(v_local, r)           // panics on failure
+    return <- r
 }
 ```
 

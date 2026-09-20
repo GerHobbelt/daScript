@@ -428,14 +428,15 @@ def handle_tools_list(id_json : string) : string {
     ))
     result.tools |> emplace(make_tool(
         "export_corpus",
-        "Build a corpus.json from one or more .das files/dirs/globs. Output is the same shape `detect_duplicates` expects: a JSON dump of every user function's canonical token stream and source location. Run this once over a body of code (e.g. 'daslib', 'tests', or your project) to produce a corpus, then point `detect_duplicates` at it. This is the MCP-side replacement for `detect-dupe --export-functions`; the whole workflow stays inside the MCP server with no shelling out.",
+        "Build a corpus.json from one or more .das files/dirs/globs. Output is the same shape `detect_duplicates` expects: a JSON dump of every user function's canonical token stream and source location. Run this once over a body of code (e.g. 'daslib', 'tests', or your project) to produce a corpus, then point `detect_duplicates` at it. Shells out to `daslang utils/detect-dupe/main.das` (daslang's `require` grammar can't use hyphenated path components, so the wrapper invokes the CLI as a subprocess). Pass `paths_file` to scope the export to an explicit precomputed list (e.g. files in a PR diff); pass `workers` to parallelize across child processes.",
         {
-            "paths" => PropertySchema(_type = "string", description = "Files, directories, or globs to scan. Comma- or newline-delimited. Directories are walked recursively. Skips `_*` directories, hidden directories, `builtin.das`, `daslib/debugger.das`, and `daslib/profiler.das`."),
+            "paths" => PropertySchema(_type = "string", description = "Files, directories, or globs to scan. Comma- or newline-delimited. Directories are walked recursively. Skips `_*` directories, hidden directories, `builtin.das`, `daslib/debugger.das`, and `daslib/profiler.das`. Optional when `paths_file` is given; otherwise required."),
+            "paths_file" => PropertySchema(_type = "string", description = "Path to a newline-delimited file of paths. Skips blank lines and lines starting with `#`. Composes with `paths` (union; deduped). Use this for PR-scoped runs where you'd otherwise hit ARG_MAX (e.g. piping `git diff --name-only` to a file)."),
             "out" => PropertySchema(_type = "string", description = "Output corpus.json path. Overwrites if it exists. Refuses to write a partial corpus when any input file fails to compile (matches the CLI's --export-functions behavior)."),
             "min_tokens" => PropertySchema(_type = "string", description = "Minimum canonical-token count per record (default 0 — keep every user function). Records below the threshold are dropped at export time. Most callers should leave this at 0 and let `detect_duplicates --min-tokens` filter at query time."),
-            "project" => PROJECT_PROP
+            "workers" => PropertySchema(_type = "string", description = "Worker count for parallel compilation. 0 = auto (= hardware threads). 1 = sequential. Files are split into N contiguous chunks; each chunk is compiled by a child detect-dupe process; shards are merged in chunk-index order so the output is byte-identical across worker counts. Below 16 input files the export stays sequential regardless.")
         },
-        ["paths", "out"]
+        ["out"]
     ))
     result.tools |> emplace(make_tool(
         "detect_duplicates",
@@ -446,8 +447,7 @@ def handle_tools_list(id_json : string) : string {
             "threshold" => PropertySchema(_type = "string", description = "Fuzzy similarity floor 0..1 (default 0.7). Score is sqrt(jaccard × len_ratio)."),
             "min_tokens" => PropertySchema(_type = "string", description = "Minimum canonical-token count per function (default 8). Filters trivial wrappers."),
             "top" => PropertySchema(_type = "string", description = "Top-N similar matches per candidate (default 5)."),
-            "keep" => PropertySchema(_type = "string", description = "Comma-separated pattern names to KEEP despite the default-skip filter. Special value 'all' disables pattern filtering entirely. Default is empty — all known patterns are skipped (currently: 'visitor', 'dispatch', 'emit'). The skipped count per pattern is reported in the envelope as `patterns_skipped`."),
-            "project" => PROJECT_PROP
+            "keep" => PropertySchema(_type = "string", description = "Comma-separated pattern names to KEEP despite the default-skip filter. Special value 'all' disables pattern filtering entirely. Default is empty — all known patterns are skipped (currently: 'visitor', 'dispatch', 'emit'). The skipped count per pattern is reported in the envelope as `patterns_skipped`.")
         },
         ["paths", "corpus"]
     ))
@@ -455,13 +455,12 @@ def handle_tools_list(id_json : string) : string {
         "judge_duplicates",
         "AI judge for detect-dupe clusters. Takes a detect-dupe JSON report and asks Claude (Haiku 4.5 by default) to partition each cluster into real-duplicate groups vs false positives, with a one-line reason per cluster. Returns an envelope with the embedded verdict JSON. Shells out to `daslang utils/find-dupe/main.das` — requires `daspkg install --root utils/find-dupe` first (fetches the `anthropic/anthropic` package) and the `ANTHROPIC_API_KEY` env var. WARNING: sends source code to Anthropic's API — only run on code your data-handling policy permits sharing.",
         {
-            "input" => PropertySchema(_type = "string", description = "Path to a detect-dupe JSON report (produced by `detect_duplicates` MCP tool or `detect-dupe --json <path>`)."),
+            "input" => PropertySchema(_type = "string", description = "Path to a detect-dupe JSON report. Produce one with `detect-dupe --json <path>` from the CLI, or use the `find_dupe` MCP tool which writes a `dupes.json` and judges it in one call. (The `detect_duplicates` MCP tool embeds the report inline and deletes its temp file, so its output isn't a reusable path.)"),
             "out" => PropertySchema(_type = "string", description = "Output directory for find_dupe_verdicts.json + .md. Defaults to a fresh temp dir under the project root."),
             "model" => PropertySchema(_type = "string", description = "`haiku` (default — Claude Haiku 4.5) or `sonnet` (Claude Sonnet 4.6)."),
             "max_clusters" => PropertySchema(_type = "string", description = "Hard cap on clusters analyzed after the worth-it gate (default 0 = no cap). Useful for cost control on large reports."),
             "positives_only" => PropertySchema(_type = "string", description = "If `true`, the verdict report keeps only `real`+`partial` rows. Summary still reflects all clusters."),
-            "dry_run" => PropertySchema(_type = "string", description = "If `true`, estimate cluster count and token cost without making any API calls. Recommended as a first step."),
-            "project" => PROJECT_PROP
+            "dry_run" => PropertySchema(_type = "string", description = "If `true`, estimate cluster count and token cost without making any API calls. Recommended as a first step.")
         },
         ["input"]
     ))
@@ -474,8 +473,7 @@ def handle_tools_list(id_json : string) : string {
             "model" => PropertySchema(_type = "string", description = "`haiku` (default) or `sonnet`."),
             "threshold" => PropertySchema(_type = "string", description = "Fuzzy similarity floor 0..1 (default 0.7) — passed through to detect-dupe."),
             "max_clusters" => PropertySchema(_type = "string", description = "Hard cap on clusters judged (default 0 = no cap)."),
-            "dry_run" => PropertySchema(_type = "string", description = "If `true`, run detect-dupe normally but skip the API calls — returns a token+cost estimate instead of verdicts."),
-            "project" => PROJECT_PROP
+            "dry_run" => PropertySchema(_type = "string", description = "If `true`, run detect-dupe normally but skip the API calls — returns a token+cost estimate instead of verdicts.")
         },
         ["paths"]
     ))
@@ -613,13 +611,13 @@ def dispatch_tool(tool_name, arg1, arg2, arg3, arg4, arg5, arg6, project : strin
     } elif (tool_name == "lint") {
         return do_lint(arg1, project)
     } elif (tool_name == "detect_duplicates") {
-        return do_detect_duplicates(arg1, arg2, arg3, arg4, arg5, arg6, project)
+        return do_detect_duplicates(arg1, arg2, arg3, arg4, arg5, arg6)
     } elif (tool_name == "export_corpus") {
-        return do_export_corpus(arg1, arg2, arg3, project)
+        return do_export_corpus(arg1, arg2, arg3, arg4, arg5)
     } elif (tool_name == "judge_duplicates") {
-        return do_judge_duplicates(arg1, arg2, arg3, arg4, arg5, arg6, project)
+        return do_judge_duplicates(arg1, arg2, arg3, arg4, arg5, arg6)
     } elif (tool_name == "find_dupe") {
-        return do_find_dupe(arg1, arg2, arg3, arg4, arg5, arg6, project)
+        return do_find_dupe(arg1, arg2, arg3, arg4, arg5, arg6)
     } elif (tool_name == "live_status") {
         return do_live_status(arg1)
     } elif (tool_name == "live_error") {
@@ -810,14 +808,16 @@ def handle_tools_call(id_json : string; params : JsonValue?) : string {
         arg6 = get_string_arg(args, "keep")
     } elif (name == "export_corpus") {
         arg1 = get_string_arg(args, "paths")
-        if (empty(arg1)) {
-            return json_rpc_error(id_json, -32602, "missing 'paths' argument")
+        arg2 = get_string_arg(args, "paths_file")
+        if (empty(arg1) && empty(arg2)) {
+            return json_rpc_error(id_json, -32602, "missing input — provide 'paths' and/or 'paths_file'")
         }
-        arg2 = get_string_arg(args, "out")
-        if (empty(arg2)) {
+        arg3 = get_string_arg(args, "out")
+        if (empty(arg3)) {
             return json_rpc_error(id_json, -32602, "missing 'out' argument")
         }
-        arg3 = get_string_arg(args, "min_tokens")
+        arg4 = get_string_arg(args, "min_tokens")
+        arg5 = get_string_arg(args, "workers")
     } elif (name == "judge_duplicates") {
         arg1 = get_string_arg(args, "input")
         if (empty(arg1)) {

@@ -31,6 +31,7 @@ namespace das {
             } else {
                 context->to_err(&context->exceptionAt, ("macro caused exception during " + message + "\n" + context->getException()).c_str());
             }
+            context->clearException();
         }
         if (bound->g_Program) {
             bound->macroTimeTicks += ref_time_ticks() - timeM;
@@ -1334,6 +1335,17 @@ namespace das {
                 bool result = false;
                 runMacroFunction(context, "isSpecialized", [&]() {
                     result = invoke_isSpecialized(context,fnIsSpecialized,classPtr);
+                });
+                return result;
+            } else {
+                return false;
+            }
+        }
+        virtual bool isAppliedToGeneric () const override {
+            if ( auto fnIsAppliedToGeneric = get_isAppliedToGeneric(classPtr) ) {
+                bool result = false;
+                runMacroFunction(context, "isAppliedToGeneric", [&]() {
+                    result = invoke_isAppliedToGeneric(context,fnIsAppliedToGeneric,classPtr);
                 });
                 return result;
             } else {

@@ -314,6 +314,21 @@ Run any tutorial from the project root::
    tutorials/sql_23_foreign_keys.rst
    tutorials/sql_24_indexes.rst
    tutorials/sql_25_defaults_computed.rst
+   tutorials/sql_26_custom_types.rst
+   tutorials/sql_27_blob.rst
+   tutorials/sql_28_json.rst
+   tutorials/sql_29_column_names.rst
+   tutorials/sql_30_list_tables.rst
+   tutorials/sql_31_views.rst
+   tutorials/sql_32_sql_functions.rst
+   tutorials/sql_33_pragma.rst
+   tutorials/sql_34_backup_vacuum.rst
+   tutorials/sql_35_streaming.rst
+   tutorials/sql_36_attach.rst
+   tutorials/sql_37_bulk_operations.rst
+   tutorials/sql_38_concurrency.rst
+   tutorials/sql_40_fts5.rst
+   tutorials/sql_41_triggers.rst
 
 .. _tutorials_dasaudio:
 
@@ -375,6 +390,7 @@ For the strudel-to-strudel.cc feature comparison, see
    tutorials/daStrudel_13_sf2_soundfont.rst
    tutorials/daStrudel_14_midi_files.rst
    tutorials/daStrudel_15_live_reloading.rst
+   tutorials/daStrudel_16_hrtf_position.rst
 
 .. _tutorials_daspeg:
 

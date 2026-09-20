@@ -26,6 +26,8 @@ IF ((NOT DAS_SQLITE_INCLUDED) AND ((NOT ${DAS_SQLITE_DISABLED}) OR (NOT DEFINED 
 		${DAS_SQLITE_DIR}/src/dasSQLITE.cpp
 	# user include
 		${DAS_SQLITE_DIR}/src/dasSQLITE.main.cpp
+		${DAS_SQLITE_DIR}/src/dasSQLITE.userfn.cpp
+		${DAS_SQLITE_DIR}/src/dasSQLITE.backup.cpp
 	# generated binding includes
 		${DAS_SQLITE_DIR}/src/dasSQLITE.alias.add.inc
 		${DAS_SQLITE_DIR}/src/dasSQLITE.dummy.add.inc
@@ -62,6 +64,7 @@ IF ((NOT DAS_SQLITE_INCLUDED) AND ((NOT ${DAS_SQLITE_DISABLED}) OR (NOT DEFINED 
 	ADD_DEFINITIONS(-DSQLITE_ENABLE_COLUMN_METADATA=1)
 	ADD_DEFINITIONS(-DSQLITE_ENABLE_STMT_SCANSTATUS=1)
 	ADD_DEFINITIONS(-DSQLITE_ENABLE_SNAPSHOT=1)
+	ADD_DEFINITIONS(-DSQLITE_ENABLE_FTS5=1)
 
 	ADD_MODULE_CPP(dasSQLITE)
 	# ADD_MODULE_NATIVE(SQLITE_boost)
@@ -77,6 +80,14 @@ IF ((NOT DAS_SQLITE_INCLUDED) AND ((NOT ${DAS_SQLITE_DISABLED}) OR (NOT DEFINED 
 	ADD_DEPENDENCIES(libDasModuleSQLITE sqlite_shell)
 	SETUP_CPP11(sqlite_shell)
 	SETUP_LTO(sqlite_shell)
+
+	if(UNIX AND NOT APPLE)
+		# FTS5's BM25 uses log() from libm; needed by every linker that pulls
+		# in sqlite3.c with SQLITE_ENABLE_FTS5=1.
+		target_link_libraries(libDasModuleSQLITE PRIVATE m)
+		target_link_libraries(dasModuleSQLITE PRIVATE m)
+		target_link_libraries(sqlite_shell PRIVATE m)
+	endif()
 
     ADD_MODULE_DAS(sqlite daslib sqlite_boost)
     ADD_MODULE_DAS(sqlite daslib sqlite_linq)

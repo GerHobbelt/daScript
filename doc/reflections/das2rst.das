@@ -168,7 +168,7 @@ get_value|insert_clone|emplace_new|insert_default|emplace_default|get_with_defau
         group_by_regex("Binary serializer", mod, %regex~(binary_load|binary_save)$%%),
         group_by_regex("Path and command line", mod, %regex~(get_command_line_arguments|with_argv)$%%),
         group_by_regex("Time and date", mod, %regex~(get_time_usec|ref_time_ticks|get_clock|get_time_nsec|mktime)$%%),
-        group_by_regex("Platform queries", mod, %regex~(get_context_share_counter|das_is_dll_build|get_platform_name|get_architecture_name)$%%),
+        group_by_regex("Platform queries", mod, %regex~(get_context_share_counter|das_is_dll_build|is_standalone_exe|get_platform_name|get_architecture_name)$%%),
         group_by_regex("String formatting", mod, %regex~(fmt)$%%),
         group_by_regex("Argument consumption", mod, %regex~(consume_argument)$%%),
         group_by_regex("Lock checking", mod, %regex~(lock_count)$%%),
@@ -193,7 +193,7 @@ def document_module_fio(root : string) {
         group_by_regex("Path manipulation", mod, %regex~(base_name|dir_name|get_full_file_name|extension|stem|replace_extension|path_join|normalize|is_absolute|relative|relative_result|parent)$%%),
         group_by_regex("Directory manipulation", mod, %regex~(dir|dir_rec|mkdir|mkdir_rec|mkdir_result|rmdir|rmdir_rec|rmdir_rec_result|rmdir_result|chdir|getcwd)$%%),
         group_by_regex("Filesystem queries", mod, %regex~(temp_directory|temp_directory_result|create_temp_file|create_temp_file_result|create_temp_directory|create_temp_directory_result|disk_space)$%%),
-        group_by_regex("OS specific routines", mod, %regex~(sleep|exit|system|popen|popen_binary|popen_timeout|popen_timed_out|get_env_variable|sanitize_command_line|has_env_variable)$%%),
+        group_by_regex("OS specific routines", mod, %regex~(sleep|exit|system|popen|popen_binary|popen_timeout|popen_argv|popen_timed_out|get_env_variable|sanitize_command_line|has_env_variable)$%%),
         group_by_regex("Dynamic modules", mod, %regex~(register_dynamic_module|register_native_path)$%%)
     )
     documents("File input output library", mod, "fio.rst", groups)
@@ -736,7 +736,8 @@ def document_module_ast_match(root : string) {
         group_by_regex("Argument filtering", mod, %regex~.*(qm_count_real_args|qm_real_arg_index|qm_extract_remaining_args|qm_is_fake_arg|qm_count_real_call_args|qm_real_call_arg_index)$%%),
         group_by_regex("Block scanning", mod, %regex~.*(qm_scan|qm_extract_stmts)$%%),
         group_by_regex("Constant construction", mod, %regex~.*(qm_make_zero_const)$%%),
-        group_by_regex("AST reconstruction", mod, %regex~.*(qm_convert_local_function|qm_resolve_local_function|qm_convert_comprehension|qm_resolve_comprehension)$%%)
+        group_by_regex("AST reconstruction", mod, %regex~.*(qm_convert_local_function|qm_resolve_local_function|qm_convert_comprehension|qm_resolve_comprehension)$%%),
+        group_by_regex("AST normalization", mod, %regex~.*(qm_peel_ref2value)$%%)
     )
     document("AST pattern matching", mod, "ast_match.rst", groups)
 }
@@ -852,9 +853,10 @@ def document_module_utf8_utils(root : string) {
     var mod = find_module("utf8_utils")
     var groups <- array<DocGroup>(
         group_by_regex("Encoding and decoding", mod, %regex~(utf8_encode|utf8_decode|utf16_to_utf32|utf32_to_utf16|decode_unicode_escape)$%%),
-        group_by_regex("Iteration", mod, %regex~(each_utf32)$%%),
+        group_by_regex("Iteration", mod, %regex~(each_utf32|each_word)$%%),
         group_by_regex("Length and measurement", mod, %regex~(utf8_length)$%%),
-        group_by_regex("Validation", mod, %regex~(is_first_byte_of_utf8_char|contains_utf8_bom|is_utf8_string_valid)$%%)
+        group_by_regex("Validation", mod, %regex~(is_first_byte_of_utf8_char|contains_utf8_bom|is_utf8_string_valid)$%%),
+        group_by_regex("Unicode word/case primitives", mod, %regex~(utf32_is_word_char|utf32_to_lower)$%%)
     )
     document("UTF-8 utilities", mod, "utf8_utils.rst", groups)
 }
@@ -1434,7 +1436,7 @@ def document_module_strudel_synth(root : string) {
 def document_module_strudel_scheduler(root : string) {
     var mod = find_module("strudel_scheduler")
     var groups <- array<DocGroup>(
-        group_by_regex("Orbit effects", mod, %regex~(init_reverb|init_chorus|init_delay|get_orbit_reverb|get_orbit_delay)$%%),
+        group_by_regex("Orbit effects", mod, %regex~(init_reverb|init_delay|get_orbit_reverb|get_orbit_delay|get_orbit_chorus)$%%),
         group_by_regex("Scheduler lifecycle", mod, %regex~(tick|shutdown_scheduler)$%%)
     )
     document("Voice allocation, effect bus routing, and per-tick mixing", mod, "strudel_scheduler.rst", groups)
@@ -1510,6 +1512,7 @@ def document_module_strudel_pattern(root : string) {
         group_by_regex("Combinators", mod, %regex~(rev|jux|off|layer|superimpose|euclid|palindrome|ply|iter|iterBack|when_cycle|linger|hurry|compress|chunk|striate|struct_|mask|choose|wchoose|randcat|chooseCycles|shuffle|scramble|echo|stut|transpose|add|innerJoin|combineWith|combineWithStr|degrade|degradeBy|every|bjorklund|sometimes|often|sometimesby)$%%),
         group_by_regex("Setter primitives", mod, %regex~set_.*$%%),
         group_by_regex("Fluent control: dynamics and routing", mod, %regex~(gain|velocity|vel|pan|speed|note|sound|cut|orbit|begin|end_pos)$%%),
+        group_by_regex("Fluent control: 3D positioning (HRTF)", mod, %regex~(hrtf|hrtf_azimuth|hrtf_elevation)$%%),
         group_by_regex("Fluent control: effects sends", mod, %regex~(room|roomsize|size|delay|delaytime|dt|delayfeedback|dfb|delaysync|chorus)$%%),
         group_by_regex("Fluent control: filters", mod, %regex~(lpf|lp|hpf|hp|lpq|resonance|hpq|bpf|bpq|djf)$%%),
         group_by_regex("Fluent control: envelope", mod, %regex~(attack|att|decay|dec|sustain|sus|release|rel)$%%),
