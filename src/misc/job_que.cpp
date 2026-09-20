@@ -5,27 +5,73 @@
 #include "daScript/simulate/aot_builtin_jobque.h"
 #include "daScript/misc/string_writer.h"
 
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
+#if defined(__EMSCRIPTEN__)
+#include <emscripten/threading.h>   // emscripten_num_logical_cores
+#endif
+
 // Feature tracking statics
 das::Feature *  das::Feature::sTrackHead = nullptr;
 das::mutex      das::Feature::sTrackMutex;
 
 namespace das {
 
+#if defined(__APPLE__)
+    // Performance ("good") core count on heterogeneous Apple Silicon (P-cores). Returns 0 on homogeneous
+    // Macs (Intel) and wherever the keys are missing, so the caller falls back to the generic rule.
+    static int apple_perf_core_count() {
+        int nperf = 0; size_t len = sizeof(nperf);
+        if ( sysctlbyname("hw.nperflevels", &nperf, &len, nullptr, 0) != 0 || nperf < 2 ) return 0;
+        int good = 0; len = sizeof(good);
+        if ( sysctlbyname("hw.perflevel0.logicalcpu", &good, &len, nullptr, 0) != 0 ) return 0;
+        return good;
+    }
+#endif
+
+    // Worker count. Generic rule: logical cores - 1, capped at DAS_MAX_HW_JOBS — parallel_for has the
+    // CALLING (main) thread run a chunk and then wait, so it occupies a core; cores-1 workers + main ==
+    // cores avoids the oversubscription that otherwise makes the surplus worker "trickle in" over the
+    // first ~37% of every matmul. DAS_MAX_HW_JOBS (default 4; raise via -DDAS_MAX_HW_JOBS=N) keeps a
+    // wasm build from spawning one Web Worker per logical core. On heterogeneous Apple Silicon we
+    // instead run one worker per PERFORMANCE core (no -1, no cap): the efficiency cores absorb the main
+    // thread + OS, whereas cores-1 (logical) spills a worker onto a slow E-core that stalls every
+    // parallel_for on the straggler — measured ~1.6x slower on an M-series 8P+2E prefill. DAS_JOBQUE_THREADS
+    // is an explicit override that bypasses everything (0/unset = the default).
+    static int jobque_thread_count(int hw) {
+        static int forced = []{ const char * e = getenv("DAS_JOBQUE_THREADS"); return e ? atoi(e) : 0; }();
+        if ( forced > 0 ) return forced;
+#if defined(__APPLE__)
+        if ( int good = apple_perf_core_count() ) return good;
+#endif
+        return max(1, min(DAS_MAX_HW_JOBS, hw - 1));
+    }
+
 #if defined(_MSC_VER) && !defined(_GAMING_XBOX) && !defined(_DURANGO) && !defined(_M_ARM64)
 
     int GetLogicalProcessorCountInWindows();
 
     int JobQue::get_num_threads() {
-        int nThreads = GetLogicalProcessorCountInWindows();
-        if ( nThreads==0 ) nThreads = static_cast<int>(thread::hardware_concurrency());
-        return max(1,min(DAS_MAX_HW_JOBS,nThreads));
+        int hw = GetLogicalProcessorCountInWindows();
+        if ( hw <= 0 ) hw = max(1,static_cast<int>(thread::hardware_concurrency()));
+        return jobque_thread_count(hw);
     }
 
 
 #else
 
     int JobQue::get_num_threads() {
-        return max(1,min(DAS_MAX_HW_JOBS,static_cast<int>(thread::hardware_concurrency())));
+#if defined(__EMSCRIPTEN__)
+        // emscripten's std::thread::hardware_concurrency() does NOT reflect
+        // navigator.hardwareConcurrency in the wasm64/memory64 build (it returns a
+        // low default ~2); emscripten_num_logical_cores() reads it directly and is
+        // correct on both wasm32/64.
+        int hw = emscripten_num_logical_cores();
+#else
+        int hw = static_cast<int>(thread::hardware_concurrency());
+#endif
+        return jobque_thread_count(max(1, hw));
     }
 
 #endif
