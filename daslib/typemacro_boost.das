@@ -39,17 +39,11 @@ def append_expressions(var blk : ExprBlock?; var eblk : ExpressionPtr) {
 
 [macro_function]
 def is_typedecl_ptr(t : TypeDeclPtr) {
-    if (t.baseType != Type.tPointer) {
-        return false
-    }
+    if (t.baseType != Type.tPointer) return false
     assume pt = t.firstType
-    if (pt == null) {
-        return false
-    }
-    if (pt.baseType != Type.tHandle || pt.annotation.name != "TypeDecl" || pt.annotation._module.name != "ast_core") {
-        return false
-    }
-    return true
+    return (pt != null && pt.baseType == Type.tHandle
+            && pt.annotation.name == "TypeDecl"
+            && pt.annotation._module.name == "ast_core")
 }
 
 [macro_function]
@@ -57,9 +51,7 @@ def public get_string_const(expr : ExpressionPtr) : string {
     //! Extracts a string constant value or function address name from an expression.
     if (expr is ExprConstString) {
         return string((expr as ExprConstString).value)
-    } elif (expr is ExprAddr) {
-        return string((expr as ExprAddr).target)
-    }
+    } elif (expr is ExprAddr) return string((expr as ExprAddr).target)
     macro_error(compiling_program(), expr.at, "expecting string constant or function address")
     return ""
 }
@@ -163,9 +155,7 @@ class TypeMacroMacro : AstFunctionAnnotation {
     def override patch(var func : FunctionPtr; var group : ModuleGroup; args, progArgs : AnnotationArgumentList; var errors : das_string; var astChanged : bool&) : bool {
         for (ann in func.annotations) {
             if (ann.annotation.name == "typemacro_function") {
-                if (!(find_arg(ann.arguments, "patched") is nothing)) {
-                    return true
-                }
+                if (!(find_arg(ann.arguments, "patched") is nothing)) return true
             }
         }
         // we expect at least 2 arguments
@@ -187,7 +177,7 @@ class TypeMacroMacro : AstFunctionAnnotation {
             let macroArgIndex = ai - 1
             assume argType = func.arguments[ai]._type
             assume argDefaultValue = func.arguments[ai].init
-            if (length(argType.dim) > 0) {
+            if (!empty(argType.dim)) {
                 errors := "expecting non-array arguments"
                 return false
             }
@@ -258,9 +248,7 @@ def public make_typemacro_template_instance(instance_type, template_type : Struc
 [macro_function]
 def public is_typemacro_template_instance(passArgument, templateType : TypeDeclPtr; extra : array<tuple<string, string>> = array<tuple<string, string>>()) : bool {
     //! template instance is determined by having parent == template.parent
-    if (passArgument == null || passArgument.baseType != Type.tStructure || passArgument.structType == null) {
-        return false
-    }
+    if (passArgument == null || passArgument.baseType != Type.tStructure || passArgument.structType == null) return false
     if (!templateType.isStructure) {
         panic("macro implementation error. templateType {describe(templateType)} is not a structure")
         return false
@@ -268,12 +256,11 @@ def public is_typemacro_template_instance(passArgument, templateType : TypeDeclP
     for (ann in passArgument.structType.annotations) {
         if (ann.annotation.name == "typemacro_template") {
             let parentName = find_arg(ann.arguments, "parent")
-            return false if (!(parentName is tString))
-            return false if ((parentName as tString) != "{templateType.structType._module.name}::{templateType.structType.name}")
+            return false if (!(parentName is tString)
+                    || (parentName as tString) != "{templateType.structType._module.name}::{templateType.structType.name}")
             for (ex in extra) {
                 let arg = find_arg(ann.arguments, ex._0)
-                return false if (!(arg is tString))
-                return false if ((arg as tString) != ex._1)
+                return false if (!(arg is tString) || (arg as tString) != ex._1)
             }
             return true
         }
@@ -293,9 +280,7 @@ def public infer_struct_aliases(structType : Structure?; var args : array<TypeMa
     //! Infers structure alias types for all template arguments from a structure definition.
     for (arg in args) {
         arg.inferred_type  = get_structure_alias(structType, arg.name)
-        if (arg.inferred_type == null) {
-            return false
-        }
+        if (arg.inferred_type == null) return false
     }
     return true
 }
@@ -308,8 +293,8 @@ def public infer_template_types(passArgument : TypeDeclPtr; var args  : array<Ty
         assume inferredTemplateType = arg.inferred_type
         if (templateType.isAutoOrAlias) {
             var resT = infer_generic_type(templateType, inferredTemplateType, true, true)
-            return null if (resT == null)
-            return null if (!inferredTemplateType |> is_same_type(resT, RefMatters.no, ConstMatters.no, TemporaryMatters.yes))
+            return null if (resT == null
+                    || !inferredTemplateType |> is_same_type(resT, RefMatters.no, ConstMatters.no, TemporaryMatters.yes))
             compiling_program() |> update_alias_map(templateType, resT)
         } else {
             return null if (!inferredTemplateType |> is_same_type(templateType, RefMatters.no, ConstMatters.no, TemporaryMatters.yes))
@@ -406,9 +391,7 @@ class TemplateTypeMacroMacro : AstFunctionAnnotation {
     def override patch(var func : FunctionPtr; var group : ModuleGroup; args, progArgs : AnnotationArgumentList; var errors : das_string; var astChanged : bool&) : bool {
         for (ann in func.annotations) {
             if (ann.annotation.name == "typemacro_template_function") {
-                if (!(find_arg(ann.arguments, "patched") is nothing)) {
-                    return true
-                }
+                if (!(find_arg(ann.arguments, "patched") is nothing)) return true
             }
         }
         // lets get the template type name
@@ -450,7 +433,7 @@ class TemplateTypeMacroMacro : AstFunctionAnnotation {
                 mk_extra_array_expr.values |> emplace(mk_tuple)
             }
         }
-        if (length(mk_extra_array_expr.values) == 0) {
+        if (empty(mk_extra_array_expr.values)) {
             body.list |> emplace_new <| qmacro_expr() {
                 var inscope extra_template_arguments : array<tuple<string, string>>
             }
@@ -688,9 +671,7 @@ def public is_custom_work_done(structType : Structure?) : bool {
     //! Returns true if custom work has already been performed on the template structure.
     for (ann in structType.annotations) {
         if (ann.annotation.name == "template_structure") {
-            if (!(find_arg(ann.arguments, "custom_work_done") is nothing)) {
-                return true
-            }
+            if (!(find_arg(ann.arguments, "custom_work_done") is nothing)) return true
         }
     }
     return false

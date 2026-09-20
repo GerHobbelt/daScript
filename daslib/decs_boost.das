@@ -57,7 +57,7 @@ class DecsTemplate : AstStructureAnnotation {
     //!   * ``apply_decs_template_arch(arch, eidx, eid, src)`` — writes directly into archetype storage
     //!   * ``create_entities`T(count, blk)`` — bulk creation with direct archetype writes
     def override apply(var st : StructurePtr; var group : ModuleGroup; args : AnnotationArgumentList; var errors : das_string) : bool {
-        if (length(st.fields) == 0) {
+        if (empty(st.fields)) {
             errors := "expecting at least one field in the desc_template {st.name}"
             return false
         }
@@ -152,9 +152,7 @@ def private decs_prefix(arg : AnnotationArgumentList) {
 
 [macro_function]
 def private is_decs_template(v : VariablePtr) {
-    if (v._type.baseType != Type.tStructure) {
-        return ItCheck(no = true)
-    }
+    if (v._type.baseType != Type.tStructure) return ItCheck(no = true)
     var p = v.annotation |> decs_prefix
     if (p is no) {
         for (ann in v._type.structType.annotations) {
@@ -251,9 +249,7 @@ def private append_iterator(arch_name : string; var qloop : ExprFor?; a; prefix,
     qloop.iteratorsAt |> push(a.at)
     qloop.iteratorsTags |> resize(qli + 1)
     let getter = getter_name(a, const_parent, can_be_optional)
-    if (empty(getter)) {
-        return false
-    }
+    if (empty(getter)) return false
     if (getter == "get_default_ro") {
         qloop.sources |> emplace_new <| qmacro($c(getter)($i(arch_name), $v("{prefix}{a.name}"), $e(a.init)))
     } else {
@@ -270,9 +266,7 @@ def private append_iterator(arch_name : string; var qloop : ExprFor?; a; prefix,
 [macro_function]
 def private append_index_lookup(arch_name : string; var qblock : ExprBlock?; a; prefix, suffix : string; const_parent : bool = false; can_be_optional : bool = true) {
     let getter = getter_name(a, const_parent, can_be_optional)
-    if (empty(getter)) {
-        return false
-    }
+    if (empty(getter)) return false
     var iget : ExpressionPtr
     if (getter == "get_default_ro") {
         iget = clone_expression(a.init)
@@ -372,13 +366,9 @@ class DecsQueryMacro : AstCallMacro {
     //!             apply_decs_template(cmp, [[Particle pos=float3(i), vel=float3(i+1)]])
     def override preVisit(prog : ProgramPtr; mod : Module?; var expr : ExprCallMacro?) : void {
         let totalArgs = length(expr.arguments)
-        if (totalArgs != 1 && totalArgs != 2) {
-            return
-        }
+        if (totalArgs != 1 && totalArgs != 2) return
         let block_arg_index = totalArgs - 1
-        if (!(expr.arguments[block_arg_index] is ExprMakeBlock)) {
-            return
-        }
+        if (!(expr.arguments[block_arg_index] is ExprMakeBlock)) return
         var mblk = expr.arguments[block_arg_index] as ExprMakeBlock
         var qblk = mblk._block as ExprBlock
         for (arg in qblk.arguments) {
@@ -403,7 +393,7 @@ class DecsQueryMacro : AstCallMacro {
         macro_verify(expr.arguments[block_arg_index] is ExprMakeBlock, compiling_program(), expr.at, "expecting $(block_with_arguments)")
         let mblk = expr.arguments[block_arg_index] as ExprMakeBlock
         let qblk = mblk._block as ExprBlock
-        macro_verify(length(qblk.arguments) != 0, compiling_program(), expr.at, "expecting query($(block_with_arguments)), arguments are missing")
+        macro_verify(!empty(qblk.arguments), compiling_program(), expr.at, "expecting query($(block_with_arguments)), arguments are missing")
         let prefix = "__{expr.at.line}_desc"
         let arch_name = "{prefix}_arch"
         var req <- build_req_from_args(qblk)
@@ -423,14 +413,10 @@ class DecsQueryMacro : AstCallMacro {
                 if (detp is yes) {
                     kaboom |> push <| (string(a.name), detp as yes, "_{a.name}")
                     for (f in a._type.structType.fields) {
-                        if (!append_index_lookup(arch_name, qlbody, f, detp as yes, "_{a.name}", a._type.flags.constant, false)) {
-                            return null
-                        }
+                        if (!append_index_lookup(arch_name, qlbody, f, detp as yes, "_{a.name}", a._type.flags.constant, false)) return null
                     }
                 } else {
-                    if (!append_index_lookup(arch_name, qlbody, a, "", "")) {
-                        return null
-                    }
+                    if (!append_index_lookup(arch_name, qlbody, a, "", "")) return null
                 }
             }
             for (l in qblk.list) {
@@ -451,14 +437,10 @@ class DecsQueryMacro : AstCallMacro {
                 if (detp is yes) {
                     kaboom |> push <| (string(a.name), detp as yes, "_{a.name}")
                     for (f in a._type.structType.fields) {
-                        if (!append_iterator(arch_name, qloop, f, detp as yes, "_{a.name}", a._type.flags.constant, false)) {
-                            return null
-                        }
+                        if (!append_iterator(arch_name, qloop, f, detp as yes, "_{a.name}", a._type.flags.constant, false)) return null
                     }
                 } else {
-                    if (!append_iterator(arch_name, qloop, a, "", "")) {
-                        return null
-                    }
+                    if (!append_iterator(arch_name, qloop, a, "", "")) return null
                 }
             }
             var qlbody = new ExprBlock(at = qblk.at)
@@ -481,7 +463,7 @@ class DecsQueryMacro : AstCallMacro {
                 rules |> kaboomVarField(kb._0, kb._1, kb._2)
             }
         }
-        if (length(kaboom) > 0) {
+        if (!empty(kaboom)) {
             apply_template(qtop) $(rules) {
                 for (kb in kaboom) {
                     rules |> replaceVariable(kb._0) <| make_static_assert_false("decs_template variables can only be accessed by fields", expr.at)
@@ -525,7 +507,7 @@ class DecsQueryMacro : AstCallMacro {
             rules |> replaceVariable("tag_loop") <| add_ptr_ref(qtop)
         }
         var qres = move_unquote_block(qblock)
-        assert(length(qres.list) == 1 && length(qres.finalList) == 0)
+        assert(length(qres.list) == 1 && empty(qres.finalList))
         var rqres = qres.list[0]
         qres := null
         rqres.genFlags.alwaysSafe = true
@@ -581,7 +563,7 @@ class DecsEcsMacro : AstFunctionAnnotation {
         let passName = argPass as tString
         let passFuncName = "decs`pass`{passName}"
         var blk <- setup_call_list(passFuncName, func.at, false, true)
-        if (length(blk.list) == 0) {
+        if (empty(blk.list)) {
             var reg <- setup_call_list("register`decs`passes", func.at, true, true)
             reg.list |> push(qmacro(decs::register_decs_stage_call($v(passName), @@$c(passFuncName))))
         }
@@ -671,7 +653,7 @@ class FromDecsMacro : AstCallMacro {
         macro_verify(expr.arguments[0] is ExprMakeBlock, prog, expr.at, "expecting from_decs($(block_with_arguments))")
         let mblk = expr.arguments[0] as ExprMakeBlock
         let qblk = mblk._block as ExprBlock
-        macro_verify(length(qblk.arguments) != 0, prog, expr.at, "expecting from_decs($(block_with_arguments)), arguments are missing")
+        macro_verify(!empty(qblk.arguments), prog, expr.at, "expecting from_decs($(block_with_arguments)), arguments are missing")
         for (arg in qblk.arguments) {
             macro_verify(!arg._type.isAutoOrAlias, prog, expr.at, "argument types are not fully inferred")
         }

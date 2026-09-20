@@ -785,6 +785,7 @@ include/daScript/misc/job_que.h
 include/daScript/misc/handle_registry.h
 include/daScript/misc/uric.h
 include/daScript/misc/lexer_alloc_track.h
+src/misc/das_common.cpp
 src/misc/gc_node.cpp
 src/misc/globals.cpp
 src/misc/sysos.cpp
@@ -854,6 +855,7 @@ src/misc/network.cpp
 src/simulate/hash.cpp
 src/simulate/debug_info.cpp
 src/simulate/runtime_string.cpp
+src/simulate/runtime_iterator.cpp
 src/simulate/runtime_array.cpp
 src/simulate/runtime_table.cpp
 src/simulate/runtime_profile.cpp
@@ -874,6 +876,7 @@ include/daScript/simulate/debug_info.h
 include/daScript/simulate/interop.h
 include/daScript/simulate/runtime_string.h
 include/daScript/simulate/runtime_string_delete.h
+include/daScript/simulate/runtime_iterator.h
 include/daScript/simulate/runtime_array.h
 include/daScript/simulate/runtime_table.h
 include/daScript/simulate/runtime_table_nodes.h
@@ -1285,7 +1288,6 @@ SET(DAS_RELEASE_INCLUDE
     include/daScript/daScript.h
     include/daScript/daScriptBind.h
     include/daScript/daScriptModule.h
-    include/daScript/das_common.h
     include/daScript/das_config.h
     include/daScript/das_project_specific.h
 )
@@ -1295,6 +1297,7 @@ SET(DAS_RELEASE_MISC_INCLUDE
     include/daScript/misc/arraytype.h
     include/daScript/misc/callable.h
     include/daScript/misc/crash_handler.h
+    include/daScript/misc/das_common.h
     include/daScript/misc/debug_break.h
     include/daScript/misc/enums.h
     include/daScript/misc/fpe.h
@@ -1353,6 +1356,7 @@ SET(DAS_SIMULATE_INCLUDES
     include/daScript/simulate/interop.h
     include/daScript/simulate/jit_abi.h
     include/daScript/simulate/runtime_array.h
+    include/daScript/simulate/runtime_iterator.h
     include/daScript/simulate/runtime_matrices.h
     include/daScript/simulate/runtime_profile.h
     include/daScript/simulate/runtime_range.h

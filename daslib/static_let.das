@@ -82,7 +82,7 @@ class StaticLetMacro : AstFunctionAnnotation {
             return null
         }
         var blk = mblk._block as ExprBlock
-        if (blk.finalList |> length != 0) {
+        if (!empty(blk.finalList)) {
             errors := "not expecting finally section in the static_let"
             return null
         }
@@ -128,9 +128,7 @@ class StaticLetMacro : AstFunctionAnnotation {
                 }
             }
         }
-        if (!success) {
-            return null
-        }
+        if (!success) return null
         return <- quote() {
             pass
         }
