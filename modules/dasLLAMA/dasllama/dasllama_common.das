@@ -10,6 +10,7 @@ require dasllama/dasllama_math_aarch64_neon  // registers the arm64 SDOT Q8·Q8 
 require ?llvm/daslib/llvm_tune dasllama/dasllama_math_gen  // nolint:STYLE030 — [init]-only: registers "arm64-gen" (the generated GEMM family, arm64 load-select tier). PATH guard: the module hard-requires llvm_tune, so it loads exactly when dasLLVM is mounted
 require ?llvm/daslib/llvm_tune llvm/daslib/llvm_tune public  // re-export ONLY llvm_tune (not math_gen's whole public surface — its jobque_boost would flood requirers with ambiguities): the auto-policy pass and tune_status reach every app that requires this module
 require ?das_metal dasllama/dasllama_math_metal  // nolint:STYLE030 — [init]-only: registers "metal" (the GPU prefill-GEMM batch donor). STRICT guard: the C++ das_metal module exists on Apple builds only, so non-Apple lanes never compile the Metal driver
+require ?vulkan dasllama/dasllama_math_vulkan  // nolint:STYLE030 — [init]-only: registers "vulkan" (the GPU tier; stage-0 skeleton, kernels land with the offload rail). STRICT guard: the C++ vulkan module is linked only where the dasVulkan package is installed, so CI lanes without it never compile the Vulkan driver
 require dasllama/dasllama_quant
 require dasllama/dasllama_gguf
 require dasllama/dasllama_gemm_schema  // kq_qsb/kq_ssb — the fmt-id plane strides
@@ -1309,15 +1310,21 @@ def caps_(m : Model) : LlmCaps {
 
 // Look the arch up, apply its config flags, and copy its (copyable) block kernels onto the model.
 // The full descriptor stays in the registry; only the hot-path pointers ride on the Model.
-// public: the image loader re-binds blocks + re-runs the arch's configure (idempotent) after
-// deserializing the model meta — same registry path as load_gguf
-def resolve_arch(var t : Model; arch : string) {
+def private resolve_arch(var t : Model; arch : string) {
+    rebind_arch_blocks(t, arch)
+    g_arch_registry[arch].configure(t.config)
+}
+
+// The image loader's post-read half of resolve_arch: block kernels re-bind from the registry,
+// but configure must NOT re-run — the serialized config already carries configure's flags PLUS
+// the gguf's overrides, and configures set overridable fallbacks (gemma4's sliding_window = 1024
+// clobbered the E2B's real 512 and drifted tokens past the window).
+def rebind_arch_blocks(var t : Model; arch : string) {
     if (!key_exists(g_arch_registry, arch)) {
         let registered = join(arch_names(), ", ")
         panic("dasLLAMA: unsupported architecture '{arch}' (registered: {registered})")
     }
     t.arch = arch
-    g_arch_registry[arch].configure(t.config)
     t.blocks = g_arch_registry[arch].blocks
 }
 
@@ -1519,6 +1526,133 @@ def private wscale_convert_f16(var t : Model) {
     delete t.qscales
     t.wscale_f16 = true
     to_log(LOG_INFO, "dasLLAMA: weight-scale plane converted to f16 ({n} scales, -{n * 2l} bytes)\n")
+}
+
+// ===== GPU MoE tier upload (post-prepare, loader-agnostic) =====
+
+// Gather one PREPARED Q8 weight stack into the GPU tier's two row-major planes — int8 quants
+// (word-aligned rows, ready for packed-uint loads) + f16 halfword scales. slice_rows is the
+// repack unit (one expert's rows — every expert slice interleaves independently). Reads
+// whatever the active backend prepared: the grp<mr> interleave (kgroup k-bytes per row per
+// group, bias128 group bytes un-biased back to plain s8, row-major tails) or plain row-major
+// (mr 1), scales from the f16 halfword plane or the f32 plane. Runs after repack/wscale on
+// every rail (gguf, quantize, mapped image) — one reader serves them all.
+def moe_gpu_gather_stack(t : Model; woff : int64; n, rows, slice_rows : int64; mr, kgroup, wbias : int64;
+                         var wq : array<uint8>; var ws : array<uint8>) {
+    let nb = n / 32l
+    assert(rows * n <= 2147483647l, "GPU MoE stack exceeds the int32 gather-buffer rail")
+    wq |> resize(int(rows * n))
+    ws |> resize(int(rows * nb * 2l))
+    assert(wbias == 0l || wbias == 128l, "GPU MoE gather: unknown q8 plane bias")
+    let nslices = int(rows / slice_rows)
+    unsafe {
+        let wp = addr<int8 const?>(t.qblob[woff])
+        var s16p : uint16 const? = null
+        var s32p : float const? = null
+        if (t.wscale_f16) {
+            s16p = addr<uint16 const?>(t.qscales16[woff / 32l])
+        } else {
+            s32p = addr<float const?>(t.qscales[woff / 32l])
+        }
+        var wqp = addr(wq[0])
+        var wsp = addr<uint16?>(ws[0])
+        let njobs = is_job_que_available() ? min(nslices, 4 * (get_total_hw_jobs() + 1)) : 1
+        maybe_parallel_for(0, nslices, njobs) $(sb, se) {
+            unsafe {
+                let ng = slice_rows / mr
+                for (s in range(sb, se)) {
+                    let swoff = int64(s) * slice_rows * n
+                    let ssoff = int64(s) * slice_rows * nb
+                    for (rr in range64(slice_rows)) {
+                        let grouped = rr < ng * mr
+                        let g = rr / mr
+                        let r = rr % mr
+                        for (bi in range64(nb)) {
+                            // scale: group-interleaved [g][bi][r] or the row-major tail; the f32
+                            // fallback takes the same clamped rounding wscale_convert_f16 applies
+                            let si = grouped ? ssoff + (g * nb + bi) * mr + r : ssoff + rr * nb + bi
+                            wsp[ssoff + rr * nb + bi] = (s16p != null ? s16p[si]
+                                : uint16(f32_to_f16(clamp(s32p[si], -65504.0, 65504.0))))
+                            var dst = wqp + swoff + rr * n + bi * 32l
+                            if (grouped) {
+                                let gbase = swoff + g * mr * n + r * kgroup
+                                var kg = (bi * 32l) / kgroup
+                                var o = 0l
+                                for (_kk in range64(32l / kgroup)) {
+                                    let src = gbase + kg * kgroup * mr
+                                    for (j in range64(kgroup)) {
+                                        dst[o + j] = uint8(int(wp[src + j]) ^ int(wbias))
+                                    }
+                                    kg++
+                                    o += kgroup
+                                }
+                            } else {
+                                let src = swoff + rr * n + bi * 32l
+                                for (j in range64(32l)) {
+                                    dst[j] = uint8(wp[src + j])
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Upload the offloaded layers' expert stacks to the GPU tier from the PREPARED planes. Called at
+// the end of every load rail — gguf (post repack/wscale), quantize_weights, and the mapped-image
+// rail — so DASLLAMA_GPU_MOE_LAYERS behaves identically however the model arrived. Layers go
+// resident from the end while the tier's VRAM budget holds; from_layer freezes the resident set.
+def moe_gpu_upload_resident(var t : Model) {
+    set_moe_gpu_from_layer(t.config.n_layers)   // nothing resident until an upload lands
+    // mx4/biased expert stacks never dispatch on the GPU, so they never upload either
+    if (t.quant != QuantMode.q8 || t.config.n_expert <= 0l || moe_gpu_layer_count() <= 0l
+            || t.experts_mx4 || t.config.moe_exps_bias) {
+        return
+    }
+    let ts_gpu = ref_time_ticks()
+    let layers = t.config.n_layers
+    let dim = t.config.dim
+    let ne = t.config.n_expert
+    let nfe = t.config.n_ff_exp
+    let want = min(moe_gpu_layer_count(), layers)
+    let repacked = kernel_backend_needs_repack(active_kernel_backend())
+    let mr = repacked ? active_q8_layout_mr() : 1l
+    let kgroup = repacked ? active_q8_kgroup() : 4l
+    let wbias = repacked ? active_q8_wbias() : 0l
+    var from_l = layers
+    var wq : array<uint8>
+    var ws : array<uint8>
+    for (i in range64(want)) {
+        let l = layers - 1l - i
+        // dense-lead layers carry no expert stacks; the tier offloads plain-q8 stacks only —
+        // either way the walk stops so the resident set stays contiguous from the end
+        if (l < t.config.n_layer_dense_lead || t.we1_offs[l] < 0l
+                || fmt_at(t.we1_fmt, l) != KqFmt.q8 || fmt_at(t.we2_fmt, l) != KqFmt.q8 || fmt_at(t.we3_fmt, l) != KqFmt.q8) {
+            break
+        }
+        moe_gpu_gather_stack(t, t.we1_offs[l], dim, ne * nfe, nfe, mr, kgroup, wbias, wq, ws)
+        var ok = moe_gpu_upload_stack(wq, ws, t.we1_offs[l], dim, ne * nfe)
+        if (ok) {
+            moe_gpu_gather_stack(t, t.we3_offs[l], dim, ne * nfe, nfe, mr, kgroup, wbias, wq, ws)
+            ok = moe_gpu_upload_stack(wq, ws, t.we3_offs[l], dim, ne * nfe)
+        }
+        if (ok) {
+            moe_gpu_gather_stack(t, t.we2_offs[l], nfe, ne * dim, dim, mr, kgroup, wbias, wq, ws)
+            ok = moe_gpu_upload_stack(wq, ws, t.we2_offs[l], nfe, ne * dim)
+        }
+        if (!ok) {
+            break   // VRAM budget hit — this and lower layers stay on CPU (partial-layer buffers idle)
+        }
+        from_l = l
+    }
+    delete wq
+    delete ws
+    set_moe_gpu_from_layer(from_l)
+    if (from_l < layers) {
+        to_log(LOG_INFO, "dasLLAMA: GPU MoE tier: expert stacks of layers [{from_l}..{layers}) resident, {get_time_usec(ts_gpu) / 1000} ms\n")
+    }
 }
 
 //! Load a llama-architecture GGUF into the split layout at the requested precision. The big weights
@@ -1805,6 +1939,13 @@ var private g_weights_epoch = 0l
 //! model's buffers.
 def public weights_epoch() : int64 {
     return g_weights_epoch
+}
+
+//! The image loader's half of the same contract: mapping a prepared image lands planes at
+//! fresh (possibly recycled) addresses exactly like a gguf load does, so it must move the
+//! epoch too — dasllama_image calls this on every successful load_image.
+def public bump_weights_epoch() {
+    g_weights_epoch++
 }
 
 def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
@@ -2660,6 +2801,7 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
             wscale_convert_f16(t)
         }
         to_log(LOG_INFO, "dasLLAMA: load stage wscale: {get_time_usec(ts_stage) / 1000} ms, total {get_time_usec(ts_load) / 1000} ms\n")
+        moe_gpu_upload_resident(t)
     }
 }
 
@@ -2679,6 +2821,7 @@ def quantize_weights(var t : Model) {
     if (g_wscale_f16) {
         wscale_convert_f16(t)
     }
+    moe_gpu_upload_resident(t)
 }
 
 //! Quantize a fp32-loaded model's big weights to Q4_0 in place and switch forward onto the Q4 path.
@@ -2864,6 +3007,7 @@ struct Session {
     moe_ao : array<float>       // gemma4 MoE: attn_out held while its two branches read three norms of it (dim; moe_dense_shexp only)
     // decode dispatch-fuse scratch: all k routed experts' projections run as region-list GEMVs
     moe_offs : array<int64>     // packed (weight, activation) element-offset pairs (2 per region)
+    moe_offs_up : array<int64>  // the up stack's pairs, filled beside moe_offs for the fused GPU gate+up submit
     moe_boffs : array<int64>    // per-region fblob bias offsets for the biased groupn forms (k)
     moe_gu : array<float>       // fused gate outputs (k x n_ff_exp)
     moe_gu2 : array<float>      // fused up outputs (k x n_ff_exp)
@@ -3028,6 +3172,7 @@ def make_run_state(c : Config; kdt : KVDtype = KVDtype.f32; vdt : KVDtype = KVDt
         s.moe_xs |> resize(c.dim / 32l)
         s.moe_dbs |> resize(c.n_expert_used * c.n_ff_exp / 16l)
         s.moe_offs |> resize(2l * c.n_expert_used)
+        s.moe_offs_up |> resize(2l * c.n_expert_used)
         s.moe_boffs |> resize(c.n_expert_used)
         s.moe_gu |> resize(c.n_expert_used * c.n_ff_exp)
         s.moe_gu2 |> resize(c.n_expert_used * c.n_ff_exp)
@@ -6447,6 +6592,9 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
         let f1 = fmt_at(t.we1_fmt, l)
         let f2 = fmt_at(t.we2_fmt, l)
         let f3 = fmt_at(t.we3_fmt, l)
+        // GPU MoE tier: plain-q8 unbiased stacks of offloaded layers dispatch on the GPU (the
+        // loader uploaded them row-major pre-repack; offs resolve against those device copies)
+        let gpu_moe = !biased && !t.experts_mx4 && moe_gpu_layer_on_gpu(l)
         for (j in range64(k)) {
             let e = l * ne + s.moe_idx[j]
             s.moe_offs[j * 2l] = t.we1_offs[l] + s.moe_idx[j] * ege
@@ -6463,27 +6611,36 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
             }
         } elif (biased) {
             mm_at_q8_groupn(s.moe_gu, t, s.moe_offs, s.moe_boffs, k, s.moe_xq, s.moe_xs, dim, nfe)
+        } elif (gpu_moe) {
+            // fused gate+up: both stacks read the same hoisted xb image — ONE GPU submit
+            for (j in range64(k)) {
+                s.moe_offs_up[j * 2l] = t.we3_offs[l] + s.moe_idx[j] * ege
+                s.moe_offs_up[j * 2l + 1l] = 0l
+            }
+            matmul_q8q8_moe_gpu2(s.moe_gu, s.moe_gu2, s.moe_offs, s.moe_offs_up, k, s.moe_xq, s.moe_xs, dim, nfe)
         } else {
             mm_at_q8_groupn(s.moe_gu, t, s.moe_offs, k, s.moe_xq, s.moe_xs, dim, nfe)
         }
-        for (j in range64(k)) {
-            let e = l * ne + s.moe_idx[j]
-            s.moe_offs[j * 2l] = t.we3_offs[l] + s.moe_idx[j] * ege
-            s.moe_offs[j * 2l + 1l] = 0l   // ups read the same hoisted xb image (explicit, not inherited from the gate pass)
-            s.moe_boffs[j] = t.web3_off + e * nfe
-        }
-        if (f3 != KqFmt.q8) {   // kq v2: Q8_K-form scratch
-            mm_at_kq_groupn(s.moe_gu2, t, f3, s.moe_offs, k, s.kxq, s.kxs, s.kxbs, dim, nfe)
-        } elif (t.experts_mx4) {
-            if (biased) {
-                mm_at_mx4_groupn(s.moe_gu2, t, s.moe_offs, s.moe_boffs, k, s.moe_xq, s.moe_xs, dim, nfe)
-            } else {
-                mm_at_mx4_groupn(s.moe_gu2, t, s.moe_offs, k, s.moe_xq, s.moe_xs, dim, nfe)
+        if (!gpu_moe) {
+            for (j in range64(k)) {
+                let e = l * ne + s.moe_idx[j]
+                s.moe_offs[j * 2l] = t.we3_offs[l] + s.moe_idx[j] * ege
+                s.moe_offs[j * 2l + 1l] = 0l   // ups read the same hoisted xb image (explicit, not inherited from the gate pass)
+                s.moe_boffs[j] = t.web3_off + e * nfe
             }
-        } elif (biased) {
-            mm_at_q8_groupn(s.moe_gu2, t, s.moe_offs, s.moe_boffs, k, s.moe_xq, s.moe_xs, dim, nfe)
-        } else {
-            mm_at_q8_groupn(s.moe_gu2, t, s.moe_offs, k, s.moe_xq, s.moe_xs, dim, nfe)
+            if (f3 != KqFmt.q8) {   // kq v2: Q8_K-form scratch
+                mm_at_kq_groupn(s.moe_gu2, t, f3, s.moe_offs, k, s.kxq, s.kxs, s.kxbs, dim, nfe)
+            } elif (t.experts_mx4) {
+                if (biased) {
+                    mm_at_mx4_groupn(s.moe_gu2, t, s.moe_offs, s.moe_boffs, k, s.moe_xq, s.moe_xs, dim, nfe)
+                } else {
+                    mm_at_mx4_groupn(s.moe_gu2, t, s.moe_offs, k, s.moe_xq, s.moe_xs, dim, nfe)
+                }
+            } elif (biased) {
+                mm_at_q8_groupn(s.moe_gu2, t, s.moe_offs, s.moe_boffs, k, s.moe_xq, s.moe_xs, dim, nfe)
+            } else {
+                mm_at_q8_groupn(s.moe_gu2, t, s.moe_offs, k, s.moe_xq, s.moe_xs, dim, nfe)
+            }
         }
         prof_add("mm_moe", ts_gu)
         let ts_act = ref_time_ticks()
@@ -6511,6 +6668,8 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
             }
         } elif (biased) {
             mm_at_q8_groupn(s.moe_dn, t, s.moe_offs, s.moe_boffs, k, s.moe_dq, s.moe_ds, nfe, dim)
+        } elif (gpu_moe) {
+            matmul_q8q8_moe_gpu(s.moe_dn, s.moe_offs, k, s.moe_dq, s.moe_ds, nfe, dim)
         } else {
             mm_at_q8_groupn(s.moe_dn, t, s.moe_offs, k, s.moe_dq, s.moe_ds, nfe, dim)
         }
@@ -9066,7 +9225,12 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
     // kq layers whose three stacks are ALL K-quant (a mixed q8 kind keeps the per-expert loop)
     let fused_kq = (kq_layer && f1 != KqFmt.q8 && f2 != KqFmt.q8 && f3 != KqFmt.q8
         && t.kq_repacked && kernel_backend_has_kq_batch_groupn() && g_moe_fused_expert_gemms)
-    let fused = (t.experts_mx4 && g_active_mx4_native_batch && g_moe_fused_expert_gemms) || fused_kq
+    // GPU MoE tier prefill: offloaded plain-q8 unbiased layers run the three batched region-list
+    // GEMMs on the resident device stacks (tiny batches stay on the CPU per-expert loop — two
+    // GPU submits cost more than the whole GEMM there)
+    let fused_gpu = (!kq_layer && !c.moe_exps_bias && !t.experts_mx4 && moe_gpu_layer_on_gpu(l)
+        && moe_gpu_batch_ready() && g_moe_fused_expert_gemms && npos >= 32l)
+    let fused = (t.experts_mx4 && g_active_mx4_native_batch && g_moe_fused_expert_gemms) || fused_kq || fused_gpu
     let grows = fused ? nk : npos
     s.moe_rlog |> resize(npos * ne)
     s.moe_idx_b |> resize(nk)
@@ -9225,7 +9389,9 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
             nreg++
         }
         let ts_g1 = ref_time_ticks()
-        if (fused_kq) {   // native kq: one batched region-list GEMM per projection (never biased)
+        if (fused_gpu) {   // GPU tier: gate+up regions share row0/cnt and the gathered image — one fused submit
+            matmul_q8q8_moe_gpu_batch2(s.moe_ghb, s.moe_ghb2, s.moe_offs1, s.moe_offs3, nreg, s.moe_gxq, s.moe_gxs, dim, nfe, nk)
+        } elif (fused_kq) {   // native kq: one batched region-list GEMM per projection (never biased)
             mm_b_kq_groupn(s.moe_ghb, t, f1, s.moe_offs1, nreg, s.moe_gxq, s.moe_gxs, s.moe_gxbs, dim, nfe)
             mm_b_kq_groupn(s.moe_ghb2, t, f3, s.moe_offs3, nreg, s.moe_gxq, s.moe_gxs, s.moe_gxbs, dim, nfe)
         } elif (c.moe_exps_bias) {   // gpt-oss: gate/up biases fold into the stores, before the act
@@ -9245,7 +9411,9 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
             requant_rows_q8(s.moe_ghb, nfe, nk, s.moe_hq, s.moe_hs)
         }
         let ts_g3 = ref_time_ticks()
-        if (fused_kq) {
+        if (fused_gpu) {
+            matmul_q8q8_moe_gpu_batch(s.moe_gout, s.moe_offs2, nreg, s.moe_hq, s.moe_hs, nfe, dim, nk)
+        } elif (fused_kq) {
             mm_b_kq_groupn(s.moe_gout, t, f2, s.moe_offs2, nreg, s.moe_hq, s.moe_hs, s.moe_hbs, nfe, dim)
         } elif (c.moe_exps_bias) {   // ... and the down biases, inside the routed weight (ggml_add_id order)
             matmul_mx4q8_batch_groupn(s.moe_gout, t.mxq, t.mxs, s.moe_offs2, nreg, s.moe_hq, s.moe_hs, t.fblob, s.moe_boffs2, nfe, dim)

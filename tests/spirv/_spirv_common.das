@@ -1786,3 +1786,115 @@ def lattice_kernel {
 def public lattice_words : array<uint> {
     return clone_to_move(lattice_spv)
 }
+
+// ===== subgroup ops: the GroupNonUniform reduce family (8 opcodes — IAdd serves both int
+// classes), shuffle-xor, broadcast-first, elect, + the four subgroup builtins. The
+// GroupNonUniform* capabilities ride the declared OpCapability. =====
+def public subgroup_emitter_opcodes : table<uint> {
+    var s <- lattice_emitter_opcodes()
+    for (op in [
+        SpvOp.GroupNonUniformIAdd, SpvOp.GroupNonUniformFAdd,
+        SpvOp.GroupNonUniformSMin, SpvOp.GroupNonUniformUMin, SpvOp.GroupNonUniformFMin,
+        SpvOp.GroupNonUniformSMax, SpvOp.GroupNonUniformUMax, SpvOp.GroupNonUniformFMax,
+        SpvOp.GroupNonUniformShuffleXor, SpvOp.GroupNonUniformBroadcastFirst, SpvOp.GroupNonUniformElect
+    ]) {
+        s |> insert(uint(op))
+    }
+    return <- s
+}
+
+var @ssbo @binding = 0 sg_f : array<float>
+var @ssbo @binding = 1 sg_u : array<uint>
+var @ssbo @binding = 2 sg_i : array<int>
+
+[compute_shader(local_size_x=64, name="subgroup_spv"), marker(no_coverage)]
+def subgroup_kernel {
+    let gi = gl_GlobalInvocationID.x
+    let fs = subgroupAdd(sg_f[gi]) + subgroupMin(sg_f[gi]) + subgroupMax(sg_f[gi])
+    let us = (subgroupAdd(sg_u[gi]) + subgroupMin(sg_u[gi]) + subgroupMax(sg_u[gi])
+        + subgroupShuffleXor(sg_u[gi], 2u) + subgroupBroadcastFirst(sg_u[gi]))
+    let si = (subgroupAdd(sg_i[gi]) + subgroupMin(sg_i[gi]) + subgroupMax(sg_i[gi])
+        + subgroupShuffleXor(sg_i[gi], 4u) + subgroupBroadcastFirst(sg_i[gi]))
+    let bf = subgroupBroadcastFirst(sg_f[gi]) + subgroupShuffleXor(sg_f[gi], 1u)
+    let lane = gl_SubgroupSize + gl_SubgroupInvocationID + gl_NumSubgroups
+    if (subgroupElect()) {
+        sg_f[gl_SubgroupID] = fs + bf + float(us + uint(si)) + float(lane)
+    }
+}
+
+def public subgroup_words : array<uint> {
+    return clone_to_move(subgroup_spv)
+}
+
+// ===== spec constants: @constant_id scalars (uint / int / float / both bool defaults — the census
+// needs SpecConstantTrue AND SpecConstantFalse) + a local_size_x_id workgroup axis (per-axis
+// OpSpecConstant folded into an OpSpecConstantComposite decorated BuiltIn WorkgroupSize). The
+// SpecId decorations ride the declared OpDecorate. =====
+def public spec_emitter_opcodes : table<uint> {
+    var s <- subgroup_emitter_opcodes()
+    for (op in [SpvOp.SpecConstant, SpvOp.SpecConstantTrue, SpvOp.SpecConstantFalse, SpvOp.SpecConstantComposite]) {
+        s |> insert(uint(op))
+    }
+    return <- s
+}
+
+var @constant_id = 1 spc_scale_u : uint = 8u
+var @constant_id = 2 spc_bias_i : int = -3
+var @constant_id = 3 spc_gain_f : float = 1.5
+var @constant_id = 4 spc_on_b : bool = true
+var @constant_id = 5 spc_off_b : bool = false
+
+var @ssbo @binding = 0 spc_data : array<float>
+
+[compute_shader(local_size_x=64, local_size_x_id=0, name="specc_spv"), marker(no_coverage)]
+def specc_kernel {
+    let gi = gl_GlobalInvocationID.x
+    var acc = float(spc_scale_u) * spc_gain_f + float(spc_bias_i)
+    if (spc_on_b || spc_off_b) {
+        acc++
+    }
+    spc_data[gi] = acc
+}
+
+def public specc_words : array<uint> {
+    return clone_to_move(specc_spv)
+}
+
+// ===== 8/16-bit SSBO storage: the llama.cpp block_q8_0 mirror (f16 scale + int8[32] quants —
+// ArrayStride 34, member Offsets 0/2, qs element stride 1 under std430), a half4 element array
+// (stride 8), and the unpack8/pack32 OpBitcast pack intrinsics with OpSConvert sign-extended
+// widening. Zero NEW opcodes — the StorageBuffer8/16BitAccess capabilities + the
+// SPV_KHR_8bit_storage extension ride the declared Capability/Extension opcodes. =====
+def public storage816_emitter_opcodes : table<uint> {
+    return <- spec_emitter_opcodes()
+}
+
+struct BlockQ8 {
+    d  : float16
+    qs : int8[32]
+}
+
+var @ssbo @binding = 0 q8_blocks : array<BlockQ8>
+var @ssbo @binding = 1 q8_packed : array<uint>
+var @ssbo @binding = 2 q8_y : array<float>
+var @ssbo @binding = 3 q8_h4 : array<half4>
+
+[compute_shader(local_size_x=64, name="q8blk_spv"), marker(no_coverage)]
+def q8blk_kernel {
+    let gi = gl_GlobalInvocationID.x
+    var acc = 0.0
+    var i = 0u
+    while (i < 32u) {
+        acc += float(int(q8_blocks[gi].qs[i]))
+        i++
+    }
+    let b4 = unpack8(int(q8_packed[gi]))
+    let w = int4(b4)
+    let hp = q8_h4[gi]
+    q8_y[gi] = (acc * float(q8_blocks[gi].d) + float(w.x + w.y + w.z + w.w)
+        + float(hp.x) + float(pack32(b4)))
+}
+
+def public q8blk_words : array<uint> {
+    return clone_to_move(q8blk_spv)
+}

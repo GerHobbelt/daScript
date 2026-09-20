@@ -103,11 +103,16 @@ struct EmitCtx {
     sampled_image_nu_cap : bool                 // OpCapability SampledImageArrayNonUniformIndexing already emitted (NonUniform-indexed sampler descriptor array)
     mesh_shading_cap : bool                     // OpCapability MeshShadingEXT + OpExtension "SPV_EXT_mesh_shader" already emitted (mesh / task stages)
     ray_tracing_cap : bool                      // OpCapability RayTracingKHR + OpExtension "SPV_KHR_ray_tracing" already emitted (raygen / miss / closest-hit stages)
+    group_nonuniform_cap : bool                 // OpCapability GroupNonUniform already emitted (subgroup builtins, subgroupElect)
+    group_nonuniform_arith_cap : bool           // OpCapability GroupNonUniformArithmetic already emitted (subgroupAdd/Min/Max)
+    group_nonuniform_shuffle_cap : bool         // OpCapability GroupNonUniformShuffle already emitted (subgroupShuffleXor)
+    group_nonuniform_ballot_cap : bool          // OpCapability GroupNonUniformBallot already emitted (subgroupBroadcastFirst)
     mesh_max_vertices : int                     // mesh-output array sizing (from MeshOutputConfig): gl_MeshVerticesEXT length
     mesh_max_primitives : int                   // mesh-output array sizing: gl_PrimitiveTriangleIndicesEXT length
     mesh_topology : MeshOutputTopology          // declared output topology; the index-array builtin must match it (triangles -> gl_PrimitiveTriangleIndicesEXT)
     task_payload_id : uint                      // the @task_payload TaskPayloadWorkgroupEXT variable id (0 = none); EmitMeshTasksEXT appends it as the 4th operand
     nonuniform_ids : table<uint>                // set of result ids that carry the NonUniform decoration (nonuniformEXT marker + cascade through OpAccessChain / OpLoad on descriptor arrays)
+    spec_ids      : table<uint>                 // SpecId decorations already used (@constant_id globals + local_size_*_id axes) -> duplicate ids rejected
     user_funcs    : table<uint64; UserFunc>     // intptr(Function) -> emittable user-defined shader function
     user_order    : array<uint64>               // user_funcs keys in stable emission order (collect_dependencies order)
     call_temps    : table<uint64; CallTemp>     // intptr(ref-arg Expression) -> its copy-in/out Function-storage temp
@@ -167,6 +172,7 @@ def finalize(var c : EmitCtx) {
     delete c.user_order
     delete c.call_temps
     delete c.nonuniform_ids
+    delete c.spec_ids
 }
 
 // ===== builtin name -> SpvBuiltIn + storage class + the stage it's legal in =====
@@ -181,6 +187,12 @@ def private builtin_info(name : string) : tuple<ok : bool; bi : SpvBuiltIn; stor
     if (name == "gl_WorkGroupID") return (ok = true, bi = SpvBuiltIn.WorkgroupId, storage = SpvStorageClass.Input, req = ShaderStage.Compute)
     if (name == "gl_NumWorkGroups") return (ok = true, bi = SpvBuiltIn.NumWorkgroups, storage = SpvStorageClass.Input, req = ShaderStage.Compute)
     if (name == "gl_LocalInvocationIndex") return (ok = true, bi = SpvBuiltIn.LocalInvocationIndex, storage = SpvStorageClass.Input, req = ShaderStage.Compute)
+    // subgroup (GroupNonUniform capability, pulled at classification; req=Compute rides the same
+    // workgroup-stage relaxation as the grid builtins, so mesh/task see them too)
+    if (name == "gl_SubgroupSize") return (ok = true, bi = SpvBuiltIn.SubgroupSize, storage = SpvStorageClass.Input, req = ShaderStage.Compute)
+    if (name == "gl_SubgroupInvocationID") return (ok = true, bi = SpvBuiltIn.SubgroupLocalInvocationId, storage = SpvStorageClass.Input, req = ShaderStage.Compute)
+    if (name == "gl_NumSubgroups") return (ok = true, bi = SpvBuiltIn.NumSubgroups, storage = SpvStorageClass.Input, req = ShaderStage.Compute)
+    if (name == "gl_SubgroupID") return (ok = true, bi = SpvBuiltIn.SubgroupId, storage = SpvStorageClass.Input, req = ShaderStage.Compute)
     // vertex
     if (name == "gl_Position") return (ok = true, bi = SpvBuiltIn.Position, storage = SpvStorageClass.Output, req = ShaderStage.Vertex)
     if (name == "gl_PointSize") return (ok = true, bi = SpvBuiltIn.PointSize, storage = SpvStorageClass.Output, req = ShaderStage.Vertex)
@@ -242,17 +254,32 @@ def private is_rt_stage(stage : ShaderStage) : bool {
     return stage == ShaderStage.RayGen || stage == ShaderStage.Miss || stage == ShaderStage.ClosestHit
 }
 
+// Pull the StorageBuffer8/16BitAccess capability for a sub-32-bit member reachable through an
+// @ssbo (std430) layout. std140 blocks never see sub-32 members (compute_block_layout rejects
+// them), so std140 calls are no-ops by construction.
+def private ensure_member_storage_caps(var m : SpirvModule; bt : Type; rules : BlockLayoutRules) {
+    if (rules != BlockLayoutRules.std430) return
+    let w = scalar_width(bt)
+    if (w == 16) {
+        ensure_storage_buffer_16(m)
+    } elif (w == 8) {
+        ensure_storage_buffer_8(m)
+    }
+}
+
 // Build a laid-out interface struct from a daslang struct's fields. Supported member shapes:
-// 32-bit scalar / vector / matrix; fixed-array of scalar / vector / nested struct (std140
-// ArrayStride decoration on the OpTypeArray); nested struct (recursive non-Block OpTypeStruct with
-// its own Offset cascade). `as_block` toggles the Block decoration on the *outer* struct (true for
-// @uniform/@push_constant blocks, false for an SSBO runtime-array element struct); recursively-built
-// nested structs are always emitted non-Block. Returns the OpTypeStruct id plus the std140 size
-// (offset past the last member) and the struct's max-member alignment (which the SSBO caller rounds
-// the struct size up to before using it as the OpTypeRuntimeArray's stride).
-def private build_block_struct(var m : SpirvModule; sname : string; st : Structure?; as_block : bool; var errors : array<string>) : tuple<ok : bool; type_id : uint; size : int; align : int> {
+// scalar / vector / matrix; fixed-array of scalar / vector / nested struct (ArrayStride decoration
+// on the OpTypeArray); nested struct (recursive non-Block OpTypeStruct with its own Offset cascade).
+// `rules` picks the packing: std140 (@uniform / @push_constant — 32-bit members only) or std430
+// (@ssbo element structs — tight strides, 8/16-bit members legal; the matching StorageBuffer8/16BitAccess
+// capability is pulled per member width). `as_block` toggles the Block decoration on the *outer*
+// struct (true for @uniform/@push_constant blocks, false for an SSBO runtime-array element struct);
+// recursively-built nested structs are always emitted non-Block. Returns the OpTypeStruct id plus
+// the laid-out size (offset past the last member) and the struct's max-member alignment (which the
+// SSBO caller rounds the struct size up to before using it as the OpTypeRuntimeArray's stride).
+def private build_block_struct(var m : SpirvModule; sname : string; st : Structure?; as_block : bool; var errors : array<string>; rules : BlockLayoutRules = BlockLayoutRules.std140) : tuple<ok : bool; type_id : uint; size : int; align : int> {
     var fields : array<BlockField>
-    let layout = compute_block_layout(sname, st, fields, errors)
+    let layout = compute_block_layout(sname, st, fields, errors, rules)
     if (!layout.ok) {
         delete fields
         return (ok = false, type_id = 0u, size = 0, align = 0)
@@ -271,13 +298,14 @@ def private build_block_struct(var m : SpirvModule; sname : string; st : Structu
             let et = fld._type.firstType
             var elem_type : uint = 0u
             if (et.baseType == Type.tStructure && et.structType != null) {
-                let inner = build_block_struct(m, "{sname}.{f.name}[]", et.structType, false, errors)
+                let inner = build_block_struct(m, "{sname}.{f.name}[]", et.structType, false, errors, rules)
                 if (!inner.ok) {
                     delete members; delete offsets; delete mat_strides; delete fields
                     return (ok = false, type_id = 0u, size = 0, align = 0)
                 }
                 elem_type = inner.type_id
             } else {
+                ensure_member_storage_caps(m, et.baseType, rules)
                 elem_type = emit_type(m, et)
             }
             members |> push(type_array_strided(m, elem_type, f.array_count, f.array_stride))
@@ -287,7 +315,7 @@ def private build_block_struct(var m : SpirvModule; sname : string; st : Structu
             continue
         }
         if (f.is_struct) {
-            let inner = build_block_struct(m, "{sname}.{f.name}", fld._type.structType, false, errors)
+            let inner = build_block_struct(m, "{sname}.{f.name}", fld._type.structType, false, errors, rules)
             if (!inner.ok) {
                 delete members; delete offsets; delete mat_strides; delete fields
                 return (ok = false, type_id = 0u, size = 0, align = 0)
@@ -298,6 +326,7 @@ def private build_block_struct(var m : SpirvModule; sname : string; st : Structu
             fi++
             continue
         }
+        ensure_member_storage_caps(m, fld._type.baseType, rules)
         members |> push(emit_type(m, fld._type))
         offsets |> push(f.offset)
         // std140 matrix: ColMajor, each column padded to vec4 (MatrixStride 16) — see BlockField docs.
@@ -314,11 +343,11 @@ def private build_block_struct(var m : SpirvModule; sname : string; st : Structu
 }
 
 // std430 layout of an SSBO runtime-array element. Returns the element SPIR-V type-id + the
-// ArrayStride. A 32-bit scalar/vector element strides by its std430 base size rounded up to its base
-// alignment (vec3 -> 16, vec2 -> 8, scalar -> 4); a struct element is laid out non-Block and strides
-// by its size rounded to the struct alignment. Matrix and nested-array elements are rejected (wrap a
-// matrix in a struct). std140_size/std140_align are reused: they equal the std430 base size/alignment
-// for these flat scalar/vector kinds (std430 differs only on array/struct padding, handled here).
+// ArrayStride. A scalar/vector element strides by its std430 base size rounded up to its base
+// alignment — width-aware, so 8/16-bit elements pack tight (int8 -> 1, half -> 2, half4 -> 8) and
+// pull the matching StorageBuffer8/16BitAccess capability; a struct element is laid out non-Block
+// under std430 rules and strides by its size rounded to the struct alignment. Matrix and
+// nested-array elements are rejected (wrap a matrix in a struct).
 def private ssbo_element_layout(var m : SpirvModule; sname : string; et : TypeDecl?; var errors : array<string>) : tuple<ok : bool; elem_type : uint; stride : int> {
     if (et == null) {
         errors |> push("ssbo '{sname}' has no element type")
@@ -330,16 +359,18 @@ def private ssbo_element_layout(var m : SpirvModule; sname : string; et : TypeDe
     }
     let bt = et.baseType
     if (bt == Type.tStructure) {
-        let bs = build_block_struct(m, "{sname} element", et.structType, false, errors)
+        let bs = build_block_struct(m, "{sname} element", et.structType, false, errors, BlockLayoutRules.std430)
         if (!bs.ok) return (ok = false, elem_type = 0u, stride = 0)
         return (ok = true, elem_type = bs.type_id, stride = round_up(bs.size, bs.align))
     }
-    // 32-bit scalar or its 2/3/4 vector (scalar_class rejects bool and non-numeric base types;
-    // the width gate keeps 16/8-bit lattice elements out until the storage-caps wave)
-    if (component_count(bt) >= 1 && scalar_class(bt) >= 0 && scalar_width(bt) == 32) {
-        return (ok = true, elem_type = emit_type(m, et), stride = round_up(std140_size(bt), std140_align(bt)))
+    // scalar or 2/3/4 vector, any lattice width (scalar_class rejects bool, non-numeric base
+    // types, and the CPU-only 8/16-lane forms)
+    if (component_count(bt) >= 1 && scalar_class(bt) >= 0) {
+        ensure_member_storage_caps(m, bt, BlockLayoutRules.std430)
+        return (ok = true, elem_type = emit_type(m, et),
+            stride = round_up(block_scalar_size(bt), block_scalar_align(bt, BlockLayoutRules.std430)))
     }
-    errors |> push("ssbo '{sname}' element type {bt} is not supported (a 32-bit scalar, a vector of those, or a struct of those)")
+    errors |> push("ssbo '{sname}' element type {bt} is not supported (an int/uint/float scalar of any lattice width, a 2/3/4-lane vector of those, or a struct of those)")
     return (ok = false, elem_type = 0u, stride = 0)
 }
 
@@ -575,6 +606,12 @@ def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : Variable
         if (bi.bi == SpvBuiltIn.PrimitiveId && stage == ShaderStage.Fragment) {
             ensure_per_primitive(m, ctx)
             emit(m, SEC_DECOR, SpvOp.Decorate, vid, uint(SpvDecoration.Flat))
+        }
+        // The subgroup builtins are the GroupNonUniform feature's data plane, not part of the base
+        // Shader capability.
+        if (bi.bi == SpvBuiltIn.SubgroupSize || bi.bi == SpvBuiltIn.SubgroupLocalInvocationId ||
+                bi.bi == SpvBuiltIn.NumSubgroups || bi.bi == SpvBuiltIn.SubgroupId) {
+            ensure_group_nonuniform(m, ctx)
         }
         return
     }
@@ -1060,6 +1097,88 @@ def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : Variable
         // interface pass appends these (they are not Input/Output, so the <= 1.3 rule never applies)
         return
     }
+    // specialization constant: a module-scope 32-bit scalar with `@constant_id = N`. Emitted as a
+    // fresh OpSpecConstant -- NEVER through the const pool: two spec constants with equal defaults
+    // must stay distinct ids, and a spec constant must not alias the plain OpConstant of its default
+    // -- plus OpDecorate SpecId. References resolve like a folded constant (is_constant/const_id);
+    // the host overrides the default at pipeline-create time via VkSpecializationInfo.
+    if (v.annotation |> find_arg("constant_id") is tInt) {
+        let cid = v.annotation |> find_arg("constant_id") ?as tInt ?? 0
+        if (cid < 0) {
+            errors |> push("spec constant '{vname}': @constant_id must be non-negative (got {cid})")
+            return
+        }
+        if (v._type == null || (v._type.baseType != Type.tUInt && v._type.baseType != Type.tInt &&
+                                v._type.baseType != Type.tFloat && v._type.baseType != Type.tBool)) {
+            errors |> push("spec constant '{vname}' must be a 32-bit scalar (uint, int, float, or bool)")
+            return
+        }
+        if (key_exists(ctx.spec_ids, uint(cid))) {
+            errors |> push("spec constant '{vname}': duplicate @constant_id {cid}")
+            return
+        }
+        var ie = v.init
+        let r2v = ie ?as ExprRef2Value
+        if (r2v != null) {
+            ie = r2v.subexpr
+        }
+        var has_default = false
+        var bits = 0u
+        var bool_default = false
+        if (ie != null) {
+            let cu = ie ?as ExprConstUInt
+            let ci = ie ?as ExprConstInt
+            let cf = ie ?as ExprConstFloat
+            let cb = ie ?as ExprConstBool
+            if (cu != null) {
+                bits = cu.value
+                has_default = true
+            } elif (ci != null) {
+                bits = uint(ci.value)
+                has_default = true
+            } elif (cf != null) {
+                bits = unsafe(reinterpret<uint>(cf.value))
+                has_default = true
+            } elif (cb != null) {
+                bool_default = cb.value
+                has_default = true
+            }
+            // depending on fold state `-3` can arrive as ExprOp1("-", const) rather than a folded
+            // negative literal (same shape emit_const handles) — fold it here so both parse states
+            // produce the same default bits
+            if (!has_default) {
+                let neg = ie ?as ExprOp1
+                if (neg != null && "{neg.op}" == "-") {
+                    let ir2v = neg.subexpr ?as ExprRef2Value
+                    let sub = ir2v != null ? ir2v.subexpr : neg.subexpr
+                    let nci = sub ?as ExprConstInt
+                    let ncf = sub ?as ExprConstFloat
+                    if (nci != null) {
+                        bits = uint(-nci.value)
+                        has_default = true
+                    } elif (ncf != null) {
+                        bits = unsafe(reinterpret<uint>(-ncf.value))
+                        has_default = true
+                    }
+                }
+            }
+        }
+        if (!has_default) {
+            errors |> push("spec constant '{vname}' needs a literal scalar initializer (its default value)")
+            return
+        }
+        let tid = emit_type(m, v._type)
+        let sid = alloc_id(m)
+        if (v._type.baseType == Type.tBool) {
+            emit(m, SEC_TYPES, bool_default ? SpvOp.SpecConstantTrue : SpvOp.SpecConstantFalse, tid, sid)
+        } else {
+            emit(m, SEC_TYPES, SpvOp.SpecConstant, tid, sid, bits)
+        }
+        emit(m, SEC_DECOR, SpvOp.Decorate, sid, uint(SpvDecoration.SpecId), uint(cid))
+        ctx.spec_ids |> insert(uint(cid))
+        ctx.globals |> insert(intptr(v), GlobalInfo(value_type = tid, is_constant = true, const_id = sid))
+        return
+    }
     // module-scope constant: an immutable `let X = <const-expr>` referenced by the shader body. Fold the
     // initializer to an OpConstant and resolve references straight to it (no OpVariable / OpLoad), so a
     // shader can hoist view rectangles, iteration counts, etc. to module scope and share them with the
@@ -1133,6 +1252,20 @@ def private atomic_info(name : string; cls : int) : tuple<ok : bool; op : SpvOp;
     if (name == "atomicExchange") return (ok = true, op = SpvOp.AtomicExchange, compswap = false)
     if (name == "atomicCompSwap") return (ok = true, op = SpvOp.AtomicCompareExchange, compswap = true)
     return (ok = false, op = SpvOp.AtomicIAdd, compswap = false)
+}
+
+// ===== subgroup call name + operand class -> SPIR-V opcode =====
+// kind: 0 = reduce (scope id, GroupOperation LITERAL, value), 1 = shuffle-xor (scope id, value,
+// mask), 2 = broadcast-first (scope id, value), 3 = elect (scope id only). cls picks the F/I
+// opcode (and S/U for min/max) exactly like atomic_info / glsl_ext_op.
+def private subgroup_info(name : string; cls : int) : tuple<ok : bool; op : SpvOp; kind : int> {
+    if (name == "subgroupAdd") return (ok = true, op = cls == 2 ? SpvOp.GroupNonUniformFAdd : SpvOp.GroupNonUniformIAdd, kind = 0)
+    if (name == "subgroupMin") return (ok = true, op = cls == 2 ? SpvOp.GroupNonUniformFMin : (cls == 1 ? SpvOp.GroupNonUniformUMin : SpvOp.GroupNonUniformSMin), kind = 0)
+    if (name == "subgroupMax") return (ok = true, op = cls == 2 ? SpvOp.GroupNonUniformFMax : (cls == 1 ? SpvOp.GroupNonUniformUMax : SpvOp.GroupNonUniformSMax), kind = 0)
+    if (name == "subgroupShuffleXor") return (ok = true, op = SpvOp.GroupNonUniformShuffleXor, kind = 1)
+    if (name == "subgroupBroadcastFirst") return (ok = true, op = SpvOp.GroupNonUniformBroadcastFirst, kind = 2)
+    if (name == "subgroupElect") return (ok = true, op = SpvOp.GroupNonUniformElect, kind = 3)
+    return (ok = false, op = SpvOp.GroupNonUniformIAdd, kind = -1)
 }
 
 // ===== arithmetic opcode selection =====
@@ -1329,6 +1462,39 @@ def private ensure_draw_parameters(var m : SpirvModule; var ctx : EmitCtx) {
     if (ctx.draw_parameters_cap) return
     emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.DrawParameters))
     ctx.draw_parameters_cap = true
+}
+
+// Subgroup builtins + subgroupElect require the GroupNonUniform capability -- core in SPIR-V 1.3,
+// cap only, no extension. Emit-once + ctx-flag dedupe.
+def private ensure_group_nonuniform(var m : SpirvModule; var ctx : EmitCtx) {
+    if (ctx.group_nonuniform_cap) return
+    emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.GroupNonUniform))
+    ctx.group_nonuniform_cap = true
+}
+
+// The subgroup reduce family (subgroupAdd/Min/Max) additionally requires GroupNonUniformArithmetic.
+def private ensure_group_nonuniform_arithmetic(var m : SpirvModule; var ctx : EmitCtx) {
+    ensure_group_nonuniform(m, ctx)
+    if (ctx.group_nonuniform_arith_cap) return
+    emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.GroupNonUniformArithmetic))
+    ctx.group_nonuniform_arith_cap = true
+}
+
+// subgroupShuffleXor requires GroupNonUniformShuffle.
+def private ensure_group_nonuniform_shuffle(var m : SpirvModule; var ctx : EmitCtx) {
+    ensure_group_nonuniform(m, ctx)
+    if (ctx.group_nonuniform_shuffle_cap) return
+    emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.GroupNonUniformShuffle))
+    ctx.group_nonuniform_shuffle_cap = true
+}
+
+// subgroupBroadcastFirst requires GroupNonUniformBallot -- the spec groups it with the ballot
+// family, NOT shuffle.
+def private ensure_group_nonuniform_ballot(var m : SpirvModule; var ctx : EmitCtx) {
+    ensure_group_nonuniform(m, ctx)
+    if (ctx.group_nonuniform_ballot_cap) return
+    emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.GroupNonUniformBallot))
+    ctx.group_nonuniform_ballot_cap = true
 }
 
 // Descriptor indexing (Vulkan VK_EXT_descriptor_indexing): nonuniformEXT() emits the NonUniform
@@ -1933,6 +2099,14 @@ class SpirvEmit : AstVisitor {
             errs |> push("cannot assign through a swizzle — write-swizzle (e.g. `v.xy = …`) is not supported; assign the whole vector instead")
             return (id = 0u, pty = 0u)
         }
+        // a module-scope constant (`let` fold or @constant_id spec constant) used as a write target:
+        // constants have no OpVariable, so there is no pointer to store through. Name the actual
+        // mistake instead of the generic internal message.
+        let wg = global_var_of(e)
+        if (wg != null && (ctx.globals?[intptr(wg)] ?? GlobalInfo()).is_constant) {
+            errs |> push("cannot assign to '{wg.name}' — module-scope constants (incl. @constant_id spec constants) are read-only in a shader")
+            return (id = 0u, pty = 0u)
+        }
         errs |> push("internal: {e.__rtti} is not an lvalue")
         return (id = 0u, pty = 0u)
     }
@@ -2449,10 +2623,16 @@ class SpirvEmit : AstVisitor {
         if (storage == SpvStorageClass.TaskPayloadWorkgroupEXT) {
             return emit_type(bm, ft)
         }
+        // The packing rules follow the root global's storage class: an @ssbo member access rebuilds
+        // its member types under std430 (tight, width-aware strides), everything else under std140.
+        // MUST stay in lockstep with build_block_struct — the stride is part of the type-dedup key,
+        // so a rules mismatch here yields a DIFFERENT OpTypeArray than the struct's member type and
+        // the OpAccessChain result type no longer matches (spirv-val failure).
+        let rules = storage == SpvStorageClass.StorageBuffer ? BlockLayoutRules.std430 : BlockLayoutRules.std140
         // matrices come back through emit_type -> type_matrix correctly; only tStructure and
         // tFixedArray need the layout-aware path.
         if (ft.baseType == Type.tStructure && ft.structType != null) {
-            let inner = build_block_struct(bm, sname, ft.structType, false, errs)
+            let inner = build_block_struct(bm, sname, ft.structType, false, errs, rules)
             if (!inner.ok) return 0u
             return inner.type_id
         }
@@ -2461,30 +2641,34 @@ class SpirvEmit : AstVisitor {
             let nelem = ft.fixedDim
             var elem_type : uint = 0u
             if (et.baseType == Type.tStructure && et.structType != null) {
-                let inner = build_block_struct(bm, "{sname}[]", et.structType, false, errs)
+                let inner = build_block_struct(bm, "{sname}[]", et.structType, false, errs, rules)
                 if (!inner.ok) return 0u
                 elem_type = inner.type_id
             } else {
+                ensure_member_storage_caps(bm, et.baseType, rules)
                 elem_type = emit_type(bm, et)
             }
-            // std140 element stride: scalar/vector rounds up to vec4; struct element strides by its
-            // laid-out size rounded to the struct alignment. matrix-of-array is out of PR-G scope.
+            // element stride: scalar/vector rounds up to vec4 under std140 / packs tight under
+            // std430; struct element strides by its laid-out size rounded to the struct alignment.
             // The struct-element probe routes its diagnostics through the visitor's `errs` so a
             // layout failure here surfaces the same detailed message a direct classify_global path
             // would (was a local array that swallowed errors).
             var stride = 0
             if (et.baseType == Type.tStructure && et.structType != null) {
                 var probe : array<BlockField>
-                let pl = compute_block_layout("{sname}[]", et.structType, probe, errs)
+                let pl = compute_block_layout("{sname}[]", et.structType, probe, errs, rules)
                 delete probe
                 if (!pl.ok) return 0u
-                let salign = round_up(pl.align, 16)
+                let salign = rules == BlockLayoutRules.std140 ? round_up(pl.align, 16) : pl.align
                 stride = round_up(pl.size, salign)
             } else {
-                stride = round_up(std140_size(et.baseType), 16)
+                stride = block_array_element_stride(et.baseType, rules)
             }
             return type_array_strided(bm, elem_type, nelem, stride)
         }
+        // a terminal sub-32 member type still needs the storage cap (e.g. reading `blk.d : float16`
+        // directly through an access chain)
+        ensure_member_storage_caps(bm, ft.baseType, rules)
         return emit_type(bm, ft)
     }
 
@@ -2847,6 +3031,73 @@ class SpirvEmit : AstVisitor {
                 emit_n(bm, SEC_FUNCS, ainfo.op, ops)
                 delete ops
             }
+            e2id[k] = res
+            return expr
+        }
+        // subgroup ops: cross-lane cooperation at Subgroup scope (SPIR-V 1.3 GroupNonUniform*).
+        // The Execution scope is an ID operand (a constant uint, Subgroup = 3); the reduce family
+        // additionally takes the GroupOperation as a LITERAL word (Reduce = 0), not an id. Compute-only
+        // like barrier(). Each kind pulls its own capability (reduce -> Arithmetic, shuffleXor ->
+        // Shuffle, broadcastFirst -> Ballot, elect -> base GroupNonUniform).
+        let scls = empty(expr.arguments) ? -1 : scalar_class(expr.arguments[0]._type.baseType)
+        let sginfo = subgroup_info(name, scls)
+        if (sginfo.ok) {
+            if (ctx.stage != ShaderStage.Compute) {
+                errs |> push("{name} is only valid in a compute shader")
+                return expr
+            }
+            let nargs = sginfo.kind == 3 ? 0 : (sginfo.kind == 1 ? 2 : 1)
+            if (length(expr.arguments) != nargs) {
+                errs |> push("{name} expects {nargs} argument(s)")
+                return expr
+            }
+            if (sginfo.kind != 3 && scls != 0 && scls != 1 && scls != 2) {
+                errs |> push("{name}: operand must be a float, int, or uint scalar")
+                return expr
+            }
+            let scope_id = const_uint(bm, uint(SpvScope.Subgroup))
+            let rt = emit_type(bm, expr._type)
+            let res = alloc_id(bm)
+            if (sginfo.kind == 0) {
+                ensure_group_nonuniform_arithmetic(bm, *ctx)
+                let val = value_of(expr.arguments[0])
+                if (val == 0u) return expr
+                var ops <- [rt, res, scope_id, uint(SpvGroupOperation.Reduce), val]
+                emit_n(bm, SEC_FUNCS, sginfo.op, ops)
+                delete ops
+            } elif (sginfo.kind == 1) {
+                ensure_group_nonuniform_shuffle(bm, *ctx)
+                let val = value_of(expr.arguments[0])
+                let mask = value_of(expr.arguments[1])
+                if (val == 0u || mask == 0u) return expr
+                var ops <- [rt, res, scope_id, val, mask]
+                emit_n(bm, SEC_FUNCS, sginfo.op, ops)
+                delete ops
+            } elif (sginfo.kind == 2) {
+                ensure_group_nonuniform_ballot(bm, *ctx)
+                let val = value_of(expr.arguments[0])
+                if (val == 0u) return expr
+                emit(bm, SEC_FUNCS, sginfo.op, rt, res, scope_id, val)
+            } else {
+                ensure_group_nonuniform(bm, *ctx)
+                emit(bm, SEC_FUNCS, sginfo.op, rt, res, scope_id)
+            }
+            e2id[k] = res
+            return expr
+        }
+        // unpack8 / pack32: reinterpret one 32-bit scalar as four 8-bit lanes (and back) — a single
+        // OpBitcast; the byte4/ubyte4 type factory pulls the Int8 capability. Widening the unpacked
+        // lanes (`int4(b4)`) rides the existing OpSConvert path, giving sign extension for free.
+        if (name == "unpack8" || name == "pack32") {
+            if (length(expr.arguments) != 1) {
+                errs |> push("{name} expects 1 argument")
+                return expr
+            }
+            let v = value_of(expr.arguments[0])
+            if (v == 0u) return expr
+            let rt = emit_type(bm, expr._type)
+            let res = alloc_id(bm)
+            emit(bm, SEC_FUNCS, SpvOp.Bitcast, rt, res, v)
             e2id[k] = res
             return expr
         }
@@ -4015,7 +4266,7 @@ def private execution_model(stage : ShaderStage) : SpvExecutionModel {
 }
 
 [macro_function]
-def generate_spirv(fn : FunctionPtr; var errors : array<string>; stage : ShaderStage; local_size : int3; mesh_config : MeshOutputConfig; var reflection : SpirvReflection) : array<uint> {
+def generate_spirv(fn : FunctionPtr; var errors : array<string>; stage : ShaderStage; local_size : int3; local_size_ids : int3; mesh_config : MeshOutputConfig; var reflection : SpirvReflection) : array<uint> {
     var m = make_module()
     var ctx : EmitCtx
     ctx.stage = stage
@@ -4109,6 +4360,38 @@ def generate_spirv(fn : FunctionPtr; var errors : array<string>; stage : ShaderS
         var em <- [id_main, uint(SpvExecutionMode.LocalSize), lx, ly, lz]
         emit_n(m, SEC_EXECMODE, SpvOp.ExecutionMode, em)
         delete em
+        // A local_size_*_id annotation arg makes that workgroup axis specializable: an
+        // OpSpecConstantComposite uint3 decorated BuiltIn WorkgroupSize, each constituent an
+        // OpSpecConstant (SpecId = the axis id, default = the LocalSize value) or the pooled
+        // OpConstant default for id-less axes. Per SPIR-V 2.16.2 the WorkgroupSize builtin takes
+        // precedence over the LocalSize execution mode (kept above -- glslang parity). WorkgroupSize
+        // is deprecated only at SPIR-V >= 1.6 (LocalSizeId), fine at our 1.3 header.
+        if (local_size_ids.x >= 0 || local_size_ids.y >= 0 || local_size_ids.z >= 0) {
+            let t_u32 = type_int(m, 32u, 0u)
+            var axis_ids : array<uint>
+            for (aid, adefault in fixed_array(local_size_ids.x, local_size_ids.y, local_size_ids.z), fixed_array(lx, ly, lz)) {
+                if (aid >= 0) {
+                    if (key_exists(ctx.spec_ids, uint(aid))) {
+                        errors |> push("local_size_*_id {aid} duplicates another SpecId in this shader")
+                    }
+                    ctx.spec_ids |> insert(uint(aid))
+                    let sid = alloc_id(m)
+                    emit(m, SEC_TYPES, SpvOp.SpecConstant, t_u32, sid, adefault)
+                    emit(m, SEC_DECOR, SpvOp.Decorate, sid, uint(SpvDecoration.SpecId), uint(aid))
+                    axis_ids |> push(sid)
+                } else {
+                    axis_ids |> push(const_uint(m, adefault))
+                }
+            }
+            let t_uv3 = type_vector(m, t_u32, 3)
+            let wgs_id = alloc_id(m)
+            var wo <- [t_uv3, wgs_id]
+            wo |> push_from(axis_ids)
+            emit_n(m, SEC_TYPES, SpvOp.SpecConstantComposite, wo)
+            delete wo
+            delete axis_ids
+            emit(m, SEC_DECOR, SpvOp.Decorate, wgs_id, uint(SpvDecoration.BuiltIn), uint(SpvBuiltIn.WorkgroupSize))
+        }
     }
     if (stage == ShaderStage.Mesh) {
         // OutputVertices / OutputPrimitivesEXT counts + the output topology come from the [mesh_shader]
