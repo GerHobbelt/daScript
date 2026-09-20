@@ -83,9 +83,10 @@ def private emit_combined_sampler_bind(var blk : ExprBlock?; vv : VariablePtr; f
 // Loose-bind every leaf field of a struct uniform / push-constant. GL exposes a `uniform Block b;`
 // as one by-name location per leaf (b.field, b.nested.field, ...), so we walk the struct and emit a
 // glUniformAny(glGetUniformLocation(prog, "<flattened.name>"), <field access>) per terminal field,
-// recursing into nested structs. Array-of-struct fields aren't flattened here -- glUniformAny has no
-// array<Struct> overload, so such a shape fails to compile (fail-closed; use a flat block or, later,
-// the std140 UBO pack path). The accessExpr is the parent reference (b, then b.nested, ...).
+// recursing into nested structs and flattening fixed arrays of structs per element (name[i].field).
+// Arrays of scalar/vector fields fall through to glUniformAny's whole-array overload (one upload from
+// the base location); a field glUniformAny has no overload for (e.g. a dynamic array<Struct>) stays
+// fail-closed at compile time. The accessExpr is the parent reference (b, then b.nested, ...).
 [macro_function]
 def private emit_loose_struct_bind(var blk : ExprBlock?; st : Structure?; namePrefix : string; accessExpr : ExpressionPtr) {
     for (f in st.fields) {
@@ -96,6 +97,18 @@ def private emit_loose_struct_bind(var blk : ExprBlock?; st : Structure?; namePr
         )
         if (f._type.baseType == Type.tStructure && f._type.structType != null) {
             emit_loose_struct_bind(blk, f._type.structType, fieldName, fieldAccess)
+        } elif (f._type.baseType == Type.tFixedArray && f._type.firstType != null &&
+                f._type.firstType.baseType == Type.tStructure && f._type.firstType.structType != null) {
+            // array of struct: GL exposes name[0].field, name[1].field, ... as separate locations, so
+            // flatten per element index. (Arrays of scalar/vector fall through to glUniformAny's array
+            // overload below, which uploads the whole array from the base location in one call.)
+            for (i in range(f._type.fixedDim)) {
+                var elemAccess = new ExprAt(at = accessExpr.at,
+                    subexpr <- clone_expression(fieldAccess),
+                    index <- new ExprConstInt(at = accessExpr.at, value = i)
+                )
+                emit_loose_struct_bind(blk, f._type.firstType.structType, "{fieldName}[{i}]", elemAccess)
+            }
         } else {
             var cll_gul = new ExprCall(at = accessExpr.at, name := "glGetUniformLocation")
             cll_gul.arguments |> emplace_new() <| new ExprVar(at = accessExpr.at, name := "_opengl_program")

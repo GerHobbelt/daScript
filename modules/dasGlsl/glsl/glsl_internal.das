@@ -283,6 +283,24 @@ let private glsl_compatibility_constructors <- {
     "uint2"  =>  "UVEC2"
 }
 
+// A GLSL float literal must carry a '.', 'e', or 'E', otherwise the token is an
+// int. `:g` drops the decimal point on integer-valued floats (4.0 -> "4"), which
+// desktop GLSL tolerates via implicit conversion but GLSL ES 3.00 (WebGL2) rejects
+// in scalar / binary-operator contexts (`float x = 0;`, `x > 4`, `x / 256`). Print
+// with `:g` for compactness, then re-attach ".0" when the result is a bare integer
+// so it stays a float on every target. (inf/nan tails are left alone.)
+def private glsl_float_literal(value : float) : string {
+    var s = build_string() $(var w) {
+        w |> fmt(":g", value)
+    }
+    // Append ".0" only for a bare integer ("256"); leave decimals ("0.5"),
+    // exponents ("1e+20"), and inf/nan (the 'e'/'f'/'n' letters) untouched.
+    if (find(s, ".") < 0 && find(s, "e") < 0 && find(s, "E") < 0 && find(s, "f") < 0 && find(s, "n") < 0) {
+        s += ".0"
+    }
+    return s
+}
+
 class GlslExport : AstVisitor {
     errors : array<string>
     writer : StringBuilderWriter?
@@ -548,11 +566,39 @@ class GlslExport : AstVisitor {
         }
     }
     def override preVisitProgram(prog : ProgramPtr) : void {
+        // GLSL ES 3.00 (WebGL2) vs desktop core. Keyed off the compiler's platform:
+        // under emscripten the interpreter IS the wasm target (Model A), so a wasm
+        // compile emits ES 3.00. (A host cross-compile to wasm — Model B — emits on
+        // the host and would need an explicit target flag threaded into GlslExport;
+        // not wired yet.) ES 3.00 already matches what desktop core wants minus the
+        // version token, so the body emission below is unchanged.
+        let es300 = get_platform_name() == "emscripten"
         if (caps.write_version) {
-            *writer |> write("#version {version} core\n\n")
+            if (es300) {
+                *writer |> write("#version 300 es\n")
+                // Fragment shaders are invalid in ES without a default precision;
+                // ES 3.0 guarantees highp in fragment so this is loss-free, and it
+                // is a legal no-op in vertex shaders -> emit unconditionally.
+                *writer |> write("precision highp float;\nprecision highp int;\n")
+                // ES 3.0 fragment shaders predeclare a default precision only for
+                // sampler2D and samplerCube; the other sampler types the shared
+                // sampler surface exposes (sampler3D, sampler2DArray, and the depth-
+                // compare sampler2DShadow) have NO fragment default and fail to
+                // compile without one. Emit highp defaults; a legal no-op in the
+                // vertex stage, which already defaults every sampler to highp.
+                *writer |> write("precision highp sampler3D;\nprecision highp sampler2DArray;\nprecision highp sampler2DShadow;\n\n")
+            } else {
+                *writer |> write("#version {version} core\n\n")
+            }
         }
         // TODO: only output builtin functions which are necessary
-        if (version >= 400 && shaderType != ShaderType.compute) {
+        // `discard()` renames to `_discard()` (the keyword can't be a daslang call); emit the
+        // wrapper that bridges back to the GLSL `discard` keyword. It is needed in EVERY GLSL
+        // version (the keyword exists since GLSL 110 / ES 100), so it must NOT be gated on
+        // version >= 400 (that left ES 3.00 / 330 fragment shaders with `_discard()` undefined).
+        // `discard` is a fragment-only keyword, so emit the helper ONLY for fragment shaders --
+        // a vertex/compute stage carrying `discard;` in the preamble would itself fail to compile.
+        if (shaderType == ShaderType.fragment) {
             *writer |> write("void _discard ( ) \{ discard; \}\n")
         }
         *writer |> write("float rcp ( float r ) \{ return 1.0 / r; \}\n")
@@ -995,6 +1041,13 @@ class GlslExport : AstVisitor {
                     checkUniformType(arg._type)
                     if (outputSamplerMacro(arg)) return
                     *writer |> write("uniform "); needInit = false
+                }
+                // GLSL ES 3.00 REQUIRES an explicit layout(location=N) on every fragment output when
+                // there are multiple (MRT / deferred G-buffer). Mirror the vertex branch so a
+                // @out @location=N fragment output emits its location (valid on #version 330 too).
+                let argLoc = arg.annotation |> find_arg("location")
+                if (argLoc is tInt) {
+                    *writer |> write("layout(location={argLoc as tInt}) "); needInit = false
                 }
                 if (arg.annotation |> find_arg("in") is tBool) {
                     *writer |> write("in "); needInit = false
@@ -1793,7 +1846,7 @@ class GlslExport : AstVisitor {
     }
 // const float
     def override preVisitExprConstFloat(expr : ExprConstFloat?) : void {
-        *writer |> fmt(":g", expr.value)
+        *writer |> write(glsl_float_literal(expr.value))
     }
 // const float2
     def override preVisitExprConstFloat2(expr : ExprConstFloat2?) : void {
@@ -1802,9 +1855,9 @@ class GlslExport : AstVisitor {
         } else {
             *writer |> write("vec2(")
         }
-        *writer |> fmt(":g", expr.value.x)
+        *writer |> write(glsl_float_literal(expr.value.x))
         *writer |> write(",")
-        *writer |> fmt(":g", expr.value.y)
+        *writer |> write(glsl_float_literal(expr.value.y))
         *writer |> write(")")
     }
 // const float3
@@ -1814,11 +1867,11 @@ class GlslExport : AstVisitor {
         } else {
             *writer |> write("vec3(")
         }
-        *writer |> fmt(":g", expr.value.x)
+        *writer |> write(glsl_float_literal(expr.value.x))
         *writer |> write(",")
-        *writer |> fmt(":g", expr.value.y)
+        *writer |> write(glsl_float_literal(expr.value.y))
         *writer |> write(",")
-        *writer |> fmt(":g", expr.value.z)
+        *writer |> write(glsl_float_literal(expr.value.z))
         *writer |> write(")")
     }
 // const float4
@@ -1828,13 +1881,13 @@ class GlslExport : AstVisitor {
         } else {
             *writer |> write("vec4(")
         }
-        *writer |> fmt(":g", expr.value.x)
+        *writer |> write(glsl_float_literal(expr.value.x))
         *writer |> write(",")
-        *writer |> fmt(":g", expr.value.y)
+        *writer |> write(glsl_float_literal(expr.value.y))
         *writer |> write(",")
-        *writer |> fmt(":g", expr.value.z)
+        *writer |> write(glsl_float_literal(expr.value.z))
         *writer |> write(",")
-        *writer |> fmt(":g", expr.value.w)
+        *writer |> write(glsl_float_literal(expr.value.w))
         *writer |> write(")")
     }
 // string
