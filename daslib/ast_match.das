@@ -355,16 +355,17 @@ def qm_tmp_args : array<VariablePtr> {
 }
 
 
-def qm_make_zero_const(call_name : string) : Expression? {
-    //! Create a zero-value ExprConst for the range first component.
+def qm_make_zero_const(call_name : string; at : LineInfo) : Expression? {
+    //! Create a zero-value ExprConst for the range first component, reporting at the
+    //! call it stands in for.
     //! range → 0, urange → 0u, range64 → 0l, urange64 → 0ul.
     if (call_name == "range") {
-        return new ExprConstInt(value = 0)
+        return new ExprConstInt(value = 0, at = at)
     } elif (call_name == "urange") {
-        return new ExprConstUInt(value = 0u)
+        return new ExprConstUInt(value = 0u, at = at)
     } elif (call_name == "range64") {
-        return new ExprConstInt64(value = 0l)
-    } elif (call_name == "urange64") return new ExprConstUInt64(value = 0ul)
+        return new ExprConstInt64(value = 0l, at = at)
+    } elif (call_name == "urange64") return new ExprConstUInt64(value = 0ul, at = at)
     return null
 }
 
@@ -955,16 +956,25 @@ def private qm_const_value_guard(at : LineInfo; cast_var : string; actual_var : 
 def private generate_synth_component(comp_rtti : string; synth_var : string; cast_var : string; field_name : string; var body : array<Expression?>&; at : LineInfo) {
     //! Synthesize a ``var synth = new ExprConstXxx(value = cast_var.value.field)`` so that the component can be fed through generate_match for tag handling.
     if (comp_rtti == "ExprConstInt") {
-        body |> push <| qmacro_expr(${ var $i(synth_var) = new ExprConstInt(value = $i(cast_var).value.$f(field_name)); })
+        body |> push <| qmacro_expr(${ var $i(synth_var) = new ExprConstInt(value = $i(cast_var).value.$f(field_name), at = $i(cast_var).at); })
     } elif (comp_rtti == "ExprConstUInt") {
-        body |> push <| qmacro_expr(${ var $i(synth_var) = new ExprConstUInt(value = $i(cast_var).value.$f(field_name)); })
+        body |> push <| qmacro_expr(${ var $i(synth_var) = new ExprConstUInt(value = $i(cast_var).value.$f(field_name), at = $i(cast_var).at); })
     } elif (comp_rtti == "ExprConstFloat") {
-        body |> push <| qmacro_expr(${ var $i(synth_var) = new ExprConstFloat(value = $i(cast_var).value.$f(field_name)); })
+        body |> push <| qmacro_expr(${ var $i(synth_var) = new ExprConstFloat(value = $i(cast_var).value.$f(field_name), at = $i(cast_var).at); })
     } elif (comp_rtti == "ExprConstInt64") {
-        body |> push <| qmacro_expr(${ var $i(synth_var) = new ExprConstInt64(value = $i(cast_var).value.$f(field_name)); })
+        body |> push <| qmacro_expr(${ var $i(synth_var) = new ExprConstInt64(value = $i(cast_var).value.$f(field_name), at = $i(cast_var).at); })
     } elif (comp_rtti == "ExprConstUInt64") {
-        body |> push <| qmacro_expr(${ var $i(synth_var) = new ExprConstUInt64(value = $i(cast_var).value.$f(field_name)); })
+        body |> push <| qmacro_expr(${ var $i(synth_var) = new ExprConstUInt64(value = $i(cast_var).value.$f(field_name), at = $i(cast_var).at); })
     }
+}
+
+// `if (<cond var>) { <body> }` - the shape every folded / direct match arm appends
+def private guarded_block(at : LineInfo; cond_var : string; var stmts : array<Expression?>) : ExpressionPtr {
+    var blk = new ExprBlock(at = at)
+    for (stmt in stmts) {
+        blk.list |> emplace(stmt)
+    }
+    return new ExprIfThenElse(at = at, cond = make_var_ref(at, cond_var), if_true = blk)
 }
 
 [macro_function]
@@ -1450,13 +1460,7 @@ def private generate_match(pattern : Expression?; actual_var : string; var body 
             // If folded: match as constant constructor and continue
             var folded_body : array<Expression?>
             generate_const_constructor_match(call, folded_rtti, actual_var, folded_body, caps, index, at)
-            var folded_blk = new ExprBlock(at = at)
-            for (stmt in folded_body) {
-                folded_blk.list |> emplace(stmt)
-            }
-            var folded_cond = make_var_ref(at, is_folded_var)
-            var folded_if = new ExprIfThenElse(at = at, cond = folded_cond, if_true = folded_blk)
-            body |> emplace(folded_if)
+            body |> push(guarded_block(at, is_folded_var, folded_body))
             // Unfolded: match as ExprCall with one-value expansion (skip if folded matched)
             var unfolded_body : array<Expression?>
             unfolded_body |> push <| qm_rtti_guard(at, actual_var, "ExprCall")
@@ -1495,7 +1499,7 @@ def private generate_match(pattern : Expression?; actual_var : string; var body 
                         full_body |> push <| qmacro_expr(${ var $i(phys_full) = qm_real_call_arg_index($i(cast_var).arguments, 0); })
                         full_body |> push <| qmacro_expr(${ $i(child_var) = clone_expression($i(cast_var).arguments[$i(phys_full)]); })
                         var one_body : array<Expression?>
-                        one_body |> push <| qmacro_expr(${ $i(child_var) = qm_make_zero_const($v(call_name)); })
+                        one_body |> push <| qmacro_expr(${ $i(child_var) = qm_make_zero_const($v(call_name), $i(cast_var).at); })
                         // if (is_one_val) { child = zero } else { child = actual[0] }
                         var one_blk = new ExprBlock(at = at)
                         for (s in one_body) { one_blk.list |> emplace(s); }
@@ -1838,13 +1842,7 @@ def private generate_block_match(var pat_block : ExprBlock?; actual_var : string
             }
             direct_body |> push <| qmacro_expr(${return qm_ok(); })
             // Build: if (direct_var) { direct match + return }
-            var direct_blk = new ExprBlock(at = at)
-            for (stmt in direct_body) {
-                direct_blk.list |> emplace(stmt)
-            }
-            var direct_cond = make_var_ref(at, direct_var)
-            var direct_if = new ExprIfThenElse(at = at, cond = direct_cond, if_true = direct_blk)
-            body |> emplace(direct_if)
+            body |> push(guarded_block(at, direct_var, direct_body))
             // Fall through to block matching if it IS a block
         }
     }

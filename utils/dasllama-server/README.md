@@ -6,7 +6,7 @@ entirely in daslang over the public dasLLAMA facade + the `dasHV` HTTP layer. Po
 client (opencode, Open WebUI, the `llm` CLI, the `openai` Python SDK, …) at `http://127.0.0.1:<port>/v1`.
 
 It reaches **only** public facade verbs (`load_model` / `create_chat_renderer` / `add_user` /
-`render_assistant` / `render_turn` / `eval_batch` via `llm_scheduler` / `transcribe` / `embed`) —
+`render_assistant` / `render_turn` / `eval_batch` via `dasllama_scheduler` / `transcribe` / `embed`) —
 that is the point: the server is the acceptance test for the API rework. If it builds with no
 reach into engine internals, the facade is complete.
 
@@ -80,7 +80,7 @@ path = "D:/models/SmolLM2-135M-Instruct-Q8_0.gguf"
 backend = "cpu"    # never touches the device — alternating with the GPU slot costs nothing
 ```
 
-Chat and completion requests **batch continuously** (`llm_scheduler.das`): up to `--streams`
+Chat and completion requests **batch continuously** (`dasllama/dasllama_scheduler.das`): up to `--streams`
 generations run concurrently through one `eval_batch` decode step per tick, with long prompts
 prefilled in `--chunk`-token slices so a new arrival never stalls running streams for more than
 one chunk. Requests beyond `--streams` queue (up to 32; then 503). KV is **paged** by default —
@@ -160,12 +160,26 @@ Windows locks the DLLs.
 | `GET`  | `/config` | Effective config with per-key source (`default`/`cli`/`toml`), the `[[models]]` roster, model files beside the served one, active rail (gguf vs prepared `.dlim`), GPU tier status (`supported` + `reason` when the loaded model can't ride it) |
 | `POST` | `/config` | Validate a `{key: value}` JSON body and write it as an **authoritative** TOML (`authoritative = true`) to the config path (or `dasllama-server.toml` beside the program on a config-less start). Applies on the next restart |
 | `POST` | `/restart` | Drain like `/shutdown`, then exit with code **4** — the watchdog relaunches, picking up the saved config (3 stays the tune-restart code) |
+| `GET`  | `/exchange` | The sidecar-exchange surface: policy (url/accept/submit) + the current tune sidecar's identity and share state (sha, origin, box/applied_box, version gate, shared-yet) |
+| `GET`  | `/exchange/matches` | Live lookup of this box against the exchange (a network call — seconds; the control page requests it explicitly) |
+| `POST` | `/exchange/apply` | `{"sha": ...}`: download + validate (content sha, schema, `DASLLAMA_VERSION`) + adopt that sidecar, then drain and exit **4** so the relaunch stamps its winners |
+| `POST` | `/exchange/submit` | Privacy-strip and submit this box's own tune to the exchange (refuses exchange-sourced or foreign-box sidecars) |
+| `POST` | `/exchange/retune` | Arm a local re-tune: removes the sidecar, skips the exchange once, restarts — the next boot races this box (~20 min, quiet machine) |
 | `POST` | `/gc` | Schedule a validated collection at the next lifecycle safe point; concurrent requests coalesce |
 | `POST` | `/shutdown` | Stop admitting new LLM/ASR work, drain accepted work, then exit |
 
 Config precedence: `defaults < config TOML < explicit CLI flags` — unless the TOML carries
 `authoritative = true` (what the control page saves), which flips the top: `defaults < CLI <
-authoritative TOML`. The `gpu` key (`off | metal | metal-required | vulkan`) is the first-class
+authoritative TOML`.
+
+The sidecar exchange rides three config-only keys (no CLI flags — one code path):
+`exchange_accept = verified | any | off` (default `verified` — at an untuned boot a verified
+match downloads and applies instead of racing ~20 minutes; unverified NEVER auto-applies),
+`exchange_submit = ask | always | never` (default `ask` — a fresh local tune surfaces as an
+offer on the control page and the watchdog balloon; `always` shares it automatically), and
+`exchange_url` (baked default `https://dasllama.io`). `DASLLAMA_EXCHANGE_URL` /
+`DASLLAMA_EXCHANGE_ACCEPT` env override for tests and one-shot watchdog relaunches. Lookup
+failure is never fatal — the boot falls through to the local tuner. The `gpu` key (`off | metal | metal-required | vulkan`) is the first-class
 backend selector; `gpu = vulkan` arms the MoE tier in its blessed shape — expert stacks sized
 **automatically** (resident layers fill the VRAM budget, the rest stream) plus DN + ATTN + dense +
 the resident shared expert. `gpu_layers` / `gpu_stream` are `0` = auto by default; set either to a
@@ -214,14 +228,22 @@ effect with `temperature > 0` — greedy short-circuits to argmax; the penalties
 mode too. E.g. Qwen3.6's instruct-mode card settings: `"temperature": 0.7, "top_p": 0.8,
 "presence_penalty": 1.5`.
 
-### Thinking control
+### Thinking control and `reasoning_content`
 
-Hybrid thinking models (the Qwen3/Qwen3.6 family) reason in a `<think>` block by default. Set
-`"enable_thinking": false` (top-level, or the llama.cpp spelling
-`"chat_template_kwargs": {"enable_thinking": false}`) and the server appends the template's
-empty think block (`<think>\n\n</think>\n\n`) to the generation prompt — the model answers
-directly, matching the family Jinja's `enable_thinking=false` form. A no-op for models whose
-vocab has no think tokens.
+`enable_thinking` is tri-state: ABSENT leaves the family's own default in force (the
+Qwen3/3.5/3.6 and GLM families think by default; gemma-4 E-series is instruct unless asked;
+gpt-oss always thinks), and a present bool — top-level or the llama.cpp spelling
+`"chat_template_kwargs": {"enable_thinking": ...}` — overrides it. `false` on a
+`<think>`-family appends the template's empty think block so the model answers directly;
+`true` on gemma-4 opens the system turn with the `<|think|>` gate and lets the model emit its
+thought channel. A no-op for models whose vocab has no think tokens.
+
+A thinking reply's reasoning span comes back as **`reasoning_content`** (the
+DeepSeek/llama.cpp framing) with `content` clean of the family's markers: on the
+`chat.completion` message for buffered requests, and as `delta.reasoning_content` chunks —
+streamed before the `delta.content` chunks — for `stream: true`. Tool-calling replies split
+reasoning first, so a thinking model that calls tools returns `reasoning_content` AND
+`tool_calls` in one response. The field is absent (never empty) when the model did not think.
 
 ### Context truncation
 
@@ -238,11 +260,16 @@ request still returns 400. `finish_reason: "length"` means generation consumed i
 messages, repeat. Assistant `tool_calls` turns and `role: "tool"` results replay exactly through
 the chat template on each stateless resend, so agent loops (opencode, pi, …) work end-to-end.
 
-The wire format is per model family: the ChatML/Hermes shape (Qwen2.5 / Qwen3 — tool JSONs in a
-`<tools>` system block, calls as `<tool_call>{"name":…,"arguments":…}</tool_call>`) is
-implemented; a model whose chat template declares no tool format gets an honest 400. Streaming
-with tools streams content up to the first tool-call marker, then buffers and emits the parsed
-calls as one `delta.tool_calls` chunk at finish.
+The wire format is per model family (`ToolMode`, `dasllama_tools.das`): **hermes** (Qwen2.5 /
+Qwen3 family — `<tools>` system block, `<tool_call>` JSON), **harmony** (gpt-oss — developer-turn
+TypeScript namespace defs, commentary-channel recipient calls; reasoning and calls come from one
+channel walk), **gemma4** (gemma-4 — declaration/call/response DSL with the `<|"|>` quote token),
+**mistral** (v0.3+ — `[AVAILABLE_TOOLS]` defs, `[TOOL_CALLS]` array, bare-array replies
+tolerated since the SPM stream suppresses control-token pieces), and **llama_json** (llama-3.x —
+the whole reply is one `{"name","parameters"}` object, results on the `ipython` role). A model
+whose chat template declares no tool format (GLM until its zen2 leg) gets an honest 400.
+Streaming with tools buffers the native envelope and emits the parsed calls as one
+`delta.tool_calls` chunk at finish.
 
 Requests the server does NOT fully understand are visible in the log: unknown endpoints 404
 through a catch-all that logs method + path + body head, and known routes warn per ignored field
@@ -283,13 +310,16 @@ absent; set `DASLLAMA_MODELS_DIR`):
 - `test_openai_server.das` — endpoint conformance (`/v1/models`, `/v1/embeddings`, buffered chat,
   the tools-unsupported 400, the unknown-endpoint 404) over the real dashv HTTP client, plus
   model-free `parse_tool_calls` unit tests; needs `tinyllama-1.1b-chat-v1.0.Q8_0.gguf`.
-- `test_llm_scheduler.das` — the continuous-batching scheduler against `generate()` references
+- `modules/dasLLAMA/tests/test_scheduler.das` — the continuous-batching scheduler against `generate()` references (moved with the module)
   (bit-exact single stream, chunk invariance, staggered admits, eviction); needs
   `SmolLM2-135M-Instruct-Q8_0.gguf`.
 - `test_openai_server_stream.das` — SSE chunk framing, the over-long-prompt 400, two concurrent
   clients batching on one server (`peak_active >= 2` via `/v1/stats`), mid-generation disconnect
   eviction, and the prefix cache returning an identical completion for a repeated request; needs
   `SmolLM2-135M-Instruct-Q8_0.gguf`.
+- `test_exchange_client.das` — the exception: model-free and runs everywhere. The sidecar
+  exchange client against a fake exchange on 127.0.0.1:18131 (lookup/pick, the fetch-and-apply
+  gate, applied_box staleness, the privacy strip, both submit rails, policy parsing).
 
 ```sh
 bin/daslang -jit dastest/dastest.das -- --test utils/dasllama-server/test_openai_server.das

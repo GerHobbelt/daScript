@@ -15,15 +15,20 @@ require math
 require daslib/defer
 
 
-let sorted_tokens_source <- fixed_array("<<<=", ">>>=",
-    "<<=", ">>=", "&&=", "||=", "^^=", "<<<", ">>>",
+// !is and !as are deliberately NOT templates: template matching has no word boundary, so
+// they would steal the prefix of `!is_unary`-style unary-not expressions. They format fine
+// as `!` + keyword. `!?as` IS a template - `!?as<letter>` cannot appear in valid source, and
+// without it the `?` gets spaced apart (`! ?as`), breaking the token
+let sorted_tokens_source <- fixed_array("<<<=", ">>>=", "!?as",
+    "<<=", ">>=", "&&=", "||=", "^^=", "<<<", ">>>", "!?.", "!?[", "!??",
     "::", "+=", "-=", "/=", "*=", "%=", "|=", "&=", "^=", "<<", ">>", "++", "--", "<=", ">=", "==",
     "!=", "->", "<-", "??", "?.", "?[", "<|", "|>", ":=", "=>", "@@", "&&", "||", "^^",
-    "%%"
+    "%%", "!.", "!["
     )
 
 let dont_need_space_around <- fixed_array("(", ")", "[", "]", "\{", "\}",
-    ".", ";", ",", "`", "::", "++", "--", "?.", "?[", "@@", "!", "~", "#", "->", "$"
+    ".", ";", ",", "`", "::", "++", "--", "?.", "?[", "@@", "!", "~", "#", "->", "$",
+    "!.", "!?.", "![", "!?["
     )
 
 let type_after_keyword <- fixed_array("generator", "cast", "upcast", "smart_ptr", "match_type",
@@ -224,7 +229,7 @@ def push_token(var ctx : FormatterCtx; from_char_idx, to_char_idx, space_count, 
 }
 
 
-def parse_token(var ctx : FormatterCtx) {
+def parse_token(var ctx : FormatterCtx) { // nolint:STYLE037,STYLE038 — flat token-class dispatch; splitting would hide the shape
     ctx |> skip_spaces()
     if (ctx.eof) {
         ctx.tokens |> push(ctx.tokens[0])
@@ -414,7 +419,7 @@ def update_paren(ctx : FormatterCtx; index : int; var paren_counter : ParenCount
     if (ctx |> eq(index, "[")) {
         paren_counter.square++;
     }
-    if (ctx |> eq(index, "?[")) {
+    if (ctx |> eq(index, "?[", "![", "!?[")) {
         paren_counter.square++;
     }
     if (ctx |> eq(index, "]")) {
@@ -582,7 +587,15 @@ def have_formatter_token(ctx : FormatterCtx; command : string) {
 }
 
 
-def mark_token_context(var ctx : FormatterCtx) {
+// marks the type tokens after the `:` (or `=` for a typedef) that opens line `j`
+def private mark_type_after_separator(var ctx : FormatterCtx; i, j : int) : void {
+    let colonPos = ctx |> search_token_in_line(j, ctx |> eq(i, "typedef") ? "=" : ":")
+    if (colonPos > 0) {
+        ctx |> mark_tokens_as_type(colonPos + 1)
+    }
+}
+
+def mark_token_context(var ctx : FormatterCtx) { // nolint:STYLE037,STYLE038 — flat per-token-kind context classifier; splitting would hide the shape
     // don't format  require / expect / label
     for (i in range(0, length(ctx.tokens) - 1)) {
         if (ctx |> new_line_before(i) && (ctx |> eq(i, "require") || ctx |> eq(i, "expect") || ctx |> eq(i, "label") || ctx |> eq(i, "include"))) {
@@ -673,10 +686,7 @@ def mark_token_context(var ctx : FormatterCtx) {
             for (j in range(i + skip, length(ctx.tokens) - 3)) {
                 if (ctx |> new_line_before(j)) {
                     if (ctx |> eq(j, "def") || ctx.tokens[j].spaces <= ident) break
-                    let colonPos = ctx |> search_token_in_line(j, ctx |> eq(i, "typedef") ? "=" : ":")
-                    if (colonPos > 0) {
-                        ctx |> mark_tokens_as_type(colonPos + 1)
-                    }
+                    ctx |> mark_type_after_separator(i, j)
                 }
             }
         }
@@ -687,10 +697,7 @@ def mark_token_context(var ctx : FormatterCtx) {
         if (ctx |> new_line_before(i) && (ctx |> eq(i, "typedef") && !ctx |> new_line_before(i + 1))) {
             for (j in range(i + 1, length(ctx.tokens) - 3)) {
                 if (ctx |> new_line_before(j)) break
-                let colonPos = ctx |> search_token_in_line(j, ctx |> eq(i, "typedef") ? "=" : ":")
-                if (colonPos > 0) {
-                    ctx |> mark_tokens_as_type(colonPos + 1)
-                }
+                ctx |> mark_type_after_separator(i, j)
             }
         }
     }
@@ -817,13 +824,6 @@ def fmt_remove_space_before_args(var ctx : FormatterCtx) {
 }
 
 
-def debug_print_tokens(ctx : FormatterCtx) {
-    for (t in ctx.tokens) {
-        to_log(LOG_DEBUG, "{t.isInFunctionParam ? ">" : " "}{t.isInType ? "*" : " "} '{t.str}'\n")
-    }
-}
-
-
 def generate_source(ctx : FormatterCtx) : string {
     var res : array<uint8>
     res |> reserve(1000 + length(ctx.tokens) * 8)
@@ -906,7 +906,7 @@ def remove_space_before(var ctx : FormatterCtx; i) {
 }
 
 
-let tokens_before_unary <- fixed_array("(", "[", "?[", "\{", "auto", "int", "float", "int16", "int32", "int8", ";", ",",
+let tokens_before_unary <- fixed_array("(", "[", "?[", "![", "!?[", "\{", "auto", "int", "float", "int16", "int32", "int8", ";", ",",
     "if", "elif", "while", "switch", "return", "yield", "in", "=", "!"
     );
 

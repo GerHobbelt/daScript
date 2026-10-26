@@ -38,6 +38,26 @@ struct Template {
     tag2expr : table<string; Expression?>                                        //! tag expression replacement rules
 }
 
+// a type substituted into a template stands at the splice site (same rule as $e/$v
+// expression splices); an input cloned from an inferred expression type carries no location
+def private stamp_type_missing_at(var typ : TypeDeclPtr; at : LineInfo) {
+    if (typ == null) {
+        return
+    }
+    if (typ.at.fileInfo == null) {
+        typ.at = at
+    }
+    if (typ.firstType != null) {
+        stamp_type_missing_at(typ.firstType, at)
+    }
+    if (typ.secondType != null) {
+        stamp_type_missing_at(typ.secondType, at)
+    }
+    for (arg in typ.argTypes) {
+        stamp_type_missing_at(arg, at)
+    }
+}
+
 def kaboomVarField(var self : Template; name, prefix, suffix : string) {
     //! Adds a rule to to the template to replace a variable field access with a prefix and suffix.
     //! I.e. foo.bar into prefix + bar + suffix
@@ -145,6 +165,8 @@ class private TemplateVisitor : AstVisitor {
                 if (key_exists(rules.tag2expr, tn)) {
                     var rexpr = clone_expression(unsafe(rules.tag2expr[tn]))
                     rexpr.at = expr.at
+                    // qmacro applies with forceAt = false, so a $v() subtree gets no other location
+                    stamp_missing_at(rexpr, expr.at)
                     return rexpr
                 }
             }
@@ -242,6 +264,8 @@ class private TemplateVisitor : AstVisitor {
         }
         if (in_r2v_direct_var == 0 && key_exists(rules.var2expr, vn)) {
             var rexpr = clone_expression(unsafe(rules.var2expr[vn]))
+            // the whole subtree stands at the splice site, not just its root
+            stamp_missing_at(rexpr, expr.at)
             rexpr.at = expr.at
             return rexpr
         }
@@ -255,6 +279,7 @@ class private TemplateVisitor : AstVisitor {
             let vn = string(vvar.name)
             if (key_exists(rules.var2expr, vn)) {
                 var rexpr = clone_expression(unsafe(rules.var2expr[vn]))
+                stamp_missing_at(rexpr, expr.at)
                 rexpr.at = expr.at
                 return rexpr
             }
@@ -266,7 +291,10 @@ class private TemplateVisitor : AstVisitor {
         if (typ.baseType == Type.alias) {
             let ta = string(typ.alias)
             if (key_exists(rules.type2etype, ta)) {
+                // fill the donor's MISSING locations from the splice site; real ones stay (unlike $e(), which forces the root)
+                let oldAt = typ.at
                 typ = clone_type(unsafe(rules.type2etype[ta]))
+                stamp_type_missing_at(typ, oldAt)
             } elif (key_exists(rules.type2type, ta)) {
                 typ.alias := rules.type2type |> get_value(ta)
             }
@@ -274,8 +302,10 @@ class private TemplateVisitor : AstVisitor {
             let st = typ.structType
             if (key_exists(rules.struct2etype, st)) {
                 let oldFlags = typ.flags
+                let oldAt = typ.at
                 typ = clone_type(unsafe(rules.struct2etype[st]))
                 typ.flags = oldFlags
+                stamp_type_missing_at(typ, oldAt)
             }
         }
         if (typ.firstType != null) {
@@ -472,6 +502,10 @@ def move_unquote_block(var expr : Expression?&) : ExprBlock? {
 def make_expression_block(var exprs : array<Expression?>) : ExprBlock? {
     //! Create ExprBlock and move all expressions from expr to the list of the block.
     var blk = new ExprBlock(uninitialized)
+    // the block stands for the statements it holds, so it reports at the first of them
+    if (!empty(exprs) && exprs[0] != null) {
+        blk.at = exprs[0].at
+    }
     for (e in exprs) {
         blk.list |> emplace_new <| clone_to_move(e)
     }
@@ -481,6 +515,9 @@ def make_expression_block(var exprs : array<Expression?>) : ExprBlock? {
 def make_expression_block(var exprs : dasvector`ptr`Expression) : ExprBlock? {
     //! Create ExprBlock and move all expressions from expr to the list of the block.
     var blk = new ExprBlock(uninitialized)
+    if (!empty(exprs) && exprs[0] != null) {
+        blk.at = exprs[0].at
+    }
     for (e in exprs) {
         blk.list |> emplace_new <| clone_expression(e)
     }
@@ -885,7 +922,7 @@ class private QRulesVisitor : AstVisitor {
                 ))
         }
     }
-    def override visitExprTag(var expr : ExprTag?) : Expression? {
+    def override visitExprTag(var expr : ExprTag?) : Expression? { // nolint:STYLE037 nolint:STYLE038 - one arm per tag spelling, a dispatch ladder
         //! Visits tag expression and processes variable/expression/argument/call tags.
         var new_tag_name = ""
         if (expr.name == "c") {
@@ -1346,7 +1383,7 @@ class private AstQMethodMacro : AstQNamedClassMacro {
     override apply_call = "apply_qmacro_method"
 }
 
-def public apply_qmacro_template_class(instance_name : string; var template_type : TypeDecl?; blk : block<(var rules : Template) : void>) : TypeDeclPtr {
+def public apply_qmacro_template_class(instance_name : string; var template_type : TypeDecl?; blk : block<(var rules : Template) : void>) : TypeDeclPtr { // nolint:STYLE038 - one linear reification pass, its phases share the instance state
     //! Implementation details for the expression reification. This is a template class instantiation reification.
     var mod = compiling_module()
     var template_structure = template_type.structType
@@ -1576,6 +1613,7 @@ def public add_structure_field(var cls : StructurePtr; name : string; var t : Ty
     cls.fields[fi].name := name
     cls.fields[fi]._type = t
     cls.fields[fi].init = init
+    cls.fields[fi].at = t != null && t.at.fileInfo != null ? t.at : cls.at
     return fi
 }
 

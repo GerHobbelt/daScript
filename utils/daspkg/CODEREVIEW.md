@@ -6,6 +6,11 @@ Run this list on every daspkg change before it ships. Every entry is checkable a
 file.** Mark it like any other finding — a checklist defect blocks nothing, but its fix (a
 rewrite or a move, never silent tolerance) lands in the same batch as the round's other fixes.
 
+**New functionality ships with tests — same PR, no follow-up promises.** A new or changed
+reachable branch ships a test that fails without it; a diff that adds a branch no test
+distinguishes is a defect. The audit procedure — including the negative control that settles
+"would it fail?" — is `skills/tdd_audit.md`.
+
 ## Tests
 
 **Run the unit suite on every change:**
@@ -16,13 +21,18 @@ bin/daslang dastest/dastest.das -- --test utils/daspkg/test_daspkg.das
 
 Fast, no network, runs interpreted. A daspkg change without a green unit run is a defect.
 
-**Run the integration suite when install, resolve, index, or git behavior changes:**
+**Run the integration suite on any edit to `index.das`, or to any function reachable from
+`install`, `update`, `upgrade`, `introduce`, `withdraw`, or `update-index` — whichever file it
+lives in, the `utils.das` helpers those commands call included — and a behavior-preserving
+refactor of one still counts:**
 
 ```text
 bin/daslang dastest/dastest.das -- --test utils/daspkg/test_daspkg_git.das
 ```
 
-Needs network (the `borisbat/daspkg-test-*` fixture repos).
+Needs network (the `borisbat/daspkg-test-*` fixture repos). One exception to that trigger, even
+though those commands reach them: `gitignore_add` / `gitignore_remove` in `utils.das` run no git
+command, and stay the unit suite's.
 
 **A release-path change is verified on macOS, or the review says it was not.** The release
 layout forks per platform (`.app` bundle vs flat directory); the only CI on these suites is
@@ -44,5 +54,8 @@ on every platform.
 **Unit cells touch only local fixtures.** A `test_daspkg.das` cell that reaches the network is
 a defect — network coverage belongs in `test_daspkg_git.das`.
 
-**Anything interpolated into a shell command is validated first** (`shell_unsafe` /
-`is_safe_pkg_name`). A new interpolation site without its check is a defect.
+**A package, bundle, or app name that reaches a shell command is validated by `is_safe_pkg_name`
+first** — a new interpolation site in `commands.das` without that check is a defect. The
+validator is `def private` to `commands.das`, so no validator is reachable from any other file
+here: a new shell command interpolating a package, bundle, or app name outside `commands.das` is
+a defect.

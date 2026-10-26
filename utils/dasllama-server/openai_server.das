@@ -5,13 +5,15 @@ options fast_math = true   // ggml-parity FP laxity (non-bit-exact); inference t
 module openai_server
 
 require dasllama/dasllama       // the public facade — the main dasLLAMA surface this tool touches
-require llm_scheduler           // continuous-batching scheduler (sibling — bare require, hyphenated dir)
+require dasllama/dasllama_scheduler   // continuous-batching scheduler (layer 3 over the facade)
 require dashv/dashv_boost public
 require daslib/json_boost
 require daslib/toml             // write_toml: POST /config persists the authoritative config
 require dasllama/dasllama_math  // gpu_tier_status: the GET /config GPU badge
 require dasllama/dasllama_image   // dlim_inventory / dlim_clean: GET /v1/images + the bake GC
 require dasllama/dasllama_config  // dlim_config_current/json: the bake child's --config payload
+require ../../modules/dasLLAMA/performance/exchange_client.das   // the /exchange surface + submit rails
+require llvm/daslib/llvm_tune   // tune_manifest_path — the /exchange apply target
 require daslib/defer            // defer() { delete js } — free the parsed request JSON on every exit path
 require daslib/jobque_boost
 require daslib/rtti             // this_context().last_exception inside ASR worker recovery
@@ -29,7 +31,7 @@ require dasllama/dasllama_gpu_resident   // multi-model slot switch (marks save/
 // surface builds without reaching into the engine, the facade is complete. (The dashboard-only
 // surfaces additionally read dasllama_math's tier-status getters — see the require above.)
 // Chat and completion requests batch continuously: handlers parse + render + register and return;
-// run_server's loop drives llm_scheduler (one eval_batch decode step over every live stream + one
+// run_server's loop drives dasllama_scheduler (one eval_batch decode step over every live stream + one
 // bounded prefill chunk per tick) and routes SchedEvents back to each request's writer. Streaming
 // and buffered responses both ride the deferred writer ops, so N streams generate concurrently.
 // ASR uploads are queued to long-lived new_thread workers, each with its own model/session/context;
@@ -149,6 +151,8 @@ struct private StreamWire {
     last_keepalive_ticks : int64    // tool streams buffer native envelopes; empty deltas keep HTTP alive
     call_open : string              // the family's tool-call markers (copied from the chat template)
     call_close : string
+    tool_mode : ToolMode = ToolMode.none   // the family's tool wire format — the finish parse dispatches on it
+    think : ThinkStream = ThinkStream()   // the reply-side reasoning splitter (pass-through when unarmed)
 }
 
 var g_wires : table<int64; StreamWire>
@@ -592,7 +596,7 @@ def private bake_worker(daslang_bin, gguf_path, flavor, cfg_path : string; var e
         var line_start = 0
         while (at < length(bytes)) {
             if (bytes[at] == uint8('\n')) {
-                let line = slice(out, line_start, at)
+                let line = slice(bytes, line_start, at)
                 if (find(line, "dasllama-convert:") >= 0) {
                     bake_emit(events, 0, clone_string(line))
                 }
@@ -851,6 +855,7 @@ struct OaiToolCall {
 struct private OaiMessage {
     role : string
     content : string
+    @optional reasoning_content : string   // the reply's reasoning span (thinking models; absent when empty)
     @optional tool_calls : array<OaiToolCall>
 }
 
@@ -887,6 +892,7 @@ struct private OaiStreamToolCall {
 struct private OaiDelta {
     @optional role : string
     @optional content : string
+    @optional reasoning_content : string   // streamed reasoning deltas (the DeepSeek/llama.cpp framing)
     @optional tool_calls : array<OaiStreamToolCall>
 }
 
@@ -1110,12 +1116,15 @@ def private utf8_hold_bytes(s : string) : int {
     return hold
 }
 
-// One chat.completion.chunk SSE event. role-only for the opening delta, content for each token,
-// empty delta + finish_reason for the terminating chunk.
+// One chat.completion.chunk SSE event. role-only for the opening delta, content and/or
+// reasoning_content for each token, empty delta + finish_reason for the terminating chunk.
 def private send_chat_chunk(srv : WebSocketServer; var writer : HttpResponseWriter?;
-                            id : string; created : int64; role, content, finish : string) {
+                            id : string; created : int64; role, content, finish : string;
+                            reasoning : string = "") {
     var chunk = OaiStreamChunk(id = id, _object = "chat.completion.chunk", created = created, model = cur_name())
-    chunk.choices |> emplace(OaiStreamChoice(index = 0, delta <- OaiDelta(role = role, content = content),
+    chunk.choices |> emplace(OaiStreamChoice(index = 0,
+                                             delta <- OaiDelta(role = role, content = content,
+                                                               reasoning_content = reasoning),
                                              finish_reason = finish))
     sse_event(srv, writer, sprint_json(chunk, false), "")
     delete chunk
@@ -1141,52 +1150,22 @@ def private send_chat_tool_calls_chunk(srv : WebSocketServer; var writer : HttpR
 
 //! Extract Hermes-style tool calls from a finished reply: every well-formed open…close span becomes
 //! one call; returns the content BEFORE the first opener (everything when nothing parses, so no
-//! reply text is silently dropped). Unparseable call JSON logs and is skipped; an unterminated
-//! span logs and ends the scan.
+//! reply text is silently dropped). The scan itself is dasllama_tools' ``marker_parse`` — this
+//! wrapper maps its calls onto the OpenAI wire shapes and logs when spans parse to nothing.
 def parse_tool_calls(full : string; open_mark, close_mark, id_base : string;
                      var calls : array<OaiToolCall>) : string {
-    var content_end = -1
-    var pos = 0
-    while (true) {
-        let o = find(full, open_mark, pos)
-        if (o < 0) {
-            break
-        }
-        if (content_end < 0) {
-            content_end = o
-        }
-        let bstart = o + length(open_mark)
-        let cl = find(full, close_mark, bstart)
-        if (cl < 0) {
-            to_log(LOG_WARNING, "dasllama-server: unterminated {open_mark} span (token budget cut?) — scan stopped\n")
-            break
-        }
-        let body = strip(slice(full, bstart, cl))
-        var perr = ""
-        var cjs = read_json(body, perr)
-        if (cjs == null) {
-            to_log(LOG_WARNING, "dasllama-server: unparseable tool-call JSON ({perr}): {body}\n")
-        } else {
-            let cname = cjs?["name"] ?? ""
-            let av = cjs?["arguments"]
-            var args = "\{}"
-            if (av != null && av.value is _string) {   // non-spec but seen: arguments emitted as a string
-                let s = av ?? ""
-                args = empty(s) ? "\{}" : s
-            } elif (av != null && !(av.value is _null)) {
-                args = write_json_compact(av)   // the OpenAI wire carries arguments as compact JSON text
-            }
-            if (!empty(cname)) {
-                calls |> push(OaiToolCall(id = "{id_base}_{length(calls)}", _type = "function",
-                                          _function = OaiToolCallFn(name = cname, arguments = args)))
-            } else {
-                to_log(LOG_WARNING, "dasllama-server: tool call without a name — skipped: {body}\n")
-            }
-            unsafe { delete cjs }
-        }
-        pos = cl + length(close_mark)
+    var tr <- marker_parse(full, open_mark, close_mark)
+    if (empty(tr.calls) && !empty(open_mark) && find(full, open_mark) >= 0) {
+        to_log(LOG_WARNING, "dasllama-server: {open_mark} span(s) present but no calls parsed (unterminated or malformed JSON)\n")
     }
-    return (content_end < 0 || empty(calls)) ? full : strip(slice(full, 0, content_end))
+    calls |> reserve(length(calls) + length(tr.calls))
+    for (c in tr.calls) {
+        calls |> push(OaiToolCall(id = "{id_base}_{length(calls)}", _type = "function",
+                                  _function = OaiToolCallFn(name = c.name, arguments = c.args)))
+    }
+    let content = tr.content
+    delete tr
+    return content
 }
 
 // Normalize one of the JSON call objects used by common model families. OpenAI/Hermes/Mistral
@@ -1539,7 +1518,8 @@ def private register_request(srv : WebSocketServer; var writer : HttpResponseWri
                              params : SamplingParams; max_new : int64;
                              streaming, is_chat : bool; prefix : string;
                              tools_declared : bool = false; call_open : string = ""; call_close : string = "";
-                             seed : int = 0) {
+                             seed : int = 0; think : ThinkStream = ThinkStream();
+                             tool_mode : ToolMode = ToolMode.none) {
     let np = long_length(prompt)
     if (np + 1l > cur_model().config.seq_len) {
         bad_request(srv, writer, "the rendered prompt is {np} tokens; the model context is {cur_model().config.seq_len} — shorten the conversation or raise --ctx")
@@ -1564,9 +1544,10 @@ def private register_request(srv : WebSocketServer; var writer : HttpResponseWri
     to_log(LOG_INFO, "[req {rid}] {prefix}: prompt={np} tok, stream={streaming}, max_new={max_new}\n")
     var wire <- StreamWire(writer = writer, streaming = streaming, is_chat = is_chat,
                            slot = g_cur, id = cid, created = created,
-                           has_tools = tools_declared && !empty(call_open),
+                           has_tools = tools_declared && tool_mode != ToolMode.none,
                            last_keepalive_ticks = ref_time_ticks(),
-                           call_open = call_open, call_close = call_close)
+                           call_open = call_open, call_close = call_close,
+                           tool_mode = tool_mode, think = think)
     g_wires[rid] <- wire
     if (streaming && is_chat) {
         send_chat_chunk(srv, writer, cid, created, "assistant", "", "")   // opening role delta
@@ -1579,16 +1560,17 @@ def private register_request(srv : WebSocketServer; var writer : HttpResponseWri
 // Render a user-led suffix of the transcript. System messages are always retained (they were
 // folded into `system`); `start` applies only to conversational messages in the original array.
 def private render_chat_suffix(msgs_v : JsonValue?; system : string; tools : array<string>;   // nolint:STYLE037,STYLE038 — one arm per message role, each accumulating into the same renderer state
-                               max_new : int64; start : int; thinking : bool;
+                               max_new : int64; start : int; think_set, think_val : bool;
                                var prompt, stop_ids, close : array<int64>&;
-                               var call_open, call_close : string&) : string {
+                               var call_open, call_close : string&; var think_out : ThinkStream&;
+                               var tool_mode_out : ToolMode&) : string {
     var chat <- create_chat_renderer(cur_model(), system, max_new)
     defer() { delete chat }
-    if (!thinking) {
-        set_thinking(chat, false)
+    if (think_set) {   // absent from the request => the family's own default (gemma-4 E: off)
+        set_thinking(chat, think_val)
     }
     if (!empty(tools)) {
-        if (empty(chat.tmpl.tool_call_open)) {
+        if (chat.tmpl.tool_mode == ToolMode.none) {
             return "'tools' is not supported: the {cur_name()} chat template declares no tool-call format"
         }
         var render_tools <- [for (tool in tools); tool]
@@ -1596,10 +1578,30 @@ def private render_chat_suffix(msgs_v : JsonValue?; system : string; tools : arr
         delete render_tools
     }
 
+    // tool_call_id -> function name over the WHOLE transcript: results carry their names, so the
+    // name-spelling framings (harmony, gemma-4) pair correctly even out of call order
+    var id2name : table<string; string>
+    defer() { delete id2name }
+    for (av in (msgs_v.value as _array)) {
+        let tcv = av?["tool_calls"]
+        if (((av?["role"] ?? "") == "assistant") && tcv != null && tcv.value is _array) {
+            for (tcall in (tcv.value as _array)) {
+                let cid = tcall?["id"] ?? ""
+                let cnm = tcall?["function"]?["name"] ?? ""
+                if (!empty(cid) && !empty(cnm)) {
+                    id2name[cid] = cnm
+                }
+            }
+        }
+    }
     var rendered : array<int64>
     var pending = false
     var tool_results : array<string>
-    defer() { delete tool_results }
+    var tool_names : array<string>
+    defer() {
+        delete tool_results
+        delete tool_names
+    }
     for (i in range(length(msgs_v.value as _array))) {
         let mv = (msgs_v.value as _array)[i]
         let role = mv?["role"] ?? ""
@@ -1608,8 +1610,9 @@ def private render_chat_suffix(msgs_v : JsonValue?; system : string; tools : arr
         }
         let content = message_text(mv, "/v1/chat/completions")
         if (role != "tool" && !empty(tool_results)) {
-            add_tool_results(chat, tool_results)
+            add_tool_results(chat, tool_results, tool_names)
             tool_results |> clear()
+            tool_names |> clear()
             pending = true
         }
         if (role == "user") {
@@ -1650,13 +1653,15 @@ def private render_chat_suffix(msgs_v : JsonValue?; system : string; tools : arr
             }
             delete calls
         } elif (role == "tool") {
+            let tcid = mv?["tool_call_id"] ?? ""
             tool_results |> push(content)
+            tool_names |> push(id2name?[tcid] ?? "")   // "" falls back to positional pairing
         } elif (role != "system") {
             to_log(LOG_WARNING, "/v1/chat/completions: dropping message with unsupported role '{role}'\n")
         }
     }
     if (!empty(tool_results)) {
-        add_tool_results(chat, tool_results)
+        add_tool_results(chat, tool_results, tool_names)
         pending = true
     }
     if (!pending) {
@@ -1668,10 +1673,12 @@ def private render_chat_suffix(msgs_v : JsonValue?; system : string; tools : arr
     delete turn
     // out-params: the sole caller hands them in empty and deletes them before every re-render
     prompt <- rendered      // nolint:PERF030 — empty on entry
-    stop_ids <- chat.stop_ids   // nolint:PERF030 — empty on entry
+    stop_ids <- effective_stop_ids(chat)   // nolint:PERF030 — empty on entry; + thinking-off extras
     close <- render_close(cur_model(), chat)   // nolint:PERF030 — empty on entry
     call_open = chat.tmpl.tool_call_open
     call_close = chat.tmpl.tool_call_close
+    think_out = make_think_stream(chat)   // armed per the family's reply format + effective thinking
+    tool_mode_out = chat.tmpl.tool_mode
     return ""
 }
 
@@ -1774,8 +1781,12 @@ def private handle_chat(srv : WebSocketServer; var req : HttpRequest?; var write
     } elif (ctk != null && !(ctk.value is _null)) {
         to_log(LOG_WARNING, "/v1/chat/completions: 'chat_template_kwargs' must be an object — ignoring\n")
     }
-    var think = js?["enable_thinking"] ?? true
-    think = think && (ctk?["enable_thinking"] ?? true)
+    // tri-state: an ABSENT enable_thinking leaves the family's own default in force (qwen thinks,
+    // gemma-4 E doesn't); a present bool — either spelling — overrides it
+    let tv = js?["enable_thinking"]
+    let cv = ctk?["enable_thinking"]
+    let think_set = (tv != null && tv.value is _bool) || (cv != null && cv.value is _bool)
+    let think_val = (tv ?? true) && (cv ?? true)
     let has_tools = !empty(tools)
     var prompt : array<int64>
     defer() { delete prompt }
@@ -1785,10 +1796,13 @@ def private handle_chat(srv : WebSocketServer; var req : HttpRequest?; var write
     defer() { delete close }
     var call_open = ""
     var call_close = ""
+    var think_stream = ThinkStream()
+    var wire_tool_mode = ToolMode.none
     var start = 0
     while (true) {
-        let render_error = render_chat_suffix(msgs_v, system, tools, max_new, start, think,
-                                              prompt, stop_ids, close, call_open, call_close)
+        let render_error = render_chat_suffix(msgs_v, system, tools, max_new, start, think_set, think_val,
+                                              prompt, stop_ids, close, call_open, call_close, think_stream,
+                                              wire_tool_mode)
         if (!empty(render_error)) {
             bad_request(srv, writer, render_error)
             return
@@ -1810,7 +1824,7 @@ def private handle_chat(srv : WebSocketServer; var req : HttpRequest?; var write
         delete close
     }
     register_request(srv, writer, prompt, stop_ids, close, params, max_new, streaming, true, "chatcmpl",
-                     has_tools, call_open, call_close, seed)
+                     has_tools, call_open, call_close, seed, think_stream, wire_tool_mode)
 }
 
 def private handle_completion(srv : WebSocketServer; var req : HttpRequest?; var writer : HttpResponseWriter?) {
@@ -1885,6 +1899,52 @@ def private flush_tool_keepalives(srv : WebSocketServer) {
     }
 }
 
+// Split a complete buffered reply through the wire's splitter (fresh on buffered wires — pieces
+// never fed it): reasoning lands in the out-param, the content half returns. One engine with the
+// chat layer's split_reasoning — the strip rule lives in think_drain.
+def private split_wire_reasoning(var w : StreamWire?; full : string; var reasoning : string&) : string {
+    let res = think_drain(w.think, full)
+    reasoning = res.reasoning
+    return res.content
+}
+
+// dasllama_tools calls -> the OpenAI wire shape, minting ids where the format carries none.
+def private oai_calls_of(tcs : array<ToolCall>; id_base : string; var calls : array<OaiToolCall>) {
+    calls |> reserve(length(tcs))
+    var i = 0
+    for (tc in tcs) {
+        let id = empty(tc.id) ? "{id_base}_{i}" : tc.id
+        calls |> emplace(OaiToolCall(id = id, _type = "function",
+                                     _function = OaiToolCallFn(name = tc.name, arguments = tc.args)))
+        i ++
+    }
+}
+
+// The finish-time parse for a tool-capable wire, dispatched on its ToolMode: harmony walks the
+// channel structure once (reasoning + content + calls); the marker modes split reasoning first
+// and parse their format from the content half; hermes keeps the marker+sniff path.
+def private parse_wire_tools(var w : StreamWire?; full, id_base : string;
+                             var reasoning : string&; var calls : array<OaiToolCall>) : string {
+    if (w.tool_mode == ToolMode.harmony) {
+        var tr <- harmony_parse(full)
+        reasoning = tr.reasoning
+        oai_calls_of(tr.calls, id_base, calls)
+        let content = tr.content
+        delete tr
+        return content
+    }
+    let body = split_wire_reasoning(w, full, reasoning)
+    if (w.tool_mode == ToolMode.gemma4 || w.tool_mode == ToolMode.mistral || w.tool_mode == ToolMode.llama_json) {
+        var tr <- (w.tool_mode == ToolMode.gemma4 ? gemma4_parse(body)
+            : (w.tool_mode == ToolMode.mistral ? mistral_parse(body) : llama_json_parse(body)))
+        oai_calls_of(tr.calls, id_base, calls)
+        let content = tr.content
+        delete tr
+        return content
+    }
+    return parse_tool_calls_auto(body, w.call_open, w.call_close, id_base, calls)
+}
+
 // Route drained SchedEvents to their writers: streaming wires emit SSE chunks, buffered wires
 // accumulate pieces and respond once at finish. "evicted" releases the writer with no bytes —
 // the client is gone (reap_disconnected produced it). Finished wires unregister.
@@ -1913,7 +1973,17 @@ def private flush_events(srv : WebSocketServer) {   // nolint:STYLE037,STYLE038 
                 w.utf8_tail = hold > 0 ? slice(whole, cut) : ""
                 if (!empty(emit_now)) {
                     if (w.is_chat) {
-                        send_chat_chunk(srv, w.writer, w.id, w.created, "", emit_now, "")
+                        // reasoning/content split rides the wire's splitter; either half may be
+                        // empty (partial markers hold back across deltas)
+                        var rsn = ""
+                        var cnt = ""
+                        think_feed(w.think, emit_now, rsn, cnt)
+                        if (!empty(rsn)) {
+                            send_chat_chunk(srv, w.writer, w.id, w.created, "", "", "", rsn)
+                        }
+                        if (!empty(cnt)) {
+                            send_chat_chunk(srv, w.writer, w.id, w.created, "", cnt, "")
+                        }
                     } else {
                         send_compl_chunk(srv, w.writer, w.id, w.created, emit_now, "")
                     }
@@ -1932,11 +2002,14 @@ def private flush_events(srv : WebSocketServer) {   // nolint:STYLE037,STYLE038 
             }
             var finish = e.finish
             if (w.has_tools) {
-                // Normalize the complete reply, then send content and calls in OpenAI framing.
+                // Normalize the complete reply: reasoning first, then calls, in OpenAI framing.
                 let full = join(w.reply_parts, "")
+                var rsn = ""
                 var calls : array<OaiToolCall>
-                let content = parse_tool_calls_auto(full, w.call_open, w.call_close,
-                                                    "call_{e.stream}", calls)
+                let content = parse_wire_tools(w, full, "call_{e.stream}", rsn, calls)
+                if (!empty(rsn)) {
+                    send_chat_chunk(srv, w.writer, w.id, w.created, "", "", "", rsn)
+                }
                 if (!empty(content)) {
                     send_chat_chunk(srv, w.writer, w.id, w.created, "", content, "")
                 }
@@ -1945,6 +2018,17 @@ def private flush_events(srv : WebSocketServer) {   // nolint:STYLE037,STYLE038 
                     finish = "tool_calls"
                 }
                 delete calls
+            } elif (w.is_chat) {
+                // flush the splitter's tail (an unclosed reasoning span classifies as reasoning)
+                var rsn = ""
+                var cnt = ""
+                think_finish(w.think, rsn, cnt)
+                if (!empty(rsn)) {
+                    send_chat_chunk(srv, w.writer, w.id, w.created, "", "", "", rsn)
+                }
+                if (!empty(cnt)) {
+                    send_chat_chunk(srv, w.writer, w.id, w.created, "", cnt, "")
+                }
             }
             if (w.is_chat) {
                 send_chat_chunk(srv, w.writer, w.id, w.created, "", "", finish)
@@ -1955,19 +2039,22 @@ def private flush_events(srv : WebSocketServer) {   // nolint:STYLE037,STYLE038 
             close_writer(srv, w.writer)
         } elif (w.is_chat) {
             let full = join(w.reply_parts, "")
-            var content = full
+            var rsn = ""
+            var content = ""
             var finish = e.finish
             var calls : array<OaiToolCall>
             if (w.has_tools) {
-                content = parse_tool_calls_auto(full, w.call_open, w.call_close,
-                                                "call_{e.stream}", calls)
+                content = parse_wire_tools(w, full, "call_{e.stream}", rsn, calls)
                 if (!empty(calls)) {
                     finish = "tool_calls"
                 }
+            } else {
+                content = split_wire_reasoning(w, full, rsn)
             }
             var out = OaiChatResponse(id = w.id, _object = "chat.completion", created = w.created, model = cur_name())
             out.choices |> emplace(OaiChoice(index = 0,
                                              message <- OaiMessage(role = "assistant", content = content,
+                                                                   reasoning_content = rsn,
                                                                    tool_calls <- calls),
                                              finish_reason = finish))
             out.usage = OaiUsage(prompt_tokens = e.n_prompt, completion_tokens = e.n_gen,
@@ -2237,7 +2324,8 @@ let private CONFIG_KEY_KINDS <- {
     "gpu_dense" => "b", "gpu_vram_mb" => "i", "asr" => "s", "mmproj" => "s", "asr_workers" => "i",
     "ctx" => "i", "max_tokens" => "i", "streams" => "i", "threads" => "i", "team_dispatch" => "s",
     "affinity" => "i", "chunk" => "i", "page_rows" => "i", "prefix" => "i", "flat" => "b",
-    "mtp" => "b", "lcpp_bin" => "s", "models" => "a"
+    "mtp" => "b", "lcpp_bin" => "s", "models" => "a",
+    "exchange_url" => "s", "exchange_accept" => "s", "exchange_submit" => "s"
 }
 
 let private MODEL_KEY_KINDS <- {
@@ -2504,6 +2592,115 @@ def private handle_config_save(var req : HttpRequest?; var resp : HttpResponse?)
     }
     to_log(LOG_INFO, "dasllama-server: authoritative config saved to {g_config_save_path} ({length(toml)} bytes)\n")
     return resp |> JSON("\{\"saved\":{json_str(g_config_save_path)},\"restart_required\":true}", http_status.OK)
+}
+
+// ===== the exchange surface (GET /exchange + the apply/submit/retune levers) =====
+
+def private exchange_policy_now : ExchangePolicy {
+    // the save path covers every start shape: --config, auto-discovered, and config-less
+    // (where the file may not exist yet and the baked defaults stand)
+    return exchange_policy_from_config(g_config_save_path)
+}
+
+// The exchange control routes are an operator surface reached through the loopback control
+// page. The matching route does a blocking network call on the tick thread; apply/retune are
+// destructive; submit publishes. Gate them to the loopback peer so a LAN client (the inference
+// API deliberately binds every interface) cannot stall generation or trigger those actions.
+def private is_loopback_req(req : HttpRequest?) : bool {
+    let ip = client_ip(req)
+    // an unknown/empty peer counts as remote (fail closed, like the ladder's is_loopback_peer):
+    // this service binds every interface, so a LAN caller must not slip through on an unresolved peer
+    let loopback = ip == "127.0.0.1" || ip == "::1" || ip == "::ffff:127.0.0.1"
+    return loopback && same_origin_or_headerless(req)
+}
+
+// CSRF guard for the operator routes: allow_cors() is global and the peer is 127.0.0.1 for ANY
+// local browser, so a page the operator merely visits could POST to the destructive routes. Accept
+// only a same-origin request (the control page is served from here) or a header-less CLI client.
+def private same_origin_or_headerless(req : HttpRequest?) : bool {
+    let origin = get_header(req, "Origin")
+    if (empty(origin)) {
+        return true   // curl/CLI and same-origin navigations send no Origin; only a cross-site POST does
+    }
+    let sep = find(origin, "://")
+    let authority = sep >= 0 ? slice(origin, sep + 3) : origin
+    return authority == get_header(req, "Host")
+}
+
+// the forbidden reply shared by every operator/control route (the public inference API stays open)
+def private deny_operator(var resp : HttpResponse?) : http_status {
+    return resp |> JSON(error_body("loopback-only (operator surface)", "forbidden"), http_status.FORBIDDEN)
+}
+
+def private handle_exchange_get(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+    if (!is_loopback_req(req)) {
+        // the status carries the local sidecar path (username in it) — operator-only, like the rest
+        return resp |> JSON(error_body("loopback-only (operator surface)", "forbidden"), http_status.FORBIDDEN)
+    }
+    return resp |> JSON(exchange_status_json(exchange_policy_now()))
+}
+
+def private handle_exchange_matches(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+    if (!is_loopback_req(req)) {
+        return resp |> JSON(error_body("loopback-only (operator surface)", "forbidden"), http_status.FORBIDDEN)
+    }
+    // a live exchange lookup — seconds on the tick thread; the page requests it explicitly
+    return resp |> JSON(exchange_matches_json(exchange_policy_now()))
+}
+
+def private handle_exchange_apply(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+    if (!is_loopback_req(req)) {
+        return resp |> JSON(error_body("loopback-only (operator surface)", "forbidden"), http_status.FORBIDDEN)
+    }
+    var jerr = ""
+    var js = read_json(string(req.body), jerr)
+    defer() {
+        unsafe {
+            delete js
+        }
+    }
+    let sha : string = js?["sha"] ?? ""
+    if (empty(sha)) {
+        return resp |> JSON(error_body("body must carry the sidecar sha", "invalid_request_error"), http_status.BAD_REQUEST)
+    }
+    // the listing box the page picked: passed through so the downloaded sidecar is verified to
+    // match what the exchange listed — the same lying-exchange gate the boot resolver applies
+    let box : string = js?["box"] ?? ""
+    let err = exchange_fetch_and_apply(exchange_policy_now().url, sha, tune_manifest_path(), box)
+    if (!empty(err)) {
+        return resp |> JSON(error_body(err, "invalid_request_error"), http_status.BAD_REQUEST)
+    }
+    to_log(LOG_INFO, "dasllama-server: exchange sidecar {sha} applied via the control page; draining for restart\n")
+    g_shutdown_requested = true
+    g_restart_requested = true
+    return resp |> JSON("\{\"ok\":true,\"restarting\":true}", http_status.OK)
+}
+
+def private handle_exchange_submit(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+    if (!is_loopback_req(req)) {
+        return resp |> JSON(error_body("loopback-only (operator surface)", "forbidden"), http_status.FORBIDDEN)
+    }
+    let err = exchange_submit_current(exchange_policy_now())
+    if (!empty(err)) {
+        return resp |> JSON(error_body(err, "invalid_request_error"), http_status.BAD_REQUEST)
+    }
+    to_log(LOG_INFO, "dasllama-server: this box's tune submitted to the exchange\n")
+    return resp |> JSON("\{\"ok\":true}", http_status.OK)
+}
+
+def private handle_exchange_retune(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+    if (!is_loopback_req(req)) {
+        return resp |> JSON(error_body("loopback-only (operator surface)", "forbidden"), http_status.FORBIDDEN)
+    }
+    let err = exchange_request_retune()
+    if (!empty(err)) {
+        // the marker write failed and the sidecar is untouched — do NOT drain/restart
+        return resp |> JSON(error_body(err, "server_error"), http_status.INTERNAL_SERVER_ERROR)
+    }
+    to_log(LOG_INFO, "dasllama-server: re-tune armed (sidecar removed, exchange skipped once); draining for restart\n")
+    g_shutdown_requested = true
+    g_restart_requested = true
+    return resp |> JSON("\{\"ok\":true,\"restarting\":true,\"tune\":true}", http_status.OK)
 }
 
 def private emit_asr_event(events : Channel?; event : AsrEvent) {
@@ -2835,15 +3032,33 @@ class OpenAiServer : HvWebServer {
             return handle_vad(req, resp)
         }
         POST("/config") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!is_loopback_req(req)) return deny_operator(resp)
             return handle_config_save(req, resp)
         }
+        GET("/exchange") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            return handle_exchange_get(req, resp)
+        }
+        GET("/exchange/matches") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            return handle_exchange_matches(req, resp)
+        }
+        POST("/exchange/apply") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            return handle_exchange_apply(req, resp)
+        }
+        POST("/exchange/submit") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            return handle_exchange_submit(req, resp)
+        }
+        POST("/exchange/retune") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            return handle_exchange_retune(req, resp)
+        }
         POST("/bench") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!is_loopback_req(req)) return deny_operator(resp)
             return handle_bench_start(resp)
         }
         GET("/bench") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             return handle_bench_get(resp)
         }
         POST("/bake") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!is_loopback_req(req)) return deny_operator(resp)
             return handle_bake_start(req, resp)
         }
         GET("/bake") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
@@ -2853,6 +3068,7 @@ class OpenAiServer : HvWebServer {
             return handle_images(resp)
         }
         POST("/restart") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!is_loopback_req(req)) return deny_operator(resp)
             if (!g_shutdown_requested) {
                 to_log(
                     LOG_INFO,
@@ -2863,6 +3079,7 @@ class OpenAiServer : HvWebServer {
             return resp |> JSON("\{\"ok\":true,\"draining\":true,\"restarting\":true}", http_status.OK)
         }
         POST("/shutdown") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!is_loopback_req(req)) return deny_operator(resp)
             if (!g_shutdown_requested) {
                 to_log(
                     LOG_INFO,
@@ -2872,6 +3089,7 @@ class OpenAiServer : HvWebServer {
             return resp |> JSON("\{\"ok\":true,\"draining\":true}", http_status.OK)
         }
         POST("/gc") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (!is_loopback_req(req)) return deny_operator(resp)
             let coalesced = g_gc_requested
             g_gc_requested = true
             to_log(LOG_INFO, "dasllama-server: GC requested via POST /gc (coalesced={coalesced})\n")

@@ -383,39 +383,42 @@ def private sql_to_frags_ex(sql : string;
                             var orderedBinds : array<ExpressionPtr>;
                             var orderedInlineIds : array<ExpressionPtr>;
                             var out : array<SqlFrag>) {
-    var rest = sql
     var bindIdx = 0
     var idIdx = 0
-    while (true) {
-        let p = next_placeholder(rest)
-        if (p._0 < 0) break
-        if (p._1 == uint8('?')) {
-            if (bindIdx >= length(orderedBinds)) {
-                out |> push_text(rest |> slice(0, p._0 + 1))
-                rest = rest |> slice(p._0 + 1)
-                continue
+    peek_data(sql) $(d) {
+        let n = length(d)
+        var rest = 0     // start of the not-yet-emitted text run
+        while (true) {
+            let p = next_placeholder(d, rest)
+            if (p._0 < 0) break
+            if (p._1 == uint8('?')) {
+                if (bindIdx >= length(orderedBinds)) {
+                    out |> push_text(slice(d, rest, p._0 + 1))
+                    rest = p._0 + 1
+                    continue
+                }
+                if (p._0 > rest) {
+                    out |> push_text(slice(d, rest, p._0))
+                }
+                out |> push_bind(orderedBinds[bindIdx])
+                bindIdx++
+            } else {
+                if (idIdx >= length(orderedInlineIds)) {
+                    out |> push_text(slice(d, rest, p._0 + 1))
+                    rest = p._0 + 1
+                    continue
+                }
+                if (p._0 > rest) {
+                    out |> push_text(slice(d, rest, p._0))
+                }
+                out |> push_inline_id(orderedInlineIds[idIdx])
+                idIdx++
             }
-            if (p._0 > 0) {
-                out |> push_text(rest |> slice(0, p._0))
-            }
-            out |> push_bind(orderedBinds[bindIdx])
-            bindIdx++
-        } else {
-            if (idIdx >= length(orderedInlineIds)) {
-                out |> push_text(rest |> slice(0, p._0 + 1))
-                rest = rest |> slice(p._0 + 1)
-                continue
-            }
-            if (p._0 > 0) {
-                out |> push_text(rest |> slice(0, p._0))
-            }
-            out |> push_inline_id(orderedInlineIds[idIdx])
-            idIdx++
+            rest = p._0 + 1
         }
-        rest = rest |> slice(p._0 + 1)
-    }
-    if (!empty(rest)) {
-        out |> push_text(rest)
+        if (rest < n) {
+            out |> push_text(slice(d, rest, n))
+        }
     }
 }
 
@@ -2221,6 +2224,35 @@ def private try_join_null_probe(var node : ExpressionPtr; q : SqlQuery;
     }
 }
 
+// alias / fragment / type for a plain source column. Parallel arrays are always populated -
+// the emitter discriminates on emptiness, not on q.seenJoin.
+def private push_source_column(var q : SqlQuery; srcIdx : int; fieldName : string) : void {
+    q.selectColAliases |> push(source_alias_for_idx(q, srcIdx))
+    q.selectColSqlFragments |> push("")
+    let srcType = source_rootType_for_idx(q, srcIdx)
+    q.selectColTypes |> push(lookup_struct_field_type(srcType, fieldName))
+}
+
+// the five parallel projection arrays grow together; reserve them in one place
+def private reserve_projection(var q : SqlQuery; n : int) : void {
+    q.selectCols |> reserve(n)
+    q.selectColAliases |> reserve(n)
+    q.selectColTypes |> reserve(n)
+    q.selectColSqlFragments |> reserve(n)
+    q.projRecordNames |> reserve(n)
+}
+
+// outer-to-inner access chain as a column-out JSON path, dropping the column name itself
+def private reversed_json_path(chain : array<string>) : array<string> {
+    let nChain = length(chain)
+    var jsonPath : array<string>
+    jsonPath |> reserve(nChain - 1)
+    for (i in range(nChain - 1)) {
+        jsonPath |> push(chain[nChain - 2 - i])
+    }
+    return <- jsonPath
+}
+
 [macro_function]
 def private try_recognize_json_path_proj(val : ExpressionPtr; var q : SqlQuery&;
                                          var outFrag : string&; var outLeafType : TypeDeclPtr&;
@@ -2264,11 +2296,7 @@ def private try_recognize_json_path_proj(val : ExpressionPtr; var q : SqlQuery&;
         return -1
     }
     if (!has_field_annotation(srcType, colName, "sql_json")) return 0
-    var jsonPath : array<string>
-    jsonPath |> reserve(nChain - 1)
-    for (i in range(nChain - 1)) {
-        jsonPath |> push(chain[nChain - 2 - i])
-    }
+    let jsonPath <- reversed_json_path(chain)
     var leaf = resolve_nested_field_type(srcType, colName, jsonPath)
     if (leaf == null) {
         macro_error(prog, at, "_sql: JSON path on @sql_json column '{colName}' walks into a field that isn't a struct/tuple member at depth {length(jsonPath)}")
@@ -2386,11 +2414,7 @@ def private analyze_projection_impl(var body : ExpressionPtr; var q : SqlQuery&;
         q.selectColTypes |> clear
         q.selectColSqlFragments |> clear
         q.projRecordNames |> clear
-        q.selectCols |> reserve(n)
-        q.selectColAliases |> reserve(n)
-        q.selectColTypes |> reserve(n)
-        q.selectColSqlFragments |> reserve(n)
-        q.projRecordNames |> reserve(n)
+        reserve_projection(q, n)
         let sourceAlias = source_alias_for_idx(q, srcIdx)
         for (field in srcType.structType.fields) {
             let fieldName = string(field.name)
@@ -2451,10 +2475,7 @@ def private analyze_projection_impl(var body : ExpressionPtr; var q : SqlQuery&;
             q.selectColSqlFragments |> clear
             q.selectCols |> push(fieldName)
             // Parallel arrays always populated — emitter discriminates on emptiness, not q.seenJoin.
-            q.selectColAliases |> push(source_alias_for_idx(q, srcIdx))
-            q.selectColSqlFragments |> push("")
-            let srcType = source_rootType_for_idx(q, srcIdx)
-            q.selectColTypes |> push(lookup_struct_field_type(srcType, fieldName))
+            push_source_column(q, srcIdx, fieldName)
             q.proj = ProjectionShape.SingleColumn
             return true
         }
@@ -2507,10 +2528,7 @@ def private analyze_projection_impl(var body : ExpressionPtr; var q : SqlQuery&;
                     if (srcIdx < 0) return false
                     q.selectCols |> push(fieldName)
                     q.projRecordNames |> push(string(tupT.argNames[i]))
-                    q.selectColAliases |> push(source_alias_for_idx(q, srcIdx))
-                    q.selectColSqlFragments |> push("")
-                    let srcType = source_rootType_for_idx(q, srcIdx)
-                    q.selectColTypes |> push(lookup_struct_field_type(srcType, fieldName))
+                    push_source_column(q, srcIdx, fieldName)
                     continue
                 }
                 // is_some / is_none on a LEFT JOIN's Option<TB> arg → bool computed projection.
@@ -2820,11 +2838,7 @@ def private analyze_global_aggregate_projection(var aggregateLambda : Expression
     q.projRecordNames |> clear
     q.projBindExprs |> clear
     let n = length(mkTup.values)
-    q.selectCols |> reserve(n)
-    q.selectColAliases |> reserve(n)
-    q.selectColTypes |> reserve(n)
-    q.selectColSqlFragments |> reserve(n)
-    q.projRecordNames |> reserve(n)
+    reserve_projection(q, n)
     for (i in range(n)) {
         var sqlFrag : string
         var resultType : TypeDeclPtr
@@ -3504,11 +3518,7 @@ def private pred_to_sql(var node : ExpressionPtr; var q : SqlQuery&; prog : Prog
                     if (has_field_annotation(srcType, colName, "sql_blob")) return pred_fail(q, prog, at, "_sql: cannot descend into @sql_blob column '{colName}'; filter in daslang after round-trip, or use raw SQL")
                     if (has_field_annotation(srcType, colName, "sql_json")) {
                         // Reverse outer-to-inner chain into column-out path (drop the column name).
-                        var jsonPath : array<string>
-                        jsonPath |> reserve(nChain - 1)
-                        for (i in range(nChain - 1)) {
-                            jsonPath |> push(chain[nChain - 2 - i])
-                        }
+                        let jsonPath <- reversed_json_path(chain)
                         // Validate every path segment — the typer never sees `_where`'s lambda body so silent NULL-on-typo is the failure mode.
                         let leaf = resolve_nested_field_type(srcType, colName, jsonPath)
                         if (leaf == null) return pred_fail(q, prog, at, "_sql: JSON path on @sql_json column '{colName}' walks into a field that isn't a struct/tuple member at depth {length(jsonPath)}")
@@ -4122,40 +4132,35 @@ def private is_none_call(node : ExpressionPtr) : bool {
 }
 
 [macro_function]
-def private next_bind_placeholder(sql : string) : int {
-    return next_placeholder(sql)._0
+def private next_bind_placeholder(bytes : array<uint8> const implicit; from : int) : int {
+    return next_placeholder(bytes, from)._0
 }
 
-// Walks the SQL string honoring single-quote literals; returns (position, marker).
-// Markers: '?' = bind, '\x01' = runtime inline_id (column name supplied at runtime).
+// Walks the SQL bytes from `from` honoring single-quote literals; returns (position, marker).
+// Markers: '?' = bind, '\x01' = runtime inline_id. `from` always resumes just past a placeholder,
+// which is only ever found outside a literal, so the scan starts with no quote open.
 [macro_function]
-def private next_placeholder(sql : string) : tuple<int; uint8> {
-    var found_pos = -1
-    var found_ch = uint8(0)
-    peek_data(sql) $(bytes) {
-        let n = length(bytes)
-        var i = 0
-        var in_quote = false
-        while (i < n) {
-            let ch = int(bytes[i])
-            if (ch == '\'') {
-                if (in_quote && i + 1 < n && int(bytes[i + 1]) == '\'') {
-                    i += 2
-                    continue
-                }
-                in_quote = !in_quote
-                i++
+def private next_placeholder(bytes : array<uint8> const implicit; from : int) : tuple<int; uint8> {
+    let n = length(bytes)
+    var i = from
+    var in_quote = false
+    while (i < n) {
+        let ch = int(bytes[i])
+        if (ch == '\'') {
+            if (in_quote && i + 1 < n && int(bytes[i + 1]) == '\'') {
+                i += 2
                 continue
             }
-            if (!in_quote && (ch == '?' || ch == 0x01)) {
-                found_pos = i
-                found_ch = uint8(ch)
-                return
-            }
+            in_quote = !in_quote
             i++
+            continue
         }
+        if (!in_quote && (ch == '?' || ch == 0x01)) {
+            return (i, uint8(ch))
+        }
+        i++
     }
-    return (found_pos, found_ch)
+    return (-1, uint8(0))
 }
 
 [macro_function]
@@ -4554,23 +4559,26 @@ class private SqlCreateViewMacro : AstCallMacro {
         let select_sql_template = build_sql_string(q)
         var sb = new ExprStringBuilder(at = call.at)
         var pending = "CREATE VIEW \"{view_name}\"({col_list}) AS "
-        var rest = select_sql_template
         var bind_idx = 0
         // macro_function: short-burst string accumulation, flushed into ExprConstString nodes
-        while (true) {
-            let pos = next_bind_placeholder(rest)
-            if (pos < 0) {
-                pending += rest // nolint:PERF001
-                break
+        peek_data(select_sql_template) $(d) {
+            let n = length(d)
+            var rest = 0     // start of the not-yet-emitted text run
+            while (true) {
+                let pos = next_bind_placeholder(d, rest)
+                if (pos < 0) {
+                    pending += slice(d, rest, n) // nolint:PERF001,LINT019 - PERF001 is blind inside a block body, so its marker reads stale
+                    break
+                }
+                pending += slice(d, rest, pos) // nolint:PERF001,LINT019 - PERF001 is blind inside a block body, so its marker reads stale
+                if (!empty(pending)) {
+                    sb.elements |> push <| new ExprConstString(at = call.at, value := pending)
+                    pending = ""
+                }
+                sb.elements |> push <| qmacro(_::to_sql_literal($e(ordered_binds[bind_idx])))
+                rest = pos + 1
+                bind_idx++
             }
-            pending += rest |> slice(0, pos) // nolint:PERF001
-            if (!empty(pending)) {
-                sb.elements |> push <| new ExprConstString(at = call.at, value := pending)
-                pending = ""
-            }
-            sb.elements |> push <| qmacro(_::to_sql_literal($e(ordered_binds[bind_idx])))
-            rest = rest |> slice(pos + 1)
-            bind_idx++
         }
         if (!empty(pending)) {
             sb.elements |> push <| new ExprConstString(at = call.at, value := pending)

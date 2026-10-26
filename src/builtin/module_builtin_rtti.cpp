@@ -395,7 +395,8 @@ namespace das {
         ft->argNames = {
             "builtIn", "promoted", "isPublic", "isModule", "isSolidContext",
             "fromExtraDependency", "doNotAllowUnsafe",
-            "wasParsedNameless", "visibleEverywhere", "allowPodInscope"
+            "wasParsedNameless", "visibleEverywhere", "allowPodInscope",
+            "neverInline"
         };
         return ft;
     }
@@ -540,6 +541,7 @@ namespace das {
             addField<DAS_BIND_MANAGED_FIELD(totalVariables)>("totalVariables");
             addField<DAS_BIND_MANAGED_FIELD(globalStringHeapSize)>("globalStringHeapSize");
             addField<DAS_BIND_MANAGED_FIELD(initSemanticHashWithDep)>("initSemanticHashWithDep");
+            addField<DAS_BIND_MANAGED_FIELD(visitBuiltinFunctions)>("visitBuiltinFunctions");
             addFieldEx ( "flags", "flags", offsetof(Program, flags), makeProgramFlags() );
             addProperty<DAS_BIND_MANAGED_PROP(getThisModule)>("getThisModule");
             addProperty<DAS_BIND_MANAGED_PROP(getDebugger)>("getDebugger");
@@ -924,7 +926,6 @@ namespace das {
             addField<DAS_BIND_MANAGED_FIELD(aot)>("aot");
             addField<DAS_BIND_MANAGED_FIELD(aot_lib)>("aot_lib");
             addField<DAS_BIND_MANAGED_FIELD(paranoid_validation)>("paranoid_validation");
-            addField<DAS_BIND_MANAGED_FIELD(validate_ast)>("validate_ast");
             addField<DAS_BIND_MANAGED_FIELD(cross_platform)>("cross_platform");
             addField<DAS_BIND_MANAGED_FIELD(standalone_context)>("standalone_context");
             addField<DAS_BIND_MANAGED_FIELD(aot_module)>("aot_module");

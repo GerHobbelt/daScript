@@ -99,6 +99,29 @@ small-model run joins it. Small-tier warnings for kernels whose carriers sit abo
 the served-count floor is asserted only on family-unfiltered runs. The vulkan half here is
 the device-free rail unit; the serving vulkan census runs on the PC box.
 
+## Model-free / no-arm tests
+
+Suite-less files run under plain dastest (still `-jit`) — no arm, no family tag, no runner.
+New suite-less files register on this note (CODEREVIEW: "A new file under `tests/` registers
+in `tests/CLAUDE.md`"); suite members register in their suite's arm list via `run.das` instead.
+Current note: `test_think_split.das` — the reply-side reasoning matcher, model-free: every
+thinking family's wire shape, whole-string and per-chunk down to 1 byte.
+`test_tool_formats.das` — the per-ToolMode wire codecs (dasllama_tools), model-free: defs
+serializers and call parsers for harmony/gemma4/mistral/llama_json against verbatim fixtures.
+`test_scheduler.das` — the continuous-batching scheduler (dasllama_scheduler) against
+`generate()` references; skips honestly without SmolLM2-135M / the MTP fixture, `-jit` only.
+`test_program_roots.das` — model-free: every dasllama program root (tutorials, examples,
+server tools) declares `options stack = 524288`, and every model-loading root declares its
+prefill intent.
+`test_asr_verbs.das` — model-free: the family-owned ASR facade verbs (`asr_exec_fmt` /
+`asr_encode_bucket`) over constructed structs, parakeet's SPM detokenizer over a toy vocab, and
+the `fetch_models.das` provenance-manifest invariants.
+`test_run_summary.das` — model-free: `run.das`'s own `log_summary` log scraper (last marker line
+wins, end of file closes an unterminated final line, doubled marker yields one line), fed
+synthetic log files from a per-process temp dir. Requires `run` by bare same-dir name.
+`test_tok_seed.das` — model-free: `lcpp_bench.das`'s `tok_read_seed` corpus-header walk, required
+by relative path (`../benchmarks/lcpp_bench.das`), so it pays the bench's full engine compile.
+
 ## Model loads — never the image rail (CODEREVIEW: "A test suite loads models with load_model_")
 
 Suites load models with `load_model_` (the direct gguf load) — never `load_model` /
@@ -175,3 +198,10 @@ FORCED-FEED logits-tolerance form (the k4 freeform cell, cached stream `gen_free
 token equality. For that form the cache is a FEED, not a truth: both sides force through the
 same tokens, so a stale feed stays a valid instrument and the stale-cache red class does not
 exist for it. Counting cells stay token-exact.
+
+## Standalone schema tests (model-free)
+
+`test_bench_records_schema.das` (the record store: round-trip, upsert identity, annotations)
+and `test_exchange_schema.das` (the exchange validator: sweeps the ENTIRE in-tree
+records/sidecar corpus, so a writer-schema change reds here first) run directly under dastest
+with `-jit` — no runner, no arms, no models.

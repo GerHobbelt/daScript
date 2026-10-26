@@ -36,57 +36,6 @@ namespace das {
         return false;
     }
 
-#define VERIFY_GENERATED    0
-#define LOG_GENERATED       0
-
-    struct CheckLineInfoVisitor : Visitor {
-        virtual void preVisitExpression ( Expression * expr ) override {
-            Visitor::preVisitExpression(expr);
-            if ( expr->rtti_isFakeContext() || expr->rtti_isFakeLineInfo() ) return;
-            DAS_ASSERT(expr->at.column && expr->at.line);
-        }
-        virtual void preVisit ( Structure * var ) override {
-            Visitor::preVisit(var);
-            DAS_ASSERT(var->at.column && var->at.line);
-        }
-        virtual void preVisitStructureField ( Structure * var, Structure::FieldDeclaration & decl, bool last ) override {
-            Visitor::preVisitStructureField(var,decl,last);
-            DAS_ASSERT(decl.at.column && decl.at.line);
-        }
-        virtual void preVisitLet ( ExprLet * expr, const VariablePtr & var, bool last ) override {
-            Visitor::preVisitLet(expr,var,last);
-            DAS_ASSERT(var->at.column && var->at.line);
-            DAS_ASSERT(expr->atInit.line);
-        }
-        virtual void preVisitGlobalLet ( const VariablePtr & var ) override {
-            Visitor::preVisitGlobalLet(var);
-            DAS_ASSERT(var->at.column && var->at.line);
-        }
-        virtual void preVisit ( Function * fn ) override {
-            Visitor::preVisit(fn);
-            DAS_ASSERT(fn->at.column && fn->at.line);
-            DAS_ASSERT(fn->atDecl.column && fn->atDecl.line);
-        }
-        virtual void preVisitArgument ( Function * fn, const VariablePtr & var, bool lastArg ) override {
-            Visitor::preVisitArgument(fn, var, lastArg);
-            DAS_ASSERT(var->at.column && var->at.line);
-        }
-        virtual void preVisitBlockArgument ( ExprBlock * block, const VariablePtr & var, bool lastArg ) override {
-            Visitor::preVisitBlockArgument(block, var, lastArg);
-            DAS_ASSERT(var->at.column && var->at.line);
-        }
-    };
-
-    void verifyGenerated ( ExpressionPtr expr ) {
-        (void)expr;
-#if LOG_GENERATED
-        LOG(LogLevel::trace) << "VERIFY:\n" << *expr << "\n";
-#endif
-#if VERIFY_GENERATED
-        CheckLineInfoVisitor vis;
-        expr->visit(vis);
-#endif
-    }
 
     ExpressionPtr genComment ( const string & comment ) {
         auto call = new ExprCall(LineInfo(), "print");
@@ -129,9 +78,11 @@ namespace das {
         pVar->at = expr->at;
         pVar->name = compName;
         pVar->type = new TypeDecl(Type::tArray);
+        pVar->type->at = expr->at;
         pVar->type->constant = false;
         pVar->type->removeConstant = true;
         pVar->type->firstType = new TypeDecl(*expr->subexpr->type);
+        pVar->type->firstType->at = expr->at;
         pVar->type->firstType->ref = false;
         pVar->type->firstType->constant = false;
         if ( expr->subexpr->type->isPointer() && expr->subexpr->type->constant ) {
@@ -255,9 +206,9 @@ namespace das {
     }
 
     /* a->b(args) is short for invoke(a.b, cast<auto> deref(a), args)  */
-    ExprInvoke * makeInvokeMethod ( const LineInfo & at, Expression * a, const string & b ) {
+    ExprInvoke * makeInvokeMethod ( const LineInfo & at, Expression * a, const string & b, bool no_promo ) {
         auto pInvoke = new ExprInvoke(at, "invoke");
-        auto pAt = new ExprField(at, a, b);
+        auto pAt = new ExprField(at, a, b, no_promo);
         pInvoke->arguments.push_back(pAt);
         pInvoke->isInvokeMethod = true;
         auto pTypeAuto = new ExprTypeDecl(at, new TypeDecl(Type::autoinfer));
@@ -317,6 +268,7 @@ namespace das {
         fn->name = str->name;
         fn->at = fn->atDecl = str->at;
         fn->result = new TypeDecl(str);
+        fn->result->at = str->at;
         if ( str->isClass ) {
             fn->isClassMethod = true;
             fn->classParent = str;
@@ -347,6 +299,7 @@ namespace das {
             makeT->useInitializer = true;
             makeT->nativeClassInitializer = true;
             makeT->makeType = new TypeDecl(str);
+            makeT->makeType->at = str->at;
             makeT->structs.push_back(new MakeStruct());
             auto letS = new ExprLet();
             letS->at = str->at;
@@ -354,6 +307,7 @@ namespace das {
             letS->visibility = str->at;
             letS->alwaysSafe = true;    // local class variable
             auto argT = new TypeDecl(str);
+            argT->at = str->at;
             argT->constant = false;
             auto argV = new Variable();
             argV->name = "self";
@@ -385,13 +339,13 @@ namespace das {
                 }
             }
             makeT->makeType = new TypeDecl(str);
+            makeT->makeType->at = str->at;
             makeT->structs.push_back(new MakeStruct());
             auto returnDecl = new ExprReturn(str->at,makeT);
             returnDecl->moveSemantics = true;
             block->list.push_back(returnDecl);
         }
         fn->body = block;
-        verifyGenerated(fn->body);
         return fn;
     }
 
@@ -403,11 +357,13 @@ namespace das {
         auto varA = new Variable();
         varA->name = "a";
         varA->type = new TypeDecl(str);
+        varA->type->at = str->at;
         varA->type->isExplicit = true;
         varA->at = str->at;
         auto varB = new Variable();
         varB->name = "b";
         varB->type = new TypeDecl(str);
+        varB->type->at = str->at;
         varB->type->constant = str->canCloneFromConst();    // allow to clone from const
         varB->type->implicit = true;
         varB->at = str->at;
@@ -418,6 +374,7 @@ namespace das {
         fn->privateFunction = true;
         fn->at = fn->atDecl = str->at;
         fn->result = new TypeDecl();
+        fn->result->at = str->at;
         fn->arguments.push_back(varA);
         fn->arguments.push_back(varB);
         auto block = new ExprBlock();
@@ -431,7 +388,6 @@ namespace das {
             block->list.push_back(cl);
         }
         fn->body = block;
-        verifyGenerated(fn->body);
         return fn;
     }
 
@@ -463,6 +419,7 @@ namespace das {
             vsiz->at = at;
             vsiz->name = "__size";
             vsiz->type = new TypeDecl(Type::autoinfer);
+            if ( !vsiz->type->at.fileInfo ) vsiz->type->at = vsiz->at;
             vsiz->type->constant = true;
             auto crs = new ExprCall(at,"class_rtti_size");
             crs->arguments.push_back(new ExprVar(at,"__this"));
@@ -508,10 +465,13 @@ namespace das {
         fb->list.push_back(ife);
         pFunc->body = fb;
         pFunc->result = new TypeDecl(Type::tVoid);
+        pFunc->result->at = pFunc->at;
         auto cTHIS = new Variable();
         cTHIS->name = "__this";
         cTHIS->at = at;
         cTHIS->type = new TypeDecl(*ptrType);
+        if ( !cTHIS->type->at.fileInfo ) cTHIS->type->at = at;
+        if ( cTHIS->type->firstType && !cTHIS->type->firstType->at.fileInfo ) cTHIS->type->firstType->at = at;
         cTHIS->type->constant = false;
         cTHIS->type->removeConstant = true;
         cTHIS->type->ref = true;
@@ -519,7 +479,6 @@ namespace das {
         cTHIS->type->isExplicit = true;
         pFunc->arguments.push_back(cTHIS);
         wrapInUnsafe(pFunc);
-        verifyGenerated(pFunc->body);
         return pFunc;
     }
 
@@ -571,7 +530,9 @@ namespace das {
         }
         if ( chainParent ) {
             auto chthis = new ExprVar(ls->at, "__this");
-            auto chcast = new ExprCast(ls->at, chthis, new TypeDecl(chainParent));
+            auto chparT = new TypeDecl(chainParent);
+            chparT->at = ls->at;
+            auto chcast = new ExprCast(ls->at, chthis, chparT);
             auto chdel = new ExprDelete(ls->at, chcast);
             chdel->alwaysSafe = true;
             fb->list.push_back(chdel);
@@ -582,16 +543,17 @@ namespace das {
         fb->list.push_back(mz);
         pFunc->body = fb;
         pFunc->result = new TypeDecl(Type::tVoid);
+        pFunc->result->at = pFunc->at;
         auto cTHIS = new Variable();
         cTHIS->at = ls->at;
         cTHIS->name = "__this";
         cTHIS->type = new TypeDecl(ls);
+        cTHIS->type->at = ls->at;
         cTHIS->type->isExplicit = true;
         pFunc->arguments.push_back(cTHIS);
         if ( needUnsafe ) {
             wrapInUnsafe(pFunc);
         }
-        verifyGenerated(pFunc->body);
         return pFunc;
     }
 
@@ -644,15 +606,17 @@ namespace das {
         fb->list.push_back(delit1);
         // function goo
         pFunc->result = new TypeDecl(Type::tVoid);
+        pFunc->result->at = pFunc->at;
         auto cTHIS = new Variable();
         cTHIS->at = ls->at;
         cTHIS->name = "__this";
         cTHIS->type = new TypeDecl(Type::tPointer);
+        cTHIS->type->at = ls->at;
         cTHIS->type->firstType = new TypeDecl(ls);
+        cTHIS->type->firstType->at = ls->at;
         cTHIS->type->isExplicit = true;
         pFunc->arguments.push_back(cTHIS);
         // wrapInUnsafe(pFunc);
-        verifyGenerated(pFunc->body);
         return pFunc;
     }
 
@@ -675,7 +639,6 @@ namespace das {
             cA->marked_used = true;
             pFunc->arguments.push_back(cA);
         }
-        verifyGenerated(pFunc->body);
         return pFunc;
     }
 
@@ -722,11 +685,13 @@ namespace das {
         fb->list.push_back(with);
         pFunc->body = fb;
         pFunc->result = new TypeDecl(*block->type);
+        if ( !pFunc->result->at.fileInfo ) pFunc->result->at = block->at;
         auto cTHIS = new Variable();
         cTHIS->generated = true;
         cTHIS->at = block->at;
         cTHIS->name = "__this";
         cTHIS->type = new TypeDecl(ls);
+        cTHIS->type->at = ls->at;
         cTHIS->type->isExplicit = true;
         pFunc->arguments.push_back(cTHIS);
         for ( auto & arg : block->arguments ) {
@@ -752,7 +717,6 @@ namespace das {
             }
             return true;
         },"*");
-        verifyGenerated(pFunc->body);
         return pFunc;
     }
 
@@ -765,27 +729,34 @@ namespace das {
         pStruct->isLambda = true;
         pStruct->at = block->at;
         auto btd = block->makeBlockType();
+        if ( !btd->at.fileInfo ) btd->at = block->at;
         btd->baseType = Type::tFunction;
         btd->constant = false;
         auto thisArg = new TypeDecl(pStruct);
+        thisArg->at = block->at;
         btd->argTypes.insert(btd->argTypes.begin(), thisArg);
         btd->argNames.insert(btd->argNames.begin(), "__this");
         pStruct->fields.emplace_back("__lambda", btd, nullptr, AnnotationArgumentList(), false, block->at);
         pStruct->fields.back().generated = true;
         pStruct->fields.back().type->sanitize();
         auto finFunc = new TypeDecl(Type::tFunction);
+        finFunc->at = block->at;
         auto finArg = new TypeDecl(Type::tPointer);
+        finArg->at = block->at;
         finArg->firstType = new TypeDecl(pStruct);
+        finArg->firstType->at = block->at;
         finArg->constant = false;
         finArg->removeConstant = true;
         finFunc->argTypes.push_back(finArg);
         finFunc->argNames.push_back("__this");
         finFunc->firstType = new TypeDecl(Type::tVoid);
+        finFunc->firstType->at = block->at;
         pStruct->fields.emplace_back("__finalize", finFunc, nullptr, AnnotationArgumentList(), false, block->at);
         pStruct->fields.back().generated = true;
         pStruct->fields.back().type->sanitize();
         if ( needYield ) {
             auto yt = new TypeDecl(Type::tInt);
+            yt->at = block->at;
             pStruct->fields.emplace_back("__yield", yt, nullptr, AnnotationArgumentList(), false, block->at);
             auto & fldb = pStruct->fields.back();
             fldb.generated = true;
@@ -793,6 +764,7 @@ namespace das {
         }
         for ( auto var : capt ) {
             auto td = new TypeDecl(*var->type);
+            if ( !td->at.fileInfo ) td->at = var->at;
             td->constant = false;
             CaptureMode mode = CaptureMode::capture_any;
             auto it = find_if ( capture.begin(), capture.end(), [&] ( const auto & entry ){
@@ -805,6 +777,7 @@ namespace das {
                 td->ref = false;
                 td->constant = var->type->constant;
                 auto ptd = new TypeDecl(Type::tPointer);
+                ptd->at = var->at;
                 ptd->firstType = td;
                 td = ptd;
                 pStruct->fields.emplace_back(var->name, td, nullptr, AnnotationArgumentList(), false, var->at);
@@ -829,6 +802,9 @@ namespace das {
     ExpressionPtr generateLambdaMakeStruct ( const StructurePtr & ls, const FunctionPtr & lf, const FunctionPtr & lff,
                                             const safe_var_set & capt, const vector<CaptureEntry> & capture,
                                             const LineInfo & at, const LineInfo & captureAt, Program * thisProgram ) {
+        // captureAt is the explicit capture(...) clause; a lambda or comprehension without
+        // one has no such location, so its captures report at the construct that captures
+        const LineInfo & capAt = captureAt.fileInfo ? captureAt : at;
         auto asc = new ExprAscend();
         asc->at = at;
         asc->needTypeInfo = true;
@@ -836,6 +812,7 @@ namespace das {
         // makeS->useInitializer = true;
         makeS->at = at;
         makeS->makeType = new TypeDecl(ls);
+        makeS->makeType->at = at;
         auto ms = new MakeStruct();
         auto atTHIS = new ExprAddr(lf->at, "_::" + lf->name);
         // TODO: expand atTHIS->funcType, so that it points to correct function by type as well
@@ -853,12 +830,12 @@ namespace das {
                 mode = it->mode;
             }
             if ( isCaptureAsRef(cV) || mode==CaptureMode::capture_by_reference ) {
-                auto varV = new ExprVar(captureAt, cV->name);
+                auto varV = new ExprVar(capAt, cV->name);
                 varV->generated = true;     // capture machinery; captureAt is zero-width for implicit captures
-                auto addrV = new ExprRef2Ptr(captureAt, varV);
+                auto addrV = new ExprRef2Ptr(capAt, varV);
                 addrV->generated = true;
                 addrV->alwaysSafe = true;
-                auto mV = new MakeFieldDecl(captureAt, cV->name, addrV, false, false);
+                auto mV = new MakeFieldDecl(capAt, cV->name, addrV, false, false);
                 ms->push_back(mV);
             } else {
                 bool moveS = false;
@@ -869,9 +846,9 @@ namespace das {
                     case CaptureMode::capture_any:          moveS = !cV->type->canCopy(); break;
                     default: ;
                 }
-                auto varV = new ExprVar(captureAt, cV->name);
+                auto varV = new ExprVar(capAt, cV->name);
                 varV->generated = true;     // capture machinery; captureAt is zero-width for implicit captures
-                auto mV = new MakeFieldDecl(captureAt, cV->name, varV, moveS, cloneS);
+                auto mV = new MakeFieldDecl(capAt, cV->name, varV, moveS, cloneS);
                 ms->push_back(mV);
             }
             auto & lexpr = ms->back();
@@ -891,7 +868,6 @@ namespace das {
         asc->ascType->argTypes.erase(asc->ascType->argTypes.begin());
         asc->ascType->argNames.erase(asc->ascType->argNames.begin());
         asc->ascType->baseType = Type::tLambda;
-        verifyGenerated(asc);
         return asc;
     }
 
@@ -1166,7 +1142,6 @@ namespace das {
         auto lbx = new ExprLabel(expr->at, LabelX,
                                           "yield at line " + to_string(expr->at.line));
         blk->list.push_back(lbx);
-        verifyGenerated(blk);
         return blk;
     }
 
@@ -1227,7 +1202,6 @@ namespace das {
                 blk->list.push_back(mz);
             }
         }
-        verifyGenerated(blk);
         return blk;
     }
 
@@ -1287,7 +1261,6 @@ namespace das {
                                                 "end if at line " + to_string(expr->at.line));
             blk->list.push_back(enddl);
         }
-        verifyGenerated(blk);
         return blk;
     }
 
@@ -1337,6 +1310,7 @@ namespace das {
             bvar->at = expr->at;
             bvar->name = breakFlag;
             bvar->type = new TypeDecl(Type::tBool);
+            if ( !bvar->type->at.fileInfo ) bvar->type->at = bvar->at;
             bvar->init = new ExprConstBool(expr->at, false);
             leqt->variables.push_back(bvar);
             blk->list.push_back(leqt);
@@ -1352,6 +1326,8 @@ namespace das {
             rvar->at = expr->at;
             rvar->name = returnFlag;
             rvar->type = new TypeDecl(Type::tBool);
+            if ( !rvar->type->at.fileInfo ) rvar->type->at = rvar->at;
+            if ( !rvar->type->at.fileInfo ) rvar->type->at = rvar->at;
             rvar->init = new ExprConstBool(expr->at, false);
             leqt->variables.push_back(rvar);
             blk->list.push_back(leqt);
@@ -1365,6 +1341,7 @@ namespace das {
                 vvar->at = expr->at;
                 vvar->name = returnValueName;
                 vvar->type = new TypeDecl(*func->result);
+                if ( !vvar->type->at.fileInfo ) vvar->type->at = vvar->at;
                 vvar->type->constant = false;
                 vvar->type->explicitConst = false;
                 vvar->type->ref = false;
@@ -1425,7 +1402,6 @@ namespace das {
         auto ell = new ExprLabel(expr->at, end_loop_label,
                                           "end while at line " + to_string(expr->at.line));
         blk->list.push_back(ell);
-        verifyGenerated(blk);
         return blk;
     }
 
@@ -1490,6 +1466,7 @@ namespace das {
         lvar->at = expr->at;
         lvar->name = loopVar;
         lvar->type = new TypeDecl(Type::tBool);
+        if ( !lvar->type->at.fileInfo ) lvar->type->at = lvar->at;
         lvar->init = new ExprConstBool(expr->at, true);
         leqt->variables.push_back(lvar);
         blk->list.push_back(leqt);
@@ -1504,6 +1481,7 @@ namespace das {
             bvar->at = expr->at;
             bvar->name = breakFlag;
             bvar->type = new TypeDecl(Type::tBool);
+            if ( !bvar->type->at.fileInfo ) bvar->type->at = bvar->at;
             bvar->init = new ExprConstBool(expr->at, false);
             bleqt->variables.push_back(bvar);
             blk->list.push_back(bleqt);
@@ -1519,6 +1497,7 @@ namespace das {
             rvar->at = expr->at;
             rvar->name = returnFlag;
             rvar->type = new TypeDecl(Type::tBool);
+            if ( !rvar->type->at.fileInfo ) rvar->type->at = rvar->at;
             rvar->init = new ExprConstBool(expr->at, false);
             rleqt->variables.push_back(rvar);
             blk->list.push_back(rleqt);
@@ -1558,6 +1537,8 @@ namespace das {
                 svar->at = expr->at;
                 svar->name = srcName + "_temp_var";
                 svar->type = new TypeDecl(Type::autoinfer);
+            svar->type->at = svar->at;
+                svar->type->at = svar->at;
                 svar->init_via_move = true;
                 svar->init = src->clone();
                 tempLet->variables.push_back(svar);
@@ -1573,6 +1554,7 @@ namespace das {
             svar->at = expr->at;
             svar->name = srcName;
             svar->type = new TypeDecl(Type::autoinfer);
+            svar->type->at = svar->at;
             svar->init_via_move = true;
             if ( src->type->isGoodIteratorType() ) {
                 svar->init = src->clone();
@@ -1600,7 +1582,9 @@ namespace das {
             if ( iterv->type->ref ) {
                 srcv->do_not_delete = true;
                 srcv->type = new TypeDecl(Type::tPointer);
+                srcv->type->at = srcv->at;
                 srcv->type->firstType = new TypeDecl(*iterv->type);
+                if ( !srcv->type->firstType->at.fileInfo ) srcv->type->firstType->at = srcv->at;
                 srcv->type->firstType->constant |= src->type->constant;
                 srcv->type->firstType->ref = false;
                 if ( bodyBlock ) {
@@ -1610,6 +1594,7 @@ namespace das {
                 }
             } else {
                 srcv->type = new TypeDecl(*iterv->type);
+                if ( !srcv->type->at.fileInfo ) srcv->type->at = srcv->at;
                 srcv->type->constant |= src->type->constant;
             }
             srci->variables.push_back(srcv);
@@ -1619,7 +1604,9 @@ namespace das {
             auto adri = new ExprRef2Ptr(expr->at, vit0);
             adri->alwaysSafe = true;
             auto pvoid = new TypeDecl(Type::tPointer);
+            pvoid->at = expr->at;
             pvoid->firstType = new TypeDecl(Type::tVoid);
+            pvoid->firstType->at = expr->at;
             auto rein = new ExprCast(expr->at, adri, pvoid);
             rein->reinterpret = true;
             rein->alwaysSafe = true;
@@ -1727,7 +1714,6 @@ namespace das {
             cbif->arguments.push_back(new ExprVar(expr->at, pVarName));
             blk->list.push_back(cbif);
         }
-        verifyGenerated(blk);
         return blk;
     }
 
@@ -1740,6 +1726,7 @@ namespace das {
         fn->name = "clone";
         fn->at = fn->atDecl = at;
         fn->result = new TypeDecl(Type::tVoid);
+        fn->result->at = fn->at;
         auto arg0 = new Variable();
         arg0->at = at;
         arg0->name = "dest";
@@ -1769,7 +1756,6 @@ namespace das {
             block->list.push_back(cl);
         }
         fn->body = block;
-        verifyGenerated(fn->body);
         return fn;
     }
 
@@ -1781,6 +1767,7 @@ namespace das {
         fn->name = "finalize";
         fn->at = fn->atDecl = at;
         fn->result = new TypeDecl(Type::tVoid);
+        fn->result->at = fn->at;
         auto arg0 = new Variable();
         arg0->at = at;
         arg0->name = "__this";
@@ -1814,7 +1801,6 @@ namespace das {
         if ( needUnsafe ) {
             wrapInUnsafe(fn);
         }
-        verifyGenerated(fn->body);
         return fn;
     }
 
@@ -1827,6 +1813,7 @@ namespace das {
         fn->name = "clone";
         fn->at = fn->atDecl = at;
         fn->result = new TypeDecl(Type::tVoid);
+        fn->result->at = fn->at;
         auto arg0 = new Variable();
         arg0->at = at;
         arg0->name = "dest";
@@ -1860,15 +1847,16 @@ namespace das {
             svi->arguments.push_back(vi);
             cb->list.push_back(svi);
             auto lv = new ExprVar(at, "dest");
-            auto lf = new ExprField(at, lv, argn);
+            auto lf = new ExprField(at, lv, argn, true);    // raw: generated code must reach the real variant, not an overload
             lf->alwaysSafe = true;
             auto rv = new ExprVar(at, "src");
-            auto rf = new ExprField(at, rv, argn);
+            auto rf = new ExprField(at, rv, argn, true);
             rf->alwaysSafe = true;
             auto cl = new ExprClone(at, lf, rf);
             cb->list.push_back(cl);
             auto av = new ExprVar(at, "src");
             auto isv = new ExprIsVariant(at, av, argn);
+            isv->no_promotion = true;
             auto thisIf = new ExprIfThenElse(at, isv, cb, nullptr);
             if ( lastIf ) {
                 lastIf->if_false = thisIf;
@@ -1879,7 +1867,6 @@ namespace das {
         }
         if (topIf) block->list.push_back(topIf);
         fn->body = block;
-        verifyGenerated(fn->body);
         return fn;
     }
 
@@ -1891,6 +1878,7 @@ namespace das {
         fn->name = "finalize";
         fn->at = fn->atDecl = at;
         fn->result = new TypeDecl(Type::tVoid);
+        fn->result->at = fn->at;
         auto arg0 = new Variable();
         arg0->at = at;
         arg0->name = "__this";
@@ -1910,7 +1898,7 @@ namespace das {
                     && variantType->argTypes[argi]->firstType->constant ) continue;
                 const string & argn = variantType->argNames[argi];
                 auto lv = new ExprVar(at, "__this");
-                auto lf = new ExprField(at, lv, argn);
+                auto lf = new ExprField(at, lv, argn, true);    // raw: generated code must reach the real variant, not an overload
                 lf->alwaysSafe = true;
                 auto cl = new ExprDelete(at, lf);
                 cl->alwaysSafe = true;
@@ -1919,6 +1907,7 @@ namespace das {
                 cb->list.push_back(cl);
                 auto av = new ExprVar(at, "__this");
                 auto isv = new ExprIsVariant(at, av, argn);
+                isv->no_promotion = true;
                 auto thisIf = new ExprIfThenElse(at, isv, cb, nullptr);
                 if ( lastIf ) {
                     lastIf->if_false = thisIf;
@@ -1940,7 +1929,6 @@ namespace das {
         if ( needUnsafe ) {
             wrapInUnsafe(fn);
         }
-        verifyGenerated(fn->body);
         return fn;
     }
 
@@ -1954,6 +1942,7 @@ namespace das {
         fn->name = "clone";
         fn->at = fn->atDecl = at;
         fn->result = new TypeDecl(Type::tVoid);
+        fn->result->at = fn->at;
         auto arg0 = new Variable();
         arg0->at = at;
         arg0->name = "dest";
@@ -1981,7 +1970,6 @@ namespace das {
         cl->arguments.push_back(rv);
         block->list.push_back(cl);
         fn->body = block;
-        verifyGenerated(fn->body);
         return fn;
     }
 
@@ -1999,6 +1987,18 @@ namespace das {
             // flag it so range-consuming tooling (lint fix, refactoring) knows
             // these ranges are not spliceable source text
             expr->generated = true;
+        }
+        // a MakeFieldDecl is not an Expression, so preVisitExpression never reaches it - without
+        // these the fields of a relocated make-struct keep whatever location they were built with,
+        // which for a $v() conversion is none at all
+        virtual void preVisitMakeStructureField ( ExprMakeStruct *, int, MakeFieldDecl * decl, bool ) override {
+            decl->at = newAt;
+        }
+        virtual void preVisitMakeVariantField ( ExprMakeVariant *, int, MakeFieldDecl * decl, bool ) override {
+            decl->at = newAt;
+        }
+        virtual void preVisitNamedCallArg ( ExprNamedCall *, MakeFieldDecl * arg, bool ) override {
+            arg->at = newAt;
         }
     protected:
         LineInfo    newAt;
@@ -2107,9 +2107,48 @@ namespace das {
         return enc.enclosure;
     }
 
+    // A subtree materialized from a declaration that has no location of its own - a default
+    // argument of a C++ binding, say - reports at the site it was inserted into, so every
+    // later diagnostic, profile row and debug-info entry over it points at real source.
+    class StampMissingAtVisitor : public Visitor {
+    public:
+        StampMissingAtVisitor ( const LineInfo & a ) : at(a) {}
+    protected:
+        virtual void preVisitExpression ( Expression * expr ) override {
+            Visitor::preVisitExpression(expr);
+            if ( !expr->at.fileInfo ) expr->at = at;   // no file means no location, whatever line it carries
+        }
+        // declaration types are nodes too - a macro-built `let x : <type>` splices a type
+        // cloned from an inferred expression type, which never carried a location
+        virtual void preVisit ( TypeDecl * td ) override {
+            Visitor::preVisit(td);
+            if ( !td->at.fileInfo ) td->at = at;
+        }
+        // a MakeFieldDecl is not an Expression, so preVisitExpression never reaches it - a
+        // $v() conversion builds its make-struct fields with no location at all
+        virtual void preVisitMakeStructureField ( ExprMakeStruct *, int, MakeFieldDecl * decl, bool ) override {
+            if ( !decl->at.fileInfo ) decl->at = at;
+        }
+        virtual void preVisitMakeVariantField ( ExprMakeVariant *, int, MakeFieldDecl * decl, bool ) override {
+            if ( !decl->at.fileInfo ) decl->at = at;
+        }
+        virtual void preVisitNamedCallArg ( ExprNamedCall *, MakeFieldDecl * arg, bool ) override {
+            if ( !arg->at.fileInfo ) arg->at = at;
+        }
+        LineInfo at;
+    };
+
+    void stampMissingAt ( const ExpressionPtr & expr, const LineInfo & at ) {
+        if ( !expr || !at.fileInfo ) return;
+        StampMissingAtVisitor vis(at);
+        expr->visit(vis);
+    }
+
+
     void modifyToClassMember ( Function * func, Structure * baseClass, bool isExplicit, bool isConstant ) {
         // first argument is this
         auto argT = new TypeDecl(baseClass);
+        argT->at = func->at;
         argT->constant = isConstant;
         argT->isExplicit = isExplicit;
         auto argV = new Variable();
@@ -2138,7 +2177,6 @@ namespace das {
         func->isClassMethod = true;
         func->classParent = baseClass;
         DAS_ASSERT(func->classParent);
-        verifyGenerated(func->body);
     }
 
     FunctionPtr makeClassConstructor ( Structure * baseClass, Function * method ) {
@@ -2150,6 +2188,7 @@ namespace das {
         func->atDecl = method->at;
         func->name = baseClass->name;
         func->result = new TypeDecl(baseClass);
+        func->result->at = func->at;
         func->isClassMethod = true;
         func->classParent = baseClass;
         DAS_ASSERT(func->classParent);
@@ -2167,6 +2206,7 @@ namespace das {
         makeT->useInitializer = true;
         makeT->nativeClassInitializer = true;
         makeT->makeType = new TypeDecl(baseClass);
+        makeT->makeType->at = func->at;
         makeT->structs.push_back(new MakeStruct());
         auto letS = new ExprLet();
         letS->at = func->at;
@@ -2174,6 +2214,7 @@ namespace das {
         letS->visibility = func->atDecl;
         letS->alwaysSafe = true;    // this is due to local class variable
         auto argT = new TypeDecl(baseClass);
+        argT->at = func->at;
         argT->constant = false;
         auto argV = new Variable();
         argV->name = "self";
@@ -2201,12 +2242,13 @@ namespace das {
         block->list.push_back(returnDecl);
         // and done
         func->body = block;
-        verifyGenerated(func->body);
         return func;
     }
 
     void makeClassRtti ( Structure * baseClass ) {
-        ExpressionPtr finit = new ExprTypeInfo(baseClass->at, "rtti_classinfo", new TypeDecl(baseClass));
+        auto rttiType = new TypeDecl(baseClass);
+        rttiType->at = baseClass->at;
+        ExpressionPtr finit = new ExprTypeInfo(baseClass->at, "rtti_classinfo", rttiType);
         if ( baseClass->parent ) {
             auto fd = (Structure::FieldDeclaration *) baseClass->findField("__rtti");
             fd->init = finit;
@@ -2214,7 +2256,9 @@ namespace das {
             fd->generated = true;
         } else {
             auto pvoid = new TypeDecl(Type::tPointer);
+            pvoid->at = baseClass->at;
             pvoid->firstType = new TypeDecl(Type::tVoid);
+            pvoid->firstType->at = baseClass->at;
             baseClass->fields.emplace_back(
                 "__rtti",
                 pvoid,
@@ -2229,16 +2273,24 @@ namespace das {
     FunctionPtr makeClassFinalize ( Structure * baseClass ) {
         // add __finalize field
         auto fname = baseClass->name + "'__finalize";
-        ExpressionPtr finit = new ExprAddr(baseClass->at, "_::" + fname);
+        // the generated finalizer lives in the class's own module - pin the lookup there
+        // ("__::"), so a same-named class in a required module can't make it ambiguous.
+        // template classes stay on open "_::": their stamped instances infer in the consumer
+        // module while the stamped finalizer may live elsewhere, so a strict pin can't see it
+        ExpressionPtr finit = new ExprAddr(baseClass->at, (baseClass->isTemplate ? "_::" : "__::") + fname);
         if ( baseClass->parent ) {
             auto fd = (Structure::FieldDeclaration *) baseClass->findField("__finalize");
-            fd->init = new ExprCast(baseClass->at, finit, new TypeDecl(Type::autoinfer));
+            auto castT = new TypeDecl(Type::autoinfer);
+            castT->at = baseClass->at;
+            fd->init = new ExprCast(baseClass->at, finit, castT);
             fd->parentType = fd->type->isAuto();
             fd->generated = true;
         } else {
+            auto finT = new TypeDecl(Type::autoinfer);
+            finT->at = baseClass->at;
             baseClass->fields.emplace_back(
                 "__finalize",
-                new TypeDecl(Type::autoinfer),
+                finT,
                 finit,
                 AnnotationArgumentList(),
                 false,
@@ -2253,6 +2305,7 @@ namespace das {
         func->atDecl = baseClass->at;
         func->name = fname;
         func->result = new TypeDecl(Type::tVoid);
+        func->result->at = func->at;
         func->isClassMethod = true;
         func->classParent = baseClass;
         func->isTemplate = baseClass->isTemplate;
@@ -2263,6 +2316,7 @@ namespace das {
         func->body = block;
         // only one argument, and its 'self'
         auto argT = new TypeDecl(baseClass);
+        argT->at = func->at;
         argT->constant = false;
         auto argV = new Variable();
         argV->name = "self";
@@ -2277,7 +2331,6 @@ namespace das {
         edel->alwaysSafe = true;
         block->list.push_back(edel);
         // and done
-        verifyGenerated(func->body);
         return func;
     }
 
@@ -2311,6 +2364,7 @@ namespace das {
         block->at = mks->at;
         block->isClosure = true;
         block->returnType = new TypeDecl(Type::tVoid);
+        block->returnType->at = block->at;
         // only one argument, and its 'self'
         auto mkBaseT = mks->makeType;
         while ( mkBaseT->baseType==Type::tFixedArray && mkBaseT->firstType ) mkBaseT = mkBaseT->firstType;
@@ -2329,7 +2383,6 @@ namespace das {
         // make-block
         auto mkb = new ExprMakeBlock(mks->at,block,false);
         // and done
-        verifyGenerated(mkb);
         return mkb;
     }
 

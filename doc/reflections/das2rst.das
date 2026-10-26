@@ -194,7 +194,7 @@ get_value|insert_clone|emplace_new|insert_default|emplace_default|get_with_defau
         group_by_regex("Macro infrastructure", mod, %regex~(is_folding|is_compiling|is_in_completion|is_in_lint_check|is_building_documentation|is_reporting_compilation_errors)%%),
         group_by_regex("Profiler", mod, %regex~(profile|reset_profiler|dump_profile_info|collect_profile_info)$%%),
         group_by_regex("System infrastructure", mod, %regex~(panic|print|feint|sprint|sprint_json|sscan_json|to_log|to_compiler_log|error|terminate|breakpoint|stackwalk|get_stackwalk|get_das_root|get_das_version|is_in_aot|aot_enabled|is_intern_strings|is_safe_hash|eval_main_loop|shared_module_extension)$%%),
-        group_by_regex("Memory manipulation", mod, %regex~(intptr|memcmp|variant_index|set_variant_index|hash|memcpy|lock_data|map_to_array|map_to_ro_array)$%%),
+        group_by_regex("Memory manipulation", mod, %regex~(intptr|memcmp|variant_index|set_variant_index|hash|hash_combine64|memcpy|lock_data|map_to_array|map_to_ro_array)$%%),
         group_by_regex("Binary serializer", mod, %regex~(binary_load|binary_save)$%%),
         group_by_regex("Path and command line", mod, %regex~(get_command_line_arguments|with_argv)$%%),
         group_by_regex("Time and date", mod, %regex~(get_time_usec|ref_time_ticks|get_clock|get_time_nsec|mktime|iso8601_now|format_time|clock)$%%),
@@ -228,7 +228,7 @@ def document_module_fio(_root : string) {
         group_by_regex("Filesystem queries", mod, %regex~(temp_directory|temp_directory_result|create_temp_file|create_temp_file_result|create_temp_directory|create_temp_directory_result|disk_space)$%%),
         group_by_regex("Terminal queries", mod, %regex~(is_terminal|terminal_width)$%%),
         group_by_regex("OS specific routines", mod, %regex~(sleep|exit|system|popen|popen_binary|popen_timeout|spawn_argv|popen_argv|popen_argv_pipe|popen_timed_out|run_and_capture|get_env_variable|set_env_variable|sanitize_command_line|has_env_variable)$%%),
-        group_by_regex("Dynamic modules", mod, %regex~(register_dynamic_module|register_native_path)$%%)
+        group_by_regex("Dynamic modules", mod, %regex~(register_dynamic_module|register_native_path|describe_pending_dynamic_modules)$%%)
     )
     documents("File input output library", mod, "fio.rst", groups)
 }
@@ -283,7 +283,7 @@ def document_module_dashv(_root : string) {
 def document_module_dashv_boost(_root : string) {
     var mod = find_module("dashv_boost")
     var groups <- array<DocGroup>(
-        group_by_regex("HTTP request helpers", mod, %regex~(with_http_request|get_body_bytes)$%%)
+        group_by_regex("HTTP request helpers", mod, %regex~(with_http_request|get_body_bytes|url_encode)$%%)
     )
     document("High-level HTTP and WebSocket wrappers", mod, "dashv_boost.rst", groups)
 }
@@ -327,7 +327,8 @@ def document_module_dasllama(_root : string) {
         group_by_regex("Generation", mod, %regex~(generate|generate_embd)$%%),
         group_by_regex("Embeddings", mod, %regex~(embed)$%%),
         group_by_regex("Chat", mod, %regex~(create_chat|create_chat_renderer|add_user|add_user_audio|add_assistant|render_turn|render_assistant|render_close|respond|set_thinking)$%%),
-        group_by_regex("Tool calling", mod, %regex~(set_tools|add_tool_results|render_assistant_calls)$%%)
+        group_by_regex("Tool calling", mod, %regex~(set_tools|add_tool_results|render_assistant_calls|parse_calls)$%%),
+        group_by_regex("Reasoning (thinking models)", mod, %regex~(split_reasoning|make_think_stream|think_feed|think_finish|think_drain|effective_stop_ids)$%%)
     )
     var hook = DocsHook()
     hook.afterEnums <- @(var f : FILE const?; _was_enums : bool) {
@@ -345,9 +346,9 @@ def document_module_dasllama(_root : string) {
         dasllama_type_stanza(f, "struct-dasllama_prefix-PrefixCache", "PrefixCache",
             "A page-granular prefix cache over one pool's sessions (``create_prefix_cache``): finished streams donate their KV pages keyed by a chained page hash of the token history, and later requests attach the longest cached prefix instead of re-prefilling it. Pages are refcounted with the pool; an LRU budget bounds retention.")
         dasllama_type_stanza(f, "enum-dasllama_common-KVDtype", "KVDtype",
-            "Per-session KV-cache codec picked at ``create_session``/``create_chat``: ``f16`` — the default, half the KV bytes and faster deep-context decode (stores clamp to ±65504); ``f32`` — the bit-exact reference; ``q8_0`` — block-quantized (llama.cpp ``-ctk``/``-ctv q8_0``), half the f16 bytes again and near-lossless in practice; needs head_size and kv_dim to be multiples of 32 (checked at create).")
+            "Per-session KV-cache codec picked at ``create_session``/``create_chat``: ``f16`` — the default, half the KV bytes and faster deep-context decode (stores clamp to ±65504); ``f32`` — the bit-exact reference; ``q8_0`` — block-quantized (llama.cpp ``-ctk``/``-ctv q8_0``), half the f16 bytes again and near-lossless in practice; needs head_size and kv_dim to be multiples of 32 (checked at create); ``tq4`` — the FWHT-rotated ternary codec, smaller still.")
         dasllama_type_stanza(f, "enum-dasllama_common-QuantMode", "QuantMode",
-            "Weight representation picked at load: ``fp32`` — the token-exact reference; ``q8`` — int8 quantization, the fast CPU path; ``q4`` — 4-bit, smallest footprint.")
+            "Weight representation picked at load: ``fp32`` — the token-exact reference; ``q8`` — int8 quantization, the fast CPU path (K-quant/mxfp4/Q4_0 files keep their native planes on the same rails); ``q4_0`` — the legacy requant tier, 4-bit blocks, smallest footprint.")
         dasllama_type_stanza(f, "struct-dasllama_sampling-SamplingParams", "SamplingParams",
             "Sampling knobs: ``temp`` (<= 0 selects greedy argmax), ``top_k`` (0 = no cutoff), and repetition ``penalty`` (1.0 = none) applied over the last ``penalty_last_n`` generated tokens. The defaults are greedy — ``SamplingParams()`` reproduces argmax exactly.")
         dasllama_type_stanza(f, "struct-dasllama_sampling-Stats", "Stats",
@@ -356,6 +357,14 @@ def document_module_dasllama(_root : string) {
             "What the model honestly supports at the chat layer, as returned by ``caps``: ``system_prompt`` is false for architectures with no system role (gemma), where the chat layer silently folds the system prompt into the first user turn. Grows as gaps surface.")
         dasllama_type_stanza(f, "struct-dasllama_chat-ChatSession", "ChatSession",
             "A conversation over a model: its ``session``, the resolved chat template, and the running transcript in ``history``. Create with ``create_chat``, then drive with ``add_user`` + ``respond``.")
+        dasllama_type_stanza(f, "struct-dasllama_chat-ThinkStream", "ThinkStream",
+            "The incremental reasoning/content splitter for a streamed reply (``make_think_stream``): feed decoded pieces through ``think_feed``, flush with ``think_finish``. Holds partial reasoning markers back across chunk boundaries; a non-thinking family yields a pass-through stream.")
+        dasllama_type_stanza(f, "struct-dasllama_chat-ThinkSplit", "ThinkSplit",
+            "One reply split at its reasoning boundary, as returned by ``split_reasoning``: ``reasoning`` holds the thinking span (empty when the model answered directly), ``content`` the answer.")
+        dasllama_type_stanza(f, "struct-dasllama_tools-ToolReply", "ToolReply",
+            "A fully classified tool-capable reply, as returned by ``parse_calls``: the ``reasoning`` span, the ``content``, and the ``calls`` the model made (empty when it answered directly).")
+        dasllama_type_stanza(f, "struct-dasllama_tools-ToolCall", "ToolCall",
+            "One parsed tool call: the function ``name``, its ``args`` normalized to JSON object text, and the wire ``id`` where the family carries one (mistral; empty elsewhere).")
         dasllama_type_stanza(f, "struct-dasllama_audio-AudioTower", "AudioTower",
             "A loaded audio encoder: Whisper-family encoder weights plus the model-specific projector tail, as produced by ``load_audio_tower`` from an mmproj GGUF. Pass it to ``create_chat`` to enable ``add_user_audio`` turns.")
     }
@@ -420,7 +429,7 @@ def document_module_ast(_root : string) {
         group_by_regex("Compilation and file access", mod, %regex~(compile|compile_file|make_file_access)$%%),
         group_by_regex("Call generation", mod, %regex~(make_call)$%%),
         group_by_regex("Visitor pattern", mod, %regex~visit.*%%),
-        group_by_regex("Expression generation", mod, %regex~(force_generated|get_expression_annotation|make_type_info_structure)%%),
+        group_by_regex("Expression generation", mod, %regex~(force_generated|get_expression_annotation|make_type_info_structure|stamp_missing_at)%%),
         group_by_regex("Adapter generation", mod, %regex~make_.*%%),
         group_by_regex("Adapter application", mod, %regex~(add_.*_(annotation|macro)|add_new_comment_reader|add_comment_reader|add_module_option)%%),
         group_by_regex("Adding objects to objects", mod, %regex~add_.*%%),
@@ -474,15 +483,15 @@ def document_module_strings(_root : string) {
         group_by_regex("Character set", mod, %regex~(set_total|set_element|is_char_in_set)$%%),
         group_by_regex("Character groups", mod, %regex~is.+%%),
         group_by_regex("Character by index", mod, %regex~(character_at|character_uat|first_character)$%%),
-        group_by_regex("String properties", mod, %regex~(empty|ends_with|length|starts_with)$%%),
-        group_by_regex("String builder", mod, %regex~(build_string|format|write|write_char|write_chars|write_escape_string|build_hash)$%%),
+        group_by_regex("String properties", mod, %regex~(empty|ends_with|length|starts_with|skip_white_space)$%%),
+        group_by_regex("String builder", mod, %regex~(build_string|format|write|write_char|write_chars|write_escape_string|write_string|build_hash)$%%),
         group_by_regex("das::string manipulation", mod, %regex~(append|resize|with_das_string)$%%),
         group_by_regex("String modifications", mod, %regex~(chop|escape|unescape|repeat|replace|reverse|slice|
 strip|strip_left|strip_right|to_lower|to_upper|rtrim|safe_unescape|ltrim|trim)$%%),
         group_by_regex("Search substrings", mod, %regex~(find|rfind).*%%),
         group_by_regex("String comparison", mod, %regex~(compare_ignore_case)$%%),
         group_by_regex("String conversion routines", mod, %regex~(double|float|int|uint|int64|uint64|to_double|to_float|to_int|to_uint|to_int64|to_uint64|string|to_char|fmt|int8|to_int8|uint8|to_uint8|int16|to_int16|uint16|to_uint16|to_cpp_float)$%%),
-        group_by_regex("String as array", mod, %regex~(modify_data|peek_data)$%%),
+        group_by_regex("String as array", mod, %regex~(modify_data|peek_data|to_bytes)$%%),
         group_by_regex("Low level memory allocation", mod, %regex~(delete_string|reserve_string_buffer)$%%)
     );
     document("String manipulation library", mod, "strings.rst", groups);
@@ -604,11 +613,12 @@ def document_module_apply(_root : string) {
 def document_module_jobque(_root : string) {
     var mod = find_module("jobque")
     var groups <- array<DocGroup>(
-        group_by_regex("Channel, JobStatus, Lockbox, Stream", mod, %regex~(append|notify|join|channel_create|channel_remove|stream_create|stream_remove|add_ref|release|notify_and_release|lock_box_create|lock_box_remove|job_status_create|job_status_remove)$%%),
+        group_by_regex("Channel, JobStatus, Lockbox, SeqBox, Stream", mod, %regex~(append|notify|join|channel_create|channel_remove|stream_create|stream_remove|add_ref|release|notify_and_release|lock_box_create|lock_box_remove|job_status_create|job_status_remove|seq_box_create|seq_box_release)$%%),
         group_by_regex("Queries", mod, %regex~(get_total_hw_jobs|get_total_hw_threads|get_total_hw_cores|is_job_que_shutting_down|is_job_que_available|count_jobque_leaks)$%%),
         group_by_regex("Event tracing", mod, %regex~(jobque_trace_start|jobque_trace_stop|jobque_trace_save|jobque_trace_tag|jobque_trace_category|jobque_trace_marker_name|jobque_trace_marker)$%%),
-        group_by_regex("Internal invocations", mod, %regex~(new_job_invoke|new_thread_invoke|new_debugger_thread|set_jobque_fork_pool|set_jobque_fork_skip_heap_reset|set_jobque_worker_spin|set_jobque_batch_dispatch|set_jobque_join_spin|set_jobque_team_mode|get_jobque_team_mode|set_jobque_thread_team_mode|get_jobque_thread_team_mode|set_current_thread_priority|set_jobque_threads_cap|set_jobque_affinity|get_jobque_affinity|set_jobque_worker_limit|get_jobque_worker_limit|set_jobque_team_rank_gate|get_jobque_team_rank_gate|set_jobque_team_prof|reset_jobque_team_prof|get_jobque_team_prof|get_jobque_team_prof_counts|get_jobque_team_prof_react|team_parallel_for_invoke|team_parallel_for_indexed_invoke|team_parallel_stages_invoke|flush_jobque_batch|jobque_try_run_one)$%%),
-        group_by_regex("Construction", mod, %regex~(with_channel|with_stream|with_job_status|with_job_que|with_lock_box|create_job_que|destroy_job_que)$%%),
+        group_by_regex("Internal invocations", mod, %regex~(new_job_invoke|new_thread_invoke|new_debugger_thread|set_jobque_fork_pool|set_jobque_fork_skip_heap_reset|set_jobque_worker_spin|set_jobque_batch_dispatch|set_jobque_join_spin|set_jobque_team_mode|get_jobque_team_mode|set_jobque_thread_team_mode|get_jobque_thread_team_mode|set_current_thread_priority|set_jobque_threads_cap|set_jobque_affinity|get_jobque_affinity|set_jobque_worker_limit|get_jobque_worker_limit|set_jobque_team_rank_gate|get_jobque_team_rank_gate|set_jobque_team_prof|reset_jobque_team_prof|get_jobque_team_prof|get_jobque_team_prof_counts|get_jobque_team_prof_react|team_parallel_for_invoke|team_parallel_for_indexed_invoke|team_parallel_stages_invoke|flush_jobque_batch|jobque_try_run_one|_builtin_seq_box_publish|_builtin_seq_box_read)$%%),
+        group_by_regex("Construction", mod, %regex~(with_channel|with_stream|with_job_status|with_job_que|with_lock_box|with_seq_box|create_job_que|destroy_job_que)$%%),
+        group_by_regex("SeqBox operations", mod, %regex~(clear)$%%),
         group_by_regex("Atomic", mod, %regex~(atomic32_create|atomic32_remove|with_atomic32|atomic64_create|atomic64_remove|with_atomic64|get|set|inc|dec)$%%)
     )
     document("Jobs and threads", mod, "jobque.rst", groups)
@@ -624,7 +634,8 @@ def document_module_jobque_boost(_root : string) {
         group_by_regex("Synchronization", mod, %regex~(with_wait_group|done)$%%),
         group_by_regex("Parallel execution", mod, %regex~(_parallel_for|parallel_for|team_parallel_for|team_parallel_for_indexed|team_parallel_stages|_parallel_for_each|parallel_for_each|_parallel_map|parallel_map)$%%),
         group_by_regex("LockBox operations", mod, %regex~(set|get|update|clear|fill|grab)$%%),
-        group_by_regex("Internal capture details", mod, %regex~(capture_jobque_channel|capture_jobque_job_status|release_capture_jobque_channel|release_capture_jobque_job_status|capture_jobque_lock_box|release_capture_jobque_lock_box|capture_jobque_stream|release_capture_jobque_stream)$%%)
+        group_by_regex("SeqBox operations", mod, %regex~(publish|read)$%%),
+        group_by_regex("Internal capture details", mod, %regex~(capture_jobque_channel|capture_jobque_job_status|release_capture_jobque_channel|release_capture_jobque_job_status|capture_jobque_lock_box|release_capture_jobque_lock_box|capture_jobque_stream|release_capture_jobque_stream|capture_jobque_seq_box|release_capture_jobque_seq_box)$%%)
     )
     document("Boost package for jobs and threads", mod, "jobque_boost.rst", groups)
 }
@@ -1325,7 +1336,7 @@ def document_module_lint_config(_root : string) {
     var mod = find_module("lint_config")
     var groups <- array<DocGroup>(
         group_by_regex("Configuration", mod, %regex~(load_lint_config|load_lint_config_from_path|load_env_disabled|seed_default_disabled|build_lint_macro_disabled|lint_config_forces_on)$%%),
-        group_by_regex("Path-based rule defaults", mod, %regex~(is_daslib_source|is_shipped_library_source)$%%),
+        group_by_regex("Path-based rule defaults", mod, %regex~(is_daslib_source|is_shipped_library_source|is_core_library_source)$%%),
         group_by_regex("Structured findings", mod, %regex~(make_lint_issue)$%%)
     )
     document("Repo-level lint configuration", mod, "lint_config.rst", groups)

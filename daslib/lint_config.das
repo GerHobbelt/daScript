@@ -151,8 +151,12 @@ def public build_lint_macro_disabled(prog : ProgramPtr) : table<string> {
         seed_default_disabled(disabled)
     }
     ensure_cache_loaded()
-    for (code in keys(_cache_off)) {
-        if (!key_exists(disabled, code)) disabled |> insert(code)
+    // fixture mode (_enable_default_off_rules) also skips the repo config's off directives —
+    // repo policy must not silence the rule a lint fixture exists to exercise
+    if (!force_default_off) {
+        for (code in keys(_cache_off)) {
+            if (!key_exists(disabled, code)) disabled |> insert(code)
+        }
     }
     for (code in keys(_cache_on)) {
         if (key_exists(disabled, code)) disabled |> erase(code)
@@ -191,6 +195,15 @@ def public is_daslib_source(prog : ProgramPtr) : bool {
 def public is_shipped_library_source(prog : ProgramPtr) : bool {
     let file = module_source_path(prog)
     return path_has_segment(file, "daslib") || path_has_segment(file, "modules")
+}
+
+//! True under ``daslib/`` or ``utils/`` - the trees kept free of duplicated regions and unused
+//! private declarations (STYLE040/LINT022). Elsewhere both are a backlog, not a gate.
+def public is_core_library_source(prog : ProgramPtr) : bool {
+    let file = module_source_path(prog)
+    // `modules/<X>/daslib/` carries a "daslib" segment too, and those trees are NOT swept
+    return ((path_has_segment(file, "daslib") || path_has_segment(file, "utils"))
+        && !path_has_segment(file, "modules"))
 }
 
 //! One structured lint finding — the machine-readable twin of the ``"<message> at <file>:<line>:<column>"`` strings the ``*_collect`` overloads emit. Produced by the ``*_collect_issues`` overloads in ``daslib/lint`` / ``daslib/perf_lint`` / ``daslib/style_lint`` for consumers that need positions (e.g. the LSP validate subtool).

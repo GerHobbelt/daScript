@@ -192,12 +192,11 @@ namespace das
         };
         virtual bool lint(const FunctionPtr & func, ModuleGroup &, const AnnotationArgumentList &,
                 const AnnotationArgumentList &, string & err) override {
-            return checkInlineShape(func, err) && checkInlineRecursion(func, err);
+            return canFunctionInline(func, err) && isInlineRecursionFree(func, err);
         }
     };
 
-    // [never_inline] - keep this function out of best-effort (auto) inlining. [inline]
-    // stays a hard error to combine; block-literal and heuristic auto tiers decline
+    // [never_inline] - keep this function, or this block literal, out of best-effort (auto) inlining
     struct NeverInlineFunctionAnnotation : MarkFunctionAnnotation {
         NeverInlineFunctionAnnotation() : MarkFunctionAnnotation("never_inline") { }
         virtual bool apply(const FunctionPtr & func, ModuleGroup &, const AnnotationArgumentList &, string & err) override {
@@ -208,6 +207,11 @@ namespace das
             func->neverInline = true;
             return true;
         };
+        // on a block literal the marker rides block->annotations; the inline pass
+        // checks it at the invoke-block gate (canBlockInline, ast_inline.cpp)
+        virtual bool apply(ExprBlock *, ModuleGroup &, const AnnotationArgumentList &, string &) override {
+            return true;
+        }
     };
 
     struct RequestNoDiscardFunctionAnnotation : MarkFunctionAnnotation {
@@ -2482,6 +2486,8 @@ namespace das
         addExtern<DAS_BIND_FUN(_builtin_hash_float)>(*this, lib, "hash", SideEffects::none, "_builtin_hash_float")->arg("value");
         addExtern<DAS_BIND_FUN(_builtin_hash_double)>(*this, lib, "hash", SideEffects::none, "_builtin_hash_double")->arg("value");
         addExtern<DAS_BIND_FUN(_builtin_hash_das_string)>(*this, lib, "hash", SideEffects::none, "_builtin_hash_das_string")->arg("value");
+        addExtern<DAS_BIND_FUN(hash_combine64)>(*this, lib, "hash_combine64", SideEffects::none, "hash_combine64")
+            ->args({"hash","value"});
         // table functions
         addExtern<DAS_BIND_FUN(builtin_table_clear)>(*this, lib, "_builtin_table_clear",
             SideEffects::modifyArgument, "builtin_table_clear")

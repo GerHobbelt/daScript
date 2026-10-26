@@ -50,7 +50,7 @@ def private has(lines : array<string>; needle : string) : bool {
 }
 
 [test]
-def test_llvm_tune_scope_policy(t : T?) {
+def test_llvm_tune_scope_policy(t : T?) {   // nolint:STYLE038 - flat numbered policy-flavor arms over shared child-spawn state; no arm stands alone
     let args <- get_command_line_arguments()  // locked view — do not delete
     let bin = args[0]
 
@@ -134,6 +134,26 @@ def test_llvm_tune_scope_policy(t : T?) {
     t |> equal(spawn_child("{tune_env("restart")}\"{bin}\" \"{client}\"", l6c), 0)
     t |> success(l6c |> has("RESULT 5"))
 
+    // 6b. policy=restart + a registered scope resolver: the guard consults it INSTEAD of
+    //     spawning the tuner — the resolver writes the winner (the exchange-client shape),
+    //     prints its own restart marker, and the next start stamps what it wrote
+    let resolverClient = "{get_this_module_dir()}/llvm_tune_scope_client_resolver.das"
+    let resolverSidecar = "{get_this_module_dir()}/llvm_tune_scope_client_resolver.tune.json"
+    remove(resolverSidecar)
+    var l6r : array<string>
+    t |> equal(spawn_child("{tune_env("restart")}\"{bin}\" \"{resolverClient}\"", l6r), 0)
+    t |> success(l6r |> has("RESOLVER llvm_tune_scope_probe ->"))
+    t |> success(!(l6r |> has("FAKE TUNER")))
+    t |> success(l6r |> has("exchange: sidecar applied, restart to apply the winners"))
+    t |> success(!(l6r |> has("RESULT")))
+    var l6s : array<string>
+    t |> equal(spawn_child("{tune_env("restart")}\"{bin}\" \"{resolverClient}\"", l6s), 0)
+    t |> success(l6s |> has("STATUS scope_add|llvm_tune_scope_probe|k2|manifest"))
+    t |> success(l6s |> has("RESULT 5"))   // interp = reference body; the STATUS row is the stamp proof
+    remove(resolverSidecar)
+    delete l6r
+    delete l6s
+
     // 7. AOT gate: policy=error + missing sidecar must stay COMPLETELY silent
     remove(sidecar)
     let outRes = create_temp_file_result("llvm_tune_scope_aot_", ".cpp")
@@ -178,8 +198,38 @@ def test_llvm_tune_scope_policy(t : T?) {
     t |> success(!(l10 |> has("FAKE TUNER")))
     t |> success(l10 |> has("RESULT 6"))
 
+    // 11. --jit-opt-level=0 flips the injected DEFAULT to fallback (winners are raced under
+    //     O3 codegen — an O0 run must not block on the tuner to mint them): no tuning,
+    //     fallback stamps, same RESULT 6 as the env kill switch
+    remove(autoSidecar)
+    var l11 : array<string>
+    t |> equal(spawn_child("{tune_env("")}\"{bin}\" -jit \"{autoClient}\" -- --jit-opt-level=0", l11), 0)
+    t |> success(!(l11 |> has("FAKE TUNER")))
+    t |> success(l11 |> has("RESULT 6"))
+
+    // 12. DAS_TUNE_POLICY overrides the O0 default in the other direction too: env auto beats
+    //     the injected fallback — the tuner runs and the tuned tier serves
+    remove(autoSidecar)
+    var l12 : array<string>
+    t |> equal(spawn_child("{tune_env("auto")}\"{bin}\" -jit \"{autoClient}\" -- --jit-opt-level=0", l12), 0)
+    t |> success(l12 |> has("FAKE TUNER ->"))
+    t |> success(l12 |> has("RESULT 7"))
+
+    // 13. tune_suppress_mint from a library [init] (the dev-run escape): the auto DEFAULT would
+    //     tune, but the mint is suppressed — no tuner, fallback stamps, the suppression says why
+    let supClient = "{get_this_module_dir()}/llvm_tune_scope_client_suppress.das"
+    let supSidecar = "{get_this_module_dir()}/llvm_tune_scope_client_suppress.tune.json"
+    remove(supSidecar)
+    var l13 : array<string>
+    t |> equal(spawn_child("{tune_env("")}\"{bin}\" -jit \"{supClient}\"", l13), 0)
+    t |> success(!(l13 |> has("FAKE TUNER")))
+    t |> success(l13 |> has("mint SUPPRESSED (TEST_SUPPRESS=1)"))
+    t |> success(l13 |> has("RESULT 6"))
+    t |> success(!fexist(supSidecar))
+
     remove(sidecar)
     remove(autoSidecar)
+    remove(supSidecar)
     remove(aotOut)
     delete l1
     delete l2
@@ -194,4 +244,7 @@ def test_llvm_tune_scope_policy(t : T?) {
     delete l9
     delete l9b
     delete l10
+    delete l11
+    delete l12
+    delete l13
 }

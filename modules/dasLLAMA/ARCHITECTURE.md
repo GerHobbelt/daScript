@@ -39,13 +39,20 @@ never hand-edit the tables).
 - **`dasllama.das`** — the public API facade and nothing else: `load_model` → `create_session` →
   generate, re-exported names, the doc surface. No engine logic; a function that does work belongs
   in the module that owns the concern, and the facade re-exports it.
+- **`dasllama_version.das`** — `DASLLAMA_VERSION`, the module's own release counter, and nothing
+  else. Decoupled from the daslang version and from `LLVM_JIT_CODEGEN_VERSION`; ANY kernel work
+  bumps it (CODEREVIEW.md), so equal versions mean an equal kernel roster — the sidecar exchange
+  keys validity on (version, box). A zero-require leaf so the tuner's noise half, the benches,
+  and the facade chain (`dasllama_common` re-exports it) all reach it without weight.
 - **`dasllama_common.das`** — the engine: `Model`/`Session`/`Config`, the forward loops, the
   override registries, the runtime knobs. **Not** the load walk (§1.3) and **not** GPU residency
   (§1.5) — both left, and the seam each left behind is a registered hook, so neither comes back.
   It remains the module's debt sink; what sits here that is family-specific or platform-specific is
   debt, **not precedent**. Nothing platform-specific may be added; new shared concerns get their own
   file rather than another thousand lines here.
-- **`dasllama_transformer.das`** — the block-composition seam only.
+- **`dasllama_transformer.das`** — the block-composition seam, and the require umbrella: the
+  `[init]`-only side-effect requires (arch registrations, GPU tiers, and any module that
+  requires the engine back, which the umbrella therefore hosts to break the cycle).
 - **`dasllama_blocks.das`** — the std/dense/MoE transformer block kernels, decode and prefill,
   plus the two default block sets the arch files bind. `forward()` never names a kernel here — it
   dispatches through the `ArchBlocks` function pointers, which is why the family lives outside the
@@ -65,6 +72,11 @@ never hand-edit the tables).
 - **`dasllama_config.das`** — `DlimConfiguration`: every input that changes `.dlim` image BYTES,
   in one struct, plus its identity formatter. A knob that does not change image bytes does not
   belong here; a knob that does and is missing is an image-aliasing bug.
+- **`dasllama_tools.das`** — the per-ToolMode tool wire codecs (definition serializers,
+  replay/result text builders, reply parsers; Harmony namespace/channels, gemma-4 DSL, mistral
+  control tokens, llama JSON). Every byte of tool wire text is produced here — pure string+JSON
+  functions, model-free testable; the chat layer assembles the output into ChatParts and the
+  server parses through the parsers. Verbatim-format provenance: `tool_formats_plan.md`.
 - **`dasllama_chat.das`** — conversation turns and chat-template application. Per-arch template
   *content* is registered by the arch file (§1.6), not written here.
 - **`dasllama_par.das`** — `maybe_parallel_for` and nothing else. Threading policy (job counts,
@@ -110,9 +122,20 @@ often gotten wrong, so each says explicitly where the neighbouring half goes.
 - **`dasllama_layout.das`** — disk-format → compute-layout transforms at LOAD scope: the blob
   transform, the CPU repack walkers, the GPU tier gathers, and the refusal half (`can this model
   take the blob form`) split out so the image writer can commit without loading.
-- **`dasllama_tokenizer.das`** — SentencePiece (Llama-2 family, Phi-3, Gemma).
-- **`dasllama_bpe.das`** — byte-level BPE / tiktoken (Llama-3, Qwen2 pre-tokenizers). Two files
-  because the two algorithms share no state; a third tokenizer family gets a third file.
+- **`dasllama_tokenizer.das`** — the tokenizer facade: backend selection off the GGUF metadata and
+  the one encode/decode/piece surface models and the chat layer call. Re-exports both backends, so
+  a consumer requires this file and never picks a backend by hand.
+- **`dasllama_spm.das`** — the SentencePiece backend (Llama-2 family, Phi-3, Gemma): score-greedy
+  merges over vocab pieces, `<0xXX>` byte fallback.
+- **`dasllama_bpe.das`** — the byte-level BPE backend (Llama-3 / tiktoken family): vocab load, the
+  GPT-2 byte alphabet, ranked merges, encode/decode. Split from SPM because the two algorithms
+  share no state; a third merge algorithm gets a fourth file.
+- **`dasllama_pretok.das`** — the pre-tokenizer: one hand-compiled split function per family
+  (llama3/qwen2/qwen35, gpt-2, gpt-4o, tekken), selected by the BPE `pre` name. Regex-port growth
+  lands here, never in the merge engine — the two change for different reasons (new model family
+  vs. algorithm work). Every arm with an on-disk llama.cpp corpus vocab is gated by its case in
+  `test_tokenizer.das` (llama3, qwen2, qwen35, gpt-2); tekken has no corpus case, and gpt-4o is
+  pinned by frozen ids in `test_parity.das` only.
 
 ### 1.3 The load and image rail
 
@@ -162,7 +185,9 @@ that a question answered for one backend has an obvious address in the other. Th
 
 - **Vulkan additionally has an ENTRY, `dasllama_math_vulkan.das`** — capability probe/arm, `.dlim`
   identity source, cross-arm routers, the `[init]` installs. It re-exports the family `public`,
-  and its NAME is common's `?vulkan` require contract: **never rename it.**
+  and its NAME is the transformer umbrella's `?vulkan` require contract (deliberately LAST in the
+  umbrella: the vulkan drivers are the hot-edit modules, and require order is the jit obj-cache
+  layout): **never rename it.**
 - **Vulkan additionally has `dasllama_vulkan_seams.das`** — the thin whole-op call seams the tier
   and suites dispatch through (`vk_add_rms`, `vk_rope_kv_store`, `vk_decode_attn`). It exists
   because of a require direction: common cannot require the classes module (classes requires
@@ -215,10 +240,11 @@ both paths.
 **The allowed asymmetries between the backends — this list is closed; a new one lands with its
 entry here:**
 
-- **Metal sits ABOVE `dasllama_common`** (typed `Model`/`Session` access, umbrella entry via the
-  transformer's `?das_metal` requires, shapes unconditional); **Vulkan sits BELOW it** (untyped
-  pointer/array seams, the single `?vulkan` entry through the `dasllama_math_vulkan` facade).
-  That inversion is why their kernels↔common require directions differ.
+- **Metal sits ABOVE `dasllama_common`** (typed `Model`/`Session` access, shapes unconditional);
+  **Vulkan sits BELOW it** (untyped pointer/array seams — the family never requires common).
+  Both tiers ENTER from the transformer umbrella (`?das_metal` requires; the single `?vulkan`
+  require of the `dasllama_math_vulkan` facade); the inversion that remains is the
+  kernels↔common require DIRECTION, and it is why their seam shapes differ.
 - **UMA vs discrete VRAM**: Metal never grows residency machinery (memory is memory); arenas,
   upload economics, mirrors and hydration are Vulkan's alone.
 - **Lens depth**: both lenses generate `enc_*` builders from kernel classes — Metal via
@@ -281,11 +307,27 @@ on a shared path is the anti-pattern. Only a genuinely new dataflow earns its ow
 - **`performance/fetch_models.das`** — the committed model-provenance manifest: per catalog
   file, the exact HF repo + revision pin + sha256, or the on-box conversion recipe. Verify by
   default, `--fetch` downloads; it never converts, never benches. BRINGUP.md §2 is the runbook.
+- **`performance/exchange_schema.das`** — engine-free validation for exchange submissions
+  (record stores + tune sidecars); the dasllama.io ladder service builds on it.
+- **`performance/exchange_client.das`** — the sidecar-exchange client: the boot-time
+  lookup/apply (llvm_tune's scope resolver — a verified per-box match downloads instead of a
+  ~20-minute tune), the privacy-stripped submit rails, and the control-page surface
+  dasllama-server serves at `/exchange`.
 - **`benchmarks/asr/mem_census.sh`** — the peak-memory census (`/usr/bin/time -l` around one
   asr_bench process per cell; macOS only) — the interim footprint instrument until a footprint
   leg lands in `gen_bench_records`; its numbers live in `PERF_LEDGER.md`, never the stores.
 
 ---
+
+### 1.9 Serving
+
+- **`dasllama_scheduler.das`** — the continuous-batching scheduler, the serving layer over the
+  facade (its one engine require is `dasllama/dasllama`). One synchronous thread: each
+  `scheduler_step` admits queued requests, runs one `eval_batch` decode step over every
+  decoding stream, then at most one bounded prefill chunk FCFS; paged serving donates finished
+  streams' KV pages to the prefix cache. Results flow out as `SchedEvent`s — no HTTP here.
+  `utils/dasllama-server` owns the writers; `tutorials/dasLLAMA/13_serving.das` is the
+  teaching consumer; `tests/test_scheduler.das` gates it against `generate()` references.
 
 ## 2. Mechanisms
 
@@ -498,6 +540,16 @@ the documentation and to the registry test. The sanctioned forms beyond a plain 
 
 `tests/test_env_registry.das` enforces the lot in both directions (declared ↔ documented,
 read ↔ registered, writes included).
+
+**Override announces.** A knob that is a gate escape, a policy override, or a threshold
+recalibration — one whose presence makes a run measure, mint, or emit something its defaults
+would not (`DASLLAMA_ALLOW_UNTUNED`, the `DAS_TUNE_NOISE_*` pair and `DAS_TUNE_POLICY` read
+through llvm_tune's accessors) — announces at the point it changes the outcome: at least one
+printed or logged line naming the knob by its env spelling. Set-but-inert stays silent;
+per-site repeats are correct (the same knob may legitimately announce at its `[init]` wire, at
+a gate it bypasses, and in a tool banner). Ordinary behavior knobs (thread counts, rail
+selection, formats) are not overrides under this contract — their state belongs in the tools'
+existing config/status lines, not in per-knob announces.
 
 ### 2.10 Sanctioned instrumentation rails
 

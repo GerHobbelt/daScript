@@ -156,7 +156,7 @@ Apple Accelerate / AMX float lane. `DASLLAMA_ACCEL` arms the whole group.
 
 | Variable | Type | Default | Effect |
 |---|---|---|---|
-| `DASLLAMA_ALLOW_UNTUNED` | flag | off | Let a bench cell measure on fallback/absent tune winners. The gate exists because a stale sidecar silently downgrades every kernel and the whole board sandbags; only set for dev runs whose numbers are never published. |
+| `DASLLAMA_ALLOW_UNTUNED` | flag | off | Let a bench cell measure on fallback/absent tune winners, and skip the auto-tune mint entirely (untuned kernels keep fallback stamps instead of paying the minutes-long tune). The gate exists because a stale sidecar silently downgrades every kernel and the whole board sandbags; only set for dev runs whose numbers are never published. |
 | `DASLLAMA_BENCH_MODEL` | text | tinyllama | Model name for the isolated GEMM bench. |
 | `DASLLAMA_BENCH_NTOK` | number | unset | Token count for the isolated GEMM bench. |
 | `DASLLAMA_BENCH_SKIP_ROWMAJOR` | flag | off | Skip the row-major arm of the isolated GEMM bench. |
@@ -215,6 +215,15 @@ Apple Accelerate / AMX float lane. `DASLLAMA_ACCEL` arms the whole group.
 | Variable | Type | Default | Effect |
 |---|---|---|---|
 | `DASLLAMA_MODEL` | path | unset | Model path for the dasLLAMA tutorials when none is passed on the command line. |
+
+## Sidecar exchange
+
+Overrides for the dasllama.io exchange client.
+
+| Variable | Type | Default | Effect |
+|---|---|---|---|
+| `DASLLAMA_EXCHANGE_URL` | text | unset | Sidecar exchange base URL override (tests, mirrors); unset = the baked-in dasllama.io. |
+| `DASLLAMA_EXCHANGE_ACCEPT` | text | unset | One-shot exchange accept-policy override: verified | any | off; unset = the app config's exchange_accept. The watchdog arms 'any' on a relaunch when the user adopts an unverified sidecar over finishing a tune. |
 
 ## daslang core knobs dasLLAMA honours
 

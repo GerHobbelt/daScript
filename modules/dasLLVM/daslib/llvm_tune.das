@@ -17,6 +17,8 @@ require daslib/clargs
 require strings
 require math
 require llvm/daslib/llvm_code public
+require llvm/daslib/llvm_jit_cli
+require llvm/daslib/llvm_env
 
 //! Generalized tune framework (gemm_generator_plan.md part 2). `[tune_perm(...), ...,
 //! tune(gen="key", fallback="suffix")]` — perm rows first, `tune` last — turns one reference
@@ -53,8 +55,17 @@ require llvm/daslib/llvm_code public
 
 //! Compile-time tune mode from the `DAS_TUNE_MODE` env var: "normal" (default), "tune", "test".
 def tune_mode() : string {
-    let m = get_env_variable("DAS_TUNE_MODE")
+    let m = g_env_tune.tune_mode
     return empty(m) ? "normal" : m
+}
+
+//! The jit codegen tier this process resolved: `--jit-opt-level` CLI over `policies.jit_opt_level`.
+//! Compile-time — lets policy defaults key off the tier (winners are raced under O3 codegen,
+//! so an O0 run cannot represent them and must not block on the tuner to mint them).
+def jit_cli_opt_level() : int {
+    let r <- parse_args(type<JitCliOptions>)
+    let cli = r |> unwrap_or_default
+    return cli.opt_level |> unwrap_or(compiling_program().policies.jit_opt_level)
 }
 
     //! True when this compile must stay stamp-free: `policies.tune_frozen` (the cross-box
@@ -132,7 +143,7 @@ def set_tune_manifest_runtime_path(p : string) {
     //! `<app>.tune.json` beside the app (the root script, or the binary when there is none).
     //! Never "" — every app has a sidecar location.
 def tune_manifest_path() : string {
-    let env = get_env_variable("DAS_TUNE_MANIFEST")
+    let env = g_env_tune.tune_manifest
     if (!empty(env)) return env
     if (!empty(g_runtime_manifest)) return g_runtime_manifest
     let app = tune_app_script()
@@ -141,49 +152,139 @@ def tune_manifest_path() : string {
 
 var private g_box_identity = ""
 
-    //! This box's tune identity: platform|arch|hardware|OS-build|cpu. Measurements are a
-    //! property of the box AND its OS (GPU fallback perf moves with macOS updates), so a
-    //! sidecar carrying a different identity reads as stale — the cross-box-copy hazard.
-def tune_box_identity() : string {
-    if (!empty(g_box_identity)) {
-        return g_box_identity
+def private all_digits(s : string) : bool {
+    if (empty(s)) {
+        return false
     }
-    var hw = ""
-    let plat = get_platform_name()
-    if (plat == "windows") {
-        hw = "{get_env_variable("PROCESSOR_IDENTIFIER")}|{get_env_variable("OS")}"
-    } elif (plat == "osx" || plat == "darwin") {   // get_platform_name says "darwin" on macOS
-        unsafe {
-            popen("sysctl -n hw.model kern.osversion machdep.cpu.brand_string 2>/dev/null") $(f) {
-                while (!feof(f)) {
-                    let ln = strip(fgets(f))
-                    if (!empty(ln)) {
-                        hw = empty(hw) ? ln : "{hw}|{ln}"
-                    }
-                }
+    var ok = true
+    peek_data(s) $(arr) {
+        for (b in arr) {
+            ok = ok && is_number(int(b))
+        }
+    }
+    return ok
+}
+
+// the substring from the first digit to the end — locale-proof extraction of the version
+// number out of a `ver` banner whose leading word ("Version", "Versión", "Версия", …) varies
+def private digits_tail(s : string) : string {
+    var at = -1
+    peek_data(s) $(arr) {
+        for (i in range(length(arr))) {
+            if (is_number(int(arr[i]))) {
+                at = i
+                break
             }
         }
-    } else {
-        unsafe {
-            popen("uname -r 2>/dev/null") $(f) {
-                hw = strip(fgets(f))
-            }
-        }
+    }
+    return at >= 0 ? slice(s, at) : ""
+}
+
+// The CPU brand from /proc/cpuinfo — x86 has "model name", arm64 does not (it carries "Model" /
+// "Hardware" / "CPU part"); try the keys in order so the identity's cpu field is never empty
+def private linux_cpu_brand() : string {
+    var brand = ""
+    for (key in fixed_array("model name", "Model", "Hardware", "CPU part")) {
         fopen("/proc/cpuinfo", "rb") $(f) {
             if (f != null) {
                 while (!feof(f)) {
                     let ln = fgets(f)
-                    if (ln |> starts_with("model name")) {
+                    if (ln |> starts_with(key)) {
                         let ix = find(ln, ":")
-                        hw = "{hw}|{strip(slice(ln, ix + 1))}"
+                        if (ix >= 0) {
+                            brand = strip(slice(ln, ix + 1))
+                        }
                         break
                     }
                 }
             }
         }
+        break if (!empty(brand))
     }
-    g_box_identity = "{plat}|{get_architecture_name()}|{hw}"
+    return brand
+}
+
+    //! This box's tune identity: platform|arch|model_id|os_build|cpu — a sidecar carrying a
+    //! different identity reads as stale (the cross-box hazard). Always five fields, non-empty
+    //! cpu (the schema requires it); os_build keeps its full value, `box_match_key` folds it.
+def tune_box_identity() : string {
+    if (!empty(g_box_identity)) {
+        return g_box_identity
+    }
+    var model_id = ""
+    var os_build = ""
+    var cpu = ""
+    let plat = get_platform_name()
+    if (plat == "windows") {
+        var build = ""
+        unsafe {
+            popen("ver") $(f) {
+                if (f != null) {
+                    while (!feof(f)) {
+                        let ln = strip(fgets(f))
+                        if (!empty(ln)) {
+                            build = ln
+                        }
+                    }
+                }
+            }
+        }
+        let lb = find(build, "[")
+        let rb = find(build, "]")
+        // keep only the trailing [0-9.] version run, so a localized "Version" word (and its
+        // console-codepage bytes) never enters the identity
+        os_build = (lb >= 0 && rb > lb) ? digits_tail(strip(slice(build, lb + 1, rb))) : ""
+        if (empty(os_build)) {
+            os_build = env_value_of("OS")
+        }
+        cpu = env_value_of("PROCESSOR_IDENTIFIER")
+    } elif (plat == "osx" || plat == "darwin") {   // get_platform_name says "darwin" on macOS
+        var lines : array<string>
+        unsafe {
+            popen("sysctl -n hw.model kern.osversion machdep.cpu.brand_string 2>/dev/null") $(f) {
+                while (!feof(f)) {
+                    let ln = strip(fgets(f))
+                    if (!empty(ln)) {
+                        lines |> push(ln)
+                    }
+                }
+            }
+        }
+        // positional: a missing sysctl key blank-fills its field rather than collapsing the count
+        model_id = !empty(lines) ? lines[0] : ""
+        os_build = length(lines) > 1 ? lines[1] : ""
+        cpu = length(lines) > 2 ? lines[2] : ""
+        delete lines
+    } else {
+        unsafe {
+            popen("uname -r 2>/dev/null") $(f) {
+                os_build = strip(fgets(f))
+            }
+        }
+        cpu = linux_cpu_brand()
+    }
+    if (empty(cpu)) {
+        cpu = "unknown-cpu"   // the schema rejects an empty cpu field; never emit one
+    }
+    g_box_identity = "{plat}|{get_architecture_name()}|{model_id}|{os_build}|{cpu}"
     return g_box_identity
+}
+
+    //! Comparison key for a box identity — stored and shown verbatim, but staleness and same-box
+    //! tests fold the volatile Windows `os_build` UBR (4th dotted component) so a monthly patch
+    //! neither invalidates a sidecar nor blocks its resubmit. Lowercased; other builds unchanged.
+def box_match_key(box : string) : string {
+    let parts <- split(box, "|")
+    if (length(parts) != 5) {
+        return to_lower(box)
+    }
+    var osb = parts[3]
+    let dots <- split(osb, ".")
+    if (length(dots) == 4 && all_digits(dots[0]) && all_digits(dots[1])
+        && all_digits(dots[2]) && all_digits(dots[3])) {
+        osb = "{dots[0]}.{dots[1]}.{dots[2]}"   // drop the UBR
+    }
+    return to_lower("{parts[0]}|{parts[1]}|{parts[2]}|{osb}|{parts[4]}")
 }
 
 // provenance.box of the sidecar at `path`, "" when absent/unreadable — cached per path+mtime
@@ -201,7 +302,11 @@ def private sidecar_box(path : string; mkey : string) : string {
         var err = ""
         var doc = read_json(text, err)
         if (doc != null) {
-            box = doc?["provenance"]?["box"] ?? ""
+            // applied_box wins: a resolver-adopted cross-box sidecar records the ADOPTING box there; a hand-copy (no applied_box) still reads stale
+            box = doc?["provenance"]?["applied_box"] ?? ""
+            if (empty(box)) {
+                box = doc?["provenance"]?["box"] ?? ""
+            }
             delete_json(doc)
         }
     }
@@ -209,9 +314,9 @@ def private sidecar_box(path : string; mkey : string) : string {
     return box
 }
 
-    //! True when the sidecar predates the running binary OR carries a different box identity
-    //! (missing counts as different — pre-identity files re-tune once); a stale sidecar reads
-    //! as ABSENT everywhere, killing the copy-a-stale-file and copy-from-another-box traps.
+    //! True when the sidecar predates the running binary OR carries a different box identity —
+    //! the stale-file and cross-box-copy traps; stale reads as ABSENT everywhere. A
+    //! `provenance.applied_box` naming this box overrides the identity check (resolver adoption).
 def tune_sidecar_stale(path : string) : bool {
     var sfs : FStat
     return false if (!stat(path, sfs))   // absent is "missing", not "stale"
@@ -219,7 +324,7 @@ def tune_sidecar_stale(path : string) : bool {
     if (stat(running_binary(), bfs) && sfs.mtime < bfs.mtime) {
         return true
     }
-    return sidecar_box(path, "{sfs.mtime}") != tune_box_identity()
+    return box_match_key(sidecar_box(path, "{sfs.mtime}")) != box_match_key(tune_box_identity())
 }
 
 // the sidecar's "kernels" section as a flat { function name : perm suffix } map;
@@ -264,9 +369,9 @@ def tune_manifest_get(fname : string) : string {
     return r
 }
 
-// the sidecar document for read-modify-write: parsed when fresh, a new empty object when
-// absent, unparsable, or STALE (stale measurements are invalid; the first save makes the
-// file newer than the binary so the rest of the run appends)
+// the sidecar document for read-modify-write: a new empty object when absent, unparsable,
+// STALE, or EXCHANGE-ADOPTED — a local tuner writing over an adopted file must not blend its
+// measured keys with the donor's (that yields a complete-looking, wrongly re-submittable mix).
 def private load_sidecar_doc(path : string) : JsonValue? {
     var doc : JsonValue?
     if (!tune_sidecar_stale(path)) {
@@ -274,6 +379,11 @@ def private load_sidecar_doc(path : string) : JsonValue? {
         if (!empty(text)) {
             var err = ""
             doc = read_json(text, err)
+            if (doc != null && doc.value is _object
+                && (doc?["provenance"]?["origin"] ?? "") == "exchange") {
+                delete_json(doc)
+                doc = null
+            }
         }
     }
     if (doc == null || !(doc.value is _object)) {
@@ -394,6 +504,13 @@ def tune_sidecar_section_merge(section : string; var entries : table<string; Jso
 
 var private g_history_dir = ""
 
+    //! Point the history at an explicit directory in-process (the env loads once at context
+    //! init); arms `DAS_TUNE_HISTORY` for tuner children too.
+def tune_set_history_dir(d : string) {
+    g_history_dir = d
+    set_env_variable("DAS_TUNE_HISTORY", d)
+}
+
     //! This box's tune-history directory: `DAS_TUNE_HISTORY` env, else
     //! `<home>/.tune-history/<sanitized box identity>/`. Every mint archives here — sidecars
     //! are small and the history is the box's longitudinal health record; NEVER deleted.
@@ -401,14 +518,14 @@ def tune_history_dir() : string {
     if (!empty(g_history_dir)) {
         return g_history_dir
     }
-    let env = get_env_variable("DAS_TUNE_HISTORY")
+    let env = g_env_tune.tune_history
     if (!empty(env)) {
         g_history_dir = env
         return g_history_dir
     }
-    var home = get_env_variable("HOME")
+    var home = env_value_of("HOME")
     if (empty(home)) {
-        home = get_env_variable("USERPROFILE")
+        home = env_value_of("USERPROFILE")
     }
     var san = ""
     peek_data(tune_box_identity()) $(bytes) {
@@ -429,9 +546,9 @@ def tune_history_dir() : string {
     //! `.FAILED.json` stub carrying `verdict`/`note`. Best-effort — never fails the mint.
 def tune_history_archive(path : string; verdict : string; note : string) : string {
     let dir = tune_history_dir()
-    var home = get_env_variable("HOME")
+    var home = env_value_of("HOME")
     if (empty(home)) {
-        home = get_env_variable("USERPROFILE")
+        home = env_value_of("USERPROFILE")
     }
     mkdir("{home}/.tune-history")   // best-effort parents; mkdir on an existing dir is a no-op failure
     mkdir(dir)
@@ -536,10 +653,24 @@ var private g_noise_ovr = -1
     //! else 2% normal / 1% paranoid — confirmed empirically on the quiet boxes during rollout.
 def tune_noise_threshold_pct(paranoid : bool) : double {
     if (g_noise_thr < 0.0lf) {
-        let v = to_float(get_env_variable("DAS_TUNE_NOISE_CV"))
+        let v = g_env_tune.tune_noise_cv
         g_noise_thr = v > 0.0f ? double(v) : 0.0lf
     }
     return g_noise_thr > 0.0lf ? g_noise_thr : (paranoid ? 1.0lf : 2.0lf)
+}
+
+    //! Recalibrate the noise gate in-process (the env loads once at context init, so a
+    //! harness sets this instead of `set_env_variable`); the env is armed for tuner children.
+def tune_set_noise_cv(pct : float) {
+    g_noise_thr = pct > 0.0f ? double(pct) : 0.0lf
+    set_env_variable("DAS_TUNE_NOISE_CV", "{pct}")
+}
+
+    //! True when `DAS_TUNE_NOISE_CV` recalibrated the gate — the announce hook for the
+    //! overrides-are-visible rule (a threshold line a recalibration shaped must say so).
+def tune_noise_threshold_overridden() : bool {
+    tune_noise_threshold_pct(false)   // force the lazy seed; the paranoid arg does not affect the override bit
+    return g_noise_thr > 0.0lf
 }
 
     //! True when `DAS_TUNE_NOISE_OVERRIDE` asks to tune through a failing noise gate anyway.
@@ -547,10 +678,15 @@ def tune_noise_threshold_pct(paranoid : bool) : double {
     //! a mark, so a later regression hunt can see the mint was taken on a loud box.
 def tune_noise_override() : bool {
     if (g_noise_ovr < 0) {
-        let v = get_env_variable("DAS_TUNE_NOISE_OVERRIDE")
-        g_noise_ovr = (!empty(v) && v != "0") ? 1 : 0
+        g_noise_ovr = g_env_tune.tune_noise_override ? 1 : 0
     }
     return g_noise_ovr == 1
+}
+
+    //! In-process twin of `DAS_TUNE_NOISE_OVERRIDE` (load-once env); arms children too.
+def tune_set_noise_override(b : bool) {
+    g_noise_ovr = b ? 1 : 0
+    set_env_variable("DAS_TUNE_NOISE_OVERRIDE", b ? "1" : "0")
 }
 
 // ===== tune status (runtime) =====
@@ -787,10 +923,10 @@ struct private TunePerm {
     // selection only; the generator's own decline predicate stays the emission truth.
 def private fallback_feature_ok(name : string) : bool {
     if (cpu_supports(name)) return true
-    for (part in split(get_env_variable("DAS_JIT_X64_FORCE_FEATURES"), ",")) {
+    for (part in split(g_env_jit.jit_x64_force_features, ",")) {
         if (part == name) return true
     }
-    for (part in split(get_env_variable("DAS_JIT_ARM64_FORCE_FEATURES"), ",")) {
+    for (part in split(g_env_jit.jit_arm64_force_features, ",")) {
         if (part == name) return true
     }
     return false
@@ -1135,6 +1271,25 @@ class private TuneAnnotation : AstFunctionAnnotation {
         if (manifestFound) {
             suffix = manifest?[fname] ?? ""
         }
+        // clear an adopted winner this box can't run (ISA-gated → would decline to reference; or not in this build's grid → would crash-loop) so the fallback ;-chain picks a legal perm and it boots
+        if (!empty(suffix) && suffix != "reference") {
+            var known = false
+            var eligible = true
+            for (p in perms) {
+                if (p.suffix == suffix) {
+                    known = true
+                    eligible = perm_requires_ok(p)
+                    break
+                }
+            }
+            if (!known || !eligible) {
+                if (tune_verbosity() != "silent") {
+                    let why = known ? "fails its requires= on this box" : "is not in this build's grid"
+                    print("llvm_tune: {fname} manifest winner '{suffix}' {why} - using the fallback chain\n")
+                }
+                suffix = ""
+            }
+        }
         let fromManifest = !empty(suffix)
         var ok = true
         if (empty(suffix)) {
@@ -1309,7 +1464,7 @@ var private g_verbosity = ""
 //! display). Anything unrecognized reads as `normal`, so a typo never silences the tune.
 def tune_verbosity() : string {
     if (empty(g_verbosity)) {
-        let v = get_env_variable("DAS_TUNE_VERBOSITY")
+        let v = g_env_tune.tune_verbosity
         g_verbosity = v == "silent" ? "silent" : (v == "verbose" ? "verbose" : "normal")
     }
     return g_verbosity
@@ -1575,11 +1730,30 @@ def private run_scope_tuner(scope : TuneScope) : bool {
 var private g_tuned_scopes = 0
 var private g_reexec_code = 0
 
+var private g_mint_suppressed = ""
+
+//! Suppress the auto/restart mint (from a library ``[init]``): untuned scopes keep fallback
+//! stamps instead of paying the minutes-long tune. Process-wide across ALL scopes by design —
+//! a dev-run escape, not per-scope policy. ``--tune`` still wins. `knob` prints verbatim.
+def public tune_suppress_mint(knob : string) {
+    g_mint_suppressed = knob
+}
+
     //! Runtime half of `[tune_policy(missing = "auto")]` / `--tune`, injected at the top of the
     //! app's `main` and followed by `tune_auto_reexec()`. Tuning happens at RUNTIME because the
     //! winners are compile-time stamps. An empty or corrupt sidecar reads as untuned, so it self-heals.
 def tune_auto_prepare(scopeName : string; manifestPath : string; tunerPath : string; force : bool; fnames : string) {
     if (!force && tune_sidecar_entries_complete(manifestPath, fnames)) {
+        return
+    }
+    if (!force && scope_resolved_externally(scopeName, manifestPath, fnames)) {
+        g_tuned_scopes++   // the re-exec picks the resolved sidecar up like a fresh tune
+        return
+    }
+    if (!force && !empty(g_mint_suppressed)) {
+        if (tune_verbosity() != "silent") {
+            print("llvm_tune: scope '{scopeName}' is untuned - mint SUPPRESSED ({g_mint_suppressed}); kernels run their fallback\n")
+        }
         return
     }
     announce_tuning(scopeName, force, true)
@@ -1628,11 +1802,56 @@ def tune_reexec_code() : int {
     return g_reexec_code
 }
 
-    //! Runtime half of `[tune_policy(missing = "restart")]`, injected as a guard at the top of the
-    //! app's `main`. Runs the tuner, prints the restart banner, and returns true so main returns
-    //! immediately (the winners are compile-time stamps). False = scope complete, carry on.
+// the pre-tune scope resolver: consulted by the auto and restart guards before spawning the
+// tuner; an app registers one from an [init] (which runs before the guard at the top of main)
+var private g_scope_resolver : function<(scopeName : string; manifestPath : string; fnames : string) : bool>
+var private g_has_scope_resolver = false
+
+    //! Register a resolver the auto/restart guards consult before spawning a scope's tuner —
+    //! e.g. an exchange client downloading a matching sidecar. True = "the scope may now be
+    //! satisfied"; completeness is re-checked, never trusted. Never consulted under `--tune`.
+def tune_set_scope_resolver(resolver : function<(scopeName : string; manifestPath : string; fnames : string) : bool>) {
+    g_scope_resolver = resolver
+    g_has_scope_resolver = true
+}
+
+// resolver consult shared by both guards: true = the scope is complete now, skip the tuner
+// (the resolver prints its own restart marker — the guards add nothing on this path)
+def private scope_resolved_externally(scopeName : string; manifestPath : string; fnames : string) : bool {
+    if (!g_has_scope_resolver) {
+        return false
+    }
+    return (invoke(g_scope_resolver, scopeName, manifestPath, fnames)
+        && tune_sidecar_entries_complete(manifestPath, fnames))
+}
+
+    //! True when the file named by `DAS_TUNE_CONTROL` exists — a supervisor's stop request.
+    //! Tuners poll at kernel-family boundaries and abort without minting, so the measurement
+    //! in flight always completes.
+def tune_interrupt_requested() : bool {
+    let p = g_env_tune.tune_control
+    if (empty(p)) {
+        return false
+    }
+    var fs : FStat
+    return stat(p, fs)
+}
+
+    //! Runtime half of `[tune_policy(missing = "restart")]`, injected as a guard at the top of
+    //! the app's `main`: consults the scope resolver first, else runs the tuner; true = main
+    //! returns immediately (winners are compile-time stamps), false = scope complete, carry on.
 def tune_restart_needed(scopeName : string; manifestPath : string; tunerPath : string; fnames : string) : bool {
     if (tune_sidecar_entries_complete(manifestPath, fnames)) {
+        return false
+    }
+    if (scope_resolved_externally(scopeName, manifestPath, fnames)) {
+        return true   // resolved without a tune; the resolver printed its own restart marker
+    }
+    if (!empty(g_mint_suppressed)) {
+        // false = carry on with fallback stamps, do not tune and do not stop main
+        if (tune_verbosity() != "silent") {
+            print("llvm_tune: scope '{scopeName}' is untuned - mint SUPPRESSED ({g_mint_suppressed}); kernels run their fallback\n")
+        }
         return false
     }
     if (empty(tunerPath)) {
@@ -1692,7 +1911,7 @@ def private collect_status(prog : Program?) : array<TuneStatus> {
     // still owes the status [init], so its call sites re-admit it via exe_status_report().
 def private tune_policy_gated() : bool {
     return (tune_stamp_free_gate() || tune_mode() != "normal"
-        || !empty(get_env_variable("DAS_TUNE_MANIFEST")))
+        || !empty(g_env_tune.tune_manifest))
 }
 
     // -exe owes the status [init] even under a DAS_TUNE_MANIFEST redirect (report ≠ policy —
@@ -1733,9 +1952,14 @@ def private emit_status_init(var errors : string&) {
 def private apply_tune_policy(var func : FunctionPtr; declared : string; var errors : string&) : bool { // nolint:STYLE037,STYLE038 — the policy dispatch ladder: one arm per flavor and gate
     var policy = declared
     {
-        let penv = get_env_variable("DAS_TUNE_POLICY")
+        let penv = g_env_tune.tune_policy
+        // announce deferred to the first INCOMPLETE scope - a fully-tuned start stays silent
+        var envNote = ""
         if (!empty(penv)) {
             policy = penv
+            if (tune_verbosity() != "silent") {
+                envNote = "llvm_tune: policy '{policy}' set by DAS_TUNE_POLICY (declared/default '{declared}')\n"
+            }
         }
         if (policy != "fallback" && policy != "warn" && policy != "error" && policy != "auto" && policy != "restart") {
             errors = "[tune_policy] on {func.name}: missing=\"{policy}\" - use fallback | warn | error | auto | restart"
@@ -1754,6 +1978,10 @@ def private apply_tune_policy(var func : FunctionPtr; declared : string; var err
             seen |> insert(scope.scopeName)
             // per-scope KEY completeness, not file existence — the sidecar is shared
             continue if (!force && tune_sidecar_entries_complete(scope.manifestPath, scope_fnames_joined(scope)))
+            if (!empty(envNote)) {
+                print(envNote)
+                envNote = ""
+            }
             if (force || policy == "auto") {
     // a runtime guard tunes and RE-EXECS: restamping a required module's compiled function is a cross-module mutation re-infer cannot survive
                 if (empty(scope.tunerPath)) {
@@ -1908,7 +2136,9 @@ class private TuneDefaultPolicy : AstPassMacro {
             // standalone build: no policy, but the artifact self-reports its stamps
             emit_status_init(errs)
         } else {
-            ok = apply_tune_policy(main_fn, "auto", errs)
+            // O0 cannot represent winners raced under O3 - default fallback (DAS_TUNE_POLICY wins)
+            let flavor = jit_cli_opt_level() == 0 ? "fallback" : "auto"
+            ok = apply_tune_policy(main_fn, flavor, errs)
         }
         if (!ok || !empty(errs)) {
     // macro_error mid-infer-pass is dropped by the retry loop — print + panic actually stops it

@@ -13,6 +13,11 @@ entry needs code-reading or prior knowledge, it is not a review criterion — mo
 file.** Mark it like any other finding — a checklist defect blocks nothing, but its fix (a
 rewrite or a move, never silent tolerance) lands in the same batch as the round's other fixes.
 
+**New functionality ships with tests — same PR, no follow-up promises.** A new or changed
+reachable branch ships a test that fails without it; a diff that adds a branch no test
+distinguishes is a defect. The audit procedure — including the negative control that settles
+"would it fail?" — is `skills/tdd_audit.md`.
+
 **Form, and it is a hard limit:**
 
 - **One rule is one short paragraph.** An entry that needs more than that is describing how to
@@ -33,8 +38,6 @@ rewrite or a move, never silent tolerance) lands in the same batch as the round'
 
 ## Tests
 
-**New functionality ships with tests — same PR, no follow-up promises.**
-
 **Tests go under `modules/dasImgui/tests`.** No tests go under `tests/dasImgui` — that folder
 must not exist.
 
@@ -51,15 +54,5 @@ so the local run is the pre-push gate.
 OS-only assumptions; locations resolve via `get_das_root()` / module-relative helpers, never
 absolute or machine-local paths.
 
-## Grammar canary — tree-sitter-daslang drift contract
-
-**Any change to `tree-sitter-daslang/grammar.js` regenerates `parser.c`, rebuilds all three
-consumers** (the tree_sitter_daslang shared module/DLL, `daslang`, `daslang-live`) **and shows
-a green `tests/test_grammar_canary.das` — in the same change.** "It still parses" is not the
-gate; the canary is.
-
-**New syntax (`src/parser/ds2_parser.ypp` or `grammar.js`) lands with a new canary section in
-`test_grammar_canary.das` in the same PR** — the canary only protects syntax it pins.
-
-**A red canary names the section that broke. Never ship around it by deleting or loosening
-sections.**
+**`modules/dasImgui/tests/test_grammar_canary.das` is governed by
+`tree-sitter-daslang/CODEREVIEW.md`** — a grammar change touching it applies that list too.

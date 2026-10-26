@@ -337,6 +337,12 @@ Optimization and AOT
     Keeps the function out of best-effort (automatic) inlining - block-literal call-site
     splicing and the heuristic ``auto_inline_functions`` tier both skip it. Combining it
     with ``[inline]`` is a compile-time error: the two contracts are contradictory.
+    On a block literal (``$ [never_inline] (args) { ... }``) it keeps that block from
+    invoke-block inlining. Module-wide, ``options never_inline`` takes the whole module
+    out of the game: the pass skips its bodies (instances of its generics included,
+    wherever they land), and its functions refuse as callees everywhere - an
+    ``[inline]`` call to one degrades to a plain call. As with ``disable_inline``,
+    the declaration-level contract checks (body shape, recursion, ``@@``) still run.
 
 ``[hybrid]``
     Marks a function as an AOT hybrid — it can call interpreted code from AOT context.
@@ -536,12 +542,16 @@ All accept an optional ``name`` argument. If omitted, the class name is used.
    * - ``[global_lint_macro]``
      - ``AstPassMacro``
      - Runs after all modules are compiled
+   * - ``[post_compile_macro]``
+     - ``AstPassMacro``
+     - Runs once the module is compiled and its gc root collected
    * - ``[tag_function_macro(tag="...")]``
      - ``AstFunctionAnnotation``
      - Attaches the macro to every function tagged with ``[tag_function]``
 
 Every pass macro — ``[infer_macro]``, ``[dirty_infer_macro]``, ``[optimization_macro]``,
-``[pre_infer_macro]``, ``[post_infer_macro]``, ``[lint_macro]``, ``[global_lint_macro]`` —
+``[pre_infer_macro]``, ``[post_infer_macro]``, ``[lint_macro]``, ``[global_lint_macro]``,
+``[post_compile_macro]`` —
 derives from the single ``AstPassMacro`` base class and overrides
 ``apply(prog : ProgramPtr; mod : Module?) : bool``. There is no per-pass base class.
 

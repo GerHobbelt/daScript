@@ -92,9 +92,14 @@ namespace das {
         string moduleName, funcName;
         splitTypeName(name, moduleName, funcName);
         MatchingFunctions result;
+        // "__::" means THIS module exactly - but foreach on a module name also walks that
+        // module's public dependencies, so without this filter a `require X public` twin
+        // still makes the lookup ambiguous (the generated class-finalizer pin relies on it)
+        const bool strictThisModule = (moduleName == "__");
         auto inWhichModule = getSearchModule(moduleName);
         auto hFuncName = hash64z(funcName.c_str());
         program->library.foreach ([&](Module *mod) -> bool {
+                if ( strictThisModule && mod != inWhichModule ) return true;
                 auto itFnList = mod->functionsByName.find(hFuncName);
                 if ( itFnList ) {
                     // Hoist module-level visibility — pFn->module == mod for non-generic fns (set in addFunction).
@@ -535,6 +540,7 @@ namespace das {
         vector<ExpressionPtr> padded;
         for (int ai = p; ai != k; ++ai) {
             auto newArg = winner->arguments[ai]->init->clone();
+            stampMissingAt(newArg, expr->at);
             if (!newArg->type) {
                 // recursive resolve - same as the append-default path below
                 inInfer.push_back(winner);
@@ -789,6 +795,7 @@ namespace das {
                 continue;
             }
             auto def = pFn->arguments[s]->init->clone();
+            stampMissingAt(def, expr->at);
             if (!def->type) { // resolve a not-yet-inferred default, same as tryPipedCallPadding
                 inInfer.push_back(pFn);
                 def = def->visit(*this);
@@ -1227,6 +1234,7 @@ namespace das {
                 } else {
                     DAS_ASSERTF(fnArg->init, "somehow matched function, which does not match. can only skip defaults");
                     newCallArguments.push_back(fnArg->init->clone());
+                    stampMissingAt(newCallArguments.back(), expr->at);
                 }
                 fnArgIndex++;
             }
@@ -1238,6 +1246,7 @@ namespace das {
             auto &fnArg = pFn->arguments[fnArgIndex];
             DAS_ASSERTF(fnArg->init, "somehow matched function, which does not match. tail has to be defaults");
             newCallArguments.push_back(fnArg->init->clone());
+            stampMissingAt(newCallArguments.back(), expr->at);
             fnArgIndex++;
         }
         return newCallArguments;
@@ -1802,6 +1811,7 @@ namespace das {
             // append default arguments
             for (size_t iT = expr->arguments.size(), iTs = funcC->arguments.size(); iT != iTs; ++iT) {
                 auto newArg = funcC->arguments[iT]->init->clone();
+                stampMissingAt(newArg, expr->at);
                 if (!newArg->type) {
                     // recursive resolve???
                     inInfer.push_back(funcC);
@@ -1930,12 +1940,14 @@ namespace das {
                                 arg->init = arg->init->visit(*this);
                                 if (arg->init->type && !arg->init->type->isAutoOrAlias()) {
                                     arg->type = new TypeDecl(*arg->init->type);
+                                    if ( !arg->type->at.fileInfo ) arg->type->at = arg->at;
                                     continue;
                                 }
                             }
                             auto argT = inferPartialAliases(arg->type, arg->type, clone, &aliases);
                             if ( !argT->isAutoOrAlias() ) {
                                 arg->type = argT;
+                                if ( !arg->type->at.fileInfo ) arg->type->at = arg->at;
                                 continue;
                             }
                             error("unknown type of argument " + clone->arguments[ai]->name + "; can't instance " + describeFunction(oneGeneric), "",

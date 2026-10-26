@@ -68,6 +68,17 @@ namespace das {
         }, "*");
     }
 
+    void applyPostCompileMacros ( Program * program ) {
+        // macro modules live in the global module list, not in program->library - the same
+        // reason Program::lint reaches global lint macros through Module::foreach
+        Module::foreach([&](Module * mod) -> bool {
+            for ( const auto & pm : mod->postCompileMacros ) {
+                pm->apply(program, program->thisModule.get());
+            }
+            return true;
+        });
+    }
+
     // defined in ast_module.cpp (runtime); appends a parsed builtin module's content
     bool appendBuiltinModuleContent ( Module * target, ProgramPtr program, const string & modName );
 
@@ -570,6 +581,11 @@ namespace das {
         gc_root::gc_get_active_root() = program->thisModule->module_gc_root.get();
     }
 
+    // module-cache stream magic: one header at the head of the whole storage. Lets a new
+    // reader reject a cache written by a different protocol/version cleanly, instead of
+    // desyncing on a layout difference mid-record.
+    static constexpr uint32_t SER_MODULE_STREAM_MAGIC = 0x4D534144u;    // 'DASM'
+
     bool trySerializeProgramModule (
             ProgramPtr          & program,
             const FileAccessPtr & access,
@@ -583,30 +599,50 @@ namespace das {
             return false;
         }
 
-        int64_t file_mtime = access->getFileMtime(fileName.c_str());
         // The serializer module owns the exception boundary. This parser module is
         // also built in configurations where exception handling is disabled.
+
+        // stream header: checked once, and only when this serializer starts at the head of
+        // the storage (a persistent serializer appends several compiles into one stream -
+        // later compiles begin mid-stream, past the header)
+        if ( !serializer_read->checkedStreamHeader ) {
+            serializer_read->checkedStreamHeader = true;
+            if ( serializer_read->buffer->bufferPos == 0 ) {
+                uint32_t magic = 0, version = 0;
+                if ( !serializer_read->trySerialize([&](AstSerializer & serializer) {
+                    serializer << magic;
+                    serializer << version;
+                }) || magic != SER_MODULE_STREAM_MAGIC || version != AstSerializer::getVersion() ) {
+                    serializer_read->seenNewModule = true;
+                    serializer_read->failed = true;
+                    logs << "ser: read failed (stale or foreign module cache stream)\n";
+                    return false;
+                }
+            }
+        }
+
+        int64_t file_mtime = access->getFileMtime(fileName.c_str());
+        int64_t file_size = access->getFileSize(fileName.c_str());
         int64_t saved_mtime = 0;
+        int64_t saved_size = -1;
         string saved_filename{};
-        bool header_mismatch = false;
+        uint64_t payload_size = 0;
         if ( !serializer_read->trySerialize([&](AstSerializer & serializer) {
             serializer << saved_mtime;
+            serializer << saved_size;
             serializer << saved_filename;
-            header_mismatch = saved_filename != fileName || file_mtime != saved_mtime;
-            if ( header_mismatch ) {
-                return;
-            }
-            LOG(LogLevel::debug) << "das: serialize: read program '" << fileName << "' epoch " << (unsigned long long)(serializer.epoch + 1) << "\n";
-            serializer.thisModuleGroup = &libGroup;
-            serializer.serializeProgram(program, libGroup);
+            serializer << payload_size;
         }) ) {
             serializer_read->seenNewModule = true;
-            replaceProgramKeepGcRootValid(program);
             logs << "ser: read failed '" << fileName << "'\n";
             return false;
         }
 
-        if ( header_mismatch ) {
+        // mtime alone is 1-second granular - a same-second rewrite would serve the stale
+        // AST with no diagnostic, so the size rides beside it in the header
+        if ( saved_filename != fileName || file_mtime != saved_mtime || file_size != saved_size ) {
+            // a CHANGED (or added/removed) module invalidates everything after it - das
+            // modules depend on earlier ones (macros), so this stays the prefix cutoff
             serializer_read->seenNewModule = true;
             serializer_read->failed = true;
             if (saved_filename != fileName) {
@@ -615,31 +651,64 @@ namespace das {
             if (file_mtime != saved_mtime) {
                 logs << "ser: file mtime mismatch. Expected " << saved_mtime << ", got " << file_mtime << "\n";
             }
+            if (file_size != saved_size) {
+                logs << "ser: file size mismatch. Expected " << saved_size << ", got " << file_size << "\n";
+            }
             return false;
         }
 
-        if ( program->failed()) {
-            serializer_read->seenNewModule = true;
-            serializer_read->failed = true;
-            replaceProgramKeepGcRootValid(program);
+        size_t payload_start = serializer_read->buffer->bufferPos;
+        // no per-module logging on the happy path - the standalone sink has no level
+        // threshold, so a line here prints once per warm module; the verdict line and the
+        // failure branches below carry everything a human needs
+        bool read_ok = serializer_read->trySerialize([&](AstSerializer & serializer) {
+            serializer.thisModuleGroup = &libGroup;
+            serializer.serializeProgram(program, libGroup);
+        });
+
+        if ( read_ok && !program->failed() && !serializer_read->failed ) {
+            program->thisModuleGroup = &libGroup;
+            if ( serializer_write != nullptr ) {
+                serializer_write->parsedModules.push_back({fileName, file_mtime, file_size, program, program->thisModule.get()});
+            }
+            return true;
+        }
+
+        if ( !read_ok ) {
+            logs << "ser: read failed '" << fileName << "'\n";
+        } else if ( program->failed() ) {
             logs << "ser: program failed '" << fileName << "'\n";
-            return false;
-        }
-
-        program->thisModuleGroup = &libGroup;
-
-        if ( serializer_read->failed ) {
-            serializer_read->seenNewModule = true;
-            replaceProgramKeepGcRootValid(program);
+        } else {
             logs << "ser: serialization failed. Internal issue.\n";
+        }
+        replaceProgramKeepGcRootValid(program);
+
+        // the record failed but the FILE is unchanged (header matched) - environment drift
+        // (e.g. a lazily populated builtin like dasbind, whose registrations only exist
+        // after its registrar module compiles) or a corrupt record. Reparsing the unchanged
+        // file reproduces the write-run state, registrations included, so later records
+        // stay valid: skip to the record end and keep serving them. A zero length (writer's
+        // storage could not backpatch) or an out-of-range one keeps the legacy cutoff.
+        // overflow-safe bound: payload_size is stream data - a wrapped sum must not pass
+        if ( payload_size != 0 && uint64_t(payload_size) <= uint64_t(serializer_read->buffer->buffer.size() - payload_start) ) {
+            // two resume flavors: a builtin cumulative-hash mismatch is environment drift
+            // (a lazily populated builtin like dasbind), deterministic per process - a
+            // rewrite would change nothing and just churn. EVERYTHING else (a throwing
+            // failure, a mangled module name, a missing module) is repaired by the
+            // writeback, so the next run reads clean
+            if ( !serializer_read->builtinHashDrift ) serializer_read->resumedCorrupt ++;
+            serializer_read->buffer->bufferPos = payload_start + size_t(payload_size);
+            serializer_read->failed = false;            // per-record failure; the stream is still aligned
+            // the throwing failure flavor sets seenNewModule too - clear it, or every later
+            // record (still valid: the file is UNCHANGED) reparses instead of serving
+            serializer_read->seenNewModule = false;
+            serializer_read->resumedModules ++;
+            logs << "ser: reparsing in place '" << fileName << "'\n";
             return false;
         }
-
-        if ( serializer_write != nullptr ) {
-            serializer_write->parsedModules.push_back({fileName, file_mtime, program, program->thisModule.get()});
-        }
-
-        return true;
+        serializer_read->seenNewModule = true;
+        serializer_read->failed = true;
+        return false;
     }
 
     bool detectGen2Syntax ( const char * text, uint32_t length, bool& value ) {
@@ -805,7 +874,10 @@ namespace das {
         TextWriter * logs = nullptr;
         explicit ModuleGcFinalize ( Program * p ) : prog(p) {}
         ~ModuleGcFinalize() {
-            if ( prog ) {
+            // thisModule is legitimately null while a deserialize is in flight: Program::serialize
+            // releases it for the whole module-read loop and only restores it at the end, so an
+            // exception unwinding out of that loop reaches here with no module to collect
+            if ( prog && prog->thisModule ) {
                 auto m = prog->thisModule.get();
                 gc_root * oldRoot = m->module_gc_root.get();
                 auto fresh = make_unique<gc_root>();
@@ -825,6 +897,24 @@ namespace das {
         ModuleGcFinalize & operator = ( const ModuleGcFinalize & ) = delete;
     };
 
+    // the CodeOfPolicies ABI canary (see the abi_stamp field): the host exe wrote the stamp with
+    // ITS headers' layout; a mismatch means every later field would be read at wrong offsets, so
+    // fail loud here instead of letting a stale host silently misread the policies (e.g. jit off)
+    bool checkCodeOfPoliciesStamp ( const CodeOfPolicies & policies ) {
+        return policies.abi_stamp == CodeOfPolicies::expected_abi_stamp();
+    }
+
+    void verifyCodeOfPoliciesStamp ( const CodeOfPolicies & policies ) {
+        if ( checkCodeOfPoliciesStamp(policies) ) return;
+        TextPrinter tp;
+        tp << "FATAL: CodeOfPolicies ABI stamp mismatch - the host executable wrote 0x" << HEX
+           << policies.abi_stamp << ", libDaScript expects 0x" << CodeOfPolicies::expected_abi_stamp() << DEC
+           << "\nthe host executable (daslang.exe or an embedder) was built against different daScript"
+           << " headers than this libDaScript - relink the host\n";
+        tp.output();
+        exit(1);
+    }
+
     ProgramPtr parseDaScript ( const string & fileName,
                                const string & moduleName,
                               const FileAccessPtr & access,
@@ -833,6 +923,7 @@ namespace das {
                               bool exportAll,
                               bool isDep,
                               CodeOfPolicies policies ) {
+        verifyCodeOfPoliciesStamp(policies);
         CompilationCallbackGuard compilationCallbackGuard(moduleName, fileName);
         ProgramPtr program = make_smart<Program>();
         // The module's own root is the working/active root for the whole compile, so live
@@ -888,6 +979,7 @@ namespace das {
         parserState.das_gen2_make_syntax = policies.gen2_make_syntax;
         yyscan_t scanner = nullptr;
         int64_t file_mtime = access->getFileMtime(fileName.c_str());
+        int64_t file_size = access->getFileSize(fileName.c_str());
         if ( auto fi = access->getFileInfo(fileName) ) {
             callCompilationCallback(moduleName, fileName, "parse");
             parserState.g_FileAccessStack.push_back(fi);
@@ -1128,8 +1220,8 @@ namespace das {
             if ( policies.macro_context_collect ) libGroup.collectMacroContexts();
             bool logModule = program->options.getBoolOption("log_module_compile_time",policies.log_module_compile_time);
             // For the entry script (isDep == false) the heaviest post-parseDaScript work
-            // (markExecutableSymbolUse / removeUnusedSymbols / deriveAliases / allocateStack /
-            // validateAst) runs in compileDaScript AFTER this point, so the per-module
+            // (markExecutableSymbolUse / removeUnusedSymbols / deriveAliases / allocateStack)
+            // runs in compileDaScript AFTER this point, so the per-module
             // breakdown here would be misleadingly low. The top-level summary emitted later
             // in compileDaScript covers the entry's full cost authoritatively.
             if ( logModule && isDep ) {
@@ -1148,7 +1240,7 @@ namespace das {
             }
             auto & serializer_write = daScriptEnvironment::getBound()->serializer_write;
             if ( serializer_write != nullptr ) {
-                serializer_write->parsedModules.push_back({fileName, file_mtime, program, program->thisModule.get()});
+                serializer_write->parsedModules.push_back({fileName, file_mtime, file_size, program, program->thisModule.get()});
             }
             return program;
         }
@@ -1262,11 +1354,32 @@ namespace das {
 
     void writebackModules ( ModuleGroup & libGroup ) {
         auto & serializer_write = daScriptEnvironment::getBound()->serializer_write;
+        // stream header once, at the head of the storage (a persistent serializer appends
+        // several compiles into one stream - only the first one carries the header)
+        if ( serializer_write->buffer->writingSize() == 0 ) {
+            uint32_t magic = SER_MODULE_STREAM_MAGIC;
+            uint32_t version = AstSerializer::getVersion();
+            *serializer_write << magic;
+            *serializer_write << version;
+        }
         for ( auto & parsedModule : serializer_write->parsedModules ) {
-            auto & [fileName, fileMtime, program, thisModule] = parsedModule; // parsedModule is tuple<string, int64_t, ProgramPtr, Module *>
+            auto & [fileName, fileMtime, fileSize, program, thisModule] = parsedModule; // tuple<string, int64_t, int64_t, ProgramPtr, Module *>
             *serializer_write << fileMtime;
+            *serializer_write << fileSize;
             *serializer_write << const_cast<string &>(fileName);
+            // record length, backpatched after the payload: lets the reader skip a record
+            // that fails to deserialize for an UNCHANGED file and keep serving later ones.
+            // Fixed-width u64 on purpose - an adaptive size could not be patched in place.
+            uint64_t payload_size = 0;
+            size_t len_at = serializer_write->buffer->writingSize();
+            *serializer_write << payload_size;
+            size_t payload_start = serializer_write->buffer->writingSize();
             if ( program->thisModule && program->thisModule->name.empty() )  {
+                serializer_write->serializeProgram(program, libGroup);
+            } else if ( program->thisModule.get() == thisModule ) {
+                // the ENTRY program still owns its module (dependency programs released
+                // theirs in addNewModules) - re-attaching via reset(get()) would delete
+                // the module and leave a dangling pointer
                 serializer_write->serializeProgram(program, libGroup);
             } else {
                 // set thisModule to program
@@ -1274,6 +1387,8 @@ namespace das {
                 serializer_write->serializeProgram(program, libGroup);
                 program->thisModule.release();
             }
+            payload_size = uint64_t(serializer_write->buffer->writingSize() - payload_start);
+            serializer_write->buffer->patch(len_at, &payload_size, sizeof(payload_size));
         }
     }
 
@@ -1496,14 +1611,14 @@ namespace das {
                                 TextWriter & logs,
                                 ModuleGroup & libGroup,
                                 CodeOfPolicies policies ) {
+        verifyCodeOfPoliciesStamp(policies);
         DAS_ASSERTF(policies.no_init_check || (daScriptEnvironment::getBound() && daScriptEnvironment::getBound()->g_modulesInitialized),
             "compileDaScript on an environment that never called Module::Initialize(); "
             "call das::Module::Initialize() after registering modules in this environment.");
         gc_guard compile_gc_scope;
         GcCollectOnExit compile_gc_collect(compile_gc_scope);
         ReuseCacheGuard rcg;
-        bool exportAll = policies.export_all || policies.validate_ast;
-        if ( policies.validate_ast ) policies.rtti = true;
+        bool exportAll = policies.export_all;
         auto time0 = ref_time_ticks();
         *totParse = 0;
         *totInfer = 0;
@@ -1588,9 +1703,15 @@ namespace das {
             if ( serializer_read && !policies.serialize_main_module ) serializer_read->seenNewModule = true;
             auto res = parseDaScript(fileName, modName, access, logs, libGroup, exportAll, false, policies);
             compile_gc_collect.prog = res.get();
-            // wirteback all parsed modules from serializer_write
-            if ( daScriptEnvironment::getBound()->serializer_write != nullptr
-                && (!daScriptEnvironment::getBound()->serializer_read || daScriptEnvironment::getBound()->serializer_read->failed) ) {
+            // writeback all parsed modules from serializer_write - but never from a FAILED
+            // compile: a syntax error must not overwrite a good cache with a broken graph.
+            // Fires when the stream went stale (failed), or when a resumed record failed
+            // the THROWING way (resumedCorrupt) - that stream is damaged and self-heals
+            // here; drift-flavored resumes (dasbind) deliberately do not rewrite
+            if ( daScriptEnvironment::getBound()->serializer_write != nullptr && !res->failed()
+                && (!daScriptEnvironment::getBound()->serializer_read
+                    || daScriptEnvironment::getBound()->serializer_read->failed
+                    || daScriptEnvironment::getBound()->serializer_read->resumedCorrupt != 0) ) {
                 writebackModules(libGroup);
             }
             policies.threadlock_context |= res->options.getBoolOption("threadlock_context",false);
@@ -1630,7 +1751,9 @@ namespace das {
             if ( !res->failed() ) {
                 res->thisNamespace = "_anon_" + to_string(normalizedPathHash(fileName, getDasRoot()));
             }
-            res->validateAst();
+            if ( !res->failed() ) {
+                applyPostCompileMacros(res.get());
+            }
             if ( res->options.getBoolOption("log_total_compile_time",policies.log_total_compile_time)
                  || res->options.getBoolOption("log_module_compile_time",policies.log_module_compile_time) ) {
                 auto totT = get_time_usec(time0);

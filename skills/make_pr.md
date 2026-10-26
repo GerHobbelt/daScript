@@ -45,6 +45,33 @@ under the self-review rule) and merge the reports. Registry caveat: agent defini
 snapshot at session start, so a just-pulled or just-edited definition only exists in the
 next session.
 
+Alongside the checklist auditors, launch the **`tdd-auditor` agent**
+(`.claude/agents/tdd-auditor.md`) — ONE instance for the whole diff, CODEREVIEW.md folders
+or not. It audits the constitutional test rule (a new or changed reachable branch has a
+test that fails without it — procedure in `skills/tdd_audit.md`), runs negative
+controls where reading can't settle a branch, and runs the cheat check over the diff's own
+test edits. Fix policy: an UNTESTED branch gets its test written in the same change, never
+a follow-up promise; an UNPROVEN one gets its named settling run executed, or the claim
+stated explicitly in the PR description; a RETUNED test edit (re-tuned to pass, no stated
+reason) gets the old expectation restored or the reason stated; a WEAKENED one (assertion
+weakened, case deleted, skip added — coverage loss the diff didn't require) gets the
+instrument restored or the reason stated — never shipped silent.
+
+When the change warrants a full review round (non-trivial arcs), the round itself —
+grounding, change-derived risk dimensions, parallel surfacers, the falsification-gate
+prover — is `skills/review_round.md`; the auditor instances above run as part of its
+surfacing phase, and this step's discovered set feeds its grounding.
+
+### 0a2. Style hygiene audit — mandatory run, non-blocking findings
+
+Every PR's new code gets the `style-hygiene-auditor` agent
+(`.claude/agents/style-hygiene-auditor.md`), whose rulebook is
+`skills/comment_style_hygiene.md` — comments, naming, and code shape, any language.
+Small diff: one instance over the whole changed set. Large diff: one instance per file
+cluster (by directory or language), reports merged. The run is mandatory; the findings
+are not a gate — fix each or consciously decline it (unlike lint, which blocks). Same
+registry caveat as above.
+
 ### 0b. Build-config drift — nuke `build/` only when you see it
 
 The "never `rm -rf build`" rule stands, and there is **no per-PR clean-build step**: the drift a proactive nuke would pre-empt is rare (it needs configure args or `ExternalProject` inputs to actually change), heavily MSVC-skewed, and fixed reactively at the same cost. Nuke and reconfigure **only on these symptoms**:
@@ -159,6 +186,27 @@ The candidate files are auto-stripped from the corpus before comparison, so it's
 Skip this step for PRs that only touch tests, fixtures, or generated files.
 
 See `skills/detect_dupe.md` for the full workflow including B1 baseline / CI gate modes.
+
+## 1.6. AST verify — mandatory when the diff touches macros or AST building
+
+If the diff touches `daslib/*.das` macro code, a `[*_macro]` class, `utils/`
+macro tooling, or the compiler's AST generation / inference (`src/ast/*.cpp`),
+the tree must still verify clean:
+
+```bash
+# the files you changed, plus anything that requires them
+<daslang> --ast-verify -compile-only <changed .das files>
+# broader, when you touched daslib or src/ast: only an `AST verify` line is a failure
+find daslib tests -name '*.das' ! -name 'cant_*' ! -name 'failed_*' ! -name 'invalid_*' -print0 \
+  | xargs -0 -P8 -n1 <daslang> --ast-verify -compile-only
+```
+
+Expect **zero** `AST verify` lines — the tree is clean tree-wide, so any report is
+a bug in whatever built the node, not a pre-existing wart. The two invariants (a
+node carries the location of the construct it stands for; a node has exactly one
+parent) and the repair tools are in `skills/das_macros.md`. The full nightly sweep
+is not a PR gate (`skills/preflight.md`), which is exactly why this local run
+matters.
 
 ## 1.7. Workaround audit — read every changed file for hacks
 
@@ -399,7 +447,10 @@ created it.
 | Step | Tool/Command | Fix policy |
 |---|---|---|
 | Sync | `git fetch origin master && git rebase origin/master` | Always run first; verify diff vs origin/master is clean |
+| CODEREVIEW audit | step-0a walk → one `codereview-md-auditor` per discovered checklist | Binding rules; checklist defects fixed in the same batch |
+| TDD audit | one `tdd-auditor` on the whole diff (`skills/tdd_audit.md`) | UNTESTED branch → write the test in the same change; UNPROVEN → run the named gate or state the claim in the PR; RETUNED/WEAKENED test edit → restore the expectation/instrument or state the reason |
 | Lint | `utils/lint/main.das --quiet` on `git diff --name-only origin/master..HEAD -- '*.das'` | **Zero warnings.** Fix or `// nolint:CODE` every one — CI exits 2 on any warning |
+| AST verify | `<daslang> --ast-verify -compile-only <changed .das>` when the diff touches macros or `src/ast` | **Zero** `AST verify` lines. A report is a bug in the node's builder — see `skills/das_macros.md` |
 | Workaround audit | `git diff origin/master..HEAD` — read every changed file | Smell (redundant step / synthetic≠real / special-case / copied-hack) → surface fix-vs-workaround and **ask**; never ship a buried workaround |
 | Tests | `dastest -- --test tests/` | Must pass. Fix own, fix obvious pre-existing, ask about unclear |
 | JIT smoke | `daslang.exe -jit <test>.das 2>&1 \| grep -iE "verifier\|Both operands"` | Empty output = pass. Windows `clang-cl` link fail is local-only, ignore |

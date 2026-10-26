@@ -16,6 +16,7 @@ require math
 require daslib/strings_boost public
 require daslib/logger public              // structured, ISO-8601-timestamped ndjson event log
 require daslib/json public                // JV(...) for logger field payloads
+require daslib/json_boost                 // ?[] / ?? navigation — the sidecar provenance reader
 require dasllama/dasllama_common public   // QuantMode
 require dasllama/dasllama_math            // active_kernel_backend — the exec_fmt layout receipt
 require llvm/daslib/llvm_tune             // tune_status — stamp provenance for the platform block
@@ -335,8 +336,10 @@ def run_and_stream(args : array<string>; var tail_out : string&; keep_tail : int
             }
             print(line)
             acc = "{acc}{line}"
+            // rolling tail: acc is a fresh string on every line and never exceeds 2 * keep_tail,
+            // so the trim below runs once per keep_tail bytes of child output
             if (length(acc) > keep_tail * 2) {
-                acc = slice(acc, length(acc) - keep_tail)
+                acc = slice(acc, length(acc) - keep_tail)   // nolint:PERF031 - bounded source, one slice per trim
             }
         }
     }))
@@ -500,7 +503,8 @@ def tune_summary() : string {
 //! * **``DAS_TUNE_MANIFEST`` pinned**: stamps apply, status stays empty (framework gap,
 //!   ledgered) — gate on the FILE: present, newer than the binary, carrying kernels.
 //! * **plain script**: the policy rail ran, so every row must stamp a manifest winner.
-//! ``DASLLAMA_ALLOW_UNTUNED=1`` is the dev-run escape in all three.
+//! ``DASLLAMA_ALLOW_UNTUNED=1`` is the dev-run escape in all three (it also suppresses the
+//! auto-mint at ``[init]`` — see ``dasllama_math_gen_register`` — so the gate is reached at all).
 def tune_gate() : bool {
     var why = ""
     let mpath = g_env_core.tune_manifest
@@ -895,6 +899,21 @@ def private compute_sha256(path : string) : string {
     //! Rows minted under different generations are not comparable; "" when the sidecar is absent.
 def tune_manifest_sha() : string {
     return sidecar_generation_sha(tune_manifest_path())
+}
+
+//! The mint's noise verdict from the sidecar provenance ("ok" | "overridden"; "" when the
+//! sidecar or its provenance is absent) — records copy it so a mint taken through a failing
+//! noise gate is visible on the board, not only inside the sidecar.
+def tune_manifest_noise() : string {
+    let path = tune_manifest_path()
+    if (!stat(path).is_valid) {
+        return ""
+    }
+    var err = ""
+    var doc = read_json(fread(path), err)
+    let verdict = doc?["provenance"]?["noise"] ?? ""   // string-heap value; safe past delete_json (nodes only)
+    delete_json(doc)
+    return verdict
 }
 
     //! sha256 of an explicit sidecar file — the oracle's current-generation probe; "" when absent.
@@ -1616,10 +1635,14 @@ struct BenchRun {
     @optional source : string   // "official" | "community" — stamped by the store driver, not the tool
     @optional sha : string      // engine commit (das: git HEAD; llama.cpp: build_commit)
     @optional version : string  // das release version
+    @optional dasllama_version : int // dasLLAMA's own release counter (das rows only) — the
+                                // sidecar-exchange roster key; see dasllama_version.das
     @optional versions : string // reference-tool version line (venv package pins, patch sha) — see B4
     @optional tune : string     // das gen-kernel stamp provenance — required for reproducibility
     @optional tune_sha : string // sha256 of the tune sidecar the exe shipped with — the sidecar
                                 // GENERATION; rows across generations are not comparable
+    @optional noise : string    // the mint's noise verdict from the sidecar provenance ("ok" |
+                                // "overridden") — an overridden mint shows on the board, not only in the sidecar
     @optional exec_fmt : string // what this engine EXECUTES for this file (weight formats per site
                                 // class + activation/scale treatment) — the apples-to-apples receipt;
                                 // das derives it from the loaded Model, llama.cpp rows from flavor

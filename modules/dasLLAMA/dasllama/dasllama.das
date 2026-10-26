@@ -4,9 +4,10 @@ options _comment_hygiene = true
 //! dasLLAMA — CPU LLM inference over GGUF models, in pure daslang. This module is the public API:
 //! ``load_model`` -> ``create_session`` -> ``encode`` / ``eval`` / ``sample`` (or the one-call
 //! streaming ``generate``), plus the chat layer (``create_chat`` / ``add_user`` / ``respond``).
-//! Requiring it also registers every supported architecture (Llama-2/3, Mistral, Qwen, Phi-3,
-//! Gemma-2/3/4, Qwen-MoE, gpt-oss) — ``load_model`` dispatches on GGUF metadata, so the same
-//! program runs any of them.
+//! Requiring it also registers every supported architecture (Llama-2/3, Mistral-3, the
+//! Qwen-2/3 dense, VL and MoE families, the Qwen3.5/3.6 DeltaNet hybrids, GLM-4.5 MoE,
+//! Phi-3, Gemma-2/3/4, gpt-oss) — ``load_model`` dispatches on GGUF metadata, so the same
+//! program runs any of them; ``arch_names()`` lists the live registry.
 //!
 //! Run model programs with ``-jit`` (interpreted inference is far too slow), wrap the
 //! generation in ``with_job_que()`` from ``daslib/jobque_boost`` so the kernels can thread, and
@@ -285,6 +286,20 @@ def add_tool_results(var chat : ChatSession; results : array<string>) {
     add_tool_results_(chat, results)
 }
 
+def add_tool_results(var chat : ChatSession; results : array<string>; names : array<string>) {
+    //! ``add_tool_results`` with each result's function NAME known (e.g. mapped back from its
+    //! ``tool_call_id``) — the name-spelling framings (harmony, gemma-4) then pair results
+    //! correctly even out of call order. An empty name slot falls back to the last call set.
+    add_tool_results_(chat, results, names)
+}
+
+def parse_calls(chat : ChatSession; reply : string) : ToolReply {
+    //! Parse a complete reply per the model family's wire format into a ToolReply — the reasoning
+    //! span, the content, and the calls with arguments normalized to JSON object text. A family with
+    //! no tool format returns the reasoning/content split alone (safe on every reply); the buffered twin of the server's streaming parse.
+    return <- parse_calls_(chat, reply)
+}
+
 def set_thinking(var chat : ChatSession; on : bool) {
     //! Toggle reasoning for a hybrid thinking model (Qwen3 family): ``false`` appends the
     //! template's empty think block so the model answers directly. No-op without a suppress
@@ -296,6 +311,46 @@ def render_assistant_calls(model : Model; var chat : ChatSession; text : string;
     //! ``render_assistant``'s tool-calling twin: replay an assistant turn that emitted tool calls
     //! (verbatim ``\{"name":…,"arguments":…}`` objects) plus any ``text`` alongside.
     render_assistant_calls_(model, chat, text, calls, out)
+}
+
+def effective_stop_ids(chat : ChatSession) : array<int64> {
+    //! The stop ids in force for the NEXT generation: the template's stops plus its thinking-off
+    //! extras while thinking is off. Schedulers that stop streams themselves read this, not
+    //! ``chat.stop_ids``, so an instruct-mode gemma-4 cuts at a stray channel marker.
+    return <- effective_stop_ids_(chat)
+}
+
+def split_reasoning(chat : ChatSession; reply : string) : ThinkSplit {
+    //! Split a complete reply at its reasoning boundary per the model family's reply format
+    //! (``<think>`` pair, Harmony channels, gemma-4's thought channel). Both halves come back
+    //! stripped when a reasoning span is found; a reply with no reasoning passes through untouched.
+    return split_reasoning_(chat.tmpl, reply)
+}
+
+def make_think_stream(chat : ChatSession) : ThinkStream {
+    //! The incremental reasoning/content splitter for ``chat``'s next turn — feed streamed pieces
+    //! through ``think_feed``, flush with ``think_finish``. Armed only when the turn actually
+    //! thinks (toggle on, markers in the vocab, gate rendered) — else a pass-through stream.
+    return make_think_stream_(chat)
+}
+
+def think_drain(var ts : ThinkStream; full : string) : ThinkSplit {
+    //! Drain a COMPLETE reply through the splitter in one call: feed + finish + the strip rule
+    //! (both halves strip when a reasoning span was consumed). The buffered-response twin of the
+    //! ``think_feed``/``think_finish`` streaming pair.
+    return think_drain_(ts, full)
+}
+
+def think_feed(var ts : ThinkStream; piece : string; var reasoning, content : string&) {
+    //! Feed one streamed piece through the splitter; the out-strings are OVERWRITTEN with this
+    //! piece's reasoning/content deltas (either may be empty while a partial marker is held).
+    think_feed_(ts, piece, reasoning, content)
+}
+
+def think_finish(var ts : ThinkStream; var reasoning, content : string&) {
+    //! Flush the splitter at end-of-generation (OVERWRITES the out-strings with the final deltas):
+    //! an unclosed reasoning span classifies as reasoning — the truncated-tail rule.
+    think_finish_(ts, reasoning, content)
 }
 
 def respond(model : Model; var chat : ChatSession; params : SamplingParams;

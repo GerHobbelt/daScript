@@ -142,8 +142,10 @@ modules/dasLLAMA/
     dasllama_plane.das        #   the borrowed-plane vocabulary — Plane* structs: a pointer into a prepared image + element count; a carrier owns only its backing
     dasllama_image.das        #   the .dlim prepared-model image — post-load planes dumped once, mapped back with zero O(model) copying
     dasllama_unicode.das      #   Unicode classification + UTF-8 codec
-    dasllama_tokenizer.das    #   SentencePiece tokenizer (Llama-2 family, Phi-3, Gemma)
-    dasllama_bpe.das          #   byte-level BPE / tiktoken tokenizer (Llama-3 + Qwen2 pre-tokenizers)
+    dasllama_tokenizer.das    #   the tokenizer facade — backend pick + the encode/decode/piece surface
+    dasllama_spm.das          #   SentencePiece backend (Llama-2 family, Phi-3, Gemma)
+    dasllama_bpe.das          #   byte-level BPE backend (Llama-3 / tiktoken family — vocab, ranked merges)
+    dasllama_pretok.das       #   the pre-tokenizer — one hand-compiled split per family, picked by `pre`
     dasllama_common.das       #   engine core — Config / Model / Session, load + forward + generate + sample (incl. MTP/NextN self-spec decode)
     dasllama_blocks.das       #   the shared dense/grouped transformer block helpers (FFN, embed rows, eval bridges)
     dasllama_moe.das          #   MoE routing — select, expert dispatch, the GPU expert-tier hooks
@@ -183,7 +185,7 @@ modules/dasLLAMA/
   harness/                    # verification / eval test beds, per-box tuners, GGUF inspection tools
   tests/                      # dastest [test] suites (model-gated ones self-skip)
 examples/dasLLAMA/            # runnable demos only — run.das (completion + stats), chat.das (REPL), audio_chat.das (audio chat), transcribe.das (speech-to-text), dictate.das (live mic -> text)
-tutorials/dasLLAMA/           # the guided series — 01 generate ... 06 add an arch, 07 speech-to-text, 08 audio chat
+tutorials/dasLLAMA/           # the guided series — 00 problem statement, 01 generate ... 11 tool calling, 12 voice activity, 13 serving
 ```
 
 One require is the whole public API (docs: the `dasllama` page in the stdlib reference):
@@ -198,8 +200,8 @@ Engine internals remain reachable for tools and kernel work:
 
 ```das
 require dasllama/dasllama_transformer    // engine spellings (load_model_, eval_, ...) + raw load_gguf / forward
-require dasllama/dasllama_tokenizer      // SentencePiece
-require dasllama/dasllama_bpe            // byte-level BPE (Llama-3 / Qwen2)
+require dasllama/dasllama_tokenizer      // tokenizer facade (re-exports the SPM + BPE backends)
+require dasllama/dasllama_bpe            // byte-level BPE backend (Llama-3 / Qwen2; pretok arms in dasllama_pretok)
 require dasllama/dasllama_math           // matmul / rmsnorm / softmax / silu / rope / dot
 ```
 
@@ -311,8 +313,10 @@ What a model needs to "just work" today:
 | Model size | files >4GB load (needed the fmap >4GB engine fix); single >4GB in-memory arrays (a 7.1GB Q8 weight blob, a 4GiB KV cache at native seq_len) work on the default context heap — no `options persistent_heap` needed (needed the 64-bit linear-chunk engine fix) |
 | Attention biases | **Qwen2** / **glm4moe** — Q/K/V projection biases; **gpt-oss** — Q/K/V + output-projection biases |
 | Sampling | greedy, temperature, top-k, top-p, min-p, repetition/presence/frequency penalties (`SamplingParams`; greedy = temp 0, bit-identical to argmax) |
-| Chat | per-arch data-driven templates in the registry + one segment-accumulation renderer (`dasllama_chat`) — reproduces the reference prefills token-for-token (`test_chat.das`); the template is auto-detected by sniffing the GGUF's embedded `tokenizer.chat_template` (never executed), falling back to the arch heuristic; Qwen3-style `<think>` blocks are stripped from chat history (`strip_think`); Gemma-4 uses its channel-based turn format (`<|turn>` / `<turn|>`, non-thinking opener closes an empty `thought` channel); gpt-oss uses the Harmony-lite template (`<|start|>role<|message|>...<|end|>`, replies end at `<|return|>` / `<|call|>`, channel markers render in decoded text as in llama.cpp) |
-| Self-speculative decode (MTP/NextN) | qwen35-family `-MTP-` GGUFs load natively (`nextn_predict_layers == 1`): the in-file NextN draft block — one trunk-shaped attention layer at index `n_layers` plus `nextn.eh_proj/enorm/hnorm/shared_head_norm` — drafts one token ahead and a 2-row batched trunk forward verifies it, so accepted steps stream the weights once for two tokens. **Output-invariant vs plain greedy** (gated by `modules/dasLLAMA/tests/test_mtp.das` + the scheduler arm in `test_llm_scheduler.das`); 1.39× decode on Qwen3.6-27B Q8 flat-loop, ~2× through the server (zen2, list continuation). Engine gate `set_mtp_spec` + per-step `mtp_spec_eval`: prefills maintain the head's KV incrementally (chunked prefill included, seam rows via the `mtp_h` handoff), flat AND paged sessions (the pool carries the draft-block slab), every KV codec; `dasllama-server --mtp` spec-ticks greedy streams. Greedy-only v1; the DeltaNet recurrent state snapshots and rolls back around rejected drafts; `mtp_only` sidecar files panic honestly; a draft block with its OWN `nextn.embed_tokens`/`shared_head_head` (glm4moe) disables the MTP head with a warning — the das head drafts through the trunk's embedding/classifier, so it would use the wrong weights there (trunk forward unaffected; llama.cpp never runs the NextN layer either) |
+| Chat | per-arch data-driven templates in the registry + one segment-accumulation renderer (`dasllama_chat`) — reproduces the reference prefills token-for-token (`test_chat.das`); the template is auto-detected by sniffing the GGUF's embedded `tokenizer.chat_template` (never executed), falling back to the arch heuristic; Gemma-4 uses its channel-based turn format (`<|turn>` / `<turn|>`; thinking is opt-in — the `<|think|>` gate opens the system turn and the bare opener lets the model emit its `thought` channel; instruct default prefills the closed empty channel); gpt-oss uses the Harmony-lite template (`<|start|>role<|message|>...<|end|>`, replies end at `<|return|>` / `<|call|>`, channel markers render in decoded text as in llama.cpp) |
+| Thinking (reasoning) | per-arch reply-side matcher (`THINKING.md`): symmetric `<think>` (Qwen3/3.5/3.6, GLM), Harmony channel-switch (gpt-oss), asymmetric channels (Gemma-4) — `split_reasoning` splits a reply into reasoning/content (history stores content only), the `make_think_stream`/`think_feed`/`think_finish` splitter streams the same split, and both are vocab-gated so an inert declaration (Qwen2.5 shares the ChatML template without think tokens) never reclassifies a reply; `set_thinking` toggles the per-family default (`enable_thinking=false` empty-block suppression, Gemma-4's opt-in gate), and `effective_stop_ids` adds the instruct-mode framing-marker stops |
+| Tool calling | per-arch `ToolMode` wire codecs (`dasllama_tools.das`): hermes (Qwen), harmony (gpt-oss), gemma4 DSL, mistral control tokens, llama_json — defs render, call replay, and result framing dispatch on the mode in the chat layer (`set_tools`/`add_tool_results`/`render_assistant_calls`), the server parses each format back to OpenAI `tool_calls`; model-free codec pins in `tests/test_tool_formats.das`, live legs per family in the server tests |
+| Self-speculative decode (MTP/NextN) | qwen35-family `-MTP-` GGUFs load natively (`nextn_predict_layers == 1`): the in-file NextN draft block — one trunk-shaped attention layer at index `n_layers` plus `nextn.eh_proj/enorm/hnorm/shared_head_norm` — drafts one token ahead and a 2-row batched trunk forward verifies it, so accepted steps stream the weights once for two tokens. **Output-invariant vs plain greedy** (gated by `modules/dasLLAMA/tests/test_mtp.das` + the scheduler arm in `test_scheduler.das`); 1.39× decode on Qwen3.6-27B Q8 flat-loop, ~2× through the server (zen2, list continuation). Engine gate `set_mtp_spec` + per-step `mtp_spec_eval`: prefills maintain the head's KV incrementally (chunked prefill included, seam rows via the `mtp_h` handoff), flat AND paged sessions (the pool carries the draft-block slab), every KV codec; `dasllama-server --mtp` spec-ticks greedy streams. Greedy-only v1; the DeltaNet recurrent state snapshots and rolls back around rejected drafts; `mtp_only` sidecar files panic honestly; a draft block with its OWN `nextn.embed_tokens`/`shared_head_head` (glm4moe) disables the MTP head with a warning — the das head drafts through the trunk's embedding/classifier, so it would use the wrong weights there (trunk forward unaffected; llama.cpp never runs the NextN layer either) |
 | Performance | KV cache, SIMD + JobQue-threaded matmul, activation-quant Q8·Q8 behind a pluggable kernel-backend registry (ARM SDOT/laneq + the generated x64 AVX2 maddubs/vpdpbusd tier — `history/dasLLAMA/x64_arch.md`), flash-attention batched prefill, per-box kernel tuning (`tune_for_this_box.md`) |
 
 ## Optimization guidelines

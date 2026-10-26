@@ -801,7 +801,11 @@ namespace das {
                     if ( !var->local && !var->argument && !var->block ) {
                         if ( variable->init->rtti_isConstant() ) {
                             reportFolding();
-                            return cloneWithType(variable->init);
+                            auto folded = cloneWithType(variable->init);
+                            // a C++-registered constant carries no location, so the folded
+                            // value reports where it was read
+                            stampMissingAt(folded, var->at);
+                            return folded;
                         }
                     }
                 }
@@ -816,7 +820,9 @@ namespace das {
                     if ( !evar->local && !evar->argument && !evar->block ) {
                         if ( variable->init->rtti_isConstant() ) {
                             reportFolding();
-                            return cloneWithType(variable->init);
+                            auto folded = cloneWithType(variable->init);
+                            stampMissingAt(folded, evar->at);
+                            return folded;
                         }
                     }
                 }
@@ -1379,7 +1385,7 @@ namespace das {
                         message = cast<char *>::to(resM);
                     }
                 } else {
-                    message = iscf ? "static assert failed" : "concept failed";
+                    message = iscf ? "concept assert failed" : "static assert failed";
                 }
                 if ( iscf ) {
                     LineInfo atC = expr->at;

@@ -144,6 +144,9 @@ namespace das {
 
     atomic<int> g_envTotal(0);
 
+    // from module_builtin_fio.cpp — modules whose .shared_module dlopen failed (Quiet)
+    DAS_API string describe_pending_dynamic_modules();
+
     static void daslang_atexit_audit() {
         int n = g_envTotal.load();
         if ( n != 0 ) {
@@ -193,6 +196,13 @@ namespace das {
                 if (!mod_state.at(i)) {
                     error += " " + m->name;
                 }
+            }
+            // A module that never initializes usually failed Module::require on a dependency
+            // whose .shared_module dlopen failed QUIETLY during the startup scan. Name those
+            // load failures (with their dlerror) so this doesn't read as a missing C++ module.
+            auto pendingNote = describe_pending_dynamic_modules();
+            if ( !pendingNote.empty() ) {
+                error += "\nnote: these dynamic modules failed to load - an unresolved dependency may live in one of them:\n" + pendingNote;
             }
             DAS_FATAL_ERROR("Unable to initialize some modules:%s\n", error.c_str());
         }
@@ -803,6 +813,7 @@ namespace das {
         for (auto & m : ptm->preInferMacros) target->preInferMacros.push_back(std::move(m));
         for (auto & m : ptm->postInferMacros) target->postInferMacros.push_back(std::move(m));
         for (auto & m : ptm->lintMacros) target->lintMacros.push_back(std::move(m));
+        for (auto & m : ptm->postCompileMacros) target->postCompileMacros.push_back(std::move(m));
         for (auto & m : ptm->globalLintMacros) target->globalLintMacros.push_back(std::move(m));
         for ( auto & rm : ptm->readMacros ) {
             rm.second->seal(target);
@@ -1149,9 +1160,11 @@ namespace das {
 
     TypeDeclPtr ModuleLibrary::makeStructureType ( const string & name ) const {
         auto t = new TypeDecl(Type::tStructure);
+        t->at = cppBindingLineInfo(name.c_str());
         auto structs = findStructure(name,nullptr);
         if ( structs.size()==1 ) {
             t->structType = structs.back();
+            if ( t->structType->at.fileInfo ) t->at = t->structType->at;
         } else {
             DAS_FATAL_ERROR("makeStructureType(%s) failed\n", name.c_str());
             return nullptr;
@@ -1173,6 +1186,7 @@ namespace das {
 
     TypeDeclPtr ModuleLibrary::makeHandleType ( const string & name ) const {
         auto t = new TypeDecl(Type::tHandle);
+        t->at = cppBindingLineInfo(name.c_str());
         auto handles = findAnnotation(name,nullptr);
 #if DAS_ALLOW_ANNOTATION_LOOKUP
         bool need_require = false;
@@ -1234,9 +1248,11 @@ namespace das {
         }
         auto dann = static_cast<DistinctTypeAnnotation *>(handles.back());
         auto t = new TypeDecl(Type::tDistinct);
+        t->at = cppBindingLineInfo(name.c_str());
         t->annotation = dann;
         if ( dann->underlyingType ) {
             t->firstType = new TypeDecl(*dann->underlyingType);
+            t->firstType->at = cppBindingLineInfo(name.c_str());
         }
         return t;
     }

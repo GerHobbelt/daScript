@@ -4,6 +4,7 @@ options _comment_hygiene = true
 module dasllama_common shared public
 
 require daslib/fio
+require dasllama/dasllama_version public  // DASLLAMA_VERSION — re-exported so the facade chain carries the module's release counter
 require dasllama/dasllama_env  // the g_env_* knob globals ([EnvConfig] declarations; ENVIRONMENT.md is generated from them)
 require dasllama/dasllama_config  // DlimConfiguration — this module registers the cpu/metal sources
 require dasllama/dasllama_kqformat public   // KqFmt + kq_sb + the stride truth — re-exported so every requirer keeps seeing the enum
@@ -20,7 +21,6 @@ require ?llvm/daslib/llvm_tune dasllama/dasllama_math_gen  // [init]-only: regis
 require ?llvm/daslib/llvm_tune llvm/daslib/llvm_tune public  // re-export ONLY llvm_tune (not math_gen's whole public surface — its jobque_boost would flood requirers with ambiguities): the auto-policy pass and tune_status reach every app that requires this module
 require ?das_metal dasllama/dasllama_metal_gemm  // [init]-only: registers "metal" (the GPU prefill-GEMM batch donor). STRICT guard: the C++ das_metal module exists on Apple builds only, so non-Apple lanes never compile the Metal driver
 require ?das_accelerate dasllama/dasllama_math_accelerate  // [init]-only: arms the "+AMX" float-batch override when DASLLAMA_ACCEL=1. Same Apple-only guard shape as the metal driver
-require ?vulkan dasllama/dasllama_math_vulkan  // [init]-only: registers "vulkan" (the GPU tier; stage-0 skeleton, kernels land with the offload rail). STRICT guard: the C++ vulkan module is linked only where the dasVulkan package is installed, so CI lanes without it never compile the Vulkan driver
 require dasllama/dasllama_gguf
 require dasllama/dasllama_gemm_schema  // kq_qsb/kq_ssb — the fmt-id plane strides
 require dasllama/dasllama_tokenizer  // Model owns its tokenizer; load_model populates it
@@ -450,9 +450,9 @@ def register_gpu_upload_resident(fn : GpuUploadResidentFn) {
 
 def gpu_upload_resident(t : Model) {
     if (g_gpu_upload_resident == null) {
-        // A tier CAN arm without the rail — this module requires ?vulkan itself, the rail only from
-        // the transformer umbrella. Silently skipping the upload there would leave a model the tier
-        // believes it serves with nothing on the device, so say so instead.
+        // A tier CAN arm without the rail — a program may require dasllama/dasllama_math_vulkan
+        // directly without the umbrella (which carries both the tier and the rail). Silently skipping
+        // the upload would leave a model the tier believes it serves with nothing on the device.
         if (moe_gpu_tier_installed()) {
             panic("dasLLAMA: a GPU tier is installed but no residency rail registered - the program must require dasllama/dasllama_gpu_resident")
         }
@@ -1012,6 +1012,27 @@ struct ChatTurn {
     parts : array<ChatPart>
 }
 
+//! How a thinking family marks its reasoning span in the DECODED reply (the reply-side matcher's
+//! mode; the prompt-side forms are `think_suppress` / `think_gate` / `assistant_open_think`).
+enum ThinkMode {
+    none            // non-thinking family, or no reply-side format declared
+    symmetric       // <think> ... </think> (Qwen, GLM)
+    channel_switch  // Harmony channels (gpt-oss): <|channel|>analysis ... <|channel|>final
+    asymmetric      // gemma-4: <|channel>thought ... <channel|> (asymmetric brackets by design)
+}
+
+//! The family's tool-calling convention — defs render, call parse, replay, and results framing
+//! all dispatch on it (`ToolMode.none` = no format declared; the server answers `tools` with an
+//! honest 400 there).
+enum ToolMode {
+    none        // no tool format declared
+    hermes      // Qwen: JSON defs in the system prose, <tool_call> marker pair, results ride user turns
+    harmony     // gpt-oss: developer-turn `functions` namespace defs, commentary-channel recipient calls
+    gemma4      // gemma-4: asymmetric <|tool_call> ... <tool_call|> pair
+    mistral     // Mistral v0.3+: [AVAILABLE_TOOLS] defs, [TOOL_CALLS] + JSON array, [TOOL_RESULTS]
+    llama_json  // Llama-3.x custom functions: the whole reply is one JSON object; results on the ipython role
+}
+
 //! Per-arch chat template. `user` frames a user message; `assistant_open` is the generation prompt;
 //! `stop` lists the special-token spellings that end a turn. `system` is empty for arches with no
 //! system role (folded into the first user turn, e.g. Gemma).
@@ -1024,11 +1045,20 @@ struct ChatTemplate {
     assistant_close : ChatTurn = ChatTurn()   // empty = derive from the user turn's tail parts
     think_suppress : ChatTurn = ChatTurn()    // appended to the generation prompt when thinking is off
                                               // (Qwen3-style empty think block; empty = no suppress form)
+    // reply-side reasoning format (split_reasoning_/think_feed_ in the chat layer)
+    think_mode : ThinkMode = ThinkMode.none
+    think_open : string = ""                  // reasoning opener as decoded in the reply (symmetric/asymmetric)
+    think_close : string = ""                 // closer; channel_switch carries Harmony's markers in the mode itself
+    think_default : bool = true               // the family's thinking default (gemma-4 E-series: off)
+    think_gate : ChatTurn = ChatTurn()        // spliced before the system content when thinking is ON (gemma-4 <|think|>)
+    assistant_open_think : ChatTurn = ChatTurn()   // replaces assistant_open when thinking is ON (gemma-4 bare header)
     audio_pre : ChatTurn = ChatTurn()
     audio_post : ChatTurn = ChatTurn()
     stop : array<string>
-    // tool-calling format (empty tool_call_open = the family declares none; see hermes_tools)
-    tool_sys_prelude : string = ""    // opens the tool-definitions block in the system turn
+    stop_nothink : array<string>   // extra stops when thinking is OFF (gemma-4: a channel marker in an instruct turn is framing noise — the turn is over)
+    // tool-calling format (ToolMode.none = the family declares none; see hermes_tools)
+    tool_mode : ToolMode = ToolMode.none
+    tool_sys_prelude : string = ""    // opens the tool-definitions block in the system turn (marker modes)
     tool_sys_epilogue : string = ""   // closes the block + the call-format instructions
     tool_call_open : string = ""      // marker opening one call in assistant output
     tool_call_close : string = ""
@@ -4370,6 +4400,9 @@ def chatml_chat(var ct : ChatTemplate) {
     ct.user.parts <- [chat_special("<|im_start|>"), chat_text("user\n"), chat_content(), chat_special("<|im_end|>"), chat_text("\n")]
     ct.assistant_open.parts <- [chat_special("<|im_start|>"), chat_text("assistant\n")]
     ct.think_suppress.parts <- [chat_special("<think>"), chat_text("\n\n"), chat_special("</think>"), chat_text("\n\n")]
+    ct.think_mode = ThinkMode.symmetric   // reply-side: <think> ... </think>, thinking fine-tunes only
+    ct.think_open = "<think>"
+    ct.think_close = "</think>"
     ct.stop <- ["<|im_end|>", "<|endoftext|>"]
 }
 
@@ -4387,6 +4420,7 @@ def gemma_chat(var ct : ChatTemplate) {
 //! ``<tools>`` JSON definitions in the system turn, ``<tool_call>`` JSON calls in assistant
 //! output, ``<tool_response>`` results riding user turns.
 def hermes_tools(var ct : ChatTemplate) {
+    ct.tool_mode = ToolMode.hermes
     ct.tool_sys_prelude = "# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>"
     ct.tool_sys_epilogue = "</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n\{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>"
     ct.tool_call_open = "<tool_call>"

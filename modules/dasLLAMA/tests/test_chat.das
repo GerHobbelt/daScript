@@ -408,7 +408,392 @@ def test_chat_think_suppress(t : T?) {
         add_user(b, USR)
         let got_off <- render_turn(m, b)
         t |> success(same(got_on, got_off), "no think tokens => prompt unchanged, no panic")
+        // the reply matcher is vocab-gated the same way: a chatml family without the think
+        // tokens (qwen2.5) must NOT arm, or a literal "<think>" echo reclassifies the reply
+        let ts = make_think_stream(b)
+        t |> success(ts.mode == ThinkMode.none, "no think vocab => the reply matcher stays unarmed")
         delete b
+        delete m
+    }
+}
+
+// ===== gemma-4 E-series thinking (opt-in via the <|think|> gate) =====
+
+[test]
+def test_chat_gemma4_thinking(t : T?) {   // nolint:STYLE038 — flat expected-token stream, one push per run
+    t |> run("default = closed empty thought; thinking-ON = gate + bare opener (needs gemma-4-E2B)") @(t : T?) {
+        let path = path_join(models_dir(), "gemma-4-E2B-it-Q4_K_M.gguf")
+        if (!stat(path).is_valid) {
+            t |> skip("{path} not present")
+            return
+        }
+        var m <- load_capped(path)
+        let trn = special_id(m, "<|turn>")
+        let trc = special_id(m, "<turn|>")
+        let cho = special_id(m, "<|channel>")
+        let chc = special_id(m, "<channel|>")
+        let thk = special_id(m, "<|think|>")
+        t |> success(trn >= 0l && trc >= 0l && cho >= 0l && chc >= 0l, "the vocab carries the turn/channel markers")
+        t |> success(thk >= 0l, "the vocab carries the <|think|> gate")
+
+        // thinking OFF (the E-series default): the closed empty thought prefill — the exact
+        // pre-thinking-arc token stream, pinned so the assistant_open restructure changes nothing
+        var c = create_chat_renderer(m, "", 8l)
+        t |> success(!c.enable_thinking, "gemma-4 defaults to thinking off")
+        // instruct mode stops at a stray channel marker; thinking-ON must NOT (they frame the thought)
+        let base_stops = length(c.stop_ids)
+        var eff_off <- effective_stop_ids(c)
+        t |> equal(length(eff_off), base_stops + 2, "thinking-off adds the two channel-marker stops")
+        t |> success(find_index(eff_off, cho) >= 0 && find_index(eff_off, chc) >= 0, "the extras are the channel markers")
+        delete eff_off
+        set_thinking(c, true)
+        var eff_on <- effective_stop_ids(c)
+        t |> equal(length(eff_on), base_stops, "thinking-on keeps only the template stops")
+        delete eff_on
+        set_thinking(c, false)
+        add_user(c, USR)
+        let got <- render_turn(m, c)
+        var want : array<int64>
+        want |> push(bos_id(m))
+        want |> push(trn)
+        want |> push_from(encode(m, "user\n{USR}", false, false))
+        want |> push(trc)
+        want |> push_from(encode(m, "\n", false, false))
+        want |> push(trn)
+        want |> push_from(encode(m, "model\n", false, false))
+        want |> push(cho)
+        want |> push_from(encode(m, "thought\n", false, false))
+        want |> push(chc)
+        t |> success(same(got, want), "default prefill token-for-token (instruct shape)")
+        delete c
+
+        // thinking ON: the <|think|> gate opens a system turn (even with no system prompt) and
+        // the generation prompt is the bare model header — the model emits its own thought channel
+        var c2 = create_chat_renderer(m, "", 8l)
+        set_thinking(c2, true)
+        add_user(c2, USR)
+        let got2 <- render_turn(m, c2)
+        var want2 : array<int64>
+        want2 |> push(bos_id(m))
+        want2 |> push(trn)
+        want2 |> push_from(encode(m, "system\n", false, false))
+        want2 |> push(thk)
+        want2 |> push(trc)
+        want2 |> push_from(encode(m, "\n", false, false))
+        want2 |> push(trn)
+        want2 |> push_from(encode(m, "user\n{USR}", false, false))
+        want2 |> push(trc)
+        want2 |> push_from(encode(m, "\n", false, false))
+        want2 |> push(trn)
+        want2 |> push_from(encode(m, "model\n", false, false))
+        t |> success(same(got2, want2), "thinking-ON prefill: <|think|> system gate + bare opener")
+        delete c2
+
+        // thinking ON with a system prompt: the gate precedes the prompt text in the same turn
+        var c3 = create_chat_renderer(m, SYS, 8l)
+        set_thinking(c3, true)
+        add_user(c3, USR)
+        let got3 <- render_turn(m, c3)
+        var want3 : array<int64>
+        want3 |> push(bos_id(m))
+        want3 |> push(trn)
+        want3 |> push_from(encode(m, "system\n", false, false))
+        want3 |> push(thk)
+        want3 |> push_from(encode(m, SYS, false, false))
+        want3 |> push(trc)
+        want3 |> push_from(encode(m, "\n", false, false))
+        want3 |> push(trn)
+        want3 |> push_from(encode(m, "user\n{USR}", false, false))
+        want3 |> push(trc)
+        want3 |> push_from(encode(m, "\n", false, false))
+        want3 |> push(trn)
+        want3 |> push_from(encode(m, "model\n", false, false))
+        t |> success(same(got3, want3), "thinking-ON + system prompt: gate precedes the prompt text")
+        delete c3
+
+        // a mid-conversation set_thinking(true) cannot inject the gate (the system turn already
+        // rendered) — the prompt stays instruct-shaped and the channel-marker stops stay armed
+        var c5 = create_chat_renderer(m, "", 8l)
+        add_user(c5, USR)
+        var replay : array<int64>
+        render_assistant(m, c5, "The answer.", replay)   // consumes turn 1, thinking off — no gate
+        delete replay
+        set_thinking(c5, true)
+        add_user(c5, "and again?")
+        let got5 <- render_turn(m, c5)
+        t |> success(find_index(got5, thk) < 0, "no late gate materializes")
+        t |> equal(got5[length(got5) - 1], chc, "the opener keeps the closed empty thought")
+        var eff5 <- effective_stop_ids(c5)
+        t |> success(find_index(eff5, chc) >= 0, "the channel-marker stops stay armed (thinking never armed)")
+        delete eff5
+        delete c5
+        delete m
+    }
+}
+
+// ===== qwen35 Hermes tools (the qwen2/qwen3 block, kept by the 3.5 template) =====
+
+[test]
+def test_chat_qwen35_tools(t : T?) {
+    t |> run("the qwen35 registration declares the Hermes tool format (model-free)") @(t : T?) {
+        var ct <- arch_chat("qwen35")
+        t |> equal(ct.tool_call_open, "<tool_call>")
+        t |> equal(ct.tool_resp_open, "<tool_response>")
+        t |> success(!empty(ct.tool_sys_prelude), "tool block prelude declared")
+        delete ct
+    }
+    t |> run("tool markers resolve in the 3.5 vocab and render as single ids (needs Qwen3.5-0.8B)") @(t : T?) {
+        let path = path_join(models_dir(), "Qwen3.5-0.8B-Q8_0.gguf")
+        if (!stat(path).is_valid) {
+            t |> skip("{path} not present")
+            return
+        }
+        var m <- load_capped(path)
+        let tco = special_id(m, "<tool_call>")
+        let tcc = special_id(m, "</tool_call>")
+        t |> success(tco >= 0l && tcc >= 0l, "the vocab carries the tool-call markers")
+        var c = create_chat_renderer(m, "", 8l)
+        var tools : array<string>
+        tools |> push("\{\"type\": \"function\", \"function\": \{\"name\": \"get_weather\", \"parameters\": \{}}}")
+        set_tools(c, tools)
+        add_user(c, USR)
+        let got <- render_turn(m, c)
+        // the format instructions quote the markers — each must encode as its single vocab id
+        var n_open = 0
+        var n_close = 0
+        for (id in got) {
+            if (id == tco) {
+                n_open ++
+            } elif (id == tcc) {
+                n_close ++
+            }
+        }
+        t |> success(n_open >= 1 && n_close >= 1, "system tool block renders the markers as vocab ids")
+        delete c
+        delete m
+    }
+}
+
+// ===== ToolMode declarations + the gemma-4 tool wire (the tool-formats arc) =====
+
+[test]
+def test_chat_tool_modes(t : T?) {
+    t |> run("each family's registration/template declares its ToolMode (model-free)") @(t : T?) {
+        var g <- arch_chat("gpt-oss")
+        t |> success(g.tool_mode == ToolMode.harmony, "gpt-oss declares harmony")
+        delete g
+        var g4 <- arch_chat("gemma4")
+        t |> success(g4.tool_mode == ToolMode.gemma4, "gemma4 declares the DSL mode")
+        delete g4
+        var l <- arch_chat("llama")
+        t |> success(l.tool_mode == ToolMode.llama_json, "llama declares the whole-reply JSON mode")
+        delete l
+        var q <- arch_chat("qwen3")
+        t |> success(q.tool_mode == ToolMode.hermes, "the qwen family declares hermes")
+        delete q
+        // mistral rides template DETECTION (arch is "llama" for those GGUFs), not a registration
+        var m = Model()
+        m.arch = "llama"
+        m.chat_template_str = "bos [INST] u [/INST] eos"
+        let ct <- chat_template(m)
+        t |> success(ct.tool_mode == ToolMode.mistral, "[INST] detection declares the mistral mode")
+    }
+    t |> run("a declared mode without its control specials demotes to none at create") @(t : T?) {
+        // an [INST] template over a vocab with NO [TOOL_CALLS] family (v0.1/v0.2-class): the
+        // template says mistral, the session honestly says none — the server 400s instead of
+        // panicking on the missing specials at render
+        var m = Model()
+        m.arch = "llama"
+        m.chat_template_str = "bos [INST] u [/INST] eos"
+        var c = create_chat_renderer(m, "", 8l)
+        t |> success(c.tmpl.tool_mode == ToolMode.none, "missing [TOOL_CALLS] family demotes to none")
+        delete c
+    }
+}
+
+[test]
+def test_chat_gemma4_tool_wire(t : T?) {   // nolint:STYLE038 — flat expected-token stream, one push per run
+    t |> run("defs turn + call replay + result turn token-for-token (needs gemma-4-E2B)") @(t : T?) {
+        let path = path_join(models_dir(), "gemma-4-E2B-it-Q4_K_M.gguf")
+        if (!stat(path).is_valid) {
+            t |> skip("{path} not present")
+            return
+        }
+        var m <- load_capped(path)
+        let trn = special_id(m, "<|turn>")
+        let trc = special_id(m, "<turn|>")
+        let cho = special_id(m, "<|channel>")
+        let chc = special_id(m, "<channel|>")
+        let tlo = special_id(m, "<|tool>")
+        let tlc = special_id(m, "<tool|>")
+        let tco = special_id(m, "<|tool_call>")
+        let tcc = special_id(m, "<tool_call|>")
+        let tro = special_id(m, "<|tool_response>")
+        let trr = special_id(m, "<tool_response|>")
+        let q = special_id(m, "<|\"|>")
+        t |> success(tlo >= 0l && tlc >= 0l && tco >= 0l && tcc >= 0l && tro >= 0l && trr >= 0l && q >= 0l,
+                     "the vocab carries the tool + quote specials")
+
+        // the defs turn: one <|tool>declaration DSL block in a forced system turn, quote tokens as specials
+        let tooldef = ("\{\"type\": \"function\", \"function\": \{\"name\": \"get_weather\", " +
+            "\"description\": \"Get current weather\", \"parameters\": \{\"type\": \"object\", " +
+            "\"properties\": \{\"city\": \{\"type\": \"string\"}}, \"required\": [\"city\"]}}}")
+        var c = create_chat_renderer(m, "", 8l)
+        var tools : array<string>
+        tools |> push(tooldef)
+        set_tools(c, tools)
+        add_user(c, USR)
+        let got <- render_turn(m, c)
+        var want : array<int64>
+        want |> push(bos_id(m))
+        want |> push(trn)
+        want |> push_from(encode(m, "system\n", false, false))
+        want |> push(tlo)
+        want |> push_from(encode(m, "declaration:get_weather\{description:", false, false))
+        want |> push(q)
+        want |> push_from(encode(m, "Get current weather", false, false))
+        want |> push(q)
+        want |> push_from(encode(m, ",parameters:\{properties:\{city:\{type:", false, false))
+        want |> push(q)
+        want |> push_from(encode(m, "STRING", false, false))
+        want |> push(q)
+        want |> push_from(encode(m, "}},required:[", false, false))
+        want |> push(q)
+        want |> push_from(encode(m, "city", false, false))
+        want |> push(q)
+        want |> push_from(encode(m, "],type:", false, false))
+        want |> push(q)
+        want |> push_from(encode(m, "OBJECT", false, false))
+        want |> push(q)
+        want |> push_from(encode(m, "}}", false, false))
+        want |> push(tlc)
+        want |> push(trc)
+        want |> push_from(encode(m, "\n", false, false))
+        want |> push(trn)
+        want |> push_from(encode(m, "user\n{USR}", false, false))
+        want |> push(trc)
+        want |> push_from(encode(m, "\n", false, false))
+        want |> push(trn)
+        want |> push_from(encode(m, "model\n", false, false))
+        want |> push(cho)
+        want |> push_from(encode(m, "thought\n", false, false))
+        want |> push(chc)
+        t |> success(same(got, want), "defs turn token-for-token")
+        delete c
+
+        // call replay: the DSL block continues the model turn, which stays OPEN (no close parts)
+        var c2 = create_chat_renderer(m, "", 8l)
+        add_user(c2, USR)
+        var calls : array<string>
+        calls |> push("\{\"name\": \"get_weather\", \"arguments\": \{\"city\": \"Paris\"}}")
+        var toks : array<int64>
+        render_assistant_calls(m, c2, "", calls, toks)
+        var want2 : array<int64>
+        want2 |> push(bos_id(m))
+        want2 |> push(trn)
+        want2 |> push_from(encode(m, "user\n{USR}", false, false))
+        want2 |> push(trc)
+        want2 |> push_from(encode(m, "\n", false, false))
+        want2 |> push(trn)
+        want2 |> push_from(encode(m, "model\n", false, false))
+        want2 |> push(cho)
+        want2 |> push_from(encode(m, "thought\n", false, false))
+        want2 |> push(chc)
+        want2 |> push(tco)
+        want2 |> push_from(encode(m, "call:get_weather\{city:", false, false))
+        want2 |> push(q)
+        want2 |> push_from(encode(m, "Paris", false, false))
+        want2 |> push(q)
+        want2 |> push_from(encode(m, "}", false, false))
+        want2 |> push(tcc)
+        t |> success(same(toks, want2), "call replay token-for-token, turn left open")
+        t |> success(c2.turn_open, "the model turn is recorded open")
+
+        // the result continues the OPEN turn in-turn — no user frame, no close before it
+        var results : array<string>
+        results |> push("\{\"temp\": 21}")
+        var names : array<string>
+        names |> push("get_weather")
+        add_tool_results(c2, results, names)
+        let got3 <- render_turn(m, c2)
+        var want3 : array<int64>
+        want3 |> push(tro)
+        want3 |> push_from(encode(m, "response:get_weather\{temp:21}", false, false))
+        want3 |> push(trr)
+        t |> success(same(got3, want3), "result turn token-for-token (in-turn, named)")
+        delete c2
+        delete m
+    }
+    t |> run("displaced results + leaked open turn both heal on the next render (needs gemma-4-E2B)") @(t : T?) {
+        let path = path_join(models_dir(), "gemma-4-E2B-it-Q4_K_M.gguf")
+        if (!stat(path).is_valid) {
+            t |> skip("{path} not present")
+            return
+        }
+        var m <- load_capped(path)
+        let trn = special_id(m, "<|turn>")
+        let trc = special_id(m, "<turn|>")
+        let cho = special_id(m, "<|channel>")
+        let chc = special_id(m, "<channel|>")
+        let tro = special_id(m, "<|tool_response>")
+        let trr = special_id(m, "<tool_response|>")
+
+        // [user, asst(calls), tool, user]: the displaced results render FIRST (in the open turn),
+        // then the turn closes, then the user turn — transcript order on the wire
+        var c = create_chat_renderer(m, "", 8l)
+        add_user(c, USR)
+        var calls : array<string>
+        calls |> push("\{\"name\": \"get_weather\", \"arguments\": \{\"city\": \"Paris\"}}")
+        var toks : array<int64>
+        render_assistant_calls(m, c, "", calls, toks)
+        delete toks
+        var results : array<string>
+        results |> push("\{\"temp\": 21}")
+        var names : array<string>
+        names |> push("get_weather")
+        add_tool_results(c, results, names)
+        add_user(c, "and in Rome?")   // displaces the queued results turn
+        let got <- render_turn(m, c)
+        var want : array<int64>
+        want |> push(tro)
+        want |> push_from(encode(m, "response:get_weather\{temp:21}", false, false))
+        want |> push(trr)
+        want |> push(trc)   // the open model turn closes
+        want |> push_from(encode(m, "\n", false, false))
+        want |> push(trn)
+        want |> push_from(encode(m, "user\nand in Rome?", false, false))
+        want |> push(trc)
+        want |> push_from(encode(m, "\n", false, false))
+        want |> push(trn)
+        want |> push_from(encode(m, "model\n", false, false))
+        want |> push(cho)
+        want |> push_from(encode(m, "thought\n", false, false))
+        want |> push(chc)
+        t |> success(same(got, want), "displaced results + close + user turn token-for-token")
+        delete c
+
+        // [user, asst(calls), user] with NO results: only the leaked close heals
+        var c2 = create_chat_renderer(m, "", 8l)
+        add_user(c2, USR)
+        var toks2 : array<int64>
+        render_assistant_calls(m, c2, "", calls, toks2)
+        delete toks2
+        add_user(c2, "never mind")
+        let got2 <- render_turn(m, c2)
+        var want2 : array<int64>
+        want2 |> push(trc)
+        want2 |> push_from(encode(m, "\n", false, false))
+        want2 |> push(trn)
+        want2 |> push_from(encode(m, "user\nnever mind", false, false))
+        want2 |> push(trc)
+        want2 |> push_from(encode(m, "\n", false, false))
+        want2 |> push(trn)
+        want2 |> push_from(encode(m, "model\n", false, false))
+        want2 |> push(cho)
+        want2 |> push_from(encode(m, "thought\n", false, false))
+        want2 |> push(chc)
+        t |> success(same(got2, want2), "the leaked open turn closes before the user turn")
+        delete c2
         delete m
     }
 }
