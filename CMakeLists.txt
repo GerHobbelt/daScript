@@ -33,6 +33,7 @@ option(DAS_SMT_DISABLED "Disable dasSMT (Z3 SMT solver bindings)" ON)
 option(DAS_HV_DISABLED "Disable dasHV (websokets,http server and client)" OFF)
 option(DAS_GLFW_DISABLED "Disable dasGLFW (GLFW window for graphics apps)" OFF)
 option(DAS_IMGUI_DISABLED "Disable dasImgui (Dear ImGui bindings + widget DSL; needs dasGlfw + dasClipboard)" OFF)
+option(DAS_VULKAN_DISABLED "Disable dasVulkan (Vulkan bindings generated from vk.xml; headers + volk vendored, no SDK needed)" OFF)
 option(DAS_AUDIO_DISABLED "Disable dasAudio (Miniaudio sound library)" OFF)
 option(DAS_STDDLG_DISABLED "Disable dasStdDlg (File new,open,save etc dialogs)" OFF)
 option(DAS_STBIMAGE_DISABLED "Disable dasStbImage (StbImage bindings, image loading and saving)" OFF)
@@ -318,10 +319,10 @@ MACRO(DAS_LLVM_AOT_LIB input_files genList mainTarget)
         if(_batch_n EQUAL 32 OR _llvm_aot_idx EQUAL _llvm_aot_total)
             ADD_CUSTOM_COMMAND(
                 OUTPUT  ${_batch_objs}
-                DEPENDS daslang ${_batch_srcs} ${PROJECT_SOURCE_DIR}/utils/jit/main.das ${_das_llvm_aot_codegen}
+                DEPENDS daslang ${_batch_srcs} ${PROJECT_SOURCE_DIR}/utils/internal/jit/main.das ${_das_llvm_aot_codegen}
                 WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
                 COMMENT "LLVM-AOT compiling ${_batch_n} files"
-                COMMAND daslang ${PROJECT_SOURCE_DIR}/utils/jit/main.das -- ${_batch_rels} --aot-object --aot-object-prefix ${mainTarget}
+                COMMAND daslang ${PROJECT_SOURCE_DIR}/utils/internal/jit/main.das -- ${_batch_rels} --aot-object --aot-object-prefix ${mainTarget}
             )
             set(_batch_rels "")
             set(_batch_srcs "")
@@ -836,7 +837,7 @@ FLEX(src/parser/ds_lexer.lpp)
 FLEX(src/parser/ds2_lexer.lpp)
 BISON(src/parser/ds_parser.ypp)
 BISON(src/parser/ds2_parser.ypp)
-BISON(utils/dasFormatter/ds_parser.ypp)
+BISON(utils/gen1-to-gen2/ds_parser.ypp)
 
 SET(PARSER_GENERATED_SRC
 # 1st parser
@@ -1128,13 +1129,12 @@ src/simulate/fs_file_info.cpp
 )
 
 
-# das formatter
-SET(DASCRIPT_FMT_SRC
-        ${PROJECT_SOURCE_DIR}/utils/dasFormatter/fmt.cpp
-        ${PROJECT_SOURCE_DIR}/utils/dasFormatter/formatter.cpp
-        ${PROJECT_SOURCE_DIR}/utils/dasFormatter/helpers.cpp
-        ${PROJECT_SOURCE_DIR}/utils/dasFormatter/ds_parser.cpp
-        CACHE INTERNAL "DAS_DASCRIPT_FMT_SRC"
+SET(GEN1_TO_GEN2_SRC
+        ${PROJECT_SOURCE_DIR}/utils/gen1-to-gen2/fmt.cpp
+        ${PROJECT_SOURCE_DIR}/utils/gen1-to-gen2/formatter.cpp
+        ${PROJECT_SOURCE_DIR}/utils/gen1-to-gen2/helpers.cpp
+        ${PROJECT_SOURCE_DIR}/utils/gen1-to-gen2/ds_parser.cpp
+        CACHE INTERNAL "GEN1_TO_GEN2_SRC"
 )
 
 # MSVC first so clang-cl (CXX_COMPILER_ID==Clang but MSVC driver) takes /EHsc, not -fexceptions
@@ -1150,9 +1150,9 @@ endif()
 
 # flex/bison output (the gen1_to_gen2 converter's own copy) is not ours to clean
 IF(MSVC)
-  set_source_files_properties(${PROJECT_SOURCE_DIR}/utils/dasFormatter/ds_parser.cpp PROPERTIES COMPILE_FLAGS "/W0")
+  set_source_files_properties(${PROJECT_SOURCE_DIR}/utils/gen1-to-gen2/ds_parser.cpp PROPERTIES COMPILE_FLAGS "/W0")
 ELSE()
-  set_source_files_properties(${PROJECT_SOURCE_DIR}/utils/dasFormatter/ds_parser.cpp PROPERTIES COMPILE_FLAGS "-w")
+  set_source_files_properties(${PROJECT_SOURCE_DIR}/utils/gen1-to-gen2/ds_parser.cpp PROPERTIES COMPILE_FLAGS "-w")
   # fmt's vendored format-inl.h noreturn helper: GCC needs -Wno-error, clang -Wno-invalid-noreturn
   IF("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
     set_source_files_properties(src/misc/format.cpp PROPERTIES COMPILE_FLAGS "-Wno-error")
@@ -1259,7 +1259,7 @@ SET(LIBDASCRIPT_COMPILER_SRC
     ${SIMULATE_FUSION_SRC}
     ${PARSER_GENERATED_SRC}
     ${PARSER_SRC}
-    ${DASCRIPT_FMT_SRC}
+    ${GEN1_TO_GEN2_SRC}
     src/ast/ast_parse.cpp
     src/ast/ast_optimize.cpp
     src/ast/ast_const_folding.cpp
@@ -1385,7 +1385,7 @@ if(NOT ${DAS_AOT_EXAMPLES_DISABLED})
 endif()
 
 SET(DAS_DASCRIPT_MAIN_SRC
-    ${PROJECT_SOURCE_DIR}/utils/daScript/main.cpp
+    ${PROJECT_SOURCE_DIR}/utils/daslang/main.cpp
     ${DAS_MODULES_NEED_INC}
     ${DAS_MODULES_DECLARE_INC}
     ${DAS_MODULES_PULL_INC}
@@ -1557,7 +1557,7 @@ if (NOT ${DAS_TOOLS_DISABLED})
         FILES_MATCHING PATTERN "*.das"
     )
 
-    add_executable(gen1_to_gen2 ${PROJECT_SOURCE_DIR}/utils/dasFormatter/main.cpp)
+    add_executable(gen1_to_gen2 ${PROJECT_SOURCE_DIR}/utils/gen1-to-gen2/main.cpp)
     TARGET_LINK_LIBRARIES(gen1_to_gen2 libDaScriptDyn ${SRC_LIBRARIES})
     ADD_DEPENDENCIES(gen1_to_gen2 libDaScriptDyn ${DAS_DYN_MODULES_LIBS})
     target_include_directories(gen1_to_gen2 PRIVATE ${NEED_MODULES_PATH})
@@ -1578,7 +1578,7 @@ if (NOT ${DAS_TOOLS_DISABLED})
     #  set_target_properties(daslangOsx PROPERTIES
     #      MACOSX_BUNDLE_SHORT_VERSION_STRING "0.6"
     #      MACOSX_BUNDLE_LONG_VERSION_STRING  "daslang 0.6"
-    #      MACOSX_BUNDLE_INFO_PLIST ${CMAKE_SOURCE_DIR}/utils/daScript/MacOSXBundleInfo.plist.in)
+    #      MACOSX_BUNDLE_INFO_PLIST ${CMAKE_SOURCE_DIR}/utils/daslang/MacOSXBundleInfo.plist.in)
     #ENDIF()
 
     # C++ test infrastructure (doctest under tests-cpp/, plus big-test executables).
@@ -1818,50 +1818,41 @@ install(FILES ${PROJECT_SOURCE_DIR}/GETTING_STARTED.md DESTINATION ${DAS_INSTALL
 install(FILES ${PROJECT_SOURCE_DIR}/CHANGELIST.md DESTINATION ${DAS_INSTALL_DOCDIR})
 install(FILES ${PROJECT_SOURCE_DIR}/install/.gitignore DESTINATION ${DAS_INSTALL_DOCDIR})
 
-# Skills shipped to the SDK — the manifest install/skills.list names which
-# files from skills/ get copied into the install tree under skills/. Keeps
-# top-level skills/ as the single source of truth (no install/skills/ mirror).
-# ENCODING UTF-8: without it file(STRINGS) treats non-ASCII bytes as separators,
-# so a stray em-dash in a comment splits the line and the tail is read as a
-# filename, failing the check below with a nonsense path.
-file(STRINGS ${PROJECT_SOURCE_DIR}/install/skills.list SHIPPED_SKILLS_RAW ENCODING UTF-8)
-set(SHIPPED_SKILLS "")
-foreach(LINE IN LISTS SHIPPED_SKILLS_RAW)
-    string(STRIP "${LINE}" LINE)
-    if(LINE AND NOT LINE MATCHES "^#")
-        set(SKILL_PATH "${PROJECT_SOURCE_DIR}/skills/${LINE}")
-        if(NOT EXISTS "${SKILL_PATH}")
-            message(FATAL_ERROR "install/skills.list references missing file: skills/${LINE}")
-        endif()
-        list(APPEND SHIPPED_SKILLS "${SKILL_PATH}")
-    endif()
-endforeach()
-install(FILES ${SHIPPED_SKILLS} DESTINATION ${DAS_INSTALL_DOCDIR}/skills)
+# Skills shipped to the SDK — the FOLDER is the shipping decision. Content
+# rules are enforced per PR by ci/check_shipped_skills.py; layout presence by
+# ci/smoke_test_bundle.sh. Pattern order matters: first match wins, so the
+# EXCLUDE clauses must precede the inclusive *.md pattern.
+install(DIRECTORY ${PROJECT_SOURCE_DIR}/skills/
+    DESTINATION ${DAS_INSTALL_DOCDIR}/skills
+    FILES_MATCHING
+    # "$"-anchored: an unanchored "/skills/daslang" would also swallow
+    # skills/daslang_live.md (prefix match on the full path)
+    REGEX "/skills/internal$" EXCLUDE
+    REGEX "/skills/daslang$" EXCLUDE
+    PATTERN "*.md"
+)
+# its README is editing rules for this repo's maintainers, meaningless in the SDK
+install(DIRECTORY ${PROJECT_SOURCE_DIR}/skills/daslang/
+    DESTINATION ${DAS_INSTALL_DOCDIR}/skills/daslang
+    FILES_MATCHING
+    REGEX "/daslang/README\\.md$" EXCLUDE
+    PATTERN "*.md"
+)
+# The review constitution ships with the review skills that route to it.
+install(FILES ${PROJECT_SOURCE_DIR}/REVIEW_COMMON.md DESTINATION ${DAS_INSTALL_DOCDIR})
 install(FILES ${PROJECT_SOURCE_DIR}/LICENSE DESTINATION ${DAS_INSTALL_DOCDIR})
 install(FILES ${PROJECT_SOURCE_DIR}/3rdparty/uriparser/COPYING DESTINATION ${DAS_INSTALL_DOCDIR} RENAME URIPARSER.LICENSE)
 install(FILES ${PROJECT_SOURCE_DIR}/include/dag_noise/LICENSE DESTINATION ${DAS_INSTALL_DOCDIR} RENAME DAG_NOISE.LICENSE)
 install(FILES ${PROJECT_SOURCE_DIR}/include/vecmath/LICENSE DESTINATION ${DAS_INSTALL_DOCDIR} RENAME VEC_MATH.LICENSE)
 
-# Install utility scripts
-install(FILES ${PROJECT_SOURCE_DIR}/utils/aot/main.das DESTINATION utils/aot)
+# utils/internal/ never installs — the folder is the audience decision
+# (machine-checked by utils/REVIEW.das).
 
-# Install jit tool (LLVM JIT CLI — .das to shared lib or standalone -exe)
-install(FILES ${PROJECT_SOURCE_DIR}/utils/jit/main.das DESTINATION utils/jit)
+# Install aot tool (the AOT generation driver the integration scaffolds invoke)
+install(FILES ${PROJECT_SOURCE_DIR}/utils/aot/main.das DESTINATION utils/aot)
 
 # Install fix-lint-errors tool (mechanical lint auto-fixer)
 install(FILES ${PROJECT_SOURCE_DIR}/utils/fix-lint-errors/main.das DESTINATION utils/fix-lint-errors)
-
-# Install requirefix tool (require-statement fixer + its module)
-install(FILES
-    ${PROJECT_SOURCE_DIR}/utils/requirefix/main.das
-    ${PROJECT_SOURCE_DIR}/utils/requirefix/requirefix.das
-    ${PROJECT_SOURCE_DIR}/utils/requirefix/test_requirefix.das
-    DESTINATION utils/requirefix
-)
-install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/requirefix/testdata/
-    DESTINATION utils/requirefix/testdata
-    FILES_MATCHING PATTERN "*.das"
-)
 
 # Install MCP server (stdio transport, no dasHV dependency)
 #   main.das        — full server entry point
@@ -1929,6 +1920,15 @@ install(FILES ${PROJECT_SOURCE_DIR}/utils/lsp/plugin/.claude-plugin/plugin.json
 install(FILES ${PROJECT_SOURCE_DIR}/.claude/skills/daslang-lsp/.claude-plugin/plugin.json
     DESTINATION .claude/skills/daslang-lsp/.claude-plugin
 )
+# Same prefix-root rationale: an agent session started at the SDK root picks up
+# the language skill and the dragon rule-document auditor with no configuration.
+install(DIRECTORY ${PROJECT_SOURCE_DIR}/skills/daslang/
+    DESTINATION .claude/skills/daslang
+    FILES_MATCHING
+    REGEX "/daslang/README\\.md$" EXCLUDE
+    PATTERN "*.md"
+)
+install(FILES ${PROJECT_SOURCE_DIR}/.claude/agents/dragon.md DESTINATION .claude/agents)
 
 # Install dascov (code coverage)
 install(FILES ${PROJECT_SOURCE_DIR}/utils/dascov/main.das DESTINATION utils/dascov)
@@ -1948,10 +1948,6 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/lint/tests/
     DESTINATION utils/lint/tests
     FILES_MATCHING PATTERN "*.das"
 )
-
-# Install hygiene (comment/doc hygiene checker)
-file(GLOB DAS_HYGIENE_FILES ${PROJECT_SOURCE_DIR}/utils/hygiene/*.das)
-install(FILES ${DAS_HYGIENE_FILES} DESTINATION utils/hygiene)
 
 # Install detect-dupe (cross-file duplicate-function detector)
 file(GLOB DAS_DETECT_DUPE_FILES ${PROJECT_SOURCE_DIR}/utils/detect-dupe/*.das)
@@ -2011,241 +2007,71 @@ install(FILES
     DESTINATION utils/das-fmt
 )
 
-# Install daspkg examples. Whole-dir install, so exclude everything daspkg
-# generates in a working tree — modules/ (fetched deps), the lock file, build
-# output and shared modules would otherwise all land in the bundle.
-install(DIRECTORY ${PROJECT_SOURCE_DIR}/examples/daspkg/
-    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/daspkg
+# Install dasllama-server (OpenAI-compatible LLM server; JIT-only, runs from the
+# SDK's live toolchain — see its deploy-jit.ps1 for the standalone bundle path)
+file(GLOB DAS_LLAMA_SERVER_FILES ${PROJECT_SOURCE_DIR}/utils/dasllama-server/*.das)
+install(FILES ${DAS_LLAMA_SERVER_FILES}
+    ${PROJECT_SOURCE_DIR}/utils/dasllama-server/README.md
+    ${PROJECT_SOURCE_DIR}/utils/dasllama-server/control.html
+    ${PROJECT_SOURCE_DIR}/utils/dasllama-server/tray.ico
+    ${PROJECT_SOURCE_DIR}/utils/dasllama-server/watchdog.json
+    ${PROJECT_SOURCE_DIR}/utils/dasllama-server/deploy-jit.ps1
+    DESTINATION utils/dasllama-server
+)
+
+# Install dasllama-convert (offline GGUF -> .dlim model prep)
+install(FILES ${PROJECT_SOURCE_DIR}/utils/dasllama-convert/main.das
+    DESTINATION utils/dasllama-convert
+)
+
+# Install watchdog (supervisor for long-running daslang programs; the worked
+# example in the daspkg skill's release_include_from docs)
+install(FILES
+    ${PROJECT_SOURCE_DIR}/utils/watchdog/watchdog.py
+    ${PROJECT_SOURCE_DIR}/utils/watchdog/dummy_server.py
+    ${PROJECT_SOURCE_DIR}/utils/watchdog/README.md
+    DESTINATION utils/watchdog
+)
+
+# Install jobque-timeline (per-lane jobque trace viewer)
+file(GLOB DAS_JOBQUE_TIMELINE_FILES ${PROJECT_SOURCE_DIR}/utils/jobque-timeline/*.das)
+install(FILES ${DAS_JOBQUE_TIMELINE_FILES}
+    ${PROJECT_SOURCE_DIR}/utils/jobque-timeline/README.md
+    DESTINATION utils/jobque-timeline
+)
+
+# Install vscode-daslang-test (VSCode Test Explorer extension for dastest,
+# ships as source — build per its README)
+install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/vscode-daslang-test/
+    DESTINATION utils/vscode-daslang-test
+    PATTERN "node_modules" EXCLUDE
+    PATTERN "out" EXCLUDE
+)
+
+# The folder IS the shipping decision: everything under examples/ ships with the
+# SDK and must compile from a bare bundle (utils/internal/test-release owns the
+# floor sweep); a package-dependent example lives with its package, not here.
+# Excludes are working-tree residue plus fatman, the CI-only ABI-canary host.
+install(DIRECTORY ${PROJECT_SOURCE_DIR}/examples/
+    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}
+    PATTERN "fatman" EXCLUDE
     PATTERN "modules" EXCLUDE
     PATTERN "_build" EXCLUDE
     PATTERN ".daspkg_cache" EXCLUDE
     PATTERN ".daspkg_tmp" EXCLUDE
     PATTERN ".jitted_scripts" EXCLUDE
+    PATTERN "jitted_scripts" EXCLUDE
     PATTERN "_aot_generated" EXCLUDE
+    PATTERN "_standalone_ctx_generated" EXCLUDE
     PATTERN "daspkg.lock" EXCLUDE
     PATTERN ".daspkg.log" EXCLUDE
     PATTERN "*.shared_module" EXCLUDE
 )
 
-# Install daslive examples
-install(DIRECTORY ${PROJECT_SOURCE_DIR}/examples/daslive/
-    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/daslive
-    FILES_MATCHING
-        PATTERN "*.das"
-        PATTERN ".das_package"
-    PATTERN "modules" EXCLUDE
-    PATTERN ".jitted_scripts" EXCLUDE
-    PATTERN "_aot_generated" EXCLUDE
-    PATTERN "jitted_scripts" EXCLUDE
-)
-
-# Install game examples with their full directory structure.
-install(DIRECTORY ${PROJECT_SOURCE_DIR}/examples/games/
-    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/games
-    PATTERN "modules" EXCLUDE
-    PATTERN "_build" EXCLUDE
-    PATTERN "*.shared_module" EXCLUDE
-    PATTERN ".daspkg_cache" EXCLUDE
-    PATTERN ".daspkg_tmp" EXCLUDE
-    PATTERN ".daspkg.log" EXCLUDE
-    PATTERN ".jitted_scripts" EXCLUDE
-    PATTERN "jitted_scripts" EXCLUDE
-    PATTERN "_aot_generated" EXCLUDE
-)
-
-# Install core example files
-install(FILES
-    ${PROJECT_SOURCE_DIR}/examples/hello_world.das
-    ${PROJECT_SOURCE_DIR}/examples/README.md
-    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}
-)
-
-# Install clargs example
-file(GLOB DAS_CLARGS_EXAMPLES
-    ${PROJECT_SOURCE_DIR}/examples/clargs/*.das
-)
-install(FILES ${DAS_CLARGS_EXAMPLES}
-    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/clargs
-)
-
-# Install file_path_require example (cross-file require + .das_project resolution)
-install(FILES
-    ${PROJECT_SOURCE_DIR}/examples/file_path_require/main.das
-    ${PROJECT_SOURCE_DIR}/examples/file_path_require/shared_helpers.das
-    ${PROJECT_SOURCE_DIR}/examples/file_path_require/project.das_project
-    ${PROJECT_SOURCE_DIR}/examples/file_path_require/README.md
-    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/file_path_require
-)
-
-# Install mcp echo example (stdio MCP server + client)
-install(FILES
-    ${PROJECT_SOURCE_DIR}/examples/mcp/echo/server.das
-    ${PROJECT_SOURCE_DIR}/examples/mcp/echo/client.das
-    ${PROJECT_SOURCE_DIR}/examples/mcp/echo/README.md
-    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/mcp/echo
-)
-
-# Install dasbind example
-install(FILES
-    ${PROJECT_SOURCE_DIR}/examples/dasbind/dasbind_example.das
-    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/dasbind
-)
-
-# Install crash example. The native failure modes now live in packages/dascrash, installed via
-# `daspkg install` from this local path, so there is no example-specific CMake target to include.
-install(FILES
-    ${PROJECT_SOURCE_DIR}/examples/crash/main.das
-    ${PROJECT_SOURCE_DIR}/examples/crash/crash_kinds.das
-    ${PROJECT_SOURCE_DIR}/examples/crash/README.md
-    ${PROJECT_SOURCE_DIR}/examples/crash/.das_package
-    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/crash
-)
-install(DIRECTORY ${PROJECT_SOURCE_DIR}/examples/crash/packages
-    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/crash
-)
-
-# Install minfft example (install rule is in modules/dasMinfft/CMakeLists.txt)
-
-file(GLOB DAS_DEBUGAPI_EXAMPLES
-    ${PROJECT_SOURCE_DIR}/examples/debugapi/*.das
-)
-install(FILES ${DAS_DEBUGAPI_EXAMPLES}
-    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/debugapi
-)
-
-# Each per-example subdir (furier/, path_tracer_lab/, physarum_lab/) is a daspkg
-# -project-root: its own .das_package names the package and points release_main at the
-# shared source one level up, so those manifests are load-bearing for the cross-compile
-# path and must ship beside the .das. The manifests declare no deps (dasImgui is
-# in-tree); the modules/ EXCLUDE guards against stale local daspkg installs.
-install(DIRECTORY ${PROJECT_SOURCE_DIR}/examples/graphics/
-    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/graphics
-    FILES_MATCHING
-        PATTERN "*.das"
-        PATTERN ".das_package"
-        PATTERN "README.md"
-    PATTERN "modules" EXCLUDE
-    PATTERN ".daspkg_cache" EXCLUDE
-    PATTERN ".jitted_scripts" EXCLUDE
-    PATTERN "_aot_generated" EXCLUDE
-)
-
-# Install the SQL benchmark lanes. The installed examples/README.md documents this
-# folder and links its README, so it has to ship; the DuckDB/PostgreSQL providers are
-# daspkg-installed into modules/ from the folder's .das_package at run time (the SQLite
-# lane and the array baseline work against the bundled dasSQLITE alone).
-install(DIRECTORY ${PROJECT_SOURCE_DIR}/examples/benchmarks/
-    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/benchmarks
-    FILES_MATCHING
-        PATTERN "*.das"
-        PATTERN "*.md"
-        PATTERN ".das_package"
-    PATTERN "modules" EXCLUDE
-    PATTERN ".daspkg_cache" EXCLUDE
-    PATTERN ".jitted_scripts" EXCLUDE
-)
-
-# Install node-editor example
-file(GLOB DAS_NODE_EDITOR_EXAMPLES
-    ${PROJECT_SOURCE_DIR}/examples/node-editor/*.das
-    ${PROJECT_SOURCE_DIR}/examples/node-editor/.das_package
-    ${PROJECT_SOURCE_DIR}/examples/node-editor/README.md
-)
-install(FILES ${DAS_NODE_EDITOR_EXAMPLES}
-    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/node-editor
-)
-
-file(GLOB DAS_UNCATEGORIZED_EXAMPLES
-    ${PROJECT_SOURCE_DIR}/examples/uncategorized/*.das
-)
-install(FILES ${DAS_UNCATEGORIZED_EXAMPLES}
-    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/uncategorized
-)
-
-# Install telegram echo-bot example
-install(FILES
-    ${PROJECT_SOURCE_DIR}/examples/telegram/echo-bot/.das_package
-    ${PROJECT_SOURCE_DIR}/examples/telegram/echo-bot/README.md
-    ${PROJECT_SOURCE_DIR}/examples/telegram/echo-bot/echo_bot.das
-    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/telegram/echo-bot
-)
-
-# Install claude example
-install(FILES
-    ${PROJECT_SOURCE_DIR}/examples/claude/.das_package
-    ${PROJECT_SOURCE_DIR}/examples/claude/.gitignore
-    ${PROJECT_SOURCE_DIR}/examples/claude/daslang_helper_bot.das
-    ${PROJECT_SOURCE_DIR}/examples/claude/sandbox.das_project
-    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/claude
-)
-install(FILES
-    ${PROJECT_SOURCE_DIR}/examples/claude/examples/daslang_helper/system_prompt.md
-    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/claude/examples/daslang_helper
-)
-
-file(GLOB DAS_HV_EXAMPLES
-    ${PROJECT_SOURCE_DIR}/examples/hv/*.das
-    ${PROJECT_SOURCE_DIR}/examples/hv/*.html
-    ${PROJECT_SOURCE_DIR}/examples/hv/*.md
-)
-install(FILES ${DAS_HV_EXAMPLES}
-    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/hv
-)
-
-# Install opengl examples
-file(GLOB DAS_OPENGL_EXAMPLES
-    ${PROJECT_SOURCE_DIR}/examples/opengl/*.das
-)
-install(FILES ${DAS_OPENGL_EXAMPLES}
-    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/opengl
-)
-install(FILES
-    ${PROJECT_SOURCE_DIR}/examples/opengl/image.png
-    # This mesh was taken from BGFX `modules/dasBGFX/bgfx/bgfx/examples/assets/meshes`
-    ${PROJECT_SOURCE_DIR}/examples/opengl/orb.obj
-    # This font was taken from BGFX `modules/dasBGFX/bgfx/bgfx/examples/runtime/font`
-    ${PROJECT_SOURCE_DIR}/examples/opengl/droidsansmono.ttf
-    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/opengl/media
-)
-
-# dasGLTF sample assets (Khronos glTF-Sample-Assets). BoomBox is CC0; Fox is a CC0 model with
-# CC-BY 4.0 rig/animation (attribution in GLTF_SAMPLE_ASSETS.LICENSE, shipped below). Loaded by
-# examples/opengl/10_hello_gltf.das (BoomBox) + 11_hello_gltf_animation.das (Fox) via
-# get_das_root()/examples/gltf/media.
-install(FILES
-    ${PROJECT_SOURCE_DIR}/examples/gltf/media/BoomBox.glb
-    ${PROJECT_SOURCE_DIR}/examples/gltf/media/Fox.glb
-    ${PROJECT_SOURCE_DIR}/examples/gltf/PROVENANCE.md
-    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/gltf/media
-)
-# The Fox rig/animation is CC-BY 4.0, so its attribution must ship with the SDK.
+# The Fox rig/animation is CC-BY 4.0, so its attribution must also ship at the
+# bundle root beside the other licenses (the examples/gltf copy rides the blanket).
 install(FILES ${PROJECT_SOURCE_DIR}/examples/gltf/GLTF_SAMPLE_ASSETS.LICENSE
     DESTINATION ${DAS_INSTALL_DOCDIR}
-)
-
-# dasGLTF ImGui mesh viewer. dasImgui is in-tree; run with
-# -project_root examples/gltf/mesh_viewer_opengl. Ships source + manifest only.
-file(GLOB DAS_GLTF_VIEWER_EXAMPLE
-    ${PROJECT_SOURCE_DIR}/examples/gltf/mesh_viewer_opengl/*.das
-    ${PROJECT_SOURCE_DIR}/examples/gltf/mesh_viewer_opengl/.das_package
-    ${PROJECT_SOURCE_DIR}/examples/gltf/mesh_viewer_opengl/.gitignore
-    ${PROJECT_SOURCE_DIR}/examples/gltf/mesh_viewer_opengl/README.md
-)
-install(FILES ${DAS_GLTF_VIEWER_EXAMPLE}
-    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/gltf/mesh_viewer_opengl
-)
-
-# dasGLTF Vulkan ImGui mesh viewer (vulkan_gltf sibling of the above). The dasVulkan dep is
-# daspkg-installed into modules/ (gitignored) from the .das_package (dasImgui is in-tree); run with
-# -project_root examples/gltf/mesh_viewer_vulkan. Ships source + manifest only.
-file(GLOB DAS_GLTF_VIEWER_VULKAN_EXAMPLE
-    ${PROJECT_SOURCE_DIR}/examples/gltf/mesh_viewer_vulkan/*.das
-    ${PROJECT_SOURCE_DIR}/examples/gltf/mesh_viewer_vulkan/.das_package
-    ${PROJECT_SOURCE_DIR}/examples/gltf/mesh_viewer_vulkan/.gitignore
-    ${PROJECT_SOURCE_DIR}/examples/gltf/mesh_viewer_vulkan/README.md
-)
-install(FILES ${DAS_GLTF_VIEWER_VULKAN_EXAMPLE}
-    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/gltf/mesh_viewer_vulkan
 )
 
 add_subdirectory(tutorials)

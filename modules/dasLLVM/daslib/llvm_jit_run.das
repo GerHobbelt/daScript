@@ -25,7 +25,7 @@ require jit
 module llvm_jit_run shared private
 
 //! JIT codegen driver shared by the `jit_llvm` simulate-macro (llvm_macro) and
-//! the `utils/jit` tool. `run_jit` performs the whole compile->IR->optimize->
+//! the repo's `jit` tool. `run_jit` performs the whole compile->IR->optimize->
 //! emit(.dll/.exe/.wasm) sequence for an already-simulated program+context, so
 //! callers do not need to inject the `just_in_time` module at runtime.
 
@@ -37,6 +37,10 @@ var LINK_WHOLE_LIB = false // when true, standalone exe links against the whole 
 // runtime helper ABI, default target triple). Cache filenames fold this in, so a bump
 // makes every previously written DLL miss the cache on the next run and get GC'd.
 let LLVM_JIT_CODEGEN_VERSION : uint64 = 0x4ful   // literal lowering: fixed-array element slots sized by recordType.sizeOf; invoke-to-cmres now skipped like call-to-cmres at let-init, copy/move and every make-* element visit (0x4e: scalar ABI coercion at calls, returns and branches)
+
+// Read by tests-cpp/small/test_jit_emitter_pin.cpp: FNV-1a64 of the emitter sources
+// (normalized to LF; file list in the test)
+let LLVM_JIT_EMITTER_HASH : uint64 = 0xafb153c2e58d8417ul
 
 let JIT_FNV_PRIME : uint64 = 1099511628211ul
 

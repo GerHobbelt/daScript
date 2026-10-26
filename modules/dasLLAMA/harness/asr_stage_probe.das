@@ -1,10 +1,12 @@
 options gen2
 options stack = 524288   // every dasLLAMA program root takes this budget (options stack does not unify up from libs)
+options _dasllama_internal = true
 
 require dasllama/dasllama_asr
 require dasllama/dasllama_audio
 require dasllama/dasllama_math
 require dasllama/dasllama_common   // forward_profile_reset/report — the decoder-engine buckets
+require ?das_metal dasllama/dasllama_metal_asr_dec   // set_metal_wdec_step — the all-Metal probe arm
 require audio
 require math   // the parakeet mel worker resolves log at the instantiation site
 require daslib/clargs
@@ -40,11 +42,22 @@ struct ProbeArgs {
     @clarg_doc = "Pin fp32 weights (set_asr_fp32) — A/B the q8 default"
     fp32 : bool
 
+    @clarg_name = "fp32-tower"
+    @clarg_doc = "Pin fp32 on the tower half only (set_asr_tower_fp32) — the GPU serving mode"
+    fp32_tower : bool
+
+    @clarg_name = "wdec-step"
+    @clarg_doc = "Arm the GPU whisper decode step (set_metal_wdec_step) — the all-Metal probe arm"
+    wdec_step : bool
+
     @clarg_doc = "Decoder-session KV dtype, LLM-decoder families only: f16 (default) | f32 | q8"
     kv : string
 
     @clarg_doc = "Save a jobque lane trace of the profiled reps to this path (perfetto JSON, encoder stages colored)"
     trace : string
+
+    @clarg_doc = "Session language (default en; Qwen3-ASR needs auto)"
+    lang : string = "en"
 
     @clarg_short = "?"
     @clarg_name = "show-help"
@@ -78,8 +91,8 @@ def load_audio_16k_mono(path : string) : array<float> {
     return <- out
 }
 
-def run_once(m : AsrModel; samples : array<float>) {
-    var s = create_session(m, "en")
+def run_once(m : AsrModel; samples : array<float>; lang : string) {
+    var s = create_session(m, lang)
     transcribe(m, s, samples) $(seg : TranscribeSegment) {
         feint("{seg.text}\n")
     }
@@ -87,6 +100,7 @@ def run_once(m : AsrModel; samples : array<float>) {
 
 [export]
 def main() : int {
+    allow_cpu_prefill()   // a CPU-stage instrument by design: the LLM-decoder families (qwen3a, canary) prefill encoder rows on the CPU
     var r <- parse_args(type<ProbeArgs>)
     if (r |> is_err) {
         print("error: {r |> unwrap_err}\n\n")
@@ -103,6 +117,12 @@ def main() : int {
         return 1
     }
     set_asr_fp32(cfg.fp32)
+    set_asr_tower_fp32(cfg.fp32_tower)
+    static_if (typeinfo builtin_module_exists(das_metal)) {
+        if (cfg.wdec_step) {
+            set_metal_wdec_step(true)
+        }
+    }
     if (cfg.kv == "f16") {
         set_asr_kv(KVDtype.f16)
     } elif (cfg.kv == "f32") {
@@ -123,7 +143,7 @@ def main() : int {
     with_job_que() {
         setup_dasllama_jobque_()   // the engine dispatch standard — bare with_job_que profiles the
                                    // ~10us/job fifo fork/join instead of the shipped team dispatch
-        run_once(m, samples)               // warmup, unprofiled
+        run_once(m, samples, cfg.lang)     // warmup, unprofiled
         if (!empty(cfg.trace)) {
             jobque_trace_start(1 << 21)   // encoder chunks are coarse — a couple of reps fit easily
             set_trace_tags(true)
@@ -135,7 +155,7 @@ def main() : int {
             print("note: decoder-engine buckets need JOBQUE_PROFILING=1 - printing the ASR stage table only\n")
         }
         for (_rep in range(reps)) {
-            run_once(m, samples)
+            run_once(m, samples, cfg.lang)
         }
         if (!empty(cfg.trace)) {
             set_trace_tags(false)

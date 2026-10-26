@@ -2,9 +2,11 @@ options gen2
 options stack = 524288   // every dasLLAMA program root takes this budget
 options _function_length = 0        // per-kernel gates: hand-bound buffers/uniforms + dispatch + oracle compare, one flat run each
 options _cyclomatic_complexity = 0  // same — the arm ladders follow the kernel's own binding/variant axes
+options _dasllama_internal = true
 
 require dastest/testing_boost public
 require dasllama/dasllama_convert   // dequant_k6_plane_superblock_at — the embed-k6 reference
+require dasllama/dasllama_audio     // layernorm + the shipped gelu flavors — the tower oracles
 require ?das_metal dasllama/dasllama_metal_kernels  // the decode elementwise/misc kernel set (Apple builds)
 require ?das_metal metal/das_metal_boost  // device/pipeline/buffer plumbing + the leak gate
 require ?das_metal _metal_kernel_common   // shared buf helpers + eyeball-dump compares
@@ -489,6 +491,848 @@ def private geglu_gate(t : T?; dev, queue; total : int) {
     delete want
 }
 
+// LayerNorm w+b vs the shipped CPU layernorm (dasllama_audio) — the tower/embedder norm.
+// The bias fixture keeps |b| >= 0.1 so a bias-blind kernel cannot pass.
+def private layernorm_gate(t : T?; dev, queue; dim, nrows : int; eps : float; inplace : bool) {
+    let tag = "layernorm dim={dim} nrows={nrows} eps={eps} inplace={inplace}"
+    var err : string
+    var pso = pipeline_from_source(dev, metal_layernorm_msl, metal_layernorm_msl_entry, metal_layernorm_msl_fastmath, err)
+    t |> success(pso != null, "{tag}: pipeline: {err}")
+    return if (pso == null)
+    var x : array<float>
+    var w : array<float>
+    var b : array<float>
+    x |> resize(nrows * dim)
+    w |> resize(dim)
+    b |> resize(dim)
+    for (i in range(nrows * dim)) {
+        x[i] = 0.23 * float(i % 31) - 3.1
+    }
+    if (nrows > 0 && dim > 0) {
+        for (i in range(dim)) {   // one constant row exercises the zero-variance eps path
+            x[(nrows - 1) * dim + i] = 1.75
+        }
+    }
+    for (i in range(dim)) {
+        w[i] = 0.5 + 0.04 * float(i % 13)
+        b[i] = -0.7 + 0.05 * float(i % 17)
+    }
+    var want : array<float>
+    want |> resize(nrows * dim)
+    unsafe {
+        for (r in range(nrows)) {
+            layernorm(addr(want[r * dim]), addr < float const? >(x[r * dim]),
+                addr < float const? >(w[0]), addr < float const? >(b[0]), int64(dim), eps)
+        }
+    }
+    var bx = buf_upload(dev, x)
+    var bw = buf_upload(dev, w)
+    var bb = buf_upload(dev, b)
+    var by = inplace ? bx : buf_fill(dev, nrows * dim, 0.0)
+    var bdim = buf_u32(dev, uint(dim))
+    var beps = buf_f32(dev, eps)
+    let ran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
+        metal_set_pipeline(enc, pso)
+        metal_set_threadgroup_memory_length(enc, metal_layernorm_msl_tgmem, 0)
+        metal_set_buffer(enc, bx, 0ul, 0)
+        metal_set_buffer(enc, bw, 0ul, 1)
+        metal_set_buffer(enc, bb, 0ul, 2)
+        metal_set_buffer(enc, by, 0ul, 3)
+        metal_set_buffer(enc, bdim, 0ul, 4)
+        metal_set_buffer(enc, beps, 0ul, 5)
+        metal_dispatch_threadgroups(enc, uint3(uint(nrows), 1u, 1u), uint3(256u, 1u, 1u))
+    }
+    t |> success(ran, "{tag}: encode: {err}")
+    if (ran) {
+        t |> equal(buf_mismatch_approx(by, want, tag), 0)
+    }
+    metal_release(bx)
+    metal_release(bw)
+    metal_release(bb)
+    if (!inplace) {
+        metal_release(by)
+    }
+    metal_release(bdim)
+    metal_release(beps)
+    metal_release(pso)
+    delete x
+    delete w
+    delete b
+    delete want
+}
+
+// The two FORM-MATCHED tower GELUs vs their shipped CPU flavors on the same fixture. The LUT
+// flavor runs the CPU's own clamps + f16 round-trips in kernel (bar = one f16 ulp at the range
+// edge, tie flips only); the erf flavor's A&S polynomial sits within ~1e-5 of the CPU's
+// double-precision erf. Saturation/NaN probes ride the tail slots of every arm.
+def private gelu_flavor_gate(t : T?; dev, queue; total : int; lut : bool) {
+    let tag = "gelu_{lut ? "lut" : "erf"} total={total}"
+    var err : string
+    var pso = (lut
+        ? pipeline_from_source(dev, MetalGeluLut_metal_ew1_msl, MetalGeluLut_metal_ew1_msl_entry, MetalGeluLut_metal_ew1_msl_fastmath, err)
+        : pipeline_from_source(dev, MetalGeluErf_metal_ew1_msl, MetalGeluErf_metal_ew1_msl_entry, MetalGeluErf_metal_ew1_msl_fastmath, err))
+    t |> success(pso != null, "{tag}: pipeline: {err}")
+    return if (pso == null)
+    var g : array<float>
+    g |> resize(total)
+    for (i in range(total)) {
+        g[i] = 0.21 * float(i % 43) - 4.3
+    }
+    if (total >= 8) {   // the saturation + zero probes ride the tail slots
+        g[total - 1] = 50.0
+        g[total - 2] = -50.0
+        g[total - 3] = 100.0
+        g[total - 4] = -100.0
+        g[total - 5] = 0.0
+        g[total - 6] = 1e-30
+        g[total - 7] = -1e-30
+    }
+    var want := g
+    if (lut) {
+        gelu_tanh_lut(want, int64(total))
+    } else {
+        gelu_erf(want, int64(total))
+    }
+    var bg = buf_upload(dev, g)
+    var btot = buf_u32(dev, uint(total))
+    let ran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
+        metal_set_pipeline(enc, pso)
+        metal_set_buffer(enc, bg, 0ul, 0)
+        metal_set_buffer(enc, btot, 0ul, 1)
+        metal_dispatch_threadgroups(enc, uint3(uint((total + 63) / 64), 1u, 1u), uint3(64u, 1u, 1u))
+    }
+    t |> success(ran, "{tag}: encode: {err}")
+    if (ran && total >= 8) {
+        var back : array<float>
+        back |> resize(total)
+        unsafe {
+            memcpy(addr(back[0]), metal_buffer_contents(bg), total * 4)
+        }
+        var maxd = 0.0
+        for (bv, wv in back, want) {
+            maxd = max(maxd, abs(bv - wv))
+        }
+        to_log(LOG_INFO, "{tag}: max |gpu - cpu flavor| = {maxd}\n")
+        // LUT: one f16 ulp at |g|~10 (RNE tie flips between the tanh and exp-identity evals);
+        // erf: two ~1.5e-7-accurate erf approximations (NR double vs A&S f32) plus f32 eval noise
+        t |> success(maxd <= (lut ? 1e-2 : 1e-5), "{tag}: form-matched inside the flavor bar")
+        t |> success(back[total - 1] == 50.0 && back[total - 3] == 100.0, "{tag}: positive saturation exact")
+        t |> success(back[total - 2] == 0.0 && back[total - 4] == 0.0, "{tag}: negative saturation exact")
+        var nan_found = false
+        for (v in back) {
+            if (v != v) {
+                nan_found = true
+            }
+        }
+        t |> success(!nan_found, "{tag}: no NaN anywhere")
+        delete back
+    }
+    metal_release(bg)
+    metal_release(btot)
+    metal_release(pso)
+    delete g
+    delete want
+}
+
+// The form-delta cell: the analytic tanh-GELU vs the two shipped CPU flavors — the measured
+// per-element distances whose 32-layer coherent amplification (~4e-2 rel_l2 on qwen2audio)
+// is WHY the GPU ships form-matched flavors instead of one substituted form.
+def private gelu_form_delta(t : T?) {
+    let n = 65536
+    var xs : array<float>
+    var lut : array<float>
+    var erfv : array<float>
+    xs |> resize(n)
+    lut |> resize(n)
+    erfv |> resize(n)
+    for (i in range(n)) {
+        xs[i] = -10.0 + 20.0 * float(i) / 65535.0
+        lut[i] = xs[i]
+        erfv[i] = xs[i]
+    }
+    gelu_tanh_lut(lut, int64(n))   // the SHIPPED whisper flavor (f16-LUT round trip)
+    gelu_erf(erfv, int64(n))       // the SHIPPED mtmd-family flavor
+    var max_lut = 0.0
+    var max_erf = 0.0
+    for (i in range(n)) {
+        let x = xs[i]
+        let analytic = 0.5 * x * (1.0 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))
+        max_lut = max(max_lut, abs(analytic - lut[i]))
+        max_erf = max(max_erf, abs(analytic - erfv[i]))
+    }
+    to_log(LOG_INFO, "gelu_form_delta over [-10,10]: |analytic-lut| max {max_lut}, |analytic-erf| max {max_erf}\n")
+    // measured 3.90625e-3 = the f16 HALF-ULP at the range edge (|x|~10, spacing 2^-7): the LUT
+    // quantizes its INPUT, so the delta is absolute half-ulp * gelu' ~ 1, not relative
+    t |> success(max_lut <= 4.5e-3, "gelu analytic-vs-LUT substitution bounded (measured {max_lut})")
+    t |> success(max_erf <= 1e-3, "gelu analytic-vs-erf substitution bounded (measured {max_erf})")
+    delete xs
+    delete lut
+    delete erfv
+}
+
+// Weightless rms via MetalRmsNorm + a ones vector at the meta eps — the gemma4uv chain's idiom.
+def private rms_weightless_gate(t : T?; dev, queue; dim, nrows : int; eps : float) {
+    let tag = "rms_weightless dim={dim} nrows={nrows}"
+    var err : string
+    var pso = pipeline_from_source(dev, metal_rmsnorm_msl, metal_rmsnorm_msl_entry, metal_rmsnorm_msl_fastmath, err)
+    t |> success(pso != null, "{tag}: pipeline: {err}")
+    return if (pso == null)
+    var x : array<float>
+    var ones : array<float>
+    x |> resize(nrows * dim)
+    ones |> resize(dim)
+    for (i in range(nrows * dim)) {
+        x[i] = 0.19 * float(i % 37) - 2.9
+    }
+    for (i in range(dim)) {
+        ones[i] = 1.0
+    }
+    var want : array<float>
+    want |> resize(nrows * dim)
+    for (r in range(nrows)) {
+        var ss = 0.0
+        for (i in range(dim)) {
+            let vv = x[r * dim + i]
+            ss += vv * vv
+        }
+        let inv = 1.0 / sqrt(ss / float(dim) + eps)
+        for (i in range(dim)) {
+            want[r * dim + i] = x[r * dim + i] * inv
+        }
+    }
+    var bx = buf_upload(dev, x)
+    var bw = buf_upload(dev, ones)
+    var by = buf_fill(dev, nrows * dim, 0.0)
+    var bdim = buf_u32(dev, uint(dim))
+    var beps = buf_f32(dev, eps)
+    let ran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
+        metal_set_pipeline(enc, pso)
+        metal_set_threadgroup_memory_length(enc, metal_rmsnorm_msl_tgmem, 0)
+        metal_set_buffer(enc, bx, 0ul, 0)
+        metal_set_buffer(enc, bw, 0ul, 1)
+        metal_set_buffer(enc, by, 0ul, 2)
+        metal_set_buffer(enc, bdim, 0ul, 3)
+        metal_set_buffer(enc, beps, 0ul, 4)
+        metal_dispatch_threadgroups(enc, uint3(uint(nrows), 1u, 1u), uint3(256u, 1u, 1u))
+    }
+    t |> success(ran, "{tag}: encode: {err}")
+    if (ran) {
+        t |> equal(buf_mismatch_approx(by, want, tag), 0)
+    }
+    metal_release(bx)
+    metal_release(bw)
+    metal_release(by)
+    metal_release(bdim)
+    metal_release(beps)
+    metal_release(pso)
+    delete x
+    delete ones
+    delete want
+}
+
+// The gemma4uv 2-axis position add — bit-EXACT vs the CPU's (row + ex) + ey order; the
+// split-exponent fixture makes any reassociation visible, the non-square grid any axis swap.
+def private pos_add_gate(t : T?; dev, queue; npos, dim, ncols, pos_entries : int) {
+    let tag = "posadd2d npos={npos} ncols={ncols}"
+    var err : string
+    var pso = pipeline_from_source(dev, metal_posadd2d_msl, metal_posadd2d_msl_entry, metal_posadd2d_msl_fastmath, err)
+    t |> success(pso != null, "{tag}: pipeline: {err}")
+    return if (pso == null)
+    let total = npos * dim
+    var x : array<float>
+    var tbl : array<float>
+    x |> resize(total)
+    tbl |> resize(2 * pos_entries * dim)
+    for (i in range(total)) {
+        x[i] = 1.0e3 + 0.37 * float(i % 29)          // large exponent
+    }
+    for (i in range(pos_entries * dim)) {
+        tbl[i] = 1.0e-3 * float(i % 41 + 1)          // x-table rows: tiny exponent
+        tbl[pos_entries * dim + i] = 9.0e2 + 0.21 * float(i % 19)   // y-table rows: large again
+    }
+    var want : array<float>
+    want |> resize(total)
+    for (p in range(npos)) {
+        for (i in range(dim)) {
+            let ex = tbl[(p % ncols) * dim + i]
+            let ey = tbl[(pos_entries + p / ncols) * dim + i]
+            want[p * dim + i] = (x[p * dim + i] + ex) + ey
+        }
+    }
+    var bx = buf_upload(dev, x)
+    var btbl = buf_upload(dev, tbl)
+    var bdim = buf_u32(dev, uint(dim))
+    var bcols = buf_u32(dev, uint(ncols))
+    var bpe = buf_u32(dev, uint(pos_entries))
+    var btot = buf_u32(dev, uint(total))
+    let ran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
+        metal_set_pipeline(enc, pso)
+        metal_set_buffer(enc, bx, 0ul, 0)
+        metal_set_buffer(enc, btbl, 0ul, 1)
+        metal_set_buffer(enc, bdim, 0ul, 2)
+        metal_set_buffer(enc, bcols, 0ul, 3)
+        metal_set_buffer(enc, bpe, 0ul, 4)
+        metal_set_buffer(enc, btot, 0ul, 5)
+        metal_dispatch_threadgroups(enc, uint3(uint((total + 63) / 64), 1u, 1u), uint3(64u, 1u, 1u))
+    }
+    t |> success(ran, "{tag}: encode: {err}")
+    if (ran) {
+        t |> equal(buf_mismatch_exact(bx, want, tag), 0)
+    }
+    metal_release(bx)
+    metal_release(btbl)
+    metal_release(bdim)
+    metal_release(bcols)
+    metal_release(bpe)
+    metal_release(btot)
+    metal_release(pso)
+    delete x
+    delete tbl
+    delete want
+}
+
+// The whisper cross-KV shuffles — pure scatter (+ one multiply for kx), bit-EXACT vs the CPU
+// walk. The offset leg writes the SECOND layer slot and proves the first stays untouched.
+// Negative controls recorded 2026-08-16: dropped kscale in the kx oracle and swapped t/j in
+// the vx oracle each redded with dumps (the kx mismatch ratio was exactly kscale).
+def private cross_kx_gate(t : T?; dev, queue; ta, dim, hh : int; off_layer : bool) {
+    let tag = "cross_kx ta={ta} dim={dim} hh={hh} off={off_layer}"
+    var err : string
+    var pso = pipeline_from_source(dev, metal_cross_kx_msl, metal_cross_kx_msl_entry, metal_cross_kx_msl_fastmath, err)
+    t |> success(pso != null, "{tag}: pipeline: {err}")
+    return if (pso == null)
+    let hs = dim / hh
+    let total = ta * dim
+    let kscale = 1.0 / sqrt(sqrt(float(hs)))
+    var src : array<float>
+    src |> resize(total)
+    for (i in range(total)) {
+        src[i] = 0.25 * float(i % 97) - 3.0
+    }
+    let sentinel = -777.0
+    var want : array<float>
+    want |> resize(2 * total)
+    for (i in range(2 * total)) {
+        want[i] = sentinel
+    }
+    let base = off_layer ? total : 0
+    for (h in range(hh)) {
+        for (j in range(hs)) {
+            for (tt in range(ta)) {
+                want[base + (h * hs + j) * ta + tt] = src[tt * dim + h * hs + j] * kscale
+            }
+        }
+    }
+    var bsrc = buf_upload(dev, src)
+    var bkx = buf_fill(dev, 2 * total, sentinel)
+    var bdim = buf_u32(dev, uint(dim))
+    var bhs = buf_u32(dev, uint(hs))
+    var bta = buf_u32(dev, uint(ta))
+    var bks = buf_f32(dev, kscale)
+    var btot = buf_u32(dev, uint(total))
+    let ran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
+        metal_set_pipeline(enc, pso)
+        metal_set_buffer(enc, bsrc, 0ul, 0)
+        metal_set_buffer(enc, bkx, uint64(base * 4), 1)
+        metal_set_buffer(enc, bdim, 0ul, 2)
+        metal_set_buffer(enc, bhs, 0ul, 3)
+        metal_set_buffer(enc, bta, 0ul, 4)
+        metal_set_buffer(enc, bks, 0ul, 5)
+        metal_set_buffer(enc, btot, 0ul, 6)
+        metal_dispatch_threadgroups(enc, uint3(uint((total + 63) / 64), 1u, 1u), uint3(64u, 1u, 1u))
+    }
+    t |> success(ran, "{tag}: encode: {err}")
+    if (ran) {
+        t |> equal(buf_mismatch_exact(bkx, want, tag), 0)
+    }
+    metal_release(bsrc)
+    metal_release(bkx)
+    metal_release(bdim)
+    metal_release(bhs)
+    metal_release(bta)
+    metal_release(bks)
+    metal_release(btot)
+    metal_release(pso)
+    delete src
+    delete want
+}
+
+// The Vx form doubles as the KV APPEND: the offset leg writes n rows at t0 into a wider
+// tstride slab (sentinel-checked whole), the bias leg folds a per-column bias, and soff picks
+// a column block out of a fused-QKV row (src bound at a byte offset with the fused row stride).
+def private cross_vx_gate(t : T?; dev, queue; ta, dim, hh : int; t0, tstride : int; hasb : bool; soff_cols : int = 0; src_stride : int = 0) {
+    let tag = "cross_vx ta={ta} dim={dim} hh={hh} t0={t0} hasb={hasb} soff={soff_cols}"
+    var err : string
+    var pso = pipeline_from_source(dev, metal_cross_vx_msl, metal_cross_vx_msl_entry, metal_cross_vx_msl_fastmath, err)
+    t |> success(pso != null, "{tag}: pipeline: {err}")
+    return if (pso == null)
+    let hs = dim / hh
+    let sstride = src_stride > 0 ? src_stride : dim
+    let total = ta * dim
+    let sentinel = -555.0
+    var src : array<float>
+    src |> resize(ta * sstride)
+    for (i in range(ta * sstride)) {
+        src[i] = 0.5 * float(i % 89) - 11.0
+    }
+    var bias : array<float>
+    bias |> resize(dim)
+    for (i in range(dim)) {
+        bias[i] = 0.125 * float(i % 13) - 0.5
+    }
+    let slab = hh * tstride * hs
+    var want : array<float>
+    want |> resize(slab)
+    for (i in range(slab)) {
+        want[i] = sentinel
+    }
+    for (h in range(hh)) {
+        for (tt in range(ta)) {
+            for (j in range(hs)) {
+                let v = src[tt * sstride + soff_cols + h * hs + j] + (hasb ? bias[h * hs + j] : 0.0)
+                want[h * tstride * hs + (t0 + tt) * hs + j] = v
+            }
+        }
+    }
+    var bsrc = buf_upload(dev, src)
+    var bvx = buf_fill(dev, slab, sentinel)
+    var bb = buf_upload(dev, bias)
+    var bdim = buf_u32(dev, uint(sstride))
+    var bhs = buf_u32(dev, uint(hs))
+    var bta = buf_u32(dev, uint(ta))
+    var bt0 = buf_u32(dev, uint(t0))
+    var bts = buf_u32(dev, uint(tstride))
+    var bhb = buf_u32(dev, hasb ? 1u : 0u)
+    var btot = buf_u32(dev, uint(total))
+    let ran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
+        metal_set_pipeline(enc, pso)
+        metal_set_buffer(enc, bsrc, uint64(soff_cols * 4), 0)
+        metal_set_buffer(enc, bvx, 0ul, 1)
+        metal_set_buffer(enc, bb, 0ul, 2)
+        metal_set_buffer(enc, bdim, 0ul, 3)
+        metal_set_buffer(enc, bhs, 0ul, 4)
+        metal_set_buffer(enc, bta, 0ul, 5)
+        metal_set_buffer(enc, bt0, 0ul, 6)
+        metal_set_buffer(enc, bts, 0ul, 7)
+        metal_set_buffer(enc, bhb, 0ul, 8)
+        metal_set_buffer(enc, btot, 0ul, 9)
+        metal_dispatch_threadgroups(enc, uint3(uint((total + 63) / 64), 1u, 1u), uint3(64u, 1u, 1u))
+    }
+    t |> success(ran, "{tag}: encode: {err}")
+    if (ran) {
+        t |> equal(buf_mismatch_exact(bvx, want, tag), 0)
+    }
+    metal_release(bsrc)
+    metal_release(bvx)
+    metal_release(bb)
+    metal_release(bdim)
+    metal_release(bhs)
+    metal_release(bta)
+    metal_release(bt0)
+    metal_release(bts)
+    metal_release(bhb)
+    metal_release(btot)
+    metal_release(pso)
+    delete src
+    delete bias
+    delete want
+}
+
+// The chunked twin pair vs the SAME oracle: Part writes per-chunk (m, s, y) partials, Comb
+// merges by log-sum-exp — the pair must land on the single-pass answer (1e-4, exp reassoc).
+// Negative control recorded 2026-08-16: an off-by-one oracle len redded all three cells.
+def private wdec_attn_pc_gate(t : T?; dev, queue; n, dim, hh, tstride, len0 : int; causal : bool) {
+    let tag = "wdec_attn_pc n={n} dim={dim} hh={hh} len0={len0} causal={causal}"
+    var err : string
+    var pp = pipeline_from_source(dev, metal_wdec_attn_part_msl, metal_wdec_attn_part_msl_entry, metal_wdec_attn_part_msl_fastmath, err)
+    t |> success(pp != null, "{tag}: part pipeline: {err}")
+    return if (pp == null)
+    var pc = pipeline_from_source(dev, metal_wdec_attn_comb_msl, metal_wdec_attn_comb_msl_entry, metal_wdec_attn_comb_msl_fastmath, err)
+    t |> success(pc != null, "{tag}: comb pipeline: {err}")
+    if (pc == null) {
+        metal_release(pp)
+        return
+    }
+    let hs = dim / hh
+    let scale = 1.0 / sqrt(float(hs))
+    let maxlen = causal ? len0 + n - 1 : len0
+    let nch = (maxlen + 255) / 256
+    var q : array<float>
+    var qb : array<float>
+    var kvh : array<uint16>
+    var vvh : array<uint16>
+    var kv : array<float>
+    var vv : array<float>
+    q |> resize(n * dim)
+    qb |> resize(dim)
+    kvh |> resize(hh * tstride * hs)
+    vvh |> resize(hh * tstride * hs)
+    kv |> resize(hh * tstride * hs)
+    vv |> resize(hh * tstride * hs)
+    for (i in range(n * dim)) {
+        q[i] = 0.11 * float(i % 37) - 1.7
+    }
+    for (i in range(dim)) {
+        qb[i] = 0.07 * float(i % 11) - 0.3
+    }
+    for (i in range(hh * tstride * hs)) {
+        kvh[i] = uint16(f32_to_f16(0.09 * float(i % 41) - 1.9))
+        vvh[i] = uint16(f32_to_f16(0.13 * float(i % 29) - 1.1))
+        kv[i] = f16_to_f32(uint(kvh[i]))
+        vv[i] = f16_to_f32(uint(vvh[i]))
+    }
+    var want : array<float>
+    want |> resize(n * dim)
+    var scores : array<float>
+    scores |> resize(tstride)
+    for (h in range(hh)) {
+        for (r in range(n)) {
+            let len = causal ? len0 + r : len0
+            var mx = -3.0e38
+            for (tt in range(len)) {
+                var sacc = 0.0
+                for (j in range(hs)) {
+                    sacc += (q[r * dim + h * hs + j] + qb[h * hs + j]) * kv[(h * tstride + tt) * hs + j]
+                }
+                scores[tt] = sacc * scale
+                mx = max(mx, scores[tt])
+            }
+            var tot = 0.0
+            for (tt in range(len)) {
+                scores[tt] = exp(scores[tt] - mx)
+                tot += scores[tt]
+            }
+            for (j in range(hs)) {
+                var acc = 0.0
+                for (tt in range(len)) {
+                    acc += scores[tt] * vv[(h * tstride + tt) * hs + j]
+                }
+                want[r * dim + h * hs + j] = acc / tot
+            }
+        }
+    }
+    var bq = buf_upload(dev, q)
+    var bk = buf_upload(dev, kvh)
+    var bv = buf_upload(dev, vvh)
+    var bqb = buf_upload(dev, qb)
+    var bpms = buf_fill(dev, nch * hh * n * 2, -888.0)
+    var bpy = buf_fill(dev, nch * hh * n * hs, -888.0)
+    var by = buf_fill(dev, n * dim, -444.0)
+    var bdim = buf_u32(dev, uint(dim))
+    var bhs = buf_u32(dev, uint(hs))
+    var bts = buf_u32(dev, uint(tstride))
+    var blen = buf_u32(dev, uint(len0))
+    var bca = buf_u32(dev, causal ? 1u : 0u)
+    var bsc = buf_f32(dev, scale)
+    var bhh = buf_u32(dev, uint(hh))
+    var bn = buf_u32(dev, uint(n))
+    var bnch = buf_u32(dev, uint(nch))
+    let ran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
+        metal_set_pipeline(enc, pp)
+        metal_set_threadgroup_memory_length(enc, metal_wdec_attn_part_msl_tgmem, 0)
+        metal_set_buffer(enc, bq, 0ul, 0)
+        metal_set_buffer(enc, bk, 0ul, 1)
+        metal_set_buffer(enc, bv, 0ul, 2)
+        metal_set_buffer(enc, bpms, 0ul, 3)
+        metal_set_buffer(enc, bpy, 0ul, 4)
+        metal_set_buffer(enc, bqb, 0ul, 5)
+        metal_set_buffer(enc, bdim, 0ul, 6)
+        metal_set_buffer(enc, bhs, 0ul, 7)
+        metal_set_buffer(enc, bts, 0ul, 8)
+        metal_set_buffer(enc, blen, 0ul, 9)
+        metal_set_buffer(enc, bca, 0ul, 10)
+        metal_set_buffer(enc, bsc, 0ul, 11)
+        metal_set_buffer(enc, bhh, 0ul, 12)
+        metal_set_buffer(enc, bn, 0ul, 13)
+        metal_dispatch_threadgroups(enc, uint3(uint(hh), uint(n), uint(nch)), uint3(128u, 1u, 1u))
+        metal_memory_barrier(enc)
+        metal_set_pipeline(enc, pc)
+        metal_set_buffer(enc, bpms, 0ul, 0)
+        metal_set_buffer(enc, bpy, 0ul, 1)
+        metal_set_buffer(enc, by, 0ul, 2)
+        metal_set_buffer(enc, bdim, 0ul, 3)
+        metal_set_buffer(enc, bhs, 0ul, 4)
+        metal_set_buffer(enc, bnch, 0ul, 5)
+        metal_set_buffer(enc, bhh, 0ul, 6)
+        metal_set_buffer(enc, bn, 0ul, 7)
+        metal_dispatch_threadgroups(enc, uint3(uint(hh), uint(n), 1u), uint3(64u, 1u, 1u))
+    }
+    t |> success(ran, "{tag}: encode: {err}")
+    if (ran) {
+        t |> equal(buf_mismatch_approx(by, want, tag), 0)
+    }
+    metal_release(bq)
+    metal_release(bk)
+    metal_release(bv)
+    metal_release(bqb)
+    metal_release(bpms)
+    metal_release(bpy)
+    metal_release(by)
+    metal_release(bdim)
+    metal_release(bhs)
+    metal_release(bts)
+    metal_release(blen)
+    metal_release(bca)
+    metal_release(bsc)
+    metal_release(bhh)
+    metal_release(bn)
+    metal_release(bnch)
+    metal_release(pp)
+    metal_release(pc)
+    delete q
+    delete qb
+    delete kvh
+    delete vvh
+    delete kv
+    delete vv
+    delete want
+    delete scores
+}
+
+def private bias_add_res_gate(t : T?; dev, queue; nrows, dim : int) {
+    let tag = "bias_add_res nrows={nrows} dim={dim}"
+    var err : string
+    var pso = pipeline_from_source(dev, metal_bias_add_res_msl, metal_bias_add_res_msl_entry, metal_bias_add_res_msl_fastmath, err)
+    t |> success(pso != null, "{tag}: pipeline: {err}")
+    return if (pso == null)
+    let total = nrows * dim
+    var x : array<float>
+    var y : array<float>
+    var b : array<float>
+    x |> resize(total)
+    y |> resize(total)
+    b |> resize(dim)
+    for (i in range(total)) {
+        x[i] = 0.3 * float(i % 23) - 2.0
+        y[i] = 0.17 * float(i % 31) - 1.0
+    }
+    for (i in range(dim)) {
+        b[i] = 0.05 * float(i % 7) - 0.1
+    }
+    var want : array<float>
+    want |> resize(total)
+    for (i in range(total)) {
+        want[i] = x[i] + (y[i] + b[i % dim])
+    }
+    var bx = buf_upload(dev, x)
+    var by = buf_upload(dev, y)
+    var bb = buf_upload(dev, b)
+    var bdim = buf_u32(dev, uint(dim))
+    var btot = buf_u32(dev, uint(total))
+    let ran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
+        metal_set_pipeline(enc, pso)
+        metal_set_buffer(enc, bx, 0ul, 0)
+        metal_set_buffer(enc, by, 0ul, 1)
+        metal_set_buffer(enc, bb, 0ul, 2)
+        metal_set_buffer(enc, bdim, 0ul, 3)
+        metal_set_buffer(enc, btot, 0ul, 4)
+        metal_dispatch_threadgroups(enc, uint3(uint((total + 63) / 64), 1u, 1u), uint3(64u, 1u, 1u))
+    }
+    t |> success(ran, "{tag}: encode: {err}")
+    if (ran) {
+        t |> equal(buf_mismatch_approx(bx, want, tag), 0)
+    }
+    metal_release(bx)
+    metal_release(by)
+    metal_release(bb)
+    metal_release(bdim)
+    metal_release(btot)
+    metal_release(pso)
+    delete x
+    delete y
+    delete b
+    delete want
+}
+
+def private bias_gelu_lut_gate(t : T?; dev, queue; nrows, dim : int) {
+    let tag = "bias_gelu_lut nrows={nrows} dim={dim}"
+    var err : string
+    var pso = pipeline_from_source(dev, metal_bias_gelu_lut_msl, metal_bias_gelu_lut_msl_entry, metal_bias_gelu_lut_msl_fastmath, err)
+    t |> success(pso != null, "{tag}: pipeline: {err}")
+    return if (pso == null)
+    let total = nrows * dim
+    var x : array<float>
+    var b : array<float>
+    x |> resize(total)
+    b |> resize(dim)
+    for (i in range(total)) {
+        x[i] = 0.02 * float(i % 512) - 5.0   // spans the LUT clamp on both sides
+    }
+    for (i in range(dim)) {
+        b[i] = 0.03 * float(i % 17) - 0.25
+    }
+    var want : array<float>
+    want |> resize(total)
+    for (i in range(total)) {
+        want[i] = x[i] + b[i % dim]
+    }
+    gelu_tanh_lut(want, int64(total))   // the CPU LUT form — the form-matched oracle
+    var bx = buf_upload(dev, x)
+    var bb = buf_upload(dev, b)
+    var bdim = buf_u32(dev, uint(dim))
+    var btot = buf_u32(dev, uint(total))
+    let ran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
+        metal_set_pipeline(enc, pso)
+        metal_set_buffer(enc, bx, 0ul, 0)
+        metal_set_buffer(enc, bb, 0ul, 1)
+        metal_set_buffer(enc, bdim, 0ul, 2)
+        metal_set_buffer(enc, btot, 0ul, 3)
+        metal_dispatch_threadgroups(enc, uint3(uint((total + 63) / 64), 1u, 1u), uint3(64u, 1u, 1u))
+    }
+    t |> success(ran, "{tag}: encode: {err}")
+    if (ran) {
+        t |> equal(buf_mismatch_approx(bx, want, tag), 0)
+    }
+    metal_release(bx)
+    metal_release(bb)
+    metal_release(bdim)
+    metal_release(btot)
+    metal_release(pso)
+    delete x
+    delete b
+    delete want
+}
+
+// The conv-frontend im2col vs the CPU walk — bit-exact scatter with the "same"-pad zero
+// edges; both source layouts (chmajor mel vs row-major y1) and both strides.
+// Negative control recorded 2026-08-16: dropping the -1 pad shift redded all four cells.
+def private im2col3_gate(t : T?; dev, queue; rows, nch, srclen, stride : int; chmajor : bool) {
+    let tag = "im2col3 rows={rows} nch={nch} stride={stride} chmajor={chmajor}"
+    var err : string
+    var pso = pipeline_from_source(dev, metal_im2col3_msl, metal_im2col3_msl_entry, metal_im2col3_msl_fastmath, err)
+    t |> success(pso != null, "{tag}: pipeline: {err}")
+    return if (pso == null)
+    let total = rows * 3 * nch
+    var src : array<float>
+    src |> resize(srclen * nch)
+    for (i in range(srclen * nch)) {
+        src[i] = 0.21 * float(i % 53) - 4.0
+    }
+    var want : array<float>
+    want |> resize(total)
+    for (i in range(rows)) {
+        for (dk in range(3)) {
+            let sp = i * stride + dk - 1
+            for (c in range(nch)) {
+                want[(i * 3 + dk) * nch + c] = (sp >= 0 && sp < srclen
+                    ? (chmajor ? src[c * srclen + sp] : src[sp * nch + c])
+                    : 0.0)
+            }
+        }
+    }
+    var bsrc = buf_upload(dev, src)
+    var bcol = buf_fill(dev, total, -333.0)
+    var bnch = buf_u32(dev, uint(nch))
+    var bsl = buf_u32(dev, uint(srclen))
+    var bst = buf_u32(dev, uint(stride))
+    var bch = buf_u32(dev, chmajor ? 1u : 0u)
+    var btot = buf_u32(dev, uint(total))
+    let ran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
+        metal_set_pipeline(enc, pso)
+        metal_set_buffer(enc, bsrc, 0ul, 0)
+        metal_set_buffer(enc, bcol, 0ul, 1)
+        metal_set_buffer(enc, bnch, 0ul, 2)
+        metal_set_buffer(enc, bsl, 0ul, 3)
+        metal_set_buffer(enc, bst, 0ul, 4)
+        metal_set_buffer(enc, bch, 0ul, 5)
+        metal_set_buffer(enc, btot, 0ul, 6)
+        metal_dispatch_threadgroups(enc, uint3(uint((total + 63) / 64), 1u, 1u), uint3(64u, 1u, 1u))
+    }
+    t |> success(ran, "{tag}: encode: {err}")
+    if (ran) {
+        t |> equal(buf_mismatch_exact(bcol, want, tag), 0)
+    }
+    metal_release(bsrc)
+    metal_release(bcol)
+    metal_release(bnch)
+    metal_release(bsl)
+    metal_release(bst)
+    metal_release(bch)
+    metal_release(btot)
+    metal_release(pso)
+    delete src
+    delete want
+}
+
+// The 2D conv im2col (k=3 s=2 p=1) vs the CPU conv2d_s2 walk — bit-exact scatter with the
+// zero pad edges, the K pad (kd > cin*9) and the strided source (sstride > cin, the padded
+// GEMM rows). Negative control recorded 2026-08-16: dropping the -1 pad shift redded every cell.
+def private im2col2d_gate(t : T?; dev, queue; iw, ih, cin, kd, sstride : int) {
+    let tag = "im2col2d iw={iw} ih={ih} cin={cin} kd={kd} ss={sstride}"
+    var err : string
+    var pso = pipeline_from_source(dev, metal_im2col2d_msl, metal_im2col2d_msl_entry, metal_im2col2d_msl_fastmath, err)
+    t |> success(pso != null, "{tag}: pipeline: {err}")
+    return if (pso == null)
+    let ow = (iw - 1) / 2 + 1
+    let oh = (ih - 1) / 2 + 1
+    let rows = oh * ow
+    let total = rows * kd
+    var src : array<float>
+    src |> resize(ih * iw * sstride)
+    for (i in range(ih * iw * sstride)) {
+        src[i] = 0.31 * float(i % 47) - 6.0
+    }
+    var want : array<float>
+    want |> resize(total)
+    for (oy in range(oh)) {
+        for (ox in range(ow)) {
+            let r = oy * ow + ox
+            for (k in range(kd)) {
+                var v = 0.0
+                if (k < cin * 9) {
+                    let ic = k / 9
+                    let kh = (k % 9) / 3
+                    let kw = k % 3
+                    let iy = oy * 2 + kh - 1
+                    let ix = ox * 2 + kw - 1
+                    if (iy >= 0 && iy < ih && ix >= 0 && ix < iw) {
+                        v = src[(iy * iw + ix) * sstride + ic]
+                    }
+                }
+                want[r * kd + k] = v
+            }
+        }
+    }
+    var bsrc = buf_upload(dev, src)
+    var bcol = buf_fill(dev, total, -222.0)
+    var biw = buf_u32(dev, uint(iw))
+    var bih = buf_u32(dev, uint(ih))
+    var bcin = buf_u32(dev, uint(cin))
+    var bow = buf_u32(dev, uint(ow))
+    var bkd = buf_u32(dev, uint(kd))
+    var bss = buf_u32(dev, uint(sstride))
+    var btot = buf_u32(dev, uint(total))
+    let ran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
+        metal_set_pipeline(enc, pso)
+        metal_set_buffer(enc, bsrc, 0ul, 0)
+        metal_set_buffer(enc, bcol, 0ul, 1)
+        metal_set_buffer(enc, biw, 0ul, 2)
+        metal_set_buffer(enc, bih, 0ul, 3)
+        metal_set_buffer(enc, bcin, 0ul, 4)
+        metal_set_buffer(enc, bow, 0ul, 5)
+        metal_set_buffer(enc, bkd, 0ul, 6)
+        metal_set_buffer(enc, bss, 0ul, 7)
+        metal_set_buffer(enc, btot, 0ul, 8)
+        metal_dispatch_threadgroups(enc, uint3(uint((total + 63) / 64), 1u, 1u), uint3(64u, 1u, 1u))
+    }
+    t |> success(ran, "{tag}: encode: {err}")
+    if (ran) {
+        t |> equal(buf_mismatch_exact(bcol, want, tag), 0)
+    }
+    metal_release(bsrc)
+    metal_release(bcol)
+    metal_release(biw)
+    metal_release(bih)
+    metal_release(bcin)
+    metal_release(bow)
+    metal_release(bkd)
+    metal_release(bss)
+    metal_release(btot)
+    metal_release(pso)
+    delete src
+    delete want
+}
+
 def private suppress_row_gate(t : T?; dev, queue; total, nids : int) {
     let tag = "suppress_row total={total} nids={nids}"
     var err : string
@@ -623,9 +1467,9 @@ def private mtl_toy_lens_gate(t : T?; dev, queue; n : int) {
 
 [test]
 def test_metal_misc_kernels(t : T?) {
-    t |> run("decode elementwise/misc kernels == direct CPU oracles") <| @(t : T?) {
+    t |> run("decode elementwise/misc kernels == direct CPU oracles") @(t : T?) {
         static_if (typeinfo builtin_module_exists(das_metal)) {
-            with_metal_device() <| $(dev : MetalDevice?) {
+            with_metal_device() $(dev : MetalDevice?) {
                 if (dev == null) {
                     feint("no Metal device on this box; GPU kernel checks skipped\n")
                     return
@@ -644,6 +1488,43 @@ def test_metal_misc_kernels(t : T?) {
                 qk_norm_gate(t, dev, queue, 64, 4, 2, 2, true)      // the no-wv V-fusion shape
                 qk_norm_gate(t, dev, queue, 128, 2, 1, 1, false)
                 geglu_gate(t, dev, queue, 800)
+
+                // ===== tower primitives =====
+                layernorm_gate(t, dev, queue, 384, 4, 1.0e-5, false)    // whisper-tiny d; strided tail
+                layernorm_gate(t, dev, queue, 896, 2, 1.0e-5, false)    // qwen3a d
+                layernorm_gate(t, dev, queue, 1280, 2, 1.0e-5, false)   // whisper-large d
+                layernorm_gate(t, dev, queue, 3840, 3, 1.0e-5, false)   // gemma4uv n_embd
+                layernorm_gate(t, dev, queue, 6912, 3, 1.0e-5, false)   // gemma4uv patch_dim - widest row
+                layernorm_gate(t, dev, queue, 1280, 1, 1.0e-5, false)   // single-row grid
+                layernorm_gate(t, dev, queue, 100, 2, 1.0e-5, false)    // smaller than a simdgroup stride
+                layernorm_gate(t, dev, queue, 1280, 2, 1.0e-3, false)   // non-default eps: the uniform is live
+                layernorm_gate(t, dev, queue, 1280, 2, 1.0e-5, true)    // IN PLACE - the gemma4uv production shape
+                gelu_flavor_gate(t, dev, queue, 800, true)     // %64 != 0 tail guard
+                gelu_flavor_gate(t, dev, queue, 1000, true)
+                gelu_flavor_gate(t, dev, queue, 5120, true)    // whisper-large n_ff
+                gelu_flavor_gate(t, dev, queue, 800, false)
+                gelu_flavor_gate(t, dev, queue, 5120, false)
+                gelu_form_delta(t)
+                rms_weightless_gate(t, dev, queue, 3840, 3, 1.0e-6)
+                pos_add_gate(t, dev, queue, 98, 64, 14, 1120)   // 672x336 grid: NON-square, axis order visible
+                pos_add_gate(t, dev, queue, 49, 64, 7, 1120)    // square control
+                cross_kx_gate(t, dev, queue, 96, 128, 2, false)   // whisper hs=64; exact total%64
+                cross_kx_gate(t, dev, queue, 12, 16, 2, true)     // ceil grid guard + the layer-offset slot
+                cross_vx_gate(t, dev, queue, 96, 128, 2, 0, 96, false)     // the cross_kv shape (t0=0, tstride=ta)
+                cross_vx_gate(t, dev, queue, 12, 16, 2, 0, 12, true)       // ceil grid + the folded bias
+                cross_vx_gate(t, dev, queue, 3, 16, 2, 5, 20, true)        // the KV APPEND shape: t0>0 into a wider slab
+                cross_vx_gate(t, dev, queue, 1, 16, 2, 0, 20, false, 16, 48)   // the fused-QKV column pick (soff, 3d row)
+                wdec_attn_pc_gate(t, dev, queue, 1, 128, 2, 600, 600, false)   // 3 chunks, full last chunk boundary
+                wdec_attn_pc_gate(t, dev, queue, 3, 128, 2, 300, 259, true)    // causal rows crossing a chunk edge
+                wdec_attn_pc_gate(t, dev, queue, 1, 128, 2, 256, 256, false)   // exactly one chunk
+                bias_add_res_gate(t, dev, queue, 3, 128)
+                bias_gelu_lut_gate(t, dev, queue, 2, 640)
+                im2col3_gate(t, dev, queue, 20, 16, 20, 1, true)    // conv1 shape: chmajor, s1, same len
+                im2col3_gate(t, dev, queue, 10, 32, 20, 2, false)   // conv2 shape: row-major, s2, halved rows
+                im2col3_gate(t, dev, queue, 7, 16, 13, 2, true)     // odd tail + the right pad edge
+                im2col2d_gate(t, dev, queue, 10, 12, 1, 32, 1)      // conv1 shape: cin 1, K padded 9->32
+                im2col2d_gate(t, dev, queue, 10, 8, 4, 36, 8)       // dense K, strided source (padded rows)
+                im2col2d_gate(t, dev, queue, 5, 6, 4, 36, 4)        // odd grid, tight source
                 suppress_row_gate(t, dev, queue, 2000, 37)
                 softcap_row_gate(t, dev, queue, 900, 30.0)
                 mtl_toy_lens_gate(t, dev, queue, 1000)      // n%64 != 0 — the tail workgroup's guard

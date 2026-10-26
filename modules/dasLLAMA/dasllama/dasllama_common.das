@@ -1,8 +1,10 @@
 options gen2
 options _comment_hygiene = true
+options _dasllama_internal = true
 
 module dasllama_common shared public
 
+require dasllama/dasllama_lint public
 require daslib/fio
 require dasllama/dasllama_version public  // DASLLAMA_VERSION — re-exported so the facade chain carries the module's release counter
 require dasllama/dasllama_env  // the g_env_* knob globals ([EnvConfig] declarations; ENVIRONMENT.md is generated from them)
@@ -885,8 +887,8 @@ struct Model {
     // trimmed-flavor embedding planes (P3): the emb/cls tensor's rows kept CPU-readable after
     // the big weight families drop. q8: mblob-style 34B interleaved blocks (embs empty);
     // kq: the region's quant + scale planes copied verbatim (repack layout preserved, rebased to 0).
-    embq : array<uint8>
-    embs : array<uint8>
+    @exact_size embq : array<uint8>
+    @exact_size embs : array<uint8>
     // prepared-model image backing (dasllama_image): when set, every locked array field above
     // is a borrowed VIEW into this image (zero-copy) and the finalizer below releases it.
     // Both fields are skipped by the image save/load field walk.
@@ -1257,7 +1259,7 @@ def apply_box_profile_runtime(path : string = "") {
     apply_i64_knob(rt, "gemv_lane_cap") $(v) { set_gemv_lane_cap(int(min(v, 2147483647l))) }
     apply_i64_knob(rt, "batch_lane_cap") $(v) { set_batch_lane_cap(int(min(v, 2147483647l))) }
     apply_i64_knob(rt, "batch_grid_2d") $(v) { set_batch_grid_2d(int(min(v, 2l))) }
-    apply_i64_knob(rt, "dispatch_worker_limit") $(v) { set_dispatch_worker_limit(int(min(v, 2147483647l))) }
+    apply_i64_knob(rt, "dispatch_worker_limit") $(v) { set_dispatch_worker_limit_(int(min(v, 2147483647l))) }
     apply_i64_knob(rt, "gemv_wave_fill") $(v) { set_gemv_wave_fill(v != 0l) }
     apply_i64_knob(rt, "fused_decode") $(v) { set_fused_decode(v != 0l) }
     // stored only — the queue may not exist yet; setup_dasllama_jobque applies these inside with_job_que
@@ -1342,7 +1344,7 @@ def public get_kq_q51_native() : bool {
 
 def private dlim_cpu_source_impl(var c : DlimCpuConfig) {
     // the one sanctioned backend-select side effect — the identity itself is a pure formatter
-    select_matmul_backend_for_load()
+    select_matmul_backend_for_load_()
     c.backend = dlim_backend_name()   // the cross-box bake's target alias when one is armed
     c.q8_mr = active_q8_layout_mr()
     c.q8_wbias = active_q8_wbias()
@@ -1696,8 +1698,8 @@ struct Session {
     @scratch moe_ghb2 : array<float>     // bucket up outputs (same shape)
     @scratch moe_hq : array<int8>        // bucket hidden requant quants (npos x max(n_ff_exp, n_ff_shexp))
     @scratch moe_hs : array<float>       // bucket hidden requant scales (same / 32)
-    @scratch moe_gout : array<float>     // bucket (then shared-expert) down-projection output (npos x dim)
-    @scratch moe_eout : array<float>     // routed expert outputs parked by (position, slot) (npos x k x dim)
+    @scratch @exact_size moe_gout : array<float>     // bucket (then shared-expert) down-projection output (npos x dim)
+    @scratch @exact_size moe_eout : array<float>     // routed expert outputs parked by (position, slot) (npos x k x dim)
     ffn_offs : array<int64>     // dense/shexp gate+up fuse: 2 region (weight, activation) offset pairs
     ffn_gu : array<float>       // dense/shexp gate+up fuse output — gate half then up half (2 x max_ffn_width)
     mx4_wq : array<int8>        // grouped-prefill expansion of ONE native-MXFP4 expert to exact Q8 (dim x n_ff_exp)
@@ -1713,8 +1715,8 @@ struct Session {
     // qwen35 deltanet recurrent state (persists across tokens; zeroed at position 0) + scratch.
     // Empty unless config.recr_mask != 0. State is forward-only — dn_pos guards against rewind.
     dn_pos : int64                 // the next position the deltanet stack expects
-    dn_conv_state : array<float>   // per recurrent layer: (d_conv-1) history taps per channel, channel-major
-    dn_state : array<float>        // per recurrent layer: S — dt_rank heads x (d_state x d_state) f32
+    @exact_size dn_conv_state : array<float>   // per recurrent layer: (d_conv-1) history taps per channel, channel-major
+    @exact_size dn_state : array<float>        // per recurrent layer: S — dt_rank heads x (d_state x d_state) f32
     dn_conv_prefix : array<int64>  // per-layer element offsets into the two above; -1 = attention layer
     dn_state_prefix : array<int64>
     dn_qkv : array<float>          // fused [q;k;v] projection out (conv_dim)
@@ -1860,8 +1862,8 @@ def make_run_state(c : Config; kdt : KVDtype = KVDtype.f32; vdt : KVDtype = KVDt
                 s.dn_state_prefix |> push(-1l)
             }
         }
-        s.dn_conv_state |> resize(co)
-        s.dn_state |> resize(so)
+        s.dn_conv_state |> reserve_resize(co)
+        s.dn_state |> reserve_resize(so)   // 27B-class: 48 recurrent layers x 48 heads x 128^2 = 144 MB in one grow
         s.dn_qkv |> resize(cd)
         s.dn_z |> resize(c.ssm_d_inner)
         s.dn_beta |> resize(c.ssm_dt_rank)
@@ -4745,8 +4747,8 @@ def forward_prefill_body(t : Model; var s : Session; npos, start_pos : int64; sk
     prof_add("rope_build", ts_rope_build)   // one-time cos/sin table build (separate bucket)
 
     // an active whole-prefill override may claim the entire stack (false = decline, fall back to
-    // the CPU loop). Contract: a claiming override must honor s.attn_uniform_end — both
-    // registered overrides decline the non-causal image span, so it lands on the CPU loop below.
+    // the CPU loop). Contract: a claiming override must honor s.attn_uniform_end — metal serves
+    // the span through AttnArgs.uend; vulkan declines it.
     var stack_done = false
     g_prefill_logits_done = false
     if (!empty(g_prefill_override_name)) {
@@ -4755,9 +4757,7 @@ def forward_prefill_body(t : Model; var s : Session; npos, start_pos : int64; sk
     if (!stack_done) {
         blob_only_panic(t, "prefill stack")
         // Metal-capable build about to chew a real prompt on the CPU stack — the silent profiling-time sink, not a serving path; fail loud unless CPU intent was declared.
-        // The image span is exempt: CPU is its only correct arm today, so it is not a silent fallback.
-        if (npos > CPU_PREFILL_PANIC_NPOS && has_prefill_override("metal") && !cpu_prefill_allowed()
-                && s.attn_uniform_end == 0l) {
+        if (npos > CPU_PREFILL_PANIC_NPOS && has_prefill_override("metal") && !cpu_prefill_allowed()) {
             panic("dasLLAMA: CPU batched prefill of {npos} tokens on a Metal-capable build (override `{g_prefill_override_name}` {empty(g_prefill_override_name) ? "not selected" : "declined"}) - select the metal prefill (set_metal_mode / DASLLAMA_PIN_PREFILL=metal), or declare CPU intent: allow_cpu_prefill() / DASLLAMA_CPU_PREFILL=1")
         }
         for (l in range64(c.n_layers)) {

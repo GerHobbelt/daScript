@@ -1,9 +1,11 @@
 options gen2
 options _comment_hygiene = true
+options _dasllama_internal = true
 
 module dasllama_audio shared public
 options _function_length = 0   // per-family transcribe pipelines mirror the model schema
 
+require dasllama/dasllama_lint public
 require math
 require dasllama/dasllama_env  // the g_env_* knob globals ([EnvConfig] declarations; ENVIRONMENT.md is generated from them)
 require strings
@@ -1153,7 +1155,7 @@ def private tower_quantize_(var t : AudioTower; var fblob : array<float>; var qb
     delete fblob
     fblob <- nf
     t.q8 = true
-    if (!select_matmul_backend_for_load()) {
+    if (!select_matmul_backend_for_load_()) {
         return   // row-major backend reads the dense Q8_0 planes as-is
     }
     if (has_conv) {
@@ -1397,24 +1399,24 @@ def stage_audio_tower(path : string; q8 : bool = false) : AudioTowerStaging {
 
 //! Encoder scratch, sized once per tower and reused across chunks/calls.
 struct EncoderState {
-    x1 : array<float>    // conv1 im2col [T_in × 3·n_mel]
-    y1 : array<float>    // conv1 out [T_in × d]
-    x2 : array<float>    // conv2 im2col [T × 3·d]
-    x : array<float>     // residual stream [T × d]
-    xb : array<float>    // norm output [T × d]
-    xb2 : array<float>   // attn/ffn projection out [T × d]
-    qq : array<float>    // q token-major [T × d]
-    kk : array<float>    // k token-major [T × d]
-    vv : array<float>    // v token-major [T × d]
-    hp : array<float>    // per-head packs q,kT,v,out: 4 × [T × d]
-    @scratch att : array<float>   // per-slot blocked scores [get_dispatch_slot_bound() × ATTN_ENC_QB × T]
-    h : array<float>     // ffn hidden [T × ff]
-    pooled : array<float>// [T/2 × d]
+    @exact_size x1 : array<float>    // conv1 im2col [T_in × 3·n_mel]
+    @exact_size y1 : array<float>    // conv1 out [T_in × d]
+    @exact_size x2 : array<float>    // conv2 im2col [T × 3·d]
+    @exact_size x : array<float>     // residual stream [T × d]
+    @exact_size xb : array<float>    // norm output [T × d]
+    @exact_size xb2 : array<float>   // attn/ffn projection out [T × d]
+    @exact_size qq : array<float>    // q token-major [T × d]
+    @exact_size kk : array<float>    // k token-major [T × d]
+    @exact_size vv : array<float>    // v token-major [T × d]
+    @exact_size hp : array<float>    // per-head packs q,kT,v,out: 4 × [T × d]
+    @scratch @exact_size att : array<float>   // per-slot blocked scores [get_dispatch_slot_bound() × ATTN_ENC_QB × T]
+    @exact_size h : array<float>     // ffn hidden [T × ff]
+    @exact_size pooled : array<float>// [T/2 × d]
     @scratch ph : array<float>    // projector hidden [rows × mm1_out] (ultravox/voxtral)
     pg : array<float>    // ultravox swiglu output [rows × mm1_out/2]
     @scratch out : array<float>   // projected soft tokens [tokens_per_chunk × proj_dim]
-    xqi : array<int8>    // q8 requant image [T × max(3d, ff)] (empty on fp32 towers)
-    xsi : array<float>   // per-32-block scales for xqi
+    @exact_size xqi : array<int8>    // q8 requant image [T × max(3d, ff)] (empty on fp32 towers)
+    @exact_size xsi : array<float>   // per-32-block scales for xqi
 }
 
 let ATTN_ENC_QB = 128l  // query rows per attention score block (15 MB att scratch at T=1500)
@@ -1424,18 +1426,19 @@ def make_encoder_state(t : AudioTower) : EncoderState {
     let tt = t.n_ctx
     let d = t.d_model
     var s = EncoderState()
-    s.x1 |> resize(tin * 3l * t.n_mel)
-    s.y1 |> resize(tin * d)
-    s.x2 |> resize(tt * 3l * d)
-    s.x |> resize(tt * d)
-    s.xb |> resize(tt * d)
-    s.xb2 |> resize(tt * d)
-    s.qq |> resize(tt * d)
-    s.kk |> resize(tt * d)
-    s.vv |> resize(tt * d)
-    s.hp |> resize(4l * tt * d)
-    s.att |> resize(int64(get_dispatch_slot_bound()) * ATTN_ENC_QB * tt)
-    s.h |> resize(tt * t.n_ff)
+    // whole-clip towers carry tt = the clip's own frame count — minutes-scale buffers here
+    s.x1 |> reserve_resize(tin * 3l * t.n_mel)
+    s.y1 |> reserve_resize(tin * d)
+    s.x2 |> reserve_resize(tt * 3l * d)
+    s.x |> reserve_resize(tt * d)
+    s.xb |> reserve_resize(tt * d)
+    s.xb2 |> reserve_resize(tt * d)
+    s.qq |> reserve_resize(tt * d)
+    s.kk |> reserve_resize(tt * d)
+    s.vv |> reserve_resize(tt * d)
+    s.hp |> reserve_resize(4l * tt * d)
+    s.att |> reserve_resize(int64(get_dispatch_slot_bound()) * ATTN_ENC_QB * tt)
+    s.h |> reserve_resize(tt * t.n_ff)
     s.pooled |> reserve_resize(tt / 2l * d)
     let rows = audio_tokens_per_chunk(t)
     if (t.proj_kind != AudioProjKind.qwen2a) {
@@ -1467,7 +1470,8 @@ def private enc_attention(t : AudioTower; var s : EncoderState; tt : int64) {
     let nu = int(t.n_head) * nqb
     // que-less-creation guard: the state may have been sized under a smaller slot bound
     let attNeed = int64(get_dispatch_slot_bound()) * ATTN_ENC_QB * tt
-    if (long_length(s.att) < attNeed) {
+    if (long_length(s.att) < attNeed) {   // inline: PERF026 can't see @scratch through reserve_resize
+        s.att |> reserve(attNeed)
         s.att |> resize(attNeed)
     }
     unsafe {
@@ -1651,6 +1655,11 @@ def audio_encode_blocks(t : AudioTower; var s : EncoderState; mel : MelChunk) {
     let nm = t.n_mel
     let tc = ref_time_ticks()
     trace_tag(TRACE_TAG_ENC_CONV)
+    if (g_tw_conv_gpu_set && empty(g_audio_ref_dir) && invoke(g_tw_conv_gpu, t, s, mel)) {
+        asr_prof_add("enc.conv", tc)
+        encoder_blocks(t, s, tt)
+        return
+    }
 
     // conv1 k3 s1 same: im2col column (dk, c) — matches the loader's weight permute
     for (i in range64(tin)) {
@@ -1692,10 +1701,41 @@ def audio_encode_blocks(t : AudioTower; var s : EncoderState; mel : MelChunk) {
     encoder_blocks(t, s, tt)
 }
 
+// ===== the GPU tower hook (registered by dasllama_metal_tower at [init]; requires-back, so it
+// cannot be required from here). Serves the whole block loop or declines; the CPU loop below
+// stays the correct fallback. The diff-stage rail keeps the CPU loop (its dumps ARE the point).
+typedef TowerBlocksGpuFn = function<(t : AudioTower; var s : EncoderState; npos : int64) : bool>
+var private g_tw_blocks_gpu : TowerBlocksGpuFn
+var private g_tw_blocks_gpu_set = false
+
+def register_tower_blocks_gpu(fn : TowerBlocksGpuFn) {
+    g_tw_blocks_gpu = fn
+    g_tw_blocks_gpu_set = true
+}
+
+//! The conv-frontend twin: serves conv1/conv2/pos-add for one mel chunk (s.x filled) or
+//! declines with false — the CPU conv above stays the correct fallback, best-effort inside
+//! the tower knob (a shape misfit like tiny's 3x80 im2col width just keeps the CPU conv).
+typedef TowerConvGpuFn = function<(t : AudioTower; var s : EncoderState; mel : MelChunk) : bool>
+var private g_tw_conv_gpu : TowerConvGpuFn
+var private g_tw_conv_gpu_set = false
+
+def register_tower_conv_gpu(fn : TowerConvGpuFn) {
+    g_tw_conv_gpu = fn
+    g_tw_conv_gpu_set = true
+}
+
 //! The pre-LN transformer block loop over ``npos`` positions of the residual stream in ``s.x``
 //! (token-major). Shared by the whisper conv frontend above and the qwen3a conv2d frontend —
 //! any frontend that leaves ``npos × d_model`` rows in ``s.x`` can run the blocks.
 def encoder_blocks(t : AudioTower; var s : EncoderState; npos : int64) {
+    if (g_tw_blocks_gpu_set && empty(g_audio_ref_dir)) {
+        let te = ref_time_ticks()
+        if (invoke(g_tw_blocks_gpu, t, s, npos)) {
+            asr_prof_add("enc.blocks.gpu", te)
+            return
+        }
+    }
     let tt = npos
     let d = t.d_model
     for (l in range64(t.n_layer)) {

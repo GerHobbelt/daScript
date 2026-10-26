@@ -132,10 +132,11 @@ cmake --build build --config Release -j 16        # 15-25 min clean
 
 ## 2. Models
 
-- **One tool provisions and gates the whole set** — `models_provenance()` in
-  `performance/fetch_models.das` is the committed manifest: per file, the exact HF repo +
-  revision pin, canonical bytes + sha256, and the conversion recipe where no registry serves
-  the file. Verify is the default; `--fetch` downloads what is absent (resumable curl):
+- **One tool provisions and gates the whole set** — `performance/fetch_models.das` drives the
+  committed manifest (`models_provenance()`, a view over the `performance/model_specs.das`
+  table): per file, the exact HF repo + revision pin, canonical bytes + sha256, and the
+  conversion recipe where no registry serves the file. Verify is the default; `--fetch`
+  downloads what is absent (resumable curl):
 
 ```sh
 export DASLLAMA_MODELS_DIR=<dir>       # WHISPER_CPP_MODELS too, or point both at ONE dir
@@ -252,8 +253,8 @@ bin/daslang -jit utils/dasllama-convert/main.das -- -m <models-dir>/canary-qwen-
 bin/daslang -jit utils/dasllama-convert/main.das -- -m $WHISPER_CPP/models --clean --apply
 ```
 
-Expected wall-clock (M1 Max, NVMe ~6 GB/s image writes, catalog of 8): a FULL re-bake of both
-flavors is **~5–6 minutes total**. Per model: bake time is dominated by reading + transcoding
+Expected wall-clock (M1 Max, NVMe ~6 GB/s image writes, catalog of 9): a FULL re-bake of both
+flavors is **~6 minutes total**. Per model: bake time is dominated by reading + transcoding
 the GGUF, not the write — the 22 GB 35B ≈ 19 s planar / 10 s metal, the 16–19 GB class ≈ 7–15 s
 per flavor, the 7–8 GB class ≈ 4–7 s. A re-run over valid images completes in ~2 minutes of
 verify-and-skip. The ASR set adds **~1 minute** (measured M1: the 31 GB Omni decoder 40 s —

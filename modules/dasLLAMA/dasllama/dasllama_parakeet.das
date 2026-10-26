@@ -1,9 +1,11 @@
 options gen2
 options _comment_hygiene = true
+options _dasllama_internal = true
 
 module dasllama_parakeet shared public
 options _function_length = 0   // model forward/serialize walks mirror the model schema
 
+require dasllama/dasllama_lint public
 require math
 require daslib/fio
 require strings
@@ -277,7 +279,7 @@ def private pk_repack(var st : ParakeetStaging; woff, n, d : int64) {
 // repack every GEMM region for the active backend's q8q8 kernels; without a selected
 // backend matmul_q8q8_batch reads the flat Q8_0 image as-is
 def private pk_repack_all(var st : ParakeetStaging) {
-    if (!select_matmul_backend_for_load()) {
+    if (!select_matmul_backend_for_load_()) {
         return
     }
     let d = st.e.n_state
@@ -402,12 +404,10 @@ def private pk_mm_rq(m : ParakeetModel; var y : array<float>; woff : int64; x : 
     pk_mm(m, y, woff, x, xq, xs, n, d, npos)
 }
 
-def private pk_requant(x : array<float>; n, npos : int64; @scratch var xq : array<int8>; @scratch var xs : array<float>) {
+def private pk_requant(x : array<float>; n, npos : int64; @scratch @exact_size var xq : array<int8>; @scratch @exact_size var xs : array<float>) {
     let need = npos * n
-    if (long_length(xq) < need) {
-        xq |> resize(need)
-        xs |> resize(need / 32l)
-    }
+    pk_ensure(xq, need)
+    pk_ensure(xs, need / 32l)
     asr_requant_rows_q8(x, n, npos, xq, xs)
 }
 

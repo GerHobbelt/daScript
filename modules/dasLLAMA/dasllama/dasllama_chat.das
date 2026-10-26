@@ -1,8 +1,10 @@
 options gen2
 options _comment_hygiene = true
+options _dasllama_internal = true
 
 module dasllama_chat shared public
 
+require dasllama/dasllama_lint public
 require dasllama/dasllama_transformer   // the umbrella fires each arch [init] registration; requiring dasllama_common directly would drop them
 require dasllama/dasllama_tokenizer  // TokKind — disambiguate the "llama" chat template by backend
 require dasllama/dasllama_audio      // AudioTower + encoder: chat sessions can carry an audio tower
@@ -674,13 +676,10 @@ def create_chat_(model : Model; var tower : AudioTower; system : string = ""; ma
 
 //! Start a VISION-CAPABLE conversation: takes ownership of a gemma4uv embedder (moved in) so
 //! ``add_user_image`` can splice image soft tokens into its turns. A mismatched decoder/mmproj
-//! pair, a family with no image markers, or a metal-blob decoder panics here — not at respond time.
+//! pair or a family with no image markers panics here — not at respond time.
 def create_chat_(model : Model; var embedder : Gemma4uvEmbedder; system : string = ""; max_new : int64 = 256l; kv_dtype : KVDtype = KVDtype.f16) : ChatSession {
     if (embedder.proj_dim != model.config.dim) {
         panic("dasLLAMA chat: mmproj projects to {embedder.proj_dim} but the decoder is {model.config.dim}-wide - mismatched pair")
-    }
-    if (model.metal_blob) {
-        panic("dasLLAMA chat: the image span prefills on the CPU and a metal-blob model has no CPU weights - load the decoder without the metal blob to use vision")
     }
     if (model.config.recr_mask != 0ul) {
         panic("dasLLAMA chat: a non-causal image span cannot apply to recurrent layers - this architecture has no vision arm")

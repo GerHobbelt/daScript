@@ -1,5 +1,6 @@
 options gen2
 options stack = 524288   // every dasLLAMA program root takes this budget (options stack does not unify up from libs)
+options _dasllama_internal = true
 
 require das_accelerate
 require ?das_metal metal/das_metal_boost  // the live-Metal-device ingredient (env METAL=1)
@@ -117,7 +118,7 @@ def bnns_phase {
         let hxp = addr<uint16 const?>(hx[0])
         var yp = addr(y[0])
         if (accel_bnns_hgemm_nt(1, 1, 1, hxp, 1, hwp, 1, yp, 1) != 0) {
-            print("bnns unavailable on this OS — phase skipped\n")
+            print("bnns unavailable on this OS - phase skipped\n")
             return
         }
         var acc = 0.0

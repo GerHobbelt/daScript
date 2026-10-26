@@ -130,9 +130,13 @@ The image TURN on a vision decoder — what a user actually waits on when they a
 One process, one tune-key demand, one image-identity stamp, same as the ASR cell:
 
 ```sh
-bin/daslang -jit modules/dasLLAMA/benchmarks/lcpp_bench.das -- \
-  -m <decoder.gguf> --image-mmproj <mmproj.gguf> --image <picture.jpg> -r 5 --for-debug-purposes
+modules/dasLLAMA/performance/_rig/dasllama-bench.app/Contents/MacOS/dasllama-bench \
+  -m <decoder.gguf> --image-mmproj <mmproj.gguf> --image <picture.jpg> -r 5
 ```
+
+The released exe (built above) is the protocol — its winners are baked, so the cell cannot
+tune or drift mid-run. The `-jit` script form with `--for-debug-purposes` is a debug
+instrument only: its rows stamp `debug-jit` and never reach a board or a doc.
 
 - Three keys per row. `img:enc` is the embedder alone in ms (best of `-r`), `img:pp` the SPLICED
   prefill in tok/s (head tokens + soft-token rows + tail tokens — every position the turn holds),
@@ -141,15 +145,42 @@ bin/daslang -jit modules/dasLLAMA/benchmarks/lcpp_bench.das -- \
   the timed text and the row prices a reply the product would never have shown.
 - `workload = "image-chat"` on the record, beside `asr` and `audio-chat`. The picture is pinned by
   content hash in `files`, like the weights and the mmproj.
-- CPU by design: every GPU prefill arm — the per-layer rail (`attn_gpu_prefill_ready`), the
-  Metal whole-stack override (`MetalPrefillDecline.non_causal_span`) and the Vulkan resident
-  override — declines a non-causal span, and the CPU-prefill tripwire exempts the SPAN call
-  only: the head/tail text slices of an image turn still need declared CPU intent
-  (`allow_cpu_prefill()`), which every in-tree vision caller carries.
-  The Metal arm gets its cell when GPU multimodal prefill is the work (`followup_general.md` #23).
+- Two backends, one flag: without `--ngl` the cell runs all-CPU by intent
+  (`allow_cpu_prefill()`, `backend = "cpu"`); with `--ngl` it loads the metal-blob flavor and
+  the whole turn — head, span (`AttnArgs.uend`), tail, decode — serves on Metal
+  (`backend = "metal"`), with the tripwire ARMED so a CPU fallback reds the row instead of
+  sandbagging it. The Vulkan span is still declined (`followup_general.md` #23's other half).
 - The embedder ALONE is a kernel question, not a board row: price it in the kernel A/B lab, not here.
 
 ---
+
+## The ASR cell (`--asr`)
+
+Transcription wall time per corpus clip — what a user waits on when they feed audio. Same
+process/tune/identity discipline as the cells above; the reference tools are measured
+adjacent by `gen_bench_records`, never in this process.
+
+```sh
+modules/dasLLAMA/performance/_rig/dasllama-bench.app/Contents/MacOS/dasllama-bench --asr -m "Whisper large" -r 3          # the q8-CPU serving default
+modules/dasLLAMA/performance/_rig/dasllama-bench.app/Contents/MacOS/dasllama-bench --asr -m "Whisper large" --ngl 1 -r 3  # the f32 Metal tower rail
+```
+
+Same executable rule as the image cell: the released exe, never the `-jit` script —
+`--for-debug-purposes` rows are debug instruments, not measurements.
+
+- One `asr:<clip>.wav` key per corpus bucket: best-of-`-r` transcribe ms, the clip seconds,
+  the LAST rep's transcript (under fast-math a token flip is what moves the timing), and
+  `encode_ms` (the encoder split, sampled in its own untimed rep off the asr_prof rail).
+- Three legs: the plain row pins BOTH GPU drivers off (`set_metal_wdec(false)` +
+  `set_metal_tower(false)`, `backend = "cpu"` — a CPU row means CPU); `--accel` adds the
+  Accelerate tier (`backend = "accel"`); `--ngl` serves the f32 tower on Metal
+  (`set_asr_tower_fp32` — the tower half only, the decoder stays q8) plus the whisper
+  decoder driver, all four knobs pinned on (`backend = "metal"`). A whisper gpu row must
+  show tower-engage counters, a wdec windows delta, and a non-zero `encode_ms` or the leg
+  exits non-zero. A Conformer row under `--ngl` therefore FAILS by design: that family has
+  no GPU tower lane to measure.
+- `exec_fmt` on the row states the quant mode the encoder actually ran, so a number can
+  never silently describe a format nobody serves.
 
 ## The tokenizer cell (`--tok`)
 

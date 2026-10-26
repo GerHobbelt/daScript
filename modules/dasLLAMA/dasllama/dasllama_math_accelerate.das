@@ -1,8 +1,10 @@
 options gen2
 options _comment_hygiene = true
+options _dasllama_internal = true
 
 module dasllama_math_accelerate shared public
 
+require dasllama/dasllama_lint public
 require dasllama/dasllama_math
 require dasllama/dasllama_convert  // cvt_f32_to_f16 — the BNNS f16 batch prep
 require dasllama/dasllama_env  // the g_env_* knob globals ([EnvConfig] declarations; ENVIRONMENT.md is generated from them)
@@ -305,7 +307,7 @@ def private floor_or(name : string; v : Option<int64>; def_v : int64; min_v : in
     return def_v if (is_none(v))
     let got = unwrap(v)
     if (got < min_v) {
-        to_log(LOG_WARNING, "dasLLAMA: {name} {got} is below the floor {min_v} — keeping {def_v}\n")
+        to_log(LOG_WARNING, "dasLLAMA: {name} {got} is below the floor {min_v} - keeping {def_v}\n")
         return def_v
     }
     return got
@@ -320,7 +322,7 @@ def private dasllama_math_accelerate_init() {
     dasllama_accelerate_set_f16_strips(floor_or("DASLLAMA_ACCEL_F16_STRIPS", g_env_accel.accel_f16_strips, 0l, 0l))
     dasllama_accelerate_set_strips(floor_or("DASLLAMA_ACCEL_STRIPS", g_env_accel.accel_strips, 0l, 0l))
     if (g_env_accel.accel_f16 && !dasllama_accelerate_set_f16(true)) {
-        to_log(LOG_WARNING, "dasLLAMA: DASLLAMA_ACCEL_F16=1 but the BNNS probe failed — f16 lane stays off\n")
+        to_log(LOG_WARNING, "dasLLAMA: DASLLAMA_ACCEL_F16=1 but the BNNS probe failed - f16 lane stays off\n")
     }
     dasllama_accelerate_enable(floor_or("DASLLAMA_ACCEL_MIN_NTOK", g_env_accel.accel_min_ntok, 32l, 1l))
 }

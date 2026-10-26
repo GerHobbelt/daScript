@@ -66,6 +66,10 @@ Apple GPU backend. Absent on non-Apple builds, where setting them does nothing.
 |---|---|---|---|
 | `DASLLAMA_METAL_LOGITS` | flag | on | Produce logits on the GPU; 0 pulls the classifier back to the CPU. Blob-only models force it on. |
 | `DASLLAMA_METAL_ATTN` | flag | on | ggml-geometry QK/AV prefill attention (~10x the trio GEMMs); 0 pins the trio. |
+| `DASLLAMA_METAL_SPAN` | flag | on | Serve the non-causal media span on the prefill driver (AttnArgs.uend); 0 declines it to the CPU arm, which then needs declared CPU intent. |
+| `DASLLAMA_METAL_TOWER` | flag | on | Serve tower/embedder encodes on the Metal tower driver — the gemma4uv chain, the whisper-class block loops, and the conv frontends (whisper im2col + the qwen3a conv2d, which serves the q8 default); 0 pins the CPU tower. |
+| `DASLLAMA_METAL_WDEC` | flag | on | Serve the whisper decoder side (cross-KV; the decode step under wdec_step) on the Metal ASR-decoder driver; 0 pins the CPU decoder. |
+| `DASLLAMA_METAL_WDEC_STEP` | flag | on | Serve the whisper DECODE STEP on the GPU too (needs wdec). Small decoders (n_text_state under the 1024 floor; set_metal_wdec_step_min_d) keep the CPU rail — the per-dispatch latency floor beats them. |
 | `DASLLAMA_METAL_ATTN_D` | flag | on | Fused single-pass decode attention (assumes head_size 128); 0 is the A/B rail to the chunked pair. |
 | `DASLLAMA_METAL_ATTN_SINGLE` | number | 64 | Row count below which attention uses the single-chunk kernel; clamped to 128. |
 | `DASLLAMA_METAL_MULMM` | flag | on | The mul_mm prefill GEMM; 0 falls back to the legacy per-op path. |
@@ -243,7 +247,7 @@ Owned by daslang, not by dasLLAMA - listed because dasLLAMA's behaviour depends 
 |---|---|---|---|
 | `HF_HOME` | path | ~/.cache/huggingface | Hugging Face hub root; fetch_models --convert resolves checkpoint blobs under <HF_HOME>/hub. Falls back to HOME's default cache location when unset. |
 | `HOME` | path | unset | Ambient platform variable; read only to derive the default Hugging Face cache when HF_HOME is unset. |
-| `DAS_JOBQUE_THREADS` | number | conservative default | Total compute lanes for job queues (N-1 workers plus the caller). Overrides set_jobque_threads_cap; see skills/environment_variables.md. |
+| `DAS_JOBQUE_THREADS` | number | conservative default | Total compute lanes for job queues (N-1 workers plus the caller). Overrides set_jobque_threads_cap; see skills/internal/environment_variables.md. |
 | `DAS_JOBQUE_AFFINITY` | number | 2 on darwin (engine [init]), else 0 | Worker affinity: 0 off, 1 ideal-processor hint, 2 hard mask — on darwin mode 2 is QoS classification (no pin API) and dasLLAMA defaults it on. Matters on big SMT boxes. |
 | `DAS_JOBQUE_TEAM_RANK_GATE` | number | profile-driven | Team-dispatch rank gate. When set, it suppresses the box profile's own team_rank_gate knob. |
 | `DAS_TUNE_MANIFEST` | path | <app>.tune.json | Kernel-tuning sidecar to read/write. Point it somewhere writable when the app dir is read-only. |

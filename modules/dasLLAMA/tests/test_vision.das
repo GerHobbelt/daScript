@@ -1,5 +1,6 @@
 options gen2
 options stack = 524288   // every dasLLAMA program root takes this budget (options stack does not unify up from libs)
+options _dasllama_internal = true
 
 require dastest/testing_boost public
 require dasllama/dasllama_vision
@@ -19,6 +20,7 @@ let MAX_TOKENS = 280
 
 def make_fixture(kind : string; w, h : int) : VisionImage {
     var img = VisionImage(width = w, height = h)
+    img.rgb |> reserve(w * h * 3)
     img.rgb |> resize(w * h * 3)
     if (kind == "black") {
         pass   // resize already zero-fills

@@ -1,6 +1,7 @@
 options gen2
 options persistent_heap   // + explicit deletes: the models free before the process exits
 options stack = 524288   // every dasLLAMA program root takes this budget (options stack does not unify up from libs)
+options _dasllama_internal = true
 
 require dastest/testing_boost public
 require dasllama/dasllama   // nolint:STYLE029,LINT019 — the public facade (engine + arch registrations + the metal overrides); only the metal half uses more than dasllama_common
@@ -10,7 +11,13 @@ require ?das_metal dasllama/dasllama_metal_common  // the coverage census rail
 require ?das_metal dasllama/dasllama_metal_decode  // decode stats + shutdown rails
 require ?das_metal metal/das_metal_boost  // device probe
 require ?vulkan dasllama/dasllama_vulkan_common  // the vulkan census rail (spec-only here)
-require dasllama/dasllama_gpu_resident  // moe_gpu_drop_model — the census's model-switch drops
+require dasllama/dasllama_gpu_resident  // moe_gpu_drop_model_ — the census's model-switch drops
+require dasllama/dasllama_whisper   // the cov_tower whisper row
+require dasllama/dasllama_audio     // load_audio_tower — the cov_tower erf-GELU carrier
+require dasllama/dasllama_gemma4uv  // the cov_tower embedder row
+require dasllama/dasllama_qwen3a    // the cov_tower conv2d carrier
+require ?das_metal dasllama/dasllama_metal_tower   // set_metal_tower — the census pins the rail ON
+require ?das_metal dasllama/dasllama_metal_asr_dec // set_metal_wdec — the cov_tower mixed chunk's decoder half
 require daslib/jobque_boost
 require daslib/fio  // the zoo paths
 require math  // nolint:STYLE030,LINT019 — used only inside the das_metal static_if half
@@ -165,6 +172,91 @@ def private census_zoo(t : T?) {
     // qwen2moe: q8 expert stacks + the sigmoid-gated shared expert on std attention; large tier
     cov_model(t, path_join(models_dir(), "Qwen1.5-MoE-A2.7B-Chat.Q8_0.gguf"), "qwen2moe",
         [KVDtype.f16], none)
+    cov_tower(t)
+}
+
+// cov_tower: the tower-driver kernels (LN / f32 mul_mm / the gelu flavors / posadd / the
+// borrowed trio) AND the decoder-side cross-KV kernels go non-zero — a whisper tiny MIXED
+// chunk (f32 enc = the tower LUT flavor, q8 dec = the wdec driver) plus a small gemma4uv canvas
+[unused_argument(t)]   // off-Apple the gated body is empty
+def private cov_tower(t : T?) {
+    static_if (typeinfo builtin_module_exists(das_metal)) {
+        set_metal_tower(true)
+        set_metal_wdec(true)
+        set_metal_wdec_step(true)
+        set_metal_wdec_step_min_d(0l)   // the census carrier is tiny — under the serving floor
+        let wpath = path_join(whisper_dir(), "ggml-tiny.bin")
+        var samples <- read_wav_pcm16_mono(path_join(models_dir(), "jfk.wav"))
+        if (model_available(t, wpath) && !empty(samples)) {
+            var inscope w = WhisperModel()
+            var inscope stg <- stage_whisper_model(wpath, false, true)
+            mint_whisper_model(stg, w, false, true)
+            with_job_que() {
+                setup_dasllama_jobque()
+                var ws <- create_session(w)
+                transcribe(w, ws, samples) $(_seg) {
+                    pass
+                }
+                delete ws
+            }
+        }
+        delete samples
+        // the erf-GELU carrier (whisper is the LUT flavor): one qwen2audio chunk on varied mel
+        let apath = path_join(models_dir(), "qwen2audio-mmproj-f32.gguf")
+        if (model_available(t, apath)) {
+            var atw <- load_audio_tower(apath)
+            var mel = MelChunk(n_mel = atw.n_mel, n_len = AUDIO_CHUNK_FRAMES)
+            mel.data |> resize(atw.n_mel * AUDIO_CHUNK_FRAMES)
+            for (i in range(length(mel.data))) {
+                mel.data[i] = sin(float(i) * 0.0137) * 0.8
+            }
+            var aenc <- make_encoder_state(atw)
+            with_job_que() {
+                setup_dasllama_jobque()
+                audio_encode(atw, aenc, mel)
+            }
+            delete aenc
+            delete atw
+        }
+        // the qwen3a conv2d carrier: one padded window drives the im2col2d + padded tile GEMMs
+        let qpath = path_join(models_dir(), "mmproj-Qwen3-ASR-0.6B-bf16.gguf")
+        if (model_available(t, qpath)) {
+            var inscope qtw <- load_qwen3a_tower(qpath)
+            var qmel = WhisperMel(n_mel = qtw.core.n_mel, n_len = 900l)
+            qmel.data |> resize(qtw.core.n_mel * 900l)
+            for (i in range(length(qmel.data))) {
+                qmel.data[i] = cos(float(i) * 0.0091) * 0.7
+            }
+            var qenc <- make_encoder_state(qtw.core)
+            var qcs = Qwen3aConvState()
+            var qrows : array<float>
+            with_job_que() {
+                setup_dasllama_jobque()
+                qwen3a_encode_all(qtw, qenc, qcs, qmel, qrows)
+            }
+            delete qrows
+            delete qcs
+            delete qenc
+        }
+        let mpath = path_join(models_dir(), "mmproj-gemma-4-12B-it-BF16.gguf")
+        if (model_available(t, mpath)) {
+            var inscope emb <- load_gemma4uv_embedder(mpath)
+            var st = Gemma4uvState()
+            var planes : array<float>
+            planes |> resize(96l * 96l * 3l)
+            for (i in range64(96l * 96l * 3l)) {
+                planes[i] = sin(float(i) * 0.013) * 0.7
+            }
+            var out : array<float>
+            with_job_que() {
+                setup_dasllama_jobque()
+                gemma4uv_encode(emb, st, planes, 96l, 96l, out)
+            }
+            delete out
+            delete planes
+            delete st
+        }
+    }
 }
 
 [test]
@@ -209,6 +301,7 @@ def test_metal_kernel_coverage(tst : T?) {
                 to_log(LOG_INFO, "census floor not asserted (family filter '{famfilter}'): {served} served\n")
             }
             delete cov
+            metal_tower_shutdown()
             metal_decode_shutdown()
             clear_kernel_backend_pin()
             select_kernel_backend(prior_backend)
@@ -275,7 +368,7 @@ def private vk_cov_model(t : T?; path, family : string; nbs : array<int>) {
         // the model-switch contract: whoever puts a DIFFERENT model on the GPU drops the old one
         // first (the slot machinery / server do) — without this the stack table accumulates
         // across the zoo until the MAX_STACKS decline
-        moe_gpu_drop_model()
+        moe_gpu_drop_model_()
         delete tr
     }
 }

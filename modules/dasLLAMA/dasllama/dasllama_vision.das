@@ -1,8 +1,10 @@
 options gen2
 options _comment_hygiene = true
+options _dasllama_internal = true
 
 module dasllama_vision shared public
 
+require dasllama/dasllama_lint public
 require math
 require daslib/fio
 require dasllama/dasllama_env
@@ -16,7 +18,7 @@ require dasllama/dasllama_env
 struct public VisionImage {
     width : int
     height : int
-    rgb : array<uint8>   // interleaved RGB, row-major
+    @exact_size rgb : array<uint8>   // interleaved RGB, row-major
 }
 
 //! The target canvas under dynamic resolution: sides round to the nearest `align` multiple,

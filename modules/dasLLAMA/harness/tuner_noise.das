@@ -1,4 +1,5 @@
 options gen2
+options _dasllama_internal = true
 
 module tuner_noise shared public
 
@@ -8,8 +9,10 @@ module tuner_noise shared public
 //! dot kernel at the real round shape, compute the cv, and REFUSE to tune above the threshold.
 //! A noisy end-probe means the sidecar is not written at all.
 
+require dasllama/dasllama_lint public
 require llvm/daslib/llvm_tune
 require dasllama/dasllama_version  // DASLLAMA_VERSION — stamped into sidecar provenance (zero-require leaf)
+require tuner_phrases  // provenance phrase leaf — render-charset-pinned by test_exchange_schema
 require daslib/strings_boost
 require daslib/fio            // popen + get_das_root — the engine-sha probe
 require math
@@ -112,7 +115,7 @@ def noise_gate(tag : string) : bool {
         tune_progress_note("noise probe ({tag}): cv {cv:0.2f}% > {thr:0.1f}%{thrTag} - settling 8s hot, re-probing\n")
         let cv0 = cv
         cv = probe_once(8000, med)
-        g_probe_log |> push("{tag} cv {cv0:0.2f}% -> settled {cv:0.2f}%")
+        g_probe_log |> push(settle_note(tag, cv0, cv))
     } else {
         g_probe_log |> push("{tag} cv {cv:0.2f}%")
     }

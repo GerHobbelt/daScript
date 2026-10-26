@@ -1,5 +1,6 @@
 options gen2
 options _comment_hygiene = true
+options _dasllama_internal = true
 
 //! dasLLAMA's environment knobs, declared as `[EnvConfig]` structs (daslib/clargs) — one struct
 //! per area, one field per variable, the field initializer as the default and the doc line on the
@@ -18,6 +19,7 @@ options _comment_hygiene = true
 
 module dasllama_env shared public
 
+require dasllama/dasllama_lint public
 require daslib/clargs
 require daslib/env_registry public
 require daslib/option public
@@ -163,6 +165,18 @@ struct public MetalEnv {
 
     @clarg_doc = "ggml-geometry QK/AV prefill attention (~10x the trio GEMMs); 0 pins the trio."
     attn : bool = true
+
+    @clarg_doc = "Serve the non-causal media span on the prefill driver (AttnArgs.uend); 0 declines it to the CPU arm, which then needs declared CPU intent."
+    span : bool = true
+
+    @clarg_doc = "Serve tower/embedder encodes on the Metal tower driver — the gemma4uv chain, the whisper-class block loops, and the conv frontends (whisper im2col + the qwen3a conv2d, which serves the q8 default); 0 pins the CPU tower."
+    tower : bool = true
+
+    @clarg_doc = "Serve the whisper decoder side (cross-KV; the decode step under wdec_step) on the Metal ASR-decoder driver; 0 pins the CPU decoder."
+    wdec : bool = true
+
+    @clarg_doc = "Serve the whisper DECODE STEP on the GPU too (needs wdec). Small decoders (n_text_state under the 1024 floor; set_metal_wdec_step_min_d) keep the CPU rail — the per-dispatch latency floor beats them."
+    wdec_step : bool = true
 
     @clarg_doc = "Fused single-pass decode attention (assumes head_size 128); 0 is the A/B rail to the chunked pair."
     attn_d : bool = true
@@ -645,7 +659,7 @@ struct public CoreEnv {
     home : string = ""
 
     @clarg_default_doc = "conservative default"
-    @clarg_doc = "Total compute lanes for job queues (N-1 workers plus the caller). Overrides set_jobque_threads_cap; see skills/environment_variables.md."
+    @clarg_doc = "Total compute lanes for job queues (N-1 workers plus the caller). Overrides set_jobque_threads_cap; see skills/internal/environment_variables.md."
     jobque_threads : Option<int>
 
     @clarg_default_doc = "2 on darwin (engine [init]), else 0"

@@ -1,11 +1,13 @@
 options gen2
 options _comment_hygiene = true
+options _dasllama_internal = true
 
 module dasllama_transformer shared public
 
 // dasLLAMA public front door. Re-exports the engine (dasllama_common) and pulls in every architecture
 // so its [init] registration fires. Consumers `require dasllama/dasllama_transformer` get the full API
 // plus all registered arches; adding an architecture = a new dasllama_arch_*.das + one require here.
+require dasllama/dasllama_lint public
 require dasllama/dasllama_common public
 require dasllama/dasllama_layout   // [init]-only: registers the disk->compute layout hooks (repacks + GPU gathers) into dasllama_common; unset hooks panic at load
 require dasllama/dasllama_moe public   // the MoE router/expert dispatch the block kernels reach through
@@ -32,4 +34,6 @@ require dasllama/dasllama_arch_glm4moe  // side-effect require: fires the arch's
 require dasllama/dasllama_metal_shapes  // [init]-only: registers the PORTABLE metal servable predicate (pure model shape) — every build, so a non-Apple converter can bake the metal flavor
 require ?das_metal dasllama/dasllama_metal_prefill  // [init]-only: registers prefill override "metal" (the dasMetal GPU-resident path). STRICT guard: Apple builds only; it lives here (not dasllama_common) because it requires the engine back — the umbrella breaks the cycle
 require ?das_metal dasllama/dasllama_metal_decode  // [init]-only: registers decode override "metal" (same contract as the prefill line above)
+require ?das_metal dasllama/dasllama_metal_tower  // [init]-only: registers the gemma4uv GPU tower encode (same contract as the prefill line above)
+require ?das_metal dasllama/dasllama_metal_asr_dec  // [init]-only: registers the whisper cross-KV GPU driver (same contract as the prefill line above)
 require ?vulkan dasllama/dasllama_math_vulkan  // [init]-only: registers "vulkan" (the GPU tier). STRICT guard: the C++ vulkan module is linked only where dasVulkan is installed. LAST on purpose: the vulkan drivers are the hot-edit modules, and require order is the jit obj-cache layout — a late position keeps the fat module prefix cached across driver edits

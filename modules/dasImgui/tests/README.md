@@ -58,7 +58,7 @@ are NOT in CI; they're one-shell driver scripts that spawn their own
 timeline, and save an `.apng`. A single ffmpeg pass converts each
 `.apng` to the shipped `.mp4` (~300× smaller). The `.mp4` files are NOT
 committed — they ship as assets on the rolling `docs-assets` GitHub
-release; docs builds stage them via `utils/docs_assets/fetch.ps1` before
+release; docs builds stage them via `utils/internal/docs-assets/fetch.ps1` before
 sphinx runs.
 
 ### The script
@@ -126,7 +126,7 @@ gh release upload docs-assets *.mp4 --clobber
 ### CI integration
 
 The main-repo docs builds (`doc.yml`, `pages.yml`) run
-`utils/docs_assets/fetch.ps1` to stage the release MP4s before sphinx.
+`utils/internal/docs-assets/fetch.ps1` to stage the release MP4s before sphinx.
 Sphinx runs with `-W` and the video role checks file existence, so an RST
 citing a missing `.mp4` fails the build. Implication for a new tutorial PR:
 upload the `.mp4` to `docs-assets` ahead of the RST cite to keep CI passing.
@@ -136,7 +136,7 @@ upload the `.mp4` to `docs-assets` ahead of the RST cite to keep CI passing.
 For a new tutorial `foo`:
 
 1. Write `modules/dasImgui/examples/tutorial/foo.das` and
-   `modules/dasImgui/tests/record_foo.das` (see `skills/imgui_recording.md` for the
+   `modules/dasImgui/tests/record_foo.das` (see `skills/internal/imgui_recording.md` for the
    driver template).
 2. `daslang.exe -project_root . modules/dasImgui/tests/record_foo.das` —
    produces `doc/source/_static/tutorials/foo.apng`
@@ -159,7 +159,7 @@ can be deleted; nothing references it.
 
 Detailed driver-authoring guidance, pacing constants, menu-interaction
 gotchas, and visual aid recipes live in
-[`skills/imgui_recording.md`](../../skills/imgui_recording.md).
+[`skills/internal/imgui_recording.md`](../../../skills/internal/imgui_recording.md).
 
 ## Notes
 

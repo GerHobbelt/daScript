@@ -1,9 +1,11 @@
 options gen2
 options _comment_hygiene = true
 options _metal_manual_dispatch = true   // PERMANENT opt-out: this module IS the capture rail (kn_dispatch / graph replay dispatch here)
+options _dasllama_internal = true
 
 module dasllama_metal_common shared public
 
+require dasllama/dasllama_lint public
 require math
 require strings
 require dasllama/dasllama_env  // the g_env_* knob globals ([EnvConfig] declarations; ENVIRONMENT.md is generated from them)
@@ -67,6 +69,30 @@ var g_us_encode = 0l
 var g_us_wait = 0l
 var g_us_readback = 0l
 var g_gpu_ms = 0.0lf
+// the tower-driver counters (one-shot embedder/encoder encodes; the driver lives in
+// dasllama_metal_tower, the counting home is here like every other driver's)
+var g_tower_encodes = 0l
+var g_tower_rows = 0l
+var g_tower_blocks = 0l
+var g_tower_convs = 0l                       // conv-frontend chunks served on the GPU
+var g_tower_declines_by_reason : table<string; int64>
+
+[cold_path]   // the decline leg IS the fall-off-the-GPU path; its bookkeeping is not hot
+def note_tower_decline(key : string) {
+    g_tower_declines_by_reason[key] = (g_tower_declines_by_reason?[key] ?? 0l) + 1l
+}
+
+// the whisper ASR-decoder driver's counters (dasllama_metal_asr_dec; counting home here)
+var g_wdec_windows = 0l                      // cross-KV windows served
+var g_wdec_steps = 0l                        // decode batches served
+var g_wdec_tokens = 0l                       // token rows across the served batches
+var g_wdec_declines_by_reason : table<string; int64>
+
+[cold_path]
+def note_wdec_decline(key : string) {
+    g_wdec_declines_by_reason[key] = (g_wdec_declines_by_reason?[key] ?? 0l) + 1l
+}
+
 // the batched-step twins (per eval_batch step, not per token)
 var g_batch_steps = 0l
 var g_batch_rows = 0l
@@ -138,6 +164,21 @@ var g_pso_addrms : MetalComputePipeline?
 var g_pso_preaddrms : MetalComputePipeline?
 var g_pso_swiglu : MetalComputePipeline?
 var g_pso_geglu : MetalComputePipeline?
+// ===== tower primitives (compiled in the tower driver's init) =====
+var g_pso_ln : MetalComputePipeline?
+var g_pso_gelu_erf : MetalComputePipeline?
+var g_pso_gelu_lut : MetalComputePipeline?
+var g_pso_posadd : MetalComputePipeline?
+var g_pso_f32mm : MetalComputePipeline?
+var g_pso_cross_kx : MetalComputePipeline?   // whisper cross-KV: K transpose+prescale shuffle
+var g_pso_cross_vx : MetalComputePipeline?   // whisper cross-KV: V head-major re-tile (+ the KV append)
+var g_pso_cross_vx_h : MetalComputePipeline?  // the f16-store twin — the resident K/V memory
+var g_pso_im2col3 : MetalComputePipeline?     // the whisper conv-frontend im2col (k=3, same pad)
+var g_pso_im2col2d : MetalComputePipeline?    // the qwen3a conv2d im2col (k=3, s=2, p=1)
+var g_pso_wdec_attn_part : MetalComputePipeline?  // the chunked online-softmax partial
+var g_pso_wdec_attn_comb : MetalComputePipeline?  // the log-sum-exp chunk merge
+var g_pso_bias_add_res : MetalComputePipeline?   // whisper decode: bias + residual add
+var g_pso_bias_gelu_lut : MetalComputePipeline?  // whisper decode: bias + LUT-form GELU
 var g_pso_softcap : MetalComputePipeline?
 var g_pso_suppress : MetalComputePipeline?
 var g_one : MetalBuffer?                    // persistent 1.0f — the rms oscale default bind
@@ -573,7 +614,7 @@ def upload_region_cat3(p0 : void?; b0 : uint64; p1 : void?; b1 : uint64; p2 : vo
 // Each GPU-ready plane becomes ONE resident buffer (zero-copy page wrap when image-mapped, else a
 // one-time untracked copy); tensors bind at byte offsets, keeping in-kernel indices REGION-relative — a 13GB blob's absolute byte indices overflow the kernels' uint32 index math.
 
-def private plane_buffer(dev : MetalDevice?; base : void?; bytes : uint64; mapped : bool) : MetalBuffer? {
+def plane_buffer(dev : MetalDevice?; base : void?; bytes : uint64; mapped : bool) : MetalBuffer? {   // public: the tower driver wraps embedder planes too
     let key = intptr(base)
     if (key_exists(g_regions, key)) {
         var cached = g_regions[key]

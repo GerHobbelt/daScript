@@ -2,6 +2,7 @@ options gen2
 options persistent_heap   // the server thread loads/frees a multi-GB model once; explicit deletes below
 options stack = 524288   // every dasLLAMA program root takes this budget (options stack does not unify up from libs)
 options fast_math = true  // ggml-parity FP laxity — this is an inference tool test, not the bit-exact suite
+options _dasllama_internal = true
 
 require dastest/testing_boost public
 require openai_server                                   // set_model / set_model_vision / run_server (sibling)
@@ -34,7 +35,7 @@ let CATS_ROWS = 130
 def private with_vision_server(port : int; blk : block<(base_url : string) : void>) {
     with_job_status(1) $(finished) {
         new_thread() @() {
-            allow_cpu_prefill()   // the image span prefills on the CPU arm
+            allow_cpu_prefill()   // planar q8 model: every prefill is CPU here, span included
             var m <- load_model(DEC_PATH, QuantMode.q8)
             set_model(m, "test-vlm")
             set_model_vision("test-vlm", MM_PATH)
@@ -143,6 +144,18 @@ def test_openai_server_vision(t : T?) {   // nolint:STYLE038 — one server boot
                     let reply = to_lower(js?["choices"]?[0]?["message"]?["content"] ?? "")
                     t |> success(!empty(reply), "the reply is not empty")
                     t |> success(find(reply, "cat") >= 0, "the model calls the cats cats: '{reply}'")
+                    unsafe {
+                        delete js
+                    }
+                }
+            }
+            // the admitted span rows land on the stats surface
+            GET("{base_url}/v1/stats") $(resp) {
+                var err : string
+                var js = read_json(string(resp.body), err)
+                t |> success(js != null && (js?["media_rows"] ?? 0l) >= int64(CATS_ROWS),
+                    "stats media_rows counts the admitted span rows ({js?["media_rows"] ?? 0l})")
+                if (js != null) {
                     unsafe {
                         delete js
                     }

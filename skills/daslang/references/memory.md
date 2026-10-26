@@ -153,10 +153,17 @@ def work() {
 }
 ```
 
-`defer` is **rejected** directly inside a loop body (`error[50503]`) because a loop's `finally` runs
-once, not once per iteration — wrap the body in a bare block if you need it there. `var inscope` has
-no such restriction: the loop body is its own scope, so it releases every iteration.
+`defer` is **rejected** (`error[50503]`) directly inside a loop body — a loop's `finally` runs once,
+not once per iteration — and at the top level of a lambda or generator body, where the body's
+`finally` is the lambda's finalizer and would run on `delete`, not per call. Wrap the statements in
+a bare `{ }` block to get a per-iteration / per-call scope. `var inscope` has no loop restriction:
+the loop body is its own scope, so it releases every iteration.
 (`defer_delete` is deprecated; use `var inscope`.)
+
+**A `defer()` at the top level of a lambda body never fires per call** — it lands in the lambda's
+`finally`, which is its *finalizer* (runs once, on `delete`), and nothing rejects it (probe-verified
+2026-08-18). A `$()` block body and a nested bare block `{ }` inside the lambda both fire at exit as
+expected — so wrap the lambda body in a bare block, or put the cleanup as the last statement.
 
 **Scope-exit cleanup does not run on panic.** A block's `finally` — and everything built on it — is
 skipped when the block panics, by design: a panicked program is broken and its cleanup cannot be
@@ -219,6 +226,11 @@ unsafe { delete owned }         // finalizes + frees each Foo, then the buffer
 view |> clear()                 // borrowed view: clear never touches pointees
 unsafe { delete view }          // frees only the buffer
 ```
+
+Getting it wrong reads differently per build, which is what makes it expensive: interpreted, the
+free reports `deleting <ptr>, which is not a chunk pointer` at the delete; optimized and JIT-ed, it
+corrupts the heap silently and crashes later, at an unrelated allocation with nothing pointing back
+to the real cause.
 
 For a struct field holding borrowed pointers, annotate it `@do_not_delete` instead.
 
@@ -312,11 +324,16 @@ functions — those need their own.
 | a local class variable (`var g = Goo()`) | lifetime issues |
 | variant `.field` write, `set_variant_index` | effectively a reinterpret |
 | `?as` / `?.field` / `?[]` **not** followed by `??` | yields a pointer to a temporary |
+| `let r & = expr` binding a reference to a **non-local** expression | the referent's lifetime is not provable from this frame |
 | returning a reference or a temporary (`#`) value | escaping the frame |
 | `implicit` parameters, `heap_collect` | policy-level escapes |
 
 Reading a variant through `is` + `as` is safe. A table lookup `tab[k]` is safe by default (an
 `unsafe_table_lookup` policy exists, off by default).
+
+The local-reference rule turns on *where the referent lives*, not on the syntax: `let r & = s.a`
+is fine when `s` is a stack local, while the same line with `s` a heap pointer is
+`error[31019] local reference to non-local expression is unsafe`. (probe-verified 2026-08-16)
 
 `addr<T?>(x)` is sugar for `reinterpret<T?>(addr(x))` and takes a **single** `unsafe` covering both
 halves — prefer it to the double-wrapped long form. The target must be a pointer type:

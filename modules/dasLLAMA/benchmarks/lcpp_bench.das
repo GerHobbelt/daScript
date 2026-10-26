@@ -5,14 +5,18 @@ options _cyclomatic_complexity = 0   // bench cell main = the measurement protoc
 options _function_length = 0   // same
 options _ascii_strings = false   // the bench report is human-facing: the markdown/console rows print the mean +- sd with a real plus-minus sign
 options log_compile_time = true   // front-end compile wall + the jit backend's per-phase breakdown (llvm_jit_run reads the same option)
+options _dasllama_internal = true
 
 require dasllama/dasllama_transformer   // umbrella fires each arch [init] registration; requiring dasllama_common directly would drop them
 require dasllama/dasllama_math   // setup_dasllama_jobque_ + apply_box_profile_runtime (engine-level, not re-exported)
 require dasllama/dasllama_image   // load_model_cached — the .dlim rail, without the full facade's compile weight
+require dasllama/dasllama_load   // --parity: load_model_ — the planar rail the parity fixtures were frozen on
 require dasllama/dasllama_tokenizer   // the tg-real row needs REAL tokens (see Lever.real)
 require dasllama/dasllama_asr   // --asr: load_asr_model/create_session/transcribe (narrower than the full facade; it requires the transformer umbrella itself)
 require audio   // --asr: the miniaudio decoder behind load_audio_16k_mono
 require dasllama/dasllama_audio   // --asr: AUDIO_SAMPLE_RATE, the 16 kHz mono contract
+require ?das_metal dasllama/dasllama_metal_tower   // --asr --ngl: the tower engage counters (anti-sandbag)
+require ?das_metal dasllama/dasllama_metal_asr_dec   // --asr CPU rows pin the wdec driver off (CPU means CPU)
 require dasllama/dasllama_chat   // --image: the chat renderer + the two-span image turn
 require dasllama/dasllama_gemma4uv   // --image: the vision embedder + encode_image_
 require dasllama/dasllama_vision   // --image: VisionImage — the decoded-pixel carrier
@@ -22,7 +26,7 @@ require daslib/module_path            // get_this_module_dir — the default pro
 require daslib/jobque_profile   // JOBQUE_PROFILING_ENABLED — --prof refuses on a build without the marker rail
 require ?das_accelerate dasllama/dasllama_math_accelerate   // the --accel leg; Apple-only C++ module
 require ../performance/profile_common.das   // profile_threads + affinity_on + bench records — the standing per-box methodology
-require ../performance/exchange_client.das   // --submit: POST the stamped records to the exchange
+require dasllama/dasllama_exchange   // --submit: POST the stamped records to the exchange
 require llvm/daslib/llvm_tune   // tune_app_script — the exe-vs-script discriminator behind --for-debug-purposes
 require daslib/jobque_boost
 require daslib/clargs
@@ -135,6 +139,9 @@ struct Args {
     @clarg_doc = "ASR cell mode: -m becomes a CATALOG substring (display name or das_model), not a path. Times transcribe best-of--r over the model's corpus buckets and emits the same BenchModel cell the LLM rows use"
     asr : bool
 
+    @clarg_doc = "Parity pregate mode: run -m's frozen pinned-greedy fixture from the model-set table (model_specs.das) and exit — 0 only on token-for-token, with both decoded texts printed; no timings. The board driver runs this before a model's first cell"
+    parity : bool
+
     @clarg_doc = "Image cell mode: the image TURN on -m (a vision decoder path) — embedder encode, the spliced prefill, and decode, as one image-chat cell. Needs --image-mmproj"
     image : string
 
@@ -242,8 +249,10 @@ def private measure_das(var m : AsrModel; samples : array<float>; reps : int; la
     return best
 }
 
-// One catalog model's timed buckets -> a BenchModel cell, appended to `jsonModels`.
-def private asr_measure_spec(spec : AsrModelSpec; reps, threads : int; var jsonModels : array<BenchModel>) {
+// One catalog model's timed buckets -> a BenchModel cell, appended to `jsonModels`. The gpu
+// arm (--ngl) rides the f32 tower rail; a row that never dispatches the tower (Conformer
+// families, or a regression) FAILS the leg.
+def private asr_measure_spec(spec : AsrModelSpec; reps, threads : int; var jsonModels : array<BenchModel>; gpu, accel : bool) : bool {
     let model_path = asr_model_path(spec)
     var m <- (empty(spec.das_mmproj)
         ? load_asr_model(model_path)
@@ -253,7 +262,9 @@ def private asr_measure_spec(spec : AsrModelSpec; reps, threads : int; var jsonM
     var warm_enc = 0.0lf
     measure_das(m, warm, 1, spec.lang, warm_text, warm_enc)   // JIT compile + first-touch
     delete warm
-    var run = BenchRun(engine = "das", backend = "cpu", flavor = flavor_stamp("tuned"),
+    var leg_ok = true   // nolint:LINT003,LINT019 — falsified in the apple static_if half; the linux flavor sees it const
+    var run = BenchRun(engine = "das", backend = gpu ? "metal" : "cpu",   // accel is the FLAVOR, like the LLM rows
+        flavor = flavor_stamp(accel ? "accel" : "tuned"),
         exec_fmt = asr_exec_fmt(m),
         workload = asr_workload(spec), box = box_name(), threads = threads,
         date = format_time(get_clock(), "%Y-%m-%d"), cmd = bench_cmd_line(), env = bench_env_line(),
@@ -271,7 +282,26 @@ def private asr_measure_spec(spec : AsrModelSpec; reps, threads : int; var jsonM
         let audio_s = double(length(samples)) / double(AUDIO_SAMPLE_RATE)
         var text = ""
         var enc_ms = 0.0lf
+        var tw_enc0 = 0l   // nolint:LINT002,LINT019 — read in the apple static_if half; the linux flavor sees it unused
+        var wd_win0 = 0l   // nolint:LINT002,LINT019 — same
+        static_if (typeinfo builtin_module_exists(das_metal)) {
+            tw_enc0 = metal_tower_stats().encodes
+            wd_win0 = metal_wdec_stats().windows
+        }
         let das_ms = measure_das(m, samples, reps, spec.lang, text, enc_ms)
+        static_if (typeinfo builtin_module_exists(das_metal)) {
+            if (gpu && (metal_tower_stats().encodes == tw_enc0 || enc_ms <= 0.0lf)) {
+                print("lcpp_bench --asr: LOUD FAIL - gpu row {spec.display} {wav} never dispatched the tower (encodes delta {metal_tower_stats().encodes - tw_enc0}, encode_ms {enc_ms}) - a \"metal\" row that measured the CPU\n")
+                leg_ok = false
+            }
+            // the decoder half's twin: every whisper window cross-KV-serves on the gpu leg, so
+            // a flat windows counter means the wdec driver never engaged (the tower check above
+            // cannot see it, and exec_fmt cannot either)
+            if (gpu && m.kind == AsrKind.whisper && metal_wdec_stats().windows == wd_win0) {
+                print("lcpp_bench --asr: LOUD FAIL - gpu row {spec.display} {wav} never engaged the wdec driver (windows delta 0) - the decoder half measured the CPU\n")
+                leg_ok = false
+            }
+        }
         run.tests |> insert("asr:{wav}", BenchTest(ms = das_ms, audio_s = audio_s, text = text, encode_ms = enc_ms))
         run.files |> emplace(file_identity("{asr_corpus_dir()}{wav}", "clip"))
         print("lcpp_bench --asr: {spec.display} {wav} {das_ms} ms ({audio_s} s audio)\n")
@@ -306,16 +336,50 @@ def private asr_measure_spec(spec : AsrModelSpec; reps, threads : int; var jsonM
     cell.runs |> emplace(run)
     jsonModels |> emplace(cell)
     delete m
+    return leg_ok
 }
 
-// The --asr entry: catalog match -> measure -> the same cell JSON the LLM rows emit.
-def private asr_cell_main(model, json_path : string; reps, threads : int) : bool {
-    allow_cpu_prefill()   // the ASR cell is CPU by protocol — disarm the Metal-build tripwire
+// The --asr entry: catalog match -> measure -> the same cell JSON the LLM rows emit. --ngl
+// selects the gpu leg: the f32 tower rail on the Metal tower driver; decoders and Conformer
+// paths stay CPU (declared intent), and every measured row must show tower engagement or the
+// leg exits non-zero.
+def private asr_cell_main(model, json_path : string; reps, threads : int; gpu, accel : bool) : bool {
+    allow_cpu_prefill()   // ASR decoders/Conformer paths are CPU by protocol — disarm the tripwire
+    if (accel && gpu) {
+        print("--accel is a CPU-tier lever - drop it or run with -ngl 0\n")
+        return false
+    }
+    if (accel) {
+        static_if (typeinfo builtin_module_exists(das_accelerate)) {
+            dasllama_accelerate_enable(32l)   // the shipped +AMX defaults, same as the LLM leg
+        } else {
+            print("--accel requested but das_accelerate is not built on this platform - no accel row to measure\n")
+            return false
+        }
+    }
+    if (gpu) {
+        static_if (typeinfo builtin_module_exists(das_metal)) {
+            set_asr_tower_fp32(true)   // f32 TOWER only (q8 towers decline quant_mode); the decoder half stays on its q8 rail
+            set_metal_tower(true)
+            set_metal_wdec(true)        // explicit intent, like the CPU arm's pins: a stray
+            set_metal_wdec_step(true)   // DASLLAMA_METAL_WDEC=0 must not yield a CPU-decoder "metal" row
+        } else {
+            print("lcpp_bench --asr: --ngl needs a Metal build (no das_metal on this platform)\n")
+            return false
+        }
+    }
+    static_if (typeinfo builtin_module_exists(das_metal)) {
+        if (!gpu) {   // a CPU/accel row means CPU: the default-on drivers would silently GPU-serve
+            set_metal_wdec(false)   // the q8 whisper decode
+            set_metal_tower(false)  // the qwen3a-family conv2d (f32 planes serve even under q8 towers)
+        }
+    }
     apply_box_profile_runtime()
     if (!tune_gate()) {   // never measure on fallback winners — the whole board would sandbag
         return false
     }
     var found = false
+    var all_ok = true
     var jsonModels : array<BenchModel>
     with_job_que() {
         setup_dasllama_jobque_()
@@ -328,8 +392,13 @@ def private asr_cell_main(model, json_path : string; reps, threads : int) : bool
                 continue
             }
             found = true
-            asr_measure_spec(spec, reps, threads, jsonModels)
+            if (!asr_measure_spec(spec, reps, threads, jsonModels, gpu, accel)) {
+                all_ok = false
+            }
         }
+    }
+    if (!all_ok) {
+        return false
     }
     if (!found) {
         print("lcpp_bench --asr: no catalog model matches '{model}'\n")
@@ -421,8 +490,14 @@ def private measure_image_turn(var m : Model; emb : Gemma4uvEmbedder; img : Visi
 }
 
 // The --image entry: load the pair, time the turn, emit the same cell JSON the LLM rows emit.
-def private image_cell_main(model, mmproj, image, prompt, json_path : string; reps, threads : int) : bool {
-    allow_cpu_prefill()   // the image cell is CPU by protocol — disarm the Metal-build tripwire
+def private image_cell_main(model, mmproj, image, prompt, json_path : string; reps, threads : int; gpu : bool) : bool {
+    // the metal arm serves the whole turn on the driver with the tripwire ARMED, so a CPU
+    // fallback reds the row instead of sandbagging it
+    if (gpu) {
+        set_metal_mode(MetalMode.required)
+    } else {
+        allow_cpu_prefill()   // the CPU arm is CPU by intent — disarm the Metal-build tripwire
+    }
     apply_box_profile_runtime()
     if (!tune_gate()) {   // never measure on fallback winners — the whole board would sandbag
         return false
@@ -448,7 +523,7 @@ def private image_cell_main(model, mmproj, image, prompt, json_path : string; re
         } else {
             var inscope warm <- measure_image_turn(m, emb, pic, ask, 1)   // warm: JIT + first touch
             var inscope turn <- measure_image_turn(m, emb, pic, ask, reps)
-            var run = BenchRun(engine = "das", backend = "cpu", flavor = flavor_stamp("tuned"),
+            var run = BenchRun(engine = "das", backend = gpu ? "metal" : "cpu", flavor = flavor_stamp("tuned"),
                 exec_fmt = model_exec_fmt(m),
                 workload = "image-chat", box = box_name(), threads = threads,
                 date = format_time(get_clock(), "%Y-%m-%d"), cmd = bench_cmd_line(), env = bench_env_line(),
@@ -949,6 +1024,98 @@ def private argmax_logit(s : Session; vocab : int64) : int64 {
     return best
 }
 
+// ===== The parity pregate (--parity: the board's start-of-model gate) =====
+
+// greedy continuation over the same slice test_parity's parity_gen_ok compares
+def private parity_greedy(t : Model; prompt : array<int64>; n_gen : int64) : array<int64> {
+    var got : array<int64>
+    got |> reserve(n_gen)
+    var s <- make_run_state(t.config)
+    let pl = long_length(prompt)
+    forward_prefill(t, s, prompt, pl, 0l)
+    var pos = pl
+    while (long_length(got) < n_gen) {
+        let nxt = argmax_logit(s, t.config.vocab_size)
+        got |> push(nxt)
+        break if (long_length(got) >= n_gen)
+        forward(t, s, nxt, pos)
+        pos++
+    }
+    delete s
+    return <- got
+}
+
+def private parity_eyeball(t : Model; ids : array<int64>) : string {
+    return replace(decode_(t, ids), "\n", "\\n")
+}
+
+// The board's start-of-model gate: one pinned run against the spec's frozen evidence — the same
+// fixture test_parity's generic loop drives. Loads the PLANAR rail (load_model_ — the layout the
+// fixtures were frozen on); the eyeball texts are derived via the tokenizer here, never stored.
+def private parity_cell_main(model : string) : bool {
+    var inscope spec <- spec_by_file(base_name(model))
+    return parity_check(model, spec)
+}
+
+//! The pregate's verdict for `model` under `spec`'s evidence — public so a test can drive the
+//! compare with a deliberately wrong fixture; the arm's own path binds `spec` off the table.
+def parity_check(model : string; spec : ModelSpec) : bool {
+    if (empty(spec.parity.gen)) {
+        print("PARITY PREGATE: no evidence for {base_name(model)} in the model-set table (model_specs.das) - freeze a fixture (harness/parity.sh) before boarding this model\n")
+        return false
+    }
+    allow_cpu_prefill()   // the pinned compare is CPU by protocol — disarm the Metal-build tripwire
+    let prev_kq = get_kquant_native()
+    if (spec.parity.kq_native) {
+        set_kquant_native(true)
+    }
+    var t <- load_model_(model, spec.parity.quant)
+    if (spec.parity.kq_native) {
+        set_kquant_native(prev_kq)
+    }
+    // the modes the fixtures were frozen under — keep in step with test_parity's parity_gen_ok
+    let prev_attn = get_prefill_attn_mode()
+    set_prefill_attn_mode(AttnPrefillMode.classic)
+    let prev_act = get_act_vec()
+    set_act_vec(false)
+    let prev_dn = get_deltanet_prefill_mode()
+    set_deltanet_prefill_mode(DnPrefillMode.recurrent)
+    var ok = false
+    with_job_que() {
+        setup_dasllama_jobque_()
+        // text-form evidence encodes through the loaded model's own tokenizer (load_model_
+        // carries it), the same flags the test loop uses (add_special on, parse_special off)
+        var prompt <- (empty(spec.parity.prompt_text) ? clone_to_move(spec.parity.prompt)
+            : encode_(t, spec.parity.prompt_text, true, false))
+        let n_gen = long_length(spec.parity.gen)
+        t.config.seq_len = min(t.config.seq_len, long_length(prompt) + n_gen + 8l)   // KV cap: only these positions run
+        var got <- parity_greedy(t, prompt, n_gen)
+        ok = long_length(got) == n_gen
+        if (ok) {
+            for (a, b in got, spec.parity.gen) {
+                if (a != b) {
+                    ok = false
+                    break
+                }
+            }
+        }
+        print("parity want: {parity_eyeball(t, spec.parity.gen)}\n")
+        print("parity got:  {parity_eyeball(t, got)}\n")
+        if (ok) {
+            print("parity ok: {base_name(model)} {int(n_gen)}/{int(n_gen)} token-for-token\n")
+        } else {
+            print("PARITY PREGATE: {base_name(model)} diverges from its frozen fixture - this box's engine does not reproduce the pinned continuation, so no cell of this model is measurable\n")
+        }
+        delete got
+        delete prompt
+    }
+    set_prefill_attn_mode(prev_attn)
+    set_act_vec(prev_act)
+    set_deltanet_prefill_mode(prev_dn)
+    delete t
+    return ok
+}
+
 // Prompt corpus: segments separated by lines of two percent signs, '#' segments skipped.
 def private load_corpus(path : string) : array<string> {
     var texts : array<string>
@@ -1155,7 +1322,7 @@ def main() : int {
     let pin_desc = "{lcpp_mask_on() ? "hard mask" : "QoS classified"} (bench-forced)"
     say(fmt, "regime: {threads} lanes ({max(threads - 1, 1)} pool workers + main), affinity {pinned ? pin_desc : (is_some(g_env_core.jobque_affinity) ? "env override" : "off (platform default)")}\n")
     if (cfg.asr) {   // the audio cell shares every lane decision above, then runs its own protocol
-        return asr_cell_main(cfg.model, cfg.json_path, reps, threads) ? 0 : 1
+        return asr_cell_main(cfg.model, cfg.json_path, reps, threads, gpu, cfg.accel) ? 0 : 1
     }
     if (!empty(cfg.image)) {   // the vision cell, same deal
         if (empty(cfg.image_mmproj)) {
@@ -1163,11 +1330,14 @@ def main() : int {
             return 1
         }
         return image_cell_main(cfg.model, cfg.image_mmproj, cfg.image, cfg.image_prompt,
-                               cfg.json_path, reps, threads) ? 0 : 1
+                               cfg.json_path, reps, threads, gpu) ? 0 : 1
     }
     apply_box_profile_runtime()   // the tuned per-box stack — what load_model users get
     if (!tune_gate()) {   // never measure on fallback winners — the whole board would sandbag
         return 1
+    }
+    if (cfg.parity) {   // the board pregate: correctness only — same tuned stack as the cells, fixture modes pinned, no timings
+        return parity_cell_main(cfg.model) ? 0 : 1
     }
     if (cfg.accel && gpu) {
         print("--accel is a CPU-tier lever - drop it or run with -ngl 0\n")
@@ -1251,7 +1421,7 @@ def main() : int {
         // the exec REQUEST (exe-native / -jit / interpreted) + the armed GPU tier are stamped;
         // a jit run that produced nothing logs its own LLVM JIT error beside this
         let exec_state = is_standalone_exe() ? "exe-native" : (jit_enabled() ? "jit" : "INTERPRETED")
-        let gpu_seg = moe_gpu_tier_installed() ? " | gpu {gpu_tier_status().backend}" : ""
+        let gpu_seg = moe_gpu_tier_installed() ? " | gpu {gpu_tier_status_().backend}" : ""
         say(fmt, "config: dim={c.dim} layers={c.n_layers} vocab={c.vocab_size} | backend {active_kernel_backend()} (batch {active_batch_backend()}) | {exec_state}{gpu_seg} | t{threads} affinity {pinned ? "hard" : "env/off"} | pp{plen} tg{ngen} x {reps} reps\n")
         modelArch = "{t.arch}"
         activeB = active_params_b(t)

@@ -1,6 +1,7 @@
 options gen2
 options stack = 524288   // every dasLLAMA program root takes this budget
 options indenting = 4
+options _dasllama_internal = true
 
 require dastest/testing_boost public
 require ?das_metal dasllama/dasllama_metal_kernels  // the decode kernel set (Apple builds)
@@ -190,7 +191,7 @@ def private sq_part_gate(t : T?; dev, queue; tag : string; cnt, window : int) {
 def test_metal_sq_attn_kernels(t : T?) {
     t |> run("single-query attention kernels == CPU attention oracle (sinks, softcap, split-K, window)") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(das_metal)) {
-            with_metal_device() <| $(dev : MetalDevice?) {
+            with_metal_device() $(dev : MetalDevice?) {
                 if (dev == null) {
                     feint("no Metal device on this box; GPU kernel checks skipped\n")
                     return

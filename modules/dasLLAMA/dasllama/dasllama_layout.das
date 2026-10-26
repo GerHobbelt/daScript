@@ -1,10 +1,12 @@
 options gen2
 options _comment_hygiene = true
+options _dasllama_internal = true
 
 module dasllama_layout shared public
 options _cyclomatic_complexity = 0   // format/schema dispatch ladders are the domain shape
 options _function_length = 0   // same
 
+require dasllama/dasllama_lint public
 require dasllama/dasllama_common
 require dasllama/dasllama_math          // g_repack_* backend pointers + active_* layout knobs
 require dasllama/dasllama_math_default  // k4_sc_mn — the k4 6-bit sc/mn decoder
@@ -172,9 +174,9 @@ def metal_blob_scale_plane(var t : Model; name : string) : bool {
     }
     // k6: the GPU split form — [nsb x 16B sub-scale strips][nsb x f16 d halfwords]
     if (!empty(t.k6s)) {
-        var k6c : array<uint8>
+        var @exact_size k6c : array<uint8>
         let nsb = long_length(t.k6s) / K6_SSB
-        k6c |> resize(nsb * K6_SSB)
+        k6c |> reserve_resize(nsb * K6_SSB)   // a 27B-class q6 region is a ~120 MB strip — one grow
         unsafe {
             var dp = addr(k6c[0])
             let sp = addr < uint8 const? >(t.k6s[0])
@@ -518,7 +520,7 @@ def private repack_kq_weights(var t : Model) {
 
 // Repack the native-MXFP4 expert stacks into the active backend's interleaved mx layout, IN PLACE
 // (each expert slice is its own 2D tensor). Mirrors repack_q8_weights' contract: called only after
-// select_matmul_backend_for_load picks a repack backend; the pointer is otherwise identity.
+// select_matmul_backend_for_load_ picks a repack backend; the pointer is otherwise identity.
 def private repack_mx4_stacks(var t : Model) {
     let c = t.config
     let dim = c.dim
@@ -649,6 +651,49 @@ def moe_gpu_gather_stack(t : Model; woff : int64; n, rows, slice_rows : int64; m
                                     dst[j] = uint8(wp[src + j])
                                 }
                             }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Interleave one PREPARED Q8 region (split planes, f32 scales, possibly grp<mr>-repacked) into
+// the Metal 34B-block stream (f16 scale + 32 quants per block, row-major) — the whisper-decoder
+// upload's per-region step; the region is ONE repack unit (rows/mr groups + a row-major tail).
+def q8_region_to_metal_blob(qp : int8 const?; sp : float const?; n, rows : int64;
+                            repacked : bool; mr, kgroup, wbias : int64; var dst : uint8?) {
+    let nb = n / Q8_BLOCK_ELEMS
+    assert(wbias == 0l || wbias == 128l, "q8_region_to_metal_blob: unknown q8 plane bias")
+    let ng = repacked ? rows / mr : 0l
+    let njobs = is_job_que_available() ? min(int(rows), 4 * (get_total_hw_jobs() + 1)) : 1
+    maybe_parallel_for(0, int(rows), njobs) $(rb, re) {
+        unsafe {
+            for (rr in range64(int64(rb), int64(re))) {
+                let grouped = repacked && rr < ng * mr
+                let g = rr / mr
+                let r = rr % mr
+                for (bi in range64(nb)) {
+                    var blk = dst + (rr * nb + bi) * 34l
+                    let si = grouped ? (g * nb + bi) * mr + r : rr * nb + bi
+                    *reinterpret<uint16?>(blk) = uint16(f32_to_f16(clamp(sp[si], -65504.0, 65504.0)))
+                    if (grouped) {
+                        let gbase = g * mr * n + r * kgroup
+                        var kg = (bi * 32l) / kgroup
+                        var o = 2l
+                        for (_kk in range64(32l / kgroup)) {
+                            let src = gbase + kg * kgroup * mr
+                            for (j in range64(kgroup)) {
+                                blk[o + j] = uint8(int(qp[src + j]) ^ int(wbias))
+                            }
+                            kg++
+                            o += kgroup
+                        }
+                    } else {
+                        let src = rr * n + bi * 32l
+                        for (j in range64(32l)) {
+                            blk[2l + j] = uint8(qp[src + j])
                         }
                     }
                 }

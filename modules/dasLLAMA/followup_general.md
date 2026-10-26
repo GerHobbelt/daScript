@@ -317,6 +317,11 @@
     uniform bound, the three declines and the blob refusals are deleted, and the kernel
     coverage suite dispatches the non-causal arm. Scheduled for the Metal arc's tail —
     pulled forward only if CPU-fallback vision proves a blocker (Boris 2026-08-14).
+    **Metal half DONE (metal-media chunk 1, 2026-08-16):** the trio takes the bound as
+    `AttnArgs.uend` (no separate kernel — the census criterion is moot), the declines and
+    blob refusals are deleted, and the span parity arm + support-matrix engage cell gate it.
+    REMAINING: the Vulkan half (`vk_moe_attn` signature surgery, device KV pre-seed,
+    `AT_CTX`), on the PC box.
 
 24. **Stream the over-line audio-carrier mints (the 1 GiB staging rule, 2026-08-14).**
     `REVIEW.md` caps `cache_via_image_staged` at a 1 GiB source file; six carriers on the
@@ -328,3 +333,159 @@
     entry points refuse a source over the line, and the mint-form-differs conversions
     restructure into per-plane producers. The vision carriers stay staged (gemma-4 12B
     mmproj 0.2 GB, E2B 0.9 GB).
+
+25. **OpenAI-standard audio/image API surface — conformance, decisions, hygiene (2026-08-16).**
+    The server implements `image_url`/`input_image` chat parts (data:-only) and
+    `/v1/audio/transcriptions` (`json`/`text`/`verbose_json`, `language`, VAD segments).
+    The rest of the standard surface, tiered:
+    - CONFORMANCE DEBT (plumbing, no new capability): `input_audio` chat parts plus the
+      ecosystem `audio_url` twin (accept both — audio-in-chat rides the existing
+      `render_prompt_media` splice); `srt`/`vtt` transcription response formats;
+      `timestamp_granularities[]` where the family has word timestamps; `prompt` biasing;
+      `stream=true` transcription events; `/v1/audio/translations` for the whisper family
+      (native decoder mode; other families decline); accept-and-ignore `image_url.detail`.
+    - CAPABILITY DECISIONS (Boris's call, each a new model class): TTS — `/v1/audio/speech`
+      and chat `modalities:["text","audio"]`. No served artifact can speak; the two Omni
+      families have Talkers upstream but the GGUF ecosystem carries only thinker + audio
+      encoder, and a talker conditions on thinker HIDDEN STATES (not a bolt-on). The
+      reference-backed route if wanted: a dedicated small TTS family (llama.cpp's tts
+      example — OuteTTS + WavTokenizer ggufs). Realtime API (WebSocket voice, barge-in) is
+      the end-state the smaller audio choices point at; name it before choosing them.
+    - DECLINE/PARK: `/v1/images/generations` (+edits/variations) — no roster model
+      generates images even upstream; diffusion is a disjoint class (DiT/UNet + conv2d VAE,
+      no reference in llama.cpp; the GGML reference is stable-diffusion.cpp, which shares
+      our quants/GGUF/GEMMs but not the graph). `file`/`video_url` parts likewise parked.
+    - HYGIENE: our `/v1/images` is the dlim-inventory/bake endpoint — a name squat on the
+      standard image-API prefix; rename ours or accept the squat deliberately.
+
+26. **ASR perf follow-ups after the Metal tower — MOSTLY RESOLVED by metal-media chunk 3
+    (2026-08-16, `history/dasLLAMA/metal_media_plan.md` slices M-R).** The decoder half SHIPPED (cross-KV +
+    the q8-native decode step on Metal, part/comb attention, f16 KV — decode beats the
+    q8-CPU rail 1.6x and serves by default above the `n_text_state >= 1024` floor); J-qwen3a
+    SHIPPED (the conv2d frontend pads into the tile GEMM — encode 6.3x on the stage probe
+    (`harness/asr_stage_probe.das`, no board cell), the q8 serving default included); the
+    whisper conv frontend rides the GPU too (37x, same probe). gb1 large-v3-turbo lands
+    4.04 s vs whisper-cli's 5.54 (both celled, `records/m1.json`). What remains:
+    - **The q8 tower lane**: transform-vs-upload-dequant, measurement-driven — the encoder
+      blocks still ride the f32 lane under `--ngl` (the one remaining fp32-forced half).
+    - **Audio mmproj provenance**: `qwen2audio-mmproj-f32.gguf` and
+      `voxtral-mini-mmproj-f32.gguf` are locally-converted fixtures with no
+      `performance/fetch_models.das` entry — the tests that load them skip honestly without
+      them, but the files are not re-fetchable from the manifest. Mint the entries (or a
+      documented convert recipe) rather than inventing provenance.
+    - **The whisper decode step's small-model floor**: tiny (d=384) loses ~3x to the
+      per-dispatch latency floor and keeps the CPU rail by policy — a graph/ICB replay or
+      megafusion round would move the floor; measured, ledgered, not urgent.
+
+27. **The metal suites should catch a raw (runner-less) invocation (2026-08-17).** Running
+    `dastest -- --test modules/dasLLAMA/tests` directly — without `tests/run.das` — drops the
+    runner's env (`DASLLAMA_CPU_PREFILL=1`, `DASLLAMA_METAL_HAZARD_STRICT=1`,
+    `DAS_TUNE_MANIFEST=m1.tune.json`) and produces phantom reds that read like real
+    regressions: the CPU-truth A/B halves trip the CPU-prefill panic, untuned identities
+    collide with the dlim flavor-lane fixtures, and the combined run even segfaulted. The
+    prohibition exists in `tests/CLAUDE.md` but nothing ENFORCES it — a session that skips
+    the doc burns an hour on fake failures. Add a guard test (or a `_model_tier` setup
+    check) that detects the missing runner markers and fails IMMEDIATELY with "run through
+    modules/dasLLAMA/tests/run.das", instead of letting the suite die deep. Design choice
+    for implementation: refuse outright vs loud-warn; and keep single-file dastest runs
+    OUTSIDE the metal-suite set (test_whisper.das etc.) unaffected.
+
+28. **CPU fallback on anything but tiny should be LOUD (2026-08-17).** The review round's
+    pattern: the GPU drivers decline silently by design (best-effort inside knobs), which is
+    right for tiny — the floor genuinely serves it better on CPU — but on any above-floor
+    model a silent CPU fallback is a performance cliff the user only finds by profiling.
+    Discussion to have: a single loudness policy for the serving paths — e.g. every decline
+    of a model the driver WOULD normally serve (above the floor, right quant, registered
+    family) logs one line naming the reason, while policy-class declines (floor, knob-off)
+    stay counter-only. Touches the tower conv frontends' bare-false contract, the wdec
+    decline notes (partly landed in the review round), and the required-mode asymmetry the
+    round ledgered. Decide the policy once, then sweep the drivers to it.
+
+29. **The f32-fallback REVIEW rule's form defects — parked for REVIEW.das (2026-08-17).**
+    The rule as landed has a stale name census (misses `matmul`, `gemm_f32_jo`, `mm_fblob*`,
+    `enc_f32_mm`), a twin-existence clause not decidable from a diff, and a self-exempting
+    inline `unless`. The dragon's proposed repair — a `// f32: <reason>` marker on every
+    f32-matmul call line, mechanically checkable like `// clock: control` — is sound but
+    parked: the coming executable-checklist mechanism (REVIEW.das) is the better home for a
+    rule that is really a lint. Revisit when that lands.
+
+30. **REVIEW_GPU's derived-uniform clause — parked for REVIEW.das (2026-08-17).** The
+    "no value reaches an encoder twice" rule condemns the file's own standing shape (the
+    grid extent re-bound as the device-side tail guard) and cannot say so. Once REVIEW.das
+    lands, the check is mechanical: the [metal_dispatch] lens knows every grid= param and
+    binding, so "an argument other arguments determine is a defect, except the grid extent
+    as the bounds guard" becomes an auto-test; the rule text then shrinks to the sanction.
+
+31. **`pin_kernel_backend` is not load-sticky (2026-08-17).** A model load's internal
+    selection overrode an `arm64-gen` pin mid-cell (portable pins survive — the asymmetry is
+    availability-gated re-selection), which corrupted the wdec attach until the driver moved
+    to the pure read. Decide the contract: the pin survives loads, or its doc states it pins
+    only until the next load — then sweep the A/B seats that assume the stronger reading.
+
+32. **`daspkg --quick` silently downgrades on an incomplete sidecar (2026-08-17).** Finding
+    the scope incomplete, --quick re-mints in NORMAL mode — a quick rebuild can quietly strip
+    the record-grade rig of its paranoid winners (observed: 5 tie-class winner flips, oracle
+    INCOMPARABLE until the LKG restore). Safer contract: refuse and name the LKG restore, or
+    re-mint in the sidecar's previous mode.
+
+33. **Lint/test-cell candidates from the metal-asr review round (2026-08-17).**
+    - `[hot_path]` region contracts are blind across `invoke`d function-pointer seams (the
+      four new GPU hooks) — the PERF026-028 scan cannot traverse them.
+    - The tests/REVIEW CMakeLists rule is a pure grep: a model-free cell walking every
+      CMakeLists.txt for `modules/dasLLAMA/tests/` basenames.
+    - Three `test_metadata.py` cells for site-dasllama: page metadata (title/description/
+      OG/Atom), news-region idempotence (regenerate into tmp, byte-compare), and the `dl-*`
+      prefix ban.
+    - The site dl-* shared-selector parity check (parse both files, intersect selectors,
+      assert identical bodies).
+
+34. **ModelSpec unification — the staged README rendering (2026-08-18, remainder).** The
+    catalog move SHIPPED: one `ModelSpec` table (`performance/model_specs.das`, re-exported
+    by `profile_common`) carries catalog fields + `official` flag/note + provenance +
+    companions + parity evidence as data; `llm_catalog` / `official_catalog` /
+    `models_provenance` are views, `asr_catalog` specs carry their own provenance,
+    `test_parity` runs one generic loop over evidence, and the board pregate
+    (`lcpp_bench --parity`) refuses a model whose fixture does not reproduce, stamping
+    `parity` into das rows. STAGED BEHIND: the README support-matrix table becomes a
+    generated rendering of the table (gen_env_doc pattern; authored arch-prose rides as a
+    field). Found while scoping it: the README matrix claims frozen `test_parity.das`
+    fixtures for GLM-4.5-Air, Phi-3.5, Mistral-Medium-3.5 and Gemma-4-31B that do not exist
+    in the tree — the generation arc starts by reconciling those rows (re-mint or re-word).
+
+35. **`@exact_size` — DONE as a lint contract, not a runtime mode (2026-08-18).** The
+    declaration-site annotation landed on variables, fields and by-ref parameters (locals gained
+    `@` metadata grammar for it); it changes nothing at runtime — PERF032 holds every
+    `resize`/`resize_no_init` on an annotated array to a `reserve`/`ensure_capacity` earlier in
+    the same function, helpers like `reserve_resize`/`grow_resize`/`zeroed_resize` staying
+    transparent. Annotated: the deltanet state pair, `moe_gout`/`moe_eout`, every T-scaled
+    `EncoderState` buffer, `VisionImage.rgb`, the k6 scale-split staging local, the ASR requant
+    helper parameters, and `embq`/`embs`. The runtime exact-growth mode was judged not doable
+    (an argument passed by reference, a copy-initialized variable — the flag has no home).
+
+36. **DONE (2026-08-18) under #35:** the vulkan bake-trim `embq`/`embs` bare resizes in
+    `dasllama_gpu_resident.das` were the first PERF032 hits — now `reserve_resize`.
+
+37. **The Mistral-7B-v0.3 parity fixture is red on clean master (2026-08-18).** Verified by a
+    detached-master run (54 tests, that one red); the arm now runs as
+    `pinned-greedy parity: Mistral-7B-Instruct-v0.3-Q8_0.gguf` inside `test_parity_specs`.
+    PARITY_FULL-gated, so per-PR CI never sees it. The eyeball rail now shows the shape:
+    38/40 match, then "...interest in the technology" (oracle) vs "...in the field" (das) —
+    a prose-tail near-tie of the "Once upon a time" prompt, the exact class the fixture
+    header disallows. Needs its own session: regression vs upstream re-upload vs stale
+    expectation (stash-and-rerun, then the model-file sha against the manifest); the likely
+    resolution is re-freezing on the counting prompt like every other carrier.
+
+38. **Large-tier parity fixtures have no CI lane (2026-08-18; narrowed).** The official
+    set's evidence is now exercised by every board sweep (the parity pregate — the de facto
+    liveness lane), and the invariants test pins official ⇒ evidence. What remains
+    CI-blind: the non-official large-tier fixtures (the kq trios, the 26B Q8, the
+    plain-stem 35B, Coder-Next) still run only under `DASLLAMA_PARITY_FULL` on dev boxes.
+    Decide whether a nightly PARITY_FULL job on a model-stocked runner is worth standing up
+    for that residue.
+
+39. **The ASR reference receipt collapses a clip ladder to one argv (2026-08-18).** Reference
+    ASR tools take one clip per invocation, and `gen_bench_records.das` stores only the LAST
+    clip's command line ("they differ only in -f"), so the site renders hp0x2's receipt under
+    every clip row of that run — a reader reproducing jfk gets the hp0x2 number. Fix is a
+    per-clip `cmd` (schema addition) or a receipt template with the `-f` slot marked; the das
+    rows are unaffected (one process serves the whole ladder).

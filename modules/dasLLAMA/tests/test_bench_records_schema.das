@@ -1,4 +1,5 @@
 options gen2
+options _dasllama_internal = true
 require dastest/testing_boost public
 require ../performance/profile_common.das
 require dasllama/dasllama_version
@@ -21,6 +22,7 @@ def private make_asr_run(engine, workload : string) : BenchRun {
         date = "2026-07-28",
         cmd = "test-cmd",
         noise = engine == "das" ? "ok" : "",
+        parity = engine == "das" ? "ok" : "",
         dasllama_version = engine == "das" ? DASLLAMA_VERSION : 0,
         versions = engine == "das" ? "" : "whisper.cpp @ abcdef123")
     r.tests |> insert("asr:jfk.wav", BenchTest(ms = 197.1lf, audio_s = 11.0lf))
@@ -55,6 +57,8 @@ def test_asr_round_trip(t : T?) {
         t |> equal(back[0].runs[1].versions, "whisper.cpp @ abcdef123")
         t |> equal(back[0].runs[0].noise, "ok")
         t |> equal(back[0].runs[1].noise, "")
+        t |> equal(back[0].runs[0].parity, "ok")
+        t |> equal(back[0].runs[1].parity, "")
         // the engine's own release counter: stamped on das rows, absent (0) on reference rows
         t |> equal(back[0].runs[0].dasllama_version, DASLLAMA_VERSION)
         t |> success(back[0].runs[0].dasllama_version >= 1, "the counter starts at 1 - 0 means unstamped")

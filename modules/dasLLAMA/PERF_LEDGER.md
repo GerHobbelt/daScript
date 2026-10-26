@@ -387,7 +387,7 @@ what it costs today and what the fix would change.
 
 - **Canary-Qwen ASR runs fp32 for parity; q8 decoder+encoder is the follow-up (Wave A1,
   2026-07-08).** The token-for-token gate loads the LoRA-merged Qwen3-1.7B decoder + FastConformer
-  encoder at fp32. Perf A/B (M1 8T, das vs NeMo SALM greedy, `benchmarks/asr/results.md`): das
+  encoder at fp32. Perf A/B (M1 8T, das vs NeMo SALM greedy; `benchmarks/asr/results.md`, now git history): das
   LEADS every short/dictation clip 1.4–3× (jfk das/nemo 0.61×, LibriSpeech 0.34–0.49×) — the
   Canary-Qwen use case — but TRAILS 3.7× on the 3-min gb1, where the fp32 1.7B decoder is
   bandwidth-bound over gb1's ~2500 audio soft tokens. Fix: a q8 decoder (the existing q8 GEMV path,
@@ -397,7 +397,7 @@ what it costs today and what the fix would change.
 
 - **Gemma-4 E-series audio (gemma4a) encoder is fp32 SCALAR — big A/B gap (Wave A2, 2026-07-08).**
   The parity gate is fp32 encoder correctness, so the gemma4a Conformer runs a plain fp32 scalar
-  forward. A/B (M1 Max 8T, das vs llama-mtmd-cli, `benchmarks/asr/results.md`): das transcribe
+  forward. A/B (M1 Max 8T, das vs llama-mtmd-cli; `benchmarks/asr/results.md`, now git history): das transcribe
   6028 ms / xRT 2.89 vs mtmd-cli 1547 ms / xRT 11.3 → **das TRAILS 3.9×**, dominated by the encoder:
   das encode 1888 ms vs mtmd 117 ms = **16×** (fp32 scalar Conformer vs ggml's bf16-weight SIMD
   GEMMs); long-context decode 21.7 vs 78 tok/s also lags. Unlike A1/parakeet/whisper (which lead or
@@ -830,6 +830,18 @@ group; wording kept.
   is SUPERSEDED** — the AMX arc (#3562) shipped a BNNS-f16 lane in
   `dasllama/dasllama_math_accelerate.das` (bf16 planes via BNNS f16 matmul under
   `DASLLAMA_ACCEL_F16=1`, jobque strip-dispatched).
+
+- **OPEN — k4-native deltanet planes (the "dn planes are ALWAYS q8" loader invariant aged).**
+  Minted on 0.8B–4B where the dn projections were a rounding error; on Qwen3.8-27B (dense
+  hybrid, 48 recurrent layers) they are ~5.6 B of the 6.7 B q8-region weights, so the
+  q4k→q8 load transcode costs **+~2.8 GB of image (22.3 vs ~19.5 GB metal blob) and ~20% of
+  decode's per-token weight reads** (measured via the 2026-08-17 27B bring-up: dlim plane
+  sizes + the q8-region scale count). The dn shapes are why the invariant exists — β/α are
+  dim × dt_rank (16–64, under every kq GEMM tile's N) — so the fix is a narrow k4 GEMV
+  family (`MetalDnBa`-class + the CPU dot), not a kq-tile retrofit. Pays on every lane, and
+  it is step one of **the 16 GB-card game** (Boris, 2026-08-17): 27B q4k on a discrete
+  16 GB GPU needs the image at ~19.5 GB *plus* partial residency (the vulkan tier's
+  offload/stream lane) or a ~3.5 bpw format family (k3/IQ — unsupported today).
 
 ### From `audio_models_plan.md` (Findings; correctness, not perf)
 

@@ -1,8 +1,10 @@
 options gen2
 options _comment_hygiene = true
+options _dasllama_internal = true
 
 module dasllama_metal_shapes shared public
 
+require dasllama/dasllama_lint public
 require dasllama/dasllama_common
 require dasllama/dasllama_math   // kernel_backend_needs_repack / active_kernel_backend — the repack clause
 
@@ -46,6 +48,34 @@ enum MetalDecodeDecline {
                         // forward-only and NOT re-derivable — no watermark repair exists)
 }
 
+// The tower/embedder driver's decline set — same contract as the prefill/decode enums: FIRST
+// failing clause, .none = supported, names asserted as strings by the image suite's mtower
+// cells. Conformer families never decline — no seam; their evidence is frozen counters.
+enum MetalTowerDecline {
+    none                // supported — the tower encode runs on the GPU
+    knob                // DASLLAMA_METAL_TOWER=0 — the A/B rail
+    quant_mode          // a q8-loaded tower: the f32/bf16 lane only (the q8 tower lane is its own slice)
+    shape               // a dim violating the GEMM grids (m%32 / ndim%64 / kdim%32) or a misaligned plane offset
+    device              // metal init failed (no device / PSO build failure)
+    gpu_error           // dispatch failed at execution time
+}
+
+// The whisper ASR-decoder driver's decline set — FIRST failing clause, .none = supported,
+// names asserted as strings by the gates. Q8-NATIVE: an f32-forced decoder declines.
+// knob/small/step_knob are POLICY (no panic, outside the declines sum); the rest honor required.
+enum MetalWdecDecline {
+    none                // supported — the decoder-side work runs on the GPU
+    knob                // DASLLAMA_METAL_WDEC=0 — the A/B rail (policy: never panics)
+    small               // the decode STEP only: n_text_state under the serving floor — the
+                        // per-dispatch latency beats small decoders (policy; cross-KV serves)
+    step_knob           // the decode STEP only: DASLLAMA_METAL_WDEC_STEP=0 (policy; cross-KV
+                        // serves — the note is what separates "off by config" from "broken")
+    quant_mode          // an f32-loaded decoder: the q8 lane only (f32 is the CPU oracle rail)
+    shape               // a dim violating the GEMM grids or a misaligned plane offset
+    device              // metal init failed (no device / PSO build failure)
+    gpu_error           // dispatch failed at execution time
+}
+
 // why a prefill declined to the CPU path — the FIRST failing gate clause (the decode enum's
 // twin; the support-matrix test asserts these names as strings)
 enum MetalPrefillDecline {
@@ -67,8 +97,8 @@ enum MetalPrefillDecline {
     shape               // head/dim alignment outside the kernel grids
     layers              // per-layer non-uniformity (kv_dim/head_size/hidden/sliding/missing wv)
     rope_rows           // the window's rope table not built
-    non_causal_span     // s.attn_uniform_end armed — the GPU chains encode the causal mask, so
-                        // an image span serves on the CPU loop until a uniform-bound kernel lands
+    non_causal_span     // the A/B decline only (DASLLAMA_METAL_SPAN=0): the trio takes the
+                        // uniform bound as AttnArgs.uend, so a span serves by default
     device              // metal_prefill_init failed (no device / PSO build failure)
     gpu_error           // dispatch failed at execution time
     planar              // weights not in the blob-image form (the drivers are blob-only)

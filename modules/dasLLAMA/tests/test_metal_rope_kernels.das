@@ -2,6 +2,7 @@ options gen2
 options stack = 524288   // every dasLLAMA program root takes this budget
 options _function_length = 0        // per-kernel gates: hand-bound buffers/uniforms + dispatch + oracle compare, one flat run each
 options _cyclomatic_complexity = 0  // same — the arm ladders follow the kernel's own binding/variant axes
+options _dasllama_internal = true
 
 require dastest/testing_boost public
 require dasllama/dasllama_math      // rope_scaled_tab / rope_scaled_neox_tab(_part) — the CPU rope truth
@@ -974,7 +975,7 @@ def private unsign_gate(t : T?; dev, queue; hs, nheads, nrows, pad : int) {
 def test_metal_rope_store_kernels(t : T?) {
     t |> run("fused rope + KV-store kernels == the CPU rope/codec seam (all four mirrors, flat/head/batched)") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(das_metal)) {
-            with_metal_device() <| $(dev : MetalDevice?) {
+            with_metal_device() $(dev : MetalDevice?) {
                 if (dev == null) {
                     feint("no Metal device on this box; GPU kernel checks skipped\n")
                     return

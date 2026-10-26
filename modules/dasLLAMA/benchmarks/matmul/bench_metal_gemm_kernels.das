@@ -2,6 +2,7 @@ options gen2
 options persistent_heap
 options _function_length = 0        // one MSL kernel body + its hand-bound dispatch per lab — barrier/register coupled, no seam
 options _cyclomatic_complexity = 0  // same — run_lab is the flat variant ladder
+options _dasllama_internal = true
 
 require dastest/testing_boost
 require dasllama/dasllama_env  // the g_env_* knob globals ([EnvConfig] declarations; ENVIRONMENT.md is generated from them)
@@ -4064,7 +4065,7 @@ def private compile_lab_pso(dev; v : LabVariant) {
     var err : string
     var pso = pipeline_from_source(dev, v.src, v.entry, v.fastmath, err)
     if (pso == null) {
-        to_log(LOG_ERROR, "{v.name}: kernel compile failed — {err}\n")
+        to_log(LOG_ERROR, "{v.name}: kernel compile failed - {err}\n")
     }
     return pso
 }

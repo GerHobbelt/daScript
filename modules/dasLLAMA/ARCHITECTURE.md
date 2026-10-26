@@ -120,8 +120,10 @@ often gotten wrong, so each says explicitly where the neighbouring half goes.
 - **`dasllama_gguf.das`** — the GGUF container: KV/tensor descriptors, the byte-level reader, the
   mapping. Codecs live in `dasllama_convert`; this file finds bytes, it does not decode them.
 - **`dasllama_layout.das`** — disk-format → compute-layout transforms at LOAD scope: the blob
-  transform, the CPU repack walkers, the GPU tier gathers, and the refusal half (`can this model
-  take the blob form`) split out so the image writer can commit without loading.
+  transform, the CPU repack walkers, the GPU tier gathers, the per-region q8→Metal-34B
+  un-repack (`q8_region_to_metal_blob`, the ASR-decoder driver's upload form), and the refusal
+  half (`can this model take the blob form`) split out so the image writer can commit without
+  loading.
 - **`dasllama_tokenizer.das`** — the tokenizer facade: backend selection off the GGUF metadata and
   the one encode/decode/piece surface models and the chat layer call. Re-exports both backends, so
   a consumer requires this file and never picks a backend by hand.
@@ -184,6 +186,8 @@ that a question answered for one backend has an obvious address in the other. Th
 | `dasllama_<gpu>_decode`<br>`dasllama_metal_decode`, `dasllama_vulkan_decode` | the resident token-step driver + decode-time arms | kernel bodies |
 | `dasllama_<gpu>_prefill`<br>`dasllama_metal_prefill`, `dasllama_vulkan_prefill` | the batched prefill driver + batch arms | kernel bodies |
 | `dasllama_<gpu>_shapes`<br>`dasllama_metal_shapes` | PORTABLE servability gates — no GPU C++ require, so any box can bake | device calls |
+| the tower driver<br>`dasllama_metal_tower` | one-shot embedder/encoder encodes (gemma4uv chain, the whisper-class block loop, the conv frontends + the qwen3a padded-weight slab) — no session, no KV, no mirror; registers the gemma4uv, encoder_blocks, tower-conv and qwen3a-conv hooks | kernel bodies, decoder state |
+| the ASR-decoder driver<br>`dasllama_metal_asr_dec` | the whisper decoder on Metal: the 34B weight blob, the f16 resident cross/self K/V, window-granular cross-KV + decode-step serves; registers the whisper cross-KV and decode hooks (family registries in `dasllama_whisper`) | kernel bodies, LLM session state |
 | the kernel-access lens<br>`dasllama_metal_lens` (Metal), `dasllama_vulkan_dispatch` (Vulkan — the `[vk_dispatch]` macro derives access per class) | the kernel-access macro | anything else |
 
 - **Vulkan additionally has an ENTRY, `dasllama_math_vulkan.das`** — capability probe/arm, `.dlim`
@@ -202,10 +206,26 @@ that a question answered for one backend has an obvious address in the other. Th
   metal_common → dasllama_common → metal_gemm would cycle.
 - **Backend-only capabilities live in their matching ROLE file, not in new grab-bags** — vulkan's
   weight arena, streamed mirrors, heat cache, host-import, coopmat; metal's blob transform and MTP.
+- **The tower driver owns NO PSOs.** Its kernels (LN, f32 mul_mm, the two gelu flavors,
+  posadd) live in the kernel home, so `metal_decode_init` compiles and `metal_kernels_release`
+  releases them like every other registry PSO; the borrowed prefill builders (`pf_enc_bf16_mm`,
+  `enc_add_bias_rows`, the attention trio via `enc_qk_mm`/`enc_av_mm`) come up through
+  `metal_prefill_pso_init`, prefill's public bring-up seat, and `plane_buffer` in common is
+  public for the same wrap-a-plane reason. The tower's own objects (the ones buffer, its
+  scratch pool) release through `metal_tower_shutdown`.
+- **The tower driver is a Metal-only role** — Vulkan has no tower twin; audio/vision encodes
+  on the Vulkan tier stay CPU. Likewise the non-causal media span: Metal serves it through
+  `AttnArgs.uend`; the Vulkan resident prefill declines it (`followup_general.md` #23's
+  remaining half).
 - **Family-shared kernel classes live in `dasllama_metal_kernels`.** The `[metal_dispatch]` lens
   generates `enc_*` builders and MSL globals into the module the class COMPILES in, so co-location
   follows the class — "the builder needs the driver module" is never a placement reason. Prefill's
   prefill-only classes are convergence debt, not precedent.
+- **Retired: the single-pass whisper-decoder attention (`MetalWdecAttn`/`enc_wdec_attn`)** —
+  deleted in the metal-asr review round (2026-08-17, the `bbatkin/metal-asr` PR; the kernel is
+  in git history). The chunked part/comb pair replaced it during bring-up (1470→709 ms on the
+  turbo decode) and its `float[1504]` tgmem bound was the only reason for the driver's old
+  ta/n_text_ctx≤1504 shape cap, which left with it.
 - **Ledgered kernel-binding asymmetries** — a REVIEW rule firing on one of these is expected, and
   this entry is the sanction: the moe mul_mm TENSOR twins (`MetalMoeMulMmQ8T` /
   `MetalMoeMulMmMx4T`) keep the pre-family compact kargs slots while their base classes bind the
@@ -215,7 +235,9 @@ that a question answered for one backend has an obvious address in the other. Th
 - **`dasllama_gpu_tier.das`** — the device-cooperation SPI: hook types, install/unset slots,
   route/mark/want/status state, engine-facing forwarders. Vulkan implements it (per-op offload plus
   resident plumbing); Metal deliberately does not, because UMA makes residency moot there and Metal
-  integrates as a whole-forward driver through common's override registries.
+  integrates as a whole-forward driver through common's override registries (the ASR-decoder
+  driver is the one exception: whisper is not a `Model`, so its hooks are family registries in
+  `dasllama_whisper`, same decline contract).
 - **`dasllama_gpu_resident.das`** — the WHOLE-MODEL residency rail: bake the device layout offline
   into the flavor image, upload a model's stacks to the tier, and drive decode/prefill entirely on
   device. It is device-AGNOSTIC — it holds no device call and requires no GPU module, reaching the
@@ -314,7 +336,8 @@ on a shared path is the anti-pattern. Only a genuinely new dataflow earns its ow
   letterbox resize (aspect-preserving bilinear onto a centered black canvas), u8→f32 normalize,
   and the `DASLLAMA_VISION_DUMP` PPM writer. The only preprocessing home.
 - **`dasllama_vision_io.das`** — image decode to RGB8, from a file or a byte blob. The only file
-  that talks to stbimage; optional, like `dasllama_audio_io` — the facade takes decoded pixels.
+  that talks to stbimage; re-exported by the facade (like `dasllama_audio_io`) so consumers
+  decode through one seam — the engine itself takes decoded pixels.
 - **`dasllama_gemma4uv.das`** — the gemma4uv embedder (gemma-4 dense): mmproj load and the
   im2col → LayerNorm → GEMM → position-table → projection forward. One file per vision
   projector family, following the audio tower pattern; shared pieces move up, never sideways.
@@ -334,13 +357,25 @@ command, not archaeology.
 - **`dasllama_parity.das`** — CPU-reference caches for the parity instruments. Test-facing, but
   library-side because the caches outlive a single suite.
 - **`dasllama_prefix.das`** — the prefix/page cache for evaluated token history.
-- **`performance/fetch_models.das`** — the committed model-provenance manifest: per catalog
-  file, the exact HF repo + revision pin + sha256, or the on-box conversion recipe. Verify by
-  default, `--fetch` downloads; it never converts, never benches, and it touches no tune
-  state (`tune_policy(missing="fallback")`). BRINGUP.md §2 is the runbook.
-- **`performance/exchange_schema.das`** — engine-free validation for exchange submissions
+- **`dasllama_lint.das`** — the facade boundary as a compile-time lint (DASLLAMA001): every
+  engine module carries it, so a consumer requiring anything under `modules/dasLLAMA/` but the
+  entry modules (facade, scheduler, exchange pair) fails to compile. Escape:
+  `options _dasllama_internal = true` — engine files, this module's own tests/harnesses/
+  benchmarks/rigs, and the ruled consumers: `utils/dasllama-convert` (the bake tool reads
+  the mint rail), `utils/dasllama-server/test_openai_server*.das` (env-registry test knobs),
+  `modules/dasLLVM/daslib/llvm_user_modules.das` + `modules/dasLLVM/tests/test_{grid,tune,tuned}.das`
+  (the tune-generator contract).
+- **`performance/model_specs.das`** — the ONE model-set table: per carrier, the profiled-
+  catalog fields, the official-board flag, the provenance pin (exact HF repo + revision +
+  sha256, or the on-box conversion recipe; companions hang off their owning entry), and the
+  frozen parity evidence as data (pinned ids + arms). `llm_catalog` / `official_catalog` /
+  `models_provenance` are views over it.
+- **`performance/fetch_models.das`** — the fetch/verify driver over the provenance view.
+  Verify by default, `--fetch` downloads; it never converts on `--fetch`, never benches, and
+  it touches no tune state (`tune_policy(missing="fallback")`). BRINGUP.md §2 is the runbook.
+- **`dasllama/dasllama_exchange_schema.das`** — engine-free validation for exchange submissions
   (record stores + tune sidecars); the dasllama.io ladder service builds on it.
-- **`performance/exchange_client.das`** — the sidecar-exchange client: the boot-time
+- **`dasllama/dasllama_exchange.das`** — the sidecar-exchange client (a sanctioned public entry point): the boot-time
   lookup/apply (llvm_tune's scope resolver — a verified per-box match downloads instead of a
   ~20-minute tune), the privacy-stripped submit rails, and the control-page surface
   dasllama-server serves at `/exchange`.

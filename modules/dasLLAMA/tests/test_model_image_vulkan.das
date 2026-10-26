@@ -1,6 +1,7 @@
 options gen2
 options persistent_heap
 options stack = 524288   // every dasLLAMA program root takes this budget (options stack does not unify up from libs)
+options _dasllama_internal = true
 
 require dastest/testing_boost public
 require dasllama/dasllama   // nolint:STYLE030,LINT019 — umbrella fires each arch [init] registration; used only inside the vulkan static_if half
@@ -107,7 +108,7 @@ def test_vulkan_inline_bake(tst : T?) {
             remove(img_p)
             var a = Model()
             with_job_que() {
-                a <- load_model_cached(path, QuantMode.q8)   // the move must sit inside with_job_que
+                a <- load_model_cached(path, QuantMode.q8)   // nolint:PERF030,LINT019 -- the move must sit inside with_job_que; the target is fresh-empty, so nothing drops
             }
             t |> success(a.image_map != null, "the cold cached load serves an image")
             t |> success(stat(img_v).is_valid, "the vulkan flavor was baked")
