@@ -11,7 +11,6 @@ require ?vulkan dasllama/dasllama_vulkan_decode   // rd_routed_slots_fit - the N
 require dasllama/dasllama_metal_shapes   // moe_metal_ok - the Metal routed block's admission, portable
 require strings
 require daslib/strings_boost
-require _compares   // panic_text_of: a panic's text read back
 require daslib/enum_trait   // the format-set drift guard walks the whole KqFmt enum
 
 [unused_argument(rows)]
@@ -40,8 +39,6 @@ def private shell(n_layers : int64; recr_mask : uint64) : Model {
     return <- m
 }
 
-def private says(s : string; part : string) : bool => find(s, part) >= 0
-
 [test]
 def test_resident_unserved_features(t : T?) {
     t |> run("a plain dense config has no unserved feature") @(t : T?) {
@@ -58,8 +55,8 @@ def test_resident_unserved_features(t : T?) {
         t |> equal(resident_unserved_features(c), "")
         c.qk_norm = false
         let s = resident_unserved_features(c)
-        t |> success(says(s, "gated attention without qk-norm"), "gated attention named: {s}")
-        t |> success(says(s, "partial rotary (64 of 256) without qk-norm"), "partial rotary named with its widths: {s}")
+        t |> success(contains(s, "gated attention without qk-norm"), "gated attention named: {s}")
+        t |> success(contains(s, "partial rotary (64 of 256) without qk-norm"), "partial rotary named with its widths: {s}")
         t |> equal(length(split(s, ", ")), 2)
     }
     t |> run("one feature alone is one name, no separator") @(t : T?) {
@@ -123,7 +120,7 @@ def test_resident_layer_decline(t : T?) {
     t |> run("a recurrent layer without deltanet planes is named by number; the attention layers around it pass") @(t : T?) {
         var m <- shell(3l, 2ul)
         t |> equal(resident_layer_decline(m, 0l), "")
-        t |> success(says(resident_layer_decline(m, 1l), "layer 1 lacks a deltanet plane"), "layer 1 named")
+        t |> success(contains(resident_layer_decline(m, 1l), "layer 1 lacks a deltanet plane"), "layer 1 named")
         t |> equal(resident_layer_decline(m, 2l), "")
         m.dnqkv_offs <- [-1l, 0l, -1l]
         m.dngate_offs <- [-1l, 0l, -1l]
@@ -136,13 +133,13 @@ def test_resident_layer_decline(t : T?) {
         m.dngate_fmt <- [KqFmt.q8, KqFmt.k4, KqFmt.q8]
         m.dnout_fmt <- [KqFmt.q8, KqFmt.q8, KqFmt.q8]
         let sq = resident_layer_decline(m, 1l)
-        t |> success(!says(sq, "kq-tagged") && !says(sq, "do not serve"), "a K-quant qkv/z pair is no format decline: '{sq}'")
+        t |> success(!contains(sq, "kq-tagged") && !contains(sq, "do not serve"), "a K-quant qkv/z pair is no format decline: '{sq}'")
         m.dnout_fmt <- [KqFmt.q8, KqFmt.k4, KqFmt.q8]
         let so = resident_layer_decline(m, 1l)
-        t |> success(!says(so, "out plane"), "a K-quant out plane is no format decline: '{so}'")
+        t |> success(!contains(so, "out plane"), "a K-quant out plane is no format decline: '{so}'")
         //! an inner width off the format's block leaves the out plane untileable - the decline names it
         m.config.ssm_d_inner = 100l
-        t |> success(says(resident_layer_decline(m, 1l), "layer 1's deltanet out plane carries a format"), "an untileable out plane is named")
+        t |> success(contains(resident_layer_decline(m, 1l), "layer 1's deltanet out plane carries a format"), "an untileable out plane is named")
         delete m
     }
     t |> run("shared K/V, a missing plane and a head size off the kernels' shape each name the layer; a differing FFN width or a sliding window is served") @(t : T?) {
@@ -150,14 +147,14 @@ def test_resident_layer_decline(t : T?) {
         m.kv_src[2] = 1l
         t |> equal(resident_layer_decline(m, 2l), "", "a layer sharing the K/V of a layer below it is served (Q only, the donor's rows)")
         m.kv_src[1] = 2l
-        t |> success(says(resident_layer_decline(m, 1l), "layer 1 shares layer 2's K/V, a layer above it"), "a donor above the sharing layer is named")
+        t |> success(contains(resident_layer_decline(m, 1l), "layer 1 shares layer 2's K/V, a layer above it"), "a donor above the sharing layer is named")
         m.kv_src[1] = 1l
         m.kv_src[2] = 2l
         m.wq_offs[0] = -1l
-        t |> success(says(resident_layer_decline(m, 0l), "layer 0 lacks a q/k plane"), "missing plane named")
+        t |> success(contains(resident_layer_decline(m, 0l), "layer 0 lacks a q/k plane"), "missing plane named")
         m.wq_offs[0] = 0l
         m.wv_offs[0] = -1l
-        t |> success(says(resident_layer_decline(m, 0l), "layer 0 lacks a v plane"), "a missing v plane is named where the layer is not V-from-K")
+        t |> success(contains(resident_layer_decline(m, 0l), "layer 0 lacks a v plane"), "a missing v plane is named where the layer is not V-from-K")
         m.config.v_from_k_mask = 1ul
         t |> equal(resident_layer_decline(m, 0l), "", "a V-from-K layer needs no v plane: V is its k row at its own rms")
         m.ffn_w <- [64l, 96l, 64l]
@@ -168,9 +165,9 @@ def test_resident_layer_decline(t : T?) {
         m.config.head_size = 512l
         t |> equal(resident_layer_decline(m, 1l), "", "a 512 head is served (two elements a thread)")
         m.config.head_size = 544l
-        t |> success(says(resident_layer_decline(m, 1l), "layer 1 head size 544"), "a head past the kernels' 512 is named by layer")
+        t |> success(contains(resident_layer_decline(m, 1l), "layer 1 head size 544"), "a head past the kernels' 512 is named by layer")
         m.config.head_size = 40l
-        t |> success(says(resident_layer_decline(m, 1l), "layer 1 head size 40"), "a head off the 32-multiple is named by layer")
+        t |> success(contains(resident_layer_decline(m, 1l), "layer 1 head size 40"), "a head off the 32-multiple is named by layer")
         delete m
     }
     t |> run("a MoE layer's dense width is its shared expert's; a layer past the dense lead without expert planes is named") @(t : T?) {
@@ -187,7 +184,7 @@ def test_resident_layer_decline(t : T?) {
         t |> success(!layer_is_moe(m, 0l) && layer_is_moe(m, 1l) && !layer_is_moe(m, 2l), "a layer routes only past the dense lead with all three expert planes")
         t |> equal(resident_dense_width(m, 0l), 64l, "the dense-lead layer's width is its FFN's")
         t |> equal(resident_dense_width(m, 1l), 512l, "an MoE layer's width is the shared expert's")
-        t |> success(says(resident_layer_decline(m, 2l), "layer 2 lacks an expert plane"), "a layer past the dense lead without its expert planes is named")
+        t |> success(contains(resident_layer_decline(m, 2l), "layer 2 lacks an expert plane"), "a layer past the dense lead without its expert planes is named")
         t |> equal(resident_layer_decline(m, 0l), "", "the dense-lead layer's own width is its registration's, whatever the shared expert's")
         delete m
     }
@@ -208,13 +205,13 @@ def test_resident_unserved_moe_features(t : T?) {
         c.moe_router_bias = true
         c.moe_exp_probs = true
         let s = resident_unserved_features(c)
-        t |> success(!says(s, "router bias") && says(s, "an expert selection bias"), "the router bias is served (the select adds it), the expert selection bias named: {s}")
+        t |> success(!contains(s, "router bias") && contains(s, "an expert selection bias"), "the router bias is served (the select adds it), the expert selection bias named: {s}")
         c.moe_router_bias = false
         c.moe_exp_probs = false
         c.n_expert = 300l
         c.n_expert_used = 70l
         let g = resident_unserved_features(c)
-        t |> success(says(g, "300 experts") && says(g, "70 routed experts"), "the kernels' reach named with the counts: {g}")
+        t |> success(contains(g, "300 experts") && contains(g, "70 routed experts"), "the kernels' reach named with the counts: {g}")
         c.n_expert = 60l
         c.n_expert_used = 4l
         c.moe_exps_bias = true
@@ -277,11 +274,11 @@ def test_moe_metal_expert_formats(t : T?) {
     t |> run("the resident driver names a biased expert stack feeding a K-quant down plane by layer; a per-32 down plane draws no such decline") @(t : T?) {
         var kb <- moe_shell(KqFmt.k6)
         kb.config.moe_exps_bias = true
-        t |> success(says(resident_layer_decline(kb, 0l), "layer 0's biased expert stacks feed a K-quant down plane"), "the biased K-quant down is named")
+        t |> success(contains(resident_layer_decline(kb, 0l), "layer 0's biased expert stacks feed a K-quant down plane"), "the biased K-quant down is named")
         delete kb
         var qb <- moe_shell(KqFmt.q8)
         qb.config.moe_exps_bias = true
-        t |> success(!says(resident_layer_decline(qb, 0l), "biased expert stacks"), "a biased stack over a Q8_0 down plane draws no bias decline")
+        t |> success(!contains(resident_layer_decline(qb, 0l), "biased expert stacks"), "a biased stack over a Q8_0 down plane draws no bias decline")
         delete qb
     }
     t |> run("the kernel roster and the site-alignment gate name ONE format set - every KqFmt reads the same on both") @(t : T?) {
@@ -379,6 +376,30 @@ def test_resident_region_ctx(t : T?) {
 }
 
 [test]
+def test_resident_fit_ctx(t : T?) {
+    t |> run("a plan past its room shortens to the context the room holds: a block codec's shadow shortens with the mirror") @(t : T?) {
+        let mb = 1_048_576l
+        let asked = 100000l
+        let kv_pos = 3456l          // 24 layers' K and V rows of 128 elements at tq4's 18 bytes a 32-block
+        let shadow_pos = 512l       // both sides' rows of one layer as halves
+        let staged = 10l * mb
+        var plan = ResidentPlan(usable_bytes = 800l * mb, weight_bytes = 500l * mb, kv_bytes = asked * kv_pos, scratch_bytes = staged + asked * shadow_pos)
+        let room = 800l * mb - 500l * mb - staged
+        let want = (room / 8l * 7l) / (kv_pos + shadow_pos)
+        t |> equal(resident_fit_ctx(plan, asked, shadow_pos), want, "the room past the weights and the staged rows, over the mirror's and the shadow's bytes a position")
+        t |> success(want * (kv_pos + shadow_pos) <= room / 8l * 7l && (want + 1l) * (kv_pos + shadow_pos) > room / 8l * 7l, "the mirror and its shadow at that context fill the room less its slack, and one position more does not fit")
+        let shadow_whole = ((room - asked * shadow_pos) / 8l * 7l) / kv_pos
+        t |> success(want > shadow_whole, "the shadow charged whole at the asked context holds fewer positions ({shadow_whole} against {want})")
+        plan.scratch_bytes = staged
+        t |> equal(resident_fit_ctx(plan, asked, 0l), (room / 8l * 7l) / kv_pos, "a scalar codec has no shadow: the room over the mirror's bytes a position")
+        plan.hot_bytes = 100l * mb
+        t |> equal(resident_fit_ctx(plan, asked, 0l), ((room - 100l * mb) / 8l * 7l) / kv_pos, "the hot pool's bytes come off the room")
+        plan.weight_bytes = 900l * mb
+        t |> equal(resident_fit_ctx(plan, asked, 0l), 0l, "weights past the room: no context fits")
+    }
+}
+
+[test]
 def test_resident_binding_ctx(t : T?) {
     t |> run("the KV mirror's binding cap counts the attention layers' rows, whatever layer 0 is") @(t : T?) {
         let bcap = 4_294_967_295l   //! the 4 GiB maxStorageBufferRange of the NV/AMD drivers
@@ -390,6 +411,13 @@ def test_resident_binding_ctx(t : T?) {
         t |> equal(resident_binding_ctx(hy, KVDtype.f16, bcap), 262143l, "the hybrid's ctx is the range over eight attention rows, not skipped for layer 0's zero width")
         t |> equal(resident_binding_ctx(hy, KVDtype.f32, bcap), 131071l, "f32 rows halve it")
         t |> equal(resident_binding_ctx(hy, KVDtype.f16, 0l), 0l, "no cap known reads 0")
+        //! a block codec's kernels address bytes in 32 bits: past that many bytes the device's range no longer raises the context
+        let wide = 4l * BLOCK_CODEC_SIDE_BYTES
+        t |> equal(resident_binding_ctx(hy, KVDtype.q8_0, wide), resident_binding_ctx(hy, KVDtype.q8_0, BLOCK_CODEC_SIDE_BYTES), "a q8_0 mirror stops at the byte cap on a device that binds four times it")
+        t |> equal(resident_binding_ctx(hy, KVDtype.tq4, wide), resident_binding_ctx(hy, KVDtype.tq4, BLOCK_CODEC_SIDE_BYTES), "... and a tq4 mirror")
+        t |> equal(resident_binding_ctx(hy, KVDtype.f16, wide), 4l * resident_binding_ctx(hy, KVDtype.f16, BLOCK_CODEC_SIDE_BYTES), "control: an f16 mirror, addressed by element, takes the wider range")
+        t |> success(resident_binding_ctx(hy, KVDtype.tq4, bcap) > resident_binding_ctx(hy, KVDtype.q8_0, bcap)
+            && resident_binding_ctx(hy, KVDtype.q8_0, bcap) > resident_binding_ctx(hy, KVDtype.f16, bcap), "under the cap one range holds more tq4 positions than q8_0, and more q8_0 than f16")
         delete hy
         var dense <- shell(32l, 0ul)
         dense.config.n_kv_heads = 8l
@@ -403,6 +431,73 @@ def test_resident_binding_ctx(t : T?) {
         var recr <- shell(4l, 0xFul)
         t |> equal(resident_binding_ctx(recr, KVDtype.f16, bcap), 0l, "no attention layer reads 0")
         delete recr
+    }
+    t |> run("a block codec's f16 shadow caps a region's context at one binding of the widest K/V row's halves") @(t : T?) {
+        let bcap = 4_294_967_295l
+        var hy <- shell(32l, 0x7777_7777ul)
+        hy.config.n_kv_heads = 8l
+        hy.config.head_size = 128l   // a 1024-wide K/V row: 2048 B of halves a position
+        t |> equal(resident_shadow_ctx(hy, KVDtype.q8_0, bcap), 2097151l, "the range over one layer's row as halves, whatever the layer count")
+        t |> equal(resident_shadow_ctx(hy, KVDtype.tq4, bcap), 2097151l, "the shadow is the same halves under tq4")
+        t |> equal(resident_shadow_ctx(hy, KVDtype.f16, bcap), 0l, "control: a scalar codec has no shadow, so no cap")
+        t |> equal(resident_shadow_ctx(hy, KVDtype.q8_0, 0l), 0l, "no cap known reads 0")
+        hy.config.head_size = 256l
+        t |> equal(resident_shadow_ctx(hy, KVDtype.q8_0, bcap), 1048575l, "a row twice as wide halves it")
+        delete hy
+        var recr <- shell(4l, 0xFul)
+        t |> equal(resident_shadow_ctx(recr, KVDtype.q8_0, bcap), 0l, "no attention layer reads 0")
+        delete recr
+    }
+}
+
+[test]
+def test_resident_mirror_codec_ask(t : T?) {
+    t |> run("a block codec's geometry: whole 32-blocks a row and a head, a power-of-two head under tq4") @(t : T?) {
+        var m <- shell(2l, 0ul)
+        t |> success(empty(kv_codec_geometry_why(m.config, KVDtype.q8_0)) && empty(kv_codec_geometry_why(m.config, KVDtype.tq4)), "a 32-wide head holds both block codecs")
+        m.config.head_size = 96l
+        t |> success(empty(kv_codec_geometry_why(m.config, KVDtype.q8_0)), "a 96-wide head is whole blocks: q8_0 holds it")
+        t |> success(find(kv_codec_geometry_why(m.config, KVDtype.tq4), "power-of-two head_size") >= 0, "tq4 names the head it cannot rotate")
+        m.config.head_size = 48l
+        t |> success(find(kv_codec_geometry_why(m.config, KVDtype.q8_0), "multiples of 32") >= 0, "a 48-wide head is no whole block: q8_0 names it")
+        t |> success(empty(kv_codec_geometry_why(m.config, KVDtype.f16)), "a scalar codec holds any head")
+        delete m
+    }
+    t |> run("the mirror codec the plan arms: the ask where the model holds it, f16 where it does not, f16 for an f32 ask") @(t : T?) {
+        let pin0 = gpu_kv_dtype_pin_()
+        set_gpu_kv_dtype_(KVDtype.tq4)
+        if (resident_mirror_dtype() != KVDtype.tq4) {
+            t |> skip("the environment arms a {resident_mirror_dtype()} mirror over the ask (DASLLAMA_VK_KV32=1) - the cell needs that unset")
+        } else {
+            var m <- shell(2l, 0ul)
+            t |> equal(resident_mirror_dtype_of(m), KVDtype.tq4, "tq4 asked of a 32-wide head arms tq4")
+            m.config.head_size = 96l
+            t |> equal(resident_mirror_dtype_of(m), KVDtype.f16, "tq4 asked of a 96-wide head arms f16")
+            set_gpu_kv_dtype_(KVDtype.q8_0)
+            t |> equal(resident_mirror_dtype_of(m), KVDtype.q8_0, "control: q8_0 holds the same head")
+            set_gpu_kv_dtype_(KVDtype.f32)
+            t |> equal(resident_mirror_dtype(), KVDtype.f16, "an f32 ask arms f16: the f32 mirror is DASLLAMA_VK_KV32=1's alone")
+            reset_gpu_kv_dtype_()
+            t |> success(!gpu_kv_dtype_pin_().pinned, "the reset lifts the ask")
+            delete m
+        }
+        if (pin0.pinned) {
+            set_gpu_kv_dtype_(pin0.dt)
+        } else {
+            reset_gpu_kv_dtype_()
+        }
+    }
+    t |> run("a codec's spelling, in any case, and its ordinal across the tier's seam") @(t : T?) {
+        let upper = kv_dtype_named("Q8_0")
+        t |> success(upper.known && upper.dt == KVDtype.q8_0, "an upper-case spelling names the codec")
+        t |> success(kv_dtype_named("tq4").dt == KVDtype.tq4 && kv_dtype_named("f32").dt == KVDtype.f32 && kv_dtype_named("f16").known, "every codec has its spelling")
+        let bogus = kv_dtype_named("bogus")
+        t |> success(!bogus.known && bogus.dt == KVDtype.f16, "a spelling that names no codec reads f16, marked unknown")
+        t |> equal(kv_dtype_of(int(KVDtype.tq4)), KVDtype.tq4, "an ordinal names its codec")
+        let why = panic_text() $ {
+            kv_dtype_of(99)
+        }
+        t |> success(find(why, "no KVDtype has ordinal 99") >= 0, "an ordinal no codec carries panics by name: {why}")
     }
 }
 
@@ -764,7 +859,7 @@ def private round_seats_arm(pick, truth : int64; rollback_ok : bool) {
 def private round_under(name : string; var s : Session; m : Model; var hit : bool&) : string {
     let prev = active_decode_override()
     select_decode_override(name)
-    let why = panic_text_of() $ {
+    let why = panic_text() $ {
         var acc = 0l
         hit = mtp_spec_eval(m, s, ROUND_TOKEN, acc)
     }
@@ -784,13 +879,13 @@ def test_mtp_round_panics(t : T?) {
         var hit = false
         let asked = round_under(ROUND_SEATS, s, m, hit)
         to_log(LOG_INFO, "pick ask beside a sampled walk: {empty(asked) ? "no panic" : asked}\n")
-        t |> success(says(asked, "asked for a pick") && says(asked, "sample"), "a pick ask beside a sampled walk panics, naming both: '{asked}'")
+        t |> success(contains(asked, "asked for a pick") && contains(asked, "sample"), "a pick ask beside a sampled walk panics, naming both: '{asked}'")
         t |> equal(g_round_draft_calls, 0l, "the panic fired before the draft")
         s.spec_params = null
         s.pick_asked = false
         let declined = round_under(ROUND_SEATS, s, m, hit)
         to_log(LOG_INFO, "rollback seat declining after a served verify: {empty(declined) ? "no panic" : declined}\n")
-        t |> success(says(declined, "rollback seat declined a reject after its verify seat served") && says(declined, ROUND_SEATS), "the reject panics naming the override whose rollback seat declined: '{declined}'")
+        t |> success(contains(declined, "rollback seat declined a reject after its verify seat served") && contains(declined, ROUND_SEATS), "the reject panics naming the override whose rollback seat declined: '{declined}'")
         t |> equal(g_round_verify_calls, 1l, "the verify seat served the round")
         t |> equal(g_round_rollback_calls, 1l, "the rollback seat was asked once and declined")
         delete s
@@ -809,8 +904,8 @@ def test_mtp_verify_snapshot(t : T?) {
         t |> success(empty(why), "the round completed ({why})")
         t |> success(hit, "the fake verify's row-0 pick is the draft: the round accepted")
         t |> equal(s.n_past, 3l, "an accept commits the token and the draft")
-        t |> equal(long_length(s.mtp_snap_conv), ROUND_CONV, "recurrent, no rollback seat: the CPU snapshot ran before the seat - its conv buffer sized to the history")
-        t |> equal(long_length(s.mtp_snap_state), ROUND_STATE, "... and its state buffer to the state")
+        t |> equal(long_length(s.mtp_snap.conv), ROUND_CONV, "recurrent, no rollback seat: the CPU snapshot ran before the seat - its conv buffer sized to the history")
+        t |> equal(long_length(s.mtp_snap.state), ROUND_STATE, "... and its state buffer to the state")
         t |> equal(g_round_verify_calls, 1l, "the verify seat served")
         delete s
         delete m
@@ -818,7 +913,7 @@ def test_mtp_verify_snapshot(t : T?) {
         var ps <- round_session()
         let why_plain = round_under(ROUND_SEATS_NO_ROLLBACK, ps, plain, hit)
         t |> success(empty(why_plain) && hit, "the non-recurrent round completed and accepted ({why_plain})")
-        t |> equal(long_length(ps.mtp_snap_conv), 0l, "non-recurrent: no snapshot - nothing to restore")
+        t |> equal(long_length(ps.mtp_snap.conv), 0l, "non-recurrent: no snapshot - nothing to restore")
         round_seats_arm(5l, 7l, true)
         let why_reject = round_under(ROUND_SEATS_NO_ROLLBACK, ps, plain, hit)
         t |> success(empty(why_reject) && !hit, "the non-recurrent reject completed ({why_reject})")
@@ -832,7 +927,7 @@ def test_mtp_verify_snapshot(t : T?) {
         let why_rolled = round_under(ROUND_SEATS, rs, rm, hit)
         t |> success(empty(why_rolled) && !hit, "the recurrent reject through a serving rollback seat completed ({why_rolled})")
         t |> equal(g_round_rollback_calls, 1l, "the rollback seat served the reject")
-        t |> equal(long_length(rs.mtp_snap_conv), 0l, "a rollback seat behind the verify seat: no snapshot was taken")
+        t |> equal(long_length(rs.mtp_snap.conv), 0l, "a rollback seat behind the verify seat: no snapshot was taken")
         t |> equal(rs.n_past, 2l, "the reject commits the token alone")
         t |> equal(rs.mtp_h_pos1, 2l, "the carry's watermark sits at the token's row")
         t |> equal(rs.mtp_h[0], 0.25, "the carry re-seeds from the verify's row-0 hidden")

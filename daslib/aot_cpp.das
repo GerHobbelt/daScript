@@ -532,10 +532,6 @@ def public describeCppType(typeDecl : TypeDeclPtr;
     return describeCppTypeEx(typeDecl, cfg, CpptUseAlias.no);
 }
 
-def stackNewName(expr : ExpressionPtr) : string {
-    return "_stack_new_{expr.at.line:d}_{expr.at.column:d}";
-}
-
 def stackNewPointeeType(expr : ExpressionPtr; cross_platform : bool) : string {
     if (expr is ExprNew) {
         return describeCppType((expr as ExprNew).typeexpr, DescribeConfig(skip_ref = true, skip_const = true, cross_platform = cross_platform));
@@ -1298,16 +1294,20 @@ class public BlockVariableCollector : AstVisitor {
     def override preVisitExprMakeVariant(var expr : ExprMakeVariant?) {
         handleExpr(expr)
     }
+    def recordStackNew(var expr : Expression?) {
+        stackNew[getCurrentBlock()] |> push(expr)
+        if (!stackNewIds |> key_exists(expr)) {
+            stackNewIds |> insert(expr, length(stackNewIds))
+        }
+    }
     def override preVisitExprNew(var expr : ExprNew?) {
         if (expr.allocate_on_stack) {
-            let blk = getCurrentBlock();
-            stackNew[blk] |> push(expr);
+            recordStackNew(expr)
         }
     }
     def override preVisitExprAscend(var expr : ExprAscend?) {
         if (expr.ascendFlags.allocate_on_stack && !expr.ascendFlags.needTypeInfo) {
-            let blk = getCurrentBlock();
-            stackNew[blk] |> push(expr);
+            recordStackNew(expr)
         }
     }
     def override preVisitExprCall(var expr : ExprCall?) {
@@ -1333,6 +1333,7 @@ class public BlockVariableCollector : AstVisitor {
     @do_not_delete blockLets :  table<ExprBlock?, array<Variable?>>
     @do_not_delete localTemps : table<ExprBlock?, array<Expression?>>
     @do_not_delete stackNew :   table<ExprBlock?, array<Expression?>>
+    @do_not_delete stackNewIds : table<Expression?; int>
 
     rename : table<Variable?, string>
     moved : table<Variable?>
@@ -1701,6 +1702,9 @@ class public CppAot : AstVisitor {
             panic("we should not be here. we need stacktop for the name");
         }
         return "_temp_make_local_{expr.at.line:d}_{expr.at.column:d}_{local_temp_names |> get_value(expr):d}";
+    }
+    def stackNewName(expr : ExpressionPtr) {
+        return "_stack_new_{expr.at.line:d}_{expr.at.column:d}_{collector.stackNewIds |> get_value(expr):d}";
     }
     def override preVisitExprBlock(var blk : ExprBlock?) {
         push(scopes, blk);
@@ -2153,7 +2157,7 @@ class public CppAot : AstVisitor {
     def override preVisitExprOp2(var that : ExprOp2?) {
         if (!noBracket(that)) write(*ss, "(");
         if (needsOrderedOperands(that)) {
-            write(*ss, "[&](auto && __lr) \{ return ");
+            write(*ss, "das_ordered2([&](auto && __lr_left, auto && __lr_right) \{ return ");
             if (isOpPolicy2(that)) {
                 assume pt = opPolicyBase(that);
                 if (policyResultNeedCast(pt, that._type)) {
@@ -2163,17 +2167,17 @@ class public CppAot : AstVisitor {
                 }
                 outPolicy(pt);
                 write(*ss, "::{opPolicyName(that)}(");
-                writeOrderedPolicyArg(pt, that.left._type, "__lr.left");
+                writeOrderedPolicyArg(pt, that.left._type, "__lr_left");
                 write(*ss, ",");
-                writeOrderedPolicyArg(pt, that.right._type, "__lr.right");
+                writeOrderedPolicyArg(pt, that.right._type, "__lr_right");
                 write(*ss, ",*__context__,nullptr)");
                 if (policyResultNeedCast(pt, that._type)) {
                     write(*ss, ")");
                 }
             } else {
-                write(*ss, "(__lr.left {plainOp2Text(that)} __lr.right)");
+                write(*ss, "(__lr_left {plainOp2Text(that)} __lr_right)");
             }
-            write(*ss, "; \}(das_ordered2\{ ");
+            write(*ss, "; \}, [&]() \{ return ");
             return ;
         }
         if (!that.func.flags.builtIn || that.func.flags.callBased) {
@@ -2216,7 +2220,7 @@ class public CppAot : AstVisitor {
     }
     def override preVisitExprOp2Right(that : ExprOp2?; right : ExpressionPtr) {
         if (needsOrderedOperands(that)) {
-            write(*ss, ", ");
+            write(*ss, "; \}, [&]() \{ return ");
             return ;
         }
         if (!that.func.flags.builtIn || that.func.flags.callBased) {
@@ -2251,7 +2255,7 @@ class public CppAot : AstVisitor {
     }
     def override visitExprOp2(var that : ExprOp2?) : ExpressionPtr {
         if (needsOrderedOperands(that)) {
-            write(*ss, " \})");
+            write(*ss, "; \})");
             if (!noBracket(that)) {
                 write(*ss, ")");
             }

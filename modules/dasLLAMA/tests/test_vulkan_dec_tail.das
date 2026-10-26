@@ -6,13 +6,13 @@ module test_vulkan_dec_tail
 
 require dastest/testing_boost public
 require dasllama/dasllama_math
+require dasllama/dasllama_gpu_math
 require dasllama/dasllama_rope
 require dasllama/dasllama_common   // MoeGate, select_decode_override
 require dasllama/dasllama_blocks   // registers the vulkan_moe_span decode override at init
 require dasllama/dasllama_moe   // moe_select_core: the host select the span's device top-k mirrors
 require ?vulkan dasllama/dasllama_math_vulkan  // the decode attention block + FFN tail under test; the test installs the hooks explicitly (no env gate)
 require ?vulkan dasllama/dasllama_vulkan_decode   // vk_span_reset: the span records once per model, so the second span cell forgets the first's record
-require daslib/f16_cvt
 require math
 require _vk_kq_fixtures
 require _kq_fixtures   // q8_roundtrip: the feeds and requants the device quantizes, through the engine's quantizers
@@ -382,12 +382,8 @@ def private pair_cell(t : T?; f : Ffn; fmt : int; base : int64; tag : string; ne
     kb |> resize(2l * KVD * 2l)
     vb |> resize(2l * KVD * 2l)
     for (i in range64(2l * KVD)) {
-        let hk = f32_to_f16(qb.kmir[i])
-        let hv = f32_to_f16(qb.vmir[i])
-        kb[i * 2l] = uint8(hk & 0xFFu)
-        kb[i * 2l + 1l] = uint8((hk >> 8u) & 0xFFu)
-        vb[i * 2l] = uint8(hv & 0xFFu)
-        vb[i * 2l + 1l] = uint8((hv >> 8u) & 0xFFu)
+        put_f16(kb, i * 2l, qb.kmir[i])
+        put_f16(vb, i * 2l, qb.vmir[i])
     }
     unsafe {
         matmul_moe_gpu_attn_dec_hydrate(qa.woq, qa.fmt, addr<uint8 const?>(qa.kmir[0]), addr<uint8 const?>(qa.vmir[0]), 2l, KVD, false)
@@ -422,7 +418,7 @@ def private ffn_ref_sel(f : Ffn; fd : array<float>; idx : array<int64>; w : arra
         var hrow : array<float>
         hrow |> resize(NFE)
         for (i in range64(NFE)) {
-            hrow[i] = silu(gg[i]) * u[i]
+            hrow[i] = silu_f32(gg[i]) * u[i]
         }
         let hr <- q8_roundtrip(hrow, NFE, true)
         for (i in range64(N * NFE)) {
@@ -572,7 +568,7 @@ def private span_layer_ref_sh(var q : Quad; f : Ffn; sh : Shexp; router : array<
     for (i in range64(N)) {
         gl += sh.gate[li * N + i] * r.xb[i]
     }
-    let g = gated ? 1.0 / (1.0 + exp(-gl)) : 1.0
+    let g = gated ? sigmoid_f32(gl) : 1.0
     let fd <- feed_ref(x, f.norm, 1)
     let fd0 <- feed_ref(x, f.norm, 0)
     ffn_ref_sel(f, fd.deq, r.idx, r.w, x)
@@ -583,7 +579,7 @@ def private span_layer_ref_sh(var q : Quad; f : Ffn; sh : Shexp; router : array<
     var hrow : array<float>
     hrow |> resize(NFE)
     for (i in range64(NFE)) {
-        hrow[i] = silu(gg[i]) * u[i]
+        hrow[i] = silu_f32(gg[i]) * u[i]
     }
     let hr <- q8_roundtrip(hrow, NFE, false)
     var d : array<float>

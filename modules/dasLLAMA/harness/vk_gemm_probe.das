@@ -43,6 +43,7 @@ require dasllama/dasllama_kqformat
 require daslib/typemacro_boost
 require _vk_probe_fixture   // hash_word, cool_f16_pair: the synthetic planes both probes build
 require ../tests/_vkd_oracles.das   // k4f16_gemm_oracle: the CPU reference the khrx baseline arm is checked against
+require ../tests/_compares.das
 
 let private MM_TILE = 128
 let private DISPATCHES = 16
@@ -526,28 +527,6 @@ def private cm2_shape_upload(fmt : int; d, n, cnt : int; slab_blocks : int = 0; 
     return dv
 }
 
-//! one region of `cnt` rows for `wgs` workgroups: the schedule words the tile classes read at `map_off` 4, in a device buffer or in host memory (the prefill's `pf_meta` form)
-def private one_region_sched(cnt, wgs : int; host : bool = false; wblk0 : int = 0) : tuple<buf : uint64; bytes : int64> {
-    var sched : array<uint>
-    sched |> resize(4 + wgs)
-    sched[0] = uint(wblk0)
-    sched[2] = uint(cnt)
-    let sc_bytes = int64(4 + wgs) * 4l
-    var scd = 0ul
-    unsafe {
-        if (host) {
-            let hb = make_host_buf(sc_bytes, true)
-            memcpy(hb.mapped, addr<void?>(sched[0]), sc_bytes)
-            scd = hb.buf
-        } else {
-            scd = make_device_buf(sc_bytes)
-            upload_region_at(scd, 0l, addr<uint8 const?>(sched[0]), sc_bytes)
-        }
-    }
-    delete sched
-    return (buf = scd, bytes = sc_bytes)
-}
-
 [arch(at="../ARCHITECTURE_MEASUREMENT_VK_GEMM_PROBE.md#vk-gemm-probe")]
 //! `serial`: one hazard rail and one output plane across the dispatches, so a barrier separates them and the row reads a single dispatch's latency - the chain's cost - instead of the throughput of sixteen overlapping ones
 def private run_cm2_fmt_shape(fmt : int; name : string; d, n, cnt : int; l_stamp_only : bool = false; serial : bool = false) {
@@ -662,21 +641,9 @@ def private run_dec_small_kernels() {   // nolint:STYLE038 — one linear measur
         let hist_off = wnorm_off + ds
         let sm_n = hist_off + 2 * cd * taps
         let nblk = di / 32
-        var projh : array<float>
-        var sth : array<float>
-        var smh : array<float>
-        projh |> resize(cd + di)
-        sth |> resize(nvh * ds * ds)
-        smh |> resize(sm_n)
-        for (i in range(length(projh))) {
-            projh[i] = float((i * 23) % 71) * 0.03 - 1.0
-        }
-        for (i in range(length(sth))) {
-            sth[i] = float((i * 13) % 53) * 0.02 - 0.5
-        }
-        for (i in range(sm_n)) {
-            smh[i] = float((i * 17) % 43) * 0.02 - 0.4
-        }
+        var projh <- row_fill(cd + di, 23, 0, 0.03, 1.0, 71)
+        var sth <- row_fill(nvh * ds * ds, 13, 0, 0.02, 0.5, 53)
+        var smh <- row_fill(sm_n, 17, 0, 0.02, 0.4, 43)
         for (i in range(nvh)) {
             smh[a_off + i] = -0.4 - float(i) * 0.1
         }
@@ -1112,13 +1079,9 @@ def private run_k4_shape(name : string; d, n, cnt : int) {   // nolint:STYLE038 
             let ttile = v == 1 ? 128 : (v == 3 ? 32 : 256)
             let wtile = v == 3 ? 32 : 128
             let wgs = ((cnt + ttile - 1) / ttile) * ((d + wtile - 1) / wtile)
-            var sched : array<uint>
-            sched |> resize(4 + wgs)
-            sched[2] = uint(cnt)
-            let sc_bytes = int64(4 + wgs) * 4l
-            let scd = make_device_buf(sc_bytes)
-            upload_region_at(scd, 0l, addr<uint8 const?>(sched[0]), sc_bytes)
-            delete sched
+            let sched = one_region_sched(cnt, wgs)
+            let scd = sched.buf
+            let sc_bytes = sched.bytes
             var raw = alloc_cmd()
             let begin = VkCommandBufferBeginInfo()
             vk_check(vkBeginCommandBuffer(raw, begin), null)
@@ -1825,15 +1788,8 @@ def private read_back_y(var raw : VkCommandBuffer; dev : uint64; bytes : int64; 
     submit_wait(raw)
     out |> resize(bytes / 4l)
     var host = make_host_buf(bytes, true, [cached = true])
-    var rc = alloc_cmd()
-    let begin = VkCommandBufferBeginInfo()
-    vk_check(vkBeginCommandBuffer(rc, begin), null)
-    cmd_copy_whole(rc, dev, host.buf, bytes)
-    vk_check(vkEndCommandBuffer(rc), null)
-    submit_wait(rc)
-    unsafe {
-        memcpy(addr<void?>(out[0]), host.mapped, bytes)
-    }
+    readback_range(dev, 0u, host, unsafe(addr(out[0])), bytes)
+    destroy_host_buf(host)
 }
 
 def private max_rel_diff(a, b : array<float>) : double {
@@ -2041,13 +1997,9 @@ def private run_khr_shape(name : string; d, n, cnt : int; prof : bool = false) {
             }
             let tile = v == KHR_ARM_KQ ? 32 : 128
             let wgs = ((cnt + tile - 1) / tile) * ((d + tile - 1) / tile)
-            var sched : array<uint>
-            sched |> resize(4 + wgs)
-            sched[2] = uint(cnt)
-            let sc_bytes = int64(4 + wgs) * 4l
-            let scd = make_device_buf(sc_bytes)
-            upload_region_at(scd, 0l, addr<uint8 const?>(sched[0]), sc_bytes)
-            delete sched
+            let sched = one_region_sched(cnt, wgs)
+            let scd = sched.buf
+            let sc_bytes = sched.bytes
             var sa = khr_arm_set(v, fmt, wqd, wsd, scd, xfd, xqd, axsd, yd, wq_bytes, ws_bytes, sc_bytes, xf_bytes, xq_bytes, axs_bytes, y_bytes)
             var sb = khr_arm_set(v, fmt, wqd, wsd, scd, xfd, xqd, axsd, yd2, wq_bytes, ws_bytes, sc_bytes, xf_bytes, xq_bytes, axs_bytes, y_bytes)
             var raw = alloc_cmd()
@@ -2607,13 +2559,9 @@ def private run_mmq_shape(name : string; d, n, cnt : int) {   // nolint:STYLE038
             let ttile = v == 0 ? 32 : 64
             let wtile = v == 2 ? 128 : (v >= 3 ? 64 : 32)
             let wgs = ((cnt + ttile - 1) / ttile) * ((d + wtile - 1) / wtile)
-            var sched : array<uint>
-            sched |> resize(4 + wgs)
-            sched[2] = uint(cnt)
-            let sc_bytes = int64(4 + wgs) * 4l
-            let scd = make_device_buf(sc_bytes)
-            upload_region_at(scd, 0l, addr<uint8 const?>(sched[0]), sc_bytes)
-            delete sched
+            let sched = one_region_sched(cnt, wgs)
+            let scd = sched.buf
+            let sc_bytes = sched.bytes
             let gbits = fixed_array(1u, 2u, 0u, 4u, 8u, 16u)
             let asizes = fixed_array(wq_bytes, ws_bytes, sc_bytes, xq_bytes, axs_bytes, y_bytes)
             var sa = mmq_arm_set(v, fmt, fixed_array(wqd, wsd, scd, xqd, axsd, yd), asizes, gbits)
@@ -2716,13 +2664,9 @@ def private run_k6_shape(name : string; d, n, cnt : int; bisect : bool = false) 
             let ttile = v == 1 ? 128 : (v == 3 ? 32 : 256)
             let wtile = v == 3 ? 32 : 128
             let wgs = ((cnt + ttile - 1) / ttile) * ((d + wtile - 1) / wtile)
-            var sched : array<uint>
-            sched |> resize(4 + wgs)
-            sched[2] = uint(cnt)
-            let sc_bytes = int64(4 + wgs) * 4l
-            let scd = make_device_buf(sc_bytes)
-            upload_region_at(scd, 0l, addr<uint8 const?>(sched[0]), sc_bytes)
-            delete sched
+            let sched = one_region_sched(cnt, wgs)
+            let scd = sched.buf
+            let sc_bytes = sched.bytes
             var raw = alloc_cmd()
             let begin = VkCommandBufferBeginInfo()
             vk_check(vkBeginCommandBuffer(raw, begin), null)
@@ -2824,9 +2768,6 @@ def private run_shape(name : string; d, n, cnt : int; with_sdot4_mm : bool = tru
     let xsd = make_device_buf(xs_bytes)
     let xfd = make_device_buf(xf_dev_bytes)
     let yd = make_device_buf(y_bytes)
-    var sched : array<uint>
-    sched |> resize(4 + wgs)
-    sched[2] = uint(cnt)   // one region: [wblk0 = 0, row0 = 0, cnt, wg0 = 0], map all zeros
     var per_us : double
     var cm2l_us = 0.0lf
     var cm2m_us = 0.0lf
@@ -2838,9 +2779,9 @@ def private run_shape(name : string; d, n, cnt : int; with_sdot4_mm : bool = tru
         upload_region_at(xqd, 0l, addr<uint8 const?>(b.xq[0]), xq_bytes)
         upload_region_at(xsd, 0l, addr<uint8 const?>(b.xs[0]), xs_bytes)
         upload_region_at(xfd, 0l, addr<uint8 const?>(b.xf[0]), xf_bytes)
-        let sc_bytes = int64(4 + wgs) * 4l
-        let scd = make_device_buf(sc_bytes)
-        upload_region_at(scd, 0l, addr<uint8 const?>(sched[0]), sc_bytes)
+        let sched = one_region_sched(cnt, wgs)
+        let scd = sched.buf
+        let sc_bytes = sched.bytes
         let bufs = fixed_array(wqd, wsd, scd, xqd, xsd, yd)
         let sizes = fixed_array(wq_bytes, ws_bytes, sc_bytes, xq_bytes, xs_bytes, y_bytes)
         let gbits = fixed_array(1u, 2u, 0u, 4u, 8u, 16u)
@@ -2898,7 +2839,6 @@ def private run_shape(name : string; d, n, cnt : int; with_sdot4_mm : bool = tru
         print("{name}: cm2l wgs={lwgs}  {cm2l_us / 1000.0lf} ms/dispatch  {ltf} TFLOP/s  timing-only\n")
         print("{name}: cm2m wgs={mwgs}  {cm2m_us / 1000.0lf} ms/dispatch  {mtf} TFLOP/s  timing-only\n")
     }
-    delete sched
     delete b
 }
 
@@ -2926,9 +2866,6 @@ def private run_shape_split(name : string; d, n, cnt, nsplit : int; khr : bool =
         delete b
         return
     }
-    var sched : array<uint>
-    sched |> resize(4 + lwgs)
-    sched[2] = uint(cnt)   // one region: [wblk0 = 0, row0 = 0, cnt, wg0 = 0], map all zeros; the tile reads its split plane and tile off its own workgroup id
     var cm2l_us : double
     var cm2m_us : double
     var red_us : double
@@ -2937,9 +2874,9 @@ def private run_shape_split(name : string; d, n, cnt, nsplit : int; khr : bool =
         upload_region_at(wqd, 0l, addr<uint8 const?>(b.wq[0]), wq_bytes)
         upload_region_at(wsd, 0l, addr<uint8 const?>(b.ws[0]), ws_bytes)
         upload_region_at(xfd, 0l, addr<uint8 const?>(b.xf[0]), xf_bytes)
-        let sc_bytes = int64(4 + lwgs) * 4l
-        let scd = make_device_buf(sc_bytes)
-        upload_region_at(scd, 0l, addr<uint8 const?>(sched[0]), sc_bytes)
+        let sched = one_region_sched(cnt, lwgs)   // the tile reads its split plane and tile off its own workgroup id
+        let scd = sched.buf
+        let sc_bytes = sched.bytes
         let cbufs = fixed_array(wqd, wsd, scd, xfd, yd)
         let csizes = fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_dev_bytes, y_bytes)
         let cgbits = fixed_array(1u, 2u, 0u, 4u, 16u)
@@ -2993,7 +2930,6 @@ def private run_shape_split(name : string; d, n, cnt, nsplit : int; khr : bool =
         print("{name} split{nsplit} (chunk {ck}): cm2m wgs={mwgs}  {cm2m_us / 1000.0lf} ms/dispatch  {flop / (cm2m_us * 1000000.0lf)} TFLOP/s  timing-only\n")
     }
     print("{name} split{nsplit} (chunk {ck}): reduce {red_us} us, {khr ? "tile" : "l"} + reduce chained {chain_us} us  timing-only\n")
-    delete sched
     delete b
 }
 
@@ -3167,16 +3103,14 @@ def private run_lastwg(dim : int) {   // nolint:STYLE038 — one linear measurem
     let wnd = make_device_buf(nb)
     var wh : array<float>
     var wnh : array<float>
-    var x0 : array<float>
+    var x0 <- row_fill(dim, 1, 0, 0.001, -0.5, 17)
     wh |> resize(dim * dim)
     wnh |> resize(dim)
-    x0 |> resize(dim)
     for (i in range(dim * dim)) {
         wh[i] = (float(hash_word(uint(i) + 3u) % 2001u) - 1000.0) * 0.00005 / float(dim) * 1152.0
     }
     for (i in range(dim)) {
         wnh[i] = 0.9 + 0.2 * float(i % 7) / 7.0
-        x0[i] = 0.001 * float(i % 17) + 0.5
     }
     unsafe {
         upload_region_at(wd, 0l, addr<uint8 const?>(wh[0]), w_bytes)
@@ -3277,11 +3211,7 @@ def private run_barrier_forms(dim : int) {
     let ad = make_device_buf(nb)
     let wnd = make_device_buf(nb)
     let yd = make_device_buf(nb)
-    var ones : array<float>
-    ones |> resize(dim)
-    for (i in range(dim)) {
-        ones[i] = 0.001 * float(i % 17) + 0.5
-    }
+    var ones <- row_fill(dim, 1, 0, 0.001, -0.5, 17)
     unsafe {
         upload_region_at(xd, 0l, addr<uint8 const?>(ones[0]), nb)
         upload_region_at(ad, 0l, addr<uint8 const?>(ones[0]), nb)
@@ -3351,7 +3281,7 @@ def private probe_barrier(raw : VkCommandBuffer; form : int; buf : uint64; bytes
     }
 }
 
-//! the token command's small-kernel floor: the add+rms step (`cls_ar`) and its fused requant twin (`cls_ar_rq`) at
+//! the token command's small-kernel floor: the add+rms step (`cls_ar`) and its fused requant twin (`cls_ar_rq_b`) at
 //! a row width, 64 dispatches chained through the hazard rail (each reads what the last wrote, a barrier between)
 //! against the same 64 with no dependency declared - the per-dispatch cost of a one-workgroup row kernel, with
 //! and without the barrier
@@ -3363,17 +3293,13 @@ def private run_small_kernels(dim : int) {
     let yd = make_device_buf(nb)
     let xqd = make_device_buf(int64(dim))
     let xsd = make_device_buf(int64(dim / 32) * 4l)
-    var ones : array<float>
-    ones |> resize(dim)
-    for (i in range(dim)) {
-        ones[i] = 0.001 * float(i % 17) + 0.5
-    }
+    var ones <- row_fill(dim, 1, 0, 0.001, -0.5, 17)
     unsafe {
         upload_region_at(xd, 0l, addr<uint8 const?>(ones[0]), nb)
         upload_region_at(ad, 0l, addr<uint8 const?>(ones[0]), nb)
         upload_region_at(wnd, 0l, addr<uint8 const?>(ones[0]), nb)
     }
-    verify(ensure_cls_ar() && ensure_cls_ar_rq(), "the add+rms class rails must engage")
+    verify(ensure_cls_ar() && ensure_cls_ar_rq_b(), "the add+rms class rails must engage")
     var pc = ArArgs(dim = uint(dim), add_on = 1u, woff = 0u, eps = 1.0e-6, ascale = 1.0)
     let begin = VkCommandBufferBeginInfo()
     for (dep in range(2)) {
@@ -3387,16 +3313,16 @@ def private run_small_kernels(dim : int) {
         }
         vk_check(vkEndCommandBuffer(raw), null)
         let us = usec_per_dispatch(raw)
-        var scq = set_cls_ar_rq(fixed_array(xd, ad, wnd, xqd, xsd), fixed_array(nb, nb, nb, int64(dim), int64(dim / 32) * 4l), fixed_array(bit, 0u, 0u, 2u * bit, 2u * bit))
+        var scq = set_cls_ar_rq_b(fixed_array(xd, ad, wnd, xqd, xsd), fixed_array(nb, nb, nb, int64(dim), int64(dim / 32) * 4l), fixed_array(bit, 0u, 0u, 2u * bit, 2u * bit))
         var rawq = alloc_cmd()
         vk_check(vkBeginCommandBuffer(rawq, begin), null)
         var hzq : VkHaz
         for (_k in range(DISPATCHES)) {
-            enc_cls_ar_rq(rawq, hzq, scq, pc, 1l)
+            enc_cls_ar_rq_b(rawq, hzq, scq, pc, 1l)
         }
         vk_check(vkEndCommandBuffer(rawq), null)
         let usq = usec_per_dispatch(rawq)
-        print("small dim={dim} {dep == 1 ? "chained (barrier between)" : "independent"}: cls_ar {us} us/dispatch, cls_ar_rq {usq} us/dispatch | timing-only\n")
+        print("small dim={dim} {dep == 1 ? "chained (barrier between)" : "independent"}: cls_ar {us} us/dispatch, cls_ar_rq_b {usq} us/dispatch | timing-only\n")
     }
     delete ones
 }
@@ -3418,17 +3344,14 @@ def private run_cm2x_shape(name : string; d, n, cnt : int) {   // nolint:STYLE03
     let xfd = make_device_buf(xf_bytes)
     let yd = make_device_buf(y_bytes)
     let lwgs = ((cnt + 255) / 256) * ((d + 127) / 128)
-    var sched : array<uint>
-    sched |> resize(4 + lwgs)
-    sched[2] = uint(cnt)
     let flop = 2.0lf * double(rows) * double(d) * double(n)
     unsafe {
         upload_region_at(wqd, 0l, addr<uint8 const?>(b.wq[0]), wq_bytes)
         upload_region_at(wsd, 0l, addr<uint8 const?>(b.ws[0]), ws_bytes)
         upload_region_at(xfd, 0l, addr<uint8 const?>(b.xf[0]), xf_bytes)
-        let sc_bytes = int64(4 + lwgs) * 4l
-        let scd = make_device_buf(sc_bytes)
-        upload_region_at(scd, 0l, addr<uint8 const?>(sched[0]), sc_bytes)
+        let sched = one_region_sched(cnt, lwgs)
+        let scd = sched.buf
+        let sc_bytes = sched.bytes
         let cbufs = fixed_array(wqd, wsd, scd, xfd, yd)
         let csizes = fixed_array(wq_bytes, ws_bytes, sc_bytes, xf_bytes, y_bytes)
         let cgbits = fixed_array(1u, 2u, 0u, 4u, 16u)
@@ -3440,19 +3363,15 @@ def private run_cm2x_shape(name : string; d, n, cnt : int) {   // nolint:STYLE03
         let fgbits = fixed_array(1u, 0u, 4u, 16u)
         let vnames = fixed_array("cm2l", "lit ", "flat", "nil ", "f16a", "nobar", "mmnb ", "push")
         let mm_wgs = ((cnt + 127) / 128) * ((d + 127) / 128)
-        var mmsched : array<uint>
-        mmsched |> resize(4 + mm_wgs)
-        mmsched[2] = uint(cnt)
-        let msc_bytes = int64(4 + mm_wgs) * 4l
-        let mscd = make_device_buf(msc_bytes)
-        upload_region_at(mscd, 0l, addr<uint8 const?>(mmsched[0]), msc_bytes)
+        let msc = one_region_sched(cnt, mm_wgs)
+        let mscd = msc.buf
+        let msc_bytes = msc.bytes
         let xq_bytes = int64(rows * nbb) * 32l
         let xs_bytes = int64(rows * nbb) * 4l
         let xqd = make_device_buf(xq_bytes)
         let xsd = make_device_buf(xs_bytes)
         upload_region_at(xqd, 0l, addr<uint8 const?>(b.xq[0]), xq_bytes)
         upload_region_at(xsd, 0l, addr<uint8 const?>(b.xs[0]), xs_bytes)
-        delete mmsched
         for (v in range(8)) {
             var raw = alloc_cmd()
             let begin = VkCommandBufferBeginInfo()
@@ -3513,7 +3432,6 @@ def private run_cm2x_shape(name : string; d, n, cnt : int) {   // nolint:STYLE03
             print("{name} {vnames[v]}: {us / 1000.0lf} ms/dispatch  {tf} TFLOP/s  timing-only\n")
         }
     }
-    delete sched
     delete b
 }
 

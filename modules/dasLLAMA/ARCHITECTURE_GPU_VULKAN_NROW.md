@@ -53,7 +53,7 @@ takes a Q8_0 feed and reads no float row; every other head takes the split add-r
 pair, as the site before a routed block does. The row-parallel kernels take the
 rows' planes whole; the rope, the mirror store and the attention run at each row's own position,
 cached count and mirror region, which ride the shared `TokMeta` block a row (`mirbase` an
-element offset; `DaAttnArgs.rowwg` and `qrow` carry the row stride into the attention, `rowwg`
+offset in mirror units; `DaAttnArgs.rowwg` and `qrow` carry the row stride into the attention, `rowwg`
 0 naming a one-row dispatch). The attention's key split is the span's, the ladder the one-row
 command takes below its wide form (`rd_split_pieces` and the layer's window cap,
 `ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-decode-attn-split`), so the rows sum as each row does alone while every
@@ -82,8 +82,8 @@ q plane's `2 x qd` row where the gate is on, the projection row's width where it
 **A MoE layer's routed block steps the rows as regions of the one-row leaves.** The router GEMV
 takes the rows as columns of one dispatch (`RouterArgs.ncols`: a workgroup an expert row, its
 weights read once and dotted against every column, the logits a row at `obase + c * ne`); the per-row top-k
-stamp (`TopKN`, a row a workgroup over the record base `TopKRecords` the one-row stamp `TopK`
-splices too) writes row p's k slots at `p * k` - the gate and up region records reading row p's
+stamp (`TopKN`, a row a workgroup over the record base `TopKRecords`; the one-row command
+dispatches the same stamp at one workgroup) writes row p's k slots at `p * k` - the gate and up region records reading row p's
 feed blocks (`TopkArgs.xnb1`), the down records each slot's hidden row; and the gate, up and
 down GEMVs are the one-row leaves over `nrows * k` regions (`GemvArgs.nreg`), the act over every
 slot, the combine per row (`ClsArComb`'s position is its workgroup). The rows take the split

@@ -32,6 +32,18 @@ def sigmoid_f32(v : float) : float => 1.0 / (1.0 + exp(-v))
 //! SiLU as the one quotient v / (1 + exp(-v)), the CPU `silu`'s form
 def silu_f32(v : float) : float => v / (1.0 + exp(-v))
 
+//! `x` gated by the logistic of `g` as the one quotient x / (1 + exp(-g)), not x times `sigmoid_f32(g)`
+def sig_gate(x, g : float) : float => x / (1.0 + exp(-g))
+
+//! `v` stored as a half, saturated at the half's largest finite magnitude instead of overflowing to infinity
+def half_sat(v : float) : float16 => float16(clamp(v, -65504.0, 65504.0))
+
+//! Softplus with the standard large-x shortcut: x > 20 → x, else log(1 + exp(x)).
+def softplus(x : float) : float => x > 20.0 ? x : log(1.0 + exp(x))
+
+//! the gated delta rule's decay for a head's `a` = -exp(A_log) and its raw gate plus dt_bias
+def dn_decay(a, g : float) : float => exp(a * softplus(g))
+
 //! the CPU `gelu`'s tanh form in f32 (not the f16 LUT form the vision towers read), its tanh clamped by `tts_tanh`
 def tts_gelu_tanh(v : float) : float => 0.5 * v * (1.0 + tts_tanh(0.7978845608028654 * (v + 0.044715 * v * v * v)))
 

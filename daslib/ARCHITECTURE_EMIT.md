@@ -27,12 +27,18 @@ Companion to `ARCHITECTURE.md` in this folder; section numbers are unique across
   moves with it), elaborated `struct X`, double parens around `das_iterator` sources
   (most vexing parse), non-const value loop variables (`first()`/`next()` write into it).
 - **Sequenced binary operands**: any op2 whose operands are not both side-effect-free is
-  emitted through `das_ordered2{ L, R }` plus an immediately-invoked lambda. The struct and
-  its member names live in `include/daScript/simulate/aot.h` and move with the emitter's
-  `__lr.left`/`__lr.right` spellings.
+  emitted as `das_ordered2([&](auto && __lr_left, auto && __lr_right) { return op; },
+  [&]() { return L; }, [&]() { return R; })`. The function lives in
+  `include/daScript/simulate/aot.h` and moves with the emitter's `__lr_left`/`__lr_right`
+  spellings.
 - **Stack-frame `new`/ascend**: per-block storage declared once, the USE site
   re-initializes per evaluation (memset for `new`, whole-value overwrite for ascend) -
-  dropping the reinit reuses the previous iteration's value.
+  dropping the reinit reuses the previous iteration's value. At scope exit the escape pass
+  frees such a local by `isStackedPointee` (`src/ast/ast_escape_analysis.cpp`): a stacked
+  pointee gets `builtin_collect_local(*p, size)`, which frees only the heap it owns, and a
+  heap pointee gets `builtin_scope_free(p, size)`, which frees the shell too. The emitter's
+  stack gate (`allocate_on_stack`; an ascend also needs `!needTypeInfo` and a non-handle type)
+  must change together with that predicate; a mismatch fails only the full `test_aot` lane.
 - **fp16 and the 8/16-bit lattice go through the vec4f policy ABI**: `SimPolicy_HalfVec` is
   vec4f-shaped even at width 1, so scalar fp16 always casts across the policy boundary,
   and a lattice-vector policy result must come back typed for `das_equ_val` deduction.

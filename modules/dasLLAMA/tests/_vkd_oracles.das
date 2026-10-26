@@ -29,19 +29,8 @@ let FA_SHADOW_SLACK_ROWS = int(RDEC_MIR_SLACK_ROWS)   //! the flash fixtures pad
 
 let MR_SENT = 0x5A5A5A5Au   //! the schedule planes' fill: a word the kernel never writes stays this on both sides
 
-//! `bytes` of `word` into the device buffer `dev` at `off`
-def fill_upload(dev : uint64; off, bytes : int64; word : uint) {
-    var s : array<uint>
-    s |> resize(bytes / 4l)
-    for (v in s) {
-        v = word
-    }
-    upload_region_at(dev, off, unsafe(addr<uint8 const?>(s[0])), bytes)
-    delete s
-}
-
 //! NaN-fills a device output's [off, off + bytes) before its dispatch: a stale or unwritten output cannot sit inside any bar
-def nan_sentinel_upload(dev : uint64; bytes : int64; off : int64 = 0l) => fill_upload(dev, off, bytes, NAN_SENTINEL_BITS)
+def nan_sentinel_upload(dev : uint64; bytes : int64; off : int64 = 0l) => upload_fill(dev, off, bytes, NAN_SENTINEL_BITS)
 
 //! a device buffer holding `a` whole
 def dev_upload(a : array<auto(TT)>) : uint64 {
@@ -49,6 +38,21 @@ def dev_upload(a : array<auto(TT)>) : uint64 {
     let dev = make_device_buf(bytes)
     upload_region_at(dev, 0l, unsafe(addr<uint8 const?>(a[0])), bytes)
     return dev
+}
+
+//! one region of `cnt` rows at weight block `wblk0` for `wgs` workgroups: the schedule words the tile classes read at `map_off` 4, in a device buffer or in host memory (the prefill's `pf_meta` form)
+def one_region_sched(cnt, wgs : int; host : bool = false; wblk0 : int = 0) : tuple<buf : uint64; bytes : int64> {
+    let sc_bytes = int64(4 + wgs) * 4l
+    var cur = 4l
+    if (host) {
+        let hb = make_host_buf(sc_bytes, true)
+        batch_sched_map(unsafe(reinterpret<uint?>(hb.mapped)), cur, 0l, int64(wblk0), int64(cnt), int64(wgs))
+        return (buf = hb.buf, bytes = sc_bytes)
+    }
+    let scd = make_staged_buf(sc_bytes) $(var words : uint?) {
+        batch_sched_map(words, cur, 0l, int64(wblk0), int64(cnt), int64(wgs))
+    }
+    return (buf = scd, bytes = sc_bytes)
 }
 
 //! each plane's host offset when the planes stage back to back - the sum of the sizes before it - and the total bytes last
@@ -150,7 +154,7 @@ def out_(var cp : CellPlanes; n : int; base : int = 0; slack : int = 0; bit : ui
 //! a plane the kernels write that is not floats: `bytes` under the sentinel `word` - a NaN in both halves for f16, -128 bytes for Q8_0 quants
 def out_words(var cp : CellPlanes; bytes : int64; word : uint; bit : uint = 0u) : int {
     let dev = make_device_buf(bytes)
-    fill_upload(dev, 0l, bytes, word)
+    upload_fill(dev, 0l, bytes, word)
     return cp |> add_plane(dev, bytes, true, 0, int(bytes / 4l), bit, word)
 }
 
@@ -219,7 +223,7 @@ def plane_as(cp : CellPlanes; p : int; elem : auto(TT); n : int; at : int = 0) :
 
 //! the plane's sentinel over written plane `p` again, before a dispatch that must write it anew
 def plane_refill(cp : CellPlanes; p : int) {
-    fill_upload(cp.dev[p], 0l, cp.bytes[p], cp.fill[p])
+    upload_fill(cp.dev[p], 0l, cp.bytes[p], cp.fill[p])
 }
 
 //! `a` over plane `p` from its base, between two `cell_record`s: a rerun's poisoned or rescaled input

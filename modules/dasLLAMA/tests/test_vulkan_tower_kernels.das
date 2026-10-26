@@ -22,6 +22,7 @@ require _compares   // nolint:STYLE030,LINT019 — the compares, inside the vulk
 require _attn_oracle   // attn_row_scored: the softmax row the attention oracles share
 require _vk_kq_fixtures   // nolint:STYLE030,LINT019 — f16r, inside the vulkan arms alone
 require dasllama/dasllama_math
+require dasllama/dasllama_gpu_math
 require daslib/jobque_boost
 require daslib/linq   // nolint:STYLE030,LINT019 — count: the sentinel words a dispatch left, the pads' zero tails, inside the vulkan arms alone
 
@@ -70,20 +71,20 @@ def private fa_bidir_arm(t : T?; khr : bool; hs : int) {
             let vhp = cp |> out_words(sh_bytes, F16_SENTINEL_BITS)
             let yp = cp |> out_(rows * qd)
             let ycp = cp |> out_(rows * qd)
-            var sck = cp |> cls_set(fixed_array(kp, khp), @@set_f16cvt_cls)
-            var scv = cp |> cls_set(fixed_array(vp, vhp), @@set_f16cvt_cls)
+            var sck = cp |> cls_set(fixed_array(kp, khp), @@set_tower_clamp_cvt_cls)
+            var scv = cp |> cls_set(fixed_array(vp, vhp), @@set_tower_clamp_cvt_cls)
             let fa = fixed_array(qp, khp, vhp, yp)
             let fc = fixed_array(qp, khp, vhp, ycp)
             var sfa = fa_stamp_set(khr, gather_planes(cp.dev, fa), gather_planes(cp.bytes, fa), gather_planes(cp.hazard_bit, fa))
             var sfc = fa_stamp_set(khr, gather_planes(cp.dev, fc), gather_planes(cp.bytes, fc), gather_planes(cp.hazard_bit, fc))
-            var pcv = ActArgs(nelem = uint(kpad * qd), nblk = 0u)
+            var pcv = f16_rows_args(uint(kpad * qd))
             var pcf = FaArgs(rows = uint(rows), w0 = 0u, qd = uint(qd), kvd = uint(qd), kv_mul = 1u, kvbase = 0u,
                 scale = TOWER_SCALE, window = 0u, sinkoff = 0u)
             let cvtwgs = int64((kpad * qd / 4 + 255) / 256)
             let wgs = fa_stamp_wgs(khr, int64(nheads), int64(rows))
             cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
-                enc_f16cvt_cls(raw, h, sck, pcv, cvtwgs)
-                enc_f16cvt_cls(raw, h, scv, pcv, cvtwgs)
+                enc_tower_clamp_cvt_cls(raw, h, sck, pcv, cvtwgs)
+                enc_tower_clamp_cvt_cls(raw, h, scv, pcv, cvtwgs)
                 fa_stamp_enc(khr, int64(hs), false, false, false, false, raw, h, sfa, pcf, wgs, true)
                 fa_stamp_enc(khr, int64(hs), false, false, false, false, raw, h, sfc, pcf, wgs)
             }
@@ -118,7 +119,7 @@ def private fa_bidir_arm(t : T?; khr : bool; hs : int) {
 def test_vkt_fa_bidir(t0 : T?) {
     t0 |> run("bidirectional flash attention (h64 and the padded h128, cm2 and KHR arms) == the CPU oracle over every key") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
-            if (!vk_moe_init() || !ensure_f16cvt_cls()) {
+            if (!vk_moe_init() || !ensure_tower_clamp_cvt_cls()) {
                 t |> skip("no Vulkan device")
                 return
             }
@@ -222,9 +223,9 @@ def private wdec_fused_rq_shape(t : T?; d, rows, nch : int) {   // nolint:STYLE0
             var s_comb = cp |> cls_set(fixed_array(pmsp, pyp, ycp), @@set_tower_wdec_attn_comb_cls)
             var s_rq4 = cp |> cls_set(fixed_array(ycp, qp[6], sp[6]), @@set_tower_clamp_rq_cls)
             var s_combrq = cp |> cls_set(fixed_array(pmsp, pyp, qp[7], sp[7]), @@set_tower_wdec_attn_comb_rq_cls)
-            var pa_ln = TowerLnArgs(d = uint(d), rows = uint(rows), woff = 0u, boff = uint(d), eps = ROWS_EPS)   // nolint:LINT003 - the encoders take the push block by value, and the lambda below captures it
-            var pa_rq = TowerClampRqArgs(inbase = 0u, nblk = uint(nd / q8e), lo = -3.0e38, hi = 3.0e38)   // nolint:LINT003 - the same
-            var pa_rqh = TowerClampRqArgs(inbase = 0u, nblk = uint(nff / q8e), lo = -3.0e38, hi = 3.0e38)   // nolint:LINT003 - the same
+            var pa_ln = TowerLnArgs(d = uint(d), rows = uint(rows), eps = ROWS_EPS, ln_on = 1u, lnoff = 0u, lnboff = uint(d))   // nolint:LINT003 - the encoders take the push block by value, and the lambda below captures it
+            var pa_rq = RqArgs(inbase = 0u, nblk = uint(nd / q8e), lo = -3.0e38, hi = 3.0e38)   // nolint:LINT003 - the same
+            var pa_rqh = RqArgs(inbase = 0u, nblk = uint(nff / q8e), lo = -3.0e38, hi = 3.0e38)   // nolint:LINT003 - the same
             var pa_post = TowerLnArgs(d = uint(d), rows = uint(rows), boff = uint(2 * d), eps = ROWS_EPS, ln_on = 1u, lnoff = uint(3 * d), lnboff = uint(4 * d), ascale = 1.0)   // nolint:LINT003 - the same
             var pa_bias = TowerBiasArgs(d = uint(ff), nelem = uint(nff), boff = uint(5 * d), act = BIAS_ACT_GELU_TANH)   // nolint:LINT003 - the same
             var pa_biasrq = TowerBiasRqArgs(d = uint(ff), nblk = uint(nff / q8e), boff = uint(5 * d))   // nolint:LINT003 - the same
@@ -368,7 +369,7 @@ def private gelu_quick_ref(x : float) : float => x * (1.0 / (1.0 + exp(-1.702 * 
 def test_vkt_tower_rows(t0 : T?) {   // nolint:STYLE038 — one flat gate over the eight row classes: the fixture, one command buffer, eight oracles and their controls
     t0 |> run("the tower row classes (rms, clamp, clamp+cvt, clamp+rq, rope2d, post-add, post-add plain, geglu) == the CPU tower helpers") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
-            if (!vk_moe_init() || !ensure_tower_rms_cls() || !ensure_tower_clamp_cls() || !ensure_tower_clamp_cvt_cls()
+            if (!vk_moe_init() || !ensure_hc_norm_cls() || !ensure_tower_clamp_cls() || !ensure_tower_clamp_cvt_cls()
                     || !ensure_tower_clamp_rq_cls() || !ensure_tower_rope2d_cls() || !ensure_tower_post_add_cls()
                     || !ensure_tower_post_add_plain_cls() || !ensure_tower_geglu_cls()) {
                 t |> skip("no Vulkan device")
@@ -414,7 +415,7 @@ def test_vkt_tower_rows(t0 : T?) {   // nolint:STYLE038 — one flat gate over t
                 let xb_plain0_p = cp |> out_(nd)   // ... and its pre-norm output, which must stay untouched
                 let x_half_p = cp |> io_(x)      // the post-norm stamp at ascale = 0.5, ln_on = 0
                 let xb_half_p = cp |> out_(nd)
-                var s_rms = cp |> cls_set(fixed_array(xp, xbp, wp), @@set_tower_rms_cls)
+                var s_rms = cp |> cls_set(fixed_array(xp, xbp, wp), @@set_hc_norm_cls)
                 var s_clamp = cp |> cls_set(fixed_array(yp), @@set_tower_clamp_cls)
                 var s_cvt = cp |> cls_set(fixed_array(xp, xhp), @@set_tower_clamp_cvt_cls)
                 var s_rq = cp |> cls_set(fixed_array(xp, xqp, xsp), @@set_tower_clamp_rq_cls)
@@ -425,7 +426,7 @@ def test_vkt_tower_rows(t0 : T?) {   // nolint:STYLE038 — one flat gate over t
                 var s_post_plain0 = cp |> cls_set(fixed_array(x_plain0_p, yp, xb_plain0_p, wp), @@set_tower_post_add_plain_cls)
                 var s_post_half = cp |> cls_set(fixed_array(x_half_p, yp, xb_half_p, wp), @@set_tower_post_add_cls)
                 var s_geglu = cp |> cls_set(fixed_array(gp, up), @@set_tower_geglu_cls)
-                var pa_rms = TowerRowArgs(d = uint(d), rows = uint(rows), woff = 0u, eps = ROWS_EPS)
+                var pa_rms = tower_rms_args(uint(d), 0u, ROWS_EPS)
                 var pa_post = TowerLnArgs(d = uint(d), rows = uint(rows), woff = uint(d), boff = 0u, eps = ROWS_EPS, ln_on = 1u, lnoff = 0u, lnboff = 0u, ascale = 1.0)
                 var pa_post0 = TowerLnArgs(d = uint(d), rows = uint(rows), woff = uint(d), boff = 0u, eps = ROWS_EPS, ln_on = 0u, lnoff = 0u, lnboff = 0u, ascale = 1.0)
                 var pa_post_plain = TowerLnArgs(d = uint(d), rows = uint(rows), woff = 0u, boff = 0u, eps = ROWS_EPS, ln_on = 1u, lnoff = 0u, lnboff = 0u, ascale = 0.5)
@@ -433,12 +434,12 @@ def test_vkt_tower_rows(t0 : T?) {   // nolint:STYLE038 — one flat gate over t
                 var pa_post_half = TowerLnArgs(d = uint(d), rows = uint(rows), woff = uint(d), boff = 0u, eps = ROWS_EPS, ln_on = 0u, lnoff = 0u, lnboff = 0u, ascale = 0.5)
                 var pa_clamp = TowerClampArgs(nelem = uint(nd), lo = lo, hi = hi)
                 var pa_cvt = TowerClampArgs(nelem = uint(nd), lo = lo2, hi = hi2)
-                var pa_rq = TowerClampRqArgs(inbase = 0u, nblk = uint(nd / q8e), lo = lo2, hi = hi2)
+                var pa_rq = RqArgs(inbase = 0u, nblk = uint(nd / q8e), lo = lo2, hi = hi2)
                 var pa_rope = TowerRopeArgs(nheads = uint(ROWS_HEADS), hs = uint(hs), rows = uint(rows))
                 var pa_geglu = TowerGegluArgs(nelem = uint(nff), glo = -2.0, ghi = 2.5, ulo = -1.5, uhi = 1.75, dlo = -1.0, dhi = 1.2)
                 let wg4 = int64((nd / 4 + 255) / 256)
                 cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
-                    enc_tower_rms_cls(raw, h, s_rms, pa_rms, int64(rows))
+                    enc_hc_norm_cls(raw, h, s_rms, pa_rms, int64(rows))
                     enc_tower_clamp_cvt_cls(raw, h, s_cvt, pa_cvt, wg4)
                     enc_tower_clamp_rq_cls(raw, h, s_rq, pa_rq, int64((nd / 4 + 255) / 256))
                     enc_tower_rope2d_cls(raw, h, s_rope, pa_rope, int64((rows * ROWS_HEADS * pairs + 255) / 256))
@@ -555,29 +556,6 @@ def test_vkt_tower_rows(t0 : T?) {   // nolint:STYLE038 — one flat gate over t
 let private G4A_PAST = int(gemma4a_attn_past())   //! the RPE table carries past + 1 rows
 let private G4A_CAP = gemma4a_softcap()
 
-//! the CPU form of the windowed RPE attention, spelled as `gemma4a_encode`'s loop
-def private g4a_attn_ref(q, k, v, rpe, pds : array<float>; rows, d, heads, hs : int; qscale, kscale, cap : float) : array<float> {
-    var ao : array<float>
-    ao |> resize(rows * d)
-    for (hh in range(heads)) {
-        let hoff = hh * hs
-        for (i in range(rows)) {
-            attn_row_scored(v, hoff, d, hs, max(0, i - (G4A_PAST - 1)), i + 1, ao, i * d + hoff, false, 0.0) $(j : int) : float {
-                let rr = (G4A_PAST - (i - j)) * d
-                var cs = 0.0
-                var rs = 0.0
-                for (n in range(hs)) {
-                    let qv = q[i * d + hoff + n] * qscale * pds[n]
-                    cs += qv * (k[j * d + hoff + n] * kscale)
-                    rs += qv * rpe[rr + hoff + n]
-                }
-                return cap * tanh((cs + rs) / cap)
-            }
-        }
-    }
-    return <- ao
-}
-
 [test]
 def test_vkt_tower_conformer(t0 : T?) {   // nolint:STYLE038 — one flat gate over the four classes: the fixture, one command buffer, the oracles and their controls
     t0 |> run("the Conformer row classes (silu, GLU, depthwise conv, windowed RPE attention) == the CPU forms") <| @(t : T?) {
@@ -637,7 +615,7 @@ def test_vkt_tower_conformer(t0 : T?) {   // nolint:STYLE038 — one flat gate o
                 for (r in range(rows)) {
                     for (c in range(d)) {
                         let gate = glu_pw_rows[r * 2 * d + d + c]
-                        g_ref[r * d + c] = glu_pw_rows[r * 2 * d + c] * (1.0 / (1.0 + exp(-gate)))
+                        g_ref[r * d + c] = glu_pw_rows[r * 2 * d + c] * sigmoid_f32(gate)
                     }
                 }
                 check_rows(t, "tower_glu_sig value . sigmoid(gate) off the pointwise rows", g_dev, g_ref, BAR_APPROX, d)
@@ -656,10 +634,10 @@ def test_vkt_tower_conformer(t0 : T?) {   // nolint:STYLE038 — one flat gate o
                     }
                 }
                 check_rows(t, "tower_dw_conv5 causal depthwise taps vs the CPU loop", c_dev, c_ref, BAR_APPROX, d)
-                let ao_ref <- g4a_attn_ref(q, k, v, rpe, wn, rows, d, ROWS_HEADS, hs, qscale, kscale, G4A_CAP)
+                let ao_ref <- g4a_attn_oracle(q, k, v, rpe, wn, rows, d, ROWS_HEADS, hs, G4A_PAST, qscale, kscale, G4A_CAP)
                 check_rows(t, "tower_g4a_attn (64-wide stamp) windowed RPE attention vs the CPU loop", ao_dev, ao_ref, BAR_APPROX, d, hs)
                 let k_scaled <- scaled_copy(k, 1.5)
-                let ao_ctl <- g4a_attn_ref(q, k_scaled, v, rpe, wn, rows, d, ROWS_HEADS, hs, qscale, kscale, G4A_CAP)
+                let ao_ctl <- g4a_attn_oracle(q, k_scaled, v, rpe, wn, rows, d, ROWS_HEADS, hs, G4A_PAST, qscale, kscale, G4A_CAP)
                 let moved = mismatch_approx(ao_dev, ao_ctl)
                 t |> success(moved > nd / 4, "tower_g4a_attn control: scaled keys land the oracle elsewhere ({moved} of {nd} moved)")
                 // the 128-wide stamp (the served carriers' head) over the same rows read as two heads, the queries scaled up so
@@ -676,9 +654,9 @@ def test_vkt_tower_conformer(t0 : T?) {   // nolint:STYLE038 — one flat gate o
                     enc_tower_g4a_attn_cls(raw, h, s_attn128, pa_attn128, int64((rows * heads2 + 63) / 64))
                 }
                 let ao_knee_dev <- cp |> plane_run(aop)
-                let ao_capped_ref <- g4a_attn_ref(q_at_cap_knee, k, v, rpe, wn, rows, d, heads2, hs2, qscale2, kscale, G4A_CAP)
+                let ao_capped_ref <- g4a_attn_oracle(q_at_cap_knee, k, v, rpe, wn, rows, d, heads2, hs2, G4A_PAST, qscale2, kscale, G4A_CAP)
                 check_rows(t, "tower_g4a_attn (128-wide stamp) windowed RPE attention over scaled queries vs the CPU loop", ao_knee_dev, ao_capped_ref, BAR_APPROX, d, hs2)
-                let ao_cap4_ref <- g4a_attn_ref(q_at_cap_knee, k, v, rpe, wn, rows, d, heads2, hs2, qscale2, kscale, 4.0 * G4A_CAP)
+                let ao_cap4_ref <- g4a_attn_oracle(q_at_cap_knee, k, v, rpe, wn, rows, d, heads2, hs2, G4A_PAST, qscale2, kscale, 4.0 * G4A_CAP)
                 let moved_cap4 = mismatch_approx(ao_knee_dev, ao_cap4_ref)
                 t |> success(moved_cap4 > nd / 4, "tower_g4a_attn 128 control: the softcap engages on the scaled queries - the oracle at four times the cap lands elsewhere ({moved_cap4} of {nd} moved)")
             }
@@ -754,7 +732,7 @@ def test_vkt_tower_fastconformer(t0 : T?) {
                             }
                         }
                         let bv = acc * wn[bnw_off + c] + wn[bnb_off + c]
-                        c_ref[r * d + c] = bv * (1.0 / (1.0 + exp(-bv)))
+                        c_ref[r * d + c] = bv * sigmoid_f32(bv)
                     }
                 }
                 check_rows(t, "tower_cn_dw centered taps, folded BatchNorm and silu vs the CPU loop", c_dev, c_ref, BAR_APPROX, d)
@@ -822,7 +800,7 @@ def test_vkt_tower_ln_rows(t0 : T?) {   // nolint:STYLE038 — one flat gate ove
                 var s_pad = cp |> cls_set(fixed_array(qp, qpp), @@set_tower_hpad_cls)
                 var s_pad16 = cp |> cls_set(fixed_array(qp, qphp), @@set_tower_hpad16_cls)
                 var s_unpad = cp |> cls_set(fixed_array(qpp, qcp), @@set_tower_hunpad_cls)
-                var pa_ln = TowerLnArgs(d = uint(d), rows = uint(rows), woff = 0u, boff = uint(d), eps = ROWS_EPS)
+                var pa_ln = TowerLnArgs(d = uint(d), rows = uint(rows), eps = ROWS_EPS, ln_on = 1u, lnoff = 0u, lnboff = uint(d))
                 var pa_post = TowerLnArgs(d = uint(d), rows = uint(rows), boff = uint(2 * d), eps = ROWS_EPS, ln_on = 1u, lnoff = uint(3 * d), lnboff = uint(d), ascale = 1.0)
                 var pa_post0 = TowerLnArgs(d = uint(d), rows = uint(rows), boff = uint(2 * d), eps = ROWS_EPS, ln_on = 0u, lnoff = uint(3 * d), lnboff = uint(d), ascale = 1.0)
                 var pa_post_half = TowerLnArgs(d = uint(d), rows = uint(rows), boff = uint(2 * d), eps = ROWS_EPS, ln_on = 0u, lnoff = uint(3 * d), lnboff = uint(d), ascale = 0.5)
@@ -1005,7 +983,7 @@ def test_vkt_tower_f16_feeds(t0 : T?) {   // nolint:STYLE038 — one flat gate o
                 var s_padb = cp |> cls_set(fixed_array(qp, qpp, wp), @@set_tower_hpad_b_cls)
                 var s_pad16b = cp |> cls_set(fixed_array(qp, qphp, wp), @@set_tower_hpad16_b_cls)
                 var s_unpad16 = cp |> cls_set(fixed_array(qpp, qchp), @@set_tower_hunpad16_cls)
-                var pa_ln = TowerLnArgs(d = uint(d), rows = uint(rows), woff = 0u, boff = uint(d), eps = ROWS_EPS)
+                var pa_ln = TowerLnArgs(d = uint(d), rows = uint(rows), eps = ROWS_EPS, ln_on = 1u, lnoff = 0u, lnboff = uint(d))
                 var pa_post = TowerLnArgs(d = uint(d), rows = uint(rows), boff = uint(2 * d), eps = ROWS_EPS, ln_on = 1u, lnoff = uint(3 * d), lnboff = uint(d), ascale = 1.0)
                 var pa_post0 = TowerLnArgs(d = uint(d), rows = uint(rows), boff = uint(2 * d), eps = ROWS_EPS, ln_on = 0u, lnoff = uint(3 * d), lnboff = uint(d), ascale = 1.0)
                 var pa_rs = TowerRestrideArgs(rows = uint(rows), rows_pad = uint(rows_pad), nheads = uint(ROWS_HEADS), hs = uint(LN_HS), hsp = uint(LN_HSP),

@@ -189,7 +189,7 @@ let private CENSUS_NEVER_DISPATCHED <- [
     "MetalDnGateSig",
     // the device attention pair's 128-row stamps: they serve a window whose padded row count is a
     // multiple of 128, and the census prompt pads to 608 rows, which the 32-row stamps take. Their
-    // coverage is attn_qk_dev_gate and attn_dev_pair_gate in test_metal_gemm_kernels.das and the
+    // coverage is attn_qk_mm_gate's pair arms and attn_dev_pair_gate in test_metal_gemm_kernels.das and the
     // attn-dev arm's 384-row continuation in test_metal_prefill_parity.das
     "MetalAttnQKDev128", "MetalAttnAVDev128"
 ]
@@ -807,11 +807,9 @@ let private VK_CENSUS_NEVER_DISPATCHED <- [
     // the iq4nl32 expert rail (the 32-block IQ4_NL down planes off the 256 lattice - Qwen3.8-Flash-Next, above the zoo's tier) -
     // its s and e stamps and its decode GEMV; their coverage is test_vkd_iq4nl32_cm2_batch and test_vkd_iq4nl32_gemv
     "iq4nl32_batch_cm2s_cls_spv", "iq4nl32_batch_cm2e_cls_spv", "iq4nl32_gemv_cls_spv",
-    // the iq3s4 rail (IQ3_S served as a nibble codebook plane: the same carrier's gate and up stacks) - its decode GEMV, its
-    // batch tile and its cm2 l/m/s and KHR stamps; their coverage is the iq3s4 rows of test_vkd_kq_gemv_family and
-    // test_vkd_kq_batch_family and test_vkd_iq3s4_cm2_batch
-    "kq_gemv_iq3s4_cls_spv", "kq_batch_iq3s4_cls_spv", "kq_batch_iq3s4_cm2l_cls_spv", "kq_batch_iq3s4_cm2m_cls_spv",
-    "kq_batch_iq3s4_cm2s_cls_spv", "kq_batch_iq3s4_khr_cls_spv",
+    // the iq3s4 rail's cm2 l stamp (IQ3_S served as a nibble codebook plane: the zoo's IQ3_S rows dispatch its decode GEMV, its
+    // batch tile and its m, s and KHR stamps, none of them a plane tall enough for the l column); its coverage is test_vkd_iq3s4_cm2_batch
+    "kq_batch_iq3s4_cm2l_cls_spv",
     // the hyper-connection chain (Qwen3.8-Flash-Next, the one qwen4exp carrier, above the zoo's tier): the mixer seams and the
     // n-gram side input; their coverage is test_vkd_hc_seams, test_vkd_hc_rows and test_vkd_ple_side, the serving run
     // test_gpu_resident_hc.das
@@ -892,11 +890,11 @@ let private VK_CENSUS_NEVER_DISPATCHED <- [
     // kernel coverage is test_vkt_tower_f16_feeds in test_vulkan_tower_kernels.das
     "tower_ln16_cls_spv", "tower_post_add_ln16_cls_spv", "tower_hpad_b_cls_spv", "tower_hpad16_b_cls_spv", "tower_hunpad16_cls_spv",
     "tower_bias_act_cvt16_cls_spv",
-    // the gemma4v tower's row classes (the norms, clamps, feeds, the two-axis rope, the post-add and the GEGLU): the stocked
+    // the gemma4v tower's row classes (the clamps, feeds, the two-axis rope, the post-add and the GEGLU; its rms rows are hc_norm's): the stocked
     // mmproj-gemma-4-E2B-it-bf16.gguf, dispatched by test_gemma4v_vulkan_twin in test_gemma4v.das - no zoo row; their kernel
-    // coverage is test_vkt_tower_rows in test_vulkan_tower_kernels.das (the clamp + halfword feed also serves every audio
-    // chain's cm2 feed, dispatched by the audio twins; test_vkt_tower_front_movers covers it too)
-    "tower_rms_cls_spv", "tower_clamp_cls_spv", "tower_clamp_cvt_cls_spv", "tower_clamp_rq_cls_spv", "tower_rope2d_cls_spv",
+    // coverage is test_vkt_tower_rows in test_vulkan_tower_kernels.das (the clamp + halfword feed is no entry: it is the LLM
+    // prefill's f32 -> f16 rows too, which the zoo rows dispatch)
+    "tower_clamp_cls_spv", "tower_clamp_rq_cls_spv", "tower_rope2d_cls_spv",
     "tower_post_add_cls_spv", "tower_geglu_cls_spv",
     // the biased-block (SigLIP) row classes: the bias with its GELU, the head restrides to the flash tile's width (the
     // stocked mmproj-gemma-3-4b-it-F16.gguf, dispatched by test_gemma3v_vulkan_twin in test_gemma3v.das; the rope on a
@@ -925,10 +923,9 @@ let private VK_CENSUS_NEVER_DISPATCHED <- [
     // its carrier is the 26B-A4B, above the zoo's tier; its coverage is test_vkd_moe_routing's gemma-4
     // combine arm in test_vulkan_kernels.das
     "cls_ar_comb_g4_spv", "cls_ar_comb_g4_f16_b_spv", "cls_ar_comb_g4_rq_spv",
-    // the gemma-2 softcap flash tile (the attention logits through cap * tanh(s / cap)) and the h512 flash tile
-    // (gemma-4's global heads), each with its f16 twin: their carriers are gemma-2-2b and the gemma-4 dense files,
-    // no zoo row; their coverage is test_vkd_fa_cm2_h256_softcap and test_vkd_fa_cm2's h512 arm in test_vulkan_kernels.das
-    "fa_cm2_h256_cap_cls_spv", "fa_cm2_h256_cap_f16_cls_spv", "fa_cm2_h512_cls_spv", "fa_cm2_h512_f16_cls_spv",
+    // the h512 flash tile (gemma-4's global heads) with its f16 twin: its carriers are the gemma-4 dense files,
+    // no zoo row; its coverage is test_vkd_fa_cm2's h512 arm in test_vulkan_kernels.das
+    "fa_cm2_h512_cls_spv", "fa_cm2_h512_f16_cls_spv",
     // the batched windowed decode attention and its f16 twin (a sliding window over the batch rows: the gemma
     // carriers, no zoo row); its coverage is test_vkd_da_attn_bw in test_vulkan_kernels.das
     "da_attn_bw_cls_spv", "da_attn_bw_f16_cls_spv",
@@ -957,9 +954,50 @@ let private VK_CENSUS_NEVER_DISPATCHED <- [
     // (the batched rows need a region a row; the stocked regions files - test_gpu_resident_regions_qwen3.das and the
     // gemma files - reach them at two regions); their coverage is test_vkd_q8_gemv_gu_n in test_vulkan_kernels.das
     "q8_gemv_gu_n2_cls_spv", "q8_gemv_gu_n4_cls_spv", "q8_gemv_gu_n8_cls_spv",
-    // the N-row command's per-row top-k: the census steps every session a row at a time (the batched step needs two sessions
-    // over two regions - the gpt-oss and Qwen3-30B regions files serve it); its coverage is test_vkd_topk_n in test_vulkan_kernels.das
-    "topk_n_cls_spv"]
+    // the sink stamps over a block-codec K/V mirror (gpt-oss with the mirror asked in q8_0 or tq4: the census loads no sink
+    // carrier); their coverage is the sink arms of test_vkc_q8_da_attn and test_vkc_tq4_da_attn in test_vulkan_kv_codec_kernels.das
+    "da_attn_q8_sink_cls_spv", "da_attn_tq4_sink_cls_spv"]
+
+//! a prefill over the counting prompt and two greedy decode steps through `s`
+def private cov_prefill_two_steps(tr : Model; var s : Session) {
+    let vocab = tr.config.vocab_size
+    let p <- encode(tr, counting_prompt(1, 40), true, false)
+    eval_(tr, s, p)
+    var cur = argmax_of(s.logits, vocab)
+    for (_i in range(2)) {
+        var one <- [cur]
+        eval_(tr, s, one)
+        delete one
+        cur = argmax_of(s.logits, vocab)
+    }
+}
+
+//! one model's sweep with the K/V mirror asked in block codec `kv`, on a session of that codec: a prefill (the window's staged
+//! store, the shadow, the flash tiles over it) and two decode steps (the token store, the codec's attention stamp, tq4's un-rotation)
+[unused_argument(t, path, family, kv)]   // without vulkan the gated body is empty
+def private vk_cov_codec_model(t : T?; path, family : string; kv : KVDtype) {
+    static_if (typeinfo builtin_module_exists(vulkan)) {
+        if (!family_on(t, family) || !arm_on(t, "coverage-vk") || !model_available(t, path)) {
+            return
+        }
+        let pin = gpu_kv_dtype_pin_()
+        set_gpu_kv_dtype_(kv)
+        var tr <- load_model_(path, QuantMode.q8)
+        if (pin.pinned) {
+            set_gpu_kv_dtype_(pin.dt)
+        } else {
+            reset_gpu_kv_dtype_()
+        }
+        tr.config.seq_len = min(tr.config.seq_len, 512l)
+        with_dasllama_jobque() {
+            var s = make_run_state(tr.config, kv, kv)
+            cov_prefill_two_steps(tr, s)
+            delete s
+        }
+        moe_gpu_drop_model_()
+        delete tr
+    }
+}
 
 [unused_argument(t, path, family, nbs)]   // without vulkan the gated body is empty
 def private vk_cov_model(t : T?; path, family : string; nbs : array<int>) {
@@ -977,15 +1015,7 @@ def private vk_cov_model(t : T?; path, family : string; nbs : array<int>) {
             // an f32 session rides the per-op rails; an f16 one (the armed mirror codec) the whole-model driver
             for (kdt in [KVDtype.f32, KVDtype.f16]) {
                 var s = make_run_state(tr.config, kdt, kdt)
-                let p <- encode(tr, counting_prompt(1, 40), true, false)
-                eval_(tr, s, p)
-                var cur = argmax_of(s.logits, vocab)
-                for (_i in range(2)) {
-                    var one <- [cur]
-                    eval_(tr, s, one)
-                    delete one
-                    cur = argmax_of(s.logits, vocab)
-                }
+                cov_prefill_two_steps(tr, s)
                 var p2 <- encode(tr, counting_prompt(50, 90), false, false)
                 eval_(tr, s, p2)
                 delete p2
@@ -1019,6 +1049,16 @@ def private vk_cov_model(t : T?; path, family : string; nbs : array<int>) {
         // across the zoo until the MAX_STACKS decline
         moe_gpu_drop_model_()
         delete tr
+    }
+}
+
+//! the two carriers the block codecs' attention stamps need: the four-head slab (qwen2: fourteen heads over two) and the
+//! two-head slab (gemma-2: eight over four)
+[cold_path]
+def private vk_cov_codecs(t : T?) {
+    for (kv in [KVDtype.q8_0, KVDtype.tq4]) {
+        vk_cov_codec_model(t, path_join(models_dir(), "Qwen2.5-0.5B-Instruct-Q8_0.gguf"), "qwen2", kv)
+        vk_cov_codec_model(t, path_join(models_dir(), "gemma-2-2b-it-Q8_0.gguf"), "gemma2", kv)
     }
 }
 
@@ -1074,6 +1114,7 @@ def test_vulkan_kernel_coverage_serving(tst : T?) {
             vk_cov_model(t, path_join(models_dir(), "tinyllama-1.1b-chat-v1.0.Q8_0.gguf"), "llama", [2, 4, 8])
             // gemma3 q8: the per-op arena rails + qk_norm
             vk_cov_model(t, path_join(models_dir(), "gemma-3-1b-it-Q8_0.gguf"), "gemma3", none)
+            vk_cov_codecs(t)
             vk_cov_mode_sweep(t)
             // qwen3.5 q8: the DeltaNet chains (conv/step/scan + the decode step)
             vk_cov_model(t, path_join(models_dir(), "Qwen3.5-0.8B-Q8_0.gguf"), "qwen35", none)

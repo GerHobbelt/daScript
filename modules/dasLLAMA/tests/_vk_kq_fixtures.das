@@ -4,7 +4,7 @@ options _dasllama_internal = true
 module _vk_kq_fixtures shared public   //! shared: the harness's probe fixture (a shared module) requires it
 
 require daslib/f16_cvt
-require math
+require dasllama/dasllama_convert
 
 // Synthetic K-quant expert stacks in the vulkan tier's DEVICE layout, shared by the tier suite
 // (test_vulkan_tier) and the cm2 expert-chain suite (test_vulkan_moe_cm2): the pow2 scale sets
@@ -13,8 +13,19 @@ require math
 //! a float rounded through f16 and back - the value the device reads where it stages a plane in halves
 def f16r(v : float) : float => f16_to_f32(f32_to_f16(v))
 
-//! the scalar silu the CPU references spell where a kernel's gate rides it one element at a time
-def silu(v : float) : float => v / (1.0 + exp(-v))
+//! `v` as a little-endian f16 at byte `off` of `b`
+def put_f16(var b : array<uint8>; off : int64; v : float) {
+    let bits = f32_to_f16(v)
+    b[off] = uint8(bits & 0xFFu)
+    b[off + 1l] = uint8(bits >> 8u)
+}
+
+def put_f16(var b : array<uint8>; off : int; v : float) {
+    put_f16(b, int64(off), v)
+}
+
+//! the little-endian f16 at byte `off` of `b`, widened
+def get_f16(b : array<uint8>; off : int64) : float => f16_to_f32(rd_u16(b, off))
 
 // the small set for gate/up/x scale planes
 def pow2_small(i : int64) : float {
@@ -54,27 +65,19 @@ def fill_kq_stack(fmt : int; rows, n : int64; seed : int64; tiny_d : bool;
             for (i in range(16)) {   // signed i8 sub-scales in a modest range
                 wsb[so + i] = uint8(int(lcg_byte(st)) % 63 - 31)
             }
-            let h = f32_to_f16(tiny_d ? pow2_tiny(sb + seed) : pow2_small(sb + seed))
-            wsb[so + 16] = uint8(h & 0xFFu)
-            wsb[so + 17] = uint8((h >> 8u) & 0xFFu)
+            put_f16(wsb, so + 16, tiny_d ? pow2_tiny(sb + seed) : pow2_small(sb + seed))
             wsb[so + 18] = uint8(0)
             wsb[so + 19] = uint8(0)
         } elif (fmt == 4) {
             for (blk in range(8)) {   // one f16 d per 32-block, words 0..3; 16..19 pad
-                let h = f32_to_f16(tiny_d ? pow2_tiny(sb + seed + int64(blk)) : pow2_small(sb + seed + int64(blk)))
-                wsb[so + blk * 2] = uint8(h & 0xFFu)
-                wsb[so + blk * 2 + 1] = uint8((h >> 8u) & 0xFFu)
+                put_f16(wsb, so + blk * 2, tiny_d ? pow2_tiny(sb + seed + int64(blk)) : pow2_small(sb + seed + int64(blk)))
             }
             for (i in range(16, 20)) {
                 wsb[so + i] = uint8(0)
             }
         } else {
-            let hd = f32_to_f16(tiny_d ? pow2_tiny(sb + seed) : pow2_small(sb + seed))
-            let hm = f32_to_f16(tiny_d ? pow2_tiny(sb + seed + 1l) : pow2_small(sb + seed + 1l))
-            wsb[so] = uint8(hd & 0xFFu)
-            wsb[so + 1] = uint8((hd >> 8u) & 0xFFu)
-            wsb[so + 2] = uint8(hm & 0xFFu)
-            wsb[so + 3] = uint8((hm >> 8u) & 0xFFu)
+            put_f16(wsb, so, tiny_d ? pow2_tiny(sb + seed) : pow2_small(sb + seed))
+            put_f16(wsb, so + 2, tiny_d ? pow2_tiny(sb + seed + 1l) : pow2_small(sb + seed + 1l))
             for (i in range(16)) {   // 8 sc + 8 mn, 6-bit
                 wsb[so + 4 + i] = uint8(int(lcg_byte(st)) & 63)
             }
@@ -97,7 +100,7 @@ def dequant_kq_stack(fmt : int; wqb : array<uint8>; wsb : array<uint8>; rows, n 
             let wo = rr * n + sbi * 256l
             if (fmt == 4) {
                 for (blk in range64(8l)) {
-                    let d = f16_to_f32(uint(wsb[so + blk * 2l]) | (uint(wsb[so + blk * 2l + 1l]) << 8u))
+                    let d = get_f16(wsb, so + blk * 2l)
                     for (m in range64(16l)) {
                         let b = int(wqb[qo + blk * 16l + m])
                         w[wo + blk * 32l + m] = d * float((b & 15) - 8)
@@ -105,7 +108,7 @@ def dequant_kq_stack(fmt : int; wqb : array<uint8>; wsb : array<uint8>; rows, n 
                     }
                 }
             } elif (fmt == 3) {
-                let d = f16_to_f32(uint(wsb[so + 16l]) | (uint(wsb[so + 17l]) << 8u))
+                let d = get_f16(wsb, so + 16l)
                 for (blk in range64(8l)) {
                     let shift = int(2l * (blk % 4l))
                     let vlo = int(wsb[so + 2l * blk])
@@ -123,8 +126,8 @@ def dequant_kq_stack(fmt : int; wqb : array<uint8>; wsb : array<uint8>; rows, n 
                     }
                 }
             } else {
-                let d = f16_to_f32(uint(wsb[so]) | (uint(wsb[so + 1l]) << 8u))
-                let dmin = f16_to_f32(uint(wsb[so + 2l]) | (uint(wsb[so + 3l]) << 8u))
+                let d = get_f16(wsb, so)
+                let dmin = get_f16(wsb, so + 2l)
                 for (blk in range64(8l)) {
                     let d1 = d * float(uint(wsb[so + 4l + blk]))
                     let m1 = dmin * float(uint(wsb[so + 12l + blk]))
@@ -158,9 +161,7 @@ def fill_q8_stack(rows, n : int64; seed : int64; var wqb : array<uint8>; var wsb
     scales |> resize(rows * nb)
     for (i in range64(rows * nb)) {
         scales[i] = pow2_small(i + seed)
-        let h = f32_to_f16(scales[i])
-        wsb[i * 2l] = uint8(h & 0xFFu)
-        wsb[i * 2l + 1l] = uint8((h >> 8u) & 0xFFu)
+        put_f16(wsb, i * 2l, scales[i])
     }
     for (i in range64(rows * n)) {
         let q = int((i * 7l + seed) % 255l - 127l)
@@ -169,24 +170,26 @@ def fill_q8_stack(rows, n : int64; seed : int64; var wqb : array<uint8>; var wsb
     }
 }
 
-//! the device-vs-reference bars every Vulkan cell shares: an element is off when it misses BOTH
-//! the absolute bar and the relative one (a fraction of the reference row's max); a NaN is inside neither
-def count_bad(gpu, refv : array<float>; abs_bar, rel_bar : float) : int {
-    var bad = 0
-    for (g, r in gpu, refv) {
-        let d = abs(g - r)
-        if (!(d <= max(abs_bar, rel_bar))) {
-            bad++
-        }
-    }
-    return bad
-}
-
 //! one hashed word of synthetic quant bytes for index i - the kernel suite's and the probes' plane filler
 def hash_word(i : uint) : uint {
     var h = i * 2654435761u
     h ^= h >> 16u
     h *= 2246822519u
     return h ^ (h >> 13u)
+}
+
+//! `n` hashed words `hash_word(i * mul + add)`: a synthetic quant plane
+def hashed_words(n : int; mul, add : uint) : array<uint> {
+    return <- [for (i in range(n)); hash_word(uint(i) * mul + add)]
+}
+
+//! `n` hashed floats `float(hash_word(i + salt) % modulus) / div - off`: a cell's unit-range input fill
+def hash_fill(n : int; salt, modulus : uint; div, off : float) : array<float> {
+    return <- [for (i in range(n)); float(hash_word(uint(i) + salt) % modulus) / div - off]
+}
+
+//! `n` hashed floats `float(hash_word(i + salt) % 2001) * 0.001 - 1`: the combine cells' rows, in steps of 1e-3 over [-1, 1]
+def hash_steps(n : int; salt : uint) : array<float> {
+    return <- [for (i in range(n)); float(hash_word(uint(i) + salt) % 2001u) * 0.001 - 1.0]
 }
 

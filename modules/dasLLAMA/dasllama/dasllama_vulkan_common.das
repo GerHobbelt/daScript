@@ -12,6 +12,7 @@ require vulkan/vulkan_boost
 require spirv/spirv_dis
 require dasllama/dasllama_math
 require dasllama/dasllama_gpu_tier
+require dasllama/dasllama_kv_dtype   // KVDtype and its unit arithmetic: the mirror's codec
 require dasllama/dasllama_gemm_schema
 require dasllama/dasllama_env
 require dasllama/dasllama_config
@@ -21,6 +22,7 @@ require strings
 require daslib/strings_boost
 require daslib/fio
 require daslib/enum_trait
+require daslib/algorithm
 
 // The Vulkan backend's shared infrastructure: device state (GpuState/g_gpu), buffer/descriptor
 // makers, upload + stacks + host-import, the weight arena, command/submit plumbing, the
@@ -126,7 +128,14 @@ def cm2_fa_on : bool => g_gpu.has_coopmat2_fa && g_gpu.coopmat_mode == COOPMAT_C
 
 //! the KHR flash tile serves a head of 64, 128, 256 or 512 on an ungated model, the softcap at 256 alone (its cap stamps); the pre-flight and the window chain pick from this one predicate
 def fa_khr_serves(hs : int64; cap : float; gated : bool) : bool
-    => (hs == 64l || hs == 128l || hs == 256l || hs == 512l) && !gated && (cap == 0.0 || hs == 256l)
+    => fa_head_ok(hs) && !gated && (cap == 0.0 || hs == 256l)
+
+//! the cm2 flash tile serves a head of 64, 128, 256 or 512, gated at 256 alone, the softcap at an ungated 256 alone
+def fa_cm2_serves(hs : int64; cap : float; gated : bool) : bool
+    => fa_head_ok(hs) && (!gated || hs == 256l) && (cap == 0.0 || (hs == 256l && !gated))
+
+//! the head sizes a flash tile is stamped at
+def fa_head_ok(hs : int64) : bool => hs == 64l || hs == 128l || hs == 256l || hs == 512l
 
 //! the per-32 formats that serve as routed expert planes only: their one cm2 column is the s tile
 def cm2_b32_routed(fmt : int) : bool => fmt == int(KqFmt.q51) || fmt == int(KqFmt.mx4) || fmt == int(KqFmt.iq4nl32)
@@ -329,6 +338,8 @@ let AT_MAX_KV = 2_048l   // an MHA 16 x 128 layer (Qwen1.5-MoE) - the k/v planes
 let AT_MAX_HS = 256l
 let AT_META_BYTES = 128l
 let AR_MAX_DIM = 8_192l   // the add-rms kernels' row stash: 32 KB of the 48 KiB workgroup memory the tier requires of a device
+let RDEC_MIR_SLACK_ROWS = 16l   //! the KV rows a flash fragment may read past a window's end
+let RDEC_MIR_SLACK = RDEC_MIR_SLACK_ROWS * AR_MAX_DIM   //! slack elements past each KV mirror's last plane and past a block codec's shadow rows: one fragment at the widest KV row the prepare admits
 // smalls plane float offsets: [eps, scale] consts, the per-head qk-rms weight rows, then the
 // window's cos/sin rope rows packed contiguously (sin offset = AT_SM_COS + rows*half, meta [13])
 let AT_SM_RMSQ = 16l
@@ -2284,6 +2295,8 @@ struct RLayer {
     s_qkn : VkDescriptorSet         // per-head q/k rmsnorm class set (qk_norm models only)
     s_qkn_rope : VkDescriptorSet    // the fused qk-rmsnorm + rope + KV store (qk_norm models only; per-token words ride the shared TokMeta)
     s_rope : VkDescriptorSet        // rope + KV store class set
+    s_kv_store : VkDescriptorSet    //! a block codec's store of the staged rows into the mirror
+    s_unrot : VkDescriptorSet       //! tq4: the attention rows out of the rotated basis
     s_attn : VkDescriptorSet        // decode attention class set
     s_quant_at : VkDescriptorSet
     s_wo : VkDescriptorSet
@@ -2297,7 +2310,7 @@ struct RLayer {
     s_quant_xb2 : VkDescriptorSet
     s_gate, s_up : VkDescriptorSet
     s_actrq : VkDescriptorSet
-    s_gu : VkDescriptorSet          //! the fused gate + up + act + Q8_0 requant dispatch (`Q8GemvGu`), where the triple is q8 with a Q8_0 feed
+    s_gu : VkDescriptorSet          //! the fused gate + up + act + Q8_0 requant dispatch (`Q8GemvGuN1`), where the triple is q8 with a Q8_0 feed
     gu_on : bool
     s_down : VkDescriptorSet
     s_addr_next : VkDescriptorSet
@@ -2313,7 +2326,7 @@ struct RLayer {
     hs, qd, kvd, hid, rot : int64   //! head size, query width, kv width, dense FFN width, rotary width per head
     kv_mul : int64                  //! query heads per kv head
     window : int64                  //! positions a sliding layer attends over; 0 = every position
-    mir_base : int64                //! this layer's first element in each K/V mirror side (its rows are seq_cap x kvd from there)
+    mir_base : int64                //! this layer's first unit in each K/V mirror side (its rows are seq_cap x the row's units from there)
     cbase : int64                   //! its rope class's row base inside a position's cos/sin plane
     boff : int64                    //! its row base in the q/k/v bias plane
     pf_fa : bool                    //! the window chain takes the cm2 flash tile on this layer (its head size has a stamp)
@@ -2429,14 +2442,13 @@ struct RDec {
     weight_bytes : int64          // the plan's weight bytes on the device (the warm-up self-check's bandwidth floor)
     n_layers, dim, qd, kv_dim, head_size, n_heads, kv_mul, hidden, vocab, seq_cap : int64
     neox : bool
-    kv16 : bool                   // the mirror codec: f16 rows (the default) vs f32; sessions must match
-    kv_esz : int64                // mirror element bytes (2 or 4)
+    kv_dt : KVDtype               //! the mirror codec
     qk_norm : bool                // per-head q/k rmsnorm role armed (norms buffer carries the rows)
     norms_bytes : int64           // full norms buffer size (grows past the fixed layout under qk_norm)
     ar_scal_off : int64            // eps/ascale pair, appended to the norms buffer (float units) —
                                    // the fused ar+requant needs binding 4 for its scale output
     cos_elems : int64              //! a position's cos/sin plane: every rope class's row (cos[half] + sin[half]) end to end
-    mir_elems : int64              //! one K/V mirror side's elements over every attention layer (seq_cap x its kvd each)
+    mir_units : int64              //! one K/V mirror side's units over every attention layer (seq_cap x its row's units each): elements, or blocks under a block codec
     eps, scale : float
     // per-token device buffers
     x_dev, xb_dev : uint64        // residual, normed activation
@@ -2451,8 +2463,15 @@ struct RDec {
     gate_dev, up_dev : uint64
     ffnout_dev : uint64
     xb2_dev : uint64              // wo output
-    k_mirror, v_mirror : uint64   // `regions` consecutive copies of mir_elems elements of the kv16 codec: each attention layer's [seq_cap x its kvd] rows from RLayer.mir_base
-    regions : int64 = 1l          //! one mirror region per served stream: a region is a session's whole K/V history, addressed as an element offset into both sides
+    k_mirror, v_mirror : uint64   // `regions` consecutive copies of `mir_units` units in the armed codec: each attention layer's seq_cap rows from RLayer.mir_base
+    kst_dev, vst_dev : uint64     //! a block codec's staged rows: the token command's float K and V rows [nb x kv_dim], which the codec's store quantizes into the mirror
+    stage_tok : HostBuf           //! ... and the token block the staging stores read: row r at position r of the staged planes
+    ksh_dev, vsh_dev : uint64     //! a block codec's f16 shadow of one layer's rows [seq_cap x kv_dim], refilled before each layer's prefill attention
+    pf_kst, pf_vst : uint64       //! the prefill window's staged rows [PF_WINDOW x kv_dim]
+    pf_kv_store_set, pf_kv_shadow_set : VkDescriptorSet   //! the window's quant store and its shadow pass
+    pf_unrot_set : VkDescriptorSet  //! tq4: the window's attention rows out of the rotated basis
+    tq4_signs_dev : uint64          //! tq4: the rotation's sign row, `KV_TQ4_SIGNS` floats
+    regions : int64 = 1l          //! one mirror region per served stream: a region is a session's whole K/V history, addressed as a unit offset into both sides
     region : int64                //! the region every mirror address and the submitted token command resolve against (`vk_rdec_select_region`)
     n_attn : int64                // attention layers = mirror slots
     q_gated : bool                // the q GEMV writes [q | gate] per head (2*qd rows); rope/attention read q head-strided
@@ -2747,11 +2766,31 @@ def f16g_shape_ok(dim : int64) : bool => g_gpu.coopmat_mode == COOPMAT_CM2 && di
 
 var g_rd : RDec?
 
-//! a layer's first mirror element in the selected region
-def rd_mir_base(L : RLayer) : int64 => L.mir_base + g_rd.region * g_rd.mir_elems
+//! a layer's first mirror unit in the selected region
+def rd_mir_base(L : RLayer) : int64 => L.mir_base + g_rd.region * g_rd.mir_units
 
 //! one mirror side's binding: all `regions` copies end to end
-def rd_mir_bytes : int64 => g_rd.regions * g_rd.mir_elems * g_rd.kv_esz
+def rd_mir_bytes : int64 => g_rd.regions * g_rd.mir_units * kv_unit_bytes(g_rd.kv_dt)
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-kv-block-codecs")]
+def rd_kv_row_units(kvd : int64) : int64 => kv_row_units(g_rd.kv_dt, kvd)
+
+def rd_kv16 : bool => g_rd.kv_dt == KVDtype.f16
+def rd_kvq8 : bool => g_rd.kv_dt == KVDtype.q8_0
+def rd_kvtq4 : bool => g_rd.kv_dt == KVDtype.tq4
+def rd_kv_block_codec : bool => kv_block_codec(g_rd.kv_dt)
+
+//! the prefill's attention reads f16 rows: the f16 mirror's own, or a block-codec mirror's shadow
+def rd_pf_reads_f16 : bool => g_rd.kv_dt != KVDtype.f32
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-kv-tq4-basis")]
+def rd_attn_gated : bool => g_rd.q_gated && !rd_kvtq4()
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-kv-tq4-basis")]
+def pf_fa_lands_f16(wo_f16 : bool) : bool => wo_f16 && !rd_kvtq4()
+
+//! one shadow plane's bytes: the widest layer's rows at seq_cap as halves, and the slack a flash fragment reads past them
+def rd_shadow_bytes : int64 => (g_rd.seq_cap * g_rd.kv_dim + RDEC_MIR_SLACK) * 2l
 
 //! the decided-once set families (the fused sites', the N-row rail's, the combine's) rebuild on their next ensure: a
 //! set they read was replaced
@@ -2763,24 +2802,12 @@ def rd_unmake_sets {
 
 //! every region's token and draft commands and the verify commands re-record: the sets or planes they reference were replaced
 def rd_invalidate_token {
-    for (rec in g_rd.tok_recorded) {
-        rec = false
-    }
-    for (rec in g_rd.seg_recorded) {
-        rec = false
-    }
-    for (rec in g_rd.tok_wide_recorded) {
-        rec = false
-    }
-    for (rec in g_rd.tok_n_recorded) {
-        rec = false
-    }
-    for (rec in g_rd.head_draft_recorded) {
-        rec = false
-    }
-    for (rec in g_rd.v_recorded) {
-        rec = false
-    }
+    fill(g_rd.tok_recorded, false)
+    fill(g_rd.seg_recorded, false)
+    fill(g_rd.tok_wide_recorded, false)
+    fill(g_rd.tok_n_recorded, false)
+    fill(g_rd.head_draft_recorded, false)
+    fill(g_rd.v_recorded, false)
 }
 
 let RD_UNSPLIT_POS = 512l   //! the token command submits its unsplit attention twin under this position (`ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-decode-attn-split`)
@@ -3027,7 +3054,7 @@ let VHZ_XQ = 0x4u         // quantized activations xq+xs
 let VHZ_Q = 0x8u          // q rows
 let VHZ_KVK = 0x10u       // kv panel, k half
 let VHZ_KVV = 0x20u       // kv panel, v half
-let VHZ_VST = 0x40u       // prefill v-GEMM staging (pf_v)
+let VHZ_VST = 0x40u       // prefill v-GEMM staging (pf_v), and a block codec's staged K/V rows
 let VHZ_MIR = 0x80u       // k/v mirrors
 let VHZ_ATT = 0x100u      // attention out
 let VHZ_AQ = 0x200u       // quantized attention out aq+as
@@ -3084,7 +3111,7 @@ let VHS_ACTS = 0x200000u   // an attention feed image (the next layer's q-stack 
 let VHS_GACTS = 0x400000u  // the gate/up feed images
 let VHS_LOG = 0x800000u   // the router logits
 let VHS_META = 0x1000000u  // the three stacks' slot metas + the combine weights
-let VHZ_SK = 0x40000u     // cm2 split-k partial planes (the reduce's input scratch) — shares the VHZ namespace with the roles it interleaves
+let VHZ_SK = 0x40000u     // cm2 split-k partial planes (the reduce's input scratch), and a block codec's f16 shadow — shares the VHZ namespace with the roles it interleaves
 let VHZ_DNP = 0x80000u    // deltanet projection row: the qkv half (the z half rides VHZ_DNZ, so the two GEMVs co-run)
 let VHZ_DNST = 0x100000u  // deltanet per-layer state (in place)
 let VHZ_DNSM = 0x200000u  // deltanet per-layer smalls (beta/g rows + the conv ring)
@@ -3170,25 +3197,18 @@ var g_vkd_spv_keep = false
 var g_vkd_spv_kept : table<string; array<uint>>
 
 // once-per-class named decline log for the workgroup-footprint gate below
-var private g_wg_declined : table<string>
+var private g_wg_decline : VkDeclineCounter
 
 // the [vk_dispatch]-generated ensure_ calls this BEFORE building the pipeline: a class whose
 // @workgroup members exceed the device's shared-memory cap declines by name instead of dying
 // in vkCreateComputePipelines (MoltenVK: "Threadgroup memory size exceeds the maximum")
 def vkd_wg_fits(wg_bytes : int; kname : string) : bool {
-    if (uint(wg_bytes) <= g_gpu.max_wg_bytes) {
-        return true
-    }
-    vkd_wg_decline(wg_bytes, kname)
-    return false
+    return uint(wg_bytes) <= g_gpu.max_wg_bytes || vkd_wg_decline(wg_bytes, kname)
 }
 
-[cold_path]   // once per declined kernel name
-def private vkd_wg_decline(wg_bytes : int; kname : string) {
-    if (!key_exists(g_wg_declined, kname)) {
-        g_wg_declined |> insert(kname)
-        to_log(LOG_INFO, "dasLLAMA vulkan tier: {kname}: workgroup footprint {wg_bytes} B exceeds device cap {int(g_gpu.max_wg_bytes)} B - kernel declined\n")
-    }
+[cold_path]
+def private vkd_wg_decline(wg_bytes : int; kname : string) : bool {
+    return note(g_wg_decline, kname, "workgroup", "the workgroup footprint {wg_bytes} B exceeds the device cap {int(g_gpu.max_wg_bytes)} B")
 }
 
 [cold_path]   // family layout creation — once per class family
@@ -3583,19 +3603,61 @@ def free_transient_cmd(var raw : VkCommandBuffer) {
 def cmd_one_shot(rec : block<(raw : VkCommandBuffer; var h : VkHaz) : void>) {
     var raw = alloc_transient_cmd()
     var h : VkHaz
-    record_submit_wait(raw) $(r : VkCommandBuffer) {
+    record_submit_wait(raw, false) $(r : VkCommandBuffer) {
         invoke(rec, r, h)
     }
     free_transient_cmd(raw)
 }
 
-//! `rec` recorded into `raw`, submitted on the compute queue and waited: the one-shot commands' shared body
-def private record_submit_wait(var raw : VkCommandBuffer; rec : block<(raw : VkCommandBuffer) : void>) {
+//! `rec` recorded into `raw` (reset first under `reset`), submitted on the compute queue and waited: the one-shot commands' shared body
+def record_submit_wait(var raw : VkCommandBuffer; reset : bool; rec : block<(raw : VkCommandBuffer) : void>) {
+    cmd_open(raw, reset)
+    invoke(rec, raw)
+    cmd_close(raw)
+    submit_wait(raw)
+}
+
+//! `raw` begun, reset first under `reset`; returns the fresh hazard rail its recording starts on
+def cmd_open(raw : VkCommandBuffer; reset : bool) : VkHaz {
+    if (reset) {
+        let rf : VkCommandBufferResetFlags
+        vk_check(vkResetCommandBuffer(raw, rf), null)
+    }
     let begin = VkCommandBufferBeginInfo()
     vk_check(vkBeginCommandBuffer(raw, begin), null)
-    invoke(rec, raw)
+    return VkHaz()
+}
+
+def cmd_close(raw : VkCommandBuffer) {
     vk_check(vkEndCommandBuffer(raw), null)
-    submit_wait(raw)
+}
+
+//! `raw` ended and `next` reset and begun: a recorder's cut between two commands, on a fresh hazard rail
+def cmd_reopen(raw, next : VkCommandBuffer) : VkHaz {
+    cmd_close(raw)
+    return cmd_open(next, true)
+}
+
+//! `raw` recorded by `rec` between `cmd_open` and `cmd_close`
+def record_cmd(raw : VkCommandBuffer; reset : bool; rec : block<(raw : VkCommandBuffer; var h : VkHaz) : void>) {
+    var h = cmd_open(raw, reset)
+    invoke(rec, raw, h)
+    cmd_close(raw)
+}
+
+//! the same, the rail's node and barrier counts logged under `tag` at DASLLAMA_GPU_PROF=1
+def record_cmd(raw : VkCommandBuffer; reset : bool; tag : string; rec : block<(raw : VkCommandBuffer; var h : VkHaz) : void>) {
+    var h = cmd_open(raw, reset)
+    invoke(rec, raw, h)
+    cmd_close(raw, h, tag)
+}
+
+//! `raw` ended, its rail's node and barrier counts logged under `tag` at DASLLAMA_GPU_PROF=1
+def cmd_close(raw : VkCommandBuffer; h : VkHaz; tag : string) {
+    if (vk_prof()) {
+        to_log(LOG_INFO, "{tag} hz: {h.disp} nodes, {h.barriers} barriers\n")
+    }
+    cmd_close(raw)
 }
 
 //! the DASLLAMA_GPU_PROF=1 ledger of an encode chain: the role of every GPU timestamp the chain wrote (stamp 0 is the baseline)
@@ -3702,17 +3764,27 @@ def readback_range(dev : uint64; bits : uint; off : int64; hb : HostBuf; var dst
         vhz_dep(raw, h, bits, 0u, true)
         cmd_copy_range(raw, dev, off, hb.buf, 0l, bytes)
     }
+    host_buf_read(hb, unsafe(reinterpret<void?>(dst)), bytes)
+}
+
+//! a host cut's landing: `rows` x rows from `xsrc` and their router logits from `logsrc` into the host buffers the host's routed sum reads
+def host_land(raw : VkCommandBuffer; var h : VkHaz; xsrc : uint64; xhost : HostBuf; logsrc : uint64; loghost : HostBuf; rows : int64) {
+    vhz_dep(raw, h, VHZ_XB | VHZ_MRT, 0u, true)
+    cmd_copy_whole(raw, xsrc, xhost.buf, g_rd.dim * 4l * rows)
+    cmd_copy_whole(raw, logsrc, loghost.buf, g_rd.ner * 4l * rows)
+}
+
+//! `bytes` of a host buffer's mapped memory from byte `off` copied to `dst`
+def host_buf_read(hb : HostBuf; var dst : void?; bytes : int64; off : int64 = 0l) {
     unsafe {
-        memcpy(reinterpret<void?>(dst), hb.mapped, bytes)
+        memcpy(dst, reinterpret<void?>(reinterpret<uint8?>(hb.mapped) + off), bytes)
     }
 }
 
 //! the same on the shared batch command buffer, reset first: the decode's cold state uploads and readbacks
 def batch_cmd_one_shot(rec : block<(raw : VkCommandBuffer) : void>) {
     var raw = g_gpu.batch_cmd
-    let rf : VkCommandBufferResetFlags
-    vk_check(vkResetCommandBuffer(raw, rf), null)
-    record_submit_wait(raw, rec)
+    record_submit_wait(raw, true, rec)
 }
 
 //! a persistent command on `pool`, model-owned through `owned` (the list the model drop frees)
@@ -3730,8 +3802,82 @@ def alloc_xfer_cmd : VkCommandBuffer => alloc_owned_cmd(g_gpu.xfer_pool, g_gpu.m
 
 //! `bytes` of a device buffer from `off` zeroed by a fill command, no host array
 def upload_zeros(dev : uint64; off, bytes : int64) {
+    upload_fill(dev, off, bytes, 0u)
+}
+
+//! `bytes` of a device buffer from `off` set to the 32-bit `word` by a fill command (`0x3F800000u` is 1.0f), no host array
+def upload_fill(dev : uint64; off, bytes : int64; word : uint) {
     cmd_one_shot() $(raw : VkCommandBuffer; var _h : VkHaz) {
-        cmd_fill_zero(raw, dev, off, bytes)
+        vkCmdFillBuffer(raw, unsafe(reinterpret<VkBuffer>(dev)), uint64(off), uint64(bytes), word)
+    }
+}
+
+//! `tab[key]`, built by `build` on its first ask: the drivers' int-keyed set caches
+def cached(@scratch var tab : table<int; auto(TT)>; key : int; build : block<() : TT>) : TT {
+    if (!key_exists(tab, key)) {
+        tab[key] = invoke(build)
+    }
+    return tab[key]
+}
+
+//! float `ranges` (a source and its element count each) laid end to end with `ones_n` ones after them, staged into `dev`
+//! from its first byte in one upload
+def upload_float_ranges(dev : uint64; ranges : array<tuple<p : float const?; n : int64>>; ones_n : int64 = 0l) {
+    var total = ones_n
+    for (r in ranges) {
+        total += r.n
+    }
+    var rows : array<float>
+    rows |> reserve_resize(total)
+    var at = 0l
+    for (r in ranges) {
+        if (r.n > 0l) {
+            unsafe {
+                memcpy(addr<void?>(rows[at]), reinterpret<void?>(r.p), r.n * 4l)
+            }
+        }
+        at += r.n
+    }
+    for (i in range64(at, total)) {
+        rows[i] = 1.0
+    }
+    upload_region_at(dev, 0l, unsafe(addr<uint8 const?>(rows[0])), total * 4l)
+    delete rows
+}
+
+//! batch GEMM schedule record `rid` = [wblk0, row0, rows, 0] at word 4 rid and its map of `groups` words at the cursor;
+//! returns the map's word offset and advances the cursor
+def batch_sched_map(var mp : uint?; var cur : int64&; rid : int64; wblk0, rows, groups : int64; row0 : int64 = 0l) : uint {
+    unsafe {
+        mp[rid * 4l] = uint(wblk0)
+        mp[rid * 4l + 1l] = uint(row0)
+        mp[rid * 4l + 2l] = uint(rows)
+        mp[rid * 4l + 3l] = 0u
+        let at = cur
+        for (g in range64(groups)) {
+            mp[at + g] = uint(rid)
+        }
+        cur += groups
+        return uint(at)
+    }
+}
+
+//! a device buffer of `bytes` whose words `fill` writes into the staging buffer, staged up once
+def make_staged_buf(bytes : int64; fill : block<(var words : uint?) : void>) : uint64 {
+    let dev = make_device_buf(bytes)
+    invoke(fill, unsafe(reinterpret<uint?>(g_gpu.staging.mapped)))
+    staged_upload(dev, 0l, bytes)
+    return dev
+}
+
+let F32_ONE_WORD = 0x3F800000u   //! 1.0f as the word `upload_fill` writes
+
+//! a device buffer of `n` words counting up from `base`: the slot and row identity maps
+def make_ramp_buf(n, base : int64) : uint64 {
+    return make_staged_buf(n * 4l) $(var words : uint?) {
+        for (i in range64(n)) {
+            unsafe(words[i]) = uint(base + i)
+        }
     }
 }
 

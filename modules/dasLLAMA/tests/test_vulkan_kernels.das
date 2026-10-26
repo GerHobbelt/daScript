@@ -18,7 +18,7 @@ require ?vulkan vulkan/vulkan_boost
 require ?vulkan dasllama/dasllama_vulkan_common
 require ?vulkan dasllama/dasllama_env   // g_env_vulkan.coopmat - the resolved-default ladder cell pins and restores it
 require ?vulkan dasllama/dasllama_vulkan_classes
-require ?vulkan dasllama/dasllama_gpu_math   // softcap_exp - the softcap cells' oracle
+require dasllama/dasllama_gpu_math   // softcap_exp - the softcap cells' oracle
 require ?vulkan dasllama/dasllama_vulkan_prefill
 require ?vulkan dasllama/dasllama_vulkan_decode   // da_nsplit - the decode attention's key-split pick the tile-pick cell pins
 require ?vulkan dasllama/dasllama_vulkan_seams
@@ -94,11 +94,7 @@ struct TileFixture {
 def private tile_fixture(n, blk_k : int; var wqh, wsh : array<uint>; xf_mul, xf_add : uint) : TileFixture {
     let rows = TILE_CELL_ROWS0 + TILE_CELL_ROWS1
     let xf_words = (rows + TILE_SLACK_ROWS) * n / 2
-    var xfh : array<uint>
-    xfh |> resize(xf_words)
-    for (i in range(xf_words)) {
-        xfh[i] = ws_word(uint(i) * xf_mul + xf_add)   // f16 activation pairs
-    }
+    var xfh <- ws_plane(xf_words, xf_mul, xf_add)   // f16 activation pairs
     var f = TileFixture(n = n, blk_k = blk_k, rows = rows, wq_bytes = long_length(wqh) * 4l, ws_bytes = long_length(wsh) * 4l,
         xf_bytes = int64(xf_words) * 4l, y_bytes = int64(rows * TILE_CELL_D) * 4l)
     f.wqh <- wqh
@@ -126,14 +122,10 @@ def private tile_fixture_upload(var f : TileFixture) {
 def private q8_plane(totblk : int; wq_mul, wq_add, ws_mul, ws_add : uint; var wqh, wsh : array<uint>) {
     let qwords = totblk * int(Q8_BLOCK_ELEMS / 4l)   //! a byte an element: q8 has no `kq_desc` stride row (`kq_qsb` panics on it by design)
     let swords = (totblk * 2 + 3) / 4   //! an f16 scale a block
-    wqh |> resize(qwords)
-    wsh |> resize(swords)
-    for (i in range(qwords)) {
-        wqh[i] = hash_word(uint(i) * wq_mul + wq_add)
-    }
-    for (i in range(swords)) {
-        wsh[i] = ws_word(uint(i) * ws_mul + ws_add)
-    }
+    delete wqh
+    delete wsh
+    wqh <- hashed_words(qwords, wq_mul, wq_add)
+    wsh <- ws_plane(swords, ws_mul, ws_add)
 }
 
 //! the tile cells' q8 fmt-0 host planes from two seeds, K = n over both weight planes
@@ -250,10 +242,8 @@ def private fmt_tile_rows() : array<FmtTile> {
 def private fmt_tile_planes(row : FmtTile; var wqh, wsh : array<uint>) {
     static_if (typeinfo builtin_module_exists(vulkan)) {
         let units = 2 * TILE_CELL_D * (row.n / row.blk_k)
-        wqh |> resize(units * row.wq_words)
-        for (i in range(units * row.wq_words)) {
-            wqh[i] = hash_word(uint(i) + row.wq_seed)
-        }
+        delete wqh
+        wqh <- hashed_words(units * row.wq_words, 1u, row.wq_seed)
         if (row.form == ScaleForm.d_dmin_hash || row.form == ScaleForm.d_pairs || row.form == ScaleForm.hash_d) {
             wsh |> resize(units * 5)
         } elif (row.form == ScaleForm.d_hi_hash) {
@@ -378,19 +368,10 @@ struct private Sdot4Planes {
 //! their scales 0.375 + (i % 9) / 16 times `xs_mul`
 def private q8_sdot4_planes(units, wq_words, ws_words : int; ws_bytes : int64; xunits, xq_words : int; xs_mul : float) : Sdot4Planes {
     var p = Sdot4Planes(ws_bytes = ws_bytes)
-    p.wqh |> resize(units * wq_words)
-    p.wsh |> resize(ws_words)
-    p.xqh |> resize(xunits * xq_words)
+    p.wqh <- hashed_words(units * wq_words, 1u, 3u)
+    p.wsh <- ws_plane(ws_words, 1u, 7u)
+    p.xqh <- hashed_words(xunits * xq_words, 13u, 1u)
     p.xsh |> resize(xunits)
-    for (i in range(units * wq_words)) {
-        p.wqh[i] = hash_word(uint(i) + 3u)
-    }
-    for (i in range(ws_words)) {
-        p.wsh[i] = ws_word(uint(i) + 7u)
-    }
-    for (i in range(xunits * xq_words)) {
-        p.xqh[i] = hash_word(uint(i) * 13u + 1u)
-    }
     for (i in range(xunits)) {
         p.xsh[i] = (0.375 + float(i % 9) * 0.0625) * xs_mul
     }
@@ -594,7 +575,7 @@ def test_vkd_readonly_stamp(t0 : T?) {
 def test_vkd_fa_stamp_words(t0 : T?) {
     t0 |> run("the folded flash template's stamps: the KHR arm's shared-memory tiles exist on its stamps alone, and each arm asks for its own cooperative-matrix capability") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
-            if (!ensure_f16cvt_cls()) {   // engage the device without touching coopmat rails
+            if (!ensure_tower_clamp_cvt_cls()) {   // engage the device without touching coopmat rails
                 t |> skip("no Vulkan device")
                 return
             }
@@ -1026,14 +1007,12 @@ def test_vkd_ar_class(t0 : T?) {
             //! the biased add partner (gpt-oss's attention output bias): the bias row rides the norms plane past the norm row, the
             //! kernel adds it to the partner before the add; the seam fed the pre-added partner is the bit-exact reference
             {
-                var b : array<float>
+                var b <- row_fill(dim, 23, 0, 0.09, 3.1, 71)
                 var ab : array<float>
                 var wb : array<float>
-                b |> resize(dim)
                 ab |> resize(dim)
                 wb |> resize(2 * dim)
                 for (i in range(dim)) {
-                    b[i] = float((i * 23) % 71) * 0.09 - 3.1
                     ab[i] = a[i] + b[i]
                     wb[i] = w[i]
                     wb[dim + i] = b[i]
@@ -1132,8 +1111,9 @@ def private cls_ar_run(x, a, w : array<float>; pc; nrows : int) : tuple<y : arra
             cmd_copy_planes(raw, h, fixed_array(yd), host, fixed_array(bytes), 8u | 1u)
         }
         var y_out <- staged(host.mapped, 0l, n, type<float>)
-        vkd_read_back(xd, host, bytes)
-        var x_out <- staged(host.mapped, 0l, n, type<float>)
+        var x_out : array<float>
+        x_out |> resize(n)
+        readback_range(xd, 0u, host, unsafe(addr(x_out[0])), bytes)
         delete ysent
         return <- (y = y_out, x = x_out)
     } else {
@@ -1189,11 +1169,7 @@ def test_vkd_cls_epi_rows(t0 : T?) {
             let rows = 4l
             let cap = 30.0
             var supp <- [3u, 777u, 999u]
-            var y : array<float>
-            y |> resize(vocab * rows)
-            for (i in range64(vocab * rows)) {
-                y[i] = float((i * 37l) % 211l) * 0.7 - 60.0   //! reaches past the cap on both sides
-            }
+            var y <- row_fill(int(vocab * rows), 37, 0, 0.7, 60.0, 211)   //! reaches past the cap on both sides
             var want : array<float>   // the CPU form: the cap in the exp form the kernel takes, then the pins
             want |> resize(vocab * rows)
             for (i in range64(vocab * rows)) {
@@ -1425,14 +1401,8 @@ def test_vkd_actf16_base(t0 : T?) {
             let total = nelem * 2
             let g_bytes = int64(total) * 4l
             let h_bytes = int64(total) * 2l
-            var gh : array<float>
-            var uh : array<float>
-            gh |> resize(total)
-            uh |> resize(total)
-            for (i in range(total)) {
-                gh[i] = float((i * 29) % 61) * 0.06 - 1.9
-                uh[i] = float((i * 43) % 83) * 0.05 - 2.1
-            }
+            var gh <- row_fill(total, 29, 0, 0.06, 1.9, 61)
+            var uh <- row_fill(total, 43, 0, 0.05, 2.1, 83)
             // arm 0: the second row's data at the front, base 0; arm 1: the plane as is, base nelem
             var g0 : array<float>
             var u0 : array<float>
@@ -1505,6 +1475,11 @@ def private safe_half(i : uint) : uint {
 
 def private ws_word(i : uint) : uint {
     return safe_half(i * 7u + 3u) | (safe_half(i * 3u + 1u) << 16u)
+}
+
+//! `n` scale words `ws_word(i * mul + add)`: two finite halves a word
+def private ws_plane(n : int; mul, add : uint) : array<uint> {
+    return <- [for (i in range(n)); ws_word(uint(i) * mul + add)]
 }
 
 // ===== CPU oracles =====
@@ -1585,21 +1560,8 @@ struct private GemvFix {
 //! `hash_word(i * xq_mul + xq_add)`, its scales `xs0 + (i % xs_mod) * xs_step`
 def private gemv_fix(nreg, d, units, wq_words : int; wq_seed : uint; var wsh : array<uint>; xunits, xq_words : int; xq_mul, xq_add : uint;
                      xs0, xs_step : float; xs_mod : int) : GemvFix {
-    var f : GemvFix
-    let wq_n = nreg * d * units * wq_words
-    f.wqh |> resize(wq_n)
-    for (i in range(wq_n)) {
-        f.wqh[i] = hash_word(uint(i) + wq_seed)
-    }
-    f.wsh <- wsh
-    f.xqh |> resize(xunits * xq_words)
-    for (i in range(xunits * xq_words)) {
-        f.xqh[i] = hash_word(uint(i) * xq_mul + xq_add)
-    }
-    f.xsh |> resize(xunits)
-    for (i in range(xunits)) {
-        f.xsh[i] = xs0 + float(i % xs_mod) * xs_step
-    }
+    var f <- GemvFix(wqh <- hashed_words(nreg * d * units * wq_words, 1u, wq_seed), wsh <- wsh,
+        xqh <- hashed_words(xunits * xq_words, xq_mul, xq_add), xsh <- row_fill(xunits, 1, 0, xs_step, -xs0, xs_mod))
     f.regs |> resize(nreg * 2)
     for (r in range(nreg)) {
         f.regs[r * 2] = uint(r * d * units)
@@ -1707,11 +1669,7 @@ def test_vkd_kq_gemv_family(t0 : T?) {
             for (fmt in KQ_LEAF_FMTS) {
                 let sb_words = int(kq_qsb(kq_fmt_of_slot(fmt)) / 4l)
                 let ws_words_n = rows * nsb * int(kq_dev_ssb_i(fmt) / 4l)
-                var wsh : array<uint>
-                wsh |> resize(ws_words_n)
-                for (i in range(ws_words_n)) {
-                    wsh[i] = ws_word(uint(i) + uint(fmt) * 13u)
-                }
+                var wsh <- ws_plane(ws_words_n, 1u, uint(fmt) * 13u)
                 var f <- gemv_fix(nreg, d, nsb, sb_words, uint(fmt) * 77777u, wsh, nsb, 64, 31u, 5u, 0.5, 0.25, 7)
                 var y_ref <- kq_gemv_oracle(fmt, f.wqh, f.wsh, f.xqh, f.xsh, f.regs, nsb * 256, d, nreg)
                 with_cell_planes() $(var cp : CellPlanes) {
@@ -1773,26 +1731,10 @@ def test_vkd_kq_gemv_k4_gu(t0 : T?) {
             let nwsb = 2 * rows * nsb   // the gate stack's rows, then the up stack's
             let wq_words = nwsb * 32
             let ws_words_n = nwsb * int(kq_dev_ssb_i(fmt) / 4l)
-            var wqh : array<uint>
-            var wsh : array<uint>
-            var xqh : array<uint>
-            var xsh : array<float>
-            wqh |> resize(wq_words)
-            wsh |> resize(ws_words_n)
-            xqh |> resize(nsb * 64)
-            xsh |> resize(nsb)
-            for (i in range(wq_words)) {
-                wqh[i] = hash_word(uint(i) * 7u + 4441u)
-            }
-            for (i in range(ws_words_n)) {
-                wsh[i] = ws_word(uint(i) * 3u + 91u)
-            }
-            for (i in range(nsb * 64)) {
-                xqh[i] = hash_word(uint(i) * 23u + 17u)
-            }
-            for (i in range(nsb)) {
-                xsh[i] = 0.5 + float(i % 5) * 0.25
-            }
+            var wqh <- hashed_words(wq_words, 7u, 4441u)
+            var wsh <- ws_plane(ws_words_n, 3u, 91u)
+            var xqh <- hashed_words(nsb * 64, 23u, 17u)
+            var xsh <- row_fill(nsb, 1, 0, 0.25, -0.5, 5)
             var regs : array<uint>
             var regs3 : array<uint>
             regs |> resize(nreg * 2)
@@ -1919,14 +1861,8 @@ def test_vkd_act_family(t0 : T?) {
                 return
             }
             let nelem = 1024
-            var gh : array<float>
-            var uh : array<float>
-            gh |> resize(nelem)
-            uh |> resize(nelem)
-            for (i in range(nelem)) {
-                gh[i] = float((i * 29) % 61) * 0.21 - 6.0
-                uh[i] = float((i * 11) % 47) * 0.17 - 4.0
-            }
+            var gh <- row_fill(nelem, 29, 0, 0.21, 6.0, 61)
+            var uh <- row_fill(nelem, 11, 0, 0.17, 4.0, 47)
             let e_bytes = int64(nelem) * 4l
             let gd = make_device_buf(e_bytes)
             let ud = make_device_buf(e_bytes)
@@ -1951,7 +1887,7 @@ def test_vkd_act_family(t0 : T?) {
                 s_cls |> resize(nblk)
                 let wgs = 1l   // 256 threads cover both shapes at nelem = 1024
                 unsafe {
-                    fill_upload(hq2, 0l, q_bytes, I8_SENTINEL_BITS)
+                    upload_fill(hq2, 0l, q_bytes, I8_SENTINEL_BITS)
                     nan_sentinel_upload(hs2, s_bytes)
                     // the class kernel: gate@0, up@1, outq@2, outs@3
                     var sc = set_actrq_cls(fixed_array(gd, ud, hq2, hs2),
@@ -1992,18 +1928,12 @@ def test_vkd_act_family(t0 : T?) {
                 let nrow = 3
                 let nb = nrow * brow
                 var rex <- [uint(2), uint(0), uint(5)]
-                var gb : array<float>
-                var ub : array<float>
+                var gb <- row_fill(ne * brow, 13, 0, 0.3, 4.5, 31)   //! biases past the 7 clamp on some elements: the clamps must engage
+                var ub <- row_fill(ne * brow, 17, 0, 0.4, 5.6, 29)
                 var gh2 : array<float>
                 var uh2 : array<float>
-                gb |> resize(ne * brow)
-                ub |> resize(ne * brow)
                 gh2 |> resize(nb)
                 uh2 |> resize(nb)
-                for (i in range(ne * brow)) {
-                    gb[i] = float((i * 13) % 31) * 0.3 - 4.5   //! biases past the 7 clamp on some elements: the clamps must engage
-                    ub[i] = float((i * 17) % 29) * 0.4 - 5.6
-                }
                 for (e in range(nb)) {
                     let ex = int(rex[e / brow])
                     gh2[e] = gh[e] + gb[ex * brow + e % brow]
@@ -2099,17 +2029,13 @@ def test_vkd_act_family(t0 : T?) {
                 let nrows = 8
                 var sidx : array<uint>
                 var sw : array<float>
-                var rows : array<float>
                 sidx |> resize(npos * k)
                 sw |> resize(npos * k)
-                rows |> resize(nrows * n)
                 for (i in range(npos * k)) {
                     sidx[i] = hash_word(uint(i)) % uint(nrows)
                     sw[i] = 0.125 + float(i % 5) * 0.25
                 }
-                for (i in range(nrows * n)) {
-                    rows[i] = float((i * 7) % 93) * 0.13 - 5.5
-                }
+                var rows <- row_fill(nrows * n, 7, 0, 0.13, 5.5, 93)
                 let si_bytes = int64(npos * k) * 4l
                 let ro_bytes = int64(nrows * n) * 4l
                 let ac_bytes = int64(npos * n) * 4l
@@ -2261,18 +2187,10 @@ def test_vkd_rope_family(t0 : T?) {
             {
                 let npairs = (nh + nkvh) * half
                 let kpair0 = nh * half
-                var qh : array<float>
-                var kvh : array<float>
+                var qh <- row_fill(qd, 23, 0, 0.09, 3.0, 71)
+                var kvh <- row_fill(qd + 2 * kvd, 19, 0, 0.07, 2.9, 83)
                 var csh : array<float>
-                qh |> resize(qd)
-                kvh |> resize(qd + 2 * kvd)
                 csh |> resize(hs)
-                for (i in range(qd)) {
-                    qh[i] = float((i * 23) % 71) * 0.09 - 3.0
-                }
-                for (i in range(qd + 2 * kvd)) {
-                    kvh[i] = float((i * 19) % 83) * 0.07 - 2.9
-                }
                 for (i in range(half)) {
                     csh[i] = 0.3 + float(i % 9) * 0.07          // cos row
                     csh[half + i] = 0.1 + float(i % 7) * 0.11   // sin row
@@ -2323,10 +2241,8 @@ def test_vkd_rope_family(t0 : T?) {
                         cmd_copy_planes(raw2, h2, fixed_array(q2), host, fixed_array(q_bytes), 2u | 4u | 16u)
                     }
                     memcpy(addr<void?>(cls_q[0]), host.mapped, q_bytes)
-                    vkd_read_back(km2, host, m_bytes)
-                    memcpy(addr<void?>(cls_k[0]), host.mapped, m_bytes)
-                    vkd_read_back(vm2, host, m_bytes)
-                    memcpy(addr<void?>(cls_v[0]), host.mapped, m_bytes)
+                    readback_range(km2, 0u, host, addr(cls_k[0]), m_bytes)
+                    readback_range(vm2, 0u, host, addr(cls_v[0]), m_bytes)
                 }
                 //! oracle: bias first, then the engine's NEOX table rotation; v is raw plus bias — the approx bars ride out the device's fma contraction
                 var ref <- rope_kv_rows(qh, kvh, bh, csh, 0, qd, qd + kvd, 0, bpad, nh, nkvh, hs) $(x : float) => x
@@ -2347,20 +2263,12 @@ def test_vkd_rope_family(t0 : T?) {
                 let qstride = qd
                 let kstride = kvd
                 let eps = 1e-5
-                var qh : array<float>
-                var kh : array<float>
+                var qh <- row_fill(rows * qd, 31, 0, 0.08, 2.5, 67)
+                var kh <- row_fill(rows * kvd, 43, 0, 0.06, 1.7, 59)
                 var wh : array<float>
                 var eh : array<float>
-                qh |> resize(rows * qd)
-                kh |> resize(rows * kvd)
                 wh |> resize(2 * hs)
                 eh |> resize(1)
-                for (i in range(rows * qd)) {
-                    qh[i] = float((i * 31) % 67) * 0.08 - 2.5
-                }
-                for (i in range(rows * kvd)) {
-                    kh[i] = float((i * 43) % 59) * 0.06 - 1.7
-                }
                 for (i in range(2 * hs)) {
                     wh[i] = 0.4 + float(i % 13) * 0.06
                 }
@@ -2393,8 +2301,7 @@ def test_vkd_rope_family(t0 : T?) {
                         cmd_copy_planes(raw2, h2, fixed_array(q2), host, fixed_array(q_bytes), 1u | 16u)
                     }
                     memcpy(addr<void?>(cls_q[0]), host.mapped, q_bytes)
-                    vkd_read_back(k2, host, k_bytes)
-                    memcpy(addr<void?>(cls_k[0]), host.mapped, k_bytes)
+                    readback_range(k2, 0u, host, addr(cls_k[0]), k_bytes)
                 }
                 // oracle: per-head rms (1/sqrt(mean(v^2)+eps)) times the shared weight row —
                 // the device reduces sum-of-squares in tree order, so approx bars
@@ -2486,22 +2393,10 @@ def test_vkd_kq_batch_family(t0 : T?) {
                 let sb_words = int(kq_qsb(kq_fmt_of_slot(fmt)) / 4l)
                 let wswords = totsb * int(kq_dev_ssb_i(fmt) / 4l)
                 var p = Sdot4Planes(ws_bytes = int64(wswords) * 4l)
-                p.wqh |> resize(totsb * sb_words)
-                p.wsh |> resize(wswords)
-                p.xqh |> resize(rows * nsb * 64)
-                p.xsh |> resize(rows * nsb)
-                for (i in range(totsb * sb_words)) {
-                    p.wqh[i] = hash_word(uint(i) + uint(fmt) * 131u)
-                }
-                for (i in range(wswords)) {
-                    p.wsh[i] = ws_word(uint(i) + uint(fmt) * 17u)
-                }
-                for (i in range(rows * nsb * 64)) {
-                    p.xqh[i] = hash_word(uint(i) * 7u + 2u)
-                }
-                for (i in range(rows * nsb)) {
-                    p.xsh[i] = 0.3 + float(i % 11) * 0.05
-                }
+                p.wqh <- hashed_words(totsb * sb_words, 1u, uint(fmt) * 131u)
+                p.wsh <- ws_plane(wswords, 1u, uint(fmt) * 17u)
+                p.xqh <- hashed_words(rows * nsb * 64, 7u, 2u)
+                p.xsh <- row_fill(rows * nsb, 1, 0, 0.05, -0.3, 11)
                 //! one family set serves every format; region 1's weights follow region 0's stack in superblock units
                 var r <- sdot4_tile_run(n, d, cnt0, cnt1, 32, d * nsb, p) $(bufs : uint64[6]; sizes : int64[6]; raw2 : VkCommandBuffer; var h2 : VkHaz; wgs : int64) {
                     var sc = set_kq_batch_cls(bufs, sizes, fixed_array(1u, 2u, 0u, 4u, 8u, 16u))
@@ -2677,9 +2572,7 @@ def test_vkd_q8_khr_batch(t0 : T?) {
             let cnt0 = TILE_CELL_ROWS0
             let d = TILE_CELL_D
             let swgs = ((cnt0 + 127) / 128) * ((d + 127) / 128) * nsplit
-            var ssched : array<uint>
-            ssched |> resize(4 + swgs)
-            ssched[2] = uint(cnt0)   // one region at row 0 over the first weight plane; the map stays zero
+            let ssched = one_region_sched(cnt0, swgs)   // one region at row 0 over the first weight plane
             let y0_bytes = int64(cnt0 * d) * 4l
             let part_bytes = y0_bytes * int64(nsplit)
             let pd = make_device_buf(part_bytes)
@@ -2687,9 +2580,8 @@ def test_vkd_q8_khr_batch(t0 : T?) {
             let host_s = make_host_buf(y0_bytes, true, [cached = true])
             nan_sentinel_upload(pd, part_bytes)
             nan_sentinel_upload(yd_s, y0_bytes)
-            let ssc_bytes = int64(4 + swgs) * 4l
-            let sscd = make_device_buf(ssc_bytes)
-            upload_region_at(sscd, 0l, unsafe(addr<uint8 const?>(ssched[0])), ssc_bytes)
+            let ssc_bytes = ssched.bytes
+            let sscd = ssched.buf
             var scs = set_q8_batch_khr_cls(fixed_array(f.wqd, f.wsd, sscd, f.xfd, pd),
                 fixed_array(f.wq_bytes, f.ws_bytes, ssc_bytes, f.xf_bytes, part_bytes), fixed_array(1u, 2u, 0u, 4u, 8u))
             var srd = set_splitk_reduce_cls(fixed_array(pd, yd_s), fixed_array(part_bytes, y0_bytes), fixed_array(8u, 16u))
@@ -2714,7 +2606,6 @@ def test_vkd_q8_khr_batch(t0 : T?) {
             delete y_poison_s
             delete y_ref0
             delete y_split
-            delete ssched
             delete y_ref
             delete f
         } else {
@@ -2992,21 +2883,9 @@ def test_vkd_cm2l_split(t0 : T?) {
             let ttiles = (rows + 255) / 256
             let wgs = wtiles * ttiles * nsplit
             let totblk = d * nbb
-            var wqh : array<uint>
-            var wsh : array<uint>
-            var xfh : array<uint>
-            wqh |> resize(totblk * 8)
-            wsh |> resize((totblk + 1) / 2)
-            xfh |> resize(rows * n / 2)
-            for (i in range(totblk * 8)) {
-                wqh[i] = hash_word(uint(i) + 43u)     // arbitrary bytes — s8 quants
-            }
-            for (i in range((totblk + 1) / 2)) {
-                wsh[i] = ws_word(uint(i) + 337u)      // f16 scale pairs, finite halves
-            }
-            for (i in range(rows * n / 2)) {
-                xfh[i] = ws_word(uint(i) * 7u + 3u)   // f16 activation pairs
-            }
+            var wqh <- hashed_words(totblk * 8, 1u, 43u)     // arbitrary bytes — s8 quants
+            var wsh <- ws_plane((totblk + 1) / 2, 1u, 337u)   // f16 scale pairs, finite halves
+            var xfh <- ws_plane(rows * n / 2, 7u, 3u)   // f16 activation pairs
             let wq_bytes = int64(totblk) * 32l
             let ws_bytes = int64(length(wsh)) * 4l
             let xf_bytes = int64(rows * n) * 2l
@@ -3022,13 +2901,8 @@ def test_vkd_cm2l_split(t0 : T?) {
             y_cls |> resize(rows * d)
             var sched : array<uint>
             sched |> resize(4 + wgs)
-            sched[0] = 0u
-            sched[1] = 0u
-            sched[2] = uint(rows)
-            sched[3] = 0u
-            for (w in range(wgs)) {
-                sched[4 + w] = 0u
-            }
+            var cur = 4l
+            batch_sched_map(unsafe(addr(sched[0])), cur, 0l, 0l, int64(rows), int64(wgs))
             unsafe {
                 upload_region_at(wqd, 0l, addr<uint8 const?>(wqh[0]), wq_bytes)
                 upload_region_at(wsd, 0l, addr<uint8 const?>(wsh[0]), ws_bytes)
@@ -3113,19 +2987,9 @@ def private da_attn_rqk_arm(t : T?; hs, nheads, kv_mul, cnt, nsplit : int; rqk :
         let qdim = nheads * hs
         let scale = 0.125
         let blk = rqk == DA_RQ_Q8K ? 256 : 32
-        var qh : array<float>
-        var kh : array<float>
-        var vh : array<float>
-        qh |> resize(qdim)
-        kh |> resize(cnt * kvd)
-        vh |> resize(cnt * kvd)
-        for (i in range(qdim)) {
-            qh[i] = float((i * 41) % 73) * 0.05 - 1.8
-        }
-        for (i in range(cnt * kvd)) {
-            kh[i] = float((i * 17) % 97) * 0.03 - 1.4
-            vh[i] = float((i * 53) % 89) * 0.04 - 1.7
-        }
+        var qh <- row_fill(qdim, 41, 0, 0.05, 1.8, 73)
+        var kh <- row_fill(cnt * kvd, 17, 0, 0.03, 1.4, 97)
+        var vh <- row_fill(cnt * kvd, 53, 0, 0.04, 1.7, 89)
         let q_bytes = int64(qdim) * 4l
         let m_bytes = int64(cnt * kvd) * 4l
         let cnt_off = nheads * nsplit * (hs + 2)   //! the arrival counters past the pieces
@@ -3269,21 +3133,11 @@ def test_vkd_da_attn(t0 : T?) {
             let kvd = (nheads / kv_mul) * hs
             let cnt = 300   // crosses the 256-position chunk boundary: the alpha-rescale path runs
             let scale = 0.125
-            var qh : array<float>
-            var kh : array<float>
-            var vh : array<float>
+            var qh <- row_fill(nheads * hs, 41, 0, 0.05, 1.8, 73)
+            var kh <- row_fill(cnt * kvd, 17, 0, 0.03, 1.4, 97)
+            var vh <- row_fill(cnt * kvd, 53, 0, 0.04, 1.7, 89)
             var sh : array<float>
-            qh |> resize(nheads * hs)
-            kh |> resize(cnt * kvd)
-            vh |> resize(cnt * kvd)
             sh |> resize(1)
-            for (i in range(nheads * hs)) {
-                qh[i] = float((i * 41) % 73) * 0.05 - 1.8
-            }
-            for (i in range(cnt * kvd)) {
-                kh[i] = float((i * 17) % 97) * 0.03 - 1.4
-                vh[i] = float((i * 53) % 89) * 0.04 - 1.7
-            }
             sh[0] = scale
             let q_bytes = int64(nheads * hs) * 4l
             let m_bytes = int64(cnt * kvd) * 4l
@@ -3473,25 +3327,25 @@ def private da_attn_shape_arm(t : T?; hs, nheads, kv_mul, cnt, nsplit, nrows : i
         let kvd = (nheads / kv_mul) * hs
         let qdim = nheads * hs
         let scale = 0.125
-        let mir_elems = cnt * kvd
+        let mir_units = cnt * kvd
         var qh : array<float>
         var kh : array<float>
         var vh : array<float>
         qh |> resize(qdim * nrows)
-        kh |> resize(mir_elems * nrows)
-        vh |> resize(mir_elems * nrows)
+        kh |> resize(mir_units * nrows)
+        vh |> resize(mir_units * nrows)
         for (r in range(nrows)) {
             let rs = 1.0 + 0.5 * float(r)
             for (i in range(qdim)) {
                 qh[r * qdim + i] = (float(((i + r * 17) * 41) % 73) * 0.05 - 1.8) * rs
             }
-            for (i in range(mir_elems)) {
-                kh[r * mir_elems + i] = (float((i * 17) % 97) * 0.03 - 1.4) * rs
-                vh[r * mir_elems + i] = (float((i * 53) % 89) * 0.04 - 1.7) * rs
+            for (i in range(mir_units)) {
+                kh[r * mir_units + i] = (float((i * 17) % 97) * 0.03 - 1.4) * rs
+                vh[r * mir_units + i] = (float((i * 53) % 89) * 0.04 - 1.7) * rs
             }
         }
         let q_bytes = int64(qdim * nrows) * 4l
-        let m_bytes = int64(mir_elems) * int64(nrows) * 4l
+        let m_bytes = int64(mir_units) * int64(nrows) * 4l
         let tok_bytes = TOK_META_BYTES * int64(nrows)
         let rowwg = da_attn_row_wgs(int64(nheads), int64(kv_mul), int64(nsplit))
         let rowgroups = int(da_attn_row_wgs(int64(nheads), int64(kv_mul), 1l))   //! the (kv head, slab) groups a row: a counter each
@@ -3519,7 +3373,7 @@ def private da_attn_shape_arm(t : T?; hs, nheads, kv_mul, cnt, nsplit, nrows : i
                 tm[r].pos = uint(cnt - 1)
                 tm[r].cnt = uint(cnt)
                 tm[r].parity = 0u
-                tm[r].mirbase = uint(r * mir_elems)
+                tm[r].mirbase = uint(r * mir_units)
             }
             var sc = set_da_attn_cls(fixed_array(qd, kd, vd, yd, tokb.buf, partd, yd, yd),   //! unfolded: the quant bindings take the out rows (unwritten)
                 fixed_array(q_bytes, m_bytes, m_bytes, q_bytes, tok_bytes, p_bytes, q_bytes, q_bytes),
@@ -3544,7 +3398,7 @@ def private da_attn_shape_arm(t : T?; hs, nheads, kv_mul, cnt, nsplit, nrows : i
         y_ref |> resize(qdim * nrows)
         for (r in range(nrows)) {
             for (hh in range(nheads)) {
-                attn_row_oracle(qh, r * qdim + hh * hs, kh, r * mir_elems, vh, r * mir_elems, kvd, hh, hs, kv_mul, cnt, scale, y_ref, r * qdim + hh * hs)
+                attn_row_oracle(qh, r * qdim + hh * hs, kh, r * mir_units, vh, r * mir_units, kvd, hh, hs, kv_mul, cnt, scale, y_ref, r * qdim + hh * hs)
             }
         }
         let arm = "hs {hs} x {nheads} heads, {kv_mul} a kv head, {cnt} keys, {nsplit} split(s), {nrows} row(s){slab2 ? ", the two-head slab" : ""}"
@@ -3630,22 +3484,10 @@ def test_vkd_at_attn(t0 : T?) {
                 let qd = nheads * hs
                 let kvd = (nheads / kv_mul) * hs
                 let kpos = w0 + rows   // K/V panels hold absolute positions [0, w0+rows)
-                var qh : array<float>
-                var kh : array<float>
-                var vh : array<float>
-                var gh : array<float>
-                qh |> resize(rows * qd)
-                kh |> resize(kpos * kvd)
-                vh |> resize(kpos * kvd)
-                gh |> resize(rows * qd)
-                for (i in range(rows * qd)) {
-                    qh[i] = float((i * 41) % 73) * 0.05 - 1.8
-                    gh[i] = float((i * 29) % 61) * 0.06 - 1.9
-                }
-                for (i in range(kpos * kvd)) {
-                    kh[i] = float((i * 17) % 97) * 0.03 - 1.4
-                    vh[i] = float((i * 53) % 89) * 0.04 - 1.7
-                }
+                var qh <- row_fill(rows * qd, 41, 0, 0.05, 1.8, 73)
+                var kh <- row_fill(kpos * kvd, 17, 0, 0.03, 1.4, 97)
+                var vh <- row_fill(kpos * kvd, 53, 0, 0.04, 1.7, 89)
+                var gh <- row_fill(rows * qd, 29, 0, 0.06, 1.9, 61)
                 let q_bytes = int64(rows * qd) * 4l
                 let m_bytes = int64(kpos * kvd) * 4l
                 let qdev = make_device_buf(q_bytes)
@@ -3683,7 +3525,7 @@ def test_vkd_at_attn(t0 : T?) {
                 }
                 if (gated) {
                     for (i in range(rows * qd)) {
-                        y_ref[i] = y_ref[i] / (1.0 + exp(-gh[i]))
+                        y_ref[i] = sig_gate(y_ref[i], gh[i])
                     }
                 }
                 let bad = mismatch_approx(y_cls, y_ref)
@@ -3717,7 +3559,7 @@ def private fa_arm_ensure(khr : bool) : bool {
 }
 
 //! the f16-out twin is held to the f32 stamp's output through f16cvt, not to the oracle: the two stamps must agree bit for bit
-def private fa_tile_run(t : T?; khr : bool) {   // nolint:STYLE037 — one arm loop: the fixture, both stamps, the oracle and its controls
+def private fa_tile_run(t : T?; khr : bool) {
     static_if (typeinfo builtin_module_exists(vulkan)) {
         let tag = khr ? "fa_khr" : "fa_cm2"
         let nheads = 4
@@ -3743,19 +3585,11 @@ def private fa_tile_run(t : T?; khr : bool) {   // nolint:STYLE037 — one arm l
             let kvd = (nheads / kv_mul) * hs
             let kpos = w0 + rows
             let kpad = kpos + FA_SHADOW_SLACK_ROWS
-            var qh : array<float>
-            var kh : array<float>
-            var vh : array<float>
-            qh |> resize(rows * qd)
+            var qh <- row_fill(rows * qd, 41, 0, 0.05, 1.8, 73)
+            var kh <- row_fill(kpos * kvd, 17, 0, 0.03, 1.4, 97)
+            var vh <- row_fill(kpos * kvd, 53, 0, 0.04, 1.7, 89)
             kh |> resize(kpad * kvd)
             vh |> resize(kpad * kvd)
-            for (i in range(rows * qd)) {
-                qh[i] = float((i * 41) % 73) * 0.05 - 1.8
-            }
-            for (i in range(kpos * kvd)) {
-                kh[i] = float((i * 17) % 97) * 0.03 - 1.4
-                vh[i] = float((i * 53) % 89) * 0.04 - 1.7
-            }
             for (i in range(kpos * kvd, kpad * kvd)) {   //! the slack rows carry a large finite value, not zero: a masked probability that is not exactly zero would drag it into the output
                 kh[i] = 10000.0
                 vh[i] = 10000.0
@@ -3793,9 +3627,9 @@ def private fa_tile_run(t : T?; khr : bool) {   // nolint:STYLE037 — one arm l
                 upload_region_at(yh16_split, 0l, addr<uint8 const?>(y16_split[0]), h16_bytes)
                 upload_region_at(sinkd, 0l, addr<uint8 const?>(sinkh[0]), sink_bytes)
                 nan_sentinel_upload(yd, q_bytes)
-                var sck = set_f16cvt_cls(fixed_array(kdev, khdev),
+                var sck = set_tower_clamp_cvt_cls(fixed_array(kdev, khdev),
                     fixed_array(m_bytes, sh_bytes), fixed_array(2u, 16u))
-                var scv = set_f16cvt_cls(fixed_array(vdev, vhdev),
+                var scv = set_tower_clamp_cvt_cls(fixed_array(vdev, vhdev),
                     fixed_array(m_bytes, sh_bytes), fixed_array(8u, 32u))
                 var sfa = (sink
                     ? fa_stamp_sink_set(khr, fixed_array(qdev, khdev, vhdev, yd, sinkd),
@@ -3811,20 +3645,20 @@ def private fa_tile_run(t : T?; khr : bool) {   // nolint:STYLE037 — one arm l
                     : fa_stamp_set(khr, fixed_array(qdev, khdev, vhdev, yh16_fused),
                         fixed_array(q_bytes, sh_bytes, sh_bytes, h16_bytes),
                         fixed_array(1u, 16u, 32u, 64u)))
-                var scy = set_f16cvt_cls(fixed_array(yd, yh16_split),
+                var scy = set_tower_clamp_cvt_cls(fixed_array(yd, yh16_split),
                     fixed_array(q_bytes, h16_bytes), fixed_array(4u, 128u))
-                var pcv = ActArgs(nelem = uint(kpad * kvd), nblk = 0u)
+                var pcv = f16_rows_args(uint(kpad * kvd))
                 let cvtwgs = int64((kpad * kvd / 4 + 255) / 256)
                 var pcf = FaArgs(rows = uint(rows), w0 = uint(w0), qd = uint(qd),
                     kvd = uint(kvd), kv_mul = uint(kv_mul), kvbase = 0u, scale = scale, window = uint(window), sinkoff = 0u)
-                var pcy = ActArgs(nelem = uint(rows * qd), nblk = 0u)
+                var pcy = f16_rows_args(uint(rows * qd))
                 cmd_one_shot() $(raw2 : VkCommandBuffer; var h2 : VkHaz) {
-                    enc_f16cvt_cls(raw2, h2, sck, pcv, cvtwgs)
-                    enc_f16cvt_cls(raw2, h2, scv, pcv, cvtwgs)
+                    enc_tower_clamp_cvt_cls(raw2, h2, sck, pcv, cvtwgs)
+                    enc_tower_clamp_cvt_cls(raw2, h2, scv, pcv, cvtwgs)
                     enc_fa_tile(khr, hs, false, false, sink, false, raw2, h2, sfa, pcf, nheads, rows)
                     enc_fa_tile(khr, hs, false, false, sink, true, raw2, h2, sfa16, pcf, nheads, rows)
                     // the split pair's own convert: f16cvt over the f32 out - the fused twin's true peer
-                    enc_f16cvt_cls(raw2, h2, scy, pcy, int64((rows * qd / 4 + 255) / 256))
+                    enc_tower_clamp_cvt_cls(raw2, h2, scy, pcy, int64((rows * qd / 4 + 255) / 256))
                     vhz_dep(raw2, h2, 4u | 64u | 128u, 0u, true)
                     cmd_copy_whole(raw2, yd, host.buf, q_bytes)
                     cmd_copy_range(raw2, yh16_fused, 0l, host16.buf, 0l, h16_bytes)
@@ -3907,7 +3741,7 @@ def private fa_tile_run(t : T?; khr : bool) {   // nolint:STYLE037 — one arm l
 def test_vkd_fa_cm2(t0 : T?) {
     t0 |> run("cm2 flash-attention family == the CPU oracle (h64 + h128 + h256, f16cvt-staged planes)") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
-            if (!ensure_f16cvt_cls()) {   // engage the device without touching coopmat rails
+            if (!ensure_tower_clamp_cvt_cls()) {   // engage the device without touching coopmat rails
                 t |> skip("no Vulkan device")
                 return
             }
@@ -3927,7 +3761,7 @@ def test_vkd_fa_cm2(t0 : T?) {
 def test_vkd_fa_khr(t0 : T?) {
     t0 |> run("KHR flash-attention family == the CPU oracle (h64 + h128 + h256 + h512, the window arm, f16cvt-staged planes)") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
-            if (!ensure_f16cvt_cls()) {
+            if (!ensure_tower_clamp_cvt_cls()) {
                 t |> skip("no Vulkan device")
                 return
             }
@@ -3961,19 +3795,12 @@ def private fa_h256_run(nheads, kv_mul, rows, w0 : int; gated : bool; cap : floa
         let kvd = (nheads / kv_mul) * hs
         let kpos = w0 + rows
         let kpad = kpos + FA_SHADOW_SLACK_ROWS
-        var qp : array<float>
-        var kh : array<float>
-        var vh : array<float>
-        qp |> resize(rows * qrow)
+        //! the softcap fixture's wide q and k values: the scaled scores run past the cap, so the cap is load-bearing
+        var qp <- row_fill(rows * qrow, 41, 0, gated ? 0.05 : 0.25, gated ? 1.8 : 9.0, 73)
+        var kh <- row_fill(kpos * kvd, 17, 0, gated ? 0.03 : 0.15, gated ? 1.4 : 7.0, 97)
+        var vh <- row_fill(kpos * kvd, 53, 0, 0.04, 1.7, 89)
         kh |> resize(kpad * kvd)
         vh |> resize(kpad * kvd)
-        for (i in range(rows * qrow)) {   //! the softcap fixture's wide q and k values: the scaled scores run past the cap, so the cap is load-bearing
-            qp[i] = gated ? float((i * 41) % 73) * 0.05 - 1.8 : float((i * 41) % 73) * 0.25 - 9.0
-        }
-        for (i in range(kpos * kvd)) {
-            kh[i] = gated ? float((i * 17) % 97) * 0.03 - 1.4 : float((i * 17) % 97) * 0.15 - 7.0
-            vh[i] = float((i * 53) % 89) * 0.04 - 1.7
-        }
         let qp_bytes = int64(rows * qrow) * 4l
         let m_bytes = int64(kpad * kvd) * 4l
         let sh_bytes = int64(kpad * kvd) * 2l
@@ -3994,20 +3821,20 @@ def private fa_h256_run(nheads, kv_mul, rows, w0 : int; gated : bool; cap : floa
             upload_region_at(kdev, 0l, addr<uint8 const?>(kh[0]), m_bytes)
             upload_region_at(vdev, 0l, addr<uint8 const?>(vh[0]), m_bytes)
         }
-        var sck = set_f16cvt_cls(fixed_array(kdev, khdev), fixed_array(m_bytes, sh_bytes), fixed_array(2u, 16u))
-        var scv = set_f16cvt_cls(fixed_array(vdev, vhdev), fixed_array(m_bytes, sh_bytes), fixed_array(8u, 32u))
+        var sck = set_tower_clamp_cvt_cls(fixed_array(kdev, khdev), fixed_array(m_bytes, sh_bytes), fixed_array(2u, 16u))
+        var scv = set_tower_clamp_cvt_cls(fixed_array(vdev, vhdev), fixed_array(m_bytes, sh_bytes), fixed_array(8u, 32u))
         var sfa = fa_stamp_set(khr, fixed_array(qdev, khdev, vhdev, yd),
             fixed_array(qp_bytes, sh_bytes, sh_bytes, o_bytes), fixed_array(1u, 16u, 32u, 4u))
         var sfa16 = fa_stamp_set(khr, fixed_array(qdev, khdev, vhdev, yh16),
             fixed_array(qp_bytes, sh_bytes, sh_bytes, o16_bytes), fixed_array(1u, 16u, 32u, 64u))
-        var pcv = ActArgs(nelem = uint(kpad * kvd), nblk = 0u)
+        var pcv = f16_rows_args(uint(kpad * kvd))
         let cvtwgs = int64((kpad * kvd / 4 + 255) / 256)
         var pcf = FaArgs(rows = uint(rows), w0 = uint(w0), qd = uint(qd), kvd = uint(kvd), kv_mul = uint(kv_mul), kvbase = 0u,
             scale = scale, cap = cap, qstride = gated ? uint(qrow) : 0u, qhs = gated ? uint(qhs) : 0u)
         let capped = !gated
         cmd_one_shot() $(raw2 : VkCommandBuffer; var h2 : VkHaz) {
-            enc_f16cvt_cls(raw2, h2, sck, pcv, cvtwgs)
-            enc_f16cvt_cls(raw2, h2, scv, pcv, cvtwgs)
+            enc_tower_clamp_cvt_cls(raw2, h2, sck, pcv, cvtwgs)
+            enc_tower_clamp_cvt_cls(raw2, h2, scv, pcv, cvtwgs)
             enc_fa_tile(khr, hs, gated, capped, false, false, raw2, h2, sfa, pcf, nheads, rows)
             enc_fa_tile(khr, hs, gated, capped, false, true, raw2, h2, sfa16, pcf, nheads, rows)
             cmd_copy_planes(raw2, h2, fixed_array(yd, yh16), host, fixed_array(o_bytes, o16_bytes), 4u | 64u)
@@ -4068,7 +3895,7 @@ def private fa_h256_run(nheads, kv_mul, rows, w0 : int; gated : bool; cap : floa
 //! oracle element, the f16-out twin matches the f32 stamp rounded
 def private fa_h256_gated_cell(t : T?; tag : string; nheads, kv_mul, rows, w0 : int) {
     static_if (typeinfo builtin_module_exists(vulkan)) {
-        if (!ensure_f16cvt_cls()) {
+        if (!ensure_tower_clamp_cvt_cls()) {
             t |> skip("no Vulkan device")
             return
         }
@@ -4098,7 +3925,7 @@ def test_vkd_fa_cm2_h256_gated(t0 : T?) {
 def test_vkd_fa_cm2_h256_softcap(t0 : T?) {
     t0 |> run("cm2 flash-attention h256 softcap stamps == the CPU oracle under cap 50 (gemma-2's shape; the uncapped oracle as the control)") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
-            if (!ensure_f16cvt_cls()) {
+            if (!ensure_tower_clamp_cvt_cls()) {
                 t |> skip("no Vulkan device")
                 return
             }
@@ -4121,7 +3948,7 @@ def test_vkd_fa_cm2_h256_softcap(t0 : T?) {
 def test_vkd_fa_khr_h256_softcap(t0 : T?) {
     t0 |> run("KHR flash-attention h256 softcap stamps == the CPU oracle under cap 50 (gemma-2's shape; the uncapped oracle as the control)") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
-            if (!ensure_f16cvt_cls()) {
+            if (!ensure_tower_clamp_cvt_cls()) {
                 t |> skip("no Vulkan device")
                 return
             }
@@ -4369,7 +4196,7 @@ def test_vkd_da_attn_b_h128(t0 : T?) {
 def test_vkd_requant_family(t0 : T?) {
     t0 |> run("fused ar+requant + q8k requant class kernels == the CPU oracle") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
-            if (!(ensure_cls_ar_rq() && ensure_cls_q8k_rq() && ensure_cls_ar_rqx() && ensure_cls_ar_rqk() && ensure_cls_ar_rqkx())) {
+            if (!(ensure_cls_ar_rq_b() && ensure_cls_q8k_rq() && ensure_cls_ar_rqx() && ensure_cls_ar_rqk() && ensure_cls_ar_rqkx())) {
                 t |> skip("no Vulkan device")
                 return
             }
@@ -4379,15 +4206,11 @@ def test_vkd_requant_family(t0 : T?) {
                 let eps = 1e-5
                 let ascale = 1.25
                 let nblk = dim / 32
-                var x : array<float>
-                var a : array<float>
+                var x <- row_fill(dim, 37, 0, 0.09, 4.2, 101)
+                var a <- row_fill(dim, 13, 0, 0.06, 2.6, 89)
                 var w : array<float>
-                x |> resize(dim)
-                a |> resize(dim)
                 w |> resize(dim)
                 for (i in range(dim)) {
-                    x[i] = float((i * 37) % 101) * 0.09 - 4.2
-                    a[i] = float((i * 13) % 89) * 0.06 - 2.6
                     w[i] = 0.5 + float(i % 17) * 0.04
                 }
                 let e_bytes = int64(dim) * 4l
@@ -4409,22 +4232,20 @@ def test_vkd_requant_family(t0 : T?) {
                     upload_region_at(x2, 0l, addr<uint8 const?>(x[0]), e_bytes)
                     upload_region_at(ad, 0l, addr<uint8 const?>(a[0]), e_bytes)
                     upload_region_at(wd, 0l, addr<uint8 const?>(w[0]), e_bytes)
-                    fill_upload(q2, 0l, q_bytes, I8_SENTINEL_BITS)
+                    upload_fill(q2, 0l, q_bytes, I8_SENTINEL_BITS)
                     nan_sentinel_upload(s2, s_bytes)
                     // the class kernel: x@0, a@1, w@2, outq@3, outs@4
-                    var sc = set_cls_ar_rq(fixed_array(x2, ad, wd, q2, s2),
+                    var sc = set_cls_ar_rq_b(fixed_array(x2, ad, wd, q2, s2),
                         fixed_array(e_bytes, e_bytes, e_bytes, q_bytes, s_bytes),
                         fixed_array(1u, 2u, 4u, 16u, 8u))
                     var pc = ArArgs(dim = uint(dim), add_on = 1u, eps = eps, ascale = ascale)
                     cmd_one_shot() $(raw2 : VkCommandBuffer; var h2 : VkHaz) {
-                        enc_cls_ar_rq(raw2, h2, sc, pc, 1l)
+                        enc_cls_ar_rq_b(raw2, h2, sc, pc, 1l)
                         cmd_copy_planes(raw2, h2, fixed_array(q2), host, fixed_array(q_bytes), 1u | 8u | 16u)
                     }
                     memcpy(addr<void?>(q_cls[0]), host.mapped, q_bytes)
-                    vkd_read_back(s2, host, s_bytes)
-                    memcpy(addr<void?>(s_cls[0]), host.mapped, s_bytes)
-                    vkd_read_back(x2, host, e_bytes)
-                    memcpy(addr<void?>(x_cls[0]), host.mapped, e_bytes)
+                    readback_range(s2, 0u, host, addr(s_cls[0]), s_bytes)
+                    readback_range(x2, 0u, host, addr(x_cls[0]), e_bytes)
                 }
                 // oracle: x' = (x+a)*ascale in place, rms over the row, y = w*(x'*inv), Q8_0 pack —
                 // the wg reduce reassociates the sum of squares, so quants ride the byte bar
@@ -4444,12 +4265,10 @@ def test_vkd_requant_family(t0 : T?) {
                 t |> success(bad == 0, "ar+requant fused matches the CPU oracle ({bad} elements off)")
                 //! the biased add partner (gpt-oss's output bias) on the fused stamp: the bias row rides the norms plane past the norm row
                 {
-                    var b : array<float>
+                    var b <- row_fill(dim, 23, 0, 0.09, 3.1, 71)
                     var wb : array<float>
-                    b |> resize(dim)
                     wb |> resize(2 * dim)
                     for (i in range(dim)) {
-                        b[i] = float((i * 23) % 71) * 0.09 - 3.1
                         wb[i] = w[i]
                         wb[dim + i] = b[i]
                     }
@@ -4463,21 +4282,19 @@ def test_vkd_requant_family(t0 : T?) {
                     unsafe {
                         upload_region_at(x2, 0l, addr<uint8 const?>(x[0]), e_bytes)
                         upload_region_at(wbd, 0l, addr<uint8 const?>(wb[0]), 2l * e_bytes)
-                        fill_upload(q2, 0l, q_bytes, I8_SENTINEL_BITS)
+                        upload_fill(q2, 0l, q_bytes, I8_SENTINEL_BITS)
                         nan_sentinel_upload(s2, s_bytes)
-                        var scb = set_cls_ar_rq(fixed_array(x2, ad, wbd, q2, s2),
+                        var scb = set_cls_ar_rq_b(fixed_array(x2, ad, wbd, q2, s2),
                             fixed_array(e_bytes, e_bytes, 2l * e_bytes, q_bytes, s_bytes),
                             fixed_array(1u, 2u, 4u, 16u, 8u))
                         var pcb = ArArgs(dim = uint(dim), add_on = 1u, eps = eps, ascale = ascale, abias_on = 1u, aboff = uint(dim))
                         cmd_one_shot() $(rawb : VkCommandBuffer; var hb : VkHaz) {
-                            enc_cls_ar_rq(rawb, hb, scb, pcb, 1l)
+                            enc_cls_ar_rq_b(rawb, hb, scb, pcb, 1l)
                             cmd_copy_planes(rawb, hb, fixed_array(q2), host, fixed_array(q_bytes), 1u | 8u | 16u)
                         }
                         memcpy(addr<void?>(qb_cls[0]), host.mapped, q_bytes)
-                        vkd_read_back(s2, host, s_bytes)
-                        memcpy(addr<void?>(sb_cls[0]), host.mapped, s_bytes)
-                        vkd_read_back(x2, host, e_bytes)
-                        memcpy(addr<void?>(xb_cls[0]), host.mapped, e_bytes)
+                        readback_range(s2, 0u, host, addr(sb_cls[0]), s_bytes)
+                        readback_range(x2, 0u, host, addr(xb_cls[0]), e_bytes)
                     }
                     var xb_ref : array<float>
                     var yb_ref : array<float>
@@ -4598,11 +4415,7 @@ def test_vkd_requant_family(t0 : T?) {
             {
                 let nsb = 4
                 let nelem = nsb * 256
-                var src : array<float>
-                src |> resize(nelem)
-                for (i in range(nelem)) {
-                    src[i] = float((i * 61) % 113) * 0.05 - 2.8
-                }
+                var src <- row_fill(nelem, 61, 0, 0.05, 2.8, 113)
                 let e_bytes = int64(nelem) * 4l
                 let q_bytes = int64(nelem)
                 let s_bytes = int64(nsb) * 4l
@@ -4617,7 +4430,7 @@ def test_vkd_requant_family(t0 : T?) {
                 let wgs = (nsb * 32 + 255) / 256
                 unsafe {
                     upload_region_at(sd, 0l, addr<uint8 const?>(src[0]), e_bytes)
-                    fill_upload(q2, 0l, q_bytes, I8_SENTINEL_BITS)
+                    upload_fill(q2, 0l, q_bytes, I8_SENTINEL_BITS)
                     nan_sentinel_upload(s2, s_bytes)
                     // the class kernel: src@0, outq@1, outs@2
                     var sc = set_rq_cls(fixed_array(sd, q2, s2),
@@ -4629,8 +4442,7 @@ def test_vkd_requant_family(t0 : T?) {
                         cmd_copy_planes(raw2, h2, fixed_array(q2), host, fixed_array(q_bytes), 4u | 8u)
                     }
                     memcpy(addr<void?>(q_cls[0]), host.mapped, q_bytes)
-                    vkd_read_back(s2, host, s_bytes)
-                    memcpy(addr<void?>(s_cls[0]), host.mapped, s_bytes)
+                    readback_range(s2, 0u, host, addr(s_cls[0]), s_bytes)
                 }
                 // plain requant of f32 rows — amax is order-free, the pack deterministic: exact
                 var q_ref : array<uint>
@@ -4715,28 +4527,16 @@ def private mx4_gemv_gu_run(t : T?; d, nreg : int; bias : bool) {
         let nblk = rows / 32
         let ne = 6
         let totblk = 2 * rows * nb   // the gate stack's blocks, then the up stack's
-        var wqh : array<uint>
-        var xqh : array<uint>
-        var xsh : array<float>
+        var wqh <- hashed_words(totblk * 4, 5u, 977u)
+        var xqh <- hashed_words(nb * 8, 29u, 11u)
+        var xsh <- row_fill(nb, 1, 0, 0.125, -0.25, 5)
         var gb : array<float>
         var ub : array<float>
         var rex : array<uint>
-        wqh |> resize(totblk * 4)
-        xqh |> resize(nb * 8)
-        xsh |> resize(nb)
         gb |> resize(ne * d)
         ub |> resize(ne * d)
         rex |> resize(nreg)
-        for (i in range(totblk * 4)) {
-            wqh[i] = hash_word(uint(i) * 5u + 977u)
-        }
         var wsh <- mx4_scale_words(totblk)
-        for (i in range(nb * 8)) {
-            xqh[i] = hash_word(uint(i) * 29u + 11u)
-        }
-        for (i in range(nb)) {
-            xsh[i] = 0.25 + float(i % 5) * 0.125
-        }
         for (i in range(ne * d)) {   //! biases of the dots' own magnitude, some past the 7 clamp
             gb[i] = bias ? float((i * 13) % 31) * 0.5 - 7.5 : 0.0
             ub[i] = bias ? float((i * 17) % 29) * 0.6 - 8.4 : 0.0
@@ -4912,16 +4712,8 @@ def private q8_gemv_gu_run(t; n, hid : int; gelu : bool) {
     var gqh, gsh, uqh, ush : array<uint>
     q8_plane(totblk, 1u, 71u, 1u, 3u, gqh, gsh)
     q8_plane(totblk, 3u, 5u, 7u, 11u, uqh, ush)
-    var xqh : array<uint>
-    var xsh : array<float>
-    xqh |> resize(nb * 8)
-    xsh |> resize(nb)
-    for (i in range(nb * 8)) {
-        xqh[i] = hash_word(uint(i) * 17u + 9u)
-    }
-    for (i in range(nb)) {
-        xsh[i] = 0.25 + float(i % 5) * 0.125
-    }
+    var xqh <- hashed_words(nb * 8, 17u, 9u)
+    var xsh <- row_fill(nb, 1, 0, 0.125, -0.25, 5)
     let xq_bytes = int64(nb) * 32l
     let xs_bytes = int64(nb) * 4l
     let oq_bytes = int64(hid)
@@ -4944,12 +4736,12 @@ def private q8_gemv_gu_run(t; n, hid : int; gelu : bool) {
         upload_region_at(xsd, 0l, addr<uint8 const?>(xsh[0]), xs_bytes)
         nan_sentinel_upload(oqd, oq_bytes)
         nan_sentinel_upload(osd, os_bytes)
-        var s_cls = set_q8_gemv_gu_cls(fixed_array(gqd, gsd, uqd, usd, xqd, xsd, oqd, osd),
+        var s_cls = set_q8_gemv_gu_n1_cls(fixed_array(gqd, gsd, uqd, usd, xqd, xsd, oqd, osd),
             fixed_array(wq_bytes, ws_bytes, wq_bytes, ws_bytes, xq_bytes, xs_bytes, oq_bytes, os_bytes),
             fixed_array(1u, 2u, 4u, 8u, 16u, 32u, 64u, 64u))
-        var pc = GuArgs(n = uint(n), d = uint(hid), gblk = 0u, ublk = 0u, act = gelu ? ACT_GELU : ACT_SILU)
+        var pc = GuNArgs(n = uint(n), d = uint(hid), gblk = 0u, ublk = 0u, act = gelu ? ACT_GELU : ACT_SILU, ncols = 1u)
         cmd_one_shot() $(raw2 : VkCommandBuffer; var h2 : VkHaz) {
-            enc_q8_gemv_gu_cls(raw2, h2, s_cls, pc, int64(nblk_out))
+            enc_q8_gemv_gu_n1_cls(raw2, h2, s_cls, pc, int64(nblk_out))
             cmd_copy_planes(raw2, h2, fixed_array(oqd, osd), host, fixed_array(oq_bytes, os_bytes), 64u)
         }
     }
@@ -4998,7 +4790,7 @@ def private q8_gemv_gu_run(t; n, hid : int; gelu : bool) {
 def test_vkd_q8_gemv_gu(t0 : T?) {
     t0 |> run("fused q8 gate + up GEMV + act + Q8_0 requant == the CPU oracle (gelu and silu; 36 and 16 blocks deep)") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
-            if (!ensure_q8_gemv_gu_cls()) {
+            if (!ensure_q8_gemv_gu_n1_cls()) {
                 t |> skip("no Vulkan device")
                 return
             }
@@ -5020,16 +4812,8 @@ def private q8_gemv_pleact_run(t; n, d : int) {
     let ws_bytes = int64(totblk) * 2l
     var wqh, wsh : array<uint>
     q8_plane(totblk, 5u, 19u, 3u, 7u, wqh, wsh)
-    var gh : array<float>
-    var sh : array<float>
-    gh |> resize(n)
-    sh |> resize(3 * n)   // three layers' side rows: the cell reads the middle one
-    for (i in range(n)) {
-        gh[i] = float((i * 37) % 101) * 0.06 - 3.0
-    }
-    for (i in range(3 * n)) {
-        sh[i] = float((i * 29) % 83) * 0.05 - 2.0
-    }
+    var gh <- row_fill(n, 37, 0, 0.06, 3.0, 101)
+    var sh <- row_fill(3 * n, 29, 0, 0.05, 2.0, 83)   // three layers' side rows: the cell reads the middle one
     let g_bytes = int64(n) * 4l
     let s_bytes = int64(3 * n) * 4l
     let y_bytes = int64(d) * 4l
@@ -5128,28 +4912,9 @@ struct GemvArFixture {
 def private q8_gemv_ar_fixture(n, d : int) : GemvArFixture {
     let nb = n / 32
     let totblk = d * nb
-    var fx : GemvArFixture
-    fx.wqh |> resize(totblk * 8)
-    fx.wsh |> resize(totblk / 2 + 1)
-    fx.xqh |> resize(nb * 8)
-    fx.xsh |> resize(nb)
-    fx.xres |> resize(d)
+    var fx <- GemvArFixture(wqh <- hashed_words(totblk * 8, 3u, 29u), wsh <- ws_plane(totblk / 2 + 1, 5u, 1u),
+        xqh <- hashed_words(nb * 8, 13u, 7u), xsh <- row_fill(nb, 1, 0, 0.1, -0.2, 7), xres <- row_fill(d, 43, 0, 0.4, 19.0, 97))
     fx.wnh |> resize(3 * d)
-    for (i in range(totblk * 8)) {
-        fx.wqh[i] = hash_word(uint(i) * 3u + 29u)
-    }
-    for (i in range(totblk / 2 + 1)) {
-        fx.wsh[i] = ws_word(uint(i) * 5u + 1u)
-    }
-    for (i in range(nb * 8)) {
-        fx.xqh[i] = hash_word(uint(i) * 13u + 7u)
-    }
-    for (i in range(nb)) {
-        fx.xsh[i] = 0.2 + float(i % 7) * 0.1
-    }
-    for (i in range(d)) {
-        fx.xres[i] = float((i * 43) % 97) * 0.4 - 19.0
-    }
     for (i in range(2 * d)) {
         fx.wnh[i] = 0.8 + float(i % 9) * 0.05
     }
@@ -5667,16 +5432,8 @@ def private q8_gemv_gu_n_run(t; n, hid, ncols : int; act : uint) {
     var gqh, gsh, uqh, ush : array<uint>
     q8_plane(totblk, 1u, 71u, 1u, 3u, gqh, gsh)
     q8_plane(totblk, 3u, 5u, 7u, 11u, uqh, ush)
-    var xqh : array<uint>
-    var xsh : array<float>
-    xqh |> resize(nb * 8 * ncol_max)
-    xsh |> resize(nb * ncol_max)
-    for (i in range(nb * 8 * ncol_max)) {
-        xqh[i] = hash_word(uint(i) * 17u + 9u)
-    }
-    for (i in range(nb * ncol_max)) {
-        xsh[i] = 0.25 + float(i % 5) * 0.125
-    }
+    var xqh <- hashed_words(nb * 8 * ncol_max, 17u, 9u)
+    var xsh <- row_fill(nb * ncol_max, 1, 0, 0.125, -0.25, 5)
     let gqd = make_device_buf(wq_bytes)
     let gsd = make_device_buf(ws_bytes)
     let uqd = make_device_buf(wq_bytes)
@@ -5702,10 +5459,10 @@ def private q8_gemv_gu_n_run(t; n, hid, ncols : int; act : uint) {
                 upload_region_at(xqd, 0l, addr<uint8 const?>(xqh[c * nb * 8]), xq_bytes)
                 upload_region_at(xsd, 0l, addr<uint8 const?>(xsh[c * nb]), xs_bytes)
             }
-            var s_one = set_q8_gemv_gu_cls(fixed_array(gqd, gsd, uqd, usd, xqd, xsd, o.bufs[0], o.bufs[1]),
+            var s_one = set_q8_gemv_gu_n1_cls(fixed_array(gqd, gsd, uqd, usd, xqd, xsd, o.bufs[0], o.bufs[1]),
                 fixed_array(wq_bytes, ws_bytes, wq_bytes, ws_bytes, xq_bytes, xs_bytes, o.bytes[0], o.bytes[1]), gbits)
-            var pc1 = GuArgs(n = uint(n), d = uint(hid), gblk = 0u, ublk = 0u, act = act)
-            enc_q8_gemv_gu_cls(raw, h, s_one, pc1, int64(nblk_out))
+            var pc1 = GuNArgs(n = uint(n), d = uint(hid), gblk = 0u, ublk = 0u, act = act, ncols = 1u)
+            enc_q8_gemv_gu_n1_cls(raw, h, s_one, pc1, int64(nblk_out))
         },
         $(nc : int; raw : VkCommandBuffer; var h : VkHaz; o : NformOuts) {
             var s_n = q8_gemv_gu_n_set(fixed_array(gqd, gsd, uqd, usd, xqd_n, xsd_n, o.bufs[0], o.bufs[1]),
@@ -5727,7 +5484,7 @@ def private q8_gemv_gu_n_run(t; n, hid, ncols : int; act : uint) {
 def test_vkd_q8_gemv_gu_n(t0 : T?) {
     t0 |> run("fused q8 gate-up GEMV's N-column stamps == the one-row kernel a column at a time, bit for bit; the one-row rows == the CPU chain") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
-            if (!(ensure_q8_gemv_gu_cls() && q8_gemv_gu_n_ensure(8l))) {
+            if (!(ensure_q8_gemv_gu_n1_cls() && q8_gemv_gu_n_ensure(8l))) {
                 t |> skip("no Vulkan device")
                 return
             }
@@ -5754,16 +5511,8 @@ def private q8_gemv_pleact_cols_run(t; n, d, ncols : int) {
     let ncol_max = 8
     var wqh, wsh : array<uint>
     q8_plane(totblk, 5u, 19u, 3u, 7u, wqh, wsh)
-    var gh : array<float>
-    var sh : array<float>
-    gh |> resize(ncol_max * n)
-    sh |> resize(ncol_max * all)
-    for (i in range(ncol_max * n)) {
-        gh[i] = float((i * 37) % 101) * 0.06 - 3.0
-    }
-    for (i in range(ncol_max * all)) {
-        sh[i] = float((i * 29) % 83) * 0.05 - 2.0
-    }
+    var gh <- row_fill(ncol_max * n, 37, 0, 0.06, 3.0, 101)
+    var sh <- row_fill(ncol_max * all, 29, 0, 0.05, 2.0, 83)
     let g_bytes = int64(ncols * n) * 4l
     let s_bytes = int64(ncols * all) * 4l
     let g1_bytes = int64(n) * 4l
@@ -5891,27 +5640,11 @@ def private gemv_ncol_arm(t : T?; f : KqFmt; n, d : int) {
         if (q8) {
             q8_plane(d * xblk, 1u, uint(fmt) * 77777u, 1u, uint(fmt) * 13u, wqh, wsh)
         } else {
-            let wq_words = d * xblk * int(kq_qsb(f) / 4l)
-            let ws_words = d * xblk * int(kq_dev_ssb(f) / 4l)
-            wqh |> resize(wq_words)
-            wsh |> resize(ws_words)
-            for (i in range(wq_words)) {
-                wqh[i] = hash_word(uint(i) + uint(fmt) * 77777u)
-            }
-            for (i in range(ws_words)) {
-                wsh[i] = ws_word(uint(i) + uint(fmt) * 13u)
-            }
+            wqh |> push_from(hashed_words(d * xblk * int(kq_qsb(f) / 4l), 1u, uint(fmt) * 77777u))
+            wsh |> push_from(ws_plane(d * xblk * int(kq_dev_ssb(f) / 4l), 1u, uint(fmt) * 13u))
         }
-        var xqh : array<uint>
-        var xsh : array<float>
-        xqh |> resize(xq_col * ncol_max)
-        xsh |> resize(xblk * ncol_max)
-        for (i in range(xq_col * ncol_max)) {
-            xqh[i] = hash_word(uint(i) * 31u + 5u)
-        }
-        for (i in range(xblk * ncol_max)) {
-            xsh[i] = 0.5 + float(i % 7) * 0.25
-        }
+        var xqh <- hashed_words(xq_col * ncol_max, 31u, 5u)
+        var xsh <- row_fill(xblk * ncol_max, 1, 0, 0.25, -0.5, 7)
         let wq_bytes = long_length(wqh) * 4l
         let ws_bytes = long_length(wsh) * 4l
         let xq_bytes = int64(xq_col * ncol_max) * 4l
@@ -6007,11 +5740,7 @@ def test_vkd_cvt_family(t0 : T?) {
             {
                 let nblk = 24
                 let inbase = 64
-                var srch : array<float>
-                srch |> resize(inbase + nblk * 32)
-                for (i in range(inbase + nblk * 32)) {
-                    srch[i] = float((i * 37) % 113) * 0.04 - 2.2
-                }
+                var srch <- row_fill(inbase + nblk * 32, 37, 0, 0.04, 2.2, 113)
                 let src_bytes = int64(inbase + nblk * 32) * 4l
                 let q_bytes = int64(nblk) * 32l
                 let s_bytes = int64(nblk) * 4l
@@ -6045,17 +5774,11 @@ def test_vkd_cvt_family(t0 : T?) {
             }
             // the f16 converters: act-f16, f16 convert (mode-free classes)
             {
-                verify(ensure_actf16_cls() && ensure_f16cvt_cls(),
+                verify(ensure_actf16_cls() && ensure_tower_clamp_cvt_cls(),
                     "the cvt class rails must engage on a live device")
                 let nelem = 2048
-                var gh : array<float>
-                var uh : array<float>
-                gh |> resize(nelem)
-                uh |> resize(nelem)
-                for (i in range(nelem)) {
-                    gh[i] = float((i * 29) % 61) * 0.06 - 1.9
-                    uh[i] = float((i * 43) % 83) * 0.05 - 2.1
-                }
+                var gh <- row_fill(nelem, 29, 0, 0.06, 1.9, 61)
+                var uh <- row_fill(nelem, 43, 0, 0.05, 2.1, 83)
                 let g_bytes = int64(nelem) * 4l
                 let h_bytes = int64(nelem) * 2l
                 let gd = make_device_buf(g_bytes)
@@ -6077,10 +5800,10 @@ def test_vkd_cvt_family(t0 : T?) {
                                 var pc = ActArgs(nelem = uint(nelem), act = arm == 3 ? ACT_OAI : ACT_GELU, nblk = 0u)
                                 enc_actf16_cls(raw2, h2, sc, pc, int64(wgs))
                             } else {
-                                sc = set_f16cvt_cls(fixed_array(ud, hd2),
+                                sc = set_tower_clamp_cvt_cls(fixed_array(ud, hd2),
                                     fixed_array(g_bytes, h_bytes), fixed_array(1u, 4u))
-                                var pc = ActArgs(nelem = uint(nelem), nblk = 0u)
-                                enc_f16cvt_cls(raw2, h2, sc, pc, int64(wgs))
+                                var pc = f16_rows_args(uint(nelem))
+                                enc_tower_clamp_cvt_cls(raw2, h2, sc, pc, int64(wgs))
                             }
                             cmd_copy_planes(raw2, h2, fixed_array(hd2), host, fixed_array(h_bytes), 4u)
                         }
@@ -6135,21 +5858,9 @@ def test_vkd_rope_b_pair(t0 : T?) {
                 let ppp = (nh + nkvh) * half
                 let kpair0 = nh * half
                 let mirn = layerbase + (pos0 + npos) * kvd
-                var q0h : array<float>
-                var kvh : array<float>
-                var csh : array<float>
-                q0h |> resize(npos * qd)
-                kvh |> resize(voff + npos * kvd)
-                csh |> resize(npos * hs)
-                for (i in range(npos * qd)) {
-                    q0h[i] = float((i * 31) % 67) * 0.05 - 1.6
-                }
-                for (i in range(voff + npos * kvd)) {
-                    kvh[i] = float((i * 23) % 71) * 0.04 - 1.5
-                }
-                for (i in range(npos * hs)) {
-                    csh[i] = float((i * 13) % 41) * 0.045 - 0.9
-                }
+                var q0h <- row_fill(npos * qd, 31, 0, 0.05, 1.6, 67)
+                var kvh <- row_fill(voff + npos * kvd, 23, 0, 0.04, 1.5, 71)
+                var csh <- row_fill(npos * hs, 13, 0, 0.045, 0.9, 41)
                 let q_bytes = int64(npos * qd) * 4l
                 let kv_bytes = int64(voff + npos * kvd) * 4l
                 let cs_bytes = int64(npos * hs) * 4l
@@ -6289,23 +6000,11 @@ def test_vkd_rope_b_pair(t0 : T?) {
                 let vrow = 192
                 let eps = 0.00001
                 let mirn2 = vrow + nkvh * hs
-                var q0h : array<float>
-                var kvh : array<float>
-                var csh : array<float>
+                var q0h <- row_fill(qd, 31, 0, 0.05, 1.6, 67)
+                var kvh <- row_fill(qd + 2 * kvd, 23, 0, 0.04, 1.5, 71)
+                var csh <- row_fill(hs, 13, 0, 0.045, 0.9, 41)
                 var wnh : array<float>
-                q0h |> resize(qd)
-                kvh |> resize(qd + 2 * kvd)
-                csh |> resize(hs)
                 wnh |> resize(2 * hs)
-                for (i in range(qd)) {
-                    q0h[i] = float((i * 31) % 67) * 0.05 - 1.6
-                }
-                for (i in range(qd + 2 * kvd)) {
-                    kvh[i] = float((i * 23) % 71) * 0.04 - 1.5
-                }
-                for (i in range(hs)) {
-                    csh[i] = float((i * 13) % 41) * 0.045 - 0.9
-                }
                 for (i in range(2 * hs)) {
                     wnh[i] = 0.75 + float(i % 11) * 0.05
                 }
@@ -6537,26 +6236,10 @@ def test_vkd_at_prep(t0 : T?) {
             let cos_off = 16 + 2 * hs
             let sin_off = cos_off + rows * half
             let sm_n = sin_off + rows * half
-            var srcqh : array<float>
-            var srckh : array<float>
-            var smh : array<float>
-            var bh : array<float>   //! the projection bias: [q (qd) | k (kvd)], the k pass reads at boff = qd
-            srcqh |> resize(rows * 2 * qd)
-            srckh |> resize(rows * kvd)
-            smh |> resize(sm_n)
-            bh |> resize(qd + kvd)
-            for (i in range(rows * 2 * qd)) {
-                srcqh[i] = float((i * 19) % 79) * 0.045 - 1.7
-            }
-            for (i in range(rows * kvd)) {
-                srckh[i] = float((i * 27) % 59) * 0.055 - 1.4
-            }
-            for (i in range(sm_n)) {
-                smh[i] = float((i * 11) % 37) * 0.05 - 0.8
-            }
-            for (i in range(qd + kvd)) {
-                bh[i] = float((i * 7) % 23) * 0.03 - 0.3
-            }
+            var srcqh <- row_fill(rows * 2 * qd, 19, 0, 0.045, 1.7, 79)
+            var srckh <- row_fill(rows * kvd, 27, 0, 0.055, 1.4, 59)
+            var smh <- row_fill(sm_n, 11, 0, 0.05, 0.8, 37)
+            var bh <- row_fill(qd + kvd, 7, 0, 0.03, 0.3, 23)   //! the projection bias: [q (qd) | k (kvd)], the k pass reads at boff = qd
             smh[0] = eps
             let srcq_bytes = int64(rows * 2 * qd) * 4l
             let srck_bytes = int64(rows * kvd) * 4l
@@ -6740,7 +6423,7 @@ def test_vkd_hc_seams(t0 : T?) {
             act |> resize(HCT_LR)
             for (i in range(HCT_LR)) {
                 let v = lo[i] / float(HCT_HC)
-                act[i] = v / (1.0 + exp(-v))
+                act[i] = silu_f32(v)
             }
             var q_ref : array<int8>
             var s_ref : array<float>
@@ -7075,7 +6758,7 @@ def private ple_side_case(t : T?; pos : int) {
                     co += wn[3 * hcd + e * PLT_KERN + k] * hist_ref[(src_pos % PLT_NROWS) * hcd + e]
                 }
             }
-            res_ref[e] = (res[e] + gated_ref[e]) + co / (1.0 + exp(-co))
+            res_ref[e] = (res[e] + gated_ref[e]) + silu_f32(co)
         }
         var toks <- [TokMeta(pos = uint(pos), cnt = uint(pos + 1), dnslot = 0u)]
         with_cell_planes() $(var cp : CellPlanes) {
@@ -7170,7 +6853,7 @@ def private ple_panel_case(t : T?; rows, pos0 : int; tok_pos : bool = false) {
                         from_ring += e == 0 ? 1 : 0
                     }
                 }
-                res_ref[r * hcd + e] = (res[r * hcd + e] + gated_ref[r * hcd + e]) + co / (1.0 + exp(-co))
+                res_ref[r * hcd + e] = (res[r * hcd + e] + gated_ref[r * hcd + e]) + silu_f32(co)
             }
         }
         t |> success(from_ring > 0 && from_panel > 0, "the fixture's taps read both the ring and the panel ({from_ring} ring, {from_panel} panel)")
@@ -7277,16 +6960,8 @@ def test_vkd_dn_family(t0 : T?) {
                 let taps_off = 16
                 let hist_off = taps_off + cd * dconv
                 let sm_n = hist_off + cd * taps
-                var srch : array<float>
-                var smh : array<float>
-                srch |> resize(npos * cd)
-                smh |> resize(sm_n)
-                for (i in range(npos * cd)) {
-                    srch[i] = float((i * 19) % 79) * 0.03 - 1.1
-                }
-                for (i in range(sm_n)) {
-                    smh[i] = float((i * 11) % 37) * 0.02 - 0.35
-                }
+                var srch <- row_fill(npos * cd, 19, 0, 0.03, 1.1, 79)
+                var smh <- row_fill(sm_n, 11, 0, 0.02, 0.35, 37)
                 smh[0] = eps
                 smh[1] = qscale
                 let src_bytes = int64(npos * cd) * 4l
@@ -7328,7 +7003,7 @@ def test_vkd_dn_family(t0 : T?) {
                             }
                             acc += xv * smh[taps_off + ch * dconv + k]
                         }
-                        o_ref[p * cd + ch] = acc / (1.0 + exp(-acc))
+                        o_ref[p * cd + ch] = silu_f32(acc)
                     }
                     for (b in range(2 * kd / ds)) {
                         var sum = 0.0
@@ -7360,21 +7035,9 @@ def test_vkd_dn_family(t0 : T?) {
                 let hist_off = wnorm_off + ds
                 let sm_n = hist_off + 2 * cd * taps
                 let nblk = nvh * ds / 32
-                var projh : array<float>
-                var sth : array<float>
-                var smh : array<float>
-                projh |> resize(cd + nvh * ds)
-                sth |> resize(nvh * ds * ds)
-                smh |> resize(sm_n)
-                for (i in range(cd + nvh * ds)) {
-                    projh[i] = float((i * 23) % 71) * 0.03 - 1.0
-                }
-                for (i in range(nvh * ds * ds)) {
-                    sth[i] = float((i * 13) % 53) * 0.02 - 0.5
-                }
-                for (i in range(sm_n)) {
-                    smh[i] = float((i * 17) % 43) * 0.02 - 0.4
-                }
+                var projh <- row_fill(cd + nvh * ds, 23, 0, 0.03, 1.0, 71)
+                var sth <- row_fill(nvh * ds * ds, 13, 0, 0.02, 0.5, 53)
+                var smh <- row_fill(sm_n, 17, 0, 0.02, 0.4, 43)
                 smh[0] = eps
                 smh[1] = qscale
                 smh[2] = float(par)
@@ -7418,7 +7081,7 @@ def test_vkd_dn_family(t0 : T?) {
                             for (k in range(taps)) {
                                 acc += smh[rrb + ch * taps + k] * smh[taps_off + ch * dconv + k]
                             }
-                            let sv = acc / (1.0 + exp(-acc))
+                            let sv = silu_f32(acc)
                             if (sl == 0) {
                                 dq[j] = sv
                             } elif (sl == 1) {
@@ -7437,7 +7100,7 @@ def test_vkd_dn_family(t0 : T?) {
                     let sq = (1.0 / max(sqrt(sumq), eps)) * qscale
                     let sk = 1.0 / max(sqrt(sumk), eps)
                     let graw = smh[g_off + hh] + smh[dt_off + hh]
-                    let eg = exp(smh[a_off + hh] * (graw > 20.0 ? graw : log(1.0 + exp(graw))))
+                    let eg = exp(smh[a_off + hh] * softplus(graw))
                     let bt = sigmoid_f32(smh[beta_off + hh])
                     var qk = 0.0
                     for (j in range(ds)) {
@@ -7470,7 +7133,7 @@ def test_vkd_dn_family(t0 : T?) {
                     let inv = 1.0 / sqrt(sum / float(ds) + eps)
                     for (j in range(ds)) {
                         let zv = projh[cd + hh * ds + j]
-                        out_ref[hh * ds + j] = dout[j] * inv * smh[wnorm_off + j] * (zv / (1.0 + exp(-zv)))
+                        out_ref[hh * ds + j] = dout[j] * inv * smh[wnorm_off + j] * silu_f32(zv)
                         out_ref_sig[hh * ds + j] = dout[j] * inv * smh[wnorm_off + j] * sigmoid_f32(zv)
                     }
                     delete dq
@@ -7527,25 +7190,13 @@ def test_vkd_dn_family(t0 : T?) {
                 let wnorm_off = dt_off + nvh
                 let sm_n = wnorm_off + ds
                 var convh : array<float>
-                var zh : array<float>
-                var sth : array<float>
-                var smh : array<float>
                 convh |> resize(npos * cd)
-                zh |> resize(npos * di)
-                sth |> resize(nvh * ds * ds)
-                smh |> resize(sm_n)
                 for (i in range(npos * cd)) {   //! unit-scale q/k rows, the conv stage's L2-normed shape: on unnormed rows the delta rule's recurrence overflows float range within the window at ds 128
                     convh[i] = (float((i * 19) % 79) * 0.025 - 0.9) * 0.15
                 }
-                for (i in range(npos * di)) {
-                    zh[i] = float((i * 29) % 61) * 0.05 - 1.5
-                }
-                for (i in range(nvh * ds * ds)) {
-                    sth[i] = float((i * 13) % 53) * 0.02 - 0.5
-                }
-                for (i in range(sm_n)) {
-                    smh[i] = float((i * 17) % 43) * 0.03 - 0.6
-                }
+                var zh <- row_fill(npos * di, 29, 0, 0.05, 1.5, 61)
+                var sth <- row_fill(nvh * ds * ds, 13, 0, 0.02, 0.5, 53)
+                var smh <- row_fill(sm_n, 17, 0, 0.03, 0.6, 43)
                 smh[0] = eps
                 for (i in range(nvh)) {
                     smh[a_off + i] = -0.4 - float(i) * 0.1
@@ -7612,7 +7263,7 @@ def test_vkd_dn_family(t0 : T?) {
                     for (tt in range(npos)) {
                         let crow = tt * cd
                         let graw = smh[g_off + tt * nvh + hh] + smh[dt_off + hh]
-                        let gt = smh[a_off + hh] * (graw > 20.0 ? graw : log(1.0 + exp(graw)))
+                        let gt = smh[a_off + hh] * softplus(graw)
                         gcum += gt
                         let eg = exp(gt)
                         let bt = sigmoid_f32(smh[beta_off + tt * nvh + hh])
@@ -7642,7 +7293,7 @@ def test_vkd_dn_family(t0 : T?) {
                         let inv = 1.0 / sqrt(sum / float(ds) + eps)
                         for (j in range(ds)) {
                             let zv = zh[tt * di + hh * ds + j]
-                            o_ref[tt * di + hh * ds + j] = orow[j] * inv * smh[wnorm_off + j] * (zv / (1.0 + exp(-zv)))
+                            o_ref[tt * di + hh * ds + j] = orow[j] * inv * smh[wnorm_off + j] * silu_f32(zv)
                             o_ref_sig[tt * di + hh * ds + j] = orow[j] * inv * smh[wnorm_off + j] * sigmoid_f32(zv)
                         }
                         delete dvn
@@ -7864,18 +7515,9 @@ def private dn_fixture(nrows, nslots, ds : int; out_f32 : bool) : DnFixture {
     f.nblk = f.nvh * ds / 32
     f.orow = out_f32 ? f.nvh * ds : f.nblk * 8
     f.offs = fixed_array(f.beta_off, f.g_off, a_off, dt_off, taps_off, wnorm_off, f.hist_off, f.bstride)
-    f.projh |> resize(nrows * f.prow)
-    f.sth |> resize(nslots * f.st_n)
-    f.smh |> resize(f.sm_n)
-    for (i in range(nrows * f.prow)) {
-        f.projh[i] = float((i * 29) % 67) * 0.03 - 1.0
-    }
-    for (i in range(nslots * f.st_n)) {
-        f.sth[i] = float((i * 13) % 53) * 0.02 - 0.5
-    }
-    for (i in range(f.sm_n)) {
-        f.smh[i] = float((i * 17) % 43) * 0.02 - 0.4
-    }
+    f.projh <- row_fill(nrows * f.prow, 29, 0, 0.03, 1.0, 67)
+    f.sth <- row_fill(nslots * f.st_n, 13, 0, 0.02, 0.5, 53)
+    f.smh <- row_fill(f.sm_n, 17, 0, 0.02, 0.4, 43)
     f.smh[0] = f.eps
     f.smh[1] = f.qscale
     for (i in range(f.nvh)) {
@@ -8087,18 +7729,10 @@ def private dn_ba_cell(t : T?; tag : string; dim, nvh, npos, woff : int; poison_
         let ob_b = 16
         let ob_g = ob_b + npos * ostride + 8
         let out_n = ob_g + npos * ostride
-        var wh : array<float>
-        var xh : array<float>
+        var wh <- hash_fill(woff + ne * dim, 0u, 1000u, 500.0, 1.0)
+        var xh <- hash_fill(npos * dim, 77777u, 1000u, 500.0, 1.0)
         var want : array<float>
-        wh |> resize(woff + ne * dim)
-        xh |> resize(npos * dim)
         want |> resize(out_n)
-        for (i in range(length(wh))) {
-            wh[i] = float(hash_word(uint(i)) % 1000u) / 500.0 - 1.0
-        }
-        for (i in range(length(xh))) {
-            xh[i] = float(hash_word(uint(i) + 77777u) % 1000u) / 500.0 - 1.0
-        }
         var wh16 <- pack_f16(wh)   // the device keeps the rows f16: the oracle dots the rounded weights
         for (p in range(npos)) {
             for (e in range(ne)) {
@@ -8175,20 +7809,12 @@ def private dn_scan_cell(t : T?; tag : string; ds, nkh, nvh, npos : int) {
             let o_off = 64   // the o rows sit past a header the kernel must leave alone
             let o_n = o_off + npos * di
             var convh : array<float>
-            var sth : array<float>
-            var smh : array<float>
             convh |> resize(npos * cd)
-            sth |> resize(nvh * ds * ds)
-            smh |> resize(sm_n)
             for (i in range(npos * cd)) {   // unit-scale q/k rows keep the 512-step recurrence bounded
                 convh[i] = (float((i * 19) % 79) * 0.025 - 0.9) * 0.15
             }
-            for (i in range(nvh * ds * ds)) {
-                sth[i] = float((i * 13) % 53) * 0.02 - 0.5
-            }
-            for (i in range(sm_n)) {
-                smh[i] = float((i * 17) % 43) * 0.03 - 0.6
-            }
+            var sth <- row_fill(nvh * ds * ds, 13, 0, 0.02, 0.5, 53)
+            var smh <- row_fill(sm_n, 17, 0, 0.03, 0.6, 43)
             for (i in range(nvh)) {
                 smh[a_off + i] = -0.4 - float(i) * 0.1
             }
@@ -8249,7 +7875,7 @@ def private dn_scan_cell(t : T?; tag : string; ds, nkh, nvh, npos : int) {
                 for (tt in range(npos)) {
                     let crow = tt * cd
                     let graw = smh[g_off + tt * nvh + hh] + smh[dt_off + hh]
-                    let eg = exp(smh[a_off + hh] * (graw > 20.0 ? graw : log(1.0 + exp(graw))))
+                    let eg = exp(smh[a_off + hh] * softplus(graw))
                     let bt = sigmoid_f32(smh[beta_off + tt * nvh + hh])
                     for (j in range(ds)) {
                         var ks = 0.0
@@ -8369,18 +7995,10 @@ def test_vkd_router_gemv_f16(t0 : T?) {
             let woff = ne * dim   // the second layer's alpha rows
             let obase = 16
             let out_n = obase + ne + 8
-            var wh : array<float>
-            var xh : array<float>
+            var wh <- hash_fill(woff + ne * dim, 4242u, 1000u, 500.0, 1.0)
+            var xh <- hash_fill(dim, 99u, 1000u, 500.0, 1.0)
             var want : array<float>
-            wh |> resize(woff + ne * dim)
-            xh |> resize(dim)
             want |> resize(out_n)
-            for (i in range(length(wh))) {
-                wh[i] = float(hash_word(uint(i) + 4242u) % 1000u) / 500.0 - 1.0
-            }
-            for (i in range(dim)) {
-                xh[i] = float(hash_word(uint(i) + 99u) % 1000u) / 500.0 - 1.0
-            }
             var wh16 <- pack_f16(wh)
             for (e in range(ne)) {
                 var acc = 0.0
@@ -8440,11 +8058,7 @@ def test_vkd_router_gemv_f16(t0 : T?) {
             t |> success(bad2 == 0 && gap == 0, "router_gemv_f16 two bases: {bad2} of {ne} outputs off the CPU dot, {gap} of 4 gap words written")
             //! the norm-folded form: every expert row's dot over x under the norm row at nwoff, scaled by the row's weightless rms
             let nwoff = 64
-            var wnh : array<float>
-            wnh |> resize(nwoff + dim)
-            for (i in range(length(wnh))) {
-                wnh[i] = float(hash_word(uint(i) + 777u) % 1000u) / 1000.0 + 0.5
-            }
+            var wnh <- hash_fill(nwoff + dim, 777u, 1000u, 1000.0, -0.5)
             let eps = 1.0e-6
             var ssn = 0.0
             for (k in range(dim)) {
@@ -8530,18 +8144,10 @@ def test_vkd_kv16_writers(t0 : T?) {
             for (biased in fixed_array(false, true)) {
                 let npairs = (nh + nkvh) * half
                 let kpair0 = nh * half
-                var qh : array<float>
-                var kvh : array<float>
+                var qh <- row_fill(qd, 23, 0, 0.09, 3.0, 71)
+                var kvh <- row_fill(qd + 2 * kvd, 19, 0, 0.07, 2.9, 83)
                 var csh : array<float>
-                qh |> resize(qd)
-                kvh |> resize(qd + 2 * kvd)
                 csh |> resize(hs)
-                for (i in range(qd)) {
-                    qh[i] = float((i * 23) % 71) * 0.09 - 3.0
-                }
-                for (i in range(qd + 2 * kvd)) {
-                    kvh[i] = float((i * 19) % 83) * 0.07 - 2.9
-                }
                 for (i in range(half)) {
                     csh[i] = 0.3 + float(i % 9) * 0.07
                     csh[half + i] = 0.1 + float(i % 7) * 0.11
@@ -8625,21 +8231,9 @@ def test_vkd_kv16_writers(t0 : T?) {
                 let ppp = (nh + nkvh) * half
                 let kpair0 = nh * half
                 let mirn = layerbase + (pos0 + npos) * kvd
-                var q0h : array<float>
-                var kvh : array<float>
-                var csh : array<float>
-                q0h |> resize(npos * qd)
-                kvh |> resize(voff + npos * kvd)
-                csh |> resize(npos * hs)
-                for (i in range(npos * qd)) {
-                    q0h[i] = float((i * 31) % 67) * 0.05 - 1.6
-                }
-                for (i in range(voff + npos * kvd)) {
-                    kvh[i] = float((i * 23) % 71) * 0.04 - 1.5
-                }
-                for (i in range(npos * hs)) {
-                    csh[i] = float((i * 13) % 41) * 0.045 - 0.9
-                }
+                var q0h <- row_fill(npos * qd, 31, 0, 0.05, 1.6, 67)
+                var kvh <- row_fill(voff + npos * kvd, 23, 0, 0.04, 1.5, 71)
+                var csh <- row_fill(npos * hs, 13, 0, 0.045, 0.9, 41)
                 let q_bytes = int64(npos * qd) * 4l
                 let kv_bytes = int64(voff + npos * kvd) * 4l
                 let cs_bytes = int64(npos * hs) * 4l
@@ -8770,23 +8364,11 @@ def test_vkd_kv16_writers(t0 : T?) {
                 let krow = 192
                 let eps = 0.00001
                 let mirn2 = krow + nkvh * hs
-                var q0h : array<float>
-                var kvh : array<float>
-                var csh : array<float>
+                var q0h <- row_fill(qd, 31, 0, 0.05, 1.6, 67)
+                var kvh <- row_fill(qd + 2 * kvd, 23, 0, 0.04, 1.5, 71)
+                var csh <- row_fill(hs, 13, 0, 0.045, 0.9, 41)
                 var wnh : array<float>
-                q0h |> resize(qd)
-                kvh |> resize(qd + 2 * kvd)
-                csh |> resize(hs)
                 wnh |> resize(2 * hs)
-                for (i in range(qd)) {
-                    q0h[i] = float((i * 31) % 67) * 0.05 - 1.6
-                }
-                for (i in range(qd + 2 * kvd)) {
-                    kvh[i] = float((i * 23) % 71) * 0.04 - 1.5
-                }
-                for (i in range(hs)) {
-                    csh[i] = float((i * 13) % 41) * 0.045 - 0.9
-                }
                 for (i in range(2 * hs)) {
                     wnh[i] = 0.75 + float(i % 11) * 0.05
                 }
@@ -8891,15 +8473,11 @@ def test_vkd_kv16_readers(t0 : T?) {
                 let kvd = (nheads / kv_mul) * hs
                 let cnt = 300
                 let scale = 0.125
-                var qh : array<float>
+                var qh <- row_fill(nheads * hs, 41, 0, 0.05, 1.8, 73)
                 var kh : array<float>
                 var vh : array<float>
-                qh |> resize(nheads * hs)
                 kh |> resize(cnt * kvd)
                 vh |> resize(cnt * kvd)
-                for (i in range(nheads * hs)) {
-                    qh[i] = float((i * 41) % 73) * 0.05 - 1.8
-                }
                 for (i in range(cnt * kvd)) {
                     kh[i] = f16r(float((i * 17) % 97) * 0.03 - 1.4)
                     vh[i] = f16r(float((i * 53) % 89) * 0.04 - 1.7)
@@ -9004,15 +8582,11 @@ def test_vkd_emb_gather_pair(t0 : T?) {
             let scale = 1.25
             let wblk0 = 3              // the plane sits 3 blocks into its slab - the serving shape, never block 0
             let totblk = wblk0 + vocab * nbb
-            var wqh : array<uint>
+            var wqh <- hashed_words(totblk * 8, 1u, 5u)
             var wsh16 : array<float16>
             var idsh : array<uint>
-            wqh |> resize(totblk * 8)
             wsh16 |> resize(totblk)
             idsh |> resize(npos)
-            for (i in range(totblk * 8)) {
-                wqh[i] = hash_word(uint(i) + 5u)
-            }
             for (i in range(totblk)) {
                 wsh16[i] = float16(0.0625 + float(i % 7) * 0.03125)
             }
@@ -9106,24 +8680,19 @@ def test_vkd_hot_combine(t0 : T?) {
             let n = 300   //! past one workgroup's 256 threads: the strided loop's second trip
             let k = 5
             let nhit = 3
-            var miss : array<float>
+            var miss <- hash_steps(n, 71u)
             var w : array<float>
-            var down : array<float>
+            var down <- hash_steps(k * n, 83u)
             var ident1 : array<uint>
-            miss |> resize(n)
             w |> resize(k)
-            down |> resize(k * n)
             ident1 |> resize(k)
-            for (i in range(n)) {
-                miss[i] = float(int(hash_word(uint(i) + 71u) % 2001u)) * 0.001 - 1.0
-            }
             for (j in range(k)) {
                 w[j] = j < nhit ? 0.05 + float(j) * 0.07 : 0.0
                 ident1[j] = uint(j + 1)
             }
             let nan = unsafe(reinterpret<float>(0x7FC00000u))
-            for (i in range(k * n)) {
-                down[i] = i < nhit * n ? float(int(hash_word(uint(i) + 83u) % 2001u)) * 0.001 - 1.0 : nan   // a miss's row is stale: no hit chain wrote it
+            for (i in range(nhit * n, k * n)) {
+                down[i] = nan   // a miss's row is stale: no hit chain wrote it
             }
             let x_bytes = int64(n) * 4l
             let w_bytes = int64(k) * 4l
@@ -9201,25 +8770,15 @@ def test_vkd_dec_combine_pair(t0 : T?) {
             let k = 5
             let ngate = 8
             let gidx = 6
-            var xin : array<float>
+            var xin <- hash_steps(n, 11u)
             var w : array<float>
-            var down : array<float>
-            var sh : array<float>
+            var down <- hash_steps(k * n, 37u)
+            var sh <- hash_steps(n, 23u)
             var gate : array<float>
-            xin |> resize(n)
             w |> resize(k)
-            down |> resize(k * n)
-            sh |> resize(n)
             gate |> resize(ngate)
-            for (i in range(n)) {
-                xin[i] = float(int(hash_word(uint(i) + 11u) % 2001u)) * 0.001 - 1.0
-                sh[i] = float(int(hash_word(uint(i) + 23u) % 2001u)) * 0.001 - 1.0
-            }
             for (j in range(k)) {
                 w[j] = 0.05 + float(j) * 0.07
-            }
-            for (i in range(k * n)) {
-                down[i] = float(int(hash_word(uint(i) + 37u) % 2001u)) * 0.001 - 1.0
             }
             for (i in range(ngate)) {
                 gate[i] = float(i) * 0.5 - 2.0   // gate[gidx] = 1.0: a sigmoid off 0.5, so an ungated arm reads apart
@@ -9547,7 +9106,7 @@ def test_vk_coopmat_default_and_tile_pick(t0 : T?) {
 def test_vkd_ar_f16_fused(t0 : T?) {
     t0 |> run("fused batch ar+f16 == the split cls_ar + f16cvt_cls pair, bit-exact") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
-            if (!ensure_cls_ar() || !ensure_f16cvt_cls() || !ensure_cls_ar_f16_b()) {
+            if (!ensure_cls_ar() || !ensure_tower_clamp_cvt_cls() || !ensure_cls_ar_f16_b()) {
                 t |> skip("no Vulkan device")
                 return
             }
@@ -9588,16 +9147,16 @@ def test_vkd_ar_f16_fused(t0 : T?) {
                 var sca = set_cls_ar(fixed_array(x_split, aad, wnd, yod),
                     fixed_array(row_bytes, row_bytes, wn_bytes, row_bytes),
                     fixed_array(1u, 2u, 0u, 4u))
-                var scc = set_f16cvt_cls(fixed_array(yod, f16_split),
+                var scc = set_tower_clamp_cvt_cls(fixed_array(yod, f16_split),
                     fixed_array(row_bytes, h_bytes), fixed_array(4u, 8u))
                 var scf = set_cls_ar_f16_b(fixed_array(x_fused, aad, wnd, f16_fused),
                     fixed_array(row_bytes, row_bytes, wn_bytes, h_bytes),
                     fixed_array(16u, 2u, 0u, 32u))
                 var pca = ArArgs(dim = uint(dim), add_on = 1u, woff = uint(woff), eps = 1e-5, ascale = 1.0)
-                var pcc = ActArgs(nelem = uint(nrows * dim), nblk = 0u)
+                var pcc = f16_rows_args(uint(nrows * dim))
                 cmd_one_shot() $(raw : VkCommandBuffer; var h : VkHaz) {
                     enc_cls_ar(raw, h, sca, pca, int64(nrows))
-                    enc_f16cvt_cls(raw, h, scc, pcc, int64((nrows * dim / 4 + 255) / 256))
+                    enc_tower_clamp_cvt_cls(raw, h, scc, pcc, int64((nrows * dim / 4 + 255) / 256))
                     enc_cls_ar_f16_b(raw, h, scf, pca, int64(nrows))
                     cmd_copy_planes(raw, h, fixed_array(f16_split, f16_fused, x_split, x_fused), host, fixed_array(h_bytes, h_bytes, row_bytes, row_bytes), 8u | 32u | 16u | 1u)
                 }
@@ -9635,13 +9194,6 @@ let private MR_NER = MR_NE + 1   //! the shared expert's gate row rides past the
 
 //! one 32-bit word to a float in [-2, 2)
 def private hash_unit(i : uint) : float => float(hash_word(i) % 4096u) / 1024.0 - 2.0
-
-//! `bytes` of `dev` back into `host` on a transient command of its own, after the dispatches already landed
-def private vkd_read_back(dev : uint64; host; bytes : int64) {
-    cmd_one_shot() $(raw : VkCommandBuffer; var h : VkHaz) {
-        cmd_copy_whole(raw, dev, host.buf, bytes)
-    }
-}
 
 //! the host select's picks and weights over the rows, `k` a row
 struct TopkSelect {
@@ -9772,8 +9324,8 @@ def private moe_topk_rows_arm(t : T?; norm : bool; wscale : float; gate : MoeGat
             upload_region_at(rbd, 0l, addr<uint8 const?>(rb[0]), rb_bytes)
             nan_sentinel_upload(idxd, s_bytes)
             nan_sentinel_upload(wd, s_bytes)
-            var sc = set_topk_rows_cls(fixed_array(ld, idxd, wd, ld, rbd), fixed_array(l_bytes, s_bytes, s_bytes, l_bytes, rb_bytes), fixed_array(1u, 2u, 4u, 1u, 0u))   //! no down scale: the logits fill the ds binding, never read at NO_DSCALE
-            var pc = TopkRowsArgs(npos = uint(MR_NPOS), ne = uint(MR_NE), k = uint(MR_K), norm = norm || gate == MoeGate.softmax_weight ? 1u : 0u, lstride = uint(MR_NER), wscale = wscale, dsoff = NO_DSCALE,
+            var sc = set_topk_rows_cls(fixed_array(ld, wd, ld, rbd, idxd), fixed_array(l_bytes, s_bytes, l_bytes, rb_bytes, s_bytes), fixed_array(1u, 4u, 1u, 0u, 2u))   //! no down scale: the logits fill the ds binding, never read at NO_DSCALE
+            var pc = TopkArgs(ne = uint(MR_NE), k = uint(MR_K), norm = norm || gate == MoeGate.softmax_weight ? 1u : 0u, lstride = uint(MR_NER), wscale = wscale, dsoff = NO_DSCALE,
                 rbias_on = rbias ? 1u : 0u, rboff = uint(MR_NE))
             cmd_one_shot() $(raw : VkCommandBuffer; var h : VkHaz) {
                 enc_topk_rows_cls(raw, h, sc, pc, int64(MR_NPOS))
@@ -9840,19 +9392,12 @@ def private moe_sched_arm(t : T?) {
         let s1d = make_device_buf(s_bytes)
         let s3d = make_device_buf(s_bytes)
         let s2d = make_device_buf(s_bytes)
-        var fill : array<uint>
-        fill |> resize(length(w1))
-        for (f in fill) {
-            f = MR_SENT
-        }
         let host = make_host_buf(2l * i_bytes + 3l * s_bytes, true, [cached = true])
-        unsafe {
-            upload_region_at(idxd, 0l, addr<uint8 const?>(idx[0]), i_bytes)
-            nan_sentinel_upload(invd, i_bytes)
-            nan_sentinel_upload(bexd, i_bytes)
-            upload_region_at(s1d, 0l, addr<uint8 const?>(fill[0]), s_bytes)
-            upload_region_at(s3d, 0l, addr<uint8 const?>(fill[0]), s_bytes)
-            upload_region_at(s2d, 0l, addr<uint8 const?>(fill[0]), s_bytes)
+        upload_region_at(idxd, 0l, unsafe(addr<uint8 const?>(idx[0])), i_bytes)
+        nan_sentinel_upload(invd, i_bytes)
+        nan_sentinel_upload(bexd, i_bytes)
+        for (sd in fixed_array(s1d, s3d, s2d)) {
+            upload_fill(sd, 0l, s_bytes, MR_SENT)
         }
         var sc = set_moe_sched_cls(fixed_array(idxd, invd, s1d, s3d, s2d, bexd), fixed_array(i_bytes, i_bytes, s_bytes, s_bytes, s_bytes, i_bytes), fixed_array(1u, 2u, 2u, 2u, 2u, 2u))
         var pc = SchedArgs(nk = uint(nk), ne = uint(MR_NE), wt_gu = uint(wt_gu), wt_dn = uint(wt_dn),
@@ -9901,7 +9446,6 @@ def private moe_sched_arm(t : T?) {
         delete w1
         delete w3
         delete w2
-        delete fill
         delete ginv
         delete g1
         delete g3
@@ -9923,18 +9467,15 @@ def private moe_ar_comb_arm(t : T?; gated, with_sh, dbias : bool) {   // nolint:
         let eps = 1.0e-6
         var sidx : array<uint>
         var sw : array<float>
-        var rows : array<float>
-        var xs : array<float>
-        var sh : array<float>
+        var rows <- row_fill(nrows * n, 7, 0, 0.13, 5.5, 93)
+        var xs <- row_fill(npos * n, 11, 0, 0.1, 1.7, 37)
+        var sh <- row_fill(npos * n, 5, 0, 0.2, 3.0, 41)
         var wn : array<float>
         var lg : array<float>
         var sex : array<uint>
         var db : array<float>
         sidx |> resize(nrows)
         sw |> resize(nrows)
-        rows |> resize(nrows * n)
-        xs |> resize(npos * n)
-        sh |> resize(npos * n)
         wn |> resize(n)
         lg |> resize(npos * MR_NER)
         sex |> resize(nrows)
@@ -9947,13 +9488,6 @@ def private moe_ar_comb_arm(t : T?; gated, with_sh, dbias : bool) {   // nolint:
         }
         for (i in range(dbn)) {
             db[i] = dbias ? (i < ne * n ? 9.0 : float((i * 19) % 23) * 0.25 - 2.75) : 0.0   //! the first layer's rows are a decoy
-        }
-        for (i in range(nrows * n)) {
-            rows[i] = float((i * 7) % 93) * 0.13 - 5.5
-        }
-        for (i in range(npos * n)) {
-            xs[i] = float((i * 11) % 37) * 0.1 - 1.7
-            sh[i] = float((i * 5) % 41) * 0.2 - 3.0
         }
         for (i in range(n)) {
             wn[i] = 0.5 + float(i % 7) * 0.125
@@ -10142,26 +9676,16 @@ def private moe_ar_comb_g4_arm(t : T?) {
         let ascale = 0.75
         var sidx : array<uint>
         var sw : array<float>
-        var rows : array<float>
-        var xs : array<float>
-        var sh : array<float>
+        var rows <- row_fill(nrows * n, 7, 0, 0.13, 5.5, 93)
+        var xs <- row_fill(npos * n, 11, 0, 0.1, 1.7, 37)
+        var sh <- row_fill(npos * n, 5, 0, 0.2, 3.0, 41)
         var wn : array<float>   //! four norm rows: the next norm, the dense post norm, the routed post norm, the layer's post norm
         sidx |> resize(nrows)
         sw |> resize(nrows)
-        rows |> resize(nrows * n)
-        xs |> resize(npos * n)
-        sh |> resize(npos * n)
         wn |> resize(4 * n)
         for (i in range(nrows)) {
             sidx[i] = uint((i * 7) % nrows)
             sw[i] = 0.125 + float(i % 5) * 0.25
-        }
-        for (i in range(nrows * n)) {
-            rows[i] = float((i * 7) % 93) * 0.13 - 5.5
-        }
-        for (i in range(npos * n)) {
-            xs[i] = float((i * 11) % 37) * 0.1 - 1.7
-            sh[i] = float((i * 5) % 41) * 0.2 - 3.0
         }
         for (i in range(4 * n)) {
             wn[i] = 0.5 + float((i * 3) % 7) * 0.125
@@ -10371,9 +9895,9 @@ def private topk_n_arm(t : T?; gptoss_router_bias : bool) {
             2u | 4u | 8u | 16u | 32u,
             $(p : int; raw : VkCommandBuffer; var h : VkHaz; o : NformOuts) {
                 upload_region_at(ld1, 0l, unsafe(addr<uint8 const?>(lh[p * lstride])), l1_bytes)
-                var sc1 = set_topk_cls(fixed_array(ld1, o.bufs[0], o.bufs[1], o.bufs[2], o.bufs[3], dsd, rbd, o.bufs[4]),
+                var sc1 = set_topk_n_cls(fixed_array(ld1, o.bufs[0], o.bufs[1], o.bufs[2], o.bufs[3], dsd, rbd, o.bufs[4]),
                     fixed_array(l1_bytes, o.bytes[0], o.bytes[1], o.bytes[2], o.bytes[3], ds_bytes, rb_bytes, o.bytes[4]), gbits)
-                enc_topk_cls(raw, h, sc1, pc1, 1l)
+                enc_topk_n_cls(raw, h, sc1, pc1, 1l)
             },
             $(nrows : int; raw : VkCommandBuffer; var h : VkHaz; o : NformOuts) {
                 var scN = set_topk_n_cls(fixed_array(ld, o.bufs[0], o.bufs[1], o.bufs[2], o.bufs[3], dsd, rbd, o.bufs[4]),
@@ -10414,7 +9938,7 @@ def private topk_n_arm(t : T?; gptoss_router_bias : bool) {
 def test_vkd_topk_n(t0 : T?) {
     t0 |> run("the N-row command's top-k == the one-row top-k a row at a time, bit for bit, and the host select") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
-            if (!(ensure_topk_cls() && ensure_topk_n_cls())) {
+            if (!ensure_topk_n_cls()) {
                 t |> skip("no Vulkan device")
                 return
             }
@@ -10494,19 +10018,9 @@ def private router_cols_arm(t : T?; ncols : int; norm_on, f16 : bool) {
         let ne = 24
         let obase = 8
         let ncol_max = 8
-        var wh, xh, nh : array<float>
-        wh |> resize(ne * dim)
-        xh |> resize(ncol_max * dim)
-        nh |> resize(dim)
-        for (i in range(ne * dim)) {
-            wh[i] = float(hash_word(uint(i) + 777u) % 1000u) / 500.0 - 1.0
-        }
-        for (i in range(ncol_max * dim)) {
-            xh[i] = float(hash_word(uint(i) + 31u) % 1000u) / 500.0 - 1.0
-        }
-        for (i in range(dim)) {
-            nh[i] = float(hash_word(uint(i) + 9u) % 1000u) / 1000.0 + 0.5
-        }
+        var wh <- hash_fill(ne * dim, 777u, 1000u, 500.0, 1.0)
+        var xh <- hash_fill(ncol_max * dim, 31u, 1000u, 500.0, 1.0)
+        var nh <- hash_fill(dim, 9u, 1000u, 1000.0, -0.5)
         var wh16 <- pack_f16(wh)
         var wdev : array<float>   //! the weights as the device reads them: the f16 stamp's rounded, the f32 stamp's as given
         wdev |> resize(ne * dim)
