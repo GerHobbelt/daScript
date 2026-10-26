@@ -69,6 +69,7 @@ Before reaching for `Bash`/`Grep`/`Read` to find a symbol or trace usages in thi
 
 | Question | Tool |
 |---|---|
+| Does the stdlib already do this? (before writing ANY helper) | `discover` - a few intent words over the generated digest of every module's public symbols |
 | Where is symbol X defined? (`.das`) | `find_symbol` - pass `with_cpp_source=true` for builtins / handled types to bridge daslang->C++ in one call |
 | Where is symbol X defined? (`.cpp`) | `cpp_find_symbol` |
 | Where is X used? (`.das`) | `grep_usage` |
@@ -98,7 +99,7 @@ Task-specific instructions are split into skill files under `skills/`. You MUST 
 | `skills/internal/documentation_rst.md` | Editing RST in `doc/source/`, `//!` doc-comments in `daslib/*.das`, tutorial RST pages |
 | `skills/internal/tutorials.md` | Anything that looks like a tutorial - they live under `/tutorials/<area>/`, NEVER `modules/<X>/tutorial/` |
 | `skills/internal/tutorial_prose.md` | WRITING or revising general-reader doc/tutorial prose (`documentation_rst.md` is mechanics, this is the words) |
-| `skills/cpp_integration.md` | Embedding daslang in C++; binding types/functions/enums; shipping without the compiler (`libDaScriptNano`, or a standalone context on the full runtime) |
+| `skills/cpp_integration.md` | Embedding daslang in C++; binding types/functions/enums; shipping without the compiler (`libDaScriptNano`, or a standalone context on the full runtime); calling daslang from C (`daslang -lib`) |
 | `skills/internal/cpp_codebase_notes.md` | Working on daslang's own C++ - where inference/builtins/errors/parser live, AST function flags |
 | `skills/internal/clang_bind_build.md` | Enabling `dasClangBind` / bumping the libclang SDK / running any `bind_*.das` self-binder |
 | `skills/daslib_modules.md` | Working with `daslib/` modules or extending the stdlib |
@@ -143,6 +144,7 @@ Task-specific instructions are split into skill files under `skills/`. You MUST 
 | `skills/internal/woodpecker.md` | Running the external codex reviewer on a branch/diff - every `make_pr` arc gets a round |
 | `skills/review_md.md` | Creating or editing any module `REVIEW.md`, or reviewing a diff to one |
 | `skills/tdd_audit.md` | Auditing any diff for test coverage - the branch-test rule |
+| `skills/dupe_audit.md` | Auditing a diff or a file set for duplicated or parameterizable code - the one-implementation rule; before claiming a helper is new |
 | `skills/internal/preflight.md` | Pushing a non-trivial branch or reproducing a red CI lane - each lane's local mirror command |
 | `skills/internal/abi_break_sweep.md` | Changing public C++ API, AST node layout, or daslib generic signatures external module repos compile against |
 | `skills/internal/wsl_ci_repro.md` | Reproducing a Linux-only CI failure in the WSL CI-mirror distro |
@@ -179,7 +181,7 @@ New knowledge about daslang syntax, semantics, or conventions - from compiler er
 
 **Rule files carry rules, not history.** CLAUDE.md files, `skills/*.md`, and per-module rule docs state the CURRENT contract only - no incident anecdotes, PR/issue numbers, dated rulings, or "as of" entries. When a rule changes, replace the old text outright and state the timeless WHY; history lives in git and in the author's out-of-tree notes, so a motivating incident is not written into the tree. A syntax/behavior claim is still probe-verified before it lands, but the verification date is history too: never write an inline `(probe-verified <date>)` tag. These files load into context and are read by weaker models, so every token must carry meaning.
 
-**Every REVIEW.md reviews itself.** A discovered checklist is itself audited under the self-review rule, not just applied - its own defects are findings, fixed in the same batch. The contract all checklists share lives ONCE in `REVIEW_COMMON.md` at the repo root; checklists point at it and never restate it (`skills/review_md.md`). Per-PR discovery, the `REVIEW.das` gates, and the auditor-agent topology: `skills/internal/make_pr.md`, the REVIEW audit row and its agent-topology section.
+**Every REVIEW.md reviews itself.** A discovered checklist is itself audited under the self-review rule, not just applied - its own defects are findings, fixed in the same batch. The contract all checklists share lives ONCE in `REVIEW_COMMON.md` at the repo root; checklists point at it and never restate it (`skills/review_md.md`). The rule-document audit is capped at two dragon passes per document per round - one over the batch, one cold re-read whose serious findings close the round without a third read: prose can be improved endlessly, and the doc gates are the floor. Per-PR discovery, the `REVIEW.das` gates, and the auditor-agent topology: `skills/internal/make_pr.md`, the REVIEW audit row and its agent-topology section.
 
 **Doc improvements at stopping points.** Propose-first applies only to restructuring, removing existing guidance, **or proposing a new skill file for a recurring pattern no existing skill covers**. Structural diffs get review; factual drift must be self-healing, not queued behind it.
 
@@ -193,11 +195,9 @@ Read `skills/internal/writing_skills.md` first - it carries the full checklist. 
 
 ## daslang Language
 
-Language, runtime and stdlib truth lives in **`skills/daslang/`** - `SKILL.md` plus thirteen
-references (`types`, `functions`, `structs-and-classes`, `closures`, `memory`, `generics`,
-`macros`, `modules-and-stdlib`, `strings`, `files-and-paths`, `json`, `queries`,
-`cli-and-config`). Read the one that covers what you are about to write or review, before you
-write it. Compiler internals no user-facing doc carries - the container collect banner, the
+Language, runtime and stdlib truth lives in **`skills/daslang/`** - `SKILL.md` plus the
+reference files under `skills/daslang/references/`. Read the one that covers what you are
+about to write or review, before you write it. Compiler internals no user-facing doc carries - the container collect banner, the
 `/*option*/` policy marker, known mangling defects - are in `skills/internal/daslang_internals.md`.
 
 What follows is only what the bundle deliberately does not carry: the shapes that fail
@@ -211,9 +211,10 @@ diagnostic in any tier.
 - **A continuation line starting `+` or `-` is its own statement**, and unary plus is pure, so
   the optimizer deletes it: `let x = a` <enter> `+ b` <enter> `+ c` leaves `x == a`. Always wrap a
   multi-line arithmetic RHS in `(...)`.
-- **Stripping `const` in order to write.** The const type already licensed readonly /
-  `noalias` / DCE, so the write vanishes in interp, JIT and AOT alike. Declare the parameter
-  `var T?`; never `reinterpret` the const away.
+- **Stripping `const` in order to write.** The type is what the optimizer reads: a const
+  pointer or reference parameter is read-only memory to it, and a write routed through
+  `intptr` and back is invisible to the compiler's write marks and the JIT's read-only guard.
+  LINT031 rejects the shape. Declare the parameter `var T?`; never `reinterpret` the const away.
 - **`delete` on `array<T?>` frees the POINTEES**, not just the buffer. On borrowed pointers the
   interpreter reports `deleting <ptr>, which is not a chunk pointer`, while Release+JIT corrupts
   the heap silently and crashes later at an unrelated allocation. `clear()` the container first,

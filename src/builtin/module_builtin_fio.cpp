@@ -286,6 +286,8 @@ namespace das {
     bool builtin_is_terminal ( int32_t ) GENERATE_IO_STUB_RET
     int32_t builtin_terminal_width () GENERATE_IO_STUB_RET
     bool builtin_feof(const FILE*) GENERATE_IO_STUB_RET
+    bool builtin_fpoll(const FILE*, int) GENERATE_IO_STUB_RET
+    void builtin_funbuffered(const FILE*) GENERATE_IO_STUB
     const FILE * builtin_fopen  ( const char *, const char *, Context *, LineInfoArg * ) GENERATE_IO_STUB_RET
     vec4f builtin_read ( Context &, SimNode_CallBase *, vec4f * ) GENERATE_IO_STUB_VEC
     vec4f builtin_write ( Context &, SimNode_CallBase *, vec4f * ) GENERATE_IO_STUB_VEC
@@ -296,6 +298,7 @@ namespace das {
     bool builtin_chdir ( const char * ) GENERATE_IO_STUB_RET
     bool builtin_mkdir ( const char * ) GENERATE_IO_STUB_RET
     void builtin_exit ( int32_t, Context *, LineInfoArg * ) GENERATE_IO_STUB
+    void builtin_exit_now ( int32_t, Context *, LineInfoArg * ) GENERATE_IO_STUB
     char * builtin_resolve_this_module_dir ( const char *, bool, Context * ) GENERATE_IO_STUB_RET
     bool builtin_remove_file ( const char * ) GENERATE_IO_STUB_RET
     bool builtin_rename_file ( const char *, const char * ) GENERATE_IO_STUB_RET
@@ -318,6 +321,8 @@ namespace das {
     DAS_API bool load_deferred_dynamic_module ( const char * ) GENERATE_IO_STUB_RET
     DAS_API size_t load_all_deferred_dynamic_modules () GENERATE_IO_STUB_RET
     DAS_API bool is_dynamic_module_deferred ( const char * ) GENERATE_IO_STUB_RET
+    DAS_API bool pending_dynamic_module_artifact_present () GENERATE_IO_STUB_RET
+    DAS_API string registered_dynamic_module_name ( const char *, const char * ) GENERATE_IO_STUB_RET
     DAS_API void clear_deferred_dynamic_modules () GENERATE_IO_STUB
 
 #undef GENERATE_IO_STUB
@@ -338,6 +343,7 @@ namespace das {
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>         // isatty, STDOUT_FILENO
@@ -500,6 +506,39 @@ namespace das {
     bool builtin_feof(const FILE* _f) {
         FILE* f = (FILE*)_f;
         return feof(f);
+    }
+
+    bool builtin_fpoll(const FILE* _f, int timeout_ms) {
+        FILE* f = (FILE*)_f;
+        if ( !f ) return false;
+#ifdef _WIN32
+        intptr_t raw = _get_osfhandle(fileno(f));
+        if ( raw == -1 || raw == -2 ) return true;
+        HANDLE h = (HANDLE) raw;
+        const bool forever = timeout_ms < 0;
+        DWORD type = GetFileType(h);
+        if ( type == FILE_TYPE_CHAR ) return WaitForSingleObject(h, forever ? INFINITE : (DWORD) timeout_ms) == WAIT_OBJECT_0;
+        if ( type != FILE_TYPE_PIPE ) return true;
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(forever ? 0 : timeout_ms);
+        for ( ;; ) {
+            DWORD avail = 0;
+            if ( !PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr) ) return true;
+            if ( avail > 0 ) return true;
+            if ( !forever && std::chrono::steady_clock::now() >= deadline ) return false;
+            Sleep(1);
+        }
+#else
+        struct pollfd pfd;
+        pfd.fd = fileno(f);
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        return poll(&pfd, 1, timeout_ms) > 0;
+#endif
+    }
+
+    void builtin_funbuffered(const FILE* _f) {
+        if ( !_f ) return;
+        setvbuf((FILE*)_f, nullptr, _IONBF, 0);
     }
 
     // 64-bit-size stat/fstat (see das_filestat in aot_builtin_fio.h): on Windows the plain
@@ -876,15 +915,17 @@ namespace das {
 
     bool builtin_fstat ( const FILE * f, FStat & fs, Context * context, LineInfoArg * at ) {
         if ( !f ) context->throw_error_at(at, "fstat of null");
-        return das_fstat64(fileno((FILE *)f), fs.stats) == 0;
+        das_filestat st;
+        if ( das_fstat64(fileno((FILE *)f), st) != 0 ) { fs.clear(); return false; }
+        fs.set(st);
+        return true;
     }
 
     bool builtin_stat ( const char * filename, FStat & fs ) {
-        if ( filename!=nullptr ) {
-            return das_stat64(filename, fs.stats) == 0;
-        } else {
-            return false;
-        }
+        das_filestat st;
+        if ( filename==nullptr || das_stat64(filename, st) != 0 ) { fs.clear(); return false; }
+        fs.set(st);
+        return true;
     }
 
      void builtin_dir ( const char * path, const Block & fblk, Context * context, LineInfoArg * at ) {
@@ -988,6 +1029,15 @@ namespace das {
             if ( context ) context->stackWalk(at, false, false);
         }
         exit(ec);
+    }
+
+    extern atomic<bool> g_exitingNow;
+
+    void builtin_exit_now ( int32_t ec, Context *, LineInfoArg * ) {
+        g_exitingNow = true;
+        fflush(stdout);
+        fflush(stderr);
+        _exit(ec);
     }
 
     int builtin_popen_impl ( const char * cmd, bool bin, const TBlock<void,const FILE *> & blk, Context * context, LineInfoArg * at ) {
@@ -2325,6 +2375,19 @@ namespace das {
         return on;
     }
 
+    // Debug builds produce _debug.shared_module; rewrite the path so that
+    // .das_module files don't need per-config conditional logic.
+    static string dynamic_module_actual_path ( const char * path ) {
+        string actualPath(path);
+#ifndef NDEBUG
+        auto pos = actualPath.rfind(".shared_module");
+        if ( pos != string::npos && pos + 14 == actualPath.size() ) {
+            actualPath.insert(pos, "_debug");
+        }
+#endif
+        return actualPath;
+    }
+
     // Returns DLL handle, nullptr on failure. on_error governs LOAD failures only:
     // Quiet defers a failed dlopen to retry_pending_dynamic_modules() (sibling-dep
     // ordering). A loadable-but-broken artifact (registrator missing, build-id
@@ -2340,15 +2403,7 @@ namespace das {
             row.on_error = on_error;
             g_manifest_rows.push_back(das::move(row));
         }
-        string actualPath(path);
-#ifndef NDEBUG
-        // Debug builds produce _debug.shared_module; rewrite the path so that
-        // .das_module files don't need per-config conditional logic.
-        auto pos = actualPath.rfind(".shared_module");
-        if ( pos != string::npos && pos + 14 == actualPath.size() ) {
-            actualPath.insert(pos, "_debug");
-        }
-#endif
+        string actualPath = dynamic_module_actual_path(path);
         auto lib = loadDynamicLibrary(actualPath.c_str());
         // Capture the dlopen error once, before anything else can clear it.
         string dlErr = lib ? string() : getDynamicLibraryError();
@@ -2418,6 +2473,15 @@ namespace das {
     }
     void *register_dynamic_module_silent(const char *path, const char *mod_name, Context * context, LineInfoArg * at ) {
         return register_dynamic_module(path, mod_name, static_cast<int>(RegisterOnError::Quiet), context, at);
+    }
+
+    // the das-visible name a registered module took, by the path and class its row carries; empty while it is not registered
+    DAS_API string registered_dynamic_module_name ( const char * path, const char * cpp_class ) {
+        if ( !path || !cpp_class ) return string();
+        for ( const auto & [p, c, n] : g_registered_dynamic_modules ) {
+            if ( p == path && c == cpp_class ) return n;
+        }
+        return string();
     }
 
     DAS_API void replay_dynamic_module ( const char * path, const char * cpp_class, int on_error ) {
@@ -2498,6 +2562,17 @@ namespace das {
                 }
             }
         }
+    }
+
+    // src/ast/ARCHITECTURE.md sec.2 - a pending row whose artifact is on disk failed on something
+    // other than a missing file: on a platform that resolves imports at load, a sibling the
+    // deferred set still holds
+    DAS_API bool pending_dynamic_module_artifact_present() {
+        for (auto & pr : g_pending_dynamic_modules) {
+            std::error_code ec;
+            if (std::filesystem::exists(das_to_path(dynamic_module_actual_path(get<0>(pr).c_str()).c_str()), ec) && !ec) return true;
+        }
+        return false;
     }
 
     // One line per still-pending (dlopen-failed) module: "  Module_Glfw <- <path> (<dlerror>)"
@@ -2819,7 +2894,7 @@ namespace das {
         std::ofstream ofs(p, std::ios::binary);
         if ( !ofs ) return nullptr;
         ofs.close();
-        auto s = p.string();
+        auto s = path_to_das(p);
         return ctx->allocateString(s.data(), uint32_t(s.size()), at);
     }
 
@@ -2833,7 +2908,7 @@ namespace das {
             if ( ec ) error = ec_to_string(ec, ctx, at);
             return nullptr;
         }
-        auto s = p.string();
+        auto s = path_to_das(p);
         return ctx->allocateString(s.data(), uint32_t(s.size()), at);
     }
 
@@ -2841,7 +2916,7 @@ namespace das {
         error = nullptr;
         if ( !path ) { error = empty_path_error(ctx, at); return false; }
         std::error_code ec;
-        auto si = std::filesystem::space(path, ec);
+        auto si = std::filesystem::space(das_to_path(path), ec);
         if ( ec ) { error = ec_to_string(ec, ctx, at); return false; }
         info.capacity = si.capacity;
         info.free = si.free;
@@ -2859,7 +2934,7 @@ namespace das {
     }
 
     // 3-tier directory resolver mirroring the shared-module resolution policy
-    // from PR #2579 (module_jit.cpp::resolve_dynamic_module_path), but for
+    // from PR #2579 (jit_runtime.cpp::resolve_dynamic_module_path), but for
     // source-side asset directories.  Given a baked source-file path captured
     // at macro expansion (e.g. ".../modules/das-cards/cards/card_mesh.das"),
     // returns the directory where that module's runtime assets currently live:
@@ -3074,6 +3149,12 @@ namespace das {
             addExtern<DAS_BIND_FUN(builtin_feof)>(*this, lib, "feof",
                 SideEffects::modifyExternal, "builtin_feof")
                     ->arg("file");
+            addExtern<DAS_BIND_FUN(builtin_fpoll)>(*this, lib, "fpoll",
+                SideEffects::modifyExternal, "builtin_fpoll")
+                    ->args({"file","timeout_ms"});
+            addExtern<DAS_BIND_FUN(builtin_funbuffered)>(*this, lib, "funbuffered",
+                SideEffects::modifyExternal, "builtin_funbuffered")
+                    ->arg("file");
             addExtern<DAS_BIND_FUN(builtin_fseek)>(*this, lib, "fseek",
                 SideEffects::modifyExternal, "builtin_fseek")
                     ->args({"file","offset","mode","context","line"});
@@ -3147,6 +3228,9 @@ namespace das {
                 SideEffects::modifyExternal, "getchar_wrapper");
             addExtern<DAS_BIND_FUN(builtin_exit)>(*this, lib, "exit",
                 SideEffects::modifyExternal, "builtin_exit")
+                    ->args({"exitCode","context","line"})->unsafeOperation = true;
+            addExtern<DAS_BIND_FUN(builtin_exit_now)>(*this, lib, "exit_now",
+                SideEffects::modifyExternal, "builtin_exit_now")
                     ->args({"exitCode","context","line"})->unsafeOperation = true;
             addExtern<DAS_BIND_FUN(builtin_popen)>(*this, lib, "popen",
                 SideEffects::modifyExternal, "builtin_popen")

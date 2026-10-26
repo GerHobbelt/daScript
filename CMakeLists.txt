@@ -63,9 +63,9 @@ if(DAS_VECMATH_SCALAR)
     add_compile_definitions(_TARGET_SIMD_SCALAR=1)
 endif()
 # Upper bound on JobQue worker threads (caps get_total_hw_threads / get_total_hw_jobs and the
-# persistent job pool). Empty = platform.h default: 4 on wasm (keeps a web build from spawning one
+# persistent job pool). Empty = platform.h default: 8 on wasm (keeps a web build from spawning one
 # Web Worker per logical core), effectively uncapped elsewhere (the cores-1 rule governs).
-set(DAS_MAX_HW_JOBS "" CACHE STRING "Max JobQue worker threads (empty = platform.h default: 4 wasm, uncapped elsewhere)")
+set(DAS_MAX_HW_JOBS "" CACHE STRING "Max JobQue worker threads (empty = platform.h default: 8 wasm, uncapped elsewhere)")
 if(DAS_MAX_HW_JOBS)
     add_compile_definitions(DAS_MAX_HW_JOBS=${DAS_MAX_HW_JOBS})
 endif()
@@ -1000,6 +1000,7 @@ src/builtin/module_builtin_rtti.cpp
 src/builtin/module_builtin_ast.h
 src/builtin/module_builtin_uriparser.h
 src/builtin/module_builtin_uriparser.cpp
+src/builtin/jit_runtime.cpp
 src/builtin/module_jit.cpp
 src/builtin/module_builtin_fio.cpp
 src/builtin/module_builtin_dasbind.cpp
@@ -1644,6 +1645,9 @@ if (NOT ${DAS_TOOLS_DISABLED})
     # their C++, which is why they live here and not beside the nano library.
     add_subdirectory(examples/standalone)
 
+    # `daslang -lib` libraries bound back into daslang through generated [extern] bindings.
+    add_subdirectory(examples/c_api_library)
+
 endif()
 
 # This list should be significantly reduced, most of the files, except aot related should be private.
@@ -1983,6 +1987,7 @@ install(FILES
     ${PROJECT_SOURCE_DIR}/utils/mcp/main.das
     ${PROJECT_SOURCE_DIR}/utils/mcp/cpp_main.das
     ${PROJECT_SOURCE_DIR}/utils/mcp/mcp_core.das
+    ${PROJECT_SOURCE_DIR}/utils/mcp/tool_result.das
     ${PROJECT_SOURCE_DIR}/utils/mcp/protocol_core.das
     ${PROJECT_SOURCE_DIR}/utils/mcp/registry_das.das
     ${PROJECT_SOURCE_DIR}/utils/mcp/registry_cpp.das
@@ -2013,14 +2018,13 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/mcp/tests/
 
 # Install LSP server (Claude Code plugin: push diagnostics after every edit +
 # definition/references/hover/symbols/call hierarchy/implementation).
-#   lsp_supervisor.py — the LSP endpoint (python; zero language knowledge)
-#   subtools/*.das    — stateless spawn-per-request batch tools
+#   the endpoint is `watchdog --lsp` (utils/watchdog/lsp_front.das, in the static exe)
+#   subtools/*.das — stateless spawn-per-request batch tools
 # The .claude/skills manifest auto-loads the plugin for Claude Code sessions
 # started at the install root; utils/lsp/plugin serves explicit --plugin-dir
 # registration from anywhere else. Same relative layout as the repo, so both
 # manifests work unchanged.
 install(FILES
-    ${PROJECT_SOURCE_DIR}/utils/lsp/lsp_supervisor.py
     ${PROJECT_SOURCE_DIR}/utils/lsp/README.md
     DESTINATION utils/lsp
 )
@@ -2046,7 +2050,8 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/skills/daslang/
 install(FILES ${PROJECT_SOURCE_DIR}/.claude/agents/dragon.md DESTINATION .claude/agents)
 
 install(FILES
-    ${PROJECT_SOURCE_DIR}/utils/dap/mcp_bridge.py
+    ${PROJECT_SOURCE_DIR}/utils/dap/main.das
+    ${PROJECT_SOURCE_DIR}/utils/dap/dap_bridge.das
     ${PROJECT_SOURCE_DIR}/utils/dap/README.md
     DESTINATION utils/dap
 )
@@ -2153,6 +2158,7 @@ install(FILES ${PROJECT_SOURCE_DIR}/utils/dasllama-convert/main.das
 install(FILES
     ${PROJECT_SOURCE_DIR}/utils/watchdog/watchdog.das
     ${PROJECT_SOURCE_DIR}/utils/watchdog/stdio_front.das
+    ${PROJECT_SOURCE_DIR}/utils/watchdog/lsp_front.das
     ${PROJECT_SOURCE_DIR}/utils/watchdog/main.das
     ${PROJECT_SOURCE_DIR}/utils/watchdog/README.md
     DESTINATION utils/watchdog

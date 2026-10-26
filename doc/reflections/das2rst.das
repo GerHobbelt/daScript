@@ -17,6 +17,7 @@ require daslib/ast_boost
 require daslib/strings_boost
 require daslib/strings_convert
 require daslib/md_boost
+require daslib/clargs
 require daslib/rst
 require daslib/rst_comment
 require daslib/functional
@@ -198,7 +199,7 @@ get_value|insert_clone|emplace_new|insert_default|emplace_default|get_with_defau
         group_by_regex("Macro infrastructure", mod, %regex~(is_folding|is_compiling|is_in_completion|is_in_lint_check|is_building_documentation|is_reporting_compilation_errors)%%),
         group_by_regex("Profiler", mod, %regex~(profile|reset_profiler|dump_profile_info|collect_profile_info)$%%),
         group_by_regex("System infrastructure", mod, %regex~(panic|print|feint|sprint|sprint_json|sscan_json|to_log|to_compiler_log|diagnostics_to_stderr|diagnostics_to_file|error|terminate|breakpoint|stackwalk|get_stackwalk|get_das_root|get_das_version|is_in_aot|aot_enabled|is_intern_strings|is_safe_hash|eval_main_loop|shared_module_extension)$%%),
-        group_by_regex("Memory manipulation", mod, %regex~(intptr|memcmp|variant_index|set_variant_index|hash|hash_combine64|memcpy|lock_data|map_to_array|map_to_ro_array)$%%),
+        group_by_regex("Memory manipulation", mod, %regex~(intptr|memcmp|variant_index|set_variant_index|hash|hash_combine64|memcpy|memmove|lock_data|map_to_array|map_to_ro_array)$%%),
         group_by_regex("Binary serializer", mod, %regex~(binary_load|binary_save)$%%),
         group_by_regex("Path and command line", mod, %regex~(get_command_line_arguments|with_argv)$%%),
         group_by_regex("Time and date", mod, %regex~(get_time_usec|ref_time_ticks|get_clock|get_time_nsec|mktime|iso8601_now|format_time|clock)$%%),
@@ -231,7 +232,7 @@ def document_module_fio(_root : string) {
         group_by_regex("Glob and pattern matching", mod, %regex~(match_glob|glob|glob_filtered|is_glob_pattern|expand_glob|parse_file_list)$%%),
         group_by_regex("Filesystem queries", mod, %regex~(temp_directory|temp_directory_result|create_temp_file|create_temp_file_result|create_temp_directory|create_temp_directory_result|disk_space)$%%),
         group_by_regex("Terminal queries", mod, %regex~(is_terminal|terminal_width)$%%),
-        group_by_regex("OS specific routines", mod, %regex~(sleep|exit|system|popen|popen_binary|popen_timeout|spawn_argv|popen_argv|popen_argv_pipe|popen_timed_out|run_and_capture|spawn_process|process_drain|process_poll|process_wait|process_terminate|process_kill|process_pid|process_alive|close_process|process_running|with_process|get_env_variable|set_env_variable|sanitize_command_line|has_env_variable)$%%),
+        group_by_regex("OS specific routines", mod, %regex~(sleep|exit|exit_now|system|popen|popen_binary|popen_timeout|spawn_argv|popen_argv|popen_argv_pipe|popen_timed_out|run_and_capture|spawn_process|process_drain|process_poll|process_wait|process_terminate|process_kill|process_pid|process_alive|close_process|process_running|with_process|get_env_variable|set_env_variable|sanitize_command_line|has_env_variable)$%%),
         group_by_regex("Dynamic modules", mod, %regex~(register_dynamic_module|register_native_path|register_module_group|describe_pending_dynamic_modules|no_manifest)$%%)
     )
     documents("File input output library", mod, "fio.rst", groups)
@@ -259,7 +260,8 @@ def document_module_random(_root : string) {
 def document_module_network(_root : string) {
     var mod = get_module("network_core")
     var groups <- array<DocGroup>(
-        group_by_regex("Low level NetworkServer IO", mod, %regex~(make_server|server_init|server_is_open|server_is_connected|server_tick|server_send|server_restore)$%%)
+        group_by_regex("Low level NetworkServer IO", mod, %regex~(make_server|server_init|server_is_open|server_is_connected|server_tick|server_send|server_restore)$%%),
+        group_by_regex("Low level NetworkClient IO", mod, %regex~(make_client|client_connect|client_is_connected|client_tick|client_send|client_close|probe_local_port)$%%)
     )
     document("Network socket library", mod, "network.rst", groups)
 }
@@ -334,7 +336,7 @@ def document_module_dasllama(_root : string) {
         group_by_regex("Chat", mod, %regex~(create_chat|create_chat_renderer|add_user|add_user_audio|add_user_image|add_user_image_rows|add_assistant|render_turn|render_turn_image|render_turn_audio|render_assistant|render_close|respond|set_thinking)$%%),
         group_by_regex("Tool calling", mod, %regex~(set_tools|add_tool_results|render_assistant_calls|parse_calls)$%%),
         group_by_regex("Reasoning (thinking models)", mod, %regex~(split_reasoning|make_think_stream|think_feed|think_finish|think_drain|effective_stop_ids)$%%),
-        group_by_regex("Operations: prepared images and dispatch", mod, %regex~(dlim_inventory|dlim_clean|set_dispatch_worker_limit|get_dispatch_worker_limit|select_matmul_backend_for_load|kernel_backend_available)$%%),
+        group_by_regex("Operations: prepared images and dispatch", mod, %regex~(dlim_inventory|dlim_clean|set_dispatch_worker_limit|get_dispatch_worker_limit|set_jobque_spin_us|get_jobque_spin_us|select_matmul_backend_for_load|kernel_backend_available)$%%),
         group_by_regex("Operations: GPU tier and model slots", mod, %regex~(gpu_tier_status|set_gpu_tier_want|moe_gpu_tier_arm|moe_gpu_weight_budget|gpu_model_marks_init|gpu_slot_capture|gpu_slot_rearm|moe_gpu_model_marks_save|moe_gpu_model_marks_restore|moe_gpu_hydrate_session|moe_gpu_drop_model|set_resident_prefill_allowed)$%%)
     )
     var hook = DocsHook()
@@ -451,7 +453,7 @@ def document_module_rtti(_root : string) {
         group_by_regex("Program access", mod, %regex~(program_for_each_module|program_for_each_registered_module|get_this_module|get_module|has_module|module_group_for_each_member)$%%),
         group_by_regex("Module access", mod, %regex~(module_for_each_structure|module_for_each_enumeration|module_for_each_function|module_for_each_generic|module_for_each_global|module_for_each_annotation|module_for_each_dependency)$%%),
         group_by_regex("Annotation access", mod, %regex~(get_annotation_argument_value|add_annotation_argument|get_annotation|get_annotation_argument|resolve_annotation|each_annotation|each_annotation_argument)$%%),
-        group_by_regex("Compilation and simulation", mod, %regex~(compile|compile_file|for_each_expected_error|for_each_require_declaration|simulate|create_ast_serializer|create_ast_deserializer|delete_ast_serializer|serialize_program|deserialize_program|ast_serializer_get_data)$%%),
+        group_by_regex("Compilation and simulation", mod, %regex~(compile|compile_file|for_each_expected_error|for_each_require_declaration|simulate|create_ast_serializer|create_ast_deserializer|delete_ast_serializer|serialize_program|deserialize_program|ast_serializer_get_data|ast_serializer_finalize_usec|ast_serializer_setup_usec)$%%),
         group_by_regex("File access", mod, %regex~(make_file_access|set_file_source|add_file_access_root|add_extra_module)$%%),
         group_by_regex("Structure access", mod, %regex~(rtti_builtin_structure_for_each_annotation|basic_struct_for_each_field|structure_for_each_annotation|basic_struct_for_each_parent)$%%),
         group_by_regex("Data walking and printing", mod, %regex~(sprint_data|sprint_json_at|sscan_json_at|describe|get_mangled_name)$%%),
@@ -470,7 +472,7 @@ def document_module_rtti(_root : string) {
 def document_module_ast(_root : string) {
     var mod = [get_module("ast_core"), find_module("ast")]
     var groups <- array<DocGroup>(
-        group_by_regex("Compilation and file access", mod, %regex~(compile|compile_file|parse_file|make_file_access|require_module_now)$%%),
+        group_by_regex("Compilation and file access", mod, %regex~(compile|compile_file|parse_file|parse_file_no_prerequisites|make_file_access|require_module_now)$%%),
         group_by_regex("Call generation", mod, %regex~(make_call)$%%),
         group_by_regex("Visitor pattern", mod, %regex~visit.*%%),
         group_by_regex("Expression generation", mod, %regex~(force_generated|get_expression_annotation|make_type_info_structure|stamp_missing_at)%%),
@@ -593,7 +595,7 @@ def document_module_json_boost(_root : string) {
     var groups <- array<DocGroup>(
         group_by_regex("Value conversion", mod, %regex~(JV|from_JV)$%%),
         group_by_regex("LINQ source builders", mod, %regex~(from_json|from_json_row|read_json_field)$%%),
-        group_by_regex("Element access operators", mod, %regex~(\[\]|\?\[\]|\?\.|\.)$%%),
+        group_by_regex("Element access operators", mod, %regex~(\[\]|\?\[\]|\?\.|\.|key_exists)$%%),
         group_by_regex("Null coalescing operators", mod, %regex~(\?\?)$%%),
         group_by_regex("Value extraction", mod, %regex~(\?\.)?`value$%%),
         group_by_regex("Annotation parsing", mod, %regex~(parse_json_annotation)$%%)
@@ -604,7 +606,7 @@ def document_module_json_boost(_root : string) {
 def document_module_jsonrpc(_root : string) {
     var mod = find_module("jsonrpc")
     var groups <- array<DocGroup>(
-        group_by_regex("Envelope builders", mod, %regex~(response|error|error_with_data|serialize_id)$%%),
+        group_by_regex("Envelope builders", mod, %regex~(response|error|error_with_data|serialize_id|quoted)$%%),
         group_by_regex("Server-side parsers", mod, %regex~(parse_request|parse_batch)$%%),
         group_by_regex("Request scope", mod, %regex~(free_request|free_batch)$%%),
         group_by_regex("Outgoing request builders", mod, %regex~(make_request|make_notification|make_batch)$%%),
@@ -636,7 +638,7 @@ def document_module_regex_boost(_root : string) {
 def document_module_rst(_root : string) {
     var mod = find_module("rst")
     var groups <- array<DocGroup>(
-        group_by_regex("Document writers", mod, %regex~document%%),
+        group_by_regex("Document writers", mod, %regex~(document|write_digest)%%),
         group_by_regex("Descriptions", mod, %regex~describe%%),
         group_by_regex("Label makers", mod, %regex~(\w+_label_name|function_label_file)%%),
         group_by_regex("RST section makers", mod, %regex~make%%),
@@ -1687,7 +1689,7 @@ def document_module_audio_boost(_root : string) {
         group_by_regex("PCM stream", mod, %regex~(append_to_pcm|append_box_to_pcm)$%%),
         group_by_regex("Decoding", mod, %regex~(decode_audio)$%%),
         group_by_regex("Sound ID", mod, %regex~(generate_sound_sid)$%%),
-        group_by_regex("Internal stream management", mod, %regex~(get_audio_command_stream|set_audio_thread_command_stream|get_sound_sid|set_sound_sid)$%%)
+        group_by_regex("Internal stream management", mod, %regex~(get_audio_command_stream|set_audio_thread_command_stream|adopt_audio_thread_command_stream|get_sound_sid|set_sound_sid)$%%)
     )
     document("Audio playback, mixing, 3D spatial audio, and effects", mod, "audio_boost.rst", groups)
 }
@@ -1798,7 +1800,7 @@ def document_module_strudel_player(_root : string) {
         group_by_regex("One-shots", mod, %regex~strudel_(one_shot|active_tracks)$%%),
         group_by_regex("Orbit levels", mod, %regex~strudel_(fade_orbit|set_orbit_gain|orbit_gain)$%%),
         group_by_regex("State serialization", mod, %regex~strudel_(save_state|restore_state|save_sf2_state|restore_sf2_state)$%%),
-        group_by_regex("Debug and diagnostics", mod, %regex~strudel_(debug_memory|reset_memory_baseline|debug_sample_peaks|debug_master_peak|debug_output_peak|debug_voices)$%%)
+        group_by_regex("Debug and diagnostics", mod, %regex~strudel_(debug_memory|reset_memory_baseline|get_worker_heap_bytes|debug_sample_peaks|debug_master_peak|debug_output_peak|debug_voices)$%%)
     )
     document("Top-level playback harness: tracks, BPM/CPS, and threaded audio", mod, "strudel_player.rst", groups)
 }
@@ -1855,7 +1857,7 @@ def document_module_strudel_pattern(_root : string) {
     var groups <- array<DocGroup>(
         group_by_regex("Pattern construction", mod, %regex~(pure|silence|atom|querySpan|queryArc|patternType)$%%),
         group_by_regex("Time manipulation", mod, %regex~(fast|slow|stack|cat|fastcat|weighted_fastcat|fmap)$%%),
-        group_by_regex("Combinators", mod, %regex~(rev|jux|off|layer|superimpose|euclid|euclidRot|palindrome|ply|iter|iterBack|when_cycle|linger|hurry|compress|chunk|striate|chop|slice|struct_|mask|choose|wchoose|randcat|chooseCycles|shuffle|scramble|echo|stut|transpose|add|innerJoin|combineWith|combineWithStr|degrade|degradeBy|every|bjorklund|sometimes|often|sometimesby|playFor|once)$%%),
+        group_by_regex("Combinators", mod, %regex~(rev|jux|off|layer|superimpose|euclid|euclidRot|palindrome|ply|iter|iterBack|when_cycle|linger|hurry|compress|chunk|striate|chop|slice|struct_|mask|choose|wchoose|randcat|chooseCycles|shuffle|scramble|echo|stut|transpose|add|sub|early|late|innerJoin|combineWith|combineWithStr|degrade|degradeBy|every|bjorklund|sometimes|often|rarely|sometimesby|playFor|once)$%%),
         group_by_regex("Setter primitives", mod, %regex~set_.*$%%),
         group_by_regex("Fluent control: dynamics and routing", mod, %regex~(gain|velocity|vel|pan|speed|note|freq|sound|cut|orbit|begin|end_pos)$%%),
         group_by_regex("Fluent control: 3D positioning (HRTF)", mod, %regex~(hrtf|hrtf_azimuth|hrtf_elevation)$%%),
@@ -1918,6 +1920,8 @@ def main {  // nolint:STYLE038 — flat one-call-per-documented-module dispatch 
     disable_profiler_log(this_context())
     ast_gc_guard() {
     let root = get_das_root() + "/doc/source/stdlib/generated"
+    digest_path = unwrap_or(find_flag_raw_value(get_command_line_arguments(), "--digest"),
+        get_das_root() + "/skills/daslang/references/everything.md")
     // document embedded modules
     document_module_builtin(root)
     document_module_math(root)
@@ -2073,5 +2077,6 @@ def main {  // nolint:STYLE038 — flat one-call-per-documented-module dispatch 
     document_module_uriparser_boost(root)
     document_module_utf8_utils(root)
     document_module_validate_code(root)
+    write_digest()
     }
 }

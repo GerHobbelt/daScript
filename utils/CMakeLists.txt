@@ -37,6 +37,7 @@ if(TARGET libDasModuleHV AND TARGET libDasModuleStdDlg AND TARGET libDasModuleSt
             "${PROJECT_SOURCE_DIR}/utils/aot/main.das"
             "${PROJECT_SOURCE_DIR}/daslib/aot_standalone.das"
             "${PROJECT_SOURCE_DIR}/daslib/aot_cpp.das"
+        "${PROJECT_SOURCE_DIR}/daslib/c_api_header.das"
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
         COMMENT "Standalone AOT (full runtime): watchdog"
         VERBATIM
@@ -57,6 +58,14 @@ if(TARGET libDasModuleHV AND TARGET libDasModuleStdDlg AND TARGET libDasModuleSt
         add_custom_command(TARGET watchdog POST_BUILD
             COMMAND ${CMAKE_STRIP} $<TARGET_FILE:watchdog>
             COMMENT "Stripping watchdog")
+    endif()
+    # A multi-config generator lands the exe in bin/<Config>/; the checked-in LSP plugin manifest
+    # and every other hand-written spelling name bin/watchdog, so the built exe is copied there too
+    get_property(_DAS_WATCHDOG_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+    if(_DAS_WATCHDOG_MULTI_CONFIG)
+        add_custom_command(TARGET watchdog POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:watchdog> ${PROJECT_SOURCE_DIR}/bin/$<TARGET_FILE_NAME:watchdog>
+            COMMENT "Copying watchdog to bin/")
     endif()
     INSTALL(TARGETS watchdog RUNTIME DESTINATION ${DAS_INSTALL_BINDIR})
     add_test(NAME watchdog_smoke
@@ -95,7 +104,7 @@ endif()
 
 # Entries are paths relative to utils/; the exe/target name is the basename.
 # mcp/lsp never build as exe: their development runs interpreted under a supervisor
-# (the watchdog front, lsp_supervisor.py), so an exe form would never be dogfooded.
+# (the watchdog's --stdio and --lsp fronts), so an exe form would never be dogfooded.
 set(DAS_UTILS
     aot
     dascov

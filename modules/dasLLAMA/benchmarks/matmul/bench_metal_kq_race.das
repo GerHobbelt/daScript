@@ -20,7 +20,7 @@ require ?das_metal ../../tests/_metal_kernel_common.das
 // The per-format Metal KQ kernel RACE rig - rig 1 of the kernel catch-up procedure. Races the
 // production decode GEMV and prefill mul_mm of every kq format against candidate spellings and
 // against a pinned llama.cpp test-backend-ops reference row, on synthetic planes, no model, no
-// tuner, seconds per cell. The dispatch-loop probe shape (HOW_TO_ADD_A_FORMAT.md QUIRK 22):
+// tuner, seconds per cell. The dispatch-loop probe shape (HOW_TO_ADD_A_FORMAT.md, the Metal step):
 // `reps` back-to-back dispatches per timed encoder (the shared y buffer's hazard serializes
 // them), best-of `rounds` encoders. The metric is weight-plane GB/s for GEMV (decode is
 // weight-bound) and GMAC/s for mul_mm, plus us/dispatch for the reference ratio.
@@ -126,9 +126,9 @@ def private gemv_arms(f) : array<KqRaceArm> {   // candidate GEMV spellings regi
     } elif (f.fmt == 6) {
         arms |> push(KqRaceArm(name = "prod", src = metal_kq_gemv_k6_msl, entry = metal_kq_gemv_k6_msl_entry, fastmath = metal_kq_gemv_k6_msl_fastmath, tgmem = 0ul, gdiv = f.gemv_gdiv))
     } elif (f.fmt == 44) {
-        arms |> push(KqRaceArm(name = "prod", src = metal_kq_gemv_iq4xs_msl, entry = metal_kq_gemv_iq4xs_msl_entry, fastmath = metal_kq_gemv_iq4xs_msl_fastmath, tgmem = metal_kq_gemv_iq4xs_msl_tgmem, gdiv = f.gemv_gdiv))
+        arms |> push(KqRaceArm(name = "prod", src = MetalKqGemvIq4xs_metal_kq_gemv_iq4_msl, entry = MetalKqGemvIq4xs_metal_kq_gemv_iq4_msl_entry, fastmath = MetalKqGemvIq4xs_metal_kq_gemv_iq4_msl_fastmath, tgmem = MetalKqGemvIq4xs_metal_kq_gemv_iq4_msl_tgmem, gdiv = f.gemv_gdiv))
     } elif (f.fmt == 45) {
-        arms |> push(KqRaceArm(name = "prod", src = metal_kq_gemv_iq4nl_msl, entry = metal_kq_gemv_iq4nl_msl_entry, fastmath = metal_kq_gemv_iq4nl_msl_fastmath, tgmem = metal_kq_gemv_iq4nl_msl_tgmem, gdiv = f.gemv_gdiv))
+        arms |> push(KqRaceArm(name = "prod", src = MetalKqGemvIq4nl_metal_kq_gemv_iq4_msl, entry = MetalKqGemvIq4nl_metal_kq_gemv_iq4_msl_entry, fastmath = MetalKqGemvIq4nl_metal_kq_gemv_iq4_msl_fastmath, tgmem = MetalKqGemvIq4nl_metal_kq_gemv_iq4_msl_tgmem, gdiv = f.gemv_gdiv))
     } elif (f.fmt == 3) {
         arms |> push(KqRaceArm(name = "prod", src = metal_kq_gemv_k3_msl, entry = metal_kq_gemv_k3_msl_entry, fastmath = metal_kq_gemv_k3_msl_fastmath, tgmem = 0ul, gdiv = f.gemv_gdiv))
     } elif (f.fmt == 33) {

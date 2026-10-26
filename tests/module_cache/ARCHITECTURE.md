@@ -14,6 +14,16 @@ this document states what the folder is and why its tests take the shape they do
   the module's source, stamped by content so a byte-identical rewrite serves and a same-size
   edit cuts off; and the directory's size cap - children run inside a temp directory, so the
   default cache they fill and prune is their own, never the tree's.
+- `test_compile_file_cache.das` - a script's `compile_file` under `CodeOfPolicies.module_cache`
+  reads and refreshes the default cache as the host does for its own script: the cold compile
+  parses and writes one record for the compiled file, the warm one serves the leaf and the root
+  (read off the `cache read took` lines `log_module_compile_time` prints, matched on the file
+  since the compiled file's own module has no name), an edited root reparses while the leaf
+  before it still serves, the policy off parses from source beside the record, and other
+  policies, other host arguments, or a `--jit-target` after the separator compile cold into
+  records of their own - the target beside other policies too, since the occurrence list the
+  key folds is NUL-separated and the key is hashed as a C string; the children run inside the
+  temp directory, so the default cache they write is under it.
 - `test_macro_dep_invalidate.das` - a compile-time input a macro pinned through
   `add_module_cache_dependency` is compared by content, not mtime: a byte-identical rewrite
   serves the record, a changed file re-parses from that module on and says so.
@@ -44,8 +54,13 @@ this document states what the folder is and why its tests take the shape they do
   the guard sits in a module walked earlier;
   `-ignore-manifest` compiles every descriptor, loads every C++ module on start and writes no
   manifest; a manifest row hand-edited to an absent artifact makes the require bring every
-  deferred module in and then fail on the missing prerequisite; a module cache an eager start
-  wrote serves a lazy start, with `-log-compile-time` printing the reads and the startup
+  deferred module in and then fail on the missing prerequisite; a nameless `dm` row added by
+  hand whose path is a file that exists and is no shared module fails at the scan and, its
+  artifact present, makes the scan bring every deferred module in before any require; the real
+  `dm` row with its name blanked loads at the scan, gets its name written back, and the next start
+  defers it; a module
+  cache an eager start wrote serves a lazy start, with `-log-compile-time` printing the reads
+  and the startup
   timeline; a dastest `--ser` stream of a test requiring the module is read by a `--deser`
   child that nothing made require it, and the reader loads it; and, where the tree holds dasImgui and dasGlfw, `require imgui_app` brings every
   deferred module in because its `initDependencies` asks for two more, and a half-warm tree -
@@ -93,7 +108,8 @@ this document states what the folder is and why its tests take the shape they do
   its own compile reads clean on two warm runs, rewrites nothing, and keeps the good cache when
   a later edit breaks the compile.
 - `_fixtures/` - the driver and module scripts the spawned children compile (`mc_dep_*`,
-  `mc_generic_origin_*`, the `mc_late_*` set a late require targets: a shared module with a
+  `mc_generic_origin_*`, `mc_cf_drv` - the `compile_file` driver, the file it compiles and
+  whether it caches on its argv; the `mc_late_*` set a late require targets: a shared module with a
   macro context, one without, one that is not shared, one that does not compile, one declaring
   another name, and a macro module whose call macro requires the first from inside a compile);
   a case needing a macro-bearing module graph puts it here instead of writing the script inline.

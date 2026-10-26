@@ -60,6 +60,20 @@ share one. `-no-module-cache` disables the cache outright, over an explicit `-mo
 override; beside `-ser` / `-deser` - the explicit round-trip halves, whose verdict is the point
 of the run - the host rejects the command line instead of silently disabling them.
 
+A script's own `compile_file` (`rtti_builtin_compile_file`, `module_builtin_ast.cpp`) installs
+the same default cache when its `CodeOfPolicies.module_cache` is set, with
+`ModuleFileCache::embeddedHostOptions` standing in for the host's command line: this process's
+arguments up to `--`, a `--jit-target` after it, and a hash of the policies streamed as a record
+stamps them, so two tools compiling one file under different policies keep separate records
+instead of rewriting one. `ScriptModuleCache` is the guard around that compile: it empties the
+environment's serializer slots before installing - the enclosing compile's stream (a
+`compile_file` from an `[init]` runs under the host's armed cache) never feeds the nested one, a
+cold nested read included - finishes the cache and puts the slots back on every exit, an
+exception's included, and the finish happens before the block runs, so a require the block
+issues is not this cache's. The writeback's temporary file carries the process id and a per-process
+sequence number, since two subtools compiling one file at once key the same record, as do two
+threads of one process.
+
 Every variant is its own record and an engine root's record is 200 MB, so the default directory
 is capped: after a writeback `ModuleFileCache::finish` lists the directory's `.dascache` files
 and removes the oldest by mtime until it fits `DAS_MODULE_CACHE_LIMIT` megabytes (4096 unless
@@ -114,9 +128,25 @@ under distinct multipliers, so one argument in the wrong register or slot change
 `tests/dasbind/CMakeLists.txt` builds the probe on a 64-bit host that builds and dlopens a
 shared library at test time - not wasm, Android or iOS, none of which walks `tests/` - and
 `tests/.das_test` skips the suite only on a 32-bit host, where the probe is not built, and under
-dastest's `--ser`/`--deser` sweep, because a deserialized program never applies `[extern]` and
-so never manufactures the `__dasbind__` function it names in the `dasbind` module; a 64-bit
-desktop tree without the library fails the suite instead of skipping it.
+dastest's `--ser`/`--deser` sweep. A deserialized program never applies `[extern]`, while a
+deserialized call already names its `__dasbind__` function in the `dasbind` module - and only
+`apply` or a retarget manufactures that function. A 64-bit desktop tree without the library
+fails the suite instead of skipping it.
+
+The `__dasbind__` proxy - the `DasBindFunction` a call to an `[extern]` is retargeted to - is
+registered by the `[extern]` annotation's `apply` callback when the registrar - the module
+carrying the `[extern]` declarations - compiles, and on demand by `transformCall` when the
+`dasbind` module lacks it: the module cache serves a registrar in a process that already
+compiled it (a live reload - the same process, so the `dasbind` module's hash shows no drift and
+nothing reparses the registrar), or a fresh process reads a dependent's record before any
+compile applied the registrar. `transformCall` takes the bind name from the call target's own
+`[extern]` declaration every time (`bindNameOf`) - the one input every process has - rather than
+from a table keyed on the function object, which every deserialization mints anew and whose
+freed addresses a later compile reuses. The proxy's signature types are clones with no source
+location (`proxyType`): the declaration's types and file record belong to the registrar's
+compile, which a served registrar's program takes with it, while the proxy lives for the
+process. A failed bind on the on-demand path is the call's transform error, the diagnostic
+`apply` would have given.
 
 ## 4. A message that crosses the panic jump
 
@@ -143,3 +173,81 @@ collects. A POSIX pipe carries 64 KB by default, and Windows sizes an anonymous 
 when asked for the default - a chatty child under the watchdog's tick moves at most 16 KB a
 second through one of those, the pipe's 4 KB four drains a second - so the Windows pipe is
 created at the POSIX capacity, and every platform drains the same bursts.
+
+## 6. What a module-cache record's bytes are
+
+`module_builtin_ast_serialize.cpp` writes and reads one record per module. Every table below is
+per record: it clears in `AstSerializer::clearNodeIds` at the end of each program, so no record
+points into another and a reader that skipped one can still read the next. The file, module and
+expression-class tables number from 1 and keep 0 for null, a fresh entry taking its number from
+the table's size after its own insert; the string table numbers from 0, since a string is never
+null; the type table's entries start at 3, after its three tags.
+
+**Sizes.** A 32-bit value streams as an adaptive size - seven bits a byte, low bits first, the
+high bit saying another byte follows, so one byte below 128, two below 16384, at most five
+(`encodeAdaptiveSize32`, `serializeAdaptiveSize32`). Flags, offsets, indices, counts and table
+numbers are all small, so a `uint32_t` and a zigzagged `int32_t` both stream that way; a 32-bit
+hash keeps a raw four-byte write, since a hash has no small end - the `tag()` field and an
+expression class's first mention are the two. Reading takes the bytes straight off the vector
+storage while five are in reach and falls back to a checked byte-at-a-time read at the end of the
+buffer. A field group encodes into one local buffer and writes once.
+
+**Strings.** A string streams as its number in a per-record table, numbered from 0 in
+first-mention order; a first mention is that number followed by the bytes. The table holds pointers to strings
+that live in process memory for the record - the AST's own fields, which nothing changes while a
+record is written or read - so neither side copies them and neither side looks into the storage.
+A string with no home past the call goes through `serializeTemp`, which parks one copy in the
+record's arena for the table to point at; the same name on any other type is the ordinary
+operator, so a container element or a field of a local record streams through `serializeTemp`
+whatever its type. The empty string is most of the occurrences, every unaliased `TypeDecl`
+carrying one, so it answers from its own slot without hashing.
+
+**Types.** A `TypeDecl` reference streams as a number (`TypeRef`): 0 null, 1 an inline payload,
+2 a fresh table entry whose payload follows, 3 and up an entry already in the table followed by
+its own `at`. A type carrying expressions - a fixed-dim expression, a type macro - is not tableable and
+streams inline, and so does any type with such a child: the table dedups by content, and an
+expression is not content the key covers. The writer keys the live type and hashes and compares
+its content recursively, the two `findAlias` cache bits masked out of both the key and the stream
+since they are a cache and not part of the type; the reader keeps the first decoded instance and
+deep-copies it for every later reference, so no two nodes share a type. A type takes its number
+AFTER its payload on both sides: the payload can carry a same-module structure inline whose field
+holds a type equal to this one, and with the number taken first the reader would copy a prototype
+it has not finished decoding. The writer counts fresh entries apart from the map, since an equal
+type registered from inside the payload keeps the map's number while the reader pushes every
+fresh entry.
+
+**Files and lines.** A `FileInfo` streams as its per-record number, the first mention carrying
+the payload after the number; a record names its own few files, so the number is one byte. A
+one-entry cache sits in front of the writer's map, because `LineInfo`s come in runs from one
+file. A `LineInfo` is coded against the previous one of the record: a shape byte (`LineShape`) -
+bit 7 the file is the previous one's, else its number follows; bit 6 `last_line` equals `line`,
+else the difference follows; the low six bits the line's delta from the previous line, -31..31,
+or 63 when a zigzag delta follows - then the column and the zigzag span to `last_column`.
+
+**Modules, expression classes, functions.** A `Module` and an expression class each stream as a
+per-record number, the first mention carrying the module's name hash or the class's rtti hash and
+every later one a byte; the reader keeps the hash beside the module it resolved, so a later
+mention of a module the library lacks names it. Under `ignoreEmptyExternal` a module the library lacks reads as null;
+outside that context a module the library cannot resolve fails the record. A cross-module
+function's mangled name is computed once per record and kept in a table keyed by the function,
+since the same function is named at every call site of a module.
+
+**The storage.** The vector storage (`SerializationStorageVector`, `ast_serializer.h`) backs
+every in-process stream. Writing grows the vector by doubling and counts the bytes in `writePos`,
+so a field write is a bounds check and a store rather than a resize, and the serializer writes
+and reads through it directly when the storage is that one. `flush()` trims the vector to the
+bytes written and `serializeProgram` calls it at the end of every program, so `buffer` is exactly
+the stream at a quiescent point; a storage that buffers ahead settles what it holds in its own
+`flush()`.
+
+## 7. The serialization profile rail
+
+`DAS_SERIALIZE_PROFILE` (`ast_serializer.h`, 0 unless the build defines it) compiles in the
+stream's size and time breakdown; off, every `DAS_SER_PROFILE` expands to nothing and the
+serializer carries no profile state. On, every compound serialize opens a named frame: bytes and
+ticks accrue to a frame tree keyed by parent and name, and an aggregate per name carries self
+bytes beside the bytes and ticks of that name's outermost frames only, so a recursive shape
+counts once. Two histograms - string payloads by text, `TypeDecl` payloads by mangled name -
+carry the dedup estimate, and the record layer (`ast_parse.cpp`) appends one row per record with
+its file, payload size and time. `ModuleFileCache::finish` prints the report through
+`AstSerializer::profReport`, for the reader and the writer alike.

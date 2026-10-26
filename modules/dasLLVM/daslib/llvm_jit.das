@@ -91,7 +91,7 @@ def set_debug_linkage(value : LLVMOpaqueValue?) {
     LLVMSetLinkage(value, LLVMLinkage.LLVMInternalLinkage)
 }
 
-def set_public_linkage(value : LLVMOpaqueValue?) {
+def public set_public_linkage(value : LLVMOpaqueValue?) {
     LLVMSetLinkage(value, LLVMLinkage.LLVMDLLExportLinkage)
     LLVMSetDLLStorageClass(value, LLVMDLLStorageClass.LLVMDLLExportStorageClass)
 }
@@ -643,7 +643,8 @@ class public LlvmJitVisitor : AstVisitor {
     }
 
     // nolint:STYLE014 - the definition/declaration parity contract below is load-bearing
-    // The impl-half parameter attributes: alignments, readonly on const indirect args, the
+    // The impl-half parameter attributes: alignments, readonly on const indirect args the body
+    // never writes through (a const-stripped write leaves the compiler's access_ref mark), the
     // annotation-driven noalias/nocapture, and the capture/context/cmres tail attrs. Shared by
     // the definition AND get_or_declare_impl's cross-partition declaration - LLVM reads call-site
     // parameter attributes off the DECLARATION, so a split build loses alias precision wherever
@@ -660,7 +661,8 @@ class public LlvmJitVisitor : AstVisitor {
                 LLVMSetParamAlignment(param, uint(a._type.firstType.alignOf))
             }
             LLVMSetValueName(param, string(a.name))
-            if ((a._type.isRef || a._type.isPointer || a._type.isString) && a._type.flags.constant) {
+            if ((a._type.isRef || a._type.isPointer || a._type.isString) && a._type.flags.constant
+                    && !a.access_flags.access_ref) {
                 LLVMAddAttributeToFunctionArgument(fn, ai, attributes.readonly)
             }
             if ((use_option_flags && option_no_alias) || nat.noalias |> key_exists(string(a.name))) {
@@ -4746,7 +4748,7 @@ class public LlvmJitVisitor : AstVisitor {
         setE(expr, mks_ptr)
     }
 
-    def override preVisitExprMakeArrayIndex(expr : ExprMakeArray?; index : int; init : ExpressionPtr; last : bool) : void {
+    def override preVisitExprMakeArrayIndex(expr : ExprMakeArray?; index : int; var init : ExpressionPtr; last : bool) : void {
         let stride = expr.recordType.sizeOf
         let offset =  index * stride
         // heap literals fill arr.data (top of heapMkaData), not the Array struct held in getE(expr)
@@ -4830,7 +4832,7 @@ class public LlvmJitVisitor : AstVisitor {
         setE(expr, mks_ptr)
     }
 
-    def override preVisitExprMakeTupleIndex(expr : ExprMakeTuple?; index : int; init : ExpressionPtr; last : bool) : void {
+    def override preVisitExprMakeTupleIndex(expr : ExprMakeTuple?; index : int; var init : ExpressionPtr; last : bool) : void {
         let offset = get_tuple_field_offset(expr.makeType, index)
         var v_ptr = getE(expr)
         verify(v_ptr != null && LLVMIsUndef(v_ptr) == 0, "make tuple index, but no pointer")
@@ -7890,6 +7892,30 @@ def public generate_globals_initialization_fn(ctx : Context?; prog : Program?;
                 )
                 LLVMBuildCall2(visitor.g_builder, set_gv_type, set_gv_fn, gv_args, "")
             }
+            let set_fa_type = LLVMFunctionType(types.t_void,
+                fixed_array<LLVMTypeRef>(
+                    types.LLVMVoidPtrType(),
+                    types.t_int64,
+                    types.t_int32,
+                    types.LLVMVoidPtrType()
+                )
+            )
+            var set_fa_fn = LLVMGetNamedFunction(g_mod, "jit_set_standalone_function_arg")
+            if (set_fa_fn == null) {
+                set_fa_fn = LLVMAddFunctionWithType(g_mod, "jit_set_standalone_function_arg", set_fa_type)
+            }
+            for (fi in range(get_context_total_functions(ctx))) {
+                let di = get_lambda_capture_debug_info(ctx, fi)
+                if (di == null) continue
+                let tinfo_ptr = visitor.create_type_info_global(unsafe(reinterpret<TypeInfo?>(di)))
+                var fa_args = fixed_array(
+                    ctx_param,
+                    types.ConstI64(uint64(fi)),
+                    types.ConstI32(0ul),
+                    tinfo_ptr
+                )
+                LLVMBuildCall2(visitor.g_builder, set_fa_type, set_fa_fn, fa_args, "")
+            }
         }
         LLVMBuildRetVoid(visitor.g_builder)
         // terminate entry block with branch to body (entry only has allocas from at_function_entry)
@@ -8154,5 +8180,7 @@ def init_llvm_jit_module_options() {
         this_module() |> add_module_option("jit_target", Type.tString)
         this_module() |> add_module_option("jit_split_modules", Type.tInt)
         this_module() |> add_module_option("jit_obj_cache", Type.tBool)
+        this_module() |> add_module_option("jit_lib", Type.tBool)
+        this_module() |> add_module_option("jit_lib_export_marked", Type.tBool)
     }
 }

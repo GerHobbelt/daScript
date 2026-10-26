@@ -49,6 +49,13 @@ on unasked for an ordinary run; ungated, each of those lines would be output eve
 an ordinary edit. An explicit `-module-cache` leaves the flag off, so those runs get the lines
 together with the host's verdict.
 
+A served record's time splits three ways: the decode, the finalize (`finalizeModule` -
+annotations, macro-module re-simulation, `gc_collect`) and the setup `Program::serialize` runs
+after the stream (symbol marking, stack allocation). The serializer accumulates the last two over
+every program it read, das reading them back through `ast_serializer_finalize_usec` and
+`ast_serializer_setup_usec`, and the decode is the read minus both; `-log-compile-time`'s cache
+line prints decode against finalize, with the macro simulate named inside finalize.
+
 ## 2. The module scan and the descriptor manifest (`dyn_modules.cpp`)
 
 `require_dynamic_modules` walks `<dasroot>/modules/`, then the project root's, then each
@@ -113,7 +120,17 @@ dumps its leftovers on the thread root, and a collect stops at a node owned by a
 after the load every module, not only the new ones, collects from that root, since a
 constructor registers into modules that exist already, and the rest is swept. A `dm` row
 with no name - the recording start's load failed - replays as recorded, so the Quiet deferral
-and the post-scan retry of a sibling `DT_NEEDED` dlopen behave as on a compiled start. A
+and the post-scan retry of a sibling `DT_NEEDED` dlopen behave as on a compiled start. A row
+still pending after that retry whose artifact is on disk failed on something other than a
+missing file - on a platform that resolves a library's imports at load (Windows, Linux without
+a RUNPATH), a sibling a deferred row holds, which the retry alone can never bring in - so the
+scan brings every deferred module in and runs the retry once more, the set an eager start has;
+a pending row whose artifact is absent stays pending and silent, as Quiet means, so a build
+without a module's artifact pays nothing for it. A replayed nameless row whose module is
+registered by the end of the scan - loaded at the scan, or by that fallback - gets the module's
+name written back into its manifest (the same key and dependency stamps, the row named), so the
+next start defers it as a start that recorded a clean load would; a row that never loads stays
+nameless. A
 require guard (`require ?mod`) and `builtin_module_exists` ask whether the build has the
 module (`guardModuleAvailable`): linked in, or waiting in a manifest row, which the guard
 loads then - so `require ?das_metal metal/das_metal_boost` still means "on a build with
@@ -165,9 +182,10 @@ re-parses the modules that require the group. With
 (shared module load <sec>, deferred K)`, `compiled (<why>), manifest written (N row(s))`,
 `compiled (no_manifest)`, `compiled (manifests ignored)`, or why a manifest was not written -
 and a deferred load prints `[module] require <name>: loading the deferred <class>`, the
-fallback `[module] loading every deferred module (K)`. A replayed descriptor's time is its
-manifest read plus its rows, and the second number is the share the `.shared_module` dlopen and
-module constructor took.
+fallback `[module] loading every deferred module (K)`, and the scan's own fallback announces
+itself first with `[module] a pending module's artifact exists - loading every deferred module`.
+A replayed descriptor's time is its manifest read plus its rows, and the second number is the
+share the `.shared_module` dlopen and module constructor took.
 
 ## 3. A require after the walk (`requireModuleNow`, `ast_parse.cpp`)
 

@@ -59,7 +59,7 @@ struct Config {
     clang : string
 
     @clarg_short = "j"
-    @clarg_doc = "Parallel width for the C++ syntax pass and cmake builds; 0 = hardware threads"
+    @clarg_doc = "Parallel width for the C++ syntax pass and cmake builds; 0 = physical cores, at most 16"
     jobs : int
 
     @clarg_doc = "Per-user preflight TOML (default: platform config directory)"
@@ -795,7 +795,7 @@ def private build_sweep_argvs(ctx : PreflightCtx; in_scope : array<string>) : tu
     var group_flags : table<string; array<string>>
     var from_db = 0
     for (f in in_scope) {
-        let abs = path_join(cwd, f)
+        let abs = cc_key(path_join(cwd, f))
         var flags : array<string>
         if (cc |> key_exists(abs)) {
             flags := cc[abs]

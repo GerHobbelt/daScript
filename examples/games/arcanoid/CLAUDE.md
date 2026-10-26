@@ -56,6 +56,13 @@ Use `live_command` with `name="help"` to list all available commands.
 | `cmd_god_mode` | Toggle god mode (ball never falls) | - |
 | `cmd_slow_motion` | Set game speed multiplier | `speed` (float, 0.1=slow, 1=normal, 2=fast) |
 | `cmd_decs_dump` | Dump DECS archetypes/entities | - |
+| `cmd_level` | Jump to a board | `level` (int, 1-based) |
+| `cmd_next_level` | Advance as a win does: the next board, or the win screen on the last | - |
+| `cmd_bonus_row` | One capsule of every type in a row across the field | - |
+| `cmd_attract` | Start the bot-played demo round now | - |
+| `cmd_toggle_crt` | Toggle the CRT present | - |
+| `cmd_toggle_ssao` | Toggle the ambient-occlusion pass | - |
+| `cmd_fx_debug` | Present a post buffer instead of the frame | `view` (int: 0 frame, 1 occlusion, 2 normal-depth) |
 
 **Powerup/bonus types:** `triple_ball`, `wide_paddle`, `narrow_paddle`, `sticky_paddle`, `fireball`, `extra_life`, `speed_up`, `speed_down`
 
@@ -85,9 +92,11 @@ live_command name=cmd_reset_game                                # Reset the game
 
 ## Keyboard Controls
 
-- **Arrow keys**: Move paddle left/right
+- **Arrow keys** or **A** / **D**: Move paddle left/right
 - **Space**: Start game / launch ball / release sticky ball / restart after game over
 - **Escape**: Pause / unpause
+- **F1** / **F2**: Toggle the CRT present / the ambient-occlusion pass
+- **F3** / **F4**: Step the CRT scanline pitch down / up (framebuffer pixels per line, 2 to 8; the HUD shows it)
 
 ## Game States
 
@@ -97,4 +106,6 @@ Pause available during `playing` via Escape.
 
 ## File Structure
 
-Single file: `main.das` (~1250 lines). Contains everything: shaders, audio generation, game logic, rendering, HUD, live commands, state preservation.
+- `main.das` - shaders, audio generation, game logic, rendering, HUD, live commands, state preservation, the strudel beds
+- `levels.das` - the boards as ASCII stencils; the legend is the file's own header
+- `arcanoid_postfx.das` - the post chain (SSAO, bloom, CRT present)

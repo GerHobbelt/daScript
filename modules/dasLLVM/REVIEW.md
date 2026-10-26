@@ -2,7 +2,7 @@
 
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture docs:
 `ARCHITECTURE.md`, `ARCHITECTURE_TARGET_FEATURES.md`, `ARCHITECTURE_DEBUG_INFO.md`,
-`ARCHITECTURE_JIT_ENTRY.md`. Planned work: `DEBUGGING.md` (sec. Roadmap), `fat_mode_plan.md`.
+`ARCHITECTURE_JIT_ENTRY.md`, `ARCHITECTURE_EXE.md`. Planned work: `LEDGER.md` takes a new row; `DEBUGGING.md` (sec. Roadmap) and `fat_mode_plan.md` carry older plans.
 
 **A `[test]` file under this module that carries a `require dasllama/...` line of its own answers
 to `modules/dasLLAMA/tests/REVIEW.md` (repo root) as well** - its out-of-folder ledger row lives
@@ -75,6 +75,14 @@ there.
   `add_module_cache_dependency` before any early return, in the same change**
   (`ARCHITECTURE.md` sec.5). An unpinned compile-time file read serves stale macro output
   from the module cache until an unrelated source file changes - silently.
+
+- **A diff that adds a `-lib` entry point, or work to one, keeps the C boundary's three promises:
+  a raise reaches the caller as a return value and never an unwind, `<P>_create` answers null
+  rather than aborting, and `<P>_destroy` runs what the runtime's own shutdown cannot find**
+  (`ARCHITECTURE_LIB.md#lib-runtime-scope`). A library is called by code that cannot catch anything.
+
+- **A `-lib` build that writes no artifact exits non-zero.** A build rule reads the exit code, and
+  a silent success lets it link the previous run's library against this run's header.
 
 - **A change to a `[tune]`-family annotation is reviewed with `skills/tune.md`.**
 
@@ -173,6 +181,12 @@ there.
   dropping a check, shrinking a scanned set or a tracked-fixture directory (a guard over nothing),
   widening an exemption list without naming the exempted input's reason beside it, or a finding
   text that no longer names what failed. What the gate enforces is read from the gate itself.
+
+- **A walk over the program's modules in this module's `daslib/` that leaves a module out by
+  `moduleFlags.builtIn` alone is a defect - a promoted das module (`module X shared`) is
+  builtIn too; a walk that means the C++ modules tests `builtIn && !promoted`**
+  (`ARCHITECTURE_EXE.md` sec.2). A promoted module's global initializers are program
+  code, and a walk that skips them leaves the address globals they need null in the exe.
 
 - **A diff that builds an x64 or aarch64 machine's feature string appends the forced ones
   (`x64_forced_plus_features` / `arm64_forced_plus_features`, `daslib/llvm_jit_common.das`) AFTER

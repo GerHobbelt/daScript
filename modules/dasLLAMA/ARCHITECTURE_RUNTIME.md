@@ -94,10 +94,10 @@ Three consequences the code is shaped around:
   per-dispatch: the wrong lattice indexes garbage scales, outputs stay finite, and nothing
   panics - only end-to-end token parity (`harness/parity.das`) catches it, so a resident
   change is witnessed only by parity runs over both a q8 and a k-quant model.
-- **The fused add-rms+requant twin exists only for the per-32 form.** The rail gates it on
-  "every consumer of this buffer is Q8_0-scaled" (`rd_x_quants_b32`), and the profiler stamp
-  shape rides the SAME gate; on a different gate the profiles desync from what actually
-  dispatched.
+- **The fused add-rms+requant twin quantizes the consumer's block form per site** (`RqStamp`:
+  Q8_0 or Q8_K, the normed row also stored where a consumer reads it as floats), picked once
+  every layer is registered (`rd_ensure_fused_sets`); the profiler keys on the stamps' recorded
+  names, so no count rides the gate.
 - **The activation group - the dispatches that read one activation buffer, never a layer - is the
   decision unit: its members share one lattice, and its feed is picked once for all of them.**
   q/k/v share one quantized x; gate/up share another. Resident arming classifies each member's
@@ -193,7 +193,9 @@ measurements behind this section and each refuted attempt.
 
 ### 2.18 The CPU worker pool on a hybrid box {#hybrid-pool-policy}
 
-SMT siblings share the FMA and load ports, so the default pool is physical cores - 1 workers. A box
+SMT siblings share the FMA and load ports, so the default pool is (physical cores - 1) workers -
+a cap the engine's `[init]` sets on every platform but a browser, where the reported count can be
+a fingerprint cap of two and the runtime's own floor and cap size the pool (2.18a). A box
 with two core tiers splits on the SECOND tier's KIND: a compute tier (an M5's Super plus Performance
 cores) extends the pool to every core with GEMV capped to the fast tier, while an efficiency tier
 (M1, M4) makes batch barriers wait and gets no worker at all. A compute-grade second tier only
@@ -216,6 +218,23 @@ the profile loads. A `gemv_lane_cap` of 0 in a minted profile - one the tuner wr
 measured race - records the fast-tier-only "uncapped" default rather than a measured choice, so a
 hybrid box ignores it and keeps the fast-tier cap; a non-zero value is a measured choice and
 applies.
+
+### 2.18a A browser's workers park {#browser-workers-park}
+
+The spin-before-park window (`g_jobque_spin_us`, 30 ms on a desktop) keeps a worker hot through
+the serial gaps of a token; in a browser the workers are web workers, and one that spins holds a
+core the caller's own thread is competing for, so the window costs more than the wake it saves.
+Pocket TTS in Chrome (wasm64, eight workers in the pool) generates at 1.1x real time with the
+window and the renderer at 800% CPU, and at 1.4x with the workers parked at ~112% - the same
+text, three runs each; team dispatch keeps its small edge there, and the pool still pays (one
+worker reads 0.7x). The engine's `[init]` therefore sets the window to 0 when the platform is
+emscripten (`dasllama_jobque_spin_default`); a box profile's `jobque_spin_us` and the setter still
+override it, and a program reads the value in force through `get_jobque_spin_us`. The pool's size
+is the runtime's (`src/misc/job_que.cpp`): the browser's reported cores, capped and floored by
+`DAS_MAX_HW_JOBS` and `DAS_MIN_WEB_JOBS` (eight and four unless the build overrides them), minus
+one for the computing main thread - seven workers on a real box, the pool
+an eight-core desktop runs, and three under fingerprint protection, where a browser reports two
+cores whatever the box has; the floor is what keeps such a visitor off a one-worker pool.
 
 ### 2.19 The CPU MoE region list caps a region at 32 rows {#moe-region-split}
 

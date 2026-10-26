@@ -2,19 +2,18 @@
 
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture
 docs: `ARCHITECTURE.md`, `ARCHITECTURE_ENGINE.md`, `ARCHITECTURE_RUNTIME.md`,
-`ARCHITECTURE_MEASUREMENT.md` (the other companions belong to the routed checklists). Planned
-work: `followup_general.md`, `followup_vulkan.md`, `followup_metal.md` (the Metal tier, and CPU
-work measured on macOS), `PERF_LEDGER.md` (performance goes to the perf ledger, everything else
-to the followup ledgers).
+`ARCHITECTURE_MEASUREMENT.md` (routed checklists own the other companions). Planned work:
+`followup_general.md` (rig and instrument rows included), `followup_vulkan.md` (engine work on
+the Vulkan tier), `followup_metal.md` (engine work on the Metal tier, or CPU engine work
+measured on macOS), `PERF_LEDGER.md` (performance; the rest goes to the followup ledgers).
 
-**A dasLLAMA `[test]` file, wherever the diff puts it, answers to this module's
-`tests/REVIEW.md`.**
+**A dasLLAMA `[test]` file, wherever the diff puts it, answers to `tests/REVIEW.md` here.**
 
-**A timing rig (a file that times a run and reports a wall-clock time or rate as its result,
-printed or returned to a caller that prints it), a kernel race (a run that times two kernel
-variants - arms - against each other in one process), or a function a
-`benchmarks/lcpp_bench.das` cell's timed body calls, wherever it lives, answers to this
-folder's `benchmarks/REVIEW.md` in addition to its own folder's checklist.**
+**A timing rig (a file that times a run itself and reports a wall-clock time or rate as its
+result, printed or returned to a caller that prints it - a driver reading a child's clock is
+not one), a kernel race (a run timing two kernel variants - arms - against each other in one
+process), or a function a `benchmarks/lcpp_bench.das` cell's timed body calls, wherever it
+lives, answers to this folder's `benchmarks/REVIEW.md` beside its own folder's checklist.**
 
 **A diff that writes a measured number down - into `PERF_LEDGER.md`, a checked-in doc, a
 code comment, checked-in data a run produced, or a PR body - or adds a serving path or moves
@@ -56,11 +55,10 @@ a `.dlim` mint (building a `.dlim` from a gguf), a `.dlim` load, an image identi
 flavor (the backend-and-layout variant an image is baked for, one part of its identity) -
 applies `REVIEW_IMAGE.md`.**
 
-**A change to `dasllama/dasllama_audio.das`, `dasllama/dasllama_audio_io.das`,
-`dasllama/dasllama_audio_embedder.das`, `dasllama/dasllama_asr.das`,
-`dasllama/dasllama_asr_types.das`, `dasllama/dasllama_vad.das`, or an ASR family file - one
-`dasllama/dasllama_<family>.das` holding a single speech-recognition family - applies
-`REVIEW_AUDIO.md`.**
+**A change to `dasllama/dasllama_audio.das`, `dasllama_audio_io.das`, `dasllama_audio_embedder.das`,
+`dasllama_asr.das`, `dasllama_asr_types.das` or `dasllama_vad.das` (all under `dasllama/`), or to
+an ASR family file - one `dasllama/dasllama_<family>.das` holding a single speech-recognition
+family - applies `REVIEW_AUDIO.md`.**
 
 **A change to `dasllama/dasllama_vision.das`, `dasllama/dasllama_vision_io.das`,
 `dasllama/dasllama_vision_embedder.das`, a vision family file - one
@@ -95,8 +93,8 @@ sidecars stay valid across code changes, and per-change invalidation lives in th
 mechanisms - `IMAGE_VERSION` and `layout_fingerprint()` (`dasllama/dasllama_image.das`).
 
 **A value that cannot change between dispatches of one compiled kernel never reaches that
-kernel as a uniform, a kargs field, an `@off` bind offset, or a helper parameter - stamp it
-into the class as a `@template_constant` instead.**
+kernel as a uniform, a kargs field, or an `@off` bind offset - stamp it into the class as a
+`@template_constant` instead.**
 
 **A function-typed global a serialized exe must re-establish lands in a `dasllama/` file with
 the `[init]` that establishes it at boot; landing one where `REVIEW.das`'s restore-check walk
@@ -109,11 +107,11 @@ initializer, and its null default is the declared "no hook".
 (`dasllama/dasllama_rope.das`).** A regrouping moves the angles in the last bits and flips
 token-exact fixtures.
 
-**A diff that changes a predicate in `dasllama/` picking between kernel forms that both
-produce the right answer is based on timing that ran both forms interleaved in one process,
-under one instrument.** The same holds for a constant in `dasllama/` whose value was chosen by
-timing two candidates against each other. A reading taken across two processes, or across two
-commits, says which way the wall-clock time moved, not which implementation to adopt.
+**A diff that changes a predicate in `dasllama/` picking between kernel forms that both produce
+the right answer, or a constant there chosen by timing two candidates against each other, rests
+on timing that ran both forms interleaved in one process under one instrument, and puts that
+race's rows, each naming its arm, in the PR body.** A reading taken across two processes or two
+commits says which way the wall clock moved, not which implementation to adopt.
 
 **A change to an allocation reached from a load, bake, or convert path (judge a shared helper
 at each call site) that trades footprint against wall-clock, either way, ships the measured
@@ -179,23 +177,23 @@ template strings any of them look up, records a run of this folder's
 An override is an environment knob, an exported runtime setter, or an on-disk state file - one
 a run writes or a user places, never data a build ships - that moves a gate, policy, or
 threshold off its default and so changes what the run writes, reads, mints, or computes (a
-timing knob included when it moves numerics); a knob that changes only WHEN work happens is not
-one, and a CLI flag never is. The announce is a line printed where the override changes the
-outcome, naming it by the spelling a user would set (the env variable, the sidecar or file key,
-the setter's name) and, for one that is on unless turned off, the spelling that turns it off;
-one with no off spelling says so. Per-site repeats are fine; a set-but-inert override is silent.
+timing knob is one only when it moves a number other than a measured time); a CLI flag never
+is one. The announce is a line printed where the override changes the outcome, naming it by
+the spelling a user would set (the env variable, the sidecar or file key, the setter's name)
+and, for one that is on unless turned off, the spelling that turns it off; one with no off
+spelling says so. Per-site repeats are fine; a set-but-inert override is silent.
 
 **A tutorial source, `.rst` page, docstring, help string, `README.md`, or checked-in document
-left showing the old call, flag, or default after a change to user-facing API is a defect of
-the change, not of the docs.** User-facing means anything a consumer outside this repo can
-depend on - what it calls, types, requires, or parses (facade functions, CLI flags, environment
+outside this folder left showing the old call, flag, or default after a change to user-facing API
+is the change's defect, not the docs'.** User-facing is anything a consumer outside this repo can
+depend on - what it calls, types, requires or parses (facade functions, CLI flags, environment
 knobs, file formats, defaults, what the installed SDK lets a program `require`) - plus the in-repo
 rig and tool surface: any output another tool parses. A console-only diagnostic is not user-facing.
 
-**A diff that falsifies a statement in an `ARCHITECTURE_*.md` companion, a module-root
-document, a `//!` docstring, or a document outside this folder whose own checklist routed this
-diff here, updates it in the same change** - no lint checks a section no `[arch]` cites; only
-the reviewer does.
+**A diff that falsifies a statement in checked-in text under this folder - docs, `//!` docstrings,
+`//` comments, or string data, any language - or in a document outside this folder whose own
+checklist routed this diff here, updates that text in the same change** - no lint reads text no
+`[arch]` cites; only the reviewer does.
 
 **Weakening `dasllama_lint` (`dasllama/dasllama_lint.das`) - the compile-time check that a
 consumer requires only this module's public entry modules, matched by the resolved file's
@@ -205,10 +203,10 @@ without both halves of the pair that makes it an entry module - the `ARCHITECTUR
 sec.1.8 charter line naming it a sanctioned public entry point, and the DASLLAMA001 error text
 naming it beside the facade. The allowed set is the table in the lint.
 
-**A `// nolint:STYLE037` or `// nolint:STYLE038` on a function a follow-up ledger entry says
-can be shortened or split is a defect - land the ledgered split instead.** The warning is what
-keeps the ledger entry visible. A ledger entry asking for a dedup across bodies - one template
-for several twins - does not fire this rule: the one body left still carries its length.
+**A STYLE037 or STYLE038 suppression, `// nolint:` or the file's `options _function_length` /
+`_cyclomatic_complexity`, on a function a follow-up ledger entry says can be shortened or split
+is a defect - land the ledgered split instead.** The warning keeps the entry visible; an entry
+asking that twin bodies merge into one template does not fire this rule.
 
 **`options _dasllama_internal` belongs only in a file whose job is to reach engine
 internals: an engine file under `dasllama/`, a test, harness, benchmark, or rig this module
@@ -224,10 +222,10 @@ finding text names the set as its extension point and the diff lands the paired 
 edit that text asks for. What the gate enforces is read from the gate itself; each check's
 finding text states its own rule.
 
-**A new `REVIEW.das` check ships its line on the checked file's sec.1 charter - in an
-`ARCHITECTURE_*.md` companion, never `ARCHITECTURE.md` - in the same change.** The line names
-the check and the names it licenses. A licensed name is one that check does not flag. When the
-check licenses no names, the line says so.
+**A new `REVIEW.das` check ships its line in the companion section that owns the mechanism the
+check guards - an `ARCHITECTURE_*.md` companion, never `ARCHITECTURE.md` - in the same change.**
+The line names the check and the names it licenses. A licensed name is one that check does not
+flag. When the check licenses no names, the line says so.
 
 **Checked-in text under `modules/dasLLAMA/` - docs, comments, or string data, any language -
 that describes a mechanism of the reference build, or names that build, its binaries or its
@@ -256,8 +254,8 @@ that only names it (a comment, a passing reference) does not count.
 adds that file to `REVIEW.das`'s `FACADE_FILES` in the same change.**
 
 **A NEW `[EnvConfig]` area struct is rendered by `env_markdown()` in the same change.** A struct
-the renderer never emits is absent from `ENVIRONMENT.md` and invisible to every test; a struct
-the renderer emits but the registry does not is caught by `tests/test_env_registry.das`.
+the renderer never emits is absent from `ENVIRONMENT.md` and every test; one it emits but the
+registry does not, `tests/test_env_registry.das` catches.
 
 **Hand-editing `dasllama/dasllama_unicode.das`'s RANGES/WS tables is a defect - regenerate them
 by retranscoding `$LCPP/src/unicode-data.cpp` (the reference checkout) instead.**
@@ -266,15 +264,18 @@ by retranscoding `$LCPP/src/unicode-data.cpp` (the reference checkout) instead.*
 global in a file there, or gives a file a weight format, a serving lane (the quant form a
 tensor serves from) or a data structure its charter does not name, lands the sec.1 edit that
 keeps the charters true - in an `ARCHITECTURE_*.md` companion, never `ARCHITECTURE.md` - in the
-same change.** A diff that adds a file to any folder where another file has its own sec.1
-charter line lands the new file's charter line too; a module-root ledger has no charter line.
+same change.** A file added beside files with their own sec.1 charter lines gets one too; a
+module-root ledger has none.
+
+**A follow-up ledger row whose work landed in this change is deleted, and the rows below keep
+their numbers; when a row lists several items and one item's work landed, that item is deleted
+and the row stays** - checked-in text cites rows by number.
 
 **A diff that adds, removes, or moves a section of an `ARCHITECTURE_*.md` companion, or adds
 or removes a companion, lands `ARCHITECTURE.md`'s index line and section range, the
 companion's own opening (its range and the sections it names), and every repointed prose
-`sec.N` / file citation of the moved sections, in the same change.** The `[arch]` citations are
-LINT026-gated; the prose ones are not, and a prose citation of a section that left its file
-sends the reader to nothing.
+`sec.N` / file citation of the moved sections, in the same change.** Prose citations are not
+LINT026-gated, so one naming a section that left its file sends the reader to nothing.
 
 **A diff that moves a family encode stage onto a GPU hook leaves the CPU form in place and
 changes none of its arithmetic.** The CPU form serves every box with no driver.
@@ -288,8 +289,7 @@ profile re-runs the tuning the profile was meant to save.
 **A value that a team-lane kernel reads - anything reachable from a `team_parallel_for` /
 `team_parallel_for_indexed` / `team_parallel_stages` body (`daslib/jobque_boost.das`, repo
 root) - is a `def` returning it, never a module global with a declaration initializer (`let`
-or `var`).** A team lane never runs global initializers, so the global reads zero there while
-every single-threaded run reads the right value.
+or `var`).** A team lane never runs global initializers, so the global reads zero there.
 
 **A `resize` in `dasllama/` of a buffer whose element count scales with a model dimension (a
 count the model file sets: layers, dim, experts, vocab, positions) is preceded by a `reserve` of

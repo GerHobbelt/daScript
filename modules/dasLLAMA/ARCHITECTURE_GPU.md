@@ -73,14 +73,14 @@ that a question answered for one backend has an obvious address in the other. Th
   E-series never reaches its width question.
 - **Family-shared kernel classes live in `dasllama_metal_kernels`.** The `[metal_dispatch]` lens
   generates `enc_*` builders and MSL globals into the module the class COMPILES in, so co-location
-  follows the class - "the builder needs the driver module" is never a placement reason. Prefill's
-  prefill-only classes are convergence debt, not precedent.
+  follows the class, never "the builder needs the driver module". Prefill's prefill-only classes are convergence debt, not precedent.
 - **Ledgered kernel-binding asymmetries** - a REVIEW rule firing on one of these is expected, and
-  this entry is the sanction: the moe mul_mm TENSOR twins (`MetalMoeMulMmQ8T` /
-  `MetalMoeMulMmMx4T`) keep the pre-family compact kargs slots while their base classes bind the
-  family numbers, so no shared bind path may span the two layouts; and the in-engine moe mul_mm
-  A/B race harnesses (`dasllama_metal_prefill.das`) encode through `kn_moe_mm_family_tail`
-  rather than a per-class `enc_*` builder.
+  this entry is the sanction: the moe mul_mm TENSOR twins (`MetalMoeMulMmQ8T` / `MetalMoeMulMmMx4T`)
+  keep the pre-family compact kargs slots while their base classes bind the family numbers, so no
+  shared bind path may span the two layouts; the in-engine moe mul_mm A/B race harnesses
+  (`dasllama_metal_prefill.das`) encode through `kn_moe_mm_family_tail` rather than a per-class
+  `enc_*` builder; and the iq4 family's iq4nl stamps (`MetalKqGemvIq4T`, `MetalKqMvIq4T`, `MetalKqMvB8Iq4T`)
+  bind the strip plane unread, so both formats share one set layout and one host bind path.
 - **`dasllama_gpu_tier.das`** - the device-cooperation SPI: hook types, install/unset slots, route/mark/want/status
   state, engine-facing forwarders. Vulkan implements it (per-op offload plus resident plumbing, and the decode-era
   seats it alone fills: the cm2 expert chain `set_moe_gpu_ffn_xf_hooks` / `_async_hooks`, the decode attention block
@@ -134,8 +134,8 @@ in prefill) and the tuner calls those public entries.
 `MetalPrefillDecline`); decline COUNTING lives in `<gpu>_common` beside `require_or_panic`, for
 both paths.
 
-Sections 2.28-2.39 - the Metal speculative round, the depth a round drafts, the kernel argument-alignment
-contract, and the verify, drafter and batch-driver mechanics after them - are `ARCHITECTURE_GPU_MTP.md`.
+Sections 2.28-2.39a - the Metal speculative round, the depth a round drafts, the kernel argument-alignment
+contract, the verify, drafter and batch-driver mechanics, and the decode layer encoder - are `ARCHITECTURE_GPU_MTP.md`.
 
 **The allowed asymmetries between the backends - this list is closed; a new one lands with its
 entry here:**
@@ -166,18 +166,18 @@ entry here:**
   the same-slab verify and the NextN draft forward exist only in the Metal decode driver, and
   Vulkan serves the CPU round (`ARCHITECTURE_GPU_MTP.md`).
 - **Lens depth**: both lenses generate `enc_*` builders from kernel classes - Metal via
-  `[metal_dispatch]`, Vulkan via `[vk_dispatch]` (per-class set layouts + push constants; the
-  class-kernel arc retired the hand-built 6-slot set ladders outright) - and both speak the
-  multi-kernel form (`kernel=` names the method, one macro instance per kernel, declared roles
-  must cover every kernel).
+  `[metal_dispatch]`, Vulkan via `[vk_dispatch]` (per-class set layouts + push constants, and
+  NonWritable derived per binding from the access classification - `ARCHITECTURE_GPU_VULKAN.md`
+  sec.2.2aj carries the rule, its refusal and its reading; Metal lowers a read role to `device const`
+  already) - and both speak the multi-kernel form (`kernel=` names the method, one macro instance per kernel, declared roles must cover every kernel).
 - **`family=` is Vulkan-only.** A vulkan family shares the per-class surface - the `VkdClass`
   global, the `set_*` builder, the pipe slots - across classes with one binding layout. Metal's
   `enc_*` builder is the entire generated surface, so there is nothing for a family to share;
   cross-class PSO/source sharing on Metal is a PSO-lifecycle question, not a lens one.
 - **`@default` is Metal-only.** A `[metal_dispatch]` field may name a fallback global
   (`@default = g_one`) that the generated builder binds when the caller passes null;
-  `[vk_dispatch]` has no counterpart - vulkan callers pass a real buffer at every slot. If
-  vulkan grows an optional-bind shape, it lands as this same annotation, not a new spelling.
+  `[vk_dispatch]` has no counterpart - vulkan callers pass a real buffer at every slot, and an
+  optional-bind shape there takes this same annotation, not a new spelling.
 - **The workgroup-footprint gate is Vulkan-only.** `[vk_dispatch]` sums a class's `@workgroup`
   members and its generated `ensure_*` declines by name (`vkd_wg_fits`) before the pipeline
   build, because MoltenVK's over-cap failure is an opaque `INITIALIZATION_FAILED` - and the
@@ -247,8 +247,8 @@ the production dialect against them - the bisect seat when the flash regresses.
 every tensor template's `XT = float` stamp - the live fallback wherever the half panel is absent
 (below the convert row floor, panel does not fit, half-X pinned off) - the
 batch-decode/classifier `MetalQ8GemmTensorT` family, whose half-X extension is an open ledger
-item, and the double-buffered `*Db` staging templates (`MetalQ8MulMmDbT`, `MetalKqMulMmK45DbT`,
-`MetalKqMulMmK6DbT`), which pin `XT = float16` today - there the flag is scaffolding a future
+item, and the double-buffered `*Db` staging stamps (`MetalQ8MulMmTensorT`'s `BK = 128` stamps,
+`MetalKqMulMmK45DbT`, `MetalKqMulMmK6DbT`), which pin `XT = float16` today - there the flag is scaffolding a future
 float stamp would need, not a live float operand - and the verify-width lab template
 `MetalKqLabK4Tmv8T` in the GEMV lab, whose A operand is the decode driver's f32 x panel.
 - **Fused single-kernel attention (scores in threadgroup, online softmax):** loses 10-80% to
@@ -261,7 +261,7 @@ consecutive staging runs, relaxed_precision always - are `REVIEW_GPU.md` rules a
 and why they lose.
 
 The Vulkan resident driver's sections live in its companions, each head saying what it holds: 2.2j,
-2.2p, 2.2ab, 2.2ac and 2.2ad in `ARCHITECTURE_GPU_VULKAN.md`; 2.2k-2.2m, 2.2q, 2.2ae and 2.2ah in
+2.2p, 2.2ab, 2.2ac, 2.2ad, 2.2ai and 2.2aj in `ARCHITECTURE_GPU_VULKAN.md`; 2.2k-2.2m, 2.2q, 2.2ae and 2.2ah in
 `ARCHITECTURE_GPU_VULKAN_GEMM.md`; 2.2n-2.2o in `ARCHITECTURE_GPU_VULKAN_RESIDENCY.md`; 2.2r-2.2v in
 `ARCHITECTURE_GPU_VULKAN_DECODE.md`; 2.2af and 2.2ag in `ARCHITECTURE_GPU_VULKAN_MOE.md`.
 

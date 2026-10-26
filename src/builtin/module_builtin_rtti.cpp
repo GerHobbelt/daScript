@@ -548,6 +548,7 @@ namespace das {
             addFieldEx ( "flags", "flags", offsetof(Program, flags), makeProgramFlags() );
             addProperty<DAS_BIND_MANAGED_PROP(getThisModule)>("getThisModule");
             addProperty<DAS_BIND_MANAGED_PROP(getDebugger)>("getDebugger");
+            addProperty<DAS_BIND_MANAGED_PROP(getOptimize)>("getOptimize");
             addField<DAS_BIND_MANAGED_FIELD(errors)>("errors");
             addField<DAS_BIND_MANAGED_FIELD(options)>("_options","options");
             addField<DAS_BIND_MANAGED_FIELD(policies)>("policies","policies");
@@ -974,6 +975,7 @@ namespace das {
             addField<DAS_BIND_MANAGED_FIELD(no_lint)>("no_lint");
             addField<DAS_BIND_MANAGED_FIELD(no_init_check)>("no_init_check");
             addField<DAS_BIND_MANAGED_FIELD(export_all)>("export_all");
+            addField<DAS_BIND_MANAGED_FIELD(export_public_functions)>("export_public_functions");
             addField<DAS_BIND_MANAGED_FIELD(serialize_main_module)>("serialize_main_module");
             addField<DAS_BIND_MANAGED_FIELD(keep_alive)>("keep_alive");
             addField<DAS_BIND_MANAGED_FIELD(very_safe_context)>("very_safe_context");
@@ -1078,6 +1080,7 @@ namespace das {
             addField<DAS_BIND_MANAGED_FIELD(jit_output_path)>("jit_output_path");
             addField<DAS_BIND_MANAGED_FIELD(jit_path_to_shared_lib)>("jit_path_to_shared_lib");
             addField<DAS_BIND_MANAGED_FIELD(jit_path_to_linker)>("jit_path_to_linker");
+            addField<DAS_BIND_MANAGED_FIELD(module_cache)>("module_cache");
         }
         virtual bool isLocal() const override { return true; }
     };
@@ -2043,6 +2046,12 @@ namespace das {
             addExtern<DAS_BIND_FUN(rtti_ast_serializer_get_data)>(*this, lib, "ast_serializer_get_data",
                 SideEffects::modifyExternal, "rtti_ast_serializer_get_data")
                     ->args({"serializer","block","context","line"});
+            addExtern<DAS_BIND_FUN(rtti_ast_serializer_finalize_usec)>(*this, lib, "ast_serializer_finalize_usec",
+                SideEffects::none, "rtti_ast_serializer_finalize_usec")
+                    ->args({"serializer"});
+            addExtern<DAS_BIND_FUN(rtti_ast_serializer_setup_usec)>(*this, lib, "ast_serializer_setup_usec",
+                SideEffects::none, "rtti_ast_serializer_setup_usec")
+                    ->args({"serializer"});
             addExtern<DAS_BIND_FUN(introduceFile)>(*this, lib, "set_file_source",
                 SideEffects::modifyExternal, "introduceFile")
                     ->args({"access","fileName","text","context","line"});

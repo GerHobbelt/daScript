@@ -735,8 +735,8 @@
     mints new kernels only. at least in debug-only mode." Today a sidecar missing ANY demanded
     kernel re-tunes the whole scope (the completeness rule), so every new `[tune]` family - one
     per format in this arc - re-mints every application sidecar on the box on its next start,
-    minutes each (HOW_TO_ADD_A_FORMAT.md QUIRK 17), and the same rule keeps a stub-era
-    `"reference"` pin alive after the emitter lands (QUIRK 11). The partial mint keeps the
+    minutes each (the format recipe's step 4 gate), and the same rule keeps a stub-era
+    `"reference"` pin alive after the emitter lands (item 134). The partial mint keeps the
     existing entries and races only the families the sidecar lacks (or names as reference),
     validating the merged file as one. Debug-only is the acceptable first form: a
     `DAS_TUNE_PARTIAL=1` (or `--tune-partial`) rail that the auto policy does not take, so a
@@ -750,8 +750,8 @@
     loads beating hardware gather); IQ4_XS and Q3_K were written from the disk format alone.
     Toward the end of the arc: read the reference exe's vec-dot and the reference exe's vec-dot
     (x86 + arm), list every technique ours does not measure, land the missing ones as
-    `[tune_perm]` spellings and let the probe judge. Done = a per-format note naming what was
-    raced and what won, beside the existing bench rows.
+    `[tune_perm]` spellings and let the probe judge. Done = the PR body naming what was raced and
+    what won, beside the existing bench rows.
 
 61. **Grid-format CPU decode: the panel round trip, one shared cost (kernel-level 0.43x-0.91x).**
     Measured 2026-09-01 at one thread, m=4096 k=14336 (`benchmarks/matmul/kq_kernel_bench.das` vs
@@ -792,7 +792,7 @@
     10%). The f4 slab ships (+9%, tg128 0.82x -> 0.95x same-run). Candidates beyond kernel
     shape: emitted-MSL diffs vs llama.cpp's compiled kernel (half math, function constants),
     or fusing the sign flip into the staged slab per SITE via a second indexed table. Done =
-    a form that clears 180 GB/s in the dispatch-loop probe (QUIRK 22's harness), or a note
+    a form that clears 180 GB/s in the dispatch-loop probe (the format recipe's Metal step), or a note
     proving the ceiling is shared by llama.cpp's own kernel when isolated the same way.
 
 63. **Reasoning-trace length under quantization: a rollback-and-ban sampler feature (Boris,
@@ -1480,3 +1480,145 @@
     on the K-quant path (the f32 dequant `read_linear` hands `linear_take_kq`, released per tensor
     but sized by the largest). The instrument is the resident set sampled per half second with the
     `--limit` one and two forms, and the das leak profiler on the run.
+131. **The format recipe's plane fields and hand ladders.** `Model` holds a plane pair per kq
+    format (`k4q/k4s ... iq4xsq/iq4xss`) and every consumer selects the pair with an
+    `if (fmt == KqFmt.k4) ... elif` chain: 12 ladders in `dasllama_load.das`, 13 in
+    `dasllama_common.das`, 3 in `dasllama_layout.das`, 8 in `dasllama_math_gen.das`, 3 in
+    `dasllama_math_default.das`, 4 in `dasllama_math.das`, one each in `ple`, `gpu_resident`,
+    `blocks`, `config`, `image`; the planes grew one format at a time and each arm carries a
+    different literal stride. Unquirked: one `KqPlanes` (quant, scale, mr) indexed by `KqFmt` on
+    `Model`, `kq_plane_q/s` the only accessors, every ladder one table lookup, a new format the
+    enum member plus its strides. The image's per-format `kq_repack_mr<id>` field and its
+    hand-grown `IMAGE_META_FIELDS` count, the repack-interleave freeze ladder in
+    `dasllama_load.das` (a format missing from it keeps `mr` 4 while its planes sit at the
+    companion's, and every `kq_active_mr` consumer reads the wrong interleave with no diagnostic
+    - caught only end to end), and `moe_gpu_gather_stack_kq`'s two per-format ladders (the
+    grouped and the tail-row branch need a verbatim arm each for a format already in the device
+    form) all collapse into that table.
+132. **The format recipe's test ladders.** `tests/test_kquant.das` builds fixtures, transcodes,
+    dequants, dots, repacks and calls the stubs through the same `fmt == 4/5/6/40` chains in five
+    gates (28 arms for one format) and raises `_cyclomatic_complexity` / `_function_length` per
+    format; `harness/gen_tune_probe.das` repeats the shape (9 arms) and its test mode gates a hand
+    list of families separate from the tune-mode family array. Unquirked: per-format dispatch
+    helpers in one `_kq_fixtures.das` shared by the test and the harness (`kq_transcode_sb`,
+    `kq_dequant_sb`, `kq_dot`, `kq_repack`, `kq_gemv_gen`, `kq_tile_gen`), each a single ladder,
+    and one family array both probe modes walk. The Metal test ladders are the same shape as
+    nested ternaries (`kq_gemv_gate`, `kq_mvb_gate`, `kq_mulmm_gate` and the fixtures pick MSL
+    sources, entries, fastmath and tgmem names per format, an `else` that means k6): one
+    per-format record per kernel family, indexed by format.
+133. **The format recipe's three int id spaces and the hand-formatted bake identity.**
+    `int(KqFmt)` (device stack tags, image plane ids, `vk_kq_schema_id`'s input), the kernel/IR
+    id (`kq_schema_id`), and the stream/repack region code (`kq_stream_code`: 0/2 for q8/q51,
+    else the kernel id, so k2 streams under 20 and translates back at every dispatch boundary);
+    `dlim_identity` formats `DlimCpuConfig.kq_mr<id>` into the identity string by hand, so a
+    field added without the string keys two interleaves identically. Unquirked: one id, or one
+    table that derives the other two and formats the identity.
+134. **The tune sidecar's identity lacks the generator hash.** A sidecar minted while a family's
+    generator stubs declined records `"<fmt>q8_tile_gen" : "reference"`; staleness keys on the
+    binary's mtime and the emitter is `.das`, so landing the emitter arm invalidates nothing and
+    the next run serves the reference body under the same `tune-stamped` line. The JIT DLL cache
+    has the same hole from the other side: the registered generators' bodies do not fold into
+    the cached DLL's hash, so after an emitter edit a cache hit executes the old stamps with no
+    signal. Unquirked: the generator hash folds into the sidecar identity and the DLL cache key.
+135. **The MSL emitter's `static_if` has no `elif`.** A format arm beside `SIXBIT` in
+    `MetalKqMulMmK45T` re-nests the k4/k5 arm one level deeper, so the diff is mostly
+    indentation. Unquirked: `elif` on `static_if` in the MSL emitter.
+136. **The SPIR-V emitter lowers a dynamically indexed `fixed_array` local to Function storage.**
+    A 16-entry codebook held as a `let fixed_array<int>` local inside a kernel class and indexed
+    per nibble spills to private memory (the IQ4_XS Vulkan GEMV decoded at 105.7 t/s against
+    k3's 372.8 on fewer bytes a weight); the form that runs packs the codebook into four `uint4`
+    words and selects with a dynamic vector index plus a byte shift. Unquirked: the emitter
+    lowers a `let` fixed_array of literals to a constant-storage array, or a lint flags a
+    dynamically indexed fixed_array local inside a kernel class.
+
+137. **The toolchain roll carries its own copy of dasImgui's wasm archive list.** Step 4 of
+    `utils/internal/dasweb-buildd/roll_toolchain.sh` repeats the `emcmake` build command and the
+    archive names that `modules/dasImgui/.das_package` declares (`release_wasm_build`,
+    `release_wasm_archive`), minus `liblibDasModuleClipboard.a`, which `daspkg build --wasm`
+    stages; a pairing rule in the folder's `REVIEW.md` is what keeps the two copies equal. The
+    fix is one source, not a second check: the roll runs the package's own wasm build - a daspkg
+    entry point that reads the manifest and bakes what it declares - and the copied list goes.
+138. **The records oracle's first read after an image prepare is cold.** In `--oracle --legs
+    metal` the first measure of a text cell whose image the batch just mapped or baked reads far
+    below its stored mean (gemma-4-12B tg128 -28% / pp512 -43%, gemma-4-26B tg128 -19%,
+    Qwen3.8-27B tg128 -41%, and on a second board gemma-4-E4B tg128 -21%, Qwen3.6-27B pp512
+    -32%, Qwen3.6-35B-A3B pp512 -33% / tg128 -20%), and the solo re-run after the 180 s settle
+    lands within 1% every time. Reproduced on the M5 Max box with the board's own sequence - a
+    big model's timed cell, then the victim's prepare, the 12 s settle, the victim's timed cell
+    - five of five times, the cells run by hand as the oracle runs them (the released
+    `dasllama-bench` exe, `--frozen`, the box's tuned sidecar, no overrides) with
+    `powermetrics --samplers gpu_power,thermal` reading the GPU clock and the pressure level:
+    the GPU enters Moderate thermal pressure during the big cell and runs the victim at
+    990-1420 MHz instead of 1620 (Qwen3.6-35B pp512 2444 +- 628, tg128 103 vs 3401 / 127.5),
+    while the page-in counter, the residency rails and the map's reclaim state show nothing; a
+    60 s settle reads Nominal and lands within 1%, a 120 s settle the same. The prepare is only
+    the sequence's shape: the throttle is the previous cell's heat, and the 12 s `--settle` is a
+    reclaim window, not a cooling one, so the oracle idles `--oracle-settle` seconds (60) before
+    every timed cell, on every leg - the Vulkan boards report the same first-read drop, not yet
+    instrumented. Unquirked: a timed cell waits for the process's thermal state to read nominal
+    (`NSProcessInfo.thermalState`, no sudo) with a capped wait, so the box's own reading
+    replaces a fixed number that is too long for a cool box and may be too short for a hot one.
+139. **The tuner's end-to-end confirm reads a stamp line a warm JIT does not print.** The
+    generator confirm (`gen_tune_probe.das`, confirm_e2e_prefill) scores each arm by the
+    `llvm_tune: q8q8_tile_gen <- <perm>` line of a verbose child, and a child that runs the
+    prefill and prints its `CONFIRM_PP` still scores 0 when the line is absent: under a
+    `daspkg release` on this box every arm's child loaded, ran the E4B prefill and
+    printed no stamp, so the confirm rejected, the tuner refused to ship, and the bundle kept
+    its unrenamed exe; the same child command by hand prints the stamp. Row 134 names the hole
+    from the cache side: a generator served from a cached compile is not re-stamped, so its
+    stamp line is not printed either. Unquirked: the confirm reads the served permutation from
+    the runtime (the sidecar apply's own report), not from a compile-time log line.
+140. **The CPU-side board is slower than its August 30 records at master's head.** On the M5
+    box, `gen_bench_records --oracle` at master e6eca7218 (the arcanoid-tune merge) reads every
+    CPU and Accelerate ASR row past its stored mean - parakeet v2/v3 +11..+17% on the short
+    clips and +4..+5% on the nine-minute one, gemma4a +8..+11%, canary +8..+16%, Qwen3-ASR
+    +8..+15%, Qwen3-Omni audio +5..+14%, whisper tiny/large-turbo +2..+5% - and the CPU image
+    rows' spliced prefill 15..21% slower (Qwen3VL-4B, Qwen2.5-Omni) with the Qwen2.5-Omni CPU
+    window-ViT encode +23%; every Metal text, image and ASR row holds within 1%. An A/B of the
+    same cells between master and a Metal-only refactor branch on identical winners (both trees
+    as -jit scripts on the shipped class defaults) reads within 2% both ways, so the drift sits
+    between the August 30 record and master's head, not in a branch. The short-clip bias (a
+    larger loss the shorter the clip) points at per-call overhead - a wake, a prep, or a
+    kernel winner that lost its small-shape arm - rather than a GEMM's steady-state rate.
+    Replicated on the M5 Max box after a reboot with a worktree at the recording commit
+    (013a151f4) beside master's head, the parakeet jfk.wav cell interleaved, eight reps a run,
+    five runs a tree, each tree's own `-jit` binary on a single-clip script in the bench's
+    regime (its jobque, five workers, the box profile, `DASLLAMA_ALLOW_UNTUNED=1
+    DAS_TUNE_MANIFEST=0`), the cluster residency read by `powermetrics --samplers cpu_power`:
+    best reps equal (146 vs 143 ms), medians 158.5 vs 162.5 (2.5%). An 11% step would show in
+    one run of eight; none did. The spread is placement: the box's six Super cores stay
+    saturated while the twelve Performance cores take 35% of the run when fast and 55% when
+    slow, per rep, on both trees and both affinity modes. The oracle's shortfall is a record
+    minted as a best-of-two on a fresh box read against a placement-scattered box; the residual
+    2.5% between the two commits sits inside that scatter and no bisect resolves it. Unquirked:
+    the oracle's CPU rows carry a placement-aware instrument (the median of many reps, the
+    Performance-cluster residency beside it) before any CPU row is re-recorded or gated.
+141. **Four tower sites release a pool buffer under a byte count that is not its acquire's.** In
+    `dasllama_metal_tower.das` the K panel `bk` is acquired at `bytes_rowk` (the 64-padded key
+    rows) and released at `bytes_row` / `bytes_rowp` (the 32-padded rows) at four self-attention
+    sites, where `pool_release` files by `pool_bucket(bytes)` and the pool's contract is that the
+    two counts match. Harmless today because `nk == npos` there, so the misfiled buffer is the
+    larger of the two; a shape where it is the smaller hands the next acquire a short buffer and
+    the GPU writes past it with no diagnostic. Unquirked: the four sites release under
+    `bytes_rowk`, and the tower context (`tw_ctx_make` / `tw_ctx_release`) carries the K panel
+    so the pair is written once.
+142. **The verify's chunk count and its partials buffer are sized by two formulas.** The MTP
+    verify's chunked attention dispatches `ceil((chain_pos + nrows) / 64)` chunks per row (the
+    pre-fold spelling, kept), while `acquire_step` sizes `bpart` for `ceil((pos + 1) / 64)`
+    chunks of its own (one-ahead) position - the two differ once `nrows > 2` crosses a 64-row
+    boundary, and the deepest verify row's true count is `ceil((chain_pos + nrows + 1) / 64)`.
+    Nothing reaches it below `g_attn_single_max` rows of context. Unquirked: one chunk-count
+    formula over the deepest row, used both to size `bpart` and to dispatch, with a cell that
+    verifies at a context depth crossing a 64-row boundary.
+143. **The CPU chain's gemma-4-12B perplexity trails the resident driver's, and more so past one
+    prefill window.** Measured 2026-09-12 on the RTX 5060 Ti box, gemma-4-12B Q8_0, ordinary
+    prose through the model's tokenizer, teacher-forced after a prefill (`test_gpu_resident_gemma.das`,
+    the perplexity cells): 150 prefilled + 150 scored reads CPU 1.516 (137 argmax hits) against
+    the resident 1.449 (139) and llama.cpp b10660 1.390 on the same split; 520 prefilled + 80 scored
+    reads CPU 2.784 (67 of 80) against the resident 2.006 (72). The CPU chain's own prefill-in-one
+    and teacher-forced decode also land 13% (8 positions) to 44% (300) of the max logit apart on
+    this file where gemma-3-1b's land 3%. The suspects are the CPU prefill's Q8 activation blocks
+    on the 12B's widths (the resident feeds f16 rows) and its blocked attention over the 512-wide
+    V-from-K heads; the instrument is the perplexity cell's `forced_nll` against llama.cpp's
+    `--save-all-logits` file (a parser sits with the arc's notes). Unquirked: the CPU chain's chunk
+    perplexity within 2% of llama.cpp's on this file.

@@ -1,19 +1,26 @@
 # Simulate Headers Code Review Checklist
 
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture doc:
-`ARCHITECTURE.md`. A diff that changes a `debug_info.h` struct layout, or removes, renames or
-retypes a public member of a struct or class under this folder, applies
-`skills/internal/abi_break_sweep.md` too. A diff that changes what a name under this folder
+`ARCHITECTURE.md`. A diff that changes the layout of a public struct or class under this folder -
+a member added, removed, reordered, renamed or retyped, including in any struct declared in
+`debug_info.h` - applies `skills/internal/abi_break_sweep.md` too. A diff that changes what a name under this folder
 resolves to for a `daslib/*.das` caller - a rename, a removal, or a new overload of a struct or
 member the AOT C++ emitter writes into generated code, or of a flag or field a daslib predicate
 reads - applies `daslib/REVIEW.md` too; checklist discovery walks changed paths only, so the
-C++ half never opens the daslib checklist on its own.
+C++ half never opens the daslib checklist on its own. A diff that adds, reorders or retypes a
+member of a C++ type das binds through an annotation applies `src/builtin/REVIEW.md` too, for
+the same reason.
 
 - **A diff that adds a field to `CodeOfPolicies` (`code_of_policies.h`) adds it to
   `DAS_MODULE_CACHE_POLICY_FIELDS` in `src/builtin/module_builtin_ast_serialize.cpp`, in the
   same change** - that list drives both the module-cache record's policy stream and the compare
   that refuses a record written under other policies, so a field missing from it is a policy the
   cache silently ignores.
+
+- **A diff that adds a data member to a C++ type under this folder that das binds through an
+  annotation appends it after that type's last member, or bumps `LLVM_JIT_CODEGEN_VERSION`
+  (`modules/dasLLVM/daslib/llvm_jit_plan.das`) in the same change.** A cached JIT DLL binds the members it read by offset; a member inserted
+  before them moves every later one under code that still uses the old offsets.
 
 - **A diff that hashes a table key hashes a builtin key type - one in `heap.h`'s
   `makeTableKeyValueNode` list - as itself through `hash_function(context, key)` (`hash.h`),
@@ -64,3 +71,4 @@ C++ half never opens the daslib checklist on its own.
   `tests-cpp/small/test_debug_info_layout_pin.cpp` it makes false, and adds an `offsetof`
   pin for each field it adds** - a field that lands in tail padding leaves `sizeof`
   unchanged, so no other assertion in that file fails.
+

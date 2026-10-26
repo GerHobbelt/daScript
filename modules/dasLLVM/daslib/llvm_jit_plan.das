@@ -15,7 +15,7 @@ module llvm_jit_plan shared private
 //! a miss; the emitter builds on the same plan and the same install. The three host queries
 //! the key folds - triple, CPU name, CPU features - are the one use of the LLVM bindings here.
 
-require llvm/bindings/llvm_func
+require llvm/bindings/llvm_host
 require llvm/daslib/llvm_dll_utils public
 require llvm/daslib/llvm_env
 require llvm/daslib/llvm_cpu_class
@@ -31,7 +31,7 @@ require jit
 // invalidates cached DLLs (e.g. edits to llvm_jit.das, llvm_macro.das, llvm_jit_common.das,
 // runtime helper ABI, default target triple). Cache filenames fold this in, so a bump
 // makes every previously written DLL miss the cache on the next run and get GC'd.
-let public LLVM_JIT_CODEGEN_VERSION : uint64 = 0x7dul   // 0x7d: the DLL key folds the candidate set - every used function the policy selects, before the emitter's content gate - so a cache hit binds what the DLL holds with no emitter loaded (0x7c: under --jit-debug a das global is described too, at the ctx-derived pointer each function computes for it; every das local, argument and block variable carries a DILocalVariable with a real DIType, a das block opens a DILexicalBlock, a subprogram is named as the das source names it and carries no linkage name, one compile unit covers the whole module, and the prologue and a loop latch carry no stale line (0x7a: a lambda <-> int64/uint64 reinterpret lowers through ptrtoint / inttoptr, not a bitcast (0x79: an intrinsic emitter keys off the declared name, so a module-qualified call (math::sqrt) builds llvm.sqrt.f32, and a function <-> int64/uint64 reinterpret extracts and inserts the { ptr } aggregate instead of bitcasting it (0x78: a standalone exe adopts its emitter-sealed function and global lookups right after the context is created (0x77: a vector of a handled element type registers into the element's module, so the externs a DLL binds by mangled name moved out of `$` (0x76: a statement after a terminator in the same block list lands in its own dead block instead of after the ret (0x75: the global-offset lookup is memory(none) and emitted at its use site - LLVM dedups and hoists it, an untaken branch never pays it; a solid-context global resolves once per function at entry (0x74: a runtime-only exe emits no register_native_path rows, and a whole-lib exe emits them once (0x73: computed goto lowers to one switch with the trap as its default, not an icmp chain (0x72: policies.fast_math defaults to the host's float flags, so a fast-math host now JITs fast-math (0x71: a CPU class row's cpu is the arch's bare baseline, so a DAS_JIT_BASELINE build enables the row's set and nothing a level implies (0x70: the wasm feature string drops +relaxed-simd and the idot family keeps only the exact extmul + extadd_pairwise lowering on wasm SIMD128 (0x6f: the first wasm idot lowering; 0x6e: the aarch64 SDOT / SMMLA tables gate on DotProd / i8mm, not the arch alone, and the force env reaches the generic exe machine (0x6d: the inline polynomial rail carries NaN: tanh selects the operand back over its ordered clamp, and the sincos quadrant / tan octant convert through llvm.fptosi.sat instead of poisoning on NaN and out-of-range (0x6c: aarch64 vector tan/exp2/log2/log/pow join the inline polynomial rail bit-exactly with the interpreter, sinh/cosh/tanh ride the exp one; 0x6b: aarch64 vector sin/cos ride the inline polynomial; 0x6a: srem/urem for 32-bit %; 0x69: every string argument of an extern is substituted, not just the ones which asked))))
+let public LLVM_JIT_CODEGEN_VERSION : uint64 = 0x80ul   // 0x80: a standalone exe's context gets its mutex from `options threadlock_context` too, not only from a [pinvoke] function or the policy (0x7f: a standalone exe hands its context the capture type of every lambda body, so a job or thread lambda's block header carries it (0x7e: a const pointer or reference parameter the body writes through after stripping the const (the compiler's access_ref mark) carries no readonly attribute, so the optimizer no longer folds the caller's read of that memory to its pre-call value (0x7d: the DLL key folds the candidate set - every used function the policy selects, before the emitter's content gate - so a cache hit binds what the DLL holds with no emitter loaded (0x7c: under --jit-debug a das global is described too, at the ctx-derived pointer each function computes for it; every das local, argument and block variable carries a DILocalVariable with a real DIType, a das block opens a DILexicalBlock, a subprogram is named as the das source names it and carries no linkage name, one compile unit covers the whole module, and the prologue and a loop latch carry no stale line (0x7a: a lambda <-> int64/uint64 reinterpret lowers through ptrtoint / inttoptr, not a bitcast (0x79: an intrinsic emitter keys off the declared name, so a module-qualified call (math::sqrt) builds llvm.sqrt.f32, and a function <-> int64/uint64 reinterpret extracts and inserts the { ptr } aggregate instead of bitcasting it (0x78: a standalone exe adopts its emitter-sealed function and global lookups right after the context is created (0x77: a vector of a handled element type registers into the element's module, so the externs a DLL binds by mangled name moved out of `$` (0x76: a statement after a terminator in the same block list lands in its own dead block instead of after the ret (0x75: the global-offset lookup is memory(none) and emitted at its use site - LLVM dedups and hoists it, an untaken branch never pays it; a solid-context global resolves once per function at entry (0x74: a runtime-only exe emits no register_native_path rows, and a whole-lib exe emits them once (0x73: computed goto lowers to one switch with the trap as its default, not an icmp chain (0x72: policies.fast_math defaults to the host's float flags, so a fast-math host now JITs fast-math (0x71: a CPU class row's cpu is the arch's bare baseline, so a DAS_JIT_BASELINE build enables the row's set and nothing a level implies (0x70: the wasm feature string drops +relaxed-simd and the idot family keeps only the exact extmul + extadd_pairwise lowering on wasm SIMD128 (0x6f: the first wasm idot lowering; 0x6e: the aarch64 SDOT / SMMLA tables gate on DotProd / i8mm, not the arch alone, and the force env reaches the generic exe machine (0x6d: the inline polynomial rail carries NaN: tanh selects the operand back over its ordered clamp, and the sincos quadrant / tan octant convert through llvm.fptosi.sat instead of poisoning on NaN and out-of-range (0x6c: aarch64 vector tan/exp2/log2/log/pow join the inline polynomial rail bit-exactly with the interpreter, sinh/cosh/tanh ride the exp one; 0x6b: aarch64 vector sin/cos ride the inline polynomial; 0x6a: srem/urem for 32-bit %; 0x69: every string argument of an extern is substituted, not just the ones which asked)))))
 
 let public JIT_FNV_PRIME : uint64 = 1099511628211ul
 
@@ -719,6 +719,10 @@ struct public JitPlan {
     debug_info : bool
     dump_ir : bool
     gen_exe : bool
+    gen_lib : bool
+    lib_static : bool
+    lib_export_marked : bool
+    lib_bindings : string
     exe_main : string
     compile_only : bool
     emit_aot_object : bool
@@ -774,7 +778,19 @@ def public make_jit_plan(prog : Program?; var ctx : Context?; announce : bool) :
         to_log(LOG_WARNING, "LLVM JIT: dll mode requested but this daslang build is static - no DLL cache, " +
             "every run pays full in-memory codegen\n")
     }
-    plan.gen_exe = prog.policies.jit_exe_mode
+    plan.gen_lib = cli_opts.lib |> unwrap_or((prog._options |> find_arg("jit_lib")) ?as tBool ?? false)
+    plan.gen_exe = prog.policies.jit_exe_mode || plan.gen_lib
+    plan.lib_static = cli_opts.lib_static |> unwrap_or(false)
+    plan.lib_bindings = cli_opts.lib_bindings |> unwrap_or("")
+    plan.lib_export_marked = cli_opts.lib_export_marked |> unwrap_or((prog._options |> find_arg("jit_lib_export_marked")) ?as tBool ?? false)
+    if (announce && !plan.gen_lib) {
+        if (cli_opts.lib_static |> is_some()) {
+            to_log(LOG_WARNING, "LLVM JIT: --jit-lib-static applies to -lib only - ignored for this run\n")
+        }
+        if (cli_opts.lib_bindings |> is_some()) {
+            to_log(LOG_WARNING, "LLVM JIT: --jit-lib-bindings applies to -lib only - ignored for this run\n")
+        }
+    }
     plan.exe_main = "main"
     // --jit-compile-only: build + verify + optimize (+dump), write/load/install nothing —
     // the program runs interpreted. Also bypasses the DLL cache probe, so the

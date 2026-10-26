@@ -184,6 +184,7 @@ def suite_files(name : string) : array<string> {   // nolint:STYLE038 - a flat s
                     "modules/dasLLAMA/tests/test_gemma4v.das",
                     "modules/dasLLAMA/tests/test_gpu_model_swap.das",
                     "modules/dasLLAMA/tests/test_gpu_moe_shexp.das",
+                    "modules/dasLLAMA/tests/test_gpu_resident_gemma.das",
                     "modules/dasLLAMA/tests/test_gpu_resident_hybrid.das",
                     "modules/dasLLAMA/tests/test_gpu_resident_moe.das",
                     "modules/dasLLAMA/tests/test_gpu_resident_qwen2.das",
@@ -262,7 +263,7 @@ def area_tests(area : string) : array<string> {
         return <- [ "test_accel_backend.das", "test_affinity_predicates.das", "test_arch_registry.das", "test_batch_decode.das",
                     "test_batch_grid.das", "test_chat.das", "test_deltanet.das", "test_dispatch_shaping.das", "test_facade.das",
                     "test_flash.das", "test_forward.das", "test_fused_decode.das", "test_gguf_quant.das", "test_gguf_shards.das",
-                    "test_gpu_model_swap.das", "test_gpu_moe_shexp.das", "test_gpu_resident_hybrid.das", "test_gpu_resident_moe.das", "test_gpu_resident_qwen2.das", "test_gpu_serving_declines.das", "test_gpu_slot_swap.das", "test_gpu_tier.das", "test_groupn.das",
+                    "test_gpu_model_swap.das", "test_gpu_moe_shexp.das", "test_gpu_resident_gemma.das", "test_gpu_resident_hybrid.das", "test_gpu_resident_moe.das", "test_gpu_resident_qwen2.das", "test_gpu_serving_declines.das", "test_gpu_slot_swap.das", "test_gpu_tier.das", "test_groupn.das",
                     "test_jobque_tripwire.das", "test_kernel_backend.das", "test_kgroup_repack.das", "test_kqformat.das", "test_kquant.das",
                     "test_kv_codec.das", "test_kv_paged.das", "test_kv_prefix.das", "test_math_activations.das",
                     "test_math_elementwise.das", "test_matmul.das", "test_matmul_batch.das",
@@ -625,7 +626,7 @@ def private run_files(cfg : RunArgs; files : array<string>; image_arms : string;
     let win = get_platform_name() == "windows"
     let envs = child_envs(cfg, win, cfg.arm)
     let image_envs = child_envs(cfg, win, image_arms)
-    let tmo = cfg.full ? 3600 : 1200   //! the full gate holds the 8B/70B tails; 1200 s is the arm-mode budget
+    let tmo = (cfg.full || cfg.suite == "stocked") ? 3600 : 1200   //! the full gate and the stocked gate hold the large tier's tails (the parity file alone runs past 20 min there); 1200 s is the arm-mode budget
     let reps = max(cfg.nreps, 1)
     let das_exe = empty(cfg.das) ? get_command_line_arguments()[0] : cfg.das
     mkdir(dir_name(MODULE_CACHE))

@@ -1,7 +1,8 @@
 # daslib Code Review Checklist
 
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture
-docs: `ARCHITECTURE.md`, `ARCHITECTURE_LINT.md`, `ARCHITECTURE_EMIT.md`, `ARCHITECTURE_LINQ.md`.
+docs: `ARCHITECTURE.md`, `ARCHITECTURE_CAPI.md`, `ARCHITECTURE_LINT.md`, `ARCHITECTURE_EMIT.md`,
+`ARCHITECTURE_LINQ.md`.
 A diff touching the linq family - `linq*.das`, `sql_*.das` - applies `REVIEW_LINQ.md` too. A
 diff touching `daspkg.das` - the functions a `.das_package` manifest body calls - applies
 `utils/daspkg/REVIEW.md` (repo root) too; the folder walk never opens it for a `daslib/` diff.
@@ -40,7 +41,7 @@ construct's exit path and unbalances it.
 
 **A diff that adds or changes a daslib fact - code or a `//!` contract - whose truth is
 decided by a definition outside this folder - a C++ definition, or another module's descriptor
-- with no test, lint, or compile error failing when the two sides no longer match, records the
+- with no lint, compile error, or test in the default suite failing when the two sides no longer match, records the
 pair, naming both sides, in whichever `ARCHITECTURE*.md` in this folder holds the daslib file's
 section - adding that section to `ARCHITECTURE.md` when no doc holds one.**
 
@@ -52,8 +53,10 @@ other side in the same diff.**
 read as the current tree, and a name that no longer resolves or a scope that no longer holds is
 trusted until someone reads the code.
 
-**A diff adds an architecture-doc entry only for a fact that can go false with no name, shape,
-test, lint, or compile error catching it.**
+**A diff adds an architecture-doc entry only for a fact that no lint, compile error, or test in
+the default suite reports when it goes false, and that the code's own names do not make
+self-evident** - a test gated on an environment variable, or run only in a nightly lane, does
+not count.
 
 **A diff that changes daslib's nolint scanning - suppression parsing, staleness detection, or
 the header window - keeps `tests/lint/test_nolint_suppression.das` and
@@ -98,7 +101,8 @@ statements with one expression - gates the suggestion on receiver type, arity, c
 and duplicate constant keys.**
 
 **A diff that adds or changes the rewrite a lint message suggests adds that rewrite to the
-rule's fixture as a good shape that compiles and does not fire.**
+rule's fixture in `utils/lint/tests/` (repo root) as a good shape that compiles and does not
+fire.**
 
 **A diff that makes two collapse checks fire on one shape is a defect.** Overlaps stay
 partitioned: STYLE021 owns the const-key run over STYLE031, STYLE032 owns fresh-empty
@@ -264,10 +268,11 @@ KIND.** An rvalue stays materialized, because a reference to a temporary dangles
 **Never reuse a swizzle rewrite's source node in a second output lane without cloning it** -
 the first appearance moves it, and skipping the clone gives one node two parents.
 
-**A diff that changes how the RST label or topic key is computed makes the same change in
-every place `rst.das` computes it - the stub pass (`generate_module_stubs`) and the
-documenting pass (`documents`) - keeping them byte-for-byte equal.** When the two diverge, the page
-prints a bare signature and the symbol re-stubs.
+**A diff that changes how the RST label (the `.. _name:` target) or the topic key (the
+`|detail/...|` / `|handmade/...|` substitution name) is computed makes the same change at
+every site in `rst.das` that spells it, keeping them byte-for-byte equal; how a key resolves
+to a file is not the key.** When the two diverge, the page prints a bare signature and the
+symbol re-stubs.
 
 **A diff that adds a numeric value form to the toml lexer routes it through `rewind_to_bare`
 on a bare-key character.** Without the rewind, a bare key that starts like a number lexes as

@@ -13,10 +13,11 @@ require dastest/review_gate
 // utils/ children that are not tool directories: the shared library hub
 var private LIBRARY_DIRS <- { "common" }
 
-// tools whose development runs interpreted under a supervisor - the watchdog front for mcp,
-// lsp_supervisor.py for lsp: never built or shipped as an exe, since that form would ship
-// without anyone having run it. An entry leaves when the supervisor's --program names the exe.
-var private SUPERVISED_TOOLS <- { "mcp", "lsp" }
+// tools whose development runs interpreted under a supervisor - the watchdog's --stdio front
+// for mcp and dap, its --lsp front for the lsp subtools: never built or shipped as an exe,
+// since that form would ship without anyone having run it. An entry leaves when the front
+// names the exe.
+var private SUPERVISED_TOOLS <- { "mcp", "lsp", "dap" }
 
 // Files licensed to name utils/internal outside internal/:
 var private INTERNAL_REF_EXEMPT <- {

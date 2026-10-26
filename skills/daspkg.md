@@ -335,7 +335,7 @@ daspkg release wasm --root examples/games/arcanoid --out _release
 ### Prerequisites
 
 - **emsdk active** - `emcc` + `cmake` on PATH (CI activates `emsdk_env` first).
-- **wasm64 archives** - from `daspkg build --wasm` (in `web/output64/lib`, or pass `--wasm-lib-dir`).
+- **wasm64 archives** - from `daspkg build --wasm` (in `web/output64/lib`, or pass `--wasm-lib-dir`). A module with a `release_wasm_build` hook (dasImgui) builds its archives on demand only while one of its declared archives is missing from that directory - a staged archive never refreshes, so after a change to that module's C++ delete its staged `liblib*.a` before `release wasm`, or the app links the stale one.
 - **Host shared modules** (graphics examples only) - the host daslang must have `modules/dasGlfw/dasModuleGlfw.shared_module` + `modules/dasOpenGL/dasModuleOpenGL.shared_module` present, or GL silently falls back to the broken dasbind path (black canvas + runtime "Failed to find @dasbind::glCreateShader"). Guard before release: the cross-compile log must show `NEED_MODULE(Module_dasOpenGL) for opengl` (native), not a `@dasbind` binding. Pure compute scripts need no shared modules.
 
 ### `release()` hooks for web
@@ -362,6 +362,8 @@ def release() {
 ### Game source contract (cross-compiles UNCHANGED)
 
 A game keeps its plain desktop `main` - on wasm the browser lifecycle auto-drives `init`/`update`/`shutdown` per `requestAnimationFrame` and **bypasses `main`**. No `eval_main_loop` / per-platform edits. (Graphics examples may need `options stack = 8_388_608` - decs nested queries overflow the 16 KB default context stack in the cross-compiled exe.)
+
+A branch on the platform that must hold in the artifact reads `get_running_platform_name()` (`"emscripten"` in the browser). `get_platform_name()` is folded at compile time, so a cross-compiled artifact carries the build HOST's name (`"darwin"` on a Mac) - an `[init]` gated on it never fires in the browser.
 
 ## Resetting a Project (cleanup)
 

@@ -284,10 +284,12 @@ namespace das
             uint32_t    flags = 0;
         };
         mutable bool circularGuard = false;   // we prevent circular lookups with this guard. Do not serialize, do not expose to daslang
+        mutable int32_t cachedGcFlags = -1;   // gc flags of the whole structure, -1 until a top-level walk fills it. Not serialized
     };
 
     struct DAS_API Variable : gc_node {
         Variable() { gc_magic = GC_MAGIC_VARIABLE; }
+        explicit Variable( const LineInfo & at ) : at(at) { gc_magic = GC_MAGIC_VARIABLE; }
         VariablePtr clone() const;
         string getMangledName() const;
         uint64_t getMangledNameHash() const;
@@ -475,6 +477,7 @@ namespace das
             return hb.getHash();
         }
         virtual int32_t getGcFlags(das_set<Structure *> &, das_set<Annotation *> &) const { return 0; }
+        mutable int32_t cachedGcFlags = -1;   // gc flags of the handled type, -1 until a top-level walk fills it
         virtual bool canAot(das_set<Structure *> &) const { return true; }
         virtual bool canMove() const {
             return !hasNonTrivialCopy();
@@ -1164,7 +1167,9 @@ namespace das
         static void Initialize();
         static bool InitializeDependencies ( string & notInitialized );
         static void CollectFileInfo(das::vector<FileInfoPtr> &accesses);
-        static void Shutdown( bool dumpHandleLeaks = true );
+        // resetFusion=false orphans the fusion table: for a host whose process ends right after, the
+        // teardown is time spent on memory the OS reclaims anyway; a host that initializes again must reset
+        static void Shutdown( bool dumpHandleLeaks = true, bool resetFusion = true );
         // Runtime-only shutdown — for standalone exes built with `daslang -exe`,
         // which link libDaScript*_runtime without the fusion engine. See issue #2583.
         static void ShutdownStandalone( bool dumpHandleLeaks = false );
@@ -1515,6 +1520,7 @@ namespace das
 
         das_hash_map<TypeInfo *,string>          t2cppTypeName;
         das_hash_map<StructInfo *,string>        s2cppTypeName;
+        bool collectCppNames = true;    // the C++ spellings above are read only through debug_helper_find_*_cppname, by the AOT emitter's own helper; a simulate's helper turns this off
     };
 
     struct CommentReader {
@@ -1647,8 +1653,6 @@ namespace das
         void linkCppAot ( Context & context, AotLibrary & aotLib, TextWriter & logs );
         void linkError ( const string & str, const string & extra );
     public:
-        UpdateAliasMapCallback updateAliasMapCallback;
-    public:
         template <typename TT>
         string describeCandidates ( const TT & result, bool needHeader = true ) const {
             if ( !result.size() ) return "";
@@ -1723,6 +1727,7 @@ namespace das
         // stores and re-validates them, so a changed input invalidates the cached record instead
         // of serving what a compile folded from the old value.
         vector<tuple<string,int64_t,uint64_t>> moduleCacheDependencies;
+        UpdateAliasMapCallback      updateAliasMapCallback;
     };
 
     // the shared capture/validate stat for Program::moduleCacheDependencies: size -1 + hash 0
