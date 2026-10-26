@@ -11,15 +11,15 @@ require dasllama/dasllama_rope       // the RoPE angle/table generation (Model-f
 require dasllama/dasllama_gpu_tier   // the device-cooperation seam (hooks the loader/dispatch arms call)
 require daslib/array_boost // nolint:STYLE030 — temp_array is [template]; STYLE030 misses template-fn refs and false-flags this as unused
 require dasllama/dasllama_math
-require dasllama/dasllama_kv_codec  // the KV-cache codec families — kv_store_row/kv_load_row/kv_dot/kv_axpy dispatch into them
+require dasllama/dasllama_kv_codec public  // the KV-cache codec families — kv_store_row/kv_load_row/kv_dot/kv_axpy dispatch into them
 require dasllama/dasllama_convert   // cvt_f32_to_f16/cvt_f16_to_f32 — the f16 rows (wscale plane + the f16 KV codec)
 require dasllama/dasllama_math_default  // registers the portable Q8·Q8 backend at [init] (the fallback everywhere)
 require dasllama/dasllama_math_aarch64_neon  // registers the arm64 SDOT Q8·Q8 backend at [init]; no-op off-ARM
-require ?llvm/daslib/llvm_tune dasllama/dasllama_math_gen  // nolint:STYLE030 — [init]-only: registers "arm64-gen" (the generated GEMM family, arm64 load-select tier). PATH guard: the module hard-requires llvm_tune, so it loads exactly when dasLLVM is mounted
+require ?llvm/daslib/llvm_tune dasllama/dasllama_math_gen  // [init]-only: registers "arm64-gen" (the generated GEMM family, arm64 load-select tier). PATH guard: the module hard-requires llvm_tune, so it loads exactly when dasLLVM is mounted
 require ?llvm/daslib/llvm_tune llvm/daslib/llvm_tune public  // re-export ONLY llvm_tune (not math_gen's whole public surface — its jobque_boost would flood requirers with ambiguities): the auto-policy pass and tune_status reach every app that requires this module
-require ?das_metal dasllama/dasllama_metal_gemm  // nolint:STYLE030 — [init]-only: registers "metal" (the GPU prefill-GEMM batch donor). STRICT guard: the C++ das_metal module exists on Apple builds only, so non-Apple lanes never compile the Metal driver
-require ?das_accelerate dasllama/dasllama_math_accelerate  // nolint:STYLE030 — [init]-only: arms the "+AMX" float-batch override when DASLLAMA_ACCEL=1. Same Apple-only guard shape as the metal driver
-require ?vulkan dasllama/dasllama_math_vulkan  // nolint:STYLE030 — [init]-only: registers "vulkan" (the GPU tier; stage-0 skeleton, kernels land with the offload rail). STRICT guard: the C++ vulkan module is linked only where the dasVulkan package is installed, so CI lanes without it never compile the Vulkan driver
+require ?das_metal dasllama/dasllama_metal_gemm  // [init]-only: registers "metal" (the GPU prefill-GEMM batch donor). STRICT guard: the C++ das_metal module exists on Apple builds only, so non-Apple lanes never compile the Metal driver
+require ?das_accelerate dasllama/dasllama_math_accelerate  // [init]-only: arms the "+AMX" float-batch override when DASLLAMA_ACCEL=1. Same Apple-only guard shape as the metal driver
+require ?vulkan dasllama/dasllama_math_vulkan  // [init]-only: registers "vulkan" (the GPU tier; stage-0 skeleton, kernels land with the offload rail). STRICT guard: the C++ vulkan module is linked only where the dasVulkan package is installed, so CI lanes without it never compile the Vulkan driver
 require dasllama/dasllama_gguf
 require dasllama/dasllama_gemm_schema  // kq_qsb/kq_ssb — the fmt-id plane strides
 require dasllama/dasllama_tokenizer  // Model owns its tokenizer; load_model populates it
@@ -90,11 +90,6 @@ enum KVDtype {
     q8_0
     tq4
 }
-
-// tq4 cache-pointer dispatch tag: the read seam overloads on the cache pointer's element type, and
-// q8_0 already owns `uint8 const?` — a distinct newtype over uint8 gives tq4 its own overload
-// identity at zero runtime cost (byte-strided arithmetic, ABI identical to uint8).
-typedef distinct TQ4B = uint8
 
 //! Model hyperparameters (the 7-int checkpoint header plus derived sizes).
 struct Config {
@@ -1257,12 +1252,12 @@ def apply_box_profile_runtime(path : string = "") {
         select_batch_backend(bbe)
         to_log(LOG_INFO, "dasLLAMA: box profile runtime: batch_backend = {active_batch_backend()} (profile pin '{bbe}')\n")
     }
-    // "threads" is advisory — the worker count is fixed at jobque creation, controlled by the
-    // DAS_JOBQUE_THREADS env (see tune_for_this_box.md); a profile can only recommend it. No live
-    // comparison here: get_dispatch_lanes() throws outside a job queue, and load_model may run there.
+    // "threads" is a receipt, not a knob: total lanes (workers + computing main) at mint time.
+    // The pool sizes itself (cores-1 workers + main); DAS_JOBQUE_THREADS is a manual override
+    // only — never advise setting it. No live compare: get_dispatch_lanes() throws outside a que.
     let adv = read_json_field(rt, "threads", -1l)
     if (adv > 0l) {
-        to_log(LOG_INFO, "dasLLAMA: box profile advises threads = {adv} — ensure DAS_JOBQUE_THREADS={adv}\n")
+        to_log(LOG_INFO, "dasLLAMA: box profile minted at {adv} total lanes\n")
     }
 }
 
@@ -1767,7 +1762,8 @@ var private g_session_uid : uint64
 //! Allocate the run state sized to a model. `kdt`/`vdt` pick the KV-cache codec for THIS session
 //! (no process-global state — sessions with different codecs coexist, models run in parallel).
 //! `alloc_cache = false` skips the flat cache slabs (paged sessions and cache-less scratch).
-def make_run_state(c : Config; kdt : KVDtype = KVDtype.f32; vdt : KVDtype = KVDtype.f32; alloc_cache : bool = true) : Session {
+def make_run_state(c : Config; kdt : KVDtype = KVDtype.f32; vdt : KVDtype = KVDtype.f32; alloc_cache : bool = true) : Session {   // nolint:STYLE038 — a flat sizing run: one buffer per line, all against the same geometry
+    guard_interp_inference("session creation")
     kv_validate_q8(c, kdt, vdt)
     var s : Session
     g_session_uid++
@@ -1791,7 +1787,7 @@ def make_run_state(c : Config; kdt : KVDtype = KVDtype.f32; vdt : KVDtype = KVDt
     // logits carry page-rounded CAPACITY (length stays vocab_size): the Metal drivers wrap this
     // storage in a bytesNoCopy MTLBuffer (zero-copy logits), whose length must be a 16KB-page
     // multiple — the reserve keeps that rounded length inside the array's own allocation
-    s.logits |> reserve(int(((c.vocab_size * 4l + 16383l) & ~16383l) / 4l))
+    s.logits |> reserve(((c.vocab_size * 4l + 16383l) & ~16383l) / 4l)
     s.logits |> resize(c.vocab_size)
     if (c.n_expert > 0l) {   // MoE routing scratch
         s.moe_logits |> resize(c.n_expert)
@@ -1820,8 +1816,8 @@ def make_run_state(c : Config; kdt : KVDtype = KVDtype.f32; vdt : KVDtype = KVDt
     }
     if (c.recr_mask != 0ul) {   // qwen35 deltanet: per-recurrent-layer conv history + S state (zeroed by resize)
         let cd = dn_conv_dim(c)
-        s.dn_conv_prefix |> reserve(int(c.n_layers))
-        s.dn_state_prefix |> reserve(int(c.n_layers))
+        s.dn_conv_prefix |> reserve(c.n_layers)
+        s.dn_state_prefix |> reserve(c.n_layers)
         var co = 0l
         var so = 0l
         for (l in range64(c.n_layers)) {
@@ -1888,8 +1884,8 @@ def make_run_state(c : Config; kdt : KVDtype = KVDtype.f32; vdt : KVDtype = KVDt
     s.kv_dtype_v = vdt
     // + the MTP/NextN draft block's slab (index n_layers) — one attention layer's rows
     let kv_layers = c.n_layers + c.n_layer_nextn
-    s.kv_bprefix_k |> reserve(int(kv_layers))
-    s.kv_bprefix_v |> reserve(int(kv_layers))
+    s.kv_bprefix_k |> reserve(kv_layers)
+    s.kv_bprefix_v |> reserve(kv_layers)
     var krow = 0l
     var vrow = 0l
     for (l in range64(kv_layers)) {
@@ -1938,7 +1934,7 @@ def make_run_state_paged(c : Config; var pool : KVPool) : Session {
         s.kv_pool = addr(pool)
     }
     // paged run scratch: a window can span every page of the (post-cap) context
-    s.kv_runs |> resize(int((c.seq_len + pool.page_rows - 1l) / pool.page_rows + 1l))
+    s.kv_runs |> resize((c.seq_len + pool.page_rows - 1l) / pool.page_rows + 1l)
     return <- s
 }
 
@@ -2104,8 +2100,8 @@ def build_rope_table(@scratch var cos_tab : array<float>; @scratch var sin_tab :
 // (batch rows come from different sequences at unrelated positions). Bit-identical per row to the
 // npos=1 decode table at that position, so rope_batch_tab consumes it unchanged.
 def build_rope_table_rows(@scratch var cos_tab : array<float>; @scratch var sin_tab : array<float>; t : Model;
-                                  theta, fscale : float; positions : array<int64>; nrows, head_size : int64;
-                                  use_ff : bool = true) {
+                          theta, fscale : float; positions : array<int64>; nrows, head_size : int64;
+                          use_ff : bool = true) {
     build_rope_tabs_rows(cos_tab, sin_tab, theta, fscale, t.config.rope_mscale, t.rope_freqs, use_ff,
                          positions, nrows, head_size)
 }
@@ -2262,7 +2258,7 @@ def create_kv_pool_(c : Config; page_rows : int64; kdt, vdt : KVDtype) : KVPool 
     // + the MTP/NextN draft block's slab (index n_layers) — one attention layer's rows, so the
     // self-spec rails work on paged sessions too (pages only allocate when rows are written)
     let kv_layers = c.n_layers + c.n_layer_nextn
-    p.blob_of |> reserve(int(kv_layers))
+    p.blob_of |> reserve(kv_layers)
     for (l in range64(kv_layers)) {
         let src = layer_kv_source(c, l)
         if (src != l) {
@@ -2274,8 +2270,8 @@ def create_kv_pool_(c : Config; page_rows : int64; kdt, vdt : KVDtype) : KVPool 
             p.nblobs ++
         }
     }
-    p.kblobs |> resize(int(p.nblobs))
-    p.vblobs |> resize(int(p.nblobs))
+    p.kblobs |> resize(p.nblobs)
+    p.vblobs |> resize(p.nblobs)
     return <- p
 }
 
@@ -2286,10 +2282,10 @@ def private kv_pool_grow(var p : KVPool) {
     let oldcap = p.capacity_groups
     let newcap = oldcap <= 0l ? 4l : oldcap * 2l
     for (b in range64(p.nblobs)) {
-        p.kblobs[b] |> resize(int(newcap * p.page_rows * p.krow_bytes[b]))
-        p.vblobs[b] |> resize(int(newcap * p.page_rows * p.vrow_bytes[b]))
+        p.kblobs[b] |> resize(newcap * p.page_rows * p.krow_bytes[b])
+        p.vblobs[b] |> resize(newcap * p.page_rows * p.vrow_bytes[b])
     }
-    p.refcnt |> resize(int(newcap))
+    p.refcnt |> resize(newcap)
     var g = int(newcap)
     while (g > int(oldcap)) {   // push high->low so the LOWEST new group pops first
         g --
@@ -2408,109 +2404,6 @@ def kv_load_row(src0 : uint8 const?; dt : KVDtype; kv_dim, row, sub, n : int64; 
         }
     } else {
         panic("KV cache codec not yet implemented")
-    }
-}
-
-// Read-side glue: overload per cache element type, resolved inside the monomorphized workers.
-def private kv_dot(a : float const?; b : float const?; n : int64) : float => dot(a, b, n)
-def kv_axpy(var d : float?; s : float const?; scale : float; n : int64) {
-    axpy(d, s, scale, n)
-}
-def kv_load(p : float const?; base, i : int64) : float => unsafe(p[base + i])
-def private kv_dot(a : float const?; b : uint16 const?; n : int64) : float => dot_f16(a, b, n)
-def kv_axpy(var d : float?; s : uint16 const?; scale : float; n : int64) {
-    axpy_f16(d, s, scale, n)
-}
-def kv_load(p : uint16 const?; base, i : int64) : float => f16_to_f32(uint(unsafe(p[base + i])))
-// q8_0: the cache pointer stays uint8 (byte units — the _d wrappers prescale stride/offset via
-// kv_side_off), so `base` here is a whole-block BYTE offset and `i` an element index within it
-def private kv_dot(a : float const?; b : uint8 const?; n : int64) : float => dot_q8kv(a, b, n)
-def kv_axpy(var d : float?; s : uint8 const?; scale : float; n : int64) {
-    axpy_q8kv(d, s, scale, n)
-}
-def kv_load(p : uint8 const?; base, i : int64) : float {
-    unsafe {
-        let blk = p + base + i / 32l * 34l
-        let b16 = reinterpret<uint16 const?>(blk)   // bind first: reinterpret would swallow the index
-        let bq = reinterpret<int8 const?>(blk)
-        return float(bq[2l + i % 32l]) * f16_to_f32(uint(b16[0]))
-    }
-}
-// tq4: dispatch rides the TQ4B distinct-pointer tag (q8_0 owns the raw uint8 overloads); the
-// kernels themselves are byte-typed, so each arm re-tags back to uint8. Values come out in the
-// ROTATED basis — kv_axpy accumulates rotated and the drivers un-rotate each head's output once.
-def kv_axpy(var d : float?; s : TQ4B const?; scale : float; n : int64) {
-    axpy_tq4kv(d, unsafe(reinterpret<uint8 const?>(s)), scale, n)
-}
-def kv_load(p : TQ4B const?; base, i : int64) : float {
-    unsafe {
-        let blk = reinterpret<uint8 const?>(p) + base + i / 32l * 18l
-        let b16 = reinterpret<uint16 const?>(blk)
-        let by = int(blk[2l + (i % 32l) / 2l])
-        let q = (i & 1l) == 0l ? (by & 15) : (by >> 4)
-        return float(q - 8) * f16_to_f32(uint(b16[0]))
-    }
-}
-// kv_side_off's pointer-typed twin for code that is generic over the cache element type (the
-// flash-decode witness): element offset -> the side's own addressing units
-[unused_argument(p)]
-def kv_head_off(p : float const?; elems : int64) : int64 => elems
-[unused_argument(p)]
-def kv_head_off(p : uint16 const?; elems : int64) : int64 => elems
-[unused_argument(p)]
-def kv_head_off(p : uint8 const?; elems : int64) : int64 => elems / 32l * 34l
-[unused_argument(p)]
-def kv_head_off(p : TQ4B const?; elems : int64) : int64 => elems / 32l * 18l
-
-// Bulk one-row dequant into f32 scratch — the flash pack's per-row primitive (and any future
-// codec's bulk-dequant seam: q8_0 adds a cvt overload here, never a new pack shape).
-def kv_row_to_f32(var d : float?; p : float const?; base, n : int64) {
-    unsafe {
-        copy_floats(d, p + base, n)
-    }
-}
-def kv_row_to_f32(var d : float?; p : uint16 const?; base, n : int64) {
-    unsafe {
-        cvt_f16_to_f32(d, p + base, n)
-    }
-}
-def kv_row_to_f32(var d : float?; p : uint8 const?; base, n : int64) {
-    unsafe {
-        cvt_q8kv_to_f32(d, p + base, n)
-    }
-}
-def kv_row_to_f32(var d : float?; p : TQ4B const?; base, n : int64) {
-    unsafe {
-        cvt_tq4kv_to_f32(d, reinterpret<uint8 const?>(p) + base, n)
-    }
-}
-
-// Decode-read score dot, resolved on the K-cache pointer type: scalar codecs dot the f32 query;
-// q8_0 dots the PRE-QUANTIZED query planes (qq/qs — filled once per token after RoPE) through the
-// int8×int8 kernel. Lets the flash-decode witness recompute scores exactly as the sliced path did.
-[unused_argument(qq, qs)]
-def kv_score(qp : float const?; qq : int8 const?; qs : float const?; kcp : float const?;
-                     koff, qoff, head_size : int64) : float {
-    return kv_dot(unsafe(qp + qoff), unsafe(kcp + koff), head_size)
-}
-[unused_argument(qq, qs)]
-def kv_score(qp : float const?; qq : int8 const?; qs : float const?; kcp : uint16 const?;
-                     koff, qoff, head_size : int64) : float {
-    return kv_dot(unsafe(qp + qoff), unsafe(kcp + koff), head_size)
-}
-[unused_argument(qp)]
-def kv_score(qp : float const?; qq : int8 const?; qs : float const?; kcp : uint8 const?;
-                     koff, qoff, head_size : int64) : float {
-    return dot_q8q8kv(unsafe(qq + qoff), unsafe(qs + qoff / 32l), unsafe(kcp + koff), head_size)
-}
-// tq4 K: same pre-quantized-query planes as q8_0 — the drivers fill them from the ROTATED query,
-// so the int8×int4 dot runs entirely in the rotated basis
-[unused_argument(qp)]
-def kv_score(qp : float const?; qq : int8 const?; qs : float const?; kcp : TQ4B const?;
-                     koff, qoff, head_size : int64) : float {
-    unsafe {
-        let kb = reinterpret<uint8 const?>(kcp)
-        return dot_q8tq4kv(qq + qoff, qs + qoff / 32l, kb + koff, head_size)
     }
 }
 
@@ -2720,7 +2613,7 @@ def kv_slice_av_d(var flop : float?; attp : float const?; vcl : uint8 const?; vd
 // recompute of every head's attention output vs the sliced result in xb. Codec-generic like the
 // workers; test-only and serial, so the extraction costs nothing.
 [cold_path]   // reference-check path, armed by g_flash_decode_check
-def private flash_decode_check_g(qp : float const?; qq : int8 const?; qsp : float const?;
+def private flash_decode_check_g(qp : float const?; qq : int8 const?; qsp : float const?;   // nolint:STYLE038 — one serial exact-recompute pass per head; the phases share every accumulator
                                  kcp, vcp : auto const?; xbv : float const?;
                                  runs : KVRun const?;
                                  nrun, n_heads, kv_mul, head_size, kdim, vdim, kstart, cnt, l, nsl : int64;
@@ -3593,7 +3486,7 @@ def private dequant_embq_row(t : Model; off, n : int64; var dst : float?) {
 // Copy token `token`'s embedding row into dst — from fp32 fblob, or (cls_q8) dequanted from the
 // linear Q8 copy at emb_q8_off (embq when trimmed), or (cls_kq) from the K-quant plane at
 // wcls_off (embq/embs when trimmed). Rows are whole superblocks (a ggml K-quant invariant).
-def embed_row(t : Model; token : int64; var dst : float?) {
+def embed_row(t : Model; token : int64; var dst : float?) {   // nolint:STYLE037,STYLE038 — a KqFmt ladder x trimmed/repacked; arms differ only in the plane pair and its strides
     let dim = t.config.dim
     if (t.cls_q8) {
         if (t.planes_trimmed) {
@@ -3740,7 +3633,7 @@ def private cls_softcap_chain(t : Model; var s : Session; cap : float) {
     let mmrows = mm_q8q8_rows_fn()
     let ngrp = int(vocab / 32l)
     let n0 = chain_stage_chunks(ngrp, int(vocab), dim * vocab)
-    s.chain_stages |> resize(1)   // nolint:PERF026 — session scratch, fixed size after the first classifier call
+    s.chain_stages |> resize(1)
     s.chain_stages[0] = int3(0, ngrp, n0)
     count_parallel_dispatch(min(n0, ngrp))
     unsafe {
@@ -3782,7 +3675,7 @@ def private cls_softcap_chain(t : Model; var s : Session; cap : float) {
 
 //! One forward pass: token at position `pos` -> s.logits. Faithful port of llama2.c forward().
 [no_alloc, no_env, no_io]
-def forward(t : Model; var s : Session; token, pos : int64) {
+def forward(t : Model; var s : Session; token, pos : int64) {   // nolint:STYLE038 — one decode step; the phases share s and must stay in order
     let c = t.config
     let dim = c.dim
     kv_ensure(s, pos + 1l)   // paged sessions: grow the block table BEFORE any cache-pointer hoist
@@ -4456,6 +4349,27 @@ def chat_content() : ChatPart {
     return ChatPart(kind = ChatPartKind.content, s = "")
 }
 
+//! Install the ChatML turn set (``<|im_start|>``/``<|im_end|>``) the whole qwen family shares,
+//! empty-think suppress included — every ``<|im_start|>`` GGUF maps here, thinking fine-tunes
+//! too; the suppress renders only when the vocab carries the think specials.
+def chatml_chat(var ct : ChatTemplate) {
+    ct.system.parts <- [chat_special("<|im_start|>"), chat_text("system\n"), chat_content(), chat_special("<|im_end|>"), chat_text("\n")]
+    ct.user.parts <- [chat_special("<|im_start|>"), chat_text("user\n"), chat_content(), chat_special("<|im_end|>"), chat_text("\n")]
+    ct.assistant_open.parts <- [chat_special("<|im_start|>"), chat_text("assistant\n")]
+    ct.think_suppress.parts <- [chat_special("<think>"), chat_text("\n\n"), chat_special("</think>"), chat_text("\n\n")]
+    ct.stop <- ["<|im_end|>", "<|endoftext|>"]
+}
+
+//! Install the Gemma turn set (``<start_of_turn>``/``<end_of_turn>``, BOS at conversation start,
+//! no system role — the chat layer folds it into the first user turn; pair with
+//! ``lcaps.system_prompt = false``). gemma4's channel-based format diverges and stays in its file.
+def gemma_chat(var ct : ChatTemplate) {
+    ct.add_bos = true   // BOS = <bos>
+    ct.user.parts <- [chat_special("<start_of_turn>"), chat_text("user\n"), chat_content(), chat_special("<end_of_turn>"), chat_text("\n")]
+    ct.assistant_open.parts <- [chat_special("<start_of_turn>"), chat_text("model\n")]
+    ct.stop <- ["<end_of_turn>", "<eos>"]
+}
+
 //! Install the Hermes-style tool-calling format (the Qwen2.5/Qwen3 chat template's tool block):
 //! ``<tools>`` JSON definitions in the system turn, ``<tool_call>`` JSON calls in assistant
 //! output, ``<tool_response>`` results riding user turns.
@@ -4468,9 +4382,9 @@ def hermes_tools(var ct : ChatTemplate) {
     ct.tool_resp_close = "</tool_response>"
 }
 
-// ===== std/dense block kernels (prefill, batched) =====
-// Batched counterparts to attention_std_decode / ffn_dense_decode; bit-for-bit identical to
-// calling forward() per position in sequence. Q4 has no batched kernel, falls back to per-token.
+// ===== forward drivers (prefill, batched) =====
+// The prefill/batch entry points and the shared QKV+RoPE prefix; the block kernels themselves
+// live in dasllama_blocks. Bit-for-bit identical to calling forward() per position in sequence.
 
 // attn-norm → batched QKV(+bias) → qk/v-norm → RoPE, for npos rows of x_b into q_b/k_b/v_b — the
 // position-free head of the std attention block, shared by prefill and (later) batched decode.
@@ -4605,7 +4519,7 @@ def forward_prefill(t : Model; var s : Session; tokens : array<int64>; npos, sta
     if (has_ple(c)) {  // gemma-4 E-series: build each position's per-(layer) side input before the stack
         let ts_ple = ref_time_ticks()
         if (g_ple_gpu_gate_set && invoke(g_ple_gpu_gate, t, s, npos, start_pos)) {
-            s.ple_gpu_tokens |> resize(int(npos))
+            s.ple_gpu_tokens |> resize(npos)
             for (p in range64(npos)) {
                 s.ple_gpu_tokens[p] = tokens[p]
             }

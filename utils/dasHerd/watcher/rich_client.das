@@ -235,8 +235,14 @@ let private RETIRE_ROW_COMMITS = 2
 def private checklist_row(row : int; passing : bool; caption : string) {
     //! One fact, its pass/fail glyph, and what it means. Never a bare colour:
     //! the sentence has to carry the meaning on its own.
-    icon_tinted(passing ? "check" : "warning", GetTextLineHeight(),
-        passing ? token_added_color() : token_warning_color())
+    checklist_glyph_row(row, passing ? "check" : "warning",
+        passing ? token_added_color() : token_warning_color(), caption)
+}
+
+def private checklist_glyph_row(row : int; glyph : string; tint : float4;
+                                caption : string) {
+    // the third state: "help" carries a fact that could not be measured
+    icon_tinted(glyph, GetTextLineHeight(), tint)
     same_line(WORKTREE_RETIRE_ROW_JOIN[row])
     text(WORKTREE_RETIRE_ROW_TEXT[row], (text = caption))
 }
@@ -331,7 +337,7 @@ def private draw_retire_operation(operation : WorktreeOperation const) {
 // facts are re-read live every frame instead of captured at open time, so it
 // can never describe a state the repository has already left — a WIP commit
 // made from inside this dialog flips its own verdict.
-def private draw_worktree_retire_popup() {
+def private draw_worktree_retire_popup() { // nolint:STYLE038
     if (g_worktree_retire.active) {
         g_worktree_retire.active = false
         // A tick left over from the last worktree must never pre-arm a
@@ -340,7 +346,7 @@ def private draw_worktree_retire_popup() {
         open_popup(WORKTREE_RETIRE_DIALOG)
     }
     popup_modal(WORKTREE_RETIRE_DIALOG.PUBLIC, (text = "Retire worktree",
-            closable = true, flags = ImGuiWindowFlags.AlwaysAutoResize)) {
+            closable = true, flags = ImGuiWindowFlags.AlwaysAutoResize)) { // nolint:STYLE037
         let path = g_worktree_retire.worktree_path
         let repository_id = g_worktree_retire.repository_id
         text(WORKTREE_RETIRE_PATH, (text = path))
@@ -427,8 +433,10 @@ def private draw_worktree_retire_popup() {
         // The unpushed line is about REDUNDANCY, not risk: removing a worktree
         // cannot lose a commit, the branch keeps every one of them.
         if (!worktree.unmerged_known) {
-            checklist_row(RETIRE_ROW_COMMITS, true,
-                "Commits: no base ref to compare against — count unknown.")
+            checklist_glyph_row(RETIRE_ROW_COMMITS, "help",
+                token_warning_color(),
+                "Commits vs base: unknown — no base ref resolved, so " +
+                "redundancy cannot be confirmed. The branch keeps its commits.")
         } elif (worktree.unmerged_commits == 0) {
             checklist_row(RETIRE_ROW_COMMITS, true,
                 "Nothing here that {worktree.unmerged_base_ref} does not have.")
@@ -606,7 +614,7 @@ def private register_commands() {
         CommandBinding(), @@() { imgui_terminal_clear_selection(g_terminal_view); })
 }
 
-def draw_main_menu() {
+def draw_main_menu() { // nolint:STYLE038
     main_menu_bar(MAIN_MENU) {
         menu(FILE_MENU, (text = "File", enabled = true)) {
             if (menu_label(FILE_EXIT, (text = "Exit", shortcut = "Alt+F4"))) {
@@ -783,12 +791,19 @@ def init() {
 }
 
 [export]
-def update() {
+def update() { // nolint:STYLE037
     // The native frame gate returns false while the window is minimized.
     // Keep the transport alive outside that gate so heartbeats, controller
     // renewal, and queued PTY output continue until the window is restored.
     if (g_client != null) g_client->pump()
     if (g_client != null) {
+        // Every refreshed status list re-scopes the Changelist selection: a row
+        // that left the list drops out, so a file that comes back to that group
+        // cannot arrive pre-selected and ride a stage or discard batch.
+        if (g_client.repository_message_count != g_changelist_pruned_revision) {
+            g_changelist_pruned_revision = g_client.repository_message_count
+            prune_changelist_selection(g_client.repositories)
+        }
         // Error ring (note 28): capture every transition to a new error text.
         if (g_client.error != g_last_seen_error) {
             g_last_seen_error = g_client.error

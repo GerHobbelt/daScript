@@ -24,10 +24,10 @@ struct RunArgs {
     full : bool
 
     @clarg_short = "s"
-    @clarg_doc = "Suite: decode | prefill | matrix | kernels | image | coverage | all (default all)"
+    @clarg_doc = "Suite: decode | prefill | matrix | kernels | image | image-vulkan | coverage | all (default all; all excludes image-vulkan)"
     suite : string = "all"
 
-    @clarg_doc = "Family filter — comma-separated family tokens (llama, qwen2, qwen3, phi3, gemma, ultravox, whisper, voxtral); only blocks of these model families run (model-free blocks always run); sets DASLLAMA_TEST_FAMILY"
+    @clarg_doc = "Family filter — comma-separated family tokens (the full list lives in tests/CLAUDE.md, EXACT match); only blocks of these model families run (model-free blocks always run); sets DASLLAMA_TEST_FAMILY"
     family : string
 
     @clarg_short = "n"
@@ -51,7 +51,8 @@ def private suite_files(name : string) : array<string> {
     } elif (name == "matrix") {
         return <- [ "modules/dasLLAMA/tests/test_metal_support_matrix.das" ]
     } elif (name == "kernels") {
-        return <- [ "modules/dasLLAMA/tests/test_metal_prefill_kernels.das" ]
+        return <- [ "modules/dasLLAMA/tests/test_metal_prefill_kernels.das",
+                    "modules/dasLLAMA/tests/test_metal_decode_kernels.das" ]
     } elif (name == "image") {
         return <- [ "modules/dasLLAMA/tests/test_model_image.das" ]
     } elif (name == "image-vulkan") {
@@ -63,6 +64,7 @@ def private suite_files(name : string) : array<string> {
                     "modules/dasLLAMA/tests/test_metal_prefill_parity.das",
                     "modules/dasLLAMA/tests/test_metal_support_matrix.das",
                     "modules/dasLLAMA/tests/test_metal_prefill_kernels.das",
+                    "modules/dasLLAMA/tests/test_metal_decode_kernels.das",
                     "modules/dasLLAMA/tests/test_model_image.das" ]
     }
     var none : array<string>
@@ -188,7 +190,7 @@ def main() : int {
             var rc = 0
             unsafe {
                 rc = popen(cmd) $(f) {
-                    let _drain = fread_to_eof(f)   // output is redirected; drain keeps the pipe contract
+                    let _drain = fread(f)   // output is redirected; drain keeps the pipe contract
                 }
             }
             let secs = double(get_time_usec(t0)) / 1000000.0lf

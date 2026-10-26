@@ -21,7 +21,7 @@ require dasllama/dasllama_par
 require dasllama/dasllama_gpu_tier
 require llvm/daslib/f16_cvt
 require daslib/json_boost
-require daslib/array_boost   // nolint:STYLE030 — temp_array is [template]; STYLE030 misses template-fn refs
+require daslib/array_boost
 require dasllama/dasllama_tokenizer   // load_tokenizer_auto — load_model_ populates the Model's tokenizer
 require daslib/fio
 require strings
@@ -114,7 +114,7 @@ var private g_blob_hooks_set = false
 // Fill both offset tables from the config; return the element counts of each region. Offsets are
 // 32-aligned (every dim/kv/hidden is a multiple of 32), so Q8/Q4 scale/byte indices divide cleanly.
 // Attention tensors get PER-LAYER offsets (shapes differ per layer class on gemma4).
-def private layout_offsets(var t : Model) : LayoutSizes {
+def private layout_offsets(var t : Model) : LayoutSizes {   // nolint:STYLE037,STYLE038 — one linear offset walk; every region's offset depends on the running cursor
     let c = t.config
     let dim = c.dim
     let hidden = c.hidden_dim
@@ -662,6 +662,7 @@ def private stream_job_qoff(t : Model; j : FillJob) : int64 {
 //! Total bytes the streamed fill will append for `field` (page padding NOT included) — the
 //! LAYOUT size when the sizing pass recorded one (holes included), else the job sum.
 def stream_plane_bytes(t : Model; jobs : array<FillJob>; field : string) : int64 {
+    if (empty(jobs)) return 0l   // no plan: the save must degrade to the eager walk EXACTLY (its contract)
     let lt = g_stream_plane_total?[field] ?? 0l
     if (lt > 0l) {
         return lt
@@ -694,7 +695,7 @@ def private stream_zero_fill(gap : int64; var zeros : array<uint8>;
 //! Execute every recorded job targeting `field`: transcode into a job-sized temp (load_big's
 //! own arms at temp offset 0), land scales in the RAM plane, apply the job's repack regions
 //! (temp-biased q, in-place s), hand the temp to `append`; qblob's tail runs the wscale epilogue.
-def fill_stream_plane(m : GGUFMeta; bytes : array<uint8> | #; var t : Model; field : string;
+def fill_stream_plane(m : GGUFMeta; bytes : array<uint8> | #; var t : Model; field : string;   // nolint:STYLE037,STYLE038 — per-format transcode arms sharing one temp buffer and the append block
                       jobs : array<FillJob>; regs : array<StreamReg>;
                       append : block<(p : void?; nbytes : uint64) : void>) : bool {
     // jobs for this field, ascending woff — plane order IS ascending source order
@@ -842,12 +843,15 @@ def private blob_pack_job(q : array<int8>; s : array<float>; nblk : int64;
 def fill_plan_begin {
     g_fill_plan_mode = true
     g_fill_plan |> clear()
+    // plane totals are THIS plan's sizing — a load that disarms must not save under the previous one's
+    g_stream_plane_total |> clear()
 }
 
 //! Disarm and move the recorded plan out (empty = nothing recorded).
 def fill_plan_take(var out : array<FillJob>) {
     g_fill_plan_mode = false
-    out <- g_fill_plan
+    delete out   // a take replaces whatever the caller brought, so release it rather than drop it
+    out <- g_fill_plan   // nolint:PERF030 — released on the line above; the rule has no delete tracking
 }
 
 // ONE source for the (fmt, disk type) -> kq transcode decision. load_big and fill_stream_plane
@@ -1043,7 +1047,7 @@ def private kq_fmt_of(gt : int) : KqFmt {
 // Fill the per-kind weight format tags from the file's tensor types (q8-mode loads with the
 // kquant_native knob on). Fused-projection arches (Phi3) split attn_qkv/ffn_up at row-aligned
 // slice offsets, so every slice stays superblock-aligned; one disk tensor = one tag for its slices.
-def private detect_kq_formats(var t : Model; m : GGUFMeta) {
+def private detect_kq_formats(var t : Model; m : GGUFMeta) {   // nolint:STYLE038 — a flat tag-assignment run: one weight kind per line
     if (t.quant != QuantMode.q8 || !get_kquant_native()
             || (t.config.fused_qkv && t.config.dim % 256l != 0l)) {   // fused slice offsets are dim-multiples
         return
@@ -1166,9 +1170,9 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
 }
 
 //! Streaming-conversion entry: plan-load `t`, then invoke `blk(m, bytes)` with the source
-//! mapping STILL ALIVE — the caller streams the save inside. Fails open (unstreamable models
-//! materialize + save eagerly through the same blk); split shards return false pre-blk.
-def load_gguf_streaming(path : string; mode : QuantMode; var t : Model; var jobs : array<FillJob>;
+//! mapping(s) STILL ALIVE — split shards included, every shard stays mapped; the caller streams
+//! the save inside. Fails open: unstreamable models materialize + save eagerly through the same blk.
+def load_gguf_streaming(path : string; mode : QuantMode; var t : Model; var jobs : array<FillJob>;   // nolint:STYLE038 — one linear plan-then-stream sequence under a live mapping
                         want_blob : bool = false;
                         blk : block<(m : GGUFMeta; bytes : array<uint8>) : bool>) : bool {
     if (!is_job_que_available()) {
@@ -1230,7 +1234,7 @@ def load_gguf_streaming(path : string; mode : QuantMode; var t : Model; var jobs
     if (f == null) {
         return false
     }
-    var ok = false   // nolint:LINT003 — written inside the fmap block
+    var ok = false
     let lmode = mode
     fmap(f) $(var bytes : array<uint8>#) {
         if (env_flag("DASLLAMA_PREFETCH", true)) {
@@ -1316,7 +1320,7 @@ def private load_gguf_impl(path : string; var mode : QuantMode) : Model {
 
 // The load once metadata is parsed and the byte view carrying the KVs (shard 0 for splits) is
 // mapped — config, vocab, plane sizing, tensor reads/transcodes, repack, wscale.
-def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> | #; var mode : QuantMode; ts_load : int64) {
+def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> | #; var mode : QuantMode; ts_load : int64) {   // nolint:STYLE037,STYLE038 — the load pipeline: ordered phases over one shared cursor; splitting it needs its own pass
     var ts_stage = ref_time_ticks()
     {
         let arch = gguf_str(m, bytes, "general.architecture")
@@ -2255,4 +2259,23 @@ def load_model_(path : string; mode : QuantMode = QuantMode.fp32) : Model {
     var m <- load_gguf(path, mode)
     m.tok <- load_tokenizer_auto(path)
     return <- m
+}
+
+// Function values do not survive the -exe bake's global serialization (the
+// dasllama_config restore names the defect) — every @@-defaulted seam in this
+// module boot-restores here; a real registrar wins via the null guards.
+[init]
+def private restore_load_fn_defaults {
+    if (g_stream_collect_q8 == null) {
+        g_stream_collect_q8 = @@stream_no_collect
+    }
+    if (g_stream_collect_kq == null) {
+        g_stream_collect_kq = @@stream_no_collect
+    }
+    if (g_stream_collect_q51 == null) {
+        g_stream_collect_q51 = @@stream_no_collect
+    }
+    if (g_stream_repack == null) {
+        g_stream_repack = @@stream_no_repack
+    }
 }

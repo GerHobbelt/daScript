@@ -994,6 +994,7 @@ namespace das
                 bool    isConstClassMethod : 1;      // method is const
                 bool    isCustomProperty : 1;        // this is a user function which looks like a property ("`name")
                 bool    neverInline : 1;             // [never_inline] - excluded from best-effort (auto) inlining; conflicts with [inline]
+                bool    localFunction : 1;           // @@{} local function body - generated, but the block is verbatim user code
             };
             uint32_t moreFlags = 0;
         };
@@ -1247,6 +1248,8 @@ namespace das
         vector<unique_ptr<PassMacro>>               macros;             // infer macros (clean infer, assume no errors)
         vector<unique_ptr<PassMacro>>               inferMacros;        // infer macros (dirty infer, assume half-way-there tree)
         vector<unique_ptr<PassMacro>>               optimizationMacros; // optimization macros
+        vector<unique_ptr<PassMacro>>               preInferMacros;     // run before (re-)inference, on a possibly dirty tree
+        vector<unique_ptr<PassMacro>>               preSimulateMacros;  // run after inference, before codegen
         vector<unique_ptr<PassMacro>>               lintMacros;         // lint macros (assume read-only)
         vector<unique_ptr<PassMacro>>               globalLintMacros;   // lint macros which work everywhere
         vector<unique_ptr<VariantMacro>>            variantMacros;      //  X is Y, X as Y expression handler
@@ -1570,7 +1573,7 @@ namespace das
     // language
         /*option*/ bool unsafe_table_lookup = false;                // table lookup (tab[key]) to be unsafe
         /*option*/ bool relaxed_pointer_const = false;             // allow const correctness to be relaxed on pointers
-        bool version_2_syntax = false;                  // use syntax version 2
+        bool version_2_syntax = true;                   // use syntax version 2 (per-file `options gen2 = false` still opts out)
         bool gen2_make_syntax = false;                  // only new make syntax is allowed (no [[...]] or [{...}])
         /*option*/ bool relaxed_assign = true;                     // allow = to <- substitution, in certain expressions
         bool no_unsafe = false;
@@ -1598,6 +1601,7 @@ namespace das
         /*option*/ bool report_invisible_functions = true;         // report invisible functions (report functions not visible from current module)
         /*option*/ bool report_private_functions = true;           // report private functions (report functions which are not accessible due to private module)
         /*option*/ bool no_unsafe_uninitialized_structures = true; // if true, then unsafe uninitialized structures are not allowed
+        /*option*/ bool default_init_containers = true;            // if true, containers construct their elements (resize inits new slots, table index inits fresh slots)
         /*option*/ bool strict_properties = false;                 // if true, then properties are strict, i.e. a.prop = b does not get promoted to a.prop := b
         /*option*/ bool no_writing_to_nameless = true;             // if true, then writing to nameless variables (intermediate on the stack) is not allowed
     // environment
@@ -1758,6 +1762,9 @@ namespace das
         bool simulate ( Context & context, TextWriter & logs, StackAllocator * sharedStack = nullptr );
         uint64_t getInitSemanticHashWithDep( uint64_t initHash );
         void error ( const string & str, const string & extra, const string & fixme, const LineInfo & at, CompilationError cerr = CompilationError::unspecified );
+        // for malformed-AST reports on a tree that gets repaired in place: survives the per-pass
+        // errors.clear() in infer (re-armed at the end of every infer leg), so the compile still fails
+        void stickyError ( const string & str, const string & extra, const string & fixme, const LineInfo & at, CompilationError cerr = CompilationError::unspecified );
         void deduplicateErrors ();
         bool failed() const { return failToCompile || macroException; }
         static ExpressionPtr makeConst ( const LineInfo & at, const TypeDeclPtr & type, vec4f value );
@@ -1816,6 +1823,7 @@ namespace das
         int                         newLambdaIndex = 1;
         int                         inferPassesUsed = 0;   // sum of inferTypesDirty inner-loop pass counts across all inferTypes calls (incl. restartInfer legs) for this module; reset by parseDaScript once per module-compile; used by per-module compile-time log
         vector<Error>               errors;
+        vector<Error>               stickyErrors;
         vector<Error>               aotErrors;
         uint32_t                    globalInitStackSize = 0;
         uint32_t                    globalStringHeapSize = 0;

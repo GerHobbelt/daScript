@@ -1286,14 +1286,14 @@ def public wait_for_key_idle(app : ImguiApp; timeout_sec : float = DEFAULT_FRAME
 }
 
 def public wait_for_mouse_idle(app : ImguiApp; timeout_sec : float = DEFAULT_FRAME_WAIT_SEC) : bool {
-    //! Poll ``imgui_mouse_status`` until ``playing == false`` or timeout; returns true on idle.
-    //! Uses one HTTP request per poll (unlike a ``wait_until`` body that pairs a snapshot
-    //! with a status call), keeping the per-subprocess connection count low on Windows.
+    //! Poll ``imgui_mouse_status`` until ``busy == false`` (both gesture rails: the timeline
+    //! AND the click/drag coroutine ``imgui_click`` rides — ``playing`` alone misses the latter,
+    //! letting a click land mid-keystrokes). One HTTP request per poll, cheap on Windows.
     let start = ref_time_ticks()
     let timeout_usec = int(timeout_sec * 1000000.0f)
     while (get_time_usec(start) < timeout_usec) {
         let r = post_command(app, "imgui_mouse_status", null)
-        if (!(r?["playing"] ?? true)) return true
+        if (!(r?["busy"] ?? (r?["playing"] ?? true))) return true
         sleep(FRAME_POLL_INTERVAL_MS)
     }
     dump_on_timeout(app, "wait_for_mouse_idle")
@@ -1498,16 +1498,16 @@ def public with_imgui_app(feature_path : string;
         return if (f == null)
         if (!wait_until_ready(app, ready_timeout_sec)) {
             unready = true
-            // Tell the host to exit so fread_to_eof returns once it drains, instead
+            // Tell the host to exit so fread returns once it drains, instead
             // of blocking until the test_timeout_sec popen watchdog (the readiness
             // decision was already made at ready_timeout_sec — don't waste the rest).
             post_signal(app, "/shutdown")
-            captured = unsafe(fread_to_eof(f))
+            captured = fread(f)
             return
         }
         invoke(body, app)
         post_signal(app, "/shutdown")
-        captured = unsafe(fread_to_eof(f))
+        captured = fread(f)
     }))
     if (unready) {
         panic("daslang-live not ready after {ready_timeout_sec}s.\nstdout/stderr:\n{captured}")
@@ -1642,7 +1642,7 @@ def public with_recording_app(feature_path : string; // nolint:STYLE038
         return if (f == null)
         if (!wait_until_ready(app, host_ready_timeout_sec())) {
             unready = true
-            captured = unsafe(fread_to_eof(f))
+            captured = fread(f)
             return
         }
         post_command(app, "imgui_mouse_trail",   JV((enabled = true)))
@@ -1671,7 +1671,7 @@ def public with_recording_app(feature_path : string; // nolint:STYLE038
         post_command(app, "imgui_cursor_sprite", JV((enabled = false)))
         post_command(app, "imgui_mouse_trail",   JV((enabled = false)))
         post_signal(app, "/shutdown")
-        captured = unsafe(fread_to_eof(f))
+        captured = fread(f)
     }))
     if (unready) {
         panic("daslang-live not ready after {host_ready_timeout_sec()}s.\nstdout/stderr:\n{captured}")

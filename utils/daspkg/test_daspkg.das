@@ -162,7 +162,7 @@ def test_index_push_target(t : T?) {
 }
 
 [test]
-def test_parse_args(t : T?) {
+def test_parse_args(t : T?) {   // nolint:STYLE038 — a flat case table: one argv shape per `t |> run` block
     t |> run("install command") @(t : T?) {
         var r <- parse_args(type<DaspkgArgs>, ["install", "dasImgui"])
         t |> success(r |> is_ok, "parse succeeds")
@@ -194,13 +194,21 @@ def test_parse_args(t : T?) {
         t |> equal(parsed.command ?? "", "list")
         t |> success(parsed.command_arg |> is_none)
     }
-    t |> run("release with fast tuning") @(t : T?) {
-        var r <- parse_args(type<DaspkgArgs>, ["release", "--out", "E:/", "--tune-fast"])
+    t |> run("release with paranoid tuning") @(t : T?) {
+        var r <- parse_args(type<DaspkgArgs>, ["release", "--out", "E:/", "--paranoid"])
         t |> success(r |> is_ok, "parse succeeds")
         let parsed <- r |> move_unwrap
         t |> equal(parsed.command ?? "", "release")
         t |> equal(parsed.out, "E:/")
-        t |> success(parsed.tune_fast)
+        t |> success(parsed.paranoid)
+    }
+    t |> run("release with quick inherit") @(t : T?) {
+        var r <- parse_args(type<DaspkgArgs>, ["release", "--quick"])
+        t |> success(r |> is_ok, "parse succeeds")
+        let parsed <- r |> move_unwrap
+        t |> equal(parsed.command ?? "", "release")
+        t |> success(parsed.quick)
+        t |> success(!parsed.paranoid)
     }
     t |> run("no command") @(t : T?) {
         let empty_args : array<string>
@@ -1791,6 +1799,47 @@ def test_cmd_release_pure_daslang(t : T?) {
         tt |> success(find(manifest, "config.toml") < 0,
             "user-owned starter config is omitted from release manifest")
 
+        force_rmdir(tmp_root)
+        force_rmdir(out_dir)
+    }
+}
+
+[test]
+def test_cmd_release_ships_minted_scope_manifest(t : T?) {
+    t |> run("a tune scope's RESOLVED manifest ships beside the exe") @(tt : T?) {
+        let tmp_root = "{get_das_root()}/_test_release_tunescope"
+        let out_dir = "{get_das_root()}/_test_release_tunescope_out"
+        force_rmdir(tmp_root)
+        force_rmdir(out_dir)
+        mkdir(tmp_root)
+        // the scope's tuner is a STUB: a real tuner races candidates (minutes, noise-gated);
+        // the stub copies a canned sidecar into DAS_TUNE_MANIFEST, so the SHIP path — the
+        // exact line the M4 mis-ship broke — tests at unit speed
+        let payload = "\{\"kernels\":\{\"stub_kernel\":\{\"suffix\":\"stub\"\}\},\"provenance\":\{\"mode\":\"stub\"\}\}"
+        fopen("{tmp_root}/stub_payload.json", "wb") $(f) {
+            fwrite(f, payload)
+        }
+        fopen("{tmp_root}/main.das", "wb") $(f) {
+            fwrite(f, "options gen2\nrequire llvm/daslib/llvm_tune\n[tune_scope(name=\"stubscope\", tuner=\"stub_tuner.das\")]\nstruct StubScope \{\n    unused : int\n\}\n[export]\ndef main() \{\n    print(\"hi\\n\")\n\}\n")
+        }
+        fopen("{tmp_root}/stub_tuner.das", "wb") $(f) {
+            fwrite(f, "options gen2\nrequire daslib/fio\n[export]\ndef main() \{\n    fopen(get_env_variable(\"DAS_TUNE_MANIFEST\"), \"wb\") $(mf) \{\n        fwrite(mf, fread(\"{tmp_root}/stub_payload.json\"))\n    \}\n\}\n")
+        }
+        fopen("{tmp_root}/.das_package", "wb") $(f) {
+            fwrite(f, "options gen2\nrequire daslib/daspkg\n[export]\ndef package() \{\n    package_name(\"tunestub\")\n\}\n[export]\ndef release() \{\n    release_main(\"main.das\")\n\}\n")
+        }
+        let rc = cmd_release(tmp_root, out_dir)
+        tt |> equal(0, rc, "cmd_release returns 0")
+        // the mint ran: the stub wrote the resolved manifest beside main.das
+        let src_manifest = "{tmp_root}/main.tune.json"
+        tt |> success(fexist(src_manifest), "the scope's manifest was minted at {src_manifest}")
+        // the ship: <bundle>/<name>.tune.json is that SAME manifest, byte-for-byte — shipping
+        // a next-to-root guess instead put a stale July sidecar beside a fresh M4 exe once
+        let bundle_dir = dir_name(bundle_exe_path(out_dir, "tunestub"))
+        let shipped = path_join(bundle_dir, "tunestub.tune.json")
+        tt |> success(fexist(shipped), "the bundle ships a tune sidecar at {shipped}")
+        tt |> equal(fread(src_manifest), fread(shipped), "shipped sidecar == the resolved manifest")
+        tt |> success(find(fread(shipped), "stub_kernel") >= 0, "the shipped winners are the stub mint's")
         force_rmdir(tmp_root)
         force_rmdir(out_dir)
     }

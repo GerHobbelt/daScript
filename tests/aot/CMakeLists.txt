@@ -286,6 +286,7 @@ SET(AOT_DASLIB_FILES
     tests/daslib/test_toml.das
     tests/daslib/test_logger.das
     tests/daslib/tty_test.das
+    tests/daslib/test_sha_256.das
 )
 
 FILE(GLOB AOT_MCP_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/mcp/*.das")
@@ -353,6 +354,7 @@ SET(AOT_LANGUAGE_MODULE_FILES
     tests/language/_distinct_fixture.das
     tests/language/_glob.das
     tests/language/_helper_foo.das
+    tests/language/_inline_constant_expression_helper.das
     tests/language/_inline_generic_helper.das
     tests/language/_inline_scope_helper.das
     tests/language/_inline_unsafe_helper.das

@@ -133,7 +133,7 @@ class WatcherRichClient : HvWebSocketClient {
         }
     }
 
-    def override onMessage(message : string#) {
+    def override onMessage(message : string#) { // nolint:STYLE037
         message_count++
         var envelope : WatcherEnvelope
         let body = string(message)
@@ -942,9 +942,12 @@ class WatcherRichClient : HvWebSocketClient {
         sent_rows = desired_rows
     }
 
-    def terminate_selected() {
-        if (!connected || empty(selected_id)) return
-        send("\{\"op\":\"terminate\",\"session_id\":{sprint_json(selected_id, false)}\}")
+    def terminate_session(session_id : string) {
+        //! Always by id. The selection moves on its own — the network re-points
+        //! it on every launch and relaunch — so "terminate the selected one" is
+        //! never what a user who named a session meant.
+        if (!connected || empty(session_id)) return
+        send("\{\"op\":\"terminate\",\"session_id\":{sprint_json(session_id, false)}\}")
     }
 
     def refresh() {

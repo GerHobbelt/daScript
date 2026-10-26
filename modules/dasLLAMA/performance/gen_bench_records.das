@@ -4,6 +4,7 @@ options _cyclomatic_complexity = 0   // orchestrator passes; reshaped by the sin
 options _function_length = 0   // same
 
 require profile_common
+require dasllama/dasllama_env   // env_flag — the ALLOW_UNTUNED store escape
 require dasllama/dasllama_image   // dlim_clean + dlim_inventory — step-zero GC and the re-mint tripwire
 require llvm/daslib/llvm_tune   // [tune_policy]: the orchestrator never measures — it must never self-tune
 require daslib/clargs
@@ -11,7 +12,7 @@ require daslib/fio
 require math
 
 // The official record driver — ONE rig for every workload: loops the catalogs x pair legs, runs
-// the das side as a CHILD per cell (lcpp_bench for LLM, asr_bench_cell for audio; one model
+// the das side as a CHILD per cell (the ONE released lcpp_bench exe, --asr for audio; one model
 // process at a time), and upserts the --json-path records into the per-box store — written after
 // EVERY cell, so a crash never costs a measured cell. Each board ratio is one das cell + its
 // matched ref run ADJACENT:
@@ -19,7 +20,7 @@ require math
 //   neon  : das cpu              vs clean-cpu -ngl 0       ("cpu", kernel vs kernel)
 //   amx   : das cpu --accel      vs stock -ngl 0 -nopo 1   ("cpu + accel" — -nopo keeps lcpp's
 //           Metal op-offload from serving 'CPU' rows on the GPU; nopo == nometal-build)
-//   asr   : das cpu (asr_bench_cell) vs each catalog reference tool, per clip
+//   asr   : das cpu (lcpp_bench --asr) vs each catalog reference tool, per clip
 //   bin/daslang modules/dasLLAMA/performance/gen_bench_records.das -- [-o substr] [--workload llm|asr|all]
 // --oracle inverts the rig into a regression tripwire: the stored das LLM rows re-measure once
 // each (frozen artifacts, no refs, store never written) and gate against their stored means.
@@ -41,6 +42,10 @@ struct Args {
     @clarg_doc = "Seconds to idle between passes (default: 12) — a dead child's 10-20GB map reclaims ASYNC after exit, and short cells bench right into that churn (12B pp ±33 at 0s settle, ±3 at 12s)"
     settle : int = 12
 
+    @clarg_name = "das-settle"
+    @clarg_doc = "Seconds to idle before each das cell (default: 180) — das tuned kernels run near the package power ceiling, and a heat-soaked box under-reads them with a CLEAN cv (gpt-oss tuned pp512 read −13.6% mid-board, 180s of idle restored it; llama.cpp refs were insensitive all along). The cv retry cannot catch a stable-low cell; only cool-slot entry can"
+    das_settle : int = 180
+
     @clarg_name = "ref-clean"
     @clarg_doc = "clean-cpu llama-bench binary (default: env LLAMA_BENCH_CLEAN)"
     ref_clean : string
@@ -48,6 +53,10 @@ struct Args {
     @clarg_name = "ref-stock"
     @clarg_doc = "stock llama-bench binary (default: env LLAMA_BENCH_STOCK)"
     ref_stock : string
+
+    @clarg_name = "ref-no-affinity"
+    @clarg_doc = "Drop --cpu-mask/--cpu-strict from reference invocations (zen2 3990X: driver-spawned pinned refs read ~18% low; solo runs show pins are worth nothing there anyway)"
+    ref_no_affinity : bool
 
     @clarg_short = "t"
     @clarg_doc = "Worker threads (default: the box profile)"
@@ -64,6 +73,10 @@ struct Args {
     @clarg_short = "r"
     @clarg_doc = "Timed repetitions per row (default: 5)"
     reps : int = 5
+
+    @clarg_name = "asr-tier"
+    @clarg_doc = "ASR model tier: small | large | all (default all). Declared per catalog entry, not derived from bytes — ASR cost is clip-duration x model-speed, and large-v3-turbo is SMALLER on disk than Parakeet yet 2.5x costlier"
+    asr_tier : string = "all"
 
     @clarg_short = "w"
     @clarg_doc = "Workloads to measure: llm | asr | all (default: all — absent models/tools skip with a warning)"
@@ -85,8 +98,12 @@ struct Args {
     @clarg_doc = "Oracle: FAIL when a cell lands this far below its stored mean, percent (default: 5)"
     oracle_fail : float = 5.0
 
-    @clarg_doc = "Oracle: seconds to idle before the automatic solo re-run of a FAILED cell, whose verdict then stands (default: 60; 0 disables) — board-tail cells under-read on a hot chip (−6.5%..−34% observed), a solo re-run after settle reads true"
-    oracle_retry_settle : int = 60
+    @clarg_doc = "Oracle: seconds to idle before the automatic solo re-run of a FAILED cell, whose verdict then stands (default: 180; 0 disables) — board-tail cells under-read on a hot chip (−6.5%..−34% observed; thermal recovery takes ~3 min), a solo re-run after settle reads true"
+    oracle_retry_settle : int = 180
+
+    @clarg_name = "oracle-allow-crossgen"
+    @clarg_doc = "Oracle: compare across sidecar generations anyway (default: a tune_sha mismatch is INCOMPARABLE — the stored mean belongs to different winners — and fails the run)"
+    oracle_allow_crossgen : bool
 
     @clarg_short = "?"
     @clarg_doc = "Show this help and exit"
@@ -128,9 +145,9 @@ def private rig_exe_path() : string {
     if (is_apple_box()) {
         return "{RIG_EXE_OUT}/dasllama-bench.app/Contents/MacOS/dasllama-bench"
     }
-    // .exe is required because this path is STAT'd — CreateProcess appends it when spawning, stat does not
-    let ext = get_platform_name() == "windows" ? ".exe" : ""
-    return "{RIG_EXE_OUT}/dasllama-bench/dasllama-bench{ext}"
+    // daslang -exe appends `.exe` on EVERY platform (daspkg bundle_exe_path) — and this path is
+    // STAT'd, so it must be spelled out (zen4 bringup: the bare-Linux name never existed)
+    return "{RIG_EXE_OUT}/dasllama-bench/dasllama-bench.exe"
 }
 
 def private rig_build_line() : string {
@@ -216,10 +233,46 @@ def private elapsed_ms(t0 : int64) : int {
 }
 
 // Stamp source + the catalog note and upsert every run of `cell` into the store, then persist.
-def private absorb_cell(var models : array<BenchModel>; var cell : array<BenchModel>; store, note : string) {
+// the records directory carries each sidecar generation ONCE, by shasum: a row's tune_sha
+// resolves to the FULL doc (winners + race tables + provenance) sitting beside the store
+def private snapshot_tune_generation(exe : string) {
+    let sc = sidecar_for(exe)
+    let sha = sidecar_generation_sha(sc)
+    return if (empty(sha))
+    let dst = "modules/dasLLAMA/performance/records/{box_name()}.tune.{slice(sha, 0, 12)}.json"
+    return if (stat(dst).is_valid)
+    if (fwrite(dst, fread(sc))) {
+        to_log(LOG_INFO, "gen_bench_records: sidecar generation archived -> {dst}\n")
+    }
+}
+
+def private absorb_cell(var models : array<BenchModel>; var cell : array<BenchModel>; store, note : string;
+                        var failed : array<string>&) {
+    let hw = gather_hardware()
     for (c in cell) {
+        var debug_stamped = false
+        var unstamped = false
         for (r in c.runs) {
             r.source = "official"
+            // the driver's probe is the hardware truth — a child exe built before a probe fix
+            // stamps stale/empty identity (zen4 bringup: every das cell read "unknown")
+            r.hardware = hw
+            debug_stamped ||= r.flavor |> starts_with("debug-jit")
+            unstamped ||= das_run_unstamped(r)
+        }
+        if (debug_stamped) {
+            // belt + braces: the rig only spawns the released exe, but a debug-stamped row
+            // must never survive into the store no matter how it arrived
+            to_log(LOG_ERROR, "gen_bench_records: DROPPING debug-jit cell for {c.gguf} — debug runs are not records\n")
+            continue
+        }
+        if (unstamped && !env_flag("DASLLAMA_ALLOW_UNTUNED", false)) {
+            // the store-time arm of the tune gate: the file-level gate passes a VALID-but-stale
+            // shipped sidecar (the M4 mis-ship), the runtime then drops to fallback, and the
+            // row arrives here with an empty stamp — unnameable winners are not records
+            to_log(LOG_ERROR, "gen_bench_records: DROPPING {c.gguf} — a das run carries no tune stamp, the winners it measured under cannot be named (fix the release/manifest; DASLLAMA_ALLOW_UNTUNED=1 stores a dev row)\n")
+            failed |> push("{c.gguf} unstamped")
+            continue
         }
         upsert_bench_model(models, c)
         stamp_note(models, c.gguf, note)
@@ -242,6 +295,13 @@ def private stamp_note(var models : array<BenchModel>; gguf, note : string) {
 def private settle(cfg : Args) {
     if (cfg.settle > 0) {
         sleep(uint(cfg.settle * 1000))
+    }
+}
+
+// cool-slot entry for das cells: thermal recovery, not map-reclaim churn — see --das-settle
+def private settle_das(cfg : Args) {
+    if (cfg.das_settle > 0) {
+        sleep(uint(cfg.das_settle * 1000))
     }
 }
 
@@ -318,7 +378,7 @@ def private das_cell(file, path, be, exe : string; accel : bool; cfg : Args; thr
         return
     }
     mint_check(models_dir(), "{file} das {tag}")
-    absorb_cell(models, cell, store, note)
+    absorb_cell(models, cell, store, note, failed)
     remove(cellPath)
     to_log(LOG_INFO, "gen_bench_records: DONE {file} das {tag} ({elapsed_ms(t0)} ms)\n")
     logger_info("bench.records", "cell done", JV({"model" => JV(file), "engine" => JV("das"), "leg" => JV(tag), "elapsed_ms" => JV(elapsed_ms(t0))}))
@@ -369,6 +429,50 @@ def private oracle_cell(gguf, be, tag, exe : string; accel : bool; stored : Benc
     return verdict
 }
 
+// The ASR twin of oracle_cell: re-measure one stored audio row and gate it against itself. No
+// reference tools run — this is the das side against its own record, like the LLM legs. The ms
+// metrics gate through the same oracle_compare, mirrored (for a duration, worse is HIGHER).
+def private oracle_asr_cell(spec : AsrModelSpec; stored : BenchRun; cfg : Args; threads : int;
+                            cellPath, exe : string; var board : array<string>) : OracleVerdict {
+    let path = asr_model_path(spec)
+    if (!stat(path).is_valid) {
+        let miss = "FAIL {spec.display} das asr — model file missing: {path}"
+        to_log(LOG_ERROR, "gen_bench_records: ORACLE {miss}\n")
+        board |> push(miss)
+        return OracleVerdict.fail
+    }
+    to_log(LOG_INFO, "gen_bench_records: ORACLE START {spec.display} das asr\n")
+    logger_info("bench.records", "oracle asr cell start", JV({"model" => JV(spec.display)}))
+    let args <- [exe, "--", "--asr", "-m", spec.das_model, "-r", "{cfg.asr_reps}", "-t", "{threads}",
+                 "--json-path", cellPath]
+    var out = ""
+    let rc = run_and_stream(args, out)
+    var cell : array<BenchModel>
+    if (rc != 0 || !read_bench_records(cellPath, cell)) {
+        board |> push("FAIL {spec.display} das asr — cell did not measure (rc={rc}, see the log)")
+        return OracleVerdict.fail
+    }
+    remove(cellPath)
+    var verdict = OracleVerdict.fail
+    var detail = "no das run in the fresh cell records"
+    for (c in cell) {
+        for (r in c.runs) {
+            if (r.engine != "das" || empty(r.workload)) {
+                continue
+            }
+            var lines : array<string>
+            verdict = oracle_compare(r, stored, double(cfg.oracle_warn), double(cfg.oracle_fail), lines)
+            detail = join(lines, "; ")
+            delete lines
+        }
+    }
+    let line = "{oracle_verdict_str(verdict)} {spec.display} das asr: {detail}"
+    let level = verdict == OracleVerdict.fail ? LOG_ERROR : (verdict == OracleVerdict.warn ? LOG_WARNING : LOG_INFO)
+    to_log(level, "gen_bench_records: ORACLE {line}\n")
+    board |> push(line)
+    return verdict
+}
+
 // The freeze exists so a cell cannot silently mint a DIFFERENT image and measure a config the
 // stored row never used — but an ABSENT image (GC'd) has no identity to protect, and freezing
 // there just makes the board unrunnable. The load walk mints it (never pre-mint by hand); this
@@ -405,9 +509,39 @@ def private oracle_prepare(gguf, be, tag, exe : string; accel : bool; threads : 
 // The --oracle driver: the work list is the STORE's das LLM rows for this box (the published
 // tables re-verify; coverage gaps fail loudly), each re-measured once and gated one-sided
 // against its stored mean. Pure check — the store is never written.
+// the cross-generation gate: a stored row minted under a DIFFERENT sidecar generation is not
+// comparable — its mean belongs to different winners. Legacy rows (no tune_sha) warn and
+// compare; a mismatch declines as INCOMPARABLE unless --oracle-allow-crossgen forces it.
+def private crossgen_ok(sr : BenchRun; currentSha : string; allow : bool; what : string;
+                        var board : array<string>; var fails : int&; var warns : int&) : bool {
+    if (empty(currentSha)) {
+        return true   // rig exe without a sidecar: the tune gate inside the cell reports it
+    }
+    if (empty(sr.tune_sha)) {
+        board |> push("WARN {what}: legacy row (no sidecar generation recorded) — comparing anyway")
+        warns++
+        return true
+    }
+    if (sr.tune_sha == currentSha) {
+        return true
+    }
+    if (allow) {
+        board |> push("WARN {what}: cross-generation compare FORCED (stored {slice(sr.tune_sha, 0, 12)} vs current {slice(currentSha, 0, 12)})")
+        warns++
+        return true
+    }
+    board |> push("INCOMPARABLE {what}: sidecar generation changed (stored {slice(sr.tune_sha, 0, 12)} vs current {slice(currentSha, 0, 12)}) — re-record the row or --oracle-allow-crossgen")
+    to_log(LOG_ERROR, "gen_bench_records: ORACLE INCOMPARABLE {what} — the stored mean belongs to different winners\n")
+    fails++
+    return false
+}
+
 def private oracle_main(cfg : Args; legNeon, legAmx, legMetal : bool; models : array<BenchModel>;
                         threads : int; cellPath, exe : string) : int {
     let box = box_name()
+    let currentSha = sidecar_generation_sha(sidecar_for(exe))
+    let doAsrOracle = cfg.workload != "llm"
+    let asrTier = parse_tier(cfg.asr_tier)
     var board : array<string>
     var cells = 0
     var warns = 0
@@ -420,7 +554,42 @@ def private oracle_main(cfg : Args; legNeon, legAmx, legMetal : bool; models : a
         }
         for (sr in m.runs) {
             break if (stopped)
-            if (sr.engine != "das" || sr.box != box || !empty(sr.workload)) {
+            if (sr.engine != "das" || sr.box != box) {
+                continue
+            }
+            if (!empty(sr.workload)) {   // audio row: its own cell, its own ms-shaped gate
+                if (!doAsrOracle) {
+                    continue
+                }
+                var spec = AsrModelSpec()
+                var found = false
+                for (s in asr_catalog()) {
+                    if (s.das_model == m.gguf && asr_model_selected(s, asrTier)) {
+                        spec := s
+                        found = true
+                    }
+                }
+                if (!found) {
+                    continue
+                }
+                cells++
+                if (!crossgen_ok(sr, currentSha, cfg.oracle_allow_crossgen, "{m.gguf} das asr", board, fails, warns)) {
+                    continue
+                }
+                settle(cfg)
+                let va = oracle_asr_cell(spec, sr, cfg, threads, cellPath, exe, board)
+                if (va == OracleVerdict.fail) {
+                    fails++
+                    if (!cfg.oracle_keep_going) {
+                        to_log(LOG_ERROR, "gen_bench_records: ORACLE stopping at the first FAIL (--oracle-keep-going runs the full board)\n")
+                        stopped = true
+                    }
+                } elif (va == OracleVerdict.warn) {
+                    warns++
+                }
+                continue
+            }
+            if (cfg.workload == "asr") {   // -w asr narrows the oracle exactly like the publishing rig
                 continue
             }
             var be = ""
@@ -448,6 +617,9 @@ def private oracle_main(cfg : Args; legNeon, legAmx, legMetal : bool; models : a
                 continue
             }
             cells++
+            if (!crossgen_ok(sr, currentSha, cfg.oracle_allow_crossgen, "{m.gguf} das {tag}", board, fails, warns)) {
+                continue
+            }
             oracle_prepare(m.gguf, be, tag, exe, accel, threads, cellPath)
             settle(cfg)
             var v = oracle_cell(m.gguf, be, tag, exe, accel, sr, cfg, threads, cellPath, board)
@@ -498,7 +670,7 @@ def private ref_pass(file, path, bin, flavor : string; ngl : int; nopo : bool; c
         args |> push_from(["-nopo", "1"])
     }
     args |> push_from(["-t", "{threads}"])
-    if (ngl == 0) {
+    if (ngl == 0 && !cfg.ref_no_affinity) {
         args |> push_from(lcpp_affinity_argv(threads))
     }
     args |> push_from(["-p", "{cfg.plen}", "-n", "{cfg.ngen}", "-r", "{cfg.reps}", "-o", "json"])
@@ -510,7 +682,12 @@ def private ref_pass(file, path, bin, flavor : string; ngl : int; nopo : bool; c
     if (!run_llama_bench(args, rows, raw) || empty(rows)) {
         // the tail is the whole diagnosis: a ref cell that dies has no other voice
         let tail = slice(raw, max(0, length(raw) - 400))
-        to_log(LOG_ERROR, "gen_bench_records: FAILED {file} ref {flavor} {backend} ({elapsed_ms(t0)} ms) — cmd: {cmd}\n  tail: {tail}\n")
+        // name WHY, not just the last 200 bytes: an empty capture is a dead child, output with
+        // no result array is a child that only logged, and either beats a mid-token slice
+        let why = (empty(strip(raw)) ? "child printed NOTHING (spawn or early death)"
+            : (find(raw, "\n[") < 0 && !(strip(raw) |> starts_with("[")) ? "output carries NO json result array (only diagnostics?)"
+                : "a result array was found but did not parse"))
+        to_log(LOG_ERROR, "gen_bench_records: FAILED {file} ref {flavor} {backend} ({elapsed_ms(t0)} ms) — {why}\n  cmd: {cmd}\n  tail: {tail}\n")
         logger_error("bench.records", "cell FAILED", JV({"model" => JV(file), "engine" => JV("llama.cpp"), "leg" => JV("{flavor} {backend}"), "elapsed_ms" => JV(elapsed_ms(t0))}))
         failed |> push("{file} ref {flavor} {backend}")
         return
@@ -543,14 +720,13 @@ def private ref_pass(file, path, bin, flavor : string; ngl : int; nopo : bool; c
 
 // ===== ASR legs (the audio workloads, same adjacency discipline as the LLM legs) =====
 
-// das side: one asr_bench_cell child per catalog model, absorbed via the same cell protocol
-def private asr_das_cell(spec : AsrModelSpec; cfg : Args; threads : int; cellPath, store : string;
+// das side: one lcpp_bench --asr child per catalog model, absorbed via the same cell protocol
+def private asr_das_cell(spec : AsrModelSpec; cfg : Args; threads : int; cellPath, store, exe : string;
                          var models : array<BenchModel>; var failed : array<string>) {
     let t0 = ref_time_ticks()
     to_log(LOG_INFO, "gen_bench_records: START {spec.display} das asr\n")
     logger_info("bench.records", "cell start", JV({"model" => JV(spec.display), "engine" => JV("das"), "leg" => JV("asr")}))
-    let args <- [daslang_bin(), "-jit", "modules/dasLLAMA/benchmarks/asr/asr_bench_cell.das", "--",
-                 "-m", spec.das_model, "-r", "{cfg.asr_reps}", "-t", "{threads}",
+    let args <- [exe, "--", "--asr", "-m", spec.das_model, "-r", "{cfg.asr_reps}", "-t", "{threads}",
                  "--json-path", cellPath]
     var out = ""
     let rc = run_and_stream(args, out)
@@ -562,7 +738,7 @@ def private asr_das_cell(spec : AsrModelSpec; cfg : Args; threads : int; cellPat
         failed |> push("{spec.display} das asr")
         return
     }
-    absorb_cell(models, cell, store, "")
+    absorb_cell(models, cell, store, "", failed)
     remove(cellPath)
     to_log(LOG_INFO, "gen_bench_records: DONE {spec.display} das asr ({elapsed_ms(t0)} ms)\n")
     logger_info("bench.records", "cell done", JV({"model" => JV(spec.display), "engine" => JV("das"), "leg" => JV("asr"), "elapsed_ms" => JV(elapsed_ms(t0))}))
@@ -597,7 +773,15 @@ def private asr_ref_pass(spec : AsrModelSpec; ref : AsrRef; versions : string; c
     let t0 = ref_time_ticks()
     to_log(LOG_INFO, "gen_bench_records: START {spec.display} ref {ref.tool}\n")
     logger_info("bench.records", "cell start", JV({"model" => JV(spec.display), "engine" => JV(asr_engine_name(ref.tool)), "leg" => JV("asr")}))
-    let model_path = "{spec.root}{spec.das_model}"
+    // cli tools time the ref's own carrier when the catalog names one (the q8_0 siblings);
+    // mtmd's handle stays its mmproj, onnx/nemo weights are venv-managed
+    let cli_tool = ref.tool == "parakeet-cli" || ref.tool == "whisper-cli"
+    let model_path = (cli_tool && !empty(ref.handle)) ? "{spec.root}{ref.handle}" : "{spec.root}{spec.das_model}"
+    // a slow reference caps its own clip ladder in the catalog; empty = the spec's
+    var inscope rbuckets := spec.buckets
+    if (!empty(ref.buckets)) {
+        rbuckets := ref.buckets
+    }
     var rr = BenchRun(
         engine = asr_engine_name(ref.tool),
         backend = "cpu",
@@ -608,17 +792,18 @@ def private asr_ref_pass(spec : AsrModelSpec; ref : AsrRef; versions : string; c
         date = date,
         source = "official",
         versions = versions,
+        exec_fmt = ref.exec_fmt,
         hardware = hw)
     var measured = 0
     if (ref.tool == "onnx" || ref.tool == "nemo") {
         // the onnx/nemo weights are venv-managed (the variant/HF handle in `versions` names
         // them); only the clips are local files here
-        var clips := spec.buckets
-        var lib : array<string>
+        var clips := rbuckets
+        var lib : array<string>   // the aggregate leg reads it again after the per-clip rows
         if (!empty(spec.libri_short) && ref.tool == "onnx") {
             // the dictation aggregate pairs against onnx only: one amortized process covers all
             // 25 clips in ~30 s, where a per-clip cli process would cost ~9 min per sweep
-            lib <- libri_wavs()
+            lib <- libri_wavs()   // nolint:PERF030 — first write to the empty decl above
             if (empty(lib)) {
                 to_log(LOG_WARNING, "gen_bench_records: {spec.display} ref onnx — librispeech set absent/partial, leg skipped\n")
             } else {
@@ -641,7 +826,7 @@ def private asr_ref_pass(spec : AsrModelSpec; ref : AsrRef; versions : string; c
                 to_log(LOG_WARNING, "gen_bench_records:   {ref.tool} output carries no BENCH rows — tail: {dtail}\n")
             }
         }
-        for (wav in spec.buckets) {
+        for (wav in rbuckets) {
             var audio_s = -1.0lf
             let ms = parse_bench_best(out, wav, audio_s)
             if (ms > 0.0lf) {
@@ -680,18 +865,19 @@ def private asr_ref_pass(spec : AsrModelSpec; ref : AsrRef; versions : string; c
         if (ref.tool == "mtmd") {
             rr.files |> emplace(file_identity("{spec.root}{ref.handle}", "mmproj"))
         }
-        for (wav in spec.buckets) {
+        for (wav in rbuckets) {
             let wav_path = "{asr_corpus_dir()}{wav}"
             to_log(LOG_INFO, "gen_bench_records:   {ref.tool} {wav} ({cfg.asr_reps} rep(s))...\n")
             var cmd = ""
+            var enc_ms = 0.0lf
             let ms = (ref.tool == "mtmd"
-                ? run_asr_mtmd(model_path, "{spec.root}{ref.handle}", wav_path, threads, cfg.asr_reps, cmd)
+                ? run_asr_mtmd(model_path, "{spec.root}{ref.handle}", wav_path, threads, cfg.asr_reps, cmd, enc_ms)
                 : run_asr_cli(ref.tool, model_path, wav_path, threads, cfg.asr_reps, cmd))
             rr.cmd = cmd   // last clip's line; they differ only in -f
             if (ms > 0.0lf) {
                 to_log(LOG_INFO, "gen_bench_records:   {ref.tool} {wav} = {ms:.0f} ms\n")
                 // audio seconds live on the das cell's matching test key; cli tools don't report it
-                rr.tests |> insert("asr:{wav}", BenchTest(ms = ms))
+                rr.tests |> insert("asr:{wav}", BenchTest(ms = ms, encode_ms = enc_ms))
                 rr.files |> emplace(file_identity(wav_path, "clip"))
                 measured++
             } else {
@@ -771,15 +957,17 @@ def main : int {
         set_env_variable("DAS_TUNE_MANIFEST", "")
     }
     // STEP ZERO, automatic: GC image siblings that can never load again (BROKEN/version-stale)
-    // across the dirs this sweep reads — a box once carried 274 GB of them. OTHER stays.
+    // across the dirs this sweep reads — a box once carried 274 GB of them. OTHER STAYS, and
+    // keep_other is what makes that true: the cells measure through the bench EXE (its own baked
+    // winners), so this orchestrator cannot recompute their identities and must not judge them.
     // --oracle skips it: the artifact set is frozen for the whole check.
     if (!cfg.oracle) {
-        let gc_llm = dlim_clean(models_dir(), true)
+        let gc_llm = dlim_clean(models_dir(), true, keep_other = true)
         if (gc_llm.removed > 0) {
             to_log(LOG_INFO, "gen_bench_records: GC freed {gc_llm.freed >> 20l} MB — {gc_llm.removed} stale image(s) in {models_dir()}\n")
         }
         if (cfg.workload == "asr" || cfg.workload == "all") {
-            let gc_w = dlim_clean(whisper_models_dir(), true)
+            let gc_w = dlim_clean(whisper_models_dir(), true, keep_other = true)
             if (gc_w.removed > 0) {
                 to_log(LOG_INFO, "gen_bench_records: GC freed {gc_w.freed >> 20l} MB — {gc_w.removed} stale image(s) in {whisper_models_dir()}\n")
             }
@@ -834,10 +1022,6 @@ def main : int {
     if (cfg.oracle) {
         // GATE 1: no refs run (binaries not even required); GATE 2: one das pass per stored row
         // (the cv warm-retry stays — it REPLACES a bad cold measure); GATE 3: frozen artifacts.
-        if (cfg.workload == "asr") {
-            to_log(LOG_ERROR, "gen_bench_records: --oracle covers the LLM legs only — the asr das cells are CPU-path (they join when a phase touches the ASR path)\n")
-            return 1
-        }
         let ostore = bench_records_path()
         var omodels : array<BenchModel>
         if (!read_bench_records(ostore, omodels)) {
@@ -867,6 +1051,7 @@ def main : int {
         return 1
     }
     mkdir_rec("modules/dasLLAMA/performance/records")
+    snapshot_tune_generation(exe)
     let store = bench_records_path()
     var models : array<BenchModel>
     read_bench_records(store, models)
@@ -897,37 +1082,48 @@ def main : int {
         // state (27B: das 110.7 soaked vs 138.1 quiet — a phantom 0.91 board red). Refs still
         // run independently of das-cell failures.
         if (legMetal) {
-            settle(cfg)
+            settle_das(cfg)
             das_cell(file, path, "metal", exe, false, cfg, threads, cellPath, ent.note, store, models, failed)
-            settle(cfg)
+            // the ref gets COOL-SLOT entry too: it is not insensitive on high-power parts —
+            // zen2 35B read pp 81.7 twelve seconds behind a das cell vs 103.9 solo-cooled
+            settle_das(cfg)
             ref_pass(file, path, refStock, "stock", 99, false, cfg, threads, hw, box, date, ent.note, store, models, failed)
         }
         if (legNeon) {
-            settle(cfg)
+            settle_das(cfg)
             das_cell(file, path, "cpu", exe, false, cfg, threads, cellPath, ent.note, store, models, failed)
-            settle(cfg)
+            // the ref gets COOL-SLOT entry too: it is not insensitive on high-power parts —
+            // zen2 35B read pp 81.7 twelve seconds behind a das cell vs 103.9 solo-cooled
+            settle_das(cfg)
             ref_pass(file, path, refClean, "clean-cpu", 0, false, cfg, threads, hw, box, date, ent.note, store, models, failed)
         }
         if (legAmx) {
-            settle(cfg)
+            settle_das(cfg)
             das_cell(file, path, "cpu", exe, true, cfg, threads, cellPath, ent.note, store, models, failed)
-            settle(cfg)
+            // the ref gets COOL-SLOT entry too: it is not insensitive on high-power parts —
+            // zen2 35B read pp 81.7 twelve seconds behind a das cell vs 103.9 solo-cooled
+            settle_das(cfg)
             ref_pass(file, path, refStock, "stock", 0, true, cfg, threads, hw, box, date, ent.note, store, models, failed)
         }
     }
     if (doAsr) {
+        let asrTier = parse_tier(cfg.asr_tier)
         // per-tool version lines are session facts — capture once, not per model
         var toolVersions : table<string; string>
         for (spec in asr_catalog()) {
             if (!empty(cfg.only) && find(spec.display, cfg.only) < 0 && find(spec.das_model, cfg.only) < 0) {
                 continue
             }
-            if (!stat("{spec.root}{spec.das_model}").is_valid) {
+            if (!stat(asr_model_path(spec)).is_valid) {
                 to_log(LOG_WARNING, "gen_bench_records: SKIP {spec.display} — model not on this box\n")
                 continue
             }
-            settle(cfg)
-            asr_das_cell(spec, cfg, threads, cellPath, store, models, failed)
+            if (!asr_model_selected(spec, asrTier)) {
+                to_log(LOG_INFO, "gen_bench_records: SKIP {spec.display} — not in --asr-tier {cfg.asr_tier}\n")
+                continue
+            }
+            settle_das(cfg)
+            asr_das_cell(spec, cfg, threads, cellPath, store, exe, models, failed)
             for (rf in spec.refs) {
                 if (!key_exists(toolVersions, rf.tool)) {
                     toolVersions |> insert(rf.tool, asr_ref_available(rf.tool) ? asr_tool_versions(rf.tool) : "")

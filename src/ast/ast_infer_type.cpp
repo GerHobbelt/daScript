@@ -111,6 +111,7 @@ namespace das {
         relaxedAssign = prog->options.getBoolOption("relaxed_assign", prog->policies.relaxed_assign);
         relaxedPointerConst = prog->options.getBoolOption("relaxed_pointer_const", prog->policies.relaxed_pointer_const);
         unsafeTableLookup = prog->options.getBoolOption("unsafe_table_lookup", prog->policies.unsafe_table_lookup);
+        defaultInitContainers = prog->options.getBoolOption("default_init_containers", prog->policies.default_init_containers);
         withModuleIsUnsafe = prog->options.getBoolOption("with_module_is_unsafe", prog->policies.with_module_is_unsafe);
         forceInscopePod = prog->options.getBoolOption("force_inscope_pod", prog->policies.force_inscope_pod);
         logInscopePod = prog->options.getBoolOption("log_inscope_pod", prog->policies.log_inscope_pod);
@@ -291,6 +292,12 @@ namespace das {
         Visitor::preVisitStructureField(that, decl, last);
         checkEmptyName(decl.name, "structure field", decl.at);
         that->fieldLookup[decl.name] = fieldIndex++;
+        if (!decl.type) {
+            program->stickyError("malformed AST, structure field '" + decl.name + "' is missing its type",
+                  "likely a macro-generated declaration; set its type to auto to request inference", "",
+                  decl.at, CompilationError::internal_field);
+            decl.type = new TypeDecl(Type::autoinfer);  // repair in place; the sticky error still fails the compile
+        }
         if (decl.type->isAuto() && !decl.init) {
             error("structure field type can't be inferred, it needs an initializer", "", "",
                   decl.at, CompilationError::missing_structure_field);
@@ -468,6 +475,12 @@ namespace das {
     void InferTypes::preVisitGlobalLet(const VariablePtr &var) {
         Visitor::preVisitGlobalLet(var);
         checkEmptyName(var->name, "global variable declaration", var->at);
+        if (!var->type) {
+            program->stickyError("malformed AST, global variable '" + var->name + "' is missing its type",
+                  "likely a macro-generated declaration; set its type to auto to request inference", "",
+                  var->at, CompilationError::internal_variable);
+            var->type = new TypeDecl(Type::autoinfer);  // repair in place; the sticky error still fails the compile
+        }
         if (noUnsafeUninitializedStructs && !var->init && var->type->unsafeInit()) {
             if (!hasSafeWhenUninitialized(var->annotation)) {
                 error("Uninitialized variable " + var->name + " is unsafe. Use initializer syntax or @safe_when_uninitialized when intended.", "", "",
@@ -664,6 +677,22 @@ namespace das {
     void InferTypes::preVisit(Function *f) {
         Visitor::preVisit(f);
         checkEmptyName(f->name, "function declaration", f->at);
+        if (!f->result) {
+            program->stickyError("malformed AST, function '" + f->name + "' is missing its result type",
+                  "likely a macro-generated function; set result to auto to request inference", "",
+                  f->at, CompilationError::internal_function);
+            f->result = new TypeDecl(Type::autoinfer);  // repair in place; the sticky error still fails the compile
+        }
+        for (auto it = f->arguments.begin(); it != f->arguments.end();) {
+            if (*it == nullptr) {
+                program->stickyError("malformed AST, function '" + f->name + "' has a null argument entry",
+                      "likely a macro-generated function", "",
+                      f->at, CompilationError::internal_function);
+                it = f->arguments.erase(it);  // repair in place; the sticky error still fails the compile
+            } else {
+                ++it;
+            }
+        }
         oneReturn = nullptr;
         returnCount = 0;
         canFoldResult = true;
@@ -688,6 +717,12 @@ namespace das {
     void InferTypes::preVisitArgument(Function *fn, const VariablePtr &var, bool lastArg) {
         Visitor::preVisitArgument(fn, var, lastArg);
         checkEmptyName(var->name, "function argument", var->at);
+        if (!var->type) {
+            program->stickyError("malformed AST, function argument '" + var->name + "' is missing its type",
+                  "likely a macro-generated declaration; set its type to auto to request inference", "",
+                  var->at, CompilationError::internal_variable);
+            var->type = new TypeDecl(Type::autoinfer);  // repair in place; the sticky error still fails the compile
+        }
         if (var->type->isAlias()) {
             if (auto aT = inferAlias(var->type)) {
                 var->type = aT;
@@ -1224,6 +1259,13 @@ namespace das {
             propagateTempType(expr->subexpr->type, expr->type); // deref(Foo#?) is Foo#
         }
         return Visitor::visit(expr);
+    }
+    void InferTypes::preVisit(ExprRef2Ptr *expr) {
+        Visitor::preVisit(expr);
+        // addr(tab[k]) is raw slot access — no default_init_containers rewrite
+        if (expr->subexpr->rtti_isAt()) {
+            static_cast<ExprAt*>(expr->subexpr)->noTableInit = true;
+        }
     }
     ExpressionPtr InferTypes::visit(ExprRef2Ptr *expr) {
         if (!expr->subexpr->type)
@@ -2549,6 +2591,31 @@ namespace das {
             } else if (expr->trait == "is_unsafe_when_uninitialized") {
                 reportAstChanged();
                 return new ExprConstBool(expr->at, noUnsafeUninitializedStructs && expr->typeexpr->unsafeInit());
+            } else if (expr->trait == "is_safe_to_delete") {
+                reportAstChanged();
+                return new ExprConstBool(expr->at, expr->typeexpr->isSafeToDelete());
+            } else if (expr->trait == "needs_container_init") {
+                reportAstChanged();
+                return new ExprConstBool(expr->at, defaultInitContainers && expr->typeexpr->unsafeInit());
+            } else if (expr->trait == "is_pod_delete") {
+                reportAstChanged();
+                return new ExprConstBool(expr->at, isPodDelete(expr->typeexpr));
+            } else if (expr->trait == "needs_container_finalize") {
+                // the COLLECT half rides force_inscope_pod - the same policy that governs
+                // builtin_collect_local_and_zero on move-assign/scope-exit; container init
+                // (default_init_containers) is the construct half only, a separate knob.
+                // isPodDelete: collection must be fully GENERATED (user finalizers never run
+                // implicitly), must only free heap the value owns, and there must be some — so POD
+                // structs cost nothing. isSafeToDelete on top: a generated finalizer that would
+                // DELETE POINTEES (a struct with a raw-pointer field, e.g. sql_linq's JoinSpec) is
+                // unsafe to run implicitly — those keep the old drop-the-slot behavior.
+                reportAstChanged();
+                const auto & tt = expr->typeexpr;
+                return new ExprConstBool(expr->at, forceInscopePod && !tt->isConst()
+                                                    && isPodDelete(tt) && tt->isSafeToDelete());
+            } else if (expr->trait == "needs_nontrivial_init") {
+                reportAstChanged();
+                return new ExprConstBool(expr->at, expr->typeexpr->unsafeInit());
             } else if (expr->trait == "has_nontrivial_ctor") {
                 reportAstChanged();
                 return new ExprConstBool(expr->at, expr->typeexpr->hasNonTrivialCtor());
@@ -3314,6 +3381,23 @@ namespace das {
                 error("table index requires unsafe", "use 'get_value', 'insert', 'insert_clone' or 'emplace' instead. consider 'get'", "",
                       expr->at, CompilationError::unsafe_table_index);
             }
+            // default_init_containers: a non-store index over an init-carrying value type becomes
+            // _table_index_and_init(tab,key) - a ref-returning wrapper - so a fresh slot runs its
+            // initializers (builtin.das owns the wrapper; its own body is exempt below, which is
+            // what keeps its Tab[at] from recursing into itself). Temporary tables keep the raw
+            // index - a # view is a borrowed shape whose indexed inserts panic on the lock at
+            // runtime anyway; rewriting it would only trade that for a compile error naming a
+            // compiler-internal generic.
+            if (defaultInitContainers && !unsafeTableLookup && !expr->noTableInit
+                && !seT->temporary && seT->secondType->unsafeInit()
+                && !(func && func->fromGeneric && func->fromGeneric->name == "_table_index_and_init")) {
+                auto pCall = new ExprCall(expr->at, "_table_index_and_init");
+                pCall->arguments.push_back(expr->subexpr->clone());
+                pCall->arguments.push_back(expr->index->clone());
+                pCall->generated = true;
+                reportAstChanged();
+                return pCall;
+            }
             TypeDecl::clone(expr->type, seT->secondType);
             expr->type->ref = true;
             expr->type->constant |= seT->constant;
@@ -3563,6 +3647,16 @@ namespace das {
     }
     void InferTypes::preVisit(ExprBlock *block) {
         Visitor::preVisit(block);
+        for (auto it = block->arguments.begin(); it != block->arguments.end();) {
+            if (*it == nullptr) {
+                program->stickyError("malformed AST, block has a null argument entry",
+                      "likely a macro-built block", "",
+                      block->at, CompilationError::internal_variable);
+                it = block->arguments.erase(it);  // repair in place; the sticky error still fails the compile
+            } else {
+                ++it;
+            }
+        }
         block->hasEarlyOut = false;
         block->hasReturn = false;
         block->forLoop = false;
@@ -3592,6 +3686,12 @@ namespace das {
     void InferTypes::preVisitBlockArgument(ExprBlock *block, const VariablePtr &var, bool lastArg) {
         Visitor::preVisitBlockArgument(block, var, lastArg);
         checkEmptyName(var->name, "block argument", var->at);
+        if (!var->type) {
+            program->stickyError("malformed AST, block argument '" + var->name + "' is missing its type",
+                  "likely a macro-generated declaration; set its type to auto to request inference", "",
+                  var->at, CompilationError::internal_variable);
+            var->type = new TypeDecl(Type::autoinfer);  // repair in place; the sticky error still fails the compile
+        }
         if (!var->can_shadow && !program->policies.allow_block_variable_shadowing) {
             if (func) {
                 for (auto &fna : func->arguments) {
@@ -5006,6 +5106,30 @@ namespace das {
         Visitor::preVisit(expr);
         // macro generated invisible variables
         // DAS_ASSERT(expr->visibility.line);
+        if (!expr->body && expr != comprehensionFor) {  // a comprehension's embedded for legally has no body until lowering
+            program->stickyError("malformed AST, for loop is missing its body",
+                  "likely a macro-built loop; set body to an ExprBlock", "",
+                  expr->at, CompilationError::internal_expression);
+            expr->body = new ExprBlock();  // repair in place; the sticky error still fails the compile
+            expr->body->at = expr->at;
+        }
+        for (size_t i = 0; i < expr->sources.size();) {
+            if (expr->sources[i] == nullptr) {
+                program->stickyError("malformed AST, for loop has a null source entry",
+                      "likely a macro-built loop", "",
+                      expr->at, CompilationError::internal_expression);
+                // repair in place (erase the whole iterator column, keeping the parallel
+                // vectors consistent); the sticky error still fails the compile
+                expr->sources.erase(expr->sources.begin() + i);
+                if (expr->iterators.size() > i) expr->iterators.erase(expr->iterators.begin() + i);
+                if (expr->iteratorsAt.size() > i) expr->iteratorsAt.erase(expr->iteratorsAt.begin() + i);
+                if (expr->iteratorsAka.size() > i) expr->iteratorsAka.erase(expr->iteratorsAka.begin() + i);
+                if (expr->iteratorsTupleExpansion.size() > i) expr->iteratorsTupleExpansion.erase(expr->iteratorsTupleExpansion.begin() + i);
+                if (expr->iteratorsTags.size() > i) expr->iteratorsTags.erase(expr->iteratorsTags.begin() + i);
+            } else {
+                ++i;
+            }
+        }
         loop.push_back(expr);
         pushVarStack();
     }
@@ -5019,6 +5143,14 @@ namespace das {
             error("for loop needs as many iterators as there are sources", "", "",
                   expr->at, CompilationError::invalid_for_iterator_count);
             return;
+        }
+        if (expr->iteratorsAt.size() < expr->iterators.size() || expr->iteratorsAka.size() < expr->iterators.size()) {
+            program->stickyError("malformed AST, for loop iteratorsAt/iteratorsAka are shorter than the iterator list",
+                  "likely a macro-built loop; keep iterators, iteratorsAt and iteratorsAka the same length", "",
+                  expr->at, CompilationError::internal_expression);
+            // repair in place (pad with defaults); the sticky error still fails the compile
+            if (expr->iteratorsAt.size() < expr->iterators.size()) expr->iteratorsAt.resize(expr->iterators.size());
+            if (expr->iteratorsAka.size() < expr->iterators.size()) expr->iteratorsAka.resize(expr->iterators.size());
         }
         // iterator variables
         int idx = 0;
@@ -5207,6 +5339,16 @@ namespace das {
     }
     void InferTypes::preVisit(ExprLet *expr) {
         Visitor::preVisit(expr);
+        for (auto it = expr->variables.begin(); it != expr->variables.end();) {
+            if (*it == nullptr) {
+                program->stickyError("malformed AST, let expression has a null variable entry",
+                      "likely a macro-built declaration list", "",
+                      expr->at, CompilationError::internal_variable);
+                it = expr->variables.erase(it);  // repair in place; the sticky error still fails the compile
+            } else {
+                ++it;
+            }
+        }
         DAS_ASSERT(!scopes.empty());
         auto scope = scopes.back();
         expr->visibility.fileInfo = expr->at.fileInfo;
@@ -5222,6 +5364,12 @@ namespace das {
         checkEmptyName(var->name, "variable declaration", var->at);
         var->single_return_via_move = false;
         var->consumed = false;
+        if (!var->type) {
+            program->stickyError("malformed AST, variable '" + var->name + "' is missing its type",
+                  "likely a macro-generated declaration; set its type to auto to request inference", "",
+                  var->at, CompilationError::internal_variable);
+            var->type = new TypeDecl(Type::autoinfer);  // repair in place; the sticky error still fails the compile
+        }
         if (var->type && var->type->isExprType()) {
             return;
         }
@@ -5294,16 +5442,20 @@ namespace das {
             error("local reference has to be initialized", "", "",
                   var->at, CompilationError::missing_local_reference_init);
         // A reference can only bind to addressable storage. Split the non-local case in two:
-        //  - a freshly-materialized temporary - a *value* (type->ref==false) that is not a cast/view:
-        //    a make-local literal, or a value-returning call. It needs its own temp-stack slot and has
-        //    no storage to point at, so the reference would dangle. Never valid: a hard error,
-        //    regardless of `unsafe`. (`[1]` etc. is lowered to a value-returning call by this point, so
-        //    rtti_isMakeLocal no longer holds - hence the type->ref + !rtti_isCast test.)
+        //  - a freshly-materialized temporary - a make-local literal, or a value-returning call. It needs
+        //    its own temp-stack slot and has no storage to point at, so the reference would dangle. Never
+        //    valid: a hard error, regardless of `unsafe`. (`[1]` etc. is lowered to a value-returning call
+        //    by this point, so rtti_isMakeLocal alone is not enough - hence the call-like test.) The test
+        //    is on the initializer's SHAPE, not just type->ref: an argument of a natively-by-reference
+        //    type (struct, array, table, tuple) is addressable storage yet also carries type->ref==false,
+        //    since it is already a reference at the ABI level. A value that is neither shape - an int, a
+        //    string, a lambda - never reaches here: the value-init check below rejects it first.
         //  - an addressable non-local - a deref, or an upcast/reinterpret view of real storage: merely
         //    unsafe (the existing policy-gated diagnostic).
         if (var->type->ref && var->init && !(var->init->alwaysSafe || isLocalOrGlobal(var->init))
                 && var->init->type && !var->init->type->temporary) {
-            if (!var->init->type->ref && !var->init->rtti_isCast()) {
+            if (!var->init->type->ref && !var->init->rtti_isCast()
+                    && (var->init->rtti_isCallLikeExpr() || var->init->rtti_isMakeLocal())) {
                 error("local reference to a temporary value is not allowed",
                       "a reference must bind to addressable storage (a variable, a field, or a function "
                       "returning a reference); a freshly-built temporary has none", "",
@@ -5345,9 +5497,11 @@ namespace das {
                 }
             }
             if (forceInscopePod && !expr->inScope && !var->pod_delete && !var->type->ref) { // no constant for now
-                if ((expr->variables.size() == 1)                                           // only one variable
-                                                                                            // very restrictive on functions
-                    && (func && !func->generated && !func->generator && !func->lambda)
+                // lambda and @@{} local-function bodies are generated wrappers around verbatim
+                // user blocks - their locals are ordinary per-invocation stack locals, so
+                // scope-exit collection is as sound there as in a plain function. Generators
+                // stay excluded: their locals persist across yields in the state machine.
+                if ((func && (!func->generated || func->lambda || func->localFunction) && !func->generator)
                     // not in the generator block
                     && (blocks.empty() || !blocks.back()->isGeneratorBlock)) {
                     if (isPodDelete(var->type)) {
@@ -6175,10 +6329,25 @@ namespace das {
 
     // try infer, if failed - no macros
     // run macros til any of them does work, then reinfer and restart (i.e. infer after each macro)
+    static bool applyPreInferMacros ( Program * program ) {
+        auto nErr = program->errors.size();
+        // program->library, not Module::foreach: the latter walks every module in the
+        // process, so a nested compile would run macros from an unrelated program
+        program->library.foreach([&](Module * mod) -> bool {
+            for ( const auto & pm : mod->preInferMacros ) {
+                pm->apply(program, program->thisModule.get());
+            }
+            return true;
+        }, "*");
+        // the next pass clears program->errors, so a violation has to stop the loop
+        return program->errors.size() == nErr;
+    }
+
     void inferTypes(Program * program, TextWriter &logs, ModuleGroup &libGroup) {
         program->newLambdaIndex = 1;
         // inferPassesUsed is NOT reset here — parseDaScript resets it once per module
         // before the restartInfer: loop, so multiple inferTypes legs accumulate properly.
+        applyPreInferMacros(program);
         inferTypesDirty(program, logs, false);
         bool anyMacrosDidWork = false;
         bool anyMacrosFailedToInfer = false;
@@ -6200,6 +6369,7 @@ namespace das {
                             return false;
                         }
                         if (anyWork) { // if macro did anything, we done
+                            applyPreInferMacros(program);
                             program->reportingInferErrors = true;
                             inferTypesDirty(program, logs, true);
                             program->reportingInferErrors = false;
@@ -6306,6 +6476,9 @@ namespace das {
             program->inferPassesUsed++;   // count each body invocation; avoids undercount when loop breaks early (pass is 0-based)
             program->failToCompile = false;
             program->errors.clear();
+            if (!applyPreInferMacros(program)) {
+                break;
+            }
             InferTypes context(program, &logs);
             context.verbose = verbose || logInferPasses;
             program->visit(context);
@@ -6357,6 +6530,11 @@ namespace das {
                                                                                                              "this is likely due to a loop in the type system",
                   "", "",
                   LineInfo(), CompilationError::exceeds_infer_passes);
+        }
+        // re-arm sticky (malformed-AST) reports: the tree was repaired in place so the guard that
+        // detected the damage won't re-fire, and every pass cleared program->errors
+        for (auto &serr : program->stickyErrors) {
+            program->error(serr.what, serr.extra, serr.fixme, serr.at, serr.cerr);
         }
         // End-of-leg collect: sweep this leg's accumulated garbage so the next inferTypes
         // leg (macro restart / restartInfer) inherits only live nodes, not a compounding

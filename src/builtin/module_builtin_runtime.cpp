@@ -2069,8 +2069,10 @@ namespace das
         if ( strcmp(f, "sve")==0 )      return (hw  & HWCAP_SVE) != 0;
         return false;
     #elif defined(_WIN32)
+        #ifdef PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE    // newer than the CRC32 bit below
         if ( strcmp(f, "dotprod")==0 )
             return IsProcessorFeaturePresent(PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE) != 0;
+        #endif
         if ( strcmp(f, "crc")==0 )
             return IsProcessorFeaturePresent(PF_ARM_V8_CRC32_INSTRUCTIONS_AVAILABLE) != 0;
         return false;
@@ -2516,6 +2518,9 @@ namespace das
         // local collection
         addInterop<builtin_collect_local_and_zero,void,vec4f,uint32_t>(*this, lib, "builtin_collect_local_and_zero",
             SideEffects::modifyArgumentAndExternal, "builtin_collect_local_and_zero")
+                ->args({"anything","sizeOfAnything"})->unsafeOperation = true;
+        addInterop<builtin_collect_local,void,vec4f,uint32_t>(*this, lib, "builtin_collect_local",
+            SideEffects::modifyArgumentAndExternal, "builtin_collect_local")
                 ->args({"anything","sizeOfAnything"})->unsafeOperation = true;
         addInterop<builtin_scope_free,void,vec4f,uint32_t>(*this, lib, "builtin_scope_free",
             SideEffects::modifyArgumentAndExternal, "builtin_scope_free")

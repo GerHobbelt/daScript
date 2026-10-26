@@ -22,7 +22,7 @@ options _function_length = 0   // same
 // GGUF and writing the image. Both numbers are reported per stage so a slow box is diagnosable
 // without a profiler.
 
-require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration
+require dasllama/dasllama_transformer   // the umbrella fires each arch [init] registration
 require dasllama/dasllama_math          // apply_box_profile_runtime + select_matmul_backend_for_load
 require dasllama/dasllama_image         // the .dlim rail itself
 require dasllama/dasllama_gpu_resident  // the vulkan flavor's bake arm + --trim
@@ -257,7 +257,7 @@ def private convert_asr(cfg : ConvertArgs; kind : string; qm : QuantMode) : int 
     } elif (kind == "parakeet") {
         tag = q8 ? "parakeet-q8" : "parakeet-f32"
     } elif (kind == "canary") {
-        tag = "canary-f32"       // the CNRY encoder is fp32-only
+        tag = q8 ? "canary-q8" : "canary-f32"
     } elif (kind == "qwen3a") {
         tag = "qwen3a-f32"
     } elif (kind == "gemma4a") {
@@ -290,7 +290,7 @@ def private convert_asr(cfg : ConvertArgs; kind : string; qm : QuantMode) : int 
         } elif (kind == "parakeet") {
             var inscope m <- load_parakeet_model(cfg.model, q8)
         } elif (kind == "canary") {
-            var inscope m <- load_canary_encoder(cfg.model)
+            var inscope m <- load_canary_encoder(cfg.model, q8)
         } elif (kind == "qwen3a") {
             var inscope m <- load_qwen3a_tower(cfg.model)
         } elif (kind == "gemma4a") {
@@ -533,7 +533,7 @@ def main() : int {
         to_log(LOG_INFO, "dasllama-convert: wrote {bytes >> 20l} MB (streamed) in {total_ms} ms total\n")
     }
     if (rc == 0) {
-        dlim_gc_stale(cfg.model)   // the fresh bake proves version-stale siblings dead
+        dlim_gc_stale(cfg.model, tag, qs)   // the fresh bake proves ITS LANE's siblings dead
     }
     return rc
 }

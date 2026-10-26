@@ -7,6 +7,7 @@ options _function_length = 0   // same
 
 require dasllama/dasllama_vulkan_common   // g_gpu/g_rd state, plumbing, hazard rail, fill metas
 require dasllama/dasllama_vulkan_decode   // vk_moe_dn_step — the dn chain's npos==1 arm routes through the decode step
+require dasllama/dasllama_kqformat   // KqFmt — the arena fmt slots are its ordinals
 require vulkan
 require vulkan/vulkan_boost
 require dasllama/dasllama_math
@@ -193,7 +194,7 @@ def vk_rdec_prefill(x_batch : array<float>; cos_batch : array<float>; npos : int
     let kvd = g_rd.kv_dim
     let hid = g_rd.hidden
     let nlfin = g_rd.n_layers * 2l * dim
-    let pairs = qd / 2l + kvd / 2l
+    let pairs = int(qd / 2l + kvd / 2l)
     unsafe {
         var sp = reinterpret<float?>(g_gpu.staging.mapped)
         sp[0] = g_rd.scale
@@ -231,7 +232,7 @@ def vk_rdec_prefill(x_batch : array<float>; cos_batch : array<float>; npos : int
                 invoke(mA, b + 2, dim, kvd, L.bk, L.fk)
                 invoke(mA, b + 3, dim, kvd, L.bv, L.fv)
                 if (g_rd.qk_norm) {
-                    let hs = g_rd.head_size
+                    let hs = g_rd.head_size   // nolint:LINT021 — the norm-row words compose it with int64 layout offsets
                     var mn = reinterpret<uint?>(g_rd.pf_meta[b + 15].mapped)
                     mn[0] = uint(hs); mn[1] = uint(g_rd.n_heads); mn[2] = uint(kvd / hs)
                     mn[3] = uint(qd); mn[4] = uint(kvd); mn[5] = 0u   // k rows at 0 in pf_kv, kvd stride
@@ -283,7 +284,7 @@ def vk_rdec_prefill(x_batch : array<float>; cos_batch : array<float>; npos : int
             vhz_dep(raw, h, 0u, VHZ_META, true)
             cmd_copy_whole(raw, g_gpu.ffn_meta.buf, g_gpu.ffn_meta_dev, FFN_META_BYTES)
             pfq_ts(raw)   // q1: meta copy
-            let ropewg = uint((wlen * pairs + int64(WG_X) - 1l) / int64(WG_X))
+            let ropewg = uint((int(wlen) * pairs + int(WG_X) - 1) / int(WG_X))
             let fa128 = g_gpu.has_coopmat && g_rd.head_size == 128l && vk_fa_on()
             let attnwg = uint(fa128 ? g_rd.n_heads * ((wlen + 31l) / 32l) : g_rd.n_heads * ((wlen + 7l) / 8l))
             rd_dispatch(raw, g_gpu.ar_pipeline, g_rd.pf_sets[bp + 0], uint(wlen), h)   // prologue norm
@@ -343,13 +344,13 @@ def vk_rdec_prefill(x_batch : array<float>; cos_batch : array<float>; npos : int
         if (vk_prof() && g_pfq_n == 5u + uint(g_rd.n_layers * rpl)) {
             var role : double[16]
             for (l in range64(g_rd.n_layers)) {
-                for (s in range(int(rpl))) {
+                for (s in range64(rpl)) {
                     role[s] += pfq_us(uint(3l + l * rpl) + uint(s))
                 }
             }
             let nq = 3u + uint(g_rd.n_layers * rpl)
             var tot = 0.0lf
-            for (s in range(int(rpl))) {
+            for (s in range64(rpl)) {
                 tot += role[s]
             }
             tot += pfq_us(2u) + pfq_us(nq) + pfq_us(nq + 1u)
@@ -427,26 +428,11 @@ def private fill_arena_batch_meta(hb : HostBuf; n, d, blk, npos : int64; fmt : i
     return uint(total)
 }
 
-def private arena_ensure_batch(fmt : int) {
-    unsafe {
-        var a & = g_gpu.arenas[fmt]
-        if (a.batch_ready) {
-            return
-        }
-        ensure_batch_state()
-        a.batch_meta = make_host_buf(BATCH_META_BYTES, true)
-        a.batch_set = vk_set6(a.wqbuf, a.wsbuf, a.batch_meta.buf, g_gpu.batch_xq_dev, g_gpu.batch_xs_dev, g_gpu.batch_y1_dev,
-            a.wqbytes, a.wsbytes, BATCH_META_BYTES, BATCH_XQ_BYTES, BATCH_XS_BYTES, BATCH_Y_BYTES,
-            fixed_array(0u, 0u, 0u, 0u, 0u, VHG_YO))   // meta/acts fill pre-cmd
-        a.batch_ready = true
-    }
-}
-
 //! Arena seam: batch GEMM of the [d x n] tensor at block `blk` against `npos` quantized activation
 //! rows (xq/xs, [npos x n]) into y[0..npos*d). The prefill twin of vk_arena_gemv (q8 only for now).
 def vk_arena_gemm(var y : array<float>; blk : int64; n, d, npos : int64; fmt : int; xq : array<int8>; xs : array<float>) {
     verify(vk_moe_init())
-    assert(fmt == 0, "dasLLAMA vulkan arena_gemm: q8 only")
+    assert(fmt == int(KqFmt.q8), "dasLLAMA vulkan arena_gemm: q8 only")
     assert(npos * n <= BATCH_XQ_BYTES && npos * d * 4l <= BATCH_Y_BYTES, "arena_gemm: batch exceeds scratch")
     arena_ensure_batch(fmt)
     let groups = fill_arena_batch_meta(g_gpu.arenas[fmt].batch_meta, n, d, blk, npos, fmt)
@@ -621,7 +607,7 @@ def private fill_batch_meta(si : int; offs : int64 const?; nregions : int64; n, 
         // route the tile on the AVERAGE rows per active region
         let te = batch_tile_edges(fmt, d, nrc > 0l ? nrows / nrc : r1 - r0)
         g_gpu.stacks[si].batch_tile = te.tile
-        g_gpu.stacks[si].batch_aligned = fmt == 0 && te.tile == 128l && d % 128l == 0l && all128
+        g_gpu.stacks[si].batch_aligned = fmt == int(KqFmt.q8) && te.tile == 128l && d % 128l == 0l && all128
         let wtiles = (d + te.td - 1l) / te.td
         let wg_bound = ((r1 - r0 + te.tc - 1l) / te.tc + nrc) * wtiles
         assert((4l + nrc * 4l + wg_bound) * 4l <= BATCH_META_BYTES, "dasLLAMA vulkan tier: batch meta exceeds capacity")
@@ -688,7 +674,7 @@ def private record_ffn_batch_cmd(s1, s3, s2 : int; nwg_gu, nwg_dn : uint; rows, 
         cmd_copy_whole(raw, g_gpu.comb_stage.buf, g_gpu.comb_w_dev, comb_wi_bytes)
         cmd_copy_range(raw, g_gpu.comb_stage.buf, COMB_WI_BYTES, g_gpu.comb_inv_dev, 0l, comb_wi_bytes)
     }
-    if (g_gpu.stacks[s1].fmt == 6) {   // the cm2 chain: dequant feed, twin GEMMs, f16 mid-step
+    if (g_gpu.stacks[s1].fmt == int(KqFmt.q8n)) {   // the cm2 chain: dequant feed, twin GEMMs, f16 mid-step
         hz_dispatch(raw, h, weak_copy(g_gpu.xf16_pipeline), g_gpu.batch_xf_set,
             uint((axq_bytes / 4l + 255l) / 256l))
     }
@@ -697,7 +683,7 @@ def private record_ffn_batch_cmd(s1, s3, s2 : int; nwg_gu, nwg_dn : uint; rows, 
     hz_dispatch(raw, h, batch_pipe(g_gpu.stacks[s3].fmt, g_gpu.stacks[s3].batch_tile, g_gpu.stacks[s3].batch_aligned),
         g_gpu.stacks[s3].batch_set, nwg_gu)
     // the mid-step form follows the DOWN stack — its GEMM is the consumer of the hidden plane
-    if (g_gpu.stacks[s2].fmt == 6) {
+    if (g_gpu.stacks[s2].fmt == int(KqFmt.q8n)) {
         hz_dispatch(raw, h, weak_copy(g_gpu.actf16_pipeline), g_gpu.batch_hf_set,
             uint((rows * nfe / 4l + 255l) / 256l))
     } else {

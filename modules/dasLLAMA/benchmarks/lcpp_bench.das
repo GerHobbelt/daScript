@@ -4,13 +4,17 @@ options _jit_fast_math = true   // ggml-parity FP laxity — matches how llama.c
 options _cyclomatic_complexity = 0   // bench cell main = the measurement protocol ladder
 options _function_length = 0   // same
 
-require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration; requiring dasllama_common directly would drop them
+require dasllama/dasllama_transformer   // umbrella fires each arch [init] registration; requiring dasllama_common directly would drop them
 require dasllama/dasllama_math   // setup_dasllama_jobque_ + apply_box_profile_runtime (engine-level, not re-exported)
 require dasllama/dasllama_image   // load_model_cached — the .dlim rail, without the full facade's compile weight
 require dasllama/dasllama_tokenizer   // the tg-real row needs REAL tokens (see Lever.real)
+require dasllama/dasllama_asr   // --asr: load_asr_model/create_session/transcribe (narrower than the full facade; it requires the transformer umbrella itself)
+require audio   // --asr: the miniaudio decoder behind load_audio_16k_mono
+require dasllama/dasllama_audio   // --asr: AUDIO_SAMPLE_RATE, the 16 kHz mono contract
 require daslib/module_path            // get_this_module_dir — the default prompt corpus beside this bench
-require ?das_accelerate dasllama/dasllama_math_accelerate   // nolint:STYLE030 — the --accel leg; Apple-only C++ module
+require ?das_accelerate dasllama/dasllama_math_accelerate   // the --accel leg; Apple-only C++ module
 require ../performance/profile_common.das   // profile_threads + affinity_on + bench records — the standing per-box methodology
+require llvm/daslib/llvm_tune   // tune_app_script — the exe-vs-script discriminator behind --for-debug-purposes
 require daslib/jobque_boost
 require daslib/clargs
 require daslib/fio
@@ -74,6 +78,10 @@ struct Args {
     @clarg_doc = "The --ref binary's build flavor tag for the record: stock | clean-cpu (default: stock)"
     ref_flavor : string = "stock"
 
+    @clarg_name = "ref-no-affinity"
+    @clarg_doc = "Drop --cpu-mask/--cpu-strict from the --ref invocation (see gen_bench_records --ref-no-affinity)"
+    ref_no_affinity : bool
+
     @clarg_name = "json-path"
     @clarg_doc = "With -o json: also write the records to this file — the machine rail (stdout carries engine logs too, and an untuned box's tune-relaunch merges stderr into it)"
     json_path : string
@@ -104,6 +112,13 @@ struct Args {
     @clarg_doc = "Refuse to mint artifacts: load only an existing prepared .dlim image, panic otherwise (the gen_bench_records --oracle contract)"
     frozen : bool
 
+    @clarg_name = "for-debug-purposes"
+    @clarg_doc = "Allow running as a -jit SCRIPT — a debug instrument only: output is stamped debug-jit and must never enter records. Measurement runs the released exe"
+    for_debug_purposes : bool
+
+    @clarg_doc = "ASR cell mode: -m becomes a CATALOG substring (display name or das_model), not a path. Times transcribe best-of--r over the model's corpus buckets and emits the same BenchModel cell the LLM rows use"
+    asr : bool
+
     @clarg_doc = "Prompt corpus for the tg-real row (segments split on lines of two percent signs; default: data/wikitext2_prompts.txt beside this bench)"
     prompts : string = ""
 
@@ -113,6 +128,189 @@ struct Args {
     @clarg_short = "?"
     @clarg_doc = "Show this help and exit"
     help : bool
+}
+
+// ===== ASR cell mode (--asr) =====
+// The audio sibling of the LLM protocol below, folded in by the single-rig consolidation: ONE
+// process, one tune-key demand, one image-identity stamp. It runs under this file's
+// `options _jit_fast_math` — the same ggml FP laxity whisper-cli/parakeet-cli are built with, so
+// the das side is no longer held to stricter FP than the reference it is measured against.
+// The reference tools are NOT run here; gen_bench_records measures them adjacent, as for the LLM legs.
+
+// Decode any file miniaudio understands to 16 kHz mono f32.
+def private load_audio_16k_mono(path : string) : array<float> {
+    var decoder = new ma_decoder
+    var config <- ma_decoder_config_init(ma_format.ma_format_f32, 1u, uint(AUDIO_SAMPLE_RATE))
+    if (ma_decoder_init_file(path, unsafe(addr(config)), decoder) != ma_result.MA_SUCCESS) {
+        panic("cannot open audio file '{path}'")
+    }
+    var out : array<float>
+    let chunk = 65536
+    var buf : array<float>
+    buf |> resize(chunk)
+    while (true) {
+        let got = int(ma_decoder_read_pcm_frames(decoder, unsafe(addr(buf[0])), uint64(chunk)))
+        break if (got <= 0)
+        out |> reserve(length(out) + got)
+        for (i in range(got)) {
+            out |> push(buf[i])
+        }
+        break if (got < chunk)
+    }
+    ma_decoder_uninit(decoder)
+    unsafe {
+        delete decoder
+    }
+    delete buf
+    return <- out
+}
+
+// Best-of-`reps` transcribe ms for one loaded model, from a warmed JIT + live jobque. `text`
+// receives the LAST rep's transcript: under fast-math a token flip is the thing that moves the
+// timing, so a run that reports only ms cannot tell a real speedup from a shorter decode.
+// `encode_ms` receives the BEST rep's encode split via the asr_prof rail (0 when the family
+// carries no encode-total bucket).
+def private measure_das(var m : AsrModel; samples : array<float>; reps : int; lang : string;
+                        var text : string&; var encode_ms : double&) : double {
+    var best = 1.0e30lf
+    encode_ms = 0.0lf
+    for (_rep in range(reps)) {
+        var s <- create_session(m, lang)
+        var parts : array<string>
+        let t0 = ref_time_ticks()
+        transcribe(m, s, samples) $(seg) {
+            parts |> push(seg.text)
+        }
+        let ms = double(get_time_usec(t0)) / 1000.0lf
+        if (ms < best) {
+            best = ms
+        }
+        text = join(parts, "")
+        delete parts
+        delete s
+    }
+    // the encode split samples in its OWN untimed rep: every asr_prof_add site is a
+    // string-keyed table insert, so an enabled profiler inside the timed region would tax
+    // exactly the families that carry a bucket and no others
+    let ebucket = asr_encode_bucket(m)
+    if (!empty(ebucket)) {
+        set_asr_prof(true)
+        asr_prof_reset()
+        var s <- create_session(m, lang)
+        transcribe(m, s, samples) $(_seg) {}
+        encode_ms = asr_prof_ms(ebucket)
+        set_asr_prof(false)
+        delete s
+    }
+    return best
+}
+
+// One catalog model's timed buckets -> a BenchModel cell, appended to `jsonModels`.
+def private asr_measure_spec(spec : AsrModelSpec; reps, threads : int; var jsonModels : array<BenchModel>) {
+    let model_path = asr_model_path(spec)
+    var m <- (empty(spec.das_mmproj)
+        ? load_asr_model(model_path)
+        : load_asr_model(model_path, "{spec.root}{spec.das_mmproj}"))
+    var warm <- load_audio_16k_mono("{asr_corpus_dir()}{spec.buckets[0]}")
+    var warm_text = ""
+    var warm_enc = 0.0lf
+    measure_das(m, warm, 1, spec.lang, warm_text, warm_enc)   // JIT compile + first-touch
+    delete warm
+    var run = BenchRun(engine = "das", backend = "cpu", flavor = flavor_stamp("tuned"),
+        exec_fmt = asr_exec_fmt(m),
+        workload = asr_workload(spec), box = box_name(), threads = threads,
+        date = format_time(get_clock(), "%Y-%m-%d"), cmd = bench_cmd_line(), env = bench_env_line(),
+        sha = run_capture("git rev-parse --short=9 HEAD", true), version = das_version(),
+        tune = tune_summary(), tune_sha = tune_manifest_sha(), hardware = gather_hardware())
+    run.files |> emplace(file_identity(model_path, "weights"))
+    if (!empty(spec.das_mmproj)) {
+        run.files |> emplace(file_identity("{spec.root}{spec.das_mmproj}", "mmproj"))
+    }
+    run.files |> reserve(length(run.files) + length(spec.buckets))
+    for (wav in spec.buckets) {
+        var samples <- load_audio_16k_mono("{asr_corpus_dir()}{wav}")
+        let audio_s = double(length(samples)) / double(AUDIO_SAMPLE_RATE)
+        var text = ""
+        var enc_ms = 0.0lf
+        let das_ms = measure_das(m, samples, reps, spec.lang, text, enc_ms)
+        run.tests |> insert("asr:{wav}", BenchTest(ms = das_ms, audio_s = audio_s, text = text, encode_ms = enc_ms))
+        run.files |> emplace(file_identity("{asr_corpus_dir()}{wav}", "clip"))
+        print("lcpp_bench --asr: {spec.display} {wav} {das_ms} ms ({audio_s} s audio)\n")
+        print("  text: {text}\n")
+        delete samples
+    }
+    if (!empty(spec.libri_short)) {
+        // the dictation aggregate: 25 short clips, ONE whole-set total on one test key
+        var lib <- libri_wavs()
+        if (empty(lib)) {
+            print("lcpp_bench --asr: {spec.display} — librispeech set absent/partial (setup_asr_rig --libri), leg skipped\n")
+        } else {
+            var lib_ms = 0.0lf
+            var lib_audio = 0.0lf
+            run.files |> reserve(length(run.files) + length(lib))
+            for (wav in lib) {
+                var samples <- load_audio_16k_mono("{asr_corpus_dir()}{wav}")
+                lib_audio += double(length(samples)) / double(AUDIO_SAMPLE_RATE)
+                var ltext = ""
+                var lenc = 0.0lf
+                lib_ms += measure_das(m, samples, reps, spec.lang, ltext, lenc)
+                run.files |> emplace(file_identity("{asr_corpus_dir()}{wav}", "clip"))
+                delete samples
+            }
+            run.tests |> insert(libri_test_key(), BenchTest(ms = lib_ms, audio_s = lib_audio))
+            print("lcpp_bench --asr: {spec.display} librispeech25 total {lib_ms} ms ({lib_audio} s audio, {length(lib)} clips)\n")
+        }
+        delete lib
+    }
+    var cell = BenchModel(gguf = spec.das_model, arch = spec.display,
+                          size_bytes = int64(stat(model_path).size))
+    cell.runs |> emplace(run)
+    jsonModels |> emplace(cell)
+    delete m
+}
+
+// The --asr entry: catalog match -> measure -> the same cell JSON the LLM rows emit.
+def private asr_cell_main(model, json_path : string; reps, threads : int) : bool {
+    allow_cpu_prefill()   // the ASR cell is CPU by protocol — disarm the Metal-build tripwire
+    apply_box_profile_runtime()
+    if (!tune_gate()) {   // never measure on fallback winners — the whole board would sandbag
+        return false
+    }
+    var found = false
+    var jsonModels : array<BenchModel>
+    with_job_que() {
+        setup_dasllama_jobque_()
+        for (spec in asr_catalog()) {
+            if (find(spec.display, model) < 0 && find(spec.das_model, model) < 0) {
+                continue
+            }
+            if (!stat(asr_model_path(spec)).is_valid) {
+                print("lcpp_bench --asr: {spec.display} — model absent ({asr_model_path(spec)}), skipped\n")
+                continue
+            }
+            found = true
+            asr_measure_spec(spec, reps, threads, jsonModels)
+        }
+    }
+    if (!found) {
+        print("lcpp_bench --asr: no catalog model matches '{model}'\n")
+        return false
+    }
+    let text = sprint_json(jsonModels, true)
+    if (!empty(json_path)) {
+        var wrote = false
+        fopen(json_path, "wb") $(f) {
+            if (f != null) {
+                fwrite(f, text)
+                wrote = true
+            }
+        }
+        if (!wrote) {
+            print("warning: could not open {json_path} for writing — no records file\n")
+        }
+    }
+    print("{text}\n")
+    return true
 }
 
 // deterministic synthetic ids (vocab-safe low range, the decode_prof convention); llama-bench
@@ -230,22 +428,41 @@ def private tests_of(rows : array<RowStat>) : table<string; BenchTest> {
     return <- { for (r in rows); r.test => BenchTest(tok_s = r.mean, stddev = r.sd) }
 }
 
+// true when this process is a -jit script run (--for-debug-purposes): every emitted record's
+// flavor is stamped debug-jit so no board or oracle can mistake it for measurement
+var private g_debug_run = false
+
+def private flavor_stamp(base : string) : string {
+    return g_debug_run ? "debug-jit:{base}" : base
+}
+
 [export]
-def main() {
+def main() : int {
     if (!jit_enabled()) {
         print("This benchmark is JIT-only — run with: daslang -jit <file>\n")
-        return
+        return 1
     }
     var r <- parse_args(type<Args>)
     if (r |> is_err) {
         print("error: {r |> unwrap_err}\n\n")
         print_help(get_command_info(type<Args>), "lcpp_bench")
-        return
+        return 1
     }
     let cfg <- r |> move_unwrap
     if (cfg.help) {
         print_help(get_command_info(type<Args>), "lcpp_bench")
-        return
+        return 0
+    }
+    // measurement exists only from the released exe: a -jit SCRIPT run reads whatever sidecar
+    // sits beside the script and re-keys nothing — its numbers must never enter records
+    g_debug_run = !empty(tune_app_script())
+    if (g_debug_run && !cfg.for_debug_purposes) {
+        print("lcpp_bench: this is a -jit SCRIPT run — measurement runs the released exe (daspkg release).\n")
+        print("  pass --for-debug-purposes to proceed as a debug instrument; output is stamped debug-jit and is not record-grade\n")
+        return 1
+    }
+    if (g_debug_run) {
+        print("lcpp_bench: DEBUG RUN (-jit script) — numbers are debug-grade, flavor is stamped debug-jit\n")
     }
     let gpu = cfg.ngl != 0
     if (!gpu) {
@@ -278,26 +495,38 @@ def main() {
         threads = to_int(get_env_variable("DAS_JOBQUE_THREADS"))
         say(fmt, "warning: DAS_JOBQUE_THREADS overrides -t — running {threads} lanes\n")
     } elif (!t_env) {
+        // the PC measurement regime caps at 16 lanes (an explicit env or -t always wins) —
+        // a big-SMT box at full width measures the scheduler, not the kernels
+        if (get_platform_name() == "windows" && cfg.threads <= 0 && threads > 16) {
+            say(fmt, "lcpp_bench: capping {threads} lanes to the 16-lane PC regime (-t or DAS_JOBQUE_THREADS overrides)\n")
+            threads = 16
+        }
         set_jobque_threads_cap(max(threads - 1, 1))
     }
     let pinned = affinity_on() && !has_env_variable("DAS_JOBQUE_AFFINITY")
     if (pinned) {
         set_jobque_affinity(2)   // 2 = hard mask, the llama-bench --cpu-strict mirror (mode 1 re-rolls SMT placement)
     }
+    // the regime is set BY THE BENCH, printed so nobody has to guess: N lanes = N-1 pool
+    // workers + the computing main thread (DAS_JOBQUE_THREADS counts LANES, not workers)
+    say(fmt, "regime: {threads} lanes ({max(threads - 1, 1)} pool workers + main), affinity {pinned ? "hard mask (bench-forced)" : (has_env_variable("DAS_JOBQUE_AFFINITY") ? "env override" : "off (platform default)")}\n")
+    if (cfg.asr) {   // the audio cell shares every lane decision above, then runs its own protocol
+        return asr_cell_main(cfg.model, cfg.json_path, reps, threads) ? 0 : 1
+    }
     apply_box_profile_runtime()   // the tuned per-box stack — what load_model users get
     if (!tune_gate()) {   // never measure on fallback winners — the whole board would sandbag
-        return
+        return 1
     }
     if (cfg.accel && gpu) {
         print("--accel is a CPU-tier lever — drop it or run with -ngl 0\n")
-        return
+        return 1
     }
     if (cfg.accel) {
         static_if (typeinfo builtin_module_exists(das_accelerate)) {
             dasllama_accelerate_enable(32l)   // the shipped +AMX defaults: min ntok 32, work floor 512 MMAC
         } else {
             print("--accel requested but das_accelerate is not built on this platform — no accel row to measure\n")
-            return
+            return 1
         }
     }
     if (gpu) {
@@ -495,7 +724,9 @@ def main() {
         if (!empty(cfg.ref)) {
             var refArgs <- [cfg.ref, "-m", mpath, "-ngl", "{cfg.ngl}", "-t", "{threads}"]
             if (!gpu) {
-                refArgs |> push_from(lcpp_affinity_argv(threads))
+                if (!cfg.ref_no_affinity) {
+                    refArgs |> push_from(lcpp_affinity_argv(threads))
+                }
             }
             refArgs |> push_from(["-p", "{cfg.plen}", "-n", "{cfg.ngen}", "-r", "{reps}", "-o", "json"])
             refCmd = argv_line(refArgs)
@@ -546,7 +777,7 @@ def main() {
     var dr = BenchRun(
         engine = "das",
         backend = backend,
-        flavor = cfg.accel ? "accel" : "tuned",
+        flavor = flavor_stamp(cfg.accel ? "accel" : "tuned"),
         box = box,
         threads = threads,
         date = date,
@@ -555,6 +786,7 @@ def main() {
         sha = run_capture("git rev-parse --short=9 HEAD", true),
         version = das_version(),
         tune = tune_summary(),
+        tune_sha = tune_manifest_sha(),
         exec_fmt = execFmt,
         hardware = hw,
         tests <- tests_of(results))
@@ -588,10 +820,10 @@ def main() {
         let headers <- ["engine", "model", "backend", "ngl", "threads", "test", "t/s"]
         let aligns <- [ColAlign.left, ColAlign.left, ColAlign.left, ColAlign.right, ColAlign.right, ColAlign.left, ColAlign.right]
         print(render_md_table(headers, aligns, mdRows))
-        return
+        return 0
     }
     if (fmt != OutFmt.json) {
-        return
+        return 0
     }
     let text = sprint_json(jsonModels, true)
     if (!empty(cfg.json_path)) {
@@ -609,4 +841,5 @@ def main() {
         }
     }
     print("{text}\n")
+    return 0
 }

@@ -45,6 +45,9 @@ struct public TextEditUndoOp {
 struct public TextEditUndoUnit {
     ops : array<TextEditUndoOp>
     kind : TextEditUndoKind = TextEditUndoKind.other
+    //! Monotonic id assigned at creation — the save-point identity test
+    //! (`text_edit_mark_saved`); survives undo/redo round-trips.
+    serial : int
     before_cursor_line : int
     before_cursor_column : int
     before_anchor_line : int = -1
@@ -63,6 +66,25 @@ struct public TextEditRange {
     start_column : int
     end_line : int
     end_column : int
+}
+
+enum public TextEditCompileStatus {
+    unknown
+    compiling
+    ok
+    failed
+}
+
+struct public TextEditDiagnostic {
+    //! One compiler finding: [start..end) positions, 0-based bytes; end ==
+    //! start = width unknown (underline the word there). `file` "" = THIS
+    //! buffer; a foreign path shows in Issues but never underlines here.
+    line : int
+    column : int
+    end_line : int
+    end_column : int
+    file : string
+    message : string
 }
 
 struct public TextEditStyleRun {
@@ -95,6 +117,8 @@ struct public TextEditState {
     //! so pure verbs and the renderer agree.
     tab_cells : int = 4
     revision : int = 0
+    //! False when the journal position equals the save point (see
+    //! `text_edit_mark_saved`); undoing back to the save point clears it.
     dirty : bool = false
     focused : bool = false
     blink_time : float = 0.0f
@@ -109,6 +133,12 @@ struct public TextEditState {
     redo_stack : array<TextEditUndoUnit>
     //! True while the newest undo unit still accepts coalescing appends.
     undo_open : bool = false
+    //! Counter behind `TextEditUndoUnit.serial`; reset by `text_edit_load`.
+    undo_serial : int = 0
+    //! Serial of the unit on top of the undo stack at the last save (0 = the
+    //! pristine load state). Diverging after undoing past it makes the save
+    //! point unreachable, so `dirty` stays set — the VS Code rule.
+    saved_serial : int = 0
     //! Viewport scroll request in lines (Ctrl+Up/Down); caret stays put.
     pending_scroll_lines : int = 0
     //! Host-fed ranges painted under the text (find matches); keep ascending.
@@ -124,6 +154,43 @@ struct public TextEditState {
     //! Ghost completion drawn after the caret; Tab accepts it. Cleared by
     //! every edit/move — the completion sync re-offers next frame.
     ghost_text : string
+    //! Compiler findings underlined in the text (provider-fed; positions may
+    //! lag edits until the next compile) + the compile state for chrome.
+    diagnostics : array<TextEditDiagnostic>
+    compile_status : TextEditCompileStatus = TextEditCompileStatus.unknown
+    //! Display/overlay name for the buffer ("" = unnamed scratch); the das
+    //! provider compiles under this name, so errors carry it.
+    file_name : string
+    //! Go-to-line overlay (Ctrl+G): component-owned, no host wiring.
+    goto_open : bool = false
+    goto_focus : bool = false
+    //! Mouse-drag granularity from click count (0 char, 1 word, 2 line) +
+    //! the anchor run for word/line extends.
+    drag_mode : int = 0
+    drag_origin_line : int = 0
+    drag_origin_start : int = 0
+    drag_origin_end : int = 0
+    //! Press inside the selection = a possible drag-and-drop of it.
+    drag_move_pending : bool = false
+    drag_move_active : bool = false
+    //! Segment (by line_first) that started the live drag - other segments
+    //! sharing this state must not continue or finish it.
+    drag_owner_first : int = -1
+    //! A sibling segment's item held keyboard focus (this/last frame) - the
+    //! primary's FocusItem reclaim must not steal it (nav would yank scroll).
+    sibling_focus_now : bool = false
+    sibling_focus_prev : bool = false
+    //! Inline color embed: picker session over a 0xRRGGBB / 0xAARRGGBB
+    //! literal; color_undo_mark makes the write-backs roll into ONE unit.
+    color_open : bool = false
+    color_line : int = 0
+    color_start : int = 0
+    color_digits : int = 0
+    color_undo_mark : int = -1
+    //! The opening click must not count as a click-away on the first frame.
+    color_ignore_click : bool = false
+    //! Where the dialog anchors: under the literal's line, not the mouse.
+    color_anchor : float2
     //! Completion LIST under the caret (top candidates). list_index -1 =
     //! visible but the keyboard is still in the editor (Down enters).
     list_items : array<string>
@@ -131,11 +198,26 @@ struct public TextEditState {
     list_index : int = -1
     //! Byte length of the request prefix — accepting inserts the remainder.
     list_prefix_bytes : int = 0
+    //! Snippet session: tab stops in traversal order (numbered ascending, the
+    //! `${0}` final always last). snippet_index -1 = no session.
+    snippet_stops : array<TextEditSnippetStop>
+    snippet_index : int = -1
+    //! The whole inserted span; the caret leaving it ends the session.
+    snippet_region : TextEditRange = TextEditRange()
     // widget layout cache + per-draw stamps for live inspection
     layout_revision : int = -1
     max_line_bytes : int = 0
     line_count : int = 1
     visible_rows : int = 0
+}
+
+struct public TextEditSnippetStop {
+    //! One placeholder range: single-line [start_column..end_column) on `line`.
+    line : int
+    start_column : int
+    end_column : int
+    //! The `${n}` number; 0 = the final caret (always traversed last).
+    index : int
 }
 
 struct public TextEditResult {
@@ -151,7 +233,9 @@ def public text_edit_dispose(var ed : TextEditState) {
     delete ed.highlight_ranges
     delete ed.line_styles
     delete ed.list_items
-    ed = TextEditState()
+    delete ed.diagnostics
+    delete ed.snippet_stops
+    ed = TextEditState() // nolint:PERF030 (owned fields deleted above; the move target is already empty)
 }
 
 def public text_edit_load(var ed : TextEditState; source : string) {
@@ -174,8 +258,13 @@ def public text_edit_load(var ed : TextEditState; source : string) {
     delete ed.redo_stack
     delete ed.highlight_ranges
     delete ed.line_styles
+    delete ed.diagnostics
+    ed.compile_status = TextEditCompileStatus.unknown
     text_edit_close_list(ed)
+    text_edit_snippet_end(ed)
     ed.undo_open = false
+    ed.undo_serial = 0
+    ed.saved_serial = 0
     ed.dirty = false
     ed.revision++
     ed.follow_revision++
@@ -207,6 +296,19 @@ def public text_edit_position_of_byte(ed : TextEditState const;
     }
     let last = length(ed.lines) - 1
     return int2(last, length(ed.lines[last]))
+}
+
+def public text_edit_byte_of_position(ed : TextEditState const;
+                                      line, column : int) : int {
+    //! Inverse of `text_edit_position_of_byte`: (line, column) to a byte
+    //! offset in the LF-joined text; positions clamp to the buffer ends.
+    return 0 if (empty(ed.lines))
+    let line_index = clamp(line, 0, length(ed.lines) - 1)
+    var byte_offset = 0
+    for (index in range(line_index)) {
+        byte_offset += length(ed.lines[index]) + 1
+    }
+    return byte_offset + clamp(column, 0, length(ed.lines[line_index]))
 }
 
 def public text_edit_range_of_bytes(ed : TextEditState const;
@@ -257,7 +359,7 @@ def private byte_in(set_bytes : string; b : int) : bool {
     return hit
 }
 
-def private lex_line(profile : TextLanguageProfile const; line : string; // nolint:STYLE037
+def private lex_line(profile : TextLanguageProfile const; line : string;
                      entry_comment : bool;
                      var runs : array<TextEditStyleRun>) : bool {
     // returns whether the NEXT line starts inside a block comment
@@ -344,13 +446,22 @@ def private restyle_lines(var ed : TextEditState; first_line, last_forced : int)
         ed.line_styles |> emplace(blank, clamp(first_line, 0, length(ed.line_styles)))
     }
     while (length(ed.line_styles) > length(ed.lines)) {
-        ed.line_styles |> erase(clamp(first_line, 0, length(ed.line_styles) - 1))
+        // erase does NOT finalize the element: free the nested runs first
+        let drop_at = clamp(first_line, 0, length(ed.line_styles) - 1)
+        delete ed.line_styles[drop_at].runs
+        ed.line_styles |> erase(drop_at)
     }
     return if (empty(ed.lines))
     text_language_profile(ed.language) $(profile) {
-        // start one line ABOVE the change: lexing it recovers the valid carry
-        var at = clamp(first_line - 1, 0, length(ed.lines) - 1)
-        var carry = at == 0 ? false : ed.line_styles[at].in_block_comment
+        // scratch-lex the line above for its carry - never replace its runs
+        var at = clamp(first_line, 0, length(ed.lines) - 1)
+        var carry = false
+        if (at > 0 && at - 1 < length(ed.line_styles)) {
+            var scratch : array<TextEditStyleRun>
+            carry = lex_line(profile, ed.lines[at - 1],
+                ed.line_styles[at - 1].in_block_comment, scratch)
+            delete scratch
+        }
         while (at < length(ed.lines)) {
             // converged: an untouched line already starts in this state
             break if (at > last_forced && ed.line_styles[at].in_block_comment == carry)
@@ -385,7 +496,7 @@ def private code_byte(ed : TextEditState const; line, column : int) : int {
     return value
 }
 
-def private scan_bracket(ed : TextEditState const; line, column : int; // nolint:STYLE037
+def private scan_bracket(ed : TextEditState const; line, column : int;
                          open_byte, close_byte : int; forward : bool) : int2 {
     var depth = 1
     var at_line = line
@@ -466,6 +577,56 @@ def private bracket_pair_index(profile : TextLanguageProfile const; b : int) : i
         return index if (b == pair.x || b == pair.y)
     }
     return -1
+}
+
+def private parse_only_style(syntax : TextSourceSyntaxStyle) : bool {
+    // styles only the FULL parse produces; the lexical pass never emits them
+    return (syntax == TextSourceSyntaxStyle.type_
+        || syntax == TextSourceSyntaxStyle.function_
+        || syntax == TextSourceSyntaxStyle.variable
+        || syntax == TextSourceSyntaxStyle.property
+        || syntax == TextSourceSyntaxStyle.constant
+        || syntax == TextSourceSyntaxStyle.operator_
+        || syntax == TextSourceSyntaxStyle.punctuation)
+}
+
+def private run_overlaps(runs : array<TextEditStyleRun>; start, end_ : int) : bool {
+    for (run in runs) {
+        return true if (run.start_byte < end_ && run.end_byte > start)
+    }
+    return false
+}
+
+def private merge_parse_styles(var ed : TextEditState; line : int;
+                               old_runs : array<TextEditStyleRun>;
+                               edit_column, removed_bytes, inserted_bytes : int) {
+    // anti-flicker: shift old parse-only runs across the edit into lexical gaps
+    return if (line >= length(ed.line_styles) || line >= length(ed.lines))
+    let delta = inserted_bytes - removed_bytes
+    let line_length = length(ed.lines[line])
+    for (old in old_runs) {
+        continue if (!parse_only_style(old.style))
+        var start = old.start_byte
+        var end_ = old.end_byte
+        if (start >= edit_column + removed_bytes) {
+            start += delta
+            end_ += delta
+        } elif (end_ > edit_column) {
+            continue // the edit cut through it - the reparse will restyle
+        }
+        continue if (start < 0 || end_ > line_length || end_ <= start
+            || run_overlaps(ed.line_styles[line].runs, start, end_))
+        // keep the runs sorted by start byte - the painter fills gaps in order
+        var insert_at = length(ed.line_styles[line].runs)
+        for (index in range(length(ed.line_styles[line].runs))) {
+            if (ed.line_styles[line].runs[index].start_byte > start) {
+                insert_at = index
+                break
+            }
+        }
+        ed.line_styles[line].runs |> push(TextEditStyleRun(start_byte = start,
+            end_byte = end_, style = old.style), insert_at)
+    }
 }
 
 def public text_edit_set_language(var ed : TextEditState; language : string) {
@@ -616,6 +777,23 @@ def public text_edit_can_redo(ed : TextEditState const) : bool {
     return !empty(ed.redo_stack)
 }
 
+def private journal_serial(ed : TextEditState const) : int {
+    return empty(ed.undo_stack) ? 0 : ed.undo_stack[length(ed.undo_stack) - 1].serial
+}
+
+def private refresh_dirty(var ed : TextEditState) {
+    ed.dirty = journal_serial(ed) != ed.saved_serial
+}
+
+def public text_edit_mark_saved(var ed : TextEditState) {
+    //! Record the current journal position as the save point: `dirty` clears
+    //! now and again whenever undo/redo returns here. Fences the open unit so
+    //! later typing cannot coalesce into pre-save history.
+    ed.undo_open = false
+    ed.saved_serial = journal_serial(ed)
+    ed.dirty = false
+}
+
 def private space_kind_for(ed : TextEditState const; text : string) : TextEditUndoKind {
     return TextEditUndoKind.insert_typing if (text != " ")
     if (ed.undo_open && !empty(ed.undo_stack)) {
@@ -646,6 +824,11 @@ def private breaks_run(previous, current : TextEditUndoKind) : bool {
 def private commit_edit(var ed : TextEditState; kind : TextEditUndoKind;
                         line, column : int; removed, inserted : string) {
     // THE one recorded mutation: (removed -> inserted) at (line, column)
+    let same_line = find(removed, "\n") < 0 && find(inserted, "\n") < 0
+    var preserved : array<TextEditStyleRun>
+    if (same_line && line < length(ed.line_styles)) {
+        preserved := ed.line_styles[line].runs
+    }
     delete ed.redo_stack
     var append_to_open = false
     if (ed.undo_open && !empty(ed.undo_stack)
@@ -659,7 +842,8 @@ def private commit_edit(var ed : TextEditState; kind : TextEditUndoKind;
         }
     }
     if (!append_to_open) {
-        var unit = TextEditUndoUnit(kind = kind,
+        ed.undo_serial++
+        var unit = TextEditUndoUnit(kind = kind, serial = ed.undo_serial,
             before_cursor_line = ed.cursor_line, before_cursor_column = ed.cursor_column,
             before_anchor_line = ed.anchor_line, before_anchor_column = ed.anchor_column)
         ed.undo_stack |> emplace(unit)
@@ -683,8 +867,14 @@ def private commit_edit(var ed : TextEditState; kind : TextEditUndoKind;
     last.after_cursor_line = ed.cursor_line
     last.after_cursor_column = ed.cursor_column
     ed.undo_open = true
+    snippet_track_edit(ed, line, column, removed, inserted)
     touch_edit(ed)
     restyle_lines(ed, min(line, ed.cursor_line), max(line, ed.cursor_line))
+    if (same_line) {
+        merge_parse_styles(ed, line, preserved, column, length(removed),
+            length(inserted))
+    }
+    delete preserved
 }
 
 def private restore_unit_cursor(var ed : TextEditState;
@@ -699,6 +889,7 @@ def private restore_unit_cursor(var ed : TextEditState;
 def public text_edit_undo(var ed : TextEditState) : bool {
     //! Revert the newest undo unit; restores the pre-edit cursor + selection.
     ed.undo_open = false
+    text_edit_snippet_end(ed)
     return false if (empty(ed.undo_stack))
     let unit_index = length(ed.undo_stack) - 1
     var unit <- ed.undo_stack[unit_index]
@@ -720,7 +911,7 @@ def public text_edit_undo(var ed : TextEditState) : bool {
     restore_unit_cursor(ed, unit.before_cursor_line, unit.before_cursor_column,
         unit.before_anchor_line, unit.before_anchor_column)
     ed.redo_stack |> emplace(unit)
-    ed.dirty = true
+    refresh_dirty(ed)
     ed.revision++
     ed.follow_revision++
     ed.blink_time = 0.0f
@@ -730,6 +921,7 @@ def public text_edit_undo(var ed : TextEditState) : bool {
 
 def public text_edit_redo(var ed : TextEditState) : bool {
     ed.undo_open = false
+    text_edit_snippet_end(ed)
     return false if (empty(ed.redo_stack))
     let unit_index = length(ed.redo_stack) - 1
     var unit <- ed.redo_stack[unit_index]
@@ -745,7 +937,7 @@ def public text_edit_redo(var ed : TextEditState) : bool {
     }
     restore_unit_cursor(ed, unit.after_cursor_line, unit.after_cursor_column, -1, 0)
     ed.undo_stack |> emplace(unit)
-    ed.dirty = true
+    refresh_dirty(ed)
     ed.revision++
     ed.follow_revision++
     ed.blink_time = 0.0f
@@ -893,7 +1085,7 @@ def private column_at_visual(line : string; visual_target, tab_cells : int) : in
 // ===== Edits =====
 
 def private touch_edit(var ed : TextEditState) {
-    ed.dirty = true
+    refresh_dirty(ed)
     ed.revision++
     ed.preferred_column = -1
     ed.follow_revision++
@@ -959,6 +1151,83 @@ def private closer_dedents(var ed : TextEditState; text : string) : bool {
     return handled
 }
 
+def private line_byte(line : string; at : int) : int {
+    return -1 if (at < 0 || at >= length(line))
+    var value = -1
+    peek_data(line) $(bytes) {
+        value = int(bytes[at])
+    }
+    return value
+}
+
+def private pair_close_for(profile : TextLanguageProfile const; b : int) : int {
+    for (pair in profile.bracket_pairs) {
+        return pair.y if (b == pair.x)
+    }
+    return -1
+}
+
+def private is_pair_closer(profile : TextLanguageProfile const; b : int) : bool {
+    for (pair in profile.bracket_pairs) {
+        return true if (b == pair.y)
+    }
+    return false
+}
+
+def private surround_selection(var ed : TextEditState;
+                               close_b : int; text : string) : bool {
+    return false if (close_b < 0)
+    let sel = text_edit_selection(ed)
+    let inner = text_edit_range_text(ed, sel)
+    commit_edit(ed, TextEditUndoKind.other, sel.start_line, sel.start_column,
+        inner, text + inner + to_char(close_b))
+    // the content stays selected inside the fresh pair
+    let end_column = sel.end_line == sel.start_line ? sel.end_column + 1 : sel.end_column
+    text_edit_select(ed, sel.start_line, sel.start_column + 1,
+        sel.end_line, end_column)
+    patch_unit_after(ed)
+    return true
+}
+
+def private auto_close_pairs(var ed : TextEditState; text : string) : bool {
+    // openers close themselves, closers skip twins, selections surround
+    return false if (empty(ed.language) || length(text) != 1 || ed.overtype)
+    let b = first_character(text)
+    var handled = false
+    text_language_profile(ed.language) $(profile) {
+        let close_b = pair_close_for(profile, b)
+        if (text_edit_has_selection(ed)) {
+            handled = surround_selection(ed, close_b, text)
+        } else {
+            let line = ed.lines[ed.cursor_line]
+            let next_b = line_byte(line, ed.cursor_column)
+            let prev_b = line_byte(line, ed.cursor_column - 1)
+            let quote = byte_in(profile.string_delimiters, b)
+            let before_open = (next_b < 0 || next_b == ' ' || next_b == '\t'
+                || is_pair_closer(profile, next_b))
+            if (next_b == b && (is_pair_closer(profile, b) || quote)) {
+                // typing the closer that is already there: step over it
+                text_edit_move_right(ed)
+                handled = true
+            } elif (close_b >= 0 && before_open) {
+                commit_edit(ed, TextEditUndoKind.other, ed.cursor_line,
+                    ed.cursor_column, "", text + to_char(close_b))
+                ed.cursor_column--
+                patch_unit_after(ed)
+                handled = true
+            } elif (quote && before_open && byte_word_class(prev_b) != 1
+                    && prev_b != b) {
+                commit_edit(ed, TextEditUndoKind.other, ed.cursor_line,
+                    ed.cursor_column, "", text + text)
+                ed.cursor_column--
+                patch_unit_after(ed)
+                handled = true
+            }
+        }
+    }
+    return handled
+}
+
 def public text_edit_type(var ed : TextEditState; text : string) {
     //! One typed keystroke: like insert, but honoring overtype mode —
     //! replaces the next grapheme within the line, falls back to inserting
@@ -966,7 +1235,7 @@ def public text_edit_type(var ed : TextEditState; text : string) {
     return if (empty(text))
     ensure_line(ed)
     ed.input_revision++
-    return if (closer_dedents(ed, text))
+    return if (closer_dedents(ed, text) || auto_close_pairs(ed, text))
     if (ed.overtype && !text_edit_has_selection(ed) && find(text, "\n") < 0) {
         let line = ed.lines[ed.cursor_line]
         if (ed.cursor_column < length(line)) {
@@ -1016,6 +1285,28 @@ def public text_edit_newline(var ed : TextEditState) {
     //! Fences the undo unit BEFORE, so typing coalesces on the new line.
     text_edit_push_undo_stop(ed)
     ensure_line(ed)
+    if (!empty(ed.language) && !text_edit_has_selection(ed)) {
+        // Enter between a pair: the closer gets its own line at the original
+        // indent, the caret lands indented on the middle line - ONE unit
+        let line = ed.lines[ed.cursor_line]
+        let prev_b = line_byte(line, ed.cursor_column - 1)
+        let next_b = line_byte(line, ed.cursor_column)
+        var between_pair = false
+        text_language_profile(ed.language) $(profile) {
+            between_pair = (prev_b >= 0 && next_b >= 0
+                && pair_close_for(profile, prev_b) == next_b)
+        }
+        if (between_pair) {
+            let indent = leading_whitespace(line)
+            let target_line = ed.cursor_line + 1
+            text_edit_insert(ed, "\n" + indent + "\t\n" + indent)
+            ed.cursor_line = target_line
+            ed.cursor_column = length(indent) + 1
+            patch_unit_after(ed)
+            ed.follow_revision++
+            return
+        }
+    }
     var inserted = "\n"
     if (!empty(ed.language)) {
         let reference = text_edit_selection(ed)
@@ -1043,6 +1334,23 @@ def public text_edit_backspace(var ed : TextEditState) {
     }
     if (ed.cursor_column > 0) {
         let line = ed.lines[ed.cursor_line]
+        if (!empty(ed.language)) {
+            // inside an empty auto-closed pair, Backspace eats both halves
+            let prev_b = line_byte(line, ed.cursor_column - 1)
+            let next_b = line_byte(line, ed.cursor_column)
+            var pair_delete = false
+            text_language_profile(ed.language) $(profile) {
+                pair_delete = ((next_b >= 0 && pair_close_for(profile, prev_b) == next_b)
+                    || (prev_b >= 0 && prev_b == next_b
+                        && byte_in(profile.string_delimiters, prev_b)))
+            }
+            if (pair_delete) {
+                commit_edit(ed, TextEditUndoKind.delete_back, ed.cursor_line,
+                    ed.cursor_column - 1,
+                    slice(line, ed.cursor_column - 1, ed.cursor_column + 1), "")
+                return
+            }
+        }
         let previous = grapheme_prev(line, ed.cursor_column)
         commit_edit(ed, TextEditUndoKind.delete_back, ed.cursor_line, previous,
             slice(line, previous, ed.cursor_column), "")
@@ -1383,7 +1691,9 @@ def private patch_unit_after(var ed : TextEditState) {
     last.after_cursor_column = ed.cursor_column
 }
 
-def private leading_whitespace(line : string) : string {
+def public leading_whitespace(line : string) : string {
+    //! The line's leading spaces/tabs — the indent domain shared by the
+    //! auto-indent verbs, snippet expansion, and the creation registry.
     var at = 0
     peek_data(line) $(bytes) {
         while (at < length(bytes)
@@ -1514,6 +1824,8 @@ def private reindent_block(var ed : TextEditState; outdent : bool) {
     }
     return if (new_text == old_text)
     let cursor_line = ed.cursor_line
+    let cursor_column = ed.cursor_column
+    let cursor_line_bytes = length(ed.lines[cursor_line])
     commit_edit(ed, TextEditUndoKind.other, touched.x, 0, old_text, new_text)
     if (had_selection) {
         // the block stays selected whole after a re-indent
@@ -1522,8 +1834,11 @@ def private reindent_block(var ed : TextEditState; outdent : bool) {
         ed.cursor_line = touched.y
         ed.cursor_column = length(ed.lines[touched.y])
     } else {
+        // only leading whitespace moved: carry the caret by the line's delta
         ed.cursor_line = cursor_line
-        ed.cursor_column = min(ed.cursor_column, length(ed.lines[cursor_line]))
+        let shift = length(ed.lines[cursor_line]) - cursor_line_bytes
+        ed.cursor_column = clamp(cursor_column + shift, 0,
+            length(ed.lines[cursor_line]))
     }
     patch_unit_after(ed)
     ed.follow_revision++
@@ -1546,6 +1861,60 @@ def public text_edit_indent_lines(var ed : TextEditState) {
 
 def public text_edit_outdent_lines(var ed : TextEditState) {
     reindent_block(ed, true)
+}
+
+def public text_edit_set_file_name(var ed : TextEditState; name : string) {
+    ed.file_name = name
+}
+
+def public text_edit_goto_line(var ed : TextEditState; line : int;
+                               column : int = 1) {
+    //! User-facing navigation: 1-BASED line and column (what the go-to-line
+    //! dialog and the Ln/Col chrome speak); clamps and reveals.
+    ensure_line(ed)
+    text_edit_set_cursor(ed, line - 1, max(column - 1, 0))
+}
+
+def public text_edit_open_goto(var ed : TextEditState) {
+    ed.goto_open = true
+    ed.goto_focus = true
+    // fresh dialog, fresh query
+    unsafe {
+        GOTO_INPUT.has_pending = true
+        GOTO_INPUT.pending_value = ""
+    }
+}
+
+def public text_edit_diagnostic_row_span(ed : TextEditState const;
+                                         diag : TextEditDiagnostic const;
+                                         row : int) : int2 {
+    //! The byte range a finding covers on `row`, (-1,-1) when none — the
+    //! squiggle painter, the hover hit-test, and the tests all share this.
+    return int2(-1, -1) if (!empty(diag.file) || row < diag.line
+        || row >= length(ed.lines))
+    let last_line = max(diag.end_line, diag.line)
+    return int2(-1, -1) if (row > last_line)
+    let text = ed.lines[row]
+    if (last_line == diag.line
+            && (diag.end_column <= diag.column || diag.end_line < diag.line)) {
+        // width unknown: the word at the position
+        return int2(0, 0) if (empty(text))
+        let column = clamp(diag.column, 0, length(text) - 1)
+        let word_end = clamp(word_run_at(text, column).y, column + 1, length(text))
+        return int2(column, word_end)
+    }
+    let from = row == diag.line ? clamp(diag.column, 0, length(text)) : 0
+    let to = row == last_line ? clamp(diag.end_column, 0, length(text)) : length(text)
+    return int2(from, max(to, from))
+}
+
+def public text_edit_set_diagnostics(var ed : TextEditState;
+                                     var diags : array<TextEditDiagnostic>;
+                                     status : TextEditCompileStatus) {
+    //! Provider rail: replace the findings + compile state (diags move in).
+    delete ed.diagnostics
+    ed.diagnostics <- diags
+    ed.compile_status = status
 }
 
 def public text_edit_set_ghost(var ed : TextEditState; text : string) {
@@ -1588,10 +1957,14 @@ def public text_edit_list_accept(var ed : TextEditState) : bool {
 }
 
 def public text_edit_tab(var ed : TextEditState) {
-    //! Tab accepts a visible ghost completion first (the VS Code rule); else
-    //! per spec fork 2: multi-line or full-line selection block indents; a
-    //! partial-line selection is replaced; else insert a tab.
+    //! Tab precedence: active snippet session > ghost completion > indent.
+    //! Else per spec fork 2: multi-line or full-line selection block indents;
+    //! a partial-line selection is replaced; else insert a tab.
     ensure_line(ed)
+    if (text_edit_snippet_active(ed)) {
+        let _ = text_edit_snippet_next(ed)
+        return
+    }
     if (!empty(ed.ghost_text)) {
         let accepted = ed.ghost_text
         text_edit_insert(ed, accepted)
@@ -1607,6 +1980,334 @@ def public text_edit_tab(var ed : TextEditState) {
         }
     }
     text_edit_insert(ed, "\t")
+}
+
+// ===== Snippet sessions =====
+
+struct private SnippetParse {
+    body : string
+    stops : array<TextEditSnippetStop> // body-relative positions
+    sel_start : int2 = int2(-1, -1)
+    sel_end : int2 = int2(-1, -1)
+    final_at : int2 = int2(-1, -1)
+}
+
+def private snippet_advance(text : string; var rl : int&; var rc : int&) {
+    let breaks = count(text, "\n")
+    if (breaks == 0) {
+        rc += length(text)
+    } else {
+        rl += breaks
+        rc = length(text) - rfind(text, "\n") - 1
+    }
+}
+
+def private snippet_digits(text : string) : bool {
+    return false if (empty(text))
+    var all = true
+    peek_data(text) $(bytes) {
+        for (value in bytes) {
+            if (!is_number(int(value))) {
+                all = false
+                break
+            }
+        }
+    }
+    return all
+}
+
+def private snippet_chunk(text, indent : string) : string {
+    // body lines after the first inherit the caret line's indentation
+    return empty(indent) ? text : replace(text, "\n", "\n" + indent)
+}
+
+def private snippet_token(token, selection : string; var writer : StringBuilderWriter;
+                          var parsed : SnippetParse; var rl : int&; var rc : int&) : bool {
+    if (token == "SEL") {
+        parsed.sel_start = int2(rl, rc)
+        writer |> write(selection)
+        snippet_advance(selection, rl, rc)
+        parsed.sel_end = int2(rl, rc)
+        return true
+    }
+    let colon = find(token, ":")
+    let number_text = colon >= 0 ? slice(token, 0, colon) : token
+    return false if (!snippet_digits(number_text))
+    let number = to_int(number_text)
+    if (number == 0) {
+        parsed.final_at = int2(rl, rc)
+        return true
+    }
+    let caption = colon >= 0 ? slice(token, colon + 1, length(token)) : ""
+    var known = false
+    for (stop in parsed.stops) {
+        if (stop.index == number) {
+            known = true
+            break
+        }
+    }
+    let start_column = rc
+    writer |> write(caption)
+    snippet_advance(caption, rl, rc)
+    if (!known) {
+        // duplicates emit their label but record no stop (no mirrors in v1)
+        parsed.stops |> push(TextEditSnippetStop(line = rl, index = number,
+            start_column = start_column, end_column = rc))
+    }
+    return true
+}
+
+def private snippet_parse(pattern, selection, indent : string;
+                          var parsed : SnippetParse) {
+    var rl = 0
+    var rc = 0
+    parsed.body = build_string() $(var writer) {
+        var at = 0
+        let total = length(pattern)
+        while (at < total) {
+            let open_ = find(pattern, "$\{", at)
+            let close_ = open_ < 0 ? -1 : find(pattern, "}", open_)
+            if (open_ < 0 || close_ < 0) {
+                let chunk = snippet_chunk(slice(pattern, at, total), indent)
+                writer |> write(chunk)
+                snippet_advance(chunk, rl, rc)
+                break
+            }
+            if (open_ > at) {
+                let chunk = snippet_chunk(slice(pattern, at, open_), indent)
+                writer |> write(chunk)
+                snippet_advance(chunk, rl, rc)
+            }
+            let token = slice(pattern, open_ + 2, close_)
+            if (!snippet_token(token, selection, writer, parsed, rl, rc)) {
+                // not a placeholder: emit verbatim
+                let literal = slice(pattern, open_, close_ + 1)
+                writer |> write(literal)
+                snippet_advance(literal, rl, rc)
+            }
+            at = close_ + 1
+        }
+    }
+}
+
+def private snippet_absolute(rel : int2; line, column : int) : int2 {
+    return int2(line + rel.x, rel.x == 0 ? column + rel.y : rel.y)
+}
+
+def private snippet_focus_stop(var ed : TextEditState) {
+    let stop = ed.snippet_stops[ed.snippet_index]
+    if (stop.end_column > stop.start_column) {
+        text_edit_select(ed, stop.line, stop.start_column, stop.line, stop.end_column)
+    } else {
+        text_edit_set_cursor(ed, stop.line, stop.start_column)
+    }
+}
+
+def public text_edit_snippet_active(ed : TextEditState const) : bool {
+    return ed.snippet_index >= 0
+}
+
+def public text_edit_snippet_end(var ed : TextEditState) {
+    //! Drop the tab-stop session; the buffer is untouched.
+    delete ed.snippet_stops
+    ed.snippet_index = -1
+}
+
+def private snippet_arm(var ed : TextEditState; parsed : SnippetParse;
+                        anchor_line, anchor_column : int) {
+    var stops : array<TextEditSnippetStop>
+    stops |> reserve(length(parsed.stops) + 1)
+    for (stop in parsed.stops) {
+        let start_ = snippet_absolute(int2(stop.line, stop.start_column),
+            anchor_line, anchor_column)
+        let end_ = snippet_absolute(int2(stop.line, stop.end_column),
+            anchor_line, anchor_column)
+        // traversal is by ${n} number: insertion sort on the small set
+        var at = 0
+        while (at < length(stops) && stops[at].index <= stop.index) {
+            at++
+        }
+        stops |> push(TextEditSnippetStop(line = start_.x, index = stop.index,
+            start_column = start_.y, end_column = end_.y), at)
+    }
+    if (empty(stops) && parsed.sel_start.x >= 0) {
+        // wrap rule: the spliced selection stays selected for chaining
+        let start_ = snippet_absolute(parsed.sel_start, anchor_line, anchor_column)
+        let end_ = snippet_absolute(parsed.sel_end, anchor_line, anchor_column)
+        if (start_.x == end_.x) {
+            stops |> push(TextEditSnippetStop(line = start_.x, index = 1,
+                start_column = start_.y, end_column = end_.y))
+        }
+    }
+    var final_at = int2(ed.cursor_line, ed.cursor_column)
+    if (parsed.final_at.x >= 0) {
+        final_at = snippet_absolute(parsed.final_at, anchor_line, anchor_column)
+    }
+    if (empty(stops)) {
+        // no tab stops: place the caret and stay sessionless
+        text_edit_set_cursor(ed, final_at.x, final_at.y)
+        delete stops
+        return
+    }
+    stops |> push(TextEditSnippetStop(line = final_at.x, index = 0,
+        start_column = final_at.y, end_column = final_at.y))
+    ed.snippet_stops <- stops
+    ed.snippet_index = 0
+    snippet_focus_stop(ed)
+}
+
+def public text_edit_snippet_expand(var ed : TextEditState;
+                                    pattern : string) : bool {
+    //! Expand a `$\{n:label}` snippet at the caret (replacing any selection)
+    //! as ONE undo unit and arm the tab-stop session; `$\{SEL}` splices the
+    //! selection, `$\{0}` places the final caret.
+    ensure_line(ed)
+    text_edit_snippet_end(ed)
+    let had_selection = text_edit_has_selection(ed)
+    let target = text_edit_selection(ed)
+    let anchor_line = had_selection ? target.start_line : ed.cursor_line
+    let anchor_column = had_selection ? target.start_column : ed.cursor_column
+    var parsed = SnippetParse()
+    snippet_parse(pattern, had_selection ? text_edit_selected_text(ed) : "",
+        leading_whitespace(ed.lines[anchor_line]), parsed)
+    if (empty(parsed.body) && parsed.final_at.x < 0) {
+        delete parsed.stops
+        return false
+    }
+    text_edit_push_undo_stop(ed)
+    text_edit_insert(ed, parsed.body)
+    ed.snippet_region = TextEditRange(start_line = anchor_line,
+        start_column = anchor_column,
+        end_line = ed.cursor_line, end_column = ed.cursor_column)
+    snippet_arm(ed, parsed, anchor_line, anchor_column)
+    patch_unit_after(ed)
+    text_edit_push_undo_stop(ed)
+    delete parsed.stops
+    return true
+}
+
+def public text_edit_snippet_next(var ed : TextEditState) : bool {
+    //! Tab: advance to the next stop; past the last (or onto `$\{0}`) lands
+    //! the final caret and ends the session. False = no active session.
+    return false if (ed.snippet_index < 0)
+    ed.snippet_index++
+    if (ed.snippet_index >= length(ed.snippet_stops)
+            || ed.snippet_stops[ed.snippet_index].index == 0) {
+        let final_stop = ed.snippet_stops[length(ed.snippet_stops) - 1]
+        text_edit_set_cursor(ed, final_stop.line, final_stop.start_column)
+        text_edit_snippet_end(ed)
+        return true
+    }
+    snippet_focus_stop(ed)
+    return true
+}
+
+def public text_edit_snippet_prev(var ed : TextEditState) : bool {
+    //! Shift+Tab: step back to the previous stop (clamped at the first).
+    return false if (ed.snippet_index < 0)
+    if (ed.snippet_index > 0) {
+        ed.snippet_index--
+    }
+    snippet_focus_stop(ed)
+    return true
+}
+
+def public text_edit_snippet_sync(var ed : TextEditState) {
+    //! Frame watchdog: the caret leaving the inserted region ends the session.
+    return if (ed.snippet_index < 0)
+    let region = ed.snippet_region
+    if (pos_before(ed.cursor_line, ed.cursor_column,
+                   region.start_line, region.start_column)
+            || pos_before(region.end_line, region.end_column,
+                          ed.cursor_line, ed.cursor_column)) {
+        text_edit_snippet_end(ed)
+    }
+}
+
+def public text_edit_patch_redo_cursor(var ed : TextEditState) {
+    //! Stamp the caret placed AFTER a compound commit into the newest undo
+    //! unit so redo restores it (the line-op recipe, public for registries).
+    patch_unit_after(ed)
+}
+
+def private snippet_map_position(p, s, re, ie : int2) : int2 {
+    // map a tracked position across (removed -> inserted) at s; (-1,-1) = gone
+    if (pos_before(p.x, p.y, s.x, s.y)) return p
+    if (!pos_before(p.x, p.y, re.x, re.y)) {
+        let dl = ie.x - re.x
+        if (p.x == re.x) return int2(ie.x, ie.y + (p.y - re.y))
+        return int2(p.x + dl, p.y)
+    }
+    return int2(-1, -1)
+}
+
+def private snippet_track_stop(var stop : TextEditSnippetStop;
+                               s, re, ie : int2) : bool {
+    // false = the session must die (partial overlap / stop went multi-line)
+    let start_ = int2(stop.line, stop.start_column)
+    let end_ = int2(stop.line, stop.end_column)
+    if (!pos_before(s.x, s.y, start_.x, start_.y)
+            && !pos_before(end_.x, end_.y, re.x, re.y)) {
+        // edit CONTAINED in the stop: the start anchors, only the end maps
+        let mapped = snippet_map_position(end_, s, re, ie)
+        return false if (mapped.x != stop.line)
+        stop.end_column = mapped.y
+        return true
+    }
+    if (!pos_before(s.x, s.y, end_.x, end_.y)) {
+        return true // entirely after the stop
+    }
+    if (!pos_before(start_.x, start_.y, re.x, re.y)) {
+        // entirely before: both ends shift
+        let mapped_start = snippet_map_position(start_, s, re, ie)
+        let mapped_end = snippet_map_position(end_, s, re, ie)
+        return false if (mapped_start.x < 0 || mapped_end.x < 0
+            || mapped_start.x != mapped_end.x)
+        stop.line = mapped_start.x
+        stop.start_column = mapped_start.y
+        stop.end_column = mapped_end.y
+        return true
+    }
+    return false
+}
+
+def private snippet_track_edit(var ed : TextEditState; line, column : int;
+                               removed, inserted : string) {
+    // ONE rule at the ONE mutation funnel: shift/grow stops, else kill clean
+    return if (ed.snippet_index < 0)
+    let s = int2(line, column)
+    let re = text_end_position(line, column, removed)
+    let ie = text_end_position(line, column, inserted)
+    var region = ed.snippet_region
+    var ok = true
+    if (pos_before(re.x, re.y, region.start_line, region.start_column)) {
+        let mapped = snippet_map_position(
+            int2(region.start_line, region.start_column), s, re, ie)
+        region.start_line = mapped.x
+        region.start_column = mapped.y
+    } elif (pos_before(s.x, s.y, region.start_line, region.start_column)) {
+        ok = false // the edit spans across the region's start
+    }
+    if (ok && !pos_before(region.end_line, region.end_column, s.x, s.y)) {
+        let mapped = snippet_map_position(
+            int2(region.end_line, region.end_column), s, re, ie)
+        if (mapped.x < 0) {
+            ok = false
+        } else {
+            region.end_line = mapped.x
+            region.end_column = mapped.y
+        }
+    }
+    var index = 0
+    while (ok && index < length(ed.snippet_stops)) {
+        ok = snippet_track_stop(ed.snippet_stops[index], s, re, ie)
+        index++
+    }
+    if (!ok) {
+        text_edit_snippet_end(ed)
+        return
+    }
+    ed.snippet_region = region
 }
 
 // ===== Find / replace =====
@@ -1627,10 +2328,12 @@ def public text_edit_replace_all(var ed : TextEditState;
     //! Replace every span (ascending, non-overlapping) with its text as ONE
     //! undo unit — one undo reverts the whole replace-all. Returns the count.
     ensure_line(ed)
+    text_edit_snippet_end(ed) // bypasses commit_edit: stops cannot track it
     let count_ = min(length(spans), length(texts))
     return 0 if (count_ == 0)
     delete ed.redo_stack
-    var unit = TextEditUndoUnit(kind = TextEditUndoKind.other,
+    ed.undo_serial++
+    var unit = TextEditUndoUnit(kind = TextEditUndoKind.other, serial = ed.undo_serial,
         before_cursor_line = ed.cursor_line, before_cursor_column = ed.cursor_column,
         before_anchor_line = ed.anchor_line, before_anchor_column = ed.anchor_column)
     ed.undo_stack |> emplace(unit)
@@ -1661,6 +2364,65 @@ def public text_edit_replace_all(var ed : TextEditState;
     return count_
 }
 
+def private pos_before(a_line, a_column, b_line, b_column : int) : bool {
+    return a_line < b_line || (a_line == b_line && a_column < b_column)
+}
+
+def public text_edit_move_selection_to(var ed : TextEditState;
+                                       line, column : int) : bool {
+    //! Drag-and-drop: move the selected text to (line, column) as ONE undo
+    //! unit; the moved text stays selected. Declines inside the selection.
+    return false if (!text_edit_has_selection(ed))
+    let sel = text_edit_selection(ed)
+    return false if (!pos_before(line, column, sel.start_line, sel.start_column)
+        && !pos_before(sel.end_line, sel.end_column, line, column))
+    let moved = text_edit_range_text(ed, sel)
+    // removal shifts a target sitting past the selection
+    var target_line = line
+    var target_column = column
+    if (pos_before(sel.end_line, sel.end_column, line, column)) {
+        // the removal splices the end-line tail onto start_column, single-
+        // and multi-line spans alike
+        if (line == sel.end_line) {
+            target_column = column - sel.end_column + sel.start_column
+        }
+        target_line = line - (sel.end_line - sel.start_line)
+    }
+    delete ed.redo_stack
+    ed.undo_serial++
+    var unit = TextEditUndoUnit(kind = TextEditUndoKind.other, serial = ed.undo_serial,
+        before_cursor_line = ed.cursor_line, before_cursor_column = ed.cursor_column,
+        before_anchor_line = ed.anchor_line, before_anchor_column = ed.anchor_column)
+    ed.undo_stack |> emplace(unit)
+    let unit_index = length(ed.undo_stack) - 1
+    ed.undo_stack[unit_index].ops |> push(TextEditUndoOp(line = sel.start_line,
+        column = sel.start_column, removed = moved, inserted = ""))
+    remove_range_raw(ed, sel)
+    ed.undo_stack[unit_index].ops |> push(TextEditUndoOp(line = target_line,
+        column = target_column, removed = "", inserted = moved))
+    let landed = insert_raw(ed, target_line, target_column, moved)
+    // the moved text stays selected, caret at its end
+    ed.anchor_line = target_line
+    ed.anchor_column = target_column
+    ed.cursor_line = landed.x
+    ed.cursor_column = landed.y
+    var last & = unsafe(ed.undo_stack[unit_index])
+    last.after_cursor_line = ed.cursor_line
+    last.after_cursor_column = ed.cursor_column
+    last.end_line = ed.cursor_line
+    last.end_column = ed.cursor_column
+    ed.undo_open = false
+    refresh_dirty(ed)
+    ed.revision++
+    ed.follow_revision++
+    ed.blink_time = 0.0f
+    ed.syntax_idle = 0.0f
+    ed.ghost_text = ""
+    ed.preferred_column = -1
+    restyle_lines(ed, 0, length(ed.lines) - 1)
+    return true
+}
+
 def public text_edit_set_highlights(var ed : TextEditState;
                                     spans : array<TextEditRange>) {
     //! Ranges painted under the text (find matches); keep them ascending.
@@ -1670,6 +2432,19 @@ def public text_edit_set_highlights(var ed : TextEditState;
 
 def public text_edit_clear_highlights(var ed : TextEditState) {
     delete ed.highlight_ranges
+}
+
+def public text_edit_highlight_row_span(ed : TextEditState const;
+                                        span : TextEditRange const;
+                                        row : int) : int2 {
+    //! Byte range a highlight covers on `row`, (-1,-1) when none — clamped at
+    //! USE because host ranges go stale between an edit and the next find sync.
+    return int2(-1, -1) if (row < 0 || row >= length(ed.lines)
+        || row < span.start_line || row > span.end_line)
+    let bytes = length(ed.lines[row])
+    let from = row == span.start_line ? clamp(span.start_column, 0, bytes) : 0
+    let to = row == span.end_line ? clamp(span.end_column, 0, bytes) : bytes
+    return int2(from, max(to, from))
 }
 
 def private refresh_find_highlights(var ed : TextEditState;
@@ -1805,6 +2580,49 @@ def public text_edit_find_sync(var ed : TextEditState; var find : TextFindState;
     text_edit_find_sync(ed, find)
 }
 
+def private trim_right_ws(line : string) : string {
+    var end_ = length(line)
+    peek_data(line) $(bytes) {
+        while (end_ > 0 && (int(bytes[end_ - 1]) == ' '
+                || int(bytes[end_ - 1]) == '\t')) {
+            end_--
+        }
+    }
+    return slice(line, 0, end_)
+}
+
+def public text_edit_join_lines(var ed : TextEditState) {
+    //! Ctrl+J: join the selection's lines (or the current line with the
+    //! next) with single spaces, whitespace collapsed at the seams; ONE undo
+    //! unit, caret lands on the first seam.
+    ensure_line(ed)
+    let touched = line_block(ed)
+    let last = max(touched.y, touched.x + 1)
+    return if (last >= length(ed.lines))
+    let first_part = trim_right_ws(ed.lines[touched.x])
+    let seam = length(first_part)
+    let joined = build_string() $(var writer) {
+        writer |> write(first_part)
+        var wrote = !empty(first_part)
+        for (index in range(touched.x + 1, last + 1)) {
+            let line = ed.lines[index]
+            let tail = trim_right_ws(slice(line,
+                length(leading_whitespace(line)), length(line)))
+            continue if (empty(tail))
+            if (wrote) {
+                writer |> write(" ")
+            }
+            writer |> write(tail)
+            wrote = true
+        }
+    }
+    commit_edit(ed, TextEditUndoKind.other, touched.x, 0,
+        block_text(ed, touched.x, last), joined)
+    ed.cursor_line = touched.x
+    ed.cursor_column = min(seam, length(ed.lines[touched.x]))
+    patch_unit_after(ed)
+}
+
 def public text_edit_expand_line_selection(var ed : TextEditState) {
     //! Ctrl+L: select the current line incl. newline; repeat extends a line.
     ensure_line(ed)
@@ -1901,133 +2719,6 @@ def private drain_typed_chars(var ed : TextEditState) : bool {
     return typed_chars
 }
 
-def private nav_pressed(main_key, keypad_key : ImGuiKey; keypad_nav : bool) : bool {
-    // every nav key answers for its numpad twin; twins mute while typing
-    return (IsKeyPressed(main_key, true)
-        || (keypad_nav && IsKeyPressed(keypad_key, true)))
-}
-
-def private route_editor_keys(var ed : TextEditState; page_rows : int; // nolint:STYLE037
-                              use_system_clipboard : bool) {
-    // interim hardwired keymap — migrates to imgui_commands in the registry step
-    let io & = unsafe(GetIO())
-    let select = io.KeyShift
-    // chars drain FIRST: a char-delivering frame types, keypad nav mutes
-    let keypad_nav = !drain_typed_chars(ed)
-    if (io.KeyCtrl && !io.KeyAlt) {
-        if (nav_pressed(ImGuiKey.LeftArrow, ImGuiKey.Keypad4, keypad_nav)) {
-            text_edit_move_word_left(ed, select)
-        }
-        if (nav_pressed(ImGuiKey.RightArrow, ImGuiKey.Keypad6, keypad_nav)) {
-            text_edit_move_word_right(ed, select)
-        }
-        if (nav_pressed(ImGuiKey.UpArrow, ImGuiKey.Keypad8, keypad_nav)) {
-            text_edit_move_vertical(ed, -1, select)
-        }
-        if (nav_pressed(ImGuiKey.DownArrow, ImGuiKey.Keypad2, keypad_nav)) {
-            text_edit_move_vertical(ed, 1, select)
-        }
-        if (nav_pressed(ImGuiKey.Home, ImGuiKey.Keypad7, keypad_nav)) {
-            text_edit_move_document_start(ed, select)
-        }
-        if (nav_pressed(ImGuiKey.End, ImGuiKey.Keypad1, keypad_nav)) {
-            text_edit_move_document_end(ed, select)
-        }
-        if (IsKeyPressed(ImGuiKey.Backspace, true)) {
-            text_edit_delete_word_left(ed)
-        }
-        if (nav_pressed(ImGuiKey.Delete, ImGuiKey.KeypadDecimal, keypad_nav)) {
-            text_edit_delete_word_right(ed)
-        }
-        if (IsKeyPressed(ImGuiKey.A, false)
-                || (keypad_nav && IsKeyPressed(ImGuiKey.Keypad5, false))) {
-            text_edit_select_all(ed)
-        }
-        if (IsKeyPressed(ImGuiKey.Z, true)) {
-            let _ = io.KeyShift ? text_edit_redo(ed) : text_edit_undo(ed)
-        }
-        if (IsKeyPressed(ImGuiKey.Y, true)) {
-            let _ = text_edit_redo(ed)
-        }
-        if (IsKeyPressed(ImGuiKey.C, false) || IsKeyPressed(ImGuiKey.Insert, false)
-                || (keypad_nav && IsKeyPressed(ImGuiKey.Keypad0, false))) {
-            editor_copy_to_clipboard(ed, use_system_clipboard)
-        }
-        if (IsKeyPressed(ImGuiKey.X, false)) {
-            editor_cut_to_clipboard(ed, use_system_clipboard)
-        }
-        if (IsKeyPressed(ImGuiKey.V, true)) {
-            editor_paste_from_clipboard(ed, use_system_clipboard)
-        }
-    } elif (io.KeyAlt && !io.KeyCtrl) {
-        // Alt+Backspace undo, Shift+Alt+Backspace redo — the CUA legacy pair.
-        if (IsKeyPressed(ImGuiKey.Backspace, true)) {
-            let _ = io.KeyShift ? text_edit_redo(ed) : text_edit_undo(ed)
-        }
-    } elif (!io.KeyAlt) {
-        if (nav_pressed(ImGuiKey.LeftArrow, ImGuiKey.Keypad4, keypad_nav)) {
-            text_edit_move_left(ed, select)
-        }
-        if (nav_pressed(ImGuiKey.RightArrow, ImGuiKey.Keypad6, keypad_nav)) {
-            text_edit_move_right(ed, select)
-        }
-        if (nav_pressed(ImGuiKey.UpArrow, ImGuiKey.Keypad8, keypad_nav)) {
-            if (select || !text_edit_list_prev(ed)) {
-                text_edit_move_vertical(ed, -1, select)
-            }
-        }
-        if (nav_pressed(ImGuiKey.DownArrow, ImGuiKey.Keypad2, keypad_nav)) {
-            if (select || !text_edit_list_next(ed)) {
-                text_edit_move_vertical(ed, 1, select)
-            }
-        }
-        if (nav_pressed(ImGuiKey.PageUp, ImGuiKey.Keypad9, keypad_nav)) {
-            text_edit_move_vertical(ed, -max(page_rows, 1), select)
-        }
-        if (nav_pressed(ImGuiKey.PageDown, ImGuiKey.Keypad3, keypad_nav)) {
-            text_edit_move_vertical(ed, max(page_rows, 1), select)
-        }
-        if (nav_pressed(ImGuiKey.Home, ImGuiKey.Keypad7, keypad_nav)) {
-            text_edit_move_home(ed, select)
-        }
-        if (nav_pressed(ImGuiKey.End, ImGuiKey.Keypad1, keypad_nav)) {
-            text_edit_move_end(ed, select)
-        }
-        if (IsKeyPressed(ImGuiKey.Enter, true) || IsKeyPressed(ImGuiKey.KeypadEnter, true)) {
-            if (!text_edit_list_accept(ed)) {
-                text_edit_newline(ed)
-            }
-        }
-        if (IsKeyPressed(ImGuiKey.Backspace, true)) {
-            text_edit_backspace(ed)
-        }
-        if (nav_pressed(ImGuiKey.Delete, ImGuiKey.KeypadDecimal, keypad_nav)) {
-            if (select) {
-                editor_cut_to_clipboard(ed, use_system_clipboard) // Shift+Del = cut (CUA)
-            } else {
-                text_edit_delete(ed)
-            }
-        }
-        if (select && IsKeyPressed(ImGuiKey.Insert, false)) {
-            editor_paste_from_clipboard(ed, use_system_clipboard) // Shift+Ins = paste (CUA)
-        }
-        if (!select && (IsKeyPressed(ImGuiKey.Insert, false)
-                || (keypad_nav && IsKeyPressed(ImGuiKey.Keypad0, false)))) {
-            text_edit_toggle_overtype(ed)
-        }
-        if (IsKeyPressed(ImGuiKey.Tab, true)) {
-            text_edit_insert(ed, "\t")
-        }
-        if (IsKeyPressed(ImGuiKey.Escape, false)) {
-            if (ed.list_open) {
-                text_edit_close_list(ed)
-            } elif (text_edit_has_selection(ed)) {
-                text_edit_clear_selection(ed)
-            }
-        }
-    }
-}
-
 struct private EditMetrics {
     zoom : float = 1.0f
     font_size : float = 0.0f
@@ -2035,14 +2726,28 @@ struct private EditMetrics {
     cell_width : float = 1.0f
     number_width : float = 0.0f
     gutter_space : float = 0.0f
-    origin : float2
+    origin : float2 // screen top-left of line_first's row
     extent : float2
     view_height : float = 0.0f
+    view_top : float = 0.0f // screen y of the scrolling viewport's top
+    line_first : int = 0
+    line_last : int = 0 // inclusive
 }
+
+def private edit_row_y(m : EditMetrics; row : int) : float => (
+    m.origin.y + float(row - m.line_first) * m.line_height)
+
+def private edit_hit_row(ed : TextEditState const; m : EditMetrics;
+                         mouse_y : float) : int => (
+    clamp(m.line_first + int(floor((mouse_y - m.origin.y) / m.line_height)),
+        m.line_first, min(m.line_last, length(ed.lines) - 1)))
 
 def private compute_edit_metrics(ed : TextEditState const;
                                  style : TextSourceViewStyle const;
-                                 var font : ImFont?) : EditMetrics {
+                                 var font : ImFont?;
+                                 line_first : int = 0; line_last : int = -1;
+                                 view_height_override : float = -1.0f;
+                                 view_top_override : float = -1.0f) : EditMetrics {
     let zoom = clamp(style.zoom, 0.5f, 3.0f)
     let font_size = (style.fonts.size_px > 0.0f
         ? style.fonts.size_px : GetFontSize()) * zoom
@@ -2051,101 +2756,201 @@ def private compute_edit_metrics(ed : TextEditState const;
     let cell_width = max(1.0f,
         CalcTextSizeForFontRange(font, font_size, "M", 1, 0, 1).x)
     let line_count = length(ed.lines)
+    // the gutter is sized from the FULL buffer so it never jumps per segment
     let number_text = "{line_count}"
     let number_width = CalcTextSizeForFontRange(font, font_size,
         number_text, length(number_text), 0, length(number_text)).x
     let gutter_space = number_width + cell_width * 2.0f
     let text_width = max(GetContentRegionAvail().x - gutter_space,
         float(ed.max_line_bytes) * cell_width + cell_width)
+    let seg_last = line_last < 0 ? line_count - 1 : min(line_last, line_count - 1)
+    let seg_first = clamp(line_first, 0, max(seg_last, 0))
+    let row_count = max(seg_last - seg_first + 1, 1)
     return EditMetrics(zoom = zoom, font_size = font_size,
         line_height = line_height, cell_width = cell_width,
         number_width = number_width, gutter_space = gutter_space,
         origin = GetCursorScreenPos(),
-        extent = float2(gutter_space + text_width, float(line_count) * line_height),
-        view_height = GetWindowHeight())
+        extent = float2(gutter_space + text_width, float(row_count) * line_height),
+        view_height = (view_height_override >= 0.0f
+            ? view_height_override : GetWindowHeight()),
+        view_top = (view_top_override >= 0.0f
+            ? view_top_override : GetWindowPos().y),
+        line_first = seg_first, line_last = seg_last)
 }
 
 def private edit_hit_position(ed : TextEditState const; m : EditMetrics;
                               style : TextSourceViewStyle const;
                               var font : ImFont?) : int2 {
     let local = GetMousePos() - m.origin
-    let row = clamp(int(floor(local.y / m.line_height)), 0, length(ed.lines) - 1)
+    let row = edit_hit_row(ed, m, GetMousePos().y)
     let column = edit_hit_column(ed.lines[row], local.x - m.gutter_space,
         font, m.font_size, m.cell_width, style.tab_cells)
     return int2(row, column)
 }
 
-def private handle_edit_mouse(var ed : TextEditState; m : EditMetrics;
-                              style : TextSourceViewStyle const; hovered : bool;
-                              var font : ImFont?) {
-    let io & = unsafe(GetIO())
-    if (hovered && IsMouseClicked(ImGuiMouseButton.Left, false)) {
-        ed.focused = true
-        let hit = edit_hit_position(ed, m, style, font)
-        let clicks = GetMouseClickedCount(ImGuiMouseButton.Left)
-        if (io.KeyShift) {
-            // Shift+click extends from the current caret (or existing anchor).
-            if (ed.anchor_line < 0) {
-                ed.anchor_line = ed.cursor_line
-                ed.anchor_column = ed.cursor_column
-            }
-            ed.cursor_line = hit.x
-            ed.cursor_column = hit.y
-        } elif (clicks >= 3) {
-            // Triple-click: whole line including its newline.
-            ed.anchor_line = hit.x
-            ed.anchor_column = 0
-            if (hit.x < length(ed.lines) - 1) {
-                ed.cursor_line = hit.x + 1
-                ed.cursor_column = 0
-            } else {
-                ed.cursor_line = hit.x
-                ed.cursor_column = length(ed.lines[hit.x])
-            }
-        } elif (clicks == 2) {
-            let run = word_run_at(ed.lines[hit.x], hit.y)
-            ed.anchor_line = hit.x
-            ed.anchor_column = run.x
-            ed.cursor_line = hit.x
-            ed.cursor_column = run.y
-        } else {
-            ed.cursor_line = hit.x
-            ed.cursor_column = hit.y
-            // Anchor arms at the click point; dragging grows the selection.
-            ed.anchor_line = hit.x
-            ed.anchor_column = hit.y
-            ed.selection_dragging = true
-        }
-        ed.preferred_column = -1
-        ed.blink_time = 0.0f
-    } elif (ed.selection_dragging && IsMouseDown(ImGuiMouseButton.Left)) {
-        let hit = edit_hit_position(ed, m, style, font)
+def private inside_selection(ed : TextEditState const; hit : int2) : bool {
+    return false if (!text_edit_has_selection(ed))
+    let sel = text_edit_selection(ed)
+    return (!pos_before(hit.x, hit.y, sel.start_line, sel.start_column)
+        && pos_before(hit.x, hit.y, sel.end_line, sel.end_column))
+}
+
+def private extend_word_drag(var ed : TextEditState; hit : int2) {
+    // double-click drag grows by whole words around the origin word
+    let run = word_run_at(ed.lines[hit.x], hit.y)
+    if (pos_before(hit.x, run.x, ed.drag_origin_line, ed.drag_origin_start)) {
+        ed.anchor_line = ed.drag_origin_line
+        ed.anchor_column = ed.drag_origin_end
         ed.cursor_line = hit.x
-        ed.cursor_column = hit.y
-    } elif (!hovered && IsMouseClicked(ImGuiMouseButton.Left, false)) {
-        ed.focused = false
+        ed.cursor_column = run.x
+    } else {
+        ed.anchor_line = ed.drag_origin_line
+        ed.anchor_column = ed.drag_origin_start
+        ed.cursor_line = hit.x
+        ed.cursor_column = run.y
     }
-    if (ed.selection_dragging && IsMouseReleased(ImGuiMouseButton.Left)) {
-        ed.selection_dragging = false
-        if (!text_edit_has_selection(ed)) {
-            text_edit_clear_selection(ed)
+}
+
+def private extend_line_drag(var ed : TextEditState; hit_line : int) {
+    // triple-click drag grows by whole lines around the origin line
+    if (hit_line < ed.drag_origin_line) {
+        let below = min(ed.drag_origin_line + 1, length(ed.lines) - 1)
+        ed.anchor_line = below
+        ed.anchor_column = below > ed.drag_origin_line ? 0 : length(ed.lines[below])
+        ed.cursor_line = hit_line
+        ed.cursor_column = 0
+    } else {
+        ed.anchor_line = ed.drag_origin_line
+        ed.anchor_column = 0
+        if (hit_line < length(ed.lines) - 1) {
+            ed.cursor_line = hit_line + 1
+            ed.cursor_column = 0
+        } else {
+            ed.cursor_line = hit_line
+            ed.cursor_column = length(ed.lines[hit_line])
         }
     }
 }
 
-def private follow_edit_cursor(var ed : TextEditState; m : EditMetrics;
-                               tab_cells : int; var font : ImFont?) {
-    //! Scroll-follow before drawing so the caret never renders off-view.
-    return if (ed.follow_revision == ed.followed_revision)
-    ed.followed_revision = ed.follow_revision
-    let scroll_y = GetScrollY()
-    let widget_top = m.origin.y - GetWindowPos().y + scroll_y
-    let cursor_top = widget_top + float(ed.cursor_line) * m.line_height
-    if (cursor_top < scroll_y) {
-        SetScrollY(max(cursor_top, 0.0f))
-    } elif (cursor_top + m.line_height > scroll_y + m.view_height) {
-        SetScrollY(cursor_top + m.line_height - m.view_height)
+def private handle_edit_click(var ed : TextEditState; hit : int2;
+                              clicks : int; shift : bool) {
+    ed.focused = true
+    if (shift) {
+        // Shift+click extends from the current caret (or existing anchor).
+        if (ed.anchor_line < 0) {
+            ed.anchor_line = ed.cursor_line
+            ed.anchor_column = ed.cursor_column
+        }
+        ed.cursor_line = hit.x
+        ed.cursor_column = hit.y
+    } elif (clicks >= 3) {
+        ed.drag_mode = 2
+        ed.drag_origin_line = hit.x
+        ed.selection_dragging = true
+        extend_line_drag(ed, hit.x)
+    } elif (clicks == 2) {
+        let run = word_run_at(ed.lines[hit.x], hit.y)
+        ed.drag_mode = 1
+        ed.drag_origin_line = hit.x
+        ed.drag_origin_start = run.x
+        ed.drag_origin_end = run.y
+        ed.selection_dragging = true
+        ed.anchor_line = hit.x
+        ed.anchor_column = run.x
+        ed.cursor_line = hit.x
+        ed.cursor_column = run.y
+    } elif (inside_selection(ed, hit)) {
+        // maybe a drag-and-drop of the selection; the caret waits for release
+        ed.drag_move_pending = true
+    } else {
+        ed.drag_mode = 0
+        ed.cursor_line = hit.x
+        ed.cursor_column = hit.y
+        // Anchor arms at the click point; dragging grows the selection.
+        ed.anchor_line = hit.x
+        ed.anchor_column = hit.y
+        ed.selection_dragging = true
     }
+    ed.preferred_column = -1
+    ed.blink_time = 0.0f
+}
+
+def private handle_edit_mouse(var ed : TextEditState; m : EditMetrics;
+                              style : TextSourceViewStyle const;
+                              hovered, window_hovered : bool;
+                              dead_area, defocus_outside : bool;
+                              var font : ImFont?) {
+    let io & = unsafe(GetIO())
+    if (hovered && IsMouseClicked(ImGuiMouseButton.Left, false)) {
+        if (!swatch_at_mouse(ed, m, style, font)) {
+            handle_edit_click(ed, edit_hit_position(ed, m, style, font),
+                GetMouseClickedCount(ImGuiMouseButton.Left), io.KeyShift)
+            ed.drag_owner_first = m.line_first
+        }
+    } elif ((ed.selection_dragging || ed.drag_move_pending)
+            && ed.drag_owner_first == m.line_first
+            && IsMouseDown(ImGuiMouseButton.Left)) {
+        let hit = edit_hit_position(ed, m, style, font)
+        if (ed.drag_move_pending) {
+            if (IsMouseDragging(ImGuiMouseButton.Left, 4.0f)) {
+                ed.drag_move_active = true
+            }
+        } elif (ed.drag_mode == 1) {
+            extend_word_drag(ed, hit)
+        } elif (ed.drag_mode == 2) {
+            extend_line_drag(ed, hit.x)
+        } else {
+            ed.cursor_line = hit.x
+            ed.cursor_column = hit.y
+        }
+    } elif (dead_area && !hovered && IsMouseClicked(ImGuiMouseButton.Left, false)) {
+        if (window_hovered) {
+            // dead area past the buffer: land on the clamped last-line hit
+            ed.focused = true
+            let hit = edit_hit_position(ed, m, style, font)
+            ed.cursor_line = hit.x
+            ed.cursor_column = hit.y
+            ed.anchor_line = hit.x
+            ed.anchor_column = hit.y
+            ed.selection_dragging = true
+            ed.drag_owner_first = m.line_first
+            ed.preferred_column = -1
+            ed.blink_time = 0.0f
+        } elif (defocus_outside && !ed.goto_open) {
+            // clicks on the goto dialog itself never unfocus the editor
+            ed.focused = false
+        }
+    }
+    // only the drag-owner segment finishes it (siblings would re-clamp the hit)
+    if (IsMouseReleased(ImGuiMouseButton.Left)
+            && ed.drag_owner_first == m.line_first) {
+        if (ed.drag_move_active) {
+            // drop the selection at the release point (declines inside it)
+            let hit = edit_hit_position(ed, m, style, font)
+            if (!text_edit_move_selection_to(ed, hit.x, hit.y)) {
+                text_edit_set_cursor(ed, hit.x, hit.y)
+            }
+        } elif (ed.drag_move_pending) {
+            // pressed inside the selection, never moved: a plain click
+            let hit = edit_hit_position(ed, m, style, font)
+            text_edit_set_cursor(ed, hit.x, hit.y)
+        }
+        ed.drag_move_pending = false
+        ed.drag_move_active = false
+        ed.drag_mode = 0
+        ed.drag_owner_first = -1
+        if (ed.selection_dragging) {
+            ed.selection_dragging = false
+            if (!text_edit_has_selection(ed)) {
+                text_edit_clear_selection(ed)
+            }
+        }
+    }
+}
+
+def private follow_edit_cursor_x(ed : TextEditState const; m : EditMetrics;
+                                 tab_cells : int; var font : ImFont?) {
+    // X-only half; runs inside the segment's own child, never stamps the latch
     let caret_x = text_source_range_width(ed.lines[ed.cursor_line], 0,
         ed.cursor_column, font, m.font_size, m.cell_width, tab_cells)
     let scroll_x = GetScrollX()
@@ -2157,48 +2962,57 @@ def private follow_edit_cursor(var ed : TextEditState; m : EditMetrics;
     }
 }
 
-def private draw_edit_content(var ed : TextEditState; m : EditMetrics;
+def private follow_edit_cursor(var ed : TextEditState; m : EditMetrics;
+                               tab_cells : int; var font : ImFont?) {
+    //! Scroll-follow before drawing so the caret never renders off-view.
+    return if (ed.follow_revision == ed.followed_revision)
+    ed.followed_revision = ed.follow_revision
+    let scroll_y = GetScrollY()
+    let widget_top = m.origin.y - GetWindowPos().y + scroll_y
+    let cursor_top = widget_top + float(ed.cursor_line - m.line_first) * m.line_height
+    if (cursor_top < scroll_y) {
+        SetScrollY(max(cursor_top, 0.0f))
+    } elif (cursor_top + m.line_height > scroll_y + m.view_height) {
+        SetScrollY(cursor_top + m.line_height - m.view_height)
+    }
+    follow_edit_cursor_x(ed, m, tab_cells, font)
+}
+
+def private draw_edit_content(ed : TextEditState const; m : EditMetrics;
                               style : TextSourceViewStyle const;
-                              var font : ImFont?) {
+                              var font : ImFont?; primary : bool) {
     var dl = GetWindowDrawList()
-    let draw_count = length(ed.lines)
+    let draw_last = min(m.line_last, length(ed.lines) - 1)
+    // viewport-top virtualization - a segment child's own pos pins to its head
     let first_visible = clamp(
-        int(floor((GetWindowPos().y - m.origin.y) / m.line_height)),
-        0, draw_count - 1)
+        m.line_first + int(floor((m.view_top - m.origin.y) / m.line_height)),
+        m.line_first, draw_last)
     let last_visible = clamp(
         first_visible + int(ceil(m.view_height / m.line_height)) + 1,
-        0, draw_count - 1)
-    let io & = unsafe(GetIO())
-    ed.blink_time += io.DeltaTime
-    ed.syntax_idle += io.DeltaTime
+        m.line_first, draw_last)
     draw_edit_highlights(ed, m, style, font, dl, first_visible, last_visible)
     if (ed.focused) {
         draw_bracket_highlight(ed, m, style, font, dl, first_visible, last_visible)
     }
+    if (!empty(ed.diagnostics)) {
+        draw_edit_diagnostics(ed, m, style, font, dl, first_visible, last_visible)
+    }
     let has_selection = text_edit_has_selection(ed)
     let sel = text_edit_selection(ed)
+    // the ghost pushes the tail of the caret row right, never over it
+    let ghost_active = ed.focused && !empty(ed.ghost_text) && !has_selection
+    let ghost_width = !ghost_active ? 0.0f : text_source_range_width(
+        ed.ghost_text, 0, length(ed.ghost_text), font, m.font_size,
+        m.cell_width, style.tab_cells)
     for (row in range(first_visible, last_visible + 1)) {
-        let row_origin = float2(m.origin.x, m.origin.y + float(row) * m.line_height)
+        let row_origin = float2(m.origin.x, edit_row_y(m, row))
         if (row == ed.cursor_line && ed.focused && !has_selection) {
             *dl |> AddRectFilled(row_origin,
                 row_origin + float2(m.extent.x, m.line_height),
                 GetColorU32(style.current_line_color), 0.0f, ImDrawFlags.None)
         }
         if (has_selection && row >= sel.start_line && row <= sel.end_line) {
-            let row_line = ed.lines[row]
-            let from_column = row == sel.start_line ? sel.start_column : 0
-            let to_column = row == sel.end_line ? sel.end_column : length(row_line)
-            let x0 = (m.gutter_space + text_source_range_width(row_line, 0,
-                from_column, font, m.font_size, m.cell_width, style.tab_cells))
-            var x1 = (m.gutter_space + text_source_range_width(row_line, 0,
-                to_column, font, m.font_size, m.cell_width, style.tab_cells))
-            if (row < sel.end_line) {
-                x1 += m.cell_width * 0.5f // the selected newline shows as a nub
-            }
-            *dl |> AddRectFilled(
-                float2(row_origin.x + x0, row_origin.y),
-                float2(row_origin.x + max(x1, x0 + 1.0f), row_origin.y + m.line_height),
-                GetColorU32(style.selection_color), 0.0f, ImDrawFlags.None)
+            draw_row_selection(ed, m, style, font, dl, row, row_origin, sel)
         }
         let row_number = "{row + 1}"
         let row_number_width = CalcTextSizeForFontRange(font, m.font_size,
@@ -2209,7 +3023,13 @@ def private draw_edit_content(var ed : TextEditState; m : EditMetrics;
             row_number, length(row_number), 0, length(row_number))
         let line = ed.lines[row]
         if (!empty(line)) {
-            draw_edit_line(ed, row, line, m, style, font, dl, row_origin)
+            if (ghost_active && row == ed.cursor_line) {
+                draw_edit_line(ed, row, line, m, style, font, dl, row_origin,
+                    ed.cursor_column, ghost_width)
+            } else {
+                draw_edit_line(ed, row, line, m, style, font, dl, row_origin)
+            }
+            draw_color_swatches(ed, m, style, font, dl, row)
         }
     }
     if (ed.focused && !empty(ed.ghost_text) && !has_selection
@@ -2218,26 +3038,32 @@ def private draw_edit_content(var ed : TextEditState; m : EditMetrics;
     }
     if (ed.focused && ed.cursor_line >= first_visible && ed.cursor_line <= last_visible
             && fmod(ed.blink_time, 1.06f) < 0.53f) {
-        let caret_x = (m.origin.x + m.gutter_space
-            + text_source_range_width(ed.lines[ed.cursor_line], 0, ed.cursor_column,
-                font, m.font_size, m.cell_width, style.tab_cells))
-        let caret_y = m.origin.y + float(ed.cursor_line) * m.line_height
-        // overtype renders the block caret (translucent so the glyph reads)
-        let caret_width = ed.overtype ? m.cell_width : max(1.0f, 1.5f * m.zoom)
-        var caret_color = style.caret_color
-        if (ed.overtype) {
-            caret_color.w *= 0.55f
-        }
-        *dl |> AddRectFilled(float2(caret_x, caret_y),
-            float2(caret_x + caret_width, caret_y + m.line_height),
-            GetColorU32(caret_color), 0.0f, ImDrawFlags.None)
+        draw_edit_caret(ed, m, style, font, dl)
     }
-    if (ed.focused && ed.list_open && !empty(ed.list_items)) {
+    if (primary && ed.focused && ed.list_open && !empty(ed.list_items)) {
         draw_edit_list(ed, m, style, font, dl)
     }
 }
 
-def private edit_syntax_color(style : TextSourceViewStyle const; // nolint:STYLE037
+def private draw_edit_caret(ed : TextEditState const; m : EditMetrics;
+                            style : TextSourceViewStyle const;
+                            var font : ImFont?; var dl : ImDrawList?) {
+    let caret_x = (m.origin.x + m.gutter_space
+        + text_source_range_width(ed.lines[ed.cursor_line], 0, ed.cursor_column,
+            font, m.font_size, m.cell_width, style.tab_cells))
+    let caret_y = edit_row_y(m, ed.cursor_line)
+    // overtype renders the block caret (translucent so the glyph reads)
+    let caret_width = ed.overtype ? m.cell_width : max(1.0f, 1.5f * m.zoom)
+    var caret_color = style.caret_color
+    if (ed.overtype) {
+        caret_color.w *= 0.55f
+    }
+    *dl |> AddRectFilled(float2(caret_x, caret_y),
+        float2(caret_x + caret_width, caret_y + m.line_height),
+        GetColorU32(caret_color), 0.0f, ImDrawFlags.None)
+}
+
+def private edit_syntax_color(style : TextSourceViewStyle const;
                               syntax : TextSourceSyntaxStyle) : float4 {
     if (syntax == TextSourceSyntaxStyle.comment) return style.syntax_comment_color
     if (syntax == TextSourceSyntaxStyle.string_) return style.syntax_string_color
@@ -2253,34 +3079,117 @@ def private edit_syntax_color(style : TextSourceViewStyle const; // nolint:STYLE
     return style.text_color
 }
 
+def private draw_line_piece(var dl : ImDrawList?; var font : ImFont?;
+                            m : EditMetrics; style : TextSourceViewStyle const;
+                            line : string; from, to : int; color : float4;
+                            var x : float&; y : float;
+                            gap_column : int; gap_width : float;
+                            var gap_pending : bool&) {
+    // the ghost's gap opens exactly once as the drawing crosses gap_column
+    return if (to <= from)
+    var start = from
+    if (gap_pending && gap_column <= start) {
+        x += gap_width
+        gap_pending = false
+    } elif (gap_pending && gap_column < to) {
+        x += text_source_draw_range(dl, font, m.font_size, float2(x, y), color,
+            line, start, gap_column, m.cell_width, style.tab_cells)
+        x += gap_width
+        gap_pending = false
+        start = gap_column
+    }
+    x += text_source_draw_range(dl, font, m.font_size, float2(x, y), color,
+        line, start, to, m.cell_width, style.tab_cells)
+}
+
 def private draw_edit_line(ed : TextEditState const; row : int; line : string;
                            m : EditMetrics; style : TextSourceViewStyle const;
                            var font : ImFont?; var dl : ImDrawList?;
-                           row_origin : float2) {
+                           row_origin : float2;
+                           gap_column : int = -1; gap_width : float = 0.0f) {
     var x = row_origin.x + m.gutter_space
     let position_y = row_origin.y
+    var gap_pending = gap_column >= 0
     if (row >= length(ed.line_styles) || empty(ed.line_styles[row].runs)) {
-        let _ = text_source_draw_range(dl, font, m.font_size, float2(x, position_y),
-            style.text_color, line, 0, length(line), m.cell_width, style.tab_cells)
+        draw_line_piece(dl, font, m, style, line, 0, length(line),
+            style.text_color, x, position_y, gap_column, gap_width, gap_pending)
         return
     }
     var covered = 0
     for (run in ed.line_styles[row].runs) {
         if (run.start_byte > covered) {
-            x += text_source_draw_range(dl, font, m.font_size, float2(x, position_y),
-                style.text_color, line, covered, run.start_byte,
-                m.cell_width, style.tab_cells)
+            draw_line_piece(dl, font, m, style, line, covered, run.start_byte,
+                style.text_color, x, position_y, gap_column, gap_width, gap_pending)
         }
         let run_end = min(run.end_byte, length(line))
-        x += text_source_draw_range(dl, font, m.font_size, float2(x, position_y),
-            edit_syntax_color(style, run.style), line, run.start_byte, run_end,
-            m.cell_width, style.tab_cells)
+        draw_line_piece(dl, font, m, style, line, run.start_byte, run_end,
+            edit_syntax_color(style, run.style), x, position_y,
+            gap_column, gap_width, gap_pending)
         covered = run_end
     }
-    if (covered < length(line)) {
-        let _ = text_source_draw_range(dl, font, m.font_size, float2(x, position_y),
-            style.text_color, line, covered, length(line),
-            m.cell_width, style.tab_cells)
+    draw_line_piece(dl, font, m, style, line, covered, length(line),
+        style.text_color, x, position_y, gap_column, gap_width, gap_pending)
+}
+
+def private diagnostic_row_pixels(ed : TextEditState const;
+                                  diag : TextEditDiagnostic const; row : int;
+                                  m : EditMetrics; style : TextSourceViewStyle const;
+                                  var font : ImFont?) : float2 {
+    // (x0, x1) in widget space for one row; x1 < x0 = nothing on this row
+    let span = text_edit_diagnostic_row_span(ed, diag, row)
+    return float2(1.0f, 0.0f) if (span.x < 0)
+    let text = ed.lines[row]
+    let x0 = (m.gutter_space + text_source_range_width(text, 0, span.x,
+        font, m.font_size, m.cell_width, style.tab_cells))
+    let x1 = (m.gutter_space + text_source_range_width(text, 0, span.y,
+        font, m.font_size, m.cell_width, style.tab_cells))
+    return float2(x0, max(x1, x0 + m.cell_width))
+}
+
+def private draw_edit_diagnostics(ed : TextEditState const; m : EditMetrics;
+                                  style : TextSourceViewStyle const;
+                                  var font : ImFont?; var dl : ImDrawList?;
+                                  first_visible, last_visible : int) {
+    let color = GetColorU32(style.error_underline_color)
+    for (diag in ed.diagnostics) {
+        let last_line = max(diag.end_line, diag.line)
+        continue if (last_line < first_visible || diag.line > last_visible)
+        for (row in range(max(diag.line, first_visible),
+                min(last_line, last_visible) + 1)) {
+            let px = diagnostic_row_pixels(ed, diag, row, m, style, font)
+            continue if (px.y < px.x)
+            let base_y = edit_row_y(m, row + 1) - 2.0f
+            var x = m.origin.x + px.x
+            let x_end = m.origin.x + px.y
+            var up = true
+            while (x < x_end) {
+                let next = min(x + 3.0f, x_end)
+                *dl |> AddLine(float2(x, up ? base_y + 1.5f : base_y),
+                    float2(next, up ? base_y : base_y + 1.5f), color, 1.0f)
+                x = next
+                up = !up
+            }
+        }
+    }
+}
+
+def private edit_diagnostic_tooltip(ed : TextEditState const; m : EditMetrics;
+                                    style : TextSourceViewStyle const;
+                                    var font : ImFont?) {
+    let local = GetMousePos() - m.origin
+    let row = m.line_first + int(floor(local.y / m.line_height))
+    return if (row < m.line_first || row > m.line_last || row >= length(ed.lines))
+    var message = ""
+    for (diag in ed.diagnostics) {
+        let px = diagnostic_row_pixels(ed, diag, row, m, style, font)
+        continue if (px.y < px.x)
+        if (local.x >= px.x - 2.0f && local.x <= px.y + 2.0f) {
+            message = empty(message) ? diag.message : message + "\n" + diag.message
+        }
+    }
+    if (!empty(message) && BeginTooltip()) {
+        TextUnformatted(message)
+        EndTooltip()
     }
 }
 
@@ -2297,7 +3206,7 @@ def private draw_edit_list(ed : TextEditState const; m : EditMetrics;
         width = max(width, CalcTextSizeForFontRange(font, m.font_size,
             item, length(item), 0, length(item)).x + m.cell_width * 2.0f)
     }
-    let top = m.origin.y + float(ed.cursor_line + 1) * m.line_height
+    let top = edit_row_y(m, ed.cursor_line + 1)
     let bottom = top + float(length(ed.list_items)) * m.line_height
     *dl |> AddRectFilled(float2(anchor_x, top), float2(anchor_x + width, bottom),
         GetColorU32(style.list_bg_color), 0.0f, ImDrawFlags.None)
@@ -2315,6 +3224,41 @@ def private draw_edit_list(ed : TextEditState const; m : EditMetrics;
     }
 }
 
+def private draw_row_selection(ed : TextEditState const; m : EditMetrics;
+                               style : TextSourceViewStyle const;
+                               var font : ImFont?; var dl : ImDrawList?;
+                               row : int; row_origin : float2;
+                               sel : TextEditRange) {
+    let row_line = ed.lines[row]
+    let from_column = row == sel.start_line ? sel.start_column : 0
+    let to_column = row == sel.end_line ? sel.end_column : length(row_line)
+    let x0 = (m.gutter_space + text_source_range_width(row_line, 0,
+        from_column, font, m.font_size, m.cell_width, style.tab_cells))
+    var x1 = (m.gutter_space + text_source_range_width(row_line, 0,
+        to_column, font, m.font_size, m.cell_width, style.tab_cells))
+    if (row < sel.end_line) {
+        x1 += m.cell_width * 0.5f // the selected newline shows as a nub
+    }
+    *dl |> AddRectFilled(
+        float2(row_origin.x + x0, row_origin.y),
+        float2(row_origin.x + max(x1, x0 + 1.0f), row_origin.y + m.line_height),
+        GetColorU32(style.selection_color), 0.0f, ImDrawFlags.None)
+}
+
+def private draw_edit_overlays(var ed : TextEditState; m : EditMetrics;
+                               style : TextSourceViewStyle const;
+                               var font : ImFont?) {
+    if (ed.drag_move_active) {
+        draw_drag_preview(ed, m, style, font)
+    }
+    if (ed.goto_open) {
+        draw_goto_overlay(ed)
+    }
+    if (ed.color_open) {
+        draw_color_dialog(ed)
+    }
+}
+
 def private draw_edit_ghost(ed : TextEditState const; m : EditMetrics;
                             style : TextSourceViewStyle const;
                             var font : ImFont?; var dl : ImDrawList?) {
@@ -2324,9 +3268,52 @@ def private draw_edit_ghost(ed : TextEditState const; m : EditMetrics;
     var ghost_color = style.text_color
     ghost_color.w *= 0.45f
     let _ = text_source_draw_range(dl, font, m.font_size,
-        float2(ghost_x, m.origin.y + float(ed.cursor_line) * m.line_height),
+        float2(ghost_x, edit_row_y(m, ed.cursor_line)),
         ghost_color, ed.ghost_text, 0, length(ed.ghost_text),
         m.cell_width, style.tab_cells)
+}
+
+def private preview_snippet(text : string) : string {
+    let cut = find(text, "\n")
+    var snippet = cut >= 0 ? slice(text, 0, cut) : text
+    var trimmed = cut >= 0
+    if (length(snippet) > 32) {
+        // cut on a grapheme boundary so the preview never garbles
+        var end_ = 0
+        var inscope graphemes <- text_graphemes(snippet)
+        for (grapheme in graphemes) {
+            break if (grapheme.source.end_byte > 32)
+            end_ = grapheme.source.end_byte
+        }
+        snippet = slice(snippet, 0, end_)
+        trimmed = true
+    }
+    return trimmed ? snippet + "..." : snippet
+}
+
+def private draw_drag_preview(ed : TextEditState const; m : EditMetrics;
+                              style : TextSourceViewStyle const;
+                              var font : ImFont?) {
+    // the payload rides the mouse; a drop caret marks the would-be target
+    var dl = GetWindowDrawList()
+    let hit = edit_hit_position(ed, m, style, font)
+    let drop_x = (m.origin.x + m.gutter_space
+        + text_source_range_width(ed.lines[hit.x], 0, hit.y, font,
+            m.font_size, m.cell_width, style.tab_cells))
+    let drop_y = edit_row_y(m, hit.x)
+    *dl |> AddRectFilled(float2(drop_x, drop_y),
+        float2(drop_x + max(1.0f, 1.5f * m.zoom), drop_y + m.line_height),
+        GetColorU32(style.caret_color), 0.0f, ImDrawFlags.None)
+    let text = preview_snippet(text_edit_selected_text(ed))
+    return if (empty(text))
+    let pos = GetMousePos() + float2(14.0f, 10.0f)
+    let text_width = CalcTextSizeForFontRange(font, m.font_size, text,
+        length(text), 0, length(text)).x
+    *dl |> AddRectFilled(pos - float2(4.0f, 2.0f),
+        pos + float2(text_width + 4.0f, m.line_height + 2.0f),
+        GetColorU32(style.list_bg_color), 3.0f, ImDrawFlags.None)
+    *dl |> AddTextRange(font, m.font_size, pos,
+        GetColorU32(style.text_color), text, length(text), 0, length(text))
 }
 
 def private draw_bracket_highlight(ed : TextEditState const; m : EditMetrics;
@@ -2360,7 +3347,7 @@ def private draw_bracket_cell(ed : TextEditState const; m : EditMetrics;
     let x1 = (m.gutter_space + text_source_range_width(text, 0,
         min(column + 1, length(text)), font, m.font_size, m.cell_width,
         style.tab_cells))
-    let top = m.origin.y + float(line) * m.line_height
+    let top = edit_row_y(m, line)
     *dl |> AddRectFilled(float2(m.origin.x + x0, top),
         float2(m.origin.x + max(x1, x0 + 2.0f), top + m.line_height),
         GetColorU32(color), 0.0f, ImDrawFlags.None)
@@ -2377,14 +3364,14 @@ def private draw_edit_highlights(ed : TextEditState const; m : EditMetrics;
         break if (span.start_line > last_visible)
         for (row in range(max(span.start_line, first_visible),
                 min(span.end_line, last_visible) + 1)) {
+            let columns = text_edit_highlight_row_span(ed, span, row)
+            continue if (columns.x < 0)
             let row_line = ed.lines[row]
-            let from_column = row == span.start_line ? span.start_column : 0
-            let to_column = row == span.end_line ? span.end_column : length(row_line)
             let x0 = (m.gutter_space + text_source_range_width(row_line, 0,
-                from_column, font, m.font_size, m.cell_width, style.tab_cells))
+                columns.x, font, m.font_size, m.cell_width, style.tab_cells))
             let x1 = (m.gutter_space + text_source_range_width(row_line, 0,
-                to_column, font, m.font_size, m.cell_width, style.tab_cells))
-            let row_top = m.origin.y + float(row) * m.line_height
+                columns.y, font, m.font_size, m.cell_width, style.tab_cells))
+            let row_top = edit_row_y(m, row)
             *dl |> AddRectFilled(float2(m.origin.x + x0, row_top),
                 float2(m.origin.x + max(x1, x0 + 2.0f), row_top + m.line_height),
                 color, 0.0f, ImDrawFlags.None)
@@ -2392,65 +3379,184 @@ def private draw_edit_highlights(ed : TextEditState const; m : EditMetrics;
     }
 }
 
-def private text_source_edit_impl(id : string; var ed : TextEditState;
-                                  var style : TextSourceViewStyle;
-                                  var registry : CommandRegistry;
-                                  use_registry : bool) : TextEditResult {
+struct public TextEditSegmentSpec {
+    //! Line-range + surface-role knobs for composing the editor into a hybrid
+    //! view. The defaults reproduce the classic whole-buffer widget exactly.
+    line_first : int = 0
+    line_last : int = -1 // inclusive; -1 = last buffer line
+    //! Caret surface: focus arbitration, typed chars, command poll/drain,
+    //! completion list, goto/color/drag overlays. Exactly one per frame.
+    primary : bool = true
+    //! blink_time/syntax_idle advance — exactly one surface per frame.
+    advance_clocks : bool = true
+    //! Consume the caret-follow latch + pending scroll on the current window.
+    //! A compositor passes false and owns both against its own scroller.
+    owns_scroll : bool = true
+    //! Screen y of the scrolling viewport's top (the compositor's pane).
+    //! Negative = this segment's own window scrolls (the classic editor).
+    view_top : float = -1.0f
+    //! One-shot X-only caret follow when !owns_scroll (the segment's child is
+    //! the horizontal scroller; the compositor decides when).
+    follow_x : bool = false
+    //! Off-widget clicks INSIDE the current window clamp the caret to the
+    //! nearest line (classic dead area).
+    dead_area : bool = true
+    //! Clicks outside the window ALSO defocus the editor. A compositor turns
+    //! this off: rich-area clicks route the caret and must keep focus.
+    defocus_outside : bool = true
+    //! Register the playwright state bbox for this surface.
+    register_alias : bool = true
+    //! Page-rows viewport override for a segment shorter than the real view;
+    //! -1 = current window height.
+    view_height : float = -1.0f
+}
+
+def private drive_primary_input(var ed : TextEditState;
+                                var registry : CommandRegistry;
+                                id : string; page_rows : int;
+                                write_system_clipboard, window_focused : bool) {
+    let io & = unsafe(GetIO())
+
+    if (ed.focused && window_focused && !io.WantTextInput) {
+        // chars first (never binding-routed); char frames mute keypad chords
+        let typed = drain_typed_chars(ed)
+        // belt for Escape: closing the list never depends on chord routing
+        if (ed.list_open && IsKeyPressed(ImGuiKey.Escape, false)) {
+            text_edit_close_list(ed)
+        }
+        command_set_enabled(registry, "edit.cancel",
+            text_edit_has_selection(ed) || ed.list_open
+            || text_edit_snippet_active(ed))
+        // global route: focus routing dies when the caret's child loses nav
+        command_poll_scope(registry, CommandScope.component, id, typed, true)
+    }
+    var invocation = CommandInvocation()
+    while (command_take_prefix(registry, "edit.", invocation)) {
+        dispatch_edit_command(ed, invocation.command_id, page_rows,
+            write_system_clipboard)
+    }
+    text_edit_snippet_sync(ed)
+}
+
+def public text_edit_drive_clipped(var ed : TextEditState;
+                                   var registry : CommandRegistry;
+                                   id : string;
+                                   view_height, line_height : float;
+                                   write_system_clipboard : bool) {
+    //! Keyboard-only drive for a PRIMARY segment whose child was clipped out
+    //! of view — keys must not go dead just because the caret scrolled off.
+    //! A caret move re-arms the follow, so the compositor reveals it again.
+    let page_rows = max(1, int(floor(view_height / max(line_height, 1.0f))) - 1)
+    let window_focused = (IsWindowFocused(ImGuiFocusedFlags.RootAndChildWindows)
+        || (ed.focused && !IsWindowFocused(ImGuiFocusedFlags.AnyWindow)))
+    drive_primary_input(ed, registry, id, page_rows,
+        write_system_clipboard, window_focused)
+}
+
+def private apply_segment_scroll(var ed : TextEditState; m : EditMetrics;
+                                 tab_cells : int; spec : TextEditSegmentSpec;
+                                 var font : ImFont?) {
+    if (spec.owns_scroll) {
+        follow_edit_cursor(ed, m, tab_cells, font)
+        if (ed.pending_scroll_lines != 0) {
+            SetScrollY(max(GetScrollY()
+                + float(ed.pending_scroll_lines) * m.line_height, 0.0f))
+            ed.pending_scroll_lines = 0
+        }
+    } elif (spec.follow_x && ed.follow_revision != ed.followed_revision) {
+        // the compositor stamps the latch after its own Y-follow
+        follow_edit_cursor_x(ed, m, tab_cells, font)
+    }
+}
+
+def private roll_segment_frame_state(var ed : TextEditState) {
+    // per frame: focus memory rolls; any never-released drag sweeps — the ownerless latch too, which an owner-gated sweep can never clear
+    ed.sibling_focus_prev = ed.sibling_focus_now
+    ed.sibling_focus_now = false
+    if ((ed.drag_owner_first >= 0 || ed.selection_dragging || ed.drag_move_pending)
+            && !IsMouseDown(ImGuiMouseButton.Left)
+            && !IsMouseReleased(ImGuiMouseButton.Left)) {
+        ed.selection_dragging = false
+        ed.drag_move_pending = false
+        ed.drag_move_active = false
+        ed.drag_mode = 0
+        ed.drag_owner_first = -1
+    }
+}
+
+def public text_source_edit_segment(id : string; var ed : TextEditState;
+                                    var style : TextSourceViewStyle;
+                                    var registry : CommandRegistry;
+                                    spec : TextEditSegmentSpec) : TextEditResult {
+    //! Draw + drive lines [spec.line_first .. spec.line_last] of the buffer at
+    //! the current cursor position — the composition core behind
+    //! `text_source_edit` (whole buffer) and the hybrid live-preview widget.
     var result = TextEditResult()
     ensure_line(ed)
     ed.tab_cells = max(style.tab_cells, 1)
     refresh_layout_cache(ed)
     let revision_before = ed.revision
     let follow_before = ed.follow_revision
+    if (spec.advance_clocks) {
+        roll_segment_frame_state(ed)
+    }
     var fallback = GetFont()
     var font = style.fonts.monospace != null ? style.fonts.monospace : fallback
-    let m = compute_edit_metrics(ed, style, font)
+    let m = compute_edit_metrics(ed, style, font, spec.line_first, spec.line_last,
+        spec.view_height, spec.view_top)
     PushID(id)
     InvisibleButton("##edit", m.extent)
-    unsafe {
-        register_clickable_state_bbox(id, "##edit", "text_edit", addr(ed),
-            reinterpret<TypeInfo const?>(typeinfo rtti_typeinfo(type<TextEditState>)))
+    if (spec.register_alias) {
+        unsafe {
+            register_clickable_state_bbox(id, "##edit", "text_edit", addr(ed),
+                reinterpret<TypeInfo const?>(typeinfo rtti_typeinfo(type<TextEditState>)))
+        }
     }
     let hovered = IsItemHovered(ImGuiHoveredFlags.None)
     // keyboard arbitration: focused WINDOW picks the editor; WantTextInput mutes
     let io & = unsafe(GetIO())
-    let window_focused = IsWindowFocused(ImGuiFocusedFlags.RootAndChildWindows)
+    let nav_focused = IsWindowFocused(ImGuiFocusedFlags.RootAndChildWindows)
+    // nav dies entirely when the focused segment-child gets clipped out (e.g.
+    // Ctrl+End jumps the view): NO window holds focus, yet the user is still
+    // editing - keys keep flowing; the reclaim keeps the strict sensor
+    let window_focused = (nav_focused
+        || (ed.focused && !IsWindowFocused(ImGuiFocusedFlags.AnyWindow)))
     if (IsItemFocused()) {
-        ed.focused = true
-    } elif (ed.focused && window_focused && !io.WantTextInput) {
-        // Shortcut routing follows item focus; the find bar keeps it on close — reclaim
+        ed.sibling_focus_now = true
+        if (spec.primary) {
+            ed.focused = true
+        }
+    } elif (spec.primary && ed.focused && nav_focused && !io.WantTextInput
+            && !IsAnyItemActive()
+            && !ed.sibling_focus_now && !ed.sibling_focus_prev) {
+        // find-bar-close reclaim; NEVER while an item holds an active press
+        // (cancels earlier-submitted buttons) or while a SIBLING segment holds
+        // focus (nav's scroll-to-focused-item would yank the pane scroll)
         FocusItem()
     }
-    handle_edit_mouse(ed, m, style, hovered, font)
+    handle_edit_mouse(ed, m, style, hovered,
+        IsWindowHovered(ImGuiHoveredFlags.None), spec.dead_area,
+        spec.defocus_outside, font)
+    if (hovered && !empty(ed.diagnostics)) {
+        edit_diagnostic_tooltip(ed, m, style, font)
+    }
     let page_rows = max(1, int(floor(m.view_height / m.line_height)) - 1)
     ed.visible_rows = page_rows
-    if (ed.focused && window_focused && !io.WantTextInput) {
-        if (use_registry) {
-            // chars first (never binding-routed); char frames mute keypad chords
-            let typed = drain_typed_chars(ed)
-            command_set_enabled(registry, "edit.cancel",
-                text_edit_has_selection(ed) || ed.list_open)
-            command_poll_scope(registry, CommandScope.component, id, typed)
-        } else {
-            route_editor_keys(ed, page_rows, style.write_system_clipboard)
-        }
+    if (spec.primary) {
+        drive_primary_input(ed, registry, id, page_rows,
+            style.write_system_clipboard, window_focused)
     }
-    if (use_registry) {
-        var invocation = CommandInvocation()
-        while (command_take_prefix(registry, "edit.", invocation)) {
-            dispatch_edit_command(ed, invocation.command_id, page_rows,
-                style.write_system_clipboard)
-        }
-    }
-    follow_edit_cursor(ed, m, style.tab_cells, font)
-    if (ed.pending_scroll_lines != 0) {
-        SetScrollY(max(GetScrollY()
-            + float(ed.pending_scroll_lines) * m.line_height, 0.0f))
-        ed.pending_scroll_lines = 0
+    apply_segment_scroll(ed, m, style.tab_cells, spec, font)
+    if (spec.advance_clocks) {
+        ed.blink_time += io.DeltaTime
+        ed.syntax_idle += io.DeltaTime
     }
     // recount after input: a line-join edit shrinks the buffer mid-frame
     refresh_layout_cache(ed)
-    draw_edit_content(ed, m, style, font)
+    draw_edit_content(ed, m, style, font, spec.primary)
+    if (spec.primary) {
+        draw_edit_overlays(ed, m, style, font)
+    }
     PopID()
     result.focused = ed.focused
     result.edited = ed.revision != revision_before
@@ -2458,16 +3564,368 @@ def private text_source_edit_impl(id : string; var ed : TextEditState;
     return result
 }
 
+// ===== Go-to-line overlay =====
+
+var private GOTO_INPUT = InputTextState()
+var private GOTO_HINT : NarrativeState
+
+def public text_edit_parse_goto(query : string) : int2 {
+    //! `line`, `line:col` or `line,col` (1-based) -> (line, column);
+    //! line <= 0 = invalid input.
+    var line_text = query
+    var column_text = ""
+    var sep = find(query, ":")
+    if (sep < 0) {
+        sep = find(query, ",")
+    }
+    if (sep >= 0) {
+        line_text = slice(query, 0, sep)
+        column_text = slice(query, sep + 1, length(query))
+    }
+    return int2(to_int(line_text), max(to_int(column_text), 1))
+}
+
+def public text_edit_goto_query(var ed : TextEditState; query : string) : bool {
+    //! The go-to dialog's action: parse + jump; garbage keeps the position
+    //! and returns false.
+    let target = text_edit_parse_goto(query)
+    return false if (target.x <= 0)
+    text_edit_goto_line(ed, target.x, target.y)
+    return true
+}
+
+def private mouse_in_current_window() : bool {
+    let win_pos = GetWindowPos()
+    let win_size = GetWindowSize()
+    let mouse = GetMousePos()
+    return (mouse.x >= win_pos.x && mouse.y >= win_pos.y
+        && mouse.x <= win_pos.x + win_size.x
+        && mouse.y <= win_pos.y + win_size.y)
+}
+
+def private draw_goto_overlay(var ed : TextEditState) {
+    // a real floating window: own hit-test space, clean keyboard focus
+    let width = 150.0f
+    SetNextWindowPos(float2(GetWindowPos().x + GetWindowWidth() - width - 40.0f,
+        GetWindowPos().y + 4.0f), ImGuiCond.Always)
+    let flags = (ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoResize
+        | ImGuiWindowFlags.AlwaysAutoResize | ImGuiWindowFlags.NoMove
+        | ImGuiWindowFlags.NoSavedSettings)
+    var keep_open : bool?
+    if (Begin("##text_edit_goto", keep_open, flags)) {
+        if (ed.goto_focus && !GOTO_INPUT.has_pending) {
+            set_keyboard_focus_here(0)
+            ed.goto_focus = false
+        }
+        SetNextItemWidth(width)
+        input_text(GOTO_INPUT, (text = "##goto_line"))
+        let active = IsItemActive()
+        let done = IsItemDeactivated()
+        // the hint keeps the RANGE visible while typing (Boris: no preview)
+        text_disabled(GOTO_HINT, (text = "Line 1..{text_edit_line_count(ed)}"))
+        if (done && IsKeyPressed(ImGuiKey.Escape, false)) {
+            ed.goto_open = false
+        } elif ((active || done) && (IsKeyPressed(ImGuiKey.Enter, false)
+                || IsKeyPressed(ImGuiKey.KeypadEnter, false))) {
+            let _ = text_edit_goto_query(ed, GOTO_INPUT.value)
+            ed.goto_open = false
+            ed.focused = true // the jump hands the keyboard back
+        } elif (IsMouseClicked(ImGuiMouseButton.Left, false)
+                && !mouse_in_current_window()) {
+            ed.goto_open = false // clicking away dismisses
+        }
+    }
+    End()
+}
+
+// ===== Inline color embed =====
+
+var private COLOR_STATE = ColorState4()
+
+def private hex_digit(b : int) : int {
+    return b - '0' if (is_number(b))
+    return b - 'a' + 10 if (b >= 'a' && b <= 'f')
+    return b - 'A' + 10 if (b >= 'A' && b <= 'F')
+    return -1
+}
+
+def public text_edit_scan_color(line : string; from : int) : int2 {
+    //! Next `0x` + exactly 6 (RRGGBB) or 8 (AARRGGBB) hex digits at ident
+    //! boundaries -> (start, digit_count); (-1, 0) when none.
+    var found = int2(-1, 0)
+    peek_data(line) $(bytes) {
+        var at = max(from, 0)
+        let n = length(bytes)
+        while (at + 8 <= n) { // 0x + at least 6 digits
+            if (int(bytes[at]) == '0' && (int(bytes[at + 1]) == 'x'
+                    || int(bytes[at + 1]) == 'X')
+                    && (at == 0 || byte_word_class(int(bytes[at - 1])) != 1)) {
+                var digits = 0
+                while (at + 2 + digits < n
+                        && hex_digit(int(bytes[at + 2 + digits])) >= 0) {
+                    digits++
+                }
+                let boundary = (at + 2 + digits >= n
+                    || byte_word_class(int(bytes[at + 2 + digits])) != 1)
+                if ((digits == 6 || digits == 8) && boundary) {
+                    found = int2(at, digits)
+                    break
+                }
+                at += 2 + max(digits, 1)
+            } else {
+                at++
+            }
+        }
+    }
+    return found
+}
+
+def public text_edit_color_value(line : string; start, digits : int) : float4 {
+    //! Parse the literal at (start, digits) -> RGBA floats (alpha 1 for 6).
+    var value = 0u
+    peek_data(line) $(bytes) {
+        for (at in range(start + 2, start + 2 + digits)) {
+            value = value * 16u + uint(hex_digit(int(bytes[at])))
+        }
+    }
+    let r = float((value >> 16u) & 0xFF) / 255.0f
+    let g = float((value >> 8u) & 0xFF) / 255.0f
+    let b = float(value & 0xFF) / 255.0f
+    let a = digits == 8 ? float((value >> 24u) & 0xFF) / 255.0f : 1.0f
+    return float4(r, g, b, a)
+}
+
+def public text_edit_color_text(value : float4; digits : int) : string {
+    //! Rebuild the literal (0x + 6 or 8 uppercase digits, AARRGGBB layout).
+    var packed = ((uint(clamp(value.x, 0.0f, 1.0f) * 255.0f + 0.5f) << 16u)
+        | (uint(clamp(value.y, 0.0f, 1.0f) * 255.0f + 0.5f) << 8u)
+        | uint(clamp(value.z, 0.0f, 1.0f) * 255.0f + 0.5f))
+    if (digits == 8) {
+        packed |= uint(clamp(value.w, 0.0f, 1.0f) * 255.0f + 0.5f) << 24u
+    }
+    let hex_chars = "0123456789ABCDEF"
+    return build_string() $(var writer) {
+        writer |> write("0x")
+        var shift = (digits - 1) * 4
+        while (shift >= 0) {
+            let nibble = int((packed >> uint(shift)) & 0xF)
+            writer |> write(slice(hex_chars, nibble, nibble + 1))
+            shift -= 4
+        }
+    }
+}
+
+def private swatch_rect(ed : TextEditState const; m : EditMetrics;
+                        style : TextSourceViewStyle const; var font : ImFont?;
+                        row, end_byte : int) : float4 {
+    // one cell after the literal: the usual trailing space renders empty
+    let x = (m.origin.x + m.gutter_space + text_source_range_width(ed.lines[row],
+        0, end_byte, font, m.font_size, m.cell_width, style.tab_cells) + 1.0f)
+    let y = edit_row_y(m, row) + 2.0f
+    return float4(x, y, x + max(m.cell_width - 2.0f, 4.0f),
+        y + m.line_height - 4.0f)
+}
+
+def private draw_color_swatches(ed : TextEditState const; m : EditMetrics;
+                                style : TextSourceViewStyle const;
+                                var font : ImFont?; var dl : ImDrawList?;
+                                row : int) {
+    let line = ed.lines[row]
+    var at = 0
+    while (true) {
+        let hit = text_edit_scan_color(line, at)
+        break if (hit.x < 0)
+        let end_ = hit.x + 2 + hit.y
+        let rect = swatch_rect(ed, m, style, font, row, end_)
+        *dl |> AddRectFilled(float2(rect.x, rect.y), float2(rect.z, rect.w),
+            GetColorU32(text_edit_color_value(line, hit.x, hit.y)), 2.0f,
+            ImDrawFlags.None)
+        *dl |> AddRect(float2(rect.x, rect.y), float2(rect.z, rect.w),
+            GetColorU32(style.line_number_color), 2.0f, ImDrawFlags.None, 1.0f)
+        at = end_
+    }
+}
+
+def private swatch_at_mouse(var ed : TextEditState; m : EditMetrics;
+                            style : TextSourceViewStyle const;
+                            var font : ImFont?) : bool {
+    // a click on a swatch opens the picker session instead of moving the caret
+    let mouse = GetMousePos()
+    let row = m.line_first + int(floor((mouse.y - m.origin.y) / m.line_height))
+    return false if (row < m.line_first || row > m.line_last
+        || row >= length(ed.lines))
+    let line = ed.lines[row]
+    var at = 0
+    while (true) {
+        let hit = text_edit_scan_color(line, at)
+        return false if (hit.x < 0)
+        let end_ = hit.x + 2 + hit.y
+        let rect = swatch_rect(ed, m, style, font, row, end_)
+        if (mouse.x >= rect.x && mouse.x <= rect.z
+                && mouse.y >= rect.y && mouse.y <= rect.w) {
+            ed.color_open = true
+            ed.color_ignore_click = true
+            ed.color_line = row
+            ed.color_start = hit.x
+            ed.color_digits = hit.y
+            ed.color_undo_mark = -1
+            ed.color_anchor = float2(rect.x, edit_row_y(m, row + 1) + 2.0f)
+            unsafe {
+                COLOR_STATE.has_pending = true
+                COLOR_STATE.pending_value = text_edit_color_value(line, hit.x, hit.y)
+            }
+            return true
+        }
+        at = end_
+    }
+    return false
+}
+
+def private color_write_back(var ed : TextEditState) {
+    return if (ed.color_line >= length(ed.lines))
+    // rolling ONE undo unit: undo this session's previous write first
+    if (ed.color_undo_mark >= 0 && length(ed.undo_stack) == ed.color_undo_mark) {
+        let _ = text_edit_undo(ed)
+    }
+    let line = ed.lines[ed.color_line]
+    let end_ = ed.color_start + 2 + ed.color_digits
+    return if (end_ > length(line))
+    commit_edit(ed, TextEditUndoKind.other, ed.color_line, ed.color_start,
+        slice(line, ed.color_start, end_),
+        text_edit_color_text(COLOR_STATE.value, ed.color_digits))
+    ed.color_undo_mark = length(ed.undo_stack)
+    text_edit_push_undo_stop(ed)
+}
+
+def private draw_color_dialog(var ed : TextEditState) {
+    SetNextWindowPos(ed.color_anchor, ImGuiCond.Appearing)
+    let flags = (ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.AlwaysAutoResize
+        | ImGuiWindowFlags.NoSavedSettings)
+    var keep_open : bool?
+    if (Begin("##text_edit_color", keep_open, flags)) {
+        if (color_picker4(COLOR_STATE, "##embed_color")) {
+            color_write_back(ed)
+        }
+        if (IsMouseClicked(ImGuiMouseButton.Left, false)) {
+            if (ed.color_ignore_click) {
+                ed.color_ignore_click = false // the opening click
+            } elif (!mouse_in_current_window()) {
+                // geometric: IsWindowHovered lies while a drag holds the active id
+                ed.color_open = false
+            }
+        }
+        if (IsKeyPressed(ImGuiKey.Escape, false)) {
+            ed.color_open = false
+        }
+    }
+    End()
+}
+
+// ===== Issues panel =====
+
+var private ISSUE_HEADER : NarrativeState
+var private ISSUE_ROW : table<int; ToggleState>
+
+def private issue_segment(var dl : ImDrawList?; var x : float&; y : float;
+                          color : float4; text : string) {
+    return if (empty(text))
+    var font = GetFont()
+    let size = GetFontSize()
+    *dl |> AddTextRange(font, size, float2(x, y), GetColorU32(color),
+        text, length(text), 0, length(text))
+    x += CalcTextSizeForFontRange(font, size, text, length(text), 0,
+        length(text)).x
+}
+
+def private draw_issue_row(style : TextSourceViewStyle const;
+                           prefix, span, message : string) {
+    // colored segments over the blank selectable; quoted identifiers pop
+    var dl = GetWindowDrawList()
+    let top = GetItemRectMin()
+    var x = top.x + 4.0f
+    issue_segment(dl, x, top.y, style.syntax_function_color, prefix)
+    issue_segment(dl, x, top.y, style.line_number_color, span + "  ")
+    var at = 0
+    while (at < length(message)) {
+        let q1 = find(message, "'", at)
+        let q2 = q1 < 0 ? -1 : find(message, "'", q1 + 1)
+        if (q2 < 0) {
+            issue_segment(dl, x, top.y, style.text_color,
+                slice(message, at, length(message)))
+            break
+        }
+        issue_segment(dl, x, top.y, style.text_color, slice(message, at, q1))
+        issue_segment(dl, x, top.y, style.syntax_string_color,
+            slice(message, q1, q2 + 1))
+        at = q2 + 1
+    }
+}
+
+def public text_edit_issues_panel(var ed : TextEditState;
+                                  style : TextSourceViewStyle const) {
+    //! Compiler findings as clickable rows, positioned in the compiler's OWN
+    //! convention (`text_edit_issue_span_text`); a click navigates there.
+    var header = "no compile yet"
+    if (ed.compile_status == TextEditCompileStatus.compiling) {
+        header = "compiling..."
+    } elif (ed.compile_status == TextEditCompileStatus.ok) {
+        header = "0 issues - compiles"
+    } elif (ed.compile_status == TextEditCompileStatus.failed) {
+        header = "{length(ed.diagnostics)} issue(s)"
+    }
+    text_disabled(ISSUE_HEADER, (text = header))
+    for (index in range(length(ed.diagnostics))) {
+        let source_file = (!empty(ed.diagnostics[index].file)
+            ? ed.diagnostics[index].file : ed.file_name)
+        let prefix = empty(source_file) ? "" : source_file + ":"
+        let row_span = text_edit_issue_span_text(ed, ed.diagnostics[index])
+        if (selectable(ISSUE_ROW[index], (text = "###issue_{index}"))) {
+            // foreign-file findings show but cannot navigate this buffer
+            if (empty(ed.diagnostics[index].file)) {
+                text_edit_set_cursor(ed, ed.diagnostics[index].line,
+                    ed.diagnostics[index].column)
+                ed.focused = true
+            }
+        }
+        draw_issue_row(style, prefix, row_span, ed.diagnostics[index].message)
+    }
+}
+
+def public text_edit_issue_span_text(ed : TextEditState const;
+                                     diag : TextEditDiagnostic const) : string {
+    //! An Issues row's position in the COMPILER's own convention: lines are
+    //! always 1-based, columns follow the language (daslang 0-based, clang
+    //! 1-based) so the row matches the compiler's text verbatim.
+    let from_line = diag.line + 1
+    let base = (ed.language == "cpp" || ed.language == "c") ? 1 : 0
+    let from_column = diag.column + base
+    let to_column = diag.end_column + base
+    if (diag.end_line > diag.line) {
+        return "{from_line}:{from_column}-{diag.end_line + 1}:{to_column}"
+    }
+    if (diag.end_column > diag.column) {
+        return "{from_line}:{from_column}-{to_column}"
+    }
+    return "{from_line}:{from_column}"
+}
+
 // ===== Command registry keymap =====
 
-var private g_no_registry = CommandRegistry()
+// the no-registry overload owns this default-keymap registry (lazy-registered)
+var private g_builtin_registry = CommandRegistry()
+var private g_builtin_registered = false
 
 def public text_source_edit(id : string; var ed : TextEditState;
                             var style : TextSourceViewStyle) : TextEditResult {
     //! Draw + drive the editor as the sole content of a scrolling child window
-    //! (the host owns the child, like `text_source_view`). This overload uses
-    //! the built-in keymap; pass a CommandRegistry for rebindable keys.
-    return text_source_edit_impl(id, ed, style, g_no_registry, false)
+    //! (the host owns the child, like `text_source_view`). Runs a private
+    //! default-keymap registry; pass your own CommandRegistry for rebindable keys.
+    if (!g_builtin_registered) {
+        text_edit_register_commands(g_builtin_registry)
+        g_builtin_registered = true
+    }
+    return text_source_edit_segment(id, ed, style, g_builtin_registry,
+        TextEditSegmentSpec())
 }
 
 def public text_source_edit(id : string; var ed : TextEditState;
@@ -2476,7 +3934,8 @@ def public text_source_edit(id : string; var ed : TextEditState;
     //! Registry-driven variant: every key routes through rebindable
     //! imgui_commands bindings (call `text_edit_register_commands` once at
     //! init; the bindings editor + JSON persistence come with the registry).
-    return text_source_edit_impl(id, ed, style, registry, true)
+    return text_source_edit_segment(id, ed, style, registry,
+        TextEditSegmentSpec())
 }
 
 def private edit_define(var registry : CommandRegistry; id, title : string;
@@ -2504,7 +3963,7 @@ def private edit_define_nav(var registry : CommandRegistry; id, title : string;
         edit_binding(id + ".select", key, keypad, primary, true, true))
 }
 
-def public text_edit_register_commands(var registry : CommandRegistry) { // nolint:STYLE038
+def public text_edit_register_commands(var registry : CommandRegistry) { // nolint:STYLE038 — flat keymap table, one edit_define per verb; registration order IS the Escape-chain precedence
     //! Register the editor verb surface as rebindable commands with the spec
     //! defaults (VS Code chords, CUA alternates, numpad twins). Idempotent.
     // find.close registers BEFORE edit.cancel: the Escape chain closes the bar first
@@ -2520,6 +3979,8 @@ def public text_edit_register_commands(var registry : CommandRegistry) { // noli
         edit_binding("find.next", ImGuiKey.F3, ImGuiKey.None, false, false, true))
     edit_define(registry, "find.prev", "Find previous",
         edit_binding("find.prev", ImGuiKey.F3, ImGuiKey.None, false, true, true))
+    edit_define(registry, "edit.goto", "Go to line",
+        edit_binding("edit.goto", ImGuiKey.G, ImGuiKey.None, true, false, false))
     edit_define_nav(registry, "edit.cursor_left", "Cursor left",
         ImGuiKey.LeftArrow, ImGuiKey.Keypad4)
     edit_define_nav(registry, "edit.cursor_right", "Cursor right",
@@ -2641,6 +4102,9 @@ def public text_edit_register_commands(var registry : CommandRegistry) { // noli
     edit_define(registry, "edit.expand_line_selection", "Select line",
         command_binding("edit.expand_line_selection", ImGuiKey.L, true, false,
             false, false, CommandScope.component, true))
+    edit_define(registry, "edit.join_lines", "Join lines",
+        command_binding("edit.join_lines", ImGuiKey.J, true, false,
+            false, false, CommandScope.component, true))
 }
 
 def private edit_define_ctrl_select(var registry : CommandRegistry;
@@ -2651,17 +4115,8 @@ def private edit_define_ctrl_select(var registry : CommandRegistry;
             CommandScope.component, true), keypad, true, true))
 }
 
-def private dispatch_edit_command(var ed : TextEditState; command_id : string; // nolint:STYLE037
-                                  page_rows : int; use_system_clipboard : bool) {
-    var select = false
-    var verb = command_id
-    if (ends_with(verb, ".2")) {
-        verb = slice(verb, 0, length(verb) - 2)
-    }
-    if (ends_with(verb, ".select")) {
-        select = true
-        verb = slice(verb, 0, length(verb) - 7)
-    }
+def private dispatch_edit_motion(var ed : TextEditState; verb : string;
+                                 page_rows : int; select : bool) : bool {
     if (verb == "edit.cursor_left") {
         text_edit_move_left(ed, select)
     } elif (verb == "edit.cursor_right") {
@@ -2690,6 +4145,25 @@ def private dispatch_edit_command(var ed : TextEditState; command_id : string; /
         text_edit_move_document_start(ed, select)
     } elif (verb == "edit.document_end") {
         text_edit_move_document_end(ed, select)
+    } else {
+        return false
+    }
+    return true
+}
+
+def private dispatch_edit_command(var ed : TextEditState; command_id : string; // nolint:STYLE037 — one arm per command id; the verb ladder is flat, with motion + line ops split off
+                                  page_rows : int; use_system_clipboard : bool) {
+    var select = false
+    var verb = command_id
+    if (ends_with(verb, ".2")) {
+        verb = slice(verb, 0, length(verb) - 2)
+    }
+    if (ends_with(verb, ".select")) {
+        select = true
+        verb = slice(verb, 0, length(verb) - 7)
+    }
+    if (dispatch_edit_motion(ed, verb, page_rows, select)) {
+        pass
     } elif (verb == "edit.newline") {
         if (!text_edit_list_accept(ed)) {
             text_edit_newline(ed)
@@ -2718,9 +4192,14 @@ def private dispatch_edit_command(var ed : TextEditState; command_id : string; /
         editor_paste_from_clipboard(ed, use_system_clipboard)
     } elif (verb == "edit.toggle_overtype") {
         text_edit_toggle_overtype(ed)
+    } elif (verb == "edit.goto") {
+        text_edit_open_goto(ed)
     } elif (verb == "edit.cancel") {
+        // Escape chain: completion list, then the snippet session, then selection
         if (ed.list_open) {
             text_edit_close_list(ed)
+        } elif (text_edit_snippet_active(ed)) {
+            text_edit_snippet_end(ed)
         } else {
             text_edit_clear_selection(ed)
         }
@@ -2751,8 +4230,15 @@ def private dispatch_edit_line_command(var ed : TextEditState; verb : string) {
     } elif (verb == "edit.indent_lines") {
         text_edit_indent_lines(ed)
     } elif (verb == "edit.outdent_lines") {
-        text_edit_outdent_lines(ed)
+        // Shift+Tab steps the active snippet session back instead
+        if (text_edit_snippet_active(ed)) {
+            let _ = text_edit_snippet_prev(ed)
+        } else {
+            text_edit_outdent_lines(ed)
+        }
     } elif (verb == "edit.expand_line_selection") {
         text_edit_expand_line_selection(ed)
+    } elif (verb == "edit.join_lines") {
+        text_edit_join_lines(ed)
     }
 }

@@ -12,6 +12,64 @@ what it costs today and what the fix would change.
 
 ## Entries
 
+- **Batched-tg bench row: tg at B=16 sequences is the kernel story decode can't tell at B=1
+  (spotted 2026-08-04, zen2 thread ladder).** Single-sequence decode is GEMV — bandwidth-bound
+  at any thread count, so das:ref tg reads as parity (t=4 zen2: 13.10 vs 12.59) while pp shows
+  +45% on the same box. At B=16 every decode step is a 16-row GEMM: arithmetic intensity ×16,
+  weight stream amortized across the batch — the same regime pp wins in, and the serving shape
+  dasllama.io actually runs. The engine side EXISTS (`eval_batch_` in `dasllama_batch.das`,
+  synchronous B-row step; Metal has `metal_batch_decode_forward`); what's missing is only the
+  bench row: a `--tg-batch N` mode in `lcpp_bench.das` driving B sessions per step, ref via
+  `llama-batched-bench` (separate binary from `llama-bench` — check the ref checkouts build it).
+  **What a fix changes:** a board column where the kernel advantage shows in decode, and the
+  first honest throughput-serving number for the server story.
+
+- **Decode work-splitting vs thread count: tg on the 3990X ladder read flat 13.1–13.3 at t=4–8
+  then jumped +59% to 21.2 at t=12 (2026-08-04).** Read: the per-op split count is mismatched to
+  the lane count at some t (undersplit or oversplit, depending), with CCD-spread-vs-pack pin
+  placement a secondary suspect (unpinned llama-bench led das tg at t=8, 14.1 vs 13.3). Cost
+  today: optics only — single-sequence tg absolutes don't drive engine choices. Why it stays
+  ledgered: batched decode (see the batched-tg entry) turns each step into a B-row GEMM where the
+  same split/placement question prices real serving throughput; revisit there, not as a B=1 hunt.
+
+- **`g_lp_cbs` per-step buffer churn: the `@scratch` recycling never happens on the batch-decode
+  pipeline path (spotted 2026-08-02, lint uplift).** `metal_batch_decode_forward` builds each
+  step's command-buffer list in a LOCAL `cbs` and hands it over with `g_lp_cbs <- cbs`
+  (`dasllama_metal_decode.das:3002`) — the move drops the global's retained buffer every step,
+  so `finish_pending_step`'s capacity-retaining `clear()` recycles nothing, and on a persistent
+  heap the dropped buffer is ~ncb pointers per step. **What a fix changes:** prefill's
+  `g_pf_cbs` ping-pong pattern (build into the global, or `push_from` a reference) recycles both
+  buffers, deletes the per-step allocation, and makes the PERF026/PERF030 nolints at that site
+  unnecessary. Cost today is small (one small alloc + drop per step); the reason to do it is the
+  allocation sits on the measured hot orchestrator, so it belongs to a perf pass with A/B cells,
+  not a lint sweep.
+
+- **ASR peak-memory census (2026-08-03, m1, /usr/bin/time -l around asr_bench — the
+  reproducible ladder is `benchmarks/asr/mem_census.sh`): canary warm footprint
+  jfk 2.71 / gb1 4.29 / hp0x2 8.35 GB; canary MINT gb1 4.62 (+0.33 over warm);
+  parakeet-v3 warm hp0x2 5.61 GB.** The canary-apples arc closed the 2026-08-02 baseline's
+  two findings: the 13.1 GB canary serve peak (fp32 weights + quadratic scratch) is now
+  ~4.3 GB on gb1 (q8 end-to-end + per-job attention slabs), the mint spike is +0.3 GB
+  (read-time tensor-at-a-time transcode), and hp0x2-length canary — previously one clip from
+  swap on a 16 GB box — runs at 8.35 GB. Parakeet's hp0x2 quadratic scratch died with the
+  same slab change (−0.6 GB vs its pre-slab control). REMAINING: canary's hp0x2 tail is
+  ~4 GB of decoder-side prefill/KV at ~7k soft tokens — map it (KV codec residency, prefill
+  panel sizing) before chasing; and whisper's mint spike (1.48/5.29) predates this arc's
+  machinery, already ledgered via the streamed mint.
+
+- **Try the borrowed plane WITHOUT its bounds check, at profiling time (spotted 2026-08-01, audio
+  `.dlim` arc).** `PlaneF`/`PlaneI8` `operator []` in `dasllama_plane.das` guards every read with
+  one unsigned compare. **Costs nothing today, measured:** M1, `-jit`, cache-resident
+  4-accumulator sum, 67.1 M elements, 7 interleaved reps — raw pointer 15.608 ms, checked plane
+  15.611 ms, and the `array<float>` indexing it replaces 20.856 ms (cv ≤ 0.6% on every arm). So
+  the check ships. **What the removal would change:** in that microbenchmark, nothing — LLVM
+  folds the compare out of a loop whose bound it can prove. Real audio kernels index with computed
+  offsets (`blob[woff + i]`, layer strides, conv taps) where the bound is not provable, so the
+  compare may survive there and the microbenchmark does not answer it. The A/B to run once the
+  audio carriers are converted: an `unsafe`/unchecked accessor variant behind a build knob, A/B'd
+  on real encode/decode cells per family, interleaved, not on a synthetic sum. **Do not remove it
+  on the strength of the number above** — that number measures a loop the real kernels are not.
+
 - **gemma-4-26B-A4B tg 0.84x — routed k4 GEMV was load-issue-bound; float4-x fix SHIPPED, +8.7% tg
   (2026-07-23).** Chapter 1, knockout (new moe_rt/moe_sh arms, decode_metal_chase nomoert/nomoesh,
   Q4_K_M @512, best-of-3, clean window): full 18.80ms; routed k4/q51 expert GEMVs 5.48ms (29%) at

@@ -24,8 +24,8 @@ let private MAX_BINARY_PREVIEW_PIXELS = 64l * 1024l * 1024l
 // generated C++): tree-sitter plus the two full-syntax projections took 21.0
 // SECONDS and produced 148,590 spans, for a diff with zero hunks. The view
 // renders anything over 128 KB through the virtualised path, drawing only the
-// visible runs, so nearly all of that work was thrown away. 256 KB keeps
-// highlighting for every hand-written source file in the tree.
+// visible runs, so nearly all of that work was thrown away. The size cap is a
+// generous 2 MiB backstop; the shape gate below does the real discrimination.
 let private MAX_SYNTAX_HIGHLIGHT_BYTES = 2 * 1024 * 1024
 let private MAX_SYNTAX_HIGHLIGHT_LINE_BYTES = 16 * 1024
 
@@ -46,6 +46,24 @@ def public inspector_syntax_worth_highlighting(source : string) : bool {
         worst = max(worst, length(data) - line_start)
     }
     return worst <= MAX_SYNTAX_HIGHLIGHT_LINE_BYTES
+}
+
+def public inspector_highlight_language(language, view_source,
+                                        old_source : string) : string {
+    //! The ONE capped-language answer. Everything downstream keys on THIS, not
+    //! on the requested language: the highlighter, the markdown build gate,
+    //! and (through inspector_resolved_language) the view's renderer choice.
+    return (inspector_syntax_worth_highlighting(view_source)
+        && inspector_syntax_worth_highlighting(old_source)) ? language : ""
+}
+
+def public inspector_resolved_language(language : string;
+                                       syntax_capped : bool) : string {
+    //! What the VIEW renders with. A capped file has no markdown document
+    //! built for it, so its renderer must fall back to plain text too — the
+    //! .md that renders "Invalid Markdown document" the moment it crosses the
+    //! size or line-shape cap.
+    return syntax_capped ? "" : language
 }
 
 enum public InspectorPrepareEventKind {
@@ -204,18 +222,10 @@ def private line_starts(source : string) : array<int> {
     return <- result
 }
 
-def private inspector_byte_at(source : string; index : int) : int {
-    var result = 0
-    peek_data(source) $(bytes) {
-        result = int(bytes[index])
-    }
-    return result
-}
-
 def private line_body_end(source : string; starts : array<int> const;
                           line_index : int) : int {
     var result = line_index + 1 < length(starts) ? starts[line_index + 1] - 1 : length(source)
-    if (result > starts[line_index] && inspector_byte_at(source, result - 1) == '\r') {
+    if (result > starts[line_index] && byte_at(source, result - 1) == '\r') {
         result--
     }
     return result
@@ -286,7 +296,7 @@ def public inspector_project_full_syntax(full : TextSourceDocument const;
     return <- result
 }
 
-def private prepare_worker_main(var jobs : Channel?&;
+def private prepare_worker_main(var jobs : Channel?&; // nolint:STYLE038
                                 var events : Channel?&) {
     this_context().name := "dasHerd_inspector_prepare"
     emit_prepare_event(events, InspectorPrepareEvent(
@@ -344,7 +354,7 @@ def private prepare_worker_main(var jobs : Channel?&;
             var preview_width = 0
             var preview_height = 0
             var preview_error = ""
-            let failed = catch_prepare_panic(failure) {
+            let failed = catch_prepare_panic(failure) { // nolint:STYLE037
                 var prepared_patch <- git_parse_unified_patch(patch_text)
                 if (prepared_patch.error == "diff contains no text hunks"
                         && job.view_available) {
@@ -404,10 +414,8 @@ def private prepare_worker_main(var jobs : Channel?&;
                     // across SEVEN lines (generated parser tables); a normal
                     // 700 KB hand-written module parses in well under a second
                     // and keeps its colors (the live-review regression).
-                    let highlight_language = (
-                        inspector_syntax_worth_highlighting(view_source)
-                            && inspector_syntax_worth_highlighting(old_source)
-                        ? language : "")
+                    let highlight_language = inspector_highlight_language(
+                        language, view_source, old_source)
                     syntax_capped = !empty(language) && empty(highlight_language)
                     var full_old <- tree_sitter_source_document(
                         old_source, highlight_language, job.generation)

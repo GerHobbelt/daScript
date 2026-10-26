@@ -82,9 +82,12 @@ tuning beats hand-written universal kernels — tuning is the mechanism, not an 
 advantage; llama.cpp's own build-time dispatch (AVX tiers, i8mm paths) is likewise active on
 its side.
 
-No prebuilt das binary is used, here or anywhere: `[tune]` bakes the winning kernel forms at
-compile time, so a distributable binary would carry whichever box built it. Every das row is
-the `.das` source run under `-jit` on the box being measured.
+No cross-box das binary is used, here or anywhere: `[tune]` bakes the winning kernel forms at
+compile time, so a binary carries whichever box built it. Every das row is the `.das` source
+compiled ON the box being measured — `daspkg release` mints that box's standalone bench
+executable (its freshly tuned sidecar beside it), records run through that executable, and a
+debug-flavored `-jit` script run is excluded from the record store by design (the two vehicles
+measure equivalent; the release rail is the one with the identity stamps).
 
 ## Identity: what exactly ran, on what
 
@@ -148,7 +151,7 @@ configurations still in active development. Measured rows are annotated, not del
 
 ## Reproducing
 
-`modules/dasLLAMA/performance/BRINGUP.md` is the box checklist: build, models, reference
+`modules/dasLLAMA/BRINGUP.md` is the box checklist: build, models, reference
 engines (scripted, pinned commits, locked venvs), corpus fetch with manifest verification,
 pre-bake, sweep. The sweep writes a per-box record store after every cell; the site renders
 from the merged stores. Every tool narrates its progress on stdout as it runs.

@@ -39,7 +39,7 @@ bin/daslang -jit examples/dasLLAMA/run.das -- <model.gguf>
 bin/daslang -jit examples/dasLLAMA/chat.das -- <model.gguf>
 
 # audio chat (omni models: decoder GGUF + audio mmproj)
-bin/daslang -jit examples/dasLLAMA/audio.das -- <decoder.gguf> <mmproj.gguf> <audio-file> [prompt]
+bin/daslang -jit examples/dasLLAMA/audio_chat.das -- <decoder.gguf> <mmproj.gguf> <audio-file> [prompt]
 
 # speech-to-text: whisper / parakeet / canary ggml bins, or qwen3-asr GGUF pairs
 bin/daslang -jit examples/dasLLAMA/transcribe.das -- <ggml-model.bin | decoder.gguf mmproj.gguf> <audio-file>
@@ -83,10 +83,10 @@ modules/dasLLAMA/
   INVENTORY.md                # as-is census of the module
   CODEREVIEW.md               # the per-change review checklist
   METHODOLOGY.md              # how every published number is measured (the site's method page)
-  PROFILE.md                  # THE two profiling commands — the oracle, and the rig that publishes
+  PROFILE.md                  # the three profiling rigs — the routine in-process check, the oracle cell, the rig that publishes
   PERF_LEDGER.md              # the living perf backlog — parked ideas, not chased mid-wave
   tune_for_this_box.md        # per-box tuning + the measurement discipline (SDK-installed)
-  ENVIRONMENT.md              # GENERATED from dasllama_env's registry (`--dump-env`) — every knob
+  ENVIRONMENT.md              # GENERATED from dasllama_env's registry (harness/gen_env_doc.das writes it; tests/test_env_registry.das gates drift) — every knob
   THINKING.md                 # design notes and open questions
   followup_vulkan.md          # PLANNED: grow the vulkan resident driver to Metal's contract shape
   whisper_plan.md             # per-family bring-up records + findings:
@@ -97,7 +97,9 @@ modules/dasLLAMA/
                               #  kernel_access_lens_metal.md, kv_cache_compression.md,
                               #  turboquant_research.md, audio_models_plan.md,
                               #  box_profile.epyc9654.json, avx_kernel_matrix.md,
-                              #  epyc9654_measurements.md, model_expansion_plan.md — are
+                              #  epyc9654_measurements.md, model_expansion_plan.md,
+                              #  audio_image_plan.md, and the pre-board metal profiling
+                              #  set results_metal_*.md + baseline_metal_*.tsv — are
                               #  archived under history/dasLLAMA/)
   dasllama/                   # the module — require dasllama/<name>
     dasllama_env.das          #   the env-var registry + the typed readers every knob goes through (ENVIRONMENT.md is generated from it)
@@ -125,6 +127,7 @@ modules/dasLLAMA/
     dasllama_vulkan_prefill.das #  Vulkan resident PREFILL driver + batch arms (FFN batch, dense, dn, attention, streamed mirrors)
     dasllama_vulkan_lens.das  #   the Vulkan kernel-access lens — per-binding hazard masks derived from the kernel body
     dasllama_kernel_access.das #  the shared body-walk read/write classifier both GPU lenses run on
+    dasllama_gpu_resident.das #   the vulkan MoE GPU-resident expert tier — bake plan, upload/stream slots, per-layer placement
     dasllama_math_gen.das     #   the generated GEMM tier — registers "arm64-gen"/"x64-gen" (load-select repack backends; traversals read the stamped layout)
     dasllama_gemm_schema.das  #   tune_perm grid + layout schema shared by the generator and the runtime
     dasllama_gemm_gen.das     #   the GEMM tile generator (emits per-perm kernels under llvm_tune)
@@ -133,14 +136,23 @@ modules/dasLLAMA/
     dasllama_tune.das         #   per-box kernel loop-hint tuner — [tuned] / [dasllama_grid] (see tune_for_this_box.md)
     dasllama_parity.das       #   CPU-reference caches for the parity instruments (the metal suites, batch_parity_probe)
     dasllama_gguf.das         #   GGUF container parser + tensor read drivers (codecs live in dasllama_convert)
+    dasllama_load.das         #   the gguf load rail — plan-load, the streaming cold build (FillJobs), the staged load stages
     dasllama_layout.das       #   disk-format -> compute-layout transforms (the blob transform, the CPU repack walkers, the GPU tier gathers)
     dasllama_config.das       #   DlimConfiguration — every input that changes .dlim image BYTES, in one struct (+ the identity formatter)
+    dasllama_plane.das        #   the borrowed-plane vocabulary — Plane* structs: a pointer into a prepared image + element count; a carrier owns only its backing
     dasllama_image.das        #   the .dlim prepared-model image — post-load planes dumped once, mapped back with zero O(model) copying
     dasllama_unicode.das      #   Unicode classification + UTF-8 codec
     dasllama_tokenizer.das    #   SentencePiece tokenizer (Llama-2 family, Phi-3, Gemma)
     dasllama_bpe.das          #   byte-level BPE / tiktoken tokenizer (Llama-3 + Qwen2 pre-tokenizers)
     dasllama_common.das       #   engine core — Config / Model / Session, load + forward + generate + sample (incl. MTP/NextN self-spec decode)
+    dasllama_blocks.das       #   the shared dense/grouped transformer block helpers (FFN, embed rows, eval bridges)
+    dasllama_moe.das          #   MoE routing — select, expert dispatch, the GPU expert-tier hooks
+    dasllama_ple.das          #   gemma-4 E-series per-layer embeddings + the gemma4 MoE FFN (hook-registered into the forward)
+    dasllama_attn_prefill.das #   the CPU batch-attention prefill driver
+    dasllama_batch.das        #   batch decode — BatchWorkspace stepping over multiple sequences
+    dasllama_sampling.das     #   SamplingParams / Stats + the samplers (greedy, top-k, penalties)
     dasllama_prefix.das       #   vLLM-style page-granular prefix cache over the paged KV pool
+    dasllama_asr_types.das    #   the ASR floor types — AsrCaps/AsrTimestamps/TranscribeSegment (+ asr_ctx_guard); family files require this, never each other
     dasllama_audio_io.das     #   miniaudio decode (wav/mp3/flac/ogg -> 16 kHz mono f32) + mic capture
     dasllama_audio.das        #   audio tower — whisper mel frontends + encoder core + qwen2a projector (soft-token splice)
     dasllama_whisper.das      #   whisper-proper ASR — ggml-bin loader, cross-attn decoder, greedy driver, transcribe API
@@ -170,7 +182,7 @@ modules/dasLLAMA/
     matmul/                   #   matmul kernel micro-bench ledger
   harness/                    # verification / eval test beds, per-box tuners, GGUF inspection tools
   tests/                      # dastest [test] suites (model-gated ones self-skip)
-examples/dasLLAMA/            # runnable demos only — run.das (completion + stats), chat.das (REPL), audio.das (audio chat), transcribe.das (speech-to-text), dictate.das (live mic -> text)
+examples/dasLLAMA/            # runnable demos only — run.das (completion + stats), chat.das (REPL), audio_chat.das (audio chat), transcribe.das (speech-to-text), dictate.das (live mic -> text)
 tutorials/dasLLAMA/           # the guided series — 01 generate ... 06 add an arch, 07 speech-to-text, 08 audio chat
 ```
 
@@ -234,7 +246,7 @@ Legend: ✅ **verified token-for-token** vs the reference · 🚧 in progress ·
 | **Qwen3-ASR 0.6B / 1.7B** (speech-to-text) | ggml-org Q8_0 decoder + bf16 mmproj GGUFs (read directly — bf16→f32 is exact) | decoder is arch `qwen3vl` (M-RoPE degenerates for text+audio, deepstack inactive without vision — registered as a qwen3 alias) + NEW `qwen3a` encoder: 100-frame mel chunks through 3 stride-2 conv2d blocks (13×16×480), features to d_model, per-chunk position reset, transformer over 800-frame windows (13 tokens/chunk, k-biased attention on the shared tower block loop), GELU MLP projector; LLM-style transcription — the model emits `language {L}<asr_text>{text}`, parsed into `detected_lang` + one segment (no timestamps); context biasing via `AsrSession.context` | BPE (qwen2 pre) | ✅ | `llama-mtmd-cli --temp 0`: 0.6B transcript byte-identical on jfk.wav AND tools/mtmd/test-2.mp3 (88-token read of the NYT clip); 1.7B byte-identical on jfk.wav; encoder gated vs `MTMD_DEBUG_EMBEDDINGS` per-window token-0 (≤1e-4) in `test_whisper.das` |
 | **Parakeet-TDT 0.6b-v2** (speech-to-text) | self-converted `.nemo` → ggml bin (whisper.cpp's in-tree `convert-parakeet-to-ggml.py`, `--use-f32`) | NEW family end to end: frame-major mel (preemph 0.97, zero-center-pad, natural log, per-feature Bessel normalization) → conv2d subsampling (regular+depthwise ×2, 8× time) → 24 FastConformer blocks (macaron half-FFNs ×0.5, rel-pos attention with u/v biases + interleaved sin/cos table + scalar rel-shift gather, GLU→depthwise-k9→inference-BN→SiLU conv module, per-layer post-norm) → 2-layer LSTM predictor ([i,f,o,g] packed gates) → TDT joint (relu, full-row log-softmax) + duration-skip greedy | SPM (▁ pieces from the bin) | ✅ | `parakeet-cli -ng -ps` (CPU, f32): **jfk.wav 33/33 and gb1 (3-min Columbia address) 786/786 token-for-token** — ids, frames, duration indices AND values; the duration argmax must run over fp32 softmax values, not raw logits (the oracle's underflow-to-−inf tie-break, see `parakeet_plan.md`); suite gate in `test_whisper.das` |
 | **Parakeet-TDT 0.6b-v3** (speech-to-text, 25 European languages) | same converter as v2 (`--use-f32`) | the v2 pipeline verbatim — only the SPM vocab grows to 8192 pieces (joint row 8198); the loader reads every dim from the header, the ASR sniff routes any sub-32768 ggml-bin vocab to parakeet, and `caps()` flips to the 25-language list on the 8192-piece vocab | SPM (▁ pieces from the bin) | ✅ | `parakeet-cli -ng -ps` (CPU, f32): **jfk.wav 38/38 and gb1 655/655 token-for-token** — ids, frames, duration indices AND values; q8 default stays id/text-exact on both (jfk durations too; gb1 flips 16/655 duration picks only — ≤4-frame transient timestamp drift, always re-syncing); suite gate in `test_whisper.das` |
-| **Canary-Qwen 2.5B** (speech-to-text, tops Open ASR) | self-converted from HF-native safetensors (`harness/convert_canary_to_ggml.py`) → **two files**: a LoRA-merged Qwen3-1.7B decoder GGUF (fold `W += 2.0·B·A` on q/v_proj at conversion) + a "CNRY" FastConformer encoder bin (all-f32; bf16→f32 exact) | SALM = **FastConformer-32 encoder + linear projector + unmodified Qwen3-1.7B decoder** (new module `dasllama_canary.das`). Encoder = parakeet's conformer neighborhood PLUS the qkv/ffn/conv biases parakeet lacks (32 layers, d_model 1024, 8 heads, dw-striding ×8 through NeMo's **MaskedConvSequential** length mask — zero the time-rows past the propagated valid length before each stride-2 conv — rel-pos u/v attention, GLU→depthwise-k9→BN→SiLU conv module with the depthwise bias folded into BN), then `perception.proj` (1024→2048); no TDT/predictor/joint. Soft tokens splice at `<\|audioplaceholder\|>` in the SALM/Qwen chatml prompt (`user\nTranscribe the following: <AUDIO><\|im_end\|>\n…assistant`), greedy decode until the text EOS (151645, emitted into the ids). New `AsrKind.canary` behind the uniform ASR surface — `load_asr_model(decoder, encoder_bin)`, routed by the "CNRY" mmproj magic | BPE (qwen2 pre) | ✅ | **NeMo SALM greedy** (`do_sample=False`, engine-level python — NO cli/llama.cpp/onnx-asr canary support exists): **jfk + 2 LibriSpeech clips token-for-token** incl. trailing EOS vs `harness/canary_qwen_expected.tsv`; encoder+projector gated bit-exact (≤1e-4, every layer 0.0 rel) vs the NeMo perception dump on jfk; large-tier fixture `test_canary_qwen_oracle` in `test_whisper.das` (`DASLLAMA_PARITY_FULL=1`). Perf A/B (fp32) in `benchmarks/asr/results.md` — das leads the NeMo reference ~1.3–1.5x |
+| **Canary-Qwen 2.5B** (speech-to-text, tops Open ASR) | self-converted from HF-native safetensors (`harness/convert_canary_to_ggml.py`) → **two files**: a LoRA-merged Qwen3-1.7B decoder GGUF (fold `W += 2.0·B·A` on q/v_proj at conversion) + a "CNRY" FastConformer encoder bin (all-f32; bf16→f32 exact) | SALM = **FastConformer-32 encoder + linear projector + unmodified Qwen3-1.7B decoder** (new module `dasllama_canary.das`). Encoder = parakeet's conformer neighborhood PLUS the qkv/ffn/conv biases parakeet lacks (32 layers, d_model 1024, 8 heads, dw-striding ×8 through NeMo's **MaskedConvSequential** length mask — zero the time-rows past the propagated valid length before each stride-2 conv — rel-pos u/v attention, GLU→depthwise-k9→BN→SiLU conv module with the depthwise bias folded into BN), then `perception.proj` (1024→2048); no TDT/predictor/joint. Soft tokens splice at `<\|audioplaceholder\|>` in the SALM/Qwen chatml prompt (`user\nTranscribe the following: <AUDIO><\|im_end\|>\n…assistant`), greedy decode until the text EOS (151645, emitted into the ids). New `AsrKind.canary` behind the uniform ASR surface — `load_asr_model(decoder, encoder_bin)`, routed by the "CNRY" mmproj magic | BPE (qwen2 pre) | ✅ | **NeMo SALM greedy** (`do_sample=False`, engine-level python — NO cli/llama.cpp/onnx-asr canary support exists): **jfk + 2 LibriSpeech clips token-for-token** incl. trailing EOS vs `harness/canary_qwen_expected.tsv`; encoder+projector gated bit-exact (≤1e-4, every layer 0.0 rel) vs the NeMo perception dump on jfk; large-tier fixture `test_canary_qwen_oracle` in `test_whisper.das` (`DASLLAMA_PARITY_FULL=1`) — and the oracle holds UNCHANGED on the q8 default rail (decoder on the tuned q8 rail, encoder transcoded Q8_0 at load; `set_asr_fp32` keeps the fp32 arm). Perf A/B in `benchmarks/asr/results.md` — das leads NeMo on every clip (gb1 0.50x, jfk 0.16x, M1) |
 | **Whisper — full family** (speech-to-text): tiny/base/base.en/small/medium/large-v3/large-v3-turbo | stock whisper.cpp `ggml-*.bin` (f16, read directly — no conversion) | Whisper encoder (the qwen2a tower core, tanh-fp16-LUT gelu, ln_post tail) + NEW text decoder w/ cross-attention (learned abs pos, tied logits, ≤448 ctx) + `whisper_full`'s greedy driver (timestamp rules, no-speech gate, long-form seek) | byte-level vocab from the bin | ✅ | `whisper-cli` CPU greedy (`-bs 1 -bo 1 -nf -ng`), jfk.wav w/ timestamps: **tiny, base.en, small, medium, large-v3, large-v3-turbo all token-for-token** (turbo also on 33 s long-form, 3 windows exact); base flips ONE step where the force-timestamp rule sits at a 2e-4-logit margin (oracle's own p=0.495 — a coin flip; base is exact in `-nt` mode) — rig + findings in `whisper_plan.md`; suite gate in `test_whisper.das` |
 | **Silero-VAD v6** (voice activity detection, 16 kHz) | checked-in `models/silero_vad.bin` (~1.2 MB, MIT © Silero Team — converted from the official `silero_vad_16k_op15.onnx` initializers, NOT the safetensors, which ship non-reparameterized weights) | STFT-as-conv (258-basis, reflect-pad 640, 4 hops → 129-bin magnitude) → 4× conv1d encoder (129→128→64→64→128, k3, strides 1/2/2/1, ReLU) → single LSTM cell (hidden 128, i,f,g,o) → conv1d 128→1 + sigmoid; per 512-sample chunk carrying a 64-sample context + LSTM h/c | — | ✅ | onnxruntime `silero_vad_16k_op15.onnx` (proven bit-exact to silero's `OnnxWrapper`): per-frame prob **≤4.6e-6** (jfk 344 frames, gb1 6211); `find_speech_timestamps` == silero `get_speech_timestamps` **sample-for-sample** (jfk 4/4, gb1 73/73 segments); streaming `VadIter` == silero `VADIterator` (jfk 9/9, gb1 146/146 events); suite gate in `test_vad.das` (self-contained LCG + jfk segments) |
 | **Gemma-4 E2B / E4B** (audio input) | ggml-org Q8_0 decoder + **bf16 audio mmproj** GGUFs (read directly — bf16→f32 exact, no conversion) | Gemma-4 E-series text decoder (unchanged — the G3 PLE + cross-layer-KV path) + NEW `gemma4a` **Conformer** audio encoder (`dasllama_gemma4a.das`): 128-mel HTK filterbank → Conv2D ×2 subsample (LN-over-channels + ReLU) → input proj → 12 blocks { half-step macaron FFN (SiLU) · causal sliding-window-12 self-attn with sinusoidal RPE (`matrix_bd[12−d]`) + softcap 50 + per-dim Q scale · conv module: pw1 → GLU → causal depthwise conv1d k=5 → RMSNorm → SiLU → pw2 } → out proj → weightless RMSNorm → mm input proj. 🔑 the FFN/attn/conv matmuls honor **per-op activation-quant calibration ranges** (clamp-in/clamp-out); 🔑 the conv `norm_conv`/`conv_norm` tensors are name-swapped in the GGUF. Soft tokens splice at `<\|audio>…<audio\|>` in the Gemma-4 turn template via `forward_prefill_embd`; new `AsrKind.gemma4a`, routed by the mmproj's `clip.audio.projector_type='gemma4a'` | SPM (gemma) | ✅ | `llama-mtmd-cli --temp 0 --jinja` (no-think): E2B encoder soft tokens match mtmd's audio embeddings at rel ~0.0027 (float-order noise); greedy transcription token-for-token through the 48-token confident prefix, diverging only at the Gemma-4 q8 decoder's OWN ~0.6-logit near-tie (llama.cpp's raw logits there: 3 tokens within 0.6). Fixture `test_gemma4a_audio_oracle` in `test_whisper.das`; perf A/B in `benchmarks/asr/results.md` |
@@ -260,9 +272,9 @@ bin/daslang -jit examples/dasLLAMA/chat.das -- ~/Work/llama.cpp/models/gemma-2-2
 # Audio chat: whisper-encoder tower + soft-token splice into the decoder. The mmproj's
 # projector type picks the prompt shape — the same demo runs Qwen2-Audio, Qwen2.5-Omni,
 # Ultravox (stock Llama-3 decoders), and Voxtral pairs:
-bin/daslang -jit examples/dasLLAMA/audio.das -- ~/Work/llama.cpp/models/qwen2audio-7b-q8_0.gguf \
+bin/daslang -jit examples/dasLLAMA/audio_chat.das -- ~/Work/llama.cpp/models/qwen2audio-7b-q8_0.gguf \
     ~/Work/llama.cpp/models/qwen2audio-mmproj-f32.gguf ~/Work/llama.cpp/models/jfk.wav "What is being said in this audio?"
-bin/daslang -jit examples/dasLLAMA/audio.das -- ~/Work/llama.cpp/models/Llama-3.2-1B-Instruct-Q8_0.gguf \
+bin/daslang -jit examples/dasLLAMA/audio_chat.das -- ~/Work/llama.cpp/models/Llama-3.2-1B-Instruct-Q8_0.gguf \
     ~/Work/llama.cpp/models/mmproj-ultravox-1b-f32.gguf ~/Work/llama.cpp/models/jfk.wav
 
 # Speech-to-text (Whisper): any audio file -> timestamped segments, stock whisper.cpp models

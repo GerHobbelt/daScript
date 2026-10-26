@@ -391,7 +391,7 @@ def private worktree_verdict_jv(repository_id, worktree_path : string) : JsonVal
         only_here = repository_worktree_only_here(worktree)))
 }
 
-[live_command(description = "Read the retire-a-worktree verdict and every fact behind it: tier (in_use | main | dirty | warn | green), claiming session, working-tree counts, and unmerged commits WITH the base ref they were measured against. Args: repository_id, worktree_path.")]
+[live_command(description = "Read the retire-a-worktree verdict and every fact behind it: tier (in_use | main | dirty | warn | unknown | green), claiming session, working-tree counts, and unmerged commits WITH the base ref they were measured against. Args: repository_id, worktree_path.")]
 def herder_worktree_retire_state(input : JsonValue?) : JsonValue? {
     if (g_client == null) return JV((ok = false, error = "no client"))
     let args = from_JV(input, type<HerderRetireWorktreeArgs>)
@@ -622,7 +622,7 @@ def herder_changelist_select(input : JsonValue?) : JsonValue? {
 }
 
 [live_command(description = "Run a Changelist action on the watcher's operation rail, as the row menu would. Args: repository_id, worktree_path (empty = shown), action = stage|unstage|discard, paths (empty = derive from the current selection; discard ALWAYS derives, split by class). Discard is unrecoverable — this rail IS the explicit second confirmation. Outcome rides herder_worktree_operation_state.")]
-def herder_changelist_action(input : JsonValue?) : JsonValue? {
+def herder_changelist_action(input : JsonValue?) : JsonValue? { // nolint:STYLE037
     if (g_client == null || !g_client.connected) {
         return JV((ok = false, error = "watcher is not connected"))
     }
@@ -1269,7 +1269,7 @@ def herder_git_file_action(input : JsonValue?) : JsonValue? {
 }
 
 [live_command(description = "Inspect the selected Git file, comparison, render mode, and changed-line telemetry.")]
-def herder_file_inspector_state(_input : JsonValue?) : JsonValue? {
+def herder_file_inspector_state(_input : JsonValue?) : JsonValue? { // nolint:STYLE038
     let view_selection = text_source_view_selection(g_inspector.view)
     return JV((
         ok = g_inspector.prepare.has_retained_content,
@@ -1535,22 +1535,18 @@ def herder_inspector_fold(input : JsonValue?) : JsonValue? {
 
 [live_command(description = "List the inspector markdown view's rendered code blocks: collapsed state, screen origin, and hover icon centers.")]
 def herder_inspector_md_code_blocks(_input : JsonValue?) : JsonValue? {
-    var blocks : array<JsonValue?>
-    for (index in range(length(g_inspector.markdown_document.nodes))) {
-        continue if (g_inspector.markdown_document.nodes[index].kind
-            != RichNodeKind.code_block)
-        let entry & = unsafe(g_inspector.markdown_view.nodes[index])
-        blocks |> push(JV((node = index,
-            collapsed = markdown_view_code_collapsed(
-                g_inspector.markdown_view, index),
-            screen_x = entry.screen_origin.x,
-            screen_y = entry.screen_origin.y,
-            icons_valid = entry.icon_rects_valid,
-            fold_icon_x = (entry.fold_icon_rect.x + entry.fold_icon_rect.z) * 0.5f,
-            fold_icon_y = (entry.fold_icon_rect.y + entry.fold_icon_rect.w) * 0.5f,
-            copy_icon_x = (entry.copy_icon_rect.x + entry.copy_icon_rect.z) * 0.5f,
-            copy_icon_y = (entry.copy_icon_rect.y + entry.copy_icon_rect.w) * 0.5f)))
-    }
+    var found <- markdown_view_code_blocks(g_inspector.markdown_document,
+        g_inspector.markdown_view)
+    var blocks <- [for (code in found); JV((node = code.node,
+        collapsed = code.collapsed,
+        laid_out = code.laid_out,
+        screen_x = code.screen_origin.x,
+        screen_y = code.screen_origin.y,
+        icons_valid = code.icons_valid,
+        fold_icon_x = code.fold_icon_center.x,
+        fold_icon_y = code.fold_icon_center.y,
+        copy_icon_x = code.copy_icon_center.x,
+        copy_icon_y = code.copy_icon_center.y))]
     return JV((ok = true, count = length(blocks), blocks = JV(blocks)))
 }
 

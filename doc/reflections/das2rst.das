@@ -96,6 +96,7 @@ require daslib/generic_return
 // require daslib/heartbeat                     // qmacro(heartbeat()) conflicts when used in das2rst context
 require daslib/lint
 require daslib/logger
+require daslib/sha_256
 // require daslib/lint_everything               // global_lint_macro causes lint errors in other modules
 require daslib/profiler
 require daslib/profiler_boost
@@ -174,6 +175,7 @@ def document_module_builtin(_root : string) {
         hide_group(group_by_regex("Internal pointer arithmetics", mod, %regex~i_das_%%)),
         hide_group(group_by_regex("Internal clone infrastructure", mod, %regex~clone%%)),
         hide_group(group_by_regex("Internal finalize infrastructure", mod, %regex~finalize%%)),
+        hide_group(group_by_regex("Internal container init infrastructure", mod, %regex~_table_index_and_init%%)),
         group_by_regex("Containers", mod, %regex~(capacity|clear|length|resize|resize_no_init|reserve|each|each_kv|emplace|emplace_from|erase|find|
 find_for_edit|find_if_exists|find_index|find_index_if|has_value|key_exists|keys|values|get_key|lock|each_enum|each_ref|
 find_for_edit_if_exists|lock_forever|next|nothing|pop|push|push_from|push_clone|push_clone_from|back|sort|stable_sort|to_array|to_table|to_array_move|
@@ -267,7 +269,7 @@ def document_module_dashv(_root : string) {
         group_by_regex("HTTP server configuration", mod, %regex~(STATIC|allow_cors|set_document_root|set_home_page|set_index_of|set_error_page)$%%),
         group_by_regex("HTTP response helpers", mod, %regex~(TEXT_PLAIN|JSON|REDIRECT|SERVE_FILE|DATA|set_header|set_content_type)$%%),
         group_by_regex("HTTP client requests", mod, %regex~(request|request_cb|status_message)$%%),
-        group_by_regex("Message and header access", mod, %regex~(get_header|each_header|.*content_length)$%%),
+        group_by_regex("Message and header access", mod, %regex~(get_header|each_header|client_ip|.*content_length)$%%),
         group_by_regex("Request configuration", mod, %regex~(set_basic_auth|set_bearer_token_auth|set_timeout|set_connect_timeout|allow_redirect|set_param|get_param|each_param)$%%),
         group_by_regex("Cookies", mod, %regex~(add_cookie|get_cookie|each_cookie)$%%),
         group_by_regex("Form data", mod, %regex~(set_form_data|set_form_file|get_form_data|each_form_field|save_form_file|set_url_encoded|get_url_encoded)$%%),
@@ -344,9 +346,9 @@ def document_module_dasllama(_root : string) {
             "Per-session KV-cache codec picked at ``create_session``/``create_chat``: ``f16`` — the default, half the KV bytes and faster deep-context decode (stores clamp to ±65504); ``f32`` — the bit-exact reference; ``q8_0`` — block-quantized (llama.cpp ``-ctk``/``-ctv q8_0``), half the f16 bytes again and near-lossless in practice; needs head_size and kv_dim to be multiples of 32 (checked at create).")
         dasllama_type_stanza(f, "enum-dasllama_common-QuantMode", "QuantMode",
             "Weight representation picked at load: ``fp32`` — the token-exact reference; ``q8`` — int8 quantization, the fast CPU path; ``q4`` — 4-bit, smallest footprint.")
-        dasllama_type_stanza(f, "struct-dasllama_common-SamplingParams", "SamplingParams",
+        dasllama_type_stanza(f, "struct-dasllama_sampling-SamplingParams", "SamplingParams",
             "Sampling knobs: ``temp`` (<= 0 selects greedy argmax), ``top_k`` (0 = no cutoff), and repetition ``penalty`` (1.0 = none) applied over the last ``penalty_last_n`` generated tokens. The defaults are greedy — ``SamplingParams()`` reproduces argmax exactly.")
-        dasllama_type_stanza(f, "struct-dasllama_common-Stats", "Stats",
+        dasllama_type_stanza(f, "struct-dasllama_sampling-Stats", "Stats",
             "Timing of the last ``generate``/``respond`` call: ``n_prompt``/``n_gen`` token counts, ``ttft_s`` (seconds to first token), and ``prefill_tps``/``gen_tps`` throughput in tokens per second.")
         dasllama_type_stanza(f, "struct-dasllama_common-LlmCaps",  "LlmCaps",
             "What the model honestly supports at the chat layer, as returned by ``caps``: ``system_prompt`` is false for architectures with no system role (gemma), where the chat layer silently folds the system prompt into the first user turn. Grows as gaps surface.")
@@ -403,7 +405,7 @@ def document_module_rtti(_root : string) {
         group_by_regex("Context and mutex locking", mod, %regex~(lock_this_context|lock_context|lock_mutex)$%%),
         group_by_regex("Runtime data access", mod, %regex~(get_table_key_index)$%%),
         group_by_regex("Tuple and variant access", mod, %regex~(get_tuple_field_offset|get_variant_field_offset)$%%),
-        group_by_regex("Lint suppression", mod, %regex~(rtti_get_source_line|rtti_is_nolint_suppressed|is_lint_suppressed|extract_lint_code)$%%),
+        group_by_regex("Lint suppression", mod, %regex~(rtti_get_source_line|rtti_is_nolint_suppressed|is_lint_suppressed|was_nolint_consumed|extract_lint_code)$%%),
         group_by_regex("Iteration", mod, %regex~(each)$%%))
     // CompilationError's 580-value list blows the search crawler's per-record size cap;
     // exclude it from search (the symbol + its description stay indexed).
@@ -429,7 +431,7 @@ def document_module_ast(_root : string) {
         group_by_regex("Size and offset", mod, %regex~.*_(size|offset)%%),
         group_by_regex("Pointer conversion", mod, %regex~(ExpressionPtr|FunctionPtr|StructurePtr)%%),
         group_by_regex("Evaluations", mod, %regex~(eval_single_expression)%%),
-        group_by_regex("Error reporting", mod, %regex~(macro_error|macro_performance_warning|macro_style_warning)%%),
+        group_by_regex("Error reporting", mod, %regex~(macro_error|macro_sticky_error|macro_performance_warning|macro_style_warning)%%),
         group_by_regex("Location and context", mod, %regex~(force_at|collect_dependencies|get_ast_context)%%),
         group_by_regex("Use queries", mod, %regex~(get_use_global_variables|get_use_functions)%%),
         group_by_regex("Log", mod, %regex~(to_compilation_log)%%),
@@ -584,7 +586,8 @@ def document_module_rst(_root : string) {
         group_by_regex("RST section makers", mod, %regex~make%%),
         group_by_regex("Documentation queries", mod, %regex~.+_needs%%),
         group_by_regex("Group operations", mod, %regex~.*group%%),
-        group_by_regex("Naming helpers", mod, %regex~(topic|module_name|function_name|safe_function_name)$%%)
+        group_by_regex("Naming helpers", mod, %regex~(topic|module_name|function_name|safe_function_name)$%%),
+        group_by_regex("Reference policy", mod, %regex~mark_module_pageless$%%)
     )
     document("Documentation generator", mod, "rst.rst", groups)
 }
@@ -1303,7 +1306,7 @@ def document_module_heartbeat(_root : string) {
 def document_module_lint(_root : string) {
     var mod = find_module("lint")
     var groups <- array<DocGroup>(
-        group_by_regex("Lint operations", mod, %regex~(paranoid|paranoid_collect|paranoid_collect_issues)$%%)
+        group_by_regex("Lint operations", mod, %regex~(paranoid|paranoid_collect|paranoid_collect_issues|stale_nolint_collect)$%%)
     )
     document("Paranoid lint pass", mod, "lint.rst", groups)
 }
@@ -1336,6 +1339,15 @@ def document_module_logger(_root : string) {
         group_by_regex("Stdout hook", mod, %regex~.*(logger_install_hook)$%%)
     )
     document("Structured JSON Lines logger", mod, "logger.rst", groups)
+}
+
+def document_module_sha_256(_root : string) {
+    var mod = find_module("sha_256")
+    var groups <- array<DocGroup>(
+        group_by_regex("One-shot hashing", mod, %regex~.*(sha256_hex)$%%),
+        group_by_regex("Streaming", mod, %regex~.*(sha256_init|sha256_update|sha256_final|sha256_hex_digest)$%%)
+    )
+    document("SHA-256", mod, "sha_256.rst", groups)
 }
 
 def document_module_lint_everything(_root : string) {
@@ -1801,7 +1813,7 @@ def document_module_gltf(_root : string) {
 def main {  // nolint:STYLE038 — flat one-call-per-documented-module dispatch list
     disable_profiler(this_context())
     disable_profiler_log(this_context())
-    ast_gc_guard() {  // nolint:STYLE038 — same flat dispatch list, one guard scope
+    ast_gc_guard() {
     let root = get_das_root() + "/doc/source/stdlib/generated"
     // document embedded modules
     document_module_builtin(root)
@@ -1913,6 +1925,7 @@ def main {  // nolint:STYLE038 — flat one-call-per-documented-module dispatch 
     document_module_lint_config(root)
     document_module_toml(root)
     document_module_logger(root)
+    document_module_sha_256(root)
     // document_module_lint_everything(root)       // global_lint_macro causes lint errors in other modules
     // document_module_live(root)                  // uses multiple_contexts
     document_module_lpipe(root)

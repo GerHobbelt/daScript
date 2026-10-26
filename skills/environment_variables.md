@@ -56,6 +56,9 @@ application directory is read-only.
 | Variable | Type | Effect |
 |---|---|---|
 | `DAS_TUNE_VERBOSITY` | text | What a tune shows: `silent`, `normal` (default), `verbose`. Anything unrecognized reads as `normal`, so a typo never silences a tune. |
+| `DAS_TUNE_NOISE_CV` | number | The noise gate's cv ceiling in percent, overriding the built-in 2% normal / 1% paranoid. A calibration lever; garbage reads as unset. |
+| `DAS_TUNE_NOISE_OVERRIDE` | flag | Tune through a failing noise gate anyway. The sidecar provenance is stamped `noise: overridden`, so the escape always leaves a mark. |
+| `DAS_TUNE_HISTORY` | path | Where mint archives land, overriding `<home>/.tune-history/<box>/`. Every mint archives (failures kept, marked `.FAILED.json`); the history is never deleted. |
 
 `--tune-quiet` / `--tune-verbose` on the application set it, and it inherits down the whole tuner
 process chain — the measuring code is two `popen`s below the process the user typed the flag at.
@@ -104,3 +107,18 @@ If a variable is genuinely warranted:
    to zero. Plain `to_int` answers `0` on garbage, which silently reads as "explicitly zero".
 3. **Document it in the same commit.** A knob that exists only in the source is a knob nobody can
    use and nobody can remove.
+
+On the C++ side every core read goes through an accessor declared in
+`include/daScript/misc/env_cfg.h` rather than a `getenv` at the use site. The accessor is
+`get_dasenv_` plus the variable in lowercase without its `DAS_` prefix (`DAS_GC_STAGE_REPORT` →
+`get_dasenv_gc_stage_report`); a variable daslang does not own keeps its own name (`COLUMNS` →
+`get_columns`). It returns the raw `const char *`, and leaves parsing and caching to the caller.
+That keeps the name string in one place, and gives the PS targets — which have no environment at
+all — a single point to return "unset" from.
+
+Adding one: declare it in that header and implement it in `src/misc/env_cfg.cpp` alongside the
+others, one line each.
+
+Writes go through `das_setenv` from the same header, a no-op on PS. Host configs may poison
+`getenv`/`setenv`/`putenv` outside `src/misc/env_cfg.cpp` (dagor's CI config does), so a direct
+call at a use site fails to compile.

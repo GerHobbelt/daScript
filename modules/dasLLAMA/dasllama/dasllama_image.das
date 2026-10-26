@@ -9,9 +9,11 @@ require daslib/fio
 require dasllama/dasllama_env  // the shared typed env readers + the knob registry
 require daslib/apply
 require strings
+require daslib/strings_boost   // split — the identity-lane parser
 require dasllama/dasllama_tokenizer   // Tokenizer — the bulk tokenizer serializer below
 require daslib/archive
-require daslib/array_boost   // nolint:STYLE030 — temp_array is [template]; STYLE030 misses template-fn refs (same note as dasllama_common)
+require daslib/array_boost
+require dasllama/dasllama_plane   // PlaneF/PlaneI8 + plane_bind — the borrowed-plane bind arm below
 require dasllama/dasllama_common
 require dasllama/dasllama_gguf   // GGUFMeta — the streamed cold build's block signature names it
 require dasllama/dasllama_layout   // convert_model_to_metal_blob — the blob-flavor image transform
@@ -103,7 +105,7 @@ def image_peek(path : string) : DlimPeek {
         && meta_off <= msize - meta_bytes && meta_bytes <= uint64(INT_MAX))
     if (p.valid && p.version >= 7) {
         var head : array<uint8>
-        head |> resize(int(min(meta_bytes, 65536ul)))
+        head |> resize(int64(min(meta_bytes, 65536ul)))
         unsafe {
             memcpy(addr(head[0]), reinterpret<void?>(bp + int64(meta_off)), uint64(long_length(head)))
         }
@@ -173,6 +175,37 @@ def dlim_current_identities : table<string> {
     return <- idents
 }
 
+//! The (quant, tag) LANE of an identity — the coexistence unit: flavors and quants coexist as
+//! lanes, and a bake can prove staleness only inside its own lane.
+def dlim_identity_lane(identity : string) : string {
+    var parts <- split(identity, "|")
+    if (length(parts) < 8) {
+        delete parts
+        return identity   // malformed/pre-v7 — its own lane, never cross-matched
+    }
+    let quant = parts[1]
+    var tag = ""
+    for (i in range(8, length(parts))) {
+        tag = empty(tag) ? parts[i] : "{tag}|{parts[i]}"
+    }
+    delete parts
+    return "{quant}#{tag}"
+}
+
+// FOREIGN = this process cannot recompute the identity, so it may not judge it: GPU flavors
+// (their bake context pins its own backend + winners) and family tags whose module is not
+// loaded here. Only a lane this process can actually produce may be judged stale.
+def private dlim_lane_foreign(lane : string) : bool {
+    let tag = slice(lane, find(lane, "#") + 1, length(lane))
+    if (empty(tag)) {
+        return false   // the planar lane: every process produces it
+    }
+    if (tag == METAL_IMAGE_TAG || (tag |> starts_with("vulkan"))) {
+        return true    // pinned by its own bake context
+    }
+    return !has_value(g_family_tags, tag)
+}
+
 def dlim_image_verdict(p : DlimPeek; current : table<string>) : string {
     if (!p.valid) {
         return "BROKEN"
@@ -180,7 +213,10 @@ def dlim_image_verdict(p : DlimPeek; current : table<string>) : string {
     if (p.version != IMAGE_VERSION) {
         return "STALE v{p.version}"
     }
-    return key_exists(current, p.identity) ? "CURRENT" : "OTHER"
+    if (key_exists(current, p.identity)) {
+        return "CURRENT"
+    }
+    return dlim_lane_foreign(dlim_identity_lane(p.identity)) ? "FOREIGN" : "OTHER"
 }
 
 //! Every .dlim beside `gguf_path` (or in a directory), with sizes and verdicts.
@@ -206,13 +242,28 @@ def dlim_inventory(gguf_path : string) : array<DlimImageInfo> {
     return <- out
 }
 
-//! GC-after-save: a fresh bake proves every non-CURRENT sibling of this source dead — BROKEN,
-//! version-stale, AND other-identity images all go (old identities piled up 0.5 TB per box).
-//! CURRENT spans all flavors/quants/families, so a planar save never touches the metal twin.
-def dlim_gc_stale(source_path : string) {
-    let r = dlim_clean(source_path, true)
-    if (r.removed > 0) {
-        to_log(LOG_INFO, "dasLLAMA image: GC freed {r.freed >> 20l} MB — {r.removed} dead sibling(s) of {base_name(source_path)}\n")
+//! GC-after-save: a fresh bake proves dead the non-current siblings of ITS OWN LANE (the
+//! (quant, tag) it just wrote), plus BROKEN and version-stale images in any lane. Other lanes'
+//! identities fold other bake contexts' backend/winner state — this save proves nothing there.
+def dlim_gc_stale(source_path : string; tag : string = ""; quant : string = "q8") {
+    let lane = "{quant}#{tag}"
+    var inv <- dlim_inventory(source_path)
+    var removed = 0
+    var freed = 0l
+    for (im in inv) {
+        let stale_any = im.verdict == "BROKEN" || (im.verdict |> starts_with("STALE"))
+        let lane_dead = ((im.verdict == "OTHER" || im.verdict == "FOREIGN")
+            && dlim_identity_lane(im.identity) == lane)
+        continue if (!(stale_any || lane_dead))
+        if (remove(im.path)) {
+            removed++
+            freed += im.bytes
+            to_log(LOG_INFO, "dasLLAMA image: GC removed {im.file} ({im.bytes >> 20l} MB, {im.verdict})\n")
+        }
+    }
+    delete inv
+    if (removed > 0) {
+        to_log(LOG_INFO, "dasLLAMA image: GC freed {freed >> 20l} MB — {removed} dead sibling(s) of {base_name(source_path)}\n")
     }
 }
 
@@ -222,8 +273,13 @@ def dlim_gc_stale(source_path : string) {
 def dlim_clean(gguf_path : string; apply : bool; keep_other : bool = false) : tuple<total : int; stale : int; removed : int; freed : int64> {
     var r = (total = 0, stale = 0, removed = 0, freed = 0l)
     var inv <- dlim_inventory(gguf_path)
+    var foreign_kept = 0
     for (im in inv) {
         r.total++
+        if (im.verdict == "FOREIGN") {
+            foreign_kept++   // another bake context's lane — never judged from here
+            continue
+        }
         continue if (im.verdict == "CURRENT" || (keep_other && im.verdict == "OTHER"))
         r.stale++
         if (apply && remove(im.path)) {
@@ -233,10 +289,13 @@ def dlim_clean(gguf_path : string; apply : bool; keep_other : bool = false) : tu
         }
     }
     delete inv
+    if (foreign_kept > 0) {
+        to_log(LOG_INFO, "dasLLAMA image: GC kept {foreign_kept} foreign-flavor image(s) — their bake contexts own them\n")
+    }
     return r
 }
 
-def private pad_to_page(cur : uint64) : uint64 {
+def pad_to_page(cur : uint64) : uint64 {
     let page = uint64(IMAGE_PAGE)
     return (cur + page - 1ul) / page * page
 }
@@ -244,10 +303,10 @@ def private pad_to_page(cur : uint64) : uint64 {
 let private IMAGE_WRITE_BAND = 16l * 1024l * 1024l   // the direct writer's staging band
 let private SECTION_TABLE_SLACK = 65536ul            // preallocation headroom for the section blob
 
-// The image's byte sink: append-only and strictly ascending, which is what keeps NTFS from
-// charging valid-data-length zero-fill on the preallocated file (measured: 3.4 s per 8 GB gap).
-// Two backings, one walk: a memory chunk or the direct file writer.
-struct private ImgWriter {
+//! The mint sink: append-only and strictly ascending (what keeps NTFS from charging
+//! valid-data-length zero-fill on the preallocated file), one walk over two backings (memory
+//! chunk / direct file writer). Public so family streamers append planes from their hooks.
+struct ImgWriter {
     h : void? = null       // the direct file writer; null on the memory rail
     mem : void? = null     // the page-aligned chunk; null on the file rail
     cap : uint64 = 0ul     // the chunk's usable extent — an append past it is a sizing bug
@@ -275,7 +334,7 @@ def private mem_at(base : void?; off : uint64) : void? {
     return unsafe(reinterpret<void?>(at))
 }
 
-def private w_append(var w : ImgWriter; p : void?; nbytes : uint64) {
+def w_append(var w : ImgWriter; p : void?; nbytes : uint64) {
     if (!w.ok || nbytes == 0ul) {
         return
     }
@@ -295,12 +354,12 @@ def private w_append(var w : ImgWriter; p : void?; nbytes : uint64) {
     w.cur += nbytes
 }
 
-def private w_zeros(var w : ImgWriter; n : uint64) {
+def w_zeros(var w : ImgWriter; n : uint64) {
     if (n == 0ul || !w.ok) {
         return
     }
     var z : array<uint8>
-    z |> resize(int(n))
+    z |> resize(int64(n))
     unsafe {
         w_append(w, addr<void?>(z[0]), n)
     }
@@ -355,6 +414,13 @@ def private image_total_bytes(var t; meta_bytes : uint64) : uint64 {
         static_if (typeinfo is_array(field)) {
             static_if (!typeinfo is_string(field[0])) {
                 cur = plane_end(cur, field)
+            }
+        } static_elif (typeinfo safe_has_field < image_planes > (field)) {
+            // a staging plane-group (nested carrier's bytes) — sized exactly like nested planes
+            apply(field) $ [unused_argument(iname)] (iname : string; var ifield) {
+                static_if (typeinfo is_array(ifield)) {
+                    cur = plane_end(cur, ifield)
+                }
             }
         } static_elif (typeinfo safe_has_field < image_map > (field)) {
             apply(field) $ [unused_argument(iname)] (iname : string; var ifield) {
@@ -452,14 +518,13 @@ def serialize_strings(var arch : Archive; var a : array<string>) {
     if (arch.reading) {
         a |> resize(length(lens))
         var at = 0
-        for (i in range(length(lens))) {
-            let n = lens[i]
+        for (n, s in lens, a) {
             if (n > 0) {
                 unsafe {
-                    a[i] = string(temp_array(addr < uint8? >(blob[at]), n, type<uint8>))
+                    s = string(temp_array(addr<uint8?>(blob[at]), n, type<uint8>))
                 }
             } else {
-                a[i] = ""
+                s = ""
             }
             at += n
         }
@@ -591,10 +656,12 @@ let IMAGE_META_FIELDS = 66 + 3
 def count_meta_fields(var t) : int {
     var n = 0
     apply(t) $ [unused_argument(name, field)] (name : string; var field) {
-        static_if (!typeinfo is_array(field)) {
-            n++
-        } static_elif (typeinfo is_string(field[0])) {
-            n++
+        static_if (typeinfo is_array(field)) {
+            static_if (typeinfo is_string(field[0])) {
+                n++
+            }
+        } static_elif (!typeinfo safe_has_field < borrowed_plane > (field)) {
+            n++   // a borrowed plane is a section, not a meta field
         }
     }
     return n
@@ -641,7 +708,7 @@ def private write_plane(var w : ImgWriter; var sections : array<ImgSection>;
 //! THE image build — every prepared image in the process comes out of this walk, whichever sink it
 //! lands in: planes page-aligned raw (borrowed back at load), everything else archived. `plane`
 //! gets first refusal on each plane by name; `consume` frees each owned plane as it lands.
-def private build_image(var t; dst : string; in_mem : bool; extra : uint64;   // nolint:STYLE038 — one linear pass; the phases share w/sections and split into nothing reusable
+def private build_image(var t; dst : string; in_mem : bool; extra : uint64;
                         tag : string; quant : string; consume : bool;
                         plane : block<(name : string; var w : ImgWriter; var sections : array<ImgSection>) : bool>) : ImgWriter {
     // one config snapshot serves the meta embed AND the header hash — they must agree
@@ -677,6 +744,19 @@ def private build_image(var t; dst : string; in_mem : bool; extra : uint64;   //
                     // lock_count != 0 is a BORROWED view over some other image — never ours to free
                     if (consume && lock_count(field) == 0) {
                         delete field
+                    }
+                }
+            } static_elif (typeinfo safe_has_field < image_planes > (field)) {
+                // a staging plane-group: the nested carrier's bytes under dotted names, with
+                // the hook getting the same first refusal the top level gives it
+                apply(field) $(iname : string; var ifield) {
+                    static_if (typeinfo is_array(ifield)) {
+                        if (!invoke(plane, "{name}.{iname}", w, sections)) {
+                            write_plane(w, sections, "{name}.{iname}", ifield)
+                        }
+                        if (consume) {
+                            delete ifield
+                        }
                     }
                 }
             } static_elif (typeinfo safe_has_field < image_map > (field)) {
@@ -857,8 +937,9 @@ def save_model_image_streaming(var t : Model; m : GGUFMeta; bytes : array<uint8>
     var regs : array<StreamReg>
     stream_collect_regions(t, regs)
     let ok = save_image_to_file(t, path, stream_extra_bytes(t, jobs), tag, quant) $(name : string;
-            var w : ImgWriter; var sections : array<ImgSection>) {
-        if (stream_plane_bytes(t, jobs, name) <= 0l) {
+                                                                                    var w : ImgWriter; var sections : array<ImgSection>) {
+        let want = stream_plane_bytes(t, jobs, name)
+        if (want <= 0l) {
             // a blob build's kq scale strips take their device form as each one's turn comes —
             // its own fills are done by then and its bytes are not yet written
             if (t.metal_blob) {
@@ -871,6 +952,11 @@ def save_model_image_streaming(var t : Model; m : GGUFMeta; bytes : array<uint8>
         if (!fill_stream_plane(m, bytes, t, name, jobs, regs) $(p : void?; nb : uint64) { w_append(w, p, nb) }) {
             // a failed transcode IS a failed write: kill the sink so the tmp never gets promoted
             to_log(LOG_ERROR, "dasLLAMA image: streamed fill of plane '{name}' failed — image save aborted\n")
+            w.ok = false
+        }
+        // a plane short of its plan maps back as a silently-truncated borrow — that too is a failed write
+        if (w.ok && w.cur - at != uint64(want)) {
+            to_log(LOG_ERROR, "dasLLAMA image: streamed plane '{name}' wrote {int64(w.cur - at)} bytes, plan says {want} — image save aborted\n")
             w.ok = false
         }
         sections |> push(ImgSection(name = name, off = at, bytes = w.cur - at))
@@ -899,6 +985,27 @@ def private borrow_plane(bp : uint8 const?; msize : uint64; path : string;
         unsafe {
             _builtin_make_temp_array_i64(field, reinterpret<void?>(bp + int64(sec.off)), int64(sec.bytes / esz))
         }
+    }
+}
+
+// one borrowed plane: validate the section against the mapping, then point the plane at it.
+// The plane owns nothing, so a decline leaves it empty and the caller drops the whole carrier.
+def private bind_plane_section(bp : uint8 const?; msize : uint64; path : string;
+                               by_name : table<string; ImgSection>; var ok : bool&;
+                               name : string; var pl) {
+    if (!key_exists(by_name, name)) {
+        return
+    }
+    let sec = by_name?[name] ?? ImgSection()
+    // bytes-then-offset ordering keeps the bounds math wrap-free (off + bytes could overflow)
+    if (sec.off % uint64(IMAGE_PAGE) != 0ul || sec.bytes > msize || sec.off > msize - sec.bytes) {
+        to_log(LOG_WARNING, "dasLLAMA image: '{path}' declined — section '{name}' at {sec.off}+{sec.bytes} is malformed\n")
+        ok = false
+        return
+    }
+    if (!_::plane_bind(pl, bp, int64(sec.off), int64(sec.bytes))) {
+        to_log(LOG_WARNING, "dasLLAMA image: '{path}' declined — section '{name}' is {sec.bytes} bytes, not a whole number of elements\n")
+        ok = false
     }
 }
 
@@ -1010,6 +1117,8 @@ def private parse_image(base : void?; msize : uint64; path : string; var t; tag 
             static_if (!typeinfo is_string(field[0])) {   // string arrays ride the meta blob
                 borrow_plane(bp, msize, path, by_name, ok, name, field)
             }
+        } static_elif (typeinfo safe_has_field < borrowed_plane > (field)) {
+            bind_plane_section(bp, msize, path, by_name, ok, name, field)
         } static_elif (typeinfo safe_has_field < image_map > (field)) {
             // nested weight-carrier: borrow its planes back from the dotted sections (the
             // nested image_map stays null — the OUTER struct owns this mapping)
@@ -1018,6 +1127,8 @@ def private parse_image(base : void?; msize : uint64; path : string; var t; tag 
                     static_if (!typeinfo is_string(ifield[0])) {
                         borrow_plane(bp, msize, path, by_name, ok, "{name}.{iname}", ifield)
                     }
+                } static_elif (typeinfo safe_has_field < borrowed_plane > (ifield)) {
+                    bind_plane_section(bp, msize, path, by_name, ok, "{name}.{iname}", ifield)
                 }
             }
         }
@@ -1126,8 +1237,9 @@ def image_from_model_streaming(var t : Model; var out : Model; m : GGUFMeta; byt
     var regs : array<StreamReg>
     stream_collect_regions(t, regs)
     let ok = chunk_rail(t, out, save_to, stream_extra_bytes(t, jobs), tag, quant) $(name : string;
-            var w : ImgWriter; var sections : array<ImgSection>) {
-        if (stream_plane_bytes(t, jobs, name) <= 0l) {
+                                                                                    var w : ImgWriter; var sections : array<ImgSection>) {
+        let want = stream_plane_bytes(t, jobs, name)
+        if (want <= 0l) {
             if (t.metal_blob) {   // the kq scale strips take their device form — see the file saver
                 blob_stream_scale_plane(t, name)
             }
@@ -1137,6 +1249,11 @@ def image_from_model_streaming(var t : Model; var out : Model; m : GGUFMeta; byt
         let at = w.cur
         if (!fill_stream_plane(m, bytes, t, name, jobs, regs) $(p : void?; nb : uint64) { w_append(w, p, nb) }) {
             to_log(LOG_ERROR, "dasLLAMA image: streamed fill of plane '{name}' failed — image build aborted\n")
+            w.ok = false
+        }
+        // a plane short of its plan maps back as a silently-truncated borrow — that too is a failed write
+        if (w.ok && w.cur - at != uint64(want)) {
+            to_log(LOG_ERROR, "dasLLAMA image: streamed plane '{name}' wrote {int64(w.cur - at)} bytes, plan says {want} — image build aborted\n")
             w.ok = false
         }
         sections |> push(ImgSection(name = name, off = at, bytes = w.cur - at))
@@ -1230,20 +1347,52 @@ def cache_via_image(var m; var out; img : string; tag : string = ""; quant : str
     }
 }
 
+//! cache_via_image for a carrier whose MINT form differs from its SERVED form: `st` carries owned
+//! plane arrays, `out` comes back borrowing the image. A staging struct is not servable, so a
+//! build that cannot produce an image panics rather than handing anything back.
+def cache_via_image_staged(var st; var out; img : string; tag : string = ""; quant : string = "q8") {
+    cache_via_image_staged_(st, out, img, 0ul, tag, quant) $ [unused_argument(name, w, sections)] (name : string;
+                                                                                                   var w : ImgWriter; var sections : array<ImgSection>) {
+        return false
+    }
+}
+
+//! cache_via_image_staged with the walk's plane hook exposed plus a pre-sized `extra` for the
+//! bytes the hook streams — the streamed mints serve their big planes straight from the source
+//! mapping instead of staging them (Phase 3 of the audio rail).
+def cache_via_image_staged_(var st; var out; img : string; extra : uint64; tag : string; quant : string;
+                            plane : block<(name : string; var w : ImgWriter; var sections : array<ImgSection>) : bool>) {
+    if (img != "" && image_save_enabled()) {
+        let ts = ref_time_ticks()
+        if (save_image_to_file(st, img, extra, tag, quant, plane)) {
+            to_log(LOG_INFO, "dasLLAMA: prepared image written in {get_time_usec(ts) / 1000} ms — {img}\n")
+            delete st   // before the map, not after: holding both is what makes a cold load peak twice
+            if (!load_image(img, out, tag, quant)) {
+                panic("dasLLAMA: '{img}' was just written and verified, and will not map back — see the decline above")
+            }
+            return
+        }
+        to_log(LOG_WARNING, "dasLLAMA: could not write '{img}' — building the image in memory instead\n")
+    }
+    if (!chunk_rail(st, out, "", extra, tag, quant, plane)) {
+        panic("dasLLAMA: could not build the prepared image in memory — there is no other form to serve")
+    }
+}
+
 // cache_via_image with the walk's plane hook exposed — the metal flavor derives its blob plane
 // from the planar ones here instead of materializing it first (see metal_derive_plane).
 def private cache_via_image_(var m; var out; img : string; tag : string; quant : string;
                              plane : block<(name : string; var w : ImgWriter; var sections : array<ImgSection>) : bool>) {
     if (img == "" || !image_save_enabled()) {
         if (!chunk_rail(m, out, "", 0ul, tag, quant, plane)) {
-            out <- m
+            out <- m   // nolint:PERF030 — `out` is the caller's fresh destination (the cache_via_image contract); m is spent
         }
         return
     }
     let ts = ref_time_ticks()
     if (!save_image_to_file(m, img, 0ul, tag, quant, plane)) {
         to_log(LOG_WARNING, "dasLLAMA: could not write '{img}' — serving the carrier as loaded\n")
-        out <- m
+        out <- m   // nolint:PERF030 — `out` is the caller's fresh destination (the cache_via_image contract); m is spent
         return
     }
     to_log(LOG_INFO, "dasLLAMA: prepared image written in {get_time_usec(ts) / 1000} ms — {img}\n")
@@ -1404,7 +1553,7 @@ def load_model_cached(path : string; mode : QuantMode = QuantMode.fp32;
                 if (!load_image(s_img, streamed, s_tag, s_quant)) {
                     panic("dasLLAMA: '{s_img}' was just streamed out and will not map back — see the decline above")
                 }
-                dlim_gc_stale(path)   // the fresh bake proves version-stale siblings dead
+                dlim_gc_stale(path, s_tag, s_quant)   // the fresh bake proves ITS LANE's siblings dead
             }
             if (served) {
                 // the GPU MoE tier gathers from the PREPARED planes, same as the mapped rail —
@@ -1433,7 +1582,7 @@ def load_model_cached(path : string; mode : QuantMode = QuantMode.fp32;
         var built = Model()
         cache_via_image_(m, built, metal_flavor ? image_path_for(path, METAL_IMAGE_TAG) : img,
             metal_flavor ? METAL_IMAGE_TAG : "", metal_flavor ? "q8" : qs) $(name : string;
-                var w : ImgWriter; var sections : array<ImgSection>) {
+                                                                             var w : ImgWriter; var sections : array<ImgSection>) {
             return metal_flavor && metal_derive_plane(m, name, w, sections)
         }
         if (metal_flavor && built.image_map == null) {
@@ -1442,7 +1591,7 @@ def load_model_cached(path : string; mode : QuantMode = QuantMode.fp32;
             convert_model_to_metal_blob(built)
         }
         delete m
-        dlim_gc_stale(path)   // the fresh bake proves version-stale siblings dead
+        dlim_gc_stale(path, metal_flavor ? METAL_IMAGE_TAG : "", metal_flavor ? "q8" : qs)   // this lane only
         // the GPU MoE tier gathered from planes the build just freed — re-gather from the image,
         // exactly as the mapped rail does (a no-op when the build declined and `built` IS m)
         moe_gpu_upload_resident(built)

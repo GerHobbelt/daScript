@@ -406,6 +406,78 @@ def test_undo_multiline_insert(t : T?) {
 }
 
 [test]
+def test_save_point_clears_dirty_on_undo(t : T?) {
+    var ed = TextEditState()
+    text_edit_load(ed, "base")
+    text_edit_move_end(ed)
+    text_edit_insert(ed, "1")
+    t |> success(ed.dirty, "edit marks dirty")
+    text_edit_mark_saved(ed)
+    t |> success(!ed.dirty, "mark_saved clears dirty")
+    text_edit_insert(ed, "2")
+    t |> success(ed.dirty, "post-save edit is dirty again")
+    t |> equal(length(ed.undo_stack), 2, "save fences the open typing run")
+    let _ = text_edit_undo(ed)
+    t |> success(!ed.dirty, "undo back TO the save point is clean")
+    t |> equal(text_edit_source(ed), "base1", "buffer matches the saved state")
+    let _2 = text_edit_redo(ed)
+    t |> success(ed.dirty, "redo past the save point is dirty")
+    let _3 = text_edit_undo(ed)
+    let _4 = text_edit_undo(ed)
+    t |> success(ed.dirty, "undo PAST the save point is dirty (older state)")
+    t |> equal(text_edit_source(ed), "base", "buffer is the pre-save state")
+    let _5 = text_edit_redo(ed)
+    t |> success(!ed.dirty, "redo forward to the save point is clean again")
+    text_edit_dispose(ed)
+}
+
+[test]
+def test_save_point_unreachable_after_divergence(t : T?) {
+    var ed = TextEditState()
+    text_edit_load(ed, "")
+    text_edit_insert(ed, "a")
+    text_edit_mark_saved(ed)
+    let _ = text_edit_undo(ed)
+    t |> success(ed.dirty, "undone past the save point")
+    text_edit_insert(ed, "b")
+    t |> success(!text_edit_can_redo(ed), "divergence cleared redo")
+    t |> success(ed.dirty, "diverged state is dirty")
+    let _2 = text_edit_undo(ed)
+    t |> success(ed.dirty,
+        "the save point is unreachable: same depth, different history stays dirty")
+    t |> equal(text_edit_source(ed), "", "buffer content is the load state")
+    text_edit_dispose(ed)
+}
+
+[test]
+def test_save_point_at_pristine_load(t : T?) {
+    var ed = TextEditState()
+    text_edit_load(ed, "text")
+    text_edit_mark_saved(ed)
+    t |> success(!ed.dirty, "saving the pristine buffer is a no-op")
+    text_edit_move_end(ed)
+    text_edit_insert(ed, "!")
+    let _ = text_edit_undo(ed)
+    t |> success(!ed.dirty, "undo to the pristine save point is clean")
+    text_edit_load(ed, "reset")
+    t |> success(!ed.dirty, "load resets the save point")
+    text_edit_insert(ed, "x")
+    text_edit_mark_saved(ed)
+    var spans : array<TextEditRange>
+    var texts : array<string>
+    spans |> push(TextEditRange(start_line = 0, start_column = 0,
+        end_line = 0, end_column = 1))
+    texts |> push("R")
+    let _2 = text_edit_replace_all(ed, spans, texts)
+    t |> success(ed.dirty, "replace_all after save is dirty")
+    let _3 = text_edit_undo(ed)
+    t |> success(!ed.dirty, "undoing the replace_all returns to the save point")
+    delete spans
+    delete texts
+    text_edit_dispose(ed)
+}
+
+[test]
 def test_clipboard_selection_round_trip(t : T?) {
     var ed = TextEditState()
     text_edit_load(ed, "alpha beta")
@@ -547,6 +619,18 @@ def test_line_insert_indent_and_expand(t : T?) {
     text_edit_select(ed, 0, 0, 1, 4)
     text_edit_outdent_lines(ed)
     t |> equal(text_edit_source(ed), "four\ntab", "outdent strips a tab or up to 4 spaces")
+    // no selection: the caret rides the indent shift instead of jumping to EOL
+    text_edit_load(ed, "value")
+    text_edit_set_cursor(ed, 0, 2)
+    text_edit_indent_lines(ed)
+    t |> equal(text_edit_source(ed), "\tvalue", "single-line indent adds the tab")
+    t |> equal(ed.cursor_column, 3, "the caret follows its byte, not the line end")
+    text_edit_outdent_lines(ed)
+    t |> equal(ed.cursor_column, 2, "outdent carries the caret back")
+    text_edit_load(ed, "\tvalue")
+    text_edit_set_cursor(ed, 0, 0)
+    text_edit_outdent_lines(ed)
+    t |> equal(ed.cursor_column, 0, "an outdent past the caret clamps at zero")
     text_edit_load(ed, "ab\ncd\nef")
     text_edit_set_cursor(ed, 0, 1)
     text_edit_expand_line_selection(ed)
@@ -601,6 +685,125 @@ def test_vertical_moves_are_tab_visual(t : T?) {
 }
 
 [test]
+def test_edit_goto_line(t : T?) {
+    var ed = TextEditState()
+    text_edit_load(ed, "one\ntwo\nthree four\nfive")
+    text_edit_goto_line(ed, 3, 7)
+    t |> equal(ed.cursor_line, 2, "goto speaks 1-based lines")
+    t |> equal(ed.cursor_column, 6, "and 1-based columns")
+    text_edit_goto_line(ed, 99)
+    t |> equal(ed.cursor_line, 3, "past-the-end clamps to the last line")
+    text_edit_goto_line(ed, 2)
+    t |> equal(ed.cursor_column, 0, "no column means column one")
+    // the dialog's query parse
+    t |> success(text_edit_goto_query(ed, "3:7"), "line:col parses")
+    t |> equal(ed.cursor_line, 2, "query moved the line")
+    t |> equal(ed.cursor_column, 6, "query moved the column")
+    t |> success(text_edit_goto_query(ed, "1,2"), "comma works too")
+    t |> equal(ed.cursor_line, 0, "comma query moved")
+    t |> success(!text_edit_goto_query(ed, "banana"), "garbage declines")
+    t |> equal(ed.cursor_line, 0, "and keeps the position")
+    text_edit_open_goto(ed)
+    t |> success(ed.goto_open && ed.goto_focus, "open arms the dialog + focus")
+    text_edit_dispose(ed)
+}
+
+[test]
+def test_edit_color_literals(t : T?) {
+    // scan: 6 or 8 hex digits at ident boundaries only
+    var hit = text_edit_scan_color("let c = 0x12AF2A // tint", 0)
+    t |> equal(hit, int2(8, 6), "a 6-digit literal scans")
+    hit = text_edit_scan_color("x = 0x80FF8040", 0)
+    t |> equal(hit, int2(4, 8), "an 8-digit literal scans")
+    hit = text_edit_scan_color("mask = 0x3F", 0)
+    t |> equal(hit.x, -1, "short hex is not a color")
+    hit = text_edit_scan_color("a0xFFFFFF", 0)
+    t |> equal(hit.x, -1, "glued to an identifier is not a color")
+    hit = text_edit_scan_color("0xAABBCCDDEE", 0)
+    t |> equal(hit.x, -1, "wrong digit counts decline")
+    // parse and round-trip
+    let rgb = text_edit_color_value("0x12AF2A", 0, 6)
+    t |> success(rgb.w == 1.0f, "6 digits mean opaque")
+    t |> equal(text_edit_color_text(rgb, 6), "0x12AF2A", "RGB round-trips")
+    let argb = text_edit_color_value("0x80FF8040", 0, 8)
+    t |> success(argb.w > 0.49f && argb.w < 0.51f, "8 digits carry alpha")
+    t |> equal(text_edit_color_text(argb, 8), "0x80FF8040", "ARGB round-trips")
+}
+
+[test]
+def test_edit_join_lines(t : T?) {
+    var ed = TextEditState()
+    text_edit_load(ed, "one  \n\ttwo\nthree")
+    text_edit_set_cursor(ed, 0, 1)
+    text_edit_join_lines(ed)
+    t |> equal(ed.lines[0], "one two", "join collapses the seam to one space")
+    t |> equal(ed.cursor_line, 0, "caret stays on the joined line")
+    t |> equal(ed.cursor_column, 3, "caret sits at the seam")
+    t |> success(text_edit_undo(ed), "join undoes")
+    t |> equal(text_edit_source(ed), "one  \n\ttwo\nthree", "one undo restores")
+    // a selection joins ALL its lines in one unit
+    text_edit_select(ed, 0, 0, 2, 2)
+    text_edit_join_lines(ed)
+    t |> equal(ed.lines[0], "one two three", "the block joins whole")
+    t |> equal(length(ed.lines), 1, "into a single line")
+    t |> success(text_edit_undo(ed), "block join undoes")
+    t |> equal(length(ed.lines), 3, "one undo restores all lines")
+    // joining with an empty line adds no stray space
+    text_edit_load(ed, "aa\n\nbb")
+    text_edit_set_cursor(ed, 0, 0)
+    text_edit_join_lines(ed)
+    t |> equal(ed.lines[0], "aa", "empty next line joins clean")
+    t |> equal(length(ed.lines), 2, "and the line count drops")
+    text_edit_dispose(ed)
+}
+
+[test]
+def test_edit_move_selection_to(t : T?) {
+    var ed = TextEditState()
+    text_edit_load(ed, "alpha beta\ngamma")
+    text_edit_select(ed, 0, 0, 0, 5) // "alpha"
+    t |> success(text_edit_move_selection_to(ed, 1, 5), "drop after gamma")
+    t |> equal(text_edit_source(ed), " beta\ngammaalpha", "the text moved whole")
+    t |> equal(text_edit_selected_text(ed), "alpha", "and stays selected")
+    t |> success(text_edit_undo(ed), "the move undoes")
+    t |> equal(text_edit_source(ed), "alpha beta\ngamma", "ONE undo restores")
+    // dropping before the selection needs no adjustment
+    text_edit_select(ed, 0, 6, 0, 10) // "beta"
+    t |> success(text_edit_move_selection_to(ed, 0, 0), "drop at the start")
+    t |> equal(ed.lines[0], "betaalpha ", "moved ahead of alpha")
+    // a drop later on the SAME line: the removal shifts the target left
+    text_edit_load(ed, "one two three")
+    text_edit_select(ed, 0, 0, 0, 4) // "one "
+    t |> success(text_edit_move_selection_to(ed, 0, 8), "same-line drop after")
+    t |> equal(ed.lines[0], "two one three", "the target adjusted for the removal")
+    // a MULTI-line selection dropped later on its OWN end line: the removal
+    // splices that line's tail onto the start column, so the target carries it
+    text_edit_load(ed, "abcdef\nghijkl")
+    text_edit_select(ed, 0, 2, 1, 3) // "cdef\nghi"
+    t |> success(text_edit_move_selection_to(ed, 1, 5), "multi-line end-line drop")
+    t |> equal(text_edit_source(ed), "abjkcdef\nghil",
+        "the end-line target keeps the start column offset")
+    t |> success(text_edit_undo(ed), "the multi-line move undoes")
+    t |> equal(text_edit_source(ed), "abcdef\nghijkl", "ONE undo restores")
+    // three lines, dropped at the very end of the end line
+    text_edit_load(ed, "abc\ndef\nghi")
+    text_edit_select(ed, 0, 1, 2, 1) // "bc\ndef\ng"
+    t |> success(text_edit_move_selection_to(ed, 2, 3), "three-line end-line drop")
+    t |> equal(text_edit_source(ed), "ahibc\ndef\ng", "the spliced tail stays put")
+    // a drop on a line PAST the selection only shifts the line index
+    text_edit_load(ed, "aa\nbb\ncc")
+    text_edit_select(ed, 0, 1, 1, 1) // "a\nb"
+    t |> success(text_edit_move_selection_to(ed, 2, 1), "drop past the end line")
+    t |> equal(text_edit_source(ed), "ab\nca\nbc", "the target line shifts up whole")
+    // a drop inside the selection declines
+    text_edit_load(ed, "abcdef")
+    text_edit_select(ed, 0, 1, 0, 5)
+    t |> success(!text_edit_move_selection_to(ed, 0, 3), "inside drop declines")
+    t |> equal(text_edit_source(ed), "abcdef", "and nothing changes")
+    text_edit_dispose(ed)
+}
+
+[test]
 def test_edit_byte_mapping(t : T?) {
     var ed = TextEditState()
     text_edit_load(ed, "ab\r\ncd\r\né")
@@ -620,6 +823,13 @@ def test_edit_byte_mapping(t : T?) {
     t |> equal(span.start_column, 1, "range start column maps by byte")
     t |> equal(span.end_line, 1, "range end crosses the newline")
     t |> equal(span.end_column, 1, "range end column maps by byte")
+    for (offset in range(8)) {
+        let pos = text_edit_position_of_byte(ed, offset)
+        t |> equal(text_edit_byte_of_position(ed, pos.x, pos.y), offset,
+            "byte_of_position inverts position_of_byte")
+    }
+    t |> equal(text_edit_byte_of_position(ed, 99, 99), 8,
+        "past-the-end positions clamp to the buffer end")
     text_edit_dispose(ed)
 }
 
@@ -799,6 +1009,71 @@ def test_edit_auto_indent_on_enter(t : T?) {
     text_edit_move_end(ed)
     text_edit_newline(ed)
     t |> equal(ed.lines[1], "", "markdown Enter does not auto-indent")
+    // Enter BETWEEN a pair: closer gets its own line, caret indented between
+    text_edit_load(ed, "\tfoo \{\}")
+    text_edit_set_language(ed, "das")
+    text_edit_set_cursor(ed, 0, 6)
+    text_edit_newline(ed)
+    t |> equal(length(ed.lines), 3, "the pair splits into three lines")
+    t |> equal(ed.lines[0], "\tfoo \{", "the opener line keeps its text")
+    t |> equal(ed.lines[1], "\t\t", "the middle line indents one deeper")
+    t |> equal(ed.lines[2], "\t\}", "the closer keeps the original indent")
+    t |> equal(ed.cursor_line, 1, "caret on the middle line")
+    t |> equal(ed.cursor_column, 2, "caret at the middle indent")
+    t |> success(text_edit_undo(ed), "the split undoes")
+    t |> equal(text_edit_source(ed), "\tfoo \{\}", "one undo restores the pair")
+    text_edit_dispose(ed)
+}
+
+[test]
+def test_edit_auto_close_pairs(t : T?) {
+    var ed = TextEditState()
+    text_edit_load(ed, "")
+    text_edit_set_language(ed, "das")
+    // opener at EOL closes itself, caret lands between
+    text_edit_type(ed, "(")
+    t |> equal(ed.lines[0], "()", "the opener auto-closes")
+    t |> equal(ed.cursor_column, 1, "caret sits between the pair")
+    // typing the closer steps over the twin instead of inserting
+    text_edit_type(ed, ")")
+    t |> equal(ed.lines[0], "()", "the closer skips its twin")
+    t |> equal(ed.cursor_column, 2, "caret stepped over it")
+    // an opener BEFORE a word does not pair
+    text_edit_load(ed, "word")
+    text_edit_set_language(ed, "das")
+    text_edit_set_cursor(ed, 0, 0)
+    text_edit_type(ed, "\{")
+    t |> equal(ed.lines[0], "\{word", "no auto-close before an identifier")
+    // backspace inside an empty pair eats both halves
+    text_edit_load(ed, "")
+    text_edit_set_language(ed, "das")
+    text_edit_type(ed, "[")
+    t |> equal(ed.lines[0], "[]", "bracket pairs too")
+    text_edit_backspace(ed)
+    t |> equal(ed.lines[0], "", "backspace deletes the empty pair whole")
+    // quotes pair at word boundaries only
+    text_edit_type(ed, "\"")
+    t |> equal(ed.lines[0], "\"\"", "quote pairs at a boundary")
+    text_edit_type(ed, "\"")
+    t |> equal(ed.lines[0], "\"\"", "the second quote steps over")
+    t |> equal(ed.cursor_column, 2, "caret after the pair")
+    text_edit_type(ed, "s")
+    text_edit_type(ed, "'")
+    t |> equal(ed.lines[0], "\"\"s'", "no quote pair right after a word byte")
+    // surround: a selection wraps and stays selected inside
+    text_edit_load(ed, "abc")
+    text_edit_set_language(ed, "das")
+    text_edit_select(ed, 0, 0, 0, 3)
+    text_edit_type(ed, "(")
+    t |> equal(ed.lines[0], "(abc)", "the selection wraps in the pair")
+    t |> equal(text_edit_selected_text(ed), "abc", "the content stays selected")
+    t |> success(text_edit_undo(ed), "surround undoes")
+    t |> equal(ed.lines[0], "abc", "one undo unwraps")
+    // plain text pairs nothing (load keeps the language; clear it)
+    text_edit_load(ed, "")
+    text_edit_set_language(ed, "")
+    text_edit_type(ed, "(")
+    t |> equal(ed.lines[0], "(", "no language, no pairing")
     text_edit_dispose(ed)
 }
 
@@ -874,4 +1149,79 @@ def test_edit_find_sync_regex_groups(t : T?) {
     t |> equal(text_edit_source(ed), "foo-bar baz-qux", "one undo restores it")
     text_find_dispose(find)
     text_edit_dispose(ed)
+}
+
+[test]
+def test_edit_highlight_row_span_clamps(t : T?) {
+    var ed = TextEditState()
+    text_edit_load(ed, "alpha beta\ngamma")
+    var spans <- [TextEditRange(start_line = 0, start_column = 6,
+        end_line = 0, end_column = 10)]
+    text_edit_set_highlights(ed, spans)
+    t |> equal(text_edit_highlight_row_span(ed, ed.highlight_ranges[0], 0),
+        int2(6, 10), "a fresh highlight passes through")
+    // the edit lands BEFORE the next find sync: the range is now stale
+    text_edit_select(ed, 0, 4, 0, 10)
+    text_edit_backspace(ed)
+    t |> equal(ed.lines[0], "alph", "the highlighted tail is gone")
+    let columns = text_edit_highlight_row_span(ed, ed.highlight_ranges[0], 0)
+    t |> equal(columns, int2(4, 4), "the stale range clamps to the shortened line")
+    t |> success(columns.y <= length(ed.lines[0]),
+        "so the draw-side geometry never reads past the line")
+    // a multi-line range only clamps its own end rows
+    var wide <- [TextEditRange(start_line = 0, start_column = 2,
+        end_line = 1, end_column = 99)]
+    text_edit_set_highlights(ed, wide)
+    t |> equal(text_edit_highlight_row_span(ed, ed.highlight_ranges[0], 1),
+        int2(0, 5), "the end row clamps to 'gamma'")
+    t |> equal(text_edit_highlight_row_span(ed, ed.highlight_ranges[0], 4),
+        int2(-1, -1), "a row outside the buffer has no span")
+    delete spans
+    delete wide
+    text_edit_dispose(ed)
+}
+
+[test]
+def test_edit_issue_span_language_convention(t : T?) {
+    var ed = TextEditState()
+    text_edit_load(ed, "int main() \{ return; \}")
+    var diag = TextEditDiagnostic(line = 3, column = 7, end_line = 3,
+        end_column = 7, message = "expected ';'")
+    text_edit_set_language(ed, "das")
+    t |> equal(text_edit_issue_span_text(ed, diag), "4:7",
+        "daslang prints 1-based lines and 0-based columns")
+    text_edit_set_language(ed, "cpp")
+    t |> equal(text_edit_issue_span_text(ed, diag), "4:8",
+        "clang's own text is 1-based BOTH")
+    diag.end_column = 12
+    t |> equal(text_edit_issue_span_text(ed, diag), "4:8-13",
+        "a width span shifts both ends")
+    diag.end_line = 5
+    t |> equal(text_edit_issue_span_text(ed, diag), "4:8-6:13",
+        "a multi-line span too")
+    text_edit_set_language(ed, "")
+    t |> equal(text_edit_issue_span_text(ed, diag), "4:7-6:12",
+        "plain buffers keep the 0-based column")
+    text_edit_dispose(ed)
+}
+
+[test]
+def test_source_view_line_top_virtual_mode(t : T?) {
+    // the virtual path (>= 128 KB documents) never fills state.key, so the row
+    // pitch has to come from the content height the last draw stamped
+    var state = TextSourceViewState()
+    state.virtual_mode = true
+    state.virtual_line_starts <- [0, 10, 20, 30]
+    state.screen_size = float2(100.0f, 80.0f) // 4 rows at 20px
+    t |> equal(text_source_view_line_top(state, 0), 0.0f,
+        "the first line sits at the top")
+    t |> equal(text_source_view_line_top(state, 25), 40.0f,
+        "an interior byte lands on its own row")
+    t |> equal(text_source_view_line_top(state, 999), 60.0f,
+        "a past-the-end byte clamps to the last row")
+    // before the first draw there is nothing to derive from
+    state.screen_size = float2(0.0f, 0.0f)
+    t |> equal(text_source_view_line_top(state, 0), -1.0f,
+        "an unlaid-out virtual view still declines")
+    text_source_view_invalidate(state)
 }

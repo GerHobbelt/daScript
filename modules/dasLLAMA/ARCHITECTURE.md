@@ -28,8 +28,11 @@ thing live instead. Files with no contested edge get one short line.
 
 ## 1. File charters
 
-Every non-generated file under `dasllama/` appears here. `dasllama_env.das` and
-`dasllama_unicode.das` are generated and have no charter — edit their generators.
+Every file under `dasllama/` appears here. Two carry generated CONTENT rather than being
+generated themselves: `dasllama_env.das` is the hand-written env registry (`ENVIRONMENT.md` is
+generated FROM it by `harness/gen_env_doc.das`), and `dasllama_unicode.das` is hand-written
+around transcoded data tables (RANGES/WS from llama.cpp's unicode-data.cpp — retranscode,
+never hand-edit the tables).
 
 ### 1.1 Engine core
 
@@ -43,6 +46,22 @@ Every non-generated file under `dasllama/` appears here. `dasllama_env.das` and
   debt, **not precedent**. Nothing platform-specific may be added; new shared concerns get their own
   file rather than another thousand lines here.
 - **`dasllama_transformer.das`** — the block-composition seam only.
+- **`dasllama_blocks.das`** — the std/dense/MoE transformer block kernels, decode and prefill,
+  plus the two default block sets the arch files bind. `forward()` never names a kernel here — it
+  dispatches through the `ArchBlocks` function pointers, which is why the family lives outside the
+  hub with no hook.
+- **`dasllama_moe.das`** — MoE expert routing and dispatch: the top-k router, per-expert FFN
+  accumulation, the shared expert, and the decode instruments. The block kernels reach it only
+  through `moe_ffn_core`.
+- **`dasllama_attn_prefill.das`** — prefill attention, threaded over heads. `prefill_attention`
+  is the only entry; the classic/blocked/flash head kernels and their KV-codec ladders are its
+  implementation.
+- **`dasllama_batch.das`** — the batched decode step: one pass of the weights over B sessions,
+  GEMVs widened to B-row GEMMs, attention still per-(row, head) against each session's own cache.
+- **`dasllama_sampling.das`** — token sampling and the generation drivers. A leaf on top of
+  `forward`/`eval_batch`; the engine never calls back in.
+- **`dasllama_ple.das`** — gemma-4 E-series per-layer embeddings and the gemma4 MoE FFN. The
+  forward sequence reaches it only through the hooks it registers at init.
 - **`dasllama_config.das`** — `DlimConfiguration`: every input that changes `.dlim` image BYTES,
   in one struct, plus its identity formatter. A knob that does not change image bytes does not
   belong here; a knob that does and is missing is an image-aliasing bug.
@@ -53,19 +72,23 @@ Every non-generated file under `dasllama/` appears here. `dasllama_env.das` and
 
 ### 1.2 Formats and data movement
 
-These five own the module's data-shape vocabulary. The boundaries between them are the ones most
+These six own the module's data-shape vocabulary. The boundaries between them are the ones most
 often gotten wrong, so each says explicitly where the neighbouring half goes.
 
+- **`dasllama_plane.das`** — the borrowed-plane vocabulary: a plane is a pointer into a prepared
+  image plus its element count; the image owns the bytes, a carrier owns nothing but its backing.
+  Requires nothing in dasllama — the image rail binds planes, every carrier holds them.
 - **`dasllama_kqformat.das`** — format IDENTITY: the `KqFmt` enum, the per-format descriptor table
   (plane strides, block geometry, stream codes), format predicates. It requires nothing else in
   dasllama, because it is the taxonomy everything keys off. ONE id space — the enum; integer ids
   exist only at the IR/kernel-param boundary. `kq_sb` is the superblock-lattice predicate: a
   `fmt != q8` test does not imply the lattice, so branch on the predicate.
 - **`dasllama_convert.das`** — every tensor format CONVERSION: quantize/dequantize/transcode/encode,
-  codec byte readers, numeric widen/narrow — regardless of platform or caller. Metadata-coupled
-  drivers (GGUF lookup, threading, guards) stay with their containers and dispatch in. ONE
-  carve-out: a conversion that IS a KV-cache format's store/read half lives with its codec family
-  (§ below).
+  codec byte readers, numeric widen/narrow — regardless of platform or caller; plus the Q8_0/Q4_0
+  format identity itself (block geometry, scale layout, the quantization-quality detector).
+  Metadata-coupled drivers (GGUF lookup, threading, guards) stay with their containers and
+  dispatch in. ONE carve-out: a conversion that IS a KV-cache format's store/read half lives with
+  its codec family (§ below).
 - **`dasllama_repack.das`** — every disk-order → compute-order kernel-LAYOUT transform (grp
   interleaves, disk-order extractors, panel unpacks), any format, any platform. Number sources
   (tune stamps, bake overrides) stay with their owners and pass plain parameters in.
@@ -100,8 +123,9 @@ forward path touches at run time — a loaded `Model` is the whole handoff — a
 breaks the cycle. That re-export is what keeps every consumer on the facade.
 
 - **`dasllama_image.das`** — the prepared-model `.dlim` rail, and it is ONE rail (§2.1). Nothing
-  outside this file may read weights into a live carrier, and nothing outside it may release an
-  image backing.
+  outside this file may read weights into a live carrier; image backings are released only
+  through the single release path in `dasllama_common` that the carrier finalizers call — never
+  an ad-hoc unmap.
 
 ### 1.4 CPU kernel tiers
 
@@ -163,6 +187,37 @@ that a question answered for one backend has an obvious address in the other. Th
 - **`dasllama_kernel_access.das`** — the shared body-walk read/write classifier both GPU lenses run
   on. Backend-specific lowering stays in that backend's lens.
 
+**PSO lifecycle — the family shares ONE device and queue** (`metal_common_init`; the second-device
+question was surveyed and closed against). The decode PSO set lives as `g_pso_*` in
+`dasllama_metal_common`, is compiled by `metal_decode_init` in `dasllama_metal_kernels` and
+released by `metal_kernels_release` there — the kernels module owns its set's lifecycle even
+though the vars live with the device state. Prefill's `g_pf_pso_*` set is prefill-private end to
+end: `metal_prefill_init` compiles, `metal_prefill_shutdown` releases.
+
+**Race and tune code for a kernel family lives beside the family.** The shared scaffolding
+(`race_buf`, `race_envelope_ok`, `race_pair_ms`, `MetalTensorRaceResult`) is `<gpu>_common`'s;
+each module races its OWN families (`metal_tensor_race_decode` in kernels, `metal_tensor_race`
+in prefill) and the tuner calls those public entries.
+
+**Decline REASONS are enum values in the shapes module** (`MetalDecodeDecline`,
+`MetalPrefillDecline`); decline COUNTING lives in `<gpu>_common` beside `require_or_panic`, for
+both paths.
+
+**The allowed asymmetries between the backends — this list is closed; a new one lands with its
+entry here:**
+
+- **Metal sits ABOVE `dasllama_common`** (typed `Model`/`Session` access, umbrella entry via the
+  transformer's `?das_metal` requires, shapes unconditional); **Vulkan sits BELOW it** (untyped
+  pointer/array seams, the single `?vulkan` entry through the `dasllama_math_vulkan` facade).
+  That inversion is why their kernels↔common require directions differ.
+- **UMA vs discrete VRAM**: Metal never grows residency machinery (memory is memory); arenas,
+  upload economics, mirrors and hydration are Vulkan's alone.
+- **Lens depth**: the Metal lens generates `enc_*` builders from kernel classes; Vulkan's
+  hand-built `vk_set6`/`vk_write6` ladders stand until the class-kernel arc
+  (`followup_vulkan.md` item 9) gives SPIR-V the same interface surface.
+- **Vulkan has no shapes module yet** — `resident_upload` declines ad hoc by feature name; the
+  gap is `followup_vulkan.md` item 1, not a precedent to copy.
+
 Vulkan is the deliberately-designed model of this shape; Metal converges as it is touched.
 
 ### 1.6 Architecture registrations
@@ -178,6 +233,10 @@ on a shared path is the anti-pattern. Only a genuinely new dataflow earns its ow
 
 ### 1.7 Audio and ASR
 
+- **`dasllama_asr_types.das`** — the ASR floor: the capability/segment/timestamp types every
+  family file and the facade share (`AsrCaps`/`AsrTimestamps`/`TranscribeSegment`, plus
+  `asr_ctx_guard`). Family modules require this instead of each other — a shape needed by two
+  families moves up here, never sideways.
 - **`dasllama_audio.das`** — the shared audio tower: mel front-end, encoder blocks, the pieces every
   audio model composes.
 - **`dasllama_audio_io.das`** — decode-any-format → 16 kHz mono f32 PCM. The only file that talks to
@@ -195,6 +254,12 @@ on a shared path is the anti-pattern. Only a genuinely new dataflow earns its ow
 - **`dasllama_parity.das`** — CPU-reference caches for the parity instruments. Test-facing, but
   library-side because the caches outlive a single suite.
 - **`dasllama_prefix.das`** — the prefix/page cache for evaluated token history.
+- **`performance/fetch_models.das`** — the committed model-provenance manifest: per catalog
+  file, the exact HF repo + revision pin + sha256, or the on-box conversion recipe. Verify by
+  default, `--fetch` downloads; it never converts, never benches. BRINGUP.md §2 is the runbook.
+- **`benchmarks/asr/mem_census.sh`** — the peak-memory census (`/usr/bin/time -l` around one
+  asr_bench process per cell; macOS only) — the interim footprint instrument until a footprint
+  leg lands in `gen_bench_records`; its numbers live in `PERF_LEDGER.md`, never the stores.
 
 ---
 
@@ -224,6 +289,17 @@ identity-stamped `.dlim` flavors and GC-purge siblings. A suite child's pinned i
 pin, wscale, tune manifest) differs from the serving rig's, so a suite on the rail both re-mints
 multi-GB images the rig cannot use and purges the flavors the rig depends on. Image-rail coverage
 belongs to the image suites alone.
+
+**An image is judged only where its identity can be recomputed — the LANE rule.** An identity's
+(quant, tag) pair is its lane, and lanes coexist by design: a bake proves dead only its OWN lane's
+siblings, plus BROKEN and version-stale images anywhere. Everything else is `FOREIGN` — kept, and
+counted in the log. Two contexts produce lanes this process cannot reproduce: a GPU flavor (a blob
+bake selects its own backend and winners, so the string differs even where the tag matches:
+`portable|q8 mr4` against a planar `arm64-gen|q8 mr8`), and a family tag whose module is not loaded
+(the tag registry is filled by each family's `[init]`, so a process that never required whisper has
+no way to know a whisper image is current). A process that cannot recompute an identity has no
+standing to call it dead — the orchestrator of a sweep least of all, since its cells measure through
+an exe carrying its own baked winners.
 
 ### 2.2 Kernel SHAPE is compile-time; only DATA is runtime
 
@@ -311,6 +387,16 @@ why writing one is a review defect.
 an untuned invocation re-execs into a full retune rather than measuring — so re-mint the box
 manifest and check its winners against the stored rows' `tune` stamps before trusting a delta.
 
+**The retune re-exec bites scaffolding, and the pin for it is checked in.** Any bare `daslang`
+run that requires the engine — a probe, a one-off script, a REPL experiment — re-execs into a
+full retune when no manifest is armed. `performance/last_known_good_sidecar.json` exists for
+exactly that: a frozen copy of a complete, noise-gated mint, tracked in git (the `*.tune.json`
+ignore rule deliberately does not match it). Point `DAS_TUNE_MANIFEST` at it and the framework
+never retunes; on a different box the identity mismatch just serves fallbacks. That is the whole
+contract — it suppresses the re-exec, it does not tune the box, and a number measured under it
+is not a benchmark. Benches and the rig keep minting their own; refresh the copy when a
+paranoid re-mint moves the crowns.
+
 ### 2.6 Capability questions and readiness questions are different questions
 
 A predicate that mixes them cannot be reused. `prefill_decline` answers "can metal serve this
@@ -349,9 +435,10 @@ Durable "why it is built this way" facts harvested from the design docs archived
   Loop hints and intrinsic lowering exist only in the JIT, and the JIT tier is the only one the
   oracles gate. **Scaffolding is exempt:** conversion utilities (`.dlim` bake, image processing),
   debug scripts, and batch/driver tools that spawn the real runner as a child may run interpreted.
-  Interim enforcement is `guard_interp_gguf_load` (`dasllama_image.das` — big-load panic +
-  `DASLLAMA_ALLOW_INTERP_LOAD` escape for the conversion path); the unconditional library-seam
-  check lands with the tuning rework, after the repack/convert pulls make that seam clean. (The
+  Enforcement is `guard_interp_gguf_load` (`dasllama_image.das` — big-load panic +
+  `DASLLAMA_ALLOW_INTERP_LOAD` escape for the conversion path) plus `guard_interp_inference`
+  (`dasllama_math.das`), which panics at the library seams: `make_run_state`, ASR session
+  creation, and `vad_chunk_prob`. (The
   x64-era "fallback rail" framing — AOT/interp as correct-but-untuned tiers — is retired;
   intrinsic fallback bodies exist for off-ARCH correctness *inside* the JIT, not as runnable
   tiers.)

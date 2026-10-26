@@ -116,6 +116,65 @@ covers it); Ctrl+F/Ctrl+H only fire while the editor is focused
 case/whole-word toggles yet (find bar is case-insensitive literal or
 regex, as shipped in the viewer arc).
 
+**E4 status (SHIPPED 2026-07-31, ~30 commits a3fd66daa..59c82f373):**
+all eight slices landed, live-driven by Boris throughout (bug trail
+fixed same-session, each with a pinning test). (1) `imgui_text_language`
+profiles (fold kinds migrated in). (2) Syntax-while-editing: lexical
+tier (comment carry, anti-flicker merge — the carry-recovery scratch-lex
+was the second flicker root) + debounced tree-sitter refinement that
+never downgrades (quality bar). (3) Auto-indent (+ closer dedent, pair
+split on Enter, auto-closing pairs with quotes/surround/backspace-pair).
+(4) Bracket-pair highlight + red mismatch. (5) The completion carrier:
+async offer rail with rank tiers (compiled > words > keywords;
+statement-start boosts keywords — FROZEN until LSP), ghost (pushes the
+tail, never overwrites) + VS Code-style list (Down enters, sticky
+Escape, dot trigger), THREE providers: doc-words, .das in-process
+compiler (worker thread, gen2 policy fix — `version_2_syntax` lives in
+the CLI not the struct; latent in all das-side tool compiles, sweep
+pending), .cpp external clang (`-fsyntax-only`, SDK-sibling discovery).
+Diagnostics: squiggles with compiler-true ranges (das columns 0-based,
+clang 1-based — both probe-verified), multi-line spans, foreign-file
+findings, hover tooltip, compile status chrome, dockable Issues panel
+(colored rows, click-navigate). (6) Go-to-line (floating window,
+range hint, click-away). (7) Join lines, word/line drag extends,
+drag-and-drop selection with payload preview + drop caret. (8) Inline
+color embed: 0xRRGGBB/0xAARRGGBB swatches + picker dialog writing back
+as one rolling undo unit. Suites: edit model 42, complete 15, syntax 3,
+find 9, language 4, smoke 3 (incl. goto flow). Residuals: block/column
+selection post-LSP (confirmed); snippets + format-on-type recorded;
+`version_2_syntax` sweep of das-side tools; smoke re-run cadence
+whenever 9090 frees.
+
+**E5 status (SHIPPED 2026-08-01):** examples/text is the editor. Component:
+undo units carry serials; `text_edit_mark_saved` records the save point and
+`dirty` recomputes as top-serial != saved-serial (undo back to the save
+point clears it; divergence makes it unreachable — VS Code semantics, three
+model tests); `text_edit_byte_of_position` added (inverse byte mapping).
+App: per-document edit state; enter by typing (printable char pre-arms the
+editor's keyboard and the widget's own drain consumes the queued chars —
+a manual replay double-typed, probe-caught), Ctrl+E, footer Edit/Done, or
+View menu; plain/code = single pane, markdown = side-by-side with live
+preview (debounced `md_parse` of the LF buffer into SEPARATE preview state
+so viewer scroll/folds survive; caret follow = one-byte selection walked
+back to the nearest rendered byte, then the find-scroll band); save/save-as
+/reload ride the existing commands with editor sync + save-point record;
+dirty asterisk in the window title; welcome doc read-only; file.new =
+untitled buffer; 2s stat watch detects external changes (warn only, never
+auto-reload — explicit Reload refreshes and re-seeds). FOCUS LESSON: the
+find bar must draw AFTER the editor in the frame — the editor's FocusItem
+reclaim runs at its own draw, so a bar drawn earlier loses the
+replace-input focus race every frame (each typed char then replaced the
+currently-selected match through the re-jumping find sync — the undo
+journal made the failure legible). GRAMMAR FIX ridden in: bare named call
+arguments (#3410) were unparseable by the tree-sitter grammar, silently
+killing folds/outline after the first such call — `_argument` grew
+`make_struct_field` (two GLR conflicts declared, corpus 44/44, parser.c
+regenerated). The features demo (`examples/features/text_edit.das`) is
+DELETED; its three smokes retarget examples/text; viewer suite 10/10 with
+new save-point and preview/watch scenarios; the fold-click leg got a
+test-owned fixture. Deliberately left for E6: async das/cpp providers,
+Issues panel, completion beyond the tier-1 words/keywords rail.
+
 ## Shape: ONE component, one arc, two skins
 
 One arc, not two. The editing core — buffer, cursor, selection, undo,
@@ -123,9 +182,15 @@ input, search/replace — is identical for markdown and code; only the
 presentation differs, and both presentations already exist as viewers.
 The **rich text editor edits markdown SOURCE with a live preview pane**
 (the existing markdown viewer) beside it — the shape every good md editor
-uses. True WYSIWYG editing inside the laid-out rich text is a different,
-much larger beast: named non-goal, revisit only if the split-view editor
-proves insufficient in use.
+uses. **Markdown end state (E5 discussion, 2026-08-01, Boris): THREE
+editing modes** — plain source, side-by-side (source + live preview), and
+rich-text. Rich-text arrives via the Obsidian/Typora "live preview"
+stepping stone: every block renders rich except the one owning the
+cursor, which shows as inline editable source — reuses the line editor
+(per block) and the markdown renderer unchanged; the render tree's
+per-node source indices are the block↔source map. Slotted as **E5.5**.
+Full in-place WYSIWYG (a rich cursor inside a styled run) stays gated
+behind "live preview proves insufficient in use".
 
 - Component home: `modules/dasImgui/text/imgui_text_source_edit.das`,
   the editing sibling of `imgui_text_source_view`.
@@ -134,10 +199,11 @@ proves insufficient in use.
   presentations (rendered Markdown + syntax-highlighted source), command
   registry, live rails, and a dastest suite — is the parallel preview app
   for every feature slice: search, LSP, editing. It accretes the arc
-  instead of new `examples/editor/*` apps being built beside it; whether a
-  separate minimal code-editor example is still worth shipping is decided
-  at E5, not before. (The dasImgui merge landed 2026-07-30 — one repo,
-  the old staging caveat is gone.)
+  instead of new `examples/editor/*` apps being built beside it; the
+  separate minimal code-editor example is FOLDED (E5 discussion,
+  2026-08-01, Boris) — `examples/features/text_edit.das` served its E1
+  preview purpose and retires when the viewer edits. (The dasImgui merge
+  landed 2026-07-30 — one repo, the old staging caveat is gone.)
 
 ## The component, in detail
 
@@ -303,22 +369,88 @@ highlight inside code blocks lands with the selection work in E2/E4.
 - **E4-follow-up (recorded, not pressing): LLM completion tier.** Own
   section when it comes: API port setting, async request, model picked
   for fill speed, model-per-language setting; basic-basic completion.
+- **E4-follow-up (Boris, 2026-07-31, "feels later"): snippets +
+  format-on-type.** The observed gap: an accepted completion lands
+  unformatted next to auto-closed braces (no space after `{`). Two
+  standard mechanisms, both recorded: (1) TextMate-style snippet
+  completions (tab stops/placeholders — the format VS Code and LSP
+  adopted verbatim; slots into the provider interface as items carrying
+  templates instead of words); (2) format-on-type — reformat the
+  construct just closed (on `}` / Enter). (2) is uniquely cheap here:
+  we OWN das_source_formatter in-process, no LSP hop — "least
+  keystrokes to formatted code" (Boris's energy-compaction framing;
+  the KLM/GOMS literature is the study lineage) likely lands as
+  format-on-type first, snippets second.
 - **Post-LSP tail (Boris): block/column selection** — Alt+mouse drag +
   multi-line insert. Deliberately late: the undo journal already carries
   multi-op units and selection lives inside TextEditState, so nothing
   architectural forces it early.
+- **E4.5 (language-core interlude, Boris 2026-07-31): container
+  default-init + finalize banner** — element-lifetime correctness in the
+  language core (resize/table-index construct their elements,
+  erase/clear finalize them) lands BEFORE the editor grows on top of it.
+  Plan of record: CONTAINER_INIT_PLAN.md (same directory).
 - **E5** `examples/text` becomes an honest editor: the component wired
   into both its presentations (markdown source with live preview beside
   it, plain/code source), carrying save/load, dirty-state (undo back to
-  the save point clears dirty), and the find widget. Decide HERE whether
-  a separate minimal code-editor example still earns its keep or the
-  viewer covers it.
+  the save point clears dirty), and the find widget. **Settled (E5
+  discussion, 2026-08-01, Boris):** (a) viewer IS editor — a document
+  opens as viewer, first edit makes it an editor, with visible
+  indication (read-only badge vs dirty marker); the standalone example
+  folds (see above). (b) Editable = has a write-back path: disk files
+  write via fio; git-backed surfaces with a write-back (e.g. the PR
+  body — save pushes the change) are editable too; diff panes never
+  edit. (c) External change under a dirty buffer: detect and warn,
+  never auto-reload; merge/reload UX deferred. (d) Save surface: Ctrl+S
+  + dirty marker, save-as included; the file-open dialog needs its own
+  slice regardless — low priority, not a blocker. (e) Side-by-side
+  preview follows the edit point: scrolls to the current line AND
+  indicates the cursor position in the rendered pane. (f) Save-point
+  dirty semantics are the VS Code ones — redo past the save point then
+  diverging makes it unreachable and dirty returns; pinned in tests
+  day one.
+- **E5.5** rich-text markdown mode — the live-preview model per the
+  Shape section, right after E5 while the markdown machinery is hot;
+  E6/E7 numbering unchanged.
+  **STATUS: SHIPPED (2026-08-02, one PR on codex/e5-preview-caret).**
+  What landed, in dependency order: (1) editor range-core —
+  `text_source_edit_segment` + `TextEditSegmentSpec` draw any line range
+  at a composition offset, classic widget = the defaults call; (2)
+  markdown view begin/render/end split + partial block rendering
+  (`markdown_view_top_blocks`, `markdown_view_block_before/after`); (3)
+  `imgui/imgui_markdown_hybrid` — the segmented-buffer compositor: pure
+  block↔line segmentation (fence widen, sourceless-block resolution,
+  separators attach to the preceding block), innermost unfold (quote
+  inner paragraph, list per-item), delta shifting while typing, dirty
+  caret-exit → same-frame reparse, rich clicks → caret, compositor-owned
+  follow; (4) examples/text three-way editing surface (Source | Split |
+  Preview; live preview is the md editing default) with `hybrid_*` state
+  rails + `text_viewer_set_cursor`/`text_viewer_hybrid_segments`; (5)
+  snippet engine IN THE EDITOR CORE (`text_edit_snippet_expand`,
+  `${n:label}`/`${0}`/`${SEL}`, one undo unit fenced both sides, session
+  wins Tab over ghost/indent, tracking via ONE rule at the commit_edit
+  funnel); (6) `imgui/imgui_text_create` — the user-extensible creation
+  registry (LAST-wins `creation_define`, context tags + `can_create`
+  predicate lambdas, transforms, md set with Ctrl+B/I/K + das construct
+  set, `create.<id>` commands, Insert menu); (7)
+  `imgui/imgui_text_rich_das` — the SECOND hybrid format: comment groups
+  render rich via per-group fragment parses with adoption caching, das
+  buffers get Source | Preview. Deliberate v1 limits (flagged in code):
+  selection paints only in the source island, no snippet mirrors,
+  rich-das caret columns approximate under inline markup, read-only das
+  docs keep the plain view.
 - **E6** LSP in the code editor: hover + definition reuse the viewing
   arc's spawn-per-request transport verbatim (`nav.das`, overlay = the
   unsaved buffer — the SAME `--overlay` flag, no new machinery);
   diagnostics via `validate.das` on the debounce, squiggles from the
   span layer. Completion stays in LANGUAGE_SUPPORT_PLAN step 6 with the
   profelis floor.
+  **Completion plan of record (Boris, 2026-07-31, mid-E4): the daslang
+  VS Code plugin does completion amazingly well — EXTRACT that code,
+  generalize it into daslib somewhere, and use it in the LSP for
+  completion.** Until then the E4 heuristics (tiers, statement-start
+  keyword boost) are FROZEN — good enough, no more position jazz; that
+  intelligence belongs to the LSP tier when it lands.
   **Provider abstraction (Boris, 2026-07-30, dropped mid-E3): the editor
   talks to an LSP-LIKE interface, not to LSP.** One abstracted
   language-intelligence surface (hover / definition / diagnostics /
@@ -328,6 +460,11 @@ highlight inside code blocks lands with the selection work in E2/E4.
   through the SAME route: the E4 document-words/keywords tier, the LSP
   tier, and the LLM follow-up are providers behind one interface, not
   special cases.
+- **E7 synergy note (Boris, 2026-07-31): once the editor sits in herder
+  scenarios, git grows INTO the editor** — who-changed-this-line (blame)
+  populating as you navigate to a line, and the like; herder's
+  repository machinery already parses git, the editor's chrome/tooltip
+  rails exist, the join is the point.
 - **E7** dasHerd binds it: PR body (markdown instance, no preview pane
   needed at first), conflict resolution (ours / base / theirs +
   editable result, per-conflict accept-ours / accept-theirs / edit,

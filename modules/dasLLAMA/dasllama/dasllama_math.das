@@ -6,6 +6,7 @@ module dasllama_math shared public
 require math
 require daslib/fio  // has_env_variable: DAS_JOBQUE_TEAM_RANK_GATE suppresses the profile's team_rank_gate knob
 require dasllama/dasllama_env  // env_flag/env_int64: the shared typed readers + the knob registry
+require dasllama/dasllama_plane  // PlaneF/PlaneI8 — the borrowed-plane weight forms below
 require dasllama/dasllama_config  // DlimVulkanConfig — the dry-bake seam's config argument
 require daslib/jobque_boost public  // matmul's threaded path expands parallel_for; consumers need its symbols
 require daslib/jobque_profile  // named trace categories + unit markers (set_trace_tags registers them)
@@ -22,11 +23,17 @@ require llvm/daslib/f16_cvt  // f16<->f32 converts: JIT half intrinsics on aarch
 // can be passed zero-copy as views into one big model blob and outputs can be written
 // straight into a view (e.g. the KV cache). Dims/indices are int64 for large models.
 
-//! Dot product of two n-length float buffers, auto-vectorized by the LLVM JIT
-//! (width-8, no bounds checks, a/b asserted non-aliasing). Beats hand-rolled float4 ~1.8x.
-//! `dot_template` is the single source of truth (hot loop marked `[tune=1]`); the emitted
-//! `dot` below reconstitutes it via `[tuned]` with the per-box permutation — default `vec8_u2`
-//! is the original `[vectorize, vectorize_width=8, unroll_count=2]`, so this is bit-identical.
+//! The library-seam ``-jit`` stop: dasLLAMA inference NEVER runs interpreted (kernels 10-40x
+//! slower). Inference seams call it; scaffolding that only parses or peeks never crosses it.
+def guard_interp_inference(what : string) {
+    if (!jit_enabled() && !is_standalone_exe()) {
+        panic("dasLLAMA: {what} requires -jit (or a compiled exe) — interpreted inference runs the kernels 10-40x slower")
+    }
+}
+
+//! Dot product of two n-length float buffers, auto-vectorized (width-8, no bounds checks,
+//! non-aliasing). `dot_template` is the single source (hot loop `[tune=1]`); the emitted `dot`
+//! reconstitutes it via `[tuned]` — default `vec8_u2` is the original hints, bit-identical.
 [hint(unsafe_range_check, noalias = a, noalias = b)]
 def template dot_template(a, b : float const ?; n : int64) : float {
     var acc = 0.0
@@ -499,13 +506,21 @@ def matmul(var y : array<float>; w : array<float> | #; x : array<float>; n, d : 
     }
 }
 
+//! Borrowed-plane form of the blob+offset matvec.
+def matmul(var y : array<float>; w : PlaneF; woff : int64; x : array<float>; n, d : int64) {
+    matmul_at(y, plane_at(w, woff), x, n, d)
+}
+
 //! Blob+offset form: the weight is rows [d x n] at element offset `woff` inside `w` — no
 //! array_view (the view's block invoke is an LLVM optimization boundary; the kernel only ever
 //! wanted the base pointer).
 def matmul(var y : array<float>; w : array<float>; woff : int64; x : array<float>; n, d : int64) {
+    matmul_at(y, unsafe(addr<float const?>(w[woff])), x, n, d)
+}
+
+def private matmul_at(var y : array<float>; wp : float const?; x : array<float>; n, d : int64) {
     unsafe {
         var yp = addr(y[0])
-        let wp = addr<float const?>(w[woff])
         let xp = addr(x[0])
         maybe_parallel_for(0, int(d), matmul_chunks_gemv(int(d), 1, n * d)) $(rb, re) {
             unsafe {
@@ -601,12 +616,35 @@ def clear_float_batch_override() {
 
 def float_batch_override_active() : bool => g_fp_override_active
 
-//! Blob+offset form of matmul_batch (see the matmul woff overload).
-def matmul_batch(var y : array<float>; w : array<float>; woff : int64; x : array<float>; n, d, ntok : int64) {
+// the one body: the float-override seam then the core. Both weight forms below reach it with a
+// base pointer, so a borrowed plane and an owned blob take the identical route.
+def private matmul_batch_at(var y : array<float>; wp : float const?; x : array<float>; n, d, ntok : int64) {
     unsafe {
         var yp = addr(y[0])
-        let wp = addr<float const?>(w[woff])
         let xp = addr<float const?>(x[0])
+        if (g_fp_override_active && ntok >= g_fp_override_min_ntok && invoke(g_mm_fp_batch_override, yp, wp, xp, n, d, ntok)) {
+            return
+        }
+        matmul_batch_core(yp, wp, xp, n, d, ntok)
+    }
+}
+
+//! Blob+offset form of matmul_batch (see the matmul woff overload).
+def matmul_batch(var y : array<float>; w : array<float>; woff : int64; x : array<float>; n, d, ntok : int64) {
+    matmul_batch_at(y, unsafe(addr<float const?>(w[woff])), x, n, d, ntok)
+}
+
+//! Borrowed-plane form: the weights live in a prepared image, indexed from `woff`.
+def matmul_batch(var y : array<float>; w : PlaneF; woff : int64; x : array<float>; n, d, ntok : int64) {
+    matmul_batch_at(y, plane_at(w, woff), x, n, d, ntok)
+}
+
+//! Both sides borrowed — a baked table (gemma4a's positional embedding) driving a baked weight.
+def matmul_batch(var y : array<float>; w : PlaneF; woff : int64; x : PlaneF; n, d, ntok : int64) {
+    unsafe {
+        var yp = addr(y[0])
+        let wp = plane_at(w, woff)
+        let xp = plane_at(x, 0l)
         if (g_fp_override_active && ntok >= g_fp_override_min_ntok && invoke(g_mm_fp_batch_override, yp, wp, xp, n, d, ntok)) {
             return
         }
@@ -1188,7 +1226,7 @@ def q51q8_batch_kernel(var yp : float?; wq : uint8 const?; ws : uint8 const?; xq
             var qe : array<int8>
             qe |> resize(n)
             var sc : array<uint8>
-            sc |> resize(int(nb * 4l))
+            sc |> resize(nb * 4l)
             unsafe {
                 var qep = addr(qe[0])
                 var scp = addr(sc[0])
@@ -1226,7 +1264,7 @@ def q51q8_groupn_kernel(var yp : float?; wq : uint8 const?; ws : uint8 const?; o
             var qe : array<int8>
             qe |> resize(n)
             var sc : array<uint8>
-            sc |> resize(int(nb * 4l))
+            sc |> resize(nb * 4l)
             unsafe {
                 var qep = addr(qe[0])
                 var scp = addr(sc[0])
@@ -1266,7 +1304,7 @@ def q51q8_batch_groupn_kernel(var yp : float?; wq : uint8 const?; ws : uint8 con
             var qe : array<int8>
             qe |> resize(n)
             var sc : array<uint8>
-            sc |> resize(int(nb * 4l))
+            sc |> resize(nb * 4l)
             unsafe {
                 var qep = addr(qe[0])
                 var scp = addr(sc[0])
@@ -1894,6 +1932,16 @@ def matmul_q8q8_batch(var y : array<float>; wq : array<int8>; ws : array<float>;
     unsafe {
         invoke(g_mm_q8q8_batch, addr(y[0]),
             addr<int8 const?>(wq[woff]), addr<float const?>(ws[woff / 32l]),
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, d, ntok)
+    }
+}
+
+//! Borrowed-plane form: the Q8 quant and scale planes live in a prepared image. Scales index
+//! at woff/32, exactly as the array form does.
+def matmul_q8q8_batch(var y : array<float>; wq : PlaneI8; ws : PlaneF; woff : int64; xq : array<int8>; xs : array<float>; n, d, ntok : int64) {
+    unsafe {
+        invoke(g_mm_q8q8_batch, addr(y[0]),
+            plane_at(wq, woff), plane_at(ws, woff / 32l),
             addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, d, ntok)
     }
 }
@@ -2936,5 +2984,117 @@ def rope_apply(var vec : array<float> | #; pos, head_size, n : int64; theta, fsc
     unsafe {
         let ff = has_ff ? addr<float const?>(freq_factors[0]) : null
         rope_apply(addr<float?>(vec[0]), pos, head_size, n, theta, fscale, has_ff, ff, neox, mscale)
+    }
+}
+
+// Function values do not survive the -exe bake's global serialization (the
+// dasllama_config restore names the defect) — every @@-defaulted seam in this
+// module boot-restores here; a real registrar wins via the null guards.
+[init]
+def private restore_math_fn_defaults { // nolint:STYLE037,STYLE038 — flat seam list, one guard per global
+    if (g_repack_q8q8 == null) {
+        g_repack_q8q8 = @@repack_q8q8_identity
+    }
+    if (g_repack_mx4 == null) {
+        g_repack_mx4 = @@repack_mx4_identity
+    }
+    if (g_mm_q8q8 == null) {
+        g_mm_q8q8 = @@q8q8_unset_kernel
+    }
+    if (g_mm_q8q8_batch == null) {
+        g_mm_q8q8_batch = @@q8q8_unset_batch
+    }
+    if (g_mm_q8q8_group3 == null) {
+        g_mm_q8q8_group3 = @@q8q8_unset_group3
+    }
+    if (g_mm_mx4q8 == null) {
+        g_mm_mx4q8 = @@mx4q8_unset_kernel
+    }
+    if (g_mm_mx4q8_batch == null) {
+        g_mm_mx4q8_batch = @@mx4q8_unset_batch
+    }
+    if (g_mm_mx4q8_batch_groupn == null) {
+        g_mm_mx4q8_batch_groupn = @@mx4q8_unset_batch_groupn
+    }
+    if (g_mm_q8q8_groupn == null) {
+        g_mm_q8q8_groupn = @@q8q8_unset_groupn
+    }
+    if (g_mm_mx4q8_groupn == null) {
+        g_mm_mx4q8_groupn = @@mx4q8_unset_groupn
+    }
+    if (g_mm_q51q8_batch == null) {
+        g_mm_q51q8_batch = @@q51q8_batch_kernel
+    }
+    if (g_mm_q51q8_groupn == null) {
+        g_mm_q51q8_groupn = @@q51q8_groupn_kernel
+    }
+    if (g_mm_q51q8_batch_groupn == null) {
+        g_mm_q51q8_batch_groupn = @@q51q8_batch_groupn_kernel
+    }
+    if (g_mm_q8q8_rows == null) {
+        g_mm_q8q8_rows = @@q8q8_unset_rows
+    }
+    if (g_mm_mx4q8_rows == null) {
+        g_mm_mx4q8_rows = @@mx4q8_unset_rows
+    }
+    if (g_mm_q8q8_s16 == null) {
+        g_mm_q8q8_s16 = @@q8q8_unset_kernel_s16
+    }
+    if (g_mm_q8q8_batch_s16 == null) {
+        g_mm_q8q8_batch_s16 = @@q8q8_unset_batch_s16
+    }
+    if (g_mm_q8q8_group3_s16 == null) {
+        g_mm_q8q8_group3_s16 = @@q8q8_unset_group3_s16
+    }
+    if (g_mm_q8q8_groupn_s16 == null) {
+        g_mm_q8q8_groupn_s16 = @@q8q8_unset_groupn_s16
+    }
+    if (g_mm_q8q8_rows_s16 == null) {
+        g_mm_q8q8_rows_s16 = @@q8q8_unset_rows_s16
+    }
+    if (g_mm_kq == null) {
+        g_mm_kq = @@kq_unset_kernel
+    }
+    if (g_kq_rows_k4 == null) {
+        g_kq_rows_k4 = @@kq_unset_rows
+    }
+    if (g_kq_rows_k5 == null) {
+        g_kq_rows_k5 = @@kq_unset_rows
+    }
+    if (g_kq_rows_k6 == null) {
+        g_kq_rows_k6 = @@kq_unset_rows
+    }
+    if (g_kq_rows_q40 == null) {
+        g_kq_rows_q40 = @@kq_unset_rows
+    }
+    if (g_mm_kq_batch == null) {
+        g_mm_kq_batch = @@kq_unset_batch
+    }
+    if (g_mm_kq_groupn == null) {
+        g_mm_kq_groupn = @@kq_unset_groupn
+    }
+    if (g_mm_kq_batch_groupn == null) {
+        g_mm_kq_batch_groupn = @@kq_unset_batch_groupn
+    }
+    if (g_bake_q51_repack == null) {
+        g_bake_q51_repack = @@repack_q51_identity
+    }
+    if (g_bake_q8q8_repack == null) {
+        g_bake_q8q8_repack = @@repack_q8q8_identity
+    }
+    if (g_bake_mx4_repack == null) {
+        g_bake_mx4_repack = @@repack_mx4_identity
+    }
+    if (g_bake_kq_repack == null) {
+        g_bake_kq_repack = @@repack_kq_identity
+    }
+    if (g_repack_q51 == null) {
+        g_repack_q51 = @@repack_q51_identity
+    }
+    if (g_repack_kq == null) {
+        g_repack_kq = @@repack_kq_identity
+    }
+    if (g_active_kq_layout == null) {
+        g_active_kq_layout = @@kq_layout_grp4_fmt
     }
 }

@@ -838,6 +838,12 @@ def private dispatch_post_command_hooks(command : string; target : string) {
     }
 }
 
+def public synth_coroutines_active : int {
+    //! In-flight L1 input coroutines (click/drag gestures). A gesture riding a coroutine is
+    //! invisible to the timeline players, so status endpoints fold this into their idle answer.
+    return length(g_coroutines)
+}
+
 def public advance_coroutines() {
     //! Step every active L1 input coroutine one frame; finished coroutines drop out. ``harness_begin_frame`` calls this automatically — demo code should not call it directly. Exposed for the rare host that doesn't use the harness; in that case must run between ``ImGui_ImplGlfw_NewFrame()`` and ``NewFrame()`` so synthetic events aren't clobbered by the GLFW backend.
     var i = length(g_coroutines)
@@ -1576,14 +1582,26 @@ def private mod_alias_for_side_key(key : int) : int {
     return 0
 }
 
+def private wire_key(key : int) : int {
+    // Synth keys are LOGICAL — pre-swap Ctrl<->Super under ConfigMacOSXBehaviors to cancel ImGui's AddKeyEvent swap, so a synth Ctrl lands as io.KeyCtrl on every platform and chords never need a per-OS mods dance.
+    if (!GetIO().ConfigMacOSXBehaviors) return key
+    if (key == int(ImGuiKey.LeftCtrl)) return int(ImGuiKey.LeftSuper)
+    if (key == int(ImGuiKey.RightCtrl)) return int(ImGuiKey.RightSuper)
+    if (key == int(ImGuiKey.LeftSuper)) return int(ImGuiKey.LeftCtrl)
+    if (key == int(ImGuiKey.RightSuper)) return int(ImGuiKey.RightCtrl)
+    if (key == int(ImGuiKey.ImGuiMod_Ctrl)) return int(ImGuiKey.ImGuiMod_Super)
+    if (key == int(ImGuiKey.ImGuiMod_Super)) return int(ImGuiKey.ImGuiMod_Ctrl)
+    return key
+}
+
 def public synth_key_press(key : int) {
-    //! Press synth ``key`` (ImGuiKey int); auto-pairs the ``ImGuiMod_*`` alias for side-mod keys so ``Shortcut()`` routing sees the chord.
+    //! Press synth ``key`` (a LOGICAL ImGuiKey int — Ctrl means io.KeyCtrl even under macOS behaviors); auto-pairs the ``ImGuiMod_*`` alias for side-mod keys so ``Shortcut()`` routing sees the chord.
     var io & = unsafe(GetIO())
-    io |> AddKeyEvent(as_imgui_key(key), true)
+    io |> AddKeyEvent(as_imgui_key(wire_key(key)), true)
     synth_held_keys |> insert(key)
     let mod_alias = mod_alias_for_side_key(key)
     if (mod_alias != 0) {
-        io |> AddKeyEvent(as_imgui_key(mod_alias), true)
+        io |> AddKeyEvent(as_imgui_key(wire_key(mod_alias)), true)
         synth_held_keys |> insert(mod_alias)
     }
     synth_last_keycode   = key
@@ -1593,11 +1611,11 @@ def public synth_key_press(key : int) {
 def public synth_key_release(key : int) {
     //! Release synth ``key`` (and its mod alias).
     var io & = unsafe(GetIO())
-    io |> AddKeyEvent(as_imgui_key(key), false)
+    io |> AddKeyEvent(as_imgui_key(wire_key(key)), false)
     synth_held_keys |> erase(key)
     let mod_alias = mod_alias_for_side_key(key)
     if (mod_alias != 0) {
-        io |> AddKeyEvent(as_imgui_key(mod_alias), false)
+        io |> AddKeyEvent(as_imgui_key(wire_key(mod_alias)), false)
         synth_held_keys |> erase(mod_alias)
     }
 }
@@ -1713,7 +1731,7 @@ def public imgui_synth_tick() {
         }
     }
     for (k in keys(synth_held_keys)) {
-        io |> AddKeyEvent(as_imgui_key(k), true)
+        io |> AddKeyEvent(as_imgui_key(wire_key(k)), true)
     }
 }
 

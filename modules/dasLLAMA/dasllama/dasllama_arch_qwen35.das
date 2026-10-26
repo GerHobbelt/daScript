@@ -38,11 +38,7 @@ def private configure_qwen35moe(var c : Config) {
 def register_arch_qwen35() {
     var d = ArchDesc(name = "qwen35", configure = @@configure_qwen35)
     d.blocks = qwen35_blocks()
-    d.chat.system.parts <- [chat_special("<|im_start|>"), chat_text("system\n"), chat_content(), chat_special("<|im_end|>"), chat_text("\n")]
-    d.chat.user.parts <- [chat_special("<|im_start|>"), chat_text("user\n"), chat_content(), chat_special("<|im_end|>"), chat_text("\n")]
-    d.chat.assistant_open.parts <- [chat_special("<|im_start|>"), chat_text("assistant\n")]
-    d.chat.think_suppress.parts <- [chat_special("<think>"), chat_text("\n\n"), chat_special("</think>"), chat_text("\n\n")]
-    d.chat.stop <- ["<|im_end|>", "<|endoftext|>"]
+    chatml_chat(d.chat)
     // (clone the template BEFORE register_arch moves `d`)
     var dm = ArchDesc(name = "qwen35moe", configure = @@configure_qwen35moe)
     dm.blocks = qwen35moe_blocks()
@@ -198,7 +194,7 @@ def private deltanet_decode_gpu(t : Model; var s : Session; l : int64) {
     quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)   // one Q8_0 image serves the qkv AND z GEMVs
     prof_add("mm_qkv", ts_qkv)
     let ts_gpu = ref_time_ticks()
-    s.dn_tail |> resize(int(taps * cd))   // contract slot only — the step arm never writes it
+    s.dn_tail |> resize(taps * cd)   // contract slot only — the step arm never writes it
     unsafe {
         matmul_moe_gpu_dn(s.xb2, t.dnqkv_offs[l], t.dngate_offs[l], t.dnout_offs[l],
             s.xq, s.xs, s.dn_beta, s.dn_g,
@@ -515,7 +511,7 @@ def private dn_conv_batch(t : Model; var s : Session; l : int64; npos : int64) {
 // One v-head's chunked delta rule over the whole prefill window (mirrors llama.cpp
 // build_delta_net_chunking; NOT bit-identical to the recurrent form — chunk FP reassociation).
 // Solves (I + A) d = V_beta - (K_beta ⊙ e^{gcum}) S per chunk; state S advances once per chunk.
-def private dn_chunked_head(conv : float const?; qoff, koff, voff, cd : int64; // nolint:STYLE037 — the chunked DeltaNet head is one barrier-coupled recurrence; splitting it would spill the chunk state
+def private dn_chunked_head(conv : float const?; qoff, koff, voff, cd : int64; // nolint:STYLE037,STYLE038 — the chunked DeltaNet head is one barrier-coupled recurrence; splitting it would spill the chunk state
                             bp, gp : float const?; bg_stride : int64;
                             zp : float const?; var op : float?; o_stride : int64;
                             var stp : float?; var ws : float?; wnorm : float const?;
@@ -735,7 +731,7 @@ def private deltanet_prefill_gpu(t : Model; var s : Session; l : int64; npos : i
     requant_rows_q8(s.xb_b, dim, npos, s.xqb, s.xsb)   // one Q8_0 image serves the qkv AND z GEMMs
     prof_add("dn_mm_in", ts_in)
     let ts_gpu = ref_time_ticks()
-    s.dn_tail |> resize(int(taps * cd))
+    s.dn_tail |> resize(taps * cd)
     unsafe {
         matmul_moe_gpu_dn(s.xb2_b, t.dnqkv_offs[l], t.dngate_offs[l], t.dnout_offs[l],
             s.xqb, s.xsb, s.dn_beta_b, s.dn_g_b,

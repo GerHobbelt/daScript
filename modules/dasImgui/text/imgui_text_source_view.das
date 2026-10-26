@@ -63,6 +63,7 @@ struct public TextSourceViewStyle {
     bracket_match_color : float4 = float4(0.55f, 0.65f, 0.85f, 0.35f)
     bracket_mismatch_color : float4 = float4(0.90f, 0.30f, 0.30f, 0.45f)
     list_bg_color : float4 = float4(0.11f, 0.12f, 0.14f, 0.97f)
+    error_underline_color : float4 = float4(0.92f, 0.32f, 0.30f, 0.90f)
     caret_color : float4 = float4(0.92f, 0.92f, 0.94f, 1.0f)
     current_line_color : float4 = float4(1.0f, 1.0f, 1.0f, 0.045f)
     added_line_color : float4 = float4(0.20f, 0.72f, 0.38f, 0.92f)
@@ -241,7 +242,12 @@ def public text_source_view_line_top(state : TextSourceViewState const;
     //! SetScrollY. Returns -1.0 before the first layout pass.
     if (state.virtual_mode) {
         let count = length(state.virtual_line_starts)
-        if (count == 0 || state.key.line_height <= 0.0f) return -1.0f
+        if (count == 0) return -1.0f
+        // the virtual path never fills state.key - recover the row pitch from
+        // the content height the last virtual draw stamped
+        let line_height = (state.screen_size.y > 0.0f
+            ? state.screen_size.y / float(count) : state.key.line_height)
+        if (line_height <= 0.0f) return -1.0f
         var lo = 0
         var hi = count
         while (lo < hi) {
@@ -252,7 +258,7 @@ def public text_source_view_line_top(state : TextSourceViewState const;
                 hi = mid
             }
         }
-        return float(max(lo - 1, 0)) * state.key.line_height
+        return float(max(lo - 1, 0)) * line_height
     }
     let count = length(state.layout.lines)
     if (count == 0) return -1.0f

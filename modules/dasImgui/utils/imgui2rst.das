@@ -46,7 +46,7 @@ def document_module_imgui_boost_runtime() {
         group_by_regex("Widget state types",      mod, %regex~.*State(Float|Int|Float2|Float3|Float4|Int2|Int3|Int4)?$%%),
         group_by_regex("Per-frame registry",      mod, %regex~^(WidgetEntry|WidgetMeta|begin_frame|end_frame|end_of_frame|register_widget|register_focusable|register_radio_site_alias|register_handle_bbox|register_clickable_bbox|register_clickable_state_bbox|register_end_of_frame_hook|register_post_command_hook|lookup_widget|lookup_state_addr|clear_module_widgets|widget_registered|widget_prelude|widget_rect|with_state|id_to_path|id_to_bbox).*%%),
         group_by_regex("Path machinery",          mod, %regex~^(container_path_push|container_path_pop|widget_path_key|container_path_key|active_widget_path)$%%),
-        group_by_regex("Coroutines",              mod, %regex~^(advance_coroutines|spawn_coroutine)$%%),
+        group_by_regex("Coroutines",              mod, %regex~^(advance_coroutines|spawn_coroutine|synth_coroutines_active)$%%),
         group_by_regex("Window control",          mod, %regex~^imgui_(dock|undock|dock_reset|raise|set_window_pos|set_window_size)$%%),
         group_by_regex("Live commands",           mod, %regex~^imgui_(snapshot|click|force_set|open|close|select|focus|await|mouse_pos|mouse_click|mouse_scroll|key_press|key_release|key_char)$%%),
         group_by_regex("Synthetic input",         mod, %regex~^(synth_mouse_move|synth_mouse_button|synth_mouse_wheel|synth_key_press|synth_key_release|synth_char|release_held_buttons|release_held_keys|get_synth_cursor|get_synth_keys|imgui_synth_tick|user_control_enabled|set_user_control_enabled|set_user_control|register_real_input_toggle|register_synth_frame_hook|register_synth_stop_hook)$%%),
@@ -153,7 +153,7 @@ def document_module_imgui_playwright() {
     var groups <- array<DocGroup>(
         group_by_regex("App lifecycle",     mod, %regex~^(with_imgui_app|launch_imgui_app|shutdown|with_recording_app).*%%),
         group_by_regex("Locators / queries", mod, %regex~^(find_widget|widget_exists|widget_payload_field|widget_rendered|widget_click_point|widget_component_point|get_text)$%%),
-        group_by_regex("Actions",           mod, %regex~^(click|double_click|click_at|right_click|type_text|key_tap|force_set_value|force_set_verified|drag|drag_along|drag_to|focus|open_widget|close_widget|select_widget|reload|reset|move_to|reset_cursor_pos|resize_window)$%%),
+        group_by_regex("Actions",           mod, %regex~^(click|double_click|click_at|right_click|type_text|key_tap|key_chord_tap|key_hold|force_set_value|force_set_verified|drag|drag_along|drag_to|focus|open_widget|close_widget|select_widget|reload|reset|move_to|reset_cursor_pos|resize_window)$%%),
         group_by_regex("Recording / narration", mod, %regex~^(say|say_begin|say_hash|hold_through_voice|drag_through_voice|type_into_voice|combo_pick_voice|toggle_tree_voice|close_button_voice|click_render_voice|menu_pick_voice|record_check_value|record_check_changed|record_check_unchanged|record_check_rendered|record_check_kind_count|record_check)$%%),
         group_by_regex("Content-time gating", mod, %regex~^(wait_content_frames|hold_content|record_frame_count|hold_remainder_content)$%%),
         group_by_regex("Snapshots",         mod, %regex~^(snapshot|log_snapshot|expect_value|expect_render).*%%),
@@ -256,6 +256,10 @@ def main {
         let doc_stdlib = get_das_root() + "/doc/source/stdlib"
         topic_root = "{doc_stdlib}/generated"
         handmade_root = doc_stdlib
+
+        // the raw binding has no generated pages; signatures naming its types
+        // (ImGuiKey etc.) must print plain, or sphinx -W dies on the dead ref
+        mark_module_pageless("imgui")
 
         document_module_imgui_boost_v2()
         document_module_imgui_boost_runtime()

@@ -5,6 +5,51 @@ code, structure macros, qmacro/quote code generation, or any code that
 manipulates AST node pointers (e.g., `TypeDeclPtr`, `ExpressionPtr`,
 `FunctionPtr`, `StructurePtr`).
 
+## Debug with the AST verifier — FIRST, not last
+
+A macro that builds slightly-wrong AST does not fail where the mistake is. It
+segfaults several passes later inside inference or codegen, with no line number
+and no clue which macro did it. `daslib/ast_verify` turns that into a diagnostic
+at the offending node, so reach for it the moment a macro misbehaves:
+
+```
+daslang --ast-verify foo.das
+```
+
+```
+CRASH: SIGSEGV (Segmentation fault) (signal 11) at address 0x30      # without
+AST verify: let variable 'i' has no type (Variable._type is null)    # with
+```
+
+It checks shapes the compiler dereferences unguarded: null required children,
+null elements in child vectors, statements in value slots, slots reached through
+an unchecked cast, malformed `TypeDecl`s (element-less containers, payload-less
+named types), declaration types (function result, arguments, struct fields), and
+flag pairings the parser always establishes.
+
+Three ways in, by how much of the tree you can see:
+
+| Call | Use when |
+|---|---|
+| `daslang --ast-verify file.das` | first move on any unexplained crash; force-includes the module and checks every non-builtin module before each inference pass |
+| `require daslib/ast_verify` | same, pinned in the source |
+| `verify_module(prog, mod)` | at the end of your `apply()`, once the tree is installed |
+| `verify_expression(expr)` | you BUILD and RETURN a subtree — for-loop / call / variant / reader macros run inside inference, where the module-level form cannot see your result yet |
+| `verify_function(fn)` | you BUILD a function. `add_function` mangles the signature immediately, so a malformed result or argument type crashes there, before any pass could run — verify before you register |
+
+Each returns the violation count, and each REPAIRS what it reports, substituting
+a placeholder so the walk finishes and surfaces every diagnostic rather than
+dying on the first. That repair is not a nicety: the verifier walks with the same
+visitor the compiler uses, and `Expr*::visit` dereferences children unguarded, so
+reporting without repairing gives you the diagnostic AND the segfault.
+
+Two things it will not do for you. It is a denylist of shapes that CRASH — a
+shape the compiler tolerates, or legitimately produces, is deliberately not
+flagged, so silence is not proof your tree is right. And a macro that re-breaks
+the same node every pass never converges: the verifier repairs, you break it
+again, and the compile ends in `error[30507]: type inference exceeded maximum
+allowed number of passes`. That is your bug — break the node once.
+
 ## AST nodes are gc_node — unique, no `inscope`, no `<-` for assignment
 
 Every AST type — `TypeDecl`, `Expression` (every subclass: `ExprBlock`,
@@ -56,6 +101,12 @@ pvar._type.flags.ref = true
 ```
 
 Same family of trap as the [ExprRef2Value blocker](#peel-exprref2value-before-qmatch) — the typer doesn't repair what macro substitution introduces, when the substitution lands in an already-typed AST fragment.
+
+**A `Variable` you emit MUST have `_type` set** — unlike `ExprVar` (where a null `_type` means "let the typer fill it"), a `new Variable(name := n, at = at, init = e)` destined for an `ExprLet` (or a global, function/block argument, structure field) with null `_type` is a malformed tree: infer reports `error[50640] malformed AST, variable '<n>' is missing its type` (`50608` for structure fields) and fails the compile. For type inference from the initializer, set `_type = new TypeDecl(baseType = Type.autoinfer, at = at)`.
+
+The same `malformed AST, ...` detection family covers the other required-but-nullable fields a macro-built tree can miss: a for loop's `body` (`50607`), `iteratorsAt`/`iteratorsAka` left shorter than `iterators` when rewriting a loop (`50607` — keep all the parallel vectors the same length, like the tutorial's table_kv macro does), null ENTRIES in `variables`/`arguments`/`sources` lists (`50640`/`50609`/`50607`), and a generated `Function` with null `result` (`50609` — set `result` to an auto `TypeDecl`). These repair the tree in place so compilation can continue reporting, but the error is sticky — the compile still fails. Null *expression children* (`ExprOp2.left`, an `if` condition) are NOT guarded — those crash in the visitor walk itself; the crash-capture stack trace is the diagnostic there.
+
+**`macro_sticky_error(prog, at, message)`** — the sticky-error primitive itself, next to `macro_error` in the ast module. Use it when your macro detects damage, repairs it so infer can proceed, but the program must still fail to compile: a plain `macro_error` recorded on a pass that also changed the AST is discarded by the next infer pass, a sticky one survives to the end.
 
 Canonical example: `try_make_inline_cmp` and the `_where`-arm projection-bind rewrite in `daslib/linq_fold_common.das` (PR #2714).
 

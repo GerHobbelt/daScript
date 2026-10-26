@@ -56,7 +56,7 @@ fam-qwen35/fam-qwen35moe are deltanet hybrids whose batch cell asserts the per-r
 shape — metal batch steps 0, both rows served on the single-decode path; fam-qwen2moe's
 batch cell asserts the `graph` DECLINE on the planar model — shexp has no batch arm, and a
 blob twin's CPU batch fallback would trip the blob-only panic). The
-`kernels` suite (test_metal_prefill_kernels — model-less kernel units, ~80s) has no arms;
+`kernels` suite (test_metal_prefill_kernels + test_metal_decode_kernels — model-less kernel units, ~80s) has no arms;
 remember it exists — kernel uniform/binding changes MUST update its hand-bound dispatches.
 The `image` suite (test_model_image — the prepared-image .dlim rail): `mechanics` (synthetic
 carrier, model-free, runs in CI) `smol metal tower whisper voxtral parakeet qwen3a canary
@@ -67,7 +67,8 @@ teacher-forced logits-tolerance parity cell (greedy token equality is NOT a vali
 135M — genuine near-ties flip on ~0.02 gaps under ~0.75 cross-backend noise). The ASR-family
 arms (`parakeet` transcript-exact, `qwen3a`/`canary`/`gemma4a` element-exact planes,
 `canary-dec` = the opt-in fp32 Model rail, token-exact) re-save their images from cold each
-run like the voxtral arm.
+run like the voxtral arm. The canary arm carries both lanes: the f32 element-exact cell and
+the q8 cell (read-time transcode — qblob/qscales/compact-blob element-exact vs a staged read).
 The `image-vulkan` suite (test_model_image_vulkan, arm `vulkan`) covers the OFFLINE vulkan
 bake: the runner arms DASLLAMA_GPU + a small VRAM budget so the probed config carries a
 vulkan section, the DRY tier collects a role-stamped plan with no device calls (safe on

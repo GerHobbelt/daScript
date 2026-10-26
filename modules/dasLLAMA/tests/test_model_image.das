@@ -8,6 +8,10 @@ require dasllama/dasllama            // the facade: load_model's image cache is 
 require dasllama/dasllama_whisper
 require dasllama/dasllama_gguf       // rd_u32/rd_u16 — the wav fixture reader
 require dasllama/dasllama_image
+require dasllama/dasllama_plane   // PlaneF — the served side of the round-trip comparisons
+require dasllama/dasllama_canary  // CanaryStaging/stage_canary_encoder — the off-rail truth read
+require dasllama/dasllama_gemma4a // Gemma4aStaging/stage_gemma4a_encoder — same, for the gemma4a arm
+require dasllama/dasllama_parakeet // ParakeetStaging/stage_parakeet_model — same, for the parakeet arm
 require dasllama/dasllama_config     // DlimConfiguration — the peek/round-trip mechanics arms
 require dasllama/dasllama_math   // pin_kernel_backend — the metal-flavor arm's donor contract
 require dasllama/dasllama_layout // convert_model_to_metal_blob — the derive cell's in-RAM control
@@ -34,6 +38,34 @@ def private whisper_dir() : string {
 }
 
 // element-exact plane compare: -1 = length mismatch, else the number of differing elements
+// the staged (owned array) side against the served (borrowed plane) side — the only comparison
+// that can prove an image round-trips, now that a served carrier has no array form
+def private count_mismatch(a : array<float>; b : PlaneF) : int64 {
+    if (long_length(a) != length(b)) {
+        return -1l
+    }
+    var bad = 0l
+    for (i in range64(long_length(a))) {
+        if (a[i] != b[i]) {
+            bad++
+        }
+    }
+    return bad
+}
+
+def private count_mismatch_i8(a : array<int8>; b : PlaneI8) : int64 {
+    if (long_length(a) != length(b)) {
+        return -1l
+    }
+    var bad = 0l
+    for (i in range64(long_length(a))) {
+        if (a[i] != b[i]) {
+            bad++
+        }
+    }
+    return bad
+}
+
 def private count_mismatch(a, b : array<auto(TT)>) : int64 {
     if (long_length(a) != long_length(b)) {
         return -1l
@@ -684,29 +716,26 @@ def test_tower_image_roundtrip(t : T?) {
         }
         let img = image_path_for(path, "tower-f32")
         remove(img)
-        // the truth is the OFF-RAIL gguf read: cold and warm are both image-backed now, so a
+        // the truth is the OFF-RAIL staged read: cold and warm are both image-backed now, so a
         // cold-vs-warm compare alone would only prove the file matches the chunk it came from
-        var a <- load_audio_tower_(path)
-        var cold <- load_audio_tower(path)
+        var inscope a <- stage_audio_tower(path)
+        var inscope cold <- load_audio_tower(path)
         t |> success(cold.image_map != null, "cold load serves the image it built")
         t |> success(stat(img).is_valid, "cold load saved an image")
         t |> equal(count_mismatch(a.fblob, cold.fblob), 0l, "cold-built fblob element-exact")
-        delete cold
-        var b <- load_audio_tower(path)
+        var inscope b <- load_audio_tower(path)
         t |> success(b.image_map != null, "warm load is image-backed")
-        t |> equal(b.d_model, a.d_model)
-        t |> equal(b.n_layer, a.n_layer)
-        t |> equal(b.n_ff, a.n_ff)
-        t |> equal(b.n_ctx, a.n_ctx)
-        t |> equal(b.proj_dim, a.proj_dim)
-        t |> equal(b.stack_factor, a.stack_factor)
-        t |> equal(b.mm1_out, a.mm1_out)
-        t |> success(b.proj_kind == a.proj_kind, "proj_kind")
-        t |> equal(b.layers_off, a.layers_off)
-        t |> equal(b.layer_stride, a.layer_stride)
+        t |> equal(b.d_model, a.e.d_model)
+        t |> equal(b.n_layer, a.e.n_layer)
+        t |> equal(b.n_ff, a.e.n_ff)
+        t |> equal(b.n_ctx, a.e.n_ctx)
+        t |> equal(b.proj_dim, a.e.proj_dim)
+        t |> equal(b.stack_factor, a.e.stack_factor)
+        t |> equal(b.mm1_out, a.e.mm1_out)
+        t |> success(b.proj_kind == a.e.proj_kind, "proj_kind")
+        t |> equal(b.layers_off, a.e.layers_off)
+        t |> equal(b.layer_stride, a.e.layer_stride)
         t |> equal(count_mismatch(a.fblob, b.fblob), 0l, "fblob element-exact")
-        delete a
-        delete b
     }
 }
 
@@ -725,7 +754,7 @@ def private read_wav_pcm16_mono(path : string) : array<float> {
             let sz = int64(rd_u32(bytes, o + 4l))
             if (id == 0x61746164u) {
                 let cnt = min(sz, n - o - 8l) / 2l
-                out |> resize(int(cnt))
+                out |> resize(cnt)
                 for (i in range64(cnt)) {
                     var v = int(rd_u16(bytes, o + 8l + i * 2l))
                     if (v >= 32768) {
@@ -743,11 +772,13 @@ def private read_wav_pcm16_mono(path : string) : array<float> {
 }
 
 def private whisper_transcribe_text(path : string; samples : array<float>; cached : bool = true) : tuple<text : string; mapped : bool> {
-    var w = WhisperModel()
+    var inscope w = WhisperModel()
     if (cached) {
-        w <- load_whisper_model(path)
+        w <- load_whisper_model(path)   // nolint:PERF030 — fresh default-constructed target, single move
     } else {
-        w <- load_whisper_model_(path)   // the off-rail control
+        // the control: a staged read minted straight into memory — no shared bytes, no shared file
+        var inscope stg <- stage_whisper_model(path)
+        mint_whisper_model(stg, w)
     }
     var text = ""
     with_job_que() {
@@ -759,7 +790,6 @@ def private whisper_transcribe_text(path : string; samples : array<float>; cache
         delete s
     }
     let mapped = w.image_map != null
-    delete w
     return (text = text, mapped = mapped)
 }
 
@@ -792,21 +822,44 @@ def test_whisper_image_roundtrip(t : T?) {
         t |> success(stat(img).is_valid, "cold load saved an image")
         let b = whisper_transcribe_text(path, samples)
         t |> success(b.mapped, "warm load is image-backed")
-        t |> success(!g.mapped && !empty(g.text), "non-empty transcript off the rail")
-        t |> success(g.text == a.text, "bin vs cold-built image transcript")
-        t |> success(g.text == b.text, "bin vs mapped image transcript")
+        // every served model is image-backed now; the control differs by SINK, not by form —
+        // it is minted into memory and never touches the canonical .dlim
+        to_log(LOG_INFO, "whisper image-roundtrip jfk eyeball: '{g.text}'\n")
+        t |> success(g.mapped && !empty(g.text), "non-empty transcript from the in-memory mint")
+        t |> success(g.text == a.text, "in-memory mint vs cold-built image transcript")
+        t |> success(g.text == b.text, "in-memory mint vs mapped image transcript")
+        // streamed == eager, plane for plane: the cold mint above STREAMED the big planes from
+        // the source mapping; the staged read materializes them. Same bytes or the stream lied.
+        var inscope stg <- stage_whisper_model(path)
+        var inscope w32 <- load_whisper_model(path)
+        t |> equal(count_mismatch(stg.dblob, w32.dblob), 0l, "streamed dblob element-exact vs staged")
+        t |> equal(count_mismatch(stg.enc.fblob, w32.enc.fblob), 0l, "streamed enc.fblob element-exact vs staged")
+        t |> equal(count_mismatch(stg.filters, w32.filters), 0l, "filters element-exact")
+        // and the q8 flavor — quantize+repack per streamed job must match the eager whole-blob pass
+        let img8 = image_path_for(path, "whisper-q8")
+        remove(img8)
+        var inscope stg8 <- stage_whisper_model(path, true)
+        var inscope w8 <- load_whisper_model(path, true)
+        t |> success(w8.image_map != null, "q8 cold load serves the image it streamed")
+        t |> equal(count_mismatch_i8(stg8.dqblob, w8.dqblob), 0l, "streamed dqblob element-exact vs staged")
+        t |> equal(count_mismatch(stg8.dqscales, w8.dqscales), 0l, "streamed dqscales element-exact vs staged")
+        t |> equal(count_mismatch_i8(stg8.enc.qblob, w8.enc.qblob), 0l, "streamed enc.qblob element-exact vs staged")
+        t |> equal(count_mismatch(stg8.enc.qscales, w8.enc.qscales), 0l, "streamed enc.qscales element-exact vs staged")
+        t |> equal(count_mismatch(stg8.dblob, w8.dblob), 0l, "q8 flavor's fp32 dblob element-exact too")
         delete samples
     }
 }
 
 def private parakeet_transcribe_text(path : string; samples : array<float>; cached : bool = true) : tuple<text : string; mapped : bool> {
-    var m = AsrModel()
+    var inscope m = AsrModel()
     if (cached) {
-        m <- load_asr_model(path)
+        m <- load_asr_model(path)   // nolint:PERF030 — fresh default-constructed target, single move
     } else {
-        // the off-rail control, assembled exactly as load_asr_model's parakeet arm does
-        m = AsrModel(kind = AsrKind.parakeet)
-        m.pk <- load_parakeet_model_(path, true)
+        // the control: a staged read minted straight into memory, so it shares no bytes and no
+        // file with the canonical image the other two arms load
+        m.kind = AsrKind.parakeet
+        var inscope stg <- stage_parakeet_model(path, true)
+        mint_parakeet_model(stg, m.pk, true)
     }
     var text = ""
     with_job_que() {
@@ -816,7 +869,6 @@ def private parakeet_transcribe_text(path : string; samples : array<float>; cach
         delete s
     }
     let mapped = m.pk.image_map != null
-    delete m
     return (text = text, mapped = mapped)
 }
 
@@ -847,9 +899,12 @@ def test_parakeet_image_roundtrip(t : T?) {
         t |> success(stat(img).is_valid, "cold load saved an image")
         let b = parakeet_transcribe_text(path, samples)
         t |> success(b.mapped, "warm load is image-backed")
-        t |> success(!g.mapped && !empty(g.text), "non-empty transcript off the rail")
-        t |> success(g.text == a.text, "bin vs cold-built image transcript")
-        t |> success(g.text == b.text, "bin vs mapped image transcript")
+        // every served model is image-backed now; the control differs by SINK, not by form —
+        // it is minted into memory and never touches the canonical .dlim
+        to_log(LOG_INFO, "parakeet image-roundtrip jfk eyeball: '{g.text}'\n")
+        t |> success(g.mapped && !empty(g.text), "non-empty transcript from the in-memory mint")
+        t |> success(g.text == a.text, "in-memory mint vs cold-built image transcript")
+        t |> success(g.text == b.text, "in-memory mint vs mapped image transcript")
         delete samples
     }
 }
@@ -869,24 +924,22 @@ def test_qwen3a_tower_image_roundtrip(t : T?) {
         }
         let img = image_path_for(path, "qwen3a-f32")
         remove(img)
-        // off-rail truth: both cached loads are image-backed, so they cannot check each other
-        var a <- load_qwen3a_tower_(path)
-        var cold <- load_qwen3a_tower(path)
+        // off-rail truth: the staged read — both cached loads are image-backed and cannot
+        // check each other
+        var inscope a <- stage_qwen3a_tower(path)
+        var inscope cold <- load_qwen3a_tower(path)
         t |> success(cold.image_map != null, "cold load serves the image it built")
         t |> success(stat(img).is_valid, "cold load saved an image")
         t |> equal(count_mismatch(a.cblob, cold.cblob), 0l, "cold-built cblob element-exact")
-        delete cold
-        var b <- load_qwen3a_tower(path)
+        var inscope b <- load_qwen3a_tower(path)
         t |> success(b.image_map != null, "warm load is image-backed")
-        t |> equal(b.core.d_model, a.core.d_model)
-        t |> equal(b.core.n_layer, a.core.n_layer)
-        t |> equal(b.core.n_ctx, a.core.n_ctx)
-        t |> equal(b.proj_dim, a.proj_dim)
-        t |> equal(b.n_ch, a.n_ch)
+        t |> equal(b.core.d_model, a.e.core.d_model)
+        t |> equal(b.core.n_layer, a.e.core.n_layer)
+        t |> equal(b.core.n_ctx, a.e.core.n_ctx)
+        t |> equal(b.proj_dim, a.e.proj_dim)
+        t |> equal(b.n_ch, a.e.n_ch)
         t |> equal(count_mismatch(a.core.fblob, b.core.fblob), 0l, "core.fblob element-exact")
         t |> equal(count_mismatch(a.cblob, b.cblob), 0l, "cblob element-exact")
-        delete a
-        delete b
     }
 }
 
@@ -905,23 +958,67 @@ def test_canary_encoder_image_roundtrip(t : T?) {
         }
         let img = image_path_for(path, "canary-f32")
         remove(img)
-        // off-rail truth: both cached loads are image-backed, so they cannot check each other
-        var a <- load_canary_encoder_(path)
-        var cold <- load_canary_encoder(path)
+        // off-rail truth: both cached loads are image-backed, so they cannot check each other.
+        // The staging carrier IS the off-rail read now — a served encoder has no array form.
+        var inscope a <- stage_canary_encoder(path)
+        var inscope cold <- load_canary_encoder(path)
         t |> success(cold.image_map != null, "cold load serves the image it built")
         t |> success(stat(img).is_valid, "cold load saved an image")
         t |> equal(count_mismatch(a.blob, cold.blob), 0l, "cold-built blob element-exact")
-        delete cold
-        var b <- load_canary_encoder(path)
+        var inscope b <- load_canary_encoder(path)
         t |> success(b.image_map != null, "warm load is image-backed")
-        t |> equal(b.d_model, a.d_model)
-        t |> equal(b.n_layer, a.n_layer)
-        t |> equal(b.proj_dim, a.proj_dim)
-        t |> equal(long_length(b.layers), long_length(a.layers))
+        t |> equal(b.d_model, a.e.d_model)
+        t |> equal(b.n_layer, a.e.n_layer)
+        t |> equal(b.proj_dim, a.e.proj_dim)
+        t |> equal(length(b.layers), long_length(a.layers))
         t |> equal(count_mismatch(a.blob, b.blob), 0l, "blob element-exact")
         t |> equal(count_mismatch(a.filters, b.filters), 0l, "filters element-exact")
-        delete a
-        delete b
+        t |> equal(count_mismatch(a.window, b.window), 0l, "window element-exact")
+        t |> equal(count_mismatch(a.twiddles, b.twiddles), 0l, "twiddles element-exact")
+    }
+}
+
+[test]
+def test_canary_encoder_q8_image_roundtrip(t : T?) {
+    t |> run("canary encoder q8: mapped image planes are element-exact vs bin transcode") @(t : T?) {
+        if (!family_on(t, "canary")) return
+        if (!arm_on(t, "canary")) return
+        if (!jit_enabled()) {
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(models_dir(), "canary-qwen-2.5b-encoder-f32.bin")
+        if (!model_available(t, path)) {
+            return
+        }
+        let img = image_path_for(path, "canary-q8")
+        remove(img)
+        // off-rail truth: the staging carrier re-runs the read-time transcode + repack under
+        // the same backend pin, so its planes are the served image's ground truth
+        var inscope a <- stage_canary_encoder(path, true)
+        var inscope cold <- load_canary_encoder(path, true)
+        t |> success(cold.image_map != null, "cold load serves the image it built")
+        t |> success(stat(img).is_valid, "cold load saved an image")
+        t |> success(cold.q8, "served encoder is on the q8 rail")
+        t |> equal(count_mismatch_i8(a.qblob, cold.qblob), 0l, "cold-built qblob element-exact")
+        var inscope b <- load_canary_encoder(path, true)
+        t |> success(b.image_map != null, "warm load is image-backed")
+        t |> success(b.q8, "warm encoder is on the q8 rail")
+        t |> equal(b.d_model, a.e.d_model)
+        t |> equal(b.n_layer, a.e.n_layer)
+        t |> equal(b.proj_dim, a.e.proj_dim)
+        t |> equal(length(b.layers), long_length(a.layers))
+        t |> equal(count_mismatch_i8(a.qblob, b.qblob), 0l, "qblob element-exact")
+        t |> equal(count_mismatch(a.qscales, b.qscales), 0l, "qscales element-exact")
+        t |> equal(count_mismatch(a.blob, b.blob), 0l, "compact fp32 blob element-exact")
+        t |> equal(count_mismatch(a.filters, b.filters), 0l, "filters element-exact")
+        // the off-rail control: a staged read minted straight into memory; the mint derives
+        // its family tag from the staging's own precision
+        var inscope stg <- stage_canary_encoder(path, true)
+        var inscope minted = CanaryEncoder()
+        mint_canary_encoder(stg, minted)
+        t |> success(minted.q8, "minted encoder is on the staging's q8 rail")
+        t |> equal(count_mismatch_i8(a.qblob, minted.qblob), 0l, "minted qblob element-exact vs staged truth")
     }
 }
 
@@ -940,23 +1037,25 @@ def test_gemma4a_encoder_image_roundtrip(t : T?) {
         }
         let img = image_path_for(path, "gemma4a-f32")
         remove(img)
-        // off-rail truth: both cached loads are image-backed, so they cannot check each other
-        var a <- load_gemma4a_encoder_(path)
-        var cold <- load_gemma4a_encoder(path)
+        // off-rail truth: both cached loads are image-backed, so they cannot check each other.
+        // The staging carrier IS the off-rail read now — a served encoder has no array form.
+        var inscope a <- stage_gemma4a_encoder(path)
+        var inscope cold <- load_gemma4a_encoder(path)
         t |> success(cold.image_map != null, "cold load serves the image it built")
         t |> success(stat(img).is_valid, "cold load saved an image")
         t |> equal(count_mismatch(a.blob, cold.blob), 0l, "cold-built blob element-exact")
-        delete cold
-        var b <- load_gemma4a_encoder(path)
+        var inscope b <- load_gemma4a_encoder(path)
         t |> success(b.image_map != null, "warm load is image-backed")
-        t |> equal(b.d_model, a.d_model)
-        t |> equal(b.n_layer, a.n_layer)
-        t |> equal(b.proj_dim, a.proj_dim)
-        t |> equal(long_length(b.layers), long_length(a.layers))
+        t |> equal(b.d_model, a.e.d_model)
+        t |> equal(b.n_layer, a.e.n_layer)
+        t |> equal(b.proj_dim, a.e.proj_dim)
+        t |> equal(length(b.layers), long_length(a.layers))
         t |> equal(count_mismatch(a.blob, b.blob), 0l, "blob element-exact")
         t |> equal(count_mismatch(a.twiddles, b.twiddles), 0l, "twiddles element-exact")
-        delete a
-        delete b
+        t |> equal(count_mismatch(a.filters, b.filters), 0l, "filters element-exact")
+        t |> equal(count_mismatch(a.pos_emb, b.pos_emb), 0l, "pos_emb element-exact")
+        t |> equal(count_mismatch(a.hann, b.hann), 0l, "hann element-exact")
+        t |> equal(count_mismatch(a.ones, b.ones), 0l, "ones element-exact")
     }
 }
 
@@ -999,5 +1098,49 @@ def test_fp32_decoder_image_roundtrip(t : T?) {
         delete ga
         delete gb
         delete prompt
+    }
+}
+
+// The lane-GC regression gate: a GPU-flavor bake runs in its own pin context, so its identity
+// is un-recomputable here — the verdict must say FOREIGN (kept), never OTHER (reaped). The
+// 2026-08-02 bring-up lost every two-flavor model to exactly this: the metal save reaped the
+// planar sibling, then --clean reaped the metal images.
+[test]
+def test_dlim_flavor_lanes(t : T?) {
+    t |> run("flavor lanes: another bake context's image is never judged from here") @(t : T?) {
+        if (!arm_on(t, "mechanics")) {
+            return
+        }
+        let planar = image_identity("", "q8")
+        t |> equal(dlim_identity_lane(planar), "q8#", "planar lane is quant-only")
+        t |> equal(dlim_identity_lane("{planar}|metal"), "q8#metal", "metal tag folds into the lane")
+        let vk_tag = "vulkan|m2n b8192 l4 s1 r110000110"
+        t |> equal(dlim_identity_lane("{planar}|{vk_tag}"), "q8#{vk_tag}", "vulkan tags keep their inner pipes")
+        var current <- dlim_current_identities()
+        var p = DlimPeek(valid = true, version = IMAGE_VERSION, identity = planar)
+        t |> equal(dlim_image_verdict(p, current), "CURRENT", "own planar identity")
+        // the observed cross-context metal identity: blob bake selects portable + its own winners
+        p.identity = "v{IMAGE_VERSION}|q8|portable|s16|q8 mr4 b0 g4|kq 4/4/4/4|q51 mr1|nat 1101|metal"
+        t |> equal(dlim_image_verdict(p, current), "FOREIGN", "cross-context metal image is FOREIGN, not OTHER")
+        p.identity = "v{IMAGE_VERSION}|q8|portable|s16|q8 mr4 b0 g4|kq 4/4/4/4|q51 mr1|nat 1101|{vk_tag}"
+        t |> equal(dlim_image_verdict(p, current), "FOREIGN", "cross-context vulkan image is FOREIGN")
+        // a family tag whose module is not loaded in the judging process: unrecomputable, so
+        // FOREIGN — the 2026-08-02 board's step-zero GC reaped every whisper/parakeet image
+        // this way before the rule generalized
+        p.identity = "v{IMAGE_VERSION}|q8|arm64-gen|s16|q8 mr8 b0 g4|kq 8/8/4/8|q51 mr4|nat 1101|not-a-registered-family"
+        t |> equal(dlim_image_verdict(p, current), "FOREIGN", "unregistered family tag is FOREIGN")
+        // a REGISTERED family tag is judgeable — whisper's module is required by this suite
+        p.identity = image_identity("whisper-q8")
+        t |> equal(dlim_image_verdict(p, current), "CURRENT", "registered family tag, own identity")
+        p.identity = replace(image_identity("whisper-q8"), "|s16|", "|s32|")
+        t |> equal(dlim_image_verdict(p, current), "OTHER", "registered family tag, drifted knobs")
+        // same LANE as this process, different knobs — provably stale here
+        p.identity = replace(planar, "|s16|", "|s32|")
+        t |> equal(dlim_image_verdict(p, current), "OTHER", "own-lane knob drift stays OTHER")
+        p.version = IMAGE_VERSION - 1
+        t |> equal(dlim_image_verdict(p, current), "STALE v{IMAGE_VERSION - 1}", "version staleness wins in any lane")
+        p.valid = false
+        t |> equal(dlim_image_verdict(p, current), "BROKEN", "invalid peek")
+        delete current
     }
 }

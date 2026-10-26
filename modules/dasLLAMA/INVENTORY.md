@@ -11,7 +11,7 @@
 - **197 `.das` files, ~128,900 lines** under `modules/dasLLAMA/`, plus `utils/dasllama-server/` (16 files) and the untracked `modules/dasVulkan/` backend.
 - Directory roles: `dasllama/` engine (58 files, ~72,600 lines) · `tests/` (59, module-owned, NEVER AOT) · `benchmarks/` (59) · `harness/` (78, hand-run probes/tuners/oracles) · `performance/` (33, the publishable rig) · `models/` (silero weights only) · 18 root `.md` docs.
 - The five monoliths: `dasllama_common.das` 13,684 · `dasllama_math_vulkan.das` 9,339 · `dasllama_metal_prefill.das` 8,240 · `dasllama_metal_kernels.das` 7,281 · `dasllama_math.das` 4,330.
-- Hub files by require in-degree: `dasllama_math` 112 · `dasllama_common` 53 · `dasllama_transformer` 30 · `dasllama_quant` 29 · `dasllama_env` 27 (full table in the Math backends section).
+- Hub files by require in-degree: `dasllama_math` 112 · `dasllama_common` 53 · `dasllama_transformer` 30 · `dasllama_quant` 29 (module since DELETED — the convert extraction absorbed it) · `dasllama_env` 27 (full table in the Math backends section).
 - Audit method: six parallel deep-read passes (common anatomy / math backends / GPU dispatch / families / tools-rig-server / root docs), 2026-07-29. Duplication percentages marked "measured" come from line diffs, not eyeballing.
 
 ## dasllama_common.das — the 13,684-line monolith
@@ -142,7 +142,7 @@ Scope note: GPU-side *load-time* layout rearrangement (`moe_gpu_gather_stack`, `
 
 **`dasllama_math_accelerate.das` — 250.** NOT a KernelBackend — installs float-batch override hooks. 32–46 strips · 48–134 BNNS f16 lane (bf16→f16 cached plane convert w/ sampled fingerprint) · 136–175 `accel_bf16_f16_lane` · 184–250 batch overrides + `[init]`.
 
-**`dasllama_math_metal.das` — 442, "metal" backend at priority −1.** 37–211 two GEMM shader classes (`MetalQ8Gemm` 32×32, `MetalQ8Gemm64`) · 216–218 `gemm_use64` · 220–343 host driver · 348–403 `metal_q8q8_batch` (the one live slot; CPU fallback on small/odd shapes) · 405–442 probe + 3 panic stubs + `metal_repack_noop` + `[init]`. Consumers: `dasllama_metal_prefill:14`, `benchmarks/matmul/occupancy_report`.
+**`dasllama_metal_gemm.das` — 442, "metal" backend at priority −1.** (Its byte-identical rename leftover `dasllama_math_metal.das` was deleted in the reorg.) 37–211 two GEMM shader classes (`MetalQ8Gemm` 32×32, `MetalQ8Gemm64`) · 216–218 `gemm_use64` · 220–343 host driver · 348–403 `metal_q8q8_batch` (the one live slot; CPU fallback on small/odd shapes) · 405–442 probe + 3 panic stubs + `metal_repack_noop` + `[init]`. Consumers: `dasllama_metal_prefill:14`, `benchmarks/matmul/occupancy_report`.
 
 **`dasllama_math_vulkan.das` — 9,339, "vulkan" backend at priority −1.** Pulled only via `require ?vulkan` (`dasllama_common:17`) + 2 tier tests. Split: header 1–50 / **shaders 51–3659 (3,609 lines)** / **host 3661–9339 (5,679 lines)**.
 Shaders: 65–113 `q8_moe_groupn` · 115–228 `q8_moe_batch` (sdot4 32×32) · 230–873 coopmat variants (`_cmf16`/`_cmi8`/`_mm`/`_mm_a`/`_mm_m`) · 875–975 `kq_moe_batch_q40_cmf16` · 977–1102 cm2 twins · 1104–1117 `q8_moe_xf16` · 1119–1233 FFN mid-chain (`act_mul`, `q8_moe_actrq`, `q8k_moe_actrq`, `q8_moe_actf16`, `rd_f16cvt`) · 1235–1259 `moe_combine` · 1261–1834 deltanet · 1836–2064 attention (`at_prep_*`, `at_attn`) · 2066–2914 resident residual-stream (`ar_add_rms(_b/_rq)`, `qk_rms`, `rope_kv_store(_b)`, `qkn_rope_kv`, `da_attn(_b/_b_h128)`, `q8k_requant`) · 2916–3150 kq decode GEMV family · 3152–3659 kq batch tiles (k4/q40/k5/k6).
@@ -156,7 +156,7 @@ Host: 3661–3823 capacity consts + tile routers · 3824–4156 structs (`HostBu
 
 **`dasllama_gemm_schema.das` — 79, no requires, required by 9.** THE layout-descriptor source: `Q8RepackType`, `q8q8_repack_type`, block consts (`Q8_QPB/SPB`, `KQ_SUPERBLOCK_ELEMS`, `Q51_QPB/SPB`, `Q8N_BPB=34`), `kq_qsb(fmt)`/`kq_ssb(fmt)`.
 
-**`dasllama_quant.das` — 350, required by 30.** The convert nucleus: `quantize_q8_0(_into/_into_ptr/_bs_into/_bs_into_ptr/_k_into/_k_into_ptr)`, `dequantize_q8_0`, `quantize/dequantize_q4_0`, `quant_error_stats`.
+**`dasllama_quant.das` — 350, required by 30.** DELETED 2026-08-02: the convert extraction copied this whole surface into `dasllama_convert.das` and rewired every requirer; the file was a dead duplicate. Was the convert nucleus: `quantize_q8_0(_into/_into_ptr/_bs_into/_bs_into_ptr/_k_into/_k_into_ptr)`, `dequantize_q8_0`, `quantize/dequantize_q4_0`, `quant_error_stats`.
 
 ### Cross-platform duplication clusters
 
@@ -363,7 +363,8 @@ They are **audio-encoder tower loaders + forwards**, not decoder architectures �
 
 | file | lines | what |
 |---|---|---|
-| `dasllama_asr.das` | 770 | facade **and 4 of 6 pipelines in-file** (qwen3a/qwen3omni/canary/gemma4a transcribes = 290 lines ≈ 38% of the "facade") — whisper/parakeet keep theirs in their own modules. `AsrModel` = fat struct carrying all six backends by value; dispatch = if/elif on private `AsrKind` in FOUR places (caps/create_session/transcribe/feed-drain-flush). Model sniff: vocab<32768→parakeet, 51864–51999→whisper; mmproj tag/projector_type routes |
+| `dasllama_asr_types.das` | ~45 | the shared ASR floor: `AsrCaps`/`AsrTimestamps`/`TranscribeSegment` + `asr_ctx_guard` — what family files and the facade both see (arms-home move, 2026-08) |
+| `dasllama_asr.das` | ~330 | facade ONLY since the arms-home move: sniffing loaders + model/session unions + one-call dispatch arms (if/elif on private `AsrKind` in caps/create_session/transcribe/feed-drain-flush). Every pipeline lives in its family file. Model sniff: vocab<32768→parakeet, 51864–51999→whisper; mmproj tag/projector_type routes |
 | `dasllama_audio.das` | 1,565 | **the hub (20+ dependents)**: mel flavors ×2, FFT plan, `AudioTower`, shared row kernels, tower Q8 rail, loader, `EncoderState`, `enc_attention`, `encoder_blocks` (1422–1491 — the ONE shared transformer loop), 3 projector tails |
 | `dasllama_whisper.das` | 1,520 | whisper-proper over ggml-*.bin: decoder Q8 rail, cross-KV, self/cross attn, batch decode, greedy driver + whisper.cpp logit-filter suite, window driver, lang table |
 | `dasllama_parakeet.das` | 1,641 | Parakeet-TDT: FastConformer + LSTM predictor + TDT decode; frame-major mel; 4 hand-vectorized conv-subsample kernels; 24-block conformer loop |
@@ -383,13 +384,13 @@ They are **audio-encoder tower loaders + forwards**, not decoder architectures �
 - glm4moe: dense-lead, `exp_probs_b` sniff, NextN block + layout ×5.
 - phi3: LongRoPE synthesis 4174–4215. llama: the defaults ARE llama; only arch-name string literal in common is `resolve_arch(t,"llama")` L1641 (llama2.c path). mistral3: live chat template is NOT in its arch file (`mistral_v7_tekken_template` in chat.das:81–90; arch-file template reachable only when GGUF lacks `tokenizer.chat_template`).
 
-**ASR side: NO registry, NO interface, NO dispatch table** (zero `function<`/`variant` hits across all 6 files). Fat struct + if-chains in 4 places; image-tag registration is the only `[init]`; the only real shared contract is the `AudioTower`+`EncoderState`+`encoder_blocks` data shape (whisper + qwen3a use it; parakeet/canary/gemma4a/vad share only leaf kernels).
+**ASR side: family behavior lives in family files, the facade routes** (the arms-home move; CODEREVIEW §Audio carries the rules). Still no registry/interface — the union carrier + one-line if/elif arms in 4 verbs are the deliberate shape (a fn-pointer `AsrDesc` needs type erasure the union already provides for free); image-tag registration is the only `[init]`; the shared contracts are `dasllama_asr_types` (caps/segment) and the `AudioTower`+`EncoderState`+`encoder_blocks` data shape (whisper + qwen3a use it; parakeet/canary/gemma4a/vad share only leaf kernels).
 
-### Cross-family duplication clusters
+### Cross-family duplication clusters (dispositions 2026-08-02)
 
-**arch_ files:** C1 ChatML template block verbatim ×5 (qwen2/qwen2moe/qwen3/qwen35/qwen3moe, ~20 ln each) · C2 think_suppress ×6 (5 identical + glm4moe divergent) · C3 Gemma turn block ×2 identical + gemma4 divergent · C4 "clone template before register_arch moves d" idiom ×5 with same warning comment · C5 audio-marker pair ×3 (divergent spellings; placement asymmetry: qwen2 sets before clone → alias inherits, qwen3 after → base doesn't) · C6 gemma config stack 3-level accretion (4-flag core spelled 3×).
+**arch_ files:** ✅ C1 ChatML ×5 + C2 think_suppress ×5-of-6 → `chatml_chat()`; ✅ C3 Gemma turn ×2 → `gemma_chat()` (gemma4's channel format and glm4moe's suppress stay divergent by design) · C4 clone-before-register idiom ×5 — KEPT, it IS the documented move-semantics idiom · C5 audio-marker placement asymmetry — INTENTIONAL, now stated at both qwen3-family sites (qwen2's audio models convert base-arch, qwen3's as vl) · C6 gemma config accretion — DECLINED: each configure_* is that arch's declarative truth; a shared core would hide which arch sets what.
 
-**ASR pile:**
+**ASR pile** (Boris ruling 2026-08: together-over-shared, no conformer library — the cn_/pk_ twins STAY twins until a backend port forces the seam):
 - **C7 log-mel/STFT ×6 independent copies** — parakeet↔canary = COPY-PASTE (preemph/pad/normalize line-for-line; only DFT engine differs); audio's two divergent by design (different oracles); + 2 filterbank generators (Slaney vs HTK).
 - C8 conv subsampling ×3 (parakeet↔canary same topology, divergent impl — f4/threaded vs naive scalar; canary adds length masking parakeet lacks); output-length arithmetic `(l-1)/2+1` ×4.
 - **C9 conformer block loop ×2 = COPY-PASTE with systematic bias delta** (canary adds add_bias_rows everywhere, drops Q8).
@@ -449,7 +450,7 @@ Rest: 2 tuners' wrappers (`dasllama_tuner.das` 81, `tuner_cli.das` 28), parity o
 
 Other: `gen_bench_records.das` 623 (the one-rig record driver, das cell as child, upsert-per-cell) · `gen_results.das` 358 (renders `results_llm.md` + GEN:asr blocks) · `gen_site_records.das` 59 · `gen_profile.das` 239 · `establish_baselines.das` 149 · `setup_asr_rig.das` 445 · `coopmat_mulmm_port.das` 561 + `coopmat_mulmm_reference.das` 419 (**"scratch probe" pair, Windows-only hardcoded paths, ~400 shared lines — parked in the publishable dir**) · `BRINGUP.md` 212.
 
-**Generated-vs-hand:** `results_llm.md` GENERATED (marker L3) · `benchmarks/asr/results.md` PARTLY generated (20 GEN:asr fences; prose hand) · `records/{m1,m4,zen2,m3air}.json` (10,684 lines) GENERATED-but-tracked, **no marker** · `annotations.json` hand by design · `profile_*.json`, `baseline_llm_*.tsv` generated · **`baseline_metal_*.tsv` (5) + `results_metal_{3b,gemma,qwen35,qwen3_4b,qwen3moe}.md` (5) HAND-AUTHORED despite "living doc — CURRENT numbers only" banners — no writer exists.**
+**Generated-vs-hand:** `results_llm.md` GENERATED (marker L3) · `benchmarks/asr/results.md` PARTLY generated (20 GEN:asr fences; prose hand) · `records/{m1,m4,zen2,m3air}.json` (10,684 lines) GENERATED-but-tracked, **no marker** · `annotations.json` hand by design · `profile_*.json`, `baseline_llm_*.tsv` generated · **`baseline_metal_*.tsv` (5) + `results_metal_{3b,gemma,qwen35,qwen3_4b,qwen3moe}.md` (5) were HAND-AUTHORED despite "living doc" banners with no writer — archived to `history/dasLLAMA/performance/` 2026-08-02.**
 
 ### benchmarks/ — 59 files, 7 subdirs (`.das_package` releases `lcpp_bench` as `dasllama-bench` exe)
 
@@ -498,7 +499,7 @@ Root: `lcpp_bench.das` 606 (llama-bench mirror, `-o json` records) · `setup_lcp
 | tests/run.das:117–120 | `--full` unconditionally rejected | but parsed and threaded through envs/tmo — dead-but-live path |
 | results_llm.md:5 | "daslang 0.6.3, 2026-07-22" | tree is 0.6.4; "CURRENT numbers only" banner |
 | benchmarks/asr/results.md:16 | "0.6.3, 2026-07-09" | same |
-| results_metal_*.md:1 ×5 | "living doc — CURRENT numbers only" | **no generator exists** — suspect by construction |
+| results_metal_*.md:1 ×5 | "living doc — CURRENT numbers only" | **no generator existed** — archived to history/dasLLAMA/performance/ |
 | harness/README.md | documents 7 of 78 files; "~9 minutes" 4k prefill; "11/11 SWA" | severely stale; perf claim predates flash prefill + metal override |
 | tests/README.md:5–7 | leads with the forbidden direct-dastest invocation | contradicts run.das:4 + tests/CLAUDE.md |
 | kv_cache_compression.md:30,150,325 | line refs into common.das + "re-verified 2026-07-09" | refs point at unrelated code now |
@@ -521,7 +522,7 @@ GGUF-superblock **layout knowledge re-encoded in ≥4 places in this slice** (ge
 ### Anomalies
 
 - **Generated-but-tracked, no marker:** records/*.json (10,684 lines), profile_*.json, baseline_llm_*.tsv — hand-edit undetectable.
-- **"Living docs" with no generator:** results_metal_*.md ×5, baseline_metal_*.tsv.
+- **"Living docs" with no generator:** results_metal_*.md ×5, baseline_metal_*.tsv — archived to history/dasLLAMA/performance/ 2026-08-02.
 - **Repo-tree venvs:** `benchmarks/asr/.venv-nemo/`, `.venv-onnx/` (~GB-class; gitignored via `.venv-*/`; recreated by `setup_asr_rig --venvs`).
 - **9 orphaned `.tune.json`** manifests naming deleted benchmarks (probe_logits_ab, batch_decode_perf, prefill_perf, prefill/decode_metal_chase, decode_real_bench, zz_attrib, kq_scale_bench, _argv_probe). `performance/m1.tune.json` NOT an orphan.
 - **Abandoned scripts:** zen2_sweep.sh; coopmat pair; ~29 harness files referenced nowhere (probes are expected unreferenced, but README covers 7/78 so live-vs-dead is undecidable).
