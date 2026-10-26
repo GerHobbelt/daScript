@@ -594,19 +594,20 @@ def gate_format(ctx : PreflightCtx) : GateResult {
 // outside the PR — staleness belongs to the nightly whole-tree -j 1 pass.
 def gate_lint(ctx : PreflightCtx) : GateResult {
     let t0 = ref_time_ticks()
-    if (empty(ctx.changed_das) && empty(ctx.changed_md) && empty(ctx.changed_cpp) && empty(ctx.changed_cxx_other)) {
-        return GateResult(name = "lint", status = GateStatus.Skip, seconds = seconds_since(t0),
-            detail = "no .das, .md or C/C++ files changed vs {ctx.base}")
-    }
-    var files <- [for (f in ctx.changed_das); f]
     // a C/C++ positional compiles nothing; it arms its folder's [arch] pass, whose pointers it may carry
-    files |> push_from(ctx.changed_md, ctx.changed_cpp, ctx.changed_cxx_other)
+    var files <- lint_gate_files(ctx.changed_das, ctx.changed_md, ctx.changed_cpp, ctx.changed_cxx_other)
+    if (empty(files)) {
+        return GateResult(name = "lint", status = GateStatus.Skip, seconds = seconds_since(t0),
+            detail = "no .das, .md or C/C++ files changed vs {ctx.base} outside tree-sitter-daslang/")
+    }
     var host_args <- [ctx.daslang, "utils/lint/main.das", "--"]
     host_args |> push_from(files)
     host_args |> push("--quiet")
+    host_args |> push("--fix")
     host_args |> push("--disable")
     host_args |> push("LINT019")
     let host = run_argv(host_args)
+    let fixed = count_fixed_files(host.out)
     if (host.rc != 0) {
         return GateResult(name = "lint", status = GateStatus.Fail, seconds = seconds_since(t0),
             detail = "host-flavor lint warnings — fix or nolint each (see skills/internal/make_pr.md §1)", output = host.out)
@@ -623,7 +624,9 @@ def gate_lint(ctx : PreflightCtx) : GateResult {
             detail = "LINUX-lane lint warnings (host pass was clean — a platform static_if half hides the symbol here; nolint:...,LINT019 both-worlds spelling, see skills/internal/preflight.md)", output = mirror.out)
     }
     return GateResult(name = "lint", status = GateStatus.Pass, seconds = seconds_since(t0),
-        detail = "{length(files)} file(s) clean on both rails (host, linux-mirror)")
+        detail = fixed == 0 ? "{length(files)} file(s) clean on both rails (host, linux-mirror)"
+            : "{length(files)} file(s) clean on both rails after --fix rewrote {fixed} of them - review and commit those edits",
+        output = fixed == 0 ? "" : host.out)
 }
 
 // ===== ast-verify on changed .das (mirrors extended_checks "Run ast-verify on changed .das files") =====

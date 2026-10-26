@@ -300,11 +300,7 @@ class StyleLintVisitor : AstVisitor {
         if (!(ret is ExprReturn) || ret.genFlags.generated) return
         let r = ret as ExprReturn
         if (r.subexpr == null) return
-        var root = fn
-        while (root.fromGeneric != null) {
-            root = root.fromGeneric
-        }
-        let full = string(root.name)
+        let full = string(root_generic(fn).name)
         let name = fn.flags.isClassMethod ? slice(full, rfind(full, "`") + 1) : full
         let fix = st042_fix(body)
         return if (fix.line < 0)
@@ -326,10 +322,13 @@ class StyleLintVisitor : AstVisitor {
         }
     }
 
+    def written_span(fn : FunctionPtr) : LineInfo =>
+        fn.atDecl.line != 0u ? fn.atDecl : fn.body.at
+
     def check_defer_pipe(fn : FunctionPtr) : void {
         if (fn.body == null || fn.at.fileInfo == null || fn.at.line == 0u) return
-        let body_at = fn.body.at
-        for (ln in range(int(body_at.line), int(body_at.last_line) + 1)) {
+        let span = written_span(fn)
+        for (ln in range(int(span.line), int(span.last_line) + 1)) {
             var src = ""
             get_file_source_line(fn.at.fileInfo, uint(ln)) $(line) {
                 src := line
@@ -374,7 +373,7 @@ class StyleLintVisitor : AstVisitor {
     def override visitFunction(var fn : FunctionPtr) : FunctionPtr {
         st037_pop_and_check("function '{fn.name}'", "split it into smaller functions", fn.at)
         if (fn.body != null) {
-            st038_check_length("function '{fn.name}'", "split it into smaller functions", fn.at, fn.atDecl.line != 0u ? fn.atDecl : fn.body.at)
+            st038_check_length("function '{fn.name}'", "split it into smaller functions", fn.at, written_span(fn))
         }
         st041_flush()
         current_function = null
@@ -400,10 +399,7 @@ class StyleLintVisitor : AstVisitor {
     def foreign_module_code() : bool {
         if (current_function == null || this_module == null) return false
         if (current_function._module != this_module) return true
-        var root = current_function.fromGeneric
-        while (root != null && root.fromGeneric != null) {
-            root = root.fromGeneric
-        }
+        let root = root_generic(current_function.fromGeneric)
         return root != null && root._module != this_module
     }
 
@@ -502,15 +498,6 @@ class StyleLintVisitor : AstVisitor {
                 || bt == Type.tInt64 || bt == Type.tUInt64
                 || bt == Type.tFloat || bt == Type.tDouble
                 || bt == Type.tBool  || bt == Type.tString)
-    }
-
-    def root_generic(fn : Function const?) : Function const? {
-        //! Walk fromGeneric chain to its root. Template instantiations of overloaded generics produce a 2-level chain: instantiated → mangled-overload → root.
-        var cur = fn
-        while (cur != null && cur.fromGeneric != null) {
-            cur = cur.fromGeneric
-        }
-        return cur
     }
 
     def check_style020_from_jv(expr : ExprCall?) : void {

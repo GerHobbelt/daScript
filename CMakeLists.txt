@@ -1,4 +1,4 @@
-cmake_minimum_required (VERSION 3.17)
+cmake_minimum_required (VERSION 3.24)
 project (DAS VERSION 0.6.5)
 
 # Set build type to Debug by default. If not set it will break
@@ -1992,6 +1992,11 @@ install(FILES ${PROJECT_SOURCE_DIR}/include/vecmath/LICENSE DESTINATION ${DAS_IN
 install(FILES ${PROJECT_SOURCE_DIR}/3rdparty/fmt/LICENSE DESTINATION ${DAS_INSTALL_DOCDIR} RENAME FMT.LICENSE)
 install(FILES ${PROJECT_SOURCE_DIR}/include/fast_float/LICENSE DESTINATION ${DAS_INSTALL_DOCDIR} RENAME FAST_FLOAT.LICENSE)
 install(FILES ${PROJECT_SOURCE_DIR}/src/misc/LUAU.LICENSE DESTINATION ${DAS_INSTALL_DOCDIR} RENAME LUAU.LICENSE)
+install(FILES ${PROJECT_SOURCE_DIR}/3rdparty/unicode/LICENSE.txt DESTINATION ${DAS_INSTALL_DOCDIR} RENAME UNICODE.LICENSE COMPONENT UnicodeData)
+install(DIRECTORY ${PROJECT_SOURCE_DIR}/3rdparty/unicode/
+    DESTINATION 3rdparty/unicode
+    COMPONENT UnicodeData
+    FILES_MATCHING PATTERN "*.txt" PATTERN "*.json")
 
 # utils/internal/ never installs — the folder is the audience decision
 # (machine-checked by utils/REVIEW.das).
@@ -2036,6 +2041,10 @@ file(GLOB DAS_MCP_TOOLS CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/utils/mcp/tools/
 install(FILES ${DAS_MCP_TOOLS} DESTINATION utils/mcp/tools)
 file(GLOB DAS_MCP_SUBTOOLS CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/utils/mcp/subtools/*.das)
 install(FILES ${DAS_MCP_SUBTOOLS} DESTINATION utils/mcp/subtools)
+install(FILES
+    ${PROJECT_SOURCE_DIR}/utils/mcp/rules/cpp_outline_rules.yml
+    DESTINATION utils/mcp/rules
+)
 install(FILES
     ${PROJECT_SOURCE_DIR}/utils/mcp/test_tools.das
     DESTINATION utils/mcp
@@ -2115,6 +2124,9 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/lint/tests/
 # so the verdict is read from its output)
 install(FILES ${PROJECT_SOURCE_DIR}/utils/ast-verify/main.das DESTINATION utils/ast-verify)
 
+# Install tools (`daslang -tool` without a name: lists the tools of the install)
+install(FILES ${PROJECT_SOURCE_DIR}/utils/tools/main.das DESTINATION utils/tools)
+
 # Install detect-dupe (cross-file duplicate-function detector)
 file(GLOB DAS_DETECT_DUPE_FILES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/utils/detect-dupe/*.das)
 install(FILES ${DAS_DETECT_DUPE_FILES} DESTINATION utils/detect-dupe)
@@ -2127,9 +2139,8 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/detect-dupe/fixture/
     FILES_MATCHING PATTERN "*.das"
 )
 
-# Install find-dupe (AI judge for detect-dupe clusters via das-claude).
-# Not built into all_utils_exe — it depends on the das-claude daspkg
-# package fetched at runtime, which isn't available at build time.
+# Install find-dupe (AI judge for detect-dupe clusters via das-claude). Not a shipped exe:
+# it runs only after `daspkg install --root utils/find-dupe` fetches das-claude.
 file(GLOB DAS_FIND_DUPE_FILES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/utils/find-dupe/*.das)
 install(FILES ${DAS_FIND_DUPE_FILES} DESTINATION utils/find-dupe)
 install(FILES
@@ -2382,22 +2393,25 @@ if(NOT ${DAS_TREE_SITTER_DISABLED})
         tree-sitter-daslang/src/node-types.json
         tree-sitter-daslang/grammar.js
         tree-sitter-daslang/package.json
+        tree-sitter-daslang/tree-sitter.json
+        tree-sitter-daslang/LICENSE
         DESTINATION tree-sitter-daslang
     )
     install(FILES
         tree-sitter-daslang/queries/highlights.scm
+        tree-sitter-daslang/queries/tags.scm
         DESTINATION tree-sitter-daslang/queries
     )
     # The Zed extension — the installed install/README.md points users at this
     # directory, so it has to travel with the bundle.
-    install(DIRECTORY tree-sitter-daslang/zed-daslang/
-        DESTINATION tree-sitter-daslang/zed-daslang
+    install(DIRECTORY utils/zed-daslang/
+        DESTINATION utils/zed-daslang
     )
     # Install platform-specific sgconfig.yml for ast-grep (used by grep_usage and outline MCP tools)
     install(FILES "${SGCONFIG_TEMPLATE}" DESTINATION . RENAME sgconfig.yml)
     install(FILES
-        tree-sitter-daslang/outline_rules.yml
-        DESTINATION tree-sitter-daslang
+        utils/mcp/rules/outline_rules.yml
+        DESTINATION utils/mcp/rules
     )
 endif()
 
@@ -2499,6 +2513,30 @@ if(NOT DAS_TOOLS_DISABLED)
 endif()
 
 get_property(_das_shared_modules GLOBAL PROPERTY DAS_SHARED_MODULE_TARGETS)
+
+if(TARGET daslang)
+    if(NOT DAS_TEST_CACHE_DIR MATCHES "/\\.cache/daslang/test_cache$")
+        message(FATAL_ERROR "dastest_cache_guard runs rm -rf on DAS_TEST_CACHE_DIR; refusing \"${DAS_TEST_CACHE_DIR}\"")
+    endif()
+    set(_das_test_binaries)
+    foreach(_t daslang libDaScriptDyn libDaScriptDyn_runtime daslang-live watchdog dasbind_probe ${_das_shared_modules})
+        if(TARGET ${_t})
+            list(APPEND _das_test_binaries ${_t})
+        endif()
+    endforeach()
+    list(TRANSFORM _das_test_binaries REPLACE "^(.+)$" "$<TARGET_FILE:\\1>" OUTPUT_VARIABLE _das_test_binary_files)
+    set(_identity ${DAS_LANE_STAMP_DIR}/binary_identity.txt)
+    set(_same_binaries ${CMAKE_COMMAND} -E compare_files ${_identity} ${DAS_TEST_CACHE_DIR}/binary_identity.txt)
+    if(NOT DAS_TEST_RESULT_CACHE)
+        set(_same_binaries ${CMAKE_COMMAND} -E false)
+    endif()
+    add_custom_target(dastest_cache_guard
+        COMMAND ${CMAKE_COMMAND} -E sha256sum ${_das_test_binary_files} > ${_identity}
+        COMMAND ${_same_binaries} || ${CMAKE_COMMAND} -E rm -rf ${DAS_TEST_CACHE_DIR}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${DAS_TEST_CACHE_DIR}
+        COMMAND ${CMAKE_COMMAND} -E copy ${_identity} ${DAS_TEST_CACHE_DIR})
+    add_dependencies(dastest_cache_guard ${_das_test_binaries})
+endif()
 foreach(_t check_lint_tree check_vulkan run_tests_vulkan run_tests_imgui_integration
         build_site_wasm check_playground_samples run_imgui2rst run_vulkan2rst)
     if(TARGET ${_t} AND _das_shared_modules)

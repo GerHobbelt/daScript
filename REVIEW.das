@@ -2,6 +2,7 @@ options gen2
 
 require strings
 require daslib/strings_boost
+require daslib/strings_convert
 require daslib/fio
 require dastest/review_gate
 
@@ -38,14 +39,16 @@ def private is_tolerated_set(name : string; files : array<string>) : bool {
     return true
 }
 
-//! every tracked .das in the tree - the generated and vendored copies git ignores stay out;
-//! a git that fails is a finding, never an empty tree
-def private tracked_das_files : array<string> {
+//! every tracked file matching one of `globs` - the generated and vendored copies git ignores
+//! stay out; a git that fails is a finding, never an empty tree
+def private tracked_files(globs : array<string>; check_name : string) : array<string> {
     var out : string
-    let rc = run_and_capture(["git", "ls-files", "--", "*.das"], out, 60.0)
+    var inscope cmd <- ["git", "ls-files", "--"]
+    cmd |> push_from(globs)
+    let rc = run_and_capture(cmd, out, 60.0)
     var inscope files <- [for (ln in split(out, "\n")); strip(ln); where !empty(strip(ln))]
     if (rc != 0 || empty(files)) {
-        gate_finding("REVIEW.das", "git ls-files failed (exit {rc}, {length(files)} files) - the shared-module check ran over nothing")
+        gate_finding("REVIEW.das", "git ls-files failed (exit {rc}, {length(files)} files) - the {check_name} check ran over nothing")
     }
     return <- files
 }
@@ -73,7 +76,7 @@ def private shared_module_decl(path : string) : SharedDecl {
 }
 
 def private check_shared_module_names {
-    var inscope files <- tracked_das_files()
+    var inscope files <- tracked_files(["*.das"], "shared-module")
     var sites : table<string; array<string>>
     for (f in files) {
         let d = shared_module_decl(f)
@@ -93,6 +96,38 @@ def private check_shared_module_names {
     }
 }
 
+def private is_url_download(command : string; args : array<string>) : bool {
+    if (command == "file") {
+        return !empty(args) && to_upper(args[0]) == "DOWNLOAD"
+    }
+    return find_index(args, "URL") >= 0
+}
+
+//! `0`, a variable, or a missing value leaves the download without a timeout
+def private has_inactivity_timeout(args : array<string>) : bool {
+    let at = find_index(args, "INACTIVITY_TIMEOUT")
+    return at >= 0 && at + 1 < length(args) && (try_to_int(args[at + 1]) ?? 0) > 0
+}
+
+def private check_download_timeouts {
+    var inscope files <- tracked_files(["*CMakeLists.txt", "*.cmake"], "download-timeout")
+    for (f in files) {
+        continue if (!fexist(f))
+        let text = fread(f)
+        for (command in ["ExternalProject_Add", "FetchContent_Declare", "file"]) {
+            var inscope calls <- cmake_command_blocks(text, command)
+            for (call in calls) {
+                var inscope args <- cmake_args(call)
+                continue if (!is_url_download(command, args) || has_inactivity_timeout(args))
+                let shown_command = command == "file" ? "file(DOWNLOAD)" : command
+                let retry = command == "file" ? "" : " ({command} then retries it and moves on to the next URL)"
+                gate_finding(f, find_line(text, call),
+                    "{shown_command} downloads from a URL with no positive literal INACTIVITY_TIMEOUT - a server that stops sending leaves the download waiting until the CI job's own time limit kills it; add INACTIVITY_TIMEOUT 60, so a stalled transfer fails instead{retry}")
+            }
+        }
+    }
+}
+
 [export]
 def main {
     if (!fexist("REVIEW_COMMON.md") || !fexist("CMakeLists.txt")) {
@@ -100,5 +135,6 @@ def main {
         return 2
     }
     check_shared_module_names()
+    check_download_timeouts()
     return gate_verdict("repo root")
 }

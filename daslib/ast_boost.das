@@ -254,7 +254,16 @@ def setup_tag_annotation(name, tag : string; var classPtr) {
     //! Creates and registers a function annotation associated with a tag.
     var ann = make_function_annotation(name, classPtr)
     apply_tag_annotation(tag, ann)
-    this_module() |> add_function_annotation(ann)
+    compiling_module() |> add_function_annotation(ann)
+}
+
+def root_generic(fn : Function const?) : Function const? {
+    //! The generic an instance came from, walked to the root; a `[template]` instance of an overloaded generic is two levels deep (instance, mangled overload, root). A function that is no instance comes back as is.
+    var cur = fn
+    while (cur != null && cur.fromGeneric != null) {
+        cur = cur.fromGeneric
+    }
+    return cur
 }
 
 def peel_distinct(typ : TypeDeclPtr) : TypeDeclPtr const {

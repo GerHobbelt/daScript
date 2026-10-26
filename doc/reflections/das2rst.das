@@ -70,6 +70,7 @@ require daslib/cpp_bind
 require daslib/decs
 require daslib/decs_boost
 require daslib/utf8_utils
+require daslib/unicode_text
 require daslib/coroutines
 require daslib/interfaces
 require daslib/faker
@@ -202,7 +203,7 @@ get_value|insert_clone|emplace_new|insert_default|emplace_default|get_with_defau
         group_by_regex("Smart ptr infrastructure", mod, %regex~(add_ptr_ref|smart_ptr|get_const_ptr|move|move_new|get_ptr$)%%),
         group_by_regex("Macro infrastructure", mod, %regex~(is_folding|is_compiling|is_in_completion|is_in_lint_check|is_building_documentation|is_reporting_compilation_errors)%%),
         group_by_regex("Profiler", mod, %regex~(profile|reset_profiler|dump_profile_info|collect_profile_info)$%%),
-        group_by_regex("System infrastructure", mod, %regex~(panic|print|feint|sprint|sprint_json|sscan_json|to_log|to_compiler_log|diagnostics_to_stderr|diagnostics_to_file|error|terminate|breakpoint|stackwalk|get_stackwalk|get_das_root|get_executable_path|get_das_version|is_in_aot|aot_enabled|is_intern_strings|is_safe_hash|eval_main_loop|shared_module_extension)$%%),
+        group_by_regex("System infrastructure", mod, %regex~(panic|print|feint|sprint|sprint_json|sscan_json|to_log|to_compiler_log|diagnostics_to_stderr|diagnostics_to_file|error|terminate|breakpoint|stackwalk|get_stackwalk|get_das_root|get_tool_script|get_executable_path|get_das_version|is_in_aot|aot_enabled|is_intern_strings|is_safe_hash|eval_main_loop|shared_module_extension)$%%),
         group_by_regex("Memory manipulation", mod, %regex~(intptr|memcmp|variant_index|set_variant_index|hash|hash_combine64|memcpy|memmove|lock_data|map_to_array|map_to_ro_array)$%%),
         group_by_regex("Binary serializer", mod, %regex~(binary_load|binary_save)$%%),
         group_by_regex("Path and command line", mod, %regex~(get_command_line_arguments|with_argv)$%%),
@@ -345,13 +346,13 @@ def document_module_dasllama(_root : string) {
         group_by_regex("Model loading and sessions", mod, %regex~(load_model|create_session|create_kv_pool|release_kv_pages|create_batch_workspace|setup_dasllama_jobque|with_dasllama_jobque|caps|mtp_drafter_sidecar|attach_mtp_drafter|mtp_capable)$%%),
         group_by_regex("Prefix cache", mod, %regex~(create_prefix_cache|prefix_attach|prefix_insert|prefix_checkpoint_at|prefix_match_len|prefix_release|prefix_held_groups|prefix_chain_list)$%%),
         group_by_regex("Tokenizer", mod, %regex~(encode|decode|piece)$%%),
-        group_by_regex("Evaluation and sampling", mod, %regex~(eval|eval_embd|eval_embd_span|eval_embd_span_mrope|eval_embd_body|media_body_rows|eval_batch|sample|set_seed|stats)$%%),
+        group_by_regex("Evaluation and sampling", mod, %regex~(eval|eval_segments|eval_embd|eval_embd_span|eval_embd_span_mrope|eval_embd_body|media_body_rows|eval_batch|sample|set_seed|stats)$%%),
         group_by_regex("Generation", mod, %regex~(generate|generate_embd)$%%),
         group_by_regex("Embeddings", mod, %regex~(embed)$%%),
         group_by_regex("Vision and audio encoders", mod, %regex~(encode_image|encode_audio)$%%),
         group_by_regex("Chat", mod, %regex~(create_chat|create_chat_renderer|add_user|add_user_audio|add_user_image|add_user_image_rows|add_user_audio_rows|add_user_span|set_chat_date|add_assistant|render_turn|render_turn_marked|render_turn_image|render_turn_audio|render_assistant|render_user|render_close|respond|set_thinking)$%%),
         group_by_regex("Tool calling", mod, %regex~(set_tools|add_tool_results|render_assistant_calls|parse_calls)$%%),
-        group_by_regex("Reasoning (thinking models)", mod, %regex~(split_reasoning|set_preserve_thinking|set_reasoning_effort|make_think_stream|think_feed|think_finish|think_drain|effective_stop_ids|turn_stop_ids|make_nothink_guard|nothink_stop_here)$%%),
+        group_by_regex("Reasoning (thinking models)", mod, %regex~(split_reasoning|set_preserve_thinking|set_reasoning_effort|make_think_stream|think_budget_marks|think_feed|think_finish|think_drain|effective_stop_ids|turn_stop_ids|make_nothink_guard|nothink_stop_here)$%%),
         group_by_regex("Operations: prepared images and dispatch", mod, %regex~(dlim_inventory|dlim_clean|set_dispatch_worker_limit|get_dispatch_worker_limit|set_jobque_spin_us|get_jobque_spin_us|set_jobque_spin_gpu_us|get_jobque_spin_gpu_us|get_jobque_spin_in_force|set_single_thread|get_single_thread|select_matmul_backend_for_load|kernel_backend_available)$%%),
         group_by_regex("Operations: GPU tier and model slots", mod, %regex~(gpu_tier_status|set_gpu_tier_want|moe_gpu_tier_arm|moe_gpu_weight_budget|gpu_model_marks_init|gpu_slot_capture|gpu_slot_rearm|moe_gpu_model_marks_save|moe_gpu_model_marks_restore|moe_gpu_hydrate_session|moe_gpu_drop_model|set_resident_prefill_allowed|resident_prefill_allowed)$%%),
         group_by_regex("Operations: serving from the device", mod, %regex~(create_device_session|gpu_device_sessions|gpu_dn_room|gpu_device_prefill_continues|gpu_device_prefill_window|gpu_device_kv_park|gpu_device_kv_adopt|gpu_device_session_ctx|gpu_device_session_dtype|set_gpu_resident_regions|set_gpu_ctx_max|set_gpu_ctx_strict|gpu_ctx_pins|set_gpu_kv_dtype|gpu_kv_dtype_pin|reset_gpu_kv_dtype|gpu_resident_decline|gpu_resident_experts_host|gpu_cpu_passes|device_kv_max_rows)$%%)
@@ -385,6 +386,8 @@ def document_module_dasllama(_root : string) {
             "A conversation over a model: its ``session``, the resolved chat template, and the running transcript in ``history``. Create with ``create_chat``, then drive with ``add_user`` + ``respond``.")
         dasllama_type_stanza(f, "struct-dasllama_chat-ThinkStream", "ThinkStream",
             "The incremental reasoning/content splitter for a streamed reply (``make_think_stream``): feed decoded pieces through ``think_feed``, flush with ``think_finish``. Holds partial reasoning markers back across chunk boundaries; a non-thinking family yields a pass-through stream.")
+        dasllama_type_stanza(f, "struct-dasllama_common-ThinkBudgetMarks", "ThinkBudgetMarks",
+            "The token marks a reasoning budget acts on (``think_budget_marks``): ``open`` the token a reply writes to open its reasoning span (empty where the prompt opened it), ``close`` the tokens a scheduler forces to end the span at the request's ``think_budget`` - a family's close special, or harmony's end mark and final-channel header - and ``opened`` whether the generation prompt left the reply inside the span. An empty ``close`` means no budget can act.")
         dasllama_type_stanza(f, "struct-dasllama_chat-ThinkSplit", "ThinkSplit",
             "One reply split at its reasoning boundary, as returned by ``split_reasoning``: ``reasoning`` holds the thinking span (empty when the model answered directly), ``content`` the answer.")
         dasllama_type_stanza(f, "struct-dasllama_chat-NothinkStopGuard", "NothinkStopGuard",
@@ -532,7 +535,7 @@ def document_module_ast_boost(_root : string) {
         group_by_regex("Containers", mod, %regex~(emplace_new)%%),
         group_by_regex("Textual descriptions of the objects", mod, %regex~(describe.*|debug_expression)%%),
         group_by_regex("Collect carriers", mod, %regex~(collect_carrier_violation)$%%),
-        group_by_regex("Queries", mod, %regex~(is.*|find.*|get.*|peel_distinct|table_key_storage_base_type)%%),
+        group_by_regex("Queries", mod, %regex~(is.*|find.*|get.*|peel_distinct|root_generic|table_key_storage_base_type)%%),
         group_by_regex("Annotations", mod, %regex~(append.*|add.*)%%),
         group_by_regex("Expression generation", mod, %regex~(override_method|panic_expr_as|make_static_assert_false|convert_to_expression)%%),
         group_by_regex("Visitors", mod, %regex~(visit.*)%%),
@@ -1140,6 +1143,15 @@ def document_module_decs_boost(_root : string) {
     var groups <- array<DocGroup>(
     )
     document("Boost package for DECS", mod, "decs_boost.rst", groups)
+}
+
+def document_module_unicode_text(_root : string) {
+    var mod = find_module("unicode_text")
+    var groups <- array<DocGroup>(
+        group_by_regex("Normalization and case folding", mod, %regex~.*(try_unicode_nfd|try_unicode_casefold|try_unicode_caseless_key)$%%),
+        group_by_regex("Unicode data versions", mod, %regex~.*(UNICODE_TEXT_VERSION|UNICODE_CASELESS_KEY_VERSION)$%%)
+    )
+    document("Unicode normalization and canonical caseless comparison", mod, "unicode_text.rst", groups)
 }
 
 def document_module_utf8_utils(_root : string) {
@@ -2146,6 +2158,7 @@ def main {  // nolint:STYLE038 — flat one-call-per-documented-module dispatch 
     document_module_unroll(root)
     document_module_uriparser_boost(root)
     document_module_utf8_utils(root)
+    document_module_unicode_text(root)
     document_module_validate_code(root)
     write_digest()
     }

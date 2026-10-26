@@ -18,6 +18,8 @@ das_lane_python(check_wheel_repack "Testing the pip wheel repack" "ci/test_wheel
 das_lane_python(check_rpm_spec "Testing the rpm spec render" "ci/test_rpm_build.py")
 das_lane_python(check_deb_control "Testing the deb control render" "ci/test_deb_build.py")
 das_lane_python(check_manifest_render "Testing the Homebrew and scoop manifest render" "ci/test_render_manifests.py")
+das_lane_python(check_tree_sitter_parse_sources "Testing the tree-sitter source parse selection"
+    "ci/test_tree_sitter_parse_sources.py")
 
 add_custom_target(check_bundle_smoke
 COMMAND ${CMAKE_COMMAND} -E rm -rf ${CMAKE_BINARY_DIR}/daslang_bundle
@@ -80,7 +82,9 @@ set(DAS_EXTENDED_CORE
 if(NOT WIN32)
     # check_model_mint: its test stands in a shell script for daslang, which Windows cannot exec;
     # check_rpm_spec, check_deb_control: Linux packages, and their fixtures' exec bits mean nothing on NTFS
-    list(APPEND DAS_EXTENDED_CORE run_tests_dap_bridge check_model_mint check_rpm_spec check_deb_control)
+    # check_tree_sitter_parse_sources: its test stands in a shell script for tree-sitter
+    list(APPEND DAS_EXTENDED_CORE run_tests_dap_bridge check_model_mint check_rpm_spec check_deb_control
+        check_tree_sitter_parse_sources)
 endif()
 
 set(DAS_EXTENDED_MODULES
@@ -93,13 +97,16 @@ if(TARGET run_tests_dasopenai)
     list(APPEND DAS_EXTENDED_MODULES run_tests_dasopenai)
 endif()
 if(TARGET run_tests_llvm_jit_backend)
-    list(APPEND DAS_EXTENDED_MODULES run_tests_llvm_jit_backend run_tests_llvm_exe)
+    list(APPEND DAS_EXTENDED_MODULES run_tests_llvm_jit_backend run_tests_llvm_exe run_tests_llvm_tune)
 endif()
 if(APPLE)
     list(APPEND DAS_EXTENDED_MODULES run_tests_llvm_vector_math)
 endif()
 
 set(DAS_EXTENDED_NIGHTLY run_examples dry_run_tutorials)
+if(TARGET run_tests_llvm_tune_slow)
+    list(APPEND DAS_EXTENDED_NIGHTLY run_tests_llvm_tune_slow)
+endif()
 if(NOT WIN32)
     list(APPEND DAS_EXTENDED_NIGHTLY check_doc_verify)
 endif()

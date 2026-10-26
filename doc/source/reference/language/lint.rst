@@ -1896,7 +1896,9 @@ PERF033 — container declared inside a loop without ``inscope``
 An ``array`` or ``table`` declared inside a loop body is never freed: every iteration
 leaks its buffer until the heap resets. Declare it ``var inscope``; ``--fix`` adds it.
 A container holding raw pointers, lambdas or iterators is not reported - ``inscope``
-would delete what they point at.
+would delete what they point at. Neither is a ``temp_array(...)`` view: it borrows memory
+the loop does not own, so there is nothing to free, and ``inscope`` on it deletes the
+pointee (``can't delete locked array`` at the loop's end).
 
 PERF019 — ``int(T.a) | int(T.b)`` on bitfield/enum — collapse to one cast
 ==========================================================================
@@ -2263,7 +2265,10 @@ callback, a frame loop.
 From each annotated root the scan follows **direct** calls transitively, so a
 sink several frames deep is still reported, with the call chain in the message
 and the warning anchored on the line you wrote rather than the daslib internal
-that actually allocates.
+that actually allocates. An ``invoke`` of a function value continues the walk
+into every function whose address the program stores under that function type,
+so a table-driven dispatch ladder (a table of ``@@builder`` values picked by a
+key) is scanned like a ladder of direct calls.
 
 Declaring a contract is free: the five markers are registered by the compiler
 as metadata-only annotations, so a file under contract requires nothing. The

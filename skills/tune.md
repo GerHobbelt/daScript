@@ -456,8 +456,9 @@ manifest a runner pinned for it.
 
 A sidecar whose mtime **predates the running binary's** is stale: its
 `"kernels"` read as absent (stamps fall back, the policy rail re-tunes), and
-the first `tune_manifest_set` resets the whole document - the `"runtime"`
-section included. Measurements never outlive the binary that made them. A sidecar carrying another box's
+the first `tune_manifest_set` resets the document - every section but this
+box's own `"runtime"`, whose knobs and crowns are facts of the box, not of the
+binary. Measurements never outlive the binary that made them. A sidecar carrying another box's
 identity is stale too - measurements are a property of the box - unless
 `provenance.applied_box` names this box, which is how a scope resolver (below)
 adopts a compatible sibling box's mint deliberately. That identity is the
@@ -470,7 +471,9 @@ library version reads incomplete for that scope alone.
 
 Every "untuned" refusal **names its reason** via `tune_sidecar_verdict`
 (`TuneSidecarReason`) - `absent` (no sidecar at the path), `stale_binary`
-(both dates), `foreign_box` (both identities), `unreadable` (not a tune
+(both dates), `foreign_box` (both identities; checked before the date, so a sidecar another box minted whose
+`provenance.applied_box` does not name this box reports `foreign_box` whatever its mtime),
+`unreadable` (not a tune
 sidecar), `version` (both values), `missing` (the kernel names), so a bare
 "untuned" never leaves the operator to diff provenance by hand. And when `DAS_TUNE_MANIFEST`
 points at a file that reads untuned, the compile prints one loud warning per

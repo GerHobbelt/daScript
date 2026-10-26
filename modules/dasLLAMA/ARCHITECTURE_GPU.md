@@ -167,13 +167,13 @@ that a question answered for one backend has an obvious address in the other. Th
   shared bind path may span the two layouts; the MoE combine pair (`MetalMoeCombine` y/dim/nk at
   2/3/4, `MetalMoeReduce` at 3/4/5 under its gated `inv`) keeps each leaf's numbers; the in-engine moe mul_mm A/B race harnesses
   (`dasllama_metal_prefill.das`) encode through `kn_moe_mm_family_tail` rather than a per-class
-  `enc_*` builder; the iq4 family's iq4nl stamps (`MetalKqGemvIq4T`, `MetalKqMvIq4T`, `MetalKqMvB8Iq4T`)
-  and the mul_mm tensor template's compact-scale stamps off the same family (`MetalKqMulMmIq4xsTensorT`
-  at IQ4NL, the dense `MetalKqMulMmIq4nlT` / `TH` and `MetalKqMulMmQ40T` / `TH`, and the four
-  `MetalMoeMulMmQ40*` expert stamps) bind the strip plane unread, so both formats share one set layout
-  and one host bind path; the split-scale dev-W dequant stamps (`MetalKqDequant<Fmt>`) inherit the
-  mul_mm scaffold's `xf` and `y` bindings unread - they write only the f16 panel at binding 7 - so a
-  format's dequant pass and its mul_mm twins keep one set layout and one host bind path; and the Vulkan
+  `enc_*` builder; the iq4 family's iq4nl stamps (`MetalKqGemvIq4T`, `MetalKqMvIq4T`, `MetalKqMvB8Iq4T`) and the mul_mm tensor
+  template's compact-scale stamps off the same family (`MetalKqMulMmIq4xsTensorT` at IQ4NL, the dense `MetalKqMulMmIq4nlT` / `TH`
+  and `MetalKqMulMmQ40T` / `TH`, the four `MetalMoeMulMmQ40*` expert stamps) bind the strip plane unread, so both formats share
+  one set layout and one host bind path; the split-scale dev-W dequant stamps (`MetalKqDequant<Fmt>`) inherit the mul_mm
+  scaffold's `xf` and `y` bindings unread - they write only the f16 panel at binding 7 - so a format's dequant pass and its
+  mul_mm twins keep one set layout and one host bind path; the MoE tile lab's knockout stamps (`LabMoe*Ko*`,
+  `benchmarks/matmul/bench_metal_moe_tile_lab.das`) keep the full bind lists, the dropped stage's buffer unread; and the Vulkan
   `kq_gemv_cls` family binds `gridb` (the grid formats' codebook plane, `kq_grid_dev`) at binding 6 on
   every stamp, one set layout for the family - the grid stamps (iq2xxs, iq2xs, iq2s, iq3xxs, iq3s) and
   their N leaves read it; every other stamp (k2 k3 k4 k5 k6 q40 iq4xs iq4nl, iq3s4 - whose codebook is arithmetic - and the fused `kq_gemv_k4_gu_cls`) binds it unread.
@@ -197,7 +197,7 @@ that a question answered for one backend has an obvious address in the other. Th
   the resident driver: `rows` answers how many rows it steps at once on the armed model, 0 = none; `rdec_token_n` steps
   them), all behind the route lever `set_gpu_resident_route` / `gpu_want_resident`, the
   OS video-memory seat `install_moe_gpu_os_memory` the residency plan sizes against, the weight-bytes seat
-  `install_rdec_note_weight_bytes` the decode warm-up guard reads, the speculative carry's landing `install_rdec_carry` (`ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#logits-transfer-queue`), the NextN draft head's seat `install_rdec_draft` (`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-draft-head`), its prompt warm on the window chain `install_rdec_head_warm` (the ask and the rows written; the head's K/V row ranges move up and down through the resident driver's two K/V row seats, `rdec_kv_sync` / `rdec_kv_read` (filled by `install_moe_gpu_resident`'s `kv_sync` / `kv_read` arguments), at layer `n_layers`; `ARCHITECTURE_GPU_VULKAN_MTP.md#resident-head-prompt-warm`), the same-slab verify's `install_rdec_verify` (`ARCHITECTURE_GPU_VULKAN_NROW.md#nrow-verify-command`), the reject's device rollback `install_rdec_rollback` (`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-verify-rollback`), and the per-layer-embedding seats `install_rdec_ple`
+  `install_rdec_note_weight_bytes` the decode warm-up guard reads, the speculative carry's landing `install_rdec_carry` (`ARCHITECTURE_GPU_VULKAN_LANDING.md#logits-transfer-queue`), the NextN draft head's seat `install_rdec_draft` (`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-draft-head`), its prompt warm on the window chain `install_rdec_head_warm` (the ask and the rows written; the head's K/V row ranges move up and down through the resident driver's two K/V row seats, `rdec_kv_sync` / `rdec_kv_read` (filled by `install_moe_gpu_resident`'s `kv_sync` / `kv_read` arguments), at layer `n_layers`; `ARCHITECTURE_GPU_VULKAN_MTP.md#resident-head-prompt-warm`), the same-slab verify's `install_rdec_verify` (`ARCHITECTURE_GPU_VULKAN_NROW.md#nrow-verify-command`), the reject's device rollback `install_rdec_rollback` (`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-verify-rollback`), and the per-layer-embedding seats `install_rdec_ple`
   - the branch's width, its per-layer gate and proj planes, the pre-step's projection and the token table on the
   device). The installs are one-way (a test that arms the tier never restores them) but for `unset_rdec_draft`, the CPU
   draft's control, which answers the seat for `reinstall_rdec_draft`; a seat serves whatever model loads next. Metal deliberately does not - UMA makes residency moot there, and

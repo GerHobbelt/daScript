@@ -151,6 +151,28 @@ struct private HotEdge {
     @do_not_delete caller_site : ExpressionPtr
 }
 
+//! an `invoke` of a function value: the walk continues into every function the program stores under that function type
+struct private HotInvoke {
+    type_key : string
+    @do_not_delete site : ExpressionPtr
+}
+
+//! a function type's key for the stored-value edges: the result and the argument types, each with its own qualifiers, so a
+//! `@@fn` and the field or variable it is stored in key alike - the const or reference a read of the holder adds, and the
+//! argument names a declaration carries, are not part of the key
+def private hot_fn_type_key(ty : TypeDecl?) : string {
+    let key = build_string() $(w) {
+        write(w, ty.firstType != null ? describe(ty.firstType, false, false, true) : "void")
+        write(w, "(")
+        for (a in ty.argTypes) {
+            write(w, describe(a, false, false, true))
+            write(w, ";")
+        }
+        write(w, ")")
+    }
+    return key
+}
+
 struct private HotCache {
     sinks_span_by_fn : table<uint64; int2>
     edges_span_by_fn : table<uint64; int2>
@@ -309,6 +331,7 @@ def private is_io_builtin(n : string) : bool {
 class HotBodyScan : AstVisitor {
     sinks : array<HotSink>
     edges : array<HotEdge>
+    invokes : array<HotInvoke>
     panic_depth : int = 0
 
     gen_depth : int = 0
@@ -363,6 +386,13 @@ class HotBodyScan : AstVisitor {
             add_sink(HotBits.perf026_alloc, "{n}() returns a newly allocated string", expr)
         }
         edges |> push(HotEdge(fn = expr.func, caller_site = expr))
+    }
+
+    def override preVisitExprInvoke(var expr : ExprInvoke?) : void {
+        return if (panic_depth > 0 || gen_depth > 0 || empty(expr.arguments))
+        let fv = expr.arguments[0]
+        return if (fv._type == null || fv._type.baseType != Type.tFunction)
+        invokes |> push(HotInvoke(type_key = hot_fn_type_key(fv._type), site = expr))
     }
 
     def override preVisitExprNew(var expr : ExprNew?) : void {
@@ -490,6 +520,7 @@ class PerfLintVisitor : AstVisitor {
     @do_not_delete current_function : Function?
     in_template : bool = false
     @do_not_delete hot_roots : array<Function?>
+    @do_not_delete fn_values_by_type : table<string; array<Function?>>   //! every `@@fn` the program stores, by its function type's key
     known_length_loop_depth : int = 0
     current_for_known_length : bool = true
     known_length_stack : array<bool>
@@ -1041,12 +1072,20 @@ class PerfLintVisitor : AstVisitor {
         check_perf032_declaration(decl._type, decl.annotation, decl.at)
     }
 
+    //! a `temp_array(...)` initializer is a view over memory the loop does not own: nothing to free, and `inscope` would free the pointee
+    def perf033_borrowed_view(init : ExpressionPtr) : bool {
+        if (init == null || !(init is ExprCall)) return false
+        let root = root_generic((init as ExprCall).func)
+        return root != null && root.name == "temp_array" && root._module != null && root._module.name == "array_boost"
+    }
+
     def perf033_leaks(expr : ExprLet?; v : VariablePtr) : bool {
         let origin = current_function != null ? current_function.fromGeneric : null
         if (any_loop_depth == 0 || (origin != null && origin._module != current_function._module)
                 || expr.genFlags.generated || v.flags.generated || v.flags.inScope
                 || v.flags.pod_delete_gen || v._type == null || v._type.flags.ref
-                || !(v._type.baseType == Type.tArray || v._type.baseType == Type.tTable)) return false
+                || !(v._type.baseType == Type.tArray || v._type.baseType == Type.tTable)
+                || perf033_borrowed_view(v.init)) return false
         var seen : table<Structure?>
         return !perf033_delete_frees_shared(v._type, seen)
     }
@@ -1893,6 +1932,7 @@ class PerfLintVisitor : AstVisitor {
     }
 
     def check_perf017_length_zero(expr : ExprOp2?) : void {
+        return if (expr.genFlags.generated)
         if (current_function != null) {
             let direct_match = (current_function.name == "empty"
                 && current_function._module != null
@@ -2369,12 +2409,26 @@ class PerfLintVisitor : AstVisitor {
     def hot_visit_key(fn_hash : uint64; anchor : ExpressionPtr) : uint64 =>
         fn_hash * 1099511628211ul + intptr(anchor)
 
+    def override preVisitExprAddr(var expr : ExprAddr?) : void {
+        return if (expr.func == null || expr._type == null)
+        fn_values_by_type[hot_fn_type_key(expr._type)] |> push(expr.func)
+    }
+
     def hot_ensure_summary(var fn : Function?; var hc : HotCache) {
         let h = fn.getMangledNameHash
         return if (key_exists(hc.sinks_span_by_fn, h))
         var scan = new HotBodyScan()
         make_visitor(*scan) $(adapter) {
             visit(fn, adapter)
+        }
+        for (inv in scan.invokes) {
+            var stored = unsafe(fn_values_by_type?[inv.type_key])
+            continue if (stored == null)
+            scan.edges |> reserve(length(scan.edges) + length(*stored))
+            for (f in *stored) {
+                var fnp = f
+                scan.edges |> push(HotEdge(fn = fnp, caller_site = inv.site))
+            }
         }
         hc.sinks_span_by_fn |> insert(h, int2(length(hc.sinks_all), length(scan.sinks)))
         hc.sinks_all |> push_from(scan.sinks)

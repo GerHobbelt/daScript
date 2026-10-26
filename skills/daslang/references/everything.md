@@ -144,6 +144,7 @@ One section per module: what the module is for, then its public symbols grouped 
 - [tty](#tty) - The TTY module answers whether a stream is attached to a real terminal, and how wide that terminal is.
 - [type_traits](#type_traits) - The TYPE_TRAITS module provides compile-time type introspection and manipulation.
 - [typemacro_boost](#typemacro_boost) - The TYPEMACRO_BOOST module provides infrastructure for defining type macros — custom compile-time type transformations.
+- [unicode_text](#unicode_text) - Module unicode_text
 - [unroll](#unroll) - The UNROLL module implements compile-time loop unrolling.
 - [uriparser](#uriparser) - The URIPARSER module provides URI parsing and manipulation based on the uriparser library.
 - [uriparser_boost](#uriparser_boost) - The URIPARSER_BOOST module extends URI handling with convenience functions for common operations like building URIs from components, extracting query parameters, and resolving relative paths.
@@ -444,6 +445,7 @@ The BUILTIN module contains core runtime functions available in all daslang prog
 - `get_das_version` - Returns the daslang SDK version as a string in "major.minor.patch" format (e.g.
 - `get_executable_path` - Returns the absolute path of the running executable with symlinks resolved (on Windows the module file name), or an empty string where the platform exposes none.
 - `get_stackwalk` - Returns the current call stack as a string — the same report `stackwalk` prints, captured instead of logged.
+- `get_tool_script` - Returns the entry file `daslang -tool name` runs from the tree at `root` (`get_das_root()` for the running SDK), or an empty string when that tree has no such tool.
 - `is_in_aot` - Returns `true` if the compiler is currently generating ahead-of-time (AOT) compiled code.
 - `is_intern_strings` - Returns `true` if string interning is enabled in the current context, meaning identical strings share the same memory.
 - `is_safe_hash` - Returns true when the runtime computes string hashes with the safe byte-at-a-time algorithm rather than the faster word-at-a-time one.
@@ -929,7 +931,7 @@ The FIO module implements file input/output and filesystem operations. It provid
 - `get_env_variable` - Returns the string value of the environment variable with the given name, or an empty string if undefined.
 - `has_env_variable` - Returns true if an environment variable with the given name is defined in the current process environment.
 - `popen` - Opens a pipe to the given shell command, provides the resulting FILE pointer to the block, and returns the process exit code.
-- `popen_argv` - Spawns a subprocess directly via argv (Windows: CreateProcess; Unix: fork+execvp), bypassing the shell entirely so arguments are not subject to `$()`, backtick, or cmd.exe quote-stripping.
+- `popen_argv` - Spawns a subprocess directly via argv, bypassing the shell, in the directory `cwd` (empty inherits the caller's) with each `env` entry, `KEY=VALUE`, applied over the inherited environment.
 - `popen_argv_pipe` - Spawns a subprocess with bidirectional pipes connected to its stdin and stdout (child stderr is merged into stdout).
 - `popen_binary` - Opens a pipe to the given shell command in binary mode, provides the resulting FILE pointer to the block, and returns the process exit code.
 - `popen_timeout` - Opens a process for reading, kills the entire process tree if it exceeds `timeout` seconds.
@@ -3205,6 +3207,7 @@ CPU large-language-model inference in pure daslang: load a GGUF model, tokenize,
 - `eval_embd_body` - Prefill `npos` rows built by `media_body_rows`: [span_lo, span_hi) a non-causal span (empty = every row causal), roped on a merged image `grid` where one is given.
 - `eval_embd_span` - `eval_embd` for a prompt carrying one NON-CAUSAL image span: rows `[span_lo, span_hi)` prefill with every query attending the whole span, the text around them causally — the gemma vision decode shape (non-causal media chunk).
 - `eval_embd_span_mrope` - `eval_embd_span`'s qwen mrope twin: the span rows rope as a `grid`-shaped merged image (position advance `max(grid.x, grid.y)`, tracked on the session for every later eval); same span mask, only the angles differ.
+- `eval_segments` - Several sessions' prompt chunks as ONE prefill: segment i runs `toks[i]` at `sessions[i]`'s position and advances it, each segment's logits landing in its own session.
 - `media_body_rows` - One prefill body's rows for `eval_embd_body` on `session`: `head` text, `n_media` media rows of width `src_w`, `tail` text.
 - `sample` - Sample the next token from `session.logits` per `params`: penalties, then temperature/top-k/top-p/min-p and a CDF draw — or greedy argmax when `params.temp <= 0` (`SamplingParams()` defaults are greedy).
 - `set_seed` - Seed the session's sampling RNG for reproducible generation.
@@ -3262,6 +3265,7 @@ CPU large-language-model inference in pure daslang: load a GGUF model, tokenize,
 - `set_preserve_thinking` - `true` makes every replayed assistant turn carry its think block - its `reasoning` between the template's markers, the empty block when it had none - so a replayed transcript renders the tokens the model generated and a prefix cache matches through it.
 - `set_reasoning_effort` - The reasoning level a harmony (gpt-oss) system turn asks for: `low`, `medium` or `high`.
 - `split_reasoning` - Split a complete reply at its reasoning boundary per the model family's reply format (`<think>` pair, Harmony channels, gemma-4's thought channel).
+- `think_budget_marks` - The token marks a reasoning budget acts on for `chat`'s next turn (`ThinkBudgetMarks`): the span's open token, the close tokens a scheduler forces at a stream's `think_budget` (the family's close special; harmony's end mark and final-channel header), and whether the prompt opened the span.
 - `think_drain` - Drain a COMPLETE reply through the splitter in one call: feed + finish + the strip rule (both halves strip when a reasoning span was consumed).
 - `think_feed` - Feed one streamed piece through the splitter; the out-strings are OVERWRITTEN with this piece's reasoning/content deltas (either may be empty while a partial marker is held).
 - `think_finish` - Flush the splitter at end-of-generation (OVERWRITES the out-strings with the final deltas): an unclosed reasoning span classifies as reasoning — the truncated-tail rule.
@@ -5050,6 +5054,7 @@ The AST_BOOST module provides high-level utilities for working with the AST. It 
 - `is_class_method` - Returns `true` if a `TypeDeclPtr` field represents a class method — a non-dim `tFunction` whose first argument is the class structure (or a parent of it).
 - `is_same_or_inherited` - Returns `true` if `child` is the same `Structure` as `parent` or is transitively inherited from `parent` by walking the parent chain.
 - `peel_distinct` - Returns the type under every `distinct` level; a type that is not distinct comes back as is.
+- `root_generic` - Returns the generic an instance came from, walked to the root; a `[template]` instance of an overloaded generic is two levels deep (instance, mangled overload, root).
 - `table_key_storage_base_type` - Returns the base type a table key is stored and hashed as: a `distinct` key peels to its underlying type, a handled key to its value type.
 
 ### Annotations
@@ -7883,7 +7888,7 @@ The UTF8_UTILS module provides Unicode UTF-8 string utilities including characte
 
 - `decode_unicode_escape` - Decodes Unicode escape sequences (backslash followed by hex digits) in a string to UTF-8.
 - `utf16_to_utf32` - Converts a UTF-16 surrogate pair to a single UTF-32 codepoint.
-- `utf8_decode` - Converts UTF-8 string to UTF-32 and returns it as an array of codepoints (UTF-32 string)
+- `utf8_decode` - Converts UTF-8 to a UTF-32 array.
 - `utf8_encode` - Converts a codepoint (UTF-32 symbol) to the UTF-8 byte array
 
 ### Iteration
@@ -7904,6 +7909,22 @@ The UTF8_UTILS module provides Unicode UTF-8 string utilities including characte
 
 - `utf32_is_word_char` - ASCII `[A-Za-z0-9_]` fast path; otherwise consults a non-word range table.
 - `utf32_to_lower` - Lowercases a codepoint.
+
+## unicode_text
+
+Module unicode_text
+
+
+### Constants
+
+- `UNICODE_TEXT_VERSION` - Bundled Unicode Character Database version.
+- `UNICODE_CASELESS_KEY_VERSION` - Persisted comparison keys must record this version and be reindexed when it changes.
+
+### Normalization and case folding
+
+- `try_unicode_casefold` - Full default, locale-independent Unicode case folding.
+- `try_unicode_caseless_key` - Unicode D145 canonical caseless key: NFD(casefold(NFD(value))).
+- `try_unicode_nfd` - Canonically decompose valid UTF-8 using Unicode17.0.0.
 
 ## validate_code
 

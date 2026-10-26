@@ -125,7 +125,6 @@ IF ((NOT DAS_LLVM_INCLUDED) AND ((NOT ${DAS_LLVM_DISABLED}) OR (NOT DEFINED DAS_
                 URL_HASH               SHA256=${DAS_LLVM_FILE_HASH}
                 DOWNLOAD_EXTRACT_TIMESTAMP 1
                 INACTIVITY_TIMEOUT 60
-                DOWNLOAD_RETRIES 5
                 URL ${LLVM_LINK}
             )
             FetchContent_MakeAvailable(das_llvm_shared_lib)
@@ -183,9 +182,24 @@ if(NOT DAS_TOOLS_DISABLED)
                   modules/dasLLVM/tests/llvm_split_modules.das modules/dasLLVM/tests/llvm_ast_roundtrip.das
                   modules/dasLLVM/tests/llvm_cache_selfheal.das modules/dasLLVM/tests/exe_host_cpu.das
                   modules/dasLLVM/tests/llvm_jit_never_fast_math.das
-                  modules/dasLLVM/tests/llvm_jit_hint_folds.das)
+                  modules/dasLLVM/tests/llvm_jit_hint_folds.das modules/dasLLVM/tests/llvm_slot_names_key.das
+                  modules/dasLLVM/tests/llvm_class_target_gates.das modules/dasLLVM/tests/llvm_gep_inbounds.das
+                  modules/dasLLVM/tests/llvm_jit_baseline.das modules/dasLLVM/tests/llvm_jit_debug_info.das
+                  modules/dasLLVM/tests/llvm_jit_global_lookup.das modules/dasLLVM/tests/llvm_jit_link.das
+                  modules/dasLLVM/tests/llvm_jit_sanitize.das modules/dasLLVM/tests/llvm_layout_key.das)
+    das_lane_dastest_target(run_tests_llvm_tune COMMENT "Testing the llvm_tune framework"
+        JIT_FILES modules/dasLLVM/tests/llvm_tune.das modules/dasLLVM/tests/llvm_tune_fat.das
+                  modules/dasLLVM/tests/llvm_tune_manifest.das modules/dasLLVM/tests/llvm_tune_modes.das
+                  modules/dasLLVM/tests/llvm_tune_modes_client.das
+                  modules/dasLLVM/tests/llvm_tune_progress.das modules/dasLLVM/tests/llvm_tune_requires.das
+                  modules/dasLLVM/tests/llvm_tune_stats.das
+                  modules/dasLLVM/tests/test_grid.das modules/dasLLVM/tests/test_tune.das
+                  modules/dasLLVM/tests/test_tuned.das)
+    das_lane_dastest_target(run_tests_llvm_tune_slow COMMENT "Testing the llvm_tune framework (slow tuner runs)"
+        JIT_FILES modules/dasLLVM/tests/llvm_tune_profiles.das modules/dasLLVM/tests/llvm_tune_scope.das)
     das_lane_dastest_target(run_tests_llvm_exe COMMENT "Testing the standalone exe"
         JIT_FILES modules/dasLLVM/tests/llvm_exe_name_lookup.das modules/dasLLVM/tests/llvm_exe_native_paths.das
+                  modules/dasLLVM/tests/llvm_exe_optional_module.das
                   modules/dasLLVM/tests/llvm_exe_shared_addr.das modules/dasLLVM/tests/llvm_exe_split_lto.das
                   modules/dasLLVM/tests/llvm_exe_thread_collect.das modules/dasLLVM/tests/llvm_exe_thread_loop_collect.das modules/dasLLVM/tests/llvm_exe_threadlock.das)
 endif()

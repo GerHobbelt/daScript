@@ -231,9 +231,24 @@ typedef FinalNormFn       = function<(t : Model; var s : Session; row : int64; b
 //! every row only under `Session.keep_hidden` (the Metal lastrow tail narrows). false = declined.
 typedef PrefillOverrideFn = function<(t : Model; var s : Session; npos : int64; start_pos : int64) : bool>
 
+//! One segment of a prefill over several sessions: `npos` rows of `s` from its position `start_pos`; `toki` is its chunk's
+//! index in the caller's token arrays (a one-token chunk never rides the window, so the index and the segment count part).
+struct PrefillSeg {
+    s : Session?
+    start_pos : int64
+    npos : int64
+    toki : int64
+}
+
+//! A whole-prefill override over several sessions' chunks as ONE window: on true every segment's KV cache is filled, its
+//! x_b holds its last row's residual stream (every row under `Session.keep_hidden`) and, when the override set
+//! `prefill_override_logits_done`, its logits stand. false = declined whole; the caller then runs each segment alone.
+typedef PrefillSegmentsOverrideFn = function<(t : Model; var segs : array<PrefillSeg>) : bool>
+
 // The prefill-override registry (see PrefillOverrideFn). Name-keyed like the kernel backends;
 // nothing activates by default — an empty active name keeps the CPU layer loop.
 var private g_prefill_overrides : table<string; PrefillOverrideFn>
+var private g_prefill_seg_overrides : table<string; PrefillSegmentsOverrideFn>
 var private g_prefill_override : PrefillOverrideFn
 var private g_prefill_override_name = ""
 var private g_prefill_split_span : table<string; bool>
@@ -243,6 +258,15 @@ var private g_prefill_ds_adds : table<string; bool>
 def register_prefill_override(name : string; fn : PrefillOverrideFn) {
     g_prefill_overrides[name] = fn
 }
+
+//! Registered beside the override under the same name: the window over several sessions' chunks. An override without one
+//! prefills segments one at a time.
+def register_prefill_segments_override(name : string; fn : PrefillSegmentsOverrideFn) {
+    g_prefill_seg_overrides[name] = fn
+}
+
+//! Whether the active override takes several sessions' chunks as one window.
+def active_prefill_serves_segments : bool => key_exists(g_prefill_seg_overrides, g_prefill_override_name)
 
 //! Registered beside the override: `true` = this override cannot serve a fused mid-turn span
 //! (a per-query non-causal mask), so `eval_embd_span_` keeps the three-eval splice while it
@@ -594,7 +618,7 @@ def mtp_walk_samples(s : Session) : bool {
     return true
 }
 
-[arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#logits-transfer-queue")]
+[arch(at="../ARCHITECTURE_GPU_VULKAN_LANDING.md#logits-transfer-queue")]
 def land_pick(var s : Session; pick : int64) {
     verify(!s.pick_ready, "dasLLAMA: a session's landed pick was never sampled before its next step - engine bug")
     s.pick_tok = pick
@@ -1493,6 +1517,16 @@ enum ThinkMode {
     asymmetric      // gemma-4: <|channel>thought ... <channel|> (asymmetric brackets by design)
 }
 
+//! The token marks a reasoning budget acts on, resolved per request from the family's template and the model's vocab
+//! (`think_budget_marks_`); an empty `close` means no budget can act - thinking off, or a vocab without the markers.
+struct ThinkBudgetMarks {
+    open : array<int64>      //!< the token sequence a reply writes to open its reasoning span (a special, or harmony's channel mark and `analysis`)
+    close : array<int64>     //!< the tokens forced at the budget to end the span: a close special, or harmony's end mark + final header
+    close_tok : int64 = -1l  //!< the one token the model itself writes to leave the span (the close special; harmony's end mark)
+    reopen : array<int64>    //!< the markers that end the turn once the forced close is out - a span re-opened past the budget is the model rambling past its answer
+    opened : bool = false    //!< the generation prompt left the reply inside the span
+}
+
 //! The family's tool-calling convention — defs render, call parse, replay, and results framing
 //! all dispatch on it (`ToolMode.none` = no format declared; the server answers `tools` with an
 //! honest 400 there).
@@ -1720,6 +1754,18 @@ def public set_runtime_race_hook(hook : function<() : bool>) : function<() : boo
 
 def private runtime_race_writes() : bool => g_runtime_race_armed && invoke(g_runtime_race_hook)
 
+var private g_box_runtime_hook : function<() : string>
+
+//! Install what answers the per-box runtime file for a run that keeps no sidecar of its own (`dasllama_fat_start`
+//! registers the engine's): the path of a file this box raced, or "" where the process keeps its manifest.
+def public set_box_runtime_hook(hook : function<() : string>) : function<() : string> {
+    let old = g_box_runtime_hook
+    g_box_runtime_hook = hook
+    return old
+}
+
+def private box_runtime_file_() : string => g_box_runtime_hook != null ? invoke(g_box_runtime_hook) : ""
+
 var private g_sidecar_place_hook : function<() : void>
 
 //! Install what chooses the app sidecar's location before the default apply reads it
@@ -1741,22 +1787,30 @@ def apply_box_profile_runtime(path : string = "") {
         if (g_sidecar_place_hook != null) {
             invoke(g_sidecar_place_hook)
         }
-        apply_box_profile_runtime_checked(box_profile_path())
+        apply_box_profile_runtime_checked(box_profile_path(), true)
     } else {
         apply_box_profile_runtime_at(path)
     }
 }
 
-//! A sidecar another box minted, or one that does not read as a sidecar, is somewhere else's box
-//! state and applies nothing; one that merely predates the binary keeps its runtime section - the
-//! knobs are this box's state, only the kernel winners died with the rebuild.
-def apply_box_profile_runtime_checked(path : string) {
+//! A sidecar another box minted, or one that does not read as a sidecar, is somewhere else's box state and applies
+//! nothing; one that merely predates the binary keeps its runtime section - the knobs are this box's state, only the
+//! kernel winners died. `box_fallback` is the default apply's: a path a caller names never falls back to the box file.
+def apply_box_profile_runtime_checked(path : string; box_fallback : bool = false) {
     g_box_profile_runtime_applied = false   // both flags describe THIS apply, never an earlier one
     g_box_profile_runtime_declined = ""
     var reason = box_profile_verdict_at(path)
     // no section of this box's own to apply: the first-start race, when one is installed, mints it now
     if ((reason == "absent" || reason == "foreign_box") && runtime_race_writes()) {
         reason = box_profile_verdict_at(path)
+    }
+    if (box_fallback && (reason == "absent" || reason == "foreign_box" || reason == "unreadable")) {
+        //! no section of this box's own in the manifest: the per-box file every run on the box shares, raced once
+        let bp = box_runtime_file_()
+        if (!empty(bp)) {
+            apply_box_profile_runtime_at(bp)
+            return
+        }
     }
     if (reason == "absent") {
         g_box_profile_runtime_declined = reason
@@ -1773,6 +1827,12 @@ def apply_box_profile_runtime_checked(path : string) {
     apply_box_profile_runtime_at(path)
     if (g_box_profile_runtime_declined == "no_runtime_section" && runtime_race_writes()) {
         apply_box_profile_runtime_at(path)
+    }
+    if (box_fallback && g_box_profile_runtime_declined == "no_runtime_section") {
+        let bp = box_runtime_file_()
+        if (!empty(bp)) {
+            apply_box_profile_runtime_at(bp)
+        }
     }
 }
 
@@ -1843,10 +1903,13 @@ def apply_box_profile_runtime_at(ppath : string) {   // nolint:STYLE038 — a fl
     apply_i64_knob(rt, "metal_tall_floor") $(v) { set_metal_tall_floor(v) }
     apply_i64_knob(rt, "metal_devw_small_panel_mb") $(v) { set_metal_devw_small_panel_mb(v) }
     apply_i64_knob(rt, "metal_cvt_min_rows") $(v) { set_metal_cvt_min_rows(v) }
+    apply_i64_knob(rt, "metal_moe_gemv_max") $(v) { set_metal_moe_gemv_max(v) }
     apply_i64_knob(rt, "mtp_depth_nextn") $(v) { set_mtp_depth_nextn(v) }
     apply_i64_knob(rt, "mtp_depth_assistant") $(v) { set_mtp_depth_assistant(v) }
     let mtc = read_json_field(rt, "metal_tensor", "")
-    if (mtc != "" && !g_tensor_crowns_pinned) {
+    if (mtc != "" && !g_tensor_crowns_pinned && !g_env_metal.tensor) {
+        to_log(LOG_WARNING, "dasLLAMA: DASLLAMA_METAL_TENSOR=0 - the box profile's metal_tensor crowns NOT applied; every family serves its base form, as a GPU without the tensor lane does\n")
+    } elif (mtc != "" && !g_tensor_crowns_pinned) {
         set_metal_tensor_crowns(mtc)
         to_log(LOG_INFO, "dasLLAMA: box profile runtime: metal_tensor crowns = {mtc}\n")
     } elif (mtc != "") {
@@ -2854,6 +2917,48 @@ def eval_(t : Model; var s : Session; tokens : array<int64>) {
     s.n_past += npos
 }
 
+var private @scratch g_eval_segs : array<PrefillSeg>
+
+def eval_segments_(t : Model; var sessions : array<Session?>; toks : array<array<int64>>) {
+    let n = long_length(sessions)
+    if (n != long_length(toks)) {
+        panic("eval_segments: {n} sessions and {length(toks)} chunks")
+    }
+    if (n == 0l) return   //! as eval_ on no token: nothing to prefill, nothing to advance
+    for (sp, i in sessions, count()) {
+        if (sp == null) {
+            panic("eval_segments: segment {i} names no session")
+        }
+        if (empty(toks[i])) {
+            panic("eval_segments: segment {i} carries no token")
+        }
+        for (j in range(i)) {
+            if (sessions[j] == sp) {
+                panic("eval_segments: segments {j} and {i} are one session")
+            }
+        }
+    }
+    g_eval_segs |> clear()
+    for (sp, i in sessions, count()) {
+        let np = long_length(toks[i])
+        if (np == 1l) {   //! a one-token chunk keeps eval's dispatch - the decode step - and would cost the window a segment's dispatches for one row
+            eval_(t, *sp, toks[i])
+        } else {
+            g_eval_segs |> push(PrefillSeg(s = sp, start_pos = sp.n_past, npos = np, toki = int64(i)))
+        }
+    }
+    let nw = long_length(g_eval_segs)
+    if (nw == 0l) return
+    if (nw == 1l) {
+        eval_(t, *g_eval_segs[0].s, toks[g_eval_segs[0].toki])
+        return
+    }
+    forward_prefill_segments(t, g_eval_segs, toks)
+    for (sg in g_eval_segs) {
+        sg.s.n_past += sg.npos
+    }
+}
+
 // ===== Per-app runtime profile (the tune sidecar's "runtime" section) =====
 
 // ===== Metal-4 tensor-lane crowns (the sidecar's "runtime"."metal_tensor" knob) =====
@@ -2891,6 +2996,9 @@ def public pin_metal_tensor_crowns(list : string) {
 def public unpin_metal_tensor_crowns {
     g_tensor_crowns_pinned = false
 }
+
+//! whether a cell pinned the crowns (the box profile's apply then leaves them) - what a cell captures to put the pin back
+def public metal_tensor_crowns_pinned : bool => g_tensor_crowns_pinned
 
 // ===== Metal prefill raced constants (sidecar "runtime" knobs; prefill caches at its init) =====
 
@@ -2930,6 +3038,25 @@ def public set_metal_cvt_min_rows(v : int64) {
 }
 
 def public metal_cvt_min_rows : int64 => g_metal_cvt_min_rows
+
+//! The widest prefill window whose routed experts ride the decode's gathered GEMV (one dispatch slice per token and
+//! expert slot) instead of the bucketed mul_mm tiles; 0 keeps every window on the tiles, -1 takes the prefill's default
+//! (`pf_moe_gemv_knee`). Read per window, not cached.
+var private g_metal_moe_gemv_max = -1l
+
+def public set_metal_moe_gemv_max(v : int64) {
+    if (v < -1l) {
+        to_log(LOG_WARNING, "dasLLAMA: set_metal_moe_gemv_max({v}) out of range - keeping {g_metal_moe_gemv_max}\n")
+        return
+    }
+    if (v != g_metal_moe_gemv_max) {
+        let knee = v < 0l ? "the default knee" : "{v} tokens"
+        to_log(LOG_WARNING, "dasLLAMA metal prefill: set_metal_moe_gemv_max({v}) - the gathered expert route serves a routed window of {knee} or fewer (0 = the tiles alone)\n")
+    }
+    g_metal_moe_gemv_max = v
+}
+
+def public metal_moe_gemv_max : int64 => g_metal_moe_gemv_max
 
 //! Encode text to token ids using the model's tokenizer.
 def encode_(m : Model; text : string; add_special = true; parse_special = false) : array<int64> =>
@@ -6161,10 +6288,53 @@ def private embed_rows(t : Model; var s : Session; tokens : array<int64>; npos :
 // image, KV-store, and residual stay CPU. Numerics: GPU f32 tile accumulation — drift-class vs CPU flash.
 [no_alloc, no_env, no_io, arch(at="../ARCHITECTURE_GPU.md#gpu-backends")]
 def forward_prefill(t : Model; var s : Session; tokens : array<int64>; npos, start_pos : int64; skip_logits : bool = false) {
-    let c = t.config
     if (npos <= 0l) {
         return
     }
+    forward_prefill_head(t, s, tokens, npos, start_pos)
+    forward_prefill_body(t, s, npos, start_pos, skip_logits)
+    forward_prefill_warm(t, s, tokens, npos, start_pos)
+}
+
+[arch(at="../ARCHITECTURE_GPU_PREFILL_WINDOW.md#prefill-segments")]
+def forward_prefill_segments(t : Model; var segs : array<PrefillSeg>; toks : array<array<int64>>) {
+    for (sg in segs) {
+        kv_capacity_check(t, sg.npos, sg.start_pos)
+        forward_prefill_head(t, *sg.s, toks[sg.toki], sg.npos, sg.start_pos)
+        prefill_rope_tables(t, *sg.s, sg.npos, sg.start_pos)
+    }
+    g_prefill_logits_done = false
+    var done = false
+    if (active_prefill_serves_segments()) {
+        done = invoke(g_prefill_seg_overrides[g_prefill_override_name], t, segs)
+    }
+    if (done) {
+        for (sg in segs) {
+            if (!g_prefill_logits_done) {
+                prefill_cpu_logits(t, *sg.s, sg.npos, sg.start_pos, false)
+            }
+        }
+    } else {
+        for (sg in segs) {
+            forward_prefill_body(t, *sg.s, sg.npos, sg.start_pos)
+        }
+    }
+    for (sg in segs) {
+        forward_prefill_warm(t, *sg.s, toks[sg.toki], sg.npos, sg.start_pos)
+    }
+}
+
+//! the draft head's KV warms beside the trunk's on the CPU rail only: on a blob model the GPU spec loop owns the draft slab
+def private forward_prefill_warm(t : Model; var s : Session; tokens : array<int64>; npos, start_pos : int64) {
+    let c = t.config
+    if (g_mtp_spec && c.n_layer_nextn > 0l && !t.metal_blob && !g_prefill_logits_done) {
+        mtp_prefill_warm(t, s, tokens, npos, start_pos)
+    }
+}
+
+[arch(at="../ARCHITECTURE_GPU_PREFILL_WINDOW.md#prefill-segments")]
+def private forward_prefill_head(t : Model; var s : Session; tokens : array<int64>; npos, start_pos : int64) {
+    let c = t.config
     if (npos >= 32l) {
         dispatch_phase_batch()
     }
@@ -6202,25 +6372,17 @@ def forward_prefill(t : Model; var s : Session; tokens : array<int64>; npos, sta
         prof_add("ple", ts_ple)
     }
 
-    // spec on: the draft head's SEAM row (start_pos-1) must be written BEFORE the body — the body's
-    // own tail overwrites mtp_h with THIS window's last hidden. Cold/foreign handoff just skips it.
+    //! spec on: the draft head's SEAM row (start_pos-1) is written BEFORE the body, whose tail overwrites mtp_h with this window's last hidden
     if (g_mtp_spec && c.n_layer_nextn > 0l && start_pos > 0l && s.mtp_h_pos1 == start_pos) {
         let seat = mtp_seated(t, g_mtp_seam_overrides)
         let served = seat && invoke(g_mtp_seam_overrides[g_decode_override_name], t, s, tokens[0], start_pos)   // nolint:PERF026 — `seat` holds key_exists, so the index cannot insert
         if (!served && !t.metal_blob) {
             forward_mtp(t, s, tokens[0], start_pos - 1l, false)
         } elif (!served && seat) {
-            // quality-only miss: the stale seam row dents draft acceptance until the next
-            // draft rewrites it (the verify keeps outputs exact) — loud so a dip is traceable
+            //! quality-only miss: the stale seam row dents draft acceptance until the next draft rewrites it (the verify keeps outputs exact)
             g_mtp_seam_declines++
             to_log(LOG_WARNING, "dasLLAMA: MTP seam row declined at pos {start_pos} - draft acceptance may dip this window\n")   // nolint:PERF028,PERF026 - fires only on a seam decline; loud by design so a quality dip is traceable
         }
-    }
-    forward_prefill_body(t, s, npos, start_pos, skip_logits)
-    // spec on: maintain the draft head's KV alongside the trunk's — CPU rail only (on a blob
-    // model the GPU spec loop owns the draft slab; these hooks would CPU-touch blob planes)
-    if (g_mtp_spec && c.n_layer_nextn > 0l && !t.metal_blob && !g_prefill_logits_done) {
-        mtp_prefill_warm(t, s, tokens, npos, start_pos)
     }
 }
 
@@ -6476,6 +6638,14 @@ def forward_prefill_body(t : Model; var s : Session; npos, start_pos : int64; sk
 
     // final rmsnorm + classifier on the LAST position only (that's what we sample next)
     return if (stack_done && g_prefill_logits_done)   // the override already produced s.logits
+    prefill_cpu_logits(t, s, npos, start_pos, skip_logits)
+}
+
+//! The final norm and the classifier over the chunk's last row into `s.logits`, the MTP carry stashed; the CPU step an
+//! override that lands no logits leaves to the caller.
+def private prefill_cpu_logits(t : Model; var s : Session; npos, start_pos : int64; skip_logits : bool) {
+    let c = t.config
+    let dim = c.dim
     blob_only_panic(t, "prefill final-norm/classifier step")
     let ts_final = prof_ticks()
     let last = npos - 1l

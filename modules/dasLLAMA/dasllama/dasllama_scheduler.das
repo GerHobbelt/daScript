@@ -11,8 +11,8 @@ require daslib/utf8_utils   // is_first_byte_of_utf8_char: codepoint-safe tail/h
 
 // Continuous-batching scheduler over the dasLLAMA facade. One thread, synchronous: each
 // scheduler_step admits queued requests, runs ONE eval_batch decode step over every decoding
-// stream (decode priority), then at most ONE bounded prefill chunk FCFS — a long prompt stalls
-// decode by T_chunk, not T_prefill. Results flow out as SchedEvents; no HTTP here — the wiring
+// stream (decode priority), then ONE prefill call over every prefilling stream's next chunk, the
+// quantum shared FCFS — a long prompt stalls decode by T_chunk, not T_prefill. Results flow out as SchedEvents; no HTTP here — the wiring
 // (openai_server) owns the writers, so the whole scheduler unit-tests with zero network.
 
 //! Stream lifecycle: prefilling (prompt chunks pending) -> decoding (one token per step) -> done.
@@ -73,6 +73,8 @@ struct PendingReq {
     system_at : int64 = 0l                  //! prompt tokens of the conversation's opening every request on this system prompt and tool set shares (`ChatSession.first_opening`); a recurrent model's prefill leaves a second checkpoint there when it sits a page or more under `stable_at` (0 = unknown)
     system_head_at : int64 = 0l             //! the opening's tokens shared beyond this system prompt and tool set - its system text or its tool block, whichever the template writes first (`ChatSession.system_head_at`): a third checkpoint, a page or more under `system_at` (0 = unknown)
     messages_end_at : int64 = 0l            //! prompt tokens through the last message's close, ahead of the generation prompt (`RenderedTurn.messages_end`): the last checkpoint sits there, where the conversation's next turn still matches whatever its replayed assistant turn renders (0 = unknown; the prompt's end less one token stands in)
+    think_budget : int64 = 0l               //! reasoning tokens the reply may spend before the span is closed for it (0 = no budget)
+    think_marks : ThinkBudgetMarks = ThinkBudgetMarks()   //! the span's open and forced-close tokens (`think_budget_marks_`); an empty close leaves the budget inert
     // MEDIA splice (images today; audio rides the same fields): `n_media` embedding rows that
     // prefill BETWEEN prompt[media_at-1] and prompt[media_at] — the render seam hands the two
     // token spans and the encoder hands the rows. Zero rows = an ordinary text request.
@@ -103,6 +105,12 @@ struct Stream {
     max_new : int64
     n_gen : int64                           // tokens emitted so far
     cur_tok : int64 = -1l                   // sampled but not yet evaled — the next decode step's input
+    think_budget : int64 = 0l               //! the request's reasoning budget (0 = none)
+    think_marks : ThinkBudgetMarks = ThinkBudgetMarks()   //! the span's marks the budget acts on
+    n_think : int64                         //! reasoning tokens emitted so far
+    think_state : int = 0                   //! 0 = the span not opened, 1 = inside the span, 2 = past it (closed by the model or forced)
+    forced : array<int64>                   //! tokens the next steps emit in place of their samples - the budget's forced close
+    think_open_at : int = 0                 //! how many tokens of the span's open sequence the reply has written in a row
     state : StreamState = StreamState.prefilling
     finish : string = ""
     constraint : TokenConstraintBox         //! owned here (freed with the stream); the session carries the pointer and never frees it
@@ -135,10 +143,11 @@ struct DoneStream {
     done_at : int64                         // ref_time_ticks at reap
 }
 
-//! true while a stream is decoding: the tick's prefill chunk is a stall every one of them waits out
-def private any_decoding(sch : Scheduler) : bool {
+//! true while a stream sits in `state`: decoding (the tick's prefill call is a stall every one of them waits out),
+//! prefilling, done (the tick ends before its prefill, so the finished event reaches the caller first)
+def private any_stream_in(sch : Scheduler; state : StreamState) : bool {
     for (st in sch.streams) {
-        return true if (st.state == StreamState.decoding)
+        return true if (st.state == state)
     }
     return false
 }
@@ -146,7 +155,7 @@ def private any_decoding(sch : Scheduler) : bool {
 //! on a host-cached stream `chunk_tokens` while a stream decodes and at least `idle_chunk_tokens` while none does; on a device-home stream at least the device's window, and the whole head at once for a model whose device prefill cannot continue past zero
 def private prefill_chunk(m : Model; sch : Scheduler; head_end : int64) : int64 {
     if (!sch.device_kv) {
-        return any_decoding(sch) ? sch.chunk_tokens : max(sch.chunk_tokens, sch.idle_chunk_tokens)
+        return any_stream_in(sch, StreamState.decoding) ? sch.chunk_tokens : max(sch.chunk_tokens, sch.idle_chunk_tokens)
     }
     return gpu_device_prefill_continues(m) ? max(sch.chunk_tokens, gpu_device_prefill_window()) : head_end   // a chunk under the device's window is one submit per chunk for no bounded-stall gain
 }
@@ -194,6 +203,9 @@ struct Scheduler {
     batch_toks : array<int64>
     batch_idx : array<int64>                // batch row -> streams index
     mtp_acc : array<int64>                  // the joint speculative tick's answer per batch row: the accepted draft, or -1
+    @do_not_delete seg_rows : array<Session?>   //!< the tick's prefill segments' sessions, borrowed like batch_rows
+    seg_toks : array<array<int64>>              //!< segment i's tokens
+    seg_stream_idx : array<int64>               //!< segment i -> streams index
     chunk : array<int64>                    // the current prefill chunk
     chunk_tail : array<int64>               // a media body's text past its span
     @exact_size body : array<float>         // a media body's rows
@@ -202,6 +214,7 @@ struct Scheduler {
     n_admitted : int64
     mrope_streams : int64                   // admitted streams whose media rode the mrope grid walk
     n_finished : int64                      // reaped streams (any finish, evictions included)
+    chunk_owed : bool                       //! the prefill call a tick that emitted events put off: the next tick runs it first and decodes nothing
     n_evicted : int64                       // evictions, active or still queued
     decode_steps : int64
     gen_tokens : int64
@@ -385,7 +398,6 @@ def submit(model : Model; var sch : Scheduler; var req : PendingReq) : bool {
     return true
 }
 
-// Terminate a stream: mark done (reaped at step end) and append its finished event.
 //! the nearest checkpoint stop past the rows prefilled so far, 0 when none is left: the system text, the system opening, the request's own
 def private next_checkpoint(st : Stream) : int64 {
     for (at in fixed_array(st.ckpt_head_at, st.ckpt_sys_at, st.ckpt_at, st.ckpt_end_at)) {
@@ -519,6 +531,7 @@ def private advance_with(m : Model; var st : Stream; tok : int64; var events : a
         finish_stream(st, "stop", events)
         return false
     }
+    think_budget_track(st, tok)
     var emit = ptxt
     if (!empty(st.stop_strs) && stop_scan(st.stop_hold, ptxt, st.stop_strs, emit)) {
         if (!empty(emit)) {
@@ -551,8 +564,65 @@ def private advance_with(m : Model; var st : Stream; tok : int64; var events : a
     return true
 }
 
-def private sample_advance(m : Model; var st : Stream; var events : array<SchedEvent>) : bool =>
-    advance_with(m, st, sample(st.session, st.params), events)
+//! Where the emitted token stands against the reasoning budget: the span's open token enters it, every token inside it counts,
+//! the close token the model writes leaves it, and the budget reached inside it - or the length cap drawing closer than the
+//! forced close is long - queues the forced close for the steps that follow.
+[arch(at="../ARCHITECTURE_ENGINE_SERVING.md#think-budget")]
+def private think_budget_track(var st : Stream; tok : int64) {
+    return if (st.think_budget <= 0l || empty(st.think_marks.close) || st.think_state == 2)
+    if (st.think_state == 0) {
+        let nopen = length(st.think_marks.open)
+        return if (nopen == 0)
+        st.think_open_at = tok == st.think_marks.open[st.think_open_at] ? st.think_open_at + 1 : (tok == st.think_marks.open[0] ? 1 : 0)
+        if (st.think_open_at >= nopen) {
+            st.think_state = 1
+            st.think_open_at = 0
+        }
+        return
+    }
+    if (tok == st.think_marks.close_tok) {
+        st.think_state = 2
+        return
+    }
+    st.n_think ++
+    let left = st.max_new - st.n_gen - 1l   //! the steps after this token, which the length check has not counted yet
+    let nclose = long_length(st.think_marks.close)
+    if (st.n_think >= st.think_budget || left <= nclose) {
+        if (left >= nclose) {
+            st.forced := st.think_marks.close
+        } elif (left >= 1l) {
+            //! a cap too close for the whole close keeps its marker alone - the sentence and the blank line go, the span still ends
+            st.forced <- [st.think_marks.close_tok]
+        }
+        st.think_state = 2
+        think_budget_forced_log(st, left)
+    }
+}
+
+[cold_path]
+def private think_budget_forced_log(st : Stream; left : int64) {
+    let why = st.n_think >= st.think_budget ? "thinking budget of {st.think_budget} tokens reached" : "{left} tokens left under max_tokens"
+    to_log(LOG_INFO, "[stream {st.id}] {why}: the span's close is forced\n")
+}
+
+//! the step's token: the sample, or the next forced token where the budget queued a close - the sample is still drawn, so a
+//! device pick landed for the step is consumed and the sampler's state advances as on every other step
+[arch(at="../ARCHITECTURE_ENGINE_SERVING.md#think-budget")]
+def private sample_advance(m : Model; var st : Stream; var events : array<SchedEvent>) : bool {
+    let sampled = sample(st.session, st.params)
+    if (empty(st.forced)) {
+        return advance_with(m, st, sampled, events)
+    }
+    let tok = st.forced[0]
+    st.forced |> erase(0)
+    let alive = advance_with(m, st, tok, events)
+    if (empty(st.forced) && !empty(st.think_marks.reopen)) {
+        //! the forced close is out: from here a re-opened span ends the turn, as a marker after content does in instruct mode
+        st.nothink.ids := st.think_marks.reopen
+        st.nothink.content_seen = true
+    }
+    return alive
+}
 
 // one plain decode step over the gathered batch arrays (nothing when they are empty): the device pick
 // asked for an argmax stream with no constraint, then every row sampled and advanced
@@ -601,13 +671,43 @@ def evict(var sch : Scheduler; id : int64; var events : array<SchedEvent>) : boo
     return false
 }
 
-//! One scheduler tick: admit from the queue while under max_streams, ONE eval_batch decode step
-//! over every decoding stream, at most ONE prefill chunk (`chunk_tokens`, or `prefill_chunk`'s wider one on an idle tick and in device mode; FCFS; the final chunk's
-//! logits sample the first token inline), then reap finished streams. Events append to `events`
-//! (the caller drains it). Returns true while any stream or queued request remains.
+def private reap_finished(m : Model; var sch : Scheduler) {
+    var i = 0
+    while (i < length(sch.streams)) {
+        if (sch.streams[i].state == StreamState.done) {
+            if (sch.streams[i].ttft_us > 0l) {
+                sch.ttft_sum_us += sch.streams[i].ttft_us
+                sch.ttft_count ++
+                sch.last_ttft_us = sch.streams[i].ttft_us
+            }
+            sch.recent_done |> push(DoneStream(
+                id = sch.streams[i].id, finish = sch.streams[i].finish,
+                n_prompt = long_length(sch.streams[i].prompt),
+                n_cached = sch.streams[i].n_cached,
+                n_gen = sch.streams[i].n_gen, ttft_us = sch.streams[i].ttft_us,
+                prompt_head = sch.streams[i].prompt_head, gen_tail = string(sch.streams[i].gen_tail_bytes),
+                done_at = ref_time_ticks()))
+            if (sch.streams[i].session.device_kv) {
+                park_stream(m, sch, sch.streams[i])
+            } elif (sch.paged) {
+                if (sch.streams[i].finish != "media_lost") {
+                    donate_stream(m, sch, sch.streams[i])
+                }
+                release_kv_pages(sch.streams[i].session)
+            }
+            delete sch.streams[i]   // erase is a raw memmove — finalize the owned session first
+            sch.streams |> erase(i)
+            sch.n_finished ++
+        } else {
+            i ++
+        }
+    }
+}
+
+//! One scheduler tick: events append to `events` (the caller drains it); true while any stream or queued request remains
 [arch(at="../ARCHITECTURE_ENGINE_SERVING.md#scheduler-step")]
-def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent>) : bool {  // nolint:STYLE037,STYLE038 - admit/decode/prefill/reap, one linear pass
-    // (0) drop finished-stream linger entries past their poll window (bounded backstop at 32).
+def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent>) : bool {  // nolint:STYLE037,STYLE038 - linger/reap/admit/decode/prefill, one linear pass
+    // drop finished-stream linger entries past their poll window (bounded backstop at 32).
     // get_time_nsec, NOT get_time_usec: the usec helper returns int and wraps at ~35.8 min,
     // which would freeze this comparison for any entry that survived a wrap
     while (!empty(sch.recent_done)
@@ -615,15 +715,16 @@ def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent
         delete sch.recent_done[0]
         sch.recent_done |> erase(0)
     }
-    // (1) admit FIFO while under the cap — sessions (KV memory) exist only from this point on.
-    // Paged mode also attaches the longest prefix-cache hit: those positions never prefill.
-    while (!empty(sch.queue) && long_length(sch.streams) < sch.max_streams) {
+    reap_finished(m, sch)
+    while (!empty(sch.queue) && long_length(sch.streams) < sch.max_streams && !any_prefilling_before_a_shared_checkpoint(sch)) {
         var st <- Stream(id = sch.queue[0].id,
                          params = sch.queue[0].params, prompt <- sch.queue[0].prompt,
                          close_toks <- sch.queue[0].close_toks, stop_ids <- sch.queue[0].stop_ids,
                          stop_strs <- sch.queue[0].stop_strs, nothink <- sch.queue[0].nothink,
                          spans <- sch.queue[0].spans, constraint <- sch.queue[0].constraint,
-                         max_new = sch.queue[0].max_new, t_admit = ref_time_ticks())
+                         max_new = sch.queue[0].max_new, t_admit = ref_time_ticks(),
+                         think_budget = sch.queue[0].think_budget, think_marks <- sch.queue[0].think_marks)
+        st.think_state = st.think_marks.opened ? 1 : 0
         if (sch.device_kv) {
             st.session <- create_device_session(m, gpu_device_session_dtype())
             let matched = parked_attach(sch, st.session, st.prompt)   // a model whose prefill cannot continue parks nothing, so nothing matches
@@ -712,7 +813,13 @@ def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent
         sch.n_admitted ++
     }
     sch.peak_active = max(sch.peak_active, long_length(sch.streams))
-    // (2) ONE batched decode step over every decoding stream (decode priority). Rows are gathered
+    if (sch.chunk_owed) {   //! the window the last tick put off: run it alone, the decode comes next tick
+        sch.chunk_owed = false
+        prefill_tick(m, sch, events)
+        return !empty(sch.streams) || !empty(sch.queue)
+    }
+    let n_events0 = length(events)
+    // ONE batched decode step over every decoding stream (decode priority). Rows are gathered
     // fresh each step: admission above may have reallocated `streams`, and nothing below grows it.
     sch.batch_rows |> clear()
     sch.batch_toks |> clear()
@@ -725,8 +832,8 @@ def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent
             finish_stream(sch.streams[i], "length", events)
             continue
         }
-        if (sch.mtp && sch.streams[i].constraint.constraint != null) {
-            continue   // a constrained stream decodes plain, after the speculative round (below)
+        if (sch.mtp && (sch.streams[i].constraint.constraint != null || !empty(sch.streams[i].forced))) {
+            continue   // a constrained stream, or one with a forced close pending, decodes plain, after the speculative round (below)
         }
         if (sch.mtp) {
             // self-spec tick: the stream trades its cross-stream batch row for up to two positions per
@@ -772,8 +879,8 @@ def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent
         sch.batch_idx |> clear()
     }
     if (sch.mtp) {
-        for (i in range64(long_length(sch.streams))) {   // the constrained streams the round skipped: one plain step, round or no round
-            if (sch.streams[i].state == StreamState.decoding && sch.streams[i].constraint.constraint != null) {
+        for (i in range64(long_length(sch.streams))) {   // the constrained and forced-close streams the round skipped: one plain step, round or no round
+            if (sch.streams[i].state == StreamState.decoding && (sch.streams[i].constraint.constraint != null || !empty(sch.streams[i].forced))) {
                 sch.batch_rows |> push(unsafe(addr(sch.streams[i].session)))
                 sch.batch_toks |> push(sch.streams[i].cur_tok)
                 sch.batch_idx |> push(i)
@@ -784,11 +891,116 @@ def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent
     sch.batch_rows |> clear()
     sch.batch_toks |> clear()
     sch.batch_idx |> clear()
-    // (3) at most ONE prefill chunk, FCFS — decode-priority with a bounded prefill quantum
-    for (i in range64(long_length(sch.streams))) {
-        if (sch.streams[i].state != StreamState.prefilling) {
-            continue
+    //! a decode phase that emitted events ends the tick: the caller drains them to the wire ahead of the chunk, which the
+    //! next tick runs first - the token a stream just produced never waits out another stream's prefill window
+    let next = next_prefilling(sch)
+    if (next >= 0l) {
+        if (length(events) > n_events0) {
+            sch.chunk_owed = true
+            return true
         }
+        prefill_tick(m, sch, events)
+    }
+    return !empty(sch.streams) || !empty(sch.queue)
+}
+
+//! the first stream still on its prompt, -1 with none: the tick's window opens with its chunk (FCFS)
+def private next_prefilling(sch : Scheduler) : int64 {
+    for (i in range64(long_length(sch.streams))) {
+        return i if (sch.streams[i].state == StreamState.prefilling)
+    }
+    return -1l
+}
+
+//! a prefilling stream with a SHARED checkpoint stop still ahead - the opening's head, the system opening, a stable opening
+//! that is no tail: a request admitted now would prefill the opening that stop is about to leave for it, so admission
+//! waits; a stream past its shared stops, with only its own conversation's stops ahead, or with none, holds nothing back
+def private any_prefilling_before_a_shared_checkpoint(sch : Scheduler) : bool {
+    for (st in sch.streams) {
+        continue if (st.state != StreamState.prefilling)
+        return true if (st.ckpt_head_at > st.n_prefilled || st.ckpt_sys_at > st.n_prefilled || (!st.ckpt_at_tail && st.ckpt_at > st.n_prefilled))
+    }
+    return false
+}
+
+//! whether a media span's K/V is still to stand for the stream: its body, and the text around it, eval as one call of their own
+def private stream_has_span_ahead(st : Stream) : bool => next_span(st.spans) >= 0
+
+//! the rows a stream's next text chunk takes of `chunk`, never past `prompt_end`; a checkpoint within a chunk and a half
+//! ends the chunk there: stopping a chunk short of it would add a window, and a window's cost is mostly fixed
+def private chunk_take(st : Stream; chunk, prompt_end : int64) : int64 {
+    let to_ckpt = next_checkpoint(st) - st.n_prefilled
+    return min(to_ckpt > 0l && to_ckpt <= chunk + chunk / 2l ? to_ckpt : chunk, prompt_end - st.n_prefilled)
+}
+
+[arch(at="../ARCHITECTURE_ENGINE_SERVING.md#scheduler-step")]
+def private prefill_tick(m : Model; var sch : Scheduler; var events : array<SchedEvent>) {
+    let first = next_prefilling(sch)
+    return if (first < 0l)
+    if (sch.device_kv || stream_has_span_ahead(sch.streams[first])) {
+        prefill_one_chunk(m, sch, events, first)
+        return
+    }
+    let quantum = prefill_chunk(m, sch, 0l)
+    var budget = quantum
+    sch.seg_rows |> clear()
+    sch.seg_toks |> resize(0)
+    sch.seg_stream_idx |> clear()
+    for (i in range64(long_length(sch.streams))) {
+        break if (budget <= 0l)
+        var st & = unsafe(sch.streams[i])
+        continue if (st.state != StreamState.prefilling || stream_has_span_ahead(st))
+        let take = chunk_take(st, min(budget, quantum), long_length(st.prompt))
+        continue if (take <= 0l)
+        let k = long_length(sch.seg_stream_idx)
+        sch.seg_toks |> resize(k + 1l)
+        sch.seg_toks[k] |> resize(take)
+        for (j in range64(take)) {
+            sch.seg_toks[k][j] = st.prompt[st.n_prefilled + j]
+        }
+        sch.seg_rows |> push(unsafe(addr(st.session)))
+        sch.seg_stream_idx |> push(i)
+        budget -= take
+    }
+    let nseg = long_length(sch.seg_stream_idx)   //! at least the first stream's: it has no span ahead and rows left
+    eval_segments(m, sch.seg_rows, sch.seg_toks)
+    sch.prefill_evals ++
+    for (k in range64(nseg)) {
+        note_prefilled(m, sch, events, sch.seg_stream_idx[k], long_length(sch.seg_toks[k]))
+    }
+    sch.seg_rows |> clear()
+}
+
+//! `take` rows of stream `i`'s prompt stand after an eval: the counts move, a checkpoint the rows end at is inserted,
+//! and a wholly prefilled stream turns to decoding
+def private note_prefilled(m : Model; var sch : Scheduler; var events : array<SchedEvent>; i, take : int64) {
+    sch.streams[i].n_prefilled += take
+    sch.prefill_tokens += take
+    if (at_checkpoint(sch.streams[i])) {
+        let tail = (sch.streams[i].ckpt_at_tail && sch.streams[i].n_prefilled == sch.streams[i].ckpt_at) || sch.streams[i].n_prefilled == sch.streams[i].ckpt_end_at
+        prefix_insert(sch.prefix, sch.pool, sch.streams[i].session, sch.streams[i].prompt, "", !tail)
+        to_log(LOG_INFO, "[stream {sch.streams[i].id}] prefix checkpoint at {sch.streams[i].n_prefilled} tok: {tail ? "this conversation's next turn" : "the next prompt on this opening"} attaches here ({length(sch.prefix.states)} checkpoints, {sch.prefix.state_bytes / 1048576l} MB)\n")
+    }
+    begin_decoding_if_prefilled(m, sch, events, i)
+}
+
+//! a stream whose prompt is wholly prefilled turns to decoding and samples its first token from the window's logits
+def private begin_decoding_if_prefilled(m : Model; var sch : Scheduler; var events : array<SchedEvent>; i : int64) {
+    let np = long_length(sch.streams[i].prompt)
+    return if (sch.streams[i].n_prefilled < np)
+    let pf_ms = int64(get_time_usec(sch.streams[i].t_admit)) / 1000l
+    let pf_tok = np - sch.streams[i].n_cached
+    let pf_rate = pf_ms > 0l ? 1000.0 * float(pf_tok) / float(pf_ms) : 0.0
+    to_log(LOG_INFO, "[stream {sch.streams[i].id}] prefill done: {pf_tok} tok in {pf_ms}ms ({pf_rate} tok/s)\n")
+    sch.streams[i].state = StreamState.decoding   //! before sampling: sample_advance may finish it
+    if (sample_advance(m, sch.streams[i], events)) {
+        sch.gen_tokens ++
+    }
+}
+
+//! ONE prefill chunk of stream `i` - decode-priority with a bounded prefill quantum
+def private prefill_one_chunk(m : Model; var sch : Scheduler; var events : array<SchedEvent>; i : int64) {
+    {
         let np = long_length(sch.streams[i].prompt)
         // a media span takes the whole quantum: its rows eval as ONE body, because the mask (gemma vision's
         // non-causal span) is per-call and a chunk boundary would split it. Text chunks normally up to the next span.
@@ -808,72 +1020,21 @@ def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent
             sch.prefill_tokens += sn
             sch.prefill_evals ++
         } else {
-            let head_end = si >= 0 ? sch.streams[i].spans[si].at : np
-            let chunk = prefill_chunk(m, sch, head_end)
-            let next_ckpt = next_checkpoint(sch.streams[i])
-            let to_ckpt = next_ckpt - sch.streams[i].n_prefilled
-            //! a checkpoint within a chunk and a half ends this chunk: stopping a chunk short of it would add a window, and a window's cost is mostly fixed
-            let take = min(to_ckpt > 0l && to_ckpt <= chunk + chunk / 2l ? to_ckpt : chunk, head_end - sch.streams[i].n_prefilled)   //! never past the next media span's start: a stop inside or past a span waits for the span's own eval
+            let head_end = si >= 0 ? sch.streams[i].spans[si].at : np   //! never past the next media span's start: a stop inside or past a span waits for the span's own eval
+            let take = chunk_take(sch.streams[i], prefill_chunk(m, sch, head_end), head_end)
             sch.chunk |> resize(take)
             for (k in range64(take)) {
                 sch.chunk[k] = sch.streams[i].prompt[sch.streams[i].n_prefilled + k]
             }
             eval(m, sch.streams[i].session, sch.chunk)
-            sch.streams[i].n_prefilled += take
-            sch.prefill_tokens += take
             sch.prefill_evals ++
-            if (at_checkpoint(sch.streams[i])) {
-                let tail = (sch.streams[i].ckpt_at_tail && sch.streams[i].n_prefilled == sch.streams[i].ckpt_at) || sch.streams[i].n_prefilled == sch.streams[i].ckpt_end_at
-                prefix_insert(sch.prefix, sch.pool, sch.streams[i].session, sch.streams[i].prompt, "", !tail)
-                to_log(LOG_INFO, "[stream {sch.streams[i].id}] prefix checkpoint at {sch.streams[i].n_prefilled} tok: {tail ? "this conversation's next turn" : "the next prompt on this opening"} attaches here ({length(sch.prefix.states)} checkpoints, {sch.prefix.state_bytes / 1048576l} MB)\n")
-            }
+            note_prefilled(m, sch, events, i, take)
+            return
         }
-        if (sch.streams[i].n_prefilled >= np) {
-            let pf_ms = int64(get_time_usec(sch.streams[i].t_admit)) / 1000l
-            let pf_tok = np - sch.streams[i].n_cached
-            let pf_rate = pf_ms > 0l ? 1000.0 * float(pf_tok) / float(pf_ms) : 0.0
-            to_log(LOG_INFO, "[stream {sch.streams[i].id}] prefill done: {pf_tok} tok in {pf_ms}ms ({pf_rate} tok/s)\n")
-            sch.streams[i].state = StreamState.decoding   // before sampling: sample_advance may finish it
-            if (sample_advance(m, sch.streams[i], events)) {   // the final chunk's logits sample the first token inline
-                sch.gen_tokens ++
-            }
-        }
-        break
+        begin_decoding_if_prefilled(m, sch, events, i)
     }
-    // (4) reap done streams (their finished events were emitted at the state flip); paged streams
-    // donate their pages to the prefix cache on the way out
-    var i = 0
-    while (i < length(sch.streams)) {
-        if (sch.streams[i].state == StreamState.done) {
-            if (sch.streams[i].ttft_us > 0l) {
-                sch.ttft_sum_us += sch.streams[i].ttft_us
-                sch.ttft_count ++
-                sch.last_ttft_us = sch.streams[i].ttft_us
-            }
-            sch.recent_done |> push(DoneStream(
-                id = sch.streams[i].id, finish = sch.streams[i].finish,
-                n_prompt = long_length(sch.streams[i].prompt),
-                n_cached = sch.streams[i].n_cached,
-                n_gen = sch.streams[i].n_gen, ttft_us = sch.streams[i].ttft_us,
-                prompt_head = sch.streams[i].prompt_head, gen_tail = string(sch.streams[i].gen_tail_bytes),
-                done_at = ref_time_ticks()))
-            if (sch.streams[i].session.device_kv) {
-                park_stream(m, sch, sch.streams[i])
-            } elif (sch.paged) {
-                if (sch.streams[i].finish != "media_lost") {
-                    donate_stream(m, sch, sch.streams[i])
-                }
-                release_kv_pages(sch.streams[i].session)
-            }
-            delete sch.streams[i]   // erase is a raw memmove — finalize the owned session first
-            sch.streams |> erase(i)
-            sch.n_finished ++
-        } else {
-            i ++
-        }
-    }
-    return !empty(sch.streams) || !empty(sch.queue)
 }
+
 
 //! One eval for span `si` and the text around it, up to a chunk of text: a prefill call's cost is mostly fixed, so
 //! the text either side of a span rides the span's call. False where the body is not one eval - a recurrent

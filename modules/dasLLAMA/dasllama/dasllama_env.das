@@ -128,7 +128,7 @@ struct public GpuTierEnv {
     gpu_min_ctx : int64 = 0l
 
     @clarg_default_doc = "the model's context"
-    @clarg_doc = "Cap the resident driver's KV mirror at this many positions (the card's room and the 4 GiB binding cap still bound it); a cap under the arming floor lowers the floor to the cap (never under 256), since the cap is the shape the caller serves; 0 follows the model's context; a server keeps the model's."
+    @clarg_doc = "Cap the resident driver's KV mirror at this many positions (the card's room and the 4 GiB binding cap on the widest layer's rows still bound it); a cap under the arming floor lowers the floor to the cap (never under 256), since the cap is the shape the caller serves; 0 follows the model's context; a server keeps the model's."
     gpu_ctx_max : int64 = 0l
 
     @clarg_doc = "The context pin (DASLLAMA_GPU_CTX_MAX, set_gpu_ctx_max) is the context asked, not a cap: a K/V mirror the card cannot hold at it declines the resident driver instead of shortening, and the per-op rails serve the asked context; the load log names the room."
@@ -260,6 +260,12 @@ struct public MetalEnv {
     @clarg_doc = "GEMV-tail prefill dispatch: npos % 32 in [1,8] peels the last M tile's real rows onto the fixed-B GEMV family instead of billing a full 32-row tile; 0 pins the padded-tile path (the A/B rail)."
     mm_tail : bool = true
 
+    @clarg_doc = "The K-quant rows sites (two to eight rows: the verify, the batch step, the prefill's short window) read x as the f16 twin the row producer stores beside it, for every format whose half-x route the box crowned (kq_rows_half_<fmt>); 0 keeps the f32 forms under every crown (the A/B rail)."
+    kq_half : bool = true
+
+    @clarg_doc = "Apply the box profile's tensor-lane crowns (its runtime.metal_tensor set), so every family the box's race crowned serves its tensor twin; 0 leaves the set empty and every family on its base form - what a GPU without the tensor lane (the M4 class) serves - the arm that proves a change, and the base kernel set, on that class from an M5."
+    tensor : bool = true
+
     @clarg_doc = "Fused prefill qk_norm+rope pass (one panel rewrite, q panel dual-stores its f16 twin); 0 restores the split norm/rope/cvt dispatches (the A/B rail)."
     qk_rope : bool = true
 
@@ -314,7 +320,7 @@ struct public MetalEnv {
     @clarg_doc = "A released paged session's KV mirror goes to the next session whose leading pages are the same pool groups, its rows not uploaded again; 0 uploads every attached row - the A/B rail."
     mirror_adopt : bool = true
 
-    @clarg_doc = "An f16-KV prefill writes its K/V rows into the session's KV mirror and its attention reads the cached rows there (the device pair, at any row count), so a continuation gathers nothing on the CPU and the first decode step uploads nothing; 0 keeps the f32 panels and the gather - the A/B rail."
+    @clarg_doc = "An f16-KV prefill writes its K/V rows into the session's KV mirror and its attention reads the cached rows there (the device pair, at any row count), so a continuation gathers nothing on the CPU and the first decode step uploads nothing; without the attn_dev crown the attention keeps its f32 panels and the gather, and the whole panel still converts into the mirror, so that first step uploads nothing there either; 0 keeps the panels and leaves the mirror to the decode step's upload - the A/B rail."
     pf_mirror : bool = true
 
     @clarg_doc = "Pin the served working set (weight regions, planes, the recycled pool buffers) in an MTLResidencySet, macOS 15+: the per-commit residency pass stays a no-op, so the first submission after a CPU-only window stops repaying it (~15 ms/encode on the M1 Max released-rig image cell; ARCHITECTURE_RUNTIME.md 2.12); 0 is the A/B rail."

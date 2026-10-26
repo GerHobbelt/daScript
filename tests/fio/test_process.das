@@ -38,12 +38,16 @@ def make_temp_root(t : T?; prefix : string) : string {
 def guard(seconds : float) : float =>
     shared_module_extension() == "_debug.shared_module" ? min(seconds * 3.0, 300.0) : seconds
 
+//! the child compiles its fixture before it signals ready, which a sanitizer build on a loaded
+//! runner stretches far past a quick startup
+let private READY_SECONDS = 60.0
+
 // drain until the child's ready file appears; the file event drives it, the clock only guards
 def wait_for_ready(t : T?; var p : process; ready : string) {
     let started = ref_time_ticks()
     while (!fexist(ready)) {
         unsafe(process_drain(p) $(_line) {})
-        if (float(get_time_usec(started)) > guard(15.0) * 1000000.0) {
+        if (float(get_time_usec(started)) > guard(READY_SECONDS) * 1000000.0) {
             t |> failure("child never signaled ready")
             return
         }
@@ -97,7 +101,7 @@ def test_process_lifecycle(t : T?) {
             unsafe(process_drain(p) $(line) {
                 lines |> push(clone_string(line))
             })
-            if (float(get_time_usec(started)) > guard(15.0) * 1000000.0) {
+            if (float(get_time_usec(started)) > guard(READY_SECONDS) * 1000000.0) {
                 t |> failure("child never signaled ready")
                 break
             }
@@ -173,15 +177,7 @@ def test_process_terminate(t : T?) {
         let noenv : array<string>
         var p = unsafe(spawn_process(child_argv(fixture, ready, release), "", noenv))
         t |> success(p != null, "spawn_process returned a handle")
-        let started = ref_time_ticks()
-        while (!fexist(ready)) {
-            unsafe(process_drain(p) $(_line) {})
-            if (float(get_time_usec(started)) > guard(15.0) * 1000000.0) {
-                t |> failure("child never signaled ready")
-                break
-            }
-            sleep(5u)
-        }
+        wait_for_ready(t, p, ready)
         let pid = unsafe(process_pid(p))
         t |> equal(unsafe(process_wait(p, 0.2)), process_running, "wait answers process_running when the timeout passes first")
         unsafe(process_terminate(p))
@@ -195,6 +191,66 @@ def test_process_terminate(t : T?) {
 }
 
 [test]
+def test_run_and_capture_with_cwd_and_env(t : T?) {
+    let fixture = path_join(get_das_root(), "tests/fio/_fixture_process_child.das")
+    t |> run("the child runs in cwd with the env overrides, and its code and every line come back") @(t : T?) {
+        let root_dir = make_temp_root(t, "das capture cwd ")
+        return if (empty(root_dir))
+        let release = path_join(root_dir, "release")
+        t |> success(fwrite(release, "go"), "released before the start, so the child runs straight through")
+        var output : string
+        let rc = run_and_capture(child_argv(fixture, path_join(root_dir, "ready"), release), root_dir, ["DAS_PROC_TEST=marker42"], output, guard(30.0))
+        t |> equal(rc, 7, output)
+        t |> equal(output, "env=marker42\ncwd={base_name(root_dir)}\nhello one\nhello two\n")
+        rmdir_rec(root_dir)
+    }
+    t |> run("a child still running when the timeout passes is killed and reads as popen_timed_out") @(t : T?) {
+        let root_dir = make_temp_root(t, "das capture timeout ")
+        return if (empty(root_dir))
+        let ready = path_join(root_dir, "ready")
+        let noenv : array<string>
+        var output : string
+        let rc = run_and_capture(child_argv(fixture, ready, path_join(root_dir, "never")), "", noenv, output, 1.0)
+        t |> equal(rc, popen_timed_out, output)
+        rmdir_rec(root_dir)
+    }
+    t |> run("a binary that cannot start answers -1 on Windows (no process) and 127 on POSIX (the child's exec), with no output") @(t : T?) {
+        let noenv : array<string>
+        var output = "stale"
+        let expected = get_running_platform_name() == "windows" ? -1 : 127
+        t |> equal(run_and_capture(["/nonexistent/daslang-that-is-not-there"], "", noenv, output), expected)
+        t |> equal(output, "")
+    }
+    t |> run("a partial last line the child wrote before the timeout still comes back") @(t : T?) {
+        let noenv : array<string>
+        var output : string
+        let partial = path_join(get_das_root(), "tests/fio/_fixture_partial_line_child.das")
+        let rc = run_and_capture([das_exe(), "-dasroot", get_das_root(), partial], "", noenv, output, guard(5.0))
+        t |> equal(rc, popen_timed_out, output)
+        t |> success(output |> contains("partial"), "got: {output}")
+    }
+    t |> run("a timeout of 0 sets no limit") @(t : T?) {
+        let root_dir = make_temp_root(t, "das capture no limit ")
+        return if (empty(root_dir))
+        let release = path_join(root_dir, "release")
+        t |> success(fwrite(release, "go"), "released before the start")
+        let noenv : array<string>
+        var output : string
+        let rc = run_and_capture(child_argv(fixture, path_join(root_dir, "ready"), release), "", noenv, output, 0.0)
+        t |> equal(rc, 7, output)
+        rmdir_rec(root_dir)
+    }
+    t |> run("output past what a pipe holds is read while the child runs, so the child finishes") @(t : T?) {
+        let noenv : array<string>
+        var output : string
+        let big = path_join(get_das_root(), "tests/fio/_fixture_big_output_child.das")
+        let rc = run_and_capture([das_exe(), "-dasroot", get_das_root(), big, "--", "5000"], "", noenv, output, guard(60.0))
+        t |> equal(rc, 0, "rc={rc}")
+        t |> equal(length(output), 500000)
+    }
+}
+
+[test]
 def test_exit_now_carries_its_code(t : T?) {
     t |> run("exit_now ends a child with the code it was given, and the line printed before it arrives") @(t : T?) {
         let fixture = path_join(get_das_root(), "tests/fio/_fixture_exit_now_child.das")
@@ -203,5 +259,18 @@ def test_exit_now_carries_its_code(t : T?) {
         t |> equal(rc, 7, "the child's exit code, got:\n{output}")
         t |> success(output |> contains("before exit_now"), "the flushed line reached the parent, got:\n{output}")
         t |> success(!(output |> contains("[daslang atexit]")), "the runtime's atexit audit must stay quiet on a deliberate exit, got:\n{output}")
+    }
+}
+
+[test]
+def test_exit_carries_its_code(t : T?) {
+    let fixture = path_join(get_das_root(), "tests/fio/_fixture_exit_child.das")
+    for (code in [42, 0]) {
+        t |> run("exit({code}) ends a child with {code}") @(t : T?) {
+            var output : string
+            let rc = run_and_capture([das_exe(), "-dasroot", get_das_root(), fixture, "--", "{code}"], output, guard(15.0))
+            t |> equal(rc, code, "the child's exit code, got:\n{output}")
+            t |> success(!(output |> contains("[daslang atexit]")), "the runtime's atexit audit must stay quiet on a deliberate exit, got:\n{output}")
+        }
     }
 }

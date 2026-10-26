@@ -16,9 +16,9 @@ it.
 
 A tool is shipped when an `install(...)` rule in `CMakeLists.txt` (beside this file) or the
 repo root's `CMakeLists.txt` puts its program in the bundle - a built executable
-(`install(PROGRAMS ...)` for a `DAS_UTILS_SHIPPED_EXES` entry, `install(TARGETS ...)` for a
-C++ target), or the entry file copied as source (`install(FILES ...)` or
-`install(DIRECTORY ...)`).
+(`install(TARGETS ...)` for a C++ target), or the entry file copied as source (`install(FILES
+...)` or `install(DIRECTORY ...)`). A `DAS_UTILS_SHIPPED_EXES` entry ships no program of its own:
+it installs a copy of daslang under the tool's name, which runs the shipped source.
 
 An arm is one test case that a test runner executes and reports pass or fail for on its own,
 in any language: a `dastest` `[test]` function and each `t |> run(...)` case inside that
@@ -29,19 +29,19 @@ skip-path assertion.
 A CI row is a workflow step whose command runs the arm, directly or through a process it
 spawns. An assertion no CI row can run is one that needs something no pull-request lane's
 runner image provides - a GPU, a host tool the image does not carry, a network service, a
-credential - or one the arm returns or skips before on every such runner; whether a row runs
-the arm today does not decide it. An arm that skips unless a host tool is present has
-assertions a CI row can run when the pull-request lane's runner image carries that tool, and
-the change names that lane. One arm can hold assertions of both kinds.
+credential - that list is closed; whether a row runs the arm today does not decide it. An arm
+that skips unless something the build can produce is present - a target, an exe, a generated
+file - has assertions a CI row can run. An arm that skips unless a host tool is present has
+assertions a CI row can run when a pull-request lane's runner image carries that tool. One arm
+can hold assertions of both kinds.
 
 **A changed file that belongs to a tool, wherever the tool sits, is reviewed with that tool's
 own `REVIEW.md`, where one exists, as well as with this checklist.**
 
 **A diff that adds a `[test]` file covering a change to a tool puts that file under the tool's
 directory; a test that calls a `common/` module directly goes under `common/`, even when it also
-runs a tool, one that tests a
-`common/` change by running a tool that requires it goes under that tool, and a test covering
-two tools goes under either one.**
+runs a tool, one that tests a `common/` change by running a tool that requires it goes under that
+tool, and a test covering two tools goes under either one.**
 
 **A diff that changes how a tool builds a `.dlim` from a gguf, how one loads it, or what
 identifies one - the fields that decide whether two `.dlim`s are the same image - answers to
@@ -54,9 +54,10 @@ puts it, applies `modules/dasLLAMA/REVIEW.md` (repo root) too.**
 walks, or rewriting a finding text so it no longer names what failed.**
 
 **A diff that drops a tool from `DAS_UTILS_SHIPPED_EXES` (`CMakeLists.txt`, beside this file)
-while keeping that tool's directory records the decision to stop shipping it in that tool's
+while keeping that tool's directory records the decision to drop its named exe in that tool's
 own `README.md`, wherever that directory is, in the same change** - `REVIEW.das` cannot see a
-removed entry, and it reads each shipped tool's `README.md` for the standing decision.
+removed entry, and it reads the `README.md` of each `DAS_UTILS_SHIPPED_EXES` entry for the
+standing decision.
 
 **A diff that deletes a tool named in `DAS_UTILS_SHIPPED_EXES` leaves a comment line beside
 the list naming the removed exe, in the same change.**
@@ -64,8 +65,9 @@ the list naming the removed exe, in the same change.**
 **An arm the diff adds or changes that covers a change to a tool, whose load-bearing
 assertions a CI row can run against the change, ships with a CI row that executes those
 assertions on every pull request, wherever the diff puts the arm, added in the same change
-when no row does that yet.** A row that only compile-checks the arm (`dastest --compile-only`)
-does not execute them.
+when no row does that yet; when the arm skips unless a host tool is present, the PR description
+names the pull-request lane whose runner image carries that tool.** A row that only
+compile-checks the arm (`dastest --compile-only`) does not execute them.
 
 **An arm the diff adds or changes that covers a change to a tool, whose load-bearing
 assertions no CI row can run, ships with a row that compile-checks the file the arm sits in -

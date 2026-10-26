@@ -14,10 +14,10 @@ require resolver (`FsFileAccess::getModuleInfo`), which lives in the compiler li
 runtime-only exe has no compiler and can never reach them, and every row it would carry is a
 startup `jit_register_native_path_resolve` call - one exe-file lookup and one stat per row, for
 every row the host scan loaded - and a build-machine path baked into the binary. A whole-lib exe
-(`dastest.exe`, which compiles test files at run time) still carries every row, re-rooted at run
+(the internal `jit.exe`, which compiles scripts at run time) still carries every row, re-rooted at run
 time the way dynamic modules are.
 
-## 2. A global initializer's addresses are filled at startup
+## 2. A global initializer's addresses are filled at startup {#exe-global-init-walk}
 
 The exe emitter leaves every address global - a `@@fn` value, a handled type's `new`, the
 table accessors - null and private, since a JIT-process address means nothing in the exe, and
@@ -78,3 +78,15 @@ int, or bool installs the browser lifecycle, with optional `init` and `shutdown`
 and needs no native entry function. Other paths require the requested native
 entry. Entry validation follows lifecycle selection so a browser-only module can
 build without weakening the checks on its included functions.
+
+## Dynamic module startup {#dynamic-module-startup}
+
+`collect_external_functions` completes the emitted `initialize_modules` body after
+walking extern references, which can discover dynamic libraries beyond the require
+walk. On native targets, deferred dynamic-module loads retry after these
+registrations and before `jit_initialize_modules_done` initializes module bindings.
+A retry after binding initialization leaves functions from a deferred library
+unregistered. Exe startup uses `jit_finalize_dynamic_modules`; emitted library
+startup uses `jit_lib_finalize_dynamic_modules` so a failed load reaches the host
+without aborting its process. Register-all tools retain the module scanner's Quiet
+optional-load policy; unrelated unavailable descriptors do not become fatal.

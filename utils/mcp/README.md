@@ -79,17 +79,17 @@ The server has two entry points over the same dispatch core (the provider-neutra
 - **`main.das`** - the full tool set (everything above).
 - **`cpp_main.das`** - only the cpp/agnostic subset: `grep_usage`, `outline`, the seven `cpp_*` tools, and `shutdown`. None of the daslang compiler-backed tools (compile / lint / AOT / introspection / live-reload) are registered, so a C++-only project gets a focused tool list without the daslang toolchain.
 
-Register one or both. `utils/mcp/setup.das` writes the `daslang` entry as the watchdog's stdio front over the tree's own binary - the front answers `initialize` itself, spawns the server on the first tool call, and respawns it after a kill or a rebuild, so a session never loses its tools (`utils/watchdog/README.md`, "Serving a stdio client"):
+Register one or both. The `daslang` entry is the watchdog's `-tool mcp` front, which runs `daslang -tool mcp` on the daslang beside the watchdog - the front answers `initialize` itself, spawns the server on the first tool call, and respawns it after a kill or a rebuild, so a session never loses its tools (`utils/watchdog/README.md`, "Serving a stdio client"). From an installed SDK, with the watchdog on PATH as `daslang-watchdog`, the entry needs no path; the client's directory is the project root:
 
 ```json
 "mcpServers": {
-  "daslang": { "command": "<tree>/bin/watchdog",
-               "args": ["--stdio", "--name", "daslang-mcp", "--cwd", "<tree>",
-                        "--program", "<tree>/bin/daslang", "--", "-ignore-manifest", "utils/mcp/main.das"] }
+  "daslang": { "command": "daslang-watchdog", "args": ["-tool", "mcp"] }
 }
 ```
 
-On **Windows** the child is the vcvars launcher, so `cpp_compile_check` finds `cl.exe`: `"--program", "C:\\Windows\\System32\\cmd.exe", "--", "/c", "<tree>\\utils\\mcp\\daslang-mcp-msvc.cmd"`; the launcher's first argument selects the server script, so the C++-only server is the same line with `cpp_main.das` appended. A tree without the watchdog built runs the front through the interpreter: `"command"` is the binary and `"args"` start with `"utils/watchdog/main.das", "--"`.
+`utils/mcp/setup.das` writes the same entry for a tree, over the tree's own watchdog and rooted at the tree: `"command": "<tree>/bin/watchdog", "args": ["--cwd", "<tree>", "-tool", "mcp"]`. A tree without the watchdog built runs the front through the interpreter: `"command"` is the binary and `"args"` start with `"utils/watchdog/main.das", "--"`.
+
+On **Windows** the front's child is the vcvars launcher `daslang-mcp-msvc.cmd`, so `cpp_compile_check` finds `cl.exe`. The launcher's first argument selects the server script: the C++-only server is the watchdog's `--stdio` front with `"--program", "C:\\Windows\\System32\\cmd.exe", "--", "/c", "<tree>\\utils\\mcp\\daslang-mcp-msvc.cmd", "cpp_main.das"`.
 
 The bare form still works, minus the respawn - point the entry at the binary directly:
 
@@ -279,6 +279,8 @@ After creating/editing these files, restart Claude Code (or start a new session)
 ## ast-grep / tree-sitter setup
 
 The `grep_usage` and `outline` tools use [ast-grep](https://ast-grep.github.io/) (`sg` CLI) with a custom tree-sitter grammar for daslang. The `sgconfig.yml` config file is platform-specific (shared library extension differs), so it is gitignored.
+
+The tools need `sg` 0.37.0 or later, before 0.50.0. With `sgconfig.yml` in place, an older `sg` cannot load the grammar library and every ast-grep tool returns no matches, the C++ tools included; `sg` 0.50.0 and later ignore the daslang language.
 
 Copy the appropriate template to `sgconfig.yml` in the project root:
 

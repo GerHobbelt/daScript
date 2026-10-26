@@ -9,7 +9,8 @@ require _scheduler_rig   // make_req, drain, toks_of, finished_of
 require dasllama/dasllama_batch   // batch_step_census: how the speculative ticks were served
 require dasllama/dasllama                               // facade: load/encode/generate references + engine knobs
 require dasllama/dasllama_blocks   // embed_text_rows: the media arms build rows from the prompt's own tokens
-require dasllama/dasllama_common   // layer_is_recurrent: the deltanet-on-GPU cell finds a recurrent layer to probe
+require dasllama/dasllama_common   // layer_is_recurrent: the deltanet-on-GPU cell finds a recurrent layer to probe; eval_ / forward_prefill: the one-token segment cell's two dispatches
+require _compares   // mismatch_exact
 require dasllama/dasllama_gpu_tier   // moe_gpu_dnd_on_gpu: that cell skips unless the tier serves the decode step; moe_gpu_tier_installed / gpu_want_auto
 require dasllama/dasllama_gpu_resident   // moe_gpu_resident_active / moe_gpu_resident_verifies: the resident pick-ask cell's witnesses
 require daslib/jobque_boost
@@ -26,14 +27,7 @@ require _model_tier
 
 let MODEL_PATH = path_join(models_dir(), "SmolLM2-135M-Instruct-Q8_0.gguf")
 
-def private model_missing(t : T?) : bool {
-    return true if (!jit_only(t))
-    if (!stat(MODEL_PATH).is_valid) {
-        t |> skip("{MODEL_PATH} not present")
-        return true
-    }
-    return false
-}
+def private model_missing(t : T?) : bool => !jit_model_available(t, MODEL_PATH)
 
 def private load_capped_cpu(cap : int64) : Model {
     var m <- load_model_(MODEL_PATH, QuantMode.q8)
@@ -350,6 +344,143 @@ def test_scheduler_stop_strings(t : T?) {
     }
 }
 
+// ===== the reasoning budget: the forced close lands after the budgeted tokens, the stream continues =====
+
+[test]
+def test_scheduler_think_budget(t : T?) {   // nolint:STYLE038 — one cell: the budget's six streams against one reference on one loaded model
+    t |> run("a reasoning budget forces the span's close tokens after that many tokens; a budget with no close is inert (needs SmolLM2-135M)") @(t : T?) {
+        return if (!jit_only(t) || !model_available(t, MODEL_PATH))
+        //! the scheduler and the reference run one CPU code path over one set of weights (the model's GPU state dropped
+        //! by load_capped_cpu), so the exact compares below hold - a GPU rail would round the two apart
+        with_dasllama_jobque() {
+            var m <- load_capped_cpu(128l)
+            var prompt <- encode(m, "Once upon a time", true, false)
+            var none : array<int64>
+            let greedy = SamplingParams()
+            var ref <- ref_generate(m, prompt, greedy, 12l, none)
+            var sch <- create_scheduler(m, 1l, 4l, 512l)
+            var events : array<SchedEvent>
+            // the close sequence stands in for a family's: two tokens the reference never emits in a row, read off the vocab
+            var close <- encode(m, " THE END", false, false)
+            t |> success(length(close) >= 2, "the stand-in close is at least two tokens ({length(close)})")
+            // the prompt "opened" the span: the first 3 tokens count, the 4th and 5th are the forced close, the rest the model's again
+            var req <- make_req(1l, prompt, greedy, 12l, none)
+            req.think_budget = 3l
+            req.think_marks.opened = true
+            req.think_marks.close := close
+            t |> success(submit(m, sch, req), "the budgeted stream is queued")
+            drain(m, sch, events)
+            var toks <- toks_of(events, 1l)
+            t |> equal(12, length(toks), "the budget ends nothing: the reply still runs to its length")
+            for (i in range(3)) {
+                t |> equal(ref.toks[i], toks[i], "token {i} is the model's own")
+            }
+            for (i in range(length(close))) {
+                t |> equal(close[i], toks[3 + i], "forced close token {i} lands at position {3 + i}")
+            }
+            t |> equal("length", finished_of(events, 1l).finish)
+            to_log(LOG_INFO, "think budget: reference {escape(text_of(ref.pieces))}\n")
+            to_log(LOG_INFO, "think budget: stream    {escape(text_of(pieces_of(events, 1l)))}\n")
+            // the span never opened (an open token the model does not emit): the budget counts nothing and forces nothing
+            events |> clear()
+            var req2 <- make_req(2l, prompt, greedy, 12l, none)
+            req2.think_budget = 3l
+            req2.think_marks.open <- [close[0]]
+            req2.think_marks.close := close
+            t |> success(submit(m, sch, req2), "the unopened stream is queued")
+            drain(m, sch, events)
+            var toks2 <- toks_of(events, 2l)
+            t |> equal(ref.toks, toks2, "no open token emitted: the stream is the reference, token for token")
+            // a budget with no close marks is inert
+            events |> clear()
+            var req3 <- make_req(3l, prompt, greedy, 12l, none)
+            req3.think_budget = 3l
+            req3.think_marks.opened = true
+            t |> success(submit(m, sch, req3), "the markless stream is queued")
+            drain(m, sch, events)
+            var toks3 <- toks_of(events, 3l)
+            t |> equal(ref.toks, toks3, "no close marks: the budget forces nothing")
+            // the model's own close ends the count: a stream whose close token is the reference's second token leaves
+            // the span there, and the budget of 3 never fires - the close sequence's first token is NOT the close
+            // (a symmetric family's forced close opens with a sentence whose first token the reasoning writes freely)
+            events |> clear()
+            var req4 <- make_req(4l, prompt, greedy, 12l, none)
+            req4.think_budget = 3l
+            req4.think_marks.opened = true
+            req4.think_marks.close := close
+            req4.think_marks.close_tok = ref.toks[1]
+            t |> success(submit(m, sch, req4), "the self-closing stream is queued")
+            drain(m, sch, events)
+            var toks4 <- toks_of(events, 4l)
+            t |> equal(ref.toks, toks4, "the model's own close token ended the span: the budget forced nothing")
+            // a two-token open sequence: the span opens after both, so with a budget of 2 the close lands at 4 and 5
+            events |> clear()
+            var req5 <- make_req(5l, prompt, greedy, 12l, none)
+            req5.think_budget = 2l
+            req5.think_marks.open <- [ref.toks[0], ref.toks[1]]
+            req5.think_marks.close := close
+            t |> success(submit(m, sch, req5), "the sequence-opened stream is queued")
+            drain(m, sch, events)
+            var toks5 <- toks_of(events, 5l)
+            for (i in range(4)) {
+                t |> equal(ref.toks[i], toks5[i], "sequence open: token {i} is the model's own")
+            }
+            for (i in range(length(close))) {
+                t |> equal(close[i], toks5[4 + i], "sequence open: forced close token {i} lands at position {4 + i}")
+            }
+            // the length cap closer than the close is long forces it early: a budget of 20 never fires on 12 tokens,
+            // the close lands at the last positions and the reply still ends for length within its cap
+            events |> clear()
+            var req6 <- make_req(6l, prompt, greedy, 12l, none)
+            req6.think_budget = 20l
+            req6.think_marks.opened = true
+            req6.think_marks.close := close
+            t |> success(submit(m, sch, req6), "the capped stream is queued")
+            drain(m, sch, events)
+            var toks6 <- toks_of(events, 6l)
+            t |> equal(12, length(toks6), "the forced close stays inside max_tokens")
+            for (i in range(length(close))) {
+                t |> equal(close[i], toks6[12 - length(close) + i], "early close: token {i} lands at position {12 - length(close) + i}")
+            }
+            t |> equal(ref.toks[12 - length(close) - 1], toks6[12 - length(close) - 1], "the token before the early close is the model's own")
+            t |> equal("length", finished_of(events, 6l).finish)
+            // a re-opened span past the forced close ends the turn: the stream of the first request names the token it
+            // wrote right after its forced close as the re-open marker, so this stream stops there with the marker unemitted
+            events |> clear()
+            let after_close = 3 + length(close)
+            var req7 <- make_req(7l, prompt, greedy, 12l, none)
+            req7.think_budget = 3l
+            req7.think_marks.opened = true
+            req7.think_marks.close := close
+            req7.think_marks.reopen <- [toks[after_close]]
+            t |> success(submit(m, sch, req7), "the re-open-guarded stream is queued")
+            drain(m, sch, events)
+            var toks7 <- toks_of(events, 7l)
+            t |> equal(after_close, length(toks7), "the re-opened span ends the turn at the marker, which is not emitted")
+            for (i in range(after_close)) {
+                t |> equal(toks[i], toks7[i], "re-open guard: token {i} is the budgeted stream's")
+            }
+            t |> equal("stop", finished_of(events, 7l).finish)
+            to_log(LOG_INFO, "think budget: self-closed {escape(text_of(pieces_of(events, 4l)))}\n")
+            to_log(LOG_INFO, "think budget: early close {escape(text_of(pieces_of(events, 6l)))}\n")
+            to_log(LOG_INFO, "think budget: re-open guard {escape(text_of(pieces_of(events, 7l)))}\n")
+            delete toks
+            delete toks2
+            delete toks3
+            delete toks4
+            delete toks5
+            delete toks6
+            delete toks7
+            delete close
+            delete ref
+            delete events
+            delete sch
+            delete prompt
+            delete m
+        }
+    }
+}
+
 // ===== chunked prefill: {1,3,17,64} produce the identical stream under classic prefill =====
 
 [test]
@@ -442,8 +573,9 @@ def test_scheduler_idle_quantum(t : T?) {
             t |> equal(sch.prefill_tokens, long_length(short), "the short prompt prefilled in its first tick")
             t |> success(submit(m, sch, make_req(3l, prompt, greedy, 6l, none)), "second stream queued beside it")
             let before = sch.prefill_tokens
+            scheduler_step(m, sch, events)   // decodes 2 - the chunk is owed to the next tick
             scheduler_step(m, sch, events)
-            t |> equal(sch.prefill_tokens - before, K, "beside a decoding stream the tick prefilled one chunk ({sch.prefill_tokens - before} tokens)")
+            t |> equal(sch.prefill_tokens - before, K, "beside a decoding stream the owed tick prefilled one chunk ({sch.prefill_tokens - before} tokens)")
             drain(m, sch, events)
             set_prefill_attn_mode(saved_mode)
             delete events
@@ -451,6 +583,223 @@ def test_scheduler_idle_quantum(t : T?) {
             delete streams
             delete prompt
             delete short
+            delete m
+        }
+    }
+}
+
+// ===== the tick's order around a finishing stream, and admission behind a prefilling one =====
+
+[test]
+def test_scheduler_finishing_tick(t : T?) {
+    t |> run("a tick that finishes a stream ends before its prefill chunk and reaps the stream on the next tick (needs SmolLM2-135M)") @(t : T?) {
+        if (model_missing(t)) {
+            return
+        }
+        with_dasllama_jobque() {
+            var m <- load_capped_cpu(128l)
+            var short <- encode(m, "Once upon a time", true, false)
+            var prompt <- encode(m, "The quick brown fox jumps over the lazy dog while the little robot watches from a small hill near the old village bakery", true, false)
+            let K = 8l
+            t |> success(long_length(short) <= K && long_length(prompt) > 2l * K, "the short prompt fits one chunk, the long one spans chunks ({length(short)} and {length(prompt)} tokens)")
+            var none : array<int64>
+            let greedy = SamplingParams()
+            var sch <- create_scheduler(m, 2l, 4l, K, [idle_chunk_tokens = 0l])
+            var events : array<SchedEvent>
+            t |> success(submit(m, sch, make_req(1l, short, greedy, 2l, none)), "a two-token stream queued")
+            scheduler_step(m, sch, events)   // admitted, prefilled whole, its first token sampled inline
+            t |> equal(sch.prefill_tokens, long_length(short), "the short prompt prefilled in its first tick")
+            t |> success(submit(m, sch, make_req(2l, prompt, greedy, 4l, none)), "a long prompt queued beside the decoding stream")
+            let before = sch.prefill_tokens
+            let more = scheduler_step(m, sch, events)   // admits 2, decodes 1 to its length - and ends there
+            t |> equal(finished_of(events, 1l).stream, 1l, "stream 1 finished on this tick")
+            t |> equal(finished_of(events, 1l).finish, "length", "at its length")
+            t |> equal(sch.prefill_tokens, before, "the finishing tick prefilled nothing for stream 2 ({sch.prefill_tokens - before} tokens)")
+            t |> success(empty(toks_of(events, 2l)), "and emitted nothing of stream 2")
+            t |> equal(sch.n_finished, 0l, "the finished stream is not reaped on the tick it finished")
+            t |> equal(n_active(sch), 2l, "it still holds its slot")
+            t |> success(more, "the step asks for another tick")
+            scheduler_step(m, sch, events)   // reaps 1, prefills one chunk of 2
+            t |> equal(sch.n_finished, 1l, "the next tick reaped it")
+            t |> equal(length(sch.recent_done), 1, "into the poll surface")
+            t |> equal(n_active(sch), 1l, "freeing its slot")
+            t |> equal(sch.prefill_tokens - before, K, "and prefilled one chunk of stream 2 ({sch.prefill_tokens - before} tokens)")
+            drain(m, sch, events)
+            t |> equal(finished_of(events, 2l).stream, 2l, "stream 2 ran to its end")
+            delete events
+            delete sch
+            delete prompt
+            delete short
+            delete m
+        }
+    }
+}
+
+[test]
+def test_scheduler_decode_events_precede_chunk(t : T?) {
+    t |> run("a tick whose decode step emitted a token ends before its prefill chunk; the next tick runs the chunk alone (needs SmolLM2-135M)") @(t : T?) {
+        if (model_missing(t)) {
+            return
+        }
+        with_dasllama_jobque() {
+            var m <- load_capped_cpu(128l)
+            var short <- encode(m, "Once upon a time", true, false)
+            var prompt <- encode(m, "The quick brown fox jumps over the lazy dog while the little robot watches from a small hill near the old village bakery", true, false)
+            let K = 8l
+            t |> success(long_length(short) <= K && long_length(prompt) > 2l * K, "the short prompt fits one chunk, the long one spans chunks ({length(short)} and {length(prompt)} tokens)")
+            var none : array<int64>
+            let greedy = SamplingParams()
+            var sch <- create_scheduler(m, 2l, 4l, K, [idle_chunk_tokens = 0l])
+            var events : array<SchedEvent>
+            t |> success(submit(m, sch, make_req(1l, short, greedy, 8l, none)), "an eight-token stream queued")
+            scheduler_step(m, sch, events)   // admitted, prefilled whole, its first token sampled inline
+            t |> success(submit(m, sch, make_req(2l, prompt, greedy, 4l, none)), "a long prompt queued beside the decoding stream")
+            delete events
+            let before = sch.prefill_tokens
+            let steps = sch.decode_steps
+            scheduler_step(m, sch, events)   // admits stream 2, decodes stream 1 by one token - and ends there
+            t |> equal(long_length(toks_of(events, 1l)), 1l, "the tick emitted stream 1's token")
+            t |> equal(sch.decode_steps - steps, 1l, "one decode step ran")
+            t |> equal(sch.prefill_tokens, before, "the tick prefilled nothing for stream 2 ({sch.prefill_tokens - before} tokens)")
+            delete events
+            scheduler_step(m, sch, events)   // the owed chunk alone
+            t |> equal(sch.prefill_tokens - before, K, "the next tick prefilled one chunk of stream 2 ({sch.prefill_tokens - before} tokens)")
+            t |> equal(sch.decode_steps - steps, 1l, "and ran no decode step")
+            t |> success(empty(toks_of(events, 1l)), "so stream 1 emitted nothing on it")
+            delete events
+            scheduler_step(m, sch, events)   // decode again
+            t |> equal(long_length(toks_of(events, 1l)), 1l, "the tick after decodes stream 1 again")
+            t |> equal(sch.prefill_tokens - before, K, "and puts the next chunk off again")
+            var ticks = 0l
+            while (sch.prefill_tokens - before < long_length(prompt) && ticks < 64l) {   // the chunks and the decodes alternate until stream 2 is off its prompt
+                scheduler_step(m, sch, events)
+                ticks++
+            }
+            t |> success(ticks < 64l, "stream 2 left its prompt within the ticks ({ticks})")
+            let both = sch.decode_steps
+            scheduler_step(m, sch, events)
+            t |> equal(sch.decode_steps - both, 1l, "with no stream on its prompt a tick decodes - nothing is owed to the next one")
+            drain(m, sch, events)
+            t |> equal(finished_of(events, 1l).stream, 1l, "stream 1 ran to its end")
+            t |> equal(finished_of(events, 2l).stream, 2l, "stream 2 ran to its end")
+            delete events
+            delete sch
+            delete prompt
+            delete short
+            delete m
+        }
+    }
+}
+
+//! Admission beside a prefilling stream: nothing holds a request back while no checkpoint stop lies ahead of a prefilling
+//! stream (the wait for one is the Metal prefix-checkpoint cells'), the two prompts prefill as segments of the ticks'
+//! windows inside the quantum - the first stream's chunk whole, the second's rows as the quantum leaves room - and each
+//! stream reads its solo reference token for token.
+[test]
+def test_scheduler_admission_beside_prefill(t : T?) {
+    t |> run("a request is admitted beside a prefilling stream with no checkpoint ahead, and both read their solo references (needs SmolLM2-135M)") @(t : T?) {
+        if (model_missing(t)) {
+            return
+        }
+        with_dasllama_jobque() {
+            var m <- load_capped_cpu(128l)
+            let prev_fused = get_fused_decode()
+            set_fused_decode(false)
+            var prompt <- encode(m, "The quick brown fox jumps over the lazy dog while the little robot watches from a small hill near the old village bakery and counts every bird that crosses the evening sky", true, false)
+            var short <- encode(m, "Once upon a time", true, false)
+            let K = 8l
+            let np = long_length(prompt)
+            t |> success(np > 3l * K && long_length(short) <= K, "the long prompt spans chunks, the short one fits one ({np} and {length(short)} tokens)")
+            var none : array<int64>
+            let greedy = SamplingParams()
+            var refs <- [ <- ref_generate(m, prompt, greedy, 4l, none), <- ref_generate(m, short, greedy, 4l, none)]
+            var sch <- create_scheduler(m, 2l, 4l, K, [idle_chunk_tokens = 0l])
+            var events : array<SchedEvent>
+            t |> success(submit(m, sch, make_req(1l, prompt, greedy, 4l, none)), "the long prompt queued")
+            t |> success(submit(m, sch, make_req(2l, short, greedy, 4l, none)), "the short one queued behind it")
+            scheduler_step(m, sch, events)
+            t |> equal(n_active(sch), 2l, "the first tick admits both: the first stream has no checkpoint stop ahead")
+            t |> equal(n_queued(sch), 0l, "the queue is empty")
+            t |> equal(sch.prefill_evals, 1l, "the first tick ran one prefill call")
+            t |> equal(sch.prefill_tokens, K, "the quantum went to the first stream's chunk whole")
+            drain(m, sch, events)
+            t |> equal(finished_of(events, 1l).finish, "length", "stream 1 ran to its length")
+            t |> equal(finished_of(events, 2l).finish, "length", "stream 2 ran to its length")
+            t |> success(sch.prefill_evals <= (np + K - 1l) / K + 1l, "the second prompt rode the first's windows or one of its own ({sch.prefill_evals} calls for {np} + {length(short)} tokens at K={K})")
+            var g1 <- toks_of(events, 1l)
+            var g2 <- toks_of(events, 2l)
+            to_log(LOG_INFO, "beside prefill A: {g1} | solo A: {refs[0].toks}\n")
+            to_log(LOG_INFO, "beside prefill B: {g2} | solo B: {refs[1].toks}\n")
+            t |> success(ids_equal(g1, refs[0].toks), "stream 1 matches its solo reference")
+            t |> success(ids_equal(g2, refs[1].toks), "stream 2 matches its solo reference")
+            set_fused_decode(prev_fused)
+            delete g1
+            delete g2
+            delete refs
+            delete events
+            delete sch
+            delete prompt
+            delete short
+            delete m
+        }
+    }
+}
+
+var private g_probe_prefill_rows : array<int64>   //! the row counts a declining prefill override was offered, in order
+
+[unused_argument(t, s, start_pos)]
+def private probe_prefill_declines(t : Model; var s : Session; npos, start_pos : int64) : bool {
+    g_probe_prefill_rows |> push(npos)
+    return false
+}
+
+//! A one-token chunk beside a longer one keeps eval's dispatch - the decode step, which offers no prefill override its row -
+//! while the longer chunk is offered as a prefill; both chunks' logits are their own eval's, bit for bit.
+[test]
+def test_eval_segments_one_token_chunk(t : T?) {
+    t |> run("a one-token segment runs as eval does, the longer one as its own eval (needs SmolLM2-135M)") @(t : T?) {
+        if (model_missing(t)) {
+            return
+        }
+        with_dasllama_jobque() {
+            var m <- load_capped_cpu(128l)
+            var prompt <- encode(m, "The quick brown fox jumps over the lazy dog", true, false)
+            var one <- [prompt[1]]
+            var ra <- make_run_state(m.config)
+            eval_(m, ra, prompt)
+            var rb <- make_run_state(m.config)
+            eval_(m, rb, one)
+            let probe = "test-declining-prefill"
+            register_prefill_override(probe, @@probe_prefill_declines)
+            let prefill0 = active_prefill_override()
+            select_prefill_override(probe)
+            g_probe_prefill_rows |> clear()
+            var sa <- make_run_state(m.config)
+            var sb <- make_run_state(m.config)
+            var sess <- [unsafe(addr(sa)), unsafe(addr(sb))]
+            var toks : array<array<int64>>
+            toks |> resize(2)
+            toks[0] := prompt
+            toks[1] := one
+            eval_segments(m, sess, toks)
+            t |> equal(sa.n_past, long_length(prompt), "the longer segment advanced its session")
+            t |> equal(sb.n_past, 1l, "the one-token segment advanced its session")
+            t |> equal(mismatch_exact(sa.logits, ra.logits), 0, "the longer segment's logits are its own eval's, bit for bit")
+            t |> equal(mismatch_exact(sb.logits, rb.logits), 0, "the one-token segment's logits are the decode step's, bit for bit")
+            t |> equal(g_probe_prefill_rows, [long_length(prompt)], "the override was offered the longer chunk alone: the one-token chunk took the decode step ({g_probe_prefill_rows})")
+            var cb <- make_run_state(m.config)
+            forward_prefill(m, cb, one, 1l, 0l)
+            t |> equal(g_probe_prefill_rows, [long_length(prompt), 1l], "control: the same token through the prefill body is offered to the override ({g_probe_prefill_rows})")
+            select_prefill_override(prefill0)
+            sess |> clear()   //! borrowed pointers: the sessions are deleted below
+            delete toks
+            delete cb
+            delete sa
+            delete sb
+            delete ra
+            delete rb
+            delete one
+            delete prompt
             delete m
         }
     }

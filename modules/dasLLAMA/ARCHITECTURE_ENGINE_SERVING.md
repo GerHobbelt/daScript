@@ -7,11 +7,33 @@ anchor.
 
 - **`dasllama_scheduler.das`** - the continuous-batching scheduler, the serving layer over the
   facade (its one engine require is `dasllama/dasllama`). One synchronous thread: each
-  `scheduler_step` admits queued requests, runs one `eval_batch` decode step over every
+  `scheduler_step` reaps the streams that finished on an earlier tick (`reap_finished` - the
+  finished turn's close tokens eval, its snapshot and its donation run only once the caller has
+  drained the finished event, so they never sit between a reply's last token and its finish on the
+  wire; the reap runs ahead of admission, so the slot a finished stream frees goes to a queued
+  request on the same tick), admits queued requests while no admitted stream is prefilling with a
+  SHARED checkpoint stop still ahead of it - the opening's head, the system opening, a stable
+  opening that is no tail (a request admitted then would prefill the opening that stop is
+  about to leave for it; admitted after the stop it attaches the checkpoint, the opening two
+  requests of one minute share, instead of prefilling it again - and a prefilling stream past its
+  shared stops, with only its own conversation's stops ahead, or with none, holds nothing back,
+  since the newcomer's chunks ride the same windows; a
+  queued request holds no session - its KV memory exists from admission on, and in paged mode
+  admission attaches the longest prefix-cache hit, whose positions never prefill), runs one `eval_batch` decode step over every
   decoding stream (a self-speculative scheduler instead ticks every stream's round through
   `mtp_spec_eval_batch`, one joint verify where a driver seats one, and counts the tick as a
-  batched step only when every stream's rows rode it), then at most one prefill chunk FCFS - `chunk_tokens` while
-  a stream decodes, since the chunk is the stall every decoding stream waits out, and at least `idle_chunk_tokens`
+  batched step only when every stream's rows rode it), then - unless a stream is still on its prompt
+  and the decode phase emitted an event, a token or a finish, which ends the tick there (the caller
+  drains the event to the wire, and the chunk the tick owes runs first on the next tick, which
+  decodes nothing: a token a stream produced never waits out another stream's prefill window) - ONE
+  prefill call over every prefilling stream's next text chunk (`prefill_tick`: the segments of one
+  window through `eval_segments`, FCFS inside the quantum - the first stream's chunk whole, the next
+  streams' rows while the quantum leaves room - so two prompts' tails cost about one window where
+  the GPU serves segments (`ARCHITECTURE_GPU_PREFILL_WINDOW.md#prefill-segments`) and run one after
+  the other elsewhere; a stream with a media span ahead takes no segment, and when the first
+  prefilling stream is one, or the scheduler is device-home, the tick is that stream's own call,
+  `prefill_one_chunk`) - the quantum `chunk_tokens` while
+  a stream decodes, since the call is the stall every decoding stream waits out, and at least `idle_chunk_tokens`
   while none does, since a prefill window's cost is mostly fixed and nothing waits on it; `chunk_defaults` names
   both sizes per serving backend (the chunk 512 where a GPU prefills and 64 on the CPU, whose chunk costs its token count, so the stall follows it down; idle 512,
   2048 on Metal, where four windows in one call run within a few percent of the whole prompt's rate); paged serving donates finished streams'
@@ -42,9 +64,12 @@ anchor.
   taken back, and a stop string split across tokens still cuts. Results flow out as `SchedEvent`s - no HTTP here.
   `utils/dasllama-server` owns the writers; `tutorials/dasLLAMA/13_serving.das` is the
   teaching consumer; `tests/test_scheduler.das` gates it against `generate()` references.
-  The step clears its gather arrays (`batch_rows`, `batch_toks`, `batch_idx`) before it reaps
-  finished streams: `batch_rows` holds borrowed pointers into the sessions the reap deletes,
-  and a validating heap collect between steps walks every pointer the array still holds.
+  The step clears its gather arrays (`batch_rows`, `batch_toks`, `batch_idx`) at the end of its
+  decode step, before the tick's prefill chunk and before the next tick's reap: `batch_rows` holds
+  borrowed pointers into the sessions the reap deletes, and a validating heap collect between
+  steps walks every pointer the array still holds. `prefill_tick` clears `seg_rows` before it
+  returns for the same reason: it holds borrowed pointers into the streams' sessions, and
+  admission and the reap move the streams.
 
 ### The prefix cache's partial page {#prefix-tail-page}
 
@@ -65,6 +90,41 @@ page (`PrefixCache.roots`) - and copies the first page it shares the most leadin
 match is therefore the longest common prefix of the prompt and a cached history at any length - a
 request that repeats an earlier one's opening and changes a word reuses the rows before the word,
 under a page or past it.
+
+### The reasoning budget {#think-budget}
+
+A request's `thinking_budget` (`PendingReq.think_budget`, the server's field of that name; 0 = none)
+is the number of reasoning tokens a thinking reply may spend before the scheduler closes the span
+for it. The scheduler reads tokens, not text, so the span's bounds come with the request as token
+marks (`ThinkBudgetMarks`, `think_budget_marks_`): the token SEQUENCE a reply writes to open the
+span (the family's open marker encoded with its specials parsed - Qwen's `<think>` is one token,
+gemma-4's `<|channel>thought` the channel mark and a word, harmony's the channel mark and
+`analysis`, which the answer's `final` channel does not match), the one token the model writes to
+leave it (`close_tok`: the close special, harmony's `<|end|>`), the tokens the budget forces, and
+whether the generation prompt already opened it (Qwen3.5/3.6's opener ends inside the block;
+gemma-4's continuation after a tool result re-opens the channel). A stream matches the open
+sequence token by token (`think_budget_track`, `Stream.think_open_at`), counts every token it emits
+inside the span, leaves on `close_tok` - never on a token of the forced close, whose first token a
+symmetric family's reasoning writes freely - and, at the budget, queues the forced close as
+`Stream.forced`: the steps that follow emit it in the sample's place, the sample still drawn so a
+device pick landed for the step is consumed and the sampler's state advances as on every other
+step (`sample_advance`). The length cap drawing within the forced close's length forces it early,
+so the close lands inside `max_tokens`; a cap already shorter than the forced close keeps the
+model's own close marker alone, so the span still ends. The forced close is the family's own - a symmetric family's
+close special after the sentence the Qwen3 recipe inserts at a spent budget (a bare close
+mid-thought leaves the model reasoning on in its content and closing again at the end), gemma-4's
+`<channel|>`, harmony's `<|end|>` followed by the final channel's header, each followed by the
+template's blank line - so the server's reply-side splitter reads it as the model's and the answer
+begins as content. Once the forced close is out, the marks' `reopen` tokens arm the stream's
+instruct-mode marker guard (`Stream.nothink`, its content already seen): a span the model re-opens
+past the budget - gemma-4's channel markers, harmony's channel mark, a symmetric family's open
+special - ends the turn as a
+marker after content does in instruct mode, since a thought re-opened after the cut never reaches an
+answer. The marks are looked up by name, not through the tokenizer's special parse, which does not
+see an asymmetric bracket such as `<channel|>`. A stream with a forced close pending
+leaves the speculative round for a plain step, as a constrained stream does: the round's drafts
+would run past the close. A budget on a turn that does not think, or on a vocab without the
+markers, has empty marks and acts on nothing.
 
 ### The prefix cache on a recurrent model {#prefix-recurrent-checkpoints}
 

@@ -36,6 +36,8 @@ class UidGen : AstVisitor {
         uid++
     }
 
+    def override canVisitWithAliasSubexpression(_expr : ExprAssume?) : bool => false
+
     [unused_argument(expr)] def override preVisitFunction(expr : FunctionPtr) {
         uid = 0 |> uint64()
     }
@@ -113,6 +115,7 @@ class public UidNodes {
     id_map : table<void?, uint64>
     namesp : string
     @do_not_delete thisFunc : Function?
+    hints_only : bool   //! get_base and get_dll_fn_name_ptr return the raw hint alone - the cache key's view, which assigns no ids
 
     def UidNodes(prog : Program?; var tab : table<void?, uint64>) {
         namesp = prog.thisNamespace |> string()
@@ -122,6 +125,7 @@ class public UidNodes {
     def const get_namesp_prefix() => namesp
 
     def private get_base(ptr : void?; hint : string) {
+        return DllName(name = hint) if (hints_only)
         if (!(id_map |> key_exists(ptr))) {
             let who = thisFunc != null ? "{describe(thisFunc.at)}: {thisFunc.name}" : "a global initializer"
             panic("LLVM: {who} is outside the JIT function set - it fell back to the interpreter, " +
@@ -164,7 +168,7 @@ class public UidNodes {
 
     def get_tinfo(expr : ExprTypeInfo?) => get_base(expr, "tinfo_{expr.typeexpr.get_mnh}")
 
-    def get_ctor(expr : ExprMakeStruct?) => get_base(expr, "ctor_{expr.constructor}")
+    def get_ctor(expr : ExprMakeStruct?) => get_base(expr, "ctor_{get_mangled_name(expr.constructor)}")
 
     def get_call(expr : ExprCallFunc?) : DllName =>
         get_base(expr, "call_{get_mangled_name(expr.func)}")
@@ -180,7 +184,7 @@ class public UidNodes {
     }
 
     def const get_dll_fn_name_ptr(fn : Function?) : DllName =>
-        DllName("{get_namesp_prefix()}`{fn |> get_mangled_name()}")
+        hints_only ? DllName(name = fn |> get_mangled_name()) : DllName("{get_namesp_prefix()}`{fn |> get_mangled_name()}")
 
     def const get_dll_fn_name(fn : FunctionPtr) : DllName =>
         DllName("{get_namesp_prefix()}`{fn |> get_mangled_name()}")

@@ -96,11 +96,12 @@ IF ((NOT DAS_HV_INCLUDED) AND ((NOT ${DAS_HV_DISABLED}) OR (NOT DEFINED DAS_HV_D
 		URL https://github.com/ithewei/libhv/archive/303f50c7b23f250c5b620d92c04b41060e1701c2.tar.gz
 		URL_HASH SHA256=43f425dae61d060913c5ce280c9776dfb98c61bb965a38c5a38d4788a7295201
 		DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+		INACTIVITY_TIMEOUT 60
 		PATCH_COMMAND ${CMAKE_COMMAND} -DLIBHV_SRC_DIR=<SOURCE_DIR> -P ${DAS_HV_DIR}/patch_libhv.cmake
 		PREFIX ${CMAKE_CURRENT_BINARY_DIR}/libhv
 		CMAKE_ARGS ${HV_CMAKE_FLAGS}
 		BUILD_BYPRODUCTS ${HV_LIBRARIES}
-		BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --config $<CONFIG>
+		BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --config $<CONFIG> ${DAS_NESTED_BUILD_TOOL_ARGS}
 		INSTALL_COMMAND ${CMAKE_COMMAND} --install <BINARY_DIR> --config $<CONFIG> --prefix ${DAS_HV_DIR}/hv/$<CONFIG>
 	)
 	ExternalProject_Add_StepDependencies(LIBHV patch ${DAS_HV_DIR}/patch_libhv.cmake ${DAS_HV_DIR}/patch_libhv_limits.cmake ${DAS_HV_DIR}/patch_libhv_upgrade.cmake ${DAS_HV_DIR}/patch_libhv_tls.cmake ${DAS_HV_DIR}/patch_libhv_pipeline.cmake ${DAS_HV_DIR}/patch_libhv_logging.cmake ${DAS_HV_DIR}/patch_libhv_cookies.cmake ${DAS_HV_DIR}/patch_libhv_shutdown.cmake ${DAS_HV_DIR}/patch_libhv_date.cmake)
@@ -112,7 +113,6 @@ IF ((NOT DAS_HV_INCLUDED) AND ((NOT ${DAS_HV_DISABLED}) OR (NOT DEFINED DAS_HV_D
         DEPENDEES install
         COMMAND ${CMAKE_COMMAND} -E touch ${HV_PATCHED_PUBLIC_HEADERS}
         BYPRODUCTS ${HV_PATCHED_PUBLIC_HEADERS})
-    ExternalProject_Add_StepTargets(LIBHV public_headers)
 
 	# Copy cert files from downloaded libhv source (not stored in repo to avoid pushing private keys)
 	SET(LIBHV_SRC_DIR ${CMAKE_CURRENT_BINARY_DIR}/libhv/src/LIBHV)
@@ -146,7 +146,7 @@ IF ((NOT DAS_HV_INCLUDED) AND ((NOT ${DAS_HV_DISABLED}) OR (NOT DEFINED DAS_HV_D
         if(APPLE)
             target_link_libraries(${lib} PRIVATE "-framework Security" "-framework CoreFoundation")
         endif()
-		ADD_DEPENDENCIES(${lib} LIBHV LIBHV-public_headers)
+		ADD_DEPENDENCIES(${lib} LIBHV)
 		SETUP_CPP11(${lib})
 	ENDMACRO()
 	SETUP_HV(libDasModuleHV)

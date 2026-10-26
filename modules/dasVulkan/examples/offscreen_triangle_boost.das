@@ -4,7 +4,7 @@ options _comment_hygiene = true
 require vulkan
 require vulkan/vulkan_boost
 require triangle_example_shaders
-require daslib/fio
+require example_ppm
 require math
 
 let WIDTH = 256
@@ -23,20 +23,6 @@ def vcheck(what : string; ok : bool) : int {
     return ok ? 0 : 1
 }
 
-def write_ppm(path : string; pixels : array<uint8>; w, h : int) {
-    fopen(path, "wb") $(f) {
-        fprint(f, "P6\n{w} {h}\n255\n")
-        var rgb : array<uint8>
-        rgb |> resize(w * h * 3)
-        for (i in range(w * h)) {
-            rgb[i * 3] = pixels[i * 4]
-            rgb[i * 3 + 1] = pixels[i * 4 + 1]
-            rgb[i * 3 + 2] = pixels[i * 4 + 2]
-        }
-        fwrite(f, rgb)
-    }
-}
-
 [export]
 def main() : int {
     if (volkInitialize() != 0) {
@@ -53,34 +39,20 @@ def main() : int {
     let queue = get_device_queue(device, gfx, 0u)
 
     var inscope target <- build_offscreen_target(device, phys, WIDTH, HEIGHT, FORMAT)
-    var inscope render_pass <- create_render_pass_single_color(device, FORMAT)
-
-    var fbci = FramebufferCreateInfo(renderPass = weak_copy(render_pass),
-                                     pAttachments <- [weak_copy(target.view)],
-                                     width = uint(WIDTH), height = uint(HEIGHT), layers = 1u)
-    var inscope framebuffer <- create_framebuffer(device, fbci)
 
     // tri_vert_spv / tri_frag_spv: SPIR-V words emitted by dasSpirv from triangle_example_shaders.das
     var inscope vert <- create_shader_module(device, tri_vert_spv)
     var inscope frag <- create_shader_module(device, tri_frag_spv)
     var inscope layout <- create_pipeline_layout(device)
-    var inscope pipeline <- create_graphics_pipeline_simple(device, render_pass, layout, vert, frag, WIDTH, HEIGHT)
+    // the pipeline carries the color format it renders into; no render pass, no framebuffer
+    var inscope pipeline <- create_graphics_pipeline_simple(device, FORMAT, layout, vert, frag, WIDTH, HEIGHT)
 
-    let buf_size = uint64(WIDTH * HEIGHT * 4)
-    var inscope readback <- create_host_buffer(device, phys, buf_size)
     var inscope pool <- create_command_pool(device, command_pool_info(gfx))
 
-    run_cmd_sync(device, pool, queue) $(cmd) {
-        record_render_pass(cmd, render_pass, framebuffer, full_area(WIDTH, HEIGHT), clear_color(0.1f, 0.1f, 0.15f, 1.0f)) {
-            cmd_bind_pipeline(cmd, pipeline)
-            cmd_draw(cmd, 3u)
-        }
-        copy_image_to_buffer(cmd, target.image, readback, WIDTH, HEIGHT)
-    }
-
-    var pixels : array<uint8>
-    map_memory_to_array(device, readback.memory, buf_size) $(m) {
-        pixels := m
+    // one synchronous frame: the barriers around the rendering and the readback copy live in the helper
+    let pixels <- render_offscreen_rgba8(device, phys, queue, pool, target, WIDTH, HEIGHT, clear_color(0.1f, 0.1f, 0.15f, 1.0f)) $(cmd) {
+        cmd_bind_pipeline(cmd, pipeline)
+        cmd_draw(cmd, 3u)
     }
 
     write_ppm("triangle_boost.ppm", pixels, WIDTH, HEIGHT)
