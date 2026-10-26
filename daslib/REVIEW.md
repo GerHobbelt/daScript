@@ -1,7 +1,8 @@
 # daslib Code Review Checklist
 
-**Read `REVIEW_COMMON.md` (repo root) first — its contract binds this checklist.** Architecture doc:
+**Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture doc:
 `daslib/ARCHITECTURE.md`. Planned work: `daslib/followup_comment_sweep.md`.
+A diff touching the linq family - `linq*.das`, `sql_*.das` - applies `REVIEW_LINQ.md` too.
 
 **A lint report path (`perf_warning` / `style_warning` / `lint_error`) checks suppression BEFORE
 its dedup insert.** A nolint'd finding that takes the (rule, location) slot silences a
@@ -10,15 +11,15 @@ co-located sibling rule.
 **The rule code stays part of the dedup key.** A key without the code collides across rules.
 
 **PERF026-028 honor a `// nolint` at ANY frame of the reported chain.** The sink often
-bottoms out in daslib while the actionable line is an intermediate call site — narrowing the
+bottoms out in daslib while the actionable line is an intermediate call site - narrowing the
 check to the sink line is a defect.
 
 **Moving an `in_closure` / `in_deferred` guard inside a lint visitor method is a semantic
 change, never cleanup.** The guard's position encodes which rules are meaningful inside a
-lambda; the per-rule policy is in `ARCHITECTURE.md` § perf_lint.
+lambda; the per-rule policy is in `ARCHITECTURE.md` sec. perf_lint.
 
 **A lint warning anchors at the code its fix rewrites.** A remedy that deletes a statement
-reports the statement; a remedy that edits one variable's initializer reports the variable —
+reports the statement; a remedy that edits one variable's initializer reports the variable -
 an anchor chosen for implementation convenience instead is a defect.
 
 **Visitor state scoped to a construct is reset or restored on every exit path of that
@@ -30,14 +31,15 @@ sibling loop's exit path and unbalances its counter.
 **Per-function visitor state resets in `preVisitFunction`, ahead of any early return.**
 A latch that skips the template early-return poisons the next function.
 
-**A daslib predicate that replicates a C++ compiler decision changes in lockstep with its
-C++ side.** The pairs: `lint022_optimized` / `lint022_calls_may_be_inlined` ↔
-`Program::getOptimize` / `Program::patchInline`; `stale_scan_line` ↔
-`rtti_is_nolint_suppressed`; `is_inline_temp_name` ↔ `INLINE_TEMP_PREFIX`; the
-STYLE024/025 unsafe map ↔ infer's `unsafe_*` rules; `style036_inert_contract` ↔ infer's
-contract clearing. Nothing fails when one side moves alone.
+**A diff that makes a daslib predicate or emitted identifier depend on a C++-side
+definition records the pair in `ARCHITECTURE.md`, in its module's section, naming both
+sides.** Nothing catches it when one side later moves alone.
 
-**Weakening the nolint-window tests is a defect** — `tests/lint/test_nolint_suppression.das`
+**When a diff changes one side of a recorded daslib/C++ pair so the two no longer match,
+it changes the other side and updates the pair's `ARCHITECTURE.md` entry in the same
+diff.**
+
+**Weakening the nolint-window tests is a defect** - `tests/lint/test_nolint_suppression.das`
 pins that a string literal, a URL, and a mid-comment `nolint:` do not suppress while a
 first-token directive after `//` or `//!` does, and `tests/lint/test_stale_nolint.das` pins
 that a `lint-skip-file` past the header window is prose.
@@ -48,11 +50,11 @@ that a `lint-skip-file` past the header window is prose.
 **`options _enable_default_off_rules` skips BOTH the default seeding and the repo `off`
 directives.** Repo policy must not silence the rule a fixture exists to exercise.
 
-**Weakening `tests/lint/test_lint_config.das` is a defect** — it pins that each `[format]`
+**Weakening `tests/lint/test_lint_config.das` is a defect** - it pins that each `[format]`
 key resolves nearest-wins independently up to the `.git` root, so a nearer `.lint_config`
 declaring one key does not reset the other.
 
-**Weakening the kept-comment cases in `utils/mcp/test_tools.das` is a defect** — they pin
+**Weakening the kept-comment cases in `utils/mcp/test_tools.das` is a defect** - they pin
 the formatter's kept set.
 
 **A daslib module that emits a lint rule id joins `RULE_MODULES` in `utils/lint/REVIEW.das`
@@ -63,13 +65,13 @@ check never runs.
 `preVisitExprVar`.** The LHS's variable fires before the RHS is walked; an early record
 lets the RHS's own read clear the store it just recorded.
 
-**A rule identifying a callee by name matches the root generic, not the instance** —
+**A rule identifying a callee by name matches the root generic, not the instance** -
 instantiation mangles names and strips witness arguments.
 
-**A rule never fires inside the module whose idiom it advertises** — a rule advertising
+**A rule never fires inside the module whose idiom it advertises** - a rule advertising
 module M's idiom firing on M's own dispatch is a defect.
 
-**A collapse suggestion compiles and preserves semantics for the exact shape reported** —
+**A collapse suggestion compiles and preserves semantics for the exact shape reported** -
 gate on receiver type, arity, cloneability, and duplicate constant keys.
 
 **Exactly one sibling rule fires on a shape several collapse rules can match.** Overlaps
@@ -78,7 +80,7 @@ declarations over STYLE033, and STYLE033's chain-receiver check leaves a plain-v
 receiver to STYLE033's variable-form check, so the two never double-fire.
 
 **The lint message text is the rule-code transport: the code is everything before the
-FIRST colon.** Suppression, disable lists, and dedup all parse it from the message —
+FIRST colon.** Suppression, disable lists, and dedup all parse it from the message -
 rewording a message so the code is not the leading colon-delimited token makes the rule
 unsuppressable and self-colliding.
 
@@ -86,61 +88,100 @@ unsuppressable and self-colliding.
 the subtree it skips.** The walk pushes one frame per expression and pops it, so a skipped
 subtree unbalances the count; the balance panic in each entry point is the tripwire.
 
-**The arity caps mirror overload sets that live elsewhere** — `MAX_CONCAT_ARITY` ↔ linq's
-`concat` variadics, `MAX_VARIADIC_PUSH_ARITY` ↔ builtin `push_from`/`push_clone_from`;
+**The arity caps mirror overload sets that live elsewhere** - `MAX_CONCAT_ARITY` <-> linq's
+`concat` variadics, `MAX_VARIADIC_PUSH_ARITY` <-> builtin `push_from`/`push_clone_from`;
 growing either overload set without the cap is a silently missed finding, the reverse a
 suggestion that does not compile.
 
-**AOT emit is fail-closed: every entry point tests `macroException`/`failToCompile` BEFORE
-materializing output.** A codegen exception mid-visit leaves partial C++.
+**A diff that adds or changes an emit entry point - a function that runs the emit visitor
+and then returns or writes the generated C++ - keeps the error check ahead of that return
+or write.** The error check is the program's `macroException`/`failToCompile` state, or
+`log_aot_emit_errors` where the emit runs standalone; a codegen exception mid-visit
+leaves partial C++.
 
-**An unreachable emit state writes `#error` into the output, never `panic`** —
+**A visitor override in the emit visitor never gates on `macroException`/`failToCompile`.**
+The entry point owns that check; an override that returns early on the error state emits
+truncated C++ that the entry point still writes out as complete.
+
+**An unreachable emit state writes `#error` into the output, never `panic`** -
 `runMacroFunction` swallows a panic, so the emitter never reports through it.
 
-**`aotStructName` and the `VarInfo` emitter's inline `aotSuffixNameEx(info.name, "_S", ...)`
-build the same C++ identifier, and `buildStructEnumCollisions` is seeded before either
-emits.** An emit path that skips the seeding, or a suffix rule changed on one side, produces
-`offsetof`s naming a struct declared under a different identifier.
+**A diff that changes how a struct's C++ name is built changes every site that spells
+that name the same way.** The name is the module namespace (`aotModuleName`, or
+`aotModuleNameFromString` on the `VarInfo` path) plus the `_S` suffix; the sites that
+spell it are `aotStructName` and the `VarInfo` emitter's inline
+`aotSuffixNameEx(info.name, "_S", ...)`. One site changed alone writes `offsetof`s that
+name a struct declared under a different name.
 
-**`match_error` stores a BORROWED `LineInfo` pointer — pass a pattern node's location,
+**A diff that adds or changes a function that runs the emit visitor calls
+`buildStructEnumCollisions` before that visitor runs.** The duty sits on that function,
+not on each helper it calls to spell a name: the table decides when a name gets its
+collision suffix, and a run that skips it spells structs differently from the one that
+seeded it.
+
+**`match_error` stores a BORROWED `LineInfo` pointer - pass a pattern node's location,
 never a synthesized access expression's.** Access nodes are cloned per field inside a bare
 scope and die with it.
 
 **A macro that lowers lambdas reports through `macro_sticky_error`, never `macro_error`.**
 A later pass lowers the lambda to a plain function and clears non-sticky errors.
 
-**UTF-8 byte-class tables are indexed through `uint(uint8(ch))`** — `for (ch in string)`
+**UTF-8 byte-class tables are indexed through `uint(uint8(ch))`** - `for (ch in string)`
 yields a SIGNED byte under JIT; a raw index reads out of bounds for every byte >= 0x80.
 
-**Every flatten_opt rewrite arm ships a read-only residual predicate** — the oracle the
+**A parser result that borrows a view into a tree the parser allocated names the owning
+field and ships the scope-ender that frees it.** Nothing else can free it - the tree must
+outlive the caller's read, and daslang finalizes neither a raw pointer field nor a local
+container at scope exit - so a borrowed view with no named owner leaks the whole document
+per call, invisibly until the process is long-lived.
+
+**A conversion that throws on out-of-range input is a panic on untrusted bytes.** `int64` /
+`uint64` / `double` on a string throw; a lexer or decoder reachable from a file, a socket,
+or a model reaches for the non-throwing `to_*` twin and reports through its own error
+channel.
+
+**A parser never re-derives control flow from the text of its own diagnostics.** A message
+carries user data, so `starts_with` on an error string is an input-controlled branch; the
+token that caused the failure is what the decision reads.
+
+**Every flatten_opt rewrite arm ships a read-only residual predicate** - the oracle the
 residual visitors call to prove the pass complete.
 
 **A residual oracle mirrors its arm's gate exactly and never calls the transform.** A
 narrower oracle is a false pass, a wider one a false miss; calling the transform from an
-oracle aliases the live tree.
+oracle aliases the live tree. A gate the transform takes as a parameter is threaded into the
+oracle too - re-spelling its default as a constant makes every non-default run a false pass,
+and the tests that call the oracle pass the same value.
 
 **Every new fold/fuse arm declares its float class.** Inf/NaN/rounding/association changes
 are fast-math-only; bit-exact per-lane rewrites are never gated. An arm added without that
 decision silently changes output under `_flatten_no_fast_math`.
 
 **A fuse arm emits a call only after proving the target module can resolve it**, and the
-miss path falls back to the unfused shape — the pass must never turn a shader that compiled
+miss path falls back to the unfused shape - the pass must never turn a shader that compiled
 into an unresolvable call on a narrower backend.
 
-**`flatten_function` runs its passes in this order — dse → copy-prop → mask-const-prop →
-dse → ssa-rename — and a diff that reorders them is a defect.** Each pass produces the next
+**A new store spelling joins `MutCollect` in the same change.** CSE reads a name outside the
+mutable set as constant for the whole block, so an uncollected store is a silently shared
+subexpression.
+
+**A statement the lowering cannot predicate is refused, never dropped.** `lower_stmt`'s
+fall-through drop is licensed only because every call that survives lowering is pure.
+
+**`flatten_function` runs its passes in this order - dse -> copy-prop -> mask-const-prop ->
+dse -> ssa-rename - and a diff that reorders them is a defect.** Each pass produces the next
 one's input; a reorder leaves scaffolding in the generated `<name>_flat` twin, which must
 come out branchless and call-free.
 
-**`lift_expr` and the lowering it drives use plain recursion, never `make_visitor`** —
+**`lift_expr` and the lowering it drives use plain recursion, never `make_visitor`** -
 inlining recurses back through the pipeline, and a nested visitor traversal corrupts the
 visitor machinery.
 
 **A macro that splices the same subexpression more than once pre-binds it to a local ref
-first** — re-splicing re-evaluates a call once per splice; a lock/unlock pair then releases
+first** - re-splicing re-evaluates a call once per splice; a lock/unlock pair then releases
 a different temporary than it took.
 
-**Every `[sql_table]` helper pair registers its 2-arg form BEFORE the 1-arg form** —
+**Every `[sql_table]` helper pair registers its 2-arg form BEFORE the 1-arg form** -
 `find_struct_helper_fn` keeps the LAST match, and the finish pass rewrites the helper it
 returns; swapped, index DDL attaches to the wrong overload.
 
@@ -152,9 +193,9 @@ drift is silently wrong data, not an error.
 the same change.** The scanners match daslang source text; a missing spelling makes every
 enforcement test pass vacuously.
 
-**An `ast_verify` check names, in `ARCHITECTURE.md` § ast_verify, the C++ `::visit` site
+**An `ast_verify` check names, in `ARCHITECTURE.md` sec. ast_verify, the C++ `::visit` site
 that dereferences the slot unguarded.** A check with no such site invents an invariant the
-compiler does not hold, and the two passes disagree — a slot infer fills in is checkable
+compiler does not hold, and the two passes disagree - a slot infer fills in is checkable
 only post-infer.
 
 **An `ast_verify` check repairs the slot it reports, not only reports it.** A broken slot
@@ -164,22 +205,24 @@ left in place trips every later pass that walks the same node.
 (`erase(at, count)`): a signed sum wraps, the bounds test passes, and the walk leaves the
 array silently.
 
-**Macro-built AST carries no branch a macro-time value can decide** — nothing folds at
+**Macro-built AST carries no branch a macro-time value can decide** - nothing folds at
 macro-application time, so a generated `if ($v(flag))` keeps its dead arm and type-checks
 it. Branch in daslang and emit only the taken arm.
 
-**Every buffer-I/O overload returns before taking `addr(buf[0])` on an empty buffer** —
+**Every buffer-I/O overload returns before taking `addr(buf[0])` on an empty buffer** -
 the address is out of bounds and the call sits inside `unsafe`; a new overload without the
 guard passes every non-empty test.
 
-**`apply`'s inline path decides lvalue-ness by node KIND, never by a ref flag** — an rvalue
+**`apply`'s inline path decides lvalue-ness by node KIND, never by a ref flag** - an rvalue
 stays materialized, because a reference to a temporary dangles.
 
-**A `let` generated by `apply`'s inline path carries `alwaysSafe`** — that flag, not an
+**A `let` generated by `apply`'s inline path carries `alwaysSafe`** - that flag, not an
 `unsafe` block, licenses the variant access.
 
-**A swizzle rewrite reuses each source node once and clones every repeat** — the first
+**A swizzle rewrite reuses each source node once and clones every repeat** - the first
 appearance moves, a second output lane MUST clone, or one node gets two parents.
 
-**The RST label and topic key are computed twice — pre-infer and post-infer — and must
-agree byte-for-byte**, or the page prints a bare signature and the symbol re-stubs.
+**A diff that changes how the RST label or topic key is computed makes the same change in
+every place `rst.das` computes it - the stub pass (`generate_module_stubs`) and the
+documenting pass (`documents`) - keeping them byte-for-byte equal.** Diverged, the page
+prints a bare signature and the symbol re-stubs.

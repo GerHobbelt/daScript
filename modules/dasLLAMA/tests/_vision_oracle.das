@@ -1,6 +1,6 @@
 // Shared tier-1 vision oracle pieces for the gemma4uv / gemma4v encoder tests:
 //   - the per-token line parser for llama-mtmd-debug's MTMD_DEBUG_EMBEDDINGS block
-//   - the exact-value fixture generators (float-for-float from mtmd-debug.cpp)
+//   - the exact-value fixture generators (float-for-float against the llama-mtmd-debug dump)
 //   - the per-token compare, logging the maxdiff against an absolute + scale-relative bar
 
 options gen2
@@ -19,6 +19,9 @@ struct OracleEncode {
     npos : int
     means : array<float>
     v0 : array<float>; v1 : array<float>; v2 : array<float>; v3 : array<float>
+    // quarter-offset probes (newer dumps): row values at d/4, d/2, 3d/4 — on a deepstack-wide
+    // row they hit each concatenated slice's first element; empty on older dumps
+    q1 : array<float>; q2 : array<float>; q3 : array<float>
 }
 
 def private parse_field(part : string) : float {
@@ -54,13 +57,19 @@ def load_oracle_encode(path : string; var o : OracleEncode) : bool {
                 o.v2 |> push(parse_field(part))
             } elif (part |> starts_with("v3=")) {
                 o.v3 |> push(parse_field(part))
+            } elif (part |> starts_with("q1=")) {
+                o.q1 |> push(parse_field(part))
+            } elif (part |> starts_with("q2=")) {
+                o.q2 |> push(parse_field(part))
+            } elif (part |> starts_with("q3=")) {
+                o.q3 |> push(parse_field(part))
             }
         }
     }
     return o.npos > 0 && length(o.means) == o.npos
 }
 
-// the -p encode fixture generators, float-for-float from mtmd-debug.cpp (interleaved RGB rows)
+// the -p encode fixture generators, float-for-float against the llama-mtmd-debug dump (interleaved RGB rows)
 def make_planes(kind : string; w, h : int) : array<float> {
     var planes : array<float>
     planes |> resize(w * h * 3)
@@ -72,6 +81,23 @@ def make_planes(kind : string; w, h : int) : array<float> {
         for (y in range(h)) {
             for (x in range(w)) {
                 let v = ((x + y) % 2) != 0 ? 0.0 : 1.0
+                let p = (y * w + x) * 3
+                planes[p] = v
+                planes[p + 1] = v
+                planes[p + 2] = v
+            }
+        }
+    } elif (kind == "quad") {
+        // four exact-value quadrants (TL 0, TR 1, BL 0.25, BR 0.75): the window-attention
+        // discriminator — uniform/periodic fixtures make every window statistically identical
+        for (y in range(h)) {
+            for (x in range(w)) {
+                var v = 0.0
+                if (y < h / 2) {
+                    v = x < w / 2 ? 0.0 : 1.0
+                } else {
+                    v = x < w / 2 ? 0.25 : 0.75
+                }
                 let p = (y * w + x) * 3
                 planes[p] = v
                 planes[p + 1] = v
@@ -91,6 +117,34 @@ def make_planes(kind : string; w, h : int) : array<float> {
     return <- planes
 }
 
+
+// the compare's walk without the assert: the worst excess over the bar (<= 0 means every
+// token holds it) - the must-EXCEED half of a poison leg, where compare_encode would red
+def encode_excess(out : array<float>; d : int; o : OracleEncode; abs_tol, rel_tol : float) : float {
+    var max_excess = -1e30
+    for (p in range(o.npos)) {
+        var sq = 0.0
+        var mean = 0.0
+        for (i in range(d)) {
+            mean += out[p * d + i]
+            sq += out[p * d + i] * out[p * d + i]
+        }
+        mean /= float(d)
+        let bound = abs_tol + rel_tol * sqrt(sq / float(d))
+        var diffs <- [ abs(mean - o.means[p]), abs(out[p * d + 0] - o.v0[p]), abs(out[p * d + 1] - o.v1[p]),
+                       abs(out[p * d + 2] - o.v2[p]), abs(out[p * d + 3] - o.v3[p]) ]
+        if (length(o.q1) == o.npos) {
+            diffs |> push(abs(out[p * d + d / 4] - o.q1[p]))
+            diffs |> push(abs(out[p * d + d / 2] - o.q2[p]))
+            diffs |> push(abs(out[p * d + 3 * (d / 4)] - o.q3[p]))
+        }
+        for (diff in diffs) {
+            max_excess = max(max_excess, diff - bound)
+        }
+        delete diffs
+    }
+    return max_excess
+}
 
 // the per-token compare: mean and v0..v3 of every token against the dump, on the bar
 // abs_tol + rel_tol * token_rms (token_rms = sqrt(mean(out[p]^2)) per token); logs the maxdiff under tag
@@ -112,8 +166,14 @@ def compare_encode(t : T?; tag : string; out : array<float>; d : int; o : Oracle
         }
         mean /= float(d)
         let bound = abs_tol + rel_tol * sqrt(sq / float(d))
-        for (diff in [abs(mean - o.means[p]), abs(out[p * d + 0] - o.v0[p]), abs(out[p * d + 1] - o.v1[p]),
-                      abs(out[p * d + 2] - o.v2[p]), abs(out[p * d + 3] - o.v3[p])]) {
+        var diffs <- [ abs(mean - o.means[p]), abs(out[p * d + 0] - o.v0[p]), abs(out[p * d + 1] - o.v1[p]),
+                       abs(out[p * d + 2] - o.v2[p]), abs(out[p * d + 3] - o.v3[p]) ]
+        if (length(o.q1) == o.npos) {   // quarter probes (per-slice witnesses on deepstack rows)
+            diffs |> push(abs(out[p * d + d / 4] - o.q1[p]))
+            diffs |> push(abs(out[p * d + d / 2] - o.q2[p]))
+            diffs |> push(abs(out[p * d + 3 * (d / 4)] - o.q3[p]))
+        }
+        for (diff in diffs) {
             if (diff > maxdiff) {
                 maxdiff = diff
                 max_tok = p
@@ -122,6 +182,7 @@ def compare_encode(t : T?; tag : string; out : array<float>; d : int; o : Oracle
                 max_excess = diff - bound
             }
         }
+        delete diffs
     }
     to_log(LOG_INFO, "{tag}: {o.npos} tokens, maxdiff {maxdiff} at tok {max_tok} (bar {abs_tol} + {rel_tol} x rms)\n")
     if (nonfinite > 0) {

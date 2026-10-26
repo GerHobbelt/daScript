@@ -77,15 +77,15 @@ enum AttnPrefillMode {
 }
 
 //! Deltanet prefill algorithm (qwen35 hybrid). `recurrent` runs the per-token delta rule — the
-//! bit-exact reference the parity fixtures pin. `chunked` (default) is the 64-token blocked form
-//! (llama.cpp's default); NOT bit-identical (chunk-parallel FP reassociation), tolerance-validated.
+//! bit-exact reference the parity fixtures pin. `chunked` (default) is the 64-token blocked form -
+//! the fast rail; NOT bit-identical (chunk-parallel FP reassociation), tolerance-validated.
 enum DnPrefillMode {
     recurrent
     chunked
 }
 
-//! KV-cache storage codec, chosen per session at create time (llama.cpp -ctk/-ctv analog; K and V
-//! carry independent dtypes). f16 = half the KV bytes, near-lossless; f32 = bit-exact reference;
+//! KV-cache storage codec, chosen per session at create time; K and V carry independent
+//! dtypes. f16 = half the KV bytes, near-lossless; f32 = bit-exact reference;
 //! q8_0 = block codec (34B/32 elements, needs kv_dim/head_size % 32); tq4 = rotated 4-bit (18B/32, needs head_size a power of two).
 enum KVDtype {
     f32
@@ -171,6 +171,16 @@ struct Config {
     q_gated : bool = false             // attn_q is 2x-wide — per head [q | gate]; out ⊙ σ(gate) before wo
     recr_mask : uint64 = 0ul           // bit l: layer l is recurrent (deltanet) — no KV, no attn tensors
     rope_dim : int64 = 0               // partial rotary width (qwen35: 64 of 256); 0 = rope the full head
+    // qwen3vl IMROPE: half-dim sections (t,h,w,e) from {arch}.rope.dimension_sections; a sum > 0
+    // marks the mrope arch. Text rows carry equal positions in every section, which collapses to
+    // plain NEOX — only image-span rows build their tables through build_rope_tabs_imrope.
+    rope_sections : int4 = int4(0)
+    // qwen3vl's IMROPE interleaves the section walk (t,h,w repeating); qwen2vl's plain MROPE
+    // reads the sections as contiguous ranges — the arch configure picks the builder
+    mrope_interleaved : bool = false
+    // qwen3vl deepstack: image-quantum embd rows arrive (1+n)·dim wide; slice l+1 adds to the
+    // hidden state after layer l < n (text rows carry zero slices, so text serving is untouched)
+    n_deepstack : int64 = 0
     ssm_d_conv : int64 = 0             // deltanet conv kernel width (4)
     ssm_d_state : int64 = 0            // deltanet q/k/v head dim (128)
     ssm_n_group : int64 = 0            // deltanet k-head count (16)
@@ -199,9 +209,44 @@ typedef PrefillOverrideFn = function<(t : Model; var s : Session; npos : int64; 
 var private g_prefill_overrides : table<string; PrefillOverrideFn>
 var private g_prefill_override : PrefillOverrideFn
 var private g_prefill_override_name = ""
+var private g_prefill_split_span : table<string; bool>
+var private g_prefill_mrope_tables : table<string; bool>
+var private g_prefill_ds_adds : table<string; bool>
 
 def register_prefill_override(name : string; fn : PrefillOverrideFn) {
     g_prefill_overrides[name] = fn
+}
+
+//! Registered beside the override: `true` = this override cannot serve a fused mid-turn span
+//! (a per-query non-causal mask), so `eval_embd_span_` keeps the three-eval splice while it
+//! is active. Unregistered overrides — and the CPU layer loop — serve the fused mask.
+def register_prefill_override_split_span(name : string) {
+    g_prefill_split_span[name] = true
+}
+
+def active_prefill_splits_span : bool {
+    return g_prefill_split_span?[g_prefill_override_name] ?? false
+}
+
+//! Registered beside the override: `true` = this override ropes from the session's per-row
+//! cos/sin tables, so an mrope quantum's grid map reaches it through `prefill_rope_tables`.
+//! Unregistered overrides decline mrope quanta — scalar-position angles rope grid rows wrong.
+def register_prefill_override_mrope_tables(name : string) {
+    g_prefill_mrope_tables[name] = true
+}
+
+def active_prefill_serves_mrope : bool {
+    return g_prefill_mrope_tables?[g_prefill_override_name] ?? false
+}
+
+//! Registered beside the override: `true` = this override performs the deepstack per-layer
+//! slice adds (Session.ds_embd). Unregistered overrides decline ds quanta to the CPU loop.
+def register_prefill_override_ds_adds(name : string) {
+    g_prefill_ds_adds[name] = true
+}
+
+def active_prefill_serves_ds : bool {
+    return g_prefill_ds_adds?[g_prefill_override_name] ?? false
 }
 
 //! Activate a registered whole-prefill override by name ("" deactivates). false = unknown name.
@@ -301,7 +346,8 @@ typedef DecodeOverrideFn = function<(t : Model; var s : Session; token, pos : in
 //! apply unchanged; per call it impersonates the batch's cache geometry (dtypes + byte prefixes).
 struct BatchWorkspace {
     scr : Session             // *_b scratch, rope tables, ple scratch — no KV cache / sampler state
-    positions : array<int64>  // row i's absolute position (sessions[i].n_past at entry)
+    positions : array<int64>  // row i's absolute KV position (sessions[i].n_past at entry)
+    rope_positions : array<int64>   // row i's ROPE position (n_past + rope_pos_delta — mrope streams diverge)
     logits_b : array<float>   // B x vocab classifier output, scattered per session after softcap
     // row i's cache base pointers (into sessions[i]; valid per call). @do_not_delete is load-bearing:
     // delete of a plain array<T?> CASCADES to the pointees, which would free the sessions' cache blobs
@@ -716,12 +762,12 @@ struct Model {
     wblob : array<float>
     qblob : array<int8>
     qscales : array<float>
-    // wscale_f16 rail: the Q8 weight-scale plane as raw binary16 halfwords — llama.cpp byte
+    // wscale_f16 rail: the Q8 weight-scale plane as raw binary16 halfwords — upstream byte
     // parity (34 vs 36 B per 32 weights). Built by wscale_convert_f16 post-repack (qscales is
     // then freed); exactly one of qscales/qscales16 is populated for a q8 model.
     qscales16 : array<uint16>
     wscale_f16 : bool = false
-    // Metal-flavor blob rail (blob-only .dlim): q8 weights as 34-byte block_q8_0 blocks populated
+    // Metal-flavor blob rail (blob-only .dlim): q8 weights as 34-byte q8_0 blocks populated
     // INSTEAD of qblob + qscales/qscales16 (blob byte = (off/32)*34); k4s/k5s hold 16B compact
     // scale strips, k6s the GPU split form. CPU inference on a blob-only model PANICS.
     mblob : array<uint8>
@@ -863,7 +909,7 @@ struct Model {
     dn_dt_off : int64           // ssm_dt.bias: layers x dt_rank
     dn_a_off : int64            // ssm_a (= -exp(A_log), precomputed on disk): layers x dt_rank
     dn_norm_off : int64         // ssm_norm (gated out-norm weight, shared across heads): layers x d_state
-    // ssm_beta/ssm_alpha ride the DISK type like llama.cpp: quantized files matmul them q8
+    // ssm_beta/ssm_alpha ride the DISK type: quantized files matmul them q8
     // (dnbeta/dnalpha_offs above); F32 files (35B-A3B) keep them fp32 in fblob and matmul fp32
     dn_ba_f32 : bool = false
     dn_betaf_off : int64        // fblob: layers x (dim x dt_rank), valid when dn_ba_f32
@@ -1470,11 +1516,25 @@ def public weights_epoch() : int64 {
     return g_weights_epoch
 }
 
+// the push half of the contract: caches don't poll for staleness (a poll is a call every
+// consumer must remember), the bump invokes them — dasllama_metal_common subscribes its drop
+var private g_weights_epoch_listeners : array<function<void>>
+
+//! Subscribe a drop-everything reaction to weight-address recycling — for GPU caches keyed by
+//! HOST ADDRESS. Invoked synchronously by every ``bump_weights_epoch`` ([init]-time is the
+//! registration home; bumps only happen at load/map boundaries, never mid-step).
+def public register_weights_epoch_listener(f : function<void>) {
+    g_weights_epoch_listeners |> push(f)
+}
+
 //! The image loader's half of the same contract: mapping a prepared image lands planes at
 //! fresh (possibly recycled) addresses exactly like a gguf load does, so it must move the
 //! epoch too — dasllama_image calls this on every successful load_image.
 def public bump_weights_epoch() {
     g_weights_epoch++
+    for (f in g_weights_epoch_listeners) {
+        invoke(f)
+    }
 }
 //! Resident memory footprint of a loaded model, in bytes, broken down by region. aux_fp32 is the
 //! embedding + norms (always kept); weight_fp32 is the dense big weights (only in fp32 mode — a
@@ -1550,10 +1610,11 @@ struct Session {
     // same-geometry sessions (ABA) and Stream erase memmoves Sessions. 0 = never assigned.
     uid : uint64
     n_past : int64            // absolute position of the next token to eval (0 at session start); advanced by eval()
-    // batched-prefill mask override: 0 = causal; > 0 = every query of the CURRENT prefill call
-    // attends [the sliding-window floor, attn_uniform_end) — the non-causal image span (gemma vision). Set and
-    // cleared by forward_prefill_embd; read by prefill_attention and the GPU readiness guard.
+    // batched-prefill mask override: 0 = causal; > 0 = queries at [attn_uniform_lo, attn_uniform_end)
+    // attend [the sliding-window floor, attn_uniform_end) — the non-causal image span (gemma vision);
+    // queries outside stay causal. forward_prefill_embd sets/clears; prefill_attention + GPU guards read.
     attn_uniform_end : int64
+    attn_uniform_lo : int64   // meaningful only while attn_uniform_end > 0
     rng : int4                // sampling RNG state (seeded in make_run_state; reseed via set_seed)
     recent : array<int64>     // recently generated tokens, for the repetition penalty
     sample_scratch : array<float>  // vocab-sized scratch for top-k selection
@@ -1655,6 +1716,23 @@ struct Session {
     // θ=10k unscaled local vs θ=1M linear-scaled global); empty otherwise
     rope_cos_swa : array<float>
     rope_sin_swa : array<float>
+    // qwen3vl mrope (rope_sections): rope position = row index + rope_pos_delta — an image span
+    // advances the sequence position by max(grid nx, ny), not by its row count, so the delta goes
+    // negative after each image. Applies ONLY where rope angles are computed, never to KV indexing.
+    rope_pos_delta : int64
+    // transient, one prefill call: per-row (t,h,w,e) positions overriding start_pos+pi in the rope
+    // table build (the image-span quantum); empty = sequential positions
+    @scratch mrope_pos : array<int4>
+    // transient, one prefill call (qwen3vl deepstack): the wide image quantum's tail slices
+    // [npos × n_deepstack·dim] — slice l adds to x_b after layer l while ds_active
+    @scratch ds_embd : array<float>
+    ds_active : bool
+    // transient, one prefill call: a BORROWED view of the caller's wide quantum (row stride
+    // wide_stride, first row wide_soff) — a wide-capable override uploads it whole and
+    // extracts slices on the GPU; the CPU fallback splits it via ds_split_quantum
+    @do_not_delete wide_src : float const?   // a borrow, never owned
+    wide_stride : int64
+    wide_soff : int64
     // MoE scratch (sized in make_run_state when n_expert > 0; empty for dense arches)
     moe_logits : array<float>   // router logits, then probs (n_expert)
     moe_w : array<float>        // the selected top-k weights (n_expert_used)
@@ -1753,7 +1831,7 @@ struct Session {
     @scratch dn_cws : array<float>          // per-v-head chunk workspace slabs (dt_rank x dn_cws_head_size)
     @scratch dn_tail : array<float>         // GPU deltanet chain: last taps qkv rows back (conv-history store)
     // MTP/NextN self-spec state (empty unless config.n_layer_nextn > 0). mtp_h is the trunk's
-    // post-output-norm hidden of the LAST evaluated position (llama.cpp's t_h_nextn handoff);
+    // post-output-norm hidden of the LAST evaluated position (the MTP draft-head handoff);
     // mtp_h_pos1 is that position PLUS ONE (0 = cold, keeps Session zero-init-safe).
     mtp_h : array<float>           // h_nextn (dim)
     mtp_h0 : array<float>          // the verify batch's ROW-0 normed hidden (= h_pos). forward_prefill's
@@ -3364,7 +3442,7 @@ def dn_key_dim(c : Config) : int64 => c.ssm_n_group * c.ssm_d_state
 //! deltanet fused-projection / conv channel count: [q (key_dim) ; k (key_dim) ; v (d_inner)].
 def dn_conv_dim(c : Config) : int64 => 2l * dn_key_dim(c) + c.ssm_d_inner
 
-// Chunk length for the blocked (chunked) deltanet prefill — llama.cpp's CS for gated deltanet.
+// Chunk length (CS) for the blocked (chunked) gated-deltanet prefill.
 let DN_CHUNK = 64l
 
 // Per-v-head workspace floats for the chunked deltanet prefill: eight CS x d_state panels
@@ -3403,7 +3481,7 @@ def dn_flush_all(var s : Session) {
 //! (gemma-4 E2B: 6144 for layers 0-14, 12288 for 15-34).
 def layer_hidden(t : Model; l : int64) : int64 => (empty(t.ffn_w) ? t.config.hidden_dim : t.ffn_w[l])
 
-//! Layer `l`'s KV source (mirrors llama.cpp gemma4 reuse()): own-KV layers map to themselves; a
+//! Layer `l`'s KV source: own-KV layers map to themselves; a
 //! shared layer (l >= n_layer_kv_from_start) reuses the last own-KV layer of its class — sliding
 //! reads kv_from_start-2, global reads kv_from_start-1 (those two straddle the boundary by pattern).
 def layer_kv_source(c : Config; l : int64) : int64 {
@@ -3541,7 +3619,7 @@ def private dequant_embq_row(t : Model; off, n : int64; var dst : float?) {
 
 // Copy token `token`'s embedding row into dst — from fp32 fblob, or (cls_q8) dequanted from the
 // linear Q8 copy at emb_q8_off (embq when trimmed), or (cls_kq) from the K-quant plane at
-// wcls_off (embq/embs when trimmed). Rows are whole superblocks (a ggml K-quant invariant).
+// wcls_off (embq/embs when trimmed). Rows are whole superblocks (the K-quant row invariant).
 def embed_row(t : Model; token : int64; var dst : float?) {   // nolint:STYLE037,STYLE038 — a KqFmt ladder x trimmed/repacked; arms differ only in the plane pair and its strides
     let dim = t.config.dim
     if (t.cls_q8) {
@@ -3653,7 +3731,7 @@ def private mm_cls(var y : array<float>; t : Model; x : array<float>; var xq : a
         // K-quant classifier (tied plane copy or untied kq output.weight)
         mm_kq(y, t, cls_fmt, t.wcls_off, x, xq, xs, xbs, n, d)
     } else {
-        // untied — or the tied classifier's Q8 transcode (the exact quants llama.cpp matmuls)
+        // untied — or the tied classifier's Q8 transcode (the exact quants the reference matmuls)
         mm(y, t, t.wcls_off, x, xq, xs, n, d)
     }
 }
@@ -3729,7 +3807,7 @@ def private cls_softcap_chain(t : Model; var s : Session; cap : float) {
     }
 }
 
-//! One forward pass: token at position `pos` -> s.logits. Faithful port of llama2.c forward().
+//! One forward pass: token at position `pos` -> s.logits.
 [no_alloc, no_env, no_io]
 def forward(t : Model; var s : Session; token, pos : int64) {   // nolint:STYLE038 — one decode step; the phases share s and must stay in order
     let c = t.config
@@ -3754,13 +3832,14 @@ def forward(t : Model; var s : Session; token, pos : int64) {   // nolint:STYLE0
     // values, trig deduplicated). Dual-rope arches get the sliding class's row alongside.
     if (g_use_rope_table) {
         let ts_rope_build = prof_ticks()
-        // partial rotary (qwen35): the table spans rope_dim — frequencies run over the rotated span
-        build_rope_table(s.rope_cos, s.rope_sin, t, c.rope_freq_base, c.rope_freq_scale, pos, 1l,
+        // partial rotary (qwen35): the table spans rope_dim — frequencies run over the rotated span.
+        // rope_pos_delta: text after an image span ropes at grid-advanced positions (qwen3vl mrope)
+        build_rope_table(s.rope_cos, s.rope_sin, t, c.rope_freq_base, c.rope_freq_scale, pos + s.rope_pos_delta, 1l,
                          c.rope_dim > 0l ? c.rope_dim : c.head_size, true)
         if (has_dual_rope(c)) {
             let swa_hs = c.head_size_swa > 0l ? c.head_size_swa : c.head_size
             build_rope_table(s.rope_cos_swa, s.rope_sin_swa, t, c.rope_freq_base_swa, c.rope_freq_scale_swa,
-                             pos, 1l, swa_hs, !c.rope_ff_global_only)
+                             pos + s.rope_pos_delta, 1l, swa_hs, !c.rope_ff_global_only)
         }
         prof_add("rope_build", ts_rope_build)
     }
@@ -3792,7 +3871,7 @@ def forward(t : Model; var s : Session; token, pos : int64) {   // nolint:STYLE0
     let ts_final = prof_ticks()
     trace_tag(TRACE_TAG_CLS)
     rms_at(s.xb, t, t.rms_final_off, s.x, dim)
-    if (c.n_layer_nextn > 0l) {   // stash h_nextn (llama.cpp t_h_nextn) for the MTP draft head
+    if (c.n_layer_nextn > 0l) {   // stash h_nextn for the MTP draft head
         copy_floats(s.xb, 0l, s.mtp_h, 0l, dim)
         s.mtp_h_pos1 = pos + 1l
     }
@@ -3814,7 +3893,7 @@ def forward(t : Model; var s : Session; token, pos : int64) {   // nolint:STYLE0
 }
 
 //! One MTP/NextN draft step: from stashed trunk hidden `s.mtp_h` and `token`, produce draft logits
-//! in s.logits. `pos` is one BELOW llama.cpp's convention — rotary is position-delta-invariant, so
+//! in s.logits. `pos` is one BELOW the upstream convention — rotary is position-delta-invariant, so
 //! shifting every MTP row down by one is mathematically identical. Overwrites s.mtp_h with h_nextn.
 var private g_mtp_spec = false
 
@@ -3845,7 +3924,7 @@ def forward_mtp(t : Model; var s : Session; token, pos : int64; want_logits : bo
     let dim = c.dim
     assert(c.n_layer_nextn > 0l)
     kv_ensure(s, pos + 1l)
-    // eh_proj input: [enorm(embed(token)) ; hnorm(h)] — embedding first (llama.cpp concat order)
+    // eh_proj input: [enorm(embed(token)) ; hnorm(h)] — embedding first in the concat
     embed_row(t, token, unsafe(addr(s.x[0])))
     rms_at(s.xb, t, t.mtp_enorm_off, s.x, dim)
     copy_floats(s.xb, 0l, s.mtp_cat, 0l, dim)
@@ -4114,7 +4193,7 @@ def generate_mtp_greedy(t : Model; var s : Session; prompt : array<int64>; total
 // Measurement is UNCONDITIONAL and negligible vs the matmuls; reset() starts a window, report() dumps it.
 
 // Batch widths at or below this are speculative-verify shaped, so they follow the DECODE dispatch
-// policy, not the prefill work threshold — see prefill_attention (lcpp runs n=1..3, vLLM's GLM 1).
+// policy, not the prefill work threshold — see prefill_attention (upstream cuts over at n=1..3, GLM at 1).
 let ATTN_NARROW_NPOS = 8l
 
 var g_attn_par_threshold = 100_000l
@@ -4440,6 +4519,11 @@ def chatml_chat(var ct : ChatTemplate) {
     ct.think_mode = ThinkMode.symmetric   // reply-side: <think> ... </think>, thinking fine-tunes only
     ct.think_open = "<think>"
     ct.think_close = "</think>"
+    // qwen vision (<|vision_start|> ... embeddings ... <|vision_end|>). Declared on the
+    // SHARED ChatML shape like gemma3's on gemma_chat: a text-only vocab lacks the markers and
+    // the chat layer's image_vocab_ok gate refuses the pair there.
+    ct.image_pre.parts <- [chat_special("<|vision_start|>")]
+    ct.image_post.parts <- [chat_special("<|vision_end|>")]
     ct.stop <- ["<|im_end|>", "<|endoftext|>"]
 }
 
@@ -4450,7 +4534,7 @@ def gemma_chat(var ct : ChatTemplate) {
     ct.add_bos = true   // BOS = <bos>
     ct.user.parts <- [chat_special("<start_of_turn>"), chat_text("user\n"), chat_content(), chat_special("<end_of_turn>"), chat_text("\n")]
     ct.assistant_open.parts <- [chat_special("<start_of_turn>"), chat_text("model\n")]
-    // gemma3 vision (mtmd: <start_of_image> ... 256 embeddings ... <end_of_image>). Declared on
+    // gemma3 vision (<start_of_image> ... 256 embeddings ... <end_of_image>). Declared on
     // the SHARED shape because template detection cannot tell gemma3 from gemma2; a text-only
     // vocab lacks the markers and the chat layer's image_vocab_ok gate refuses the pair there.
     ct.image_pre.parts <- [chat_special("<start_of_image>")]
@@ -4485,7 +4569,8 @@ def attn_qkv_rope_prefix(t : Model; var s : Session; l : int64; npos : int64; st
     let n_heads = c.n_heads
     let n_kv_heads = layer_n_kv_heads(c, l)
     let qd = n_heads * head_size
-    let use_rope_tab = g_use_rope_table
+    // a pending mrope map means the body built its per-row table — the classic path has no form for it
+    let use_rope_tab = g_use_rope_table || !empty(s.mrope_pos)
     // sliding vs global attention per the arch's layer pattern (see attention_std_decode)
     let is_sliding = layer_is_sliding(c, l)
     // gemma-4 E-series shared-KV layer: project Q only, attend against the source layer's cache (loff aliases it)
@@ -4547,7 +4632,7 @@ def attn_qkv_rope_prefix(t : Model; var s : Session; l : int64; npos : int64; st
         let theta = swa_rope ? c.rope_freq_base_swa : c.rope_freq_base
         let fscale = swa_rope ? c.rope_freq_scale_swa : c.rope_freq_scale
         let use_ff = !(c.rope_ff_global_only && is_sliding)
-        rope_batch(s.q_b, s.k_b, t, theta, fscale, start_pos, npos, head_size, qd, rope_kv, use_ff, c.rope_dim)
+        rope_batch(s.q_b, s.k_b, t, theta, fscale, start_pos + s.rope_pos_delta, npos, head_size, qd, rope_kv, use_ff, c.rope_dim)
     }
     prof_add("rope", ts_rope)
 }
@@ -4751,36 +4836,100 @@ def forward_prefill_alloc(t : Model; var s : Session; npos, start_pos : int64) {
     }
 }
 
+// the deepstack add: x_b[r] += ds[r][slice l] for every row (dst dim-wide, ds n_ds·dim-wide)
+//! Split a borrowed wide quantum (`Session.wide_src`) into `x_b` + row-major `ds_embd` — the
+//! CPU-side half of the wide-borrow contract; a no-op with no borrow armed.
+def ds_split_quantum(t : Model; var s : Session; npos : int64) {
+    if (s.wide_src == null) {
+        return
+    }
+    let dim = t.config.dim
+    let n_ds = t.config.n_deepstack
+    let stride = s.wide_stride
+    if (long_length(s.ds_embd) < npos * n_ds * dim) {   // inline: PERF026 can't see @scratch through reserve_resize
+        s.ds_embd |> reserve(npos * n_ds * dim)
+        s.ds_embd |> resize(npos * n_ds * dim)
+    }
+    unsafe {
+        let src = s.wide_src
+        for (r in range64(npos)) {
+            let rb = (s.wide_soff + r) * stride
+            copy_floats(addr(s.x_b[r * dim]), src + rb, dim)
+            copy_floats(addr(s.ds_embd[r * n_ds * dim]), src + rb + dim, n_ds * dim)
+        }
+    }
+}
+
+def private ds_add_slice(var x_b : array<float>; ds : array<float>; l, n_ds, dim, npos : int64) {
+    unsafe {
+        var xp = addr(x_b[0])
+        let dp = addr<float const?>(ds[0])
+        for (r in range64(npos)) {
+            add_inplace(xp + r * dim, dp + r * n_ds * dim + l * dim, dim)
+        }
+    }
+}
+
+// the prefill rope tables: sequential from start_pos + rope_pos_delta, or the pending per-row mrope map (which forces the table path — no classic form)
+def private prefill_rope_tables(t : Model; var s : Session; npos, start_pos : int64) {
+    let c = t.config
+    let has_mrope = !empty(s.mrope_pos)
+    let ts_rope_build = prof_ticks()
+    if (has_mrope) {
+        if (has_dual_rope(c)) {
+            panic("forward_prefill_body: an mrope quantum on a dual-rope arch is not supported")
+        }
+        if (long_length(s.mrope_pos) != npos) {
+            panic("forward_prefill_body: mrope map carries {long_length(s.mrope_pos)} rows for an npos={npos} call")
+        }
+        if (c.mrope_interleaved) {
+            build_rope_tabs_imrope(s.rope_cos, s.rope_sin, c.rope_freq_base, c.rope_freq_scale, c.rope_mscale,
+                                   t.rope_freqs, true, s.mrope_pos, c.rope_sections, npos,
+                                   c.rope_dim > 0l ? c.rope_dim : c.head_size)
+        } else {   // qwen2vl: the sections read as contiguous ranges
+            build_rope_tabs_mrope(s.rope_cos, s.rope_sin, c.rope_freq_base, c.rope_freq_scale, c.rope_mscale,
+                                  t.rope_freqs, true, s.mrope_pos, c.rope_sections, npos,
+                                  c.rope_dim > 0l ? c.rope_dim : c.head_size)
+        }
+    } elif (g_use_rope_table) {
+        // the swa table uses the sliding class's head size; delta = mrope grid-advanced positions
+        build_rope_table(s.rope_cos, s.rope_sin, t, c.rope_freq_base, c.rope_freq_scale,
+                         start_pos + s.rope_pos_delta, npos,
+                         c.rope_dim > 0l ? c.rope_dim : c.head_size, true)
+        if (has_dual_rope(c)) {
+            let swa_hs = c.head_size_swa > 0l ? c.head_size_swa : c.head_size
+            build_rope_table(s.rope_cos_swa, s.rope_sin_swa, t, c.rope_freq_base_swa, c.rope_freq_scale_swa,
+                             start_pos + s.rope_pos_delta, npos, swa_hs, !c.rope_ff_global_only)
+        }
+    }
+    prof_add("rope_build", ts_rope_build)   // one-time cos/sin table build (separate bucket)
+}
+
 // the shared prefill core: rope table + layer stack + final norm/classifier, over a pre-filled
 // s.x_b residual stream (token or embedding sourced)
 def forward_prefill_body(t : Model; var s : Session; npos, start_pos : int64; skip_logits : bool = false) {
     let c = t.config
     let dim = c.dim
+    prefill_rope_tables(t, s, npos, start_pos)
 
-    // one npos x head_size/2 cos/sin table replaces per-head/per-layer pow/cos/sin recomputation
-    let use_rope_tab = g_use_rope_table
-    let ts_rope_build = prof_ticks()
-    if (use_rope_tab) {
-        // swa table uses the sliding class's head size and drops factors on p-RoPE arches (gemma4)
-        build_rope_table(s.rope_cos, s.rope_sin, t, c.rope_freq_base, c.rope_freq_scale, start_pos, npos,
-                         c.rope_dim > 0l ? c.rope_dim : c.head_size, true)
-        if (has_dual_rope(c)) {
-            let swa_hs = c.head_size_swa > 0l ? c.head_size_swa : c.head_size
-            build_rope_table(s.rope_cos_swa, s.rope_sin_swa, t, c.rope_freq_base_swa, c.rope_freq_scale_swa,
-                             start_pos, npos, swa_hs, !c.rope_ff_global_only)
-        }
-    }
-    prof_add("rope_build", ts_rope_build)   // one-time cos/sin table build (separate bucket)
-
-    // an active whole-prefill override may claim the entire stack (false = decline, fall back to
-    // the CPU loop). Contract: a claiming override must honor s.attn_uniform_end — metal serves
-    // the span through AttnArgs.uend; vulkan declines it.
+    // an active whole-prefill override may claim the entire stack (false = decline, fall back
+    // to the CPU loop); a claimer must honor s.attn_uniform_end (metal: AttnArgs.uend). An
+    // mrope quantum serves only on a per-row-table roper (metal); others decline it loudly.
     var stack_done = false
     g_prefill_logits_done = false
-    if (!empty(g_prefill_override_name)) {
+    if (!empty(g_prefill_override_name) && !empty(s.mrope_pos) && !active_prefill_serves_mrope()) {
+        to_log(LOG_INFO, "dasLLAMA: mrope image quantum ({npos} rows) declined to the CPU prefill loop - the `{g_prefill_override_name}` override does not rope from per-row tables\n")   // nolint:PERF026,PERF028 — once per image quantum, never per token
+    } elif (!empty(g_prefill_override_name) && s.ds_active && !active_prefill_serves_ds()) {
+        to_log(LOG_INFO, "dasLLAMA: deepstack image quantum ({npos} rows) declined to the CPU prefill loop - the `{g_prefill_override_name}` override has no per-layer slice-add arm\n")   // nolint:PERF026,PERF028 — once per image quantum, never per token
+    } elif (!empty(g_prefill_override_name)) {
         stack_done = invoke(g_prefill_override, t, s, npos, start_pos)
     }
     if (!stack_done) {
+        if (s.ds_active && s.wide_src != null) {   // the wide borrow was for an override that declined
+            let ts_split = prof_ticks()
+            ds_split_quantum(t, s, npos)
+            prof_add("embed", ts_split)
+        }
         blob_only_panic(t, "prefill stack")
         // Metal-capable build about to chew a real prompt on the CPU stack — the silent profiling-time sink, not a serving path; fail loud unless CPU intent was declared.
         if (npos > CPU_PREFILL_PANIC_NPOS && has_prefill_override("metal") && !cpu_prefill_allowed()) {
@@ -4796,6 +4945,9 @@ def forward_prefill_body(t : Model; var s : Session; npos, start_pos : int64; sk
             let ts_blk_ffn = prof_ticks()
             t.blocks.ffn_prefill(t, s, l, npos)
             prof_add("blk_ffn", ts_blk_ffn)
+            if (s.ds_active && l < c.n_deepstack) {   // qwen3vl deepstack: slice l adds to every row (text slices are zero)
+                ds_add_slice(s.x_b, s.ds_embd, l, c.n_deepstack, dim, npos)
+            }
         }
     }
 

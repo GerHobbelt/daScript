@@ -20,11 +20,10 @@ require strudel/strudel_player
 require daslib/strings_boost
 require live_stub   // playground shim: replaces the live/* + live_host stack (window, clock, no-op [live_command])
 
-// Music is OFF on the web build: the game's strudel music uses the THREADED
-// player (strudel_init/strudel_play), which needs the jobque worker that wasm
-// stubs out. SFX (play_sound_from_pcm) is single-threaded and stays on. Flip to
-// true once the music is ported to main-thread strudel (strudel_tick).
-let MUSIC_ENABLED = false
+// Music uses the THREADED strudel player (strudel_init/strudel_play). The playground
+// interpreter shares the renderer's runtime and cannot host that worker safely; only
+// standalone builds may enable it, and only with a threaded audio backend. SFX stay on.
+var music_enabled = false
 
 // --- Constants ---
 
@@ -271,7 +270,7 @@ def start_gameover_music() {
 
 def update_music() {
     // music off on the web build (threaded strudel)
-    return if (!MUSIC_ENABLED || game_state == prev_music_state)
+    return if (!music_enabled || game_state == prev_music_state)
     let FADE_OUT = 0.8
     let FADE_IN = 0.5
     // Pause: fade down existing tracks, keep them alive
@@ -1320,7 +1319,8 @@ def init() {
         audio_initialized = true
         init_audio_samples()
     }
-    if (MUSIC_ENABLED && !music_initialized) {
+    music_enabled = is_standalone_exe() && !audio_is_single_threaded()
+    if (music_enabled && !music_initialized) {
         strudel_init(@@strudel_music_main)
         strudel_set_volume(0.4, 0.0)
         music_initialized = true
@@ -1488,7 +1488,7 @@ def update() {  // nolint:STYLE037,STYLE038 -- game frame: input, sim, and rende
 [export]
 def shutdown() {
     print("Shutting down...\n")
-    if (MUSIC_ENABLED) {
+    if (music_enabled) {
         strudel_shutdown()
     }
     audio_system_finalize(asch.command, asch.next_sid)

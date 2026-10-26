@@ -1,13 +1,14 @@
 {
   "hooks": {
-    "PostToolUse": [
+    "PreToolUse": [
       {
-        "matcher": "Edit|Write",
+        "matcher": "Monitor|Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "python .claude/hooks/comment_guard.py",
-            "timeout": 30
+            "command": "jq -c -f \".claude/hooks/monitor_guard.jq\"",
+            "timeout": 15,
+            "statusMessage": "PR-watch guard: pr-babysit is the tool"
           }
         ]
       }

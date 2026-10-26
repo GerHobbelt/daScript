@@ -57,9 +57,17 @@ def private word_in_any(texts : array<string>; name : string) : bool {
     return false
 }
 
-def private read_matching(folder : string; prefix : string; suffix : string; var out : array<string>) {
+def private read_das_stripped(folder : string; var out : array<string>) {
     dir(folder) $(name) {
-        if (name |> starts_with(prefix) && name |> ends_with(suffix)) {
+        if (name |> ends_with(".das")) {
+            out |> push(strip_line_comments(fread("{folder}/{name}")))
+        }
+    }
+}
+
+def private read_rst(folder : string; prefix : string; var out : array<string>) {
+    dir(folder) $(name) {
+        if (name |> starts_with(prefix) && name |> ends_with(".rst")) {
             out |> push(fread("{folder}/{name}"))
         }
     }
@@ -89,6 +97,96 @@ def private check_tutorial_floor(tut_texts, rst_texts : array<string>) {
     }
 }
 
+let private AUDIO_CARRIER = "modules/dasLLAMA/dasllama/dasllama_audio_embedder.das"
+let private VISION_CARRIER = "modules/dasLLAMA/dasllama/dasllama_vision_embedder.das"
+
+// The licensed family namers per modality - ARCHITECTURE.md §1 ledgers each with its reason.
+var private AUDIO_SEAM_EXEMPT <- {
+    "modules/dasLLAMA/dasllama/dasllama_asr.das",
+    "modules/dasLLAMA/dasllama/dasllama_metal_tower.das",
+    "modules/dasLLAMA/dasllama/dasllama_metal_asr_dec.das",
+    "modules/dasLLAMA/benchmarks/asr/asr_bench.das",
+    "utils/dasllama-convert/main.das"
+}
+
+var private VISION_SEAM_EXEMPT <- {
+    "modules/dasLLAMA/dasllama/dasllama_metal_tower.das"
+}
+
+def private carried_families(carrier, kind_enum : string) : array<string> {
+    var fams : array<string>
+    var in_kind = false
+    for (line in split(fread(carrier), "\n")) {
+        if (starts_with(line, "enum {kind_enum}")) {
+            in_kind = true
+        } elif (in_kind && starts_with(line, "}")) {
+            break
+        } elif (in_kind) {
+            let name = ident_prefix(slice(line, 4))
+            if (!empty(name) && name != "none") {
+                fams |> push("dasllama_{name}")
+            }
+        }
+    }
+    return <- fams
+}
+
+def private family_owned_names(fam : string; fam_path : string; var out : array<string>) {
+    let prefix = slice(fam, length("dasllama_"))
+    for (line in split(fread(fam_path), "\n")) {
+        if (starts_with(line, "struct ") && !starts_with(line, "struct private ")) {
+            out |> push(ident_prefix(slice(line, 7)))
+        } elif (starts_with(line, "typedef ") && !starts_with(line, "typedef private ")) {
+            out |> push(ident_prefix(slice(line, 8)))
+        } elif (starts_with(line, "def ") && !starts_with(line, "def private ") && !starts_with(line, "def operator")) {
+            let name = ident_prefix(slice(line, 4))
+            // not a prefix test - the family word sits mid-identifier (stage_gemma4uv_embedder, set_gemma4v_q8)
+            if (find(name, prefix) >= 0) {
+                out |> push(name)
+            }
+        }
+    }
+}
+
+def private collect_das_files(folder : string; var out : array<string>) {
+    dir(folder) $(fname) {
+        return if (fname == "." || fname == "..")
+        let p = "{folder}/{fname}"
+        let st = stat(p)
+        if (st.is_valid && st.is_dir) {
+            collect_das_files(p, out)
+        } elif (ends_with(fname, ".das")) {
+            out |> push(p)
+        }
+    }
+}
+
+def private check_family_seams(carrier, kind_enum : string; exempt : table<string>; route_hint : string) {
+    for (fam in carried_families(carrier, kind_enum)) {
+        let fam_path = "modules/dasLLAMA/dasllama/{fam}.das"
+        if (!fexist(fam_path)) {
+            gate_finding(carrier, "{kind_enum} arm {fam} has no {fam_path} - the carrier names a family the module does not carry, and its seams would go unpoliced")
+            continue
+        }
+        var inscope names : array<string>
+        family_owned_names(fam, fam_path, names)
+        var inscope files : array<string>
+        for (folder in ["modules/dasLLAMA/dasllama", "modules/dasLLAMA/benchmarks", "modules/dasLLAMA/performance",
+                        "modules/dasLLAMA/harness", "utils/dasllama-server", "utils/dasllama-convert", "tutorials/dasLLAMA"]) {
+            collect_das_files(folder, files)
+        }
+        for (p in files) {
+            continue if (p == fam_path || p == carrier || key_exists(exempt, p))
+            let text = strip_line_comments(fread(p))
+            for (n in names) {
+                if (contains_word(text, n)) {
+                    gate_finding(p, "names {n}, which the {fam} family owns - the carrier is the one seam type; route through it ({route_hint})")
+                }
+            }
+        }
+    }
+}
+
 [export]
 def main() : int {
     if (!fexist("modules/dasLLAMA/REVIEW.das") || !fexist(FACADE)) {
@@ -96,9 +194,14 @@ def main() : int {
         return 2
     }
     var inscope tut_texts : array<string>
-    read_matching(TUTORIAL_DIR, "", ".das", tut_texts)
+    read_das_stripped(TUTORIAL_DIR, tut_texts)
     var inscope rst_texts : array<string>
-    read_matching(RST_DIR, "dasLLAMA_", ".rst", rst_texts)
+    read_rst(RST_DIR, "dasLLAMA_", rst_texts)
     check_tutorial_floor(tut_texts, rst_texts)
+    gate_descriptor_census("modules/dasLLAMA/.das_module", ["modules/dasLLAMA/dasllama"])
+    check_family_seams(AUDIO_CARRIER, "AudioKind", AUDIO_SEAM_EXEMPT,
+        "load_audio_embedder / encode_audio / audio_probe_proj_dim")
+    check_family_seams(VISION_CARRIER, "VisionKind", VISION_SEAM_EXEMPT,
+        "load_vision_embedder / encode_image / vision_proj_dim")
     return gate_verdict("dasllama")
 }

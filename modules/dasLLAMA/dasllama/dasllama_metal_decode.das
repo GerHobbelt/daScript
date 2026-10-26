@@ -650,7 +650,7 @@ def private encode_layer(t : Model; var r : StepRes; enc : MetalComputeEncoder?;
             if (fused_qkv && t.wv_offs[l] >= 0l) {
                 // one dispatch over all three segments — the kernel binds each tensor's blob slice separately (kind-major layout keeps q/k/v apart)
                 let bwq_ = blob_of(g_dev, t, t.wq_offs[l])
-                var fka = Q8QkvRsArgs(ndim = r.k_dim, ddim = r.k_qkvd, qd = r.k_qd, kvd = r.k_kvd,
+                var fka = Q8QkvRsArgs(ndim = r.k_dim, qd = r.k_qd, kvd = r.k_kvd,
                     hs = r.k_hs, neox = r.k_neox, has_bias = r.k_hasb)
                 enc_gemv_qkv_rs(enc, f16v, bwq_.buf, bwq_.boff,
                     uint64((t.wk_offs[l] / 32l) * 34l), uint64((t.wv_offs[l] / 32l) * 34l),
@@ -1097,7 +1097,7 @@ def private finish_draft_step(t : Model; var s : Session; r : StepRes; seam : bo
 def metal_mtp_draft_forward(t : Model; var s : Session; token, pos : int64; seam : bool = false) : bool {
     let c = t.config
     if (g_dev == null || !t.metal_blob || c.n_layer_nextn <= 0l || pos < 1l ||
-            weight_caches_stale() || !key_exists(g_mirrors, s.uid)) {
+            !key_exists(g_mirrors, s.uid)) {
         return false
     }
     finish_pending_step()
@@ -1923,13 +1923,13 @@ def private pre_encode_next(t : Model; s : Session; npos : int64; var prev_blog 
         // a spec step is IN FLIGHT after forward() returns — must not touch session memory (staging only; acceptance lands it via finish_step)
         r.bnc = null
         r.btok = pool_acquire(g_pool, g_dev, 64ul)
-        build_decode_rope_row(t, npos, g_rope_cos_next, g_rope_sin_next)
+        build_decode_rope_row(t, npos + s.rope_pos_delta, g_rope_cos_next, g_rope_sin_next)   // the delta keeps this bit-identical to forward()'s row for post-image mrope sessions
         unsafe {
             memcpy(metal_buffer_contents(r.bcos), addr < void? >(g_rope_cos_next[0]), r.bytes_tab)
             memcpy(metal_buffer_contents(r.bsin), addr < void? >(g_rope_sin_next[0]), r.bytes_tab)
         }
         if (r.bcos_swa != null) {
-            build_decode_rope_row_swa(t, npos, g_rope_cos_next_swa, g_rope_sin_next_swa)
+            build_decode_rope_row_swa(t, npos + s.rope_pos_delta, g_rope_cos_next_swa, g_rope_sin_next_swa)
             unsafe {
                 memcpy(metal_buffer_contents(r.bcos_swa), addr < void? >(g_rope_cos_next_swa[0]), r.bytes_tab_sw)
                 memcpy(metal_buffer_contents(r.bsin_swa), addr < void? >(g_rope_sin_next_swa[0]), r.bytes_tab_sw)
@@ -1983,10 +1983,6 @@ def metal_decode_forward(t : Model; var s : Session; token, pos : int64) : bool 
     // mixed batch/single schedules: a pipelined batch step may still own this session's KV row
     // and logits — land it before reading anything session-side (no-op when nothing pends)
     finish_pending_step()
-    if (weight_caches_stale()) {   // a model (re)load may have recycled cached weight addresses
-        discard_pre()
-        weight_caches_flush_on_reload()
-    }
     g_lp_err = false
     var why = decode_decline(t, s, pos)
     if (why == MetalDecodeDecline.none && !metal_decode_init()) {
@@ -2001,6 +1997,7 @@ def metal_decode_forward(t : Model; var s : Session; token, pos : int64) : bool 
         }
         return false
     }
+    residency_flush()   // pin/commit before the step's submission (the post-CPU-window slack)
     if (!(g_pre.valid && g_pre.uid == s.uid && g_pre.pos == pos &&
             g_pre.kdt == s.kv_dtype_k && g_pre.s16 == t.wscale_f16 &&
             g_pre.arena_epoch == g_arena_epoch)) {
@@ -2055,7 +2052,7 @@ def metal_decode_forward(t : Model; var s : Session; token, pos : int64) : bool 
 // B ~ 5 on every decode site (P1a lab — all sites are big shapes: the QKV concat, wo, w1/w3, w2).
 // DASLLAMA_METAL_BATCH_GEMM_MIN overrides for A/B.
 var private g_bgemm_min = -1l
-// the step splits into DASLLAMA_METAL_BATCH_NCB command buffers (llama.cpp's n_cb shape): the
+// the step splits into DASLLAMA_METAL_BATCH_NCB command buffers: the
 // ~3.2ms/step scheduling span pipelines behind cb k's execution instead of idling as one big cb;
 // queue order serializes the pieces, every encode is token-independent. 1 = the single-cb A/B rail.
 var private g_bncb = -1l
@@ -2072,7 +2069,7 @@ var private g_bconcurrent = true
 // Default ON; =0 pins the unfused triple (the A/B rail).
 var private g_bfuse = true
 
-// the mul_mv-shape GEMV (MetalQ8MvB2/B4 — the de-verbatim'd Part-3 winner, in-graph == the lcpp
+// the mul_mv-shape GEMV (MetalQ8MvB2/B4 — the Part-3 winner, in-graph == the upstream
 // reference) at every fixed-B site instead of the x-staged forms (which measured -10.5% in-graph:
 // the walkthrough lab win was SLC-inflated). DASLLAMA_METAL_BATCH_MV=0 = the x-staged A/B rail.
 var private g_bmv = true
@@ -2170,10 +2167,6 @@ def private batch_decode_decline(t : Model; ws : BatchWorkspace; sessions : arra
 //! ws.scr.x_b holds the final residuals; false = declined, CPU loop recomputes from clean state.
 [hot_path]
 def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions : array<Session?>; nrows : int64) : bool {   // nolint:STYLE037,STYLE038 — the batch step driver; encode/commit/stash share the whole step's state
-    if (weight_caches_stale()) {   // a model (re)load may have recycled cached weight addresses
-        discard_pre()
-        weight_caches_flush_on_reload()
-    }
     var why = batch_decode_decline(t, ws, sessions, nrows)
     if (why == MetalDecodeDecline.none && !metal_decode_init()) {
         why = MetalDecodeDecline.device
@@ -2188,6 +2181,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
         }
         return false
     }
+    residency_flush()   // pin/commit before the step's submission (the post-CPU-window slack)
     // a parked single-stream pre-step may reference a batch row's mirror slice — retire it first
     discard_pre()
     // encode-ahead readiness: with a step in flight, mirror_prepare must stay on its fast path
@@ -3174,6 +3168,7 @@ def dasllama_metal_decode_register() {
     // shapes decline per call
     register_decode_override("metal", @@metal_decode_forward)
     register_batch_decode_override("metal", @@metal_batch_decode_forward)
+    register_reload_prep(@@discard_pre)   // a reload orphans the speculative pre-step — retire it before the regions drop
     register_mtp_spec_override("metal", @@metal_mtp_spec_eval)
     register_mtp_seam_override("metal", @@metal_mtp_seam_row)
     g_env_logits = g_env_metal.logits

@@ -25,11 +25,11 @@ let MODEL_PATH = path_join(models_dir(), "SmolLM2-135M-Instruct-Q8_0.gguf")
 
 def private model_missing(t : T?) : bool {
     if (!jit_enabled()) {
-        t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+        t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
         return true
     }
     if (!stat(MODEL_PATH).is_valid) {
-        t |> success(true, "skipped: {MODEL_PATH} not present")
+        t |> skip("{MODEL_PATH} not present")
         return true
     }
     return false
@@ -511,11 +511,11 @@ let MTP_MODEL_PATH = path_join(models_dir(), "Qwen3.5-0.8B-MTP-Q8_0.gguf")
 def test_scheduler_mtp(t : T?) {
     t |> run("scheduler mtp: self-spec greedy stream == plain scheduler, chunked prefill + paged (needs Qwen3.5-0.8B-MTP)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         if (!stat(MTP_MODEL_PATH).is_valid) {
-            t |> success(true, "skipped: {MTP_MODEL_PATH} not present")
+            t |> skip("{MTP_MODEL_PATH} not present")
             return
         }
         // pin the bit-exact kernels (same reasoning as test_mtp): the spec arm's verify rides the
@@ -628,10 +628,12 @@ def test_scheduler_paged_sampled(t : T?) {
 // splice bug — wrong position, a head chunk running past media_at, rows evaled twice or never —
 // changes the KV and diverges.
 def private media_req(m : Model; id : int64; prompt : array<int64>; lo, hi : int64;
-                      non_causal : bool; params : SamplingParams; max_new : int64) : PendingReq {
+                      non_causal : bool; params : SamplingParams; max_new : int64;
+                      grid : int2 = int2(0)) : PendingReq {
     let np = long_length(prompt)
     var r <- PendingReq(id = id, params = params, max_new = max_new,
-                        media_at = lo, n_media = hi - lo, media_non_causal = non_causal)
+                        media_at = lo, n_media = hi - lo, media_non_causal = non_causal,
+                        media_grid = grid)
     r.prompt <- [for (k in range64(np)); prompt[k]; where k < lo || k >= hi]
     var mid <- [for (k in range64(lo, hi)); prompt[k]]
     r.media_embd |> resize((hi - lo) * m.config.dim)
@@ -758,7 +760,7 @@ def test_scheduler_media_splice(t : T?) {   // nolint:STYLE038 — one model loa
 // ===== media validation: submit refuses malformed shapes by panic =====
 
 [test]
-def test_scheduler_media_validation(t : T?) {
+def test_scheduler_media_validation(t : T?) {   // nolint:STYLE038 — one flat story: each malformed shape probes the same submit guard
     t |> run("submit panics on malformed media shapes (needs SmolLM2-135M)") @(t : T?) {
         if (model_missing(t)) {
             return
@@ -810,6 +812,178 @@ def test_scheduler_media_validation(t : T?) {
                 tripped = true
             }
             t |> success(tripped, "media rows with n_media == 0 panic instead of dropping silently")
+            tripped = false
+            try {
+                var bad <- PendingReq(id = 13l, params = greedy, max_new = 4l, media_at = 1l, n_media = 2l)
+                bad.prompt := prompt
+                bad.media_embd |> resize(3l * m.config.dim)   // oversized: the exact-width guard refuses slop
+                submit(m, sch, bad)
+            } recover {
+                tripped = true
+            }
+            t |> success(tripped, "oversized media rows panic")
+            tripped = false
+            try {
+                m.config.n_deepstack = 3l   // a deepstack decoder: image rows arrive (1+n)·dim-wide
+                var bad <- PendingReq(id = 14l, params = greedy, max_new = 4l, media_at = 1l, n_media = 2l, media_non_causal = true)
+                bad.prompt := prompt
+                bad.media_embd |> resize(2l * m.config.dim)   // narrow feed = the slice adds would silently skip
+                submit(m, sch, bad)
+            } recover {
+                tripped = true
+            }
+            m.config.n_deepstack = 0l
+            t |> success(tripped, "narrow image rows on a deepstack decoder panic")
+            unsafe {
+                delete sch
+            }
+            delete prompt
+            delete m
+        }
+    }
+}
+
+// ===== mrope media: the qwen grid reaches the quantum's angles and the batched decode =====
+
+// embd_span_generate's mrope twin (generate_embd's grid form) — the reference the scheduler's
+// media_grid arm must reproduce, decode included: the session's rope_pos_delta shifts every
+// post-image position, so a decode that ropes at n_past instead diverges.
+def private embd_mrope_generate(m : Model; prompt : array<int64>; lo, hi : int64; grid : int2;
+                                params : SamplingParams; max_new : int64) : array<int64> {
+    var s <- create_session(m)
+    var e : array<float>
+    e |> reserve(long_length(prompt) * m.config.dim)
+    e |> resize(long_length(prompt) * m.config.dim)
+    embed_text_rows(m, prompt, e, 0l)
+    var out : array<int64>
+    generate_embd(m, s, e, long_length(prompt), params, max_new, lo, hi, grid) $(id, _pc) {
+        out |> push(id)
+        return true
+    }
+    delete e
+    delete s
+    return <- out
+}
+
+[test]
+def test_scheduler_mrope(t : T?) {
+    t |> run("media_grid: the mrope walk reaches the quantum and survives the batched decode (needs SmolLM2-135M)") @(t : T?) {
+        if (model_missing(t)) {
+            return
+        }
+        with_job_que() {
+            setup_dasllama_jobque()
+            var m <- load_capped(128l)
+            m.config.rope_sections = int4(12, 10, 10, 0)   // stamp: the toy is not an mrope arch (rotary 64 -> half 32)
+            m.config.mrope_interleaved = true
+            let saved_mode = get_prefill_attn_mode()
+            set_prefill_attn_mode(AttnPrefillMode.classic)
+            let prev_fused = get_fused_decode()
+            set_fused_decode(false)   // the batch worker mirrors the std decode path (test_scheduler_batching's pin)
+            var prompt <- encode(m, "The quick brown fox jumps over the lazy dog while the little robot watches from a small hill near the old village bakery", true, false)
+            let np = long_length(prompt)
+            let lo = 4l
+            let hi = lo + 12l   // 12 rows = a 4x3 merged grid; position advance 4, so rope_pos_delta lands at -8
+            let grid = int2(4, 3)
+            t |> success(np > hi + 2l, "prompt long enough to leave a tail after the span ({np} tokens)")
+            let greedy = SamplingParams()
+            var none : array<int64>
+            var mref <- embd_mrope_generate(m, prompt, lo, hi, grid, greedy, 8l)
+            var sref <- embd_span_generate(m, prompt, lo, hi, greedy, 8l)
+            t |> success(!same(mref, sref), "grid angles move the stream (the mrope walk is load-bearing here)")
+            // (1) the grid reaches the quantum: scheduler stream == generate_embd's grid form
+            var sch <- create_scheduler(m, 1l, 4l, 64l)
+            var events : array<SchedEvent>
+            var req <- media_req(m, 1l, prompt, lo, hi, true, greedy, 8l, grid)
+            t |> success(submit(m, sch, req), "mrope media stream queued")
+            drain(m, sch, events)
+            var got <- toks_of(events, 1l)
+            t |> success(same(got, mref), "scheduler mrope stream == generate_embd's grid form")
+            t |> equal(finished_of(events, 1l).n_prompt, np)
+            t |> equal(sch.mrope_streams, 1l)   // the telemetry counter the server stats surface reads
+            // (2) batched decode: the mrope stream and a text stream decode as one 2-row batch —
+            // the delta'd rope position must survive the gather (ws.rope_positions, not n_past)
+            var tref <- ref_generate(m, prompt, greedy, 8l, none)
+            var schb <- create_scheduler(m, 2l, 4l, 64l)
+            var eb : array<SchedEvent>
+            var rq1 <- media_req(m, 21l, prompt, lo, hi, true, greedy, 8l, grid)
+            t |> success(submit(m, schb, rq1), "mrope stream queued (batch arm)")
+            t |> success(submit(m, schb, make_req(22l, prompt, greedy, 8l, none)), "text stream queued (batch arm)")
+            drain(m, schb, eb)
+            var g1 <- toks_of(eb, 21l)
+            var g2 <- toks_of(eb, 22l)
+            t |> success(same(g1, mref), "batched mrope stream == its solo grid reference")
+            t |> success(same(g2, tref.toks), "batched text stream == its solo reference")
+            t |> success(schb.sum_batch >= 4l, "decode steps actually batched (sum batch {schb.sum_batch})")
+            set_fused_decode(prev_fused)
+            set_prefill_attn_mode(saved_mode)
+            delete g1
+            delete g2
+            delete eb
+            unsafe {
+                delete schb
+            }
+            delete tref
+            delete got
+            delete events
+            unsafe {
+                delete sch
+            }
+            delete mref
+            delete sref
+            delete prompt
+            delete m
+        }
+    }
+}
+
+// ===== mrope validation: submit refuses malformed grids by panic =====
+
+[test]
+def test_scheduler_mrope_validation(t : T?) {
+    t |> run("submit panics on malformed media grids (needs SmolLM2-135M)") @(t : T?) {
+        if (model_missing(t)) {
+            return
+        }
+        with_job_que() {
+            setup_dasllama_jobque()
+            var m <- load_capped(128l)
+            var prompt <- encode(m, "The quick brown fox", true, false)
+            let greedy = SamplingParams()
+            var sch <- create_scheduler(m, 1l, 4l, 64l)
+            var tripped = false
+            try {
+                var bad <- media_req(m, 30l, prompt, 1l, 3l, true, greedy, 4l, int2(3, 1))   // 3 rows shaped for 2
+                submit(m, sch, bad)
+            } recover {
+                tripped = true
+            }
+            t |> success(tripped, "a grid shaping more rows than n_media panics")
+            tripped = false
+            try {
+                var bad <- media_req(m, 31l, prompt, 1l, 3l, false, greedy, 4l, int2(2, 1))   // causal rows
+                submit(m, sch, bad)
+            } recover {
+                tripped = true
+            }
+            t |> success(tripped, "a grid on causal media rows panics")
+            tripped = false
+            try {
+                var bad <- media_req(m, 32l, prompt, 1l, 3l, true, greedy, 4l, int2(2, 0))   // one-sided grid
+                submit(m, sch, bad)
+            } recover {
+                tripped = true
+            }
+            t |> success(tripped, "a one-sided grid panics")
+            tripped = false
+            try {
+                var bad <- PendingReq(id = 33l, params = greedy, max_new = 4l, media_grid = int2(2, 1))
+                bad.prompt := prompt
+                submit(m, sch, bad)
+            } recover {
+                tripped = true
+            }
+            t |> success(tripped, "a grid with n_media == 0 panics instead of dropping silently")
             unsafe {
                 delete sch
             }

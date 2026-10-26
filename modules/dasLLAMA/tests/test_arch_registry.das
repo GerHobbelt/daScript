@@ -32,6 +32,22 @@ def test_arch_registry_populated(t : T?) {
 }
 
 [test]
+def test_mrope_walk_flags(t : T?) {
+    t |> run("the qwen3vl family ropes interleaved, qwen2vl contiguous - the flag decides the builder") @(t : T?) {
+        for (name in ["qwen3vl", "qwen3vlmoe"]) {
+            var m = Model()
+            resolve_arch(m, name)
+            t |> success(m.config.mrope_interleaved, "'{name}' sets mrope_interleaved (the IMROPE walk)")
+            delete m
+        }
+        var m2 = Model()
+        resolve_arch(m2, "qwen2vl")
+        t |> success(!m2.config.mrope_interleaved, "'qwen2vl' keeps the contiguous MROPE walk")
+        delete m2
+    }
+}
+
+[test]
 def test_llm_caps(t : T?) {
     t |> run("per-arch LlmCaps: gemma has no system role, everyone else does") @(t : T?) {
         for (name in ["gemma2", "gemma3", "gemma4"]) {
@@ -57,8 +73,8 @@ def test_audio_wrap_parts(t : T?) {
         t |> equal(q3.audio_pre.parts[0].s, "<|audio_start|>", "qwen3vl audio_pre")
         t |> equal(q3.audio_post.parts[0].s, "<|audio_end|>", "qwen3vl audio_post")
         let g4 <- arch_chat("gemma4")
-        t |> equal(g4.audio_pre.parts[0].s, "<|audio>", "gemma4 audio_pre matches gemma4a_transcribe's hand-rolled span")
-        t |> equal(g4.audio_post.parts[0].s, "<audio|>", "gemma4 audio_post matches gemma4a_transcribe's hand-rolled span")
+        t |> equal(g4.audio_pre.parts[0].s, "<|audio>", "gemma4 audio_pre - gemma4a_transcribe reads its span from arch_chat(\"gemma4\")")
+        t |> equal(g4.audio_post.parts[0].s, "<audio|>", "gemma4 audio_post - gemma4a_transcribe reads its span from arch_chat(\"gemma4\")")
         let lt <- arch_chat("llama")
         t |> success(empty(lt.audio_pre.parts) && empty(lt.audio_post.parts), "llama-3: bare embeddings")
     }

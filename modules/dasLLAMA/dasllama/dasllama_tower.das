@@ -17,7 +17,7 @@ require dasllama/dasllama_gguf   // read_clamp reads sidecar scalar tensors
 // file that re-implements a shape found here is a defect; nothing here names a family type.
 
 // erfc rational approximation (Numerical Recipes 6.2), |fractional error| < 1.2e-7 —
-// float-level agreement with ggml's erff. Double internally.
+// float-level agreement with the reference erff. Double internally.
 def private erf_nr(x : double) : double {
     let z = abs(x)
     let t = 1.0lf / (1.0lf + 0.5lf * z)
@@ -27,7 +27,7 @@ def private erf_nr(x : double) : double {
     return x >= 0.0lf ? 1.0lf - erfc : erfc - 1.0lf
 }
 
-//! gelu_erf(x) = 0.5·x·(1 + erf(x/√2)) — the EXACT erf form (ggml's ggml_vec_gelu_erf_f32),
+//! gelu_erf(x) = 0.5·x·(1 + erf(x/√2)) — the EXACT erf form,
 //! not the tanh approximation ``gelu`` uses. Whisper's conv frontend and encoder FFN both
 //! use this flavor. In place over the first ``size`` elements.
 def gelu_erf(var x : float?; size : int64) {
@@ -45,9 +45,9 @@ def gelu_erf(var x : array<float> | #; size : int64) {
     gelu_erf(unsafe(addr(x[0])), size)
 }
 
-//! whisper.cpp's ggml_gelu flavor (GGML_GELU_FP16): tanh approximation evaluated through an
+//! The fp16-LUT gelu flavor: tanh approximation evaluated through an
 //! fp16 lookup table — input and output both round-trip through binary16, with ±10 clamps
-//! applied BEFORE the conversion. Bit-exact vs ggml's CPU path. In place over ``size``.
+//! applied BEFORE the conversion. Bit-exact vs the reference CPU path. In place over ``size``.
 def gelu_tanh_lut(var x : float?; size : int64) {
     unsafe {
         for (i in range64(size)) {
@@ -123,8 +123,8 @@ def gelu_erf_batch(var x : array<float> | #; d, npos : int64) {
     }
 }
 
-//! Per-row swiglu with ggml's swapped halves: out[r][i] = silu(x[r][half+i]) · x[r][i]
-//! (ultravox_model.py's SwiGLU — silu on the SECOND half, passthrough on the first).
+//! Per-row swiglu with swapped halves: out[r][i] = silu(x[r][half+i]) · x[r][i]
+//! (silu on the SECOND half, passthrough on the first - the swapped convention).
 def swiglu_swapped_rows(var o : array<float>; x : array<float>; half, rows : int64) {
     for (r in range64(rows)) {
         for (i in range64(half)) {
@@ -140,7 +140,7 @@ def swiglu_swapped_rows(var o : array<float>; x : array<float>; half, rows : int
 }
 
 //! LayerNorm row: o = (x − mean)/√(var + eps)·w + b, mean/var double-accumulated over the
-//! row (ggml_norm's exact shape; the decoder only has RMS so this is new). Population var.
+//! row (the decoder only has RMS so this is new). Population var.
 def layernorm(var o : float?; x, w, b : float const?; size : int64; eps : float) {
     unsafe {
         var mean = 0.0lf
@@ -294,9 +294,156 @@ def tower_read_gemm(m : GGUFMeta; b : array<uint8> | #; name : string; var wblob
     }
 }
 
-//! Per-op activation-quant calibration range (mtmd ClippableLinear): clamp(x, imin, imax) before
+//! Read one GEMM weight transcoded to Q8_0 — the q8 serving lane's read: the file's tensor
+//! (any f32-widenable type) widens into ``wscratch``, then quantizes into qblob/qscales at the
+//! 32-aligned region (``wo/32`` indexes the scales). ``family`` names the panic.
+def tower_read_gemm_q8(m : GGUFMeta; b : array<uint8> | #; name : string; var qblob : array<int8>;
+                       var qscales : array<float>; @scratch var wscratch : array<float>;
+                       wo, n_elem : int64; family : string) {
+    if (n_elem % 32l != 0l || wo % 32l != 0l) {
+        panic("{family}: GEMM tensor '{name}' ({n_elem} elements at {wo}) is not 32-aligned")
+    }
+    if (long_length(wscratch) < n_elem) {   // inline: PERF026 can't see @scratch through reserve_resize
+        wscratch |> reserve(n_elem)
+        wscratch |> resize(n_elem)
+    }
+    gguf_read_tensor_f32(m, b, name, wscratch, 0l, n_elem)
+    quantize_q8_0_into(wscratch, n_elem, qblob, qscales, wo, wo / 32l)
+}
+
+//! Stage a [file_rows × width] GEMM into a q8 region padded to [pad_rows × width] with zero
+//! rows appended — their quantized outputs are exactly zero, so a non-32-aligned FFN's up/gate
+//! half can emit the padded width its down partner consumes.
+def tower_stage_q8_zero_rows(m : GGUFMeta; b : array<uint8> | #; name : string; var qblob : array<int8>;
+                             var qscales : array<float>; @scratch var wscratch : array<float>;
+                             wo, file_rows, pad_rows, width : int64; family : string) {
+    let file_n = file_rows * width
+    let served = pad_rows * width
+    // the row width itself must quantize: repack and the row requant both take n % 32 == 0
+    if (width % 32l != 0l || served % 32l != 0l || wo % 32l != 0l) {
+        panic("{family}: GEMM tensor '{name}' ({served} served elements, width {width}, at {wo}) is not 32-aligned")
+    }
+    if (long_length(wscratch) < served) {
+        wscratch |> reserve(served)
+        wscratch |> resize(served)
+    }
+    gguf_read_tensor_f32(m, b, name, wscratch, 0l, file_n)
+    tower_zero_span(wscratch, file_n, served - file_n)
+    quantize_q8_0_into(wscratch, served, qblob, qscales, wo, wo / 32l)
+}
+
+//! Stage a [rows × ff] GEMM into a q8 region with each row zero-padded to [rows × fp] — the
+//! down half: the pad columns multiply the up pad's zero outputs, so the padded dot is exact.
+def tower_stage_q8_pad_cols(m : GGUFMeta; b : array<uint8> | #; name : string; var qblob : array<int8>;
+                            var qscales : array<float>; @scratch var wscratch : array<float>;
+                            @scratch var rowscratch : array<float>; wo, rows, ff, fp : int64; family : string) {
+    let served = rows * fp
+    // the padded row width itself must quantize: repack and the row requant both take n % 32 == 0
+    if (fp % 32l != 0l || served % 32l != 0l || wo % 32l != 0l) {
+        panic("{family}: GEMM tensor '{name}' ({served} served elements, padded width {fp}, at {wo}) is not 32-aligned")
+    }
+    if (long_length(rowscratch) < rows * ff) {
+        rowscratch |> reserve(rows * ff)
+        rowscratch |> resize(rows * ff)
+    }
+    gguf_read_tensor_f32(m, b, name, rowscratch, 0l, rows * ff)
+    if (long_length(wscratch) < served) {
+        wscratch |> reserve(served)
+        wscratch |> resize(served)
+    }
+    unsafe {
+        var dp = addr(wscratch[0])
+        let sp = addr(rowscratch[0])
+        for (r in range64(rows)) {
+            memcpy(dp + r * fp, sp + r * ff, ff * 4l)
+            for (i in range64(ff, fp)) {
+                dp[r * fp + i] = 0.0
+            }
+        }
+    }
+    quantize_q8_0_into(wscratch, served, qblob, qscales, wo, wo / 32l)
+}
+
+//! Repack every block-GEMM region of a staged q8 layout for the active backend's q8q8 kernels —
+//! per-row alignment (each region's input width, ``widths``/``sizes`` in the family's GEMM
+//! order) keeps blocks from straddling rows; no repack backend selected = the flat image serves.
+def tower_repack_q8_blocks(var qblob : array<int8>; var qscales : array<float>;
+                           layer_w, layer_w_stride, n_layer : int64;
+                           widths : array<int64>; sizes : array<int64>) {
+    if (!select_matmul_backend_for_load_()) {
+        return
+    }
+    for (l in range64(n_layer)) {
+        var wo = layer_w + l * layer_w_stride
+        for (w, sz in widths, sizes) {
+            repack_q8q8_weight(qblob, qscales, wo, w, sz / w)
+            wo += sz
+        }
+    }
+}
+
+//! The f32 twin of ``tower_stage_q8_zero_rows``: stage a ``[file_rows × width]`` GEMM into its
+//! padded region — the file's rows land first, then ``pad_rows − file_rows`` zero weight rows
+//! (the pad outputs are exactly zero).
+def tower_stage_f32_zero_rows(m : GGUFMeta; b : array<uint8> | #; name : string; var blob : array<float>;
+                              wo, file_rows, pad_rows, width : int64) {
+    gguf_read_tensor_f32(m, b, name, blob, wo, file_rows * width)
+    tower_zero_span(blob, wo + file_rows * width, (pad_rows - file_rows) * width)
+}
+
+//! The f32 twin of ``tower_stage_q8_pad_cols``: stage a ``[rows × ff]`` GEMM into its padded
+//! ``[rows × fp]`` f32 region — each file row lands first, then ``fp − ff`` zero tail columns
+//! (the pads multiply the up GEMM's zero pad outputs, bit-identical).
+def tower_stage_f32_pad_cols(m : GGUFMeta; b : array<uint8> | #; name : string; var blob : array<float>;
+                             @scratch var rowscratch : array<float>; wo, rows, ff, fp : int64) {
+    if (long_length(rowscratch) < rows * ff) {
+        rowscratch |> reserve(rows * ff)
+        rowscratch |> resize(rows * ff)
+    }
+    gguf_read_tensor_f32(m, b, name, rowscratch, 0l, rows * ff)
+    unsafe {
+        var dp = addr(blob[wo])
+        let sp = addr(rowscratch[0])
+        for (r in range64(rows)) {
+            memcpy(dp + r * fp, sp + r * ff, ff * 4l)
+            for (i in range64(ff, fp)) {
+                dp[r * fp + i] = 0.0
+            }
+        }
+    }
+}
+
+//! Zero ``n`` floats at ``at`` — pad tails of staged planes.
+def tower_zero_span(var a : array<float>; at, n : int64) {
+    if (n <= 0l) {
+        return
+    }
+    unsafe {
+        var p = addr(a[at])
+        for (i in range64(n)) {
+            p[i] = 0.0
+        }
+    }
+}
+
+//! Read a temporal patch-conv PAIR folded for still images: conv0(img) + conv1(img) = (W0+W1)·img,
+//! so ``base`` lands at ``off`` and ``base.1`` accumulates into the same plane region.
+def tower_read_conv_pair_folded(m : GGUFMeta; b : array<uint8> | #; base : string;
+                                var blob : array<float>; off, n_elem : int64) {
+    gguf_read_tensor_f32(m, b, base, blob, off, n_elem)
+    var w1 : array<float>
+    w1 |> reserve(n_elem)
+    w1 |> resize(n_elem)
+    gguf_read_tensor_f32(m, b, "{base}.1", w1, 0l, n_elem)
+    for (i in range64(n_elem)) {
+        blob[off + i] += w1[i]
+    }
+    delete w1
+}
+
+//! Per-op activation-quant calibration range: clamp(x, imin, imax) before
 //! the matmul, clamp the result to (omin, omax) after. ``active`` false = no sidecar scalars on
-//! disk, which mtmd treats as ±FLT_MAX — an identity clamp, so callers may skip the pass.
+//! disk, which means ±FLT_MAX — an identity clamp, so callers may skip the pass.
 [safe_when_uninitialized]
 struct Clamp {
     imin : float = -3.4028235e38
@@ -346,7 +493,7 @@ def clamp_rows(var dst : array<float>; src : array<float>; n : int64; lo, hi : f
 }
 
 //! Threaded per-row RMSNorm against a weight row in a prepared image: out[r] = rmsnorm(src[r])·w
-//! (``rmsnorm``'s (x·scale)·w order — ggml's RMS_NORM then MUL). ``out`` may be ``src``. A
+//! (``rmsnorm``'s (x·scale)·w order — normalize, then multiply). ``out`` may be ``src``. A
 //! per-head norm is this with ``d`` = head width and ``npos`` = tokens × heads.
 def rms_rows(var out : array<float>; src : array<float>; w : PlaneF; woff, d, npos : int64; eps : float) {
     if (npos <= 0l || d <= 0l) return
@@ -364,7 +511,7 @@ def rms_rows(var out : array<float>; src : array<float>; w : PlaneF; woff, d, np
     }
 }
 
-//! Weightless ggml_rms_norm per row, in place: x ⊙ 1/√(mean(x²) + eps), the mean accumulated in
+//! Weightless RMS norm per row, in place: x ⊙ 1/√(mean(x²) + eps), the mean accumulated in
 //! double (gemma4uv's pre-projection norm; gemma4v's V-norm with ``d`` = head width).
 def rms_rows_weightless(var x : array<float>; d, npos : int64; eps : float) {
     if (npos <= 0l || d <= 0l) return
@@ -388,8 +535,8 @@ def rms_rows_weightless(var x : array<float>; d, npos : int64; eps : float) {
     }
 }
 
-// The f16 table for geglu_quick_lut_rows: ggml-cpu's ggml_table_gelu_quick_f16 (GGML_GELU_QUICK_FP16
-// is on by default) — idx = f32_to_f16(x), value = f16(x·σ(1.702x)) widened. Built once, main thread.
+// The f16 table for geglu_quick_lut_rows, matching the reference CPU LUT:
+// idx = f32_to_f16(x), value = f16(x·σ(1.702x)) widened. Built once, main thread.
 var private g_gelu_quick_lut : array<float>
 
 [cold_path]
@@ -407,8 +554,8 @@ def private gelu_quick_lut_ensure() {
     }
 }
 
-//! GEGLU-quick over token-major rows: h = gelu_quick(gate) ⊙ up, gelu_quick evaluated as ggml-cpu
-//! does — input and output both round-trip through binary16 (its f16 table), matching the CPU
+//! GEGLU-quick over token-major rows: h = gelu_quick(gate) ⊙ up, gelu_quick evaluated through
+//! the f16 table — input and output both round-trip through binary16, matching the CPU
 //! oracle bit-for-bit rather than the exact x·σ(1.702x). Elementwise ⇒ lane-count invariant.
 def geglu_quick_lut_rows(var h : array<float>; gate, up : array<float>; ff, npos : int64) {
     if (npos <= 0l || ff <= 0l) return
@@ -428,7 +575,7 @@ def geglu_quick_lut_rows(var h : array<float>; gate, up : array<float>; ff, npos
     }
 }
 
-//! im2col over an interleaved-RGB [h × w × 3] canvas into token-major rows in ggml's [C][KH][KW]
+//! im2col over an interleaved-RGB [h × w × 3] canvas into token-major rows in [C][KH][KW]
 //! order (row index c·p² + ky·p + kx), one row per non-overlapping p×p patch walking the canvas
 //! row-major (pos_x = i % n_cols, pos_y = i / n_cols). Returns npos; ``x0`` grows to npos × 3p².
 def im2col_rgb_patches(planes : array<float>; w, h, p : int64; @scratch var x0 : array<float>) : int64 {
@@ -462,8 +609,8 @@ def im2col_rgb_patches(planes : array<float>; w, h, p : int64; @scratch var x0 :
 }
 
 //! Two-axis NEOX RoPE over token-major rows [npos × n_head·hs], in place: each head's first hs/2
-//! dims rotate by the row's x-position table entry, the second hs/2 by its y entry (ggml: two ROPE
-//! views then CONCAT). Tables are ``build_rope_tabs_rows`` outputs at head_size = hs/2.
+//! dims rotate by the row's x-position table entry, the second hs/2 by its y entry (two half-width
+//! rotations concatenated). Tables are ``build_rope_tabs_rows`` outputs at head_size = hs/2.
 def rope_neox_2d_rows(var v : array<float>; npos, n_head, hs : int64;
                       cos_x, sin_x, cos_y, sin_y : array<float>) {
     if (npos <= 0l) return
@@ -487,9 +634,89 @@ def rope_neox_2d_rows(var v : array<float>; npos, n_head, hs : int64;
     }
 }
 
+//! Full-head NEOX RoPE over token-major rows [npos × n_head·hs], in place, ONE table pair per
+//! row (every head of a row shares its angles — the qwen3vl ViT's vision-mrope, tables from
+//! ``build_rope_tabs_vision``): row r applies cos/sin row r across all heads.
+def rope_neox_tab_rows(var v : array<float>; npos, n_head, hs : int64; cos_t, sin_t : array<float>) {
+    if (npos <= 0l) return
+    let d = n_head * hs
+    let half = hs / 2l
+    unsafe {
+        var vp = addr(v[0])
+        let ct = addr<float const?>(cos_t[0])
+        let st = addr<float const?>(sin_t[0])
+        maybe_parallel_for(0, int(npos), lanes_for_work(npos * d * 4l, 0)) $(rb, re) {
+            unsafe {
+                for (r in range64(int64(rb), int64(re))) {
+                    rope_scaled_neox_tab(vp + r * d, hs, d, ct + r * half, st + r * half)
+                }
+            }
+        }
+    }
+}
+
+//! Antialiased bilinear resize (the pos-embed resize): resample a
+//! channel-inner grid [sh×sw rows × d] to [dh×dw rows × d] — triangle filter, support
+//! max(1, 1/scale), weights normalized per pixel, f32 accumulation in (sy, sx) order.
+def interpolate_grid_bilinear_aa(@scratch var out : array<float>; src : PlaneF; src_off : int64;
+                                 sw, sh, dw, dh, d : int64) {
+    if (long_length(out) < dw * dh * d) {
+        out |> reserve(dw * dh * d)
+        out |> resize(dw * dh * d)
+    }
+    let sf0 = float(dw) / float(sw)
+    let sf1 = float(dh) / float(sh)
+    let support0 = max(1.0, 1.0 / sf0)
+    let support1 = max(1.0, 1.0 / sf1)
+    let invscale0 = 1.0 / support0
+    let invscale1 = 1.0 / support1
+    unsafe {
+        let sp = plane_at(src, src_off)
+        var op = addr(out[0])
+        maybe_parallel_for(0, int(dh), lanes_for_work(dw * dh * d * 8l, 0)) $(yb, ye) {
+            unsafe {
+                for (i1 in range64(int64(yb), int64(ye))) {
+                    let y = (float(i1) + 0.5) / sf1
+                    let y_min = max(int64(y - support1 + 0.5), 0l)
+                    let y_max = min(int64(y + support1 + 0.5), sh)
+                    for (i0 in range64(dw)) {
+                        let x = (float(i0) + 0.5) / sf0
+                        let x_min = max(int64(x - support0 + 0.5), 0l)
+                        let x_max = min(int64(x + support0 + 0.5), sw)
+                        var orow = op + (i1 * dw + i0) * d
+                        for (c in range64(d)) {
+                            orow[c] = 0.0
+                        }
+                        var total_weight = 0.0
+                        for (sy in range64(y_min, y_max)) {
+                            let weight_y = max(1.0 - abs((float(sy) - y + 0.5) * invscale1), 0.0)
+                            for (sx in range64(x_min, x_max)) {
+                                let weight = max(1.0 - abs((float(sx) - x + 0.5) * invscale0), 0.0) * weight_y
+                                if (weight <= 0.0) {
+                                    continue
+                                }
+                                let srow = sp + (sy * sw + sx) * d
+                                for (c in range64(d)) {
+                                    orow[c] += srow[c] * weight
+                                }
+                                total_weight += weight
+                            }
+                        }
+                        if (total_weight > 0.0) {
+                            for (c in range64(d)) {
+                                orow[c] /= total_weight
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 //! Average pool k×k, stride k, over a patch grid held token-major (row = gy·gw + gx, d channels):
-//! out row (oy·(gw/k) + ox) = mean of the k×k window (ky outer, kx inner — ggml's POOL_2D
-//! accumulation order, then one divide). Ragged edges are dropped. Returns the output row count.
+//! out row (oy·(gw/k) + ox) = mean of the k×k window (ky outer, kx inner accumulation
+//! order, then one divide). Ragged edges are dropped. Returns the output row count.
 def avg_pool2d_rows(@scratch var out : array<float>; x : array<float>; gw, gh, d, k : int64) : int64 {
     let ow = gw / k
     let oh = gh / k
@@ -618,6 +845,84 @@ def attention_bidir(var out : array<float>; qq, kk, vv : array<float>; @scratch 
             }
         }
         asr_prof_add("enc.attn.blocks", tp)
+    }
+}
+
+//! ``attention_bidir`` restricted to CONTIGUOUS row windows: ``win_lo`` = each window's first
+//! row plus a total-row sentinel; every window attends only within itself (the qwen2.5 ViT's
+//! block-diagonal mask in its window-sorted row order). Units = (window, head), per-slot scratch.
+def attention_bidir_windows(var out : array<float>; qq, kk, vv : array<float>; @scratch var hp : array<float>;
+                            @scratch var att : array<float>; win_lo : array<int64>; d, n_head : int64; scale : float) {
+    let hs = d / n_head
+    let nwin = long_length(win_lo) - 1l
+    var max_wr = 0l
+    for (i in range64(nwin)) {
+        max_wr = max(max_wr, win_lo[i + 1l] - win_lo[i])
+    }
+    let nu = int(nwin * n_head)
+    // per-slot scratch: q [wr×hs], kT [hs×wr], v [wr×hs], o [wr×hs] + the att block [wr×wr]
+    let slot_hp = 4l * max_wr * hs
+    let hpNeed = int64(get_dispatch_slot_bound()) * slot_hp
+    if (long_length(hp) < hpNeed) {   // inline: PERF026 can't see @scratch through reserve_resize
+        hp |> reserve(hpNeed)
+        hp |> resize(hpNeed)
+    }
+    let attNeed = int64(get_dispatch_slot_bound()) * max_wr * max_wr
+    if (long_length(att) < attNeed) {
+        att |> reserve(attNeed)
+        att |> resize(attNeed)
+    }
+    unsafe {
+        let qp = addr<float const?>(qq[0])
+        let kp = addr<float const?>(kk[0])
+        let vp = addr<float const?>(vv[0])
+        let wp = addr<int64 const?>(win_lo[0])
+        var hpp = addr(hp[0])
+        var attp = addr(att[0])
+        var aop = addr(out[0])
+        maybe_parallel_for_indexed(0, nu, nu) $(slot, ub, ue) {
+            unsafe {
+                var qh = hpp + int64(slot) * slot_hp
+                var ah = attp + int64(slot) * max_wr * max_wr
+                for (u in range(ub, ue)) {
+                    let wi = int64(u) / n_head
+                    let h = int64(u) % n_head
+                    let hoff = h * hs
+                    let r0 = wp[wi]
+                    let wr = wp[wi + 1l] - r0
+                    var kt = qh + wr * hs
+                    var vh = kt + wr * hs
+                    var oh = vh + wr * hs
+                    for (p in range64(wr)) {
+                        for (j in range64(hs)) {
+                            qh[p * hs + j] = qp[(r0 + p) * d + hoff + j]
+                            kt[j * wr + p] = kp[(r0 + p) * d + hoff + j]
+                            vh[p * hs + j] = vp[(r0 + p) * d + hoff + j]
+                        }
+                    }
+                    for (i in range64(wr * wr)) {
+                        ah[i] = 0.0
+                    }
+                    gemm_f32(ah, qh, kt, wr, hs, wr)
+                    for (r in range64(wr)) {
+                        var row = ah + r * wr
+                        for (i in range64(wr)) {
+                            row[i] *= scale
+                        }
+                        softmax(row, wr)
+                    }
+                    for (i in range64(wr * hs)) {
+                        oh[i] = 0.0
+                    }
+                    gemm_f32(oh, ah, vh, wr, wr, hs)
+                    for (p in range64(wr)) {
+                        for (j in range64(hs)) {
+                            aop[(r0 + p) * d + hoff + j] = oh[p * hs + j]
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

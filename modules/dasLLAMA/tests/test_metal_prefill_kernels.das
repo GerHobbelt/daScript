@@ -141,8 +141,8 @@ def private attn_trio_gate(t : T?; dev, queue; head_size, n_heads, n_kv_heads, n
         metal_dispatch_threadgroups(enc, uint3(uint(np32 / 32), uint(head_size / (mm ? 64 : 32)), uint(n_heads)), uint3(128u, 1u, 1u))
     }
     t |> success(aran, "attention dispatches (hs={head_size}, mm={mm}): {err}")
-    // the mm pair stages HALF (llama.cpp's f32_f32 mul_mm does the same) — the envelope is the
-    // half-precision score shift through softmax, ~1% of the convex-combination output
+    // the mm pair stages HALF — the envelope is the half-precision score shift through
+    // softmax, ~1% of the convex-combination output
     t |> equal(buf_mismatch_tol(bxb, axb_want, mm ? 2e-2 : 1e-4), 0)
     metal_release(baq)
     metal_release(bak)
@@ -160,15 +160,20 @@ def private attn_trio_gate(t : T?; dev, queue; head_size, n_heads, n_kv_heads, n
     delete prow
 }
 
-// The trio under a uniform span (media rows): every query attends [window floor, uend) with
-// uend = qoff + npos — the eval_embd non-causal contract. The continuation shape (qoff > 0) and
-// a sliding layer (window > 0) exercise the two bounds independently: the upper bound is
-// uniform, the window floor stays query-based (a floor derived from uend would flatten it).
-def private attn_trio_span_gate(t : T?; dev, queue; head_size, n_heads, n_kv_heads, npos, qoff, window : int; mm : bool) {
+// The trio under a uniform span (media rows): queries at [ulo, uend) attend [window floor,
+// uend), the rest stay causal — the fused eval_embd_span_ contract. The legacy whole-eval
+// shape is ulo = 0, uend = qoff + npos (every chunk row in the span); span_lo/span_hi >= 0
+// pin the fused MIXED shape (causal head + span rows + causal tail in one chunk). The
+// continuation shape (qoff > 0) and a sliding layer (window > 0) exercise the two bounds
+// independently: the window floor stays query-based even for span rows.
+def private attn_trio_span_gate(t : T?; dev, queue; head_size, n_heads, n_kv_heads, npos, qoff, window : int; mm : bool;
+                                span_lo : int = -1; span_hi : int = -1) {
     let kv_mul = n_heads / n_kv_heads
     let qd = n_heads * head_size
     let kv_dim = n_kv_heads * head_size
     let nk = qoff + npos                    // key rows: existing context + the span chunk
+    let ulo = span_lo >= 0 ? qoff + span_lo : 0
+    let ue = span_lo >= 0 ? qoff + span_hi : nk
     let nkp = (nk + 63) / 64 * 64           // 64-padded key extent (the driver's nk64)
     let qp = (npos + 31) / 32 * 32          // padded query rows (continuation: != nkp)
     var err : string
@@ -205,8 +210,9 @@ def private attn_trio_span_gate(t : T?; dev, queue; head_size, n_heads, n_kv_hea
         for (qi in range(npos)) {
             let ap = qoff + qi
             let jlo = window > 0 && ap + 1 > window ? ap + 1 - window : 0
+            let jhi = ap >= ulo && ap < ue ? ue : ap + 1   // span row: uniform bound; else causal
             var m = -1.0e30
-            for (j in range(jlo, nk)) {
+            for (j in range(jlo, jhi)) {
                 var dot = 0.0
                 for (d in range(head_size)) {
                     dot += aq[qi * qd + h * head_size + d] * ak[j * kv_dim + kvhoff + d]
@@ -215,13 +221,13 @@ def private attn_trio_span_gate(t : T?; dev, queue; head_size, n_heads, n_kv_hea
                 m = max(m, prow[j])
             }
             var sum = 0.0
-            for (j in range(jlo, nk)) {
+            for (j in range(jlo, jhi)) {
                 prow[j] = exp(prow[j] - m)
                 sum += prow[j]
             }
             for (d in range(head_size)) {
                 var acc = 0.0
-                for (j in range(jlo, nk)) {
+                for (j in range(jlo, jhi)) {
                     acc += (prow[j] / sum) * av[j * kv_dim + kvhoff + d]
                 }
                 axb_want[qi * qd + h * head_size + d] = acc
@@ -236,7 +242,7 @@ def private attn_trio_span_gate(t : T?; dev, queue; head_size, n_heads, n_kv_hea
     var ka = AttnArgs(qd = uint(qd), kv_dim = uint(kv_dim), head_size = uint(head_size),
         kv_mul = uint(kv_mul), npos = uint(nk), np32 = uint(nkp), scale = scale,
         qoff = uint(qoff), qrows = uint(qp), window = uint(window), softcap = 0.0, hass = 0u,
-        uend = uint(nk))
+        uend = uint(ue), ulo = uint(ulo))
     var bcap0 = buf_f32(dev, 0.0)   // stands in for the sink buffer slot (hass = 0: never read)
     let aran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
         metal_set_pipeline(enc, pso_sc)
@@ -260,7 +266,7 @@ def private attn_trio_span_gate(t : T?; dev, queue; head_size, n_heads, n_kv_hea
         metal_set_bytes(enc, unsafe(addr<void?>(ka)), uint64(typeinfo sizeof(ka)), 3)
         metal_dispatch_threadgroups(enc, uint3(uint(qp / 32), uint(head_size / (mm ? 64 : 32)), uint(n_heads)), uint3(128u, 1u, 1u))
     }
-    t |> success(aran, "span attention dispatches (hs={head_size}, qoff={qoff}, w={window}, mm={mm}): {err}")
+    t |> success(aran, "span attention dispatches (hs={head_size}, qoff={qoff}, w={window}, mm={mm}, span=[{ulo},{ue})): {err}")
     t |> equal(buf_mismatch_tol(bxb, axb_want, mm ? 2e-2 : 1e-4), 0)
     metal_release(baq)
     metal_release(bak)
@@ -457,7 +463,7 @@ def test_metal_prefill_kernels(t : T?) {
                 // (hs 128 — the QK kernel's two-k-slab path; 2 heads keep the oracle cheap)
                 attn_trio_gate(t, dev, queue, HEAD_SIZE, N_HEADS, N_KV_HEADS, NPOS, false)
                 attn_trio_gate(t, dev, queue, 128, 2, 1, NPOS, false)
-                // the ggml-geometry pair (hs % 64 shapes: llama-1B/3B classes + GQA)
+                // the tiled QK/AV pair (hs % 64 shapes: llama-1B/3B classes + GQA)
                 attn_trio_gate(t, dev, queue, 64, 4, 2, NPOS, true)
                 attn_trio_gate(t, dev, queue, 128, 6, 2, 40, true)
 
@@ -468,6 +474,11 @@ def test_metal_prefill_kernels(t : T?) {
                 attn_trio_span_gate(t, dev, queue, 64, 4, 2, NPOS, 0, 0, true)
                 attn_trio_span_gate(t, dev, queue, 64, 4, 2, NPOS, 32, 0, true)
                 attn_trio_span_gate(t, dev, queue, 64, 4, 2, NPOS, 32, 40, true)
+                // the fused MIXED shape (AttnArgs.ulo): causal head + span rows + causal tail
+                attn_trio_span_gate(t, dev, queue, HEAD_SIZE, N_HEADS, N_KV_HEADS, NPOS, 0, 0, false, span_lo = 5, span_hi = NPOS - 11)
+                attn_trio_span_gate(t, dev, queue, HEAD_SIZE, N_HEADS, N_KV_HEADS, NPOS, 32, 40, false, span_lo = 5, span_hi = NPOS - 11)
+                attn_trio_span_gate(t, dev, queue, 64, 4, 2, NPOS, 0, 0, true, span_lo = 5, span_hi = NPOS - 11)
+                attn_trio_span_gate(t, dev, queue, 64, 4, 2, NPOS, 32, 0, true, span_lo = 5, span_hi = NPOS - 11)
 
                 // ===== swiglu + residual add =====
                 var pso_sw = pipeline_from_source(dev, MetalSwiglu_metal_ew2_msl, MetalSwiglu_metal_ew2_msl_entry, MetalSwiglu_metal_ew2_msl_fastmath, err)
@@ -546,7 +557,7 @@ def test_metal_prefill_kernels(t : T?) {
                 // ===== the classifier GEMV (logits-on-GPU) =====
                 // exact-arithmetic data (quants in [-8, 7], pow2 scales, int x): every per-byte4
                 // dot, scale product, and simd_sum partial is exactly representable — BIT-exact
-                // vs the CPU reference. d = 21 exercises the row < ddim tail guard (grid pads to 24).
+                // vs the CPU reference. d = 21 exercises the row < ddim tail guard (grid pads to 22).
                 gemv_gate(t, dev, queue, 96, 21)            // 3 blocks per row, guarded tail
                 gemv_gate(t, dev, queue, 160, 64)           // 5 blocks per row, exact grid
                 gemv_gate(t, dev, queue, 1120, 8)           // 35 blocks: exercises the 4-chunk main loop, not only the tail
@@ -1430,8 +1441,11 @@ def private gemv_gate(t : T?; dev, queue; n, d : int) {
             }
         }
     }
+    // one sentinel float past the output: the odd-d tail guard's only witness - an unguarded
+    // pair row writes element d, which a d-wide compare never reads
+    want |> push(-1000.0)
     var bx = buf_upload(dev, xv)
-    var by = buf_fill(dev, d, -1000.0)
+    var by = buf_fill(dev, d + 1, -1000.0)
     var bn = buf_u32(dev, uint(n))
     var bd = buf_u32(dev, uint(d))
     let ran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
@@ -1442,7 +1456,8 @@ def private gemv_gate(t : T?; dev, queue; n, d : int) {
         metal_set_buffer(enc, by, 0ul, 3)
         metal_set_buffer(enc, bn, 0ul, 4)
         metal_set_buffer(enc, bd, 0ul, 5)
-        metal_dispatch_threadgroups(enc, uint3(uint((d + 3) / 4), 1u, 1u), uint3(128u, 1u, 1u))
+        metal_set_threadgroup_memory_length(enc, MetalQ8Gemv_metal_q8_gemv_msl_tgmem, 0)
+        metal_dispatch_threadgroups(enc, uint3(uint((d + 1) / 2), 1u, 1u), uint3(128u, 1u, 1u))
     }
     t |> success(ran, "gemv dispatch n={n} d={d}: {err}")
     t |> equal(buf_mismatch_exact(by, want), 0)

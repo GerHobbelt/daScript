@@ -26,7 +26,7 @@ require dasllama/dasllama_image
 // Gemma-4 E-series audio front end: the `gemma4a` Conformer encoder + the audio multimodal
 // embedder, read straight from the bf16 audio mmproj GGUF (mmproj-gemma-4-E{2,4}B-it-bf16.gguf,
 // no conversion). 12 blocks, audio d_model 1024, FFN 4096, 8 heads, 128 mel bins; projects into
-// the text embedding (1536 E2B / 2560 E4B). Structure (tools/mtmd/models/gemma4a.cpp): subsample
+// the text embedding (1536 E2B / 2560 E4B). Structure: subsample
 // Conv2D ×2 (stride 2) + LayerNorm(channels)+ReLU + input proj -> per block { half-step macaron
 // FFN (SiLU) · causal sliding-window (12) self-attn with sinusoidal RPE + softcap 50 · conv
 // module (pw1 -> GLU -> causal depthwise k=5 -> RMSNorm -> SiLU -> pw2) · half-step macaron FFN }
@@ -35,7 +35,7 @@ require dasllama/dasllama_image
 // ranges (input_max/min, output_max/min) — honored via clamp-in/clamp-out around each matmul.
 // Oracle = llama-mtmd-cli greedy (--temp 0 --jinja), token-for-token.
 
-let GEMMA4A_NORM_EPS = 1.0e-6      // hardcoded in mtmd's gemma4a graph (ignores the 1e-5 metadata)
+let GEMMA4A_NORM_EPS = 1.0e-6      // fixed for this encoder, NOT the 1e-5 metadata value
 let private G4A_N_FFT = 512l
 let private G4A_WINDOW = 320l      // 20 ms frame (Hann), zero-padded to the 512 FFT
 let private G4A_HOP = 160l
@@ -254,8 +254,8 @@ struct Gemma4aState {
 
 // ===== loader =====
 
-//! HTK triangular mel filterbank ``[n_mel][n_bins]`` (fmin=0, fmax=sr/2, no area normalization) —
-//! a direct port of mtmd's ``fill_mel_filterbank_matrix`` HTK branch for gemma4a.
+//! HTK triangular mel filterbank ``[n_mel][n_bins]`` (fmin=0, fmax=sr/2, no area normalization).
+//! Double internally, float out.
 def private g4a_htk_filterbank(n_mel, n_fft, sample_rate : int64) : array<float> {
     let n_bins = n_fft / 2l + 1l
     let fmax = 0.5lf * double(sample_rate)
@@ -330,8 +330,8 @@ def load_gemma4a_encoder(path : string) : Gemma4aEncoder {
 }
 
 //! META-only probe of an mmproj gguf: the gemma4a audio encoder's projection width, or 0 for no
-//! gemma4a audio tower (wrong family, vision-only, unreadable, a `.dlim`). Gates on the audio TENSOR
-//! and derives the width like the loader (`clip.audio.*` is written unconditionally, see REVIEW_AUDIO.md).
+//! gemma4a audio tower (wrong family, vision-only, unreadable, a `.dlim`). Gates on the audio
+//! TENSOR — converters write the `clip.audio.*` keys unconditionally, tower or not.
 def gemma4a_probe_proj_dim(path : string) : int64 {
     if (path |> ends_with(".dlim")) {
         return 0l
@@ -538,7 +538,7 @@ def stage_gemma4a_encoder(path : string) : Gemma4aStaging {
             gguf_read_tensor_f32(m, bytes, "{p}.per_dim_scale.weight", st.blob, lo.per_dim_scale, st.e.d_head)
             g4a_read_gemm(m, bytes, "{p}.attn_k_rel.weight", st, wscratch, lo.attn_k_rel, d * d)
             gguf_read_tensor_f32(m, bytes, "{p}.attn_post_norm.weight", st.blob, lo.attn_post_norm, d)
-            // 🔑 conv_norm / norm_conv are name-swapped in the GGUF (upstream tensor_mapping.py):
+            // 🔑 conv_norm / norm_conv are name-swapped in the GGUF (a naming defect we must honor):
             // the PRE-conv RMSNorm reads the tensor named "conv_norm", the POST-depthwise one "norm_conv"
             gguf_read_tensor_f32(m, bytes, "{p}.conv_norm.weight", st.blob, lo.norm_conv, d)
             g4a_read_gemm(m, bytes, "{p}.conv_pw1.weight", st, wscratch, lo.conv_pw1, 2l * d * d)
@@ -1047,9 +1047,10 @@ def gemma4a_transcribe(dec : Model; enc : Gemma4aEncoder; var s : Gemma4aAsrSess
     head |> push(special_id(dec, "<|turn>"))
     head |> push_from(encode_(dec, "user", false, false))
     head |> push_from(nl)
-    head |> push(special_id(dec, "<|audio>"))
+    var inscope tmpl <- arch_chat("gemma4")
+    head |> push(special_id(dec, tmpl.audio_pre.parts[0].s))
     var tail : array<int64>
-    tail |> push(special_id(dec, "<audio|>"))
+    tail |> push(special_id(dec, tmpl.audio_post.parts[0].s))
     tail |> push_from(encode_(dec, "Transcribe this audio.", false, false))
     tail |> push(special_id(dec, "<turn|>"))
     tail |> push_from(nl)

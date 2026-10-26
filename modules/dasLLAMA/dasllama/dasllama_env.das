@@ -126,7 +126,7 @@ struct public GpuTierEnv {
     gpu_qkv : Option<bool>
 
     @clarg_default_doc = "on"
-    @clarg_doc = "Keep the classifier plane on the GPU — the best ms-per-GB region; 0 is the CPU A/B lever."
+    @clarg_doc = "Keep the classifier plane on the GPU - the best ms-per-GB region; 0 is the CPU A/B lever."
     gpu_cls : Option<bool>
 
     @clarg_doc = "Device-side routed MoE combine; 0 falls back to the host combine."
@@ -152,8 +152,11 @@ struct public VisionEnv {
     @clarg_doc = "Maximum soft tokens per image; dynamic-resolution geometry downscales to fit."
     vision_max_tokens : int = 280
 
-    @clarg_doc = "Path prefix: dump every letterboxed image fed to a vision embedder as <prefix><tag>.ppm — the human smoke test; empty = off."
+    @clarg_doc = "Path prefix: dump every letterboxed image fed to a vision embedder as <prefix><tag>.ppm - the human smoke test; empty = off."
     vision_dump : string = ""
+
+    @clarg_doc = "Serve the image turn as ONE fused prefill (per-query span mask); 0 pins the three-eval splice (head / media rows / tail) - the parity A/B rail."
+    span_fuse : bool = true
 }
 
 // ===== Metal backend =====
@@ -163,19 +166,19 @@ struct public MetalEnv {
     @clarg_doc = "Produce logits on the GPU; 0 pulls the classifier back to the CPU. Blob-only models force it on."
     logits : bool = true
 
-    @clarg_doc = "ggml-geometry QK/AV prefill attention (~10x the trio GEMMs); 0 pins the trio."
+    @clarg_doc = "Tiled QK/AV prefill attention (~10x the trio GEMMs); 0 pins the trio."
     attn : bool = true
 
     @clarg_doc = "Serve the non-causal media span on the prefill driver (AttnArgs.uend); 0 declines it to the CPU arm, which then needs declared CPU intent."
     span : bool = true
 
-    @clarg_doc = "Serve tower/embedder encodes on the Metal tower driver — the gemma4uv chain, the gemma4v ViT and gemma3v SigLIP block loops (their exact-plane lanes), the whisper-class block loops, and the conv frontends (whisper im2col + the qwen3a conv2d, which serves the q8 default); 0 pins the CPU tower."
+    @clarg_doc = "Serve tower/embedder encodes on the Metal tower driver - the gemma4uv chain, the gemma4v ViT and gemma3v SigLIP block loops (their exact-plane lanes), the whisper-class block loops, and the conv frontends (whisper im2col + the qwen3a conv2d, which serves the q8 default); 0 pins the CPU tower."
     tower : bool = true
 
     @clarg_doc = "Serve the whisper decoder side (cross-KV; the decode step under wdec_step) on the Metal ASR-decoder driver; 0 pins the CPU decoder."
     wdec : bool = true
 
-    @clarg_doc = "Serve the whisper DECODE STEP on the GPU too (needs wdec). Small decoders (n_text_state under the 1024 floor; set_metal_wdec_step_min_d) keep the CPU rail — the per-dispatch latency floor beats them."
+    @clarg_doc = "Serve the whisper DECODE STEP on the GPU too (needs wdec). Small decoders (n_text_state under the 1024 floor; set_metal_wdec_step_min_d) keep the CPU rail - the per-dispatch latency floor beats them."
     wdec_step : bool = true
 
     @clarg_doc = "Fused single-pass decode attention (assumes head_size 128); 0 is the A/B rail to the chunked pair."
@@ -186,6 +189,9 @@ struct public MetalEnv {
 
     @clarg_doc = "The mul_mm prefill GEMM; 0 falls back to the legacy per-op path."
     mulmm : bool = true
+
+    @clarg_doc = "GEMV-tail prefill dispatch: npos % 32 in [1,8] peels the last M tile's real rows onto the fixed-B GEMV family instead of billing a full 32-row tile; 0 pins the padded-tile path (the A/B rail)."
+    mm_tail : bool = true
 
     @clarg_default_doc = "~4 layers/chunk"
     @clarg_doc = "Command-buffer split: each chunk commits as encoded so the scheduler overlaps chunk k with k-1."
@@ -210,7 +216,7 @@ struct public MetalEnv {
     @clarg_doc = "MTP speculative decode chain: 0 off, 1 forced, -1 adaptive."
     spec : Option<int>
 
-    @clarg_doc = "Rows per GEMV threadgroup, clamped 1..32."
+    @clarg_doc = "Rows per MoE router/expert GEMV threadgroup, clamped 1..32 (the dense GEMV geometry is fixed)."
     gemv_tg : int = 4
 
     @clarg_doc = "Single-pass B8 twin for K-quant small-batch mv at B=5..8; 0 is the A/B rail."
@@ -218,6 +224,12 @@ struct public MetalEnv {
 
     @clarg_doc = "Ceiling in MiB for the device-side KV mirror, clamped 64..4096."
     kv_mirror_mb : int = 4096
+
+    @clarg_doc = "Pin the served working set (weight regions, planes, the recycled pool buffers) in an MTLResidencySet, macOS 15+: the per-commit residency pass stays a no-op, so the first submission after a CPU-only window stops repaying it (~15 ms/encode on the M1 Max released-rig image cell; ARCHITECTURE.md 2.12); 0 is the A/B rail."
+    residency : bool = true
+
+    @clarg_doc = "Seconds the residency-set heartbeat keeps re-requesting residency after the last served step (a requested set still un-wires over a long CPU-only window; ARCHITECTURE.md 2.12); 0 disables the heartbeat - the A/B rail."
+    heartbeat_s : int = 180
 
     @clarg_doc = "Barrier at every dispatch instead of at tracker-detected hazards (correctness bisect)."
     hazard_paranoid : bool = false
@@ -228,7 +240,7 @@ struct public MetalEnv {
     @clarg_doc = "Per-step pipeline trace: GPU envelope and true inter-step handoff idle, first steps plus outliers."
     pipe_debug : bool = false
 
-    @clarg_doc = "Comma-separated dispatch names to skip in decode — a bring-up bisect that breaks correctness."
+    @clarg_doc = "Comma-separated dispatch names to skip in decode - a bring-up bisect that breaks correctness."
     decode_skip : string = ""
 
     @clarg_doc = "Prefill twin of DASLLAMA_METAL_DECODE_SKIP."
@@ -368,7 +380,7 @@ struct public HarnessEnv {
 
     @clarg_path
     @clarg_default_doc = "auto-resolved from the models dir"
-    @clarg_doc = "Model used by the tuner's confirm gate (FULL path, not a bare filename). Unset: the gate auto-resolves from the models dir — the preferred confirm carrier, else the largest present q8 gguf; the fallback pins only when the box has no q8 model at all."
+    @clarg_doc = "Model used by the tuner's confirm gate (FULL path, not a bare filename). Unset: the gate auto-resolves from the models dir - the preferred confirm carrier, else the largest present q8 gguf; the fallback pins only when the box has no q8 model at all."
     confirm_model : string = ""
 
     @clarg_doc = "Override the batched-dispatch chunk count in the 1-core GEMM probe."
@@ -446,7 +458,7 @@ struct public BenchmarkEnv {
     @clarg_doc = "Skip the row-major arm of the isolated GEMM bench."
     bench_skip_rowmajor : bool = false
 
-    @clarg_doc = "Per-run detail from the llama.cpp comparison bench."
+    @clarg_doc = "Per-run detail from the comparison bench (lcpp_bench)."
     bench_verbose : bool = false
 
     @clarg_doc = "Override the minimum rows per dispatch chunk in the GEMM bench."
@@ -668,7 +680,7 @@ struct public CoreEnv {
     jobque_threads : Option<int>
 
     @clarg_default_doc = "2 on darwin (engine [init]), else 0"
-    @clarg_doc = "Worker affinity: 0 off, 1 ideal-processor hint, 2 hard mask — on darwin mode 2 is QoS classification (no pin API) and dasLLAMA defaults it on. Matters on big SMT boxes."
+    @clarg_doc = "Worker affinity: 0 off, 1 ideal-processor hint, 2 hard mask - on darwin mode 2 is QoS classification (no pin API) and dasLLAMA defaults it on. Matters on big SMT boxes."
     jobque_affinity : Option<int>
 
     @clarg_default_doc = "profile-driven"

@@ -52,6 +52,7 @@ require daslib/array_boost
 require daslib/archive
 require daslib/unroll
 require daslib/assert_once
+require daslib/only_nttp
 require daslib/ast_block_to_loop
 require daslib/ast_cursor
 require daslib/ast_match
@@ -323,10 +324,10 @@ def document_module_dasllama(_root : string) {
         group_by_regex("Model loading and sessions", mod, %regex~(load_model|create_session|create_kv_pool|release_kv_pages|create_batch_workspace|setup_dasllama_jobque|caps)$%%),
         group_by_regex("Prefix cache", mod, %regex~(create_prefix_cache|prefix_attach|prefix_insert|prefix_release|prefix_held_groups|prefix_chain_list)$%%),
         group_by_regex("Tokenizer", mod, %regex~(encode|decode|piece)$%%),
-        group_by_regex("Evaluation and sampling", mod, %regex~(eval|eval_embd|eval_embd_span|eval_batch|sample|set_seed|stats)$%%),
+        group_by_regex("Evaluation and sampling", mod, %regex~(eval|eval_embd|eval_embd_span|eval_embd_span_mrope|eval_batch|sample|set_seed|stats)$%%),
         group_by_regex("Generation", mod, %regex~(generate|generate_embd)$%%),
         group_by_regex("Embeddings", mod, %regex~(embed)$%%),
-        group_by_regex("Vision", mod, %regex~(encode_image)$%%),
+        group_by_regex("Vision and audio encoders", mod, %regex~(encode_image|encode_audio)$%%),
         group_by_regex("Chat", mod, %regex~(create_chat|create_chat_renderer|add_user|add_user_audio|add_user_image|add_assistant|render_turn|render_turn_image|render_turn_audio|render_assistant|render_close|respond|set_thinking)$%%),
         group_by_regex("Tool calling", mod, %regex~(set_tools|add_tool_results|render_assistant_calls|parse_calls)$%%),
         group_by_regex("Reasoning (thinking models)", mod, %regex~(split_reasoning|make_think_stream|think_feed|think_finish|think_drain|effective_stop_ids)$%%),
@@ -373,9 +374,13 @@ def document_module_dasllama(_root : string) {
         dasllama_type_stanza(f, "struct-dasllama_vision-VisionImage", "VisionImage",
             "A decoded RGB8 image: ``width``, ``height``, and the pixel bytes in ``rgb``. Produced by ``load_image_rgb`` (the optional ``dasllama_vision_io`` companion) or built directly; ``add_user_image`` / ``encode_image`` letterbox and normalize it to the model's geometry.")
         dasllama_type_stanza(f, "struct-dasllama_vision_embedder-VisionEmbedder", "VisionEmbedder",
-            "A loaded vision embedder of whatever family the mmproj GGUF turned out to be (gemma4uv — the gemma-4 dense embedder; gemma4v — the gemma-4 E-series ViT tower; gemma3v — the gemma-3 SigLIP tower), as produced by ``load_vision_embedder``, which sniffs the family. Pass it to ``create_chat`` to enable ``add_user_image`` turns; ``vision_proj_dim`` must match the decoder's embedding width (checked at create).")
+            "A loaded vision embedder of whatever family the mmproj GGUF turned out to be (gemma4uv — the gemma-4 dense embedder; gemma4v — the gemma-4 E-series ViT tower; gemma3v — the gemma-3 SigLIP tower; qwen3v — the Qwen3-Omni / dense Qwen3-VL ViT, deepstack included; qwen25v — the Qwen2.5-Omni/VL window-attention ViT), as produced by ``load_vision_embedder``, which sniffs the family. Pass it to ``create_chat`` to enable ``add_user_image`` turns; ``vision_proj_dim`` must match the decoder's embedding width (checked at create).")
         dasllama_type_stanza(f, "struct-dasllama_vision_embedder-VisionState", "VisionState",
             "Caller-owned scratch for the embedder forward of whichever family is carried: the buffers ``encode_image`` reuses across calls. One per embedder user; holds no image state between calls.")
+        dasllama_type_stanza(f, "struct-dasllama_audio_embedder-AudioEmbedder", "AudioEmbedder",
+            "A loaded audio encoder of whatever family the mmproj GGUF turned out to be (gemma4a — the gemma-4 E-series Conformer), as produced by ``load_audio_embedder``, which probes the file; ``audio_probe_proj_dim`` answers 0 where absence is an answer. ``audio_proj_dim`` must match the decoder's embedding width. The server's media worker owns one per armed slot.")
+        dasllama_type_stanza(f, "struct-dasllama_audio_embedder-AudioState", "AudioState",
+            "Caller-owned scratch for the audio encoder forward of whichever family is carried: the buffers ``encode_audio`` reuses across calls. One per embedder user; holds no clip state between calls.")
         dasllama_type_stanza(f, "struct-dasllama_image-DlimImageInfo", "DlimImageInfo",
             "One prepared image beside a GGUF, as listed by ``dlim_inventory``: ``file``, ``path``, ``bytes``, the image ``version``, its bake ``identity``, and a ``verdict`` — ``CURRENT`` loads; ``STALE vN`` is an older image version; ``OTHER`` a different bake configuration or box; ``FOREIGN`` a different flavor.")
         dasllama_type_stanza(f, "struct-dasllama_gpu_tier-GpuTierStatus", "GpuTierStatus",
@@ -421,7 +426,7 @@ def document_module_rtti(_root : string) {
     var groups <- array<DocGroup>(
         group_by_regex("Initialization and finalization", mod, %regex~(using|LineInfo|CodeOfPolicies|RttiValue_nothing)$%%),
         group_by_regex("Type access", mod, %regex~(get_dim|builtin_is_same_type|is_compatible_cast|get_das_type_name|is_same_type|each_dim|arg_types|arg_names|get_type_size|get_type_align)$%%),
-        group_by_regex("Rtti context access", mod, %regex~(get_total_functions|get_total_variables|get_function_info|get_variable_info|get_variable_value|get_function_by_mnh|get_line_info|this_context|context_for_each_function|context_for_each_variable|class_info|type_info)$%%),
+        group_by_regex("Rtti context access", mod, %regex~(get_total_functions|get_total_variables|get_function_info|get_variable_info|get_variable_value|get_function_by_mnh|get_line_info|this_context|context_for_each_function|context_for_each_variable|for_each_init_function|class_info|type_info)$%%),
         group_by_regex("Program access", mod, %regex~(program_for_each_module|program_for_each_registered_module|get_this_module|get_module|has_module)$%%),
         group_by_regex("Module access", mod, %regex~(module_for_each_structure|module_for_each_enumeration|module_for_each_function|module_for_each_generic|module_for_each_global|module_for_each_annotation|module_for_each_dependency)$%%),
         group_by_regex("Annotation access", mod, %regex~(get_annotation_argument_value|add_annotation_argument|get_annotation|get_annotation_argument|resolve_annotation|each_annotation|each_annotation_argument)$%%),
@@ -468,7 +473,7 @@ def document_module_ast(_root : string) {
         group_by_regex("Infer", mod, %regex~(infer_generic_type|update_alias_map)$%%),
         group_by_regex("Module queries", mod, %regex~(module_find_annotation|module_find_type_annotation|module_find_structure|module_find_enumeration|module_has_comment_reader|not_inferred)$%%),
         group_by_regex("Debug info helpers", mod, %regex~(debug_helper_.*)%%),
-        group_by_regex("AOT support", mod, %regex~(aot_require|aot_type_ann_get_field_ptr|aot_need_type_info|aot_previsit_get_field_ptr|aot_previsit_get_field|aot_visit_get_field|write_aot_body|write_aot_suffix|write_aot_macro_suffix|write_aot_macro_prefix|macro_aot_infix|getInitSemanticHashWithDep|get_aot_hash_comment)$%%),
+        group_by_regex("AOT support", mod, %regex~(aot_require|aot_type_ann_get_field_ptr|aot_need_type_info|aot_previsit_get_field_ptr|aot_previsit_get_field|aot_visit_get_field|write_aot_body|write_aot_suffix|write_aot_macro_suffix|write_aot_macro_prefix|macro_aot_infix|getInitSemanticHashWithDep|get_aot_hash_comment|set_aot_main_module_name_cpp)$%%),
         group_by_regex("String builder writer", mod, %regex~(string_builder_str|string_builder_clear)$%%),
         group_by_regex("GC", mod, %regex~(ast_gc_guard|ast_gc_collect_scope|verify_typedecl_gc|verify_expression_gc|delete_expression|delete_type)$%%),
         hide_group(group_by_regex("Internal ast infrastructure", mod, %regex~(builtin_ast_.*)%%))
@@ -579,6 +584,7 @@ def document_module_jsonrpc(_root : string) {
     var groups <- array<DocGroup>(
         group_by_regex("Envelope builders", mod, %regex~(response|error|error_with_data|serialize_id)$%%),
         group_by_regex("Server-side parsers", mod, %regex~(parse_request|parse_batch)$%%),
+        group_by_regex("Request scope", mod, %regex~(free_request|free_batch)$%%),
         group_by_regex("Outgoing request builders", mod, %regex~(make_request|make_notification|make_batch)$%%),
         group_by_regex("Response parsers", mod, %regex~(parse_response|parse_response_batch)$%%),
         group_by_regex("Framing helper", mod, %regex~(compact_json_whitespace)$%%),
@@ -901,6 +907,12 @@ def document_module_assert_once(_root : string) {
         group_by_regex("Assertion", mod, %regex~(assert_once)$%%)
     )
     document("Assert once", mod, "assert_once.rst", groups)
+}
+
+def document_module_only_nttp(_root : string) {
+    var mod = find_module("only_nttp")
+    var groups : array<DocGroup>
+    document("Only NTTP", mod, "only_nttp.rst", groups)
 }
 
 def document_module_ast_block_to_loop(_root : string) {
@@ -1912,6 +1924,7 @@ def main {  // nolint:STYLE038 — flat one-call-per-documented-module dispatch 
     document_module_archive(root)
     document_module_array_boost(root)
     document_module_assert_once(root)
+    document_module_only_nttp(root)
     document_module_ast_block_to_loop(root)
     document_module_ast_boost(root)
     document_module_ast_cursor(root)

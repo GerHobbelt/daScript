@@ -27,6 +27,7 @@ require dasllama/dasllama_tower public         // shared encoder-tower pieces (r
 require dasllama/dasllama_audio public         // audio tower (mel frontend + whisper encoder + projectors)
 require dasllama/dasllama_vision public        // image preprocessing rail (geometry, letterbox, normalize)
 require dasllama/dasllama_vision_embedder public   // the vision embedder of whatever family (gemma4uv / gemma4v) — image soft tokens
+require dasllama/dasllama_audio_embedder public    // the audio encoder of whatever family (gemma4a) — audio soft tokens
 require dasllama/dasllama_asr public           // uniform ASR surface (whisper today; parakeet/qwen3-asr land behind the same sniff)
 require dasllama/dasllama_vad public           // Silero-VAD (voice-activity detection): segments + streaming iterator
 require dasllama/dasllama_config public        // the explicit .dlim bake configuration — the --config / identity contract
@@ -158,8 +159,15 @@ def eval_embd(model : Model; var session : Session; embd : array<float>; npos : 
 def eval_embd_span(model : Model; var session : Session; embd : array<float>; npos, span_lo, span_hi : int64) {
     //! ``eval_embd`` for a prompt carrying one NON-CAUSAL image span: rows ``[span_lo, span_hi)``
     //! prefill with every query attending the whole span, the text around them causally — the
-    //! gemma vision decode shape (mtmd's non-causal media chunk).
+    //! gemma vision decode shape (non-causal media chunk).
     eval_embd_span_(model, session, embd, npos, span_lo, span_hi)
+}
+
+def eval_embd_span_mrope(model : Model; var session : Session; embd : array<float>; npos, span_lo, span_hi : int64; grid : int2) {
+    //! ``eval_embd_span``'s qwen mrope twin: the span rows rope as a ``grid``-shaped merged image
+    //! (position advance ``max(grid.x, grid.y)``, tracked on the session for every later eval);
+    //! same span mask, only the angles differ. Panics without ``rope.dimension_sections``.
+    eval_embd_span_mrope_(model, session, embd, npos, span_lo, span_hi, int64(grid.x), int64(grid.y))
 }
 
 def create_batch_workspace(model : Model) : BatchWorkspace {
@@ -210,7 +218,7 @@ def generate_embd(model : Model; var session : Session; embd : array<float>; npo
     //! ``generate``'s embedding-prefill twin: prefill ``npos`` pre-built embedding rows (the
     //! multimodal splice — see ``eval_embd``), then stream-sample exactly like ``generate``. The
     //! chat layer's audio turns run on this; use it directly for custom multimodal prompts.
-    return generate_embd_(model, session, embd, npos, params, max_tokens, 0l, 0l, blk)
+    return generate_embd_(model, session, embd, npos, params, max_tokens, 0l, 0l, int2(0), blk)
 }
 
 def generate_embd(model : Model; var session : Session; embd : array<float>; npos : int64;
@@ -219,7 +227,15 @@ def generate_embd(model : Model; var session : Session; embd : array<float>; npo
     //! ``generate_embd`` with a NON-CAUSAL span: rows ``[span_lo, span_hi)`` prefill as an image
     //! span (every query attends the whole span), the text around them causally — the gemma
     //! vision decode shape. The chat layer's image turns run on this.
-    return generate_embd_(model, session, embd, npos, params, max_tokens, span_lo, span_hi, blk)
+    return generate_embd_(model, session, embd, npos, params, max_tokens, span_lo, span_hi, int2(0), blk)
+}
+
+def generate_embd(model : Model; var session : Session; embd : array<float>; npos : int64;
+                  params : SamplingParams; max_tokens : int64; span_lo, span_hi : int64; grid : int2;
+                  blk : block<(id : int64; piece : string) : bool>) : int64 {
+    //! The span form with an mrope GRID (qwen vision): the span rows rope at grid positions
+    //! (merged nx×ny; the sequence position advances by max(nx, ny)) — the qwen image shape.
+    return generate_embd_(model, session, embd, npos, params, max_tokens, span_lo, span_hi, grid, blk)
 }
 
 // ===== Embeddings =====
@@ -281,6 +297,14 @@ def encode_image(embedder : VisionEmbedder; var scratch : VisionState; img : Vis
     return encode_image_(embedder, scratch, img, tag, out)
 }
 
+def encode_audio(embedder : AudioEmbedder; var scratch : AudioState; samples : array<float> | #;
+                 var out : array<float>) : int64 {
+    //! ``encode_image``'s audio twin: 16 kHz mono samples through the carried family's encoder
+    //! into ``out`` = npos × proj_dim soft tokens (returns npos). A scheduler owning its own
+    //! embedder calls this; the server's media worker is the worked example.
+    return encode_audio_(embedder, scratch, samples, out)
+}
+
 def add_assistant(model : Model; var chat : ChatSession; text : string) {
     //! Inject a KNOWN assistant reply (no generation): prefill the pending user turn and ``text``
     //! into the KV cache, then close the turn — like ``respond`` but with a supplied reply. The
@@ -317,8 +341,8 @@ def render_turn_image(model : Model; chat : ChatSession; var head : array<int64>
 
 def render_turn_audio(model : Model; chat : ChatSession; var head : array<int64>; var tail : array<int64>) {
     //! ``render_turn``'s AUDIO twin: the same two-span contract around the audio soft-token splice
-    //! (the template's audio span markers). The rows come from the family's audio encoder — for the
-    //! gemma-4 E-series, ``gemma4a_encode_all`` over the shared vision+audio mmproj.
+    //! (the template's audio span markers). Render-only (no KV, no encoder): the rows come from
+    //! ``encode_audio``, and a scheduler prefills head, rows, tail.
     render_turn_audio_(model, chat, head, tail)
 }
 

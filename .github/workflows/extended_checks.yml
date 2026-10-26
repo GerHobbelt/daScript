@@ -334,7 +334,8 @@ jobs:
       run: |
         set -eux
         cmake --build ./build --config Release --target check_format
-        $BIN/das-fmt.exe --path ./ --verify
+        # build/doc_verify holds .das extracted verbatim from RST by the doc-verify step above - not authored source
+        $BIN/das-fmt.exe --path ./ --verify --exclude-mask build/
 
     - name: "Run lint on changed .das files"
       if: matrix.target == 'linux'
@@ -482,6 +483,13 @@ jobs:
         set -eux
         python3 ci/test_check_shipped_skills.py
 
+    - name: "Markdown ASCII gate (python)"
+      if: matrix.target == 'linux'
+      run: |
+        set -eux
+        python3 ci/test_fix_md_ascii.py
+        python3 ci/fix_md_ascii.py --check
+
     - name: "Test watchdog tray wording (python)"
       if: matrix.target == 'linux'
       run: |
@@ -494,11 +502,14 @@ jobs:
         set -eux
         python3 ci/test_wheel_build.py
 
-    - name: "Test comment-guard hook (python)"
+    - name: "Test boulder-dash samples (both copies)"
       if: matrix.target == 'linux'
       run: |
         set -eux
-        python3 .claude/hooks/test_comment_guard.py
+        $BIN/daslang _dasroot_/dastest/dastest.das -- --color --failures-only --test ./examples/games/boulder-dash/test_cave.das
+        $BIN/daslang _dasroot_/dastest/dastest.das -- --color --failures-only --test ./examples/games/boulder-dash/test_generate.das
+        $BIN/daslang _dasroot_/dastest/dastest.das -- --color --failures-only --test ./web/examples/ui/samples/examples/boulder-dash/test_cave_rules.das
+        $BIN/daslang _dasroot_/dastest/dastest.das -- --color --failures-only --test ./web/examples/ui/samples/examples/boulder-dash/test_sfx_gen.das
 
     - name: "Test review-md discovery"
       if: matrix.target == 'linux'
@@ -516,6 +527,12 @@ jobs:
       run: |
         set -eux
         $BIN/daslang _dasroot_/dastest/dastest.das -- --color --failures-only --test ./dastest/tests
+
+    - name: "Test benchmark results updater"
+      if: matrix.target == 'linux'
+      run: |
+        set -eux
+        $BIN/daslang _dasroot_/dastest/dastest.das -- --color --failures-only --test ./benchmarks/sql/tests/test_update_results.das
 
     - name: "Run REVIEW.das gates"
       # the CI counterpart of the make_pr step-0a walk (fail-fix: agents only

@@ -32,14 +32,33 @@ def aotFieldName(name : string) : string {
     return result;
 }
 
+var private g_aot_main_module_name = ""
+
+def public set_aot_main_module_name(name : string) {
+    //! aotModuleName returns this for the unnamed (promoted) main module; "" (the default) leaves its types in an anonymous namespace.
+    //! Module-global for the process - set it around one emission and restore "".
+    //! Forwards to the C++ twin so DebugInfoHelper's cached cpp type names agree.
+    g_aot_main_module_name = name
+    set_aot_main_module_name_cpp(name)
+}
+
 def aotModuleName(pm : Module?) {
     if (pm.name.empty()) {
-        return "";
+        return g_aot_main_module_name;
     } elif (pm.name == "$") {
         return "_builtin_";
     } else {
         return string(pm.name);
     }
+}
+
+def aotModuleNameFromString(module_name : string) : string {
+    if (empty(module_name)) {
+        return g_aot_main_module_name;
+    } elif (module_name == "$") {
+        return "_builtin_";
+    }
+    return module_name;
 }
 
 
@@ -431,10 +450,11 @@ def describeCppTypeEx(typeDecl : TypeDeclPtr;   // nolint:STYLE038 - one arm per
             }
         } elif (baseType == Type.tStructure) {
             if (typeDecl.structType != null) {
-                if (typeDecl.structType._module.name.empty()) {
+                let ns = aotModuleName(typeDecl.structType._module)
+                if (ns.empty()) {
                     write(writer, "struct {aotStructName(typeDecl.structType)}")
                 } else {
-                    write(writer, "struct {aotModuleName(typeDecl.structType._module)}::{aotStructName(typeDecl.structType)}")
+                    write(writer, "struct {ns}::{aotStructName(typeDecl.structType)}")
                 }
             } else {
                 write(writer, "DAS_COMMENT(unspecified structure) ");
@@ -456,12 +476,13 @@ def describeCppTypeEx(typeDecl : TypeDeclPtr;   // nolint:STYLE038 - one arm per
             }
         } elif (typeDecl.isEnumT) {
             if (typeDecl.enumType != null) {
+                let ns = aotModuleName(typeDecl.enumType._module)
                 if (typeDecl.enumType.external) {
                     write(writer, "DAS_COMMENT(bound_enum) {typeDecl.enumType.cppName}");
-                } elif (typeDecl.enumType._module.name.empty()) {
+                } elif (ns.empty()) {
                     write(writer, "DAS_COMMENT(enum) {aotEnumName(typeDecl.enumType)}");
                 } else {
-                    write(writer, "DAS_COMMENT(enum) {aotModuleName(typeDecl.enumType._module)}::{aotEnumName(typeDecl.enumType)}")
+                    write(writer, "DAS_COMMENT(enum) {ns}::{aotEnumName(typeDecl.enumType)}")
                 }
             } else {
                 write(writer, "DAS_COMMENT(unspecified enumeration)")
@@ -908,11 +929,12 @@ class public AotDebugInfoHelper {
             writeDim(writer, fld, suffix);
             writeArgTypes(writer, fld, suffix);
             writeArgNames(writer, fld, suffix);
-            let prefix = (info.module_name |> !empty(info.module_name)) ? "{info.module_name}::" : "";
+            let ns = aotModuleNameFromString(info.module_name)
+            let prefix = !empty(ns) ? "{ns}::" : "";
             writeVarAnnotationArgs(writer, fld, "{structInfoName(info)}_field_{fi}_ann");
             let fldAnnRef = fld.annotation_argument_count > 0u ? ", {structInfoName(info)}_field_{fi}_ann, {int(fld.annotation_argument_count)}u" : ""
             let structCppName = aotSuffixNameEx(info.name, "_S",
-                g_struct_enum_collide |> key_exists(structEnumNsKey(info.module_name, info.name)))
+                g_struct_enum_collide |> key_exists(structEnumNsKey(ns, info.name)))
             write(*writer, "VarInfo {structInfoName(info)}_field_{fi} =  \{ {describeCppVarInfo(prefix + structCppName, fld,suffix)}{fldAnnRef} \};\n");
         }
         let fields = (each(range(info.count))
@@ -1951,9 +1973,71 @@ class public CppAot : AstVisitor {
                 "<<=", ">>=", "<<<=", ">>>="
                 ]._any(_ == op)
     }
+    def needsOrderedOperands(that : ExprOp2?) {
+        if ((that.left.flags.noSideEffects && that.right.flags.noSideEffects)
+                || !that.func.flags.builtIn || that.func.flags.callBased
+                || isRefPolicyOp(that) || isShortCircuitBoolOp(that)) return false;
+        if (isOpPolicy2(that)) {
+            assume pt = opPolicyBase(that);
+            if (policyRefArg(pt, that.left._type) || policyRefArg(pt, that.right._type)) return false;
+        }
+        return true;
+    }
+    def isShortCircuitBoolOp(that : ExprOp2?) {
+        if (isOpPolicy2(that) || that._type.baseType != Type.tBool) return false;
+        let op = string(that.op);
+        return op == "&&" || op == "||";
+    }
+    def policyRefArg(pt, argType : TypeDeclPtr) {
+        return policyArgNeedCast(pt, argType) && argType.isRefType;
+    }
+    def plainOp2Text(that : ExprOp2?) : string {
+        if (that._type.baseType == Type.tBool) {
+            let that_op = string(that.op)
+            match (that_op) {
+                if ("&") { return "&&"; }
+                if ("|") { return "||"; }
+                if ("^" || "^^") { return "!="; }
+            }
+        }
+        return string(that.op);
+    }
+    def writeOrderedPolicyArg(pt, argType : TypeDeclPtr; argExpr : string) {
+        if (policyArgNeedCast(pt, argType)) {
+            let cfg = DescribeConfig(skip_ref = true, skip_const = true, cross_platform = cross_platform)
+            let type_str = describeCppType(argType, cfg);
+            write(*ss, "cast<{type_str}>::from({argExpr})");
+        } else {
+            write(*ss, argExpr);
+        }
+    }
 
     def override preVisitExprOp2(var that : ExprOp2?) {
         if (!noBracket(that)) write(*ss, "(");
+        if (needsOrderedOperands(that)) {
+            write(*ss, "[&](auto && __lr) \{ return ");
+            if (isOpPolicy2(that)) {
+                assume pt = opPolicyBase(that);
+                if (policyResultNeedCast(pt, that._type)) {
+                    let cfg = DescribeConfig(skip_ref = true, skip_const = true, cross_platform = cross_platform)
+                    let type_str = describeCppType(that._type, cfg);
+                    write(*ss, "cast<{type_str}>::to(");
+                }
+                outPolicy(pt);
+                write(*ss, "::{opPolicyName(that)}(");
+                writeOrderedPolicyArg(pt, that.left._type, "__lr.left");
+                write(*ss, ",");
+                writeOrderedPolicyArg(pt, that.right._type, "__lr.right");
+                write(*ss, ",*__context__,nullptr)");
+                if (policyResultNeedCast(pt, that._type)) {
+                    write(*ss, ")");
+                }
+            } else {
+                write(*ss, "(__lr.left {plainOp2Text(that)} __lr.right)");
+            }
+            write(*ss, "; \}(das_ordered2\{ ");
+            return ;
+        }
         if (!that.func.flags.builtIn || that.func.flags.callBased) {
             that.arguments |> clear();
             var left := that.left;
@@ -1993,6 +2077,10 @@ class public CppAot : AstVisitor {
         }
     }
     def override preVisitExprOp2Right(that : ExprOp2?; right : ExpressionPtr) {
+        if (needsOrderedOperands(that)) {
+            write(*ss, ", ");
+            return ;
+        }
         if (!that.func.flags.builtIn || that.func.flags.callBased) {
             CallFunc_visitCallArg(that, that.left, false);
             CallFunc_preVisitCallArg(that, that.right, true);
@@ -2020,22 +2108,17 @@ class public CppAot : AstVisitor {
         } elif (isSetBool(that)) {
             write(*ss, "),(");
         } else {
-            if (that._type.baseType == Type.tBool) {
-                var op = "";
-                let that_op = string(that.op)
-                match (that_op) {
-                    if ("&") { op = "&&"; }
-                    if ("|") { op = "||"; }
-                    if ("^" || "^^") { op = "!="; }
-                    if (_) { op = that_op; }
-                }
-                write(*ss, " {op} ");
-            } else {
-                write(*ss, " {that.op} ");
-            }
+            write(*ss, " {plainOp2Text(that)} ");
         }
     }
     def override visitExprOp2(var that : ExprOp2?) : ExpressionPtr {
+        if (needsOrderedOperands(that)) {
+            write(*ss, " \})");
+            if (!noBracket(that)) {
+                write(*ss, ")");
+            }
+            return that;
+        }
         if (!that.func.flags.builtIn || that.func.flags.callBased) {
             CallFunc_visitCallArg(that, that.right, true);
             CallFunc_visit(that);
@@ -2443,8 +2526,9 @@ class public CppAot : AstVisitor {
         return c;
     }
     def override visitExprConstPtr(var c : ExprConstPtr?) : ExpressionPtr {
-        if (c.getValue != null) {
-            write(*ss, "((void *) 0x{unsafe(reinterpret<int64>(c.getValue)):x}))");
+        let pvalue = c.getValue
+        if (pvalue != null) {
+            write(*ss, "((void *) 0x{unsafe(reinterpret<int64>(pvalue)):x})");
         } else {
             write(*ss, "nullptr");
         }
@@ -3935,7 +4019,7 @@ def private aotEmitStruct(ps : Structure?;
 def public dumpDependencies(program : ProgramPtr; var aotVisitor : CppAot?) {
     //! Writes forward declarations and dependent type/function definitions for AOT output.
     buildStructEnumCollisions(program);
-    let utm = new UseTypeMarker();
+    var utm = new UseTypeMarker();
     make_visitor(*utm) $(adapter) {
         visit(program, adapter);
     }
@@ -3970,7 +4054,9 @@ def public dumpDependencies(program : ProgramPtr; var aotVisitor : CppAot?) {
             }
         });
     })
-
+    unsafe {
+        delete utm
+    }
 }
 
 class ArgsConverter : AstVisitor {
@@ -4068,16 +4154,12 @@ def public collectProgramUsedFunctions(program : ProgramPtr; all_modules : bool;
 
 def registerAotCpp(var logs : StringBuilderWriter?; program : ProgramPtr; var context : Context; cross_platform; headers, all_modules : bool = false) {
     let fnn = collectProgramUsedFunctions(program, all_modules, false);
-    let visitor = new ArgsConverter(logs, cross_platform);
+    var visitor = new ArgsConverter(logs, cross_platform);
     make_visitor(*visitor) $(adapter_marker) {
         visit(program, adapter_marker);
     }
-
-    var funInit = false;
-    for (fn in fnn) {
-        if (fn.flags.init) {
-            funInit = true;
-        }
+    unsafe {
+        delete visitor
     }
 
     if (!fnn.empty()) {
@@ -4179,9 +4261,10 @@ def public compile_and_simulate(input : string, var access; var mg : ModuleGroup
 }
 
 
-def public fail_on_aot_emit_error(program : ProgramPtr) {
+def public log_aot_emit_errors(program : ProgramPtr) : bool {
+    //! Logs collected emit errors; returns true when the program has any.
     if (!program.flags.macroException && !program.flags.failToCompile) {
-        return
+        return false
     }
     for (err in program.errors) {
         var msg = "{describe(err.at)}: error[{int(err.cerr)}]: {err.what}"
@@ -4193,7 +4276,13 @@ def public fail_on_aot_emit_error(program : ProgramPtr) {
         }
         to_log(LOG_ERROR, "{msg}\n")
     }
-    panic("AOT codegen failed: {length(program.errors)} codegen error(s) during emission (see log)")
+    return true
+}
+
+def public fail_on_aot_emit_error(program : ProgramPtr) {
+    if (log_aot_emit_errors(program)) {
+        panic("AOT codegen failed: {length(program.errors)} codegen error(s) during emission (see log)")
+    }
 }
 
 [export]
@@ -4221,7 +4310,7 @@ def public run_aot(prog : Program?; var pctx : Context?; cop : CodeOfPolicies) :
             write(writer, "namespace das \{\n");
             write(writer, "namespace {program.thisNamespace} \{\n");
             build_string() $(tmp_writer) {
-                let marker_vis = new NoAotMarker();
+                var marker_vis = new NoAotMarker();
                 make_visitor(*marker_vis) $(adapter_marker) {
                     visit(program, adapter_marker);
                 }
@@ -4266,6 +4355,9 @@ def public run_aot(prog : Program?; var pctx : Context?; cop : CodeOfPolicies) :
                     delete cpp_aot.helper.helper
                     delete cpp_aot.collector
                     delete cpp_aot
+                    delete flags
+                    delete pmarker
+                    delete marker_vis
                 }
                 fail_on_aot_emit_error(program)
             }
@@ -4297,7 +4389,7 @@ def public run_aot_function(prog : Program?; var pctx : Context?; cop : CodeOfPo
         let (modules_str, noAotModule) = getRequiredModulesFor(program)
         if ((program._options |> find_arg("no_aot") ?as tBool ?? false) || noAotModule) return
         build_string() $(tmp_writer) {
-            let marker_vis = new NoAotMarker();
+            var marker_vis = new NoAotMarker();
             make_visitor(*marker_vis) $(adapter_marker) {
                 visit(program, adapter_marker);
             }
@@ -4343,6 +4435,9 @@ def public run_aot_function(prog : Program?; var pctx : Context?; cop : CodeOfPo
                 delete cpp_aot.helper.helper
                 delete cpp_aot.collector
                 delete cpp_aot
+                delete flags
+                delete pmarker
+                delete marker_vis
             }
             fail_on_aot_emit_error(program)
             let begin_pos = find(full_output, AOT_FUNC_BEGIN)

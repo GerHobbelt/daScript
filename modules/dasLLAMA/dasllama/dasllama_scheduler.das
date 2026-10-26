@@ -58,10 +58,11 @@ struct PendingReq {
     // MEDIA splice (images today; audio rides the same fields): `n_media` embedding rows that
     // prefill BETWEEN prompt[media_at-1] and prompt[media_at] — the render seam hands the two
     // token spans and the encoder hands the rows. Zero rows = an ordinary text request.
-    media_embd : array<float>               // n_media * model.config.dim soft-token rows
+    media_embd : array<float>               // n_media rows: dim-wide (audio), dim*(1+n_deepstack)-wide (images — what encode_image emits)
     n_media : int64
     media_at : int64                        // prompt index the rows splice at (0 <= media_at <= |prompt|)
     media_non_causal : bool                 // the rows attend each other in full (gemma vision); audio is causal
+    media_grid : int2                       // qwen mrope: the merged image grid (nx, ny) roping the rows; (0,0) = sequential positions (gemma, audio)
 }
 
 //! One active generation stream: the owned KV session plus its request state. Managed wholly by
@@ -78,6 +79,7 @@ struct Stream {
     n_media : int64
     media_at : int64
     media_non_causal : bool
+    media_grid : int2
     media_done : bool                       // the rows have been evaled (their own prefill quantum)
     max_new : int64
     n_gen : int64                           // tokens emitted so far
@@ -133,6 +135,7 @@ struct Scheduler {
     donate_toks : array<int64>              // reap-time scratch: tail eval + the insert token list
     // counters (/v1/stats and server_bench read these)
     n_admitted : int64
+    mrope_streams : int64                   // admitted streams whose media rode the mrope grid walk
     n_finished : int64                      // reaped streams (any finish, evictions included)
     n_evicted : int64                       // evictions, active or still queued
     decode_steps : int64
@@ -191,11 +194,26 @@ def submit(model : Model; var sch : Scheduler; var req : PendingReq) : bool {
         if (req.media_at < 0l || req.media_at > np) {
             panic("dasllama_scheduler: media splice at {req.media_at} outside the {np}-token prompt (stream {req.id})")
         }
-        if (long_length(req.media_embd) < req.n_media * model.config.dim) {
-            panic("dasllama_scheduler: {req.n_media} media rows need {req.n_media * model.config.dim} floats, got {length(req.media_embd)} (stream {req.id})")
+        // image rows on a deepstack decoder must arrive (1+n)·dim-wide (what the tower's
+        // encode_image emits) — a narrow feed would silently skip the per-layer slice adds
+        let media_ds = req.media_non_causal ? model.config.n_deepstack : 0l
+        let media_need = req.n_media * model.config.dim * (1l + media_ds)
+        if (long_length(req.media_embd) != media_need) {
+            panic("dasllama_scheduler: {req.n_media} media rows need {media_need} floats ({media_ds} deepstack slices at dim {model.config.dim}), got {length(req.media_embd)} (stream {req.id})")
         }
-    } elif (long_length(req.media_embd) != 0l || req.media_at != 0l) {
-        panic("dasllama_scheduler: media rows or media_at set with n_media == 0 (stream {req.id}) - the rows would be silently dropped")
+        if (min(req.media_grid.x, req.media_grid.y) < 0 || ((req.media_grid.x > 0) != (req.media_grid.y > 0))) {
+            panic("dasllama_scheduler: media_grid {req.media_grid} is neither (0,0) nor a positive grid (stream {req.id})")
+        }
+        if (req.media_grid.x > 0) {
+            if (int64(req.media_grid.x) * int64(req.media_grid.y) != req.n_media) {
+                panic("dasllama_scheduler: media_grid {req.media_grid} shapes {req.media_grid.x * req.media_grid.y} rows but n_media is {req.n_media} (stream {req.id})")
+            }
+            if (!req.media_non_causal) {
+                panic("dasllama_scheduler: media_grid on causal media rows (stream {req.id}) - the mrope walk is an image-span contract")
+            }
+        }
+    } elif (long_length(req.media_embd) != 0l || req.media_at != 0l || req.media_grid != int2(0)) {
+        panic("dasllama_scheduler: media rows, media_at, or media_grid set with n_media == 0 (stream {req.id}) - the rows would be silently dropped")
     }
     if (np + req.n_media + 1l > model.config.seq_len) {
         panic("dasllama_scheduler: {np + req.n_media}-position prompt does not fit seq_len {model.config.seq_len} (stream {req.id}) - the wiring must reject it first")
@@ -348,6 +366,7 @@ def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent
                          media_embd <- sch.queue[0].media_embd, n_media = sch.queue[0].n_media,
                          media_at = sch.queue[0].media_at,
                          media_non_causal = sch.queue[0].media_non_causal,
+                         media_grid = sch.queue[0].media_grid,
                          max_new = sch.queue[0].max_new, t_admit = ref_time_ticks())
         if (sch.paged && st.n_media > 0l) {
             // a media stream's KV past the splice does NOT follow from its token ids, so neither
@@ -371,8 +390,12 @@ def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent
         if (sch.queue[0].seed != 0) {
             set_seed(st.session, sch.queue[0].seed)
         }
+        if (st.media_grid.x > 0) {
+            sch.mrope_streams ++
+        }
         let wait_ms = sch.queue[0].t_submit != 0l ? int64(get_time_usec(sch.queue[0].t_submit)) / 1000l : 0l
-        let media_note = st.n_media > 0l ? " + {st.n_media} media rows" : ""
+        let grid_note = st.media_grid.x > 0 ? " (mrope grid {st.media_grid.x}x{st.media_grid.y})" : ""
+        let media_note = st.n_media > 0l ? " + {st.n_media} media rows{grid_note}" : ""
         to_log(LOG_INFO, "[stream {st.id}] start: prompt={length(st.prompt)} tok{media_note} (cached={st.n_cached}), queue_wait={wait_ms}ms, active={length(sch.streams) + 1}/{sch.max_streams}\n")
         for (tk in st.prompt) {   // poll-surface preview: whole pieces up to the head cap
             let p = piece(m, tk)
@@ -452,8 +475,14 @@ def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent
         // Head tokens chunk normally up to media_at, the tail resumes after.
         let media_pending = sch.streams[i].n_media > 0l && !sch.streams[i].media_done
         if (media_pending && sch.streams[i].n_prefilled >= sch.streams[i].media_at) {
-            eval_embd(m, sch.streams[i].session, sch.streams[i].media_embd, sch.streams[i].n_media,
-                      sch.streams[i].media_non_causal)
+            if (sch.streams[i].media_grid.x > 0) {   // qwen mrope: grid angles + the session-tracked position delta
+                eval_embd_span_mrope(m, sch.streams[i].session, sch.streams[i].media_embd,
+                                     sch.streams[i].n_media, 0l, sch.streams[i].n_media,
+                                     sch.streams[i].media_grid)
+            } else {
+                eval_embd(m, sch.streams[i].session, sch.streams[i].media_embd, sch.streams[i].n_media,
+                          sch.streams[i].media_non_causal)
+            }
             sch.streams[i].media_done = true
             sch.prefill_tokens += sch.streams[i].n_media
         } else {

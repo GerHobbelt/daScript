@@ -16,6 +16,11 @@
       "files" : ["examples/pacman/main.das", "examples/pacman/live_stub.das"]
     },
     {
+      "name" : "Game: Boulder Dash (3D, arrows + Z grab)",
+      "slug" : "boulder-dash",
+      "files" : ["examples/boulder-dash/main.das", "examples/boulder-dash/cave.das", "examples/boulder-dash/cave_gen.das", "examples/boulder-dash/sfx_gen.das", "examples/boulder-dash/live_stub.das"]
+    },
+    {
       "name" : "ImGui: Fourier Series (epicycles)",
       "slug" : "furier",
       "files" : ["examples/furier.das"]
@@ -101,6 +106,10 @@
     {
       "name" : "Tests",
       "files" : ["examples/tests.das"]
+    },
+    {
+      "name" : "Linq: group by + average",
+      "files" : ["examples/linq_cars.das"]
     },
     {
       "name" : "Dictionary (benchmark)",

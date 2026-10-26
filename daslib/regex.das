@@ -916,7 +916,10 @@ def private re_match2_char(var regex : Regex; var node : ReNode?; str : uint8 co
     }
     if (*str == 0u8) return null
     unsafe {
-        if (memcmp(reinterpret<uint8?>(node.text), str, node.textLen) != 0) return null
+        for (i in range(node.textLen)) {
+            let c = int(*(str + i))
+            if (c == 0 || character_uat(node.text, i) != c) return null
+        }
         var tail = str + node.textLen
         node.tail = tail
         var node2 = node.next
@@ -958,7 +961,8 @@ def private re_match2_char_ci(var regex : Regex; var node : ReNode?; str : uint8
     if (*str == 0u8) return null
     unsafe {
         for (i in range(node.textLen)) {
-            if (ci_lower(character_uat(node.text, i)) != ci_lower(int(*(str + i)))) return null
+            let c = int(*(str + i))
+            if (c == 0 || ci_lower(character_uat(node.text, i)) != ci_lower(c)) return null
         }
         var tail = str + node.textLen
         node.tail = tail
@@ -1525,8 +1529,8 @@ def regex_compile(var re : Regex; expr : string; case_insensitive : bool = false
         re_assign_next(re)
         re_assign_groups(re)
         re_assign_match_functions(re)
-        re_early_out(re.earlyOut, re.root)
-        re.canEarlyOut = !is_set_empty(re.earlyOut)
+        let matchesEmpty = re_early_out(re.earlyOut, re.root)
+        re.canEarlyOut = !matchesEmpty && !is_set_empty(re.earlyOut)
     }
     return re.root != null
 }
