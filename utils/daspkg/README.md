@@ -38,7 +38,7 @@ daslang utils/daspkg/main.das -- install --global dasImgui
 | `upgrade [name]` | Upgrade to latest version |
 | `list` | List installed packages |
 | `search <query>` | Search the package index |
-| `build` | Build all C/C++ packages (cmake) |
+| `build [name]` | Build all C/C++ packages (cmake), or only the named one |
 | `check` | Verify installed packages are present |
 | `doctor` | Check environment (git, cmake, gh) |
 | `release [--out <dir>] [--paranoid \| --quick \| --fat <class>]` | Bundle project as a redistributable standalone. A plain release mints the tune sidecar on the build box and ships it; `--quick` inherits a complete existing one instead of minting; `--fat <class>` builds a fat exe from the class profiles - no mint, no sidecar |
@@ -235,6 +235,30 @@ skips an entry whose list leaves out the sweep host instead of failing on it; an
 exits 3 under the sweep is also a skip, flagged as a stale index entry until the next
 `update-index`. A name outside the vocabulary fails the manifest outright, under `--force` too.
 
+### Moving a clone into modules/
+
+A git install clones into `modules/.daspkg_tmp/<name>` and then renames that directory into
+place. Windows refuses to rename a directory while any process holds a file under it - an
+editor's git watcher opening the new `.git`, antivirus, the search indexer - so the rename is
+retried, then the tree is copied and the clone left for the next install's stale-tmp cleanup.
+An existing `modules/<name>` that cannot be removed fails the install instead; that is the case
+where a running daslang holds the package's `.shared_module`. A copy that meets a symlink or
+junction fails rather than drop it. `update` and `upgrade` move the installed copy aside first
+and put it and its lock entry back when the reinstall fails; a local `update` gates the source's
+manifest before it removes anything.
+
+### Manifest checks against this daslang
+
+`install` runs the manifest's `package()` before anything lands in `modules/`. A manifest that
+does not compile or throws under this daslang fails the install (exit 1), under `--force` too: its
+build and dependencies are unknowable, and installing the files without them would report a
+package that is not there. The usual cause is a manifest written against a newer daslang, so
+the error says so. Inside the install, a `build()` that cannot run fails the install the same way.
+
+A `package_min_sdk` newer than this daslang's version refuses the install with exit 1; `--force`
+installs anyway with a warning. A floor that is not a version fails the manifest. A host the
+platform declaration leaves out is refused first, so the sweep still reads exit 3 as a skip.
+
 ### Wasm archive staging {#wasm-archive-staging}
 
 The web build pins every archive it produces - the runtime and each module - into its own
@@ -311,6 +335,23 @@ daslang dastest/dastest.das -- --test utils/daspkg/test_daspkg_git.das
 - Only external dependency: `git` CLI. No HTTP library needed.
 - Shallow clones (`--depth 1`) for speed.
 - Local installs: filesystem copy, no git.
+
+### External module forwarding {#external-module-forwarding}
+
+When invoked through `daslang -load_module <directory>`, release compiler subprocesses
+inherit those explicit module mounts (native programs, companions, tuning harnesses, and WebAssembly).
+Repeat the option for multiple external modules; options after `--` belong to the
+packager and are not forwarded as compiler options.
+
+On Windows, module directory arguments reject percent signs and exclamation marks
+because `cmd` can expand them inside double quotes. They also reject double quotes
+and line breaks. On other platforms, single-quoted arguments escape embedded single
+quotes so the shell passes each directory as one literal argument.
+
+To exercise the external-mount WebAssembly release fixture on an emsdk host with
+built wasm64 archives, set `DASPKG_TEST_WASM_LIB_DIR` to the archive directory when
+running the daspkg unit suite. This opt-in requires the release to produce its wasm
+artifact; the ordinary suite does not require emsdk.
 
 ## Requirements
 

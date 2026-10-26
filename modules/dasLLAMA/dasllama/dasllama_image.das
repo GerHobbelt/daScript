@@ -40,7 +40,7 @@ require dasllama/dasllama_gemm_schema   // the q8 block geometry the mint's zero
 // WhisperModel.enc) contribute their planes under dotted names ("enc.fblob"); string-array
 // fields ride the meta blob via serialize_strings — raw string pointers can't be planes.
 
-let IMAGE_VERSION = 44   // the vulkan lane's device twin precedes the planar sections
+let IMAGE_VERSION = 45   // Config.pooling and both tokenizers' add_eos flag ride the meta
 
 //! The metal (blob-only) flavor's identity tag: q8 planes ride the 34B block_q8_0 blob and the
 //! kq scale planes their GPU forms (convert_model_to_metal_blob) — flavors are per-config and
@@ -58,9 +58,8 @@ struct ImgSection {
 }
 
 [arch(at = "../ARCHITECTURE_IMAGE.md#image-identity-backend-order")]
-def image_identity(tag : string = ""; quant : string = "q8") : string {
-    return image_identity_of(image_config_for(tag, quant), tag)
-}
+def image_identity(tag : string = ""; quant : string = "q8") : string =>
+    image_identity_of(image_config_for(tag, quant), tag)
 
 //! The configuration an image under `tag` is keyed and stored by: the box's current one, or the
 //! default one for a family registered config-free (no CPU knob shapes its bytes, so its image
@@ -75,9 +74,8 @@ def image_config_for(tag : string; quant : string = "q8") : DlimConfiguration {
 //! The identity of an explicit configuration — the ONE spelling every identity consumer (the
 //! loader, the peek verdicts, the converter's want/have compare, the tests) formats through, so
 //! the schema version and the pack-code version can never be folded in two different ways.
-def image_identity_of(c : DlimConfiguration; tag : string = "") : string {
-    return dlim_identity(c, IMAGE_VERSION, tag, PACK_VERSION)
-}
+def image_identity_of(c : DlimConfiguration; tag : string = "") : string =>
+    dlim_identity(c, IMAGE_VERSION, tag, PACK_VERSION)
 
 //! the CPU lane's spelling: the box's tune class where the tune framework is built, the architecture alone otherwise -
 //! never the active backend, which is a pin the identity supersedes
@@ -202,7 +200,7 @@ def image_peek(path : string) : DlimPeek {
         }
         return p
     }
-    var bp = unsafe(reinterpret<uint8 const?>(base))
+    let bp = unsafe(reinterpret<uint8 const?>(base))
     p.bytes = int64(msize)
     p.version = int(read_u32(bp, 4l))
     p.layout = read_u64(bp, 48l)
@@ -488,6 +486,26 @@ struct ImgWriter {
     ok : bool = true
 }
 
+var private g_image_write_fails_after_bytes = 0ul
+var private g_image_write_fault_hits = 0
+
+//! Test seam: a file save that carries an image past `after_bytes` fails as a full disk does; 0 turns it off.
+def set_image_write_fault(after_bytes : uint64) {
+    g_image_write_fails_after_bytes = after_bytes
+}
+
+//! Current value of the [[set_image_write_fault]] seam (0 = off), so a fixture restores what it found.
+def get_image_write_fault() : uint64 => g_image_write_fails_after_bytes
+
+//! How many saves the [[set_image_write_fault]] seam has failed in this process.
+def image_write_fault_hits() : int => g_image_write_fault_hits
+
+def private image_write_faulted(bytes : uint64) : bool {
+    return false if (g_image_write_fails_after_bytes == 0ul || bytes <= g_image_write_fails_after_bytes)
+    g_image_write_fault_hits++
+    return true
+}
+
 def private w_open(path : string; total : uint64) : ImgWriter {
     let h = unsafe(dwrite_open(path, total, uint64(DWRITE_STAGING_BAND)))
     return ImgWriter(dwrite_h = h, ok = h != null)
@@ -618,14 +636,14 @@ def private store_at(var b : array<uint8>; at : int; v : auto(TT)) {
 
 def private read_u32(p : uint8 const?; at : int64) : uint {
     unsafe {
-        var q = reinterpret<uint const?>(p + at)
+        let q = reinterpret<uint const?>(p + at)
         return q[0]
     }
 }
 
 def private read_u64(p : uint8 const?; at : int64) : uint64 {
     unsafe {
-        var q = reinterpret<uint64 const?>(p + at)
+        let q = reinterpret<uint64 const?>(p + at)
         return q[0]
     }
 }
@@ -712,6 +730,7 @@ def private serialize_tokenizer(var arch : Archive; var tk : Tokenizer) {
     arch |> serialize_raw(tk.spm.add_space_prefix)
     arch |> serialize_raw(tk.spm.bos_id)
     arch |> serialize_raw(tk.spm.eos_id)
+    arch |> serialize_raw(tk.spm.add_eos)
     serialize_strings(arch, tk.bpe.vocab)
     serialize_pod_array(arch, tk.bpe.token_type)
     arch |> serialize(tk.bpe.pre)
@@ -719,6 +738,7 @@ def private serialize_tokenizer(var arch : Archive; var tk : Tokenizer) {
     arch |> serialize_raw(tk.bpe.eos_id)
     arch |> serialize_raw(tk.bpe.spm_space)
     arch |> serialize_raw(tk.bpe.add_bos)
+    arch |> serialize_raw(tk.bpe.add_eos)
     var merges : array<string>
     if (!arch.reading) {
         merges |> resize(length(tk.bpe.merge_rank))
@@ -838,12 +858,12 @@ def serialize_image_meta(var arch : Archive; var t : Model) {
 //! the 4 deliberate skips: blocks, blob_scaled, image_map, image_bytes; the plane table counts as ONE field.
 let IMAGE_META_FIELDS = 81 + 4
 
-// the tokenizer's tripwires: the SentencePiece backend's five serialized meta fields + its three
-// derived tables (lookup, pair_merge, bkey_id); the BPE backend's seven (merge_rank rides as the
+// the tokenizer's tripwires: the SentencePiece backend's six serialized meta fields + its three
+// derived tables (lookup, pair_merge, bkey_id); the BPE backend's eight (merge_rank rides as the
 // merges array) + its three (lookup, pair_merge, cpt_id)
 let private TOKENIZER_META_FIELDS = 3
-let private SPM_META_FIELDS = 5 + 3
-let private BPE_META_FIELDS = 7 + 3
+let private SPM_META_FIELDS = 6 + 3
+let private BPE_META_FIELDS = 8 + 3
 
 //! Count of meta-carried fields of any struct: non-arrays plus string arrays (those cannot
 //! be raw planes — see serialize_strings). Pair with a per-type field-count constant to
@@ -1093,7 +1113,9 @@ def private build_image(var t; dst : string; in_mem : bool; extra : uint64;
 [arch(at = "../ARCHITECTURE_IMAGE.md#image-publish")]
 def private promote_tmp(tmp_path : string; path : string; built : bool; want_bytes : uint64) : bool {
     var ok = built
-    if (ok) {
+    if (!ok) {
+        to_log(LOG_ERROR, "dasLLAMA image: the save of '{path}' lost a write or its open - disk full or over quota? the save declines\n")
+    } else {
         // an ENOSPC that only surfaces at close still leaves a short file — check what landed
         var st : FStat
         if (!stat(tmp_path, st) || st.size != want_bytes) {
@@ -1123,19 +1145,55 @@ def private promote_tmp(tmp_path : string; path : string; built : bool; want_byt
 
 // per-writer name: concurrent savers must not clobber each other; last rename wins, same content
 [arch(at = "../ARCHITECTURE_IMAGE.md#image-publish")]
-def private tmp_name_for(path : string) : string {
-    return "{path}.{ref_time_ticks()}.tmp"   // clock: control — unique temp-name suffix, not timing
+def private tmp_name_for(path : string) : string =>
+    "{path}.{ref_time_ticks()}{IMAGE_TMP_SUFFIX}"  // clock: control — unique temp-name suffix, not timing
+
+let private IMAGE_TMP_SUFFIX = ".tmp"
+
+let private TMP_STALE_S = 3600l   //! a temp file this long unwritten has no live writer
+
+//! Removes the image temp files beside `stem` - names that start with its file name, carry `.dlim.` and end in the
+//! temp suffix - that have gone `min_age_s` seconds unwritten; `stem` is an image path or the gguf every lane's image is named from.
+[arch(at = "../ARCHITECTURE_IMAGE.md#image-publish")]
+def sweep_image_tmps(stem : string; min_age_s : int64) : tuple<removed : int; freed : int64> {
+    let folder = dir_name(stem)
+    let base = base_name(stem)
+    let now = int64(get_clock())   // clock: control — a temp file's age decides its removal
+    var stale : array<string>
+    dir(folder) $(name) {
+        if (name |> starts_with(base) && name |> ends_with(IMAGE_TMP_SUFFIX) && find(name, ".dlim.") >= 0) {
+            let full = path_join(folder, name)
+            let st = stat(full)
+            if (st.is_valid && !st.is_dir && now - int64(st.mtime) >= min_age_s) {
+                stale |> push(full)
+            }
+        }
+    }
+    var swept : tuple<removed : int; freed : int64>
+    for (full in stale) {
+        let bytes = int64(stat(full).size)
+        if (remove(full)) {
+            swept.removed++
+            swept.freed += bytes
+            to_log(LOG_WARNING, "dasLLAMA image: removed '{full}' ({bytes >> 20l} MB) - a temp file an earlier save left behind\n")
+        } else {
+            to_log(LOG_WARNING, "dasLLAMA image: could not remove the stale temp file '{full}' - in use by a live writer?\n")
+        }
+    }
+    return swept
 }
 
 def private save_image_to_file(var t; path : string; extra : uint64; tag : string; quant : string; layout : uint64;
                                plane : block<(name : string; var w : ImgWriter; var sections : array<ImgSection>) : bool>) : bool {
+    sweep_image_tmps(path, TMP_STALE_S)
     let tmp_path = tmp_name_for(path)
     let w = build_image(t, tmp_path, false, extra, tag, quant, false, layout, plane)
-    return promote_tmp(tmp_path, path, w.ok, w.cur)
+    return promote_tmp(tmp_path, path, w.ok && !image_write_faulted(w.cur), w.cur)
 }
 
 // a finished chunk to disk, header and all — one append, no patch pass (page 0 is already stored)
 def private write_chunk(base : void?; bytes : uint64; path : string) : bool {
+    sweep_image_tmps(path, TMP_STALE_S)
     let tmp_path = tmp_name_for(path)
     var w = w_open(tmp_path, bytes)
     let ts = ref_time_ticks()
@@ -1158,9 +1216,8 @@ def save_image(var t; path : string; tag : string = ""; quant : string = "q8") :
 
 //! Model entry point (the AudioTower one is load_audio_tower's cache in dasllama_audio).
 //! `tag` names the flavor (METAL_IMAGE_TAG for blob-only metal-flavor models, "" planar).
-def save_model_image(var t : Model; path : string; tag : string = ""; quant : string = "q8") : bool {
-    return save_image(t, path, tag, quant)
-}
+def save_model_image(var t : Model; path : string; tag : string = ""; quant : string = "q8") : bool =>
+    save_image(t, path, tag, quant)
 
 //! the planes a streaming save sizes as empty and fills from the gguf mapping - the quant halves the loader streams
 def private streamed_q_planes() : array<string> {
@@ -1225,9 +1282,13 @@ def private vk_mint_arm_walk(tag : string) : bool {
     return !empty(tag) && !g_vk_mint_declined && tag == moe_gpu_bake_tag()
 }
 
+//! only an overrun panics - a dead memory-chunk writer; a file writer a lost write killed drops the rest of the walk and the save declines at the publish
 def private vk_mint_sink(p : void?; nbytes : uint64) {
-    if (!g_vk_mint_walk_writer.ok) {
+    if (!g_vk_mint_walk_writer.ok && g_vk_mint_walk_writer.chunk_base != null) {
         panic("dasLLAMA image: the vulkan lane's device twin overran the image's reserve mid-walk - the sizing is wrong, see the error above")
+    }
+    if (g_vk_mint_walk_writer.ok && g_vk_mint_walk_writer.chunk_base == null && image_write_faulted(g_vk_mint_walk_writer.cur + nbytes)) {
+        g_vk_mint_walk_writer.ok = false
     }
     w_append(*g_vk_mint_walk_writer, p, nbytes)
 }
@@ -1783,9 +1844,7 @@ def private vulkan_bake_flavor(var t : Model; path : string; vk_tag : string) {
 
 //! Whether a cold build persists its image. Off = build it in memory and serve that, leaving no
 //! .dlim behind; the run pays a second copy of the model for it, so on by default.
-def image_save_enabled : bool {
-    return g_env_engine.image_save
-}
+def image_save_enabled : bool => g_env_engine.image_save
 
 // ~36 MB per band: the interleave amortizes and appends stay bulk, with a staging cost that never registers
 let private METAL_BAND_BLOCKS = 1048576l

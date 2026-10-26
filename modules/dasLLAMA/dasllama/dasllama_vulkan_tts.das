@@ -19,9 +19,10 @@ require dasllama/dasllama_convert
 require dasllama/dasllama_vulkan_common
 require dasllama/dasllama_vulkan_classes
 require dasllama/dasllama_vulkan_tower
+require dasllama/dasllama_gpu_math   // the row stamps' activation codes
 
 //! The Vulkan TTS driver: the kitten and kokoro families' synthesis seats and the Pocket family's
-//! codec and frames seats on the tower's knob (`ARCHITECTURE_GPU_TOWER_VULKAN_TTS.md`); the Metal
+//! codec, frames and prompt seats on the tower's knob (`ARCHITECTURE_GPU_TOWER_VULKAN_TTS.md`); the Metal
 //! tower driver fills the same seats on an Apple build.
 
 var private g_ts_declines : VkDeclineCounter
@@ -319,6 +320,7 @@ def private ts_forget {
     ts_scratch_release(g_ts_dec_scratch)
     ts_scratch_release(g_ts_pkc_scratch)
     ts_scratch_release(g_ts_pkf_scratch)
+    ts_scratch_release(g_ts_pkp_scratch)
     ts_pk_voice_drop()
 }
 
@@ -389,7 +391,7 @@ def private ts_ln(raw : VkCommandBuffer; var h : VkHaz; slab : TsRows; ns : TtsN
 //! layernorm rows from x into y (y may be x) against scale and shift rows at `woff` / `boff` of `wn` (the slab, or the aux rows fc(style) landed in)
 def private ts_ln_at(raw : VkCommandBuffer; var h : VkHaz; wn : TsRows; woff, boff : int64; x, y : TsRows; rows, d : int64; eps : float) {
     var s = set_tower_ln_cls(fixed_array(x.dev, y.dev, wn.dev), fixed_array(x.bytes, y.bytes, wn.bytes), fixed_array(x.bit, y.bit, wn.bit))
-    var pa = TowerLnArgs(d = uint(d), rows = uint(rows), eps = eps, ln_on = 1u, lnoff = uint(woff), lnboff = uint(boff))
+    var pa = gk_ln_args(uint(d), uint(rows), eps, uint(woff), uint(boff))
     enc_tower_ln_cls(raw, h, s, pa, rows)
     vt_pt(raw, VtProfRole.tts_ln)
 }
@@ -397,7 +399,7 @@ def private ts_ln_at(raw : VkCommandBuffer; var h : VkHaz; wn : TsRows; woff, bo
 //! the post-LN residual seam: x += y + b (the branch linear's bias row, `bslot`), then xb = layernorm(x) on the norm slot's rows
 def private ts_add_ln(raw : VkCommandBuffer; var h : VkHaz; slab : TsRows; bslot : TtsConvSlot; ns : TtsNormSlot; x, y, xb : TsRows; rows, d : int64; eps : float) {
     var s = set_tower_post_add_ln_cls(fixed_array(x.dev, y.dev, xb.dev, slab.dev), fixed_array(x.bytes, y.bytes, xb.bytes, slab.bytes), fixed_array(x.bit, y.bit, xb.bit, 0u))
-    var pa = TowerLnArgs(d = uint(d), rows = uint(rows), woff = 0u, boff = uint(bslot.boff), eps = eps, ln_on = 1u, lnoff = uint(ns.gwoff), lnboff = uint(ns.gboff), ascale = 1.0)
+    var pa = GkPostAddLnArgs(d = uint(d), rows = uint(rows), woff = 0u, boff = uint(bslot.boff), eps = eps, ln_on = 1u, lnoff = uint(ns.gwoff), lnboff = uint(ns.gboff), ascale = 1.0, xboff = 0u)
     enc_tower_post_add_ln_cls(raw, h, s, pa, rows)
     vt_pt(raw, VtProfRole.tts_ln)
 }
@@ -417,8 +419,8 @@ def private ts_conv(raw : VkCommandBuffer; var h : VkHaz; slab : TsRows; slot : 
 
 //! x [tin][cin] gathered into col [tout][kdim_p] under the left pad `pad_l`, the columns as halves under `half`
 def private ts_im2col(raw : VkCommandBuffer; var h : VkHaz; slot : TtsConvSlot; cv : TtsConv1d; tin, tout, pad_l : int64; x, col : TsRows; half : bool) {
-    var pc = TtsIm2colArgs(cin = uint(cv.cin), tin = uint(tin), tout = uint(tout), k = uint(cv.k), stride = uint(cv.stride), pad_l = uint(pad_l),
-        dilation = uint(cv.dilation), transposed = cv.transposed ? 1u : 0u, kdim = uint(slot.kdim_p), xoff = 0u, coloff = 0u, rows = 1u)
+    var pc = GkIm2col1dArgs(cin = uint(cv.cin), tin = uint(tin), tout = uint(tout), k = uint(cv.k), stride = uint(cv.stride), pad_l = uint(pad_l),
+        dilation = uint(cv.dilation), transposed = cv.transposed ? 1u : 0u, kdim = uint(slot.kdim_p), xoff = 0u, coloff = 0u, row_major = 1u, r0 = 0u, mp = uint(tout))
     if (half) {
         var sc = set_tts_im2col16_cls(fixed_array(x.dev, col.dev), fixed_array(x.bytes, col.bytes), fixed_array(x.bit, col.bit))
         enc_tts_im2col16_cls(raw, h, sc, pc, tout * slot.kdim_p)
@@ -552,12 +554,12 @@ def private vulkan_styletts2_albert(a : St2Albert; ids : array<int>; @scratch @e
     let r_ffn = ts_rows(sc_, TS_A_FFN)
     let r_f2 = ts_rows(sc_, TS_A_F2)
     ts_upload(r_ids, ids, t)
-    var s_gather = set_tts_row_gather_cls(fixed_array(slab.dev, r_ids.dev, r_e.dev), fixed_array(slab.bytes, r_ids.bytes, r_e.bytes), fixed_array(0u, r_ids.bit, r_e.bit))
+    var s_gather = set_tts_row_gather_cls(fixed_array(slab.dev, r_ids.dev, slab.dev, slab.dev, r_e.dev), fixed_array(slab.bytes, r_ids.bytes, slab.bytes, slab.bytes, r_e.bytes),
+        fixed_array(0u, r_ids.bit, 0u, 0u, r_e.bit))
     var s_attn = set_tts_attn_cls(fixed_array(r_q.dev, r_k.dev, r_v.dev, r_xb2.dev), fixed_array(r_q.bytes, r_k.bytes, r_v.bytes, r_xb2.bytes),
         fixed_array(r_q.bit, r_k.bit, r_v.bit, r_xb2.bit))
     var s_gelu = set_tts_gelu_tanh_cls(fixed_array(r_ffn.dev), fixed_array(r_ffn.bytes), fixed_array(r_ffn.bit))
-    var pa_gather = TtsGatherArgs(c = uint(a.emb_dim), rows = uint(t), word_off = uint(sl.word_emb), pos_off = uint(sl.pos_emb),
-        type_off = uint(sl.type_emb), out_off = 0u, adds = 1u)
+    var pa_gather = GkRowGatherArgs(c = uint(a.emb_dim), rows = uint(t), aoff = uint(sl.word_emb), boff = uint(sl.pos_emb), coff = uint(sl.type_emb), out_off = 0u, add_b = 1u, add_c = 1u, scale = 1.0)
     var pa_attn = TtsAttnArgs(t = uint(t), d = uint(d), hs = uint(hs), heads = uint(a.heads), scale = 1.0 / sqrt(float(hs)),
         qoff = 0u, koff = 0u, voff = 0u, ooff = 0u)
     var pa_gelu = TtsElemArgs(nelem = uint(t * ff), off = 0u, slope = 0.0)
@@ -660,8 +662,9 @@ def private vulkan_styletts2_text(te : St2TextEncoder; ids : array<int>; @scratc
     let r_gb = ts_rows(sc_, TS_T_GB)
     let r_y = ts_rows(sc_, TS_T_Y)
     ts_upload(r_ids, ids, t)
-    var s_gather = set_tts_row_gather_cls(fixed_array(slab.dev, r_ids.dev, r_a.dev), fixed_array(slab.bytes, r_ids.bytes, r_a.bytes), fixed_array(0u, r_ids.bit, r_a.bit))
-    var pa_gather = TtsGatherArgs(c = uint(cc), rows = uint(t), word_off = uint(sl.emb), pos_off = 0u, type_off = 0u, out_off = 0u, adds = 0u)
+    var s_gather = set_tts_row_gather_cls(fixed_array(slab.dev, r_ids.dev, slab.dev, slab.dev, r_a.dev), fixed_array(slab.bytes, r_ids.bytes, slab.bytes, slab.bytes, r_a.bytes),
+        fixed_array(0u, r_ids.bit, 0u, 0u, r_a.bit))
+    var pa_gather = GkRowGatherArgs(c = uint(cc), rows = uint(t), aoff = uint(sl.emb), boff = 0u, coff = 0u, out_off = 0u, add_b = 0u, add_c = 0u, scale = 1.0)
     let ncnn = length(te.cnn)
     vt_chain_one_shot("text", int64(ncnn), t) $(raw : VkCommandBuffer; var h : VkHaz) {
         enc_tts_row_gather_cls(raw, h, s_gather, pa_gather, t * cc)
@@ -689,7 +692,7 @@ let private TS_MAX_DE_LSTMS = 8              //! the duration encoder's LSTM sta
 let private TS_MAX_RES_BLOCKS = 8            //! ... and a prosody branch's residual blocks
 
 //! o [rows][width] = cat(x [rows][c], the res rows, the f0 and n columns) zero-padded, as `pa` lays them (rs = 0 broadcasts one res row)
-def private ts_concat(raw : VkCommandBuffer; var h : VkHaz; x, res, f0, nd, o : TsRows; pa : TtsConcatArgs) {
+def private ts_concat(raw : VkCommandBuffer; var h : VkHaz; x, res, f0, nd, o : TsRows; pa : GkConcatArgs) {
     var s = set_tts_concat_cls(fixed_array(x.dev, res.dev, f0.dev, nd.dev, o.dev), fixed_array(x.bytes, res.bytes, f0.bytes, nd.bytes, o.bytes),
         fixed_array(x.bit, res.bit, f0.bit, nd.bit, o.bit))
     var pc = pa
@@ -700,7 +703,7 @@ def private ts_concat(raw : VkCommandBuffer; var h : VkHaz; x, res, f0, nd, o : 
 //! raw[t] = the sigmoid sum of nb logits a row over speed
 def private ts_sigsum(raw : VkCommandBuffer; var h : VkHaz; logits, out : TsRows; t, nb : int64; speed : float) {
     var s = set_tts_sigsum_cls(fixed_array(logits.dev, out.dev), fixed_array(logits.bytes, out.bytes), fixed_array(logits.bit, out.bit))
-    var pa = TtsSigSumArgs(t = uint(t), nb = uint(nb), ls = uint(nb), speed = speed)
+    var pa = GkSigSumArgs(t = uint(t), nb = uint(nb), ls = uint(nb), speed = speed)
     enc_tts_sigsum_cls(raw, h, s, pa, t)
     vt_pt(raw, VtProfRole.tts_rows)
 }
@@ -726,8 +729,8 @@ def private ts_adain(raw : VkCommandBuffer; var h : VkHaz; slab : TsRows; sc_ : 
     let bufs = fixed_array(x.dev, y.dev, sc_.stats.dev, sc_.aux.dev, slab.dev)
     let sizes = fixed_array(x.bytes, y.bytes, sc_.stats.bytes, sc_.aux.bytes, slab.bytes)
     let bits = fixed_array(x.bit, y.bit, sc_.stats.bit, sc_.aux.bit, 0u)
-    static_assert(TTS_ADAIN_EPS == ST2_ADAIN_EPS, "the AdaIN stamps' eps is the model's")
-    var p2 = TtsAdainArgs(c = uint(c), t = uint(t), xoff = 0u, yoff = 0u, hoff = uint(hoff), gwoff = uint(ns.gwoff), gboff = uint(ns.gboff),
+    static_assert(GK_ADAIN_EPS == ST2_ADAIN_EPS, "the AdaIN stamps' eps is the model's")
+    var p2 = GkAdainArgs(c = uint(c), t = uint(t), hoff = uint(hoff), gwoff = uint(ns.gwoff), gboff = uint(ns.gboff),
         aoff = uint(ns.aux_off))
     if (snake) {
         var s2 = set_tts_adain_snake_cls(bufs, sizes, bits)
@@ -742,7 +745,7 @@ def private ts_adain(raw : VkCommandBuffer; var h : VkHaz; slab : TsRows; sc_ : 
 //! the depthwise transposed pool on rows: y [t_out][c] from x [t_in][c] over the slab's w [c][k] at `woff` and b [c] at `boff`
 def private ts_pool_dw(raw : VkCommandBuffer; var h : VkHaz; slab : TsRows; cv : TtsConv1d; woff, boff : int64; x, y : TsRows; t_in, t_out : int64) {
     var s = set_tts_pool_dw_cls(fixed_array(x.dev, y.dev, slab.dev), fixed_array(x.bytes, y.bytes, slab.bytes), fixed_array(x.bit, y.bit, 0u))
-    var pa = DwConvRowsArgs(c = uint(cv.cin), k = uint(cv.k), stride = uint(cv.stride), pad_l = uint(cv.pad_l), dil = uint(cv.dilation), t_in = uint(t_in),
+    var pa = GkDwConvRowsArgs(c = uint(cv.cin), k = uint(cv.k), stride = uint(cv.stride), pad_l = uint(cv.pad_l), dil = uint(cv.dilation), t_in = uint(t_in),
         t_out = uint(t_out), woff = uint(woff), boff = uint(boff))
     enc_tts_pool_dw_cls(raw, h, s, pa, t_out * cv.cin)
     vt_pt(raw, VtProfRole.tts_rows)
@@ -750,8 +753,9 @@ def private ts_pool_dw(raw : VkCommandBuffer; var h : VkHaz; slab : TsRows; cv :
 
 //! out [rows][c] = src[idx[r]] - the nearest x2 upsample with idx = r / 2
 def private ts_gather_rows(raw : VkCommandBuffer; var h : VkHaz; src, idx, out : TsRows; rows, c : int64) {
-    var s = set_tts_row_gather_cls(fixed_array(src.dev, idx.dev, out.dev), fixed_array(src.bytes, idx.bytes, out.bytes), fixed_array(src.bit, idx.bit, out.bit))
-    var pa = TtsGatherArgs(c = uint(c), rows = uint(rows), word_off = 0u, pos_off = 0u, type_off = 0u, out_off = 0u, adds = 0u)
+    var s = set_tts_row_gather_cls(fixed_array(src.dev, idx.dev, src.dev, src.dev, out.dev), fixed_array(src.bytes, idx.bytes, src.bytes, src.bytes, out.bytes),
+        fixed_array(src.bit, idx.bit, src.bit, src.bit, out.bit))
+    var pa = GkRowGatherArgs(c = uint(c), rows = uint(rows), aoff = 0u, boff = 0u, coff = 0u, out_off = 0u, add_b = 0u, add_c = 0u, scale = 1.0)
     enc_tts_row_gather_cls(raw, h, s, pa, rows * c)
     vt_pt(raw, VtProfRole.tts_rows)
 }
@@ -759,7 +763,7 @@ def private ts_gather_rows(raw : VkCommandBuffer; var h : VkHaz; src, idx, out :
 //! o = (a + b) * scale over n elements (o may be a)
 def private ts_add_scale(raw : VkCommandBuffer; var h : VkHaz; a, b, o : TsRows; n : int64; scale : float) {
     var s = set_tts_add_scale_cls(fixed_array(a.dev, b.dev, o.dev), fixed_array(a.bytes, b.bytes, o.bytes), fixed_array(a.bit, b.bit, o.bit))
-    var pa = TtsAddScaleArgs(nelem = uint(n), scale = scale, aoff = 0u, boff = 0u, ooff = 0u)
+    var pa = GkAddScaleArgs(nelem = uint(n), scale = scale)
     enc_tts_add_scale_cls(raw, h, s, pa, n)
     vt_pt(raw, VtProfRole.tts_rows)
 }
@@ -840,7 +844,7 @@ def private vulkan_styletts2_dur_enc(p : St2Predictor; bert : array<float>; t : 
         return ts_decline("dur_enc", VulkanTtsDecline.memory)
     }
     ts_upload(r_bert, bert, t * hidden)
-    let pa_cat = TtsConcatArgs(c = uint(cc), rc = uint(sd), rs = 0u, f0s = 0u, ns = 0u, with_res = 1u, width = uint(width), rows = uint(t))
+    let pa_cat = GkConcatArgs(c = uint(cc), rc = uint(sd), rs = 0u, f0s = 0u, ns = 0u, with_res = 1u, width = uint(width), rows = uint(t))
     vt_chain_one_shot("dur_enc", int64(nl), t) $(raw : VkCommandBuffer; var h : VkHaz) {
         ts_lin(raw, h, slab, sl.bert_enc, hidden, cc, r_bert, r_den, t)
         ts_concat(raw, h, r_den, aux, aux, aux, r_x, pa_cat)
@@ -1315,7 +1319,7 @@ def private ts_block_style_rows(b : St2GenResBlock; s : array<float>; var at : i
 //! o += scale . y, or o = scale . y under `zero`
 def private ts_axpy(raw : VkCommandBuffer; var h : VkHaz; o, y : TsRows; n : int64; scale : float; zero : bool) {
     var s = set_tts_axpy_cls(fixed_array(o.dev, y.dev), fixed_array(o.bytes, y.bytes), fixed_array(o.bit, y.bit))
-    var pa = TtsAxpyArgs(nelem = uint(n), scale = scale, zero = zero ? 1u : 0u, ooff = 0u, yoff = 0u)
+    var pa = GkAxpyArgs(nelem = uint(n), scale = scale, zero = zero ? 1u : 0u)
     enc_tts_axpy_cls(raw, h, s, pa, n)
     vt_pt(raw, VtProfRole.tts_rows)
 }
@@ -1363,9 +1367,9 @@ def private ts_stage(raw : VkCommandBuffer; var h : VkHaz; slab : TsRows; sc_ : 
     let n = t2 * c2
     if (last) {
         var s = set_tts_pk_rows_cls(fixed_array(r_bxt.dev, r_by.dev), fixed_array(r_bxt.bytes, r_by.bytes), fixed_array(r_bxt.bit, r_by.bit))
-        var shift = TtsPkRowsArgs(rows = uint(t2 - 1l), width = uint(c2), ss = uint(c2), sc = 0u, sr0 = 0u, ds = uint(c2), dc = 0u, dr0 = 1u)
+        var shift = GkPkRowsArgs(rows = uint(t2 - 1l), width = uint(c2), ss = uint(c2), sc = 0u, sr0 = 0u, ds = uint(c2), dc = 0u, dr0 = 1u)
         enc_tts_pk_rows_cls(raw, h, s, shift, n - c2)
-        var head = TtsPkRowsArgs(rows = 1u, width = uint(c2), ss = uint(c2), sc = 0u, sr0 = 1u, ds = uint(c2), dc = 0u, dr0 = 0u)
+        var head = GkPkRowsArgs(rows = 1u, width = uint(c2), ss = uint(c2), sc = 0u, sr0 = 1u, ds = uint(c2), dc = 0u, dr0 = 0u)
         enc_tts_pk_rows_cls(raw, h, s, head, c2)
         vt_pt(raw, VtProfRole.tts_rows)
     }
@@ -1413,7 +1417,7 @@ def private ts_source_chain(raw : VkCommandBuffer; var h : VkHaz; slab : TsRows;
     let r_lowc = ts_rows(sc_, TS_D_LOWC)
     let r_har = ts_rows(sc_, TS_D_HAR)
     let r_spec = ts_rows(sc_, TS_D_SPEC)
-    var ka = TtsSourceArgs(n = uint(sh.ss.samples), nlow = uint(sh.ss.nlow), nh = uint(nh), up = uint(cfg.upsample), sr = cfg.sample_rate, sine_amp = cfg.sine_amp,
+    var ka = GkSourceArgs(n = uint(sh.ss.samples), nlow = uint(sh.ss.nlow), nh = uint(nh), up = uint(cfg.upsample), sr = cfg.sample_rate, sine_amp = cfg.sine_amp,
         noise_std = cfg.noise_std, voiced_thr = cfg.voiced_thr, seed = uint(seed ^ (seed >> 32ul)), woff = uint(sl.src_w), boff = uint(sl.src_b))
     if (!captured) {
         var s0 = set_tts_src_noise_cls(fixed_array(r_noise.dev), fixed_array(r_noise.bytes), fixed_array(r_noise.bit))
@@ -1446,7 +1450,7 @@ def private ts_source_chain(raw : VkCommandBuffer; var h : VkHaz; slab : TsRows;
         vt_pt(raw, VtProfRole.tts_source)
     }
     let re & = unsafe(d.stft_fwd_re)
-    var ks = TtsStftArgs(n = uint(sh.ss.samples), frames = uint(sh.ss.spec_frames), bins = uint(d.bins), k = uint(re.k), hop = uint(re.stride), pad = uint(ST2_STFT_PAD),
+    var ks = GkStftArgs(n = uint(sh.ss.samples), frames = uint(sh.ss.spec_frames), bins = uint(d.bins), k = uint(re.k), hop = uint(re.stride), pad = uint(ST2_STFT_PAD),
         eps = d.stft_eps, reoff = uint(sl.stft_re), imoff = uint(sl.stft_im))
     let st_bufs = fixed_array(r_har.dev, slab.dev, r_spec.dev)
     let st_sizes = fixed_array(r_har.bytes, slab.bytes, r_spec.bytes)
@@ -1473,7 +1477,7 @@ def private ts_decoder_chain(raw : VkCommandBuffer; var h : VkHaz; slab : TsRows
     let r_nd = ts_rows(sc_, TS_D_ND)
     let r_cat = ts_rows(sc_, TS_D_CAT)
     let rc = uint(d.asr_res.cout)
-    let kc = TtsConcatArgs(c = uint(text_c), rc = rc, rs = rc, f0s = 1u, ns = 1u, with_res = 0u, width = uint(d.encode.dim_in_s), rows = uint(frames))
+    let kc = GkConcatArgs(c = uint(text_c), rc = rc, rs = rc, f0s = 1u, ns = 1u, with_res = 0u, width = uint(d.encode.dim_in_s), rows = uint(frames))
     ts_concat(raw, h, r_asr, r_res, r_f0d, r_nd, r_cat, kc)
     var tt = ts_res_blk(raw, h, slab, sc_, TS_D_BLK, d.encode, sl.encode, dhoff[0], dhoff[1], r_cat, frames, r_x)
     var cwr = d.encode.dim_out
@@ -1483,7 +1487,7 @@ def private ts_decoder_chain(raw : VkCommandBuffer; var h : VkHaz; slab : TsRows
         let src = in_x ? r_x : r_bo
         let dst = in_x ? r_bo : r_x
         if (blk.dim_in != cwr) {
-            let kc2 = TtsConcatArgs(c = uint(cwr), rc = rc, rs = rc, f0s = 1u, ns = 1u, with_res = 1u, width = uint(blk.dim_in_s), rows = uint(tt))
+            let kc2 = GkConcatArgs(c = uint(cwr), rc = rc, rs = rc, f0s = 1u, ns = 1u, with_res = 1u, width = uint(blk.dim_in_s), rows = uint(tt))
             ts_concat(raw, h, src, r_res, r_f0d, r_nd, r_cat, kc2)
             tt = ts_res_blk(raw, h, slab, sc_, TS_D_BLK, blk, sl.decode[i], dhoff[2 + 2 * i], dhoff[3 + 2 * i], r_cat, tt, dst)
         } else {
@@ -1566,7 +1570,7 @@ def private vulkan_styletts2_decode(d : St2Decoder; text_c : int64; source : Sin
         ts_source_chain(raw, h, slab, sc_, d, source, sh, noise.captured, seed)
         ts_generator_chain(raw, h, slab, sc_, d, sh.dec_width, sh.dec_rows, sh.ss.spec_frames)
         let r_post = ts_rows(sc_, TS_D_POST)
-        var ki = TtsIstftArgs(tt = uint(sh.t_post), stride = uint(d.conv_post.cout), bins = uint(d.bins), k = uint(bwd.k), hop = uint(bwd.stride),
+        var ki = GkIstftArgs(tt = uint(sh.t_post), stride = uint(d.conv_post.cout), bins = uint(d.bins), k = uint(bwd.k), hop = uint(bwd.stride),
             pad = uint(ST2_STFT_PAD), envelope = d.istft_envelope ? 1u : 0u, n = uint(sh.n_out), reoff = uint(sl.istft_re), imoff = uint(sl.istft_im),
             wnoff = uint(sl.window))
         var s = set_tts_istft_cls(fixed_array(r_post.dev, slab.dev, r_wave.dev), fixed_array(r_post.bytes, slab.bytes, r_wave.bytes), fixed_array(r_post.bit, 0u, r_wave.bit))
@@ -1698,6 +1702,7 @@ struct private TsPkVoice {
     v : array<TsRows>
     rope : TsRows
     sin_off : int64
+    gen : uint64      //! counted up at every rebuild: a prompt's residency record names the build it sits in
 }
 
 var private g_ts_pk_voice : TsPkVoice
@@ -1737,6 +1742,7 @@ def private ts_pk_voice_attach(vs : PocketVoiceState; tf : PocketTransformer) : 
 def private ts_pk_voice_rebuild(vs : PocketVoiceState; tf : PocketTransformer) : bool {
     var v & = g_ts_pk_voice
     ts_pk_voice_drop()
+    v.gen++
     let t0 = ref_time_ticks()
     let cap = vs.caches[0].cap
     let d = tf.d
@@ -1744,8 +1750,7 @@ def private ts_pk_voice_rebuild(vs : PocketVoiceState; tf : PocketTransformer) :
     v.k |> reserve(length(vs.caches))
     v.v |> reserve(length(vs.caches))
     for (kc in vs.caches) {
-        var bk : TsRows
-        var bv : TsRows
+        var bk, bv : TsRows
         if (!ts_rows_alloc(bk, cap * d * 4l, TS_PK_KV_BIT) || !ts_rows_alloc(bv, cap * d * 4l, TS_PK_VV_BIT)) {
             ts_rows_release(bk)
             ts_pk_voice_drop()
@@ -1778,7 +1783,7 @@ def private ts_pk_conv(raw : VkCommandBuffer; var h : VkHaz; slab : TsRows; slot
 }
 
 //! a window of rows copied: `rows` x `width` from src [.][ss] at column sc, rows sr0.., into dst [.][ds] at column dc, rows dr0.., the ELU on the way where asked
-def private ts_pk_rows(raw : VkCommandBuffer; var h : VkHaz; src, dst : TsRows; pa : TtsPkRowsArgs; elu : bool) {
+def private ts_pk_rows(raw : VkCommandBuffer; var h : VkHaz; src, dst : TsRows; pa : GkPkRowsArgs; elu : bool) {
     var pc = pa
     let total = int64(pa.rows) * int64(pa.width)
     if (elu) {
@@ -1791,8 +1796,8 @@ def private ts_pk_rows(raw : VkCommandBuffer; var h : VkHaz; src, dst : TsRows; 
     vt_pt(raw, VtProfRole.tts_pk)
 }
 
-def private ts_pk_rows_args(rows, width : int64) : TtsPkRowsArgs
-    => TtsPkRowsArgs(rows = uint(rows), width = uint(width), ss = uint(width), sc = 0u, sr0 = 0u, ds = uint(width), dc = 0u, dr0 = 0u)
+def private ts_pk_rows_args(rows, width : int64) : GkPkRowsArgs
+    => GkPkRowsArgs(rows = uint(rows), width = uint(width), ss = uint(width), sc = 0u, sr0 = 0u, ds = uint(width), dc = 0u, dr0 = 0u)
 
 //! the ELU over x's first rows x width elements in place
 def private ts_pk_elu(raw : VkCommandBuffer; var h : VkHaz; x : TsRows; rows, width : int64) {
@@ -1802,7 +1807,7 @@ def private ts_pk_elu(raw : VkCommandBuffer; var h : VkHaz; x : TsRows; rows, wi
 //! x [rows][c] *= the slab's scale row at `soff`
 def private ts_pk_row_scale(raw : VkCommandBuffer; var h : VkHaz; slab : TsRows; x : TsRows; rows, c, soff : int64) {
     var s = set_tts_pk_row_scale_cls(fixed_array(x.dev, slab.dev), fixed_array(x.bytes, slab.bytes), fixed_array(x.bit, 0u))
-    var pa = TowerBiasArgs(d = uint(c), nelem = uint(rows * c), boff = uint(soff))
+    var pa = GkBiasActArgs(d = uint(c), nelem = uint(rows * c), boff = uint(soff))
     enc_tts_pk_row_scale_cls(raw, h, s, pa, rows * c)
     vt_pt(raw, VtProfRole.tts_pk)
 }
@@ -1810,7 +1815,7 @@ def private ts_pk_row_scale(raw : VkCommandBuffer; var h : VkHaz; slab : TsRows;
 //! the adjacent-pair rope over the span `d` wide at column `col` of x's rows [rows][qs], positions 0.., on the tables in `tabs` (cos at coff, sin at soff)
 def private ts_pk_rope(raw : VkCommandBuffer; var h : VkHaz; tabs : TsRows; coff, soff : int64; x : TsRows; rows, qs, col, d, dh : int64) {
     var s = set_tts_pk_rope_cls(fixed_array(x.dev, tabs.dev, tabs.dev), fixed_array(x.bytes, tabs.bytes, tabs.bytes), fixed_array(x.bit, tabs.bit, tabs.bit))
-    var pa = RopeTabArgs(rows = uint(rows), qs = uint(qs), col = uint(col), d = uint(d), dh = uint(dh), coff = uint(coff), soff = uint(soff))
+    var pa = GkRopeTabArgs(rows = uint(rows), qs = uint(qs), col = uint(col), d = uint(d), dh = uint(dh), coff = uint(coff), soff = uint(soff))
     enc_tts_pk_rope_cls(raw, h, s, pa, rows * d / 2l)
     vt_pt(raw, VtProfRole.tts_pk)
 }
@@ -1818,7 +1823,7 @@ def private ts_pk_rope(raw : VkCommandBuffer; var h : VkHaz; tabs : TsRows; coff
 //! the causal cached attention: q from the qkv rows [t][qs] at column 0, k and v the cache rows [pos][d], o [t][d]; query i at position pos0 + i
 def private ts_pk_attn(raw : VkCommandBuffer; var h : VkHaz; qkv, k, v, o : TsRows; t, qs, d, heads, pos0, ctx : int64) {
     var s = set_tts_pk_attn_cls(fixed_array(qkv.dev, k.dev, v.dev, o.dev), fixed_array(qkv.bytes, k.bytes, v.bytes, o.bytes), fixed_array(qkv.bit, k.bit, v.bit, o.bit))
-    var pa = TtsPkAttnArgs(t = uint(t), qs = uint(qs), qcol = 0u, d = uint(d), pos0 = uint(pos0), ctx = uint(ctx), qoff = 0u, koff = 0u, voff = 0u, ooff = 0u)
+    var pa = GkPkAttnArgs(t = uint(t), qs = uint(qs), qcol = 0u, d = uint(d), pos0 = uint(pos0), ctx = uint(ctx))
     enc_tts_pk_attn_cls(raw, h, s, pa, tts_attn_wgs(t, heads))
     vt_pt(raw, VtProfRole.tts_pk_attn)
 }
@@ -1964,37 +1969,57 @@ def private ts_pk_codec_floats(mm : PocketMimi; frames : int64) : TsFloats {
     return fl
 }
 
-//! the codec transformer over the residual rows X [t][d] at positions 0..: the CPU's layer loop, dispatch for dispatch
-def private ts_pk_transformer(raw : VkCommandBuffer; var h : VkHaz; slab : TsRows; sc_ : TsScratch; tf : PocketTransformer; sl : TtsPkCodecSlab; t : int64) {
+//! a transformer's rows form: every layer's keys and values written at row `kv_row0` of its cache rows, the rope tables'
+//! row of position 0 at `coff` / `soff`, the queries at `pos0`; `kv_only_last` ends the last layer at its cache rows
+struct private TsPkRowsForm {
+    pos0 : int64
+    kv_row0 : int64
+    tabs : TsRows
+    coff : int64
+    soff : int64
+    zero : int64
+    kv_only_last : bool
+}
+
+//! a transformer over the residual rows X [t][d] of the scratch's slot set: the CPU's layer loop, dispatch for dispatch
+def private ts_pk_rows_tf(raw : VkCommandBuffer; var h : VkHaz; slab : TsRows; sc_ : TsScratch; tf : PocketTransformer; layers : array<TtsPkLayerSlots>;
+                          t : int64; f : TsPkRowsForm; slot_x, slot_xb, slot_qkv, slot_ctx, slot_h : int; kv : block<(li : int) : tuple<k : TsRows; v : TsRows>>) {
     let d = tf.d
     let dh = d / tf.heads
     let nd = t * d
-    let r_x = ts_rows(sc_, TS_C_X)
-    let r_xb = ts_rows(sc_, TS_C_XB)
-    let r_qkv = ts_rows(sc_, TS_C_QKV)
-    let r_ctx = ts_rows(sc_, TS_C_CTX)
-    let r_h = ts_rows(sc_, TS_C_H)
-    let r_k = ts_rows(sc_, TS_C_K)
-    let r_v = ts_rows(sc_, TS_C_V)
-    var kc = TtsPkRowsArgs(rows = uint(t), width = uint(d), ss = uint(3l * d), sc = uint(d), sr0 = 0u, ds = uint(d), dc = 0u, dr0 = 0u)
+    let half = dh / 2l
+    let r_x = ts_rows(sc_, slot_x)
+    let r_xb = ts_rows(sc_, slot_xb)
+    let r_qkv = ts_rows(sc_, slot_qkv)
+    let r_ctx = ts_rows(sc_, slot_ctx)
+    let r_h = ts_rows(sc_, slot_h)
+    var kc = GkPkRowsArgs(rows = uint(t), width = uint(d), ss = uint(3l * d), sc = uint(d), sr0 = 0u, ds = uint(d), dc = 0u, dr0 = uint(f.kv_row0))
     var pa_gelu = TtsElemArgs(nelem = uint(t * tf.ffn), off = 0u, slope = 0.0)
     var s_gelu = set_tts_gelu_tanh_cls(fixed_array(r_h.dev), fixed_array(r_h.bytes), fixed_array(r_h.bit))
-    for (i in range(length(tf.layers))) {
-        let s & = unsafe(sl.layers[i])
+    let coff = f.coff + f.pos0 * half
+    let soff = f.soff + f.pos0 * half
+    let last = length(layers) - 1
+    for (i in range(length(layers))) {
+        let s & = unsafe(layers[i])
+        let cache = invoke(kv, i)
+        let kv_only = f.kv_only_last && i == last
         ts_ln(raw, h, slab, s.n1, r_x, r_xb, t, d, tf.eps)
         ts_lin(raw, h, slab, s.in_proj, d, 3l * d, r_xb, r_qkv, t)
-        ts_pk_rope(raw, h, slab, sl.rope_cos, sl.rope_sin, r_qkv, t, 3l * d, 0l, d, dh)
-        ts_pk_rope(raw, h, slab, sl.rope_cos, sl.rope_sin, r_qkv, t, 3l * d, d, d, dh)
+        if (!kv_only) {
+            ts_pk_rope(raw, h, f.tabs, coff, soff, r_qkv, t, 3l * d, 0l, d, dh)
+        }
+        ts_pk_rope(raw, h, f.tabs, coff, soff, r_qkv, t, 3l * d, d, d, dh)
         kc.sc = uint(d)
-        ts_pk_rows(raw, h, r_qkv, r_k, kc, false)
+        ts_pk_rows(raw, h, r_qkv, cache.k, kc, false)
         kc.sc = uint(2l * d)
-        ts_pk_rows(raw, h, r_qkv, r_v, kc, false)
-        ts_pk_attn(raw, h, r_qkv, r_k, r_v, r_ctx, t, 3l * d, d, tf.heads, 0l, tf.context)
+        ts_pk_rows(raw, h, r_qkv, cache.v, kc, false)
+        continue if (kv_only)
+        ts_pk_attn(raw, h, r_qkv, cache.k, cache.v, r_ctx, t, 3l * d, d, tf.heads, f.pos0, tf.context)
         ts_lin(raw, h, slab, s.out_proj, d, d, r_ctx, r_xb, t)
         if (s.has_s1) {
             ts_pk_row_scale(raw, h, slab, r_xb, t, d, s.scale1_off)
         }
-        ts_pk_add_ln(raw, h, slab, sl.zero, s.n2, r_x, r_xb, r_xb, t, d, tf.eps)
+        ts_pk_add_ln(raw, h, slab, f.zero, s.n2, r_x, r_xb, r_xb, t, d, tf.eps)
         ts_lin(raw, h, slab, s.ffn1, d, tf.ffn, r_xb, r_h, t)
         enc_tts_gelu_tanh_cls(raw, h, s_gelu, pa_gelu, t * tf.ffn)
         vt_pt(raw, VtProfRole.tts_act)
@@ -2003,6 +2028,16 @@ def private ts_pk_transformer(raw : VkCommandBuffer; var h : VkHaz; slab : TsRow
             ts_pk_row_scale(raw, h, slab, r_xb, t, d, s.scale2_off)
         }
         ts_add_scale(raw, h, r_x, r_xb, r_x, nd, 1.0)
+    }
+}
+
+//! the codec transformer over the residual rows X [t][d] at positions 0.., its keys and values in the scratch's one row set
+def private ts_pk_transformer(raw : VkCommandBuffer; var h : VkHaz; slab : TsRows; sc_ : TsScratch; tf : PocketTransformer; sl : TtsPkCodecSlab; t : int64) {
+    let r_k = ts_rows(sc_, TS_C_K)
+    let r_v = ts_rows(sc_, TS_C_V)
+    let f = TsPkRowsForm(pos0 = 0l, kv_row0 = 0l, tabs = slab, coff = sl.rope_cos, soff = sl.rope_sin, zero = sl.zero, kv_only_last = false)
+    ts_pk_rows_tf(raw, h, slab, sc_, tf, sl.layers, t, f, TS_C_X, TS_C_XB, TS_C_QKV, TS_C_CTX, TS_C_H) $(_li : int) {
+        return (k = r_k, v = r_v)
     }
 }
 
@@ -2028,7 +2063,7 @@ def private ts_pk_codec_chain(raw : VkCommandBuffer; var h : VkHaz; slab : TsRow
     let r_x = ts_rows(sc_, TS_C_X)
     ts_pk_conv(raw, h, slab, sl.quant, mm.quant_proj, frames, ts_rows(sc_, TS_C_LAT), r_col, r_q)
     var sp = set_tts_pool_dw_cls(fixed_array(r_q.dev, r_x.dev, slab.dev), fixed_array(r_q.bytes, r_x.bytes, slab.bytes), fixed_array(r_q.bit, r_x.bit, 0u))
-    var pp = DwConvRowsArgs(c = uint(d), k = uint(mm.upsample.k), stride = uint(mm.upsample.stride), pad_l = 0u, dil = uint(mm.upsample.dilation), t_in = uint(frames),
+    var pp = GkDwConvRowsArgs(c = uint(d), k = uint(mm.upsample.k), stride = uint(mm.upsample.stride), pad_l = 0u, dil = uint(mm.upsample.dilation), t_in = uint(frames),
         t_out = uint(t1), woff = uint(sl.up_w), boff = uint(sl.up_b))
     enc_tts_pool_dw_cls(raw, h, sp, pp, t1 * d)
     vt_pt(raw, VtProfRole.tts_rows)
@@ -2052,7 +2087,7 @@ def private ts_pk_codec_chain(raw : VkCommandBuffer; var h : VkHaz; slab : TsRow
     ts_pk_elu(raw, h, cur, t, w)
     let r_o = ts_rows(sc_, TS_C_O)
     ts_pk_conv(raw, h, slab, sl.dec_out, mm.dec_out, t, cur, r_col, r_o)
-    let kw = TtsPkRowsArgs(rows = uint(t), width = 1u, ss = uint(mm.dec_out.cout), sc = 0u, sr0 = 0u, ds = 1u, dc = 0u, dr0 = 0u)
+    let kw = GkPkRowsArgs(rows = uint(t), width = 1u, ss = uint(mm.dec_out.cout), sc = 0u, sr0 = 0u, ds = 1u, dc = 0u, dr0 = 0u)
     ts_pk_rows(raw, h, r_o, ts_rows(sc_, TS_C_WAVE), kw, false)
 }
 
@@ -2203,7 +2238,7 @@ def private ts_pk_frame(raw : VkCommandBuffer; var h : VkHaz; slab : TsRows; sc_
     }
     ts_ln(raw, h, slab, sl.out_norm, r_x, r_xb, 1l, d, m.backbone.eps)
     let coff = f * d
-    let kc = TtsPkRowsArgs(rows = 1u, width = uint(d), ss = uint(d), sc = 0u, sr0 = 0u, ds = uint(d), dc = 0u, dr0 = uint(f))
+    let kc = GkPkRowsArgs(rows = 1u, width = uint(d), ss = uint(d), sc = 0u, sr0 = 0u, ds = uint(d), dc = 0u, dr0 = uint(f))
     ts_pk_rows(raw, h, r_xb, r_conds, kc, false)
     ts_pk_lin(raw, h, slab, sl.out_eos, d, 1l, r_conds, coff, ts_rows(sc_, TS_F_EOS), f)
     let noff = i * ld
@@ -2268,6 +2303,7 @@ def private ts_pk_frames_loop(m : PocketModel; sl : TtsPkFramesSlab; slab : TsRo
 def private vulkan_pocket_frames(m : PocketModel; var vs : PocketVoiceState; n_txt : int64; std : float; frames_after_eos : int;
                                  captured, forced : array<float>; max_frames : int64; var sc : PocketScratch) : tuple<frames : int64; eos_at : int64> {
     let none = (frames = -1l, eos_at = -1l)
+    let dev_rows = tts_pk_prompt_dev_take(g_ts_pk_prompt_dev, vs, g_ts_pk_voice.gen, sc.rows, n_txt, m.backbone.d)   //! spent on entry: a decline below must not leave it for a later chunk
     if (!vulkan_tower_on()) {
         ts_decline("frames", VulkanTtsDecline.knob)
         return none
@@ -2295,7 +2331,7 @@ def private vulkan_pocket_frames(m : PocketModel; var vs : PocketVoiceState; n_t
         return none
     }
     for (li, kc in iter_range(vs.caches), vs.caches) {
-        ts_pk_kv_upload(kc, g_ts_pk_voice.k[li], g_ts_pk_voice.v[li], vs.len, base)
+        ts_pk_kv_upload(kc, g_ts_pk_voice.k[li], g_ts_pk_voice.v[li], vs.len + dev_rows, base)
     }
     let sl & = g_ts_pk_frames_slots
     let sc_ & = g_ts_pkf_scratch
@@ -2312,6 +2348,76 @@ def private vulkan_pocket_frames(m : PocketModel; var vs : PocketVoiceState; n_t
     return r
 }
 
+var private g_ts_pkp_scratch : TsScratch
+var private g_ts_pk_prompt_dev : TtsPkPromptDev
+
+//! the prompt seat's slots: the rows form's five at the prompt's rows (the frames slots' indices, its own scratch)
+def private ts_pk_prompt_floats(m : PocketModel; t : int64) : TsFloats {
+    let d = m.backbone.d
+    var fl : TsFloats
+    fl[TS_F_X] = t * d
+    fl[TS_F_XB] = t * d
+    fl[TS_F_QKV] = t * 3l * d
+    fl[TS_F_CTX] = t * d
+    fl[TS_F_H] = t * m.backbone.ffn
+    return fl
+}
+
+//! the prompt's K/V rows [vs.len, vs.len + t) of every layer back from the voice slot into the host caches
+def private ts_pk_prompt_readback(var vs : PocketVoiceState; sc_ : TsScratch; t, d : int64) {
+    let v & = g_ts_pk_voice
+    g_ts_pk_kv_host |> ensure_length(2l * t * d)
+    unsafe {
+        var kp = addr(g_ts_pk_kv_host[0])
+        var vp = addr(g_ts_pk_kv_host[t * d])
+        for (li, kc in iter_range(vs.caches), vs.caches) {
+            readback_range(v.k[li].dev, v.k[li].bit, vs.len * d * 4l, sc_.hb, kp, t * d * 4l)
+            readback_range(v.v[li].dev, v.v[li].bit, vs.len * d * 4l, sc_.hb, vp, t * d * 4l)
+            kv_cache_append_rows(kc, kp, vp, t, d)
+        }
+    }
+}
+
+//! the text prompt's rows through the backbone after the voice's: the frames slab's layers in the rows form at
+//! positions vs.len.., the keys and values into the voice slot and back to the host caches, the slot's rows left for
+//! the frames call after it
+[hot_path, arch(at = "../ARCHITECTURE_GPU_TOWER_VULKAN_TTS.md#vk-pocket-chain")]
+def private vulkan_pocket_prompt(m : PocketModel; var vs : PocketVoiceState; n_txt : int64; var sc : PocketScratch) : bool {
+    if (!vulkan_tower_on()) {
+        return ts_decline("prompt", VulkanTtsDecline.knob)
+    }
+    let tf & = unsafe(m.backbone)
+    let d = tf.d
+    let shape_ok = tts_pk_frames_ok(m, TS_PK_ATTN_HS, TS_PK_GEMV_MAX_NIN) $(l : TtsLinear) : bool {
+        return tts_gemm_lin_ok(l)
+    }
+    if (!tts_pk_prompt_admit(m, vs, n_txt, TS_PK_ATTN_MAX_KEYS) || d % 4l != 0l || !shape_ok) {
+        return ts_decline("prompt", VulkanTtsDecline.shape)
+    }
+    if (!ts_arm_ensure("pocket prompt", @@ts_pk_codec_ensure)) {
+        return ts_decline("prompt", VulkanTtsDecline.device)
+    }
+    let fl = ts_pk_prompt_floats(m, n_txt)
+    if (!ts_pk_frames_attach(m) || !ts_pk_voice_attach(vs, tf) || !ts_scratch_ready(g_ts_pkp_scratch, fl, 0l, 0l, n_txt * d)) {
+        return ts_decline("prompt", VulkanTtsDecline.memory)
+    }
+    let sl & = g_ts_pk_frames_slots
+    let sc_ & = g_ts_pkp_scratch
+    let slab = g_ts_pk_frames.rows
+    let v & = g_ts_pk_voice
+    ts_upload(ts_rows(sc_, TS_F_X), sc.rows, n_txt * d)
+    let f = TsPkRowsForm(pos0 = vs.len, kv_row0 = vs.len, tabs = v.rope, coff = 0l, soff = v.sin_off, zero = sl.zero, kv_only_last = true)
+    vt_chain_one_shot("pocket prompt", long_length(tf.layers), n_txt) $(raw : VkCommandBuffer; var h : VkHaz) {
+        ts_pk_rows_tf(raw, h, slab, sc_, tf, sl.layers, n_txt, f, TS_F_X, TS_F_XB, TS_F_QKV, TS_F_CTX, TS_F_H) $(li : int) {
+            return (k = v.k[li], v = v.v[li])
+        }
+    }
+    g_ts_encodes++
+    ts_pk_prompt_readback(vs, sc_, n_txt, d)
+    tts_pk_prompt_dev_set(g_ts_pk_prompt_dev, vs, v.gen, sc.rows, n_txt, d)
+    return true
+}
+
 [init]
 def dasllama_vulkan_tts_register {
     register_vk_drop_hook(@@ts_forget)
@@ -2320,6 +2426,6 @@ def dasllama_vulkan_tts_register {
         register_styletts2_gpu(St2GpuDriver(albert = @@vulkan_styletts2_albert, text = @@vulkan_styletts2_text, dur_enc = @@vulkan_styletts2_dur_enc,
             durations = @@vulkan_styletts2_durations, prosody = @@vulkan_styletts2_prosody, decode = @@vulkan_styletts2_decode,
             gen = @@vulkan_styletts2_generator))
-        register_pocket_gpu(PocketGpuDriver(codec = @@vulkan_pocket_codec, frames = @@vulkan_pocket_frames))
+        register_pocket_gpu(PocketGpuDriver(codec = @@vulkan_pocket_codec, frames = @@vulkan_pocket_frames, prompt = @@vulkan_pocket_prompt))
     }
 }

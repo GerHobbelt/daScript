@@ -16,7 +16,7 @@ def parse(json_str : string; t : T?) : JsonValue? {
 
 def parse_expect_fail(json_str : string; t : T?) {
     var error : string
-    var js = read_json(json_str, error)
+    let js = read_json(json_str, error)
     t |> equal(js == null, true)
     t |> equal(error != "", true)
 }
@@ -544,9 +544,7 @@ struct TestStruct {
     score : float
 }
 
-def operator ==(a, b : TestStruct) {
-    return a.name == b.name && a.value == b.value && a.score == b.score
-}
+def operator ==(a, b : TestStruct) => a.name == b.name && a.value == b.value && a.score == b.score
 
 [test]
 def test_from_jv(t : T?) {

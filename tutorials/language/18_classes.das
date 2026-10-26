@@ -44,9 +44,7 @@ class Circle : Shape {
         radius = r
     }
 
-    def override area : float {
-        return 3.14159 * radius * radius
-    }
+    def override area : float => 3.14159 * radius * radius
 }
 
 class Rectangle : Shape {
@@ -59,9 +57,7 @@ class Rectangle : Shape {
         height = h
     }
 
-    def override area : float {
-        return width * height
-    }
+    def override area : float => width * height
 
     // Override describe to add dimensions, but also call parent version
     def override describe {
@@ -78,9 +74,7 @@ class Counter {
         count++
     }
 
-    def get_count : int {
-        return count
-    }
+    def get_count : int => count
 }
 
 // === Static fields and static methods ===
@@ -97,9 +91,7 @@ class Tracker {
     }
 
     // Static method — no 'self', can only access static fields
-    def static getTotal : int {
-        return total
-    }
+    def static getTotal : int => total
 
     def static reset {
         total = 0
@@ -142,9 +134,9 @@ def main {   // nolint:STYLE038 - tutorial walkthrough, the sequence IS the less
     // === Static fields and methods ===
 
     // Static fields are shared across all instances
-    var t1 = new Tracker()
-    var t2 = new Tracker()
-    var t3 = new Tracker()
+    let t1 = new Tracker()
+    let t2 = new Tracker()
+    let t3 = new Tracker()
     print("tracker ids: {t1.id}, {t2.id}, {t3.id}\n")
 
     // Access static field via backtick syntax

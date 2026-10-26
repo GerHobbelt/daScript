@@ -55,7 +55,23 @@ list(FILTER AOT_CLASS_BOOST_FILES EXCLUDE REGEX "failed_")
 
 FILE(GLOB AOT_DASPEG_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/dasPEG/*.das")
 
-FILE(GLOB AOT_DASGLTF_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/dasGLTF/*.das")
+SET(AOT_DASGLTF_FILES "")
+SET(AOT_DASGLTF_MODULE_FILES "")
+IF(NOT DAS_STBIMAGE_DISABLED AND NOT DAS_MESHOPTIMIZER_DISABLED)
+    FILE(GLOB AOT_DASGLTF_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/dasGLTF/*.das")
+
+    SET(AOT_DASGLTF_MODULE_FILES
+        modules/dasGLTF/gltf/gltf_types.das
+        modules/dasGLTF/gltf/gltf_accessor.das
+        modules/dasGLTF/gltf/gltf_parse.das
+        modules/dasGLTF/gltf/gltf_scene.das
+        modules/dasGLTF/gltf/gltf_boost.das
+        modules/dasGLTF/gltf/gltf_skinning.das
+        modules/dasGLTF/gltf/gltf_processed.das
+        modules/dasGLTF/gltf/gltf_atmosphere.das
+        modules/dasGLTF/gltf/gltf_pbr_common.das
+    )
+ENDIF()
 
 # No dasLLAMA test — old or new — joins test_aot: the suite is -jit (tests/run.das), and its
 # require graph reaches dasVulkan, which is in-tree but carries no AOT registration at all, so
@@ -307,6 +323,7 @@ SET(AOT_DASLIB_FILES
     tests/daslib/test_faker.das
     tests/daslib/test_tune_shells.das
     tests/daslib/test_format_raw_assign.das
+    tests/daslib/test_wrap_long_lines.das
 )
 # tests/daslib is listed by hand, so a test file there is exactly one of: listed above, or
 # marked `options no_aot` because a module it requires keeps out of AOT. A file that is neither
@@ -453,7 +470,7 @@ foreach(_s IN LISTS DAS_AOT_SUITES)
     list(APPEND TEST_AOT_ALL_DAS ${AOT_${_u}_FILES})
 endforeach()
 
-set(DAS_AOT_MODULE_SUITES daslib dastest decs glsl language linq macro_boost math quote stbimage typemacro)
+set(DAS_AOT_MODULE_SUITES daslib dasgltf dastest decs glsl language linq macro_boost math quote stbimage typemacro)
 foreach(_s IN LISTS DAS_AOT_MODULE_SUITES)
     string(TOUPPER ${_s} _u)
     add_custom_target(test_aot_${_s}_modules)

@@ -7,6 +7,7 @@ module openai_server
 require dasllama/dasllama       // the public facade — the main dasLLAMA surface this tool touches
 require dasllama/dasllama_scheduler   // continuous-batching scheduler (layer 3 over the facade)
 require dasllama/dasllama_bench       // the llama-bench rows the in-process /bench runs on the served model
+require constraints                   // response_format / tool_choice grammars - the sampler's token admission
 require user_state                    // write_config - the /config save
 require dashv/dashv_boost public
 require daslib/json_boost
@@ -249,6 +250,7 @@ struct ModelSlot {
     vision : VisionEmbedder = VisionEmbedder()   // set_model_vision; kind == none = text only (encode runs on the media worker)
     vision_path : string                             // the worker loads its own embedder from this
     audio_armed : bool                           // set_model_audio; the media worker owns the encoder itself
+    audio_bare : bool                            // the audio encoder's rows splice with no span marker (ultravox)
     audio_path : string                              // the mmproj the worker loads the audio encoder from
     think_default : bool   // family default when the request sends no enable_thinking (THINKING.md's table)
 }
@@ -325,6 +327,7 @@ struct AsrSlot {
     mmproj : string
     workers : int
     ready : int                 //! workers that loaded and answered
+    decoder : string            //! where the workers decode, off a ready event: `metal` for a decoder loaded as the Metal flavor, else `cpu`
 }
 
 //! One served TTS model: one worker loads and owns it. The answer-side fields are the worker's own, off its ready event.
@@ -350,6 +353,7 @@ var private g_asr_alias = ""                //! the default ASR model's other na
 var private g_asr_jobs : array<Channel?>   //! a job channel a running ASR model, by its row; the thread that started the workers holds them
 var private g_tts_jobs : array<Channel?>   //! the same a TTS model, null for one that is not armed
 var g_asr_team_dispatch = false
+var g_speech_metal = MetalMode.off   //! the engine's Metal mode, handed to the ASR workers whose decoder is a Model session
 var g_tts_team_dispatch = false
 let TTS_VOICE_CLIP_EXTENSIONS : array<string> <- [".wav", ".flac", ".mp3", ".ogg"]   // what the decode rail reads
 var g_shutdown_requested = false
@@ -370,9 +374,15 @@ struct private StreamWire {
     reply_parts : array<string>     // non-streaming (or has_tools): pieces accumulate until the finished event
     utf8_tail : string              // streaming: held-back bytes of a multi-byte char split across tokens
     has_tools : bool                // chat request declared tools on a tool-capable template
-    last_keepalive_ticks : int64    // tool streams buffer native envelopes; empty deltas keep HTTP alive
+    last_keepalive_ticks : int64    // the last empty delta a silent stream got (flush_stream_keepalives)
     call_open : string              // the family's tool-call markers (copied from the chat template)
     call_close : string
+    call_hold : string              //! streaming with tools: a content tail that could still begin `call_open`, held back (`stop_scan`)
+    call_seen : bool                //! ... the marker has shown: no more content goes out, the finish-time parse frames the call
+    call_stops : array<string>      //! ... `call_open` as the stop list the hold scans for
+    content_streamed : string       //! ... the content put on the wire so far, so the finish-time parse adds only what follows it
+    think_init : ThinkStream = ThinkStream()   //! the splitter as armed, untouched by the pieces: the finish-time parse of a live stream drains the whole reply through a copy
+    tool_types : table<string; table<string; string>>   //! the declared parameter types per tool, what the xml_function parse types a block's values by
     tool_mode : ToolMode = ToolMode.none   // the family's tool wire format — the finish parse dispatches on it
     think : ThinkStream = ThinkStream()   // the reply-side reasoning splitter (pass-through when unarmed)
 }
@@ -421,6 +431,7 @@ def set_model(var m : Model; name : string) {
     unsafe {
         delete g_slots
     }
+    reset_token_pieces()
     g_default_slot = 0
     g_active = 0
     g_cur = 0
@@ -685,25 +696,28 @@ def private arm_slot_audio(mi : int; path : string) : string {
     }
     let proj_dim = audio_probe_proj_dim(path)
     if (proj_dim == 0l) {
-        return "{base_name(path)} carries no audio encoder dasLLAMA serves (gemma4a) - it cannot arm audio for {g_slots[mi].name}"
+        return "{base_name(path)} carries no audio encoder dasLLAMA serves (gemma4a, or a whisper-class tower: qwen2a, qwen2.5o, ultravox, voxtral) - it cannot arm audio for {g_slots[mi].name}"
     }
     if (proj_dim != g_slots[mi].model.config.dim) {
         return "{base_name(path)}'s audio encoder projects to {proj_dim} but {g_slots[mi].name} is {g_slots[mi].model.config.dim}-wide - mismatched pair"
     }
     var probe <- create_chat_renderer(g_slots[mi].model, "", 1l)
-    let no_markers = empty(probe.tmpl.audio_pre.parts) || !audio_vocab_ok(g_slots[mi].model, probe.tmpl)
+    // an ultravox span takes no marker: the stock decoder it pairs with declares none
+    let no_markers = !audio_probe_span_bare(path) && (empty(probe.tmpl.audio_pre.parts) || !audio_vocab_ok(g_slots[mi].model, probe.tmpl))
     delete probe
     if (no_markers) {
         return "{g_slots[mi].name}'s chat template or vocab carries no audio span markers - it has no audio arm"
     }
     g_slots[mi].audio_armed = true
+    g_slots[mi].audio_bare = audio_probe_span_bare(path)
     g_slots[mi].audio_path = path
     to_log(LOG_INFO, "dasllama-server: {g_slots[mi].name} audio arm: {base_name(path)} ({proj_dim}-wide)\n")
     return ""
 }
 
-//! Give slot `name` an audio arm: the mmproj at `path` must carry a gemma4a audio encoder (the
-//! E-series mmproj carries BOTH towers, so the same file arms vision and audio). The chat route
+//! Give slot `name` an audio arm: the mmproj at `path` must carry an audio encoder the engine serves - gemma4a,
+//! or a whisper-class tower (an E-series or Omni mmproj carries BOTH towers, so the same file arms vision
+//! and audio). The chat route
 //! then accepts `input_audio` content parts — the clip serves through THIS slot, no second
 //! decoder copy. Same call contract as ``set_model_vision``: once per slot, before
 //! ``init_server`` (the media worker snapshots the arms at init); a bad pair PANICS here.
@@ -785,9 +799,7 @@ def private tts_slot_of(model : string) : int {
 //! The weight lane ``/v1/audio/speech`` requested for its default model — what ``configure_tts`` kept
 //! after normalizing. The lane the worker actually pinned rides the ``tts`` block of
 //! ``GET /v1/stats``.
-def server_tts_lane : string {
-    return empty(g_tts) ? TTS_LANE_DEFAULT : g_tts[0].lane
-}
+def server_tts_lane : string => empty(g_tts) ? TTS_LANE_DEFAULT : g_tts[0].lane
 
 //! Configure the TTS model ``/v1/audio/speech`` serves: one worker thread loads and owns it in
 //! its own context, the route id is the file's stem. Call once before ``run_server``. A missing
@@ -827,9 +839,11 @@ def add_tts_model(path : string; lane : string = TTS_LANE_DEFAULT; voices_dir : 
 
 //! True when a TTS model is armed: false when none was configured, and false when every configured
 //! one's file set was incomplete or its worker could not load it.
-def server_has_tts : bool {
-    return tts_default() >= 0
-}
+def server_has_tts : bool => tts_default() >= 0
+
+//! True when a speech model serves with no LLM slot beside it: an armed TTS model or a configured ASR model.
+def server_has_speech : bool
+    => server_has_tts() || !empty(g_asr)
 
 //! Stop admitting new inference/ASR work and exit after all accepted work finishes. Also wired to
 //! ``POST /shutdown``.
@@ -869,14 +883,10 @@ def set_config_surface(surface_json : string; save_path : string; model_path : s
 
 //! True when the drain was started by ``POST /restart`` — the lifecycle host exits with the
 //! watchdog's config-restart code (4) instead of 0 so it relaunches with the saved config.
-def server_restart_requested : bool {
-    return g_restart_requested
-}
+def server_restart_requested : bool => g_restart_requested
 
 //! True while a benchmark runs - the A/B child measuring this box, or the in-process rows.
-def server_bench_running : bool {
-    return g_bench_state == "running"
-}
+def server_bench_running : bool => g_bench_state == "running"
 
 // ===== benchmark button (the llama.cpp A/B) =====
 // POST /bench runs, QUIESCED ONLY, one lcpp_bench child (--ref runs llama-bench inside it — same
@@ -1021,9 +1031,8 @@ def private drain_bench_events() {
 
 //! `ab` when POST /bench spawns the lcpp_bench + llama-bench child (a source-tree daslang and
 //! `lcpp_bin` both configured), else `inprocess`: the rows run on the served model right here.
-def private bench_mode() : string {
-    return (!empty(g_lcpp_bin) && !empty(g_daslang_bin)) ? "ab" : "inprocess"
-}
+def private bench_mode() : string =>
+    (!empty(g_lcpp_bin) && !empty(g_daslang_bin)) ? "ab" : "inprocess"
 
 def private handle_bench_start(var resp : Reply) : http_status {
     if (g_bench_state == "running") {
@@ -1104,19 +1113,14 @@ var private g_ibench_session : Session
 var private g_ibench_passes0 = 0l   // the CPU-pass count as the rows began: a GPU slot's rows that move it say so
 
 //! True while the in-process rows run.
-def ibench_running() : bool {
-    return g_ibench_phase != IBENCH_PHASE_IDLE
-}
+def ibench_running() : bool => g_ibench_phase != IBENCH_PHASE_IDLE
 
 //! True while any benchmark measures this box - the in-process rows, or the A/B child: every
 //! route that could contend with it holds on this, whichever mode runs.
-def bench_hold_active() : bool {
-    return server_bench_running()
-}
+def bench_hold_active() : bool => server_bench_running()
 
-def private ibench_hold_text() : string {
-    return "a benchmark is running on this server - retry when GET /bench reports it done"
-}
+def private ibench_hold_text() : string =>
+    "a benchmark is running on this server - retry when GET /bench reports it done"
 
 //! the deferred routes' hold: the audio and speech workers share the cores the timed reps run
 //! on, so their queues answer 503 for the run's duration like the text routes do
@@ -1740,7 +1744,7 @@ def private ram_gb_from_meminfo(text : string) : int {
         if (ln |> starts_with("MemTotal")) {
             let c = find(ln, ":")
             if (c >= 0) {
-                var toks <- split(strip(slice(ln, c + 1)), " ")
+                var inscope toks <- split(strip(slice(ln, c + 1)), " ")
                 let kb = empty(toks) ? 0.0 : to_float(toks[0])
                 delete toks
                 return int(kb / (1024.0 * 1024.0) + 0.5)
@@ -1748,6 +1752,16 @@ def private ram_gb_from_meminfo(text : string) : int {
         }
     }
     return 0
+}
+
+let SERVER_PREFIX_STATES = 256l   //! the server's checkpoint count cap under its byte budget - a library caller keeps `DEFAULT_PREFIX_STATES`
+
+//! The recurrent checkpoints' byte budget in MB: the one asked for, else a quarter of the box's RAM - what a 64 GB
+//! serving box gives a prompt cache - and 4 GB when the box's RAM is unknown. The count cap (`--prefix-states`) still
+//! binds first when it is the smaller.
+def prefix_state_budget_mb(requested_mb, ram_gb : int64) : int64 {
+    return requested_mb if (requested_mb > 0l)
+    return ram_gb > 0l ? ram_gb * 1024l / 4l : 4096l
 }
 
 // Total physical RAM — a twin of profile_common's private platform_ram_gb (kept separate so
@@ -2089,13 +2103,10 @@ def private next_id() : int64 {
 
 // `created` is a unix-seconds field no OpenAI client validates; a monotone stand-in is honest and
 // avoids a wall-clock dependency in the hot path.
-def private created_ts() : int64 {
-    return 1751200000l + g_req_counter
-}
+def private created_ts() : int64 => 1751200000l + g_req_counter
 
-def private error_body(msg, kind : string) : string {
-    return sprint_json(OaiErr(error = OaiErrDetail(message = msg, _type = kind)), false)
-}
+def private error_body(msg, kind : string) : string =>
+    sprint_json(OaiErr(error = OaiErrDetail(message = msg, _type = kind)), false)
 
 // Terminal error on a streaming route's writer (chat/completions run through the writer).
 def private bad_request(srv : FrontLink; writer : WriterRef; msg : string) {
@@ -2157,6 +2168,24 @@ def private send_chat_chunk(srv : FrontLink; writer : WriterRef;
                                              finish_reason = finish))
     sse_event(srv, writer, sprint_json(chunk, false), "")
     delete chunk
+}
+
+//! the content a tool-capable stream puts on the wire now: the text ahead of the family's call marker, a tail that could
+//! still begin the marker held back, and nothing once the marker has shown - the finish-time parse frames the call
+def private call_hold_pass(var w : StreamWire; cnt : string) : string {
+    if (w.call_seen || empty(cnt)) {
+        return ""
+    }
+    if (empty(w.call_stops)) {
+        w.call_stops |> push(w.call_open)
+        if (w.tool_mode == ToolMode.mistral) {
+            w.call_stops |> push("\{")   //! a mistral call the model writes as one bare object, which the finish parse frames as a call too
+        }
+    }
+    var emit = ""
+    w.call_seen = stop_scan(w.call_hold, cnt, w.call_stops, emit)
+    w.content_streamed += emit
+    return emit
 }
 
 //! a chat piece's two halves, each a chunk of its own when it carries text: the reasoning, then the content
@@ -2337,14 +2366,11 @@ def private send_compl_chunk(srv : FrontLink; writer : WriterRef;
 }
 
 // Clamp a requested reply budget to [1, model context].
-def private clamp_max(requested : int64) : int64 {
-    return clamp(requested, 1l, cur_model().config.seq_len)
-}
+def private clamp_max(requested : int64) : int64 => clamp(requested, 1l, cur_model().config.seq_len)
 
 // Error on a buffered (resp-based) route — /v1/models and the audio endpoints use the response path.
-def private resp_error(var resp : Reply; status : http_status; msg : string) : http_status {
-    return resp |> JSON(error_body(msg, "invalid_request_error"), status)
-}
+def private resp_error(var resp : Reply; status : http_status; msg : string) : http_status =>
+    resp |> JSON(error_body(msg, "invalid_request_error"), status)
 
 def private tmpdir() : string {
     var err = ""
@@ -2359,11 +2385,12 @@ def private tmpdir() : string {
 let CHAT_FIELDS : table<string> <- { "model", "messages", "stream", "temperature", "top_k", "top_p", "min_p",
                                      "presence_penalty", "frequency_penalty", "repeat_penalty", "seed",
                                      "max_tokens", "max_completion_tokens", "tools", "tool_choice",
-                                     "enable_thinking", "chat_template_kwargs", "truncation", "stream_options" }
+                                     "enable_thinking", "chat_template_kwargs", "truncation", "stream_options",
+                                     "response_format", "stop", "reasoning_effort" }
 let COMPL_FIELDS : table<string> <- { "model", "prompt", "stream", "temperature", "top_k", "top_p", "min_p",
                                      "presence_penalty", "frequency_penalty", "repeat_penalty", "seed",
-                                     "max_tokens", "stream_options" }
-let EMB_FIELDS : table<string> <- { "model", "input" }
+                                     "max_tokens", "stream_options", "stop" }
+let EMB_FIELDS : table<string> <- { "model", "input", "pooling", "dimensions" }
 
 // Sampling knobs shared by both completion routes — OpenAI names, plus the llama.cpp-style
 // extensions (top_k / min_p / repeat_penalty). Absent fields keep the greedy defaults.
@@ -2389,6 +2416,54 @@ def private warn_ignored_fields(js : JsonValue?; known : table<string>; route : 
         }
     }
 }
+
+//! The request's `stop` - one string or a list of up to STOP_MAX - sorted into the two stops the scheduler takes:
+//! a string that encodes to one token (a special such as `</think>`) is a stop id, every other a stop string the
+//! scheduler scans the reply text for. The 400's text on a malformed field, "" otherwise.
+def private read_stop_field(js : JsonValue?; var stop_ids : array<int64>; var stop_strs : array<string>) : string {
+    let sv = js?["stop"]
+    if (sv == null || sv.value is _null) {
+        return ""
+    }
+    var entries : array<string>
+    defer() { delete entries }
+    if (sv.value is _string) {
+        entries |> push(sv ?? "")
+    } elif (sv.value is _array) {
+        entries |> reserve(length(sv.value as _array))
+        for (e in (sv.value as _array)) {
+            if (!(e.value is _string)) {
+                return "'stop' must be a string or an array of strings"
+            }
+            entries |> push(e ?? "")
+        }
+    } else {
+        return "'stop' must be a string or an array of strings"
+    }
+    if (length(entries) > STOP_MAX) {
+        return "'stop' takes at most {STOP_MAX} entries"
+    }
+    for (s in entries) {
+        if (empty(s)) {
+            return "'stop' entries must be non-empty strings"
+        }
+        if (length(s) > STOP_MAX_BYTES) {
+            return "'stop' entries take at most {STOP_MAX_BYTES} bytes"
+        }
+        //! a special token's spelling stops on its id - a special never surfaces as text; any other text rides the text scan,
+        //! which also catches it inside a wider token (its own id would not)
+        let sid = special_id(cur_model(), s)
+        if (sid >= 0l) {
+            stop_ids |> push(sid)
+        } else {
+            stop_strs |> push(s)
+        }
+    }
+    return ""
+}
+
+let STOP_MAX = 8   //! OpenAI's `stop` takes four; a lenient cap keeps a client's list from growing the per-token scan
+let STOP_MAX_BYTES = 256   //! the scan holds up to a stop's length back and re-scans it a token: a long stop is a per-token cost every stream on the slot pays
 
 // A message's content: a plain string, or the OpenAI content-parts array (agents send
 // [\{type:"text", text:"..."}] even for pure text). Text parts concatenate into the return value;
@@ -2431,8 +2506,7 @@ def private message_parts(mv : JsonValue?; route : string; var images : array<st
 
 // `message_parts` for routes with no media path: image/audio parts warn and drop.
 def private message_text(mv : JsonValue?; route : string) : string {
-    var images : array<string>
-    var audios : array<string>
+    var images, audios : array<string>
     let s = message_parts(mv, route, images, audios)
     if (!empty(images)) {
         to_log(LOG_WARNING, "{route}: skipping {length(images)} image content part(s) — no vision arm on this path\n")
@@ -2563,9 +2637,11 @@ def private handle_models(var resp : Reply) : http_status {
     return resp |> JSON(body, http_status.OK)
 }
 
-// /v1/embeddings: mean-pooled, L2-normalized sentence embeddings over the facade `embed` verb.
-// `input` is a string or an array of strings; usage is counted via the facade `encode` (cheap
-// relative to the forward). Decoder-only-as-embedder — RAG-grade vectors, not a dedicated model.
+// /v1/embeddings: L2-normalized sentence embeddings over the facade `embed` verb, pooled the way the
+// file asks (its `pooling_type`; a chat model means mean) unless the request's `pooling` names one
+// ("mean" | "cls" | "last"); `dimensions` keeps the leading d components and renormalizes (the
+// Matryoshka read Qwen3-Embedding supports). `input` is a string or an array of strings; usage is
+// counted via the facade `encode` (cheap relative to the forward).
 def private handle_embeddings(req : FrontReq; var resp : Reply) : http_status {
     var perr = ""
     var js = read_json(req.body, perr)
@@ -2601,15 +2677,30 @@ def private handle_embeddings(req : FrontReq; var resp : Reply) : http_status {
     if (empty(inputs)) {
         return resp_error(resp, http_status.BAD_REQUEST, "'input' is empty")
     }
+    let pool_name = js?["pooling"] ?? ""
+    let pooling = pool_name == "mean" ? POOLING_MEAN : (pool_name == "cls" ? POOLING_CLS : (pool_name == "last" ? POOLING_LAST : -1l))
+    if (!empty(pool_name) && pooling < 0l) {
+        return resp_error(resp, http_status.BAD_REQUEST, "'pooling' must be \"mean\", \"cls\" or \"last\" (got '{pool_name}'); unset, the model's own pooling_type applies")
+    }
+    let dv = js?["dimensions"]
+    let dims = int64(dv ?? 0)
+    if ((dv != null && !(dv.value is _null) && dims < 1l) || dims > cur_model().config.dim) {   //! `?[]` answers a missing key with a null-VALUED sentinel, never a null pointer
+        return resp_error(resp, http_status.BAD_REQUEST, "'dimensions' must be 1..{cur_model().config.dim} (the model's hidden width)")
+    }
 
     var out = OaiEmbeddingList(_object = "list", model = cur_name())
     out.data |> reserve(length(inputs))
     var prompt_tokens = 0l
     var idx = 0
     for (text in inputs) {
-        let toks <- encode(cur_model(), text, true, false)
+        var inscope toks <- encode(cur_model(), text, true, false)
+        if (long_length(toks) > cur_model().config.seq_len) {   //! a cut input would embed another text and the engine's cut drops the end token the pooling reads
+            delete out
+            delete inputs
+            return resp_error(resp, http_status.BAD_REQUEST, "input {idx} is {length(toks)} tokens; the model context is {cur_model().config.seq_len} - shorten it")
+        }
         prompt_tokens += long_length(toks)
-        var vec = embed(cur_model(), text)
+        var inscope vec = embed(cur_model(), text, pooling, dims)   // the engine renormalizes
         out.data |> emplace(OaiEmbedding(_object = "embedding", embedding <- vec, index = idx))
         idx ++
     }
@@ -2620,9 +2711,8 @@ def private handle_embeddings(req : FrontReq; var resp : Reply) : http_status {
     return resp |> JSON(body, http_status.OK)
 }
 
-def private streams_busy() : bool {
-    return total_active() > 0l || total_queued() > 0l || g_asr_pending > 0 || g_media_pending > 0
-}
+def private streams_busy() : bool =>
+    total_active() > 0l || total_queued() > 0l || g_asr_pending > 0 || g_media_pending > 0
 
 // Free the tier for a runtime load and recreate the boot precondition (nothing installed, the
 // want set for THIS load). Boot-order semantics: the load arms under the engine's want, so the
@@ -2658,6 +2748,7 @@ def private unwind_failed_runtime_load(id : string; prev_owner : int) {
         uninstall_slot_marks()
         delete g_slots[ni]
         g_slots |> erase(ni)
+        erase_token_pieces(ni)
     }
     if (prev_owner >= 0) {
         bind_gpu_slot(prev_owner)
@@ -2667,15 +2758,17 @@ def private unwind_failed_runtime_load(id : string; prev_owner : int) {
 // Arm towers on a runtime-loaded slot from its mmproj; the returned note is "" or the
 // client-facing reason the slot serves text-only. Panics (a non-GGUF file, a bad projector)
 // are caught here — the model itself already serves.
-def private arm_runtime_towers(mi : int; mmproj : string) : string {
+def private arm_runtime_towers(mi : int; mmproj, audio_mmproj : string) : string {
     var note = ""
     var failure = ""
     let failed = catch_worker_panic(failure) {
-        let verr = arm_slot_vision(mi, mmproj)
-        if (!empty(verr)) {
-            note = verr
-        } elif (audio_probe_proj_dim(mmproj) > 0l) {
-            note = arm_slot_audio(mi, mmproj)   // the E-series file arms audio too
+        if (!empty(mmproj)) {
+            note = arm_slot_vision(mi, mmproj)
+        }
+        if (empty(note) && !empty(audio_mmproj)) {
+            note = arm_slot_audio(mi, audio_mmproj)
+        } elif (empty(note) && audio_probe_proj_dim(mmproj) > 0l) {
+            note = arm_slot_audio(mi, mmproj)   // a file with both towers arms audio too
         }
     }
     if (failed) {
@@ -2796,7 +2889,8 @@ def private handle_model_load(req : FrontReq; var resp : Reply) : http_status { 
     }
     let mi_new = length(g_slots) - 1
     let mmproj = js?["image_mmproj"] ?? ""
-    let tower_note = empty(mmproj) ? "" : arm_runtime_towers(mi_new, mmproj)
+    let audio_mmproj = js?["audio_mmproj"] ?? ""
+    let tower_note = empty(mmproj) && empty(audio_mmproj) ? "" : arm_runtime_towers(mi_new, mmproj, audio_mmproj)
     if (js?["activate"] ?? true) {
         set_default_model(id)   // the default is the slot model-less (page) requests land on
         g_active = mi_new
@@ -2850,6 +2944,7 @@ def private handle_model_unload(req : FrontReq; var resp : Reply) : http_status 
     let dead_name = g_slots[mi].name
     delete g_slots[mi]
     g_slots |> erase(mi)
+    erase_token_pieces(mi)
     // every slot index above mi shifted down one (the worker is immune: its tables key on names)
     if (g_default_slot > mi) {
         g_default_slot--
@@ -2947,46 +3042,75 @@ def private resolve_stream_slot(srv : FrontLink; writer : WriterRef; js : JsonVa
 // would panic) and the 503 (queue full). Moves prompt/stop_ids/close_toks into the request.
 def private register_request(srv : FrontLink; writer : WriterRef;
                              var prompt, stop_ids, close_toks : array<int64>;
-                             var media : array<float>; media_at, n_media : int64;
+                             var stop_strs : array<string>;
+                             var spans : array<MediaSpan>;
                              params : SamplingParams; max_new : int64;
                              streaming, is_chat : bool; prefix : string;
                              tools_declared : bool = false; call_open : string = ""; call_close : string = "";
                              seed : int = 0; think : ThinkStream = ThinkStream();
                              tool_mode : ToolMode = ToolMode.none; reuse_id : int64 = 0l;
-                             media_is_audio : bool = false; media_grid : int2 = int2(0);
                              var nothink : NothinkStopGuard = NothinkStopGuard(); stable_at : int64 = 0l;
-                             include_usage : bool = false) {
+                             include_usage : bool = false; resumed : bool = false;
+                             var constraint : TokenConstraint? = null; system_at : int64 = 0l; system_head_at : int64 = 0l;
+                             messages_end_at : int64 = 0l) {
+    var no_types : table<string; table<string; string>>
+    register_request(srv, writer, prompt, stop_ids, close_toks, stop_strs, spans, params, max_new, streaming, is_chat, prefix,
+                     tools_declared, call_open, call_close, seed, think, tool_mode, reuse_id, nothink, stable_at, include_usage,
+                     resumed, constraint, system_at, system_head_at, messages_end_at, no_types)
+}
+
+//! `register_request` with the declared tools' parameter types, what a Qwen3.5/3.6 reply's values are typed by
+def private register_request(srv : FrontLink; writer : WriterRef;
+                             var prompt, stop_ids, close_toks : array<int64>;
+                             var stop_strs : array<string>;
+                             var spans : array<MediaSpan>;
+                             params : SamplingParams; max_new : int64;
+                             streaming, is_chat : bool; prefix : string;
+                             tools_declared : bool; call_open : string; call_close : string;
+                             seed : int; think : ThinkStream;
+                             tool_mode : ToolMode; reuse_id : int64;
+                             var nothink : NothinkStopGuard; stable_at : int64;
+                             include_usage : bool; resumed : bool;
+                             var constraint : TokenConstraint?; system_at : int64; system_head_at : int64; messages_end_at : int64;
+                             var tool_types : table<string; table<string; string>>) {
     if (bench_hold_active()) {
+        unsafe {
+            delete constraint
+        }
         service_unavailable(srv, writer, ibench_hold_text())
         return
     }
-    let np = long_length(prompt) + n_media
+    let np = long_length(prompt)   // media positions included: a span's ids stand in the prompt
     if (np + 1l > cur_model().config.seq_len) {
+        unsafe {
+            delete constraint
+        }
         bad_request(srv, writer, "the rendered prompt is {np} tokens; the model context is {cur_model().config.seq_len} — shorten the conversation or raise --ctx")
         return
     }
     let rid = reuse_id != 0l ? reuse_id : next_id()   // a resumed image request keeps its park id, so one [req N] spans the request
     let cid = "{prefix}-{rid}"
     let created = created_ts()
-    var preq <- PendingReq(id = rid, params = params, max_new = max_new, seed = seed,
-                           media_at = media_at, n_media = n_media,
-                           media_non_causal = n_media > 0l && !media_is_audio,   // image span rows attend in full; audio rows stay causal
-                           media_grid = media_grid,   // qwen mrope grid; (0,0) on gemma families
-                           stable_at = stable_at)
+    var preq <- PendingReq(id = rid, params = params, max_new = max_new, seed = seed, stable_at = stable_at, system_at = system_at, system_head_at = system_head_at,
+                           messages_end_at = messages_end_at)
+    var encoded_rows = 0l
+    for (sp in spans) {
+        encoded_rows += empty(sp.rows) ? 0l : sp.n
+    }
     preq.prompt <- prompt
     preq.stop_ids <- stop_ids
+    preq.stop_strs <- stop_strs
     preq.nothink <- nothink
     preq.close_toks <- close_toks
-    preq.media_embd <- media
+    preq.spans <- spans
+    preq.constraint.constraint = constraint   // owned by the request from here: a refused submit frees it with preq
     if (!submit(cur_model(), cur_sched(), preq)) {
         delete preq
         to_log(LOG_WARNING, "dasllama-server: 503 queue full ({cur_sched().max_queue}) — rejected {prefix} request ({np} tok)\n")
         service_unavailable(srv, writer, "the server is at capacity ({cur_sched().max_queue} requests queued) — retry shortly")
         return
     }
-    g_media_rows += n_media   // after submit: a 503-rejected request counts nothing (an image
-                              // request reaches here once — it parks at the encode boundary
-                              // BEFORE this function and re-enters only as the resume)
+    g_media_rows += encoded_rows   // after submit: a 503-rejected request counts nothing; a span the prefix cache serves brought no rows
     g_slots[g_cur].last_used = ref_time_ticks()
     set_writer_keepalive_timeout(srv, writer, LLM_WRITER_KEEPALIVE_MS)
     to_log(LOG_INFO, "[req {rid}] {prefix}: prompt={np} tok, stream={streaming}, max_new={max_new}\n")
@@ -2995,9 +3119,10 @@ def private register_request(srv : FrontLink; writer : WriterRef;
                            has_tools = tools_declared && tool_mode != ToolMode.none,
                            last_keepalive_ticks = ref_time_ticks(),
                            call_open = call_open, call_close = call_close,
-                           tool_mode = tool_mode, think = think)
+                           tool_mode = tool_mode, think = think, think_init = think)
+    wire.tool_types <- tool_types
     g_wires[rid] <- wire
-    if (streaming && is_chat) {
+    if (streaming && is_chat && !resumed) {
         send_chat_chunk(srv, writer, cid, created, "assistant", "", "")   // opening role delta
     }
 }
@@ -3008,16 +3133,19 @@ def private register_request(srv : FrontLink; writer : WriterRef;
 // Render a user-led suffix of the transcript. System messages are always retained (they were
 // folded into `system`); `start` applies only to conversational messages in the original array.
 def private render_chat_suffix(msgs_v : JsonValue?; system : string; tools : array<string>;   // nolint:STYLE037,STYLE038 — one arm per message role, each accumulating into the same renderer state
-                               max_new : int64; start : int; think_set, think_val, has_media, media_is_audio : bool;
+                               max_new : int64; start : int; think_set, think_val, preserve_think : bool; effort : string; refs : array<MediaRef>;
                                var prompt, stop_ids, close : array<int64>&;
                                var nothink_out : NothinkStopGuard&;
                                var call_open, call_close : string&; var think_out : ThinkStream&;
-                               var tool_mode_out : ToolMode&; var media_at, stable_at : int64&) : string {
+                               var tool_mode_out : ToolMode&; var stable_at : int64&; var system_at : int64&; var system_head_at : int64&;
+                               var messages_end_at : int64&) : string {
     var chat <- create_chat_renderer(cur_model(), system, max_new)
     defer() { delete chat }
     if (think_set) {   // absent from the request => the family's own default (gemma-4 E: off)
         set_thinking(chat, think_val)
     }
+    set_preserve_thinking(chat, preserve_think)
+    set_reasoning_effort(chat, effort)
     if (!empty(tools)) {
         if (chat.tmpl.tool_mode == ToolMode.none) {
             return "'tools' is not supported: the {cur_name()} chat template declares no tool-call format"
@@ -3049,8 +3177,7 @@ def private render_chat_suffix(msgs_v : JsonValue?; system : string; tools : arr
     defer() { delete seen_images }
     var seen_audios : array<string>   // ditto for input_audio parts
     defer() { delete seen_audios }
-    var tool_results : array<string>
-    var tool_names : array<string>
+    var tool_results, tool_names : array<string>
     defer() {
         delete tool_results
         delete tool_names
@@ -3069,10 +3196,17 @@ def private render_chat_suffix(msgs_v : JsonValue?; system : string; tools : arr
             pending = true
         }
         if (role == "user") {
+            if (chat.has_pending && !chat.pending_is_tool) {   //! a user message after a user message: the earlier one is its own turn
+                render_user(cur_model(), chat, rendered)
+            }
             add_user(chat, content)
+            for (r in refs) {   // the message's media, inline where its parts sit among the text
+                continue if (r.msg != i)
+                add_user_span(cur_model(), chat, r.key, r.n_rows, r.text_before, !r.is_audio, r.is_audio && g_slots[g_cur].audio_bare)
+            }
             pending = true
         } elif (role == "assistant") {
-            var calls : array<string>
+            var inscope calls : array<string>
             let tc = mv?["tool_calls"]
             if (tc != null && tc.value is _array) {
                 calls |> reserve(length(tc.value as _array))
@@ -3097,10 +3231,11 @@ def private render_chat_suffix(msgs_v : JsonValue?; system : string; tools : arr
                 }
             }
             if (pending) {
+                let reasoning = mv?["reasoning_content"] ?? ""
                 if (!empty(calls)) {
-                    render_assistant_calls(cur_model(), chat, content, calls, rendered)
+                    render_assistant_calls(cur_model(), chat, content, calls, rendered, reasoning)
                 } else {
-                    render_assistant(cur_model(), chat, content, rendered)
+                    render_assistant(cur_model(), chat, content, rendered, reasoning)
                 }
                 pending = false
             }
@@ -3121,28 +3256,13 @@ def private render_chat_suffix(msgs_v : JsonValue?; system : string; tools : arr
         delete rendered
         return "the last message must be a user or tool message"
     }
-    media_at = 0l
-    stable_at = 0l
-    if (has_media) {
-        // the media turn renders as TWO token spans; the soft-token rows prefill between them, so
-        // the scheduler gets one flat prompt plus the index the rows splice at
-        var head : array<int64>
-        var tail : array<int64>
-        if (media_is_audio) {
-            render_turn_audio(cur_model(), chat, head, tail)
-        } else {
-            render_turn_image(cur_model(), chat, head, tail)
-        }
-        media_at = long_length(rendered) + long_length(head)
-        rendered |> push_from(head, tail)
-        delete head
-        delete tail
-    } else {
-        var turn <- render_turn_marked(cur_model(), chat)
-        stable_at = long_length(rendered) + turn.opening   //! every earlier turn, and the last turn's own opening
-        rendered |> push_from(turn.toks)
-        delete turn
-    }
+    var turn <- render_turn_marked(cur_model(), chat)
+    stable_at = long_length(rendered) + turn.opening   //! every earlier turn and the last turn's own opening: where the requests that share this history part
+    system_at = chat.first_opening > 0l ? chat.first_opening : turn.opening   //! the conversation's opening, from the replayed first turn or this one
+    system_head_at = chat.system_head_at > 0l ? chat.system_head_at : turn.system_head   //! ... and its system text before the tool block
+    messages_end_at = long_length(rendered) + turn.messages_end   //! the last message's close, ahead of the generation prompt: where the conversation's next request still matches
+    rendered |> push_from(turn.toks)
+    delete turn
     // out-params: the sole caller hands them in empty and deletes them before every re-render
     prompt <- rendered      // nolint:PERF030 — empty on entry
     stop_ids <- turn_stop_ids(chat)   // nolint:PERF030 — empty on entry; the thinking-off extras ride the guard
@@ -3197,9 +3317,9 @@ def private handle_chat(srv : FrontLink; req : FrontReq; writer : WriterRef) {
     if (parked == MediaPark.answered) {
         return   // an error already went out; the defer frees js
     }
-    var no_media : array<float>
-    defer() { delete no_media }
-    handle_chat_tail(srv, writer, js, g_cur, no_media, 0l)
+    var no_refs : array<MediaRef>
+    defer() { delete no_refs }
+    handle_chat_tail(srv, writer, js, g_cur, no_refs)
 }
 
 enum private MediaPark {
@@ -3208,90 +3328,198 @@ enum private MediaPark {
     parked     // the request is parked with the media worker, which now owns js
 }
 
-// The chat route's media boundary: ONE image or ONE audio clip, on the FINAL message (a user
-// message carrying it). Any other placement warns and drops — an earlier turn has no render seam
-// (replays go through render_assistant, which has no splice), and a trailing tool turn must render
-// as tools.
+//! One media part of a request: the message and text offset it sits at, the content key its positions carry, and its
+//! soft-token rows once encoded. `n_rows` is known ahead of the rows for media this slot has encoded before.
+struct private MediaRef {
+    key : uint64
+    is_audio : bool
+    msg : int
+    text_before : int
+    payload : string            // the part's base64 / data URI, inside the parked request's JSON
+    n_rows : int64
+    grid : int2
+    rows : array<float>
+    want_rows : bool            // known, but the prefix cache does not hold its span under this prompt: encode it
+}
+
+//! what a slot remembers of media it encoded: the span's shape, which a transcript needs to lay the span out
+struct private MediaSeen {
+    n_rows : int64
+    grid : int2
+}
+
+let MEDIA_SPANS_LIMIT = 16     // media parts one request may carry, every message's
+let MEDIA_SEEN_LIMIT = 4096    // remembered span shapes; past it the table starts over
+
+var private g_media_seen : table<uint64; MediaSeen>
+
+//! the media parts of every user message, in transcript order, each at its text offset in its message
+def private collect_media_refs(msgs_v : JsonValue?; var refs : array<MediaRef>) {
+    let salt = hash(g_slots[g_cur].name)
+    for (i in range(length(msgs_v.value as _array))) {
+        let mv = (msgs_v.value as _array)[i]
+        let cv = mv?["content"]
+        continue if (cv == null || !(cv.value is _array))
+        let is_user = (mv?["role"] ?? "") == "user"
+        var at = 0
+        for (pv in (cv.value as _array)) {
+            let ptype = pv?["type"] ?? ""
+            var payload = ""
+            if (ptype == "text") {
+                at += length(pv?["text"] ?? "")
+            } elif (ptype == "image_url") {
+                let uv = pv?["image_url"]
+                payload = uv != null && uv.value is _string ? (uv ?? "") : (uv?["url"] ?? "")
+            } elif (ptype == "input_image") {
+                payload = pv?["image_url"] ?? ""
+            } elif (ptype == "input_audio") {
+                payload = pv?["input_audio"]?["data"] ?? ""
+            }
+            continue if (ptype == "text" || empty(payload) && ptype != "image_url" && ptype != "input_image" && ptype != "input_audio")
+            if (!is_user) {
+                to_log(LOG_WARNING, "/v1/chat/completions: dropping a media part on message {i} - media rides user messages\n")
+                continue
+            }
+            let is_audio = ptype == "input_audio"
+            refs |> emplace(MediaRef(key = hash_combine64(hash_combine64(hash(payload), salt), is_audio ? 1ul : 2ul),
+                                     is_audio = is_audio, msg = i, text_before = at, payload = payload))
+        }
+    }
+}
+
+//! Send the worker a job for every ref that needs rows - all of them under `force`, else the ones this slot never
+//! encoded; a job's id maps back to its ref. False with `why` when a part does not decode.
+def private encode_media_refs(rid : int64; var wire : MediaWire; force : bool; var why : string&) : bool {
+    for (r, ri in wire.refs, count()) {
+        continue if (!empty(r.rows) || (!force && !r.want_rows && r.n_rows > 0l))
+        r.want_rows = false
+        var inscope file_bytes : array<uint8>
+        let decoded = (r.is_audio ? decode_base64_bytes(r.payload, file_bytes, why)
+            : decode_data_uri_bytes(r.payload, file_bytes, why))
+        if (!decoded) {
+            delete file_bytes
+            return false
+        }
+        let jid = next_id()
+        var vjob = MediaJob(id = jid, name = g_slots[wire.slot].name, file_bytes <- file_bytes, tag = "req{rid}",
+                            is_audio = r.is_audio,
+                            max_audio_frames = r.is_audio ? audio_decode_frame_cap(g_slots[wire.slot].model.config.seq_len) : 0)
+        g_media_jobs |> push_clone(vjob)
+        delete vjob
+        g_media_job_ref[jid] = MediaJobRef(wire = rid, at = ri)
+        g_media_pending++
+        wire.jobs_left++
+    }
+    return true
+}
+
+// The chat route's media boundary: every image and audio part of every user message stays in the transcript, at its
+// place among the message's text. A part this slot has encoded before goes to the scheduler with no rows - the
+// prefix cache holds its span on a continued chat - and only a new part parks with the media worker.
 def private park_media_request(srv : FrontLink; writer : WriterRef;
                                var js : JsonValue?; msgs_v : JsonValue?) : MediaPark {
-    var images : array<string>
-    defer() { delete images }
-    var audios : array<string>
-    defer() { delete audios }
-    let n_msgs = length(msgs_v.value as _array)
-    for (i in range(n_msgs)) {
-        var img_here : array<string>
-        var aud_here : array<string>
-        message_parts((msgs_v.value as _array)[i], "/v1/chat/completions", img_here, aud_here)
-        let is_final_user = i == n_msgs - 1 && ((msgs_v.value as _array)[i]?["role"] ?? "") == "user"
-        if ((!empty(img_here) || !empty(aud_here)) && !is_final_user) {
-            to_log(LOG_WARNING, "/v1/chat/completions: dropping {length(img_here) + length(aud_here)} media part(s) on message {i} — media is read from the FINAL user message only\n")
-        } else {
-            images |> push_from(img_here)
-            audios |> push_from(aud_here)
-        }
-        delete img_here
-        delete aud_here
-    }
-    if (empty(images) && empty(audios)) {
+    var refs : array<MediaRef>
+    collect_media_refs(msgs_v, refs)
+    if (empty(refs)) {
+        delete refs
         return MediaPark.none
     }
-    if (!empty(images) && !empty(audios)) {
-        bad_request(srv, writer, "one media clip per request — this message carries an image AND audio")
+    var refusal = ""
+    var n_new = 0
+    for (r in refs) {
+        if (r.is_audio && !g_slots[g_cur].audio_armed) {
+            refusal = "model '{cur_name()}' has no audio arm — start the server with --audio-mmproj (or an --image-mmproj that carries an audio tower) for it to accept input_audio parts"
+        } elif (!r.is_audio && g_slots[g_cur].vision.kind == VisionKind.none) {
+            refusal = "model '{cur_name()}' has no vision arm — start the server with an image mmproj for it to accept image_url parts"
+        }
+        let seen = g_media_seen?[r.key] ?? MediaSeen()
+        r.n_rows = seen.n_rows
+        r.grid = seen.grid
+        n_new += seen.n_rows == 0l ? 1 : 0
+    }
+    let has_new = n_new > 0
+    if (empty(refusal) && length(refs) > MEDIA_SPANS_LIMIT) {
+        refusal = "this request carries {length(refs)} media parts; the limit is {MEDIA_SPANS_LIMIT}"
+    }
+    if (!empty(refusal)) {
+        delete refs
+        bad_request(srv, writer, refusal)
         return MediaPark.answered
     }
-    let is_audio = !empty(audios)
-    if (is_audio && !g_slots[g_cur].audio_armed) {
-        bad_request(srv, writer, "model '{cur_name()}' has no audio arm — start the server with its (audio-carrying) mmproj for it to accept input_audio parts")
-        return MediaPark.answered
-    }
-    if (!is_audio && g_slots[g_cur].vision.kind == VisionKind.none) {
-        bad_request(srv, writer, "model '{cur_name()}' has no vision arm — start the server with an image mmproj for it to accept image_url parts")
-        return MediaPark.answered
-    }
-    if (length(images) > 1 || length(audios) > 1) {
-        bad_request(srv, writer, "one media clip per request — this message carries {length(images) + length(audios)}")
-        return MediaPark.answered
-    }
-    if (!g_media_armed || g_media_ready < 1) {
+    if (has_new && (!g_media_armed || g_media_ready < 1)) {
+        delete refs
         service_unavailable(srv, writer, "the media worker is not ready")
         return MediaPark.answered
     }
-    if (g_media_pending >= MEDIA_QUEUE_LIMIT) {
+    if (g_media_pending + n_new > MEDIA_QUEUE_LIMIT) {
+        delete refs
         service_unavailable(srv, writer, "the media queue is at capacity ({MEDIA_QUEUE_LIMIT}) — retry shortly")
         return MediaPark.answered
     }
-    var file_bytes : array<uint8>
+    // park at the encode boundary: the worker decodes + encodes off-thread, and drain_media_events resumes at
+    // handle_chat_tail with the rows; a request of known media resumes at once, its wire kept for a lost span
+    let rid = next_id()
+    set_writer_keepalive_timeout(srv, writer, LLM_WRITER_KEEPALIVE_MS)
+    g_media_wires[rid] <- MediaWire(writer = writer, js = js, slot = g_cur, refs <- refs)
+    var wire = unsafe(g_media_wires?[rid])
     var why = ""
-    let decoded = (is_audio ? decode_base64_bytes(audios[0], file_bytes, why)
-        : decode_data_uri_bytes(images[0], file_bytes, why))
-    if (!decoded) {
-        delete file_bytes
+    if (!encode_media_refs(rid, *wire, false, why)) {
+        drop_media_wire(rid, false)
         bad_request(srv, writer, why)
         return MediaPark.answered
     }
-    // park at the encode boundary: the worker decodes + encodes off-thread, and
-    // drain_media_events resumes at handle_chat_tail with the rows
-    let rid = next_id()
-    set_writer_keepalive_timeout(srv, writer, LLM_WRITER_KEEPALIVE_MS)
-    g_media_wires[rid] <- MediaWire(writer = writer, js = js, slot = g_cur, is_audio = is_audio)
-    let max_audio_frames = is_audio ? audio_decode_frame_cap(g_slots[g_cur].model.config.seq_len) : 0
-    var vjob = MediaJob(id = rid, name = g_slots[g_cur].name, file_bytes <- file_bytes, tag = "req{rid}",
-                        is_audio = is_audio, max_audio_frames = max_audio_frames)
-    g_media_jobs |> push_clone(vjob)
-    delete vjob
-    g_media_pending++
-    to_log(LOG_INFO, "[req {rid}] {is_audio ? "audio" : "image"} parked for the media worker ({g_media_pending} queued or in flight)\n")
+    if (wire.jobs_left > 0) {
+        to_log(LOG_INFO, "[req {rid}] {wire.jobs_left} media part(s) parked for the media worker, {length(wire.refs) - wire.jobs_left} known ({g_media_pending} queued or in flight)\n")
+    } else {
+        to_log(LOG_INFO, "[req {rid}] {length(wire.refs)} media part(s), every one known\n")
+        resume_media_request(srv, rid)
+    }
     return MediaPark.parked
+}
+
+//! free a parked request's wire; `keep_js` where the caller's own defer frees the request JSON
+def private drop_media_wire(rid : int64; free_js : bool) {
+    return if (!key_exists(g_media_wires, rid))
+    if (free_js) {
+        unsafe {
+            delete g_media_wires[rid].js
+        }
+    }
+    g_media_wires[rid].js = null
+    delete g_media_wires[rid]
+    g_media_wires |> erase(rid)
+}
+
+//! every job of a parked request is in: render and submit it. The wire stays until the stream's first event, since a
+//! span submitted with no rows may turn out lost.
+def private resume_media_request(srv : FrontLink; rid : int64) {
+    var wire = unsafe(g_media_wires?[rid])
+    return if (wire == null)
+    wire.submitted = true
+    handle_chat_tail(srv, wire.writer, wire.js, wire.slot, wire.refs, rid, wire.retried)
+    wire = unsafe(g_media_wires?[rid])
+    if (wire != null && wire.submitted && !key_exists(g_wires, rid)) {   // answered with an error: no stream to wait on
+        drop_media_wire(rid, true)
+    }
+}
+
+//! A stream finished `media_lost`: the prefix cache no longer held a span the request sent no rows for. Encode every
+//! part and submit again, once. False where there is nothing to retry.
+def private retry_lost_media(rid : int64) : bool {
+    var wire = unsafe(g_media_wires?[rid])
+    return false if (wire == null || wire.retried)
+    wire.retried = true
+    wire.submitted = false
+    var why = ""
+    to_log(LOG_INFO, "[req {rid}] a span the prefix cache no longer holds: encoding the request's media\n")
+    return encode_media_refs(rid, *wire, true, why) && wire.jobs_left > 0
 }
 
 // everything after the media boundary: re-derives the request fields from `js` (cheap), renders,
 // and registers. Runs synchronously for a text request; an image request re-enters here from
 // drain_media_events with the worker's rows.
 def private handle_chat_tail(srv : FrontLink; writer : WriterRef; js : JsonValue?;   // nolint:STYLE037,STYLE038 — flat request-field derivation: one guard and one client-facing message per field
-                             slot : int; var media : array<float>; n_media : int64;
-                             media_is_audio : bool = false; resume_rid : int64 = 0l;
-                             media_grid : int2 = int2(0)) {
+                             slot : int; var refs : array<MediaRef>; resume_rid : int64 = 0l; resumed : bool = false) {
     g_cur = slot
     let msgs_v = js?["messages"]
     let streaming = js?["stream"] ?? false
@@ -3332,10 +3560,20 @@ def private handle_chat_tail(srv : FrontLink; writer : WriterRef; js : JsonValue
             } elif (choice != "auto" && choice != "required") {
                 to_log(LOG_WARNING, "/v1/chat/completions: unknown tool_choice '{choice}' — treating as auto\n")
             }
-        } else {
-            to_log(LOG_WARNING, "/v1/chat/completions: forced tool_choice is not honored — treating as auto\n")
         }
     }
+    // a constrained reply (a JSON format, or a forced tool call) is sampled through a grammar; it carries no
+    // reasoning preamble, so thinking is off for it. The markers a forced call is wrapped in are the template's.
+    var spec : ConstraintSpec
+    if (constraint_fields_present(js)) {
+        let tmpl = chat_template(cur_model())
+        spec <- read_constraint_spec(js, tools, tmpl.tool_call_open, tmpl.tool_call_close, tmpl.tool_mode)
+        if (!empty(spec.err)) {
+            bad_request(srv, writer, spec.err)
+            return
+        }
+    }
+    let constrained = !empty(spec.gbnf)
 
     // OpenAI is stateless — the client resends the whole transcript. Fold system turns, replay
     // prior user/assistant/tool turns through the renderer, then render the trailing turn + the
@@ -3347,24 +3585,31 @@ def private handle_chat_tail(srv : FrontLink; writer : WriterRef; js : JsonValue
             system = empty(system) ? sc : "{system}\n{sc}"
         }
     }
-    // top-level enable_thinking, or the llama.cpp-server spelling chat_template_kwargs.enable_thinking;
-    // other kwargs keys warn like any unsupported field instead of vanishing
+    // top-level enable_thinking, or the llama.cpp-server spelling chat_template_kwargs.enable_thinking, and the
+    // kwargs' preserve_thinking (every replayed assistant turn renders its think block); other kwargs keys warn
+    // like any unsupported field instead of vanishing
     let ctk = js?["chat_template_kwargs"]
     if (ctk != null && ctk.value is _object) {
         for (k in keys(ctk.value as _object)) {
-            if (k != "enable_thinking") {
+            if (k != "enable_thinking" && k != "preserve_thinking") {
                 to_log(LOG_WARNING, "/v1/chat/completions: ignoring unsupported chat_template_kwargs key '{k}'\n")
             }
         }
     } elif (ctk != null && !(ctk.value is _null)) {
         to_log(LOG_WARNING, "/v1/chat/completions: 'chat_template_kwargs' must be an object — ignoring\n")
     }
+    let preserve_think = ctk?["preserve_thinking"] ?? false
+    let effort = js?["reasoning_effort"] ?? ""   //! OpenAI's field: harmony's `Reasoning:` line (`minimal` and `none` read as `low`); other families render nothing for it
+    if (!empty(effort) && effort != "low" && effort != "medium" && effort != "high" && effort != "minimal" && effort != "none") {
+        bad_request(srv, writer, "'reasoning_effort' is one of none, minimal, low, medium, high")
+        return
+    }
     // tri-state: an ABSENT enable_thinking leaves the family's own default in force (qwen thinks,
     // gemma-4 E doesn't); a present bool — either spelling — overrides it
     let tv = js?["enable_thinking"]
     let cv = ctk?["enable_thinking"]
-    let think_set = (tv != null && tv.value is _bool) || (cv != null && cv.value is _bool)
-    let think_val = (tv ?? true) && (cv ?? true)
+    let think_set = constrained || (tv != null && tv.value is _bool) || (cv != null && cv.value is _bool)
+    let think_val = !constrained && (tv ?? true) && (cv ?? true)
     let has_tools = !empty(tools)
     var prompt : array<int64>
     defer() { delete prompt }
@@ -3378,18 +3623,20 @@ def private handle_chat_tail(srv : FrontLink; writer : WriterRef; js : JsonValue
     var call_close = ""
     var think_stream = ThinkStream()
     var wire_tool_mode = ToolMode.none
-    var media_at = 0l
     var stable_at = 0l
+    var system_at = 0l
+    var system_head_at = 0l
+    var messages_end_at = 0l
     var start = 0
     while (true) {
-        let render_error = render_chat_suffix(msgs_v, system, tools, max_new, start, think_set, think_val,
-                                              n_media > 0l, media_is_audio, prompt, stop_ids, close, nothink, call_open, call_close,
-                                              think_stream, wire_tool_mode, media_at, stable_at)
+        let render_error = render_chat_suffix(msgs_v, system, tools, max_new, start, think_set, think_val, preserve_think, effort,
+                                              refs, prompt, stop_ids, close, nothink, call_open, call_close,
+                                              think_stream, wire_tool_mode, stable_at, system_at, system_head_at, messages_end_at)
         if (!empty(render_error)) {
             bad_request(srv, writer, render_error)
             return
         }
-        let required = long_length(prompt) + n_media + (truncation == "auto" ? max_new : 1l)
+        let required = long_length(prompt) + (truncation == "auto" ? max_new : 1l)
         if (required <= cur_model().config.seq_len || truncation != "auto") {
             break
         }
@@ -3406,10 +3653,80 @@ def private handle_chat_tail(srv : FrontLink; writer : WriterRef; js : JsonValue
         delete nothink
         delete close
     }
-    register_request(srv, writer, prompt, stop_ids, close, media, media_at, n_media, params, max_new,
+    if (resume_rid != 0l && g_media_cover_probe && uncovered_media(prompt, refs)) {
+        // a part this slot knows, under a prompt whose cached prefix stops short of it: the worker encodes it, and
+        // the request resumes here with its rows
+        var wire = unsafe(g_media_wires?[resume_rid])
+        var why = ""
+        if (wire != null && encode_media_refs(resume_rid, *wire, false, why) && wire.jobs_left > 0) {
+            wire.submitted = false
+            return
+        }
+    }
+    var inscope grammar_ends := stop_ids   //! the turn's own end tokens, before the request's stops join: a user stop ends the reply, it is no sentence end a grammar must have reached
+    var stop_strs : array<string>
+    defer() { delete stop_strs }
+    let stop_err = read_stop_field(js, stop_ids, stop_strs)
+    if (!empty(stop_err)) {
+        bad_request(srv, writer, stop_err)
+        return
+    }
+    var constraint : TokenConstraint?
+    if (constrained) {
+        var gerr = ""
+        constraint = constraint_of(spec, cur_model(), g_cur, grammar_ends, gerr)
+        if (!empty(gerr)) {
+            bad_request(srv, writer, "the request's grammar does not build: {gerr}")
+            return
+        }
+        to_log(LOG_INFO, "/v1/chat/completions: {spec.kind} constraint armed\n")
+    }
+    var spans <- media_spans(prompt, refs)
+    register_request(srv, writer, prompt, stop_ids, close, stop_strs, spans, params, max_new,
                      streaming, true, "chatcmpl",
                      has_tools, call_open, call_close, seed, think_stream, wire_tool_mode, resume_rid,
-                     media_is_audio, media_grid, nothink, stable_at, wants_usage(js))
+                     nothink, stable_at, wants_usage(js), resumed, constraint, system_at, system_head_at, messages_end_at,
+                     tool_param_types(tools))
+}
+
+//! Marks the refs that bring no rows and whose span the slot's prefix cache does not hold under `prompt`; true when
+//! there is one. A flat (unpaged) scheduler holds nothing, so every rowless ref is marked.
+def private uncovered_media(prompt : array<int64>; var refs : array<MediaRef>) : bool {
+    let covered = cur_sched().paged ? prefix_match_len(cur_sched().prefix, cur_sched().pool, prompt) : 0l
+    var any = false
+    var from = 0l
+    for (r in refs) {
+        let first = media_position_id(r.key, 0l)
+        var at = from
+        while (at < long_length(prompt) && prompt[at] != first) {
+            at++
+        }
+        continue if (at >= long_length(prompt))
+        from = at + r.n_rows
+        if (empty(r.rows) && from > covered) {
+            r.want_rows = true
+            any = true
+        }
+    }
+    return any
+}
+
+//! The spans of a rendered prompt: each ref's run of position ids, in prompt order, with the ref's rows moved in. A ref
+//! whose message the renderer dropped (auto truncation) has no run and makes no span.
+def private media_spans(prompt : array<int64>; var refs : array<MediaRef>) : array<MediaSpan> {
+    var spans : array<MediaSpan>
+    var from = 0l
+    for (r in refs) {
+        let first = media_position_id(r.key, 0l)
+        var at = from
+        while (at < long_length(prompt) && prompt[at] != first) {
+            at++
+        }
+        continue if (at >= long_length(prompt))
+        spans |> emplace(MediaSpan(at = at, n = r.n_rows, non_causal = !r.is_audio, grid = r.grid, rows <- r.rows))
+        from = at + r.n_rows
+    }
+    return <- spans
 }
 
 //! whether a request asks its stream to end on the usage chunk (`stream_options.include_usage`)
@@ -3441,11 +3758,18 @@ def private handle_completion(srv : FrontLink; req : FrontReq; writer : WriterRe
     let max_new = clamp_max(js?["max_tokens"] ?? g_default_max_new)
     var toks <- encode(cur_model(), prompt, true, false)
     defer() { delete toks }
-    // no stop ids and no close: raw completions run to the budget, matching bare generate()
-    var none_stop : array<int64>
-    var none_close : array<int64>
-    var no_media : array<float>
-    register_request(srv, writer, toks, none_stop, none_close, no_media, 0l, 0l,
+    // no template stops and no close: a raw completion runs to the budget, matching bare generate(), unless
+    // the request's own `stop` ends it
+    var stop_ids, none_close : array<int64>
+    var stop_strs : array<string>
+    defer() { delete stop_strs }
+    let stop_err = read_stop_field(js, stop_ids, stop_strs)
+    if (!empty(stop_err)) {
+        bad_request(srv, writer, stop_err)
+        return
+    }
+    var no_spans : array<MediaSpan>
+    register_request(srv, writer, toks, stop_ids, none_close, stop_strs, no_spans,
                      params, max_new, streaming, false, "cmpl",
                      [seed = seed, include_usage = wants_usage(js)])
 }
@@ -3490,27 +3814,34 @@ def private reap_disconnected(srv : FrontLink) {
     reap_speech_wires(srv)
     var disconnected_vision <- gone_wires(srv, g_media_wires)
     for (id in disconnected_vision) {
-        unsafe {
-            delete g_media_wires[id].js
-        }
-        g_media_wires[id].js = null
-        delete g_media_wires[id]
-        g_media_wires |> erase(id)
+        drop_media_wire(id, true)
     }
     delete disconnected_vision
 }
 
-// Tool-capable streaming buffers the model's native envelope until it can be normalized into an
-// OpenAI tool_calls delta. Slow CPU inference can otherwise leave the socket silent beyond libhv's
-// keep-alive window during prefill or generation. Emit a valid empty delta at least every 10s;
-// scheduler steps may be long, so this is intentionally time-based rather than token-count-based.
-def private flush_tool_keepalives(srv : FrontLink) {
+var g_stream_keepalive_us = 10000000l
+
+def set_stream_keepalive_ms(ms : int64) {
+    //! How long a streaming reply may stay silent before the server sends an empty delta (default 10 s): a
+    //! long cold prefill, or a tool stream buffering its envelope, otherwise sends nothing until its first
+    //! token, past the window a client allows. 0 sends one every tick.
+    g_stream_keepalive_us = ms * 1000l
+}
+
+// A streaming reply silent past the keep-alive window gets a valid empty delta in its own framing: a cold prefill
+// sends no token for seconds, a tool-capable stream buffers the model's native envelope until finish, and a client
+// with a no-bytes timeout, or libhv's own keep-alive window, gives up on the silence. Time-based, since a scheduler
+// step may be long.
+def private flush_stream_keepalives(srv : FrontLink) {
     for (id in keys(g_wires)) {
         var w = unsafe(g_wires?[id])
-        if (w != null && w.streaming && w.has_tools &&
-            get_time_usec(w.last_keepalive_ticks) >= 10000000) {
+        if (w != null && w.streaming && int64(get_time_usec(w.last_keepalive_ticks)) >= g_stream_keepalive_us) {
             g_cur = w.slot
-            send_chat_chunk(srv, w.writer, w.id, w.created, "", "", "")
+            if (w.is_chat) {
+                send_chat_chunk(srv, w.writer, w.id, w.created, "", "", "")
+            } else {
+                send_compl_chunk(srv, w.writer, w.id, w.created, "", "")
+            }
             w.last_keepalive_ticks = ref_time_ticks()
         }
     }
@@ -3541,7 +3872,7 @@ def private oai_calls_of(tcs : array<ToolCall>; id_base : string; var calls : ar
 // channel structure once (reasoning + content + calls); the marker modes split reasoning first
 // and parse their format from the content half; hermes keeps the marker+sniff path.
 def private parse_wire_tools(var w : StreamWire?; full, id_base : string;
-                             var reasoning : string&; var calls : array<OaiToolCall>) : string {
+                             var reasoning : string&; var calls : array<OaiToolCall>; live : bool = false) : string {
     if (w.tool_mode == ToolMode.harmony) {
         var tr <- harmony_parse(full)
         reasoning = tr.reasoning
@@ -3550,14 +3881,29 @@ def private parse_wire_tools(var w : StreamWire?; full, id_base : string;
         delete tr
         return content
     }
-    let body = split_wire_reasoning(w, full, reasoning)
-    if (w.tool_mode == ToolMode.gemma4 || w.tool_mode == ToolMode.mistral || w.tool_mode == ToolMode.llama_json) {
+    //! a live stream's pieces advanced `w.think`; its finish parse drains the whole reply through the splitter as armed
+    var body = ""
+    if (live) {
+        var fresh = w.think_init
+        let res = think_drain(fresh, full)
+        reasoning = res.reasoning
+        body = res.content
+    } else {
+        body = split_wire_reasoning(w, full, reasoning)
+    }
+    if (w.tool_mode == ToolMode.gemma4 || w.tool_mode == ToolMode.mistral || w.tool_mode == ToolMode.llama_json || w.tool_mode == ToolMode.xml_function) {
         var tr <- (w.tool_mode == ToolMode.gemma4 ? gemma4_parse(body)
-            : (w.tool_mode == ToolMode.mistral ? mistral_parse(body) : llama_json_parse(body)))
+            : (w.tool_mode == ToolMode.mistral ? mistral_parse(body)
+            : (w.tool_mode == ToolMode.xml_function ? xml_function_parse(body, w.tool_types) : llama_json_parse(body))))
         oai_calls_of(tr.calls, id_base, calls)
         let content = tr.content
         delete tr
         return content
+    }
+    //! a live hermes stream's text already went out as content: only a marker-framed call is a call now - a bare JSON
+    //! object or another family's envelope, which the buffered parse would also accept, would arrive twice
+    if (live) {
+        return parse_tool_calls(body, w.call_open, w.call_close, id_base, calls)
     }
     return parse_tool_calls_auto(body, w.call_open, w.call_close, id_base, calls)
 }
@@ -3573,13 +3919,19 @@ def private flush_events(srv : FrontLink) {   // nolint:STYLE037,STYLE038 — on
             continue
         }
         g_cur = w.slot   // response builders read the wire's slot (cur_name / cur_model)
+        if (e.kind != SchedEventKind.piece && e.finish == "media_lost" && retry_lost_media(e.stream)) {
+            delete g_wires[e.stream]   // the retry registers the stream's wire again, under the same id
+            g_wires |> erase(e.stream)
+            continue
+        }
+        drop_media_wire(e.stream, true)   // the stream is under way: its parked request has nothing left to retry
         if (e.kind == SchedEventKind.piece) {
             if (!w.streaming || w.has_tools) {
                 w.reply_parts |> push(e.text)   // buffered reply, and/or the finish-time tool-call parse
             }
-            if (w.streaming && w.has_tools) {
-                // Buffer all tool-capable output until finish so native model envelopes never leak
-                // onto the OpenAI wire. flush_tool_keepalives covers slow prefill and generation.
+            if (w.streaming && w.has_tools && empty(w.call_open)) {
+                // a family with no call marker (its calls ride channels): the whole reply is framed at finish, so no
+                // native envelope leaks onto the OpenAI wire. flush_stream_keepalives covers the silence.
             } elif (w.streaming) {
                 // re-join any held-back partial character, then hold the new incomplete tail
                 // so every delta on the wire is valid UTF-8 by itself
@@ -3595,9 +3947,16 @@ def private flush_events(srv : FrontLink) {   // nolint:STYLE037,STYLE038 — on
                         var rsn = ""
                         var cnt = ""
                         think_feed(w.think, emit_now, rsn, cnt)
+                        if (w.has_tools) {
+                            cnt = call_hold_pass(*w, cnt)
+                        }
                         send_chat_halves(srv, *w, rsn, cnt)
+                        if (!empty(rsn) || !empty(cnt)) {
+                            w.last_keepalive_ticks = ref_time_ticks()   // a delta of its own keeps the wire alive
+                        }
                     } else {
                         send_compl_chunk(srv, w.writer, w.id, w.created, emit_now, "")
+                        w.last_keepalive_ticks = ref_time_ticks()
                     }
                 }
             }
@@ -3617,13 +3976,33 @@ def private flush_events(srv : FrontLink) {   // nolint:STYLE037,STYLE038 — on
                 // Normalize the complete reply: reasoning first, then calls, in OpenAI framing.
                 let full = join(w.reply_parts, "")
                 var rsn = ""
-                var calls : array<OaiToolCall>
-                let content = parse_wire_tools(w, full, "call_{e.stream}", rsn, calls)
-                if (!empty(rsn)) {
-                    send_chat_chunk(srv, w.writer, w.id, w.created, "", "", "", rsn)
-                }
-                if (!empty(content)) {
-                    send_chat_chunk(srv, w.writer, w.id, w.created, "", content, "")
+                var inscope calls : array<OaiToolCall>
+                let live = !empty(w.call_open)
+                let content = parse_wire_tools(w, full, "call_{e.stream}", rsn, calls, live)
+                if (!live) {
+                    if (!empty(rsn)) {
+                        send_chat_chunk(srv, w.writer, w.id, w.created, "", "", "", rsn)
+                    }
+                    if (!empty(content)) {
+                        send_chat_chunk(srv, w.writer, w.id, w.created, "", content, "")
+                    }
+                } else {
+                    // the text went out as it came; now the live splitter's reasoning tail, and the content the parse frames
+                    // past what the wire carries - a held marker tail that never completed - less the bytes of a character the
+                    // generation cut mid-way, which never go out; nothing when the parse normalized the text another way
+                    var rsn_tail = ""
+                    var cnt_tail = ""
+                    think_finish(w.think, rsn_tail, cnt_tail)
+                    send_chat_halves(srv, *w, rsn_tail, "")
+                    if (length(content) > length(w.content_streamed) && starts_with(content, w.content_streamed)) {
+                        var rest = slice(content, length(w.content_streamed))
+                        if (!empty(w.utf8_tail) && ends_with(rest, w.utf8_tail)) {
+                            rest = slice(rest, 0, length(rest) - length(w.utf8_tail))
+                        }
+                        if (!empty(rest)) {
+                            send_chat_chunk(srv, w.writer, w.id, w.created, "", rest, "")
+                        }
+                    }
                 }
                 if (!empty(calls)) {
                     send_chat_tool_calls_chunk(srv, w.writer, w.id, w.created, calls)
@@ -3652,7 +4031,7 @@ def private flush_events(srv : FrontLink) {   // nolint:STYLE037,STYLE038 — on
             var rsn = ""
             var content = ""
             var finish = e.finish
-            var calls : array<OaiToolCall>
+            var inscope calls : array<OaiToolCall>
             if (w.has_tools) {
                 content = parse_wire_tools(w, full, "call_{e.stream}", rsn, calls)
                 if (!empty(calls)) {
@@ -3779,9 +4158,8 @@ struct private OaiStatsResponse {
 // budget only when the device already EXISTS (tier.device is "" until first upload creates
 // it) — the budget hook device-inits on first call, and `supported` can read true while the
 // tier is merely armed, so it must not gate this
-def private gpu_weight_budget_bytes() : int64 {
-    return !empty(gpu_tier_status().device) ? moe_gpu_weight_budget() : 0l
-}
+def private gpu_weight_budget_bytes() : int64 =>
+    !empty(gpu_tier_status().device) ? moe_gpu_weight_budget() : 0l
 
 // The `tts` member of /v1/stats, comma-prefixed, or "" when the boot configured no speech model.
 // A boot whose worker could not load its model still carries the block: `ready` reads false and
@@ -3817,6 +4195,15 @@ def private tts_stats_member() : string {
     return ",\"tts\":\{\"id\":{json_str(m.id)},\"ready\":{m.ready > 0},\"pending\":{g_tts_pending},\"done_jobs\":{g_tts_done_jobs},\"audio_s\":{g_tts_audio_s},\"voices\":[{voices}],\"sample_rate\":{m.sample_rate},\"lane\":{json_str(lane)},\"cloning\":{m.cloning},\"speed\":{m.speed},\"lang\":{json_str(m.lang)}{models}{failed}}"
 }
 
+//! the stats answer's `asr` member: each served ASR model with its workers and where they decode; "" with none
+def private asr_stats_member() : string {
+    return "" if (empty(g_asr))
+    var models <- [for (a in g_asr); "\{\"id\":{json_str(a.id)},\"workers\":{a.workers},\"ready\":{a.ready},\"decoder\":{json_str(a.decoder)}}"]
+    let member = ",\"asr\":\{\"models\":[{join(models, ",")}]}"
+    delete models
+    return member
+}
+
 // splice a member into a compact JSON object body: sprint_json/write_json_compact both close on
 // the final `}`, and the stats shapes are objects with at least one member
 def private with_json_member(body : string; member : string) : string {
@@ -3832,7 +4219,7 @@ def private handle_stats(var resp : Reply) : http_status {
         // `setup` is the MODE, not the slot count — a speech-only server serves the speech route
         // and must not draw the page's pick-a-model surface.
         return resp |> JSON(
-            "\{\"setup\":{g_setup_mode},\"model\":\"(no model)\",\"active_model\":\"\",\"ctx\":0,\"uptime_s\":{g_started_at > 0l ? get_time_nsec(g_started_at) / 1_000_000_000l : 0l},\"draining\":{g_shutdown_requested},\"active\":0,\"queued\":0,\"peak_active\":0,\"admitted\":0,\"finished\":0,\"evicted\":0,\"decode_steps\":0,\"gen_tokens\":0,\"avg_batch\":0,\"cached_tokens\":0,\"prefix_pages\":0,\"max_streams\":0,\"chunk_tokens\":0,\"asr_workers\":0,\"asr_ready\":0,\"asr_active\":0,\"asr_pending\":0,\"mtp_drafted\":0,\"mtp_accepted\":0,\"prefill_tokens\":0,\"ttft_avg_ms\":0,\"ttft_last_ms\":0,\"weights_bytes\":0,\"kv_bytes\":0,\"gpu_vram_bytes\":0,\"gpu_budget_bytes\":0,\"hardware\":{json_str(g_hardware_line)},\"asr_done_jobs\":0,\"asr_audio_s\":0,\"tts_done_jobs\":{g_tts_done_jobs},\"tts_audio_s\":{g_tts_audio_s},\"vision\":false,\"audio\":false,\"models\":[]{tts_stats_member()}}",
+            "\{\"setup\":{g_setup_mode},\"model\":\"(no model)\",\"active_model\":\"\",\"ctx\":0,\"uptime_s\":{g_started_at > 0l ? get_time_nsec(g_started_at) / 1_000_000_000l : 0l},\"draining\":{g_shutdown_requested},\"active\":0,\"queued\":0,\"peak_active\":0,\"admitted\":0,\"finished\":0,\"evicted\":0,\"decode_steps\":0,\"gen_tokens\":0,\"avg_batch\":0,\"cached_tokens\":0,\"prefix_pages\":0,\"max_streams\":0,\"chunk_tokens\":0,\"asr_workers\":{[for (a in g_asr); a.workers] |> sum()},\"asr_ready\":{[for (a in g_asr); a.ready] |> sum()},\"asr_active\":{g_asr_active},\"asr_pending\":{g_asr_pending},\"mtp_drafted\":0,\"mtp_accepted\":0,\"prefill_tokens\":0,\"ttft_avg_ms\":0,\"ttft_last_ms\":0,\"weights_bytes\":0,\"kv_bytes\":0,\"gpu_vram_bytes\":0,\"gpu_budget_bytes\":0,\"hardware\":{json_str(g_hardware_line)},\"asr_done_jobs\":{g_asr_done_jobs},\"asr_audio_s\":{g_asr_audio_s},\"tts_done_jobs\":{g_tts_done_jobs},\"tts_audio_s\":{g_tts_audio_s},\"vision\":false,\"audio\":false,\"models\":[]{asr_stats_member()}{tts_stats_member()}}",
             http_status.OK)
     }
     let tier = gpu_tier_status()
@@ -3901,7 +4288,7 @@ def private handle_stats(var resp : Reply) : http_status {
     }
     let body = sprint_json(out, false)
     delete out
-    return resp |> JSON(with_json_member(body, tts_stats_member()), http_status.OK)
+    return resp |> JSON(with_json_member(body, "{asr_stats_member()}{tts_stats_member()}"), http_status.OK)
 }
 
 // /v1/streams: the poll surface behind the page's swimlane + stream cards — per-stream state,
@@ -3953,9 +4340,7 @@ struct private OaiStreamsResponse {
 
 // Age of a ref_time_ticks stamp in seconds, wrap-safe: get_time_usec returns int and wraps at
 // ~35.8 min — poison for prefix-cache chains and anything else that lives hours.
-def private age_seconds(t : int64) : float {
-    return float(double(get_time_nsec(t)) * 1e-9lf)
-}
+def private age_seconds(t : int64) : float => float(double(get_time_nsec(t)) * 1e-9lf)
 
 def private handle_streams(var resp : Reply) : http_status {
     // the stream list below aggregates every slot, so the lane capacity the page sizes its
@@ -3974,7 +4359,7 @@ def private handle_streams(var resp : Reply) : http_status {
                 id = st.id, model = mname,
                 state = st.state == StreamState.prefilling ? "prefilling" : "decoding",
                 age_s = age_seconds(st.t_admit),
-                n_prompt = long_length(st.prompt) + st.n_media, n_cached = st.n_cached,
+                n_prompt = long_length(st.prompt), n_cached = st.n_cached,
                 n_prefilled = st.n_prefilled, n_gen = st.n_gen, max_new = st.max_new,
                 ttft_ms = float(st.ttft_us) / 1000.0,
                 prompt_head = st.prompt_head, gen_tail = utf8_trim_partial_end(string(st.gen_tail_bytes))))
@@ -3983,7 +4368,7 @@ def private handle_streams(var resp : Reply) : http_status {
             out.streams |> push(OaiStreamInfo(
                 id = q.id, model = mname, state = "queued",
                 age_s = q.t_submit != 0l ? age_seconds(q.t_submit) : 0.0,
-                n_prompt = long_length(q.prompt) + q.n_media, max_new = q.max_new))
+                n_prompt = long_length(q.prompt), max_new = q.max_new))
         }
         for (d in sch.recent_done) {
             out.streams |> push(OaiStreamInfo(
@@ -3992,7 +4377,7 @@ def private handle_streams(var resp : Reply) : http_status {
                 ttft_ms = float(d.ttft_us) / 1000.0,
                 prompt_head = d.prompt_head, gen_tail = utf8_trim_partial_end(d.gen_tail)))
         }
-        var chains <- prefix_chain_list(sch.prefix)
+        var inscope chains <- prefix_chain_list(sch.prefix)
         out.cache |> reserve(length(out.cache) + length(chains))
         for (c in chains) {
             let age = age_seconds(c.born_at)
@@ -4024,16 +4409,16 @@ let private CONFIG_KEY_KINDS <- {
     "gpu_dense" => "b", "gpu_vram_mb" => "i", "asr" => "s", "mmproj" => "s", "asr_workers" => "i",
     "tts" => "s", "tts_lane" => "s", "tts_voices_dir" => "s",
     "ctx" => "i", "max_tokens" => "i", "streams" => "i", "threads" => "i", "team_dispatch" => "s",
-    "affinity" => "i", "chunk" => "i", "chunk_idle" => "i", "page_rows" => "i", "prefix" => "i", "flat" => "b",
+    "affinity" => "i", "chunk" => "i", "chunk_idle" => "i", "page_rows" => "i", "prefix" => "i", "prefix_states" => "i", "prefix_state_mb" => "i", "flat" => "b",
     "mtp" => "b", "rope_scaling" => "s", "rope_scale" => "f", "yarn_orig_ctx" => "i",
-    "lcpp_bin" => "s", "models_dir" => "s", "image_mmproj" => "s", "models" => "a",
-    "exchange_url" => "s", "exchange_accept" => "s", "exchange_submit" => "s"
+    "lcpp_bin" => "s", "models_dir" => "s", "image_mmproj" => "s", "audio_mmproj" => "s", "models" => "a",
+    "exchange_url" => "s", "exchange_accept" => "s", "exchange_submit" => "s", "host" => "s"
 }
 
 let private MODEL_KEY_KINDS <- {
     "name" => "s", "path" => "s", "backend" => "s", "ctx" => "i", "quant" => "s",
     "kv_dtype" => "s", "streams" => "i", "chunk" => "i", "chunk_idle" => "i", "page_rows" => "i", "prefix" => "i",
-    "mtp" => "b", "default" => "b", "image_mmproj" => "s",
+    "mtp" => "b", "default" => "b", "image_mmproj" => "s", "audio_mmproj" => "s",
     "rope_scaling" => "s", "rope_scale" => "f", "yarn_orig_ctx" => "i"
 }
 
@@ -4214,9 +4599,8 @@ def private handle_vad(req : FrontReq; var resp : Reply) : http_status {
     return resp |> JSON(body, http_status.OK)
 }
 
-def private json_str(s : string) : string {
-    return sprint_json(s, false)   // a bare string serializes as its quoted+escaped JSON literal
-}
+def private json_str(s : string) : string =>
+    sprint_json(s, false)  // a bare string serializes as its quoted+escaped JSON literal
 
 def private kind_name(kind : string) : string {
     if (kind == "s") {
@@ -4395,9 +4779,8 @@ def private same_origin_or_headerless(req : HttpRequest?) : bool {
 }
 
 // the forbidden reply shared by every operator/control route (the public inference API stays open)
-def private deny_operator(var resp : Reply) : http_status {
-    return resp |> JSON(error_body("loopback-only (operator surface)", "forbidden"), http_status.FORBIDDEN)
-}
+def private deny_operator(var resp : Reply) : http_status =>
+    resp |> JSON(error_body("loopback-only (operator surface)", "forbidden"), http_status.FORBIDDEN)
 
 [arch(at = "README.md#exchange-policy")]
 def private handle_exchange_get(req : FrontReq; var resp : Reply) : http_status {
@@ -4641,14 +5024,18 @@ def private asr_worker_main(
                             worker_index : int;
                             model_path, mmproj_path : string;
                             team_dispatch : bool;
+                            metal : MetalMode;
                             var jobs : Channel?&;
                             var events : Channel?&
                             ) {
     this_context().name := "dasllama_asr_{worker_index}"
     configure_media_worker_dispatch(team_dispatch)
-    // the engine's Metal mode is the engine context's: this one starts with none, and a family whose decoder is an
-    // LLM (Qwen3-ASR, Canary) prefills it here on the CPU arm - a legitimate serving configuration, not a profiling slip
-    allow_cpu_prefill()
+    // a two-file model's decoder is a Model session and takes the engine's Metal mode; a one-file model (whisper,
+    // parakeet) decodes on hand-written CPU loops over planar weights, which the mode's portable pin would slow
+    if (!empty(mmproj_path)) {
+        set_metal_mode(metal)
+    }
+    allow_cpu_prefill()   // a decline lands the decoder's prefill on the CPU arm: served, not a profiling slip
     var model = AsrModel()
     var load_failure = ""
     let load_failed = catch_worker_panic(load_failure) {
@@ -4661,7 +5048,7 @@ def private asr_worker_main(
         events |> release
         return
     }
-    emit_asr_event(events, AsrEvent(kind = AsrEventKind.ready))
+    emit_asr_event(events, AsrEvent(kind = AsrEventKind.ready, body = model.dec.metal_blob ? "metal" : "cpu"))
     var session = AsrSession()
     var session_language = ""
     var has_session = false
@@ -4765,12 +5152,13 @@ def private start_asr_worker_threads() {
             let model_path = a.path
             let mmproj_path = a.mmproj
             let team_dispatch = g_asr_team_dispatch
+            let metal = g_speech_metal
             var jobs_capture = jobs
             var events_capture = g_asr_events
-            new_thread() <| @capture(= worker_index, = model_path, = mmproj_path, = team_dispatch,
+            new_thread() <| @capture(= worker_index, = model_path, = mmproj_path, = team_dispatch, = metal,
                                     = jobs_capture, = events_capture) {
                 asr_worker_main(
-                    worker_index, model_path, mmproj_path, team_dispatch, jobs_capture, events_capture)
+                    worker_index, model_path, mmproj_path, team_dispatch, metal, jobs_capture, events_capture)
             }
             index++
         }
@@ -4779,7 +5167,8 @@ def private start_asr_worker_threads() {
             g_asr_events |> pop_with_timeout_clone(1000) $(event : AsrEvent#) {
                 if (event.kind == AsrEventKind.ready) {
                     a.ready++
-                    to_log(LOG_INFO, "dasllama-server: ASR worker ready ({a.id}: {a.ready}/{a.workers})\n")
+                    a.decoder = clone_string(event.body)
+                    to_log(LOG_INFO, "dasllama-server: ASR worker ready ({a.id}: {a.ready}/{a.workers}, decoder on {a.decoder})\n")
                 } elif (event.kind == AsrEventKind.failed) {
                     load_failure = clone_string(event.body)
                 }
@@ -4818,7 +5207,7 @@ def private drain_asr_events(srv : FrontLink) {
                     g_asr_done_jobs ++
                     g_asr_audio_s += event.audio_s
                 }
-                var wire = unsafe(g_asr_wires?[event.id])
+                let wire = unsafe(g_asr_wires?[event.id])
                 if (wire != null) {
                     if (is_writer_connected(srv, wire.writer)) {
                         set_writer_keepalive_timeout(srv, wire.writer, DEFAULT_WRITER_KEEPALIVE_MS)
@@ -5175,9 +5564,7 @@ def private tts_input_field(srv : FrontLink; writer : WriterRef; js : JsonValue?
     return input
 }
 
-def private served_tts_ids : string {
-    return join([for (m in g_tts); "'{m.id}'"; where m.armed], ", ")
-}
+def private served_tts_ids : string => join([for (m in g_tts); "'{m.id}'"; where m.armed], ", ")
 
 // the `model` field both TTS routes take: a served id, or nothing (the default model). The model's slot, or -1
 // when the request is already refused.
@@ -5331,7 +5718,7 @@ def private drain_tts_events(srv : FrontLink) {
                     g_tts_done_jobs++
                     g_tts_audio_s += event.audio_s
                 }
-                var wire = unsafe(g_tts_wires?[event.id])
+                let wire = unsafe(g_tts_wires?[event.id])
                 if (wire != null) {
                     if (is_writer_connected(srv, wire.writer)) {
                         set_writer_keepalive_timeout(srv, wire.writer, DEFAULT_WRITER_KEEPALIVE_MS)
@@ -5373,7 +5760,7 @@ def private drain_tts_events(srv : FrontLink) {
 // temp file are ours to close, so the teardown finishes the job instead of dropping it.
 def private discard_tts_completion(id : int64; file_path : string) {
     g_tts_pending = max(g_tts_pending - 1, 0)
-    var wire = unsafe(g_tts_wires?[id])
+    let wire = unsafe(g_tts_wires?[id])
     if (wire != null) {
         if (g_link.out != null) {
             release_writer(g_link, wire.writer)
@@ -5453,12 +5840,24 @@ struct private MediaEvent {
 
 struct private MediaWire {
     @do_not_delete writer : WriterRef
-    @do_not_delete js : JsonValue?   // the parked parsed request — drain_media_events deletes it explicitly
+    @do_not_delete js : JsonValue?   // the parked parsed request — `drop_media_wire` deletes it explicitly
     slot : int
-    is_audio : bool                  // picks the render span (audio vs image) and the causal splice
+    refs : array<MediaRef>           // the request's media parts, in transcript order
+    jobs_left : int                  // encode jobs the worker still owes this request
+    failed : string                  // the first job failure's reason
+    submitted : bool                 // rendered and handed to the scheduler: kept only for a lost span's retry
+    retried : bool                   // a lost span was retried once already
 }
 
-let MEDIA_QUEUE_LIMIT = 8   // parked image requests are heavy (decoded bytes ride the channel)
+//! which ref of which parked request an encode job serves
+struct private MediaJobRef {
+    wire : int64
+    at : int
+}
+
+var private g_media_job_ref : table<int64; MediaJobRef>
+
+let MEDIA_QUEUE_LIMIT = MEDIA_SPANS_LIMIT   //!< encode jobs queued or in flight, a job a new part: one request's parts fill it alone (decoded bytes ride the channel)
 
 let GEMMA4A_AUDIO_SOFT_TOKENS_PER_SEC = 25l
 let AUDIO_DECODE_SAMPLE_RATE = 16000l
@@ -5466,14 +5865,22 @@ let AUDIO_DECODE_SAMPLE_RATE = 16000l
 //! The 16 kHz decode-frame ceiling for a clip a model with `seq_len` context can hold: the clip's
 //! soft tokens must fit the context, so the longest usable clip is `seq_len / tokens-per-sec`
 //! seconds. Caps the decode of an untrusted upload before a compressed bomb reaches the encoder.
-def private audio_decode_frame_cap(seq_len : int64) : int {
-    return max(int(AUDIO_DECODE_SAMPLE_RATE), int(seq_len / GEMMA4A_AUDIO_SOFT_TOKENS_PER_SEC * AUDIO_DECODE_SAMPLE_RATE))
-}
+def private audio_decode_frame_cap(seq_len : int64) : int =>
+    max(int(AUDIO_DECODE_SAMPLE_RATE), int(seq_len / GEMMA4A_AUDIO_SOFT_TOKENS_PER_SEC * AUDIO_DECODE_SAMPLE_RATE))
 
 var private g_media_jobs : Channel?
 var private g_media_events : Channel?
 var private g_media_wires : table<int64; MediaWire>
 var private g_media_rows = 0l   // media (image span) rows admitted to prefill since boot
+var private g_media_cover_probe = true
+
+//! Whether a rowless part's span is looked up in the prefix cache before the request is submitted (the default). Off,
+//! every known part goes to the scheduler rowless and a span the cache does not hold comes back `media_lost` - the
+//! route a span evicted between the lookup and the admission takes. Non-private: test_openai_server_audio.das gates
+//! the retry through it.
+def set_media_cover_probe(on : bool) {
+    g_media_cover_probe = on
+}
 var private g_media_ready = 0
 var private g_media_armed = false
 var private g_media_pending = 0   // encode jobs queued or in flight; the wire table undercounts
@@ -5666,33 +6073,43 @@ def private drain_media_events(srv : FrontLink) {
             var ev : MediaEvent
             ev := event
             defer() { delete ev }
-            // interior pointer into g_media_wires — nothing inserts into the table between here
-            // and the erase (the only insert is handle_chat's park, and handlers cannot run inside
-            // this drain)
-            var wire = unsafe(g_media_wires?[ev.id])
+            let jr = g_media_job_ref?[ev.id] ?? MediaJobRef()
+            g_media_job_ref |> erase(ev.id)
+            // interior pointer into g_media_wires — nothing inserts into the table inside this drain
+            var wire = unsafe(g_media_wires?[jr.wire])
             if (wire == null) {
                 return   // the client vanished while encoding; reap released the writer
             }
-            if (!is_writer_connected(srv, wire.writer)) {
-                release_writer(srv, wire.writer)
-            } elif (!ev.ok) {
-                bad_request(srv, wire.writer, ev.why)
-            } elif (reject_deferred_while_draining(srv, wire.writer)) {
-                pass   // a clean terminal 503: the drain must not admit a new generation
+            wire.jobs_left--
+            if (!ev.ok) {
+                wire.failed = empty(wire.failed) ? ev.why : wire.failed
             } else {
                 if (ev.is_audio) {
-                    to_log(LOG_INFO, "[req {ev.id}] audio {float(ev.audio_cs) / 100f}s -> {ev.n_media} soft tokens in {ev.enc_ms}ms off-thread\n")
+                    to_log(LOG_INFO, "[req {jr.wire}] audio {float(ev.audio_cs) / 100f}s -> {ev.n_media} soft tokens in {ev.enc_ms}ms off-thread\n")
                 } else {
-                    to_log(LOG_INFO, "[req {ev.id}] image {ev.width}x{ev.height} -> {ev.n_media} soft tokens in {ev.enc_ms}ms off-thread\n")
+                    to_log(LOG_INFO, "[req {jr.wire}] image {ev.width}x{ev.height} -> {ev.n_media} soft tokens in {ev.enc_ms}ms off-thread\n")
                 }
-                handle_chat_tail(srv, wire.writer, wire.js, wire.slot, ev.rows, ev.n_media, ev.is_audio, ev.id, ev.grid)
+                wire.refs[jr.at].n_rows = ev.n_media
+                wire.refs[jr.at].grid = ev.grid
+                delete wire.refs[jr.at].rows
+                wire.refs[jr.at].rows <- ev.rows
+                if (length(g_media_seen) >= MEDIA_SEEN_LIMIT) {
+                    g_media_seen |> clear()
+                }
+                g_media_seen[wire.refs[jr.at].key] = MediaSeen(n_rows = ev.n_media, grid = ev.grid)
             }
-            unsafe {
-                delete wire.js
+            return if (wire.jobs_left > 0)
+            if (!is_writer_connected(srv, wire.writer)) {
+                release_writer(srv, wire.writer)
+                drop_media_wire(jr.wire, true)
+            } elif (!empty(wire.failed)) {
+                bad_request(srv, wire.writer, wire.failed)
+                drop_media_wire(jr.wire, true)
+            } elif (reject_deferred_while_draining(srv, wire.writer)) {
+                drop_media_wire(jr.wire, true)   // a clean terminal 503: the drain must not admit a new generation
+            } else {
+                resume_media_request(srv, jr.wire)
             }
-            wire.js = null
-            delete g_media_wires[ev.id]
-            g_media_wires |> erase(ev.id)
         }
     }
 }
@@ -5908,13 +6325,15 @@ let private FRONT_OUT_BURST = 512           //! engine ops applied between two s
 
 //! The front thread: the HTTP server, its writers, and nothing else. It blocks on the engine's op channel for a
 //! millisecond at a time, so an op reaches its socket as it arrives and a new request waits a millisecond at most.
-def private front_main(port : int; var to_engine : Channel?&; var from_engine : Channel?&; var to_speech : Channel?&) {
+def private front_main(port : int; host : string; var to_engine : Channel?&; var from_engine : Channel?&; var to_speech : Channel?&) {
     this_context().name := "dasllama-front"
     g_fto_engine = to_engine
     g_fto_speech = to_speech
     var server = new OpenAiFront()
     server->init(port)
-    let rc = server->start()   // 0 on success; non-zero = bind/listen failed (e.g. port in use)
+    //! the interface the front listens on: loopback unless the operator opens it. A host the server refuses
+    //! (empty, or past its 63-byte field) must not fall through to libhv's every-interface default
+    let rc = server->set_bind_host(host) ? server->start() : FRONT_BIND_HOST_REFUSED
     to_engine |> push_clone(FrontReq(kind = FrontKind.ready, status = rc, port = rc == 0 ? server->bound_port() : 0))
     var stop = rc != 0
     var last_reap = ref_time_ticks()
@@ -6116,19 +6535,20 @@ let private FRONT_START_WAIT_MS = 30000
 let private FRONT_STOP_WAIT_MS = 10000
 
 //! Start the front thread on `port` and wait for it to listen: its start rc, or -1 when it never answered.
-def private start_front(port : int) : int {
+def private start_front(port : int; host : string) : int {
     g_front_launched = true
     var to_engine = g_front_in
     var from_engine = g_link.out
+    let bind_host = clone_string(host)   //! the capture crosses a context: the string travels as its own bytes
     if (g_speech_up) {
         var to_speech = g_speech_in
-        new_thread() <| @capture(= port, = to_engine, = from_engine, = to_speech) {
-            front_main(port, to_engine, from_engine, to_speech)
+        new_thread() <| @capture(= port, = bind_host, = to_engine, = from_engine, = to_speech) {
+            front_main(port, bind_host, to_engine, from_engine, to_speech)
         }
     } else {   // a capture takes a reference, and there is no channel to take one of
-        new_thread() <| @capture(= port, = to_engine, = from_engine) {
+        new_thread() <| @capture(= port, = bind_host, = to_engine, = from_engine) {
             var no_speech : Channel?
-            front_main(port, to_engine, from_engine, no_speech)
+            front_main(port, bind_host, to_engine, from_engine, no_speech)
         }
     }
     g_front_up = true
@@ -6136,7 +6556,13 @@ def private start_front(port : int) : int {
     g_front_in |> pop_with_timeout_clone(FRONT_START_WAIT_MS) $(ev : FrontReq#) {
         if (ev.kind == FrontKind.ready) {
             rc = ev.status
+            if (rc == 0) {
+                to_log(LOG_INFO, "dasllama-server: listening on {host}:{ev.port}\n")
+            }
         }
+    }
+    if (rc == FRONT_BIND_HOST_REFUSED) {
+        to_log(LOG_ERROR, "dasllama-server: cannot listen on '{host}' - a host is 1 to 63 bytes\n")
     }
     if (rc != 0) {
         stop_front()
@@ -6176,6 +6602,7 @@ struct private SpeechBoot {
     asr_team : bool
     tts_team : bool
     asr_alias : string
+    metal : MetalMode
 }
 
 //! the speech state the engine's status routes and its drain read
@@ -6265,6 +6692,7 @@ def private speech_main(var boot : Channel?&; var inbox : Channel?&; var to_engi
         g_tts := b.tts
         g_asr_team_dispatch = b.asr_team
         g_tts_team_dispatch = b.tts_team
+        g_speech_metal = b.metal
         g_asr_alias = clone_string(b.asr_alias)
     }
     boot |> release
@@ -6371,7 +6799,7 @@ def private start_speech_thread {
     g_speech_out = worker_channel()
     var boot = worker_channel()
     g_asr_alias = empty(g_slots) ? "" : "{g_slots[g_default_slot].name}-asr"
-    var first = SpeechBoot(asr_team = g_asr_team_dispatch, tts_team = g_tts_team_dispatch, asr_alias = g_asr_alias)
+    var first = SpeechBoot(asr_team = g_asr_team_dispatch, tts_team = g_tts_team_dispatch, asr_alias = g_asr_alias, metal = get_metal_mode())
     first.asr := g_asr
     first.tts := g_tts
     boot |> push_clone(first)
@@ -6491,6 +6919,8 @@ struct private SchedDefaults {
     idle_chunk_tokens : int64
     page_rows : int64
     prefix_groups : int64
+    prefix_states : int64        //! a recurrent model's checkpoint count budget
+    prefix_state_bytes : int64   //! ... and byte budget (0 = the count alone)
     kv_dtype : KVDtype
     mtp : int   //! -1 auto (`mtp_auto_arms`) | 0 off | 1 on
 }
@@ -6568,7 +6998,8 @@ def private init_one_scheduler(var s : ModelSlot) {
             spec = false
         }
     }
-    s.sched <- create_scheduler(s.model, s_streams, g_sched_defaults.max_queue, s_chunk, s_pages, pfx, s_kv, spec, s_idle)
+    s.sched <- create_scheduler(s.model, s_streams, g_sched_defaults.max_queue, s_chunk, s_pages, pfx, s_kv, spec, s_idle,
+                                g_sched_defaults.prefix_states, g_sched_defaults.prefix_state_bytes)
     slot_default_chunk(s)
 }
 
@@ -6586,10 +7017,11 @@ def private slot_default_chunk(var s : ModelSlot) {
 }
 
 // one scheduler per slot: the init args are the defaults, SlotOpts sentinels override per slot
-def private init_slot_schedulers(max_streams, max_queue, chunk_tokens, idle_chunk_tokens, page_rows, prefix_groups : int64; kv_dtype : KVDtype; mtp : int) {
+def private init_slot_schedulers(max_streams, max_queue, chunk_tokens, idle_chunk_tokens, page_rows, prefix_groups, prefix_states, prefix_state_bytes : int64; kv_dtype : KVDtype; mtp : int) {
     g_sched_defaults = SchedDefaults(max_streams = max_streams, max_queue = max_queue,
                                      chunk_tokens = chunk_tokens, idle_chunk_tokens = idle_chunk_tokens, page_rows = page_rows,
-                                     prefix_groups = prefix_groups, kv_dtype = kv_dtype, mtp = mtp)
+                                     prefix_groups = prefix_groups, prefix_states = prefix_states, prefix_state_bytes = prefix_state_bytes,
+                                     kv_dtype = kv_dtype, mtp = mtp)
     for (s in g_slots) {
         init_one_scheduler(s)
     }
@@ -6597,16 +7029,23 @@ def private init_slot_schedulers(max_streams, max_queue, chunk_tokens, idle_chun
 
 //! `mtp`: -1 lets each slot decide (self-speculation on when it runs one stream on a GPU, `mtp_auto_arms`), 0 / 1 set it
 //! `asr_team`: -1 lets the slots decide whether the ASR workers publish to the worker team (`asr_auto_team`), 0 runs them inline, 1 puts them and the TTS worker on the team
+//! the interface the front binds when nobody names one: this machine alone - a server on the network is the operator's choice
+let DEFAULT_BIND_HOST = "127.0.0.1"
+//! the interface the front binds: loopback unless the operator names one (`--host` / config `host`)
+def bind_host(configured : string) : string => empty(configured) ? DEFAULT_BIND_HOST : configured
+let FRONT_BIND_HOST_REFUSED = -2   //! the ready `status` when the server refuses the host string itself, before any bind
+
 def init_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; chunk_tokens : int64 = 0l;
                 page_rows : int64 = 64l; prefix_groups : int64 = 0l; kv_dtype : KVDtype = KVDtype.f16;
                 team_dispatch : bool = true; asr_team : int = -1; mtp : int = -1;
-                idle_chunk_tokens : int64 = -1l) : bool {
+                idle_chunk_tokens : int64 = -1l; host : string = DEFAULT_BIND_HOST;
+                prefix_states : int64 = SERVER_PREFIX_STATES; prefix_state_mb : int64 = 0l) : bool {
     if (g_front_up || g_jobque_owned) {
         to_log(LOG_ERROR, "dasllama-server: init_server called while already initialized\n")
         return false
     }
-    if (empty(g_slots) && !g_setup_mode && !server_has_tts()) {
-        to_log(LOG_ERROR, "dasllama-server: init_server with no model slots (call set_model/add_model first, or configure_tts for a speech-only server)\n")
+    if (empty(g_slots) && !g_setup_mode && !server_has_speech()) {
+        to_log(LOG_ERROR, "dasllama-server: init_server with no model slots (call set_model/add_model first, or add_tts_model / add_asr_model for a speech-only server)\n")
         return false
     }
     g_shutdown_requested = false   // reset so a restart in the same context after /shutdown doesn't drain at once
@@ -6629,7 +7068,7 @@ def init_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; c
     g_media_events = worker_channel()
     init_worker_rails()
     if (empty(g_slots)) {
-        if (!g_setup_mode && !server_has_tts()) {
+        if (!g_setup_mode && !server_has_speech()) {
             // the speech-only boot's worker dropped the route as it loaded: the catalog/config
             // page is all that is left to serve, and it is where the config gets fixed
             to_log(LOG_WARNING, "dasllama-server: the speech route did not arm and no model is loaded - falling back to setup mode\n")
@@ -6637,7 +7076,11 @@ def init_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; c
         }
         to_log(LOG_INFO, g_setup_mode ? "dasllama-server: setup mode - serving the catalog/config page only\n" : "dasllama-server: no LLM slot - serving the speech route and the catalog only\n")
     }
-    init_slot_schedulers(max_streams, max_queue, chunk_tokens, idle_chunk_tokens, page_rows, prefix_groups, kv_dtype, mtp)
+    g_box_ram_gb = box_ram_gb()   // probed once: a probe spawns sysctl, wmic or powershell
+    let state_mb = prefix_state_budget_mb(prefix_state_mb, int64(g_box_ram_gb))
+    to_log(LOG_INFO, "dasllama-server: a recurrent model's checkpoints: up to {prefix_states} within {state_mb} MB\n")
+    init_slot_schedulers(max_streams, max_queue, chunk_tokens, idle_chunk_tokens, page_rows, prefix_groups,
+                         prefix_states, state_mb * 1048576l, kv_dtype, mtp)
     g_active = g_default_slot
     g_cur = g_default_slot
     g_prev_mtp_spec = get_mtp_spec()
@@ -6649,7 +7092,7 @@ def init_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; c
     }
     // a resident prefill would strand device-only rows when host-cached sessions outnumber the driver's K/V regions; device-home streams prefill on the device regardless
     set_resident_prefill_allowed(false)
-    let rc = start_front(port)   // 0 on success; non-zero = bind/listen failed (e.g. port in use)
+    let rc = start_front(port, bind_host(host))   // 0 on success; non-zero = bind/listen failed (e.g. port in use)
     if (rc != 0) {
         to_log(LOG_ERROR, "dasllama-server: could not start on port {port} (start rc {rc}; is the port already in use?)\n")
         return false
@@ -6658,7 +7101,6 @@ def init_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; c
     g_started_at = ref_time_ticks()
     g_tickprof = env_noisy_diag()
     compose_hardware_line()
-    g_box_ram_gb = box_ram_gb()
     var names <- [for (s in g_slots); s.is_default && length(g_slots) > 1 ? "{s.name}*" : s.name]
     let kv_mode = page_rows > 0l ? "{kv_dtype} paged P={page_rows}" : "{kv_dtype} flat"
     let chunk_note = empty(g_slots) ? "none" : "{g_slots[g_active].sched.chunk_tokens}, {g_slots[g_active].sched.idle_chunk_tokens} idle"
@@ -6775,7 +7217,7 @@ def update_server() : bool {
     }
     let t_flush = ref_time_ticks()
     flush_events(g_link)
-    flush_tool_keepalives(g_link)
+    flush_stream_keepalives(g_link)
     if (g_tickprof) {
         g_prof_flush_us += int64(get_time_usec(t_flush))
         g_prof_ticks++
@@ -6840,6 +7282,7 @@ def shutdown_server() {   // nolint:STYLE038 — one ordered teardown: workers s
     g_default_slot = 0
     g_active = 0
     g_cur = 0
+    reset_token_pieces()
     delete g_events
     delete g_wires
     release_speech_state()   // the engine's own: empty rails on a server whose speech thread ran them
@@ -6907,9 +7350,10 @@ def shutdown_server() {   // nolint:STYLE038 — one ordered teardown: workers s
 def run_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; chunk_tokens : int64 = 0l;
                page_rows : int64 = 64l; prefix_groups : int64 = 0l; kv_dtype : KVDtype = KVDtype.f16;
                team_dispatch : bool = true; asr_team : int = -1; mtp : int = -1;
-               idle_chunk_tokens : int64 = -1l) {
+               idle_chunk_tokens : int64 = -1l; host : string = DEFAULT_BIND_HOST;
+               prefix_states : int64 = SERVER_PREFIX_STATES; prefix_state_mb : int64 = 0l) {
     if (init_server(port, max_streams, max_queue, chunk_tokens, page_rows, prefix_groups, kv_dtype,
-            team_dispatch, asr_team, mtp, idle_chunk_tokens)) {
+            team_dispatch, asr_team, mtp, idle_chunk_tokens, host, prefix_states, prefix_state_mb)) {
         while (update_server()) {
         }
     }

@@ -19,9 +19,8 @@ require daslib/flatten_opt_common
 require daslib/flatten_opt_fuse
 
 
-def private psh_reserved(name : das_string) : bool {
-    return name |> starts_with("__flat_") || name |> starts_with("__ssa_") || name |> starts_with("_preshader_")
-}
+def private psh_reserved(name : das_string) : bool =>
+    name |> starts_with("__flat_") || name |> starts_with("__ssa_") || name |> starts_with("_preshader_")
 
 def private name_counter_suffix(name : das_string; prefix : string) : int {
     if (!(name |> starts_with(prefix))) return -1
@@ -148,7 +147,7 @@ def private pex_extract(var pe : PEX; barriers : table<string>; var e : Expressi
     return e
 }
 
-def private extract_preshader(var func : FunctionPtr; var blk : ExprBlock?; barriers : table<string>; var counter : int&; no_fast_math : bool) : bool {   // nolint:STYLE037,STYLE038 - one hoist pass; seeding, colouring and splice share the dedup state
+def private extract_preshader(func : FunctionPtr; var blk : ExprBlock?; barriers : table<string>; var counter : int&; no_fast_math : bool) : bool {   // nolint:STYLE037,STYLE038 - one hoist pass; seeding, colouring and splice share the dedup state
     var pe = PEX(counter = counter, noFastMath = no_fast_math)
     for (a in func.arguments) {
         pe.paramNames |> insert("{a.name}")
@@ -336,9 +335,9 @@ def private cse_body(var blk : ExprBlock?; var counter : int&) : bool {   // nol
     var mutableVars <- collect_mutable(blk)
     while (guard < 4096) {
         guard ++
-        var counts : table<string; int>
+        var inscope counts : table<string; int>
         var sample : table<string; ExpressionPtr>
-        var firstStmt : table<string; int>
+        var inscope firstStmt : table<string; int>
         for (i in range(length(blk.list))) {
             var ct = new CseTally()
             ct.collectSample = true
@@ -408,9 +407,7 @@ def private cse_body(var blk : ExprBlock?; var counter : int&) : bool {   // nol
     return anyChange
 }
 
-def private cm_key(l, r : ExpressionPtr) : string {
-    return "{describe(l)}\t-\t{describe(r)}"
-}
+def private cm_key(l, r : ExpressionPtr) : string => "{describe(l)}\t-\t{describe(r)}"
 
 class private CmTally : AstVisitor {
     counts : table<string; int>

@@ -42,7 +42,7 @@ def register_arch_qwen35() {
     var d = ArchDesc(name = "qwen35", configure = @@configure_qwen35)
     d.blocks = qwen35_blocks()
     chatml_chat(d.chat)
-    hermes_tools(d.chat)   // same Hermes tool block as qwen2/qwen3 (the Qwen3.5 template keeps it)
+    hermes_tools(d.chat)   // the registration's fallback for a file with no template; the 3.5/3.6 GGUF templates sniff to xml_function
     // (clone the template BEFORE register_arch moves `d`)
     var dm = ArchDesc(name = "qwen35moe", configure = @@configure_qwen35moe)
     dm.blocks = qwen35moe_blocks()
@@ -593,9 +593,7 @@ def private dn_conv_batch(t : Model; var s : Session; l : int64; npos : int64) {
             }
         }
     }
-    var inp0 : float const?
-    var wtap0 : float const?
-    var hist0 : float const?
+    var inp0, wtap0, hist0 : float const?
     var outp0 : float?
     unsafe {
         inp0 = addr < float const? >(s.dn_qkv_b[0])
@@ -811,16 +809,9 @@ def private deltanet_prefill_chunked(t : Model; var s : Session; l : int64; npos
     let ts_conv = prof_ticks()
     dn_conv_batch(t, s, l, npos)
     prof_add("dn_conv", ts_conv)
-    var conv0 : float const?
-    var bp0 : float const?
-    var gp0 : float const?
-    var zp0 : float const?
-    var op0 : float?
-    var st0 : float?
-    var ws0 : float?
-    var wnorm0 : float const?
-    var ab0 : float const?
-    var dtb0 : float const?
+    var conv0, bp0, gp0, zp0 : float const?
+    var op0, st0, ws0 : float?
+    var wnorm0, ab0, dtb0 : float const?
     unsafe {
         conv0 = addr < float const? >(s.dn_conv_b[0])
         bp0 = addr < float const? >(s.dn_beta_b[0])

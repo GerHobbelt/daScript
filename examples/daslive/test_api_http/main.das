@@ -46,9 +46,7 @@ def ping(input : JsonValue?) : JsonValue? {
 
 // --- Tests (run on the client thread) ---
 
-def base_url() : string {
-    return "http://127.0.0.1:{live_api_port}"
-}
+def base_url() : string => "http://127.0.0.1:{live_api_port}"
 
 def test_status() {
     print("--- GET /status ---\n")
@@ -79,7 +77,7 @@ def test_pause_unpause() {
         var paused = false
         if (resp != null) {
             var parse_error = ""
-            var js = read_json(string(resp.body), parse_error)
+            let js = read_json(string(resp.body), parse_error)
             if (js != null && js.value is _object) {
                 let tab & = unsafe(js.value as _object)
                 var pv = tab?["paused"] ?? null
@@ -99,12 +97,12 @@ def test_pause_unpause() {
 // body is a quoted string; parse the outer string, then the object inside it. -1 = no pong.
 def pong_of(body : string) : int {
     var err = ""
-    var outer = read_json(body, err)
+    let outer = read_json(body, err)
     if (outer == null || !(outer.value is _string)) return -1
-    var inner = read_json(outer.value as _string, err)
+    let inner = read_json(outer.value as _string, err)
     if (inner == null || !(inner.value is _object)) return -1
     let tab & = unsafe(inner.value as _object)
-    var pv = tab?["pong"] ?? null
+    let pv = tab?["pong"] ?? null
     return pv ?? -1   // integral JSON literals parse as _longint, not _number - let json_boost widen
 }
 

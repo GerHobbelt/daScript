@@ -27,7 +27,7 @@ struct DefinitionResult {
 // Read a few lines from a file around a given line number
 def read_source_snippet(file_path : string; line : int; context_lines : int = 3) : string {
     if (empty(file_path) || line <= 0) return ""
-    var f = fopen(file_path, "r")
+    let f = fopen(file_path, "r")
     if (f == null) return ""
     var lines : array<string>
     while (!feof(f)) {
@@ -92,9 +92,8 @@ def definition_of(d : DeclarationHit; line : int) : DefinitionResult {
     )
 }
 
-def type_definition(program : smart_ptr<Program>; td : TypeDecl const?) : DefinitionResult {
-    return definition_of(declaration_of(program, td), 0)
-}
+def type_definition(program : smart_ptr<Program>; td : TypeDecl const?) : DefinitionResult =>
+    definition_of(declaration_of(program, td), 0)
 
 def resolve_definition(program : smart_ptr<Program>; hit : CursorHit) : DefinitionResult { // nolint:STYLE037,STYLE038 — exact-type `is` ladder over the AST node classes; each arm builds one DefinitionResult
     if (hit.variable != null) return variable_definition(hit.variable)

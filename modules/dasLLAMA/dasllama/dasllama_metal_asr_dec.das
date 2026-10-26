@@ -16,6 +16,7 @@ require dasllama/dasllama_whisper
 require metal/das_metal_boost
 require dasllama/dasllama_metal_common
 require dasllama/dasllama_metal_lens   // release_handles
+require dasllama/dasllama_gpu_math   // the row stamps' activation codes
 require dasllama/dasllama_metal_kernels
 require dasllama/dasllama_metal_prefill   // metal_prefill_pso_init — the borrowed-builder bring-up seat
 
@@ -29,7 +30,9 @@ var private g_wd_failed = false
 var private g_wd_pool : MetalBufferPool
 var private g_wd_env = true
 var private g_wd_step_env = true    // the decode-step half (DASLLAMA_METAL_WDEC_STEP); windows capture it
-var private g_wd_step_min_d = 1024l   // the step's serving floor (measured: d=1280 wins 1.6x, d=384 loses)
+//! The text width the decode step serves from: at 384 (tiny) the device step is slower than the CPU's, from 512 (base) up it is faster.
+let METAL_WDEC_STEP_MIN_D = 512l
+var private g_wd_step_min_d = METAL_WDEC_STEP_MIN_D
 // the attached decoder, keyed on the dq plane (base, length): ONE live whisper decoder per
 // process is the serving contract — a key mismatch re-attaches; tests switching models call
 // metal_wdec_shutdown between them (address reuse after an unmap could alias the key)
@@ -78,15 +81,11 @@ def metal_wdec_stats : tuple<windows : int64; steps : int64; tokens : int64; dec
 }
 
 //! The declines-by-reason table (a copy), keyed by `MetalWdecDecline` value names.
-def metal_wdec_declines : table<string; int64> {
-    return <- clone_to_move(g_wdec_declines.by_reason)
-}
+def metal_wdec_declines : table<string; int64> => <- clone_to_move(g_wdec_declines.by_reason)
 
 //! The step-time split across every served decode batch: GPU-busy vs host-encode microseconds.
 //! Wall minus their sum is the commit/wait/readback residue — the per-token overhead lens.
-def metal_wdec_times : tuple<us_gpu : int64; us_encode : int64> {
-    return (us_gpu = g_wd_us_gpu, us_encode = g_wd_us_encode)
-}
+def metal_wdec_times : tuple<us_gpu : int64; us_encode : int64> => (us_gpu = g_wd_us_gpu, us_encode = g_wd_us_encode)
 
 //! Test A/B seat: pin the ASR-decoder driver on/off in-process (the env knob's setter twin).
 def set_metal_wdec(on : bool) {
@@ -115,7 +114,54 @@ def private wd_decline(why : MetalWdecDecline) : bool {
     return false
 }
 
+var private g_wd_pend_uid = 0ul           //!< the state whose cross-KV layouts wait on the device, unread
+var private g_wd_pend_bytes = 0ul         //!< their size a plane; 0 = nothing waits
+var private g_wd_pend_kx : MetalBuffer?
+var private g_wd_pend_vx : MetalBuffer?
+var private g_wd_dropped : table<uint64>  //!< the states whose waiting layouts were lost unread; a state leaves it at its next window
+var private g_wd_uid_next = 1ul
+
+//! the driver's identity for a decoder state, minted at its first window: a state re-created at the same address inherits nothing
+def private wd_uid(var ds : DecoderState) : uint64 {
+    if (ds.gpu_uid == 0ul) {
+        ds.gpu_uid = g_wd_uid_next++
+    }
+    return ds.gpu_uid
+}
+
+def private wd_pend_release {
+    pool_release(g_wd_pool, g_wd_pend_kx, g_wd_pend_bytes)
+    pool_release(g_wd_pool, g_wd_pend_vx, g_wd_pend_bytes)
+    g_wd_pend_kx = null
+    g_wd_pend_vx = null
+    g_wd_pend_bytes = 0ul
+}
+
+//! the waiting cross-KV layouts of `ds`, where they are its own, landed in its `kx` / `vx`: the CPU chain is about to read them
+[cold_path]
+def private wd_flush_cross_kv(var ds : DecoderState) {
+    if (g_wd_pend_bytes == 0ul || g_wd_pend_uid != ds.gpu_uid) {
+        return
+    }
+    unsafe {
+        memcpy(addr(ds.kx[0]), metal_buffer_contents(g_wd_pend_kx), g_wd_pend_bytes)
+        memcpy(addr(ds.vx[0]), metal_buffer_contents(g_wd_pend_vx), g_wd_pend_bytes)
+    }
+    wd_pend_release()
+}
+
+//! the waiting layouts lost unread (another window's about to take their place, or the driver released): the owner is marked,
+//! and its next decode step panics until it starts a window of its own
+[cold_path]
+def private wd_drop_pending {
+    if (g_wd_pend_bytes > 0ul) {
+        g_wd_dropped |> insert(g_wd_pend_uid)
+        wd_pend_release()
+    }
+}
+
 def private wd_release_all {
+    wd_drop_pending()
     release_handles(g_wd_mblob, g_wd_bkxr, g_wd_bvxr, g_wd_bkc, g_wd_bvc, g_wd_sx)
     release_handles(g_wd_sxb, g_wd_sxb2, g_wd_sq, g_wd_sk, g_wd_sv, g_wd_sh)
     release_handles(g_wd_slog, g_wd_bpms, g_wd_bpy)
@@ -134,9 +180,8 @@ def metal_wdec_shutdown {
 }
 
 [cold_path]   // per-window bring-up: the registry/prefill inits are latched-flag cheap
-def private metal_wdec_init : bool {
-    return !g_wd_failed && metal_common_init() && metal_prefill_pso_init() && g_pso_cross_kx != null
-}
+def private metal_wdec_init : bool =>
+    !g_wd_failed && metal_common_init() && metal_prefill_pso_init() && g_pso_wdec_kv != null && g_pso_wdec_kv_h != null
 
 // one region of the 34B-blob build: `off` is the SOURCE element offset in the dq planes; the
 // destination is the 16B-aligned cursor, recorded and advanced
@@ -230,6 +275,8 @@ def private wdec_attach(w : WhisperModel) : bool {
 [hot_path]
 def private metal_whisper_cross_kv(w : WhisperModel; var ds : DecoderState; enc_out : array<float>) : bool {   // nolint:STYLE038 — the dispatch chain is the shape
     g_wd_window_live = false   // whatever happens below, the previous window is over
+    wd_drop_pending()
+    g_wd_dropped |> erase(wd_uid(ds))   // this state starts a window of its own, on either chain
     if (!g_wd_env) {
         return wd_decline(MetalWdecDecline.knob)
     }
@@ -258,35 +305,32 @@ def private metal_whisper_cross_kv(w : WhisperModel; var ds : DecoderState; enc_
     var btmp = pool_acquire(g_wd_pool, g_dev, bytes_rows)
     var bkx = pool_acquire(g_wd_pool, g_dev, bytes_x)
     var bvx = pool_acquire(g_wd_pool, g_dev, bytes_x)
+    var bxh = pf_q8_mm_half() ? pool_acquire(g_wd_pool, g_dev, bytes_rows / 2ul) : null
     upload_rows_padded(bx, unsafe(addr(enc_out[0])), ta, mp, d)   // the pad outputs go unread; the zero guards stale-Inf pool reuse
     var u_d = uniform_u32(uint(d))
-    var u_hs = uniform_u32(uint(hs))
-    var u_ta = uniform_u32(uint(ta))
-    var u_t0 = uniform_u32(0u)
-    var u_h0 = uniform_u32(0u)
-    var u_h1 = uniform_u32(1u)
-    var u_kscale = uniform_f32(1.0 / sqrt(sqrt(float(hs))))
-    var u_tot = uniform_u32(uint(d * ta))
     var err = ""
     let ran = with_compute_encoder(g_queue, err) $(enc : MetalComputeEncoder?) {   // nolint:PERF026 — the error-text fetch runs only on the failure leg
         for (l in range64(nl)) {
             let lo = dec_layer_offsets(w, l)
-            enc_gemm_mm_b(enc, g_wd_mblob, g_wd_boffs[l * WD_MATS + 5l], bx, btmp, 0ul, u_d, u_d, mp, d)
+            if (bxh != null && l == 0l) {   // one half panel serves every layer's two GEMMs: they all read the encoder rows
+                tw_half(enc, bx, bxh, mp * d)
+            }
+            pf_enc_q8_mm(enc, g_wd_mblob, g_wd_boffs[l * WD_MATS + 5l], bx, bxh, btmp, u_d, u_d, mp, d, d)
             // kx: the pre-scaled CPU layout (the ds.kx readback); kxr: the unscaled resident twin
-            enc_cross_kx(enc, btmp, bkx, uint64(l * d * ta * 4l), u_d, u_hs, u_ta, u_kscale, u_tot, d * ta)
-            enc_cross_vx_h(enc, btmp, 0ul, g_wd_bkxr, uint64(l * d * ta * 2l), bblobf, 0ul, u_d, u_hs, u_ta, u_t0, u_ta, u_h0, u_tot, d * ta)
-            enc_gemm_mm_b(enc, g_wd_mblob, g_wd_boffs[l * WD_MATS + 6l], bx, btmp, 0ul, u_d, u_d, mp, d)
+            var kv_k = GkWdecKvArgs(rows = uint(ta), sstride = uint(d), soff = 0u, nheads = uint(d / hs), tstride = uint(ta), p0 = 0u, dst_off = uint(l * d * ta), boff = 0u, bias_on = 0u, mode = WDEC_KV_KX, hs = uint(hs), kscale = wdec_kscale(hs))
+            enc_wdec_kv(enc, btmp, bkx, bblobf, kv_k, d * ta)
+            kv_k.mode = WDEC_KV_F16
+            enc_wdec_kv_h(enc, btmp, g_wd_bkxr, bblobf, kv_k, d * ta)
+            pf_enc_q8_mm(enc, g_wd_mblob, g_wd_boffs[l * WD_MATS + 6l], bx, bxh, btmp, u_d, u_d, mp, d, d)
             // cv bias folds into both shuffles: the f32 readback (ds.vx) and the f16 resident
-            enc_cross_vx(enc, btmp, 0ul, bvx, uint64(l * d * ta * 4l), bblobf, uint64(lo.cv_b * 4l), u_d, u_hs, u_ta, u_t0, u_ta, u_h1, u_tot, d * ta)
-            enc_cross_vx_h(enc, btmp, 0ul, g_wd_bvxr, uint64(l * d * ta * 2l), bblobf, uint64(lo.cv_b * 4l), u_d, u_hs, u_ta, u_t0, u_ta, u_h1, u_tot, d * ta)
+            var kv_v = GkWdecKvArgs(rows = uint(ta), sstride = uint(d), soff = 0u, nheads = uint(d / hs), tstride = uint(ta), p0 = 0u, dst_off = uint(l * d * ta), boff = uint(lo.cv_b), bias_on = 1u, mode = WDEC_KV_VX, hs = uint(hs), kscale = wdec_kscale(hs))
+            enc_wdec_kv(enc, btmp, bvx, bblobf, kv_v, d * ta)
+            kv_v.mode = WDEC_KV_F16
+            enc_wdec_kv_h(enc, btmp, g_wd_bvxr, bblobf, kv_v, d * ta)
         }
     }
     var served = false
     if (ran) {
-        unsafe {
-            memcpy(addr(ds.kx[0]), metal_buffer_contents(bkx), bytes_x)
-            memcpy(addr(ds.vx[0]), metal_buffer_contents(bvx), bytes_x)
-        }
         g_wdec_windows++
         g_wd_window_key = intptr(unsafe(addr(ds)))
         g_wd_window_live = true
@@ -299,18 +343,27 @@ def private metal_whisper_cross_kv(w : WhisperModel; var ds : DecoderState; enc_
         }
         served = true
     }
+    if (served && g_wd_window_step) {   // the device step reads the resident twins: the CPU layouts wait, read back only at a decline
+        g_wd_pend_uid = ds.gpu_uid
+        g_wd_pend_bytes = bytes_x
+        g_wd_pend_kx = bkx
+        g_wd_pend_vx = bvx
+    } else {
+        if (served) {
+            unsafe {
+                memcpy(addr(ds.kx[0]), metal_buffer_contents(bkx), bytes_x)
+                memcpy(addr(ds.vx[0]), metal_buffer_contents(bvx), bytes_x)
+            }
+        }
+        pool_release(g_wd_pool, bkx, bytes_x)
+        pool_release(g_wd_pool, bvx, bytes_x)
+    }
     pool_release(g_wd_pool, bx, bytes_rows)
     pool_release(g_wd_pool, btmp, bytes_rows)
-    pool_release(g_wd_pool, bkx, bytes_x)
-    pool_release(g_wd_pool, bvx, bytes_x)
+    if (bxh != null) {
+        pool_release(g_wd_pool, bxh, bytes_rows / 2ul)
+    }
     pool_release(g_upool, u_d, 4ul)
-    pool_release(g_upool, u_hs, 4ul)
-    pool_release(g_upool, u_ta, 4ul)
-    pool_release(g_upool, u_t0, 4ul)
-    pool_release(g_upool, u_h0, 4ul)
-    pool_release(g_upool, u_h1, 4ul)
-    pool_release(g_upool, u_kscale, 4ul)
-    pool_release(g_upool, u_tot, 4ul)
     if (!served) {
         return wd_decline(MetalWdecDecline.gpu_error)
     }
@@ -344,7 +397,11 @@ def private wd_mm(enc : MetalComputeEncoder?; boff : uint64; bx, by : MetalBuffe
 // logits) and the full-vocab logits readback — the CPU filter/sampler stays the parity anchor.
 [hot_path]
 def private metal_whisper_decode(w : WhisperModel; var ds : DecoderState; toks : int const?; n : int64) : bool {   // nolint:STYLE038 — the dispatch chain is the shape
+    if (ds.gpu_uid != 0ul && key_exists(g_wd_dropped, ds.gpu_uid)) {
+        panic("dasLLAMA wdec: this decoder window's cross-attention memory was lost before it was read back - another state's window or a driver release took its device planes; ONE live decoder window per process, and a state decodes only a window it started after the loss")
+    }
     if (!g_wd_window_live || !g_wd_window_step || g_wd_window_key != intptr(unsafe(addr(ds)))) {
+        wd_flush_cross_kv(ds)
         // an evicted GPU-decoded window: the CPU chain would read kcache rows the GPU owns
         if (ds.gpu_kv_gen != 0l && ds.n_past > 0l) {
             panic("dasLLAMA wdec: the GPU decoder window was evicted mid-window - ONE live decoder window per process (a second DecoderState may not interleave whisper_cross_kv/whisper_decode_batch)")
@@ -354,6 +411,7 @@ def private metal_whisper_decode(w : WhisperModel; var ds : DecoderState; toks :
     if (n > WD_ROW_CAP) {
         if (ds.n_past == 0l) {   // first batch: nothing GPU-owned yet — release the claim, the CPU serves the window
             g_wd_window_live = false
+            wd_flush_cross_kv(ds)
             return false
         }
         panic("dasLLAMA wdec: decode batch of {n} exceeds the {WD_ROW_CAP}-row step cap mid-window")
@@ -370,22 +428,13 @@ def private metal_whisper_decode(w : WhisperModel; var ds : DecoderState; toks :
     var bblobf = plane_buffer(g_dev, unsafe(reinterpret<void?>(plane_at(w.dblob, 0l))), uint64(length(w.dblob) * 4l), mapped)
     var u_d = uniform_u32(uint(d))
     var u_3d = uniform_u32(uint(3l * d))
-    var u_hs = uniform_u32(uint(hs))
     var u_ff = uniform_u32(uint(4l * d))
     var u_eps = uniform_f32(w.eps)
     var u_totd = uniform_u32(uint(n * d))
-    var u_totff = uniform_u32(uint(n * 4l * d))
     var u_n = uniform_u32(uint(n))
-    var u_p0 = uniform_u32(uint(p0))
-    var u_tmax = uniform_u32(uint(tmax))
-    var u_ta = uniform_u32(uint(ta))
-    var u_len_self = uniform_u32(uint(p0 + 1l))
-    var u_hh = uniform_u32(uint(hh))
-    var u_nch_s = uniform_u32(uint((p0 + n + 255l) / 256l))
-    var u_nch_c = uniform_u32(uint((ta + 255l) / 256l))
-    var u_c1 = uniform_u32(1u)
-    var u_c0 = uniform_u32(0u)
-    var u_scale = uniform_f32(1.0 / sqrt(float(hs)))
+    let nch_s = (p0 + n + 255l) / 256l
+    let nch_c = (ta + 255l) / 256l
+    let wd_scale = 1.0 / sqrt(float(hs))
     var u_nv = uniform_u32(uint(g_wd_nvpad))
     var err = ""
     var gpu_ms = 0.0lf
@@ -394,62 +443,57 @@ def private metal_whisper_decode(w : WhisperModel; var ds : DecoderState; toks :
         for (l in range64(nl)) {
             let lo = dec_layer_offsets(w, l)
             let bo = l * WD_MATS
-            let koff_self = uint64(l * d * tmax * 2l)   // the resident K/V memory is f16
-            let koff_cross = uint64(l * d * ta * 2l)
             // self-attention (v bias folds into the append shuffle, q bias into the attention load)
-            enc_ln(enc, g_wd_sx, bblobf, uint64(lo.ln1_w * 4l), bblobf, uint64(lo.ln1_b * 4l), g_wd_sxb, 0ul, u_d, u_eps, n)
+            enc_ln(enc, g_wd_sx, g_wd_sxb, bblobf, gk_ln_args(uint(d), uint(n), w.eps, uint(lo.ln1_w), uint(lo.ln1_b)), n)
             if (n == 1l) {   // the fused-QKV GEMV: the q,k,v regions sit contiguous in the driver's blob
                 enc_gemv(enc, g_wd_mblob, g_wd_boffs[bo], g_wd_sxb, g_wd_sq, u_d, u_3d, 3l * d)
                 // dim = the SOURCE row stride: the k/v column blocks sit in the fused 3d-wide rows
-                enc_cross_vx_h(enc, g_wd_sq, uint64(d * 4l), g_wd_bkc, koff_self, bblobf, 0ul, u_3d, u_hs, u_n, u_p0, u_tmax, u_c0, u_totd, n * d)
-                enc_cross_vx_h(enc, g_wd_sq, uint64(2l * d * 4l), g_wd_bvc, koff_self, bblobf, uint64(lo.v_b * 4l), u_3d, u_hs, u_n, u_p0, u_tmax, u_c1, u_totd, n * d)
+                var kv_s = GkWdecKvArgs(rows = uint(n), sstride = uint(3l * d), soff = uint(d), nheads = uint(hh), tstride = uint(tmax), p0 = uint(p0), dst_off = uint(l * d * tmax), boff = 0u, bias_on = 0u, mode = WDEC_KV_F16, hs = uint(hs), kscale = wdec_kscale(hs))
+                enc_wdec_kv_h(enc, g_wd_sq, g_wd_bkc, bblobf, kv_s, n * d)
+                kv_s.soff = uint(2l * d)
+                kv_s.boff = uint(lo.v_b)
+                kv_s.bias_on = 1u
+                enc_wdec_kv_h(enc, g_wd_sq, g_wd_bvc, bblobf, kv_s, n * d)
             } else {
                 wd_mm(enc, g_wd_boffs[bo], g_wd_sxb, g_wd_sq, u_d, u_d, d, d, n)
                 wd_mm(enc, g_wd_boffs[bo + 1l], g_wd_sxb, g_wd_sk, u_d, u_d, d, d, n)
                 wd_mm(enc, g_wd_boffs[bo + 2l], g_wd_sxb, g_wd_sv, u_d, u_d, d, d, n)
-                enc_cross_vx_h(enc, g_wd_sk, 0ul, g_wd_bkc, koff_self, bblobf, 0ul, u_d, u_hs, u_n, u_p0, u_tmax, u_c0, u_totd, n * d)
-                enc_cross_vx_h(enc, g_wd_sv, 0ul, g_wd_bvc, koff_self, bblobf, uint64(lo.v_b * 4l), u_d, u_hs, u_n, u_p0, u_tmax, u_c1, u_totd, n * d)
+                var kv_s = GkWdecKvArgs(rows = uint(n), sstride = uint(d), soff = 0u, nheads = uint(hh), tstride = uint(tmax), p0 = uint(p0), dst_off = uint(l * d * tmax), boff = 0u, bias_on = 0u, mode = WDEC_KV_F16, hs = uint(hs), kscale = wdec_kscale(hs))
+                enc_wdec_kv_h(enc, g_wd_sk, g_wd_bkc, bblobf, kv_s, n * d)
+                kv_s.boff = uint(lo.v_b)
+                kv_s.bias_on = 1u
+                enc_wdec_kv_h(enc, g_wd_sv, g_wd_bvc, bblobf, kv_s, n * d)
             }
-            enc_wdec_attn_part(enc, g_wd_sq, g_wd_bkc, koff_self, g_wd_bvc, koff_self, g_wd_bpms, g_wd_bpy, bblobf, uint64(lo.q_b * 4l), u_d, u_hs, u_tmax, u_len_self, u_c1, u_scale, u_hh, u_n, hh, n, (p0 + n + 255l) / 256l)
-            enc_wdec_attn_comb(enc, g_wd_bpms, g_wd_bpy, g_wd_sxb2, u_d, u_hs, u_nch_s, u_hh, u_n, hh, n)
+            enc_wdec_attn_part(enc, g_wd_sq, g_wd_bkc, g_wd_bvc, g_wd_bpms, g_wd_bpy, bblobf, GkWdecAttnArgs(dim = uint(d), tstride = uint(tmax), len0 = uint(p0 + 1l),
+                causal = 1u, nheads = uint(hh), nrows = uint(n), koff = uint(l * d * tmax), voff = uint(l * d * tmax), qboff = uint(lo.q_b), hs = uint(hs), scale = wd_scale), nch_s * hh * n)
+            enc_wdec_attn_comb(enc, g_wd_bpms, g_wd_bpy, g_wd_sxb2, GkWdecCombArgs(dim = uint(d), nchunks = uint(nch_s), nheads = uint(hh), nrows = uint(n), hs = uint(hs)), hh * n)
             wd_mm(enc, g_wd_boffs[bo + 3l], g_wd_sxb2, g_wd_sxb, u_d, u_d, d, d, n)
             enc_bias_add_res(enc, g_wd_sx, g_wd_sxb, bblobf, uint64(lo.o_b * 4l), u_d, u_totd, n * d)
             // cross-attention against the window's resident memory
-            enc_ln(enc, g_wd_sx, bblobf, uint64(lo.cln_w * 4l), bblobf, uint64(lo.cln_b * 4l), g_wd_sxb, 0ul, u_d, u_eps, n)
+            enc_ln(enc, g_wd_sx, g_wd_sxb, bblobf, gk_ln_args(uint(d), uint(n), w.eps, uint(lo.cln_w), uint(lo.cln_b)), n)
             wd_mm(enc, g_wd_boffs[bo + 4l], g_wd_sxb, g_wd_sq, u_d, u_d, d, d, n)
-            enc_wdec_attn_part(enc, g_wd_sq, g_wd_bkxr, koff_cross, g_wd_bvxr, koff_cross, g_wd_bpms, g_wd_bpy, bblobf, uint64(lo.cq_b * 4l), u_d, u_hs, u_ta, u_ta, u_c0, u_scale, u_hh, u_n, hh, n, (ta + 255l) / 256l)
-            enc_wdec_attn_comb(enc, g_wd_bpms, g_wd_bpy, g_wd_sxb2, u_d, u_hs, u_nch_c, u_hh, u_n, hh, n)
+            enc_wdec_attn_part(enc, g_wd_sq, g_wd_bkxr, g_wd_bvxr, g_wd_bpms, g_wd_bpy, bblobf, GkWdecAttnArgs(dim = uint(d), tstride = uint(ta), len0 = uint(ta),
+                causal = 0u, nheads = uint(hh), nrows = uint(n), koff = uint(l * d * ta), voff = uint(l * d * ta), qboff = uint(lo.cq_b), hs = uint(hs), scale = wd_scale), nch_c * hh * n)
+            enc_wdec_attn_comb(enc, g_wd_bpms, g_wd_bpy, g_wd_sxb2, GkWdecCombArgs(dim = uint(d), nchunks = uint(nch_c), nheads = uint(hh), nrows = uint(n), hs = uint(hs)), hh * n)
             wd_mm(enc, g_wd_boffs[bo + 7l], g_wd_sxb2, g_wd_sxb, u_d, u_d, d, d, n)
             enc_bias_add_res(enc, g_wd_sx, g_wd_sxb, bblobf, uint64(lo.co_b * 4l), u_d, u_totd, n * d)
             // mlp (fc1 bias folds into the LUT-GELU pass, fc2's into the residual add)
-            enc_ln(enc, g_wd_sx, bblobf, uint64(lo.ln2_w * 4l), bblobf, uint64(lo.ln2_b * 4l), g_wd_sxb, 0ul, u_d, u_eps, n)
+            enc_ln(enc, g_wd_sx, g_wd_sxb, bblobf, gk_ln_args(uint(d), uint(n), w.eps, uint(lo.ln2_w), uint(lo.ln2_b)), n)
             wd_mm(enc, g_wd_boffs[bo + 8l], g_wd_sxb, g_wd_sh, u_d, u_ff, d, 4l * d, n)
-            enc_bias_gelu_lut(enc, g_wd_sh, 0ul, bblobf, uint64(lo.fc1_b * 4l), u_ff, u_totff, n * 4l * d)
+            tw_bias(enc, g_wd_sh, bblobf, GkBiasActArgs(d = uint(4l * d), nelem = uint(n * 4l * d), boff = uint(lo.fc1_b), act = BIAS_ACT_GELU_TANH))
             wd_mm(enc, g_wd_boffs[bo + 9l], g_wd_sh, g_wd_sxb, u_ff, u_d, 4l * d, d, n)
             enc_bias_add_res(enc, g_wd_sx, g_wd_sxb, bblobf, uint64(lo.fc2_b * 4l), u_d, u_totd, n * d)
         }
         // final LN, then logits: a single-row GEMV per token; the prompt batch GEMMs every row
-        enc_ln(enc, g_wd_sx, bblobf, uint64(w.d_ln_w_off * 4l), bblobf, uint64(w.d_ln_b_off * 4l), g_wd_sxb, 0ul, u_d, u_eps, n)
+        enc_ln(enc, g_wd_sx, g_wd_sxb, bblobf, gk_ln_args(uint(d), uint(n), w.eps, uint(w.d_ln_w_off), uint(w.d_ln_b_off)), n)
         wd_mm(enc, g_wd_te_boff, g_wd_sxb, g_wd_slog, u_d, u_nv, d, g_wd_nvpad, n)
     }
     pool_release(g_upool, u_d, 4ul)
     pool_release(g_upool, u_3d, 4ul)
-    pool_release(g_upool, u_hs, 4ul)
     pool_release(g_upool, u_ff, 4ul)
     pool_release(g_upool, u_eps, 4ul)
     pool_release(g_upool, u_totd, 4ul)
-    pool_release(g_upool, u_totff, 4ul)
     pool_release(g_upool, u_n, 4ul)
-    pool_release(g_upool, u_p0, 4ul)
-    pool_release(g_upool, u_tmax, 4ul)
-    pool_release(g_upool, u_ta, 4ul)
-    pool_release(g_upool, u_len_self, 4ul)
-    pool_release(g_upool, u_hh, 4ul)
-    pool_release(g_upool, u_nch_s, 4ul)
-    pool_release(g_upool, u_nch_c, 4ul)
-    pool_release(g_upool, u_c1, 4ul)
-    pool_release(g_upool, u_c0, 4ul)
-    pool_release(g_upool, u_scale, 4ul)
     pool_release(g_upool, u_nv, 4ul)
     if (!ran) {   // the GPU owns this window's KV — a silent CPU fallback would decode blind
         panic("dasLLAMA wdec: GPU decode failed mid-window: {err}")

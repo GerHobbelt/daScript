@@ -11,6 +11,7 @@ require strings
 // This tutorial covers:
 //   - create_prefix_cache over one create_kv_pool pool
 //   - prefix_insert: a finished stream donates its KV pages
+//   - prefix_match_len: how much of a prompt the cache holds, attaching nothing
 //   - prefix_attach: the next request skips the donated prefill
 //   - prefix_chain_list + prefix_held_groups: what the cache holds
 //   - render_turn_marked + prefix_checkpoint_at: models that carry state between tokens
@@ -42,6 +43,10 @@ let PAGE_ROWS = 16l
 // prefix_insert. `tokens` is A's full evaled history — the cache keeps every
 // full page of it. The preview string is only a label for dashboards.
 //
+// Before B takes anything, prefix_match_len asks the cache how many of B's
+// leading tokens it holds. It attaches nothing and touches no entry - a
+// caller uses it to decide what a request must still bring.
+//
 // Stream B starts FRESH from the same pool. prefix_attach walks B's prompt
 // against the cached chains: matched pages join B's page table, B's n_past
 // jumps past them, and we prefill only the tail. The match is capped one
@@ -57,6 +62,7 @@ def section_donate_attach(m : Model; var pool : KVPool; var cache : PrefixCache)
     delete s1
 
     let p2 <- encode(m, "{SYSTEM}{Q2}")
+    print("prefix_match_len: the cache holds {prefix_match_len(cache, pool, p2)} of B's leading tokens\n")
     var s2 = create_session(m, pool)
     let matched = prefix_attach(cache, pool, s2, p2)
     let total = long_length(p2)
@@ -98,7 +104,7 @@ def section_checkpoint(m : Model; var pool : KVPool; var cache : PrefixCache) {
     if (stop > 0l) {
         let head <- [for (i in range64(matched, stop)); turn.toks[i]]
         eval(m, s, head)
-        prefix_insert(cache, pool, s, turn.toks)   // a checkpoint at `stop`: the session stands exactly there
+        prefix_insert(cache, pool, s, turn.toks, "", true)   // a checkpoint at `stop`: the session stands exactly there; an OPENING, which every conversation on this system prompt shares and the budget drops last
         print("stopped at {stop} and left a checkpoint; the next conversation attaches it\n")
     } else {
         print("no stop needed: this model keeps no state between tokens\n")
@@ -150,7 +156,7 @@ def main() {
     var m <- load_model(path, QuantMode.q8)
     allow_cpu_prefill()   // a CPU tutorial, said explicitly — on a Mac, set_metal_mode(MetalMode.when_available) picks the GPU rails instead
     var pool <- create_kv_pool(m, PAGE_ROWS)
-    var cache <- create_prefix_cache()
+    var cache <- create_prefix_cache(0l, DEFAULT_PREFIX_STATES, 1024l * 1048576l)   // a recurrent model's checkpoints: up to 16 of them within 1 GB
     with_job_que() {
         setup_dasllama_jobque()
         section_donate_attach(m, pool, cache)

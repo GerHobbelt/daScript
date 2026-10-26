@@ -20,17 +20,14 @@ let DEADLOCK_GUARD_SEC = 30.0f
 let HYBRID_EDITOR = "DOCK_ROOT/g_document_windows[1]/DOCUMENT_CONTENT/editor"
 let HYBRID_FIXTURE = "# Hybrid probe\n\nFirst paragraph line.\n\nSecond paragraph line.\n\n- alpha\n- beta\n\nTail paragraph.\n"
 
-def private viewer_state(app : ImguiApp) : JsonValue? {
-    return post_command(app, "text_viewer_state", null)
-}
+def private viewer_state(app : ImguiApp) : JsonValue? =>
+    post_command(app, "text_viewer_state", null)
 
-def private edit_text_state(app : ImguiApp) : JsonValue? {
-    return post_command(app, "text_viewer_edit_text", null)
-}
+def private edit_text_state(app : ImguiApp) : JsonValue? =>
+    post_command(app, "text_viewer_edit_text", null)
 
-def private hybrid_segments(app : ImguiApp) : JsonValue? {
-    return post_command(app, "text_viewer_hybrid_segments", null)
-}
+def private hybrid_segments(app : ImguiApp) : JsonValue? =>
+    post_command(app, "text_viewer_hybrid_segments", null)
 
 def private set_cursor(app : ImguiApp; line : int; column : int = 0) : JsonValue? {
     return post_command(app, "text_viewer_set_cursor",
@@ -81,7 +78,7 @@ def test_hybrid_surface_three_way(t : T?) {
             return (viewer_state(app)?["edit_surface"] ?? "") == "source"
         }
         t |> success(sourced, "footer radio selects the Source surface")
-        var pane = wait_for_render(app,
+        let pane = wait_for_render(app,
             "DOCK_ROOT/g_document_windows[1]/DOCUMENT_CONTENT/EDITOR_PANE/editor",
             15.0f)
         t |> success(pane != null, "source surface shows the classic editor pane")
@@ -194,7 +191,7 @@ def test_hybrid_typing_debounce_and_exit_snap(t : T?) {
         return if (empty(temp_dir))
         {
         return if (!open_hybrid_fixture(t, app, temp_dir))
-        var probe = wait_for_render(app, HYBRID_EDITOR, 15.0f)
+        let probe = wait_for_render(app, HYBRID_EDITOR, 15.0f)
         t |> success(probe != null, "the source island renders in the hybrid")
         click(app, HYBRID_EDITOR)
         t |> success(wait_for_mouse_idle(app), "island focus click drains")
@@ -239,7 +236,7 @@ def test_hybrid_editor_state_across_surfaces(t : T?) {
         return if (empty(temp_dir))
         {
         return if (!open_hybrid_fixture(t, app, temp_dir))
-        var probe = wait_for_render(app, HYBRID_EDITOR, 15.0f)
+        let probe = wait_for_render(app, HYBRID_EDITOR, 15.0f)
         t |> success(probe != null, "the source island renders")
         click(app, HYBRID_EDITOR)
         t |> success(wait_for_mouse_idle(app), "island focus click drains")

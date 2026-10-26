@@ -269,9 +269,7 @@ class FindEscapingReturn : AstVisitor {
     def override preVisitExprReturn(expr : ExprReturn?) : void {
         found = true
     }
-    def override canVisitMakeBlockBody(expr : ExprMakeBlock?) : bool {
-        return false
-    }
+    def override canVisitMakeBlockBody(expr : ExprMakeBlock?) : bool => false
 }
 
 [macro_function]
@@ -458,7 +456,7 @@ class ApplyImmMacro : AstCallMacro {
         if (expr.arguments[0]._type == null) {
             return null
         }
-        var argT = clone_type(expr.arguments[0]._type)
+        let argT = clone_type(expr.arguments[0]._type)
         macro_verify(argT.baseType == Type.tStructure, prog, expr.at, "apply_imm supports struct only")
         macro_verify(expr.arguments[1] is ExprMakeBlock, prog, expr.at, "expecting make block, i.e. $(..)")
         macro_verify(apply_block_inline_safe(expr.arguments[1]), prog, expr.at,

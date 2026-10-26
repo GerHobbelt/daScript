@@ -76,6 +76,8 @@ var g_tower_rows = 0l
 var g_tower_blocks = 0l
 var g_tower_convs = 0l                       // conv-frontend chunks served on the GPU
 var g_tower_f16_encodes = 0l                 // encodes whose GEMMs rode the f16-W shadow route
+var g_tower_mels = 0l                        // whisper-preprocessor mels served on the GPU
+var g_tower_tail_encodes = 0l                // whisper-class encodes whose projector tail ran behind the blocks
 var g_tower_declines : DeclineCounter
 
 // the whisper ASR-decoder driver's counters (dasllama_metal_asr_dec; counting home here)
@@ -166,23 +168,23 @@ var g_pso_geglu : MetalComputePipeline?
 var g_pso_geglu_hx : MetalComputePipeline?    // dual-store stamp
 // ===== tower primitives (compiled in the tower driver's init) =====
 var g_pso_ln : MetalComputePipeline?
-var g_pso_gelu_erf : MetalComputePipeline?
-var g_pso_gelu_lut : MetalComputePipeline?
+var g_pso_bias_act : MetalComputePipeline?   //! the bias + activation rows, the template both homes stamp
+var g_pso_act_rows : MetalComputePipeline?   //! the activation alone
 var g_pso_posadd : MetalComputePipeline?
 var g_pso_q3v_stem : MetalComputePipeline?   //!< the qwen3v stem assemble (reorder-gather + bias + pos)
-var g_pso_clamp : MetalComputePipeline?        // gemma4v: the ClippableLinear clamp
+var g_pso_clamp : MetalComputePipeline?
+var g_pso_clamp_copy : MetalComputePipeline?
 var g_pso_rope2d : MetalComputePipeline?       // gemma4v: the two-axis NEOX rope
-var g_pso_head_restride : MetalComputePipeline?   // gemma3v: head-width repack around the attention tiles
+var g_pso_head_pad : MetalComputePipeline?   //!< the vision towers' head pad onto the attention tiles' width
+var g_pso_head_unpad : MetalComputePipeline?   //!< and the compact rows back off it
 var g_pso_geglu_quick : MetalComputePipeline?  // gemma4v: GEGLU-quick, f16-table form
 var g_pso_f32mm : MetalComputePipeline?
-var g_pso_cross_kx : MetalComputePipeline?   // whisper cross-KV: K transpose+prescale shuffle
-var g_pso_cross_vx : MetalComputePipeline?   // whisper cross-KV: V head-major re-tile (+ the KV append)
-var g_pso_cross_vx_h : MetalComputePipeline?  // the f16-store twin — the resident K/V memory
+var g_pso_wdec_kv : MetalComputePipeline?    // the whisper decoder's K/V stores in the CPU chain's f32 layouts
+var g_pso_wdec_kv_h : MetalComputePipeline?  // ... into the resident f16 K/V memory (the decode step's append rides it)
 var g_pso_im2col2d : MetalComputePipeline?    // the qwen3a conv2d im2col (k=3, s=2, p=1)
 var g_pso_wdec_attn_part : MetalComputePipeline?  // the chunked online-softmax partial
 var g_pso_wdec_attn_comb : MetalComputePipeline?  // the log-sum-exp chunk merge
 var g_pso_bias_add_res : MetalComputePipeline?   // whisper decode: bias + residual add
-var g_pso_bias_gelu_lut : MetalComputePipeline?  // whisper decode: bias + LUT-form GELU
 var g_pso_softcap : MetalComputePipeline?
 var g_pso_suppress : MetalComputePipeline?
 var g_one : MetalBuffer?                    // persistent 1.0f — the rms oscale default bind
@@ -218,6 +220,7 @@ var g_pso_moe_gemv_q8 : MetalComputePipeline?  // expert-indexed GEMV twins (gri
 var g_pso_moe_kq_k4 : MetalComputePipeline?
 var g_pso_moe_kq_k3 : MetalComputePipeline?
 var g_pso_moe_kq_iq3s : MetalComputePipeline?
+var g_pso_moe_kq_iq3s_f4 : MetalComputePipeline?   //!< the gathered iq3s f4-slab twin, compiled only behind the crown "kq_gemv_iq3s_f4"
 var g_pso_moe_kq_iq3xxs : MetalComputePipeline?
 var g_pso_moe_kq_iq2s : MetalComputePipeline?
 var g_pso_moe_kq_iq2xs : MetalComputePipeline?
@@ -237,8 +240,6 @@ var g_mx4_vtab : MetalBuffer?                   // [16] signed doubled-e2m1 valu
 var g_pso_dn_conv : MetalComputePipeline?      // deltanet (Wave D): causal conv + SiLU
 var g_pso_dn_hist : MetalComputePipeline?      // conv-history advance
 var g_pso_st2_im2col : MetalComputePipeline?
-var g_pso_st2_im2col_tr : MetalComputePipeline?
-var g_pso_st2_im2col_cm : MetalComputePipeline?
 var g_pso_st2_conv_mm : MetalComputePipeline?
 var g_pso_st2_conv_tr_mm : MetalComputePipeline?
 var g_pso_f32_exact_mm : MetalComputePipeline?
@@ -272,7 +273,15 @@ var g_pso_pk_rows : MetalComputePipeline?
 var g_pso_pk_rows_elu : MetalComputePipeline?
 var g_pso_pk_row_scale : MetalComputePipeline?
 var g_pso_pk_attn : MetalComputePipeline?
+var g_pso_pk_rope_tab : MetalComputePipeline?
 var g_pso_pk_add_ln : MetalComputePipeline?
+var g_pso_tw_rms : MetalComputePipeline?        //!< the towers' rms rows on the layernorm template's RMS arm
+var g_pso_tw_patch_im2col : MetalComputePipeline?   //!< the vision stems' patch im2col over the uploaded planes
+var g_pso_tw_add_ln : MetalComputePipeline?     //!< the biased residual seam with its next layernorm
+var g_pso_tw_add_rms : MetalComputePipeline?    //!< ... with its next rms (qwen25v)
+var g_pso_tw_add_post_rms : MetalComputePipeline?   //!< the post-normed seam with its next rms (gemma4v)
+var g_pso_tw_rope_tab : MetalComputePipeline?   //!< the vision towers' NEOX table rope
+var g_pso_tw_bias_gate : MetalComputePipeline?  //!< a gated hidden with its bias rows (qwen25v)
 var g_pso_pk_gemv_f32 : MetalComputePipeline?
 var g_pso_pk_gemv_f32_ln_silu : MetalComputePipeline?
 var g_pso_pk_gemv_f32_gate : MetalComputePipeline?
@@ -532,25 +541,21 @@ def batch_decline(why : MetalDecodeDecline; missing : MetalNeed) {
 }
 
 //! (gpu decode steps served, declines to the CPU path) since load — diagnostics / tests.
-def public metal_decode_stats() : tuple<decodes : int64; declines : int64> {
-    return (decodes = g_decodes, declines = g_decode_declines.total)
-}
+def public metal_decode_stats() : tuple<decodes : int64; declines : int64> =>
+    (decodes = g_decodes, declines = g_decode_declines.total)
 
 //! Single-stream declines-by-reason since load — reason name -> count (the first failing gate
 //! clause per declined step). The support-matrix test asserts WHY a config declined.
-def public metal_decode_declines() : table<string; int64> {
-    return clone_to_move(g_decode_declines.by_reason)
-}
+def public metal_decode_declines() : table<string; int64> =>
+    clone_to_move(g_decode_declines.by_reason)
 
 //! (batched eval_batch steps served, total rows across them, batch declines) since load.
-def public metal_batch_decode_stats() : tuple<steps : int64; rows : int64; declines : int64> {
-    return (steps = g_batch_steps, rows = g_batch_rows, declines = g_batch_declines.total)
-}
+def public metal_batch_decode_stats() : tuple<steps : int64; rows : int64; declines : int64> =>
+    (steps = g_batch_steps, rows = g_batch_rows, declines = g_batch_declines.total)
 
 //! Batched-step declines-by-reason since load — reason name -> count.
-def public metal_batch_decode_declines() : table<string; int64> {
-    return clone_to_move(g_batch_declines.by_reason)
-}
+def public metal_batch_decode_declines() : table<string; int64> =>
+    clone_to_move(g_batch_declines.by_reason)
 
 // speculative-chain state: the pre-encoded next step may open with GPU argmax + embed gather off
 // the current step's logits (no CPU poke). A greedy caller never misses; forced/non-greedy
@@ -569,14 +574,11 @@ def public set_metal_decode_speculate(v : int) {
 }
 
 //! The chaining rail's current mode (-1 adaptive, 0 off, 1 forced) - a test captures it to restore.
-def public metal_decode_spec_mode() : int {
-    return g_spec_mode
-}
+def public metal_decode_spec_mode() : int => g_spec_mode
 
 //! (speculative steps verified correct, mispredicted-and-rerun) since load.
-def public metal_decode_spec_stats() : tuple<hits : int64; misses : int64> {
-    return (hits = g_spec_hits, misses = g_spec_misses)
-}
+def public metal_decode_spec_stats() : tuple<hits : int64; misses : int64> =>
+    (hits = g_spec_hits, misses = g_spec_misses)
 
 def spec_armed() : bool {
     if (g_spec_mode == 0) {
@@ -715,9 +717,8 @@ def public metal_decode_stage_stats() : tuple<steps : int64; setup_us : int64; e
 }
 
 //! (live KV mirrors, resident mirror bytes) — the churn / LRU-cap gates read this.
-def public metal_decode_mirror_stats() : tuple<mirrors : int64; bytes : uint64> {
-    return (mirrors = long_length(g_mirrors), bytes = g_mirror_bytes)
-}
+def public metal_decode_mirror_stats() : tuple<mirrors : int64; bytes : uint64> =>
+    (mirrors = long_length(g_mirrors), bytes = g_mirror_bytes)
 
 //! Arm the per-step single-stream decode trace for the next `cap` retired steps (0 disarms) — the
 //! bimodality diagnostic. Recording stops when full; batch/prefill steps are never recorded; a spec
@@ -1055,8 +1056,7 @@ def nc_logits_release {
 //! grp-repacked loads). Serves BOTH resident drivers (prefill passes its own device handle).
 def kq_quants_of(dev : MetalDevice?; t : Model; fmt : KqFmt; off : int64) : tuple<buf : MetalBuffer?; qoff : uint64> {
     assert(t.metal_blob)
-    var kq : array<uint8> const?
-    var ks : array<uint8> const?
+    var kq, ks : array<uint8> const?
     kq_planes_of(t, fmt, kq, ks)
     unsafe {
         return (buf = plane_buffer(dev, addr<void?>((*kq)[0]), uint64(long_length(*kq)), t.image_map != null),
@@ -1071,8 +1071,7 @@ def kq_quants_of(dev : MetalDevice?; t : Model; fmt : KqFmt; off : int64) : tupl
 def kq_scales_of(dev : MetalDevice?; t : Model; fmt : KqFmt; off : int64) : tuple<buf : MetalBuffer?; soff : uint64; doff : uint64> {
     assert(t.metal_blob)
     let sb0 = off / 256l
-    var kq : array<uint8> const?
-    var ks : array<uint8> const?
+    var kq, ks : array<uint8> const?
     kq_planes_of(t, fmt, kq, ks)
     let plane_sb = long_length(*ks) / (16l + kq_scale_d_tail(fmt))
     return (buf = plane_buffer(dev, unsafe(addr<void?>((*ks)[0])), uint64(long_length(*ks)), t.image_map != null),
@@ -1249,9 +1248,8 @@ def mirror_defrag(total : uint64) : bool {
 // Ensure s.uid's mirror exists, is big enough, and holds logical rows [0, pos) — the watermark
 // contract (module header). Returns arena byte offsets; caller writes row `pos` GPU-side and
 // advances the watermark only after the step + writeback complete. ok=false ⇒ decline to CPU.
-def mirror_prepare(t : Model; var s : Session; pos : int64) : tuple<ok : bool; koff : uint64; voff : uint64; cap : int64> {
-    return mirror_prepare_rows(t, s, pos, pos + 1l)
-}
+def mirror_prepare(t : Model; var s : Session; pos : int64) : tuple<ok : bool; koff : uint64; voff : uint64; cap : int64> =>
+    mirror_prepare_rows(t, s, pos, pos + 1l)
 
 //! A released paged session's mirror stays for the next session whose leading pages are the same groups:
 //! page i's allocation stamp, by the released session's uid.
@@ -2068,9 +2066,7 @@ def public metal_kernel_profile(on : bool) {
 
 //! GPU ms since `metal_kernel_profile(true)`, by MSL entry name and dispatch grid - one kernel's
 //! sites of different shapes read apart.
-def public metal_kernel_profile_ms() : table<string; double> {
-    return <- clone_to_move(g_kprof_ms)
-}
+def public metal_kernel_profile_ms() : table<string; double> => <- clone_to_move(g_kprof_ms)
 
 //! one captured node in a command buffer of its own on the driver's queue, committed and waited
 [cold_path]   // the profile replay only - a serving flush never reaches it
@@ -2129,9 +2125,8 @@ def hz_coverage_check(ndisp, ngated : int64; who : string = "decode") {
 
 //! (barriers issued, gated dispatches, conservative undeclared fallbacks) since load — read
 //! deltas around a window; the chase prints barriers/step next to disp/step.
-def public metal_hazard_stats() : tuple<barriers : int64; gated : int64; undeclared : int64> {
-    return (barriers = g_hz_barriers, gated = g_hz_gated, undeclared = g_hz_undeclared)
-}
+def public metal_hazard_stats() : tuple<barriers : int64; gated : int64; undeclared : int64> =>
+    (barriers = g_hz_barriers, gated = g_hz_gated, undeclared = g_hz_undeclared)
 
 //! Hazard-mode rails: `paranoid` barriers every dispatch on the concurrent encoder (isolates
 //! encoder-flip bugs from barrier-elision bugs); `strict` panics on an undeclared dispatch
@@ -2396,7 +2391,7 @@ def finish_pending_step {   // nolint:STYLE038 — the pipeline join: wait/error
         // the optimistic commit-time watermark now overstates the mirror (its rows are garbage at
         // and above this step's positions) — force a full re-upload from the CPU truth
         for (i in range64(L.nrows)) {
-            var sp = L.sessions[i]
+            let sp = L.sessions[i]
             if (key_exists(g_mirrors, sp.uid)) {
                 g_mirrors[sp.uid].watermark = 0l
             }
@@ -2582,9 +2577,8 @@ def decline(why : MetalPrefillDecline; missing : MetalNeed) {
 //! Declines-by-reason since load — reason name -> count (the first failing gate clause per
 //! declined prefill). The support-matrix test asserts WHY a config declined; the stage report
 //! prints it alongside the decode tables.
-def public metal_prefill_declines() : table<string; int64> {
-    return clone_to_move(g_prefill_declines.by_reason)
-}
+def public metal_prefill_declines() : table<string; int64> =>
+    clone_to_move(g_prefill_declines.by_reason)
 
 //! The IQ4_XS codebook (kvalues_iq4nl) as four packed words, selected + byte-extracted - no
 //! table memory, the k6 sign trick widens the byte. Shared by the kernels file's GEMV/mv set
@@ -2772,6 +2766,13 @@ struct public RacePsoPair {
     ok : bool
 }
 
+//! `pipeline_from_source` for every pipeline this backend builds: the kernel's generated source goes to the dump
+//! directory first, where `DASLLAMA_METAL_MSL_DUMP` names one.
+def pso_from_source(dev : MetalDevice?; source, entry : string; fastmath : bool; var err : string&) : MetalComputePipeline? {
+    kernel_dump_save(g_env_metal.msl_dump, "{entry}.metal", "DASLLAMA_METAL_MSL_DUMP", source)
+    return pipeline_from_source(dev, source, entry, fastmath, err)
+}
+
 //! the `race_pso_pair_stamp` macro is the spelling a race arm uses - it names each side by its
 //! ONE `_msl` stem, so the entry name and the fastmath flag cannot drift onto another kernel's
 def race_pso_pair(dev : MetalDevice?; family : string;
@@ -2780,12 +2781,12 @@ def race_pso_pair(dev : MetalDevice?; family : string;
     var p = RacePsoPair(base_pso = null, twin_pso = null, ok = false,
         verdict = MetalTensorRaceResult(family = family, winner = "", base_ms = -1.0lf, twin_ms = -1.0lf, note = ""))
     var err = ""
-    p.base_pso = pipeline_from_source(dev, base_src, base_entry, base_fm, err)
+    p.base_pso = pso_from_source(dev, base_src, base_entry, base_fm, err)
     if (p.base_pso == null) {
         p.verdict.note = "base pso: {err}"
         return p
     }
-    p.twin_pso = pipeline_from_source(dev, twin_src, twin_entry, twin_fm, err)
+    p.twin_pso = pso_from_source(dev, twin_src, twin_entry, twin_fm, err)
     if (p.twin_pso == null) {
         p.verdict.winner = "simdgroup"
         p.verdict.note = "twin pso: {err}"

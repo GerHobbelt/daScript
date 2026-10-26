@@ -276,14 +276,11 @@ def private wm_repack(var dqblob : array<int8>; var dqscales : array<float>; wof
 
 //! The loaded precision as ``<encoder>/<decoder>`` — whisper's half of the facade's
 //! [[asr_exec_fmt]] stamp.
-def whisper_exec_fmt(w : WhisperModel) : string {
-    return "{w.enc.q8 ? "q8" : "f32"}/{w.dq8 ? "q8" : "f32"}"
-}
+def whisper_exec_fmt(w : WhisperModel) : string =>
+    "{w.enc.q8 ? "q8" : "f32"}/{w.dq8 ? "q8" : "f32"}"
 
 //! Whisper's encode-total ``asr_prof`` bucket (the facade's [[asr_encode_bucket]] arm).
-def whisper_encode_bucket : string {
-    return "wh.encode_total"
-}
+def whisper_encode_bucket : string => "wh.encode_total"
 
 //! Quantizes the decoder's GEMM set to Q8_0 COMPACT planes: per-layer self/cross mats + fc1/fc2
 //! dense in dqblob; the tied token embedding gets a q8 copy (the logits GEMV weight) while its
@@ -392,7 +389,7 @@ def private wm_mm_rq(w : WhisperModel; var y : array<float>; woff : int64; x : a
 
 // ===== ggml bin container parsing =====
 
-// One tensor's location in the bin: ggml ttype (0=f32, 1=f16), element count, absolute
+// One tensor's location in the bin: ggml ttype (0=f32, 1=f16, 8=q8_0), element count, absolute
 // byte offset of the raw data (which follows the name with NO alignment padding).
 struct private WTensorRec {
     ttype : int
@@ -411,7 +408,9 @@ def private bytes_str(b : array<uint8> | #; o, n : int64) : string {
     return s
 }
 
-// Read a tensor's raw data (f32 or f16) into dst[dst_off..) as fp32. Byte-wise reads — the
+let private GGML_FTYPE_MOSTLY_Q8_0 = 7   //!< the file type whisper.cpp's quantizer stamps a q8_0 bin with
+
+// Read a tensor's raw data (f32, f16 or Q8_0 blocks) into dst[dst_off..) as fp32. Byte-wise reads — the
 // bin stores tensor data unaligned.
 def private wt_read(recs : table<string; WTensorRec>; b : array<uint8> | #; name : string;
                     var dst : array<float>; dst_off, n : int64) {
@@ -422,15 +421,7 @@ def private wt_read(recs : table<string; WTensorRec>; b : array<uint8> | #; name
     if (r.n_elem != n) {
         panic("dasLLAMA whisper: tensor '{name}' has {r.n_elem} elements, want {n}")
     }
-    if (r.ttype == GGML_TYPE_F32) {
-        for (i in range64(n)) {
-            dst[dst_off + i] = rd_f32(b, r.off + i * 4l)
-        }
-    } else {
-        for (i in range64(n)) {
-            dst[dst_off + i] = f16_to_f32(rd_u16(b, r.off + i * 2l))
-        }
-    }
+    ggml_bin_read_f32(b, r.ttype, r.off, n, dst, dst_off)
 }
 
 // Conv1d weight (flat [c_out][c_in][k=3], k contiguous — torch layout) permuted to the
@@ -460,9 +451,8 @@ def private whisper_tag(enc_q8, dec_q8 : bool) : string {
 //! Loads a whisper.cpp ggml-*.bin model (f32/f16 only; verified byte-for-byte against the
 //! reference loader). Like ``load_model``, caches a box/knob-specific PREPARED IMAGE for fast
 //! reload; ``DASLLAMA_IMAGE=0`` disables it, a ``.dlim`` path loads one directly.
-def load_whisper_model(path : string; q8 : bool = false) : WhisperModel {
-    return <- load_whisper_model(path, q8, q8)
-}
+def load_whisper_model(path : string; q8 : bool = false) : WhisperModel =>
+    <- load_whisper_model(path, q8, q8)
 
 //! The per-half form: ``enc_q8`` quantizes the encoder (the CPU tower rail; the metal tower
 //! declines it), ``dec_q8`` the decoder. The GPU-tower serving mode is (false, true) —
@@ -546,9 +536,8 @@ def mint_whisper_model(var st : WhisperStaging; var out : WhisperModel; enc_q8, 
 
 //! The ggml-bin reader proper: scalars land in the served model, plane bytes in the staging
 //! arrays beside it. Nothing here is servable — the image build is what produces a live model.
-def stage_whisper_model(path : string; q8 : bool = false) : WhisperStaging {
-    return <- stage_whisper_model(path, q8, q8)
-}
+def stage_whisper_model(path : string; q8 : bool = false) : WhisperStaging =>
+    <- stage_whisper_model(path, q8, q8)
 
 //! The per-half staging twin (see ``load_whisper_model``'s per-half form for the pair's meaning).
 def stage_whisper_model(path : string; enc_q8, dec_q8 : bool) : WhisperStaging {
@@ -559,8 +548,7 @@ def stage_whisper_model(path : string; enc_q8, dec_q8 : bool) : WhisperStaging {
     }
     fmap(f) $(var bytes : array<uint8>#) {
         var recs : table<string; WTensorRec>
-        var encJobs : array<WFillJob>
-        var decJobs : array<WFillJob>
+        var encJobs, decJobs : array<WFillJob>
         let sz = whisper_index(bytes, int64(stat(path).size), st, recs, encJobs, decJobs)
         st.enc.fblob |> reserve_resize(sz.enc_len)
         for (j in encJobs) {
@@ -721,8 +709,7 @@ def private stream_whisper_model(path : string; enc_q8, dec_q8 : bool; img, tag 
     fmap(f) $(var bytes : array<uint8>#) {
         var st = WhisperStaging()
         var recs : table<string; WTensorRec>
-        var encJobs : array<WFillJob>
-        var decJobs : array<WFillJob>
+        var encJobs, decJobs : array<WFillJob>
         let sz = whisper_index(bytes, int64(stat(path).size), st, recs, encJobs, decJobs)
         // the streamed meta must carry the compact offsets the eager quantizers write
         if (enc_q8) {
@@ -802,8 +789,8 @@ def private whisper_index(bytes : array<uint8> | #; n_bytes : int64; var st : Wh
     st.e.n_text_layer = int64(rd_i32(bytes, o)); o += 4l
     let n_mels = int64(rd_i32(bytes, o)); o += 4l
     let ftype = rd_i32(bytes, o) % 1000; o += 4l
-    if (ftype != GGML_TYPE_F32 && ftype != GGML_TYPE_F16) {
-        panic("dasLLAMA whisper: unsupported ftype {ftype} (only f32/f16 bins)")
+    if (ftype != GGML_TYPE_F32 && ftype != GGML_TYPE_F16 && ftype != GGML_FTYPE_MOSTLY_Q8_0) {
+        panic("dasLLAMA whisper: unsupported ftype {ftype} (f32, f16 and q8_0 bins load)")
     }
 
     // mel filterbank
@@ -866,8 +853,8 @@ def private whisper_index(bytes : array<uint8> | #; n_bytes : int64; var st : Wh
         let nl = int64(rd_i32(bytes, o + 4l))
         let tt = rd_i32(bytes, o + 8l)
         o += 12l
-        if (tt != GGML_TYPE_F32 && tt != GGML_TYPE_F16) {
-            panic("dasLLAMA whisper: unsupported tensor type {tt} (only f32/f16 bins)")
+        if (tt != GGML_TYPE_F32 && tt != GGML_TYPE_F16 && tt != GGML_TYPE_Q8_0) {
+            panic("dasLLAMA whisper: unsupported tensor type {tt} (f32, f16 and q8_0 tensors load)")
         }
         var ne = 1l
         for (_i in range(nd)) {
@@ -877,7 +864,7 @@ def private whisper_index(bytes : array<uint8> | #; n_bytes : int64; var st : Wh
         let name = bytes_str(bytes, o, nl)
         o += nl
         recs[name] = WTensorRec(ttype = tt, n_elem = ne, off = o)
-        o += ne * (tt == GGML_TYPE_F32 ? 4l : 2l)
+        o += ggml_bin_tensor_bytes(tt, ne)
     }
 
     // encoder tower layout -> AudioTower scalars + one job per tensor, in blob-offset order
@@ -1097,6 +1084,9 @@ def register_whisper_decode_gpu(fn : WhisperDecodeGpuFn) {
     g_wh_decode_gpu_set = true
 }
 
+//! the decoder's key pre-scale as this chain rounds it, hs^-0.25 - every rail and cell reads it here
+def wdec_kscale(hs : int64) : float => 1.0 / sqrt(sqrt(float(hs)))
+
 //! Precompute the cross-attention memory for one encoded window (``enc_out`` =
 //! whisper_encode's ``s.xb``, ``n_ctx × d``): per layer K = W_k·enc (no bias, pre-scaled
 //! hs^-0.25), V = W_v·enc + b. Resets the sequence.
@@ -1110,7 +1100,7 @@ def whisper_cross_kv(w : WhisperModel; var ds : DecoderState; enc_out : array<fl
     let hh = w.n_text_head
     let hs = d / hh
     let ta = w.enc.n_ctx
-    let kscale = 1.0 / sqrt(sqrt(float(hs)))
+    let kscale = wdec_kscale(hs)
     wm_requant(w, enc_out, d, ta, ds.xqi, ds.xsi)   // every layer's ck & cv share this one requant
     for (l in range64(w.n_text_layer)) {
         let lo = dec_layer_offsets(w, l)

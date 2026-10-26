@@ -37,28 +37,28 @@ class TmmKernels {
 
     [metal_kernel(name="tmm_bf16_msl", float_a_ok=true), marker(no_coverage)]
     def tmm_bf16_k {
-        var ap = unsafe(addr(xa[0]))
-        var wp = unsafe(addr(wb[0]))
+        let ap = unsafe(addr(xa[0]))
+        let wp = unsafe(addr(wb[0]))
         var cp = unsafe(addr(oc[0]))
         tmm2d_f32_bf16_f32(8u, 16u, 2u, ap, 64u, wp, 64u, cp, 16u, 64u)
     }
 
     [metal_kernel(name="tmm_q8_msl"), marker(no_coverage)]
     def tmm_q8_k {
-        var ap = unsafe(addr(aq[0]))
-        var sp = unsafe(addr(asf[0]))
-        var wp = unsafe(addr(wq[0]))
-        var vp = unsafe(addr(wsf[0]))
+        let ap = unsafe(addr(aq[0]))
+        let sp = unsafe(addr(asf[0]))
+        let wp = unsafe(addr(wq[0]))
+        let vp = unsafe(addr(wsf[0]))
         var cp = unsafe(addr(oc[0]))
         tmm2d_q8_f32(8u, 16u, 2u, ap, 64u, sp, 2u, wp, 64u, vp, 2u, cp, 16u, 64u)
     }
 
     [metal_kernel(name="tmm_q8h_msl"), marker(no_coverage)]
     def tmm_q8h_k {
-        var ap = unsafe(addr(aq[0]))
-        var sp = unsafe(addr(asf[0]))
-        var wp = unsafe(addr(wq[0]))
-        var vp = unsafe(addr(wsh[0]))
+        let ap = unsafe(addr(aq[0]))
+        let sp = unsafe(addr(asf[0]))
+        let wp = unsafe(addr(wq[0]))
+        let vp = unsafe(addr(wsh[0]))
         var cp = unsafe(addr(oc[0]))
         tmm2d_q8_f16s(8u, 16u, 2u, ap, 64u, sp, 2u, wp, 64u, vp, 2u, cp, 16u, 64u)
     }
@@ -69,8 +69,8 @@ class TmmKernels {
     [metal_kernel(name="tmm_tg_msl"), marker(no_coverage)]
     def tmm_tg_k {
         var acc : float[128]
-        var ap = unsafe(addr(xa[0]))
-        var wp = unsafe(addr(wb[0]))
+        let ap = unsafe(addr(xa[0]))
+        let wp = unsafe(addr(wb[0]))
         var cp = unsafe(addr(oc[0]))
         tmm2d_tg_begin(acc, 8u, 16u, 2u, 32u)
         var kb = 0u
@@ -95,9 +95,9 @@ class TmmKernels {
 
     [metal_kernel(name="tmm_q8b_msl", float_a_ok=true), marker(no_coverage)]   // q8b has no half-A twin - the license is the only form
     def tmm_q8b_k {
-        var sp = unsafe(addr(bsh[0]))
-        var wp = unsafe(addr(bqb[2]))
-        var ap = unsafe(addr(xa[0]))
+        let sp = unsafe(addr(bsh[0]))
+        let wp = unsafe(addr(bqb[2]))
+        let ap = unsafe(addr(xa[0]))
         var cp = unsafe(addr(oc[0]))
         tmm2d_q8b_f32(8u, 16u, 2u, sp, wp, ap, 64u, cp, 16u, 64u, 2u)
     }
@@ -109,8 +109,8 @@ class TmmKernels {
     [metal_kernel(name="tmm_nt_msl"), marker(no_coverage)]
     def tmm_nt_k {
         var acc : float[128]
-        var ap = unsafe(addr(xa[0]))
-        var wp = unsafe(addr(wb[0]))
+        let ap = unsafe(addr(xa[0]))
+        let wp = unsafe(addr(wb[0]))
         var cp = unsafe(addr(oc[0]))
         tmm2d_tg_begin_nt(acc, 8u, 16u, 2u, 32u)
         var kb = 0u
@@ -139,8 +139,8 @@ class TmmKernels {
     [metal_kernel(name="tmm_nth_msl"), marker(no_coverage)]
     def tmm_nth_k {
         var acc : float[128]
-        var ap = unsafe(addr(xa[0]))
-        var wp = unsafe(addr(wb[0]))
+        let ap = unsafe(addr(xa[0]))
+        let wp = unsafe(addr(wb[0]))
         var cp = unsafe(addr(och[0]))
         tmm2d_tg_begin_nt(acc, 8u, 16u, 2u, 32u)
         var kb = 0u
@@ -168,7 +168,7 @@ class TmmKernels {
     [metal_kernel(name="tmm_devant_msl", float_a_ok=true), marker(no_coverage)]
     def tmm_devant_k {
         var acc : float[128]
-        var wp = unsafe(addr(wb[0]))
+        let wp = unsafe(addr(wb[0]))
         var cp = unsafe(addr(oc[0]))
         tmm2d_tg_begin_devant(acc, 8u, 16u, 2u, 32u)
         var kb = 0u
@@ -191,7 +191,7 @@ class TmmKernels {
     [metal_kernel(name="tmm_deva_msl", float_a_ok=true), marker(no_coverage)]
     def tmm_deva_k {
         var acc : float[128]
-        var wp = unsafe(addr(wb[0]))
+        let wp = unsafe(addr(wb[0]))
         var cp = unsafe(addr(oc[0]))
         tmm2d_tg_begin_deva(acc, unsafe(addr(xa[0])), 8u, 16u, 2u, 32u)
         var kb = 0u
@@ -212,7 +212,7 @@ class TmmKernels {
     [metal_kernel(name="tmm_devah_msl"), marker(no_coverage)]
     def tmm_devah_k {
         var acc : float[128]
-        var wp = unsafe(addr(wb[0]))
+        let wp = unsafe(addr(wb[0]))
         var cp = unsafe(addr(oc[0]))
         tmm2d_tg_begin_deva(acc, unsafe(addr(xah[0])), 8u, 16u, 2u, 32u)
         var kb = 0u
@@ -232,42 +232,42 @@ class TmmKernels {
 
     [metal_kernel(name="tmm_bfh_msl"), marker(no_coverage)]
     def tmm_bfh_k {
-        var ap = unsafe(addr(xah[0]))
-        var wp = unsafe(addr(wb[0]))
+        let ap = unsafe(addr(xah[0]))
+        let wp = unsafe(addr(wb[0]))
         var cp = unsafe(addr(oc[0]))
         tmm2d_f32_bf16_f32(8u, 16u, 2u, ap, 64u, wp, 64u, cp, 16u, 64u)
     }
 
     [metal_kernel(name="tmm_hw_msl", float_a_ok=true), marker(no_coverage)]
     def tmm_hw_k {
-        var ap = unsafe(addr(xa[0]))
-        var wp = unsafe(addr(wh[0]))
+        let ap = unsafe(addr(xa[0]))
+        let wp = unsafe(addr(wh[0]))
         var cp = unsafe(addr(oc[0]))
         tmm2d_f16w_f32(8u, 16u, 2u, ap, 64u, wp, 64u, cp, 16u, 64u)
     }
 
     [metal_kernel(name="tmm_hwh_msl"), marker(no_coverage)]
     def tmm_hwh_k {
-        var ap = unsafe(addr(xah[0]))
-        var wp = unsafe(addr(wh[0]))
+        let ap = unsafe(addr(xah[0]))
+        let wp = unsafe(addr(wh[0]))
         var cp = unsafe(addr(oc[0]))
         tmm2d_f16w_f32(8u, 16u, 2u, ap, 64u, wp, 64u, cp, 16u, 64u)
     }
 
     [metal_kernel(name="tmm_q8u_msl", float_a_ok=true), marker(no_coverage)]
     def tmm_q8u_k {
-        var sp = unsafe(addr(bsh[0]))
-        var wp = unsafe(addr(bqb[2]))
-        var ap = unsafe(addr(xa[0]))
+        let sp = unsafe(addr(bsh[0]))
+        let wp = unsafe(addr(bqb[2]))
+        let ap = unsafe(addr(xa[0]))
         var cp = unsafe(addr(oc[0]))
         tmm2d_q8u_f32(8u, 16u, 2u, tqu, sp, wp, ap, 64u, cp, 16u, 64u, 2u, gl_LocalInvocationIndex)
     }
 
     [metal_kernel(name="tmm_q8uh_msl"), marker(no_coverage)]
     def tmm_q8uh_k {
-        var sp = unsafe(addr(bsh[0]))
-        var wp = unsafe(addr(bqb[2]))
-        var ap = unsafe(addr(xah[0]))
+        let sp = unsafe(addr(bsh[0]))
+        let wp = unsafe(addr(bqb[2]))
+        let ap = unsafe(addr(xah[0]))
         var cp = unsafe(addr(oc[0]))
         tmm2d_q8u_f32(8u, 16u, 2u, tqu, sp, wp, ap, 64u, cp, 16u, 64u, 2u, gl_LocalInvocationIndex)
     }
@@ -286,9 +286,7 @@ let NCELL = 9
 // cell index -> the K width it runs: cells 0-3 are bk = 64 and 4-7 bk = 128, both over
 // 32/64/96/128 (so each bk meets a full 64-deep walk, a bare 32-deep tail, and both together);
 // the last cell is the deva 72-half tile, which is a kk = 64 shape by construction
-def private cell_kk(ci : int) : uint {
-    return ci == NCELL - 1 ? 64u : 32u * uint(ci % 4 + 1)
-}
+def private cell_kk(ci : int) : uint => ci == NCELL - 1 ? 64u : 32u * uint(ci % 4 + 1)
 
 class TmmBkKernels {
     @ssbo @binding = 0 xah : array<float16>   // A: M x KMAX f16 activations, row stride KMAX
@@ -303,18 +301,18 @@ class TmmBkKernels {
 
     [metal_kernel(name="tmm_bk64_msl"), marker(no_coverage)]
     def tmm_bk64_k {
-        var sp = unsafe(addr(bsh[0]))
-        var wp = unsafe(addr(bqb[2]))
-        var ap = unsafe(addr(xah[0]))
+        let sp = unsafe(addr(bsh[0]))
+        let wp = unsafe(addr(bqb[2]))
+        let ap = unsafe(addr(xah[0]))
         var cp = unsafe(addr(oc[0]))
         tmm2d_q8u_f32(8u, 16u, 2u, tq64, sp, wp, ap, 128u, cp, 16u, dims[0], dims[1], gl_LocalInvocationIndex, 64u)
     }
 
     [metal_kernel(name="tmm_bk128_msl"), marker(no_coverage)]
     def tmm_bk128_k {
-        var sp = unsafe(addr(bsh[0]))
-        var wp = unsafe(addr(bqb[2]))
-        var ap = unsafe(addr(xah[0]))
+        let sp = unsafe(addr(bsh[0]))
+        let wp = unsafe(addr(bqb[2]))
+        let ap = unsafe(addr(xah[0]))
         var cp = unsafe(addr(oc[0]))
         tmm2d_q8u_f32(8u, 16u, 2u, tq128, sp, wp, ap, 128u, cp, 16u, dims[0], dims[1], gl_LocalInvocationIndex, 128u)
     }
@@ -455,9 +453,7 @@ def test_tensor_ops(t : T?) { // nolint:STYLE038 - flat list of generated-source
         fill_oracle(oracle)
         gl_LocalInvocationID = uint3(0u, 0u, 0u)
         gl_WorkGroupSize = uint3(1u, 1u, 1u)   // width-1 replay: staging strides cover whole tiles
-        var want_bf : array<float>
-        var want_q8 : array<float>
-        var want_q8h : array<float>
+        var want_bf, want_q8, want_q8h : array<float>
         oracle->tmm_bf16_k()
         want_bf := oracle.oc
         oracle->tmm_q8_k()
@@ -679,7 +675,7 @@ def test_tmm2d_bk_shapes(t : T?) { // nolint:STYLE038 - one flat cell sweep over
                     let entry = deva ? tmm_deva72_msl_entry : (ci < 4 ? tmm_bk64_msl_entry : tmm_bk128_msl_entry)
                     let tgm = deva ? tmm_deva72_msl_tgmem : (ci < 4 ? tmm_bk64_msl_tgmem : tmm_bk128_msl_tgmem)
                     let kkv = cell_kk(ci)
-                    var dv : array<uint>
+                    var inscope dv : array<uint>
                     dv |> resize(2)
                     dv[0] = kkv
                     dv[1] = uint(LDWB)
@@ -700,7 +696,7 @@ def test_tmm2d_bk_shapes(t : T?) { // nolint:STYLE038 - one flat cell sweep over
                     let ran = run_compute_1d(queue, pso, bufs, tpg, tpg, rerr, tgm)
                     t |> success(ran, "dispatch {entry} kk={int(kkv)}: {rerr}")
                     if (ran) {
-                        var wref : array<float>
+                        var inscope wref : array<float>
                         wref |> resize(M * N)
                         for (i in range(M * N)) {
                             wref[i] = wants[ci * M * N + i]
@@ -796,9 +792,7 @@ def private fill_devab_oracle(var o : TmmDevabKernels?) {
 }
 
 //! the B element at output column 5, reduction step 44 - inside the second step's kk range
-def private devab_poison_index(natural : bool) : int {
-    return natural ? 44 * DV_LD + 5 : 5 * DV_LD + 44
-}
+def private devab_poison_index(natural : bool) : int => natural ? 44 * DV_LD + 5 : 5 * DV_LD + 44
 
 def private devab_replay(var o : TmmDevabKernels?; natural : bool) : array<float> {
     if (natural) {
@@ -885,8 +879,7 @@ def test_tmm2d_devab(t : T?) { // nolint:STYLE038 - both flavors x clean/poisone
         fill_devab_oracle(oracle)
         gl_LocalInvocationID = uint3(0u, 0u, 0u)
         gl_WorkGroupSize = uint3(1u, 1u, 1u)
-        var want : array<array<float>>
-        var want_poisoned : array<array<float>>
+        var want, want_poisoned : array<array<float>>
         var wh_poisoned : array<array<float16>>
         want |> reserve(2)
         want_poisoned |> reserve(2)
@@ -894,9 +887,9 @@ def test_tmm2d_devab(t : T?) { // nolint:STYLE038 - both flavors x clean/poisone
         for (fl in range(2)) {
             let natural = fl == 1
             want |> emplace(devab_replay(oracle, natural))
-            var whp := oracle.wh
+            var inscope whp := oracle.wh
             whp[devab_poison_index(natural)] = float16(60.0)
-            var clean <- oracle.wh
+            var inscope clean <- oracle.wh
             oracle.wh <- whp
             want_poisoned |> emplace(devab_replay(oracle, natural))
             wh_poisoned |> emplace(oracle.wh)
@@ -932,10 +925,10 @@ def test_tmm2d_devab(t : T?) { // nolint:STYLE038 - both flavors x clean/poisone
                     let src = fl == 1 ? tmm_devabnt_msl : tmm_devab_msl
                     let entry = fl == 1 ? tmm_devabnt_msl_entry : tmm_devab_msl_entry
                     var bwh = buf_upload(dev, oracle.wh)
-                    let got <- devab_gpu(t, dev, queue, src, entry, bxah, bwh, bdims)
+                    var inscope got <- devab_gpu(t, dev, queue, src, entry, bxah, bwh, bdims)
                     metal_release(bwh)
                     var bwhp = buf_upload(dev, wh_poisoned[fl])
-                    let gotp <- devab_gpu(t, dev, queue, src, entry, bxah, bwhp, bdims)
+                    var inscope gotp <- devab_gpu(t, dev, queue, src, entry, bxah, bwhp, bdims)
                     metal_release(bwhp)
                     if (length(got) != M * N || length(gotp) != M * N) {
                         gpu_bad++

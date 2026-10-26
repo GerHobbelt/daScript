@@ -21,60 +21,23 @@ add_custom_target(check_dasgen
     COMMENT "Checking generated builtin .inc files are up to date (dasgen)"
 )
 
-# The lint gate's -P script; configure emits it into the build dir.
-set(_das_changed_files_fn [==[
-function(das_ci_changed_files out base_ref)
-    execute_process(
-        COMMAND git diff --name-only --diff-filter=AM "origin/${base_ref}...HEAD" -- ${ARGN}
-        WORKING_DIRECTORY "${DAS_ROOT}"
-        OUTPUT_VARIABLE _files
-        RESULT_VARIABLE _rc
-        OUTPUT_STRIP_TRAILING_WHITESPACE)
-    if(NOT _rc EQUAL 0)
-        message(FATAL_ERROR "git diff against origin/${base_ref} failed (${_rc})")
-    endif()
-    string(REPLACE "\n" ";" _files "${_files}")
-    set(${out} "${_files}" PARENT_SCOPE)
-endfunction()
-]==])
-
-set(DAS_LINT_CHANGED_SCRIPT ${CMAKE_BINARY_DIR}/das_lint_changed.cmake)
-file(WRITE ${DAS_LINT_CHANGED_SCRIPT} "${_das_changed_files_fn}" [==[
-if(NOT BASE_REF)
-    set(BASE_REF "$ENV{DAS_CI_BASE_REF}")
-endif()
-if(NOT BASE_REF)
-    set(BASE_REF master)
-endif()
-das_ci_changed_files(_changed "${BASE_REF}" "*.das" "*.md")
-if(NOT _changed)
-    message(STATUS "no .das or .md files changed; skipping lint")
-    return()
-endif()
-message(STATUS "linting: ${_changed}")
-execute_process(
-    COMMAND "${DASLANG}" ./utils/lint/main.das -- ${_changed} --quiet --disable LINT019
-    WORKING_DIRECTORY "${DAS_ROOT}"
-    RESULT_VARIABLE _rc)
-if(NOT _rc EQUAL 0)
-    message(FATAL_ERROR "lint reported findings (${_rc})")
-endif()
-]==])
-
-add_das_target(check_lint_changed
-    COMMAND ${CMAKE_COMMAND} -DDAS_ROOT=${PROJECT_SOURCE_DIR} -DDASLANG=$<TARGET_FILE:daslang>
-            -P ${DAS_LINT_CHANGED_SCRIPT}
-    DEPENDS daslang
-    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-    COMMENT "Linting the .das and .md files changed against origin/DAS_CI_BASE_REF"
-)
-add_custom_target(check_lint_tree
-    COMMAND $<TARGET_FILE:daslang> ./utils/lint/main.das -- daslib utils modules tutorials examples tests src
-            -q --silent -j 1
-    DEPENDS daslang
-    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-    COMMENT "Linting the whole tree in one process"
-)
+# check_lint_tree lints DAS_CHUNKS of the tree in parallel. LINT019 needs every compile's nolint
+set(_lint_roots daslib utils modules tutorials examples tests src)
+list(TRANSFORM _lint_roots PREPEND "${PROJECT_SOURCE_DIR}/" OUTPUT_VARIABLE _lint_globs)
+list(TRANSFORM _lint_globs APPEND "/*.das")
+file(GLOB_RECURSE _lint_files RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS ${_lint_globs})
+list(FILTER _lint_files EXCLUDE REGEX "(^|/)(\\.[^/]*|node_modules|_[^/]*)(/|$)")
+list(LENGTH _lint_files _lint_count)
+math(EXPR _lint_size "(${_lint_count} + 127) / 128")
+DAS_CHUNKS(_lint_chunks ${_lint_size} ${_lint_files})
+set(_lint_targets)
+foreach(_n ${_lint_chunks})
+    add_custom_target(lint_tree_chunk_${_n}
+        COMMAND $<TARGET_FILE:daslang> ./utils/lint/main.das -- ${_lint_chunks_${_n}} -q --silent
+        DEPENDS daslang WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    list(APPEND _lint_targets lint_tree_chunk_${_n})
+endforeach()
+add_custom_target(check_lint_tree DEPENDS ${_lint_targets})
 
 set(_dupe_paths -p daslib -p utils -p src)
 file(GLOB _dupe_entries LIST_DIRECTORIES true RELATIVE ${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/modules/*/*)
@@ -360,19 +323,23 @@ foreach(util_path ${DAS_UTILS})
 endforeach()
 add_dependencies(all_utils_exe dastest_exe)
 
-# Single-config generators only: UTIL_BIN_DIR embeds CMAKE_CFG_INTDIR on
-# multi-config, which install() cannot resolve — and release bundles are cut on
-# single-config (Ninja) lanes. Each shipped tool's decision is recorded in that
-# tool's README.md, where utils/REVIEW.das reads it.
-if(NOT _DAS_UTILS_MULTI_CONFIG)
-    set(DAS_UTILS_SHIPPED_EXES lint daspkg dascov detect-dupe das-fmt dastest)
-    if(NOT DAS_SQLITE_DISABLED)
-        list(APPEND DAS_UTILS_SHIPPED_EXES benchctl)   # same gate on DAS_UTILS above
-    endif()
-    foreach(util ${DAS_UTILS_SHIPPED_EXES})
-        install(PROGRAMS ${UTIL_BIN_DIR}/${util}.exe DESTINATION ${DAS_INSTALL_BINDIR})
-    endforeach()
+# UTIL_BIN_DIR embeds CMAKE_CFG_INTDIR on multi-config generators, which install()
+# cannot resolve, so the install rule spells the configuration as $<CONFIG> there:
+# `cmake --install build --config Release` from a Visual Studio tree ships the same
+# exes the single-config (Ninja) release lanes do. Each shipped tool's decision is
+# recorded in that tool's README.md, where utils/REVIEW.das reads it.
+if(_DAS_UTILS_MULTI_CONFIG)
+    set(_DAS_UTILS_INSTALL_BIN_DIR ${PROJECT_SOURCE_DIR}/bin/$<CONFIG>)
+else()
+    set(_DAS_UTILS_INSTALL_BIN_DIR ${UTIL_BIN_DIR})
 endif()
+set(DAS_UTILS_SHIPPED_EXES lint daspkg dascov detect-dupe das-fmt dastest)
+if(NOT DAS_SQLITE_DISABLED)
+    list(APPEND DAS_UTILS_SHIPPED_EXES benchctl)   # same gate on DAS_UTILS above
+endif()
+foreach(util ${DAS_UTILS_SHIPPED_EXES})
+    install(PROGRAMS ${_DAS_UTILS_INSTALL_BIN_DIR}/${util}.exe DESTINATION ${DAS_INSTALL_BINDIR})
+endforeach()
 
 # Prewarm the JIT dll cache for the whole test tree, except module-gated folders and gc
 # (mirrors tests/.das_test: gc stays interp-only under -jit — heap_collect can't see

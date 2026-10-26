@@ -479,7 +479,7 @@ class ValidateShaderVisitor : AstVisitor {
         if (t.baseType == Type.tFloat3) { return ShaderPinType.Float3; }
         if (t.baseType == Type.tFloat4) { return ShaderPinType.Float4; }
         if (t.baseType == Type.tStructure) {
-            var st = t.structType
+            let st = t.structType
             if (st != null && st.name == "Sampler2D" && st._module != null && st._module.name == PRIMITIVES_MODULE_NAME) {
                 return ShaderPinType.Texture2D
             }
@@ -504,7 +504,7 @@ class ValidateShaderVisitor : AstVisitor {
             // The branchless backend treats it as a float 0/1 selector.
             pin._type = ShaderPinType.Float
         } elif (expr._type.baseType == Type.tStructure) {
-            var st = expr._type.structType
+            let st = expr._type.structType
             if (st.name == "Sampler2D" && st._module != null && st._module.name == PRIMITIVES_MODULE_NAME) {
                 pin._type = ShaderPinType.Texture2D
             } else {
@@ -602,9 +602,8 @@ class ValidateShaderVisitor : AstVisitor {
     }
 
 
-    def override canVisitFunctionArgumentInit(fun : Function?; arg : VariablePtr; value : ExpressionPtr) : bool {
-        return false
-    }
+    def override canVisitFunctionArgumentInit(fun : Function?; arg : VariablePtr; value : ExpressionPtr) : bool =>
+        false
 
     // Field access on I/O contract struct arguments: inp.uv, inp.worldPos, etc.
     // Any other field access remains an error.
@@ -725,9 +724,8 @@ class ValidateShaderVisitor : AstVisitor {
         register_node(decl.value, irNode)
     }
 
-    def override visitExprMakeStructField(expr : ExprMakeStruct?; index : int; var decl : MakeFieldDeclPtr; last : bool) : MakeFieldDeclPtr {
-        return <- decl
-    }
+    def override visitExprMakeStructField(expr : ExprMakeStruct?; index : int; var decl : MakeFieldDeclPtr; last : bool) : MakeFieldDeclPtr =>
+        <- decl
 
     def override visitExprMakeStruct(var expr : ExprMakeStruct?) : ExpressionPtr {
         if (!empty(makeStructStates)) {
@@ -1052,7 +1050,7 @@ class ValidateShaderVisitor : AstVisitor {
         if (expr.varFlags.argument) {
             // I/O contract struct arguments (PbrInput etc.) are accessed via ExprField — silently ignore
             if (expr.variable._type.baseType == Type.tStructure) {
-                var st = expr.variable._type.structType
+                let st = expr.variable._type.structType
                 if (st != null && st._module != null && st._module.name == PRIMITIVES_MODULE_NAME && st.name != "Sampler2D") {
                     return
                 }
@@ -1116,7 +1114,7 @@ class ValidateShaderVisitor : AstVisitor {
                     }
                 }
             } elif (arg._type.baseType == Type.tStructure) {
-                var st = arg._type.structType
+                let st = arg._type.structType
                 if (st.name == "Sampler2D" && st._module != null && st._module.name == PRIMITIVES_MODULE_NAME) {
                     prop._type = ShaderPropertyType.Texture2D
                     valid = true
@@ -1467,11 +1465,11 @@ def shader_build_ir(var func : FunctionPtr; var group : ModuleGroup; var errors 
                             continue
                         }
                         let x : void? = targetVar
-                        var y : void? = it
+                        let y : void? = it
                         if (x == y) {
                             for (it2, outPin in keys(astVisitor.nodeExitPins), values(astVisitor.nodeExitPins)) {
                                 let x2 : void? = initExpr
-                                var y2 : void? = it2
+                                let y2 : void? = it2
                                 if (x2 == y2) {
                                     toPin = outPin
                                     break
@@ -1497,8 +1495,7 @@ def shader_build_ir(var func : FunctionPtr; var group : ModuleGroup; var errors 
                 verify(node.inputs.length() == 1 && node.outputs.length() == 1)
                 let inPin = node.inputs[0]
                 let outPin = node.outputs[0]
-                var enters : array<IRPin?>
-                var exits : array<IRPin?>
+                var enters, exits : array<IRPin?>
                 for (link in astVisitor.links) {
                     if (link.toPin == inPin.id) {
                         enters.push(astVisitor.pins[link.fromPin])
@@ -1701,7 +1698,7 @@ class PixelShaderMacro : AstFunctionAnnotation {
         }
         // Cycle 1: flatten does ALL lowering — inline helper calls, if/else -> ?:,
         // unroll fixed loops. The [hint] primitives are kept (whitelist precedence).
-        var ctx = flatten_function(func, HINT_WHITELIST)
+        let ctx = flatten_function(func, HINT_WHITELIST)
         if (!ctx.ok) {
             errors := ctx.err
             return false
@@ -1711,9 +1708,8 @@ class PixelShaderMacro : AstFunctionAnnotation {
         return true
     }
     def override finish(var func : FunctionPtr; var group : ModuleGroup;
-                        var args : AnnotationArgumentList; progArgs : AnnotationArgumentList; var errors : das_string) : bool {
-        return shader_build_ir(func, group, errors, "pixel")
-    }
+                        var args : AnnotationArgumentList; progArgs : AnnotationArgumentList; var errors : das_string) : bool =>
+                            shader_build_ir(func, group, errors, "pixel")
 }
 
 

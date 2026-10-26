@@ -19,13 +19,10 @@ require daslib/strings_boost
 // (HOME, PROCESSOR_IDENTIFIER, ...). Same set-but-empty-is-unset rule as the loaders. Not for
 // hot paths, and a LITERAL knob name through these must still be declared in the registry.
 
-def public env_is_set(name : string) : bool {
-    return has_env_variable(name) && !empty(get_env_variable(name))
-}
+def public env_is_set(name : string) : bool =>
+    has_env_variable(name) && !empty(get_env_variable(name))
 
-def public env_value_of(name : string) : string {
-    return get_env_variable(name)
-}
+def public env_value_of(name : string) : string => get_env_variable(name)
 
 //! A hand-written doc row for knobs no struct field can tell the truth about (compile-time
 //! constants, foreign variables) — appended to a section after its `write_env_info_rows`.
@@ -92,7 +89,7 @@ def public push_info_names(var out : array<string>; info : CommandInfo) {
 //! The generator-driver body: write the rendered doc, log the outcome. Callers pass an
 //! absolute path (usually `{get_das_root()}/...`).
 def public save_generated_doc(path, body : string) : bool {
-    var f = fopen(path, "wb")
+    let f = fopen(path, "wb")
     if (f == null) {
         to_log(LOG_ERROR, "env_registry: cannot write {path}\n")
         return false
@@ -270,7 +267,7 @@ def public env_undocumented_rows(md : string) : array<string> {
     var undocumented : array<string>
     for (line in split(md, "\n")) {
         continue if (!starts_with(line, "| `"))
-        var cols <- split(line, "|")
+        var inscope cols <- split(line, "|")
         if (length(cols) >= 5 && empty(strip(cols[4]))) {
             undocumented |> push(strip(cols[1]))
         }

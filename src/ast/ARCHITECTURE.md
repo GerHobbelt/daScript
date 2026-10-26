@@ -1,8 +1,8 @@
 # src/ast - the front end's AST
 
-Contract: `ARCHITECTURE_COMMON.md` (repo root). This document carries the mechanisms of this
-folder that a rule cites; `ARCHITECTURE_INFER.md` carries the inference mechanisms code cites,
-`ARCHITECTURE_BUILT.md` the programs a host builds from AST nodes, `ARCHITECTURE_GC.md` gc roots.
+Contract: `ARCHITECTURE_COMMON.md` (repo root). This document carries the mechanisms of this folder
+that a rule cites; `ARCHITECTURE_INFER.md` the inference mechanisms code cites, `ARCHITECTURE_BUILT.md`
+host-built programs, `ARCHITECTURE_GC.md` gc roots, `ARCHITECTURE_SHARED.md` shared-module promotion.
 The rest of inference, with parsing and simulation, is in `skills/internal/cpp_codebase_notes.md` (repo-only).
 
 ## 1. The module-cache read in `trySerializeProgramModule` (`ast_parse.cpp`) {#module-cache-read}
@@ -61,8 +61,8 @@ sites would fail to resolve (or, for a binder, find no proxy).
 A builtin module's embedded source (`compileBuiltinModule`, the `unit_test.das` of `UnitTest`)
 compiles with the stream hidden: its program is never read from or written to the cache. That
 compile runs inside the module's constructor, and every record pins each builtin module it
-references by the module's cumulative hash, the chain over the mangled names of the builtin
-functions added to it. With the stream visible the embedded program was a record like any other,
+references by the module's cumulative hash, a sum over the functions, globals and types it
+binds. With the stream visible the embedded program was a record like any other,
 written by a cold run and served by a warm one, and the module's hash then differed between the
 two kinds of run - so every record naming the module failed its read on the other kind, the
 entry program's included, and the hash-drift resume reparsed each of them on every start.
@@ -173,7 +173,7 @@ build has over a target that does not resolve is the ordinary missing-module err
 falls back to the target's own resolvability: a module's source directory sits in every checkout
 whatever the build configured. A load adds
 nothing to `$`: a module-cache record carries each builtin module's cumulative hash of
-mangled names, and a process that loaded a different set of C++ modules would otherwise fail
+its content, and a process that loaded a different set of C++ modules would otherwise fail
 every record on `$`, so a `vector<T>` of a handled element registers into the element's
 module (`vectorHomeModule`, `ast_handle.h`) whichever module builds it - a module that exists
 already, when the element is another module's - and only a vector of a builtin element lands

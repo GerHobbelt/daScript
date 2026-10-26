@@ -64,13 +64,16 @@ def public lib_prefix_from_path(input : string) : string {
 }
 
 
-def public export_c_name_override(fn : Function?) : string {
+let private EXPORT_SEPARATOR = "// ================================================================================================="
+
+
+def private export_c_string_arg(fn : Function?; key : string) : string {
     for (ann in fn.annotations) {
         if (ann.annotation.name != "export_c") {
             continue
         }
         for (arg in ann.arguments) {
-            if (arg.name == "name" && arg.basicType == Type.tString) {
+            if (arg.name == key && arg.basicType == Type.tString) {
                 return string(arg.sValue)
             }
         }
@@ -79,14 +82,27 @@ def public export_c_name_override(fn : Function?) : string {
 }
 
 
-def public has_export_c_annotation(var fn : Function?) : bool {
-    return (fn |> find_annotation("export_c")) != null
+def public export_c_name_override(fn : Function?) : string => export_c_string_arg(fn, "name")
+
+
+def private export_c_comment(fn : Function?) : string => export_c_string_arg(fn, "comment") |> unescape()
+
+
+def private write_comment_lines(var writer : StringBuilderWriter; text : string) {
+    if (text |> empty()) {
+        return
+    }
+    for (line in text |> split("\n")) {
+        write(writer, "// {line}\n")
+    }
 }
 
 
-def private aotFunctionName(str : string) {
-    return replace(str, "`", "__")
-}
+def public has_export_c_annotation(var fn : Function?) : bool =>
+    (fn |> find_annotation("export_c")) != null
+
+
+def private aotFunctionName(str : string) => replace(str, "`", "__")
 
 def public standalone_function_name(fn : Function?) : string {
     let renamed = fn |> export_c_name_override()
@@ -123,14 +139,12 @@ struct CVector {
 }
 
 
-def private is_unsigned_type(t : Type) : bool {
-    return t == Type.tUInt || t == Type.tUInt8 || t == Type.tUInt16 || t == Type.tUInt64
-}
+def private is_unsigned_type(t : Type) : bool =>
+    t == Type.tUInt || t == Type.tUInt8 || t == Type.tUInt16 || t == Type.tUInt64
 
 
-def private c_int_name(is_signed : bool; bytes : int) : string {
-    return "{is_signed ? "" : "u"}int{bytes * 8}_t"
-}
+def private c_int_name(is_signed : bool; bytes : int) : string =>
+    "{is_signed ? "" : "u"}int{bytes * 8}_t"
 
 
 def private scalar_of(t : TypeDeclPtr) : string {
@@ -178,9 +192,8 @@ let VEC_LANE_NAMES <- ["x", "y", "z", "w"]
 let SPAN_LANE_NAMES <- ["from", "to"]
 
 
-def private vector_field_names(v : CVector) : array<string> {
-    return [for (i in range(v.lanes)); v.span ? SPAN_LANE_NAMES[i] : VEC_LANE_NAMES[i]]
-}
+def private vector_field_names(v : CVector) : array<string> =>
+    [for (i in range(v.lanes)); v.span ? SPAN_LANE_NAMES[i] : VEC_LANE_NAMES[i]]
 
 
 struct public CNames {
@@ -189,7 +202,7 @@ struct public CNames {
 }
 
 
-def private c_type_name(names : CNames; var owner : Module?; name : das_string) : string {
+def private c_type_name(names : CNames; owner : Module?; name : das_string) : string {
     if (owner == null || owner == names.this_module || owner.name |> empty()) {
         return "{names.prefix}_{c_ident_part(string(name))}"
     }
@@ -205,9 +218,8 @@ def private peel(var t : TypeDeclPtr) : TypeDeclPtr {
 }
 
 
-def private is_pod_struct(var st : Structure?) : bool {
-    return st != null && !st.flags.isClass && !(st.fields |> empty())
-}
+def private is_pod_struct(st : Structure?) : bool =>
+    st != null && !st.flags.isClass && !(st.fields |> empty())
 
 
 def private pointee_ok(var t : TypeDeclPtr) : bool {
@@ -395,6 +407,7 @@ struct public CExport {
     @do_not_delete fn : Function?
     c_name : string
     das_signature : string
+    comment : string
     params : array<CParam>
     result : CResult
 }
@@ -433,9 +446,8 @@ def private describe_params(var fn : Function?; names : CNames; var out : array<
 }
 
 
-def private returns_cmres(var fn : Function?) : bool {
-    return fn.flags.copyOnReturn || fn.flags.moveOnReturn
-}
+def private returns_cmres(fn : Function?) : bool =>
+    fn.flags.copyOnReturn || fn.flags.moveOnReturn
 
 
 def public describe_c_signature(var fn : Function?; names : CNames; c_name : string) : tuple<exp : CExport; reject : CReject> {
@@ -450,7 +462,7 @@ def public describe_c_signature(var fn : Function?; names : CNames; c_name : str
     }
     let res = CResult(c_type = rt.spelling, via_out = rt.by_pointer, cmres = returns_cmres(fn))
     return (exp = CExport(fn = fn, c_name = c_name, das_signature = das_signature_of(fn),
-        params <- params, result = res), reject = CReject(ok = true))
+        comment = export_c_comment(fn), params <- params, result = res), reject = CReject(ok = true))
 }
 
 
@@ -797,15 +809,15 @@ def private write_c_section(var writer : StringBuilderWriter; var exports : arra
     for (st in types.structs) {
         write_struct(writer, st, names)
     }
-    write(writer, "\n")
+    write(writer, "\n\n{EXPORT_SEPARATOR}\n")
     for (e in exports) {
-        write(writer, "\n// {e.das_signature}\n{c_declaration(e, names)};\n")
+        write(writer, "\n")
+        write_comment_lines(writer, e.comment)
+        write(writer, "// {e.das_signature}\n{c_declaration(e, names)};\n")
     }
     if (!(link_note |> empty())) {
         write(writer, "\n// Linking:\n")
-        for (line in link_note |> split("\n")) {
-            write(writer, "// {line}\n")
-        }
+        write_comment_lines(writer, link_note)
     }
     write(writer, "\n#ifdef __cplusplus\n\} // extern \"C\"\n#endif\n")
 }
@@ -935,7 +947,7 @@ struct public DasBindings {
 }
 
 
-def private das_scalar_of(var t : TypeDeclPtr) : string {
+def private das_scalar_of(t : TypeDeclPtr) : string {
     if (t.isBool) {
         return "bool"
     }
@@ -1037,7 +1049,7 @@ def private dasbind_can_wrap(float_at : array<bool>) : bool {
 
 def private das_extern_signature(var e : CExport; names : CNames) : tuple<sig : string; why : string> {
     var fn = e.fn
-    var args = ["ctx : void?"]
+    var args = ["ctx : {names.prefix}_ctx?"]
     var float_at = [false]
     args |> reserve(length(e.params) + 2)
     for (pp, variable in e.params, fn.arguments) {
@@ -1086,6 +1098,7 @@ def public build_das_bindings(var exports : array<CExport>; names : CNames; b : 
     return build_string() $(var writer) {
         write(writer, "options gen2\n\n// Code generated by `{generated_by}`. DO NOT EDIT.\n\n")
         write(writer, "require dasbind public\n\n")
+        write(writer, "// One library instance; only the library reads it.\nstruct {p}_ctx \{\}\n\n")
         for (st in types.structs) {
             if (!das_struct_ok(st, names)) {
                 continue
@@ -1096,16 +1109,22 @@ def public build_das_bindings(var exports : array<CExport>; names : CNames; b : 
             }
             write(writer, "\}\n\n")
         }
-        write_extern(writer, b, "{p}_create", "{p}_create() : void?")
-        write_extern(writer, b, "{p}_destroy", "{p}_destroy(ctx : void?) : void")
-        write_extern(writer, b, "{p}_last_error", "{p}_last_error(ctx : void?) : string")
+        write(writer, "// Creates an instance and runs its initializers; null when they raised.\n")
+        write_extern(writer, b, "{p}_create", "{p}_create() : {p}_ctx?")
+        write(writer, "// Runs the [finalize] functions, then frees the instance and everything it returned.\n")
+        write_extern(writer, b, "{p}_destroy", "{p}_destroy(ctx : {p}_ctx?) : void")
+        write(writer, "// The last call's exception text, or \"\" when it completed normally; null ctx reads a failed create.\n")
+        write_extern(writer, b, "{p}_last_error", "{p}_last_error(ctx : {p}_ctx?) : string")
+        write(writer, "// Drains the daslang runtime for the whole process; no library may be used afterwards.\n")
         write_extern(writer, b, "{p}_shutdown_runtime", "{p}_shutdown_runtime() : void")
+        write(writer, "{EXPORT_SEPARATOR}\n\n")
         for (e in exports) {
             let spelled = das_extern_signature(e, names)
             if (spelled.sig |> empty()) {
                 write(writer, "// {e.c_name} is declared in the C header only: {spelled.why}\n\n")
                 continue
             }
+            write_comment_lines(writer, e.comment)
             write(writer, "// das: {e.das_signature}\n")
             write_extern(writer, b, e.c_name, spelled.sig)
         }

@@ -31,19 +31,31 @@ def rope_tab_ref(var v : array<float>; base, hs, rot, n : int; neox : bool; tcos
     }
 }
 
+//! the vision stems' 2-axis position add over `npos` rows of `x`, `dim` wide, on a grid `ncols` wide: row p plus the x-table row
+//! p % ncols, then the y-table row p / ncols, the y rows `pos_entries` rows into `tbl` - the engine's (row + ex) + ey order
+def pos_add_2d_ref(x, tbl : array<float>; npos, dim, ncols, pos_entries : int) : array<float> {
+    var want : array<float>
+    want |> resize(npos * dim)
+    for (p in range(npos)) {
+        for (i in range(dim)) {
+            let ex = tbl[(p % ncols) * dim + i]
+            let ey = tbl[(pos_entries + p / ncols) * dim + i]
+            want[p * dim + i] = (x[p * dim + i] + ex) + ey
+        }
+    }
+    return <- want
+}
+
 //! the attention cells' query element `i`: (i * 5) % 11 - 5 eighths
 def attn_q_val(i : int) : float => float((i * 5) % 11 - 5) * 0.125
 
 //! `n` query elements, `attn_q_val` of 0 .. n - 1
-def attn_q_row(n : int) : array<float> {
-    return <- [for (i in range(n)); attn_q_val(i)]
-}
+def attn_q_row(n : int) : array<float> => <- [for (i in range(n)); attn_q_val(i)]
 
 //! The padded-CSR prefix of a MoE route: each expert's row count, its rows' base on the 32-row tile lattice, and `pad`, the
 //! padded total past the last expert.
 def padded_bases(counts : array<int>) : tuple<cnt : array<uint>; base : array<uint>; pad : int> {
-    var cnt : array<uint>
-    var base : array<uint>
+    var cnt, base : array<uint>
     cnt |> reserve(length(counts))
     base |> reserve(length(counts))
     var pad = 0
@@ -168,10 +180,9 @@ def ffn_expert_ref(w1, w3, w2, x : array<float>; m, n, nfe, r1, r3, r2 : int; ro
     var h : array<float>
     h |> reserve(m * nfe)
     for (r in range(m)) {
-        var hr <- [for (i in range(nfe)); silu_f32(g.want[r * nfe + i]) * u.want[r * nfe + i]]
+        var inscope hr <- [for (i in range(nfe)); silu_f32(g.want[r * nfe + i]) * u.want[r * nfe + i]]
         invoke(round_h, hr)
         h |> push_from(hr)
-        delete hr
     }
     var y <- plane_rows_ref(w2, h, m, nfe, n, r2)
     var out <- y.want
@@ -222,4 +233,30 @@ def q8_blocks_off(oq : array<int8>; os : array<float>; a : array<float>; nblk : 
         }
     }
     return off
+}
+
+//! The front convs' CPU form on an image odd along one axis and even along the other, so each edge drops its own taps:
+//! the first conv off one channel (FIRST) with its bias and ReLU (RELU), or the depthwise conv with its bias, the rows
+//! past `valid` masked off. Bar: nine f16-exact products summed in f32 against the same order.
+def dw_s2_front_ref(first, relu : bool; iw, ch, oh, ow, valid : int; xv, wv, bv : array<float>) : array<float> {
+    var want : array<float>
+    want |> resize(oh * ow * ch)
+    for (oy in range(oh)) {
+        for (ox in range(ow)) {
+            for (c in range(ch)) {
+                var acc = relu ? 0.0 : bv[c]
+                for (kh in range(3)) {
+                    for (kw in range(3)) {
+                        let iy = oy * 2 - 1 + kh
+                        let ix = ox * 2 - 1 + kw
+                        if (iy >= 0 && iy < valid && ix >= 0 && ix < iw) {
+                            acc += wv[(kh * 3 + kw) * ch + c] * xv[first ? iy * iw + ix : (iy * iw + ix) * ch + c]
+                        }
+                    }
+                }
+                want[(oy * ow + ox) * ch + c] = relu ? max(acc + bv[c], 0.0) : acc
+            }
+        }
+    }
+    return <- want
 }

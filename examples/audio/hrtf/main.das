@@ -74,13 +74,10 @@ var cursor_captured = false
 var last_mouse_x = 0.0
 var last_mouse_y = 0.0
 
-def camera_forward() : float3 {
-    return normalize(float3(cos(camera_yaw) * cos(camera_pitch), sin(camera_pitch), sin(camera_yaw) * cos(camera_pitch)))
-}
+def camera_forward() : float3 =>
+    normalize(float3(cos(camera_yaw) * cos(camera_pitch), sin(camera_pitch), sin(camera_yaw) * cos(camera_pitch)))
 
-def camera_right() : float3 {
-    return normalize(cross(camera_forward(), float3(0.0, 1.0, 0.0)))
-}
+def camera_right() : float3 => normalize(cross(camera_forward(), float3(0.0, 1.0, 0.0)))
 
 // -- Sound sources --
 
@@ -152,7 +149,7 @@ def draw_grid(line_program : uint; view, proj : float4x4) {
 
 def load_sound_data() {
     let fname = "{get_das_root()}/examples/media/audio/music.wav"
-    var f = fopen(fname, "rb")
+    let f = fopen(fname, "rb")
     if (f == null) {
         // Fallback: generate a 440Hz sine tone
         delete sound_data
@@ -171,9 +168,7 @@ def load_sound_data() {
 // Audio uses XY horizontal + Z elevation; OpenGL uses XZ horizontal + Y up
 // Audio uses XY horizontal + Z elevation; OpenGL uses XZ horizontal + Y up
 // Audio: -Y = forward, +X = right.  OpenGL: -Z = forward, +X = right.
-def gl_to_audio(p : float3) : float3 {
-    return float3(p.x, p.z, p.y)
-}
+def gl_to_audio(p : float3) : float3 => float3(p.x, p.z, p.y)
 
 def add_sound_source(pos : float3; volume : float = 1.0) {
     let idx = length(sources) % 5

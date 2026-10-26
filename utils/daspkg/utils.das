@@ -370,9 +370,8 @@ def gitignore_remove(root, pattern : string) {
 // a package is its files, not its history or its build residue: .git costs more than
 // the rest of the tree, and a copied build dir (_build or build) carries a CMakeCache
 // pointing at the source path, which aborts the installed package's own configure
-def private is_package_content(name : string) : bool {
-    return name != "." && name != ".." && name != ".git" && name != "_build" && name != "build"
-}
+def private is_package_content(name : string) : bool =>
+    name != "." && name != ".." && name != ".git" && name != "_build" && name != "build"
 
 // streamed through a fixed window: sizing a buffer by the file costs that file in
 // memory, and panics outright on one past max_unreserved_size
@@ -412,20 +411,27 @@ def private copy_file_bytes(src, dst : string) : bool {
     return ok
 }
 
-def copy_dir_rec(src, dst : string) : bool {
+//! Copy the package content of `src` into `dst`; `whole_tree` also copies `.git` and the build dirs.
+def copy_dir_rec(src, dst : string; whole_tree : bool = false) : bool {
     mkdir(dst)
     var ok = true
     dir(src) $(name) {
-        return if (!is_package_content(name))
+        return if (name == "." || name == ".." || (!whole_tree && !is_package_content(name)))
         let src_child = "{src}/{name}"
         let dst_child = "{dst}/{name}"
         // never follow a junction/symlink: one into the tree recurses forever, and one
         // out of it copies content that is not the package's
         var link_err : string
-        return if (is_reparse_point(src_child, link_err))
+        if (is_reparse_point(src_child, link_err)) {
+            if (whole_tree) {
+                to_log(LOG_ERROR, "Error: {src_child} is a link; a whole-tree copy does not reproduce links\n")
+                ok = false
+            }
+            return
+        }
         let st = stat(src_child)
         if (st.is_dir) {
-            if (!copy_dir_rec(src_child, dst_child)) {
+            if (!copy_dir_rec(src_child, dst_child, whole_tree)) {
                 ok = false
             }
         } elif (st.is_reg) {

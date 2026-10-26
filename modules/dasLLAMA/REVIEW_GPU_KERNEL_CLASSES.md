@@ -37,16 +37,17 @@ a module `let` in the body - never a module `var`.**
 **A stamp sets only `@template_constant`s its own compiled body reads: a `static_if` arm, a
 `@template_gate`, an expression, a loop bound, an array extent.** A constant
 no such site reads is a defect - move it to the template whose body reads it, or make the body
-read it.
+read it. A read that sits only inside a `static_if` arm the stamp's own constants compile out is
+not a read.
 
 **A diff that changes a class body, a class template, a base shell, or a helper a stamp's body
-splices carries in the PR body, for every stamp built from what it changed, that stamp's
-generated source diffed against the pre-change tree (the `*_msl` global, or a disassembly diff
-of the `.spv` files `DASLLAMA_VK_SPV_DUMP=<dir>` writes).**
+splices diffs, for every stamp built from what it changed, that stamp's generated source against
+the pre-change tree's (the files `DASLLAMA_METAL_MSL_DUMP=<dir>` writes, or a disassembly diff of the
+`.spv` files `DASLLAMA_VK_SPV_DUMP=<dir>` writes), and its PR body names each stamp with the kind of
+difference read there - never the source text.**
 
-**Each generated-source diff a PR body carries for a changed stamp takes only one of these forms:
-an empty diff; a difference confined to whitespace, scoping braces, parentheses or identifier names,
-with every changed line paired against its pre-change line in the PR body; the expression text
+**The kind a PR body names for a changed stamp is one of these: no difference; a difference
+confined to whitespace, scoping braces, parentheses or identifier names; the expression text
 unchanged, moved into a named helper the stamp now calls; the difference named with the
 compile-time choice that carries it; or the behaviour change named with the test cell that pins
 it.**
@@ -64,6 +65,10 @@ writes any field declared on it - fields in the stamp or in the shell may share 
 shell they derive from, gives the class a `//!` line above its `[metal_dispatch]` /
 `[vk_dispatch]` declaration naming the body difference that keeps it out of that template or
 shell.**
+
+**A diff that moves a standalone kernel class onto a template both homes stamp
+(`dasllama/dasllama_gpu_kernels_common.das`) gives the class a `//!` line above its declaration
+naming the template it joined.**
 
 **A diff that adds or changes a `[metal_dispatch]` / `[vk_dispatch]` binding that no site writes
 after arming - a binding filled before the first encode and never written again - puts

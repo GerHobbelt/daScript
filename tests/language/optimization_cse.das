@@ -148,7 +148,7 @@ def target_swizzle(v : float3) : float {
 def target_alias(x : int) : int {
     var y = x + 1
     let a = y * 3
-    var p = unsafe(addr(y)) // addr() disqualifies y as a leaf
+    let p = unsafe(addr(y)) // addr() disqualifies y as a leaf
     let b = y * 3           // must be recomputed
     return a + b + *p
 }
@@ -241,13 +241,9 @@ def target_pure_ref_read(arr : array<int>) : int {
     return length(arr) * 47 + n // pure by-ref read of a chain base reused
 }
 
-def has(s, sub : string) : bool {
-    return find(s, sub, 0) >= 0
-}
+def has(s, sub : string) : bool => find(s, sub, 0) >= 0
 
-def count_of(s, sub : string) : int {
-    return length(split(s, sub)) - 1
-}
+def count_of(s, sub : string) : int => length(split(s, sub)) - 1
 
 def body_of(t : T?; nm : string) : string {
     var body = ""

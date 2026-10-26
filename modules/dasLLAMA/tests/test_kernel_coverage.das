@@ -109,7 +109,7 @@ let private CENSUS_NEVER_DISPATCHED <- [
     // and the tensor mul_mm T/TH stamps compile only behind a box crown and dispatch only on
     // planes the zoo does not stock. Their coverage is the same kernel-unit gates plus the
     // tensor-twins/iq2xxs matrix row and the mint's METAL_TWIN race rows
-    "metal_kq_gemv_iq3s_f4", "metal_kq_gemv_iq3xxs_f4", "MetalKqGemvIq2xxsF4",
+    "metal_kq_gemv_iq3s_f4", "metal_kq_gemv_iq3xxs_f4", "MetalKqGemvIq2xxsF4", "metal_moe_gemv_iq3s_f4",
     "MetalKqMulMmIq4xsT", "MetalKqMulMmIq4xsTH", "MetalKqMulMmIq4nlT", "MetalKqMulMmIq4nlTH",
     "MetalKqMulMmK3T", "MetalKqMulMmK3TH", "MetalKqMulMmK2T", "MetalKqMulMmK2TH",
     "MetalKqMulMmIq3sT", "MetalKqMulMmIq3sTH", "MetalKqMulMmIq3xxsT", "MetalKqMulMmIq3xxsTH",
@@ -181,11 +181,6 @@ let private CENSUS_NEVER_DISPATCHED <- [
     // serves and this one never does. Its coverage is ew2_hx_gate(geglu = true, bounded = true) in
     // test_metal_misc_kernels.das
     "MetalGegluB",
-    // the transposed im2col: only a transposed conv whose channel count is off the GEMM's 8-run
-    // lattice takes it, and every stocked StyleTTS2 and Pocket transposed conv sits on the lattice,
-    // so the gathering CONV stamp serves. Its coverage is st2_im2col_gate(transposed = true) in
-    // test_metal_prefill_kernels.das
-    "metal_st2_im2col_tr",
     // the hyper-connection mixer, its scatter, the n-gram side input and the σ(z) deltanet gate
     // (qwen4exp): the one carrier is Qwen3.8-Flash-Next (94 GB, the large tier), which no census
     // row loads. Their coverage is the hc_*/ple_* gates in test_metal_misc_kernels.das and the
@@ -220,51 +215,50 @@ def private cov_model(t : T?; path, family : string; kdts : array<KVDtype>; nbs 
         let vocab = tr.config.vocab_size
         select_prefill_override("metal")
         select_decode_override("metal")
+        var batch_sessions : array<Session>       //! the batch's sessions, their handles and their picks, reused across the shapes
+        var sess : array<Session?>    //! borrowed handles into batch_sessions: cleared before batch_sessions goes, never deleted whole
+        var curs : array<int64>
         with_dasllama_jobque() {
             for (kdt in kdts) {
                 var s = make_run_state(tr.config, kdt, kdt)
                 // >= 256 rows: the half-X convert (CVT_MIN_ROWS), the tall M-tile stamps and
                 // the MoE gather engage only past their row floors — a short prompt leaves
                 // every one of those kernels undispatched and the census blind to them
-                let p <- encode(tr, counting_prompt(1, 140), true, false)
+                var inscope p <- encode(tr, counting_prompt(1, 140), true, false)
                 eval_(tr, s, p)
                 var cur = argmax_of(s.logits, vocab)
                 for (_i in range(2)) {
-                    var one <- [cur]
+                    var inscope one <- [cur]
                     eval_(tr, s, one)
-                    delete one
                     cur = argmax_of(s.logits, vocab)
                 }
                 // continuation prefill (start_pos > 0) — the pf window-landing utilities only
                 // serve when a second window lands on an already-warm cache
-                var p2 <- encode(tr, counting_prompt(50, 90), false, false)
+                var inscope p2 <- encode(tr, counting_prompt(50, 90), false, false)
                 eval_(tr, s, p2)
-                delete p2
                 delete s
                 for (nb in nbs) {
-                    var ss : array<Session>
-                    ss |> reserve(nb)
-                    var sess : array<Session?>
-                    var curs : array<int64>
+                    batch_sessions |> reserve(nb)
                     for (i in range(nb)) {
-                        ss |> emplace <| make_run_state(tr.config, kdt, kdt)
-                        let pb <- encode(tr, counting_prompt(3 + i, 44 + i), true, false)
-                        eval_(tr, ss[i], pb)
-                        sess |> push(unsafe(addr(ss[i])))
-                        curs |> push(argmax_of(ss[i].logits, vocab))
+                        batch_sessions |> emplace <| make_run_state(tr.config, kdt, kdt)
+                        var inscope pb <- encode(tr, counting_prompt(3 + i, 44 + i), true, false)
+                        eval_(tr, batch_sessions[i], pb)
+                        sess |> push(unsafe(addr(batch_sessions[i])))
+                        curs |> push(argmax_of(batch_sessions[i].logits, vocab))
                     }
                     var ws <- create_batch_workspace_(tr)
                     eval_batch_(tr, ws, sess, curs)
                     sess |> clear()   // borrowed handles — delete of array<T?> cascades to the pointees
-                    unsafe {
-                        delete ws
-                        delete sess
-                    }
-                    delete curs
-                    delete ss
+                    curs |> clear()
+                    delete ws
+                    delete batch_sessions
                 }
             }
         }
+        unsafe {
+            delete sess
+        }
+        delete curs
         select_prefill_override("")
         select_decode_override("")
         delete tr
@@ -698,6 +692,7 @@ def private cov_tower_gemma4uv(t : T?) {
 let private CENSUS_CROWN_CONDITIONAL : table<string; string> <- {
     "MetalKqMvB2K4R2" => "kq_mvb2_k4_r2",
     "metal_kq_gemv_iq3s_f4" => "kq_gemv_iq3s_f4",
+    "metal_moe_gemv_iq3s_f4" => "kq_gemv_iq3s_f4",
     "metal_kq_gemv_iq3xxs_f4" => "kq_gemv_iq3xxs_f4",
     "MetalKqGemvIq2xxsF4" => "kq_gemv_iq2xxs_f4",
     "MetalAttnQKDev128" => "attn_dev",
@@ -872,6 +867,15 @@ let private VK_CENSUS_NEVER_DISPATCHED <- [
     "tower_q3a_shuffle_cls_spv",
     // the LayerNorm + ReLU rows of the gemma4a subsample convs; its coverage is test_vkt_tower_front_movers
     "tower_ln_relu_cls_spv",
+    // the whisper-class projector tails' pair pool and swapped SwiGLU; their coverage is test_vkt_tower_tail_rows
+    "tower_pool_rows_cls_spv",
+    "tower_swiglu_swapped_cls_spv",
+    // parakeet's tap-major subsample depthwise conv2d; its coverage is test_vkt_tower_dw2d
+    "tower_pk_dw2d_cls_spv",
+    // the bias-less seam of parakeet's blocks; its coverage is test_vkt_tower_ln_rows
+    "tower_post_add_ln_nb_cls_spv",
+    // the whisper decoder's f16 K/V store; its coverage is test_vkt_wdec_classes
+    "tower_wdec_kv16_cls_spv",
     // canary's per-feature mel normalization; its coverage is test_vkt_tower_front_mel
     "tower_mel_norm_cls_spv",
     // canary's front depthwise conv; its coverage is test_vkt_tower_front_mel
@@ -899,12 +903,21 @@ let private VK_CENSUS_NEVER_DISPATCHED <- [
     // kernel coverage is test_vkt_tower_f16_feeds in test_vulkan_tower_kernels.das
     "tower_ln16_cls_spv", "tower_post_add_ln16_cls_spv", "tower_hpad_b_cls_spv", "tower_hpad16_b_cls_spv", "tower_hunpad16_cls_spv",
     "tower_bias_act_cvt16_cls_spv",
-    // the gemma4v tower's row classes (the clamps, feeds, the two-axis rope, the post-add and the GEGLU; its rms rows are hc_norm's): the stocked
-    // mmproj-gemma-4-E2B-it-bf16.gguf, dispatched by test_gemma4v_vulkan_twin in test_gemma4v.das - no zoo row; their kernel
-    // coverage is test_vkt_tower_rows in test_vulkan_tower_kernels.das (the clamp + halfword feed is no entry: it is the LLM
-    // prefill's f32 -> f16 rows too, which the zoo rows dispatch)
+    // the gemma4v tower's row classes (the clamps, feeds, the two-axis rope, the post-add, the GEGLU and the weighted rms the
+    // vision tails share): the stocked mmproj-gemma-4-E2B-it-bf16.gguf, dispatched by test_gemma4v_vulkan_twin in
+    // test_gemma4v.das - no zoo row; their kernel coverage is test_vkt_tower_rows in test_vulkan_tower_kernels.das (the clamp +
+    // halfword feed is no entry: it is the LLM prefill's f32 -> f16 rows too, which the zoo rows dispatch)
     "tower_clamp_cls_spv", "tower_clamp_rq_cls_spv", "tower_rope2d_cls_spv",
-    "tower_post_add_cls_spv", "tower_geglu_cls_spv",
+    "tower_post_add_cls_spv", "tower_geglu_cls_spv", "tower_rms_cls_spv",
+    // the vision chains' stems and tails on the device (the patch im2col, the 2-axis position add, the qwen3v stem assemble, the
+    // grid pool, the standardize rows) and the exact lane's clamp copy ahead of the f32 tile (gemma4v): the stocked
+    // mmproj-gemma-3-4b-it-F16.gguf, mmproj-gemma-4-E2B-it-bf16.gguf and mmproj-Qwen3VL-4B-Instruct-F16.gguf through the
+    // families' Vulkan twins - no zoo row; their kernel coverage is test_vkt_tower_vision_rows in test_vulkan_tower_kernels.das
+    // (the clamp copy's is test_vkt_tower_rows), their bodies the templates both homes stamp, whose Metal cells are
+    // test_metal_misc_kernels.das' pos_add, q3v_stem and patch_im2col gates and test_metal_prefill_kernels.das' pool and affine
+    // gates
+    "tower_patch_im2col_cls_spv", "tower_pos_add_2d_cls_spv", "tower_stem_asm_cls_spv", "tower_pool_2d_cls_spv", "tower_affine_rows_cls_spv",
+    "tower_clamp_copy_cls_spv",
     // the biased-block (SigLIP) row classes: the bias with its GELU, the head restrides to the flash tile's width (the
     // stocked mmproj-gemma-3-4b-it-F16.gguf, dispatched by test_gemma3v_vulkan_twin in test_gemma3v.das; the rope on a
     // fused row's slot is the qwen3v tower's - mmproj-Qwen3VL-4B-Instruct-F16.gguf via test_qwen3v_vulkan_twin in
@@ -914,9 +927,9 @@ let private VK_CENSUS_NEVER_DISPATCHED <- [
     "tower_hpad_cls_spv", "tower_hpad16_cls_spv",
     "tower_hunpad_cls_spv", "tower_rope_tab_cls_spv",
     // the window-attention ViT's classes (qwen25v): the f32 per-window attention over the compact rows and the rms seam (the
-    // gated hidden is the LLM's biased f16 act stamp at a zero row map; the stocked mmproj-Qwen2.5-Omni-3B-f16.gguf,
+    // gated hidden is the shared bias-gate stamp (`TowerBiasGate16`); the stocked mmproj-Qwen2.5-Omni-3B-f16.gguf,
     // dispatched by test_qwen25v_vulkan_twin in test_qwen25v.das); their kernel coverage is test_vkt_tower_win_rows
-    "tower_win_attn_cls_spv", "tower_post_add_rms_cls_spv",
+    "tower_win_attn_cls_spv", "tower_post_add_rms_cls_spv", "tower_bias_gate16_cls_spv",
     // the audio towers' classes - no zoo row runs an audio tower: the Conformer's silu rows (the bias class's unbiased stamp),
     // GLU, causal depthwise taps, windowed RPE attention (the 128-wide stamp serves the stocked mmproj-gemma-4-E2B-it-bf16.gguf's
     // audio encoder through test_gemma4a_vulkan_twin in test_audio.das) and the plain residual seam; the FastConformer's
@@ -974,7 +987,7 @@ def private cov_prefill_two_steps(tr : Model; var s : Session) {
     eval_(tr, s, p)
     var cur = argmax_of(s.logits, vocab)
     for (_i in range(2)) {
-        var one <- [cur]
+        var inscope one <- [cur]
         eval_(tr, s, one)
         delete one
         cur = argmax_of(s.logits, vocab)
@@ -1021,19 +1034,19 @@ def private vk_cov_model(t : T?; path, family : string; nbs : array<int>) {
             for (kdt in [KVDtype.f32, KVDtype.f16]) {
                 var s = make_run_state(tr.config, kdt, kdt)
                 cov_prefill_two_steps(tr, s)
-                var p2 <- encode(tr, counting_prompt(50, 90), false, false)
+                var inscope p2 <- encode(tr, counting_prompt(50, 90), false, false)
                 eval_(tr, s, p2)
                 delete p2
                 delete s
             }
             for (nb in nbs) {
-                var ss : array<Session>
+                var inscope ss : array<Session>
                 ss |> reserve(nb)
                 var sess : array<Session?>
-                var curs : array<int64>
+                var inscope curs : array<int64>
                 for (i in range(nb)) {
                     ss |> emplace <| make_run_state(tr.config, KVDtype.f32, KVDtype.f32)
-                    let pb <- encode(tr, counting_prompt(3 + i, 44 + i), true, false)
+                    var inscope pb <- encode(tr, counting_prompt(3 + i, 44 + i), true, false)
                     eval_(tr, ss[i], pb)
                     sess |> push(unsafe(addr(ss[i])))
                     curs |> push(argmax_of(ss[i].logits, vocab))

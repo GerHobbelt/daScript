@@ -35,9 +35,8 @@ let private PR_ROWS = 7
 let private PR_WIDTH = 13   //! the window: 91 elements, off every workgroup and float4 multiple
 
 //! the window's elements out of a whole dst plane, row by row
-def private pk_window(dst : array<float>) : array<float> {
-    return <- [for (e in range(PR_ROWS * PR_WIDTH)); dst[(PR_DR0 + e / PR_WIDTH) * PR_DS + PR_DC + e % PR_WIDTH]]
-}
+def private pk_window(dst : array<float>) : array<float> =>
+    <- [for (e in range(PR_ROWS * PR_WIDTH)); dst[(PR_DR0 + e / PR_WIDTH) * PR_DS + PR_DC + e % PR_WIDTH]]
 
 [test]
 def test_vkt_pk_rows(t0 : T?) {
@@ -63,7 +62,7 @@ def test_vkt_pk_rows(t0 : T?) {
                 let ep = cp |> out_(ndst)
                 var s_p = cp |> cls_set(fixed_array(sp, dp), @@set_tts_pk_rows_cls)
                 var s_e = cp |> cls_set(fixed_array(sp, ep), @@set_tts_pk_rows_elu_cls)
-                var pa = TtsPkRowsArgs(rows = uint(PR_ROWS), width = uint(PR_WIDTH), ss = uint(PR_SS), sc = uint(PR_SC), sr0 = uint(PR_SR0),
+                var pa = GkPkRowsArgs(rows = uint(PR_ROWS), width = uint(PR_WIDTH), ss = uint(PR_SS), sc = uint(PR_SC), sr0 = uint(PR_SR0),
                     ds = uint(PR_DS), dc = uint(PR_DC), dr0 = uint(PR_DR0))
                 cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
                     enc_tts_pk_rows_cls(raw, h, s_p, pa, int64(nwin))
@@ -119,7 +118,7 @@ def test_vkt_pk_row_scale(t0 : T?) {
                 let xp = cp |> io_(x, 0, SLACK)
                 let wp = cp |> in_(scale, RS_SOFF, SLACK)
                 var s = cp |> cls_set(fixed_array(xp, wp), @@set_tts_pk_row_scale_cls)
-                var pa = TowerBiasArgs(d = uint(RS_C), nelem = uint(n), boff = uint(RS_SOFF))
+                var pa = GkBiasActArgs(d = uint(RS_C), nelem = uint(n), boff = uint(RS_SOFF))
                 cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
                     enc_tts_pk_row_scale_cls(raw, h, s, pa, int64(n))
                 }
@@ -142,10 +141,6 @@ let private PA_CAP = 300
 let private PA_QS = 264      //! q's row stride: the query span sits at PA_QCOL among other columns
 let private PA_QCOL = 8
 let private PA_PROWS = 48    //! the device caches' rows: the 45 appended, then three poisoned rows no query may see
-let private PA_QOFF = 5
-let private PA_KOFF = 7
-let private PA_VOFF = 11
-let private PA_OOFF = 13
 let private PA_DEC_POS = 44  //! the decode step's position: the last appended key
 let private PA_DEC_CTX = 8
 let private PA_WIN_CTX = 16
@@ -207,26 +202,26 @@ def private pk_attn_device(kc : TtsKvCache; qfull : array<float>) : PkAttnOut {
         var inscope rows <- pk_cache_rows(kc, -1l)
         var inscope rows_x <- pk_cache_rows(kc, int64(PA_DEC_POS - PA_DEC_CTX))
         with_cell_planes() $(var cp : CellPlanes) {
-            let qp = cp |> in_(qfull, PA_QOFF, SLACK)
-            let kp = cp |> in_(rows.k, PA_KOFF, SLACK)
-            let vp = cp |> in_(rows.v, PA_VOFF, SLACK)
-            let kxp = cp |> in_(rows_x.k, PA_KOFF, SLACK)
-            let vxp = cp |> in_(rows_x.v, PA_VOFF, SLACK)
-            let oa = cp |> out_(PA_T * d, PA_OOFF)
-            let ob = cp |> out_(d, PA_OOFF)
-            let ox = cp |> out_(d, PA_OOFF)
-            let oc = cp |> out_(PA_T * d, PA_OOFF)
+            let qp = cp |> in_(qfull, 0, SLACK)
+            var inscope qdec <- copy_span(qfull, PA_DEC_POS * PA_QS, PA_QS)
+            let qdp = cp |> in_(qdec, 0, SLACK)
+            let kp = cp |> in_(rows.k, 0, SLACK)
+            let vp = cp |> in_(rows.v, 0, SLACK)
+            let kxp = cp |> in_(rows_x.k, 0, SLACK)
+            let vxp = cp |> in_(rows_x.v, 0, SLACK)
+            let oa = cp |> out_(PA_T * d)
+            let ob = cp |> out_(d)
+            let ox = cp |> out_(d)
+            let oc = cp |> out_(PA_T * d)
             var s_a = cp |> cls_set(fixed_array(qp, kp, vp, oa), @@set_tts_pk_attn_cls)
-            var s_b = cp |> cls_set(fixed_array(qp, kp, vp, ob), @@set_tts_pk_attn_cls)
-            var s_x = cp |> cls_set(fixed_array(qp, kxp, vxp, ox), @@set_tts_pk_attn_cls)
+            var s_b = cp |> cls_set(fixed_array(qdp, kp, vp, ob), @@set_tts_pk_attn_cls)
+            var s_x = cp |> cls_set(fixed_array(qdp, kxp, vxp, ox), @@set_tts_pk_attn_cls)
             var s_c = cp |> cls_set(fixed_array(qp, kp, vp, oc), @@set_tts_pk_attn_cls)
-            var pa = TtsPkAttnArgs(t = uint(PA_T), qs = uint(PA_QS), qcol = uint(PA_QCOL), d = uint(d), pos0 = 0u, ctx = 0u,
-                qoff = uint(PA_QOFF), koff = uint(PA_KOFF), voff = uint(PA_VOFF), ooff = uint(PA_OOFF))
+            var pa = GkPkAttnArgs(t = uint(PA_T), qs = uint(PA_QS), qcol = uint(PA_QCOL), d = uint(d), pos0 = 0u, ctx = 0u)
             var pb = pa
             pb.t = 1u
             pb.pos0 = uint(PA_DEC_POS)
             pb.ctx = uint(PA_DEC_CTX)
-            pb.qoff = uint(PA_QOFF + PA_DEC_POS * PA_QS)
             var pc = pa
             pc.ctx = uint(PA_WIN_CTX)
             let heads = int64(PA_HEADS)
@@ -271,7 +266,7 @@ def test_vkt_pk_attn(t0 : T?) {
                 }
             }
             t |> success(moved > 0, "tts_pk_attn control: the 16-key window moves the prompt's late rows off the every-key rows ({moved} apart)")
-            t |> success(outside_run(got.a_whole, PA_OOFF, PA_T * d, NAN_SENTINEL), "tts_pk_attn: the prefix before ooff keeps its sentinel")
+            t |> success(outside_run(got.a_whole, 0, PA_T * d, NAN_SENTINEL), "tts_pk_attn: the elements past the rows keep their sentinel")
         } else {
             t |> skip("dasVulkan not present")
         }
@@ -343,8 +338,7 @@ def private pk_gemv_fixture(quad : bool) : PkGemvFix {
 def private pk_gemv_wants(f : PkGemvFix) : PkGemvRows {
     let nin = PG_NIN
     let nout = PG_NOUT
-    var d_plain : array<float>
-    var d_norm : array<float>
+    var d_plain, d_norm : array<float>
     with_dasllama_jobque_() {
         linear_vec(f.lin, f.x, d_plain)
         var xn := f.x
@@ -464,8 +458,7 @@ def test_vkt_pk_rope(t0 : T?) {
             let nk = PO_T * PO_D
             let half = PO_DH / 2
             let x <- row_fill(n, 41, 7, 0.05, 2.1)
-            var cos_tab : array<float>
-            var sin_tab : array<float>
+            var cos_tab, sin_tab : array<float>
             let no_freqs : array<float>
             build_rope_tabs(cos_tab, sin_tab, PO_THETA, 1.0, 1.0, no_freqs, false, 0l, int64(PO_CAP), int64(PO_DH))
             t |> equal(length(cos_tab), PO_CAP * half, "tts_pk_rope: the tables carry {PO_CAP} positions of {half} angles")
@@ -479,7 +472,7 @@ def test_vkt_pk_rope(t0 : T?) {
                 let xp = cp |> io_(x, 0, SLACK)
                 let wp = cp |> in_(slab)
                 var s = cp |> cls_set(fixed_array(xp, wp, wp), @@set_tts_pk_rope_cls)
-                var pa = RopeTabArgs(rows = uint(PO_T), qs = uint(PO_QS), col = uint(PO_D), d = uint(PO_D), dh = uint(PO_DH), coff = uint(coff), soff = uint(soff))
+                var pa = GkRopeTabArgs(rows = uint(PO_T), qs = uint(PO_QS), col = uint(PO_D), d = uint(PO_D), dh = uint(PO_DH), coff = uint(coff), soff = uint(soff))
                 cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
                     enc_tts_pk_rope_cls(raw, h, s, pa, int64(nk / 2))
                 }
@@ -555,8 +548,7 @@ def private pk_fused_fixture() : PkFusedFix {
     f.lboff = put_run(f.slab, f.norm.b)
     f.aoff = put_run(f.slab, f.scale)
     f.slab |> push_from(poison_plane(SLAB_GAP))
-    var cos_tab : array<float>
-    var sin_tab : array<float>
+    var cos_tab, sin_tab : array<float>
     let no_freqs : array<float>
     build_rope_tabs(cos_tab, sin_tab, PO_THETA, 1.0, 1.0, no_freqs, false, 0l, int64(PF_CAP), int64(PF_DH))
     f.coff = put_run(f.tabs, cos_tab)
@@ -576,9 +568,7 @@ def test_vkt_pk_gemv_fused(t0 : T?) {
             let d = PF_D
             var inscope f <- pk_fused_fixture()
             var xn := f.x
-            var qkv_row : array<float>
-            var dp : array<float>
-            var dn : array<float>
+            var qkv_row, dp, dn : array<float>
             with_dasllama_jobque_() {
                 layernorm_rows(xn, 1l, int64(d), f.norm, PG_EPS)
                 linear_vec(f.qkv, xn, qkv_row)

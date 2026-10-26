@@ -2210,7 +2210,11 @@ def forward_prefill_embd(t : Model; var s : Session; embd : array<float>; npos, 
     prof_add("embed", ts_embed)
     if (has_ple(t.config)) {  // gemma-4 E-series: PLE side input (padding-token gather for the media path)
         let ts_ple = prof_ticks()
-        ple_pre_prefill_pad_gated(t, s, npos, start_pos)
+        if (long_length(s.embd_ids) >= src_off + npos) {   // a media body: its text rows take their own tokens' side input
+            ple_pre_prefill_gated(t, s, s.embd_ids, src_off, npos, start_pos)
+        } else {
+            ple_pre_prefill_pad_gated(t, s, npos, start_pos)
+        }
         prof_add("ple", ts_ple)
     }
     // the non-causal image span (gemma vision): span queries attend
@@ -2245,6 +2249,49 @@ def embed_text_rows_strided(t : Model; tokens : array<int64>; var dst : array<fl
             }
         }
     }
+}
+
+//! One prefill body's rows at the decoder's row stride: ``head`` text, ``n_media`` media rows of width ``src_w``,
+//! ``tail`` text. A deepstack decoder's stride is (1+n)·dim - a text row and a dim-wide media row keep a zero tail.
+//! On a gemma-4 E-series decoder the session takes each row's token id for ``eval_embd_body_``, which spends them.
+def media_body_rows_(t : Model; var s : Session; head : array<int64>; rows : array<float>; n_media, src_w : int64;
+                     tail : array<int64>; var embd : array<float>) {
+    let rw = t.config.dim * (1l + t.config.n_deepstack)
+    let n_head = long_length(head)
+    let npos = n_head + n_media + long_length(tail)
+    embd |> clear()
+    embd |> ensure_capacity(npos * rw)
+    embd |> resize(npos * rw)
+    embed_text_rows_strided(t, head, embd, 0l, rw)
+    for (r in range64(n_media)) {
+        unsafe {
+            memcpy(addr(embd[(n_head + r) * rw]), addr(rows[r * src_w]), src_w * 4l)
+        }
+    }
+    embed_text_rows_strided(t, tail, embd, n_head + n_media, rw)
+    s.embd_ids |> clear()
+    if (has_ple(t.config)) {
+        s.embd_ids |> resize(npos)
+        for (p in range64(n_head)) {
+            s.embd_ids[p] = head[p]
+        }
+        for (p in range64(long_length(tail))) {
+            s.embd_ids[n_head + n_media + p] = tail[p]
+        }
+    }
+}
+
+//! Prefill ``npos`` rows whose [span_lo, span_hi) are a NON-CAUSAL span (span_hi <= span_lo = every row causal);
+//! a non-zero merged ``grid`` ropes the span on the image-grid walk.
+def eval_embd_body_(t : Model; var s : Session; embd : array<float>; npos, span_lo, span_hi : int64; grid : int2) {
+    if (span_hi > span_lo && grid.x > 0) {
+        eval_embd_span_mrope_(t, s, embd, npos, span_lo, span_hi, int64(grid.x), int64(grid.y))
+    } elif (span_hi > span_lo) {
+        eval_embd_span_(t, s, embd, npos, span_lo, span_hi)
+    } else {
+        eval_embd_(t, s, embd, npos)
+    }
+    s.embd_ids |> clear()
 }
 
 //! Fill ``dst[at*dim ..]`` with the embedding rows of ``tokens`` (embed_scale applied) — the
@@ -2291,9 +2338,7 @@ def public set_span_fuse(on : bool) {
 // An override that cannot serve the per-query span mask registers the split-span capability
 // (register_prefill_override_split_span) and keeps the three-eval splice; Metal serves the
 // fused mask (AttnArgs.ulo), and the CPU arms mask per query.
-def private span_fusable : bool {
-    return g_span_fuse && !active_prefill_splits_span()
-}
+def private span_fusable : bool => g_span_fuse && !active_prefill_splits_span()
 
 //! `eval_embd_` for a prompt carrying ONE non-causal image span: rows [span_lo, span_hi) prefill
 //! non-causally, the text around them causally. One fused eval (per-query mask) where the backend
@@ -2385,11 +2430,13 @@ def private eval_embd_slice_mrope_(t : Model; var s : Session; whole : array<int
     s.mrope_pos |> clear()
 }
 
-//! Mean-pooled, L2-normalized sentence embedding for `tokens` into `out`: last-layer hidden state
-//! averaged over positions, unit-normalized. Runs one forward over `s` from position 0 — pass a
-//! FRESH session (no KV history assumed; cache is left filled).
+//! L2-normalized sentence embedding for `tokens` into `out`: the post-final-norm hidden rows `pooling` picks, averaged, cut to
+//! the leading `dims` components where `dims` is 1..dim-1 (the Matryoshka read), unit-normalized once. Runs one forward over
+//! `s` from position 0 - pass a FRESH session (no KV history assumed; cache is left filled).
 [arch(at="../ARCHITECTURE_GPU_PREFILL.md#prefill-last-row-tail")]
-def embed_forward(t : Model; var s : Session; tokens : array<int64>; npos : int64; var out : array<float>) {
+//! `pooling` picks the rows that make the vector: POOLING_MEAN averages every position's post-final-norm row, POOLING_LAST
+//! takes the last position's (the EOS the tokenizer appends - what Qwen3-Embedding is trained to be read at), POOLING_CLS the first's
+def embed_forward(t : Model; var s : Session; tokens : array<int64>; npos : int64; var out : array<float>; pooling : int64 = POOLING_MEAN; dims : int64 = 0l) {
     let c = t.config
     let dim = c.dim
     out |> resize(dim)
@@ -2399,12 +2446,14 @@ def embed_forward(t : Model; var s : Session; tokens : array<int64>; npos : int6
     if (npos <= 0l) {
         return
     }
+    let first = pooling == POOLING_CLS ? 0l : (pooling == POOLING_LAST ? npos - 1l : 0l)
+    let last = pooling == POOLING_CLS ? 1l : npos
     if (t.quant != QuantMode.q4_0 && npos > 1l) {
         // batched prefill fills s.x_b (npos × dim residual) and leaves it intact; the body norms only
-        // the last position, so re-apply the final RMSNorm to EVERY position and accumulate.
+        // the last position, so re-apply the final RMSNorm to the pooled positions and accumulate.
         s.keep_hidden = true
         forward_prefill(t, s, tokens, npos, 0l)
-        for (p in range64(npos)) {
+        for (p in range64(first, last)) {
             rms_at(s.xb, t, t.rms_final_off, s.x_b, p * dim, dim)
             add_inplace(unsafe(addr(out[0])), unsafe(addr(s.xb[0])), dim)
         }
@@ -2412,31 +2461,40 @@ def embed_forward(t : Model; var s : Session; tokens : array<int64>; npos : int6
         // q4_0 (no batched prefill) or a single token: per-token forward leaves s.xb = post-final-norm hidden.
         for (p in range64(npos)) {
             forward(t, s, tokens[p], p)
-            add_inplace(unsafe(addr(out[0])), unsafe(addr(s.xb[0])), dim)
+            if (p >= first && p < last) {
+                add_inplace(unsafe(addr(out[0])), unsafe(addr(s.xb[0])), dim)
+            }
         }
     }
     s.n_past = npos   // KV now holds npos positions (start_pos was 0) — keep the session cursor consistent
-    // mean over positions, then L2-normalize
-    let inv = 1.0 / float(npos)
+    // the pooled rows' mean, the cut, then L2-normalize: cutting before the normalize is the renormalized cut
+    let width = dims > 0l && dims < dim ? dims : dim
+    out |> resize(width)
+    let inv = 1.0 / float(last - first)
     var ss = 0.0
-    for (i in range64(dim)) {
+    for (i in range64(width)) {
         out[i] *= inv
         ss += out[i] * out[i]
     }
     let rn = ss > 0.0 ? 1.0 / sqrt(ss) : 0.0
-    for (i in range64(dim)) {
+    for (i in range64(width)) {
         out[i] *= rn
     }
 }
 
-//! Mean-pooled, L2-normalized sentence embedding of `text` (`dim` floats): tokenize, run one forward,
-//! average the decoder's last-layer hidden state over positions, unit-normalize. Decoder-as-embedder
-//! yields RAG-grade vectors, not a substitute for a dedicated embedding model.
-def embed_(m : Model; text : string) : array<float> {
+//! L2-normalized sentence embedding of `text` (`dim` floats, or the leading `dims`): tokenize, run one forward, pool the
+//! decoder's last-layer hidden rows the way `pooling` asks (the mean for a chat model, the last row for an embedding model),
+//! cut, unit-normalize. A text past the model's context embeds its leading `seq_len` tokens: the session holds that many rows.
+def embed_(m : Model; text : string; pooling : int64 = POOLING_MEAN; dims : int64 = 0l) : array<float> {
     var s <- create_session_(m)
     let tokens = encode_(m, text)
+    var npos = long_length(tokens)
+    if (npos > m.config.seq_len) {
+        to_log(LOG_WARNING, "embed: {npos} tokens past the model context of {m.config.seq_len}; the leading {m.config.seq_len} are embedded\n")
+        npos = m.config.seq_len
+    }
     var out : array<float>
-    embed_forward(m, s, tokens, long_length(tokens), out)
+    embed_forward(m, s, tokens, npos, out, pooling, dims)
     delete s
     return <- out
 }

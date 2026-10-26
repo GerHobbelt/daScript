@@ -28,6 +28,8 @@ struct LintResult {
     compile_errors : string
     skip_reason : string
     excluded : int      // findings dropped by the .lint_config [paths] exclude policy
+    fixed : int
+    cached : bool       // a clean result the cache vouched for: nothing was compiled
 }
 
 [CommandLineArgs]
@@ -57,9 +59,16 @@ struct Config {
     @clarg_doc = "Only run style lint (skip paranoid and perf)"
     style_only : bool
 
+    @clarg_doc = "Apply the fixes rules attach to their findings, then re-lint each changed file; a fix that breaks the compile is rolled back"
+    fix : bool
+    @clarg_doc = "Skip the result cache: compile and lint every file, record nothing"
+    no_cache : bool
+    @clarg_doc = "Where the result cache lives (one entry per clean file: the content hash of every input its compile read)"
+    cache_dir : string = LINT_CACHE_DEFAULT_DIR
+
     @clarg_short = "j"
-    @clarg_doc = "Parallel workers (0 = auto = physical cores, at most 16). 1 = serial. Below 16 files, stays serial regardless."
-    workers : int
+    @clarg_doc = "Parallel workers (default 1 = serial; 0 = auto = physical cores, at most 16). Below 16 files, stays serial regardless."
+    workers : int = 1
 
     @clarg_doc = "Worker mode: read newline-delimited file paths and emit one JSON-wrapped LintResult per file on stdout. Internal — used by parallel driver. Skips positional args, banner, summary."
     paths_from : string
@@ -132,20 +141,15 @@ def write_deduped(var writer : StringBuilderWriter; issues : array<LintIssue>; p
     }
 }
 
-def is_skip_file(name : string) : bool {
-    return name == "builtin.das"
-}
+def is_skip_file(name : string) : bool => name == "builtin.das"
 
-def is_skip_dir(name : string) : bool {
-    return name |> starts_with(".") || name == "node_modules"
-}
+def is_skip_dir(name : string) : bool => name |> starts_with(".") || name == "node_modules" || name == "logs"   //! `logs/` is the gitignored run and audit log tree: a report quotes anchors it never cites
 
 // A CMake build tree is not source, whatever it is named: FetchContent checkouts under it
 // carry .das and .md the tree never wrote. Neither is another repository's checkout inside this
 // one (the EASTL local-verify clones): its comments cite documents of its own.
-def is_build_tree(path : string) : bool {
-    return stat("{path}/CMakeCache.txt").is_valid || stat("{path}/.git").is_valid
-}
+def is_build_tree(path : string) : bool =>
+    stat("{path}/CMakeCache.txt").is_valid || stat("{path}/.git").is_valid
 
 def scan_das_files(path : string; var files : array<string>; var cache : table<string; void?>; var skipped : int&) {
     let st = stat(path)
@@ -196,9 +200,8 @@ def is_rule_doc_name(name : string) : bool {
 }
 
 // A rule runs unless --disable names it, or --enable put the run in whitelist mode without it.
-def rule_is_on(code : string; disabled_codes, enabled_codes : table<string>) : bool {
-    return !key_exists(disabled_codes, code) && (empty(enabled_codes) || key_exists(enabled_codes, code))
-}
+def rule_is_on(code : string; disabled_codes, enabled_codes : table<string>) : bool =>
+    !key_exists(disabled_codes, code) && (empty(enabled_codes) || key_exists(enabled_codes, code))
 
 // Directories under `path` the two tagged-or-present folder rules answer for: a folder whose
 // OWN .lint_config sets rule_docs_only feeds LINT025, and any folder holding a rule document
@@ -265,7 +268,7 @@ def collect_folder_mds(folder : string; rule_docs : bool; var out : array<string
 def run_rule_docs_pass(folders : array<string>) : int {
     var found = 0
     for (folder in folders) {
-        var strays : array<string>
+        var inscope strays : array<string>
         collect_folder_mds(folder, false, strays)
         strays |> sort
         for (md in strays) {
@@ -447,7 +450,7 @@ def run_rule_doc_text_pass(folders : array<string>; roots : array<string>; want_
     var names_indexed = false
     for (folder in folders) {
         let root = owning_root(folder, roots)
-        var docs : array<string>
+        var inscope docs : array<string>
         collect_folder_mds(folder, true, docs)
         docs |> sort
         var cells : table<string; void?>
@@ -455,14 +458,14 @@ def run_rule_doc_text_pass(folders : array<string>; roots : array<string>; want_
         for (md in docs) {
             let is_checklist = base_name(md) |> starts_with("REVIEW")
             continue if (!is_checklist)
-            let lines <- fread(md) |> split("\n")
+            var inscope lines <- fread(md) |> split("\n")
             for (line, i in lines, count()) {
                 if (want_pos && line_cites_by_position(line)) {
                     print("{md}:{i + 1}: LINT032: a checklist cites a rule by position (\"above\" / \"below\") - name what the rule binds instead; rules are order-independent\n")
                     found ++
                 }
                 continue if (!want_names)
-                var toks : array<string>
+                var inscope toks : array<string>
                 backticked_tokens(line, toks)
                 for (tok in toks) {
                     if (token_is_rule_doc_path(tok)) {
@@ -518,7 +521,7 @@ def count_text_lines(text : string) : int {
 def run_doc_lines_pass(folders : array<string>) : int {
     var found = 0
     for (folder in folders) {
-        var docs : array<string>
+        var inscope docs : array<string>
         collect_folder_mds(folder, true, docs)
         docs |> sort
         for (md in docs) {
@@ -562,6 +565,28 @@ def private scan_arch_folder(path : string; var mds, dases : array<string>; var 
     }
 }
 
+def private ancestor_docs(roots : array<string>; seen : table<string; void?>) : array<string> {
+    var docs : array<string>
+    var visited : table<string>
+    for (root in roots) {
+        var dir = dir_name(root)
+        while (!empty(dir) && dir != "." && !key_exists(visited, dir)) {
+            visited |> insert(dir)
+            if (!key_exists(seen, dir)) {
+                fio::dir(dir) $(name) {
+                    if (name |> ends_with(".md") && stat("{dir}/{name}").is_reg) {
+                        docs |> push("{dir}/{name}")
+                    }
+                }
+            }
+            let up = dir_name(dir)
+            break if (up == dir)
+            dir = up
+        }
+    }
+    return <- docs
+}
+
 // [arch] citation pass, both directions off one read of each file: forward reports every
 // citation that does not resolve and every .das citation that resolves but sits inside a
 // comment, reverse every anchor no citation names - an anchor is a
@@ -570,8 +595,7 @@ def private scan_arch_folder(path : string; var mds, dases : array<string>; var 
 // daslib citer satisfies a module's anchor), each .md parsed once through the shared index.
 // A folder pass like LINT025 - once per invocation, not once per file.
 def run_arch_pass(roots : array<string>) : int {
-    var mds : array<string>
-    var dases : array<string>
+    var mds, dases : array<string>
     var seen : table<string; void?>
     for (root in roots) {
         scan_arch_folder(root, mds, dases, seen)
@@ -607,6 +631,15 @@ def run_arch_pass(roots : array<string>) : int {
                 continue
             }
             cited |> insert("{c.doc}#{c.anchor}")
+        }
+    }
+    for (md in ancestor_docs(roots, seen)) {
+        let text = fread(md)
+        continue if (empty(text) || find(text, ".md#") < 0)
+        for (c in collect_md_citations(md, text)) {
+            if (empty(citation_failure_reason(docs, c))) {
+                cited |> insert("{c.doc}#{c.anchor}")
+            }
         }
     }
     for (md in mds) {
@@ -649,7 +682,7 @@ def is_valid_rule_code(code : string) : bool {
 // (caller emits error + exits); on success returns "" and dest is populated.
 def normalize_rule_list(raw : array<string>; var dest : table<string>) : string {
     for (entry in raw) {
-        let parts <- entry |> split(",")
+        var inscope parts <- entry |> split(",")
         for (p in parts) {
             let token = p |> strip |> to_upper
             continue if (empty(token))
@@ -697,12 +730,88 @@ def private lint_policies(var cop : CodeOfPolicies) {
     cop.no_fold_unsafe = true
 }
 
+var lint_cache_dir = ""
+var lint_cache_header = ""
+var content_hashes : table<string; string>
+
+//! The hash of ``path``'s bytes, ``-`` for a missing file; memoized for the run
+def content_hash(path : string) : string {
+    let known = content_hashes?[path] ?? ""
+    return known if (!empty(known))
+    var st : FStat
+    let digest = stat(path, st) && st.is_reg ? "{hash(fread(path))}" : "-"
+    content_hashes[path] = digest
+    return digest
+}
+
+def sort_keys(tab : table<string>) : array<string> {
+    var keys <- [for (k in keys(tab)); k]
+    sort(keys)
+    return <- keys
+}
+
+//! The cache entry of ``file`` under these options: one per file and option set, rewritten in place, so the folder never outgrows the tree
+def lint_cache_entry(file : string; run_paranoid, run_perf, run_style, comment_hygiene, lint_fixtures, lint_excluded_paths : bool;
+                     disabled_codes, enabled_codes : table<string>) : string {
+    content_hashes |> erase(file)
+    if (empty(lint_cache_header)) {
+        let config_env = has_env_variable("DAS_LINT_CONFIG_PATH") ? get_env_variable("DAS_LINT_CONFIG_PATH") : ""
+        lint_cache_header = "config {config_env}"
+        mkdir_rec(lint_cache_dir)
+    }
+    let codes = "{join(sort_keys(disabled_codes), ",")}|{join(sort_keys(enabled_codes), ",")}"
+    let flags = "{run_paranoid}{run_perf}{run_style}{comment_hygiene}{lint_fixtures}{lint_excluded_paths}"
+    let key = "{normalize(file)}|{flags}|{codes}"
+    return "{lint_cache_dir}/{hash(key)}"
+}
+
+//! True when ``entry`` was written under this config and every input it lists still has the content it was recorded with
+def lint_cache_hit(entry : string) : bool {
+    let text = fread(entry)
+    return false if (empty(text))
+    for (line, i in split(text, "\n"), count()) {
+        if (i == 0) {
+            return false if (line != lint_cache_header)
+            continue
+        }
+        continue if (empty(line))
+        let sp = find(line, " ")
+        return false if (sp < 0 || content_hash(slice(line, sp + 1)) != slice(line, 0, sp))
+    }
+    return true
+}
+
+//! The inputs a clean lint of ``file`` depended on: every module source of ``program`` and every config that can steer it
+def lint_cache_inputs(program : ProgramPtr; file : string) : array<string> {
+    var inputs : array<string>
+    program_for_each_module(program) $(m) {
+        inputs |> push(string(m.fileName)) if (!empty(m.fileName))
+    }
+    inputs |> push_from(lint_configs_for(file))
+    return <- inputs
+}
+
+def lint_cache_store(entry : string; inputs : array<string>) {
+    fwrite(entry, build_string() $(var w) {
+        w |> write("{lint_cache_header}\n")
+        for (path in inputs) {
+            w |> write("{content_hash(path)} {path}\n")
+        }
+    })
+}
+
 def lint_file(file : string; run_paranoid, run_perf, run_style, comment_hygiene, lint_fixtures, lint_excluded_paths : bool;
-              disabled_codes, enabled_codes : table<string>; defer_stale : bool) : LintResult {
+              disabled_codes, enabled_codes : table<string>) : LintResult {
     var result = LintResult(file = file)
     if (set_skip_reason(file, lint_fixtures, result)) {
         return <- result
     }
+    let entry = !empty(lint_cache_dir) ? lint_cache_entry(file, run_paranoid, run_perf, run_style, comment_hygiene, lint_fixtures, lint_excluded_paths, disabled_codes, enabled_codes) : ""
+    if (!empty(entry) && lint_cache_hit(entry)) {
+        result.cached = true
+        return <- result
+    }
+    var inputs : array<string>
     var inscope access <- make_file_access("")
     using() $(var mg : ModuleGroup) {
         using() $(var cop : CodeOfPolicies) {
@@ -739,6 +848,7 @@ def lint_file(file : string; run_paranoid, run_perf, run_style, comment_hygiene,
                     result.compile_errors = issue_str
                     return
                 }
+                inputs |> push_from(lint_cache_inputs(program, file)) if (!empty(entry))
                 let file_disabled <- file_nolint_codes(program, disabled_codes)
                 if (run_paranoid) {
                     var paranoid_issues : array<LintIssue>
@@ -755,23 +865,52 @@ def lint_file(file : string; run_paranoid, run_perf, run_style, comment_hygiene,
                     result.count += style_lint_collect_issues(program, style_issues, file_disabled, enabled_codes, comment_hygiene)
                     result.issues |> push_from(style_issues)
                 }
+                if (run_paranoid && run_perf && run_style) {
+                    var stale : array<LintIssue>
+                    result.count += stale_nolint_collect(program, file, fread(file), disabled_codes, enabled_codes, stale)
+                    result.issues |> push_from(stale)
+                }
             }
         }
     }
-    // LINT019 (stale nolint) needs every pass's consumption record - a partial run
-    // under-consumes and would report live directives as dead
-    if (!defer_stale && run_paranoid && run_perf && run_style && !result.failed && empty(result.skip_reason)) {
-        let src = fread(file)
-        if (!empty(src)) {
-            var stale : array<LintIssue>
-            result.count += stale_nolint_collect(file, src, disabled_codes, enabled_codes, stale)
-            result.issues |> push_from(stale)
-        }
-    }
+    result.count -= drop_skipped_file_issues(file, result.issues)
     if (!lint_excluded_paths) {
         apply_path_excludes(result)
     }
+    lint_cache_store(entry, inputs) if (!empty(inputs) && result.count == 0 && !result.failed && empty(result.skip_reason))
     return <- result
+}
+
+def lint_file_fixing(file : string; run_paranoid, run_perf, run_style, comment_hygiene, lint_fixtures, lint_excluded_paths : bool;
+                     disabled_codes, enabled_codes : table<string>; fix : bool) : LintResult {
+    var result <- lint_file(file, run_paranoid, run_perf, run_style, comment_hygiene, lint_fixtures, lint_excluded_paths, disabled_codes, enabled_codes)
+    return <- result if (!fix || result.failed || !empty(result.skip_reason))
+    var fixes <- [for (issue in result.issues); issue.fix; where issue.fix.line > 0 && (empty(issue.file) || normalize(issue.file) == normalize(file))]
+    return <- result if (empty(fixes))
+    let original = fread(file)
+    var patched = apply_lint_fixes(original, fixes)
+    fwrite(file, patched.text)
+    var after <- lint_file(file, run_paranoid, run_perf, run_style, comment_hygiene, lint_fixtures, lint_excluded_paths, disabled_codes, enabled_codes)
+    if (after.failed) {
+        var kept : array<LintFix>
+        kept |> reserve(length(fixes))
+        for (f in fixes) {
+            kept |> push(f)
+            patched = apply_lint_fixes(original, kept)
+            fwrite(file, patched.text)
+            delete after
+            after <- lint_file(file, run_paranoid, run_perf, run_style, comment_hygiene, lint_fixtures, lint_excluded_paths, disabled_codes, enabled_codes)
+            if (after.failed) {
+                kept |> pop()
+            }
+        }
+        patched = apply_lint_fixes(original, kept)
+        fwrite(file, patched.text)
+        delete after
+        after <- lint_file(file, run_paranoid, run_perf, run_style, comment_hygiene, lint_fixtures, lint_excluded_paths, disabled_codes, enabled_codes)
+    }
+    after.fixed = patched.applied
+    return <- after
 }
 
 // .lint_config [paths] excludes filter findings at REPORT time only - the compile
@@ -797,6 +936,9 @@ def apply_path_excludes(var result : LintResult) {
 // parallel paths; per-file output matches, though serial mode appends its
 // LINT019 findings as a trailing block while parallel reports them inline.
 def print_result(result : LintResult; quiet, silent : bool) {
+    if (result.fixed > 0) {
+        print("FIXED {result.file} ({result.fixed})\n")
+    }
     if (!empty(result.skip_reason)) {
         if (!quiet) {
             print("SKIP {result.file} {result.skip_reason}\n")
@@ -814,7 +956,7 @@ def print_result(result : LintResult; quiet, silent : bool) {
             write_deduped(w, result.issues, "  ", !silent)
         })
     } elif (!quiet) {
-        print("PASS {result.file}\n")
+        print(result.cached ? "CACHED {result.file}\n" : "PASS {result.file}\n")
     }
 }
 
@@ -852,10 +994,10 @@ def maybe_collect(var since_collect : int&) {
 // parses the stream and aggregates.
 [unsafe_heap_collect]
 def run_worker(paths : array<string>; run_paranoid, run_perf, run_style, comment_hygiene, lint_fixtures, lint_excluded_paths : bool;
-               disabled_codes, enabled_codes : table<string>) {
+               disabled_codes, enabled_codes : table<string>; fix : bool) {
     var since_collect = 0
     for (f in paths) {
-        let result = lint_file(f, run_paranoid, run_perf, run_style, comment_hygiene, lint_fixtures, lint_excluded_paths, disabled_codes, enabled_codes, defer_stale = false)
+        let result = lint_file_fixing(f, run_paranoid, run_perf, run_style, comment_hygiene, lint_fixtures, lint_excluded_paths, disabled_codes, enabled_codes, fix)
         print("{JSON_PREFIX}{write_json(JV(result))}\n{JSON_PREFIX}")
         maybe_collect(since_collect)
     }
@@ -881,6 +1023,14 @@ def build_worker_argv(spawn_prefix : array<string>; chunk_path : string; cfg : C
     if (cfg.lint_excluded_paths) {
         argv |> push("--lint-excluded-paths")
     }
+    if (cfg.fix) {
+        argv |> push("--fix")
+    }
+    if (cfg.no_cache) {
+        argv |> push("--no-cache")
+    }
+    argv |> push("--cache-dir")
+    argv |> push(cfg.cache_dir)
     if (cfg.paranoid_only) {
         argv |> push("--paranoid-only")
     }
@@ -951,7 +1101,7 @@ def run_parallel_lint(files : array<string>; cfg : Config) : array<LintResult> {
             print("error: could not write chunk file {cp}\n")
             return <- results
         }
-        var argv <- build_worker_argv(spawn_prefix, cp, cfg)
+        var inscope argv <- build_worker_argv(spawn_prefix, cp, cfg)
         argvs |> emplace(argv)
     }
 
@@ -1066,35 +1216,6 @@ def collect_input_files(var files : array<string>&; var dirs : array<string>&) :
     return -1
 }
 
-// Stale scan LAST, over the whole run's consumption ledger: a directive is consumed
-// by ANY compile in the run, including files sorted after it. Worker mode still
-// scans per-file - its ledger is per-process.
-def stale_scan_at_end(stale_eligible : array<string>; cfg : Config; disabled_codes, enabled_codes : table<string>;
-                      var total_issues : int&; var total_errors : int&; var total_skipped : int&; var total_excluded : int&) : void {
-    // the collector no-ops per file when LINT019 is off - skip the whole fread loop then
-    return if (key_exists(disabled_codes, "LINT019")
-                    || (!empty(enabled_codes) && !key_exists(enabled_codes, "LINT019")))
-    for (file in stale_eligible) {
-        let src = fread(file)
-        continue if (empty(src))
-        var result = LintResult(file = file)
-        var stale : array<LintIssue>
-        result.count = stale_nolint_collect(file, src, disabled_codes, enabled_codes, stale)
-        result.issues <- stale
-        if (!cfg.lint_excluded_paths) {
-            apply_path_excludes(result)
-        }
-        if (result.count > 0 || result.excluded > 0) {
-            // count == 0 with excluded > 0 still tallies, but a print would emit a
-            // second PASS line for a file the main pass already reported
-            if (result.count > 0) {
-                print_result(result, cfg.quiet, cfg.silent)
-            }
-            tally_result(result, total_issues, total_errors, total_skipped, total_excluded)
-        }
-    }
-}
-
 def tally_result(result : LintResult; var issues : int&; var errors : int&; var skipped : int&; var excluded : int&) : void {
     excluded += result.excluded
     if (!empty(result.skip_reason)) {
@@ -1115,8 +1236,7 @@ def run_folder_passes(docs_roots : array<string>; disabled_codes, enabled_codes 
     let want_doc_lines = rule_is_on("LINT027", disabled_codes, enabled_codes)
     let want_pos = rule_is_on("LINT032", disabled_codes, enabled_codes)
     let want_names = rule_is_on("LINT033", disabled_codes, enabled_codes)
-    var rule_docs_folders : array<string>
-    var line_folders : array<string>
+    var rule_docs_folders, line_folders : array<string>
     collect_docs_folders(docs_roots, want_rule_docs, want_doc_lines || want_pos || want_names, rule_docs_folders, line_folders)
     var found = 0
     if (want_rule_docs) {
@@ -1162,7 +1282,7 @@ def print_lint_help(rc : int) : int {
     return rc
 }
 
-[export, unsafe_heap_collect]
+[export, unsafe_heap_collect, lint_tool_entry]
 def main() : int {
     var r <- parse_args(type<Config>)
     if (r |> is_err) {
@@ -1178,9 +1298,9 @@ def main() : int {
     let run_perf = !any_only || cfg.perf_only
     let run_style = !any_only || cfg.style_only
 
-    var disabled_codes : table<string>
-    var enabled_codes : table<string>
+    var disabled_codes, enabled_codes : table<string>
     if (!resolve_rule_filters(cfg, disabled_codes, enabled_codes)) return 1
+    lint_cache_dir = cfg.no_cache || is_standalone_exe() ? "" : cfg.cache_dir
 
     // Worker mode: lint a pre-resolved list from a paths-from file and emit
     // JSON-wrapped results. No banner, no summary, no exit-code derivation.
@@ -1190,13 +1310,12 @@ def main() : int {
             print("error: cannot read paths-from file: {cfg.paths_from}\n")
             return 1
         }
-        run_worker(paths, run_paranoid, run_perf, run_style, cfg.comment_hygiene, cfg.lint_fixtures, cfg.lint_excluded_paths, disabled_codes, enabled_codes)
+        run_worker(paths, run_paranoid, run_perf, run_style, cfg.comment_hygiene, cfg.lint_fixtures, cfg.lint_excluded_paths, disabled_codes, enabled_codes, cfg.fix)
         return 0
     }
 
     // Driver mode: scan positional paths, collect file list.
-    var files : array<string>
-    var docs_roots : array<string>
+    var files, docs_roots : array<string>
     let collect_rc = collect_input_files(files, docs_roots)
     if (collect_rc >= 0) return collect_rc
 
@@ -1217,23 +1336,15 @@ def main() : int {
         if (!cfg.quiet) {
             print("Linting {length(files)} file(s)...\n\n")
         }
-        var stale_eligible : array<string>
         var since_collect = 0
         for (file in files) {
             if (!cfg.quiet) {
                 print("checking {file}...\n")
             }
-            let result = lint_file(file, run_paranoid, run_perf, run_style, cfg.comment_hygiene, cfg.lint_fixtures, cfg.lint_excluded_paths, disabled_codes, enabled_codes, defer_stale = true)
-            if (!result.failed && empty(result.skip_reason)) {
-                stale_eligible |> push(file)
-            }
+            let result = lint_file_fixing(file, run_paranoid, run_perf, run_style, cfg.comment_hygiene, cfg.lint_fixtures, cfg.lint_excluded_paths, disabled_codes, enabled_codes, cfg.fix)
             print_result(result, cfg.quiet, cfg.silent)
             tally_result(result, total_issues, total_errors, total_skipped, total_excluded)
             maybe_collect(since_collect)
-        }
-        if (run_paranoid && run_perf && run_style) {
-            stale_scan_at_end(stale_eligible, cfg, disabled_codes, enabled_codes,
-                total_issues, total_errors, total_skipped, total_excluded)
         }
     }
 

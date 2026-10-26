@@ -126,7 +126,8 @@ var private AUDIO_SEAM_EXEMPT <- {
 
 var private VISION_SEAM_EXEMPT <- {
     "modules/dasLLAMA/dasllama/dasllama_metal_tower.das",
-    "modules/dasLLAMA/dasllama/dasllama_vulkan_tower.das"
+    "modules/dasLLAMA/dasllama/dasllama_vulkan_tower.das",
+    "modules/dasLLAMA/harness/vision_lane_probe.das"   //! the lane probe pins a family's lane and mints its tower in memory - neither reaches the carrier
 }
 
 def private carried_families(carrier, kind_enum : string) : array<string> {
@@ -556,15 +557,16 @@ def private rb_trailing_int(line : string) : int {
 }
 
 // The per-function pipeline map: the calls that bind a local to a class's compiled source -
-// `pipeline_from_source` over a literal global, and the shared `race_pso_pair` shell in either
-// spelling - plus the local-to-local reads of one. True where the line is such a bind and no
-// later check reads it.
+// `pipeline_from_source` or its dumping shell `pso_from_source` over a literal global, and the
+// shared `race_pso_pair` shell in either spelling - plus the local-to-local reads of one. True
+// where the line is such a bind and no later check reads it.
 def private rb_track_pso(line : string; class_names : table<string>; kernel_class : table<string; string>;
                          var pso_class : table<string; string>) : bool {
-    let pf = find(line, "pipeline_from_source(")
+    let pfs = find(line, "pipeline_from_source(")
+    let pf = pfs >= 0 ? pfs : find(line, "pso_from_source(")
     if (pf >= 0) {
         let pvar = rb_bound_var(line)
-        let args = slice(line, pf + length("pipeline_from_source("))
+        let args = slice(line, find(line, "(", pf) + 1)
         let c1 = find(args, ",")
         let src = strip(slice(args, c1 + 1, find(args, ",", c1 + 1)))
         let cls = rb_resolve_class(src, class_names, kernel_class)
@@ -616,8 +618,7 @@ def private rb_bound_var(line : string) : string {
 
 def private check_race_bind_numbers {
     var declared : table<string>
-    var class_base : table<string; string>
-    var kernel_class : table<string; string>
+    var class_base, kernel_class : table<string; string>
     var files : array<string>
     dir("modules/dasLLAMA/dasllama") $(name) {
         if (name |> ends_with(".das")) {
@@ -630,7 +631,7 @@ def private check_race_bind_numbers {
     }
     for (name in files) {
         let path = "modules/dasLLAMA/dasllama/{name}"
-        var pso_class : table<string; string>   // per-function psoVar -> class
+        var inscope pso_class : table<string; string>   // per-function psoVar -> class
         var target = ""
         var line_no = 0
         for (line in split(fread(path), "\n")) {
@@ -742,7 +743,7 @@ def private check_image_backing_release {
     for (p in files) {
         var fn = ""
         var opened = false
-        var closes : array<int>
+        var inscope closes : array<int>
         var line_no = 0
         for (line in split(strip_line_comments(fread(p)), "\n")) {
             line_no++
@@ -774,8 +775,8 @@ let private TTS_BLOCKS_FILE = "modules/dasLLAMA/dasllama/dasllama_tts_blocks.das
 // the TTS block file's *_prepare mints, the layout helpers and the layout constants' declaration
 // lines, hashed in file order. A closure change with IMAGE_VERSION unmoved is red; the finding prints the
 // value to re-stamp with.
-let private IMAGE_LAYOUT_STAMP_VERSION = 44
-let private IMAGE_LAYOUT_STAMP_HASH = 0x8e9e64463851a40ful
+let private IMAGE_LAYOUT_STAMP_VERSION = 45
+let private IMAGE_LAYOUT_STAMP_HASH = 0xa5973cf0f378f4a8ul
 
 // The helpers that decide WHERE bytes land: the page pad, the plane and total sizing, the
 // writer's append / zero-fill / header patch, the header's scalar stores, the lattice
@@ -798,15 +799,13 @@ var private LAYOUT_CONSTANTS <- {
     "DWRITE_STAGING_BAND", "METAL_BAND_BLOCKS", "BLOB_ALIGN_FLOATS"
 }
 
-def private is_archive_serializer(header : string) : bool {
-    return (header |> starts_with("def serialize") || header |> starts_with("def private serialize")) && find(header, "Archive") >= 0
-}
+def private is_archive_serializer(header : string) : bool =>
+    (header |> starts_with("def serialize") || header |> starts_with("def private serialize")) && find(header, "Archive") >= 0
 
 // A meta serializer hand-lists a STRUCT's fields, so its count can be pinned; the bulk payload
 // forms take an `array` and have no field list of their own.
-def private is_meta_serializer(header : string) : bool {
-    return is_archive_serializer(header) && find(header, "array<") < 0
-}
+def private is_meta_serializer(header : string) : bool =>
+    is_archive_serializer(header) && find(header, "array<") < 0
 
 //! the `*_prepare` mints that place image bytes are the TTS block file's (`conv1d_prepare`, `linear_prepare`); a driver's prepare (`vk_rdec_prepare`, `mirror_prepare`) places none
 def private is_layout_function(file : string; header : string) : bool {
@@ -816,9 +815,7 @@ def private is_layout_function(file : string; header : string) : bool {
     return name == "build_image" || name == "parse_image" || (find(name, "_prepare") >= 0 && "{DASLLAMA_DIR}/{file}" == TTS_BLOCKS_FILE)
 }
 
-def private read_lf(path : string) : string {
-    return replace(fread(path), "\r\n", "\n")
-}
+def private read_lf(path : string) : string => replace(fread(path), "\r\n", "\n")
 
 // the declaration lines of the layout constants a file declares, in file order
 def private layout_constant_lines(path : string) : array<tuple<line : int; body : string>> {
@@ -1118,9 +1115,8 @@ struct private LadderTrio {
     why : string        //! what a missing arm does at run time
 }
 
-def private cm2_dispatch_name(fmt, tail : string) : string {
-    return fmt == "q8" || fmt == "q51" || fmt == "mx4" || fmt == "iq4nl32" ? "{fmt}_batch_{tail}" : "kq_batch_{fmt}_{tail}"
-}
+def private cm2_dispatch_name(fmt, tail : string) : string =>
+    fmt == "q8" || fmt == "q51" || fmt == "mx4" || fmt == "iq4nl32" ? "{fmt}_batch_{tail}" : "kq_batch_{fmt}_{tail}"
 
 //! the words of a `let [private] NAME = "..."` line in `path`, or none with a finding: a roster the gate reads where the code reads it
 def private let_words(path, name : string) : array<string> {
@@ -1374,8 +1370,7 @@ def private check_cm2_stamp_tile(path : string; st : VkStamp; d : StampDefaults)
 //! `let KQ_GRID_<FMT> = KQ_GRID_<PREV> + KQ_GRID_<PREV>_WORDS` chain the host fill (`kq_grid_dev`) reads
 def private check_kq_gemv_grid_literals {
     var inscope lines <- split(strip_line_comments(fread(VK_CLASSES)), "\n")
-    var words : table<string; int>
-    var offs : table<string; int>
+    var words, offs : table<string; int>
     var templates : array<string>
     for (line in lines) {
         if (line |> starts_with("let KQ_GRID_")) {
@@ -1664,7 +1659,7 @@ let private GEMM_GEN_FILES = [
     "modules/dasLLAMA/dasllama/dasllama_gemm_gen.das",
     "modules/dasLLAMA/dasllama/dasllama_gemm_schema.das"
 ]
-let private GEMM_GEN_STAMP_HASH = 0x81db69026507ad94ul
+let private GEMM_GEN_STAMP_HASH = 0x90ebe425c98c9c04ul
 
 [arch(at = "ARCHITECTURE_ENGINE_FORMATS.md#cpu-kernel-tiers")]
 def private check_gemm_gen_stamp {
@@ -1750,8 +1745,7 @@ def private check_ple_gather_sites {
         let suffix = ident_prefix(rest)
         psos |> insert(empty(suffix) ? "q8" : slice(suffix, 1))
     }
-    var picks : table<string>
-    var encodes : table<string>
+    var picks, encodes : table<string>
     var inscope fns <- function_bodies(PREFILL_FILE) $(header) {
         return find(header, "ple_gather_pso_of(") >= 0 || find(header, "pf_enc_ple_gather_fmt(") >= 0
     }

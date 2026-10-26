@@ -23,21 +23,40 @@ require dasllama/dasllama_tune_scope  // nolint:STYLE030 — the dasllama [tune_
 
 // ===== little-endian byte readers =====
 
-def rd_u16(b : array<uint8> | #; o : int64) : uint {
-    return uint(b[o]) | (uint(b[o + 1l]) << 8u)
+def rd_u16(b : array<uint8> | #; o : int64) : uint => uint(b[o]) | (uint(b[o + 1l]) << 8u)
+
+def rd_u32(b : array<uint8> | #; o : int64) : uint =>
+    uint(b[o]) | (uint(b[o + 1l]) << 8u) | (uint(b[o + 2l]) << 16u) | (uint(b[o + 3l]) << 24u)
+
+def rd_f32(b : array<uint8> | #; o : int64) : float => unsafe(reinterpret<float>(rd_u32(b, o)))
+
+let GGML_BIN_Q8_BLOCK_ELEMS = 32l   //!< a Q8_0 block of a ggml bin: an f16 scale, then this many quants
+let GGML_BIN_Q8_BLOCK_BYTES = 34l
+
+//! `n` elements of a ggml bin tensor at byte `off` into `dst[dst_off..)` as f32: byte-wise, the bin stores its data
+//! unaligned; a Q8_0 element is its block's scale times its quant
+def ggml_bin_read_f32(b : array<uint8> | #; ttype : int; off, n : int64; var dst : array<float>; dst_off : int64) {
+    if (ttype == GGML_TYPE_F32) {
+        for (i in range64(n)) {
+            dst[dst_off + i] = rd_f32(b, off + i * 4l)
+        }
+    } elif (ttype == GGML_TYPE_F16) {
+        for (i in range64(n)) {
+            dst[dst_off + i] = f16_to_f32(rd_u16(b, off + i * 2l))
+        }
+    } else {
+        for (blk in range64(n / GGML_BIN_Q8_BLOCK_ELEMS)) {
+            let at = off + blk * GGML_BIN_Q8_BLOCK_BYTES
+            let scale = f16_to_f32(rd_u16(b, at))
+            for (i in range64(GGML_BIN_Q8_BLOCK_ELEMS)) {
+                dst[dst_off + blk * GGML_BIN_Q8_BLOCK_ELEMS + i] = scale * float(int8(b[at + 2l + i]))
+            }
+        }
+    }
 }
 
-def rd_u32(b : array<uint8> | #; o : int64) : uint {
-    return uint(b[o]) | (uint(b[o + 1l]) << 8u) | (uint(b[o + 2l]) << 16u) | (uint(b[o + 3l]) << 24u)
-}
 
-def rd_f32(b : array<uint8> | #; o : int64) : float {
-    return unsafe(reinterpret<float>(rd_u32(b, o)))
-}
-
-def rd_i32(b : array<uint8> | #; o : int64) : int {
-    return int(rd_u32(b, o))
-}
+def rd_i32(b : array<uint8> | #; o : int64) : int => int(rd_u32(b, o))
 
 // ===== K-quant superblock dequant (256-weight superblocks, on-disk Q4_K / Q6_K) =====
 
@@ -488,8 +507,7 @@ def private quantize_k5_superblock_p(x : float const?; var kq : uint8?; kqo : in
         var lq : int[256]
         var lsub : int[32]
         var wt : float[32]
-        var scales : float[8]
-        var mins : float[8]
+        var scales, mins : float[8]
         var max_scale = 0.0
         var max_min = 0.0
         for (j in range64(8l)) {
@@ -1166,6 +1184,15 @@ def guard_dst(name : string; what : string; off, need, have : int64) {
 // ===== f16 row converts (generic f32 <-> binary16-in-uint16, [tuned]) =====
 // Dual-use and HOT: the f16 KV-cache codec's store/read (per token), the weight-scale plane
 // convert and gguf's bulk f16 dequant (load), and the Accelerate batch prep (per prefill chunk).
+
+//! bf16 halfwords widened to f32 - each the top halfword of its float, so the shift is exact
+def widen_bf16(var dst : float?; src : uint16 const?; n : int64) {
+    unsafe {
+        for (i in range64(n)) {
+            dst[i] = reinterpret<float>(uint(src[i]) << 16u)
+        }
+    }
+}
 
 //! f32 -> f16 row convert. Clamps to ±65504 so inf can NEVER enter a cache/plane —
 //! O(kv_dim) per token at the KV store seam, free next to the reads.

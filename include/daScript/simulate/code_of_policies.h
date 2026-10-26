@@ -7,7 +7,7 @@ namespace das {
 
     // bump when CodeOfPolicies changes layout or meaning without changing size — a field
     // reorder/repurpose, or an insert that lands in a padding pocket (sizeof can't see those)
-    #define DAS_POLICIES_VERSION    1
+    #define DAS_POLICIES_VERSION    2
 
     // per-binary linkage for the ABI-stamp functions: at -O0 gcc/clang emit them as weak
     // default-visibility symbols, and the dynamic linker would bind every binary to the FIRST
@@ -110,7 +110,7 @@ namespace das {
         /*option*/ bool strict_properties = false;                 // if true, then properties are strict, i.e. a.prop = b does not get promoted to a.prop := b
         /*option*/ bool no_writing_to_nameless = true;             // if true, then writing to nameless variables (intermediate on the stack) is not allowed
     // environment
-        /*option*/ bool no_optimizations = false;                  // disable optimizations, regardless of settings
+        /*option*/ bool no_optimizations = false;                  // disable optimizations, regardless of settings; the compile's shared dependencies stay private to it (src/ast/ARCHITECTURE_SHARED.md#shared-promotion)
         /*option*/ bool no_fold_unsafe = false;                    // keep the `unsafe { }` wrapper in the AST after infer (tooling that walks a compiled program: the scope is invisible once foldUnsafe runs)
         /*option*/ bool fast_math = false;                         // allow VALUE-SAFE float optimizations with bit differences (reassociation, FMA contraction, signed-zero laxity); inf/NaN semantics are preserved — no rcp division, no nan-compare flips (JIT stamps reassoc|nsz|contract only). doubles stay bit-exact unless this is on
         /*option*/ bool disable_dse = false;                       // disable the dead-store-elimination pass
@@ -171,7 +171,8 @@ namespace das {
         vector<string> dll_search_paths;          // additional search paths for dll loading
     // one-liners
         /*option*/ bool temp_table_lint_warning = false;
-        bool module_cache = false;               // a script's compile_file runs under the default module cache; last: a cached JIT DLL binds earlier fields by offset
+        bool module_cache = false;               // a script's compile_file runs under the default module cache
+        /*option*/ uint32_t max_fast_call_depth = 0;  // interpreter only; 0 = unchecked. last: a cached JIT DLL binds earlier fields by offset
 
         // the abi_stamp truth (a member so the NSDMI above can call it - complete-class context).
         // Low byte 0 keeps a pre-stamp libDaScript reading this word seeing aot == false -

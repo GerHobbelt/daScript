@@ -45,7 +45,7 @@ def private upload_blocks(t : BlockTexture; sampler : GltfSampler; var bytes : u
             glCompressedTexImage2D(GL_TEXTURE_2D, level, format, m.width, m.height, 0, length(m.data), unsafe(addr(m.data[0])))
             bytes += uint64(long_length(m.data))
         }else{
-            var pixels <- decode_block_mip(t, level)
+            var inscope pixels <- decode_block_mip(t, level)
             glTexImage2D(GL_TEXTURE_2D, level, int(t.srgb ? GL_SRGB8_ALPHA8 : GL_RGBA8), m.width, m.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, unsafe(addr(pixels[0])))
             bytes += uint64(long_length(pixels)); delete pixels
         }
@@ -74,6 +74,7 @@ def gltf_packed_primitive_attributes(scene : GltfScene; mesh_index, material_ind
     var attributes = VERTEX_UV
     for (node in scene.nodes){if (node.mesh == mesh_index && node.skin >= 0){attributes |= VERTEX_SKIN}}
     if (material_index >= 0 && material_index < length(scene.materials) && scene.materials[material_index].normalTex >= 0){attributes |= VERTEX_TANGENT}
+    if (material_index >= 0 && material_index < length(scene.materials) && scene.materials[material_index].unlit){attributes |= VERTEX_COLOR}
     return attributes
 }
 def upload_processed_primitive(p : ProcessedPrimitive) : GltfGlPrimitive {

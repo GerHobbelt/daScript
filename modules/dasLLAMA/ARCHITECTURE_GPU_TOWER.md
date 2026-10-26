@@ -4,9 +4,11 @@ Companion to `ARCHITECTURE_GPU.md`; a section is cited by its anchor. This docum
 carries what a tower driver is and the registrations its hooks come through, the three routes
 that serve tower attention on Metal, the
 one-command-buffer encode chain each family the Metal tower driver serves gets, and the StyleTTS2
-synthesis chain, and the Pocket TTS codec and frames seats. The GPU backend role table these
-sections build on - the tower driver's role row included - stays in `ARCHITECTURE_GPU.md#gpu-backends`.
+synthesis chain. The GPU backend role table these sections build on - the tower driver's role row
+included - stays in `ARCHITECTURE_GPU.md#gpu-backends`.
 
+- `ARCHITECTURE_GPU_TOWER_POCKET.md` - the Metal tower driver's three Pocket TTS seats: the
+  codec, the frame loop and the text prompt.
 - `ARCHITECTURE_GPU_TOWER_VULKAN.md` - the Vulkan tower driver's row classes and attention
   routes, its encode chains, and the Vulkan ASR-decoder driver.
 
@@ -19,6 +21,14 @@ reload or weights-epoch listener. The registrations run in `dasllama_metal_tower
 Metal tower), `dasllama_vulkan_tower_register` (the Vulkan tower) and
 `dasllama_vulkan_tts_register` (the Vulkan TTS driver, the Vulkan tower's TTS seats), so the
 hooks a function can reach are the ones those three register.
+
+A gate covers a hook when it asserts the hook's counter rising on a leg where that hook is the
+only reachable hook raising it. The counters: `vulkan_tower_stats()`'s or `metal_tower_stats()`'s
+`encodes` and `blocks` for a blocks hook (the whole-chain vision seats included), `encodes` for an
+encode hook, `convs` for a front, conv or chunk hook; for the mel hook `mels` on Vulkan and
+`metal_tower_mel_encodes()` on Metal; for the whisper-class tail hook `metal_tower_tail_encodes()`;
+on either tower, `styletts2_gpu_stats(<seat>)`'s or `pocket_gpu_stats(<seat>)`'s `served` for a
+TTS seat.
 
 ### The tower attention routes {#tower-attn-routes}
 
@@ -51,6 +61,77 @@ specification and the CPU-vs-GPU transcript cells are its parity instrument. Eve
 best-effort: it answers false (or -1) on any shape, knob, quant-mode or device decline, and the
 CPU chain serves that encode. Engage is read from counter deltas (`metal_tower_stats`,
 `metal_tower_f16_encodes`), never from "the model ran".
+
+The whisper-class chain serves both weight lanes. An f32 tower's block GEMMs read the f32 blob or
+its halfword twin. A q8 tower's read the q8 planes themselves: `tw_q8_attach` uploads the stem's
+second conv and each block's six GEMM regions once a tower, out of the CPU backend's repack layout
+into the 34-byte q8 blocks the prefill driver's q8 GEMM reads (`q8_region_to_metal_blob`, the
+transform the ASR-decoder driver uploads its planes through), and every site runs on the prefill
+ladder (`pf_enc_q8_mm`) with the activations converted to one half panel where that ladder reads
+one. The device blob is 34/32 of the q8 planes and no image carries it; it drops with the weights
+epoch and the tower shutdown. The stem's first conv reads the f32 blob on both lanes - its
+3 x n_mel columns are not quantized - and where those columns are off the GEMM's 32 lattice (80
+mels: 240) it reads a device copy of its rows zero-padded to the lattice (`tw_conv1_pad_attach`),
+the im2col pass padding its own rows with zeros to the same width. A position plane adds through
+the shared bias rows stamp (`tw_bias` at `BIAS_ACT_NONE`) as one bias row as wide as the rows it
+covers, because the stamp repeats its bias row every `d` elements: the whisper stem's row is its
+whole plane, so each position row lands once; qwen3a's is one chunk's position rows, so every chunk
+takes them, in a second pass after the `conv_out` bias row - the CPU's order, (x + b) + pos.
+
+The whisper-class chain has three forms over one block loop (`TwForm`): the blocks alone, the
+blocks with the tower's post-norm (whisper's encoder output), and the blocks with the projector
+tail - the chat towers' soft tokens (`tw_tail_body`). The tail is the CPU tail's steps at its
+widths, by projector kind: qwen2a pools row pairs (`MetalTwPool2`), norms, and runs one biased
+linear; voxtral pools, norms, and runs the stacked rows through a GELU MLP; ultravox norms every
+position, rms-norms the stacked rows at the projector's own eps, and runs the gated MLP
+(`MetalTwSwigluRows`: silu of a row's second half times its first). A stack is no kernel: the
+stacked row is the same memory read at the wider row. The tail's GEMMs read the f32 blob on the
+f32 tile, so the tail seat serves it on an f32 tower whose widths sit on that tile's lattice
+(`tw_tail_shape_ok`) and serves the blocks alone otherwise - a q8 tower's projector planes are not
+on the device - answering which it served (`TowerTailServed`), so the CPU tail runs exactly when
+the device one did not. Its engage counter is `metal_tower_tail_encodes`, its lever
+`set_metal_tower_tail`.
+
+The vision chains run their ends on the device too. Every vision chain takes the image planes, not
+the stem's columns: the chain uploads them (`tw_planes_up`) and runs the patch im2col on the device
+(`tw_patch_im2col` on `MetalTwPatchIm2col`, the shared `GkPatchIm2col` template), which writes the pad
+rows and columns zero and applies gemma4v's [0, 1] -> [-1, 1] map as its scale and shift; the family
+skips its CPU im2col while a chain is registered and runs it only after a decline. Each block loop
+runs block 0's pre-norm alone, ahead of the loop, and folds every later pre-norm into the residual
+seam before it: the seam stamps (`MetalTwAddLn`, `MetalTwAddRms`, `MetalTwAddPostRms`, the Metal stamps
+of the shared `GkPostAddLn` template) add the branch and write the next block's pre-norm from the
+updated row in one pass, the last seam writing the tower's post-norm where the chain has one (the
+whisper-class `ln_post` form, qwen25v's post-rms) and no norm otherwise, and a tail reads the rows the
+last seam left. The gemma3v chain ends in its tail - the post-norm, the grid mean pool
+(`MetalTwPool2d`), the soft norm and the projection (`g3v_tail_body`). The gemma4v chain runs the
+patch conv and the 2-axis position add itself (`g4v_stem_body`), then ends in its tail: the grid pool, the sqrt(d) scale and the
+standardize in one row pass (`MetalTwAffineRows`), the weightless rms, and the projection between its
+two clamps (`g4v_tail_body`). With the tail on the device the soft tokens alone come back; the block
+rows stay there. The vision chains serve both weight lanes: an exact tower's block GEMMs ride the f32
+tiles over the blob (the crowned halfword twin where the crown compiles it), a q8 tower's the prefill
+ladder's q8 GEMM over the vision q8 slab (`g_tw_q8_vis`: the family's block regions repacked once a
+tower beside the audio slab, `tw_q8_attach_vis` over the family's block list - `ln_block_regions` over
+`gemma3v_ln_offs`, `qwen3v_block_regions` with the fused qkv split three ways, `gemma4v_block_regions` -
+keyed by the tower's q8 planes and their scales) with the half feed where the ladder reads one (`pf_q8_mm_half`), so a pinned q8 tower
+serves on the driver and declines nothing; the families register the f32 lane as served, so the policy
+prefers the file's planes under the tower.
+
+The gemma4a chain ends in the projector tail, in the blocks' command buffer: the out projection
+and its bias at the encoder's own output width (`gemma4a_mid_dim`, the length of the weightless
+norm's ones row), that norm, then the audio embedder to the decoder's width (`proj_dim`). The
+embedder is square on E2B (1536 by 1536) and widens on E4B (1536 to 2560), so the two widths are
+read apart off the file - the out projection's rows, the embedder's rows - and never assumed equal.
+The chain lands the soft tokens in `Gemma4aState.out` and says so (`out_ready`).
+
+Canary's front runs whole on the device ahead of its block seat (`metal_canary_front`, the front
+seat): off the CPU-windowed frames, the DFT as a GEMM over the transposed twiddles, the power
+spectrum, the mel sums, `MetalCnMelNorm` - the log and the per-feature normalization over the valid
+frames, one thread a feature - then the parakeet front's convs and the input projection. The first
+conv is the im2col GEMM both homes run (the shared `GkIm2col2d` at one channel, the f16-staged GEMM
+over a `[ch][32]` tap panel kept once an encoder - `tw_conv0_panel`, canary's taps channel-major in
+its file, parakeet's tap-major - and the bias-and-ReLU rows); the two depthwise convs stamp the template both homes share
+(`GkDwConv2d`) over the file's taps, and a stage's valid rows ride the template's length mask
+(`ih_valid`), so a row past them adds nothing and no mask pass is dispatched.
 
 The FastConformer chain (canary and parakeet share it: one context, one block body over the
 canary offsets record, parakeet's offsets mapped onto it with no GEMM biases and its tap-major
@@ -92,12 +173,14 @@ lever and `metal_tower_fc_dev_encodes()` the engage counter.
 
 Parakeet's chain starts at the mel: its whole-encode seat (`metal_parakeet_encode`,
 `register_parakeet_gpu_encode`) runs the subsample front and the pre-projection ahead of the
-blocks in the same command buffer - the first conv off the one-channel mel with its bias and
-ReLU and the two depthwise stride-2 convs as one-thread-an-element kernels over the blob's
-tap-major taps (`MetalPkFrontConvT`), the two 1x1 convs and the pre-projection as weighted GEMMs
-of the chain with a bias-and-ReLU or a bias row pass behind them, the feature permute between
-(`MetalPkXf`, which also zeroes the pre-projection's row pad). The rel table is the session's
-(`parakeet_pos_table`, built once a frame count). The seat answers -1 with nothing counted on a
+blocks in the same command buffer - the first conv off the one-channel mel as the im2col GEMM
+with its bias-and-ReLU rows and the two depthwise stride-2 convs as one-thread-an-element kernels over
+the blob's tap-major taps (the shared `GkDwConv2d` under TAP_MAJOR), the two 1x1 convs and the
+pre-projection as weighted GEMMs of the chain with a bias-and-ReLU or a bias row pass behind them,
+the feature permute between (the shared `GkFeatShuffle`, which also zeroes the pre-projection's row
+pad). The rel table is built on the device at the head of every FastConformer command buffer
+(the shared `GkRelSinCos` into the context's zero-padded table, canary's and parakeet's alike), so
+no session table is uploaded. The seat answers -1 with nothing counted on a
 q8 model, a clip whose first conv output passes 1 GB (about five minutes of audio), a shape off
 the lattice or `set_metal_parakeet_front(false)`: the CPU front runs then and the block seat
 serves behind it. `metal_tower_stats().convs` counts the encodes whose front ran on the device.
@@ -183,67 +266,3 @@ the slab allocation), `gpu_error`. Engage is each seat's `served` counter beside
 `metal_tower_stats` (one encode per seat per chunk); the parity instruments are the per-stage
 cells on identical inputs on the f32 lane (`tests/CLAUDE.md`, the kitten file) and the served
 synthesis across the knob.
-
-### The tower driver's Pocket codec seat {#tower-pocket-codec}
-
-The Pocket TTS codec decoder rides the tower driver as the first seat of the family's hook record
-(`register_pocket_gpu`, `ARCHITECTURE_MEDIA.md#tower-gpu-hook`): the latents of a chunk go up, the
-samples come back, one command buffer. The chain is the CPU's `pocket_decode_latents` run as its
-first window over the whole chunk - the stream's carries are the first window's zero rows, and the
-CPU's windows equal that one shot to float noise (`ARCHITECTURE_POCKET.md#pocket-codec-stream`) - so no carry
-crosses a dispatch: the 1x1 latent projection and every dense conv on the conv-gathering GEMM stamp
-(a forward conv behind `k - stride` zero rows, a transposed conv's first `t * stride` output rows;
-the input row stride `xs` of `St2ConvArgs` lets a conv read the padded width its producer wrote),
-the depthwise upsample on the residual pool kernel, the two codec transformer layers on the dense
-GEMM stamp with the layer scale, the prefill rows rope over the layer's row stride with the CPU's own
-cos and sin tables (no device trigonometry) and a windowed causal attention kernel over device K/V
-rows, ELU and the row copies on one row kernel, the sample column picked out of the last conv's
-padded rows. Every GEMM is the
-f32-exact stamp: the codec reads within 1e-6 of the CPU chain on the f32 lane that way on the M5
-Max (1e-2 on the served q8 and K-quant lanes, whose CPU chains quantize their activations), and the f16-staged twins
-bought no time on this chain (the row kernels and the attention, not the GEMMs, carry its cost)
-at three orders of magnitude of agreement. The slab holds every codec weight, keyed on the
-addresses and the lane as the StyleTTS2 slabs are, and drops with them. A chunk past
-`PK_CODEC_MAX_FRAMES` latent frames declines on its row budget (the one-shot rows scale with the
-chunk) and the CPU's windows serve it; the other declines are `knob`, `shape` (a channel count off
-the 8-run lattice, a head over 128 wide, a transformer width off the 32 lattice), `device` and
-`gpu_error`. The frame loop is the family's second seat (`ARCHITECTURE_GPU_TOWER.md#tower-pocket-frames`).
-
-### The tower driver's Pocket frames seat {#tower-pocket-frames}
-
-The Pocket frame loop - the backbone step and the flow head for every frame of a chunk - rides
-the tower driver as the family's second seat once the prompt's rows sit in the voice's caches:
-the CPU's `pocket_synthesize` loop, dispatch for dispatch, in batches of `pocket_frame_batch()` frames
-(eight) per command buffer, the EOS logits read back and the stop rule walked on the host between
-batches (`pocket_frames_batched`, the host loop both GPU drivers run), the latents and the
-conditioning rows read back once at the end. A voice slot holds the device K/V rows `[cap][d]` per
-backbone layer, keyed (`tts_pk_voice_current`, the residency both drivers read) on the caches'
-addresses, their fill and capacity and a sample of the rows they hold: the voice's prompt rows are transposed in once at
-attach, a chunk's text rows behind them every chunk, and the frames append after those - nothing
-comes back to the host, since the CPU chain forgets a chunk's rows by resetting the fill. The
-key samples the rows because an address alone outlives the voice that held it: a later voice's
-caches can land at the freed address with the same fill and capacity. The
-backbone's q8 linears (a K-quant linear requantized to q8 from its dequantized rows, so the small
-form serves) ride the decode GEMV over a 34B-block blob with their bias rows in the slab, the bias
-a row add after the GEMV (the row GEMV's fused-bias q8 form as it stood before the lane-map fold,
-one lane a block, ran a frame 20% slower than the decode GEMV's split-K walk - `PERF_LEDGER.md`'s
-Pocket frame loop entry; the folded row stamp keeps the epilogue kinds only); every
-f32 linear rides the row GEMV over the slab's rows - a simdgroup a row, x staged in threadgroup
-memory - so the parity lane runs exact. Per layer: the first norm (the layer before's residual
-joined in the same dispatch - the tower LayerNorm's ADD stamp), the fused q/k/v projection, the
-decode rail's rope-and-store kernel rotating q and k and storing k and v into the voice slot's row
-(its f32 stamp, the rope tables and the caches bound at the position's row), the attention row (a
-threadgroup per head, the scores staged, one softmax, the value sum in parts), the out projection,
-the residual join with the second norm, the two ffn projections around the tanh GELU. The out norm writes the conditioning row straight
-into the readback rows, and the head's GEMVs carry their norm, modulation and activations as
-prologue and epilogue stamps (the LayerNorm and adaLN modulation in, the SiLU, the gated
-residual, the SiLU over the time constant, the tail that adds the noise and denormalizes the
-latent). The noise is drawn a batch ahead in the frame order the CPU draws it, so a teacher-forced
-run reads the same stream, and the last batch's draws past the frames made are rewound so the
-generator ends where the CPU loop's does; a command buffer that fails declines the loop as
-`gpu_error`, the generator is put back to where the chunk found it, and the CPU loop reruns the
-chunk from the caches and the stream as they were. The other declines are `knob`, `shape` (the
-backbone and head widths off the 32 lattice, a head size other than the 64 the attention row is
-stamped for, a cache past 2048 rows, a width past the GEMV's 4096-wide stage) and `device`. On the served lanes the seat reads within the CPU chain's own
-distance from the reference: the CPU quantizes the activations it feeds a q8 or K-quant plane, the
-tower feeds them f32.

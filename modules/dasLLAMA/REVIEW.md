@@ -96,8 +96,8 @@ compiles - wherever the diff puts it, applies `modules/REVIEW_SHADER_EMITTERS.md
 
 **A change to the image rail - `dasllama/dasllama_image.das`, or, wherever the diff puts it, a
 `.dlim` mint (building a `.dlim` from a gguf), a `.dlim` load, an image identity, a flavor (the
-backend-and-layout variant an image is baked for, one part of its identity), or what
-`resident_would_serve` answers, or an environment variable or setter it or any function it calls
+backend-and-layout variant an image is baked for, one part of its identity), which prepared
+image (its tag, lane or flavor) a load requests or mints, or what `resident_would_serve` answers, or an environment variable or setter it or any function it calls
 reads - applies `REVIEW_IMAGE.md`.** The mint of a
 trimmed image - one written without the weight planes the GPU driver holds - reads that answer
 to decide whether to trim.
@@ -273,8 +273,9 @@ a model card (the provenance-and-licence page beside a released model or pack), 
 adopt or reject a model, a dataset, or a dependency; anywhere else in prose it is a defect.**
 
 **A diff that moves a family encode stage - a `dasllama/dasllama_<family>.das` stage that turns
-input into embeddings - onto a GPU hook leaves the CPU form in place and changes none of its
-arithmetic.** The CPU form serves every box with no driver.
+input into embeddings or fills a cache the next stage reads - onto a GPU hook leaves the CPU form
+in place and changes no value that code after the stage reads.** The CPU form serves every box
+with no driver.
 
 **A call to a `set_*_q8` lane setter - one that picks whether a model family's weights run the
 q8 or the float path - in a file under `dasllama/` or `harness/`, outside the body of another

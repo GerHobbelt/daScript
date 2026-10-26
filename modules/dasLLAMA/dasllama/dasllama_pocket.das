@@ -302,9 +302,8 @@ let private FRAME_RATE = 12.5
 
 def private need_tensor(m : GGUFMeta; name : string) : int => gguf_need_tensor(m, name, "pocket")
 
-def private read_arr(m : GGUFMeta; bytes : array<uint8> | #; name : string) : array<float> {
-    return <- gguf_read_f32_arr(m, bytes, name, "pocket")
-}
+def private read_arr(m : GGUFMeta; bytes : array<uint8> | #; name : string) : array<float> =>
+    <- gguf_read_f32_arr(m, bytes, name, "pocket")
 
 def private read_weight(m : GGUFMeta; bytes : array<uint8> | #; name : string) : TtsWeight => TtsWeight(a <- read_arr(m, bytes, name))
 
@@ -340,8 +339,7 @@ def private read_linear(m : GGUFMeta; bytes : array<uint8> | #; prefix : string;
     if (g_stage_native && gguf_tensor_type(m, wname) == GGML_TYPE_Q4_K) {
         // the kq lane: the file's own K-quant planes, straight into the layer (the width rule is the layer's own)
         let n = l.nout * l.nin
-        var inscope kq : array<uint8>
-        var inscope ks : array<uint8>
+        var inscope kq, ks : array<uint8>
         kq |> reserve_resize(n / 256l * kq_qsb(KqFmt.k4))
         ks |> reserve_resize(n / 256l * kq_ssb(KqFmt.k4))
         gguf_transcode_kq(m, bytes, wname, KqFmt.k4, kq, ks, 0l, n)
@@ -581,9 +579,8 @@ def private read_roster(g : GGUFMeta; bytes : array<uint8> | #; var m : PocketMo
 
 //! Whether `name` is a voice this model speaks: a roster voice (stored as latent frames, or as
 //! a clip in the older file form) or a cloned one.
-def pocket_has_voice(m : PocketModel; name : string) : bool {
-    return key_exists(m.voice_latents, name) || key_exists(m.voices, name)
-}
+def pocket_has_voice(m : PocketModel; name : string) : bool =>
+    key_exists(m.voice_latents, name) || key_exists(m.voices, name)
 
 //! Load a converted Pocket TTS GGUF: the scalars from its `pocket.*` metadata, the weights
 //! prepared for the rows kernels, the tokenizer, and the roster (its states built on first use).
@@ -695,16 +692,20 @@ def private proj(l : TtsLinear; x : array<float>; t : int64; @scratch @exact_siz
     }
 }
 
+//! `kv_only` ends the layer at its cache append - the last layer of a prompt, whose residual nothing reads
 def private layer_attention(l : PocketLayer; tf : PocketTransformer; var x : array<float>; t, pos0 : int64;
-                            var kc : TtsKvCache; var sc : PocketScratch) {
+                            var kc : TtsKvCache; var sc : PocketScratch; kv_only : bool = false) {
     let d = tf.d
     let dh = d / tf.heads
     layernorm_rows_into(x, sc.xb, t, d, l.norm1, tf.eps)
     proj(l.in_proj, sc.xb, t, sc.qkv)
     split_qkv(sc.qkv, t, d, sc.q, sc.k, sc.v)
-    rope_rows(sc.q, t, d, dh, pos0, tf.period)
+    if (!kv_only) {
+        rope_rows(sc.q, t, d, dh, pos0, tf.period)
+    }
     rope_rows(sc.k, t, d, dh, pos0, tf.period)
     kv_cache_append(kc, sc.k, sc.v, t, d)
+    return if (kv_only)
     attention_causal_rows(sc.q, t, d, tf.context, kc, sc.ctx)
     proj(l.out_proj, sc.ctx, t, sc.xb)
     if (!empty(l.scale1.a)) {
@@ -726,10 +727,15 @@ def private layer_ffn(l : PocketLayer; tf : PocketTransformer; var x : array<flo
 }
 
 //! `t` rows of x [t][d] through the transformer at positions pos0.., every layer's keys and
-//! values appended to its cache; x carries the residual out.
-def transformer_rows(tf : PocketTransformer; var x : array<float>; t, pos0 : int64; var caches : array<TtsKvCache>; var sc : PocketScratch) {
+//! values appended to its cache; x carries the residual out - unless `kv_only_last`, which ends
+//! the last layer at its cache append (a prompt, whose residual nothing reads).
+def transformer_rows(tf : PocketTransformer; var x : array<float>; t, pos0 : int64; var caches : array<TtsKvCache>; var sc : PocketScratch;
+                     kv_only_last : bool = false) {
+    let last = length(tf.layers) - 1
     for (i, l in iter_range(tf.layers), tf.layers) {
-        layer_attention(l, tf, x, t, pos0, caches[i], sc)
+        let kv_only = kv_only_last && i == last
+        layer_attention(l, tf, x, t, pos0, caches[i], sc, kv_only)
+        continue if (kv_only)
         layer_ffn(l, tf, x, t, sc)
     }
 }
@@ -748,9 +754,8 @@ def private caches_init(var caches : array<TtsKvCache>; tf : PocketTransformer; 
 //! the rows a conv sees again ahead of a window: a forward conv its last `k - stride` inputs
 //! (the causal pad's width, zeros before the first window), a transposed one the inputs whose
 //! taps reach past the rows it emitted
-def private carry_rows(c : TtsConv1d) : int64 {
-    return c.transposed ? (c.k + c.stride - 1l) / c.stride - 1l : c.k - c.stride
-}
+def private carry_rows(c : TtsConv1d) : int64 =>
+    c.transposed ? (c.k + c.stride - 1l) / c.stride - 1l : c.k - c.stride
 
 def private carry_init(var cr : PocketConvCarry; c : TtsConv1d) {
     cr.n = c.transposed ? 0l : carry_rows(c)
@@ -827,10 +832,16 @@ typedef PocketCodecGpuFn = function<(m : PocketModel; latents : array<float>; fr
 typedef PocketFramesGpuFn = function<(m : PocketModel; var vs : PocketVoiceState; n_txt : int64; std : float; frames_after_eos : int;
                                       captured, forced : array<float>; max_frames : int64; var sc : PocketScratch) : tuple<frames : int64; eos_at : int64>>
 
+//! The text prompt's rows through the backbone after the voice's: `prompt_rows`' contract - the
+//! embedding rows of `sc.rows` (`pocket_prompt_embed`) at positions vs.len.., every layer's cache
+//! appended on the host; false = declined, the caches untouched.
+typedef PocketPromptGpuFn = function<(m : PocketModel; var vs : PocketVoiceState; n_txt : int64; var sc : PocketScratch) : bool>
+
 //! A driver's seats, one per stage; a seat left empty keeps the CPU form for that stage.
 struct PocketGpuDriver {
     codec : PocketCodecGpuFn
     frames : PocketFramesGpuFn
+    prompt : PocketPromptGpuFn
 }
 
 var private g_pk_drv : PocketGpuDriver
@@ -838,7 +849,8 @@ var private g_pk_drv_prev : PocketGpuDriver   //! the registration a caller's se
 
 let private PK_SEAT_CODEC = 0
 let private PK_SEAT_FRAMES = 1
-var private g_pk_seats <- tts_seats(["codec", "frames"])
+let private PK_SEAT_PROMPT = 2
+var private g_pk_seats <- tts_seats(["codec", "frames", "prompt"])
 
 [arch(at = "../ARCHITECTURE_MEDIA.md#tower-gpu-hook")]
 def register_pocket_gpu(drv : PocketGpuDriver) {
@@ -1005,7 +1017,7 @@ def voice_state_from_latents(m : PocketModel; lat : array<float>; frames : int64
     }
     vs.len = frames + bos
     caches_init(vs.caches, m.backbone, vs.len + chunk_rows(int64(POCKET_MAX_TOKENS)))
-    transformer_rows(m.backbone, rows, vs.len, 0l, vs.caches, sc)
+    transformer_rows(m.backbone, rows, vs.len, 0l, vs.caches, sc, kv_only_last = true)
     return <- vs
 }
 
@@ -1131,9 +1143,8 @@ def prepare_pocket_text(m : PocketModel; text : string) : tuple<prepared : strin
 }
 
 //! Token ids of a prepared chunk.
-def pocket_text_ids(m : PocketModel; prepared : string) : array<int64> {
-    return <- unigram_encode(m.tok, prepared, m.unk_id, m.byte_fallback, m.reserved_ids)
-}
+def pocket_text_ids(m : PocketModel; prepared : string) : array<int64> =>
+    <- unigram_encode(m.tok, prepared, m.unk_id, m.byte_fallback, m.reserved_ids)
 
 let POCKET_MAX_TOKENS = 50   // the reference driver's chunk budget; past it the model skips words
 
@@ -1146,8 +1157,7 @@ def private marker_ids(m : PocketModel; s : string) : array<int64> {
 
 // a boundary that sits right after a decimal point's period is no sentence end
 def private decimal_boundary(m : PocketModel; ids : array<int64>; at : int) : bool {
-    var inscope head : array<int64>
-    var inscope tail : array<int64>
+    var inscope head, tail : array<int64>
     head |> reserve(at)
     tail |> reserve(length(ids) - at)
     for (i, id in count(), ids) {
@@ -1325,9 +1335,7 @@ def private grow_cache(var kc : TtsKvCache; cap : int64) {
 }
 
 //! the rows a chunk of `n_txt` tokens can take after the voice: its text and every frame the cap allows
-def private chunk_rows(n_txt : int64) : int64 {
-    return n_txt + pocket_max_frames(n_txt) + 1l
-}
+def private chunk_rows(n_txt : int64) : int64 => n_txt + pocket_max_frames(n_txt) + 1l
 
 // the voice's rows stay; the previous chunk's text and frames are forgotten, and a chunk the
 // caches cannot hold - `n_txt` text rows plus every frame the cap allows - grows them first
@@ -1344,9 +1352,8 @@ def private caches_ready(var vs : PocketVoiceState; n_txt : int64) {
 [cold_path]
 //! The loop's noise for latent element `at` of the chunk: the captured stream's value where it
 //! reaches, the generator's normal at `std` past it - both loops draw in this order.
-def pocket_noise_at(var sc : PocketScratch; captured : array<float>; at : int64; std : float) : float {
-    return at < long_length(captured) ? captured[at] : rng_normal(sc.rng) * std
-}
+def pocket_noise_at(var sc : PocketScratch; captured : array<float>; at : int64; std : float) : float =>
+    at < long_length(captured) ? captured[at] : rng_normal(sc.rng) * std
 
 //! The EOS rule on frame `frame`'s logit: the first crossing of the threshold pins `eos_at`, and
 //! the loop stops `frames_after_eos` frames past it - both loops stop by this one rule.
@@ -1413,17 +1420,36 @@ def private warn_no_eos(frames, n_txt : int64) {
 }
 
 //! The frames one chunk needs at most: the reference's speech-rate estimate plus a margin.
-def pocket_max_frames(n_tokens : int64) : int64 {
-    return int64(ceil((float(n_tokens) / MAX_GEN_TOKENS_PER_SECOND + GEN_SECONDS_PADDING) * FRAME_RATE))
+def pocket_max_frames(n_tokens : int64) : int64 =>
+    int64(ceil((float(n_tokens) / MAX_GEN_TOKENS_PER_SECOND + GEN_SECONDS_PADDING) * FRAME_RATE))
+
+//! The text prompt's embedding rows [n_txt][d] into `sc.rows` - the backbone's input on either rail.
+def pocket_prompt_embed(m : PocketModel; ids : array<int64>; var sc : PocketScratch) {
+    let d = m.backbone.d
+    unsafe(scratch_resize(sc.rows, long_length(ids) * d))
+    gather_rows(sc.rows, m.text_emb.a, ids, d)
 }
 
 //! The text prompt's rows through the backbone after the voice's, every layer's cache filled.
 def private prompt_rows(m : PocketModel; ids : array<int64>; var vs : PocketVoiceState; var sc : PocketScratch) {
-    let d = m.backbone.d
     let n_txt = long_length(ids)
-    unsafe(scratch_resize(sc.rows, n_txt * d))
-    gather_rows(sc.rows, m.text_emb.a, ids, d)
-    transformer_rows(m.backbone, sc.rows, n_txt, vs.len, vs.caches, sc)
+    pocket_prompt_embed(m, ids, sc)
+    if (g_pk_drv.prompt != null) {
+        tts_seat_call(g_pk_seats, PK_SEAT_PROMPT)
+        if (invoke(g_pk_drv.prompt, m, vs, n_txt, sc)) {
+            tts_seat_served(g_pk_seats, PK_SEAT_PROMPT)
+            return
+        }
+    }
+    transformer_rows(m.backbone, sc.rows, n_txt, vs.len, vs.caches, sc, kv_only_last = true)
+}
+
+//! The prompt's rows into the voice's caches alone, on whichever rail serves it - `pocket_synthesize`'s opening, the
+//! caches reset to the voice's rows first.
+[cold_path]
+def pocket_prompt_rows(m : PocketModel; ids : array<int64>; var vs : PocketVoiceState; var sc : PocketScratch) {
+    caches_ready(vs, long_length(ids))
+    prompt_rows(m, ids, vs, sc)
 }
 
 //! One prepared chunk in one voice: the text prompt after the voice's rows, frames until EOS plus

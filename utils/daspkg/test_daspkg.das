@@ -5,6 +5,7 @@ require dastest/testing_boost public
 
 require daslib/fio
 require daslib/clargs
+require daslib/defer
 require strings
 require daslib/strings_boost
 
@@ -2198,8 +2199,7 @@ def test_cmd_release_ships_minted_scope_manifest(t : T?) {
         tt |> success(find(fread(shipped), "stub_kernel") >= 0, "the shipped winners are the stub mint's")
         // the ship contract: STRICTLY newer than the exe, or the runtime staleness rule drops
         // every kernel to its fallback and the artifact cannot name its winners
-        var exe_fs : FStat
-        var side_fs : FStat
+        var exe_fs, side_fs : FStat
         tt |> success(stat(bundle_exe_path(out_dir, "tunestub"), exe_fs), "exe stats")
         tt |> success(stat(shipped, side_fs), "shipped sidecar stats")
         tt |> success(int64(side_fs.mtime) > int64(exe_fs.mtime), "shipped sidecar mtime is strictly newer than the exe")
@@ -2798,7 +2798,7 @@ def test_ship_external_files(t : T?) {
     }
     fwrite(path_join(root, "victim.txt"), "untouched")
     for (entry in ["README.md@../victim.txt", "README.md@nested/../../victim.txt", "README.md@{root}/absolute.txt", "README.md@nested/quote\".txt", "README.md@nested\\..\\..\\victim.txt", "@empty.txt", "README.md", "missing-external-source@missing.txt"]) {
-        var rejected : array<string>
+        var inscope rejected : array<string>
         t |> equal(ship_external_files("pkg", bundle, [entry], rejected), 1, entry)
         t |> equal(length(rejected), 0, "rejected entry is not recorded as shipped")
     }
@@ -2870,18 +2870,363 @@ def test_platform_gate(t : T?) {
     t |> run("an unknown name is an error even under --force") @(t : T?) {
         t |> equal(1, platform_gate("pkg", host, ["amiga"], true))
     }
+}
+
+[test]
+def test_sdk_gate(t : T?) {
+    t |> run("no floor passes") @(t : T?) {
+        t |> equal(0, sdk_gate("pkg", "", "0.6.4", false))
+    }
+    t |> run("a floor at or below the SDK passes") @(t : T?) {
+        t |> equal(0, sdk_gate("pkg", "0.6.4", "0.6.4", false))
+        t |> equal(0, sdk_gate("pkg", "0.4", "0.6.4", false))
+    }
+    t |> run("a floor above the SDK refuses") @(t : T?) {
+        t |> equal(1, sdk_gate("pkg", "0.6.5", "0.6.4", false))
+        t |> equal(1, sdk_gate("pkg", "1.0", "0.6.4", false))
+    }
+    t |> run("--force turns the refusal into a warning") @(t : T?) {
+        t |> equal(0, sdk_gate("pkg", "0.6.5", "0.6.4", true))
+    }
+    t |> run("a floor that is not a version is an error even under --force") @(t : T?) {
+        t |> equal(1, sdk_gate("pkg", "latest", "0.6.4", true))
+    }
+}
+
+let private BROKEN_MANIFEST = "options gen2\nrequire daslib/daspkg\n[export]\ndef package() \{\n    package_from_a_newer_sdk(\"x\")\n\}\n"
+
+// A fresh directory from create_temp_directory, owned by the calling run.
+def private scratch_dir(t : T?; prefix : string) : string {
+    var error : string
+    let dir_path = create_temp_directory(prefix, error)
+    t |> equal("", error)
+    return dir_path
+}
+
+[test]
+def test_manifest_gate(t : T?) {
+    let host = get_platform_name()
     t |> run("a directory without a manifest passes") @(t : T?) {
-        let tmp_dir = "{get_das_root()}/_daspkg_test_gate_nomanifest"
-        mkdir(tmp_dir)
-        t |> equal(0, platform_gate(tmp_dir, "pkg", host, false))
+        let tmp_dir = scratch_dir(t, "daspkg-gate-")
+        t |> equal(0, manifest_gate(tmp_dir, "pkg", host, false))
         force_rmdir(tmp_dir)
     }
-    t |> run("a manifest that does not compile passes - the install fails on it later, not here") @(t : T?) {
-        let tmp_dir = "{get_das_root()}/_daspkg_test_gate_broken"
-        mkdir(tmp_dir)
+    t |> run("a manifest that does not compile fails, even under --force") @(t : T?) {
+        let tmp_dir = scratch_dir(t, "daspkg-gate-")
         fwrite("{tmp_dir}/.das_package", "this is not daslang\n")
-        t |> equal(0, platform_gate(tmp_dir, "pkg", host, false))
+        t |> equal(1, manifest_gate(tmp_dir, "pkg", host, false))
+        t |> equal(1, manifest_gate(tmp_dir, "pkg", host, true))
         force_rmdir(tmp_dir)
+    }
+    t |> run("a floor above this daslang refuses") @(t : T?) {
+        let tmp_dir = scratch_dir(t, "daspkg-gate-")
+        let no_deps : array<string>
+        write_passing_pkg(tmp_dir, "pkg", ["package_min_sdk(\"999.0\")"], no_deps)
+        t |> equal(1, manifest_gate(tmp_dir, "pkg", host, false))
+        t |> equal(0, manifest_gate(tmp_dir, "pkg", host, true))
+        force_rmdir(tmp_dir)
+    }
+    t |> run("another platform is the sweep's skip code even when the floor also refuses") @(t : T?) {
+        let tmp_dir = scratch_dir(t, "daspkg-gate-")
+        let no_deps : array<string>
+        write_passing_pkg(tmp_dir, "pkg", ["package_min_sdk(\"999.0\")", "package_platform(\"{other_platform()}\")"], no_deps)
+        t |> equal(RC_UNSUPPORTED_PLATFORM, manifest_gate(tmp_dir, "pkg", host, false))
+        force_rmdir(tmp_dir)
+    }
+    t |> run("the platform declaration still gates") @(t : T?) {
+        let tmp_dir = scratch_dir(t, "daspkg-gate-")
+        write_platform_pkg(tmp_dir, "pkg", other_platform())
+        t |> equal(RC_UNSUPPORTED_PLATFORM, manifest_gate(tmp_dir, "pkg", host, false))
+        force_rmdir(tmp_dir)
+    }
+}
+
+[test]
+def test_install_local_manifest_this_sdk_cannot_run(t : T?) {
+    t |> run("a manifest that does not compile is refused before anything lands") @(t : T?) {
+        let tmp = scratch_dir(t, "daspkg-nocompile-")
+        let tmp_root = "{tmp}/root"
+        let tmp_src = "{tmp}/src"
+        mkdir_rec("{tmp_root}/modules/nocompile")
+        fwrite("{tmp_root}/modules/nocompile/keep.txt", "an earlier install")
+        mkdir(tmp_src)
+        fwrite("{tmp_src}/.das_package", BROKEN_MANIFEST)
+        var lf : LockFile
+        t |> equal(1, install_local(tmp_root, "nocompile", tmp_src, lf, [force = true]))
+        t |> success(!has_package(lf, "nocompile"))
+        t |> success(fexist("{tmp_root}/modules/nocompile/keep.txt"))
+        force_rmdir(tmp)
+    }
+    t |> run("a build() that throws fails the install and rolls it back") @(t : T?) {
+        let tmp = scratch_dir(t, "daspkg-throwbuild-")
+        let tmp_root = "{tmp}/root"
+        let tmp_src = "{tmp}/src"
+        mkdir(tmp_root)
+        mkdir(tmp_src)
+        fwrite("{tmp_src}/.das_package", "options gen2\nrequire daslib/daspkg\n[export]\ndef package() \{\n    package_name(\"throwbuild\")\n\}\n[export]\ndef build() \{\n    panic(\"build hook sentinel\")\n\}\n")
+        var lf : LockFile
+        t |> equal(1, install_local(tmp_root, "throwbuild", tmp_src, lf))
+        t |> success(!has_package(lf, "throwbuild"))
+        t |> success(!fexist("{tmp_root}/modules/throwbuild"))
+        force_rmdir(tmp)
+    }
+}
+
+[test]
+def test_install_local_existing_target_held(t : T?) {
+    t |> run("an existing install a process holds a file of fails the reinstall, not the copy") @(t : T?) {
+        let tmp = scratch_dir(t, "daspkg-held-target-")
+        let tmp_root = "{tmp}/root"
+        let tmp_src = "{tmp}/src"
+        mkdir(tmp_root)
+        write_passing_pkg(tmp_src, "heldpkg")
+        var lf : LockFile
+        t |> equal(0, install_local(tmp_root, "heldpkg", tmp_src, lf))
+        // Windows cannot delete a file open without share-delete; elsewhere the unlink succeeds
+        let expected = get_platform_name() == "windows" ? 1 : 0
+        fopen("{tmp_root}/modules/heldpkg/.das_package", "rb") $(held) {
+            t |> success(held != null)
+            t |> equal(expected, install_local(tmp_root, "heldpkg", tmp_src, lf))
+        }
+        force_rmdir(tmp)
+    }
+}
+
+[test]
+def test_move_into_place(t : T?) {
+    t |> run("a tree moves") @(t : T?) {
+        let tmp = scratch_dir(t, "daspkg-move-")
+        let src = "{tmp}/src"
+        let dst = "{tmp}/dst"
+        mkdir(src)
+        mkdir("{src}/sub")
+        fwrite("{src}/sub/b.txt", "b")
+        t |> success(move_into_place(src, dst))
+        t |> success(fexist("{dst}/sub/b.txt"))
+        t |> success(!fexist(src))
+        force_rmdir(tmp)
+    }
+    t |> run("a file held open under the source still lands the whole tree") @(t : T?) {
+        let tmp = scratch_dir(t, "daspkg-move-held-")
+        let src = "{tmp}/src"
+        let dst = "{tmp}/dst"
+        mkdir_rec("{src}/sub")
+        mkdir_rec("{src}/.git")
+        mkdir_rec("{src}/build")
+        fwrite("{src}/a.txt", "a")
+        fwrite("{src}/sub/b.txt", "b")
+        fwrite("{src}/.git/HEAD", "ref: refs/heads/main\n")
+        fwrite("{src}/build/c.txt", "c")
+        fopen("{src}/a.txt", "rb") $(held) {
+            t |> success(held != null)
+            t |> success(move_into_place(src, dst))
+        }
+        t |> success(fexist("{dst}/a.txt"))
+        t |> success(fexist("{dst}/sub/b.txt"))
+        t |> success(fexist("{dst}/.git/HEAD"))
+        t |> success(fexist("{dst}/build/c.txt"))
+        force_rmdir(tmp)
+    }
+    t |> run("a link in the source fails the copy instead of dropping it") @(t : T?) {
+        let tmp = scratch_dir(t, "daspkg-move-link-")
+        let src = "{tmp}/src"
+        let target = "{tmp}/target"
+        mkdir(src)
+        mkdir(target)
+        fwrite("{src}/a.txt", "a")
+        let link = "{src}/linked"
+        var link_cmd = "ln -s \"{target}\" \"{link}\""
+        if (get_platform_name() == "windows") {
+            link_cmd = "cmd /c mklink /J \"{replace(link, "/", "\\")}\" \"{replace(target, "/", "\\")}\""
+        }
+        var out : string
+        if (run_cmd(link_cmd, out) != 0) {
+            t |> skip("could not create a junction/symlink here")
+            force_rmdir(tmp)
+            return
+        }
+        t |> success(!copy_dir_rec(src, "{tmp}/whole", true))
+        t |> success(copy_dir_rec(src, "{tmp}/content"))
+        force_rmdir(tmp)
+    }
+    t |> run("a destination that cannot be made fails and leaves nothing there") @(t : T?) {
+        let tmp = scratch_dir(t, "daspkg-move-nodst-")
+        let src = "{tmp}/src"
+        let dst = "{tmp}/no/such/parent/dst"
+        mkdir(src)
+        fwrite("{src}/a.txt", "a")
+        t |> success(!move_into_place(src, dst))
+        t |> success(!fexist(dst))
+        force_rmdir(tmp)
+    }
+}
+
+[test]
+def test_reinstall_with_backup(t : T?) {
+    t |> run("a failed install restores the installed copy and its lock entry") @(t : T?) {
+        let root = scratch_dir(t, "daspkg-reinstall-")
+        mkdir_rec("{root}/modules/pkg")
+        fwrite("{root}/modules/pkg/old.txt", "old")
+        var lf : LockFile
+        let entry = PackageEntry(name = "pkg", source = "github.com/nobody/pkg", tag = "v1.0")
+        set_package(lf, entry)
+        let rc = reinstall_with_backup(root, entry, lf, false) $(var into_lf : LockFile) {
+            mkdir("{root}/modules/pkg")
+            fwrite("{root}/modules/pkg/partial.txt", "partial")
+            return 1
+        }
+        t |> equal(1, rc)
+        t |> success(fexist("{root}/modules/pkg/old.txt"))
+        t |> success(!fexist("{root}/modules/pkg/partial.txt"))
+        t |> success(has_package(lf, "pkg"))
+        var on_disk : LockFile
+        t |> success(read_lock_file(root, on_disk))
+        t |> equal("v1.0", get_package(on_disk, "pkg").tag)
+        force_rmdir(root)
+    }
+    t |> run("a successful install replaces the copy and drops the backup") @(t : T?) {
+        let root = scratch_dir(t, "daspkg-reinstall-")
+        mkdir_rec("{root}/modules/pkg")
+        fwrite("{root}/modules/pkg/old.txt", "old")
+        var lf : LockFile
+        let entry = PackageEntry(name = "pkg", source = "github.com/nobody/pkg", tag = "v1.0")
+        set_package(lf, entry)
+        let rc = reinstall_with_backup(root, entry, lf, false) $(var into_lf : LockFile) {
+            mkdir("{root}/modules/pkg")
+            fwrite("{root}/modules/pkg/new.txt", "new")
+            set_package(into_lf, PackageEntry(name = "pkg", source = "github.com/nobody/pkg", tag = "v2.0"))
+            return 0
+        }
+        t |> equal(0, rc)
+        t |> success(fexist("{root}/modules/pkg/new.txt"))
+        t |> success(!fexist("{root}/modules/pkg/old.txt"))
+        t |> success(!fexist("{root}/modules/.daspkg_backup/pkg"))
+        t |> equal("v2.0", get_package(lf, "pkg").tag)
+        force_rmdir(root)
+    }
+}
+
+[test]
+def test_update_local_gates_the_manifest(t : T?) {
+    t |> run("a local source whose manifest this daslang cannot run leaves the installed copy") @(t : T?) {
+        let tmp = scratch_dir(t, "daspkg-update-local-")
+        let tmp_root = "{tmp}/root"
+        let tmp_src = "{tmp}/src"
+        mkdir(tmp_root)
+        write_passing_pkg(tmp_src, "localgated")
+        var lf : LockFile
+        t |> equal(0, install_local(tmp_root, "localgated", tmp_src, lf))
+        fwrite("{tmp_src}/.das_package", BROKEN_MANIFEST)
+        t |> equal(1, cmd_update(tmp_root, "localgated"))
+        let kept = fread("{tmp_root}/modules/localgated/.das_package")
+        t |> success(find(kept, "package_from_a_newer_sdk") < 0)
+        force_rmdir(tmp)
+    }
+}
+
+[test]
+def test_land_clone(t : T?) {
+    t |> run("a clone replaces the existing install") @(t : T?) {
+        let tmp = scratch_dir(t, "daspkg-land-")
+        let clone = "{tmp}/clone"
+        let target = "{tmp}/modules/pkg"
+        write_passing_pkg(clone, "pkg")
+        fwrite("{clone}/new.txt", "new")
+        mkdir_rec(target)
+        fwrite("{target}/old.txt", "old")
+        t |> equal(0, land_clone(clone, target, "pkg", false))
+        t |> success(fexist("{target}/new.txt"))
+        t |> success(!fexist("{target}/old.txt"))
+        force_rmdir(tmp)
+    }
+    t |> run("a refused manifest removes the clone and leaves the existing install") @(t : T?) {
+        let tmp = scratch_dir(t, "daspkg-land-")
+        let clone = "{tmp}/clone"
+        let target = "{tmp}/modules/pkg"
+        mkdir(clone)
+        fwrite("{clone}/.das_package", BROKEN_MANIFEST)
+        mkdir_rec(target)
+        fwrite("{target}/old.txt", "old")
+        t |> equal(1, land_clone(clone, target, "pkg", true))
+        t |> success(!fexist(clone))
+        t |> success(fexist("{target}/old.txt"))
+        force_rmdir(tmp)
+    }
+    t |> run("an existing install a process holds a file of fails the landing") @(t : T?) {
+        let tmp = scratch_dir(t, "daspkg-land-")
+        let clone = "{tmp}/clone"
+        let target = "{tmp}/modules/pkg"
+        write_passing_pkg(clone, "pkg")
+        mkdir_rec(target)
+        fwrite("{target}/held.txt", "held")
+        // Windows cannot delete a file open without share-delete; elsewhere the unlink succeeds
+        let expected = get_platform_name() == "windows" ? 1 : 0
+        fopen("{target}/held.txt", "rb") $(held) {
+            t |> success(held != null)
+            t |> equal(expected, land_clone(clone, target, "pkg", false))
+        }
+        t |> success(!fexist(clone))
+        force_rmdir(tmp)
+    }
+    t |> run("a move that fails removes the clone") @(t : T?) {
+        let tmp = scratch_dir(t, "daspkg-land-")
+        let clone = "{tmp}/clone"
+        let target = "{tmp}/no/such/parent/pkg"
+        write_passing_pkg(clone, "pkg")
+        t |> equal(1, land_clone(clone, target, "pkg", false))
+        t |> success(!fexist(clone))
+        t |> success(!fexist(target))
+        force_rmdir(tmp)
+    }
+}
+
+[test]
+def test_cmd_build_only(t : T?) {
+    t |> run("a name with no CMake package fails") @(t : T?) {
+        let tmp_root = scratch_dir(t, "daspkg-build-only-")
+        mkdir_rec("{tmp_root}/modules/plain")
+        t |> equal(1, cmd_build(tmp_root, false, "absent"))
+        t |> equal(1, cmd_build(tmp_root, false, "plain"))
+        force_rmdir(tmp_root)
+    }
+    t |> run("a name that is not a bare package name fails") @(t : T?) {
+        let tmp_root = scratch_dir(t, "daspkg-build-only-")
+        mkdir_rec("{tmp_root}/modules/wanted")
+        fwrite("{tmp_root}/modules/wanted/CMakeLists.txt", "cmake_minimum_required(VERSION 3.16)\nproject(wanted NONE)\n")
+        t |> equal(1, cmd_build(tmp_root, false, "wanted/"))
+        t |> equal(1, cmd_build(tmp_root, false, "../modules/wanted"))
+        force_rmdir(tmp_root)
+    }
+    t |> run("only the named package builds") @(t : T?) {
+        let tmp_root = scratch_dir(t, "daspkg-build-only-")
+        mkdir_rec("{tmp_root}/modules/wanted")
+        mkdir_rec("{tmp_root}/modules/broken")
+        fwrite("{tmp_root}/modules/wanted/CMakeLists.txt", "cmake_minimum_required(VERSION 3.16)\nproject(wanted NONE)\n")
+        fwrite("{tmp_root}/modules/broken/CMakeLists.txt", "message(FATAL_ERROR \"built a package nobody named\")\n")
+        t |> equal(0, cmd_build(tmp_root, false, "wanted"))
+        t |> equal(1, cmd_build(tmp_root))
+        // the filesystem's case rule decides whether WANTED names it; build agrees with the lookup
+        let found = fexist("{tmp_root}/modules/WANTED/CMakeLists.txt")
+        t |> equal(found ? 0 : 1, cmd_build(tmp_root, false, "WANTED"))
+        force_rmdir(tmp_root)
+    }
+}
+
+[test]
+def test_main_build_takes_a_name(t : T?) {
+    t |> run("daspkg build <name> builds only that name, so an absent one fails") @(t : T?) {
+        let tmp = scratch_dir(t, "daspkg-main-build-")
+        mkdir("{tmp}/modules")
+        let args <- get_command_line_arguments()
+        var exe = replace(args[0], "\\", "/")
+        if (find(exe, ":") < 0 && first_character(exe) != '/') {
+            exe = "{get_das_root()}/{exe}"
+        }
+        var output : string
+        let main_das = "{get_das_root()}/utils/daspkg/main.das"
+        t |> equal(0, run_cmd("\"{exe}\" \"{main_das}\" -- build --root \"{tmp}\"", output), output)
+        t |> equal(1, run_cmd("\"{exe}\" \"{main_das}\" -- build absent --root \"{tmp}\"", output), output)
+        force_rmdir(tmp)
     }
 }
 
@@ -3116,4 +3461,85 @@ def test_parse_args_update_index_flags(t : T?) {
 [test]
 def test_package_hook_failures(t : T?) {
     failing_package_hooks_do_not_publish_partial_metadata(t)
+}
+
+[test]
+def test_release_external_module_arguments(t : T?) {
+    let tmp = create_temp_directory_result("daspkg module path ")
+    if (!(tmp is value)){t |> failure("temporary module directory unavailable"); return }
+    let root = tmp as value
+    defer(){force_rmdir(root)}
+    let module_dir = path_join(root, get_platform_name() == "windows" ? "external module" : "external module's $(not-a-command)")
+    mkdir(module_dir)
+    fwrite(path_join(module_dir, ".das_module"), "options gen2\nrequire daslib/fio\n[export]\ndef initialize(root : string) \{ register_native_path(\"release_fixture\", \"value\", root + \"/value.das\") \}\n")
+    fwrite(path_join(module_dir, "value.das"), "options gen2\nlet RELEASE_FIXTURE_VALUE = 42\n")
+    let script = path_join(root, "main.das")
+    fwrite(script, "options gen2\nrequire release_fixture/value\n[export]\ndef main()\{print(\"mounted: \{RELEASE_FIXTURE_VALUE}\\n\")\}\n")
+    let exe = get_host_binary()
+    for (flag in ["-load_module", "-load-module", "--load_module", "--load-module"]) {
+        let args = release_module_args([exe, flag, module_dir, "main.das", "--", "-load_module", "must-not-load"])
+        var output : string
+        let rc = run_cmd("\"{exe}\"{args} \"{script}\"", output)
+        t |> equal(rc, 0, output)
+        t |> success(find(output, "mounted: 42") >= 0, output)
+    }
+    t |> equal(release_module_args([exe, "main.das", "--", "-load_module", module_dir]), "")
+    fwrite(path_join(root, "companion.das"), "options gen2\nrequire release_fixture/value\n[export]\ndef main()\{print(\"companion: \{RELEASE_FIXTURE_VALUE}\\n\")\}\n")
+    fwrite(path_join(root, ".das_package"), "options gen2\nrequire daslib/daspkg\n[export]\ndef package()\{package_name(\"mounted_app\")}\n[export]\ndef release()\{release_main(\"main.das\"); release_program(\"mounted_companion\", \"companion.das\")}\n")
+    let mounted = release_module_args([exe, "-load_module", module_dir])
+    let payload = "\{\"kernels\":\{\"mounted_stub\":\{\"suffix\":\"stub\"\}\},\"provenance\":\{\"mode\":\"stub\"\}\}"
+    fwrite(path_join(root, "stub_payload.json"), payload)
+    fwrite(path_join(root, "stub_tuner.das"), "options gen2\nrequire daslib/fio\nrequire release_fixture/value\n[export]\ndef main()\{\n    assert(RELEASE_FIXTURE_VALUE == 42)\n    fwrite(get_env_variable(\"DAS_TUNE_MANIFEST\"), fread(get_env_variable(\"DASPKG_MOUNT_PAYLOAD\")))\n    print(\"mounted tuner: \{RELEASE_FIXTURE_VALUE}\\n\")\n\}\n")
+    fwrite(script, "options gen2\nrequire release_fixture/value\nrequire daslib/tune\nrequire llvm/daslib/llvm_tune\n[tune_scope(name=\"mounted_scope\", tuner=\"stub_tuner.das\")]\nstruct MountedScope\{unused : int\}\n[export]\ndef main()\{print(\"mounted: \{RELEASE_FIXTURE_VALUE}\\n\")\}\n")
+    let old_payload = get_env_variable("DASPKG_MOUNT_PAYLOAD")
+    set_env_variable("DASPKG_MOUNT_PAYLOAD", path_join(root, "stub_payload.json"))
+    defer(){set_env_variable("DASPKG_MOUNT_PAYLOAD", old_payload)}
+    let out_dir = path_join(root, "out")
+    var output : string
+    let release_rc = run_cmd("\"{exe}\"{mounted} \"{get_das_root()}/utils/daspkg/main.das\" -- release --root \"{root}\" --out \"{out_dir}\"", output)
+    t |> equal(release_rc, 0, output)
+    if (release_rc == 0) {
+        let minted = path_join(root, "main.tune.json")
+        t |> success(fexist(minted), "the external-module tuner minted the sidecar")
+        t |> equal(fread(minted), payload)
+        let shipped = path_join(bundle_artifacts_dir(out_dir, "mounted_app"), "mounted_app.tune.json")
+        t |> equal(fread(shipped), payload, "the tuner payload ships with the main executable")
+        let companion = path_join(bundle_artifacts_dir(out_dir, "mounted_app"), get_platform_name() == "darwin" ? "mounted_companion" : "mounted_companion.exe")
+        let companion_rc = run_cmd("\"{companion}\"", output)
+        t |> equal(companion_rc, 0, output)
+        t |> success(find(output, "companion: 42") >= 0, output)
+        let app = bundle_exe_path(out_dir, "mounted_app")
+        let run_rc = run_cmd("\"{app}\"", output)
+        t |> equal(run_rc, 0, output)
+        t |> success(find(output, "mounted: 42") >= 0, output)
+    }
+    let wasm_lib_dir = get_env_variable("DASPKG_TEST_WASM_LIB_DIR")
+    if (!empty(wasm_lib_dir)) {
+        fwrite(script, "options gen2\nrequire release_fixture/value\n[export]\ndef main()\{print(\"mounted: \{RELEASE_FIXTURE_VALUE}\\n\")\}\n")
+        let wasm_out = path_join(root, "wasm_out")
+        let wasm_rc = run_cmd("\"{exe}\"{mounted} \"{get_das_root()}/utils/daspkg/main.das\" -- release wasm --root \"{root}\" --out \"{wasm_out}\" --wasm-lib-dir \"{wasm_lib_dir}\"", output)
+        t |> equal(wasm_rc, 0, output)
+        t |> success(fexist(path_join(wasm_out, "mounted_app/mounted_app.wasm")), "wasm cross-compiler resolves the mounted namespace")
+    }
+}
+
+[test]
+def test_release_external_module_argument_errors(t : T?) {
+    let missing = panic_text() {
+        release_module_args(["daslang", "-load_module"])
+    }
+    t |> success(find(missing, "requires a module directory") >= 0, missing)
+    if (get_platform_name() == "windows") {
+        for (path in ["C:/module%name", "C:/module!name", "C:/module\"name", "C:/module\nname", "C:/module\rname"]) {
+            let why = panic_text() {
+                release_module_args(["daslang", "-load_module", path])
+            }
+            t |> success(find(why, "Unsupported shell character") >= 0, why)
+            t |> success(find(why, path) >= 0, "the diagnostic identifies the rejected directory: {why}")
+        }
+        t |> equal(release_module_args(["daslang", "-load_module", "C:\\safe module\\path"]), " -load_module \"C:/safe module/path\"")
+    }
+    let repeated = release_module_args(["daslang", "-load_module", "first", "-load-module", "second", "--", "-load_module", "ignored"])
+    let expected = get_platform_name() == "windows" ? " -load_module \"first\" -load_module \"second\"" : " -load_module 'first' -load_module 'second'"
+    t |> equal(repeated, expected)
 }

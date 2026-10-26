@@ -102,8 +102,7 @@ def main() {   // nolint:STYLE038 — flat probe driver: args, load, prefill, sl
         forward_prefill(t, s, prompt, p, 0l)
     }
     // walk each layer's slab: seq_len rows of layer_kv_dim, but only the p filled positions
-    var khist : array<int64>
-    var vhist : array<int64>
+    var khist, vhist : array<int64>
     khist |> resize(HIST_N)
     vhist |> resize(HIST_N)
     var kall = Range()
@@ -115,8 +114,8 @@ def main() {   // nolint:STYLE038 — flat probe driver: args, load, prefill, sl
                 continue   // shared-KV layer: aliases the source slab, nothing of its own
             }
             let kvd = layer_kv_dim(c, l)
-            var kcp = reinterpret<float const?>(addr(s.key_cache[0]) + kv_base_k(s, l, c.seq_len))
-            var vcp = reinterpret<float const?>(addr(s.value_cache[0]) + kv_base_v(s, l, c.seq_len))
+            let kcp = reinterpret<float const?>(addr(s.key_cache[0]) + kv_base_k(s, l, c.seq_len))
+            let vcp = reinterpret<float const?>(addr(s.value_cache[0]) + kv_base_v(s, l, c.seq_len))
             var kr = Range()
             var vr = Range()
             for (i in range64(p * kvd)) {

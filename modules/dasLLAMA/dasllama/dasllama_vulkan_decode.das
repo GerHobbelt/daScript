@@ -329,9 +329,8 @@ def private stack_gemv_set(si : int; meta : uint64; meta_bytes : int64; xq, xs :
 }
 
 //! ... over stack `sx`'s own activation scratch and `si`'s meta, the output at `y`
-def private stack_gemv_set_x(si, sx : int; y : uint64; y_bytes : int64; ybit : uint) : VkDescriptorSet {
-    return stack_gemv_set(si, g_gpu.stacks[si].meta.buf, META_BYTES, g_gpu.stacks[sx].xq.buf, g_gpu.stacks[sx].xs.buf, XQ_BYTES, XS_BYTES, 0u, y, y_bytes, ybit)
-}
+def private stack_gemv_set_x(si, sx : int; y : uint64; y_bytes : int64; ybit : uint) : VkDescriptorSet =>
+    stack_gemv_set(si, g_gpu.stacks[si].meta.buf, META_BYTES, g_gpu.stacks[sx].xq.buf, g_gpu.stacks[sx].xs.buf, XQ_BYTES, XS_BYTES, 0u, y, y_bytes, ybit)
 
 def private rd_ffn_sets(var L : RLayer; b1, b3, b2 : int64; f1, f3, f2 : int) {
     let dim = g_rd.dim
@@ -1000,9 +999,8 @@ def vk_rdec_upload_sinks(rows : array<float>) : bool {
 }
 
 //! hasb 0 leaves the binding unread - the norms buffer only fills the slot
-def private rd_bias_bind() : tuple<buf : uint64; bytes : int64> {
-    return g_rd.has_bias ? (buf = g_rd.bias_dev, bytes = g_rd.bias_bytes) : (buf = g_rd.norms_dev, bytes = g_rd.norms_bytes)
-}
+def private rd_bias_bind() : tuple<buf : uint64; bytes : int64> =>
+    g_rd.has_bias ? (buf = g_rd.bias_dev, bytes = g_rd.bias_bytes) : (buf = g_rd.norms_dev, bytes = g_rd.norms_bytes)
 
 def private rd_bias_off(L : RLayer) : uint => uint(L.boff)
 
@@ -2189,8 +2187,7 @@ def private rd_announce_fuse_bisect {
         (bit = FUSE_BX_POST_ATT_RQ, name = "the post-attention requant stamp", live = true),
         (bit = FUSE_BX_POST_FFN_RQ, name = "the post-FFN requant stamp", live = true),
         (bit = FUSE_BX_QKN_ROPE, name = "the fused qk-norm+rope", live = g_rd.qk_norm && !g_rd.q_gated)]
-    var taken : array<string>
-    var inert : array<string>
+    var taken, inert : array<string>
     for (e in names) {
         continue if ((bx & e.bit) == 0l)
         if (e.live) {
@@ -2890,7 +2887,7 @@ def private rdq_sample(var led : RdqLedger; what, shape : string; st : RdqStamps
     if (st.overflow || n != uint(want)) {
         // a bare stamp or a full query pool: the whole command's GPU span reads off the first and last stamps
         unsafe {
-            var tp = reinterpret<uint64?>(g_pfq_buf.mapped)
+            let tp = reinterpret<uint64?>(g_pfq_buf.mapped)
             led.total += double(tp[n - 1u] - tp[0u]) * double(g_pfq_period) / 1000.0lf
         }
         if (led.count == 0l) {
@@ -2920,7 +2917,7 @@ def private rdq_sample(var led : RdqLedger; what, shape : string; st : RdqStamps
         led.us_by_name[nm] += pfq_us(uint(i))
     }
     unsafe {
-        var tp = reinterpret<uint64?>(g_pfq_buf.mapped)
+        let tp = reinterpret<uint64?>(g_pfq_buf.mapped)
         led.total += double(tp[n - 1u] - tp[0u]) * double(g_pfq_period) / 1000.0lf
     }
     led.count++
@@ -3225,7 +3222,7 @@ def private rd_record_n_form(var raw : VkCommandBuffer; nrows, nsplit : int64; f
 
 //! the landed pick of row `i` as a token id: the passes leave `0xFFFFFFFF` on a row with no element (never a served row)
 def private rd_landed_pick(i : int64) : int64 {
-    var pk = unsafe(reinterpret<uint?>(g_rd.pick_host.mapped))
+    let pk = unsafe(reinterpret<uint?>(g_rd.pick_host.mapped))
     let pick = int64(unsafe(pk[i]))
     if (pick >= g_rd.vocab) {
         panic("dasLLAMA vulkan tier: the device landed no pick for row {i} ({pick} of a {g_rd.vocab} vocab) - engine bug")

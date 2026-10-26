@@ -65,12 +65,17 @@ Each companion's sections are anchored by topic; a citation spells `<doc>.md#<an
 - `ARCHITECTURE_GPU_RACE_SHAPES.md` - the tensor-GEMM and fused-attention shapes that measured
   out, the retained reference arms beside them, and the sanctioned float-A stamps.
 - `ARCHITECTURE_GPU_TOWER.md` - the Metal tower attention routes, the Metal tower driver's
-  encode chains, the StyleTTS2 synthesis chain, and the Pocket TTS codec and frames seats.
+  encode chains, and the StyleTTS2 synthesis chain.
+- `ARCHITECTURE_GPU_TOWER_POCKET.md` - the Metal tower driver's Pocket TTS seats: the codec, the
+  frame loop and the text prompt.
 - `ARCHITECTURE_GPU_TOWER_VULKAN.md` - the Vulkan tower's row classes and attention routes, the
   Vulkan tower driver's encode chains, and the Vulkan ASR-decoder driver.
-- `ARCHITECTURE_GPU_TOWER_VULKAN_TTS.md` - the StyleTTS2 synthesis seats and the Pocket codec and
-  frames seats on the Vulkan tower: the shared weight slab, the f32-exact front end, the source
+- `ARCHITECTURE_GPU_TOWER_VULKAN_TTS.md` - the StyleTTS2 synthesis seats and the Pocket codec,
+  frames and prompt seats on the Vulkan tower: the shared weight slab, the f32-exact front end, the source
   and the generator, the seats' scratch and declines.
+- `ARCHITECTURE_GPU_TOWER_VULKAN_VISION.md` - the Vulkan tower's vision chains: the stems, blocks, taps
+  and tails of gemma4uv, gemma4v, gemma3v, qwen3v and qwen25v on both weight lanes, and the lane policy's
+  Vulkan default.
 - `ARCHITECTURE_GPU_QUANT_PLANES.md` - the Metal kq split scale plane, the iquant GEMV grid read
   with its f4-slab twin, and the Metal GEMV site abstraction.
 - `ARCHITECTURE_GPU_PREFILL.md` - the Metal prefill driver's GEMM form ladder, dev-W knee map,

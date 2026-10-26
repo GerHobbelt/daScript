@@ -12,9 +12,7 @@ require daslib/ast_boost
 
 let MAX_FIND_RESULTS = 50
 
-def module_display_name(mname : string) : string {
-    return mname == "$" ? "builtin" : mname
-}
+def module_display_name(mname : string) : string => mname == "$" ? "builtin" : mname
 
 def write_location(var w : StringBuilderWriter; at) {
     if (int(at.line) > 0) {
@@ -67,7 +65,7 @@ def struct_has_matching_field(value; query : string) : bool {
 
 def handled_has_matching_field(value : Annotation const; query : string) : bool {
     var found = false
-    var ann = unsafe(reinterpret<BasicStructureAnnotation?>(value))
+    let ann = unsafe(reinterpret<BasicStructureAnnotation?>(value))
     for_each_field(*ann) $(name, _cppName, _xtype, _offset) {
         if (symbol_matches(name, query)) {
             found = true
@@ -87,7 +85,7 @@ def write_struct_fields_highlighted(var w : StringBuilderWriter; value; query : 
 }
 
 def write_handled_fields_highlighted(var w : StringBuilderWriter; value : Annotation const; query : string; field_search : bool) {
-    var ann = unsafe(reinterpret<BasicStructureAnnotation?>(value))
+    let ann = unsafe(reinterpret<BasicStructureAnnotation?>(value))
     for_each_field(*ann) $(name, cppName, xtype, _offset) {
         let prefix = field_search && symbol_matches(name, query) ? "  > " : "    "
         if (!empty(cppName) && cppName != name) {

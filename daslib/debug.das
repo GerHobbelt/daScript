@@ -128,9 +128,8 @@ def private join_path(a, path_b : string) : string {
     return fix_path(res)
 }
 
-def private fix_path(path : string) : string {
-    return path |> trim_path() |> file_name_to_uri() |> normalize_uri() |> uri_to_file_name()
-}
+def private fix_path(path : string) : string =>
+    path |> trim_path() |> file_name_to_uri() |> normalize_uri() |> uri_to_file_name()
 
 def private resolve_path(path : string; paths : array<string>) : string {
     if (path |> empty()) return path
@@ -231,7 +230,7 @@ class DAWalker : DapiDataWalker {
         if (n > 0) {
             var v & = unsafe(varsStack[n - 1])
             if (v.children == null) {
-                var ti = type_info(vi)
+                let ti = type_info(vi)
                 v.value = sprint_data_fast(pv, ti, print_flags_debug)
             }
             if (empty(v.value)) {
@@ -1814,7 +1813,7 @@ class private DAServer : Server {
             var setId = -1
             var hex = 0ul
             if (b.enabled) {
-                var parts <- b.dataId |> split(",")
+                var inscope parts <- b.dataId |> split(",")
                 let ctxHex = to_uint64(parts[0], true)
                 hex = to_uint64(parts[1], true)
                 let size = to_int(parts[2])

@@ -1170,6 +1170,52 @@ def test_env_config_default_doc_and_path(t : T?) {
     }
 }
 
+[CommandLineArgs]
+struct RenamedHelpConfig {
+    @clarg_name = "show-help"
+    help : bool
+    name : string
+}
+
+[CommandLineArgs]
+struct ClaimedShortHConfig {
+    @clarg_short = "h"
+    host : string
+
+    @clarg_name = "show-help"
+    help : bool
+}
+
+[test]
+def test_help_reaches_a_renamed_help_flag(t : T?) {
+    for (asked in fixed_array("--help", "-h", "--show-help")) {
+        var r <- parse_args(type<RenamedHelpConfig>, [asked])
+        t |> success(r |> is_ok, "{asked} parses")
+        let cfg <- r |> move_unwrap
+        t |> success(cfg.help, "{asked} sets the help field the struct named --show-help")
+    }
+}
+
+[test]
+def test_help_alias_leaves_claimed_tokens_alone(t : T?) {
+    var as_value <- parse_args(type<RenamedHelpConfig>, ["--name", "--help"])
+    let cfg_value <- as_value |> move_unwrap
+    t |> success(!cfg_value.help && cfg_value.name == "--help", "a --help that is a flag's value is that value, not a help request")
+    var passed_on <- parse_args(type<RenamedHelpConfig>, ["--name", "x", "--", "--help"])
+    let cfg_passed <- passed_on |> move_unwrap
+    t |> success(!cfg_passed.help && cfg_passed.name == "x", "a --help after a bare -- belongs to whoever takes the rest")
+    var claimed <- parse_args(type<ClaimedShortHConfig>, ["-h", "box"])
+    let cfg_claimed <- claimed |> move_unwrap
+    t |> success(!cfg_claimed.help && cfg_claimed.host == "box", "a -h the struct declares for another flag stays that flag")
+    var plain <- parse_args(type<RenamedHelpConfig>, ["--name", "y"])
+    let cfg_plain <- plain |> move_unwrap
+    t |> success(!cfg_plain.help, "control: no help request leaves the field false")
+    var no_field <- parse_args(type<Config>, ["--help", "--name", "z"])
+    t |> success(no_field |> is_ok, "a struct with no help field still ignores --help")
+    let cfg_no_field <- no_field |> move_unwrap
+    t |> equal(cfg_no_field.name, "z")
+}
+
 [test]
 def test_get_host_binary(t : T?) {
     let host = get_host_binary()
@@ -1195,7 +1241,9 @@ def test_get_host_binary_relative_start(t : T?) {
         t |> skip("the host is not under the current directory: {err}")
         return
     }
-    let argv0 = get_platform_name() == "windows" ? replace_extension(rel, "") : rel
+    let by_name = get_platform_name() == "windows" ? replace_extension(rel, "") : rel
+    // a bare name is a PATH lookup on POSIX, not a start by path: from the host's own directory the relative path needs its `./`
+    let argv0 = base_name(by_name) == by_name ? path_join(".", by_name) : by_name
     var output : string
     let rc = run_and_capture([argv0, path_join(get_das_root(), "tests/daslib/_host_binary_probe.das")], output, 120.0)
     t |> equal(rc, 0, "the host starts by '{argv0}': {output}")

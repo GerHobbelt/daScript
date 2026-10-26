@@ -186,6 +186,7 @@ def suite_files(name : string) : array<string> {   // nolint:STYLE038 - a flat s
                     "modules/dasLLAMA/tests/test_bench_rows.das",
                     "modules/dasLLAMA/tests/test_chat.das",
                     "modules/dasLLAMA/tests/test_deltanet.das",
+                    "modules/dasLLAMA/tests/test_embeddings.das",
                     "modules/dasLLAMA/tests/test_exe_smoke.das",
                     "modules/dasLLAMA/tests/test_facade.das",
                     "modules/dasLLAMA/tests/test_flash.das",
@@ -251,6 +252,7 @@ def suite_files(name : string) : array<string> {   // nolint:STYLE038 - a flat s
                     "modules/dasLLAMA/tests/test_qwen3v.das",
                     "modules/dasLLAMA/tests/test_qwen25v.das",
                     "modules/dasLLAMA/tests/test_sampling.das",
+                    "modules/dasLLAMA/tests/test_constraint.das",
                     "modules/dasLLAMA/tests/test_scheduler.das",
                     "modules/dasLLAMA/tests/test_storyteller_restart.das",
                     "modules/dasLLAMA/tests/test_storywish.das",
@@ -315,7 +317,7 @@ def area_tests(area : string) : array<string> {
                     "test_batch_grid.das", "test_chat.das", "test_deltanet.das", "test_dispatch_shaping.das", "test_facade.das",
                     "test_flash.das", "test_forward.das", "test_from_template.das", "test_fused_decode.das", "test_gguf_quant.das", "test_gguf_shards.das",
                     "test_gpu_model_swap.das", "test_gpu_moe_shexp.das", "test_gpu_perop_kv_codec.das", "test_gpu_perop_kv_codec_iq.das", "test_gpu_perop_kv_codec_k.das", "test_gpu_resident_codec_llama_iq.das", "test_gpu_resident_codec_llama_k.das", "test_gpu_resident_gemma2.das", "test_gpu_resident_gemma3_1b.das", "test_gpu_resident_gemma3_4b.das", "test_gpu_resident_gemma4_12b_k.das", "test_gpu_resident_gemma4_12b_q8.das", "test_gpu_resident_gemma4_26b.das", "test_gpu_resident_gemma4_26b_k.das", "test_gpu_resident_gemma4_31b.das", "test_gpu_resident_gemma4_e2b.das", "test_gpu_resident_gemma4_e4b.das", "test_gpu_resident_gptoss.das", "test_gpu_resident_hc.das", "test_gpu_resident_hybrid.das", "test_gpu_resident_llama.das", "test_gpu_resident_moe.das", "test_gpu_resident_qwen2.das", "test_gpu_resident_regions.das", "test_gpu_resident_regions_e2b.das", "test_gpu_resident_regions_gptoss.das", "test_gpu_resident_regions_qwen3moe.das", "test_gpu_resident_regions_qwen2moe.das", "test_gpu_resident_regions_gemma4moe.das", "test_gpu_resident_regions_gemma2.das", "test_gpu_resident_regions_gemma3.das", "test_gpu_resident_regions_gemma4.das", "test_gpu_resident_regions_hybrid.das", "test_gpu_resident_regions_hybrid_k.das", "test_gpu_resident_regions_hybrid_iq3s.das", "test_gpu_resident_regions_hybrid_q3kxl.das", "test_gpu_resident_regions_llama_k.das", "test_gpu_resident_regions_phi3.das", "test_gpu_resident_regions_qwen3.das", "test_gpu_resident_regions_q8kv.das", "test_gpu_resident_regions_tq4kv.das", "test_gpu_serving_declines.das", "test_gpu_slot_swap.das", "test_gpu_tier.das", "test_groupn.das",
-                    "test_jobque_tripwire.das", "test_kernel_backend.das", "test_kgroup_repack.das", "test_kqformat.das", "test_kquant.das",
+                    "test_embeddings.das", "test_jobque_tripwire.das", "test_kernel_backend.das", "test_kgroup_repack.das", "test_kqformat.das", "test_kquant.das",
                     "test_kv_codec.das", "test_kv_paged.das", "test_kv_prefix.das", "test_metal_batched_row.das", "test_math_activations.das",
                     "test_math_elementwise.das", "test_matmul.das", "test_matmul_batch.das",
                     "test_metal_float_a_gate.das", "test_metal_gemm.das", "test_metal_role_infer.das", "test_mtp.das",
@@ -324,7 +326,7 @@ def area_tests(area : string) : array<string> {
                     "test_plane.das", "test_ple_check.das", "test_ple_modes.das", "test_prefill.das", "test_prefill_cpu_kernels.das",
                     "test_q8q8_family.das", "test_quant.das", "test_qwen4exp.das",
                     "test_repack.das", "test_repack_lane_context.das", "test_rmsnorm.das", "test_rope.das", "test_rope_apply.das",
-                    "test_sampling.das",
+                    "test_sampling.das", "test_constraint.das",
                     "test_scheduler.das", "test_silu.das", "test_softmax.das", "test_storyteller_restart.das", "test_storywish.das", "test_think_split.das", "test_tokenizer.das",
                     "test_tool_formats.das", "test_unicode.das", "test_vulkan_dec_tail.das", "test_vulkan_kernels.das", "test_vulkan_kv_codec_kernels.das",
                     "test_vulkan_mint.das", "test_vulkan_moe_cm2.das", "test_vulkan_tier.das" ]
@@ -355,6 +357,7 @@ let MODULE_AREAS <- {
     "dasllama_vulkan_tower" => "audio,vision,tts",   // the Vulkan TTS driver rides the tower's classes
     "dasllama_tts_slab" => "audio,vision,tts",   // the Metal tower requires it for every seat
     "dasllama_vulkan_tts" => "tts",
+    "dasllama_gpu_kernels_common" => "audio,vision,tts,llm",   // the kernels both GPU homes stamp: the TTS chains', and the depthwise rows and rope the audio and vision towers stamp
     "dasllama_asr" => "audio", "dasllama_asr_types" => "audio", "dasllama_audio" => "audio",
     "dasllama_audio_embedder" => "audio", "dasllama_audio_io" => "audio", "dasllama_canary" => "audio",
     "dasllama_gemma4a" => "audio", "dasllama_metal_asr_dec" => "audio", "dasllama_vulkan_asr_dec" => "audio", "dasllama_parakeet" => "audio",
@@ -388,9 +391,8 @@ let MODULE_AREAS <- {
     "dasllama_vulkan_decode" => "llm", "dasllama_vulkan_prefill" => "llm", "dasllama_vulkan_seams" => "llm"
 }
 
-def private csv_list(csv : string) : array<string> {
-    return <- [for (tok in split(csv, ",")); strip(tok); where !empty(strip(tok))]
-}
+def private csv_list(csv : string) : array<string> =>
+    <- [for (tok in split(csv, ",")); strip(tok); where !empty(strip(tok))]
 
 //! a changed path -> the areas it reaches (empty for a path outside the module, and for a model-suite
 //! test file - those take --arm). Non-private: test_run_suites.das pins the table
@@ -443,8 +445,7 @@ def areas_for_path(path : string) : array<string> {
 //! --exclude: a file whose base name contains any comma-separated token is dropped. Non-private:
 //! test_run_suites.das gates it
 def exclude_files(files : array<string>; exclude : string) : tuple<kept : array<string>; dropped : array<string>> {
-    var kept : array<string>
-    var dropped : array<string>
+    var kept, dropped : array<string>
     let tokens <- [for (tok in split(exclude, ",")); strip(tok); where !empty(strip(tok))]
     for (file in files) {
         let name = base_name(file)
@@ -615,7 +616,7 @@ def select_areas(cfg : RunArgs) : tuple<status : int; areas : array<string>> {
             return <- (status = 2, areas <- none)
         }
         for (p in changed_paths(cfg.base)) {
-            let hit <- areas_for_path(p)
+            var inscope hit <- areas_for_path(p)
             if (empty(hit)) {
                 if ((p |> replace("\\", "/")) |> starts_with("modules/dasLLAMA/")) {
                     to_log(LOG_INFO, "CHANGED {p} -> a model suite file: run its suite with --arm scoped to the change\n")

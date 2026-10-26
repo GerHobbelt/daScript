@@ -37,7 +37,7 @@ def private read_points(path : string) : array<CalPoint> {
         if (empty(trimmed) || starts_with(trimmed, "#")) {
             continue
         }
-        let cells <- split(trimmed, ",")
+        var inscope cells <- split(trimmed, ",")
         if (length(cells) != 2) {
             continue
         }
@@ -75,7 +75,7 @@ def private sample_at(points : array<CalPoint>; x : int) : int {
 }
 
 // resolved against the CALLING file, so an example moves without its data breaking
-def private csv_path(var expr : ExprCallMacro?) : string {
+def private csv_path(expr : ExprCallMacro?) : string {
     let rel = string((expr.arguments[0] as ExprConstString).value)
     return path_join(dir_name(string(expr.at.fileInfo.name)), rel)
 }

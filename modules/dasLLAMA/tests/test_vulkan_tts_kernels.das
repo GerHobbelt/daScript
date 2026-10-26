@@ -8,6 +8,7 @@ require dastest/testing_boost public
 require ?vulkan vulkan
 require ?vulkan dasllama/dasllama_vulkan_common
 require ?vulkan dasllama/dasllama_vulkan_classes
+require dasllama/dasllama_gpu_math   // nolint:STYLE030,LINT019 - gelu_tanh_lut_f32, the GELU cell's oracle, inside the vulkan arm alone
 require ?vulkan _vkd_oracles
 require _compares   // nolint:STYLE030,LINT019 — the compares, inside the vulkan arms alone
 require _tts_kernel_oracles   // nolint:STYLE030,LINT019 — the in-test CPU forms the cells share, inside the vulkan arms alone
@@ -118,9 +119,8 @@ def test_vkt_row_gather(t0 : T?) {
                 let sp = cp |> in_(slab)
                 let ip = cp |> in_plain(ids)
                 let op = cp |> out_(total, GA_OUT)
-                var s = cp |> cls_set(fixed_array(sp, ip, op), @@set_tts_row_gather_cls)
-                var pa = TtsGatherArgs(c = uint(c), rows = uint(rows), word_off = uint(GA_WORD), pos_off = uint(pos_off), type_off = uint(type_off),
-                    out_off = uint(GA_OUT), adds = 1u)
+                var s = cp |> cls_set(fixed_array(sp, ip, sp, sp, op), @@set_tts_row_gather_cls)
+                var pa = GkRowGatherArgs(c = uint(c), rows = uint(rows), aoff = uint(GA_WORD), boff = uint(pos_off), coff = uint(type_off), out_off = uint(GA_OUT), add_b = 1u, add_c = 1u, scale = 1.0)
                 cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
                     enc_tts_row_gather_cls(raw, h, s, pa, int64(total))
                 }
@@ -134,7 +134,8 @@ def test_vkt_row_gather(t0 : T?) {
                 t |> success(mismatch_exact(subarray(got, range(c)), subarray(got, range(c, 2 * c))) > 0, "tts_row_gather control: two positions on one word differ by their position rows")
                 t |> success(outside_run(cp |> plane_whole(op), GA_OUT, total, NAN_SENTINEL), "tts_row_gather: the prefix before out_off keeps its sentinel")
                 cp |> plane_refill(op)
-                pa.adds = 0u
+                pa.add_b = 0u
+                pa.add_c = 0u
                 cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
                     enc_tts_row_gather_cls(raw, h, s, pa, int64(total))
                 }
@@ -144,6 +145,18 @@ def test_vkt_row_gather(t0 : T?) {
                 gather_rows(want_plain, subarray(slab, range(GA_WORD, pos_off)), ids, int64(c))
                 check_rows(t, "tts_row_gather adds = 0 vs the word row alone", got_plain, want_plain, BAR_EXACT, c)
                 t |> success(mismatch_exact(got_plain, want) > 0, "tts_row_gather adds = 0 control: the position rows are out of the sum")
+                for (arm in range(2)) {   //! each add alone: the [rows x c] plane, then the [c] row
+                    cp |> plane_refill(op)
+                    pa.add_b = arm == 0 ? 1u : 0u
+                    pa.add_c = arm == 0 ? 0u : 1u
+                    cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
+                        enc_tts_row_gather_cls(raw, h, s, pa, int64(total))
+                    }
+                    var inscope got_one <- cp |> plane_run(op)
+                    var inscope want_one <- [for (i in range(total)); want_plain[i] + (arm == 0 ? slab[pos_off + i] : slab[type_off + i % c])]
+                    check_rows(t, "tts_row_gather {arm == 0 ? "add_b" : "add_c"} alone vs the word row plus that add", got_one, want_one, BAR_EXACT, c)
+                    t |> success(mismatch_exact(got_one, want) > 0 && mismatch_exact(got_one, want_plain) > 0, "tts_row_gather control: one add alone lands between the plain and the full sums")
+                }
             }
         } else {
             t |> skip("dasVulkan not present")
@@ -187,7 +200,7 @@ def test_vkt_gelu_tanh(t0 : T?) {
                 t |> success(outside_run(got, EL_OFF, EL_N, x), "tts_gelu_tanh: the elements outside the run are untouched")
                 var lut_off = 0
                 for (i in range(EL_OFF, EL_OFF + EL_N)) {
-                    if (!bar_ok(tower_gelu_tanh(x[i]), want[i], TTS_REL)) {
+                    if (!bar_ok(gelu_tanh_lut_f32(x[i]), want[i], TTS_REL)) {
                         lut_off++
                     }
                 }
@@ -265,8 +278,7 @@ def private attn_arm(t : T?; rows, heads, hs : int) {
             }
             let got <- cp |> plane_run(op)
             let gotz <- cp |> plane_run(ozp)
-            var want : array<float>
-            var wantz : array<float>
+            var want, wantz : array<float>
             attention_rows(q, k, v, int64(rows), int64(d), int64(heads), want)
             attention_rows(q, kz, v, int64(rows), int64(d), int64(heads), wantz)
             check_rows(t, "{tag} vs the CPU attention_rows", got, want, Bar(rel = TTS_REL, poison = 1e-4), d, hs)
@@ -333,8 +345,8 @@ def test_vkt_concat(t0 : T?) {
                 let opp = cp |> out_(rows * CC_WIDTH)
                 var s_res = cp |> cls_set(fixed_array(xp, sp, fp, np, orp), @@set_tts_concat_cls)
                 var s_pad = cp |> cls_set(fixed_array(xp, xp, fp, np, opp), @@set_tts_concat_cls)
-                var pr = TtsConcatArgs(c = uint(c), rc = uint(CC_RC), rs = 0u, f0s = 0u, ns = 0u, with_res = 1u, width = uint(wr), rows = uint(rows))
-                var pp = TtsConcatArgs(c = uint(c), rc = uint(CC_RC), rs = uint(CC_RC), f0s = uint(CC_F0S), ns = uint(CC_NS), with_res = 0u,
+                var pr = GkConcatArgs(c = uint(c), rc = uint(CC_RC), rs = 0u, f0s = 0u, ns = 0u, with_res = 1u, width = uint(wr), rows = uint(rows))
+                var pp = GkConcatArgs(c = uint(c), rc = uint(CC_RC), rs = uint(CC_RC), f0s = uint(CC_F0S), ns = uint(CC_NS), with_res = 0u,
                     width = uint(CC_WIDTH), rows = uint(rows))
                 cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
                     enc_tts_concat_cls(raw, h, s_res, pr, int64(rows * wr))
@@ -375,7 +387,7 @@ def test_vkt_sigsum(t0 : T?) {
                 let lp = cp |> in_(logits)
                 let rp = cp |> out_(SG_T)
                 var s = cp |> cls_set(fixed_array(lp, rp), @@set_tts_sigsum_cls)
-                var pa = TtsSigSumArgs(t = uint(SG_T), nb = uint(SG_NB), ls = uint(SG_LS), speed = SG_SPEED)
+                var pa = GkSigSumArgs(t = uint(SG_T), nb = uint(SG_NB), ls = uint(SG_LS), speed = SG_SPEED)
                 cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
                     enc_tts_sigsum_cls(raw, h, s, pa, int64(SG_T))
                 }
@@ -485,9 +497,8 @@ let private AD_T = 45
 let private AD_C = 72
 let private AD_SD = 16      //! the style vector's width
 let private AD_EPS = 1e-5
-let private AD_XOFF = 5     //! each plane's element base: the prefix before it is never written
-let private AD_YOFF = 9
-let private AD_HOFF = 7
+let private AD_HOFF = 7     //! the style rows' element base: the prefix before it is never read
+let private AD_SLACK = 5    //! elements past the run, left at the sentinel
 let private AD_GWOFF = 3    //! the slab's norm scale row, then its shift row and Snake's alpha row, POISON between
 
 //! an AdaIN over AD_C channels from an AD_SD-wide style: fc w [2c][sd] and b, the norm's scale and shift rows
@@ -550,26 +561,23 @@ def test_vkt_adain(t0 : T?) {
             var f <- adain_fixture()
             with_cell_planes() $(var cp : CellPlanes) {
                 let x0p = cp |> in_(f.x)
-                let xp = cp |> in_(f.x, AD_XOFF)
-                let xip = cp |> io_(f.x, AD_XOFF)
+                let xp = cp |> in_(f.x)
+                let xip = cp |> io_(f.x, 0, AD_SLACK)
                 let hp = cp |> in_(f.style_fc, AD_HOFF)
                 let wp = cp |> in_(f.slab)
                 let stp = cp |> out_(colstats_floats(AD_T, c))
-                let ylp = cp |> out_(n, AD_YOFF)
-                let ysp = cp |> out_(n, AD_YOFF)
+                let ylp = cp |> out_(n, 0, AD_SLACK)
+                let ysp = cp |> out_(n, 0, AD_SLACK)
                 var s_l = cp |> cls_set(fixed_array(xp, ylp, stp, hp, wp), @@set_tts_adain_leaky_cls)
                 var s_s = cp |> cls_set(fixed_array(xp, ysp, stp, hp, wp), @@set_tts_adain_snake_cls)
                 var s_i = cp |> cls_set(fixed_array(xip, xip, stp, hp, wp), @@set_tts_adain_leaky_cls)
-                static_assert(AD_EPS == TTS_ADAIN_EPS, "the CPU oracle's eps is the stamps' literal")
-                var pa = TtsAdainArgs(c = uint(c), t = uint(AD_T), xoff = uint(AD_XOFF), yoff = uint(AD_YOFF), hoff = uint(AD_HOFF),
-                    gwoff = uint(AD_GWOFF), gboff = uint(f.gboff), aoff = uint(f.aoff))
-                var pi = pa
-                pi.yoff = uint(AD_XOFF)
+                static_assert(AD_EPS == GK_ADAIN_EPS, "the CPU oracle's eps is the stamps' literal")
+                var pa = GkAdainArgs(c = uint(c), t = uint(AD_T), hoff = uint(AD_HOFF), gwoff = uint(AD_GWOFF), gboff = uint(f.gboff), aoff = uint(f.aoff))
                 cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
                     colstats_enc(raw, h, cp, x0p, stp, AD_T, c)
                     enc_tts_adain_leaky_cls(raw, h, s_l, pa, int64(n))
                     enc_tts_adain_snake_cls(raw, h, s_s, pa, int64(n))
-                    enc_tts_adain_leaky_cls(raw, h, s_i, pi, int64(n))
+                    enc_tts_adain_leaky_cls(raw, h, s_i, pa, int64(n))
                 }
                 let got_l <- cp |> plane_run(ylp)
                 let got_i <- cp |> plane_run(xip)
@@ -578,9 +586,9 @@ def test_vkt_adain(t0 : T?) {
                 check_rows(t, "tts_adain_leaky in place vs the CPU adain_rows_into and leaky_relu", got_i, f.want_leaky, BAR_APPROX, AD_C)
                 t |> success(got_i[0] != f.x[0], "tts_adain_leaky in place control: the input row is overwritten")
                 t |> equal(mismatch_exact(got_i, got_l), 0, "tts_adain_leaky: in place == out of place, bit for bit")
-                t |> success(outside_run(cp |> plane_whole(ylp), AD_YOFF, n, NAN_SENTINEL) && outside_run(cp |> plane_whole(ysp), AD_YOFF, n, NAN_SENTINEL),
-                    "tts_adain: the prefix before yoff keeps its sentinel")
-                t |> success(outside_run(cp |> plane_whole(xip), AD_XOFF, n, POISON), "tts_adain in place: the prefix before xoff is untouched")
+                t |> success(outside_run(cp |> plane_whole(ylp), 0, n, NAN_SENTINEL) && outside_run(cp |> plane_whole(ysp), 0, n, NAN_SENTINEL),
+                    "tts_adain: the elements past the run keep their sentinel")
+                t |> success(outside_run(cp |> plane_whole(xip), 0, n, POISON), "tts_adain in place: the elements past the run are untouched")
             }
             delete f
         } else {
@@ -590,9 +598,6 @@ def test_vkt_adain(t0 : T?) {
 }
 
 let private AS_N = 1030     //! four whole workgroups and six more
-let private AS_AOFF = 3
-let private AS_BOFF = 7
-let private AS_OOFF = 11
 let private AS_SLACK = 5    //! elements past the run, left at the sentinel
 
 [test]
@@ -608,26 +613,24 @@ def test_vkt_add_scale(t0 : T?) {
             let a <- row_fill(n, 41, 7, 0.05, 2.1)
             let b <- row_fill(n, 17, 3, 0.04, 1.9)
             with_cell_planes() $(var cp : CellPlanes) {
-                let ap = cp |> in_(a, AS_AOFF)
-                let aip = cp |> io_(a, AS_AOFF)
-                let bp = cp |> in_(b, AS_BOFF)
-                let op = cp |> out_(n, AS_OOFF, AS_SLACK)
+                let ap = cp |> in_(a, 0)
+                let aip = cp |> io_(a, 0, AS_SLACK)
+                let bp = cp |> in_(b, 0)
+                let op = cp |> out_(n, 0, AS_SLACK)
                 var s_o = cp |> cls_set(fixed_array(ap, bp, op), @@set_tts_add_scale_cls)
                 var s_i = cp |> cls_set(fixed_array(aip, bp, aip), @@set_tts_add_scale_cls)
-                var po = TtsAddScaleArgs(nelem = uint(n), scale = scale, aoff = uint(AS_AOFF), boff = uint(AS_BOFF), ooff = uint(AS_OOFF))
-                var pi = po
-                pi.ooff = uint(AS_AOFF)
+                var po = GkAddScaleArgs(nelem = uint(n), scale = scale)
                 cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
                     enc_tts_add_scale_cls(raw, h, s_o, po, int64(n))
-                    enc_tts_add_scale_cls(raw, h, s_i, pi, int64(n))
+                    enc_tts_add_scale_cls(raw, h, s_i, po, int64(n))
                 }
                 let got_i <- cp |> plane_run(aip)
                 let want <- [for (i in range(n)); (a[i] + b[i]) * scale]
                 check_rows(t, "tts_add_scale vs (a + b) * scale", cp |> plane_run(op), want, BAR_EXACT, FLAT_ROWS)
                 check_rows(t, "tts_add_scale in place vs (a + b) * scale", got_i, want, BAR_EXACT, FLAT_ROWS)
                 t |> success(got_i[0] != a[0], "tts_add_scale in place control: the input row is overwritten")
-                t |> success(outside_run(cp |> plane_whole(op), AS_OOFF, n, NAN_SENTINEL), "tts_add_scale: the elements outside the run keep their sentinel")
-                t |> success(outside_run(cp |> plane_whole(aip), AS_AOFF, n, POISON), "tts_add_scale in place: the prefix before aoff is untouched")
+                t |> success(outside_run(cp |> plane_whole(op), 0, n, NAN_SENTINEL), "tts_add_scale: the elements outside the run keep their sentinel")
+                t |> success(outside_run(cp |> plane_whole(aip), 0, n, POISON), "tts_add_scale in place: the elements past the run are untouched")
             }
         } else {
             t |> skip("dasVulkan not present")

@@ -20,9 +20,8 @@ let FEATURE = "examples/text/main.das"
 let DEADLOCK_GUARD_SEC = 30.0f
 let RICH_DAS_FIXTURE = "// # Doc header\n// Intro paragraph.\n\nlet q = 1 // trailing note\n\ndef foo() \{\n\tpass\n\}\n\n// Tail note\n"
 
-def private viewer_state(app : ImguiApp) : JsonValue? {
-    return post_command(app, "text_viewer_state", null)
-}
+def private viewer_state(app : ImguiApp) : JsonValue? =>
+    post_command(app, "text_viewer_state", null)
 
 def private real_click_at(app : ImguiApp; x, y : float) {
     post_command(app, "imgui_mouse_pos", JV((x = x, y = y)))
@@ -244,7 +243,7 @@ def test_rich_das_edit_refreshes_one_fragment(t : T?) {
         return if (empty(temp_dir))
         {
         return if (!open_rich_das(t, app, temp_dir))
-        var probe = wait_for_render(app,
+        let probe = wait_for_render(app,
             "DOCK_ROOT/g_document_windows[1]/DOCUMENT_CONTENT/editor", 15.0f)
         t |> success(probe != null, "the caret island renders")
         click(app, "DOCK_ROOT/g_document_windows[1]/DOCUMENT_CONTENT/editor")

@@ -220,6 +220,10 @@ struct public VisionEnv {
 
 [EnvConfig(env_prefix = "DASLLAMA_METAL")]
 struct public MetalEnv {
+    @clarg_path
+    @clarg_doc = "Directory to write each kernel's generated source as <entry>.metal when its pipeline is built - the SPIR-V dump's twin, for diffing a kernel across a change."
+    msl_dump : string = ""
+
     @clarg_doc = "Produce logits on the GPU; 0 pulls the classifier back to the CPU. Blob-only models force it on."
     logits : bool = true
 
@@ -241,7 +245,7 @@ struct public MetalEnv {
     @clarg_doc = "Serve the whisper decoder side (cross-KV; the decode step under wdec_step) on the Metal ASR-decoder driver; 0 pins the CPU decoder."
     wdec : bool = true
 
-    @clarg_doc = "Serve the whisper DECODE STEP on the GPU too (needs wdec). Small decoders (n_text_state under the 1024 floor; set_metal_wdec_step_min_d) keep the CPU rail - the per-dispatch latency floor beats them."
+    @clarg_doc = "Serve the whisper DECODE STEP on the GPU too (needs wdec). Small decoders (n_text_state under the 512 floor; set_metal_wdec_step_min_d) keep the CPU rail - the per-dispatch latency floor beats them."
     wdec_step : bool = true
 
     @clarg_doc = "Fused single-pass decode attention (a head of 64, 96, 128, 256 or 512 on every KV codec; sliding windows, attention sinks, the logit soft cap and a second head class included), on the single row, the speculative verify's rows and the batch; 0 is the A/B rail to the chunked pair."
@@ -874,14 +878,11 @@ let public g_env_core = env_config(type<CoreEnv>)
 
 //! The per-user dasLLAMA directory under `home`: the standalone programs' models, config, tune
 //! state and logs, so an install directory can stay read-only.
-def public dasllama_home_dir_from(home : string) : string {
-    return path_join(home, ".dasllama")
-}
+def public dasllama_home_dir_from(home : string) : string => path_join(home, ".dasllama")
 
 //! `<home>/.dasllama`, home being USERPROFILE (Windows), else HOME.
-def public dasllama_home_dir() : string {
-    return dasllama_home_dir_from(!empty(g_env_core.user_profile) ? g_env_core.user_profile : g_env_core.home)
-}
+def public dasllama_home_dir() : string =>
+    dasllama_home_dir_from(!empty(g_env_core.user_profile) ? g_env_core.user_profile : g_env_core.home)
 
 //! A dasLLAMA app's config `name`, looked for in the working directory, then in `dasllama_home`,
 //! then in `anchor_dir` (beside the program or its script); "" when none exists. The one lookup

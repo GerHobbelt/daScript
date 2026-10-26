@@ -34,6 +34,7 @@ struct BpeTokenizer {
     // newline-run pre-split. No field default — zero-init `var tk : BpeTokenizer` must stay legal.
     spm_space : bool
     add_bos : bool
+    add_eos : bool                  //! `tokenizer.ggml.add_eos_token`: an embedding model (Qwen3-Embedding) ends every text with EOS, the row its last-token pooling reads
 }
 
 //! Whether a BPE vocab whose GGUF omits `tokenizer.ggml.add_bos_token` prepends BOS - upstream's
@@ -76,6 +77,7 @@ def load_bpe_tokenizer_gguf(path : string) : BpeTokenizer {
         tk.add_bos = (gguf_has(m, "tokenizer.ggml.add_bos_token")
             ? gguf_int(m, bytes, "tokenizer.ggml.add_bos_token") != 0l
             : bpe_pre_adds_bos(tk.pre))
+        tk.add_eos = gguf_int_or(m, bytes, "tokenizer.ggml.add_eos_token", 0l) != 0l
         if (tk.pre == "gpt-4o") {
             // these gpt-oss control tokens force-render (attr -> USER_DEFINED) so channel
             // markers stay visible in decoded text (type 4 escapes the type-3 mute rule)
@@ -216,8 +218,7 @@ def private bigram_try_push(pair_merge : table<int64; int64>; var h : array<Bigr
 def private bigram_merge_heap(pair_merge : table<int64; int64>; var syms : array<int64>) {
     let n = length(syms)
     return if (n < 2)
-    var nxt : array<int>
-    var prv : array<int>
+    var nxt, prv : array<int>
     nxt |> resize(n)
     prv |> resize(n)
     for (i in range(n)) {
@@ -351,7 +352,7 @@ def private bpe_encode_spm_space(tk : BpeTokenizer; text : string) : array<int64
             }
         }
         if (!done) {
-            var syms : array<int64>
+            var inscope syms : array<int64>
             syms |> reserve(e - pos)
             for (i in range(pos, e)) {
                 let cid = tk.cpt_id?[cpts[i]] ?? -1l
@@ -397,7 +398,7 @@ def bpe_encode(tk : BpeTokenizer; text : string) : array<int64> {
     var cpb : array<uint8>   // one codepoint's UTF-8 bytes, reused across the walk (no string per codepoint)
     cpb |> reserve(4)
     for (off in offs) {
-        var syms : array<int64>
+        var inscope syms : array<int64>
         syms |> reserve(off)
         var has_unk = false
         for (i in range(pos, pos + off)) {
@@ -502,6 +503,4 @@ def bpe_decode_ids(tk : BpeTokenizer; ids : array<int64>) : string {
 }
 
 //! Look up a special/added token id by its surface form (e.g. "<|eot_id|>"); -1 if absent.
-def special_id(tk : BpeTokenizer; name : string) : int64 {
-    return tk.lookup?[name] ?? -1l
-}
+def special_id(tk : BpeTokenizer; name : string) : int64 => tk.lookup?[name] ?? -1l

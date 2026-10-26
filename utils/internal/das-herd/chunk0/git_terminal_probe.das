@@ -39,9 +39,7 @@ struct public GitProbeSample {
     error : string
 }
 
-def private elapsed_us(started : int64) : int64 {
-    return get_time_nsec(started) / 1000l
-}
+def private elapsed_us(started : int64) : int64 => get_time_nsec(started) / 1000l
 
 def private quote_terminal_arg(arg : string) : string {
     if (empty(arg)) return "\"\""
@@ -121,7 +119,7 @@ def public run_direct_probe(command : GitProbeCommand const;
     sample.output_text = (first_count > 0 ? to_char(int(first_byte[0])) : "") + remainder
     if (!empty(log_path)) {
         let log_started = ref_time_ticks()
-        var log_file = fopen(log_path, "wb")
+        let log_file = fopen(log_path, "wb")
         if (log_file == null) {
             sample.error = "could not open log: {log_path}"
         } else {
@@ -148,7 +146,7 @@ def public run_terminal_probe(command : GitProbeCommand const;
         command = command.name,
         lane = GitProbeLane.terminal_logged,
         log_path = log_path)
-    var log_file = fopen(log_path, "wb")
+    let log_file = fopen(log_path, "wb")
     if (log_file == null) {
         sample.error = "could not open log: {log_path}"
         return <- sample

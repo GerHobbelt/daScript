@@ -14,13 +14,15 @@ require _compares
 // load_audio_16k_mono's empty-on-failure contract that every caller must guard.
 
 // a one-function program requiring `requires` (one per line), no escape line
-def fixture_source(requires : array<string>) : string {
-    return join(requires, "\n") + "\n\n[export]\ndef main() " + "\{\n    print(\"ok\\n\")\n\}\n"
-}
+def fixture_source(requires : array<string>) : string =>
+    join(requires, "\n") + "\n\n[export]\ndef main() " + "\{\n    print(\"ok\\n\")\n\}\n"
 
-def spawn_compile(requires : array<string>; tag : string) : tuple<rc : int; out : string> {
-    return spawn_compile_only(fixture_source(requires), "lint_{tag}", 120.0)
-}
+//! an engine-wide compile: the facade pulls every engine module, and the windows nightly runner compiles it in about two
+//! minutes, so the cap sits well past that
+let ENGINE_COMPILE_CAP_SEC = 480.0
+
+def spawn_compile(requires : array<string>; tag : string) : tuple<rc : int; out : string> =>
+    spawn_compile_only(fixture_source(requires), "lint_{tag}", ENGINE_COMPILE_CAP_SEC)
 
 //! a module with a function global above its `[init, boot_restore]` function, and one below it where `below` is set: the annotation
 //! runs as the parser reaches the function, so a global below it would get no guard - the macro refuses the module
@@ -61,15 +63,11 @@ def test_boot_restore_order_gate(t : T?) {
 
 [test]
 def test_allowed_set_admits_the_entry_modules(t : T?) {
-    t |> run("a facade-only program with no escape compiles") @(t : T?) {
-        let r = spawn_compile(["require dasllama/dasllama"], "facade")
-        t |> equal(0, r.rc, "facade require is allowed: {r.out}")
-        t |> success(find(r.out, "DASLLAMA001") < 0, "no lint finding on the facade")
-    }
-    t |> run("the scheduler, exchange and bench entries are allowed too") @(t : T?) {
+    t |> run("a program on the facade, scheduler, exchange and bench entries with no escape compiles") @(t : T?) {
         let r = spawn_compile(["require dasllama/dasllama", "require dasllama/dasllama_scheduler",
                                "require dasllama/dasllama_exchange_schema", "require dasllama/dasllama_bench"], "entries")
-        t |> equal(0, r.rc, "scheduler + exchange_schema + bench allowed: {r.out}")
+        t |> equal(0, r.rc, "facade + scheduler + exchange_schema + bench allowed: {r.out}")
+        t |> success(find(r.out, "DASLLAMA001") < 0, "no lint finding on the entry modules")
     }
     t |> run("an engine internal with no escape does not compile") @(t : T?) {
         let r = spawn_compile(["require dasllama/dasllama_gguf"], "internal")

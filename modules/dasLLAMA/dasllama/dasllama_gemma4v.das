@@ -103,6 +103,8 @@ struct Gemma4vState {
     @scratch pos_x : array<int64>; @scratch pos_y : array<int64>   // the grid's patch columns / rows
     grid_w : int64       // the grid the tables were built for (0 = none yet)
     grid_h : int64
+    @scratch @exact_size tail : array<float>   // [nout × proj_dim] soft tokens a device chain landed behind its blocks
+    tail_ready : bool    //! `tail` holds this encode's soft tokens: the CPU tail stands down
 }
 
 // the tower owns exactly one thing — its image backing. Every plane borrows.
@@ -213,27 +215,27 @@ def private register_gemma4v_image_tags {
     register_image_family_tag(GEMMA4V_TAG_Q8)
 }
 
-// the GPU blocks hook (dasllama_metal_tower or dasllama_vulkan_tower registers it at [init]; requires-back). It takes
-// s.x after the stem (rope tables built), runs every block, leaves the result in s.x; false = declined, the CPU loop is
-// the fallback. `serves` = would the driver serve (the lane policy asks)
-typedef Gemma4vGpuBlocksFn = function<(t : Gemma4vTower; var s : Gemma4vState; npos : int64) : bool>
-typedef Gemma4vGpuServesFn = function<() : bool>
-var private g_g4v_gpu : Gemma4vGpuBlocksFn
-var private g_g4v_gpu_serves : Gemma4vGpuServesFn
-var private g_g4v_gpu_set = false
+// the GPU chain hook (dasllama_metal_tower or dasllama_vulkan_tower registers it at [init]; requires-back): the whole chain
+// off the planes; false = declined, the CPU chain is the fallback. `serves` = would the driver serve (the lane policy asks)
+typedef Gemma4vGpuChainFn = function<(t : Gemma4vTower; var s : Gemma4vState; planes : array<float>; w, h, npos : int64) : bool>   //! the whole chain from the planes
+var private g_g4v_gpu : Gemma4vGpuChainFn
+var private g_g4v_seat = GpuLaneSeat()
 
-def register_gemma4v_gpu(fn : Gemma4vGpuBlocksFn; serves : Gemma4vGpuServesFn) {
+//! the whole-chain seat: the fn runs the stem, the blocks and the tail on the device off the planes; `serves` answers the knob so
+//! the encode skips the CPU im2col; `f32_lane` says whether the policy prefers the file's planes over the q8 image (true where the device's f32 tiles are its faster lane)
+def register_gemma4v_gpu(fn : Gemma4vGpuChainFn; serves : function<() : bool>; f32_lane : bool = true) {
     g_g4v_gpu = fn
-    g_g4v_gpu_serves = serves
-    g_g4v_gpu_set = true
+    g_g4v_seat = GpuLaneSeat(set = true, f32_lane = f32_lane, serves = serves)
 }
 
-// The lane policy follows the fastest GEMM path on the box: a serving GPU blocks driver or the
-// armed accelerate float-batch tier both want the file's planes (the driver declines q8, the tier
-// serves float planes only) and flip the default to the exact lane; else q8. A pin overrides.
+// The lane policy follows the fastest GEMM path on the box: a serving GPU chain or the armed
+// accelerate float-batch tier prefers the file's planes and flips the default to the exact lane; else q8. A pin overrides.
 var private g_g4v_q8_pin = GemmLane.unset
 
-def private g4v_serve_q8() : bool => lane_serves_q8(g_g4v_q8_pin, !((g_g4v_gpu_set && invoke(g_g4v_gpu_serves)) || float_batch_override_active()))
+//! the GPU tower would serve this encode on the file's planes - the lane policy's clause: with it false the policy's default is the q8 image
+def gemma4v_gpu_exact_serves() : bool => gpu_exact_serves(g_g4v_seat)
+
+def private g4v_serve_q8() : bool => lane_serves_q8(g_g4v_q8_pin, !(gemma4v_gpu_exact_serves() || float_batch_override_active()))
 
 //! Pin the gemma4v tower's block-GEMM format for subsequent loads: q8 (the CPU serving default)
 //! vs the file's own planes (the parity rail, and what the Metal tower serves). Each lane is its
@@ -253,15 +255,7 @@ def private g4v_tag() : string => g4v_serve_q8() ? GEMMA4V_TAG_Q8 : GEMMA4V_TAG
 
 // the lane changes what a load mints and serves, so the load says which and why, by knob spelling
 def private g4v_announce_lane() {
-    var why = "the CPU default (DASLLAMA_METAL_TOWER off / no accelerate tier)"
-    if (g_g4v_q8_pin != GemmLane.unset) {
-        why = "pinned"
-    } elif (g_g4v_gpu_set && invoke(g_g4v_gpu_serves)) {
-        why = "DASLLAMA_METAL_TOWER on: the Metal tower serves the file's planes"
-    } elif (float_batch_override_active()) {
-        why = "DASLLAMA_ACCEL on: the float-batch tier serves the file's planes"
-    }
-    to_log(LOG_INFO, "dasLLAMA gemma4v: block GEMM lane {g4v_serve_q8() ? "q8" : "exact planes"} - {why}\n")
+    to_log(LOG_INFO, "dasLLAMA gemma4v: block GEMM lane {g4v_serve_q8() ? "q8" : "exact planes"} - {lane_why(g_g4v_seat, g_g4v_q8_pin != GemmLane.unset)}\n")
 }
 
 // the clamp's five floats into the f32 blob at `off` (read back by g4v_clamp_at)
@@ -291,9 +285,8 @@ let private G4V_BLK_GEMM_NAMES <- [ "attn_q", "attn_k", "attn_v", "attn_out", "f
 
 // the block GEMM element counts in GEMMA4V_GEMM_* order — the staged layout and the served
 // offsets both size from this one list
-def private g4v_gemm_sizes(d, ff : int64) : array<int64> {
-    return <- [ d * d, d * d, d * d, d * d, d * ff, d * ff, ff * d ]
-}
+def private g4v_gemm_sizes(d, ff : int64) : array<int64> =>
+    <- [ d * d, d * d, d * d, d * d, d * ff, d * ff, ff * d ]
 
 // every tensor the forward reads, by name and element count, before any layout is committed
 def private g4v_verify_tensors(m : GGUFMeta; t : Gemma4vTower; gemm_sizes : array<int64>) {
@@ -409,7 +402,7 @@ def stage_gemma4v_tower(path : string) : Gemma4vStaging {
     // the staged mint holds source + image at once; past the line a carrier streams like a decoder,
     // and this tower has no streamed mint — the shipped vision mmprojs sit under it (E2B bf16 0.99 GB)
     if (stat(path).size >= GEMMA4V_STAGE_CAP) {
-        panic("dasLLAMA gemma4v: '{path}' is {stat(path).size / 1048576ul} MB - at or past the 1 GiB staged-mint line; serve the bf16 mmproj (an f32-widened twin is an oracle artifact, not a serving file)")
+        panic("dasLLAMA gemma4v: '{path}' is {int64(stat(path).size / 1048576ul)} MB - at or past the 1 GiB staged-mint line; serve the bf16 mmproj (an f32-widened twin is an oracle artifact, not a serving file)")
     }
     fmap(f) $(var bytes : array<uint8>#) {
         var inscope m <- parse_gguf_meta(bytes)
@@ -634,6 +627,15 @@ def gemma4v_block_offs(t : Gemma4vTower; l : int64) : Gemma4vBlockOffs {
     return o
 }
 
+//! the block's q8 GEMM regions in GEMM order - the site order both tower drivers read
+def gemma4v_block_regions(t : Gemma4vTower; l : int64; var out : Q8Region[int(GEMMA4V_GEMMS)]) {
+    let o = gemma4v_block_offs(t, l)
+    for (g in range64(GEMMA4V_GEMMS)) {
+        let wide = g == GEMMA4V_GEMM_GATE || g == GEMMA4V_GEMM_UP
+        out[g] = Q8Region(woff = o.w[g], n = g == GEMMA4V_GEMM_DOWN ? t.n_ff : t.n_embd, rows = wide ? t.n_ff : t.n_embd)
+    }
+}
+
 // one pre-norm block over the residual stream s.x (npos rows)
 def private g4v_block(t : Gemma4vTower; var s : Gemma4vState; l, npos : int64) {
     let d = t.n_embd
@@ -684,10 +686,7 @@ def private g4v_block(t : Gemma4vTower; var s : Gemma4vState; l, npos : int64) {
     asr_prof_add("g4v.norm", tp)
 }
 
-// the stem: im2col → x·2−1 → patch conv → x/y position-table adds, leaving the residual stream in
-// s.x (npos rows); sizes every block buffer for this canvas
-def private g4v_stem(t : Gemma4vTower; var s : Gemma4vState; planes : array<float>; w, h, n_cols : int64) : int64 {
-    let d = t.n_embd
+def private g4v_im2col(t : Gemma4vTower; var s : Gemma4vState; planes : array<float>; w, h : int64) : int64 {
     let npos = im2col_rgb_patches(planes, w, h, t.patch, s.x0)
     // inp_raw_scaled: pixels [0, 1] -> [-1, 1] ahead of the conv
     unsafe {
@@ -696,6 +695,13 @@ def private g4v_stem(t : Gemma4vTower; var s : Gemma4vState; planes : array<floa
             xp[i] = xp[i] * 2.0 - 1.0
         }
     }
+    return npos
+}
+
+//! sizes every block buffer for this canvas on both routes; the CPU im2col with the pixel map only under `im2col`
+def private g4v_stem_cols(t : Gemma4vTower; var s : Gemma4vState; planes : array<float>; w, h : int64; im2col : bool) : int64 {
+    let d = t.n_embd
+    let npos = im2col ? g4v_im2col(t, s, planes, w, h) : (w / t.patch) * (h / t.patch)
     ensure_length(s.x, npos * d)
     ensure_length(s.xb, npos * d)
     ensure_length(s.xb2, npos * d)
@@ -704,6 +710,13 @@ def private g4v_stem(t : Gemma4vTower; var s : Gemma4vState; planes : array<floa
     ensure_length(s.vv, npos * d)
     ensure_length(s.hg, npos * t.n_ff)
     ensure_length(s.hu, npos * t.n_ff)
+    return npos
+}
+
+// the stem's finish: the patch conv over the columns and the x/y position-table adds, leaving the residual stream in
+// s.x - a device chain runs both itself off s.x0
+def private g4v_stem_finish(t : Gemma4vTower; var s : Gemma4vState; npos, n_cols : int64) {
+    let d = t.n_embd
     mm_plane_b(s.x, t.patch_bf16, t.wblob, t.blob, t.patch_w, s.x0, t.patch_dim, d, npos)
     unsafe {
         var xp = addr(s.x[0])
@@ -717,7 +730,6 @@ def private g4v_stem(t : Gemma4vTower; var s : Gemma4vState; planes : array<floa
             }
         }
     }
-    return npos
 }
 
 // the tail: Gemma4VisionPooler (merge×merge mean, ×√d), the std guard, then the
@@ -765,17 +777,35 @@ def gemma4v_encode(t : Gemma4vTower; var s : Gemma4vState; planes : array<float>
     let n_rows = h / t.patch
     dispatch_phase_encode(n_cols * n_rows)
     var tp = ref_time_ticks()
-    let npos = g4v_stem(t, s, planes, w, h, n_cols)
+    let chain = g_g4v_seat.set
+    let npos = g4v_stem_cols(t, s, planes, w, h, !chain)
     g4v_rope_tables(t, s, n_cols, n_rows)
     asr_prof_add("g4v.stem", tp)
     var gpu_served = false
-    if (g_g4v_gpu_set) {
-        gpu_served = invoke(g_g4v_gpu, t, s, npos)
+    s.tail_ready = false
+    if (chain) {
+        tp = ref_time_ticks()
+        gpu_served = invoke(g_g4v_gpu, t, s, planes, w, h, npos)
+        asr_prof_add("g4v.gpu", tp)
     }
     if (!gpu_served) {
+        tp = ref_time_ticks()
+        if (chain) {
+            g4v_im2col(t, s, planes, w, h)
+        }
+        g4v_stem_finish(t, s, npos, n_cols)
+        asr_prof_add("g4v.stem", tp)
         for (l in range64(t.n_layer)) {
             g4v_block(t, s, l, npos)
         }
+    }
+    if (gpu_served && s.tail_ready) {   // the device chain ran the tail behind its blocks
+        let n_out = (n_cols / t.merge) * (n_rows / t.merge)
+        ensure_length(out, n_out * t.proj_dim)
+        unsafe {
+            memcpy(addr(out[0]), addr(s.tail[0]), uint64(n_out * t.proj_dim * 4l))
+        }
+        return n_out
     }
     tp = ref_time_ticks()
     let nout = g4v_tail(t, s, n_cols, n_rows, out)

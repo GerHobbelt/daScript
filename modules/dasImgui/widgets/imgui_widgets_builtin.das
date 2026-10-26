@@ -843,12 +843,10 @@ def drag_int_range2(var state : DragStateRangeInt; text : string;
 // A zero-init bounds (a forgotten bounds=) is a degenerate min==max==0 slider that can't move;
 // substitute ImGui's stock range so a slider with no bounds set is still usable instead of silently
 // dead. Sliders only — drag's (0,0)=unbounded is deliberate and keeps its zero-init default.
-def private slider_range(b : tuple<float; float>) : tuple<float; float> {
-    return b._0 == 0.0f && b._1 == 0.0f ? (0.0f, 1.0f) : b
-}
-def private slider_range(b : tuple<int; int>) : tuple<int; int> {
-    return b._0 == 0 && b._1 == 0 ? (0, 100) : b
-}
+def private slider_range(b : tuple<float; float>) : tuple<float; float> =>
+    b._0 == 0.0f && b._1 == 0.0f ? (0.0f, 1.0f) : b
+def private slider_range(b : tuple<int; int>) : tuple<int; int> =>
+    b._0 == 0 && b._1 == 0 ? (0, 100) : b
 
 [widget]
 def slider_float(var state : SliderStateFloat; text : string;
@@ -1240,6 +1238,7 @@ def combo(var state : ComboState; text : string; items : array<string>;
     if (BeginCombo(text, preview, ImGuiComboFlags.None)) {
         for (i in range(n)) {
             let is_sel = i == state.value
+            PushID(i)
             if (Selectable(items[i], is_sel)) {
                 state.value = i
                 changed = true
@@ -1248,6 +1247,7 @@ def combo(var state : ComboState; text : string; items : array<string>;
                 SetItemDefaultFocus()
             }
             subs |> push(capture_current_item_rect())
+            PopID()
         }
         EndCombo()
     }
@@ -1514,6 +1514,7 @@ def combo_getter(var state : ComboState; text : string;
             var lbl : string
             if (invoke(getter, i, lbl)) {
                 let is_sel = i == state.value
+                PushID(i)
                 if (Selectable(lbl, is_sel)) {
                     state.value = i
                     changed = true
@@ -1522,6 +1523,7 @@ def combo_getter(var state : ComboState; text : string;
                     SetItemDefaultFocus()
                 }
                 subs |> push(capture_current_item_rect())
+                PopID()
             }
         }
         EndCombo()
@@ -2492,6 +2494,7 @@ def edit_combo(var ptr : int? implicit; text : string = "";
     if (BeginCombo(lbl, preview, ImGuiComboFlags.None)) {
         for (i in range(n)) {
             let is_sel = i == cur
+            PushID(i)
             if (Selectable(items[i], is_sel)) {
                 unsafe(*ptr) = i
                 changed = true
@@ -2500,6 +2503,7 @@ def edit_combo(var ptr : int? implicit; text : string = "";
                 SetItemDefaultFocus()
             }
             subs |> push(capture_current_item_rect())
+            PopID()
         }
         EndCombo()
     }

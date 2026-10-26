@@ -161,7 +161,7 @@ def public load_path_excludes_from_path(path : string; var excludes : array<stri
     if (paths_obj == null || !(paths_obj.value is _object)) return
     var paths & = unsafe(paths_obj.value as _object)
     if (!key_exists(paths, "exclude")) return
-    var excl_jv : JsonValue? = paths["exclude"]
+    let excl_jv : JsonValue? = paths["exclude"]
     if (excl_jv == null || !(excl_jv.value is _array)) return
     for (pat_jv in excl_jv.value as _array) {
         if (pat_jv != null && pat_jv.value is _string) {
@@ -259,21 +259,18 @@ def private module_source_path(prog : ProgramPtr) : string {
     return res
 }
 
-def private path_has_segment(file : string; seg : string) : bool {
-    return starts_with(file, seg + "/") || find(file, "/" + seg + "/") >= 0
-}
+def private path_has_segment(file : string; seg : string) : bool =>
+    starts_with(file, seg + "/") || find(file, "/" + seg + "/") >= 0
 
 //! True when the compiling module's source lives under ``daslib/``.
 //! Default gate for rules that hold the standard library to a stricter bar (STYLE014/STYLE015).
-def public is_daslib_source(prog : ProgramPtr) : bool {
-    return path_has_segment(module_source_path(prog), "daslib")
-}
+def public is_daslib_source(prog : ProgramPtr) : bool =>
+    path_has_segment(module_source_path(prog), "daslib")
 
 //! True when the compiling module's source lives under ``daslib/`` or ``modules/`` -
 //! shipped library code whose emitted strings flow into every consumer's logs (STYLE039).
-def public lint029_source_exempt(prog : ProgramPtr) : bool {
-    return path_has_segment(module_source_path(prog), "daslib")
-}
+def public lint029_source_exempt(prog : ProgramPtr) : bool =>
+    path_has_segment(module_source_path(prog), "daslib")
 
 def public is_shipped_library_source(prog : ProgramPtr) : bool {
     let file = module_source_path(prog)
@@ -335,9 +332,8 @@ def private docs_flag_at(config_path, key : string) : bool {
 //! True when the ``.lint_config`` at `config_path` sets ``[docs] rule_docs_only = true`` — the folder
 //! carries rule documents only (``REVIEW*.md`` / ``ARCHITECTURE*.md``). A folder property,
 //! NOT the ``[format]`` cascade: only that one file is read, and anything missing reads as false.
-def public rule_docs_only_at(config_path : string) : bool {
-    return docs_flag_at(config_path, "rule_docs_only")
-}
+def public rule_docs_only_at(config_path : string) : bool =>
+    docs_flag_at(config_path, "rule_docs_only")
 
 def private config_dir_of(file : string) : string {
     let dir = to_generic_path(dir_name(to_generic_path(file)))
@@ -383,21 +379,12 @@ def public partition_by_format_policy(var files : array<string>; var skipped : a
     return <- jobs
 }
 
-//! Walks ``.lint_config`` files from ``file``'s directory up to the repository root (the
-//! directory holding ``.git``, read inclusively); the nearest file defining a key wins that
-//! key. Single-threaded — resolve on the coordinating thread, pass results to jobs.
-def public format_policy_for(file : string) : FormatPolicy {
-    var pol = FormatPolicy()
-    var enabled_decided = false
-    var clean_decided = false
+//! The ``.lint_config`` path of every directory from ``file``'s own up to the repository root (the directory holding ``.git``, read inclusively), nearest first
+def private folder_configs_of(file : string) : array<string> {
+    var configs : array<string>
     var dir = config_dir_of(file)
     while (true) {
-        let cfg = dir == "." ? ".lint_config" : "{dir}/.lint_config"
-        with_config_table(cfg, "format") $(var fmt_jv) {
-            take_format_key(fmt_jv, "format_enabled", pol.format_enabled, enabled_decided)
-            take_format_key(fmt_jv, "force_clean_comments", pol.force_clean_comments, clean_decided)
-        }
-        break if (enabled_decided && clean_decided)
+        configs |> push(dir == "." ? ".lint_config" : "{dir}/.lint_config")
         var st : FStat
         break if (stat(path_join(dir, ".git"), st))
         let up = dir_name(dir)
@@ -408,7 +395,69 @@ def public format_policy_for(file : string) : FormatPolicy {
             dir = up
         }
     }
+    return <- configs
+}
+
+//! Walks ``.lint_config`` files from ``file``'s directory up to the repository root (the
+//! directory holding ``.git``, read inclusively); the nearest file defining a key wins that
+//! key. Single-threaded — resolve on the coordinating thread, pass results to jobs.
+def public format_policy_for(file : string) : FormatPolicy {
+    var pol = FormatPolicy()
+    var enabled_decided = false
+    var clean_decided = false
+    for (cfg in folder_configs_of(file)) {
+        with_config_table(cfg, "format") $(var fmt_jv) {
+            take_format_key(fmt_jv, "format_enabled", pol.format_enabled, enabled_decided)
+            take_format_key(fmt_jv, "force_clean_comments", pol.force_clean_comments, clean_decided)
+        }
+        break if (enabled_decided && clean_decided)
+    }
     return pol
+}
+
+//! Every config file that can steer a lint of ``file``: its folders' ``.lint_config`` files, nearest first, then the repo-level one
+def public lint_configs_for(file : string) : array<string> {
+    var configs <- folder_configs_of(file)
+    configs |> push(resolved_config_path())
+    return <- configs
+}
+
+//! Where the lint runner keeps its result cache unless ``--cache-dir`` says otherwise
+let public LINT_CACHE_DEFAULT_DIR = ".cache/daslang/lint_cache"
+
+[function_macro(name="lint_tool_entry")]
+class private LintToolEntry : AstFunctionAnnotation {
+    //! ``[lint_tool_entry]`` marks the lint runner's entry point: its semantic hash, every function it reaches included, versions the result cache
+}
+
+def private reset_lint_cache(tool_hash : string) {
+    let args <- get_command_line_arguments()
+    var dir = LINT_CACHE_DEFAULT_DIR
+    for (a, i in args, count()) {
+        return if (a == "--no-cache")
+        if (a == "--cache-dir" && i + 1 < length(args)) {
+            dir = args[i + 1]
+        }
+    }
+    let stamp = "{dir}/lint_hash.txt"
+    return if (fread(stamp) == tool_hash)
+    rmdir_rec(dir)
+    mkdir_rec(dir)
+    fwrite(stamp, tool_hash)
+}
+
+[simulate_macro(name="lint_tool_hash")]
+class private LintToolHash : AstSimulateMacro {
+    //! Empties the lint result cache when the ``[lint_tool_entry]`` function's semantic hash differs from the one ``lint_hash.txt`` recorded; a program without one is left alone
+    def override simulate(prog : Program?; var ctx : Context?) : bool {
+        return true if (is_in_completion() || is_compiling_macros() || is_folding())
+        for_each_function(prog.getThisModule, "main") $(fn) {
+            for (ann in fn.annotations) {
+                reset_lint_cache("{get_function_aot_hash(fn)}") if (ann.annotation.name == "lint_tool_entry")
+            }
+        }
+        return true
+    }
 }
 
 //! True when `fn` is user-authored from lint's point of view: not generated, or a generated
@@ -422,9 +471,8 @@ def public is_user_authored_body(fn : Function?) : bool {
 //! True for the lint-fixture naming convention: an underscore-led basename containing
 //! ``fixture``. Such files violate rules BY DESIGN, for tests that compile them or spawn
 //! the lint CLI over them, so the runner skips them (re-enabled via ``--lint-fixtures``).
-def public is_lint_fixture_name(base : string) : bool {
-    return starts_with(base, "_") && find(base, "fixture") >= 0
-}
+def public is_lint_fixture_name(base : string) : bool =>
+    starts_with(base, "_") && find(base, "fixture") >= 0
 
 let public LINT_SKIP_HEADER_LINES = 16
 
@@ -446,6 +494,14 @@ def public lint_file_skip_reason(file : string; expect_skips : bool = true) : st
     return ""
 }
 
+struct public LintFix {
+    line : int
+    column : int
+    last_line : int
+    last_column : int
+    replacement : string
+}
+
 //! One structured lint finding — the machine-readable twin of the ``"<message> at <file>:<line>:<column>"`` strings the ``*_collect`` overloads emit. Produced by the ``*_collect_issues`` overloads in ``daslib/lint`` / ``daslib/perf_lint`` / ``daslib/style_lint`` for consumers that need positions (e.g. the LSP validate subtool).
 struct public LintIssue {
     code : string           //!< rule id ("LINT002", "PERF018", "STYLE005"); "" when the message carries none
@@ -455,6 +511,52 @@ struct public LintIssue {
     column : int            //!< 0-based start column (byte offset — the LineInfo convention)
     last_line : int         //!< 1-based end line; 0 when unknown
     last_column : int       //!< 0-based end column (byte offset, end-exclusive)
+    fix : LintFix           //!< the edit that resolves the finding; line 0 when the rule offers none
+}
+
+def public apply_lint_fixes(text : string; fixes : array<LintFix>) : tuple<text : string; applied : int> {
+    var line_start : array<int>
+    line_start |> push(0)
+    peek_data(text) $(d) {
+        for (c, i in d, count()) {
+            if (int(c) == '\n') {
+                line_start |> push(i + 1)
+            }
+        }
+    }
+    var spans : array<int3>
+    for (f, k in fixes, count()) {
+        continue if (f.line <= 0 || f.line > length(line_start) || f.last_line < f.line || f.last_line > length(line_start))
+        spans |> push(int3(line_start[f.line - 1] + f.column, line_start[f.last_line - 1] + f.last_column, k))
+    }
+    sort(spans) $(a, b) => a.x < b.x
+    var applied = 0
+    let crlf = find(text, "\r\n") >= 0
+    let tlen = length(text)
+    let result = build_string() $(var w) {
+        peek_data(text) $(d) {
+            var pos = 0
+            for (sp in spans) {
+                continue if (sp.x < pos || sp.y < sp.x || sp.y > tlen)
+                if (sp.x > pos) write_string(w, d, pos, sp.x)
+                w |> write(crlf ? replace(fixes[sp.z].replacement, "\n", "\r\n") : fixes[sp.z].replacement)
+                pos = sp.y
+                applied++
+            }
+            if (tlen > pos) write_string(w, d, pos, tlen)
+        }
+    }
+    return (text = result, applied = applied)
+}
+
+def public lint_source_line(at : LineInfo; ln : int) : string {
+    var text = ""
+    if (at.fileInfo != null && ln > 0) {
+        get_file_source_line(at.fileInfo, uint(ln)) $(line) {
+            text := line
+        }
+    }
+    return text
 }
 
 //! Builds a ``LintIssue`` from a lint message and its source location.
@@ -468,4 +570,22 @@ def public make_lint_issue(message : string; at : LineInfo) : LintIssue {
         column = int(at.column),
         last_line = int(at.last_line),
         last_column = int(at.last_column))
+}
+
+def public drop_skipped_file_issues(target : string; var issues : array<LintIssue>) : int {
+    var skipped : table<string; bool>
+    var kept : array<LintIssue>
+    kept |> reserve(length(issues))
+    for (issue in issues) {
+        if (!empty(issue.file) && issue.file != target && !key_exists(skipped, issue.file)) {
+            skipped[issue.file] = !empty(lint_file_skip_reason(issue.file, false))
+        }
+        if (empty(issue.file) || issue.file == target || !(skipped?[issue.file] ?? false)) {
+            kept |> push(issue)
+        }
+    }
+    let dropped = length(issues) - length(kept)
+    delete issues
+    issues <- kept
+    return dropped
 }

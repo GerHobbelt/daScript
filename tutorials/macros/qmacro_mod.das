@@ -51,9 +51,7 @@ struct template DemoPair {
 // when qmacro_template_function clones the function — it reads the tag
 // and substitutes whatever TypeDeclPtr `t_value` holds at expansion time.
 // -----------------------------------------------------------------------
-def template demo_add(a, b : $t(t_value)) : $t(t_value) {
-    return a + b
-}
+def template demo_add(a, b : $t(t_value)) : $t(t_value) => a + b
 
 // -----------------------------------------------------------------------
 // The main call macro.
@@ -68,7 +66,7 @@ class BuildDemoMacro : AstCallMacro {
         //    Returns ExpressionPtr.  Use for simple literal constants.
         // ===============================================================
         var literal_true = quote(true)   // ExprConstBool
-        var literal_zero = quote(0)      // ExprConstInt
+        let literal_zero = quote(0)      // ExprConstInt
 
         // ===============================================================
         // 2. qmacro(expr) — expression with reification splices.
@@ -94,7 +92,7 @@ class BuildDemoMacro : AstCallMacro {
         var int_type   = qmacro_type(type<int>)
         var float_type = qmacro_type(type<float>)
         // $t — compose types: array<$t(int_type)> → array<int>
-        var arr_int_type = qmacro_type(type<array<$t(int_type)>>)
+        let arr_int_type = qmacro_type(type<array<$t(int_type)>>)
 
         // ===============================================================
         // 4. qmacro_variable("name", type<T>) — build a VariablePtr.

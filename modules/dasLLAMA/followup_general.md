@@ -1188,7 +1188,9 @@
    through `sample_` (the row copied into `s.logits`, `s.recent` advanced per accepted token) and
    accepts while the draw equals the draft, the scheduler gate drops to "MTP on", and a seeded
    counting run at temp 0.8 matches plain sampled decode token for token.
-102. **The NextN draft chain is k command buffers, a submit and a wait a draft.**
+102. **The NextN draft chain at depth 2 and up, or on an embedding table that is not Q8_0, is k command
+   buffers, a submit and a wait a draft** (depth 1 on a Q8_0 table rides the verify's command buffer,
+   `ARCHITECTURE_GPU_MTP.md#mtp-nextn-chain`).
    `metal_mtp_spec_round` runs k `metal_mtp_draft_forward` calls - a submit, a wait, a 1 MB logits
    readback and a CPU argmax each (about 0.4 ms of a 2.8 ms draft on Qwen3.8-27B, M5: `lcpp_bench
    --mtp-ab --prof --for-debug-purposes` under `JOBQUE_PROFILING=1`, the `mtp.draft.*` sections) - where the
@@ -2103,3 +2105,14 @@
    the reference up with the channel's pending count in one step and their owner joins. Several
    workers share one events channel, so the count does not fit them as it stands. Done = a worker
    exit the owner can wait on - a status a worker, or the count sized to the workers.
+
+212. **A request served off the prefix cache can answer differently from its cold run.** A cached run attaches
+    every row of the prompt but its last token's and evals that token alone, where the cold run evaled it
+    inside the prefill batch. On SmolLM2-135M Q8_0 on the CPU, a 138-token prompt (the model's default system
+    line and the robot story of `utils/dasllama-server/test_openai_server_stream.das`) reads "eyes sparkle"
+    cold and "eyes light up" off the cache under greedy sampling, the two parting at the fifth generated
+    token; a 117-token prompt reads the same both ways, and two cached runs always agree. The classic
+    attention mode set in the server's thread did not close it, which a rounding difference alone would
+    predict it to. The work: the cached K/V rows against a cold prefill's row by row at that prompt, to name
+    the row that differs and whether it is the last token's alone; then either the cold run's last row
+    evaled as the cached run evals it, or the difference stated in the server's README.

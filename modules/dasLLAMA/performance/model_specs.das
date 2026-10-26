@@ -259,9 +259,7 @@ def counting_prompt(start, last : int) : string {
 // the gemma4 fixture prompt, 1..320 (~1490 tokens): the sliding window is genuinely engaged
 // (kstart > 0). The short 21-token counting prompt was rejected — its oracle continuation
 // drifts into the channel format on a near-tie that flips under the pinned classic+libm kernels.
-def private gemma4_counting_prompt() : string {
-    return counting_prompt(320)
-}
+def private gemma4_counting_prompt() : string => counting_prompt(320)
 
 // the dense-gemma4 continuation (frozen on the 12B, shared by every dense gemma4 carrier —
 // same vocab, all count; each reuse verified per-file against the oracle)
@@ -374,6 +372,11 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
         ModelSpec(file = "Qwen3.5-0.8B-MTP-Q8_0.gguf",
             url = "{HF}/unsloth/Qwen3.5-0.8B-MTP-GGUF/resolve/main/Qwen3.5-0.8B-Q8_0.gguf",
             bytes = 833592736l, sha256 = "c54f8b67069c70085b98440de696b44da8250250ac69a961b41133def876e262"),
+        // the embedding model whose file names its read: `qwen3.pooling_type` last, `add_eos_token` on
+        // (tests/test_embeddings.das holds its model card's cosine matrix as the oracle)
+        ModelSpec(file = "Qwen3-Embedding-0.6B-Q8_0.gguf",
+            url = "{HF}/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/370f27d7550e0def9b39c1f16d3fbaa13aa67728/Qwen3-Embedding-0.6B-Q8_0.gguf",
+            bytes = 639150592l, sha256 = "06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439"),
         // the K-quant twin of the hybrid for the resident driver's native-plane cells
         // (tests/test_gpu_resident_hybrid.das): qkv q6_K, z q4_K, beta/alpha q4_K, the deltanet
         // out plane q4_K - the step leaves the o row f32 for the superblock out plane's requant
@@ -674,6 +677,13 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
             // plain evidence only (verified per-file 40/40, 2026-08-18): the qwen35moe arm
             // coverage (chunked deltanet + reference MoE prefill) lives on the plain-stem twin
             parity <- ev_qwen_count()),
+        // the single-format IQ4_XS twin with the MTP head (4.27 bpw): the fewest bytes of the 4-bit
+        // ladder at the K-quant files' quality (PERF_LEDGER.md's 2026-10-06 equal-bytes entry); the
+        // recipe is deterministic (no imatrix) from unsloth's BF16 shards, the published file its output
+        ModelSpec(file = "Qwen3.6-35B-A3B-MTP-IQ4_XS-pure.gguf",
+            url = "{HF}/borisbat/Qwen3.6-35B-A3B-MTP-IQ4_XS-pure-GGUF/resolve/6a1d560e64f8a9058773e5c1521534d9ef533bc8/Qwen3.6-35B-A3B-MTP-IQ4_XS-pure.gguf",
+            recipe = "llama-quantize --pure Qwen3.6-35B-A3B-BF16-00001-of-00002.gguf Qwen3.6-35B-A3B-MTP-IQ4_XS-pure.gguf IQ4_XS",
+            bytes = 18951018528l, sha256 = "8296de4b5b62724ae7eac1cf005a65a2936f227ef2cafcee8d9bad0a25c4806c"),
         ModelSpec(file = "Qwen3-Coder-30B-A3B-Instruct-Q8_0.gguf", display = "Qwen3-Coder-30B",
             parity <- ev_qwen_count([moe_reference = true])),
         ModelSpec(file = "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf", display = "Qwen3-Coder-30B-q4k", quant_label = "q4_k_m",
@@ -920,22 +930,19 @@ def private spec_view(keep : block<(s : ModelSpec) : bool>) : array<ModelSpec> {
 
 //! The profiled text-LLM view over [[model_specs]] — the rows gen_profile / the baseline
 //! establisher measure (a spec with a scoreboard display name).
-def llm_catalog() : array<ModelSpec> {
-    return <- spec_view() $(s : ModelSpec) : bool { return !empty(s.display); }
-}
+def llm_catalog() : array<ModelSpec> =>
+    <- spec_view() $(s : ModelSpec) : bool { return !empty(s.display); }
 
 //! The public-board view over [[model_specs]] — the rows gen_bench_records sweeps: community-
 //! popular GGUFs, one popular quant each, NOT the internal quant matrix (curated to what
 //! people run THIS year). Absent files skip with a warning, so one list serves every box.
-def official_catalog() : array<ModelSpec> {
-    return <- spec_view() $(s : ModelSpec) : bool { return s.official; }
-}
+def official_catalog() : array<ModelSpec> =>
+    <- spec_view() $(s : ModelSpec) : bool { return s.official; }
 
 //! Every row of [[model_specs]] - the sweep view: gen_bench_records `--catalog all` visits each
 //! stocked file, board row or not (absent files skip with a warning like the board view's).
-def full_catalog() : array<ModelSpec> {
-    return <- spec_view() $(s : ModelSpec) : bool { return !empty(s.file); }
-}
+def full_catalog() : array<ModelSpec> =>
+    <- spec_view() $(s : ModelSpec) : bool { return !empty(s.file); }
 
 //! The spec's vision mmproj companion basename ("" = no vision pairing) — the image-chat
 //! cell's second file. A row with one is a vision decoder; the driver pairs it with
@@ -952,9 +959,7 @@ def mmproj_companion(s : ModelSpec) : string {
 //! The one pinned picture every image-chat cell measures (provenanced as a companion of the
 //! spec row that owns it) — cells across models and boxes stay comparable because the input
 //! never varies.
-def bench_image_fixture() : string {
-    return "coco-val2017-000000039769.jpg"
-}
+def bench_image_fixture() : string => "coco-val2017-000000039769.jpg"
 
 //! The spec row keyed `file` - its models-dir path or its base name (a split-shard row sits in a subfolder, the
 //! pregate holds the base name); an empty `file` back = no such spec. A fresh copy, never a reference into the table.

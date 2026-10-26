@@ -76,6 +76,26 @@ def test_kv_pool_alloc_release(t : T?) {
         t |> equal(pool.capacity_groups, 8l)
         delete pool
     }
+    t |> run("growth inside a reserve moves no blob and keeps the rows written; past it the pool still grows") @(t : T?) {
+        let c = mk_config(2l, 4l, 2l, 16l, 32l)
+        var pool <- create_kv_pool_(c, 4l, KVDtype.f32, KVDtype.f32)
+        kv_pool_reserve(pool, 32l)
+        t |> equal(long_capacity(pool.kblobs[0]), 8l * 4l * pool.krow_bytes[0])
+        t |> equal(pool.capacity_groups, 0l)
+        kv_pool_alloc_group(pool)
+        pool.kblobs[0][0] = 0x5au8
+        let home = unsafe(addr(pool.kblobs[0][0]))
+        for (_i in range(7)) {
+            kv_pool_alloc_group(pool)
+        }
+        t |> equal(pool.capacity_groups, 8l)
+        t |> equal(home, unsafe(addr(pool.kblobs[0][0])))
+        t |> equal(pool.kblobs[0][0], 0x5au8)
+        t |> equal(8, kv_pool_alloc_group(pool))
+        t |> equal(pool.capacity_groups, 16l)
+        t |> equal(pool.kblobs[0][0], 0x5au8)
+        delete pool
+    }
 }
 
 [test]
@@ -235,9 +255,7 @@ def test_kv_paged_store_roundtrip(t : T?) {
 
 let MODEL_PATH = path_join(llama2c_dir(), "stories15M.bin")
 
-def private mk_prompt(n : int64) : array<int64> {
-    return <- [for (i in range64(n)); 2l + i % 40l]
-}
+def private mk_prompt(n : int64) : array<int64> => <- [for (i in range64(n)); 2l + i % 40l]
 
 def private logits_equal(a : Session; b : Session; vocab : int64) : bool {
     for (i in range64(vocab)) {
@@ -256,10 +274,10 @@ def private cache_rows_equal(var sf : Session; var sp : Session; c : Config; npo
             let kvd = layer_kv_dim(c, l)
             let krb = kv_row_bytes(sf.kv_dtype_k, kvd)
             let vrb = kv_row_bytes(sf.kv_dtype_v, kvd)
-            var fk = kv_layer_kbase(sf, l, c.seq_len)
-            var pk = kv_layer_kbase(sp, l, c.seq_len)
-            var fv = kv_layer_vbase(sf, l, c.seq_len)
-            var pv = kv_layer_vbase(sp, l, c.seq_len)
+            let fk = kv_layer_kbase(sf, l, c.seq_len)
+            let pk = kv_layer_kbase(sp, l, c.seq_len)
+            let fv = kv_layer_vbase(sf, l, c.seq_len)
+            let pv = kv_layer_vbase(sp, l, c.seq_len)
             for (pos in range64(npos)) {
                 let pr = kv_phys_row(sp, pos)
                 for (b in range64(krb)) {

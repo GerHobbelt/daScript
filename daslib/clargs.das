@@ -47,9 +47,7 @@ def public get_cli_arguments(all_args : array<string>) : array<string> {
     return <- result
 }
 
-def public get_cli_arguments() : array<string> {
-    return <- get_cli_arguments(get_command_line_arguments())
-}
+def public get_cli_arguments() : array<string> => <- get_cli_arguments(get_command_line_arguments())
 
 def public get_program_args(all_args : array<string>) : array<string> {
     var result : array<string>
@@ -61,9 +59,7 @@ def public get_program_args(all_args : array<string>) : array<string> {
     return <- result
 }
 
-def public get_program_args() : array<string> {
-    return <- get_program_args(get_command_line_arguments())
-}
+def public get_program_args() : array<string> => <- get_program_args(get_command_line_arguments())
 
 def public get_user_args() : array<string> {
     let argv <- get_command_line_arguments()
@@ -85,9 +81,8 @@ def public get_host_binary() : string {
     return arg0
 }
 
-def clargs_flag_name(field_name : string) : string {
-    return "--" + replace_multiple(field_name, [(text="_", replacement="-")])
-}
+def clargs_flag_name(field_name : string) : string =>
+    "--" + replace_multiple(field_name, [(text="_", replacement="-")])
 
 def public find_bool_flag_raw_value(args : array<string>; flag_name : string) : Option<string> {
     let prefix = "{flag_name}="
@@ -160,9 +155,8 @@ def public env_config_text(name : string) : Option<string> {
     return some(v)
 }
 
-def env_raw_value(arg_info : CommandArgumentInfo) : Option<string> {
-    return env_config_text(arg_info.env_name)
-}
+def env_raw_value(arg_info : CommandArgumentInfo) : Option<string> =>
+    env_config_text(arg_info.env_name)
 
 def public env_config_flag(name : string; dflt : bool) : bool {
     let v = env_config_text(name)
@@ -417,34 +411,41 @@ def public parse_argument(args : array<string>; arg_info : CommandArgumentInfo; 
     }
 }
 
+//! How many tokens the declared flag at `args[i]` takes: 0 when `args[i]` is no declared flag, 2 when it takes the next token as its value.
+def private declared_flag_span(args : array<string>; i : int; info : CommandInfo) : int {
+    let arg = args[i]
+    for (a in info.args) {
+        if (a.is_positional) continue
+        let has_short = !empty(a.short_flag_name)
+        let exact = arg == a.flag_name || (has_short && arg == a.short_flag_name)
+        let prefixed = starts_with(arg, "{a.flag_name}=") || (has_short && starts_with(arg, "{a.short_flag_name}="))
+        if (exact || prefixed) {
+            let is_bool_simple = (a.value_type == Type.tBool && !a.is_array)
+            return (exact && !is_bool_simple && !a.is_count && i + 1 < length(args)) ? 2 : 1
+        }
+    }
+    return 0
+}
+
+//! The first `--help` / `-h` among `args` that no declared flag claims - not a declared flag, not a flag's value, and before a bare `--`; "" when there is none.
+def public unclaimed_help_flag(args : array<string>; info : CommandInfo) : string {
+    var i = 0
+    while (i < length(args) && args[i] != "--") {
+        let span = declared_flag_span(args, i, info)
+        return args[i] if (span == 0 && (args[i] == "--help" || args[i] == "-h"))
+        i += span == 0 ? 1 : span
+    }
+    return ""
+}
+
 def public collect_positional_args(args : array<string>; info : CommandInfo) : array<string> {
     var result : array<string>
     var i = 0
     while (i < length(args)) {
         let arg = args[i]
-        var matched_flag = false
-        var consumes_value = false
-        for (a in info.args) {
-            if (a.is_positional) continue
-            let has_short = !empty(a.short_flag_name)
-            let exact_long = (arg == a.flag_name)
-            let exact_short = has_short && (arg == a.short_flag_name)
-            let prefix_long = starts_with(arg, "{a.flag_name}=")
-            let prefix_short = has_short && starts_with(arg, "{a.short_flag_name}=")
-            if (exact_long || exact_short || prefix_long || prefix_short) {
-                matched_flag = true
-                let is_bool_simple = (a.value_type == Type.tBool && !a.is_array)
-                if (!is_bool_simple && !a.is_count && (exact_long || exact_short)) {
-                    consumes_value = true
-                }
-                break
-            }
-        }
-        if (matched_flag) {
-            i++
-            if (consumes_value && i < length(args)) {
-                i++
-            }
+        let span = declared_flag_span(args, i, info)
+        if (span != 0) {
+            i += span
             continue
         }
         if (length(arg) >= 2 && first_character(arg) == int(0x2D)) {
@@ -615,8 +616,7 @@ def render_positional_usage_token(arg : CommandArgumentInfo) : string {
 }
 
 def public format_help(info : CommandInfo; prog_name : string) : string {
-    var positionals : array<CommandArgumentInfo>
-    var flags : array<CommandArgumentInfo>
+    var positionals, flags : array<CommandArgumentInfo>
     for (arg in info.args) {
         if (arg.is_positional) {
             positionals |> push_clone(arg)
@@ -921,8 +921,8 @@ class ArgsMacro : AstStructureAnnotation {
     def make_parse_args_with_help_fn(var st : StructurePtr) : FunctionPtr {
         var fn = qmacro_function("parse_args_with_help") $(var dst : $t(st); prog_name : string) : int {
             let auto_args <- get_user_args()
-            if (find_index(auto_args, "--help") != -1 || find_index(auto_args, "-h") != -1) {
-                let auto_info <- get_command_info(type<$t(st)>)
+            let auto_info <- get_command_info(type<$t(st)>)
+            if (!empty(unclaimed_help_flag(auto_args, auto_info))) {
                 print(format_help_with_auto_help(auto_info, prog_name))
                 return 0
             }
@@ -1037,6 +1037,15 @@ class ArgsMacro : AstStructureAnnotation {
         }
     }
 
+    // a bool `help` field renamed off --help still takes --help / -h, else the tool runs instead of printing its help
+    def make_help_alias_expr(arg : CommandArgumentInfo) : ExpressionPtr {
+        return qmacro_block() {
+            if (!empty(unclaimed_help_flag(args, command_info))) {
+                dst.$f(arg.field_name) = true
+            }
+        }
+    }
+
     def make_parse_fn(var st : StructurePtr; info : CommandInfo) : FunctionPtr {   // nolint:STYLE038 — four parallel qmacro variants (positional × mutex); the enumeration IS the function
         var name_to_index <- { for (i in range(length(st.fields))); string(st.fields[i].name) => i }
         var field_index_by_name <- { for (arg in info.args); arg.field_name => name_to_index[arg.field_name]; where key_exists(name_to_index, arg.field_name) }
@@ -1082,6 +1091,11 @@ class ArgsMacro : AstStructureAnnotation {
                 continue
             }
             init_exprs |> push(make_enum_init_expr(st, i, arg, field_index))
+        }
+        for (arg in info.args) {
+            if (arg.field_name == "help" && arg.flag_name != "--help" && arg.value_type == Type.tBool && !arg.is_array && !arg.is_positional && !arg.is_count) {
+                init_exprs |> push(make_help_alias_expr(arg))
+            }
         }
 
         if (has_positional && has_mutex) {

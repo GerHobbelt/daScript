@@ -29,8 +29,10 @@ family-blind.
 3. **`think_gate` + `assistant_open_think`** (off -> thinking, gemma-4-shaped): the gate
    (`<|think|>`) opens the system turn - rendered even when no system prompt is set - and the
    generation prompt switches to the bare `assistant_open_think` header so the model emits its
-   own thought channel. gemma-4's default `assistant_open` keeps the closed empty
-   `<|channel>thought\n<channel|>` prefill, so thinking-off renders the exact pre-arc tokens.
+   own thought channel. gemma-4's thinking-off `assistant_open` is read off the model's own
+   template: the larger models' template closes an empty `<|channel>thought\n<channel|>` after the
+   model turn's opener, the E-series' opens the turn bare - with the closed thought ahead of it an
+   E-series model writes its reasoning as the answer.
 4. **`stop_nothink`** - guarded stop tokens in force whenever the next turn is NOT a thinking
    turn. gemma-4 lists its channel markers: an instruct-mode E-series model rambles past its
    answer through a stray `<channel|>` (`...4.<channel|>4`), and the same model opens a media
@@ -82,7 +84,8 @@ DeepSeek framing). Tool-capable replies split reasoning FIRST, then
 | gemma-4 E-series | on (instruct = opt-out via the closed-channel prefill) | asymmetric | gemma4 (declaration/call/response DSL) | gemma-4-E2B |
 | llama-3.x (llama) | none | none | llama_json (whole-reply object, ipython results) | Llama-3.2-3B |
 | mistral v0.3 (mistral-instruct template) | none | none | mistral ([AVAILABLE_TOOLS]/[TOOL_CALLS]) | Mistral-7B-v0.3 Q4 |
-| phi3, gemma2/3, mistral3 (v7-tekken) | none | none | none declared | - |
+| phi3, gemma2/3 | none | none | none declared | - |
+| mistral3 (v7-tekken: Mistral-Small 3.x, Magistral, Devstral) | none | none | mistral | - |
 
 Every ToolMode's wire codec lives in `dasllama_tools.das` (serializers + parsers, model-free
 pinned in `tests/test_tool_formats.das`); the chat layer dispatches defs/replay/results on the

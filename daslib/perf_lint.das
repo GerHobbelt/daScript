@@ -102,6 +102,13 @@ struct Perf024Candidate {
     disqualified : bool
 }
 
+struct Perf033Candidate {
+    //! PERF033 per-candidate state: a container declared inside a loop, reported at the function's end unless the walk sees it moved out - into a `var` parameter, as the right side of `<-`, by `return <-`, or into a struct or variant field
+    @do_not_delete v : Variable?
+    fix : LintFix
+    consumed : bool
+}
+
 struct Perf023Candidate {
     //! PERF023 per-candidate state. One entry per `var X = clone_expression(E)` decl seen in the current function. `safe_uses` counts ExprVar refs to X whose ancestor chain (within this function) includes an `add_ptr_ref(...)` call — the splice-wrapper installed by `apply_qrules` for every `$e(...)` tag. `disqualified` is set on any other use (assignment, call arg passed to a non-splice consumer, etc.); the pre-clone is then load-bearing. The `var` carries the decl `at` directly (v.at), so the warning location is derived without storing LineInfo in the array.
     @do_not_delete v : Variable?
@@ -219,6 +226,31 @@ def private perf030_needs_release(td : TypeDeclPtr) : bool {
     return false
 }
 
+def private perf033_delete_frees_shared(td : TypeDeclPtr; var seen : table<Structure?>) : bool {
+    if (td == null) return false
+    let bt = td.baseType
+    if (bt == Type.tPointer) return !td.flags.smartPtr
+    if (bt == Type.tLambda || bt == Type.tIterator) return true
+    if (bt == Type.tArray || bt == Type.tTable || bt == Type.tFixedArray) {
+        return perf033_delete_frees_shared(td.firstType, seen) || perf033_delete_frees_shared(td.secondType, seen)
+    }
+    if (bt == Type.tStructure && td.structType != null) {
+        let st = td.structType
+        return false if (key_exists(seen, st))
+        seen |> insert(st)
+        for (fld in td.structType.fields) {
+            if (!fld.flags.doNotDelete && perf033_delete_frees_shared(fld._type, seen)) return true
+        }
+        return false
+    }
+    if (bt == Type.tTuple || bt == Type.tVariant) {
+        for (aft in td.argTypes) {
+            if (perf033_delete_frees_shared(aft, seen)) return true
+        }
+    }
+    return false
+}
+
 def private has_annotation(annotations; name : string) : bool {
     for (a in annotations) {
         if (a.name == name) return true
@@ -230,7 +262,7 @@ def private is_annotated_dest(var expr : Expression?; name : string) : bool {
     return false if (expr == null)
     if (expr is ExprField) {
         var f = expr as ExprField
-        var fd = f.field
+        let fd = f.field
         if (fd != null && has_annotation(fd.annotation, name)) return true
         return is_annotated_dest(f.value, name)
     }
@@ -251,9 +283,7 @@ def private is_annotated_dest(var expr : Expression?; name : string) : bool {
     return false
 }
 
-def private is_scratch_dest(var expr : Expression?) : bool {
-    return is_annotated_dest(expr, "scratch")
-}
+def private is_scratch_dest(var expr : Expression?) : bool => is_annotated_dest(expr, "scratch")
 
 def private takes_scratch_arg(fn : Function?) : bool {
     return false if (fn == null)
@@ -268,9 +298,8 @@ def private is_explicit_capacity_call(n : string) : bool {
             || n == "scratch_reserve" || n == "scratch_ensure_capacity" || n == "scratch_resize")
 }
 
-def private is_env_builtin(n : string) : bool {
-    return n == "get_env_variable" || n == "has_env_variable" || n == "set_env_variable"
-}
+def private is_env_builtin(n : string) : bool =>
+    n == "get_env_variable" || n == "has_env_variable" || n == "set_env_variable"
 
 def private is_io_builtin(n : string) : bool {
     return (n == "print" || n == "to_log" || n == "fprint" || n == "fopen" || n == "fclose"
@@ -366,6 +395,74 @@ class HotBodyScan : AstVisitor {
     }
 }
 
+//! the bodiless builtins that free an argument's buffer - what `delete` on an array or table lowers to, through daslib `finalize`
+def perf033_builtin_takes(fn : Function?; idx : int) : bool =>
+    idx == 0 && (fn.name == "__builtin_array_free" || fn.name == "__builtin_table_free")
+
+class Perf033MoveScan : AstVisitor {
+    //! answers whether a function body takes one of its parameters: moves it out (`<-`, `return <-`, a tuple, struct or variant literal it sits in, `emplace`), or deletes it
+    @do_not_delete param : Variable?
+    depth : int = 0
+    takes : bool = false
+
+    def is_param(e : ExpressionPtr) : bool {
+        var inner = e
+        if (inner != null && inner is ExprRef2Value) {
+            inner = (inner as ExprRef2Value).subexpr
+        }
+        return inner != null && inner is ExprVar && (inner as ExprVar).variable == param
+    }
+
+    def override preVisitExprMove(expr : ExprMove?) : void {
+        takes ||= is_param(expr.right)
+    }
+
+    def override preVisitExprReturn(expr : ExprReturn?) : void {
+        takes ||= expr.returnFlags.moveSemantics && is_param(expr.subexpr)
+    }
+
+    def override preVisitExprDelete(expr : ExprDelete?) : void {
+        takes ||= is_param(expr.subexpr)
+    }
+
+    def override preVisitExprMakeTupleIndex(_expr : ExprMakeTuple?; _index : int; init : ExpressionPtr; _last : bool) : void {
+        takes ||= is_param(init)
+    }
+
+    def override preVisitExprMakeStructField(_expr : ExprMakeStruct?; _index : int; decl : MakeFieldDeclPtr; _last : bool) : void {
+        takes ||= decl != null && decl.flags.moveSemantics && is_param(decl.value)
+    }
+
+    def override preVisitExprMakeVariantField(_expr : ExprMakeVariant?; _index : int; decl : MakeFieldDeclPtr; _last : bool) : void {
+        takes ||= decl != null && decl.flags.moveSemantics && is_param(decl.value)
+    }
+
+    def override preVisitExprCallArgument(var expr : ExprCall?; arg : ExpressionPtr; _last : bool) : void {
+        if (expr == null || expr.func == null || takes || !is_param(arg)) return
+        for (i in 0 .. length(expr.arguments)) {
+            if (intptr(expr.arguments[i]) != intptr(arg) || i >= length(expr.func.arguments)) continue
+            let pt = expr.func.arguments[i]._type
+            if (pt != null && !pt.flags.constant && perf033_param_taken(expr.func, i, depth + 1)) {
+                takes = true
+            }
+        }
+    }
+}
+
+//! whether `fn` takes its parameter `idx`: a bodiless builtin by name, a body by a scan that follows the parameter through `depth` levels of callees - daslib `finalize` and `emplace` are one level above the builtins they wrap
+def perf033_param_taken(var fn : Function?; idx : int; depth : int) : bool {
+    if (fn == null || idx < 0 || idx >= length(fn.arguments)) return false
+    if (fn.flags.builtIn || fn.body == null) return perf033_builtin_takes(fn, idx)
+    if (depth >= 4) return false
+    var scan = new Perf033MoveScan(param = fn.arguments[idx], depth = depth)
+    make_visitor(*scan) $(adapter) {
+        visit(fn, adapter)
+    }
+    let takes = scan.takes
+    unsafe { delete scan; }
+    return takes
+}
+
 class PerfLintVisitor : AstVisitor {
     compile_time_errors : bool
     perf032_reserved : table<string>
@@ -377,6 +474,7 @@ class PerfLintVisitor : AstVisitor {
     inline_block_entry_depth : array<int>
     in_deferred : int = 0
     inline_aware_loop_depth : int = 0
+    any_loop_depth : int = 0
     block_tail_exit : array<BlockTailExit>
     return_frames : array<Perf031Return>
     in_while_cond : bool = false
@@ -410,6 +508,8 @@ class PerfLintVisitor : AstVisitor {
     perf023_splice_depth : int = 0
     perf024_candidates : array<Perf024Candidate>
     perf024_skip_iptr : uint64 = 0ul
+    perf033_candidates : array<Perf033Candidate>
+    perf033_takes : table<uint64; bool>
     warning_count : int = 0
     collect_warnings : bool = false
     warnings : array<string>
@@ -440,7 +540,7 @@ class PerfLintVisitor : AstVisitor {
         return is_lint_suppressed(at, code)
     }
 
-    def perf_warning(text : string; at : LineInfo) : void {
+    def perf_warning(text : string; at : LineInfo; fix : LintFix = LintFix()) : void {
         if (in_template
             || !is_user_authored_body(current_function)
             || is_suppressed(text, at)) return
@@ -462,7 +562,9 @@ class PerfLintVisitor : AstVisitor {
             compiling_program() |> macro_performance_warning(at, msg)
         } elif (collect_warnings) {
             warnings |> push("performance warning: {msg} at {describe(at)}")
-            issues |> push(make_lint_issue(msg, at))
+            var issue = make_lint_issue(msg, at)
+            issue.fix = fix
+            issues |> push(issue)
         } else {
             to_log(LOG_WARNING, "performance warning: {msg} at {describe(at)}\n")
         }
@@ -490,7 +592,7 @@ class PerfLintVisitor : AstVisitor {
 
     def is_character_at_zero(expr : ExprCall?) : bool {
         if (length(expr.arguments) >= 2) {
-            var idx = expr.arguments[1]
+            let idx = expr.arguments[1]
             if (idx is ExprConstInt && (idx as ExprConstInt).value == 0) return true
         }
         return false
@@ -547,9 +649,7 @@ class PerfLintVisitor : AstVisitor {
         return null
     }
 
-    def make_path_key(v : Variable?; path : string) : string {
-        return "{intptr(v)}{path}"
-    }
+    def make_path_key(v : Variable?; path : string) : string => "{intptr(v)}{path}"
 
     def find_string_var_from_expr(expr : Expression?) : Variable? {
         return null if (expr == null)
@@ -572,9 +672,9 @@ class PerfLintVisitor : AstVisitor {
             inner = (inner as ExprRef2Value.subexpr)
         }
         return false if (inner == null || !(inner is ExprCall))
-        var call = inner as ExprCall
+        let call = inner as ExprCall
         if (empty(call.arguments) || call.name != "string") return false
-        var arg = call.arguments[0]
+        let arg = call.arguments[0]
         if (arg._type == null || arg._type.baseType != Type.tHandle) return false
         return arg._type.annotation != null && arg._type.annotation.name == "das_string"
     }
@@ -582,7 +682,7 @@ class PerfLintVisitor : AstVisitor {
     def is_get_ptr_of_smart_ptr(expr : Expression?) : bool {
         //! Returns true if expr is a X call where X is a smart_ptr.
         return false if (expr == null || !(expr is ExprCall))
-        var call = expr as ExprCall
+        let call = expr as ExprCall
         if (call.func == null || call.func.fromGeneric == null) return false
         return call.func.fromGeneric.name == "get_ptr"
     }
@@ -591,7 +691,7 @@ class PerfLintVisitor : AstVisitor {
         //! Returns true if maybe_get_ptr is get_ptr() and maybe_null is null.
         if (!is_get_ptr_of_smart_ptr(maybe_get_ptr) || maybe_null == null) return false
         if (maybe_null is ExprConstPtr) {
-            var cptr = maybe_null as ExprConstPtr
+            let cptr = maybe_null as ExprConstPtr
             return cptr.value == null
         }
         return false
@@ -794,6 +894,7 @@ class PerfLintVisitor : AstVisitor {
         perf023_splice_depth = 0
         perf024_candidates |> clear
         perf024_skip_iptr = 0ul
+        perf033_candidates |> clear
         perf030_released |> clear
         perf032_reserved |> clear
         pending_move_var = null
@@ -817,6 +918,12 @@ class PerfLintVisitor : AstVisitor {
                     c.v.at)
             }
         }
+        for (c in perf033_candidates) {
+            if (!c.consumed && c.v != null) {
+                perf_warning("PERF033: {c.v._type.baseType == Type.tArray ? "array" : "table"} declared inside a loop is never freed - every iteration leaks its buffer until the heap resets; declare it 'var inscope'", c.v.at, c.fix)
+            }
+        }
+        perf033_candidates |> clear
         perf023_candidates |> clear
         perf023_splice_depth = 0
         perf024_candidates |> clear
@@ -896,7 +1003,27 @@ class PerfLintVisitor : AstVisitor {
     }
 
     def override preVisitExprReturn(expr : ExprReturn?) : void {
+        if (expr.returnFlags.moveSemantics) {
+            perf033_consume(expr.subexpr)
+        }
         return_frames |> push(Perf031Return(loop_depth_at_return = inline_aware_loop_depth, barrier = inline_barrier()))
+    }
+
+    def override preVisitExprMakeStructField(_expr : ExprMakeStruct?; _index : int; decl : MakeFieldDeclPtr; _last : bool) : void {
+        if (decl != null && decl.flags.moveSemantics) {
+            perf033_consume(decl.value)
+        }
+    }
+
+    def override preVisitExprMakeVariantField(_expr : ExprMakeVariant?; _index : int; decl : MakeFieldDeclPtr; _last : bool) : void {
+        if (decl != null && decl.flags.moveSemantics) {
+            perf033_consume(decl.value)
+        }
+    }
+
+    //! a tuple literal keeps no per-element move flag, and a container element cannot be copied, so the element is taken
+    def override preVisitExprMakeTupleIndex(_expr : ExprMakeTuple?; _index : int; init : ExpressionPtr; _last : bool) : void {
+        perf033_consume(init)
     }
 
     def override visitExprReturn(var expr : ExprReturn?) : ExpressionPtr {
@@ -914,8 +1041,81 @@ class PerfLintVisitor : AstVisitor {
         check_perf032_declaration(decl._type, decl.annotation, decl.at)
     }
 
+    def perf033_leaks(expr : ExprLet?; v : VariablePtr) : bool {
+        let origin = current_function != null ? current_function.fromGeneric : null
+        if (any_loop_depth == 0 || (origin != null && origin._module != current_function._module)
+                || expr.genFlags.generated || v.flags.generated || v.flags.inScope
+                || v.flags.pod_delete_gen || v._type == null || v._type.flags.ref
+                || !(v._type.baseType == Type.tArray || v._type.baseType == Type.tTable)) return false
+        var seen : table<Structure?>
+        return !perf033_delete_frees_shared(v._type, seen)
+    }
+
+    //! marks the PERF033 candidate behind `e` consumed: the container left the loop body through a move, so the callee or the target frees it
+    def perf033_consume(e : ExpressionPtr) : void {
+        if (e == null || empty(perf033_candidates)) return
+        var inner = e
+        if (inner is ExprRef2Value) {
+            inner = (inner as ExprRef2Value).subexpr
+        }
+        if (inner == null || !(inner is ExprVar)) return
+        let vv = (inner as ExprVar).variable
+        if (vv == null) return
+        for (i in 0 .. length(perf033_candidates)) {
+            if (perf033_candidates[i].v == vv) {
+                perf033_candidates[i].consumed = true
+                return
+            }
+        }
+    }
+
+    //! perf033_param_taken, answered once per callee parameter
+    def perf033_callee_takes(var fn : Function?; idx : int) : bool {
+        if (fn == null || idx < 0 || idx >= length(fn.arguments)) return false
+        let key = intptr(fn) * 31ul + uint64(idx)
+        if (perf033_takes |> key_exists(key)) return perf033_takes[key]
+        let takes = perf033_param_taken(fn, idx, 0)
+        perf033_takes[key] = takes
+        return takes
+    }
+
+    //! an argument the callee takes (`add_production(gb, lhs, rhs)` moves `rhs` into a tuple) counts as consumed; a `var` parameter the callee only mutates does not
+    def perf033_consume_argument(var expr : ExprCall?; arg : ExpressionPtr) : void {
+        if (expr == null || expr.func == null || empty(perf033_candidates)) return
+        for (i in 0 .. length(expr.arguments)) {
+            if (intptr(expr.arguments[i]) != intptr(arg)) continue
+            if (i < length(expr.func.arguments)) {
+                let pt = expr.func.arguments[i]._type
+                if (pt != null && !pt.flags.constant && perf033_callee_takes(expr.func, i)) {
+                    perf033_consume(arg)
+                }
+            }
+            return
+        }
+    }
+
+    def perf033_fix(expr : ExprLet?; v : VariablePtr) : LintFix {
+        let first = expr.variables[0]
+        if (v != first) return LintFix()
+        for (other in expr.variables) {
+            if (other.flags.do_not_delete || !perf033_leaks(expr, other)) return LintFix()
+        }
+        let ln = int(v.at.line)
+        let col = int(v.at.column)
+        let head = slice(lint_source_line(v.at, ln), 0, col)
+        let kw = strip_right(head)
+        let kw_col = length(kw) - 3
+        if (kw_col < 0 || length(head) == length(kw) || (kw_col > 0 && !ends_with(slice(kw, 0, kw_col), " "))) return LintFix()
+        if (ends_with(kw, "var")) return LintFix(line = ln, column = col, last_line = ln, last_column = col, replacement = "inscope ")
+        if (ends_with(kw, "let")) return LintFix(line = ln, column = kw_col, last_line = ln, last_column = kw_col + 3, replacement = "var inscope")
+        return LintFix()
+    }
+
     def override preVisitExprLetVariable(expr : ExprLet?; var v : VariablePtr; last : bool) : void {
         check_perf032_declaration(v._type, v.annotation, v.at)
+        if (perf033_leaks(expr, v)) {
+            perf033_candidates |> push(Perf033Candidate(v = v, fix = perf033_fix(expr, v), consumed = false))
+        }
         if (in_deferred == 0) {
             var_stack |> push(VarStackEntry(v = v, depth = loop_depth, inline_aware_depth = inline_aware_loop_depth, is_iter = false))
         }
@@ -930,7 +1130,7 @@ class PerfLintVisitor : AstVisitor {
         }
         if (last && v.flags.init_via_move && v.init != null) {
             var dominated_by_clone = false
-            var ini = v.init
+            let ini = v.init
             if (ini is ExprCall) {
                 let ecall = ini as ExprCall
                 if (ecall.func != null) {
@@ -1012,6 +1212,7 @@ class PerfLintVisitor : AstVisitor {
         if (in_deferred == 0) {
             inline_aware_loop_depth++
         }
+        any_loop_depth++
     }
 
     def override preVisitExprForVariable(expr : ExprFor?; var v : VariablePtr; last : bool) : void {
@@ -1028,6 +1229,7 @@ class PerfLintVisitor : AstVisitor {
         if (in_deferred == 0) {
             inline_aware_loop_depth--
         }
+        any_loop_depth--
         if (in_closure == 0) {
             perf018_pop_and_check()
             perf022_pop_and_check()
@@ -1208,7 +1410,7 @@ class PerfLintVisitor : AstVisitor {
                 perf018_stack[i] = st
                 pushes++
             } else {
-                var av = perf029_other_array_of(expr, i)
+                let av = perf029_other_array_of(expr, i)
                 if (av != null) {
                     var st = perf018_stack[i]
                     st.perf029_sibling_count++
@@ -1312,7 +1514,7 @@ class PerfLintVisitor : AstVisitor {
             arg1 = (arg1 as ExprRef2Value.subexpr)
         }
         if (arg1 == null || !(arg1 is ExprVar)) return
-        var ev = arg1 as ExprVar
+        let ev = arg1 as ExprVar
         if (ev.variable != state.iter_var) return
         state.matched = true
         state.callee_id = callee_id
@@ -1365,6 +1567,7 @@ class PerfLintVisitor : AstVisitor {
         if (in_deferred == 0) {
             inline_aware_loop_depth++
         }
+        any_loop_depth++
     }
 
     def override preVisitExprWhileBody(expr : ExprWhile?; body : ExpressionPtr) : void {
@@ -1388,6 +1591,7 @@ class PerfLintVisitor : AstVisitor {
         if (in_deferred == 0) {
             inline_aware_loop_depth--
         }
+        any_loop_depth--
         if (in_closure == 0) {
             loop_depth--
             pop_loop_scope()
@@ -1441,7 +1645,7 @@ class PerfLintVisitor : AstVisitor {
                 left = (left as ExprRef2Value.subexpr)
             }
             if (left is ExprField) {
-                var field = left as ExprField
+                let field = left as ExprField
                 if (field.name == "__rtti" && is_get_ptr_of_smart_ptr(field.value)) {
                     perf_warning("PERF008: get_ptr() is unnecessary for is/as; smart_ptr supports type checks directly", expr.at)
                 }
@@ -1751,7 +1955,7 @@ class PerfLintVisitor : AstVisitor {
         check_perf021_ternary_cast_hoist(expr)
         if (in_closure > 0 || expr.op != "?"
             || expr.subexpr == null || !(expr.subexpr is ExprOp2)) return
-        var cmp = expr.subexpr as ExprOp2
+        let cmp = expr.subexpr as ExprOp2
         let cop = string(cmp.op)
         if ((cop != "<" && cop != "<=" && cop != ">" && cop != ">=")
             || expr.left == null || expr.right == null) return
@@ -1845,7 +2049,8 @@ class PerfLintVisitor : AstVisitor {
         }
     }
 
-    def override preVisitExprCallArgument(expr : ExprCall?; arg : ExpressionPtr; last : bool) : void {
+    def override preVisitExprCallArgument(var expr : ExprCall?; arg : ExpressionPtr; last : bool) : void {
+        perf033_consume_argument(expr, arg)
         if (expr == null || expr.func == null) return
         var indices : array<int>
         get_clone_param_indices(expr.func, indices)
@@ -1956,7 +2161,7 @@ class PerfLintVisitor : AstVisitor {
             perf023_splice_depth--
         }
         if (expr.func.name == "character_at" && expr.func._module.name == "strings") {
-            var ecall = expr
+            let ecall = expr
             if (in_closure == 0 && loop_depth > 0 && in_character_at_call > 0) {
                 in_character_at_call--
                 current_character_at = null
@@ -2024,6 +2229,7 @@ class PerfLintVisitor : AstVisitor {
     }
 
     def override preVisitExprMove(expr : ExprMove?) : void {
+        perf033_consume(expr.right)
         check_perf030_move_leak(expr)
         if (in_closure > 0 || loop_depth == 0) return
         var v = find_string_var_from_expr(expr.left)
@@ -2158,13 +2364,10 @@ class PerfLintVisitor : AstVisitor {
         }
     }
 
-    def hot_file_of(at : LineInfo) : string {
-        return at.fileInfo != null ? "{at.fileInfo.name}" : ""
-    }
+    def hot_file_of(at : LineInfo) : string => at.fileInfo != null ? "{at.fileInfo.name}" : ""
 
-    def hot_visit_key(fn_hash : uint64; anchor : ExpressionPtr) : uint64 {
-        return fn_hash * 1099511628211ul + intptr(anchor)
-    }
+    def hot_visit_key(fn_hash : uint64; anchor : ExpressionPtr) : uint64 =>
+        fn_hash * 1099511628211ul + intptr(anchor)
 
     def hot_ensure_summary(var fn : Function?; var hc : HotCache) {
         let h = fn.getMangledNameHash
@@ -2203,7 +2406,7 @@ class PerfLintVisitor : AstVisitor {
         var parts : array<string>
         var pi = fi
         while (pi >= 0) {
-            var pf = frames[pi].fn
+            let pf = frames[pi].fn
             parts |> push(string(pf.fromGeneric != null ? pf.fromGeneric.name : pf.name))
             pi = frames[pi].parent
         }

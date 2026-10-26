@@ -384,7 +384,7 @@ def qm_convert_local_function(var expr : Expression?) : Expression? {
     for (arg in fn.arguments) {
         blk.arguments |> emplace_new <| clone_variable(arg)
     }
-    var fn_body = clone_expression(fn.body)
+    let fn_body = clone_expression(fn.body)
     let fn_blk = fn_body as ExprBlock
     if (fn_blk != null) {
         for (stmt in fn_blk.list) {
@@ -428,8 +428,7 @@ def qm_convert_comprehension(var expr : Expression?) : Expression? {
     let src_for = blk.list[1] as ExprFor
     let for_body = src_for.body as ExprBlock
     if (for_body == null || empty(for_body.list)) return null
-    var comp_subexpr : Expression?
-    var comp_where : Expression?
+    var comp_subexpr, comp_where : Expression?
     if (for_body.list[0] is ExprIfThenElse) {
         let ite = for_body.list[0] as ExprIfThenElse
         comp_where = clone_expression(ite.cond)
@@ -466,19 +465,16 @@ def qm_resolve_comprehension(var expr : Expression?) : Expression? {
 }
 
 [macro_function]
-def private make_is_check(at : LineInfo; var expr : Expression?&; rtti_name : string) : Expression? {
-    return new ExprIsVariant(at = at, value = expr, name := rtti_name)
-}
+def private make_is_check(at : LineInfo; var expr : Expression?&; rtti_name : string) : Expression? =>
+    new ExprIsVariant(at = at, value = expr, name := rtti_name)
 
 [macro_function]
-def private make_not(at : LineInfo; var expr : Expression?&) : Expression? {
-    return new ExprOp1(at = at, op := "!", subexpr = expr)
-}
+def private make_not(at : LineInfo; var expr : Expression?&) : Expression? =>
+    new ExprOp1(at = at, op := "!", subexpr = expr)
 
 [macro_function]
-def private make_var_ref(at : LineInfo; name : string) : Expression? {
-    return new ExprVar(at = at, name := name)
-}
+def private make_var_ref(at : LineInfo; name : string) : Expression? =>
+    new ExprVar(at = at, name := name)
 
 struct private QmCaptures {
     decls : array<Expression?>
@@ -857,9 +853,8 @@ def private const_component_expr_rtti(folded_rtti : string) : string {
 }
 
 [macro_function]
-def private is_range_constructor(call_name : string) : bool {
-    return call_name == "range" || call_name == "urange" || call_name == "range64" || call_name == "urange64"
-}
+def private is_range_constructor(call_name : string) : bool =>
+    call_name == "range" || call_name == "urange" || call_name == "range64" || call_name == "urange64"
 
 [macro_function]
 def private const_component_fields(folded_rtti : string) : array<string> {
@@ -1233,7 +1228,7 @@ def private generate_match(pattern : Expression?; actual_var : string; var body 
     }
 
     if (pattern is ExprFor) {
-        var pat_for = pattern as ExprFor
+        let pat_for = pattern as ExprFor
         var has_tags = false
         for (tag in pat_for.iteratorsTags) {
             if (tag != null) {
@@ -1246,7 +1241,7 @@ def private generate_match(pattern : Expression?; actual_var : string; var body 
         var as_val_f = make_var_ref(at, actual_var)
         var as_cast_f = new ExprAsVariant(at = at, value = as_val_f, name := rtti)
         body |> push <| qmacro_expr(${ var $i(cast_var) = $e(as_cast_f); })
-        var ann = unsafe(reinterpret<BasicStructureAnnotation?>(get_expression_annotation(pattern)))
+        let ann = unsafe(reinterpret<BasicStructureAnnotation?>(get_expression_annotation(pattern)))
         if (ann != null) {
             for_each_field(*ann) $(name, _cppName, xtype, offset) {
                 return if (offset == 0xFFFFFFFFu
@@ -1492,7 +1487,7 @@ def private generate_match(pattern : Expression?; actual_var : string; var body 
     var as_cast2 = new ExprAsVariant(at = at, value = as_val2, name := rtti)
     body |> push <| qmacro_expr(${ var $i(cast_var) = $e(as_cast2); }) // nolint:LINT004,LINT019
 
-    var ann = unsafe(reinterpret<BasicStructureAnnotation?>(get_expression_annotation(pattern)))
+    let ann = unsafe(reinterpret<BasicStructureAnnotation?>(get_expression_annotation(pattern)))
     if (ann == null) return
 
     for_each_field(*ann) $(name, _cppName, xtype, offset) {
@@ -1571,7 +1566,7 @@ def private generate_match(pattern : Expression?; actual_var : string; var body 
                     {
                         var pat_v = velem
                         if (pat_v.flags.tag && pat_v.source != null) {
-                            var src = pat_v.source
+                            let src = pat_v.source
                             if (src is ExprVar) {
                                 body |> push <| qmacro_expr(${ $i((src as ExprVar).name) = $i(cast_var).$f(name)[$v(vi)].name; })
                             }
@@ -1881,9 +1876,7 @@ def private qm_validate_expr_arg(prog : ProgramPtr; arg : Expression?; at : Line
 
 [call_macro(name="qmatch")]
 class private QMatch : AstCallMacro {
-    def override canVisitArgument(call : ExprCallMacro?; argIndex : int) : bool {
-        return argIndex == 0
-    }
+    def override canVisitArgument(call : ExprCallMacro?; argIndex : int) : bool => argIndex == 0
     def override visit(prog : ProgramPtr; mod : Module?; var call : ExprCallMacro?) : Expression? {
         if (call.arguments |> length != 2) {
             macro_error(prog, call.at, "expecting qmatch(expression, pattern)")
@@ -1920,9 +1913,7 @@ class private QMatch : AstCallMacro {
 
 [call_macro(name="qmatch_block")]
 class private QMatchBlock : AstCallMacro {
-    def override canVisitArgument(call : ExprCallMacro?; argIndex : int) : bool {
-        return argIndex == 0
-    }
+    def override canVisitArgument(call : ExprCallMacro?; argIndex : int) : bool => argIndex == 0
     def override visit(prog : ProgramPtr; mod : Module?; var call : ExprCallMacro?) : Expression? {
         if (call.arguments |> length != 2) {
             macro_error(prog, call.at, "expecting qmatch_block(expression, block_pattern)")
@@ -1971,9 +1962,7 @@ class private QMatchBlock : AstCallMacro {
 [call_macro(name="qmatch_function")]
 class private QMatchFunction : AstCallMacro {
     //! ``qmatch_function(func, block_pattern)`` — match function body against block pattern.
-    def override canVisitArgument(call : ExprCallMacro?; argIndex : int) : bool {
-        return argIndex == 0
-    }
+    def override canVisitArgument(call : ExprCallMacro?; argIndex : int) : bool => argIndex == 0
     def override visit(prog : ProgramPtr; mod : Module?; var call : ExprCallMacro?) : Expression? {
         if (call.arguments |> length != 2) {
             macro_error(prog, call.at, "expecting qmatch_function(func, block_pattern)")

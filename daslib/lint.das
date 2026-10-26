@@ -82,9 +82,8 @@ def private note_ref(var self : RefIndex; fn : Function?; raw_name : string) : v
     }
 }
 
-def private knows(self : RefIndex; fn : Function?; nm : string) : bool {
-    return key_exists(self.functions, fn) || key_exists(self.names, nm)
-}
+def private knows(self : RefIndex; fn : Function?; nm : string) : bool =>
+    key_exists(self.functions, fn) || key_exists(self.names, nm)
 
 def private note_type(var self : RefIndex; t : TypeDecl?; depth : int; skip : Structure const? = null) : void {
     return if (t == null || depth > 24)
@@ -191,9 +190,8 @@ struct private Lint030Frame {
 //! another not; a key sits at `true` while its scan runs, so a recursive chain reads as writing
 var private lint030_writers : table<string; bool>
 
-def private lint030_bare_var(e : Expression?) : Variable const? {
-    return e is ExprVar ? (e as ExprVar).variable : null
-}
+def private lint030_bare_var(e : Expression?) : Variable const? =>
+    e is ExprVar ? (e as ExprVar).variable : null
 
 //! the variable a chain of plain field accesses is rooted at (`dr.offs`, `s.k.v`), the bare
 //! variable itself, or null for any other shape; a field reached through a pointer is a value
@@ -212,13 +210,11 @@ struct private Lint030ArgFrame {
 }
 
 //! an operator that assigns to its left operand: `=` is an ExprCopy, these are the compound forms
-def private lint030_assigns(op : string) : bool {
-    return op |> ends_with("=") && op != "==" && op != "!=" && op != "<=" && op != ">="
-}
+def private lint030_assigns(op : string) : bool =>
+    op |> ends_with("=") && op != "==" && op != "!=" && op != "<=" && op != ">="
 
-def private lint030_steps(op : string) : bool {
-    return op == "++" || op == "--" || op == "+++" || op == "---"
-}
+def private lint030_steps(op : string) : bool =>
+    op == "++" || op == "--" || op == "+++" || op == "---"
 
 //! scans one function body for a write to `param` during the call; which compiler write marks
 //! count and which are discounted is `daslib/ARCHITECTURE_LINT.md` sec.3's LINT030 entry
@@ -1502,9 +1498,7 @@ class LintVisitor : AstVisitor {
         lint_error(msg, at)
     }
 
-    def override canVisitWithAliasSubexpression(_expr : ExprAssume?) : bool {
-        return false
-    }
+    def override canVisitWithAliasSubexpression(_expr : ExprAssume?) : bool => false
 
     def override preVisitExprLet(expr : ExprLet?) : void {
         for (v in expr.variables) {
@@ -1834,9 +1828,7 @@ def public paranoid_collect_issues(prog : ProgramPtr; var issues : array<LintIss
     return count
 }
 
-def private is_nolint_space(b : uint8) : bool {
-    return int(b) == ' ' || int(b) == '\t'
-}
+def private is_nolint_space(b : uint8) : bool => int(b) == ' ' || int(b) == '\t'
 
 def private comment_start_outside_literals(d : array<uint8> const# implicit) : int {
     let n = length(d)
@@ -1911,20 +1903,42 @@ def private stale_scan_line(bytes : array<uint8> const# implicit; fname : string
     }
 }
 
+def private uninstanced_generic_lines(prog : ProgramPtr; fname : string) : array<int2> {
+    let mod = prog.getThisModule
+    var instanced : table<int>
+    for_each_function(mod, "") $(fn) {
+        var root = fn.fromGeneric
+        while (root != null && root.fromGeneric != null) {
+            root = root.fromGeneric
+        }
+        if (root != null && root._module == mod) {
+            instanced |> insert(int(root.at.line))
+        }
+    }
+    var lines : array<int2>
+    for_each_generic(mod, "") $(g) {
+        if (g.body != null && g.at.fileInfo != null && g.at.fileInfo.name == fname && !key_exists(instanced, int(g.at.line))) {
+            lines |> push(int2(int(g.at.line), int(g.body.at.last_line)))
+        }
+    }
+    return <- lines
+}
+
 //! LINT019 - stale nolint detection: reports every leading ``// nolint:CODE`` directive in
 //! `source` (recognition rule: stale_scan_line) whose code suppressed nothing this process.
 //! Call AFTER all lint passes ran; a partial run under-consumes and would lie.
-def public stale_nolint_collect(fname, source : string; disabled_codes, enabled_codes : table<string>; var issues : array<LintIssue>) : int {
+def public stale_nolint_collect(prog : ProgramPtr; fname, source : string; disabled_codes, enabled_codes : table<string>; var issues : array<LintIssue>) : int {
     return 0 if (key_exists(disabled_codes, "LINT019")
                     || (!empty(enabled_codes) && !key_exists(enabled_codes, "LINT019")))
     var count = 0
     var line_no = 0
     var stale_codes : array<string>
     stale_codes |> reserve(4)
+    let skipped <- uninstanced_generic_lines(prog, fname)
     for (raw_line in split(source, "\n")) {
         line_no++
         let line = raw_line |> ends_with("\r") ? slice(raw_line, 0, length(raw_line) - 1) : raw_line
-        continue if (find(line, "nolint:") < 0)
+        continue if (find(line, "nolint:") < 0 || find_index_if(skipped, $(r) => line_no >= r.x && line_no <= r.y) >= 0)
         stale_codes |> clear()
         var self_suppressed = false
         peek_data(line) $(bytes) {

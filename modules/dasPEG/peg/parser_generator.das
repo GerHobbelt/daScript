@@ -486,9 +486,7 @@ def set_rule_handle(var subrule_ : Rule_?; handle : string) {
 }
 
 
-def get_action_block(var alternative : Alternative) : ExpressionPtr {
-    return <- alternative.action
-}
+def get_action_block(var alternative : Alternative) : ExpressionPtr => <- alternative.action
 
 
 // Contract: block is managed externally and will clean up its own memory
@@ -552,7 +550,7 @@ def generate(var gen : ParserGenerator; var rule_ : Rule) : array<ExpressionPtr>
             let result_handle = subrule.name
             let i = gen.rule_counter["extract"]++
             var subrule_ <- gen |> generate(subrule.rule)
-            var return_type = gen.return_types |> get_value_and_clone_type(gen.current_context)
+            let return_type = gen.return_types |> get_value_and_clone_type(gen.current_context)
 
             var t <- qmacro_block() {
                 let $i("ext_pos_{i}") = parser.index
@@ -962,7 +960,7 @@ def generate_option(var gen : ParserGenerator; var rule_ : Rule_?) : array<Expre
 
     set_rule_handle(rule_, "temp_name")
     var type_decl = gen |> get_rule_type(rule_.rule)
-    var result_type = gen.return_types |> get_value_and_clone_type(gen.current_context)
+    let result_type = gen.return_types |> get_value_and_clone_type(gen.current_context)
 
     var rule_code <- gen |> with_context("__option__") {
         return <- gen |> generate(rule_.rule)

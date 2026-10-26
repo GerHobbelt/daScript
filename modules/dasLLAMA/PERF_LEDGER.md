@@ -11,6 +11,250 @@ what it costs today and what the fix would change.
 
 ## Entries
 
+- **MEASURED (2026-10-07, `direction-grade`, `debug-jit`) - the forced tool call under the grammar, on the house assistant's tool bench.**
+  M1 Max, Metal, one stream, the server run from the tree under `-jit` with the m1 tune manifest, the house assistant's `bench_llm.py`
+  tool part (the house prompt, a nonce a run, no-think, 256-token budget), 12 runs an arm; `auto` = `tools` alone,
+  `forced` = the same with `tool_choice: "required"`, which samples the call through the dasLR1 grammar.
+
+  | file | auto ok | forced ok | auto warm total | forced warm total | tokens |
+  |---|---|---|---|---|---|
+  | pure Q4_0 (4.52 bpw, `Qwen3.6-35B-A3B-MTP-Q4_0-pure.gguf`) | 6/12 | 12/12 | 1.29 s | 1.34 s | 40 |
+  | pure IQ4_XS (4.27 bpw, `Qwen3.6-35B-A3B-MTP-IQ4_XS-pure.gguf`) | 12/12 | 12/12 | 1.31 s | 1.35 s | 40 |
+
+  Q4_0's six misses were plain-text answers (`finish: stop`, no call), not malformed arguments; the grammar turns every
+  reply into a well-formed `control` call. The constraint adds about 40-50 ms to a 40-token call (3-4 %): the piece table
+  is built on the first constrained request (a second, folded into that request's time) and each token probes the
+  candidate list against the grammar.
+- **STATED (2026-10-07) - the constrained sampled draw's candidate copy.** `Session.cand_full` (16 B an entry) holds the
+  candidate list a sampled constrained draw starts from - the top-k, at most `SAMPLE_TOPK_FAST_CAP` (1024) entries plus
+  ties at the k-th logit - so a refused first pick refilters from the logits the draw consumed: 16 KB a session at the
+  cap, `@scratch @exact_size`, reserved once at `make_run_state`. Not measured; the formula is the record.
+- **STATED (2026-10-07) - the token constraint's two vocabulary-sized allocations.** `Session.cand` (16 B an entry)
+  grows to the whole row only when a constraint refuses every candidate of the probe window: 16 x vocab bytes a
+  session, 2.4 MB at a 151936-entry vocabulary (Qwen), 4.2 MB at 262144 (gemma); it is `@scratch @exact_size` and
+  reused, so the growth is paid once a session. `utils/dasllama-server`'s token piece table holds one string a token
+  a served slot, built on the slot's first constrained request: about (24 + the piece's bytes) x vocab, 6 MB at
+  151936 and 10 MB at 262144, freed with the slot. Neither is measured; the formulas are the record.
+
+- **MEASURED (2026-10-06, `direction-grade`, `debug-jit`) - the 4-bit formats of Qwen3.6-35B-A3B at equal bytes, and
+  four races on their Metal expert GEMVs.** M1 Max (MacBookPro18,2, 64 GB), Metal, one stream, the sidecar
+  re-minted on the binary the same day (0 winner changes against the one the mtime rule had called stale);
+  `benchmarks/lcpp_bench.das` as the `-jit` script, `-m <gguf> --ngl 99 -n 64 -r 2 --mtp-ab --for-debug-purposes`
+  under `DAS_TUNE_MANIFEST=modules/dasLLAMA/performance/m1.tune.json`, decode = the tg-real64 row, MTP off; perplexity
+  = 256 wikitext-2 positions teacher-forced after a 256-id prefill (a small sample: differences past the second decimal
+  are noise); tool call = the house assistant's prompt (`bench_llm.py`, a random nonce a run, `control` well-formed), 12 runs.
+  The pure files are `llama-quantize --pure` from unsloth's BF16 shards; the two UD files are unsloth's. Decode rates
+  are tok/s; bpw is the file's bits a weight.
+
+  | file | bpw | tg | PPL | hits/256 | tool x12 |
+  |---|---|---|---|---|---|
+  | Q8_0 (reference) | 8.5 | 72.1 | 4.62 | 173 | 12 |
+  | UD-Q4_K_M (Q4_K/Q5_K experts, Q8_0 rest) | 5.4 | 71.6 | 4.83 | 173 | 12 |
+  | pure Q4_K | 4.52 | 81.1 | 4.93 | 174 | 11 |
+  | pure IQ4_XS | 4.27 | 84.4 | 4.95 | 169 | 12 |
+  | pure Q4_0 | 4.52 | 85.1 | 4.95 | 169 | 4 |
+  | UD-IQ4_XS (IQ3_S gate/up experts, IQ4_XS down) | 4.3 | 73.6 | 4.97 | 167 | 12 |
+
+  - Q8_0 is the one row near bandwidth: 3.5 GB a token at 72 tok/s is 250 GB/s. The 4-bit files move 1.9 GB a token
+    at 85 tok/s, 160 GB/s: the 4-bit expert GEMVs reach 60 % of the q8 GEMV's bytes a second, so a 4.5-bpw file at
+    the q8 kernel's rate would decode near 130 tok/s. The q8 kernel's shape - one simdgroup a row, four 32-weight
+    chunks loaded ahead of the FMA chains - is the difference (`followup_metal.md` 45).
+  - Pure Q4_0 slips the tool call on 8 of 12 runs, the same dropped `"arguments":` key every time, at the perplexity
+    of the asymmetric formats: the symmetric codebook lands that near-tie wrong. Pure IQ4_XS is the fewest bytes at
+    the K-quant files' quality, and the format to put against mlx's 4-bit group-64 affine weights (4.5 bpw, 19 GB).
+  - Four kernel races on the gathered (expert) GEMVs, each the e2e tg minutes apart on the same binary and sidecar:
+    the IQ3_S f4-slab twin on the gathered site, 73.6 -> 75.2 on the UD-IQ4_XS file (shipped, the dense twin's crown
+    gates it); the same twin at sixteen rows a threadgroup 74.2 (fewer threadgroups a 512-row expert cost more than
+    the halved staging saved); the grid read from constant memory instead of the staged float4 slab 69.8 (scattered
+    constant reads, four scalar loads a word - vector literals do not hoist); the q40 identity codebook folded to
+    arithmetic 85.3 +- 0.4 against 85.1 +- 0.5 (noise); the iq4 codebook held in registers as four packed words
+    61.4 against 84.4 (seven ALU ops a nibble lose to one threadgroup read). The codebook read and the staging are not
+    where a 4-bit expert GEMV's time goes.
+- **MEASURED (2026-10-06, `audio-shared-kernels`) - the audio chains' kernels moved to templates both homes stamp read as
+  before on both boxes.** whisper large-v3-turbo q8 served (`dasllama-server` with the ASR model alone, `main.das -- --asr
+  <bin>`; `harness/served_bench.das --no-chat --asr-url <server> --clip jfk_ask_not.wav --reps 8`), master and the branch
+  alternated twice in one sitting on each box, one life a server (the master lives first); the branch moves the Metal
+  layernorm, bias, clamp, GEGLU, im2col, row gather, K/V store and conv0 stamps and the Vulkan tower's seam, im2col, gather
+  and K/V classes onto the shared templates, so the served encode and decode ride every one of them.
+  - M5 Max, Metal, ms a request, master / branch: 229.6 / 228.8 (cv 0.5% / 0.7%); the second pair 242.5 / 243.0, both void
+    at cv 3.1% / 2.9% (the box warmed under the four lives).
+  - RTX PRO 4500, Vulkan, ms a request, master / branch: 51.3 / 51.7 and 50.8 / 49.5 (cv 1.9% / 2.4% / 1.8% / 0.8%); a
+    first sitting read every row void on that box's round-trip spread (cv 6-28%), with one master life refused at its
+    second rep because the transcript differed from the first - the Vulkan chain's text moved between reps on master.
+  - Long-lived device memory the branch adds, bytes: the Vulkan chat tail's rows `cap x (hid + gate + out) x 4` beside its
+    host copy `cap x out x 4` (the whisper-class projector widths, a few MB at the 1500-row cap), its projector q8 planes
+    beside the block records (`d x stack x mm1_out + mm2_in x proj_dim` bytes); parakeet's Vulkan resident (its q8 planes and
+    norms plane, as canary's); the Metal fronts' conv0 panel `nch x 32 x 4` once an encoder (32 KB at 256 channels).
+
+- **MEASURED (2026-10-06, `direction-grade`) - Pocket's text prompt on the device takes a third of its request on
+  both boxes; the thirteen TTS kernels moved to templates both homes stamp read as before.** The prompt seat runs the
+  chunk's text rows through the frames slab's layers at the voice's positions (`ARCHITECTURE_GPU_TOWER_POCKET.md#tower-pocket-frames`,
+  `ARCHITECTURE_GPU_TOWER_VULKAN_TTS.md#vk-pocket-chain`), the keys and values back to the host; the last layer ends at
+  its K/V on every rail, including the CPU's. `dasllama-server` with the TTS model alone, `harness/served_bench.das
+  --no-chat --tts-url <server> --reps 8`, one sentence, master and the branch alternated twice in one sitting on each
+  box (the master lives first); the stages are the engine's own stage clock. The M5's tune sidecar predates the binary.
+  - M5 Max, Metal, ms a request, master / branch: Pocket q8 67.5 / 49.5 and 67.5 / 49.4 (4.56 s of speech on master,
+    4.64 on the branch - the device prompt moves the EOS frame by one), its stages prompt 15.5 / 2.1, backbone
+    38.4 / 34.2 (the attention's unrolled loads and the frames call's upload of rows the device already holds),
+    codec 8.8 / 8.6; Kokoro-82M 73.5 / 73.5 (a third branch life 73.5, two branch lives void at cv 3.3% and 3.4%),
+    its stages the same to the tenth (decoder 41.22 / 41.29); Kitten mini 64.5 / 64.5 (one branch life void at cv
+    4.1%), decoder 29.37 / 29.36.
+  - RTX PRO 4500, Vulkan (driver 580.159), ms a request, master / branch: Pocket q8 114.7 / 68.1 and 114.2 / 67.9,
+    its stages prompt 50.0 / 3.8, backbone 50.2 / 49.2, codec 8.7 / 8.8; Kokoro-82M 48.3 / 48.1 and 48.3 / 47.9 (the
+    first master row void at cv 9.3%), its stages the same to the tenth (bert 4.29 / 4.29, decoder 13.9 / 13.9);
+    Kitten mini 48.6 / 46.4 and 52.5 / 47.8, every row void on spread (that box's round trip jitters), its stages the
+    same to the tenth (decoder 10.5 / 10.4). The shared reduce base the row kernels now derive puts one call under
+    every `WgReduceBase` reduce (eight audio-tower stamps and five TTS stamps moved by it, `harness/vk_spv_diff.das`):
+    the backbone and bert stages above ride it, and whisper large-v3-turbo q8 served (`main.das -- --asr <bin>`,
+    `served_bench.das --no-chat --asr-url <server> --clip jfk_ask_not.wav --reps 8`) reads 48.8 / 48.5 on the one
+    round both sides held under 3% (54.2 / 54.7 on the other, both void).
+  - Quality, `harness/tts_rig.py` on the 200-sentence corpus, flag-free on the M5 (the Metal seats serve), WER % /
+    UTMOS before -> after: Pocket f32 4.18 / 4.373 -> 3.95 / 4.368, q8 4.41 / 4.363 -> 4.23 / 4.354, kq 3.91 / 4.325 ->
+    3.77 / 4.314, stuart-kq 3.32 / 4.137 -> 3.27 / 4.139 (the device prompt moves an EOS frame here and there);
+    kitten-nano 3.09 / 3.980 -> 3.09 / 3.976, kitten-mini 2.77 / 4.331 -> 2.77 / 4.331, kokoro 2.73 / 4.501 ->
+    2.73 / 4.501.
+- **MEASURED (2026-10-05, `direction-grade`, `debug-jit`) - the depth-1 NextN round on the M1 Max: the draft at two
+  rows, then chained into the verify's command buffer.** M1 Max (MacBookPro18,2, 64 GB), Metal,
+  Qwen3.6-35B-A3B-MTP UD-Q4_K_M, `benchmarks/lcpp_bench.das` as the `-jit` script (`-no-module-cache`):
+  `-m <gguf> --ngl 99 -n 64 -r 2 --mtp-ab --prof --for-debug-purposes` under `JOBQUE_PROFILING=1
+  DAS_LOG_LEVEL=info DAS_TUNE_MANIFEST=modules/dasLLAMA/performance/m1.tune.json` (the sidecar re-minted on
+  the binary by `harness/dasllama_tuner.das`), `DAS_TUNE_POLICY` and `DASLLAMA_PIN_BACKEND` unset; the
+  tg-real64 row is the mean and stdev over 2 reps of 8 prompts, the per-round split one untimed
+  `forward_profile` window of 36-37 rounds, each arm one commit - `add367ec1` (the four-row tile, the host
+  chain), `bf99297f5` (two rows), `3826f59ff` (two rows, chained). Decode rates are MTP off / on, tok/s, the
+  parenthesis the on arm against the off arm; the round's parts are ms a round. The chained round parks its
+  draft step through the verify, so the pool holds one more step than the host chain did: its logits rows
+  `max(ng, 2) x vocab x 4` bytes (1.99 MB at one or two streams, 0.99 MB a stream past that on this vocabulary)
+  beside a few activation rows.
+
+  | | `add367ec1` | `bf99297f5` | `3826f59ff` |
+  |---|---|---|---|
+  | tg-real64 off / on | 71.8 +/- 0.0 / 69.1 +/- 0.1 (0.96x) | 71.7 +/- 0.0 / 73.9 +/- 0.9 (1.03x) | 71.7 +/- 0.0 / 74.3 +/- 0.0 (1.04x) |
+  | acceptance | 76.4% (440/576) | 76.4% (440/576) | 76.4% (440/576) |
+  | mtp.draft, host wall | 3.92 | 2.55 | 0.01 |
+  | mtp.verify (its GPU wait) | 20.9 (20.5) | 20.5 (20.1) | 23.1 (22.6), the draft's GPU inside it |
+  | mtp.walk + mtp.replay | 0.57 | 0.60 | 0.57 |
+
+  - The four-row tile cost a solo stream a second pair of rows over the draft layer and the 417 MB Q6_K
+    classifier (248320 x 2048); the two-row tile drafts the same tokens (0 of 288 rounds differ,
+    `DASLLAMA_MTP_DEBUG=trace`, `-r 1`, the same flags) and the one-row form does not: 36 of 257 differ, that
+    run an uncommitted probe edit of `bf99297f5` (`nrows = ng`, the rows forms' buffers and uniforms forced on
+    for a draft step), no commit carries it (`followup_metal.md` 44).
+  - The chain removed the draft's join, its 1 MB logits readback and the host argmax - 0.4 ms of the 2.55;
+    the draft's GPU work now sits inside the verify's wait. The chained round drafts and commits the two-row
+    host chain's tokens on every traced round (0 of 288 differ, the same trace flags).
+  - The row-cost ladder at `a8655daf0`, `harness/batch_rows_probe.das -m <gguf> --bs 1,2,4 --steps 32` (two
+    sessions a row) and `--sameslab --bs 1` (one session), same flags, ms a step: the single-row driver
+    13.6; the rows driver at one row 15.5 (x1.14), at two rows 19.8 (x1.45), at four 31.2 (x2.29), every
+    ratio against the single-row driver's step. The verify's 22.2 ms of GPU is that two-row step plus the
+    draft layer, two classifier passes and the draft-slab re-warm; two rows route to two expert sets, so the
+    step streams their union. At 1.76 tokens a round over a 1.45x step the depth-1 ceiling here is 1.21x.
+  - The same-slab probe declines at two rows on this hybrid (`followup_metal.md` 43), so the two-row figure is
+    the two-session batch step, not the verify itself.
+- **MEASURED (2026-10-05, `direction-grade`) - Axpy and Concat as kernels both GPU homes stamp read as before on
+  both.** The two kernels moved to one class template each (`dasllama_gpu_kernels_common.das`); on Metal their
+  arguments became one struct and Axpy lost two offsets no site passed, on Vulkan the body became a function the
+  entry calls (Concat's SPIR-V 52 bytes longer, Axpy's 196 shorter for the dropped offsets; 25 of the 27 TTS
+  stamps byte-identical). `dasllama-server` with the TTS model alone (`main.das -- --tts <gguf>`),
+  `harness/served_bench.das --no-chat --tts-url <server> --reps 8`, one sentence, master and the branch alternated
+  twice in one sitting on each box; the decoder stage is the engine's own stage clock and is the stage that runs
+  both kernels. The M5's tune sidecar predates the binary.
+  - M5 Max, Metal, ms a request, master / branch / master / branch: Kokoro-82M 73.7 / 73.8 / 73.6 / 73.8 for
+    5.68 s of speech (the last two void at cv 2.9% and 3.5%), its decoder 41.29 / 41.30 / 41.30 / 41.27; Kitten
+    mini 64.6 / 64.7 / 64.5 / 64.8 for 5.84 s (the third void at cv 3.9%), its decoder 29.44 / 29.37 / 29.38 / 29.27.
+  - RTX PRO 4500, Vulkan (driver 580.173), decoder stage ms, master / branch / master / branch: Kokoro-82M 14.14 /
+    14.04 / 13.91 / 13.97; Kitten mini 10.54 / 10.53 / 10.57 / 10.63. The request walls there read 46.3-52.4
+    (Kokoro) and 46.1-48.1 (Kitten mini) with seven of the eight rows void on spread - the round trip jitters on
+    that box, the stage clock does not.
+
+- **MEASURED (2026-10-04, `direction-grade`) - a served media turn's first token, and the speech rows beside
+  mlx-audio.** M5 Max, Metal, `dasllama-server` with one model (`main.das -- -m <gguf> --image-mmproj <mmproj>` or
+  `--audio-mmproj <mmproj>`, `-s 1 --ctx 16384`), the pinned llama-server as `-m <gguf> --mmproj <mmproj> -ngl 99
+  -np 1 -c 16384`, `harness/served_bench.das --url <server> --no-chat --reps 5 --image <jpg> --chat-clip <wav>`
+  (tagged `served`, `out-of-process`), a 60 s rest before each life; the tune sidecar predates the binary. The
+  first token of a question about a 640x480 image or an 8 s clip under a system line no server has seen, ms,
+  ours / the reference; a row over 3% cv is marked void.
+  - The paged KV pool grew by doubling, and a doubling copied and zero-filled every cached page inside one
+    request: Qwen3-VL 4B's image row read cv 7.9% with prefills of 116 ms beside ones of 158, 189 and 271. With
+    the pool's address room reserved at scheduler creation, twenty prefills in a row read 116-118 ms and the
+    row cv 0.9-1.2% over three runs. A model whose K/V passes the 4 GiB reserve (Qwen2-Audio, 524 KB a
+    position) still pays one copy a server life: 246 ms, once.
+  - A media prompt prefilled as three calls - text, rows, text - and each short call paid the call's floor
+    (about 20 ms): Voxtral Mini's clip read 214.7 with 102 of encode and 84 of prefill (21 + 41 + 20). As one
+    call it reads 181.0; Qwen3-VL 4B's image 185 to 148; gemma-4 E2B's image 115 to 82 and E4B's 164 to 98,
+    once the body carries each row's token id.
+  - Images: gemma-4 E2B 81.7 / 141.4, E4B 98.3 / 206.9, 12B 164.3 / 371.2; gemma-3 4B 426.6 / 466.8, 12B
+    561.0 / 666.1; Qwen3-VL 4B 147.2 / 196.5 (the reference void, 3.2%), 8B 220.8 / 295.5; Qwen2.5-Omni 3B
+    188.8 (void, 3.8%) / 224.6, 7B 257.0 (void, 5.7%) / 349.3.
+  - Clips: gemma-4 E2B 77.9 / 125.8 (the reference void, 6.3%), E4B 107.4 / 187.2; Qwen2.5-Omni 3B
+    219.3 / 294.5, 7B 348.2 / 465.6; Ultravox 1B 132.0 / 147.9 (the reference void, 6.1%), 8B 219.1 / 292.3;
+    Voxtral Mini 181.6 / 189.1 (the reference void, 5.3%), Small 439.6 / 503.6 (the reference void, 4.2%);
+    Qwen2-Audio 465.0 / 508.2. The E-series rows and the 12B image are single re-runs after their change; the
+    rest are one sweep taken before the instrument's lead-in request, which is what voids the two Omni images.
+  - Asked again under the same line, both servers answer off their cache within a few ms of each other on
+    every row; the one row the reference leads is Voxtral Small, 167.8 / 161.8.
+  - Speech, `main.das -- --tts <gguf>` against `mlx_audio.server` (mlx-audio 0.5.7), `served_bench.das
+    --no-chat --tts-url <server> --reps 8`, one sentence: ms a request / s of speech / real-time factor.
+    Kokoro-82M (the same voice, ours q8, theirs bf16): 73.1 / 5.50 / 0.013 against 108.9 / 5.47 / 0.020; three
+    sentences 218.9 / 17.5 / 0.013 against 323.5 / 17.1 / 0.019. Kitten nano 22.5 / 5.24 / 0.004 against
+    75.1 / 7.93 / 0.009 and mini 64.6 / 5.84 / 0.011 against 242.7 / 7.55 / 0.032 - their files are the 0.8
+    release and speak the sentence longer, so the factor is the comparison. Pocket (ours the English 2026-04
+    file at q8 and kq, theirs Kyutai's without-voice-cloning weights at full and 8 bit): 67.7 / 4.64 / 0.015
+    and 61.7 / 4.80 / 0.013 against 200.3 / 4.96 / 0.040 (void, 8.6%) and 152.6 / 5.12 / 0.030 (void, 6.7%).
+  - The M5 and M4 boards' Metal rows this arc re-routes are withdrawn until a mint on a fresh sidecar: the
+    ASR rows of whisper tiny and large-v3-turbo, Canary-Qwen, Qwen3-ASR 0.6B, Qwen3-Omni 30B and gemma-4 E2B,
+    and the image rows of gemma-4 E2B and E4B.
+
+- **MEASURED (2026-10-04, `direction-grade`) - canary's mel and subsample front run on the Metal tower.**
+  M5 Max, Metal, canary-qwen-2.5b (the q8_0 decoder, the f32 encoder), in process as the server's
+  ASR worker runs it (the engine's stage clock, the fourth transcription of a clip), the tune sidecar
+  predating the binary. The front seat was filled by the Vulkan driver alone, so on Metal the mel
+  (a twiddle GEMM on the CPU) and the subsample stack ran on the CPU beside 80 ms of blocks on the
+  device.
+  - A 64 s clip: 1274 ms before - mel 239, front 258, blocks 80, projection 7, prefill 56, decode
+    629 - and 772 after, the mel and the front together 8.0. An 8 s clip: 163 ms before, 106 after
+    (3.5 for the two).
+  - The device rows sit 2.1e-3 rel-l2 from the CPU chain's on the jfk clip (3.1e-4 with the CPU
+    front ahead of the device blocks); the transcripts are equal. The reading is `test_model_image.das`'s
+    canary `mtower` arm (`canary mtower encode rel-l2`).
+
+- **MEASURED (2026-10-03, `direction-grade`) - the Metal tower reads a whisper encoder's q8 planes.**
+  M5 Max, Metal, whisper large-v3-turbo, `dasllama-server` with the ASR model alone
+  (`main.das -- --asr ggml-large-v3-turbo.bin`), the reference whisper.cpp `6fc7c33` as
+  `whisper-server -m <bin> --inference-path /v1/audio/transcriptions`, `harness/served_bench.das
+  --no-chat --asr-url <server> --clip <wav> --reps 5` (tagged `served`, `out-of-process`), a 60 s
+  rest before each life, every request a clip no server has heard; the tune sidecar predates the
+  binary, so the CPU kernels ran their fallback stamps. Clips of 8 s, 11 s and 64 s (one 30 s
+  window, one, three), ms a transcription.
+  - The tower declined a q8 encoder, and whisper serves q8: the encoder ran on the CPU and read
+    911.7 / 951.4 / 3092.8. The reference reads 131.3 / 147.1 / 601.5 on the f16 file and
+    127.1 / 139.8 / 554.8 on its q8_0 file (0.87 GB).
+  - The block GEMMs off the q8 blob on the plain q8 tile: 240.5 / 253.1 / 876.7. On the prefill
+    ladder: 153.5 / 166.1 / 608.9. With the stem's second conv off the same blob: 137.4 / 149.0 /
+    541.0, on the 1.2 GB q8 image. The f32 encoder lane on the same tower reads 132.3 / 140.0 /
+    517.9 on a 4.3 GB image.
+  - A window's stages on the q8 lane (the encoder's own stage clock, in process): blocks 102.5 ms
+    (94.0 on the f32 lane), the stem 2.2 (15.6 on the CPU), the decode 21.2, the cross K/V 6.4,
+    the mel 1.4.
+
+- **MEASURED (2026-10-03, `direction-grade`) - a served Qwen3-ASR transcription decodes on the device, and a
+  repeated clip measures the other server's prompt cache.** M5 Max, Metal, `dasllama-server` with the
+  ASR model alone (`main.das -- --asr <gguf> --mmproj <mmproj>`), the pinned llama-server as
+  `-m <gguf> --mmproj <mmproj> -ngl 99 -np 1`, `harness/served_bench.das --no-chat --asr-url <server>
+  --clip <wav> --reps 5` (tagged `served`, `out-of-process`), a 60 s rest before each life; the tune
+  sidecar predates the binary, so the CPU kernels ran their fallback stamps.
+  - The ASR worker's context carried no Metal mode, so the decoder - a `Model` session - prefilled
+    and decoded on the CPU: Qwen3-ASR-0.6B Q8_0 read a 4 s clip in 127.5 ms. The worker takes the
+    engine's mode for a two-file model: 50.5 ms. Inside it (the worker's own stage clock): encode
+    10.7 ms, the 75-row prefill 6.7, twelve decode steps 29.0 - 2.4 ms a token, where the reference's
+    own timing line reads 2.65.
+  - The reference keeps the prompts it has evaluated, audio rows included: the same clip sent again
+    costs it one prompt token (`cached_tokens` 79 of 80) and reads 37.4 ms, and a clip one sample
+    off costs the whole prompt. The instrument's rows before this entry repeated one clip and so
+    read that cache; every request now uploads a clip no server has heard.
+  - Unseen clips, ours / the reference, ms a transcription: Qwen3-ASR-0.6B 4 s 50.5 / 60.7, 8 s
+    76.6 / 98.1 (the reference's cv 6.1%, void); Qwen3-ASR-1.7B 4 s 85.5 / 95.1, 8 s 130.8 / 164.4.
+
 - **MEASURED (2026-10-02) - the K/V mirror's block codecs on the whole-model driver
   (`ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-kv-block-codecs`, `set_gpu_kv_dtype` / the server's `--kv-dtype`): a
   q8_0 mirror is 17/32 of the f16 mirror's bytes and tq4 9/32, and on a model whose context was asked whole
@@ -1092,7 +1336,7 @@ what it costs today and what the fix would change.
   pays the device bring-up and the slab builds; of the spread only the min named below is in the
   record, the rest is the run's log). Pocket q8 (`pocket-tts-en-q8.gguf`, alba): 132 ms a
   sentence, the first 641, a steady sentence about 99 - the prompt 27 ms of it on the CPU chain
-  (`followup_vulkan.md` 107), the backbone 62, the codec 10. kokoro (`kokoro-82m.gguf`): 98 ms,
+  (the prompt seat since serves it on the device, the entry above), the backbone 62, the codec 10. kokoro (`kokoro-82m.gguf`): 98 ms,
   the first 785, min 36, the steady sentences about 62, against the torch CUDA reference row of
   52 ms a sentence (`external`: `harness/tts_ref_bench.py --device cuda --models
   kokoro-82m:af_heart --limit 20` on the pod under
@@ -1148,7 +1392,7 @@ what it costs today and what the fix would change.
   before the change: sampled within 5% of greedy. `lcpp_bench` carries no sampler flag (its
   `--mtp-temp` sets a temperature alone), so no board row holds the sampled rate.
 - **LANDED (2026-09-25) - the Pocket TTS frame loop rides the Metal tower as the family's second
-  seat (`ARCHITECTURE_GPU_TOWER.md#tower-pocket-frames`): the backbone step and the flow head for every
+  seat (`ARCHITECTURE_GPU_TOWER_POCKET.md#tower-pocket-frames`): the backbone step and the flow head for every
   frame, eight frames a command buffer over a per-voice device K/V slot, the EOS rule on the host
   between batches, the q8 backbone on the decode GEMV, the head's GEMVs carrying their norm and
   activations, the attention row a threadgroup a head with its scores staged.** The bare q8
@@ -1196,7 +1440,7 @@ what it costs today and what the fix would change.
   `harness/tts_rig.py` on the 200-sentence corpus against the codec-seat rows: q8 4.23 / 4.364 -> 4.18 / 4.364, kq 4.04 / 4.333 -> 3.91 / 4.325, stuart-kq 3.23 / 4.117 -> 3.36 / 4.136 (WER / UTMOS, a word or two of the 2201 either way, the UTMOS within a hundredth). The
   levers left are `followup_metal.md` sec.27.
 
-- **LANDED (2026-09-25) - the Pocket TTS codec rides the Metal tower (`ARCHITECTURE_GPU_TOWER.md#tower-pocket-codec`): a chunk's latents up, its samples back, one command buffer, the CPU's windowed codec
+- **LANDED (2026-09-25) - the Pocket TTS codec rides the Metal tower (`ARCHITECTURE_GPU_TOWER_POCKET.md#tower-pocket-codec`): a chunk's latents up, its samples back, one command buffer, the CPU's windowed codec
   run as one shot over the chunk on the f32-exact GEMM stamps, the K-quant transformer linears
   dequantized into the slab so the small form serves too.** Box: the M5 Max, every das figure
   `-jit` on this tree with `DAS_TUNE_MANIFEST=performance/m5.tune.json` (its runtime section
@@ -4639,3 +4883,36 @@ and pp512 is read against its own spread.
   row's largest live |value| (`live_maxabs`, a NaN and the suppressed-id floor left out) and the control row
   past `ctrl_bars` bars, the widest miss and the tightest control logged with their rows. The cells it
   serves read the same verdicts before and after the fold (hybrid, moe, hc, the regions files 26/26 twice).
+
+### From the vision shared-kernels arc (2026-10-08, Apple M5 Max and the RunPod RTX PRO 4500 Blackwell)
+
+The arc folds the vision towers' kernel pairs onto templates both homes stamp, runs every Vulkan
+vision chain whole off the image planes on both weight lanes, and gives the Metal vision chains the
+q8 lane. The lane readings below come from `harness/vision_lane_probe.das`:
+`DASLLAMA_IMAGE=0 bin/daslang -jit modules/dasLLAMA/harness/vision_lane_probe.das -- <family> <q8 0|1> <mmproj> <w> <h>`
+with `DAS_TUNE_POLICY` unset - the tower staged and minted in memory under the lane pin, no `.dlim`,
+the family's encode (`gemma3v_encode`, `gemma4v_encode`, `qwen3v_encode`, `qwen25v_encode`) called
+thirteen times on a checkerboard canvas, the median of the last ten in ms. The Metal box ran the
+probe alone, no box profile applied; the Vulkan box ran it under `DASLLAMA_GPU=1` with
+`DASLLAMA_COOPMAT` unset (the cm2 arm). Each lane is its own process, so a lane pair is
+`direction-grade`. Encode ms, the exact lane then the q8 lane of the same file.
+
+- **The lane the policy keeps is the faster one on each home** (`direction-grade`). Metal (M5 Max):
+  gemma3v at the fixed 896 canvas 340.9 / 507.3, gemma4v E2B at 672x336 29.1 / 30.1, qwen3v 4B at
+  448 26.2 / 55.2 - the f32 tiles beat the q8 GEMM ladder with its half feed on every family, so the
+  Metal chains keep the file's planes as the default. Vulkan (RTX PRO 4500): gemma3v 281.5 / 88.2,
+  gemma4v 26.5 / 23.3, qwen3v 48.0 / (no figure: the q8 encode alternates 34 and 66 ms on
+  consecutive calls, the pre-arc driver the same, `followup_vulkan.md` row 146), qwen25v 30.8 -
+  the exact lane rides the f32 tile over the whole blob (no feed, no schedule) and the q8 lane the
+  cm2 tiles, so the Vulkan chains keep the q8 image as the default and serve a pinned exact tower on
+  the f32 tile; the f16 slab for the exact lane is `followup_vulkan.md` row 95's lever.
+- **The qwen25v Metal chain's folds read 67.5 -> 52.8 -> 50.9 ms** on the 448 checkerboard
+  (`direction-grade`, the probe at three commits of the arc): the shared bias-gate stamp storing the
+  halves the down GEMM reads in one dispatch (52.8), then the seam stamps folding each block's
+  pre-norm into the residual add (50.9).
+- **A weight drop discharges the vision towers' device memory.** The Metal tower frees its q8
+  vision slab (`g_tw_q8_vis` - the block regions' q8 bytes and scales, one slab for the file, keyed
+  on the blob and the scales so a re-mint of the same file reuses it) on `tw_weights_drop` and at
+  shutdown; the Vulkan tower forgets its vision marks (`vt_vis_forget` - the planes, im2col, stem
+  weight and norm buffers' capacities and the stem-slab freshness) with its scratch, so the next
+  file's canvas grows them from zero instead of reading a stale key as fresh.

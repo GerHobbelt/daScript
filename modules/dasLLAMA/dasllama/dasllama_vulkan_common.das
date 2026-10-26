@@ -776,9 +776,7 @@ var g_vk_upload_bytes = 0l
 //! DASLLAMA_GPU_PROF=1: per-piece batch-chain timing to log
 def vk_prof : bool => g_env_gpu.gpu_prof
 
-def dev_raw : VkDevice {
-    return boost_value_to_vk(g_gpu.device)
-}
+def dev_raw : VkDevice => boost_value_to_vk(g_gpu.device)
 
 // host-visible memory comes in two flavors on discrete cards: write-combined (fast CPU writes,
 // ~100x SLOWER CPU reads) and host-cached. Buffers the CPU reads back (the y planes) MUST be
@@ -3028,7 +3026,7 @@ def pfq_end(raw : VkCommandBuffer) {
 // query i's delta to its predecessor, usec
 def pfq_us(i : uint) : double {
     unsafe {
-        var tp = reinterpret<uint64?>(g_pfq_buf.mapped)
+        let tp = reinterpret<uint64?>(g_pfq_buf.mapped)
         return double(tp[i] - tp[i - 1u]) * double(g_pfq_period) / 1000.0lf
     }
 }
@@ -3344,30 +3342,13 @@ def private spv_override_load(kernel : string; var spv : array<uint>) {
     }
 }
 
-[arch(at="../ARCHITECTURE_GPU_VULKAN_GEMM.md#vk-class-pipeline-build")]
-def private spv_dump_save(kernel : string; spv : array<uint>) {
-    let dir = g_env_vulkan.vk_spv_dump
-    if (empty(dir)) {
-        return
-    }
-    let path = path_join(dir, "{kernel}.spv")
-    fopen(path, "wb") $(f) {
-        if (f != null) {
-            f |> fwrite(spv)
-            to_log(LOG_INFO, "dasLLAMA vulkan tier: DASLLAMA_VK_SPV_DUMP wrote {path}\n")
-        } else {
-            to_log(LOG_WARNING, "dasLLAMA vulkan tier: DASLLAMA_VK_SPV_DUMP could not write {path}\n")
-        }
-    }
-}
-
 [cold_path, arch(at="../ARCHITECTURE_GPU_VULKAN_GEMM.md#vk-class-pipeline-build")]
 def vkd_class_pipe(var c : VkdClass; ord : int; var spv : array<uint>; rmask, wmask : uint; kernel : string) {
     if (length(c.pipes) <= ord) {
         c.pipes |> resize(ord + 1)   // empty slots hold null handles until their kernel ensures
         c.pipe_epochs |> resize(ord + 1)
     }
-    spv_dump_save(kernel, spv)   // the EMITTED words, before an override replaces them
+    kernel_dump_save(g_env_vulkan.vk_spv_dump, "{kernel}.spv", "DASLLAMA_VK_SPV_DUMP", spv)   // the EMITTED words, before an override replaces them
     if (g_vkd_spv_keep) {
         g_vkd_spv_kept[kernel] := spv
     }
@@ -3689,6 +3670,7 @@ enum VtProfRole {
     spectrum    //! the fronts' DFT
     mel         //! the fronts' log filterbank and canary's normalization
     shuffle     //! the fronts' feature-row shuffles
+    pool        //! the chat projector tails' pair pool
     tts_gemm    //! the TTS seats' f32 tile GEMMs (the linears, the convs' tiles, the LSTM input gates)
     tts_im2col  //! the TTS convs' column builder
     tts_lstm    //! the LSTM recurrence walks

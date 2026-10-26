@@ -167,7 +167,9 @@ Run under ``-jit`` --- the interpreter is refused, it is far too slow for infere
 
    bin/daslang -jit utils/dasllama-server/main.das -- --model <model.gguf> [--port 8080] [--quant q8] \
        [--asr <asr.bin>] [--asr-workers 2] [--mmproj <mmproj.gguf>] [--image-mmproj <mmproj.gguf>] \
-       [--ctx 4096] [--streams 4] [--chunk 512] [--chunk-idle 2048] [--page-rows 64] [--prefix N] [--tune]
+       [--audio-mmproj <mmproj.gguf>] \
+       [--ctx 4096] [--streams 4] [--chunk 512] [--chunk-idle 2048] [--page-rows 64] [--prefix N] \
+       [--prefix-states 256] [--prefix-state-mb 0] [--tune]
 
 .. list-table::
    :header-rows: 1
@@ -189,6 +191,11 @@ Run under ``-jit`` --- the interpreter is refused, it is far too slow for infere
      - ``-p``
      - ``8080``
      - Listen port
+   * - ``--host``
+     -
+     - ``127.0.0.1``
+     - Interface to listen on. The default serves this machine only; ``0.0.0.0`` opens the
+       server to every device on the network, which is the operator's choice, never the default
    * - ``--quant``
      - ``-q``
      - ``q8``
@@ -256,7 +263,11 @@ Run under ``-jit`` --- the interpreter is refused, it is far too slow for infere
    * - ``--image-mmproj``
      -
      - ---
-     - Vision mmproj (gemma4uv, gemma4v or gemma3v, sniffed) for the default model --- the chat route then accepts ``image_url`` content parts. When the file also carries a gemma4a audio encoder (the E-series mmproj carries both towers) the same flag arms native audio: ``input_audio`` parts serve through the same slot
+     - Vision mmproj (gemma4uv, gemma4v or gemma3v, sniffed) for the default model --- the chat route then accepts ``image_url`` content parts. When the file also carries an audio encoder (the gemma-4 E-series and the Qwen Omni mmprojs carry both towers) the same flag arms native audio: ``input_audio`` parts serve through the same slot
+   * - ``--audio-mmproj``
+     -
+     - ---
+     - Audio mmproj for the default model --- the chat route then accepts ``input_audio`` content parts: a whisper-class tower with its projector (Qwen2-Audio, Qwen2.5-Omni, Ultravox, Voxtral) or the gemma-4 Conformer. Not needed when ``--image-mmproj`` names a file that carries the audio tower too
    * - ``--ctx``
      -
      - *model*
@@ -297,6 +308,14 @@ Run under ``-jit`` --- the interpreter is refused, it is far too slow for infere
      -
      - *auto*
      - Prefix-cache retention cap in pages (auto: one full context per stream; ``-1`` = unbounded)
+   * - ``--prefix-states``
+     -
+     - ``256``
+     - Recurrent models (the Qwen3.5/3.6/3.8 hybrids) cache whole checkpoints instead of pages: the most a slot keeps (``0`` = none; config key ``prefix_states``); the byte budget binds first. Every request leaves one at its opening's shared head (the system text or the tool block, whichever its template writes first), one at its opening with the tools, one where its last message starts, one where it ends (ahead of the generation prompt), one at its finished turn; a conversation's own stops are dropped before shared openings
+   * - ``--prefix-state-mb``
+     -
+     - *auto*
+     - The checkpoints' byte budget in MB, snapshots and held pages (auto: a quarter of the box's RAM; config key ``prefix_state_mb``)
    * - ``--flat``
      -
      - ---
@@ -304,7 +323,7 @@ Run under ``-jit`` --- the interpreter is refused, it is far too slow for infere
    * - ``--mtp``
      -
      - *auto*
-     - MTP/NextN self-speculative decode. Unset, a slot turns it on when it runs one stream (``streams = 1``) on a GPU --- Metal, or the whole model resident on a Vulkan device with its routed experts on the card --- and leaves it off otherwise: at one stream on Metal the draft-and-verify round cuts decode time on the dense Qwen3.5 MTP models (0.8B 1.20x, 4B 1.21x, 9B 1.10x), on a Vulkan device more unless the driver sums a MoE's routed experts on the host (there the verify rows' host sums cost more than a plain token), on the CPU the round's second verify row costs a second decode step and the round is slower than plain decode, and at several streams the plain batched step is faster. An armed round keeps every stream's cache on the host, so a drafting Vulkan slot (``--gpu vulkan``) serves host-cached sessions in place of device-home ones. ``true`` / ``false`` set it outright. It needs a model with an in-file NextN head (the ``-MTP-`` GGUFs), or an assistant drafter GGUF beside the model file (gemma-4: ``mtp-<stem>-Q8_0.gguf``), which the load attaches; on any other model the server logs one line and serves plain. Greedy requests are output-invariant; a sampled request draws each verify row with its own sampler and keeps the plain sampled distribution, at a lower acceptance rate. ``/v1/stats`` reports ``mtp_drafted`` / ``mtp_accepted``
+     - MTP/NextN self-speculative decode. Unset, a slot turns it on when it runs one stream (``streams = 1``) on a GPU --- Metal, or the whole model resident on a Vulkan device with its routed experts on the card --- and leaves it off otherwise: at one stream on Metal the draft-and-verify round cuts decode time on the dense Qwen3.5 MTP models (0.8B 1.20x, 4B 1.21x, 9B 1.10x), on a Vulkan device more unless the driver sums a MoE's routed experts on the host (there the verify rows' host sums cost more than a plain token), on the CPU the round's second verify row costs a second decode step and the round is slower than plain decode, and at several streams the plain batched step is faster. An armed round keeps every stream's cache on the host, so a drafting Vulkan slot (``--gpu vulkan``) serves host-cached sessions in place of device-home ones. ``true`` / ``false`` set it outright. It needs a model with an in-file NextN head (the ``-MTP-`` GGUFs), or an assistant drafter GGUF beside the model file (gemma-4: ``mtp-<stem>-Q8_0.gguf``), which the load attaches; on any other model the server logs one line and serves plain. Greedy requests are output-invariant; a sampled request draws each verify row with its own sampler and keeps the plain sampled distribution, at a lower acceptance rate. ``/v1/stats`` reports ``mtp_drafted`` / ``mtp_accepted``. A constrained reply (``response_format``, a forced ``tool_choice``) decodes plain.
    * - ``--rope-scaling``
      -
      - *file*
@@ -343,6 +362,7 @@ picks a different one:
 
    model = "D:/models/SmolLM2-135M-Instruct-Q8_0.gguf"
    port = 8080
+   host = "127.0.0.1"   # the interface: this machine only; "0.0.0.0" opens it to the network
    quant = "q8"
    kv_dtype = "tq4"   # rotated 4-bit KV - half the q8_0 cache bytes
    ctx = 4096
@@ -394,7 +414,7 @@ model's GPU state lives in VRAM at a time (the tier drops and re-arms on
 switch; ``backend = "cpu"`` slots never evict the GPU owner). Blank keys
 inherit the flat defaults; ``backend`` is ``auto`` | ``cpu`` | ``gpu``, and
 per-entry ``ctx``, ``quant``, ``kv_dtype``, ``streams``, ``chunk``, ``chunk_idle``,
-``page_rows``, ``prefix``, ``mtp``, ``rope_scaling``, ``rope_scale``, ``yarn_orig_ctx`` and ``image_mmproj`` override per model:
+``page_rows``, ``prefix``, ``mtp``, ``rope_scaling``, ``rope_scale``, ``yarn_orig_ctx``, ``image_mmproj`` and ``audio_mmproj`` override per model:
 
 .. code-block:: toml
 
@@ -432,7 +452,7 @@ Setup mode and the model catalog
 ================================
 
 A start with no LLM model at all - no ``--model``, no config, or every
-configured path missing - and no servable ``--tts`` boots into setup mode: the
+configured path missing - and no servable ``--tts`` or ``--asr`` boots into setup mode: the
 port opens, the control page serves, every inference route answers with a
 clean error, and the page leads with the model catalog - a curated, sha-pinned
 list of current models (``model_catalog.das``, a view over the module's one
@@ -452,8 +472,13 @@ wears a fit badge (fits gpu / fits / tight / too big) from the box facts the
 ``/catalog`` document carries; the advertised working set is a hint, not a load
 gate.
 
-``--tts`` alone is a serving start, not a setup start: a speech-only server has
-no LLM slot, so ``/v1/stats`` answers the slotless shape with ``setup`` false.
+``--tts`` or ``--asr`` alone is a serving start, not a setup start: a speech-only
+server has no LLM slot, so ``/v1/stats`` answers the slotless shape with ``setup``
+false and its speech counters live. An ASR model whose decoder is an LLM - a
+two-file model, ``--asr`` with ``--mmproj`` - decodes where the server's LLMs do:
+its worker takes the boot's Metal mode, and ``/v1/stats`` names the outcome under
+``asr.models[]`` as ``decoder`` (``metal`` or ``cpu``). A one-file model (whisper,
+parakeet) decodes on the CPU.
 A ``--tts`` the server cannot serve degrades, it does not die: a missing file
 or a failed load is logged, the speech route is dropped, and the boot serves
 whatever is left - the LLM slots if any loaded, else setup mode.
@@ -545,19 +570,21 @@ Endpoints
      - ``{"model": name}`` --- make ``name`` the default + stepped slot and move the GPU tier to it now (loopback-only; 409 while work is live)
    * - ``POST``
      - ``/v1/models/load``
-     - ``{"path", "id"?, "backend"?, "quant"?, "ctx"?, "image_mmproj"?, "activate"?}`` --- load a GGUF into a new serving slot with no restart (loopback-only; 409 on a live stream set, a taken id, or a GGUF another slot already serves)
+     - ``{"path", "id"?, "backend"?, "quant"?, "ctx"?, "image_mmproj"?, "audio_mmproj"?, "activate"?}`` --- load a GGUF into a new serving slot with no restart (loopback-only; 409 on a live stream set, a taken id, or a GGUF another slot already serves)
    * - ``POST``
      - ``/v1/models/unload``
      - ``{"model": name}`` --- free the slot's weights, KV and VRAM; the default slot refuses (loopback-only)
    * - ``POST``
      - ``/v1/chat/completions``
-     - Chat; ``stream: true`` gives SSE, else a buffered reply. OpenAI function calling (``tools``); ``image_url`` parts under ``--image-mmproj``; ``input_audio`` parts when the mmproj carries the audio tower (one image or one clip per request, on the final user message). A stream sent with ``stream_options: {"include_usage": true}`` ends, before ``[DONE]``, on one chunk with an empty ``choices`` list: ``usage`` (``prompt_tokens``, ``completion_tokens``, ``total_tokens``, and ``prompt_tokens_details.cached_tokens`` --- the prompt tokens the prefix cache attached) and ``timings`` (``ttft_ms``, the scheduler's admit-to-first-token wall, and ``gen_ms``, first token to finish); a stream that does not ask carries no such chunk
+     - Chat; ``stream: true`` gives SSE, else a buffered reply. OpenAI function calling (``tools``); ``image_url`` parts under ``--image-mmproj``; ``input_audio`` parts under ``--audio-mmproj``, or when the image mmproj carries the audio tower (any user message may carry images and clips, up to 16 parts a request, each spliced where the part sits among its message's text parts; a part is encoded and prefilled once --- a continued chat, or the same request again, attaches its span off the prefix cache and never reaches the tower). A stream sent with ``stream_options: {"include_usage": true}`` ends, before ``[DONE]``, on one chunk with an empty ``choices`` list: ``usage`` (``prompt_tokens``, ``completion_tokens``, ``total_tokens``, and ``prompt_tokens_details.cached_tokens`` --- the prompt tokens the prefix cache attached) and ``timings`` (``ttft_ms``, the scheduler's admit-to-first-token wall, and ``gen_ms``, first token to finish); a stream that does not ask carries no such chunk
    * - ``POST``
      - ``/v1/completions``
      - Raw completion; ``stream: true`` gives SSE, else buffered; the same ``stream_options.include_usage`` closing chunk as the chat route
    * - ``POST``
      - ``/v1/embeddings``
-     - Mean-pooled, L2-normalized sentence embeddings
+     - L2-normalized sentence embeddings, pooled the way the model's file asks (``pooling_type``:
+       last token for Qwen3-Embedding, mean for a chat model); ``pooling`` (``mean`` | ``cls`` |
+       ``last``) overrides, ``dimensions`` keeps the leading components and renormalizes
    * - ``POST``
      - ``/v1/audio/transcriptions``
      - Speech to text (multipart upload; needs ``--asr``). One ASR model takes every request, whatever ``model`` says; with several, ``model`` names one by its id (none, or the ``<default slot>-asr`` id: the first; any other name: 404); ``language`` defaults to English, and to detection on a model that only detects. ``response_format=verbose_json`` adds timed segments
@@ -724,11 +751,16 @@ The wire format follows the model family: **hermes** (Qwen2.5 / Qwen3 family -
 a ``<tools>`` system block, ``<tool_call>`` JSON), **harmony** (gpt-oss -
 developer-turn TypeScript namespace defs, commentary-channel recipient calls),
 **gemma4** (gemma-4 - the declaration / call / response DSL), **mistral**
-(v0.3+ - ``[AVAILABLE_TOOLS]`` defs, a ``[TOOL_CALLS]`` array) and
+(v0.3 and the tekken templates - Mistral-Small 3.x, Magistral, Devstral:
+``[AVAILABLE_TOOLS]`` defs, a ``[TOOL_CALLS]`` array) and
 **llama_json** (llama-3.x - the whole reply is one ``{"name","parameters"}``
 object, results on the ``ipython`` role). A model whose chat template declares
-no tool format gets a 400. Streaming with tools buffers the native envelope and
-emits the parsed calls as one ``delta.tool_calls`` chunk at finish.
+no tool format gets a 400. Streaming with tools puts the reply's text on the wire
+as it comes and holds back only the family's call marker; the parsed calls arrive
+as one ``delta.tool_calls`` chunk at finish; hermes, xml_function and gemma4 hold
+at their call marker, llama_json at the call object's opening brace, mistral at the
+call array's bracket. A family whose calls ride channels rather than a marker
+(harmony) is framed whole at the finish.
 
 
 Images
@@ -759,10 +791,17 @@ Embeddings
 ----------
 
 ``input`` is a string or an array of strings. Each vector is ``model.config.dim``
-floats, mean-pooled over the decoder's last-layer hidden state (post-final-norm)
-and L2-normalized. A decoder-only LLM used as an embedder gives **RAG-grade**
-vectors (good for retrieval / similarity), not a substitute for a dedicated
-embedding model. See :ref:`tutorial_dasLLAMA_embeddings` for the facade side.
+floats from the decoder's last-layer hidden rows (post-final-norm), L2-normalized,
+pooled the way the model's file asks: its ``pooling_type`` key names last-token
+pooling for an embedding model such as Qwen3-Embedding (the row at the appended end
+token, the way it was trained to be read) and is absent on a chat model, which is
+read by the mean over positions. ``pooling`` (``"mean"`` | ``"cls"`` | ``"last"``)
+overrides the file; ``dimensions`` keeps the leading components and renormalizes,
+the Matryoshka read the Qwen3-Embedding family supports. An instruction prefix on
+the query side ("Instruct: ...\nQuery: ...") is the client's text, as the API has no
+field for it. A chat model used as an embedder gives **RAG-grade** vectors (good for
+retrieval / similarity), not a substitute for a dedicated embedding model. See
+:ref:`tutorial_dasLLAMA_embeddings` for the facade side.
 
 .. code-block:: sh
 
@@ -867,7 +906,5 @@ prefix cache.
 Not yet implemented
 ===================
 
-The request's ``stop`` and ``response_format`` fields and the forced-function
-``tool_choice`` object form - each logged when a request carries it. On the
-media path: more than one media clip per request, media on earlier turns of a
-conversation, and remote ``image_url`` fetches.
+On the media path: more than one media clip per request, media on earlier
+turns of a conversation, and remote ``image_url`` fetches.

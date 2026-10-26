@@ -1705,7 +1705,7 @@ module) is independent and can land any time - it is pure structure.
     Still open, each a fold only after its probe row reads flat: the 8-row / 4-row flash Q-tiles (`FaT`),
     `MmBatchT`'s two tile edges, the hand-unrolled `DnScan` / `DaAttnBH128T` register blocks, the batch
     tiles' `stage_w` lane helpers against `KqGemvLeafT.grid4`; and the Q8 byte store spelled by
-    `Q8BlockStoreT.blk_store` and `ResidualT.quant32` (a template fold, pinned by the codec stamps' dump).
+    `GkQ8BlockStore.blk_store` and `ResidualT.quant32` (a template fold, pinned by the codec stamps' dump).
 94. **The qwen25v Vulkan chain's remaining f16 sources.** The chain (`ARCHITECTURE_GPU_TOWER_VULKAN.md`
     2.2ar) holds the exact CPU chain within 1e-2 x rms through eight blocks and within 0.02 to 0.09
     x rms at 32 blocks (the Metal rung's order) with the window layers in f32; what re-rolls the
@@ -1714,11 +1714,14 @@ module) is independent and can land any time - it is pure structure.
     are f32 K/V shadows on the full layers (four of 32) and an f32-x GEMM form for the late blocks'
     feed; the instrument is `test_qwen25v_vulkan_twin`'s whole-tower legs with the bar at what the
     lever reads.
-95. **The Vulkan vision tower's speed levers.** gemma3v rides the pre-LN chain (`vt_ln_chain`),
-    which already has the cm2 f16 feed and the row passes that store it (`ARCHITECTURE_GPU_TOWER_VULKAN.md`
-    2.2ar); gemma4v, qwen3v and qwen25v keep one dispatch per CPU loop step. The levers there: the
-    cm2 f16 feed in place of the Q8_0 requant and the q8 batch tile where the device has cm2;
-    fusing the per-row dispatches that sit between two GEMMs (a bias, an activation, a restride)
+95. **The Vulkan vision tower's speed levers.** gemma3v's q8 lane rides the pre-LN chain (`vt_ln_chain`),
+    which already has the cm2 f16 feed and the row passes that store it
+    (`ARCHITECTURE_GPU_TOWER_VULKAN.md#vk-tower-encode-chains`); gemma4v's and qwen3v's q8 lanes keep
+    the Q8_0 requant feed and the q8 batch tile, and every family's exact lane rides the f32 tile
+    (`ARCHITECTURE_GPU_TOWER_VULKAN_VISION.md#vk-vision-chains`). The levers: the cm2 f16 feed on
+    gemma4v's and qwen3v's q8 lanes where the device has cm2; an f16 slab for the exact lane (the halfword
+    twin the family bakes, or the bf16 rows as halves) through the f16 GEMM class, as qwen25v's chain
+    rides; fusing the per-row dispatches that sit between two GEMMs (a bias, an activation, a restride)
     into the GEMM's epilogue or the next class; and, on every vision chain, the head restrides
     folded into the flash tile's load on the padded route and K and V staged in workgroup memory on
     the f32 window route (it reads them off the compact rows). The instrument is `lcpp_bench
@@ -1735,7 +1738,7 @@ module) is independent and can land any time - it is pure structure.
     the compensated sums they protect can fold. Done = the arm sets the knob where the user has not,
     and the source kernels' cells run green on the Mac.
 112. **`tts_div`'s Newton step relies on `mad` being fused.** The source kernels divide as the
-    CPU's IEEE division rounds through `tts_div` (`dasllama_vulkan_classes.das`): a reciprocal
+    CPU's IEEE division rounds through `tts_div` (`dasllama_gpu_math.das`, both homes' bodies): a reciprocal
     refined once and the quotient corrected by its exact remainder, each correction a `mad` whose
     exactness needs one rounding. `mad` lowers to `Fma`, which the `precise` mark does not decorate
     and which Vulkan lets a driver evaluate as a multiply then an add
@@ -1770,12 +1773,6 @@ module) is independent and can land any time - it is pure structure.
     windowed the same way, or the sample-rate convs' columns gathered inside the tile so no column
     slot exists; the instrument is the attach ledger's `vk tts scratch` line and the codec served
     cells.
-107. **The Pocket prompt stays on the CPU.** The text rows' backbone prefill over the voice's
-    caches runs the CPU chain, since the family's hook record carries a codec and a frames seat
-    only (the Metal twin's too); its share of a steady Pocket sentence on the pod is the prompt
-    bucket of the `PERF_LEDGER.md` Vulkan TTS seats entry. A prompt seat is the frames seat's layer
-    chain at t = n_txt rows on the f32 tile, writing the caches' rows the frames seat reads; the
-    instrument is `harness/tts_synth.das`'s prompt bucket beside the two rows.
 106. **The TTS LSTM recurrence walks one SM.** `TtsLstmDir` runs a direction in one workgroup
     (four lanes a hidden unit over the recurrence transposed to [H][4H]), and a step costs the same
     whatever the k loop's shape (four independent accumulators read the same as one): the
@@ -1818,14 +1815,14 @@ module) is independent and can land any time - it is pure structure.
     `vk_prof()` reports) under `DASLLAMA_GPU_PROF=1` - one cell reading the report text; the
     bench's `--asr-clips` override and the served-clip stamping, and the `DASLLAMA_VK_WDEC` knob
     read; the lower-side guards of `TowerDwConv5` and `TowerCnDw` (`st >= 0` in
-    `conv_src_fwd_row`, which their `DwConvRowsT.src_row` calls) and `TowerDwConv` (`iy >= 0`,
+    `conv_src_fwd_row`, which their `GkDwConvRows.src_row` calls) and `TowerDwConv` (`iy >= 0`,
     `ix >= 0`) - a wrapped index lands gigabytes past any buffer and
     robust buffer access reads zero, so the fixtures cannot reach them without a source base offset
     in the args that lets a garbage prefix sit before the block (the upper-side guards are
     covered); the `sdot4` arm of every audio twin (the cm2-off feeds: `vt_tile`'s q8 variant, the
     requant steps, the decoder's non-cm2 buffers) as a standing run, not the one p22 leg.
 103. **The tower dedup pass's leftovers.** The folds the pass ruled out or left, each with its
-    reason. The tower's rms rows (now `HcNorm` at one stream) against `ClsArAddRms` at `add_on = 0`:
+    reason. The tower's rms rows (`TowerRms`) against `ClsArAddRms` at `add_on = 0`:
     the residual class reads a zero add partner, rewrites the row in place and stashes it in a 32 KB
     workgroup array where the norm class reads the row once, so the fold adds two plane passes and a
     workgroup array to a role that reads 1% of the gemma4a chain (176 us over 36 stamps at 275 rows
@@ -1915,9 +1912,8 @@ module) is independent and can land any time - it is pure structure.
     here, twice in the ASR decoder and eight times in the Metal driver (a `TowerEngage` in
     `dasllama_tower.das`); the three hand-rolled listener registries (`register_vk_drop_hook`,
     `register_weights_epoch_listener`, `register_reload_prep`) against daslib's `delegate` module; the
-    Vulkan dump rungs against their Metal twins; the two gelu-quick spellings (`x * (1/(1+exp(-1.702
-    x)))` and `x / (1+exp(-1.702 x))` round differently, so a fold moves one side's bits); and
-    `approx` in `test_metal_decode_kernels.das` against `_compares`.
+    Vulkan dump rungs against their Metal twins; and `approx` in `test_metal_decode_kernels.das` against
+    `_compares`.
 92. **The low-format N-row arc's review leftovers.** The kq kernel
     bodies write the per-format scale-row strides as literals (`wsb * 5u`, `* 8u`, `* 6u`, `* 10u`,
     `* 12u`, `* 40u + 32u`), which `REVIEW_KQ_FORMATS.md` wants read off `dasllama_kqformat.das`'s
@@ -1936,21 +1932,23 @@ module) is independent and can land any time - it is pure structure.
     skip on it as they do on a missing device) or the offending opcode is spelled the way
     MoltenVK's converter accepts, and the three files read green under MoltenVK.
 
-115. **Nineteen TTS kernels are one algorithm under two class shells.** `TtsSrcCumsumT`, `TtsStftT`,
-    `TtsIstft`, `TtsSrcSinesT`, `TtsSrcLowT`, `TtsAdainT`, `TtsConcat`, `TtsPkAttn`, `TtsPkGemvT`,
-    `TtsPoolDw`, `TtsIm2colT`, `TtsElemT`, `TtsAddScale`, `TtsPkRowScale`, `TtsRowGather`,
-    `TtsPkRowsT` (the reflect pad's two copies included), `TtsSigSum`, `TtsAxpy` and
-    `TtsSrcNoise` each have a `MetalSt2*` / `MetalPk*` twin whose body is the same arithmetic; the dedup pass moved that
-    arithmetic into `dasllama_gpu_math.das`, and what stays twice is the shell - the binding
-    declarations (`@push_constant pa` against `@uniform ka`), the entry, the workgroup count. No
-    `class template` is stamped by both the SPIR-V and the Metal emitter today
-    (`modules/dasMetal/ARCHITECTURE.md` section 5: uniform against push-constant bindings, method
-    splicing against calls), so the shells wait on an emitter feature: one template with a
-    per-emitter binding form, about 500 lines across the two homes. The seat chains the two
-    drivers write per backend are the other half of the same picture and a separate arc after
-    the 0.6.5 release (Boris's ruling): the host flow of every TTS seat - the stage ping-pong,
-    the concat when the width differs, the head-block loop - is identical and could run once over
-    an encoder interface, about 450 lines.
+115. **The TTS kernel pairs still under two shells, and what each fold costs.** The kernels both GPU
+    homes run as one `class template` (`ARCHITECTURE_GPU.md#gpu-shared-kernels`) cover the Pocket
+    row copy, rope and attention, the duration sums, the whole harmonic source, the STFT pair, AdaIN,
+    the depthwise rows conv, the residual add-and-scale, Axpy and Concat. What stays twice, by kind:
+    (a) the same output under a different thread-to-work split - `TtsElemT` /
+    `TtsGeluTanh` (Vulkan four elements an invocation, Metal one a thread), the reflect pad (two
+    `TtsPkRows` copies against `MetalSt2Reflect1`), the column statistics (four dispatches against
+    one), the Pocket row GEMV (`TtsPkGemvT`'s float4 lane against `MetalPkGemvT`'s strided lane, five
+    stamps) - each folds onto one body and is profiled on both boxes, two bodies kept only where the
+    profile parts; (b) a different algorithm - the LSTM direction (each home's slab writer lays `w_hh`
+    out its own way) and the ALBERT attention (a two-pass softmax against an online one) - which stay
+    two. Vulkan's four fused frame-loop GEMV stamps
+    (`LnQkv`, `AddScale`, `Add`, `LnGelu`) have no Metal twin: once the GEMV template is shared, Metal
+    gains them and the five-dispatch layer. The seat chains the two drivers write per backend are the
+    other half of the same picture and a separate arc: the host flow of every TTS seat - the stage
+    ping-pong, the concat when the width differs, the head-block loop - is identical and could run
+    once over an encoder interface, about 450 lines.
 
 116. **The speculative round has no Vulkan round seat.** The round's four backend seats
     (`register_mtp_spec_override`, `_spec_batch_`, `_round_`, `_seam_` in `dasllama_common.das`)
@@ -2151,3 +2149,38 @@ module) is independent and can land any time - it is pure structure.
     changes the k4 bytes behind the `khrx` and `mmqx` races and every recorded probe reading in
     `PERF_LEDGER.md`. The fold is admissible only together with a re-reading of those rows, in a session
     that re-stamps them.
+
+144. **The gemma4a chain declines a widening audio embedder.** The Vulkan chain's projector tail sizes
+   one tail width for the out projection, the norm and the embedder (`tail_dim`), which holds where
+   the embedder is square (E2B). On E4B the embedder widens the encoder's 1536 to the decoder's 2560
+   (`gemma4a_mid_dim` against `proj_dim`), and the chain declines `shape`, so the CPU chain serves
+   E4B audio. Done = the tail's regions, tiles and buffers at the two widths (the Metal chain's
+   `g4a_tail_body` is the form), and `test_gemma4a_vulkan_twin` run on the E4B pair.
+
+145. **The audio kernel pairs that stay two.** The audio chains both homes run share their row kernels
+   through `dasllama/dasllama_gpu_kernels_common.das` - the bias-and-activation rows, the clamp and f16
+   feeds, the im2col of both ranks, the depthwise convs, the feature shuffles, the pools, the seam and
+   layernorm, the whisper decoder's K/V stores and attention, the FastConformer's GLU and taps, gemma4a's
+   attention. Two pairs compute the same thing by different algorithms and stay two: (a) the spectrum and
+   the log-mel - Vulkan's `TowerSpecDft` and `TowerMelLog` evaluate the DFT and the filterbank sums
+   directly, one invocation a bin or a mel, where Metal runs the DFT as the f32 GEMM over the transposed
+   twiddles, the power or magnitude as a row map (`enc_q3a_pow`, `enc_g4a_mag`), the filterbank as a
+   second GEMM and the log as a row map (`enc_g4a_logmel`); each is the form its home's GEMM builder makes
+   fast, and a fold waits on the two forms profiled on both boxes; (b) canary's rel-pos attention -
+   Vulkan's rel-plane kernels (`tower_cn_attn_r_cls`, `tower_cn_attn_r64_cls`) walk every key a row over
+   the planes the device built, Metal packs each head's (Q+u), (Q+v), K, V^T and pos panels and runs the
+   f32 GEMM builder (`enc_fc_pack`, `enc_fc_pexp`, `enc_fc_twin`), because the per-row walk is the
+   encode's cost past a minute of audio there (`ARCHITECTURE_GPU_TOWER.md#tower-encode-chains`); the
+   Vulkan form folds onto the Metal one only with a Vulkan f32 GEMM of the same shape. Done = each pair
+   profiled on both boxes under one clip, and the slower form folded onto the faster where the profile
+   parts by more than its noise.
+
+146. **The qwen3v q8 chain's encode alternates two walls on the RTX PRO 4500.** The lane probe
+    (`harness/vision_lane_probe.das`, 448 canvas, `DASLLAMA_IMAGE=0`, the cm2 arm) reads consecutive
+    encodes at 34 and 66 ms in strict alternation, with the driver sources from before the vision
+    shared-kernels arc the same; every host-side rebuild (the scratch, the vision buffers, the sets,
+    the upload) fires once, and the alternation sits inside the one-shot chain's submit-and-wait.
+    gemma3v, gemma4v and qwen25v read flat. The lever: the per-role GPU timestamp ledger
+    (`DASLLAMA_GPU_PROF=1`) over two consecutive encodes, read role by role, to name the stage that
+    doubles - the deepstack mergers, the split-k down planes or the Q8_0 feed are the stages the other
+    chains do not run.

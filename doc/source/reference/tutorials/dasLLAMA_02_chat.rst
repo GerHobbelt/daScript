@@ -116,6 +116,48 @@ memory spent only when the stream actually runs:
    var toks : array<int64>
    render_assistant(m, rchat, "Paris.", toks)   // the exchange, as tokens
 
+Two user messages in a row are two user turns, as every template writes them:
+``render_user`` renders the earlier one alone, and the later one takes the
+generation prompt. A replayed assistant turn can carry the reasoning the model
+wrote - ``set_preserve_thinking(rchat, true)``, then ``render_assistant``'s last
+argument - so a thinking model's next turn attaches the whole earlier exchange
+off the prefix cache instead of re-reading it. A harmony model (gpt-oss) cannot
+skip its analysis channel; its system turn asks for a reasoning level instead -
+``set_reasoning_effort(rchat, "low")``, ``"medium"`` or ``"high"`` - and unset,
+the level follows ``set_thinking``: ``medium`` on, ``low`` off. On every other
+family the call is a no-op.
+
+.. code-block:: das
+
+   var rchat2 = create_chat_renderer(m, SYSTEM)
+   set_preserve_thinking(rchat2, true)
+   set_reasoning_effort(rchat2, "low")                   // harmony's Reasoning: line; a no-op elsewhere
+   add_user(rchat2, "A note for the assistant: answer in one word.")
+   var two_toks : array<int64>
+   render_user(m, rchat2, two_toks)                      // the note, a user turn of its own
+   add_user(rchat2, "What is the capital of France?")
+   render_assistant(m, rchat2, "Paris.", two_toks, "The capital of France is Paris.")
+
+A dated system turn
+===================
+
+The Llama-3.1+ template writes two lines into every system turn: the model's
+knowledge cutoff and today's date. Today's date changes the prompt every
+midnight. A test that compares token streams, or a benchmark with a fixed
+prompt, pins the date with ``set_chat_date``; ``""`` gives the clock back:
+
+.. code-block:: das
+
+   set_chat_date("26 Jul 2024")
+   var dated = create_chat_renderer(m, SYSTEM)
+   add_user(dated, "What day is it?")
+   print(decode(m, render_turn(m, dated)))
+   set_chat_date("")
+
+On Llama-3.2-1B-Instruct the system turn then reads
+``Cutting Knowledge Date: December 2023`` and ``Today Date: 26 Jul 2024``.
+A template that states no date - ChatML on SmolLM2, gemma - ignores the pin.
+
 .. seealso::
 
    Full source: :download:`tutorials/dasLLAMA/02_chat.das <../../../../tutorials/dasLLAMA/02_chat.das>`

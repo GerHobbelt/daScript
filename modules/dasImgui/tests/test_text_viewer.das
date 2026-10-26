@@ -17,13 +17,11 @@ require daslib/json_boost public
 let FEATURE = "examples/text/main.das"
 let DEADLOCK_GUARD_SEC = 30.0f
 
-def private viewer_state(app : ImguiApp) : JsonValue? {
-    return post_command(app, "text_viewer_state", null)
-}
+def private viewer_state(app : ImguiApp) : JsonValue? =>
+    post_command(app, "text_viewer_state", null)
 
-def private source_range(app : ImguiApp; text : string) : JsonValue? {
-    return post_command(app, "text_viewer_source_range", JV((text = text)))
-}
+def private source_range(app : ImguiApp; text : string) : JsonValue? =>
+    post_command(app, "text_viewer_source_range", JV((text = text)))
 
 [test]
 def test_text_viewer_open_modes_and_zoom(t : T?) { // nolint:STYLE038 — one event-gated scenario; splitting breaks the wait-chain
@@ -246,8 +244,7 @@ def test_text_viewer_checkbox_save_reload_roundtrip(t : T?) { // nolint:STYLE038
         let opened = post_command(app, "text_viewer_open", JV((path = fixture)))
         t |> success(opened?["ok"] ?? false, "checkbox fixture opens")
 
-        var initial : JsonValue?
-        var checkbox : JsonValue?
+        var initial, checkbox : JsonValue?
         let ready = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
             initial = viewer_state(app)
             checkbox = post_command(app, "text_viewer_checkbox", JV((index = 0)))
@@ -963,9 +960,8 @@ def test_text_viewer_single_scroller(t : T?) {
 let EDIT_WIDGET = "DOCK_ROOT/g_document_windows[1]/DOCUMENT_CONTENT/EDITOR_PANE/editor"
 let EDIT_FIXTURE_TEXT = "# Edit probe\n\n- one\n- two\n- three\n\nTail paragraph.\n"
 
-def private edit_text_state(app : ImguiApp) : JsonValue? {
-    return post_command(app, "text_viewer_edit_text", null)
-}
+def private edit_text_state(app : ImguiApp) : JsonValue? =>
+    post_command(app, "text_viewer_edit_text", null)
 
 def private viewer_ready(t : T?; app : ImguiApp) : bool {
     let ready = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
@@ -1088,7 +1084,7 @@ def test_text_viewer_edit_preview_and_watch(t : T?) { // nolint:STYLE038 — one
         t |> success(split?["ok"] ?? false, "split surface selects")
 
         // markdown split editing is side-by-side: editor pane + live preview
-        var surface = wait_for_render(app, EDIT_WIDGET, 15.0f)
+        let surface = wait_for_render(app, EDIT_WIDGET, 15.0f)
         t |> success(surface != null, "editor pane renders")
         let preview_live = wait_cond(app, DEADLOCK_GUARD_SEC) $() : bool {
             var state = viewer_state(app)

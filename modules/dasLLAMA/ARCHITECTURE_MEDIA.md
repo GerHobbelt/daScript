@@ -131,11 +131,18 @@ carriers name, and no TTS family file (`dasllama_kitten`, `dasllama_kokoro`, `da
   family's own file, a family type is named only here, in the two tower drivers' family hooks
   (`dasllama_metal_tower.das`, `dasllama_vulkan_tower.das`), and in files under `tests/` - the
   set `REVIEW.das`'s `check_family_seams` enforces, its licensed namers (`VISION_SEAM_EXEMPT`)
-  being exactly those two driver files.
+  being those two driver files and `harness/vision_lane_probe.das`, the lane probe, which pins a
+  family's lane and mints its tower in memory - the carrier exposes neither.
 - **`dasllama_audio_embedder.das`** - the audio carrier: `AudioEmbedder` / `AudioState`, the
   vision carrier's audio twin - one union through every seam (server media worker, facade
   `encode_audio`, tutorials), the family probed from the mmproj's audio tensor (or a `.dlim`'s
-  baked tag) at load, one-line arms. Outside a family's own file, an audio family type is named
+  baked tag) at load, one-line arms. It carries two kinds: the gemma-4 Conformer, and the
+  whisper-class tower with its projector (`AudioKind.audio_tower`: Qwen2-Audio, Qwen2.5-Omni, Ultravox,
+  Voxtral), whose family file `dasllama_audio_tower.das` wraps `dasllama_audio`'s tower for the carrier
+  and encodes a clip one 30 s mel chunk at a time into its state's `EncoderState`. The
+  projector says how its rows splice: an ultravox span takes no marker (`audio_span_bare`), since
+  the stock decoder it pairs with declares none, and every other kind takes the markers the
+  decoder's chat template declares. Outside a family's own file, an audio family type is named
   only here, in `dasllama_asr.das`'s union field and one-line arms (the ASR rail's own carrier),
   in the GPU family hooks (`dasllama_metal_tower.das`, `dasllama_metal_asr_dec.das`,
   `dasllama_vulkan_tower.das`, `dasllama_vulkan_asr_dec.das` - each fills the family's own seat
@@ -187,14 +194,19 @@ blocks and merger alike - because the Metal tower reads f32 planes or the baked 
 A family file owns the hook SLOT for a stage the GPU can serve - a `var private` function pointer
 plus a `register_*` entry - and a tower driver fills it at `[init]`: the Metal driver on a Metal
 build, the Vulkan driver (`dasllama_vulkan_tower.das`) on a build without das_metal, for the
-blocks seats it serves and the front seats it fills (qwen3a's mel and conv front, gemma4a's
+blocks seats it serves and the front seats it fills (the whisper preprocessor's mel
+`register_whisper_mel_gpu`, which Qwen3-ASR's mel and the chat towers' chunked mel both ask;
+qwen3a's conv front, gemma4a's
 whole chunk, canary's front, parakeet's whole encode - the Metal driver's, asked ahead of the CPU
 front with the blocks seat behind a decline - and the whisper-class blocks-with-post-norm seat
 `register_tower_blocks_ln_post_gpu`, which the whisper encode asks ahead of its CPU block loop and
-post-norm - a decline asks no second seat, its driver's blocks seat declining the same way, while a
-driver with no post-norm seat (Metal) serves the blocks at the blocks seat and the CPU norms; the
+post-norm - a decline asks no second seat, its driver's blocks seat declining the same way; both
+tower drivers fill it, the post-norm one more row pass in the blocks' command buffer; the
 seat serves the family whose post-norm follows the blocks with nothing between, whisper, while the
-families that pool before it, and ultravox, keep the CPU post-norm). The direction is forced: the
+families that pool before it, and ultravox, take the blocks-with-tail seat
+`register_tower_blocks_tail_gpu`, which `audio_encode` asks ahead of the blocks and the CPU
+projector tail and which answers what it served - nothing, the blocks, or the blocks and the tail
+(`TowerTailServed`); the Metal driver fills it). The direction is forced: the
 driver requires the family file for its
 types, so the family cannot require the driver back. A box with no driver leaves the slot empty
 and the CPU form runs. A seat taken over a filled slot (a test's stub through
@@ -203,12 +215,15 @@ and serve counters are a `TtsGpuSeats` of `dasllama_tts_types.das`) gives the di
 `unregister` - one level: the record keeps the registration it displaced, not a stack of them - so
 the driver's seats survive the test.
 
-Every hook answers "declined" in its own return - `false` for the block hooks and qwen3a's mel and
+Every hook answers "declined" in its own return - `false` for the block hooks and the whisper mel and qwen3a's
 front hooks, `-1` for the hooks that return a row count (gemma4a's whole chunk, canary's front) -
 so a decline is a fallback, never an outage, and the CPU form stays the reference. A family calls
-its hook on either lane: the Metal driver declines the q8 encoder and the Vulkan driver the exact
-one, each as a counted non-policy `quant_mode` decline, which under the driver's required mode
-panics - a caller that pins a lane pins the one its driver serves. While the stage-diff witness is
+its hook on either lane: the vision towers' chains read both lanes on both drivers
+(`ARCHITECTURE_GPU_TOWER.md#tower-encode-chains`, `ARCHITECTURE_GPU_TOWER_VULKAN_VISION.md#vk-vision-chains`);
+of the audio towers the Metal driver serves the whisper-class tower on both lanes and declines the
+q8 encoder of the rest, the Vulkan driver the exact one, each as a counted non-policy `quant_mode`
+decline, which under the driver's required mode panics - a caller that pins a lane pins one its
+driver serves. While the stage-diff witness is
 armed (`set_audio_encode_ref_dir`), the whisper-class tower skips its conv and block hooks and runs
 the CPU forms: the witness diffs the CPU stages' rows against reference dumps, and a stage the
 device served leaves nothing to diff.
@@ -226,9 +241,12 @@ column buffer (`s.x0`, `st.xw`) and never the residual stream the CPU half would
 ### The tower weight lane is a policy, not a default {#tower-weight-lane}
 
 A tower serves its GEMMs on one of two lanes: q8 planes (the CPU serving format) or the file's
-exact f32 planes. Un-pinned, the lane follows the fastest GEMM path on the box - a serving Metal
-driver reads the f32 blob and declines q8, so `*_gpu_serves` answering true flips the default to
-exact, and every other box takes q8. Each family exposes the same trio over one `GemmLane` pin
+exact f32 planes. Un-pinned, the lane follows the fastest GEMM path on the box: a GPU tower registered
+with the f32 lane served (`register_<family>_gpu`'s `f32_lane` - the Metal vision chains, whose f32
+tiles are the faster lane) and answering `*_gpu_serves` true flips the default to exact
+(`*_gpu_exact_serves`); the Vulkan vision chains register the q8 lane as the faster one, so a Vulkan
+box takes q8 and serves a pinned exact tower on its f32 tile; every other box takes q8. Whisper carries no lane policy and serves q8 everywhere:
+the Metal tower reads its q8 planes. Each family exposes the same trio over one `GemmLane` pin
 (`lane_serves_q8`, `dasllama_common.das`): `set_*_q8` pins a lane, `reset_*_q8` returns to the
 policy, `*_serves_q8` reports the lane the next load would take. The
 lane picks the image tag, so the two lanes are separate images that coexist.
@@ -236,8 +254,8 @@ lane picks the image tag, so the two lanes are separate images that coexist.
 Pins exist for the arms that must not follow the box: the parity legs, the CPU board rows, and the
 facade's fp32 rail.
 
-Every family load logs its GEMM lane and the reason at LOG_INFO - the pin, the serving Metal
-driver, or the CPU default - because the lane changes what the load mints and serves. Where the
+Every family load logs its GEMM lane and the reason at LOG_INFO - the pin, the serving GPU tower's
+lane, the accelerate tier, or the CPU default - because the lane changes what the load mints and serves. Where the
 caller hands the lane in (parakeet, canary), the line names the caller's pick beside the reason
 the policy gives, so a caller that overrides the policy shows as a pick its reason does not match.
 

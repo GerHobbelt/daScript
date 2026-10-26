@@ -38,7 +38,7 @@ def private greedy_steps(tr : Model; var s : Session; n : int) : array<int64> {
     var cur = argmax_of(s.logits, vocab)
     for (_i in range(n)) {
         ids |> push(cur)
-        var one <- [cur]
+        var inscope one <- [cur]
         eval_(tr, s, one)
         delete one
         cur = argmax_of(s.logits, vocab)
@@ -73,15 +73,14 @@ def private kv_row_max_diff_one(cache_a, cache_b : array<uint8>; base_a, base_b 
         let pa = addr < uint8 const? >(cache_a[0]) + (base_a + pos * rowb)
         let pb = addr < uint8 const? >(cache_b[0]) + (base_b + pos * rowb)
         if (dt == KVDtype.f16) {
-            var ha = reinterpret<uint16 const?>(pa)
-            var hb = reinterpret<uint16 const?>(pb)
+            let ha = reinterpret<uint16 const?>(pa)
+            let hb = reinterpret<uint16 const?>(pb)
             for (e in range64(kv_dim)) {
                 maxd = max(maxd, abs(f16_to_f32(uint(ha[e])) - f16_to_f32(uint(hb[e]))))
             }
         } elif (dt == KVDtype.q8_0 || dt == KVDtype.tq4) {
             // block codecs compare dequantized (tq4: in the rotated basis both rows share)
-            var da : array<float>
-            var db : array<float>
+            var da, db : array<float>
             da |> resize(kv_dim)
             db |> resize(kv_dim)
             if (dt == KVDtype.q8_0) {
@@ -97,8 +96,8 @@ def private kv_row_max_diff_one(cache_a, cache_b : array<uint8>; base_a, base_b 
             delete da
             delete db
         } else {
-            var fa = reinterpret<float const?>(pa)
-            var fb = reinterpret<float const?>(pb)
+            let fa = reinterpret<float const?>(pa)
+            let fb = reinterpret<float const?>(pb)
             for (e in range64(kv_dim)) {
                 maxd = max(maxd, abs(fa[e] - fb[e]))
             }
@@ -177,7 +176,7 @@ def private paged_greedy(tr, trg : Model; prompt : array<int64>; page_rows : int
         var at = 0l
         while (at < np) {   // alternate page-sized chunks -> physically interleaved block tables
             let hi = min(at + page_rows, np)
-            var chunk <- [for (i in range64(at, hi)); prompt[i]]
+            var inscope chunk <- [for (i in range64(at, hi)); prompt[i]]
             eval_(tr, sa, chunk)
             eval_(tr, sb, chunk)
             delete chunk
@@ -302,14 +301,13 @@ def private batch_step_gate(t : T?; tr, trg : Model; nb : int; kdt : KVDtype; to
     static_if (typeinfo builtin_module_exists(das_metal)) {
         let c = tr.config
         let vocab = c.vocab_size
-        var sa : array<Session>
-        var sb : array<Session>
+        var sa, sb : array<Session>
         var served = 0l
         with_dasllama_jobque() {
             sa |> reserve(nb)
             sb |> reserve(nb)
             for (i in range(nb)) {
-                let prompt <- encode(tr, counting_prompt(1 + i, plen + 7 * i), true, false)
+                var inscope prompt <- encode(tr, counting_prompt(1 + i, plen + 7 * i), true, false)
                 sa |> emplace <| make_run_state(c, kdt, kdt)
                 sb |> emplace <| make_run_state(c, kdt, kdt)
                 eval_(tr, sa[i], prompt)
@@ -317,8 +315,7 @@ def private batch_step_gate(t : T?; tr, trg : Model; nb : int; kdt : KVDtype; to
             }
             var wsa <- create_batch_workspace_(tr)
             var wsb <- create_batch_workspace_(tr)
-            var sessa : array<Session?>
-            var sessb : array<Session?>
+            var sessa, sessb : array<Session?>
             var cur : array<int64>
             for (i in range(nb)) {
                 unsafe {
@@ -384,8 +381,7 @@ def private batch_ff_pair(tr, trg : Model; prompts : array<array<int64>>; nsteps
         let vocab = c.vocab_size
         let nb = length(prompts)
         with_dasllama_jobque() {
-            var sa : array<Session>
-            var sb : array<Session>
+            var sa, sb : array<Session>
             sa |> reserve(nb)
             sb |> reserve(nb)
             for (i in range(nb)) {
@@ -465,7 +461,7 @@ def private paged_batch_greedy(tr, trg : Model; prompts : array<array<int64>>; p
                 let np = long_length(prompts[i])
                 let hi = min(at + page_rows, np)
                 if (at < hi) {
-                    var chunk <- [for (j in range64(at, hi)); prompts[i][j]]
+                    var inscope chunk <- [for (j in range64(at, hi)); prompts[i][j]]
                     eval_(tr, ss[i], chunk)
                     delete chunk
                 }
@@ -1192,7 +1188,7 @@ def private forced_maxd_pair(tr, trg : Model; prompt : array<int64>; nsteps : in
             for (a, b in sa.logits, sb.logits) {
                 maxd = max(maxd, abs(a - b))
             }
-            var one <- [tok]
+            var inscope one <- [tok]
             eval_(tr, sa, one)
             eval_(trg, sb, one)
             delete one

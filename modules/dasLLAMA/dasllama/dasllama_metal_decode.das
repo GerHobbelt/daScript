@@ -133,7 +133,7 @@ struct private StepRes {
     trace_mode : int64    // serving path for the step trace (0 slow / 1 poked / 2 spec)
     t_commit : int64      // trace-clock stamp at this step's cb commit (armed traces only)
     cb : MetalCommandBuffer?
-    btok : MetalBuffer?   // the argmax winner (spec steps; read back to verify the prediction)
+    btok : MetalBuffer?   // the argmax winners: a spec step's one (read back to verify the prediction), a chained draft step's one a row
     koff : uint64         // mirror arena offsets captured at encode time; arena_epoch pins the
     voff : uint64         // BUFFER those offsets index (a grow-rebuild frees it — stale pre-steps discard)
     arena_epoch : int64
@@ -739,9 +739,7 @@ def private add_single(var e : SingleLayerEnc; enc : MetalComputeEncoder?; bg : 
 
 //! the single row's expert args: one shared activation row, no stream strides
 [unused_argument(e, down)]
-def private moe_args_single(var e : SingleLayerEnc; ndim, ddim, eplane, xs, hasb : uint; down : bool) : MoeGemvArgs {
-    return MoeGemvArgs(ndim = ndim, ddim = ddim, eplane = eplane, xs = xs, ss = 0u, bxs = 0u, bys = 0u, hasb = hasb)
-}
+def private moe_args_single(var e : SingleLayerEnc; ndim, ddim, eplane, xs, hasb : uint; down : bool) : MoeGemvArgs => MoeGemvArgs(ndim = ndim, ddim = ddim, eplane = eplane, xs = xs, ss = 0u, bxs = 0u, bys = 0u, hasb = hasb)
 
 //! the single row's rope + KV store: the codec's form over the mirror's byte offsets
 def private rope_store_single(var e : SingleLayerEnc; t : Model; enc : MetalComputeEncoder?; l : int64; het, kvsh : bool;
@@ -1436,7 +1434,7 @@ struct template LayerEncT {
                     let nsh = c.n_ff_shexp
                     let she = dim * nsh
                     let bwsh1 = blob_of(g_dev, t, t.wsh1_off + l * she)
-                    if (nr == 1l) {
+                    if (SINGLE) {   //! the single-row driver's form owns bh12s; a rows driver at one row keeps its rows form
                         enc_gemv_w13sw(enc, bwsh1.buf, bwsh1.boff, uint64(((t.wsh3_off + l * she) / 32l) * 34l),
                             r.bxb, r.bh12s, r.u_dim, r.u_moe_nsh, dim, nsh, r.u_zero32)
                         enc_site_gemv(enc, t, KqFmt.q8, t.wsh2_off + l * she, dim, nsh, r.bh12s, r.bxb2, r.u_moe_nsh, r.u_dim)
@@ -1672,9 +1670,7 @@ def metal_mtp_draft_forward(t : Model; var s : Session; token, pos : int64; seam
 //! forward_mtp(..., false)'s GPU twin — the continuation-window SEAM: write the draft head's
 //! KV row pos-1 from (embed(token), the pre-window mtp_h) without touching logits or mtp_h.
 [hot_path]
-def metal_mtp_seam_row(t : Model; var s : Session; token, pos : int64) : bool {
-    return metal_mtp_draft_forward(t, s, token, pos, true)
-}
+def metal_mtp_seam_row(t : Model; var s : Session; token, pos : int64) : bool => metal_mtp_draft_forward(t, s, token, pos, true)
 
 // ===== MTP B=2 same-slab verify (the spec step's trunk forward) =====
 
@@ -1702,6 +1698,22 @@ struct private MtpVerifyGroup {
     a : int64
 }
 var private @scratch g_v_groups : array<MtpVerifyGroup>   //! the verify being encoded: the layer encoders read the rows' groups here
+var private g_chain_on = false   //! the chained draft rides ahead of the verify on its encoder: one command buffer, one join
+var private g_chain_rd : StepRes   //! the round's chained draft step; its btok row gi is group gi's winner, embedded as the verify's row 1
+
+//! the chained draft's winner buffer: one uint a row, never under the spec step's 64 bytes
+def private chain_btok_bytes(nrows : int64) : uint64 => uint64(max(nrows, 16l) * 4l)
+
+//! every group's rows at `rows` a group, group gi's at row0 = rows*gi, its position `delta` off its trunk -
+//! the draft layout (1, i-1) and the verify layout (k+1, 0), set from one place
+def private set_groups_layout(rows, delta : int64) {
+    for (gi in range64(long_length(g_v_groups))) {
+        var g & = unsafe(g_v_groups[gi])
+        g.row0 = rows * gi
+        g.nr = rows
+        g.pos = g.trunk + delta
+    }
+}
 // the one-stream round's and the batched eval's reused row arrays (borrowed session handles, cleared after the round)
 var private @scratch g_round_sessions : array<Session?>
 var private @scratch g_round_toks : array<int64>
@@ -1943,7 +1955,7 @@ def mtp_round_trace(tag : string; s : Session; pos, k, nr, a, vocab : int64) {
     to_log(LOG_INFO, "{line}\n")
 }
 
-[arch(at="../ARCHITECTURE_GPU_MTP.md#mtp-verify-draft-warm"), arch(at="../ARCHITECTURE_GPU_MTP.md#verify-serial-encoder")]
+[arch(at="../ARCHITECTURE_GPU_MTP.md#mtp-verify-draft-warm"), arch(at="../ARCHITECTURE_GPU_MTP.md#verify-serial-encoder"), arch(at="../ARCHITECTURE_GPU_MTP.md#mtp-nextn-chain")]
 def private encode_verify_step(t : Model; var r : StepRes) {
     let c = t.config
     let dim = c.dim
@@ -1952,6 +1964,20 @@ def private encode_verify_step(t : Model; var r : StepRes) {
     var brt = group_routes(t, r, nr)
     var cb = metal_new_command_buffer_unretained(g_queue)
     var enc = metal_new_compute_encoder(cb)
+    var dbrt : tuple<buf : MetalBuffer?; bytes : uint64>
+    if (g_chain_on) {
+        let gnr = g_v_groups[0].nr   //! rows a group (k+1); `nr` is every group's together
+        assert(gnr == 2l, "the chained round drafts at depth 1: two rows a group")
+        set_groups_layout(1l, -1l)   // the draft body reads the groups in the draft layout: one row a group at the trunk's seam
+        dbrt = encode_draft_rows_body(t, g_chain_rd, enc)
+        set_groups_layout(gnr, 0l)
+        let bemb = blob_of(g_dev, t, t.emb_q8_off)
+        for (gi in range64(ng)) {
+            let xoff = uint64((gnr * gi + 1l) * dim * 4l)
+            enc_embed(enc, bemb.buf, bemb.boff, g_chain_rd.btok, r.bx, r.u_dim, r.u_embscale, dim, uint64(gi * 4l), xoff)
+            enc_embed(enc, bemb.buf, bemb.boff, g_chain_rd.btok, r.bcat, r.u_dim, r.u_embscale, dim, uint64(gi * 4l), xoff)
+        }
+    }
     if (r.hc) {   // the rows' embeds open the wide residual rows; the mixers stand at the seams
         enc_hc_init(enc, r.bx, r.bhc, r.u_dim, r.u_hc, r.u_hcd_tot, nr * hc_dim(c))
     } else {
@@ -1994,6 +2020,9 @@ def private encode_verify_step(t : Model; var r : StepRes) {
     r.committed = true
     r.cb = cb
     pool_release(g_upool, brt.buf, brt.bytes)
+    if (g_chain_on) {
+        pool_release(g_upool, dbrt.buf, dbrt.bytes)
+    }
 }
 
 //! the draft head's rows prelude: [enorm(embed) ; hnorm(carry)] -> eh_proj -> the trunk-shaped block's
@@ -2204,12 +2233,11 @@ def private group_routes(t : Model; r : StepRes; nr : int64) : tuple<buf : Metal
 
 //! the caller poked bx = the rows' raw embeds, bxb2 = their carry hiddens, bcos/bsin = each row's rope row
 [arch(at="../ARCHITECTURE_GPU_MTP.md#mtp-joint-verify")]
-def private encode_draft_rows_step(t : Model; var r : StepRes) {
+//! the draft rows step's dispatches on `enc`; the route table it returns outlives the command buffer's commit
+def private encode_draft_rows_body(t : Model; var r : StepRes; enc : MetalComputeEncoder?) : tuple<buf : MetalBuffer?; bytes : uint64> {
     let c = t.config
     let nr = r.nrows
     var brt = group_routes(t, r, nr)
-    var cb = metal_new_command_buffer_unretained(g_queue)
-    var enc = metal_new_compute_encoder(cb)
     enc_draft_head_rows(t, r, enc, r.bx, nr)
     var dnw = 0l
     encode_verify_layer(t, r, enc, brt.buf, c.n_layers, r.chain_pos, dnw)
@@ -2217,7 +2245,17 @@ def private encode_draft_rows_step(t : Model; var r : StepRes) {
         enc_copy_row(enc, r.bhc, 0ul, r.bhc_save, 0ul, r.u_hcd_tot, nr * hc_dim(c))
     }
     let norm_off = t.mtp_headnorm_off >= 0l ? t.mtp_headnorm_off : t.rms_final_off
-    enc_cls_tail_rows(t, r, enc, norm_off, r.blog, nr, t.mtp_hc_head_norm_off, t.mtp_hc_head_down_off, t.mtp_hc_head_up_off)   //! three rows or more: the step always carries the pooled logits rows
+    enc_cls_tail_rows(t, r, enc, norm_off, r.blog, nr, t.mtp_hc_head_norm_off, t.mtp_hc_head_down_off, t.mtp_hc_head_up_off)   //! two rows or more: the step always carries the pooled logits rows
+    if (r.btok != null) {   //! a draft step holds btok only when it is chained
+        enc_argmax_rows(enc, r.blog, r.btok, r.u_vocab, nr)
+    }
+    return brt
+}
+
+def private encode_draft_rows_step(t : Model; var r : StepRes) {
+    var cb = metal_new_command_buffer_unretained(g_queue)
+    var enc = metal_new_compute_encoder(cb)
+    var brt = encode_draft_rows_body(t, r, enc)
     metal_end_encoding(enc)
     metal_release(enc)
     metal_commit(cb)
@@ -2277,8 +2315,9 @@ def private finish_draft_rows_step(t : Model; r : StepRes; slot : int64) : bool 
     return ok
 }
 
-[arch(at="../ARCHITECTURE_GPU_MTP.md#mtp-joint-verify")]
-def private mtp_draft_rows(t : Model; i : int64) : bool {
+//! draft step i over every warm group's row; `chain` parks it in g_chain_rd for the verify instead of joining; false on a decline
+[arch(at="../ARCHITECTURE_GPU_MTP.md#mtp-joint-verify"), arch(at="../ARCHITECTURE_GPU_MTP.md#mtp-nextn-chain")]
+def private mtp_draft_rows(t : Model; i : int64; chain : bool) : bool {
     let c = t.config
     let ng = long_length(g_v_groups)
     finish_pending_step()
@@ -2292,17 +2331,19 @@ def private mtp_draft_rows(t : Model; i : int64) : bool {
         if (mr.watermark < g.trunk || mr.cap_rows < tpos || mr.kdt != s.kv_dtype_k || mr.vdt != s.kv_dtype_v) {
             return false
         }
-        g.pos = tpos - 1l
-        g.row0 = gi
-        chain_pos = max(chain_pos, g.pos)
-        mtp_draft_prep(t, s, s.mtp_vbatch[i], g.pos)
+        chain_pos = max(chain_pos, tpos - 1l)
+        mtp_draft_prep(t, s, s.mtp_vbatch[i], tpos - 1l)
     }
+    set_groups_layout(1l, i - 1l)
     let g0 = g_v_groups[0]
-    let nrows = max(ng, 3l)
+    let nrows = max(ng, 2l)
     var r = acquire_step(t, *g0.s, g0.pos, g0.koff, g0.voff, g0.cap, [draft = true, nrows = nrows, deepest = chain_pos])
     if (!r.gpu_logits) {
         release_step(r)
         return false
+    }
+    if (chain) {
+        r.btok = pool_acquire(g_pool, g_dev, chain_btok_bytes(nrows))
     }
     r.chain_pos = chain_pos   //! the deepest row's position sizes the attention's chunks for every row
     unsafe {
@@ -2321,10 +2362,39 @@ def private mtp_draft_rows(t : Model; i : int64) : bool {
             memcpy(reinterpret<void?>(bsn + uint64(ri) * tabb), addr < void? >(s.rope_sin[0]), tabb)
         }
     }
+    if (chain) {
+        g_chain_rd = r
+        return true
+    }
     encode_draft_rows_step(t, r)
     let ok = finish_draft_rows_step(t, r, i + 1l)
     release_step(r)
     return ok
+}
+
+//! the chained draft's winners, read after the verify's join: slot gi is group gi's draft
+[arch(at="../ARCHITECTURE_GPU_MTP.md#mtp-nextn-chain")]
+def private chain_draft_land(t : Model; slot : int64) {
+    var rd = g_chain_rd
+    unsafe {
+        let tokp = reinterpret<uint?>(metal_buffer_contents(rd.btok))
+        let ab = reinterpret<uint8?>(metal_buffer_contents(g_arena))
+        for (gi in range64(long_length(g_v_groups))) {
+            var g & = unsafe(g_v_groups[gi])
+            var s & = unsafe(*g.s)
+            s.mtp_vbatch[slot] = g_env_mtp_debug == "reject" ? 0l : int64(tokp[gi])
+            land_draft_row(t, s, g.trunk - 1l, g.cap, g.koff, g.voff, ab, null, null)   //! the seam row's draft K/V reaches the host cache, as the host chain's landing wrote it
+        }
+    }
+    release_step(rd)
+    g_chain_on = false
+}
+
+//! a chained draft the round never encoded (the verify refused): the parked step goes back whole
+def private chain_draft_drop() {
+    var rd = g_chain_rd
+    release_step(rd)
+    g_chain_on = false
 }
 
 //! The speculative ROUNDS on the metal decode path, every stream at once: each stream's k drafts, ONE
@@ -2359,9 +2429,17 @@ def metal_mtp_spec_rounds(t : Model; var sessions : array<Session?>; toks : arra
             row0 = long_length(g_v_groups), koff = mr.koff, voff = mr.voff, cap = mr.cap_rows))
     }
     var drafted = long_length(g_v_groups) > 0l
-    for (i in range64(k)) {
-        break if (!drafted)
-        drafted = mtp_draft_rows(t, i)
+    //! depth 1 on a Q8_0 embedding table chains; a PLE n-gram model's rows gather reads the host's tokens before the join, so it keeps the host chain
+    let chain = drafted && k == 1l && t.emb_q8 && !has_ple_ngram(c)
+    g_chain_on = false
+    if (chain) {
+        drafted = mtp_draft_rows(t, 0l, true)
+        g_chain_on = drafted
+    } else {
+        for (i in range64(k)) {
+            break if (!drafted)
+            drafted = mtp_draft_rows(t, i, false)
+        }
     }
     if (!drafted) {
         for (g in g_v_groups) {
@@ -2372,15 +2450,15 @@ def metal_mtp_spec_rounds(t : Model; var sessions : array<Session?>; toks : arra
         }
         g_v_groups |> clear()
     }
-    for (gi in range64(long_length(g_v_groups))) {
-        var g & = unsafe(g_v_groups[gi])
+    for (g in g_v_groups) {
         var s & = unsafe(*g.s)
         s.mtp_drafted += k
+        if (chain) {   // row 1 embeds on the device from the chained winner; the host prep needs only a valid placeholder there
+            s.mtp_vbatch[1] = s.mtp_vbatch[0]
+        }
         mtp_verify_prep_n(t, s, s.mtp_vbatch, nr, g.trunk)
-        g.pos = g.trunk
-        g.nr = nr
-        g.row0 = nr * gi
     }
+    set_groups_layout(nr, 0l)
     prof_add("mtp.draft", ts_draft)
     let ng = long_length(g_v_groups)
     if (ng == 0l) {
@@ -2403,7 +2481,8 @@ def metal_mtp_spec_rounds(t : Model; var sessions : array<Session?>; toks : arra
         pmax = max(pmax, g.pos)
     }
     var r = acquire_step(t, *g0.s, g0.pos + 1l, g0.koff, g0.voff, g0.cap, [nrows = nr * ng, deepest = pmax + 1l])
-    var refused = !r.gpu_logits   // verify has no CPU classifier fallback (blog/bxf live under gpu_logits)
+    //! the verify has no CPU classifier fallback (blog/bxf live under gpu_logits); a parked draft whose arena moved under the verify's acquire holds stale offsets
+    var refused = !r.gpu_logits || (chain && g_chain_rd.arena_epoch != g_arena_epoch)
     if (!refused && r.dn) {
         let cd = dn_conv_dim(c)
         let nvh = c.ssm_dt_rank
@@ -2434,6 +2513,9 @@ def metal_mtp_spec_rounds(t : Model; var sessions : array<Session?>; toks : arra
         }
     }
     if (refused) {
+        if (chain) {
+            chain_draft_drop()
+        }
         release_step(r)
         for (gi in range64(ng)) {
             var g & = unsafe(g_v_groups[gi])
@@ -2479,6 +2561,13 @@ def metal_mtp_spec_rounds(t : Model; var sessions : array<Session?>; toks : arra
     encode_verify_step(t, r)
     prof_add("mtp.verify.enc", ts_enc)
     let vok = finish_verify_step(t, r)
+    if (chain) {
+        if (vok) {
+            chain_draft_land(t, 1l)
+        } else {   //! a failed command buffer leaves the winners and the draft's slab row undefined: nothing of the parked step lands
+            chain_draft_drop()
+        }
+    }
     if (!vok) {
         release_step(r)
         for (gi in range64(ng)) {
@@ -2634,8 +2723,8 @@ def private encode_step(t : Model; var r : StepRes; commit_now : bool; var prev_
             enc_embed(enc, bemb.buf, bemb.boff, r.btok, r.bx, r.u_dim, r.u_embscale, dim)
         } elif (spec_emb_f32(t)) {
             let bemb = plane_of(g_dev, t, t.fblob, t.tok_emb_off)
-            var kg = RowGatherArgs(c = uint(dim), add_b = 0u, add_c = 0u, total = uint(dim), scale = c.embed_scale)
-            enc_row_gather(enc, bemb.buf, bemb.boff, r.btok, g_one, 0ul, g_one, 0ul, r.bx, kg, dim)
+            var kg = GkRowGatherArgs(c = uint(dim), rows = 1u, aoff = uint(bemb.boff / 4ul), boff = 0u, coff = 0u, out_off = 0u, add_b = 0u, add_c = 0u, scale = c.embed_scale)
+            enc_row_gather(enc, bemb.buf, r.btok, g_one, g_one, r.bx, kg, dim)
         } else {
             let bembq = kq_quants_of(g_dev, t, KqFmt.k6, t.wcls_off)
             let bembs = kq_scales_of(g_dev, t, KqFmt.k6, t.wcls_off)
@@ -2754,8 +2843,8 @@ def private release_step(var r : StepRes) {   // nolint:STYLE037,STYLE038 — fl
         pool_release(g_pool, r.u_tnvh, 4ul)
         r.btape = null
     }
-    if (r.spec) {
-        pool_release(g_pool, r.btok, 64ul)
+    if (r.spec || (r.draft && r.btok != null)) {
+        pool_release(g_pool, r.btok, r.draft ? chain_btok_bytes(r.nrows) : 64ul)
     }
     pool_release(g_pool, r.bx, r.bytes_x)
     pool_release(g_pool, r.bxb, r.bytes_xb)
@@ -3075,7 +3164,7 @@ def metal_decode_forward(t : Model; var s : Session; token, pos : int64) : bool 
         // verify the GPU's greedy pick against the caller's actual token — a miss means this whole
         // step ran on the wrong embedding: drop the chained pre-step and rerun (the garbage KV row
         // sits at/above the rewound watermark, so mirror_prepare's re-upload repairs it).
-        var tokp = unsafe(reinterpret<uint?>(metal_buffer_contents(r.btok)))
+        let tokp = unsafe(reinterpret<uint?>(metal_buffer_contents(r.btok)))
         let picked = int64(unsafe(tokp[0]))
         if (picked != token) {
             g_spec_misses++
@@ -3929,8 +4018,7 @@ def batch_step_build(t : Model; ws : BatchWorkspace; var sessions : array<Sessio
     var u_fltot = u_flcap != null ? uniform_u32(uint(nrows * c.vocab_size)) : null
     // suppressed token ids pin to -1e30 after the cap (gemma4) — per live row, the CPU order
     let nsupp = long_length(t.suppress)
-    var bsupp : MetalBuffer?
-    var u_nsupp : MetalBuffer?
+    var bsupp, u_nsupp : MetalBuffer?
     if (gpu_logits && nsupp > 0l) {
         bsupp = pool_acquire_untracked(g_upool, g_dev, uint64(nsupp * 4l))
         unsafe {

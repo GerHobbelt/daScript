@@ -44,7 +44,9 @@ the module declares every such buffer `@exact_size` and sizes it through a reser
 - **`dasllama_common.das`** - the engine: `Model`/`Session`/`Config`, the forward loops, the
   override registries (the accept walk's row-sampler seam among them), the runtime knobs,
   `SamplingParams` (the struct a `Session` points at, so a speculative round draws with its
-  caller's sampler), and the MTP per-position accept telemetry (`mtp_pos_*`) the round-override
+  caller's sampler), `TokenConstraint` (the abstract token admission a `Session` borrows a pointer
+  to) and `TokenConstraintBox` (its owner, freed with the request or stream that holds it), and the
+  MTP per-position accept telemetry (`mtp_pos_*`) the round-override
   registry's rounds feed. The standard attention's Config-keyed arms live beside it - the gated
   projection (`q_gated`: a 2x-wide q whose second half sigmoid-gates the output) among them - one
   kernel every arch shares, its arms chosen by the model's flags. **Not** the load walk (`ARCHITECTURE_ENGINE_FORMATS.md#the-load-and-image-rail`) and **not** GPU residency
@@ -109,7 +111,18 @@ the module declares every such buffer `@exact_size` and sizes it through a reser
   top-k off or past the cap takes the vocab-wide reference path, which is also the fast path's
   parity oracle in `tests/test_sampling.das`. It registers the accept walk's row sampler
   (`register_mtp_sample_row`) at init, and that registration is the only way the engine reaches
-  this file.
+  this file. A `Session` may carry a `TokenConstraint` (`dasllama_common`'s abstract class: `admits`
+  asks whether a token may come next, `commit` advances past the one emitted); the sampler never
+  emits a token it refuses - the greedy pick probes the argmax, then the `CONSTRAINED_PROBE_K`
+  largest, then the whole row in logit order, and the sampled path draws over its candidate list
+  (capped at `SAMPLE_TOPK_FAST_CAP`, where an unconstrained draw past the cap takes the vocab-wide
+  path) unconstrained first, one probe when the pick is admitted, and on a refused pick filters the
+  list to the admitted candidates and draws again over them alone - and commits what it emits. A state no token extends is a dead end: the
+  sampler returns -1, sets `Session.constrain_dead` and commits nothing, and every caller that
+  feeds tokens back (the generation drivers, the scheduler) stops there instead of feeding -1. A
+  constrained stream reads as sampled (`Session.sampled`), since its pick can differ from the raw
+  argmax, so every greedy-chain shortcut stands down for it. The engine knows only the class; the
+  grammar behind it is the server's (`utils/dasllama-server/constraints.das` over `modules/dasLR1`).
 - **`dasllama_ple.das`** - gemma-4 E-series per-layer embeddings and the gemma4 MoE FFN. The
   forward sequence reaches it only through the hooks it registers at init. The Metal token-table
   gather (`dasllama_metal_prefill.das`) carries one format list in three places - the compiled
@@ -121,7 +134,7 @@ the module declares every such buffer `@exact_size` and sizes it through a reser
   belong here; a knob that does and is missing is an image-aliasing bug.
 - **`dasllama_tools.das`** - the per-ToolMode tool wire codecs (definition serializers,
   replay/result text builders, reply parsers; Harmony namespace/channels, gemma-4 DSL, mistral
-  control tokens, llama JSON). Every byte of tool wire text is produced here - pure string+JSON
+  control tokens, llama JSON, the `<function=NAME>` blocks of Qwen3.5 and 3.6). Every byte of tool wire text is produced here - pure string+JSON
   functions, model-free testable; the chat layer assembles the output into ChatParts and the
   server parses through the parsers.
 - **`dasllama_chat.das`** - conversation turns and chat-template application. Per-arch template

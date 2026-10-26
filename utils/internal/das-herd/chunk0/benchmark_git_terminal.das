@@ -51,9 +51,7 @@ def private percentile_us(var values : array<int64>; numerator : int) : int64 {
 }
 
 def private summarize(samples : array<GitProbeSample> const) : LaneSummary {
-    var total : array<int64>
-    var exit : array<int64>
-    var first : array<int64>
+    var total, exit, first : array<int64>
     total |> reserve(length(samples))
     exit |> reserve(length(samples))
     first |> reserve(length(samples))
@@ -95,7 +93,7 @@ def private sample_ok(command : GitProbeCommand const;
 
 def private run_lane(command : GitProbeCommand const; lane : GitProbeLane;
                      warmup, rounds : int; root : string;
-                     var result_file : FILE const?) : LaneSummary {
+                     result_file : FILE const?) : LaneSummary {
     var samples : array<GitProbeSample>
     samples |> reserve(rounds)
     let prefix = "{command.name}_{lane_name(lane)}"
@@ -156,7 +154,7 @@ def main() : int {
         return 2
     }
     let result_path = path_join(root, "samples.tsv")
-    var result_file = fopen(result_path, "wb")
+    let result_file = fopen(result_path, "wb")
     if (result_file == null) {
         print("could not create results file: {result_path}\n")
         return 2
@@ -172,7 +170,7 @@ def main() : int {
     print("drain policy: 250000us quiet after root-process exit\n")
     var ok = true
     for (command in make_git_probe_commands(cfg.repository)) {
-        var summaries : array<LaneSummary>
+        var inscope summaries : array<LaneSummary>
         summaries |> reserve(3)
         for (lane in [GitProbeLane.direct_capture,
                       GitProbeLane.direct_logged,

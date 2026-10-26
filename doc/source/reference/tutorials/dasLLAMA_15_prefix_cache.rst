@@ -37,13 +37,24 @@ every full page of it. The preview string is only a label for dashboards:
 .. code-block:: das
 
    var pool <- create_kv_pool(m, 16l)
-   var cache <- create_prefix_cache()
+   var cache <- create_prefix_cache(0l, DEFAULT_PREFIX_STATES, 1024l * 1048576l)   // a recurrent model's checkpoints: up to 16 within 1 GB
 
    let p1 <- encode(m, "{SYSTEM}{Q1}")
    var s1 = create_session(m, pool)
    eval(m, s1, p1)
    prefix_insert(cache, pool, s1, p1, "system prompt")
    release_kv_pages(s1)
+
+Before B takes anything, we ask the cache how much of B's prompt it holds.
+``prefix_match_len`` answers with the count ``prefix_attach`` would attach
+right now, and it attaches nothing and touches no entry. A server uses it to
+decide what a request must still bring - the rows of a picture the cache
+already holds need no encode:
+
+.. code-block:: das
+
+   let p2 <- encode(m, "{SYSTEM}{Q2}")
+   print("the cache holds {prefix_match_len(cache, pool, p2)} of B's leading tokens\n")
 
 Stream B starts fresh from the same pool. ``prefix_attach`` walks B's prompt
 against the cached chains: matched pages join B's page table, B's ``n_past``
@@ -52,7 +63,6 @@ short of the prompt — the model still needs one eval to make logits:
 
 .. code-block:: das
 
-   let p2 <- encode(m, "{SYSTEM}{Q2}")
    var s2 = create_session(m, pool)
    let matched = prefix_attach(cache, pool, s2, p2)
    // eval() only p2[matched..] — the matched pages are already KV
@@ -89,13 +99,17 @@ no such state it is always 0 - the pages are already the cache:
    if (stop > 0l) {
        let head <- [for (i in range64(matched, stop)); turn.toks[i]]
        eval(m, s, head)
-       prefix_insert(cache, pool, s, turn.toks)   // a checkpoint at `stop`
+       prefix_insert(cache, pool, s, turn.toks, "", true)   // a checkpoint at `stop`: an opening
    }
    // eval() the rest of turn.toks from s.n_past on
 
 ``prefix_insert`` on such a model records where the session stands, so we call
-it between two ``eval`` calls. Tutorial 13's scheduler does the same when a
-request carries ``stable_at`` - set it from ``turn.opening``.
+it between two ``eval`` calls; ``opening = true`` marks the checkpoint as one every
+conversation on this system prompt shares, which the budget drops after any
+conversation's own. The server's scheduler stops the same way, at up to four
+places a request names (the opening's shared head, the system opening, the
+request's own stable stop, its last message's close), within a byte budget - a quarter
+of the box's RAM unless ``--prefix-state-mb`` says otherwise.
 
 What the cache holds, and giving it back
 ========================================

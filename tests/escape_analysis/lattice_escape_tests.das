@@ -19,6 +19,7 @@
 // result. [NEW] marks behavior the unified lattice added (shared-but-freeable aliases; caller frees a
 // fresh-owned return value) - now implemented and passing.
 options gen2
+options _nolint = "LINT003"   // escape analysis scope-frees only a var pointer: the `new` locals stay var
 options persistent_heap
 options no_optimization
 options force_escape_free = true
@@ -52,9 +53,7 @@ def sum_alias_local() : int {
 
 // [NEW] return ownership: the callee allocates and returns it (FreshOwned), so the CALLER
 // owns `x` and frees it at scope exit - even though x's init is a call, not a `new`.
-def make_node(i : int) : Node? {
-    return new Node(x = i, y = i * 2)
-}
+def make_node(i : int) : Node? => new Node(x = i, y = i * 2)
 def sum_return_owned() : int {
     var total = 0
     for (i in range(N)) {

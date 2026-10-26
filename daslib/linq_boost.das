@@ -100,7 +100,7 @@ class private AstCallMacro_LinqPred2 : AstCallMacro {
         var iterType = clone_iterator_type(arg0type)
         var bucketBind = "_"
         if (call.arguments[1] is ExprMakeBlock) {
-            var bblk = (call.arguments[1] as ExprMakeBlock)._block
+            let bblk = (call.arguments[1] as ExprMakeBlock)._block
             if (bblk != null && bblk is ExprBlock && length((bblk as ExprBlock).arguments) == 1) {
                 bucketBind = string((bblk as ExprBlock).arguments[0].name)
             }
@@ -500,18 +500,15 @@ class private AstCallMacro_LinqJoinBase : AstCallMacro {
         res.force_at(call.at)
         return res
     }
-    def result_param1_type(iterTypeB : TypeDeclPtr; at : LineInfo) : TypeDeclPtr {
-        return null
-    }
+    def result_param1_type(iterTypeB : TypeDeclPtr; at : LineInfo) : TypeDeclPtr => null
 }
 
 [call_macro(name="_join")]
 class private LinqJoin : AstCallMacro_LinqJoinBase {
     //! implements _join(srca, srcb, on, result) shorthand notation that expands into join(srca, srcb, keya, keyb, result).
     override fnName = "join"
-    def override result_param1_type(iterTypeB : TypeDeclPtr; at : LineInfo) : TypeDeclPtr {
-        return clone_type(iterTypeB)
-    }
+    def override result_param1_type(iterTypeB : TypeDeclPtr; at : LineInfo) : TypeDeclPtr =>
+        clone_type(iterTypeB)
 }
 
 [call_macro(name="_group_join")]

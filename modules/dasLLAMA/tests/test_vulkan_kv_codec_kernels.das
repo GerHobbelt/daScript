@@ -14,7 +14,7 @@ require _compares
 require dasllama/dasllama_common
 require daslib/f16_cvt   // nolint:STYLE030,LINT019 — used only inside the vulkan static_if arms; the no-vulkan lane sees it unused
 require daslib/algorithm
-require math
+require math   // nolint:STYLE030,LINT019 - used only inside the vulkan static_if arms (a build without the module drops them)
 
 //! The Vulkan K/V mirror's quant codecs against the CPU cache's own codec (a Vulkan device, else the cells skip): the stores'
 //! bytes against `kv_store_row`, every byte outside the stored rows left at its fill; the decode attention's codec stamps
@@ -319,8 +319,7 @@ def private shadow_arm(t : T?; kv : KVDtype; kvd : int) {
             }
             var got_k <- cp |> plane_as(planes[2], type<uint16>, halves)
             var got_v <- cp |> plane_as(planes[3], type<uint16>, halves)
-            var want_k : array<uint16>
-            var want_v : array<uint16>
+            var want_k, want_v : array<uint16>
             want_k |> resize(halves)
             want_v |> resize(halves)
             want_k |> fill(HALF_NAN)

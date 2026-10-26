@@ -744,9 +744,7 @@ def register_devw_kq_mirror(f : DevwKqMirrorFn) {
 
 //! Can this model's streamed build mint the metal blob flavor? False on an unregistered layout
 //! module too — a caller without the hooks takes the planar rail rather than a wrong image.
-def blob_stream_eligible(t : Model) : bool {
-    return g_blob_hooks_set && invoke(g_blob_eligible, t)
-}
+def blob_stream_eligible(t : Model) : bool => g_blob_hooks_set && invoke(g_blob_eligible, t)
 
 //! Every Model plane field a blob build puts in its device form, in Model.blob_scaled bit order.
 let BLOB_SCALE_PLANES = fixed_array("k4s", "k5s", "k6s", "iq4xss", "k3s", "iq3ss", "iq3xxss",
@@ -1172,8 +1170,7 @@ def fill_devwf16_plane(m : GGUFMeta; bytes : array<uint8> | #; var t : Model;
     verify(length(mine) == length(t.devwf16_key))
     var temp_q8 : array<int8>
     var temp_sf : array<float>
-    var temp_kq : array<uint8>
-    var temp_ks : array<uint8>
+    var temp_kq, temp_ks : array<uint8>
     var scratch : array<float>
     var panel : array<float16>
     var ok = true
@@ -1825,6 +1822,8 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
             panic("dasLLAMA: {arch}.block_count = {layers + nextn_in} with nextn_predict_layers = {nextn_in} leaves no trunk layers")
         }
         t.config.n_layer_nextn = nextn
+        //! an embedding model names its pooling (Qwen3-Embedding: last); a chat model used as an embedder keeps the mean
+        t.config.pooling = gguf_int_or(m, bytes, "{arch}.pooling_type", POOLING_MEAN)
         // FFN width: a scalar for uniform arches, or a per-layer array (gemma-4 E2B: the elastic
         // MatFormer sub-model, 6144 for layers 0-14 then 12288). ffn_w holds the per-layer widths;
         // hidden_dim is the MAX (scratch sizing). Set before layout_offsets so the offsets vary per layer.

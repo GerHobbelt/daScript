@@ -157,6 +157,15 @@ def test_ctx_clamp_to_device_room(t : T?) {
     delete m
 }
 
+//! The interface the front binds: unset reads loopback (this machine alone), a configured one stands as given.
+[test]
+def test_bind_host_defaults_to_loopback(t : T?) {
+    t |> equal("127.0.0.1", DEFAULT_BIND_HOST, "the default is loopback")
+    t |> equal(DEFAULT_BIND_HOST, bind_host(""), "an unset host binds loopback")
+    t |> equal("0.0.0.0", bind_host("0.0.0.0"), "a configured host binds as given")
+    t |> equal("192.168.1.20", bind_host("192.168.1.20"), "... whatever address it names")
+}
+
 //! The K/V codec a slot runs on, which the live-load clamp reads too: a slot that asked for none inherits the server default
 //! (never SlotOpts' f16 seed), one that asked keeps its own.
 [test]
@@ -210,6 +219,40 @@ def test_speech_roster_from_toml(t : T?) {
         t |> success(apply_config(saved), "the authoritative config reads")
         set_cli_source("asr_workers", false)
         t |> equal(saved.asr_workers, 2, "an authoritative config wins over the flag")
+    }
+    remove(path)
+}
+
+//! The audio tower's two spellings: `--audio-mmproj` on the command line and `audio_mmproj` in the config, the flag
+//! winning over a config that is not authoritative.
+[test]
+def test_audio_mmproj_flag_and_key(t : T?) {
+    t |> run("--audio-mmproj parses onto the server's arguments") @(t : T?) {
+        let r <- parse_args(type<ServerArgs>, ["--audio-mmproj", "au.gguf", "--image-mmproj", "v.gguf"])
+        t |> success(r |> is_ok, "the flags parse")
+        if (r |> is_ok) {
+            let cfg = r |> unwrap
+            t |> equal(cfg.audio_mmproj, "au.gguf")
+            t |> equal(cfg.image_mmproj, "v.gguf", "and stays apart from the vision flag")
+        }
+    }
+    let path = path_join(test_temp_dir(), "audio_mmproj.toml")
+    t |> run("the config's audio_mmproj lands, under a flag only when the config is authoritative") @(t : T?) {
+        t |> success(fwrite(path, "audio_mmproj = \"toml.gguf\"\n"), "wrote the config")
+        var plain = ServerArgs(config = path)
+        t |> success(apply_config(plain), "the config reads")
+        t |> equal(plain.audio_mmproj, "toml.gguf", "no flag: the key is the arm")
+        var flagged = ServerArgs(config = path, audio_mmproj = "cli.gguf")
+        set_cli_source("audio_mmproj", true)
+        t |> success(apply_config(flagged), "the config reads")
+        set_cli_source("audio_mmproj", false)
+        t |> equal(flagged.audio_mmproj, "cli.gguf", "the flag wins over a config that is not authoritative")
+        t |> success(fwrite(path, "authoritative = true\naudio_mmproj = \"toml.gguf\"\n"), "wrote the authoritative config")
+        var saved = ServerArgs(config = path, audio_mmproj = "cli.gguf")
+        set_cli_source("audio_mmproj", true)
+        t |> success(apply_config(saved), "the authoritative config reads")
+        set_cli_source("audio_mmproj", false)
+        t |> equal(saved.audio_mmproj, "toml.gguf", "an authoritative config wins over the flag")
     }
     remove(path)
 }

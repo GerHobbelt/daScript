@@ -325,7 +325,7 @@ def document_module_openai(_root : string) {
         group_by_regex("Audio (TTS and STT)", mod, %regex~(speech|speak|transcribe|translate)$%%),
         group_by_regex("Moderations", mod, %regex~(moderations)$%%),
         group_by_regex("Image generation", mod, %regex~(generate_image)$%%),
-        group_by_regex("Vision", mod, %regex~(chat_vision|vision_request_body|image_file_data_uri)$%%)
+        group_by_regex("Vision", mod, %regex~(chat_vision|chat_audio|vision_request_body|audio_request_body|image_file_data_uri|file_base64)$%%)
     )
     documents("OpenAI-compatible API client (chat, embeddings, audio, vision, ...)", mod, "openai.rst", groups)
 }
@@ -343,15 +343,15 @@ def document_module_dasllama(_root : string) {
     var mod = find_module("dasllama")
     var groups <- array<DocGroup>(
         group_by_regex("Model loading and sessions", mod, %regex~(load_model|create_session|create_kv_pool|release_kv_pages|create_batch_workspace|setup_dasllama_jobque|with_dasllama_jobque|caps|mtp_drafter_sidecar|attach_mtp_drafter|mtp_capable)$%%),
-        group_by_regex("Prefix cache", mod, %regex~(create_prefix_cache|prefix_attach|prefix_insert|prefix_checkpoint_at|prefix_release|prefix_held_groups|prefix_chain_list)$%%),
+        group_by_regex("Prefix cache", mod, %regex~(create_prefix_cache|prefix_attach|prefix_insert|prefix_checkpoint_at|prefix_match_len|prefix_release|prefix_held_groups|prefix_chain_list)$%%),
         group_by_regex("Tokenizer", mod, %regex~(encode|decode|piece)$%%),
-        group_by_regex("Evaluation and sampling", mod, %regex~(eval|eval_embd|eval_embd_span|eval_embd_span_mrope|eval_batch|sample|set_seed|stats)$%%),
+        group_by_regex("Evaluation and sampling", mod, %regex~(eval|eval_embd|eval_embd_span|eval_embd_span_mrope|eval_embd_body|media_body_rows|eval_batch|sample|set_seed|stats)$%%),
         group_by_regex("Generation", mod, %regex~(generate|generate_embd)$%%),
         group_by_regex("Embeddings", mod, %regex~(embed)$%%),
         group_by_regex("Vision and audio encoders", mod, %regex~(encode_image|encode_audio)$%%),
-        group_by_regex("Chat", mod, %regex~(create_chat|create_chat_renderer|add_user|add_user_audio|add_user_image|add_user_image_rows|add_user_audio_rows|add_assistant|render_turn|render_turn_marked|render_turn_image|render_turn_audio|render_assistant|render_close|respond|set_thinking)$%%),
+        group_by_regex("Chat", mod, %regex~(create_chat|create_chat_renderer|add_user|add_user_audio|add_user_image|add_user_image_rows|add_user_audio_rows|add_user_span|set_chat_date|add_assistant|render_turn|render_turn_marked|render_turn_image|render_turn_audio|render_assistant|render_user|render_close|respond|set_thinking)$%%),
         group_by_regex("Tool calling", mod, %regex~(set_tools|add_tool_results|render_assistant_calls|parse_calls)$%%),
-        group_by_regex("Reasoning (thinking models)", mod, %regex~(split_reasoning|make_think_stream|think_feed|think_finish|think_drain|effective_stop_ids|turn_stop_ids|make_nothink_guard|nothink_stop_here)$%%),
+        group_by_regex("Reasoning (thinking models)", mod, %regex~(split_reasoning|set_preserve_thinking|set_reasoning_effort|make_think_stream|think_feed|think_finish|think_drain|effective_stop_ids|turn_stop_ids|make_nothink_guard|nothink_stop_here)$%%),
         group_by_regex("Operations: prepared images and dispatch", mod, %regex~(dlim_inventory|dlim_clean|set_dispatch_worker_limit|get_dispatch_worker_limit|set_jobque_spin_us|get_jobque_spin_us|set_jobque_spin_gpu_us|get_jobque_spin_gpu_us|get_jobque_spin_in_force|set_single_thread|get_single_thread|select_matmul_backend_for_load|kernel_backend_available)$%%),
         group_by_regex("Operations: GPU tier and model slots", mod, %regex~(gpu_tier_status|set_gpu_tier_want|moe_gpu_tier_arm|moe_gpu_weight_budget|gpu_model_marks_init|gpu_slot_capture|gpu_slot_rearm|moe_gpu_model_marks_save|moe_gpu_model_marks_restore|moe_gpu_hydrate_session|moe_gpu_drop_model|set_resident_prefill_allowed|resident_prefill_allowed)$%%),
         group_by_regex("Operations: serving from the device", mod, %regex~(create_device_session|gpu_device_sessions|gpu_dn_room|gpu_device_prefill_continues|gpu_device_prefill_window|gpu_device_kv_park|gpu_device_kv_adopt|gpu_device_session_ctx|gpu_device_session_dtype|set_gpu_resident_regions|set_gpu_ctx_max|set_gpu_ctx_strict|gpu_ctx_pins|set_gpu_kv_dtype|gpu_kv_dtype_pin|reset_gpu_kv_dtype|gpu_resident_decline|gpu_resident_experts_host|gpu_cpu_passes|device_kv_max_rows)$%%)
@@ -402,7 +402,7 @@ def document_module_dasllama(_root : string) {
         dasllama_type_stanza(f, "struct-dasllama_vision_embedder-VisionState", "VisionState",
             "Caller-owned scratch for the embedder forward of whichever family is carried: the buffers ``encode_image`` reuses across calls. One per embedder user; holds no image state between calls.")
         dasllama_type_stanza(f, "struct-dasllama_audio_embedder-AudioEmbedder", "AudioEmbedder",
-            "A loaded audio encoder of whatever family the mmproj GGUF turned out to be (gemma4a — the gemma-4 E-series Conformer), as produced by ``load_audio_embedder``, which probes the file; ``audio_probe_proj_dim`` answers 0 where absence is an answer. ``audio_proj_dim`` must match the decoder's embedding width. The server's media worker owns one per armed slot.")
+            "A loaded audio encoder of whatever family the mmproj GGUF turned out to be (gemma4a — the gemma-4 E-series Conformer; or a whisper-class tower that ``load_audio_tower`` also serves — qwen2-audio, qwen2.5-omni, ultravox, voxtral), as produced by ``load_audio_embedder``, which probes the file; ``audio_probe_proj_dim`` answers 0 where absence is an answer. ``audio_proj_dim`` must match the decoder's embedding width. The server's media worker owns one per armed slot.")
         dasllama_type_stanza(f, "struct-dasllama_audio_embedder-AudioState", "AudioState",
             "Caller-owned scratch for the audio encoder forward of whichever family is carried: the buffers ``encode_audio`` reuses across calls. One per embedder user; holds no clip state between calls.")
         dasllama_type_stanza(f, "struct-dasllama_image-DlimImageInfo", "DlimImageInfo",
@@ -1366,7 +1366,7 @@ def document_module_dap(_root : string) {
 def document_module_das_source_formatter(_root : string) {
     var mod = find_module("das_source_formatter")
     var groups <- array<DocGroup>(
-        group_by_regex("Formatting", mod, %regex~(format_das_string|format_source_string|format_source)$%%)
+        group_by_regex("Formatting", mod, %regex~(format_das_string|format_source_string|format_source|wrap_long_lines)$%%)
     )
     document("Source code formatter", mod, "das_source_formatter.rst", groups)
 }
@@ -1436,11 +1436,12 @@ def document_module_lint(_root : string) {
 def document_module_lint_config(_root : string) {
     var mod = find_module("lint_config")
     var groups <- array<DocGroup>(
-        group_by_regex("Configuration", mod, %regex~(load_lint_config|load_lint_config_from_path|load_env_disabled|seed_default_disabled|build_lint_macro_disabled|add_module_rule_overrides|lint_config_forces_on|rule_docs_only_at)$%%),
+        group_by_regex("Configuration", mod, %regex~(load_lint_config|load_lint_config_from_path|load_env_disabled|seed_default_disabled|build_lint_macro_disabled|add_module_rule_overrides|lint_config_forces_on|rule_docs_only_at|lint_configs_for)$%%),
         group_by_regex("Path excludes", mod, %regex~(load_path_excludes_from_path|matches_path_excludes|is_lint_path_excluded)$%%),
         group_by_regex("Path-based rule defaults", mod, %regex~(is_daslib_source|is_shipped_library_source|is_core_library_source|lint029_source_exempt)$%%),
-        group_by_regex("Lint-surface predicates", mod, %regex~(is_user_authored_body|is_lint_fixture_name|lint_file_skip_reason)$%%),
+        group_by_regex("Lint-surface predicates", mod, %regex~(is_user_authored_body|is_lint_fixture_name|lint_file_skip_reason|drop_skipped_file_issues)$%%),
         group_by_regex("Structured findings", mod, %regex~(make_lint_issue)$%%),
+        group_by_regex("Fixes", mod, %regex~(apply_lint_fixes|lint_source_line)$%%),
         group_by_regex("Format policy", mod, %regex~(format_policy_for|partition_by_format_policy)$%%)
     )
     document("Repo-level lint configuration", mod, "lint_config.rst", groups)

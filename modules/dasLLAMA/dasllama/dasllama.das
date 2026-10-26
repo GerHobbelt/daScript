@@ -103,11 +103,11 @@ def release_kv_pages(var session : Session) {
     release_kv_pages_(session)
 }
 
-def create_prefix_cache(max_groups : int64 = 0l; max_states : int64 = DEFAULT_PREFIX_STATES) : PrefixCache {
-    //! Create a prefix cache for the paged sessions of one ``create_kv_pool`` pool: streams donate KV pages
-    //! (``prefix_insert``), later requests with the same prefix attach them (``prefix_attach``). ``max_groups`` caps
-    //! retained groups (0 = unbounded); a recurrent model keeps at most ``max_states`` whole checkpoints instead.
-    return <- create_prefix_cache_(max_groups, max_states)
+def create_prefix_cache(max_groups : int64 = 0l; max_states : int64 = DEFAULT_PREFIX_STATES; max_state_bytes : int64 = 0l) : PrefixCache {
+    //! A prefix cache for one ``create_kv_pool`` pool: streams donate KV pages (``prefix_insert``), later requests
+    //! with the same prefix attach them (``prefix_attach``); ``max_groups`` caps the pages (0 = unbounded). A recurrent
+    //! model keeps whole checkpoints instead: ``max_states`` within ``max_state_bytes`` (0 = the count alone).
+    return <- create_prefix_cache_(max_groups, max_states, max_state_bytes)
 }
 
 def prefix_checkpoint_at(cache : PrefixCache; pool : KVPool; session : Session; prompt : array<int64>; matched : int64; stable_at : int64 = 0l) : int64 {
@@ -117,6 +117,12 @@ def prefix_checkpoint_at(cache : PrefixCache; pool : KVPool; session : Session; 
     return prefix_checkpoint_at_(cache, pool, session, prompt, matched, stable_at)
 }
 
+def prefix_match_len(cache : PrefixCache; pool : KVPool; prompt : array<int64>) : int64 {
+    //! How many leading positions of ``prompt`` a ``prefix_attach`` would attach right now, attaching nothing: a probe
+    //! for a caller deciding what a request must bring (a media span's rows). 0 on a recurrent model's cache.
+    return prefix_match_len_(cache, pool, prompt)
+}
+
 def prefix_attach(var cache : PrefixCache; var pool : KVPool; var session : Session; prompt : array<int64>) : int64 {
     //! Attach the longest cached prefix of ``prompt`` to a FRESH paged ``session`` of ``pool``:
     //! matched pages join the session's block table and ``n_past`` advances past them, so the
@@ -124,11 +130,11 @@ def prefix_attach(var cache : PrefixCache; var pool : KVPool; var session : Sess
     return prefix_attach_(cache, pool, session, prompt)
 }
 
-def prefix_insert(var cache : PrefixCache; var pool : KVPool; var session : Session; tokens : array<int64>; preview : string = "") {
-    //! Donate a session's KV pages to the cache. ``tokens`` is its EVALED history (the first ``n_past`` rows exist);
-    //! every full page not already cached survives ``release_kv_pages``, ``preview`` labels the chain. On a
-    //! recurrent model the donation is one checkpoint at ``n_past``, and may be taken between two prefill calls.
-    prefix_insert_(cache, pool, session, tokens, preview)
+def prefix_insert(var cache : PrefixCache; var pool : KVPool; var session : Session; tokens : array<int64>; preview : string = ""; opening : bool = false) {
+    //! Donate a session's KV pages to the cache: ``tokens`` is its EVALED history (the first ``n_past`` rows exist), every
+    //! full page not already cached survives ``release_kv_pages``, ``preview`` labels the chain. A recurrent model donates
+    //! one checkpoint at ``n_past``: ``opening`` marks one taken between prefill calls, kept ahead of finished turns' tails.
+    prefix_insert_(cache, pool, session, tokens, preview, opening)
 }
 
 def prefix_chain_list(cache : PrefixCache) : array<PrefixChain> {
@@ -179,6 +185,18 @@ def eval_embd(model : Model; var session : Session; embd : array<float>; npos : 
     //! token-major) at the session's current position and advance it — the multimodal splice entry.
     //! ``non_causal`` marks the whole call as one image span (gemma vision); audio rows stay causal.
     eval_embd_(model, session, embd, npos, non_causal)
+}
+
+def eval_embd_body(model : Model; var session : Session; embd : array<float>; npos, span_lo, span_hi : int64; grid : int2) {
+    //! Prefill ``npos`` rows built by ``media_body_rows``: [span_lo, span_hi) a non-causal span (empty = every row
+    //! causal), roped on a merged image ``grid`` where one is given.
+    eval_embd_body_(model, session, embd, npos, span_lo, span_hi, grid)
+}
+
+def media_body_rows(model : Model; var session : Session; head : array<int64>; rows : array<float>; n_media, src_w : int64;
+                    tail : array<int64>; var embd : array<float>) {
+    //! One prefill body's rows for ``eval_embd_body`` on ``session``: ``head`` text, ``n_media`` media rows of width ``src_w``, ``tail`` text.
+    media_body_rows_(model, session, head, rows, n_media, src_w, tail, embd)
 }
 
 def eval_embd_span(model : Model; var session : Session; embd : array<float>; npos, span_lo, span_hi : int64) {
@@ -265,11 +283,11 @@ def generate_embd(model : Model; var session : Session; embd : array<float>; npo
 
 // ===== Embeddings =====
 
-def embed(model : Model; text : string) : array<float> {
-    //! Mean-pooled, L2-normalized sentence embedding of ``text`` (``model.config.dim`` floats): the
-    //! decoder's last-layer hidden state (post-final RMSNorm), averaged then unit-normalized. A
-    //! decoder-only model used this way yields RAG-grade vectors, not a dedicated embedder's.
-    return <- embed_(model, text)
+def embed(model : Model; text : string; pooling : int64 = -1l; dims : int64 = 0l) : array<float> {
+    //! L2-normalized sentence embedding of ``text`` (``model.config.dim`` floats, or the leading ``dims`` renormalized - the
+    //! Matryoshka read) from the decoder's post-final-norm hidden rows, pooled the way the file's ``pooling_type`` asks (mean; the
+    //! last row for Qwen3-Embedding) unless ``pooling`` names one (``POOLING_MEAN`` / ``POOLING_CLS`` / ``POOLING_LAST``; -1 = the file's).
+    return <- embed_(model, text, pooling < 0l ? model.config.pooling : pooling, dims)
 }
 
 // ===== Chat =====
@@ -321,11 +339,24 @@ def add_user_image_rows(model : Model; var chat : ChatSession; var rows : array<
     add_user_image_rows_(model, chat, rows, n_rows, grid)
 }
 
-def add_user_audio_rows(model : Model; var chat : ChatSession; var rows : array<float>; n_rows : int64) {
-    //! Queue PRE-ENCODED audio soft-token rows (what ``encode_audio`` emits — ``dim``-wide on
-    //! every family, length-checked) for the next ``respond``. MOVES ``rows``; works on a plain
-    //! chat — no tower needed: the carrier-served families (the gemma-4 E-series) hear this way.
-    add_user_audio_rows_(model, chat, rows, n_rows)
+def set_chat_date(date : string) {
+    //! Pin the date a Llama-3.1+ system turn states (``"26 Jul 2024"``); ``""`` returns it to the day the turn
+    //! renders. For a prompt that must not move with the calendar - a pinned test stream, a benchmark.
+    set_chat_date_(date)
+}
+
+def add_user_span(model : Model; var chat : ChatSession; key : uint64; n_rows : int64; text_before : int; is_image : bool; bare : bool = false) {
+    //! Mark the pending user turn as carrying a media span inline: ``render_turn`` and ``render_assistant`` then lay
+    //! ``n_rows`` position ids (``media_position_id`` over the media's content ``key``) where the media sits,
+    //! ``text_before`` bytes into the turn's text. The rows themselves are the caller's to eval at those positions.
+    add_user_span_(model, chat, key, n_rows, text_before, is_image, bare)
+}
+
+def add_user_audio_rows(model : Model; var chat : ChatSession; var rows : array<float>; n_rows : int64; bare : bool = false) {
+    //! Queue PRE-ENCODED audio soft-token rows (what ``encode_audio`` emits — ``dim``-wide, length-checked) for the
+    //! next ``respond``. MOVES ``rows``; works on a plain chat, no tower needed. Pass the encoder's
+    //! ``audio_span_bare`` as ``bare``: an ultravox span takes no marker, so a stock template serves it.
+    add_user_audio_rows_(model, chat, rows, n_rows, bare)
 }
 
 def encode_image(embedder : VisionEmbedder; var scratch : VisionState; img : VisionImage;
@@ -377,25 +408,32 @@ def render_turn_marked(model : Model; chat : ChatSession) : RenderedTurn {
     return <- render_turn_marked_(model, chat)
 }
 
-def render_turn_image(model : Model; chat : ChatSession; var head : array<int64>; var tail : array<int64>) {
-    //! ``render_turn``'s IMAGE twin: the turn's prefill as the two token spans that bracket the
-    //! image soft-token splice — ``head`` before the rows, ``tail`` after. Render-only (no KV, no
-    //! embedder): the rows come from ``encode_image``, and a scheduler prefills head, rows, tail.
-    render_turn_image_(model, chat, head, tail)
+def render_turn_image(model : Model; chat : ChatSession; var head : array<int64>; var tail : array<int64>; text_before : int = 0) {
+    //! ``render_turn``'s IMAGE twin: the two token spans that bracket the image soft-token splice — ``head`` before the
+    //! rows, ``tail`` after. Render-only (no KV, no embedder): the rows come from ``encode_image``.
+    //! ``text_before`` bytes of the user text render ahead of the image (0: the image leads the turn).
+    render_turn_image_(model, chat, head, tail, text_before)
 }
 
-def render_turn_audio(model : Model; chat : ChatSession; var head : array<int64>; var tail : array<int64>) {
+def render_turn_audio(model : Model; chat : ChatSession; var head : array<int64>; var tail : array<int64>; text_before : int = 0) {
     //! ``render_turn``'s AUDIO twin: the same two-span contract around the audio soft-token splice
     //! (the template's audio span markers). Render-only (no KV, no encoder): the rows come from
-    //! ``encode_audio``, and a scheduler prefills head, rows, tail.
-    render_turn_audio_(model, chat, head, tail)
+    //! ``encode_audio``, and a scheduler prefills head, rows, tail. ``text_before`` as in ``render_turn_image``.
+    render_turn_audio_(model, chat, head, tail, text_before)
 }
 
-def render_assistant(model : Model; var chat : ChatSession; text : string; var out : array<int64>) {
-    //! ``add_assistant``'s render half: appends the exact token stream a known reply prefills to
-    //! ``out`` WITHOUT running the model, advancing the transcript like ``add_assistant``. Use on a
-    //! ``create_chat_renderer`` chat to replay history with no KV memory. Precondition: user message pending.
-    render_assistant_(model, chat, text, out)
+def render_assistant(model : Model; var chat : ChatSession; text : string; var out : array<int64>; reasoning : string = "") {
+    //! ``add_assistant``'s render half: appends the exact token stream a known reply prefills to ``out``
+    //! WITHOUT running the model, advancing the transcript like ``add_assistant`` (a ``create_chat_renderer``
+    //! chat replays history with no KV). ``reasoning`` renders in its think block under ``set_preserve_thinking``.
+    render_assistant_(model, chat, text, out, reasoning)
+}
+
+def render_user(model : Model; var chat : ChatSession; var out : array<int64>) {
+    //! Render the pending user turn alone and consume it, with no generation prompt: the turn a user message
+    //! that follows another user message makes, as every template writes them one after the other. Precondition:
+    //! a user message pending; a no-op otherwise.
+    render_user_(model, chat, out)
 }
 
 def render_close(model : Model; chat : ChatSession) : array<int64> {
@@ -407,7 +445,7 @@ def render_close(model : Model; chat : ChatSession) : array<int64> {
 def set_tools(var chat : ChatSession; var tools : array<string>) {
     //! Declare the conversation's tools (verbatim OpenAI ``tools[]`` JSON objects, moved in)
     //! BEFORE the first turn renders — the system turn carries the family's tool block. Families
-    //! with no tool format (``tmpl.tool_call_open`` empty) ignore them.
+    //! with no tool format (``tmpl.tool_mode`` none) ignore them.
     set_tools_(chat, tools)
 }
 
@@ -438,10 +476,24 @@ def set_thinking(var chat : ChatSession; on : bool) {
     set_thinking_(chat, on)
 }
 
-def render_assistant_calls(model : Model; var chat : ChatSession; text : string; calls : array<string>; var out : array<int64>) {
+def set_preserve_thinking(var chat : ChatSession; on : bool) {
+    //! ``true`` makes every replayed assistant turn carry its think block - its ``reasoning`` between the
+    //! template's markers, the empty block when it had none - so a replayed transcript renders the tokens
+    //! the model generated and a prefix cache matches through it. No-op where ``set_thinking`` is; default off.
+    set_preserve_thinking_(chat, on)
+}
+
+def set_reasoning_effort(var chat : ChatSession; effort : string) {
+    //! The reasoning level a harmony (gpt-oss) system turn asks for: ``low``, ``medium`` or ``high``. Unset, the
+    //! level follows ``set_thinking``: ``medium`` on, ``low`` off - the template has no off, and ``low`` is the
+    //! shortest analysis it writes. No-op on every other family.
+    set_reasoning_effort_(chat, effort)
+}
+
+def render_assistant_calls(model : Model; var chat : ChatSession; text : string; calls : array<string>; var out : array<int64>; reasoning : string = "") {
     //! ``render_assistant``'s tool-calling twin: replay an assistant turn that emitted tool calls
     //! (verbatim ``\{"name":…,"arguments":…}`` objects) plus any ``text`` alongside.
-    render_assistant_calls_(model, chat, text, calls, out)
+    render_assistant_calls_(model, chat, text, calls, out, reasoning)
 }
 
 def effective_stop_ids(chat : ChatSession) : array<int64> {
@@ -475,7 +527,7 @@ def split_reasoning(chat : ChatSession; reply : string) : ThinkSplit {
     //! Split a complete reply at its reasoning boundary per the model family's reply format
     //! (``<think>`` pair, Harmony channels, gemma-4's thought channel). Both halves come back
     //! stripped when a reasoning span is found; a reply with no reasoning passes through untouched.
-    return split_reasoning_(chat.tmpl, reply)
+    return split_reasoning_(chat, reply)
 }
 
 def make_think_stream(chat : ChatSession) : ThinkStream {

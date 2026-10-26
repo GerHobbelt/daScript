@@ -83,6 +83,7 @@ Apple GPU backend. Absent on non-Apple builds, where setting them does nothing.
 
 | Variable | Type | Default | Effect |
 |---|---|---|---|
+| `DASLLAMA_METAL_MSL_DUMP` | path | unset | Directory to write each kernel's generated source as <entry>.metal when its pipeline is built - the SPIR-V dump's twin, for diffing a kernel across a change. |
 | `DASLLAMA_METAL_LOGITS` | flag | on | Produce logits on the GPU; 0 pulls the classifier back to the CPU. Blob-only models force it on. |
 | `DASLLAMA_METAL_ATTN` | flag | on | Tiled QK/AV prefill attention (~10x the trio GEMMs); 0 pins the trio. |
 | `DASLLAMA_METAL_SPAN` | flag | on | Serve the non-causal media span on the prefill driver (AttnArgs.uend); 0 declines it to the CPU arm, which then needs declared CPU intent. |
@@ -90,7 +91,7 @@ Apple GPU backend. Absent on non-Apple builds, where setting them does nothing.
 | `DASLLAMA_METAL_TOWER_F16` | flag | on | Serve a tower's weighted GEMMs from a halfword twin of its weights on the crowned tensor mul_mm twins: the image's baked f16 twin plane where the mint bakes one (only for f16-sourced GEMMs, so it holds the file's own values), and the FastConformer chain's device twin of parakeet's f32 blob. Needs a tensor crown - a box without one, or an image without the plane, keeps the f32 route; 0 pins the f32 GEMM route - the A/B rail. |
 | `DASLLAMA_METAL_TOWER_FLASH` | flag | on | Serve head-72 tower attention at %64 canvases on the lifted flash kernel (no score slab, no rowstat pass, no head restrides - the gemma3v-geometry ViTs); 0 pins the three-pass slab - the A/B rail. |
 | `DASLLAMA_METAL_WDEC` | flag | on | Serve the whisper decoder side (cross-KV; the decode step under wdec_step) on the Metal ASR-decoder driver; 0 pins the CPU decoder. |
-| `DASLLAMA_METAL_WDEC_STEP` | flag | on | Serve the whisper DECODE STEP on the GPU too (needs wdec). Small decoders (n_text_state under the 1024 floor; set_metal_wdec_step_min_d) keep the CPU rail - the per-dispatch latency floor beats them. |
+| `DASLLAMA_METAL_WDEC_STEP` | flag | on | Serve the whisper DECODE STEP on the GPU too (needs wdec). Small decoders (n_text_state under the 512 floor; set_metal_wdec_step_min_d) keep the CPU rail - the per-dispatch latency floor beats them. |
 | `DASLLAMA_METAL_ATTN_D` | flag | on | Fused single-pass decode attention (a head of 64, 96, 128, 256 or 512 on every KV codec; sliding windows, attention sinks, the logit soft cap and a second head class included), on the single row, the speculative verify's rows and the batch; 0 is the A/B rail to the chunked pair. |
 | `DASLLAMA_METAL_ATTN_SINGLE` | number | 64 | Row count below which attention uses the single-chunk kernel; clamped to 128. |
 | `DASLLAMA_METAL_MULMM` | flag | on | The mul_mm prefill GEMM; 0 falls back to the legacy per-op path. |

@@ -207,13 +207,9 @@ def private parse_path(s : string) : GltfPath {
     return GltfPath.translation
 }
 
-def private attr(prim : JPrimitive; key : string) : int {
-    return prim.attributes?[key] ?? -1
-}
+def private attr(prim : JPrimitive; key : string) : int => prim.attributes?[key] ?? -1
 
-// dasGLTF implements no glTF extensions yet; when one lands, list its name here.
-[unused_argument(name)]
-def private extension_supported(name : string) : bool => false
+def private extension_supported(name : string) : bool => name == "KHR_materials_unlit"
 
 // ===== accessor decode =====
 // One float4 per element (missing lanes zero); handles interleaved byteStride,
@@ -223,9 +219,8 @@ def private extension_supported(name : string) : bool => false
 // glTF can name an out-of-range buffer or a span past the buffer end; failing this leaves the decode
 // zero-filled (or skips the sparse/image patch) rather than panicking, keeping load_gltf's documented
 // fail-closed contract (return an empty scene on bad input).
-def private buffer_range_ok(buffers : array<array<uint8>>; bufIdx : int; base, span : int64) : bool {
-    return bufIdx >= 0 && bufIdx < length(buffers) && base >= 0l && base + span <= long_length(buffers[bufIdx])
-}
+def private buffer_range_ok(buffers : array<array<uint8>>; bufIdx : int; base, span : int64) : bool =>
+    bufIdx >= 0 && bufIdx < length(buffers) && base >= 0l && base + span <= long_length(buffers[bufIdx])
 
 def private decode_floats(gltf : JGltf; buffers : array<array<uint8>>; ai : int) : array<float4> {
     var result : array<float4>
@@ -391,7 +386,7 @@ def private decode_buffers(gltf : JGltf; var glbBin : array<uint8>; baseDir : st
     var glbUsed = false
     buffers |> reserve(length(gltf.buffers))
     for (buf in gltf.buffers) {
-        var b : array<uint8>
+        var inscope b : array<uint8>
         if (empty(buf.uri)) {
             if (!glbUsed) {
                 b <- glbBin  // nolint:PERF030 - b is fresh this iteration
@@ -547,7 +542,7 @@ def private build_scene(gltf : JGltf; buffers : array<array<uint8>>; baseDir : s
         for (jsamp in ja.samplers) {
             var s = GltfAnimSampler()
             s.interp = parse_interp(jsamp.interpolation)
-            var inF <- decode_floats(gltf, buffers, jsamp.input)
+            var inscope inF <- decode_floats(gltf, buffers, jsamp.input)
             s.input |> resize(length(inF))
             for (i in range(length(inF))) {
                 s.input[i] = inF[i].x
@@ -722,6 +717,9 @@ def private parse_gltf_json(jsonText : string; var glbBin : array<uint8>; baseDi
     var buffers : array<array<uint8>>
     decode_buffers(doc, glbBin, baseDir, buffers)
     build_scene(doc, buffers, baseDir, scene)
+    for (material, i in scene.materials, count()) {
+        material.unlit = key_exists(js?["materials"]?[i]?["extensions"], "KHR_materials_unlit")
+    }
     update_world_transforms(scene)
     delete buffers
     return <- scene

@@ -26,13 +26,11 @@ let private SLACK = 5      //! the elements past a run, left at their fill
 let private BAR_EXACT_POISON_PCT = Bar(exact = true, poison = 0.01, poison_scaled = true)   //! bit-exact, its poison a hundredth of the magnitude (floored at 1): outside every bar in this file
 
 let private AX_N = 1030        //! four whole workgroups and six more
-let private AX_OOFF = 3
-let private AX_YOFF = 7
 let private AX_SCALE = 0.25    //! a power of two: scale * y is exact, so the fused and the unfused form both round once, as the f32 form does
 
 [test]
 def test_vkt_axpy(t0 : T?) {
-    t0 |> run("the axpy == o + 0.25 y in f32, exact, accumulating (zero = 0) and overwriting (zero = 1), at offsets") <| @(t : T?) {
+    t0 |> run("the axpy == o + 0.25 y in f32, exact, accumulating (zero = 0) and overwriting (zero = 1)") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
             if (!vk_moe_init() || !ensure_tts_axpy_cls()) {
                 t |> skip("no Vulkan device")
@@ -42,12 +40,12 @@ def test_vkt_axpy(t0 : T?) {
             let ob <- f16_fill(n, 7, 0.05, -1.1)
             let yv <- f16_fill(n, 5, 0.04, -0.9)
             with_cell_planes() $(var cp : CellPlanes) {
-                let oap = cp |> io_(ob, AX_OOFF, SLACK)
-                let ozp = cp |> out_(n, AX_OOFF, SLACK)
-                let yp = cp |> in_(yv, AX_YOFF)
+                let oap = cp |> io_(ob, 0, SLACK)
+                let ozp = cp |> out_(n, 0, SLACK)
+                let yp = cp |> in_(yv, 0)
                 var s_a = cp |> cls_set(fixed_array(oap, yp), @@set_tts_axpy_cls)
                 var s_z = cp |> cls_set(fixed_array(ozp, yp), @@set_tts_axpy_cls)
-                var pa = TtsAxpyArgs(nelem = uint(n), scale = AX_SCALE, zero = 0u, ooff = uint(AX_OOFF), yoff = uint(AX_YOFF))
+                var pa = GkAxpyArgs(nelem = uint(n), scale = AX_SCALE, zero = 0u)
                 var pz = pa
                 pz.zero = 1u
                 cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
@@ -59,8 +57,8 @@ def test_vkt_axpy(t0 : T?) {
                 check_rows(t, "tts_axpy zero = 0 vs o + 0.25 y", got_a, [for (i in range(n)); ob[i] + AX_SCALE * yv[i]], BAR_EXACT_POISON_PCT, FLAT_ROWS)
                 check_rows(t, "tts_axpy zero = 1 vs 0.25 y over a NaN-filled o", got_z, [for (i in range(n)); AX_SCALE * yv[i]], BAR_EXACT_POISON_PCT, FLAT_ROWS)
                 t |> success(ob[0] != 0.0 && got_a[0] != got_z[0], "tts_axpy control: the same dispatch at zero = 0 adds o's old contents")
-                t |> success(outside_run(cp |> plane_whole(oap), AX_OOFF, n, POISON), "tts_axpy zero = 0: the elements outside the run are untouched")
-                t |> success(outside_run(cp |> plane_whole(ozp), AX_OOFF, n, NAN_SENTINEL), "tts_axpy zero = 1: the elements outside the run keep their sentinel")
+                t |> success(outside_run(cp |> plane_whole(oap), 0, n, POISON), "tts_axpy zero = 0: the elements outside the run are untouched")
+                t |> success(outside_run(cp |> plane_whole(ozp), 0, n, NAN_SENTINEL), "tts_axpy zero = 1: the elements outside the run keep their sentinel")
             }
         } else {
             t |> skip("dasVulkan not present")
@@ -87,8 +85,8 @@ def test_vkt_reflect1(t0 : T?) {
                 let xp = cp |> in_(x)
                 let yp = cp |> out_(total, 0, SLACK)
                 var s = cp |> cls_set(fixed_array(xp, yp), @@set_tts_pk_rows_cls)
-                var shift = TtsPkRowsArgs(rows = uint(RF_T), width = uint(RF_C), ss = uint(RF_C), sc = 0u, sr0 = 0u, ds = uint(RF_C), dc = 0u, dr0 = 1u)
-                var head = TtsPkRowsArgs(rows = 1u, width = uint(RF_C), ss = uint(RF_C), sc = 0u, sr0 = 1u, ds = uint(RF_C), dc = 0u, dr0 = 0u)
+                var shift = GkPkRowsArgs(rows = uint(RF_T), width = uint(RF_C), ss = uint(RF_C), sc = 0u, sr0 = 0u, ds = uint(RF_C), dc = 0u, dr0 = 1u)
+                var head = GkPkRowsArgs(rows = 1u, width = uint(RF_C), ss = uint(RF_C), sc = 0u, sr0 = 1u, ds = uint(RF_C), dc = 0u, dr0 = 0u)
                 cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
                     enc_tts_pk_rows_cls(raw, h, s, shift, int64(RF_T * RF_C))
                     enc_tts_pk_rows_cls(raw, h, s, head, int64(RF_C))
@@ -149,7 +147,7 @@ def private src_run(f : TtsSrcFixture; torch : bool; f0 : array<float>; noise : 
             let lowp = cp |> out_(nlow)
             let lowcp = cp |> out_(nlow)
             let harp = cp |> out_(f.n, 0, SLACK)
-            var pa = TtsSourceArgs(n = uint(f.n), nlow = uint(f.nlow), nh = uint(TTS_SRC_NH), up = uint(f.up), sr = TTS_SRC_SR, sine_amp = 0.1,
+            var pa = GkSourceArgs(n = uint(f.n), nlow = uint(f.nlow), nh = uint(TTS_SRC_NH), up = uint(f.up), sr = TTS_SRC_SR, sine_amp = 0.1,
                 noise_std = 0.003, voiced_thr = 10.0, seed = seed, woff = uint(SRC_WOFF), boff = uint(src_boff()))
             var s_nz = cp |> cls_set(fixed_array(nzp), @@set_tts_src_noise_cls)
             let low_ix = fixed_array(f0p, nup, lowp)
@@ -199,7 +197,7 @@ def private long_cumsum_arm(t : T?; tag : string; torch : bool; up : int) {
             let cp_out = cp |> out_(nlong)
             let ix = fixed_array(lp, cp_out)
             var s = torch ? cp |> cls_set(ix, @@set_tts_src_cumsum_torch_cls) : cp |> cls_set(ix, @@set_tts_src_cumsum_onnx_cls)
-            var pa = TtsSourceArgs(n = uint(nlong * up), nlow = uint(nlong), nh = 1u, up = uint(up))
+            var pa = GkSourceArgs(n = uint(nlong * up), nlow = uint(nlong), nh = 1u, up = uint(up))
             cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
                 if (torch) {
                     enc_tts_src_cumsum_torch_cls(raw, h, s, pa, 1l)
@@ -362,7 +360,7 @@ def private stft_arm(t : T?; reflect : bool) {
             let spp = cp |> out_(nspec, 0, SLACK)
             var s = reflect ? cp |> cls_set(fixed_array(hp, wp, sp), @@set_tts_stft_reflect_cls) : cp |> cls_set(fixed_array(hp, wp, sp), @@set_tts_stft_edge_cls)
             var sq = reflect ? cp |> cls_set(fixed_array(hpp, wp, spp), @@set_tts_stft_reflect_cls) : cp |> cls_set(fixed_array(hpp, wp, spp), @@set_tts_stft_edge_cls)
-            var pa = TtsStftArgs(n = uint(ST_N), frames = uint(frames), bins = uint(ST_BINS), k = uint(ST_K), hop = uint(ST_HOP), pad = uint(ST_PAD),
+            var pa = GkStftArgs(n = uint(ST_N), frames = uint(frames), bins = uint(ST_BINS), k = uint(ST_K), hop = uint(ST_HOP), pad = uint(ST_PAD),
                 eps = 1e-9, reoff = uint(ST_REOFF), imoff = uint(imoff))
             let total = int64(frames * ST_BINS)
             cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
@@ -442,7 +440,7 @@ def private istft_arm(t : T?; envelope : bool) {
             let opq = cp |> out_(n, 0, SLACK)
             var s = cp |> cls_set(fixed_array(yq, wq, oq), @@set_tts_istft_cls)
             var sq = cp |> cls_set(fixed_array(ypq, wq, opq), @@set_tts_istft_cls)
-            var pa = TtsIstftArgs(tt = uint(IS_TT), stride = uint(IS_STRIDE), bins = uint(IS_BINS), k = uint(IS_K), hop = uint(IS_HOP),
+            var pa = GkIstftArgs(tt = uint(IS_TT), stride = uint(IS_STRIDE), bins = uint(IS_BINS), k = uint(IS_K), hop = uint(IS_HOP),
                 pad = uint(IS_PAD), envelope = envelope ? 1u : 0u, n = uint(n), reoff = uint(IS_REOFF), imoff = uint(imoff), wnoff = uint(wnoff))
             cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
                 enc_tts_istft_cls(raw, h, s, pa, int64(n))

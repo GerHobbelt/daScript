@@ -17,13 +17,15 @@ require ?vulkan dasllama/dasllama_vulkan_tower
 require dasllama/dasllama_gemma4a
 require dasllama/dasllama_canary
 require dasllama/dasllama_qwen3a
+require dasllama/dasllama_parakeet
 require _tower_twin
 
 // Audio tower tests. The mel/gelu/filterbank tests are self-contained; the encoder tests
 // need the locally-converted Qwen2-Audio mmproj (2.5 GB, gitignored) and skip without it.
 // The oracle constants come from llama-mtmd-debug (CPU backend). The Vulkan twins skip without
 // their carriers (the qwen2audio / voxtral / omni-3b f32 mmprojs, the E2B bf16 mmproj, the
-// canary f32 encoder, the Qwen3-ASR bf16 mmproj), without jfk.wav, without a Vulkan device under
+// canary f32 encoder, the parakeet f32 encoder, the ultravox f16 mmproj, the Qwen3-ASR bf16 mmproj), without jfk.wav,
+// without a Vulkan device under
 // DASLLAMA_GPU=1, and on a build with das_metal; the qwen3a front also skips when interpreted.
 
 [test]
@@ -79,14 +81,14 @@ def test_mel_filterbank(t : T?) {
 [test]
 def test_log_mel_chunks(t : T?) {
     t |> run("whisper mel: 440 Hz sine lands on its mel row, silence clamps") @(t : T?) {
-        // the mtmd-debug 'preproc 440' fixture: 5 s sine -> exactly 2 full 3000-frame chunks
+        // 5 s of sine and the 30 s of zeros past it: one full 3000-frame chunk, the partial one dropped
         var s : array<float>
         s |> resize(80000)
         for (i in range(80000)) {
             s[i] = sin(2.0 * 3.14159265 * 440.0 * float(i) / 16000.0)
         }
         let chunks <- log_mel_chunks(s, 128l)
-        t |> success(length(chunks) == 2, "two chunks (audio + padded silence)")
+        t |> equal(length(chunks), 1, "a clip under 30 s is one chunk")
         t |> equal(chunks[0].n_mel, 128l, "n_mel")
         t |> equal(chunks[0].n_len, 3000l, "n_len")
         // 440 Hz sits in the slaney linear region: center(m=18) = 19·(m_hi/129)/lin_slope ≈ 444 Hz
@@ -108,14 +110,21 @@ def test_log_mel_chunks(t : T?) {
             mx = max(mx, v)
         }
         t |> success(mx - mn <= 2.0 + 1e-6, "max-min <= 8/4 (global clamp)")
-        // the second chunk is all padded silence: every value at the clamp floor
+        // past the audio the chunk is padded silence: every value at the clamp floor
         var uniform = true
-        for (v in chunks[1].data) {
-            if (v != chunks[1].data[0]) {
-                uniform = false
+        for (m in range(128)) {
+            for (i in range(600, 3000)) {
+                if (chunks[0].data[m * 3000 + i] != chunks[0].data[600]) {
+                    uniform = false
+                }
             }
         }
-        t |> success(uniform, "silence chunk uniform at the floor")
+        t |> success(uniform, "the frames past the audio are uniform at the floor")
+        t |> success(chunks[0].data[18 * 3000 + 100] != chunks[0].data[600], "the control: a frame of the sine is off the floor")
+        // 35 s of audio: the 30 s of zeros past it complete a second chunk
+        s |> resize(560000)
+        let two <- log_mel_chunks(s, 128l)
+        t |> equal(length(two), 2, "a clip between 30 and 60 s is two chunks")
     }
 }
 
@@ -269,20 +278,24 @@ def private vulkan_blocks_twin(t : T?; family, file : string; layers_claimed : i
         if (layers_claimed > 0l) {
             t |> equal(tw.n_layer, layers_claimed, "{tag}: the tower's depth is the {layers_claimed} blocks the cell names")
         }
-        var mel = MelChunk(n_mel = tw.n_mel, n_len = AUDIO_CHUNK_FRAMES)
-        mel.data |> resize(tw.n_mel * AUDIO_CHUNK_FRAMES)
-        for (i in range(length(mel.data))) {
-            mel.data[i] = sin(float(i) * 0.0137) * 0.8 + sin(float(i) * 0.00291) * 0.5
-        }
+        let mel <- synth_mel(tw.n_mel)
         var encx <- make_encoder_state(twx)
         var enc <- make_encoder_state(tw)
         let spec = TwinSpec(family = family, tag = tag, n_layer = tw.n_layer, metric = TwinMetric.rel_l2)
-        set_vulkan_audio_blocks(true)
+        let blocks_was = set_vulkan_audio_blocks(true)
+        let tail_was = vulkan_tower_tail_knob()
+        set_vulkan_tower_tail(true)   //! the tail counter the cell asserts rides this lever
+        defer() {
+            set_vulkan_audio_blocks(blocks_was)
+            set_vulkan_tower_tail(tail_was)
+        }
+        let tail0 = vulkan_tower_tail_encodes()
         let r <- twin_three_way(t, spec, tw, enc, twx, encx, $(e; var s; var out) => aud_twin_encode(e, s, mel, out)) $(legs) {
             t |> equal(legs.dev.encodes - legs.pre.encodes, 1l, "{tag}: exactly the device leg dispatched")
             t |> equal(legs.dev.blocks - legs.pre.blocks, tw.n_layer, "{tag}: blocks delta = n_layer")
             t |> equal(legs.dev.rows - legs.pre.rows, tw.n_ctx, "{tag}: rows delta = n_ctx")
         }
+        t |> equal(vulkan_tower_tail_encodes() - tail0, 1l, "{tag}: the projector tail rode the device behind the device leg's blocks")
         if (r.bar > 0.0lf) {
             var twp <- mint_aud(path, true, tw.n_layer / 2l)
             var encp <- make_encoder_state(twp)
@@ -345,9 +358,7 @@ def private twin_regrow_legs(t : T?; tag : string; enc : auto(TW); var st : auto
                              encode : block<(e : TW; var s : ST; clip : array<float>; var out : array<float>) : int64>) {
     static_if (typeinfo builtin_module_exists(vulkan)) {
         let head <- clip_head(samples)
-        var dev_head : array<float>
-        var dev_again : array<float>
-        var dev_fresh : array<float>
+        var dev_head, dev_again, dev_fresh : array<float>
         set_vulkan_tower(true)
         let e0 = vulkan_tower_stats().encodes
         with_dasllama_jobque_() {
@@ -428,6 +439,32 @@ def test_gemma4a_vulkan_twin(tst : T?) {
     }
 }
 
+//! the eleven q8 GEMM planes of one FastConformer block zeroed: the poison of the device twins' control
+def private poison_fc_block(var qblob : array<int8>; lo : CanaryLayerOffs; d, ff : int64) {
+    for (w in fixed_array(lo.q_w, lo.k_w, lo.v_w, lo.pos_w, lo.o_w, lo.pw2_w)) {
+        zero_q8(qblob, w, d * d)
+    }
+    for (w in fixed_array(lo.ff1a_w, lo.ff1b_w, lo.ff2a_w, lo.ff2b_w)) {
+        zero_q8(qblob, w, d * ff)
+    }
+    zero_q8(qblob, lo.pw1_w, d * 2l * d)
+}
+
+//! the synthetic speech-scale mel every twin reads: the all-ones fixture is degenerate (identical rows make every attention weight
+//! a near-tie, so single elements flip O(1)); `other` is the second clip, the control's rows outside the bar
+def private synth_mel_fill(var mel : MelChunk; other : bool) {
+    mel.data |> resize(mel.n_mel * AUDIO_CHUNK_FRAMES)
+    for (i in range(length(mel.data))) {
+        mel.data[i] = other ? sin(float(i) * 0.0091) * 0.8 + sin(float(i) * 0.00417) * 0.5 : sin(float(i) * 0.0137) * 0.8 + sin(float(i) * 0.00291) * 0.5
+    }
+}
+
+def private synth_mel(n_mel : int64) : MelChunk {
+    var mel = MelChunk(n_mel = n_mel, n_len = AUDIO_CHUNK_FRAMES)
+    synth_mel_fill(mel, false)
+    return <- mel
+}
+
 //! `zero_block` >= 0 zeroes the eleven q8 GEMM planes of `poison_blocks` blocks from that block on
 def private mint_cn(path : string; q8 : bool; zero_block : int64) : CanaryEncoder {
     var inscope stg <- stage_canary_encoder(path, q8)
@@ -435,14 +472,7 @@ def private mint_cn(path : string; q8 : bool; zero_block : int64) : CanaryEncode
         let d = stg.e.d_model
         let ff = stg.e.n_ff
         for (b in range64(zero_block, min(stg.e.n_layer, zero_block + poison_blocks(stg.e.n_layer)))) {
-            let lo = stg.layers[b]
-            for (w in fixed_array(lo.q_w, lo.k_w, lo.v_w, lo.pos_w, lo.o_w, lo.pw2_w)) {
-                zero_q8(stg.qblob, w, d * d)
-            }
-            for (w in fixed_array(lo.ff1a_w, lo.ff1b_w, lo.ff2a_w, lo.ff2b_w)) {
-                zero_q8(stg.qblob, w, d * ff)
-            }
-            zero_q8(stg.qblob, lo.pw1_w, d * 2l * d)
+            poison_fc_block(stg.qblob, stg.layers[b], d, ff)
         }
     }
     var enc = CanaryEncoder()
@@ -494,6 +524,98 @@ def test_canary_vulkan_twin(tst : T?) {
                 delete st
                 delete enc
                 delete encx
+                vulkan_tower_shutdown()
+            }
+        } else {
+            t |> skip("dasVulkan not present")
+        }
+    }
+}
+
+//! the parakeet model staged and minted in memory on the lane asked; `zero_block` >= 0 zeroes the eleven q8 GEMM planes of
+//! `poison_blocks` blocks from that block on
+def private mint_pk(path : string; q8 : bool; zero_block : int64) : ParakeetModel {
+    var inscope stg <- stage_parakeet_model(path, q8)
+    if (zero_block >= 0l) {
+        let d = stg.e.n_state
+        let ff = 4l * d
+        for (b in range64(zero_block, min(stg.e.n_layer, zero_block + poison_blocks(stg.e.n_layer)))) {
+            poison_fc_block(stg.qblob, pk_fc_layer(pk_layer_offsets(stg.e, b)), d, ff)
+        }
+    }
+    var m = ParakeetModel()
+    mint_parakeet_model(stg, m, q8)
+    return <- m
+}
+
+[cold_path]
+def private pk_twin_encode(m : ParakeetModel; var st : ParakeetState; clip : array<float>; var out : array<float>) : int64 {
+    parakeet_log_mel(clip, m, st)
+    let n = parakeet_encode(m, st)
+    delete out
+    out <- copy_span(st.x, 0l, n * m.n_state)
+    return n
+}
+
+[test, arch(at = "../ARCHITECTURE_GPU_TOWER_VULKAN.md#vk-tower-encode-chains")]
+def test_parakeet_vulkan_twin(tst : T?) {
+    tst |> run("parakeet-TDT 0.6B v2: the Vulkan FastConformer front and blocks vs the CPU q8 chain on jfk, the exact chain the reference") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            let path = path_join(whisper_dir(), "ggml-parakeet-tdt-0.6b-v2-f32.bin")
+            jfk_twin_cell(t, path, false) $(samples) {
+                var mx <- mint_pk(path, false, -1l)
+                var m <- mint_pk(path, true, -1l)
+                t |> success(!mx.q8 && m.q8, "the exact and the q8 models minted")
+                var stx = ParakeetState()
+                var st = ParakeetState()
+                var n_exact = 0l
+                let spec = TwinSpec(family = "parakeet", tag = "parakeet jfk", n_layer = m.n_layer, metric = TwinMetric.rel_l2)
+                let r <- twin_three_way(t, spec, m, st, mx, stx, $(e; var s; var out) => pk_twin_encode(e, s, samples, out)) $(legs) {
+                    n_exact = legs.n_exact
+                    t |> equal(legs.n_cpu, legs.n_exact, "parakeet jfk: the q8 chain's frame count")
+                    t |> equal(legs.n_dev, legs.n_exact, "parakeet jfk: the device chain's frame count")
+                    t |> equal(legs.dev.encodes - legs.pre.encodes, 1l, "parakeet jfk: the device served the encode")
+                    t |> equal(legs.dev.blocks - legs.pre.blocks, m.n_layer, "parakeet jfk: every block ran on the driver")
+                    front_served(t, "parakeet jfk", legs.dev.convs - legs.pre.convs, 1l, legs.dev.declines - legs.cpu.declines)
+                }
+                if (r.bar > 0.0lf) {   //! the front lever off: the CPU front, the block seat behind it, the knob decline counted
+                    let front_was = set_vulkan_parakeet_front(false)
+                    let f0 = vulkan_tower_stats()
+                    let k0 = vulkan_tower_declines()?["knob"] ?? 0l
+                    var st_off = ParakeetState()
+                    var out_off : array<float>
+                    let n_off = pk_twin_encode(m, st_off, samples, out_off)
+                    let f1 = vulkan_tower_stats()
+                    let k1 = vulkan_tower_declines()?["knob"] ?? 0l
+                    set_vulkan_parakeet_front(front_was)
+                    var st_on = ParakeetState()
+                    var out_on : array<float>
+                    let n_on = pk_twin_encode(m, st_on, samples, out_on)
+                    t |> equal(n_off, n_exact, "parakeet jfk, front lever off: the frame count")
+                    t |> equal(n_on, n_exact, "parakeet jfk, front lever back on: the frame count")
+                    t |> equal(f1.convs - f0.convs, 0l, "parakeet jfk, front lever off: no front dispatch")
+                    t |> equal(f1.blocks - f0.blocks, m.n_layer, "parakeet jfk, front lever off: the block seat serves behind the CPU front")
+                    t |> equal(k1 - k0, 1l, "parakeet jfk, front lever off: the knob decline counted once")
+                    let off_vs_on = double(rel_l2(out_off, out_on))
+                    t |> success(off_vs_on < r.bar, "parakeet jfk, front lever off: the rows within the twin bar of the device front's ({off_vs_on} vs {r.bar})")
+                    delete st_off
+                    delete st_on
+                    var mp <- mint_pk(path, true, m.n_layer / 2l)
+                    var stp = ParakeetState()
+                    twin_poison(t, r, m.n_layer / 2l, mp, stp) $(e; var s; var out) => pk_twin_encode(e, s, samples, out)
+                    delete stp
+                    delete mp
+                }
+                var stx2 = ParakeetState()
+                exact_lane_declines(t, "parakeet jfk", n_exact, false) $() : int64 {
+                    parakeet_log_mel(samples, mx, stx2)
+                    return parakeet_encode(mx, stx2)
+                }
+                delete stx2
+                delete stx
+                delete st
+                delete m
+                delete mx
                 vulkan_tower_shutdown()
             }
         } else {
@@ -615,9 +737,9 @@ def test_qwen3a_vulkan_front(tst : T?) {
     }
 }
 
-// The GPU tower blocks vs the CPU encoder on the SAME all-ones fixture as the oracle above -
-// the projector runs CPU on both legs, so the delta isolates the 32-layer block loop (the
-// battery's deep structural check; whisper-large geometry). Counters prove the dispatch.
+// The GPU tower against the CPU encoder on one synthetic mel: the 32-layer block loop and the projector tail behind it
+// on the device leg (the battery's deep structural check; whisper-large geometry). Counters prove the dispatch; the
+// tail alone is `test_encoder_tail_gpu`'s.
 [test]
 def test_encoder_blocks_gpu(tst : T?) {
     tst |> run("qwen2audio tower: GPU blocks vs CPU encoder, 32 layers") @(t : T?) {
@@ -625,13 +747,7 @@ def test_encoder_blocks_gpu(tst : T?) {
             let path = path_join(models_dir(), "qwen2audio-mmproj-f32.gguf")
             return if (!jit_model_available(t, path))
             var tw <- load_audio_tower(path)
-            var mel = MelChunk(n_mel = tw.n_mel, n_len = AUDIO_CHUNK_FRAMES)
-            mel.data |> resize(int(tw.n_mel * AUDIO_CHUNK_FRAMES))
-            for (i in range(length(mel.data))) {
-                // varied, speech-scale mel: the all-ones fixture is degenerate (identical rows
-                // make every attention weight a near-tie, so single elements flip O(1))
-                mel.data[i] = sin(float(i) * 0.0137) * 0.8 + sin(float(i) * 0.00291) * 0.5
-            }
+            let mel <- synth_mel(tw.n_mel)
             var enc <- make_encoder_state(tw)
             set_metal_tower(false)
             var cpu_out : array<float>
@@ -657,11 +773,7 @@ def test_encoder_blocks_gpu(tst : T?) {
             let path = path_join(models_dir(), "voxtral-mini-mmproj-f32.gguf")
             return if (!jit_model_available(t, path))
             var tw <- load_audio_tower(path)
-            var mel = MelChunk(n_mel = tw.n_mel, n_len = AUDIO_CHUNK_FRAMES)
-            mel.data |> resize(int(tw.n_mel * AUDIO_CHUNK_FRAMES))
-            for (i in range(length(mel.data))) {
-                mel.data[i] = sin(float(i) * 0.0137) * 0.8 + sin(float(i) * 0.00291) * 0.5
-            }
+            let mel <- synth_mel(tw.n_mel)
             var enc <- make_encoder_state(tw)
             set_metal_tower(false)
             var cpu_out : array<float>
@@ -680,6 +792,177 @@ def test_encoder_blocks_gpu(tst : T?) {
             delete enc
             delete tw
         }
+    }
+}
+
+//! The projector tail on the device against the CPU tail over the SAME device block rows (the tail lever off), one cell a
+//! projector kind: the soft tokens within `bar` rel-l2, the tail's counter up by the device leg alone, and the rows of
+//! another mel outside the bar (the control).
+def private tail_gpu_cell(t : T?; file : string; kind : AudioProjKind; bar : float) {
+    static_if (typeinfo builtin_module_exists(das_metal)) {
+        let path = path_join(models_dir(), file)
+        return if (!jit_model_available(t, path))
+        var inscope st <- stage_audio_tower(path)
+        var tw = AudioTower()
+        mint_audio_tower(st, tw)
+        t |> success(tw.proj_kind == kind, "the projector kind the cell names")
+        var inscope mel <- synth_mel(tw.n_mel)
+        var enc <- make_encoder_state(tw)
+        let n = audio_tokens_per_chunk(tw) * tw.proj_dim
+        let tower_was = metal_tower_knob()
+        let tail_was = metal_tower_tail_knob()
+        set_metal_tower(true)
+        with_dasllama_jobque_() {
+            set_metal_tower_tail(false)
+            let e0 = metal_tower_stats().encodes
+            let t0 = metal_tower_tail_encodes()
+            audio_encode(tw, enc, mel)
+            var inscope cpu_tail <- copy_span(enc.out, 0l, n)
+            t |> equal(metal_tower_stats().encodes - e0, 1l, "lever off: the blocks still ride the device")
+            t |> equal(metal_tower_tail_encodes() - t0, 0l, "lever off: the tail stays on the CPU")
+            set_metal_tower_tail(true)
+            audio_encode(tw, enc, mel)
+            var inscope dev_tail <- copy_span(enc.out, 0l, n)
+            t |> equal(metal_tower_tail_encodes() - t0, 1l, "lever on: the tail rides the device behind the blocks")
+            synth_mel_fill(mel, true)
+            audio_encode(tw, enc, mel)
+            var inscope other <- copy_span(enc.out, 0l, n)
+            var got = TowerParityStats()
+            var ctl = TowerParityStats()
+            if (tower_parity_stats(t, "{file} tail", cpu_tail, dev_tail, got) && tower_parity_stats(t, "{file} tail control", cpu_tail, other, ctl)) {
+                t |> success(got.rel_l2 <= double(bar), "{file}: device tail vs CPU tail rel_l2 {got.rel_l2} (bar {bar})")
+                t |> success(ctl.rel_l2 > double(bar), "{file}: another mel's rows land outside the bar (rel_l2 {ctl.rel_l2}) - the control")
+            }
+        }
+        set_metal_tower_tail(tail_was)
+        set_metal_tower(tower_was)
+        delete enc
+        delete tw
+    }
+}
+
+//! The chat towers' chunked mel on the device seat against the CPU spectrum: a 128-mel clip's chunk within 1e-3 of the CPU
+//! mel, the mel counter up by the device leg alone, an 80-mel call (off the seat's lattice) served by the CPU with the
+//! counter unmoved, and a second clip's mel outside the bar (the control).
+[test]
+def test_log_mel_chunks_gpu(t : T?) {
+    t |> run("the chunked whisper mel rides the device mel seat") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(das_metal)) {
+            return if (!jit_only(t))
+            var inscope samples <- [for (i in range(16000 * 5)); 0.3 * sin(float(i) * 0.05) + 0.1 * sin(float(i) * 0.31)]
+            var inscope other <- [for (i in range(16000 * 5)); 0.3 * sin(float(i) * 0.11)]
+            let was = metal_tower_knob()
+            with_dasllama_jobque_() {
+                set_metal_tower(false)
+                let m0 = metal_tower_mel_encodes()
+                var inscope cpu <- log_mel_chunks(samples, 128l)
+                t |> equal(metal_tower_mel_encodes() - m0, 0l, "tower off: the CPU spectrum")
+                set_metal_tower(true)
+                var inscope dev <- log_mel_chunks(samples, 128l)
+                t |> equal(metal_tower_mel_encodes() - m0, 1l, "tower on: one device mel a clip")
+                var inscope dev2 <- log_mel_chunks(other, 128l)
+                var inscope m80 <- log_mel_chunks(samples, 80l)
+                t |> equal(metal_tower_mel_encodes() - m0, 2l, "an 80-mel call is off the seat's lattice: the CPU serves it")
+                t |> success(length(cpu) == 1 && length(dev) == 1 && length(m80) == 1, "one chunk each")
+                if (length(cpu) == 1 && length(dev) == 1 && length(dev2) == 1) {
+                    let d = logits_maxdiff(cpu[0].data, dev[0].data)
+                    let ctl = logits_maxdiff(cpu[0].data, dev2[0].data)
+                    t |> success(d <= 1e-3, "device mel within 1e-3 of the CPU mel (max diff {d})")
+                    t |> success(ctl > 1e-3, "another clip's mel lands outside the bar (max diff {ctl}) - the control")
+                }
+            }
+            set_metal_tower(was)
+        }
+    }
+}
+
+[test]
+def test_encoder_tail_gpu(tst : T?) {
+    tst |> run("the qwen2a tail: pair pool, post-norm, one biased linear") @(t : T?) {
+        tail_gpu_cell(t, "mmproj-Qwen2.5-Omni-3B-f16.gguf", AudioProjKind.qwen2a, 1e-3)
+    }
+    tst |> run("the ultravox tail: post-norm, stacked rms, gated MLP") @(t : T?) {
+        tail_gpu_cell(t, "mmproj-ultravox-v0_5-llama-3_2-1b-f16.gguf", AudioProjKind.ultravox, 1e-3)
+    }
+    tst |> run("the voxtral tail: pair pool, post-norm, stacked GELU MLP") @(t : T?) {
+        tail_gpu_cell(t, "voxtral-mini-mmproj-f32.gguf", AudioProjKind.voxtral, 1e-3)
+    }
+}
+
+//! the projector tail three ways on the device rows: the device within `TWIN_SLACK_VK` x the CPU q8 tail's distance, plus a floor (Q8_0 vs f16 feeds)
+[cold_path]
+def private vulkan_tail_cell(t : T?; file : string; kind : AudioProjKind) {
+    static_if (typeinfo builtin_module_exists(vulkan)) {
+        let path = path_join(models_dir(), file)
+        if (!model_available(t, path) || !vulkan_twin_seat(t)) {
+            return
+        }
+        let tag = "{file} vulkan tail on the synthetic mel"
+        var twx <- mint_aud(path, false, -1l)
+        var tw <- mint_aud(path, true, -1l)
+        t |> success(!twx.q8 && tw.q8 && tw.proj_kind == kind, "{tag}: the exact and the q8 towers of the projector kind the cell names")
+        var mel <- synth_mel(tw.n_mel)
+        var encx <- make_encoder_state(twx)
+        var enc <- make_encoder_state(tw)
+        let n = audio_tokens_per_chunk(tw) * tw.proj_dim
+        let tail_was = vulkan_tower_tail_knob()
+        defer() {
+            set_vulkan_tower_tail(tail_was)
+        }
+        with_gpu_knobs() {
+            set_vulkan_tower(true)
+            let blocks_was = set_vulkan_audio_blocks(true)
+            defer() {
+                set_vulkan_audio_blocks(blocks_was)
+            }
+            with_dasllama_jobque_() {
+                set_vulkan_tower_tail(false)
+                let e0 = vulkan_tower_stats().encodes
+                let t0 = vulkan_tower_tail_encodes()
+                audio_encode(tw, enc, mel)
+                var inscope cpu_tail <- copy_span(enc.out, 0l, n)
+                t |> equal(vulkan_tower_stats().encodes - e0, 1l, "{tag}: lever off: the blocks still ride the device")
+                t |> equal(vulkan_tower_tail_encodes() - t0, 0l, "{tag}: lever off: the tail stays on the CPU")
+                encx.x := enc.x
+                audio_projector_tail(twx, encx)
+                var inscope f32_tail <- copy_span(encx.out, 0l, n)
+                set_vulkan_tower_tail(true)
+                audio_encode(tw, enc, mel)
+                var inscope dev_tail <- copy_span(enc.out, 0l, n)
+                t |> equal(vulkan_tower_stats().encodes - e0, 2l, "{tag}: lever on: the blocks ride the device")
+                t |> equal(vulkan_tower_tail_encodes() - t0, 1l, "{tag}: lever on: the tail rides the device behind the blocks")
+                synth_mel_fill(mel, true)
+                audio_encode(tw, enc, mel)
+                var inscope other <- copy_span(enc.out, 0l, n)
+                let bar = tower_twin_bar(t, tag, f32_tail, cpu_tail, dev_tail, 1l, double(TWIN_SLACK_VK), TWIN_REL_L2_FLOOR)
+                if (bar > 0.0lf) {
+                    var ctl = TowerParityStats()
+                    if (tower_parity_stats(t, "{tag} control", f32_tail, other, ctl)) {
+                        t |> success(ctl.rel_l2 > bar, "{tag}: another mel's rows land outside the bar (rel_l2 {ctl.rel_l2}) - the control")
+                    }
+                }
+            }
+        }
+        delete enc
+        delete encx
+        delete tw
+        delete twx
+        vulkan_tower_shutdown()
+    } else {
+        t |> skip("dasVulkan not present")
+    }
+}
+
+[test]
+def test_encoder_tail_vulkan(tst : T?) {
+    tst |> run("the qwen2a tail on the Vulkan chain: pair pool, post-norm, one biased linear") @(t : T?) {
+        vulkan_tail_cell(t, "mmproj-omni-3b-f32.gguf", AudioProjKind.qwen2a)
+    }
+    tst |> run("the ultravox tail on the Vulkan chain: post-norm, stacked rms, gated MLP") @(t : T?) {
+        vulkan_tail_cell(t, "mmproj-ultravox-v0_5-llama-3_2-1b-f16.gguf", AudioProjKind.ultravox)
+    }
+    tst |> run("the voxtral tail on the Vulkan chain: pair pool, post-norm, stacked GELU MLP") @(t : T?) {
+        vulkan_tail_cell(t, "voxtral-mini-mmproj-f32.gguf", AudioProjKind.voxtral)
     }
 }
 

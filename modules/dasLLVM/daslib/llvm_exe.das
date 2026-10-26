@@ -102,9 +102,7 @@ class public CollectExternVisitor : AstVisitor {
 
     // Create the initialize_modules() function, position a builder in it, and emit das_ensure_environment
     // plus the builtin-module registrations (all native modules if register_all, else $ + strings). Returns the builder.
-    def override canVisitWithAliasSubexpression(expr : ExprAssume?) : bool {
-        return false
-    }
+    def override canVisitWithAliasSubexpression(expr : ExprAssume?) : bool => false
 
     def private setup_init_builder(register_all : bool) : LLVMBuilderRef {
         let init_fn = LLVMGetNamedFunction(g_mod, "initialize_modules")
@@ -711,7 +709,7 @@ def collect_external_functions(standalone_context : LLVMOpaqueValue?; ctx : LLVM
     return (needs_whole_lib = whole_lib, registered <- registered)
 }
 
-def private emit_const_words(name : string; words : array<uint64>; elem : LLVMOpaqueType?; var types : PrimitiveTypes?) : LLVMOpaqueValue? {
+def private emit_const_words(name : string; words : array<uint64>; elem : LLVMOpaqueType?; types : PrimitiveTypes?) : LLVMOpaqueValue? {
     let wide = elem == types.t_int64
     var consts <- [for (w in words); wide ? types.ConstI64(w) : types.ConstI32(w)]
     let arr_type = LLVMArrayType(elem, uint(length(consts)))
@@ -918,8 +916,7 @@ def private write_release_deps(prog : Program?) {
     let cfg <- r |> move_unwrap
     if (empty(cfg.list_shared_modules)) return
     // Snapshot the dynamic-module registry: by daslang-side name + a parallel by-package-name lookup.
-    var by_das : table<string; SharedModuleEntry>
-    var by_pkg : table<string; SharedModuleEntry>
+    var by_das, by_pkg : table<string; SharedModuleEntry>
     for_each_registered_dynamic_module() $(path, _mod_name, das_name) {
         let abs = path
         let rel = compute_modules_relative_suffix(abs)
@@ -1067,7 +1064,7 @@ def public collect_standalone_functions(prog : Program?; strict : bool) : Standa
 }
 
 
-def private find_exe_entry(var funcs : array<FunctionPtr>; var uids : UidNodes?; entry_point : string) : tuple<name : string; no_return : bool; bool_return : bool> {
+def private find_exe_entry(var funcs : array<FunctionPtr>; uids : UidNodes?; entry_point : string) : tuple<name : string; no_return : bool; bool_return : bool> {
     var start_fn_name = ""
     var no_return = true
     var bool_return = false
@@ -1146,8 +1143,7 @@ def public emit_standalone_runtime_init(builder : LLVMBuilderRef; prog : Program
     // idempotent). The sweep would re-emit an UNGUARDED jit_register_Module_X (REGISTER_MODULE_IN_
     // NAMESPACE lacks a Module::require guard) -> double-create at startup ("Module '$' already created").
     if (!register_all_modules) {
-        var emitted_reg : table<string; bool>
-        var reg_visited : table<string; bool>
+        var emitted_reg, reg_visited : table<string; bool>
         for (mod_name in keys(used_modules)) {
             if (key_exists(dynamic_modules, mod_name)) continue
             prog |> for_each_module() $(m) {

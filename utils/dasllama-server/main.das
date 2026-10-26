@@ -56,6 +56,9 @@ struct ServerArgs {
     @clarg_doc = "Port to listen on (default 8080)"
     port : int
 
+    @clarg_doc = "Interface to listen on (default 127.0.0.1 - this machine only; 0.0.0.0 opens the server to the network)"
+    host : string
+
     @clarg_short = "q"
     @clarg_doc = "Weight serving mode: fp32 | q8 (default); file-format spellings q8_0 | q4_0 | q4_k | q5_k | q6_k | mxfp4 | f16 | bf16 select q8, where those planes serve natively; q4 = legacy requant tier"
     quant : string
@@ -106,8 +109,12 @@ struct ServerArgs {
     tts_voices_dir : string
 
     @clarg_name = "image-mmproj"
-    @clarg_doc = "Vision mmproj (gemma4uv, gemma4v, or gemma3v, sniffed) for the default model — enables image_url parts on /v1/chat/completions"
+    @clarg_doc = "Vision mmproj (gemma4uv, gemma4v, or gemma3v, sniffed) for the default model — enables image_url parts on /v1/chat/completions; a file that carries an audio tower too (the gemma-4 E-series) arms input_audio parts with it"
     image_mmproj : string
+
+    @clarg_name = "audio-mmproj"
+    @clarg_doc = "Audio mmproj (a whisper-class tower: Qwen2-Audio, Qwen2.5-Omni, Ultravox, Voxtral; or gemma4a) for the default model — enables input_audio parts on /v1/chat/completions. An --image-mmproj that carries an audio tower arms it with no second flag"
+    audio_mmproj : string
 
     @clarg_doc = "Long-lived asynchronous ASR worker threads (default 1; 2 permits two parallel transcriptions; with several ASR models, the first one's)"
     asr_workers : int
@@ -144,10 +151,16 @@ struct ServerArgs {
     @clarg_doc = "Prefix-cache retention cap in pages (default: one full context per stream; -1 = unbounded)"
     prefix : int
 
+    @clarg_doc = "Recurrent models (Qwen3.5/3.6/3.8 hybrids) cache whole checkpoints instead of pages: the most a slot keeps (default 256; 0 = none) - the byte budget binds first. Every request leaves one at its opening's shared head (the system text or the tool block, whichever its template writes first), one at its opening with the tools, one where its last message starts, one where it ends (ahead of the generation prompt), one at its finished turn; a conversation's own stops are dropped before shared openings"
+    prefix_states : int
+
+    @clarg_doc = "The checkpoints' byte budget in MB, snapshots and held pages (default 0 = a quarter of the box's RAM)"
+    prefix_state_mb : int
+
     @clarg_doc = "Flat preallocated KV sessions — disables paged serving and the prefix cache"
     flat : bool
 
-    @clarg_doc = "MTP/NextN self-speculative decode. Unset: a slot turns it on when it runs one stream (--streams 1) on a GPU - Metal, or the whole model resident on a Vulkan device - and off at several streams, on the CPU, on a model the device serves in part, or where the resident driver sums a MoE's routed experts on the host (the card does not hold them); an armed round keeps every stream's cache on the host, so a drafting Vulkan slot serves host-cached sessions in place of device-home ones; true/false sets it outright. Needs a model with an in-file NextN head (the -MTP- GGUFs), or an assistant drafter GGUF beside the model file (gemma-4: mtp-<stem>-Q8_0.gguf), which the load attaches - any other model serves plain with a log line. A sampled or penalized request draws each verify row with its own sampler, keeping its distribution at a lower acceptance rate"
+    @clarg_doc = "MTP/NextN self-speculative decode. Unset: a slot turns it on when it runs one stream (--streams 1) on a GPU - Metal, or the whole model resident on a Vulkan device - and off at several streams, on the CPU, on a model the device serves in part, or where the resident driver sums a MoE's routed experts on the host (the card does not hold them); an armed round keeps every stream's cache on the host, so a drafting Vulkan slot serves host-cached sessions in place of device-home ones; true/false sets it outright. Needs a model with an in-file NextN head (the -MTP- GGUFs), or an assistant drafter GGUF beside the model file (gemma-4: mtp-<stem>-Q8_0.gguf), which the load attaches - any other model serves plain with a log line. A sampled or penalized request draws each verify row with its own sampler, keeping its distribution at a lower acceptance rate. A constrained reply (response_format, a forced tool_choice) decodes plain."
     mtp : bool
 
     @clarg_doc = "RoPE scaling override for the load: yarn | linear | none (default: the model file's own rope.scaling keys; none drops them, a file's per-pair factor tensors stay). The Qwen families publish the YaRN recipe and enable it as a setting, for long conversations only: --rope-scaling yarn --rope-scale 4; no other vendor validates it, and a non-Qwen file logs a warning. The override is baked into the prepared image under its own lane (model.gguf.metal-yarn4.dlim). Per-model in a [[models]] roster: rope_scaling"
@@ -194,6 +207,7 @@ struct ModelEntry {
     rope_scale : float = 0.0     // 0 inherits
     yarn_orig_ctx : int = 0      // 0 inherits
     image_mmproj : string   // vision mmproj (gemma4uv); empty = this model takes text only
+    audio_mmproj : string   // audio mmproj; empty = the image mmproj's audio tower, where it carries one
     is_default : bool = false
 }
 
@@ -268,13 +282,15 @@ def cli_has_flag(flag : string) : bool {
 var private g_cfg_sources : table<string; string>
 var private g_cfg_authoritative = false
 
-let CONFIG_KEYS = fixed_array("model", "port", "quant", "kv_dtype", "metal", "gpu", "gpu_layers",
-    "gpu_stream", "gpu_dn", "gpu_attn", "gpu_dense", "gpu_vram_mb", "asr", "mmproj", "image_mmproj", "asr_workers", "tts", "tts_lane", "tts_voices_dir",
+let CONFIG_KEYS = fixed_array("model", "port", "host", "quant", "kv_dtype", "metal", "gpu", "gpu_layers",
+    "gpu_stream", "gpu_dn", "gpu_attn", "gpu_dense", "gpu_vram_mb", "asr", "mmproj", "image_mmproj", "audio_mmproj", "asr_workers", "tts", "tts_lane", "tts_voices_dir",
     "ctx", "max_tokens", "streams", "threads", "team_dispatch", "affinity", "chunk", "chunk_idle", "page_rows",
-    "prefix", "flat", "mtp", "rope_scaling", "rope_scale", "yarn_orig_ctx", "lcpp_bin", "models_dir", "models")
+    "prefix", "prefix_states", "prefix_state_mb", "flat", "mtp", "rope_scaling", "rope_scale", "yarn_orig_ctx", "lcpp_bin", "models_dir", "models")
 
 def private from_cli(key : string) : bool
     => (g_cfg_sources?[key] ?? "") == "cli"
+
+//! the interface the front binds: the configured one, else loopback - a server that reaches the network is the operator's choice, never the default
 
 def private toml_has(root : JsonValue?; key : string) : bool {
     if (root == null || !(root.value is _object)) {
@@ -375,14 +391,16 @@ def set_cli_source(key : string; given : bool) {
 
 //! The ids of this boot's speech roster, in serving order - the path stands in for an entry that names none.
 //! Non-private: test_server_flags.das gates the [[asr]] / [[tts]] read.
-def speech_roster_ids(tts : bool) : array<string> {
-    return <- [for (m in tts ? g_tts_models : g_asr_models); empty(m.id) ? m.path : m.id]
-}
+def speech_roster_ids(tts : bool) : array<string> =>
+    <- [for (m in tts ? g_tts_models : g_asr_models); empty(m.id) ? m.path : m.id]
 
-//! whether any configured TTS model has its whole file set: such a boot serves the speech route with no LLM
-def private any_tts_present : bool {
+//! whether any configured speech model has its whole file set: such a boot serves its speech route with no LLM
+def private any_speech_present : bool {
     for (m in g_tts_models) {
         return true if (tts_files_present(m.path))
+    }
+    for (a in g_asr_models) {
+        return true if (stat(a.path).is_valid && (empty(a.mmproj) || stat(a.mmproj).is_valid))
     }
     return false
 }
@@ -439,6 +457,9 @@ def private mark_cli_sources(cfg : ServerArgs) {   // nolint:STYLE037,STYLE038 �
     if (cfg.port > 0) {
         g_cfg_sources["port"] = "cli"
     }
+    if (!empty(cfg.host)) {
+        g_cfg_sources["host"] = "cli"
+    }
     if (!empty(cfg.quant)) {
         g_cfg_sources["quant"] = "cli"
     }
@@ -489,6 +510,9 @@ def private mark_cli_sources(cfg : ServerArgs) {   // nolint:STYLE037,STYLE038 �
     if (!empty(cfg.image_mmproj)) {
         g_cfg_sources["image_mmproj"] = "cli"
     }
+    if (!empty(cfg.audio_mmproj)) {
+        g_cfg_sources["audio_mmproj"] = "cli"
+    }
     if (cfg.asr_workers > 0) {
         g_cfg_sources["asr_workers"] = "cli"
     }
@@ -522,6 +546,12 @@ def private mark_cli_sources(cfg : ServerArgs) {   // nolint:STYLE037,STYLE038 �
     if (cfg.prefix != 0 || cli_has_flag("--prefix")) {
         g_cfg_sources["prefix"] = "cli"
     }
+    if (cli_has_flag("--prefix-states")) {
+        g_cfg_sources["prefix_states"] = "cli"
+    }
+    if (cfg.prefix_state_mb > 0) {
+        g_cfg_sources["prefix_state_mb"] = "cli"
+    }
     if (cli_has_flag("--flat")) {
         g_cfg_sources["flat"] = "cli"
     }
@@ -545,6 +575,27 @@ def private mark_cli_sources(cfg : ServerArgs) {   // nolint:STYLE037,STYLE038 �
     }
 }
 
+//! the flat keys that size a model's sessions and scheduler
+def private apply_session_keys(root : JsonValue?; var cfg : ServerArgs; auth : bool) {
+    cfg_from_toml(root, "ctx", cfg.ctx, auth)
+    cfg_from_toml(root, "max_tokens", cfg.max_tokens, auth)
+    cfg_from_toml(root, "streams", cfg.streams, auth)
+    cfg_from_toml(root, "threads", cfg.threads, auth)
+    cfg_from_toml(root, "team_dispatch", cfg.team_dispatch, auth)
+    cfg_from_toml(root, "affinity", cfg.affinity, auth)
+    cfg_from_toml(root, "chunk", cfg.chunk, auth)
+    cfg_from_toml(root, "chunk_idle", cfg.chunk_idle, auth)
+    cfg_from_toml(root, "page_rows", cfg.page_rows, auth)
+    cfg_from_toml(root, "prefix", cfg.prefix, auth)
+    cfg_from_toml(root, "prefix_states", cfg.prefix_states, auth)
+    cfg_from_toml(root, "prefix_state_mb", cfg.prefix_state_mb, auth)
+    cfg_from_toml(root, "flat", cfg.flat, auth)
+    cfg_from_toml(root, "mtp", cfg.mtp, auth)
+    cfg_from_toml(root, "rope_scaling", cfg.rope_scaling, auth)
+    cfg_from_toml(root, "rope_scale", cfg.rope_scale, auth)
+    cfg_from_toml(root, "yarn_orig_ctx", cfg.yarn_orig_ctx, auth)
+}
+
 // fill fields from the TOML config. Default precedence: defaults < config file < explicit CLI
 // flags. A config carrying `authoritative = true` (what the control page writes) flips the top:
 // its keys override CLI flags too (defaults < CLI < authoritative TOML).
@@ -564,6 +615,7 @@ def apply_config(var cfg : ServerArgs) : bool {
     g_cfg_authoritative = auth
     cfg_from_toml(root, "model", cfg.model, auth)
     cfg_from_toml(root, "port", cfg.port, auth)
+    cfg_from_toml(root, "host", cfg.host, auth)
     cfg_from_toml(root, "quant", cfg.quant, auth)
     cfg_from_toml(root, "kv_dtype", cfg.kv_dtype, auth)
     cfg_from_toml(root, "metal", cfg.metal, auth)
@@ -586,22 +638,9 @@ def apply_config(var cfg : ServerArgs) : bool {
     cfg_from_toml(root, "tts_lane", cfg.tts_lane, auth)
     cfg_from_toml(root, "tts_voices_dir", cfg.tts_voices_dir, auth)
     cfg_from_toml(root, "image_mmproj", cfg.image_mmproj, auth)
+    cfg_from_toml(root, "audio_mmproj", cfg.audio_mmproj, auth)
     cfg_from_toml(root, "asr_workers", cfg.asr_workers, auth)
-    cfg_from_toml(root, "ctx", cfg.ctx, auth)
-    cfg_from_toml(root, "max_tokens", cfg.max_tokens, auth)
-    cfg_from_toml(root, "streams", cfg.streams, auth)
-    cfg_from_toml(root, "threads", cfg.threads, auth)
-    cfg_from_toml(root, "team_dispatch", cfg.team_dispatch, auth)
-    cfg_from_toml(root, "affinity", cfg.affinity, auth)
-    cfg_from_toml(root, "chunk", cfg.chunk, auth)
-    cfg_from_toml(root, "chunk_idle", cfg.chunk_idle, auth)
-    cfg_from_toml(root, "page_rows", cfg.page_rows, auth)
-    cfg_from_toml(root, "prefix", cfg.prefix, auth)
-    cfg_from_toml(root, "flat", cfg.flat, auth)
-    cfg_from_toml(root, "mtp", cfg.mtp, auth)
-    cfg_from_toml(root, "rope_scaling", cfg.rope_scaling, auth)
-    cfg_from_toml(root, "rope_scale", cfg.rope_scale, auth)
-    cfg_from_toml(root, "yarn_orig_ctx", cfg.yarn_orig_ctx, auth)
+    apply_session_keys(root, cfg, auth)
     cfg_from_toml(root, "lcpp_bin", cfg.lcpp_bin, auth)
     cfg_from_toml(root, "models_dir", cfg.models_dir, auth)
     if (toml_has(root, "models")) {
@@ -689,6 +728,7 @@ def private apply_models_roster(root : JsonValue?) {
             rope_scaling = e?["rope_scaling"] ?? "", rope_scale = float(e?["rope_scale"] ?? 0.0lf),
             yarn_orig_ctx = int(e?["yarn_orig_ctx"] ?? 0l),
             image_mmproj = e?["image_mmproj"] ?? "",
+            audio_mmproj = e?["audio_mmproj"] ?? "",
             is_default = e?["default"] ?? false)
         if (ent.backend != "auto" && ent.backend != "cpu" && ent.backend != "gpu") {
             to_log(LOG_WARNING, "dasllama-server: [[models]] '{base_name(ent.path)}' backend '{ent.backend}' is not auto | cpu | gpu — using auto\n")
@@ -762,6 +802,7 @@ def private roster_entry_json(ent : ModelEntry) : JsonValue? {
         "chunk_idle" => JV(int64(ent.chunk_idle)),
         "page_rows" => JV(int64(ent.page_rows)), "prefix" => JV(int64(ent.prefix)),
         "image_mmproj" => JV(ent.image_mmproj),
+        "audio_mmproj" => JV(ent.audio_mmproj),
         "default" => JV(ent.is_default)
     }
     if (ent.mtp >= 0) {
@@ -798,11 +839,12 @@ def vulkan_serving_want(cfg : ServerArgs) : GpuTierWant
 // provenance. Sentinel-is-meaning keys stay raw: ctx 0 = model default, prefix 0 = auto /
 // -1 = unbounded, threads -1 = all cores, gpu "" = legacy metal/env path.
 [arch(at = "README.md#endpoints")]
-def private build_config_surface(cfg : ServerArgs; save_path : string) : string {
+def private build_config_surface(cfg : ServerArgs; save_path : string) : string {   // nolint:STYLE037 - a flat list of surface fields, one resolution each
     let gpu = effective_gpu(cfg)
     var config = JV((
         model = cfg.model,
         port = cfg.port > 0 ? cfg.port : 8080,
+        host = bind_host(cfg.host),
         quant = empty(cfg.quant) ? "q8" : cfg.quant,
         kv_dtype = empty(cfg.kv_dtype) ? "f16" : cfg.kv_dtype,
         metal = empty(cfg.metal) ? "off" : cfg.metal,
@@ -819,6 +861,7 @@ def private build_config_surface(cfg : ServerArgs; save_path : string) : string 
         tts_lane = pick_tts_lane(cfg.tts_lane),   // the lane configure_tts kept, not the spelling asked for
         tts_voices_dir = cfg.tts_voices_dir,
         image_mmproj = cfg.image_mmproj,
+        audio_mmproj = cfg.audio_mmproj,
         asr_workers = cfg.asr_workers > 0 ? cfg.asr_workers : 1,
         ctx = cfg.ctx,
         max_tokens = cfg.max_tokens > 0 ? cfg.max_tokens : 16384,
@@ -830,6 +873,8 @@ def private build_config_surface(cfg : ServerArgs; save_path : string) : string 
         chunk_idle = max(cfg.chunk_idle, 0),
         page_rows = cfg.page_rows > 0 ? cfg.page_rows : 64,
         prefix = cfg.prefix,
+        prefix_states = cfg_sourced("prefix_states") ? cfg.prefix_states : int(SERVER_PREFIX_STATES),
+        prefix_state_mb = cfg.prefix_state_mb,   // 0 = a quarter of the box's RAM, resolved at init
         flat = cfg.flat,
         mtp = cfg_sourced("mtp") ? cfg.mtp : mtp_default_resolved(cfg.streams > 0 ? cfg.streams : 4, gpu, cfg.metal),
         rope_scaling = cfg.rope_scaling,
@@ -904,11 +949,10 @@ def parse_args() {
         request_exit()
         return
     }
-    // a [[models]] roster needs no flat model key; a --tts start with its file set complete is a
-    // SERVING server (the speech route), so it never enters setup mode - an incomplete set is one
-    // configure_tts drops, which leaves this boot nothing to serve
+    // a [[models]] roster needs no flat model key; a --tts or --asr start with its file set complete
+    // is a SERVING server (the speech routes), so it never enters setup mode
     speech_roster_from_flags(g_cfg)
-    if (empty(g_cfg.model) && empty(g_models) && !any_tts_present()) {
+    if (empty(g_cfg.model) && empty(g_models) && !any_speech_present()) {
         g_setup_mode = true
         print("no model configured - starting in setup mode (open the control page to download one from the catalog)\n")
     }
@@ -991,12 +1035,15 @@ def init() {   // nolint:STYLE037,STYLE038 — boot sequence: the knobs are orde
         return
     }
     let port = g_cfg.port > 0 ? g_cfg.port : 8080     // non-positive (incl. a stray negative) -> default
+    let host = bind_host(g_cfg.host)
     let ctx = g_cfg.ctx > 0 ? int64(g_cfg.ctx) : 0l   // 0 = keep the model's trained context_length
     let streams = g_cfg.streams > 0 ? int64(g_cfg.streams) : 4l
     let chunk = g_cfg.chunk > 0 ? int64(g_cfg.chunk) : 0l
     let chunk_idle = g_cfg.chunk_idle > 0 ? int64(g_cfg.chunk_idle) : -1l
     let page_rows = g_cfg.flat ? 0l : (g_cfg.page_rows > 0 ? int64(g_cfg.page_rows) : 64l)
     let prefix = int64(g_cfg.prefix)   // 0 = auto (init_server sizes it), < 0 = unbounded
+    let prefix_states = cfg_sourced("prefix_states") ? int64(max(g_cfg.prefix_states, 0)) : SERVER_PREFIX_STATES   // 0 set by hand = no checkpoints
+    let prefix_state_mb = int64(max(g_cfg.prefix_state_mb, 0))
     let dispatch_mode = to_lower(g_cfg.team_dispatch)
     if (!empty(dispatch_mode) && dispatch_mode != "hybrid"
         && dispatch_mode != "team" && dispatch_mode != "inline") {
@@ -1079,20 +1126,28 @@ def init() {   // nolint:STYLE037,STYLE038 — boot sequence: the knobs are orde
             to_log(LOG_ERROR, "dasllama-server: dropping the vision arm of '{empty(e.name) ? base_name(e.path) : e.name}' - mmproj not found: {e.image_mmproj}\n")
             e.image_mmproj = ""
         }
+        if (!empty(e.audio_mmproj) && !stat(e.audio_mmproj).is_valid) {
+            to_log(LOG_ERROR, "dasllama-server: dropping the audio arm of '{empty(e.name) ? base_name(e.path) : e.name}' - mmproj not found: {e.audio_mmproj}\n")
+            e.audio_mmproj = ""
+        }
         roster |> push(e)
     }
     delete g_models
     g_models <- roster
-    if (empty(g_models) && !g_setup_mode && !any_tts_present()) {
+    if (empty(g_models) && !g_setup_mode && !any_speech_present()) {
         // not an exit: a crash-looping boot under the watchdog never gets a page to fix the config from
         g_setup_mode = true
-        to_log(LOG_ERROR, "dasllama-server: no loadable model - no configured path survived its file check (roster entries, and the --tts file set); starting in setup mode\n")
+        to_log(LOG_ERROR, "dasllama-server: no loadable model - no configured path survived its file check (roster entries, and the --tts and --asr file sets); starting in setup mode\n")
     } elif (empty(g_models) && !g_setup_mode) {
-        to_log(LOG_WARNING, "dasllama-server: no loadable LLM model - serving the speech route only (the TTS model still loads)\n")
+        to_log(LOG_WARNING, "dasllama-server: no loadable LLM model - serving the speech routes only (the TTS and ASR models still load)\n")
     }
     if (!empty(g_cfg.image_mmproj) && !stat(g_cfg.image_mmproj).is_valid) {
         to_log(LOG_ERROR, "dasllama-server: dropping --image-mmproj - file not found: {g_cfg.image_mmproj}\n")
         g_cfg.image_mmproj = ""
+    }
+    if (!empty(g_cfg.audio_mmproj) && !stat(g_cfg.audio_mmproj).is_valid) {
+        to_log(LOG_ERROR, "dasllama-server: dropping --audio-mmproj - file not found: {g_cfg.audio_mmproj}\n")
+        g_cfg.audio_mmproj = ""
     }
     if (!g_setup_mode) {
         var def_idx = 0
@@ -1183,13 +1238,16 @@ def init() {   // nolint:STYLE037,STYLE038 — boot sequence: the knobs are orde
         for (i in range(length(g_models))) {
             let path = (!empty(g_models[i].image_mmproj) ? g_models[i].image_mmproj
                                                          : (i == def_idx ? g_cfg.image_mmproj : ""))
+            let audio = (!empty(g_models[i].audio_mmproj) ? g_models[i].audio_mmproj
+                                                          : (i == def_idx ? g_cfg.audio_mmproj : ""))
             if (!empty(path)) {
                 set_model_vision(g_models[i].name, path)
-                // the E-series mmproj carries BOTH towers: the same file arms native audio, so
-                // one download gives text + vision + audio off the one serving slot
-                if (audio_probe_proj_dim(path) > 0l) {
-                    set_model_audio(g_models[i].name, path)
-                }
+            }
+            // an mmproj that carries both towers (the E-series, the Omni files) arms audio with the one flag
+            if (!empty(audio)) {
+                set_model_audio(g_models[i].name, audio)
+            } elif (!empty(path) && audio_probe_proj_dim(path) > 0l) {
+                set_model_audio(g_models[i].name, path)
             }
         }
 
@@ -1206,8 +1264,7 @@ def init() {   // nolint:STYLE037,STYLE038 — boot sequence: the knobs are orde
             add_asr_model(a.path, a.mmproj, max(a.workers, 1), a.id)
         }
     }
-    // outside the serving gate: a --tts start with no loadable LLM is a speech-only SERVER, and
-    // its route has to arm on that boot too
+    // a --tts start with no loadable LLM is a speech-only SERVER, and its route arms on that boot too
     configure_tts("")
     for (m in g_tts_models) {
         add_tts_model(m.path, m.lane, m.voices_dir, m.id)
@@ -1254,7 +1311,8 @@ def init() {   // nolint:STYLE037,STYLE038 — boot sequence: the knobs are orde
         [chunk_tokens = chunk, page_rows = page_rows, prefix_groups = prefix,
          kv_dtype = pick_kv_dtype(g_cfg.kv_dtype), team_dispatch = team_dispatch,
          asr_team = asr_team,
-         mtp = mtp_setting(cfg_sourced("mtp"), g_cfg.mtp), idle_chunk_tokens = chunk_idle])
+         mtp = mtp_setting(cfg_sourced("mtp"), g_cfg.mtp), idle_chunk_tokens = chunk_idle, host = host,
+         prefix_states = prefix_states, prefix_state_mb = prefix_state_mb])
     if (!g_server_ready) {
         g_exit_code = 2
         request_exit()

@@ -26,6 +26,7 @@ require dasllama/dasllama_kv_codec   // dot_f16 / axpy_f16: the decode's weights
 require dasllama/dasllama_par
 require dasllama/dasllama_common   // apply_box_profile_runtime for the parakeet-image identity
 require dasllama/dasllama_image
+require dasllama/dasllama_canary   // CanaryLayerOffs: the FastConformer block record parakeet's blocks ride on the GPU drivers
 
 // Parakeet-TDT (NVIDIA FastConformer + LSTM predictor + Token-and-Duration Transducer),
 // read from the whisper.cpp-converted ggml bin. Oracle = whisper.cpp's in-tree parakeet-cli
@@ -426,7 +427,7 @@ def private pk_fold_bn(var blob : array<float>; w, b, mean, vr, d : int64) {
 // ===== bin container =====
 
 // whisper-bin-style tensor records: i32 n_dims, i32 name_len, i32 ftype; i32 dims (ne
-// order); name bytes; raw data (f32/f16), unaligned.
+// order); name bytes; raw data (f32, f16 or Q8_0 blocks), unaligned.
 struct private PkTensorRec {
     ttype : int
     n_elem : int64
@@ -453,15 +454,7 @@ def private pk_read(recs : table<string; PkTensorRec>; b : array<uint8> | #; nam
     if (r.n_elem != n) {
         panic("dasLLAMA parakeet: tensor '{name}' has {r.n_elem} elements, want {n}")
     }
-    if (r.ttype == GGML_TYPE_F32) {
-        for (i in range64(n)) {
-            dst[dst_off + i] = rd_f32(b, r.off + i * 4l)
-        }
-    } else {
-        for (i in range64(n)) {
-            dst[dst_off + i] = f16_to_f32(rd_u16(b, r.off + i * 2l))
-        }
-    }
+    ggml_bin_read_f32(b, r.ttype, r.off, n, dst, dst_off)
 }
 
 // GEMM weight read: a q8 load transcodes it from the file straight into qblob/qscales at its
@@ -649,7 +642,7 @@ def stage_parakeet_model(path : string; q8 : bool = false) : ParakeetStaging {
             let name = pk_bytes_str(bytes, o, name_len)
             o += name_len
             recs[name] = PkTensorRec(ttype = ttype, n_elem = n_elem, off = o)
-            o += n_elem * (ttype == GGML_TYPE_F32 ? 4l : 2l)
+            o += ggml_bin_tensor_bytes(ttype, n_elem)
         }
 
         // blob layout — dual walk: `bo` is the full layout (qblob on a q8 load, blob on an
@@ -780,9 +773,7 @@ def stage_parakeet_model(path : string; q8 : bool = false) : ParakeetStaging {
 
 //! The loaded precision (one tag — parakeet is a single carrier): the facade's
 //! [[asr_exec_fmt]] arm.
-def parakeet_exec_fmt(p : ParakeetModel) : string {
-    return p.q8 ? "q8" : "f32"
-}
+def parakeet_exec_fmt(p : ParakeetModel) : string => p.q8 ? "q8" : "f32"
 
 //! Parakeet's log-mel: preemphasis 0.97, zero center-pad n_fft/2, the file's STFT window, power
 //! spectra, mel dot, NATURAL log(sum + 2⁻²⁴), then per-feature mean/std normalization over the
@@ -1226,6 +1217,22 @@ def private pk_announce_lane(q8 : bool) {
     to_log(LOG_INFO, "dasLLAMA parakeet: GEMM lane {q8 ? "q8" : "f32 planes"} - {why}\n")
 }
 
+//! a parakeet block's offsets as the FastConformer chains read them: canary's record with no GEMM bias (-1 = none)
+def pk_fc_layer(lo : PkLayerOffs) : CanaryLayerOffs {
+    return CanaryLayerOffs(nf1_w = lo.nf1_w, nf1_b = lo.nf1_b,
+        ff1a_w = lo.ff1a_w, ff1a_b = -1l, ff1b_w = lo.ff1b_w, ff1b_b = -1l,
+        nat_w = lo.nat_w, nat_b = lo.nat_b,
+        q_w = lo.q_w, q_b = -1l, k_w = lo.k_w, k_b = -1l, v_w = lo.v_w, v_b = -1l, o_w = lo.o_w, o_b = -1l,
+        pos_w = lo.pos_w, bias_u = lo.bias_u, bias_v = lo.bias_v,
+        ncv_w = lo.ncv_w, ncv_b = lo.ncv_b,
+        pw1_w = lo.pw1_w, pw1_b = -1l, dw_w = lo.dw_w, dw_b = -1l,
+        bn_w = lo.bn_w, bn_b = lo.bn_b, bn_mean = lo.bn_mean, bn_var = lo.bn_var,
+        pw2_w = lo.pw2_w, pw2_b = -1l,
+        nf2_w = lo.nf2_w, nf2_b = lo.nf2_b,
+        ff2a_w = lo.ff2a_w, ff2a_b = -1l, ff2b_w = lo.ff2b_w, ff2b_b = -1l,
+        nout_w = lo.nout_w, nout_b = lo.nout_b)
+}
+
 def private pk_blocks_cpu(m : ParakeetModel; var st : ParakeetState; tt, ww, n_real : int64) {
     let d = m.n_state
     let n_head = m.n_head
@@ -1372,7 +1379,7 @@ def private pk_blocks_cpu(m : ParakeetModel; var st : ParakeetState; tt, ww, n_r
                                 for (q in range64(r0, r1)) {
                                     let base = tt - 1l - q
                                     var qs = scs + (q - r0) * tt
-                                    var rs = rls + (q - r0) * ww
+                                    let rs = rls + (q - r0) * ww
                                     for (k in range64(tt)) {
                                         var s = (qs[k] + rs[base + k]) * scale
                                         if (k >= n_real) {

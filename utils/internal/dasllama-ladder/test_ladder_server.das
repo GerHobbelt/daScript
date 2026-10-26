@@ -47,11 +47,10 @@ def private with_ladder_server(policy : LadderPolicy; blk : block<(base_url : st
     }
 }
 
-def private default_policy : LadderPolicy {
-    return LadderPolicy(submit_open = true)   // the submit-path tests need an open board; the gate itself has its own test
-}
+def private default_policy : LadderPolicy =>
+    LadderPolicy(submit_open = true)  // the submit-path tests need an open board; the gate itself has its own test
 
-def private json_of(var resp : HttpResponse?) : JsonValue? {
+def private json_of(resp : HttpResponse?) : JsonValue? {
     var jerr = ""
     return read_json(string(resp.body), jerr)
 }

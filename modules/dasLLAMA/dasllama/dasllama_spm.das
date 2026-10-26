@@ -31,6 +31,7 @@ struct SpmTokenizer {
     add_space_prefix : bool = true // SPM add_dummy_prefix: prepend a ▁ to non-empty text (Gemma sets it false)
     bos_id : int64 = 1l            // BOS token id from GGUF metadata (Llama-2/TinyLlama 1, Gemma 2); default = llama2.c
     eos_id : int64 = 2l            // EOS token id from GGUF metadata (Llama-2/TinyLlama 2, Gemma 1)
+    add_eos : bool                 //! `tokenizer.ggml.add_eos_token`: an embedding model ends every text with EOS, the row its last-token pooling reads
 }
 
 //! Build the DERIVED merge-pair table from vocab/lookup — called by both loaders and the image
@@ -130,6 +131,7 @@ def load_tokenizer_gguf(path : string) : SpmTokenizer {
         if (gguf_has(m, "tokenizer.ggml.eos_token_id")) {
             tk.eos_id = gguf_int(m, bytes, "tokenizer.ggml.eos_token_id")
         }
+        tk.add_eos = gguf_int_or(m, bytes, "tokenizer.ggml.add_eos_token", 0l) != 0l
     }
     fclose(f)
     build_spm_derived(tk)
@@ -197,8 +199,7 @@ def private sg_try_push(tk : SpmTokenizer; var h : array<SpmBigram>; toks : arra
 def private spm_merge_heap(tk : SpmTokenizer; var toks : array<int64>) {
     let n = length(toks)
     return if (n < 2)
-    var nxt : array<int>
-    var prv : array<int>
+    var nxt, prv : array<int>
     nxt |> resize(n)
     prv |> resize(n)
     for (i in range(n)) {
@@ -301,9 +302,7 @@ def encode(tk : SpmTokenizer; text : string; bos, eos : bool) : array<int64> {
 
 //! Resolve a special/control token id by its surface form (e.g. "<end_of_turn>"); -1 if absent.
 //! SPM special tokens live in the vocab, so this is a plain lookup — same contract as the BPE overload.
-def special_id(tk : SpmTokenizer; name : string) : int64 {
-    return tk.lookup?[name] ?? -1l
-}
+def special_id(tk : SpmTokenizer; name : string) : int64 => tk.lookup?[name] ?? -1l
 
 // ===== the unigram arm: a SentencePiece model of type UNIGRAM (GGUF `tokenizer.ggml.model =
 // "t5"`) over the same vocabulary and scores - a Viterbi lattice instead of the merge heap =====
@@ -329,9 +328,8 @@ def private spm_piece_of(d : array<uint8> const#; i, n : int) : string {
 def private hex_char(v : int) : int => v < 10 ? '0' + v : 'A' + v - 10
 
 // the byte piece's name, "<0xXX>", built without a string walk
-def private byte_piece_name(bv : int) : string {
-    return string([uint8('<'), uint8('0'), uint8('x'), uint8(hex_char(bv >> 4)), uint8(hex_char(bv & 15)), uint8('>')])
-}
+def private byte_piece_name(bv : int) : string =>
+    string([uint8('<'), uint8('0'), uint8('x'), uint8(hex_char(bv >> 4)), uint8(hex_char(bv & 15)), uint8('>')])
 
 // the next codepoint boundary after byte position i
 def private cpt_end(d : array<uint8> const#; i, n : int) : int {
@@ -404,8 +402,7 @@ def unigram_encode(tk : SpmTokenizer; text : string; unk_id : int64; byte_fallba
         unigram_lattice(tk, d, unk_id, reserved, best, back_len, back_id)
         // the pieces come off the lattice last first
         var inscope rev : array<int64>
-        var inscope rev_at : array<int>
-        var inscope rev_len : array<int>
+        var inscope rev_at, rev_len : array<int>
         var p = length(d)
         while (p > 0) {
             if (back_len[p] <= 0) {   // only a score that is not a number leaves a boundary unreached
