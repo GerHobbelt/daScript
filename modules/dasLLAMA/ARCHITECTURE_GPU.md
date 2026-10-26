@@ -1,6 +1,9 @@
 # dasLLAMA Architecture - GPU backends and refuted kernel shapes
 
-Companion to `ARCHITECTURE.md`; section numbers are that document's.
+Companion to `ARCHITECTURE.md`; section numbers are that document's. This document carries
+sections 1.5 and 2.2b: the GPU backend role table with its closed asymmetry lists, and the
+tensor-GEMM and fused-attention shapes that measured out. The Metal tower's attention routes and
+its encode chains are `ARCHITECTURE_GPU_TOWER.md` sections 2.2w-2.2x.
 
 ### 1.5 GPU backends {#gpu-backends}
 
@@ -9,7 +12,7 @@ that a question answered for one backend has an obvious address in the other. Th
 
 | role | holds | must not hold |
 |---|---|---|
-| the kernel home<br>`dasllama_metal_kernels`, `dasllama_vulkan_classes` | kernel source, the kernel-side quant-decode helpers and codebook tables, the derived-access/PSO census; on Vulkan the one device buffer kernel data fills (`kq_grid_dev`, the grid codebooks) | device state other than `kq_grid_dev`, engine types |
+| the kernel home<br>`dasllama_metal_kernels`, `dasllama_vulkan_classes` | kernel source, the kernel-side quant-decode helpers and codebook tables, the derived-access/PSO census; on Vulkan the one device buffer kernel data fills (`kq_grid_dev`, the grid codebooks) and the host-side ensure/set/enc pick ladders and grid rules over its own class stamps (`gemv_*`, `q8_batch_cls_*`, `kq_batch_cls_*`, `fa_stamp_*`, `f16_gemm_*`) | device state other than `kq_grid_dev`, engine types |
 | `dasllama_<gpu>_common`<br>`dasllama_metal_common`, `dasllama_vulkan_common` | device state, buffer/command plumbing, hazard + capture rail, profiler, host-side quant-decode helpers (Metal's `iq4_lut`) | driver policy |
 | `dasllama_<gpu>_decode`<br>`dasllama_metal_decode`, `dasllama_vulkan_decode` | the resident token-step driver + decode-time arms | kernel bodies |
 | `dasllama_<gpu>_prefill`<br>`dasllama_metal_prefill`, `dasllama_vulkan_prefill` | the batched prefill driver + batch arms | kernel bodies |
@@ -66,11 +69,16 @@ that a question answered for one backend has an obvious address in the other. Th
   the offset-bound head restride, and encodes one `enc_add` at the slice offset after each
   tapped layer's residual - no new kernel (the CPU-side split, `ds_split_quantum`, survives
   as the CPU-loop fallback and the warm/MTP edge); an override without the seat declines
-  deepstack quanta by name, so Metal serves them and Vulkan does not.
+  deepstack quanta by name, so Metal serves them and Vulkan does not. The E-series PLE pre-step
+  is two gate seats, one per direction: `register_ple_gpu_gate` for a prefill override that builds
+  the side input on device off the stashed token ids (Metal and Vulkan register it),
+  `register_ple_gpu_decode_gate` for a decode override that gathers the token's row on device
+  (Vulkan alone); the hub skips the CPU pre-step only for the direction whose gate answers yes,
+  so the Metal decode keeps reading the CPU-built side input.
 - **Per-layer FFN widths (MatFormer E-series, at most two - `ffn_second_hidden`) serve on Metal
-  only**: the decode and prefill drivers bind the width per layer (dense trunks, no MTP; batch
-  keeps the layer-0 hoist behind its uniformity decline). The Vulkan tier has no PLE arm, so
-  E-series never reaches its width question.
+  and on the Vulkan whole-model driver**: the Metal decode and prefill drivers bind the width per
+  layer (dense trunks, no MTP; batch keeps the layer-0 hoist behind its uniformity decline), and
+  the Vulkan driver's per-layer geometry (`RLayer.hid`) carries it beside the PLE branch.
 - **Family-shared kernel classes live in `dasllama_metal_kernels`.** The `[metal_dispatch]` lens
   generates `enc_*` builders and MSL globals into the module the class COMPILES in, so co-location
   follows the class, never "the builder needs the driver module". Prefill's prefill-only classes are convergence debt, not precedent.
@@ -79,19 +87,26 @@ that a question answered for one backend has an obvious address in the other. Th
   keep the pre-family compact kargs slots while their base classes bind the family numbers, so no
   shared bind path may span the two layouts; the in-engine moe mul_mm A/B race harnesses
   (`dasllama_metal_prefill.das`) encode through `kn_moe_mm_family_tail` rather than a per-class
-  `enc_*` builder; and the iq4 family's iq4nl stamps (`MetalKqGemvIq4T`, `MetalKqMvIq4T`, `MetalKqMvB8Iq4T`)
-  bind the strip plane unread, so both formats share one set layout and one host bind path.
+  `enc_*` builder; the iq4 family's iq4nl stamps (`MetalKqGemvIq4T`, `MetalKqMvIq4T`, `MetalKqMvB8Iq4T`)
+  and the mul_mm tensor template's compact-scale stamps off the same family (`MetalKqMulMmIq4xsTensorT`
+  at IQ4NL, the dense `MetalKqMulMmIq4nlT` / `TH` and `MetalKqMulMmQ40T` / `TH`, and the four
+  `MetalMoeMulMmQ40*` expert stamps)
+  bind the strip plane unread, so both formats share one set layout and one host bind path; and the
+  split-scale dev-W dequant stamps (`MetalKqDequant<Fmt>`) inherit the mul_mm scaffold's `xf` and `y`
+  bindings unread - they write only the f16 panel at binding 7 - so a format's dequant pass and its
+  mul_mm twins keep one set layout and one host bind path.
 - **`dasllama_gpu_tier.das`** - the device-cooperation SPI: hook types, install/unset slots, route/mark/want/status
   state, engine-facing forwarders. Vulkan implements it (per-op offload plus resident plumbing, and the decode-era
   seats it alone fills: the cm2 expert chain `set_moe_gpu_ffn_xf_hooks` / `_async_hooks`, the decode attention block
   `set_moe_gpu_attn_dec_hooks`, the decode FFN tail `set_moe_gpu_ffn_tail_hooks`, the deltanet decode step's state
   seams `set_moe_gpu_dn_state_hooks` (flush, invalidate, release), the whole-token span `set_moe_gpu_span_dec_hook` -
   the span rides common's decode override registry as `vulkan_moe_span`, selected by the MoE placement and declining
-  per token - the resident driver's q/k/v projection-bias seat `install_moe_gpu_resident_bias`, its MoE seats
+  per token - the resident driver's q/k/v projection-bias seat `install_moe_gpu_resident_bias`, its attention-sink seat
+  `install_moe_gpu_resident_sinks` (the per-head sink plane, `ARCHITECTURE_GPU_VULKAN_ATTN.md` sec.2.2am), its MoE seats
   `install_moe_gpu_resident_moe` (the tile admission per expert triple, the routing geometry with the router plane, an
   MoE layer, and the routed block on a layer another seat built) behind the route lever `set_gpu_resident_route` /
-  `gpu_want_resident`, the OS video-memory seat `install_moe_gpu_os_memory` the residency plan sizes against, and the
-  weight-bytes seat `install_rdec_note_weight_bytes` the decode warm-up guard reads). The
+  `gpu_want_resident`, the OS video-memory seat `install_moe_gpu_os_memory` the residency plan sizes against, the
+  weight-bytes seat `install_rdec_note_weight_bytes` the decode warm-up guard reads, and the per-layer-embedding seats `install_rdec_ple` - the branch's width, its per-layer gate and proj planes, the pre-step's projection and the token table on the device). The
   installs are one-way: a test that arms the tier installs the seats and never restores them,
   because no uninstall exists and none is needed - a seat serves whatever model loads next; Metal
   deliberately does not, because UMA makes residency moot there and Metal
@@ -221,7 +236,7 @@ re-buying a measured loss.
 The probe also RETAINS the decided-and-shipped arms (the half-A stream, the dev-W all-device
 form, the tall M-tile twin, the bk staging depths, the no-zero-init form) as hand-written MSL
 reference implementations beside the refuted ones - they are the arc's bisect ledger, and the
-sync duty is `REVIEW_GPU.md`'s. The attention lab keeps the same class of retained references:
+sync duty is `REVIEW_GPU_RACE.md`'s. The attention lab keeps the same class of retained references:
 its PORT/PORTH/PORTC arms and `benchmarks/attn/lcpp_flash_dk72.metal` are the oracle-exact
 external reference the shipped `MetalTowerFlash` was decided against, and the DIAL arm races
 the production dialect against them - the bisect seat when the flash regresses.
@@ -261,40 +276,12 @@ consecutive staging runs, relaxed_precision always - are `REVIEW_GPU.md` rules a
 and why they lose.
 
 The Vulkan resident driver's sections live in its companions, each head saying what it holds: 2.2j,
-2.2p, 2.2ab, 2.2ac, 2.2ad, 2.2ai and 2.2aj in `ARCHITECTURE_GPU_VULKAN.md`; 2.2k-2.2m, 2.2q, 2.2ae and 2.2ah in
+2.2p, 2.2ab, 2.2ac, 2.2ad, 2.2ai and 2.2aj in `ARCHITECTURE_GPU_VULKAN.md`; 2.2al and 2.2am in
+`ARCHITECTURE_GPU_VULKAN_ATTN.md`; 2.2k-2.2m, 2.2q, 2.2ae and 2.2ah in
 `ARCHITECTURE_GPU_VULKAN_GEMM.md`; 2.2n-2.2o in `ARCHITECTURE_GPU_VULKAN_RESIDENCY.md`; 2.2r-2.2v in
-`ARCHITECTURE_GPU_VULKAN_DECODE.md`; 2.2af and 2.2ag in `ARCHITECTURE_GPU_VULKAN_MOE.md`.
+`ARCHITECTURE_GPU_VULKAN_DECODE.md`; 2.2af, 2.2ag and 2.2ak in `ARCHITECTURE_GPU_VULKAN_MOE.md`.
 
-### 2.2w The tower attention routes {#tower-attn-routes}
-
-A tower head width is padded to `hs_pad = max(64, ceil32(hs))` - 72 and 80 both land on 96 -
-because the QK stamps walk multiples of 32 while the guarded AV forms carry no multiple-of-64
-requirement. A route that uses the padded width pays a restride to and from the towers' compact
-rows. Three routes serve tower attention:
-
-- **The flash route** takes a head size of exactly 72 on a canvas whose row count divides 64.
-  It runs one pass - no score slab, no rowstat, no head restrides - reading K and V as
-  per-head-contiguous f16 panels (the panel and tail-slack contract sits on the kernel class)
-  while Q and the output ride the compact f32 rows. `DASLLAMA_METAL_TOWER_FLASH=0` pins the
-  slab trio.
-- **The per-window route** serves the qwen2.5 ViT's block-diagonal layers: one threadgroup per
-  (window, head), one thread per query row, windows capped at 64 rows. It reads q, k and v
-  compact and straight from device in f32 - a window's K and V sit in L1, and f16 staging noise
-  would compound over the tower's 28 layers. Layers that attend in full restride onto the
-  padded slab and take the shared trio.
-- **The slab trio** - the prefill driver's QK, rowstat and AV builders - serves everything else
-  and sizes its score slab at `heads x mp x nk64` halfs. Off the flash route that slab is the
-  encode's only attention allocation; on it the driver takes a stub.
-
-### 2.2x The tower driver's encode chains {#tower-encode-chains}
-
-Each family the tower driver serves gets one chain that encodes the whole encode into ONE
-command buffer and reads back once: the block loop, and - for gemma4a and qwen3a - the mel and
-conv front ahead of it. A chain is dispatch for dispatch the same graph as its family's CPU
-encoder loop, in the same order and at the same operand shapes, so the CPU loop is the chain's
-specification and the CPU-vs-GPU transcript cells are its parity instrument. Every chain is
-best-effort: it answers false (or -1) on any shape, knob, quant-mode or device decline, and the
-CPU chain serves that encode. Engage is read from counter deltas (`metal_tower_stats`,
-`metal_tower_f16_encodes`), never from "the model ran".
+Sections 2.2w-2.2x, the tower attention routes and the tower driver's encode chains, are
+`ARCHITECTURE_GPU_TOWER.md`.
 
 Sections 2.2y-2.2z, the Metal quant plane reads, are `ARCHITECTURE_GPU_QUANT_PLANES.md`.

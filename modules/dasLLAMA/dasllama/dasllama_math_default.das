@@ -280,13 +280,12 @@ def private q8q8_kernel(var yp : float?; wp : int8 const?; sp : float const?; xq
 def private q8q8_batch_kernel(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n, d, ntok : int64) {
     let nb = n / 32l
     var myp = yp
-    if (g_pf_prof) {
+    // the raw parallel_for below is a dispatch single-thread mode admits no exception for
+    if (g_pf_prof && !get_single_thread_()) {
         // instrumented path: raw parallel_for + per-worker start capture (see pf_prof_report)
-        unsafe {
-            var wsp0 = addr<int64?>(g_pf_ws[0])
-            for (k in range64(d)) {
-                wsp0[k] = 0l
-            }
+        var wsp0 = unsafe(addr<int64?>(g_pf_ws[0]))
+        for (k in range64(d)) {
+            unsafe(wsp0[k]) = 0l
         }
         let pf0 = ref_time_ticks()
         unsafe {
@@ -479,9 +478,11 @@ def k4_sc_mn(sp : uint8 const?; j : int64) : int2 {
 // kq v2 (all three formats): Q8_K-form activations — xsp is the PER-SUPERBLOCK scale plane
 // (n/256 per token); integer sub-scale / bsums-x-mins sums fold to ONE float per superblock.
 // Int sums are exact, so this is bit-exact vs the grp walk regardless of sub-block order.
-[hint(unsafe_range_check, noalias = kqrow, noalias = ksrow, noalias = xqp, noalias = xsp, noalias = xbsp)]
+[arch(at = "../ARCHITECTURE_CPU_KERNELS.md#cpu-tier-target-select"),
+ hint(unsafe_range_check, noalias = kqrow, noalias = ksrow, noalias = xqp, noalias = xsp, noalias = xbsp)]
 def dot_k4q8(kqrow : uint8 const?; ksrow : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n : int64) : float {
     var acc = 0.0
+    let nibble_mask = byte16(15)
     unsafe {
         for (sb in range64(n / 256l)) {
             let kqo = sb * 128l
@@ -491,16 +492,13 @@ def dot_k4q8(kqrow : uint8 const?; ksrow : uint8 const?; xqp : int8 const?; xsp 
             var isum = 0
             var bsum = 0
             for (js in range64(4l)) {   // 32 quant bytes: low nibbles = sub-block 2js, high = 2js+1
-                let qb = kqo + 32l * js
                 let b0 = sb * 8l + 2l * js   // activation 32-block of the low-nibble sub-block
-                let ab = b0 * 32l
-                var ilo = 0
-                var ihi = 0
-                for (l in range64(32l)) {
-                    let q = int(kqrow[qb + l])
-                    ilo += (q & 15) * int(xqp[ab + l])
-                    ihi += (q >> 4) * int(xqp[ab + 32l + l])
-                }
+                let qv = reinterpret<byte16 const?>(kqrow + kqo + 32l * js)
+                let av = reinterpret<byte16 const?>(xqp + b0 * 32l)
+                let q0 = qv[0]
+                let q1 = qv[1]
+                let ilo = idot(q0 & nibble_mask, av[0]) + idot(q1 & nibble_mask, av[1])
+                let ihi = idot((q0 >> 4) & nibble_mask, av[2]) + idot((q1 >> 4) & nibble_mask, av[3])
                 let s0 = k4_sc_mn(ksrow + kso + 4l, 2l * js)
                 let s1 = k4_sc_mn(ksrow + kso + 4l, 2l * js + 1l)
                 isum += s0.x * ilo + s1.x * ihi

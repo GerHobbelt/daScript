@@ -25,7 +25,6 @@ require [tune_framework] public  // re-export ONLY llvm_tune (not math_gen's who
 require ?das_metal dasllama/dasllama_metal_gemm  // [init]-only: registers "metal" (the GPU prefill-GEMM batch donor). STRICT guard: the C++ das_metal module exists on Apple builds only, so non-Apple lanes never compile the Metal driver
 require ?das_accelerate dasllama/dasllama_math_accelerate  // [init]-only: arms the "+AMX" float-batch override when DASLLAMA_ACCEL=1. Same Apple-only guard shape as the metal driver
 require dasllama/dasllama_gguf
-require dasllama/dasllama_gemm_schema  // kq_qsb/kq_ssb — the fmt-id plane strides
 require dasllama/dasllama_tokenizer  // Model owns its tokenizer; load_model populates it
 require dasllama/dasllama_par  // maybe_parallel_for (+ get_total_hw_jobs): thread the prefill attention over heads
 require dasllama/dasllama_tune  // box_profile_path: the runtime half of the app tune sidecar applies at load_model
@@ -269,16 +268,23 @@ def active_prefill_override : string {
     return g_prefill_override_name
 }
 
-//! The GPU-PLE pre-step gate: a prefill override that can ALSO build the E-series PLE side input
-//! on its device registers a probe here. On true, forward_prefill stashes the token rows and skips
-//! the CPU gather+finish; the override consumes the stash (ple_pre_prefill = late-decline fallback).
+//! The GPU-PLE pre-step gates, one per direction: a prefill override that builds the E-series PLE
+//! side input on device registers the prefill gate, a decode override that gathers the token's row
+//! on device registers the decode gate; on true the hub skips the CPU pre-step for that call only.
 typedef PleGpuGateFn = function<(t : Model; s : Session; npos : int64; start_pos : int64) : bool>
 var private g_ple_gpu_gate : PleGpuGateFn
 var private g_ple_gpu_gate_set = false
+var private g_ple_gpu_decode_gate : PleGpuGateFn
+var private g_ple_gpu_decode_gate_set = false
 
 def register_ple_gpu_gate(fn : PleGpuGateFn) {
     g_ple_gpu_gate = fn
     g_ple_gpu_gate_set = true
+}
+
+def register_ple_gpu_decode_gate(fn : PleGpuGateFn) {
+    g_ple_gpu_decode_gate = fn
+    g_ple_gpu_decode_gate_set = true
 }
 
 typedef EmbedGpuGateFn = function<(t : Model; s : Session; npos : int64; start_pos : int64) : bool>
@@ -312,13 +318,27 @@ def register_ple_pre_prefill_pad(fn : PlePrePrefillPadFn) {
     g_ple_pre_prefill_pad = fn
 }
 
+//! the gather half of the pre-step alone: every position's per-layer table row, scaled by sqrt(ple), position-major into `dst` - a device driver finishing the pre-step on its side takes these rows
+typedef PleGatherRowsFn = function<(t : Model; tokens : array<int64>; npos : int64; var dst : array<float>) : void>
+var private g_ple_gather_rows : PleGatherRowsFn
+
+def register_ple_gather_rows(fn : PleGatherRowsFn) {
+    g_ple_gather_rows = fn
+}
+
+def ple_gather_rows(t : Model; tokens : array<int64>; npos : int64; var dst : array<float>) {
+    if (g_ple_gather_rows == null) ple_rail_missing()
+    invoke(g_ple_gather_rows, t, tokens, npos, dst)
+}
+
 // Every call site is behind has_ple(config), so an unset rail means this program was built without
 // dasllama/dasllama_ple yet loaded a model that needs it — say which require is missing, loudly.
 def private ple_rail_missing() {
     panic("dasLLAMA: this model needs the PLE rail - the program must require dasllama/dasllama_ple")
 }
 
-def private ple_pre_decode(t : Model; var s : Session; token : int64) {
+//! Public as the late-decline fallback for a driver that claimed the token's pre-step via the gate.
+def ple_pre_decode(t : Model; var s : Session; token : int64) {
     if (g_ple_pre_decode == null) ple_rail_missing()
     invoke(g_ple_pre_decode, t, s, token)
 }
@@ -541,17 +561,23 @@ var private g_layout_repack_q8 : ModelRepackFn
 var private g_layout_repack_kq : ModelRepackFn
 var private g_layout_repack_mx4 : ModelRepackFn
 var private g_layout_repack_q51 : ModelRepackFn
+typedef GatherStackB32Fn = function<(t : Model; woff : int64; n, rows, slice_rows : int64;
+                                     repacked : bool; mr : int64; var wq : array<uint8>; var ws : array<uint8>) : void>
 var private g_layout_gather : GatherStackFn
 var private g_layout_gather_kq : GatherStackKqFn
+var private g_layout_gather_q51 : GatherStackB32Fn
+var private g_layout_gather_mx4 : GatherStackB32Fn
 var private g_layout_hooks_set = false
 
-def register_model_layout(rq8, rkq, rmx4, rq51 : ModelRepackFn; gs : GatherStackFn; gskq : GatherStackKqFn) {
+def register_model_layout(rq8, rkq, rmx4, rq51 : ModelRepackFn; gs : GatherStackFn; gskq : GatherStackKqFn; gsq51, gsmx4 : GatherStackB32Fn) {
     g_layout_repack_q8 = rq8
     g_layout_repack_kq = rkq
     g_layout_repack_mx4 = rmx4
     g_layout_repack_q51 = rq51
     g_layout_gather = gs
     g_layout_gather_kq = gskq
+    g_layout_gather_q51 = gsq51
+    g_layout_gather_mx4 = gsmx4
     g_layout_hooks_set = true
 }
 
@@ -594,6 +620,18 @@ def layout_gather_stack_kq(t : Model; fmt : KqFmt; woff : int64; n, rows, slice_
                            repacked : bool; mr : int64; var wq : array<uint8>; var ws : array<uint8>) {
     layout_hooks_check()
     invoke(g_layout_gather_kq, t, fmt, woff, n, rows, slice_rows, repacked, mr, wq, ws)
+}
+
+def layout_gather_stack_q51(t : Model; woff : int64; n, rows, slice_rows : int64;
+                            repacked : bool; mr : int64; var wq : array<uint8>; var ws : array<uint8>) {
+    layout_hooks_check()
+    invoke(g_layout_gather_q51, t, woff, n, rows, slice_rows, repacked, mr, wq, ws)
+}
+
+def layout_gather_stack_mx4(t : Model; woff : int64; n, rows, slice_rows : int64;
+                            repacked : bool; mr : int64; var wq : array<uint8>; var ws : array<uint8>) {
+    layout_hooks_check()
+    invoke(g_layout_gather_mx4, t, woff, n, rows, slice_rows, repacked, mr, wq, ws)
 }
 
 // ===== whole-model GPU residency hook (registered by dasllama_gpu_resident at [init]) =====
@@ -895,6 +933,10 @@ struct Model {
     // scale strips, k6s the GPU split form. CPU inference on a blob-only model PANICS.
     mblob : array<uint8>
     metal_blob : bool = false
+    //! the kq scale planes already put in their device form, one bit per BLOB_SCALE_PLANES entry:
+    //! those transforms rewrite a plane IN PLACE, so a second walk over the same carrier shreds it.
+    //! Build-time bookkeeping about this process's carrier, never about the image - so never serialized.
+    blob_scaled : uint = 0u
     //! Baked dev-W f16 panels (metal flavor): bound zero-copy by the prefill dev-W route; empty = runtime dequant
     devwf16 : array<float16>
     devwf16_fmt : array<int>
@@ -1166,9 +1208,7 @@ def image_backing_release(map : void?; bytes : uint64) {
     if (map == null || image_chunk_free(map)) {
         return
     }
-    unsafe {
-        fmap_close(map, bytes)
-    }
+    unsafe(fmap_close(map, bytes))
 }
 
 // Model's finalizer (every `delete model` lowers to _::finalize and lands here): image-backed
@@ -1178,9 +1218,7 @@ def finalize(var t : Model) {
     apply(t) $ [unused_argument(name)] (name : string; var field) {
         static_if (typeinfo is_array(field)) {
             if (lock_count(field) != 0) {
-                unsafe {
-                    _builtin_forget_temp_array(field)
-                }
+                unsafe(_builtin_forget_temp_array(field))
             } else {
                 delete field
             }
@@ -2430,9 +2468,7 @@ def make_run_state_paged(c : Config; var pool : KVPool) : Session {
         }
     }
     var s <- make_run_state(c, pool.kdt, pool.vdt, false)
-    unsafe {
-        s.kv_pool = addr(pool)
-    }
+    s.kv_pool = unsafe(addr(pool))
     // paged run scratch: a window can span every page of the (post-cap) context
     s.kv_runs |> resize((c.seq_len + pool.page_rows - 1l) / pool.page_rows + 1l)
     return <- s
@@ -2950,16 +2986,12 @@ def kv_store_row(var dst0 : uint8?; dt : KVDtype; kv_dim, row, sub, n : int64; s
             cvt_f32_to_f16(d + row * kv_dim + sub, src, n)   // clamps to ±65504: inf never enters the cache
         }
     } elif (dt == KVDtype.q8_0) {
-        unsafe {
-            // sub is 0 or a head boundary and head_size/kv_dim are 32-multiples (create-time
-            // contract), so the destination is always a whole-block offset
-            quantize_q8kv_row(dst0 + (row * kv_dim + sub) / 32l * 34l, src, n)
-        }
+        // sub is 0 or a head boundary and head_size/kv_dim are 32-multiples (create-time
+        // contract), so the destination is always a whole-block offset
+        quantize_q8kv_row(unsafe(dst0 + (row * kv_dim + sub) / 32l * 34l), src, n)
     } elif (dt == KVDtype.tq4) {
-        unsafe {
-            // src rows are already in the rotated basis — the drivers rotate at the RoPE seam
-            quantize_tq4kv_row(dst0 + (row * kv_dim + sub) / 32l * 18l, src, n)
-        }
+        // src rows are already in the rotated basis — the drivers rotate at the RoPE seam
+        quantize_tq4kv_row(unsafe(dst0 + (row * kv_dim + sub) / 32l * 18l), src, n)
     } else {
         panic("KV cache codec not yet implemented")
     }
@@ -2980,13 +3012,9 @@ def kv_load_row(src0 : uint8 const?; dt : KVDtype; kv_dim, row, sub, n : int64; 
             cvt_f16_to_f32(dst, sp + row * kv_dim + sub, n)
         }
     } elif (dt == KVDtype.q8_0) {
-        unsafe {
-            cvt_q8kv_to_f32(dst, src0 + (row * kv_dim + sub) / 32l * 34l, n)
-        }
+        cvt_q8kv_to_f32(dst, unsafe(src0 + (row * kv_dim + sub) / 32l * 34l), n)
     } elif (dt == KVDtype.tq4) {
-        unsafe {
-            cvt_tq4kv_to_f32(dst, src0 + (row * kv_dim + sub) / 32l * 18l, n)
-        }
+        cvt_tq4kv_to_f32(dst, unsafe(src0 + (row * kv_dim + sub) / 32l * 18l), n)
     } else {
         panic("KV cache codec not yet implemented")
     }
@@ -3403,10 +3431,8 @@ def tq4_unrotate_batch(var buf : array<float>; nrows, stride, head_size : int64;
 // tq4_unrotate_batch's raw-pointer twin — the Metal prefill continuation un-rotates gathered
 // panel rows in place (the GPU attention runs in the raw basis)
 def tq4_unrotate_rows(var p : float?; nrows, stride, head_size : int64; signs : float const?) {
-    unsafe {
-        for (sg in range64(nrows * (stride / head_size))) {
-            fwht_unsign_row(p + sg * head_size, signs, head_size)
-        }
+    for (sg in range64(nrows * (stride / head_size))) {
+        fwht_unsign_row(unsafe(p + sg * head_size), signs, head_size)
     }
 }
 
@@ -4448,18 +4474,16 @@ def private cls_softcap_chain(t : Model; var s : Session; cap : float) {
         let kspc = kq_plane_s(t, cls_fmt, t.wcls_off)
         let rowsc = kq_rows_for(cls_fmt)
         team_parallel_stages(s.chain_stages) <| @(stage : int; jb : int; je : int) {   // nolint:PERF026 — dispatch-API lambda capture, see attention_chain_decode
-            unsafe {
-                let r0 = int64(jb) * 32l
-                let r1 = int64(je) * 32l
-                if (is_kq) {
-                    invoke(rowsc, lp, kqpc, kspc, xqp, xsp, xbsw, dim, r0, r1)
-                } elif (f16w) {
-                    invoke(mmrows16, lp, wp, ws16, xqp, xsp, dim, r0, r1)
-                } else {
-                    invoke(mmrows, lp, wp, ws, xqp, xsp, dim, r0, r1)
-                }
-                softcap4(lp + r0, r1 - r0, cap)
+            let r0 = int64(jb) * 32l
+            let r1 = int64(je) * 32l
+            if (is_kq) {
+                invoke(rowsc, lp, kqpc, kspc, xqp, xsp, xbsw, dim, r0, r1)
+            } elif (f16w) {
+                invoke(mmrows16, lp, wp, ws16, xqp, xsp, dim, r0, r1)
+            } else {
+                invoke(mmrows, lp, wp, ws, xqp, xsp, dim, r0, r1)
             }
+            softcap4(unsafe(lp + r0), r1 - r0, cap)
         }
     }
 }
@@ -4481,7 +4505,11 @@ def forward(t : Model; var s : Session; token, pos : int64) {   // nolint:STYLE0
     prof_add("embed", ts_embed)
     if (has_ple(c)) {  // gemma-4 E-series: build this token's per-(layer) side input before the stack
         let ts_ple = prof_ticks()
-        ple_pre_decode(t, s, token)
+        if (g_ple_gpu_decode_gate_set && invoke(g_ple_gpu_decode_gate, t, s, 1l, pos)) {
+            s.ple_gpu_pending = true   //! the decode override gathers the row off `token` itself and finishes the pre-step on device
+        } else {
+            ple_pre_decode(t, s, token)
+        }
         prof_add("ple", ts_ple)
     }
 

@@ -92,6 +92,7 @@ def public rewrite_children(var e : ExpressionPtr; fn : block<(var c : Expressio
         for (vi in range(length(o.values))) {
             o.values[vi] = invoke(fn, o.values[vi])
         }
+        o.constValues = false
     } else {
         guard_unhandled_node(e)
     }
@@ -498,10 +499,7 @@ def public fully_inferred(e : ExpressionPtr) : bool {
 def public eval_to_const(var e : ExpressionPtr) : ExpressionPtr {
     if (e == null || e._type == null || !fully_inferred(e)) return e
     var ok = false
-    var val : float4
-    unsafe {
-        val = eval_single_expression(e, ok)
-    }
+    let val = unsafe(eval_single_expression(e, ok))
     if (!ok) return e
     let bt = e._type.baseType
     if (bt == Type.tFloat) return new ExprConstFloat(at = e.at, value = val.x)

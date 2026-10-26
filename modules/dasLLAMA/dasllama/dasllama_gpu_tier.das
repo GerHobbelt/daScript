@@ -132,9 +132,7 @@ struct RdecDnGeom {
     cd, kd, di, nvh, nkh, ds, dconv : int64
     ba_f32 : bool
 }
-//! the resident driver's norms plane carries this many rows per layer: the attention norm, the FFN norm,
-//! and a pre/post-norm model's post-attention and post-FFN norms (zero rows on any other model)
-let public RDEC_NORM_ROWS = 5l   //! rms_att, rms_ffn, post-attention, post-FFN, the per-layer-embedding post norm (zero rows where a model lacks them)
+let public RDEC_NORM_ROWS = 10l   //! rms_att, rms_ffn, post-attention, post-FFN, the per-layer-embedding post norm, then the gemma-4 MoE layer's router scale, routed pre norm, dense post norm and routed post norm, then the attention output bias row (gpt-oss) - zero rows where a model lacks them
 
 //! One attention layer's geometry for the resident driver - its attention class (gemma-4's sliding and
 //! global layers differ in head size, kv width and rope), its dense FFN width, and where its rows sit.
@@ -150,12 +148,15 @@ struct RdecLayerGeom {
     vnorm : bool                    //! V is scaled by its own rms, no weight (gemma-4's v-norm on a layer with its own v plane)
     out_scale : float               //! the layer's output scale on its FFN residual step; 1.0 = none
     kv_shared : bool                //! the layer projects Q only and attends over a donor layer's K/V rows (`mir_base` is the donor's; gemma-4 E-series)
+    attn_cap : float                //! the attention logit softcap on the scaled scores (gemma-2: 50); 0 = none
+    moe_g4 : bool                   //! the gemma-4 MoE layer: a parallel dense shared expert, the routed branch and the router each on their own norm of x
 }
 //! qd / kv_dim / head_size / hidden / rot are the maxima over the layers (the scratch is sized to
 //! them); `mir_elems` is one mirror side's element count over every attention layer, `cos_elems`
 //! a position's cos/sin plane (the rope classes' rows end to end).
 typedef RdecPrepareFn = function<(n_layers : int64; n_attn : int64; dim : int64; qd : int64; kv_dim : int64; head_size : int64; n_heads : int64; hidden : int64; vocab : int64; seq_cap : int64; neox : bool; eps : float; scale : float; qk_norm : bool; kv16 : bool; q_gated : bool; rot : int64; dn : RdecDnGeom; mir_elems : int64; cos_elems : int64) : bool>
-typedef RdecNormsFn = function<(norms : array<float>) : void>
+//! `obias`: the plane's `RDEC_NORM_ROWS`-th row a layer is the attention output bias the residual step adds (gpt-oss); zero rows otherwise
+typedef RdecNormsFn = function<(norms : array<float>; obias : bool) : void>
 typedef RdecSetLayerFn = function<(l : int64; mir_idx : int64; bq : int64; bk : int64; bv : int64; bo : int64; b1 : int64; b3 : int64; b2 : int64; fq : int; fk : int; fv : int; fo : int; f1 : int; f3 : int; f2 : int; g : RdecLayerGeom) : void>
 typedef RdecSetDnLayerFn = function<(l : int64; bqkv : int64; bz : int64; bout : int64; bbeta : int64; balpha : int64; b1 : int64; b3 : int64; b2 : int64; ba_off : int64; fqkv : int; fz : int; fout : int; f1 : int; f3 : int; f2 : int; convw : float const?; wnormp : float const?; ap : float const?; dtp : float const?) : void>
 typedef RdecUploadDnBaFn = function<(rows : array<float>) : void>
@@ -166,7 +167,8 @@ typedef RdecDnPrefillOwnFn = function<(l : int64; stp : float?; histp : float?) 
 typedef RdecSetClsFn = function<(cls_block : int64; cls_fmt : int; cap : float; supp : array<int64>) : void>
 //! `ple_row` / `ple_rows`: the per-layer-embedding side input the CPU pre-step built ([layers x ple] a token; position-major over a prompt); empty on a model without one
 typedef RdecTokenFn = function<(x : array<float>; cossin : array<float>; ple_row : array<float>; pos : int64; cnt : int64; var logits : array<float>) : void>
-typedef RdecPrefillFn = function<(x_batch : array<float>; cos_batch : array<float>; ple_rows : array<float>; npos : int64; var logits : array<float>) : void>
+//! `ple_raw`: the rows are the gather half alone (sqrt(ple)-scaled table rows) and the driver finishes the pre-step on device; false = the finished side input
+typedef RdecPrefillFn = function<(x_batch : array<float>; cos_batch : array<float>; ple_rows : array<float>; ple_raw : bool; npos : int64; var logits : array<float>) : void>
 typedef RdecSyncKvFn = function<(l : int64; kp : uint8 const?; vp : uint8 const?; npos : int64) : void>
 typedef RdecReadKvFn = function<(l : int64; pos : int64; var kp : uint8?; var vp : uint8?) : void>
 typedef RdecReadKvBulkFn = function<(l : int64; var kp : uint8?; var vp : uint8?; npos : int64) : void>
@@ -177,8 +179,8 @@ def private rdec_unset_reserve(fmt : int; cap_blocks : int64) : bool => false
 def private rdec_unset_place(wq : array<uint8>; ws : array<uint8>; n, rows : int64; fmt : int) : int64 => -1l
 [unused_argument(n_layers, n_attn, dim, qd, kv_dim, head_size, n_heads, hidden, vocab, seq_cap, neox, eps, scale, qk_norm, kv16, q_gated, rot, dn, mir_elems, cos_elems)]
 def private rdec_unset_prepare(n_layers, n_attn, dim, qd, kv_dim, head_size, n_heads, hidden, vocab, seq_cap : int64; neox : bool; eps, scale : float; qk_norm : bool; kv16 : bool; q_gated : bool; rot : int64; dn : RdecDnGeom; mir_elems, cos_elems : int64) : bool => false
-[unused_argument(norms)]
-def private rdec_unset_norms(norms : array<float>) {}
+[unused_argument(norms, obias)]
+def private rdec_unset_norms(norms : array<float>; obias : bool) {}
 [unused_argument(l, mir_idx, bq, bk, bv, bo, b1, b3, b2, fq, fk, fv, fo, f1, f3, f2, g)]
 def private rdec_unset_set_layer(l, mir_idx, bq, bk, bv, bo, b1, b3, b2 : int64; fq, fk, fv, fo, f1, f3, f2 : int; g : RdecLayerGeom) {}
 [unused_argument(l, bqkv, bz, bout, bbeta, balpha, b1, b3, b2, ba_off, fqkv, fz, fout, f1, f3, f2, convw, wnormp, ap, dtp)]
@@ -195,8 +197,8 @@ def private rdec_unset_set_cls(cls_block : int64; cls_fmt : int; cap : float; su
 def private rdec_unset_token(x : array<float>; cossin : array<float>; ple_row : array<float>; pos, cnt : int64; var logits : array<float>) {
     panic("dasLLAMA: resident decode token hit without an installed GPU driver")
 }
-[unused_argument(x_batch, cos_batch, ple_rows, npos, logits)]
-def private rdec_unset_prefill(x_batch : array<float>; cos_batch : array<float>; ple_rows : array<float>; npos : int64; var logits : array<float>) {
+[unused_argument(x_batch, cos_batch, ple_rows, ple_raw, npos, logits)]
+def private rdec_unset_prefill(x_batch : array<float>; cos_batch : array<float>; ple_rows : array<float>; ple_raw : bool; npos : int64; var logits : array<float>) {
     panic("dasLLAMA: resident prefill hit without an installed GPU driver")
 }
 [unused_argument(l, kp, vp, npos)]
@@ -243,12 +245,31 @@ def public install_moe_gpu_resident_bias(upload_bias : RdecUploadBiasFn) {
 def public rdec_bias_installed() : bool => g_rdec_bias_installed
 def public rdec_upload_bias(rows : array<float>) { invoke(g_rdec_upload_bias, rows) }
 
+//! The per-head attention sink logits (gpt-oss), every layer's [n_heads] row in layer order; false = the device has no arm for them
+typedef RdecUploadSinksFn = function<(rows : array<float>) : bool>
+
+[unused_argument(rows)]
+def private rdec_unset_upload_sinks(rows : array<float>) : bool => false
+var g_rdec_upload_sinks = @@rdec_unset_upload_sinks
+var g_rdec_sinks_installed = false
+
+//! Install the resident driver's attention-sink seat (gpt-oss) - separately, so a tier without it declines a sink model by name.
+def public install_moe_gpu_resident_sinks(upload_sinks : RdecUploadSinksFn) {
+    g_rdec_upload_sinks = upload_sinks
+    g_rdec_sinks_installed = true
+}
+
+def public rdec_sinks_installed() : bool => g_rdec_sinks_installed
+def public rdec_upload_sinks(rows : array<float>) : bool => invoke(g_rdec_upload_sinks, rows)
+
 // ===== the resident driver's MoE seats =====
 //! Does the resident MoE block admit an expert triple of these formats - the tile family it
 //! rides is the device's (the f16-fed cm2 tiles today).
 typedef RdecMoeOkFn = function<(f1 : int; f3 : int; f2 : int) : bool>
 //! The MoE geometry and the router plane (every MoE layer's [ne x dim] rows, then its gate row when the shared expert is gated) after the prepare; false = the class rails declined.
-typedef RdecPrepareMoeFn = function<(ne : int64; k : int64; nfe : int64; nsh : int64; n_moe : int64; sh_gated : bool; norm_topk : bool; is_gelu : bool; wscale : float; router : array<float>) : bool>
+//! `dscale`: every MoE layer's per-expert down scales [n_moe x ne] the top-k folds into its weights (gemma-4); `act_oai`: the experts' activation is the clamped swiglu (gpt-oss).
+//! `rbias`: every MoE layer's router bias [n_moe x ne]; `gbias` / `ubias` / `dbias`: the expert stacks' bias rows ([n_moe x ne x nfe] twice, [n_moe x ne x dim]) - each plane empty on a model without it.
+typedef RdecPrepareMoeFn = function<(ne : int64; k : int64; nfe : int64; nsh : int64; n_moe : int64; sh_gated : bool; norm_topk : bool; is_gelu : bool; act_oai : bool; wscale : float; router : array<float>; dscale : array<float>; rbias : array<float>; gbias : array<float>; ubias : array<float>; dbias : array<float>) : bool>
 //! Register an MoE attention layer: the attention quad, the dense triple (the shared expert's, or -1 blocks for none) and the expert triple.
 typedef RdecSetMoeLayerFn = function<(l : int64; mir_idx : int64; router_slot : int64; bq : int64; bk : int64; bv : int64; bo : int64; b1 : int64; b3 : int64; b2 : int64; be1 : int64; be3 : int64; be2 : int64; fq : int; fk : int; fv : int; fo : int; f1 : int; f3 : int; f2 : int; fe1 : int; fe3 : int; fe2 : int; g : RdecLayerGeom) : void>
 //! Register the routed block on a layer already registered by its own seat (a recurrent MoE layer after its deltanet registration): the expert triple and the layer's router-plane slot.
@@ -256,8 +277,9 @@ typedef RdecSetMoeExpertsFn = function<(l : int64; router_slot : int64; be1 : in
 
 [unused_argument(f1, f3, f2)]
 def private rdec_unset_moe_ok(f1, f3, f2 : int) : bool => false
-[unused_argument(ne, k, nfe, nsh, n_moe, sh_gated, norm_topk, is_gelu, wscale, router)]
-def private rdec_unset_prepare_moe(ne, k, nfe, nsh, n_moe : int64; sh_gated, norm_topk, is_gelu : bool; wscale : float; router : array<float>) : bool => false
+[unused_argument(ne, k, nfe, nsh, n_moe, sh_gated, norm_topk, is_gelu, act_oai, wscale, router, dscale, rbias, gbias, ubias, dbias)]
+def private rdec_unset_prepare_moe(ne, k, nfe, nsh, n_moe : int64; sh_gated, norm_topk, is_gelu, act_oai : bool; wscale : float; router : array<float>; dscale : array<float>;
+                                   rbias : array<float>; gbias : array<float>; ubias : array<float>; dbias : array<float>) : bool => false
 [unused_argument(l, mir_idx, router_slot, bq, bk, bv, bo, b1, b3, b2, be1, be3, be2, fq, fk, fv, fo, f1, f3, f2, fe1, fe3, fe2, g)]
 def private rdec_unset_set_moe_layer(l, mir_idx, router_slot, bq, bk, bv, bo, b1, b3, b2, be1, be3, be2 : int64; fq, fk, fv, fo, f1, f3, f2, fe1, fe3, fe2 : int; g : RdecLayerGeom) {}
 [unused_argument(l, router_slot, be1, be3, be2, fe1, fe3, fe2)]
@@ -280,7 +302,9 @@ def public install_moe_gpu_resident_moe(moe_ok : RdecMoeOkFn; prepare_moe : Rdec
 
 def public rdec_moe_installed() : bool => g_rdec_moe_installed
 def public rdec_moe_ok(f1, f3, f2 : int) : bool => invoke(g_rdec_moe_ok, f1, f3, f2)
-def public rdec_prepare_moe(ne, k, nfe, nsh, n_moe : int64; sh_gated, norm_topk, is_gelu : bool; wscale : float; router : array<float>) : bool => invoke(g_rdec_prepare_moe, ne, k, nfe, nsh, n_moe, sh_gated, norm_topk, is_gelu, wscale, router)
+def public rdec_prepare_moe(ne, k, nfe, nsh, n_moe : int64; sh_gated, norm_topk, is_gelu, act_oai : bool; wscale : float; router : array<float>; dscale : array<float>;
+                            rbias : array<float>; gbias : array<float>; ubias : array<float>; dbias : array<float>) : bool
+    => invoke(g_rdec_prepare_moe, ne, k, nfe, nsh, n_moe, sh_gated, norm_topk, is_gelu, act_oai, wscale, router, dscale, rbias, gbias, ubias, dbias)
 def public rdec_set_moe_layer(l, mir_idx, router_slot, bq, bk, bv, bo, b1, b3, b2, be1, be3, be2 : int64; fq, fk, fv, fo, f1, f3, f2, fe1, fe3, fe2 : int; g : RdecLayerGeom) { invoke(g_rdec_set_moe_layer, l, mir_idx, router_slot, bq, bk, bv, bo, b1, b3, b2, be1, be3, be2, fq, fk, fv, fo, f1, f3, f2, fe1, fe3, fe2, g) }
 def public rdec_set_moe_experts(l, router_slot, be1, be3, be2 : int64; fe1, fe3, fe2 : int) { invoke(g_rdec_set_moe_experts, l, router_slot, be1, be3, be2, fe1, fe3, fe2) }
 
@@ -387,35 +411,58 @@ def public rdec_upload_emb_f32(fblob : array<float>; off, vocab, dim : int64) : 
 //! (after prepare, before the layers); `set_ple_layer` wires one layer's gate [dim x ple] and proj [ple x dim] planes
 typedef RdecSetPleFn = function<(ple : int64) : bool>
 typedef RdecSetPleLayerFn = function<(l : int64; bgate : int64; bproj : int64; fmt : int) : void>
+//! the pre-step's projection on device: `w` the per-layer model projection [layers*ple x dim] as f32 rows, `pnorm` its [ple] norm row; false = the driver keeps the CPU pre-step
+typedef RdecSetPleProjFn = function<(w : array<float>; pnorm : array<float>; all : int64) : bool>
+//! the per-layer-embedding token table placed in the arena (`blk`, a q8 plane [vocab x layers*ple]): the window chain gathers its side rows on device off the token ids
+typedef RdecSetPleTableFn = function<(blk : int64) : bool>
 [unused_argument(ple)]
 def private rdec_unset_set_ple(ple : int64) : bool => false
 [unused_argument(l, bgate, bproj, fmt)]
 def private rdec_unset_set_ple_layer(l, bgate, bproj : int64; fmt : int) {}
+[unused_argument(w, pnorm, all)]
+def private rdec_unset_set_ple_proj(w : array<float>; pnorm : array<float>; all : int64) : bool => false
+[unused_argument(blk)]
+def private rdec_unset_set_ple_table(blk : int64) : bool => false
 
 var g_rdec_set_ple = @@rdec_unset_set_ple
 var g_rdec_set_ple_layer = @@rdec_unset_set_ple_layer
+var g_rdec_set_ple_proj = @@rdec_unset_set_ple_proj
+var g_rdec_set_ple_table = @@rdec_unset_set_ple_table
 var g_rdec_ple_installed = false
+var g_rdec_ple_proj_on = false
 
 [arch(at="../ARCHITECTURE_GPU.md#gpu-backends")]
-def public install_rdec_ple(set_ple : RdecSetPleFn; set_ple_layer : RdecSetPleLayerFn) {
+def public install_rdec_ple(set_ple : RdecSetPleFn; set_ple_layer : RdecSetPleLayerFn; set_ple_proj : RdecSetPleProjFn; set_ple_table : RdecSetPleTableFn) {
     g_rdec_set_ple = set_ple
     g_rdec_set_ple_layer = set_ple_layer
+    g_rdec_set_ple_proj = set_ple_proj
+    g_rdec_set_ple_table = set_ple_table
     g_rdec_ple_installed = true
 }
+
+//! true once the driver holds the token table: the ids prefill then gathers the side rows itself
+def public rdec_set_ple_table(blk : int64) : bool => invoke(g_rdec_set_ple_table, blk)
 
 def public rdec_ple_installed() : bool => g_rdec_ple_installed
 def public rdec_set_ple(ple : int64) : bool => invoke(g_rdec_set_ple, ple)
 def public rdec_set_ple_layer(l, bgate, bproj : int64; fmt : int) { invoke(g_rdec_set_ple_layer, l, bgate, bproj, fmt) }
+//! true once the driver took the pre-step's projection: the prefill then wants the gather half alone (`ple_raw`)
+def public rdec_set_ple_proj(w : array<float>; pnorm : array<float>; all : int64) : bool {
+    g_rdec_ple_proj_on = invoke(g_rdec_set_ple_proj, w, pnorm, all)
+    return g_rdec_ple_proj_on
+}
+def public rdec_ple_proj_on() : bool => g_rdec_ple_proj_on
+def public rdec_ple_proj_set(on : bool) { g_rdec_ple_proj_on = on }
 
 def public moe_gpu_resident_installed() : bool => g_rdec_installed
 def public rdec_reserve(fmt : int; cap_blocks : int64) : bool => invoke(g_rdec_reserve, fmt, cap_blocks)
 def public rdec_place(wq : array<uint8>; ws : array<uint8>; n, rows : int64; fmt : int) : int64 => invoke(g_rdec_place, wq, ws, n, rows, fmt)
 def public rdec_prepare(n_layers, n_attn, dim, qd, kv_dim, head_size, n_heads, hidden, vocab, seq_cap : int64; neox : bool; eps, scale : float; qk_norm : bool; kv16 : bool; q_gated : bool; rot : int64; dn : RdecDnGeom; mir_elems, cos_elems : int64) : bool => invoke(g_rdec_prepare, n_layers, n_attn, dim, qd, kv_dim, head_size, n_heads, hidden, vocab, seq_cap, neox, eps, scale, qk_norm, kv16, q_gated, rot, dn, mir_elems, cos_elems)
-def public rdec_upload_norms(norms : array<float>) { invoke(g_rdec_norms, norms) }
+def public rdec_upload_norms(norms : array<float>; obias : bool) { invoke(g_rdec_norms, norms, obias) }
 def public rdec_set_layer(l, mir_idx, bq, bk, bv, bo, b1, b3, b2 : int64; fq, fk, fv, fo, f1, f3, f2 : int; g : RdecLayerGeom) { invoke(g_rdec_set_layer, l, mir_idx, bq, bk, bv, bo, b1, b3, b2, fq, fk, fv, fo, f1, f3, f2, g) }
 def public rdec_set_cls(cls_block : int64; cls_fmt : int; cap : float; supp : array<int64>) { invoke(g_rdec_set_cls, cls_block, cls_fmt, cap, supp) }
 def public rdec_token(x : array<float>; cossin : array<float>; ple_row : array<float>; pos, cnt : int64; var logits : array<float>) { invoke(g_rdec_token, x, cossin, ple_row, pos, cnt, logits) }
-def public rdec_prefill(x_batch : array<float>; cos_batch : array<float>; ple_rows : array<float>; npos : int64; var logits : array<float>) { invoke(g_rdec_prefill, x_batch, cos_batch, ple_rows, npos, logits) }
+def public rdec_prefill(x_batch : array<float>; cos_batch : array<float>; ple_rows : array<float>; ple_raw : bool; npos : int64; var logits : array<float>) { invoke(g_rdec_prefill, x_batch, cos_batch, ple_rows, ple_raw, npos, logits) }
 def public rdec_sync_kv(l : int64; kp : uint8 const?; vp : uint8 const?; npos : int64) { invoke(g_rdec_sync_kv, l, kp, vp, npos) }
 def public rdec_read_kv(l, pos : int64; var kp : uint8?; var vp : uint8?) { invoke(g_rdec_read_kv, l, pos, kp, vp) }
 def public rdec_read_kv_bulk(l : int64; var kp : uint8?; var vp : uint8?; npos : int64) { invoke(g_rdec_read_kv_bulk, l, kp, vp, npos) }
@@ -958,9 +1005,7 @@ def public matmul_moe_gpu_heat_query(l : int64; idx : array<int64>; k : int64;
 //! bases + formats. The tier reconciles against its slots under its own upload budget.
 def public moe_gpu_heat_advise(l : int64; b1, b3, b2 : int64; f1, f3, f2 : int;
                                n, nfe : int64; ids : array<int64>; nids : int64) {
-    unsafe {
-        invoke(g_moe_gpu_heat_advise, l, b1, b3, b2, f1, f3, f2, n, nfe, addr<int64 const?>(ids[0]), nids)
-    }
+    invoke(g_moe_gpu_heat_advise, l, b1, b3, b2, f1, f3, f2, n, nfe, unsafe(addr<int64 const?>(ids[0])), nids)
 }
 
 //! Async decode FFN: submit the hit chain, return before it completes (join collects gout).
@@ -977,9 +1022,7 @@ def public matmul_moe_gpu_ffn_begin(offs1 : array<int64>; offs3 : array<int64>; 
 
 //! Collect the pending async FFN's output rows (spin the fence, copy back).
 def public matmul_moe_gpu_ffn_join(var gout : array<float>) {
-    unsafe {
-        invoke(g_moe_gpu_ffn_join, addr(gout[0]))
-    }
+    invoke(g_moe_gpu_ffn_join, unsafe(addr(gout[0])))
 }
 
 // ===== GPU tier programmatic config + status =====
@@ -1546,18 +1589,16 @@ def public matmul_moe_gpu_ffn_combined_xf_begin(offs1 : array<int64>; offs3 : ar
 }
 
 def public matmul_moe_gpu_ffn_combined_xf_join(var gout : array<float>) {
-    unsafe {
-        invoke(g_moe_gpu_ffn_xf_join, addr(gout[0]))
-    }
+    invoke(g_moe_gpu_ffn_xf_join, unsafe(addr(gout[0])))
 }
 
 // ===== the decode attention block: one submit per layer over the resident q/k/v/o quad =====
 // The tier keeps a per-layer f16 K/V mirror the prefill chain fills; a served token returns the
 // wo row plus its RAW k and v rows (f32, before norm and rope) so the host re-derives its cache row.
 typedef MoeGpuAttnDecFn = function<(var xb2p : float?; var kp : float?; var vp : float?; woq : int64; wok : int64; wov : int64; woo : int64; fq : int; fk : int; fv : int; fo : int; xqp : int8 const?; xsp : float const?; cosp : float const?; rmsqp : float const?; rmskp : float const?; bqp : float const?; bkp : float const?; bvp : float const?; pos : int64; dim : int64; qd : int64; kvd : int64; hs : int64; n_heads : int64; kv_mul : int64; scale : float; eps : float; neox : bool; qk_norm : bool) : void>
-typedef MoeGpuAttnDecOkFn = function<(woq : int64; pos : int64; gen : int64) : int>
+typedef MoeGpuAttnDecOkFn = function<(woq : int64; fq : int; pos : int64; gen : int64) : int>
 typedef MoeGpuAttnDecClaimFn = function<(fresh : bool) : int64>
-typedef MoeGpuAttnDecHydrateFn = function<(woq : int64; kp : uint8 const?; vp : uint8 const?; npos : int64; kvd : int64; f16 : bool) : void>
+typedef MoeGpuAttnDecHydrateFn = function<(woq : int64; fq : int; kp : uint8 const?; vp : uint8 const?; npos : int64; kvd : int64; f16 : bool) : void>
 // MoeGpuAttnDecOkFn's answers
 let DAT_SERVE = 0        // the layer's mirror holds exactly [0, pos) of the session's generation
 let DAT_STALE_GEN = 1    // the session's generation is not the mirrors' - claim fresh at layer 0
@@ -1572,14 +1613,14 @@ def private moe_gpu_unset_attn_dec(var xb2p : float?; var kp : float?; var vp : 
     panic("dasLLAMA: GPU decode attention hit without an installed block")
 }
 
-[unused_argument(woq, pos, gen)]
-def private moe_gpu_no_attn_dec(woq, pos, gen : int64) : int => DAT_NEVER
+[unused_argument(woq, fq, pos, gen)]
+def private moe_gpu_no_attn_dec(woq : int64; fq : int; pos, gen : int64) : int => DAT_NEVER
 
 [unused_argument(fresh)]
 def private moe_gpu_noop_attn_dec_claim(fresh : bool) : int64 => 0l
 
-[unused_argument(woq, kp, vp, npos, kvd, f16)]
-def private moe_gpu_unset_attn_dec_hydrate(woq : int64; kp : uint8 const?; vp : uint8 const?; npos, kvd : int64; f16 : bool) {
+[unused_argument(woq, fq, kp, vp, npos, kvd, f16)]
+def private moe_gpu_unset_attn_dec_hydrate(woq : int64; fq : int; kp : uint8 const?; vp : uint8 const?; npos, kvd : int64; f16 : bool) {
     panic("dasLLAMA: GPU decode attention hydrate hit without an installed block")
 }
 
@@ -1599,8 +1640,8 @@ def public set_moe_gpu_attn_dec_hooks(dec : MoeGpuAttnDecFn; ok : MoeGpuAttnDecO
 //! Refill one layer's mirror with the host cache's K/V rows [0, npos) - f32 rows (converted) or
 //! f16 rows (copied) - for a session reaching the block mid-sequence or after a rewind; npos = 0
 //! empties it. The layer then holds exactly those positions.
-def public matmul_moe_gpu_attn_dec_hydrate(woq : int64; kp : uint8 const?; vp : uint8 const?; npos, kvd : int64; f16 : bool) {
-    invoke(g_moe_gpu_attn_dec_hydrate, woq, kp, vp, npos, kvd, f16)
+def public matmul_moe_gpu_attn_dec_hydrate(woq : int64; fq : int; kp : uint8 const?; vp : uint8 const?; npos, kvd : int64; f16 : bool) {
+    invoke(g_moe_gpu_attn_dec_hydrate, woq, fq, kp, vp, npos, kvd, f16)
 }
 
 //! The mirrors change hands: after a GPU prefill from position 0 they hold the prefilling session's
@@ -1610,10 +1651,11 @@ def public moe_gpu_attn_dec_claim(fresh : bool) : int64 {
     return invoke(g_moe_gpu_attn_dec_claim, fresh)
 }
 
-//! Does the block serve layer `woq`'s token at `pos` for the session holding generation `gen`?
+//! Does the block serve the token at `pos` of the layer whose q plane sits at `woq` in format `fq` (the pair is the layer's
+//! identity: offsets are per format plane) for the session holding generation `gen`?
 //! One of DAT_SERVE / DAT_STALE_GEN / DAT_HYDRATE / DAT_NEVER.
-def public moe_gpu_attn_dec_ok(woq, pos, gen : int64) : int {
-    return invoke(g_moe_gpu_attn_dec_ok, woq, pos, gen)
+def public moe_gpu_attn_dec_ok(woq : int64; fq : int; pos, gen : int64) : int {
+    return invoke(g_moe_gpu_attn_dec_ok, woq, fq, pos, gen)
 }
 
 //! One layer's decode attention on the GPU (q/k/v projections, bias, qk-norm+rope into the layer's
@@ -1765,6 +1807,9 @@ def private restore_gpu_tier_fn_defaults { // nolint:STYLE037,STYLE038 — flat 
     if (g_rdec_read_kv_bulk == null) {
         g_rdec_read_kv_bulk = @@rdec_unset_read_bulk
     }
+    if (g_rdec_set_ple_table == null) {
+        g_rdec_set_ple_table = @@rdec_unset_set_ple_table
+    }
     if (g_moe_gpu_dn_flush == null) {
         g_moe_gpu_dn_flush = @@moe_gpu_noop_dn_flush
     }
@@ -1813,6 +1858,9 @@ def private restore_gpu_tier_fn_defaults { // nolint:STYLE037,STYLE038 — flat 
     if (g_rdec_upload_bias == null) {
         g_rdec_upload_bias = @@rdec_unset_upload_bias
     }
+    if (g_rdec_upload_sinks == null) {
+        g_rdec_upload_sinks = @@rdec_unset_upload_sinks
+    }
     if (g_rdec_moe_ok == null) {
         g_rdec_moe_ok = @@rdec_unset_moe_ok
     }
@@ -1854,6 +1902,9 @@ def private restore_gpu_tier_fn_defaults { // nolint:STYLE037,STYLE038 — flat 
     }
     if (g_rdec_set_ple_layer == null) {
         g_rdec_set_ple_layer = @@rdec_unset_set_ple_layer
+    }
+    if (g_rdec_set_ple_proj == null) {
+        g_rdec_set_ple_proj = @@rdec_unset_set_ple_proj
     }
     if (g_rdec_set_emb == null) {
         g_rdec_set_emb = @@rdec_unset_set_emb

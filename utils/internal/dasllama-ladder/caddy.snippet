@@ -5,6 +5,10 @@
 #
 # Paste inside the `dasllama.io { ... }` block, ahead of `root`/`file_server`.
 
+# Every response leaves compressed: the pages ship JSON record stores and the css/js
+# beside them uncompressed on disk, and a text asset compresses 5-15x on the wire.
+encode zstd gzip
+
 # Keep the home page on one canonical URL. The static file remains index.html,
 # but requests that name explicitly are permanently redirected to the site root.
 redir /index.html / 308
@@ -59,13 +63,11 @@ handle /api/sidecar/* {
 	reverse_proxy 127.0.0.1:8201
 }
 
-# The browser examples (/examples/<id>/) are -pthread wasm64 builds: SharedArrayBuffer needs
-# a cross-origin-isolated page, so the two isolation headers ride every response under
-# /examples/. `credentialless` (not require-corp) keeps the analytics script loading; every
-# memory64-capable browser supports it, and the model files are same-origin.
+# /examples/<id>/ shells are -pthread wasm: SharedArrayBuffer needs cross-origin isolation.
+# Their one cross-origin subresource, the analytics script, loads with `crossorigin`.
 header /examples/* {
 	Cross-Origin-Opener-Policy same-origin
-	Cross-Origin-Embedder-Policy credentialless
+	Cross-Origin-Embedder-Policy require-corp
 }
 
 # /admin/* and /shutdown are deliberately absent: they are operator surfaces.

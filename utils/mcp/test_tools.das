@@ -1006,7 +1006,7 @@ def test_goto_definition_field(t : T?) {
     t |> run("resolves field access to struct field") <| @(t : T?) {
         var text : string
         var is_error = false
-        parse_result(do_goto_definition(fixture_path("_fixture_goto.das"), "15", "14"), text, is_error)
+        parse_result(do_goto_definition(fixture_path("_fixture_goto.das"), "15", "16"), text, is_error)
         t |> success(!is_error, "should not be error")
         t |> success(find(text, "Kind: field") >= 0, "should be field kind")
         t |> success(find(text, "Point.x") >= 0, "should resolve to Point.x")
@@ -1023,6 +1023,97 @@ def test_goto_definition_builtin(t : T?) {
         t |> success(!is_error, "should not be error")
         t |> success(find(text, "Kind: builtin") >= 0, "should be builtin kind")
         t |> success(find(text, "print") >= 0, "should resolve to print")
+    }
+}
+
+[test]
+def test_goto_definition_declarations(t : T?) {
+    t |> run("a class name is the class, never the finalizer the compiler puts on its line") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        parse_result(do_goto_definition(fixture_path("_fixture_refs.das"), "46", "8"), text, is_error)
+        t |> success(!is_error, "should not be error")
+        t |> success(find(text, "Symbol: Square") >= 0 && find(text, "Kind: struct") >= 0, "the class: {text}")
+        t |> success(find(text, "__finalize") < 0, "not the synthesized finalizer: {text}")
+    }
+    t |> run("the parent named on a derived class line is the parent") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        parse_result(do_goto_definition(fixture_path("_fixture_refs.das"), "46", "16"), text, is_error)
+        t |> success(!is_error, "should not be error")
+        t |> success(find(text, "Symbol: Shape") >= 0 && find(text, "Line: 42") >= 0, "the parent's declaration: {text}")
+    }
+    t |> run("a for loop variable's use navigates to its header") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        parse_result(do_goto_definition(fixture_path("_fixture_refs.das"), "69", "17"), text, is_error)
+        t |> success(!is_error, "should not be error")
+        t |> success(find(text, "Symbol: i") >= 0 && find(text, "Line: 68") >= 0, "the header: {text}")
+    }
+    t |> run("a type name in an expression, a parameter and a constructor is the type") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        parse_result(do_goto_definition(fixture_path("_fixture_refs.das"), "66", "21"), text, is_error)
+        t |> success(!is_error, "should not be error")
+        t |> success(find(text, "Symbol: Square") >= 0 && find(text, "Line: 46") >= 0 && find(text, "Column: 6") >= 0, "new Square() names the class: {text}")
+        parse_result(do_goto_definition(fixture_path("_fixture_refs.das"), "14", "24"), text, is_error)
+        t |> success(find(text, "Symbol: Point") >= 0 && find(text, "Line: 9") >= 0, "a parameter's type: {text}")
+        parse_result(do_goto_definition(fixture_path("_fixture_refs.das"), "62", "14"), text, is_error)
+        t |> success(find(text, "Symbol: Value") >= 0 && find(text, "Kind: typedef") >= 0 && find(text, "Line: 31") >= 0, "a variant constructor's type lands on the typedef: {text}")
+        parse_result(do_find_references(fixture_path("_fixture_refs.das"), "66", "21", "file", ""), text, is_error)
+        t |> success(find(text, "structure 'Square'") >= 0 && find(text, ":66:20") >= 0, "references from the type name in new: {text}")
+        parse_result(do_type_of(fixture_path("_fixture_refs.das"), "66", "21"), text, is_error)
+        t |> success(find(text, "TypeDecl(Square) : Square") >= 0, "type_of on a type name: {text}")
+    }
+    t |> run("a function's own name is its definition") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        parse_result(do_goto_definition(fixture_path("_fixture_refs.das"), "14", "6"), text, is_error)
+        t |> success(!is_error, "should not be error")
+        t |> success(find(text, "Symbol: add_points") >= 0 && find(text, "Kind: function") >= 0 && find(text, "Line: 14") >= 0, "the definition: {text}")
+    }
+    t |> run("a global's own name, a for variable's header and a class line report the cursor's column") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        parse_result(do_goto_definition(fixture_path("_fixture_refs.das"), "36", "5"), text, is_error)
+        t |> success(find(text, "Symbol: GLOBAL_SCALE") >= 0 && find(text, "Kind: variable") >= 0 && find(text, "Line: 36") >= 0, "the global: {text}")
+        parse_result(do_goto_definition(fixture_path("_fixture_refs.das"), "68", "10"), text, is_error)
+        t |> success(find(text, "Symbol: i") >= 0 && find(text, "Kind: variable") >= 0 && find(text, "Line: 68") >= 0, "the for variable on its header: {text}")
+        parse_result(do_goto_definition(fixture_path("_fixture_refs.das"), "46", "8"), text, is_error)
+        t |> success(find(text, "Column: 6") >= 0, "the class name's column on its own line: {text}")
+        parse_result(do_type_of(fixture_path("_fixture_refs.das"), "68", "10"), text, is_error)
+        t |> success(find(text, "Variable(i) : int") >= 0, "type_of on a for variable's header: {text}")
+        t |> equal(source_line(fixture_path("_fixture_refs.das"), 68), "    for (i in range(2)) \{", "the subtools' line reader is 1-based")
+        t |> equal(source_line(fixture_path("_fixture_refs.das"), 100000), "", "past the end of the file the line is empty")
+    }
+}
+
+[test]
+def test_goto_definition_members_and_types(t : T?) {
+    t |> run("a method call lands on the method the receiver's class runs, a field's own name is the field") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        parse_result(do_goto_definition(fixture_path("_fixture_refs.das"), "78", "15"), text, is_error)
+        t |> success(!is_error, "should not be error")
+        t |> success(find(text, "Symbol: Square`area") >= 0 && find(text, "Kind: function") >= 0 && find(text, "Line: 47") >= 0, "s->area() is the override, not the class: {text}")
+        parse_result(do_goto_definition(fixture_path("_fixture_refs.das"), "67", "20"), text, is_error)
+        t |> success(find(text, "Symbol: Square`area") >= 0 && find(text, "Line: 47") >= 0, "shape->area() too: {text}")
+        parse_result(do_goto_definition(fixture_path("_fixture_refs.das"), "10", "5"), text, is_error)
+        t |> success(find(text, "Symbol: x") >= 0 && find(text, "Kind: field") >= 0 && find(text, "Line: 10") >= 0, "the field's declaration: {text}")
+        parse_result(do_type_of(fixture_path("_fixture_refs.das"), "78", "15"), text, is_error)
+        t |> success(text |> starts_with("ExprField(area)") && find(text, "ExprRef2Value") < 0, "type_of on a method call: the method field first, never the compiler's ref-to-value conversion: {text}")
+    }
+    t |> run("an enum type name in a parameter is the enum") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        parse_result(do_goto_definition(fixture_path("_fixture_refs.das"), "73", "15"), text, is_error)
+        t |> success(find(text, "Symbol: Color") >= 0 && find(text, "Kind: enum") >= 0 && find(text, "Line: 3") >= 0, "the enum: {text}")
+        parse_result(do_find_references(fixture_path("_fixture_refs.das"), "73", "15", "file", "true"), text, is_error)
+        t |> success(find(text, "enumeration 'Color'") >= 0 && find(text, ":73:") >= 0 && find(text, ":60:") >= 0, "references from the parameter's type: the parameter and the constant's use (unoptimized, the folded let keeps its site): {text}")
+        parse_result(do_find_references(fixture_path("_fixture_refs.das"), "3", "6", "file", "true"), text, is_error)
+        t |> success(find(text, "enumeration 'Color'") >= 0 && find(text, ":73:") >= 0 && find(text, ":60:") >= 0 && find(text, ":3:") < 0, "from the declaration's name: the same sites, never the declaration: {text}")
+        parse_result(do_type_of(fixture_path("_fixture_refs.das"), "73", "15"), text, is_error)
+        t |> success(find(text, "TypeDecl(Color) : Color") >= 0, "type_of on the enum type name: {text}")
     }
 }
 
@@ -1078,7 +1169,7 @@ def test_type_of_field(t : T?) {
     t |> run("field access shows field type") <| @(t : T?) {
         var text : string
         var is_error = false
-        parse_result(do_type_of(fixture_path("_fixture_goto.das"), "15", "14"), text, is_error)
+        parse_result(do_type_of(fixture_path("_fixture_goto.das"), "15", "16"), text, is_error)
         t |> success(!is_error, "should not be error")
         t |> success(find(text, "ExprField(x)") >= 0, "should show ExprField")
         t |> success(find(text, "float") >= 0, "should return float type")
@@ -1102,7 +1193,7 @@ def test_find_references_function(t : T?) {
     t |> run("finds function call and addr references") <| @(t : T?) {
         var text : string
         var is_error = false
-        parse_result(do_find_references(fixture_path("_fixture_refs.das"), "46", "14", "file", ""), text, is_error)
+        parse_result(do_find_references(fixture_path("_fixture_refs.das"), "57", "14", "file", ""), text, is_error)
         t |> success(!is_error, "should not be error")
         t |> success(find(text, "func") >= 0, "should identify as function")
         t |> success(find(text, "add_points") >= 0, "should name add_points")
@@ -1116,7 +1207,7 @@ def test_find_references_variable(t : T?) {
     t |> run("finds variable references") <| @(t : T?) {
         var text : string
         var is_error = false
-        parse_result(do_find_references(fixture_path("_fixture_refs.das"), "46", "25", "file", ""), text, is_error)
+        parse_result(do_find_references(fixture_path("_fixture_refs.das"), "57", "25", "file", ""), text, is_error)
         t |> success(!is_error, "should not be error")
         t |> success(find(text, "variable") >= 0, "should identify as variable")
         t |> success(find(text, "p1") >= 0, "should name p1")
@@ -1129,7 +1220,7 @@ def test_find_references_field(t : T?) {
     t |> run("finds field references including safe field") <| @(t : T?) {
         var text : string
         var is_error = false
-        parse_result(do_find_references(fixture_path("_fixture_refs.das"), "15", "22", "file", ""), text, is_error)
+        parse_result(do_find_references(fixture_path("_fixture_refs.das"), "15", "24", "file", ""), text, is_error)
         t |> success(!is_error, "should not be error")
         t |> success(find(text, "Point.x") >= 0, "should identify as Point.x field")
         t |> success(find(text, "[field]") >= 0, "should find field references")
@@ -1143,7 +1234,7 @@ def test_find_references_addr(t : T?) {
     t |> run("finds function from @@addr expression") <| @(t : T?) {
         var text : string
         var is_error = false
-        parse_result(do_find_references(fixture_path("_fixture_refs.das"), "48", "30", "file", ""), text, is_error)
+        parse_result(do_find_references(fixture_path("_fixture_refs.das"), "59", "30", "file", ""), text, is_error)
         t |> success(!is_error, "should not be error")
         t |> success(find(text, "func") >= 0, "should identify as function")
         t |> success(find(text, "add_points") >= 0, "should name add_points")
@@ -1196,11 +1287,14 @@ def test_find_references_alias(t : T?) {
         t |> success(find(text, "alias") >= 0, "should identify as alias")
         t |> success(find(text, "Flags") >= 0, "should name Flags")
         t |> success(find(text, "[alias ref]") >= 0, "should find alias references")
+        t |> success(find(text, ":26:") < 0, "the declaration's own line is its binding, not a reference: {text}")
+        parse_result(do_find_references(fixture_path("_fixture_refs.das"), "26", "10", "file", ""), text, is_error)
+        t |> success(find(text, ":38:") >= 0 && find(text, ":26:") < 0, "from the name on the declaration: the parameter's type, not the declaration: {text}")
     }
     t |> run("finds alias references from variant usage") <| @(t : T?) {
         var text : string
         var is_error = false
-        parse_result(do_find_references(fixture_path("_fixture_refs.das"), "51", "13", "file", ""), text, is_error)
+        parse_result(do_find_references(fixture_path("_fixture_refs.das"), "62", "13", "file", ""), text, is_error)
         t |> success(!is_error, "should not be error")
         t |> success(find(text, "alias") >= 0, "should identify as alias")
         t |> success(find(text, "Value") >= 0, "should name Value")
@@ -1221,6 +1315,78 @@ def test_find_references_global_variable(t : T?) {
 }
 
 [test]
+def test_find_references_class(t : T?) {
+    t |> run("a class name resolves the class, not the finalizer the compiler puts on its line") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        parse_result(do_find_references(fixture_path("_fixture_refs.das"), "46", "8", "file", ""), text, is_error)
+        t |> success(!is_error, "should not be error")
+        t |> success(find(text, "structure 'Square'") >= 0, "should identify the class: {text}")
+        t |> success(find(text, "__finalize") < 0, "never the synthesized finalizer: {text}")
+        t |> success(find(text, "Found 2 reference") >= 0, "the new site and the parameter type, no implicit self: {text}")
+        t |> success(find(text, ":66:20 in main [type ref]") >= 0 && find(text, ":77:") >= 0, "the new site and the parameter's type: {text}")
+    }
+    t |> run("a method's sites reference its function, through -> and the implicit self; an override is its own method") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        parse_result(do_find_references(fixture_path("_fixture_refs.das"), "47", "18", "file", ""), text, is_error)
+        t |> success(!is_error, "should not be error")
+        t |> success(find(text, "func 'Square`area'") >= 0, "the override's own function: {text}")
+        t |> success(find(text, ":67:") >= 0 && find(text, ":78:") >= 0 && find(text, "[method call]") >= 0, "shape->area() and s->area() call the override: {text}")
+        t |> success(find(text, ":47:") < 0, "never the declaration's own line: {text}")
+        parse_result(do_find_references(fixture_path("_fixture_refs.das"), "43", "9", "file", ""), text, is_error)
+        t |> success(find(text, "func 'Shape`area'") >= 0 && find(text, "Found 0 reference") >= 0, "the base method has no site of its own - every receiver is a Square: {text}")
+        parse_result(do_find_references(fixture_path("_fixture_refs.das"), "78", "15", "file", ""), text, is_error)
+        t |> success(find(text, "func 'Square`area'") >= 0 && find(text, ":67:") >= 0, "from a call site the same set: {text}")
+    }
+    t |> run("a field's declaration name references its accesses") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        parse_result(do_find_references(fixture_path("_fixture_refs.das"), "10", "5", "file", ""), text, is_error)
+        t |> success(!is_error, "should not be error")
+        t |> success(find(text, "field 'Point.x'") >= 0, "the field: {text}")
+        t |> success(find(text, ":15:") >= 0 && find(text, ":19:") >= 0 && find(text, ":64:") >= 0, "a.x, p?.x and p3.x: {text}")
+        t |> success(find(text, ":10:") < 0, "never the declaration's own line: {text}")
+        t |> success(find(text, ":86:") < 0, "Other.x is a different field with the same name: {text}")
+        parse_result(do_find_references(fixture_path("_fixture_refs.das"), "86", "14", "file", ""), text, is_error)
+        t |> success(find(text, "field 'Other.x'") >= 0 && find(text, ":86:") >= 0 && find(text, ":15:") < 0, "from an access, the other field's own sites: {text}")
+    }
+    t |> run("a parent named on a derived class line references the parent") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        parse_result(do_find_references(fixture_path("_fixture_refs.das"), "42", "8", "file", ""), text, is_error)
+        t |> success(!is_error, "should not be error")
+        t |> success(find(text, "structure 'Shape'") >= 0, "should identify the base class: {text}")
+        t |> success(find(text, "Found 1 reference") >= 0, "the derived class line only, no implicit self of its method: {text}")
+        t |> success(find(text, ":46:15 [parent]") >= 0, "the parent mention on the derived class line: {text}")
+        parse_result(do_find_references(fixture_path("_fixture_refs.das"), "46", "16", "file", ""), text, is_error)
+        t |> success(find(text, "structure 'Shape'") >= 0, "the cursor on the parent name resolves the parent: {text}")
+    }
+    t |> run("a user-written finalize is itself, with no synthesized caller") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        parse_result(do_find_references(fixture_path("_fixture_refs.das"), "48", "11", "file", ""), text, is_error)
+        t |> success(!is_error, "should not be error")
+        t |> success(find(text, "func 'finalize'") >= 0, "should identify the user finalizer: {text}")
+        t |> success(find(text, "Found 0 reference") >= 0, "the synthesized finalizer chain is not a caller: {text}")
+    }
+}
+
+[test]
+def test_find_references_for_variable(t : T?) {
+    t |> run("a for loop variable in its header pairs with its body use") <| @(t : T?) {
+        var text : string
+        var is_error = false
+        parse_result(do_find_references(fixture_path("_fixture_refs.das"), "68", "10", "file", ""), text, is_error)
+        t |> success(!is_error, "should not be error")
+        t |> success(find(text, "variable 'i'") >= 0, "should identify the loop variable: {text}")
+        t |> success(find(text, ":69:16 in main [variable]") >= 0, "the body use: {text}")
+        parse_result(do_find_references(fixture_path("_fixture_refs.das"), "69", "17", "file", ""), text, is_error)
+        t |> success(find(text, "variable 'i'") >= 0 && find(text, ":69:16") >= 0, "from the use, the same variable: {text}")
+    }
+}
+
+[test]
 def test_find_references_no_expression(t : T?) {
     t |> run("reports no expression at empty position") <| @(t : T?) {
         var text : string
@@ -1228,6 +1394,7 @@ def test_find_references_no_expression(t : T?) {
         parse_result(do_find_references(fixture_path("_fixture_refs.das"), "2", "1", "file", ""), text, is_error)
         t |> success(!is_error, "should not be error")
         t |> success(find(text, "No expression or declaration found") >= 0, "should report nothing found")
+        t |> success(find(text, ":2:1") >= 0, "the message echoes the caller's 1-based position: {text}")
     }
 }
 
@@ -3439,14 +3606,13 @@ def test_arch_of(t : T?) {
         let ok = parse_result(do_arch_of(path_join(dir, "code.das")), text, is_error)
         t |> success(ok, "parse result JSON")
         t |> success(!is_error, "a readable file is not a tool failure -- text={text}")
-        t |> success(find(text, "code.das:3:") >= 0, "the citation is reported at its own line -- text={text}")
-        t |> success(find(text, "symbol: scan_tokens") >= 0, "the annotated function is named -- text={text}")
-        t |> success(find(text, "## Tokenizer \{#tokenizer\}") >= 0, "the section opens at its heading -- text={text}")
-        t |> success(find(text, "The tokenizer section body.") >= 0, "the section body is returned -- text={text}")
-        t |> success(find(text, "A subsection stays inside its parent.") >= 0,
-            "a deeper heading does not end the section -- text={text}")
-        t |> success(find(text, "The buffers section body.") < 0,
-            "the next same-level heading ends it -- text={text}")
+        t |> success(find(text, "code.das:3  scan_tokens  ->  ") >= 0,
+            "the citation is a locator: its own line, the annotated function, then where it lands -- text={text}")
+        t |> success(find(text, "ARCHITECTURE.md:3-9  #tokenizer") >= 0,
+            "the section is a line range from its heading through its last line - the deeper heading at 7 does not end it, the next same-level one at 11 does -- text={text}")
+        t |> success(find(text, "The tokenizer section body.") < 0,
+            "the text itself is the document's to show; the tool gives coordinates -- text={text}")
+        t |> success(find(text, "#buffers") < 0, "a section nothing cites is not in the answer -- text={text}")
         rmdir_rec(dir)
     }
     t |> run("a dangling citation reports LINT026's reason") <| @(t : T?) {
@@ -3461,7 +3627,8 @@ def test_arch_of(t : T?) {
         parse_result(do_arch_of(path_join(dir, "code.das")), text, is_error)
         t |> success(find(text, "does not resolve - no such anchor") >= 0,
             "lint's own wording, so one tool's answer reads as the other's -- text={text}")
-        t |> success(find(text, "symbol: dangling") >= 0, "the dangling citation still names its symbol -- text={text}")
+        t |> success(find(text, "code.das:7  dangling  ->  does not resolve") >= 0,
+            "the dangling citation still names its line and symbol -- text={text}")
         rmdir_rec(dir)
     }
     t |> run("the symbol filter keeps one citation") <| @(t : T?) {
@@ -3474,8 +3641,9 @@ def test_arch_of(t : T?) {
         var text : string
         var is_error = false
         parse_result(do_arch_of(path_join(dir, "code.das"), "scan_tokens"), text, is_error)
-        t |> success(find(text, "symbol: scan_tokens") >= 0, "the named symbol's citation is kept -- text={text}")
-        t |> success(find(text, "symbol: dangling") < 0, "the other symbol's citation is dropped -- text={text}")
+        t |> success(find(text, "scan_tokens  ->  ") >= 0, "the named symbol's citation is kept -- text={text}")
+        t |> success(find(text, "dangling") < 0, "the other symbol's citation is dropped -- text={text}")
+        t |> success(find(text, "1 citation(s) shown.") >= 0, "and the tally says one -- text={text}")
         rmdir_rec(dir)
     }
     t |> run("a missing file is a tool failure") <| @(t : T?) {
@@ -3494,6 +3662,29 @@ def test_arch_of(t : T?) {
     }
 }
 
+// The C++ arm of arch_of: a `// <doc>#<anchor>` pointer is read from a C++ source and located in
+// the same shape a .das citation is, with no symbol - the tool does not parse C++ declarations.
+[test]
+def test_arch_of_cpp(t : T?) {
+    t |> run("a C++ source is read for its pointers, and lands in the same shape") <| @(t : T?) {
+        var terr : string
+        let dir = plant_arch_fixture("mcp_arch_cpp_test", terr)
+        if (empty(dir)) {
+            t |> failure("temp dir: {terr}")
+            return
+        }
+        fwrite(path_join(dir, "code.cpp"), "// ARCHITECTURE.md#tokenizer - the pointer form\nvoid f() \{\}\n")
+        var text : string
+        var is_error = false
+        parse_result(do_arch_of(path_join(dir, "code.cpp")), text, is_error)
+        t |> success(!is_error, "a C++ file is a readable source -- text={text}")
+        t |> success(find(text, "code.cpp:1  ->  ") >= 0,
+            "the pointer is located at its line, with no symbol -- text={text}")
+        t |> success(find(text, "ARCHITECTURE.md:3-9  #tokenizer") >= 0, "and lands on the same section -- text={text}")
+        rmdir_rec(dir)
+    }
+}
+
 [test]
 def test_arch_sites(t : T?) {
     t |> run("the census finds the citations planted in the document's subtree") <| @(t : T?) {
@@ -3508,12 +3699,14 @@ def test_arch_sites(t : T?) {
         let ok = parse_result(do_arch_sites(path_join(dir, "ARCHITECTURE.md")), text, is_error)
         t |> success(ok, "parse result JSON")
         t |> success(!is_error, "an existing document is not a tool failure -- text={text}")
-        t |> success(find(text, "\{#tokenizer\} (line 3) - 1 citation(s)") >= 0,
-            "the cited anchor is grouped at its heading line -- text={text}")
+        t |> success(find(text, "\{#tokenizer\} (lines 3-9) - 1 citation(s)") >= 0,
+            "the cited anchor is grouped with its section's line range -- text={text}")
         t |> success(find(text, "code.das:3  scan_tokens") >= 0,
             "the site names file, line and symbol -- text={text}")
-        t |> success(find(text, "\{#buffers\} (line 11) - no citations") >= 0,
+        t |> success(find(text, "\{#buffers\} (lines 11-13) - no citations") >= 0,
             "an uncited anchor is part of the census -- text={text}")
+        t |> success(find(text, "searched: ") >= 0 && find(text, "searched: ") < find(text, "src"),
+            "the header names the document's own folder first, then the C++ homes -- text={text}")
         t |> success(find(text, "\{#gone\}") >= 0,
             "a citation naming an undeclared anchor is surfaced, not dropped -- text={text}")
         t |> success(find(text, "2 citation(s) in 1 file(s).") >= 0, "the tally counts both -- text={text}")

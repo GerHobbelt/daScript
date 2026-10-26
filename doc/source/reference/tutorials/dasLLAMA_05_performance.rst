@@ -64,15 +64,31 @@ process:
    }
    set_dispatch_worker_limit(0)   // 0 = back to all of them
 
+A cap still dispatches, to fewer workers. ``set_single_thread(true)`` goes the
+whole way: every kernel runs on the calling thread and the queue is never
+dispatched to, whatever queue exists. It takes effect at the next kernel, so it
+needs no new queue, and ``get_single_thread()`` reads it back
+(``DASLLAMA_SINGLE_THREAD=1`` is the environment spelling). This is the figure
+the pool is measured against, and the browser build's own rail, where waking a
+web worker costs more than a small kernel does:
+
+.. code-block:: das
+
+   set_single_thread(true)
+   with_job_que() {
+       setup_dasllama_jobque()
+       print("single thread: {get_single_thread()}\n")
+   }
+   set_single_thread(false)
+
 The workers' spin-before-park window is the other queue knob a program sets:
 ``set_jobque_spin_us(us)`` is how long an idle worker spins before it parks
 (``0`` = park at once), and ``get_jobque_spin_us()`` reads it back. The
-desktop default is 30 ms, which keeps the workers hot through a token's serial
-gaps; in a browser the default is 0, because a spinning web worker costs the
-caller its core (Pocket TTS in Chrome measured 1.1x real time spinning against
-1.4x parked). Like the cap, ``setup_dasllama_jobque()`` latches it:
+default is 30 ms on every platform, a browser included, which keeps the workers
+hot through a token's serial gaps (Pocket TTS in Chrome measured 1.7x real time
+parked against 2.3x spinning). Like the cap, ``setup_dasllama_jobque()`` latches
+it:
 
-.. das-doc: given var m = Model()
 .. code-block:: das
 
    let spin_was = get_jobque_spin_us()

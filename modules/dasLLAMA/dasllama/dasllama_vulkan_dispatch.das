@@ -141,7 +141,7 @@ class VkDispatch : AstStructureAnnotation {
     fam_count : table<string; int>   // "{module}`{family}" -> next ordinal
     seen_ord : table<string; int>    // "{module}`{name}" -> assigned ordinal
 
-    def override apply(var st : StructurePtr; var group : ModuleGroup; args : AnnotationArgumentList; var errors : das_string) : bool {   // nolint:STYLE037,STYLE038 — flat per-argument validation + emit table
+    def override apply(var st : StructurePtr; var group : ModuleGroup; var args : AnnotationArgumentList; var errors : das_string) : bool {   // nolint:STYLE037,STYLE038 — flat per-argument validation + emit table
         let at = st.at
         let base = find_arg(args, "name") ?as tString ?? ""
         let grid = find_arg(args, "grid") ?as tString ?? ""
@@ -267,8 +267,8 @@ class VkDispatch : AstStructureAnnotation {
             }
         }
         sort(blist)
-        if (blist[length(blist) - 1] > 7) {
-            errors := "[vk_dispatch] {base}: binding {blist[length(blist) - 1]} - the hazard rail's SetBits caps at binding 7"
+        if (blist[length(blist) - 1] > 11) {
+            errors := "[vk_dispatch] {base}: binding {blist[length(blist) - 1]} - the hazard rail's SetBits caps at binding 11"
             return false
         }
         let nb = length(blist)   // the set builder's arity: one buffer/size/bits entry per declared binding
@@ -432,7 +432,10 @@ class VkDispatch : AstStructureAnnotation {
         if (ord == 0) {
             var body : array<ExpressionPtr>
             var sv = new Variable(at = at, name := "set_", _type = new TypeDecl(at = at, baseType = Type.autoinfer))
-            sv.init = mk_call1(at, "vkd_alloc_set", gname)
+            var ac = new ExprCall(at = at, name := "vkd_alloc_set")   //! the family's name rides along, so a set asked before the class's ensure names its class
+            ac.arguments |> emplace_new <| mk_gvar(at, gname)
+            ac.arguments |> emplace_new <| new ExprConstString(at = at, value := family)
+            sv.init = ac
             var letd = new ExprLet(at = at)
             letd.variables |> emplace(sv)
             body |> push(letd)

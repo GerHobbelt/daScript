@@ -11,6 +11,162 @@ what it costs today and what the fix would change.
 
 ## Entries
 
+- **LANDED (2026-09-16) - the browser build runs on every engine; `+relaxed-simd` leaves the
+  wasm feature string.** WebKit implements none of the relaxed opcodes, and the previous entry's
+  `+relaxed-simd` put `f32x4.relaxed_max` (the backend's lowering of an `nnan` vector max, which
+  the previous entry believed it never emitted) into function 298 of every release, so Safari
+  refused the whole module at validation. The feature is gone and the module links
+  `-sMEMORY64=2` (wasm64 pointers, the memory lowered to 32-bit). Cost measured on the storywish
+  page in Chrome (this M5, `DASLLAMA_ALLOW_UNTUNED=1`, one run each, steady-state clips): Pocket
+  TTS rtf 0.167-0.171 with the fused multiply-add, 0.167-0.171 without it - the split
+  `mul` + `add` costs nothing measurable, so the previous entry's first lever bought reach on
+  Chrome only in theory. Prefill and decode of the story model were not measured separately.
+
+  Provenance, **direction-grade** and **out-of-process**: the two readings compare two wasm
+  builds (the feature string with and without `+relaxed-simd`, same tree otherwise), and every
+  figure is read from a console line outside the timed program. Box: the M5 Max Mac (this
+  machine). Harness: the storywish page's own first story, reading the engine's
+  `dasLLAMA tts: ... rtf` line from the Chrome console; the artifact is the wasm64 release of
+  `examples/dasLLAMA/storywish` built by `daspkg release wasm` from the wasm-host worktree,
+  served locally by `site-dasllama/serve.py` to Chrome. Flags: the wasm cross target (not `-jit`,
+  not AOT), `DASLLAMA_ALLOW_UNTUNED=1` so `DAS_TUNE_POLICY` served the reference bodies, the
+  release's 16-worker pool. One story per build, the steady-state clips after the first two.
+  NOT board-grade: no record cell backs it, and an rtf read from a page console is not an
+  `lcpp_bench` figure.
+- **LANDED (2026-09-16) - the browser gets its FMA and an int8 dot, and the spin loop stops
+  crossing into JS.** Four levers on the parrot page (Pocket TTS, zen2 box, Chrome with the window
+  verified in front before AND after each run, 7 workers + team dispatch, `DASLLAMA_ALLOW_UNTUNED=1`
+  so the figures are the fallback bodies'). One, `+relaxed-simd` joins the wasm feature string:
+  `f32x4.relaxed_madd` is the only multiply-add wasm has, so without it every contracted
+  multiply-add split back into `mul` + `add` - 8728 contractions across the module once on
+  (`SIMDTernary` 1457 -> 10185). Two, `dot_k4q8` stopped walking its 32 weights one at a time: both
+  nibbles land in a SIGNED `byte16` (`q & 15`, `(q >> 4) & 15` - 0..15 is non-negative, so both are
+  valid int8) and feed `idot`, which every target already lowers for itself, so one body needs no
+  target branch. The measure button's three runs went 1.1x -> 1.7x real time (per chunk, rtf
+  0.892-0.947 -> 0.565-0.613; per stage ms, prompt 656-716 -> 313-349, backbone 1545-1731 ->
+  812-909, codec 3739-4216 -> 2545-2822; head, which is not K-quant, 145-166 -> 153-173, the
+  control). Three, spinning workers: 1.7x -> 2.3x, the two arms taken in ONE page session with the
+  lab's spin checkbox flipped in place (`set_jobque_worker_spin`), so one process and one
+  instrument. Four, the spin loop's two JS crossings per iteration - `steady_clock::now()` for the
+  deadline and `this_thread::yield()` for the pause - are now a strided read and a counted volatile
+  loop; clock time across all threads fell 25034 ms -> 5089 ms in a 15 s window. That last one did
+  NOT move wall time here and is not expected to on this box: 64 cores against 8 busy threads, so a
+  spinning worker's waste is free. It is the core-scarce box where it should pay.
+
+  Provenance, **direction-grade** and **out-of-process**: the kernel lever compares two wasm builds
+  (two commits), and every browser figure is read from a console line outside the timed program.
+  Box: the zen2 Windows box, 64 logical cores, `performance/defaults/x86-avx2` in force. Harness:
+  the parrot lab's own measure button (three silent says a press), reading the engine's
+  `dasLLAMA tts: ... rtf` line from the page console; the artifact is the wasm64 release of
+  `examples/dasLLAMA/parrot` built by `daspkg release wasm`, served locally to Chrome. Flags: the
+  wasm cross target (not `-jit`, not AOT), `DASLLAMA_ALLOW_UNTUNED=1` so `DAS_TUNE_POLICY` served
+  the reference bodies, 7 workers with team dispatch on. The window was verified in the foreground
+  before AND after each run. The contraction count is `wasm-opt --metrics` over the two builds'
+  `parrot.wasm`. The clock-time split is a Chrome CPU profile of one measure run, aggregated per
+  thread by node self time. NOT board-grade: no `performance/records/zen2.json` cell backs any of
+  it, and an rtf read from a page console is not an `lcpp_bench` figure.
+
+- **REVERSED (2026-09-16) - "a browser's job queue workers park instead of spinning" (2026-09-10,
+  below) rested on two premises this arc falsified, and the browser now spins.** That entry
+  measured spinning as HARMFUL on the M-series box (1.1x spinning against 1.4x parked) and set
+  `dasllama_jobque_spin_default` to 0 under emscripten. It was measured (a) against the scalar
+  `dot_k4q8`, which made every parallel section about twice as long as it now is, and (b) with a
+  spin loop that crossed into JS twice an iteration - `steady_clock::now()` for the deadline and
+  `sched_yield` inside the pause - which is most of what a spinning web worker was costing the
+  caller. Both are gone. On the zen2 box spinning wins, 1.7x against 2.3x. The emscripten `[init]`
+  that zeroed the window is deleted: a browser now takes the one 30 ms default every other target
+  takes, and `setup_dasllama_jobque` pushes it with no platform test. Ruling (Boris): a slower
+  M-series result is acceptable - the box is faster to begin with and most visitors are on a PC. A
+  box that prefers parking still has the knobs (`jobque_spin_us` in a profile, the setter).
+
+- **OWED - the playback underrun counter is browser-only.** `sound_playback_underrun_frames`
+  answers a real count under emscripten with pthreads and a hard 0 everywhere else, because the
+  ring and its producer compile only there - native, null-device and non-pthread wasm run the
+  mixer straight off the device callback and have no ring to underrun. A script therefore cannot
+  tell "no underruns" from "this target does not count them". The native implementation is owed:
+  a device-callback path can still miss its own deadline, and counting that would make the same
+  question answerable on a desktop. It is also the lever that would make the whole ring path
+  testable off a browser, which is why the browser mixer has no test today.
+
+- **LANDED (2026-09-14) - the gemma family at parity on the KHR cooperative-matrix arm.** A card
+  without `VK_NV_cooperative_matrix2` (or the mode forced, `DASLLAMA_COOPMAT=mm`) ran every gemma
+  prefill at 0.33 to 0.82 of llama.cpp b10660's own KHR path (`GGML_VK_DISABLE_COOPMAT2=1`, the
+  same card): the attention on the 8-row and 4-row scalar tiles, the E-series' per-layer-embedding
+  projection on the CPU, every Q8_0 plane on the q8-fed mul_mm L-tile in one k chunk. Four levers,
+  each pod-confirmed: the KHR flash tile (now `FaT`'s KHR arm, 16x16x16 fragments; gemma-3-1b's attention
+  12578 -> 1857 us a 512-row window, E2B's 37392 -> 3547, the 12B's 83941 -> 5746), the KHR f16 GEMM
+  for the projection (`F16GemmKhr`; E2B's window 102 -> 44 ms), q8 on the KHR kq tile through
+  `khr_stage16` (E2B's down 14021 -> 5165 us with the split), and the wave model's k chunks on the
+  KHR arm (E2B's down 48 workgroups on 82 SMs before it). Every dense carrier now sits at or above
+  parity under `mm` (pp512 / tg128, ours against llama.cpp's KHR path in tok/s, the llama.cpp figures
+  `external`, five reps, one model a process): gemma-3-1b Q8_0 31751 / 27962 and 373.5 / 330.4 (1.136 /
+  1.131), gemma-2-2b Q8_0 14909 / 13618 and 207.8 / 202.7 (1.095 / 1.025), gemma-3-4b Q8_0 10354 /
+  8637 and 145.3 / 140.8 (1.199 / 1.032), gemma-4-E2B Q8_0 13748 / 12586 and 190.8 / 180.5 (1.092 /
+  1.057), gemma-4-E4B Q8_0 7556 / 6511 and 108.9 / 109.3 (1.160 / 0.996), gemma-4-12B Q4_K_M 3514 /
+  3048 and 79.98 / 80.08 (1.153 / 0.999), gemma-4-12B Q8_0 3395 / 2907 and 54.88 / 53.16 (1.168 /
+  1.032), gemma-4-31B Q4_K_M 1253 / 1025 and 35.89 / 35.80 (1.222 / 1.003). The 26B-A4B is the gap
+  as measured then: its routed block was cm2-only, so under `mm` the resident driver declined and
+  the UD-IQ3_XXS read 328 / 39.1 against 4180 / 129.3 `external` (0.078 / 0.303) on the per-op
+  rails; the resident block serves a KHR-mode card now, and the row's re-measurement is owed
+  (`followup_vulkan.md` item 66).
+  Decode is mode-independent. Provenance, direction-grade: the RunPod RTX PRO 4500 Blackwell 32 GB
+  (82 SMs) with the device created in KHR mode, `lcpp_bench --for-debug-purposes -r 5 -p 512 -n 128
+  -t 16` under `DASLLAMA_COOPMAT=mm DASLLAMA_IMAGE=0 DASLLAMA_ALLOW_UNTUNED=1 DASLLAMA_GPU_MIN_CTX=2048
+  DASLLAMA_GPU_VRAM_MB=31000` (the image rail off: a forced mode re-mints the image per box identity),
+  against the prebuilt llama.cpp b10660 Vulkan `llama-bench -ngl 99 -fa 1 -t 16 -r 3` under
+  `GGML_VK_DISABLE_COOPMAT2=1` on the same pod; the per-role figures from the resident prefill's
+  `DASLLAMA_GPU_PROF=1` window profile. The same tip in the default cm2 mode reads gemma-3-1b at
+  0.979 of llama.cpp's cm2 path on the pod (34546 against 35284 `external`).
+
+- **LANDED (2026-09-14) - the gemma family at parity on the RTX 5060 Ti, no kernel work.** The
+  pod's levers carry to the 16 GB Blackwell consumer card as they stand: every gemma carrier that
+  fits sits at or above 0.95 of llama.cpp b10660 on both rows (pp512 / tg128, ours against
+  llama.cpp in tok/s, the llama.cpp figures `external`, five reps, one model a process, the box
+  idle): gemma-3-1b Q8_0 22213 to 22900 / 21233 and 248.6 / 214.5 (1.062 to 1.079 / 1.159),
+  gemma-2-2b Q8_0 10722 to 11095 / 10737 and 121.1 / 116.8 (0.999 to 1.033 / 1.037), gemma-3-4b
+  Q8_0 6321 / 5905 and 82.9 / 79.7 (1.070 / 1.040), gemma-4-E2B Q8_0 9689 / 8372 and 121.9 / 110.2
+  (1.157 / 1.106), gemma-4-E4B Q8_0 4333 / 4328 and 65.06 / 63.34 (1.001 / 1.027), gemma-4-12B
+  Q4_K_M 2120 / 1998 and 46.9 / 46.0 (1.061 / 1.019), gemma-4-12B Q8_0 2251 / 2156 and 30.04 /
+  29.84 (1.044 / 1.007; the Q8_0 file at `DASLLAMA_GPU_MIN_CTX=1024`, its 11.8 GB against the
+  card's 16; the 26B and 31B files do not fit and decline on memory). The small carriers' prefill
+  on this box is bimodal by the process: unconfined, seven of fourteen gemma-3-1b runs read 19.3 to
+  19.7 thousand tok/s (0.91 to 0.93) and the rest 22.7 to 23.3 thousand, the rep spread inside a
+  run small either way, while llama.cpp holds 21.2 thousand (`external`) across every run; the same
+  process confined to sixteen logical processors (`start /affinity`, either end of the 3990X's 128)
+  reads the high level six of six times (22.2 to 22.9 thousand) and gemma-2-2b 10.7 to 11.1
+  thousand against its unconfined 10.3 +- 1.0. The figures above are the confined runs for those
+  two; the rest are the unconfined record sweep. The cause is the host pacing of a 25 to 50 ms window over a many-CCD
+  part - `followup_general.md` item 148. Provenance, direction-grade: Boris's box (Threadripper
+  3990X, RTX 5060 Ti 16 GB, 36 SMs, driver 616.56, `VK_NV_cooperative_matrix2` with the decode
+  vector arm live), `lcpp_bench --for-debug-purposes -r 5 -p 512 -n 128 -t 16` under
+  `DASLLAMA_ALLOW_UNTUNED=1 DASLLAMA_GPU_MIN_CTX=2048` against the local llama.cpp b10660 Vulkan
+  `llama-bench -ngl 99 -fa 1 -t 16 -r 3`; the 12B Q8_0 row from the pass's first sweep - in the
+  record sweep the desktop held 4.3 GB of the card and both sides spilled to host memory (ours
+  64 / 4.4, llama.cpp 793 / 4.9 `external`), a reading of nothing.
+
+- **LANDED (2026-09-13) - the gemma family at parity on the Vulkan resident driver.** Every gemma
+  carrier the model table stocks sits at or above 0.95 of llama.cpp b10660 on both rows, seven of
+  nine prefills and two decodes ahead of it (pp512 / tg128 ratios, five reps, one model a process):
+  gemma-3-1b Q8_0 0.974 / 1.038, gemma-2-2b Q8_0 1.023 / 0.970, gemma-3-4b Q8_0 1.017 / 0.988,
+  gemma-4-E2B Q8_0 1.038 / 0.981, gemma-4-E4B Q8_0 0.994 / 0.950, gemma-4-12B Q4_K_M 1.026 / 0.950,
+  gemma-4-12B Q8_0 1.010 / 0.987, gemma-4-26B-A4B UD-IQ3_XXS 1.071 / 1.025, gemma-4-26B-A4B UD-Q4_K_M
+  1.128 / 0.950. The last three prefill levers of the arc, each pod-confirmed: the split-k arm's k
+  offset masked to its chunk alignment (unmasked, one chunk of gemma-3-1b's down ran 304 us against
+  the whole GEMM's 152, the probe's `splitk` arm on the pod, so every split lost) with the tile and split picks folded into one wave model (`cm2_gemm_pick`; gemma-3-1b's
+  down 152 -> 78 us in four l chunks, E2B's 12288-deep down 268 -> 162 in three); the flash tile's
+  f16 O accumulator under a 3 ln 2 row-max bias, its mask pass gated to the edge steps and a
+  `[dont_unroll]` KV loop (E4B's attention 6868 -> 4014 us a window, gemma-3-1b's 2671 -> 1844);
+  and a partial last weight tile served on the fast path over the plane's last whole 128 rows with
+  Q6_K's scales staged (the 26B's 2112-wide shared expert 300 -> 71 us a dispatch, its 704-wide
+  experts 26.6 -> 20.5 ms a window). The three decodes at 0.950 (E4B, the two Q4_K_M files) are
+  `followup_vulkan.md` item 51's dependent-dispatch gap. Provenance, direction-grade: the RunPod
+  RTX PRO 4500 Blackwell 32 GB (82 SMs, driver without `VK_NV_cooperative_matrix_decode_vector`,
+  the scalar decode arm), `lcpp_bench --for-debug-purposes -r 5 -p 512 -n 128 -t 16` under
+  `DASLLAMA_ALLOW_UNTUNED=1 DASLLAMA_GPU_MIN_CTX=2048 DASLLAMA_GPU_VRAM_MB=31000`, against the
+  prebuilt llama.cpp b10660 Vulkan `llama-bench -ngl 99 -fa 1 -t 16 -r 3` on the same pod; the
+  per-dispatch figures from `harness/vk_gemm_probe.das`'s `gemma`, `splitk` and `cm2g:k6` arms and
+  the resident prefill's `DASLLAMA_GPU_PROF=1` window profile.
+
 - **LANDED (2026-09-10) - a browser's job queue workers park instead of spinning.** The
   engine's 30 ms spin-before-park window (`g_jobque_spin_us`) was unconditional, and in Chrome
   the 8 spinning web workers cost the caller its core: Pocket TTS (the parrot page's poem, four
@@ -20,7 +176,8 @@ what it costs today and what the fix would change.
   within 3%). Team dispatch stays on there (0.69 against 0.72 rtf off, the head 98 against 140
   ms). One worker instead of eight, parked or spinning, reads 0.7x (prompt 1370 / backbone 3080
   / codec 5800), so the pool does pay - 2.2x from one to eight - once nothing spins. The
-  emscripten default is now 0 (`dasllama_jobque_spin_default`); the desktop keeps its window.
+  emscripten default was set to 0 here (`dasllama_jobque_spin_default`) - REVERSED 2026-09-16, see
+  the entry above; the desktop keeps its window.
   Provenance, direction-grade: the m1 box (10 cores, the `m1.tune.json` profile); the browser
   figures are the engine's own per-synthesis timing line (`dasLLAMA tts: ... rtf`) read from the
   page's console, the wasm64 release of `examples/dasLLAMA/parrot` served locally to Chrome under
@@ -86,7 +243,7 @@ what it costs today and what the fix would change.
   from 0.86x to 1.00x of its scalar arm [direction-grade - one commit].
 
 - **LANDED (2026-09-10) - a split role takes as many k chunks as fill the device by itself.**
-  `cm2_split_k` still lets the dispatch group (a role plus the neighbours it co-runs beside)
+  The split pick (since folded into `cm2_gemm_pick`) still lets the dispatch group (a role plus the neighbours it co-runs beside)
   decide whether k splits, but the chunk count is the SM count over the role's own workgroups,
   since a split role serializes its group through the one scratch plane anyway
   (`ARCHITECTURE_GPU_VULKAN_GEMM.md` sec.2.2l). On a Linux RTX 5080 (84 SMs, driver 580.173,
@@ -1610,3 +1767,66 @@ direction-grade.
   The lanes agree within the rig's own spread; the small form loses nothing the rig can hear.
   Decision: taken - the browser pages read the small forms (storywish the one-voice file, parrot
   the 19-voice one), the q8 file stays the desktop default of the served set.
+
+### From the M4 Metal pass (2026-09-13)
+
+Instruments: `benchmarks/matmul/bench_metal_gemv_kernels.das` at the Qwen2.5-0.5B decode shapes
+(the `05b` set, plus an n-ladder at d=4096 and n=2048 at classifier width), best of 3 rounds,
+production `v0_gemv` against the lab's row-per-simdgroup forms, every arm interleaved in one
+process; `benchmarks/decode_step_trace.das` on the 0.5B Q8 file, whose step wall is read outside
+the benchmark process: out-of-process; the records rig's Metal pair, `benchmarks/lcpp_bench.das`
+under `-jit --for-debug-purposes --ngl 99 -p 512 -n 128`: debug-jit. The M4 Pro and the M5 Max,
+each on its own mint. The rows are in `followup_metal.md` sec.7.1. Every rig pair below is two
+builds or two knob settings in two processes - direction-grade - and enters as its ratio, the
+arms' rates left in the run's report. Qwen3-30B-A3B-Instruct-2507-Q4_K_M and
+Qwen3.8-27B-Q4_K_M carry committed board rows on both boxes (`performance/records/m4.json`,
+`performance/records/m5.json`); the debug-jit readings here are read beside those rows.
+
+- **The q8 GEMV at n=896, M4 Pro (ms, weight GB/s): split form vs row-per-simdgroup:** qkv
+  (d=1152) 0.0081 / 135 vs 0.0051 / 228; wo (896) 0.0068 / 126 vs 0.0044 / 208; w13 (4864)
+  0.032 / 145 vs 0.019 / 262; w2 (n=4864, d=896) 0.0129 / 360 vs 0.0186 / 263; cls (151936)
+  0.919 / 157 vs 0.574 / 267. The first lab pass read the split form 2-3x slower still (0.029
+  ms on qkv, 0.98 on cls): the M4's clocks idle between sparse dispatches, the interleaved
+  all-variant run is the honest one.
+- **The same on the M5 Max:** qkv 0.0055 vs 0.0047; wo 0.0050 vs 0.0044; w13 0.0110 vs
+  0.0075; w2 0.0078 vs 0.0072; cls 0.240 vs 0.255 - the row form wins or ties every short shape.
+- **The crossover, both boxes:** n=1536 (d=4096) row form 1.5x on both; n=2048 at d=4096 M4
+  +28% row form, M5 -9%; n=2048 at d=128256 split ahead on both (M5 0.464 vs 0.491, M4 1.169
+  vs 1.217); n=3072 split ahead on both. `GEMV_SG_MAX_N = 1536`.
+- **The 0.5B Q8 decode step, M4 Pro:** 4.2 ms per token (gpu 4.07, gap 0.02, sched 0.03;
+  197 serial nodes) before, 3.2 after; the fusion, spec-chain, concurrent-encoder and fused-
+  attention rails each moved the step under 2%. Rig tg128, the row form against the split: the
+  0.5B 1.27x (0.73 -> 0.94 of llama.cpp), the 0.6B 1.23x (0.80 -> 0.97), the 0.8B 1.25x (0.97
+  -> 1.21). M5: 0.99x, 1.00x, 0.99x and 1.00x on the 0.5B, 0.6B, 1.5B and Llama-1B Q8 - flat.
+- **dev-W on the raced M4 sidecar (no tensor crown):** Llama-1B IQ3_XXS pp 0.93 -> 1.00,
+  IQ2_XXS 0.93 -> 1.00, Q4_K_M 0.97 -> 1.02 - the same three rows the hand-crowned sidecar
+  gave, so the panel is the whole gain and the tensor stamp none of it. Qwen3-30B IQ2_XXS
+  serves at 0.95 / 1.09 where it declined to the CPU before.
+- **The bake's footprint pair (M5 Max, `utils/dasllama-convert -f metal --stream`, the
+  541 MB Llama-1B IQ3_XXS):** the image at IMAGE_VERSION 36 is 659 MB with a 32 MB dev-W plane
+  over 16 sites (the q8/k4/k5/k6 mirrors), at 37 it is 2571 MB with an 1856 MB plane over 112
+  sites; the mint's convert time 222 -> 1016 ms. The plane is 3.4x the model on a small
+  split-scale dense file - the per-panel cap keeps a 30B's expert planes out, so the cost
+  lands on the small files - and it buys the resident panel's prefill (1.05 scratch -> 1.23
+  resident on the M4 rows above). Decision: the bake stays on; the cap and a per-file
+  footprint knob are the ledger's if the disk cost bites.
+- **The step wait, Llama-1B Q8, M4 Pro (`decode_step_trace -o`, 96 steps):** GPU 5.73 ms per
+  token, wall 6.38-6.71, gap 0.61-0.98 ms per token averaged over a three-step cycle (two
+  steps at gap 0, then 3.3-3.6 ms; commits at +0.1, +6.0, +13.9 ms; waits 13.7, 0, 5.9 ms).
+  The same file on the M5 Max: wall 2.81 = GPU 2.80, one commit per step, gap 0.00. The 0.5B
+  Q8 on the M4: gap 0.02 on three processes, 1.46 (6 ms holes) on a fourth. The attention rail,
+  `taskpolicy -l 0 -t 0` and `DAS_JOBQUE_AFFINITY=2` each left the gap at 0.75-0.87. A spin on
+  `GPUEndTime` before the blocking wait: 5.66 ms per token, gap 0.007, 176.5 t/s, three runs
+  within 0.02 ms (llama-bench 167). Rig re-times, the spin against the blocking wait: Llama-1B
+  Q8 tg 1.06x (1.00 of llama.cpp), Q4_K_M 1.08x (1.00), Qwen2.5-0.5B Q8 1.10x (1.03), 1.5B Q8
+  1.07x (1.03); prefill unchanged. The adaptive form arms on the first hole (3.9 ms, both runs)
+  and the later buckets read gap 0.001. The rig's own process pays the wake on every unchained
+  step (IQ2_XXS 1.09x spinning over blocking) while the trace tool's does not, so the spin
+  ships on by default.
+- **The tall stamp on the M4 Pro (rig cells, the sidecar's `metal_tall_floor` at 100000 =
+  never tall, against 64):** Llama-1B Q4_0 pp 1.06x (0.97 -> 1.03 of llama.cpp), Llama-1B Q8
+  1.08x (0.98 -> 1.05), Qwen3-30B-A3B Q4_K_M 1.01x (1.02 -> 1.04; its board row is
+  `performance/records/m4.json`'s), Qwen3.5-9B Q8 1.00x (even); decode unchanged. The 1-D grid
+  twin, the double buffer off, the floor at 16, a re-mint and a re-baked image each left Q4_0
+  within 0.2% of the never-tall arm. The M5's tall win stands (its Llama-1B Q8 prefill reads
+  1.00x either way under the hand crown).

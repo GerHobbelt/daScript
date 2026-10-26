@@ -2,7 +2,7 @@
 
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture docs:
 `ARCHITECTURE.md`, `ARCHITECTURE_TARGET_FEATURES.md`, `ARCHITECTURE_DEBUG_INFO.md`,
-`ARCHITECTURE_JIT_ENTRY.md`, `ARCHITECTURE_EXE.md`. Planned work: `LEDGER.md` takes a new row; `DEBUGGING.md` (sec. Roadmap) and `fat_mode_plan.md` carry older plans.
+`ARCHITECTURE_JIT_ENTRY.md`, `ARCHITECTURE_EXE.md`, `ARCHITECTURE_LIB.md`. Planned work: `LEDGER.md`.
 
 **A `[test]` file under this module that carries a `require dasllama/...` line of its own answers
 to `modules/dasLLAMA/tests/REVIEW.md` (repo root) as well** - its out-of-folder ledger row lives
@@ -30,9 +30,10 @@ there.
   script.** A child writes its caches relative to the cwd otherwise, which is the tree two
   concurrent runs share.
 
-- **A diff that adds or changes a branch on the target triple records in its PR body the
-  cross-compile (`write_exe`) for that target that exercised the behavior.** The suite runs on
-  the host, so a target-triple branch is checked only by the artifact built for that target.
+- **A diff that adds or changes a branch keyed on the target triple, or changes code only a
+  cross target's arm of such a branch reaches, records in its PR body the
+  `-exe --jit-target=<triple>` build for that target that exercised the behavior.** The suite runs on the host, so a target-triple branch is checked
+  only by the artifact built for that target.
 
 - **A diff that adds work to, or moves work within, what `run_jit`
   (`daslib/llvm_jit_run.das`) or `run_jit_linked` (`daslib/llvm_jit_link.das`) executes - its
@@ -47,10 +48,9 @@ there.
   identical inputs - IR generation, target-machine setup, a `[llvm_code]` generator body, or the
   call ABI the generated code binds: function signatures, the name scheme, the prologue, the
   externs the install phase binds - bumps `LLVM_JIT_CODEGEN_VERSION`**
-  (`daslib/llvm_jit_plan.das`); selecting among existing generators' `[llvm_code]` arguments, the
-  `[tune]` stamping, is not such a change. The caches are addressed by the AST hashes and this
-  constant, so such a change without the bump serves the old machine code back
-  (`ARCHITECTURE.md` sec.1.2).
+  (`daslib/llvm_jit_plan.das`). Both keys fold each function's AST hash, the hint inputs they
+  carry - loop-hint names, `[llvm_code]` arguments, function hints - and this constant, so a
+  change none of those covers serves the old machine code back (`ARCHITECTURE.md` sec.1.2).
 
 - **A diff that adds a `require` line naming a `[llvm_code]` generator module outside this
   module - a package's, dasLLAMA's - to `daslib/llvm_user_modules.das` is a defect; the package
@@ -61,7 +61,7 @@ there.
 - **A das function the jit finalizer reaches - `free_jit_context` (`daslib/llvm_jit_link.das`)
   and anything it calls - is `[no_jit]` and calls only externs or other `[no_jit]` das
   functions; a das helper on that path (`macro_context_of` and the rest of
-  `daslib/cross_context`) is a defect - call the externs directly.** The finalizer is program
+  `daslib/cross_context`, repo root) is a defect - call the externs directly.** The finalizer is program
   code, so a jittable function on its path joins every jitted program's DLL (the block-passing
   helpers cannot be lowered: `ARCHITECTURE_JIT_ENTRY.md` sec.4).
 
@@ -84,7 +84,9 @@ there.
 - **A `-lib` build that writes no artifact exits non-zero.** A build rule reads the exit code, and
   a silent success lets it link the previous run's library against this run's header.
 
-- **A change to a `[tune]`-family annotation is reviewed with `skills/tune.md`.**
+- **A diff that changes the implementation of `[tune]`, `[tune_perm]`, `[tune_companion]`,
+  `[tune_scope]`, `[tune_policy]` or `[llvm_code]` in this folder is reviewed with
+  `skills/tune.md`.**
 
 - **A change to the tune framework - `daslib/llvm_tune.das`, its tests, or the descriptor and
   C++ rows that join it to a program (`.das_module`, `src/dasLLVM.cpp`) - is reviewed with
@@ -168,14 +170,16 @@ there.
   sign-alternating chain moves the last few bits of the result, and the interpreter and AOT
   answers do not move with it.
 
-- **A diff that changes what an emitter whose daslang body is the reference implementation
-  produces - the emitter itself, or which of its arms a call selects - also adds a cell
-  comparing the emitted result with the interpreted result over the operand range that emitter
-  serves (every vector width for a vector emitter, the full int8 lattice for a dot), and for a
-  float emitter one asserting both answer NaN in the same lanes; a lowering only a cross target
-  runs states in the PR body the artifact that compared them.** A clamp or a conversion written with
-  ordered compares turns a NaN lane into a number, and an accuracy bound reads that as success;
-  an IR-shape test names the instruction and never a number.
+- **A diff that changes the machine code an emitter whose daslang body is the reference
+  implementation produces - its body, which of its arms a call selects, or the feature set its
+  output is lowered under - ships a cell comparing the emitted result with the interpreted result
+  over the operand range that emitter serves (every vector width for a vector emitter, the full
+  int8 lattice for a dot), added in the same change when no cell covers that range.** An IR-shape
+  test names the instruction and never a number.
+
+- **A cell comparing a float emitter's emitted and interpreted results also asserts both answer
+  NaN in the same lanes.** A clamp or a conversion written with ordered compares turns a NaN lane
+  into a number, and an accuracy bound reads that as success.
 
 - **A change that makes `REVIEW.das` (beside this file) report fewer inputs is a defect:**
   dropping a check, shrinking a scanned set or a tracked-fixture directory (a guard over nothing),
@@ -188,8 +192,8 @@ there.
   (`ARCHITECTURE_EXE.md` sec.2). A promoted module's global initializers are program
   code, and a walk that skips them leaves the address globals they need null in the exe.
 
-- **A diff that builds an x64 or aarch64 machine's feature string appends the forced ones
-  (`x64_forced_plus_features` / `arm64_forced_plus_features`, `daslib/llvm_jit_common.das`) AFTER
-  the detected host features.** LLVM's `SubtargetFeatures` takes the last occurrence of a name, so
-  a forced feature placed first is silently overridden by detection. A wasm machine has no force
-  knob and no detected features, so the rule does not reach it.
+- **A diff that builds a feature string for a machine that has a force knob - a
+  `*_forced_plus_features` function in `daslib/llvm_jit_common.das` - appends the forced names
+  AFTER the detected host features.** LLVM's `SubtargetFeatures` takes
+  the last occurrence of a name, so a forced feature placed first is silently overridden by
+  detection.

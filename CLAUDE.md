@@ -44,10 +44,12 @@ beside the tree's install rules) so LINT026 stays armed in an installed SDK.
 The mood test routes misplaced text: must/never binding a diff -> REVIEW.md; present-tense
 fact -> ARCHITECTURE.md; dated or past-tense -> deleted, git keeps it.
 
-**Before editing a function annotated `[arch(at="<doc>.md#<anchor>")]`, read the section it
-cites.** MCP `arch_of` returns each of a file's citations with its section text; `arch_sites`
-returns a document's anchors with the code citing them, dead anchors and dangling citations
-included. Citation spelling, path resolution, and failure reasons: `skills/mcp_tools.md`.
+**Before editing a function annotated `[arch(at="<doc>.md#<anchor>")]`, or C++ under a
+`// <doc>.md#<anchor>` pointer, read the section it cites** - open the document at the anchor.
+MCP `arch_of` locates every citation a file makes (`file:line symbol -> doc:first-last #anchor`,
+both spellings) and `arch_sites` lists a document's anchors with their line ranges and citers,
+dead anchors and dangling citations included. Citation spelling, path resolution, and failure
+reasons: `skills/mcp_tools.md`.
 
 **An architecture-doc heading that code cites carries the `{#anchor}` its citation names, and
 every anchor is cited.** LINT026 fails a citation naming no such file or anchor, and - in every
@@ -178,6 +180,14 @@ New knowledge about daslang syntax, semantics, or conventions - from compiler er
 **Lint opportunities are reportable findings - don't hold back.** When a bug, review note, or probe reveals a pattern a mechanical check could catch (especially one that has bitten more than once), SAY SO in the end-of-turn summary and propose the rule to Boris; the suite keeps paying for itself precisely because rules keep getting added. Two landing places: a pattern one folder owns (a module's kernel classes, a test-folder discipline, a fixture-sync invariant) lands as a `REVIEW.das` gate in that folder - folder-local lint, and gate code worth writing shareably; a language- or repo-wide pattern lands in `daslib/*_lint.das` (authoring: `skills/internal/perf_lint_authoring.md` / `skills/internal/style_lint_authoring.md`). Either way the finding's error text must stand on its own - no per-rule doc catalog exists.
 
 **Syntax and factual corrections are fix-in-place, always.** A compiler error, probe, or user correction showing a claim in CLAUDE.md or `skills/*.md` is wrong, incomplete, or stale gets fixed in the same session and flagged in the end-of-turn summary - never deferred to a proposal. Verify first: grammar truth is `src/parser/ds2_parser.ypp`, behavior truth is a probe-compile with the current binary.
+
+**A version stamp's comment carries the CURRENT entry only.** `getVersion()`
+(`include/daScript/ast/ast_serializer.h`), `LLVM_JIT_CODEGEN_VERSION`
+(`modules/dasLLVM/daslib/llvm_jit_plan.das`), and every other bumped version number are read to
+answer one question - what does this build write - so a bump REPLACES the old note, never nests it
+in a parenthesis. The reasons behind earlier numbers are history: git has them, and a reader
+chasing one reads the commit that bumped it. A comment that grows a chain of nested parentheses is
+the defect, however true each clause is.
 
 **Rule files carry rules, not history.** CLAUDE.md files, `skills/*.md`, and per-module rule docs state the CURRENT contract only - no incident anecdotes, PR/issue numbers, dated rulings, or "as of" entries. When a rule changes, replace the old text outright and state the timeless WHY; history lives in git and in the author's out-of-tree notes, so a motivating incident is not written into the tree. A syntax/behavior claim is still probe-verified before it lands, but the verification date is history too: never write an inline `(probe-verified <date>)` tag. These files load into context and are read by weaker models, so every token must carry meaning.
 

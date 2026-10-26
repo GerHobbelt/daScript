@@ -288,6 +288,7 @@ namespace das {
     bool builtin_feof(const FILE*) GENERATE_IO_STUB_RET
     bool builtin_fpoll(const FILE*, int) GENERATE_IO_STUB_RET
     void builtin_funbuffered(const FILE*) GENERATE_IO_STUB
+    void builtin_fbinary(const FILE*) GENERATE_IO_STUB
     const FILE * builtin_fopen  ( const char *, const char *, Context *, LineInfoArg * ) GENERATE_IO_STUB_RET
     vec4f builtin_read ( Context &, SimNode_CallBase *, vec4f * ) GENERATE_IO_STUB_VEC
     vec4f builtin_write ( Context &, SimNode_CallBase *, vec4f * ) GENERATE_IO_STUB_VEC
@@ -539,6 +540,14 @@ namespace das {
     void builtin_funbuffered(const FILE* _f) {
         if ( !_f ) return;
         setvbuf((FILE*)_f, nullptr, _IONBF, 0);
+    }
+
+    void builtin_fbinary(const FILE* _f) {
+        if ( !_f ) return;
+#ifdef _WIN32
+        if ( _f != stdin ) fflush((FILE*)_f);
+        _setmode(_fileno((FILE*)_f), _O_BINARY);
+#endif
     }
 
     // 64-bit-size stat/fstat (see das_filestat in aot_builtin_fio.h): on Windows the plain
@@ -1856,7 +1865,7 @@ namespace das {
         sa.bInheritHandle = TRUE;
         sa.lpSecurityDescriptor = NULL;
         HANDLE hRead = NULL, hWrite = NULL;
-        const DWORD spawnPipeBytes = 64 * 1024;   // src/builtin/ARCHITECTURE.md sec.5
+        const DWORD spawnPipeBytes = 64 * 1024;   // src/builtin/ARCHITECTURE.md#spawned-child-stdout-pipe
         if ( !CreatePipe(&hRead, &hWrite, &sa, spawnPipeBytes) ) {
             context->throw_error_at(at, "spawn_process: CreatePipe failed");
             return nullptr;
@@ -1891,10 +1900,14 @@ namespace das {
         CloseHandle(hWrite);
         if ( hNull != INVALID_HANDLE_VALUE ) CloseHandle(hNull);
         if ( !ok ) {
+            // src/builtin/ARCHITECTURE.md#child-cannot-start
             CloseHandle(hRead);
             if ( hJob ) CloseHandle(hJob);
-            context->throw_error_at(at, "spawn_process: CreateProcess failed");
-            return nullptr;
+            DasSubProcess * dead = new DasSubProcess();
+            dead->stdoutOpen = false;
+            dead->reaped = true;
+            dead->exitCode = 127;
+            return dead;
         }
         if ( hJob && !AssignProcessToJobObject(hJob, pi.hProcess) ) {
             CloseHandle(hJob);      // a job we cannot assign (a restrictive parent job) must not shadow hProcess
@@ -2341,7 +2354,7 @@ namespace das {
     // after the folder scan, so module enumeration order stops mattering.
     static vector<tuple<string,string,string>> g_pending_dynamic_modules; // path, cpp_class_name, last dlopen error
 
-    // the descriptor manifest recorder (dyn_modules.h, src/ast/ARCHITECTURE.md sec.2)
+    // the descriptor manifest recorder (dyn_modules.h, src/ast/ARCHITECTURE.md#module-scan-manifest)
     static thread_local bool                         g_manifest_recording = false;
     static thread_local bool                         g_manifest_opt_out = false;
     static thread_local vector<DynModuleManifestRow> g_manifest_rows;
@@ -2494,7 +2507,7 @@ namespace das {
         string path, cpp_class, das_name;
         int on_error = 0;
     };
-    static vector<DeferredDynamicModule> g_deferred_dynamic_modules;    // src/ast/ARCHITECTURE.md sec.2
+    static vector<DeferredDynamicModule> g_deferred_dynamic_modules;    // src/ast/ARCHITECTURE.md#module-scan-manifest
     static std::recursive_mutex g_deferred_dynamic_modules_mutex;       // a run-time has_module reads while another thread's compile loads
 
     DAS_API void defer_dynamic_module ( const char * path, const char * cpp_class, int on_error, const char * das_name ) {
@@ -2564,7 +2577,7 @@ namespace das {
         }
     }
 
-    // src/ast/ARCHITECTURE.md sec.2 - a pending row whose artifact is on disk failed on something
+    // src/ast/ARCHITECTURE.md#module-scan-manifest - a pending row whose artifact is on disk failed on something
     // other than a missing file: on a platform that resolves imports at load, a sibling the
     // deferred set still holds
     DAS_API bool pending_dynamic_module_artifact_present() {
@@ -3155,6 +3168,9 @@ namespace das {
             addExtern<DAS_BIND_FUN(builtin_funbuffered)>(*this, lib, "funbuffered",
                 SideEffects::modifyExternal, "builtin_funbuffered")
                     ->arg("file");
+            addExtern<DAS_BIND_FUN(builtin_fbinary)>(*this, lib, "fbinary",
+                SideEffects::modifyExternal, "builtin_fbinary")
+                    ->arg("file");
             addExtern<DAS_BIND_FUN(builtin_fseek)>(*this, lib, "fseek",
                 SideEffects::modifyExternal, "builtin_fseek")
                     ->args({"file","offset","mode","context","line"});
@@ -3671,7 +3687,14 @@ void * das_dwrite_open ( const char * path, uint64_t total_bytes, uint64_t band_
         fstore_t st = { F_ALLOCATECONTIG | F_ALLOCATEALL, F_PEOFPOSMODE, 0, (off_t) total_bytes, 0 };
         if ( fcntl(fd, F_PREALLOCATE, &st) < 0 ) {
             st.fst_flags = F_ALLOCATEALL;   // contiguous is a preference, not a requirement
-            fcntl(fd, F_PREALLOCATE, &st);
+            if ( fcntl(fd, F_PREALLOCATE, &st) < 0 ) {
+                close(fd);
+                unlink(path);
+                free(w->band);
+                free(w->band2);
+                delete w;
+                return nullptr;
+            }
         }
     }
 #else

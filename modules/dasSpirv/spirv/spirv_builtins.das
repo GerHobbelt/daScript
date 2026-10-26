@@ -370,10 +370,11 @@ struct coopmatAcc_f32_16x16 {}
 // global + the element index), so the param type is irrelevant to lowering and this one signature accepts
 // both a dynamic @ssbo array<T> and a fixed @workgroup T[N] (shared-memory staging). dst (the coopmat
 // tile) and a/b/c stay strongly typed — that is what selects the tile shape.
+//! the f16 A/B loads take a uint index: a buffer past 2 GB of halves addresses elements past int32
 [unused_argument(dst, src, idx, stride, layout), sideeffects]
-def public coopmatLoad(var dst : coopmatA_f16_16x16; src; idx, stride, layout : int) : void {}
+def public coopmatLoad(var dst : coopmatA_f16_16x16; src; idx : int | uint; stride, layout : int) : void {}
 [unused_argument(dst, src, idx, stride, layout), sideeffects]
-def public coopmatLoad(var dst : coopmatB_f16_16x16; src; idx, stride, layout : int) : void {}
+def public coopmatLoad(var dst : coopmatB_f16_16x16; src; idx : int | uint; stride, layout : int) : void {}
 [unused_argument(mat, dst, idx, stride, layout), sideeffects]
 def public coopmatStore(mat : coopmatAcc_f32_16x16; dst; idx, stride, layout : int) : void {}
 [unused_argument(a, b), sideeffects]
@@ -432,15 +433,12 @@ struct coopmatWgAcc_f32_128x256 {}
 struct coopmatWgB_f16_64x128 {}
 struct coopmatWgAcc_f16_128x128 {}
 struct coopmatWgAcc_f32_128x128 {}
-// the s-tile shapes (BN=32): the MoE expert-bucket shape, ~32 rows per region; the 32-deep A serves the s and e stamps' 32-deep k step (their B tiles are the 32-row ones under the flash-attention banner)
+// the s-tile shapes (BN=32): the MoE expert-bucket shape, ~32 rows per region; the 32-deep A serves the s and e stamps' 32-deep k step (their B tiles are the 32-row coopmatWgB_f16_32x* markers below)
 struct coopmatWgA_f16_128x32 {}
 struct coopmatWgB_f16_64x32 {}
 struct coopmatWgAcc_f16_128x32 {}
 struct coopmatWgAcc_f32_128x32 {}
 
-// flash-attention tiles (Br=64, head sizes 64 / 128): Q & O accumulators, Qf16/P as A, K^T/V/One
-// as B. h64 runs Bc=64; h128 runs Bc=32 (llama.cpp's big-head cut — the 64-wide KV tile set
-// spills the wg staging budget next to the 64x128 O accumulator).
 struct coopmatWgA_f16_64x32 {}
 struct coopmatWgA_f16_64x64 {}
 struct coopmatWgA_f16_64x128 {}
@@ -451,12 +449,17 @@ struct coopmatWgB_f16_128x32 {}
 [arch(at="../ARCHITECTURE_COOPMAT.md#cm2-tile-markers")]
 struct coopmatWgAcc_f16_64x128 {}
 struct coopmatWgAcc_f32_64x128 {}
-// the h256 flash tiles (Br=64, Bc=32): Q & O 64x256, Qf16 as A, K^T as B 256x32, V as B 32x256
 struct coopmatWgA_f16_64x256 {}
 struct coopmatWgB_f16_256x32 {}
 struct coopmatWgB_f16_32x256 {}
 struct coopmatWgAcc_f16_64x256 {}
 struct coopmatWgAcc_f32_64x256 {}
+[arch(at="../ARCHITECTURE_COOPMAT.md#cm2-tile-markers")]
+struct coopmatWgA_f16_64x512 {}
+struct coopmatWgB_f16_512x32 {}
+struct coopmatWgB_f16_32x512 {}
+struct coopmatWgAcc_f16_64x512 {}
+struct coopmatWgAcc_f32_64x512 {}
 // the int8 twins (q8 x q8 -> s32 at workgroup scope; K-tile 32)
 struct coopmatWgA_s8_64x32 {}
 struct coopmatWgB_s8_32x16 {}
@@ -495,23 +498,32 @@ def public coopmatMulAdd(a : coopmatWgA_f16_128x64; b : coopmatWgB_f16_64x32; c 
 def public coopmatMulAdd(a : coopmatWgA_f16_128x32; b : coopmatWgB_f16_32x128; c : coopmatWgAcc_f16_128x128) : coopmatWgAcc_f16_128x128 { return c }
 [unused_argument(a, b), sideeffects]
 def public coopmatMulAdd(a : coopmatWgA_f16_128x32; b : coopmatWgB_f16_32x32; c : coopmatWgAcc_f16_128x32) : coopmatWgAcc_f16_128x32 { return c }
-// flash-attention shapes: S = Qf16 @ K^T (hsk 64 / 128), O += P @ V (hsv 64 / 128), rowsum = P @ One
 [unused_argument(a, b), sideeffects]
 def public coopmatMulAdd(a : coopmatWgA_f16_64x64; b : coopmatWgB_f16_64x64; c : coopmatWgAcc_f32_64x64) : coopmatWgAcc_f32_64x64 { return c }
 [unused_argument(a, b), sideeffects]
 def public coopmatMulAdd(a : coopmatWgA_f16_64x64; b : coopmatWgB_f16_64x128; c : coopmatWgAcc_f32_64x128) : coopmatWgAcc_f32_64x128 { return c }
-// the h128 Bc=32 trio: S = Qf16 @ K^T, rowsum = P @ One, O += P @ V
 [unused_argument(a, b), sideeffects]
 def public coopmatMulAdd(a : coopmatWgA_f16_64x128; b : coopmatWgB_f16_128x32; c : coopmatWgAcc_f32_64x32) : coopmatWgAcc_f32_64x32 { return c }
 [unused_argument(a, b), sideeffects]
 def public coopmatMulAdd(a : coopmatWgA_f16_64x32; b : coopmatWgB_f16_32x32; c : coopmatWgAcc_f32_64x32) : coopmatWgAcc_f32_64x32 { return c }
 [unused_argument(a, b), sideeffects]
 def public coopmatMulAdd(a : coopmatWgA_f16_64x32; b : coopmatWgB_f16_32x128; c : coopmatWgAcc_f32_64x128) : coopmatWgAcc_f32_64x128 { return c }
-// the h256 Bc=32 pair: S = Qf16 @ K^T, O += P @ V (rowsum = P @ One is the h128 trio's)
 [unused_argument(a, b), sideeffects]
 def public coopmatMulAdd(a : coopmatWgA_f16_64x256; b : coopmatWgB_f16_256x32; c : coopmatWgAcc_f32_64x32) : coopmatWgAcc_f32_64x32 { return c }
 [unused_argument(a, b), sideeffects]
 def public coopmatMulAdd(a : coopmatWgA_f16_64x32; b : coopmatWgB_f16_32x256; c : coopmatWgAcc_f32_64x256) : coopmatWgAcc_f32_64x256 { return c }
+[unused_argument(a, b), sideeffects]
+def public coopmatMulAdd(a : coopmatWgA_f16_64x512; b : coopmatWgB_f16_512x32; c : coopmatWgAcc_f32_64x32) : coopmatWgAcc_f32_64x32 { return c }
+[unused_argument(a, b), sideeffects]
+def public coopmatMulAdd(a : coopmatWgA_f16_64x32; b : coopmatWgB_f16_32x512; c : coopmatWgAcc_f32_64x512) : coopmatWgAcc_f32_64x512 { return c }
+[unused_argument(a, b), sideeffects]
+def public coopmatMulAdd(a : coopmatWgA_f16_64x64; b : coopmatWgB_f16_64x64; c : coopmatWgAcc_f16_64x64) : coopmatWgAcc_f16_64x64 { return c }
+[unused_argument(a, b), sideeffects]
+def public coopmatMulAdd(a : coopmatWgA_f16_64x32; b : coopmatWgB_f16_32x128; c : coopmatWgAcc_f16_64x128) : coopmatWgAcc_f16_64x128 { return c }
+[unused_argument(a, b), sideeffects]
+def public coopmatMulAdd(a : coopmatWgA_f16_64x32; b : coopmatWgB_f16_32x256; c : coopmatWgAcc_f16_64x256) : coopmatWgAcc_f16_64x256 { return c }
+[unused_argument(a, b), sideeffects]
+def public coopmatMulAdd(a : coopmatWgA_f16_64x32; b : coopmatWgB_f16_32x512; c : coopmatWgAcc_f16_64x512) : coopmatWgAcc_f16_64x512 { return c }
 [unused_argument(a, b), sideeffects]
 def public coopmatMulAdd(a : coopmatWgA_s8_64x32; b : coopmatWgB_s8_32x16; c : coopmatWgAcc_s32_64x16) : coopmatWgAcc_s32_64x16 { return c }
 [unused_argument(a, b), sideeffects]
@@ -576,6 +588,12 @@ def public coopmatConvert(var dst : coopmatWgAcc_f32_64x16; src : coopmatWgAcc_f
 def public coopmatConvert(var dst : coopmatWgAcc_f32_64x32; src : coopmatWgAcc_f16_64x32) : void {}
 [unused_argument(dst, src), sideeffects]
 def public coopmatConvert(var dst : coopmatWgAcc_f32_64x64; src : coopmatWgAcc_f16_64x64) : void {}
+[unused_argument(dst, src), sideeffects]
+def public coopmatConvert(var dst : coopmatWgAcc_f32_64x128; src : coopmatWgAcc_f16_64x128) : void {}
+[unused_argument(dst, src), sideeffects]
+def public coopmatConvert(var dst : coopmatWgAcc_f32_64x256; src : coopmatWgAcc_f16_64x256) : void {}
+[unused_argument(dst, src), sideeffects]
+def public coopmatConvert(var dst : coopmatWgAcc_f32_64x512; src : coopmatWgAcc_f16_64x512) : void {}
 [unused_argument(dst, src), sideeffects]
 def public coopmatConvert(var dst : coopmatWgAcc_f32_128x256; src : coopmatWgAcc_f16_128x256) : void {}
 [unused_argument(dst, src), sideeffects]

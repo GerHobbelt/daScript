@@ -253,47 +253,47 @@ struct Definition {
 }
 
 def private field_value_struct(expr : Expression const?) : Structure const? {
-    var value_type : TypeDecl const?
-    if (expr is ExprField) {
-        let f = expr as ExprField
-        if (f.value != null) {
-            value_type = f.value._type
-        }
-    } elif (expr is ExprSafeField) {
-        let f = expr as ExprSafeField
-        if (f.value != null) {
-            value_type = f.value._type
-        }
-    }
-    // unwrap pointer types (Foo? -> Foo)
-    if (value_type != null && value_type.structType == null && value_type.firstType != null) {
-        value_type = value_type.firstType
-    }
-    return value_type != null ? value_type.structType : null
+    if (expr is ExprField) return value_struct((expr as ExprField).value)
+    if (expr is ExprSafeField) return value_struct((expr as ExprSafeField).value)
+    return null
 }
 
-def private resolve_definition(hit : CursorHit) : Definition { // nolint:STYLE037,STYLE038 — exact-type `is` ladder, one arm per Expression class
+def private variable_definition(variable : Variable const?) : Definition {
+    return Definition(
+        found = true,
+        kind = "variable",
+        name = string(variable.name),
+        file = lineinfo_file(variable.at),
+        line = int(variable.at.line),
+        column = int(variable.at.column))
+}
+
+def private function_signature(f : Function const?) : string {
+    return build_string() $(var w) {
+        write(w, "def {f.name}")
+        write_signature(w, *f)
+    }
+}
+
+def private resolve_definition(program : smart_ptr<Program>; hit : CursorHit) : Definition { // nolint:STYLE037 — exact-type `is` ladder, one arm per Expression class
+    if (hit.variable != null) {
+        return variable_definition(hit.variable)
+    }
+    if (hit.type_decl != null) {
+        return type_definition(program, hit.type_decl)
+    }
     let expr = hit.expr
     if (expr is ExprVar) {
         let v = expr as ExprVar
         if (v.variable != null) {
-            let variable = v.variable
-            return Definition(
-                found = true,
-                kind = "variable",
-                name = string(variable.name),
-                file = lineinfo_file(variable.at),
-                line = int(variable.at.line),
-                column = int(variable.at.column))
+            return variable_definition(v.variable)
         }
     }
     if (expr is ExprCall) {
         let c = expr as ExprCall
         if (c.func != null) {
-            let signature = build_string() $(var w) {
-                write(w, "def {c.func.name}")
-                write_signature(w, *c.func)
-            }
+            let fn = origin_function(c.func)
+            let signature = function_signature(fn)
             if (c.func.flags.builtIn) {
                 let bfn = c.func as BuiltInFunction
                 return Definition(
@@ -306,10 +306,10 @@ def private resolve_definition(hit : CursorHit) : Definition { // nolint:STYLE03
             return Definition(
                 found = true,
                 kind = "function",
-                name = string(c.func.name),
-                file = lineinfo_file(c.func.at),
-                line = int(c.func.at.line),
-                column = int(c.func.at.column),
+                name = string(fn.name),
+                file = lineinfo_file(fn.at),
+                line = int(fn.at.line),
+                column = int(fn.at.column),
                 signature = signature)
         }
     }
@@ -317,16 +317,14 @@ def private resolve_definition(hit : CursorHit) : Definition { // nolint:STYLE03
         let field_name = string(expr is ExprField ? (expr as ExprField).name : (expr as ExprSafeField).name)
         let st = field_value_struct(expr)
         if (st != null) {
-            for (fld in st.fields) {
-                if (fld.name == field_name) {
-                    return Definition(
-                        found = true,
-                        kind = "field",
-                        name = field_name,
-                        file = lineinfo_file(fld.at),
-                        line = int(fld.at.line),
-                        column = int(fld.at.column))
-                }
+            let method = find_method_function(st, field_name)
+            if (method != null) {
+                return Definition(found = true, kind = "function", name = bare_name(string(method.name)), file = lineinfo_file(method.at),
+                    line = int(method.at.line), column = int(method.at.column), signature = function_signature(method))
+            }
+            let at = field_at(st, field_name)
+            if (int(at.line) > 0) {
+                return Definition(found = true, kind = "field", name = field_name, file = lineinfo_file(at), line = int(at.line), column = int(at.column))
             }
         }
     }
@@ -344,45 +342,17 @@ def private resolve_definition(hit : CursorHit) : Definition { // nolint:STYLE03
         }
     }
     if (expr._type != null) {
-        let td = expr._type
-        if (!empty(td.alias)) {
-            return Definition(
-                found = true,
-                kind = "typedef",
-                name = string(td.alias),
-                file = lineinfo_file(td.at),
-                line = int(td.at.line),
-                column = int(td.at.column))
-        }
-        if (td.isHandle && td.annotation != null) {
-            return Definition(
-                found = true,
-                kind = "handled",
-                name = string(td.annotation.name),
-                cppName = string(td.annotation.cppName))
-        }
-        if (td.structType != null) {
-            let st = td.structType
-            return Definition(
-                found = true,
-                kind = st.flags.isClass ? "class" : "struct",
-                name = string(st.name),
-                file = lineinfo_file(st.at),
-                line = int(st.at.line),
-                column = int(st.at.column))
-        }
-        if (td.enumType != null) {
-            let en = td.enumType
-            return Definition(
-                found = true,
-                kind = "enum",
-                name = string(en.name),
-                file = lineinfo_file(en.at),
-                line = int(en.at.line),
-                column = int(en.at.column))
-        }
+        return type_definition(program, expr._type)
     }
     return Definition()
+}
+
+def private type_definition(program : smart_ptr<Program>; td : TypeDecl const?) : Definition {
+    let d = declaration_of(program, td)
+    return Definition() if (d.kind == DeclarationKind.none)
+    if (d.kind == DeclarationKind.handled) return Definition(found = true, kind = "handled", name = d.name, cppName = string(d.annotation.cppName))
+    let kind = d.kind == DeclarationKind.alias ? "typedef" : d.kind == DeclarationKind.enumeration ? "enum" : d.structure.flags.isClass ? "class" : "struct"
+    return Definition(found = true, kind = kind, name = d.name, file = lineinfo_file(d.at), line = int(d.at.line), column = declared_name_column(d.at, d.name))
 }
 
 def private run_definition(file : string; line0, char16 : int; project : string) : LocationsResult {
@@ -390,9 +360,16 @@ def private run_definition(file : string; line0, char16 : int; project : string)
     var line, col : int
     request_cursor(file, line0, char16, line, col)
     let compiled = compile_nav(file, project) $(program) {
-        var hits <- find_at_cursor(program, file, line, col)
+        let decl = declaration_at_cursor(program, file, line, col)
+        if (decl.target.kind != RefTargetKind.none) {
+            res.locations |> push(NavLocation(
+                path = to_generic_path(decl.target.decl_file),
+                _range = word_range(decl.target.decl_file, decl.target.decl_line, decl.target.decl_column, decl.target.name)))
+            return
+        }
+        var hits <- find_at_cursor(program, file, line, col, true, line_text(file, line))
         for (hit in hits) {
-            let defn = resolve_definition(hit)
+            let defn = resolve_definition(program, hit)
             if (defn.found && !empty(defn.file) && defn.line > 0) {
                 res.locations |> push(NavLocation(
                     path = to_generic_path(defn.file),
@@ -420,8 +397,12 @@ def private hover_contents(hit : CursorHit; defn : Definition) : string {
         write(w, "```daslang\n")
         if (!empty(defn.signature)) {
             write(w, "{defn.signature}\n")
+        } elif (hit.variable != null && hit.variable._type != null) {
+            write(w, "{source_name(hit.name)} : {describe(hit.variable._type)}\n")
+        } elif (hit.type_decl != null) {
+            write(w, "{defn.kind} {hit.name}\n")
         } elif (!empty(hit.name) && hit.expr != null && hit.expr._type != null) {
-            write(w, "{hit.name} : {describe(hit.expr._type)}\n")
+            write(w, "{source_name(hit.name)} : {describe(hit.expr._type)}\n")
         } elif (hit.expr != null && hit.expr._type != null) {
             write(w, "{describe(hit.expr._type)}\n")
         } else {
@@ -449,25 +430,39 @@ def private run_hover(file : string; line0, char16 : int; project : string) : Ho
     request_cursor(file, line0, char16, line, col)
     let target = to_generic_path(file)
     let compiled = compile_nav(file, project) $(program) {
-        let hits <- find_at_cursor(program, file, line, col)
-        if (empty(hits)) {
-            res.message = "no expression at cursor"
+        let decl = declaration_at_cursor(program, file, line, col)
+        if (decl.target.kind != RefTargetKind.none) {
+            res.contents = "```daslang\n{decl.target.signature}\n```\n\n{kind_word(decl.target.kind)} — defined at {to_generic_path(decl.target.decl_file)}:{decl.target.decl_line}"
+            res.hasRange = true
+            res._range = word_range(file, line, decl.word_column, decl.target.name)
             return
         }
-        // innermost hit that carries a name or a type; fall back to innermost
-        var pick = 0
+        let hits <- find_at_cursor(program, file, line, col, true, line_text(file, line))
+        var pick = -1
         for (idx in range(length(hits))) {
             if (!empty(hits[idx].name) || (hits[idx].expr != null && hits[idx].expr._type != null)) {
                 pick = idx
                 break
             }
         }
+        if (pick < 0) {
+            res.message = "no expression at cursor"
+            return
+        }
         let hit = hits[pick]
-        res.contents = hover_contents(hit, resolve_definition(hit))
-        if (hit.expr != null && to_generic_path(lineinfo_file(hit.expr.at)) == target && int(hit.expr.at.line) > 0) {
+        res.contents = hover_contents(hit, resolve_definition(program, hit))
+        if (hit.variable != null || hit.type_decl != null) {
             res.hasRange = true
-            res._range = span_range(file, int(hit.expr.at.line), int(hit.expr.at.column),
-                int(hit.expr.at.last_line), int(hit.expr.at.last_column))
+            res._range = word_range(file, int(hit_at(hit).line), int(hit_at(hit).column), source_name(hit.name))
+        } elif (hit.expr != null && to_generic_path(lineinfo_file(hit.expr.at)) == target && int(hit.expr.at.line) > 0) {
+            res.hasRange = true
+            let at_field = field_name_at(hit.expr)
+            if (int(at_field.line) > 0) {
+                res._range = word_range(file, int(at_field.line), int(at_field.column), hit.name)
+            } else {
+                res._range = span_range(file, int(hit.expr.at.line), int(hit.expr.at.column),
+                    int(hit.expr.at.last_line), int(hit.expr.at.last_column))
+            }
         }
     }
     if (!compiled) {
@@ -493,13 +488,13 @@ struct RefTarget {
     kind : RefTargetKind
     // pointers stored as void? for identity comparison (avoids const mismatch)
     target_ptr : void?
-    field_struct_ptr : void?
     field_name : string
     alias_name : string
     name : string       // bare name — sizes each reference's range
     decl_file : string  // declaration site, for includeDeclaration
     decl_line : int
     decl_column : int
+    signature : string  //! the declaration as hover shows it; empty for a target identified from an expression
 }
 
 // const? param: both pointer flavors (T? / T const?) converge on one
@@ -509,7 +504,13 @@ def private to_void(p : auto(TT) const?) : void? {
     return unsafe(reinterpret<void?>(p))
 }
 
-def private identify_target(hit : CursorHit) : RefTarget { // nolint:STYLE037 — exact-type `is` ladder, one arm per Expression class
+def private identify_target(program : smart_ptr<Program>; hit : CursorHit) : RefTarget { // nolint:STYLE037 — exact-type `is` ladder, one arm per Expression class
+    if (hit.variable != null) {
+        return variable_target(hit.variable, int(hit.variable.at.column))
+    }
+    if (hit.type_decl != null) {
+        return type_target(program, hit.type_decl)
+    }
     let expr = hit.expr
     if (expr is ExprCall) {
         let c = expr as ExprCall
@@ -537,15 +538,9 @@ def private identify_target(hit : CursorHit) : RefTarget { // nolint:STYLE037 �
         let fname = string(expr is ExprField ? (expr as ExprField).name : (expr as ExprSafeField).name)
         let st = field_value_struct(expr)
         if (st != null) {
-            var t = RefTarget(kind = RefTargetKind.field, field_struct_ptr = to_void(st), field_name = fname, name = fname)
-            for (fld in st.fields) {
-                if (fld.name == fname) {
-                    t.decl_file = lineinfo_file(fld.at)
-                    t.decl_line = int(fld.at.line)
-                    t.decl_column = int(fld.at.column)
-                }
-            }
-            return t
+            let method = find_method_function(st, fname)
+            return function_target(method, int(method.at.column)) if (method != null)
+            return field_target(st, fname)
         }
     }
     if (expr is ExprConstEnumeration) {
@@ -556,74 +551,107 @@ def private identify_target(hit : CursorHit) : RefTarget { // nolint:STYLE037 �
         }
     }
     if (expr._type != null) {
-        let td = expr._type
-        if (!empty(td.alias)) {
-            return RefTarget(kind = RefTargetKind.alias, alias_name = string(td.alias), name = string(td.alias),
-                decl_file = lineinfo_file(td.at), decl_line = int(td.at.line), decl_column = int(td.at.column))
-        }
-        if (td.structType != null) {
-            return RefTarget(kind = RefTargetKind.structure, target_ptr = to_void(td.structType), name = string(td.structType.name),
-                decl_file = lineinfo_file(td.structType.at), decl_line = int(td.structType.at.line), decl_column = int(td.structType.at.column))
-        }
-        if (td.enumType != null) {
-            return RefTarget(kind = RefTargetKind.enumeration, target_ptr = to_void(td.enumType), name = string(td.enumType.name),
-                decl_file = lineinfo_file(td.enumType.at), decl_line = int(td.enumType.at.line), decl_column = int(td.enumType.at.column))
-        }
+        return type_target(program, expr._type)
     }
     return RefTarget()
 }
 
-// declarations at the cursor line (function/struct/enum/typedef/global defs are
-// not expressions — find_at_cursor misses them)
-def private identify_declaration_target(program : smart_ptr<Program>; file : string; line : int) : RefTarget {
-    let thisMod = get_this_module(program)
-    let target = to_generic_path(file)
-    var result : RefTarget
-    ast::for_each_function(thisMod, "") $(var func : FunctionPtr) {
-        return if (result.kind != RefTargetKind.none)
-        let f = func
-        if (int(f.at.line) == line && to_generic_path(lineinfo_file(f.at)) == target) {
-            result = RefTarget(kind = RefTargetKind.func, target_ptr = to_void(f), name = string(f.name),
-                decl_file = lineinfo_file(f.at), decl_line = int(f.at.line), decl_column = int(f.at.column))
+def private type_target(program : smart_ptr<Program>; td : TypeDecl const?) : RefTarget {
+    let d = declaration_of(program, td)
+    return declaration_target(d, declared_name_column(d.at, d.name))
+}
+
+//! the source line (1-based), "" past the end of the file
+def private line_text(file : string; line : int) : string {
+    var text = ""
+    with_file_lines(file) $(lines) {
+        if (line >= 1 && line <= length(lines)) {
+            text = lines[line - 1]
         }
     }
-    return result if (result.kind != RefTargetKind.none)
-    ast::for_each_structure(thisMod) $(var st : StructurePtr) {
-        return if (result.kind != RefTargetKind.none)
-        let s = st
-        if (int(s.at.line) == line && to_generic_path(lineinfo_file(s.at)) == target) {
-            result = RefTarget(kind = RefTargetKind.structure, target_ptr = to_void(s), name = string(s.name),
-                decl_file = lineinfo_file(s.at), decl_line = int(s.at.line), decl_column = int(s.at.column))
-        }
+    return text
+}
+
+def private is_unspelled_type_ref(target : RefTarget; r : RawRef) : bool {
+    return false if (target.kind != RefTargetKind.structure && target.kind != RefTargetKind.enumeration && target.kind != RefTargetKind.alias)
+    return !spells_name(line_text(r.file, r.line), r.column, target.name)
+}
+
+//! the cursor's word column for a hit on the cursor line, else the name as spelled on the declaration's own line (a derived class's parent)
+def private decl_column(hit : DeclarationHit; line : int) : int {
+    return hit.word_column if (hit.word_column >= 0 && int(hit.at.line) == line)
+    return declared_name_column(hit.at, hit.name)
+}
+
+def private function_target(f : Function const?; column : int) : RefTarget {
+    return RefTarget(kind = RefTargetKind.func, target_ptr = to_void(f), name = bare_name(string(f.name)),
+        decl_file = lineinfo_file(f.at), decl_line = int(f.at.line), decl_column = column,
+        signature = function_signature(f))
+}
+
+def private variable_target(v : Variable const?; column : int; signature : string = "") : RefTarget {
+    return RefTarget(kind = RefTargetKind.variable, target_ptr = to_void(v), name = source_name(string(v.name)),
+        decl_file = lineinfo_file(v.at), decl_line = int(v.at.line), decl_column = column, signature = signature)
+}
+
+def private structure_target(st : Structure const?; column : int) : RefTarget {
+    let head = "{st.flags.isClass ? "class" : "struct"} {st.name}"
+    return RefTarget(kind = RefTargetKind.structure, target_ptr = to_void(st), name = string(st.name),
+        decl_file = lineinfo_file(st.at), decl_line = int(st.at.line), decl_column = column,
+        signature = st.parent != null ? "{head} : {st.parent.name}" : head)
+}
+
+def private field_target(st : Structure const?; name : string; field_type : TypeDecl const? = null) : RefTarget {
+    let at = field_at(st, name)
+    return RefTarget(kind = RefTargetKind.field, field_name = name, name = name,
+        decl_file = lineinfo_file(at), decl_line = int(at.line), decl_column = int(at.column),
+        signature = field_type != null ? "{name} : {describe(unsafe(reinterpret<TypeDecl?>(field_type)))}" : "")
+}
+
+def private same_site(at : LineInfo; target : RefTarget) : bool {
+    return int(at.line) == target.decl_line && int(at.column) == target.decl_column && lineinfo_file(at) == target.decl_file
+}
+
+struct DeclHit {
+    target : RefTarget
+    word_column : int   //! where the cursor's identifier starts on its line
+}
+
+//! the reference target a declaration is, its name spelled at `column` on its line
+def private declaration_target(found : DeclarationHit; column : int) : RefTarget {
+    if (found.kind == DeclarationKind.func) return function_target(found.func, column)
+    if (found.kind == DeclarationKind.structure) return structure_target(found.structure, column)
+    if (found.kind == DeclarationKind.enumeration) {
+        let e = found.enumeration
+        return RefTarget(kind = RefTargetKind.enumeration, target_ptr = to_void(e), name = found.name,
+            decl_file = lineinfo_file(e.at), decl_line = int(e.at.line), decl_column = column, signature = "enum {e.name}")
     }
-    return result if (result.kind != RefTargetKind.none)
-    ast::for_each_enumeration(thisMod) $(var en : EnumerationPtr) {
-        return if (result.kind != RefTargetKind.none)
-        let e = en
-        if (int(e.at.line) == line && to_generic_path(lineinfo_file(e.at)) == target) {
-            result = RefTarget(kind = RefTargetKind.enumeration, target_ptr = to_void(e), name = string(e.name),
-                decl_file = lineinfo_file(e.at), decl_line = int(e.at.line), decl_column = int(e.at.column))
-        }
+    if (found.kind == DeclarationKind.alias) {
+        let alias_type = found.alias_type != null ? describe(unsafe(reinterpret<TypeDecl?>(found.alias_type))) : "auto"
+        return RefTarget(kind = RefTargetKind.alias, alias_name = found.name, name = found.name,
+            decl_file = lineinfo_file(found.at), decl_line = int(found.at.line), decl_column = column, signature = "typedef {found.name} = {alias_type}")
     }
-    return result if (result.kind != RefTargetKind.none)
-    ast::for_each_typedef(thisMod) $(name : string#; var value : TypeDeclPtr) {
-        return if (result.kind != RefTargetKind.none)
-        let td = value
-        if (int(td.at.line) == line && to_generic_path(lineinfo_file(td.at)) == target) {
-            result = RefTarget(kind = RefTargetKind.alias, alias_name = string(name), name = string(name),
-                decl_file = lineinfo_file(td.at), decl_line = int(td.at.line), decl_column = int(td.at.column))
-        }
+    if (found.kind == DeclarationKind.variable) {
+        let v = found.variable
+        return variable_target(v, column, "{v.name} : {describe(v._type)}")
     }
-    return result if (result.kind != RefTargetKind.none)
-    ast::for_each_global(thisMod) $(var value : VariablePtr) {
-        return if (result.kind != RefTargetKind.none)
-        let v = value
-        if (int(v.at.line) == line && to_generic_path(lineinfo_file(v.at)) == target) {
-            result = RefTarget(kind = RefTargetKind.variable, target_ptr = to_void(v), name = string(v.name),
-                decl_file = lineinfo_file(v.at), decl_line = int(v.at.line), decl_column = int(v.at.column))
-        }
-    }
-    return result
+    if (found.kind == DeclarationKind.field) return field_target(found.structure, found.name, found.field_type)
+    return RefTarget()
+}
+
+//! the declaration the cursor names; a negative `col` is the line-only lookup
+def private declaration_at_cursor(program : smart_ptr<Program>; file : string; line, col : int) : DeclHit {
+    let found = find_declaration_at_cursor(program, file, line, col, col < 0 ? "" : line_text(file, line))
+    return DeclHit(target = declaration_target(found, decl_column(found, line)), word_column = found.word_column)
+}
+
+def private kind_word(kind : RefTargetKind) : string {
+    if (kind == RefTargetKind.func) return "function"
+    if (kind == RefTargetKind.structure) return "struct"
+    if (kind == RefTargetKind.enumeration) return "enum"
+    if (kind == RefTargetKind.alias) return "typedef"
+    if (kind == RefTargetKind.field) return "field"
+    return "variable"
 }
 
 struct RawRef {
@@ -635,14 +663,32 @@ struct RawRef {
 class RefVisitor : AstVisitor {
     target : RefTarget
     refs : array<RawRef>
+    in_synthesized_member : bool
 
     def RefVisitor(t : RefTarget) {
         target = t
     }
 
     def add_ref(at : LineInfo) : void {
-        if (int(at.line) == 0 || at.fileInfo == null) return
+        if (in_synthesized_member || int(at.line) == 0 || at.fileInfo == null) return
         refs |> push(RawRef(file = string(at.fileInfo.name), line = int(at.line), column = int(at.column)))
+    }
+
+    def override preVisitFunction(fun : FunctionPtr) : void {
+        in_synthesized_member = is_synthesized(fun)
+    }
+
+    def override visitFunction(var fun : FunctionPtr) : FunctionPtr {
+        in_synthesized_member = false
+        return fun
+    }
+
+    // a derived class names its parent on its own line - a parent link, not a TypeDecl
+    def override preVisitStructure(str : StructurePtr) : void {
+        return if (target.kind != RefTargetKind.structure || str.parent == null || to_void(str.parent) != target.target_ptr)
+        let file = lineinfo_file(str.at)
+        return if (int(str.at.line) == 0 || empty(file))
+        refs |> push(RawRef(file = file, line = int(str.at.line), column = declared_name_column(str.at, target.name)))
     }
 
     def override preVisitExprCall(expr : ExprCall?) : void {
@@ -663,16 +709,22 @@ class RefVisitor : AstVisitor {
         }
     }
 
+    // a field is one declaration across the class hierarchy: a derived class's copy keeps the parent's position
+    def on_target_field(expr : Expression const?; name : string) : bool {
+        let st = field_value_struct(expr)
+        return false if (st == null)
+        if (target.kind == RefTargetKind.func) return to_void(find_method_function(st, name)) == target.target_ptr
+        return target.kind == RefTargetKind.field && name == target.field_name && same_site(field_at(st, name), target)
+    }
+
     def override preVisitExprField(expr : ExprField?) : void {
-        if (target.kind != RefTargetKind.field || expr.name != target.field_name) return
-        if (to_void(field_value_struct(expr)) == target.field_struct_ptr) {
+        if (on_target_field(expr, string(expr.name))) {
             add_ref(expr.atField)
         }
     }
 
     def override preVisitExprSafeField(expr : ExprSafeField?) : void {
-        if (target.kind != RefTargetKind.field || expr.name != target.field_name) return
-        if (to_void(field_value_struct(expr)) == target.field_struct_ptr) {
+        if (on_target_field(expr, string(expr.name))) {
             add_ref(expr.atField)
         }
     }
@@ -708,20 +760,25 @@ def private run_references(file : string; line0, char16 : int; include_decl : bo
     var line, col : int
     request_cursor(file, line0, char16, line, col)
     let compiled = compile_nav(file, project) $(program) {
-        var target : RefTarget
-        var hits <- find_at_cursor(program, file, line, col)
-        for (hit in hits) {
-            target = identify_target(hit)
-            break if (target.kind != RefTargetKind.none)
+        var target = declaration_at_cursor(program, file, line, col).target
+        if (target.kind == RefTargetKind.none) {
+            var hits <- find_at_cursor(program, file, line, col, true, line_text(file, line))
+            for (hit in hits) {
+                target = identify_target(program, hit)
+                break if (target.kind != RefTargetKind.none)
+            }
         }
         if (target.kind == RefTargetKind.none) {
-            target = identify_declaration_target(program, file, line)
+            target = declaration_at_cursor(program, file, line, -1).target
         }
         if (target.kind == RefTargetKind.none) {
             res.message = "no referenceable symbol at cursor"
             return
         }
+        // a ref site can repeat across generic instantiations — dedupe by position
+        var seen : table<string>
         if (include_decl && !empty(target.decl_file) && target.decl_line > 0) {
+            seen |> insert("{target.decl_file}:{target.decl_line}:{target.decl_column}")
             res.locations |> push(NavLocation(
                 path = to_generic_path(target.decl_file),
                 _range = word_range(target.decl_file, target.decl_line, target.decl_column, target.name)))
@@ -730,11 +787,9 @@ def private run_references(file : string; line0, char16 : int; include_decl : bo
         make_visitor(*visitor) $(adapter) {
             visit_modules(program, adapter)
         }
-        // a ref site can repeat across generic instantiations — dedupe by position
-        var seen : table<string>
         for (r in visitor.refs) {
             let key = "{r.file}:{r.line}:{r.column}"
-            continue if (key_exists(seen, key))
+            continue if (key_exists(seen, key) || is_unspelled_type_ref(target, r))
             seen |> insert(key)
             res.locations |> push(NavLocation(
                 path = to_generic_path(r.file),
@@ -818,19 +873,19 @@ def private run_document_symbol(file, project : string) : DocSymbolsResult {
             return if (to_generic_path(f) != target)
             var sym <- make_doc_symbol(f, s.at, string(s.name), "", s.flags.isClass ? SK_CLASS : SK_STRUCT)
             for (fld in s.fields) {
+                continue if (!is_own_field(fld) || fld.flags.classMethod)
                 push_doc_child(sym, f, fld.at, string(fld.name), describe(fld._type), SK_FIELD)
             }
             if (s.flags.isClass) {
                 ast::for_each_function(thisMod, "") $(var func : FunctionPtr) {
                     let fn = func
-                    return if (!fn.flags.isClassMethod || empty(fn.arguments) ||
-                        (fn.flags.generated && fn.fromGeneric == null))
+                    return if (!fn.flags.isClassMethod || empty(fn.arguments) || is_synthesized(fn))
                     let self_type = fn.arguments[0]._type
                     return if (self_type == null || self_type.structType == null || self_type.structType.name != s.name)
                     let detail = build_string() $(var w) {
                         write_signature(w, *fn)
                     }
-                    push_doc_child(sym, f, fn.at, string(fn.name), detail, SK_METHOD)
+                    push_doc_child(sym, f, fn.at, bare_name(string(fn.name)), detail, SK_METHOD)
                 }
             }
             res.symbols |> emplace(sym)
@@ -996,27 +1051,9 @@ def private has_source(func : Function const?) : bool {
     return func != null && int(func.at.line) > 0 && !empty(lineinfo_file(func.at))
 }
 
-// "Animal`speak" -> "speak" — the source token at the declaration/call site
-def private bare_function_name(name : string) : string {
-    let ix = rfind(name, "`")
-    return ix < 0 ? name : slice(name, ix + 1)
-}
-
-// compiler-synthesized members (Foo'__finalize etc.) sit on the `class` line
-// but aren't all flagged `generated`; user identifiers can't contain ' —
-// skip both or a cursor on a class name resolves to the finalizer
-def private is_synthesized(func : Function const?) : bool {
-    return true if (func.flags.generated && func.fromGeneric == null)
-    var has_tick = false
-    peek(func.name) $(n) {
-        has_tick = find(n, "'") >= 0
-    }
-    return has_tick
-}
-
 def private make_hier_item(func : Function const?) : HierItem {
     let f = lineinfo_file(func.at)
-    let bare = bare_function_name(string(func.name))
+    let bare = bare_name(string(func.name))
     var it = HierItem(
         name = bare,
         detail = build_string() $(var w) {
@@ -1035,12 +1072,11 @@ def private make_hier_item(func : Function const?) : HierItem {
 // (or class method) declared on the cursor line
 def private function_at_cursor(program : smart_ptr<Program>; file : string; line, col : int) : Function const? {
     var result : Function const?
-    var hits <- find_at_cursor(program, file, line, col)
+    var hits <- find_at_cursor(program, file, line, col, true, line_text(file, line))
     for (hit in hits) {
         let expr = hit.expr
-        // synthesized guard: generated finalizer-chain calls carry the class
-        // line as their position — without it a cursor on a class name
-        // resolves to Foo'__finalize instead of falling through to the type
+        continue if (expr == null)
+        // a call the compiler lowered to a synthesized member (`delete p` -> `Foo'__finalize`) is not a function the source names
         if (expr is ExprCall) {
             let c = expr as ExprCall
             if (c.func != null && !c.func.flags.builtIn && !is_synthesized(c.func)) {
@@ -1056,33 +1092,16 @@ def private function_at_cursor(program : smart_ptr<Program>; file : string; line
         }
     }
     if (result == null) {
-        let thisMod = get_this_module(program)
-        let target = to_generic_path(file)
-        ast::for_each_function(thisMod, "") $(var func : FunctionPtr) {
-            return if (result != null)
-            let f = func
-            return if (is_synthesized(f))
-            if (int(f.at.line) == line && to_generic_path(lineinfo_file(f.at)) == target) {
-                result = f
-            }
-        }
-        if (result == null) {
-            ast::for_each_generic(thisMod) $(var func : FunctionPtr) {
-                return if (result != null)
-                let f = func
-                return if (is_synthesized(f))
-                if (int(f.at.line) == line && to_generic_path(lineinfo_file(f.at)) == target) {
-                    result = f
-                }
-            }
+        let decl = find_declaration_at_cursor(program, file, line, col, line_text(file, line))
+        if (decl.kind == DeclarationKind.func) {
+            result = decl.func
         }
     }
     return origin_function(result)
 }
 
 def private matches_decl(func : Function const?; decl_path : string; decl_line : int; name : string) : bool {
-    return (func != null && int(func.at.line) == decl_line && func.name == name &&
-        to_generic_path(lineinfo_file(func.at)) == decl_path)
+    return func != null && int(func.at.line) == decl_line && to_generic_path(lineinfo_file(func.at)) == decl_path && func.name == name
 }
 
 // every Function in the program that IS the pinned declaration: the function
@@ -1154,7 +1173,7 @@ class CallGraphVisitor : AstVisitor {
 
     def override preVisitExprCall(expr : ExprCall?) : void {
         return if (expr.func == null)
-        let word = bare_function_name(string(origin_function(expr.func).name))
+        let word = bare_name(string(origin_function(expr.func).name))
         if (want_incoming) {
             if (cur != null && is_target(expr.func)) {
                 add_site(cur, word, expr.at)
@@ -1268,7 +1287,7 @@ def private run_implementation(file : string; line0, char16 : int; project : str
             if (owner != null) {
                 // method Function names are class-prefixed ("Animal`speak") —
                 // overrides match on the bare name + a derived self type
-                let mname = bare_function_name(string(fn.name))
+                let mname = bare_name(string(fn.name))
                 var derived : array<void?>
                 program_for_each_module(program) $(mod) {
                     ast::for_each_structure(mod) $(var stp : StructurePtr) {
@@ -1282,7 +1301,7 @@ def private run_implementation(file : string; line0, char16 : int; project : str
                     ast::for_each_function(mod, "") $(var fp : FunctionPtr) {
                         let f = fp
                         return if (!f.flags.isClassMethod || empty(f.arguments) ||
-                            bare_function_name(string(f.name)) != mname || int(f.at.line) <= 0)
+                            bare_name(string(f.name)) != mname || int(f.at.line) <= 0)
                         let st0 = f.arguments[0]._type != null ? f.arguments[0]._type.structType : null
                         return if (st0 == null)
                         let p = to_void(st0)
@@ -1303,9 +1322,9 @@ def private run_implementation(file : string; line0, char16 : int; project : str
         // no method at cursor — try a class/struct: implementations = derived types
         var st_ptr : void?
         var st_name = ""
-        var hits <- find_at_cursor(program, file, line, col)
+        var hits <- find_at_cursor(program, file, line, col, true, line_text(file, line))
         for (hit in hits) {
-            let t = identify_target(hit)
+            let t = identify_target(program, hit)
             if (t.kind == RefTargetKind.structure) {
                 st_ptr = t.target_ptr
                 st_name = t.name
@@ -1313,7 +1332,7 @@ def private run_implementation(file : string; line0, char16 : int; project : str
             }
         }
         if (st_ptr == null) {
-            let t = identify_declaration_target(program, file, line)
+            let t = declaration_at_cursor(program, file, line, -1).target
             if (t.kind == RefTargetKind.structure) {
                 st_ptr = t.target_ptr
                 st_name = t.name

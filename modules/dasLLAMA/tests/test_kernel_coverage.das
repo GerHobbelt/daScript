@@ -32,7 +32,7 @@ require strings
 require _model_tier
 require dasllama/dasllama_env   // nolint:STYLE030,LINT019 — the read sites sit in the apple static_if half; the linux lint flavor sees the require as unused
 
-// The KERNEL COVERAGE census (REVIEW_GPU.md: a Metal kernel class is dispatched by a census row here or named in
+// The KERNEL COVERAGE census (REVIEW_GPU_KERNEL_CLASSES.md: a Metal kernel class is dispatched by a census row here or named in
 // CENSUS_NEVER_DISPATCHED; a Vulkan kernel class by a census row or VK_CENSUS_NEVER_DISPATCHED): drive the small-model zoo across the
 // format / graph / batch-shape / KV-codec axes and report which compiled kernels were never
 // dispatched — LOUD WARNINGS, never an auto-dead verdict. A zero means "nothing this zoo runs
@@ -68,28 +68,31 @@ let private CENSUS_NEVER_DISPATCHED <- [
     "MetalMoeMulMmQ51T", "MetalMoeMulMmQ51TH",
     "MetalMoeMulMmQ51TH128", "MetalMoeMulMmQ51THR",
     // the dense tall in-kernel-dequant kq stamps: they engage only when a site's f16 panel
-    // would reach TALLKQ_MIN_PANEL (96 MiB) - the zoo's small carriers top out far below it.
+    // would reach TALLKQ_MIN_PANEL (96 MiB) - the zoo's small carriers top out far below it,
+    // and the iq3 pair additionally wants a plane in a format the zoo does not stock.
     // Their coverage is the tall kernel-unit leg in test_metal_gemm_kernels.das (kq_mulmm_gate)
     "MetalKqMulMmK4TH128", "MetalKqMulMmK5TH128", "MetalKqMulMmK6TH128",
+    "MetalKqMulMmIq3sTH128", "MetalKqMulMmIq3xxsTH128",
     // the nine formats the iquant arc added (Q2_K, Q3_K, IQ4_XS, IQ4_NL, IQ3_S, IQ3_XXS, IQ2_S,
     // IQ2_XS, IQ2_XXS): no stocked census carrier holds a plane in any of them - the zoo quants
     // are Q8_0 / Q5_K_M / Q4_K_M / mxfp4. Their coverage is the kernel-unit gates in
     // test_metal_gemv_kernels.das / test_metal_gemm_kernels.das and the per-format e2e parity
-    // rows recorded in HOW_TO_ADD_A_FORMAT.md
-    "MetalKqGemvK2", "MetalKqMvB2K2", "MetalKqMvB4K2", "MetalKqMvB8K2", "MetalKqMulMmK2",
-    "MetalKqGemvK3", "MetalKqMvB2K3", "MetalKqMvB4K3", "MetalKqMvB8K3", "MetalKqMulMmK3",
+    // rows recorded in HOW_TO_ADD_A_FORMAT.md. A class naming its own kernel records the bare
+    // shader entry name, so those stamps sit here under it, not under the class
+    "metal_kq_gemv_k2", "MetalKqMvB2K2", "MetalKqMvB4K2", "metal_kq_mvb8_k2", "MetalKqMulMmK2",
+    "metal_kq_gemv_k3", "MetalKqMvB2K3", "MetalKqMvB4K3", "metal_kq_mvb8_k3", "MetalKqMulMmK3",
     "MetalKqGemvIq4xs", "MetalKqMvB2Iq4xs", "MetalKqMvB4Iq4xs", "MetalKqMvB8Iq4xs", "MetalKqMulMmIq4xs",
     "MetalKqGemvIq4nl", "MetalKqMvB2Iq4nl", "MetalKqMvB4Iq4nl", "MetalKqMvB8Iq4nl", "MetalKqMulMmIq4nl",
-    "MetalKqGemvIq3s", "MetalKqMvB2Iq3s", "MetalKqMvB4Iq3s", "MetalKqMvB8Iq3s", "MetalKqMulMmIq3s",
-    "MetalKqGemvIq3xxs", "MetalKqMvB2Iq3xxs", "MetalKqMvB4Iq3xxs", "MetalKqMvB8Iq3xxs", "MetalKqMulMmIq3xxs",
-    "MetalKqGemvIq2s", "MetalKqMvB2Iq2s", "MetalKqMvB4Iq2s", "MetalKqMvB8Iq2s", "MetalKqMulMmIq2s",
-    "MetalKqGemvIq2xs", "MetalKqMvB2Iq2xs", "MetalKqMvB4Iq2xs", "MetalKqMvB8Iq2xs", "MetalKqMulMmIq2xs",
-    "MetalKqGemvIq2xxs", "MetalKqMvB2Iq2xxs", "MetalKqMvB4Iq2xxs", "MetalKqMvB8Iq2xxs", "MetalKqMulMmIq2xxs",
+    "metal_kq_gemv_iq3s", "MetalKqMvB2Iq3s", "MetalKqMvB4Iq3s", "metal_kq_mvb8_iq3s", "MetalKqMulMmIq3s",
+    "metal_kq_gemv_iq3xxs", "MetalKqMvB2Iq3xxs", "MetalKqMvB4Iq3xxs", "metal_kq_mvb8_iq3xxs", "MetalKqMulMmIq3xxs",
+    "metal_kq_gemv_iq2s", "MetalKqMvB2Iq2s", "MetalKqMvB4Iq2s", "metal_kq_mvb8_iq2s", "MetalKqMulMmIq2s",
+    "metal_kq_gemv_iq2xs", "MetalKqMvB2Iq2xs", "MetalKqMvB4Iq2xs", "metal_kq_mvb8_iq2xs", "MetalKqMulMmIq2xs",
+    "MetalKqGemvIq2xxs", "MetalKqMvB2Iq2xxs", "MetalKqMvB4Iq2xxs", "metal_kq_mvb8_iq2xxs", "MetalKqMulMmIq2xxs",
     // the same nine formats' crown-gated forms (the metal-kq-race arc): the f4-slab GEMV twins
     // and the tensor mul_mm T/TH stamps compile only behind a box crown and dispatch only on
     // planes the zoo does not stock. Their coverage is the same kernel-unit gates plus the
     // tensor-twins/iq2xxs matrix row and the mint's METAL_TWIN race rows
-    "MetalKqGemvIq3sF4", "MetalKqGemvIq3xxsF4", "MetalKqGemvIq2xxsF4",
+    "metal_kq_gemv_iq3s_f4", "metal_kq_gemv_iq3xxs_f4", "MetalKqGemvIq2xxsF4",
     "MetalKqMulMmIq4xsT", "MetalKqMulMmIq4xsTH", "MetalKqMulMmIq4nlT", "MetalKqMulMmIq4nlTH",
     "MetalKqMulMmK3T", "MetalKqMulMmK3TH", "MetalKqMulMmK2T", "MetalKqMulMmK2TH",
     "MetalKqMulMmIq3sT", "MetalKqMulMmIq3sTH", "MetalKqMulMmIq3xxsT", "MetalKqMulMmIq3xxsTH",
@@ -100,7 +103,63 @@ let private CENSUS_NEVER_DISPATCHED <- [
     // the kq_mvb2_k4_r2 crown. Their coverage is the argmax_rows gate in test_metal_misc_kernels.das,
     // the r2 arm of kq_mvb_gate plus the pair-walk gate in test_metal_gemv_kernels.das, and the
     // mtp suite's parity arms
-    "MetalArgmaxRows", "MetalKqMvB2K4R2"
+    "metal_argmax_rows", "MetalKqMvB2K4R2",
+    // the Q4_0 small-batch twins: the gemma4moe row reaches every other q40 dense stamp, but its
+    // decode steps are single rows, so the B2/B4/B8 tiles need a batched carrier no zoo row runs.
+    // The simdgroup dense mul_mm loses the box race to its own tensor stamp, so it never serves
+    // either - its entry carries the method suffix, since the bare class name prefix-matches the
+    // T/TH keys the row DOES dispatch. Their coverage is kq_mvb_gate(fmt 40) in
+    // test_metal_gemv_kernels.das and kq_mulmm_gate(fmt 40) in test_metal_gemm_kernels.das
+    "MetalKqMvB2Q40", "MetalKqMvB4Q40", "MetalKqMvB8Q40", "MetalKqMulMmQ40_metal_kq_mulmm",
+    // the dev-W dequant kernels of the split-scale and iquant formats: the image mint's dev-W bake
+    // runs one per format, and no stocked census carrier holds a plane in any of them (same zoo
+    // quants as above). Their coverage is kq_devw_gate in test_metal_gemm_kernels.das, whose
+    // kq_dq_kernel picks the stamp per format
+    "MetalKqDequantIq4xs", "MetalKqDequantIq4nl", "MetalKqDequantK3",
+    "MetalKqDequantIq3s", "MetalKqDequantIq3xxs", "MetalKqDequantK2", "MetalKqDequantIq2s",
+    "MetalKqDequantIq2xs", "MetalKqDequantIq2xxs",
+    // the split-format MoE expert mul_mm stamps, all four forms (f32-X base, half-X twin, and the
+    // tall pair): no stocked MoE carrier holds an expert plane in these formats - the zoo's MoE
+    // carriers put Q4_K_M (k4/k6), Q8_0 and mxfp4 expert planes on the schedule. The half-X twin
+    // and the tall pair are covered by moe_mulmm_split_gate in test_metal_gemm_kernels.das; the
+    // f32-X base of every one of these formats is NOT - moe_split_twin has no MoeSplitForm.t arm,
+    // and the only path to that stamp is a served routed model whose prefill minted no half panel
+    // (pf_enc_moe_mm's last arm). followup_metal.md sec.14 owes that arm
+    "MetalMoeMulMmK3T", "MetalMoeMulMmK3TH", "MetalMoeMulMmK3TH128", "MetalMoeMulMmK3THR",
+    "MetalMoeMulMmIq4xsT", "MetalMoeMulMmIq4xsTH", "MetalMoeMulMmIq4xsTH128", "MetalMoeMulMmIq4xsTHR",
+    "MetalMoeMulMmIq3sT", "MetalMoeMulMmIq3sTH", "MetalMoeMulMmIq3sTH128", "MetalMoeMulMmIq3sTHR",
+    "MetalMoeMulMmIq3xxsT", "MetalMoeMulMmIq3xxsTH", "MetalMoeMulMmIq3xxsTH128", "MetalMoeMulMmIq3xxsTHR",
+    "MetalMoeMulMmIq2sT", "MetalMoeMulMmIq2sTH", "MetalMoeMulMmIq2sTH128", "MetalMoeMulMmIq2sTHR",
+    "MetalMoeMulMmIq2xsT", "MetalMoeMulMmIq2xsTH", "MetalMoeMulMmIq2xsTH128", "MetalMoeMulMmIq2xsTHR",
+    "MetalMoeMulMmIq2xxsT", "MetalMoeMulMmIq2xxsTH", "MetalMoeMulMmIq2xxsTH128", "MetalMoeMulMmIq2xxsTHR",
+    // the q40 expert twins the gemma4moe row cannot reach: the tall pair engages at
+    // npos * n_expert_used >= 128 * n_expert = 16384 rows, and its coverage is
+    // moe_mulmm_split_gate(fmt 40) in test_metal_gemm_kernels.das. The f32-X base serves only
+    // where the prefill minted no half panel (pf_enc_moe_mm's last arm), which no served routed
+    // model on this box takes, and moe_split_twin has no MoeSplitForm.t arm for any format - so
+    // the T stamp has NO model-less cell, in q40 or in the seven formats above. followup_metal.md
+    // sec.14 owes that arm
+    "MetalMoeMulMmQ40T_metal_moe_mulmm_iq4xs_t",
+    "MetalMoeMulMmQ40TH128_metal_moe_mulmm_iq4xs_t", "MetalMoeMulMmQ40THR_metal_moe_mulmm_iq4xs_t",
+    // the expert-indexed GEMVs of the same formats, on the same expert planes nothing stocks.
+    // Their coverage is moe_kq_gemv_gate in test_metal_gemv_kernels.das
+    "metal_moe_gemv_k3", "metal_moe_gemv_iq4xs", "metal_moe_gemv_iq3s", "metal_moe_gemv_iq3xxs",
+    "metal_moe_gemv_iq2s", "metal_moe_gemv_iq2xs", "metal_moe_gemv_iq2xxs",
+    // the 16-deep router select stamp: it serves past 256 experts, and the stocked MoE carriers top
+    // out at 128 (Qwen3-30B-A3B), 60 (Qwen1.5-MoE) and 32 (gpt-oss-20b). Its coverage is
+    // moe_select_gate's ne=512 and ne=300 cases in test_metal_prefill_kernels.das
+    "MetalMoeSelect512",
+    // the PLE token-table gather twins: the census's only E-series carrier is the E4B Q8_0, whose
+    // table sits on the q8 plane and takes the q8 stamp. A k4/k5/q40 table needs an E-series file
+    // whose per_layer_token_embd is K-quant or Q4_0, and the zoo stocks none. Their coverage is
+    // ple_gather_kq_gate in test_metal_prefill_kernels.das
+    "MetalPleGatherK4_metal_ple_gather_kq", "MetalPleGatherK5_metal_ple_gather_kq",
+    "MetalPleGatherQ40_metal_ple_gather_kq",
+    // the unconverted geglu arm of the bound-total MoE activation: the gemma4moe row picks the
+    // geglu family on moe_dense_shexp, and its panel always clears CVT_MIN_ROWS, so the HX twin
+    // serves and this one never does. Its coverage is ew2_totb_gate(geglu = true) in
+    // test_metal_misc_kernels.das
+    "MetalGegluB"
 ]
 
 def private counting_prompt(start, last : int) : string {
@@ -174,9 +233,7 @@ def private cov_model(t : T?; path, family : string; kdts : array<KVDtype>; nbs 
                         ss |> emplace <| make_run_state(tr.config, kdt, kdt)
                         let pb <- encode(tr, counting_prompt(3 + i, 44 + i), true, false)
                         eval_(tr, ss[i], pb)
-                        unsafe {
-                            sess |> push(addr(ss[i]))
-                        }
+                        sess |> push(unsafe(addr(ss[i])))
                         curs |> push(greedy_top(ss[i].logits, vocab))
                     }
                     var ws <- create_batch_workspace_(tr)
@@ -242,6 +299,11 @@ def private census_zoo(t : T?) {
         [KVDtype.f16], none)
     // qwen2moe: q8 expert stacks + the sigmoid-gated shared expert on std attention; large tier
     cov_model(t, path_join(models_dir(), "Qwen1.5-MoE-A2.7B-Chat.Q8_0.gguf"), "qwen2moe",
+        [KVDtype.f16], none)
+    // gemma4moe: the only carrier of a Q4_0 routed expert plane - the gemma-4 dense-shared MoE
+    // whose fused gate_up stacks are Q4_0 (the 704-wide down stacks demote to q8: no multiple of
+    // 256). No batch shapes, same reason as the other MoE rows; large tier
+    cov_model(t, path_join(models_dir(), "gemma-4-26B-A4B-it-Q4_0.gguf"), "gemma4moe",
         [KVDtype.f16], none)
     cov_tower(t)
 }
@@ -541,6 +603,60 @@ def private cov_tower_gemma4uv(t : T?) {
     }
 }
 
+//! Blind entries whose stamp compiles only behind a box crown, and the crown that reaches them:
+//! where the crown IS pinned a stocked carrier dispatches the stamp, so the drain assert would red
+//! on a correct box. `CENSUS_NEVER_DISPATCHED` has no vocabulary for "blind only off this crown",
+//! so the pair is named here.
+let private CENSUS_CROWN_CONDITIONAL : table<string; string> <- {"MetalKqMvB2K4R2" => "kq_mvb2_k4_r2"}
+
+//! Did this run compile the GATED stamp families the blind list names? Two gates decide it, both
+//! read from the run itself rather than re-probed: the Metal-4 tensor toolchain - the prefill's PSO
+//! init puts every tensor stamp behind one probe, so the dense q8 tensor family's presence in the
+//! census answers for all of them - and the box's tensor crowns, since every crown-gated twin
+//! compiles only behind `metal_tensor_crowned` and an empty crown list means none of them exist.
+def private census_gated_stamps_compiled(cov : table<string; int64>) : bool {
+    if (empty(get_metal_tensor_crowns())) {
+        return false
+    }
+    for (k in keys(cov)) {
+        if (starts_with(k, "MetalQ8MulMmT")) {
+            return true
+        }
+    }
+    return false
+}
+
+//! The blind-spot list self-drains: census keys are the compiled kernels' MSL entry names, so a
+//! declared entry whose key counted dispatches is a STALE entry, and one matching no key at all
+//! names nothing and would sit green forever. A box that compiled none of the gated stamp families
+//! cannot tell that second case from a misspelt key, so it SKIPS the entry loudly, never passes it.
+def private metal_census_blind_drain(t : T?; cov : table<string; int64>) {
+    let judge_unmatched = census_gated_stamps_compiled(cov)
+    for (blind in CENSUS_NEVER_DISPATCHED) {
+        var hits = 0l
+        var named = false
+        for (k, n in keys(cov), values(cov)) {
+            if (starts_with(k, blind)) {
+                hits += n
+                named = true
+            }
+        }
+        if (!named && !judge_unmatched) {
+            t |> skip("{blind}: this box compiled no tensor or crowned stamp, so an entry matching no census key cannot be told from a misspelt one here")
+            continue
+        }
+        let crown = CENSUS_CROWN_CONDITIONAL?[blind] ?? ""
+        if (hits > 0l && !empty(crown) && metal_tensor_crowned(crown)) {
+            t |> skip("{blind}: the {crown} crown is pinned on this box, so a stocked carrier reaches it ({hits}) - the entry is blind only off that crown")
+            continue
+        }
+        t |> success(named,
+            "{blind} names no compiled kernel - spell the census key (the class's own shader entry name, or <Class>_<kernel method>)")
+        t |> success(hits == 0l,
+            "{blind} is a DECLARED blind spot - a stocked carrier now dispatches it ({hits}): drop the entry, add its census row")
+    }
+}
+
 [test]
 def test_metal_kernel_coverage(tst : T?) {
     tst |> run("Metal kernel coverage census: the small-model zoo across format/graph/batch/KV axes") <| @(t : T?) {
@@ -568,18 +684,7 @@ def test_metal_kernel_coverage(tst : T?) {
             // the assert pins only that the RAIL counts — coverage gaps are human calls
             metal_kernel_coverage_report()
             var cov <- metal_kernel_coverage()
-            // the blind-spot list self-drains: census keys are class-qualified MSL entry
-            // names, so a declared class whose entry counted dispatches is a STALE entry
-            for (blind in CENSUS_NEVER_DISPATCHED) {
-                var hits = 0l
-                for (k, n in keys(cov), values(cov)) {
-                    if (starts_with(k, blind)) {
-                        hits += n
-                    }
-                }
-                t |> success(hits == 0l,
-                    "{blind} is a DECLARED blind spot - a stocked carrier now dispatches it ({hits}): drop the entry, add its census row")
-            }
+            metal_census_blind_drain(t, cov)
             var served = 0
             for (n in values(cov)) {
                 if (n > 0l) {
@@ -615,6 +720,50 @@ let private VK_CENSUS_NEVER_DISPATCHED <- [
     // coverage is the e arm of each format's cell in test_vulkan_kernels.das
     "kq_batch_k5_cm2e_cls_spv", "kq_batch_k6_cm2e_cls_spv", "kq_batch_q40_cm2e_cls_spv",
     "kq_batch_k3_cm2e_cls_spv", "kq_batch_iq4nl_cm2e_cls_spv", "kq_batch_k2_cm2e_cls_spv",
+    // the q51 expert rail (the 32-block down planes of the 26B-A4B's Q4_K_M: a carrier above the zoo's tier) -
+    // its s and e stamps and its decode GEMV; their coverage is test_vkd_q51_cm2_batch and test_vkd_q51_gemv
+    "q51_batch_cm2s_cls_spv", "q51_batch_cm2e_cls_spv", "q51_gemv_cls_spv",
+    // the mx4 expert rail (gpt-oss's native-MXFP4 routed stacks: a carrier above the zoo's tier) - its s and e stamps and
+    // its decode GEMV; their coverage is test_vkd_mx4_cm2_batch and test_vkd_mx4_gemv
+    "mx4_batch_cm2s_cls_spv", "mx4_batch_cm2e_cls_spv", "mx4_gemv_cls_spv",
+    // the per-32 expert rails' KHR arms (the expert schedule on a KHR-mode card: the 26B-A4B Q4_K_M's q51 down stacks, gpt-oss's
+    // mx4 stacks - carriers above the zoo's tier); their coverage is the KHR arm of test_vkd_q51_cm2_batch and test_vkd_mx4_cm2_batch
+    "q51_batch_khr_cls_spv", "mx4_batch_khr_cls_spv",
+    // the mx4 experts' fused gate+up+act+requant GEMV (gpt-oss's token command, above the zoo's tier); its coverage is
+    // test_vkd_mx4_gemv_gu in test_vulkan_kernels.das
+    "mx4_gemv_gu_cls_spv",
+    // the biased act twins (gpt-oss's expert stacks carry gate and up bias rows: a carrier above the zoo's tier) - the
+    // Q8_0 requant form the token command runs and the f16 form the window chain runs; their coverage is test_vkd_act_family
+    "q8_actrq_b_cls_spv", "actf16_b_cls_spv",
+    // the attention-sink twins (gpt-oss's per-head sink logits, a carrier above the zoo's tier): the h64 flash tiles on both
+    // arms with their f16-out twins, the token command's pass and its split combine; their coverage is the sink arms of
+    // test_vkd_fa_cm2, test_vkd_fa_khr and test_vkd_da_attn in test_vulkan_kernels.das
+    "fa_cm2_h64_sink_cls_spv", "fa_cm2_h64_sink_f16_cls_spv", "fa_khr_h64_sink_cls_spv", "fa_khr_h64_sink_f16_cls_spv",
+    "da_attn_sink_cls_spv", "da_attn_f16_sink_cls_spv", "da_attn_comb_sink_cls_spv",
+    // the E-series per-layer-embedding tail (the act, its requant and the proj GEMV in one): its carriers are the
+    // gemma-4 E2B / E4B, no zoo row; its coverage is test_vkd_q8_gemv_pleact in test_vulkan_kernels.das
+    "q8_gemv_pleact_cls_spv",
+    // the KHR flash-attention tile's 256 and 512 heads: the mode sweep's mm row reaches the 64 and 128 heads through the
+    // zoo's qwens, and no zoo row carries a wider head (the gemmas sit above the tier); their coverage is test_vkd_fa_khr
+    // and test_vkd_fa_khr_h256_softcap in test_vulkan_kernels.das
+    "fa_khr_h256_cls_spv", "fa_khr_h256_f16_cls_spv", "fa_khr_h256_cap_cls_spv", "fa_khr_h256_cap_f16_cls_spv",
+    "fa_khr_h512_cls_spv", "fa_khr_h512_f16_cls_spv",
+    // the KHR f16 GEMM (the E-series projection off cm2): no zoo row carries a per-layer embedding; its coverage is
+    // test_vkd_f16_gemm_khr
+    "f16_gemm_khr_cls_spv",
+    // the gemma-4 MoE combine (the two normed branches' residual step, f32 and f16 normed-row forms):
+    // its carrier is the 26B-A4B, above the zoo's tier; its coverage is test_vkd_moe_routing's gemma-4
+    // combine arm in test_vulkan_kernels.das
+    "cls_ar_comb_g4_spv", "cls_ar_comb_g4_f16_b_spv", "cls_ar_comb_g4_rq_spv",
+    // the gemma-2 softcap flash tile (the attention logits through cap * tanh(s / cap)) and the h512 flash tile
+    // (gemma-4's global heads), each with its f16 twin: their carriers are gemma-2-2b and the gemma-4 dense files,
+    // no zoo row; their coverage is test_vkd_fa_cm2_h256_softcap and test_vkd_fa_cm2's h512 arm in test_vulkan_kernels.das
+    "fa_cm2_h256_cap_cls_spv", "fa_cm2_h256_cap_f16_cls_spv", "fa_cm2_h512_cls_spv", "fa_cm2_h512_f16_cls_spv",
+    // the batched windowed decode attention and its f16 twin (a sliding window over the batch rows: the gemma
+    // carriers, no zoo row); its coverage is test_vkd_da_attn_bw in test_vulkan_kernels.das
+    "da_attn_bw_cls_spv", "da_attn_bw_f16_cls_spv",
+    // the q51 routed down GEMV's summing twin (the 26B-A4B Q4_K_M, above the zoo's tier); its coverage is test_vkd_q51_gemv
+    "q51_gemv_sum_cls_spv",
     // the scalar router GEMM: on a cm2 box every MoE carrier whose dim the small f16 GEMM's eight
     // 64-deep chunks divide takes the f16 route, so the scalar tile runs only off it (a dim off
     // 512, the KHR route). Its coverage is test_vkd_moe_routing's router arm in test_vulkan_kernels.das
@@ -664,9 +813,7 @@ def private vk_cov_model(t : T?; path, family : string; nbs : array<int>) {
                     ss |> emplace <| make_run_state(tr.config, KVDtype.f32, KVDtype.f32)
                     let pb <- encode(tr, counting_prompt(3 + i, 44 + i), true, false)
                     eval_(tr, ss[i], pb)
-                    unsafe {
-                        sess |> push(addr(ss[i]))
-                    }
+                    sess |> push(unsafe(addr(ss[i])))
                     curs |> push(greedy_top(ss[i].logits, vocab))
                 }
                 var ws <- create_batch_workspace_(tr)
@@ -761,16 +908,27 @@ def test_vulkan_kernel_coverage_serving(tst : T?) {
                     served++
                 }
             }
-            delete cov
             if (served == 0) {
+                delete cov
                 feint("no vulkan dispatches - arm DASLLAMA_GPU=1 on a device box (the census needs the serving tier)\n")
                 return
             }
             for (blind in VK_CENSUS_NEVER_DISPATCHED) {
-                let hits = vk_kernel_coverage_of(blind)
+                var named = false
+                for (k in keys(cov)) {
+                    if (starts_with(k, blind)) {
+                        named = true
+                    }
+                }
+                // the entry must reach a COMPILED key: cov carries every seeded kernel at zero,
+                // so an entry matching none names nothing and would sit green forever
+                t |> success(named,
+                    "{blind} names no seeded kernel - spell the census key (<vk_dispatch name>_spv)")
+                let hits = named ? vk_kernel_coverage_of(blind) : 0l   //! the accessor panics on an unseeded name; the assert above is the legible red
                 t |> success(hits == 0l,
                     "{blind} is a DECLARED blind spot - a stocked carrier now dispatches it ({hits}): drop the entry, its census row exists")
             }
+            delete cov
             let famfilter = g_env_test.test_family
             if (empty(famfilter)) {
                 // floor calibration: 25 measured on the default 5-model zoo (MoE rows skip without

@@ -16,7 +16,7 @@ options indenting = 4
 module spirv_shader shared public
 
 require spirv_emit
-require spirv_reflect
+require spirv_reflect public   // every shader-bearing module's globals call its unpack_spirv_words
 require spirv_builtins public
 require daslib/ast
 require daslib/rtti
@@ -25,18 +25,32 @@ require daslib/templates_boost
 require daslib/strings_boost
 require strings
 
-// `array<uint>(w0, w1, ...)` — the gen2 array literal is ExprMakeArray(makeType=uint, gen2=true)
-// wrapped in to_array_move (ds2_parser.ypp).
+// `spirv_reflect::unpack_spirv_words(array<uint4>(c0, c1, ...), n)` — one ExprConstUInt4 per
+// four words, a quarter of the AST nodes a per-word literal costs every pass over the program;
+// the gen2 array literal is ExprMakeArray(makeType=uint4, gen2=true) wrapped in to_array_move.
+// The expander lives in spirv_reflect: a runtime function the host's AOT set compiles, where
+// this macro-only module is not.
 [macro_function]
 def private build_uint_array_literal(words : array<uint>; at : LineInfo) : ExpressionPtr {
-    var mkArr = new ExprMakeArray(at = at, makeType = new TypeDecl(at = at, baseType = Type.tUInt))
+    var mkArr = new ExprMakeArray(at = at, makeType = new TypeDecl(at = at, baseType = Type.tUInt4))
     mkArr.gen2 = true
-    for (w in words) {
-        mkArr.values |> emplace_new() <| new ExprConstUInt(at = at, value = w)
+    let n = length(words)
+    for (q in range((n + 3) / 4)) {
+        var v : uint4
+        for (j in range(4)) {
+            let i = q * 4 + j
+            if (i < n) {
+                v[j] = words[i]
+            }
+        }
+        mkArr.values |> emplace_new() <| new ExprConstUInt4(at = at, value = v)
     }
     var toMove = new ExprCall(at = at, name := "to_array_move")
     toMove.arguments |> emplace(mkArr)
-    return toMove
+    var unpack = new ExprCall(at = at, name := "spirv_reflect::unpack_spirv_words")
+    unpack.arguments |> emplace(toMove)
+    unpack.arguments |> emplace_new() <| new ExprConstInt(at = at, value = n)
+    return unpack
 }
 
 // Per-shader auxiliary function names. The dasGlsl/dasOpenGL split puts the body fill in a backend
@@ -77,7 +91,7 @@ class SpirvShader : AstFunctionAnnotation {
     def generate_push_constants(fnMain : FunctionPtr; var fn : FunctionPtr) {
         pass
     }
-    def override apply(var func : FunctionPtr; var group : ModuleGroup; args : AnnotationArgumentList; var errors : das_string) : bool {
+    def override apply(var func : FunctionPtr; var group : ModuleGroup; var args : AnnotationArgumentList; var errors : das_string) : bool {
         func.flags.exports = true   // temporary: keeps the function alive through dependency collection
         let argName = args |> find_arg("name") ?as tString ?? "{func.name}`spirv"
         var atype = new TypeDecl(at = func.at, baseType = Type.tArray)
@@ -98,7 +112,7 @@ class SpirvShader : AstFunctionAnnotation {
         generate_push_constants_dummy(func)
         return true
     }
-    def override patch(var func : FunctionPtr; var group : ModuleGroup; args, progArgs : AnnotationArgumentList; var errors : das_string; var astChanged : bool&) : bool {
+    def override patch(var func : FunctionPtr; var group : ModuleGroup; var args : AnnotationArgumentList; progArgs : AnnotationArgumentList; var errors : das_string; var astChanged : bool&) : bool {
         // GPU compilers do their own inlining — the CPU auto-inliner (patchInline, which shares
         // this patch slot and runs once annotation patches go quiet) must not reshape the shader
         // tree the emitter reads at fixup. Callee-side neverInline pins every reachable function;
@@ -131,7 +145,7 @@ class SpirvShader : AstFunctionAnnotation {
         }
         return true
     }
-    def override fixup(var func : FunctionPtr; var group : ModuleGroup; args, progArgs : AnnotationArgumentList; var errors : das_string) : bool {
+    def override fixup(var func : FunctionPtr; var group : ModuleGroup; var args : AnnotationArgumentList; progArgs : AnnotationArgumentList; var errors : das_string) : bool {
         let argName = args |> find_arg("name") ?as tString ?? "{func.name}`spirv"
         var err : array<string>
         // local_size_{x,y,z} take an int literal OR the name of a module-scope int constant -- the same
@@ -215,7 +229,7 @@ class SpirvComputeShader : SpirvShader {
 // local_size_*, local_size_*_id).
 [function_macro(name="spirv_kernel")]
 class SpirvKernelShader : SpirvShader {
-    def override apply(var func : FunctionPtr; var group : ModuleGroup; args : AnnotationArgumentList; var errors : das_string) : bool {
+    def override apply(var func : FunctionPtr; var group : ModuleGroup; var args : AnnotationArgumentList; var errors : das_string) : bool {
         if (func.classParent == null) {
             errors := "[spirv_kernel] must annotate a class method - resources are the class's annotated members"
             return false
@@ -280,7 +294,7 @@ class SpirvClosestHitShader : SpirvShader {
 // math can call the exact decode the GPU runs.
 [function_macro(name="spirv_decode")]
 class SpirvDecodeAnnotation : AstFunctionAnnotation {
-    def override apply(var func : FunctionPtr; var group : ModuleGroup; args : AnnotationArgumentList; var errors : das_string) : bool {
+    def override apply(var func : FunctionPtr; var group : ModuleGroup; var args : AnnotationArgumentList; var errors : das_string) : bool {
         // pin against the CPU auto-inliner: the emitter must see the body as authored
         func.moreFlags.neverInline = true
         return true
@@ -296,7 +310,7 @@ class SpirvDecodeAnnotation : AstFunctionAnnotation {
 // math can run the exact combine/per-element code the GPU runs.
 [function_macro(name="spirv_combine")]
 class SpirvCombineAnnotation : AstFunctionAnnotation {
-    def override apply(var func : FunctionPtr; var group : ModuleGroup; args : AnnotationArgumentList; var errors : das_string) : bool {
+    def override apply(var func : FunctionPtr; var group : ModuleGroup; var args : AnnotationArgumentList; var errors : das_string) : bool {
         func.moreFlags.neverInline = true
         return true
     }
@@ -304,7 +318,7 @@ class SpirvCombineAnnotation : AstFunctionAnnotation {
 
 [function_macro(name="spirv_per_element")]
 class SpirvPerElementAnnotation : AstFunctionAnnotation {
-    def override apply(var func : FunctionPtr; var group : ModuleGroup; args : AnnotationArgumentList; var errors : das_string) : bool {
+    def override apply(var func : FunctionPtr; var group : ModuleGroup; var args : AnnotationArgumentList; var errors : das_string) : bool {
         func.moreFlags.neverInline = true
         return true
     }

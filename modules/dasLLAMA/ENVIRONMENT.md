@@ -28,6 +28,7 @@ Read by the inference engine itself, so these affect any program that loads a mo
 | `DASLLAMA_NOISY` | flag | off | Print engine diagnostics (tier selection, upload plan, arm/decline reasons). |
 | `DASLLAMA_CALLER_PRIO` | number | 2 (the top notch) | A/B rail for the dispatch caller's thread priority, -2..2; unset claims the top notch. |
 | `DASLLAMA_ALLOW_BARE_JOBQUE` | flag | off | Let the engine dispatch on a job queue nobody configured with setup_dasllama_jobque: a loud warning instead of the panic. A bare queue decodes ~200x slower, so only a run measuring that regime wants it. |
+| `DASLLAMA_SINGLE_THREAD` | flag | off | Run every kernel on the calling thread: no dispatch to the job queue at all, whatever queue exists (set_single_thread is the runtime spelling). The browser build's baseline and the figure that says what the worker pool buys. |
 | `DASLLAMA_TRUTH_REFRESH` | flag | off | Regenerate the stored parity truth files instead of comparing against them. |
 | `DASLLAMA_CONV_PROF` | flag | off | Bucket gguf -> image conversion time by kind over the weight walk; one clock pair per tensor. |
 | `DASLLAMA_ALLOW_INTERP_LOAD` | flag | off | Permit a big gguf load without -jit; the transforms run interpreted, so expect minutes per GB. |
@@ -37,6 +38,7 @@ Read by the inference engine itself, so these affect any program that loads a mo
 | `DASLLAMA_GPU_MOE_STREAM` | number | -1 (auto) | How many MoE layers to stream rather than hold resident; -1 is auto. |
 | `DASLLAMA_GPU_VRAM_MB` | number | probed | Override the detected VRAM budget in MiB that sizes the resident expert stacks; a pinned cap takes no headroom and reads no OS room. |
 | `DASLLAMA_GPU_MIN_CTX` | number | built-in floor | Lower the context floor for arming the resident decode driver, for a short-context session on a small card. |
+| `DASLLAMA_GPU_CTX_MAX` | number | the model's context | Cap the resident driver's KV mirror at this many positions (the card's room and the 4 GiB binding cap still bound it); 0 follows the model's context; a server keeps the model's. |
 | `DASLLAMA_GPU_RESIDENT` | flag | on | The whole-model resident driver for a model that fits the card, MoE included; 0 keeps the per-op rails (the A/B lever). |
 | `DASLLAMA_GPU_DN` | flag | follows DASLLAMA_GPU | DeltaNet rail on the GPU. |
 | `DASLLAMA_GPU_DND` | flag | follows DASLLAMA_GPU | DeltaNet decode rail on the GPU. |
@@ -96,6 +98,7 @@ Apple GPU backend. Absent on non-Apple builds, where setting them does nothing.
 | `DASLLAMA_METAL_FUSE` | flag | on | The R1 epilogue-fusion kernel (post_attn_rms + add_rms); 0 restores separate dispatches for A/B. |
 | `DASLLAMA_METAL_SPEC` | number | -1 (adaptive) | The single-row Metal decode's greedy chain (the next step pre-encoded on the GPU's own argmax): 0 off, 1 forced, -1 adaptive (backs off after a miss). A session sampled at temp > 0 never chains, whatever the mode. |
 | `DASLLAMA_METAL_GEMV_TG` | number | 4 | Rows per MoE router/expert GEMV threadgroup, clamped 1..32 (the dense GEMV geometry is fixed). |
+| `DASLLAMA_METAL_WAIT_SPIN` | flag | on | The single-row decode's step wait spins on the command buffer's GPU end time before the blocking wait: the calling thread owns the step and a blocking wake returns late on a box whose cores the jobque lanes fill (M4 Pro: 0.35 ms per token, a step every third step); 0 blocks in waitUntilCompleted alone - the A/B rail. |
 | `DASLLAMA_METAL_KQ_B8` | flag | on | Single-pass B8 twin for K-quant small-batch mv at B=5..8; 0 is the A/B rail. |
 | `DASLLAMA_METAL_KV_MIRROR_MB` | number | 4096 | Ceiling in MiB for the device-side KV mirror, clamped 64..4096. |
 | `DASLLAMA_METAL_RESIDENCY` | flag | on | Pin the served working set (weight regions, planes, the recycled pool buffers) in an MTLResidencySet, macOS 15+: the per-commit residency pass stays a no-op, so the first submission after a CPU-only window stops repaying it (~15 ms/encode on the M1 Max released-rig image cell; ARCHITECTURE_RUNTIME.md 2.12); 0 is the A/B rail. |
@@ -140,8 +143,8 @@ Vulkan GPU backend. Present only where the dasVulkan package is installed.
 | `DASLLAMA_VK_FULLSG` | flag | off | Pin REQUIRE_FULL_SUBGROUPS on every class pipeline (instrument; measured slower than plain pipelines on the mm_a gate shape, so those are the default). |
 | `DASLLAMA_VK_REBAR` | flag | on | Use a ReBAR device-local host-visible heap when one larger than 1GB is present. |
 | `DASLLAMA_VK_KV32` | number | 0 | Arm the resident driver with f32 KV mirrors instead of the f16 default (A/B instrument; only sessions of the armed codec are served). |
-| `DASLLAMA_CM2_TILE` | number | 0 | cm2 prefill tile pick: 0 = occupancy heuristic, 128 = force the m tile, 256 = force the l tile (A/B instrument). Inert on the KHR arm (DASLLAMA_COOPMAT=mm, or a device without NV_coopmat2), whose kq tile has one geometry. |
-| `DASLLAMA_CM2_SPLITK` | number | 0 | cm2 split-k: 0 = occupancy heuristic, 1 = off, N = force N k-chunks (A/B instrument; shrinks if N strands an empty tail). Inert on the KHR arm, whose kq tile carries no split-k scratch. |
+| `DASLLAMA_CM2_TILE` | number | 0 | cm2 prefill tile pick: 0 = the wave model's pick (`cm2_gemm_pick`), 128 = force the m tile, 256 = force the l tile (A/B instrument). Inert on the KHR arm (DASLLAMA_COOPMAT=mm, or a device without NV_coopmat2), whose kq tile has one geometry. |
+| `DASLLAMA_CM2_SPLITK` | number | 0 | cm2 split-k: 0 = the wave model's pick (`cm2_gemm_pick`), 1 = off, N = force N k-chunks (A/B instrument; shrinks if N strands an empty tail). On the KHR arm the chunks ride its one 128-column geometry. |
 | `DASLLAMA_VK_SPV_OVERRIDE` | path | unset | Directory of <kernel>.spv files served instead of the emitted words at pipeline creation (offline spirv-opt / hand-patched A/B instrument). |
 | `DASLLAMA_VK_SPV_DUMP` | path | unset | Directory to write each kernel's emitted words as <kernel>.spv at pipeline creation (the override instrument's capture half). |
 | `DASLLAMA_VK_HAZARD_PARANOID` | flag | off | Barrier at every dispatch (correctness bisect). |

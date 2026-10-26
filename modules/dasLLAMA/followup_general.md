@@ -628,9 +628,9 @@
     five hand-split copies of one scaffold -
     `MetalMoeMulMmQ8/K45/K6/Mx4/Q51TensorT` share the expert prologue, the `while (work < 256u)`
     staging shell, the barrier pair, and the `tmm2d_tg_begin/step/store` epilogue verbatim,
-    diverging only on the weight-format decode block and its buffer views (`REVIEW_GPU.md`:
-    "kernel twins stamp one `class template`, whatever the stamp axis is"; the q5_1 twin made
-    the count five). Done = one base class template
+    diverging only on the weight-format decode block and its buffer views
+    (`REVIEW_GPU_KERNEL_CLASSES.md`: "kernel twins stamp one `class template`, whatever the
+    stamp axis is"; the q5_1 twin made the count five). Done = one base class template
     carrying the scaffold with the decode behind an abstract method spliced flat at emission -
     the `MetalMoeMulMmBase` pattern - with every format's bit-exact gate green and the MSL of
     the pre-existing four stamps unchanged.
@@ -1156,8 +1156,8 @@
    knob deleted rather than left as a permanent lever.
 96. **Fold the k4 two-row register tile into the K4 twin template.** `MetalKqMvB2K4R2`
    (`dasllama/dasllama_metal_kernels.das`) is the k4 twin body written a second time by hand for two
-   weight rows per thread; `REVIEW_GPU.md`'s twin rule wants one `class template` with rows-per-thread
-   as the stamp axis. The tile is crowned and measured as it stands (the m4 mint), so the fold is a
+   weight rows per thread; `REVIEW_GPU_KERNEL_CLASSES.md`'s twin rule wants one `class template`
+   with rows-per-thread as the stamp axis. The tile is crowned and measured as it stands (the m4 mint), so the fold is a
    refactor plus a re-race, not a kernel change. Done = one template stamps `MetalKqMvB2K4` and the
    tile, and the tile's emitted MSL is byte-identical or both boxes re-race it.
 97. **The K-quant crown races time one width and check no CPU reference.** `race_kq_rows` and
@@ -1620,5 +1620,118 @@
     this file where gemma-3-1b's land 3%. The suspects are the CPU prefill's Q8 activation blocks
     on the 12B's widths (the resident feeds f16 rows) and its blocked attention over the 512-wide
     V-from-K heads; the instrument is the perplexity cell's `forced_nll` against llama.cpp's
-    `--save-all-logits` file (a parser sits with the arc's notes). Unquirked: the CPU chain's chunk
-    perplexity within 2% of llama.cpp's on this file.
+    `--save-all-logits` file (a parser sits with the arc's notes). The 26B-A4B reads the same way
+    (2026-09-12, RunPod RTX PRO 4500 Blackwell, the UD-IQ3_XXS file, 150 + 150): against llama.cpp's
+    per-position log-probs the CPU chain's mean gap is 0.36 nats (worst 16.2) where the resident's
+    is 0.18 (worst 6.9) over the 130 positions llama.cpp is confident on, the chunk perplexities
+    llama.cpp 3.304 / CPU 3.357 / resident 2.579 (argmax hits 132 / 133 / 129); on this model the
+    routed near-ties add to the suspects, and the UD-Q4_K_M file (its Q5_1 down experts on their
+    own rail) reads the other way round on the same prose - mean gap CPU 0.21 nats, resident 0.37,
+    perplexities CPU 3.378 / resident 3.922 against llama-perplexity's 3.186, each arm with its own
+    whole-position misses where the other two agree - so the 26B cells hold a 1.25 perplexity
+    ratio. Unquirked: the CPU chain's chunk perplexity within 2% of llama.cpp's on both files.
+144. **A 16-bit weight file never serves in its own format.** A bf16 or f16 GGUF (Qwen3-8B-BF16
+    on the M5) is requantized to q8 at load under the default mode, and the fp32 mode widens it
+    to f32, which the Metal blob form declines, so it serves on the CPU alone; the only native
+    16-bit region is the gemma-4 E-series per-layer-embedding projection, which the
+    `metal_bf16_mulmm` stamps serve. The Metal sweep's bf16 row therefore has no like-for-like
+    pair: llama.cpp runs the bf16 weights, das the q8 requant (`followup_metal.md` sec.7).
+    Unquirked, one day, because a bf16 file is what a model ships as before anyone quantizes it:
+    the loader keeps bf16/f16 planes in their format under a 16-bit quant mode, the dense prefill
+    takes the bf16 tensor stamps that exist, and a 16-bit decode GEMV joins them on Metal and
+    Vulkan, with the sweep's bf16 row as the gate.
+145. **The Metal sweep's Qwen and Llama-1B quant-matrix rows carry no board row and no model
+    card.** `performance/model_specs.das`'s two sweep blocks (the Qwen quant matrix, the
+    Llama-3.2-1B format matrix) are stocked-file rows with `official` unset: the counting
+    fixture gates their correctness, but nothing pins provenance and nothing publishes them.
+    Done = each row that earns a board seat gets `official = true`, its `url`/`bytes`/`sha256`
+    (or a `recipe`) and its card, and the rows that do not are ruled sweep-only in one line
+    here.
+146. **ACCEPTED, not planned: the dev-W bake set follows the minting program, not the box.** The
+    split-scale `devwf16` panels bake only where the Metal prefill module registered its CPU
+    mirror (`ARCHITECTURE_IMAGE.md` sec.2.1h), so a program on the same box built without that
+    module mints a thinner image at the SAME identity and every site it skipped serves off the
+    runtime dequant until a program carrying the mirror re-mints. Ruled acceptable: a `.dlim` is
+    a box-local cache, so the thinner image costs a dequant pass and never a different answer.
+    This row exists so the next reader who finds a thin image stops looking for a bug; nothing
+    is owed unless a minting program that should carry the mirror stops carrying it.
+147. **Checklist grooming - the structural findings the rule-document round did not open a file
+    for.** Each is a followability class from `skills/review_md.md` (repo root), named by file
+    and rule head; none blocks a verdict today, and each is settled by a rewrite, not a ruling.
+    (a) `REVIEW_GPU.md` "A change that can alter what a served GPU decode or prefill path
+    computes or selects" - the criterion is carried by an enumeration of the things that count
+    and a second enumeration of the things that do not; state the property instead. (b)
+    `REVIEW_GPU.md` "A diff that changes a tile, grid, threadgroup, or uniform constant shows
+    the value at that constant's authoritative site" - four sentences of where to read each
+    constant kind; the how-to belongs in `ARCHITECTURE_GPU.md`. (c) `REVIEW_GPU.md` "Never
+    decide a kernel row's validity or owner by scanning the per-bucket base and count arrays"
+    and "Never test the validity of a row in the bucket-ordered buffer ... against the pad
+    sentinel" - the reviewer checks the same per-row bucket entry twice; merge into the sharper
+    one. (d) `REVIEW_GPU_KERNEL_CLASSES.md` "A kernel-family stamp ... that binds a real buffer
+    to a binding whose fields its compiled body ... never reads" - one paragraph carrying the
+    ban, two ledger addresses and three carve-out mechanisms; split it. (e) `REVIEW_GPU_RACE.md`
+    opening - the race / knockout / overhead-arm / A/B-lab definitions are a mechanism
+    paragraph ahead of the rules; the terms belong in
+    `ARCHITECTURE_MEASUREMENT_KERNEL_RACE.md` with the checklist defining each in a dozen words
+    at first use. (f) `REVIEW_GPU_RACE.md` "An arm that survives a port of an A/B lab's winning
+    variant" and "A diff deletes an A/B lab's driver and its remaining arm" - one retained-arm
+    criterion stated twice. (g) `REVIEW_MEASUREMENT.md` "A rate or wall of any leg of a served
+    turn", "A figure below a leg of a served turn" and "A figure whose value is the same on
+    every box" - three rules over one provenance criterion that differ only in what the figure
+    scales with.
+148. **A small model's GPU prefill is bimodal by the process on a many-CCD host.** On the
+    Threadripper 3990X (eight CCDs, 128 logical processors) with the RTX 5060 Ti, gemma-3-1b's
+    pp512 reads 19.3 to 19.7 thousand tok/s in half the runs and 22.7 to 23.3 in the rest - the
+    level fixed for a process, the rep spread inside it small, worker affinity hard or off alike,
+    the GPU clock pinned either way - while llama.cpp b10660 holds 21.2 thousand in every run. The
+    same process confined to sixteen logical processors (`cmd /c start /affinity FFFF`, either end
+    of the part) reads the high level six of six times, and gemma-2-2b 10.7 to 11.1 thousand
+    against its unconfined 10.3 +- 1.0. A 512-row window of a small model is 25 to 50 ms of host
+    pacing (command building, the per-window submits and waits), and where the OS lands the main
+    thread and the driver's threads against the sixteen lanes decides the level. Owed: the bench
+    and the engine confine themselves on such a part (one CCD's worth of processors near the
+    lanes' own), the rule measured on the 3990X, and the first read is which threads the
+    `affinity hard` mode leaves to the OS.
+
+149. Moved: `followup_metal.md` sec.15 (the two Metal review gates).
+
+150. **The streamed image save walks the carrier twice on a declined write.** `load_model`'s
+    streamed rail runs `save_model_image_streaming` over the streamed `Model`, and on a decline
+    (the writer died mid-plane - a full volume past the preallocation) runs
+    `image_from_model_streaming` over the same carrier: the whole plane set is transcoded and the
+    dev-W panels dequantized a second time, minutes on a 26B. The in-place split-scale transform
+    is memoized per carrier (`Model.blob_scaled`), so the second walk is correct however far the
+    writer got before it died - only doubled. Unquirked: one
+    walk into the in-memory chunk, then `write_chunk` to persist it (the shape `chunk_rail` already
+    takes), with the memory-sink decline dropping to the eager rail. The bar is one transcode per
+    load on either outcome.
+
+151. **A parity fixture carries no margin floor.** The gemma-4-12b Q5_K_M counting continuation
+    flips at its 21st token on Metal - the CPU chain's top-2 margin there is 6 logits, the Metal
+    chain's 0.03 with no tensor crown armed, and the box's crowns move the position by 0.18 - so
+    the token gate reports the side of a razor the chain lands on, not a kernel (the k5 tensor
+    twin holds the double-precision oracle at the production widths, 0.3% past the simdgroup
+    base). Unquirked: before a continuation joins `performance/model_specs.das`, run the CPU chain
+    over it and refuse a fixture whose top-2 margin at any step sits under a floor (2 logits),
+    a `test_model_specs` cell over the stocked fixtures. The bar is no parity row a rounding
+    order can flip. The margins: the CPU chain through `harness/parity.das` (kq-native, the M5
+    Max's default backend) and the Metal chain through the same harness under `--ngl 99` with
+    `DAS_TUNE_MANIFEST` naming the box sidecar minus one crown at a time, top-2 logits read at
+    position 117 of the counting fixture; the kernel error from
+    `tests/test_metal_gemm_kernels.das`'s production-width cells.
+
+152. **The q40 and iq4nl native dots read the per-256 Q8_K activation image.** `kq_sb` puts the
+    two per-32 weight formats on the Q8_K activation form `mm_kq` quantizes, and the Vulkan decode
+    GEMV reads the same form (one activation scale per superblock); the sibling per-32 format q51
+    reads the per-32 Q8_0 image and llama.cpp dots Q4_0 against Q8_0; the Vulkan cm2 prefill takes
+    f16 activations and Metal f32 (decode) and f16 (prefill), never 8-bit. On the gemma-4-26B
+    activations (absmax over rms 18.5) the per-256 form carries twice the activation-quantization
+    error of the per-32 one, and the Google QAT file's counting fixture flips a top-8 router pick
+    at layer 29 on an 8e-5 margin under the native CPU rails where the q8 requant of the same
+    planes holds (the ggml-org file of the same checkpoint holds on both). The reference dot read
+    for the per-32 pairing is `ggml_vec_dot_q4_0_q8_0`; the margins and the error ratio come from
+    a forced-feed probe over `harness/parity.das`'s chain on the M5 Max (arm64-gen backend,
+    `KQ_NATIVE=1` against `=0`), the router logits dumped at the flip position. Ruled left as is: the
+    model is coherent, tracking llama.cpp's exact tokens is not the bar. The option, if a carrier
+    ever needs it: a Q8_0-form activation path for q40 and iq4nl through the CPU kq cores and the
+    Vulkan decode GEMV, the q51 pairing as the template.

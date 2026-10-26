@@ -6,6 +6,11 @@
 #include "daScript/simulate/bind_enum.h"
 
 #include <atomic>
+#include <thread>
+#include <chrono>
+#if defined(__EMSCRIPTEN__) && defined(__EMSCRIPTEN_PTHREADS__)
+#include <emscripten/threading.h>
+#endif
 
 // include vorbis extras before miniaudio
 #define STB_VORBIS_HEADER_ONLY
@@ -308,7 +313,7 @@ void on_error_log ( void * , ma_uint32 level, const char * message ) {
     }
 }
 
-void data_callback(ma_device*, void* pOutput, const void*, ma_uint32 frameCount) {
+static void mix_audio(void* pOutput, ma_uint32 frameCount) {
     float fdt = 1.0f / float(g_rate);
     Array buffer;
     array_mark_locked(buffer, pOutput, frameCount * g_channels);
@@ -322,6 +327,92 @@ void data_callback(ma_device*, void* pOutput, const void*, ma_uint32 frameCount)
         g_mixer_context->clearException();
     }
     daScriptEnvironment::setBound(saved);
+}
+
+#if defined(__EMSCRIPTEN__) && defined(__EMSCRIPTEN_PTHREADS__)
+static ma_pcm_rb g_playback_rb;
+static std::thread g_playback_thread;
+static std::atomic<bool> g_playback_running { false };
+static bool g_playback_buffered = false;
+static std::atomic<uint64_t> g_playback_underrun_frames { 0 };
+static std::atomic<uint32_t> g_playback_drain_seq { 0 };
+
+static constexpr ma_uint32 PLAYBACK_RING_MS = 20;
+static constexpr ma_uint32 PLAYBACK_RING_MIN_FRAMES = 512;
+static constexpr ma_uint32 PLAYBACK_RING_MAX_FRAMES = 4096;
+
+static ma_uint32 playback_ring_frames() {
+    ma_uint32 rate = g_device.sampleRate ? g_device.sampleRate : (ma_uint32)g_rate;
+    ma_uint32 frames = rate * PLAYBACK_RING_MS / 1000u;
+    return frames < PLAYBACK_RING_MIN_FRAMES ? PLAYBACK_RING_MIN_FRAMES
+         : (frames > PLAYBACK_RING_MAX_FRAMES ? PLAYBACK_RING_MAX_FRAMES : frames);
+}
+
+static bool fill_playback_ring() {
+    ma_uint32 count = playback_ring_frames();
+    void * output = nullptr;
+    if (ma_pcm_rb_acquire_write(&g_playback_rb, &count, &output) != MA_SUCCESS || !count) return false;
+    memset(output, 0, (size_t)count * g_channels * sizeof(float));
+    mix_audio(output, count);
+    ma_pcm_rb_commit_write(&g_playback_rb, count);
+    return true;
+}
+
+static bool start_playback_worker() {
+    if (ma_pcm_rb_init(ma_format_f32, (ma_uint32)g_channels, playback_ring_frames(), nullptr, nullptr, &g_playback_rb) != MA_SUCCESS) return false;
+    g_playback_underrun_frames.store(0, std::memory_order_relaxed);
+    while (fill_playback_ring()) {}
+    g_playback_running.store(true, std::memory_order_release);
+    try {
+        g_playback_thread = std::thread([] {
+            while (g_playback_running.load(std::memory_order_acquire)) {
+                uint32_t seen = g_playback_drain_seq.load(std::memory_order_acquire);
+                if (fill_playback_ring()) continue;
+                emscripten_futex_wait((void *)&g_playback_drain_seq, seen, 20.0);
+            }
+        });
+    } catch (...) {
+        g_playback_running.store(false, std::memory_order_release);
+        ma_pcm_rb_uninit(&g_playback_rb);
+        return false;
+    }
+    g_playback_buffered = true;
+    return true;
+}
+
+static void stop_playback_worker() {
+    g_playback_running.store(false, std::memory_order_release);
+    if (g_playback_thread.joinable()) g_playback_thread.join();
+}
+
+static void read_playback_ring(void * output, ma_uint32 frameCount) {
+    float * destination = (float *)output;
+    while (frameCount) {
+        ma_uint32 count = frameCount;
+        void * input = nullptr;
+        if (ma_pcm_rb_acquire_read(&g_playback_rb, &count, &input) != MA_SUCCESS || !count) {
+            memset(destination, 0, (size_t)frameCount * g_channels * sizeof(float));
+            g_playback_underrun_frames.fetch_add(frameCount, std::memory_order_relaxed);
+            return;
+        }
+        memcpy(destination, input, (size_t)count * g_channels * sizeof(float));
+        ma_pcm_rb_commit_read(&g_playback_rb, count);
+        g_playback_drain_seq.fetch_add(1, std::memory_order_release);
+        emscripten_futex_wake((void *)&g_playback_drain_seq, 1);
+        destination += (size_t)count * g_channels;
+        frameCount -= count;
+    }
+}
+#endif
+
+void data_callback(ma_device*, void* pOutput, const void*, ma_uint32 frameCount) {
+#if defined(__EMSCRIPTEN__) && defined(__EMSCRIPTEN_PTHREADS__)
+    if (g_playback_buffered) {
+        read_playback_ring(pOutput, frameCount);
+        return;
+    }
+#endif
+    mix_audio(pOutput, frameCount);
 }
 
 Context & dasAudio_mixerContext ( Context * context, LineInfoArg * at ) {
@@ -371,9 +462,22 @@ bool dasAudio_init ( TFunc<void,TTemporary<TArray<float>>,int32_t,int32_t,float>
     g_mixer_context->verySafeContext = false;
     g_mixer_function = mixer;
     g_mixer_env = daScriptEnvironment::getBound();
+#if defined(__EMSCRIPTEN__) && defined(__EMSCRIPTEN_PTHREADS__)
+    if (g_device.pContext->backend == ma_backend_webaudio && !start_playback_worker()) {
+        ma_device_uninit(&g_device);
+        g_mixer_context.reset();
+        return false;
+    }
+#endif
     if ( ma_device_start(&g_device) != MA_SUCCESS ) {
+#if defined(__EMSCRIPTEN__) && defined(__EMSCRIPTEN_PTHREADS__)
+        stop_playback_worker();
+#endif
         ma_device_uninit(&g_device);
         if ( g_null_context_inited ) { ma_context_uninit(&g_null_context); g_null_context_inited = false; }
+#if defined(__EMSCRIPTEN__) && defined(__EMSCRIPTEN_PTHREADS__)
+        if (g_playback_buffered) { ma_pcm_rb_uninit(&g_playback_rb); g_playback_buffered = false; }
+#endif
         g_mixer_context.reset();
         return false;
     }
@@ -413,7 +517,13 @@ static bool ensure_capture_context () {
 
 void dasAudio_finalize ( void ) {
     if ( g_mixer_initialized ) {
+#if defined(__EMSCRIPTEN__) && defined(__EMSCRIPTEN_PTHREADS__)
+        stop_playback_worker();
+#endif
         ma_device_uninit(&g_device);
+#if defined(__EMSCRIPTEN__) && defined(__EMSCRIPTEN_PTHREADS__)
+        if (g_playback_buffered) { ma_pcm_rb_uninit(&g_playback_rb); g_playback_buffered = false; }
+#endif
         g_mixer_context.reset();
         g_mixer_initialized = false;
     }
@@ -542,6 +652,14 @@ bool dasAudio_is_recording ( void ) {
 
 int64_t dasAudio_record_overflow_frames ( void ) {
     return (int64_t) g_capture_overflow_frames.load(std::memory_order_relaxed);
+}
+
+int64_t dasAudio_playback_underrun_frames ( void ) {
+#if defined(__EMSCRIPTEN__) && defined(__EMSCRIPTEN_PTHREADS__)
+    return (int64_t) g_playback_underrun_frames.load(std::memory_order_relaxed);
+#else
+    return 0l;
+#endif
 }
 
 int32_t dasAudio_record_device_count ( Context *, LineInfoArg * ) {
@@ -1242,6 +1360,8 @@ public:
             SideEffects::accessExternal, "dasAudio_is_recording");
         addExtern<DAS_BIND_FUN(dasAudio_record_overflow_frames)>(*this, lib, "sound_record_overflow_frames",
             SideEffects::accessExternal, "dasAudio_record_overflow_frames");
+        addExtern<DAS_BIND_FUN(dasAudio_playback_underrun_frames)>(*this, lib, "sound_playback_underrun_frames",
+            SideEffects::accessExternal, "dasAudio_playback_underrun_frames");
         addExtern<DAS_BIND_FUN(dasAudio_record_device_count)>(*this, lib, "sound_record_device_count",
             SideEffects::modifyExternal, "dasAudio_record_device_count")->args({"context", "at"});
         addExtern<DAS_BIND_FUN(dasAudio_record_device_name)>(*this, lib, "sound_record_device_name",

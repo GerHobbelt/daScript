@@ -60,6 +60,7 @@ One section per module: what the module is for, then its public symbols grouped 
 - [functional](#functional) - The FUNCTIONAL module implements lazy iterator adapters and higher-order function utilities including `filter`, `map`, `reduce`, `fold`, `scan`, `flatten`, `flat_map`, `enumerate`, `chain`, `pairwise`, `iterate`, `islice`, `cycle`, `repeat`, `sorted`, `sum`, `any`, `all`, `tap`, `for_each`, `find`, `find_index`, and `partition`.
 - [fuzzer](#fuzzer) - The FUZZER module implements fuzz testing infrastructure for daslang programs.
 - [generic_return](#generic_return) - The GENERIC_RETURN module provides the `[generic_return]` annotation that allows generic functions to automatically deduce their return type from the body.
+- [gltf_processed](#gltf_processed) - Backend-neutral glTF preprocessing that packs and optionally encodes geometry, compresses textures, and persists validated monolithic or split-file assets.
 - [gltf_types](#gltf_types) - dasGLTF loads `glTF 2.0`_ models — `.glb` (binary), `.gltf` (JSON), external or base64-embedded buffers — into a **backend-neutral scene**, with no new native code (it builds on `json_boost`, `base64`, `fio`, `stbimage` and `math`).
 - [if_not_null](#if_not_null) - The IF_NOT_NULL module provides a null-safe call macro.
 - [instance_function](#instance_function) - The INSTANCE_FUNCTION module provides the `[instance_function]` annotation for creating bound method-like functions.
@@ -84,6 +85,7 @@ One section per module: what the module is for, then its public symbols grouped 
 - [math_bits](#math_bits) - The MATH_BITS module provides bit-level reinterpretation between integer and floating point representations — `int_bits_to_float`, `uint_bits_to_float`, `float_bits_to_int`, `float_bits_to_uint` (plus the 64-bit `double` forms and 2/3/4-lane vector overloads) — as well as the `cast_to_*` helpers that pack and unpack values through a `float4` payload.
 - [math_boost](#math_boost) - The MATH_BOOST module adds geometric types (`AABB`, `AABR`, `Ray`), intersection tests (`is_intersecting`), plane helpers (`plane_dot`, `plane_normalize`, `plane_from_point_normal`, `planar_shadow`), color space conversion (`linear_to_SRGB`, `RGBA_TO_UCOLOR`, `UCOLOR_TO_RGBA`), and view/projection matrix construction (`look_at_lh`, `look_at_rh`, `perspective_rh`, `ortho_rh`).
 - [md_boost](#md_boost) - The MD_BOOST module provides Markdown generation helpers: GitHub-flavored table rendering with aligned columns and per-column alignment, plus small text utilities (bold, cell-separator escaping).
+- [meshoptimizer](#meshoptimizer) - Checked array bindings for meshoptimizer 1.2 vertex remapping, vertex-cache and vertex-fetch optimization, and vertex and index buffer codecs.
 - [module_group](#module_group) - The MODULE_GROUP module calls into every member of a module group.
 - [network](#network) - The NETWORK module implements networking facilities including HTTP client/server and low-level socket operations.
 - [only_nttp](#only_nttp) - The ONLY_NTTP module provides the `[only_nttp]` function annotation — a guard for benchmark kernels.
@@ -135,6 +137,7 @@ One section per module: what the module is for, then its public symbols grouped 
 - [temp_strings](#temp_strings) - The TEMP_STRINGS module provides temporary string construction that avoids heap allocations.
 - [templates](#templates) - The TEMPLATES module implements template instantiation utilities for daslang code generation.
 - [templates_boost](#templates_boost) - The TEMPLATES_BOOST module extends template utilities with high-level macros for common code generation patterns, including template function generation, type-parameterized struct creation, and compile-time code expansion.
+- [texture_blocks](#texture_blocks) - Portable BC1, BC3, BC4, and BC5 texture compression with complete mip chains, deterministic cache keys, serialized validation, and RGBA8 decoding.
 - [toml](#toml) - The TOML module parses `TOML 1.0`_ into the same `JsonValue?` tree shape produced by `daslib/json`, so existing `json_boost` accessors (`v ?? def`, `from_JV`, etc.) work on TOML inputs as-is.
 - [tty](#tty) - The TTY module answers whether a stream is attached to a real terminal, and how wide that terminal is.
 - [type_traits](#type_traits) - The TYPE_TRAITS module provides compile-time type introspection and manipulation.
@@ -647,6 +650,7 @@ The MATH module contains floating point math functions and constants (trigonomet
 - `float4x4-` - Returns the component-wise arithmetic negation of a matrix, flipping the sign of every element; works with float3x3, float3x4, and float4x4 matrix types.
 - `floori` - Returns the largest integer not greater than x, converting the double argument to an int result.
 - `fract` - Returns the fractional part of x (equivalent to x - floor(x)), computed component-wise for float2, float3, and float4 vector types; works with float and double scalars.
+- `pow_est` - Returns a fast estimate of x raised to the power y for each component of a float2, float3, or float4 vector, trading precision for speed; unlike pow it drops the sign of a negative base, which makes it exactly the GLSL pow semantic.
 - `rcp_est` - Returns a fast hardware estimate of the reciprocal (1/x) of a scalar float or each component of a float2, float3, or float4 vector, trading precision for speed.
 - `round` - Returns the rounded value of x to the nearest integer; works with float and double scalars.
 - `roundi` - Rounds the double x to the nearest integer value and returns the result as an int.
@@ -796,6 +800,7 @@ The FIO module implements file input/output and filesystem operations. It provid
 - `copy_file_result` - Copies a file from src to dst.
 - `equivalent` - Returns true if two paths refer to the same file or directory.
 - `equivalent_result` - Returns true if two paths refer to the same file or directory.
+- `fbinary` - Switches the stream to binary mode, so the bytes written are the bytes sent and the bytes read are the bytes received: no newline translation, no end-of-file character.
 - `fclose` - Closes the given FILE pointer and releases its associated resources, equivalent to C fclose.
 - `feof` - Returns true if the end-of-file indicator has been set on the given FILE pointer, equivalent to C feof.
 - `fexist` - Returns true if a file or directory exists at the given path.
@@ -1354,12 +1359,42 @@ Low-level image I/O and resizing bindings for stb_image, stb_image_write, and st
 - `stbir_resize_uint8_linear` - Resize a uint8 image in linear color space.
 - `stbir_resize_uint8_srgb` - Resize a uint8 image with sRGB gamma correction.
 
+### Texture block compression
+
+- `stb_compress_blocks` - Compress one tightly packed RGBA8 image into GPU texture blocks, replicating edge pixels when a dimension is not divisible by four.
+
 ### Animated PNG (APNG) writer
 
 - `stbi_apng_begin` - Begin streaming APNG encoding to `filename`.
 - `stbi_apng_dropped` - Return the running count of frames dropped because the encoder thread's bounded queue was full.
 - `stbi_apng_end` - Finalize the APNG file: drain the encoder thread, backpatch the `acTL` frame count, write `IEND`, and free the writer.
 - `stbi_apng_frame` - Queue one frame on `writer`.
+
+## meshoptimizer
+
+Checked array bindings for meshoptimizer 1.2 vertex remapping, vertex-cache and vertex-fetch optimization, and vertex and index buffer codecs. The API accepts triangle-list `uint` indices and packed vertex bytes with a nonzero, 4-byte-aligned stride of at most 256 bytes.
+
+
+### Vertex remapping
+
+- `meshopt_generate_remap` - Build a vertex remap table from triangle-list `indices` and packed `vertices`, returning the number of unique vertices.
+- `meshopt_remap_indices` - Apply a vertex remap table to triangle-list `indices` and resize `output` to the index count.
+- `meshopt_remap_vertices` - Apply `remap` to packed `vertices` and resize `output` to `count * stride` bytes.
+
+### Mesh optimization
+
+- `meshopt_optimize_cache` - Reorder triangle-list `indices` in place to improve post-transform vertex-cache locality while preserving each triangle's orientation.
+- `meshopt_optimize_fetch` - Reorder `indices` and packed `vertices` in place for sequential vertex fetch, discard unreferenced vertices, and return the resulting vertex count.
+
+### Vertex codec
+
+- `meshopt_decode_vertices` - Decode `count` packed vertex records of `stride` bytes into `output` and return true on success.
+- `meshopt_encode_vertices` - Encode packed vertex records into the meshoptimizer vertex codec and resize `output` to the encoded byte count.
+
+### Index codec
+
+- `meshopt_decode_indices` - Decode exactly `count` triangle-list indices into `output` and return true on success.
+- `meshopt_encode_indices` - Encode triangle-list `indices` with the meshoptimizer index codec and resize `output` to the encoded byte count.
 
 ## raster
 
@@ -1822,6 +1857,7 @@ Module audio
 - `mixer_context` - Get the audio mixer thread's context.
 - `sound_finalize` - Shut down the audio device and release resources.
 - `sound_initalize` - Initialize the audio device with a mixer callback.
+- `sound_playback_underrun_frames` - Number of output frames the device played as silence because the mixer had not refilled the ring in time.
 - `sound_set_null_device` - Forces the audio system to use miniaudio's null backend — a timer-driven playback device with no real hardware — on the next audio_system_create / with_audio_system.
 
 ### Capture
@@ -2170,7 +2206,7 @@ Module strudel_mini
 
 ### Structures
 
-- `Token` - JSON input stream token.
+- `Token`
 
 ### Tokenizer and parser
 
@@ -2252,17 +2288,17 @@ Module strudel_synth
 
 ### Drum renderers
 
-- `render_bd` - Render an 808-style kick drum as a mono buffer at SAMPLE_RATE.
-- `render_cowbell` - Render a cowbell: two detuned square-wave tones through a narrow bandpass, with a second quieter strike 8 ms later.
-- `render_cp` - Render a hand-clap: a sharp bandpassed noise burst (~1.1 kHz) with a metallic bright edge and a long room tail.
-- `render_crash` - Render a crash cymbal: lower-pitched bell partials plus a broadband metallic wash with a medium-fast decay.
-- `render_hh` - Render a closed hi-hat: metallic oscillator bank layered with a short tonal bell (~180 Hz), plus room.
-- `render_oh` - Render an open hi-hat: the same metallic oscillator bank as hh but with a much slower decay.
-- `render_ride` - Render a ride cymbal: two bell partials (~340/387 Hz) plus a metallic shimmer, with a long sustain.
-- `render_rimshot` - Render a rimshot/side-stick: a short woody body (~200 Hz) plus a bandpassed noise snap and a high transient click.
-- `render_sd` - Render a snare drum as a mono buffer: tonal body (~220/330 Hz) plus high-passed noise for the wires, with a short room tail.
-- `render_tambourine` - Render a tambourine: high-passed noise with two narrow bandpass jingle peaks (~3.8 kHz and ~8.8 kHz) and a delayed second hit.
-- `render_tom` - Render a tom drum at `base_freq` with a BD-style body + beater click + impulse + resonant-head overtones and a short room.
+- `render_bd`
+- `render_cowbell`
+- `render_cp`
+- `render_crash`
+- `render_hh`
+- `render_oh`
+- `render_ride`
+- `render_rimshot`
+- `render_sd`
+- `render_tambourine`
+- `render_tom`
 
 ### Oscillator type
 
@@ -2864,7 +2900,7 @@ The PEG module is a parser generator based on `Parsing Expression Grammars`_. De
 
 - `get_current_char`
 - `matches`
-- `move` - Moves the smart pointer `src` into the smart pointer `dest`, nullifying the previous contents of `dest` and transferring ownership from `src`.
+- `move`
 - `reached_EOF`
 - `reached_EOL`
 
@@ -2940,6 +2976,72 @@ dasGLTF loads `glTF 2.0`_ models — `.glb` (binary), `.gltf` (JSON), external o
 - `gltf_read_comp_uint` - Read one component at byte offset `o` as uint (index accessors: u8/u16/u32).
 - `gltf_type_ncomp` - Number of components for a glTF accessor `type` string (SCALAR/VECn/MATn).
 
+## texture_blocks
+
+Portable BC1, BC3, BC4, and BC5 texture compression with complete mip chains, deterministic cache keys, serialized validation, and RGBA8 decoding.
+
+
+### Constants
+
+- `BLOCK_TEXTURE_VERSION`
+
+### Structures
+
+- `BlockMip` - One block-compressed mip level and its logical pixel dimensions.
+- `BlockTexture` - A complete BC-compressed texture with a deterministic content key and mip chain.
+
+### Compression and caching
+
+- `block_texture_key` - Compute the deterministic cache key for tightly packed RGBA8 pixels and their compression settings.
+- `cached_block_texture` - Load a valid content-keyed `.das_tex` entry from `directory`, or compress and atomically populate it on a miss.
+- `compress_block_texture` - Compress tightly packed RGBA8 pixels into BC1/BC3/BC4/BC5 (`format` 0..3), generating a box-filtered mip chain through 1x1.
+
+### Validation and decoding
+
+- `block_texture_valid` - Return true when version, dimensions, format, mip count, and every encoded byte size satisfy the serialized block-texture contract.
+- `decode_block_mip` - Decode one BC mip to tightly packed RGBA8 pixels.
+
+## gltf_processed
+
+Backend-neutral glTF preprocessing that packs and optionally encodes geometry, compresses textures, and persists validated monolithic or split-file assets.
+
+
+### Constants
+
+- `DAS_GLTF_VERSION`
+- `DAS_GLTF_PROCESSOR_VERSION`
+- `VERTEX_UV`
+- `VERTEX_TANGENT`
+- `VERTEX_SKIN`
+- `VERTEX_UV1`
+- `VERTEX_COLOR`
+
+### Structures
+
+- `ProcessingProfile` - Controls which optional vertex streams and storage encodings survive preprocessing.
+- `ProcessedPrimitive` - Portable packed geometry for one primitive, optionally meshoptimizer-encoded.
+- `ProcessedMesh` - A named mesh containing portable processed primitives.
+- `ProcessedAsset` - Backend-neutral processed glTF data: scene metadata, packed geometry, and BC textures.
+- `ProcessedCatalogEntry` - Identifies one processed asset and the key that produced it.
+- `ProcessedCatalog` - Versioned list of processed assets for tooling and package manifests.
+- `ProcessedManifest` - Split-file manifest for geometry and independently shared texture payloads.
+
+### Validation and persistence
+
+- `load_and_process_gltf` - Load an existing processed file by extension, otherwise parse and process a source glTF.
+- `load_processed` - Load and validate a `.das_glb` binary or split `.das_gltf` manifest.
+- `processed_valid` - Check serialized version, size limits, packed strides and raw byte counts, compressed textures, and scene references.
+- `save_processed` - Save a validated asset as one `.das_glb` binary or as a `.das_gltf` manifest plus geometry and texture files.
+
+### Geometry processing
+
+- `process_gltf` - Convert a loaded scene into backend-neutral processed geometry and block textures.
+- `process_primitive` - Pack one glTF primitive according to `flags`, deduplicate triangle vertices, and optionally optimize ordering and encode storage.
+- `processed_indices` - Return decoded uint32 indices for `p`, rejecting codec failures and indices outside the declared vertex range with a panic.
+- `processed_stride` - Return the packed vertex stride for the `VERTEX_*` attribute bit mask.
+- `processed_vertex_bytes` - Return decoded packed vertex bytes for `p`.
+- `unpack_processed_geometry` - Reconstruct ordinary `GltfPrimitive` vertex and index arrays from a processed asset while cloning its scene metadata.
+
 ## spirv_reflect
 
 Shader reflection for the dasSpirv SPIR-V backend: an API-neutral description of a shader's descriptor bindings and push-constant ranges, emitted alongside the SPIR-V blob and consumed by the host (e.g. dasVulkan) to auto-build descriptor-set and pipeline layouts. The same per-global classification that emits the SPIR-V fills the reflection, so the host never re-declares set/binding/type by hand. Serialized to an `array<uint>` (riding the same module-global-capture rail as the blob) and decoded once at layout-build time; the wire form is versioned so producer/consumer drift fails loudly.
@@ -2967,6 +3069,10 @@ Shader reflection for the dasSpirv SPIR-V backend: an API-neutral description of
 
 - `decode_reflection`
 - `encode_reflection`
+
+### Shader blob literals
+
+- `unpack_spirv_words`
 
 ## dasllama
 
@@ -3069,10 +3175,12 @@ CPU large-language-model inference in pure daslang: load a GGUF model, tokenize,
 - `dlim_inventory` - List the prepared images (`.dlim`) minted beside `gguf_path` — per image: file, bytes, image version, identity, and a verdict (`CURRENT` loads; `STALE vN` is an older image version; `OTHER` a different bake configuration or box; `FOREIGN` a different flavor).
 - `get_dispatch_worker_limit` - The dispatch worker cap in force (0 = no limit) — `set_dispatch_worker_limit`'s read half.
 - `get_jobque_spin_us` - The spin window in force — `set_jobque_spin_us`'s read half.
+- `get_single_thread` - Whether every kernel runs on the calling thread — `set_single_thread`'s read half.
 - `kernel_backend_available` - True when kernel backend `name` is registered AND its availability witness passes on this box — the detection probe behind defaults-first backend selection (the vulkan witness enumerates devices once and caches its verdict).
 - `select_matmul_backend_for_load` - Select the best matmul backend for the NEXT model load (honors a pin).
 - `set_dispatch_worker_limit` - Cap the kernel-dispatch worker count (0 = no limit, all job-que workers).
 - `set_jobque_spin_us` - The workers' spin-before-park window in microseconds (0 = park at once).
+- `set_single_thread` - Run every kernel on the calling thread: no dispatch to the job queue at all, whatever queue exists.
 
 ### Operations: GPU tier and model slots
 
@@ -3996,7 +4104,7 @@ The AST module provides access to the abstract syntax tree representation of das
 ### Textual descriptions of the objects
 
 - `das_to_string` - Returns the name of the corresponding daslang base type as a string.
-- `describe` - Returns textual description of the type.
+- `describe`
 - `describe_cpp`
 - `describe_expression` - Returns a string description of the Expression matching the corresponding daslang source code.
 - `describe_function` - Returns a human-readable string description of the specified function, including its name, arguments, and return type.
@@ -4013,11 +4121,12 @@ The AST module provides access to the abstract syntax tree representation of das
 - `find_enum_name` - Finds the name corresponding to an enumeration value in the specified type.
 - `find_enum_value` - Finds the integer value corresponding to an enumeration name in the specified type.
 - `find_matching_variable` - Searches the program for global variables matching the given name that are visible from the specified function's scope.
+- `find_method_function` - Returns the function a class method field points at - the override the class declares, else the inherited one - or null for a data field, an unknown name, or a null structure.
 - `find_module` - Finds a module by name in the specified program.
 - `find_module_function_via_rtti` - Finds a function by name in the specified module using RTTI.
 - `find_module_via_rtti` - Finds a module by name in the specified program using RTTI.
 - `find_struct_field_parent` - Finds and returns the parent structure in the inheritance chain that originally declares the field with the given name.
-- `find_structure_field` - Returns the FieldDeclaration for a specific field of a structure type, or null if not found.
+- `find_structure_field` - Returns the FieldDeclaration for a specific field of a structure type, or null if not found or the structure is null.
 - `find_unique_structure` - Finds a uniquely named structure in the program, returning it if unique or null if ambiguous.
 - `find_variable` - Finds a variable by name in the specified module.
 
@@ -4822,26 +4931,65 @@ The AST_BOOST module provides high-level utilities for working with the AST. It 
 Position-based AST queries. Given a file, line, and column, finds all expression nodes at that cursor position with innermost-first ordering and enclosing function context. Used for implementing IDE features like goto-definition, type-of, and find-references.
 
 
+### Enumerations
+
+- `DeclarationKind` - What `find_declaration_at_cursor` or `declaration_of` found: which of `DeclarationHit`'s pointers is set.
+
 ### Structures
 
-- `CursorHit`
+- `CursorHit` - A single hit at the cursor position: an expression node, or when asked for a variable declaration or a type name.
+- `DeclarationHit` - A declaration - the one whose name the cursor is on, or the one a type denotes: at most one of the pointers is set, by `kind`.
 
 ### Classes
 
 - `CursorVisitor`
+- `CursorVisitor.preVisitTypeDecl`
+- `CursorVisitor.preVisitStructureField`
+- `CursorVisitor.visitStructureField`
 - `CursorVisitor.preVisitFunction`
 - `CursorVisitor.visitFunction`
+- `CursorVisitor.preVisitFunctionArgument`
 - `CursorVisitor.preVisitExpression`
+- `CursorVisitor.preVisitExprBlockArgument`
+- `CursorVisitor.preVisitExprLetVariable`
+- `CursorVisitor.preVisitExprForVariable`
+- `CursorVisitor.in_target_file`
+- `CursorVisitor.cursor_on_variable`
+- `CursorVisitor.add_variable_at_cursor`
+- `CursorVisitor.generated_variable`
+- `CursorVisitor.on_field_name`
+- `CursorVisitor.cursor_on_token`
 
 ### Cursor queries
 
-- `cursor_inside`
-- `find_at_cursor`
-- `find_at_cursor_in_function`
+- `cursor_inside` - Check whether a point (line, col) is inside the span described by `at`.
+- `declaration_of` - The declaration a type denotes - its typedef, structure, enumeration or C++-bound annotation; `none` for a bare type.
+- `find_at_cursor` - Find all expression nodes at the given cursor position, innermost first; `file` is a substring of `FileInfo.name` ("" matches any); nodes inside a synthesized member and compiler-made variables are never hits.
+- `find_at_cursor_in_function` - Find all expression nodes at the given cursor position within a single function body.
+- `find_declaration_at_cursor` - The declaration whose name is at the cursor, the parent a `class` line names included; `line_text` "" makes it a line-only lookup, `file` is a substring of `FileInfo.name`.
+- `typedef_named` - The type declared under the typedef `name` - in `mod` when given, else in the program's own module, else in any module it requires; null when none declares it.
+
+### Source text
+
+- `bare_name` - "Animal`speak" -> "speak": the token the source spells at a method's declaration and call sites.
+- `declared_name_column` - Where the line a declaration starts on spells its `name`; `at.column` when it does not.
+- `name_column` - Where `line_text` spells `name` as a whole word (0-based byte column), else `hint`.
+- `source_name` - The name the source spells for a compiler-renamed variable (a generator's loop variable); any other name unchanged.
+- `spells_name` - True when `line_text` spells `name` as a whole word starting exactly at `col`.
+- `word_at` - The identifier the 0-based byte column `col` is on in `line_text`, with its start column; a caret right after a word is on it, as in an editor, and the word is empty when `col` is on none.
+
+### Class members
+
+- `field_at` - Where the field `name` of `st` is declared - the parent's line for an inherited field; a zero position when there is no such field.
+- `field_name_at` - Where a field access spells its field name - a method call's name sits past the `->` its node spans; a zero position for any other node.
+- `is_own_field` - True for a field the source declares in its struct's or class's own body - an override included - not one the compiler made (`__rtti`, `__finalize`) or a parent's copy.
+- `value_struct` - The struct a field access reads its field from - through a pointer when `value` is one; null for any other value.
 
 ### Result inspection
 
-- `describe` - Returns textual description of the type.
+- `describe` - Pretty-print a CursorHit for debugging.
+- `hit_at` - The position of the node the hit holds: its expression, variable or type.
+- `is_synthesized` - True for a member the compiler made on the `class` line (`Foo'__finalize`), never for a lambda or generator body or a generic instance.
 
 ## ast_used
 
@@ -6273,7 +6421,7 @@ The LINQ_FOLD module provides the `_fold` and `_old_fold` call macros that rewri
 
 ### Call macros
 
-- `_fold` - implements _fold(expression) that folds LINQ expressions into optimized sequnences for example::
+- `_fold`
 
 ## lint
 
@@ -6576,7 +6724,7 @@ Monadic `Option<T>` — represents a value that may or may not be present. Funct
 ### Constructors
 
 - `move_some`
-- `none` - Returns true if the array has no elements
+- `none`
 - `some`
 
 ### Queries
@@ -6587,8 +6735,8 @@ Monadic `Option<T>` — represents a value that may or may not be present. Funct
 ### Transforming
 
 - `and_then`
-- `filter` - iterates over `src` and yields only those elements for which `blk` returns true
-- `map` - iterates over `src` and yields the result of `blk` for each element
+- `filter`
+- `map`
 - `or_else`
 - `or_value`
 
@@ -6608,7 +6756,7 @@ Monadic `Option<T>` — represents a value that may or may not be present. Funct
 
 ### Pairing
 
-- `zip` - Merges two arrays into an array of tuples
+- `zip`
 
 ### Operators
 
@@ -6876,7 +7024,7 @@ Monadic `Result<T, E>` — a value (`ok`) or an error (`err`). Functional API fo
 
 ### Structures
 
-- `Result` - Result of evaluating a debug expression.
+- `Result`
 
 ### Constructors
 
@@ -6893,7 +7041,7 @@ Monadic `Result<T, E>` — a value (`ok`) or an error (`err`). Functional API fo
 ### Transforming
 
 - `and_then`
-- `map` - iterates over `src` and yields the result of `blk` for each element
+- `map`
 - `map_err`
 - `or_else`
 
@@ -7264,16 +7412,16 @@ The STRINGS_CONVERT module provides soft-failing string-to-numeric conversions t
 
 ### Soft-failing conversions
 
-- `try_to_double` - Parse `str` as a 64-bit float.
-- `try_to_float` - Parse `str` as a 32-bit float.
-- `try_to_int` - Parse `str` as a signed 32-bit integer.
-- `try_to_int16` - Parse `str` as a signed 16-bit integer.
-- `try_to_int64` - Parse `str` as a signed 64-bit integer.
-- `try_to_int8` - Parse `str` as a signed 8-bit integer.
-- `try_to_uint` - Parse `str` as an unsigned 32-bit integer.
-- `try_to_uint16` - Parse `str` as an unsigned 16-bit integer.
-- `try_to_uint64` - Parse `str` as an unsigned 64-bit integer.
-- `try_to_uint8` - Parse `str` as an unsigned 8-bit integer.
+- `try_to_double`
+- `try_to_float`
+- `try_to_int`
+- `try_to_int16`
+- `try_to_int64`
+- `try_to_int8`
+- `try_to_uint`
+- `try_to_uint16`
+- `try_to_uint64`
+- `try_to_uint8`
 
 ## temp_strings
 

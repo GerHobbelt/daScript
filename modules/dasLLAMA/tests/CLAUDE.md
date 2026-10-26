@@ -61,6 +61,10 @@ No preflight tier runs the two per-PR suites: `preflight -- --only dasllama-mode
 - Before launching any suite, state what the change can affect. A default-off knob or a
   comment edit does not need a rerun.
 - Fixing or adding one arm runs exactly that arm: `--arm arm12 --suite decode`.
+- A cell of `test_vulkan_kernels.das` (model-free, so dastest may run it directly) has no arm: a
+  kernel edit runs its own cells through dastest's name filter, `--test-names <prefix>`
+  (repeatable, a `[test]` function-name prefix) - the whole file (~15 min) runs once before the
+  commit, never per edit. The Metal kernel files sit in the `kernels` suite and run through the runner.
 - Coverage is a cell in a suite, never a scratchpad probe. A probe proves nothing after the
   session that wrote it, and its setup diverges from the suite's silently. If covering a path
   needs a large model, it needs a large model.
@@ -159,9 +163,15 @@ batch cell asserts the `graph` DECLINE on the planar model - shexp has no batch 
 blob twin's CPU batch fallback would trip the blob-only panic).
 
 The `image` suite (test_model_image - the prepared-image .dlim rail): `mechanics` (synthetic
-carrier, model-free - runs with no model stocked; also the layout fingerprint and the dev-W
-bake tables, whose rebuild-not-append contract and per-format key arithmetic are pure taxonomy
-over a job list) `smol untied metal metal-untied gemma tower whisper voxtral
+carrier, model-free - runs with no model stocked; also the layout fingerprint; the split-scale
+plane's two arms against hand-built superblocks - k6 and k3 strip-first at `strip_at` 0 / `tail_at` 16,
+iq4xs and k2 d-first at `strip_at` 4 / `tail_at` 0 with k2's four-byte tail, each carrying an
+added-value poison in one tail byte that must move that byte and nothing in the strip, plus the
+k6 sizing leg at 4,000,000 superblocks - and the dev-W bake tables, whose rebuild-not-append
+contract, per-format key arithmetic, split-scale cover predicate - a 256-wide 64-row panel
+bakes, a 384-wide one and a 32-row one do not - and expert exclusion - an `*_exps.weight`
+slice bakes nothing, a shared-expert site and a mis-spelt suffix still bake - are pure taxonomy
+over a job list, plus the split-scale transform's idempotence over one carrier) `smol untied metal metal-untied gemma tower whisper voxtral
 parakeet qwen3a canary canary-dec gemma4a gemma4uv gemma4uv-metal gemma4v gemma3v gemma4e
 mtower kitten`; `kitten` is the TTS area's arm - the StyleTTS2 carrier (kitten-nano) through
 `load_styletts2` on both lanes, and the image loaded by its own path with the family data
@@ -216,10 +226,10 @@ Q4_K_M and UD-IQ2_XXS: the resident MoE block's s stamps (the 32-row column) and
 `VK_CENSUS_NEVER_DISPATCHED` entry in `test_kernel_coverage.das` naming its kernel-unit cell;
 every prefill tile family is reached through the qwen3 Q8_0 and Q4_K_M and the 1B llama
 requants, machine-local like the other fixtures - the `-local` ones are
-minted from the bartowski Q8_0 with `llama-quantize --allow-requantize <q8> <out> <type>` - each
+minted from the bartowski Q8_0 with `llama-quantize --allow-requantize [--imatrix llama32_1b.imatrix] <q8> <out> <type>` (the IQ2/IQ3 types need the imatrix; the exact recipes are the catalog rows in `performance/model_specs.das`) - each
 swept under the coopmat modes its planes have twins in: all five for q8 and q40, the box's mode,
 mm and sdot4 for the other kq formats) is the KERNEL COVERAGE census (the census-row obligation is
-`../REVIEW_GPU.md`'s): the small-model zoo swept across format/graph/batch/KV axes, then a
+`../REVIEW_GPU_KERNEL_CLASSES.md`'s): the small-model zoo swept across format/graph/batch/KV axes, then a
 report of per-kernel dispatch counts with LOUD WARNINGS for compiled-but-never-dispatched
 kernels - never an auto-dead verdict. A zero means "nothing THIS zoo runs dispatched it",
 never "unreachable". A kernel's dispatch predicate can be satisfiable by a servable model,
@@ -267,7 +277,9 @@ suite: the runner disarms the guard that tripwire asserts. The map below is part
 two lists together are the census.
 `test_vulkan_dec_tail.das` - model-free (a Vulkan device, else skips): the per-op tier's decode
 era against a CPU reference - the decode attention block (K-quant and q8 quads, both rope
-pairings, a q8 pair carrying the q/k/v projection bias, the hydrate arms), the decode FFN tail, and the whole-token decode span with its
+pairings, a q8 pair carrying the q/k/v projection bias, the hydrate arms, and a k4 quad beside a q8
+quad at ONE plane offset - the block keys a layer by its offset under its format, so each serves its
+own mirror), the decode FFN tail, and the whole-token decode span with its
 device router + top-k against `moe_select_core`, the span with a shared expert in both its arms -
 gated (the shared q8 triple beside the routed pair, its gate logit past the router's, one combine)
 and ungated (the same at unit gate, a second span record after a reset; the reference without the
@@ -278,18 +290,34 @@ device-side f16 gather, the streamed-group slot hand-off, the streamed split's a
 the shared expert's call shape - one region over every position, the identity slot map at unit
 weight.
 `test_vulkan_kernels.das` - model-free (a Vulkan device, else skips; the two lens cells,
-`test_vkd_readonly_stamp` and `test_vkd_lens_readonly_gate`, need only the dasVulkan module): the
+`test_vkd_readonly_stamp` and `test_vkd_lens_readonly_gate`, and the flash ladders' refusal cell
+`test_vkd_fa_stamp_refusals` need only the dasVulkan module): the
 per-class CPU-oracle units of the Vulkan kernel census (`_vkd_oracles.das` runs the class methods on the CPU as the
 oracle; `_vkd_toy.das` is the `[vk_dispatch]` bring-up fixture). The per-format tile cells
 (`test_vkd_<fmt>_cm2_batch`, one per `kq_sb` format; q8's cm2 tiles ride their own fmt-0 cells
 `test_vkd_cm2l_batch` / `test_vkd_cm2m_batch` / `test_vkd_cm2s_batch` / `test_vkd_cm2e_batch`,
-which carry no KHR arm, and q51 carries no tile cell) run five arms: the cm2 l/m/s tiles and the
+and its KHR arm is `test_vkd_q8_khr_batch`, the per-32 plane through the hand-staged KHR tile over the
+same two regions, whole and under a k split with the reduce, wherever the device has KHR cooperative
+matrices at subgroup 32; q51's expert rail rides `test_vkd_q51_cm2_batch` - its s and e stamps
+on a cm2 device and its KHR tile wherever the device has KHR cooperative matrices at subgroup 32,
+over the per-32 plane with hand-packed d | m words - and `test_vkd_q51_gemv`,
+its Q8_0-activation decode GEMV against the scalar dot's float order at 704 and 1408; mx4's rail
+rides `test_vkd_mx4_cm2_batch` (the same three arms over the doubled-magnitude plane, every nibble
+code reached), `test_vkd_mx4_gemv` (the Q8_0-fed decode GEMV at 704 and gpt-oss's 2880) and
+`test_vkd_mx4_gemv_gu` (the fused gate + up + act + requant twin byte for byte against the split
+path and the CPU chain, biased and unbiased, the gate rows' bar with its poison)) run five
+arms: the cm2 l/m/s tiles and the
 expert schedule's e column (the format's own 128-row e stamp, whose k step is the stamp's - 32 on
 iq2xxs, iq2xs, iq2s, iq3xxs and iq3s, 64 on every other format) in mode 4 on an
 NV_coopmat2 device and the KHR 128x128 tile wherever the device has KHR coopmat at subgroup
-32 - the cell skips only when the device has neither, so a KHR-only card still runs its arm; the
-k4 cell dispatches two workgroups past its schedule over sentinel map words (`SCHED_NONE`), the
-device-written schedules' upper-bound shape, and every arm's rows still match;
+32 - the cell skips only when the device has neither, so a KHR-only card still runs its arm; every
+arm runs through the prefill's tile ladders (`cell_arm_set` / `cell_arm_enc` over `cm2_cls_*` and
+`khr_cls_*`) in one shared loop (`tile_cell_arms` over a `tile_fixture` - the format's packed planes
+handed in, the activation plane and the device buffers built once - with the arms asked for and the
+format's oracle passed in), which dispatches two workgroups past its schedule over sentinel map
+words (`SCHED_NONE`), the device-written schedules' upper-bound shape, and every arm's rows still
+match; the q8 fmt-0 cells (`q8_planes` for their planes) and the q51 cell run the same loop over
+their own arm lists;
 `test_vkd_ext_roster` asserts, for every entry of the device-init roster (`vk_ext_roster`: every
 Vulkan capability the tier keys a route on, what rides on it), that the entry's presence reads the
 same as the arming field it decides, so the roster's log line and the tier's route cannot
@@ -319,12 +347,34 @@ router logits, the deltanet beta/alpha rows) to the f32 dot of the same f16 valu
 shapes and one off every 4-multiple (the reduce's element-guarded tail), the direct store at a
 base and the eight-chunk split with the reduce at the same base, the header under the base kept
 as the sentinel and every bar with its added-value poison; it skips on a device without the cm2
-tile family, the only tile the class rides. `test_vkd_dn_family` holds the deltanet conv, the
+tile family, the only tile the class rides. `test_vkd_f16_gemm_khr` runs the same fixture's direct
+arm through the KHR twin (the E-series projection off cm2) at three shapes, one with rows off the
+16-row fragment, wherever the device has KHR cooperative matrices at subgroup 32. `test_vkd_dn_family` holds the deltanet conv, the
 fused step and the two-phase scan to CPU oracles at head sizes 64 and 128 (the step's one-part
 and two-part state columns, the scan's four- and eight-lane clusters); `test_vkd_dn_scan_narrow`
 runs the scan at ds 32 over 64 rows, and `test_vkd_dn_9b_scan` at the 9B geometry - 512 rows,
 one row, and the whole `DN_WINDOW` (the prefetch's first-token clamp, the gate arrays' exact
-bound).
+bound). The gemma arc's cells: `test_vkd_kq_gemv_k4_gu` (the Q4_K gate + up GEMVs with the act and
+its Q8_0 requant in one dispatch, against the three-kernel path byte for byte and the CPU chain),
+`test_vkd_q8_gemv_gu` (the fused q8 gate + up + act + requant, gelu and silu, two depths),
+`test_vkd_q8_gemv_ar` (the q8 GEMV whose last workgroup runs the residual step's requant, with
+the biased add partner beside the plain step) and
+`test_vkd_q8_gemv_pleact` (the per-layer-embedding act + requant + proj GEMV, two widths),
+the gpt-oss arc's arms - `test_vkd_ar_class` and `test_vkd_ar_rq_fused` add the biased add
+partner (the output bias row past the norm row) against the seam and the CPU oracle,
+`test_vkd_act_family` runs the unbiased act kernels under the clamped swiglu beside silu and adds
+the biased twins (`q8_actrq_b_cls`, `actf16_b_cls`) over a six-expert bias plane, `test_vkd_fa_cm2`
+/ `test_vkd_fa_khr` and `test_vkd_da_attn` add the sink arms (the h64 flash stamps whole and under
+a 40-key window; the token command's f32 and f16 sink twins unsplit and split with the sink
+combine), each with the sink-free oracle as the control, and `test_vkd_fa_stamp_refusals` covers
+the sink refusals -
+`test_vkd_da_attn_rqk` (the decode attention with the Q8_0 and Q8_K requant folded into its store,
+the pass and the combine), `test_vkd_da_attn_bw` (the batched windowed decode attention over a
+restricted horizon), `test_vkd_fa_cm2_h256_softcap` (the gemma-2 softcap tile, the no-cap control in
+the same run) and `test_vkd_fa_cm2`'s h512 arm (gemma-4's global heads, the f16 O twin against the
+f32 stamp); the KHR twins `test_vkd_fa_khr` and `test_vkd_fa_khr_h256_softcap` run the same fixture
+(`fa_tile_run`, `fa_h256_softcap_run`) through the KHR flash tile wherever the device has KHR
+cooperative matrices at subgroup 32, so a coopmat2 card covers both families.
 `test_bench_records_schema.das` - model-free: the record store's schema (round-trip, upsert
 identity with `workload` in the key, annotations landing only on the rows they select, the
 store lister admitting `records/{box}.json` alone) and the record rig's shared seams (the
@@ -389,10 +439,24 @@ from a Config or a synthetic Model shell (`resident_unserved_features`,
 `attn_chain_unserved_features`, `resident_layer_decline`) - every unserved feature and layer
 shape is named in the text a user reads, a served one yields ""; the MoE names among them (the
 router shapes the routed block's kernels do not serve, the expert and slot counts past their
-reach) and the MoE layer helpers (`layer_is_moe`, `resident_dense_width`: a layer routes only
+reach; gpt-oss's router bias, biased stacks, clamped swiglu and softmax-weight gate are served,
+a biased stack feeding a K-quant down plane is named by layer, and the attention sinks are named
+only while no sink seat is installed or the head size is not 64) and the MoE layer helpers (`layer_is_moe`, `resident_dense_width`: a layer routes only
 past the dense lead with all three expert planes, and its dense width is the shared expert's);
 plus the KV mirror's binding cap (`resident_binding_ctx`) on a hybrid shell whose layer 0 is
-recurrent, its dense twin, and a shell with no attention layer.
+recurrent, its dense twin, and a shell with no attention layer. The Metal serving gates ride the
+same synthetic shells: `test_moe_metal_expert_formats` sweeps `moe_metal_ok` over the thirteen
+expert plane formats the routed block serves and the two it declines (iq4nl, k2), one
+mixed-format model, and the drift guard walking all fifteen `KqFmt` members - the kernel roster
+(`moe_fmt_metal_served`) and the site-alignment gate (`moe_site_ok`) name ONE set, which is the
+only case that isolates the roster, since no format one admits the other refuses;
+`test_moe_metal_expert_count` pins the select stamps' ladder at 256 and 512 experts admitted,
+513 declined, the count alone deciding it; `test_mm_tile_widths_64_dense_width` and
+`test_decode_shape_dense_width` hold `has_dense_ffn`'s guard - a routed model with no dense lead
+carries an off-lattice dense width past `mm_tile_widths_64_ok` and past `decode_shape_decline`
+on both the decode and the batch needs mask, and the same width on a dense twin declines
+both. `test_plan_room` is the GPU plan's room arithmetic - the tier cap less headroom, capped by
+the OS's room where the OS answers.
 
 `test_gpu_resident_hybrid.das` - stocked suite, `-jit` only; the whole-model resident driver on a
 deltanet hybrid under `DASLLAMA_GPU=1`. Each fixture is a row in `../performance/model_specs.das`:
@@ -445,8 +509,11 @@ kernel name nothing seeded, so a misspelt key cannot read as a zero count.
 stage on the device - the hybrid file's forced-feed logits-tolerance form (its K-quant 6% bar,
 the one-step-off control) at one window and two windows, with the arm witnesses that the model
 carries the bias and the driver armed on it; skips without the model or the armed tier.
-`test_gpu_resident_gemma.das` - stocked suite, `-jit` only; the whole-model resident driver on the
-gemma dense base (gemma-3-1b-it-Q8_0, `DASLLAMA_GPU=1`): the sandwich norms (the residual steps
+`test_gpu_resident_gemma*.das` (`_gemma_resident.das` carries the cells; one model a file:
+`gemma3_1b`, `gemma3_4b`, `gemma2`, `gemma4_12b_q8`, `gemma4_12b_k`, `gemma4_e2b`, `gemma4_e4b`,
+`gemma4_26b`, `gemma4_26b_k`, `gemma4_31b` - a process loads one carrier, so no cell inherits another model's device state, and a GPU run
+loads ONE model at a time, never a chain) - stocked suite, `-jit` only; the whole-model resident
+driver on the gemma dense base (gemma-3-1b-it-Q8_0, `DASLLAMA_GPU=1`): the sandwich norms (the residual steps
 norm their add partner first), the sliding-window layers beside the global ones with their own rope
 class, the GeGLU FFN and the sqrt(dim) embed scale - the hybrid file's forced-feed logits-tolerance
 form at the 16% bar this model's rounding sensitivity sets (its CPU chain's own prefill and decode
@@ -465,7 +532,9 @@ the final softcap and the suppressed ids - the bar's max logit skips the pinned 
 perplexity form (`ppl_compare`: `n` ids prefilled, `steps` teacher-forced, the resident's
 perplexity within 5% of the CPU chain's and its argmax hits within three, the one-position-off
 targets the control) at 150 + 150 and at 520 + 80 (two prefill windows, the second eight rows
-deep); the 12B Q4_K_M in the agreement form at eight and 300 tokens. The perplexity form exists
+deep; this cell's ratio is 1.3: over its 80 targets the CPU chain reads 1.97, the resident 2.37
+and llama.cpp b10660 2.51, hits 72, 72 and 71, so the resident sits between the two references);
+the 12B Q4_K_M in the agreement form at eight and 300 tokens. The perplexity form exists
 because the 12B's logits sit within a few points of each other at whole stretches of positions
 (llama.cpp's own margins on the same text read 0.6 to 16), so a maxdiff bar at one position
 measures the model's flatness, not the driver; the CPU chain's own two paths land 13% to 44% of
@@ -474,14 +543,50 @@ form at forty tokens, the perplexity form at 150 + 150 and at 520 + 80 (two wind
 sliding window engaged on the last eight) and the agreement form at eight tokens - the per-layer
 embedding branch after every FFN residual (the CPU pre-step's side rows ride the token command
 and the window chain), twenty layers attending over the K/V of the fifteen below them, and the two
-dense FFN widths; gemma-4-E4B Q8_0 (large tier) at forty tokens and 150 + 150. Arms: `g3` (the
-gemma-3 cells), `g4k` (the 12B Q4_K_M cells), `g4x` (the 12B Q4_K_M 300-token agreement cell),
-`g4q8` (the 12B Q8_0 cells), `g4e` (E2B), `g4f` (E4B) - the tokens share no substring, so one arm
-selects one file. Skips
+dense FFN widths; gemma-4-E4B Q8_0 (large tier) at forty tokens and 150 + 150; gemma-3-4b Q8_0
+(the dense base at width 2560 and four kv heads) at forty tokens and 150 + 150; gemma-2-2b Q8_0
+(the attention logit softcap on every score - the 8-row prefill tile and the token command take
+it, and the cm2 flash tile's softcap stamps at its 256-wide heads) at forty tokens, 150 + 150 and
+the eight-token agreement form. The MoE row (large tier): gemma-4-26B-A4B UD-IQ3_XXS - the
+routed block in its gemma-4 form (the parallel dense shared expert as the layer's own FFN triple,
+the routed feed and the router off their own norms of x, the per-expert down scale folded into
+the routing weights, the combine norming both branches and their sum under the layer's output
+scale) in the perplexity form at 150 + 150 and at 520 + 80 (two windows) with an argmax slack of
+twelve (sixteen on the Q4_K_M file, whose hits read 122 to 128 against the CPU chain's 134 as the
+kernels recompile) and a perplexity ratio of 2.0 on both files (a kernel recompile alone moves the
+150 + 150 cell, with the CPU chain fixed: the Q4_K_M file read 4.05, 4.48 and 4.67 against the CPU
+chain's 3.38 as its routed GEMVs changed their lane split and fused twin, then 4.37 -> 5.17 -> 5.80
+across the gpt-oss arc's row-kernel and attention rewrites - kernels bit-identical to the old ones at
+this model's width in the kernel cells, no out-of-range access under the validation layer's
+GPU-assisted mode, and the same readings with a barrier before every dispatch, so the drift is the
+device compiler's rounding per module, not a race - and 6.22 under that validation layer's
+instrumented shaders; the IQ3_XXS file 2.58 -> 4.30 with the flash tile's f16 O accumulator, then
+4.30 -> 2.27 across the same arc, its hits 129 -> 130 -> 139 against 133; the 520 + 80 cells moved
+1.52 -> 1.72 on the Q4_K_M file against 1.24 and 1.34 -> 1.85 on the IQ3_XXS against 1.69): a router
+near-tie flips whole positions between the arms, and either arm lands the farther one
+(per-position log-probs against llama.cpp b10660 on the same prose, mean gap on its confident
+positions: the IQ3_XXS file CPU 0.36 / resident 0.18, the Q4_K_M file CPU 0.21 / resident 0.28 to
+0.56 across those kernel versions; perplexities 3.36 / 2.58 and 3.38 / 3.92 to 5.87, llama.cpp
+itself 3.87 on the Q4_K_M positions, where the resident's misses gather in one stretch of fourteen
+positions after a flipped pick), so a forced-feed maxdiff against the CPU chain is no instrument
+here, and the perplexity ratio holds only the band - the reference-anchored form is
+`../followup_vulkan.md` item 68. Its planes alone pass a 16 GB
+card (the 704-wide down-expert rows demote to q8), so the cells skip there on the memory decline
+and run on a 32 GB card. Its twin `test_gpu_resident_gemma4_26b_k.das` runs the same two cells on
+the model table's official UD-Q4_K_M file, whose 704-wide down stacks are native Q5_1 and ride
+the q51 expert rail (the s and e stamps, the Q8_0-activation decode GEMV) beside the k4 gate and
+up stacks. `test_gpu_resident_gemma4_31b.das` holds the largest dense carrier, gemma-4-31B Q4_K_M
+(large tier, a 32 GB card), in the 12B Q4_K_M's agreement form at eight tokens - one cell, since the
+CPU control of a dense 31B on the reference kernel bodies runs half an hour on an untuned box. Arms: `g2`
+(gemma-2-2b), `g3` (the gemma-3-1b cells), `g3b`
+(gemma-3-4b), `g4k` (the 12B Q4_K_M cells), `g4x` (the 12B Q4_K_M 300-token agreement cell),
+`g4q8` (the 12B Q8_0 cells), `g4e` (E2B), `g4f` (E4B), `g4m` (the 26B-A4B IQ3_XXS), `g4mk` (the
+26B-A4B Q4_K_M), `g31` (the 31B) - the tokens share no substring, so one arm selects one file. Skips
 without the model or the armed tier, and on a memory decline (`moe_gpu_resident_memory_decline`:
 the plan did not fit the card at the session's context - the 12B Q8_0 file on a 16 GB card arms
 under `DASLLAMA_GPU_MIN_CTX=1024`); a feature decline stays a red.
-`test_gpu_resident_moe.das` - stocked suite, `-jit` only; the whole-model resident driver on a MoE
+`test_gpu_resident_moe.das` (`_moe_resident.das` carries the rig, shared with
+`test_gpu_resident_gptoss.das`) - stocked suite, `-jit` only; the whole-model resident driver on a MoE
 (Qwen1.5-MoE-A2.7B-Chat-Q4_K_M-local, `DASLLAMA_GPU=1`): the expert stacks in the arena, the window
 chain's routed block and the token command's routed block - the hybrid file's forced-feed
 logits-tolerance form at the routed chain's 20% bar (the arms part on the router's near-ties from
@@ -490,16 +595,26 @@ under either of two summation orders, the one-step-off controls 0.42 and above; 
 carries the reading) with the one-step-off control, at one window and
 two windows, plus the census witnesses: the device bucket schedule and the per-row select ran once
 per MoE layer per window, the expert schedule's m pieces dispatched the format's e column on the
-three expert planes once per MoE layer per window, the token command's top-k count a whole
-multiple of the MoE layer count (the command records once and resubmits); the second
+three expert planes once per MoE layer per window in cm2 mode (in mm mode the KHR tile also serves
+the window's dense GEMMs, so its count is a floor of two dispatches a plane per MoE layer per
+window), the token command's top-k count a whole multiple of the MoE layer count (the command
+records once and resubmits), and on a device whose SM count splits the attention keys the
+unsplit twin served every step of the one-window cell and none of the two-window one; the second
 fixture is the Qwen3.6-35B-A3B UD-IQ2_XXS hybrid, whose recurrent layers take the routed block
 after the deltanet head, at the same two lengths; the third is the Qwen3-30B-A3B UD-IQ2_XXS,
 the MoE with no shared expert (the residual step with its add partner off, the FFN-norm requant
 skipped), at the same two lengths; all three are large-tier (`DASLLAMA_PARITY_FULL=1`), and the
-cells skip without the file, the armed tier, or a device with no cm2 tile family (the driver
-declines a MoE there by design); on a cm2 device the driver's admission of the fixture is
+cells skip without the file, the armed tier, or a device with neither the cm2 tile family nor KHR
+cooperative matrices at subgroup 32 (the expert pieces' two tiles; the driver declines a MoE there
+by design); on a device with either the driver's admission of the fixture is
 asserted, a decline is a red that sends the reader to the load log. Every cell pins the resident
 route on for its load (`set_gpu_resident_route`) and restores the lever after.
+`test_gpu_resident_gptoss.das` - stocked suite, `-jit` only; the same rig on gpt-oss-20b (the pinned
+upstream `gpt-oss-20b-mxfp4.gguf`, large-tier): the native-MXFP4 routed stacks on the mx4 expert
+rail, the biased router's softmax over its four picks, the gate / up / down bias rows at the act and
+the combine under the clamped swiglu, the per-head attention sinks in the flash tiles and the token
+command's pass, the output bias on the residual step and the 128-key sliding layers, at one window
+and two; the e-column witness counts the mx4 stamps beside the kq, q8 and q51 ones.
 `test_gpu_moe_shexp.das` - stocked suite, `-jit` only; the shared expert's prefill on the device
 (Qwen1.5-MoE-A2.7B-Chat-Q4_K_M-local, the Q4_K_M mint of the Q8_0 carrier, `DASLLAMA_GPU=1`): the
 shexp triple as one region over every position of the routed experts' chain, gated by the tier's
@@ -522,7 +637,9 @@ own entry with a stale mark installed and checks the MoE layer request survives 
 installed tier).
 `test_program_roots.das` - model-free: every dasllama program root (tutorials, examples,
 server tools) declares `options stack = 524288`, and every model-loading root declares its
-prefill intent.
+prefill intent. A root is a file requiring `dasllama/` that exports `main`, or - a library root,
+built by `daslang -lib` / `-ctx` - carries `[export_c]` entry points instead; both owe the same
+two declarations.
 `test_jobque_tripwire.das` - model-free: the engine's first dispatch on a job queue nobody
 configured panics naming `setup_dasllama_jobque()` (a bare queue decodes ~200x slower - the
 fork-context clone per job, a wake per job, workers parking at once), `DASLLAMA_ALLOW_BARE_JOBQUE=1`
@@ -588,8 +705,10 @@ the `--exclude` filter's semantics, and a dry run of the runner with a no-op chi
 Requires `run` by bare same-dir name.
 `test_site_records.das` - model-free: the records-vs-site drift gate - `merge_site_records`
 (required by relative path, pays the engine compile) regenerated in memory and byte-compared
-against the committed `site/files/dasllama/bench_records.json` (what daslang.io/dasllama.html
-renders); red means a records commit skipped `gen_site_records`.
+against the committed `site/files/dasllama/bench_records.json` and its first-paint projection
+`bench_cells.json` (what daslang.io/dasllama.html renders); red means a records commit skipped
+`gen_site_records`. Plus the projection contract: the render fields survive, the receipt-only
+fields are absent from the text.
 `test_tok_seed.das` - model-free: `lcpp_bench.das`'s `tok_read_seed` corpus-header walk, required
 by relative path (`../benchmarks/lcpp_bench.das`), so it pays the bench's full engine compile.
 `test_tokenizer.das` - stocked suite; the corpus cells are fixture-gated (the `ggml-vocab-*.gguf`
@@ -603,11 +722,17 @@ standalone-exe context gate. Builds `_exe_smoke_root.das` with `-jit -exe` and r
 artifact - the rail where globals restore as DATA, so a function-typed global with no
 boot-restore `[init]` dies on its first invoke while every `-jit` suite stays green. ~90 s.
 `test_gen_records_args.das` - model-free: the measurement orchestrator's pure seams - the
-pybench args builder's per-tool arms (onnx carries the `--out` recovery file and never a
-device; nemo forwards `--device`), the `asr_gpu_pair_tool` roster, the
-`records_run_verdict` ZERO-cells refusal, and the `argv_receipt` form (every element
-shell-quoted where it must be, every home directory spelled `~` outside the quotes) - the
-branches that decide what lands on the public board, which no model suite reaches.
+pybench args builder's per-tool arms (onnx carries the `--out` recovery file and never a device;
+nemo forwards `--device`), the `asr_gpu_pair_tool` roster, the `records_run_verdict` ZERO-cells
+refusal, the `argv_receipt` form (every element shell-quoted where it must be, every home
+directory spelled `~` outside the quotes), the rig's `--catalog` scope (`official | all`, every
+other spelling refused), the two guards on `records/<box>.json` (`--jit` and `--catalog all` each
+need an explicit `--store`, each with its store-given control and the board-mint control), the
+das child's argv spelling on both arms (released exe vs the `--jit` bench source with
+`--for-debug-purposes`), and the cold/warm retry verdict - `cell_rates` folding a cell's das rows
+onto the pp and tg axes separately and `keep_cold` keeping the cold cell when the warm re-run is
+slower on either, each bar with its control - the branches that decide what lands on the public
+board, which no model suite reaches.
 `test_sizing_helpers.das` - model-free: the sizing helpers (`reserve_resize` exact capacity,
 `grow_resize` geometric reuse, `overwrite_resize` grow-only no-init) fed directly, including
 grows past the `max_unreserved_size` guard that must not panic.

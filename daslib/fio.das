@@ -69,12 +69,12 @@ def fload(file : file; size : int64; blk : block<(data : array<uint8>) : void>) 
 
 [generic]
 def fload(f : file; buf : auto(BufType) -const) {
-    var dfh : df_header
+    var dfh : df_header // nolint:LINT003,LINT019 - In generic instantiations, _builtin_read writes this raw output buffer.
     let r1 = _builtin_read(f, dfh, typeinfo sizeof(type<df_header>))
     if (r1 < 0 || dfh.magic != df_magic || dfh.size < 0) return false
     var loaded = false
     _builtin_load(f, int64(dfh.size)) $(data : array<uint8>) {
-        if (length(data) != 0) {
+        if (!empty(data)) {
             binary_load(buf, data)
             loaded = true
         }
@@ -693,9 +693,9 @@ def rmdir_rec_result(path : string) : fs_result_bool {
 typedef process = SubProcess?
 
 def with_process(argv : array<string>; cwd : string; env : array<string>; blk : block<(var p : process) : void>) {
-    //! Spawn `argv` as a long-lived child (no shell; a forward-slash ``argv[0]`` spawns everywhere), run
-    //! `blk` with the live handle, then close it on scope exit - closing kills a child still running (the
-    //! Windows job tree, the POSIX group). `cwd` empty inherits the parent's; `env` is ``KEY=VALUE`` overrides.
+    //! Spawn `argv` as a long-lived child (no shell; a forward-slash ``argv[0]`` spawns everywhere), run `blk` with
+    //! the handle, then close it on scope exit - closing kills a child still running (the Windows job tree, the POSIX
+    //! group). `cwd` empty inherits; `env` is ``KEY=VALUE`` overrides. A binary that cannot start never throws: the handle reads as an exited child, exit 127, no output.
     var p = unsafe(spawn_process(argv, cwd, env))
     invoke(blk, p)
     unsafe(close_process(p))

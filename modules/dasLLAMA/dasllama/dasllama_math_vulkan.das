@@ -84,6 +84,7 @@ def install_vk_moe_hooks {
     install_moe_gpu_os_memory(@@vk_os_memory_now)
     install_rdec_note_weight_bytes(@@vk_rdec_note_weight_bytes)
     install_moe_gpu_resident_bias(@@vk_rdec_upload_bias)
+    install_moe_gpu_resident_sinks(@@vk_rdec_upload_sinks)
 }
 
 // the model drop: no chain may be in flight, the decode-side counters reset, then the tier's teardown
@@ -198,9 +199,7 @@ def private vulkan_backend_available : bool {
         exts |> push("VK_KHR_portability_enumeration")
         ci.flags.enumerate_portability_khr = true
         ci.enabledExtensionCount = 1u
-        unsafe {
-            ci.ppEnabledExtensionNames = addr<void?>(exts[0])
-        }
+        ci.ppEnabledExtensionNames = unsafe(addr<void?>(exts[0]))
     }
     var inst : VkInstance
     let cr = vkCreateInstance(ci, null, inst)
@@ -243,7 +242,8 @@ def private vk_resident_bytes : int64 => g_gpu != null ? g_gpu.resident_bytes : 
 def private vk_weight_budget : int64 => vk_moe_init() ? carved_budget() : 0l
 
 // the largest legal single-SSBO binding range (maxStorageBufferRange) — the KV mirror's ceiling
-def private vk_binding_cap : int64 => vk_moe_init() ? vk_max_storage_range() : 0l
+//! the range a KV mirror side may bind, less the slack every side carries past its planes (at the f32 codec's element size)
+def private vk_binding_cap : int64 => vk_moe_init() ? vk_max_storage_range() - RDEC_MIR_SLACK * 4l : 0l
 
 def private vk_plane_bytes(n, rows : int64; fmt : int) : int64 {
     if (!arena_rows_ok(n, fmt)) {
@@ -357,7 +357,7 @@ def dasllama_math_vulkan_register() {
     set_moe_gpu_budget_hooks(@@vk_weight_budget, @@vk_plane_bytes)
     set_moe_gpu_binding_cap(@@vk_binding_cap)
     install_rdec_prefill_ids(@@vk_rdec_prefill_ids, @@vk_rdec_set_emb, @@vk_rdec_upload_emb_f32)
-    install_rdec_ple(@@vk_rdec_set_ple, @@vk_rdec_set_ple_layer)
+    install_rdec_ple(@@vk_rdec_set_ple, @@vk_rdec_set_ple_layer, @@vk_rdec_set_ple_proj, @@vk_rdec_set_ple_table)
     install_moe_gpu_resident(@@vk_arena_reserve, @@vk_arena_place, @@vk_rdec_prepare,
         @@vk_rdec_upload_norms, @@vk_rdec_set_layer, @@vk_rdec_set_cls, @@vk_rdec_token, @@vk_rdec_prefill,
         @@vk_rdec_sync_kv, @@vk_rdec_read_kv, @@vk_rdec_read_kv_bulk)

@@ -83,8 +83,8 @@ stay the reviewer's. A mis-numbered arm dispatches, reads the wrong buffer, and
   server parses through the parsers.
 - **`dasllama_chat.das`** - conversation turns and chat-template application. Per-arch template
   *content* is registered by the arch file (sec.1.6), not written here.
-- **`dasllama_par.das`** - `maybe_parallel_for` and nothing else. Threading policy (job counts,
-  thresholds) belongs to the caller that knows the shape.
+- **`dasllama_par.das`** - `maybe_parallel_for` plus the dispatch counters its arms call at RUN
+  time, so the module AOTs, and the single-thread gate those arms read (`set_single_thread_`, `ARCHITECTURE_RUNTIME.md` sec.2.44a). Threading policy (job counts, thresholds) belongs to the caller.
 
 ### 1.2 Formats and data movement
 

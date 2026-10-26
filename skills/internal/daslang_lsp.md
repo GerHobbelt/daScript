@@ -36,7 +36,27 @@ works for development and wins over the checked-in copy (name-keyed dedup).
   verbatim). Class-method Function names are class-prefixed
   (``Animal`speak``) - items display the bare name, `data.name` keeps the full
   one. Generated members (`Foo'__finalize`, apostrophe names) sit ON the
-  `class` source line - both cursor paths skip synthesized functions.
+  `class` source line, so every cursor op resolves a declaration first through
+  `daslib/ast_cursor`'s `find_declaration_at_cursor`: the name token under the cursor
+  matched against the functions, structures (and the parent named on a `class` line),
+  enums, aliases and globals declared on that line, before any expression hit;
+  `find_at_cursor` itself never yields a node inside a synthesized member, a generated
+  field initializer, or a compiler-made variable (the `__this` a capture reads through).
+  References to a type are listed only where the source spells its name (the implicit
+  `self` of a method is not a site), and a derived class is a reference to its parent. A
+  lambda or generator body is a `generated` function of its own, visited before the
+  function whose source holds it: hits order by span, not visit order, so the body's own
+  expressions win. A variable's declaration is not an expression either: nav asks
+  `find_at_cursor` for `declarations`, which adds a `variable` hit (no `expr`) for the
+  cursor on a `for`/`let` variable or a function, lambda or block argument, and passes
+  the cursor line's text, which adds a `type_decl` hit for the cursor on a type name the
+  source spells (`new T()`, `x : T`). A method call (`a->m()`, `a.m()`, a bare `m()` in the
+  class) is a hit on its `ExprField` - the conversions the call desugars to are never hits -
+  and resolves to the method the receiver's class runs (`ast::find_method_function`); a field is one
+  declaration across the class hierarchy (`field_at`), so its references include accesses
+  through derived receivers, and a cursor on the field's own name is a `field` declaration.
+  `documentSymbol` lists a class's own fields (`is_own_field`) and bare method names. The
+  MCP cursor subtools (`utils/mcp/subtools/`) share all of this through the same module.
 - **NO resident daslang, ever** (macro-state leak, binary/DLL locks vs builds,
   crash isolation). Same rationale as the MCP subtool pattern.
 - **Every subtool compile sets `cop.module_cache = true`** - the default module cache
@@ -96,6 +116,11 @@ tests and their module gate).
 
 ## Gotchas
 
+- The front puts stdin and stdout in **binary mode** (`fbinary`, a no-op off Windows). A
+  Windows text-mode stdout writes `\r\r\n` for `\r\n`, the client never finds the header
+  terminator, and the unaccepted `initialize` reply leaves every request hanging - the LSP
+  tool "never answers" while the log shows `initialize` received and nothing after.
+  `tests/lsp/test_lsp_protocol.das` checks the header bytes exactly, on every platform.
 - Compiler paths must be **absolute** - subtools spawn with per-request cwd
   (`find_compiler` absolutizes; keep it that way).
 - The lint-profile compile (`lint_check`, `export_all`, `no_optimizations`,

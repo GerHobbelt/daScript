@@ -32,18 +32,26 @@ fetch, and the loopback `Host` refuses DNS rebinding.
 **Every operator route gates through `is_operator_caller`.**
 
 **A diff that adds a route a public caller needs also adds it to `caddy.snippet`, in the same
-change as its handler; never edit `caddy.snippet` to match the deployed Caddyfile - edit the
-deployed Caddyfile to match `caddy.snippet` instead.**
+change as its handler.**
+
+**A diff that changes `caddy.snippet` never does so to match the deployed Caddyfile - the
+deployed Caddyfile is edited to match `caddy.snippet`, through `dasllama-deploy.sh caddy`.**
+
+**A diff that adds or changes a directive at `caddy.snippet`'s top level - a line or block
+sitting directly inside the `dasllama.io { }` block, not nested in another block - also makes
+`dasllama-deploy.sh`'s `caddy_apply` reconcile that directive on the box in the same change:
+splice it when the deployed `dasllama.io` block lacks it, replace it when its deployed text
+differs from the snippet's.** Presence alone leaves a changed value on the box.
 
 **On a route that serves board data, mutates the store, or refuses a caller, a response path
 that does not log one `ladder.req` line through `log_request` is a defect.**
 
-**A handler that reads a request body without first checking `body_is_byte_faithful` is a
-defect.**
+**A handler that uses a request body as text - `string(req.body)` or anything downstream of
+it - without first checking `body_is_byte_faithful` on that body is a defect.**
 
-**A handler that calls `ladder_store` and does anything beyond these - check transport shape,
-gate the request (operator gate, submit-open, attempt-limit), make one store call, format the
-response - is a defect.**
+**A handler that calls a `ladder_store` function and does anything beyond these - check
+transport shape, gate the request (operator gate, submit-open, attempt-limit), make one store
+call, format the response, log it through `log_request` - is a defect.**
 
 **A diff that defaults `submit_open` to true in `LadderArgs` or `LadderPolicy`, lets
 `/api/submit/sidecar` or `/api/submit/records` answer anything but 403 while `submit_open` is
@@ -53,6 +61,10 @@ false, or adds an opener reachable from a non-loopback path, is a defect** - onl
 **In `caddy.snippet` every proxied route other than the `/api/submit/records` and
 `/api/submit/sidecar` matcher carries the `request_body { max_size 64KB }` cap, and that
 matcher carries `max_size 8MB` and no smaller cap.**
+
+**Every `/examples/*` response in `caddy.snippet` carries `Cross-Origin-Opener-Policy
+same-origin` and `Cross-Origin-Embedder-Policy require-corp` - never `credentialless`, which
+Safari does not implement.**
 
 **A file in this directory requires no dasLLAMA, dasLLVM, or model machinery other than the
 engine-free `dasllama/dasllama_exchange_schema`, and only `ladder_store.das` requires that**
@@ -75,16 +87,21 @@ re-plant promote instead of duplicate.
 **Never change a submission's stored `Doc` after its insert - a document leaves only by
 deleting its submission.**
 
-**Never edit a shipped `[sql_migration]` body - a schema change adds a new, higher version in
-the same stream.**
+**Never change what a `[sql_migration]` on `master` does to a store that has not run it yet -
+its body, and every function its body reaches, directly or through another call; a schema or
+backfill change adds a new, higher version in the same stream.**
 
 **A sidecar row whose `Sha` is not the sha256 of its stored `Doc` is a defect.**
+
+**A `runs` row whose `Pp512`, `Tg128` or `Cpu` differ from what `run_cells` reads from the
+`RunIdx`-th run of the `ModelIdx`-th model in its submission's `Doc` is a defect.**
 
 **A diff that adds an operator-edited file the box runs from also adds it to `.das_package`'s
 `release()`, in the same change.**
 
-**A privileged (root) deploy action that does not go through `dasllama-deploy.sh` is a defect,
-and so is any `dasllama-deploy.sudoers` grant beyond NOPASSWD for exactly
+**A privileged (root) deploy action other than installing `dasllama-deploy.sh` and
+`dasllama-deploy.sudoers` that does not go through `dasllama-deploy.sh` is a defect, and so is
+any `dasllama-deploy.sudoers` grant beyond NOPASSWD for exactly
 `/usr/local/sbin/dasllama-deploy.sh`** - a second command, a wildcard target, a bare `ALL`, or
 a shell.
 
@@ -117,7 +134,9 @@ its line here, with its tests, in the same change.**
 - `admin.html` - the loopback `/admin/` operator page: renders `GET /admin/sidecars`, drives
   the sidecar verify/delete/import routes and the gate flip. No route of its own, no direct
   db access, nothing public-facing.
-- `caddy.snippet` - the public route boundary's authoritative copy.
+- `caddy.snippet` - the dasllama.io vhost block's authoritative copy: the service's public
+  route boundary plus the vhost-wide directives every response rides (encoding, the canonical
+  redirect, the `/examples/*` isolation headers).
 - `.das_package` - the daspkg release manifest: package/release names and the
   `release_include*` set of operator files carried onto the box.
 - `dasllama-deploy.sh` - the box-side deploy tool (`provision`/`caddy`/`install`/

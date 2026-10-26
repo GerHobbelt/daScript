@@ -42,18 +42,24 @@ re-transcoding `$LCPP/src/unicode-data.cpp`).
 - `ARCHITECTURE_IMAGE.md` - sec.2.1-2.1n: the prepared-image rail, the baked dev-W f16 plane,
   the baked tower twin-W plane, the layout stamp `REVIEW.das` keeps over the byte-placing code,
   the meta-field tripwire every struct serializer opens with, and the planar-vs-blob flavor rebake.
-- `ARCHITECTURE_GPU.md` - sec.2.2b, 2.2w-2.2x: the tensor-GEMM and fused-attention shapes that
-  measured out, the tower attention routes, and the tower driver's encode chains.
+- `ARCHITECTURE_GPU.md` - sec.2.2b: the tensor-GEMM and fused-attention shapes that measured out.
+- `ARCHITECTURE_GPU_TOWER.md` - sec.2.2w-2.2x: the tower attention routes, and the tower driver's
+  encode chains.
 - `ARCHITECTURE_GPU_QUANT_PLANES.md` - sec.2.2y-2.2z: the Metal kq split scale plane, and the
   iquant GEMV grid read with its f4-slab twin.
-- `ARCHITECTURE_GPU_PREFILL.md` - sec.2.2c-2.2i, 2.2u-2.2v, 2.2aa: the Metal prefill driver's
-  GEMM form ladder, dev-W knee map, attention slab, MoE bucket rail, chunked submission, the
+- `ARCHITECTURE_GPU_PREFILL.md` - sec.2.2c-2.2f, 2.2h-2.2i, 2.2u-2.2v, 2.2aa: the Metal prefill
+  driver's GEMM form ladder, dev-W knee map, attention slab, chunked submission, the
   f16 twin dual-store, the last-layer FFN tail, and the dense-KQ tensor mul_mm scaffold.
+- `ARCHITECTURE_GPU_PREFILL_MOE.md` - sec.2.2g: the Metal prefill driver's routed block - the
+  MoE bucket rail, its tensor-twin scaffold, and the split-format expert twins.
 - `ARCHITECTURE_GPU_VULKAN.md` - sec.2.2j, 2.2p, 2.2ab, 2.2ac, 2.2ad, 2.2ai, 2.2aj: the Vulkan
   resident driver's prefill chain and byte stores - the prefill window chain, the Q8 requant byte
   store, the decode GEMV family's grid codebook buffer, the tile probe's shared descriptor set
   layout, the recurrent block of the prefill window, the device-init roster of the Vulkan
   capabilities the tier keys its routes on, and the `[vk_dispatch]` lens's readonly derivation.
+- `ARCHITECTURE_GPU_VULKAN_ATTN.md` - sec.2.2al-2.2am: the token command's attention key split,
+  and the attention-side planes the resident driver uploads beside its norms - the q/k/v
+  projection bias, gpt-oss's sink logits with the flash tiles' sink stamps, and its output bias.
 - `ARCHITECTURE_GPU_VULKAN_GEMM.md` - sec.2.2k-2.2m, 2.2q, 2.2ae, 2.2ah: the cooperative-matrix
   tiles the Vulkan tier's GEMMs run on - the cm2 decode lanes, the tile pick and the coopmat mode
   ladder, the class-pipeline build seat, the MoE expert chain on those tiles, the KHR arm's
@@ -66,21 +72,23 @@ re-transcoding `$LCPP/src/unicode-data.cpp`).
   whole-token decode span, the deltanet decode step's per-session resident state, and the
   whole-model driver's hybrid token command and prefill (recurrent layers, gated attention,
   partial rotary, the prefill-to-decode state handoff).
-- `ARCHITECTURE_GPU_VULKAN_MOE.md` - sec.2.2af, 2.2ag: the resident driver's routed block in its
+- `ARCHITECTURE_GPU_VULKAN_MOE.md` - sec.2.2af, 2.2ag, 2.2ak: the resident driver's routed block in its
   two eras - the MoE block of the prefill window, and the whole-model driver's MoE token
-  command.
+  command - and the gemma-4 form both eras take.
 - `ARCHITECTURE_GPU_MTP.md` - sec.2.28-2.39a: the Metal speculative round over the batch driver's
   same-slab verify, the box knob that sets the depth a round drafts, the kernel
   argument-alignment contract enforced at every dispatch, and the decode layer encoder.
-- `ARCHITECTURE_RUNTIME.md` - sec.2.2, 2.3, 2.3a, 2.4, 2.6-2.9, 2.11, 2.12, 2.18-2.19, 2.44:
+- `ARCHITECTURE_RUNTIME.md` - sec.2.2, 2.3, 2.3a, 2.4, 2.6-2.9, 2.11, 2.12, 2.18-2.19, 2.44, 2.44a:
   kernel shape, caches, lint policy, knobs, coverage, the GPU ramp, the hybrid worker pool, the
-  MoE region split, and the job queue the engine dispatches on.
+  MoE region split, the job queue the engine dispatches on, and the mode that dispatches to none.
 - `ARCHITECTURE_MEDIA.md` - sec.2.13-2.16: the padded tower GEMM widths, the family GPU hooks,
   the tower weight lane, and the plain-Model ASR decoders.
 - `ARCHITECTURE_MEASUREMENT.md` - sec.2.5, 2.10, 2.20, 2.40-2.41, 2.42a, 2.45: the benchmark
   rig, the tune gate, the sanctioned instrumentation rails, the ASR board's GPU row pairs, the
   `[tuned]` perm precedence, the mint wall in the sidecar's provenance, the fat exe's
   first-start race, and the speculative round's ruler record.
+- `ARCHITECTURE_MEASUREMENT_VK_GEMM_PROBE.md` - sec.2.5a: the Vulkan GEMM probe's arms, the
+  shapes they run at, and the alternates they are read against.
 - `ARCHITECTURE_MEASUREMENT_KERNEL_RACE.md` - sec.2.21, 2.26-2.27: the instruments that time a
   kernel away from the served graph - kernel-race fidelity, the gemv's own tune seat, and the
   CPU kernel bench's fixture conditions.

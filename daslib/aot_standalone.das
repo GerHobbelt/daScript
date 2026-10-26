@@ -69,15 +69,12 @@ def collectInitFunctionAotNames(program : ProgramPtr; var context : Context) : a
         initMnhSet |> insert(mnh)
     }
     var mnhToAotName : table<uint64; string>
-    let thisModule = program.getThisModule
     program.get_ptr() |> for_each_module_no_order($(pm) {
         pm |> for_each_module_function($(pfun) {
             if (function_index(program, pfun) < 0 || !is_used(program, pfun) || !(initMnhSet |> key_exists(pfun.getMangledNameHash))) {
                 return
             }
-            if (pm != thisModule) {
-                macro_error(program, pfun.at, "standalone AOT cannot run [init] function: {pm.name}::{pfun.name} lives outside the main module")
-            } elif (pfun.flags.noAot) {
+            if (pfun.flags.noAot) {
                 macro_error(program, pfun.at, "standalone AOT cannot run [init] function: {pfun.name} is [no_aot]")
             } else {
                 mnhToAotName[pfun.getMangledNameHash] = aotFuncName(pfun)
@@ -175,9 +172,7 @@ def private writeFunctionLookup(var tw : StringBuilderWriter; usedFunctions : ar
     }
     name_lookup_seal(lookup)
     writeLookupTables(tw, "fn_lookup", lookup)
-    unsafe {
-        name_lookup_destroy(lookup)
-    }
+    unsafe(name_lookup_destroy(lookup))
 }
 
 //! the standalone context's global lookup: the value is the offset InitGlobalVariable assigns at construction -
@@ -199,9 +194,7 @@ def private writeVariableLookup(program : ProgramPtr; var tw : StringBuilderWrit
     }
     name_lookup_seal(lookup)
     writeLookupTables(tw, "var_lookup", lookup)
-    unsafe {
-        name_lookup_destroy(lookup)
-    }
+    unsafe(name_lookup_destroy(lookup))
 }
 
 def writeStandaloneCtor(cfg : StandaloneContextCfg; initFunctions : string; var tw : StringBuilderWriter, program : ProgramPtr; lookupVariableTable : array<Variable?>; var context : Context) {   // nolint:STYLE038 - flat emitter - one write per ctor section
@@ -658,7 +651,7 @@ def private writeDasBindings(var exports : array<CExport>; names : CNames;
         return true
     }
     let lib = cfg.das_bindings_library
-    let b = DasBindings(linux_path = "{lib}.so", macos_path = "{lib}.dylib", windows_path = "{lib}.dll")
+    let b = DasBindings(library = lib)
     let by = "daslang utils/aot/main.das -- -ctx {cur_mod}.das {cfg.cpp_output_dir}"
     return emit_das_bindings(exports, names, b, by, cfg.das_bindings_path)
 }

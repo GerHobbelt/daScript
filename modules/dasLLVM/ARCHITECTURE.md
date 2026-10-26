@@ -204,7 +204,8 @@ to one NEON instruction apiece - so the three rails agree instead of merely bein
 one family that cannot mirror vecmath is sec.8.3. sin and cos mirror `v_sincos` (quadrant =
 round(x*2/pi), the two-constant Cody-Waite reduction, a degree-3-in-x^2 pair); tan mirrors
 `v_tan` (4/pi octants, three reduction constants, its own minimax - not sin over cos); exp2,
-log2, log and pow mirror `v_exp2`, `v_log2_est_p5`, `v_log` and `v_pow`. The gate is aarch64 by
+log2, log and pow mirror `v_exp2`, `v_log2_est_p5`, `v_log` and `v_pow`; pow takes the rail on
+every target, since `SimPolicy` runs the estimate for it. The gate is otherwise aarch64 by
 measurement, not by portability: on x64 the always-computed guard branches of these kernels
 cost more than they save. Scalar float and double keep the libm intrinsic on every target -
 libm is correctly rounded and one scalar call carries no scalarization penalty. exp keeps the
@@ -260,22 +261,10 @@ exp polynomial's error rather than agreeing with them - the opposite trade from 
 emitter on the rail, taken because the consumer (GELU over float4 rows) otherwise pays four
 libm calls per vector. `tests/llvm_vector_math.das` asserts the size of that divergence.
 
-## 9. The idot family's target lowerings {#idot-lowerings}
+## 9. The idot family's target lowerings
 
-The exact integer dots on the 8-bit lattice have three lowerings, picked by target: one
-`@llvm.aarch64.neon.sdot` where the target has DotProd (`g_target_arm64_dotprod` - the host rail's
-`+dotprod` append, or the force env on the generic rail), the SIMD128 form on a wasm target
-(`idot_wasm_simd128`), generic widen-multiply IR everywhere else. The native arms exist because
-neither backend produces them from the generic form: AArch64 expands it to zip/uzp/smull instead
-of folding to SDOT, and the wasm backend runs it a fifth as fast. The wasm form is the ISA's two
-halves of an int8 dot, `i16x8.extmul_{low,high}_i8x16_s` (what LLVM makes of `mul(sext, sext)`) and
-`i32x4.extadd_pairwise_i16x8_s`; the pairwise sums land as byte pairs, and one even/odd shuffle-add
-folds them into the quad lanes the generic form defines - exact for every int8 lane. The
-relaxed-SIMD dot (`i32x4.relaxed_dot_i8x16_i7x16_add_s`) is NOT used: its second operand is 7-bit,
-so the sign trick that would feed it (`dot(w, x) == dot(sign(x)*w, |x|)`) wraps at -128 in either
-operand and answers the wrong sign there, and `+relaxed-simd` is a whole-module switch that also
-turns float-vector `min`/`max` and `mad` into engine-defined instructions (NaN and signed-zero
-answers, fusion) - the feature string stays `+simd128,+nontrapping-fptoint`, the runtime archive's.
+Moved to `ARCHITECTURE_TARGET_FEATURES.md`: sec.9 (the three lowerings, and why the relaxed-SIMD
+dot is not one of them), which is where the target's feature string it reads already lives.
 
 ## 10. The standalone exe
 

@@ -946,9 +946,7 @@ class public AotDebugInfoHelper {
         let annArgs = build_string() $(var sb) {
             for (ai in range(int(fld.annotation_argument_count))) {
                 if (ai != 0) { write(sb, ", "); }
-                unsafe {
-                    writeAnnotationArgInit(sb, get_annotation_argument(*fld, ai))
-                }
+                writeAnnotationArgInit(sb, get_annotation_argument(*fld, ai))
             }
         }
         write(*writer, "AnnotationArgumentInfo {arrName}[{int(fld.annotation_argument_count)}] = \{ {annArgs} \};\n")
@@ -3743,13 +3741,11 @@ class public CppAot : AstVisitor {
                 write(*ss, "_cmres");
             }
             if (length(call.arguments) > 1) {
-                unsafe {
                 let args = (each(range(1, length(call.arguments)))
                     ._select("{describeCppType(call.arguments[_]._type, DescribeConfig(cross_platform=cross_platform))}{(call.arguments[_]._type.isRefType && !call.arguments[_]._type.flags.ref) ? " &" : ""}")
                     .to_array()
                     ._fold()) |> join(",")
                 write(*ss, "<{args}>");
-                }
             }
             write(*ss, "(__context__,nullptr,");
         } elif (call.name == "memzero") {
@@ -4406,12 +4402,12 @@ def registerAotCpp(var logs : StringBuilderWriter?; program : ProgramPtr; var co
         write(*logs, "\n#ifdef _MSC_VER\n#pragma optimize(\"\", off)\n#endif\n");
         write(*logs, "struct AotFunction \{ uint64_t hash; bool is_cmres; void * fn; vec4f (*wrappedFn)(Context*); \};\n");
         write(*logs, "static AotFunction functions[] = \{\n");
-        var listed : table<string>
+        var listed : table<uint64>
         for (fn in fnn) {
             let is_cmres = fn.flags.copyOnReturn || fn.flags.moveOnReturn ? "true" : "false";
             let fn_name = aotFuncName(fn);
-            if (listed |> key_exists(fn_name)) continue
-            listed |> insert(fn_name)
+            if (listed |> key_exists(fn.aotHash)) continue
+            listed |> insert(fn.aotHash)
             write(*logs, "    // {get_aot_hash_comment(fn)}\n");
             write(*logs, "    \{ {fn.aotHash}, {is_cmres}, (void*)&{fn_name}, &__wrap_{fn_name} \},\n");
         }

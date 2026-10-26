@@ -65,6 +65,9 @@ struct public EngineEnv {
     @clarg_doc = "Let the engine dispatch on a job queue nobody configured with setup_dasllama_jobque: a loud warning instead of the panic. A bare queue decodes ~200x slower, so only a run measuring that regime wants it."
     allow_bare_jobque : bool = false
 
+    @clarg_doc = "Run every kernel on the calling thread: no dispatch to the job queue at all, whatever queue exists (set_single_thread is the runtime spelling). The browser build's baseline and the figure that says what the worker pool buys."
+    single_thread : bool = false
+
     @clarg_doc = "Regenerate the stored parity truth files instead of comparing against them."
     truth_refresh : bool = false
 
@@ -101,6 +104,10 @@ struct public GpuTierEnv {
     @clarg_default_doc = "built-in floor"
     @clarg_doc = "Lower the context floor for arming the resident decode driver, for a short-context session on a small card."
     gpu_min_ctx : int64 = 0l
+
+    @clarg_default_doc = "the model's context"
+    @clarg_doc = "Cap the resident driver's KV mirror at this many positions (the card's room and the 4 GiB binding cap still bound it); 0 follows the model's context; a server keeps the model's."
+    gpu_ctx_max : int64 = 0l
 
     @clarg_doc = "The whole-model resident driver for a model that fits the card, MoE included; 0 keeps the per-op rails (the A/B lever)."
     gpu_resident : bool = true
@@ -260,6 +267,9 @@ struct public MetalEnv {
     @clarg_doc = "Rows per MoE router/expert GEMV threadgroup, clamped 1..32 (the dense GEMV geometry is fixed)."
     gemv_tg : int = 4
 
+    @clarg_doc = "The single-row decode's step wait spins on the command buffer's GPU end time before the blocking wait: the calling thread owns the step and a blocking wake returns late on a box whose cores the jobque lanes fill (M4 Pro: 0.35 ms per token, a step every third step); 0 blocks in waitUntilCompleted alone - the A/B rail."
+    wait_spin : bool = true
+
     @clarg_doc = "Single-pass B8 twin for K-quant small-batch mv at B=5..8; 0 is the A/B rail."
     kq_b8 : bool = true
 
@@ -379,10 +389,10 @@ struct public VulkanEnv {
     @clarg_doc = "Arm the resident driver with f32 KV mirrors instead of the f16 default (A/B instrument; only sessions of the armed codec are served)."
     vk_kv32 : int64 = 0l
 
-    @clarg_doc = "cm2 prefill tile pick: 0 = occupancy heuristic, 128 = force the m tile, 256 = force the l tile (A/B instrument). Inert on the KHR arm (DASLLAMA_COOPMAT=mm, or a device without NV_coopmat2), whose kq tile has one geometry."
+    @clarg_doc = "cm2 prefill tile pick: 0 = the wave model's pick (`cm2_gemm_pick`), 128 = force the m tile, 256 = force the l tile (A/B instrument). Inert on the KHR arm (DASLLAMA_COOPMAT=mm, or a device without NV_coopmat2), whose kq tile has one geometry."
     cm2_tile : int64 = 0l
 
-    @clarg_doc = "cm2 split-k: 0 = occupancy heuristic, 1 = off, N = force N k-chunks (A/B instrument; shrinks if N strands an empty tail). Inert on the KHR arm, whose kq tile carries no split-k scratch."
+    @clarg_doc = "cm2 split-k: 0 = the wave model's pick (`cm2_gemm_pick`), 1 = off, N = force N k-chunks (A/B instrument; shrinks if N strands an empty tail). On the KHR arm the chunks ride its one 128-column geometry."
     cm2_splitk : int64 = 0l
 
     @clarg_path

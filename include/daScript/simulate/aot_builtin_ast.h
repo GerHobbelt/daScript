@@ -156,6 +156,8 @@ namespace das {
         virtual bool canVisitQuoteSubexpression ( ExprQuote * expr ) override;
         virtual bool canVisitWithAliasSubexpression ( ExprAssume * expr ) override;
         virtual bool canVisitMakeBlockBody ( ExprMakeBlock * expr ) override;
+        virtual bool canVisitMakeArray ( ExprMakeArray * expr ) override;
+        virtual bool canVisitMakeArrayIndex ( ExprMakeArray * expr, int index, Expression * init, bool lastIndex ) override;
         virtual bool canVisitCall ( ExprCall * expr ) override;
         virtual bool canVisitNamedCall ( ExprNamedCall * expr ) override;
         virtual bool canVisitLooksLikeCall ( ExprLooksLikeCall * expr ) override;
@@ -526,7 +528,7 @@ namespace das {
     DAS_CC_API TypeDeclPtr parseMangledNameFn ( const char * txt, ModuleGroup & lib, Module * thisModule, Context * context, LineInfoArg * at );
     DAS_CC_API void notInferred ( Function * func, Context * context, LineInfoArg * at );
     DAS_API void collectDependencies ( FunctionPtr fun, const TBlock<void,TArray<Function *>,TArray<Variable *>> & block, Context * context, LineInfoArg * line );
-    // src/ast/ARCHITECTURE.md sec.4
+    // src/ast/ARCHITECTURE.md#program-scoped-symbol-state
     DAS_CC_API bool ast_is_function_used ( const Program * program, const Function * fn, Context * context, LineInfoArg * at );
     DAS_CC_API bool ast_is_variable_used ( const Program * program, const Variable * var, Context * context, LineInfoArg * at );
     DAS_CC_API int32_t ast_function_index ( const Program * program, const Function * fn, Context * context, LineInfoArg * at );
@@ -583,7 +585,8 @@ namespace das {
     DAS_CC_API Enumeration * module_find_enumeration ( const Module* module, const char * name, Context * context, LineInfoArg * at );
     DAS_CC_API void get_use_global_variables ( Function * func, const TBlock<void,VariablePtr> & block, Context * context, LineInfoArg * at );
     DAS_CC_API void get_use_functions ( Function * func, const TBlock<void,FunctionPtr> & block, Context * context, LineInfoArg * at );
-    DAS_CC_API Structure::FieldDeclaration * ast_findStructureField ( Structure * structType, const char * field, Context * context, LineInfoArg * at );
+    DAS_CC_API Structure::FieldDeclaration * ast_findStructureField ( const Structure * structType, const char * field );
+    DAS_CC_API Function * ast_findMethodFunction ( const Structure * structType, const char * name );
     DAS_CC_API int32_t ast_getTupleFieldOffset ( TypeDecl * ttype, int32_t field, Context * context, LineInfoArg * at );
     DAS_CC_API void das_comp_log ( const char * text, Context * context, LineInfoArg * at );
     DAS_CC_API TypeInfo * das_make_type_info_structure ( Context & ctx, TypeDeclPtr ptr, Context * context, LineInfoArg * at );

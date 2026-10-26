@@ -4,9 +4,10 @@
 doc: `CLAUDE.md`. Planned work: `../followup_general.md`, `../followup_vulkan.md`,
 `../followup_metal.md`.
 
-**A kernel-unit cell - a model-less cell that dispatches one kernel class and asserts on its
-output - or a gate that hand-dispatches or hand-binds a kernel, wherever the diff puts it,
-applies `REVIEW_KERNEL_CELLS.md` (beside this file) together with this list.**
+**A kernel-unit cell - a model-less cell (a cell is a `t |> run` block, or a helper call that
+issues asserts on `t`) that dispatches one or more kernel classes and asserts on their output - or a gate
+that hand-dispatches or hand-binds a kernel, wherever the diff puts it, applies
+`REVIEW_KERNEL_CELLS.md` (beside this file) together with this list.**
 
 **Every PR runs `run.das -- --suite model-free` and `run.das -- --suite stocked` on a box with
 the models stocked, plus every test here the change reaches - never the whole directory.** A
@@ -24,7 +25,7 @@ joins the exempt list of `test_run_suites.das`'s suite-membership gate in the sa
 weakening that gate is a defect.** `DASLLAMA_CPU_PREFILL=1` is what the runner arms for every
 suite.
 
-**Invoking dastest directly on a test file in a `run.das` suite other than `model-free` and
+**Invoking dastest directly on a test file that no `run.das` suite lists under `model-free` or
 `stocked` is a defect - run it through `run.das`.**
 
 **`run.das` declares no global whose initializer spawns, logs, writes the environment or
@@ -46,18 +47,17 @@ a run of skips is not the coverage the suite owes.
 `run.das` suite listing is the only registration these files get.**
 
 **A diff that changes what a file covers - a cell added, removed or moved, its suite, an axis or
-bar a cell the census entry names asserts - corrects that file's `CLAUDE.md` census entry,
-numbers included, in the same change.** A `{a,b}` shorthand naming several files at once, or a
+bar a cell the census entry names asserts, a cell's skip condition added, changed or dropped -
+corrects that file's `CLAUDE.md` census entry, numbers and skip clauses included, in the same
+change.** A `{a,b}` shorthand naming several files at once, or a
 suite roster, carries nothing to correct; a file with no census entry owes none.
 
 **A diff that changes the contract a gate pins - what its asserts hold fixed, an axis gained or
 lost - updates that gate's entry in this checklist's pinned set in the same change.**
 
 **A diff that adds, changes, or drops a cell's skip condition - a `t |> skip` or an early
-return - updates the test file's own header - the top comment block carrying every fact a skip
-condition in the file keys on (model, tier, fixture, device, arm, knob) - in the same change,
-and adds or corrects the skip clause in that file's `CLAUDE.md` entry where `CLAUDE.md` carries
-one.**
+return - updates the test file's header in the same change.** A header is the file's top comment
+block; it names every fact a skip condition in the file keys on.
 
 **A diff that adds, moves, or removes a `[test]` file outside this folder that carries a
 `require dasllama/...` line of its own adds, corrects, or drops its row, with the reason it
@@ -76,8 +76,9 @@ to a flag that no longer does what the text says.
 filter mechanics" section in the same change** - an arm the census does not name is
 unreachable to whoever is choosing what to run.
 
-**A pinned gate's coverage never shrinks - not its asserts, not its bounds, not the corpus or
-sweep it covers, and not the set of runs that reach it; a diff that shrinks one is a defect.**
+**A pinned gate's coverage never shrinks: a diff that removes one of its asserts, loosens one of
+its bounds, or drops an input or a run that reaches it is a defect.** Changing what a pinned
+predicate answers on an input the gate already asserts on is not a shrink; dropping the input is.
 A pinned file that reaches a fixture root sits in `stocked`, where the per-PR run reaches it;
 that is not a shrink. The pinned set, each with what it pins:
 `test_run_suites.das` (the per-PR split, the folder census, the area tables, the `--exclude`
@@ -90,11 +91,9 @@ run); `test_exchange_schema.das` (the exchange validator's corpus sweeps, and th
 wire-key pin read out of `../dasllama/dasllama_tune_scope.das`) and
 `test_bench_records_schema.das` (the `write_bench_records` output, corpus sweeps included);
 `test_scheduler.das`'s media-stream bypass check (no cached hit at `prefix_attach`, no donated
-pages at `donate_stream`); `test_vulkan_kernels.das`'s tile-pick cell (which tile the Vulkan
-matmul picks for a given width, row count and coopmat mode, and whether that dispatch splits its
-reduction across partial planes - the split's inputs being the width, the rows, the coopmat mode,
-the co-running group's workgroups and the device's SM count; added rows on those axes are not an
-axis gained) and its `test_vkd_ext_roster` cell (the device-init roster's entries against the
+pages at `donate_stream`); `test_vulkan_kernels.das`'s `test_vk_coopmat_default_and_tile_pick` (which tile the Vulkan
+matmul picks and whether that dispatch splits its reduction across partial planes, on every input
+of the prefill's tile-and-split pick; added rows on those inputs are not an axis gained) and its `test_vkd_ext_roster` cell (the device-init roster's entries against the
 arming's fields); `utils/dasllama-server/test_worker_dispatch.das` (repo root) - worker-local
 fork pools, shared queue policy.
 
@@ -153,8 +152,8 @@ of BOTH sides is a defect: for a token or id compare the decoded text (`log_gen_
 value.** A red, or a suspicious green, must be readable in the log, not only as an id or float
 difference.
 
-**A cell whose name, comment, arm, or fixture claims a size, depth, or row count asserts that
-number.** A cap, a resize, or a counter showing the path ran is not evidence that the number was
+**A size, depth, or row count that a cell's name or a comment inside the cell claims about what
+the cell exercises is asserted in that cell.** A cap, a resize, or a counter showing the path ran is not evidence that the number was
 reached.
 
 **A freeform token-parity cell whose two sides can round differently - different lanes,
@@ -181,8 +180,9 @@ beside the dumps under `models_dir()`, named by the test that loads the dump.
 the backend, the flash-attention setting, and the mmproj precision the dump came from - is a
 defect.**
 
-**A cell sets every process-wide driver setter and serving-lane knob its claim depends on, even
-when the claim needs the knob at its DEFAULT value.**
+**A cell sets every knob its claim depends on that outlives one call - any `set_*` / `pin_*` call
+in `dasllama/` that changes the driver's route or the serving lane for the rest of the process -
+even when the claim needs the knob at its DEFAULT value.**
 
 **A cell returns with every family pin unset - whether or not this cell set one - and every
 driver setter it touched back at its default; `reset_<family>_q8` is the restore.** Why a hook
@@ -256,8 +256,9 @@ not exact-value: it is not float-portable.
 **An embedding-parity cell that does not name its fixture, or does not log the measured
 maxdiff on green as well as red, is a defect.**
 
-**A diff that adds a tolerance bar, or loosens an existing one, ships in the same change a
-control that lands outside the bar.** A bar nothing has ever exceeded is not known to
+**A diff that adds an assert carrying a tolerance bar - a bar value new to the file, or one already
+used there applied at an assert site that did not carry it - or loosens one, ships in the same
+change a control that lands outside the bar.** A bar nothing has ever exceeded is not known to
 discriminate.
 
 **A family that gains a live thinking or tool format ships its recognition tests in the same
@@ -281,3 +282,14 @@ twins' rounding legitimately flips tokens.
 
 **An ASR transcript cell that cannot assert the equality its comparison calls for converts to
 a forced-feed logits compare within a tolerance bar - never to a looser text compare.**
+
+**A function in a file of this folder that requires a module behind `require ?vulkan` never names
+that module's types in its signature - leave a parameter that would carry one untyped, and drop
+a return type that would name one.** A signature cannot sit inside a `static_if`, so a build
+without dasVulkan fails the compile on it.
+
+**A function in a file of this folder that requires a module behind `require ?vulkan`, and that
+has no untyped parameter, names that module's types or calls its functions only inside a
+`static_if (typeinfo builtin_module_exists(vulkan))` body.** A build without dasVulkan infers
+every such body; a function with one untyped parameter is inferred only at a call site, which its
+caller has already guarded.

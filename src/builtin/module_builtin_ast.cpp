@@ -792,7 +792,7 @@ namespace das {
         ok = true;
         das::Context ctx;
         auto env = daScriptEnvironment::getBound();
-        ctx.thisProgram = env ? env->g_Program.get() : nullptr;  // src/ast/ARCHITECTURE.md sec.4
+        ctx.thisProgram = env ? env->g_Program.get() : nullptr;  // src/ast/ARCHITECTURE.md#program-scoped-symbol-state
         auto node = simulateExpression(ctx, expr);
         ctx.restart();
         vec4f result = ctx.evalWithCatch(node);
@@ -857,10 +857,14 @@ namespace das {
         return nullptr;
     }
 
-    Structure::FieldDeclaration * ast_findStructureField ( Structure * structType, const char * field, Context * context, LineInfoArg * at ) {
-        if ( !structType ) context->throw_error_at(at,"expecting structure");
-        if ( !field ) return nullptr;
+    Structure::FieldDeclaration * ast_findStructureField ( const Structure * structType, const char * field ) {
+        if ( !structType || !field ) return nullptr;
         return (Structure::FieldDeclaration *) structType->findField(field);
+    }
+
+    Function * ast_findMethodFunction ( const Structure * structType, const char * name ) {
+        if ( !structType || !name ) return nullptr;
+        return structType->findMethodFunction(name);
     }
 
     Structure * find_unique_structure ( smart_ptr_raw<Program> prog, const char * name, Context * context, LineInfoArg * at ) {
@@ -1255,7 +1259,7 @@ namespace das {
         return structure->aliases.find(aliasName);
     }
 
-    // a null program is a holder nobody filled, never an answer (src/ast/ARCHITECTURE.md sec.4)
+    // a null program is a holder nobody filled, never an answer (src/ast/ARCHITECTURE.md#program-scoped-symbol-state)
     static const Program * symbolStateProgram ( const Program * program, const char * what, Context * context, LineInfoArg * at ) {
         if ( !program ) context->throw_error_at(at, "%s: null program", what);
         return program;
@@ -1418,7 +1422,7 @@ namespace das {
 #endif
 
 #if !DAS_NO_FILEIO
-    // src/builtin/ARCHITECTURE.md sec.2
+    // src/builtin/ARCHITECTURE.md#default-module-cache-path
     struct ScriptModuleCache {
         unique_ptr<SerializerSlotsHidden>   hidden;
         ModuleFileCache                     cache;
@@ -1475,7 +1479,7 @@ namespace das {
     }
 #endif
 
-    // src/ast/ARCHITECTURE.md sec.3
+    // src/ast/ARCHITECTURE.md#require-after-walk
     void rtti_builtin_require_module_now ( char * name, smart_ptr<FileAccess> access, const CodeOfPolicies & cop,
             const TBlock<void,Module *,const string> & block, Context * context, LineInfoArg * at ) {
         if ( !name || !name[0] ) context->throw_error_at(at, "require_module_now: empty module name");
@@ -1681,7 +1685,10 @@ namespace das {
                 ->args({"enum","value"});
         addExtern<DAS_BIND_FUN(ast_findStructureField)>(*this, lib,  "find_structure_field",
             SideEffects::none, "ast_findStructureField")
-                ->args({"structPtr","field","context","lineinfo"});
+                ->args({"structPtr","field"});
+        addExtern<DAS_BIND_FUN(ast_findMethodFunction)>(*this, lib,  "find_method_function",
+            SideEffects::none, "ast_findMethodFunction")
+                ->args({"structPtr","name"});
         addExtern<DAS_BIND_FUN(get_mangled_name)>(*this, lib,  "get_mangled_name",
             SideEffects::none, "get_mangled_name")
                 ->args({"function","context","line"})->setTempStringResult();

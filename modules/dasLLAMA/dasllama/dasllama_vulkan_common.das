@@ -138,6 +138,13 @@ def cm2_splitk_env : int64 {
 [arch(at="../ARCHITECTURE_GPU_VULKAN_GEMM.md#khr-mm-kq-tile")]
 def khr_kq_tile_on : bool => g_gpu.has_coopmat && g_gpu.subgroup_size == 32l
 
+//! the cm2 flash tiles serve where the device was created in cm2 mode AND the mode still reads cm2 - a test that forces the mode in-process moves the pick with it
+def cm2_fa_on : bool => g_gpu.has_coopmat2_fa && g_gpu.coopmat_mode == COOPMAT_CM2
+
+//! the KHR flash tile serves a head of 64, 128, 256 or 512 on an ungated model, the softcap at 256 alone (its cap stamps); the pre-flight and the window chain pick from this one predicate
+def fa_khr_serves(hs : int64; cap : float; gated : bool) : bool
+    => (hs == 64l || hs == 128l || hs == 256l || hs == 512l) && !gated && (cap == 0.0 || hs == 256l)
+
 [arch(at="../ARCHITECTURE_GPU_VULKAN_GEMM.md#cm2-tile-pick-and-default")]
 def cm2_tile_cols(d, cnt : int64) : int64 {
     if (g_gpu.coopmat_mode == COOPMAT_MM) {
@@ -160,9 +167,22 @@ def cm2_tile_cols(d, cnt : int64) : int64 {
     let wtiles = (d + 127l) / 128l
     let tiles_l = wtiles * ((cnt + 255l) / 256l)
     let tiles_m = wtiles * ((cnt + 127l) / 128l)
-    let waves_l = (tiles_l + cores - 1l) / cores
-    let waves_m = (tiles_m + cores - 1l) / cores
-    return tiles_m * waves_l > tiles_l * waves_m ? 128l : 256l
+    if (tiles_m * 4l <= cores) {
+        return 32l
+    }
+    return cm2_wave_units(tiles_m, 1l, cores, 128l) < cm2_wave_units(tiles_l, 1l, cores, 256l) ? 128l : 256l
+}
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_GEMM.md#cm2-tile-pick-and-default")]
+def private cm2_wave_units(wgs, steps, cores, tc : int64) : int64 => ((wgs + cores - 1l) / cores) * steps * (tc == 256l ? 16l : (tc == 128l ? 10l : 5l))
+
+[arch(at="../ARCHITECTURE_GPU_VULKAN_GEMM.md#cm2-tile-pick-and-default")]
+def private cm2_reduce_units(nsplit, cnt, d : int64) : int64 => (9l + ((nsplit + 1l) * cnt * d * 4l) / 2_500_000l) * 7l
+
+//! the 256-aligned chunk `nsplit` pieces cut K into; 0 when the last piece would start past K
+def cm2_chunk(n, nsplit : int64) : int64 {
+    let ck = ((n + nsplit - 1l) / nsplit + 255l) & ~255l
+    return ck * (nsplit - 1l) < n ? ck : 0l
 }
 
 //! workgroups a (d, cnt) GEMM takes at the token column `tc`
@@ -175,36 +195,55 @@ def cm2_tiles_at(d, cnt, tc : int64) : int64 {
 [arch(at="../ARCHITECTURE_GPU_VULKAN_GEMM.md#cm2-tile-pick-and-default")]
 def cm2_tiles(d, cnt : int64) : int64 => cm2_tiles_at(d, cnt, cm2_tile_cols(d, cnt))
 
-//! returns (chunks, 256-aligned chunk); (1, 0) = off; `sib_tiles` = the workgroups of the roles this one co-runs beside - it decides whether to split, never how far
+//! one dense GEMM's column and split-k, picked together: (tc, chunks, 256-aligned chunk), chunks 1 and chunk 0 = whole. `sib_tiles` = the workgroups of the roles this one co-runs beside; `scratch_bytes` bounds the partial planes
 [arch(at="../ARCHITECTURE_GPU_VULKAN_GEMM.md#cm2-tile-pick-and-default")]
-def cm2_split_k(d, cnt, n, tc : int64; sib_tiles : int64 = 0l) : tuple<nsplit : int64; ksplit : int64> {
-    if (g_gpu.coopmat_mode == COOPMAT_MM) {
-        return (nsplit = 1l, ksplit = 0l)
-    }
-    let forced = cm2_splitk_env()
+def cm2_gemm_pick(d, cnt, n : int64; sib_tiles : int64 = 0l; scratch_bytes : int64 = 9_223_372_036_854_775_807l) : tuple<tc : int64; nsplit : int64; ksplit : int64> {
+    let tc0 = cm2_tile_cols(d, cnt)
     let cores = int64(g_gpu.sm_count)
-    var sk = 1l
+    if (cores == 0l) {
+        return (tc = tc0, nsplit = 1l, ksplit = 0l)
+    }
+    let khr = g_gpu.coopmat_mode == COOPMAT_MM
+    let forced = cm2_splitk_env()
     if (forced > 0l) {
-        sk = forced
-    } elif (cores != 0l && n >= 2048l && d >= 128l && cnt >= tc) {
-        let own = cm2_tiles_at(d, cnt, tc)
-        let tiles = own + sib_tiles
-        if (tiles <= cores / 2l) {
-            sk = cores / own
-        } elif (tiles <= cores * 2l / 3l) {
-            sk = 3l
+        var sk = min(forced, 8l)
+        while (sk > 1l && cm2_chunk(n, sk) == 0l) {
+            sk--
         }
-        sk = min(sk, 8l)
+        return (tc = tc0, nsplit = sk, ksplit = sk > 1l ? cm2_chunk(n, sk) : 0l)
     }
-    // 256-align the chunk; shed splits a rounded-up chunk would strand past the end of K
-    while (sk > 1l) {
-        let ck = ((n + sk - 1l) / sk + 255l) & ~255l
-        if (ck * (sk - 1l) < n) {
-            return (nsplit = sk, ksplit = ck)
+    if (n < 2048l || d < 128l || cnt < tc0) {
+        return (tc = tc0, nsplit = 1l, ksplit = 0l)
+    }
+    let two_cols = !khr && (tc0 == 128l || tc0 == 256l) && cnt > 128l && cm2_tile_env() <= 0l
+    let ntc = two_cols ? 2 : 1
+    let tcs = fixed_array(two_cols ? 256l : tc0, 128l)
+    var best_tc = tc0
+    var best_sk = 1l
+    var best_ck = 0l
+    let whole = cm2_wave_units(cm2_tiles_at(d, cnt, tc0) + sib_tiles, n / 64l, cores, tc0)
+    var best = whole
+    for (sk in range64(2l, 9l)) {
+        let ck = cm2_chunk(n, sk)
+        if (ck == 0l) {
+            continue
         }
-        sk--
+        if (sk * cnt * d * 4l > scratch_bytes) {
+            break
+        }
+        let reduce_units = cm2_reduce_units(sk, cnt, d)
+        for (i in range(ntc)) {
+            let own = cm2_tiles_at(d, cnt, tcs[i])
+            let units = (cm2_wave_units(own * sk, (ck + 63l) / 64l, cores, tcs[i]) + reduce_units) * (own + sib_tiles) / own
+            if (units * 12l < whole * 11l && units < best) {
+                best = units
+                best_tc = tcs[i]
+                best_sk = sk
+                best_ck = ck
+            }
+        }
     }
-    return (nsplit = 1l, ksplit = 0l)
+    return (tc = best_tc, nsplit = best_sk, ksplit = best_ck)
 }
 
 // a batch dispatch's tile pick + (rows, cols) edges — one source so wg counts, meta fills, and
@@ -518,7 +557,7 @@ struct GpuState {
     subgroup_size : int64    // the device's subgroupSize (32 on NVIDIA; the KHR kq tile gates on it)
     has_coopmat : bool       // device supports VK_KHR_cooperative_matrix (the f16/int8 tensor tiles)
     has_coopmat2 : bool      // device supports NV_cooperative_matrix2 (tensor-addressed wg tiles + decode fns)
-    has_coopmat2_fa : bool   // ... plus the cm2 flash-attention trio (reductions, conversions, per-element ops)
+    has_coopmat2_fa : bool   // ... plus the cm2 flash-attention trio (reductions, conversions, per-element ops), on a device created in cm2 mode
     has_bda : bool           // the device enabled bufferDeviceAddress (the coopmat2 creator alone does): storage buffers carry the device-address usage, allocation flag and query
     decvec_on : bool        // DASLLAMA_VK_DECVEC asked and the device reports the four-wide decode callback (a dry bake creates no pipelines and leaves it off)
     full_sg_on : bool        // DASLLAMA_VK_FULLSG asked and the device has the feature: every class pipeline pins REQUIRE_FULL_SUBGROUPS
@@ -587,11 +626,12 @@ struct GpuState {
     tail_xres_dev : uint64        // the residual row out
     tail_xb_dev : uint64          // the normed row (scratch)
     tail_xres : HostBuf           // the residual row's readback staging
-    tail_pending_woq : int64 = -1l   // the q plane whose attention submit collects the pending tail (-1 = none)
+    tail_pending_key : int64 = -1l   //! the layer (`dat_key`) whose attention submit collects the pending tail (-1 = none)
     tail_xout : float?            // where the collected residual row lands on the host
     span_x_dev : uint64           // the residual row across the span
     span_xb_dev : uint64          // the normed row (scratch)
     span_w_dev : uint64           // the combine weights the top-k writes
+    span_eidx_dev : uint64        //! the top-k's picks (the span carries no bias, so nothing reads them)
     span_logits_dev : uint64      // the router logits
     span_router_dev : uint64      // the span's router planes, f32, layer-major
     span_shgate_dev : uint64      //! the shared expert's gate rows per span layer, f32 (gated models)
@@ -800,9 +840,7 @@ def make_host_buf(bytes : int64; storage : bool; cached : bool = false; xfer_sha
     var bda = VkMemoryAllocateFlagsInfo()
     bda.flags.device_address = true
     if (bda_on) {
-        unsafe {
-            mai.next = addr<void?>(bda)
-        }
+        mai.next = unsafe(addr<void?>(bda))
     }
     var ares = VkResult.SUCCESS
     var m <- allocate_memory(g_gpu.device, mai, unsafe(addr(ares)))
@@ -812,9 +850,7 @@ def make_host_buf(bytes : int64; storage : bool; cached : bool = false; xfer_sha
             panic("dasLLAMA vulkan tier: pinned host alloc failed ({ares}, {bytes} bytes, type {mai.memoryTypeIndex})")
         }
         to_log(LOG_INFO, "dasLLAMA vulkan tier: pinned mirror alloc declined ({ares}, {bytes} bytes, type {mai.memoryTypeIndex}) - streamed walk stops here\n")
-        unsafe {
-            vkDestroyBuffer(dev_raw(), reinterpret<VkBuffer>(b._vk), null)
-        }
+        vkDestroyBuffer(dev_raw(), unsafe(reinterpret<VkBuffer>(b._vk)), null)
         return HostBuf()
     }
     bind_buffer_memory(g_gpu.device, b, m, 0ul)
@@ -823,16 +859,29 @@ def make_host_buf(bytes : int64; storage : bool; cached : bool = false; xfer_sha
     }
     var mapped : void? = null
     let mf : VkMemoryMapFlags
-    unsafe {
-        vk_check(vkMapMemory(dev_raw(), boost_value_to_vk(m), 0ul, uint64(bytes), mf, addr(mapped)), null)
-    }
+    vk_check(vkMapMemory(dev_raw(), boost_value_to_vk(m), 0ul, uint64(bytes), mf, unsafe(addr(mapped))), null)
     g_gpu.host_mem |> insert(b._vk, m._vk)
     g_gpu.host_bytes += bytes
     return HostBuf(buf = b._vk, mem = m._vk, mapped = mapped, bytes = bytes)
 }
 
 [cold_path]   // buffer creation — setup, not steady state
-def make_device_buf(bytes : int64; xfer_shared : bool = false) : uint64 {
+//! the soft form: 0 on ERROR_OUT_OF_DEVICE_MEMORY instead of the panic, for the multi-GB allocations a plan may still miss (a heap the last model fragmented, a budget that moved)
+def try_device_buf(bytes : int64) : uint64 => make_device_buf(bytes, false, true)
+
+//! a device allocation that failed: the panic every plain caller expects, or - soft - the buffer shell destroyed, the warning said, 0 back
+[cold_path]
+def private fail_device_buf(buf : uint64; bytes : int64; ares : VkResult; soft : bool) : uint64 {
+    if (!soft) {
+        panic("Vulkan call failed: {ares} (a {bytes >> 20l} MB device buffer)")
+    }
+    vkDestroyBuffer(dev_raw(), unsafe(reinterpret<VkBuffer>(buf)), null)
+    to_log(LOG_WARNING, "dasLLAMA vulkan tier: a {bytes >> 20l} MB device buffer failed with {ares}\n")
+    return 0ul
+}
+
+[cold_path]   // a device allocation is model setup, never a per-token step
+def make_device_buf(bytes : int64; xfer_shared : bool = false; soft : bool = false) : uint64 {
     var bci : BufferCreateInfo
     bci.size = uint64(bytes)
     bci.usage.storage_buffer = true
@@ -852,18 +901,14 @@ def make_device_buf(bytes : int64; xfer_shared : bool = false) : uint64 {
     var bda = VkMemoryAllocateFlagsInfo()   // the usage bit above wants its allocation flagged too
     bda.flags.device_address = g_gpu.has_bda
     if (g_gpu.has_memprio) {
-        unsafe {
-            bda.pNext = addr<void?>(prio)
-        }
+        bda.pNext = unsafe(addr<void?>(prio))
     }
     if (g_gpu.rebar_type >= 0 && (req.memoryTypeBits & (1u << uint(g_gpu.rebar_type))) != 0u) {
         // ReBAR attempt — raw alloc so a decline falls back to plain device-local below
         var rmai = VkMemoryAllocateInfo()
         rmai.allocationSize = req.size
         rmai.memoryTypeIndex = uint(g_gpu.rebar_type)
-        unsafe {
-            rmai.pNext = addr<void?>(bda)
-        }
+        rmai.pNext = unsafe(addr<void?>(bda))
         var rmem : VkDeviceMemory
         if (vkAllocateMemory(dev_raw(), rmai, null, rmem) == VkResult.SUCCESS) {
             vk_check(vkBindBufferMemory(dev_raw(), unsafe(reinterpret<VkBuffer>(b._vk)), rmem, 0ul), null)
@@ -872,9 +917,7 @@ def make_device_buf(bytes : int64; xfer_shared : bool = false) : uint64 {
             }
             var mapped : void? = null
             let mf : VkMemoryMapFlags
-            unsafe {
-                vk_check(vkMapMemory(dev_raw(), rmem, 0ul, req.size, mf, addr(mapped)), null)
-            }
+            vk_check(vkMapMemory(dev_raw(), rmem, 0ul, req.size, mf, unsafe(addr(mapped))), null)
             g_gpu.dev_mem |> insert(b._vk, unsafe(reinterpret<uint64>(rmem)))
             g_gpu.dev_mapped |> insert(b._vk, unsafe(reinterpret<uint64>(mapped)))
             return b._vk
@@ -884,10 +927,12 @@ def make_device_buf(bytes : int64; xfer_shared : bool = false) : uint64 {
     want.device_local = true
     var mai = MemoryAllocateInfo(allocationSize = req.size,
                                  memoryTypeIndex = find_memory_type(g_gpu.phys, req.memoryTypeBits, want))
-    unsafe {
-        mai.next = addr<void?>(bda)
+    mai.next = unsafe(addr<void?>(bda))
+    var ares = VkResult.SUCCESS
+    var m <- allocate_memory(g_gpu.device, mai, unsafe(addr(ares)))
+    if (ares != VkResult.SUCCESS) {
+        return fail_device_buf(b._vk, bytes, ares, soft)
     }
-    var m <- allocate_memory(g_gpu.device, mai)
     bind_buffer_memory(g_gpu.device, b, m, 0ul)
     if (g_gpu.has_bda) {
         note_device_address(b)
@@ -965,9 +1010,7 @@ def query_heap_info(phys : VkPhysicalDevice) : VkHeapInfo {
     var mb = VkPhysicalDeviceMemoryBudgetPropertiesEXT()   // sType pre-filled by the ctor
     var mp2 = VkPhysicalDeviceMemoryProperties2()
     if (has_budget) {
-        unsafe {
-            mp2.pNext = addr<void?>(mb)
-        }
+        mp2.pNext = unsafe(addr<void?>(mb))
     }
     vkGetPhysicalDeviceMemoryProperties2(phys, mp2)
     var best = -1
@@ -1130,15 +1173,16 @@ def public vk_ext_roster(phys : VkPhysicalDevice) : array<VkExtEntry> {
         VkExtEntry(name = "VK_KHR_shader_integer_dot_product", present = integer_dot_product_supported(phys),
             rides = "the sdot4 integer tiles and the quant dot kernels; the tier is disabled without it"),
         VkExtEntry(name = "VK_KHR_cooperative_matrix", present = has_cm,
-            rides = "the KHR f16 and int8 tiles (the mm mode) and the flash-attention twin; without it the sdot4 tiles serve"),
+            rides = "the KHR f16 and int8 tiles (the mm mode), the resident MoE block's expert pieces in mm mode, the KHR flash tile and its sink stamps, the KHR f16 GEMM off cm2 (at subgroup 32), and the h128 attention twin; without it the sdot4 tiles and the chunked attention serve, and a MoE stays per op in mm mode"),
         VkExtEntry(name = "VK_NV_cooperative_matrix2 (workgroup scope, flexible dimensions, tensor addressing, block loads, bufferDeviceAddress)",
             present = has_cm2,
             rides = "the cm2 decode-in-load prefill tiles, the served default; without it the KHR tiles serve (DASLLAMA_COOPMAT picks a mode by name)"),
         VkExtEntry(name = "VK_NV_cooperative_matrix2 reductions, conversions and per-element operations",
             present = has_cm2 && cooperative_matrix2_fa_supported(phys),
-            rides = "the cm2 flash-attention stamps; without them the KHR flash twin serves the attention"),
+            knob = "DASLLAMA_COOPMAT", off = resolve_coopmat_mode(has_cm, has_cm2) != COOPMAT_CM2,
+            rides = "the cm2 flash-attention stamps, on a device created in cm2 mode; without them the KHR flash tile serves at subgroup 32, and the h128 twin and the chunked attention tiles where it declines"),
         VkExtEntry(name = "VK_NV_cooperative_matrix_decode_vector", present = has_cm2 && cooperative_matrix2_decode_vector_supported(phys),
-            knob = "DASLLAMA_VK_DECVEC", off = !g_env_vulkan.vk_decvec,
+            knob = "DASLLAMA_VK_DECVEC", off = !g_env_vulkan.vk_decvec || resolve_coopmat_mode(has_cm, has_cm2) != COOPMAT_CM2,
             rides = "the cm2 tiles' four-wide decode callback; without it the scalar callback serves and a MoE prefill window runs about half again as long"),
         VkExtEntry(name = "VK_NV_shader_sm_builtins", present = device_extension_available(phys, "VK_NV_shader_sm_builtins") && sm > 0,
             rides = "the SM count the dense tile pick and split-k read ({sm} here); without it the l tile serves every dense GEMM and nothing splits k"),
@@ -1184,9 +1228,7 @@ def private query_sm_count(phys : VkPhysicalDevice) : int {
     }
     var sp = VkPhysicalDeviceShaderSMBuiltinsPropertiesNV()
     var p2 = VkPhysicalDeviceProperties2()
-    unsafe {
-        p2.pNext = addr<void?>(sp)
-    }
+    p2.pNext = unsafe(addr<void?>(sp))
     vkGetPhysicalDeviceProperties2(phys, p2)
     return int(sp.shaderSMCount)
 }
@@ -1237,9 +1279,10 @@ def vk_moe_init : bool {
     // coopmat requested whenever supported — the fa twin needs it even in sdot4 GEMM mode
     g_gpu.has_coopmat = cooperative_matrix_supported(g_gpu.phys)
     g_gpu.has_coopmat2 = g_gpu.has_coopmat && cooperative_matrix2_supported(g_gpu.phys)
-    g_gpu.has_coopmat2_fa = g_gpu.has_coopmat2 && cooperative_matrix2_fa_supported(g_gpu.phys)
-    g_gpu.decvec_on = g_gpu.has_coopmat2 && g_env_vulkan.vk_decvec && cooperative_matrix2_decode_vector_supported(g_gpu.phys)
     g_gpu.coopmat_mode = resolve_coopmat_mode(g_gpu.has_coopmat, g_gpu.has_coopmat2)
+    // the mode conjunct stays: a device created off cm2 mode (`DASLLAMA_COOPMAT=mm`) enables no coopmat2 extension, and the feature probe alone would say yes
+    g_gpu.has_coopmat2_fa = g_gpu.has_coopmat2 && g_gpu.coopmat_mode == COOPMAT_CM2 && cooperative_matrix2_fa_supported(g_gpu.phys)
+    g_gpu.decvec_on = g_gpu.has_coopmat2 && g_gpu.coopmat_mode == COOPMAT_CM2 && g_env_vulkan.vk_decvec && cooperative_matrix2_decode_vector_supported(g_gpu.phys)
     g_gpu.sm_count = query_sm_count(g_gpu.phys)
     // dedicated transfer family: streamed copies overlap compute (DASLLAMA_VK_XFERQ=0 = bisect hatch)
     var xfam = -1
@@ -1470,9 +1513,10 @@ def stack_plane_bytes(n, rows : int64; fmt : int) : tuple<wq : int64; ws : int64
 // pass slot capacities and a base of -1 (re-based per layer).
 def make_stack_shell(base, elems : int64; fmt : int; wqcap, wscap : int64; xfer_shared : bool = false) : int {
     // floor the ws buffer so a scale-less stack's descriptor slot stays valid
+    let wswords = (wscap + 3l) & ~3l   //! whole words: a byte-scale plane (mx4) is read four blocks a word
     var st = VkStack(base = base, elems = elems, fmt = fmt, wqbytes = wqcap,
                      wqbuf = g_gpu.dry ? 0ul : make_device_buf(wqcap, xfer_shared),
-                     wsbuf = g_gpu.dry ? 0ul : make_device_buf(max(wscap, 64l), xfer_shared), wsbytes = wscap)
+                     wsbuf = g_gpu.dry ? 0ul : make_device_buf(max(wswords, 64l), xfer_shared), wsbytes = wswords)
     g_gpu.stacks |> push(st)
     return length(g_gpu.stacks) - 1
 }
@@ -1535,9 +1579,7 @@ def make_imported_buf(ptr : void?; bytes : int64) : HostBuf {
         bci.sharingMode = VkSharingMode.CONCURRENT
         bci.pQueueFamilyIndices <- [g_gpu.fam, uint(g_gpu.xfer_fam)]
     }
-    unsafe {
-        bci.next = addr<void?>(emb)
-    }
+    bci.next = unsafe(addr<void?>(emb))
     var cres = VkResult.SUCCESS
     var b <- create_buffer(g_gpu.device, bci, unsafe(addr(cres)))   // deliberately never finalized (make_host_buf's rule)
     if (cres != VkResult.SUCCESS) {
@@ -1547,9 +1589,7 @@ def make_imported_buf(ptr : void?; bytes : int64) : HostBuf {
     let req = get_buffer_memory_requirements(g_gpu.device, b)
     let usable = hpp.memoryTypeBits & req.memoryTypeBits
     if (usable == 0u || int64(req.size) > sz) {
-        unsafe {
-            vkDestroyBuffer(dev_raw(), reinterpret<VkBuffer>(b._vk), null)
-        }
+        vkDestroyBuffer(dev_raw(), unsafe(reinterpret<VkBuffer>(b._vk)), null)
         vk_import_declined(usable == 0u ? "no usable memory type" : "buffer wants {req.size} bytes over a {sz} byte window")
         return hb
     }
@@ -1578,15 +1618,11 @@ def make_imported_buf(ptr : void?; bytes : int64) : HostBuf {
     imp.handleType = ht
     imp.pHostPointer = ptr
     var mai = MemoryAllocateInfo(allocationSize = uint64(sz), memoryTypeIndex = ti)
-    unsafe {
-        mai.next = addr<void?>(imp)
-    }
+    mai.next = unsafe(addr<void?>(imp))
     var ares = VkResult.SUCCESS
     var m <- allocate_memory(g_gpu.device, mai, unsafe(addr(ares)))
     if (ares != VkResult.SUCCESS) {
-        unsafe {
-            vkDestroyBuffer(dev_raw(), reinterpret<VkBuffer>(b._vk), null)
-        }
+        vkDestroyBuffer(dev_raw(), unsafe(reinterpret<VkBuffer>(b._vk)), null)
         vk_import_declined("vkAllocateMemory {ares}, type {ti} of usable {usable} ({mp.memoryTypes[int(ti)].propertyFlags}), {sz} bytes")
         return hb
     }
@@ -1786,7 +1822,7 @@ def vk_drop_model_state {
     }
     g_gpu.pend_wait = 0ul
     assert(g_gpu.ffn_pend_s2 == -1, "dasLLAMA vulkan tier: model drop with an async FFN in flight")
-    assert(g_gpu.tail_pending_woq < 0l, "dasLLAMA vulkan tier: model drop with a decode ffn tail in flight")
+    assert(g_gpu.tail_pending_key < 0l, "dasLLAMA vulkan tier: model drop with a decode ffn tail in flight")
     // the resident driver's das-side shell first (its VK objects die in the sweeps below)
     if (g_rd != null) {
         unsafe {
@@ -1796,9 +1832,7 @@ def vk_drop_model_state {
     }
     // every alloc_cmd result is model-owned — one bulk free
     if (!empty(g_gpu.model_cmds)) {
-        unsafe {
-            vkFreeCommandBuffers(dev_raw(), boost_value_to_vk(g_gpu.pool), uint(length(g_gpu.model_cmds)), addr(g_gpu.model_cmds[0]))
-        }
+        vkFreeCommandBuffers(dev_raw(), boost_value_to_vk(g_gpu.pool), uint(length(g_gpu.model_cmds)), unsafe(addr(g_gpu.model_cmds[0])))
         g_gpu.model_cmds |> clear()
     }
     // every descriptor set came from the chain and every one is model-owned — reset every chunk
@@ -1846,7 +1880,7 @@ def vk_drop_model_state {
     g_gpu.dat_layers |> clear()
     g_gpu.tail_cmds |> clear()
     g_gpu.span_layers |> clear()
-    g_gpu.tail_pending_woq = -1l
+    g_gpu.tail_pending_key = -1l
     g_gpu.tail_xout = null
     g_gpu.span_key = -1l
     g_gpu.span_nl = 0l
@@ -1979,17 +2013,21 @@ def vk_kq_schema_id(fmt : int) : int {
     return 0
 }
 
-// fmt space here = int(KqFmt): 0 = q8 (32-elem blocks), every other value the kq lattice
-def vk_fmt_b32(fmt : int) : bool => fmt == 0
 
 // meta/activation block unit of a stack format — q8 counts 32-weight blocks, the kq
 // lattice counts 256-weight superblocks
-def fmt_unit(fmt : int) : int64 => vk_fmt_b32(fmt) ? 32l : 256l
+def fmt_unit(fmt : int) : int64 => kq_block32(fmt) ? 32l : 256l
 
 [arch(at="../ARCHITECTURE_GPU_QUANT_PLANES.md#metal-kq-split-scale-plane")]
 def arena_block_bytes(fmt : int) : tuple<wq : int64; ws : int64> {
-    if (fmt == 0) {
+    if (fmt == int(KqFmt.q8)) {
         return (wq = Q8_QPB, ws = Q8_SPB)     // 32 int8 quants + one f16 scale
+    }
+    if (fmt == int(KqFmt.q51)) {
+        return (wq = Q51_QPB, ws = Q51_SPB)   // 16 nibble bytes + 4 qh bytes, f16 d + f16 m: the CPU plane verbatim
+    }
+    if (fmt == int(KqFmt.mx4)) {
+        return (wq = MX4_QB, ws = MX4_SB)   // 16 nibble bytes, one E8M0 byte: the CPU's mxq / mxs planes verbatim
     }
     return (wq = kq_qsb(vk_kq_schema_id(fmt)), ws = kq_dev_ssb_i(fmt))
 }
@@ -1999,9 +2037,9 @@ def arena_block_bytes(fmt : int) : tuple<wq : int64; ws : int64> {
 def arena_rows_ok(n : int64; fmt : int) : bool => n % fmt_unit(fmt) == 0l
 
 def arena_blocks_for(n, rows : int64; fmt : int) : int64 {
-    assert(vk_fmt_b32(fmt) || n % KQ_SUPERBLOCK_ELEMS == 0l, "dasLLAMA vulkan arena: kq row length must be a superblock multiple")
-    assert(!vk_fmt_b32(fmt) || n % Q8_BLOCK_ELEMS == 0l, "dasLLAMA vulkan arena: q8 row length must be a 32-block multiple")
-    return rows * (n / (vk_fmt_b32(fmt) ? Q8_BLOCK_ELEMS : KQ_SUPERBLOCK_ELEMS))
+    assert(kq_block32(fmt) || n % KQ_SUPERBLOCK_ELEMS == 0l, "dasLLAMA vulkan arena: kq row length must be a superblock multiple")
+    assert(!kq_block32(fmt) || n % Q8_BLOCK_ELEMS == 0l, "dasLLAMA vulkan arena: q8 row length must be a 32-block multiple")
+    return rows * (n / (kq_block32(fmt) ? Q8_BLOCK_ELEMS : KQ_SUPERBLOCK_ELEMS))
 }
 
 var private g_arena_slab_override = 0l
@@ -2032,7 +2070,7 @@ def private arena_slab_blocks(fmt : int) : int64 {
 
 // open the next slab, sized to what the content still needs (the last slab is usually partial).
 // The sealed slab's tail goes unused — bounded by the tensor that crossed, and said out loud.
-def private arena_open_slab(var a : ArenaFmt) {
+def private arena_open_slab(var a : ArenaFmt) : bool {
     let bb = arena_block_bytes(a.fmt)
     let cap = min(a.slab_cap, a.cap_blocks - a.blocks)
     if (!empty(a.slabs)) {
@@ -2040,9 +2078,20 @@ def private arena_open_slab(var a : ArenaFmt) {
         to_log(LOG_INFO, "dasLLAMA vulkan arena: fmt {a.fmt} slab {length(a.slabs)} opens ({cap} blocks; {tail} tail blocks unused in slab {length(a.slabs) - 1})\n")
     }
     let qb = cap * bb.wq
-    let sb = max(cap * bb.ws, 64l)   // ws floor keeps the descriptor slots valid (stack-shell rule)
-    a.slabs |> push(ArenaSlab(cap = cap, wqbytes = qb, wsbytes = sb,
-        wqbuf = g_gpu.dry ? 0ul : make_device_buf(qb), wsbuf = g_gpu.dry ? 0ul : make_device_buf(sb)))
+    let sb = max((cap * bb.ws + 3l) & ~3l, 64l)   // ws floor keeps the descriptor slots valid (stack-shell rule); whole words, since a byte-scale plane (mx4) is read four blocks a word
+    let wqbuf = g_gpu.dry ? 0ul : try_device_buf(qb)
+    let wsbuf = g_gpu.dry ? 0ul : try_device_buf(sb)
+    if (!g_gpu.dry && (wqbuf == 0ul || wsbuf == 0ul)) {   //! the device had no room for the slab: the placement declines instead of dying mid-upload
+        if (wqbuf != 0ul) {
+            destroy_device_buf(wqbuf)
+        }
+        if (wsbuf != 0ul) {
+            destroy_device_buf(wsbuf)
+        }
+        return false
+    }
+    a.slabs |> push(ArenaSlab(cap = cap, wqbytes = qb, wsbytes = sb, wqbuf = wqbuf, wsbuf = wsbuf))
+    return true
 }
 
 // Reserve one format's arena up front. Sizing is a decision, not a walk: the resident driver knows
@@ -2062,9 +2111,7 @@ def arena_reserve(fmt : int; cap_blocks : int64) : bool {
         }
         return true
     }
-    unsafe {
-        g_gpu.arenas[fmt] <- ArenaFmt(fmt = fmt, cap_blocks = cap_blocks, slab_cap = arena_slab_blocks(fmt))
-    }
+    g_gpu.arenas[fmt] <- ArenaFmt(fmt = fmt, cap_blocks = cap_blocks, slab_cap = arena_slab_blocks(fmt))
     return true
 }
 
@@ -2090,8 +2137,8 @@ def arena_place(wq : uint8 const?; ws : uint8 const?; n, rows : int64; fmt : int
         while (a.cur < length(a.slabs) && a.slabs[a.cur].used + need > a.slabs[a.cur].cap) {
             a.cur++
         }
-        if (a.cur >= length(a.slabs)) {
-            arena_open_slab(a)
+        if (a.cur >= length(a.slabs) && !arena_open_slab(a)) {
+            return -1l
         }
         var s & = a.slabs[a.cur]
         let blk = s.used
@@ -2200,17 +2247,26 @@ struct RLayer {
     s_q, s_k, s_v : VkDescriptorSet  // q/k/v class GEMV
     s_kv : VkDescriptorSet          // merged k+v two-region class GEMV (fk == fv: same arena planes)
     kv_merged : bool
+    s_qkv : VkDescriptorSet         //! the q+k+v region GEMV (one format, one slab): q in kvd-row pieces, then k, then v
+    qkv_merged : bool
     s_qkn : VkDescriptorSet         // per-head q/k rmsnorm class set (qk_norm models only)
     s_qkn_rope : VkDescriptorSet    // the fused qk-rmsnorm + rope + KV store (qk_norm models only; per-token words ride the shared TokMeta)
     s_rope : VkDescriptorSet        // rope + KV store class set
     s_attn : VkDescriptorSet        // decode attention class set
+    s_attn_comb : VkDescriptorSet   //! the split attention's combine (a head's partials into its row)
     s_quant_at : VkDescriptorSet
     s_wo : VkDescriptorSet
+    wo_ar : bool                    //! the wo GEMV carries the post-attention residual step as its last workgroup's epilogue (`Q8GemvAr`)
+    s_wo_ar : VkDescriptorSet
+    down_ar : bool                  //! the down GEMV carries the post-FFN residual step the same way
+    s_down_ar : VkDescriptorSet
     s_addr_ffn : VkDescriptorSet
     s_addr_ffn_rq : VkDescriptorSet   // the fused add+rms+requant twins of addr_ffn / addr_next
     s_quant_xb2 : VkDescriptorSet
     s_gate, s_up : VkDescriptorSet
     s_actrq : VkDescriptorSet
+    s_gu : VkDescriptorSet          //! the fused gate + up + act + Q8_0 requant dispatch (`Q8GemvGu`), where the triple is q8 with a Q8_0 feed
+    gu_on : bool
     s_down : VkDescriptorSet
     s_addr_next : VkDescriptorSet
     s_addr_next_rq : VkDescriptorSet
@@ -2228,12 +2284,14 @@ struct RLayer {
     cbase : int64                   //! its rope class's row base inside a position's cos/sin plane
     boff : int64                    //! its row base in the q/k/v bias plane
     pf_fa : bool                    //! the window chain takes the cm2 flash tile on this layer (its head size has a stamp)
+    pf_fakhr : bool                 //! ... or the KHR flash tile, where the device has KHR cooperative matrices and no cm2 flash
     pre_post : bool                 //! the residual steps norm their add partner first (the post-attention and post-FFN norms of a gemma)
     gelu : bool                     //! the dense FFN's activation is the tanh gelu (GeGLU), else silu
     vfk : bool                      //! no v plane: V is the raw k row at its own rms (the v GEMV and its set stay unused)
     vnorm : bool                    //! V scaled by its own rms, weightless
     out_scale : float               //! the FFN residual step's scale on the sum; 1.0 = none
     kv_shared : bool                //! Q only: the K/V GEMVs, the k/v norms and the mirror store stay off; attention reads the donor's rows at mir_base
+    attn_cap : float                //! the attention logit softcap on the scaled scores (gemma-2: 50); 0 = none - the cm2 flash tile's cap stamps take it at h256
     // the per-layer-embedding branch (gemma-4 E-series): gate [dim x ple] and proj [ple x dim] planes, their sets and metas
     ple : bool
     bpg, bpp : int64
@@ -2241,6 +2299,9 @@ struct RLayer {
     s_ple_x : VkDescriptorSet       //! the residual row requantized as it is (the gate GEMV's feed)
     s_ple_gate, s_ple_proj : VkDescriptorSet
     s_ple_act : VkDescriptorSet     //! gelu(gate) x this layer's side-input row, requantized (the proj GEMV's feed)
+    ple_fused : bool                //! the branch in three dispatches: the FFN residual step quantizes the row it writes (the gate's feed), the act rides the proj GEMV
+    s_ple_ar_rq : VkDescriptorSet   //! the residual step + raw Q8_0 requant (`ArArgs.no_norm`)
+    s_ple_pa : VkDescriptorSet      //! the act + requant + proj GEMV (`Q8GemvPleAct`)
     m_pg, m_pp : HostBuf
     // the recurrent (deltanet) form - the attention fields above stay unused on such a layer
     recurrent : bool
@@ -2271,15 +2332,27 @@ struct RLayer {
     fe1, fe3, fe2 : int
     xe_own : bool                   //! the experts' feed is its own image: their quant form differs from the dense triple's
     s_quant_xe : VkDescriptorSet    //! the second requant of xb, the experts' form
+    pre2_fused : bool               //! the gemma-4 routed feed's norm and requant as one dispatch (`s_pre2_rq`, an ArRq stamp with the add off)
+    pre2_stamp : RqStamp
+    s_pre2_rq : VkDescriptorSet
+    rtn_fused : bool                //! the gemma-4 router takes its own rms of x (`RouterArgs.norm_on`): no norm dispatch before it
     s_router, s_topk : VkDescriptorSet
     s_egate, s_eup : VkDescriptorSet
     s_eact : VkDescriptorSet
+    egu : bool                      //! the Q4_K gate and up GEMVs, the act and its Q8_0 requant as one dispatch (`KqGemvK4Gu`)
+    egu_mx4 : bool                  //! ... the mx4 twin under the slots' expert bias rows (`Mx4GemvGu`, gpt-oss)
+    s_egu : VkDescriptorSet
     s_edown : VkDescriptorSet
+    edown_sum : bool                //! the routed down GEMV sums the k rows under their weights itself (`Q51GemvSum`): the combine reads one row
+    s_edown_sum : VkDescriptorSet
+    comb_rq : bool                  //! the combine quantizes the next head's Q8_0 feed itself (`ClsArCombRq`, the gemma-4 form's `ClsArCombG4Rq`): no requant dispatch follows
+    s_comb_rq : VkDescriptorSet
     pf_router_set, pf_topk_set, pf_sched_set, pf_gather_set : VkDescriptorSet   //! the window chain's MoE block
     pf_e1_set, pf_e3_set, pf_e2_set : VkDescriptorSet   //! the expert tiles over the device-written schedules: the s column's
     pf_e1m_set, pf_e3m_set, pf_e2m_set : VkDescriptorSet   //! ... and the m column's, over the same planes
     pf_eact_set : VkDescriptorSet
     pf_arcomb_set, pf_arcomb_f16_set : VkDescriptorSet   //! the residual step with the combine folded in: the f32 and f16 normed-row forms
+    moe_g4 : bool                   //! the gemma-4 form: the dense triple is a parallel shared expert, the routed feed and the router take their own norms of x, the combine norms both branches (`ClsArCombG4`)
 }
 
 //! the layer's dense FFN triple is placed: its own FFN, or an MoE layer's shared expert (an MoE layer without one has none)
@@ -2305,6 +2378,9 @@ struct RDec {
     xq_dev, xs_dev : uint64       // quantized activation (shared across the layer's GEMVs)
     q_dev, kv_dev : uint64        // roped q; the k/v projection buffer rope reads (k@qd, v@qd+kvd)
     attn_dev : uint64             // attention output
+    attn_part_dev : uint64        //! the split decode attention's partials [heads x DA_NSPLIT_MAX x (head_size + 2)]
+    ar_cnt_dev : uint64           //! the epilogue GEMVs' arrival counter (one word: the dispatches are sequential), zero between dispatches
+    attn_nsplit : int64           //! key splits a head the token command dispatches (1 = the unsplit pass; `da_nsplit`)
     aq_dev, as_dev : uint64       // quantized attn (wo input)
     gate_dev, up_dev : uint64
     ffnout_dev : uint64
@@ -2329,6 +2405,10 @@ struct RDec {
     bias_dev : uint64             // the q/k/v projection biases, per layer [q | k | v] (qwen2; 0 = the model has none)
     bias_bytes : int64
     has_bias : bool
+    sinks_dev : uint64            //! the per-head attention sink logits, [n_heads] a layer (gpt-oss; 0 = the model has none)
+    sinks_bytes : int64
+    has_sinks : bool
+    has_obias : bool              //! the attention output bias rows ride the norms plane (`RD_NORM_OBIAS`) and the residual steps add them
     cos_dev : uint64              // this token's rope row (cos[half] + sin[half])
     logits_dev : uint64
     x_host, logits_host : HostBuf
@@ -2347,6 +2427,9 @@ struct RDec {
     cls_fmt_marker : int
     layers : array<RLayer>
     cmd : VkCommandBuffer
+    cmd_unsplit : VkCommandBuffer   //! the unsplit twin: the same chain with the attention at one split, submitted under RD_UNSPLIT_POS
+    unsplit_on : bool               //! ... recorded (a device at one split has no twin)
+    unsplit_served : int64        //! the tokens the twin served
     tok_recorded : bool           // cmd holds the whole-token chain, re-submittable as-is
     cos_host : HostBuf            // this token's rope row, copied to cos_dev in-cmd
     // the per-layer-embedding side input (gemma-4 E-series; ple = 0 elsewhere): this token's [layers x ple]
@@ -2355,6 +2438,16 @@ struct RDec {
     ple_host : HostBuf
     ple_dev, pleg_dev : uint64
     pf_ple : uint64
+    // the pre-step's projection on device (cm2 route): the per-layer model projection as an f16 mirror [layers*ple x dim],
+    // its [ple] norm row, the window's f16 embedding rows and the projected [np x layers*ple] plane, and the three steps' sets
+    ple_gpu : bool
+    ple_w16_dev, ple_pnorm_dev : uint64
+    ple_w16_bytes : int64
+    pf_plexf, pf_plep : uint64
+    pf_ple_cvt_set, pf_ple_gemm_set, pf_ple_ar_set : VkDescriptorSet
+    //! the token command's half of the pre-step: the projected [layers*ple] row and the two steps' sets (the f16 GEMV over the embedded row, the per-slice finish)
+    tok_plep : uint64
+    s_tok_pleproj, s_tok_ple_ar : VkDescriptorSet
     tok_meta : HostBuf            // the shared TokMeta block (pos/cnt), host-poked per token
     // prefill batch buffers (lazy — sized MAX_NPOS x their width) + per-layer prefill sets
     pf_ready : bool
@@ -2369,6 +2462,7 @@ struct RDec {
     // cm2 flash attention (armed by pf_setup when the device carries the fa trio and the mirror
     // is f16 — the fa tiles bind the mirrors directly, no shadow planes)
     pf_facm2 : bool
+    pf_fakhr : bool   //! the KHR flash tile armed instead (KHR cooperative matrices, no cm2 flash)
     pf_logits_host : HostBuf
     pf_midx_host : HostBuf        //! the last MoE layer's picks, read back for the profile's bucket report
     pf_meta : array<HostBuf>      // one host meta per (layer, role) + prologue/final/cls
@@ -2379,6 +2473,8 @@ struct RDec {
     emb_blk : int64 = -1l
     emb_f32 : uint64
     emb_f32_bytes : int64
+    ple_tbl_blk : int64 = -1l          //! the E-series token table's arena block (q8): the ids prefill gathers pf_ple from it
+    pf_ple_tbl_set : VkDescriptorSet
     pf_ids : uint64                    // [MAX_NPOS] token ids for the device-side embed gather
     pf_emb_set : VkDescriptorSet
     pf_arq_sets : array<VkDescriptorSet>   // fused ar+rq|f16 per layer: [l*2] = the ffn site, [l*2+1] = addr_next
@@ -2396,11 +2492,21 @@ struct RDec {
     ne, k, nfe, nsh, ner : int64  //! experts, routed slots, the expert width, the shared expert's width (0 = none), the router rows per layer (ne, + the gate row)
     n_moe : int64                 //! MoE layers (the router plane's slots)
     sh_gated, norm_topk, is_gelu : bool
+    act_oai : bool                //! the experts' activation is gpt-oss's clamped swiglu (`ACT_OAI`), else silu or gelu by `is_gelu`
     wscale : float
     router_dev : uint64           //! [n_moe x ner x dim] f32 router rows, the gate row last
     router_bytes : int64
     router16_dev : uint64         //! the same rows as f16: the window chain's router GEMM on the cm2 tile
     router16_bytes : int64
+    moe_ds_dev : uint64           //! [n_moe x ne] the per-expert down scales the top-k folds into its weights (gemma-4); the filler when the model has none
+    moe_ds_bytes : int64
+    router_bias : bool            //! the router logits take a per-expert bias before the pick (gpt-oss): `moe_rb_dev` holds [n_moe x ne]
+    moe_rb_dev : uint64
+    moe_rb_bytes : int64
+    exps_bias : bool              //! the expert stacks carry bias rows (gpt-oss): gate and up [n_moe x ne x nfe], down [n_moe x ne x dim]
+    moe_gb_dev, moe_ub_dev, moe_db_dev : uint64
+    moe_gub_bytes, moe_db_bytes : int64
+    moe_eidx_dev : uint64         //! the decode's k picks' experts (the biased act and combine's row map)
     moe_ident_dev : uint64        //! 0..MAX_ROUTED_SLOTS-1: the decode combine's identity slot map
     moe_dlog_dev : uint64         //! the decode's logits row (ner floats)
     moe_dw_dev : uint64           //! the decode's k routing weights
@@ -2410,6 +2516,7 @@ struct RDec {
     pf_nk : int64                 //! the window's slot rows (PF_WINDOW x k)
     pf_mlog : uint64              //! [np x ner] logits
     pf_midx, pf_mw, pf_minv : uint64   //! [nk] picks, weights, slot -> bucket row
+    pf_bex : uint64               //! [nk] bucket row -> its expert (the biased act's row map)
     pf_msch1, pf_msch3, pf_msch2 : uint64   //! the three expert planes' device-written schedules
     pf_mxg : uint64               //! [nk + slack x dim] the gathered f16 rows
     pf_my1, pf_my2 : uint64       //! [nk x nfe] the gate / up rows
@@ -2426,13 +2533,27 @@ def f16g_shape_ok(dim : int64) : bool => g_gpu.coopmat_mode == COOPMAT_CM2 && di
 
 var g_rd : RDec?
 
-//! the norms plane's rows per layer (`RDEC_NORM_ROWS`, the uploader's count): the attention norm, the FFN norm, the post-attention and post-FFN norms; the final norm follows the layers, the q/k norm rows follow it
+let RD_UNSPLIT_POS = 512l   //! the token command submits its unsplit attention twin under this position (`ARCHITECTURE_GPU_VULKAN_ATTN.md` sec.2.2al)
+
+//! the token command's attention split count on this device (1 = the unsplit pass alone, no twin; 0 = no driver)
+def vk_rdec_attn_nsplit : int64 => g_rd != null ? g_rd.attn_nsplit : 0l
+
+//! the tokens the unsplit twin served so far (a device at one split serves every token unsplit and counts none here)
+def vk_rdec_unsplit_tokens : int64 => g_rd != null ? g_rd.unsplit_served : 0l
+
+//! the norms plane's per-layer row indices (`RDEC_NORM_ROWS` rows a layer); the final norm follows the layers and the q/k norm rows follow it
 let RD_NORM_ROWS = RDEC_NORM_ROWS
 let RD_NORM_ATT = 0l
 let RD_NORM_FFN = 1l
 let RD_NORM_POST_ATT = 2l
 let RD_NORM_POST_FFN = 3l
 let RD_NORM_PLE_POST = 4l   //! the per-layer-embedding branch's post norm (gemma-4 E-series); a zero row elsewhere
+//! gemma-4's four rows (zero elsewhere): the router's input scale over sqrt(dim), the routed pre norm, the dense branch's post norm (FFN1), the routed sum's post norm (FFN2)
+let RD_NORM_ROUTER = 5l
+let RD_NORM_PRE_FFN2 = 6l
+let RD_NORM_POST_FFN1 = 7l
+let RD_NORM_POST_FFN2 = 8l
+let RD_NORM_OBIAS = 9l   //! the attention output bias row (gpt-oss), added to the wo GEMV's row at the residual step; a zero row elsewhere
 
 //! layer `l`'s norm row of `kind` in the norms plane, in floats
 def rd_norm_off(l, kind : int64) : int64 => (l * RD_NORM_ROWS + kind) * g_rd.dim
@@ -2474,6 +2595,26 @@ def fill_gemv_regions2(hb : HostBuf; blk_a, blk_b : int64) {
     }
 }
 
+//! the q+k+v form: q as `qpieces` regions of `piece_blocks` blocks each, then k, then v (off under with_v = false) - every
+//! region kvd rows, landing at 0, qd, qd + kvd. All three blocks live in ONE slab - the caller guards.
+def fill_gemv_regions_qkv(hb : HostBuf; blk_q, blk_k, blk_v : int64; qpieces, piece_blocks : int64; with_v : bool) {
+    unsafe {
+        var mp = reinterpret<uint?>(hb.mapped)
+        var r = 0
+        for (p in range64(qpieces)) {
+            mp[r * 2] = uint(arena_local_blk(blk_q) + p * piece_blocks)
+            mp[r * 2 + 1] = 0u
+            r++
+        }
+        mp[r * 2] = uint(arena_local_blk(blk_k))
+        mp[r * 2 + 1] = 0u
+        if (with_v) {
+            mp[r * 2 + 2] = uint(arena_local_blk(blk_v))
+            mp[r * 2 + 3] = 0u
+        }
+    }
+}
+
 // the f32->f16 convert's meta (arena cm2 chain): word 0 = element count
 def fill_cvt_meta(hb : HostBuf; elems : int64) {
     unsafe {
@@ -2491,21 +2632,45 @@ var g_rdq_n = 0u
 var g_rdq_count = 0l
 var g_rdq_total = 0.0lf
 var g_rdq_stamp_names : array<string>        //! the recorded token command's stamp names in stamp order, the recorder's own account of what each interval bills
+var g_rdq_names_unsplit : array<string>        //! ... the unsplit twin's, its stamp count and its overflow flag
+var g_rdq_n_unsplit = 0u
+var g_rdq_overflow_unsplit = false
+var g_rdq_form_unsplit = false   //! the form the last sampled token took: a switch restarts the averages
 var g_rdq_us_by_name : table<string; double>   //! the stamps' summed intervals by name (a name repeated in a token sums: every layer's "q", both kv halves)
 var g_rdq_print_order : array<string>        //! the names in first-seen order, the tables' print order
 var g_rdq_wall_us = 0.0lf   // the host side of the same tokens: memcpys + submit + fence + logits copy
+var g_rdq_host_us : double[4]   //! ... split into its pieces: the memcpys and meta, the submit, the fence spin, the logits copy
 var g_rdq_overflow = false   //! a stamp the query pool could not take (PFQ_CAP): the recorded names and the pool saturate together, so the sampler reads this instead
 
-//! the decode profiler's accumulators back to zero: a model drop or a new resident model - averages never span models
-def rdq_reset {
-    g_rdq_n = 0u
+//! the decode profiler's averages back to zero (the recorded stamp names stay): a switch between the token command's two forms
+//! the token command changed forms mid-run: say so and restart the ledger's averages, since the two forms' stamp roles differ
+[cold_path]
+def rdq_form_switch(unsplit : bool; pos : int64) {
+    to_log(LOG_INFO, "vk_rdec gpu: the token command takes its {unsplit ? "unsplit" : "split"} form from position {pos} - the averages restart\n")
+    rdq_reset_averages()
+}
+
+def rdq_reset_averages {
     g_rdq_count = 0l
     g_rdq_total = 0.0lf
     g_rdq_wall_us = 0.0lf
-    g_rdq_overflow = false
+    for (i in range(4)) {
+        g_rdq_host_us[i] = 0.0lf
+    }
     g_rdq_us_by_name |> clear()
     g_rdq_print_order |> clear()
+}
+
+//! the decode profiler's accumulators back to zero: a model drop or a new resident model - averages never span models
+def rdq_reset {
+    rdq_reset_averages()
+    g_rdq_n = 0u
+    g_rdq_overflow = false
     g_rdq_stamp_names |> clear()
+    g_rdq_names_unsplit |> clear()
+    g_rdq_n_unsplit = 0u
+    g_rdq_overflow_unsplit = false
+    g_rdq_form_unsplit = false
 }
 
 let PFQ_CAP = 2048u
@@ -2669,7 +2834,7 @@ var @scratch g_pipe_names : table<uint64; string>   // VkPipeline -> kernel name
 var @scratch g_vk_kcov : table<uint64; int64>       // VkPipeline -> dispatches (REVIEW: "A new GPU kernel ships with a small model in the kernel coverage suite")
 
 struct SetBits {
-    b : uint[8]   // per-binding region bits (up to 8 declared bindings per class)
+    b : uint[12]   // per-binding region bits (up to 12 declared bindings per class)
 }
 
 //! Census seed: every [vk_dispatch] kernel joins the coverage universe at program start (the
@@ -2729,6 +2894,11 @@ var private g_vkd_pipe_epoch = 0
 def vkd_pipes_rebuild() {
     g_vkd_pipe_epoch++
 }
+
+//! PROBE SEAM: with `g_vkd_spv_keep` on, every class pipeline built keeps its EMITTED words under its kernel name in
+//! `g_vkd_spv_kept` - the kernel cells read a stamp's words back (its Workgroup variables, its capabilities); off, nothing is kept
+var g_vkd_spv_keep = false
+var g_vkd_spv_kept : table<string; array<uint>>
 
 // once-per-class named decline log for the workgroup-footprint gate below
 var private g_wg_declined : table<string>
@@ -2791,7 +2961,7 @@ def vkd_set(c : VkdClass; set_ : VkDescriptorSet; bufs : uint64 const[]; sizes :
     update_descriptor_sets(g_gpu.device, writes, no_copies)
     var sb : SetBits
     for (i in range(length(gbits))) {
-        if (c.bindings[i] < 8) {
+        if (c.bindings[i] < 12) {
             sb.b[c.bindings[i]] = gbits[i]
         }
     }
@@ -2860,6 +3030,9 @@ def vkd_class_pipe(var c : VkdClass; ord : int; var spv : array<uint>; rmask, wm
         c.pipe_epochs |> resize(ord + 1)
     }
     spv_dump_save(kernel, spv)   // the EMITTED words, before an override replaces them
+    if (g_vkd_spv_keep) {
+        g_vkd_spv_kept[kernel] := spv
+    }
     spv_override_load(kernel, spv)
     var shader : ShaderModule
     if (g_gpu.decvec_on) {
@@ -2882,7 +3055,10 @@ def vkd_class_pipe(var c : VkdClass; ord : int; var spv : array<uint>; rmask, wm
     g_pipe_names[pk] = kernel
 }
 
-def vkd_alloc_set(c : VkdClass) : VkDescriptorSet {
+def vkd_alloc_set(c : VkdClass; family : string) : VkDescriptorSet {
+    if (intptr(boost_value_to_vk(c.set_layout)) == 0ul) {
+        panic("dasLLAMA vulkan tier: a descriptor set asked of {family} before its pipeline was ensured - call ensure_{family} first")
+    }
     return alloc_set_from_chain(boost_value_to_vk(c.set_layout))
 }
 
@@ -2901,9 +3077,7 @@ def vkd_dispatch(raw : VkCommandBuffer; var h : VkHaz; c : VkdClass; var set_ : 
     g_vk_kcov[intptr(boost_value_to_vk(c.pipes[ord]))]++
     vhz_dep(raw, h, m.r, m.w)
     cmd_bind_pipeline(vk_value_to_boost(raw), c.pipes[ord], VkPipelineBindPoint.COMPUTE)
-    unsafe {
-        vkCmdBindDescriptorSets(raw, VkPipelineBindPoint.COMPUTE, boost_value_to_vk(c.pipe_layout), 0u, 1u, addr(set_), 0u, null)
-    }
+    vkCmdBindDescriptorSets(raw, VkPipelineBindPoint.COMPUTE, boost_value_to_vk(c.pipe_layout), 0u, 1u, unsafe(addr(set_)), 0u, null)
     vkCmdDispatch(raw, groups, 1u, 1u)
 }
 
@@ -2922,7 +3096,7 @@ def hz_masks(pipe : Pipeline; var set_ : VkDescriptorSet) : tuple<r : uint; w : 
     let sb = g_set_bits[sk]
     var r = 0u
     var w = 0u
-    for (i in range(8)) {
+    for (i in range(12)) {
         let bit = 1u << uint(i)
         if ((acc.x & bit) != 0u) {
             r |= sb.b[i]
@@ -3053,9 +3227,7 @@ def vhz_dep(raw : VkCommandBuffer; var h : VkHaz; rmask, wmask : uint; transfer 
         dstage.compute_shader = true
         dstage.transfer = true
         let dflags : VkDependencyFlags
-        unsafe {
-            vkCmdPipelineBarrier(raw, sstage, dstage, dflags, 1u, addr(mb), 0u, null, 0u, null)
-        }
+        vkCmdPipelineBarrier(raw, sstage, dstage, dflags, 1u, unsafe(addr(mb)), 0u, null, 0u, null)
         h.w = 0u
         h.r = 0u
         h.pend_compute = false
@@ -3079,16 +3251,12 @@ def alloc_transient_cmd : VkCommandBuffer {
     ai.level = VkCommandBufferLevel.PRIMARY
     ai.commandBufferCount = 1u
     var raw : VkCommandBuffer
-    unsafe {
-        vk_check(vkAllocateCommandBuffers(dev_raw(), ai, addr(raw)), null)
-    }
+    vk_check(vkAllocateCommandBuffers(dev_raw(), ai, unsafe(addr(raw))), null)
     return raw
 }
 
 def free_transient_cmd(var raw : VkCommandBuffer) {
-    unsafe {
-        vkFreeCommandBuffers(dev_raw(), boost_value_to_vk(g_gpu.pool), 1u, addr(raw))
-    }
+    vkFreeCommandBuffers(dev_raw(), boost_value_to_vk(g_gpu.pool), 1u, unsafe(addr(raw)))
 }
 
 def alloc_cmd : VkCommandBuffer {
@@ -3135,11 +3303,9 @@ def submit_nofence(var raw : VkCommandBuffer) {
 
 def wait_fence {
     var fence = g_gpu.fence
-    unsafe {
-        // spin, never block: vkWaitForFences pays 1-2ms OS wake-up latency per submit (measured)
-        while (vkGetFenceStatus(dev_raw(), fence) != VkResult.SUCCESS) {}
-        vk_check(vkResetFences(dev_raw(), 1u, addr(fence)), null)
-    }
+    // spin, never block: vkWaitForFences pays 1-2ms OS wake-up latency per submit (measured)
+    while (vkGetFenceStatus(dev_raw(), fence) != VkResult.SUCCESS) {}
+    vk_check(vkResetFences(dev_raw(), 1u, unsafe(addr(fence))), null)
 }
 
 def submit_wait(var raw : VkCommandBuffer) {
@@ -3169,6 +3335,7 @@ def fill_stack_sched_rows(si : int; offs : int64 const?; nregions : int64; nrows
 
 def fill_stack_acts(si : int; xqp : int8 const?; xsp : float const?; xq_bytes : int64) {
     assert(xq_bytes <= XQ_BYTES, "dasLLAMA vulkan tier: dispatch exceeds scratch capacity")
+    assert(g_gpu.stacks[si].gemv_made, "dasLLAMA vulkan tier: a stack fill before its GEMV scratch was made")
     let unit = fmt_unit(g_gpu.stacks[si].fmt)
     unsafe {
         memcpy(g_gpu.stacks[si].xq.mapped, reinterpret<void?>(xqp), xq_bytes)
@@ -3179,13 +3346,17 @@ def fill_stack_acts(si : int; xqp : int8 const?; xsp : float const?; xq_bytes : 
 // ===== the decode attention block's per-layer mirrors =====
 
 
+let DAT_KEY_FMTS = 32l
+
+def dat_key(woq : int64; fq : int) : int64 => woq * DAT_KEY_FMTS + int64(fq)
+
 //! The layer's decode-block state exists after this, its f16 K/V mirror allocated on first sight
-//! (keyed by the q plane offset - the identity both the prefill chain and the decode block carry).
+//! (keyed by `dat_key` - the identity both the prefill chain and the decode block carry).
 [cold_path]   // once per layer: the mirror pair
-def dat_layer_ensure(woq, kvd : int64) {
-    if (!key_exists(g_gpu.dat_layers, woq)) {
+def dat_layer_ensure(key, kvd : int64) {
+    if (!key_exists(g_gpu.dat_layers, key)) {
         let bytes = DAT_MIRROR_ROWS * kvd * 2l
-        g_gpu.dat_layers |> insert(woq, DatLayer(k_mir = make_device_buf(bytes), v_mir = make_device_buf(bytes), cnt = 0l))
+        g_gpu.dat_layers |> insert(key, DatLayer(k_mir = make_device_buf(bytes), v_mir = make_device_buf(bytes), cnt = 0l))
     }
 }
 
@@ -3276,9 +3447,7 @@ let PAR_COPY_CHUNK = 2_097_152l
 
 def par_memcpy(var dst : void?; src : void?; bytes : int64) {
     if (bytes < PAR_COPY_CHUNK * 2l || !is_job_que_available()) {
-        unsafe {
-            memcpy(dst, src, bytes)
-        }
+        unsafe(memcpy(dst, src, bytes))
         return
     }
     let nch = int((bytes + PAR_COPY_CHUNK - 1l) / PAR_COPY_CHUNK)
@@ -3310,9 +3479,7 @@ def cmd_copy_range(raw : VkCommandBuffer; src : uint64; src_off : int64; dst : u
 
 // zero a device range inside a command (a transfer write; offset and size multiples of 4)
 def cmd_fill_zero(raw : VkCommandBuffer; dst : uint64; dst_off : int64; bytes : int64) {
-    unsafe {
-        vkCmdFillBuffer(raw, reinterpret<VkBuffer>(dst), uint64(dst_off), uint64(bytes), 0u)
-    }
+    vkCmdFillBuffer(raw, unsafe(reinterpret<VkBuffer>(dst)), uint64(dst_off), uint64(bytes), 0u)
 }
 
 // host-wait the transfer timeline up to `v` — the backstop before re-recording the shared xfer

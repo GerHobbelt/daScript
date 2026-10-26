@@ -53,14 +53,16 @@ let VOICE_NAME = "you"
 let READ_OUT_STATUS = "read out - change the text and say again, or record a new voice"
 let PEAK_COLUMN = 240   //! samples per waveform column: 10 ms at the model's rate
 let MEASURE_RUNS = 3    //! the measure button says the text this many times, silently
+let ENGINE_SPIN_WINDOW_US = 30000   //! the window the SPIN toggle turns on when the engine reports 0 - a box profile parked it
 
 //! the frame thread's requests to the speech thread, as archived records
 struct Ask {
-    kind : int        //! 0 the model path; 1 clone the pcm; 2 say the text in `voice`; 3 stop
+    kind : int        //! 0 the model path; 1 clone the pcm; 2 say the text in `voice`; 3 stop; 4 run the kernels per `single_thread`
     text : string
     voice : string
     gen : int         //! the say this belongs to
     silent : bool     //! a say whose clips are timed, never played (the measure button)
+    single_thread : bool   //! kind 4 alone reads it
     rate : int
     pcm : array<float>
 }
@@ -152,10 +154,11 @@ var g_audio_initialized = false
 var g_asch : AudioSystemChannels
 var g_frames = 0
 var g_jobs_max = 1
-var g_spin_window_us = 30000
+var g_spin_window_us = ENGINE_SPIN_WINDOW_US
 var g_jobs_applied = -1
 var g_team_applied = true
 var g_spin_applied = true
+var g_single_applied = false
 
 // ===== the speech thread =====
 
@@ -177,6 +180,8 @@ def start_speech_thread(var ask, answer : Stream?; var now : SeqBox?; var done :
             ask |> pop_archive() $(var a : Ask&) {
                 if (a.kind == 3) {
                     running = false
+                } elif (a.kind == 4) {
+                    set_single_thread(a.single_thread)
                 } elif (a.kind == 1) {
                     let t0 = ref_time_ticks()
                     tts_register_voice(m, VOICE_NAME, a.pcm, a.rate)
@@ -218,6 +223,7 @@ def rebuild_voice_names() {
     g_voice_names |> push_clone_from(g_roster)
 }
 
+[arch(at = "../ARCHITECTURE.md#parrot-panels")]
 def on_ready(var a : Answer) {
     g_ready = true
     g_mic_rate = a.rate
@@ -230,11 +236,14 @@ def on_ready(var a : Answer) {
     JOBS.bounds = (1, g_jobs_max)
     JOBS.value = clamp(get_jobque_worker_limit(), 1, g_jobs_max)   // the limit reads as a huge number when unset
     TEAM.value = get_jobque_team_mode()
-    SPIN.value = get_jobque_spin_us() > 0l   // the engine's default for the platform: parked in a browser
-    g_spin_window_us = SPIN.value ? int(get_jobque_spin_us()) : 30000   // the window the toggle turns back on: the box's own, or the desktop's in a browser
+    let engine_spin_us = get_jobque_spin_us()
+    SPIN.value = engine_spin_us > 0l
+    g_spin_window_us = engine_spin_us > 0l ? int(engine_spin_us) : ENGINE_SPIN_WINDOW_US
     g_jobs_applied = JOBS.value
     g_team_applied = TEAM.value
     g_spin_applied = SPIN.value
+    SINGLE.value = get_single_thread()   // the environment's setting reached both contexts at their init
+    g_single_applied = SINGLE.value
     g_status = g_can_clone ? "press record and talk, then say" : "this file cannot clone - parrot needs a Pocket file with its codec encoder; say reads in the model's voice"
     if (!empty(g_pending_clip)) {
         if (!g_can_clone) {
@@ -315,7 +324,7 @@ def on_read_out() {
         for (r in g_measure_rtf) {
             sum += r
         }
-        g_status = "measure {g_measure_no}: {s1(sum / double(length(g_measure_rtf)))}x real time over {length(g_measure_rtf)} runs at {JOBS.value} jobs"
+        g_status = "measure {g_measure_no}: {s1(sum / double(length(g_measure_rtf)))}x real time over {length(g_measure_rtf)} runs {lanes_label()}"
         return
     }
     if (g_phase == Phase.idle) {
@@ -588,7 +597,7 @@ def say_silent() {
     g_say_silent = true
     var a = Ask(kind = 2, text = text, voice = chosen_voice(), gen = g_says, silent = true)
     g_ask |> push_archive(a)
-    g_status = "measure {g_measure_no} - run {length(g_measure_rtf) + 1} of {MEASURE_RUNS} at {JOBS.value} jobs..."
+    g_status = "measure {g_measure_no} - run {length(g_measure_rtf) + 1} of {MEASURE_RUNS} {lanes_label()}..."
 }
 
 def start_measure() {
@@ -625,6 +634,16 @@ def apply_jobque_knobs() {
         g_spin_applied = SPIN.value
         set_jobque_worker_spin(SPIN.value ? g_spin_window_us : 0)
     }
+    if (SINGLE.value != g_single_applied) {
+        g_single_applied = SINGLE.value
+        // set_single_thread is a context global - the speech thread's own; the checkbox cannot reach it from here
+        var a = Ask(kind = 4, single_thread = SINGLE.value)
+        g_ask |> push_archive(a)
+    }
+}
+
+def lanes_label() : string {
+    return SINGLE.value ? "on one thread" : "at {JOBS.value} jobs"
 }
 
 // ===== the screen =====
@@ -906,17 +925,27 @@ def draw_output_panel() {
     }
 }
 
+[arch(at = "../ARCHITECTURE.md#parrot-panels")]
 def draw_lab_panel() {
     text("model  {g_args.tts_model}")
     text("rate  {g_mic_rate} Hz   voices  {length(g_roster)}   clones  {g_can_clone ? "yes" : "no"}")
     text("platform  {get_running_platform_name()}   cores  {get_total_hw_cores()}")
+    let underrun_frames = sound_playback_underrun_frames()
+    if (underrun_frames > 0l) {
+        with_style((ImGuiCol.Text, RED)) {
+            text("audio underruns  {underrun_frames} frames of silence - the mixer is not refilling the ring before the device drains it")
+        }
+    }
     spacing()
     text("job queue  ({g_jobs_max} workers in the pool)")
-    with_item_width(160.0) {
-        slider_int(JOBS, (text = "jobs"))
+    checkbox(SINGLE, (text = "single thread - no dispatch at all"))
+    with_disabled(SINGLE.value) {
+        with_item_width(160.0) {
+            slider_int(JOBS, (text = "jobs"))
+        }
+        checkbox(TEAM, (text = "team dispatch"))
+        checkbox(SPIN, (text = "workers spin before parking"))
     }
-    checkbox(TEAM, (text = "team dispatch"))
-    checkbox(SPIN, (text = "workers spin before parking"))
     apply_jobque_knobs()
     spacing()
     if (button(MEASURE_BTN, (text = "measure", size = float2(120.0, 30.0)))) {

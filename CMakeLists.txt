@@ -36,6 +36,7 @@ option(DAS_IMGUI_DISABLED "Disable dasImgui (Dear ImGui bindings + widget DSL; n
 option(DAS_VULKAN_DISABLED "Disable dasVulkan (Vulkan bindings generated from vk.xml; headers + volk vendored, no SDK needed)" OFF)
 option(DAS_AUDIO_DISABLED "Disable dasAudio (Miniaudio sound library)" OFF)
 option(DAS_STDDLG_DISABLED "Disable dasStdDlg (File new,open,save etc dialogs)" OFF)
+option(DAS_MESHOPTIMIZER_DISABLED "Disable dasMeshOptimizer (mesh processing and buffer codecs)" OFF)
 option(DAS_STBIMAGE_DISABLED "Disable dasStbImage (StbImage bindings, image loading and saving)" OFF)
 option(DAS_METAL_DISABLED "Disable dasMetal (native Metal compute binding, Apple only)" OFF)
 option(DAS_ACCELERATE_DISABLED "Disable dasAccelerate (Accelerate BLAS binding — AMX/SME, Apple only)" OFF)
@@ -1010,6 +1011,10 @@ src/builtin/module_file_access.cpp
 )
 list(SORT BUILTIN_SRC)
 SOURCE_GROUP_FILES("module builtin" BUILTIN_SRC)
+IF((DAS_USE_SANITIZER STREQUAL "undefined" OR DAS_USE_SANITIZER STREQUAL "ubsan") AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    SET_PROPERTY(SOURCE src/builtin/module_builtin_dasbind.cpp
+        APPEND_STRING PROPERTY COMPILE_FLAGS " -fno-sanitize=function")
+ENDIF()
 
 SET(MISC_SRC
 include/daScript/misc/enums.h
@@ -1648,6 +1653,10 @@ if (NOT ${DAS_TOOLS_DISABLED})
     # `daslang -lib` libraries bound back into daslang through generated [extern] bindings.
     add_subdirectory(examples/c_api_library)
 
+    # dasLLAMA behind a C ABI through both standalone backends, driven from C, C++ and daslang.
+    # After the modules, which is where DAS_LLAMA_INCLUDED is set.
+    add_subdirectory(examples/dasLLAMA/library)
+
 endif()
 
 # This list should be significantly reduced, most of the files, except aot related should be private.
@@ -1964,7 +1973,9 @@ install(FILES ${PROJECT_SOURCE_DIR}/src/misc/LUAU.LICENSE DESTINATION ${DAS_INST
 # (machine-checked by utils/REVIEW.das).
 
 # Install aot tool (the AOT generation driver the integration scaffolds invoke)
-install(FILES ${PROJECT_SOURCE_DIR}/utils/aot/main.das DESTINATION utils/aot)
+install(FILES ${PROJECT_SOURCE_DIR}/utils/aot/main.das
+    ${PROJECT_SOURCE_DIR}/utils/aot/main_llvm_aot.das
+    DESTINATION utils/aot)
 
 # Install fix-lint-errors tool (mechanical lint auto-fixer)
 install(FILES ${PROJECT_SOURCE_DIR}/utils/fix-lint-errors/main.das DESTINATION utils/fix-lint-errors)
@@ -1997,9 +2008,9 @@ install(FILES
     ${PROJECT_SOURCE_DIR}/utils/mcp/README.md
     DESTINATION utils/mcp
 )
-file(GLOB DAS_MCP_TOOLS ${PROJECT_SOURCE_DIR}/utils/mcp/tools/*.das)
+file(GLOB DAS_MCP_TOOLS CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/utils/mcp/tools/*.das)
 install(FILES ${DAS_MCP_TOOLS} DESTINATION utils/mcp/tools)
-file(GLOB DAS_MCP_SUBTOOLS ${PROJECT_SOURCE_DIR}/utils/mcp/subtools/*.das)
+file(GLOB DAS_MCP_SUBTOOLS CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/utils/mcp/subtools/*.das)
 install(FILES ${DAS_MCP_SUBTOOLS} DESTINATION utils/mcp/subtools)
 install(FILES
     ${PROJECT_SOURCE_DIR}/utils/mcp/test_tools.das
@@ -2028,7 +2039,7 @@ install(FILES
     ${PROJECT_SOURCE_DIR}/utils/lsp/README.md
     DESTINATION utils/lsp
 )
-file(GLOB DAS_LSP_SUBTOOLS ${PROJECT_SOURCE_DIR}/utils/lsp/subtools/*.das)
+file(GLOB DAS_LSP_SUBTOOLS CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/utils/lsp/subtools/*.das)
 install(FILES ${DAS_LSP_SUBTOOLS} DESTINATION utils/lsp/subtools)
 install(FILES ${PROJECT_SOURCE_DIR}/utils/lsp/plugin/.claude-plugin/plugin.json
     DESTINATION utils/lsp/plugin/.claude-plugin
@@ -2059,13 +2070,14 @@ install(FILES
 # Install dascov (code coverage)
 install(FILES ${PROJECT_SOURCE_DIR}/utils/dascov/main.das DESTINATION utils/dascov)
 install(FILES ${PROJECT_SOURCE_DIR}/utils/dascov/README.md DESTINATION utils/dascov)
-file(GLOB DAS_DASCOV_TEST_FILES ${PROJECT_SOURCE_DIR}/utils/dascov/tests/*.das)
+file(GLOB DAS_DASCOV_TEST_FILES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/utils/dascov/tests/*.das)
 install(FILES ${DAS_DASCOV_TEST_FILES} DESTINATION utils/dascov/tests)
 
 # Install benchctl (benchmark analysis)
-file(GLOB DAS_BENCHCTL_FILES ${PROJECT_SOURCE_DIR}/utils/benchctl/*.das)
+file(GLOB DAS_BENCHCTL_FILES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/utils/benchctl/*.das)
 install(FILES ${DAS_BENCHCTL_FILES} DESTINATION utils/benchctl)
 install(FILES ${PROJECT_SOURCE_DIR}/utils/benchctl/README.md DESTINATION utils/benchctl)
+install(FILES ${PROJECT_SOURCE_DIR}/utils/benchctl/suite.json DESTINATION utils/benchctl)
 
 # Install lint (unified linter) + its rule-coverage suite, so a shipped SDK can
 # self-check the linter the same way run_utils_tests does in-tree.
@@ -2076,7 +2088,7 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/lint/tests/
 )
 
 # Install detect-dupe (cross-file duplicate-function detector)
-file(GLOB DAS_DETECT_DUPE_FILES ${PROJECT_SOURCE_DIR}/utils/detect-dupe/*.das)
+file(GLOB DAS_DETECT_DUPE_FILES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/utils/detect-dupe/*.das)
 install(FILES ${DAS_DETECT_DUPE_FILES} DESTINATION utils/detect-dupe)
 install(FILES
     ${PROJECT_SOURCE_DIR}/utils/detect-dupe/README.md
@@ -2090,7 +2102,7 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/detect-dupe/fixture/
 # Install find-dupe (AI judge for detect-dupe clusters via das-claude).
 # Not built into all_utils_exe — it depends on the das-claude daspkg
 # package fetched at runtime, which isn't available at build time.
-file(GLOB DAS_FIND_DUPE_FILES ${PROJECT_SOURCE_DIR}/utils/find-dupe/*.das)
+file(GLOB DAS_FIND_DUPE_FILES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/utils/find-dupe/*.das)
 install(FILES ${DAS_FIND_DUPE_FILES} DESTINATION utils/find-dupe)
 install(FILES
     ${PROJECT_SOURCE_DIR}/utils/find-dupe/README.md
@@ -2106,7 +2118,7 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/find-dupe/tests/
 # server startable: it runs interpreted with no -project, and its require graph reaches
 # utils/common/arch_citations.das (via utils/mcp/tools/arch_common) and
 # utils/common/git_signature.das (via utils/mcp/tools/cpp_common).
-file(GLOB DAS_UTILS_COMMON_FILES ${PROJECT_SOURCE_DIR}/utils/common/*.das)
+file(GLOB DAS_UTILS_COMMON_FILES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/utils/common/*.das)
 install(FILES ${DAS_UTILS_COMMON_FILES} DESTINATION utils/common)
 install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/common/tests/
     DESTINATION utils/common/tests
@@ -2114,7 +2126,7 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/common/tests/
 )
 
 # Install daspkg (package manager)
-file(GLOB DAS_DASPKG_FILES ${PROJECT_SOURCE_DIR}/utils/daspkg/*.das)
+file(GLOB DAS_DASPKG_FILES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/utils/daspkg/*.das)
 install(FILES ${DAS_DASPKG_FILES} DESTINATION utils/daspkg)
 install(FILES
     ${PROJECT_SOURCE_DIR}/utils/daspkg/README.md
@@ -2126,7 +2138,7 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/daspkg/fixtures/
 )
 
 # Install das-fmt (daslang formatter)
-file(GLOB DAS_FMT_FILES ${PROJECT_SOURCE_DIR}/utils/das-fmt/*.das)
+file(GLOB DAS_FMT_FILES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/utils/das-fmt/*.das)
 install(FILES ${DAS_FMT_FILES} DESTINATION utils/das-fmt)
 install(FILES
     ${PROJECT_SOURCE_DIR}/utils/das-fmt/README.md
@@ -2137,7 +2149,7 @@ install(FILES
 
 # Install dasllama-server (OpenAI-compatible LLM server; JIT-only, runs from the
 # SDK's live toolchain — see its deploy-jit.ps1 for the standalone bundle path)
-file(GLOB DAS_LLAMA_SERVER_FILES ${PROJECT_SOURCE_DIR}/utils/dasllama-server/*.das)
+file(GLOB DAS_LLAMA_SERVER_FILES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/utils/dasllama-server/*.das)
 list(FILTER DAS_LLAMA_SERVER_FILES EXCLUDE REGEX "/REVIEW\\.das$")
 install(FILES ${DAS_LLAMA_SERVER_FILES}
     ${PROJECT_SOURCE_DIR}/utils/dasllama-server/README.md
@@ -2165,7 +2177,7 @@ install(FILES
 )
 
 # Install jobque-timeline (per-lane jobque trace viewer)
-file(GLOB DAS_JOBQUE_TIMELINE_FILES ${PROJECT_SOURCE_DIR}/utils/jobque-timeline/*.das)
+file(GLOB DAS_JOBQUE_TIMELINE_FILES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/utils/jobque-timeline/*.das)
 install(FILES ${DAS_JOBQUE_TIMELINE_FILES}
     ${PROJECT_SOURCE_DIR}/utils/jobque-timeline/README.md
     DESTINATION utils/jobque-timeline

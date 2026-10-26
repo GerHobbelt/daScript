@@ -1,23 +1,22 @@
 # dasLLAMA Architecture - the Vulkan resident driver
 
 Companion to `ARCHITECTURE_GPU.md`; section numbers are `ARCHITECTURE.md`'s. This document
-carries sections 2.2j, 2.2p, 2.2ab, 2.2ac, 2.2ad, 2.2ai and 2.2aj - the Vulkan resident driver's
-prefill chain, its byte stores, the tile probe's set layout, the device-init roster and the
-lens's readonly derivation: the prefill window chain, the Q8 requant byte store, the decode GEMV
-family's grid codebook buffer, the tile probe's shared descriptor set layout, the recurrent block
-of the prefill window, the roster of Vulkan capabilities the tier keys its routes on, and how the
-`[vk_dispatch]` lens derives `readonly` from a class family's accesses. The MoE block of that
-window and the token command's routed twin are `ARCHITECTURE_GPU_VULKAN_MOE.md`'s sections
-2.2af and 2.2ag. The cooperative-matrix
-tiles the chain's GEMMs run on - the cm2 decode spelling, the tile pick and the coopmat mode
-ladder, the class-pipeline build seat, the MoE expert chain on those tiles, and the KHR arm's
-hand-staged kq tile - are `ARCHITECTURE_GPU_VULKAN_GEMM.md`'s sections 2.2k-2.2m, 2.2q and
-2.2ae, and the decode GEMV family's lane split by row length its section 2.2ah. What a model has to fit on
-the card before any of this runs - the residency plan, and the marks swap that lets one GPU
-slot serve many models - is `ARCHITECTURE_GPU_VULKAN_RESIDENCY.md`'s sections 2.2n-2.2o. The
-decode-era mechanisms of the per-op tier are `ARCHITECTURE_GPU_VULKAN_DECODE.md`'s sections
-2.2r-2.2v. The GPU backend role table these sections build on stays in `ARCHITECTURE_GPU.md`
-sec.1.5.
+carries sections 2.2j, 2.2p, 2.2ab, 2.2ac, 2.2ad, 2.2ai and 2.2aj: the prefill window
+chain, the Q8 requant byte store, the decode GEMV family's grid codebook buffer, the tile probe's
+shared descriptor set layout, the recurrent block of the prefill window, the roster of Vulkan
+capabilities the tier keys its routes on, and how the `[vk_dispatch]` lens derives `readonly` from a
+class family's accesses. The token command's attention key split and the attention-side planes
+(the q/k/v bias, the sink logits, the output bias) are `ARCHITECTURE_GPU_VULKAN_ATTN.md`'s
+sections 2.2al and 2.2am. The MoE block of that
+window, the token command's routed twin and their gemma-4 form are `ARCHITECTURE_GPU_VULKAN_MOE.md`'s
+sections 2.2af, 2.2ag and 2.2ak. The cooperative-matrix tiles the chain's GEMMs run on - the cm2
+decode spelling, the tile pick and the coopmat mode ladder, the class-pipeline build seat, the MoE
+expert chain on those tiles, and the KHR arm's hand-staged kq tile - are `ARCHITECTURE_GPU_VULKAN_GEMM.md`'s
+sections 2.2k-2.2m, 2.2q and 2.2ae, and the decode GEMV family's lane split by row length its
+section 2.2ah. What a model has to fit on the card before any of this runs - the residency plan,
+and the marks swap that lets one GPU slot serve many models - is `ARCHITECTURE_GPU_VULKAN_RESIDENCY.md`'s
+sections 2.2n-2.2o. The decode-era mechanisms of the per-op tier are `ARCHITECTURE_GPU_VULKAN_DECODE.md`'s
+sections 2.2r-2.2v. The GPU backend role table these sections build on stays in `ARCHITECTURE_GPU.md` sec.1.5.
 
 The module gate's six Vulkan checks (`REVIEW.das`) read these files. `check_khr_stage16_abstract`
 reads `class template KqCm2BatchT` in `dasllama_vulkan_classes.das` and licenses no names: its
@@ -27,10 +26,10 @@ reads `class template KqCm2BatchT` in `dasllama_vulkan_classes.das` and licenses
 numbers agree. `check_cm2_ladder_sets` walks every `class template <Fmt>Cm2T : KqCm2BatchT` in
 `dasllama_vulkan_classes.das` twice: for the KHR trio it requires `<Fmt>KhrBatch`, its
 `kq_batch_<fmt>_khr_cls` stamp and an arm in each of `khr_cls_ensure`, `khr_cls_set` and
-`khr_cls_enc` in `dasllama_vulkan_prefill.das`, licensing `Q8Cm2T` alone - q8 is no `kq_sb`
-format, its cm2 tiles carry no KHR arm, and the KHR mode serves q8 through its own tile; for the
-e trio it requires `<Fmt>Cm2EBatch`, its `kq_batch_<fmt>_cm2e_cls` stamp (`q8_batch_cm2e_cls` for
-q8) and an arm in each of `cm2e_cls_ensure`, `cm2e_cls_set` and `cm2e_cls_enc`, licensing none.
+`khr_cls_enc` in `dasllama_vulkan_prefill.das`, licensing none - the per-32 formats spell their stamps `<fmt>_batch_khr_cls`
+(`Q8KhrBatch`, `Q51KhrBatch`, `Mx4KhrBatch`), and the expert schedule rides that tile in mm mode;
+for the e trio it requires `<Fmt>Cm2EBatch`, its `kq_batch_<fmt>_cm2e_cls` stamp (`<fmt>_batch_cm2e_cls` for the per-32
+formats) and an arm in each of `cm2e_cls_ensure`, `cm2e_cls_set` and `cm2e_cls_enc`, licensing none.
 `check_cm2_stamp_tiles` reads every `[vk_dispatch]` stamp of those templates - in
 `dasllama_vulkan_classes.das`, the probe's twins in `harness/vk_gemm_probe.das` and the bring-up
 fixture `tests/_vkd_toy.das` - and requires its `AT`, `BT`, `ACC` and `ACCW` typedefs to follow
@@ -47,9 +46,8 @@ walk as reference measurements of another engine's kernels.
 ### 2.2j The Vulkan resident prefill window chain {#vk-prefill-window-chain}
 
 **A prompt longer than `PF_WINDOW` rows runs as SEQUENTIAL windows over the same activation
-buffers.** Every window's rope and attention address the KV mirror at ABSOLUTE positions, so
-window w attends everything the earlier windows stored; only the last window runs the final
-requant and the classifier.
+buffers.** Every window's rope and attention address the KV mirror at ABSOLUTE positions, so window w attends
+everything the earlier windows stored; only the last window runs the final requant and the classifier.
 
 **The last layer's FFN runs on the window's last 32 rows only.** Nothing downstream of the
 final layer reads more than the last row - the classifier requantizes row `wlen - 1`, the KV
@@ -65,9 +63,8 @@ past the window - unlike the MoE chain's gathered image and hidden plane, which
 hidden and residual values that nothing reads. The sliced GEMMs do not split k: the split-k
 reduce sums partial planes from row 0, so a region starting below the window's end would reduce
 the wrong rows. The slice takes the f16-fed cm2 route only (`gu6 && dn6`); the other feeds run
-the full window. Only the plain residual step (`cls_ar`) and the f16 activation honor the row
-base: the fused residual twins feed the NEXT layer's projections and never run on the last
-layer, so they index from row 0 by design.
+the full window. Only the plain residual step (`cls_ar`) and the f16 activation honor the row base: the fused
+residual twins feed the NEXT layer's projections and never run on the last layer, so they index from row 0 by design.
 
 **The k and v GEMMs merge into ONE dispatch when the layer's q, k and v weight planes are all
 q8 and the k and v planes sit adjacent in the arena.** The bump allocator places them
@@ -120,20 +117,22 @@ residual row and b+0 converts or requantizes it. The fused twins never write the
 the last layer always takes the split arm - the final requant reads `xb`. The addr_ffn site
 fuses the same way for the gate/up feed. Bit-identity with the split pair is a suite gate.
 
-**The cm2 flash-attention tile lands its output f16 when the `wo` feed is f16.** The tile
-template carries an `OUT16` stamp: the f16 instance converts the O accumulator in-kernel and
-writes the `wo` feed plane directly, so the per-layer attn-to-f16 convert never encodes; the
-f32 instance serves the quant route. The two device converts agree bit for bit; the CPU's
-`float16()` rounds ties differently, so the twin's gate compares device against device.
+**The flash-attention tile (`FaT`, one template with a `KHR` axis, its cm2 arm here) accumulates O in f16 under a biased row max, masks only its edge steps, and lands its
+output f16 when the `wo` feed is f16.** The running row max carries 3 ln 2, so every P = e^(S - M) sits at an eighth or under and
+the f16 O accumulator cannot overflow; L carries the same bias, the final divide cancels it, and S, L and M stay f32. The mask pass
+runs only on the steps that cross the causal diagonal or the tile's last window start; the KV loop carries `[dont_unroll]` (RTX PRO
+4500, a 512-row window: E4B's attention 6868 -> 4014 us, gemma-3-1b's 2671 -> 1844). The `OUT16` instance writes the `wo` feed
+plane directly, so no attn-to-f16 convert encodes; the f32 instance serves the quant route. **Without cm2 - a KHR-only card, or a
+mode forced off cm2 - the tile's KHR arm (`FaT` at `KHR = true`, its ten `fa_khr_*` stamps) serves the same head sizes, window and softcap from the same push constants on
+subgroup-scope 16x16x16 fragments:** sixteen query rows a workgroup, 64 keys a step, each subgroup owning one 16-key column of
+S = Q K^T (K^T a column-major load straight from the f16 shadow) and, after the softmax runs per element through shared memory, a
+quarter of the head's output columns of P V (f16 fragments a step, summed into each thread's f32 o row). A key chunk that starts past
+the window's end is skipped; the last one may load up to fifteen rows past it, so every KV mirror carries `RDEC_MIR_SLACK` zeroed
+elements past its planes. The tile stages nothing from the shadows: its q tile and the step's P V plane are sized for the 512-wide head on every stamp, 32 KB of the 49152 B of workgroup memory the tier requires of a device, so K^T and V fragments load straight from the f16 mirrors. It runs its row max under the cm2 tile's 3 ln 2 bias (`FA_MAX_BIAS`). `fa_khr_serves` is the one pick the pre-flight and the window chain share: the tile wants the f16 mirrors and a 32-lane subgroup (its softmax runs eight lanes a row), carries no gated axis - a model whose q plane is `[q | gate]` keeps the chunked attention pair whatever its head size - and serves the softcap at the 256 head alone, its cap stamps.
 
-**A hybrid's gated attention rides the batch kernels through a per-head q stride** (`qhs = 2
-x hs`, twice the head size): the q GEMM writes `[q | gate]` per head, qk-rms and rope read q
-head-strided in place, and the mirror attention gates on the sigmoid of the gate half. A
-partial-rope model rotates the first `rot` elements of a head, and the kernels read the count
-as the `half = rot / 2` argument word. At head size 256 the window takes the h256 cm2 flash
-stamps (Br 64, Bc 32, the h128 loop with the head-shaped tiles doubled): the gated twins load
-q at the head's q stride and scale the normalized output by the sigmoid of the gate half
-before the store; the h128 coopmat twin stays 128-only.
+**A hybrid's gated attention rides the batch kernels through a per-head q stride** (`qhs = 2 x hs`):
+the q GEMM writes `[q | gate]` per head, qk-rms and rope read q head-strided in place, the mirror
+attention gates on the sigmoid of the gate half, a partial-rope model rotates a head's first `rot` elements, and at head size 256 the gated twins take the h256 cm2 flash stamps (Br 64, Bc 32), q at the head's q stride, the normalized output gated before the store.
 
 ### 2.2p The Q8 requant writers store one quant per byte {#q8-requant-byte-store}
 
@@ -167,12 +166,12 @@ model's first kq set rebuilds it.
 ### 2.2ac The tile probe's arms share one descriptor set layout {#khrx-shared-set-layout}
 
 `khrx` is the lever sweep of the KHR kq tile (`ARCHITECTURE_GPU_VULKAN_GEMM.md` sec.2.2ae) in
-`harness/vk_gemm_probe.das` (`ARCHITECTURE_MEASUREMENT.md` sec.2.5): eight arms timed over one
-shape. Two are shipped bodies - the KHR class, the reference each compared arm is checked
-against, and the sdot4 kq tile. `ship` is the KHR tile copied with no lever moved, the control
-the lever arms read against, and the four lever arms are that copy with one lever - the weight
-stage (`dec4`, the four-wide decode callback in place of the word stage), the accumulator
-width, the subgroup tiling, the workgroup size - moved back to its simpler form.
+`harness/vk_gemm_probe.das` (`ARCHITECTURE_MEASUREMENT_VK_GEMM_PROBE.md` sec.2.5a): eight arms
+timed over one shape. Two are shipped bodies - the KHR class, the reference each compared arm
+is checked against, and the sdot4 kq tile. `ship` is the KHR tile copied with no lever moved,
+the control the lever arms read against, and the four lever arms are that copy with one lever -
+the weight stage (`dec4`, the four-wide decode callback in place of the word stage), the
+accumulator width, the subgroup tiling, the workgroup size - moved back to its simpler form.
 Every arm but the sdot4 one binds the same five-buffer descriptor set layout as the shipped
 class, so an arm's figure differs from the shipped class's by its body alone and never by a
 binding difference. The sdot4 arm reads its own Q8 activation fixture, so it binds that

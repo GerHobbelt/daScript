@@ -45,63 +45,63 @@ public:
   __forceinline Func get_verifyCall ( void * self ) const {
     return getDasClassMethod(self,_das_class_method_offset[__fn_verifyCall]);
   }
-  __forceinline bool invoke_verifyCall ( Context * __context__, Func __funcCall__, void * self, ExprCallFunc * call, AnnotationArgumentList const  & args, AnnotationArgumentList const  & progArgs, das::string & errors ) const {
+  __forceinline bool invoke_verifyCall ( Context * __context__, Func __funcCall__, void * self, ExprCallFunc * call, AnnotationArgumentList & args, AnnotationArgumentList const  & progArgs, das::string & errors ) const {
     return das_invoke_function<bool>::invoke
-      <void *,ExprCallFunc *,AnnotationArgumentList const  &,AnnotationArgumentList const  &,das::string &>
+      <void *,ExprCallFunc *,AnnotationArgumentList &,AnnotationArgumentList const  &,das::string &>
         (__context__,nullptr,__funcCall__,
           self,call,args,progArgs,errors);
   }
   __forceinline Func get_apply ( void * self ) const {
     return getDasClassMethod(self,_das_class_method_offset[__fn_apply]);
   }
-  __forceinline bool invoke_apply ( Context * __context__, Func __funcCall__, void * self, Function * func, ModuleGroup & group, AnnotationArgumentList const  & args, das::string & errors ) const {
+  __forceinline bool invoke_apply ( Context * __context__, Func __funcCall__, void * self, Function * func, ModuleGroup & group, AnnotationArgumentList & args, das::string & errors ) const {
     return das_invoke_function<bool>::invoke
-      <void *,Function *,ModuleGroup &,AnnotationArgumentList const  &,das::string &>
+      <void *,Function *,ModuleGroup &,AnnotationArgumentList &,das::string &>
         (__context__,nullptr,__funcCall__,
           self,func,group,args,errors);
   }
   __forceinline Func get_generic_apply ( void * self ) const {
     return getDasClassMethod(self,_das_class_method_offset[__fn_generic_apply]);
   }
-  __forceinline bool invoke_generic_apply ( Context * __context__, Func __funcCall__, void * self, Function * func, ModuleGroup & group, AnnotationArgumentList const  & args, das::string & errors ) const {
+  __forceinline bool invoke_generic_apply ( Context * __context__, Func __funcCall__, void * self, Function * func, ModuleGroup & group, AnnotationArgumentList & args, das::string & errors ) const {
     return das_invoke_function<bool>::invoke
-      <void *,Function *,ModuleGroup &,AnnotationArgumentList const  &,das::string &>
+      <void *,Function *,ModuleGroup &,AnnotationArgumentList &,das::string &>
         (__context__,nullptr,__funcCall__,
           self,func,group,args,errors);
   }
   __forceinline Func get_finish ( void * self ) const {
     return getDasClassMethod(self,_das_class_method_offset[__fn_finish]);
   }
-  __forceinline bool invoke_finish ( Context * __context__, Func __funcCall__, void * self, Function * func, ModuleGroup & group, AnnotationArgumentList const  & args, AnnotationArgumentList const  & progArgs, das::string & errors ) const {
+  __forceinline bool invoke_finish ( Context * __context__, Func __funcCall__, void * self, Function * func, ModuleGroup & group, AnnotationArgumentList & args, AnnotationArgumentList const  & progArgs, das::string & errors ) const {
     return das_invoke_function<bool>::invoke
-      <void *,Function *,ModuleGroup &,AnnotationArgumentList const  &,AnnotationArgumentList const  &,das::string &>
+      <void *,Function *,ModuleGroup &,AnnotationArgumentList &,AnnotationArgumentList const  &,das::string &>
         (__context__,nullptr,__funcCall__,
           self,func,group,args,progArgs,errors);
   }
   __forceinline Func get_patch ( void * self ) const {
     return getDasClassMethod(self,_das_class_method_offset[__fn_patch]);
   }
-  __forceinline bool invoke_patch ( Context * __context__, Func __funcCall__, void * self, Function * func, ModuleGroup & group, AnnotationArgumentList const  & args, AnnotationArgumentList const  & progArgs, das::string & errors, bool & astChanged ) const {
+  __forceinline bool invoke_patch ( Context * __context__, Func __funcCall__, void * self, Function * func, ModuleGroup & group, AnnotationArgumentList & args, AnnotationArgumentList const  & progArgs, das::string & errors, bool & astChanged ) const {
     return das_invoke_function<bool>::invoke
-      <void *,Function *,ModuleGroup &,AnnotationArgumentList const  &,AnnotationArgumentList const  &,das::string &,bool &>
+      <void *,Function *,ModuleGroup &,AnnotationArgumentList &,AnnotationArgumentList const  &,das::string &,bool &>
         (__context__,nullptr,__funcCall__,
           self,func,group,args,progArgs,errors,astChanged);
   }
   __forceinline Func get_fixup ( void * self ) const {
     return getDasClassMethod(self,_das_class_method_offset[__fn_fixup]);
   }
-  __forceinline bool invoke_fixup ( Context * __context__, Func __funcCall__, void * self, Function * func, ModuleGroup & group, AnnotationArgumentList const  & args, AnnotationArgumentList const  & progArgs, das::string & errors ) const {
+  __forceinline bool invoke_fixup ( Context * __context__, Func __funcCall__, void * self, Function * func, ModuleGroup & group, AnnotationArgumentList & args, AnnotationArgumentList const  & progArgs, das::string & errors ) const {
     return das_invoke_function<bool>::invoke
-      <void *,Function *,ModuleGroup &,AnnotationArgumentList const  &,AnnotationArgumentList const  &,das::string &>
+      <void *,Function *,ModuleGroup &,AnnotationArgumentList &,AnnotationArgumentList const  &,das::string &>
         (__context__,nullptr,__funcCall__,
           self,func,group,args,progArgs,errors);
   }
   __forceinline Func get_lint ( void * self ) const {
     return getDasClassMethod(self,_das_class_method_offset[__fn_lint]);
   }
-  __forceinline bool invoke_lint ( Context * __context__, Func __funcCall__, void * self, Function * func, ModuleGroup & group, AnnotationArgumentList const  & args, AnnotationArgumentList const  & progArgs, das::string & errors ) const {
+  __forceinline bool invoke_lint ( Context * __context__, Func __funcCall__, void * self, Function * func, ModuleGroup & group, AnnotationArgumentList & args, AnnotationArgumentList const  & progArgs, das::string & errors ) const {
     return das_invoke_function<bool>::invoke
-      <void *,Function *,ModuleGroup &,AnnotationArgumentList const  &,AnnotationArgumentList const  &,das::string &>
+      <void *,Function *,ModuleGroup &,AnnotationArgumentList &,AnnotationArgumentList const  &,das::string &>
         (__context__,nullptr,__funcCall__,
           self,func,group,args,progArgs,errors);
   }
@@ -168,18 +168,18 @@ public:
   __forceinline Func get_apply ( void * self ) const {
     return getDasClassMethod(self,_das_class_method_offset[__fn_apply]);
   }
-  __forceinline bool invoke_apply ( Context * __context__, Func __funcCall__, void * self, ExprBlock * blk, ModuleGroup & group, AnnotationArgumentList const  & args, das::string & errors ) const {
+  __forceinline bool invoke_apply ( Context * __context__, Func __funcCall__, void * self, ExprBlock * blk, ModuleGroup & group, AnnotationArgumentList & args, das::string & errors ) const {
     return das_invoke_function<bool>::invoke
-      <void *,ExprBlock *,ModuleGroup &,AnnotationArgumentList const  &,das::string &>
+      <void *,ExprBlock *,ModuleGroup &,AnnotationArgumentList &,das::string &>
         (__context__,nullptr,__funcCall__,
           self,blk,group,args,errors);
   }
   __forceinline Func get_finish ( void * self ) const {
     return getDasClassMethod(self,_das_class_method_offset[__fn_finish]);
   }
-  __forceinline bool invoke_finish ( Context * __context__, Func __funcCall__, void * self, ExprBlock * blk, ModuleGroup & group, AnnotationArgumentList const  & args, AnnotationArgumentList const  & progArgs, das::string & errors ) const {
+  __forceinline bool invoke_finish ( Context * __context__, Func __funcCall__, void * self, ExprBlock * blk, ModuleGroup & group, AnnotationArgumentList & args, AnnotationArgumentList const  & progArgs, das::string & errors ) const {
     return das_invoke_function<bool>::invoke
-      <void *,ExprBlock *,ModuleGroup &,AnnotationArgumentList const  &,AnnotationArgumentList const  &,das::string &>
+      <void *,ExprBlock *,ModuleGroup &,AnnotationArgumentList &,AnnotationArgumentList const  &,das::string &>
         (__context__,nullptr,__funcCall__,
           self,blk,group,args,progArgs,errors);
   }
@@ -211,27 +211,27 @@ public:
   __forceinline Func get_apply ( void * self ) const {
     return getDasClassMethod(self,_das_class_method_offset[__fn_apply]);
   }
-  __forceinline bool invoke_apply ( Context * __context__, Func __funcCall__, void * self, Structure * st, ModuleGroup & group, AnnotationArgumentList const  & args, das::string & errors ) const {
+  __forceinline bool invoke_apply ( Context * __context__, Func __funcCall__, void * self, Structure * st, ModuleGroup & group, AnnotationArgumentList & args, das::string & errors ) const {
     return das_invoke_function<bool>::invoke
-      <void *,Structure *,ModuleGroup &,AnnotationArgumentList const  &,das::string &>
+      <void *,Structure *,ModuleGroup &,AnnotationArgumentList &,das::string &>
         (__context__,nullptr,__funcCall__,
           self,st,group,args,errors);
   }
   __forceinline Func get_finish ( void * self ) const {
     return getDasClassMethod(self,_das_class_method_offset[__fn_finish]);
   }
-  __forceinline bool invoke_finish ( Context * __context__, Func __funcCall__, void * self, Structure * st, ModuleGroup & group, AnnotationArgumentList const  & args, das::string & errors ) const {
+  __forceinline bool invoke_finish ( Context * __context__, Func __funcCall__, void * self, Structure * st, ModuleGroup & group, AnnotationArgumentList & args, das::string & errors ) const {
     return das_invoke_function<bool>::invoke
-      <void *,Structure *,ModuleGroup &,AnnotationArgumentList const  &,das::string &>
+      <void *,Structure *,ModuleGroup &,AnnotationArgumentList &,das::string &>
         (__context__,nullptr,__funcCall__,
           self,st,group,args,errors);
   }
   __forceinline Func get_patch ( void * self ) const {
     return getDasClassMethod(self,_das_class_method_offset[__fn_patch]);
   }
-  __forceinline bool invoke_patch ( Context * __context__, Func __funcCall__, void * self, Structure * st, ModuleGroup & group, AnnotationArgumentList const  & args, das::string & errors, bool & astChanged ) const {
+  __forceinline bool invoke_patch ( Context * __context__, Func __funcCall__, void * self, Structure * st, ModuleGroup & group, AnnotationArgumentList & args, das::string & errors, bool & astChanged ) const {
     return das_invoke_function<bool>::invoke
-      <void *,Structure *,ModuleGroup &,AnnotationArgumentList const  &,das::string &,bool &>
+      <void *,Structure *,ModuleGroup &,AnnotationArgumentList &,das::string &,bool &>
         (__context__,nullptr,__funcCall__,
           self,st,group,args,errors,astChanged);
   }
@@ -287,9 +287,9 @@ public:
   __forceinline Func get_apply ( void * self ) const {
     return getDasClassMethod(self,_das_class_method_offset[__fn_apply]);
   }
-  __forceinline bool invoke_apply ( Context * __context__, Func __funcCall__, void * self, Enumeration * st, ModuleGroup & group, AnnotationArgumentList const  & args, das::string & errors ) const {
+  __forceinline bool invoke_apply ( Context * __context__, Func __funcCall__, void * self, Enumeration * st, ModuleGroup & group, AnnotationArgumentList & args, das::string & errors ) const {
     return das_invoke_function<bool>::invoke
-      <void *,Enumeration *,ModuleGroup &,AnnotationArgumentList const  &,das::string &>
+      <void *,Enumeration *,ModuleGroup &,AnnotationArgumentList &,das::string &>
         (__context__,nullptr,__funcCall__,
           self,st,group,args,errors);
   }
@@ -1324,9 +1324,11 @@ protected:
     __fn_visitExprUnsafe = 308,
     __fn_preVisitExprCallMacro = 309,
     __fn_visitExprCallMacro = 310,
+    __fn_canVisitMakeArray = 311,
+    __fn_canVisitMakeArrayIndex = 312,
   };
 protected:
-  int _das_class_method_offset[311];
+  int _das_class_method_offset[313];
 public:
   AstVisitor_Adapter ( const StructInfo * info ) {
       _das_class_method_offset[__fn_preVisitProgram] = info->fields[2]->offset;
@@ -1640,6 +1642,8 @@ public:
       _das_class_method_offset[__fn_visitExprUnsafe] = info->fields[310]->offset;
       _das_class_method_offset[__fn_preVisitExprCallMacro] = info->fields[311]->offset;
       _das_class_method_offset[__fn_visitExprCallMacro] = info->fields[312]->offset;
+      _das_class_method_offset[__fn_canVisitMakeArray] = info->fields[313]->offset;
+      _das_class_method_offset[__fn_canVisitMakeArrayIndex] = info->fields[314]->offset;
   }
   __forceinline Func get_preVisitProgram ( void * self ) const {
     return getDasClassMethod(self,_das_class_method_offset[__fn_preVisitProgram]);
@@ -4439,6 +4443,24 @@ public:
       <void *,ExprCallMacro * const >
         (__context__,nullptr,__funcCall__,
           self,expr);
+  }
+  __forceinline Func get_canVisitMakeArray ( void * self ) const {
+    return getDasClassMethod(self,_das_class_method_offset[__fn_canVisitMakeArray]);
+  }
+  __forceinline bool invoke_canVisitMakeArray ( Context * __context__, Func __funcCall__, void * self, ExprMakeArray * const  expr ) const {
+    return das_invoke_function<bool>::invoke
+      <void *,ExprMakeArray * const >
+        (__context__,nullptr,__funcCall__,
+          self,expr);
+  }
+  __forceinline Func get_canVisitMakeArrayIndex ( void * self ) const {
+    return getDasClassMethod(self,_das_class_method_offset[__fn_canVisitMakeArrayIndex]);
+  }
+  __forceinline bool invoke_canVisitMakeArrayIndex ( Context * __context__, Func __funcCall__, void * self, ExprMakeArray * const  expr, int32_t index, Expression * const  init, bool last ) const {
+    return das_invoke_function<bool>::invoke
+      <void *,ExprMakeArray * const ,int32_t,Expression * const ,bool>
+        (__context__,nullptr,__funcCall__,
+          self,expr,index,init,last);
   }
 };
 

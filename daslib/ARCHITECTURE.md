@@ -3,12 +3,13 @@
 Design rationale a maintainer cannot recover from the code alone. One numbered section per
 module; entries are anchored to symbols.
 
-Four companions carry a concern each; a section number is unique across all five files.
+Five companions carry a concern each; a section number is unique across all six files.
 
 - `ARCHITECTURE_LINT.md` - sec. 1-4: perf_lint, lint_config, lint, style_lint.
 - `ARCHITECTURE_EMIT.md` - sec. 5-7, 28-29: aot_cpp, aot_standalone, flatten, the shader rails.
 - `ARCHITECTURE_CAPI.md` - sec. 30: c_api_header, the C surface both backends emit.
 - `ARCHITECTURE_LINQ.md` - sec. 11-17, 33, 37: the linq family, sql_linq, sql_migrate.
+- `ARCHITECTURE_CURSOR.md` - sec. 40: ast_cursor, the cursor module the LSP and MCP navigation tools share.
 
 ## 8. ast_verify
 
@@ -271,3 +272,24 @@ Four companions carry a concern each; a section number is unique across all five
   fails when one side moves alone: the tests name an `[export]`ed function, so a narrower or wider
   C++ root set passes them. The module itself is not the caller's dependency (`src/ast/ARCHITECTURE.md`
   sec.3): its macro context is the caller's only handle on it.
+
+## 39. ast
+
+- **Every `[macro_interface]` hook's `args` in `ast.das` is `var` because its C++ twin takes
+  `AnnotationArgumentList &`: `FunctionAnnotation`, `StructureAnnotation` and
+  `EnumerationAnnotation` in `include/daScript/ast/ast.h` (repo root) hand the adapters in
+  `src/builtin/module_builtin_ast_adapters.cpp` the declaration's own `arguments`, and
+  `include/daScript/builtin/ast_gen.inc` - regenerated from `ast.das` by
+  `utils/internal/dasgen/gen_bind.das` - carries the same reference type.** Nothing fails when
+  one side moves alone: an override compiles under either constness and the adapter resolves a
+  hook by field name, so a C++ side back on `const` leaves daslang writing through a const
+  reference with every suite green. `progArgs` (the program's `options`), `simulate` and the
+  `aot*` hooks stay const on both sides.
+
+## 40. Package release symbols {#package-release-symbols}
+
+`daspkg.das:release_include_symbols` sets `ReleaseSpec.include_symbols`.
+`utils/daspkg/commands.das` consumes that field: the native release copies Windows
+PDBs, while `cmd_release_wasm` passes it to `release_one_wasm_app` to retain DWARF,
+logical frames and the emcc symbol map. The manifest contract and these release
+implementations describe the same option.

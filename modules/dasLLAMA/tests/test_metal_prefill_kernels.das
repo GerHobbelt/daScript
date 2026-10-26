@@ -8,6 +8,7 @@ require dastest/testing_boost public
 require daslib/math_bits           // float<->uint bits — the moe_wscale sel-buffer pun
 require dasllama/dasllama_math
 require dasllama/dasllama_convert  // used only inside the Apple static_if half; off-Apple lint sees the branch compiled out
+require dasllama/dasllama_gemm_schema  // kq_qsb — the ONE per-format quant-plane stride source
 require ?das_metal dasllama/dasllama_metal_prefill  // the Phase-6 prefill kernel set (Apple builds)
 require ?das_metal dasllama/dasllama_metal_kernels  // the Wave C MoE routing kernel set (Apple builds)
 require ?das_metal metal/das_metal_boost  // device/pipeline/buffer plumbing + the leak gate
@@ -436,7 +437,7 @@ def private attn_trio_span_gate(t : T?; dev, queue; head_size, n_heads, n_kv_hea
 }
 
 // ===== the tower flash (the dk72 lifted flash + its per-head-contiguous f16 K/V restride) =====
-[arch(at="../ARCHITECTURE_GPU.md#tower-attn-routes")]
+[arch(at="../ARCHITECTURE_GPU_TOWER.md#tower-attn-routes")]
 def private tower_flash_kvhc_gate(t : T?; dev, queue) {
     let tag = "tower_flash"
     var err : string
@@ -599,7 +600,7 @@ def private tower_flash_kvhc_gate(t : T?; dev, queue) {
 }
 
 // ===== the qwen2.5 ViT per-window attention (block-diagonal, ragged last window) =====
-[arch(at="../ARCHITECTURE_GPU.md#tower-attn-routes")]
+[arch(at="../ARCHITECTURE_GPU_TOWER.md#tower-attn-routes")]
 def private tower_win_gate(t : T?; dev, queue) {
     let tag = "tower_win"
     var err : string
@@ -1434,7 +1435,9 @@ def test_metal_prefill_kernels(t : T?) {
                 // the proven site GEMVs') — their numeric coverage rides the fam-qwen3moe row.
                 moe_select_gate(t, dev, queue, 128, 8, 1, true)    // the qwen3moe shape + exact ties
                 moe_select_gate(t, dev, queue, 60, 4, 1, false)    // ne not a lane multiple — pad lanes
-                moe_select_gate(t, dev, queue, 256, 16, 1, false)  // the serve gate's caps
+                moe_select_gate(t, dev, queue, 256, 16, 1, false)  // the 8-deep stamp's cap
+                moe_select_gate(t, dev, queue, 512, 10, 1, false)  // the 16-deep stamp: the Coder-Next shape and the serve gate's cap
+                moe_select_gate(t, dev, queue, 300, 8, 2, true)    // past 256 with pad lanes and exact ties, two stream rows
                 moe_select_gate(t, dev, queue, 128, 8, 3, false)   // batch: one stream row per tg
                 moe_select_gate(t, dev, queue, 32, 4, 1, false, 1)  // gpt-oss softmax_weight mode
                 moe_router_gate(t, dev, queue, 64, 128)
@@ -1485,6 +1488,11 @@ def test_metal_prefill_kernels(t : T?) {
 
                 // ===== prefill misc (PLE pre-step, bias epilogue, MTP cat, deltanet ba) =====
                 ple_gather_q8_gate(t, dev, queue, 11, 3, 32, 5)
+                // the kq table twins: 300 superblocks of table past a non-zero base, one row per
+                // token = 3 superblocks, so every arm walks the row-stride and sub-block math
+                ple_gather_kq_gate(t, dev, queue, 4, 100, 3, 256, 5, 7)
+                ple_gather_kq_gate(t, dev, queue, 5, 100, 3, 256, 5, 7)
+                ple_gather_kq_gate(t, dev, queue, 40, 100, 3, 256, 5, 7)
                 ple_finish_gate(t, dev, queue, 3, 64, 5)
                 add_bias_rows_gate(t, dev, queue, 7, 96)
                 pf_cat2_gate(t, dev, queue, 5, 48)
@@ -1831,7 +1839,7 @@ def private moe_csr_gate(t : T?; dev, queue; npos, ne, nk : int) {
     var cntw : array<uint>
     var basew : array<uint>
     cntw |> resize(ne)
-    basew |> resize(ne)
+    basew |> resize(ne + 1)   // [ne] = the padded total the extra threadgroup publishes
     for (e in range(ne)) {
         var n = 0u
         for (tt in range(total)) {
@@ -1846,6 +1854,7 @@ def private moe_csr_gate(t : T?; dev, queue; npos, ne, nk : int) {
         basew[e] = uint(pad)
         pad += (int(cntw[e]) + 31) / 32 * 32
     }
+    basew[ne] = uint(pad)
     var bktw : array<uint>
     var invw : array<uint>
     bktw |> resize(pad)
@@ -1865,7 +1874,7 @@ def private moe_csr_gate(t : T?; dev, queue; npos, ne, nk : int) {
     }
     var bsel = buf_upload(dev, sel)
     var bcnt = buf_fill(dev, ne, 0xFFFFFFFF)
-    var bbase = buf_fill(dev, ne, 0xFFFFFFFF)
+    var bbase = buf_fill(dev, ne + 1, 0xFFFFFFFF)
     var bbkt = buf_fill(dev, pad, 0xEEEEEEEE)
     var binv = buf_fill(dev, total, 0xFFFFFFFF)
     var btot = buf_u32(dev, uint(total))
@@ -1887,7 +1896,7 @@ def private moe_csr_gate(t : T?; dev, queue; npos, ne, nk : int) {
         metal_set_buffer(enc, bnk, 0ul, 5)
         metal_set_buffer(enc, bcnt, 0ul, 6)
         metal_set_buffer(enc, bne, 0ul, 7)
-        metal_dispatch_threadgroups(enc, uint3(uint(ne), 1u, 1u), uint3(32u, 1u, 1u))
+        metal_dispatch_threadgroups(enc, uint3(uint(ne + 1), 1u, 1u), uint3(32u, 1u, 1u))   // + the total's threadgroup
     }
     t |> success(ran, "{tag}: encode: {err}")
     if (ran) {
@@ -2144,6 +2153,88 @@ def private ple_gather_q8_gate(t : T?; dev, queue; vocab, nlayers, ple, npos : i
     delete blob
     delete wdeq
     delete tok
+    delete want
+}
+
+// PLE stage 1, the kq twins (MetalPleGatherK4/K5/Q40): the same token-row gather and the same
+// layer-major output, decoding the table off its format's native planes bound at the table's
+// own superblock base (sb0) — the production shape, where kq_quants_of/kq_scales_of offset the
+// binds by the table's element offset. Truth is kq_row_ref, the same per-superblock dequant
+// ple_gather_row runs, scaled by sqrt(ple). The fixture's scales are pow2/quarter and its
+// quants are 4-/5-bit ints, so every product and difference is exact in fp32 on both sides.
+def private ple_gather_kq_gate(t : T?; dev, queue; fmt, vocab, nlayers, ple, npos, sb0 : int) {
+    let tag = "ple_gather_kq f={fmt} v={vocab} nl={nlayers} ple={ple} np={npos} sb0={sb0}"
+    var err : string
+    var pso = (fmt == 4
+        ? pipeline_from_source(dev, MetalPleGatherK4_metal_ple_gather_kq_msl, MetalPleGatherK4_metal_ple_gather_kq_msl_entry, MetalPleGatherK4_metal_ple_gather_kq_msl_fastmath, err)
+        : (fmt == 5
+            ? pipeline_from_source(dev, MetalPleGatherK5_metal_ple_gather_kq_msl, MetalPleGatherK5_metal_ple_gather_kq_msl_entry, MetalPleGatherK5_metal_ple_gather_kq_msl_fastmath, err)
+            : pipeline_from_source(dev, MetalPleGatherQ40_metal_ple_gather_kq_msl, MetalPleGatherQ40_metal_ple_gather_kq_msl_entry, MetalPleGatherQ40_metal_ple_gather_kq_msl_fastmath, err)))
+    t |> success(pso != null, "{tag}: pipeline: {err}")
+    return if (pso == null)
+    let rowlen = nlayers * ple
+    let rowsb = rowlen / 256          // superblocks per token row - the gate's `all % 256` clause
+    let nsb = sb0 + vocab * rowsb
+    var kq : array<uint8>
+    var ks : array<uint8>
+    kq_fill_planes(fmt, nsb, kq, ks)
+    var tok : array<uint>
+    tok |> resize(npos)
+    for (p in range(npos)) {
+        tok[p] = uint((p * 23 + 5) % vocab)
+    }
+    let sc0 = sqrt(float(ple))
+    var wrow : array<float>
+    var want : array<float>
+    wrow |> resize(rowlen)
+    want |> resize(nlayers * npos * ple)
+    for (p in range(npos)) {
+        kq_row_ref(fmt, sb0 + int(tok[p]) * rowsb, rowsb, nsb, kq, ks, wrow)
+        for (l in range(nlayers)) {
+            for (i in range(ple)) {
+                want[(l * npos + p) * ple + i] = wrow[l * ple + i] * sc0
+            }
+        }
+    }
+    var ka = PleArgs(npos = uint(npos), ple = uint(ple), nlayers = uint(nlayers), sc0 = sc0,
+        inv_sd = 1.0, eps = 1.0e-6, inv_s2 = 1.0)
+    var bkq = buf_upload(dev, kq)
+    var bks = buf_upload(dev, ks)
+    var btok = buf_upload(dev, tok)
+    var by = buf_fill(dev, nlayers * npos * ple, -1000.0)
+    let soff = uint64(sb0 * 16)
+    let qoff = uint64(int64(sb0) * kq_qsb(fmt))
+    let ran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
+        metal_set_pipeline(enc, pso)
+        metal_set_buffer(enc, bks, soff, 0)
+        if (fmt != 40) {
+            metal_set_buffer(enc, bks, soff, 1)   // the uint4 view of the same 16B block - `@template_gate = "!Q40"` drops it on q40
+        }
+        metal_set_buffer(enc, btok, 0ul, 2)
+        metal_set_buffer(enc, by, 0ul, 3)
+        metal_set_bytes(enc, unsafe(addr<void?>(ka)), uint64(typeinfo sizeof(ka)), 4)
+        metal_set_buffer(enc, bkq, qoff, 6)
+        metal_dispatch_threadgroups(enc, uint3(uint(nlayers), uint(npos), 1u), uint3(uint(ple), 1u, 1u))
+    }
+    t |> success(ran, "{tag}: encode: {err}")
+    if (ran) {
+        t |> equal(buf_mismatch_approx(by, want), 0, "{tag}: gather vs kq_row_ref")
+        // the control: the same compare must RED on a poisoned expectation - an added
+        // abs(want[0])*0.1 + 1.0, past buf_mismatch_approx's 1e-4*max(1, |v|) band at any magnitude
+        var wantp := want
+        wantp[0] += abs(want[0]) * 0.1 + 1.0
+        t |> success(buf_mismatch_approx(by, wantp) != 0, "{tag}: poison control reds")
+        delete wantp
+    }
+    metal_release(bkq)
+    metal_release(bks)
+    metal_release(btok)
+    metal_release(by)
+    metal_release(pso)
+    delete kq
+    delete ks
+    delete tok
+    delete wrow
     delete want
 }
 
@@ -2536,13 +2627,36 @@ def private mulmm_gate(t : T?; dev, queue; k, d, m : int) {
 
 // ===== MoE routing kernel gates (Wave C) =====
 
+//! the select buffer against one expectation pair - winner ids exact, weights within `approx`;
+//! the gate runs it twice, once on the reference and once on the poisoned control expectation
+def private moe_select_bad(bsel; widx : array<uint>; ww : array<float>; nst, k : int) : tuple<idx : int; w : int> {
+    var bidx = 0
+    var bw = 0
+    unsafe {
+        var pi = reinterpret<uint?>(metal_buffer_contents(bsel))
+        var pw = reinterpret<float?>(metal_buffer_contents(bsel))
+        for (s in range(nst)) {
+            for (j in range(k)) {
+                bidx += pi[s * 2 * k + j] != widx[s * k + j] ? 1 : 0
+                bw += approx(pw[s * 2 * k + k + j], ww[s * k + j]) ? 0 : 1
+            }
+        }
+    }
+    return (idx = bidx, w = bw)
+}
+
 // The select kernel vs an in-test moe_select_core mirror (softmax + top-k + norm_topk renorm),
 // one stream row per threadgroup ([k idx u32][k w f32] per row). idx must match EXACTLY — ties
 // are exact-equal logits, so both sides agree by the lowest-index rule; w compares within the
 // shared fp tolerance (hardware exp vs the CPU's exp).
 def private moe_select_gate(t : T?; dev, queue; ne, k, nst : int; ties : bool; gmode : int = 0) {
     var err : string
-    var pso = pipeline_from_source(dev, metal_moe_select_msl, metal_moe_select_msl_entry, metal_moe_select_msl_fastmath, err)
+    var pso : MetalComputePipeline?
+    if (ne > 256) {
+        pso = pipeline_from_source(dev, MetalMoeSelect512_metal_moe_select_msl, MetalMoeSelect512_metal_moe_select_msl_entry, MetalMoeSelect512_metal_moe_select_msl_fastmath, err)
+    } else {
+        pso = pipeline_from_source(dev, MetalMoeSelect_metal_moe_select_msl, MetalMoeSelect_metal_moe_select_msl_entry, MetalMoeSelect_metal_moe_select_msl_fastmath, err)
+    }
     t |> success(pso != null, "moe select pipeline: {err}")
     if (pso == null) {
         return
@@ -2632,24 +2746,20 @@ def private moe_select_gate(t : T?; dev, queue; ne, k, nst : int; ties : bool; g
         metal_dispatch_threadgroups(enc, uint3(uint(nst), 1u, 1u), uint3(32u, 1u, 1u))
     }
     t |> success(ran, "moe select dispatch ne={ne} k={k} nst={nst}: {err}")
-    var badidx = 0
-    var badw = 0
-    unsafe {
-        var pi = reinterpret<uint?>(metal_buffer_contents(bsel))
-        var pw = reinterpret<float?>(metal_buffer_contents(bsel))
-        for (s in range(nst)) {
-            for (j in range(k)) {
-                if (pi[s * 2 * k + j] != widx[s * k + j]) {
-                    badidx++
-                }
-                if (!approx(pw[s * 2 * k + k + j], ww[s * k + j])) {
-                    badw++
-                }
-            }
-        }
-    }
-    t |> equal(badidx, 0)
-    t |> equal(badw, 0)
+    let bad = moe_select_bad(bsel, widx, ww, nst, k)
+    t |> equal(bad.idx, 0)
+    t |> equal(bad.w, 0)
+    // the control: the same compares must RED on a poisoned expectation - the first winner moved
+    // to its neighbour id (no id can satisfy both) and its weight off by an added 1.0 + a tenth of
+    // itself, past any band `approx` admits on a renormalized weight
+    var pidx := widx
+    var pww := ww
+    pidx[0] = (pidx[0] + 1u) % uint(ne)
+    pww[0] += abs(ww[0]) * 0.1 + 1.0
+    let badp = moe_select_bad(bsel, pidx, pww, nst, k)
+    t |> success(badp.idx + badp.w > 0, "moe select ne={ne} k={k}: poison control reds")
+    delete pidx
+    delete pww
     metal_release(blg)
     metal_release(bsel)
     metal_release(bne)

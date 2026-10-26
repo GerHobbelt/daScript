@@ -138,3 +138,41 @@ def good_safe_as_on_value_variant() : void {
 def good_safe_index_of_scalar_pointer(p : float?; i : int64) : float {
     return unsafe(p?[i]) ?? -1.0
 }
+
+struct private Node {
+    a : int
+}
+
+def good_unsafe_block_delete_pointer() : void {
+    var p = new Node(a = 1)
+    unsafe {
+        delete p
+    }
+}
+
+def good_unsafe_block_delete_container() : void {
+    var arr : array<int>
+    arr |> push(1)
+    unsafe {
+        delete arr
+    }
+}
+
+// --- Regression: a reference bound to a non-local expression requires unsafe ---
+// `var r & = g_rack.items[i]` binds a local reference into storage a global pointer owns
+// (ast_infer_type.cpp's isLocalOrGlobal check), so a block whose only unsafe need is that
+// binding is NOT redundant: the compiler refuses the binding outside `unsafe`. STYLE024 must
+// NOT fire (the block frame carries the let-ref mark without an unsafe-op count).
+
+struct private Rack {
+    items : array<int>
+}
+
+var private g_rack : Rack?
+
+def good_block_binds_non_local_ref(i : int) : void {
+    unsafe {
+        var r & = g_rack.items[i]
+        r += 1
+    }
+}

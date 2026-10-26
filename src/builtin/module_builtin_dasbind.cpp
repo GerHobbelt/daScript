@@ -33,7 +33,7 @@
 #else
 #define DAS_ARM64_CALL_SYMBOL "das_arm64_call"
 #endif
-// src/builtin/ARCHITECTURE.md sec.3
+// src/builtin/ARCHITECTURE.md#interpreter-extern-call
 __asm__(
     ".text\n"
     ".p2align 2\n"
@@ -77,7 +77,7 @@ namespace das {
 
 #if DAS_BIND_EXTERNAL
 
-#ifdef _MSC_VER
+#ifdef _WIN32
     typedef uint64_t ( __stdcall * StdCallFunction )( ... );
     typedef uint64_t ( __cdecl * CdeclCallFunction )( ... );
     typedef uint64_t ( __stdcall * OpenglCallFunction )( ... );
@@ -155,7 +155,7 @@ namespace das {
     #define AX(i)   (*(uint64_t *)(args+(i)))
     #define AD(i)   (*(double *)(args+(i)))
 
-#ifdef _MSC_VER
+#ifdef _WIN32
 #include "win_x86_64_wrapper.inc"
 #else
 #include "systemV_64_wrapper.inc"
@@ -175,7 +175,7 @@ FastCallWrapper getExtraWrapper ( int nargs, int res, int perm ) {
     #undef  AX
     #undef  AD
 
-    // src/builtin/ARCHITECTURE.md sec.3
+    // src/builtin/ARCHITECTURE.md#interpreter-extern-call
     struct Arm64Layout {
         struct Slot { uint8_t argIndex, bytes; uint16_t offset; };
         uint8_t gprArg[8] = {}, fprArg[8] = {};
@@ -277,6 +277,14 @@ FastCallWrapper getExtraWrapper ( int nargs, int res, int perm ) {
     das_hash_map<string,void *>    g_dasBindLib;
     mutex                          g_dasBindLibMutex;
 
+#if defined(_WIN32)
+    #define DAS_SHARED_LIBRARY_EXTENSION ".dll"
+#elif defined(__APPLE__)
+    #define DAS_SHARED_LIBRARY_EXTENSION ".dylib"
+#else
+    #define DAS_SHARED_LIBRARY_EXTENSION ".so"
+#endif
+
     enum class ApiType {
         api_unknown,
         api_cdecl,
@@ -316,37 +324,50 @@ FastCallWrapper getExtraWrapper ( int nargs, int res, int perm ) {
         return paths;
     }
 
+    static void * searchDynamicLibrary ( const string & library ) {
+        void * libhandle = getLibraryHandle(library.c_str());
+        if ( !libhandle ) {
+            libhandle = loadDynamicLibrary(library.c_str());
+            if (!libhandle) {
+                if ( *daScriptEnvironment::bound && (*daScriptEnvironment::bound)->g_Program ) {
+                    for ( auto & root : (*daScriptEnvironment::bound)->g_Program->policies.dll_search_paths ) {
+                        libhandle = loadDynamicLibrary((root + "/" + library).c_str());
+                        if ( libhandle ) break;
+                    }
+                    /* // we figure this out later
+                    if ( !libhandle ) {
+                        libhandle = loadDynamicLibrary(((*daScriptEnvironment::bound)->g_Program->policies.jit_path_to_shared_lib + "/" + library).c_str());
+                    }
+                    */
+                }
+                if ( !libhandle ) {
+                    for ( auto & root : dasDllSearchPathsFromEnv() ) {
+                        libhandle = loadDynamicLibrary((root + "/" + library).c_str());
+                        if ( libhandle ) break;
+                    }
+                }
+                if ( !libhandle ) {
+                    libhandle = loadDynamicLibrary((getDasRoot() + "/lib/" + library).c_str());
+                }
+            }
+        }
+        return libhandle;
+    }
+
     static void * bindDynamicLibrary ( const string & library ) {
         lock_guard<mutex> guard(g_dasBindLibMutex);
         auto it = g_dasBindLib.find(library);
         if ( it!=g_dasBindLib.end() ) {
             return it->second;
         } else {
-            void * libhandle = nullptr;
-            libhandle = getLibraryHandle(library.c_str());
+            void * libhandle = searchDynamicLibrary(library);
             if ( !libhandle ) {
-                libhandle = loadDynamicLibrary(library.c_str());
-                if (!libhandle) {
-                    if ( *daScriptEnvironment::bound && (*daScriptEnvironment::bound)->g_Program ) {
-                        for ( auto & root : (*daScriptEnvironment::bound)->g_Program->policies.dll_search_paths ) {
-                            libhandle = loadDynamicLibrary((root + "/" + library).c_str());
-                            if ( libhandle ) break;
-                        }
-                        /* // we figure this out later
-                        if ( !libhandle ) {
-                            libhandle = loadDynamicLibrary(((*daScriptEnvironment::bound)->g_Program->policies.jit_path_to_shared_lib + "/" + library).c_str());
-                        }
-                        */
-                    }
-                    if ( !libhandle ) {
-                        for ( auto & root : dasDllSearchPathsFromEnv() ) {
-                            libhandle = loadDynamicLibrary((root + "/" + library).c_str());
-                            if ( libhandle ) break;
-                        }
-                    }
-                    if ( !libhandle ) {
-                        libhandle = loadDynamicLibrary((getDasRoot() + "/lib/" + library).c_str());
-                    }
+                // an [extern] may name its library without one, so every platform can spell the
+                // same binding: add this one's extension and walk the same search again
+                string ext = DAS_SHARED_LIBRARY_EXTENSION;
+                if ( library.length()<ext.length() ||
+                     library.compare(library.length()-ext.length(), ext.length(), ext)!=0 ) {
+                    libhandle = searchDynamicLibrary(library + ext);
                 }
             }
             g_dasBindLib[library] = libhandle;
@@ -390,7 +411,7 @@ FastCallWrapper getExtraWrapper ( int nargs, int res, int perm ) {
                 }
             });
             if ( !crash_and_burn.empty() ) {
-                char message[8192];   // src/builtin/ARCHITECTURE.md sec.4
+                char message[8192];   // src/builtin/ARCHITECTURE.md#message-crosses-panic-jump
                 snprintf(message, sizeof(message), "%s", crash_and_burn.c_str());
                 string().swap(crash_and_burn);
                 context.throw_error_at(debugInfo, "%s", message);
@@ -495,7 +516,7 @@ FastCallWrapper getExtraWrapper ( int nargs, int res, int perm ) {
             } else if ( arg.name=="late" ) {
                 result.late = true;
             }
-#ifdef _MSC_VER
+#ifdef _WIN32
             else if ( arg.name=="windows_library" && arg.type==Type::tString ) {
                 platform_library = arg.sValue;
             }
@@ -524,7 +545,7 @@ FastCallWrapper getExtraWrapper ( int nargs, int res, int perm ) {
     }
 
     FastCallWrapper computeWrapper ( Function * fun ) {
-#ifdef _MSC_VER
+#ifdef _WIN32
         return getWrapper(fun, 4);
 #else
         if ( fun->arguments.size()>6 ) {
@@ -548,18 +569,18 @@ FastCallWrapper getExtraWrapper ( int nargs, int res, int perm ) {
 
     struct ExternFunctionAnnotation : FunctionAnnotation {
         ExternFunctionAnnotation() : FunctionAnnotation("extern") { }
-        virtual bool apply(ExprBlock *, ModuleGroup &, const AnnotationArgumentList &, string & err) override {
+        virtual bool apply(ExprBlock *, ModuleGroup &, AnnotationArgumentList &, string & err) override {
             err = "not supported for block";
             return false;
         }
-        virtual bool finalize ( const FunctionPtr &, ModuleGroup &, const AnnotationArgumentList &, const AnnotationArgumentList &, string & ) override {
+        virtual bool finalize ( const FunctionPtr &, ModuleGroup &, AnnotationArgumentList &, const AnnotationArgumentList &, string & ) override {
             return true;
         }
-        virtual bool finalize(ExprBlock *, ModuleGroup &,const AnnotationArgumentList &, const AnnotationArgumentList &, string &) override {
+        virtual bool finalize(ExprBlock *, ModuleGroup &, AnnotationArgumentList &, const AnnotationArgumentList &, string &) override {
             return true;
         }
 #if !DAS_BIND_EXTERNAL
-        virtual bool apply ( const FunctionPtr &, ModuleGroup &, const AnnotationArgumentList &, string & err )  override {
+        virtual bool apply ( const FunctionPtr &, ModuleGroup &, AnnotationArgumentList &, string & err )  override {
             err = "daslang is configured with extern functions disabled";
             return false;
         }
@@ -581,7 +602,7 @@ FastCallWrapper getExtraWrapper ( int nargs, int res, int perm ) {
                 err = "function returns vector type, which is currently not supported by the specified binding";
                 return false;
             }
-#ifndef _MSC_VER
+#ifndef _WIN32
             if ( fun->arguments.size()>6 && !DAS_BIND_ARM64_LAYOUT ) {
                 int perm=0;
                 int nargs = int(fun->arguments.size());
@@ -610,7 +631,7 @@ FastCallWrapper getExtraWrapper ( int nargs, int res, int perm ) {
             return true;
         }
 
-        virtual bool apply ( const FunctionPtr & fun, ModuleGroup &, const AnnotationArgumentList & args, string & err )  override {
+        virtual bool apply ( const FunctionPtr & fun, ModuleGroup &, AnnotationArgumentList & args, string & err )  override {
             if (!verifyCallCorrect(fun, args, err)) {
                 return false;
             }

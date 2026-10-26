@@ -23,8 +23,10 @@ The anatomy mirrors `utils/internal/dasweb-playground`.
 
 ### 1.1 Routes
 
-Public (proxied by `caddy.snippet`): `GET /api/versions`, `GET /api/runs[?version=N]`,
-`GET /api/submission/:id` (the verbatim receipt), `GET /api/sidecars[?version=N]` (the
+Public (proxied by `caddy.snippet`): `GET /api/versions`, `GET /api/runs[?version=N]` (the
+board: every run's filter columns plus its `pp512`/`tg128` cells and `cpu` label, so a page
+paints and pairs from this one response), `GET /api/submission/:id` (the verbatim receipt,
+fetched only for a receipt a visitor opens), `GET /api/sidecars[?version=N]` (the
 browse listing; absent/0 version = all), `GET /api/sidecars?version=N&box=<encoded>` (the
 lookup ladder - a `box` switches modes and then version is required), `GET /api/sidecar/:sha`
 (download), `POST /api/submit/records`, `POST /api/submit/sidecar`. Loopback-only:
@@ -46,8 +48,10 @@ Three tables, one migration stream (`ladder_migration_*`):
 - `submissions` - one row per accepted upload, the document kept **verbatim** (`Doc`),
   content-hashed (`DocSha`, unique - byte-identical resubmits dedup). Kinds: `records`,
   `sidecar`, `official`.
-- `runs` - one row per BenchRun, flat columns for filtering; the truth stays in the
-  submission `Doc` at (`ModelIdx`, `RunIdx`). Identity per `modules/dasLLAMA/METHODOLOGY.md`
+- `runs` - one row per BenchRun: flat columns for filtering plus the `Pp512`/`Tg128` cells
+  and the `Cpu` label the board paints from; the truth stays in the submission `Doc` at
+  (`ModelIdx`, `RunIdx`); the three cell columns hold `run_cells` of that node, and migration 2
+  fills them for rows older than the columns. Identity per `modules/dasLLAMA/METHODOLOGY.md`
   is (`Gguf`, `Box`, `Engine`, `Backend`, `Flavor`, `Workload`); official imports replace on
   it, community rows append.
 - `sidecars` - content-addressed by the document's own sha256; identity columns come from
@@ -108,6 +112,15 @@ sudo dasllama-deploy.sh provision                                  # user, dirs,
 sudo dasllama-deploy.sh install $SHA /tmp/dasllama-ladder-$SHA.tar.gz
 sudo dasllama-deploy.sh caddy                                      # splice /api into the dasllama.io vhost, validate, reload
 ```
+
+`caddy` also carries the `header /examples/*` block: the browser examples served there are
+`-pthread` builds whose Web Workers share memory through `SharedArrayBuffer`, which a browser
+grants only to a cross-origin-isolated page - one whose responses carry
+`Cross-Origin-Opener-Policy same-origin` and `Cross-Origin-Embedder-Policy require-corp`. The
+COEP value is `require-corp` because Safari implements no other; under it the page's only
+cross-origin subresource, the analytics script, loads with `crossorigin`. A later `caddy` run
+replaces the deployed block when the snippet's text differs, so a header value changed in the
+snippet reaches the box.
 
 The unit `provision` writes is **sandboxed** (`ProtectSystem=strict`, all capabilities dropped,
 loopback-only, `ReadWritePaths` limited to the data dir + release tree) - it contains a

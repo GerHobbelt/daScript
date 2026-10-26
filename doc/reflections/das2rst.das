@@ -113,6 +113,7 @@ require daslib/remove_call_args
 require daslib/stringify
 require peg/peg
 require gltf/gltf_boost
+require gltf/gltf_processed
 require daslib/temp_strings
 require daslib/type_traits
 require daslib/typemacro_boost
@@ -130,6 +131,7 @@ require openai/openai_vision
 require pugixml/PUGIXML_boost
 require stbimage/stbimage_boost
 require stbimage/stbimage_ttf
+require meshoptimizer
 require audio/audio_boost
 require audio/audio_wav
 require audio/audio_record
@@ -157,7 +159,7 @@ def document_module_math(_root : string) {
         group_by_regex("Horizontal reduce (float2, float3, float4)", mod, %regex~(hmin|hmax|hadd)$%%),
         group_by_regex("all numerics (uint*, int*, float*, double)", mod, %regex~(min|max)$%%),
         group_by_regex("float* and double", mod, %regex~(sign|abs|acos|asin|safe_acos|safe_asin|atan|atan2|cos|sin|tan|sinh|cosh|tanh|asinh|acosh|atanh|exp|log|exp2|expm1|log2|log10|log1p|pow|sqrt|cbrt|hypot|fmod|remainder|trunc|rcp|ceil|floor|abs|saturate|sincos|is_finite|is_nan|radians|degrees|step|smoothstep)$%%),
-        group_by_regex("float* only", mod, %regex~(atan_est|atan2_est|rcp_est|exp_std|exp_est|ceili|floori|roundi|trunci|round|rsqrt|rsqrt_est|fract|\-)$%%),
+        group_by_regex("float* only", mod, %regex~(atan_est|atan2_est|rcp_est|pow_est|exp_std|exp_est|ceili|floori|roundi|trunci|round|rsqrt|rsqrt_est|fract|\-)$%%),
         group_by_regex("float3 only", mod, %regex~(cross|reflect|refract|distance|distance_sq|
 inv_distance|inv_distance_sq)$%%),
         group_by_regex("float2, float3, float4", mod, %regex~(length|length_sq|inv_length|inv_length_sq|
@@ -336,7 +338,7 @@ def document_module_dasllama(_root : string) {
         group_by_regex("Chat", mod, %regex~(create_chat|create_chat_renderer|add_user|add_user_audio|add_user_image|add_user_image_rows|add_assistant|render_turn|render_turn_image|render_turn_audio|render_assistant|render_close|respond|set_thinking)$%%),
         group_by_regex("Tool calling", mod, %regex~(set_tools|add_tool_results|render_assistant_calls|parse_calls)$%%),
         group_by_regex("Reasoning (thinking models)", mod, %regex~(split_reasoning|make_think_stream|think_feed|think_finish|think_drain|effective_stop_ids)$%%),
-        group_by_regex("Operations: prepared images and dispatch", mod, %regex~(dlim_inventory|dlim_clean|set_dispatch_worker_limit|get_dispatch_worker_limit|set_jobque_spin_us|get_jobque_spin_us|select_matmul_backend_for_load|kernel_backend_available)$%%),
+        group_by_regex("Operations: prepared images and dispatch", mod, %regex~(dlim_inventory|dlim_clean|set_dispatch_worker_limit|get_dispatch_worker_limit|set_jobque_spin_us|get_jobque_spin_us|set_single_thread|get_single_thread|select_matmul_backend_for_load|kernel_backend_available)$%%),
         group_by_regex("Operations: GPU tier and model slots", mod, %regex~(gpu_tier_status|set_gpu_tier_want|moe_gpu_tier_arm|moe_gpu_weight_budget|gpu_model_marks_init|gpu_slot_capture|gpu_slot_rearm|moe_gpu_model_marks_save|moe_gpu_model_marks_restore|moe_gpu_hydrate_session|moe_gpu_drop_model|set_resident_prefill_allowed)$%%)
     )
     var hook = DocsHook()
@@ -967,8 +969,10 @@ def document_module_ast_block_to_loop(_root : string) {
 def document_module_ast_cursor(_root : string) {
     var mod = find_module("ast_cursor")
     var groups <- array<DocGroup>(
-        group_by_regex("Cursor queries", mod, %regex~.*(find_at_cursor|find_at_cursor_in_function|cursor_inside)$%%),
-        group_by_regex("Result inspection", mod, %regex~.*(describe)$%%)
+        group_by_regex("Cursor queries", mod, %regex~.*(find_at_cursor|find_at_cursor_in_function|cursor_inside|find_declaration_at_cursor|declaration_of|typedef_named)$%%),
+        group_by_regex("Source text", mod, %regex~.*(word_at|name_column|declared_name_column|spells_name|source_name|bare_name)$%%),
+        group_by_regex("Class members", mod, %regex~.*(is_own_field|field_at|value_struct|field_name_at)$%%),
+        group_by_regex("Result inspection", mod, %regex~.*(describe|is_synthesized|hit_at)$%%)
     )
     document("Position-based AST queries", mod, "ast_cursor.rst", groups)
 }
@@ -1572,9 +1576,21 @@ def document_module_stbimage(_root : string) {
         group_by_regex("Write to memory", mod, %regex~(stbi_write_png_to_memory|stbi_write_bmp_to_memory|stbi_write_tga_to_memory|stbi_write_jpg_to_memory)$%%),
         group_by_regex("Write settings", mod, %regex~(stbi_flip_vertically_on_write|stbi_write_set_.*|stbi_write_get_.*)$%%),
         group_by_regex("Image resizing", mod, %regex~(stbir_resize|stbir_resize_uint8_srgb|stbir_resize_uint8_linear|stbir_resize_float_linear)$%%),
+        group_by_regex("Texture block compression", mod, %regex~stb_compress_blocks$%%),
         group_by_regex("Animated PNG (APNG) writer", mod, %regex~stbi_apng_(begin|frame|end|dropped)$%%)
     )
     document("Image loading, writing, and resizing (stb_image)", mod, "stbimage.rst", groups)
+}
+
+def document_module_meshoptimizer(_root : string) {
+    var mod = get_module("meshoptimizer")
+    var groups <- array<DocGroup>(
+        group_by_regex("Vertex remapping", mod, %regex~meshopt_(generate_remap|remap_vertices|remap_indices)$%%),
+        group_by_regex("Mesh optimization", mod, %regex~meshopt_optimize_(cache|fetch)$%%),
+        group_by_regex("Vertex codec", mod, %regex~meshopt_(encode|decode)_vertices$%%),
+        group_by_regex("Index codec", mod, %regex~meshopt_(encode|decode)_indices$%%)
+    )
+    document("Mesh remapping, optimization, and buffer codecs (meshoptimizer)", mod, "meshoptimizer.rst", groups)
 }
 
 def document_module_raster(_root : string) {
@@ -1653,7 +1669,7 @@ def document_module_stbimage_ttf(_root : string) {
 def document_module_audio(_root : string) {
     var mod = get_module("audio")
     var groups <- array<DocGroup>(
-        group_by_regex("Audio device", mod, %regex~(sound_initalize|sound_finalize|mixer_context|sound_set_null_device|audio_is_single_threaded)$%%),
+        group_by_regex("Audio device", mod, %regex~(sound_initalize|sound_finalize|mixer_context|sound_set_null_device|audio_is_single_threaded|sound_playback_underrun_frames)$%%),
         group_by_regex("Capture", mod, %regex~(sound_record|sound_is_recording)%%),
         group_by_regex("Decoder", mod, %regex~ma_decoder%%),
         group_by_regex("Resampler", mod, %regex~ma_resampler%%),
@@ -1893,6 +1909,7 @@ def document_module_spirv(_root : string) {
     var groups <- array<DocGroup>(
         group_by_regex("Reflection types", mod, %regex~(SpirvReflection|SpirvDescriptorBinding|SpirvPushConstantRange|SpirvDescriptorKind|SpirvStageFlags)$%%),
         group_by_regex("Serialization", mod, %regex~(encode_reflection|decode_reflection)$%%),
+        group_by_regex("Shader blob literals", mod, %regex~unpack_spirv_words$%%),
         hide_group(group_by_regex("Internal finalize infrastructure", mod, %regex~finalize%%))
     )
     document("SPIR-V shader reflection (dasSpirv): API-neutral descriptor + push-constant layout, host-consumed", mod, "spirv_reflect.rst", groups)
@@ -1910,6 +1927,26 @@ def document_module_gltf(_root : string) {
         hide_group(group_by_regex("Internal finalize infrastructure", mod, %regex~finalize%%))
     )
     documents("glTF 2.0 loader (dasGLTF): GLB/.gltf parse, accessor decode, node hierarchy, skinning and keyframe animation into a backend-neutral scene", mod, "gltf.rst", groups)
+}
+
+def document_module_texture_blocks(_root : string) {
+    var mod = find_module("texture_blocks")
+    var groups <- array<DocGroup>(
+        group_by_regex("Texture types", mod, %regex~.*(BlockMip|BlockTexture)$%%),
+        group_by_regex("Compression and caching", mod, %regex~.*(block_texture_key|compress_block_texture|cached_block_texture)$%%),
+        group_by_regex("Validation and decoding", mod, %regex~.*(block_texture_valid|decode_block_mip)$%%)
+    )
+    document("Portable BC texture compression, mip generation, caching, validation, and decoding", mod, "texture_blocks.rst", groups)
+}
+
+def document_module_gltf_processed(_root : string) {
+    var mod = find_module("gltf_processed")
+    var groups <- array<DocGroup>(
+        group_by_regex("Processing types", mod, %regex~.*(ProcessingProfile|ProcessedPrimitive|ProcessedMesh|ProcessedAsset|ProcessedCatalogEntry|ProcessedCatalog|ProcessedManifest)$%%),
+        group_by_regex("Validation and persistence", mod, %regex~.*(processed_valid|save_processed|load_processed|load_and_process_gltf)$%%),
+        group_by_regex("Geometry processing", mod, %regex~.*(processed_stride|processed_vertex_bytes|processed_indices|process_primitive|process_gltf|unpack_processed_geometry)$%%)
+    )
+    document("Backend-neutral glTF geometry and texture preprocessing, validation, and persistence", mod, "gltf_processed.rst", groups)
 }
 
 // das2rst compiles tuned libraries to inspect their source API. The explicit
@@ -1932,6 +1969,7 @@ def main {  // nolint:STYLE038 — flat one-call-per-documented-module dispatch 
     document_module_dashv(root)
     document_module_openai(root)
     document_module_stbimage(root)
+    document_module_meshoptimizer(root)
     document_module_raster(root)
     document_module_stbtruetype(root)
     document_module_uriparser(root)
@@ -1959,6 +1997,8 @@ def main {  // nolint:STYLE038 — flat one-call-per-documented-module dispatch 
     // document dasPEG module
     document_module_peg(root)
     document_module_gltf(root)
+    document_module_texture_blocks(root)
+    document_module_gltf_processed(root)
     // document dasSpirv reflection module
     document_module_spirv(root)
     // document the dasLLAMA facade module (the engine modules behind it stay undocumented by design)

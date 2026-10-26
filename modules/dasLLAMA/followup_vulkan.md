@@ -516,7 +516,7 @@ module) is independent and can land any time - it is pure structure.
     and `K6Cm2LBatch`/`K6Cm2MBatch` are six hand-stamped bodies over two axes (tile width
     128/256, decode format) - nine since the MoE s tiles (`*Cm2SBatch`, 32-row columns with
     the semi-fast partial-column path) joined them, generated from the m bodies by a script;
-    `REVIEW_GPU.md`'s twin rule asks for one `class template` with a
+    `REVIEW_GPU_KERNEL_CLASSES.md`'s twin rule asks for one `class template` with a
     `@template_constant` for the width, typedefs for the block/coopmat types, and a
     `def override decode_*` per format - the shape `harness/vk_gemm_probe.das`'s `K6PxBase`
     already proves. Gate: the nine oracle cells in `tests/test_vulkan_kernels.das` stay 0-off,
@@ -1282,10 +1282,7 @@ module) is independent and can land any time - it is pure structure.
     byte-identical to their m twins (only the five grid formats' e stamps differ, in k step) - alias
     the e ladder to the m stamp where they agree, moving the module gate, the census rows and the
     docs together; (2) a MoE layer with a dense triple on the f16 feed converts `pf_xb` to `pf_xf`
-    twice a window - skip the second convert; (3) the module gate's image layout stamp closure hashes
-    every function named `*_prepare` under `dasllama/`, so an edit to the resident decode's
-    `vk_rdec_prepare*` moves the stamp though no image layout moved - narrow the match to the image
-    layout's own prepare functions; (4) `spawn_readonly_fixture`, the lens refusal gate's child
+    twice a window - skip the second convert; (4) `spawn_readonly_fixture`, the lens refusal gate's child
     compile, passes no `-dasroot`, so the gate audits the binary's own tree rather than the tree under
     test - pass the test's root; (5) no cell pins the f16 router route against the f32 router GEMM
     (logits within an f16 bar, the top-k picks equal off near-ties) - an arm in
@@ -1323,16 +1320,219 @@ module) is independent and can land any time - it is pure structure.
     path sees the drift; the fix is a kernel cell in `tests/test_vulkan_kernels.das` at the 12B's
     widths against the CPU oracle, then the tile that misses. No test reads red today: the gemma
     file's cells skip on a memory decline (`moe_gpu_resident_memory_decline`).
-47. **The E-series' per-layer-embedding pre-step stays on the CPU.** The whole-model driver
+47. **The E-series' per-layer-embedding pre-step keeps two CPU halves.** The whole-model driver
     takes gemma-4 E2B / E4B with the per-layer-embedding branch, the shared-KV layers and the two
-    dense widths on device, but the side input every layer multiplies in - the token's row of the
-    per-layer table, plus `model_proj` of the scaled embedding, normed and averaged - is built by
-    the CPU pre-step (`ple_pre_decode` / `ple_pre_prefill` in `dasllama_ple.das`) and rides the
-    token command as a copied [layers x ple] row and the window chain as a position-major upload
-    (E2B: 35 x 256 floats a token, 512 x 8960 floats a window). Metal has a GPU pre-step behind
-    `register_ple_gpu_gate`; the Vulkan twin is a gather of the q8 table rows plus a
-    [dim x layers*ple] GEMV / GEMM and a per-slice rms - three kernel classes and a norms row. The
-    batch decode override declines E-series models for the same reason (its rows carry no side
-    input). Also here: the driver's prefill GEMMs for the branch run the q8 batch tile on the cm2
-    route (the gate at 256 outputs, the proj at K 256) - a small f16 route for them is a perf
-    lever once the E-series rows have a baseline.
+    dense widths on device, and the prefill's pre-step projection runs on device too (the f16
+    mirror of `per_layer_model_proj`, the `ple_raw` rows of `RdecPrefillFn`); what stays on the
+    CPU: the table gather a prefill (`ple_gather_rows`, across the job threads: 2.3 ms a 512-row
+    window on E2B - the q8 table is 2.35 GB, a device copy is the alternative), and the whole
+    decode pre-step (`ple_pre_decode`: the token's row plus a [dim x layers*ple] GEMV, normed and
+    averaged, copied to the token command as a [layers x ple] row - a GEMV over the f16 mirror and
+    a 35-row norm on device would take it). The batch decode override declines E-series models
+    (its rows carry no side input). Also here: the driver's prefill GEMMs for the branch run the
+    q8 batch tile on the cm2 route (the gate at 256 outputs, the proj at K 256) - a small f16
+    route for them is a perf lever once the E-series rows have a baseline.
+48. **The KV mirror keeps every sliding layer's rows at the full context.** The reference exe sizes
+    a sliding layer's cache rows to its window (gemma-3: 1024 on 28 of 34 layers of the 4b, 512 on
+    the 1b; gemma-4: 1024 / 512 on five of six); the mirror sizes every layer to the context, so a
+    gemma-3-4b mirror at 32768 positions holds 4.3 GB where a ringed one holds about 1 GB (the six
+    global layers at the context, the rest at 1024). The ring is a position-modulo on the sliding
+    layers' mirror row (`layerbase + (pos mod window) * kvd`) in the rope store, the attention
+    kernels' key index and the prefill's K/V writes, plus the plan's row count per layer; the
+    decode attention already masks keys below the window, so the ring changes which row a key
+    lives in, not which keys score. Worth its lever on every gemma and on the 26B (30 layers,
+    25 sliding).
+49. **The gemma-4-26B-A4B passes a 16 GB card in every quant.** Its `ffn_down_exps` rows are 704
+    wide, a width only the 32-block formats (IQ4_NL, Q5_0, Q5_1, Q8_0) quantize, and
+    the K-quant rails' 256-multiple rule (`kq_fmt_row_ok`: the Q8_K activation superblock) demotes
+    an IQ4_NL or Q5_0 down stack to q8 at load - the UD-IQ3_XXS file's 3947 MB of down planes
+    become 7456 MB, and the resident image reads 14905 MB against a 16 GB card's 12677 MB usable
+    (measured 2026-09-12 on the RTX 5060 Ti; the plan declines on memory and the cells skip). The
+    q51 expert rail (`Q51Cm2T`'s s and e stamps, `Q51Gemv`; `ARCHITECTURE_GPU_VULKAN_MOE.md`
+    sec.2.2af) serves the UD-Q4_K_M file's native Q5_1 down stacks at 704; the IQ3_XXS and
+    IQ4_NL files still demote their IQ4_NL down stacks. Two levers, either of which puts those
+    on 16 GB: an iq4nl expert rail at 32-wide rows (the same per-32 form as q51: Q8_0 activations
+    in place of Q8_K - the CPU dot, the decode GEMV twin, the tune rows and kernel cells; the cm2
+    e stamps are f16-fed and already step K by 64, which 704 divides), or the streamed-experts
+    form (attention and the dense triple resident, the expert planes streamed a layer at a
+    time - the 16 GB story for every MoE past the card). The block itself holds on a 32 GB card
+    (`test_gpu_resident_gemma4_26b.das`, the RunPod RTX PRO 4500 rows).
+50. **The prefill flash tile runs one workgroup a (head, q tile), which leaves a low-head model's
+    attention on a few SMs.** A key split of the tile (every (head, q tile) cut into equal pieces
+    with f32 partials and a combine kernel, `pf_fa_nsplit` covering the SM count twice) lost on
+    every gemma shape measured on the RunPod RTX PRO 4500 (82 SMs, `DASLLAMA_GPU_PROF=1`, a 512-row
+    window): gemma-3-1b (four heads, 32 tiles) attention 2564 us a window unsplit against 2711 at
+    two pieces and 3283 at six; gemma-2-2b (eight heads, 64 tiles) 2963 against 3410 at three -
+    the partial stores, the repeated q loads and the combine's reads outweigh the shorter key loop,
+    and the causal grid's short tiles get empty pieces. llama.cpp b10660's flash pass runs the same
+    layer in about half the time on the same grid, so the gap is the pass's own per-step and
+    per-workgroup cost, not occupancy. Of that cost the f16 O accumulator under a 3 ln 2 row-max
+    bias, the mask pass gated to the edge steps and the `[dont_unroll]` KV loop landed (E4B's
+    attention 6868 -> 4014 us a window, gemma-3-1b's 2671 -> 1844, the 26B's 7225 -> 3469; the
+    reference exe's flash-attention pass reads 3435, 1330 and 2775 on the same windows). Still open:
+    a key split with f16 O partials carrying the L and M scalars, one generic reduce dispatch and
+    empty above-diagonal pieces retiring on the block skip; and 32 query rows at head size 512,
+    where the 64-row tile carries a 64 x 512 O and q. The reference exe's split rule gives
+    gemma-3-1b four pieces over the 32 tiles.
+51. **The token command's remaining decode gap is the dependent-dispatch gap, not the kernels.** On
+    the RunPod RTX PRO 4500 every decode GEMV streams at the card's 840 GB/s (`harness/vk_gemv_probe.das`
+    at the 26B's 2816-wide shapes, every kq format and q8) and a one-workgroup row kernel costs 0.85 us
+    alone against 4.7 to 8.8 chained behind a barrier (`harness/vk_gemm_probe.das -- small`), so a
+    layer's ten or so dependent hops carry a quarter of a token; gemma-2's GPU stamp total (4686 us a
+    token at 128 generated: `benchmarks/lcpp_bench.das -- -p 512 -n 128 -t 16` under `DASLLAMA_GPU_PROF=1`)
+    equals the reference exe's whole token (4661, its own `llama-bench` row), which also pays its own
+    submit and fence, so their gap a hop is smaller than ours. Measured and reverted, each on the pod:
+    the row kernels (`ArBase`, `quant32`, the gemma-4 combine) unrolled over 32-element register arrays
+    with their loads first - the 26B's residual step 431 -> 614, its combine 556 -> 1246 us a token
+    (the arrays spill at dim 2816), gemma-3-1b flat; the q8 GEMVs taking two block steps a turn -
+    gemma-3-1b's down 376 -> 426, its classifier 376 -> 410; the decode attention's combine folded
+    into the pass as the head's last-arriving split (`@coherent` partials, a per-head counter) -
+    gemma-3-1b's attention 178 + combine 108 -> 369, E4B's 307 + 177 -> 629: a publish and an atomic
+    on sixty-four latency-bound workgroups plus the serialized per-head combine cost more than the
+    dispatch. What the last-arriving-workgroup hand-off does pay for, per the probe's `lastwg` arm
+    (an f32 row GEMV then `cls_ar` against the GEMV whose last workgroup runs the epilogue): about
+    2 us a step at dims 1152 to 3840 - so the `ArRq` epilogue riding the q8 GEMVs (wo into the
+    post-attention step, down into the post-FFN one, the E-series proj into its) is the form still
+    worth building, two to three hops a layer on every gemma; `Q8GemvAr` is that form (gemma-3-1b's
+    tg128 358.5 -> 370.1; the reference exe's row reads 362.9). The E-series branch's step riding
+    `Q8GemvPleAct` was measured and reverted: eighty workgroups publish and the last one runs a
+    2560-wide step alone, and the token loses more than the hop (E4B tg128 109.3 -> 108.5, E2B
+    192.3 -> 189.4; the stamps read 29 us less a token, the wall 70 more). The barrier's form is not a lever: the probe's
+    `barform` arm chains `cls_ar` through the rail's global compute+transfer barrier, a compute-only
+    one, shader access bits alone, a buffer barrier on the row and an execution-only barrier, and on
+    the RTX PRO 4500 every form costs the same 4.7 us a dispatch at dim 1152 (6.7 to 8.1 at 2560)
+    against 0.8 with no barrier; the RTX 5060 Ti alone charges the rail's form 1.4 us more than a
+    compute-only one (7.1 against 5.7). llama.cpp b10660 built from source with its per-op logger
+    (`GGML_VK_PERF_LOGGER=1`; apt's glslang 15.1 compiles neither its coopmat2 nor its integer-dot
+    shaders, so those kernels are not the reference's) reads its small decode ops - the logger's rows for
+    its norm, add and copy kernels - at 2.5 to 4.2 us each in isolation - the same class as ours - and its
+    q8 mat-vec kernel at our rates; the logger fences
+    every op, so what their chained gap costs it cannot say.
+52. **`DASLLAMA_CM2_TILE=256` hangs the 26B IQ3_XXS load on the RunPod RTX PRO 4500.** The forced l
+    column runs the resident upload's first dispatches into a fence the GPU never signals (the host
+    spins, the device idles; killed after fourteen minutes), where the unforced pick and the
+    `DASLLAMA_VK_F16_FFN=0` arm load in a minute. A forced tile reaches shapes the pick never hands
+    the l column - a region under its 256 rows, a plane the s rule owns - and one of them faults
+    silently. The knob is an A/B instrument, so the fix is a refusal: a forced column the shape
+    cannot fill falls back to the pick, and the load says so.
+53. **The decode callbacks still carry work llama.cpp b10660's do not.** Every kq block struct
+    declares its lanes `int16`, so each 16-bit load pays a sign extend and a mask (`uint(int(x)) &
+    0xFFFF`, two ops an element on k6, three on iq2s across all twelve leaves) where a `uint16`
+    member would load clean; the iq2s signs are two negate-selects where an XOR of the sign bit
+    or their `1 - (2 & ...)` multiply is one; and the expert gate and up run as two GEMMs over the
+    same gathered rows where the reference exe's expert GEMM runs the pair fused as one `[gate | up]`
+    GEMM at 28 TFLOP/s against our two at 18 to 20 (the 26B's expert gate 20.5 ms a window, its up
+    20.9, its down 14.5; the reference exe's fused pair 33.4 ms and its down 16.3). The fused pair
+    is the 26B's remaining prefill lever, with the tile picks and the k6 cache landed.
+54. **The GEMM probe's tile and split-k rows are hot-cache, 512-row, single-pass readings.** Every
+    `g3`, `gemma`, `splitk` and `cm2g:<fmt>` row (`harness/vk_gemm_probe.das`) times its shape at
+    512 rows - a whole multiple of both the l and the m column - over a plane that sits in the RTX
+    PRO 4500's L2 across the sixteen timed dispatches, and each arm runs once in one sequential
+    pass rather than in alternating rounds; the wave model's 64-row, 128-row and SM-fill branches
+    were never timed at the row counts they decide, nor the partial-tile store path a window's last
+    column takes. The probe's `run_cold_shape` ring and `ROUNDS` interleave exist for both. Owed with
+    them: the `k6x` and `cm2x` bisect arms mirror the tile before `wg_m0` and the k6 scale cache -
+    resync or retire them - and the `lastwg` baseline (the split GEMV + `cls_ar`) checks against no
+    CPU reference in its run.
+55. **The decode attention's key split gates on occupancy alone.** `da_nsplit` picks the splits
+    from the head count against the SM count and never from the attended span, so a session at
+    position one pays a sixteen-way split and its combine dispatch; the one measurement on record is
+    gemma-3-1b at 128 tokens (`ARCHITECTURE_GPU_VULKAN_ATTN.md` sec.2.2al). A span-keyed fallback to one
+    split, with its threshold measured at the shortest and the longest span the path serves, is the
+    lever - item 51's hop-count territory.
+56. **The gemma arc's new kernel branches are gated by whole-model cells alone.** The flash tile's
+    `window` (the shifted first step and the sliding mask), the decode attention's `cstart` window,
+    the batched attention tile's in-window mask, the top-k kernels' `dsoff` down-scale row, and the
+    qk-norm and rope kernels' `vfk` / `vnorm` arms (V from K, the weightless v-norm) reach the GPU
+    only through the gemma gates in `tests/`, where a wrong branch reads as a bar drift; every
+    kernel cell dispatches them at the off-path value. Each wants a kernel-unit arm at the on-path
+    value with its CPU oracle taught the branch (`attn_row_oracle` takes a window start already; the
+    qk-norm oracle does not know V from K).
+58. **Under `mm` the KHR kq tile serves every f16-fed GEMM, where the q8-fed mul_mm L-tile is
+    faster on the wide, shallow ones.** E2B's gate and up (1536 in, 6144 out) run 6204 / 6270 us a
+    512-row window on the KHR tile against 5537 / 5647 on `MmBatch` - twelve percent - while its
+    down ran three times faster on the KHR arm, and faster again split. The feed is a per-format
+    verdict (`pf_f16_feed`); a per-GEMM pick on the wave model's shape (a shallow k against a wide
+    n keeps the L-tile) is worth about five percent of E2B's window under `mm`.
+59. **The h128 coopmat twin reads neither `window` nor `cap`.** `DaAttnBH128T` masks on the causal
+    edge and the window's end alone (`gk <= gq && gk < kend`) while its `DaAttnBArgs` carry both
+    fields, so a sliding or softcapped 128-head layer that reaches it - a KHR-mode card where the
+    flash tile declines (a gated model) - attends every position uncapped. No stocked model hits
+    it: the sliding and softcapped families (gemma-2, gemma-3, gemma-4) run 256 and 512 heads, and
+    the 128-head families (the qwens) have neither field set. The fix is the
+    chunked tiles' mask and `attn_softcap` on the scores, with a kernel cell at the on-path values
+    (item 56's shape).
+60. **The wave model prices the KHR arm in the cm2 tile's units.** `cm2_gemm_pick` weighs a split
+    with `cm2_wave_units` (a 128-column step at 10 units, k in 64-element steps) and
+    `cm2_reduce_units`, both calibrated on the cm2 tensor tile; under `mm` the same numbers decide
+    the KHR kq tile, whose k step is 32 and whose step costs several times the cm2 tile's, so the
+    mode-independent reduce is a smaller share of a KHR GEMM than the model says and the arm
+    under-splits (the 512 x 512 x 2048 pin on 36 SMs: two chunks at 230 units, four at 237, the
+    compute equal and the reduce the whole difference). A KHR unit set measured on the `khrsk`
+    probe rows (`harness/vk_gemm_probe.das`) is the lever, item 58's per-GEMM pick beside it.
+61. **The KHR tiles' lane maps rest on the device's advertised subgroup size, not a per-pipeline
+    one.** `khr_kq_tile_on` reads `subgroupSize` from the physical device; `FaT`'s KHR arm labels its four
+    16-key bands `tid / 32` and reduces each softmax row over eight lanes with `subgroupShuffleXor`,
+    and the KHR kq tile stages by the same rule, while no `fa_khr_*` or `*_khr_cls` pipeline pins
+    `requiredSubgroupSize` and `REQUIRE_FULL_SUBGROUPS` is off by default. A driver that picks a
+    shader's subgroup width per pipeline (Intel's SIMD8/16/32) can run a 128-thread workgroup at
+    16 lanes, where two subgroups write one score band and two bands stay unwritten - a wrong
+    answer, not a decline. Item 42's real-hardware pass on such a card is where it shows; the fix
+    is the pipeline's `VkPipelineShaderStageRequiredSubgroupSizeCreateInfo` at 32 on every KHR
+    stamp, or a decline where the device cannot pin it.
+63. **Two of the prefill's class pick ladders sit outside the ladders' home.** `REVIEW_PLACEMENT.md`
+    lands a host-side pick ladder over Vulkan kernel classes in `dasllama_vulkan_classes.das`, where
+    `gemv_*`, `q8_batch_cls_*`, `kq_batch_cls_*`, `fa_stamp_*` and `f16_gemm_*` live, while the cm2
+    tile ladder (`cm2_cls_*`, its `khr_cls_*` and `cm2e_cls_*` arms) sits in
+    `dasllama_vulkan_prefill.das`, pinned there by `REVIEW.das`'s `check_cm2_ladder_set`, which reads
+    that file's bodies. Move the nine ladders to the classes file and retarget the check's
+    `function_bodies` and its two findings at `VK_CLASSES` in the same change; the cells, the probe
+    harness and the prefill call them by name, so no caller moves.
+64. **The folded flash template's KHR stamps carry two constants their arm never reads.** `FaT`
+    declares `BC` (the cm2 arm's K/V step) and `GATED` (the cm2 arm's gate multiply), and the
+    head-size templates set `BC` for both arms, so every `fa_khr_*` stamp inherits a `BC` and a
+    `GATED` its compiled `static_if (KHR)` arm ignores - an `override GATED = true` on a KHR leaf
+    compiles to an ungated kernel with no diagnostic, and only the host ladders'
+    `fa_stamp_refuse` keep such a stamp off the device. The arms share one `run` because the
+    SPIR-V emitter emits a method call as an `OpFunction` it never inlines; once the emitter inlines
+    device-side calls, each arm becomes a method on its own template and the constants move with it.
+65. **The per-op streamed prefill of a mixed-format MoE dies on a bounds check.** With the resident
+    route off and a 5000 MiB cap (`DASLLAMA_GPU_RESIDENT=0 DASLLAMA_GPU_VRAM_MB=5000`) the
+    Qwen3-30B-A3B UD-IQ2_XXS loads on the per-op rails with its expert stacks streamed for the
+    layers past the budget, the decode block serves the fixture gate's eight tokens, and the first
+    prefill window dies with `array index out of range` right after "cm2 expert chain engaged" - in
+    cm2 mode and under `DASLLAMA_COOPMAT=mm`, with the streamed split on and with
+    `DASLLAMA_GPU_MOE_SPLIT=0`. The plan serves the file resident wherever it fits, so the
+    streamed form is reached only past the budget; the fix starts from the das call stack (the
+    repro under the interpreter, or a stack-walking build), and a per-layer table keyed by a plane
+    offset alone - the decode block's old key, which this file's two layers at offset 0 of
+    different format planes collided on - is the first suspect in the streamed chain's own tables
+    (`heat_pools`, `ffn_cmds`).
+66. **The 26B-A4B row under `mm` is owed a measurement on a card that holds it.** The resident MoE
+    block serves a KHR-mode card now (`ARCHITECTURE_GPU_VULKAN_MOE.md` sec.2.2af), and
+    `PERF_LEDGER.md`'s 26B row still carries the per-op reading (328 / 39.1). The run:
+    `DASLLAMA_GPU=1 DASLLAMA_COOPMAT=mm DASLLAMA_IMAGE=0 DASLLAMA_ALLOW_UNTUNED=1 bin/daslang -jit
+    modules/dasLLAMA/benchmarks/lcpp_bench.das -- -m gemma-4-26B-A4B-it-UD-IQ3_XXS.gguf -o txt
+    --for-debug-purposes -r 3` against the reference exe's own KHR path, `GGML_VK_DISABLE_COOPMAT2=1
+    llama-bench -m gemma-4-26B-A4B-it-UD-IQ3_XXS.gguf -ngl 99 -fa 1 -t 16 -r 3 -p 512 -n 128`, on
+    the RunPod RTX PRO 4500; the UD-Q4_K_M file (the q51 down rail) takes the same pair.
+67. **The GEMM probe's `moe:` and `moesk:` arms admit no per-32 format.** `harness/vk_gemm_probe.das`
+    refuses `moe:q51` and `moe:mx4` ("needs q8 or a kq superblock format name"), so the two per-32
+    rails' s and e stamps (`Q51Cm2SBatch` / `EBatch`, `Mx4Cm2SBatch` / `EBatch`) have no probe rows
+    and the `DASLLAMA_VK_DECVEC` pair `REVIEW_GPU_VULKAN.md` asks of a changed cm2 tile cannot be
+    taken for them; the kernel cells hold the stamps meanwhile. The arms need the per-32 plane
+    builders (the block-32 quant and scale planes) beside their kq ones, then the rows.
+68. **The routed 26B's perplexity cells measure the device compiler's rounding, not the driver.**
+    `test_gpu_resident_gemma4_26b.das` and `test_gpu_resident_gemma4_26b_k.das` hold the resident
+    perplexity to a ratio of the CPU chain's, and a kernel recompile alone - kernels bit-identical
+    at the model's width in the kernel cells, no out-of-range access under the validation layer,
+    the same readings with a barrier before every dispatch - moves the Q4_K_M file's 150-position
+    cell 4.37 -> 5.17 -> 5.80 -> 6.22 against the CPU chain's 3.38 and the IQ3_XXS file's 4.30 -> 2.27
+    against 3.36 (`tests/CLAUDE.md` carries the readings): a router near-tie flips a pick and the
+    resident's misses gather in a stretch of positions after it. The ratio bar sits past the band
+    (2.0) and holds only that band. The instrument that would hold the driver is a per-position
+    compare against the reference exe's saved logits on the same prose (the arc's probe read a mean
+    gap of 0.56 for the resident and 0.21 for the CPU chain on the reference's confident positions,
+    both inside the band the gemma arc measured): a stocked fixture of the reference exe's
+    `--save-all-logits` output beside the model, the cell scoring both arms against it and holding
+    the resident's mean gap to a bar the CPU chain's gap sets.

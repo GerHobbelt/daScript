@@ -74,6 +74,12 @@ def public get_user_args() : array<string> {
     }
 }
 
+//! The running host binary as an absolute path - `argv[0]` resolved - for a program that spawns
+//! the same daslang it runs under.
+def public get_host_binary() : string {
+    return get_full_file_name(get_command_line_arguments()[0])
+}
+
 def clargs_flag_name(field_name : string) : string {
     return "--" + replace_multiple(field_name, [(text="_", replacement="-")])
 }
@@ -739,7 +745,7 @@ def resolve_env_name(fannotations : AnnotationArgumentList; fname, raw_name, env
 
 [structure_macro(name=CommandLineArgs)]
 class ArgsMacro : AstStructureAnnotation {
-    def override apply(var st : StructurePtr; var group : ModuleGroup; args : AnnotationArgumentList; var errors : das_string) : bool {
+    def override apply(var st : StructurePtr; var group : ModuleGroup; var args : AnnotationArgumentList; var errors : das_string) : bool {
         let command_info = collect_command_info(st, args, errors)
         if (!empty(errors)) return false
 
@@ -1217,7 +1223,7 @@ class EnvConfigMacro : AstStructureAnnotation {
         return ""
     }
 
-    def override apply(var st : StructurePtr; var group : ModuleGroup; args : AnnotationArgumentList; var errors : das_string) : bool {
+    def override apply(var st : StructurePtr; var group : ModuleGroup; var args : AnnotationArgumentList; var errors : das_string) : bool {
         let env_prefix = find_string_annotation(args, "env_prefix", "")
         var info : CommandInfo
         info.args |> reserve(length(st.fields))

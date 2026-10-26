@@ -46,7 +46,8 @@ contract a CALLER must know - public API always, a private helper only when call
 the module need the contract (narration of an implementation goes to a name, a test, or the
 module's `.md`), and only where the contract is not reachable from the declaration's own
 `[arch]` citation: a `//!` that restates the section its citation names is a duplicate and
-goes - `// nolint:CODE` / `@nolint` suppressions carrying their one-line why,
+goes - the one-line `//!` site contract above a top-level definition (the rule below),
+`// nolint:CODE` / `@nolint` suppressions carrying their one-line why,
 `//fmt:` formatter directives, license comments (Copyright / SPDX), and the file's leading
 header block (which may sit below the `options` / `module` / `require` preamble). Everything
 else - narration, banners, section dividers, commented-out code - does not exist. The
@@ -61,12 +62,17 @@ fixture corpora (directories of files the code under test reads as input, not te
 execute) the prose carrying the lesson passes that test, and a comment that adds nothing
 to its line still goes.
 
-**A `//!` is a doc only where one attaches: the file's header block, anywhere inside a `def`
+**A `//!` has two homes. Where one attaches - the file's header block, anywhere inside a `def`
 body, anywhere in a `struct` / `class` body outside its methods (it lands on the struct), or
-trailing on a struct field.** Outside the header block, above a top-level `def`, above a
-global, or on an `options` / `require` line a `//!` documents nothing and answers to the
-deletion test like any `//`; above a method inside a class body it lands on the class, not
-the method. Inside a function body every `//!` attaches to that function, wherever it sits -
+trailing on a struct field - it is a doc and lands in the generated reference. Above a
+top-level `def` or a global it attaches to nothing and is the SITE CONTRACT spelling: one line
+(a private one caps at three under STYLE015) stating a constraint the site needs and the code
+cannot say - a bar's derivation, a guard's reason, a layout a caller relies on - which the
+comment harvest keeps and the deletion test passes as a kept-set line.** A top-level `//!`
+that narrates goes like any `//`, its spelling no reason to keep it; a reviewer who reads one
+asks whether the line states a constraint, never whether it attaches. On an `options` /
+`require` line a `//!` documents nothing; above a method inside a class body it lands on the
+class, not the method. Inside a function body every `//!` attaches to that function, wherever it sits -
 a mid-body or lambda-body `//!` lands in the function's generated reference page, so it stays
 only when it states a contract a caller must know; otherwise respell it `//` and apply the
 deletion test. The formatter keeps every comment spelled `//!` wherever it sits, so the
@@ -83,9 +89,11 @@ it in a name, a shape, or a test, or documents itself in the module's `.md`. Kep
 is earned: `//!` and `/** */` docs on a contract a CALLER must know - public API always, a
 non-public helper when callers inside the module need the contract - `NOLINT` /
 `clang-format` suppressions, the leading header block, and the bare section pointer
-`// <folder>/ARCHITECTURE.md sec.N` on the function that implements the section (C++ has no
-`[arch]` annotation; the pointer is its citation, and nothing checks it - a renumbered section
-orphans every pointer to it). Existing comments answer to the
+`// <folder>/ARCHITECTURE.md#<anchor>` on the function that implements the section (C++ has no
+`[arch]` annotation, so the pointer is its citation; LINT026 resolves it exactly as a .das
+citation - the path is root-relative, walked up from the citing file, so a header under
+`include/` reaches the `src/` document that owns its mechanism - and a `sec.N` spelling is a
+number nothing checks). Existing comments answer to the
 deletion test; editing one so it stays true is not a new comment, and the edited comment
 answers to that test as a whole.
 

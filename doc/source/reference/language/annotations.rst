@@ -67,9 +67,8 @@ Lifecycle
 
 ``[export_c]``
     An ``[export]`` that ``daslang -lib`` additionally surfaces as a C function in the header it
-    generates. ``-lib``, ``-jit`` and ``-exe`` carry the annotation themselves, so a library source
-    needs no ``require``; a plain interpreter or AOT compile of the same file needs
-    ``require daslib/export_c``. The function keeps working in every tier. Its signature
+    generates. The annotation comes from ``require daslib/export_c``, in every tier. The
+    function keeps working in each of them. Its signature
     has to be one C can spell: scalars, ``string``, raw pointers, enumerations, plain structures,
     the ``float2``..``uint4`` and ``range`` families, and ``fixed_array`` arguments; ``array``,
     ``table``, ``tuple``, ``variant``, lambdas, blocks, iterators and bound C++ types are not, and
@@ -78,6 +77,8 @@ Lifecycle
 
     .. das-doc: alt
     .. code-block:: das
+
+        require daslib/export_c
 
         struct Vec3 {
             x : float
@@ -612,7 +613,7 @@ Example — macro registration runs during module compilation, so the file decla
     [function_macro(name="my_decorator")]
     class MyDecorator : AstFunctionAnnotation {
         def override apply(var func : FunctionPtr; var group : ModuleGroup;
-                           args : AnnotationArgumentList; var errors : das_string) : bool {
+                           var args : AnnotationArgumentList; var errors : das_string) : bool {
             print("decorating {func.name}\n")
             return true
         }

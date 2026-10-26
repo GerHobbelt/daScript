@@ -59,7 +59,9 @@ The taxonomy every other file keys off. One edit here, then the compiler finds t
   `kq_reads_packed_planes` - the one packed-versus-panel predicate the batch cell generator, the
   probe, the tests and the bench all read.
 - `tests/test_kqformat.das`: pin the enum value, the predicate, the strides, the id, the stream
-  code, and the codebook's edge values.
+  code, and the codebook's edge values; its radix guard holds every id under `DAT_KEY_FMTS`
+  (`dasllama_vulkan_common.das`, the Vulkan decode block's layer-key radix) - the 32nd member
+  grows the radix in the same change.
 
 ## 2. Codec - `dasllama/dasllama_convert.das`, `dasllama/dasllama_gguf.das`
 
@@ -259,6 +261,23 @@ decoded scale row needs no upload work - only the id bridge and the kernels. IQ4
    `enc` ladder lacks the new arm dispatches the else format's pipeline over the new planes and
    reads byte-stable across fix rounds.
 
+A per-32 format (q51's and mx4's shape: 32-weight blocks, Q8_0-form activations, off the kq
+lattice) takes none of the kq id bridge: it joins `kq_block32` (`dasllama_kqformat.das`, the one
+predicate the drivers and the resident plan read) and `arena_block_bytes` (the CPU plane's own block
+strides; mx4's scale slab rounds to whole words, since the tiles read its byte scales four blocks a
+word), the `pf_f16_feed` admission, and writes its own classes beside q8's rather than a `KqGemvBase`
+child - a `KqCm2BatchT` format template at `BLKW` 32 (`Q51Cm2T` with a word scale plane, `Mx4Cm2T`
+decoding the doubled e2m1 magnitudes under the halved E8M0 scale; the s and e stamps the expert
+schedule dispatches and the `khr_stage16` method behind the `<Fmt>KhrBatch` stamp the mm-mode
+schedule takes; `cm2_cls_ensure` refuses it a dense column, the plan declines a dense plane of it)
+and a decode GEMV in `Q8Gemv`'s shape (`Q51Gemv`, `Mx4Gemv`: one lane a block, `gemv_lanes_per_row`
+0; a format whose gate and up stacks share a slab may add the fused gate+up+act+requant twin in
+`KqGemvK4Gu`'s shape, `Mx4GemvGu`). Its census rows land in `VK_CENSUS_NEVER_DISPATCHED` while no
+stocked small carrier holds such a plane. The module gate (`REVIEW.das`) reads it twice: the
+template ships the KHR trio like every format on the cm2 template (`CM2_KHR_EXEMPT` is empty), and
+`cm2_dispatch_name` learns that the format spells its expert stamp `<fmt>_batch_cm2e_cls` the way q8
+does.
+
 A grid format adds one more: its table joins the family's grid buffer (`kq_grid_dev` - a
 `KQ_GRID_<FMT>` word offset, `KQ_GRID_WORDS` / `KQ_GRID_BYTES` grown, the accessor called
 once per word into the host image) and the GEMV's `run` stages `gridb[KQ_GRID_<FMT> + idx]`
@@ -352,10 +371,25 @@ silently, which is why the tier's gate (`kq_fmt_gpu_supported`) is closed by def
    globals + `compile_pso` + `release_pso` lines in the three ladders; every `g_pso_*` global is
    declared by hand in `dasllama_metal_common.das`, since `[metal_dispatch(pso = ...)]` only
    names it.
-4. **Ladders:** `enc_kq_gemv`, `enc_kq_mvb`, `enc_kq_gemm_mm_b` (kernels), `pf_enc_kq_site_mm`
-   (the base mul_mm only - no tensor / tall / dev-W twins: those are the M5 kernel pass),
-   `pf_devw_panel_kq` (returns false - its `dq` pick would otherwise be k5's), `enc_site_gemv`
-   (the classifier site prefill and decode share), `moe_site_ok` + the `sb1/2/3` predicates (shapes), and last the gate.
+4. **Ladders:** `enc_kq_gemv`, `enc_kq_mvb`, `enc_kq_gemm_mm_b` (kernels), `pf_enc_kq_site_mm`,
+   `enc_site_gemv` (the classifier site prefill and decode share), `moe_site_ok` + the `sb1/2/3`
+   predicates (shapes), and last the gate. The tensor side is one class: a `stage16` override on
+   `MetalKqMulMmSplitTensorBase` (`ARCHITECTURE_GPU_PREFILL.md` sec.2.2aa) gives the format its T/TH
+   mul_mm twins, its dev-W dequant pass (`MetalKqDequant<Fmt>`, plus the bake mirror and the split
+   set in `pf_kq_split_fmt`), and its routed expert twins (`MetalMoeMulMm<Fmt>SplitT`,
+   `ARCHITECTURE_GPU_PREFILL_MOE.md`); the decode GEMV derives from `MetalGemvSiteT` so the
+   dense and the expert-indexed stamps share one body (`enc_moe_gemv`, `moe_fmt_metal_served`).
+   A format whose decode already rides another format's split class stamps the four expert leaves
+   (`T`, `TH`, `TH128`, `THR`) off THAT class's MoE template with its own template constants
+   instead of authoring a new one - q40 off iq4xs's is the worked case.
+   **Serving an expert plane is six ladders, not one** (`followup_metal.md` sec.15 names the
+   dispatch-vs-predicate invariant): `pf_moe_split_fmt`, `pf_moe_split_pso`, `pf_moe_split_enc`,
+   `pf_moe_th_pso` and `pf_moe_split_th_any` (prefill) plus the `enc_moe_gemv` arm (decode); and
+   `moe_site_ok`'s alignment arm must answer for the format exactly where `moe_fmt_metal_served`
+   does - `test_moe_metal_expert_formats` walks the whole enum and reds on any disagreement. A
+   compact-scale format (q40, iq4nl: `kq_scales_of` returns `doff` 0) binds its d plane at `soff`
+   in every one of those arms; the split formats bind it at `doff`, and copying their arm reads
+   the scale plane's tail as the d row.
 5. **Tests:** `dequant_iq4xs_plane_superblock_at` (`dasllama_convert.das`, the split-layout
    twin the CPU row now calls), fixtures at fmt 44 in `tests/_metal_kernel_common.das`, the
    ladders + calls in `test_metal_gemv_kernels.das` (GEMV, B2/B4/B8) and

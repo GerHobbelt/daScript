@@ -1034,6 +1034,7 @@ namespace das {
             addField<DAS_BIND_MANAGED_FIELD(strict_properties)>("strict_properties");
         // environment
             addField<DAS_BIND_MANAGED_FIELD(no_optimizations)>("no_optimizations");
+            addField<DAS_BIND_MANAGED_FIELD(no_fold_unsafe)>("no_fold_unsafe");
             addField<DAS_BIND_MANAGED_FIELD(fast_math)>("fast_math");
             addField<DAS_BIND_MANAGED_FIELD(disable_dse)>("disable_dse");
             addField<DAS_BIND_MANAGED_FIELD(disable_cse)>("disable_cse");
@@ -1260,7 +1261,7 @@ namespace das {
         return Module::require(name) != nullptr || is_dynamic_module_deferred(name);
     }
 
-    // a member's guard answers as the require's would (src/ast/ARCHITECTURE.md sec.2)
+    // a member's guard answers as the require's would (src/ast/ARCHITECTURE.md#module-scan-manifest)
     static bool moduleGroupMemberAvailable ( const ModuleGroupMember & m ) {
         if ( m.guard.empty() ) return true;
         if ( m.guard.find('/') == string::npos ) return guardModuleAvailable(m.guard);

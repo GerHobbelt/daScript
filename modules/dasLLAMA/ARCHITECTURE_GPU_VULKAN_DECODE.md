@@ -36,7 +36,9 @@ is served: the layer's `[q | k | v]` row uploads once when its sets are made and
 rope kernels expect it, so the mirror rows carry the bias; the raw rows that come home are the
 GEMV output before it, and the host store adds the bias before its own norm and rope.
 
-**The mirror is per layer, keyed by the q plane offset, and capped** (`DAT_MIRROR_ROWS` rows;
+**The mirror is per layer, keyed by the q plane offset under its format (`dat_key`: offsets are
+per format plane, so two layers of a mixed-format file can share an offset across planes, and
+the offset alone hands the second layer the first one's mirror and sets), and capped** (`DAT_MIRROR_ROWS` rows;
 VRAM is layers x rows x kvd x 4 bytes). The loader reports that need
 (`set_moe_gpu_dat_need`) and the tier carves it from the weight budget BEFORE placement, the
 way the stream slots are carved: the mirrors are allocated after placement, and un-carved they
@@ -196,8 +198,8 @@ once.
 
 **A recurrent layer rides the same recorded token command as an attention layer.** The
 whole-model driver (`ARCHITECTURE_GPU.md` sec.1.5, `dasllama_gpu_resident.das`) records one
-command per model whose per-layer body is one of two heads followed by the shared FFN tail: an
-attention head (q/k/v GEMVs, the fused qk-norm and rope storing the mirror row, decode attention
+command per model whose per-layer body is one of two heads followed by the shared FFN tail (a q8 triple with a Q8_0 feed runs `Q8GemvGu` - the gate and up dots, the activation and the hidden row's Q8_0 requant in one dispatch, a workgroup a 32-row block - else the gate GEMV, the up GEMV and the act+requant kernel; then the down GEMV; a q8 wo or down GEMV whose residual step quantizes to Q8_0 carries that step as its last-arriving workgroup's epilogue (`Q8GemvAr`: the rows into a `@coherent` plane, an arrival counter, the `ArRq` math over the whole row by the last workgroup) so no dependent dispatch follows it; an E-series layer's per-layer-embedding branch follows in three dispatches - the FFN residual step quantizes the row it writes as it is (`ArArgs.no_norm`, the gate's feed), the gate GEMV, and `Q8GemvPleAct`, which builds gelu(gate) x the side row and its Q8_0 blocks in workgroup memory and runs the proj GEMV over them, `DASLLAMA_VK_FUSE=0` keeping the five; where the driver holds the pre-step's projection (`RDec.ple_gpu`, the window chain's f16 mirror) the token command opens with the pre-step's finish too - the f16 row GEMV over the embedded row (`RouterGemvF16`, a workgroup a projected element row) and the residual step's kernel over the [layers] slices of ple, so the host gathers the table row alone and the `forward()` gate takes the same offer the prefill's does): an
+attention head (the q, k and v GEMVs as ONE region dispatch where the three planes share a format and a slab - q in kv-width pieces, then k, then v, the projection row landing whole, the ungated q buffer being that row's front - else a GEMV a plane; the fused qk-norm and rope storing the mirror row, decode attention
 over the mirror, the wo requant and GEMV) or a recurrent head - the fused qkv GEMV and the z
 GEMV into one projection row (z at offset `cd`; the two halves under their own hazard classes,
 `VHZ_DNP` and `VHZ_DNZ`, so the GEMVs co-run and the step waits on both), the beta and alpha rows as ONE `RouterGemvF16`
@@ -245,20 +247,8 @@ mirror is sized `n_attn x seq_cap x kv_dim` and each attention layer carries its
 once on a recurrent layer. The attention geometry (head size, q and kv widths) is the first
 attention layer's - on qwen35 layer 0 is recurrent.
 
-**A q/k/v projection bias (qwen2) folds into the rope stage.** The biased models' bias rows
-upload once as one row per layer in the projection buffer's own `[q | k | v]` layout
-(`vk_rdec_upload_bias`, a recurrent layer's row zero), bound at the last binding of the three
-rope kernels - the decode rope+store, the prefill's batched twin and the fused qk-norm+rope -
-which add the bias to each element as they read it, before the rotation (or the norm) and
-before the v copy, so no dispatch is added: the CPU chain adds the bias between the projection
-and the norm, and so does this. A model without a bias binds the norms buffer in that slot as
-a placeholder the kernel never reads (`hasb` 0). The seat installs separately
-(`install_moe_gpu_resident_bias`), so a tier without it names the bias in its decline instead
-of serving the model unbiased. The per-op tier carries the same rows through its hooks: the
-decode block binds the layer's row to the same rope kernels (sec.2.2r), and the prefill chain's
-`AtPrep` stage adds the q and k rows before its norm and rope and runs a third pass over the raw
-v window - `AtPrep` with no rope and no norm is a copy plus bias, in place - so the attention and
-the v rows that come home both carry it (`ARCHITECTURE_GPU_VULKAN_GEMM.md`, the per-op chain).
+The attention-side planes the driver uploads beside its norms - the q/k/v projection bias, the
+sink logits and the output bias - are `ARCHITECTURE_GPU_VULKAN_ATTN.md` sec.2.2am.
 
 **Gated attention and partial rotary ride the fused qk-norm+rope kernel and the decode attention
 kernel, not a detour.** On a gated model the q GEMV writes `2 x qd` rows in the loader's per-head

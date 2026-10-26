@@ -539,13 +539,14 @@ def private check_image_backing_release {
 
 let private DASLLAMA_DIR = "modules/dasLLAMA/dasllama"
 let private IMAGE_FILE = "modules/dasLLAMA/dasllama/dasllama_image.das"
+let private TTS_BLOCKS_FILE = "modules/dasLLAMA/dasllama/dasllama_tts_blocks.das"
 
 // The stamp of the layout closure - every Archive serializer body, build_image, parse_image,
-// every *_prepare mint, the layout helpers and the layout constants' declaration lines, hashed
-// in file order. A closure change with IMAGE_VERSION unmoved is red; the finding prints the
+// the TTS block file's *_prepare mints, the layout helpers and the layout constants' declaration
+// lines, hashed in file order. A closure change with IMAGE_VERSION unmoved is red; the finding prints the
 // value to re-stamp with.
-let private IMAGE_LAYOUT_STAMP_VERSION = 36
-let private IMAGE_LAYOUT_STAMP_HASH = 0x9ef1ee3be9f09dbaul
+let private IMAGE_LAYOUT_STAMP_VERSION = 38
+let private IMAGE_LAYOUT_STAMP_HASH = 0xb3ed0680a8048a57ul
 
 // The helpers that decide WHERE bytes land: the page pad, the plane and total sizing, the
 // writer's append / zero-fill / header patch, and the header's scalar stores. Changing one
@@ -574,7 +575,8 @@ def private is_meta_serializer(header : string) : bool {
     return is_archive_serializer(header) && find(header, "array<") < 0
 }
 
-def private is_layout_function(header : string) : bool {
+//! the `*_prepare` mints that place image bytes are the TTS block file's (`conv1d_prepare`, `linear_prepare`); a driver's prepare (`vk_rdec_prepare`, `mirror_prepare`) places none
+def private is_layout_function(file : string; header : string) : bool {
     return true if (is_archive_serializer(header))
     var rest = slice(header, 4)
     if (rest |> starts_with("private ")) {
@@ -582,7 +584,7 @@ def private is_layout_function(header : string) : bool {
     }
     let name = ident_prefix(rest)
     return true if (key_exists(LAYOUT_HELPERS, name))
-    return name == "build_image" || name == "parse_image" || find(name, "_prepare") >= 0
+    return name == "build_image" || name == "parse_image" || (find(name, "_prepare") >= 0 && "{DASLLAMA_DIR}/{file}" == TTS_BLOCKS_FILE)
 }
 
 def private read_lf(path : string) : string {
@@ -725,7 +727,7 @@ def private check_image_layout_stamp {
             h = fnv1a("{name}\n{c.body}\n", h)
         }
         var inscope fns <- function_bodies(p) $(header) {
-            return is_layout_function(header)
+            return is_layout_function(name, header)
         }
         for (f in fns) {
             h = fnv1a("{name}\n{f.body}\n", h)
@@ -734,7 +736,7 @@ def private check_image_layout_stamp {
     return if (h == IMAGE_LAYOUT_STAMP_HASH && version == IMAGE_LAYOUT_STAMP_VERSION)
     if (version == IMAGE_LAYOUT_STAMP_VERSION) {
         gate_finding(IMAGE_FILE,
-            "the image layout closure changed (every Archive serializer, build_image, parse_image, every *_prepare mint, the layout helpers pad_to_page/plane_end/image_total_bytes/w_append/w_zeros/w_header/store_u32/store_u64, and the layout constants IMAGE_PAGE/IMAGE_HEADER_BYTES/SECTION_TABLE_SLACK/DWRITE_STAGING_BAND/METAL_BAND_BLOCKS): re-stamp IMAGE_LAYOUT_STAMP_HASH = {h}ul in modules/dasLLAMA/REVIEW.das; bump IMAGE_VERSION (still {version}) and IMAGE_LAYOUT_STAMP_VERSION with it only if the bytes moved, because a stale image at an unchanged path stays structurally valid and serves different bytes")
+            "the image layout closure changed (every Archive serializer, build_image, parse_image, every *_prepare mint of dasllama_tts_blocks.das, the layout helpers pad_to_page/plane_end/image_total_bytes/w_append/w_zeros/w_header/store_u32/store_u64, and the layout constants IMAGE_PAGE/IMAGE_HEADER_BYTES/SECTION_TABLE_SLACK/DWRITE_STAGING_BAND/METAL_BAND_BLOCKS): re-stamp IMAGE_LAYOUT_STAMP_HASH = {h}ul in modules/dasLLAMA/REVIEW.das; bump IMAGE_VERSION (still {version}) and IMAGE_LAYOUT_STAMP_VERSION with it only if the bytes moved, because a stale image at an unchanged path stays structurally valid and serves different bytes")
     } else {
         gate_finding("modules/dasLLAMA/REVIEW.das",
             "the layout stamp is behind IMAGE_VERSION {version} - re-stamp: IMAGE_LAYOUT_STAMP_HASH = {h}ul, IMAGE_LAYOUT_STAMP_VERSION = {version}")
@@ -838,9 +840,7 @@ def private check_ar_max_dim_triple {
     }
 }
 
-// q8 is no superblock format: its cm2 tiles are the fmt-0 cells with no KHR arm, and the KHR
-// mode serves q8 through its own tile - the one template the KHR set does not reach.
-var private CM2_KHR_EXEMPT <- {"Q8Cm2T"}
+var private CM2_KHR_EXEMPT : table<string>   //! every format on the cm2 template owns a KHR arm today; a per-32 format the feed never admits in mm mode would join here
 var private CM2_NO_EXEMPT : table<string>
 
 def private cm2_format_templates(exempt : table<string>) : array<string> {
@@ -858,13 +858,13 @@ def private cm2_format_templates(exempt : table<string>) : array<string> {
 //! one class ladder trio every format template on the cm2 base joins
 struct private LadderTrio {
     suffix : string     //! the stamp's class suffix: `<Fmt>` + suffix
-    tail : string       //! the dispatch name's tail: `kq_batch_<fmt>_` + tail, `q8_batch_` + tail for q8
+    tail : string       //! the dispatch name's tail: `kq_batch_<fmt>_` + tail; a per-32 format (q8, q51) spells `<fmt>_batch_` + tail
     ladder : string     //! the ladder functions' prefix: ladder + `ensure` / `set` / `enc`
     why : string        //! what a missing arm does at run time
 }
 
 def private cm2_dispatch_name(fmt, tail : string) : string {
-    return fmt == "q8" ? "q8_batch_{tail}" : "kq_batch_{fmt}_{tail}"
+    return fmt == "q8" || fmt == "q51" || fmt == "mx4" ? "{fmt}_batch_{tail}" : "kq_batch_{fmt}_{tail}"
 }
 
 def private check_cm2_ladder_set(trio : LadderTrio; exempt : table<string>) {
@@ -901,7 +901,7 @@ def private check_cm2_ladder_set(trio : LadderTrio; exempt : table<string>) {
 
 def private check_cm2_ladder_sets {
     check_cm2_ladder_set(LadderTrio(suffix = "KhrBatch", tail = "khr_cls", ladder = "khr_cls_",
-        why = "the f16 feed admits the format on a KHR-mode card, where the KHR ladders panic"), CM2_KHR_EXEMPT)
+        why = "the f16 feed admits the format on a KHR-mode card, where the KHR ladders panic; a per-32 format the feed never admits there joins CM2_KHR_EXEMPT in this file and the licensed set ARCHITECTURE_GPU_VULKAN.md names, in the same change"), CM2_KHR_EXEMPT)
     check_cm2_ladder_set(LadderTrio(suffix = "Cm2EBatch", tail = "cm2e_cls", ladder = "cm2e_cls_",
         why = "the expert schedule takes the format's planes, and the e ladders panic on the first resident MoE window"), CM2_NO_EXEMPT)
 }
