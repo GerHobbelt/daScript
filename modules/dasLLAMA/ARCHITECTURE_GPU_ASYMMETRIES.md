@@ -30,8 +30,13 @@ asymmetries a stamp family ledgers - stays in `ARCHITECTURE_GPU.md#gpu-backends`
   per-layer device slots; Metal has every expert resident, so nothing is hot or cold.
 - **A plain MoE's host-layer form is Vulkan-only** (`ARCHITECTURE_GPU_VULKAN_HC.md#hc-token-command`,
   `#hc-window-chain`, the host-rows seat): a plain MoE a discrete card does not hold whole beside a context
-  asked whole moves its first routed layers' experts to the host, the token command and the window cut at
-  those layers; Metal holds the model whole from unified memory and cuts nothing.
+  asked whole, or one whose host-layers ask names them, moves its first routed layers' experts to the host,
+  the token command and the window cut at those layers; Metal holds the model whole from unified memory and
+  cuts nothing.
+- **The host-layers ask is read by the Vulkan plan alone** (`set_gpu_host_layers`,
+  `DASLLAMA_GPU_HOST_LAYERS`, `ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool`): it names how many routed
+  layers' experts the Vulkan plan moves to the host whatever the card holds; Metal moves no expert off the
+  device, so the ask has nothing to move.
 - **The strict context pin is read by the Vulkan plan alone** (`set_gpu_ctx_strict`,
   `DASLLAMA_GPU_CTX_STRICT`, `ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#resident-plan`): Metal's mirror is the
   model's own context in unified memory, so no plan shortens it and the pin has nothing to hold.
@@ -90,6 +95,12 @@ asymmetries a stamp family ledgers - stays in `ARCHITECTURE_GPU.md#gpu-backends`
   tower's `set_metal_fc_attn_dev`): each picks between two forms the Metal prefill or
   tower driver carries side by side, and the Vulkan chain has one form at each of those sites, so nothing to pick.
   The callers outside the backend are the probe `harness/p0_ko_probe.das` and the cells that hold both forms.
+- **The decode step's per-form A/B levers are Metal-only setters** (`set_metal_batch_gather`: the batched step takes the
+  rows the host embeds instead of gathering them off their ids; `set_metal_moe_g4_unfused`: the gemma-4 MoE tail on its
+  unfused chain instead of the one-step `MetalMoeCombG4`): the Metal decode driver encodes each step afresh, so a setter
+  flips one form between two steps and drops the pre-encoded step; the Vulkan driver builds its token commands' sets at
+  the load and resubmits them, so its counterparts are load-time pins over every command - `set_gpu_resident_embed(0)` for the host-embedded
+  rows, the `g_vk_fuse` pin of `DASLLAMA_VK_FUSE` for the split MoE tail - and no per-step setter.
 - **The NextN speculative round is Metal-only.** `register_mtp_round_override("metal", ...)` has one registrant, `metal_mtp_spec_round`;
   Vulkan serves the CPU round around its draft and verify seats (`ARCHITECTURE_GPU_MTP.md`). The assistant drafter's rounds ride
   `MtpAssistantSeams` on both homes (`ARCHITECTURE_GPU_MTP_ASSISTANT.md#assistant-drafter-step`, `ARCHITECTURE_GPU_VULKAN_MTP.md#resident-assistant-drafter`).
@@ -100,8 +111,8 @@ asymmetries a stamp family ledgers - stays in `ARCHITECTURE_GPU.md#gpu-backends`
   stream to it and one same-slab verify carries all their rows (`ARCHITECTURE_GPU_MTP.md#mtp-joint-verify`); on Vulkan and the CPU the tick steps each NextN stream through its own round. An assistant drafter's tick verifies every stream's rows together on both homes.
 - **The assistant drafter's drafts reach its verify on the device on Metal alone.** Metal's verify gathers the draft rows' embeds off
   the chain's token buffer, so drafts and verify run behind one another with no join between
-  (`ARCHITECTURE_GPU_MTP.md#mtp-round-one-join`). The Vulkan N-row command takes host-staged rows - each row's embed and rope row
-  built on the host at its own position - so the draft command lands its ids on the host first, one join a round
+  (`ARCHITECTURE_GPU_MTP.md#mtp-round-one-join`). The Vulkan N-row command takes host-staged ids and rope rows - each row's id
+  staged for its gather and its rope row built on the host at its own position - so the draft command lands its ids on the host first, one join a round
   (`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-assistant-drafter`).
 - **The device KV room seat is Metal-only.** `set_gpu_kv_room_hook` has one registrant, the Metal mirror's ceiling
   (`mirror_rows_within_ceiling`); `gpu_kv_room_rows` reads unbounded elsewhere and `device_kv_max_rows` the model's
@@ -157,7 +168,7 @@ asymmetries a stamp family ledgers - stays in `ARCHITECTURE_GPU.md#gpu-backends`
 - **The dev-W f16 panels are a Metal-only knob.** `DASLLAMA_METAL_DEVW` /
   `set_metal_devw_panels` makes Metal's dense Q8_0, K-quant, iquant and per-32 prefill sites read a stored f16
   copy of their planes in place of the per-window scratch panels
-  (`ARCHITECTURE_GPU_PREFILL.md#devw-panel-knees`); Vulkan's prefill tiles read each plane's
+  (`ARCHITECTURE_GPU_PREFILL_GEMM.md#devw-panel-knees`); Vulkan's prefill tiles read each plane's
   own blocks in the tile load, so that tier has no f16 weight panel for such a knob to keep.
 - **The device-side token-embedding gather covers different tables and calls per backend.** The
   engine asks a probe before it embeds; on true it stashes the token ids, skips the CPU embed
@@ -166,15 +177,16 @@ asymmetries a stamp family ledgers - stays in `ARCHITECTURE_GPU.md#gpu-backends`
   ids-form prefill installs SEPARATELY from the resident driver bundle (`install_rdec_prefill_ids`),
   so a tier without it never arms the gate - and a decode step through its own gate under its
   override name (`register_embed_dev_gates("vulkan")`); Metal registers both gates under its name
-  (`register_embed_dev_gates("metal")`). Both gather the window's rows and the single-row decode
-  step's row on the device off the table's q8 or K-quant plane by its format - Vulkan off the tied
+  (`register_embed_dev_gates("metal")`). A batched step's rows ride each backend's batch gate
+  (`register_embed_batch_gate`, the hub embedding them late where the override declines). Both gather
+  the window's rows, the decode step's row and a batched step's rows on the device off the table's q8
+  or K-quant plane by its format - Vulkan off the tied
   classifier's plane or an untied table's own plane in the arena (`EmbGather`, the `KqEmb<Fmt>`
   leaves, `ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#vk-token-gather`), Metal off the blob planes
   (`MetalEmbedKqT`, one stamp a format; `emb_dev_gather_ok`) - and the step reads a 4-byte token id
   in place of the row (Vulkan's recorded command off a host-visible word, Metal's poke). An
   F32/F16/BF16 table both gather off its exact f32 rows - Metal reading the blob in place in unified
-  memory, Vulkan off a device upload under `RDEC_EMB_F32_CAP` the plan counts first. A Q4_1
-  table's fp32 rows are a dequant: Metal gathers them, Vulkan keeps the host embed for them.
+  memory, Vulkan off a device upload under `RDEC_EMB_F32_CAP` the plan counts first.
 - **The deltanet-resident seats are Vulkan-only.** The whole-model driver's recurrent arm
   installs SEPARATELY from the resident bundle (`install_moe_gpu_resident_dn`: a recurrent
   layer's plane set, its beta/alpha rows, the per-token owner bind and the prefill's slot

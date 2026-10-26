@@ -323,28 +323,31 @@ def select_prefill_override(name : string) : bool {
 
 def active_prefill_override : string => g_prefill_override_name
 
-//! The GPU-PLE pre-step gates, one per direction: a prefill override that builds the E-series PLE
-//! side input on device registers the prefill gate, a decode override that gathers the token's row
-//! on device registers the decode gate; on true the hub skips the CPU pre-step for that call only.
+//! The GPU-PLE pre-step gates, one list per direction: every driver that builds the E-series PLE side input on device
+//! registers its prefill gate and its decode gate (a build carries both GPU homes, each gate answering for its own armed
+//! driver); the first gate that takes a call has the hub skip the CPU pre-step for that call only.
 typedef PleGpuGateFn = function<(t : Model; s : Session; npos : int64; start_pos : int64) : bool>
-var private g_ple_gpu_gate : PleGpuGateFn
-var private g_ple_gpu_gate_set = false
-var private g_ple_gpu_decode_gate : PleGpuGateFn
-var private g_ple_gpu_decode_gate_set = false
+var private g_ple_gpu_gates : array<PleGpuGateFn>
+var private g_ple_gpu_decode_gates : array<PleGpuGateFn>
 
 def register_ple_gpu_gate(fn : PleGpuGateFn) {
-    g_ple_gpu_gate = fn
-    g_ple_gpu_gate_set = true
+    g_ple_gpu_gates |> push(fn)
 }
 
 def register_ple_gpu_decode_gate(fn : PleGpuGateFn) {
-    g_ple_gpu_decode_gate = fn
-    g_ple_gpu_decode_gate_set = true
+    g_ple_gpu_decode_gates |> push(fn)
 }
 
-//! the decode gate's answer for a step's rows: true when the armed driver gathers and projects the side input itself
-def ple_gpu_decode_gate(t : Model; s : Session; npos, pos : int64) : bool
-    => g_ple_gpu_decode_gate_set && invoke(g_ple_gpu_decode_gate, t, s, npos, pos)
+//! a gate of `gates` takes the call
+def private ple_gate_taken(gates : array<PleGpuGateFn>; t : Model; s : Session; npos, pos : int64) : bool {
+    for (g in gates) {
+        return true if (invoke(g, t, s, npos, pos))
+    }
+    return false
+}
+
+//! the decode gates' answer for a step's rows: true when the armed driver gathers and projects the side input itself
+def ple_gpu_decode_gate(t : Model; s : Session; npos, pos : int64) : bool => ple_gate_taken(g_ple_gpu_decode_gates, t, s, npos, pos)
 
 typedef EmbedGpuGateFn = function<(t : Model; s : Session; npos : int64; start_pos : int64) : bool>
 var private g_embed_gpu_gate : EmbedGpuGateFn
@@ -375,6 +378,22 @@ var private g_embed_dev_decode_gates : table<string; EmbedGpuGateFn>
 def register_embed_dev_gates(name : string; prefill, decode : EmbedGpuGateFn) {
     g_embed_dev_prefill_gates[name] = prefill
     g_embed_dev_decode_gates[name] = decode
+}
+
+var private g_embed_dev_batch_gates : table<string; EmbedGpuGateFn>
+
+//! The batch-decode override `name`'s gather gate: while it is the armed batch override, the gate answers whether its batched
+//! step gathers every row off the row's token id itself - the hub then embeds no row, and embeds them all where the step declines
+[arch(at="../ARCHITECTURE_GPU_ASYMMETRIES.md#gpu-asymmetries")]
+def register_embed_batch_gate(name : string; gate : EmbedGpuGateFn) {
+    g_embed_dev_batch_gates[name] = gate
+}
+
+//! a batched step's rows gather on the device: the armed batch override's gate, on a model whose pre-stack steps read no host row
+def embed_batch_on_device(t : Model; s : Session; nrows, pos : int64) : bool {
+    return false if (t.blocks.pre_stack_decode != null)
+    let own = g_embed_dev_batch_gates?[g_batch_decode_override_name] ?? default<EmbedGpuGateFn>
+    return own != default<EmbedGpuGateFn> && invoke(own, t, s, nrows, pos)
 }
 
 //! the prefill rows gather on the device: the active override's own gate where it registered one, else the installed seat's
@@ -458,7 +477,7 @@ def ple_pre_prefill_gated(t : Model; var s : Session; tokens : array<int64>; off
     for (p in range64(npos)) {
         s.ple_gpu_tokens[p] = tokens[off + p]
     }
-    if (g_ple_gpu_gate_set && invoke(g_ple_gpu_gate, t, s, npos, start_pos)) {
+    if (ple_gate_taken(g_ple_gpu_gates, t, s, npos, start_pos)) {
         s.ple_gpu_pending = true
     } else {
         ple_pre_prefill(t, s, s.ple_gpu_tokens, npos)
@@ -469,7 +488,7 @@ def ple_pre_prefill_gated(t : Model; var s : Session; tokens : array<int64>; off
 //! (pad ids stashed — the media path has no tokens), CPU pad impl on decline. The model_proj
 //! GEMM inside the finish is the whole cost, so an eligible driver must get the offer here too.
 def ple_pre_prefill_pad_gated(t : Model; var s : Session; npos, start_pos : int64) {
-    if (g_ple_gpu_gate_set && invoke(g_ple_gpu_gate, t, s, npos, start_pos)) {
+    if (ple_gate_taken(g_ple_gpu_gates, t, s, npos, start_pos)) {
         s.ple_gpu_tokens |> resize(npos)
         for (p in range64(npos)) {
             s.ple_gpu_tokens[p] = 0l
@@ -725,6 +744,26 @@ def mtp_round_commit_host(var s : Session; pos, k, a : int64) {
     s.n_past = pos + a + 1l
 }
 
+let MTP_COLD_PAST_CONTEXT = "the round would run past the context"   //! the one cold reason that is the work's size
+
+//! why neither home drafts the round ("" where it can): nothing evaled yet (the zero-init `mtp_h_pos1` sentinel collides with
+//! position 0), a hidden row from another position or shorter than the drafter's width, or `MTP_COLD_PAST_CONTEXT`
+def mtp_round_cold_why(t : Model; s : Session; pos, k, tdim : int64) : string {
+    return "nothing is evaled at position 0" if (pos < 1l)
+    return "the carried hidden row is from another position" if (s.mtp_h_pos1 != pos)
+    return "the carried hidden row is shorter than the drafter's width" if (long_length(s.mtp_h) < tdim)
+    return MTP_COLD_PAST_CONTEXT if (pos + k + 1l > t.config.seq_len)
+    return ""
+}
+
+def mtp_round_cold_host(t : Model; s : Session; pos, k, tdim : int64) : bool => mtp_round_cold_why(t, s, pos, k, tdim) != ""
+
+//! the round's `a` accepted drafts landed: the accepted row becomes the next round's hidden row, the draft count moves
+def mtp_round_take(var s : Session; a, kd, dim : int64) {
+    copy_floats(s.mtp_hrows, a * dim, s.mtp_h, 0l, dim)
+    s.mtp_drafted += kd
+}
+
 //! A GPU driver's assistant-drafter seams (the gemma-4 drafter sidecar), one set a backend: the attach (`""`, or why it refused),
 //! whether `t` has one attached on this backend, and the speculative rounds of a tick's streams at depth `k` - each stream's
 //! accepted draft count in `acc`, the drafts in its `mtp_vbatch[1..]`, the streams whose rows one verify carried returned.
@@ -742,6 +781,9 @@ struct MtpAssistantStats {
     accepted : int64
     rounds : int64
     joint : int64      //! verifies whose rows carried two streams or more
+    draft_us : int64   //! the round's time split, microseconds: the CPU draft chains (a GPU chain rides the verify's command buffer and sits in verify_us), the verify with its walks and commits, the plain steps of streams it could not take or whose verify it declined
+    verify_us : int64
+    cold_us : int64
 }
 var private g_mtp_assistants : table<string; MtpAssistantSeams>
 var private g_mtp_sidecar : function<(model_path : string) : string>
@@ -756,21 +798,29 @@ def register_mtp_sidecar(fn : function<(model_path : string) : string>) {
     g_mtp_sidecar = fn
 }
 
-//! The assistant drafter file beside `model_path` ("" where none, or no loader is registered).
-def mtp_drafter_sidecar_(model_path : string) : string
-    => g_mtp_sidecar != null ? invoke(g_mtp_sidecar, model_path) : ""
+//! The assistant drafter file beside `model_path` ("" where none, or no loader is registered - logged with the module to require).
+def mtp_drafter_sidecar_(model_path : string) : string {
+    return invoke(g_mtp_sidecar, model_path) if (g_mtp_sidecar != null)
+    to_log(LOG_WARNING, "dasLLAMA: no assistant drafter sidecar resolver is registered - require dasllama/dasllama_mtp_gemma (dasllama/dasllama_transformer requires it)\n")
+    return ""
+}
 
-//! Attach the assistant drafter at `path` to `t` on the backend that serves it; false where no backend took it, each refusal logged.
-def attach_mtp_drafter_(t : Model; path : string) : bool {
+//! why no backend took the drafter: each registered backend's refusal (`whys`, "<backend>: <why>"), or that none is registered
+def mtp_attach_refusal(whys : array<string>) : string
+    => (empty(whys) ? "no GPU driver on this build carries an assistant drafter - require dasllama/dasllama_metal_mtp_gemma (dasMetal) or dasllama/dasllama_vulkan_mtp_gemma (dasVulkan)"
+        : join(whys, "; "))
+
+//! Attach the assistant drafter at `path` to `t` on the backend that serves it: "" attached, else every backend's refusal, logged.
+def attach_mtp_drafter_(t : Model; path : string) : string {
     var whys : array<string>
     for (name, seams in keys(g_mtp_assistants), values(g_mtp_assistants)) {
         let why = invoke(seams.attach, t, path)
-        return true if (empty(why))
+        return "" if (empty(why))
         whys |> push("{name}: {why}")
     }
-    let none = empty(whys) ? "no GPU driver on this build carries an assistant drafter" : join(whys, "; ")
+    let none = mtp_attach_refusal(whys)
     to_log(LOG_WARNING, "dasLLAMA: the assistant drafter {path} is not attached - {none}\n")
-    return false
+    return none
 }
 
 //! The backend `t`'s assistant drafter is attached on ("" = none)
@@ -872,7 +922,6 @@ typedef GatherStackKqFn = function<(t : Model; fmt : KqFmt; woff : int64; n, row
                                     var wq : array<uint8>; var ws : array<uint8>) : void>
 var private g_layout_repack_q8 : ModelRepackFn
 var private g_layout_repack_kq : ModelRepackFn
-var private g_layout_repack_mx4 : ModelRepackFn
 //! one per-32 format's planes repacked in place
 typedef ModelRepackB32Fn = function<(var t : Model; fmt : KqFmt) : void>
 var private g_layout_repack_b32 : ModelRepackB32Fn
@@ -884,12 +933,11 @@ var private g_layout_gather_b32 : GatherStackKqFn
 var private g_layout_gather_mx4 : GatherStackB32Fn
 var private g_layout_hooks_set = false
 
-def register_model_layout(rq8, rkq, rmx4 : ModelRepackFn; rb32 : ModelRepackB32Fn;
+def register_model_layout(rq8, rkq : ModelRepackFn; rb32 : ModelRepackB32Fn;
                           gs : GatherStackFn; gskq, gsb32 : GatherStackKqFn;
                           gsmx4 : GatherStackB32Fn) {
     g_layout_repack_q8 = rq8
     g_layout_repack_kq = rkq
-    g_layout_repack_mx4 = rmx4
     g_layout_repack_b32 = rb32
     g_layout_gather = gs
     g_layout_gather_kq = gskq
@@ -911,7 +959,7 @@ def layout_gather_dispatch(src : Model; f : KqFmt; woff, n, rows, slice_rows, mr
         let qmr = disk ? 1l : active_b32_layout_mr(f)
         layout_gather_stack_b32(src, f, woff, n, rows, srows, qmr > 1l, qmr, wq, ws)
     } elif (f == KqFmt.mx4) {
-        // the mx4 stacks ride the Q8 layout's grp<mr> interleave when the CPU repacked them (repack_mx4_stacks under the q8q8 perm), disk order otherwise
+        // the mx4 stacks ride the Q8 layout's grp<mr> interleave when the CPU repacked them (the q8 walk's mx4 regions under the q8q8 perm), disk order otherwise
         layout_gather_stack_mx4(src, woff, n, rows, srows, src.mx4_repacked, active_q8_layout_mr(), wq, ws)
     } else {
         layout_gather_stack_kq(src, f, woff, n, rows, srows, src.kq_repacked && !disk, disk ? 1l : kq_active_mr(src, f), wq, ws)
@@ -932,11 +980,6 @@ def layout_repack_q8(var t : Model) {
 def layout_repack_kq(var t : Model) {
     layout_hooks_check()
     invoke(g_layout_repack_kq, t)
-}
-
-def layout_repack_mx4(var t : Model) {
-    layout_hooks_check()
-    invoke(g_layout_repack_mx4, t)
 }
 
 def layout_repack_b32(var t : Model; fmt : KqFmt) {
@@ -1121,6 +1164,26 @@ def blob_only_panic(t : Model; what : string) {
 
 def has_decode_override(name : string) : bool => key_exists(g_decode_overrides, name)
 
+//! Drops the decode override `name` and every seat registered under its name - the batched step, the token-table gather
+//! gates, the speculative round's seats - deselecting it first where it is the active one
+def unregister_decode_override(name : string) {
+    if (g_decode_override_name == name) {
+        select_decode_override("")
+    }
+    g_decode_overrides |> erase(name)
+    g_batch_decode_overrides |> erase(name)
+    g_embed_dev_decode_gates |> erase(name)
+    g_embed_dev_batch_gates |> erase(name)
+    g_mtp_spec_overrides |> erase(name)
+    g_mtp_spec_batch_overrides |> erase(name)
+    g_mtp_seam_overrides |> erase(name)
+    g_mtp_round_overrides |> erase(name)
+    g_mtp_draft_overrides |> erase(name)
+    g_mtp_verify_overrides |> erase(name)
+    g_mtp_rollback_overrides |> erase(name)
+    g_mtp_seat_owners |> erase(name)
+}
+
 //! How the Metal pipeline engages — ONE knob for all three GPU paths (prefill, single-stream
 //! decode, batched decode).
 enum MetalMode {
@@ -1266,14 +1329,19 @@ struct Model {
     // layout_offsets; kv_row_prefix aliases a shared layer's slot onto its source's.
     kv_src : array<int64>
     // gemma-4 E-series per-layer embeddings (PLE) — offsets valid only when config.n_embd_per_layer > 0.
-    // The Q8 token table (linear, gathered per token — NOT repacked) + the per-layer Q8 gate/proj live
-    // in the big-weight blob; the fp32 model-proj + the two norm families live in fblob.
+    // The token table (linear, gathered per token — NOT repacked) + the per-layer gate/proj live
+    // in the big-weight planes; the fp32 model-proj + the two norm families live in fblob.
     ple_emb_off : int64     // qblob: Q8 per_layer_token_embd, linear [vocab x (ple*layers)]
     ple_model_off : int64   // fblob: fp32 per_layer_model_proj [dim x (ple*layers)]
     ple_pnorm_off : int64   // fblob: fp32 per_layer_proj_norm [ple]
-    ple_gate_off : int64    // qblob: per_layer_inp_gate, layers x (dim x ple)
-    ple_proj_off : int64    // qblob: per_layer_proj,     layers x (ple x dim)
     ple_post_off : int64    // fblob: fp32 per_layer_post_norm, layers x dim
+    //! per layer: inp_gate [dim -> ple] and proj [ple -> dim] in their tags' planes (`ple_plane`), or in fblob under the f32 marks
+    ple_gate_offs : array<int64>
+    ple_proj_offs : array<int64>
+    @exact_size ple_gate_fmt : array<KqFmt>   //! per layer, the file's format (empty = q8 everywhere)
+    @exact_size ple_proj_fmt : array<KqFmt>
+    ple_gate_f32 : bool = false   //! every inp_gate ships F32: the rows stay the file's f32 in fblob
+    ple_proj_f32 : bool = false   //! every proj ships F32, the same
     // per-layer KV-ROW prefix (Σ layer_kv_dim of prior layers), filled by layout_offsets — makes
     // kv_cache_off O(1). seq_len-INDEPENDENT on purpose: tests cap seq_len after load, so the cache
     // offset multiplies by the live value at call time, never a baked one
@@ -1423,11 +1491,11 @@ struct Model {
     emb_q8 : bool = false
     emb_q8_off : int64
     emb_kq_off : int64 = -1l   //! an untied K-quant token table's offset in emb_fmt's planes (the tied table is the classifier's plane at wcls_off)
-    //! a tied table whose disk type no KqFmt carries (F16, BF16, Q4_1): the fp32 rows serve the embed and the CPU classifier, and a
+    //! a tied table whose disk type no KqFmt carries (F16, BF16): the fp32 rows serve the embed and the CPU classifier, and a
     //! q8 transcode at wcls_off - a converted copy - serves the device classifier (loads under a Metal mode)
     cls_q8_copy : bool = false
-    //! the fp32 table holds the file's own values: F32 on disk, or F16/BF16 widened without loss (a Q4_1 table's fp32 rows are a
-    //! dequant, a converted copy); the Vulkan gather's f32 seat serves this table alone
+    //! the fp32 table holds the file's own values: F32 on disk, or F16/BF16 widened without loss; the Vulkan
+    //! gather's f32 seat serves this table alone
     emb_f32_exact : bool = false
     quant : QuantMode
     rope_freqs : array<float>   // per-pair RoPE scaling (Llama-3.1 NTK-by-parts); empty = none
@@ -2155,7 +2223,7 @@ def public get_kq_q40_native() : bool => g_kq_q40_native
 var private g_kq_q51_native = true
 
 //! Enable/disable the native Q5_1 plane tier for subsequent loads (A/B rail; default ON;
-//! requires kquant_native). Expert stacks only — dense positions always requant to q8.
+//! requires kquant_native): the expert stacks and the dense planes keep the file's Q5_1 bytes.
 def public set_kq_q51_native(on : bool) {
     g_kq_q51_native = on
 }
@@ -2184,7 +2252,7 @@ var private g_metal_devw_panels = false
 //! A/B seat: the Metal prefill's STORED dev-W f16 panels - a converted copy of a dense site's plane, baked into a metal
 //! image (its lane folds the lever) or resident across windows - against the default, the per-window scratch panels.
 //! Default off; the pin or DASLLAMA_METAL_DEVW=1 (the served A/B rail) turns it on.
-[arch(at="../ARCHITECTURE_GPU_PREFILL.md#devw-panel-knees")]
+[arch(at="../ARCHITECTURE_GPU_PREFILL_GEMM.md#devw-panel-knees")]
 def public set_metal_devw_panels(v : bool) {
     g_metal_devw_panels = v
     to_log(LOG_WARNING, "dasLLAMA: set_metal_devw_panels({v}) - the dense Q8_0 and K-quant prefill sites {v ? "read a stored f16 converted copy of their planes" : "read per-window scratch panels past their row floor, their own bytes under it"}\n")
@@ -2238,7 +2306,7 @@ def private rope_override_from_env {
 }
 
 //! The tools' spelling of DASLLAMA_ROPE_SCALING / ROPE_SCALE / YARN_ORIG_CTX, set before the load; the loader checks the kind
-[arch(at = "../ARCHITECTURE_ENGINE.md#rope-scaling-bake")]
+[arch(at = "../ARCHITECTURE_ENGINE_MECHANISMS.md#rope-scaling-bake")]
 def public set_rope_scaling_override(o : RopeScalingOverride) {
     g_rope_override = o
     g_rope_override.kind = to_lower(o.kind)
@@ -2723,6 +2791,7 @@ struct Session {
     rdec_region : int64         //! the mirror region the claim above sits in (meaningful only while `rdec_gen` matches that region's)
     rdec_host_current : bool
     device_kv : bool            //! the K/V lives ONLY in the armed GPU driver's mirror region: no host cache is allocated
+    kv_ring_floor : int64       //! the earliest position a continuation may start at: a GPU mirror that rings the sliding layers holds their history from there on (0 = everywhere)
     dat_gen : int64             // the per-op decode attention block's mirror generation this session claimed (0 = none)
     tail_next1 : int64          // 1 + the layer whose resident FFN may take the decode tail this token (0 = none)
     tail_taken : bool           // the tail took this layer's FFN: the residual add is the device's
@@ -2927,7 +2996,7 @@ struct Session {
     // MTP/NextN self-spec state (empty unless config.n_layer_nextn > 0). mtp_h is the trunk's
     // post-output-norm hidden of the LAST evaluated position (the MTP draft-head handoff);
     // mtp_h_pos1 is that position PLUS ONE (0 = cold, keeps Session zero-init-safe).
-    mtp_h : array<float>           // h_nextn (dim; hc x dim under hyper-connections - the wide residual before the head mixer)
+    @exact_size mtp_h : array<float>           // h_nextn (dim; hc x dim under hyper-connections - the wide residual before the head mixer)
     mtp_h0 : array<float>          // the verify batch's ROW-0 normed hidden (= h_pos). forward_prefill's
                                    // tail only stashes the LAST row, which a reject discards — this is
                                    // what re-seeds mtp_h so a rejected step needs no re-forward
@@ -2939,8 +3008,8 @@ struct Session {
     mtp_logits : array<float>      // verify-batch row-0 logits (vocab; the draft check reads its argmax)
     mtp_vbatch : array<int64>      // the 2-row verify batch [tok, draft] (persistent — no per-step alloc)
     mtp_norm_b : array<float>      // verify-batch final-normed rows (npos x dim), input to the batched classifier
-    @scratch mtp_logits_b : array<float>   // verify-batch logits (rows x vocab), grown once to the round's width
-    @scratch mtp_hrows : array<float>      // verify-batch post-final-norm hidden rows (rows x dim) — the drafter's next input / the carry
+    @scratch @exact_size mtp_logits_b : array<float>   // verify-batch logits (rows x vocab), grown once to the round's width
+    @scratch @exact_size mtp_hrows : array<float>      // verify-batch post-final-norm hidden rows (rows x dim) — the drafter's next input / the carry
     @scratch mtp_picks : array<int64>      //! the last served verify seat's per-row picks, each its row's argmax: the greedy walk's truth, and the token a pick-asking round commits
     mtp_drafted : int64            // session-lifetime telemetry: drafts attempted / accepted
     mtp_accepted : int64
@@ -3955,6 +4024,22 @@ def kv_row_total(t : Model; with_head : bool = true) : int64 {
     return tot
 }
 
+//! a call at `pos` reads the sliding layers' rows of the window under it, which a ringed GPU mirror holds from the session's ring floor on:
+//! a start at 0 rebuilds the history and clears the floor, a start under it panics
+[arch(at="../ARCHITECTURE_GPU_KV_RING.md#kv-ring-floor")]
+def kv_ring_floor_check(var s : Session; pos : int64) {
+    if (pos == 0l) {
+        s.kv_ring_floor = 0l
+    } elif (pos < s.kv_ring_floor) {
+        kv_ring_floor_panic(s, pos)
+    }
+}
+
+[cold_path]
+def private kv_ring_floor_panic(s : Session; pos : int64) {
+    panic("dasLLAMA: a call at position {pos} continues a history whose sliding-window layers' rows the GPU mirror's ring holds from position {s.kv_ring_floor} on - prefill again from position 0 (DASLLAMA_GPU_KV_RING=0 keeps every row)")
+}
+
 // The eval capacity tripwire: every session buffer (KV planes, att scratch, run tables) is sized
 // by config seq_len and the store paths write through unsafe pointers, so an eval crossing
 // seq_len corrupts the das heap silently - every eval entry calls this before its first store
@@ -4697,6 +4782,7 @@ def private embed_b32_row(t : Model; fmt : KqFmt; token : int64; var dst : float
 
 //! Format router: q8-tagged weights take the classic mm; kq tags take the plane GEMV; a per-32 plane
 //! quantizes x to Q8_0 and takes its own format's kernel.
+[arch(at="../ARCHITECTURE_CPU_KERNELS.md#q8-activation-forms")]
 def mm_f(var y : array<float>; t : Model; fmt : KqFmt; woff : int64; x : array<float>; var xq : array<int8>; var xs : array<float>; var xbs : array<int>; n, d : int64) {
     if (fmt == KqFmt.q8) {
         mm(y, t, woff, x, xq, xs, n, d)
@@ -4724,13 +4810,18 @@ def mm_pre_f(var y : array<float>; t : Model; fmt : KqFmt; woff : int64; xq : ar
 def fmt_reads_q8k(fmt : KqFmt) : bool => kq_sb(fmt)
 
 // Batched format router: q8 weights ride the batch tile; kq weights take the native kq tile
-// (repacked loads) or the serial-per-position fallback (see mm_b_kq); a per-32 plane its own batch kernel.
+// (repacked loads) or the serial-per-position fallback (see mm_b_kq); a per-32 plane its own batch kernel, or the tier's
+// batch tile where the dense rail holds it.
 def mm_b_f(var s : Session; var y : array<float>; t : Model; fmt : KqFmt; woff : int64; x : array<float>; n, d, npos : int64) {
     if (fmt == KqFmt.q8) {
         mm_b(y, t, woff, x, s.xqb, s.xsb, n, d, npos)
     } elif (kq_dense_b32(fmt)) {
         requant_rows_q8(x, n, npos, s.xqb, s.xsb)
-        mm_b32_pre(y, t, woff, s.xqb, s.xsb, n, d, npos, fmt)
+        if (npos >= 32l && moe_gpu_dense_on_gpu(int(fmt), woff)) {
+            matmul_gpu_dense(y, woff, s.xqb, s.xsb, n, d, npos, int(fmt))
+        } else {
+            mm_b32_pre(y, t, woff, s.xqb, s.xsb, n, d, npos, fmt)
+        }
     } else {
         mm_b_kq(s, y, t, fmt, woff, x, n, d, npos)
     }
@@ -4893,6 +4984,54 @@ def mm_b(var y : array<float>; t : Model; woff : int64; x : array<float>; var xq
 //! alternates (p=2, even layers slide), Gemma3 runs 5 local : 1 global (p=6).
 def layer_is_sliding(c : Config; l : int64) : bool => (c.sliding_window > 0l && l < c.n_layers
     && (c.swa_mask != 0ul ? ((c.swa_mask >> uint64(l)) & 1ul) != 0ul : l % c.swa_pattern != c.swa_pattern - 1l))
+
+var private g_gpu_kv_ring_pin = -1   //! a caller's pin over DASLLAMA_GPU_KV_RING for the models loaded next: -1 the environment's, 0 flat, 1 ringed
+
+//! Pin the sliding layers' K/V mirror rings on the models this process arms next: 1 rings them, 0 keeps every position's row,
+//! -1 lets DASLLAMA_GPU_KV_RING decide
+def set_gpu_kv_ring(pin : int) {
+    g_gpu_kv_ring_pin = pin
+}
+
+//! The pin `set_gpu_kv_ring` set: what a caller that pins it puts back
+def gpu_kv_ring_pin : int => g_gpu_kv_ring_pin
+
+//! `body` under the sliding layers' ring pin `ring` (`set_gpu_kv_ring`), the pin put back as it was found - `body` may move the pin
+//! itself
+def with_gpu_kv_ring(ring : int; body : block<void>) {
+    let pin = g_gpu_kv_ring_pin
+    set_gpu_kv_ring(ring)
+    invoke(body)
+    set_gpu_kv_ring(pin)
+}
+
+//! Whether the next armed mirror rings its sliding layers
+def gpu_kv_ring_on : bool => g_gpu_kv_ring_pin < 0 ? g_env_gpu.gpu_kv_ring : g_gpu_kv_ring_pin != 0
+
+//! the K/V mirror rows layer `l` keeps at a context of `ctx` positions when one command writes at most `slack` rows: a sliding layer's
+//! window and the slack, rounded up to the attention tiles' 64-row step, as a ring (`kv_ring_row`); 0 = a row a position (a global
+//! layer, a ring that would reach the context, the lever off). A shared-KV layer asks its donor's.
+[arch(at="../ARCHITECTURE_GPU_KV_RING.md#kv-sliding-ring")]
+def kv_ring_rows(c : Config; l, ctx, slack : int64) : int64 {
+    return 0l if (!gpu_kv_ring_on() || !layer_is_sliding(c, l))
+    let rows = round_up(c.sliding_window + slack, 64l)
+    return rows < ctx ? rows : 0l
+}
+
+//! The announce of a sliding-window model's K/V mirror on GPU home `home`: `ringed` the rings' line, else - the pin or the knob
+//! turned them off - the flat slab's; a model with no sliding layer says nothing
+def kv_ring_announce(c : Config; home, ringed : string) {
+    var sliding = false
+    for (l in range64(c.n_layers)) {
+        sliding ||= layer_is_sliding(c, l)
+    }
+    return if (!sliding)
+    if (gpu_kv_ring_on()) {
+        to_log(LOG_INFO, "dasLLAMA: {home} - the sliding layers' K/V rows ride rings of {ringed} (set_gpu_kv_ring, DASLLAMA_GPU_KV_RING=0 keeps every row)\n")
+    } else {
+        to_log(LOG_WARNING, "dasLLAMA: {home} - the sliding layers' K/V rows keep every position's row, no ring, as asked (set_gpu_kv_ring, DASLLAMA_GPU_KV_RING=0)\n")
+    }
+}
 
 // ===== Per-layer attention geometry (gemma4: sliding vs global layer classes differ) =====
 // head_size/n_kv_heads/kv_dim in Config describe the GLOBAL class; the *_swa fields (0 = same)
@@ -5234,6 +5373,22 @@ def private cls_softcap_chain(t : Model; var s : Session; cap : float) {
     }
 }
 
+//! Fill ``dst[at*dim ..]`` with the embedding rows of the first ``n`` ``tokens`` (embed_scale applied)
+def embed_text_rows(t : Model; tokens : array<int64>; var dst : array<float>; at, n : int64) {
+    let dim = t.config.dim
+    for (p in range64(n)) {
+        embed_row(t, tokens[p], unsafe(addr(dst[(at + p) * dim])))
+    }
+    if (t.config.embed_scale != 1.0) {  // Gemma2: scale the embedding by sqrt(dim)
+        scale_inplace(unsafe(addr(dst[at * dim])), t.config.embed_scale, n * dim)
+    }
+}
+
+//! every row of ``tokens`` at ``dst[at*dim ..]`` - the text-span half of a multimodal prefill buffer
+def embed_text_rows(t : Model; tokens : array<int64>; var dst : array<float>; at : int64) {
+    embed_text_rows(t, tokens, dst, at, long_length(tokens))
+}
+
 //! token's embedding row into the residual stream s.x, under the model's embed scale
 def private embed_token_row(t : Model; var s : Session; token : int64) {
     embed_row(t, token, unsafe(addr(s.x[0])))
@@ -5248,6 +5403,7 @@ def forward(t : Model; var s : Session; token, pos : int64) {   // nolint:STYLE0
     let c = t.config
     let dim = c.dim
     dispatch_phase_decode()
+    kv_ring_floor_check(s, pos)
     kv_ensure(s, pos + 1l)   // paged sessions: grow the block table BEFORE any cache-pointer hoist
 
     // token embedding: row `token` into the residual stream
@@ -5481,6 +5637,20 @@ def set_mtp_depth(k : int64) {
 //! Back to the box defaults - the per-kind knobs decide again.
 def clear_mtp_depth {
     g_mtp_depth_explicit = false
+}
+
+//! What `set_mtp_depth` and `clear_mtp_depth` left: whether an explicit depth stands, and the depth set
+struct MtpDepthPin {
+    pinned : bool
+    depth : int64
+}
+
+//! The pin a caller that sets the depth puts back through `restore_mtp_depth`
+def mtp_depth_pin : MtpDepthPin => MtpDepthPin(pinned = g_mtp_depth_explicit, depth = g_mtp_depth)
+
+def restore_mtp_depth(pin : MtpDepthPin) {
+    g_mtp_depth = pin.depth
+    g_mtp_depth_explicit = pin.pinned
 }
 
 def set_mtp_depth_nextn(k : int64) {
@@ -6679,6 +6849,7 @@ def private forward_prefill_warm(t : Model; var s : Session; tokens : array<int6
 [arch(at="../ARCHITECTURE_GPU_PREFILL_WINDOW.md#prefill-segments")]
 def private forward_prefill_head(t : Model; var s : Session; tokens : array<int64>; npos, start_pos : int64) {
     let c = t.config
+    kv_ring_floor_check(s, start_pos)
     if (npos >= 32l) {
         dispatch_phase_batch()
     }

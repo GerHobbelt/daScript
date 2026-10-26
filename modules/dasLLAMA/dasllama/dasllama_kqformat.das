@@ -370,6 +370,12 @@ let GGML_TYPE_Q6_K = 14
 let GGML_TYPE_IQ4_XS = 23
 let GGML_TYPE_BF16 = 30
 let GGML_TYPE_MXFP4 = 39
+// ... and the ids the load declines by name: no reader arm and no `KqFmt` member carries them
+let GGML_TYPE_Q4_1 = 3
+let GGML_TYPE_IQ1_S = 19
+let GGML_TYPE_IQ1_M = 29
+let GGML_TYPE_TQ1_0 = 34
+let GGML_TYPE_TQ2_0 = 35
 
 //! One format's descriptor row - every per-format number a consumer keys off. The stride unit is
 //! one 256-weight superblock on the kq lattice and one 32-weight block for q8/q51/mx4; `qsb` is 0
@@ -1362,7 +1368,7 @@ def kq_elems(f : KqFmt) : int64 => kq_desc(f).elems
 let Q8_STREAM_TAG = 0   //! the q8 family's stream / repack region tag - the one format with no `kq_desc` row
 let K2_STREAM_TAG = 20
 
-//! mx4's stream tag is the GGML type id (`GGML_TYPE_MXFP4`); no loader path streams an mx4 plane, so the row exists only to keep `kq_stream_code` total
+//! mx4's stream tag is the GGML type id (`GGML_TYPE_MXFP4`): the code its streamed jobs and repack regions carry
 let MX4_STREAM_TAG = 39
 
 //! iq4nl32's stream tag: a code no kernel id claims (iq4nl's 45 is the superblock rail's)

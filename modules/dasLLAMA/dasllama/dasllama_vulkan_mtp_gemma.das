@@ -10,7 +10,9 @@ require vulkan
 require dasllama/dasllama_common
 require dasllama/dasllama_math   // grow_resize - the scratch sizing
 require dasllama/dasllama_kqformat
+require dasllama/dasllama_gemm_schema   // Q8_BLOCK_ELEMS - the activation scale rows
 require dasllama/dasllama_mtp_gemma
+require dasllama/dasllama_layout   // q8_repack - the drafter's q8 planes off the GGUF blocks
 require dasllama/dasllama_gpu_math   // ACT_GELU
 require dasllama/dasllama_gpu_kernels_common   // gk_rope_kv_args, GkQkRmsArgs
 require dasllama/dasllama_gpu_resident   // the tier's assistant seams: the bind, the N-row verify, the commit, the rope row
@@ -139,40 +141,6 @@ def private q8_tensors(dr : GemmaDrafter) : array<tuple<boff : int64; n : int64>
     return <- out
 }
 
-//! the GGUF's 34-byte Q8_0 blocks split into the device plane pair the q8 GEMV reads: 32 quant bytes a block, an f16 scale a
-//! block; each tensor's first block index back, in `q8_tensors` order
-def private q8_repack(dr : GemmaDrafter; var quants : array<uint8>; var scales : array<uint16>) : array<int64> {
-    var tensors <- q8_tensors(dr)
-    var nblk = 0l
-    for (te in tensors) {
-        nblk += te.n / 32l
-    }
-    quants |> reserve(nblk * 32l)
-    quants |> resize(nblk * 32l)
-    scales |> reserve(nblk)
-    scales |> resize(nblk)
-    var bases : array<int64>
-    bases |> reserve(long_length(tensors))
-    var cur = 0l
-    for (te in tensors) {
-        bases |> push(cur)
-        unsafe {
-            let src = addr<uint8 const?>(dr.blob[te.boff])
-            for (b in range64(te.n / 32l)) {
-                let bp = src + b * 34l
-                scales[cur] = uint16(uint(bp[0]) | (uint(bp[1]) << 8u))
-                memcpy(addr<void?>(quants[cur * 32l]), reinterpret<void?>(bp + 2l), 32l)
-                cur++
-            }
-        }
-    }
-    delete tensors
-    return <- bases
-}
-
-//! a device buffer of `bytes` made soft: 0 marks `oom`
-def private dev_buf(var oom : bool&; bytes : int64) : uint64 => soft_device_buf(oom, bytes)
-
 //! `bytes` of `src` into a fresh soft device buffer (0 and `oom` where the card has no room)
 def private dev_from(var oom : bool&; src : uint8 const?; bytes : int64) : uint64 {
     let h = soft_device_buf(oom, bytes)
@@ -245,24 +213,44 @@ def private vk_classes_ok(dt : KVDtype; slabs : array<DaSlab>) : bool {
     return ok
 }
 
-//! why the armed driver cannot take the drafter ("" = it can): the device must hold the trunk whole on the resident driver,
+//! what the armed driver holds of the trunk, as the drafter's attach reads it
+struct public VkDrafterTrunk {
+    served : bool               //! the resident driver serves the trunk whole
+    hc : bool                   //! a hyper-connection trunk
+    emb_table : bool            //! the device holds a token table to gather the seed rows from
+    assist_rows : int64         //! the rows the N-row token command takes (`gpu_resident_assist_rows`)
+    own_kv : array<bool>        //! per trunk layer: it keeps K/V rows of its own on the device
+}
+
+def private vk_trunk_facts() : VkDrafterTrunk {
+    var f : VkDrafterTrunk
+    f.served = moe_gpu_resident_active() && g_rd != null && g_rd.ready
+    return <- f if (!f.served)
+    f.hc = g_rd.hc
+    f.emb_table = g_rd.emb_blk >= 0l || g_rd.emb_f32 != 0ul
+    f.assist_rows = gpu_resident_assist_rows()
+    f.own_kv <- [for (ly in g_rd.layers); ly.mir_idx >= 0l && !ly.kv_shared]
+    return <- f
+}
+
+//! why a driver holding `f` cannot take the drafter ("" = it can): the device must hold the trunk whole on the resident driver,
 //! gather its token table, run the N-row command a round's verify rides, and hold the capture layers' K/V rows itself
-def private vk_target_why(dr : GemmaDrafter) : string {
-    if (!moe_gpu_resident_active() || g_rd == null || !g_rd.ready) {
+def public vk_drafter_trunk_why(f : VkDrafterTrunk; dr : GemmaDrafter) : string {
+    if (!f.served) {
         return "the Vulkan resident driver does not serve the trunk whole (the load log names why)"
     }
-    if (g_rd.hc) {
+    if (f.hc) {
         return "a hyper-connection trunk"
     }
-    if (g_rd.emb_blk < 0l && g_rd.emb_f32 == 0ul) {
+    if (!f.emb_table) {
         return "the device holds no token table to gather the seed rows from"
     }
-    if (gpu_resident_assist_rows() < 2l) {
+    if (f.assist_rows < 2l) {
         return "the N-row token command declined the trunk (its line above), and the round's verify rides it"
     }
     for (l in range64(dr.n_layers)) {
         let kvl = dr.kv_layer[l]
-        if (kvl < 0l || kvl >= long_length(g_rd.layers) || g_rd.layers[kvl].mir_idx < 0l || g_rd.layers[kvl].kv_shared) {
+        if (kvl < 0l || kvl >= long_length(f.own_kv) || !f.own_kv[kvl]) {
             return "the capture layer {kvl} keeps no K/V rows of its own on the device"
         }
     }
@@ -277,7 +265,7 @@ def private gemv_set(g : GemmaDrafterVk; base, n, d : int64; xq, xs : uint64; xb
         mp[1] = 0u
     }
     gv.set_ = gemv_planes_set(int(KqFmt.q8), (wq = g.wq, ws = g.ws, wqb = g.wqb, wsb = g.wsb), gv.meta.buf, META_BYTES, 0u,
-        xq, xs, n, (n / 32l) * 4l, xbit, y, d * 4l, ybit)
+        xq, xs, n, (n / Q8_BLOCK_ELEMS) * 4l, xbit, y, d * 4l, ybit)
     return gv
 }
 
@@ -293,9 +281,11 @@ def private vk_drafter_init(dr : GemmaDrafter; var g : GemmaDrafterVk) : bool {
     if (!vk_classes_ok(dt, slabs)) {
         return false
     }
-    var quants : array<uint8>
-    var scales : array<uint16>
-    var bases <- q8_repack(dr, quants, scales)
+    var @exact_size quants : array<uint8>
+    var @exact_size scales : array<uint16>
+    var tensors <- q8_tensors(dr)
+    var bases <- q8_repack(dr.blob, tensors, quants, scales)
+    delete tensors
     let made = vk_buffers_make(dr, g, quants, scales)
     delete quants
     delete scales
@@ -325,36 +315,40 @@ def private vk_buffers_make(dr : GemmaDrafter; var g : GemmaDrafterVk; quants : 
     var oom = false
     g.wqb = long_length(quants)
     g.wsb = long_length(scales) * 2l
+    g.fblob_bytes = long_length(dr.fblob) * 4l
+    if (!vk_range_ok(max(max(g.wqb, g.wsb), max(g.fblob_bytes, dr.vocab * 4l)))) {   //! each plane binds whole in every GEMV set it feeds
+        to_log(LOG_WARNING, "dasLLAMA gemma drafter: a plane (quants {g.wqb} bytes, scales {g.wsb}, f32 rows {g.fblob_bytes}, logits {dr.vocab * 4l}) passes the device's storage range {vk_max_storage_range()}\n")
+        return false
+    }
     g.wq = dev_from(oom, unsafe(addr<uint8 const?>(quants[0])), g.wqb)
     g.ws = dev_from(oom, unsafe(addr<uint8 const?>(scales[0])), g.wsb)
-    g.fblob_bytes = long_length(dr.fblob) * 4l
     g.fblob = dev_from(oom, unsafe(addr<uint8 const?>(dr.fblob[0])), g.fblob_bytes)
     let qdm = dr.n_heads * g.hs_mx
     let cat_n = 2l * dr.tdim
-    g.cat = dev_buf(oom, cat_n * 4l)
-    g.catq = dev_buf(oom, cat_n)
-    g.cats = dev_buf(oom, (cat_n / 32l) * 4l)
-    g.xin = dev_buf(oom, dr.dim * 4l)
-    g.xq = dev_buf(oom, dr.dim)
-    g.xs = dev_buf(oom, (dr.dim / 32l) * 4l)
-    g.q = dev_buf(oom, qdm * 4l)
-    g.attn = dev_buf(oom, qdm * 4l)
+    g.cat = soft_device_buf(oom, cat_n * 4l)
+    g.catq = soft_device_buf(oom, cat_n)
+    g.cats = soft_device_buf(oom, (cat_n / Q8_BLOCK_ELEMS) * 4l)
+    g.xin = soft_device_buf(oom, dr.dim * 4l)
+    g.xq = soft_device_buf(oom, dr.dim)
+    g.xs = soft_device_buf(oom, (dr.dim / Q8_BLOCK_ELEMS) * 4l)
+    g.q = soft_device_buf(oom, qdm * 4l)
+    g.attn = soft_device_buf(oom, qdm * 4l)
     g.cntoff = dr.n_heads * (g.hs_mx + 2l)   //! one key split: the counters past one piece a head
     g.part_bytes = (g.cntoff + dr.n_heads) * 4l
-    g.part = dev_buf(oom, g.part_bytes)
-    g.aq = dev_buf(oom, qdm)
-    g.aqs = dev_buf(oom, (qdm / 32l) * 4l)
-    g.o = dev_buf(oom, dr.dim * 4l)
-    g.gate = dev_buf(oom, dr.hidden * 4l)
-    g.up = dev_buf(oom, dr.hidden * 4l)
-    g.hq = dev_buf(oom, dr.hidden)
-    g.hqs = dev_buf(oom, (dr.hidden / 32l) * 4l)
-    g.logits = dev_buf(oom, dr.vocab * 4l)
-    g.hnext = dev_buf(oom, dr.tdim * 4l)
-    g.ids = dev_buf(oom, 16l)
+    g.part = soft_device_buf(oom, g.part_bytes)
+    g.aq = soft_device_buf(oom, qdm)
+    g.aqs = soft_device_buf(oom, (qdm / Q8_BLOCK_ELEMS) * 4l)
+    g.o = soft_device_buf(oom, dr.dim * 4l)
+    g.gate = soft_device_buf(oom, dr.hidden * 4l)
+    g.up = soft_device_buf(oom, dr.hidden * 4l)
+    g.hq = soft_device_buf(oom, dr.hidden)
+    g.hqs = soft_device_buf(oom, (dr.hidden / Q8_BLOCK_ELEMS) * 4l)
+    g.logits = soft_device_buf(oom, dr.vocab * 4l)
+    g.hnext = soft_device_buf(oom, dr.tdim * 4l)
+    g.ids = soft_device_buf(oom, 16l)
     let pbytes = int64(CLS_ARGMAX_CHUNKS) * 4l
-    g.pmax = dev_buf(oom, pbytes)
-    g.pid = dev_buf(oom, pbytes)
+    g.pmax = soft_device_buf(oom, pbytes)
+    g.pid = soft_device_buf(oom, pbytes)
     return false if (oom)
     upload_zeros(g.part, 0l, g.part_bytes)
     g.tok = make_host_buf(TOK_META_BYTES, true)
@@ -390,10 +384,10 @@ def private vk_sets_make(dr : GemmaDrafter; var g : GemmaDrafterVk; slabs : arra
     let qdm = dr.n_heads * g.hs_mx
     let cat_n = 2l * dr.tdim
     let pbytes = int64(CLS_ARGMAX_CHUNKS) * 4l
-    g.s_cat_rq = set_rq_cls(fixed_array(g.cat, g.catq, g.cats), fixed_array(cat_n * 4l, cat_n, (cat_n / 32l) * 4l), fixed_array(B_CAT, B_CATQ, B_CATQ))
-    g.s_ar = set_cls_ar_rq_b(fixed_array(g.xin, g.o, g.fblob, g.xq, g.xs), fixed_array(dr.dim * 4l, dr.dim * 4l, g.fblob_bytes, dr.dim, (dr.dim / 32l) * 4l),
+    g.s_cat_rq = set_rq_cls(fixed_array(g.cat, g.catq, g.cats), fixed_array(cat_n * 4l, cat_n, (cat_n / Q8_BLOCK_ELEMS) * 4l), fixed_array(B_CAT, B_CATQ, B_CATQ))
+    g.s_ar = set_cls_ar_rq_b(fixed_array(g.xin, g.o, g.fblob, g.xq, g.xs), fixed_array(dr.dim * 4l, dr.dim * 4l, g.fblob_bytes, dr.dim, (dr.dim / Q8_BLOCK_ELEMS) * 4l),
         fixed_array(B_XIN, B_O, 0u, B_XQ, B_XQ))
-    g.s_actrq = set_actrq_cls(fixed_array(g.gate, g.up, g.hq, g.hqs), fixed_array(dr.hidden * 4l, dr.hidden * 4l, dr.hidden, (dr.hidden / 32l) * 4l),
+    g.s_actrq = set_actrq_cls(fixed_array(g.gate, g.up, g.hq, g.hqs), fixed_array(dr.hidden * 4l, dr.hidden * 4l, dr.hidden, (dr.hidden / Q8_BLOCK_ELEMS) * 4l),
         fixed_array(B_GATE, B_UP, B_HQ, B_HQ))
     g.s_qkn = set_qk_rms_cls(fixed_array(g.q, g.q, g.fblob), fixed_array(qdm * 4l, qdm * 4l, g.fblob_bytes), fixed_array(B_Q, B_Q, 0u))
     let cosb = g_rd.cos_elems * 4l
@@ -414,7 +408,7 @@ def private vk_sets_make(dr : GemmaDrafter; var g : GemmaDrafterVk; slabs : arra
         let mirb = rd_mir_bytes()
         g.s_attn |> push(da_attn_stamp_set(dt, slabs[l],
             fixed_array(g.q, kmir, vmir, g.attn, g.tok.buf, g.part, g.aq, g.aqs, g.q),
-            fixed_array(qdm * 4l, mirb, mirb, qdm * 4l, TOK_META_BYTES, g.part_bytes, qdm, (qdm / 32l) * 4l, qdm * 4l),
+            fixed_array(qdm * 4l, mirb, mirb, qdm * 4l, TOK_META_BYTES, g.part_bytes, qdm, (qdm / Q8_BLOCK_ELEMS) * 4l, qdm * 4l),
             fixed_array(B_Q, 0u, 0u, B_ATT, 0u, B_ATT, B_AQ, B_AQ, 0u)))
     }
     if (dt == KVDtype.tq4) {
@@ -422,7 +416,7 @@ def private vk_sets_make(dr : GemmaDrafter; var g : GemmaDrafterVk; slabs : arra
         g.s_tq4 = set_kv_tq4_store_cls(fixed_array(g.q, g.q, g.q, g.q, g.q, g_rd.tq4_signs_dev, g.tok.buf),
             fixed_array(qdm * 4l, qdm * 4l, qdm * 4l, qdm * 4l, qdm * 4l, signb, TOK_META_BYTES), fixed_array(B_Q, 0u, 0u, 0u, 0u, 0u, 0u))
         g.s_unrot = set_kv_tq4_unrot_cls(fixed_array(g.attn, g.q, g_rd.tq4_signs_dev), fixed_array(qdm * 4l, qdm * 4l, signb), fixed_array(B_ATT, B_Q, 0u))
-        g.s_at_rq = set_rq_cls(fixed_array(g.attn, g.aq, g.aqs), fixed_array(qdm * 4l, qdm, (qdm / 32l) * 4l), fixed_array(B_ATT, B_AQ, B_AQ))
+        g.s_at_rq = set_rq_cls(fixed_array(g.attn, g.aq, g.aqs), fixed_array(qdm * 4l, qdm, (qdm / Q8_BLOCK_ELEMS) * 4l), fixed_array(B_ATT, B_AQ, B_AQ))
     }
 }
 
@@ -435,7 +429,7 @@ def private gemv_site(var g : GemmaDrafterVk; raw : VkCommandBuffer; var h : VkH
 
 //! the residual step and the next norm's Q8_0 feed in one dispatch: x += rms(o) . pw (under `add`), then rms(x) . w quantized
 def private ar_site(var g : GemmaDrafterVk; dr : GemmaDrafter; raw : VkCommandBuffer; var h : VkHaz; add : bool; woff, pwoff : int64; ascale : float) {
-    var pc = ArArgs(dim = uint(dr.dim), add_on = add ? 1u : 0u, woff = uint(woff), eps = dr.eps, ascale = ascale, pre_on = add ? 1u : 0u, pwoff = uint(pwoff))
+    var pc = GkAddRmsArgs(dim = uint(dr.dim), add_on = add ? 1u : 0u, woff = uint(woff), eps = dr.eps, ascale = ascale, pre_on = add ? 1u : 0u, pwoff = uint(pwoff))
     enc_cls_ar_rq_b(raw, h, g.s_ar, pc, 1l)
 }
 
@@ -458,9 +452,11 @@ def private vk_encode_layer(var g : GemmaDrafterVk; dr : GemmaDrafter; raw : VkC
     }
     let rowwg = da_attn_row_wgs(dr.n_heads, kv_mul, 1l)
     let mirbase = uint(rd_mir_base(L, r))
+    //! the pass's count is the anchor and its query a row past the last key, so a sliding layer reads one key short of its window
+    let win = dr.sliding[l] && L.window > 0l ? uint(L.window - 1l) : 0u
     var pca = DaAttnArgs(kvd = uint(L.kvd), hs = uint(hs), kv_mul = uint(kv_mul), kbase = mirbase, vbase = mirbase, scale = 1.0, qstride = 0u, gated = 0u,
-        window = dr.sliding[l] && L.window > 0l ? uint(L.window - 1l) : 0u, cap = 0.0,   //! the pass's count is the anchor, its query a row past the last key: one key short of the window nsplit = 1u, rqk = dt == KVDtype.tq4 ? DA_RQ_NONE : DA_RQ_Q8, sinkoff = 0u,
-        rowwg = uint(rowwg), qrow = uint(qd), cntoff = uint(g.cntoff))
+        window = win, cap = 0.0, nsplit = 1u, rqk = dt == KVDtype.tq4 ? DA_RQ_NONE : DA_RQ_Q8, sinkoff = 0u,
+        rowwg = uint(rowwg), qrow = uint(qd), cntoff = uint(g.cntoff), ring = uint(L.ring))
     da_attn_stamp_enc(dt, da_slab_of(false, kv_mul), raw, h, g.s_attn[l], pca, rowwg)
     if (dt == KVDtype.tq4) {
         var pcu = KvTqUnrotArgs(hs = uint(hs), nh = uint(dr.n_heads), orow = uint(qd), qrow = uint(qd), qstride = uint(hs), inv_sqrt_hs = 1.0 / sqrt(float(hs)))
@@ -551,10 +547,10 @@ def private vk_draft_chain(t : Model; r, seed, anchor, k : int64; h : array<floa
     }
 }
 
-var private @scratch g_vk_cosrow : array<float>
+var private @scratch @exact_size g_vk_cosrow : array<float>
 
 //! One drafter step on the device against the region `s` holds (the oracle cell's GPU side): the draft token and the next h
-def public vk_gemma_draft_step(t : Model; var s : Session; tok, anchor : int64; h : array<float>; var out_tok : int64&; var h_next : array<float>) : bool {
+def public vk_gemma_draft_step(t : Model; var s : Session; tok, anchor : int64; h : array<float>; var out_tok : int64&; @exact_size var h_next : array<float>) : bool {
     return false if (!g_vk_attached)
     g_vk_taken |> clear()
     let r = gpu_resident_assist_bind(t, s, anchor, 1l, g_vk_taken)
@@ -568,7 +564,7 @@ def public vk_gemma_draft_step(t : Model; var s : Session; tok, anchor : int64; 
 }
 
 //! The last device draft step's full-vocab logits (the oracle comparison reads them; the round never does)
-def public vk_gemma_drafter_last_logits(var dst : array<float>) {
+def public vk_gemma_drafter_last_logits(@exact_size var dst : array<float>) {
     dst |> grow_resize(g_vk_dr.vocab)
     host_buf_read(g_vk_g.lout, unsafe(addr<void?>(dst[0])), g_vk_dr.vocab * 4l)
 }
@@ -592,10 +588,12 @@ def private vk_attach(t : Model; path : string) : string {
     }
     var why = gemma_drafter_target_why(t, dr)
     if (empty(why)) {
-        why = vk_target_why(dr)
+        var facts <- vk_trunk_facts()
+        why = vk_drafter_trunk_why(facts, dr)
+        delete facts
     }
     if (empty(why) && !vk_drafter_init(dr, g_vk_g)) {
-        why = "the device has no room for the drafter's {long_length(dr.blob) >> 20l} MB of planes, or a class it dispatches did not compile"
+        why = "the device has no room for the drafter's {long_length(dr.blob) >> 20l} MB of planes, a plane passes the storage range, or a class it dispatches did not compile (the line above names a range)"
     }
     if (empty(why) && !vk_rdec_carry_arm(true)) {
         why = "the driver took no carry landing"
@@ -617,6 +615,7 @@ def private vk_attach(t : Model; path : string) : string {
     g_vk_us_draft = 0l
     g_vk_us_verify = 0l
     g_vk_us_cold = 0l
+    g_vk_cold_said |> clear()
     to_log(LOG_INFO, "dasLLAMA gemma drafter attached on the Vulkan resident driver: {path} ({g_vk_dr.n_layers} Q-only layers over target layers {g_vk_dr.kv_layer})\n")
     return ""
 }
@@ -643,9 +642,18 @@ def private vk_drop_forget {
 [unused_argument(t), hot_path]   //! one drafter a process: the attach checked it against its target
 def private vk_attached_to(t : Model) : bool => g_vk_attached
 
-//! a stream that cannot speculate this round: no carried hidden at its position, a round past the context
-def private vk_round_cold(t : Model; s : Session; pos, k : int64) : bool => (pos < 1l || s.mtp_h_pos1 != pos
-    || long_length(s.mtp_h) < g_vk_dr.tdim || pos + k + 1l > t.config.seq_len)
+var private g_vk_cold_said : table<string>   //! the cold reasons said since the attach, a reason once
+
+//! a stream that cannot speculate this round: no carried hidden at its position, a round past the context; every reason but the
+//! context's bound said once
+def private vk_round_cold(t : Model; s : Session; pos, k : int64) : bool {
+    let why = mtp_round_cold_why(t, s, pos, k, g_vk_dr.tdim)
+    return false if (why == "")
+    if (why != MTP_COLD_PAST_CONTEXT) {
+        gpu_said_once(g_vk_cold_said, LOG_INFO, "gemma drafter on the Vulkan resident driver - a stream steps plain this round: ", why)
+    }
+    return true
+}
 
 //! verify row `vr`'s truth: the device's pick where it landed one, else the argmax of the logits it landed
 def private vk_row_pick(s : Session; vr, vocab : int64) : int64 {
@@ -737,8 +745,7 @@ def private vk_gemma_rounds(t : Model; var sessions : array<Session?>; toks : ar
             if (pick_only) {
                 land_pick(s, s.mtp_picks[a])
             }
-            copy_floats(s.mtp_hrows, a * c.dim, s.mtp_h, 0l, c.dim)
-            s.mtp_drafted += kd
+            mtp_round_take(s, a, kd, c.dim)
             mtp_round_commit_host(s, pos, kd, a)
             gpu_resident_assist_commit(s)
             g_vk_drafted += kd
@@ -769,10 +776,8 @@ def private vk_gemma_rounds(t : Model; var sessions : array<Session?>; toks : ar
 }
 
 def private vk_seam_stats() : MtpAssistantStats
-    => MtpAssistantStats(drafted = g_vk_drafted, accepted = g_vk_accepted, rounds = g_vk_rounds, joint = g_vk_joint)
-
-//! Round time split since attach, microseconds: draft chains / verify+commit / the plain steps of streams the round could not take
-def public vk_gemma_drafter_time() : tuple<draft_us : int64; verify_us : int64; cold_us : int64> => (draft_us = g_vk_us_draft, verify_us = g_vk_us_verify, cold_us = g_vk_us_cold)
+    => MtpAssistantStats(drafted = g_vk_drafted, accepted = g_vk_accepted, rounds = g_vk_rounds, joint = g_vk_joint,
+        draft_us = g_vk_us_draft, verify_us = g_vk_us_verify, cold_us = g_vk_us_cold)
 
 [init]
 def private vk_gemma_mtp_init {

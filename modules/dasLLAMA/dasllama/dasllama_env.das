@@ -137,11 +137,18 @@ struct public GpuTierEnv {
     @clarg_doc = "The context pin (DASLLAMA_GPU_CTX_MAX, set_gpu_ctx_max) is the context asked, not a cap: a K/V mirror the card cannot hold at it declines the resident driver instead of shortening, and the per-op rails serve the asked context; the load log names the room."
     gpu_ctx_strict : bool = false
 
+    @clarg_default_doc = "0 (the plan's own count)"
+    @clarg_doc = "Serve at least this many routed layers' experts on the host - the first in layer order - on the whole-model driver of any MoE that routes no more picks a row than the split command serves, the gemma-4 MoE with its parallel dense expert included, whatever the card holds (set_gpu_host_layers in process): the host-layers form, with its split token command and cut window chain, reached on any card. A hyper-connection model serves every routed layer on the host regardless."
+    gpu_host_layers : int64 = 0l
+
     @clarg_doc = "The K/V codec the whole-model driver's mirror is asked to arm at, where no caller set one in process (set_gpu_kv_dtype): f16 (the default), q8_0 (half the mirror's bytes) or tq4 (a quarter). Sessions of the armed codec are served; any other spelling reads as f16."
     gpu_kv : string = ""
 
     @clarg_doc = "The whole-model resident driver for a model that fits the card, MoE included; 0 keeps the per-op rails (the A/B lever)."
     gpu_resident : bool = true
+
+    @clarg_doc = "A sliding-window layer's K/V mirror rows on a GPU home hold its window plus the rows one command writes, a position's row at its slot of that ring (both homes); 0 keeps every position's row (the flat slab, the A/B lever). A ringed history serves a continuation that starts no more than that slack under the rows it holds; one further back prefills again."
+    gpu_kv_ring : bool = true
 
     @clarg_default_doc = "follows DASLLAMA_GPU"
     @clarg_doc = "DeltaNet rail on the GPU."
@@ -196,7 +203,7 @@ struct public GpuTierEnv {
     @clarg_doc = "Hot expert slots a layer. On the per-op tier: hold the N hottest experts of a streamed layer resident (unset = none). On the whole-model driver with the routed experts on the host (a hyper-connection MoE): the slots of the hot expert pool - unset = 64 where the card has the room past the weights and the mirror, else up to 32 out of the mirror's context; a count asks that many; 0 keeps every routed expert on the host."
     gpu_heat : Option<int64>
 
-    @clarg_doc = "Report lifetime GPU queue submissions (real commands plus staging round-trips)."
+    @clarg_doc = "Report lifetime GPU queue submissions (real commands plus staging round-trips), and trace every routed row the host sums - the split token command's host segment and the CPU forward alike - as one moe_k line (the layer, the session, the first pick, the L1 of the feed row and of the routed sum)."
     gpu_prof : bool = false
 
     @clarg_doc = "Record the routed picks of every layer's host expert step under the whole-model driver - a layer, its rows, k expert ids and weights a row, in serving order - and write them to this file when the model drops: the hot expert pool's policy experiments replay the trace offline (harness/hot_pool_sim.das). Unset: no trace."
@@ -307,7 +314,7 @@ struct public MetalEnv {
     @clarg_doc = "Concurrent encoder for the single-stream decode step, with barriers only at detected hazards."
     decode_concurrent : bool = true
 
-    @clarg_doc = "The R1 epilogue-fusion kernel (post_attn_rms + add_rms); 0 restores separate dispatches for A/B."
+    @clarg_doc = "Every decode sandwich seam as one residual step (the branch's post norm, the add, the next norm); 0 restores the split chain for A/B."
     fuse : bool = true
 
     @clarg_default_doc = "-1 (adaptive)"
@@ -445,7 +452,7 @@ struct public VulkanEnv {
     @clarg_doc = "Prefill record/execute overlap: the window chain submits in ramped chunks (1,2,4,8 layers) so the GPU starts while the CPU still records; 0 pins the single fenced submit (the per-role GPU profile pins it too, so a chunk gap never bills to a role)."
     vk_overlap : bool = true
 
-    @clarg_doc = "Device-side token-embedding gather for the resident prefill and the one-row decode step: a q8 or K-quant table off its own plane (the tied classifier's, or an untied table's where it fits the room past the weights and the K/V), an F32/F16/BF16 table off its exact f32 rows uploaded under a 512 MB cap; a Q4_1 table keeps the CPU embed; 0 keeps the CPU embed loop."
+    @clarg_doc = "Device-side token-embedding gather for the resident prefill and every token command (the one-row step, the N-row command, the NextN verify and draft): a q8 or K-quant table off its own plane (the tied classifier's, or an untied table's where it fits the room past the weights and the K/V), an F32/F16/BF16 table off its exact f32 rows uploaded under a 512 MB cap; 0 keeps the CPU embed loop. `set_gpu_resident_embed` pins it for the next loads in process."
     vk_gpu_embed : bool = true
 
     @clarg_doc = "Pin REQUIRE_FULL_SUBGROUPS on every class pipeline (instrument; measured slower than plain pipelines on the mm_a gate shape, so those are the default)."

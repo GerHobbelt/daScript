@@ -65,7 +65,8 @@ function moves the chain with it.**
 **A kernel-side helper - a free `def` outside any class that a kernel body calls - that one
 backend's kernels splice lands in that backend's kernel file (`dasllama/dasllama_metal_kernels.das`,
 `dasllama/dasllama_vulkan_classes.das`); one that both backends' kernels splice and that reads no
-codebook table lands in `dasllama/dasllama_gpu_math.das`, never as a copy per home; a method of a
+codebook table lands in `dasllama/dasllama_gpu_math.das`, never as a copy per home, and in
+`dasllama/dasllama_gpu_kernels_common.das` where it carries `[spirv_inline]`; a method of a
 class template both homes stamp lands with its template.**
 
 **A disk-order -> compute-order transform lands by its consumer: a transform into the layout
@@ -83,7 +84,7 @@ tokenizer's own file (`dasllama/dasllama_spm.das` / `dasllama/dasllama_bpe.das`)
 `[metal_dispatch]` or `[vk_dispatch]` declares) picks one variant of - lands in its backend's
 kernel file, `dasllama/dasllama_metal_kernels.das` or `dasllama/dasllama_vulkan_classes.das`, where
 one backend stamps it, and as a `class template` in `dasllama/dasllama_gpu_kernels_common.das` where
-both do (`ARCHITECTURE_GPU.md#gpu-shared-kernels`).** A
+both do (`ARCHITECTURE_GPU_SHARED_KERNELS.md#gpu-shared-kernels`).** A
 class stamped from a template declared elsewhere is not a kernel body: it compiles its own
 pipeline where it is stamped.
 

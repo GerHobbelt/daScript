@@ -105,18 +105,20 @@ def resident_ready(t : T?; path : string) : bool {
 
 //! the levers a resident load pins, as the cell found them: the whole-model route's lever (never `gpu_want_resident`, which
 //! folds the environment's knob in and would pin the lever off under DASLLAMA_GPU_RESIDENT=0), the mirror regions asked
-//! for, and the Vulkan fuse pin where the module exists
+//! for, the context pins, the host-layers pin, and the Vulkan fuse pin where the module exists
 struct ResidentLevers {
     route : bool
     regions : int64
     ctx_max : int64
     ctx_strict : bool
+    host_layers : int64
     fuse : int
 }
 
 def resident_levers() : ResidentLevers {
     let pins = gpu_ctx_pins()
-    var l = ResidentLevers(route = gpu_resident_route_lever(), regions = gpu_resident_regions_want(), ctx_max = pins.ctx_max, ctx_strict = pins.strict, fuse = -1)
+    var l = ResidentLevers(route = gpu_resident_route_lever(), regions = gpu_resident_regions_want(), ctx_max = pins.ctx_max, ctx_strict = pins.strict,
+                           host_layers = gpu_host_layers_pin(), fuse = -1)
     static_if (typeinfo builtin_module_exists(vulkan)) {
         l.fuse = g_vk_fuse
     }
@@ -128,6 +130,7 @@ def restore_resident_levers(l : ResidentLevers) {
     set_gpu_resident_regions_(l.regions)
     set_gpu_ctx_max(l.ctx_max)
     set_gpu_ctx_strict(l.ctx_strict)
+    set_gpu_host_layers(l.host_layers)
     static_if (typeinfo builtin_module_exists(vulkan)) {
         g_vk_fuse = l.fuse
     }
@@ -164,6 +167,20 @@ def resident_admitted(t : T?; armed, note : string) : bool {
     t |> success(moe_gpu_resident_active(), armed)
     mirror_codec_held(t)
     return true
+}
+
+//! the resident trunk at `path` (`load` the load, its levers its own): the gate (`resident_ready`), the admission
+//! (`resident_admitted`, `note` after a memory decline's skip), the context cut to `ctx` - the sessions size their caches to the
+//! mirror's cap, not the model's max; an empty Model (`n_layers` 0) after the skip that says why
+def resident_trunk(t : T?; path : string; ctx : int64; note : string; load : block<() : Model>) : Model {
+    return <- Model() if (!resident_ready(t, path))
+    var tr <- invoke(load)
+    if (!resident_admitted(t, "the whole-model driver armed on the model (the load log names any decline)", note)) {
+        delete tr
+        return <- Model()
+    }
+    tr.config.seq_len = min(tr.config.seq_len, ctx)
+    return <- tr
 }
 
 //! holds that every layer's dense q/k/v/o and FFN planes read the file's own format (`census_plane` against `path`'s tensor
@@ -206,8 +223,9 @@ def census(kernel : string) : int64 {
 
 //! `path` loaded at q8 with the whole-model route pinned on - at `regions` mirror regions where it is past 0, the context
 //! pinned and asked whole at `strict_ctx` positions where it is past 0, else at the caller's own context pin, never strict -
-//! whatever an earlier cell left; every lever put back after
-def load_resident(path : string; regions : int64 = 0l; strict_ctx : int64 = 0l) : Model {
+//! and `host_layers` routed layers' experts asked onto the host (0: the plan's own count, pinned so the environment's ask
+//! does not reach the load) whatever an earlier cell left; every lever put back after
+def load_resident(path : string; regions : int64 = 0l; strict_ctx : int64 = 0l; host_layers : int64 = 0l) : Model {
     let levers = resident_levers()
     if (regions > 0l) {
         set_gpu_resident_regions_(regions)
@@ -216,6 +234,7 @@ def load_resident(path : string; regions : int64 = 0l; strict_ctx : int64 = 0l) 
         set_gpu_ctx_max(strict_ctx)
     }
     set_gpu_ctx_strict(strict_ctx > 0l)
+    set_gpu_host_layers(host_layers)
     set_gpu_resident_route(true)
     var tr <- load_model_(path, QuantMode.q8)
     restore_resident_levers(levers)
@@ -453,6 +472,28 @@ def resident_then_cpu_feed(t : T?; tr : Model; prompt, toks : array<int64>; afte
 //! the same with no seat between the resident prefill and its first step
 def resident_then_cpu_feed(t : T?; tr : Model; prompt, toks : array<int64>; after_gpu : block<void>) : FeedPair => <- resident_then_cpu_feed(t, tr, prompt, toks, $ {}, after_gpu)
 
+//! the device's summed distance from the file's f32 chain, as a ratio of the CPU q8 chain's own: the Qwen3.5 mixed twin reads
+//! 0.91 (3.42 against 3.77)
+let F32_DIST_REL = 1.15
+
+//! `prompt` then `toks` through the file at `path` loaded again at `QuantMode.fp32` on the CPU, the device state dropped: the file's
+//! f32 chain, the reference where the CPU q8 chain's activation quantization rounds the device and itself to either side of it
+def f32_chain_rows(path : string; prompt, toks : array<int64>) : array<array<float>> {
+    var f32_model <- load_model_(path, QuantMode.fp32)
+    moe_gpu_drop_model()
+    var rows <- feed_alone(f32_model, mirror_kv_dtype(), prompt, toks)
+    delete f32_model
+    return <- rows
+}
+
+//! the same-or-better witness: the device no further from the f32 chain's rows than `F32_DIST_REL` of the CPU q8 chain's own
+//! summed distance, the f32 rows one step off past that bound; `tr` decodes the logged picks
+def f32_chain_witness(t : T?; tr : Model; what : string; fed : FeedPair; f32_rows : array<array<float>>) {
+    let dist = chain_distances(t, tr, what, fed.gpu, fed.cpu, f32_rows, 0, "the f32 chain", "the CPU q8 chain")
+    t |> success(dist.dev_ref <= F32_DIST_REL * dist.cpu_ref, "{what}: the device sits no further from the f32 chain ({dist.dev_ref}) than {F32_DIST_REL} of the CPU q8 chain's own distance ({dist.cpu_ref})")
+    t |> success(dist.dev_ref_ctrl > F32_DIST_REL * dist.cpu_ref, "{what} control: the f32 rows one step off sit past that bound ({dist.dev_ref_ctrl})")
+}
+
 //! the forced-feed form: an `n`-token `resident_prompt` and `steps` fed tokens through `resident_then_cpu_feed` (`after_gpu`
 //! the caller's witnesses), every row held by `feed_steps_within` at `bar_rel` under `tag`
 def forced_feed_over(t : T?; tr : Model; tag : string; n, steps : int64; bar_rel : float; after_gpu : block<void>) {
@@ -613,6 +654,7 @@ def greedy_chain_cell(t : T?; path : string) {
                 let offs = off > 0l ? CHAIN_STEPS / off : 0l
                 let what = off > 0l ? "the walk fed off the pick every {off}rd step" : "the argmax walk"
                 to_log(LOG_INFO, "{path} {what}: {hits} chained steps taken, {misses} discarded\n")
+                log_gen_texts(tr, "{path} {what} (plain, chained)", plain.toks, chained.toks)
                 var differ = 0
                 for (i in range64(CHAIN_STEPS)) {
                     differ += chained.toks[i] != plain.toks[i] ? 1 : 0
@@ -624,6 +666,7 @@ def greedy_chain_cell(t : T?; path : string) {
                 let sa0 = vk_rdec_chain_stats()
                 var adaptive <- chain_walk(tr, prompt, CHAIN_STEPS, off, -1)
                 let sa1 = vk_rdec_chain_stats()
+                log_gen_texts(tr, "{path} {what} (plain, adaptive)", plain.toks, adaptive.toks)
                 for (i in range64(CHAIN_STEPS)) {
                     t |> equal(adaptive.toks[i], plain.toks[i], "{what}, step {i}: adaptive token")
                     t |> equal(logits_maxdiff(adaptive.rows[i], plain.rows[i]), 0.0,
