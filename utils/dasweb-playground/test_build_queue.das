@@ -29,6 +29,59 @@ def test_migration_v4(t : T?) {
 }
 
 [test]
+def test_expected_artifact_names(t : T?) {
+    // The server enforces this set rather than trusting the builder, so it is
+    // a store behaviour and gets a store test, not only an HTTP one.
+    t |> run("module publishes exactly one named artifact") @(tt : T?) {
+        let names <- expected_artifact_names(BUILD_MODE_MODULE)
+        tt |> equal(length(names), 1)
+        tt |> equal(names[0], "sample.wasm")
+    }
+    t |> run("page publishes exactly the html+js+wasm triple") @(tt : T?) {
+        let names <- expected_artifact_names(BUILD_MODE_PAGE)
+        tt |> equal(length(names), 3)
+        tt |> equal(names[0], "sample.html")
+        tt |> equal(names[1], "sample.js")
+        tt |> equal(names[2], "sample.wasm")
+    }
+    t |> run("a mode with no declared set publishes nothing") @(tt : T?) {
+        tt |> success(empty(expected_artifact_names("bogus")), "unknown mode")
+    }
+}
+
+[test]
+def test_detect_build_mode(t : T?) {
+    t |> run("plain compute source is a module build") @(tt : T?) {
+        tt |> equal(detect_build_mode("require math\n[export]\ndef main \{\n    print(\"hi\")\n\}\n"), BUILD_MODE_MODULE)
+        tt |> equal(detect_build_mode("require daslib/random\nrequire strings\n"), BUILD_MODE_MODULE)
+    }
+    t |> run("a native graphics/audio require forces a page build") @(tt : T?) {
+        tt |> equal(detect_build_mode("require glfw/glfw_boost\nrequire math\n"), BUILD_MODE_PAGE)
+        tt |> equal(detect_build_mode("require opengl/opengl_boost\n"), BUILD_MODE_PAGE)
+        tt |> equal(detect_build_mode("require audio/audio_boost\n"), BUILD_MODE_PAGE)
+        tt |> equal(detect_build_mode("require stbimage\n"), BUILD_MODE_PAGE)
+        tt |> equal(detect_build_mode("require strudel/strudel_player\n"), BUILD_MODE_PAGE)
+        tt |> equal(detect_build_mode("require live_stub   // playground shim\n"), BUILD_MODE_PAGE)
+    }
+    t |> run("optional-require marker and tabs still match") @(tt : T?) {
+        tt |> equal(detect_build_mode("require ?audio\n"), BUILD_MODE_PAGE)
+        tt |> equal(detect_build_mode("require\tglfw/glfw_boost\n"), BUILD_MODE_PAGE)
+    }
+    t |> run("lookalikes stay module builds") @(tt : T?) {
+        tt |> equal(detect_build_mode("require daslib/glfw_helpers.das\n"), BUILD_MODE_MODULE)   // daslib root, not glfw
+        tt |> equal(detect_build_mode("requirements = 1\n"), BUILD_MODE_MODULE)
+        tt |> equal(detect_build_mode("// require glfw\n"), BUILD_MODE_MODULE)
+        tt |> equal(detect_build_mode("require glfwish\n"), BUILD_MODE_MODULE)
+    }
+    t |> run("bundle documents scan every file") @(tt : T?) {
+        let page_bundle = "\{\"files\":\{\"main.das\":\"require helper\\n\",\"helper.das\":\"require opengl/opengl_boost\\n\"\},\"active\":\"main.das\"\}"
+        tt |> equal(detect_build_mode(page_bundle), BUILD_MODE_PAGE)
+        let mod_bundle = "\{\"files\":\{\"main.das\":\"require math\\n\"\},\"active\":\"main.das\"\}"
+        tt |> equal(detect_build_mode(mod_bundle), BUILD_MODE_MODULE)
+    }
+}
+
+[test]
 def test_toolchain_meta(t : T?) {
     with_latest_sqlite(":memory:") $(db) {
         t |> run("no toolchain until announced") @(tt : T?) {

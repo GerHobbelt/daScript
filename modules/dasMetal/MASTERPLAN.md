@@ -78,7 +78,7 @@ dasSpirv and is reused as-is.
 |---|---|---|
 | `src/dasMetal.mm` | hand | `Module("das_metal")` — Obj-C++ shim over Metal.framework. Opaque annotated handles (device, queue, command buffer, compute encoder, pipeline state, library, function, buffer) + the extern surface below. Compiled with ARC; handles cross to das as `__bridge_retained void*`; `metal_release` = `__bridge_transfer`. Shim-side live-object counter for the leak gate. APPLE-only; links `-framework Metal -framework Foundation`. |
 | `metal/msl_types.das` | hand | daslang `TypeDecl` → MSL type name (32-bit scalars/bool + the 16/8-bit lattice — MSL has native `half`/`short`/`char` — and their 2/3/4 vectors, classified via the shared `daslib/shader_block_layout` rails). `msl_buffer_elem_name` gives the layout-bearing spelling: 3-lane elements take MSL's `packed_T3` (das packs tightly; unified memory means the das array IS the buffer). |
-| `metal/metal_builtins.das` | hand | Metal-only builtin surface over the shared lingua franca (the spirv_builtins pattern): re-exports `daslib/shader_lingua_franca` (whence `gl_WorkGroupSize`), adds the four simdgroup IDs (GLSL subgroup spellings) and the `simd_sum`/`simd_shuffle*` intrinsics (Metal spellings, float/int/uint). Identity stub bodies = width-1 simdgroup CPU semantics. |
+| `metal/metal_builtins.das` | hand | Metal-only builtin surface over the shared lingua franca (the spirv_builtins pattern): re-exports `daslib/shader_lingua_franca` (whence `gl_WorkGroupSize` and the four `gl_Subgroup*` IDs, shared with dasSpirv) and adds the `simd_sum`/`simd_shuffle*` intrinsics (Metal spellings, float/int/uint). Identity stub bodies = width-1 simdgroup CPU semantics. |
 | `metal/msl_emit.das` | hand | The text emitter: `[macro_function] generate_msl(fn, var errors, cfg, var census) : string`. Manual recursion (`emit_value`/`emit_stmt`, mirroring `spirv_emit`). Kernel-signature synthesis from `@ssbo` globals (the one structural novelty — below). Records the construct census at every emit site. |
 | `metal/msl_shader.das` | hand | `[metal_kernel]` function-macro (`MetalKernel : AstFunctionAnnotation`, modeled on `SpirvShader`), applied to a **class method**; args: `name`, `fastmath` (default **true**, surfaced to the host via a companion ``{name}`msl_fastmath : bool`` global feeding the pipeline-compile options). `apply` declares the public ``{name}`msl : string`` global; **`fixup` fills `glob.init = new ExprConstString(...)`** — string capture is call-free, so fixup suffices (dasGlsl precedent; the patch/astChanged dance dasSpirv needed for `array<uint>` does not apply). Does `require spirv/spirv_builtins public`. |
 | `metal/das_metal_boost.das` | hand | Host sugar over `das_metal`: `with_metal_device`, `pipeline_from_kernel` (compile + error surfacing), unified-memory buffer helpers, `run_compute_1d` one-liner, live-object leak assert. `require das_metal` → usable only where the C++ module exists. |
@@ -259,15 +259,29 @@ Three behavioral layers + enforcement gates:
     shapes. Gates: kernel unit parity tests, 40/40 greedy parity (tolerance path), then the
     clean round (Parsec OFF — Boris window): CPU vs hybrid vs resident vs lcpp `-ngl 99`.
 
-## Cross-backend parity (deferred — not a gate)
+## Cross-backend parity — the kernel-model asymmetry ledger
 
-Stacking `[compute_shader, metal_kernel]` on one function was the original parity idea;
-class-member authoring defers it — dasSpirv's frontend reads module globals, not class
-members. The primary correctness oracle is the CPU-reference run of the same das body
-(Test architecture, layer 3), which is cheaper and stricter than a second GPU. Cross-GPU
-parity (zen2 Vulkan vs M-box Metal) returns as a nice-to-have if/when dasSpirv gains the
-same class-member authoring — an in-tree follow-up, ours to make, not a dasMetal
-prerequisite.
+The mirror rule (CODEREVIEW.md, both emitters) records deliberate or pending kernel-model
+asymmetries HERE — one ledger for both backends (dasSpirv's MASTERPLAN points at this
+section). The primary correctness oracle remains the CPU-reference run of the same das body,
+cheaper and stricter than a second GPU; cross-GPU parity of one source is a nice-to-have now
+that both emitters read class members. Current entries:
+
+- **Class-member authoring is symmetric now.** dasSpirv gained `[spirv_kernel]` classes (this
+  emitter's model, ported wholesale in the vulkan class-kernel arc) — the original blocker on
+  stacking both shader annotations on one body is gone. Free-function callees and
+  devirtualized overrides are symmetric too (msl_emit's devirtualization table was the donor).
+- **Multi-kernel-per-class + `family=` surface sharing: Vulkan leads.** `[vk_dispatch]`
+  accepts N kernel methods per class (`kernel=` picks, `family=` shares one set surface
+  across sibling classes); `[metal_dispatch]` still enforces one kernel per class
+  (`find_kernel_fn` nmatch==1). Pending follow-up: relax the metal lens the same way — the
+  reification layer builds on that surface.
+- **Inheritance in the kernel corpus: Vulkan leans on it, Metal does not yet.** The vulkan
+  classes are base+leaf families (kq GEMV/batch, flash attention, deltanet); the metal
+  classes are flat, with at least one base duplicated inline (MetalMoeMulMmK6). Dedup
+  opportunity, not a correctness gap.
+- **Grid-literal validation: Vulkan rejects non-int64 ceil-div grid params at macro apply;
+  the metal lens still carries that silent infer trap.** Pending metal-side fix.
 
 ## Top risks
 

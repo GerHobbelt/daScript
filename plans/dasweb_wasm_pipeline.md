@@ -205,6 +205,27 @@ Mapped onto the actual steps in `.github/workflows/pages.yml`:
 | 4–7. arcanoid, pacman, furier, path_tracer_lab, physarum_lab | **Fold** into the content-addressed cache rail. They change rarely, so the cache near-always hits and CI stops rebuilding them. |
 | "Verify wasm example artifacts" | Follows steps 4–7 wherever they land — it exists because those builds are non-fatal, and that property must survive the move. |
 
+**Done so far (2026-08-05):** step 3 is deleted, along with the per-sample `.wasm` overlay in
+the staging block — nothing fetches those artifacts any more, because the playground's wasm
+engine asks the build service by content hash. In its place a **compile gate** runs
+`daslang -dry-run` over every curated sample: it proves they still compile, writes nothing, and
+costs a fraction of what the wasm builds did.
+
+**Still on CI, and why:** steps 2 and 4–7 stay until **page mode** exists.
+
+Terminology, because "the games" has been used loosely for all of them: those steps build
+**five standalone `/examples` pages** — `arcanoid` and `pacman` (the two actual games, from
+`examples/games/`) plus `furier`, `path_tracer_lab` and `physarum_lab` (graphics showcases,
+from `examples/graphics/`). What they share is not that they are games; it is the **delivery
+shape**. Each is its own page — `html + js + wasm` — where a playground sample is a bare
+`.wasm` the already-loaded runtime instantiates. That shape is what "page mode" names, and what
+forces the artifact cache to hold a file set.
+
+`run_build.sh` refuses `page` mode today and `expected_artifact_names("page")` is deliberately
+empty, so the queue cannot yet produce what `/examples` needs. Step 2 exists only to serve
+those five builds and leaves with them. That is the page checkpoint below, and it is the
+remaining half of the diet.
+
 **Design point the game pages force — and it is NOT about multi-file sources.** Two axes that
 look like one and are not:
 

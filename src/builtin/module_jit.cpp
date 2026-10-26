@@ -49,6 +49,8 @@ namespace das {
     void * register_dynamic_module(const char *, const char *, int, Context *, LineInfoArg *);
     void register_native_path(const char *, const char *, const char *, Context *, LineInfoArg *);
     bool builtin_fexist ( const char * path );
+    DAS_API void retry_pending_dynamic_modules();
+    DAS_API int report_pending_dynamic_modules();
 
     // JitFunction typedef lives in arraytype.h (the SimFunction::jitFunction mirror shares it)
 
@@ -419,6 +421,18 @@ extern "C" {
         static_cast<JitContext *>(ctx)->initFunctionAddr(index, globPtr);
     }
 
+    // A missing MODULE and a missing FUNCTION die on the same lookup — distinguish them,
+    // because the former is a load failure (dlopen), not a signature mismatch.
+    static bool jit_module_is_registered ( const char * moduleName ) {
+        bool exists = false;
+        Module::foreach([&](Module * module) -> bool {
+            if ( module->name != moduleName ) return true;
+            exists = true;
+            return false;
+        });
+        return exists;
+    }
+
     DAS_API void jit_init_extern_function ( const char * moduleName,
                                             const char * funcMangledName,
                                             void ** dllGlobal ) {
@@ -449,6 +463,9 @@ extern "C" {
             });
         }
         if (!found) {
+            if ( !jit_module_is_registered(moduleName) ) {
+                DAS_FATAL_ERROR("Failed to find %s: module %s is not registered (its .shared_module may have failed to load — see errors above).\n", funcMangledName, moduleName);
+            }
             DAS_FATAL_ERROR("Failed to find %s in module %s.\n", funcMangledName, moduleName);
         }
     }
@@ -462,6 +479,9 @@ extern "C" {
             return false;
         });
         if (!result) {
+            if ( !jit_module_is_registered(moduleName) ) {
+                DAS_FATAL_ERROR("Failed to find annotation %s: module %s is not registered (its .shared_module may have failed to load — see errors above).\n", annName, moduleName);
+            }
             DAS_FATAL_ERROR("Failed to find annotation %s in module %s.\n", annName, moduleName);
         }
         return result;
@@ -1284,12 +1304,22 @@ extern "C" {
         // -sSTANDALONE_WASM: emit self-contained .wasm with wasi imports only.
         // -fwasm-exceptions + -sWASM_LEGACY_EXCEPTIONS=0: match the runtime
         // archive's modern wasm EH, avoid emcc's JS invoke_* trampolines.
-        // -sINITIAL_MEMORY=128MB: standalone wasm cannot grow memory under
-        // wasmtime (-sALLOW_MEMORY_GROWTH adds an unsatisfiable
-        // emscripten_notify_memory_growth import), so reserve up front. Cost
-        // is virtual address space only — lazy paging keeps RSS proportional
-        // to actual use. 128MB covers all current playground benchmarks; see
-        // #2805.
+        // -sINITIAL_MEMORY=128MB: reserve up front so typical programs never pay
+        // growth churn. Cost is virtual address space only — lazy paging keeps RSS
+        // proportional to actual use.
+        // -sABORTING_MALLOC=0: state the contract we rely on rather than inherit it.
+        // Every das allocation path null-checks (LinearChunkAllocator::allocate ->
+        // StringHeapAllocator::impl_allocateString -> context->throw_out_of_memory),
+        // which only works while a failed malloc RETURNS. ALLOW_MEMORY_GROWTH happens
+        // to imply this today; spelling it out keeps the guarantee if growth is ever
+        // turned back off for a host that needs a fixed memory.
+        // -sALLOW_MEMORY_GROWTH=1: 128MB is NOT enough for every program (the f2s
+        // playground benchmark retains ~130MB of string heap and died at the cap).
+        // Previously omitted because growth added an unsatisfiable
+        // emscripten_notify_memory_growth import under a bare wasi host (#2805);
+        // that is fixed upstream — verified on the pinned emsdk 5.0.7 that a
+        // STANDALONE_WASM build with growth imports NOTHING from env, so wasmtime is
+        // unaffected. Measured on that emsdk: usable heap 120MB -> 2040MB.
         const std::string runtimeArg = withRuntime ? fmt::format("\"{}\" ", runtimeLibPath) : "";
         // -sMEMORY64=1: wasm64 (memory64) target — 8-byte pointers. The object and
         // runtime archive must also be wasm64 (built with -sMEMORY64=1); the linker
@@ -1302,11 +1332,11 @@ extern "C" {
         // incorrect". Same trick create_shared_library uses (see above).
         #if defined(_WIN32) || defined(_WIN64)
         const std::string cmd = fmt::format(
-            FMT_STRING("\"\"{}\" \"{}\" {}-o \"{}\" -sSTANDALONE_WASM -fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0 -sINITIAL_MEMORY=128MB{} 2>&1\""),
+            FMT_STRING("\"\"{}\" \"{}\" {}-o \"{}\" -sSTANDALONE_WASM -fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0 -sINITIAL_MEMORY=128MB -sABORTING_MALLOC=0 -sALLOW_MEMORY_GROWTH=1{} 2>&1\""),
             linker.c_str(), objFilePath, runtimeArg, wasmPath, mem64Arg);
         #else
         const std::string cmd = fmt::format(
-            FMT_STRING("\"{}\" \"{}\" {}-o \"{}\" -sSTANDALONE_WASM -fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0 -sINITIAL_MEMORY=128MB{} 2>&1"),
+            FMT_STRING("\"{}\" \"{}\" {}-o \"{}\" -sSTANDALONE_WASM -fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0 -sINITIAL_MEMORY=128MB -sABORTING_MALLOC=0 -sALLOW_MEMORY_GROWTH=1{} 2>&1"),
             linker.c_str(), objFilePath, runtimeArg, wasmPath, mem64Arg);
         #endif
         return run_link_cmd(cmd.c_str(), wasmPath, "Wasm", context);
@@ -1722,6 +1752,18 @@ DAS_API void * jit_register_dynamic_module_resolve ( const char * rel_path,
                                                      const char * mod_name ) {
     das::string chosen = resolve_dynamic_module_path(rel_path, fallback_abs_path);
     return das::register_dynamic_module(chosen.c_str(), mod_name, 0/*Quiet*/, nullptr, nullptr);
+}
+
+// Emitted by inject_main after the per-module jit_register_dynamic_module_resolve calls.
+// Those load Quiet (sibling DT_NEEDED ordering makes a first-attempt failure normal), so
+// run the fixed-point retry, then treat anything still unloadable as fatal: every module
+// the exe registers is required by its program, and continuing only defers the death to
+// the first extern lookup, whose message no longer names the real cause.
+DAS_API void jit_finalize_dynamic_modules () {
+    das::retry_pending_dynamic_modules();
+    if ( int failed = das::report_pending_dynamic_modules() ) {
+        DAS_FATAL_ERROR("%d dynamic module(s) failed to load (see above).\n", failed);
+    }
 }
 
 DAS_API void jit_register_native_path ( const char * mod_name, const char * src_path, const char * dst_path ) {

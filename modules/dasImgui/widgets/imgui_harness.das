@@ -81,6 +81,7 @@ require imgui_app_headless
 require imgui/imgui_harness_lint public
 
 require daslib/clargs
+require daslib/safe_addr
 require strings
 
 var private g_headless          : bool = false
@@ -147,9 +148,9 @@ def public harness_init(title : string; width : int = 800; height : int = 600) {
     }
     var w = width
     var h = height
-    // On web, size the window at creation to the largest card-aspect box fitting the on-page viewport so
-    // the UI fills the card at native scale. Done ONCE: a mid-run canvas resize invalidates the WebGL
-    // context and aborts the wasm. Desktop: glfw_canvas_css_* return 0, so the requested size is used as-is.
+    // On web, size the window at creation to the card-aspect box fitting the viewport, so the first frame
+    // is already right rather than corrected by the glfwPollEvents reconcile. Desktop: glfw_canvas_css_*
+    // return 0, so the requested size is used as-is.
     let vw = glfw_canvas_css_width()
     let vh = glfw_canvas_css_height()
     if (vw > 0 && vh > 0 && width > 0 && height > 0) {
@@ -215,11 +216,22 @@ def public harness_begin_frame() : bool {
     begin_frame()
     // (no ImGui_ImplOpenGL3_NewFrame — the das renderer builds its objects at init, nothing per-frame)
     ImGui_ImplGlfw_NewFrame()
+    var io & = unsafe(GetIO())
+    // Last-resort guard, not the mechanism: glfwPollEvents reconciles window size to the canvas CSS box
+    // every frame. This only catches a host reporting no CSS box at all, where 0x0 would discard every
+    // draw list — framebuffer units are the wrong space for mouse input, but they beat rendering nothing.
+    if (io.DisplaySize.x <= 0.0f || io.DisplaySize.y <= 0.0f) {
+        var fbw, fbh : int
+        glfwGetFramebufferSize(live_window, safe_addr(fbw), safe_addr(fbh))
+        if (fbw > 0 && fbh > 0) {
+            io.DisplaySize = float2(float(fbw), float(fbh))
+            io.DisplayFramebufferScale = float2(1.0f, 1.0f)
+        }
+    }
     // Single clock: drive ImGui DeltaTime from the master clock (get_dt), so lockstep
     // recording uses the fixed step; normal mode get_dt()==wall dt (no-op). Guard >0.
     let mdt = get_dt()
     if (mdt > 0.0f) {
-        var io & = unsafe(GetIO())
         io.DeltaTime = mdt
     }
     advance_coroutines()

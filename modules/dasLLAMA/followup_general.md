@@ -97,6 +97,14 @@
    Both become expressible the moment a helper can take a pointer or a thread-space reference it
    may advance, which is the annotation work already ruled in (`@threadgroup p : float4?` and its
    `device` default). Done = k6 and q8 derive from the same base, and the family is five for five.
+   Status 2026-08-07 (vulkan-on-mac leg (b) recon): the pointer-param unlock HAS landed in
+   msl_emit (address-space-checked pointer params), and Q8/K6 are also expressible without it
+   (index-math / reload-per-kb) — but every route changes these hot inner loops (interleaved A/B
+   measurement required; the kernels-suite oracles cover correctness only), Mx4 is a third
+   stay-out (pre-loop vtab staging + bias-seeded accumulator locals need a prologue hook), and
+   Q8/Mx4 joining the base renumbers cnt/basep/bkt 6/7/8 → 7/8/9 (encoder + oracle-gate churn).
+   Ruled 2026-08-07: folds into the reification arc (the families get restamped there; the
+   constraints above apply — see plans/vulkan-on-mac.md leg (b) recon).
 
 9. **Prefill compiles its own PSO for kernels decode already has.** `enc_qk_norm_pf` in
    dasllama_metal_prefill.das is `enc_qk_norm`'s body with `g_pf_pso_qknorm` in place of
@@ -195,7 +203,7 @@
     errors on an opaque dispatch unless the function carries an explicit opt-out annotation, which
     turns an invisible class of bug into an enumerated, reviewable list. Note this is ADVISORY — it
     flags "this function hand-binds", not "this function is wrong". Until it exists the rule is
-    structural: nothing dispatches a kernel except its `enc_*` builder (CODEREVIEW rule 21).
+    structural: nothing dispatches a kernel except its `enc_*` builder (CODEREVIEW: "Nothing dispatches a kernel except its enc_* builder").
 
 14. **`dasllama_blocks` / `dasllama_moe` / `dasllama_ple` have no direct tests.** All three
    are pointer-dispatched forward-loop internals moved out of `dasllama_common` during the reorg;
@@ -205,3 +213,70 @@
    Done = each of the three gets a feed-the-function suite (a block kernel against a reference
    forward step; `moe_ffn_core` routing against a hand-checked top-k case; the PLE pre-step
    against a fixture), or a written carve-out on the rule for pointer-dispatched move-outs.
+
+15. **Accelerate (+AMX) arm for the audio-tower tables (Boris 2026-08-05; explicitly NOT the
+   quant-lane arc).** Once the towers are q8-forced, the `--accel` flavor rows should serve the
+   tower mms through the accelerate tier the way the LLM float-batch slots already do — the
+   override hook (`g_mm_fp_batch_override`) and the tier plumbing exist, so the wiring is
+   expected to be crazy cheap. Metal tower offload is explicitly deferred ("not metal (yet)").
+   Done = accel-flavor audio cells dispatch tower mms through the accelerate driver with the
+   crossover verdict recorded, default cpu rows unchanged.
+
+16. **Profiling framework refactor — zero-overhead-when-off (Boris 2026-08-05, during the
+   audio-tower probe work).** The current rails are runtime-gated hand sites: every
+   `prof_add`/`asr_prof_add` call site takes `ref_time_ticks()` unconditionally and branches on
+   a global inside the callee — "cute", but each new probe sprinkles more always-on ticks
+   through hot loops (today's `g4a.enc.*` sites included), two parallel rails exist
+   (`forward_profile` buckets vs `asr_prof` string table) with different arming and reporting,
+   and the generic-path `mm_gemm` double-count chore is a symptom of sites living at the wrong
+   level. Wanted: ONE macro-based rail where a profile site **compiles to nothing** unless
+   profiling is armed at COMPILE time — under `-jit` every run compiles at launch, so the
+   `--prof` decision can reach the macro (compile-time option/env read by the pass macro, or a
+   lens-module require, the `dasllama_metal_lens` pattern), and the released bench app bakes
+   the sites OUT of its timed paths entirely while a probe launch bakes them IN. Done = one
+   site syntax for both rails, `--prof`-off builds contain zero profiling instructions
+   (verified in emitted IR), the double-count chore resolved by construction, and the census +
+   report surface preserved.
+
+17. **Vision stills — when, not if (Boris 2026-08-05).** Image-in/text-out on the existing
+   mmproj carriers (the `v.*` towers the audio work already ships past unread). Explicitly
+   SEQUENCED: after the vulkan side comes together AND dasllama.io serves sidecars + hosts
+   ladders — not before. Scope expectation from the audio comparison: first family ≈ a
+   gemma4a-sized arc (vanilla ViT / MobileNet blocks, no DSP frontend, no realtime bar; the
+   soft-token splice, q8 tower rail, .dlim lane, and mtmd oracle harness all transfer;
+   qwen3vl's M-RoPE + deepstack are pre-registered and merely activate). One-time plumbing:
+   image decode (dasStbImage) + per-family resize/patchify conventions. VIDEO stays out:
+   not reasonable without GPU — "maybe hybrid mode, maybe one day"; its real dependency is
+   the deep-prefill context wall (50k-token splices), not new kernels.
+
+18. **Tutorials + documentation resync sweep (Boris 2026-08-05).** The ASR/audio tutorials and
+   module documentation have desynced from the API as the q8/KV/lever work landed — a full
+   pass over `tutorials/` (`.das` and `.rst`) and the dasLLAMA doc pages against the current
+   facade surface (`set_asr_kv`, `--kv`, `--fp32-tower`, exec_fmt spellings, the q8 defaults).
+   Going forward the new Documentation section in CODEREVIEW.md makes this a per-change check;
+   this item is the one-time catch-up.
+
+19. **Oracle-suite hardening round 2 (PR #3653's review round, deferred by ruling).** The
+    kernels suite is census-complete but the bug-scan agents mapped axis-coverage holes where
+    a targeted kernel mutation stays green: the Part/PartB split-K softcap path (hardcoded 0.0
+    in those gates — distinct from the fixed single/batched arms), the SqAttnB q8 K-vs-V base
+    aliasing (rt.y = rt.x in the quant branch), the D-family khoff ≡ 0 under kv_mul=2/nheads=2,
+    gemm ndim=64 hiding the nBase column-tile term, gemv output buffers sized exactly (row
+    guards unobservable — pair with sentinel-padded planes), the argmax tie pair never sharing
+    a simdgroup (the simd_shuffle_xor tie-break unwitnessed), the misc softcap fixture spanning
+    only ±0.3·cap, rope bias planes zero-filled where production dummy-binds arbitrary bytes
+    (fill non-zero when hasbias=0), the neox×hasbias confound in the rope-store quant mirrors,
+    kq gemv weight reads past exactly-sized buffers (blocks MTL_SHADER_VALIDATION=1 runs), the
+    copy_row gate's tg=64 vs production 256, the dead b4 pad-column clamp cell, the q8 region
+    fixture's sel collapsing to a k-slot function (routing untested, padding only), and the 12
+    prefill-file gates still on dump-less tag-less local compares. Also latent: the two rope
+    oracles index tcos/tsin at [0, hs/2) while sizing rot/2 — reads OOB and ropes the
+    pass-through tail the moment a cell pairs neox=false with rot < hs (the flat gate's
+    identity-pad pattern is the fix). Also: migrate the prefill file's tag-less mismatch trio
+    to the shared dumping compares (~25 call sites).
+
+20. **`vk_moe_would_accept` / resident probes vs the wg-cap decline.** The resident decline
+    for an over-cap batched-attention class now lives in `vk_rdec_prepare` (live path only).
+    The offline plan cannot see the cap (followup_vulkan item 19) and `vk_moe_would_accept`
+    answers only format/geometry — a would-accept probe that consults device caps would let
+    schedulers plan without a live ensure_ round-trip.

@@ -4,8 +4,11 @@
 #   run_build.sh <src_dir> <out_dir> <mode> <entry>
 #
 # Contract with the service (buildd_core.run_build_command):
-#   - exit 0 and artifacts in <out_dir>  => success, everything servable there uploads
-#   - nonzero exit                        => failure, stdout becomes the user-facing error
+#   - exit 0                => success; the service then collects EXACTLY the
+#                              files this mode declares, by name, and ignores
+#                              anything else in <out_dir>. A build cannot widen
+#                              its own output set, and must not be changed to.
+#   - nonzero exit          => failure, stdout becomes the user-facing error
 #   - stderr is redirected into stdout here — the service captures one stream
 #
 # THE SANDBOX IS THE SECURITY BOUNDARY. Compiling user .das is remote code
@@ -38,8 +41,12 @@
 # mode=module: the per-sample recipe, verbatim from web/CMakeLists.txt
 # (all_wasm) — host daslang -exe with the wasm64 jit target against the
 # web/output64 runtime archive, emitting <out_dir>/sample.wasm.
-# mode=page: the standalone game recipe (daspkg release wasm) — lands with the
-# game checkpoint of plans/dasweb_wasm_pipeline.md; refused until then.
+# mode=page: the standalone-page recipe — daspkg release wasm, the same rail
+# the five /examples cards use — for any sample whose requires pull in a native
+# graphics/audio module, since GL and audio live in emscripten's JS glue that a
+# bare wasi module cannot carry. The service writes the .das_package naming the
+# app `sample` into SRC_DIR first; the rail nests its output under <out>/sample,
+# which is flattened here INSIDE the sandbox.
 
 set -u
 exec 2>&1
@@ -51,7 +58,7 @@ ENTRY="${4:?missing entry}"
 
 WORKTREE="${DASWEB_WASM_WORKTREE:?DASWEB_WASM_WORKTREE is not set}"
 EMSDK_ROOT="${EMSDK:?EMSDK is not set (the pinned emsdk root)}"
-IMAGE="${DASWEB_BUILDER_IMAGE:-dasweb-builder:1}"
+IMAGE="${DASWEB_BUILDER_IMAGE:-dasweb-builder:2}"
 LLVM_LIB="${DASWEB_LLVM_LIB:-/usr/lib/llvm-19/lib}"
 BUILD_MEMORY="${DASWEB_BUILD_MEMORY:-8g}"
 BUILD_PIDS="${DASWEB_BUILD_PIDS:-512}"
@@ -107,8 +114,18 @@ module)
         --jit-runtime-lib="$RUNTIME_LIB"
     ;;
 page)
-    echo "page mode is not wired yet (lands with the game checkpoint)"
-    exit 13
+    # sample.{html,js,wasm}: daspkg's release-wasm rail — the same one the five
+    # /examples cards use — cross-compile + emcc link with the module archives,
+    # GL/thread flags and the canvas shell. The service wrote a .das_package
+    # naming the app `sample` into SRC_DIR before this ran, so the output set
+    # is exact. The rail nests it under <out>/sample/; flatten INSIDE the
+    # sandbox so the host never touches build-controlled paths.
+    run_sandboxed /bin/bash -c '
+        set -e
+        "$1" "$2/utils/daspkg/main.das" -- release wasm --root "$3" --out "$4"
+        mv "$4/sample/sample.html" "$4/sample/sample.js" "$4/sample/sample.wasm" "$4/"
+        rm -rf "$4/sample"
+    ' _ "$DASLANG" "$WORKTREE" "$SRC_DIR" "$OUT_DIR"
     ;;
 *)
     echo "unknown mode '$MODE'"

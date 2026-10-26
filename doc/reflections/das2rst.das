@@ -84,6 +84,7 @@ require daslib/bitfield_boost
 require daslib/bitfield_trait
 require daslib/async_boost
 require daslib/command_line
+require daslib/build_const
 require daslib/consume
 require daslib/dap
 require daslib/das_source_formatter
@@ -196,7 +197,7 @@ get_value|insert_clone|emplace_new|insert_default|emplace_default|get_with_defau
         group_by_regex("Memory manipulation", mod, %regex~(intptr|memcmp|variant_index|set_variant_index|hash|memcpy|lock_data|map_to_array|map_to_ro_array)$%%),
         group_by_regex("Binary serializer", mod, %regex~(binary_load|binary_save)$%%),
         group_by_regex("Path and command line", mod, %regex~(get_command_line_arguments|with_argv)$%%),
-        group_by_regex("Time and date", mod, %regex~(get_time_usec|ref_time_ticks|get_clock|get_time_nsec|mktime|iso8601_now|format_time)$%%),
+        group_by_regex("Time and date", mod, %regex~(get_time_usec|ref_time_ticks|get_clock|get_time_nsec|mktime|iso8601_now|format_time|clock)$%%),
         group_by_regex("Platform queries", mod, %regex~(get_context_share_counter|das_is_dll_build|das_is_exceptions_enabled|is_standalone_exe|get_platform_name|get_running_platform_name|get_cross_platform_name|get_architecture_name|cpu_supports)$%%),
         group_by_regex("String formatting", mod, %regex~(fmt)$%%),
         group_by_regex("Argument consumption", mod, %regex~(consume_argument)$%%),
@@ -1143,6 +1144,13 @@ def document_module_linq_fold(_root : string) {
     document("LINQ fold macros (_fold / _old_fold)", mod, "linq_fold.rst", groups)
 }
 
+def document_module_build_const(_root : string) {
+    var mod = find_module("build_const")
+    var groups <- array<DocGroup>(
+    )
+    document("Compile-time build constants", mod, "build_const.rst", groups)
+}
+
 def document_module_command_line(_root : string) {
     var mod = find_module("command_line")
     var groups <- array<DocGroup>(
@@ -1344,7 +1352,7 @@ def document_module_logger(_root : string) {
 def document_module_sha_256(_root : string) {
     var mod = find_module("sha_256")
     var groups <- array<DocGroup>(
-        group_by_regex("One-shot hashing", mod, %regex~.*(sha256_hex)$%%),
+        group_by_regex("One-shot hashing", mod, %regex~.*(sha256_hex|sha256_file_hex)$%%),
         group_by_regex("Streaming", mod, %regex~.*(sha256_init|sha256_update|sha256_final|sha256_hex_digest)$%%)
     )
     document("SHA-256", mod, "sha_256.rst", groups)
@@ -1879,6 +1887,7 @@ def main {  // nolint:STYLE038 — flat one-call-per-documented-module dispatch 
     document_module_bitfield_boost(root)
     document_module_bitfield_trait(root)
     document_module_bool_array(root)
+    document_module_build_const(root)
     document_module_class_boost(root)
     document_module_command_line(root)
     document_module_constexpr(root)

@@ -86,7 +86,7 @@ modules/dasLLAMA/
   PROFILE.md                  # the three profiling rigs — the routine in-process check, the oracle cell, the rig that publishes
   PERF_LEDGER.md              # the living perf backlog — parked ideas, not chased mid-wave
   tune_for_this_box.md        # per-box tuning + the measurement discipline (SDK-installed)
-  ENVIRONMENT.md              # GENERATED from dasllama_env's registry (harness/gen_env_doc.das writes it; tests/test_env_registry.das gates drift) — every knob
+  ENVIRONMENT.md              # GENERATED from dasllama_env's [EnvConfig] declarations (harness/gen_env_doc.das writes it; tests/test_env_registry.das gates drift) — every knob
   THINKING.md                 # design notes and open questions
   followup_vulkan.md          # PLANNED: grow the vulkan resident driver to Metal's contract shape
   whisper_plan.md             # per-family bring-up records + findings:
@@ -102,7 +102,7 @@ modules/dasLLAMA/
                               #  set results_metal_*.md + baseline_metal_*.tsv — are
                               #  archived under history/dasLLAMA/)
   dasllama/                   # the module — require dasllama/<name>
-    dasllama_env.das          #   the env-var registry + the typed readers every knob goes through (ENVIRONMENT.md is generated from it)
+    dasllama_env.das          #   the [EnvConfig] knob declarations, loaded once into the g_env_* globals every read site uses (ENVIRONMENT.md is generated from it)
     dasllama_math.das         #   numeric primitives + matmul/dot kernels + Q8·Q8 kernel-backend registry + dispatch shaping
     dasllama_kv_codec.das     #   the KV-cache codec — per cache format (f16/q8_0/tq4) the WHOLE family: store/read/dot/axpy (+ tq4 FWHT rotation)
     dasllama_kqformat.das     #   format identity — the KqFmt enum, per-format strides/geometry/stream codes, the one enum->kernel-id bridge
@@ -121,12 +121,13 @@ modules/dasLLAMA/
     dasllama_metal_shapes.das #   the Metal drivers' MODEL-SHAPE gates, extracted PORTABLE (no das_metal) so any box can bake a metal-flavor .dlim
     dasllama_metal_lens.das   #   the [metal_dispatch] lens — @role's read/write axis DERIVED from the kernel body
     dasllama_math_vulkan.das  #   Vulkan backend ENTRY: probe/arm, dry-bake, .dlim identity, routers, [init] (re-exports the family)
-    dasllama_vulkan_kernels.das #  the Vulkan [compute_shader] kernel set + derived-access spec (no device state)
+    dasllama_vulkan_classes.das #  the Vulkan KERNEL home — every kernel a [spirv_kernel]/[vk_dispatch] class (no device state)
+    dasllama_vulkan_dispatch.das # the [vk_dispatch] structure macro — generates ensure_/set_/enc_ + the census seed per class
     dasllama_vulkan_common.das #   Vulkan device state (GpuState/g_gpu) + buffer/command plumbing + hazard rail + arena + profiler
+    dasllama_vulkan_seams.das #    the per-op class-rail seams (vk_add_rms / vk_rope_kv_store / vk_decode_attn)
     dasllama_vulkan_decode.das #   Vulkan resident DECODE driver + decode arms (FFN GEMV, qkv, cls, dnd step, heat cache)
     dasllama_vulkan_prefill.das #  Vulkan resident PREFILL driver + batch arms (FFN batch, dense, dn, attention, streamed mirrors)
-    dasllama_vulkan_lens.das  #   the Vulkan kernel-access lens — per-binding hazard masks derived from the kernel body
-    dasllama_kernel_access.das #  the shared body-walk read/write classifier both GPU lenses run on
+    dasllama_kernel_access.das #  the shared body-walk read/write classifier the GPU lenses run on
     dasllama_gpu_resident.das #   the vulkan MoE GPU-resident expert tier — bake plan, upload/stream slots, per-layer placement
     dasllama_math_gen.das     #   the generated GEMM tier — registers "arm64-gen"/"x64-gen" (load-select repack backends; traversals read the stamped layout)
     dasllama_gemm_schema.das  #   tune_perm grid + layout schema shared by the generator and the runtime

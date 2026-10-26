@@ -130,6 +130,14 @@ appending a dated entry; state the timeless WHY, and if the motivating incident 
 keeping, archive it in `/history`. (Carve-out: `probe-verified <date>` tags on syntax/behavior
 claims are verification provenance, not history — they stay.)
 
+**Every CODEREVIEW.md reviews itself.** Each carries the self-review rule — a rule a reviewer
+cannot apply as written is a defect of the checklist, marked like any other finding — and a
+NEW CODEREVIEW.md includes that rule from its first commit. When a checklist audit runs for a
+PR, its scope is every CODEREVIEW.md discovered from the changed set (the `skills/make_pr.md`
+step-0a walk): each discovered checklist is itself audited under the self-review rule, not
+just applied. With several checklists in scope, the auditor fans out to parallel subagents —
+one per checklist — and merges the findings into one report.
+
 **Doc improvements at stopping points.** Propose-first applies only to what's left: restructuring, removing existing guidance, **or proposing a new skill file when you see a recurring pattern that no existing skill covers**. Doc edits direct future Claude behavior, so structural diffs still get review — but factual drift must be self-healing, not queued behind it.
 
 ### Writing a new skill
@@ -390,7 +398,7 @@ For path/filename ops use `fio` helpers (`base_name`/`dir_name`/`path_join`/etc.
 
 **Complexity/length lint (STYLE037/STYLE038) — suppress an honest shape, never force a split.** A hit is a prompt to look, not an order to refactor. When the function genuinely should not be reduced — a flat one-call-per-item list (PSO compile/release runs, registration tables), an exact-type `is` ladder, a dispatch table, flat CLI-argument handling, a GPU kernel body whose phases are barrier- or register-coupled — put `// nolint:STYLE037` (or `STYLE038`) on the `def` line with a short tail-comment reason and move on. Splitting where it does not belong makes the code worse: single-caller helpers that exist only to lower a number hide control flow, and a wide rewrite of working code is riskier than the number it removes. Split only along a natural seam — genuine duplication, a distinct phase, a self-contained arm — and only when the extracted helper stands on its own. **New code should meet both limits from the start**; the escape is for shapes that are irreducible, not for code that was written oversized. Whole-file density (codegen emitters, parsers, ported code) takes `options _cyclomatic_complexity = N` / `options _function_length = N` instead. Full resolution order: `skills/style_lint.md`.
 
-**Comment hygiene.** Comments are 1–2 lines max. Strict rules:
+**Comment hygiene.** Comments are 1–2 lines preferred, 3 the enforced cap (STYLE014 fires at 4+ — the tree carries ~1400 three-line blocks, so the tool holds the floor and this doc names the target). Strict rules:
 
 1. **No banner comments above a documented function.** When a function carries `//!` inside its body, drop the `// ===== name — desc =====` block above. The banner duplicates the doc.
 2. **No multi-paragraph architectural prose at the head of a section.** Don't write 10–30 line preambles explaining design decisions, surface examples, NULL handling, panic semantics, etc. above `// Section name`. Code reads well; design docs (plans, `API_REWORK.md`, RST tutorials) carry the WHY. If a reader genuinely needs that context, it goes in those docs, not the source.

@@ -12,6 +12,7 @@ require dasllama/dasllama_asr   // --asr: load_asr_model/create_session/transcri
 require audio   // --asr: the miniaudio decoder behind load_audio_16k_mono
 require dasllama/dasllama_audio   // --asr: AUDIO_SAMPLE_RATE, the 16 kHz mono contract
 require daslib/module_path            // get_this_module_dir — the default prompt corpus beside this bench
+require daslib/jobque_profile   // JOBQUE_PROFILING_ENABLED — --prof refuses on a build without the marker rail
 require ?das_accelerate dasllama/dasllama_math_accelerate   // the --accel leg; Apple-only C++ module
 require ../performance/profile_common.das   // profile_threads + affinity_on + bench records — the standing per-box methodology
 require llvm/daslib/llvm_tune   // tune_app_script — the exe-vs-script discriminator behind --for-debug-purposes
@@ -20,6 +21,7 @@ require daslib/clargs
 require daslib/fio
 require daslib/md_boost
 require math
+require dasllama/dasllama_env
 
 // llama-bench mirror — EXACTLY llama.cpp's test shapes, rep counts, and timing boundaries, and
 // NOTHING else. Two independent rows, each = one untimed warmup + -r timed reps, mean ± stdev:
@@ -109,6 +111,9 @@ struct Args {
     @clarg_doc = "A/B MTP/NextN self-speculation in-process, OFF then ON (needs a NextN head in the GGUF). Runs the tg-real row, NOT the llama-bench tg row — acceptance is meaningless on synthetic ids. Reports the draft accept rate; mutually exclusive with the other A/B levers"
     mtp_ab : bool
 
+    @clarg_doc = "A/B the resident ladder's per-token re-encode in-process: every row runs twice, recorded-once then re-encoded every token. Prices the carrier class twins' push-borne pos/cnt (vulkan resident decode only); mutually exclusive with the other A/B levers"
+    rerecord_ab : bool
+
     @clarg_doc = "Refuse to mint artifacts: load only an existing prepared .dlim image, panic otherwise (the gen_bench_records --oracle contract)"
     frozen : bool
 
@@ -122,7 +127,7 @@ struct Args {
     @clarg_doc = "Prompt corpus for the tg-real row (segments split on lines of two percent signs; default: data/wikitext2_prompts.txt beside this bench)"
     prompts : string = ""
 
-    @clarg_doc = "After each tg-real arm's timed reps, run one UNTIMED window with forward_profile buckets — the per-section time split of that arm. With --mtp-ab this is what attributes draft vs verify vs classifier"
+    @clarg_doc = "After the pp row and each tg-real arm's timed reps, run one UNTIMED window with forward_profile buckets — the per-section time split of that row — and print the dispatch census (backend caps, which MoE prefill arm each layer takes) after load. With --mtp-ab this is what attributes draft vs verify vs classifier"
     prof : bool
 
     @clarg_short = "?"
@@ -360,7 +365,41 @@ def private levers_of(cfg : Args) : array<Lever> {
         // set_mtp_spec must be live BEFORE the prefill — it warms the draft head's KV
         out |> emplace(Lever(flag = "mtp", tag = "mtp", route = @@set_mtp_spec, env = "", real = true))
     }
+    if (cfg.rerecord_ab) {
+        out |> emplace(Lever(flag = "rerecord", tag = "rerecord", route = @@set_vk_rdec_rerecord, env = ""))
+    }
     return <- out
+}
+
+// Output sanity, untimed and always on: each row's warmup logits must be finite with a
+// non-degenerate argmax, or the run REFUSES — the timed windows never read output (llama-bench
+// parity), so a broken pipeline would otherwise post clean-looking numbers.
+def private bench_output_gate(t : Model; s : Session; fmt : OutFmt; tag : string) : bool {
+    let vocab = t.config.vocab_size
+    var bi = 0l
+    var bv = -3.0e38
+    var mn = 3.0e38
+    var bad = 0l
+    for (v in range64(vocab)) {
+        let x = s.logits[v]
+        if (is_nan(x) || abs(x) > 3.0e38) {
+            bad++
+        } else {
+            if (x > bv) {
+                bv = x
+                bi = v
+            }
+            if (x < mn) {
+                mn = x
+            }
+        }
+    }
+    if (bad > 0l || bv <= mn) {
+        say(fmt, "REFUSED ({tag}): warmup logits unusable — {bad} non-finite of {vocab}, max {bv} min {mn}; the serving pipeline is broken and its timings would be meaningless\n")
+        return false
+    }
+    say(fmt, "sanity ({tag}): warmup argmax {bi} \"{piece_(t, bi)}\" (logit {bv})\n")
+    return true
 }
 
 // Greedy pick over the last logits — the tg-real row's sampler. Runs INSIDE the timed window, but
@@ -400,6 +439,50 @@ def private say(fmt : OutFmt; text : string) {
         print(text)
     } else {
         fwrite(fstderr(), text)
+    }
+}
+
+// --prof census: the runtime state that picks each MoE prefill arm — a fallback path names
+// itself here instead of hiding inside a slow row
+def private dispatch_census(t : Model; fmt : OutFmt) {
+    let c = t.config
+    say(fmt, "census: quant={t.quant} kquant_native={t.kquant_native} kq_repacked={t.kq_repacked} mx4_repacked={t.mx4_repacked} experts_mx4={t.experts_mx4}\n")
+    say(fmt, "census: caps kq={kernel_backend_has_kq()} kq_batch={kernel_backend_has_kq_batch()} kq_batch_groupn={kernel_backend_has_kq_batch_groupn()} rows={kernel_backend_has_rows()} mx4_rows={kernel_backend_has_mx4_rows()} grouped_prefill={get_moe_grouped_prefill()}\n")
+    // the layout-stamp provenance: 1 = disk order (reference layout — no interleave perm applied)
+    say(fmt, "census: layout mr: q8={active_q8_layout_mr()} kq4={kq_active_mr(t, KqFmt.k4)} q51={active_q51_layout_mr()}\n")
+    if (c.n_expert <= 0l) {
+        say(fmt, "census: dense model, no MoE dispatch\n")
+        return
+    }
+    // mirrors the ffn_gemma4_prefill gate; ffn_moe_prefill also ANDs the mx4 per-call
+    // economics (the mx4 note below)
+    var grouped = 0l
+    var perpos = 0l
+    var inscope fmts : array<string>
+    var inscope fcnt : array<int64>
+    for (l in range64(c.n_layers)) {
+        continue if (l < c.n_layer_dense_lead)
+        let sb = moe_layer_sb_kq(t, l)
+        let kq_ok = !sb || (t.kq_repacked && kernel_backend_has_kq_batch())
+        if (t.quant == QuantMode.q8 && get_moe_grouped_prefill() && kq_ok) {
+            grouped++
+        } else {
+            perpos++
+        }
+        let key = "{fmt_at(t.we1_fmt, l)}/{fmt_at(t.we3_fmt, l)}/{fmt_at(t.we2_fmt, l)}{sb ? " sb_kq" : ""}"
+        let fi = fmts |> find_index(key)
+        if (fi < 0) {
+            fmts |> push(key)
+            fcnt |> push(1l)
+        } else {
+            fcnt[fi]++
+        }
+    }
+    var inscope fdesc <- [for (fk, fc in fmts, fcnt); "{fk} x{fc}"]
+    say(fmt, "census: moe E={c.n_expert} k={c.n_expert_used} nfe={c.n_ff_exp} expert fmts gate/up/down: {fdesc}\n")
+    say(fmt, "census: moe prefill arms: {grouped} grouped, {perpos} per-position{perpos > 0l ? " <-- UNBATCHED reference path" : ""}\n")
+    if (t.experts_mx4) {
+        say(fmt, "census: mx4 experts — a grouped layer still drops to per-position when npos*k < 8*E (per-call economics)\n")
     }
 }
 
@@ -453,6 +536,10 @@ def main() : int {
         print_help(get_command_info(type<Args>), "lcpp_bench")
         return 0
     }
+    if (cfg.prof && !JOBQUE_PROFILING_ENABLED) {
+        print("--prof needs the marker rail compiled in — rerun with JOBQUE_PROFILING=1 (or --jobque-profiling)\n")
+        return 1
+    }
     // measurement exists only from the released exe: a -jit SCRIPT run reads whatever sidecar
     // sits beside the script and re-keys nothing — its numbers must never enter records
     g_debug_run = !empty(tune_app_script())
@@ -489,12 +576,12 @@ def main() : int {
     // (gen_profile's pattern): cap the future que's workers (computing main is the last lane) and
     // hard-pin lanes to distinct physical cores on the boxes that pin. -t is the explicit ask, but
     // DAS_JOBQUE_THREADS / DAS_JOBQUE_AFFINITY envs still win the que's actual lane count.
-    let t_env = has_env_variable("DAS_JOBQUE_THREADS")
-    var threads = cfg.threads > 0 ? cfg.threads : (t_env ? to_int(get_env_variable("DAS_JOBQUE_THREADS")) : profile_threads())
-    if (t_env && to_int(get_env_variable("DAS_JOBQUE_THREADS")) != threads) {
-        threads = to_int(get_env_variable("DAS_JOBQUE_THREADS"))
+    let t_env = g_env_core.jobque_threads
+    var threads = cfg.threads > 0 ? cfg.threads : (t_env ?? profile_threads())
+    if (is_some(t_env) && unwrap(t_env) != threads) {
+        threads = unwrap(t_env)
         say(fmt, "warning: DAS_JOBQUE_THREADS overrides -t — running {threads} lanes\n")
-    } elif (!t_env) {
+    } elif (is_none(t_env)) {
         // the PC measurement regime caps at 16 lanes (an explicit env or -t always wins) —
         // a big-SMT box at full width measures the scheduler, not the kernels
         if (get_platform_name() == "windows" && cfg.threads <= 0 && threads > 16) {
@@ -503,13 +590,13 @@ def main() : int {
         }
         set_jobque_threads_cap(max(threads - 1, 1))
     }
-    let pinned = affinity_on() && !has_env_variable("DAS_JOBQUE_AFFINITY")
+    let pinned = affinity_on() && is_none(g_env_core.jobque_affinity)
     if (pinned) {
         set_jobque_affinity(2)   // 2 = hard mask, the llama-bench --cpu-strict mirror (mode 1 re-rolls SMT placement)
     }
     // the regime is set BY THE BENCH, printed so nobody has to guess: N lanes = N-1 pool
     // workers + the computing main thread (DAS_JOBQUE_THREADS counts LANES, not workers)
-    say(fmt, "regime: {threads} lanes ({max(threads - 1, 1)} pool workers + main), affinity {pinned ? "hard mask (bench-forced)" : (has_env_variable("DAS_JOBQUE_AFFINITY") ? "env override" : "off (platform default)")}\n")
+    say(fmt, "regime: {threads} lanes ({max(threads - 1, 1)} pool workers + main), affinity {pinned ? "hard mask (bench-forced)" : (is_some(g_env_core.jobque_affinity) ? "env override" : "off (platform default)")}\n")
     if (cfg.asr) {   // the audio cell shares every lane decision above, then runs its own protocol
         return asr_cell_main(cfg.model, cfg.json_path, reps, threads) ? 0 : 1
     }
@@ -537,8 +624,8 @@ def main() : int {
     }
     // an unarmed lever silently measures the SAME thing twice — the one A/B failure that looks
     // like a real result, so it warns rather than being left to the reader
-    if (ab && !empty(levers[0].env) && !has_env_variable(levers[0].env)
-            && !(cfg.prefill_ab && has_env_variable("DASLLAMA_GPU_MOE_STREAM"))) {
+    if (ab && !empty(levers[0].env) && !env_is_set(levers[0].env)
+            && !(cfg.prefill_ab && is_some(g_env_gpu.gpu_moe_stream))) {
         print("warning: --{levers[0].flag}-ab without {levers[0].env}=1 — nothing armed, both arms identical\n")
     }
     // -m accepts a comma-separated list: one process benches every model in turn, so a sweep
@@ -591,6 +678,9 @@ def main() : int {
         modelArch = "{t.arch}"
         activeB = active_params_b(t)
         execFmt = model_exec_fmt(t)
+        if (cfg.prof) {
+            dispatch_census(t, fmt)
+        }
         var s <- make_run_state(c)
         for (arm in range(ab ? 2 : 1)) {
             var dtag = ""
@@ -680,6 +770,9 @@ def main() : int {
             if (plen > 0l) {
                 let warm <- build_prompt(plen, 999l)
                 forward_prefill(t, s, warm, plen, 0l)   // warmup — untimed full-size run, as llama-bench does
+                if (!bench_output_gate(t, s, fmt, "pp{plen}{dtag}")) {
+                    panic("lcpp_bench: output sanity gate refused pp{plen}{dtag} — see the REFUSED line")
+                }
                 var tps : array<double>
                 for (rep in range(reps)) {
                     let prompt <- build_prompt(plen, int64(rep))
@@ -690,14 +783,27 @@ def main() : int {
                 }
                 let st = row_stat("pp{plen}{dtag}", tps)
                 say(fmt, "{st.test}: {st.mean:.2f} ± {st.sd:.2f} tok/s ({reps} reps)\n")
-                if (has_env_variable("DASLLAMA_BENCH_VERBOSE")) {
+                if (g_env_bench.bench_verbose) {
                     say(fmt, "  reps: {tps}\n")
                 }
                 results |> push(st)
                 delete tps
+                if (cfg.prof) {
+                    // untimed bucket window for the pp row — reset FIRST, so the report is pure prefill
+                    forward_profile_reset()
+                    var inscope pprof <- build_prompt(plen, 998l)
+                    let ts_wall = ref_time_ticks()
+                    forward_prefill(t, s, pprof, plen, 0l)
+                    let wall_us = get_time_usec(ts_wall)
+                    say(fmt, "--- forward_profile: {st.test} (window wall {wall_us} us) ---\n")
+                    forward_profile_report()
+                }
             }
             if (ngen > 0l) {
                 forward(t, s, synth_id(0l, 999l), 0l)   // warmup — one untimed token, llama-bench's test_gen(ctx, 1)
+                if (!bench_output_gate(t, s, fmt, "tg{ngen}{dtag}")) {
+                    panic("lcpp_bench: output sanity gate refused tg{ngen}{dtag} — see the REFUSED line")
+                }
                 var tps : array<double>
                 for (rep in range(reps)) {
                     let t0 = ref_time_ticks()
@@ -709,7 +815,7 @@ def main() : int {
                 }
                 let st = row_stat("tg{ngen}{dtag}", tps)
                 say(fmt, "{st.test}: {st.mean:.2f} ± {st.sd:.2f} tok/s ({reps} reps)\n")
-                if (has_env_variable("DASLLAMA_BENCH_VERBOSE")) {
+                if (g_env_bench.bench_verbose) {
                     say(fmt, "  reps: {tps}\n")
                 }
                 results |> push(st)

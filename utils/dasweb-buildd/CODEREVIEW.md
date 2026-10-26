@@ -8,6 +8,10 @@ knowledge of the service, and without opening another document.** If an entry ne
 those, it is not a review criterion — move it to `README.md` and leave a one-line criterion
 here.
 
+**This file reviews itself: a rule a reviewer cannot apply as written is a defect of this
+file.** Mark it like any other finding — a checklist defect blocks nothing, but its fix (a
+rewrite or a move, never silent tolerance) lands in the same batch as the round's other fixes.
+
 **Form, and it is a hard limit:**
 
 - **One rule is one short paragraph.** An entry that needs more than that is describing how to
@@ -65,10 +69,14 @@ defect, and this section is the whole test.
 - `run_build.sh` — the box-side build recipe and its sandbox invocation; the only place a build
   command line or a sandbox mount lives. A behavior change here without a note in `README.md`
   (The sandbox section) is a defect.
+- `roll_toolchain.sh` — the box-side toolchain-bump recipe: moving the worktree, rebuilding the
+  cross-compile host and the wasm archives, warming the emcc cache in both modes, restarting the
+  service. The only place a roll step lives. A step added or removed here without a note in
+  `README.md` (The toolchain-bump protocol section) is a defect, and a roll path that moves the
+  worktree without rebuilding both the host and the runtime archive is a defect.
 - `Containerfile` — the sandbox image. It holds only what a system must provide the toolchain;
   anything a read-only mount can supply instead belongs in `run_build.sh`. A change here
   without bumping the image tag in both files, in the same commit, is a defect.
-- `_fake_build.das` — the cross-platform test stand-in for `run_build.sh`; test fixture only.
 - `.das_package`, `watchdog.json`, `dasweb-buildd.toml` — packaging and deployment. A behavior
   change hidden in these files without a note in `README.md` (Run section) is a defect.
 

@@ -7,10 +7,10 @@ require dashv/dashv_boost public
 require daslib/json_boost
 require daslib/logger
 require daslib/fio
+require daslib/random
 require buildd_config public
 require buildd_core public
 require buildd_client public
-require strings
 
 //! Lifecycle and orchestration: the loopback health/shutdown server plus the
 //! poll → build → upload loop. One job at a time, on the tick thread — a
@@ -93,12 +93,52 @@ def init_service(cfg : BuilddArgs) : bool {
     return true
 }
 
-def private scratch_root : string {
-    if (!empty(g_cfg.scratch_dir)) {
-        return g_cfg.scratch_dir
+def private new_scratch_dir(var error : string&) : string {
+    //! A freshly created directory for one job, never an existing one.
+    //!
+    //! What protects it is NOT the secrecy of its name. `mkdir` is
+    //! create-or-fail, so a name that already exists — including one an
+    //! attacker pre-created, and including a symlink — is refused rather than
+    //! adopted; and the parent's permissions (0700, per README) are what keep
+    //! other local accounts out of a build's sources and output. The random
+    //! suffix only avoids collisions between concurrent jobs.
+    //!
+    //! Be precise about the two paths, because they differ: with no
+    //! `scratch_dir` the name comes from the runtime's own temp-path
+    //! generator, which draws on `std::random_device` and IS unpredictable.
+    //! With one configured the suffix comes from daslib's LCG seeded off the
+    //! clock, which a local account could predict — the cost of that is a
+    //! nuisance (pre-creating candidates makes this function give up and fail
+    //! the job), not a plant, because of the create-or-fail rule above.
+    if (empty(g_cfg.scratch_dir)) {
+        return create_temp_directory("dasweb-build-", error)
     }
-    var err = ""
-    return temp_directory(err)
+    mkdir_rec(g_cfg.scratch_dir)
+    var seed = random_seed(int(int64(get_clock())) + g_job_counter)
+    for (_attempt in range(16)) {
+        let candidate = path_join(g_cfg.scratch_dir,
+            "dasweb-build-{uint(random_int(seed))}-{uint(random_int(seed))}")
+        if (mkdir(candidate)) {
+            return candidate
+        }
+    }
+    error = "could not create a scratch dir under {g_cfg.scratch_dir}"
+    return ""
+}
+
+def private declared_page_assets(src_dir, entry, mode, worktree : string; var why : string&) : array<string> {
+    //! Assets a page entry declares (`// wasm-assets: <path>`) embed into the
+    //! artifact's MEMFS. User-authored paths: validated against the worktree
+    //! allowlist BEFORE the generated package references them; an invalid line
+    //! sets `why` (the user's own declaration talking) and yields no assets.
+    if (empty(entry) || mode != "page") {
+        return <- array<string>()
+    }
+    var out <- collect_declared_assets(fread(path_join(src_dir, entry)))
+    if (!validate_asset_paths(out, worktree, why)) {
+        out |> clear()
+    }
+    return <- out
 }
 
 def private run_one_job(job : ClaimedBuild) {
@@ -107,16 +147,39 @@ def private run_one_job(job : ClaimedBuild) {
     //! saw must never be left to the stale-requeue sweep.
     g_job_counter ++
     let t0 = ref_time_ticks()
-    let root = path_join(scratch_root(), "dasweb-build-{g_job_counter}-{slice(job.hash, 0, 12)}")
+    // Unpredictable, freshly created, and ours: a name derived from the job
+    // would be guessable by anyone with a local account on this box, who could
+    // then pre-create the output directory or plant a symlink in it before the
+    // build runs.
+    var mk_err = ""
+    let root = new_scratch_dir(mk_err)
+    if (empty(root)) {
+        logger_error("buildd", "cannot create scratch dir: {mk_err}", JV((hash = job.hash)))
+        upload_failure(g_cfg.server_url, g_cfg.token, job.hash, job.toolchain,
+            "builder could not allocate scratch space")
+        return
+    }
     let src_dir = path_join(root, "src")
     let out_dir = path_join(root, "out")
     mkdir_rec(src_dir)
     mkdir_rec(out_dir)
     logger_info("buildd", "job start", JV((hash = job.hash, mode = job.mode, toolchain = job.toolchain)))
     let entry = unpack_sources(src_dir, job.source)
-    if (empty(entry)) {
-        upload_failure(g_cfg.server_url, g_cfg.token, job.hash, job.toolchain,
-            "malformed source document")
+    var asset_why = ""
+    let assets <- declared_page_assets(src_dir, entry, job.mode, g_cfg.worktree, asset_why)
+    // A page build compiles under a generated .das_package (the release-wasm
+    // rail wants one; job sources can never carry their own). Written by THIS
+    // service into a dir it owns, before the sandbox ever runs.
+    let packaged = (empty(entry) || job.mode != "page" ||
+        (empty(asset_why) && write_page_package(src_dir, entry, assets, g_cfg.worktree)))
+    if (empty(entry) || !packaged) {
+        // Three different faults, and the user must not be told their source is
+        // malformed when the builder is what failed.
+        let why = (empty(entry) ? "malformed source document"
+            : (!empty(asset_why) ? asset_why : "builder could not prepare the build directory"))
+        logger_warning("buildd", "job failed: {why}",
+            JV((hash = job.hash, duration_ms = get_time_usec(t0) / 1000)))
+        upload_failure(g_cfg.server_url, g_cfg.token, job.hash, job.toolchain, why)
     } else {
         let r = run_build_command(g_cfg.build_cmd, src_dir, out_dir, job.mode, entry,
             float(g_cfg.build_timeout_seconds))
@@ -128,11 +191,26 @@ def private run_one_job(job : ClaimedBuild) {
         } else {
             let files <- collect_artifacts(out_dir, job.mode)
             if (empty(files)) {
+                logger_warning("buildd", "job failed: no artifacts collected",
+                    JV((hash = job.hash, mode = job.mode, duration_ms = get_time_usec(t0) / 1000)))
                 upload_failure(g_cfg.server_url, g_cfg.token, job.hash, job.toolchain,
                     "build produced no artifacts\n{r.output}")
             } elif (upload_success(g_cfg.server_url, g_cfg.token, job.hash, job.toolchain, files)) {
                 logger_info("buildd", "job done",
                     JV((hash = job.hash, files = length(files), duration_ms = get_time_usec(t0) / 1000)))
+            } else {
+                // The build worked; publishing it did not. A server that
+                // REFUSED the artifact is reachable, so say so and let the user
+                // see a failure now instead of waiting out the claim timeout.
+                // Only a genuinely unreachable server falls through to the
+                // stale-claim sweep, which is what that sweep is for.
+                logger_error("buildd", "artifact upload refused; reporting the job failed",
+                    JV((hash = job.hash, duration_ms = get_time_usec(t0) / 1000)))
+                if (!upload_failure(g_cfg.server_url, g_cfg.token, job.hash, job.toolchain,
+                        "the builder could not publish this build's artifact")) {
+                    logger_error("buildd", "claim left unresolved: server unreachable",
+                        JV((hash = job.hash, toolchain = job.toolchain)))
+                }
             }
         }
     }

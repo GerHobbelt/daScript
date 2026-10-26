@@ -55,15 +55,23 @@
     // "the render went washed out".
     var MAX_VIEWPORT_FRACTION = 0.8;
 
-    function fit(rec) {
-        if (!rec || !rec.el || rec.el.style.display === "none") return;
+    // Exposed, because the wasm engine's page frame stands in the same host and
+    // must be sized by the same rule — a second copy of this drifts, and the
+    // failure mode is silent (a frame that renders, just wrong).
+    function fitElement(el, aspect) {
+        if (!el) return;
         // Measure the column, not the host — the host sizes to its content, so
         // asking it how wide it is would just echo the frame back.
         var column = host && host.parentElement;
         var maxHeight = Math.round(window.innerHeight * MAX_VIEWPORT_FRACTION);
-        var width = Math.min(column ? column.clientWidth : 640, Math.round(maxHeight / rec.aspect));
-        rec.el.style.setProperty("width", width + "px", "important");
-        rec.el.style.setProperty("height", Math.round(width * rec.aspect) + "px", "important");
+        var width = Math.min(column ? column.clientWidth : 640, Math.round(maxHeight / aspect));
+        el.style.setProperty("width", width + "px", "important");
+        el.style.setProperty("height", Math.round(width * aspect) + "px", "important");
+    }
+
+    function fit(rec) {
+        if (!rec || !rec.el || rec.el.style.display === "none") return;
+        fitElement(rec.el, rec.aspect);
     }
 
     window.addEventListener("resize", function () { fit(current); });
@@ -77,6 +85,46 @@
 
     function ensureSpare() {
         if (!spare) spare = makeFrame();
+    }
+
+    // ── fps badge ────────────────────────────────────────────────────────────
+    // One badge for both engines. The number is measured inside whichever frame is
+    // running (run-frame.html interpreted, the artifact shell in wasm mode) and
+    // posted here, because only the frame can see the program's draw calls — the
+    // wasm artifact is cross-origin and cannot be inspected from this side at all.
+    // It stands over the run host so it reads as part of the picture.
+    var badge = null;
+    var badgeVisible = true;
+    var badgeHideTimer = null;
+
+    function ensureBadge() {
+        if (badge || !host) return;
+        if (getComputedStyle(host).position === "static") host.style.position = "relative";
+        badge = document.createElement("div");
+        badge.className = "pg-fps";
+        badge.style.cssText =
+            "position:absolute;top:26px;right:6px;z-index:5;pointer-events:none;" +
+            "padding:2px 6px;border-radius:3px;background:rgba(0,0,0,.62);" +
+            "color:#e8dcc0;font:600 11px/1.4 'JetBrains Mono',monospace;" +
+            "letter-spacing:.02em;display:none;";
+        host.appendChild(badge);
+    }
+
+    function renderBadge(text) {
+        ensureBadge();
+        if (!badge) return;
+        if (text === null) { badge.style.display = "none"; return; }
+        badge.textContent = text;
+        badge.style.display = badgeVisible ? "block" : "none";
+    }
+
+    // A program that stops presenting (finished, wedged, torn down) must not leave a
+    // stale number on screen implying it is still running.
+    function noteFps(value) {
+        if (!(value >= 0)) return;
+        renderBadge(value >= 10 ? Math.round(value) + " fps" : value.toFixed(1) + " fps");
+        if (badgeHideTimer) clearTimeout(badgeHideTimer);
+        badgeHideTimer = setTimeout(function () { renderBadge(null); }, 2000);
     }
 
     // Messages carry no frame identity, so match on source window to avoid
@@ -119,6 +167,11 @@
                 var out = document.getElementById("output");
                 if (out) out.classList.add("with-canvas");
                 break;
+            case "fps":
+                // Only the frame actually running a program may drive the badge; the
+                // pre-warmed spare also ticks rAF and would otherwise report 0.
+                if (rec === current) noteFps(msg.value);
+                break;
             case "exit":
                 if (onExit) onExit(msg.code);
                 break;
@@ -143,12 +196,27 @@
             return !!(spare && spare.ready) || !!(current && current.ready && !current.used);
         },
 
+        // Size an element the way a run frame is sized. The wasm engine's page
+        // frame lives in this same host and would otherwise have to re-derive
+        // the column-measuring rule.
+        fitElement: fitElement,
+
+        // The wasm engine's page frame posts its own fps (cross-origin, so main.js
+        // receives it there and forwards); the badge itself stays owned here.
+        noteFps: noteFps,
+
+        setFpsVisible: function (on) {
+            badgeVisible = !!on;
+            if (badge && !badgeVisible) badge.style.display = "none";
+        },
+
         // Throw away the frame that ran (if any) and promote the pre-warmed one.
         // Called before every run, and by Clear.
         reset: function () {
             if (current) { destroy(current); current = null; }
             var out = document.getElementById("output");
             if (out) out.classList.remove("with-canvas");
+            renderBadge(null);   // the run it described is gone
             ensureSpare();
         },
 

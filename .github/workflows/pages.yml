@@ -1,26 +1,32 @@
-name: Deploy to GitHub Pages
+name: Deploy daslang.io
 
 on:
   push:
     branches: [master]
   workflow_dispatch:
 
-# Only one Pages deployment at a time
+# Only one site deployment at a time
 concurrency:
   group: pages-deploy
   cancel-in-progress: true
 
+# `pages: write` and `id-token: write` are gone with actions/deploy-pages: the only
+# deploy target is now the VPS over rsync, which authenticates with an SSH key.
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    # KEEP THIS, despite nothing deploying to GitHub Pages any more. The environment
+    # is now purely a SECRET SCOPE: DASWEB_DEPLOY_KEY is an environment secret on
+    # `github-pages` (the repository has no repo-level secrets), and the VPS deploy
+    # step below treats an empty key as "fork, skip" and exits 0. Delete this block
+    # and daslang.io silently stops updating while this workflow stays green.
+    # Renaming the environment to something honest means re-entering the secret
+    # under the new name FIRST, or the same silent break.
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
     - name: "SCM Checkout"
       uses: actions/checkout@v4
@@ -65,18 +71,30 @@ jobs:
     # cached binaries/archives are reused, so docs redeploy without rebuilding
     # the runtime, games, or compute samples. Any source change to the runtime,
     # modules, daslib, daspkg, or the example sources misses the key → full rebuild.
+    # `lib` is cached with `bin` and must stay that way: bin/daslang links
+    # against lib/liblibDaScriptDyn*.so, and a hit SKIPS the host build below,
+    # so restoring the exe alone yields a binary that cannot start at all
+    # ("error while loading shared libraries"). That combination only occurs on
+    # a site-only merge — anything touching src/modules/daslib misses the key
+    # and rebuilds — which is why it stayed hidden until the first one landed.
     - name: "Cache wasm build artifacts"
       id: wasm-cache
       uses: actions/cache@v4
       with:
+        # Shared modules are globbed, not enumerated: das2rst dlopens EVERY
+        # dynamic module its doc sweep requires (stbimage via dasGLTF, pugixml,
+        # hv, unit-test, ...), and an enumerated list silently drops whichever
+        # one the sweep grows next. A hit restores only what the list names, the
+        # native build is skipped, and das2rst dies on the first missing module
+        # — reachable only on a site-only merge (anything touching src/modules/
+        # daslib misses the key), the same way the lib/ omission above stayed
+        # hidden. #3652 was the first such merge; this is the second member of
+        # that class, so the list goes.
         path: |
           bin
-          modules/dasGlfw/dasModuleGlfw.shared_module
-          modules/dasOpenGL/dasModuleOpenGL.shared_module
-          modules/dasClipboard/dasModuleClipboard.shared_module
-          modules/dasImgui/dasModuleImgui.shared_module
-          modules/dasImgui/imguiApp.shared_module
-          modules/dasImgui/imguiAppHeadless.shared_module
+          lib
+          modules/**/*.shared_module
+          examples/**/*.shared_module
           web/output
           web/output64
           site/playground/samples
@@ -145,28 +163,6 @@ jobs:
       run: |
         sphinx-build -W --keep-going -b html -d doc/sphinx-build doc/source build/site
 
-    - name: "Build Sphinx LaTeX"
-      run: |
-        sphinx-build -W --keep-going -b latex -d doc/sphinx-build doc/source build/latex
-
-    - name: "Compile PDF: daslangstdlib.tex"
-      uses: xu-cheng/latex-action@v4
-      with:
-        # Pinned: the rolling texlive-alpine:latest flipped to TL 2026 (2026-07-01) whose kernel
-        # dies with "TeX capacity exceeded [input stack size]" on the generated stdlib PDF.
-        texlive_version: "2025"
-        root_file: daslangstdlib.tex
-        working_directory: build/latex
-        continue_on_error: true
-
-    - name: "Compile PDF: daslang.tex"
-      uses: xu-cheng/latex-action@v4
-      with:
-        texlive_version: "2025"
-        root_file: daslang.tex
-        working_directory: build/latex
-        continue_on_error: true
-
     # WASM build: the wasm32 interpreter playground (daslang_static) + the wasm64
     # compiled path (runtime/module archives, compute samples, and the /examples
     # games). Skipped on a cache hit — the cached web/output + web/output64 are
@@ -216,10 +212,13 @@ jobs:
         fi
         rm -rf modules/dasImguiImplot modules/dasImguiNodeEditor
 
-        # 2. wasm64 archives + compute samples + games. Configure web/build64 with
-        #    the prebuilt host (so the compute foreach reuses it instead of
+        # 2. wasm64 archives for the example games. Configure web/build64 with
+        #    the prebuilt host (so the game builds reuse it instead of
         #    rebuilding daslang) + memory64; daspkg build --wasm then populates the
         #    runtime/module archives into it.
+        #    This step exists only to serve the game builds below. When those move
+        #    onto the build queue (the game checkpoint of
+        #    plans/dasweb_wasm_pipeline.md), it leaves CI with them.
         #    DAS_WASM_PTHREADS=ON: daspkg `release wasm` now ALWAYS links -pthread
         #    (--shared-memory), so the module archives it links (dasGlfw/dasOpenGL/...)
         #    MUST be compiled with +atomics,+bulk-memory or wasm-ld rejects the link
@@ -235,10 +234,7 @@ jobs:
           -DDAS_HOST_DASLANG_OVERRIDE="$REPO/bin/daslang"
         ./bin/daslang utils/daspkg/main.das -- build --wasm
 
-        # 3. compute playground samples → wasm64 (web/output64/samples/examples)
-        cmake --build web/build64 --target all_wasm
-
-        # 4. /examples games → standalone wasm64 web apps (web/output64/examples/<g>/).
+        # 3. /examples games → standalone wasm64 web apps (web/output64/examples/<g>/).
         #    Non-fatal per game: a game's wasm build must never red the whole deploy
         #    (which would take the playground + the other example cards down with it).
         #    The staging step degrades a missing game wasm to its interpreted fallback.
@@ -251,7 +247,7 @@ jobs:
             fi
         done
 
-        # 5. /examples furier — the ImGui-in-wasm showcase. dasImgui is in-tree;
+        # 4. /examples furier — the ImGui-in-wasm showcase. dasImgui is in-tree;
         #    `release wasm` discovers it from the compiled require chain and
         #    drives its .das_package release_wasm_build to produce the 3 wasm64
         #    archives on demand — no daspkg install step (the example declares
@@ -265,7 +261,7 @@ jobs:
             echo "WARNING: furier wasm build failed — its examples card will be skipped this deploy."
         fi
 
-        # 6. /examples path_tracer_lab — the jobque + OpenGL showcase. Same in-tree
+        # 5. /examples path_tracer_lab — the jobque + OpenGL showcase. Same in-tree
         #    dasImgui require as furier; the threaded daspkg wasm pipeline (always
         #    -pthread, see step 2) maps its new_thread / JobQue modes to real Web
         #    Workers. Non-fatal for the same reason as furier; staged below only when
@@ -278,7 +274,7 @@ jobs:
             echo "WARNING: path_tracer_lab wasm build failed — its examples card will be skipped this deploy."
         fi
 
-        # 7. /examples physarum_lab — the threads + audio showcase. Same in-tree dasImgui require
+        # 6. /examples physarum_lab — the threads + audio showcase. Same in-tree dasImgui require
         #    as the path tracer; the threaded daspkg wasm
         #    pipeline maps its worker threads to Web Workers, and the daspkg wasm link's AudioWorklet
         #    flags carry the strudel soundtrack. Non-fatal; staged below only when all three outputs
@@ -289,6 +285,29 @@ jobs:
         else
             echo "WARNING: physarum_lab wasm build failed — its examples card will be skipped this deploy."
         fi
+
+    - name: "Compile-gate the curated playground samples"
+      # The per-sample wasm64 builds used to live here and doubled as the proof
+      # that every curated sample still compiles. They now build on demand
+      # through the build queue (plans/dasweb_wasm_pipeline.md), so this gate
+      # keeps that proof without producing anything: -dry-run compiles and
+      # simulates each sample and writes nothing. A sample broken by a compiler
+      # or daslib change must red this deploy, not the production queue, where
+      # the first person to click Run would find it.
+      run: |
+        set -eu
+        FAILED=""
+        for f in web/examples/ui/samples/examples/*.das; do
+            ./bin/daslang -dry-run "$f" > /tmp/gate.log 2>&1 || {
+                FAILED="$FAILED $(basename "$f")"
+                echo "--- $f ---"; tail -20 /tmp/gate.log
+            }
+        done
+        if [ -n "$FAILED" ]; then
+            echo "::error::curated playground sample(s) no longer compile:$FAILED"
+            exit 1
+        fi
+        echo "all curated samples compile"
 
     - name: "Verify wasm example artifacts (catch silent fallbacks)"
       # The example builds above are non-fatal (one run surfaces EVERY failure
@@ -356,10 +375,6 @@ jobs:
         # Freshly-built Sphinx HTML docs
         cp -r build/site _site/doc
 
-        # PDFs (referenced by index.html)
-        cp build/latex/daslang.pdf _site/doc/daslang.pdf || echo "WARNING: daslang.pdf not found"
-        cp build/latex/daslangstdlib.pdf _site/doc/daslangstdlib.pdf || echo "WARNING: daslangstdlib.pdf not found"
-
         # Blog + news + changelist (regenerated each publish). Pin --site-url
         # explicitly so feed.xml entries point at the production domain even
         # if the default in build_blog.py drifts.
@@ -375,8 +390,8 @@ jobs:
         # so under normal master deploys we always take the if-branch. The
         # else-branch survives as defense-in-depth — if the artifacts ever
         # go missing despite a green build, we stage a placeholder rather
-        # than 404'ing the route (actions/deploy-pages publishes _site as
-        # a complete snapshot, no layering over the prior deploy).
+        # than 404'ing the route (the VPS deploy rsyncs _site with --delete, so
+        # each release is a complete snapshot with no layering over the prior one).
         if [ -f web/output/daslang_static.js ] && [ -f web/output/daslang_static.wasm ]; then
             mkdir -p _site/playground _site/files/wasm
             # Copy IDE source files (CodeMirror, jQuery, main.js/css, etc.)
@@ -388,12 +403,10 @@ jobs:
             cp web/output/daslang_static.wasm _site/files/wasm/
             # Pull samples from site/playground/samples — that directory is the
             # single staged source of truth: stage_site_playground populates
-            # the .das sources. Overlay the wasm64 compute .wasm built above.
+            # the .das sources. No .wasm overlay: the playground's wasm engine
+            # fetches built artifacts from the build service by content hash,
+            # so there is nothing per-sample to ship with the site.
             cp -r site/playground/samples _site/playground/samples 2>/dev/null || true
-            if [ -d web/output64/samples/examples ]; then
-                mkdir -p _site/playground/samples/examples
-                cp web/output64/samples/examples/*.wasm _site/playground/samples/examples/ 2>/dev/null || true
-            fi
             # Tutorial assets (mesh + PBR textures + HDRI) fetched at runtime by
             # samples that ship a .das.assets.json manifest (the OpenGL
             # deferred-shading rung). stage_site_playground staged them under
@@ -411,15 +424,21 @@ jobs:
             # CodeMirror bundle (codemirror.min.js/css, simple-mode.js, daslang-*.js,
             # cm-forge.css) is served from /files/cm/ — copied via `cp -r site/files`
             # earlier, so nothing extra to copy here.
+            # Every page under site/playground, not just index.html: run-frame.html
+            # is the host each program runs in, and a playground missing it has a
+            # permanently disabled Run button (the runner never reports ready).
+            # It shipped absent once because the copy list named index.html and
+            # globbed only the .js — glob the .html too, so a new page lands.
+            cp site/playground/*.html _site/playground/
             cp site/playground/index.html _site/playground/index.html
             cp site/playground/forge-skin.css _site/playground/
             # Forge playground scripts (init shim + tabs + share + splitter).
             # Glob so future playground-*.js additions land automatically.
             cp site/playground/playground-*.js _site/playground/
         else
-            # WASM artifacts missing. actions/deploy-pages publishes _site as
-            # a complete snapshot (no layering over the prior deploy), so an
-            # absent _site/playground/ would 404 the route. Stage a
+            # WASM artifacts missing. The VPS deploy rsyncs _site with --delete,
+            # so each release is a complete snapshot (no layering over the prior
+            # one) and an absent _site/playground/ would 404 the route. Stage a
             # placeholder instead — the URL keeps resolving to something
             # useful while we re-roll the runtime.
             echo "WARNING: daslang_static.{js,wasm} missing under web/output — staging placeholder /playground/."
@@ -500,26 +519,16 @@ jobs:
             printf '%s' '<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Physarum Lab — building</title><style>html,body{margin:0;height:100%}body{background:#0d0c0a;color:#cfc8bb;font-family:ui-monospace,Menlo,Consolas,monospace;display:flex;align-items:center;justify-content:center;text-align:center;padding:24px}p{max-width:30rem;line-height:1.6}</style></head><body><p>This example is being rebuilt and will be available shortly.</p></body></html>' > _site/examples/physarum_lab/physarum_lab.html
         fi
 
-        # GitHub Pages control files
-        touch _site/.nojekyll
-
-    - name: "Upload Pages artifact"
-      uses: actions/upload-pages-artifact@v3
-      with:
-        path: _site
-
-    - name: "Deploy to GitHub Pages"
-      # master-only so a workflow_dispatch from a branch cannot touch the
-      # production Pages site. The job-level `github-pages` environment also
-      # scopes DASWEB_DEPLOY_KEY below (master-only branch policy), so testing
-      # the VPS leg from a branch needs that policy widened deliberately.
-      if: github.ref == 'refs/heads/master'
-      id: deployment
-      uses: actions/deploy-pages@v4
-
     - name: "Deploy to daslang.io origin (VPS)"
-      # Mirror the exact _site snapshot onto the origin box (daslang.io is
-      # moving off GitHub Pages; both targets stay in sync until DNS flips).
+      # master-only, in the workflow itself. This guard used to sit on the Pages step
+      # ("so a workflow_dispatch from a branch cannot touch the production site") and
+      # went with it; without it the sole thing standing between a branch dispatch and
+      # production is the `github-pages` environment's branch policy — a setting in the
+      # GitHub UI that this repository cannot see or review. Broaden that policy for any
+      # reason and unreviewed content ships. Cheap to state here, so state it here.
+      if: github.ref == 'refs/heads/master'
+      # The ONLY deploy target. Caddy serves the box directly; there is no Jekyll
+      # in the path, so the old _site/.nojekyll marker went with the Pages steps.
       # Release layout on the box: /srv/daslang.io/releases/<rNNN-sha>, with
       # `current` an atomic symlink Caddy serves; --link-dest hard-links files
       # unchanged since the previous release so a docs-only deploy costs ~MBs.
@@ -527,8 +536,17 @@ jobs:
         DEPLOY_KEY: ${{ secrets.DASWEB_DEPLOY_KEY }}
       run: |
         set -euo pipefail
+        # A fork has no access to the secret and legitimately skips. The canonical
+        # repo does not: this is now the ONLY deploy target, so an empty key there
+        # means the site silently stops updating while the workflow reports success
+        # — which is exactly how a missing DASWEB_DEPLOY_KEY would hide. Fail loudly.
         if [ -z "$DEPLOY_KEY" ]; then
-            echo "DASWEB_DEPLOY_KEY not set (fork?) - skipping VPS deploy"
+            if [ "$GITHUB_REPOSITORY" = "GaijinEntertainment/daScript" ]; then
+                echo "::error::DASWEB_DEPLOY_KEY is empty on the canonical repo - nothing was deployed."
+                echo "It is an ENVIRONMENT secret on the 'github-pages' environment; check that the job still declares it."
+                exit 1
+            fi
+            echo "DASWEB_DEPLOY_KEY not set (fork) - skipping VPS deploy"
             exit 0
         fi
         mkdir -p ~/.ssh

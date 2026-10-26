@@ -9,6 +9,10 @@ knowledge of the service, and without opening another document.** If an entry ne
 those, it is not a review criterion — move it to `README.md` and leave a one-line criterion
 here.
 
+**This file reviews itself: a rule a reviewer cannot apply as written is a defect of this
+file.** Mark it like any other finding — a checklist defect blocks nothing, but its fix (a
+rewrite or a move, never silent tolerance) lands in the same batch as the round's other fixes.
+
 **Form, and it is a hard limit:**
 
 - **One rule is one short paragraph.** An entry that needs more than that is describing how to
@@ -65,11 +69,12 @@ defect, and this section is the whole test.
   hashing, and every policy decision (size cap, rate ceiling, listing). Zero HTTP: a require
   of `dashv` here is a defect.
 - `build_queue.das` — the build queue: `BuildJob`/`BuildMeta` schema, the migrations it owns,
-  the job state machine, and queue policy (claim timeout, attempt ceiling). Zero HTTP and zero
-  filesystem.
-- `build_artifacts.das` — the artifact cache: blobs layout, toolchain/hash/filename validation,
-  integrity verification, stage-then-rename placement, and serving-path resolution. The only
-  build-side file that touches the filesystem; zero HTTP, zero SQL.
+  the job state machine, mode selection from a job's source document, and queue policy (claim
+  timeout, attempt ceiling). Zero HTTP and zero filesystem.
+- `build_artifacts.das` — the artifact cache: blobs layout, toolchain/hash/filename validation
+  (including which suffixes are documents, for the origin gate), integrity verification,
+  stage-then-rename placement, serving-path resolution, and every path the cache assembles. The
+  only build-side file that touches the filesystem; zero HTTP, zero SQL.
 - `curated_import.das` — the data.json-driven curated importer: manifest parsing, sample-file
   reads, bundle assembly, calling the store. The only file besides the config loader that reads
   the filesystem; a store mutation here that bypasses `samples_store` functions is a defect.

@@ -46,8 +46,12 @@ The service refuses to start without a token and a build command.
    killed after `build_timeout_seconds`. `run_build.sh` is the recipe — see **The sandbox**
    below — and per mode it runs the exact CI command the queue replaced: `module` = host
    daslang `-exe --jit-target=wasm64-unknown-emscripten` against the `web/output64` runtime
-   archive (→ `sample.wasm`); `page` (standalone game html+js+wasm) lands with the game
-   checkpoint.
+   archive (→ `sample.wasm`); `page` = daspkg's release-wasm rail (the one the five
+   `/examples` cards use) under a `.das_package` this service generates into the scratch src
+   dir naming the app `sample` (job sources can never carry their own — bundle names must be
+   plain `.das`), flattened inside the sandbox to `sample.{html,js,wasm}`. The server decides
+   the mode at request time by scanning the source's requires; this service only obeys the
+   claimed job's mode.
 5. **Collect**: exactly the files the mode declares, by name (`expected_artifact_names`).
    The build runs the user's compile-time code and can write anything into the output
    directory, so anything else there is logged and dropped — a build cannot widen its own
@@ -78,16 +82,22 @@ Also applied: `--network=none`, a read-only root with a tmpfs `/tmp`, `--memory`
 `--pids-limit` / `--cpus` caps, `--cap-drop=ALL`, `--security-opt=no-new-privileges`, and
 `--userns=keep-id` so the build runs as the unprivileged account this service runs as. The
 emcc cache is mounted read-only with `EM_FROZEN_CACHE=1`, so one job cannot poison what later
-jobs link against; the toolchain-bump protocol warms it with one build outside the sandbox.
+jobs link against; the toolchain-bump protocol warms it with one build **of each mode** outside
+the sandbox — the page link is `-pthread` and needs the `-mt` system libraries a module build
+never touches.
 Podman passes no host environment through, so a token in this service's environment is not
 visible to a build. There is deliberately **no** unsandboxed fallback: no podman or no image
 means no build.
 
-Two deployment requirements that are part of the boundary, not decoration. This service must
+Three deployment requirements that are part of the boundary, not decoration. This service must
 run under a **dedicated, sudo-less account** — on a box where the login user has passwordless
-sudo, a sandbox escape as that user is a root compromise. And its bearer token must reach it
+sudo, a sandbox escape as that user is a root compromise. Its bearer token must reach it
 without becoming a readable file inside any mount (systemd `LoadCredential`, or the
-environment, which podman does not forward).
+environment, which podman does not forward). And `scratch_dir` should point at a
+**service-owned directory with mode 0700**: each job gets an unguessable subdirectory of it, and
+the parent's permissions are what keep other local accounts from reading a build's sources or
+planting anything in its output. Leaving `scratch_dir` empty uses the system temp directory
+instead, which is fine on a single-purpose box and not on a shared one.
 
 Verified on zen4 by building a hostile sample: a compile-time `[init]` that `fread`s
 `~/SETUP.md`, `~/.ssh/authorized_keys` and `/etc/shadow` gets **0 bytes** from each, a planted
@@ -98,15 +108,50 @@ A build blocks the tick thread, so `/healthz` goes dark for the build's duration
 only logs health transitions (it restarts on process exit, never on health), and
 `build_timeout_seconds` bounds the window.
 
+The image also carries the X11/GL *runtime* libraries (no X server, no GPU): the host daslang
+dlopens the tree's `.shared_module` dylibs while **compiling** a sample (`require glfw` needs
+the native module registered), and their `DT_NEEDED` X11/GL libs must resolve inside the
+container or the dlopen fails and every graphics sample reports `missing prerequisite`.
+
 The box environment (`DASWEB_WASM_WORKTREE`, pinned emsdk, the worktree's own
 `web/build_wasm_host.sh` host build, the sandbox image) is documented in `~/SETUP.md` on zen4 —
 the wasm worktree is dedicated because wasm and native builds poison each other's `bin/` and
 `lib/` (`plans/dasweb_wasm_pipeline.md` has the postmortem). Build the sandbox image once per
-`Containerfile` change:
+`Containerfile` change (bump the tag here, in `Containerfile`, and in `run_build.sh` together):
 
 ```bash
-podman build -t dasweb-builder:1 -f utils/dasweb-buildd/Containerfile .
+podman build -t dasweb-builder:2 -f utils/dasweb-buildd/Containerfile .
 ```
+
+## The toolchain-bump protocol
+
+The toolchain id is the wasm worktree's HEAD sha, so moving the worktree re-keys every cached
+artifact and each sample pays a real build on its next click. Roll once, after a batch of work
+has landed — never per-merge.
+
+Moving the worktree is not by itself a roll. `run_build.sh` consumes two built things, and a
+daslang change lands in one or the other: `bin/daslang`, the cross-compile host that emits the
+emcc link line (where link flags live), and `web/output64/lib/*_runtime*.a`, the runtime archive
+linked into every artifact (where runtime behaviour lives). Pulling without rebuilding both
+announces a new id whose artifacts still carry the old code — the cache is invalidated and
+nothing is fixed. The host additionally bakes its own C++ ABI into every module it codegens, so
+it is built by `web/build_wasm_host.sh` rather than an ordinary cmake invocation; a host whose
+stdlib or exception config differs from the target corrupts the wasm heap at runtime with no
+build-time diagnostic.
+
+The emcc cache is mounted read-only into the sandbox, so a job cannot populate it: the roll
+warms it outside the sandbox with one build of **each** mode, because the page rail links
+`-pthread` and pulls `-mt` system libraries a module build never touches.
+
+`roll_toolchain.sh` performs all of it, on the box, as the box user:
+
+```bash
+./roll_toolchain.sh --dry-run     # print the plan, touch nothing
+./roll_toolchain.sh               # roll to origin/master
+```
+
+It refuses to start if the worktree has modified tracked files, and reports the old and new id.
+Verify afterwards with the browser leg of `utils/dasweb-verify`, which drives the live site.
 
 ## Tests
 
@@ -114,9 +159,9 @@ podman build -t dasweb-builder:1 -f utils/dasweb-buildd/Containerfile .
 daslang dastest/dastest.das -- --test utils/dasweb-buildd/test_buildd_core.das
 ```
 
-In-dir: config (pure merge), core (source materialization, name validation, command
-invocation via `popen_argv`, artifact collection + hashing, toolchain derivation), client
-(claim/announce/result against the stub playground on reserved port 19014, including the
-multipart round trip verified byte-exact on the receiving side). `_fake_build.das` is the
-cross-platform stand-in for `run_build.sh`. CI runs the suites in `extended_checks.yml`
+In-dir: config (pure merge, provenance, token masking), core (source materialization, name and
+job-identity validation, command invocation via `popen_argv`, artifact collection + hashing,
+the symlinked-artifact refusal, toolchain derivation), client (claim/announce/result against
+the stub playground on reserved port 19014, including the multipart round trip verified
+byte-exact on the receiving side). CI runs the suites in `extended_checks.yml`
 ("Test dasweb-buildd").

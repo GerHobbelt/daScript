@@ -43,13 +43,14 @@ require llvm/daslib/llvm_tune
 require daslib/random
 require daslib/json   // JsonValue — the null runtime arg of the deferred sidecar merge
 require daslib/json_boost   // JV over tuples — the per-variant race rows
-require daslib/fio   // has_env_variable: the compile-only mint gate (slice J recipe)
+require daslib/fio   // fread/fopen — the probe's transcript capture
 require daslib/strings_boost   // split — the confirm pass parses child output
 require daslib/command_line    // get_das_exe — the confirm pass spawns daslang children
 require tuner_cli              // --tune-paranoid, shared with tune_kernels
 require tuner_noise            // the noise gate, shared with tune_kernels
 require math
 require strings
+require dasllama/dasllama_env
 
 // This half is a flat best-of-N; paranoid triples the round count. The confirm pass is never
 // cut: it is a correctness gate, and skipping it ships an unconfirmed crown (the SPR amx lesson).
@@ -1270,7 +1271,7 @@ def private parse_confirm_pp(outp : string) : double {
 }
 
 def private compile_fallback(fname : string) : string {
-    for (entry in split(get_env_variable("DAS_TUNE_COMPILE_FALLBACKS"), ";")) {
+    for (entry in split(g_env_core.tune_compile_fallbacks, ";")) {
         let eq = find(entry, "=")
         if (eq > 0 && slice(entry, 0, eq) == fname) {
             return slice(entry, eq + 1)
@@ -1337,7 +1338,7 @@ def private confirm_winner(winner : string) : string {
         print("confirm: winner '{winner}' IS the per-ISA fallback — no e2e confirm needed\n")
         return winner
     }
-    let model = get_env_variable("DASLLAMA_CONFIRM_MODEL")
+    let model = g_env_harness.confirm_model
     if (empty(model)) {
         print("confirm: winner '{winner}' DIVERGES from the per-ISA fallback '{fb}' — a 1-core crown must confirm end-to-end before it ships (the SPR amx lesson)\n")
         print("confirm: pinning the fallback '{fb}' — re-run with DASLLAMA_CONFIRM_MODEL=<q8 gguf> to run the confirm pass\n")
@@ -1591,15 +1592,17 @@ def tune_mode_run : bool { // nolint:STYLE037,STYLE038 — flat family-by-family
         return false
     }
     let q51_t0 = ref_time_ticks()
-    tune_progress_kernel_begin("q51q8_gemv_gen", ROUNDS)
+    // the manifest key must match the [tune] fn (the TILE) or the stamp misses its own crown;
+    // the race still benches the gemv shape
+    tune_progress_kernel_begin("q51q8_tile_gen", ROUNDS)
     var qrows : table<string; JsonValue?>
     let qw = q51_tune_family(qrows)
     tune_detail("TUNE_GEN_TIME q51_family {get_time_usec(q51_t0) / 1000} ms\n")
-    tune_progress_kernel_end("q51q8_gemv_gen", qw, empty(qw) ? "rejected" : "beats")
+    tune_progress_kernel_end("q51q8_tile_gen", qw, empty(qw) ? "rejected" : "beats")
     // same gate-failure fallback as the kq loop: complete the scope on the reference body
-    pending["q51q8_gemv_gen"] = empty(qw) ? "reference" : qw
-    g_rows["q51q8_gemv_gen"] = JV(qrows)
-    print("q51q8_gemv_gen winner: {empty(qw) ? "reference (gate-failure fallback)" : qw}\n")
+    pending["q51q8_tile_gen"] = empty(qw) ? "reference" : qw
+    g_rows["q51q8_tile_gen"] = JV(qrows)
+    print("q51q8_tile_gen winner: {empty(qw) ? "reference (gate-failure fallback)" : qw}\n")
     let confirm_t0 = ref_time_ticks()
     tune_progress_kernel_begin("confirm_e2e_prefill", 0)
     let cw = confirm_winner(vs[merged]._0)
@@ -1677,7 +1680,7 @@ def main : int {
     // EXECUTION only (forced smmla variants would SIGILL on a dotprod-only host). Ship
     // .jitted_scripts to the i8mm box and run there with the same env minus this one —
     // the cache key matches, dlopen, no linker needed on the target.
-    if (has_env_variable("GEN_TUNE_COMPILE_ONLY")) {
+    if (g_env_harness.gen_tune_compile_only) {
         var vs <- q8q8_tile_gen_variants()
         print("compile-only: DLL linked, {length(vs)} tile variants, execution skipped\n")
         delete vs

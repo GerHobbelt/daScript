@@ -6,10 +6,10 @@ require daslib/jobque_boost
 require strings
 require daslib/strings_boost
 require daslib/clargs
-require daslib/fio   // has_env_variable / get_env_variable (the DASLLAMA_BATCH_GRID_2D A/B rail)
 require math
 require dasllama/dasllama_math  // setup_dasllama_jobque_ + the runtime knob setters (engine-level, not re-exported)
 require dasllama/dasllama_layout  // convert_model_to_metal_blob — the blob-flavor transform
+require dasllama/dasllama_env
 
 // dasLLAMA parity harness — the dasLLAMA side of the token-for-token oracle check.
 // Feed the prompt token IDs the reference (harness/oracle/simple_ids) produced, greedily generate N
@@ -58,23 +58,25 @@ def private parse_ids(s : string) : array<int64> {
 }
 
 [export]
-def main {
+def main : int {
+    // non-zero on EVERY path that ends without printing GEN_IDS tokens — two empty streams
+    // diff clean, so callers must branch on the exit code, not the diff alone
     var res <- parse_args(type<Args>)
     if (res |> is_err) {
         print("error: {res |> unwrap_err}\n\n")
         print_help(get_command_info(type<Args>), "parity")
-        return
+        return 2
     }
     let cfg <- res |> move_unwrap
     if (cfg.help) {
         print_help(get_command_info(type<Args>), "parity")
-        return
+        return 0
     }
     let n_gen = cfg.ngen
     let prompt <- parse_ids(cfg.ids)
     if (empty(prompt) || n_gen <= 0) {
         print_help(get_command_info(type<Args>), "parity")
-        return
+        return 2
     }
 
     if (cfg.kquant_native >= 0) {   // load-time layout decision, must precede load_gguf
@@ -94,12 +96,13 @@ def main {
     }
     let c = t.config
     var s = make_run_state(c, cfg.kv, cfg.kv)
+    var rc = 0
     with_job_que() {
         setup_dasllama_jobque_()
         // A/B rail: force the 2-D batch chunk grid (0 = 1-D, 1 = fine, 2 = aligned) — the
         // knob-on GEN_IDS gate; parity stays raw-defaults otherwise
-        if (has_env_variable("DASLLAMA_BATCH_GRID_2D")) {
-            set_batch_grid_2d(to_int(get_env_variable("DASLLAMA_BATCH_GRID_2D")))
+        if (is_some(g_env_harness.batch_grid_2d)) {
+            set_batch_grid_2d(unwrap(g_env_harness.batch_grid_2d))
             print("batch grid 2d override: {get_batch_grid_2d()}\n")
         }
         let ids <- generate(t, s, prompt, length(prompt) + n_gen)
@@ -119,5 +122,9 @@ def main {
         if (count < n_gen) {
             print("NOTE: generate stopped early ({count}/{n_gen}) — emitted BOS\n")
         }
+        if (count <= 0) {   // an empty GEN_IDS line is nothing to diff — fail loudly
+            rc = 3
+        }
     }
+    return rc
 }

@@ -56,8 +56,19 @@ fam-qwen35/fam-qwen35moe are deltanet hybrids whose batch cell asserts the per-r
 shape — metal batch steps 0, both rows served on the single-decode path; fam-qwen2moe's
 batch cell asserts the `graph` DECLINE on the planar model — shexp has no batch arm, and a
 blob twin's CPU batch fallback would trip the blob-only panic). The
-`kernels` suite (test_metal_prefill_kernels + test_metal_decode_kernels — model-less kernel units, ~80s) has no arms;
-remember it exists — kernel uniform/binding changes MUST update its hand-bound dispatches.
+`kernels` suite (7 files: test_metal_{prefill,decode,rope,gemv,misc,attn,gemm}_kernels —
+model-less per-class CPU-oracle units covering the FULL metal kernel census, ~2-3 min) has
+no arms; remember it exists — kernel uniform/binding changes MUST update its hand-bound
+dispatches. Shared fixtures (buf helpers, eyeball-dump compares, kq plane + q8 blob
+builders) live in `_metal_kernel_common.das`; the prefill file predates it and keeps only its
+tag-less mismatch compares local (same arity would collide — the buf_* twins are retired).
+`_mtl_toy.das` is the `[metal_dispatch]` multi-kernel (kernel=) fixture — its gate in
+the misc file dispatches through the GENERATED builders (kn_ rail), not hand binds.
+A new gate gets a NEGATIVE CONTROL before its first commit (poison the oracle → red
+with dumps → revert); size an additive poison to beat rel·env at the longest dot, and give
+every derived-truth compare its own poison. A kernel with `@workgroup` state needs
+`metal_set_threadgroup_memory_length` in the gate exactly as in its production encoder —
+missing tgmem reads garbage silently.
 The `image` suite (test_model_image — the prepared-image .dlim rail): `mechanics` (synthetic
 carrier, model-free, runs in CI) `smol metal tower whisper voxtral parakeet qwen3a canary
 canary-dec gemma4a`; the voxtral arm re-saves a
@@ -73,8 +84,10 @@ The `image-vulkan` suite (test_model_image_vulkan, arm `vulkan`) covers the OFFL
 bake: the runner arms DASLLAMA_GPU + a small VRAM budget so the probed config carries a
 vulkan section, the DRY tier collects a role-stamped plan with no device calls (safe on
 GPU-less boxes), and the flavor image round-trips the plan verbatim.
-The `coverage` suite (test_kernel_coverage, arm `coverage`) is the KERNEL COVERAGE census
-(CODEREVIEW rule 17): the small-model zoo swept across format/graph/batch/KV axes, then a
+The `coverage` suite (test_kernel_coverage, arm `coverage`; arm `coverage-vk` = the vulkan
+SERVING census — needs a vulkan device + `DASLLAMA_GPU=1` + `DASLLAMA_MODELS_DIR`, MoE rows
+under `DASLLAMA_PARITY_FULL=1`) is the KERNEL COVERAGE census
+(CODEREVIEW: "A new GPU kernel ships with a small model in the kernel coverage suite"): the small-model zoo swept across format/graph/batch/KV axes, then a
 report of per-kernel dispatch counts with LOUD WARNINGS for compiled-but-never-dispatched
 kernels — never an auto-dead verdict. A zero means "nothing THIS zoo runs dispatched it",
 never "unreachable": the deletion gate is a reachability AUDIT of the kernel's dispatch
@@ -86,7 +99,7 @@ small-model run joins it. Small-tier warnings for kernels whose carriers sit abo
 the served-count floor is asserted only on family-unfiltered runs. The vulkan half here is
 the device-free rail unit; the serving vulkan census runs on the PC box.
 
-## Model loads — never the image rail (CODEREVIEW rule 20)
+## Model loads — never the image rail (CODEREVIEW: "A test suite loads models with load_model_")
 
 Suites load models with `load_model_` (the direct gguf load) — never `load_model` /
 `load_model_cached` (the `.dlim` image rail). The rail stamps every mint with the box
@@ -140,7 +153,7 @@ Always capture COMPLETE logs (the runner does this); grep afterwards, never at c
 a capture-time filter once hid the exact proof line a verification run existed to produce.
 When a fixture claims a size/depth property ("2030 tokens", "crosses 2048"), assert the
 actual number in the test; a resize cap is not evidence.
-THE EYEBALL RAIL (CODEREVIEW rule 18): every token-for-token generate cell logs both decoded
+THE EYEBALL RAIL (CODEREVIEW: "Every test that compares logits also logs decoded text"): every token-for-token generate cell logs both decoded
 streams (`log_gen_texts` in `_model_tier.das`), and every logits-tolerance cell logs a decoded
 text form (forced stream + the GPU's greedy would-be picks, or both next-token pieces) — read
 the text before trusting a red or a suspicious green; a near-tie synonym flip and real garbage

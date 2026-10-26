@@ -29,7 +29,7 @@ thing live instead. Files with no contested edge get one short line.
 ## 1. File charters
 
 Every file under `dasllama/` appears here. Two carry generated CONTENT rather than being
-generated themselves: `dasllama_env.das` is the hand-written env registry (`ENVIRONMENT.md` is
+generated themselves: `dasllama_env.das` holds the `[EnvConfig]` knob declarations (`ENVIRONMENT.md` is
 generated FROM it by `harness/gen_env_doc.das`), and `dasllama_unicode.das` is hand-written
 around transcoded data tables (RANGES/WS from llama.cpp's unicode-data.cpp — retranscode,
 never hand-edit the tables).
@@ -153,16 +153,21 @@ that a question answered for one backend has an obvious address in the other. Th
 
 | role | holds | must not hold |
 |---|---|---|
-| `dasllama_<gpu>_kernels`<br>`dasllama_metal_kernels`, `dasllama_vulkan_kernels` | kernel source, the derived-access/PSO census | device state, engine types |
+| the kernel home<br>`dasllama_metal_kernels`, `dasllama_vulkan_classes` | kernel source, the derived-access/PSO census | device state, engine types |
 | `dasllama_<gpu>_common`<br>`dasllama_metal_common`, `dasllama_vulkan_common` | device state, buffer/command plumbing, hazard + capture rail, profiler | driver policy |
 | `dasllama_<gpu>_decode`<br>`dasllama_metal_decode`, `dasllama_vulkan_decode` | the resident token-step driver + decode-time arms | kernel bodies |
 | `dasllama_<gpu>_prefill`<br>`dasllama_metal_prefill`, `dasllama_vulkan_prefill` | the batched prefill driver + batch arms | kernel bodies |
 | `dasllama_<gpu>_shapes`<br>`dasllama_metal_shapes` | PORTABLE servability gates — no GPU C++ require, so any box can bake | device calls |
-| `dasllama_<gpu>_lens`<br>`dasllama_metal_lens`, `dasllama_vulkan_lens` | the kernel-access macro | anything else |
+| the kernel-access lens<br>`dasllama_metal_lens` (Metal), `dasllama_vulkan_dispatch` (Vulkan — the `[vk_dispatch]` macro derives access per class) | the kernel-access macro | anything else |
 
 - **Vulkan additionally has an ENTRY, `dasllama_math_vulkan.das`** — capability probe/arm, `.dlim`
   identity source, cross-arm routers, the `[init]` installs. It re-exports the family `public`,
   and its NAME is common's `?vulkan` require contract: **never rename it.**
+- **Vulkan additionally has `dasllama_vulkan_seams.das`** — the thin whole-op call seams the tier
+  and suites dispatch through (`vk_add_rms`, `vk_rope_kv_store`, `vk_decode_attn`). It exists
+  because of a require direction: common cannot require the classes module (classes requires
+  common back), so any seam that encodes a class kernel must sit above both. A seam here wraps
+  ensure/set/enc — kernel bodies and driver policy stay out.
 - **Metal has NO `math_` entry** — the family enters via the transformer's `?das_metal` requires
   plus unconditional shapes. Its below-common piece is **`dasllama_metal_gemm.das`** (the batch
   GEMM donor that common requires `?das_metal`), which owns its device by necessity:
@@ -185,7 +190,11 @@ that a question answered for one backend has an obvious address in the other. Th
   why it compiles on every box. It requires common back for `Model`/`Session`, so like the Metal
   drivers it is required from the transformer umbrella, never from common.
 - **`dasllama_kernel_access.das`** — the shared body-walk read/write classifier both GPU lenses run
-  on. Backend-specific lowering stays in that backend's lens.
+  on, plus the dispatch-lens micro-grammar (the grid/tg/params spec tokenizers and the shared
+  AST-emission core: `is_digit_tok`, `role_ok`, `derived_role`, `mk_uint_cast`, `mk_call1`,
+  `mk_grid_dim`, `param_type`). One owner by design — the two lenses' grammars drifted apart
+  when each carried a private copy (metal folded only the literal "1" where vulkan folded any
+  integer). Backend-specific lowering stays in that backend's lens.
 
 **PSO lifecycle — the family shares ONE device and queue** (`metal_common_init`; the second-device
 question was surveyed and closed against). The decode PSO set lives as `g_pso_*` in
@@ -212,9 +221,20 @@ entry here:**
   That inversion is why their kernels↔common require directions differ.
 - **UMA vs discrete VRAM**: Metal never grows residency machinery (memory is memory); arenas,
   upload economics, mirrors and hydration are Vulkan's alone.
-- **Lens depth**: the Metal lens generates `enc_*` builders from kernel classes; Vulkan's
-  hand-built `vk_set6`/`vk_write6` ladders stand until the class-kernel arc
-  (`followup_vulkan.md` item 9) gives SPIR-V the same interface surface.
+- **Lens depth**: both lenses generate `enc_*` builders from kernel classes — Metal via
+  `[metal_dispatch]`, Vulkan via `[vk_dispatch]` (per-class set layouts + push constants; the
+  class-kernel arc retired the hand-built 6-slot set ladders outright) — and both speak the
+  multi-kernel form (`kernel=` names the method, one macro instance per kernel, declared roles
+  must cover every kernel).
+- **`family=` is Vulkan-only.** A vulkan family shares the per-class surface — the `VkdClass`
+  global, the `set_*` builder, the pipe slots — across classes with one binding layout. Metal's
+  `enc_*` builder is the entire generated surface, so there is nothing for a family to share;
+  cross-class PSO/source sharing on Metal is a PSO-lifecycle question, not a lens one.
+- **The workgroup-footprint gate is Vulkan-only.** `[vk_dispatch]` sums a class's `@workgroup`
+  members and its generated `ensure_*` declines by name (`vkd_wg_fits`) before the pipeline
+  build, because MoltenVK's over-cap failure is an opaque `INITIALIZATION_FAILED` — and the
+  resident driver declines residency with it (`vk_rdec_prepare`). `[metal_dispatch]` has no
+  footprint gate: Metal's own pipeline compile fails loudly with the footprint in the error.
 - **Vulkan has no shapes module yet** — `resident_upload` declines ad hoc by feature name; the
   gap is `followup_vulkan.md` item 1, not a precedent to copy.
 
@@ -387,6 +407,14 @@ why writing one is a review defect.
 an untuned invocation re-execs into a full retune rather than measuring — so re-mint the box
 manifest and check its winners against the stored rows' `tune` stamps before trusting a delta.
 
+**A measured number proves its kernel provenance through `tune_gate()`
+(`performance/profile_common.das`), one arm per world it can run in.** Three worlds, because
+`tune_status()` populates in exactly one of them: a standalone exe checks the sidecar the
+release shipped beside it; a `DAS_TUNE_MANIFEST` run checks that file; a plain script checks
+that every `[tune]` row stamps a manifest winner. An invocation no arm covers refuses — or
+worse, measures on fallback kernels — which is why every measuring entry point calls the gate
+before its first timed rep.
+
 **The retune re-exec bites scaffolding, and the pin for it is checked in.** Any bare `daslang`
 run that requires the engine — a probe, a one-off script, a REPL experiment — re-execs into a
 full retune when no manifest is armed. `performance/last_known_good_sidecar.json` exists for
@@ -405,7 +433,30 @@ that runs before the window is staged must ask the capability half only, or it g
 forever and its feature silently never runs. Split such predicates rather than reordering the
 caller; an optimistic capability answer is safe when the late path has a fallback, and here it does.
 
-### 2.7 Every program root declares the same stack budget
+### 2.7 A quantized activation carries its scale lattice (Vulkan)
+
+Two activation quant forms ride the vulkan rail, and they differ in the SCALE LATTICE, not the
+int8 payload: the Q8_0 form scales per 32 values, the superblock form per 256 (with per-32
+sub-scales inside). A compiled kernel indexes ONE lattice — the q8 GEMV/GEMM rail reads per-32
+scales; the k-quant (k4/k5/k6/q40) kernels index the per-256 lattice. `kq_sb(fmt)` is the
+predicate (§1.2), and it answers for the WEIGHT plane the dispatch consumes.
+
+Three consequences the code is shaped around:
+
+- **A quant/act encoder is picked by the CONSUMING plane's format, never by a rail-wide
+  default.** Every site that encodes activations for a GEMV/GEMM keys its encoder (and its
+  grid: superblock counts are `n/256`) on the consumer's `kq_sb`. The failure mode is silent
+  per-dispatch: the wrong lattice indexes garbage scales, outputs stay finite, and nothing
+  panics — only end-to-end token parity (`harness/parity.das`) catches it, so a resident
+  change is witnessed only by parity runs over both a q8 and a k-quant model.
+- **The fused add-rms+requant twin exists only for the per-32 form.** The rail gates it on
+  "every consumer of this buffer is Q8_0-scaled" (`rd_x_quants_b32`), and the profiler stamp
+  shape must ride the SAME gate, or profiles desync from what actually dispatched.
+- **A GEMV group sharing one activation buffer must be lattice-homogeneous.** q/k/v share one
+  quantized x; gate/up share another. Resident arming classifies each member's consumer form
+  and DECLINES a mixed group rather than serving one member wrong scales.
+
+### 2.8 Every program root declares the same stack budget
 
 `options stack` is main-module-only: it does not unify up from required modules, so no library in
 the forward chain can declare the depth it needs. Every program that drives the engine — each test,

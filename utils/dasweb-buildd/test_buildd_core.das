@@ -66,6 +66,17 @@ def test_unpack_bundle(t : T?) {
             let bundle = write_json(JV((files = JV(files_obj))))
             tt |> equal(unpack_sources(dir, bundle), "")
         }
+        t |> run("a file whose content is not text is refused, not emptied") @(tt : T?) {
+            // POST /api/samples stores arbitrary text, so a stored bundle can
+            // carry a number here. Coercing it to "" would compile an EMPTY
+            // file under a hash describing something else, and the user would
+            // read the compile error as a fault in code that was discarded.
+            var files_obj <- { "main.das" => JV(123), "other.das" => JV("print(1)") }
+            let bundle = write_json(JV((files = JV(files_obj), active = "main.das")))
+            tt |> equal(unpack_sources(dir, bundle), "")
+            tt |> success(!stat(path_join(dir, "main.das")).is_reg ||
+                !empty(fread(path_join(dir, "main.das"))), "no empty stand-in was compiled")
+        }
     }
 }
 
@@ -133,9 +144,157 @@ def test_build_cannot_widen_its_own_output(t : T?) {
         }
     }
     t |> run("an undefined mode publishes nothing") @(tt : T?) {
-        tt |> success(empty(expected_artifact_names("page")), "page mode not wired")
         tt |> success(empty(expected_artifact_names("bogus")), "unknown mode")
         tt |> equal(length(expected_artifact_names("module")), 1)
+    }
+    t |> run("page mode publishes exactly the html+js+wasm triple") @(tt : T?) {
+        let names <- expected_artifact_names("page")
+        tt |> equal(length(names), 3)
+        tt |> equal(names[0], "sample.html")
+        tt |> equal(names[1], "sample.js")
+        tt |> equal(names[2], "sample.wasm")
+    }
+    with_temp_dir("buildd_out_") $(dir) {
+        fwrite(path_join(dir, "sample.html"), "<html></html>")
+        fwrite(path_join(dir, "sample.js"), "// glue")
+        fwrite(path_join(dir, "sample.wasm"), "wasm bytes")
+        t |> run("page mode collects its triple in order") @(tt : T?) {
+            let files <- collect_artifacts(dir, "page")
+            tt |> equal(length(files), 3)
+            tt |> equal(files[0].name, "sample.html")
+            tt |> equal(files[1].name, "sample.js")
+            tt |> equal(files[2].name, "sample.wasm")
+            tt |> equal(files[2].sha256, sha256_hex("wasm bytes"))
+        }
+    }
+    with_temp_dir("buildd_out_") $(dir) {
+        fwrite(path_join(dir, "sample.html"), "<html></html>")
+        fwrite(path_join(dir, "sample.wasm"), "wasm bytes")
+        t |> run("a partial page set yields nothing — all or nothing") @(tt : T?) {
+            let files <- collect_artifacts(dir, "page")
+            tt |> success(empty(files), "missing sample.js drops the whole set")
+        }
+    }
+}
+
+[test]
+def test_write_page_package(t : T?) {
+    with_temp_dir("buildd_pkg_") $(dir) {
+        t |> run("the generated package names the app sample and the job's entry") @(tt : T?) {
+            let no_assets : array<string>
+            tt |> success(write_page_package(dir, "prog.das", no_assets, ""), "written")
+            let body = fread(path_join(dir, ".das_package"))
+            tt |> success(find(body, "release_name(\"sample\")") >= 0, "app is sample")
+            tt |> success(find(body, "release_main(\"prog.das\")") >= 0, "entry carried")
+            tt |> success(find(body, "require daslib/daspkg") >= 0, "daspkg hook file")
+            tt |> success(find(body, "release_embed_file") < 0, "no embeds without assets")
+        }
+        t |> run("declared assets become absolute-src embeds at /<path>") @(tt : T?) {
+            mkdir_rec(path_join(dir, "wt/tutorials/_assets/gltf"))
+            fwrite(path_join(dir, "wt/tutorials/_assets/gltf/BoomBox.glb"), "glb bytes")
+            let wt = replace(path_join(dir, "wt"), "\\", "/")
+            let assets <- [ "tutorials/_assets/gltf/BoomBox.glb" ]
+            tt |> success(write_page_package(dir, "prog.das", assets, wt), "written")
+            let body = fread(path_join(dir, ".das_package"))
+            tt |> success(
+                find(body, "release_embed_file(\"{wt}/tutorials/_assets/gltf/BoomBox.glb\", \"/tutorials/_assets/gltf/BoomBox.glb\")") >= 0,
+                "embed line carries absolute src and MEMFS dst")
+            // embedded files live in the data segment: the package must widen INITIAL_MEMORY
+            tt |> success(find(body, "release_emcc_arg(\"-sINITIAL_MEMORY=") >= 0, "initial memory covers embeds")
+        }
+    }
+}
+
+[test]
+def test_declared_assets(t : T?) {
+    t |> run("wasm-assets lines parse; everything else is ignored") @(tt : T?) {
+        let src = ("options gen2\n" +
+            "// wasm-assets: tutorials/_assets/gltf/BoomBox.glb\n" +
+            "  // wasm-assets:   tutorials/_assets/hdri/cannon_2k.hdr  \n" +
+            "// wasm-assets:\n" +
+            "// not-assets: tutorials/_assets/x.bin\n" +
+            "require math\n")
+        let got <- collect_declared_assets(src)
+        tt |> equal(length(got), 2)
+        tt |> equal(got[0], "tutorials/_assets/gltf/BoomBox.glb")
+        tt |> equal(got[1], "tutorials/_assets/hdri/cannon_2k.hdr")
+    }
+    t |> run("asset paths are shape-checked: allowlist prefix, boring components") @(tt : T?) {
+        tt |> success(is_valid_asset_path("tutorials/_assets/cat/textures/concrete_cat_statue_diff_2k.jpg"), "real shape")
+        tt |> success(!is_valid_asset_path("/etc/passwd"), "absolute")
+        tt |> success(!is_valid_asset_path("tutorials/_assets/../../secrets.txt"), "traversal")
+        tt |> success(!is_valid_asset_path("examples/hello.das"), "outside the allowlist")
+        tt |> success(!is_valid_asset_path("tutorials/_assets/a\\b.bin"), "backslash")
+        tt |> success(!is_valid_asset_path("tutorials/_assets//x.bin"), "empty component")
+        tt |> success(!is_valid_asset_path("tutorials/_assets/"), "no file")
+    }
+    t |> run("validation fails closed with the offending path in the message") @(tt : T?) {
+        with_temp_dir("buildd_assets_") $(wt) {
+            mkdir_rec(path_join(wt, "tutorials/_assets/gltf"))
+            fwrite(path_join(wt, "tutorials/_assets/gltf/BoomBox.glb"), "glb bytes")
+            let ok_assets <- [ "tutorials/_assets/gltf/BoomBox.glb" ]
+            var err = ""
+            tt |> success(validate_asset_paths(ok_assets, wt, err), "existing asset passes")
+            let missing <- [ "tutorials/_assets/gltf/NoSuch.glb" ]
+            tt |> success(!validate_asset_paths(missing, wt, err), "missing asset refuses")
+            tt |> success(find(err, "NoSuch.glb") >= 0, "message names the path")
+            let bad <- [ "tutorials/_assets/../x" ]
+            tt |> success(!validate_asset_paths(bad, wt, err), "bad shape refuses")
+            remove(path_join(wt, "tutorials/_assets/gltf/BoomBox.glb"))
+        }
+    }
+}
+
+[test]
+def test_job_identity_validation(t : T?) {
+    // The builder assembles a scratch path from the hash the SERVER sent, so
+    // its shape is checked on arrival — "the server said so" is not validation.
+    let good = "1111111111111111111111111111111111111111111111111111111111111111"
+    t |> run("hashes are exactly 64 lowercase hex") @(tt : T?) {
+        tt |> success(is_valid_job_hash(good), "64 hex")
+        tt |> success(!is_valid_job_hash(slice(good, 0, 63)), "too short")
+        tt |> success(!is_valid_job_hash("ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB"), "uppercase")
+        tt |> success(!is_valid_job_hash("../../../etc"), "traversal")
+        tt |> success(!is_valid_job_hash(""), "empty")
+    }
+    t |> run("toolchains are 7..64 lowercase hex") @(tt : T?) {
+        tt |> success(is_valid_job_toolchain("abc1234"), "short sha")
+        tt |> success(!is_valid_job_toolchain("abc123"), "too short")
+        tt |> success(!is_valid_job_toolchain(".."), "traversal")
+    }
+}
+
+[test]
+def test_symlinked_artifact_is_refused(t : T?) {
+    // A build writes its output directory with the user's own compile-time
+    // code. Everything downstream reads the artifact path on the HOST, outside
+    // the sandbox — so a symlink there would publish a host file. Refuse it.
+    with_temp_dir("buildd_link_") $(dir) {
+        var terr = ""
+        let secret = path_join(dir, "secret.txt")
+        fwrite(secret, "host-only content")
+        let out_dir = path_join(dir, "out")
+        mkdir_rec(out_dir)
+        let link = path_join(out_dir, "sample.wasm")
+        // daslang binds no symlink CREATION, so make one the POSIX way.
+        let rc = unsafe(popen_argv(["ln", "-s", secret, link], 30.0) $(f) {
+            if (f != null) {
+                terr = fread(f)
+            }
+        })
+        // Gate on what actually landed, not on the exit code: on Windows `ln`
+        // reports success while COPYING the file, so an exit-code-only guard
+        // would assert against a premise that is false there. The refusal is
+        // still compiled everywhere and exercised wherever a real link is made.
+        var link_err = ""
+        if (rc != 0 || !is_symlink(link, link_err)) {
+            print("skipping symlink case: this platform did not create a symlink\n")
+            return
+        }
+        t |> run("a symlinked artifact yields nothing to upload") @(tt : T?) {
+            let files <- collect_artifacts(out_dir, "module")
+            tt |> success(empty(files), "refused, so nothing is published")
+        }
     }
 }
 

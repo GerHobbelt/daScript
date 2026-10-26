@@ -173,6 +173,8 @@ namespace das {
             SideEffects::accessExternal, "get_time_usec")->arg("ref");
         addExtern<DAS_BIND_FUN(cast_int64)>(*this, lib, "int64",
             SideEffects::none, "cast_int64")->arg("time");
+        addExtern<DAS_BIND_FUN(cast_clock)>(*this, lib, "clock",
+            SideEffects::none, "cast_clock")->arg("seconds");
         addExtern<DAS_BIND_FUN(get_time_nsec)>(*this, lib, "get_time_nsec",
             SideEffects::accessExternal, "get_time_nsec")->arg("ref");
     }
@@ -284,6 +286,8 @@ namespace das {
     void * register_dynamic_module ( const char *, const char *, int, Context *, LineInfoArg * ) GENERATE_IO_STUB_RET
     void register_native_path ( const char *, const char *, const char *, Context *, LineInfoArg * ) GENERATE_IO_STUB
     DAS_API void retry_pending_dynamic_modules () GENERATE_IO_STUB
+    DAS_API string describe_pending_dynamic_modules () GENERATE_IO_STUB_RET
+    DAS_API int report_pending_dynamic_modules () GENERATE_IO_STUB_RET
 
 #undef GENERATE_IO_STUB
 #undef GENERATE_IO_STUB_RET
@@ -1755,6 +1759,19 @@ namespace das {
             do {
                 if ( wcscmp(c_file.name, L".") == 0 || wcscmp(c_file.name, L"..") == 0 ) continue;
                 std::wstring child = path + L"/" + c_file.name;
+                // A junction or symlink to a directory reports _A_SUBDIR, so
+                // descending would delete the contents of whatever it points
+                // at — outside the tree being removed. Remove the link itself,
+                // which is `rm -rf`'s rule and matters wherever the tree was
+                // written by something untrusted.
+                DWORD childAttr = GetFileAttributesW(child.c_str());
+                if ( childAttr != INVALID_FILE_ATTRIBUTES && (childAttr & FILE_ATTRIBUTE_REPARSE_POINT) ) {
+                    bool unlinked = (childAttr & FILE_ATTRIBUTE_DIRECTORY)
+                        ? RemoveDirectoryW(child.c_str()) != 0
+                        : _wremove(child.c_str()) == 0;
+                    if ( !unlinked ) { _findclose(hFile); return false; }
+                    continue;
+                }
                 if ( c_file.attrib & _A_SUBDIR ) {
                     if ( !rmdir_rec_impl(child) ) { _findclose(hFile); return false; }
                 } else {
@@ -1775,7 +1792,13 @@ namespace das {
             if ( strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0 ) continue;
             string child = path + "/" + ent->d_name;
             struct stat st;
-            if ( stat(child.c_str(), &st) != 0 ) { closedir(dir); return false; }
+            // lstat, not stat: a symlink must be unlinked, never descended into.
+            // stat() reports a link-to-directory as a directory, so following it
+            // would delete the contents of whatever it points at — outside the
+            // tree being removed. That is `rm -rf`'s rule, and it matters
+            // wherever the tree being deleted was written by something
+            // untrusted (a build output directory, an unpacked archive).
+            if ( lstat(child.c_str(), &st) != 0 ) { closedir(dir); return false; }
             if ( S_ISDIR(st.st_mode) ) {
                 if ( !rmdir_rec_impl(child) ) { closedir(dir); return false; }
             } else {
@@ -1889,7 +1912,7 @@ namespace das {
     // DT_NEEDED dependency (e.g. node-editor -> dasModuleImgui) not yet loaded.
     // retry_pending_dynamic_modules() re-attempts these in fixed-point passes
     // after the folder scan, so module enumeration order stops mattering.
-    static vector<tuple<string,string>> g_pending_dynamic_modules; // path, cpp_class_name
+    static vector<tuple<string,string,string>> g_pending_dynamic_modules; // path, cpp_class_name, last dlopen error
 
     // Env-gated per-attempt module-load trace (default off). Set
     // DAS_TRACE_MODULE_LOAD=1 to surface each dlopen — turns a swallowed
@@ -1937,7 +1960,7 @@ namespace das {
                 // (module .so's live in modules/<dep>/, not on RUNPATH, so a dependent
                 // enumerated before its dependency fails dlopen). Defer; the post-scan
                 // retry_pending_dynamic_modules() re-attempts once deps are loaded.
-                g_pending_dynamic_modules.emplace_back(string(path), string(mod_name));
+                g_pending_dynamic_modules.emplace_back(string(path), string(mod_name), dlErr);
             }
             return nullptr;
         }
@@ -1984,7 +2007,7 @@ namespace das {
         bool progress = true;
         while (progress && !g_pending_dynamic_modules.empty()) {
             progress = false;
-            vector<tuple<string,string>> pending;
+            vector<tuple<string,string,string>> pending;
             pending.swap(g_pending_dynamic_modules); // drain; failures re-push into the now-empty global
             for (auto & pr : pending) {
                 if (register_dynamic_module(get<0>(pr).c_str(), get<1>(pr).c_str(),
@@ -1993,6 +2016,32 @@ namespace das {
                 }
             }
         }
+    }
+
+    // One line per still-pending (dlopen-failed) module: "  Module_Glfw <- <path> (<dlerror>)"
+    // — the registrator class name, which is what was looked up, not the dylib's file name.
+    // Empty string when nothing is pending. Compile-error paths append this to the misleading
+    // "missing prerequisite ...; file not found" so a load failure stops reading as a path typo.
+    DAS_API string describe_pending_dynamic_modules() {
+        TextWriter tw;
+        for (auto & pr : g_pending_dynamic_modules) {
+            tw << "  " << get<1>(pr) << " <- " << get<0>(pr);
+            if (!get<2>(pr).empty()) tw << " (" << get<2>(pr) << ")";
+            tw << "\n";
+        }
+        return tw.str();
+    }
+
+    // Standalone-exe epilogue to the per-module Quiet registrations: everything the exe
+    // registers is REQUIRED by its program, so a module still pending after the retry pass
+    // is a hard failure — report it loudly instead of dying later on the first extern
+    // lookup with an unrelated-looking "Failed to find <fn> in module <mod>" fatal.
+    DAS_API int report_pending_dynamic_modules() {
+        for (auto & pr : g_pending_dynamic_modules) {
+            LOG(LogLevel::error) << "dynamic module `" << get<1>(pr) << "` failed to load: " << get<0>(pr)
+                << (get<2>(pr).empty() ? string() : (" (" + get<2>(pr) + ")")) << "\n";
+        }
+        return int(g_pending_dynamic_modules.size());
     }
 
     void register_native_path(const char *mod_name, const char *src_path, const char *dst_path, Context * /*context*/, LineInfoArg * /*at*/ ) {

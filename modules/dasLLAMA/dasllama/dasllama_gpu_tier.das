@@ -427,6 +427,16 @@ def public set_moe_gpu_heat_route(on : bool) {
     g_moe_gpu_heat_route = on
 }
 
+var g_vk_rdec_rerecord = false
+
+//! Probe lever (--rerecord-ab): re-encode the resident ladder's recorded-once token cmd every
+//! token — measures the re-record cost the carrier class twins would pay for push-borne pos/cnt.
+def public set_vk_rdec_rerecord(on : bool) {
+    g_vk_rdec_rerecord = on
+}
+
+def public vk_rdec_rerecord_on : bool => g_vk_rdec_rerecord
+
 // ===== shared-expert residency (decode, async behind the routed experts) =====
 
 var g_moe_gpu_shexp_layers : table<int64>   // layers whose shexp gate/up/down triple is resident
@@ -691,7 +701,7 @@ def public set_dasllama_noisy(on : bool) {
 }
 def public dasllama_noisy() : bool {
     if (g_noisy < 0) {
-        g_noisy = env_flag("DASLLAMA_NOISY", false) ? 1 : 0
+        g_noisy = g_env_engine.noisy ? 1 : 0
     }
     return g_noisy == 1
 }
@@ -700,67 +710,67 @@ def public dasllama_noisy() : bool {
 //! deltanet/attention/dense/shared-expert/classifier rails. qkv and heat stay off (measured
 //! negative and a wash). Any DASLLAMA_GPU_* knob still overrides individually.
 def public gpu_want_auto : bool
-    => env_flag("DASLLAMA_GPU", g_gpu_want.auto_tier)
+    => g_env_gpu.gpu ?? g_gpu_want.auto_tier
 
 //! Effective tier request, env-else-programmatic — the load walk and the GPU backends read
 //! these instead of the raw env vars.
 
 // -1 = auto: the upload walk resolves it against n_layers and lets its budget stops place the split
 def public gpu_want_moe_layers : int64
-    => env_int64("DASLLAMA_GPU_MOE_LAYERS",
-                 g_gpu_want.moe_layers != 0l ? g_gpu_want.moe_layers : (gpu_want_auto() ? -1l : 0l))
+    => (g_env_gpu.gpu_moe_layers
+        ?? (g_gpu_want.moe_layers != 0l ? g_gpu_want.moe_layers : (gpu_want_auto() ? -1l : 0l)))
 
 def public gpu_want_moe_stream : int64
-    => env_int64("DASLLAMA_GPU_MOE_STREAM",
-                 g_gpu_want.moe_stream != 0l ? g_gpu_want.moe_stream : (gpu_want_auto() ? -1l : 0l))
+    => (g_env_gpu.gpu_moe_stream
+        ?? (g_gpu_want.moe_stream != 0l ? g_gpu_want.moe_stream : (gpu_want_auto() ? -1l : 0l)))
 
 def public gpu_want_vram_mb : int64
-    => env_int64("DASLLAMA_GPU_VRAM_MB", g_gpu_want.vram_mb)
+    => g_env_gpu.gpu_vram_mb ?? g_gpu_want.vram_mb
 
 def public gpu_want_dn : bool
-    => env_flag("DASLLAMA_GPU_DN", g_gpu_want.dn || gpu_want_auto())
+    => g_env_gpu.gpu_dn ?? (g_gpu_want.dn || gpu_want_auto())
 
 def public gpu_want_attn : bool
-    => env_flag("DASLLAMA_GPU_ATTN", g_gpu_want.attn || gpu_want_auto())
+    => g_env_gpu.gpu_attn ?? (g_gpu_want.attn || gpu_want_auto())
 
 def public gpu_want_dense : bool
-    => env_flag("DASLLAMA_GPU_DENSE", g_gpu_want.dense || gpu_want_auto())
+    => g_env_gpu.gpu_dense ?? (g_gpu_want.dense || gpu_want_auto())
 
 //! Dense-rail sub-arm for gemma-4's parallel dense shared expert (moe_dense_shexp) w1/w3/w2 triple.
 //! Opt-IN: MEASURED a wash-to-loss (3 dispatches each paying acts-up + y-down around a CPU gate)
 //! and the uploads displace 1-2 expert layers. Kept as the upload half of a future FUSED chain.
 def public gpu_want_dense_shexp : bool
-    => env_flag("DASLLAMA_GPU_DENSE_SHEXP", false)
+    => g_env_gpu.gpu_dense_shexp
 
 //! The dense rail's attention half (per-layer q/o pairs). Opt-OUT (``DASLLAMA_GPU_DENSE_ATTN=0``)
 //! — measured a LOSS on gemma-4 where the shexp triple is a large win, so the two halves need
 //! independent control rather than one DENSE gate.
 def public gpu_want_dense_attn : bool
-    => env_flag("DASLLAMA_GPU_DENSE_ATTN", true)
+    => g_env_gpu.gpu_dense_attn
 
 def public gpu_want_dnd : bool
-    => env_flag("DASLLAMA_GPU_DND", g_gpu_want.dnd || gpu_want_auto())
+    => g_env_gpu.gpu_dnd ?? (g_gpu_want.dnd || gpu_want_auto())
 
 def public gpu_want_heat : int64
-    => env_int64("DASLLAMA_GPU_HEAT", g_gpu_want.heat)
+    => g_env_gpu.gpu_heat ?? g_gpu_want.heat
 
 def public gpu_want_shexp : bool
-    => env_flag("DASLLAMA_GPU_SHEXP", g_gpu_want.shexp || gpu_want_auto())
+    => g_env_gpu.gpu_shexp ?? (g_gpu_want.shexp || gpu_want_auto())
 
 def public gpu_want_qkv : bool
-    => env_flag("DASLLAMA_GPU_QKV", g_gpu_want.qkv)
+    => g_env_gpu.gpu_qkv ?? g_gpu_want.qkv
 
 //! Arm-intent for the classifier plane. The UPLOAD is opt-OUT (DASLLAMA_GPU_CLS=0 declines it), so
 //! this is only the stronger "=1 arms the tier by itself" signal — letting the classifier offload be
 //! measured without also offloading expert layers. Unset keeps today's behavior exactly.
 def public gpu_want_cls : bool
-    => env_flag("DASLLAMA_GPU_CLS", false)
+    => g_env_gpu.gpu_cls ?? false
 
 //! The classifier UPLOAD gate (opt-OUT, default on when the tier is armed) — distinct from
 //! [[gpu_want_cls]], the opt-IN arm signal. One definition, shared by the upload walk and the
 //! DlimConfiguration identity, so the two can never disagree on the default again.
 def public gpu_want_cls_upload : bool
-    => env_flag("DASLLAMA_GPU_CLS", true)
+    => g_env_gpu.gpu_cls ?? true
 
 //! A GPU backend registers its arm probe here at ``[init]`` so config-driven arming works
 //! after module init (the env path arms at ``[init]`` directly).
@@ -795,6 +805,17 @@ def public set_moe_gpu_budget_hooks(budget : function<() : int64>; plane : funct
 
 //! Device-local bytes the armed tier may spend on resident weights (0 = no tier).
 def public moe_gpu_weight_budget() : int64 => invoke(g_moe_gpu_budget_report)
+
+def private moe_gpu_no_binding_cap : int64 => 0l
+var private g_moe_gpu_binding_cap = @@moe_gpu_no_binding_cap
+
+//! The tier's largest legal single-SSBO binding range in bytes (0 = no tier / unknown). The
+//! resident KV mirror binds one range per side, so the ctx negotiation must cap against it.
+def public set_moe_gpu_binding_cap(f : function<() : int64>) {
+    g_moe_gpu_binding_cap = f
+}
+
+def public moe_gpu_binding_cap() : int64 => invoke(g_moe_gpu_binding_cap)
 
 def private moe_gpu_no_q8n : bool => false
 var private g_moe_gpu_expert_q8n = @@moe_gpu_no_q8n
@@ -1153,6 +1174,9 @@ def private restore_gpu_tier_fn_defaults { // nolint:STYLE037,STYLE038 — flat 
     }
     if (g_moe_gpu_budget_report == null) {
         g_moe_gpu_budget_report = @@moe_gpu_no_budget
+    }
+    if (g_moe_gpu_binding_cap == null) {
+        g_moe_gpu_binding_cap = @@moe_gpu_no_binding_cap
     }
     if (g_moe_gpu_plane_bytes_fn == null) {
         g_moe_gpu_plane_bytes_fn = @@moe_gpu_no_plane_bytes

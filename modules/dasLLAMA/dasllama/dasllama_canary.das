@@ -464,7 +464,7 @@ def load_canary_encoder(path : string; q8 : bool = false) : CanaryEncoder {
         to_log(LOG_INFO, "dasLLAMA: prepared canary-encoder image mapped in {get_time_usec(ts_img) / 1000} ms — {path}\n")
         return <- t
     }
-    if (env_flag("DASLLAMA_IMAGE", true)) {
+    if (g_env_engine.image) {
         apply_box_profile_runtime()   // a backend pin must precede the identity (it names the backend)
         let img = image_path_for(path, tag)
         let ts_img = ref_time_ticks()
@@ -1109,11 +1109,11 @@ def canary_asr_caps() : AsrCaps {
 }
 
 //! The facade's session arm: English-only validation, then a fresh decoder session.
-def create_canary_asr_session(dec : Model; lang : string) : CanaryAsrSession {
+def create_canary_asr_session(dec : Model; lang : string; kv : KVDtype = KVDtype.f16) : CanaryAsrSession {
     if (lang != "auto" && lang != "en") {
         panic("dasLLAMA asr: this Canary-Qwen model is English-only — create the session with lang=\"en\" or \"auto\"")
     }
-    return <- CanaryAsrSession(qctx <- create_session_(dec))
+    return <- CanaryAsrSession(qctx <- create_session_(dec, kv, kv))
 }
 
 // Canary-Qwen transcription: FastConformer-32 encode + projector, the SALM/Qwen prompt with the

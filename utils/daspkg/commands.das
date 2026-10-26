@@ -2288,9 +2288,8 @@ def cmd_release(root : string; out_dir : string; paranoid = false; quick = false
                 let tune_seconds = release_elapsed(tune_t0)
                 if (trc != 0) {
                     // a nonzero tuner is a REFUSAL (noise gate, validation) or a failure —
-                    // either way the winners were not measured, and unmeasured winners do
-                    // not ship. DAS_TUNE_NOISE_OVERRIDE mints anyway (stamped).
-                    to_log(LOG_ERROR, "release: tuner for scope `{ts.name}` refused/failed after {tune_seconds}s (rc={trc}) — not shipping unmeasured winners; quiet the box and re-run, or --quick to inherit a complete sidecar\n{tout}\n")
+                    // either way the winners were not measured, and unmeasured winners do not ship
+                    to_log(LOG_ERROR, "release: tuner for scope `{ts.name}` refused/failed after {tune_seconds}s (rc={trc}) — not shipping unmeasured winners; quiet the box and re-run, --quick to inherit a complete sidecar, or DAS_TUNE_NOISE_OVERRIDE=1 to mint anyway (stamped in provenance)\n{tout}\n")
                     if (fexist(deps_file)) {
                         remove(deps_file)
                     }
@@ -2430,7 +2429,12 @@ def cmd_release(root : string; out_dir : string; paranoid = false; quick = false
             return 1
         }
         var terr : string
-        if (!set_mtime(sidecar_dst, get_clock(), terr)) {
+        // the ship contract is STRICTLY newer than the exe; a whole-second "now" stamp can
+        // only tie a same-second exe write, so anchor to the exe's final mtime instead —
+        // future-dating is harmless (staleness only checks older-than-exe)
+        var exe_fs : FStat
+        let ahead = clock(int64(stat(exe_path, exe_fs) ? exe_fs.mtime : get_clock()) + 5l)
+        if (!set_mtime(sidecar_dst, ahead, terr)) {
             to_log(LOG_WARNING, "release: cannot touch {sidecar_dst}: {terr} — the shipped sidecar may read as stale\n")
         }
         log("  ship: {sidecar_rel} (tune sidecar)\n")
@@ -2695,10 +2699,12 @@ def private release_one_wasm_app(root, out_dir, app_name, main_script : string; 
     mkdir_rec(app_out_dir)
 
     let daslang = get_daslang_path()
-    let das_root = get_das_root()
+    // Intermediates live beside the output, NOT under das_root: the SDK root may be
+    // read-only (installed SDK, or the buildd sandbox's ro-mounted worktree), and
+    // app_out_dir was just created so it is always writable.
     run_cmd_counter ++
-    let obj_path = "{das_root}/_daspkg_wasm_{run_cmd_counter}.o"
-    let deps_file = "{das_root}/_daspkg_wasm_deps_{run_cmd_counter}.json"
+    let obj_path = path_join(app_out_dir, "_daspkg_wasm_{run_cmd_counter}.o")
+    let deps_file = path_join(app_out_dir, "_daspkg_wasm_deps_{run_cmd_counter}.json")
 
     // 1. Cross-compile to a wasm64 object (link skipped via --jit-emit-object),
     //    with --list-shared-modules writing the referenced-module set.
