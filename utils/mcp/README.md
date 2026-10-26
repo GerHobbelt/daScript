@@ -20,7 +20,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server that e
 | `find_symbol` | Cross-module symbol search (functions, generics, structs, handled types, enums, globals, typedefs/aliases, fields). Case-insensitive substring by default; `=query` for exact match |
 | `list_requires` | Compile a `.das` file and list all `require` dependencies (direct and transitive), with source file paths and builtin annotations. Optional `json` for structured output |
 | `list_module_api` | List all functions, types, enums, and globals exported by a builtin or daslib module (e.g. `math`, `strings`, `fio`, `daslib/json`). Optional `compact` mode for large modules |
-| `convert_to_gen2` | Convert a `.das` file from gen1 (indentation-based) syntax to gen2 (braces/parentheses) using the `gen1_to_gen2` converter. Optional `inplace` flag to modify the file directly |
+| `convert_to_gen2` | Convert a `.das` file from gen1 (indentation-based) syntax to gen2 (braces/parentheses) using the `utils/gen1-to-gen2` converter. Optional `inplace` flag to modify the file directly |
 | `goto_definition` | Given a cursor position (file, line, column), resolve the definition of the symbol under the cursor. Returns location, kind (variable/function/field/builtin/struct/enum/typedef), and source snippet. Optional `no_opt` to preserve pre-optimization AST |
 | `type_of` | Given a cursor position (file, line, column), return the resolved type of the expression under the cursor. Shows all expressions at position from innermost to outermost. Optional `no_opt` |
 | `find_references` | Find all references to the symbol under the cursor (function calls, variable uses, field accesses, type refs, enum/bitfield values, aliases). Works from both usage and declaration sites. Scope: `file` (default) or `all` (all loaded modules). Optional `no_opt` |
@@ -29,6 +29,8 @@ A [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server that e
 | `grep_usage` | Parse-aware symbol search across `.das` files using ast-grep + tree-sitter. Finds identifier occurrences excluding comments and strings. Conditional on `sg` CLI |
 | `outline` | List all declarations (functions, structs, classes, enums, bitfields, variants, globals, typedefs) in a file or set of files using tree-sitter. Works on broken/incomplete code - no compilation needed. Conditional on `sg` CLI |
 | `aot` | Generate AOT (ahead-of-time) C++ code for a `.das` file or a single function. Without `function`, returns full AOT output. With `function`, extracts that function's C++ only. Overloaded names return a disambiguation list with mangled names for exact selection |
+| `arch_of` | The `[arch]` citations a `.das` file makes, each resolved to its document plus the section text under the cited anchor heading. Optional `symbol` to keep only one declaration's citations. Unresolved citations report LINT026's own reason. Reads source, so a file that does not compile still answers |
+| `arch_sites` | The census of an architecture document: every `.das` under the folder that owns it citing it, with file, line and annotated symbol. Grouped under the document's own headings (uncited anchors included) unless the query names an anchor |
 
 ### C++ Source & Build Tools
 

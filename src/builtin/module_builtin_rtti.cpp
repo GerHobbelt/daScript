@@ -370,7 +370,7 @@ namespace das {
     template <>
     struct typeFactory<RttiValue> {
         static TypeDeclPtr make(const ModuleLibrary & library ) {
-            auto vtype = new TypeDecl(Type::tVariant);
+            auto vtype = new TypeDecl(Type::tVariant, cppBindingLineInfo());
             vtype->alias = "RttiValue";
             vtype->aotAlias = false;
             vtype->addVariant("tBool",   typeFactory<RttiValue::NthType<RttiBool>>::make(library));
@@ -390,7 +390,7 @@ namespace das {
     };
 
     TypeDeclPtr makeModuleFlags() {
-        auto ft = new TypeDecl(Type::tBitfield);
+        auto ft = new TypeDecl(Type::tBitfield, cppBindingLineInfo());
         ft->alias = "ModuleFlags";
         ft->argNames = {
             "builtIn", "promoted", "isPublic", "isModule", "isSolidContext",
@@ -448,7 +448,7 @@ namespace das {
     };
 
     TypeDeclPtr makeContextCategoryFlags() {
-        auto ft = new TypeDecl(Type::tBitfield);
+        auto ft = new TypeDecl(Type::tBitfield, cppBindingLineInfo());
         ft->alias = "context_category_flags";
         ft->argNames = { "dead", "debug_context", "thread_clone", "job_clone", "opengl",
             "debugger_tick", "debugger_attached", "macro_context", "folding_context", "audio" };
@@ -494,7 +494,7 @@ namespace das {
     };
 
     TypeDeclPtr makeSimFunctionFlags() {
-        auto ft = new TypeDecl(Type::tBitfield);
+        auto ft = new TypeDecl(Type::tBitfield, cppBindingLineInfo());
         ft->alias = "SimFunctionFlags";
         ft->argNames = { "aot", "fastcall", "builtin", "jit", "unsafe", "cmres", "pinvoke" };
         return ft;
@@ -524,7 +524,7 @@ namespace das {
     };
 
     TypeDeclPtr makeProgramFlags() {
-        auto ft = new TypeDecl(Type::tBitfield);
+        auto ft = new TypeDecl(Type::tBitfield, cppBindingLineInfo());
         ft->alias = "ProgramFlags";
         ft->argNames = { "failToCompile", "_unsafe", "isCompiling", "isSimulating",
             "isCompilingMacros", "needMacroModule", "promoteToBuiltin",
@@ -540,6 +540,7 @@ namespace das {
             addField<DAS_BIND_MANAGED_FIELD(totalFunctions)>("totalFunctions");
             addField<DAS_BIND_MANAGED_FIELD(totalVariables)>("totalVariables");
             addField<DAS_BIND_MANAGED_FIELD(globalStringHeapSize)>("globalStringHeapSize");
+            addField<DAS_BIND_MANAGED_FIELD(globalInitStackSize)>("globalInitStackSize");
             addField<DAS_BIND_MANAGED_FIELD(initSemanticHashWithDep)>("initSemanticHashWithDep");
             addField<DAS_BIND_MANAGED_FIELD(visitBuiltinFunctions)>("visitBuiltinFunctions");
             addFieldEx ( "flags", "flags", offsetof(Program, flags), makeProgramFlags() );
@@ -583,7 +584,7 @@ namespace das {
     };
 
     TypeDeclPtr makeAnnotationDeclarationFlags() {
-        auto ft = new TypeDecl(Type::tBitfield);
+        auto ft = new TypeDecl(Type::tBitfield, cppBindingLineInfo());
         ft->alias = "AnnotationDeclarationFlags";
         ft->argNames = { "inherited" };
         return ft;
@@ -734,6 +735,36 @@ namespace das {
             auto rv = simulateExpression(context, src);
             return context.code->makeNode<SimNode_AnyIterator<ST,DebugInfoIterator<VT,ST>>>(at, rv);
         }
+        virtual void * jitGetEach () const override {
+            return (void *) +[] ( Sequence * out, void * pInfo, Context * context, LineInfoArg * at ) {
+                using Iter = DebugInfoIterator<VT,ST>;
+                char * iter = context->allocateIterator(sizeof(Iter), "DebugInfo field iterator", at);
+                new (iter) Iter((ST *)pInfo, at);
+                out->iter = (Iterator *) iter;
+            };
+        }
+        virtual void * jitGetAt ( Type indexType ) const override {
+            switch ( indexType ) {
+            case Type::tInt:
+                return (void *) +[] ( void * pInfo, int32_t index, Context * context, LineInfoArg * at ) -> char * {
+                    auto * pValue = (ST *) pInfo;
+                    if ( uint32_t(index) >= pValue->count ) {
+                        context->throw_error_at(at, "field index out of range, %d of %u", index, pValue->count);
+                    }
+                    return (char *) pValue->fields[uint32_t(index)];
+                };
+            case Type::tUInt:
+                return (void *) +[] ( void * pInfo, uint32_t index, Context * context, LineInfoArg * at ) -> char * {
+                    auto * pValue = (ST *) pInfo;
+                    if ( index >= pValue->count ) {
+                        context->throw_error_at(at, "field index out of range, %u of %u", index, pValue->count);
+                    }
+                    return (char *) pValue->fields[index];
+                };
+            default:
+                return nullptr;
+            }
+        }
         virtual void gc_collect ( gc_root * target, gc_root * from ) override {
             ManagedStructureAnnotation<ST,false>::gc_collect(target, from);
             if ( fieldType ) fieldType->gc_collect(target, from);
@@ -776,7 +807,7 @@ namespace das {
 
 
     TypeDeclPtr makeStructInfoFlags() {
-        auto ft = new TypeDecl(Type::tBitfield);
+        auto ft = new TypeDecl(Type::tBitfield, cppBindingLineInfo());
         ft->alias = "StructInfoFlags";
         ft->argNames = { "_class", "_lambda", "heapGC", "stringHeapGC" };
         return ft;
@@ -809,7 +840,7 @@ namespace das {
     }
 
     TypeDeclPtr makeTypeInfoFlags() {
-        auto ft = new TypeDecl(Type::tBitfield);
+        auto ft = new TypeDecl(Type::tBitfield, cppBindingLineInfo());
         ft->alias = "TypeInfoFlags";
         ft->argNames = { "ref", "refType", "canCopy", "isPod", "isRawPod", "isConst", "isTemp", "isImplicit",
             "refValue", "hasInitValue", "isSmartPtr", "isSmartPtrNative", "isHandled",
@@ -876,7 +907,7 @@ namespace das {
     };
 
     TypeDeclPtr makeLocalVariableInfoFlagsFlags() {
-        auto ft = new TypeDecl(Type::tBitfield);
+        auto ft = new TypeDecl(Type::tBitfield, cppBindingLineInfo());
         ft->alias = "LocalVariableInfoFlags";
         ft->argNames = { "cmres" };
         return ft;

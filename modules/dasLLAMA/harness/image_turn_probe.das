@@ -9,14 +9,14 @@ require dasllama/dasllama_math
 require dasllama/dasllama_blocks
 require dasllama/dasllama_load
 require dasllama/dasllama_image   // nolint:STYLE030,LINT019 — load_model_cached, used only inside the das_metal static_if half
-require dasllama/dasllama_env
+require dasllama/dasllama_env   // nolint:STYLE030,LINT019 — g_env_harness, read only inside the das_metal static_if half
 require ?das_metal dasllama/dasllama_metal_prefill
 require ../performance/profile_common.das   // tune_gate + apply_box_profile_runtime — the standing pre-measure stack
 require daslib/jobque_boost
-require daslib/fio
+require daslib/fio   // nolint:STYLE030,LINT019 — path_join, used only inside the das_metal static_if half
 require math
 
-// The IMAGE-TURN attribution probe: one loaded model, npos=321 (the coco turn shape), three
+// An ATTRIBUTION SWEEP: one loaded model, npos=321 (the coco turn shape), three
 // workloads — plain tokens, a narrow embd quantum with the mrope span, and the ds-wide
 // quantum — crossed with the DASLLAMA_METAL_PREFILL_SKIP knockout arms, all in ONE process.
 // Splits the image-turn tax over text into its (mrope+span) and (ds-wide) halves, then
@@ -51,7 +51,8 @@ def measure_tokens(tr : Model; reps : int) : double {
     return best
 }
 
-def measure_span(tr : Model; wide : bool; reps : int) : double {
+def measure_span(tr : Model; wide : bool; reps : int; lo : int64 = SPAN_LO; hi : int64 = SPAN_HI;
+                 gx : int64 = GRID_X; gy : int64 = GRID_Y) : double {
     let dim = tr.config.dim
     let stride = wide ? (1l + tr.config.n_deepstack) * dim : dim
     var best = 1.0e30lf
@@ -63,7 +64,7 @@ def measure_span(tr : Model; wide : bool; reps : int) : double {
             embd[i] = 0.01 * sin(float(i % 1024l))
         }
         let t0 = ref_time_ticks()
-        eval_embd_span_mrope_(tr, s, embd, NPOS, SPAN_LO, SPAN_HI, GRID_X, GRID_Y)
+        eval_embd_span_mrope_(tr, s, embd, NPOS, lo, hi, gx, gy)
         let ms = double(get_time_usec(t0)) / 1000.0lf
         if (ms < best) {
             best = ms
@@ -76,11 +77,10 @@ def measure_span(tr : Model; wide : bool; reps : int) : double {
 
 [export]
 def main {
-    let env = g_env_harness.models_dir
-    let mdir = empty(env) ? "/Users/borisbatkin/Work/llama.cpp/models/" : env
-    let mname = get_env_variable("PROBE_MODEL")
-    let path = path_join(mdir, empty(mname) ? "Qwen3VL-8B-Instruct-Q8_0.gguf" : mname)
     static_if (typeinfo builtin_module_exists(das_metal)) {
+        let env = g_env_harness.models_dir
+        let mdir = empty(env) ? "/Users/borisbatkin/Work/llama.cpp/models/" : env
+        let path = path_join(mdir, g_env_harness.probe_model)
         set_metal_mode(MetalMode.required)   // before load — pins the metal serving, same as the bench's --ngl leg
         var tr <- load_model_cached(path, QuantMode.q8)
         if (!tr.metal_blob) {
@@ -101,6 +101,17 @@ def main {
                 let wsp = measure_span(tr, true, REPS)
                 let tag = empty(arm) ? "full" : arm
                 print("PROBE {tag}: tokens {t} ms | narrow-span {nsp} ms | wide-span {wsp} ms | narrow-tax {nsp - t} | wide-tax {wsp - t}\n")
+            }
+            // the span-tax split: which attention STAGE carries it (the per-stage knockouts),
+            // and how it scales with span size (span of 1 row = the constant/overhead part,
+            // 300 rows = overhead + the intrinsic non-causal pairs)
+            for (arm in ["", "attn_qk", "attn_sm", "attn_av"]) {
+                set_metal_prefill_skip(arm)
+                let t = measure_tokens(tr, REPS)
+                let s300 = measure_span(tr, false, REPS)
+                let s1 = measure_span(tr, false, REPS, SPAN_LO, SPAN_LO + 1l, 1l, 1l)
+                let tag = empty(arm) ? "split-full" : arm
+                print("SPLIT {tag}: tokens {t} ms | span300 {s300} ms | span1 {s1} ms | tax300 {s300 - t} | tax1 {s1 - t}\n")
             }
             set_metal_prefill_skip("")
         }

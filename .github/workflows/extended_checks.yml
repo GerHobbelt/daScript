@@ -222,7 +222,7 @@ jobs:
             # No sccache launcher: this lane is nightly-only and runs uncached.
             cmake --no-warn-unused-cli -B./build -G "${{ matrix.cmake_generator }}" -DCMAKE_BUILD_TYPE:STRING=Release \
               $ACTIVE_MODULES -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
-            cmake --build ./build --config Release --target daslang gen1_to_gen2 daslang_static --parallel
+            cmake --build ./build --config Release --target daslang daslang_static --parallel
             ;;
           linux)
             echo "BIN=./bin" >> $GITHUB_ENV
@@ -282,6 +282,16 @@ jobs:
     - name: "Run tutorial dry-runs"
       run: cmake --build ./build --config Release --target dry_run_tutorials
 
+    - name: "Check the example games stay wired to the site"
+      # examples/games/REVIEW.das cross-checks the card id every place it is written
+      # down - the game directory, its package_name, the deploy loops and the verify
+      # step, the examples-page card and its poster, the playground sample and the
+      # interpreted fallback's file bundle. All of that is hand-maintained, and the
+      # deploy that consumes it only runs on master, so a mismatch is invisible until
+      # the site is already broken. Linux only: it reads files, nothing platform-bound.
+      if: matrix.target == 'linux'
+      run: $BIN/daslang examples/games/REVIEW.das
+
     - name: "Verify authored-doc code blocks (nightly only)"
       # doc-verify compiles every das code block of the authored RST corpus
       # (skills/internal/doc_sweep.md). Nightly-only per policy: doc rot is not a
@@ -289,6 +299,18 @@ jobs:
       # page via popen and is exercised on the posix cells.
       if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && matrix.target != 'windows'
       run: $BIN/daslang ./utils/internal/doc-verify/main.das -- --daslang $BIN/daslang
+
+    - name: "Cross-compile nano for cortex-m4"
+      # nano's drift tripwire - the only freestanding build in CI. Linux only:
+      # one arch catches the drift, and the toolchain is an apt away.
+      if: matrix.target == 'linux'
+      run: |
+        set -eux
+        # newlib and its libstdc++ are only *recommended* by gcc-arm-none-eabi,
+        # so --no-install-recommends leaves a compiler with no C library at all.
+        sudo bash ci/apt_install.sh --no-install-recommends \
+          gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib
+        ci/nano_arm_build.sh "$BIN/daslang"
 
     - name: "Build standalone executables"
       run: |
@@ -306,7 +328,7 @@ jobs:
       # ON via ci/release_modules.txt in this workflow.
       run: |
         set -eux
-        # The main extended_checks build only targets daslang/gen1_to_gen2/daslang_static.
+        # The main extended_checks build only targets daslang/daslang_static.
         # Sequence loads dasGlfw + dasLiveHost + dasHV + dasAudio + dasPUGIXML +
         # dasStbImage at runtime; build their dynamic-module targets first.
         # No `cmake --install` -- the source tree already IS a usable daslang

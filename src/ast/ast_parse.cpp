@@ -59,9 +59,9 @@ DAS_CC_API das::smart_ptr<das::FileAccess> get_file_access( char * pak ) {
 
 namespace das {
 
-    void applyPostInferMacros ( Program * program ) {
+    void applyPostRewriteMacros ( Program * program ) {
         program->library.foreach([&](Module * mod) -> bool {
-            for ( const auto & pm : mod->postInferMacros ) {
+            for ( const auto & pm : mod->postRewriteMacros ) {
                 pm->apply(program, program->thisModule.get());
             }
             return true;
@@ -915,14 +915,15 @@ namespace das {
         exit(1);
     }
 
-    ProgramPtr parseDaScript ( const string & fileName,
+    static ProgramPtr parseDaScriptEx ( const string & fileName,
                                const string & moduleName,
                               const FileAccessPtr & access,
                               TextWriter & logs,
                               ModuleGroup & libGroup,
                               bool exportAll,
                               bool isDep,
-                              CodeOfPolicies policies ) {
+                              CodeOfPolicies policies,
+                              bool inferAfterParse ) {
         verifyCodeOfPoliciesStamp(policies);
         CompilationCallbackGuard compilationCallbackGuard(moduleName, fileName);
         ProgramPtr program = make_smart<Program>();
@@ -1052,6 +1053,13 @@ namespace das {
             program->deduplicateErrors();
             program->isCompiling = false;
             return program;
+        } else if ( !inferAfterParse ) {
+            daScriptEnvironment::getBound()->g_Program.reset();
+            daScriptEnvironment::getBound()->g_compilerLog = nullptr;
+            daScriptEnvironment::getBound()->g_compilingFileName = nullptr;
+            daScriptEnvironment::getBound()->g_compilingModuleName = nullptr;
+            program->isCompiling = false;
+            return program;
         } else {
             if ( program->options.getBoolOption("force_inscope_pod", policies.force_inscope_pod) ) {
                 program->thisModule->allowPodInscope = access->isPodInScopeAllowed(program->thisModule->name, fileName);
@@ -1076,9 +1084,6 @@ namespace das {
                 *totInfer += inferLegT;
             }
             if ( !program->failed() ) {
-                // buildAccessFlags is the FIRST pass to read the finished tree, and it
-                // dereferences expr->type unguarded - so the verifier has to precede it
-                applyPostInferMacros(program.get());
                 program->buildAccessFlags(logs);    // this is used by the lint pass
                 if ( program->patchAnnotations() ) {
                     // A patchAnnotations() pass can both mutate the AST (astChanged) AND record a
@@ -1141,9 +1146,6 @@ namespace das {
             }
             if ( !program->failed() ) {
                 program->normalizeOptionTypes();
-                // lint / folding / codegen are the first consumers of the finished tree, and
-                // they dereference expr->type unguarded - so this is where a verifier can see it
-                applyPostInferMacros(program.get());
                 if (!program->failed())
                     program->lint(logs, libGroup);
                 if ( policies.macro_context_collect ) libGroup.collectMacroContexts();
@@ -1155,7 +1157,6 @@ namespace das {
                         callCompilationCallback(moduleName, fileName, "optimize");
                         optimizeProgram(program.get(),logs,libGroup);
                     } else {
-                        applyPostInferMacros(program.get());
                         program->buildAccessFlags(logs);
                     }
                 }
@@ -1244,6 +1245,18 @@ namespace das {
             }
             return program;
         }
+    }
+
+    ProgramPtr parseDaScript ( const string & fileName, const string & moduleName,
+                              const FileAccessPtr & access, TextWriter & logs, ModuleGroup & libGroup,
+                              bool exportAll, bool isDep, CodeOfPolicies policies ) {
+        return parseDaScriptEx(fileName, moduleName, access, logs, libGroup, exportAll, isDep, policies, true);
+    }
+
+    ProgramPtr parseDaScriptNoInfer ( const string & fileName, const string & moduleName,
+                                     const FileAccessPtr & access, TextWriter & logs, ModuleGroup & libGroup,
+                                     bool exportAll, bool isDep, CodeOfPolicies policies ) {
+        return parseDaScriptEx(fileName, moduleName, access, logs, libGroup, exportAll, isDep, policies, false);
     }
 
     bool addExtraDependency(
@@ -1374,15 +1387,11 @@ namespace das {
             size_t len_at = serializer_write->buffer->writingSize();
             *serializer_write << payload_size;
             size_t payload_start = serializer_write->buffer->writingSize();
-            if ( program->thisModule && program->thisModule->name.empty() )  {
-                serializer_write->serializeProgram(program, libGroup);
-            } else if ( program->thisModule.get() == thisModule ) {
-                // the ENTRY program still owns its module (dependency programs released
-                // theirs in addNewModules) - re-attaching via reset(get()) would delete
-                // the module and leave a dangling pointer
+            if ( program->thisModule )  {
+                // the program owns its module (entry script) - write as is, never mutate it
                 serializer_write->serializeProgram(program, libGroup);
             } else {
-                // set thisModule to program
+                // module was moved into the group by addNewModules - reattach for the write
                 program->thisModule.reset(thisModule);
                 serializer_write->serializeProgram(program, libGroup);
                 program->thisModule.release();
@@ -1392,7 +1401,7 @@ namespace das {
         }
     }
 
-    void addRttiRequireVariable ( ProgramPtr res, string fileName ) {
+    void addRttiRequireVariable ( ProgramPtr res, string fileName, const LineInfo & at ) {
         TextWriter ss;
         for ( const auto & arq : res->allRequireDecl ) {
             ss << get<1>(arq) << " ";
@@ -1400,9 +1409,10 @@ namespace das {
         ss << fileName;
         auto rtti_require = new Variable();
         rtti_require->name = "__rtti_require";
-        rtti_require->type = new TypeDecl(Type::tString);
-        rtti_require->init = new ExprConstString(ss.str());
-        rtti_require->init->type = new TypeDecl(Type::tString);
+        rtti_require->at = at;
+        rtti_require->type = new TypeDecl(Type::tString, at);
+        rtti_require->init = new ExprConstString(at, ss.str());
+        rtti_require->init->type = new TypeDecl(Type::tString, at);
         rtti_require->used = true;
         rtti_require->private_variable = true;
         res->thisModule->addVariable(rtti_require);
@@ -1606,6 +1616,67 @@ namespace das {
         logs << "module dependency graph:\n" << tw.str();
     }
 
+    ProgramPtr parseDaScriptWithPrerequisits ( const string & fileName,
+                                              const FileAccessPtr & access,
+                                              TextWriter & logs,
+                                              ModuleGroup & libGroup,
+                                              CodeOfPolicies policies ) {
+        verifyCodeOfPoliciesStamp(policies);
+        ReuseCacheGuard rcg;
+        vector<ModuleInfo> req;
+        vector<MissingRecord> missing;
+        vector<RequireRecord> circular, notAllowed;
+        vector<FileInfo *> chain;
+        das_set<string> dependencies;
+        das_hash_map<string, NamelessModuleReq> namelessReq;
+        vector<NamelessMismatch> namelessMismatches;
+        string modName;
+        if ( !addExtraDependency("builtin", get_builtin_path(), missing, circular, notAllowed, req,
+                dependencies, namelessReq, namelessMismatches, access, libGroup, policies, &logs) ) {
+            auto res = make_smart<Program>();
+            res->error("internal error: failed to build builtin.das", logs.str(), "", LineInfo(),
+                CompilationError::internal_module);
+            return res;
+        }
+        for ( const auto & em : access->getExtraModules() ) {
+            addExtraDependency(em.first, em.second, missing, circular, notAllowed, req, dependencies,
+                namelessReq, namelessMismatches, access, libGroup, policies, &logs);
+        }
+        if ( !getPrerequisits(fileName, access, modName, req, missing, circular, notAllowed, chain,
+                dependencies, namelessReq, namelessMismatches, libGroup, nullptr, 1, !policies.ignore_shared_modules) ) {
+            req.clear();
+            missing.clear();
+            circular.clear();
+            notAllowed.clear();
+            dependencies.clear();
+            namelessReq.clear();
+            namelessMismatches.clear();
+            return reportPrerequisitesErrors(fileName, missing, circular, notAllowed,
+                req, dependencies, namelessReq, namelessMismatches, access, libGroup, policies);
+        }
+        if ( !verifyModuleNamesUnique(req, logs) ) {
+            auto res = make_smart<Program>();
+            res->error("Several modules with invalid names", logs.str(), "", LineInfo(),
+                CompilationError::already_declared_module);
+            return res;
+        }
+        for ( auto & mod : req ) {
+            if ( libGroup.findModule(mod.moduleName) ) continue;
+            auto depProgram = parseDaScript(mod.fileName, mod.moduleName, access, logs, libGroup, true, true, policies);
+            if ( !depProgram ) continue;
+            policies.threadlock_context |= depProgram->options.getBoolOption("threadlock_context", false);
+            if ( depProgram->failed() ) return depProgram;
+            if ( depProgram->thisModule->name.empty() ) {
+                depProgram->library.renameModule(depProgram->thisModule.get(), mod.moduleName);
+                depProgram->thisModule->wasParsedNameless = true;
+            }
+            depProgram->thisModule->fileName = mod.fileName;
+            depProgram->thisModule->fromExtraDependency = mod.extraDepModule;
+            addNewModules(libGroup, depProgram);
+        }
+        return parseDaScriptNoInfer(fileName, modName, access, logs, libGroup, policies.export_all, false, policies);
+    }
+
     ProgramPtr compileDaScript ( const string & fileName,
                                 const FileAccessPtr & access,
                                 TextWriter & logs,
@@ -1737,7 +1808,7 @@ namespace das {
                 if (!res->failed())
                     res->markExecutableSymbolUse();
                 if (res->getDebugger())
-                    addRttiRequireVariable(res, fileName);
+                    addRttiRequireVariable(res, fileName, LineInfo(access->getFileInfo(fileName), 1, 1, 1, 1));
                 if (!res->failed() && !exportAll)
                     res->removeUnusedSymbols();
                 if (!res->failed())

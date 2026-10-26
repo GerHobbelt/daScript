@@ -523,19 +523,15 @@ input and can be invoked at numerous passes:
         def abstract apply(prog : ProgramPtr; mod : Module?) : bool
     }
 
-Seven annotations control when a pass macro runs:
+Six annotations control when a pass macro runs:
 
 - ``[infer_macro]`` — after clean type inference.  Returning ``true`` re-infers.
 - ``[dirty_infer_macro]`` — during each dirty inference pass.
-- ``[pre_infer_macro]`` — before each inference pass, on the not-yet-inferred tree.
-  Override ``canVisitPass(prog, mod, index)`` and return ``false`` to skip a pass;
-  ``index`` is the pass number within the current inference run, 0 after every
-  (re)start.
-- ``[post_infer_macro]`` — once inference is finished, before the tree is consumed
-  (access flags, lint, each optimisation round).
+- ``[optimization_macro]`` — during the optimisation loop.
+- ``[post_rewrite_macro]`` — right after any user macro of the three kinds above
+  reported ``true``, i.e. on the tree that macro just rewrote.
 - ``[lint_macro]`` — after successful compilation (lint phase, read-only).
 - ``[global_lint_macro]`` — same as ``[lint_macro]`` but for all modules.
-- ``[optimization_macro]`` — during the optimisation loop.
 
 ``make_pass_macro`` registers a class as a pass macro.
 
@@ -834,8 +830,9 @@ node. Reach for it first, not last::
 That form re-checks before every inference pass, so a break is caught on the
 pass right after it happens, and after inference it sweeps every module on each
 firing. ``--ast-verify-batch`` is the CI gate form for many files: no pre-infer
-checks, and after inference only the module being compiled is checked - the
-tree handed to lint, folding and codegen is valid, at a fraction of the cost.
+checks, and the module being compiled is walked once, right after inference -
+so the tree handed to lint, folding and codegen is valid, at a fraction of the
+cost.
 
 Without it, a macro that leaves a variable untyped crashes:
 

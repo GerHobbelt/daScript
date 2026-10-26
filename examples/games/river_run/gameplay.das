@@ -17,7 +17,10 @@ def spawn_trail(origin, color : float3) {
             max_life = TRAIL_LIFETIME,
             size = BULLET_SIZE * 1.1,
             spin_speed = 0.0,
-            spin_phase = 0.0
+            spin_phase = 0.0,
+            kind = ParticleKind.trail,
+            drag = 0.0,
+            gravity = 0.0
         ))
     }
 }
@@ -43,29 +46,147 @@ def spawn_pickup_burst(origin, color : float3) {
         p.size = random_range(0.06, 0.14)
         p.spin_speed = random_range(-15.0, 15.0)
         p.spin_phase = random_f() * 2.0 * PI
+        p.kind = ParticleKind.ember
+        p.drag = 2.2
+        p.gravity = 5.0
     }
 }
 
-def spawn_particles(origin, color : float3; object_radius : float; count : int) {
+// --- Explosions -------------------------------------------------------------
+//
+// One blast is six layers, each with its own lifetime, motion and blend mode:
+// a single white flash at the instant of the hit, a handful of fireballs that
+// expand and cool, embers that arc under gravity, smoke that rises and outlives
+// everything, solid debris, and a flat shockwave ring across the water. The
+// layering is what turns "boxes flying" into an explosion; no single layer
+// carries it alone.
+
+def private spawn_flash(origin : float3; radius : float) {
+    create_entities`Particle(1) $(_eid : EntityId; _i : int; var p : Particle) {
+        p.pos = origin
+        p.vel = float3(0.0)
+        p.color = float3(1.0, 0.96, 0.86)
+        p.lifetime = 0.075
+        p.max_life = p.lifetime
+        p.size = radius * 0.75
+        p.spin_speed = 0.0
+        p.spin_phase = 0.0
+        p.kind = ParticleKind.flash
+        p.drag = 0.0
+        p.gravity = 0.0
+    }
+}
+
+def private spawn_fireballs(origin, color : float3; radius : float; count : int) {
     create_entities`Particle(count) $(_eid : EntityId; _i : int; var p : Particle) {
         let angle = random_f() * 2.0 * PI
-        let r = max(object_radius, 0.18)
-        let local = float3(
-            random_range(-r, r),
-            random_range(-r, r),
-            random_range(-r * 0.35, r * 0.35)
-        )
-        let away = normalize(local + float3(cos(angle) * 0.35, sin(angle) * 0.35, random_range(-0.25, 0.25)))
-        let speed = random_range(2.0, 6.5) * (0.7 + r * 0.5)
-        p.pos = origin + local
-        p.vel = away * speed + float3(0.0, 0.0, random_range(0.8, 2.8))
+        let elev = random_range(-0.2, 0.9)
+        let dir = normalize(float3(cos(angle), sin(angle), elev))
+        p.pos = origin + dir * random_range(0.0, radius * 0.55)
+        p.vel = dir * random_range(0.6, 2.6) + float3(0.0, 0.0, random_range(0.4, 1.6))
         p.color = color
-        p.lifetime = random_range(PARTICLE_LIFETIME * 0.65, PARTICLE_LIFETIME * 1.25)
+        p.lifetime = random_range(0.26, 0.46)
         p.max_life = p.lifetime
-        p.size = random_range(0.07, 0.26) * (0.7 + r * 0.55)
+        p.size = radius * random_range(0.22, 0.46)
+        p.spin_speed = 0.0
+        p.spin_phase = random_f() * 2.0 * PI
+        p.kind = ParticleKind.fire
+        p.drag = 3.4
+        p.gravity = -1.2   // hot gas rises
+    }
+}
+
+def private spawn_embers(origin, color : float3; radius : float; count : int) {
+    create_entities`Particle(count) $(_eid : EntityId; _i : int; var p : Particle) {
+        let angle = random_f() * 2.0 * PI
+        let elev = random_range(0.1, 1.5)
+        let dir = normalize(float3(cos(angle), sin(angle), elev))
+        p.pos = origin + dir * radius * 0.3
+        p.vel = dir * random_range(5.0, 15.0) * (0.6 + radius * 0.4)
+        p.color = color
+        p.lifetime = random_range(0.45, 1.15)
+        p.max_life = p.lifetime
+        p.size = random_range(0.035, 0.085)
+        p.spin_speed = 0.0
+        p.spin_phase = 0.0
+        p.kind = ParticleKind.ember
+        p.drag = 1.1
+        p.gravity = 9.5
+    }
+}
+
+def private spawn_smoke(origin : float3; radius : float; count : int) {
+    create_entities`Particle(count) $(_eid : EntityId; _i : int; var p : Particle) {
+        let angle = random_f() * 2.0 * PI
+        let dir = float3(cos(angle), sin(angle), 0.0)
+        p.pos = origin + dir * random_range(0.0, radius * 0.7) + float3(0.0, 0.0, random_range(0.0, radius * 0.4))
+        p.vel = dir * random_range(0.4, 1.6) + float3(0.0, 0.0, random_range(1.1, 2.6))
+        // Smoke takes the section's fog colour so it sits in the same air as
+        // the rest of the scene instead of reading as a grey decal.
+        p.color = lerp(float3(0.10, 0.09, 0.09), env_now.fog_color, 0.35)
+        p.lifetime = random_range(1.3, 2.4)
+        p.max_life = p.lifetime
+        p.size = radius * random_range(0.24, 0.46)
+        p.spin_speed = random_range(-1.2, 1.2)
+        p.spin_phase = random_f() * 2.0 * PI
+        p.kind = ParticleKind.smoke
+        p.drag = 1.5
+        p.gravity = -0.7
+    }
+}
+
+def private spawn_debris(origin, color : float3; radius : float; count : int) {
+    create_entities`Particle(count) $(_eid : EntityId; _i : int; var p : Particle) {
+        let angle = random_f() * 2.0 * PI
+        let elev = random_range(0.05, 1.1)
+        let dir = normalize(float3(cos(angle), sin(angle), elev))
+        p.pos = origin + dir * radius * 0.4
+        p.vel = dir * random_range(3.0, 9.0) * (0.7 + radius * 0.4)
+        p.color = color
+        p.lifetime = random_range(0.6, 1.25)
+        p.max_life = p.lifetime
+        p.size = random_range(0.035, 0.10) * (0.7 + radius * 0.4)
         p.spin_speed = random_range(-13.0, 13.0)
         p.spin_phase = random_f() * 2.0 * PI
+        p.kind = ParticleKind.debris
+        p.drag = 0.55
+        p.gravity = 11.0
     }
+}
+
+def private spawn_shockwave(origin : float3; radius : float) {
+    create_entities`Particle(1) $(_eid : EntityId; _i : int; var p : Particle) {
+        // Pinned just above the water so the ring reads as a surface wave
+        // rather than a sphere seen edge-on.
+        p.pos = float3(origin.x, origin.y, 0.06)
+        p.vel = float3(0.0)
+        p.color = float3(1.0, 0.92, 0.75)
+        p.lifetime = 0.5
+        p.max_life = p.lifetime
+        p.size = radius * 3.0
+        p.spin_speed = 0.0
+        p.spin_phase = 0.0
+        p.kind = ParticleKind.shock
+        p.drag = 0.0
+        p.gravity = 0.0
+    }
+}
+
+// `scale` drives the whole blast: 1.0 is a boat, ~1.8 a fuel depot, and the
+// player's own death runs at 2.2 so losing a life lands as an event.
+def spawn_explosion(origin, color : float3; object_radius, scale : float) {
+    let r = max(object_radius, 0.35) * scale
+    spawn_flash(origin, r)
+    spawn_fireballs(origin, color, r, int(3.0 + 3.0 * scale))
+    spawn_embers(origin, lerp(color, float3(1.0, 0.85, 0.45), 0.5), r, int(10.0 + 12.0 * scale))
+    spawn_smoke(origin, r, int(3.0 + 4.0 * scale))
+    spawn_debris(origin, color * 0.55, r, int(4.0 + 5.0 * scale))
+    spawn_shockwave(origin, r)
+}
+
+// Small sparks with no fireball -- bullet impacts and ricochets.
+def spawn_particles(origin, color : float3; object_radius : float; count : int) {
+    spawn_embers(origin, color, max(object_radius, 0.18), count)
 }
 
 def spawn_enemy_boat(pos : float3) {
@@ -161,23 +282,79 @@ def spawn_island(pos : float3) {
     }
 }
 
-def spawn_river_tree(pos : float3; size : float; tiers : int; green_tint, green_shift, trunk_ratio : float) {
+// Pick what grows here. Reeds only make sense at the waterline, boulders and
+// bushes fill the near bank, and the taller silhouettes go further back -- which
+// is also how a real bank stacks up from the water.
+def flora_kind_for(shore_dist : float) : int {
+    let r = random_f()
+    if (shore_dist < 2.6) {
+        return (r < 0.62 ? FLORA_REEDS : (r < 0.85 ? FLORA_BUSH : FLORA_ROCK))
+    }
+    if (shore_dist < 7.0) {
+        if (r < 0.30) { return FLORA_BUSH; }
+        if (r < 0.46) { return FLORA_ROCK; }
+        if (r < 0.72) { return FLORA_BROADLEAF; }
+        if (r < 0.86) { return FLORA_CONIFER; }
+        return FLORA_DEAD
+    }
+    if (r < 0.42) { return FLORA_CONIFER; }
+    if (r < 0.70) { return FLORA_BROADLEAF; }
+    if (r < 0.82) { return FLORA_BUSH; }
+    if (r < 0.92) { return FLORA_ROCK; }
+    return FLORA_DEAD
+}
+
+def spawn_flora(pos : float3; kind : int; size : float) {
+    var ground = terrain_height(pos.x, pos.y)
+    for (dx in fixed_array(-size * 0.4, size * 0.4)) {
+        ground = max(ground, terrain_height(pos.x + dx, pos.y))
+    }
+    let grounded = float3(pos.x, pos.y, ground)
     create_entity() @(eid, cmp) {
         apply_decs_template(cmp, RiverTree(
-            pos = pos,
+            pos = grounded,
+            size = size,
+            tiers = 3,
+            green_tint = random_f(),
+            green_shift = random_range(-0.12, 0.12),
+            trunk_ratio = 0.35,
+            kind = kind,
+            seed = int(random_f() * 1000.0),
+            yaw = random_f() * 2.0 * PI
+        ))
+    }
+}
+
+def spawn_river_tree(pos : float3; size : float; tiers : int; green_tint, green_shift, trunk_ratio : float) {
+    let grounded = float3(pos.x, pos.y, terrain_height(pos.x, pos.y))
+    create_entity() @(eid, cmp) {
+        apply_decs_template(cmp, RiverTree(
+            pos = grounded,
             size = size,
             tiers = tiers,
             green_tint = green_tint,
             green_shift = green_shift,
-            trunk_ratio = trunk_ratio
+            trunk_ratio = trunk_ratio,
+            kind = FLORA_CONIFER,
+            seed = int(random_f() * 1000.0),
+            yaw = random_f() * 2.0 * PI
         ))
     }
 }
 
 def spawn_river_house(pos : float3; size, body_tint, roof_tint : float) {
+    // Sample the footprint corners and stand on the highest one, so a house on
+    // a slope rests on the ground instead of being half-buried by it.
+    var ground = terrain_height(pos.x, pos.y)
+    for (dx in fixed_array(-size, size)) {
+        for (dy in fixed_array(-size, size)) {
+            ground = max(ground, terrain_height(pos.x + dx, pos.y + dy))
+        }
+    }
+    let grounded = float3(pos.x, pos.y, ground)
     create_entity() @(eid, cmp) {
         apply_decs_template(cmp, RiverHouse(
-            pos = pos,
+            pos = grounded,
             size = size,
             body_tint = body_tint,
             roof_tint = roof_tint
@@ -268,24 +445,33 @@ def spawn_section_islands(base_y, section_mult : float) {
 }
 
 // River-side trees — denser and varied.
+// Bank dressing. The old pass scattered ~12 conifers over a 240m section, which
+// is why the banks read as empty fields with the occasional lollipop. This one
+// plants roughly six times as much and draws from the whole flora vocabulary,
+// clustered rather than evenly sprinkled -- real banks come in thickets with
+// gaps between them, not in a uniform scatter.
 def spawn_section_trees(base_y : float) {
-    let tree_attempts = int(18.0 + random_f() * 9.0)
-    for (_i in range(tree_attempts)) {
-        if (random_f() > 0.52) {
-            continue
-        }
-        let ty = base_y + random_range(8.0, SECTION_LENGTH - 8.0)
-        let seg = sample_river_segment(ty)
+    let clumps = int(26.0 + random_f() * 12.0)
+    for (_c in range(clumps)) {
+        let cy = base_y + random_range(6.0, SECTION_LENGTH - 6.0)
         let left_side = random_f() < 0.5
-        let bank_x = (left_side ? seg.left_bank_x : seg.right_bank_x)
-        let away = (random_f() < 0.32 ? random_range(5.2, 10.0) : random_range(1.4, 5.2))
-        let tx = bank_x + (left_side ? -away : away)
-        let tsize = random_range(0.9, 2.1)
-        let tiers = (random_f() < 0.48 ? 2 : 3)
-        let tint = random_range(0.25, 1.0)
-        let shift = random_range(-0.08, 0.08)
-        let trunk = random_range(0.35, 0.55)
-        spawn_river_tree(float3(tx, ty, 0.0), tsize, tiers, tint, shift, trunk)
+        let members = 1 + int(random_f() * 4.0)
+        for (_m in range(members)) {
+            let ty = cy + random_range(-4.5, 4.5)
+            let seg = sample_river_segment(ty)
+            let bank_x = (left_side ? seg.left_bank_x : seg.right_bank_x)
+            // Distance inland, biased toward the waterline where the eye is.
+            let r = random_f()
+            let away = (r < 0.30 ? random_range(0.2, 2.6)
+                : (r < 0.72 ? random_range(2.6, 7.0) : random_range(7.0, 16.0)))
+            let tx = bank_x + (left_side ? -away : away)
+            let kind = flora_kind_for(away)
+            let base_size = (kind == FLORA_REEDS ? random_range(0.8, 1.4)
+                : (kind == FLORA_BUSH ? random_range(0.7, 1.2)
+                : (kind == FLORA_ROCK ? random_range(0.35, 0.95)
+                : random_range(0.95, 2.2))))
+            spawn_flora(float3(tx, ty, 0.0), kind, base_size)
+        }
     }
     commit()
 }
@@ -471,13 +657,7 @@ def reset_game() {
     slow_mo_timer = 0.0
     low_fuel_beep_timer = 0.0
     refuel_sound_timer = 0.0
-    river_color_from = section_colors[0]
-    river_color_to   = section_colors[0]
-    bank_color_from  = bank_colors[0]
-    bank_color_to    = bank_colors[0]
-    fog_color_from   = fog_colors[0]
-    fog_color_to     = fog_colors[0]
-    section_color_blend_t = 1.0
+    set_env_immediate(0)
 
     global_rng_seed = uint(get_uptime() * 1000.0)
     init_river()
@@ -579,15 +759,22 @@ def update_player_movement() {
     }
 
     // Fuel
-    player_fuel = max(player_fuel - PLAYER_FUEL_DRAIN * tick_dt, 0.0)
+    if (!god_mode) {
+        player_fuel = max(player_fuel - PLAYER_FUEL_DRAIN * tick_dt, 0.0)
+    }
     if (player_fuel <= 0.0 && player_respawn_timer <= 0.0) {
         on_player_killed()
     }
 }
 
 def on_player_killed() {
+    if (god_mode) {
+        player_invuln_timer = max(player_invuln_timer, PLAYER_INVULN_TIME)
+        player_fuel = PLAYER_FUEL_MAX
+        return
+    }
     player_lives--
-    spawn_particles(player_pos, float3(1.0, 0.5, 0.2), PLAYER_SIZE * 2.6, 34)
+    spawn_explosion(player_pos, float3(1.0, 0.55, 0.18), PLAYER_SIZE * 2.6, 2.2)
     play_sfx(snd_player_hit)
     add_screen_shake(SHAKE_MED)
     if (player_lives > 0) {
@@ -644,7 +831,12 @@ def update_section() {
 
     section_dist += player_fwd_speed * tick_dt
     section_banner_timer = max(section_banner_timer - tick_dt, 0.0)
-    section_color_blend_t = min(section_color_blend_t + tick_dt * 0.7, 1.0)
+    if (section_color_blend_t < 1.0) {
+        // The whole lighting environment crossfades, not just the water tint,
+        // so a section change reads as flying into different weather.
+        section_color_blend_t = min(section_color_blend_t + tick_dt * 0.35, 1.0)
+        refresh_env()
+    }
 
     if (section_dist >= SECTION_LENGTH) {
         section_dist -= SECTION_LENGTH
@@ -652,14 +844,7 @@ def update_section() {
         section_banner_timer = WAVE_BANNER_DURATION
         play_sfx(snd_section_clear)
         score += 500 * (current_section)
-    // Start smooth color transition to new section palette
-    river_color_from = get_river_color()
-    bank_color_from  = get_bank_color()
-    fog_color_from   = get_fog_color()
-    river_color_to   = section_colors[section_idx()]
-    bank_color_to    = bank_colors[section_idx()]
-    fog_color_to     = fog_colors[section_idx()]
-    section_color_blend_t = 0.0
+        begin_env_transition(section_idx())
 
         if (current_section >= MAX_SECTIONS) {
             game_state = GameState.win_state
@@ -828,15 +1013,36 @@ def update_bullets() {
 }
 
 // Age out particles
-def age_out_particles() {
+def step_particles(dt : float) {
     query() $(eid : EntityId; var p : Particle) {
-        p.lifetime -= tick_dt
-        p.pos += p.vel * tick_dt
+        p.lifetime -= dt
+        // Drag and gravity ride on the particle, so one integrator covers
+        // rising smoke, arcing embers and tumbling debris. A negative gravity
+        // is buoyancy: that is how the hot layers climb.
+        if (p.drag > 0.0) {
+            p.vel *= max(1.0 - p.drag * dt, 0.0)
+        }
+        if (p.gravity != 0.0) {
+            p.vel.z -= p.gravity * dt
+        }
+        p.pos += p.vel * dt
+        // Debris that reaches the water stops there and skids out.
+        if (p.kind == ParticleKind.debris && p.pos.z < 0.05) {
+            p.pos.z = 0.05
+            p.vel = float3(p.vel.x * 0.4, p.vel.y * 0.4, 0.0)
+        }
         if (p.lifetime <= 0.0) {
             delete_entity(eid)
         }
     }
     commit()
+}
+
+def age_out_particles() {
+    if (fx_freeze) {
+        return
+    }
+    step_particles(tick_dt)
 }
 
 // --- Culling: remove entities far behind player ---
@@ -1096,13 +1302,12 @@ def on_enemy_destroyed(h : EnemyHitInfo; is_depot : bool) {
         return false
     }
     if (is_depot) {
-        let c1 = int(24.0 + h.blast_radius * 15.0)
-        let c2 = int(14.0 + h.blast_radius * 10.0)
-        spawn_particles(h.pos, float3(1.0, 0.5, 0.05), h.blast_radius * 1.2, c1)
-        spawn_particles(h.pos + float3(0.0, 0.0, 1.0), float3(0.9, 0.2, 0.0), h.blast_radius * 0.8, c2)
+        // A depot goes up twice: the tank at deck level, then a second bloom
+        // above it a beat later.
+        spawn_explosion(h.pos, float3(1.0, 0.52, 0.06), h.blast_radius * 1.2, 1.8)
+        spawn_explosion(h.pos + float3(0.0, 0.0, 1.1), float3(0.95, 0.28, 0.02), h.blast_radius * 0.8, 1.2)
     } else {
-        let c = int(10.0 + h.blast_radius * 12.0)
-        spawn_particles(h.pos, float3(1.0, 0.65, 0.1), h.blast_radius, c)
+        spawn_explosion(h.pos, float3(1.0, 0.66, 0.12), h.blast_radius, (is_bridge ? 1.6 : 1.0))
     }
     play_sfx(is_bridge ? snd_bridge_destroy : snd_enemy_explode)
     if (is_bridge) {
@@ -1268,120 +1473,156 @@ def quat_align_z(v : float3) : float4 {
     return float4(axis * sin(half), cos(half))
 }
 
-// --- Shadows ---
-// Flat shadow projection along LIGHT_DIR (matches phong lighting direction).
-// LIGHT_DIR = (0.4, -0.6, -1.0) — only x/z and y/z ratios matter for projection.
+// --- Model palettes ---
+//
+// Enemy factions share the player's meshes under different paint, which keeps
+// the vocabulary readable: silhouette says what it is, colour says whose it is.
 
-let SHADOW_Z = 0.02
-let SHADOW_OFFSET_X = 0.4
-let SHADOW_OFFSET_Y = -0.6
-
-def shadow_pos(p : float3) : float3 {
-    return float3(p.x + p.z * SHADOW_OFFSET_X, p.y + p.z * SHADOW_OFFSET_Y, SHADOW_Z)
-}
-
-def draw_shadow(pos : float3; sx, sy, alpha : float; round : bool) {
-    v_model = compose(shadow_pos(pos), float4(0.0, 0.0, 0.0, 1.0), float3(sx, sy, 0.001))
-    f_Color = float4(0.0, 0.0, 0.0, alpha)
-    vs_flat_bind_uniform(active_program)
-    fs_flat_bind_uniform(active_program)
-    if (round) {
-        geo_cylinder |> draw_geometry_fragment()
-    } else {
-        geo_cube |> draw_geometry_fragment()
-    }
-}
-
-// Shadow streak for a vertical pillar standing on the water (base at z=0).
-// Anchors at base XY and stretches along LIGHT_DIR projection so the shadow
-// visibly connects to the foot of the pillar.
-def draw_pillar_shadow(base_x, base_y : float; height, half_thickness, alpha : float) {
-    let dx = height * SHADOW_OFFSET_X
-    let dy = height * SHADOW_OFFSET_Y
-    let cx = base_x + dx * 0.5
-    let cy = base_y + dy * 0.5
-    let len = sqrt(dx * dx + dy * dy)
-    let angle = atan2(dy, dx)
-    v_model = compose(
-        float3(cx, cy, SHADOW_Z),
-        quat_z_rot(angle),
-        float3(len * 0.5, half_thickness, 0.001)
+def private player_palette(inv : bool; pulse : float) {
+    let base = (inv ? float3(1.0, 0.86, 0.35) : float3(0.72, 0.80, 0.88))
+    set_model_palette(
+        base * pulse,
+        float3(0.16, 0.30, 0.38),
+        float3(0.52, 0.56, 0.60),
+        float3(0.10, 0.12, 0.14)
     )
-    f_Color = float4(0.0, 0.0, 0.0, alpha)
-    vs_flat_bind_uniform(active_program)
-    fs_flat_bind_uniform(active_program)
-    geo_cube |> draw_geometry_fragment()
 }
 
-def render_shadows(game_time : float) {
-    glUseProgram(flat_program)
-    active_program = flat_program
-    glEnable(GL_BLEND)
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-    glDepthMask(false)
+def private enemy_heli_palette() {
+    set_model_palette(
+        float3(0.52, 0.14, 0.10),
+        float3(0.14, 0.10, 0.10),
+        float3(0.40, 0.38, 0.36),
+        float3(0.08, 0.07, 0.07)
+    )
+}
 
-    if (player_respawn_timer < PLAYER_RESPAWN_BLINK) {
-        let blinking = player_respawn_timer > 0.0
-        if (!blinking || int(game_time * 16.0) % 2 != 0) {
-            draw_shadow(player_pos, PLAYER_SIZE * 0.95, PLAYER_SIZE * 0.95, 0.55, true)
-        }
+def private boat_palette() {
+    set_model_palette(
+        float3(0.28, 0.30, 0.27),
+        float3(0.46, 0.42, 0.30),
+        float3(0.48, 0.47, 0.45),
+        float3(0.09, 0.10, 0.11)
+    )
+}
+
+def private jet_palette() {
+    set_model_palette(
+        float3(0.40, 0.42, 0.47),
+        float3(0.14, 0.18, 0.22),
+        float3(0.55, 0.55, 0.58),
+        float3(0.08, 0.08, 0.09)
+    )
+}
+
+// Craft bank into a turn. Purely cosmetic, but it is most of what makes the
+// helicopter feel like it is being flown rather than slid.
+def private player_orientation() : float4 {
+    let roll = clamp(-player_vel.x * 0.075, -0.55, 0.55)
+    let pitch = clamp((player_fwd_speed - PLAYER_FWD_SPEED_MIN) * 0.018, 0.0, 0.22)
+    return quat_mul(quat_y_rot(roll), quat_x_rot(-pitch))
+}
+
+// --- Shadow map pass ---
+//
+// Everything solid re-draws into the light's depth buffer. The old fake blob
+// shadows are gone: props now shade each other and the banks.
+
+// Aircraft and boats: the movers, whose shadows track the action.
+def private shadow_cast_craft() {
+    if (player_respawn_timer <= PLAYER_RESPAWN_BLINK) {
+        draw_shadow_caster(player_pos, float3(PLAYER_SIZE * 1.85), player_orientation())
+        geo_heli |> draw_geometry_fragment()
     }
 
     query() $(b : EnemyBoat) {
-        draw_shadow(b.pos, BOAT_SIZE * 0.65, BOAT_SIZE * 1.65, 0.45, false)
+        draw_shadow_caster(b.pos, float3(BOAT_SIZE * 1.25), quat_z_rot(b.patrol_dir * 0.12))
+        geo_gunboat |> draw_geometry_fragment()
     }
 
     query() $(p : EnemyPlane) {
-        draw_shadow(p.pos, PLANE_SIZE * 1.5, PLANE_SIZE * 0.65, 0.45, true)
+        draw_shadow_caster(p.pos, float3(PLANE_SIZE * 1.35))
+        geo_jet |> draw_geometry_fragment()
     }
 
     query() $(h : EnemyHelicopter) {
-        draw_shadow(h.pos, ENEMY_HELI_SIZE * 1.25, ENEMY_HELI_SIZE * 1.25, 0.5, true)
+        draw_shadow_caster(h.pos, float3(ENEMY_HELI_SIZE * 1.7), quat_y_rot(sin(h.hover_phase) * 0.2))
+        geo_heli |> draw_geometry_fragment()
     }
 
-    query() $(b : BonusPickup) {
-        let bob = sin(game_time * BONUS_BOB_SPEED + b.bob_phase) * BONUS_BOB_AMPLITUDE
-        draw_shadow(b.pos + float3(0.0, 0.0, 0.55 + bob), 0.32, 0.32, 0.5, true)
-    }
+}
 
+// Bank scenery: trees and houses, which throw the long streaks across the
+// ground that give the low sun its scale.
+def private shadow_cast_scenery() {
+    let per_kind = max(length(geo_flora) / FLORA_VARIANTS, 1)
     query() $(t : RiverTree) {
-        let r = t.size * 0.6
-        draw_shadow(t.pos + float3(0.0, 0.0, t.size * 0.7), r, r, 0.5, true)
+        if (empty(geo_flora)) { return ; }
+        draw_shadow_caster(t.pos, float3(t.size), quat_z_rot(t.yaw))
+        let idx = clamp(t.kind, 0, FLORA_VARIANTS - 1) * per_kind + (t.seed % per_kind)
+        geo_flora[clamp(idx, 0, length(geo_flora) - 1)] |> draw_geometry_fragment()
     }
 
     query() $(h : RiverHouse) {
-        // Project from near top of body so shadow extends past the building
-        // footprint instead of being eaten by the body it's under.
-        draw_shadow(h.pos + float3(0.0, 0.0, h.size * 1.0),
-            h.size * 0.85, h.size * 1.05, 0.5, false)
+        let body_h = h.size
+        draw_shadow_caster(h.pos + float3(0.0, 0.0, body_h * 0.5),
+            float3(h.size * 0.95, h.size * 1.1, body_h * 0.5))
+        geo_cube |> draw_geometry_fragment()
+        draw_shadow_caster(h.pos + float3(0.0, 0.0, body_h + h.size * 0.25),
+            float3(h.size * 1.05, h.size * 1.18, h.size * 0.55))
+        geo_prism |> draw_geometry_fragment()
+    }
+
+}
+
+// Obstacles standing in the water.
+def private shadow_cast_obstacles() {
+    query() $(isle : Island) {
+        draw_shadow_caster(isle.pos, float3(isle.size, isle.size, isle.size * 0.35))
+        geo_sphere |> draw_geometry_fragment()
     }
 
     query() $(d : FuelDepot) {
-        draw_shadow(d.pos + float3(0.0, 0.0, FUEL_DEPOT_SIZE * 0.4),
-            FUEL_DEPOT_SIZE * 1.0, FUEL_DEPOT_SIZE * 1.8, 0.5, false)
+        draw_shadow_caster(d.pos, float3(FUEL_DEPOT_SIZE, FUEL_DEPOT_SIZE * 1.8, FUEL_DEPOT_SIZE * 0.25))
+        geo_cube |> draw_geometry_fragment()
+        draw_shadow_caster(d.pos + float3(0.0, 0.0, FUEL_DEPOT_SIZE * 0.9),
+            float3(0.14, 0.14, FUEL_DEPOT_SIZE * 0.9))
+        geo_cube |> draw_geometry_fragment()
     }
 
     query() $(br : Bridge) {
         let pylon_h = BRIDGE_SPAN_Z + 0.5
-        draw_pillar_shadow(br.left_x, br.pos.y, pylon_h, 0.22, 0.55)
-        draw_pillar_shadow(br.right_x, br.pos.y, pylon_h, 0.22, 0.55)
+        for (px in fixed_array(br.left_x, br.right_x)) {
+            draw_shadow_caster(float3(px, br.pos.y, pylon_h * 0.5), float3(0.4, 0.3, pylon_h))
+            geo_cube |> draw_geometry_fragment()
+        }
         let gap_left = br.gap_center_x - BRIDGE_GAP_WIDTH * 0.5
         let gap_right = br.gap_center_x + BRIDGE_GAP_WIDTH * 0.5
         let lw = gap_left - br.left_x
         if (lw > 0.1) {
-            let cx = (br.left_x + gap_left) * 0.5
-            draw_shadow(float3(cx, br.pos.y, BRIDGE_SPAN_Z), lw * 0.5, 0.35, 0.45, false)
+            draw_shadow_caster(float3((br.left_x + gap_left) * 0.5, br.pos.y, BRIDGE_SPAN_Z),
+                float3(lw * 0.5, 0.35, 0.25))
+            geo_cube |> draw_geometry_fragment()
         }
         let rw = br.right_x - gap_right
         if (rw > 0.1) {
-            let cx = (gap_right + br.right_x) * 0.5
-            draw_shadow(float3(cx, br.pos.y, BRIDGE_SPAN_Z), rw * 0.5, 0.35, 0.45, false)
+            draw_shadow_caster(float3((gap_right + br.right_x) * 0.5, br.pos.y, BRIDGE_SPAN_Z),
+                float3(rw * 0.5, 0.35, 0.25))
+            geo_cube |> draw_geometry_fragment()
         }
     }
-
-    glDepthMask(true)
-    glDisable(GL_BLEND)
 }
+
+def render_shadow_casters() {
+    glUseProgram(shadow_program)
+    active_program = shadow_program
+    render_river_shadow()
+    shadow_cast_craft()
+    shadow_cast_scenery()
+    shadow_cast_obstacles()
+}
+
+// --- Opaque scene ---
 
 def render_player(game_time : float) {
     if (player_respawn_timer > PLAYER_RESPAWN_BLINK) {
@@ -1392,313 +1633,523 @@ def render_player(game_time : float) {
         return
     }
     let inv = player_invuln_timer > 0.0
-    let pulse = (inv ? 0.7 + 0.3 * abs(sin(game_time * 8.0)) : 1.0)
-    let body_color = (inv ? float3(pulse, pulse * 0.8, 0.2) : float3(0.7, 0.85, 1.0))
+    let pulse = (inv ? 0.75 + 0.35 * abs(sin(game_time * 8.0)) : 1.0)
 
-    glUseProgram(phong_program)
-    active_program = phong_program
-
-    // Body sphere
-    draw_with_phong(player_pos, float3(PLAYER_SIZE), body_color)
-    geo_sphere |> draw_geometry_fragment()
+    use_prop_program()
+    player_palette(inv, pulse)
+    draw_prop(player_pos, float3(PLAYER_SIZE * 1.85), float3(1.0), player_orientation(), MAT_HULL)
+    geo_heli |> draw_geometry_fragment()
+    clear_model_palette()
 }
 
-def render_enemies() {
-    glUseProgram(phong_program)
-    active_program = phong_program
+def render_enemies(game_time : float) {
+    use_prop_program()
 
-    // Boats: elongated hull + small turret
     query() $(b : EnemyBoat) {
-        let hull_color = float3(0.6, 0.35, 0.15)
-        draw_with_phong(b.pos, float3(BOAT_SIZE * 0.6, BOAT_SIZE * 1.6, BOAT_SIZE * 0.5), hull_color)
-        geo_cube |> draw_geometry_fragment()
-        // Turret
-        let turret_pos = b.pos + float3(0.0, 0.0, BOAT_SIZE * 0.5)
-        draw_with_phong(turret_pos, float3(BOAT_SIZE * 0.3), float3(0.4, 0.2, 0.1))
-        geo_cube |> draw_geometry_fragment()
+        boat_palette()
+        // Heel the hull into its patrol direction and let it ride the swell.
+        let heel = quat_y_rot(b.patrol_dir * 0.14)
+        let bob = quat_x_rot(sin(game_time * 1.7 + b.pos.x) * 0.05)
+        draw_prop(b.pos, float3(BOAT_SIZE * 1.25), float3(1.0), quat_mul(heel, bob), MAT_HULL)
+        geo_gunboat |> draw_geometry_fragment()
     }
 
-    // Planes: sphere fuselage + wing cubes
     query() $(p : EnemyPlane) {
-        let body_color = float3(0.5, 0.5, 0.7)
-        draw_with_phong(p.pos, float3(PLANE_SIZE * 0.6), body_color)
-        geo_sphere |> draw_geometry_fragment()
-        // Wings
-        let wing_l = p.pos + float3(-PLANE_SIZE * 1.0, 0.0, 0.0)
-        let wing_r = p.pos + float3(PLANE_SIZE * 1.0, 0.0, 0.0)
-        draw_with_phong(wing_l, float3(PLANE_SIZE * 0.9, PLANE_SIZE * 0.25, PLANE_SIZE * 0.1), float3(0.45, 0.45, 0.65))
-        geo_cube |> draw_geometry_fragment()
-        draw_with_phong(wing_r, float3(PLANE_SIZE * 0.9, PLANE_SIZE * 0.25, PLANE_SIZE * 0.1), float3(0.45, 0.45, 0.65))
-        geo_cube |> draw_geometry_fragment()
+        jet_palette()
+        let bank = quat_y_rot(clamp(p.vel.x * 0.10, -0.5, 0.5))
+        draw_prop(p.pos, float3(PLANE_SIZE * 1.35), float3(1.0), bank, MAT_METAL)
+        geo_jet |> draw_geometry_fragment()
     }
 
-    // Enemy helis: sphere + rotor
     query() $(h : EnemyHelicopter) {
-        let enemy_color = float3(0.8, 0.25, 0.15)
-        draw_with_phong(h.pos, float3(ENEMY_HELI_SIZE), enemy_color)
-        geo_sphere |> draw_geometry_fragment()
-        // Rotor — transparent cross
+        enemy_heli_palette()
+        let drift = quat_y_rot(clamp((h.target_x - h.pos.x) * 0.06, -0.45, 0.45))
+        draw_prop(h.pos, float3(ENEMY_HELI_SIZE * 1.7), float3(1.0), drift, MAT_HULL)
+        geo_heli |> draw_geometry_fragment()
     }
+
+    clear_model_palette()
 }
 
 def render_obstacles(game_time : float) {
-    glDisable(GL_CULL_FACE)
-    glUseProgram(phong_program)
-    active_program = phong_program
+    use_prop_program()
     render_bridges()
     render_islands()
     render_fuel_depots(game_time)
     render_trees()
     render_houses()
     render_bonuses(game_time)
-    glEnable(GL_CULL_FACE)
 }
 
-// Bridges: two pylons + two half-spans
+// Bridges: two pylons + two half-spans, with a deck lip so the gap reads.
 def render_bridges() {
+    let pylon_color = float3(0.42, 0.40, 0.37)
+    let span_color = float3(0.50, 0.47, 0.43)
     query() $(br : Bridge) {
         let pylon_h = BRIDGE_SPAN_Z + 0.5
-        let pylon_color = float3(0.55, 0.5, 0.45)
-        let span_color = float3(0.6, 0.55, 0.5)
-
-        // Left pylon
-        let lp = float3(br.left_x, br.pos.y, pylon_h * 0.5)
-        draw_with_phong(lp, float3(0.4, 0.3, pylon_h), pylon_color)
-        geo_cube |> draw_geometry_fragment()
-
-        // Right pylon
-        let rp = float3(br.right_x, br.pos.y, pylon_h * 0.5)
-        draw_with_phong(rp, float3(0.4, 0.3, pylon_h), pylon_color)
-        geo_cube |> draw_geometry_fragment()
-
-        // Left half-span (from left pylon to gap left edge)
-        let gap_left = br.gap_center_x - BRIDGE_GAP_WIDTH * 0.5
-        let left_span_cx = (br.left_x + gap_left) * 0.5
-        let left_span_w = gap_left - br.left_x
-        if (left_span_w > 0.1) {
-            let sp = float3(left_span_cx, br.pos.y, BRIDGE_SPAN_Z)
-            draw_with_phong(sp, float3(left_span_w * 0.5, 0.35, 0.25), span_color)
+        for (px in fixed_array(br.left_x, br.right_x)) {
+            draw_prop(float3(px, br.pos.y, pylon_h * 0.5), float3(0.4, 0.3, pylon_h),
+                pylon_color, float4(0.0, 0.0, 0.0, 1.0), MAT_STONE, REFLECT_PAINT)
             geo_cube |> draw_geometry_fragment()
         }
 
-        // Right half-span (from gap right edge to right pylon)
+        let gap_left = br.gap_center_x - BRIDGE_GAP_WIDTH * 0.5
         let gap_right = br.gap_center_x + BRIDGE_GAP_WIDTH * 0.5
-        let right_span_cx = (gap_right + br.right_x) * 0.5
-        let right_span_w = br.right_x - gap_right
-        if (right_span_w > 0.1) {
-            let sp = float3(right_span_cx, br.pos.y, BRIDGE_SPAN_Z)
-            draw_with_phong(sp, float3(right_span_w * 0.5, 0.35, 0.25), span_color)
+        // Damage reads as the deck darkening and losing its highlight.
+        let wear = saturate(float(br.health) / float(BRIDGE_HEALTH_MAX))
+        let deck = span_color * (0.55 + wear * 0.45)
+
+        let lw = gap_left - br.left_x
+        if (lw > 0.1) {
+            let cx = (br.left_x + gap_left) * 0.5
+            draw_prop(float3(cx, br.pos.y, BRIDGE_SPAN_Z), float3(lw * 0.5, 0.35, 0.25),
+                deck, float4(0.0, 0.0, 0.0, 1.0), MAT_STONE)
+            geo_cube |> draw_geometry_fragment()
+            draw_prop(float3(cx, br.pos.y - 0.36, BRIDGE_SPAN_Z + 0.22),
+                float3(lw * 0.5, 0.05, 0.12), deck * 1.2, float4(0.0, 0.0, 0.0, 1.0), MAT_STONE)
+            geo_cube |> draw_geometry_fragment()
+        }
+        let rw = br.right_x - gap_right
+        if (rw > 0.1) {
+            let cx = (gap_right + br.right_x) * 0.5
+            draw_prop(float3(cx, br.pos.y, BRIDGE_SPAN_Z), float3(rw * 0.5, 0.35, 0.25),
+                deck, float4(0.0, 0.0, 0.0, 1.0), MAT_STONE)
+            geo_cube |> draw_geometry_fragment()
+            draw_prop(float3(cx, br.pos.y - 0.36, BRIDGE_SPAN_Z + 0.22),
+                float3(rw * 0.5, 0.05, 0.12), deck * 1.2, float4(0.0, 0.0, 0.0, 1.0), MAT_STONE)
             geo_cube |> draw_geometry_fragment()
         }
     }
 }
 
-// Islands: flattened sphere
+// Islands: a flattened dome, tinted with the section's bank colour so a rock in
+// the ash channel is not the same green as one in the forest.
 def render_islands() {
     query() $(isle : Island) {
-        let island_color = float3(0.3, 0.45, 0.2)
-        draw_with_phong(isle.pos, float3(isle.size, isle.size, isle.size * 0.3), island_color)
+        let island_color = get_bank_color() * 1.15 + float3(0.04)
+        draw_prop(isle.pos, float3(isle.size, isle.size, isle.size * 0.35), island_color,
+            float4(0.0, 0.0, 0.0, 1.0), MAT_STONE)
         geo_sphere |> draw_geometry_fragment()
     }
 }
 
-// Fuel depots: flat barge + tall beacon
+// Fuel depots: barge, tank, and a beacon that goes green while refuelling.
 def render_fuel_depots(game_time : float) {
     query() $(d : FuelDepot) {
         let rr = FUEL_DEPOT_SIZE + PLAYER_SIZE + REFUEL_RADIUS
         let refueling = dist2d_sq(d.pos, player_pos) < rr * rr
-        let barge_color = float3(0.5, 0.5, 0.5)
-        let beacon_pulse = 0.6 + 0.4 * abs(sin(game_time * 3.5))
-        let beacon_color = (
-            refueling ? float3(0.2, beacon_pulse, 0.2) : float3(beacon_pulse, 0.8, 0.2)
-        )
-        // Barge
-        draw_with_phong(d.pos, float3(FUEL_DEPOT_SIZE, FUEL_DEPOT_SIZE * 1.8, FUEL_DEPOT_SIZE * 0.25), barge_color)
-        geo_cube |> draw_geometry_fragment()
-        // Beacon pole
-        let beacon_pos = d.pos + float3(0.0, 0.0, FUEL_DEPOT_SIZE * 0.8)
-        draw_with_phong(beacon_pos, float3(0.1, 0.1, FUEL_DEPOT_SIZE * 0.8), beacon_color)
-        geo_cube |> draw_geometry_fragment()
-    }
-}
+        let beacon_pulse = 0.55 + 0.45 * abs(sin(game_time * 3.5))
 
-// Pine trees: trunk + stacked cones
-def render_trees() {
-    query() $(t : RiverTree) {
-        let trunk_h = t.size * t.trunk_ratio
-        let trunk_pos = t.pos + float3(0.0, 0.0, trunk_h * 0.5)
-        let trunk_col = float3(0.24 + t.green_shift * 0.25, 0.18, 0.1)
-        draw_with_phong(trunk_pos, float3(0.11 * t.size, 0.11 * t.size, trunk_h), trunk_col)
+        draw_prop(d.pos, float3(FUEL_DEPOT_SIZE, FUEL_DEPOT_SIZE * 1.8, FUEL_DEPOT_SIZE * 0.25),
+            float3(0.30, 0.31, 0.33), float4(0.0, 0.0, 0.0, 1.0), MAT_METAL, REFLECT_PAINT)
+        geo_cube |> draw_geometry_fragment()
+
+        // Storage tank lying on the deck; the cylinder gives the depot a
+        // silhouette you can pick out of the bank clutter at range, and the
+        // chrome reflection is what makes it read as a pressure vessel rather
+        // than a painted drum.
+        draw_prop(d.pos + float3(0.0, 0.0, FUEL_DEPOT_SIZE * 0.45),
+            float3(FUEL_DEPOT_SIZE * 0.42, FUEL_DEPOT_SIZE * 0.42, FUEL_DEPOT_SIZE * 0.95),
+            float3(0.70, 0.66, 0.30), quat_x_rot(PI * 0.5), MAT_METAL, REFLECT_CHROME)
         geo_cylinder |> draw_geometry_fragment()
 
-        let tier_den = max(1, t.tiers - 1)
-        let pine_dark = float3(0.07, 0.3, 0.08)
-        let pine_light = float3(0.16, 0.52, 0.16)
-        for (ti in range(t.tiers)) {
-            let tf = float(ti) / float(tier_den)
-            let cone_h = t.size * (1.2 - tf * 0.28)
-            let cone_r = t.size * (0.72 - tf * 0.18)
-            let cone_z = trunk_h * 0.72 + tf * (t.size * 0.58) + cone_h * 0.5
-            let base_green = pine_dark * (1.0 - t.green_tint) + pine_light * t.green_tint
-            let cone_color = base_green + float3(t.green_shift * 0.35, t.green_shift * 0.1 - tf * 0.03, -t.green_shift * 0.2)
-            draw_with_phong(t.pos + float3(0.0, 0.0, cone_z), float3(cone_r, cone_r, cone_h), cone_color)
-            geo_cone |> draw_geometry_fragment()
-        }
+        let beacon_color = (
+            refueling ? float3(0.25, 1.0, 0.35) : float3(1.0, 0.72, 0.18)
+        ) * beacon_pulse
+        draw_prop(d.pos + float3(0.0, FUEL_DEPOT_SIZE * 0.9, FUEL_DEPOT_SIZE * 0.9),
+            float3(0.09, 0.09, FUEL_DEPOT_SIZE * 0.55), float3(0.22, 0.22, 0.24),
+            float4(0.0, 0.0, 0.0, 1.0), MAT_METAL, REFLECT_METAL)
+        geo_cube |> draw_geometry_fragment()
+        draw_prop(d.pos + float3(0.0, FUEL_DEPOT_SIZE * 0.9, FUEL_DEPOT_SIZE * 1.5),
+            float3(0.16), beacon_color, float4(0.0, 0.0, 0.0, 1.0), MAT_GLOW)
+        geo_sphere |> draw_geometry_fragment()
     }
 }
 
-// Houses: cube body + prism roof.
+// Bank flora. One welded mesh per prop, tinted through the model palette, so a
+// dressed bank costs one draw call per plant instead of one per cone.
+// Takes fields, not the template: a DECS query variable can only be accessed
+// by field, never passed whole.
+def private flora_palette(kind : int; green_tint, green_shift : float; tint : float3) {
+    if (kind == FLORA_ROCK) {
+        let stone = lerp(float3(0.34, 0.33, 0.31), get_bank_color() * 1.4, 0.35)
+        set_model_palette(stone, stone * 1.12, stone, stone * (0.86 + green_shift))
+        return
+    }
+    if (kind == FLORA_DEAD) {
+        let wood = float3(0.26 + green_shift * 0.4, 0.20, 0.14) * tint
+        set_model_palette(wood, wood * 1.15, wood, wood * 0.8)
+        return
+    }
+    let dark = float3(0.05, 0.20, 0.07)
+    let light = float3(0.15, 0.42, 0.15)
+    var green = lerp(dark, light, green_tint)
+    if (kind == FLORA_REEDS) {
+        green = lerp(green, float3(0.42, 0.44, 0.20), 0.55)
+    } elif (kind == FLORA_BUSH) {
+        green = lerp(green, float3(0.12, 0.30, 0.10), 0.35)
+    }
+    green = (green + float3(green_shift * 0.22, green_shift * 0.06, -green_shift * 0.12)) * tint
+    let bark = float3(0.22 + green_shift * 0.18, 0.15, 0.09) * tint
+    // Two foliage tones plus bark: the accent tone is what gives a crown depth
+    // instead of reading as one flat silhouette.
+    set_model_palette(green, green * 1.28 + float3(0.02, 0.05, 0.01), green, bark)
+}
+
+def render_trees() {
+    if (empty(geo_flora)) {
+        return
+    }
+    let tint = env_now.foliage_tint
+    let per_kind = length(geo_flora) / FLORA_VARIANTS
+    query() $(t : RiverTree) {
+        flora_palette(t.kind, t.green_tint, t.green_shift, tint)
+        let mat = (t.kind == FLORA_ROCK ? MAT_STONE : MAT_FOLIAGE)
+        draw_prop(t.pos, float3(t.size), float3(1.0), quat_z_rot(t.yaw), mat)
+        let idx = clamp(t.kind, 0, FLORA_VARIANTS - 1) * per_kind + (t.seed % max(per_kind, 1))
+        geo_flora[clamp(idx, 0, length(geo_flora) - 1)] |> draw_geometry_fragment()
+    }
+    clear_model_palette()
+}
+
+// Houses: body + prism roof + a chimney, so the roofline is not a bare wedge.
 def render_houses() {
     query() $(h : RiverHouse) {
-        let body_color_a = float3(0.75, 0.68, 0.58)
-        let body_color_b = float3(0.6, 0.67, 0.73)
-        let roof_color_a = float3(0.62, 0.23, 0.2)
-        let roof_color_b = float3(0.24, 0.28, 0.34)
-        let body_color = body_color_a * (1.0 - h.body_tint) + body_color_b * h.body_tint
-        let roof_color = roof_color_a * (1.0 - h.roof_tint) + roof_color_b * h.roof_tint
+        let body_color = lerp(float3(0.68, 0.62, 0.53), float3(0.52, 0.58, 0.64), h.body_tint)
+        let roof_color = lerp(float3(0.52, 0.19, 0.16), float3(0.20, 0.23, 0.29), h.roof_tint)
 
-        let body_h = h.size * 1.0
-        let body_pos = h.pos + float3(0.0, 0.0, body_h * 0.5)
-        draw_with_phong(body_pos, float3(h.size * 0.95, h.size * 1.1, body_h * 0.5), body_color)
+        let body_h = h.size
+        draw_prop(h.pos + float3(0.0, 0.0, body_h * 0.5),
+            float3(h.size * 0.95, h.size * 1.1, body_h * 0.5), body_color,
+            float4(0.0, 0.0, 0.0, 1.0), MAT_MATTE)
         geo_cube |> draw_geometry_fragment()
 
         let roof_h = h.size * 0.55
-        let roof_pos = h.pos + float3(0.0, 0.0, body_h + roof_h * 0.45)
-        draw_with_phong(roof_pos, float3(h.size * 1.05, h.size * 1.18, roof_h), roof_color)
+        draw_prop(h.pos + float3(0.0, 0.0, body_h + roof_h * 0.45),
+            float3(h.size * 1.05, h.size * 1.18, roof_h), roof_color,
+            float4(0.0, 0.0, 0.0, 1.0), MAT_MATTE)
         geo_prism |> draw_geometry_fragment()
-    }
-}
 
-// Bonuses: spinning horizontal cylinders, color-coded by type.
-def render_bonuses(game_time : float) {
-    let q_tilt = quat_y_rot(PI * 0.5)
-    query() $(b : BonusPickup) {
-        let bob = sin(game_time * BONUS_BOB_SPEED + b.bob_phase) * BONUS_BOB_AMPLITUDE
-        let p = b.pos + float3(0.0, 0.0, 0.55 + bob)
-        let color = bonus_color(b.bonus_type)
-        let spin = quat_z_rot(game_time * BONUS_SPIN_SPEED + b.bob_phase)
-        let rot = quat_mul(spin, q_tilt)
-        draw_with_phong(p, float3(0.22, 0.22, 0.55), color, rot)
-        geo_cylinder |> draw_geometry_fragment()
-    }
-}
-
-def render_projectiles() {
-    // Flat pass for particles and trails (drawn before rotors)
-    glUseProgram(flat_program)
-    active_program = flat_program
-    glEnable(GL_BLEND)
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-    glDepthMask(false)
-
-    // Explosion chunks: transparent and spinning
-    query() $(p : Particle) {
-        let is_trail = p.max_life <= TRAIL_LIFETIME + 0.01
-        if (is_trail) { return ; }
-        let alpha = p.lifetime / p.max_life
-        let spin_t = 1.0 - alpha
-        let s = max(p.size * (0.45 + alpha * 0.8), 0.03)
-        let rot = quat_y_rot(p.spin_phase + p.spin_speed * spin_t)
-        v_model = compose(p.pos, rot, float3(s))
-        f_Color = float4(p.color, alpha * 0.72)
-        vs_flat_bind_uniform(active_program)
-        fs_flat_bind_uniform(active_program)
+        draw_prop(h.pos + float3(h.size * 0.42, h.size * 0.3, body_h + roof_h * 0.9),
+            float3(h.size * 0.12, h.size * 0.12, roof_h * 0.6), roof_color * 0.7,
+            float4(0.0, 0.0, 0.0, 1.0), MAT_MATTE)
         geo_cube |> draw_geometry_fragment()
     }
+}
 
-    // Trail particles (blend based on remaining life)
-    query() $(p : Particle) {
-        let is_trail = p.max_life <= TRAIL_LIFETIME + 0.01
-        if (!is_trail) { return ; }
-        let alpha = p.lifetime / p.max_life
-        let s = max(p.size, BULLET_SIZE * 1.0)
-        v_model = compose(p.pos, float4(0.0, 0.0, 0.0, 1.0), float3(s))
-        f_Color = float4(p.color, alpha * 0.7)
-        vs_flat_bind_uniform(active_program)
-        fs_flat_bind_uniform(active_program)
+// Bonuses.
+//
+// A pickup has to look worth flying across the channel for, so it is built in
+// layers like the explosions are: a machined metal canister that takes the
+// environment reflection, a hot emissive core, and -- in the effects pass -- a
+// halo ring and a pool of light on the water under it. Each type also gets its
+// own silhouette, so what you are collecting is readable before the colour is.
+
+def private bonus_pulse(game_time : float; phase : float) : float {
+    return 0.88 + 0.12 * sin(game_time * 4.0 + phase)
+}
+
+def private bonus_body_rot(game_time : float; phase : float) : float4 {
+    return quat_mul(quat_z_rot(game_time * BONUS_SPIN_SPEED + phase), quat_y_rot(PI * 0.5))
+}
+
+def render_bonuses(game_time : float) {
+    query() $(b : BonusPickup) {
+        let bob = sin(game_time * BONUS_BOB_SPEED + b.bob_phase) * BONUS_BOB_AMPLITUDE
+        let p = b.pos + float3(0.0, 0.0, 0.72 + bob)
+        let color = bonus_color(b.bonus_type)
+        let rot = bonus_body_rot(game_time, b.bob_phase)
+        let pulse = bonus_pulse(game_time, b.bob_phase)
+
+        // Machined shell: chrome, so it picks up the sky and the sun rather than
+        // sitting flat the way the old painted cylinder did.
+        let shell = float3(0.72, 0.76, 0.80)
+        draw_prop(p, float3(0.36, 0.36, 0.60) * pulse, shell, rot, MAT_METAL, REFLECT_CHROME)
+        geo_cylinder |> draw_geometry_fragment()
+
+        // End caps in the pickup's own colour: the type reads off the ends even
+        // when the shell is busy reflecting.
+        for (side in fixed_array(-1.0, 1.0)) {
+            let cap = p + quat_mul_vec(rot, float3(0.0, 0.0, side * 0.60)) * pulse
+            draw_prop(cap, float3(0.40, 0.40, 0.09) * pulse, color * 1.4, rot, MAT_GLOW)
+            geo_cylinder |> draw_geometry_fragment()
+        }
+
+        // Type badge: a distinct shape bolted to the middle of the shell.
+        if (b.bonus_type == BonusType.multishot) {
+            // Three barrels.
+            for (i in range(3)) {
+                let a = game_time * BONUS_SPIN_SPEED + b.bob_phase + float(i) * (2.0 * PI / 3.0)
+                let off = float3(cos(a), sin(a), 0.0) * 0.27
+                draw_prop(p + off, float3(0.10, 0.10, 0.42) * pulse, color, rot, MAT_METAL, REFLECT_METAL)
+                geo_cylinder |> draw_geometry_fragment()
+            }
+        } elif (b.bonus_type == BonusType.fastshot) {
+            // A forward chevron.
+            draw_prop(p + float3(0.0, 0.40, 0.0), float3(0.27, 0.27, 0.33) * pulse,
+                color, quat_x_rot(-PI * 0.5), MAT_GLOW)
+            geo_cone |> draw_geometry_fragment()
+        } elif (b.bonus_type == BonusType.life) {
+            // A cross.
+            draw_prop(p, float3(0.46, 0.13, 0.13) * pulse, color, rot, MAT_GLOW)
+            geo_cube |> draw_geometry_fragment()
+            draw_prop(p, float3(0.13, 0.13, 0.46) * pulse, color, rot, MAT_GLOW)
+            geo_cube |> draw_geometry_fragment()
+        } else {
+            // Fuel: a banded collar.
+            draw_prop(p, float3(0.41, 0.41, 0.16) * pulse, color, rot, MAT_GLOW)
+            geo_cylinder |> draw_geometry_fragment()
+        }
+
+        // The core, always hot.
+        draw_prop(p, float3(0.22) * pulse, color * 2.2, rot, MAT_GLOW)
         geo_sphere |> draw_geometry_fragment()
     }
+}
 
-    // Player bullets: thin cyan cylinder elongated along velocity
-    glUseProgram(phong_program)
-    active_program = phong_program
+// Additive layers for the pickups: a halo ring that spins on its own axis, and a
+// pool of light where the pickup is reflected on the water. Drawn with the
+// effects, after the opaque scene.
+def render_bonus_fx(game_time : float) {
+    // Light pool on the water first -- a soft billboard laid flat.
+    use_puff_program()
+    query() $(b : BonusPickup) {
+        let color = bonus_color(b.bonus_type)
+        let pulse = bonus_pulse(game_time, b.bob_phase)
+        draw_puff(float3(b.pos.x, b.pos.y, 0.05), 1.7 * pulse, color, 0.38, 1.8,
+            game_time * 0.3 + b.bob_phase, b.bob_phase)
+        geo_disc |> draw_geometry_fragment()
+    }
+
+    glUseProgram(ring_program)
+    active_program = ring_program
+    query() $(b : BonusPickup) {
+        let bob = sin(game_time * BONUS_BOB_SPEED + b.bob_phase) * BONUS_BOB_AMPLITUDE
+        let p = b.pos + float3(0.0, 0.0, 0.72 + bob)
+        let color = bonus_color(b.bonus_type)
+        let pulse = bonus_pulse(game_time, b.bob_phase)
+        // Two rings on different axes, counter-rotating: reads as a containment
+        // field rather than as a decal.
+        let tilt_a = quat_mul(quat_z_rot(game_time * 1.6 + b.bob_phase), quat_x_rot(PI * 0.42))
+        let tilt_b = quat_mul(quat_z_rot(-game_time * 1.1 - b.bob_phase), quat_y_rot(PI * 0.5))
+        for (rot, radius in fixed_array(tilt_a, tilt_b), fixed_array(0.92, 0.74)) {
+            v_model = compose(p, rot, float3(radius * pulse, radius * pulse, 1.0))
+            f_Color = float4(color * 1.7, 0.80)
+            f_Material = float4(0.13, 0.0, 1.9, 0.0)
+            vs_ring_bind_uniform(active_program)
+            fs_ring_bind_uniform(active_program)
+            geo_disc |> draw_geometry_fragment()
+        }
+    }
+    use_unlit_program()
+}
+
+// --- Transparent scene ---
+
+// Explosion layers draw in three passes so they composite correctly: smoke and
+// debris alpha-blended first (they occlude), then everything hot additively on
+// top, which is also what feeds the bloom.
+
+def private draw_smoke(game_time : float) {
+    use_puff_program()
+    query() $(p : Particle) {
+        if (p.kind != ParticleKind.smoke) { return ; }
+        let life = p.lifetime / p.max_life
+        // Smoke expands as it ages and fades from the far end of its life, so a
+        // puff thins out instead of blinking off.
+        let grow = 1.0 + (1.0 - life) * 2.2
+        let alpha = saturate(life * 1.5) * 0.5
+        let spin = p.spin_phase + p.spin_speed * (1.0 - life) + game_time * 0.08
+        draw_puff(p.pos, p.size * grow, p.color, alpha, 0.0, spin, p.spin_phase)
+        geo_disc |> draw_geometry_fragment()
+    }
+    use_unlit_program()
+}
+
+def private draw_hot_layers() {
+    // Flash and fireballs are soft billboards; only the streaking embers below
+    // want real geometry.
+    use_puff_program()
+
+    // Flash: one frame-and-a-bit of blowout at the instant of the hit.
+    query() $(p : Particle) {
+        if (p.kind != ParticleKind.flash) { return ; }
+        let life = p.lifetime / p.max_life
+        let grow = 0.5 + (1.0 - life) * 0.9
+        draw_puff(p.pos, p.size * grow, p.color, life * life * 0.9, 4.5 * life, 0.0, 0.0)
+        geo_disc |> draw_geometry_fragment()
+    }
+
+    // Fireballs: expand and cool white -> orange -> deep red.
+    query() $(p : Particle) {
+        if (p.kind != ParticleKind.fire) { return ; }
+        let life = p.lifetime / p.max_life
+        let age = 1.0 - life
+        let grow = 0.6 + age * 1.05
+        var tint = lerp(float3(1.0, 0.48, 0.09), float3(1.0, 0.97, 0.86), saturate(life * 2.6 - 1.6))
+        tint = lerp(float3(0.34, 0.045, 0.015), tint, saturate(life * 1.9))
+        draw_puff(p.pos, p.size * grow, tint, saturate(life * 1.4), 4.2 * life * life,
+            p.spin_phase, p.spin_phase * 0.7)
+        geo_disc |> draw_geometry_fragment()
+    }
+
+    use_unlit_program()
+
+    // Embers: small, bright, and they streak along their own velocity.
+    query() $(p : Particle) {
+        if (p.kind != ParticleKind.ember && p.kind != ParticleKind.trail) { return ; }
+        let life = p.lifetime / p.max_life
+        let speed = length(p.vel)
+        let tint = lerp(float3(0.9, 0.18, 0.04), p.color, saturate(life * 1.4))
+        if (p.kind == ParticleKind.ember && speed > 0.5) {
+            let dir = p.vel / speed
+            let stretch = clamp(speed * 0.035, 1.0, 4.5)
+            draw_unlit(p.pos, float3(p.size, p.size, p.size * stretch), tint,
+                saturate(life * 2.0), quat_align_z(dir), 3.4 * life)
+            geo_cylinder |> draw_geometry_fragment()
+        } else {
+            draw_unlit(p.pos, float3(max(p.size, BULLET_SIZE * 0.8)), tint,
+                saturate(life * 2.0), float4(0.0, 0.0, 0.0, 1.0), 2.2 * life)
+            geo_sphere |> draw_geometry_fragment()
+        }
+    }
+}
+
+def private draw_shockwaves() {
+    glUseProgram(ring_program)
+    active_program = ring_program
+    query() $(p : Particle) {
+        if (p.kind != ParticleKind.shock) { return ; }
+        let life = p.lifetime / p.max_life
+        let age = 1.0 - life
+        // The front races out fast and early, then eases; the band narrows as
+        // it goes, which is what makes it read as travelling rather than growing.
+        let radius = p.size * (0.10 + sqrt(age) * 0.90)
+        let width = lerp(0.20, 0.045, age)
+        v_model = compose(p.pos, float4(0.0, 0.0, 0.0, 1.0), float3(radius, radius, 1.0))
+        f_Color = float4(p.color, life * life * 0.55)
+        f_Material = float4(width, 0.0, 1.1 * life, 0.0)
+        vs_ring_bind_uniform(active_program)
+        fs_ring_bind_uniform(active_program)
+        geo_disc |> draw_geometry_fragment()
+    }
+}
+
+def render_projectiles(game_time : float) {
+    use_unlit_program()
+    draw_smoke(game_time)
+
+    // Player tracers: a bright core with a longer, dimmer streak behind it.
     query() $(b : PlayerBullet) {
         let dir = normalize(b.vel)
         let rot = quat_align_z(dir)
-        draw_with_phong(b.pos, float3(BULLET_SIZE, BULLET_SIZE, BULLET_SIZE * 3.5), float3(0.2, 1.0, 0.9), rot)
+        draw_unlit(b.pos, float3(BULLET_SIZE * 0.9, BULLET_SIZE * 0.9, BULLET_SIZE * 3.6),
+            float3(0.35, 1.0, 0.92), 1.0, rot, 2.4)
+        geo_cylinder |> draw_geometry_fragment()
+        draw_unlit(b.pos - dir * BULLET_SIZE * 4.0,
+            float3(BULLET_SIZE * 0.55, BULLET_SIZE * 0.55, BULLET_SIZE * 5.0),
+            float3(0.18, 0.75, 0.85), 0.35, rot, 1.0)
         geo_cylinder |> draw_geometry_fragment()
     }
 
-    // Enemy bullets: type-dependent shape + color
     query() $(b : EnemyBullet) {
+        let flicker = 0.8 + 0.2 * sin(game_time * 30.0 + b.pos.x)
         if (b.bullet_type == 0) {
-            // Boat: small yellowish sphere
-            draw_with_phong(b.pos, float3(ENEMY_BULLET_SIZE * 1.2), float3(0.9, 0.7, 0.2))
+            draw_unlit(b.pos, float3(ENEMY_BULLET_SIZE * 0.85), float3(1.0, 0.80, 0.28),
+                1.0, float4(0.0, 0.0, 0.0, 1.0), 1.6 * flicker)
             geo_sphere |> draw_geometry_fragment()
-        } elif (b.bullet_type == 1) {
-            // Heli: bright red thin cylinder
-            let dir = normalize(b.vel)
-            let rot = quat_align_z(dir)
-            draw_with_phong(b.pos, float3(ENEMY_BULLET_SIZE, ENEMY_BULLET_SIZE, ENEMY_BULLET_SIZE * 3.5), float3(1.0, 0.08, 0.08), rot)
-            geo_cylinder |> draw_geometry_fragment()
         } else {
-            // Plane: orange thin cylinder
             let dir = normalize(b.vel)
             let rot = quat_align_z(dir)
-            draw_with_phong(b.pos, float3(ENEMY_BULLET_SIZE, ENEMY_BULLET_SIZE, ENEMY_BULLET_SIZE * 3.5), float3(1.0, 0.5, 0.05), rot)
+            let tint = (b.bullet_type == 1 ? float3(1.0, 0.16, 0.12) : float3(1.0, 0.55, 0.10))
+            draw_unlit(b.pos, float3(ENEMY_BULLET_SIZE * 0.5, ENEMY_BULLET_SIZE * 0.5,
+                ENEMY_BULLET_SIZE * 2.6), tint, 1.0, rot, 1.6 * flicker)
             geo_cylinder |> draw_geometry_fragment()
         }
     }
 
-    glDepthMask(true)
-    glDisable(GL_BLEND)
+    // Additive from here on: fire adds light, it does not occlude.
+    glBlendFunc(GL_SRC_ALPHA, uint(GL_ONE))
+    use_unlit_program()
+    draw_hot_layers()
+    draw_shockwaves()
+    render_bonus_fx(game_time)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 }
 
+def private draw_disc(center : float3; radius : float; rot : float4; color : float3; alpha, phase : float) {
+    v_model = compose(center, rot, float3(radius, radius, radius))
+    f_Color = float4(color, alpha)
+    f_Material = float4(1.0, 0.0, phase, 0.0)
+    vs_rotor_bind_uniform(active_program)
+    fs_rotor_bind_uniform(active_program)
+    geo_disc |> draw_geometry_fragment()
+}
+
+// Rotor discs. One alpha-blended disc per aircraft, with the blade phase driven
+// through the material's emissive slot so the shader can smear it.
 def render_rotors(game_time : float) {
     glDisable(GL_CULL_FACE)
-    glEnable(GL_BLEND)
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-    glDepthMask(false)
     glUseProgram(rotor_program)
     active_program = rotor_program
 
-    // Player rotor
     if (player_respawn_timer <= PLAYER_RESPAWN_BLINK) {
         let blinking = player_respawn_timer > 0.0
         if (!blinking || int(game_time * 16.0) % 2 != 0) {
-            let rotor_angle = game_time * 12.0
-            let rotor_rot = quat_y_rot(rotor_angle)
-            let rotor_pos = player_pos + float3(0.0, 0.0, PLAYER_SIZE * 0.8)
-            v_model = compose(rotor_pos, rotor_rot, float3(PLAYER_ROTOR_SIZE, 0.08, PLAYER_ROTOR_SIZE))
-            f_Color = float4(0.9, 0.9, 0.95, 0.9)
-            vs_rotor_bind_uniform(active_program)
-            fs_rotor_bind_uniform(active_program)
-            geo_plane_xz |> draw_geometry_fragment()
+            let orient = player_orientation()
+            let up_offset = PLAYER_SIZE * 1.85 * 0.70
+            draw_disc(player_pos + float3(0.0, 0.0, up_offset), PLAYER_ROTOR_SIZE * 1.05,
+                orient, float3(0.82, 0.88, 0.96), 0.55, game_time)
+            // Tail rotor, spinning in the vertical plane on the fin.
+            draw_disc(player_pos + float3(-PLAYER_SIZE * 0.20, -PLAYER_SIZE * 2.10, up_offset * 0.62),
+                PLAYER_ROTOR_SIZE * 0.34, quat_mul(orient, quat_y_rot(PI * 0.5)),
+                float3(0.78, 0.84, 0.92), 0.45, game_time * 2.4)
         }
     }
 
-    // Enemy helicopter rotors
     query() $(h : EnemyHelicopter) {
-        let rotor_angle = game_time * 15.0 + h.hover_phase
-        let rotor_rot = quat_y_rot(rotor_angle)
-        let rotor_pos = h.pos + float3(0.0, 0.0, ENEMY_HELI_SIZE * 0.8)
-        v_model = compose(rotor_pos, rotor_rot, float3(PLAYER_ROTOR_SIZE * 0.85, 0.06, PLAYER_ROTOR_SIZE * 0.85))
-        f_Color = float4(0.7, 0.3, 0.2, 0.85)
-        vs_rotor_bind_uniform(active_program)
-        fs_rotor_bind_uniform(active_program)
-        geo_plane_xz |> draw_geometry_fragment()
+        let up_offset = ENEMY_HELI_SIZE * 1.7 * 0.70
+        draw_disc(h.pos + float3(0.0, 0.0, up_offset), PLAYER_ROTOR_SIZE * 0.92,
+            float4(0.0, 0.0, 0.0, 1.0), float3(0.85, 0.42, 0.32), 0.5,
+            game_time + h.hover_phase)
     }
 
-    glDepthMask(true)
-    glDisable(GL_BLEND)
     glEnable(GL_CULL_FACE)
 }
 
+// Explosion debris draws with the scene, not with the effects: it is solid
+// torn plating, so it wants the lit prop program, real shading and the metal
+// reflection -- as an unlit alpha quad it read as flying paper.
+def render_debris() {
+    if (empty(geo_shards)) {
+        return
+    }
+    use_prop_program()
+    query() $(p : Particle) {
+        if (p.kind != ParticleKind.debris) { return ; }
+        let life = p.lifetime / p.max_life
+        let tumble = quat_mul(quat_y_rot(p.spin_phase + p.spin_speed * (1.0 - life)),
+            quat_x_rot(p.spin_phase * 1.7 + p.spin_speed * 0.6 * (1.0 - life)))
+        // Chunks glow briefly at the flash, then go cold. Shrinking over the
+        // last of their life hides the pop when they are culled.
+        let heat = saturate((life - 0.82) * 5.5)
+        let tint = lerp(p.color * 0.7, float3(1.0, 0.62, 0.24), heat)
+        let fade = saturate(life * 4.0)
+        draw_prop(p.pos, float3(p.size * fade), tint, tumble,
+            float4(0.45, 0.55, heat * 1.4, 0.30), REFLECT_METAL)
+        let shard_idx = int(p.spin_phase * 1.9) % length(geo_shards)
+        geo_shards[shard_idx] |> draw_geometry_fragment()
+    }
+}
+
 def render_all(game_time : float) {
-    render_shadows(game_time)
     render_player(game_time)
-    render_enemies()
+    render_enemies(game_time)
     render_obstacles(game_time)
-    render_projectiles()
+    render_debris()
+}
+
+def render_effects(game_time : float) {
+    render_projectiles(game_time)
     render_rotors(game_time)
 }

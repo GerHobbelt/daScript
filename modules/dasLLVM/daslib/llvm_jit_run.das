@@ -36,11 +36,11 @@ var LINK_WHOLE_LIB = false // when true, standalone exe links against the whole 
 // invalidates cached DLLs (e.g. edits to llvm_jit.das, llvm_macro.das, llvm_jit_common.das,
 // runtime helper ABI, default target triple). Cache filenames fold this in, so a bump
 // makes every previously written DLL miss the cache on the next run and get GC'd.
-let LLVM_JIT_CODEGEN_VERSION : uint64 = 0x50ul   // -exe native paths re-root at run time via jit_register_native_path_resolve
+let LLVM_JIT_CODEGEN_VERSION : uint64 = 0x56ul   // darwin in-memory arm emits no dtor list (0x55: handled types iterate and index through the annotation's jit hooks)
 
 // Read by tests-cpp/small/test_jit_emitter_pin.cpp: FNV-1a64 of the emitter sources
 // (normalized to LF; file list in the test)
-let LLVM_JIT_EMITTER_HASH : uint64 = 0xafb153c2e58d8417ul
+let LLVM_JIT_EMITTER_HASH : uint64 = 0x3140f6c8e0a8738eul
 
 let JIT_FNV_PRIME : uint64 = 1099511628211ul
 
@@ -294,8 +294,15 @@ def private reopen_and_gc_dll(var dll : DLLHandle?&; output_path : string; funcs
                               keep_objs : array<string>) {
     dll.reset()
     dll = get_dll_by_path(output_path)
+    // linked ok but unloadable = eaten between the two; the panic text carries the diagnosis
+    if (dll.handle == null) {
+        panic("LLVM JIT: {output_path}.dll linked but cannot be loaded back - the file is missing or unreadable. On Windows check antivirus quarantine and exclude the .jitted_scripts directory from real-time scanning.\n")
+    }
     let (missing, disabling) = get_dll_missing(funcs, disabled, dll, uids)
-    assert(missing |> empty() && disabling |> empty())
+    if (!(missing |> empty()) || !(disabling |> empty())) {
+        let names = join([for (mf in missing); "{mf.name}"], ", ")
+        panic("LLVM JIT: reopened {output_path}.dll disagrees with what was just written - {length(missing)} function(s) missing or hash-mismatched ({names}), {length(disabling)} disabled-but-present\n")
+    }
     if (!(dll_hash_basename |> empty())) {
         var keep_names : table<string>
         for (obj in keep_objs) {

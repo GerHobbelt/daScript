@@ -53,7 +53,7 @@ Task-specific instructions are in skill files under `skills/`. Read the relevant
 | `skills/mcp_tools.md` | Full MCP tool table + live-API reference |
 | `skills/das_formatting.md` | Creating or modifying any `.das` file |
 | `skills/comment_style_hygiene.md` | Writing or reviewing comments, names, or local code shape in ANY language |
-| `skills/cpp_integration.md` | Embedding daslang in C++; binding types/functions/enums |
+| `skills/cpp_integration.md` | Embedding daslang in C++; binding types/functions/enums; shipping without the compiler (`libDaScriptNano`) |
 | `skills/daslib_modules.md` | Using `daslib/` modules (linq, json, regex, etc.) |
 | `skills/das_macros.md` | Compile-time macros, AST manipulation, qmacro/quote, gc_node patterns |
 | `skills/daspkg.md` | Creating `.das_package` manifests, daspkg commands |
@@ -186,11 +186,11 @@ For path/filename ops use `fio` helpers (`base_name`/`dir_name`/`path_join`/...)
 
 **`print` is fine for application scripts.** In library and tool code prefer `to_log(LOG_INFO|LOG_WARNING|LOG_ERROR)` - same stdout, but level-tagged and filterable.
 
-**Comment hygiene (.das): ABSOLUTELY NO comments that are not documentation or lint suppression.** The kept set is exactly: `//!` docs on public API (never on private symbols), `// nolint:CODE` / `@nolint` suppressions carrying their one-line why, `//fmt:` formatter directives, and a file's leading header block. Everything else - narration, banners, section dividers, commented-out code - does not exist; the MCP `format_file` tool applies this file-wide by default, fail-closed. Teaching code (tutorials, examples) is the one exception: prose carrying the lesson stays - the folder's `.lint_config` `[format]` policy opts it out (`force_clean_comments = false`), so the same `format_file` call is safe everywhere.
+**Comment hygiene (.das): the folder's `.lint_config` decides.** Where `[format] force_clean_comments = true`, only the kept set survives a format - `//!` docs on a contract a caller must know, `// nolint:CODE` / `@nolint` suppressions carrying their one-line why, `//fmt:` directives, license comments, and the file's leading header block; the MCP `format_file` tool strips everything else, fail-closed. The key defaults to `false` - teaching code (tutorials, examples) declares that default explicitly - and wherever it is false the kept set still holds and every other comment answers to the deletion test instead: remove it and re-read; if the WHY goes dark, restore it, otherwise it was noise. The same `format_file` call is safe everywhere.
 
 ## SDK Directory Layout
 
-- `bin/` - compiler and tool binaries: `daslang`, `daslang-live`, `gen1_to_gen2`, plus prebuilt tool exes (`lint.exe`, `das-fmt.exe`, `daspkg.exe`, `dascov.exe`, `detect-dupe.exe`, `benchctl.exe`, `dastest.exe` - the `.exe` suffix on every platform) and shared-module / tree-sitter libraries on Windows. Each tool also keeps its source form - `bin/daslang utils/<tool>/main.das`, except das-fmt (`utils/das-fmt/dasfmt.das`) and dastest (`dastest/dastest.das`). **Name trap:** `bin/gen1_to_gen2` is the gen1->gen2 syntax *converter*, not a formatter; the formatter is `das-fmt` (MCP `format_file`, `bin/das-fmt.exe`, or `bin/daslang utils/das-fmt/dasfmt.das`)
+- `bin/` - compiler and tool binaries: `daslang`, `daslang-live`, plus prebuilt tool exes (`lint.exe`, `das-fmt.exe`, `daspkg.exe`, `dascov.exe`, `detect-dupe.exe`, `benchctl.exe`, `dastest.exe` - the `.exe` suffix on every platform) and shared-module / tree-sitter libraries on Windows. Each tool also keeps its source form - `bin/daslang utils/<tool>/main.das`, except das-fmt (`utils/das-fmt/dasfmt.das`) and dastest (`dastest/dastest.das`). **Name trap:** `utils/gen1-to-gen2/` is the gen1->gen2 syntax *converter*, not a formatter; the formatter is `das-fmt` (MCP `format_file`, `bin/das-fmt.exe`, or `bin/daslang utils/das-fmt/dasfmt.das`)
 - `lib/`, `include/daScript/` - libraries and C++ headers for embedding
 - `daslib/` - standard library modules (.das)
 - `modules/` - optional plugin modules (dasHV, dasGlfw, dasPUGIXML, dasSQLITE, dasAudio, dasLLVM, dasLLAMA, ...)
@@ -199,6 +199,7 @@ For path/filename ops use `fio` helpers (`base_name`/`dir_name`/`path_join`/...)
 - `utils/mcp/`, `utils/lsp/` - MCP and LSP servers for AI coding assistants
 - `utils/lint/` - lint runner: `bin/daslang utils/lint/main.das -- <files> --quiet`
 - `utils/das-fmt/` - the formatter script (`dasfmt.das`, wraps `daslib/das_source_formatter`)
+- `utils/gen1-to-gen2/` - v1 (indentation) -> gen2 (braces) syntax converter, run as `bin/daslang utils/gen1-to-gen2/main.das -- <files>` (also the `convert_to_gen2` MCP tool)
 - `utils/detect-dupe/` - cross-file duplicate-function detector (also the `export_corpus` / `detect_duplicates` MCP tools)
 - `utils/find-dupe/` - Claude-based judge for detect-dupe reports (needs `ANTHROPIC_API_KEY`; also the `judge_duplicates`/`find_dupe` MCP tools)
 - `utils/daspkg/`, `utils/dascov/` - package manager; code coverage

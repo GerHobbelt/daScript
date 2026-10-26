@@ -59,37 +59,6 @@ namespace das {
         }
     }
 
-    // ANNOTATION
-
-    const AnnotationArgument * AnnotationArgumentList::find ( const string & name, Type type ) const {
-        auto it = find_if(begin(), end(), [&](const AnnotationArgument & arg){
-            return (arg.name==name) && (type==Type::tVoid || type==arg.type);
-        });
-        return it==end() ? nullptr : &*it;
-    }
-
-    bool AnnotationArgumentList::getBoolOption(const string & name, bool def) const {
-        auto arg = find(name, Type::tBool);
-        return arg ? arg->bValue : def;
-    }
-
-    int32_t AnnotationArgumentList::getIntOption(const string & name, int32_t def) const {
-        auto arg = find(name, Type::tInt);
-        return arg ? arg->iValue : def;
-    }
-
-    uint64_t AnnotationArgumentList::getUInt64Option(const string & name, uint64_t def) const {
-        auto arg = find(name, Type::tInt);
-        return arg ? uint64_t(arg->iValue) : def;
-    }
-
-    uint64_t AnnotationArgumentList::getUInt64OptionEx(const string & name, const string & name2, uint64_t def) const {
-        auto arg = find(name, Type::tInt);
-        if (arg) return uint64_t(arg->iValue);
-        arg = find(name2, Type::tInt);
-        return arg ? uint64_t(arg->iValue) : def;
-    }
-
     // MODULE
 
     void Module::addDependency ( Module * mod, bool pub ) {
@@ -114,6 +83,17 @@ namespace das {
 
     FileInfo * Module::getFileInfo() const {
         return ownFileInfo.get();
+    }
+
+    TypeAnnotation * TypeInfo::getAnnotation() const {
+        if ( type != Type::tHandle ) {
+            return nullptr;
+        }
+        return Module::resolveAnnotation(this);
+    }
+
+    void TypeInfo::resolveAnnotation() const {
+        if ( daScriptEnvironment::getBound()->modules ) Module::resolveAnnotation(this);
     }
 
     TypeAnnotation * Module::resolveAnnotation ( const TypeInfo * info ) {
@@ -810,9 +790,8 @@ namespace das {
         for (auto & m : ptm->macros) target->macros.push_back(std::move(m));
         for (auto & m : ptm->inferMacros) target->inferMacros.push_back(std::move(m));
         for (auto & m : ptm->optimizationMacros) target->optimizationMacros.push_back(std::move(m));
-        for (auto & m : ptm->preInferMacros) target->preInferMacros.push_back(std::move(m));
-        for (auto & m : ptm->postInferMacros) target->postInferMacros.push_back(std::move(m));
         for (auto & m : ptm->lintMacros) target->lintMacros.push_back(std::move(m));
+        for (auto & m : ptm->postRewriteMacros) target->postRewriteMacros.push_back(std::move(m));
         for (auto & m : ptm->postCompileMacros) target->postCompileMacros.push_back(std::move(m));
         for (auto & m : ptm->globalLintMacros) target->globalLintMacros.push_back(std::move(m));
         for ( auto & rm : ptm->readMacros ) {
@@ -1159,8 +1138,7 @@ namespace das {
     }
 
     TypeDeclPtr ModuleLibrary::makeStructureType ( const string & name ) const {
-        auto t = new TypeDecl(Type::tStructure);
-        t->at = cppBindingLineInfo(name.c_str());
+        auto t = new TypeDecl(Type::tStructure, cppBindingLineInfo(name.c_str()));
         auto structs = findStructure(name,nullptr);
         if ( structs.size()==1 ) {
             t->structType = structs.back();
@@ -1185,8 +1163,7 @@ namespace das {
     }
 
     TypeDeclPtr ModuleLibrary::makeHandleType ( const string & name ) const {
-        auto t = new TypeDecl(Type::tHandle);
-        t->at = cppBindingLineInfo(name.c_str());
+        auto t = new TypeDecl(Type::tHandle, cppBindingLineInfo(name.c_str()));
         auto handles = findAnnotation(name,nullptr);
 #if DAS_ALLOW_ANNOTATION_LOOKUP
         bool need_require = false;
@@ -1247,8 +1224,7 @@ namespace das {
             return nullptr;
         }
         auto dann = static_cast<DistinctTypeAnnotation *>(handles.back());
-        auto t = new TypeDecl(Type::tDistinct);
-        t->at = cppBindingLineInfo(name.c_str());
+        auto t = new TypeDecl(Type::tDistinct, cppBindingLineInfo(name.c_str()));
         t->annotation = dann;
         if ( dann->underlyingType ) {
             t->firstType = new TypeDecl(*dann->underlyingType);

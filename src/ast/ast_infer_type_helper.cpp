@@ -409,7 +409,7 @@ namespace das {
             if (!aT) {
                 auto bT = nameToBasicType(decl->alias);
                 if (bT != Type::none) {
-                    aT = new TypeDecl(bT);
+                    aT = new TypeDecl(bT, decl->at);
                 }
             }
             if (aT) {
@@ -815,7 +815,9 @@ namespace das {
             if (fromGeneric) {
                 ctor->fromGeneric = getOrCreateDummy(var->module);
             }
-            bool export_for_aot = !var->cppLayout && (daScriptEnvironment::getBound() && daScriptEnvironment::getBound()->g_isInAot);
+            // AOT never emits a macro class, so exporting its ctor claims a caller that
+            // cannot exist - and that claim roots the whole macro into the simulated context
+            bool export_for_aot = !var->cppLayout && !var->macroInterface && (daScriptEnvironment::getBound() && daScriptEnvironment::getBound()->g_isInAot);
             ctor->exports = alwaysExportInitializer || export_for_aot;
             extraFunctions.push_back(ctor);
             reportAstChanged();
@@ -1050,9 +1052,23 @@ namespace das {
     }
     bool InferTypes::inferReturnType(TypeDeclPtr &resType, ExprReturn *expr) {
         if (expr->subexpr && expr->subexpr->type && expr->subexpr->type->isVoid()) {
-            error("returning void value", "", "",
-                  expr->at, CompilationError::invalid_result);
-            return false;
+            // 'return void_expr' is legal when the result is void, or a bare auto which the
+            // generic machinery below resolves to void (structured autos like auto? reject
+            // there); visit(ExprReturn) then lowers it to { void_expr; return; }
+            if (resType->isVoid() || resType->baseType == Type::autoinfer) {
+                if (expr->moveSemantics) {
+                    error("can't return void value via move", "", "",
+                          expr->at, CompilationError::invalid_result);
+                    return false;
+                }
+                if (resType->isVoid()) {
+                    return false;
+                }
+            } else if (!resType->isAuto()) {
+                error("returning void value, expecting " + describeType(resType), "", "",
+                      expr->at, CompilationError::invalid_result);
+                return false;
+            }
         }
         if (resType->isAuto()) {
             if (expr->subexpr) {
@@ -1080,8 +1096,7 @@ namespace das {
                     return true;
                 }
             } else {
-                resType = new TypeDecl(Type::tVoid);
-                resType->at = expr->at;
+                resType = new TypeDecl(Type::tVoid, expr->at);
                 reportAstChanged();
                 return true;
             }

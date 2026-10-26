@@ -18,6 +18,42 @@ Per-platform generator commands, build flags, AOT debugging, exit-code meanings,
 
 Delete files created for diagnostics, staging, and one-off tests before handing work back - temporary release trees, formatter backups, extracted audio, generated `__pycache__`, ad-hoc stdout/stderr logs. Keep intentional application logs, databases, configs, rollback bundles, and user-owned artifacts. In deployed application directories, do not leave unrelated diagnostic files beside the program.
 
+## The document system
+
+Three document types split one grammar, each with a repo-root contract:
+
+- **`REVIEW.md`** (per folder) - bans and duties binding a diff, applied at REVIEW time via
+  the folder walk. Contract: `REVIEW_COMMON.md`.
+- **`ARCHITECTURE.md`** (per folder) - present-tense statements: how the system is and why.
+  Contract: `ARCHITECTURE_COMMON.md`. **Read the folder's architecture doc BEFORE writing
+  code there** - charters say which file owns what, mechanisms say why shapes win, and the
+  exception ledger says what is already ruled. Facts formerly carried by comments live here.
+- **`/history`** - past tense: what happened. Nothing current cites it.
+
+An implementation folder - `daslib/`, a module's `daslib/` or engine folder - holds no `.md`
+besides `REVIEW*.md`, `ARCHITECTURE*.md`, and `LAWS.md` (lint-enforced: `.lint_config`
+`rule_docs_only`). Ledgers and plans live at the module root or in `plans/` (repo root). None
+of these documents installs - the SDK bundle gate bans them; `REVIEW_COMMON.md` and
+`ARCHITECTURE_COMMON.md` at the install root are the two vendoring exceptions.
+
+The mood test routes misplaced text: must/never binding a diff -> REVIEW.md; present-tense
+fact -> ARCHITECTURE.md; dated or past-tense -> /history.
+
+**Before editing a function annotated `[arch(at="<doc>.md#<anchor>")]`, read the section it
+cites.** MCP `arch_of` returns each of a file's citations with its section text; `arch_sites`
+returns a document's anchors with the code citing them, dead anchors and dangling citations
+included. Citation spelling, path resolution, and failure reasons: `skills/mcp_tools.md`.
+
+**An architecture-doc heading that code cites carries the `{#anchor}` its citation names.**
+LINT026 fails a citation naming no such file or anchor, and in a folder whose `.lint_config`
+sets `[docs] enforce_arch = true`, an anchor no `[arch]` cites.
+
+**A `REVIEW*.md` or `ARCHITECTURE*.md` past 300 lines, in a folder whose `.lint_config` sets
+`[docs] rule_docs_only = true` or `[docs] enforce_arch = true`, splits into companions** -
+`ARCHITECTURE_<CONCERN>.md` for an architecture doc, a `REVIEW_<KIND>.md` the parent
+checklist's opening routes to for a checklist. LINT027 is the gate; the `archivist` agent
+does the architecture-doc splits.
+
 ## GitHub Operations
 
 Use GitHub MCP tools (`mcp__github__*`) for all GitHub operations (PRs, issues, reads) - they avoid shell escaping entirely. Fallback when unavailable: `gh` CLI with `--body-file` for any text containing backticks (shell escape characters in every supported shell).
@@ -48,7 +84,7 @@ Task-specific instructions are split into skill files under `skills/`. You MUST 
 |---|---|
 | `skills/project_overview.md` | First significant task - design philosophy, three execution tiers, macros-as-design-lens |
 | `skills/internal/build_and_debug.md` | Build flags, AOT build commands, exit-code/crash diagnosis, `options log_infer_passes` |
-| `skills/mcp_tools.md` | Full MCP tool table + live-API reference |
+| `skills/mcp_tools.md` | Full MCP tool table + live-API reference; writing or following an `[arch(at=...)]` citation |
 | `skills/das_formatting.md` | Creating or modifying any `.das` file |
 | `skills/comment_style_hygiene.md` | Writing or reviewing comments, names, or local code shape in ANY language |
 | `skills/writing_tests.md` | Writing or editing any dastest test |
@@ -57,7 +93,7 @@ Task-specific instructions are split into skill files under `skills/`. You MUST 
 | `skills/internal/documentation_rst.md` | Editing RST in `doc/source/`, `//!` doc-comments in `daslib/*.das`, tutorial RST pages |
 | `skills/internal/tutorials.md` | Anything that looks like a tutorial - they live under `/tutorials/<area>/`, NEVER `modules/<X>/tutorial/` |
 | `skills/internal/tutorial_prose.md` | WRITING or revising general-reader doc/tutorial prose (`documentation_rst.md` is mechanics, this is the words) |
-| `skills/cpp_integration.md` | Embedding daslang in C++; binding types/functions/enums |
+| `skills/cpp_integration.md` | Embedding daslang in C++; binding types/functions/enums; shipping without the compiler (`libDaScriptNano`) |
 | `skills/internal/cpp_codebase_notes.md` | Working on daslang's own C++ - where inference/builtins/errors/parser live, AST function flags |
 | `skills/internal/clang_bind_build.md` | Enabling `dasClangBind` / bumping the libclang SDK / running any `bind_*.das` self-binder |
 | `skills/daslib_modules.md` | Working with `daslib/` modules or extending the stdlib |
@@ -126,7 +162,7 @@ Task-specific instructions are split into skill files under `skills/`. You MUST 
 
 Multiple skill files may apply to one task: creating a new daslib module needs `skills/das_formatting.md`, `skills/daslib_modules.md`, and possibly `skills/internal/documentation_rst.md`.
 
-**Formatter reminder:** format `.das` files with the MCP `format_file` tool (it calls `daslib/das_source_formatter`). NOT `utils/gen1-to-gen2/` - that is the v1->v2 syntax converter, not a formatter.
+**Formatter reminder:** format `.das` files with the MCP `format_file` tool (it calls `daslib/das_source_formatter`). NOT `utils/gen1-to-gen2/` - that is the v1->gen2 syntax converter, not a formatter.
 
 ### Updating Instructions with New Knowledge
 
@@ -250,7 +286,7 @@ For path/filename ops use `fio` helpers (`base_name`/`dir_name`/`path_join`/...)
 
 **Complexity/length lint (STYLE037/STYLE038): new code meets both limits from the start.** On a hit in existing code, the suppress-vs-split resolution policy is `skills/style_lint.md` - never force a split on an honest shape.
 
-**Comment hygiene, all languages: `skills/comment_style_hygiene.md` is the rulebook.** For `.das` outside tutorials/examples the headline is that no comment outside the skill's kept set survives to a commit - scaffolding is welcome while you work, and the PR gate drains it (`skills/internal/make_pr.md`, the Comment drain row). For C/C++ it is no NEW comments. The kept sets, teaching-code boundary, naming and code-shape rules all live in the skill; the `style-hygiene-auditor` agent applies them to every PR's new code (mandatory run in `skills/internal/make_pr.md`, findings persuade rather than block).
+**Comment hygiene, all languages: `skills/comment_style_hygiene.md` is the rulebook.** No folder arms formatter stripping any more: scaffolding is welcome while you work, and the PR gate HARVESTS the diff's added comments (`skills/internal/make_pr.md`, the Comment harvest row) - renames first, rules and facts into the folder's documents, site-local keepers as `//!` contract one-liners; every surviving `.das` comment answers to the skill's deletion test. For C/C++ it is no NEW comments. The kept sets, teaching-code boundary, naming and code-shape rules all live in the skill; the `style-hygiene-auditor` agent applies them to every PR's new code (mandatory run in `skills/internal/make_pr.md`, findings persuade rather than block).
 
 ## Key Directories
 
@@ -258,6 +294,7 @@ Most layout is obvious from `ls`. The non-obvious ones:
 
 - `skills/daslang/` - the **distributable, SDK-free daslang language skill** for third-party AI agents (`SKILL.md` + `references/`), NOT a repo task skill. Every example is probe-verified; its `README.md` carries the editing rules. Grammar/stdlib/default changes update it in the same arc
 - `daslib/aot_cpp.das` - the AOT C++ emitter lives here, NOT in C++
+- `nano/` - `libDaScriptNano`, the runtime with no compiler in it: a shadow include root whose four headers win over `include/`, so thirteen `src/` sources compile against a minimal `Context` unmodified. A source that needs an edit to build there is CARVED upstream, never forked (`nano/ARCHITECTURE.md`); every directory linking it must clear its inherited include dirs, which `nano/REVIEW.das` checks
 - `tests/aot/CMakeLists.txt` - register new test directories here for AOT compilation. Two AOT binaries: `test_aot_subset` (tests/language only, in ALL - the per-PR CI compile gate) and full `test_aot` (`EXCLUDE_FROM_ALL`, ~1080 AOT TUs - nightly CI + `preflight --full` only, via `--target test_aot`/`run_tests_aot`)
 - `dastest/` - test framework (used by both `tests/` and external repos)
 - `utils/detect-dupe/` (in-repo dupe finder) and `utils/find-dupe/` (Claude judge; needs `daspkg install --root utils/find-dupe` + `ANTHROPIC_API_KEY`) - both also MCP tools

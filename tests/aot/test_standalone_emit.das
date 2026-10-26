@@ -20,10 +20,13 @@ def private standalone_cop(var cop : CodeOfPolicies) {
     cop.tune_frozen = true
 }
 
-def private generate_standalone_files(t : T?; fixture, out_dir : string; cross_platform : bool = false) : tuple<header : string; source : string> {
+def private generate_standalone_files(t : T?; fixture, out_dir : string; cross_platform : bool = false; stack_policy : uint = 0u) : tuple<header : string; source : string> {
     let input = path_join(get_das_root(), "tests/aot/{fixture}.das")
     using() $(var cop : CodeOfPolicies) {
         standalone_cop(cop)
+        if (stack_policy != 0u) {
+            cop.stack = stack_policy
+        }
         ast_gc_guard() {
             standalone_aot(input, out_dir, cross_platform, false, cop)
         }
@@ -52,6 +55,20 @@ def private generate_standalone_source(t : T?; fixture, out_dir : string) : stri
     return generate_standalone_files(t, fixture, out_dir).source
 }
 
+def private expect_emit_failure(t : T?; fixture, out_dir : string) {
+    let input = path_join(get_das_root(), "tests/aot/{fixture}.das")
+    var ok = true
+    using() $(var cop : CodeOfPolicies) {
+        standalone_cop(cop)
+        ast_gc_guard() {
+            ok = standalone_aot(input, out_dir, false, false, cop)
+        }
+    }
+    t |> success(!ok, "standalone_aot reports failure")
+    let generated = path_join(out_dir, "{fixture}.das.cpp")
+    t |> success(!stat(generated).is_valid, "no output is written on failure")
+}
+
 def private brace_balance(text : string) : int {
     var balance = 0
     peek_data(text) $(bytes) {
@@ -78,8 +95,37 @@ def test_standalone_emit(t : T?) {   // nolint:STYLE038 - flat list of emit subc
 
     t |> run("a context with no init functions still closes its constructor") @(t : T?) {
         let source = generate_standalone_source(t, "_standalone_novars_fixture", out_dir)
-        t |> success(find(source, "Standalone::Standalone() \{") >= 0, "constructor was emitted")
+        t |> success(find(source, "Standalone::Standalone() : Context(16384/*stack*/) \{") >= 0, "constructor was emitted with the default stack size")
         t |> equal(brace_balance(source), 0, "unbalanced braces in the generated C++")
+    }
+
+    t |> run("the context stack and heap hints honor the script's options") @(t : T?) {
+        let source = generate_standalone_source(t, "_standalone_options_fixture", out_dir)
+        t |> success(find(source, ": Context(262144/*stack*/)") >= 0, "the ctor sizes the stack from options stack")
+        t |> success(find(source, "policies.heap_size_hint = 123456;") >= 0, "heap_size_hint comes from the script's options")
+        t |> success(find(source, "policies.string_heap_size_hint = 234567;") >= 0, "string_heap_size_hint comes from the script's options")
+        t |> success(find(source, "unused_interpreted_helper") < 0, "an unused [no_aot] function neither blocks emission nor emits")
+        t |> equal(brace_balance(source), 0, "unbalanced braces in the generated C++")
+    }
+
+    t |> run("an explicit stack option below the floor is honored exactly") @(t : T?) {
+        let source = generate_standalone_source(t, "_standalone_small_stack_fixture", out_dir)
+        t |> success(find(source, ": Context(4096/*stack*/)") >= 0, "options stack = 4096 emits 4096 - embedded targets budget the stack")
+    }
+
+    t |> run("an explicit stack of zero keeps the floor - Context(0) has no stack at all") @(t : T?) {
+        let source = generate_standalone_source(t, "_standalone_zero_stack_fixture", out_dir)
+        t |> success(find(source, ": Context(16384/*stack*/)") >= 0, "options stack = 0 falls back to the floored default")
+    }
+
+    t |> run("a sub-floor policies stack without an explicit option is raised to the floor") @(t : T?) {
+        let files = generate_standalone_files(t, "_standalone_novars_fixture", out_dir, stack_policy = 8192u)
+        t |> success(find(files.source, ": Context(16384/*stack*/)") >= 0, "policies.stack = 8192 still gets the 16K floor")
+    }
+
+    t |> run("with no stack option the policies' stack size decides") @(t : T?) {
+        let files = generate_standalone_files(t, "_standalone_novars_fixture", out_dir, stack_policy = 32768u)
+        t |> success(find(files.source, ": Context(32768/*stack*/)") >= 0, "the ctor sizes the stack from CodeOfPolicies")
     }
 
     t |> run("forward declarations spell types the way the definitions do") @(t : T?) {
@@ -141,18 +187,22 @@ def test_standalone_emit(t : T?) {   // nolint:STYLE038 - flat list of emit subc
         t |> equal(brace_balance(files.source), 0, "unbalanced braces in the generated C++")
     }
 
+    t |> run("a compile-time macro stays out of the standalone context") @(t : T?) {
+        // AOT mode used to force-export every generated struct ctor, macro classes
+        // included; that rooted the whole macro into the simulated context and the
+        // [no_aot] check below then reported its visit() as an unemittable function.
+        let source = generate_standalone_source(t, "_standalone_macro_fixture", out_dir)
+        t |> success(find(source, "5050") >= 0, "the macro's compile-time sum is baked into the source")
+        t |> success(find(source, "BakeSum") < 0, "the macro class does not reach the generated source")
+        t |> equal(brace_balance(source), 0, "unbalanced braces in the generated C++")
+    }
+
+    t |> run("a used [no_aot] function is a collected error, not a runtime crash") @(t : T?) {
+        expect_emit_failure(t, "_standalone_no_aot_fixture", out_dir)
+    }
+
     t |> run("a required module's [init] is a collected error, not a crash") @(t : T?) {
-        let input = path_join(get_das_root(), "tests/aot/_standalone_foreign_init_fixture.das")
-        var ok = true
-        using() $(var cop : CodeOfPolicies) {
-            standalone_cop(cop)
-            ast_gc_guard() {
-                ok = standalone_aot(input, out_dir, false, false, cop)
-            }
-        }
-        t |> success(!ok, "standalone_aot reports failure")
-        let generated = path_join(out_dir, "_standalone_foreign_init_fixture.das.cpp")
-        t |> success(!stat(generated).is_valid, "no output is written on failure")
+        expect_emit_failure(t, "_standalone_foreign_init_fixture", out_dir)
     }
 
     t |> run("before_emit receives the compiled program") @(t : T?) {

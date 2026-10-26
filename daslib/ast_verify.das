@@ -20,8 +20,9 @@ module ast_verify shared private
 //! pass right after it happens, and each post-infer firing sweeps every module.
 //! ``--ast-verify-batch`` is the CI gate: no pre-infer checks (a tree a macro breaks
 //! mid-inference crashes the compiler instead of being repaired - the gates count that as red),
-//! and each post-infer firing checks only the module being compiled: the tree handed to
-//! lint/fold/codegen is valid, at a fraction of the cost. Under the CLI force-include every
+//! and the module being compiled is walked once, on the firing right before the finished tree's
+//! first consumer - the ~10 post-infer firings per module all walk one tree, and paying for one of
+//! them is what makes the gate cheap enough for many files. Under the CLI force-include every
 //! non-builtin module compiles after the verifier registered, so each is still checked once as
 //! the module being compiled (the verifier's own requires are promoted builtin - neither mode
 //! walks those); a module read from a module cache, or required before a source
@@ -164,6 +165,7 @@ def private note_expr_node(var seen : table<void?>; var expr : ExpressionPtr; wh
 
 
 class private AstVerifyVisitor : AstVisitor {
+    prog : ProgramPtr
     error_count : int = 0
     @do_not_delete current_fn : Function?
     @do_not_delete fn_stack : array<Function?>
@@ -183,7 +185,7 @@ class private AstVerifyVisitor : AstVisitor {
         error_count++
         let loc = describe(at)
         to_log(LOG_ERROR, empty(loc) ? "AST verify: {msg}\n" : "AST verify: {msg} at {loc}\n")
-        compiling_program() |> macro_sticky_error(at, "AST verify: {msg}")
+        prog |> macro_sticky_error(at, "AST verify: {msg}")
     }
 
     def track_node(node : void?; what : string; at : LineInfo) : bool {
@@ -806,6 +808,7 @@ def public verify_module(prog : ProgramPtr; mod : Module?) : int {
     //! returning the count. Call it from a macro's ``apply()`` right after building
     //! AST — the repo's ast-fuzz suite README covers when each entry point applies.
     var v = new AstVerifyVisitor(check_unique = prog._options |> find_arg("_ast_verify_unique") ?as tBool ?? true)
+    v.prog := prog
     make_visitor(*v) $(adapter) {
         v.adapter = adapter
         visit_module(prog, adapter, mod)
@@ -817,28 +820,12 @@ def public verify_module(prog : ProgramPtr; mod : Module?) : int {
     return n
 }
 
-[pre_infer_macro]
-class AstVerifyMacro : AstPassMacro {
-    //! Verifies the module being compiled before every inference pass. Active whenever
-    //! this module is loaded — via ``--ast-verify`` (force-include) or a source
-    //! ``require daslib/ast_verify``; ``--ast-verify-batch`` turns these pre-infer checks off.
-    def override apply(prog : ProgramPtr; mod : Module?) : bool {
-        if (mod == null || mod.moduleFlags.builtIn) {
-            return true
-        }
-        verify_module(prog, mod)
-        return true
-    }
-    def override canVisitPass(prog : ProgramPtr; mod : Module?; index : int) : bool {
-        return !batch_mode()
-    }
-}
-
 def public verify_function(var fn : FunctionPtr) : int {
     //! Verifies one function IN PLACE, signature included. For a macro that BUILDS a
     //! function: add_function mangles the signature at once, so a malformed result or
     //! argument type crashes there, before [[verify_module]] could see it.
     var v = new AstVerifyVisitor()
+    v.prog := compiling_program()
     make_visitor(*v) $(adapter) {
         visit(fn, adapter)
     }
@@ -854,6 +841,7 @@ def public verify_expression(var expr : ExpressionPtr) : int {
     //! that build and return a tree (for-loop / call / annotation / reader), which
     //! run inside inference where [[verify_module]] cannot see the result yet.
     var v = new AstVerifyVisitor()
+    v.prog := compiling_program()
     make_visitor(*v) $(adapter) {
         visit(expr, adapter)
     }
@@ -917,6 +905,7 @@ def private first_located_inside(var expr : ExpressionPtr) : Expression? {
 }
 
 class private AstPostInferVerifyVisitor : AstVisitor {
+    prog : ProgramPtr
     error_count : int = 0
     @do_not_delete current_fn : Function?
     closure_depth : int = 0
@@ -938,7 +927,7 @@ class private AstPostInferVerifyVisitor : AstVisitor {
         to_log(LOG_ERROR, empty(loc)
             ? "AST verify (post-infer): {text}\n"
             : "AST verify (post-infer): {text} at {loc}\n")
-        compiling_program() |> macro_sticky_error(anchor, "AST verify (post-infer): {text}")
+        prog |> macro_sticky_error(anchor, "AST verify (post-infer): {text}")
     }
 
     def guess_at(var expr : ExpressionPtr) : Anchor {
@@ -978,11 +967,29 @@ class private AstPostInferVerifyVisitor : AstVisitor {
     }
 
     def override canVisitStructureFieldInit(st : StructurePtr) : bool {
+        decl_init_depth++
         return !st.flags.isTemplate
     }
 
     def override canVisitStructure(st : Structure?) : bool {
         return !st.flags.isTemplate
+    }
+
+    decl_init_depth : int = 0
+
+    def override visitStructureField(var _str : StructurePtr; var decl : FieldDeclaration; _last : bool) : void {
+        if (decl.init != null) {
+            decl_init_depth--
+        }
+    }
+
+    def override preVisitFunctionArgumentInit(_fun : FunctionPtr; _arg : VariablePtr; _value : ExpressionPtr) : void {
+        decl_init_depth++
+    }
+
+    def override visitFunctionArgumentInit(_fun : FunctionPtr; _arg : VariablePtr; var value : ExpressionPtr) : ExpressionPtr {
+        decl_init_depth--
+        return value
     }
 
     def need_typed(var slot : ExpressionPtr; what : string; at : LineInfo) : void {
@@ -995,7 +1002,7 @@ class private AstPostInferVerifyVisitor : AstVisitor {
     }
 
     def need_func(fn : Function?; what : string; at : LineInfo) : void {
-        if (fn != null) {
+        if (fn != null || decl_init_depth > 0) {
             return
         }
         report(at, "{what} has an unresolved func after inference")
@@ -1357,6 +1364,7 @@ def public verify_module_after_infer(prog : ProgramPtr; mod : Module?) : int {
     //! Separate from [[verify_module]]: a half-inferred tree legitimately violates
     //! these, so they can only be asserted here.
     var v = new AstPostInferVerifyVisitor()
+    v.prog := prog
     make_visitor(*v) $(adapter) {
         visit_module(prog, adapter, mod)
     }
@@ -1366,29 +1374,6 @@ def public verify_module_after_infer(prog : ProgramPtr; mod : Module?) : int {
     }
     return n
 }
-
-[post_infer_macro]
-class AstPostInferVerifyMacro : AstPassMacro {
-    //! Fires before every consumer of the finished tree (after each inference run, lint, every
-    //! optimizer round). Plain mode also sweeps every OTHER non-builtin module (a source ``require``
-    //! parses the ones before it unverified); under the CLI force-include each was verified as thisMod.
-    def override apply(prog : ProgramPtr; mod : Module?) : bool {
-        if (mod == null || mod.moduleFlags.builtIn) {
-            return true
-        }
-        if (batch_mode()) {
-            verify_module_after_infer(prog, mod)
-        } else {
-            verify_program_after_infer(prog, mod)
-        }
-        return true
-    }
-}
-
-
-
-
-
 
 class private AstGcReachVisitor : AstVisitor {
     seen : table<void?>
@@ -1506,13 +1491,48 @@ def public verify_module_gc_root(var prog : ProgramPtr; mod : Module?) : int {
 }
 
 [post_compile_macro]
-class AstGcRootVerifyMacro : AstPassMacro {
-    //! Runs the gc-root check over the module just compiled. Post-compile is the first
-    //! point where its root holds only live nodes - before the collect, the garbage
-    //! inference left behind is indistinguishable from a node nothing owns.
+class AstPostCompileVerifyMacro : AstPassMacro {
     def override apply(var prog : ProgramPtr; mod : Module?) : bool {
+        if (mod != null && !mod.moduleFlags.builtIn) {
+            verify_module(prog, mod)
+            if (batch_mode()) {
+                verify_module_after_infer(prog, mod)
+            } else {
+                verify_program_after_infer(prog, mod)
+            }
+        }
         if (mod != null && (prog._options |> find_arg("_ast_verify_gc_root") ?as tBool ?? false)) {
             verify_module_gc_root(prog, mod)
+        }
+        return true
+    }
+}
+
+
+[post_rewrite_macro]
+class AstPostRewriteVerifyMacro : AstPassMacro {
+    def override apply(prog : ProgramPtr; mod : Module?) : bool {
+        if (mod != null && !mod.moduleFlags.builtIn) {
+            verify_module(prog, mod)
+        }
+        return true
+    }
+}
+
+[simulate_macro]
+class AstSimulateVerifyMacro : AstSimulateMacro {
+    //! The last look at the tree: simulate runs after lint, folding, every optimizer round and
+    //! every codegen-prep pass, so whatever they and the user's own macros left behind is checked
+    //! here. Not reached under -compile-only, which never simulates.
+    def override simulate(_prog : Program?; _ctx : Context?) : bool {
+        let mod = compiling_module()
+        if (mod != null && !mod.moduleFlags.builtIn) {
+            verify_module(compiling_program(), mod)
+            if (batch_mode()) {
+                verify_module_after_infer(compiling_program(), mod)
+            } else {
+                verify_program_after_infer(compiling_program(), mod)
+            }
         }
         return true
     }

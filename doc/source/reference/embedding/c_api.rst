@@ -38,6 +38,21 @@ but does not expose every C++ feature (e.g. class adapters, custom
 annotations).
 
 
+Linking
+=======
+
+With CMake, ``find_package(DAS REQUIRED)`` and linking
+``DAS::libDaScript`` pulls in the whole link set.  A hand-wired project
+(a plain Visual Studio project, a custom build system) must list it
+all: the daslang runtime is split out of the compiler library, so
+linking ``libDaScript`` alone fails with unresolved symbols such as
+``das::ptr_ref_count::ref_count_track`` — the runtime half defines
+them.  Link ``libDaScript``, ``libDaScript_runtime`` and
+``libUriParser``; on Windows add the system libraries ``dbghelp``,
+``ws2_32``, ``mswsock``, ``advapi32``, ``rpcrt4``.  This applies to the
+C++ API (``daScript.h``) the same way.
+
+
 Explicit-length strings
 =======================
 
@@ -185,6 +200,13 @@ File access
 ``das_fileaccess_introduce_native_module(access, req)`` / ``das_fileaccess_introduce_native_module_n(access, req, req_length)``
    Pre-loads one native module by its require-style path.
 
+``das_fileaccess_add_extra_module(access, module_name, module_file)`` / ``das_fileaccess_add_extra_module_n(...)``
+   Registers a module as an implicit dependency of every program compiled
+   through this file access, as if each program had a ``require`` for it.
+   This is how the daslang CLI injects daslib support modules:
+   ``just_in_time`` (``-jit``), ``debug`` (``-debugger``), ``profiler``
+   (``-profiler``).
+
 ``das_fileaccess_lock(access)`` / ``das_fileaccess_unlock(access)``
    While locked, only pre-introduced files can be accessed — filesystem
    reads are blocked.  Essential for sandboxing.
@@ -194,6 +216,13 @@ File access
 
 ``das_get_root_n(buf, maxbuf)``
    ``size_t``-sized counterpart.  Passing ``NULL, 0`` is valid.
+
+``das_set_root(root)`` / ``das_set_root_n(root, root_length)``
+   Sets the daslang root path.  When unset, the root is derived from the
+   host executable's location (walking up past ``bin/``), which is wrong
+   for embedded applications that live outside the daslang distribution —
+   call this before creating file access objects so ``daslib/``,
+   ``modules/`` and ``lib/`` resolve.
 
 
 Compilation
@@ -291,6 +320,14 @@ Compilation policies
      - Generate extended RTTI
    * - ``DAS_POLICY_NO_OPTIMIZATIONS``
      - Disable all optimizations
+   * - ``DAS_POLICY_JIT_ENABLED``
+     - Enable JIT compilation (see *Enabling JIT* below)
+   * - ``DAS_POLICY_JIT_DLL_MODE``
+     - With JIT: cache generated code as per-script DLLs under
+       ``<dasroot>/.jitted_scripts`` (default: on); off = in-memory codegen
+       every run, no cache writes.  The cache path needs a DLL build of
+       daslang — a static-linked host always codegens in-memory regardless
+       of this flag
 
 **Integer policies** (``das_int_policy``):
 
@@ -311,6 +348,38 @@ Compilation policies
      - Initial string heap size hint
 
 See :ref:`tutorial_integration_c_sandbox`.
+
+
+Enabling JIT
+------------
+
+The CLI's ``-jit`` switch is three host-side steps; an embedded host mirrors
+them through the C API.  The daslang root must point at a distribution that
+carries ``daslib/``, ``modules/dasLLVM`` and ``lib/`` (the LLVM backend
+library) — set it explicitly when the host executable lives elsewhere.
+Script-side ``options jit_enabled = true`` has no effect: JIT is a host
+policy.
+
+.. code-block:: c
+
+   das_set_root("/path/to/daslang");           /* unless the exe sits in <root>/bin */
+
+   das_file_access * fa = das_fileaccess_make_default();
+   das_register_dynamic_modules(fa, "/path/to/daslang", NULL, 0, tout);
+
+   char root[4096], jit_mod[4200];
+   das_get_root_n(root, sizeof(root));
+   snprintf(jit_mod, sizeof(jit_mod), "%s/daslib/just_in_time.das", root);
+   das_fileaccess_add_extra_module(fa, "just_in_time", jit_mod);
+
+   das_policies * pol = das_policies_make();
+   das_policies_set_bool(pol, DAS_POLICY_JIT_ENABLED, 1);
+
+   das_program * prog = das_program_compile_policies(
+       "script.das", fa, tout, lib, pol);
+
+After ``das_program_simulate()`` the ``[jit]`` functions run natively;
+``jit_enabled()`` returns ``true`` inside the script.
 
 
 Simulation and context

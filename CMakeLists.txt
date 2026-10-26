@@ -55,6 +55,13 @@ option(DAS_ENABLE_PIC "Build static libs as position-independent code (UNIX, req
 # (all daslang targets, every config) and libhv's BUILD_FOR_MT (modules/dasHV) in
 # lockstep, so no target can disagree on /MT vs /MD. See CMakeCommon.txt.
 option(DAS_USE_STATIC_STD_LIBS "Link the static MSVC runtime (/MT); OFF = dynamic (/MD)" OFF)
+# Forces vecmath's scalar per-lane backend on SIMD-capable hosts. The backend is
+# auto-selected on targets with no SIMD ISA (Cortex-M, RISC-V without V); this knob
+# exists so the full test suite can validate it on x64.
+option(DAS_VECMATH_SCALAR "Force the scalar (non-SIMD) vecmath backend" OFF)
+if(DAS_VECMATH_SCALAR)
+    add_compile_definitions(_TARGET_SIMD_SCALAR=1)
+endif()
 # Upper bound on JobQue worker threads (caps get_total_hw_threads / get_total_hw_jobs and the
 # persistent job pool). Empty = platform.h default: 4 on wasm (keeps a web build from spawning one
 # Web Worker per logical core), effectively uncapped elsewhere (the cores-1 rule governs).
@@ -874,7 +881,6 @@ FLEX(src/parser/ds_lexer.lpp)
 FLEX(src/parser/ds2_lexer.lpp)
 BISON(src/parser/ds_parser.ypp)
 BISON(src/parser/ds2_parser.ypp)
-BISON(utils/gen1-to-gen2/ds_parser.ypp)
 
 SET(PARSER_GENERATED_SRC
 # 1st parser
@@ -928,8 +934,10 @@ include/vecmath/dag_vecMath.h
 include/vecmath/dag_vecMathDecl.h
 include/vecmath/dag_vecMath_common.h
 include/vecmath/dag_vecMath_const.h
+include/vecmath/dag_vecMath_double.h
 include/vecmath/dag_vecMath_neon.h
 include/vecmath/dag_vecMath_pc_sse.h
+include/vecmath/dag_vecMath_scalar.h
 include/vecmath/dag_vecMath_trig.h
 )
 list(SORT VECMATH_SRC)
@@ -1032,6 +1040,7 @@ src/misc/env_cfg.cpp
 src/misc/das_common.cpp
 src/misc/gc_node.cpp
 src/misc/globals.cpp
+src/misc/hal.cpp
 src/misc/sysos.cpp
 src/misc/string_writer.cpp
 src/misc/memory_model.cpp
@@ -1101,6 +1110,7 @@ src/misc/network.cpp
 src/simulate/hash.cpp
 src/simulate/debug_info.cpp
 src/simulate/runtime_string.cpp
+src/simulate/escape_string.cpp
 src/simulate/runtime_iterator.cpp
 src/simulate/runtime_array.cpp
 src/simulate/runtime_table.cpp
@@ -1109,12 +1119,19 @@ src/simulate/standalone_ctx_utils.cpp
 src/simulate/simulate.cpp
 src/simulate/simulate_exceptions.cpp
 src/simulate/simulate_gc.cpp
+src/simulate/simulate_gc_pod.cpp
+src/simulate/builtin_array_ops.cpp
+src/simulate/builtin_runtime_ops.cpp
+src/simulate/aot_library.cpp
 src/simulate/simulate_tracking.cpp
 src/simulate/simulate_visit.cpp
 src/simulate/simulate_print.cpp
 src/simulate/simulate_fn_hash.cpp
 src/simulate/simulate_instrument.cpp
 include/daScript/simulate/cast.h
+include/daScript/simulate/annotation_arguments.h
+src/simulate/annotation_arguments.cpp
+include/daScript/simulate/code_of_policies.h
 include/daScript/simulate/hash.h
 include/daScript/simulate/heap.h
 src/simulate/heap.cpp
@@ -1166,14 +1183,6 @@ src/simulate/fs_file_info.cpp
 )
 
 
-SET(GEN1_TO_GEN2_SRC
-        ${PROJECT_SOURCE_DIR}/utils/gen1-to-gen2/fmt.cpp
-        ${PROJECT_SOURCE_DIR}/utils/gen1-to-gen2/formatter.cpp
-        ${PROJECT_SOURCE_DIR}/utils/gen1-to-gen2/helpers.cpp
-        ${PROJECT_SOURCE_DIR}/utils/gen1-to-gen2/ds_parser.cpp
-        CACHE INTERNAL "GEN1_TO_GEN2_SRC"
-)
-
 # MSVC first so clang-cl (CXX_COMPILER_ID==Clang but MSVC driver) takes /EHsc, not -fexceptions
 if(MSVC)
   set_source_files_properties(src/builtin/module_builtin_ast_serialize.cpp PROPERTIES
@@ -1185,11 +1194,7 @@ elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   )
 endif()
 
-# flex/bison output (the gen1_to_gen2 converter's own copy) is not ours to clean
-IF(MSVC)
-  set_source_files_properties(${PROJECT_SOURCE_DIR}/utils/gen1-to-gen2/ds_parser.cpp PROPERTIES COMPILE_FLAGS "/W0")
-ELSE()
-  set_source_files_properties(${PROJECT_SOURCE_DIR}/utils/gen1-to-gen2/ds_parser.cpp PROPERTIES COMPILE_FLAGS "-w")
+IF(NOT MSVC)
   # fmt's vendored format-inl.h noreturn helper: GCC needs -Wno-error, clang -Wno-invalid-noreturn
   IF("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
     set_source_files_properties(src/misc/format.cpp PROPERTIES COMPILE_FLAGS "-Wno-error")
@@ -1230,6 +1235,11 @@ file(GLOB DAS_LIB_SRC
 list(SORT DAS_LIB_SRC)
 SOURCE_GROUP_FILES("daslib" DSA_LIB_SRC)
 list(SORT DAS_LIB_SRC)
+
+# libDaScriptNano - the minimal runtime. Added BEFORE the include_directories
+# below on purpose: nano picks its own header search order, and inheriting this
+# directory's would put the full include/ ahead of the headers nano shadows.
+add_subdirectory(nano)
 
 include_directories(include)
 include_directories(3rdparty/fmt/include)
@@ -1296,7 +1306,6 @@ SET(LIBDASCRIPT_COMPILER_SRC
     ${SIMULATE_FUSION_SRC}
     ${PARSER_GENERATED_SRC}
     ${PARSER_SRC}
-    ${GEN1_TO_GEN2_SRC}
     src/ast/ast_parse.cpp
     src/ast/ast_optimize.cpp
     src/ast/ast_const_folding.cpp
@@ -1594,17 +1603,6 @@ if (NOT ${DAS_TOOLS_DISABLED})
         FILES_MATCHING PATTERN "*.das"
     )
 
-    add_executable(gen1_to_gen2 ${PROJECT_SOURCE_DIR}/utils/gen1-to-gen2/main.cpp)
-    TARGET_LINK_LIBRARIES(gen1_to_gen2 libDaScriptDyn ${SRC_LIBRARIES})
-    ADD_DEPENDENCIES(gen1_to_gen2 libDaScriptDyn ${DAS_DYN_MODULES_LIBS})
-    target_include_directories(gen1_to_gen2 PRIVATE ${NEED_MODULES_PATH})
-
-    SETUP_CPP11(gen1_to_gen2)
-    DAS_APPLY_STRICT_WARNINGS(gen1_to_gen2)
-    SETUP_LTO(gen1_to_gen2)
-    SETUP_BIN_RPATH(gen1_to_gen2)
-    install(TARGETS gen1_to_gen2 RUNTIME DESTINATION ${DAS_INSTALL_BINDIR})
-
     #IF(APPLE)
     #  add_executable(daslangOsx MACOSX_BUNDLE ${DAS_DASCRIPT_MAIN_SRC})
     #  TARGET_LINK_LIBRARIES(daslangOsx libDaScript libDaScriptTest Threads::Threads ${DAS_MODULES_LIBS})
@@ -1628,6 +1626,10 @@ if (NOT ${DAS_TOOLS_DISABLED})
 
     # Build daslang utilities as standalone executables (-exe mode)
     add_subdirectory(utils)
+
+    # Standalone-AOT examples on libDaScriptNano. They need daslang to generate
+    # their C++, which is why they live here and not beside the nano library.
+    add_subdirectory(examples/standalone)
 
 endif()
 
@@ -1721,6 +1723,8 @@ SET(DAS_SIMULATE_INCLUDES
     include/daScript/simulate/bind_enum.h
     include/daScript/simulate/bin_serializer.h
     include/daScript/simulate/cast.h
+    include/daScript/simulate/annotation_arguments.h
+    include/daScript/simulate/code_of_policies.h
     include/daScript/simulate/das_qsort_r.h
     include/daScript/simulate/data_walker.h
     include/daScript/simulate/debug_info.h
@@ -1808,6 +1812,47 @@ install(FILES ${DAS_BUILTIN_HEADERS}
     DESTINATION include/daScript/builtin
 )
 
+# libDaScriptNano ships as sources, not as a built library: an embedder cross-
+# compiles it for their own target with their own flags, which is the whole
+# point of it. Its CMakeLists is self-contained given DASLANG_NANO_ROOT.
+install(DIRECTORY ${PROJECT_SOURCE_DIR}/nano/
+    DESTINATION nano
+    FILES_MATCHING
+        PATTERN "*.h"
+        PATTERN "*.cpp"
+        PATTERN "*.md"
+        PATTERN "CMakeLists.txt"
+        # REVIEW.md and ARCHITECTURE.md review and describe changes to this repo's
+        # copy of nano; an SDK carries the library, not the process of changing it.
+        # (REVIEW.das is not matched by any pattern above, so it never ships either.)
+        REGEX "/REVIEW\\.md$" EXCLUDE
+        REGEX "/ARCHITECTURE\\.md$" EXCLUDE
+)
+# The shared runtime sources nano compiles. They live under src/, which the SDK
+# otherwise does not carry; nano/CMakeLists.txt names them one by one, and
+# nano/REVIEW.das checks that this list still covers that one.
+install(FILES
+    ${PROJECT_SOURCE_DIR}/src/misc/hal.cpp
+    ${PROJECT_SOURCE_DIR}/src/misc/memory_model.cpp
+    DESTINATION src/misc
+)
+install(FILES
+    ${PROJECT_SOURCE_DIR}/src/simulate/annotation_arguments.cpp
+    ${PROJECT_SOURCE_DIR}/src/simulate/aot_library.cpp
+    ${PROJECT_SOURCE_DIR}/src/simulate/builtin_array_ops.cpp
+    ${PROJECT_SOURCE_DIR}/src/simulate/builtin_runtime_ops.cpp
+    ${PROJECT_SOURCE_DIR}/src/simulate/data_walker.cpp
+    ${PROJECT_SOURCE_DIR}/src/simulate/debug_info.cpp
+    ${PROJECT_SOURCE_DIR}/src/simulate/escape_string.cpp
+    ${PROJECT_SOURCE_DIR}/src/simulate/heap.cpp
+    ${PROJECT_SOURCE_DIR}/src/simulate/runtime_array.cpp
+    ${PROJECT_SOURCE_DIR}/src/simulate/runtime_iterator.cpp
+    ${PROJECT_SOURCE_DIR}/src/simulate/runtime_table.cpp
+    ${PROJECT_SOURCE_DIR}/src/simulate/simulate_gc_pod.cpp
+    ${PROJECT_SOURCE_DIR}/src/simulate/standalone_ctx_utils.cpp
+    DESTINATION src/simulate
+)
+
 # Install all modules and main library.
 install(TARGETS
     libDaScript libDaScript_runtime libDaScriptDyn libDaScriptDyn_runtime libUriParser libUriParserDyn
@@ -1866,6 +1911,8 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/skills/
     # skills/daslang_live.md (prefix match on the full path)
     REGEX "/skills/internal$" EXCLUDE
     REGEX "/skills/daslang$" EXCLUDE
+    # ruling provenance for this repo's rule documents, not a skill
+    REGEX "/LAWS\\.md$" EXCLUDE
     PATTERN "*.md"
 )
 # its README is editing rules for this repo's maintainers, meaningless in the SDK
@@ -1873,14 +1920,19 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/skills/daslang/
     DESTINATION ${DAS_INSTALL_DOCDIR}/skills/daslang
     FILES_MATCHING
     REGEX "/daslang/README\\.md$" EXCLUDE
+    REGEX "/LAWS\\.md$" EXCLUDE
     PATTERN "*.md"
 )
-# The review constitution ships with the review skills that route to it.
+# The review constitution ships with the review skills that route to it, and the
+# architecture-doc contract it names ships beside it so the pointer resolves.
 install(FILES ${PROJECT_SOURCE_DIR}/REVIEW_COMMON.md DESTINATION ${DAS_INSTALL_DOCDIR})
+install(FILES ${PROJECT_SOURCE_DIR}/ARCHITECTURE_COMMON.md DESTINATION ${DAS_INSTALL_DOCDIR})
 install(FILES ${PROJECT_SOURCE_DIR}/LICENSE DESTINATION ${DAS_INSTALL_DOCDIR})
 install(FILES ${PROJECT_SOURCE_DIR}/3rdparty/uriparser/COPYING DESTINATION ${DAS_INSTALL_DOCDIR} RENAME URIPARSER.LICENSE)
 install(FILES ${PROJECT_SOURCE_DIR}/include/dag_noise/LICENSE DESTINATION ${DAS_INSTALL_DOCDIR} RENAME DAG_NOISE.LICENSE)
 install(FILES ${PROJECT_SOURCE_DIR}/include/vecmath/LICENSE DESTINATION ${DAS_INSTALL_DOCDIR} RENAME VEC_MATH.LICENSE)
+install(FILES ${PROJECT_SOURCE_DIR}/3rdparty/fmt/LICENSE DESTINATION ${DAS_INSTALL_DOCDIR} RENAME FMT.LICENSE)
+install(FILES ${PROJECT_SOURCE_DIR}/include/fast_float/LICENSE DESTINATION ${DAS_INSTALL_DOCDIR} RENAME FAST_FLOAT.LICENSE)
 
 # utils/internal/ never installs — the folder is the audience decision
 # (machine-checked by utils/REVIEW.das).
@@ -1890,6 +1942,12 @@ install(FILES ${PROJECT_SOURCE_DIR}/utils/aot/main.das DESTINATION utils/aot)
 
 # Install fix-lint-errors tool (mechanical lint auto-fixer)
 install(FILES ${PROJECT_SOURCE_DIR}/utils/fix-lint-errors/main.das DESTINATION utils/fix-lint-errors)
+
+install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/gen1-to-gen2/
+    DESTINATION utils/gen1-to-gen2
+    FILES_MATCHING PATTERN "*.das"
+    PATTERN "tests" EXCLUDE
+)
 
 # Install MCP server (stdio transport, no dasHV dependency)
 #   main.das        — full server entry point
@@ -1963,6 +2021,7 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/skills/daslang/
     DESTINATION .claude/skills/daslang
     FILES_MATCHING
     REGEX "/daslang/README\\.md$" EXCLUDE
+    REGEX "/LAWS\\.md$" EXCLUDE
     PATTERN "*.md"
 )
 install(FILES ${PROJECT_SOURCE_DIR}/.claude/agents/dragon.md DESTINATION .claude/agents)
@@ -2013,8 +2072,10 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/find-dupe/tests/
     FILES_MATCHING PATTERN "*.das"
 )
 
-# Install utils/common (git-aware staleness signature used by
-# utils/mcp/tools/cpp_common for source-search staleness tracking).
+# Install utils/common. The GLOB covers every shared module, which is what keeps the shipped MCP
+# server startable: it runs interpreted with no -project, and its require graph reaches
+# utils/common/arch_citations.das (via utils/mcp/tools/arch_common) and
+# utils/common/git_signature.das (via utils/mcp/tools/cpp_common).
 file(GLOB DAS_UTILS_COMMON_FILES ${PROJECT_SOURCE_DIR}/utils/common/*.das)
 install(FILES ${DAS_UTILS_COMMON_FILES} DESTINATION utils/common)
 install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/common/tests/
@@ -2094,6 +2155,11 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/examples/
     DESTINATION ${DAS_INSTALL_EXAMPLESDIR}
     PATTERN "fatman" EXCLUDE
     PATTERN "modules" EXCLUDE
+    # standalone/ builds against a daslang TARGET in-tree and against an
+    # installed SDK from a bundle; the SDK copy is the .standalone.cmake below,
+    # renamed into place after this excludes the in-tree one.
+    PATTERN "standalone/CMakeLists.txt" EXCLUDE
+    PATTERN "CMakeLists.standalone.cmake" EXCLUDE
     PATTERN "_build" EXCLUDE
     PATTERN ".daspkg_cache" EXCLUDE
     PATTERN ".daspkg_tmp" EXCLUDE
@@ -2104,6 +2170,22 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/examples/
     PATTERN "daspkg.lock" EXCLUDE
     PATTERN ".daspkg.log" EXCLUDE
     PATTERN "*.shared_module" EXCLUDE
+    # rule documents are repo-internal and never install; the terminal manifest
+    # check below fatals on any that slip through
+    PATTERN "REVIEW.md" EXCLUDE
+    PATTERN "REVIEW.das" EXCLUDE
+    PATTERN "ARCHITECTURE.md" EXCLUDE
+    PATTERN "LAWS.md" EXCLUDE
+    # soundfonts are fetched locally and carry unclear redistribution terms —
+    # they must never ride into a release bundle
+    PATTERN "*.sf2" EXCLUDE
+)
+
+# The SDK's copy of the standalone examples' build: same four targets, driven by
+# find_package(DAS) instead of in-tree targets.
+install(FILES ${PROJECT_SOURCE_DIR}/examples/standalone/CMakeLists.standalone.cmake
+    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/standalone
+    RENAME CMakeLists.txt
 )
 
 # The Fox rig/animation is CC-BY 4.0, so its attribution must also ship at the
@@ -2230,28 +2312,34 @@ if(NOT ${DAS_TREE_SITTER_DISABLED})
     )
 endif()
 
-# REVIEW.md / REVIEW.das are repo-internal review machinery and never install;
-# the one exception is REVIEW_COMMON.md at the install root (adopting repos vendor
-# from it). This must stay the LAST install rule in the root CMakeLists so the
-# manifest it checks is complete.
+# Repo-internal rule-and-record documents never install: REVIEW.md / REVIEW.das,
+# ARCHITECTURE.md, LAWS.md, MASTERPLAN logs, followup/perf/profile ledgers. The two
+# exceptions are REVIEW_COMMON.md and ARCHITECTURE_COMMON.md at the install root
+# (adopting repos vendor from them). This must stay the LAST install rule in the
+# root CMakeLists so the manifest it checks is complete.
 install(CODE "set(_das_docdir \"${DAS_INSTALL_DOCDIR}\")")
 install(CODE [[
     set(_review_leaks "")
     if(IS_ABSOLUTE "${_das_docdir}")
-        set(_root_common "$ENV{DESTDIR}${_das_docdir}/REVIEW_COMMON.md")
+        set(_root_docdir "$ENV{DESTDIR}${_das_docdir}")
     else()
-        set(_root_common "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/${_das_docdir}/REVIEW_COMMON.md")
+        set(_root_docdir "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/${_das_docdir}")
     endif()
-    get_filename_component(_root_common "${_root_common}" ABSOLUTE)
+    get_filename_component(_root_common "${_root_docdir}/REVIEW_COMMON.md" ABSOLUTE)
+    get_filename_component(_root_arch_common "${_root_docdir}/ARCHITECTURE_COMMON.md" ABSOLUTE)
     foreach(_f IN LISTS CMAKE_INSTALL_MANIFEST_FILES)
         get_filename_component(_name "${_f}" NAME)
         get_filename_component(_f_abs "${_f}" ABSOLUTE)
-        if(_name MATCHES "^REVIEW.*\.(md|das)$" AND NOT _f_abs STREQUAL _root_common)
+        if((_name MATCHES "^REVIEW.*\.(md|das)$"
+                OR _name MATCHES "^(ARCHITECTURE[A-Za-z_]*|LAWS|MASTERPLAN[A-Za-z_]*|PERF_LEDGER|PROFILE|THINKING)\.md$"
+                OR _name MATCHES "^followup_.*\.md$")
+            AND NOT _f_abs STREQUAL _root_common
+            AND NOT _f_abs STREQUAL _root_arch_common)
             list(APPEND _review_leaks "${_f}")
         endif()
     endforeach()
     if(_review_leaks)
         list(JOIN _review_leaks "\n  " _review_leaks_text)
-        message(FATAL_ERROR "install carries repo-internal review files:\n  ${_review_leaks_text}")
+        message(FATAL_ERROR "install carries repo-internal rule/record documents:\n  ${_review_leaks_text}")
     endif()
 ]])

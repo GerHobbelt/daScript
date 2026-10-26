@@ -100,7 +100,8 @@ def private check_tutorial_floor(tut_texts, rst_texts : array<string>) {
 let private AUDIO_CARRIER = "modules/dasLLAMA/dasllama/dasllama_audio_embedder.das"
 let private VISION_CARRIER = "modules/dasLLAMA/dasllama/dasllama_vision_embedder.das"
 
-// The licensed family namers per modality - ARCHITECTURE.md §1 ledgers each with its reason.
+// The licensed family namers per modality - the ARCHITECTURE_MEDIA.md carrier charters (§1.7,
+// §1.7b) ledger each with its reason.
 var private AUDIO_SEAM_EXEMPT <- {
     "modules/dasLLAMA/dasllama/dasllama_asr.das",
     "modules/dasLLAMA/dasllama/dasllama_metal_tower.das",
@@ -187,12 +188,66 @@ def private check_family_seams(carrier, kind_enum : string; exempt : table<strin
     }
 }
 
+// The backend-role partition, mechanically: every dasllama_<gpu>_*.das file's suffix is a role
+// ARCHITECTURE_GPU.md sec.1.5's role table carries — a new role file adds its role to BOTH.
+var private GPU_ROLES_METAL <- {
+    "kernels", "common", "decode", "prefill", "gemm", "shapes", "tower", "asr_dec", "lens"
+}
+
+var private GPU_ROLES_VULKAN <- {
+    "classes", "common", "decode", "prefill", "seams", "dispatch"
+}
+
+// the fastmath default, mechanically: a [metal_kernel] declaring fastmath=false
+// reds unless its file is listed here (the failing test ships with the kernel per the
+// checklist; adding to this set is a gate edit the master's weakening rule reviews).
+// Empty by design — no engine kernel has earned the opt-out.
+var private FASTMATH_OFF_EXEMPT : table<string>
+
+def private check_fastmath_default {
+    var files : array<string>
+    collect_das_files("modules/dasLLAMA/dasllama", files)
+    for (p in files) {
+        var line_no = 0
+        for (line in split(fread(p), "\n")) {
+            line_no++
+            continue if (find(line, "fastmath=false") < 0 && find(line, "fastmath = false") < 0)
+            if (!key_exists(FASTMATH_OFF_EXEMPT, p)) {
+                gate_finding(p, line_no,
+                    "kernel declares fastmath=false without an exemption naming the test that fails under fastmath - fastmath is the default; the opt-out ships its demonstrated breakage")
+            }
+        }
+    }
+    delete files
+}
+
+def private check_gpu_role_partition {
+    dir("modules/dasLLAMA/dasllama") $(name) {
+        return if (!ends_with(name, ".das"))
+        for (backend in ["metal", "vulkan"]) {
+            let prefix = "dasllama_{backend}_"
+            continue if (!starts_with(name, prefix))
+            var role = ""
+            peek_data(name) $(d) {
+                role = slice(d, length(prefix), length(d) - length(".das"))
+            }
+            let known = backend == "metal" ? key_exists(GPU_ROLES_METAL, role) : key_exists(GPU_ROLES_VULKAN, role)
+            if (!known) {
+                gate_finding("modules/dasLLAMA/dasllama/{name}",
+                    "backend file with role '{role}' that the partition does not carry - add the role to ARCHITECTURE_GPU.md sec.1.5's role table and this gate's set in the same change")
+            }
+        }
+    }
+}
+
 [export]
 def main() : int {
     if (!fexist("modules/dasLLAMA/REVIEW.das") || !fexist(FACADE)) {
         to_log(LOG_ERROR, "modules/dasLLAMA/REVIEW.das: run from the repo root\n")
         return 2
     }
+    check_gpu_role_partition()
+    check_fastmath_default()
     var inscope tut_texts : array<string>
     read_das_stripped(TUTORIAL_DIR, tut_texts)
     var inscope rst_texts : array<string>

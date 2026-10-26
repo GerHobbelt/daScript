@@ -32,6 +32,7 @@ SET(DAS_AOT_DASMETAL_MODULE_DEPENDS ${DASMETAL_AOT_DEPENDS})
 # the module is disabled). Bridge them to the suite-named vars the loops below consume. spirv/msl
 # also pull one test-side fixture; dasMetal/dasSpirv are always enabled so no gate is needed.
 SET(AOT_STBIMAGE_MODULE_FILES ${DASSTBIMAGE_AOT_FILES})
+SET(AOT_GLSL_MODULE_FILES ${DASGLSL_AOT_FILES})
 SET(AOT_SPIRV_MODULE_FILES ${DASSPIRV_AOT_FILES} tests/spirv/_spirv_common.das)
 SET(AOT_MSL_MODULE_FILES ${DASMETAL_AOT_FILES} tests/msl/_msl_common.das)
 
@@ -328,6 +329,11 @@ list(FILTER AOT_LANGUAGE_FILES EXCLUDE REGEX "failed_|cant_|invalid_")
 # Exclude module files (they are compiled via DAS_AOT_LIB below)
 list(FILTER AOT_LANGUAGE_FILES EXCLUDE REGEX "/_")
 
+# JIT-vs-AOT primitive benchmarks ride the language suite so test_aot_subset can run
+# them with real AOT stubs (`--bench` lane); they require nothing beyond testing_boost.
+FILE(GLOB AOT_JIT_BENCH_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "benchmarks/core/jit_aot/*.das")
+list(APPEND AOT_LANGUAGE_FILES ${AOT_JIT_BENCH_FILES})
+
 # Minimal daslib closure for test_aot_subset: ONLY the daslib modules whose
 # runtime functions tests/language actually calls (50101 otherwise). This is
 # NOT the all-daslib coverage lib above — keep it minimal; a new tests/language
@@ -383,7 +389,7 @@ set(DAS_AOT_SUITES
     class_boost daslib dasgltf daspeg data_walker debug debug_agent decs dynamic_cast_rtti fio
     fixed_array flatten fs functional gc glsl handle_types hash_map interfaces jit
     jobque json jsonrpc language linq lint long_array_table loops lpipe lsp
-    macro_boost macro_call match math mcp md_boost module_tests option promote quote
+    macro_boost macro_call match math mcp md_boost module_cache module_tests option promote quote
     reader_macro regex rtti safe_addr soa spoof strings stbimage table_packed template
     tests type_lattice type_traits typemacro uri with_boost delegate)
 foreach(_s IN LISTS DAS_AOT_SUITES)
@@ -404,7 +410,7 @@ foreach(_s IN LISTS DAS_AOT_SUITES)
     list(APPEND TEST_AOT_ALL_DAS ${AOT_${_u}_FILES})
 endforeach()
 
-set(DAS_AOT_MODULE_SUITES daslib decs language linq macro_boost math quote stbimage)
+set(DAS_AOT_MODULE_SUITES daslib decs glsl language linq macro_boost math quote stbimage)
 foreach(_s IN LISTS DAS_AOT_MODULE_SUITES)
     string(TOUPPER ${_s} _u)
     add_custom_target(test_aot_${_s}_modules)

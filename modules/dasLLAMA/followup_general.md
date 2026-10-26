@@ -543,7 +543,7 @@
 44. **The qwen25v (Qwen2.5-Omni/VL window ViT) CPU encode stays ~4.6x behind mtmd's clip
     (released `lcpp_bench --image` vs patched llama-mtmd-cli, CPU, --image-think, r=3, t=8,
     M1 Max) -
-    the tower is ruled exact-only (ARCHITECTURE.md 1.7b: per-32-block activation requant
+    the tower is ruled exact-only (ARCHITECTURE_MEDIA.md 1.7b: per-32-block activation requant
     cannot represent its outlier rows; a q8q8 lane measured 2.0 x rms where a deleted layer
     measures less).** Two honest paths if that encode ever matters: the Metal tower for the
     qwen ViT families (the same slice the qwen3v towers await), or outlier-aware activation
@@ -571,3 +571,52 @@
     looks green off-root is a hazard for worktree-based auditors. Done = the walk either
     resolves against the repo root explicitly or the run REFUSES (exit 2) when the walk
     yields zero files - an empty scan is never a pass.
+
+48. **The cross-module template-base reifier defect is unrecorded outside one code comment.**
+    `class template X : Base` with `Base` in another module fails reification -
+    `error[30915]: can't initialize field __finalize` (the stamped instance keeps the base
+    module's `self` type; `daslib/typemacro_boost.das`'s `__finalize` rewrite only covers the
+    same-module autoinfer-cast shape). `MetalAttnAVMmSgT` (dasllama_metal_prefill.das)
+    hand-inlines `MetalMmTileBase`'s tiles + `acc_quad` because of it - a hot primitive with
+    a second unsynced copy. Done = fix the reifier to re-point `__finalize` at the stamped
+    instance type for a cross-module parent (25-line repro: base class in module A,
+    `[template_struct_instance]` template extending it in module B; the same-module control
+    compiles), then collapse the inline copy back onto the base; until then any drift between
+    the copies is a review hazard.
+
+49. **The MoE kq tensor twins (K4/K5/K6) are gated by the DENSE kq crowns - a race that never
+    measured them.** `pf_compile_moe_kq_twins` keys on `metal_tensor_crowned("kq_mulmm_k4")`
+    etc. (dense 512x2048x1024 race), but the kernels it arms add the per-expert plane fold,
+    cnt/basep indirection and the tg-uniform early exit; the q8/mx4 MoE twins already have
+    their own MoE-shaped race families (`race_moe_mulmm_q8` / `_mx4`, ne=4, 32 rows/expert).
+    On a box where the dense K4 twin wins at 512 rows while the MoE K4 twin loses at
+    32 rows/expert, every routed K4 expert site takes the slower kernel for the life of the
+    sidecar, and the sidecar cannot express the split. Done = own race families
+    (`moe_mulmm_k4/k5/k6`) beside the q8/mx4 racers, PSO gates moved onto their crowns.
+
+50. **`float_a_ok` licenses the whole kernel, so the float-A gate is disarmed on twin-stamped
+    templates.** `ctx.float_a_ok` is one per-emit bool; a `[metal_kernel(float_a_ok=true)]`
+    on a template method covers every stamp - including the `XT = float16` twins the gate
+    exists to protect (a half family regressing to an f32 panel compiles clean). Nine of the
+    ten production license sites sit on such templates, and the q8b form (no half twin by
+    construction) FORCES the blanket switch onto any kernel that carries it. Done = make the
+    license a property of the call (a call-site argument the emitter reads beside m/n/sgs, or
+    a distinct builtin spelling for deliberate f32 forms) and exempt q8b by construction;
+    test_metal_float_a_gate's arms then split per-stamp.
+
+51. **`pool_release` cannot enforce its own postcondition - the handle survives the release.**
+    The reviewer's point stands: after a release the caller still holds the pointer, and a
+    double-release pushes a live buffer into the free list twice (two later frees of one
+    buffer; the new null-guard cannot see it). The suggested in-place fix is a das no-op -
+    `var buf : MetalBuffer?` is a by-value pointer copy, so nulling it never reaches the
+    caller (the LINT023 class). Done = the signature becomes `var buf : MetalBuffer?&` and
+    the body nulls after the push, with every call site audited for lvalue-ness in the same
+    change - an API pass over das_metal_boost, not a babysit patch.
+
+52. **`build_image`'s staging plane-group arm deletes nested fields unguarded** - the
+    `image_planes` arm frees with `if (consume)` alone while its top-level and `image_map`
+    siblings guard on `lock_count(field) == 0`. Unreachable today: `AudioTowerPlanes` embeds
+    only in the mint-side staging structs (`Qwen3aStaging.core`, `WhisperStaging.enc`),
+    which are always fresh-built and never parse targets, so no borrowed view can reach the
+    arm. Done = the arm carries the same `lock_count` guard as its siblings, added when that
+    arm is next touched for real work.

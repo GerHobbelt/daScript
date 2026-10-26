@@ -730,7 +730,7 @@ namespace das
                 throw_error_at(line, "stack overflow while calling %s",fn->mangledName);
             }
             // fill prologue
-            auto aa = abiArg; auto acm = cmres;
+            auto aa = abiArg; auto acm = abiCMRES;
             abiArg = args;  abiCMRES = cmres;
 #if DAS_SANITIZER
             memset(stack.sp(), 0xcd, fn->stackSize);
@@ -860,7 +860,7 @@ namespace das
         mutex                           forkContextPoolMutex;
     public:
         string                          name;
-        Bitfield                        category = 0;
+        Bitfield                        category = Bitfield(0u);
     public:
         vec4f *         abiThisBlockArg;
         vec4f *         abiArg;

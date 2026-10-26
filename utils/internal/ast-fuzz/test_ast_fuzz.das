@@ -76,7 +76,7 @@ def test_ast_verify_guesses_a_location_for_an_unset_at(t : T?) {
     t |> success(!died(ec, out), "compile crashed (exit {ec})\n{out}")
     t |> success(find(out, "ExprOp2 has no source location (at is unset) in 'lost_one'") >= 0,
         "did not report the unset at\n{out}")
-    t |> success(find(out, "in 'lost_one'; first located node inside it is ExprRef2Value at {f}:9:11") >= 0,
+    t |> success(find(out, "in 'lost_one'; first located node inside it is ExprVar at {f}:9:11") >= 0,
         "did not anchor inside the subtree, on the operand\n{out}")
     t |> success(find(out, "in 'deep_add'; preceded by ExprReturn at {f}:14:4") >= 0,
         "an unlocated subtree did not anchor to the node enclosing it\n{out}")
@@ -110,35 +110,36 @@ def test_ast_verify_batch_still_reports_a_macro_broken_tree(t : T?) {
         "batch mode did not report the unset at\n{out}")
 }
 
-// The two modes differ exactly in the pre-infer walk: plain mode's next-pass walk reports the
-// break, repairs it so the scan finishes, and the compile FAILS (the report is sticky - a plain
-// error would be wiped by the next pass); batch mode has no pre-infer walk, so the inferer meets
-// the break itself - the compile dies (or, for a break the inferer survives, the post-infer walk
-// reports it). Either way it is not silent. Two breakers, one per pre-infer entry point:
-// mid_pass_breaker between two passes of one run, run_start_breaker before pass 0 of a new run.
-def check_pre_infer_walk_is_plain_mode_only(t : T?; f : string) {
+def check_user_macro_break_is_reported(t : T?; f : string) {
+    for (mode in ["--ast-verify", "--ast-verify-batch"]) {
+        var out : string
+        let ec = run([BIN, mode, f], out, 60.0)
+        t |> success(!died(ec, out), "{mode}: compile crashed (exit {ec})\n{out}")
+        t |> success(find(out, "AST verify: ExprOp2.right is null") >= 0,
+            "{mode} did not report the null a user macro left\n{out}")
+        t |> success(ec != 0, "{mode} compiled a repaired tree as a success (exit {ec})\n{out}")
+    }
+}
+
+[test]
+def test_user_macro_break_is_reported_mid_pass(t : T?) {
+    check_user_macro_break_is_reported(t, "utils/internal/ast-fuzz/selftest/_mid_pass.das")
+}
+
+[test]
+def test_user_macro_break_is_reported_run_start(t : T?) {
+    check_user_macro_break_is_reported(t, "utils/internal/ast-fuzz/selftest/_run_start.das")
+}
+
+[test]
+def test_user_macro_break_at_optimize_is_reported(t : T?) {
     var out : string
-    var ec = run([BIN, "--ast-verify", f], out, 60.0)
-    t |> success(!died(ec, out), "plain mode: compile crashed (exit {ec})\n{out}")
+    let f = "utils/internal/ast-fuzz/selftest/_optimize.das"
+    let ec = run([BIN, "--ast-verify-batch", f], out, 60.0)
+    t |> success(!died(ec, out), "compile crashed (exit {ec})\n{out}")
     t |> success(find(out, "AST verify: ExprOp2.right is null") >= 0,
-        "plain mode did not report the null from the pre-infer walk\n{out}")
-    t |> success(ec != 0, "plain mode compiled a repaired tree as a success (exit {ec})\n{out}")
-    out = ""
-    ec = run([BIN, "--ast-verify-batch", f], out, 60.0)
-    t |> success(find(out, "AST verify: ExprOp2.right is null") < 0,
-        "batch mode ran a pre-infer walk\n{out}")
-    t |> success(died(ec, out) || find(out, "AST verify (post-infer)") >= 0,
-        "batch mode let the null through silently (exit {ec})\n{out}")
-}
-
-[test]
-def test_ast_verify_pre_infer_walk_is_plain_mode_only_mid_pass(t : T?) {
-    check_pre_infer_walk_is_plain_mode_only(t, "utils/internal/ast-fuzz/selftest/_mid_pass.das")
-}
-
-[test]
-def test_ast_verify_pre_infer_walk_is_plain_mode_only_run_start(t : T?) {
-    check_pre_infer_walk_is_plain_mode_only(t, "utils/internal/ast-fuzz/selftest/_run_start.das")
+        "the break an [optimization_macro] made went unreported\n{out}")
+    t |> success(ec != 0, "compiled a repaired tree as a success (exit {ec})\n{out}")
 }
 
 [test]
@@ -173,4 +174,16 @@ def test_generator_runs_and_classifies(t : T?) {
         "--seeds", "3", "--synth-size", "4", "--synth-depth", "2", "--timeout", "30"], out, 300.0)
     t |> success(!died(ec, out), "driver itself crashed or hung (exit {ec})\n{out}")
     t |> success(find(out, "run(s) —") >= 0, "driver produced no summary\n{out}")
+}
+
+[test]
+def test_verifier_tolerates_uninstantiated_field_default(t : T?) {
+    // a cross-module ctor in a field default of a struct nothing constructs: infer types the
+    // decl init but never binds the func - the post-infer walk must not report it
+    var out : string
+    let ec = run([BIN, "utils/internal/ast-fuzz/selftest/uninstantiated_default.das"], out, 60.0)
+    t |> success(!died(ec, out), "compile crashed (exit {ec})\n{out}")
+    t |> success(ec == 0, "the fixture must compile and run (exit {ec})\n{out}")
+    t |> success(find(out, "AST verify") < 0, "no verify report on the dead decl init\n{out}")
+    t |> success(find(out, "uninstantiated-default-ok") >= 0, "the fixture ran to its marker\n{out}")
 }

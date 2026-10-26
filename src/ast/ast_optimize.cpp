@@ -1,5 +1,5 @@
 #include "daScript/misc/platform.h"
-#include "daScript/ast/ast_post_infer.h"
+#include "daScript/ast/ast_pass_macros.h"
 
 #include "daScript/ast/ast.h"
 #include "daScript/ast/ast_expressions.h"
@@ -23,7 +23,6 @@ namespace das {
             last = program->optimizationRefFolding(optimizationRound);    if ( program->failed() ) break;  any |= last;
             if ( log ) logs << "REF FOLDING: " << (last ? "optimized" : "nothing") << "\n";
             if ( logPass ) logs << *program;
-            applyPostInferMacros(program);                                if ( program->failed() ) break;
             last = program->optimizationUnused(logs, optimizationRound);    if ( program->failed() ) break;  any |= last;
             if ( log ) logs << "REMOVE UNUSED:" << (last ? "optimized" : "nothing") << "\n";
             if ( logPass ) logs << *program;
@@ -43,7 +42,6 @@ namespace das {
             if ( log ) logs << "DEAD STORES:" << (last ? "optimized" : "nothing") << "\n";
             if ( logPass ) logs << *program;
             // this is here again for a reason
-            applyPostInferMacros(program);                                if ( program->failed() ) break;
             last = program->optimizationUnused(logs, optimizationRound);    if ( program->failed() ) break;  any |= last;
             if ( log ) logs << "REMOVE UNUSED:" << (last ? "optimized" : "nothing") << "\n";
             if ( logPass ) logs << *program;
@@ -56,6 +54,10 @@ namespace das {
                         if ( program->failed() ) {                       // if macro failed, we report it, and we are done
                             program->error("optimization macro " + mod->name + "::" + pm->name + " failed", "","",LineInfo(), CompilationError::runtime_macro);
                             return false;
+                        }
+                        if ( last ) {
+                            applyPostRewriteMacros(program);
+                            if ( program->failed() ) return false;
                         }
                     }
                 }

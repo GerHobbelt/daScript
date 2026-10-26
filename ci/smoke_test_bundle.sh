@@ -33,7 +33,7 @@ CI_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
 # Two exe naming conventions exist:
 #   * CPP_SUFFIX — for binaries built via cmake `add_executable` (daslang,
-#     daslang-live, gen1_to_gen2): platform-natural suffix (.exe on Windows,
+#     daslang-live): platform-natural suffix (.exe on Windows,
 #     none on Linux/macOS).
 #   * DASEXE_SUFFIX — for binaries built via `daslang -exe`: ALWAYS `.exe` on
 #     every platform (utils/CMakeLists.txt: "daslang -exe appends `.exe` to the
@@ -76,6 +76,7 @@ COMPILE_TESTS=(
     "daspkg|utils/daspkg/main.das"
     "detect-dupe|utils/detect-dupe/main.das"
     "fix-lint-errors|utils/fix-lint-errors/main.das"
+    "gen1-to-gen2|utils/gen1-to-gen2/main.das"
     "jobque-timeline|utils/jobque-timeline/main.das"
     "lint|utils/lint/main.das"
     "mcp|utils/mcp/main.das"
@@ -106,7 +107,6 @@ COMPILE_TESTS=(
 # and a bundle whose rpath points back at the build tree is present-but-dead on every
 # user's box.
 SHIPPED_EXE_TESTS=(
-    "gen1_to_gen2|cpp"
     "daslang-live|cpp"
     "benchctl|dasexe"
     "dascov|dasexe"
@@ -138,7 +138,15 @@ if [[ -z "$CPP_SUFFIX" && -d "$BUILD_LIB" ]]; then
 fi
 restore_and_clean() {
     rm -f "$LOG" "$LOG.suite" "$LOG.lint"
-    if [[ -n "$HIDDEN_LIB" && -d "$HIDDEN_LIB" ]]; then mv "$HIDDEN_LIB" "$BUILD_LIB"; fi
+    if [[ -n "$HIDDEN_LIB" && -d "$HIDDEN_LIB" ]]; then
+        # A concurrent build may have recreated lib/ meanwhile; mv into an existing
+        # dir would NEST the hidden copy instead of restoring it - merge then.
+        if [[ -e "$BUILD_LIB" ]]; then
+            cp -a "$HIDDEN_LIB"/. "$BUILD_LIB"/ && rm -rf "$HIDDEN_LIB"
+        else
+            mv "$HIDDEN_LIB" "$BUILD_LIB"
+        fi
+    fi
 }
 trap restore_and_clean EXIT
 
@@ -219,22 +227,29 @@ echo "Shipped skills:"
 printf '  %-30s ' "bundle layout"
 if [[ -f "$BUNDLE/skills/daslang/SKILL.md" && -d "$BUNDLE/skills/daslang/references" \
       && ! -d "$BUNDLE/skills/internal" && -f "$BUNDLE/.claude/skills/daslang/SKILL.md" \
-      && -f "$BUNDLE/REVIEW_COMMON.md" && -f "$BUNDLE/.claude/agents/dragon.md" ]]; then
+      && -f "$BUNDLE/REVIEW_COMMON.md" && -f "$BUNDLE/ARCHITECTURE_COMMON.md" \
+      && -f "$BUNDLE/.claude/agents/dragon.md" ]]; then
     echo "OK"
     PASS=$((PASS + 1))
 else
-    echo "FAIL (need skills/daslang/{SKILL.md,references/}, .claude/skills/daslang, .claude/agents/dragon.md, REVIEW_COMMON.md, and no skills/internal/)"
+    echo "FAIL (need skills/daslang/{SKILL.md,references/}, .claude/skills/daslang, .claude/agents/dragon.md, REVIEW_COMMON.md, ARCHITECTURE_COMMON.md, and no skills/internal/)"
     FAIL=$((FAIL + 1))
 fi
-# REVIEW.md / REVIEW.das are 100% internal -- per-folder review machinery never
-# ships. REVIEW_COMMON.md is the one exception: adopting repos vendor from it.
-printf '  %-30s ' "no REVIEW.md/REVIEW.das"
-REVIEW_LEAKS=$(find "$BUNDLE" \( -name "REVIEW*.md" -o -name "REVIEW*.das" \) ! -path "$BUNDLE/REVIEW_COMMON.md" 2>/dev/null)
+# Repo-internal rule/record documents never ship: REVIEW.md / REVIEW.das,
+# ARCHITECTURE.md, LAWS.md, MASTERPLAN logs, followup/perf/profile ledgers.
+# REVIEW_COMMON.md and ARCHITECTURE_COMMON.md at the bundle root are the two
+# exceptions: adopting repos vendor from them.
+printf '  %-30s ' "no internal rule/record docs"
+REVIEW_LEAKS=$(find "$BUNDLE" \( -name "REVIEW*.md" -o -name "REVIEW*.das" \
+    -o -name "ARCHITECTURE*.md" -o -name "LAWS.md" -o -name "MASTERPLAN*.md" \
+    -o -name "PERF_LEDGER.md" -o -name "PROFILE.md" -o -name "THINKING.md" \
+    -o -name "followup_*.md" \) \
+    ! -path "$BUNDLE/REVIEW_COMMON.md" ! -path "$BUNDLE/ARCHITECTURE_COMMON.md" 2>/dev/null)
 if [[ -z "$REVIEW_LEAKS" ]]; then
     echo "OK"
     PASS=$((PASS + 1))
 else
-    echo "FAIL (internal review files in bundle):"
+    echo "FAIL (internal rule/record docs in bundle):"
     echo "$REVIEW_LEAKS" | sed 's/^/    /'
     FAIL=$((FAIL + 1))
 fi
@@ -254,6 +269,43 @@ if [[ -z "$INTERNAL_REFS" ]]; then
 else
     echo "FAIL"
     printf '%s\n' "$INTERNAL_REFS" | sed 's/^/    /'
+    FAIL=$((FAIL + 1))
+fi
+
+# Every third-party notice the release-module set (plus the default-on modules)
+# installs must land at the bundle root -- an install rule silently not firing
+# (module off, typo'd RENAME, guard block not entered) is exactly the failure
+# mode that left shipped binaries without their notices.
+printf '  %-30s ' "third-party licenses present"
+MISSING_LICENSES=""
+for lic in URIPARSER DAG_NOISE VEC_MATH FMT FAST_FLOAT GLTF_SAMPLE_ASSETS \
+           HV OPENSSL LLVM Z3 MINIAUDIO OPENMPT CIPIC PUGIXML GLFW \
+           IMGUI FREETYPE MD4C JETBRAINS_MONO KHRONOS_GL \
+           VULKAN_HEADERS VOLK TREE_SITTER TREE_SITTER_ICU TREE_SITTER_C \
+           TREE_SITTER_CPP TREE_SITTER_MARKDOWN CLIP MINFFT SPIRV_HEADERS \
+           STB DROID_SANS_MONO; do
+    [[ -f "$BUNDLE/$lic.LICENSE" ]] || MISSING_LICENSES="$MISSING_LICENSES $lic"
+done
+[[ -f "$BUNDLE/LICENSE" ]] || MISSING_LICENSES="$MISSING_LICENSES <root>"
+if [[ -z "$MISSING_LICENSES" ]]; then
+    echo "OK"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL (missing:$MISSING_LICENSES)"
+    FAIL=$((FAIL + 1))
+fi
+
+# Soundfonts are fetched locally by devs and carry unclear redistribution terms;
+# the examples install excludes them by PATTERN, and this is that rule's
+# inverted control -- delete the PATTERN and this goes red on any box holding one.
+printf '  %-30s ' "no soundfonts in bundle"
+SF2_LEAKS=$(find "$BUNDLE" -iname '*.sf2' 2>/dev/null)
+if [[ -z "$SF2_LEAKS" ]]; then
+    echo "OK"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL (soundfonts in bundle):"
+    echo "$SF2_LEAKS" | sed 's/^/    /'
     FAIL=$((FAIL + 1))
 fi
 

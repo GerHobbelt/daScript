@@ -233,17 +233,35 @@ namespace das {
             const char * fieldNames [] = {"x","y","z","w"};
             for ( int r=0; r!=RowC; ++r ) {
                 this->addFieldEx(fieldNames[r], "m[" + to_string(r) + "]", r*ColC*sizeof(float),
-                    new TypeDecl(TypeDecl::getVectorType(Type::tFloat, ColC)));
+                    new TypeDecl(TypeDecl::getVectorType(Type::tFloat, ColC), cppBindingLineInfo()));
             }
         }
         virtual bool isIndexable ( const TypeDeclPtr & decl ) const override {
             return decl->isIndex();
         }
+        virtual void * jitGetAt ( Type indexType ) const override {
+            switch ( indexType ) {
+            case Type::tInt:
+                return (void *) +[] ( void * pMat, int32_t row, Context * context, LineInfoArg * at ) -> char * {
+                    auto & mat = *(Matrix<VecT,RowC> *)pMat;
+                    if ( uint32_t(row)>=RowC ) context->throw_error_at(at, "matrix index out of range %d", row);
+                    return (char *) &mat.m[uint32_t(row)];
+                };
+            case Type::tUInt:
+                return (void *) +[] ( void * pMat, uint32_t row, Context * context, LineInfoArg * at ) -> char * {
+                    auto & mat = *(Matrix<VecT,RowC> *)pMat;
+                    if ( row>=RowC ) context->throw_error_at(at, "matrix index out of range %u", row);
+                    return (char *) &mat.m[row];
+                };
+            default:
+                return nullptr;
+            }
+        }
         virtual TypeDeclPtr makeIndexType ( ExpressionPtr, ExpressionPtr idx ) const override {
             auto decl = idx->type;
             if ( !decl->isIndex() ) return nullptr;
             auto bt = TypeDecl::getVectorType(Type::tFloat, ColC);
-            auto pt = new TypeDecl(bt);
+            auto pt = new TypeDecl(bt, idx->at);
             pt->ref = true;
             return pt;
         }
@@ -268,7 +286,7 @@ namespace das {
         }
         virtual SimNode * simulateGetAt ( Context & context, const LineInfo & at, const TypeDeclPtr &,
                                          ExpressionPtr rv, ExpressionPtr idx, uint32_t ofs ) const override {
-            gc_local<TypeDecl> none = new TypeDecl(Type::none);
+            gc_local<TypeDecl> none = new TypeDecl(Type::none, cppBindingLineInfo());
             if ( auto tnode = trySimulate(context, rv, idx, none.ptr, ofs) ) {
                 return tnode;
             } else {
@@ -281,7 +299,7 @@ namespace das {
         virtual SimNode * simulateGetAtR2V ( Context & context, const LineInfo & at, const TypeDeclPtr & readType,
                                             ExpressionPtr rv, ExpressionPtr idx, uint32_t ofs ) const override {
             auto r2vType = readType->baseType;
-            gc_local<TypeDecl> r2vTypeDecl = new TypeDecl(r2vType);
+            gc_local<TypeDecl> r2vTypeDecl = new TypeDecl(r2vType, cppBindingLineInfo());
             if ( auto tnode = trySimulate(context, rv, idx, r2vTypeDecl.ptr, ofs) ) {
                 return tnode;
             } else {
@@ -567,20 +585,6 @@ namespace das {
     float4 quat_slerp(float t, float4 a, float4 b) {
         return v_quat_slerp(v_splats(t), a, b);
     }
-
-    struct floatNxNIndexFn : defaultTempFn {
-        floatNxNIndexFn() : defaultTempFn() {}
-        ___noinline bool operator () ( Function * fn ) {
-            defaultTempFn::operator()(fn);
-            if ( !fn->arguments.empty() ) {
-                fn->arguments[0]->type->explicitConst = true;
-            }
-            fn->builtIn = true;
-            fn->generated = true;
-            fn->jitOnly = true;
-            return true;
-        }
-    };
 
     template  <typename SimT, typename RetT>
     class MatrixCTorFn : public BuiltInFunction {
@@ -922,14 +926,6 @@ namespace das {
                 SideEffects::none, "float4x4_nequ")->args({"x","y"});
             addExtern<DAS_BIND_FUN(float4x4_neg), SimNode_ExtFuncCallAndCopyOrMove>(*this, lib, "-",
                 SideEffects::none,"float4x4_neg")->arg("x");
-            addExtern<DAS_BIND_FUN((floatNxN_ati<float4x4>)), SimNode_ExtFuncCallRef, floatNxNIndexFn>(*this, lib,
-                ".[]", SideEffects::modifyArgument, "floatNxN_ati<float4>")->args({"m","i","context","at"});
-            addExtern<DAS_BIND_FUN((floatNxN_atci<float4x4>)), SimNode_ExtFuncCallRef, floatNxNIndexFn>(*this, lib,
-                ".[]", SideEffects::none, "floatNxN_atci<float4>")->args({"m","i","context","at"});
-            addExtern<DAS_BIND_FUN((floatNxN_atu<float4x4>)), SimNode_ExtFuncCallRef, floatNxNIndexFn>(*this, lib,
-                ".[]", SideEffects::modifyArgument, "floatNxN_ati<float4>")->args({"m","i","context","at"});
-            addExtern<DAS_BIND_FUN((floatNxN_atcu<float4x4>)), SimNode_ExtFuncCallRef, floatNxNIndexFn>(*this, lib,
-                ".[]", SideEffects::none, "floatNxN_atci<float4>")->args({"m","i","context","at"});
             // 3x4
             addExtern<DAS_BIND_FUN(float3x4_from_float44), SimNode_ExtFuncCallAndCopyOrMove>(*this, lib, "float3x4",
                 SideEffects::none,"float3x4_from_float44");
@@ -963,14 +959,6 @@ namespace das {
                 SideEffects::none,"float3x4_neg")->arg("x");
             addExternInline<DAS_BIND_FUN(float3x4_det)>(*this, lib, "determinant",
                 SideEffects::none,"float3x4_det")->arg("x");
-            addExtern<DAS_BIND_FUN((floatNxN_ati<float3x4>)), SimNode_ExtFuncCallRef, floatNxNIndexFn>(*this, lib,
-                ".[]", SideEffects::modifyArgument, "floatNxN_ati<float4>")->args({"m","i","context","at"});
-            addExtern<DAS_BIND_FUN((floatNxN_atci<float3x4>)), SimNode_ExtFuncCallRef, floatNxNIndexFn>(*this, lib,
-                ".[]", SideEffects::none, "floatNxN_atci<float4>")->args({"m","i","context","at"});
-            addExtern<DAS_BIND_FUN((floatNxN_atu<float3x4>)), SimNode_ExtFuncCallRef, floatNxNIndexFn>(*this, lib,
-                ".[]", SideEffects::modifyArgument, "floatNxN_ati<float4>")->args({"m","i","context","at"});
-            addExtern<DAS_BIND_FUN((floatNxN_atcu<float3x4>)), SimNode_ExtFuncCallRef, floatNxNIndexFn>(*this, lib,
-                ".[]", SideEffects::none, "floatNxN_atci<float4>")->args({"m","i","context","at"});
             // quat
             addExternInline<DAS_BIND_FUN(quat_from_unit_arc)>(*this, lib, "quat_from_unit_arc",
                 SideEffects::none, "quat_from_unit_arc")->args({"v0","v1"});
@@ -1017,14 +1005,6 @@ namespace das {
                 SideEffects::none,"float3x3_neg")->arg("x");
             addExternInline<DAS_BIND_FUN(float3x3_det)>(*this, lib, "determinant",
                 SideEffects::none,"float3x3_det")->arg("x");
-            addExtern<DAS_BIND_FUN((floatNxN_ati<float3x3>)), SimNode_ExtFuncCallRef, floatNxNIndexFn>(*this, lib,
-                ".[]", SideEffects::modifyArgument, "floatNxN_ati<float4>")->args({"m","i","context","at"});
-            addExtern<DAS_BIND_FUN((floatNxN_atci<float3x3>)), SimNode_ExtFuncCallRef, floatNxNIndexFn>(*this, lib,
-                ".[]", SideEffects::none, "floatNxN_atci<float4>")->args({"m","i","context","at"});
-            addExtern<DAS_BIND_FUN((floatNxN_atu<float3x3>)), SimNode_ExtFuncCallRef, floatNxNIndexFn>(*this, lib,
-                ".[]", SideEffects::modifyArgument, "floatNxN_ati<float4>")->args({"m","i","context","at"});
-            addExtern<DAS_BIND_FUN((floatNxN_atcu<float3x3>)), SimNode_ExtFuncCallRef, floatNxNIndexFn>(*this, lib,
-                ".[]", SideEffects::none, "floatNxN_atci<float4>")->args({"m","i","context","at"});
             // packing
             addExternInline<DAS_BIND_FUN(pack_float_to_byte)>(*this, lib, "pack_float_to_byte",
                 SideEffects::none,"pack_float_to_byte")->arg("x");

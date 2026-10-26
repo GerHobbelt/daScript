@@ -328,7 +328,7 @@ def document_module_dasllama(_root : string) {
         group_by_regex("Generation", mod, %regex~(generate|generate_embd)$%%),
         group_by_regex("Embeddings", mod, %regex~(embed)$%%),
         group_by_regex("Vision and audio encoders", mod, %regex~(encode_image|encode_audio)$%%),
-        group_by_regex("Chat", mod, %regex~(create_chat|create_chat_renderer|add_user|add_user_audio|add_user_image|add_assistant|render_turn|render_turn_image|render_turn_audio|render_assistant|render_close|respond|set_thinking)$%%),
+        group_by_regex("Chat", mod, %regex~(create_chat|create_chat_renderer|add_user|add_user_audio|add_user_image|add_user_image_rows|add_assistant|render_turn|render_turn_image|render_turn_audio|render_assistant|render_close|respond|set_thinking)$%%),
         group_by_regex("Tool calling", mod, %regex~(set_tools|add_tool_results|render_assistant_calls|parse_calls)$%%),
         group_by_regex("Reasoning (thinking models)", mod, %regex~(split_reasoning|make_think_stream|think_feed|think_finish|think_drain|effective_stop_ids)$%%),
         group_by_regex("Operations: prepared images and dispatch", mod, %regex~(dlim_inventory|dlim_clean|set_dispatch_worker_limit|get_dispatch_worker_limit|select_matmul_backend_for_load|kernel_backend_available)$%%),
@@ -448,7 +448,7 @@ def document_module_rtti(_root : string) {
 def document_module_ast(_root : string) {
     var mod = [get_module("ast_core"), find_module("ast")]
     var groups <- array<DocGroup>(
-        group_by_regex("Compilation and file access", mod, %regex~(compile|compile_file|make_file_access)$%%),
+        group_by_regex("Compilation and file access", mod, %regex~(compile|compile_file|parse_file|make_file_access)$%%),
         group_by_regex("Call generation", mod, %regex~(make_call)$%%),
         group_by_regex("Visitor pattern", mod, %regex~visit.*%%),
         group_by_regex("Expression generation", mod, %regex~(force_generated|get_expression_annotation|make_type_info_structure|stamp_missing_at)%%),
@@ -1364,7 +1364,7 @@ def document_module_lint(_root : string) {
 def document_module_lint_config(_root : string) {
     var mod = find_module("lint_config")
     var groups <- array<DocGroup>(
-        group_by_regex("Configuration", mod, %regex~(load_lint_config|load_lint_config_from_path|load_env_disabled|seed_default_disabled|build_lint_macro_disabled|lint_config_forces_on)$%%),
+        group_by_regex("Configuration", mod, %regex~(load_lint_config|load_lint_config_from_path|load_env_disabled|seed_default_disabled|build_lint_macro_disabled|lint_config_forces_on|rule_docs_only_at|enforce_arch_at)$%%),
         group_by_regex("Path excludes", mod, %regex~(load_path_excludes_from_path|matches_path_excludes|is_lint_path_excluded)$%%),
         group_by_regex("Path-based rule defaults", mod, %regex~(is_daslib_source|is_shipped_library_source|is_core_library_source)$%%),
         group_by_regex("Lint-surface predicates", mod, %regex~(is_user_authored_body|is_lint_fixture_name|lint_file_skip_reason)$%%),

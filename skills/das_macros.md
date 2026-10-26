@@ -13,7 +13,7 @@ the moment a macro misbehaves. Which entry point depends on how much of the tree
 | Call | Use when |
 |---|---|
 | `daslang --ast-verify file.das` | first move on any unexplained crash - checks the module being compiled before each infer pass, so a break is reported on the pass right after it happens (`options log_infer_passes` shows the pass), repaired so the scan finishes, and the compile fails with every finding printed; after inference it sweeps every module on each firing. `require daslib/ast_verify` pins the same per-pass check in the source; `verify_module(prog, mod)` runs it at the end of your `apply()` |
-| `daslang --ast-verify-batch file.das` | the cheap form for gating many files (CI): no pre-infer checks, and post-infer only the module being compiled. A tree a macro breaks mid-inference then surfaces as a compiler crash, which a batch gate must count as a failure |
+| `daslang --ast-verify-batch file.das` | the cheap form for gating many files (CI): no pre-infer checks, and the module being compiled is walked once, right after inference (the ~10 post-infer firings per module all walk one tree). A tree a macro breaks mid-inference then surfaces as a compiler crash, which a batch gate must count as a failure |
 | `verify_expression(expr)` | you BUILD and RETURN a subtree - call / for-loop / variant / reader macros run inside inference, where the module-level form cannot see your result yet |
 | `verify_function(fn)` | you BUILD a function - `add_function` mangles the signature immediately, so a malformed result or argument type crashes there, before any pass could run |
 
@@ -75,11 +75,12 @@ those symbols by name - that resolves at the user's splice site and is unaffecte
   2026-08-07)
 - **A `[simulate_macro]` in a shared macro module NEVER fires for the user's program** - it only
   sees the program its own module was compiled as. The hooks that do see the user program:
-  `[pre_infer_macro]`, `[infer_macro]`, `[dirty_infer_macro]`, `[post_infer_macro]`,
+  `[infer_macro]`, `[dirty_infer_macro]`, `[optimization_macro]`, `[post_rewrite_macro]`,
   `[lint_macro]`, `[global_lint_macro]`, `[post_compile_macro]`.
-- A `[pre_infer_macro]` fires before EVERY inference pass; `canVisitPass(prog, mod, index)`
-  gates it per pass (`skills/daslang/references/macros.md`) - `daslib/ast_verify` answers `false`
-  to all of them under `--ast-verify-batch`.
+- A `[post_rewrite_macro]` fires right after any user pass macro (`[infer_macro]`,
+  `[dirty_infer_macro]`, `[optimization_macro]`) returns `true`, so it sees the half-built tree
+  that macro just produced - `daslib/ast_verify` checks structure there, not types: nodes a macro
+  just created are legitimately untyped until the next pass.
 - `[post_compile_macro]` is the only hook running after the module's gc root is collected -
   everything earlier still sees the garbage inference left behind, so orphan hunting and gc
   bookkeeping belong there. Use its `prog` argument; `compiling_program()` throws by then.

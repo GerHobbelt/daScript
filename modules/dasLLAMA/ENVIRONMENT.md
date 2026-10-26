@@ -85,8 +85,8 @@ Apple GPU backend. Absent on non-Apple builds, where setting them does nothing.
 | `DASLLAMA_METAL_GEMV_TG` | number | 4 | Rows per MoE router/expert GEMV threadgroup, clamped 1..32 (the dense GEMV geometry is fixed). |
 | `DASLLAMA_METAL_KQ_B8` | flag | on | Single-pass B8 twin for K-quant small-batch mv at B=5..8; 0 is the A/B rail. |
 | `DASLLAMA_METAL_KV_MIRROR_MB` | number | 4096 | Ceiling in MiB for the device-side KV mirror, clamped 64..4096. |
-| `DASLLAMA_METAL_RESIDENCY` | flag | on | Pin the served working set (weight regions, planes, the recycled pool buffers) in an MTLResidencySet, macOS 15+: the per-commit residency pass stays a no-op, so the first submission after a CPU-only window stops repaying it (~15 ms/encode on the M1 Max released-rig image cell; ARCHITECTURE.md 2.12); 0 is the A/B rail. |
-| `DASLLAMA_METAL_HEARTBEAT_S` | number | 180 | Seconds the residency-set heartbeat keeps re-requesting residency after the last served step (a requested set still un-wires over a long CPU-only window; ARCHITECTURE.md 2.12); 0 disables the heartbeat - the A/B rail. |
+| `DASLLAMA_METAL_RESIDENCY` | flag | on | Pin the served working set (weight regions, planes, the recycled pool buffers) in an MTLResidencySet, macOS 15+: the per-commit residency pass stays a no-op, so the first submission after a CPU-only window stops repaying it (~15 ms/encode on the M1 Max released-rig image cell; ARCHITECTURE_RUNTIME.md 2.12); 0 is the A/B rail. |
+| `DASLLAMA_METAL_HEARTBEAT_S` | number | 180 | Seconds the residency-set heartbeat keeps re-requesting residency after the last served step (a requested set still un-wires over a long CPU-only window; ARCHITECTURE_RUNTIME.md 2.12); 0 disables the heartbeat - the A/B rail. |
 | `DASLLAMA_METAL_HAZARD_PARANOID` | flag | off | Barrier at every dispatch instead of at tracker-detected hazards (correctness bisect). |
 | `DASLLAMA_METAL_HAZARD_STRICT` | flag | off | Treat every detected hazard as strict, widening barriers (correctness bisect). |
 | `DASLLAMA_METAL_PIPE_DEBUG` | flag | off | Per-step pipeline trace: GPU envelope and true inter-step handoff idle, first steps plus outliers. |
@@ -154,6 +154,7 @@ Apple Accelerate / AMX float lane. `DASLLAMA_ACCEL` arms the whole group.
 | `DASLLAMA_MODELS_DIR` | path | unset | Directory holding the .gguf models the probes, benches and tests load. dasllama-server's model catalog downloads here too when set. |
 | `DASLLAMA_CONFIRM_MODEL` | path | auto-resolved from the models dir | Model used by the tuner's confirm gate (FULL path, not a bare filename). Unset: the gate auto-resolves from the models dir - the preferred confirm carrier, else the largest present q8 gguf; the fallback pins only when the box has no q8 model at all. |
 | `DASLLAMA_BATCH_CHUNKS` | text | unset | Override the batched-dispatch chunk count in the 1-core GEMM probe. |
+| `DASLLAMA_PROBE_MODEL` | text | Qwen3VL-8B-Instruct-Q8_0.gguf | Model filename (inside the models dir) the image-turn attribution probe loads. |
 | `DASLLAMA_BATCH_GRID_2D` | number | unset | Use the 2D batch grid in the parity probe. |
 | `DASLLAMA_FOCUS_BACKEND` | text | unset | Restrict the 1-core GEMM probe to one backend. |
 | `DASLLAMA_FOCUS_SHAPE` | text | unset | Restrict the 1-core GEMM probe to one shape. |

@@ -225,10 +225,10 @@ struct public MetalEnv {
     @clarg_doc = "Ceiling in MiB for the device-side KV mirror, clamped 64..4096."
     kv_mirror_mb : int = 4096
 
-    @clarg_doc = "Pin the served working set (weight regions, planes, the recycled pool buffers) in an MTLResidencySet, macOS 15+: the per-commit residency pass stays a no-op, so the first submission after a CPU-only window stops repaying it (~15 ms/encode on the M1 Max released-rig image cell; ARCHITECTURE.md 2.12); 0 is the A/B rail."
+    @clarg_doc = "Pin the served working set (weight regions, planes, the recycled pool buffers) in an MTLResidencySet, macOS 15+: the per-commit residency pass stays a no-op, so the first submission after a CPU-only window stops repaying it (~15 ms/encode on the M1 Max released-rig image cell; ARCHITECTURE_RUNTIME.md 2.12); 0 is the A/B rail."
     residency : bool = true
 
-    @clarg_doc = "Seconds the residency-set heartbeat keeps re-requesting residency after the last served step (a requested set still un-wires over a long CPU-only window; ARCHITECTURE.md 2.12); 0 disables the heartbeat - the A/B rail."
+    @clarg_doc = "Seconds the residency-set heartbeat keeps re-requesting residency after the last served step (a requested set still un-wires over a long CPU-only window; ARCHITECTURE_RUNTIME.md 2.12); 0 disables the heartbeat - the A/B rail."
     heartbeat_s : int = 180
 
     @clarg_doc = "Barrier at every dispatch instead of at tracker-detected hazards (correctness bisect)."
@@ -385,6 +385,9 @@ struct public HarnessEnv {
 
     @clarg_doc = "Override the batched-dispatch chunk count in the 1-core GEMM probe."
     batch_chunks : string = ""
+
+    @clarg_doc = "Model filename (inside the models dir) the image-turn attribution probe loads."
+    probe_model : string = "Qwen3VL-8B-Instruct-Q8_0.gguf"
 
     @clarg_doc = "Use the 2D batch grid in the parity probe."
     batch_grid_2d : Option<int>
