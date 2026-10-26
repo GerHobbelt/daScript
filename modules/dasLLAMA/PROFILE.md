@@ -51,7 +51,7 @@ sidecar beside it — which is also the exe's provenance: the tune gate checks t
 because `tune_status()` is empty by design in a standalone exe (the winners are compiled in, so the
 policy rail never runs). A missing exe — or one older than ANY dasLLAMA source it bakes — is a hard
 stop with the build line printed; the rig never rebuilds silently, because that would put minutes of
-hidden work inside a measurement run. Measured: `--paranoid` 886 s from cold, `--quick` 85 s.
+hidden work inside a measurement run. Measured (old paranoid protocol): 886 s from cold, `--quick` 85 s.
 
 **Do NOT set `DAS_TUNE_MANIFEST` for these rigs.** The exe carries its own winners, and the rig
 actively clears an inherited value. Pointing it at a shared box manifest re-opens exactly what the
@@ -102,9 +102,19 @@ DASLLAMA_BOX=<box> bin/daslang modules/dasLLAMA/performance/gen_bench_records.da
   --ref-clean <llama-bench clean-cpu build> --ref-stock <llama-bench stock build>
 ```
 
-- Reference binaries also come from `LLAMA_BENCH_CLEAN` / `LLAMA_BENCH_STOCK`.
+- Reference binaries also come from `LLAMA_BENCH_CLEAN` / `LLAMA_BENCH_STOCK`. An unset ref is
+  loud: a warning at sweep start plus a skipped-pair list in the end summary — a das-only board
+  is legal but never a surprise.
 - `--legs` takes a comma list of `cpu` (= neon + amx) / `neon` / `amx` / `metal`; there is no
-  `all`. The full Apple board is `--legs cpu,metal`. `-w llm|asr|all`, `-o <substring>` to narrow.
+  `all`. The full Apple board is `--legs cpu,metal`. `-w llm|asr|image|all`, `-o <substring>` to
+  narrow.
+- Every official model with an mmproj companion (`mmproj_companion` in `model_specs.das`) also
+  gets its image-chat cells — one `--image` child per selected leg on the pinned
+  `bench_image_fixture()` picture, `--image-reps` (default 3) repetitions, each paired with a
+  patched `llama-mtmd-cli` reference cell (metal/amx vs the stock build's sibling of
+  `LLAMA_BENCH_STOCK`, neon vs the ASR rig's CPU ref build; the cpu arms pin
+  `--no-mmproj-offload` — without it the tower silently rides Metal). `-w image` runs just
+  those cells; the oracle re-verifies the stored das rows the same way.
 - `-p 512 -n 128 -r 5` are the recorded shapes. Changing them makes the row incomparable to
   every other row in the store.
 - `--settle <seconds>` (default 12) idles between passes; a dead child's multi-GB map reclaims
@@ -127,6 +137,8 @@ bin/daslang modules/dasLLAMA/performance/gen_site_records.das
 ## The image cell (`--image`)
 
 The image TURN on a vision decoder — what a user actually waits on when they attach a picture.
+Rig 3 spawns these for every official model with an mmproj companion (and the oracle re-verifies
+the stored rows); the manual form below is for off-board pairs and one-off probes.
 One process, one tune-key demand, one image-identity stamp, same as the ASR cell:
 
 ```sh
@@ -145,11 +157,14 @@ instrument only: its rows stamp `debug-jit` and never reach a board or a doc.
   the timed text and the row prices a reply the product would never have shown.
 - `workload = "image-chat"` on the record, beside `asr` and `audio-chat`. The picture is pinned by
   content hash in `files`, like the weights and the mmproj.
-- Two backends, one flag: without `--ngl` the cell runs all-CPU by intent
-  (`allow_cpu_prefill()`, `backend = "cpu"`); with `--ngl` it loads the metal-blob flavor and
-  the whole turn — head, span (`AttnArgs.uend`), tail, decode — serves on Metal
-  (`backend = "metal"`), with the tripwire ARMED so a CPU fallback reds the row instead of
-  sandbagging it. The Vulkan span is still declined (`followup_general.md` #23's other half).
+- Three arms, two flags: without `--ngl` the cell runs all-CPU by intent
+  (`allow_cpu_prefill()`, the tower driver pinned off and announced, `backend = "cpu"`); with
+  `--accel` it is the CPU row with the accelerate float-batch tier armed (`flavor = "accel"`;
+  a gemma4v tower then serves the file's planes through it instead of its q8 lane; refused
+  with `--ngl`); with `--ngl` it loads the metal-blob flavor and the whole turn — head, span
+  (`AttnArgs.uend`), tail, decode — serves on Metal (`backend = "metal"`), with the tripwire
+  ARMED so a CPU fallback reds the row instead of sandbagging it. The Vulkan span is still
+  declined (`followup_general.md` #23's other half).
 - The embedder ALONE is a kernel question, not a board row: price it in the kernel A/B lab, not here.
 
 ---
@@ -208,14 +223,15 @@ bin/daslang -jit modules/dasLLAMA/benchmarks/lcpp_bench.das -- --tok -m <model.g
 
 Every measurement above runs under a sidecar GENERATION, and the rails enforce it:
 
-- **Session start / external-box profiling:** mint PARANOID as part of building the exe —
-  `daspkg release ... --paranoid`. Release ALWAYS mints; the noise gates refuse a loud box
-  (nonzero, nothing written), validation re-races the winners, the previous sidecar snapshots
-  to `.bak` with a printed DIFF, and every mint archives to `~/.tune-history/<box>/`.
+- **Session start / external-box profiling:** mint as part of building the exe —
+  `daspkg release ...`. Release ALWAYS mints; the noise probes stamp the box's cv (only a
+  busy box refuses), validation re-races every changed kernel against its fallback and
+  demotes a winner that lost its margin, the previous sidecar snapshots to `.bak` with a
+  printed DIFF, and every mint archives to `~/.tune-history/<box>/`.
 - **Iteration rebuilds within a session:** `daspkg release ... --quick` — the ONLY path that
   inherits, and only a complete fresh sidecar (incomplete or stale still mints). Forgetting
   `--quick` costs one normal re-mint, never correctness.
-- **Collect and oracle are different scenarios.** Publishing (rig 3) wants a fresh paranoid
+- **Collect and oracle are different scenarios.** Publishing (rig 3) wants a fresh
   generation; the oracle (rig 2) verifies against the STORED rows' generation — rows carry
   `tune_sha`, a mismatch is `INCOMPARABLE` by default (`--oracle-allow-crossgen` forces,
   legacy rows warn), and each generation's full doc sits beside the store as

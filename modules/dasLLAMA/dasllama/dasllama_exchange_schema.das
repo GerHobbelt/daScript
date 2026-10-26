@@ -635,7 +635,13 @@ def private validate_race(doc : JsonValue const?; var errors : array<string>) {
         if (!empty(fb) && !ident_ok(fb)) {
             err(errors, "{fp}.fallback", "not an identifier")
         }
+        // the winner the validation re-race demoted (its seat went back to the fallback)
+        let dm = chk_str(fam, "demoted", false, MAX_SHORT, fp, errors)
+        if (!empty(dm) && !ident_ok(dm)) {
+            err(errors, "{fp}.demoted", "not an identifier")
+        }
         chk_num(fam, "floor_pct", false, 0.0lf, 1000000.0lf, fp, errors)
+        chk_num(fam, "margin_pct", false, -1000000.0lf, 1000000.0lf, fp, errors)
         let rows = jget(fam, "rows")
         if (rows == null) {
             continue
@@ -694,6 +700,23 @@ def private validate_sidecar_doc(doc : JsonValue const?; submission : bool; var 
     return empty(errors)
 }
 
+// A slash followed by a space is prose, not a path: AMD APU brand strings read
+// `... 8700GE w/ Radeon 780M Graphics`, and that string is the box identity itself.
+def private path_shaped(s : string) : bool {
+    var shaped = s |> starts_with("/") || s |> starts_with("~")
+    peek_data(s) $(arr) {
+        let n = length(arr)
+        for (i in range(n)) {
+            let c = int(arr[i])
+            if (c == '\\' || (c == '/' && (i + 1 >= n || int(arr[i + 1]) != ' '))) {
+                shaped = true
+                break
+            }
+        }
+    }
+    return shaped
+}
+
 //! Strip what must never leave (or reach) a public store: `provenance.binary` (a full local
 //! path with the username in it) and any other path-shaped provenance value. Returns the
 //! stripped document, "" when the input does not parse. The submitting client AND the ladder
@@ -709,12 +732,8 @@ def exchange_strip_private(text : string) : string {
         var pt & = unsafe(prov.value as _object)
         var drop : array<string>
         for (k, v in keys(pt), values(pt)) {
-            var path_shaped = false
-            if (v != null && v.value is _string) {
-                let s = v.value as _string
-                path_shaped = find(s, "/") >= 0 || find(s, "\\") >= 0
-            }
-            if (k == "binary" || path_shaped) {
+            let is_path = v != null && v.value is _string && path_shaped(v.value as _string)
+            if (k == "binary" || is_path) {
                 drop |> push("{k}")   // clone — k aliases the key the erase below frees
             }
         }

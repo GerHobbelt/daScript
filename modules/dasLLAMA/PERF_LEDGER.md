@@ -12,6 +12,44 @@ what it costs today and what the fix would change.
 
 ## Entries
 
+- **OPEN — the spliced image prefill trails llama.cpp on Metal (measured 2026-08-21, M1 Max,
+  the image-ref arc).** Record-grade image-chat pairs (released `lcpp_bench` exe vs patched
+  `llama-mtmd-cli`, both pricing prefill as own positions over own time, ~160 positions): on
+  the Metal leg (das `--ngl 99` vs `llama-mtmd-cli -ngl 99 -n 32`) the `img:pp` ratio is
+  das/lcpp **0.52–0.62×** across all three vision models (E2B 687 vs 1101, E4B 362 vs 658,
+  12B 140 vs 268 tok/s) while das leads every CPU prefill cell and every encode/decode cell
+  on every leg. Mechanism hypothesis (proximity, unmeasured): the das image
+  turn evals head / soft-token rows / tail as THREE separate prefill quanta, and at ~160
+  positions the per-eval fixed cost (graph build, dispatch, KV plumbing) dominates — llama.cpp
+  runs one graph over the whole span. Levers to try: fuse the three evals into one span eval
+  with a per-range mask; or cut per-eval overhead on short prefills (the text pp512 cells show
+  no such gap — das leads Metal text prefill, so this is short-turn overhead, not kernel
+  throughput). The decode-side and encode-side crowns are unaffected.
+
+- **gemma4v ViT tower (E-series): the encode is the image turn's biggest single stage on every
+  CPU tier; the q8 lane and the Metal leg both landed (measured 2026-08-19, M1 Max, the gemma4v
+  arc).** The tower is 16 blocks × 7 GEMMs (112 bf16 GEMMs, ≈151 MMAC per patch) over 1170
+  patches for a 640×480 photo (→ 130 soft tokens). Record-grade, from the released `lcpp_bench`
+  exe's image cell (gemma-4-E2B Q8_0 off the image rail, `-r 5`): the **CPU row** (the q8 block-
+  GEMM lane, `flavor tuned`) `img:enc` **419 ms**, `img:pp` 366 tok/s over the 155-token spliced
+  prompt (0.42 s), `img:tg` 41.6 tok/s — the encode is ≈ 40 % of a 32-token turn; the
+  **`--accel` row** (the +AMX float-batch tier on the file's planes, `flavor accel`) `img:enc`
+  **459 ms**, `img:pp` 369, `img:tg` 42.6. Stage-level, from the `g4v.*` `asr_prof_report`
+  buckets of a `-jit` probe (`gemma4v_encode` on a 624×480 canvas, `DASLLAMA_CPU_PREFILL=1`,
+  three reps, direction only): the exact-plane CPU lane through `matmul_bf16_batch`'s per-row
+  `dot_bf16` loop costs ≈ 1.9 s per encode (GEMMs ≈ 90 %, ≈ 92 GMAC/s aggregate — ~10× under
+  the q8×q8 prefill kernels), the q8 lane ≈ 0.43 s (GEMMs 238 ms, the attention core 163 ms —
+  now the #2 bucket), and the Metal block loop ≈ 89 ms with the stem (10 ms) and tail (2 ms) on
+  the CPU. Prediction P2 (0.9–1.8 s, ≥ 12 % of the turn, for the exact CPU lane): the share held
+  by a wide margin, the absolute landed just above the band. **Ruled and landed in the arc:** the
+  q8 tower lane (the gemma4a / parakeet recipe — Q8_0 GEMM planes + per-row requant) is the CPU
+  serving default, the Metal leg (`register_gemma4v_gpu`) serves the file's planes on Apple
+  builds, and the lane follows the serving path (Metal tower or the accelerate tier → exact
+  planes; else q8). Left on the table: the CPU attention core (163 ms of the q8 lane's 430), the
+  per-row `pf_enc_rms` at head width (256-thread groups over 64 elements, ~14k tiny dispatches
+  per block pair), and the E2B decoder's own Metal prefill decline ("layers", `required` mode,
+  independent of the image span) — until that is served, the gemma4v Metal leg is the only GPU
+  piece of an E2B image turn and the `--ngl` image row cannot run.
 - **gemma4uv vision embedder: no quantized lane; the dlim rail is owed anyway (measured
   2026-08-14, M1 Max, the vision arc's slice G).** The embedder is two GEMMs (6912→3840 patch
   projection, 3840×3840 output projection). In a product-shaped turn — gemma-4-12B Q4_K_M
@@ -845,9 +883,9 @@ group; wording kept.
 
 ### From `audio_models_plan.md` (Findings; correctness, not perf)
 
-- **OPEN — the v0.3 Mistral `[INST]` template's derived close is ` [/INST]` — wrong for multi-turn
-  (should be `</s>`); untouched, flagged for Boris.** Pre-existing; spotted in audio session B while
-  adding `ChatTemplate.assistant_close` for the v7-tekken template (which does close with `</s>`).
+- **RESOLVED (87ffe39fe) — the v0.3 Mistral `[INST]` template's derived close was ` [/INST]` —
+  wrong for multi-turn.** Fixed: `mistral_instruct_template`'s `assistant_close` is `</s>`, like
+  v7-tekken's. Spotted in audio session B while adding `ChatTemplate.assistant_close`.
 
 ### From `whisper_plan.md` ("Performance ledger — fold into API_REWORK.md at PR time")
 

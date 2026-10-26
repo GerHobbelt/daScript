@@ -327,10 +327,10 @@ def document_module_dasllama(_root : string) {
         group_by_regex("Generation", mod, %regex~(generate|generate_embd)$%%),
         group_by_regex("Embeddings", mod, %regex~(embed)$%%),
         group_by_regex("Vision", mod, %regex~(encode_image)$%%),
-        group_by_regex("Chat", mod, %regex~(create_chat|create_chat_renderer|add_user|add_user_audio|add_user_image|add_assistant|render_turn|render_turn_image|render_assistant|render_close|respond|set_thinking)$%%),
+        group_by_regex("Chat", mod, %regex~(create_chat|create_chat_renderer|add_user|add_user_audio|add_user_image|add_assistant|render_turn|render_turn_image|render_turn_audio|render_assistant|render_close|respond|set_thinking)$%%),
         group_by_regex("Tool calling", mod, %regex~(set_tools|add_tool_results|render_assistant_calls|parse_calls)$%%),
         group_by_regex("Reasoning (thinking models)", mod, %regex~(split_reasoning|make_think_stream|think_feed|think_finish|think_drain|effective_stop_ids)$%%),
-        group_by_regex("Operations: prepared images and dispatch", mod, %regex~(dlim_inventory|dlim_clean|set_dispatch_worker_limit|get_dispatch_worker_limit|select_matmul_backend_for_load)$%%),
+        group_by_regex("Operations: prepared images and dispatch", mod, %regex~(dlim_inventory|dlim_clean|set_dispatch_worker_limit|get_dispatch_worker_limit|select_matmul_backend_for_load|kernel_backend_available)$%%),
         group_by_regex("Operations: GPU tier and model slots", mod, %regex~(gpu_tier_status|set_gpu_tier_want|moe_gpu_tier_arm|moe_gpu_weight_budget|gpu_model_marks_init|gpu_slot_capture|gpu_slot_rearm|moe_gpu_model_marks_save|moe_gpu_model_marks_restore|moe_gpu_hydrate_session|moe_gpu_drop_model|set_resident_prefill_allowed)$%%)
     )
     var hook = DocsHook()
@@ -372,10 +372,10 @@ def document_module_dasllama(_root : string) {
             "A loaded audio encoder: Whisper-family encoder weights plus the model-specific projector tail, as produced by ``load_audio_tower`` from an mmproj GGUF. Pass it to ``create_chat`` to enable ``add_user_audio`` turns.")
         dasllama_type_stanza(f, "struct-dasllama_vision-VisionImage", "VisionImage",
             "A decoded RGB8 image: ``width``, ``height``, and the pixel bytes in ``rgb``. Produced by ``load_image_rgb`` (the optional ``dasllama_vision_io`` companion) or built directly; ``add_user_image`` / ``encode_image`` letterbox and normalize it to the model's geometry.")
-        dasllama_type_stanza(f, "struct-dasllama_gemma4uv-Gemma4uvEmbedder", "Gemma4uvEmbedder",
-            "A loaded gemma vision embedder: the mmproj GGUF's projection weights plus the family's geometry, as produced by ``load_gemma4uv_embedder``. Pass it to ``create_chat`` to enable ``add_user_image`` turns; ``proj_dim`` must match the decoder's embedding width (checked at create).")
-        dasllama_type_stanza(f, "struct-dasllama_gemma4uv-Gemma4uvState", "Gemma4uvState",
-            "Caller-owned scratch for the embedder forward: the im2col and GEMM buffers ``encode_image`` reuses across calls. One per embedder user; holds no image state between calls.")
+        dasllama_type_stanza(f, "struct-dasllama_vision_embedder-VisionEmbedder", "VisionEmbedder",
+            "A loaded vision embedder of whatever family the mmproj GGUF turned out to be (gemma4uv — the gemma-4 dense embedder; gemma4v — the gemma-4 E-series ViT tower; gemma3v — the gemma-3 SigLIP tower), as produced by ``load_vision_embedder``, which sniffs the family. Pass it to ``create_chat`` to enable ``add_user_image`` turns; ``vision_proj_dim`` must match the decoder's embedding width (checked at create).")
+        dasllama_type_stanza(f, "struct-dasllama_vision_embedder-VisionState", "VisionState",
+            "Caller-owned scratch for the embedder forward of whichever family is carried: the buffers ``encode_image`` reuses across calls. One per embedder user; holds no image state between calls.")
         dasllama_type_stanza(f, "struct-dasllama_image-DlimImageInfo", "DlimImageInfo",
             "One prepared image beside a GGUF, as listed by ``dlim_inventory``: ``file``, ``path``, ``bytes``, the image ``version``, its bake ``identity``, and a ``verdict`` — ``CURRENT`` loads; ``STALE vN`` is an older image version; ``OTHER`` a different bake configuration or box; ``FOREIGN`` a different flavor.")
         dasllama_type_stanza(f, "struct-dasllama_gpu_tier-GpuTierStatus", "GpuTierStatus",
@@ -1356,7 +1356,8 @@ def document_module_lint_config(_root : string) {
         group_by_regex("Path excludes", mod, %regex~(load_path_excludes_from_path|matches_path_excludes|is_lint_path_excluded)$%%),
         group_by_regex("Path-based rule defaults", mod, %regex~(is_daslib_source|is_shipped_library_source|is_core_library_source)$%%),
         group_by_regex("Lint-surface predicates", mod, %regex~(is_user_authored_body|is_lint_fixture_name|lint_file_skip_reason)$%%),
-        group_by_regex("Structured findings", mod, %regex~(make_lint_issue)$%%)
+        group_by_regex("Structured findings", mod, %regex~(make_lint_issue)$%%),
+        group_by_regex("Format policy", mod, %regex~(format_policy_for|partition_by_format_policy)$%%)
     )
     document("Repo-level lint configuration", mod, "lint_config.rst", groups)
 }

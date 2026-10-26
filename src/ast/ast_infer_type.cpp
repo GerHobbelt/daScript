@@ -6136,6 +6136,7 @@ namespace das {
                 return Visitor::visit(expr);
             }
             auto ecast = new ExprCast(expr->at, expr->clone(), new TypeDecl(*expr->aliasSubstitution));
+            if ( !ecast->castType->at.fileInfo ) ecast->castType->at = expr->at;
             ecast->reinterpret = true;
             ecast->alwaysSafe = true;
             expr->aliasSubstitution = nullptr;
@@ -6156,7 +6157,6 @@ namespace das {
                     } else {
                         auto mks = new ExprMakeStruct(expr->at);
                         mks->makeType = new TypeDecl(*aliasT);
-                    if ( !mks->makeType->at.fileInfo ) mks->makeType->at = expr->at;
                         if ( !mks->makeType->at.fileInfo ) mks->makeType->at = expr->at;
                         return mks;
                     }
@@ -6180,6 +6180,8 @@ namespace das {
                     }
                     reportAstChanged();
                     auto ecast = new ExprCast(expr->at, expr->arguments[0]->clone(), new TypeDecl(*aliasT));
+                    if ( !ecast->castType->at.fileInfo ) ecast->castType->at = expr->at;
+                    if ( ecast->castType->firstType && !ecast->castType->firstType->at.fileInfo ) ecast->castType->firstType->at = expr->at;
                     ecast->reinterpret = true;
                     ecast->alwaysSafe = true;
                     return ecast;
@@ -6374,27 +6376,29 @@ namespace das {
         return evalAndFoldStringBuilder(expr);
     }
 
-    // try infer, if failed - no macros
-    // run macros til any of them does work, then reinfer and restart (i.e. infer after each macro)
-    static bool applyPreInferMacros ( Program * program ) {
-        auto nErr = program->errors.size();
+    // called once per inferTypesDirty pass, right after errors.clear(); each macro decides its
+    // own per-pass firings through canVisitPass. A report that must survive the per-pass
+    // errors.clear() is the macro's job (macro_sticky_error) - the loop never stops for one,
+    // stopping it would skip the infer-macro rounds and relocate/POD, and the pass would still
+    // clear the plain error
+    static void applyPreInferMacros ( Program * program, int pass ) {
+        auto thisModule = program->thisModule.get();
         // program->library, not Module::foreach: the latter walks every module in the
         // process, so a nested compile would run macros from an unrelated program
         program->library.foreach([&](Module * mod) -> bool {
             for ( const auto & pm : mod->preInferMacros ) {
-                pm->apply(program, program->thisModule.get());
+                if ( pm->canVisitPass(program, thisModule, pass) ) {
+                    pm->apply(program, thisModule);
+                }
             }
             return true;
         }, "*");
-        // the next pass clears program->errors, so a violation has to stop the loop
-        return program->errors.size() == nErr;
     }
 
     void inferTypes(Program * program, TextWriter &logs, ModuleGroup &libGroup) {
         program->newLambdaIndex = 1;
         // inferPassesUsed is NOT reset here — parseDaScript resets it once per module
         // before the restartInfer: loop, so multiple inferTypes legs accumulate properly.
-        applyPreInferMacros(program);
         inferTypesDirty(program, logs, false);
         bool anyMacrosDidWork = false;
         bool anyMacrosFailedToInfer = false;
@@ -6416,7 +6420,6 @@ namespace das {
                             return false;
                         }
                         if (anyWork) { // if macro did anything, we done
-                            applyPreInferMacros(program);
                             program->reportingInferErrors = true;
                             inferTypesDirty(program, logs, true);
                             program->reportingInferErrors = false;
@@ -6523,9 +6526,7 @@ namespace das {
             program->inferPassesUsed++;   // count each body invocation; avoids undercount when loop breaks early (pass is 0-based)
             program->failToCompile = false;
             program->errors.clear();
-            if (!applyPreInferMacros(program)) {
-                break;
-            }
+            applyPreInferMacros(program, pass);
             InferTypes context(program, &logs);
             context.verbose = verbose || logInferPasses;
             program->visit(context);

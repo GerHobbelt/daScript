@@ -5,17 +5,30 @@
 
 **`tests/`, `benchmarks/`, and `performance/` carry their own checklists, and they govern by
 KIND, not location:** a dasLLAMA `[test]` file, wherever the diff puts it, answers to this
-module's `tests/REVIEW.md` — and every `dasllama/` change opens `tests/REVIEW.md` for the test
-obligation it names; a timing rig — a script whose output is a measured wall or rate — and any
+module's `tests/REVIEW.md`; a timing rig — a script whose output is a measured wall or rate — and any
 kernel A/B lab, wherever the diff puts them, answer to `benchmarks/REVIEW.md`; a change to what
 enters `performance/records/` or its manifests, and an exchange or provenance-manifest change,
-answers to `performance/REVIEW.md`. A kind-routed file applies BOTH its checklist and this one.
+answers to `performance/REVIEW.md`.
+
+**Every `dasllama/` change applies `tests/REVIEW.md` for the test obligation it names.**
 
 **Kind-routed companions sit beside this file:** a GPU kernel, driver, dispatch-class, or
-K/V-mirror change applies `REVIEW_GPU.md`; an audio or ASR change `REVIEW_AUDIO.md`; a vision
-or media change `REVIEW_VISION.md`. A change to what the tune sidecar emits, wherever it
-lands, answers to `modules/dasLLVM/REVIEW.md`. Every file under `modules/dasLLAMA/` that the
-routing above does not claim is reviewed against the rules below.
+K/V-mirror change applies `REVIEW_GPU.md`. A change to `dasllama/dasllama_audio.das`,
+`dasllama/dasllama_audio_io.das`, `dasllama/dasllama_asr.das`, `dasllama/dasllama_asr_types.das`,
+`dasllama/dasllama_vad.das`, or an ASR family file — one `dasllama/dasllama_<family>.das`
+holding a single speech model family — applies `REVIEW_AUDIO.md`. A change to
+`dasllama/dasllama_vision.das`, `dasllama/dasllama_vision_io.das`,
+`dasllama/dasllama_vision_embedder.das`, a vision family file — one
+`dasllama/dasllama_<family>.das` holding a single vision projector family — or an in-process
+path (one that runs inside the program under review, not a spawned child process) that
+splices a stream carrying decoded media into a prompt or schedules such a stream, applies
+`REVIEW_VISION.md`. A
+`dasllama/dasllama_tower.das` change — the shared encoder-tower home — applies
+`REVIEW_AUDIO.md` and `REVIEW_VISION.md`; a family file that only CALLS a shared rail does not
+thereby pick up the other modality's checklist. A change to the tune sidecar's schema or
+emitter, wherever it lands, answers to `modules/dasLLVM/REVIEW.md`. A routed file applies BOTH
+the checklist it routes to and this one; every other file under `modules/dasLLAMA/` applies
+this one.
 
 **Any kernel work bumps `DASLLAMA_VERSION` (`dasllama/dasllama_version.das`) in the same change.** Kernel
 work is whatever changes the compiled compute a sidecar's winners were measured over: a kernel
@@ -51,8 +64,9 @@ the same weights and shape is a defect unless the site is a parity/oracle rail o
 comment naming why f32 is load-bearing there. Weights with no faster twin (unquantized
 planes) are out of scope.
 
-**Platform-specific code lands only in a platform backend file.** A platform-neutral file
-carrying it is a defect; a new shared concern gets its own file, not more of
+**Platform-specific code in an engine file (`dasllama/`) lands only in that platform's backend
+file.** A platform-neutral engine file carrying it is a defect; a new shared concern gets its
+own file, not more of
 `dasllama/dasllama_common.das`.
 
 **No ad-hoc profiling.** A NEW clock read paired with a print or log of the elapsed interval is
@@ -67,43 +81,47 @@ reaches it: the contracts arm down the call graph, so an interior function carri
 its own. A region entry is a KERNEL `*_encode` / `*_decode` / step driver; the tokenizer
 encode/decode path is out of scope (`ARCHITECTURE.md` §2.11).
 
-**A new entry point — a kernel-backend override, a batch donor, a step driver — carries its
-annotation itself; a rename is not new** (annotations follow the name in the same change).
+**A new function that no annotated entry reaches but the runtime enters — a step driver, or
+a backend entry called from dispatch or harness paths — carries its annotation itself; a
+rename is not new** (annotations follow the name in the same change).
 
 **A change to `encode`/`bpe_encode` or anything they reach in `dasllama/dasllama_spm.das` /
-`dasllama/dasllama_bpe.das` / `dasllama/dasllama_pretok.das` ships before/after `--tok` rows for the affected
-backend** — the instrument is the scaling ratio across the size ladder, and superlinear is a
-defect.
-
-**A change to the corpus input of the `--tok` measurement cell (`benchmarks/lcpp_bench.das`)
-ships the same before/after rows or a statement that the bytes are unchanged.**
+`dasllama/dasllama_bpe.das` / `dasllama/dasllama_pretok.das` ships before/after `--tok` rows
+(`benchmarks/lcpp_bench.das`) for the affected backend** — the instrument is the scaling
+ratio across the size ladder, and superlinear is a defect.
 
 **A change reaching `dasllama/dasllama_tokenizer.das`, `dasllama/dasllama_spm.das`,
 `dasllama/dasllama_bpe.das`, or `dasllama/dasllama_pretok.das` records a
 `tests/test_tokenizer.das` run with its cases EXECUTED, not skipped.**
 
-**An override announces itself where it changes the outcome.** An override is a gate escape,
-policy override, or threshold recalibration. Where one changes what a run measures, mints, or
-emits, a printed line names it by env spelling; set-but-inert stays silent, per-site repeats are
-fine. Adding one, or giving one a new effect, without the announce is a defect.
+**An override announces itself where it changes the outcome.** An override is an environment
+knob — an env variable or its programmatic setter — that moves a gate, policy, or threshold
+off its default; a CLI flag is never an override under this rule. Where one changes an
+observable outcome of the run — what it measures, writes, reads, or mints — a printed line
+names it by the env spelling; set-but-inert stays silent, per-site repeats are fine. Adding
+one, or giving one a new effect, without the announce is a defect.
 
-**Record-grade model timing — a self-measured time entering `performance/records/<box>.json`
-or `PERF_LEDGER.md` — comes only from the rigs `PROFILE.md` documents:
-`performance/gen_profile.das` and `performance/gen_bench_records.das`, both spawning
-`benchmarks/lcpp_bench.das`.** Any other producer, new or edited, is a defect. A tutorial's
-printed wall-clock is teaching output, feeding no board.
+**A self-measured model time entering `performance/records/<box>.json` or `PERF_LEDGER.md` comes
+from the released `lcpp_bench` exe — `benchmarks/lcpp_bench.das` built by `daspkg release`,
+spawned by `performance/gen_bench_records.das` or run by hand where the cell's `PROFILE.md`
+section says so — never from the `-jit` script** (a `--for-debug-purposes` row is a debug
+instrument). A tutorial's printed wall-clock is teaching output, feeding no board.
 
 **A new servable capability gets its cell in the same change**: a board row spawned by
 `performance/gen_bench_records.das`, or a manual `benchmarks/lcpp_bench.das` cell with its own
-`PROFILE.md` section. A modality, a family, or a serving path a user can wait on counts.
+`PROFILE.md` section. A modality, a family, or a serving path a user can wait on counts; a new
+family inside an existing cell owes a recorded row on at least one box.
 
-**A timing figure describing served output — tok/s, latency, a model-level comparison — that
-reaches a doc, a ledger, or a PR without a cell behind it is a defect.** The cell states its
-quant mode and stamps box and engine provenance, so a number can never silently describe a
-format nobody serves or a kernel set nobody ships. A rig-internal measurement margin — a crown
-delta, a noise floor, tuner timing — is settled by the sidecar or manifest stamp it rides in.
-A **stage-level figure** — a speedup of one engine stage, not a served turn — names the
-harness and flags that produced it, on the same line.
+**A timing figure describing served output — tok/s, latency, a model-level comparison — is a
+defect wherever it is written down with no cell behind it: a checked-in doc, a ledger, a code
+comment, or a PR description.** The cell states its quant mode and stamps box and engine
+provenance, so a number can never silently describe a format nobody serves or a kernel set
+nobody ships. A rig-internal measurement margin — a crown delta, a noise floor, tuner
+timing — is settled by the sidecar or manifest stamp it rides in.
+
+**A stage-level figure — a speedup of one engine stage, not a served turn — names the harness
+and flags that produced it in the same sentence, wherever it is written down: a checked-in
+doc, a ledger, a code comment, or a PR description.**
 
 **Runtime serves weights out of a mapped `.dlim`.** A live carrier's planes point into
 `parse_image`'s mapping, and going live does no real work — repacking, quantizing, folding,
@@ -120,8 +138,9 @@ per format, or per backend, is a defect even where its output is identical.
 out and writes each plane as it is produced. Keeping the source model resident to write from is
 a defect, and a mint that is slower in exchange for a lower peak is correct.
 
-**A carrier mint stages (`cache_via_image_staged`) only while its source file is under 1 GiB;
-at or past the line it streams like a decoder.**
+**A staged carrier mint (`cache_via_image_staged`) either refuses a source file at or past
+1 GiB, naming that file in the refusal, or streams it like a decoder** — the staged form holds
+source and image at once, and that doubled peak is what the line caps.
 
 **A `.dlim` is box- and config-specific, not a portable format.** `image_identity` names the
 box profile, the knobs, and the flavor a file was baked for, and a mismatch declines loudly. A
@@ -162,6 +181,9 @@ scheduler, and the exchange pair.
 internals: an engine file under `dasllama/`, a test, harness, benchmark, or rig this module
 owns, or a consumer `ARCHITECTURE.md` §1 names as ruled.** Any other file carrying it is a
 defect — a symbol the facade lacks is added to `dasllama/dasllama.das`, not escaped around.
+A `require ... public` that re-exports an engine module OUT of an escaped file, beyond what
+that consumer's ruled charter (`ARCHITECTURE.md` §1) grants, is the same defect wearing a
+different line.
 
 **Weakening `REVIEW.das` (beside this file) — the gate that fails when a `def` of
 `dasllama/dasllama.das` appears in no `tutorials/dasLLAMA/*.das` (repo root) or in no
@@ -206,13 +228,18 @@ its format family kept whole.** GPU twins land in their backend kernel file.
 **A kernel body lands in its tier or backend kernel file** — never in `dasllama/dasllama_math.das` or a
 lens/dispatch macro file.
 
-**A family quirk lands in the family file — or, when it is platform-specific, in that
-platform's backend file; a piece two families need moves UP into the concern's shared file
-(its own file when none exists)** — never sideways into a sibling.
+**A family quirk lands in the family file; a piece two families need moves UP into the
+concern's shared file (its own file when none exists)** — never sideways into a sibling.
 
-**A weight plane's element type follows its SOURCE tensor, per tensor.** A carrier reads a bf16
-tensor as bf16 and an fp32 tensor as fp32 — never rounds one down to match the other, and never
-decides the question for a whole file, because a shipped file mixes them.
+**Nothing in `dasllama/dasllama_tower.das` — the shared encoder-tower home — names a family: no
+signature there takes a type `dasllama/dasllama_audio.das` or a family file declares, and it
+requires neither.** The file every tower composes must serve every tower; a helper shaped for
+one lands in that tower's own file.
+
+**A weight plane's element type follows its SOURCE tensor, per tensor.** A carrier reads each
+tensor at the element type that tensor is stored as and never picks one type for the whole
+file (a shipped file mixes them); a type it cannot serve is refused in a message naming that
+tensor and its element type, never converted silently.
 
 **A harness that prints output for another tool to compare fails loudly when it has nothing to
 print.** A run that ends without its comparison lines — wrong flags, failed load — exits

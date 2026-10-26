@@ -64,6 +64,15 @@ struct ModelSpec {
     recipe : string
     companions : array<ProvEntry>   // artifacts fetched/verified with this model (mmproj, image fixture)
     parity : ParityEvidence
+    // serving-catalog membership (dasllama-server's /catalog view): a non-empty serve_name
+    // puts the row on the page. Serving rows carry COMMIT-PINNED urls - resolve/main floats.
+    serve_name : string             // stable kebab id ("" = not in the serving catalog)
+    serve_display : string
+    serve_note : string             // one-line what-it-is on the card
+    serve_ctx : int = 0             // trained context window
+    serve_vram_gb : float = 0.0     // advertised working-set hint, not a fit check
+    serve_default : bool = false    // the one the getting-started path recommends
+    serve_vision : string           // vision-tower companion NAME ("" = text only); [[serve_vision_tower]] resolves it
 }
 
 // ===== Parity fixture ids (frozen from the simple_ids oracle — harness/parity.sh) =====
@@ -264,7 +273,10 @@ let HF = "https://huggingface.co"   // shared with profile_common's asr_catalog 
 //! presence-gated, not sha-gated. fetch_models' --convert arm keys on this exact string.
 let REF_Q8_RECIPE = "derive: setup_asr_rig.das --refs quantizes it from the fp bin beside it (whisper.cpp quantize q8_0); reference-side carrier, presence-gated"
 
-let PARAKEET_RECIPE = "convert: <pinned whisper.cpp>/models/convert-parakeet-to-ggml.py --use-f32 over the nvidia/parakeet-tdt-0.6b .nemo (nemo venv; repack - sha canonical everywhere)"
+// The parakeet conversion rail is retired: ggml-org/parakeet-GGUF hosts the v3 bin
+// byte-identical to the canonical conversion (sha-verified), so v3 fetches like any
+// carrier. v2 was never hosted - its bins live on the boxes that converted them.
+let PARAKEET_V2_NOTE = "historic nemo-venv conversion (rail retired); present only on boxes that converted it - v3 is the fetched carrier"
 let CANARY_ENC_RECIPE = "convert: modules/dasLLAMA/harness/convert_canary_to_ggml.py over nvidia/canary-qwen-2.5b (nemo venv; encoder is a repack - sha canonical everywhere)"
 let CANARY_DEC_RECIPE = "convert: modules/dasLLAMA/harness/convert_canary_to_ggml.py over nvidia/canary-qwen-2.5b (nemo venv); bytes are per-arch (fp16 LoRA merge) - gate via asr_bench --text over jfk/jfk3/gb1 vs benchmarks/asr/canary_transcripts.expected"
 
@@ -309,9 +321,41 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
             bytes = 2019377696l, sha256 = "6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff"),
         ModelSpec(file = "Llama-3.2-3B-Instruct-Q8_0.gguf", display = "Llama-3.2-3B"),
         ModelSpec(file = "gemma-4-E2B-it-Q4_K_M.gguf",
-            url = "{HF}/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_K_M.gguf",
-            bytes = 3106738272l, sha256 = "740185b21d22ceb83a11c3aa62ad5842ef32c70f6096d756bbee85a1e4ec34b8"),
+            url = "{HF}/unsloth/gemma-4-E2B-it-GGUF/resolve/0314792d7f1f7e229411f620751375812bb9faf2/gemma-4-E2B-it-Q4_K_M.gguf",
+            bytes = 3106738272l, sha256 = "740185b21d22ceb83a11c3aa62ad5842ef32c70f6096d756bbee85a1e4ec34b8",
+            serve_name = "gemma-4-e2b", serve_display = "Gemma 4 E2B", serve_default = true,
+            serve_note = "the recommended default - fast, capable, runs everywhere",
+            serve_ctx = 32768, serve_vram_gb = 4.0,
+            serve_vision = "mmproj-gemma-4-E2B-it-bf16.gguf"),
+        ModelSpec(file = "gemma-4-E4B-it-Q4_K_M.gguf",
+            url = "{HF}/unsloth/gemma-4-E4B-it-GGUF/resolve/bfc15c382204943c3a8fff0c750b94ae2364d7a3/gemma-4-E4B-it-Q4_K_M.gguf",
+            bytes = 4977171584l, sha256 = "85a896a047553e842f25297ee5b031d64ff30147d9c4af17b1e4b394cd1fab87",
+            serve_name = "gemma-4-e4b", serve_display = "Gemma 4 E4B",
+            serve_note = "the bigger E-series - better answers, still laptop-class",
+            serve_ctx = 32768, serve_vram_gb = 6.5,
+            serve_vision = "mmproj-gemma-4-E4B-it-BF16.gguf"),
+        // no 12B serving row yet: the fleet's local gemma-4-12B-it-Q4_K_M bytes match no
+        // current upstream revision (the .WRONG-BYTES saga) - it joins the catalog once its
+        // provenance is reconciled to a pinnable upload
+        ModelSpec(file = "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
+            url = "{HF}/unsloth/gemma-4-26B-A4B-it-GGUF/resolve/c099eb48e663fd284577b04978a94ffccb261841/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
+            bytes = 16947541728l, sha256 = "f2c28b3dc4776931ac6f879e11f203dec637ea0f14267a86ec8f6165f63f293f",
+            serve_name = "gemma-4-26b-a4b", serve_display = "Gemma 4 26B-A4B",
+            serve_note = "the MoE - 26B quality at 4B active weights per token",
+            serve_ctx = 131072, serve_vram_gb = 19.0),
+        ModelSpec(file = "Qwen3.8-27B-UD-Q4_K_M.gguf",
+            url = "{HF}/unsloth/Qwen3.8-27B-GGUF/resolve/27af057ecb382ddfea5d12837360a8980560e3ed/Qwen3.8-27B-UD-Q4_K_M.gguf",
+            bytes = 16464440224l, sha256 = "322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482",
+            serve_name = "qwen3.8-27b", serve_display = "Qwen 3.8 27B",
+            serve_note = "the newest dense Qwen - thinking model, strong at code",
+            serve_ctx = 262144, serve_vram_gb = 18.5),
         ModelSpec(file = "gemma-3-4b-it-Q8_0.gguf", display = "gemma-3-4B",
+            // the vision mmproj rides as a companion: the gemma3v tower tests and the image chat
+            // load it beside this decoder (the tower itself is size-invariant; 4B is the tested pair)
+            companions <- [
+                ProvEntry(name = "mmproj-gemma-3-4b-it-F16.gguf", root = "llm",
+                    url = "{HF}/ggml-org/gemma-3-4b-it-GGUF/resolve/main/mmproj-model-f16.gguf",
+                    bytes = 851251104l, sha256 = "8c0fb064b019a6972856aaae2c7e4792858af3ca4561be2dbf649123ba6c40cb")],
             parity <- ev_gemma3_4b()),
         ModelSpec(file = "Qwen3-4B-Instruct-2507-Q8_0.gguf", display = "Qwen3-4B",
             parity <- ev_qwen_count()),
@@ -338,9 +382,16 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
             bytes = 4372812000l, sha256 = "1270d22c0fbb3d092fb725d4d96c457b7b687a5f5a715abe1e818da303e562b6"),
         ModelSpec(file = "Mistral-7B-Instruct-v0.3-Q8_0.gguf", display = "Mistral-7B",
             parity <- ev_mistral7b()),
-        // provenance for this carrier rides its asr_catalog spec (the audio-chat pairing owns
-        // the mmproj companion); this row is the text-LLM profile + parity facet
-        ModelSpec(file = "gemma-4-E2B-it-Q8_0.gguf", display = "gemma-4-E2B",
+        // this row owns the carrier's provenance and PINS its mmproj companion (the serving
+        // Q4_K_M row consumes the same tower by name via serve_vision); asr_catalog keeps
+        // only the pairing
+        ModelSpec(file = "gemma-4-E2B-it-Q8_0.gguf", display = "gemma-4-E2B", official = true,
+            url = "{HF}/ggml-org/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q8_0.gguf",
+            bytes = 4967497152l, sha256 = "996d08777aadc6bfd3c7375ef70ba25a0f55240075860754fdb18d6d860aa63a",
+            companions <- [
+                ProvEntry(name = "mmproj-gemma-4-E2B-it-bf16.gguf", root = "llm",
+                    url = "{HF}/ggml-org/gemma-4-E2B-it-GGUF/resolve/b4243c156154b6dca9324415f8c7ccc098b4aed1/mmproj-gemma-4-E2B-it-BF16.gguf",
+                    bytes = 986833664l, sha256 = "711e1e8f43fa0664adbac493129be1e6c25b81af4b4cdea97c7d798b25c0a3a4")],
             // PLE + cross-layer KV sharing as the E4B, plus per-layer FFN width (the elastic
             // MatFormer sub-model); dense, so the full 40 hold
             parity <- ev_gemma4_dense()),
@@ -349,6 +400,15 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
             // weights + a sigmoid-gated shared expert; QKV bias, NEOX rope); the fixture runs
             // BOTH MoE prefill paths off one load — bit-identical by construction
             parity <- ev_qwen_count([moe_reference = true])),
+        // parity-less provenance carrier: the gemma3 vision 12B pair (the same SigLIP tower at
+        // projection 3840; test_vision_chat's PARITY_FULL leg is its coverage)
+        ModelSpec(file = "gemma-3-12b-it-Q4_K_M.gguf",
+            url = "{HF}/ggml-org/gemma-3-12b-it-GGUF/resolve/main/gemma-3-12b-it-Q4_K_M.gguf",
+            bytes = 7300574976l, sha256 = "7bb69bff3f48a7b642355d64a90e481182a7794707b3133890646b1efa778ff5",
+            companions <- [
+                ProvEntry(name = "mmproj-gemma-3-12b-it-F16.gguf", root = "llm",
+                    url = "{HF}/ggml-org/gemma-3-12b-it-GGUF/resolve/main/mmproj-model-f16.gguf",
+                    bytes = 854200224l, sha256 = "30c02d056410848227001830866e0a269fcc28aaf8ca971bded494003de9f5a5")]),
         ModelSpec(file = "gemma-4-12B-it-Q4_K_M.gguf", official = true,
             url = "{HF}/lmstudio-community/gemma-4-12B-it-GGUF/resolve/main/gemma-4-12B-it-Q4_K_M.gguf",
             bytes = 7381382944l, sha256 = "95d83ba36642b1f385fb906b5962a71763361be3bac930a709945f72d97473f8",
@@ -365,6 +425,10 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
         ModelSpec(file = "gemma-4-E4B-it-Q8_0.gguf", display = "gemma-4-E4B", official = true,
             url = "{HF}/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q8_0.gguf",
             bytes = 8031242688l, sha256 = "34be82b17b4942d389b9b527170c4b058027abdd32531fda063d3d97dd8ce80a",
+            companions <- [
+                ProvEntry(name = "mmproj-gemma-4-E4B-it-BF16.gguf", root = "llm",
+                    url = "{HF}/ggml-org/gemma-4-E4B-it-GGUF/resolve/b8093469224f83f5c38f691eb906c380e9e63114/mmproj-gemma-4-E4B-it-BF16.gguf",
+                    bytes = 991552256l, sha256 = "f77995e4b6a569ab8f0d1bfdb7e8da4a0fa5b9e6f309b9bf3bdb76164d75e29f")],
             // PLE (per-layer embeddings) + cross-layer KV sharing over the last 18 layers;
             // dense, so the full 40 hold (verified 40/40 vs simple_ids on the window-engaged
             // 1..320 counting prompt)
@@ -418,8 +482,11 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
             // prefill paths and the chunked deltanet arm off one load
             parity <- ev_qwen_count([dn_chunked = true, moe_reference = true])),
         ModelSpec(file = "Qwen3.6-35B-A3B-MTP-UD-Q4_K_M.gguf", official = true,
-            url = "{HF}/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+            url = "{HF}/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/resolve/5bc3e238d916f48a861bac2f8a1990a0e9b7e98d/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
             bytes = 22663387424l, sha256 = "0b21525e972670ed59e1812e170b27c26355381f0656ecc4e25617ece7dac58b",
+            serve_name = "qwen3.6-35b-a3b", serve_display = "Qwen 3.6 35B-A3B",
+            serve_note = "the Qwen MoE - 3B active weights, MTP-ready",
+            serve_ctx = 262144, serve_vram_gb = 24.0,
             // plain evidence only (verified per-file 40/40, 2026-08-18): the qwen35moe arm
             // coverage (chunked deltanet + reference MoE prefill) lives on the plain-stem twin
             parity <- ev_qwen_count()),
@@ -430,6 +497,34 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
             // grouped v-head order) — this fixture proves the loader's grouped->tiled permutes
             parity <- ev_qwen_count([dn_chunked = true]))
     ]
+}
+
+//! The serving ASR tower: the hosted parakeet v3 bin, byte-identical to the canonical
+//! conversion and commit-pinned — the one entry dasllama-server's dictation auto-offer
+//! downloads. profile_common's asr_catalog provenance consumes this same row (single source).
+def serve_asr_tower() : ProvEntry {
+    return ProvEntry(name = "ggml-parakeet-tdt-0.6b-v3-f32.bin", root = "whisper",
+        url = "{HF}/ggml-org/parakeet-GGUF/resolve/35156454d1a39de06863303dd209fd2bed6ee079/ggml-parakeet-tdt-0.6b-v3-f32.bin",
+        bytes = 2508463079l, sha256 = "b17956ca991a7f084c978a8a9d4c9785864260b6dd9b72f884344759d913ae7f")
+}
+
+//! The pinned vision-tower companion behind a serving row's `serve_vision` name, resolved
+//! across every row's companions (the tower is size-invariant, so the pinning row and the
+//! serving row may differ). Empty `name` back = no pinned match — the tower reads as absent.
+def serve_vision_tower(name : string) : ProvEntry {
+    var all <- model_specs()
+    var out <- ProvEntry()
+    if (!empty(name)) {
+        for (s in all) {
+            for (c in s.companions) {
+                if (c.name == name && !empty(c.url) && !empty(c.sha256)) {
+                    out <- c
+                }
+            }
+        }
+    }
+    delete all
+    return <- out
 }
 
 // the rows of [[model_specs]] the predicate keeps
@@ -456,6 +551,25 @@ def llm_catalog() : array<ModelSpec> {
 //! people run THIS year). Absent files skip with a warning, so one list serves every box.
 def official_catalog() : array<ModelSpec> {
     return <- spec_view() $(s : ModelSpec) : bool { return s.official; }
+}
+
+//! The spec's vision mmproj companion basename ("" = no vision pairing) — the image-chat
+//! cell's second file. A row with one is a vision decoder; the driver pairs it with
+//! [[bench_image_fixture]] for the board's image cells.
+def mmproj_companion(s : ModelSpec) : string {
+    for (c in s.companions) {
+        if (c.name |> starts_with("mmproj-")) {
+            return c.name
+        }
+    }
+    return ""
+}
+
+//! The one pinned picture every image-chat cell measures (provenanced as a companion of the
+//! spec row that owns it) — cells across models and boxes stay comparable because the input
+//! never varies.
+def bench_image_fixture() : string {
+    return "coco-val2017-000000039769.jpg"
 }
 
 //! The spec row keyed `file` (empty `file` field back = no such spec) — a fresh copy off the

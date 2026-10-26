@@ -1,8 +1,8 @@
 # modules/dasLLAMA/tests — testing discipline
 
 The Metal suites here are wall-time-expensive (model loads dominate; a full pass holds 40GB
-GGUFs). The rules below exist because one session spent 5.75 of 6 hours re-running full suites
-to verify one-arm fixes. They are enforcement, not advice.
+GGUFs), so the rules below are enforcement, not advice — an ad-hoc full-suite run turns a
+one-arm fix into an afternoon.
 
 ## Run suites ONLY through the runner
 
@@ -48,7 +48,7 @@ batch test: `batch` (whole test), `batchB7-partd`, `batchB8-kq`. Prefill parity:
 kq cont span dim qkv` (span = the non-causal media eval shape, head + embd span, per codec).
 Support matrix: `cells-q8 window cells-s16 mode kq dim8b dim70b` + the
 family matrix `fam-qwen3 fam-qwen2 fam-phi3 fam-gemma2 fam-gemma3 fam-gemma4 fam-qwen3moe
-fam-gemma4moe fam-gptoss fam-qwen35 fam-qwen35moe fam-qwen2moe` (needs-derivation pins +
+fam-gemma4moe fam-gptoss fam-gemma4e fam-qwen35 fam-qwen35moe fam-qwen2moe` (needs-derivation pins +
 per-path cells; fam-gemma2 also carries the sliding-window masking parity row;
 fam-gemma4/fam-qwen3moe/fam-gemma4moe/fam-gptoss/fam-qwen35moe/fam-qwen2moe are
 DASLLAMA_PARITY_FULL-gated — 7.4/18.5/26.9/12.1/22/15GB; fam-gemma4moe and fam-gptoss are ENGAGE
@@ -73,7 +73,10 @@ every derived-truth compare its own poison. A kernel with `@workgroup` state nee
 missing tgmem reads garbage silently.
 The `image` suite (test_model_image — the prepared-image .dlim rail): `mechanics` (synthetic
 carrier, model-free, runs in CI) `smol metal tower whisper voxtral parakeet qwen3a canary
-canary-dec gemma4a gemma4uv gemma4uv-metal mtower`; `gemma4uv-metal` is the GPU tower
+canary-dec gemma4a gemma4uv gemma4uv-metal gemma4v gemma3v gemma4e mtower`; `gemma4e` is the E2B metal-blob
+mint+map arm — the PLE go-live tripwire (`ple_check_table`, which panics when the per-layer
+embedding table's plane is short) runs after the blob plane borrows, so a fresh mint and a warm
+map must both clear it; `gemma4uv-metal` is the GPU tower
 driver's parity/counter/knob gate for the gemma4uv embedder, Apple builds only (`--arm
 gemma4uv` selects it too — arm filters match by substring); `mtower` is the whisper-class
 tower-blocks gate, Apple builds only — whisper tiny + large-v3-turbo transcript-exact and
@@ -112,21 +115,34 @@ the device-free rail unit; the serving vulkan census runs on the PC box.
 
 ## Model-free / no-arm tests
 
-A model-free file — one whose cells run, or skip their model arms, with no model present and
-with CPU prefill declared (`DASLLAMA_CPU_PREFILL=1`, which the runner sets for every child) —
+A model-free file — one with at least one cell that runs, not skips, when no model is present
+and `DASLLAMA_CPU_PREFILL=1` is set in the environment (the runner sets it for every child) —
 runs under plain dastest (still `-jit`) or as a set through `run.das -- --suite model-free`,
 the per-PR gate. The `model-free` list in `run.das` is the census of those files; this note is
-the per-file map. A file in a model suite (every suite but `model-free`) is listed in its
-suite's arm list in `run.das` instead.
-Current note: `failed_dasllama_lint_require.das` — model-free, expected-compile-failure: the
+the per-file map. A file in a model suite (every suite but `model-free`) is listed in that
+suite's file list in `run.das` instead.
+`test_bench_records_schema.das` — model-free: the record store's schema (round-trip, upsert
+identity with `workload` in the key, annotations landing only on the rows they select, the
+store lister admitting `records/{box}.json` alone) and the record rig's shared seams (the
+`-w` workload scope; the stored-row→rig-leg map, `backend`/`flavor` ⇒ `metal` | plain cpu |
+`accel`, else refused; the tune-stamp gate; the oracle compare's ok/warn/fail bands; the
+llama.cpp image-reference parser `parse_mtmd_image` — encode summing, the MTMD_TIMING split,
+its refusal arms); plus the committed-records sweeps: image-chat receipts match their
+`backend`/`flavor` stamps and pin the fixture and mmproj, and every das row's `tune_sha`
+resolves to its committed generation archive.
+`test_exchange_schema.das` — model-free: the exchange validator, sweeping the ENTIRE in-tree
+records/sidecar corpus, so a writer-schema change reds here first.
+`failed_dasllama_lint_require.das` — model-free, expected-compile-failure: the
 facade lint trips DASLLAMA001 (code 50503) on a direct engine require with no escape.
 `failed_dasllama_lint_sidedoor.das` — model-free, expected-compile-failure: the lint's tree
 guard trips on a path-require resolving into modules/dasLLAMA, name prefix or not.
 `test_dasllama_lint_escape.das` — model-free: `options _dasllama_internal = true` admits a
 direct engine require (the lint's escape hatch).
 `test_dasllama_lint_contracts.das` — model-free: the lint's ALLOWED set (a facade-only program
-with no escape compiles; an internal require does not) via spawned compiles, and
-`load_audio_16k_mono`'s empty-on-failure contract.
+with no escape compiles; an internal require does not) via spawned compiles,
+`load_audio_16k_mono`'s empty-on-failure contract, `decode_audio_16k_mono`'s frame cap (a
+synthetic `sampleRate=1` WAV bomb is refused before decode, an uncapped call still works), and
+`gemma4a_probe_proj_dim`'s 0-not-panic contract on `.dlim` / missing / non-GGUF inputs.
 `test_think_split.das` — the reply-side reasoning matcher, model-free: every
 thinking family's wire shape, whole-string and per-chunk down to 1 byte.
 `test_tool_formats.das` — the per-ToolMode wire codecs (dasllama_tools), model-free: defs
@@ -150,8 +166,10 @@ cells, wdec knob pinned OFF per the fixtures section). Runs under plain dastest.
 `asr_encode_bucket`) over constructed structs and parakeet's SPM detokenizer over a toy vocab.
 `test_model_specs.das` — model-free: the model-set table's shape invariants
 (`../performance/model_specs.das`: unique file/display keys, official ⇒ provenance pinned,
-parity-evidence shape) and the derived provenance view's invariants (unique names, sha-or-recipe,
-https urls).
+parity-evidence shape), the derived provenance view's invariants (unique names, sha-or-recipe,
+https urls), the mmproj pairing lookup (`mmproj_companion` — the companion found by name, not
+by position; ≥ 2 official vision rows), and the pinned image fixture's provenance
+(`bench_image_fixture` rides some spec's companion list).
 `test_parity.das` — suite-less, model-gated: the frozen token-for-token parity gates. ONE
 generic loop drives every evidence-carrying spec of the model-set table through its declared
 pinned arms (evidence is DATA on `ModelSpec.parity` — ids + arms, regenerated via
@@ -185,6 +203,38 @@ On Apple builds the CPU gate pins the tower knob off, and a second test gates th
 encode against the same dumps on a scale-relative bar (2e-4 + 4e-3·token-rms) — exceeding it
 is a red, the bar each fixture actually held is logged either way, and engage is proven per
 fixture by the encodes counter.
+`test_gemma4v.das` — the gemma4v ViT tower (E-series) tier-1 parity vs the `-p encode` dumps
+minted on the f32-widened mmproj, CPU, `-fa off` (`mint_e2b.sh` / `mint_e4b.sh`): eight E2B
+fixtures (96² cb through 672×336) on the scale-relative bar 2e-4 + 4e-3·token-rms, the measured
+maxdiff logged per fixture; plus the clamp knockout (every block clamp disarmed through the
+staging planes must miss the oracle — the sidecar scalars are load-bearing); plus the E4B rung —
+the same tower geometry at soft-token width 2560, gated on its mmproj's four-dump seam subset
+with one GPU-engage and one q8-lane fixture. Skips honestly without the mmprojs or dumps.
+`test_gemma3v.das` — the gemma3 SigLIP tower (gemma-3-4b mmproj) tier-1 parity vs the
+`-p encode` dumps minted on the f32-widened f16 mmproj, CPU, `-fa off`
+(`gemma3-vision-oracle/mint_gemma3.sh`): the canvas is FIXED 896² (learned position table), so
+the five fixtures vary content, not geometry; exact lane on the 2e-4 + 4e-3·token-rms bar, the
+q8 serving lane on its measured 3.2e-1·rms bar (27 blocks, ffn served at the layout's padded
+4352 width so every GEMM quantizes), plus the fixed-canvas panic gate and the carrier
+sniff/exec_fmt cells. On Apple builds the CPU gate pins the tower knob off, and a GPU rung
+gates two fixtures through the Metal block loop on its measured 4e-2·rms bar — engage proven
+per fixture by the encodes/blocks counters, plus the knob-off decline leg (the 72-wide heads
+restride to the attention tiles' 128 on the driver). Skips honestly without the mmproj or dumps.
+`_vision_oracle.das` is the shared dump parser / fixture generator /
+per-token compare all vision tier-1 tests use.
+`test_vision_embedder.das` — model-free: the `VisionEmbedder` carrier's own arms — the sniffed
+family tag, the none-carrier refusals, and the `.dlim` route — over constructed carriers.
+`test_ple_check.das` — model-free: the PLE go-live tripwire (`ple_check_table`) on synthetic
+Model shells — short plane trips per format arm, full plane passes, non-PLE exempt.
+`test_ple_modes.das` — suite-less, model-gated (E2B Q8_0 + Q4_K_M, small tier): the PLE
+token table's pinned-plane rail across serving modes — fp32 keeps the Q8_0 table on a
+dedicated q8 plane (offset 0, plane == table exactly, gather rows BIT-match the file dequant,
+wblob provably too small to carry the expansion) and a K-quant table on its native kq plane;
+plus a greedy chat turn per serving mode on the E2B Q8_0 carrier — a q8 control, an fp32 turn,
+and a `q4_0` turn, the `q4_0` one proving q4 serving has a per-layer-embedding rail.
+`test_tower_helpers.das` — model-free: the shared encoder-tower helpers in `dasllama/dasllama_tower`
+(clamp, row norms, f16-table GEGLU-quick, im2col, two-axis rope, avg-pool, `attention_bidir`),
+each against an in-test reference.
 `test_attn_span.das` — the non-causal image span (`eval_embd_ non_causal`): mask direction by
 perturbation (causal row 0 blind to the last row, span row 0 sees it), classic/blocked/flash
 agreement, and the flag-reset bit-exactness; stories15M fixture (test_flash's), skips without it.
@@ -194,9 +244,13 @@ same stories15M fixture, deliberately never calls `allow_cpu_prefill()` (which i
 cannot live in test_attn_span — that file arms it in `[init]`, and why it stays out of the
 runner's `model-free` suite — the runner sets `DASLLAMA_CPU_PREFILL=1`). Metal-capable builds
 only; plain dastest only.
-`test_vision_chat.das` — the image chat turn end to end (12B + mmproj + the cats fixture, so
-`DASLLAMA_PARITY_FULL=1`): the prompt stream shape around the splice (marker ids, media-first,
-span length from the geometry) and the greedy caption, logged in full. NOT token-parity with
+`test_vision_chat.das` — the image chat turn end to end, three families / four legs: the 12B
+gemma4uv pair (the cats fixture, so `DASLLAMA_PARITY_FULL=1`), the E2B gemma4v pair (E2B Q8
+decoder + bf16 mmproj — small tier, runs without the flag), the gemma-3-4b gemma3v pair (small
+tier), and the gemma-3-12b pair (the same SigLIP tower at projection 3840 — large tier,
+`DASLLAMA_PARITY_FULL=1`): the prompt stream shape around the splice
+(marker ids, media-first, span length from the geometry) and the greedy caption, logged in
+full. NOT token-parity with
 llama-mtmd-cli — the oracle renders its jinja template in thinking mode while dasLLAMA's gemma-4
 arm defaults to instruct, and freeform token-parity cells are banned (see below). On Apple
 builds the turn also carries the tower legs: the default caption's image encode must show an
@@ -216,8 +270,8 @@ images the rig cannot use and purges the flavors the rig depends on. Image-rail 
 
 ## Metal fixtures — driver knobs and the two-model pattern
 
-**A cell whose claim is a CPU-served or f32-decoder leg pins the covering driver knob OFF for
-that leg (`set_metal_wdec(false)` / `set_metal_tower(false)`) and restores it after.** The
+(REVIEW: "A cell whose claim is a CPU-served or f32-decoder leg pins the covering driver knob
+OFF for that leg and restores it after.") The
 hooks are on by default: they flip a q8 leg to the GPU silently, and an f32 leg records a
 quant_mode decline that panics under required mode — either way the cell stops measuring what
 its name says.
@@ -242,7 +296,10 @@ model blocks tagged with a listed family run — `family_on(t, name)` in
 today: `llama` (all four metal suites + the image smol arm), `qwen2`, `qwen3`, `phi3`,
 `gemma2`, `gemma3`, `gemma4`, `qwen3moe`, `gemma4moe`, `gptoss`, `qwen35`, `qwen35moe`, `qwen2moe` (the support-matrix family cells), `gemma`,
 `ultravox`, `whisper`, `voxtral`, `parakeet`, `qwen3a`, `canary`, `gemma4a` (image suite arms),
-`gemma4e` (the coverage-census E4B row; `gptoss`/`qwen2moe`/`qwen3moe` carry census rows too — all PARITY_FULL-gated).
+`gemma4e` (support-matrix rows under `fam-gemma4e` — E4B PARITY_FULL-gated; E2B Q8_0 and
+Q4_K_M small-tier always-on, carrying the per-layer-FFN-width and blob-kq-PLE-gather coverage.
+Both E2B rows assert parity through their forced-feed cells, not token equality, because
+freeform continuations from a 2B sit on near-ties; plus the coverage-census E4B row; `gptoss`/`qwen2moe`/`qwen3moe` carry census rows too — all PARITY_FULL-gated).
 When profiling one family across formats, gate each round with
 `--arm <arms> --family <fam>` instead of the whole zoo. Tag every NEW model-loading block
 with its family or it silently joins every family's gate.
@@ -261,7 +318,8 @@ batched code paths get their parity on small models via pins (e.g.
 ## Log discipline
 
 Always capture COMPLETE logs (the runner does this); grep afterwards, never at capture time —
-a capture-time filter once hid the exact proof line a verification run existed to produce.
+a capture-time filter can hide the exact proof line the run exists to produce, and the silent
+capture reads as success.
 When a fixture claims a size/depth property ("2030 tokens", "crosses 2048"), assert the
 actual number in the test; a resize cap is not evidence.
 THE EYEBALL RAIL (REVIEW: "Every test that compares generated tokens, ids, or logits logs the decoded text for both sides"): every token-for-token generate cell logs both decoded
@@ -286,13 +344,6 @@ FORCED-FEED logits-tolerance form (the k4 freeform cell, cached stream `gen_free
 token equality. For that form the cache is a FEED, not a truth: both sides force through the
 same tokens, so a stale feed stays a valid instrument and the stale-cache red class does not
 exist for it. Counting cells stay token-exact.
-
-## Standalone schema tests (model-free)
-
-`test_bench_records_schema.das` (the record store: round-trip, upsert identity, annotations)
-and `test_exchange_schema.das` (the exchange validator: sweeps the ENTIRE in-tree
-records/sidecar corpus, so a writer-schema change reds here first) run directly under dastest
-with `-jit` — no runner, no arms, no models.
 
 ## Out-of-folder test files (the checklist's placement ledger)
 

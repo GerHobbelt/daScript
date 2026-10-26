@@ -23,9 +23,10 @@ require dasllama/dasllama_transformer public   // the engine + arch registry; ev
 require dasllama/dasllama_image   // the prepared-image cache: load_model maps it when present
 require dasllama/dasllama_prefix public        // page-granular prefix cache over the paged pool
 require dasllama/dasllama_chat public          // layer 2: chat sessions over the same engine
+require dasllama/dasllama_tower public         // shared encoder-tower pieces (row math, activations, prof rail)
 require dasllama/dasllama_audio public         // audio tower (mel frontend + whisper encoder + projectors)
 require dasllama/dasllama_vision public        // image preprocessing rail (geometry, letterbox, normalize)
-require dasllama/dasllama_gemma4uv public      // gemma4uv vision embedder (image soft tokens)
+require dasllama/dasllama_vision_embedder public   // the vision embedder of whatever family (gemma4uv / gemma4v) — image soft tokens
 require dasllama/dasllama_asr public           // uniform ASR surface (whisper today; parakeet/qwen3-asr land behind the same sniff)
 require dasllama/dasllama_vad public           // Silero-VAD (voice-activity detection): segments + streaming iterator
 require dasllama/dasllama_config public        // the explicit .dlim bake configuration — the --config / identity contract
@@ -246,10 +247,10 @@ def create_chat(model : Model; var tower : AudioTower; system : string = ""; max
     return <- create_chat_(model, tower, system, max_new, kv_dtype)
 }
 
-def create_chat(model : Model; var embedder : Gemma4uvEmbedder; system : string = ""; max_new : int64 = 256l; kv_dtype : KVDtype = KVDtype.f16) : ChatSession {
+def create_chat(model : Model; var embedder : VisionEmbedder; system : string = ""; max_new : int64 = 256l; kv_dtype : KVDtype = KVDtype.f16) : ChatSession {
     //! Start a VISION-CAPABLE conversation: takes ownership of ``embedder`` (moved in — load with
-    //! ``load_gemma4uv_embedder``) so ``add_user_image`` can splice image soft tokens into its
-    //! turns. Panics on a mismatched decoder/mmproj pair or a family with no image markers.
+    //! ``load_vision_embedder``, which sniffs the mmproj's family) so ``add_user_image`` can splice
+    //! image soft tokens into its turns. Panics on a mismatched pair or a family with no image markers.
     return <- create_chat_(model, embedder, system, max_new, kv_dtype)
 }
 
@@ -272,7 +273,7 @@ def add_user_image(var chat : ChatSession; img : VisionImage) {
     add_user_image_(chat, img)
 }
 
-def encode_image(embedder : Gemma4uvEmbedder; var scratch : Gemma4uvState; img : VisionImage;
+def encode_image(embedder : VisionEmbedder; var scratch : VisionState; img : VisionImage;
                  tag : string; var out : array<float>) : int64 {
     //! The whole image path in one call — geometry, letterbox, normalize, encode — into ``out`` =
     //! npos × proj_dim soft tokens (returns npos). ``add_user_image`` is this plus queueing onto a
@@ -310,8 +311,15 @@ def render_turn(model : Model; chat : ChatSession) : array<int64> {
 def render_turn_image(model : Model; chat : ChatSession; var head : array<int64>; var tail : array<int64>) {
     //! ``render_turn``'s IMAGE twin: the turn's prefill as the two token spans that bracket the
     //! image soft-token splice — ``head`` before the rows, ``tail`` after. Render-only (no KV, no
-    //! embedder): the rows come from ``gemma4uv_encode``, and a scheduler prefills head, rows, tail.
+    //! embedder): the rows come from ``encode_image``, and a scheduler prefills head, rows, tail.
     render_turn_image_(model, chat, head, tail)
+}
+
+def render_turn_audio(model : Model; chat : ChatSession; var head : array<int64>; var tail : array<int64>) {
+    //! ``render_turn``'s AUDIO twin: the same two-span contract around the audio soft-token splice
+    //! (the template's audio span markers). The rows come from the family's audio encoder — for the
+    //! gemma-4 E-series, ``gemma4a_encode_all`` over the shared vision+audio mmproj.
+    render_turn_audio_(model, chat, head, tail)
 }
 
 def render_assistant(model : Model; var chat : ChatSession; text : string; var out : array<int64>) {
@@ -466,6 +474,13 @@ def select_matmul_backend_for_load() : bool {
     return select_matmul_backend_for_load_()
 }
 
+def kernel_backend_available(name : string) : bool {
+    //! True when kernel backend ``name`` is registered AND its availability witness passes on
+    //! this box — the detection probe behind defaults-first backend selection (the vulkan
+    //! witness enumerates devices once and caches its verdict). Unknown names are false.
+    return kernel_backend_available_(name)
+}
+
 def set_gpu_tier_want(want : dasllama_gpu_tier::GpuTierWant) {
     //! Record the GPU tier request the NEXT ``moe_gpu_tier_arm``/``load_model`` honors — the
     //! programmatic form of the core ``DASLLAMA_GPU_*`` knobs (an env var present overrides its
@@ -481,6 +496,8 @@ def moe_gpu_tier_arm() : bool {
 
 def moe_gpu_weight_budget() : int64 {
     //! The armed backend's resident-weight VRAM budget in bytes (0 = no GPU backend armed).
+    //! CAVEAT: the hook device-inits on first call — a reporting caller gates on
+    //! ``gpu_tier_status().device`` being non-empty first (``supported`` must not be the gate).
     return moe_gpu_weight_budget_()
 }
 

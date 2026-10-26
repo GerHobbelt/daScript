@@ -169,7 +169,7 @@ struct public MetalEnv {
     @clarg_doc = "Serve the non-causal media span on the prefill driver (AttnArgs.uend); 0 declines it to the CPU arm, which then needs declared CPU intent."
     span : bool = true
 
-    @clarg_doc = "Serve tower/embedder encodes on the Metal tower driver — the gemma4uv chain, the whisper-class block loops, and the conv frontends (whisper im2col + the qwen3a conv2d, which serves the q8 default); 0 pins the CPU tower."
+    @clarg_doc = "Serve tower/embedder encodes on the Metal tower driver — the gemma4uv chain, the gemma4v ViT and gemma3v SigLIP block loops (their exact-plane lanes), the whisper-class block loops, and the conv frontends (whisper im2col + the qwen3a conv2d, which serves the q8 default); 0 pins the CPU tower."
     tower : bool = true
 
     @clarg_doc = "Serve the whisper decoder side (cross-KV; the decode step under wdec_step) on the Metal ASR-decoder driver; 0 pins the CPU decoder."
@@ -363,7 +363,7 @@ struct public AccelerateEnv {
 [EnvConfig(env_prefix = "DASLLAMA")]
 struct public HarnessEnv {
     @clarg_path
-    @clarg_doc = "Directory holding the .gguf models the probes, benches and tests load."
+    @clarg_doc = "Directory holding the .gguf models the probes, benches and tests load. dasllama-server's model catalog downloads here too when set."
     models_dir : string = ""
 
     @clarg_path
@@ -539,7 +539,7 @@ struct public ProfilingEnv {
 
     @clarg_env = "LLAMA_BENCH_STOCK"
     @clarg_path
-    @clarg_doc = "Path to a stock-build llama-bench for the reference column."
+    @clarg_doc = "Path to a stock-build llama-bench for the reference column; its sibling llama-mtmd-cli serves as the metal/amx image-chat reference."
     llama_bench_stock : string = ""
 
     @clarg_env = "WHISPER_CPP"
@@ -658,6 +658,11 @@ struct public CoreEnv {
     @clarg_doc = "Ambient platform variable; read only to derive the default Hugging Face cache when HF_HOME is unset."
     home : string = ""
 
+    @clarg_env = "USERPROFILE"
+    @clarg_path
+    @clarg_doc = "Ambient platform variable (Windows twin of HOME); read only to derive dasllama-server's default models dir."
+    user_profile : string = ""
+
     @clarg_default_doc = "conservative default"
     @clarg_doc = "Total compute lanes for job queues (N-1 workers plus the caller). Overrides set_jobque_threads_cap; see skills/internal/environment_variables.md."
     jobque_threads : Option<int>
@@ -702,9 +707,9 @@ let public g_env_test = env_config(type<TestEnv>)
 let public g_env_exchange = env_config(type<ExchangeEnv>)
 let public g_env_core = env_config(type<CoreEnv>)
 
-//! The ONE models-dir resolution (DASLLAMA_MODELS_DIR, else the primary rig's dir) with the
-//! trailing separator guaranteed — callers concat "{models_dir_resolved()}{file}", and a
-//! slashless override would silently skip every catalog file.
+//! The rig/probe/test models-dir resolution (DASLLAMA_MODELS_DIR, else the primary rig's dir),
+//! trailing separator guaranteed — callers concat "{models_dir_resolved()}{file}". The server's
+//! catalog resolves its own chain (model_catalog.das: env > models_dir key > ~/.dasllama/models).
 def public models_dir_resolved() : string {
     let env = g_env_harness.models_dir
     if (empty(env)) {

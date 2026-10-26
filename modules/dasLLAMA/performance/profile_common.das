@@ -122,6 +122,37 @@ def parse_tier(s : string) : Tier {
     return Tier.small
 }
 
+//! The record rig's `-w` workload scope, shared by the publishing sweep and the oracle: which
+//! of the text (`llm`), audio (`asr`) and image-chat (`image`) cell sets a workload string
+//! selects. Image cells ride the llm sweep, so `llm`/`all` imply them and `image` narrows to
+//! just them. False = unknown workload (the caller rejects it); the out-params are then all false.
+def workload_scope(w : string; var llm, asr, image : bool&) : bool {
+    llm = w == "llm" || w == "all"
+    asr = w == "asr" || w == "all"
+    image = llm || w == "image"
+    return llm || asr || image
+}
+
+//! The rig leg that produced a stored das row, from its `(backend, flavor)` stamp:
+//! `"metal"` | `""` (the plain cpu leg — neon) | `"accel"` (amx). False = no rig leg
+//! produces that stamp (a foreign backend, a stale flavor) — the oracle skips such a row
+//! loudly instead of racing it on the wrong leg.
+def stored_row_leg(backend, flavor : string; var leg : string&) : bool {
+    leg = ""
+    if (backend == "metal" && flavor == "tuned") {
+        leg = "metal"
+        return true
+    }
+    if (backend == "cpu" && flavor == "tuned") {
+        return true
+    }
+    if (backend == "cpu" && flavor == "accel") {
+        leg = "accel"
+        return true
+    }
+    return false
+}
+
 // Full path to a catalog entry's GGUF.
 def model_path(m : ModelSpec) : string {
     return "{models_dir()}{m.file}"
@@ -1127,16 +1158,14 @@ def asr_catalog() : array<AsrModelSpec> {   // nolint:STYLE038 — flat catalog 
             buckets <- corpus_buckets(), libri_short = "", lang = "en",
             prov = ProvEntry(name = "ggml-parakeet-tdt-0.6b-v2-f32.bin", root = "whisper",
                 bytes = 2471664028l, sha256 = "9dde716823d0dfe587cb7396a7cc251708c30a8475f6fccc8af36ee769fcd808",
-                recipe = PARAKEET_RECIPE),
+                recipe = PARAKEET_V2_NOTE),
             companions <- [ProvEntry(name = "ggml-parakeet-tdt-0.6b-v2-q8_0.bin", root = "whisper", recipe = REF_Q8_RECIPE)]),
         AsrModelSpec(display = "Parakeet-TDT v3", das_model = "ggml-parakeet-tdt-0.6b-v3-f32.bin",
             das_mmproj = "", root = wroot,
             refs <- [AsrRef(tool = "parakeet-cli", handle = "ggml-parakeet-tdt-0.6b-v3-q8_0.bin", exec_fmt = "q8_0"),
                      AsrRef(tool = "onnx", handle = "int8", exec_fmt = "int8")],
             buckets <- corpus_buckets(), libri_short = "v3", lang = "en",
-            prov = ProvEntry(name = "ggml-parakeet-tdt-0.6b-v3-f32.bin", root = "whisper",
-                bytes = 2508463079l, sha256 = "b17956ca991a7f084c978a8a9d4c9785864260b6dd9b72f884344759d913ae7f",
-                recipe = PARAKEET_RECIPE),
+            prov = serve_asr_tower(),
             companions <- [ProvEntry(name = "ggml-parakeet-tdt-0.6b-v3-q8_0.bin", root = "whisper", recipe = REF_Q8_RECIPE)]),
         AsrModelSpec(display = "Whisper tiny", das_model = "ggml-tiny.bin",
             das_mmproj = "", root = wroot,
@@ -1188,20 +1217,14 @@ def asr_catalog() : array<AsrModelSpec> {   // nolint:STYLE038 — flat catalog 
         // gemma4a caps at hp0: its audio tokenizer runs ~25 tok/s, so hp0x2 (547 s) is 13.7k
         // tokens against the 8192 decoder window — a single-window architectural limit
         // (asr_ctx_guard panics), the onnx-rel-pos class of honest cap, not a budget choice
+        // the E2B carrier's provenance AND its mmproj companion live on its official
+        // [[model_specs]] row — a companion rides the row that pins its carrier
         AsrModelSpec(display = "Gemma-4 E2B audio", das_model = "gemma-4-E2B-it-Q8_0.gguf",
             das_mmproj = "mmproj-gemma-4-E2B-it-bf16.gguf", root = lroot,
             // mtmd's CPU Conformer encode runs near xRT 1 — same per-rep budget cap as omni's
             refs <- [AsrRef(tool = "mtmd", handle = "mmproj-gemma-4-E2B-it-bf16.gguf",
                             exec_fmt = "bf16/q8_0", buckets <- ["jfk.wav", "jfk3.wav", "gb1.wav"])],
-            buckets <- ["jfk.wav", "jfk3.wav", "gb1.wav", "hp0.wav"], libri_short = "", lang = "auto", tier = Tier.large,
-            // this spec owns the carrier's provenance; the text-LLM row for the same file in
-            // [[model_specs]] is the profile facet only
-            prov = ProvEntry(name = "gemma-4-E2B-it-Q8_0.gguf", root = "llm",
-                url = "{HF}/ggml-org/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q8_0.gguf",
-                bytes = 4967497152l, sha256 = "996d08777aadc6bfd3c7375ef70ba25a0f55240075860754fdb18d6d860aa63a"),
-            companions <- [ProvEntry(name = "mmproj-gemma-4-E2B-it-bf16.gguf", root = "llm",
-                url = "{HF}/ggml-org/gemma-4-E2B-it-GGUF/resolve/main/mmproj-gemma-4-E2B-it-BF16.gguf",
-                bytes = 986833664l, sha256 = "711e1e8f43fa0664adbac493129be1e6c25b81af4b4cdea97c7d798b25c0a3a4")]),
+            buckets <- ["jfk.wav", "jfk3.wav", "gb1.wav", "hp0.wav"], libri_short = "", lang = "auto", tier = Tier.large),
         AsrModelSpec(display = "Qwen3-Omni-30B audio", das_model = "Qwen3-Omni-30B-A3B-Instruct-Q8_0.gguf",
             das_mmproj = "mmproj-Qwen3-Omni-30B-A3B-Instruct-bf16.gguf", root = lroot,
             // mtmd's CPU-only AuT encode runs near xRT 1 (and far worse on zen2) — the long
@@ -1397,6 +1420,78 @@ def parse_mtmd_ms(out : string) : tuple<total : double; encode : double> {
     return (total = -1.0lf, encode = -1.0lf)
 }
 
+//! The stock build's llama-mtmd-cli sits beside the stock llama-bench (`LLAMA_BENCH_STOCK`);
+//! "" in = no stock ref set, "" out = no such sibling on disk — either way the image ref pass
+//! skips loudly instead of spawning a missing binary.
+def sibling_mtmd(refStock : string) : string {
+    if (empty(refStock)) {
+        return ""
+    }
+    for (name in ["llama-mtmd-cli", "llama-mtmd-cli.exe"]) {
+        let p = path_join(dir_name(refStock), name)
+        if (stat(p).is_valid) {
+            return p
+        }
+    }
+    return ""
+}
+
+//! The image-chat pair's turn definition, ONE home for both engines: `lcpp_bench --image`'s
+//! default question and decode budget, and the driver's llama-mtmd-cli `-p` / `-n`. A second
+//! copy would let the two sides silently price different turns.
+def image_turn_prompt() : string {
+    return "What is in this picture? Answer in one sentence."
+}
+
+//! The image turn's decode budget (tokens), same contract as [[image_turn_prompt]].
+def image_turn_steps() : int {
+    return 32
+}
+
+//! One image turn's timing split from patched llama-mtmd-cli output, the image-chat ref cell's
+//! shape: `enc_ms` sums every "mtmd batch encoding done in N ms" line (one per media chunk),
+//! and the MTMD_TIMING tail supplies encode+prefill / decode ms with the position counts, so
+//! both engines price prefill and decode as own-positions over own-time. `ok` = both sources
+//! present, the counts positive, and encode strictly under encode+prefill (equality would
+//! divide a rate by zero); prefill_ms is already net of the encode.
+def parse_mtmd_image(out : string) : tuple<ok : bool; enc_ms : double; prefill_ms : double; decode_ms : double; n_prefill : int; n_decode : int> {
+    var enc = 0.0lf
+    var seen_enc = false
+    var ep = -1.0lf
+    var dec = -1.0lf
+    var np = 0
+    var nd = 0
+    for (line in split(out, "\n")) {
+        let e = find(line, "mtmd batch encoding done in ")
+        if (e >= 0) {
+            let tail_ <- split(slice(line, e + length("mtmd batch encoding done in ")), " ")
+            let v = empty(tail_) ? -1.0lf : to_double(tail_[0])
+            if (v > 0.0lf) {   // to_double("") and garbage read 0 - a zero-ms encode is no encode
+                enc += v
+                seen_enc = true
+            }
+            continue
+        }
+        if (find(line, "MTMD_TIMING") < 0) {
+            continue
+        }
+        let toks <- [for (t in split(line, " ")); t; where !empty(t)]
+        for (i in range(length(toks) - 1)) {
+            if (toks[i] == "encode_prefill_ms") {
+                ep = to_double(toks[i + 1])
+            } elif (toks[i] == "decode_ms") {
+                dec = to_double(toks[i + 1])
+            } elif (toks[i] == "n_prefill") {
+                np = to_int(toks[i + 1])
+            } elif (toks[i] == "n_decode") {
+                nd = to_int(toks[i + 1])
+            }
+        }
+    }
+    let ok = seen_enc && ep > 0.0lf && dec > 0.0lf && np > 0 && nd > 0 && ep > enc
+    return (ok = ok, enc_ms = enc, prefill_ms = ep - enc, decode_ms = dec, n_prefill = np, n_decode = nd)
+}
+
 //! whisper.cpp parakeet-cli / whisper-cli — one process per clip (load is ~ms; parse_cli_ms
 //! subtracts it regardless). Best over `reps`. Returns the winning command line too — the receipt.
 def run_asr_cli(cli, model_path, wav_path : string; threads, reps : int; var cmd_out : string&; gpu : bool = false) : double {
@@ -1569,10 +1664,12 @@ def whisper_cpp_versions() : string {
     return "whisper.cpp @ {commit}"
 }
 
-//! Version line for the patched mtmd build: base commit + the patch file's content hash. The
+//! Version line for a patched mtmd build: base commit + the patch file's content hash. The
 //! checkout is EXPECTED dirty (the patch is applied); the patch sha is what makes that ok.
-def mtmd_versions() : string {
-    let commit = git_commit_at(dir_name(mtmd_bin()))
+//! `bin` "" = the dedicated CPU ref build ([[mtmd_bin]]); pass another llama-mtmd-cli path
+//! (the stock build) to stamp that checkout instead.
+def mtmd_versions(bin : string = "") : string {
+    let commit = git_commit_at(dir_name(empty(bin) ? mtmd_bin() : bin))
     let patch = file_identity("{asr_dir()}/patches/mtmd-timing.patch", "patch")
     let ptag = empty(patch.sha256) ? "mtmd-timing.patch(unhashed)" : "mtmd-timing.patch@{slice(patch.sha256, 0, 8)}"
     return empty(commit) ? "llama.cpp + {ptag}" : "llama.cpp @ {commit} + {ptag}"
@@ -1670,7 +1767,7 @@ struct BenchRun {
     cmd : string
     hardware : HardwareInfo
     tests : table<string; BenchTest>
-    @optional workload : string // "" = text LLM; "asr" | "audio-chat" — selects the tests-key shape
+    @optional workload : string // "" = text LLM; "asr" | "audio-chat" | "image-chat" — selects the tests-key shape
     @optional source : string   // "official" | "community" — stamped by the store driver, not the tool
     @optional sha : string      // engine commit (das: git HEAD; llama.cpp: build_commit)
     @optional version : string  // das release version

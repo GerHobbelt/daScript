@@ -22,6 +22,7 @@ IF(NOT DAS_LLAMA_INCLUDED)
     ADD_MODULE_DAS(dasllama dasllama dasllama_batch)
     ADD_MODULE_DAS(dasllama dasllama dasllama_attn_prefill)
     ADD_MODULE_DAS(dasllama dasllama dasllama_asr_types)
+    ADD_MODULE_DAS(dasllama dasllama dasllama_tower)
     ADD_MODULE_DAS(dasllama dasllama dasllama_audio)
     ADD_MODULE_DAS(dasllama dasllama dasllama_audio_io)
     ADD_MODULE_DAS(dasllama dasllama dasllama_whisper)
@@ -33,6 +34,9 @@ IF(NOT DAS_LLAMA_INCLUDED)
     ADD_MODULE_DAS(dasllama dasllama dasllama_vision)
     ADD_MODULE_DAS(dasllama dasllama dasllama_vision_io)
     ADD_MODULE_DAS(dasllama dasllama dasllama_gemma4uv)
+    ADD_MODULE_DAS(dasllama dasllama dasllama_gemma4v)
+    ADD_MODULE_DAS(dasllama dasllama dasllama_gemma3v)
+    ADD_MODULE_DAS(dasllama dasllama dasllama_vision_embedder)
     ADD_MODULE_DAS(dasllama dasllama dasllama_arch_llama)
     ADD_MODULE_DAS(dasllama dasllama dasllama_arch_qwen2)
     ADD_MODULE_DAS(dasllama dasllama dasllama_arch_qwen3)
@@ -75,5 +79,10 @@ IF(NOT DAS_LLAMA_INCLUDED)
     )
     install(FILES ${PROJECT_SOURCE_DIR}/modules/dasLLAMA/tune_for_this_box.md
         DESTINATION ${DAS_INSTALL_MODULESDIR}/dasLLAMA
+    )
+    # the ONE model set (provenance + serving-catalog rows) — dasllama-server's /catalog is a
+    # view over it, so the bundle must carry it or the server dies at require
+    install(FILES ${PROJECT_SOURCE_DIR}/modules/dasLLAMA/performance/model_specs.das
+        DESTINATION ${DAS_INSTALL_MODULESDIR}/dasLLAMA/performance
     )
 ENDIF()

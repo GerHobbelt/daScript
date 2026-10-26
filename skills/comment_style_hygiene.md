@@ -6,18 +6,6 @@ name appear in C++, das, JS, Python, and build scripts alike.
 
 ## Before everything
 
-**Do not narrate code with comments.** If what a comment says comes out of the code
-for free — or with minor reasoning — it is narration; delete it. The test for every
-comment that remains: **does it add information the reader would otherwise have to go
-look for?** Every rule below is this test applied to a specific shape. Style target:
-less War & Peace, more O. Henry.
-
-**Teaching code narrates on purpose.** In tutorials and examples the prose IS the
-deliverable: the cap and the narration ban apply to comments that add nothing to the line
-they sit on (`// increment i`, a tail comment restating the call), not to section prose
-carrying the lesson. Duplication still counts — a preamble and the tail comments telling
-the same sequence twice is one telling too many.
-
 **Keep rules simple.** One rule here is one short paragraph. An entry that needs more
 is describing an essay, not a shape — split it or drop it.
 
@@ -37,114 +25,40 @@ fixes.
 - **The audit is not a gate.** Style review runs on every PR; findings persuade, lint
   compels. Fix or consciously decline — there is no re-run-until-clean loop.
 
-Rules marked *(lintable)* are mechanical enough for a lint to enforce; das already has
-some (noted), C++ and JS have none — there the rule is the reviewer's.
+Rules marked *(lintable)* are mechanical enough for a lint to enforce; where a rule notes
+an existing lint, the lint compels — an unnoted rule is the reviewer's.
 
 ## Comments
 
-**Short or absent.** 1–2 lines preferred, 3 the cap. A comment's volume is the number
-of lines its text would occupy re-wrapped at the width the file's other comments use —
-count those against the cap. das lint STYLE014 enforces the physical line count under
-`daslib/` and wherever `options _comment_hygiene = true`; everywhere else the cap is
-the reviewer's. The cap covers per-symbol and in-body comments; the file header — the
-block before the first declaration, STYLE014's boundary — is governed by the map rule
-below. Over the cap, a comment stands only when its content alone shows why — an
-injectivity argument, a wire-format contract, a miscompile it prevents; the test is
-that a cold reader never asks "why is this comment so long?". Anything else over the
-cap gets interrogated: does the detail belong at the use site, in the file-header map
-(shared contract moves up, the symbol keeps what is specific to it) — or nowhere?
+**.das outside teaching code: ABSOLUTELY NO comments that are not documentation or lint
+suppression.** The kept set is exactly: `//!` docs on a contract a CALLER must know —
+public API always, a private helper only when callers inside the module need the contract
+(narration of an implementation goes to a name, a test, or the module's `.md`) —
+`// nolint:CODE` / `@nolint` suppressions carrying their one-line why, `//fmt:` formatter
+directives, license comments (Copyright / SPDX), and the file's leading header block (which
+may sit below the `options` / `module` / `require` preamble). Everything else — narration,
+banners, section dividers, commented-out code — does not exist. The formatter enforces this
+per folder, fail-closed (a strip must compile or the file is restored); the policy mechanics
+are `skills/das_formatting.md`. A `//` comment outside the kept set is therefore EPHEMERAL:
+anything worth preserving becomes code (a name, a `//!` doc, an assert) or lands in an `.md`
+beside the code. The boundary is the folder's `.lint_config`: teaching code (tutorials,
+examples) and load-bearing fixture corpora opt out there, and prose carrying the lesson
+stays — comments that add nothing to their line still go.
 
-**No banners, no preambles.** No `// ===== name — desc =====` block above a function
-that already carries its own doc-comment, and no section-head essay restating what the
-code, the doc-comments, or the file-header map already carry — architectural WHY with
-no home in the file goes to a design doc. Terse section dividers stay.
+**C and C++: no NEW comments.** Comments go stale, code does not — new C-family code says
+it in a name, a shape, or a test, or documents itself in the module's `.md`. Kept when one
+is earned: `//!` and `/** */` docs on public API, `NOLINT` / `clang-format` suppressions,
+the leading header block. Existing comments answer to the deletion test.
 
-**A file header is a map, not an essay.** At or under the comment cap a header may stay
-prose; past it, it either becomes a map — one line per fact of the file's contract — or
-gets trimmed. A header may repeat per-symbol comments (a cold reader needs the shape
-before any symbol), never text the code already prints. The map allowance is not
-header-only: a comment whose lines are one-fact-each, sitting above a list-shaped
-declaration, is a map too — capped by the list it describes, not by the prose cap.
+**The deletion test settles any comment no kept set covers: remove it and re-read.** If
+the WHY goes dark it was load-bearing — restore it, rewritten in present tense; otherwise
+it was noise. 1–2 lines is the default, not a limit — "why is this long?" is the finding.
+The leading header block (license, provenance) stays.
 
-**Private symbols don't get public-style docs.** Doc-comment syntax (`//!` and kin) is
-for tooling-visible public API. On a private symbol a docstring restates the name to a
-reader who already has it; if there is a genuine one-line WHY, write a plain comment.
-The bar for any comment on a private symbol: a maintainer reading the symbol alone
-would be surprised without it.
+**Other languages have no kept set: every comment answers to the deletion test.**
 
-**The body of a private function caps comments at ONE line** — a `def private`, a C++
-static or anonymous-namespace helper, a non-exported JS function (das: STYLE015, same
-gating as STYLE014). A second line stands only when its content alone shows why — the
-same bar as *Short or absent* above; three or more never. Body-only: a comment
-*attached to* a private symbol takes the ordinary cap plus the bar in
-*Private symbols don't get public-style docs* above.
-
-**Field comments ride the declaration line** *(lintable)*, never a line above — fewer
-lines, and the struct scans as a table. A note that cannot fit the line belongs at the use
-site; one that explains a GROUP of fields rather than any single one may sit above the
-group, within the cap.
-
-**Branch hints ride the branch line.** A few words on the `if` identifying what lands
-in the branch (`// retries exhausted upstream, not here`). A WHY the line can't hold
-sits directly above the `if`, two lines at most. A self-describing predicate — a named
-helper, a compare against a named constant — gets nothing: restating `fn.neverInline`
-as "explicit opt-out" is narration. The comment must say something the identifiers
-don't.
-
-**A hint inside a branch body rides its statement's line.** A note about one statement
-sits on that statement's line (`pass` included); when that line has no room, directly
-above that statement. A note spanning several statements is about the branch — it goes
-on the `if` line or in the WHY above it.
-
-**No incident citations.** The banned form is a citation of an event that can only be
-verified outside the code — a PR or issue number, a date pinning when something broke or
-was fixed, "proven: <module> lost <bug>", or a reference to a past state of the code
-("came via X before the split", "moved here from Y"). A date stamping when the data pinned beside it
-was captured or verified (a frozen expected-output fixture beside its ids, a
-`probe-verified <date>` claim) points at no event and is not a citation. The required
-form is the failure mode named in present tense at the code that guards it:
-"a defaulted operand no call site can supply crashes simulation", not "used to crash".
-A mechanism note stays when a maintainer needs it to change the code without breaking
-the guard (why an encoding stays injective); it goes when it only argues the guard was
-right.
-
-**The message is the comment.** Any site that already carries a human-readable failure
-string — a branch's error/decline/log, an assertion or panic message, a test
-expectation — gets no comment restating it; put the fact the reader needs *into* the
-string instead. This makes good diagnostics double as documentation — one more reason
-to write them well.
-
-**Counterpart pointers earn their line.** When code has a counterpart that must change
-with it — the other half of a split condition, a block duplicated in a second file — a
-few words naming where the counterpart lives are a good comment:
-`if (isLiteral(a)) return true;   // variables resolve in BindingScan`. The pointer
-rides the pointed-from line when it fits; when the pointed-from code is a whole region
-— its half of a duplicated block — or the pointer overflows the line, it sits directly
-above the pointed-from code, each copy carrying its own.
-The discriminator against the consequence-note ban below: a pointer names WHERE the other
-half lives, so a maintainer changing this line knows what else to open. The absence is a
-finding too: two halves that must change together with no pointer on either half — fix by
-adding the pointer to one half
-(`// consumed by control.html's chat panel`); a note describing WHAT the effect looks like
-downstream (`// the page shows its attach button on this`) is the banned kind.
-
-**Define a term once, on the signature that coins it.** A predicate family's first
-member carries the tail comment defining the term; siblings say `// same, for X`. When
-the name alone carries the meaning, no header at all — a comment the reader
-understands the function *despite* is worse than none.
-
-**Show the transform.** For anything that rewrites code or data, a two-line
-before/after example beats a paragraph: `x = f(a) + 1  =>  x = (a * 2) + 1`. Prose
-stays only for the hazard the example can't show.
-
-**A danger named is a disposition stated.** "There is a hazard" without "and therefore
-the code refuses / hoists / defers / renames" is just ominous — the reader can't tell
-a bug-we-prevent from a bad-output-we-sometimes-emit. Every hazard comment ends with
-what the code does about it.
-
-**A comment describes the code it sits on** — not consequences realized elsewhere, not
-what a later pass will do. Emergent-behavior notes go at the line that produces them,
-if anywhere; forward references to later phases go nowhere.
+**No incident citations in a comment** — no PR numbers, no dates, no "used to crash". Name
+the failure mode in present tense at the code that guards it.
 
 ## Names
 
@@ -180,13 +94,13 @@ the implementation.
 
 ## Shape
 
-**A flag set-then-returned is a return in disguise** *(lintable — STYLE041)*.
-A bool initialized false, set on failure paths, then immediately
-consumed by a single `if (flag) return/error` — collapse to a direct return at each
-set site. The flag form often keeps looping after the answer is known and reports
-repeatedly. When the set site is inside a callback or visitor that cannot return
-through its caller, the collapse is a walk-abort instead: guard the callback's first
-line on the flag.
+**A flag set-then-returned is a return in disguise** *(partly lintable — STYLE041; a set
+that keeps looping and the walk-abort-in-callback form stay the reviewer's)*. A bool
+initialized false, set on failure paths, then immediately consumed by a single
+`if (flag) return/error` — collapse to a direct return at each set site. The flag form
+often keeps looping after the answer is known and reports repeatedly. When the set site is
+inside a callback or visitor that cannot return through its caller, the collapse is a
+walk-abort instead: guard the callback's first line on the flag.
 
 **One guard style per function.** Message-setting early-outs are one-liners:
 `if (cond) { why = "..."; return false; }` — never a *gratuitous* mix of one-liners
@@ -204,7 +118,5 @@ on "optional" members usually die with it.
 
 **Class bodies are dense** *(lintable)*. No blank lines between data members — blank
 separation is for top-level declarations; inline member-function bodies separate
-normally. Section-marker comments may subdivide a large class.
-
-**When in doubt: delete.** If reading the code plus the public doc-comments doesn't
-make the WHY clear, the comment was load-bearing. Otherwise it was noise.
+normally. A one-line section marker may subdivide a large class body in languages whose
+comments survive; in `.das` the kept set governs — a divider comment is not in it.
