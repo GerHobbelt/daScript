@@ -105,6 +105,8 @@ def suite_files(name : string) : array<string> {   // nolint:STYLE038 - a flat s
                     "modules/dasLLAMA/tests/test_compares.das",
                     "modules/dasLLAMA/tests/test_mtp_snapshot.das",
                     "modules/dasLLAMA/tests/test_mtp_sampled_walk.das",
+                    "modules/dasLLAMA/tests/test_dasllama_core.das",
+                    "modules/dasLLAMA/tests/test_dasllama_lib.das",
                     "modules/dasLLAMA/tests/test_dasllama_lint_contracts.das",
                     "modules/dasLLAMA/tests/test_metal_float_a_gate.das",
                     "modules/dasLLAMA/tests/test_dasllama_lint_escape.das",
@@ -211,7 +213,9 @@ def suite_files(name : string) : array<string> {   // nolint:STYLE038 - a flat s
                     "modules/dasLLAMA/tests/test_gpu_resident_hc.das",
                     "modules/dasLLAMA/tests/test_gpu_resident_hybrid.das",
                     "modules/dasLLAMA/tests/test_gpu_resident_llama.das",
+                    "modules/dasLLAMA/tests/test_gpu_resident_segments.das",
                     "modules/dasLLAMA/tests/test_gpu_resident_moe.das",
+                    "modules/dasLLAMA/tests/test_gpu_resident_format_census.das",
                     "modules/dasLLAMA/tests/test_gpu_perop_kv_codec.das",
                     "modules/dasLLAMA/tests/test_gpu_perop_kv_codec_iq.das",
                     "modules/dasLLAMA/tests/test_gpu_perop_kv_codec_k.das",
@@ -225,6 +229,7 @@ def suite_files(name : string) : array<string> {   // nolint:STYLE038 - a flat s
                     "modules/dasLLAMA/tests/test_gpu_resident_regions_gemma4.das",
                     "modules/dasLLAMA/tests/test_gpu_resident_regions_gptoss.das",
                     "modules/dasLLAMA/tests/test_gpu_resident_regions_qwen3moe.das",
+                    "modules/dasLLAMA/tests/test_gpu_resident_regions_qwen35moe.das",
                     "modules/dasLLAMA/tests/test_gpu_resident_regions_qwen2moe.das",
                     "modules/dasLLAMA/tests/test_gpu_resident_regions_gemma4moe.das",
                     "modules/dasLLAMA/tests/test_gpu_resident_regions_hybrid.das",
@@ -245,6 +250,7 @@ def suite_files(name : string) : array<string> {   // nolint:STYLE038 - a flat s
                     "modules/dasLLAMA/tests/test_kv_paged.das",
                     "modules/dasLLAMA/tests/test_kv_prefix.das",
                     "modules/dasLLAMA/tests/test_metal_batched_row.das",
+                    "modules/dasLLAMA/tests/test_metal_format_census.das",
                     "modules/dasLLAMA/tests/test_mtp.das",
                     "modules/dasLLAMA/tests/test_mtp_gemma_drafter.das",
                     "modules/dasLLAMA/tests/test_parity.das",
@@ -311,7 +317,9 @@ def area_tests(area : string) : array<string> {
     } elif (area == "infra") {
         return <- [ "failed_dasllama_lint_require.das", "failed_dasllama_lint_sidedoor.das", "test_bench_records_schema.das", "test_bench_rows.das",
                     "test_box_ident.das", "test_box_profile.das", "test_compares.das", "test_dasllama_lint_contracts.das",
-                    "test_dasllama_lint_escape.das", "test_dlim_wipe.das", "test_env_registry.das",
+                    "test_dasllama_core.das", "test_dasllama_lib.das",
+                    "test_dasllama_lint_escape.das", "test_dlim_wipe.das",
+                    "test_env_registry.das",
                     "test_exchange_schema.das", "test_exe_smoke.das", "test_facade_docs.das", "test_fat_hook_umbrella.das", "test_fat_start.das", "test_gen_records_args.das",
                     "test_model_specs.das", "test_program_roots.das", "test_run_suites.das", "test_run_summary.das", "test_served_bench.das",
                     "test_site_records.das", "test_sizing_helpers.das", "test_tok_seed.das", "test_tune_interrupt.das", "test_vk_spv_diff.das" ]
@@ -319,9 +327,9 @@ def area_tests(area : string) : array<string> {
         return <- [ "test_accel_backend.das", "test_affinity_predicates.das", "test_arch_registry.das", "test_batch_decode.das", "test_bench_rows.das",
                     "test_batch_grid.das", "test_chat.das", "test_deltanet.das", "test_dispatch_shaping.das", "test_facade.das",
                     "test_flash.das", "test_forward.das", "test_from_template.das", "test_fused_decode.das", "test_gguf_quant.das", "test_gguf_shards.das",
-                    "test_gpu_model_swap.das", "test_gpu_moe_shexp.das", "test_gpu_perop_kv_codec.das", "test_gpu_perop_kv_codec_iq.das", "test_gpu_perop_kv_codec_k.das", "test_gpu_resident_codec_llama_iq.das", "test_gpu_resident_codec_llama_k.das", "test_gpu_resident_gemma2.das", "test_gpu_resident_gemma3_1b.das", "test_gpu_resident_gemma3_4b.das", "test_gpu_resident_gemma4_12b_k.das", "test_gpu_resident_gemma4_12b_q8.das", "test_gpu_resident_gemma4_26b.das", "test_gpu_resident_gemma4_26b_k.das", "test_gpu_resident_gemma4_31b.das", "test_gpu_resident_gemma4_e2b.das", "test_gpu_resident_gemma4_e4b.das", "test_gpu_resident_gptoss.das", "test_gpu_resident_hc.das", "test_gpu_resident_hybrid.das", "test_gpu_resident_llama.das", "test_gpu_resident_moe.das", "test_gpu_resident_qwen2.das", "test_gpu_resident_regions.das", "test_gpu_resident_regions_e2b.das", "test_gpu_resident_regions_gptoss.das", "test_gpu_resident_regions_qwen3moe.das", "test_gpu_resident_regions_qwen2moe.das", "test_gpu_resident_regions_gemma4moe.das", "test_gpu_resident_regions_gemma2.das", "test_gpu_resident_regions_gemma3.das", "test_gpu_resident_regions_gemma4.das", "test_gpu_resident_regions_hybrid.das", "test_gpu_resident_regions_hybrid_k.das", "test_gpu_resident_regions_hybrid_iq3s.das", "test_gpu_resident_regions_hybrid_q3kxl.das", "test_gpu_resident_regions_llama_k.das", "test_gpu_resident_regions_llama3b_ctx32k.das", "test_gpu_resident_regions_gemma3_4b_ctx128k.das", "test_gpu_resident_regions_gemma4_e2b_ctx128k.das", "test_gpu_resident_regions_phi3.das", "test_gpu_resident_regions_qwen3.das", "test_gpu_resident_regions_q8kv.das", "test_gpu_resident_regions_tq4kv.das", "test_gpu_serving_declines.das", "test_gpu_slot_swap.das", "test_gpu_tier.das", "test_groupn.das",
+                    "test_gpu_model_swap.das", "test_gpu_moe_shexp.das", "test_gpu_perop_kv_codec.das", "test_gpu_perop_kv_codec_iq.das", "test_gpu_perop_kv_codec_k.das", "test_gpu_resident_codec_llama_iq.das", "test_gpu_resident_codec_llama_k.das", "test_gpu_resident_gemma2.das", "test_gpu_resident_gemma3_1b.das", "test_gpu_resident_gemma3_4b.das", "test_gpu_resident_gemma4_12b_k.das", "test_gpu_resident_gemma4_12b_q8.das", "test_gpu_resident_gemma4_26b.das", "test_gpu_resident_gemma4_26b_k.das", "test_gpu_resident_gemma4_31b.das", "test_gpu_resident_gemma4_e2b.das", "test_gpu_resident_gemma4_e4b.das", "test_gpu_resident_gptoss.das", "test_gpu_resident_hc.das", "test_gpu_resident_hybrid.das", "test_gpu_resident_llama.das", "test_gpu_resident_segments.das", "test_gpu_resident_moe.das", "test_gpu_resident_format_census.das", "test_gpu_resident_qwen2.das", "test_gpu_resident_regions.das", "test_gpu_resident_regions_e2b.das", "test_gpu_resident_regions_gptoss.das", "test_gpu_resident_regions_qwen3moe.das", "test_gpu_resident_regions_qwen35moe.das", "test_gpu_resident_regions_qwen2moe.das", "test_gpu_resident_regions_gemma4moe.das", "test_gpu_resident_regions_gemma2.das", "test_gpu_resident_regions_gemma3.das", "test_gpu_resident_regions_gemma4.das", "test_gpu_resident_regions_hybrid.das", "test_gpu_resident_regions_hybrid_k.das", "test_gpu_resident_regions_hybrid_iq3s.das", "test_gpu_resident_regions_hybrid_q3kxl.das", "test_gpu_resident_regions_llama_k.das", "test_gpu_resident_regions_llama3b_ctx32k.das", "test_gpu_resident_regions_gemma3_4b_ctx128k.das", "test_gpu_resident_regions_gemma4_e2b_ctx128k.das", "test_gpu_resident_regions_phi3.das", "test_gpu_resident_regions_qwen3.das", "test_gpu_resident_regions_q8kv.das", "test_gpu_resident_regions_tq4kv.das", "test_gpu_serving_declines.das", "test_gpu_slot_swap.das", "test_gpu_tier.das", "test_groupn.das",
                     "test_embeddings.das", "test_jobque_tripwire.das", "test_kernel_backend.das", "test_kgroup_repack.das", "test_kqformat.das", "test_kquant.das",
-                    "test_kv_codec.das", "test_kv_paged.das", "test_kv_prefix.das", "test_metal_batched_row.das", "test_math_activations.das",
+                    "test_kv_codec.das", "test_kv_paged.das", "test_kv_prefix.das", "test_metal_batched_row.das", "test_metal_format_census.das", "test_math_activations.das",
                     "test_math_elementwise.das", "test_matmul.das", "test_matmul_batch.das",
                     "test_metal_float_a_gate.das", "test_metal_gemm.das", "test_metal_role_infer.das", "test_mtp.das",
                     "test_mtp_gemma_drafter.das", "test_mtp_sampled_walk.das", "test_mtp_snapshot.das", "test_mxfp4.das",
@@ -383,9 +391,12 @@ let MODULE_AREAS <- {
     "dasllama_kv_dtype" => "llm", "dasllama_metal_decode" => "llm", "dasllama_metal_mtp_gemma" => "llm",
     "dasllama_kv_codec" => "llm,audio",   // its f16 dot and axpy serve the parakeet decode
     "dasllama_metal_prefill" => "llm,tts,audio,vision",   // its rope serves the Pocket codec transformer, its attention pair and FastConformer kernels the audio towers, its half convert the vision tower
-    "dasllama_moe" => "llm", "dasllama_mtp_gemma" => "llm",
+    "dasllama_moe" => "llm", "dasllama_mtp_gemma" => "llm", "dasllama_vulkan_mtp_gemma" => "llm",
     "dasllama_parity" => "llm", "dasllama_ple" => "llm", "dasllama_prefix" => "llm", "dasllama_pretok" => "llm",
-    "dasllama_rope" => "llm,tts",   // the TTS slab builds its rope tables through it
+    // the TTS slab builds its rope tables through it; every gguf load
+    // picks its factor tensor through it, and the vision and audio
+    // tests load decoders
+    "dasllama_rope" => "llm,tts,vision,audio",
     "dasllama_sampling" => "llm,vision,audio", "dasllama_scheduler" => "llm",
     "dasllama_spm" => "llm,tts",   // the unigram arm is the Pocket tokenizer (test_tts_pocket)
     "dasllama_bench" => "llm,infra",   // the rows serve lcpp_bench (llm) and the server's /bench (infra's tooling)

@@ -27,6 +27,7 @@ require math
 require ../../common/parallel_workers.das
 require ../../common/git_signature.das
 require ../../common/log_floor.das
+require ../../common/text_lines.das
 require ../../../dastest/worker_policy.das
 require config
 require compile_db
@@ -167,17 +168,6 @@ def temp_dir_or_cwd() : string {
 // fixed name lets concurrent preflights clobber each other's files
 def unique_temp_path(prefix, suffix : string) : string =>
     path_join(temp_dir_or_cwd(), "{prefix}_{ref_time_ticks()}{suffix}")
-
-def non_empty_lines(s : string) : array<string> {
-    var out : array<string>
-    for (raw in split(s, "\n")) {
-        let line = strip(replace(raw, "\r", ""))
-        if (!empty(line)) {
-            out |> push(line)
-        }
-    }
-    return <- out
-}
 
 // ===== environment discovery =====
 
@@ -394,7 +384,7 @@ def gate_untracked() : GateResult {
         return GateResult(name = "untracked", status = GateStatus.Fail, seconds = seconds_since(t0),
             detail = "git ls-files failed", output = ls.out)
     }
-    var inscope files <- untracked_from_ls(ls.out)
+    var inscope files <- non_empty_lines(ls.out)
     if (empty(files)) {
         return GateResult(name = "untracked", status = GateStatus.Pass, seconds = seconds_since(t0))
     }
@@ -585,20 +575,34 @@ def gate_format(ctx : PreflightCtx) : GateResult {
         output = r.out)
 }
 
-// CI's lint verdict is rendered ONLY by the linux lane (extended_checks gates the step on
-// matrix.target == 'linux'), in the linux MODULE WORLD (no dasMetal — platform static_if
-// halves compile out, so their requires/args read unused there and nowhere else; dasVulkan
-// is in-tree and present on linux, so it is NOT disabled). A host-flavor pass alone is
-// structurally blind to that — so this gate runs two rails, host then linux-mirror.
-// LINT019 is OFF on both (mirrors CI): a changed-set ledger cannot see consumers
-// outside the PR — staleness belongs to the nightly whole-tree -j 1 pass.
+// CI's lint verdict is rendered by the linux lane (extended_checks
+// gates the step on matrix.target == 'linux'), in the linux MODULE
+// WORLD (no dasMetal — platform static_if halves compile out, so
+// their requires/args read unused there and nowhere else; dasVulkan
+// is in-tree and present on linux, so it is NOT disabled), and the
+// darwin core lane compiles the whole tree with NO dasVulkan (off by
+// default on Apple), where a `?vulkan` symbol used outside
+// `static_if (typeinfo builtin_module_exists(vulkan))` fails. A
+// host-flavor pass alone is structurally blind to both — so this
+// gate runs host, linux-mirror, then the darwin-mirror on a box
+// whose build carries dasVulkan (a box without it already ran that
+// world as its host pass). LINT019 is OFF on every rail (mirrors
+// CI): a changed-set ledger cannot see consumers outside the PR —
+// staleness belongs to the nightly whole-tree -j 1 pass.
 def gate_lint(ctx : PreflightCtx) : GateResult {
     let t0 = ref_time_ticks()
+    let line_check = run_argv(line_length_argv(ctx.daslang, ctx.base))
+    let line_fail = line_length_fail_detail(line_check.rc, ctx.base)
+    if (!empty(line_fail)) {
+        return GateResult(name = "lint", status = GateStatus.Fail, seconds = seconds_since(t0),
+            detail = line_fail, output = line_check.out)
+    }
     // a C/C++ positional compiles nothing; it arms its folder's [arch] pass, whose pointers it may carry
     var files <- lint_gate_files(ctx.changed_das, ctx.changed_md, ctx.changed_cpp, ctx.changed_cxx_other)
     if (empty(files)) {
         return GateResult(name = "lint", status = GateStatus.Skip, seconds = seconds_since(t0),
-            detail = "no .das, .md or C/C++ files changed vs {ctx.base} outside tree-sitter-daslang/")
+            detail = ("no .das, .md or C/C++ files changed vs {ctx.base} outside " +
+                      "tree-sitter-daslang/; added lines within CI's length limits"))
     }
     var host_args <- [ctx.daslang, "utils/lint/main.das", "--"]
     host_args |> push_from(files)
@@ -623,9 +627,24 @@ def gate_lint(ctx : PreflightCtx) : GateResult {
         return GateResult(name = "lint", status = GateStatus.Fail, seconds = seconds_since(t0),
             detail = "LINUX-lane lint warnings (host pass was clean — a platform static_if half hides the symbol here; nolint:...,LINT019 both-worlds spelling, see skills/internal/preflight.md)", output = mirror.out)
     }
+    if (!module_absent(VULKAN_GATE)) {
+        var darwin_args <- [ctx.daslang, "--disable-module", "dasVulkan",
+                            "utils/lint/main.das", "--"]
+        darwin_args |> push_from(files)
+        darwin_args |> push("--quiet")
+        darwin_args |> push("--disable")
+        darwin_args |> push("LINT019")
+        let darwin = run_argv(darwin_args)
+        if (darwin.rc != 0) {
+            return GateResult(name = "lint", status = GateStatus.Fail, seconds = seconds_since(t0),
+                detail = ("DARWIN core lane lint warnings (host pass was clean — a `?vulkan` " +
+                          "symbol or type is used outside " +
+                          "`static_if (typeinfo builtin_module_exists(vulkan))`, " +
+                          "see skills/internal/preflight.md)"), output = darwin.out)
+        }
+    }
     return GateResult(name = "lint", status = GateStatus.Pass, seconds = seconds_since(t0),
-        detail = fixed == 0 ? "{length(files)} file(s) clean on both rails (host, linux-mirror)"
-            : "{length(files)} file(s) clean on both rails after --fix rewrote {fixed} of them - review and commit those edits",
+        detail = lint_pass_detail(length(files), fixed, lint_rails()),
         output = fixed == 0 ? "" : host.out)
 }
 
@@ -1599,7 +1618,9 @@ def gate_table() : array<GateInfo> {
     return <- [
         GateInfo(name = "untracked", tier = "fast", doc = "no untracked files at PR time — commit, delete, or ignore each"),
         GateInfo(name = "format", tier = "fast", doc = "formatter --verify on tracked .das (mirrors CI)"),
-        GateInfo(name = "lint", tier = "fast", doc = "lint changed .das and .md on two rails (host, linux-mirror), zero warnings"),
+        GateInfo(name = "lint", tier = "fast",
+                 doc = "lint changed .das and .md on two rails (host, linux-mirror), zero warnings;"
+                     + " added .das lines within CI's length limits (code 100, comments 70)"),
         GateInfo(name = "hash-refs", tier = "fast", doc = "no bare #N in branch commit messages that GitHub would mislink - ledger cites spell out or backtick"),
         GateInfo(name = "review-md", tier = "fast", doc = "REVIEW.das gates of every folder the diff touches (utils/internal/review-md; CI's extended_checks step runs every gate)"),
         GateInfo(name = "review-md-tests", tier = "fast", doc = "the review-md discovery suites (walker fixtures, make-pr gate tests, preflight's own) when the diff touches a REVIEW.das or those tools (mirrors CI's extended_checks step)"),

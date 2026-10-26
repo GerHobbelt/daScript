@@ -445,8 +445,8 @@
     `parity` into das rows. STAGED BEHIND: the README support-matrix table becomes a
     generated rendering of the table (gen_env_doc pattern; authored arch-prose rides as a
     field). Found while scoping it: the README matrix claims frozen `test_parity.das`
-    fixtures for GLM-4.5-Air, Phi-3.5, Mistral-Medium-3.5 and Gemma-4-31B that do not exist
-    in the tree - the generation arc starts by reconciling those rows (re-mint or re-word).
+    fixtures for Phi-3.5, Mistral-Medium-3.5 and Gemma-4-31B that do not exist in the
+    tree - the generation arc starts by reconciling those rows (re-mint or re-word).
 
 35. **`@exact_size` - DONE as a lint contract, not a runtime mode (2026-08-18).** The
     declaration-site annotation landed on variables, fields and by-ref parameters (locals gained
@@ -460,16 +460,6 @@
 
 36. **DONE (2026-08-18) under #35:** the vulkan bake-trim `embq`/`embs` bare resizes in
     `dasllama_gpu_resident.das` were the first PERF032 hits - now `reserve_resize`.
-
-37. **The Mistral-7B-v0.3 parity fixture is red on clean master (2026-08-18).** Verified by a
-    detached-master run (54 tests, that one red); the arm now runs as
-    `pinned-greedy parity: Mistral-7B-Instruct-v0.3-Q8_0.gguf` inside `test_parity_specs`.
-    PARITY_FULL-gated, so per-PR CI never sees it. The eyeball rail now shows the shape:
-    38/40 match, then "...interest in the technology" (oracle) vs "...in the field" (das) -
-    a prose-tail near-tie of the "Once upon a time" prompt, the exact class the fixture
-    header disallows. Needs its own session: regression vs upstream re-upload vs stale
-    expectation (stash-and-rerun, then the model-file sha against the manifest); the likely
-    resolution is re-freezing on the counting prompt like every other carrier.
 
 38. **Large-tier parity fixtures have no CI lane (2026-08-18; narrowed).** The official
     set's evidence is now exercised by every board sweep (the parity pregate - the de facto
@@ -2106,3 +2096,10 @@
     predict it to. The work: the cached K/V rows against a cold prefill's row by row at that prompt, to name
     the row that differs and whether it is the last token's alone; then either the cold run's last row
     evaled as the cached run evals it, or the difference stated in the server's README.
+213. **The module's `.das` lines run past the repo's line-length limits (code 100 columns, a comment
+    70), and `modules/dasLLAMA/.lint_config` and `utils/dasllama-server/.lint_config` leave both
+    measures unchecked in the module and its server.** The sweep, after
+    the 0.6.5 release: wrap every line over the limit by hand - a continuation line starting with `+`
+    or `-` is its own statement, so an arithmetic tail goes inside `(...)` and a kernel stamp's MSL or
+    SPIR-V text splits at its own grammar - then delete the `[line_length]` table and the file, so the
+    repo limits bind the folder; the kernels and model-free suites on both homes hold the wrapped tree.

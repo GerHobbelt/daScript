@@ -150,6 +150,35 @@ def test_failed_files_block(t : T?) {
 }
 
 [test]
+def test_line_length_run(t : T?) {
+    t |> equal(line_length_argv("das.exe", "upstream/main"),
+        ["das.exe", "utils/internal/line-length/main.das", "--", "--base", "upstream/main"],
+        "the base rides as given, never under origin/")
+    t |> equal(line_length_fail_detail(0, "origin/master"), "", "rc 0 passes")
+    t |> equal(line_length_fail_detail(1, "origin/master"),
+        ("line-length check vs origin/master failed - wrap the lines it lists, " +
+         "or fix the base it names"),
+        "rc 1 fails the gate and names the base - the tool fails on an unresolvable base too")
+}
+
+[test]
+def test_lint_pass_detail(t : T?) {
+    t |> equal(lint_pass_detail(6, 0, "host, linux-mirror, darwin-mirror"),
+        ("6 file(s) clean on every rail (host, linux-mirror, darwin-mirror), " +
+         "added lines within CI's length limits"),
+        "nothing rewritten: the rails that ran and the length check")
+    t |> equal(lint_pass_detail(6, 2, "host = darwin world, linux-mirror"),
+        ("6 file(s) clean on every rail (host = darwin world, linux-mirror) after --fix " +
+         "rewrote 2 of them - review and commit those edits; " +
+         "added lines within CI's length limits"),
+        "--fix edits are named so they get committed")
+    let rails = lint_rails()
+    let expected = (module_absent(VULKAN_GATE) ? "host = darwin world, linux-mirror" :
+        "host, linux-mirror, darwin-mirror")
+    t |> equal(rails, expected, "the darwin mirror runs only where the box carries dasVulkan")
+}
+
+[test]
 def test_lint_inputs(t : T?) {
     t |> success(is_lint_input("daslib/lint.das"), "a .das file is a lint input")
     t |> success(is_lint_input("modules/dasLLVM/ARCHITECTURE.md"), "a .md file is a lint input - LINT027's line gate reads it")

@@ -15,11 +15,6 @@ struct public PreflightSettings {
     jit_max_file_time : float = 120.0
 }
 
-//! The pure half of the untracked-files gate: repo-relative paths from
-//! `git ls-files --others --exclude-standard` output, CR and blank lines dropped.
-def public untracked_from_ls(out : string) : array<string> =>
-    <- [for (ln in split(out, "\n")); strip(ln); where !empty(strip(ln))]
-
 //! The pure half of the dasLLAMA gates' trigger: does a changed path (as `git diff --name-only`
 //! prints them - repo-relative, forward slashes, maybe CR-terminated) sit under `prefix`?
 def public has_path_under(paths : array<string>; prefix : string) : bool {
@@ -96,7 +91,8 @@ let public SWEEP_EXCLUDED <- {
 //! artifact a dll build carries it in
 typedef ModuleGate = tuple<name : string; artifact : string>
 
-let private VULKAN_GATE : ModuleGate = (name = "vulkan", artifact = "modules/dasVulkan/dasModuleVulkan.shared_module")
+let public VULKAN_GATE : ModuleGate = (name = "vulkan",
+    artifact = "modules/dasVulkan/dasModuleVulkan.shared_module")
 
 //! trees whose roots require a module the box may not have built (dasVulkan is off by default on Apple):
 //! swept while the box has the module, skipped while it does not
@@ -149,6 +145,34 @@ def public count_fixed_files(out : string) : int {
     }
     return n
 }
+
+//! The line-length tool's argv: the gate's base ref rides as given
+def public line_length_argv(daslang, base : string) : array<string> =>
+    <- [daslang, "utils/internal/line-length/main.das", "--", "--base", base]
+
+//! The lint gate's line for a failed line-length run; "" on rc 0
+def public line_length_fail_detail(rc : int; base : string) : string {
+    return "" if (rc == 0)
+    return "line-length check vs {base} failed - wrap the lines it lists, or fix the base it names"
+}
+
+//! The lint gate's pass line: the rails that ran clean, --fix edits,
+//! line lengths
+def public lint_pass_detail(file_count, fixed : int; rails : string) : string {
+    let length_note = "added lines within CI's length limits"
+    if (fixed != 0) {
+        return ("{file_count} file(s) clean on every rail ({rails}) after --fix rewrote " +
+                "{fixed} of them - review and commit those edits; {length_note}")
+    }
+    return "{file_count} file(s) clean on every rail ({rails}), {length_note}"
+}
+
+//! the rails the lint gate runs on this box: a host without
+//! dasVulkan already lints the darwin core lane's world as its host
+//! pass, so the darwin mirror runs only where the module is built
+def public lint_rails() : string =>
+    (module_absent(VULKAN_GATE) ? "host = darwin world, linux-mirror" :
+        "host, linux-mirror, darwin-mirror")
 
 //! The files dastest's closing FAILURES block names, comma-joined, at most five.
 def public failed_files_block(out : string) : string {

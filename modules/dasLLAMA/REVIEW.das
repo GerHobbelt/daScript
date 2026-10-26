@@ -217,7 +217,7 @@ var private GPU_ROLES_METAL <- {
 
 var private GPU_ROLES_VULKAN <- {
     "tts",
-    "classes", "common", "decode", "prefill", "seams", "dispatch", "tower", "asr_dec"
+    "classes", "common", "decode", "prefill", "seams", "dispatch", "tower", "asr_dec", "mtp_gemma"
 }
 
 // the fastmath default, mechanically: a [metal_kernel] declaring fastmath=false reds unless
@@ -232,7 +232,18 @@ var private FASTMATH_OFF_EXEMPT <- {
     "metal_st2_src_cumsum_torch_msl" => "st2_source_gate",
     "metal_st2_src_cumsum_onnx_msl" => "st2_source_gate",
     "metal_st2_src_sines_torch_msl" => "st2_source_gate",
-    "metal_st2_src_sines_onnx_msl" => "st2_source_gate"
+    "metal_st2_src_sines_onnx_msl" => "st2_source_gate",
+    //! the per-32 GEMV and its small-batch form (an unnamed kernel keys by its method): under fast math the two sum a
+    //! column's dot apart, and `b32_mvb_gate` in tests/test_metal_prefill_kernels.das reds its bit-for-bit compare
+    "metal_kq_gemv_q51_msl" => "b32_mvb_gate",
+    "metal_kq_gemv_iq4nl32_msl" => "b32_mvb_gate",
+    "metal_kq_gemv_q51_ks_msl" => "b32_mvb_gate",
+    "metal_kq_gemv_iq4nl32_ks_msl" => "b32_mvb_gate",
+    "metal_kq_gemv_q4032_msl" => "b32_mvb_gate",
+    "metal_kq_gemv_q4032_ks_msl" => "b32_mvb_gate",
+    "metal_kq_gemv_q5032_msl" => "b32_mvb_gate",
+    "metal_kq_gemv_q5032_ks_msl" => "b32_mvb_gate",
+    "metal_b32_mvb" => "b32_mvb_gate"
 }
 
 //! The `name="..."` a [metal_kernel] line declares, or "" where the line carries none.
@@ -246,17 +257,27 @@ def private metal_kernel_name(line : string) : string {
     return slice(line, q0 + 1, q1)
 }
 
+[arch(at = "ARCHITECTURE_ENGINE.md#engine-core")]
 def private check_fastmath_default {
     var files : array<string>
     collect_das_files("modules/dasLLAMA/dasllama", files)
     for (p in files) {
         var line_no = 0
-        for (line in split(fread(p), "\n")) {
+        var inscope lines <- split(fread(p), "\n")
+        for (line in lines) {
             line_no++
             continue if ((find(line, "fastmath=false") < 0 && find(line, "fastmath = false") < 0) || (strip(line) |> starts_with("//")))
-            if (!key_exists(FASTMATH_OFF_EXEMPT, metal_kernel_name(line))) {
+            var key = metal_kernel_name(line)
+            if (empty(key) && line_no < length(lines)) {   //! an unnamed kernel: the method the next line declares
+                let next = strip(lines[line_no])
+                key = next |> starts_with("def ") ? strip(slice(next, 4, find(next, " ", 4) < 0 ? length(next) : find(next, " ", 4))) : ""
+            }
+            if (!key_exists(FASTMATH_OFF_EXEMPT, key)) {
                 gate_finding(p, line_no,
-                    "kernel declares fastmath=false without an exemption row naming the test that fails under fastmath - fastmath is the default; the opt-out ships its demonstrated breakage")
+                    ("kernel declares fastmath=false without an exemption row naming the test that"
+                    + " fails under fastmath - fastmath is the default; the opt-out ships its"
+                    + " demonstrated breakage, and its row ships its line in"
+                    + " ARCHITECTURE_ENGINE.md#engine-core"))
             }
         }
     }
@@ -434,6 +455,59 @@ def private check_metal_kernel_load_addressing {
     dir("modules/dasLLAMA/dasllama") $(name) {
         if (starts_with(name, "dasllama_metal_") && ends_with(name, ".das")) {
             check_load_addressing_in("modules/dasLLAMA/dasllama/{name}")
+        }
+    }
+}
+
+//! every Metal GEMM form a format family stamps, every member stamps
+def private check_kq_form_matrix {
+    var inscope forms_by_fmt, family_forms : table<string; table<string>>
+    var inscope first_stamp : table<string; string>
+    var inscope first_stamp_line : table<string; int>
+    var alltext = ""
+    dir("modules/dasLLAMA/dasllama") $(name) {
+        return if (!(starts_with(name, "dasllama_metal_") && ends_with(name, ".das")))
+        let path = "modules/dasLLAMA/dasllama/{name}"
+        let text = fread(path)
+        alltext += text
+        var line_no = 0
+        for (line in split(text, "\n")) {
+            line_no++
+            let k = find(line, "stamp = \"")
+            continue if (k < 0)
+            let rest = slice(line, k + length("stamp = \""))
+            let q = find(rest, "\"")
+            continue if (q < 0)
+            var inscope parts <- split(slice(rest, 0, q), ":")
+            continue if (length(parts) != 3)
+            let key = "{parts[0]}|{parts[1]}"
+            forms_by_fmt[key] |> insert(parts[2])
+            family_forms[parts[0]] |> insert(parts[2])
+            if (!key_exists(first_stamp, key)) {
+                first_stamp[key] = path
+                first_stamp_line[key] = line_no
+            }
+        }
+    }
+    var inscope stamped <- [for (k in keys(forms_by_fmt)); k]
+    for (key in stamped) {
+        var inscope kp <- split(key, "|")
+        let family = kp[0]
+        let fmt = kp[1]
+        let path = first_stamp?[key] ?? ""
+        let line = first_stamp_line?[key] ?? 0
+        for (form in keys(family_forms[family])) {
+            if (!key_exists(forms_by_fmt[key], form)) {
+                gate_finding(path, line,
+                    "format {fmt} stamps no {family}:{form} while another format of the family does - a form one format has and another lacks sends the two through different kernel sequences on one machine; stamp it, or drop the form from every member")
+            }
+        }
+        let race = family == "kq_mm" ? "\"kq_mulmm_{fmt}\"" : "\"moe_mulmm_{fmt}\""
+        if (find(alltext, race) < 0) {
+            gate_finding(path, line, "format {fmt} stamps {family} twins and races none - no {race} verdict picks between its twin and its base; register the race in metal_tensor_race")
+        }
+        if (family == "kq_mm" && find(alltext, "\"enc_kq_dq_{fmt}\"") < 0 && find(alltext, "enc_dequant_{fmt}h(") < 0) {
+            gate_finding(path, line, "format {fmt} stamps dense twins and has no dev-W dequant pass - every dense format takes the dev-W arm or none does")
         }
     }
 }
@@ -816,8 +890,8 @@ let private TTS_BLOCKS_FILE = "modules/dasLLAMA/dasllama/dasllama_tts_blocks.das
 // the TTS block file's *_prepare mints, the layout helpers and the layout constants' declaration
 // lines, hashed in file order. A closure change with IMAGE_VERSION unmoved is red; the finding prints the
 // value to re-stamp with.
-let private IMAGE_LAYOUT_STAMP_VERSION = 45
-let private IMAGE_LAYOUT_STAMP_HASH = 0xa5973cf0f378f4a8ul
+let private IMAGE_LAYOUT_STAMP_VERSION = 49
+let private IMAGE_LAYOUT_STAMP_HASH = 0x66397501edef99d1ul
 
 // The helpers that decide WHERE bytes land: the page pad, the plane and total sizing, the
 // writer's append / zero-fill / header patch, the header's scalar stores, the lattice
@@ -1151,13 +1225,13 @@ def private cm2_template_chain_lines(name : string) : array<string> {
 //! one class ladder trio every format template on the cm2 base joins
 struct private LadderTrio {
     suffix : string     //! the stamp's class suffix: `<Fmt>` + suffix
-    tail : string       //! the dispatch name's tail: `kq_batch_<fmt>_` + tail; a per-32 format (q8, q51, mx4, iq4nl32) spells `<fmt>_batch_` + tail
+    tail : string       //! the dispatch name's tail: `kq_batch_<fmt>_` + tail; a per-32 format (q8, q51, mx4, iq4nl32, q4032, q5032) spells `<fmt>_batch_` + tail
     ladder : string     //! a ladder trio of this tile's own beside the engine's `cm2_cls_*` (the kernel cells' `khr_cls_`), "" where there is none
     why : string        //! what a missing arm does at run time
 }
 
 def private cm2_dispatch_name(fmt, tail : string) : string =>
-    fmt == "q8" || fmt == "q51" || fmt == "mx4" || fmt == "iq4nl32" ? "{fmt}_batch_{tail}" : "kq_batch_{fmt}_{tail}"
+    fmt == "q8" || fmt == "q51" || fmt == "mx4" || fmt == "iq4nl32" || fmt == "q4032" || fmt == "q5032" ? "{fmt}_batch_{tail}" : "kq_batch_{fmt}_{tail}"
 
 //! the words of a `let [private] NAME = "..."` line in `path`, or none with a finding: a roster the gate reads where the code reads it
 def private let_words(path, name : string) : array<string> {
@@ -1690,7 +1764,7 @@ let private GEMM_GEN_FILES = [
     "modules/dasLLAMA/dasllama/dasllama_gemm_gen.das",
     "modules/dasLLAMA/dasllama/dasllama_gemm_schema.das"
 ]
-let private GEMM_GEN_STAMP_HASH = 0x90ebe425c98c9c04ul
+let private GEMM_GEN_STAMP_HASH = 0x21e4317ad7604a49ul
 
 [arch(at = "ARCHITECTURE_ENGINE_FORMATS.md#cpu-kernel-tiers")]
 def private check_gemm_gen_stamp {
@@ -1967,6 +2041,7 @@ def main() : int {
     check_cm2_ladder_sets()
     check_cm2_stamp_tiles()
     check_kq_gemv_grid_literals()
+    check_kq_form_matrix()
     check_vk_extension_roster()
     check_no_hand_pipelines()
     check_verify_decline_before_state_move()

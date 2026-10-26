@@ -1,13 +1,14 @@
 # dasLLAMA tests - Pinned Gates Code Review Checklist
 
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture
-doc: `CLAUDE.md`. Planned work: `../followup_general.md`.
+doc: `../ARCHITECTURE.md`. Planned work: `../followup_general.md`.
 
 A cell is one `t |> run` subtest, or a `[test]` function that runs no subtest; a helper's
 asserts belong to every cell that calls it. A pinned test cell is a cell the pinned set lists,
 or any cell of a file the pinned set lists whole - a file entry, one naming the file and no cell -
-and the pinned set is the only test of whether a cell is one. The pinned set, one entry a line,
-each with what it must keep holding:
+and the pinned set is the only test of whether a cell is one; a named-cell entry names a `[test]`
+function and pins every cell that function runs. The pinned set, one entry a line, each with what it
+must keep holding:
 
 - `test_run_suites.das` must hold the per-PR split, the folder census, the area tables and the
   `--exclude` filter.
@@ -17,9 +18,9 @@ each with what it must keep holding:
 - `test_model_specs.das` must hold `../performance/model_specs.das`'s model-set table, and
   `spec_by_file` answering by the models-dir path and by the gguf's base name (a split-shard row
   sits in a subfolder).
-- `test_metal_prefill_kernels.das`'s `test_metal_prefill_kernels` cell must hold its
-  `attn_trio_gate` calls whose `AttnKeys` sets `softcap`, `hass`, `uend` or `ulo` - the softcap,
-  sink, uniform-span and mixed-span arms.
+- `test_metal_prefill_kernels.das`'s `test_metal_prefill_kernels` cell must hold every kernel gate
+  it calls, at the bar each gate sets, with its `attn_trio_gate` calls whose `AttnKeys` sets
+  `softcap`, `hass`, `uend` or `ulo`.
 - `test_site_records.das` must hold the byte-compare of `site/files/dasllama/bench_records.json`
   and of `site/files/dasllama/bench_cells.json` (repo root) - the smaller copy the site page loads
   first - against a fresh `merge_site_records` run, and `bench_cells.json` keeping every field
@@ -67,18 +68,18 @@ entry does not name.**
 An axis is one distinct behaviour the cell asserts - an output form, a refusal path, an argument's
 order; a new input row on an axis the cell already asserts is not an axis gained.
 
-**A diff that loosens a pinned test cell's bound, drops its input, or drops a `run.das` suite
-listing that reaches it is a defect - keep the cell's asserts and fix the code that fails them
-instead; so is a diff that removes a pinned test cell's assert without adding to the same cell, in
-the same change, an assert that holds the same values to an equal or tighter bound, with its
-control (an extra assert in the same cell proving the compare can fail).** A diff that changes the value
-the cell's asserted function answers on an input the cell keeps is not one of these.
+**A diff that widens a pinned test cell's tolerance, swaps its comparison for one more outputs
+pass, rewrites an expected value without updating the cell's entry under the contract-change rule
+above, drops its input, or drops a `run.das` suite listing that reaches it is a defect - keep the
+cell's asserts and fix the code that fails them instead; so is a diff that removes a pinned
+test cell's assert without adding to the same cell, in the same change, an assert that holds the
+same values to an equal or tighter bound, with its control (an extra assert in the same cell
+proving the compare can fail).**
 
 **A diff that adds a cell or an assert whose expected value must be kept in step with something
 maintained outside the cell - a document, a checked-in table, a committed artifact's form, a
 roster, a knob list; not a value the cell's own claim defines - or that a checked-in table names
 as its evidence, adds the cell carrying it to the pinned set in the same change** - as a named
-cell; or, when the new cell leaves every cell of its file pinned, by replacing the file's named
-cells with one file entry naming what it pins; or, when the file already has a file entry, by
-adding each axis the new cell or assert asserts to that entry's must-hold list where it is
-missing. A new entry in an existing cell's expectation list is not a new assert.
+cell, or, when the new cell leaves every cell of its file pinned, by replacing the file's named
+cells with one file entry naming what it pins. A new entry in an existing cell's expectation list
+is not a new assert.

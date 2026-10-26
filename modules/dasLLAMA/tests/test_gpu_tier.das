@@ -16,6 +16,7 @@ require dasllama/dasllama_gpu_tier
 require dasllama/dasllama_config
 require dasllama/dasllama_kv_dtype   // KVDtype: the mirror codec crosses the seam as its ordinal
 require dasllama/dasllama_env   // g_env_gpu: an exported DASLLAMA_GPU answers gpu_want_auto ahead of the want state
+require dasllama/dasllama_common   // segs_served_by_override, the prefill override registry
 
 // ===== rdec doubles: record what arrives, answer distinctively =====
 
@@ -67,8 +68,8 @@ def private d_norms(norms : array<float>; obias : bool) {}
 [unused_argument(l, mir_idx, bq, bk, bv, bo, b1, b3, b2, fq, fk, fv, fo, f1, f3, f2, g)]
 def private d_set_layer(l, mir_idx, bq, bk, bv, bo, b1, b3, b2 : int64; fq, fk, fv, fo, f1, f3, f2 : int; g : RdecLayerGeom) {}
 
-[unused_argument(bqkv, bz, bout, bbeta, balpha, b1, b3, b2, fqkv, fz, fout, f1, f3, f2, convw, wnormp, ap, dtp)]
-def private d_set_dn_layer(l, bqkv, bz, bout, bbeta, balpha, b1, b3, b2, ba_off : int64; fqkv, fz, fout, f1, f3, f2 : int; convw : float const?; wnormp : float const?; ap : float const?; dtp : float const?) {
+[unused_argument(bqkv, bz, bout, bbeta, balpha, b1, b3, b2, fqkv, fz, fout, fbeta, falpha, f1, f3, f2, convw, wnormp, ap, dtp)]
+def private d_set_dn_layer(l, bqkv, bz, bout, bbeta, balpha, b1, b3, b2, ba_off : int64; fqkv, fz, fout, fbeta, falpha, f1, f3, f2 : int; convw : float const?; wnormp : float const?; ap : float const?; dtp : float const?) {
     g_dn_layer_l = l
     g_dn_layer_ba_off = ba_off
 }
@@ -93,8 +94,8 @@ def private d_dn_prefill_own(l : int64; stp : float?; histp : float?) {
 [unused_argument(cls_block, cls_fmt, cap, supp)]
 def private d_set_cls(cls_block : int64; cls_fmt : int; cap : float; supp : array<int64>) {}
 
-[unused_argument(x, cossin, ple_row, cnt, pick_only)]
-def private d_token(x : array<float>; cossin : array<float>; ple_row : array<float>; pos, cnt : int64; pick_only : bool; var logits : array<float>) : int64 {
+[unused_argument(x, cossin, ple_row, token, cnt, pick_only)]
+def private d_token(x : array<float>; cossin : array<float>; ple_row : array<float>; token, pos, cnt : int64; pick_only : bool; var logits : array<float>) : int64 {
     g_token_pos = pos
     g_token_cnt = cnt
     if (!empty(logits)) {
@@ -133,7 +134,8 @@ def private d_read(l, row0, nrows : int64; var kp : uint8?; var vp : uint8?) {
 var private g_ids_npos = -1l
 var private g_ids_scale = 0.0
 var private g_emb_block = -1l
-var private g_emb_f32_vocab = -1l
+var private g_emb_fmt = -1
+var private g_emb_scale = 0.0
 
 [unused_argument(tokens, cos_batch, pos0, experts)]
 def private d_prefill_ids(tokens : array<int64>; emb_scale : float; cos_batch : array<float>; npos, pos0 : int64; var logits : array<float>; experts : RdecHostExpertsRowsFn) {
@@ -144,13 +146,17 @@ def private d_prefill_ids(tokens : array<int64>; emb_scale : float; cos_batch : 
     }
 }
 
-def private d_set_emb(emb_block : int64) : bool {
+def private d_set_emb(emb_block : int64; fmt : int; escale : float) : bool {
     g_emb_block = emb_block
+    g_emb_fmt = fmt
+    g_emb_scale = escale
     return emb_block >= 0l
 }
 
-[unused_argument(fblob, off, dim)]
-def private d_upload_emb_f32(fblob : array<float>; off, vocab, dim : int64) : bool {
+var private g_emb_f32_vocab = -1l
+
+[unused_argument(fblob, off, dim, escale)]
+def private d_upload_emb_f32(fblob : array<float>; off, vocab, dim : int64; escale : float) : bool {
     g_emb_f32_vocab = vocab
     return vocab > 0l
 }
@@ -269,7 +275,7 @@ def test_gpu_tier_contract(t : T?) {
         t |> equal(g_prepared_dn_cd, 96l)
         var x, cs, ple, logits : array<float>
         logits |> resize(4)
-        rdec_token(x, cs, ple, 9l, 10l, false, logits)
+        rdec_token(x, cs, ple, -1l, 9l, 10l, false, logits)
         t |> equal(g_token_pos, 9l)
         t |> equal(g_token_cnt, 10l)
         t |> equal(logits[0], 42.0)
@@ -514,7 +520,7 @@ def test_rdec_dn_seats(t : T?) {
         t |> success(!rdec_dn_installed(), "no hybrid seats before their install")
         install_moe_gpu_resident_dn(@@d_set_dn_layer, @@d_upload_dn_ba, @@d_dn_own, @@d_dn_prefill_own)
         t |> success(rdec_dn_installed(), "the hybrid install must flip its witness")
-        rdec_set_dn_layer(3l, 1l, 2l, 3l, -1l, -1l, 4l, 5l, 6l, 4096l, 0, 0, 0, 0, 0, 0, null, null, null, null)
+        rdec_set_dn_layer(3l, 1l, 2l, 3l, -1l, -1l, 4l, 5l, 6l, 4096l, 0, 0, 0, 0, 0, 0, 0, 0, null, null, null, null)
         t |> equal(g_dn_layer_l, 3l)
         t |> equal(g_dn_layer_ba_off, 4096l)
         var ba : array<float>
@@ -537,17 +543,19 @@ def test_rdec_dn_seats(t : T?) {
 def test_rdec_prefill_ids_seam(t : T?) {
     t |> run("the ids-form prefill seat: unset declines, installed doubles receive the forwarded values") @(t : T?) {
         t |> success(!rdec_prefill_ids_installed(), "the seat starts uninstalled")
-        t |> success(!rdec_set_emb(3l), "an unset set_emb declines - the engine keeps the CPU embed")
+        t |> success(!rdec_set_emb(3l, int(KqFmt.q8), 1.0), "an unset set_emb declines - the engine keeps the CPU embed")
         let nofblob : array<float>
-        t |> success(!rdec_upload_emb_f32(nofblob, 0l, 16l, 8l), "an unset f32 upload declines")
+        t |> success(!rdec_upload_emb_f32(nofblob, 0l, 16l, 8l, 1.0), "an unset f32 upload declines")
         t |> equal(rdec_emb_f32_bytes(1000l, 256l), 1000l * 256l * 4l)
         t |> equal(rdec_emb_f32_bytes(1l << 20l, 4096l), 0l)   // past RDEC_EMB_F32_CAP the arm declines, so the plan counts nothing
         install_rdec_prefill_ids(@@d_prefill_ids, @@d_set_emb, @@d_upload_emb_f32)
         t |> success(rdec_prefill_ids_installed(), "install must flip the witness")
-        t |> success(rdec_set_emb(9l), "the double's answer forwards")
+        t |> success(rdec_set_emb(9l, int(KqFmt.iq4xs), 2.5), "the double's answer forwards")
         t |> equal(g_emb_block, 9l)
-        t |> success(!rdec_set_emb(-1l), "the double's decline forwards")
-        t |> success(rdec_upload_emb_f32(nofblob, 4l, 32000l, 2048l), "the f32 double's answer forwards")
+        t |> equal(g_emb_fmt, int(KqFmt.iq4xs))
+        t |> equal(g_emb_scale, 2.5)
+        t |> success(!rdec_set_emb(-1l, int(KqFmt.q8), 1.0), "the double's decline forwards")
+        t |> success(rdec_upload_emb_f32(nofblob, 4l, 32000l, 2048l, 1.0), "the f32 double's answer forwards")
         t |> equal(g_emb_f32_vocab, 32000l)
         var ids : array<int64>
         ids |> push(5l)
@@ -584,5 +592,56 @@ def test_kernel_dump_save(t : T?) {
         t |> success(!stat("unset.metal").is_valid, "and writes no file")
         t |> success(!kernel_dump_save(path_join(dir, "no_such_dir"), "toy.metal", "TEST_DUMP", "x"), "a directory that is not there answers false")
         delete words
+    }
+}
+
+def private seg_probe_prefill(_t : Model; var _s : Session; _npos, _start_pos : int64) : bool => false
+def private seg_probe_segments(_t : Model; var _segs : array<PrefillSeg>) : bool => false
+
+//! the segments form declines what the one-session call declines: a session roping from per-row tables or adding deepstack
+//! slices takes the window only where the active override registers that arm
+[test]
+def test_segments_served_by_override(t : T?) {
+    t |> run("a per-row-table or deepstack session keeps the segments form off an override with no such arm") @(t : T?) {
+        let found = active_prefill_override()
+        register_prefill_override("seg_probe", @@seg_probe_prefill)
+        register_prefill_segments_override("seg_probe", @@seg_probe_segments)
+        t |> success(select_prefill_override("seg_probe"), "the probe override selects")
+        var a, b : Session
+        var segs <- [PrefillSeg(s = unsafe(addr(a)), start_pos = 0l, npos = 4l, toki = 0l), PrefillSeg(s = unsafe(addr(b)), start_pos = 3l, npos = 2l, toki = 1l)]
+        t |> success(segs_served_by_override(segs), "two plain sessions take the segments form")
+        b.mrope_pos |> push(int4(1, 2, 3, 0))
+        t |> success(!segs_served_by_override(segs), "a session with a per-row rope table declines it on an override without the mrope arm")
+        b.mrope_pos |> clear()
+        a.ds_active = true
+        t |> success(!segs_served_by_override(segs), "a deepstack session declines it on an override without the slice-add arm")
+        a.ds_active = false
+        t |> success(segs_served_by_override(segs), "... and both take it again with the states cleared")
+        select_prefill_override("")
+        t |> success(!segs_served_by_override(segs), "no active override, no segments form")
+        select_prefill_override(found)
+        segs |> clear()
+        unsafe {
+            delete segs
+        }
+    }
+}
+
+//! the say-once helper every GPU driver file shares: a reason set holds each `why` once, a second call with the same `why` leaves
+//! it as it was, another `why` joins it, and a cleared set says it again
+[test]
+def test_gpu_said_once(t : T?) {
+    t |> run("gpu_said_once keeps one entry a reason and says a cleared reason again") @(t : T?) {
+        var said : table<string>
+        t |> success(gpu_said_once(said, LOG_INFO, "the test's prefix - ", "a reason"), "the first call says the reason")
+        t |> equal(length(said), 1, "... and records it")
+        t |> success(!gpu_said_once(said, LOG_INFO, "the test's prefix - ", "a reason"), "the same reason again says nothing")
+        t |> equal(length(said), 1, "... and records nothing")
+        t |> success(gpu_said_once(said, LOG_WARNING, "the test's prefix - ", "another reason"), "another reason is said")
+        t |> equal(length(said), 2, "... and joins the set")
+        said |> clear()
+        t |> success(gpu_said_once(said, LOG_INFO, "the test's prefix - ", "a reason"), "a cleared set (an arm) says the reason again")
+        t |> equal(length(said), 1, "... and records it again")
+        delete said
     }
 }

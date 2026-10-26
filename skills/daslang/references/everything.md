@@ -3186,12 +3186,33 @@ CPU large-language-model inference in pure daslang: load a GGUF model, tokenize,
 
 - `create_prefix_cache` - A prefix cache for one `create_kv_pool` pool: streams donate KV pages (`prefix_insert`), later requests with the same prefix attach them (`prefix_attach`); `max_groups` caps the pages (0 = unbounded).
 - `prefix_attach` - Attach the longest cached prefix of `prompt` to a FRESH paged `session` of `pool`: matched pages join the session's block table and `n_past` advances past them, so the caller prefills only the tail.
+- `prefix_attach_state_split` - Attach the deepest recurrent checkpoint opening `prompt` apart: its pages shared into `pages` (a fresh session of `pool` that only reads them), its state into `state`.
 - `prefix_chain_list` - Snapshot of the cache's donated chains for dashboards: per donation — page-covered token count, live pages, hit count, born/last-hit ticks, and the caller-provided preview.
 - `prefix_checkpoint_at` - Where a recurrent `session`'s prefill of `prompt` should stop for a `prefix_insert`, after `prefix_attach` matched `matched` tokens: `stable_at` (`render_turn_marked`'s opening) when the caller knows it, else the longest opening an earlier checkpoint shares.
 - `prefix_held_groups` - Pages the cache currently holds (== pool groups retained for reuse).
 - `prefix_insert` - Donate a session's KV pages to the cache: `tokens` is its EVALED history (the first `n_past` rows exist), every full page not already cached survives `release_kv_pages`, `preview` labels the chain.
+- `prefix_insert_snapshot` - A recurrent checkpoint of the first `n_past` of `tokens` out of `session`'s pages, its state `snap` (moved in) taken elsewhere - a device's slots.
 - `prefix_match_len` - How many leading positions of `prompt` a `prefix_attach` would attach right now, attaching nothing: a probe for a caller deciding what a request must bring (a media span's rows).
 - `prefix_release` - Release every cached page back to `pool` and clear the cache (pages still used by live sessions stay alive until those sessions release them).
+- `prefix_share_pages` - Share the whole pages of the first `n` of `tokens` `cache` already holds into the fresh paged `session`; answers the positions they cover, where the rows still to write start.
+- `prefix_state_match_len` - How many leading positions of `prompt` a recurrent checkpoint in `cache` would attach, touching nothing (0 where none opens it).
+- `prefix_state_touch` - Whether `cache` keeps a checkpoint of the first `n` of `tokens`; one that does is used now, and `opening` makes it an opening from here on.
+- `prefix_take_spare` - A recurrent checkpoint `cache` dropped, to refill in place of a fresh snapshot (its arrays keep their room), or an empty snapshot where none waits.
+
+### Device-home streams and the host pool
+
+- `gpu_device_kv_checkpoint` - Keep a device-home recurrent `session`'s state at its position beside its rows, so a later request that opens with exactly those tokens adopts it from the parked claim.
+- `gpu_device_kv_checkpoints` - The positions a parked `claim`'s checkpoints hold its recurrent state at (empty where it is dead).
+- `gpu_device_kv_claim` - The claim a live device-home `session` holds its region under (0 = none).
+- `gpu_device_kv_export` - Copy the rows `[lo, hi)` the region of a live or parked `claim` holds down into the paged `host` session's pages (grown to `hi`), so a prefix cache keeps them past the region.
+- `gpu_device_kv_import` - Bring the first `npos` rows of the paged `host` session up into a region for the fresh device-home `session`, whose `n_past` becomes `npos`; a recurrent state goes in the session's host arrays first.
+- `gpu_device_kv_parked_pos` - The position a kept `claim`'s recurrent state stands at - the one row count `gpu_device_kv_adopt` may take on a recurrent model; 0 where the claim is gone or the model keeps no recurrent state.
+- `gpu_device_kv_parked_snapshot` - The recurrent state a parked `claim` keeps at position `at` (where its state stands, or a checkpoint), copied off the device into `into` (moved in; `prefix_take_spare` hands one whose arrays keep their room) shaped as `like`; `pos` -1 where none stands at `at`.
+- `gpu_device_kv_pool_armed` - Whether a paged scheduler keeps its device-home streams' openings in its prefix cache too (`DASLLAMA_DEVICE_POOL`, on unless set to 0).
+- `gpu_device_kv_pool_moves` - The rows `gpu_device_kv_export` brought down and `gpu_device_kv_import` took up since the process started, with the wall each direction took, and the wall `gpu_device_kv_snapshot` spent on states.
+- `gpu_device_kv_snapshot` - The recurrent state a live device-home `session` held at `at` (where it stands, or a kept checkpoint) copied off its region into `into` (moved in), the region left as it stands - a session the driver does not hold flushes as `dn_snapshot_take` does; `pos` -1 where no state stands at `at`.
+- `gpu_device_kv_victim_claims` - The claims whose regions the next `n` fresh device-home sessions bind - the least recently used regions no live session holds - and so lose.
+- `gpu_resident_mtp_device_home` - Whether `model`'s self-speculation (MTP/NextN) serves device-home sessions: the draft head, its verify and a rejected round's rollback all run on the device, so a speculating scheduler may keep its streams' caches there.
 
 ### Tokenizer
 
@@ -3312,6 +3333,7 @@ CPU large-language-model inference in pure daslang: load a GGUF model, tokenize,
 - `gpu_device_kv_adopt` - Hand the first `npos` rows a kept `claim` holds to the fresh device-home `session`, whose `n_past` becomes `npos`.
 - `gpu_device_kv_park` - A FINISHED device-home session lets go of its K/V region and answers the claim its rows stay under (0 = none) - call it before every such session's `delete`.
 - `gpu_device_prefill_continues` - A device-home session of `model` prefills from a position past zero - a prompt in chunks, a turn over the turns before it.
+- `gpu_device_prefill_segments` - A device-home scheduler's tick hands `model`'s prefilling streams to one segmented window (`eval_segments`): the armed driver has the form and the model's chain holds several sessions a window.
 - `gpu_device_prefill_window` - The positions the device prefills in one window - the shortest chunk worth handing a device-home session.
 - `gpu_device_session_ctx` - The positions one device-home session holds - the armed driver's per-region context.
 - `gpu_device_session_dtype` - The K/V codec a device-home session must carry: the armed driver's.
@@ -4286,6 +4308,7 @@ The AST module provides access to the abstract syntax tree representation of das
 - `find_struct_field_parent` - Finds and returns the parent structure in the inheritance chain that originally declares the field with the given name.
 - `find_structure_field` - Returns the FieldDeclaration for a specific field of a structure type, or null if not found or the structure is null.
 - `find_unique_structure` - Finds a uniquely named structure in the program, returning it if unique or null if ambiguous.
+- `find_unique_typedef` - Finds a uniquely named typedef in the program, returning its type if unique or null if missing or ambiguous.
 - `find_variable` - Finds a variable by name in the specified module.
 
 ### Iterating
@@ -5051,6 +5074,7 @@ The AST_BOOST module provides high-level utilities for working with the AST. It 
 - `isExpression` - Returns `true` if the given `TypeDeclPtr` refers to an `ast` module handled type whose name starts with `Expr`, including pointer-to-expression types.
 - `isMakeLocal` - Returns `true` if the expression is any `ExprMakeLocal` subclass: `ExprMakeStruct`, `ExprMakeArray`, `ExprMakeTuple`, or `ExprMakeVariant`.
 - `isVectorType` - Returns `true` if the given `Type` is a vector, range, or urange type (`int2`..`int4`, `uint2`..`uint4`, `float2`..`float4`, `range`, `urange`, `range64`, `urange64`).
+- `is_bare_variant_case` - Returns true when `name` is a case of the variant `typ` that was declared without a value (with no type).
 - `is_class_method` - Returns `true` if a `TypeDeclPtr` field represents a class method — a non-dim `tFunction` whose first argument is the class structure (or a parent of it).
 - `is_same_or_inherited` - Returns `true` if `child` is the same `Structure` as `parent` or is transitively inherited from `parent` by walking the parent chain.
 - `peel_distinct` - Returns the type under every `distinct` level; a type that is not distinct comes back as is.
@@ -6646,6 +6670,7 @@ The lint_config module loads `{get_das_root()}/.lint_config` (a TOML file with a
 
 - `FormatPolicy`
 - `FormatJob`
+- `LineLengthPolicy`
 - `LintFix`
 - `LintIssue`
 
@@ -6698,6 +6723,10 @@ The lint_config module loads `{get_das_root()}/.lint_config` (a TOML file with a
 
 - `format_policy_for`
 - `partition_by_format_policy`
+
+### Line-length policy
+
+- `line_length_policy_for`
 
 ## toml
 
@@ -6834,13 +6863,11 @@ The MD_BOOST module provides Markdown generation helpers: GitHub-flavored table 
 
 ## match
 
-The MATCH module implements pattern matching on variants, structs, tuples, arrays, and scalar values. Supports variable capture (`$v(name)`), wildcards (`_`), guard expressions (`&&`), and alternation (`||`).
+The MATCH module implements pattern matching on variants, structs, tuples, arrays, and scalar values. Each arm is `pattern => body`. A bare name in a pattern binds the matched value, `_` matches anything, `&&` adds a guard, `|` separates alternatives, and `&` requires both patterns. `match (a, b)` matches several values at once.
 
 
 ### Call macros
 
-- `static_multi_match` - Implements `static_multi_match` macro.
-- `multi_match` - Implements `multi_match` macro.
 - `match` - Implements `match` macro.
 - `static_match` - Implements `static_match` macro.
 
@@ -7804,8 +7831,9 @@ The TYPEMACRO_BOOST module provides infrastructure for defining type macros — 
 - `template_structure` - This macro creates typemacro function and associates it with the structure.
 - `typemacro_documentation` - Structure annotation that stores type macro documentation metadata.
 - `typemacro_template` - Structure annotation that marks a struct as a type macro template instance.
-- `tsi_reified` - Marker the reifier appends to a finished instance: a template CHAIN pipes one reifier copy per ancestor, and the surplus copies no-op on sight of this.
 - `template_struct_instance` - Reifies a `struct template` / `class template` parent into the annotated instance at parse time: instance `typedef`s bind the template's type parameters, `override` inits bind its `@template_constant` fields (erased from the result), `@template_gate` fields exist only in stamps where the named bool `@template_constant` is true (`@template_gate = AXIS`, or the string form `"!AXIS"` to invert; a gated-off field is erased as if never written, and the argument stays inert on kept fields — reference a gated field only from `static_if` arms on its axis: a dead `static_if` arm may name it, a dead ternary arm may not, since infer sees both ternary arms), `@template_call` fields rebind free-function callees by name (`override sdot = @@ssdot` — bare-spelled calls AND `@@` addresses; erased too, while `_::sdot` / `__::sdot` keep their normal resolution rules — the pinned escape to the real function), template methods are cloned onto the instance (instance-authored methods win), and the template parent is cut — every later structure annotation sees a finished concrete struct or class.
+- `template_variant` - Like `[template_tuple]`, but the typemacro returns a variant: each field is a case, and a `void` field is a case without a value.
+- `tsi_reified` - Marker the reifier appends to a finished instance: a template CHAIN pipes one reifier copy per ancestor, and the surplus copies no-op on sight of this.
 
 ### Enum helpers
 

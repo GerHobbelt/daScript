@@ -73,13 +73,16 @@ struct ModelSpec {
     serve_ctx : int = 0             // trained context window
     serve_vram_gb : float = 0.0     // advertised working-set hint, not a fit check
     serve_default : bool = false    // the one the getting-started path recommends
-    serve_vision : string           // vision-tower companion NAME ("" = text only); [[serve_vision_tower]] resolves it
+    serve_vision : string           // vision-tower companion NAME ("" = text only); [[serve_companion]] resolves it
+    serve_drafter : string          //! the assistant drafter companion NAME the server attaches beside the file ("" = none); [[serve_companion]] resolves it
     serve_tts : bool = false        // a speech model of the served text-to-speech set ([[serve_tts_set]]); its packs ride the companions
+    serve_mtp : string              //! the platforms ("metal", "vulkan", comma list) where the model's self-speculation measured a win at one stream (PERF_LEDGER.md); "" = the server's unset `mtp` decodes plain
 }
 
-// ===== Parity fixture ids (frozen from the simple_ids oracle — harness/parity.sh) =====
-// Prompts are deliberately the *confident* ones: high-entropy prompts flip on genuine near-ties
-// (sub-ULP libm cos/sin/exp/tanh vs the oracle), which are not bugs. See dasllama_newmodels_arc.
+// ===== Parity fixture ids (simple_ids, harness/parity.sh) =====
+// Prompts are the confident ones: a high-entropy prompt flips on a
+// genuine near-tie (sub-ULP libm cos/sin/exp/tanh vs the oracle),
+// which is not a bug.
 
 // the Qwen BPE counting fixture, "1, 2, 3, 4, 5, 6, 7," (no BOS) — every Qwen-vocab carrier
 // continues it identically (verified per-file against the live oracle before each reuse)
@@ -216,14 +219,16 @@ def private ev_smollm2() : ParityEvidence {
                 28418l, 18375l, 338l, 443l, 9086l, 1283l, 702l, 260l, 5703l, 335l])
 }
 
-// Mistral-7B-Instruct-v0.3 Q8, "Once upon a time" (SPM, BOS=1) — arch "llama" (v0.3 has no SWA).
+//! "1, 2, ... 7," - BOS=1, SPM dummy-prefix 29473 before each number
 def private ev_mistral7b() : ParityEvidence {
     return <- ParityEvidence(
-        prompt <- [1l, 6481l, 4482l, 1032l, 1495l],
-        gen <- [29493l, 1504l, 1171l, 1032l, 3286l, 1444l, 5928l, 5067l, 29491l, 5067l,
-                1171l, 1032l, 2624l, 21635l, 1072l, 28981l, 4003l, 1461l, 5767l, 1054l,
-                1070l, 3260l, 1032l, 1909l, 1122l, 3490l, 1065l, 1040l, 2294l, 1070l,
-                2723l, 29491l, 1418l, 1321l, 1032l, 3598l, 2913l, 1065l, 1040l, 6282l])
+        prompt <- [1l, 29473l, 29508l, 29493l, 29473l, 29518l, 29493l, 29473l, 29538l, 29493l,
+                   29473l, 29549l, 29493l, 29473l, 29550l, 29493l, 29473l, 29552l, 29493l,
+                   29473l, 29555l, 29493l],
+        gen <- [29473l, 29551l, 29493l, 29473l, 29542l, 29493l, 29473l, 29508l, 29502l, 29493l,
+                29473l, 29508l, 29508l, 29493l, 29473l, 29508l, 29518l, 29493l, 29473l, 29508l,
+                29538l, 29493l, 29473l, 29508l, 29549l, 29493l, 29473l, 29508l, 29550l, 29493l,
+                29473l, 29508l, 29552l, 29493l, 29473l, 29508l, 29555l, 29493l, 29473l, 29508l])
 }
 
 // gemma-3 counting fixture (5-local:1-global SWA + dual RoPE θ): the 4B counts cleanly from
@@ -359,7 +364,22 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
             sha256 = "92c2b775070b76ee31b9921f7f339ec9fc0e08b54be0616418414d4eec65d282", recipe = STORYWISH_RECIPE),   // the request-taking story writer behind examples/dasLLAMA/storywish; profiled nowhere
         ModelSpec(file = "SmolLM2-135M-Instruct-Q8_0.gguf", display = "SmolLM2-135M"),
         ModelSpec(file = "Qwen2.5-0.5B-Instruct-Q8_0.gguf", display = "Qwen2.5-0.5B",
+            url = "{HF}/bartowski/Qwen2.5-0.5B-Instruct-GGUF/resolve/41ba88dbac95fed2528c92514c131d73eb5a174b/Qwen2.5-0.5B-Instruct-Q8_0.gguf",
+            bytes = 531068480l, sha256 = "25130a98aa782284a7dabea0c23245b2fd371ed47244e79d78b8ec23245fdf96",
             parity <- ev_qwen_count()),
+        // the dense iq4nl32 carrier: 896-wide rows off the superblock lattice, every dense plane on the per-32 planes
+        ModelSpec(file = "Qwen2.5-0.5B-Instruct-IQ4_NL-local.gguf",
+            recipe = "llama-quantize --allow-requantize Qwen2.5-0.5B-Instruct-Q8_0.gguf Qwen2.5-0.5B-Instruct-IQ4_NL-local.gguf IQ4_NL"),
+        // the per-32 table carriers, every tensor in the file's format (`--pure`): the IQ4_NL token table and
+        // classifier gather and serve as iq4nl32 planes, the Q4_0 ones as q4032 (896 is off the 256 lattice), the Q5_0 ones and
+        // every Q5_0 plane as q5032
+        ModelSpec(file = "Qwen2.5-0.5B-Instruct-IQ4_NL-pure-local.gguf",
+            recipe = "llama-quantize --allow-requantize --pure --token-embedding-type iq4_nl --output-tensor-type iq4_nl Qwen2.5-0.5B-Instruct-Q8_0.gguf Qwen2.5-0.5B-Instruct-IQ4_NL-pure-local.gguf IQ4_NL"),
+        ModelSpec(file = "Qwen2.5-0.5B-Instruct-Q4_0-local.gguf",
+            recipe = "llama-quantize --allow-requantize --pure --token-embedding-type q4_0 --output-tensor-type q4_0 Qwen2.5-0.5B-Instruct-Q8_0.gguf Qwen2.5-0.5B-Instruct-Q4_0-local.gguf Q4_0"),
+        ModelSpec(file = "Qwen2.5-0.5B-Instruct-Q5_0-pure-local.gguf", bytes = 345833024l,
+            sha256 = "a9d3131babde9926f9513dfe110890416d3f997e9c01aa634a111f281176fe39",
+            recipe = "llama-quantize --allow-requantize --pure --token-embedding-type q5_0 --output-tensor-type q5_0 Qwen2.5-0.5B-Instruct-Q8_0.gguf Qwen2.5-0.5B-Instruct-Q5_0-pure-local.gguf Q5_0"),
         ModelSpec(file = "Qwen3-0.6B-Q8_0.gguf", display = "Qwen3-0.6B",
             parity <- ev_qwen_count()),   // the QK-norm arch (per-head Q/K RMSNorm before RoPE)
         ModelSpec(file = "Qwen3.5-0.8B-Q8_0.gguf", display = "Qwen3.5-0.8B",
@@ -372,6 +392,9 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
         ModelSpec(file = "Qwen3.5-0.8B-MTP-Q8_0.gguf",
             url = "{HF}/unsloth/Qwen3.5-0.8B-MTP-GGUF/resolve/main/Qwen3.5-0.8B-Q8_0.gguf",
             bytes = 833592736l, sha256 = "c54f8b67069c70085b98440de696b44da8250250ac69a961b41133def876e262"),
+        // the per-32 hybrid table carrier: the Q5_1 token table, classifier, NextN eh_proj and deltanet planes as q51
+        ModelSpec(file = "Qwen3.5-0.8B-MTP-Q5_1-local.gguf",
+            recipe = "llama-quantize --allow-requantize --pure --token-embedding-type q5_1 --output-tensor-type q5_1 Qwen3.5-0.8B-MTP-Q8_0.gguf Qwen3.5-0.8B-MTP-Q5_1-local.gguf Q5_1"),
         // the embedding model whose file names its read: `qwen3.pooling_type` last, `add_eos_token` on
         // (tests/test_embeddings.das holds its model card's cosine matrix as the oracle)
         ModelSpec(file = "Qwen3-Embedding-0.6B-Q8_0.gguf",
@@ -452,13 +475,14 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
             bytes = 16947541728l, sha256 = "f2c28b3dc4776931ac6f879e11f203dec637ea0f14267a86ec8f6165f63f293f",
             serve_name = "gemma-4-26b-a4b", serve_display = "Gemma 4 26B-A4B",
             serve_note = "the MoE - 26B quality at 4B active weights per token",
-            serve_ctx = 131072, serve_vram_gb = 19.0),
+            serve_ctx = 131072, serve_vram_gb = 19.0, serve_mtp = "metal",
+            serve_drafter = "mtp-gemma-4-26B-A4B-it-Q8_0.gguf"),
         ModelSpec(file = "Qwen3.8-27B-UD-Q4_K_M.gguf",
             url = "{HF}/unsloth/Qwen3.8-27B-GGUF/resolve/27af057ecb382ddfea5d12837360a8980560e3ed/Qwen3.8-27B-UD-Q4_K_M.gguf",
             bytes = 16464440224l, sha256 = "322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482",
             serve_name = "qwen3.8-27b", serve_display = "Qwen 3.8 27B",
             serve_note = "the newest dense Qwen - thinking model, strong at code",
-            serve_ctx = 262144, serve_vram_gb = 18.5,
+            serve_ctx = 262144, serve_vram_gb = 18.5, serve_mtp = "metal",
             parity <- ev_qwen_count([dn_chunked = true])),
         ModelSpec(file = "gemma-3-4b-it-Q8_0.gguf", display = "gemma-3-4B",
             // the vision mmproj rides as a companion: the gemma3v tower tests and the image chat
@@ -506,6 +530,17 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
             // PLE + cross-layer KV sharing as the E4B, plus per-layer FFN width (the elastic
             // MatFormer sub-model); dense, so the full 40 hold
             parity <- ev_gemma4_dense()),
+        // the per-32 and q40 PLE table carriers: the Q8_0 file with the token table requantized, which carries the PLE table
+        // with it - Q5_0 serves as q5032 planes, Q5_1 as q51, Q4_0 as q40 (8960-wide rows, on the 256 lattice)
+        ModelSpec(file = "gemma-4-E2B-it-emb-Q5_0-local.gguf", bytes = 3935698368l,
+            sha256 = "4aaa69c00d95deff67463c265a89e6e973ab754cff2ad606c77bb94dc6b53cfe",
+            recipe = "llama-quantize --allow-requantize --token-embedding-type q5_0 gemma-4-E2B-it-Q8_0.gguf gemma-4-E2B-it-emb-Q5_0-local.gguf Q8_0"),
+        ModelSpec(file = "gemma-4-E2B-it-emb-Q5_1-local.gguf", bytes = 4107664832l,
+            sha256 = "5514e9f362ff930d87c2d35c62dfc72df7d226ad20fd39cb53b2773ebbe91052",
+            recipe = "llama-quantize --allow-requantize --token-embedding-type q5_1 gemma-4-E2B-it-Q8_0.gguf gemma-4-E2B-it-emb-Q5_1-local.gguf Q8_0"),
+        ModelSpec(file = "gemma-4-E2B-it-emb-Q4_0-local.gguf", bytes = 3591765440l,
+            sha256 = "bec56582221c7025f8310b9fa6c258a651a4bd92f029afc77b9e5f20f80c3988",
+            recipe = "llama-quantize --allow-requantize --token-embedding-type q4_0 gemma-4-E2B-it-Q8_0.gguf gemma-4-E2B-it-emb-Q4_0-local.gguf Q8_0"),
         // the resident gates' large-tier carriers (tests/test_gpu_resident_gemma4_12b_q8 / _26b / _31b): provenance rows,
         // not board rows - resolve/main floats, so the bytes and sha256 pin the file
         ModelSpec(file = "gemma-4-12B-it-Q8_0.gguf",
@@ -520,6 +555,8 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
             url = "{HF}/lmstudio-community/gemma-4-31B-it-GGUF/resolve/main/gemma-4-31B-it-Q4_K_M.gguf",
             bytes = 18687063904l, sha256 = "8f3479643461601703f717931e399cc440dbd5ada598c025d6296c8165d94be9"),
         ModelSpec(file = "Qwen1.5-MoE-A2.7B-Chat.Q8_0.gguf",   // parity-only carrier
+            url = "{HF}/RichardErkhov/Qwen_-_Qwen1.5-MoE-A2.7B-Chat-gguf/resolve/947580e7b3904cd4081810d0efec4520a75609c7/Qwen1.5-MoE-A2.7B-Chat.Q8_0.gguf",
+            bytes = 15226010336l, sha256 = "d20e59b6180c775c648703fd63b8df7d01fc107672441fc3746c41f1dcaf904c",
             // the routed-experts arch (softmax router -> top-4 of 60 with un-renormalized
             // weights + a sigmoid-gated shared expert; QKV bias, NEOX rope); the fixture runs
             // BOTH MoE prefill paths off one load — bit-identical by construction
@@ -529,6 +566,16 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
         ModelSpec(file = "Qwen1.5-MoE-A2.7B-Chat-Q4_K_M-local.gguf",
             recipe = "llama-quantize --allow-requantize Qwen1.5-MoE-A2.7B-Chat.Q8_0.gguf Qwen1.5-MoE-A2.7B-Chat-Q4_K_M-local.gguf Q4_K_M",
             parity <- ev_qwen_count([kq_native = true, moe_reference = true])),
+        // the per-32 shared-expert and routed carriers (`--pure`: every tensor in the file's format): the Q5_1 file's
+        // shared expert serves as q51 planes, both files' 1408-wide routed rows (off the 256 lattice) as q51 / q4032
+        ModelSpec(file = "Qwen1.5-MoE-A2.7B-Chat-Q5_1-local.gguf",
+            recipe = "llama-quantize --allow-requantize --pure --token-embedding-type q5_1 --output-tensor-type q5_1 Qwen1.5-MoE-A2.7B-Chat.Q8_0.gguf Qwen1.5-MoE-A2.7B-Chat-Q5_1-local.gguf Q5_1"),
+        ModelSpec(file = "Qwen1.5-MoE-A2.7B-Chat-Q4_0-local.gguf",
+            recipe = "llama-quantize --allow-requantize --pure --token-embedding-type q4_0 --output-tensor-type q4_0 Qwen1.5-MoE-A2.7B-Chat.Q8_0.gguf Qwen1.5-MoE-A2.7B-Chat-Q4_0-local.gguf Q4_0"),
+        // the q5032 expert carrier: every plane Q5_0, the routed and shared stacks among them
+        ModelSpec(file = "Qwen1.5-MoE-A2.7B-Chat-Q5_0-pure-local.gguf", bytes = 9858808544l,
+            sha256 = "700d2386a8ef18bdb1e5f65df612a3014d10723e6e50f74af19251b87e4b8224",
+            recipe = "llama-quantize --allow-requantize --pure --token-embedding-type q5_0 --output-tensor-type q5_0 Qwen1.5-MoE-A2.7B-Chat.Q8_0.gguf Qwen1.5-MoE-A2.7B-Chat-Q5_0-pure-local.gguf Q5_0"),
         // the qwen vision pairs (the qwen3vl arc): parity-less provenance carriers —
         // test_vision_chat's deepstack/qwen25o legs and the qwen tier-1 suites are their coverage
         ModelSpec(file = "Qwen3VL-4B-Instruct-Q8_0.gguf", display = "Qwen3-VL-4B", official = true,
@@ -621,7 +668,7 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
             // the assistant drafter rides as a companion: the mtp suite and the ruler attach it beside this target
             companions <- [
                 ProvEntry(name = "mtp-gemma-4-26B-A4B-it-Q8_0.gguf", root = "llm",
-                    url = "{HF}/ggml-org/gemma-4-26B-A4B-it-GGUF/resolve/main/mtp-gemma-4-26B-A4B-it-Q8_0.gguf",
+                    url = "{HF}/ggml-org/gemma-4-26B-A4B-it-GGUF/resolve/bb4531cda34d1ea09d9814959ed4d5833cf2a4c8/mtp-gemma-4-26B-A4B-it-Q8_0.gguf",
                     bytes = 461766784l, sha256 = "ea4f772ffb70e02127c5f142f9ed9af97add7ca0f2bcc7b277244a9771b436bd")],
             // the q51 tier gate: this recipe's ffn_down_exps are Q5_1 on 29 layers, riding the
             // native q51 planes; the Q4_K gate_up stacks ride the kq planes
@@ -673,17 +720,21 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
             bytes = 22663387424l, sha256 = "0b21525e972670ed59e1812e170b27c26355381f0656ecc4e25617ece7dac58b",
             serve_name = "qwen3.6-35b-a3b", serve_display = "Qwen 3.6 35B-A3B",
             serve_note = "the Qwen MoE - 3B active weights, MTP-ready",
-            serve_ctx = 262144, serve_vram_gb = 24.0,
+            serve_ctx = 262144, serve_vram_gb = 24.0, serve_mtp = "vulkan",
             // plain evidence only (verified per-file 40/40, 2026-08-18): the qwen35moe arm
             // coverage (chunked deltanet + reference MoE prefill) lives on the plain-stem twin
             parity <- ev_qwen_count()),
         // the single-format IQ4_XS twin with the MTP head (4.27 bpw): the fewest bytes of the 4-bit
         // ladder at the K-quant files' quality (PERF_LEDGER.md's 2026-10-06 equal-bytes entry); the
-        // recipe is deterministic (no imatrix) from unsloth's BF16 shards, the published file its output
+        // recipe is deterministic (no imatrix) from unsloth's BF16 shards, the published file its output.
+        // The file exists for the bandwidth-bound boxes (the house's M4 Pro): the routed experts, 93 % of
+        // its bytes, are IQ4_XS by design; every other plane is served in the file's own format too
+        // (REVIEW_KQ_FORMATS.md) - a plane the engine reads as a q8 copy is a gap, not the file's recipe
         ModelSpec(file = "Qwen3.6-35B-A3B-MTP-IQ4_XS-pure.gguf",
             url = "{HF}/borisbat/Qwen3.6-35B-A3B-MTP-IQ4_XS-pure-GGUF/resolve/6a1d560e64f8a9058773e5c1521534d9ef533bc8/Qwen3.6-35B-A3B-MTP-IQ4_XS-pure.gguf",
             recipe = "llama-quantize --pure Qwen3.6-35B-A3B-BF16-00001-of-00002.gguf Qwen3.6-35B-A3B-MTP-IQ4_XS-pure.gguf IQ4_XS",
-            bytes = 18951018528l, sha256 = "8296de4b5b62724ae7eac1cf005a65a2936f227ef2cafcee8d9bad0a25c4806c"),
+            bytes = 18951018528l, sha256 = "8296de4b5b62724ae7eac1cf005a65a2936f227ef2cafcee8d9bad0a25c4806c",
+            serve_mtp = "vulkan"),
         ModelSpec(file = "Qwen3-Coder-30B-A3B-Instruct-Q8_0.gguf", display = "Qwen3-Coder-30B",
             parity <- ev_qwen_count([moe_reference = true])),
         ModelSpec(file = "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf", display = "Qwen3-Coder-30B-q4k", quant_label = "q4_k_m",
@@ -694,7 +745,9 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
             parity <- ev_qwen_count([dn_chunked = true])),
         // arch qwen4exp (Qwen3.8-Flash-Next, 125B-A6B): the qwen35moe hybrid inside hyper-connections
         // + the n-gram PLE side input; a 3-shard file named by its first shard (the split-shard walk
-        // maps the rest). No board row yet: the 640-wide expert down rows demote to q8 (followup 168)
+        // maps the rest). No board row: Metal serves the file whole (test_metal_support_matrix.das's
+        // qwen4exp row), while the Vulkan driver sums its routed experts on the host by construction
+        // (ARCHITECTURE_GPU_VULKAN_HC.md), so the two homes measure different forms
         ModelSpec(file = "Qwen3.8-Flash-Next-GGUF/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf",
             display = "Qwen3.8-Flash-Next-iq4xs", quant_label = "iq4_xs",
             // the split NextN head (`shared`: its own Q8_0 routed experts inside) rides as a companion: the hc cells pin it as the trunk's head
@@ -703,8 +756,8 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
                     url = "{HF}/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
                     bytes = 2786568256l, sha256 = "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6")],
             parity <- ev_qwen_count([dn_chunked = true, moe_reference = true])),
-        // the Metal sweep's Qwen quant matrix - every Qwen text file the M5 box stocks that the
-        // rows above do not name; no board row, no provenance, the counting fixture as the
+        // the Metal sweep's Qwen quant matrix - Qwen text files the M5 box stocks beyond the rows
+        // above, not every one; no board row, no provenance, the counting fixture as the
         // correctness gate
         ModelSpec(file = "Qwen2.5-1.5B-Instruct-IQ3_XS.gguf", display = "Qwen2.5-1.5B-iq3xs", quant_label = "iq3_xs",
             parity <- ev_qwen_count([kq_native = true])),
@@ -764,6 +817,9 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
         ModelSpec(file = "Llama-3.2-1B-Instruct-Q4_0-local.gguf", display = "Llama-3.2-1B-q40", quant_label = "q4_0",
             recipe = "llama-quantize --allow-requantize Llama-3.2-1B-Instruct-Q8_0.gguf Llama-3.2-1B-Instruct-Q4_0-local.gguf Q4_0",
             parity <- ev_llama_count([kq_native = true])),
+        // the dense q51 carrier: every dense plane on the per-32 Q5_1 planes
+        ModelSpec(file = "Llama-3.2-1B-Instruct-Q5_1-local.gguf",
+            recipe = "llama-quantize --allow-requantize Llama-3.2-1B-Instruct-Q8_0.gguf Llama-3.2-1B-Instruct-Q5_1-local.gguf Q5_1"),
         ModelSpec(file = "Llama-3.2-1B-Instruct-IQ3_M.gguf", display = "Llama-3.2-1B-iq3m", quant_label = "iq3_m",
             parity <- ev_llama_count([kq_native = true])),
         ModelSpec(file = "Llama-3.2-1B-Instruct-IQ4_XS.gguf", display = "Llama-3.2-1B-iq4xs", quant_label = "iq4_xs",
@@ -896,10 +952,11 @@ def serve_asr_tower() : ProvEntry {
         bytes = 2508463079l, sha256 = "b17956ca991a7f084c978a8a9d4c9785864260b6dd9b72f884344759d913ae7f")
 }
 
-//! The pinned vision-tower companion behind a serving row's `serve_vision` name, resolved
-//! across every row's companions (the tower is size-invariant, so the pinning row and the
-//! serving row may differ). Empty `name` back = no pinned match — the tower reads as absent.
-def serve_vision_tower(name : string) : ProvEntry {
+//! The pinned companion behind a serving row's `serve_vision` or `serve_drafter` name, resolved
+//! across every row's companions (a tower is size-invariant and a drafter rides several quants of
+//! its trunk, so the pinning row and the serving row may differ). Empty `name` back = no pinned
+//! match — the companion reads as absent.
+def serve_companion(name : string) : ProvEntry {
     var all <- model_specs()
     var out <- ProvEntry()
     if (!empty(name)) {

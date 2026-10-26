@@ -1,12 +1,12 @@
 # dasLLAMA Architecture - the Vulkan resident driver's attention
 
-Companion to `ARCHITECTURE_GPU_VULKAN.md`; a section is cited by its anchor. This document
-carries the token command's attention key split, the attention-side
-planes the resident driver uploads beside its norms - the q/k/v projection bias, gpt-oss's sink
-logits and its output bias - with the flash tiles' sink stamps, and the K/V mirror's block codecs,
-q8_0 and tq4. The window chain the flash tiles
-serve is `ARCHITECTURE_GPU_VULKAN.md#vk-prefill-window-chain`; the token command the decode pass sits in is
-`ARCHITECTURE_GPU_VULKAN_DECODE.md#hybrid-token-command`.
+Companion to `ARCHITECTURE_GPU_VULKAN.md`; a section is cited by its anchor. This document carries the
+token command's attention key split, the attention-side planes the resident driver uploads beside its
+norms - the q/k/v projection bias, gpt-oss's sink logits and its output bias - with the flash tiles'
+sink stamps, and the K/V mirror's block codecs, q8_0 and tq4, with tq4's attention in the rotated
+basis. The segmented window and the short window's peel are in `ARCHITECTURE_GPU_VULKAN_WINDOW.md`. The window chain the flash
+tiles serve is `ARCHITECTURE_GPU_VULKAN.md#vk-prefill-window-chain`; the token command the decode pass
+sits in is `ARCHITECTURE_GPU_VULKAN_DECODE.md#hybrid-token-command`.
 
 ### The token command's attention splits a head's keys across workgroups {#vk-decode-attn-split}
 
@@ -53,17 +53,15 @@ nothing). The piece count is the span's: one piece under
 (`da_nsplit`: enough (head, split) workgroups to cover the SM count twice, at most
 `DA_NSPLIT_MAX`); a sliding-window layer attends at most its window, so its count is its
 window's span's under the command's; and a layer's count is capped so its (kv head, slab)
-workgroups over the plan's rows (`RDec.nb`) fit one wave of the SMs (`rd_layer_pieces`: the
-SM count over the row's workgroups times the rows, one at least) - the pass is a chain of
+workgroups over the command's rows fit one wave of the SMs (`rd_layer_pieces`: the SM count over
+the row's workgroups times the rows the command steps, never the planes' height, one at least) - the pass is a chain of
 latencies a workgroup, and the ruler reads a second wave as a second chain: at 640 positions
 and four rows gpt-oss's shape (64 heads, eight a kv head: sixteen workgroups a row) reads 16.4
 us a layer unsplit and 34.9 at four pieces, Llama-1B's (eight a row) 14.5 and 22.6, the 30B's
 (eight a row, head 128) 22.6 at one and 20.6 at two, where E4B's (two a row) wants its four
 pieces - 22.7 against 34.4 unsplit - and every shape climbs past about thirty-two
-workgroups a layer. The cap reads the plan's rows for both commands, so a one-row step on a
-plan of four rows takes the four-row count and the two commands' rows sum in one order (the regions
-files' bit-for-bit claim); the flat rows of a `--npl 4` bench run are that shape, and they held
-through the cap (gpt-oss 209.1 -> 209.2, Llama-1B 459.2 -> 465.0, E4B 112.5 unchanged; `PERF_LEDGER.md`'s
+workgroups a layer. The cap reads each command's own rows, so the one-row command fills the wave alone and the N-row
+command fills it with its rows; the flat rows of a `--npl 4` bench run held through the cap (gpt-oss 209.1 -> 209.2, Llama-1B 459.2 -> 465.0, E4B 112.5 unchanged; `PERF_LEDGER.md`'s
 2026-09-21 section). Where the cap reads one, the unsplit and wide twins record the same chain as
 the split command (`unsplit_on` and `wide_on` read `attn_nsplit` alone), a duplicate the form switch
 pays in recording, never in a step. The ruler (`harness/vk_attn_probe.das`
@@ -75,10 +73,12 @@ against 26.7 (the edge sits between 640 and 1024; the qwen3 0.6B geometry's four
 eight pieces pay for one row alone - 33 against four's 41 at 8192, 47 against 72 at 16384 - and
 lose at four rows (51 against 44, 81 against 74), so the N-row command stays at four pieces at
 every span past 512. The old rule, covering the card twice whatever the span, recorded sixteen
-pieces for a one-row step and eleven for a four-row step and paid double. One count for every
-row count also keeps the one-row and N-row forms summing in one order, so a batched row is the
-row alone bit for bit on any SM count while every row of the batch sits in one band; the batch's
-furthest row picks the form, and a row batched across a band edge takes the batch's. The
+pieces for a one-row step and eleven for a four-row step and paid double. The one-row and N-row
+forms sum a layer's keys in one order - a batched row the row alone bit for bit - while the N-row
+command's rows times the row's workgroups times the span's pieces fit one wave; past that the
+N-row command takes fewer pieces and the regions rig holds its rows to the split bar instead
+(`vk_rdec_rows_split_alike`). Every row of the batch sits in one band: a group's furthest row
+picks the group's form, and a row batched across a band edge takes its group's. The
 pieces land in the partials plane; past them sit the arrival counters (`partu`, a word a (row, kv
 head, slab) at `cntoff`), each atomically bumped after a device-scope release. The piece that reads
 its group's count last aligns each head's pieces by their maxes, normalizes, gates and stores the

@@ -29,7 +29,7 @@ or `ensure_capacity` earlier in the function, and never compares the two counts.
 grows with a model dimension but is not declared `@exact_size` gets no lint at all, which is why
 the module declares every such buffer `@exact_size` and sizes it through a reserve first.
 
-### Engine core
+### Engine core {#engine-core}
 
 - **`dasllama.das`** - the public API facade and nothing else: `load_model` -> `create_session` ->
   generate, re-exported names, the doc surface. No engine logic; a function that does work belongs
@@ -50,18 +50,18 @@ the module declares every such buffer `@exact_size` and sizes it through a reser
   registry's rounds feed. The standard attention's Config-keyed arms live beside it - the gated
   projection (`q_gated`: a 2x-wide q whose second half sigmoid-gates the output) among them - one
   kernel every arch shares, its arms chosen by the model's flags. **Not** the load walk (`ARCHITECTURE_ENGINE_FORMATS.md#the-load-and-image-rail`) and **not** GPU residency
-  (`ARCHITECTURE_GPU.md#gpu-backends`) - both left, and the seam each left behind is a registered hook,
-  so neither comes back.
+  (`ARCHITECTURE_GPU.md#gpu-backends`) - both left; the seam each left is a registered hook, so neither comes back.
   It remains the module's debt sink; what sits here that is family-specific or platform-specific is
   debt, **not precedent**. Ledgered exceptions the sidecar-apply seam forces
   (the knob rail lives here, and the backends require this module, so their sidecar knobs cannot):
   the metal tensor crowns, and the three metal prefill raced-constant knobs beside them - both are
   applied by `apply_box_profile_runtime` and CONSUMED by the Metal backends at their own init.
   `REVIEW.das`'s `check_fastmath_default` licensed set names each kernel that opts out of fastmath
-  against the test that reds under it - the StyleTTS2 harmonic-source stamps, a resample law each
-  (`metal_st2_src_low_torch_msl` / `_onnx_msl`, `metal_st2_src_cumsum_torch_msl` / `_onnx_msl`,
-  `metal_st2_src_sines_torch_msl` / `_onnx_msl`, gated by `st2_source_gate`) - and an entrant
-  ships its failing-under-fastmath test with the kernel.
+  against the test that reds under it: the StyleTTS2 harmonic-source stamps, a resample law each
+  (`metal_st2_src_{low,cumsum,sines}_{torch,onnx}_msl`, gated by `st2_source_gate`), and the per-32
+  GEMV with its small-batch form (`metal_kq_gemv_<fmt>_msl` for q51, iq4nl32, q4032 and q5032, their
+  `_ks_msl` K-split stamps, `metal_b32_mvb` by its method - gated by `b32_mvb_gate`, whose
+  bit-for-bit compare fast math breaks); an entrant ships its failing-under-fastmath test too.
 - **`dasllama_transformer.das`** - the block-composition seam, and the require umbrella: the
   `[init]`-only side-effect requires (arch registrations, GPU tiers, and any module that
   requires the engine back, which the umbrella therefore hosts to break the cycle).
@@ -92,17 +92,16 @@ the module declares every such buffer `@exact_size` and sizes it through a reser
 - **`dasllama_mtp_gemma.das`** - the gemma-4 assistant drafter (`gemma4-assistant`), which is a
   SIDECAR head, not a trunk block: it owns no K/V projection and borrows the target trunk's cache
   at two capture layers, so it never rides the arch registry or `forward_mtp`. The file holds the
-  sidecar resolver, the refusing loader (`GemmaDrafter`, whose `blob` is raw GGUF Q8_0 = the Metal
-  34B form, so the GPU encoder uploads it with no repack), and the CPU reference forward the GPU
-  encoder is scored against. That oracle carries its own Q8_0 dot and GEMV and its own attention
-  dot over decoded rows - reference arithmetic, not a tier kernel or a codec primitive, so no
-  tier specializes it. A refusal is `ok = false` plus a `why`, never a panic - a drafter is
+  sidecar resolver, the refusing loader (`GemmaDrafter`, its `blob` raw GGUF Q8_0), the trunk check
+  every attach asks (`gemma_drafter_target_why`), and the CPU reference forward the GPU encoders
+  are scored against (`ARCHITECTURE_GPU_MTP_ASSISTANT.md`). That oracle carries its own Q8_0 dot and
+  GEMV and its own attention dot over decoded rows - reference arithmetic, not a tier kernel or a
+  codec primitive, so no tier specializes it. A refusal is `ok = false` plus a `why`, never a panic - a drafter is
   optional and a bad sidecar must degrade to plain decode. A server or scheduler reaches the
-  drafter through the engine's assistant seams (`MtpAssistantSeams` in `dasllama_common`:
-  `mtp_drafter_sidecar_`, `attach_mtp_drafter_`, `mtp_capable_`), which the Metal drafter driver
-  registers at init and which read as "no assistant" where no driver did - `mtp_capable_` is what
-  a scheduler's `mtp` asks for, a NextN head of the model's own or an attached drafter, so a
-  head-less target speculates once attached and never before.
+  drafter through the engine's assistant seams (`MtpAssistantSeams` in `dasllama_common`, one set
+  a backend), which each GPU drafter driver registers at init and which read as "no assistant" where no
+  driver took the trunk - `mtp_capable_` is what a scheduler's `mtp` asks for, a NextN head of the
+  model's own or an attached drafter, so a head-less target speculates once attached and never before.
 - **`dasllama_sampling.das`** - token sampling and the generation drivers: the sampler over
   `dasllama_common`'s `SamplingParams`. A top-k within `SAMPLE_TOPK_FAST_CAP` is a candidate-list
   sampler - one pass over the row selects the k largest logits into a heap (ties at the k-th all
@@ -154,7 +153,12 @@ divisors over the NTK-by-parts band (`yarn_rope_freqs`) and multiplies the `1 + 
 magnitude into `Config.rope_mscale`. Every rope consumer - the CPU leaves, the cos/sin tables
 the GPU drivers read - takes those fields and never the metadata, and both run over the ROTATED
 span, so a partial-rotary head (`rope_dim` under `head_size`) takes the band and the factors
-like a full one. A serving override (`set_rope_scaling_override`, seeded from
+like a full one. A Phi-3 file ships two LongRoPE factor sets; the loader reads into `rope_freqs`
+the one `rope_factor_tensor` names - the long set when the file's context (`Config.seq_len`, the
+context a session is sized to) runs past `rope.scaling.original_context_length`, else the short
+set - which is llama.cpp's rule with its context set to the file's length. The reference switches
+by each call's sequence length; one Model-level set cannot, so a short session on a 128k file runs
+the long set, as llama.cpp does at that context. A serving override (`set_rope_scaling_override`, seeded from
 `DASLLAMA_ROPE_SCALING` / `ROPE_SCALE` / `YARN_ORIG_CTX`, the tools' `--rope-scaling` flags and
 the server's config keys) replaces the file's keys at the same fold, because the Qwen files ship
 none and enable YaRN as a setting. The fold is image BYTES, so `DlimCpuConfig.rope_override`
@@ -229,11 +233,11 @@ reference below the indexer's `indexer_top_k` budget.
   (the tune-generator contract).
 - **`performance/model_specs.das`** - the ONE model-set table: per carrier, the profiled-catalog
   fields, the official-board flag, the serving-catalog fields (`serve_*`, incl. `serve_vision`
-  naming a tower companion by name), the provenance pin (exact HF repo + revision + sha256, or the
+  and `serve_drafter` naming a tower or drafter companion by name), the provenance pin (exact HF repo + revision + sha256, or the
   on-box conversion recipe; companions hang off their owning entry, and a companion shared by
   several rows is referenced from the others by name), and the frozen parity evidence as data
   (pinned ids + arms). `llm_catalog` / `official_catalog` / `models_provenance` are views over it;
-  `serve_vision_tower` resolves a tower name to its pinned companion, and `serve_asr_tower` is the
+  `serve_companion` resolves a tower or drafter name to its pinned companion, and `serve_asr_tower` is the
   one standalone pinned artifact the file carries - the serving ASR tower (parakeet v3), consumed
   by `asr_catalog`'s v3 row in `profile_common.das` (the pin's single source lives here, not there).
 - **`performance/box_ident.das`** - the hardware-keyed box tag: the fleet table maps every

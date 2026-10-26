@@ -4,10 +4,14 @@
 doc: `ARCHITECTURE.md`. Planned work: `followup_general.md`, `followup_vulkan.md`,
 `followup_metal.md`.
 
-**A diff that adds a `followup_*.md` entry asking that one function be shortened or split (not
-merged with a twin onto one template), or adds a STYLE037/STYLE038 suppression (`// nolint:`,
-`options _function_length` / `_cyclomatic_complexity`) under this folder to a function such an
-entry names, drops the suppression or lands the split in the same change.**
+**A diff that adds a `followup_*.md` entry asking that a function carrying a STYLE037/STYLE038
+suppression (`// nolint:`, `options _function_length` / `_cyclomatic_complexity`) be shortened or
+split (not merged with a twin onto one template) removes that suppression, or lands the shortening
+or split, in the same change.**
+
+**A diff that adds a STYLE037/STYLE038 suppression under this folder to a function that a
+`followup_*.md` entry asks to have shortened or split is a defect - it lands the shortening or
+split instead.**
 
 **A diff that adds a file under `dasllama/` adds that file's charter line - the one line saying
 what the file holds - to an `ARCHITECTURE_*.md` companion in the same change, never to
@@ -18,10 +22,15 @@ each file's charter line.
 number higher than every number that file has carried on the base branch or in the diff's own
 commits, deleted rows included.** Text cites rows by number.
 
-**A diff that changes the problem a `followup_*.md` row states deletes the row, repoints every
+**A diff that removes the problem a `followup_*.md` row states deletes the row - or, when the row
+lists several items and the diff resolves only some, deletes those items alone and the row keeps
+its number - and repoints every checked-in citation naming what it deleted to where the fact now
+lives (the architecture doc or the code) or drops it.**
+
+**A diff that rewrites the problem a `followup_*.md` row states deletes the row, repoints every
 checked-in citation that names it to the new row's number or drops it, and adds the new problem
-under a new number.** A row rewritten under its number turns every citation of that number into a
-citation of something else.
+under a new number; deleting a resolved item is not a rewrite.** A row rewritten under its number
+turns every citation of that number into a citation of something else.
 
 **A diff files planned work in the ledger that owns it: `followup_metal.md` for work that would
 change a Metal kernel, driver or dispatch and no Vulkan one, or CPU engine work whose problem
@@ -29,14 +38,15 @@ reproduces only on macOS; `followup_vulkan.md` for work that would change a Vulk
 or dispatch and no Metal one; `followup_general.md` for everything else, work on both backends and
 rig and instrument rows included.**
 
-**A measured figure a diff records lands in `PERF_LEDGER.md`; a `followup_*.md` row that carries
-one cites the entry it comes from.**
+**A number a run of this repository produced, written by a diff into an `ARCHITECTURE*.md` or a
+`followup_*.md`, has its entry in `PERF_LEDGER.md`; a `followup_*.md` row that carries one cites the entry it comes from.**
 
 **A diff that adds, removes, or moves a `##` or `###` heading of an `ARCHITECTURE_*.md` companion,
 or adds or removes a companion, updates every text that lists a companion's contents - the
 companion's line in `ARCHITECTURE.md`'s routing block (under `File charters` or `Mechanisms`), the
-companion's own opening, a sibling companion's routing sentence that names it - so that it names
-each added heading's subject and no removed one's, in the same change.**
+companion's own opening, any other `ARCHITECTURE*.md` sentence that lists the companion's
+subjects - so that it names each added heading's subject and no removed one's, in the same
+change.**
 
 **A diff that moves or removes a heading of an `ARCHITECTURE_*.md` companion leaves no citation
 that names the companion file alone for that heading's subject - it repoints the citation to the

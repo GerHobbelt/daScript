@@ -77,7 +77,7 @@ set(DAS_EXTENDED_CORE
     check_workflow_matrix check_shipped_skills check_md_ascii check_wheel_repack check_manifest_render
     check_example_games check_dasllama_site run_tests_bench_updater
     run_tests_pr_babysit check_dasgen run_tests_review_md run_tests_dastest
-    check_lint_tree check_ast_verify_changed check_gated_das check_review_gates
+    check_lint_tree check_ast_verify_changed check_line_length check_gated_das check_review_gates
     check_standalone_exes check_format check_format_exe run_utils_tests)
 if(NOT WIN32)
     # check_model_mint: its test stands in a shell script for daslang, which Windows cannot exec;
@@ -120,7 +120,7 @@ das_lane_group(run_extended_all "Running every extended check"
     ${DAS_EXTENDED_CORE} ${DAS_EXTENDED_MODULES} ${DAS_EXTENDED_NIGHTLY})
 
 das_lane_group(run_build "Running the build lane"
-    run_tests_sweeps test-small)
+    run_tests_sweeps test-small run_tests_aot_subset)
 das_lane_group(run_build_nightly "Running the build lane's nightly sweeps"
     run_tests_slow run_backend_sweeps test_aot_subset)
 das_lane_group(run_build_sanitizers "Running the sanitizer lane"
@@ -133,7 +133,7 @@ das_lane_group(run_build_mingw "Running the mingw lane"
 # (cmake has no retry primitive inside one target). The windows 64 Debug cell needs it every run -
 # its first pass outgrows the 1800 s watchdog and only the isolated pass finishes.
 das_lane_group(run_build_isolated "Retrying the build lane's sweeps in isolated mode"
-    run_tests_sweeps_isolated test-small)
+    run_tests_sweeps_isolated test-small run_tests_aot_subset)
 das_lane_group(run_build_sanitizers_isolated "Retrying the sanitizer lane's sweep in isolated mode"
     run_tests_interpreter_isolated test-small)
 das_lane_group(run_build_mingw_isolated "Retrying the mingw lane's sweeps in isolated mode"

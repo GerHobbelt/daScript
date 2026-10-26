@@ -1,14 +1,14 @@
-# dasLLAMA Architecture - the Vulkan tier's NextN draft head
+# dasLLAMA Architecture - the Vulkan tier's draft heads
 
 Companion to `ARCHITECTURE_GPU_VULKAN_RESIDENCY.md`; a section is cited by its anchor. This
 document carries the NextN draft head the resident driver homes beside the trunk - the draft
 command that steps it, the prompt warm the window chain gives its slab, the rollback a
 rejected device verify takes from the copies the verify command made, the verify window a
 declined verify seat runs the CPU verify in, and the speculative knob's per-step gate on the
-carry. A head that rides the hyper-connection chain - its routed experts on the host beside the
-trunk's - is `ARCHITECTURE_GPU_VULKAN_HC.md#hc-draft-head`, its verify `#hc-verify-rows`. The residency plan,
-the marks swap and the logits landing the head rides are in
-`ARCHITECTURE_GPU_VULKAN_RESIDENCY.md`; the same-slab verify that re-warms the head's rows a
+carry - and the gemma-4 assistant drafter the driver runs beside a head-less trunk. A head that rides the hyper-connection chain - its routed experts on the host beside the
+trunk's - is `ARCHITECTURE_GPU_VULKAN_HC.md#hc-draft-head`, its verify `#hc-verify-rows`. The model's residency
+the head rides is in `ARCHITECTURE_GPU_VULKAN_RESIDENCY.md`, the logits landing in
+`ARCHITECTURE_GPU_VULKAN_LANDING.md`; the same-slab verify that re-warms the head's rows a
 round at a time is in `ARCHITECTURE_GPU_VULKAN_NROW.md#nrow-verify-command`; the Metal round
 these levers take their shape from is `ARCHITECTURE_GPU_MTP.md`. The GPU backend role table
 these sections build on stays in `ARCHITECTURE_GPU.md#gpu-backends`.
@@ -17,13 +17,15 @@ these sections build on stays in `ARCHITECTURE_GPU.md#gpu-backends`.
 
 **A NextN-headed model's draft head rides the arena as layer `n_layers`, and a recorded draft
 command steps it.** Where the tier installed the draft seat (`install_rdec_draft`) and the carry
-landing, and the head has the trunk's attention shape, a dense FFN and planes the resident GEMVs
-serve (`resident_head_decline` logs any other head at load, whose draft stays the CPU's; on the
-hyper-connection chain a routed head with its experts on the host is admitted too,
-`ARCHITECTURE_GPU_VULKAN_HC.md#hc-draft-head`), the plan counts eight planes - eh_proj [2dim -> dim]
-in its own format, the q/k/v/o quad, the FFN triple (a routed head's dense triple is its shared
-expert's) - the chain's planes for a head on it, and one more K/V slot a region past the trunk's; a
-headless model plans what it always did. The
+landing, and the head has the trunk's attention shape and planes the resident GEMVs serve
+(`resident_head_decline` logs any other head at load, whose draft stays the CPU's), the plan counts
+eight planes - eh_proj [2dim -> dim] in its own format, the q/k/v/o quad, the FFN triple (a routed
+head's dense triple is its shared expert's, `shexp_plane`) - a routed head's expert stacks where its
+experts ride the device (index `n_layers` of the loader's tags, the router slot past the trunk's
+routed layers, `resident_head_routed`; on the hyper-connection chain they sum on the host,
+`ARCHITECTURE_GPU_VULKAN_HC.md#hc-draft-head`, and a plain chain whose plan moved every routed layer
+to the host keeps the head's draft on the CPU, said at load), the chain's planes for a head on it,
+and one more K/V slot a region past the trunk's; a headless model plans what it always did. The
 norms plane takes the head's q/k rows at index `n_layers` of the q/k block and five rows past it -
 the attention, FFN, embed, carry and head norms, the final norm's row where the file ships no head
 norm (`rdec_norms_len`) - since layer `n_layers`' own rows would index the final norm's. The layer
@@ -32,7 +34,9 @@ planes (`xq_dev`, `xs_dev`) hold twice `dim` a row: eh_proj reads the `[enorm ; 
 them (`vk_rdec_prepare`'s `wide`, `vk_rdec_set_head`'s `xq_bytes`). The draft command, one per region, norms the
 uploaded embed row and carry `h` into one `[enorm ; hnorm]` row, runs eh_proj into x, the layer
 through the token command's attention and FFN encoders on its slot at row `pos - 1` (the head's
-own `TokMeta` block and rope rows), the head norm into the carry's row, the classifier, its
+own `TokMeta` block and rope rows) - a routed head's block as a routed trunk layer's: the shared
+expert, then the router, the top-k, the expert GEMVs (`rd_encode_moe`) and the combine's residual
+step (`rd_ar_comb_args`) - the head norm into the carry's row, the classifier, its
 epilogue (a final softcap, the suppressed ids pinned - the token command's, so a draft never picks
 a suppressed id) and the pick; the pick and that row land (`mtp_h`, `mtp_h_pos1` 0), and the seat answers the pick as the
 draft's token (`MtpDraftOverrideFn`), so the round's greedy walk (`mtp_draft`, `pick_only`)
@@ -213,4 +217,58 @@ lands the carry from its first step: a NextN model with speculation off carries 
 and runs the step a headless model runs. The draft's hidden is the head's own row and lands
 whatever the knob says - the draft command copies it itself wherever the transfer command would
 not (no transfer family, or the knob off) - and a verify with the knob off has no stored row to
-land, so the verify seat declines it to the CPU verify.
+land, so the verify seat declines it to the CPU verify. An attached assistant drafter
+(`#resident-assistant-drafter`) reads the carry every round whatever the knob says: its attach
+arms the landing on a head-less trunk after the load (`vk_rdec_carry_arm` makes `hid_host` and
+sets `RDec.carry`; `xb_dev` is transfer-shared on every model for it), `RDec.carry_assist` holds
+`carry_live` on while it stays attached, and the tier's gates read the attach beside the knob
+(`gpu_resident_assist_set`).
+
+### A device-home session speculates on the device alone {#resident-mtp-device-home}
+
+**A device-home session's round runs every seat on the device - the draft, its verify, a rejected
+round's rollback and a continuation's seam row - because the session has no host cache any seat
+could fall back on.** The head's rows live in the region alone: the prompt warm's rows are counted
+where the chain wrote them with no readback (`rdec_prefill_head_rows`), a draft uploads no host row
+(its hydrate start is its own row, its cache pointers null), and the seam the CPU writes for a
+host-cached session runs the draft command at row `pos - 1` instead (`vulkan_resident_seam`), its
+pick unread and counted as no draft. A seat that declines such a session panics by name
+(`rdec_device_home_guard`), as a declined decode or prefill does. The engine answers whether the
+installed model's round can run so (`gpu_resident_mtp_device_home_`: the head armed, the verify seat
+built for two rows or more, a recurrent model's rollback seat installed), and the server homes a
+speculating slot's streams on the device only then (`slot_wants_device_kv`); elsewhere the slot keeps
+host-cached sessions. The device-home round runs the same commands over the same rows as the
+host-cached round, so the two sessions draft, accept and stand alike round for round
+(`test_gpu_resident_format_census.das`' NextN cell; `test_scheduler.das`' device-mode cell holds the
+stream token for token the host-cached speculating stream, every drafted round counted by the
+device's draft and verify counters).
+
+### The assistant drafter rides the resident driver beside a head-less trunk {#resident-assistant-drafter}
+
+**The gemma-4 assistant drafter attaches where the resident driver serves the trunk whole, and its
+round is a draft command of its own over the trunk's mirror plus one verify on the N-row token
+command.** The attach (`vk_attach`, `dasllama_vulkan_mtp_gemma.das`) refuses a trunk the driver does
+not serve whole, a table the device does not gather, a trunk the N-row command declined, and a
+capture layer that keeps no K/V rows of its own, each by name. The drafter's Q8_0 tensors split
+into the quant and scale planes the q8 GEMV reads, its norms and rope table go up as one f32
+plane, and its activation planes are its own. The draft command, one per (region, depth), bakes
+the capture layers' mirror bases; per step it gathers the step's token row off the trunk's table
+(the seed's id staged up at step 0, the last step's pick after it), takes h as the carry staged
+up at step 0 and the last post-projection after it, runs the pre-projection, then per layer the
+residual step and the next norm's Q8_0 feed as one dispatch (the sandwich's post-norm on the
+partner, the layer scale on the sum), the q GEMV, the q heads' norm, rope on the query alone at
+the capture layer's rope class (tq4: the query rotated into the stored rows' basis), the decode
+attention over the capture layer's rows with the anchor's key count in its token block and the
+wo plane's Q8_0 requant folded into its store (tq4: un-rotated, then requantized), wo, gate and
+up, the GeGLU act with its requant, and down; then the classifier, the two-pass pick into the next
+step's id and the post-projection, each step's pick copied out to the host. The tick's round
+(`vk_gemma_rounds`) binds every warm stream to a region of its own - a bind never takes a region
+the tick's earlier streams bound (`gpu_resident_assist_bind`), and a stream left without one steps
+plain after the verify - runs each stream's draft command, then verifies every stream's
+[token, drafts] as consecutive rows of its region on the N-row command (`gpu_resident_assist_verify`):
+a row's token block carries its region and position, so one command carries every stream's group,
+and a row attends the rows the same command stored below it. The rows land their logits - or,
+where every stream asked a bare argmax, their picks alone - and their post-final-norm hidden; the
+shared walk (`mtp_accept_walk`) and host commit run per stream, and the region holds the stream's
+rows to its new `n_past`, the rejected drafts' rows dead above it. The model drop sweeps every
+device object the drafter held, so its drop hook forgets them and the drafter stands detached.

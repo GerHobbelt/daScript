@@ -340,11 +340,12 @@ def private dasllama_type_stanza(f : FILE const?; lab : string; tname : string; 
     fwrite(f, "{text}\n\n")
 }
 
-def document_module_dasllama(_root : string) {
-    var mod = find_module("dasllama")
+def document_module_dasllama(_root : string) {  // nolint:STYLE038 — flat doc-group list
+    var mod = [find_module("dasllama"), find_module("dasllama_core")]   //! the facade re-exports the core module, which holds the documented functions
     var groups <- array<DocGroup>(
         group_by_regex("Model loading and sessions", mod, %regex~(load_model|create_session|create_kv_pool|release_kv_pages|create_batch_workspace|setup_dasllama_jobque|with_dasllama_jobque|caps|mtp_drafter_sidecar|attach_mtp_drafter|mtp_capable)$%%),
-        group_by_regex("Prefix cache", mod, %regex~(create_prefix_cache|prefix_attach|prefix_insert|prefix_checkpoint_at|prefix_match_len|prefix_release|prefix_held_groups|prefix_chain_list)$%%),
+        group_by_regex("Prefix cache", mod, %regex~(create_prefix_cache|prefix_attach|prefix_insert|prefix_insert_snapshot|prefix_checkpoint_at|prefix_match_len|prefix_state_match_len|prefix_attach_state_split|prefix_state_touch|prefix_share_pages|prefix_take_spare|prefix_release|prefix_held_groups|prefix_chain_list)$%%),
+        group_by_regex("Device-home streams and the host pool", mod, %regex~(gpu_resident_mtp_device_home|gpu_device_kv_claim|gpu_device_kv_checkpoint|gpu_device_kv_checkpoints|gpu_device_kv_snapshot|gpu_device_kv_parked_pos|gpu_device_kv_parked_snapshot|gpu_device_kv_victim_claims|gpu_device_kv_export|gpu_device_kv_import|gpu_device_kv_pool_armed|gpu_device_kv_pool_moves)$%%),
         group_by_regex("Tokenizer", mod, %regex~(encode|decode|piece)$%%),
         group_by_regex("Evaluation and sampling", mod, %regex~(eval|eval_segments|eval_embd|eval_embd_span|eval_embd_span_mrope|eval_embd_body|media_body_rows|eval_batch|sample|set_seed|stats)$%%),
         group_by_regex("Generation", mod, %regex~(generate|generate_embd)$%%),
@@ -355,7 +356,7 @@ def document_module_dasllama(_root : string) {
         group_by_regex("Reasoning (thinking models)", mod, %regex~(split_reasoning|set_preserve_thinking|set_reasoning_effort|make_think_stream|think_budget_marks|think_feed|think_finish|think_drain|effective_stop_ids|turn_stop_ids|make_nothink_guard|nothink_stop_here)$%%),
         group_by_regex("Operations: prepared images and dispatch", mod, %regex~(dlim_inventory|dlim_clean|set_dispatch_worker_limit|get_dispatch_worker_limit|set_jobque_spin_us|get_jobque_spin_us|set_jobque_spin_gpu_us|get_jobque_spin_gpu_us|get_jobque_spin_in_force|set_single_thread|get_single_thread|select_matmul_backend_for_load|kernel_backend_available)$%%),
         group_by_regex("Operations: GPU tier and model slots", mod, %regex~(gpu_tier_status|set_gpu_tier_want|moe_gpu_tier_arm|moe_gpu_weight_budget|gpu_model_marks_init|gpu_slot_capture|gpu_slot_rearm|moe_gpu_model_marks_save|moe_gpu_model_marks_restore|moe_gpu_hydrate_session|moe_gpu_drop_model|set_resident_prefill_allowed|resident_prefill_allowed)$%%),
-        group_by_regex("Operations: serving from the device", mod, %regex~(create_device_session|gpu_device_sessions|gpu_dn_room|gpu_device_prefill_continues|gpu_device_prefill_window|gpu_device_kv_park|gpu_device_kv_adopt|gpu_device_session_ctx|gpu_device_session_dtype|set_gpu_resident_regions|set_gpu_ctx_max|set_gpu_ctx_strict|gpu_ctx_pins|set_gpu_kv_dtype|gpu_kv_dtype_pin|reset_gpu_kv_dtype|gpu_resident_decline|gpu_resident_experts_host|gpu_cpu_passes|device_kv_max_rows)$%%)
+        group_by_regex("Operations: serving from the device", mod, %regex~(create_device_session|gpu_device_sessions|gpu_dn_room|gpu_device_prefill_continues|gpu_device_prefill_segments|gpu_device_prefill_window|gpu_device_kv_park|gpu_device_kv_adopt|gpu_device_session_ctx|gpu_device_session_dtype|set_gpu_resident_regions|set_gpu_ctx_max|set_gpu_ctx_strict|gpu_ctx_pins|set_gpu_kv_dtype|gpu_kv_dtype_pin|reset_gpu_kv_dtype|gpu_resident_decline|gpu_resident_experts_host|gpu_cpu_passes|device_kv_max_rows)$%%)
     )
     var hook = DocsHook()
     hook.afterEnums <- @(var f : FILE const?; _was_enums : bool) {
@@ -372,6 +373,8 @@ def document_module_dasllama(_root : string) {
             "A caller-owned paged KV-cache pool (``create_kv_pool``): sessions created over it allocate fixed-size page groups on demand, so cache memory tracks the actual context instead of the full ``seq_len`` slab. One pool serves many sessions; an ``eval_batch`` batch must share one pool. Keep it alive and in place while its sessions live.")
         dasllama_type_stanza(f, "struct-dasllama_prefix-PrefixCache", "PrefixCache",
             "A page-granular prefix cache over one pool's sessions (``create_prefix_cache``): finished streams donate their KV pages keyed by a chained page hash of the token history, and later requests attach the longest cached prefix instead of re-prefilling it. Pages are refcounted with the pool; an LRU budget bounds retention.")
+        dasllama_type_stanza(f, "struct-dasllama_common-DnSnapshot", "DnSnapshot",
+            "A recurrent (deltanet) session's state at one position - the conv history and the scan state of every recurrent layer - as the prefix cache's checkpoints and the device-home pool carry it: taken off a parked claim (``gpu_device_kv_parked_snapshot``), reused from the cache's dropped checkpoints (``prefix_take_spare``), and restored into a session that attaches at that position.")
         dasllama_type_stanza(f, "enum-dasllama_kv_dtype-KVDtype", "KVDtype",
             "Per-session KV-cache codec picked at ``create_session``/``create_chat``: ``f16`` — the default, half the KV bytes and faster deep-context decode (stores clamp to ±65504); ``f32`` — the bit-exact reference; ``q8_0`` — block-quantized (llama.cpp ``-ctk``/``-ctv q8_0``), half the f16 bytes again and near-lossless in practice; needs head_size and kv_dim to be multiples of 32 (checked at create); ``tq4`` — the FWHT-rotated ternary codec, smaller still.")
         dasllama_type_stanza(f, "enum-dasllama_common-QuantMode", "QuantMode",
@@ -417,7 +420,7 @@ def document_module_dasllama(_root : string) {
         dasllama_type_stanza(f, "struct-dasllama_gpu_resident-GpuModelMarks", "GpuModelMarks",
             "One model's complete per-model GPU tier state while it is NOT the installed model (a multi-model host keeps one per slot): its routing marks plus the resident driver's activation. Mint with ``gpu_model_marks_init``; ``gpu_slot_capture`` fills it after the model's load, ``moe_gpu_model_marks_save``/``_restore`` swap it in and out on a switch.")
     }
-    document("dasLLAMA LLM inference: models, sessions, generation, chat", mod, "dasllama.rst", groups, hook)
+    documents("dasLLAMA LLM inference: models, sessions, generation, chat", mod, "dasllama.rst", groups, hook)
 }
 
 // The TTS facade and its type floor share one page; the family, assembly and front-end
@@ -1226,7 +1229,7 @@ def document_module_fuzzer(_root : string) {
 def document_module_match(_root : string) {
     var mod = find_module("match")
     var groups <- array<DocGroup>(
-        hide_group(group_by_regex("Implementation details", mod, %regex~(match_type|match_expr|match_peel_r2v)$%%))
+        hide_group(group_by_regex("Implementation details", mod, %regex~(match_type|match_expr|match_peel_r2v|match_strip_prefix|match_strip_suffix)$%%))
     )
     document("Pattern matching", mod, "match.rst", groups)
 }
@@ -1454,7 +1457,9 @@ def document_module_lint_config(_root : string) {
         group_by_regex("Lint-surface predicates", mod, %regex~(is_user_authored_body|is_lint_fixture_name|lint_file_skip_reason|drop_skipped_file_issues)$%%),
         group_by_regex("Structured findings", mod, %regex~(make_lint_issue)$%%),
         group_by_regex("Fixes", mod, %regex~(apply_lint_fixes|lint_source_line)$%%),
-        group_by_regex("Format policy", mod, %regex~(format_policy_for|partition_by_format_policy)$%%)
+        group_by_regex("Format policy", mod,
+            %regex~(format_policy_for|partition_by_format_policy)$%%),
+        group_by_regex("Line-length policy", mod, %regex~(line_length_policy_for)$%%)
     )
     document("Repo-level lint configuration", mod, "lint_config.rst", groups)
 }

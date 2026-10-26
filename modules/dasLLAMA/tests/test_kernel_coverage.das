@@ -145,7 +145,18 @@ let private CENSUS_NEVER_DISPATCHED <- [
     // kq_dq_kernel picks the stamp per format
     "MetalKqDequantIq4xs", "MetalKqDequantIq4nl", "MetalKqDequantK3",
     "MetalKqDequantIq3s", "MetalKqDequantIq3xxs", "MetalKqDequantK2", "MetalKqDequantIq2s",
-    "MetalKqDequantIq2xs", "MetalKqDequantIq2xxs",
+    "MetalKqDequantIq2xs", "MetalKqDequantIq2xxs", "MetalKqDequantIq3s4",
+    // the tall and double-buffered dense twins of every split-scale and per-32 format, and the per-32 formats' dense tensor
+    // twins and dev-W passes: no stocked carrier holds a dense plane in these formats at a DRAM-class panel (the gemma4moe
+    // row reaches q40's under its crown). Their coverage is kq_mulmm_gate (tall) and kq_dbuf_gate (the 128- and 32-row
+    // pairs) in test_metal_gemm_kernels.das, and b32_dense_twins in test_metal_prefill_kernels.das
+    "MetalKqMulMmIq4xsTH128", "MetalKqMulMmIq3s4TH128", "MetalKqMulMmIq4nlTH128", "MetalKqMulMmQ40TH128", "MetalKqMulMmK3TH128", "MetalKqMulMmK2TH128", "MetalKqMulMmIq2sTH128", "MetalKqMulMmIq2xsTH128", "MetalKqMulMmIq2xxsTH128",
+    "MetalKqMulMmIq4xsTHDb", "MetalKqMulMmIq3s4THDb", "MetalKqMulMmIq4nlTHDb", "MetalKqMulMmQ40THDb", "MetalKqMulMmK3THDb", "MetalKqMulMmK2THDb", "MetalKqMulMmIq2sTHDb", "MetalKqMulMmIq2xsTHDb", "MetalKqMulMmIq2xxsTHDb", "MetalKqMulMmIq3sTHDb", "MetalKqMulMmIq3xxsTHDb",
+    "MetalKqMulMmIq4xsTHDb128", "MetalKqMulMmIq3s4THDb128", "MetalKqMulMmIq4nlTHDb128", "MetalKqMulMmQ40THDb128", "MetalKqMulMmK3THDb128", "MetalKqMulMmK2THDb128", "MetalKqMulMmIq2sTHDb128", "MetalKqMulMmIq2xsTHDb128", "MetalKqMulMmIq2xxsTHDb128", "MetalKqMulMmIq3sTHDb128", "MetalKqMulMmIq3xxsTHDb128",
+    "MetalKqMulMmQ51T", "MetalKqMulMmQ51TH", "MetalKqMulMmQ51TH128", "MetalKqMulMmQ51THDb", "MetalKqMulMmQ51THDb128", "MetalKqDequantQ51",
+    "MetalKqMulMmIq4nl32T", "MetalKqMulMmIq4nl32TH", "MetalKqMulMmIq4nl32TH128", "MetalKqMulMmIq4nl32THDb", "MetalKqMulMmIq4nl32THDb128", "MetalKqDequantIq4nl32",
+    "MetalKqMulMmQ4032T", "MetalKqMulMmQ4032TH", "MetalKqMulMmQ4032TH128", "MetalKqMulMmQ4032THDb", "MetalKqMulMmQ4032THDb128", "MetalKqDequantQ4032",
+    "MetalKqMulMmQ5032T", "MetalKqMulMmQ5032TH", "MetalKqMulMmQ5032TH128", "MetalKqMulMmQ5032THDb", "MetalKqMulMmQ5032THDb128", "MetalKqDequantQ5032",
     // the split-format MoE expert mul_mm stamps, all four forms (f32-X base, half-X twin, and the
     // tall pair): no stocked MoE carrier holds an expert plane in these formats - the zoo's MoE
     // carriers put Q4_K_M (k4/k6), Q8_0 and mxfp4 expert planes on the schedule. The half-X twin
@@ -173,6 +184,19 @@ let private CENSUS_NEVER_DISPATCHED <- [
     // Their coverage is moe_kq_gemv_gate in test_metal_gemv_kernels.das
     "metal_moe_gemv_k3", "metal_moe_gemv_iq4xs", "metal_moe_gemv_iq3s", "metal_moe_gemv_iq3xxs",
     "metal_moe_gemv_iq2s", "metal_moe_gemv_iq2xs", "metal_moe_gemv_iq2xxs",
+    // the Q2_K and superblock IQ4_NL routed forms - the gathered GEMV, the simdgroup base mul_mm and the four tensor
+    // twins: no stocked MoE carrier holds a k2 or iq4nl expert plane. Their coverage is moe_kq_gemv_gate (fmt 2 / 45) in
+    // test_metal_gemv_kernels.das and moe_mulmm_kq_gate / moe_mulmm_split_gate in test_metal_gemm_kernels.das
+    "metal_moe_gemv_k2", "metal_moe_gemv_iq4nl", "MetalMoeMulMmK2T", "MetalMoeMulMmIq4nlT",
+    // the simdgroup base mul_mm of the split formats - the routed site's form on a box without the tensor toolchain, or
+    // where the window took no gather panel: the same expert planes nothing stocks. Their coverage is moe_mulmm_kq_gate
+    // in test_metal_gemm_kernels.das
+    "metal_moe_mulmm_k3", "metal_moe_mulmm_k2", "metal_moe_mulmm_iq4xs", "metal_moe_mulmm_iq4nl", "metal_moe_mulmm_q40",
+    "metal_moe_mulmm_iq3s", "metal_moe_mulmm_iq3xxs", "metal_moe_mulmm_iq2s", "metal_moe_mulmm_iq2xs", "metal_moe_mulmm_iq2xxs",
+    // the dense per-32 forms (q51, iq4nl32): a dense Q5_1 or off-lattice IQ4_NL plane loads in its own form
+    // (`kq_fmt_row_ok`), and no stocked census carrier holds one - the census-q51 / census-iq4nl32 arms mint
+    // theirs locally. Their coverage is b32_gemv_gate and b32_mm_gate in test_metal_prefill_kernels.das
+    "metal_kq_gemv_q51", "metal_kq_gemv_iq4nl32", "MetalKqMulMmQ51", "MetalKqMulMmIq4nl32",
     // the 16-deep router select stamp: it serves past 256 experts, and the stocked MoE carriers top
     // out at 128 (Qwen3-30B-A3B), 60 (Qwen1.5-MoE) and 32 (gpt-oss-20b). Its coverage is
     // moe_select_gate's ne=512 and ne=300 cases in test_metal_prefill_kernels.das
@@ -697,6 +721,23 @@ def private cov_tower_gemma4uv(t : T?) {
 //! either way. `CENSUS_NEVER_DISPATCHED` has no vocabulary for "blind only off this crown", so the
 //! pair is named here.
 let private CENSUS_CROWN_CONDITIONAL : table<string; string> <- {
+    // the dense tensor twins every format stamps behind its own kq_mulmm crown: the tall and double-buffered forms of the
+    // split-scale formats, every form of the per-32 formats
+    "MetalKqMulMmIq4xsTH128" => "kq_mulmm_iq4xs", "MetalKqMulMmIq4xsTHDb" => "kq_mulmm_iq4xs", "MetalKqMulMmIq4xsTHDb128" => "kq_mulmm_iq4xs",
+    "MetalKqMulMmIq3s4TH128" => "kq_mulmm_iq3s4", "MetalKqMulMmIq3s4THDb" => "kq_mulmm_iq3s4", "MetalKqMulMmIq3s4THDb128" => "kq_mulmm_iq3s4",
+    "MetalKqMulMmIq4nlTH128" => "kq_mulmm_iq4nl", "MetalKqMulMmIq4nlTHDb" => "kq_mulmm_iq4nl", "MetalKqMulMmIq4nlTHDb128" => "kq_mulmm_iq4nl",
+    "MetalKqMulMmQ40TH128" => "kq_mulmm_q40", "MetalKqMulMmQ40THDb" => "kq_mulmm_q40", "MetalKqMulMmQ40THDb128" => "kq_mulmm_q40",
+    "MetalKqMulMmK3TH128" => "kq_mulmm_k3", "MetalKqMulMmK3THDb" => "kq_mulmm_k3", "MetalKqMulMmK3THDb128" => "kq_mulmm_k3",
+    "MetalKqMulMmK2TH128" => "kq_mulmm_k2", "MetalKqMulMmK2THDb" => "kq_mulmm_k2", "MetalKqMulMmK2THDb128" => "kq_mulmm_k2",
+    "MetalKqMulMmIq2sTH128" => "kq_mulmm_iq2s", "MetalKqMulMmIq2sTHDb" => "kq_mulmm_iq2s", "MetalKqMulMmIq2sTHDb128" => "kq_mulmm_iq2s",
+    "MetalKqMulMmIq2xsTH128" => "kq_mulmm_iq2xs", "MetalKqMulMmIq2xsTHDb" => "kq_mulmm_iq2xs", "MetalKqMulMmIq2xsTHDb128" => "kq_mulmm_iq2xs",
+    "MetalKqMulMmIq2xxsTH128" => "kq_mulmm_iq2xxs", "MetalKqMulMmIq2xxsTHDb" => "kq_mulmm_iq2xxs", "MetalKqMulMmIq2xxsTHDb128" => "kq_mulmm_iq2xxs",
+    "MetalKqMulMmIq3sTHDb" => "kq_mulmm_iq3s", "MetalKqMulMmIq3sTHDb128" => "kq_mulmm_iq3s",
+    "MetalKqMulMmIq3xxsTHDb" => "kq_mulmm_iq3xxs", "MetalKqMulMmIq3xxsTHDb128" => "kq_mulmm_iq3xxs",
+    "MetalKqMulMmQ51T" => "kq_mulmm_q51", "MetalKqMulMmQ51TH" => "kq_mulmm_q51", "MetalKqMulMmQ51TH128" => "kq_mulmm_q51", "MetalKqMulMmQ51THDb" => "kq_mulmm_q51", "MetalKqMulMmQ51THDb128" => "kq_mulmm_q51",
+    "MetalKqMulMmIq4nl32T" => "kq_mulmm_iq4nl32", "MetalKqMulMmIq4nl32TH" => "kq_mulmm_iq4nl32", "MetalKqMulMmIq4nl32TH128" => "kq_mulmm_iq4nl32", "MetalKqMulMmIq4nl32THDb" => "kq_mulmm_iq4nl32", "MetalKqMulMmIq4nl32THDb128" => "kq_mulmm_iq4nl32",
+    "MetalKqMulMmQ4032T" => "kq_mulmm_q4032", "MetalKqMulMmQ4032TH" => "kq_mulmm_q4032", "MetalKqMulMmQ4032TH128" => "kq_mulmm_q4032", "MetalKqMulMmQ4032THDb" => "kq_mulmm_q4032", "MetalKqMulMmQ4032THDb128" => "kq_mulmm_q4032",
+    "MetalKqMulMmQ5032T" => "kq_mulmm_q5032", "MetalKqMulMmQ5032TH" => "kq_mulmm_q5032", "MetalKqMulMmQ5032TH128" => "kq_mulmm_q5032", "MetalKqMulMmQ5032THDb" => "kq_mulmm_q5032", "MetalKqMulMmQ5032THDb128" => "kq_mulmm_q5032",
     "MetalKqMvB2K4R2" => "kq_mvb2_k4_r2",
     "MetalKqMvW2K4H" => "kq_rows_half_k4",
     "MetalKqMvW4K4H" => "kq_rows_half_k4",
@@ -973,10 +1014,6 @@ let private VK_CENSUS_NEVER_DISPATCHED <- [
     // 64-deep chunks divide takes the f16 route, so the scalar tile runs only off it (a dim off
     // 512, the KHR route). Its coverage is test_vkd_moe_routing's router arm in test_vulkan_kernels.das
     "router_gemm_cls_spv",
-    // the scalar beta/alpha GEMM: the same route split for a hybrid's f32 beta/alpha rows on the f16
-    // feed; off the f16 feed (DASLLAMA_COOPMAT=sdot4) it runs. Its coverage is the dn_ba run of
-    // test_vkd_dn_family in test_vulkan_kernels.das
-    "dn_ba_cls_spv",
     // the N-column decode GEMV leaves serve only the N-row token command, which the zoo's one-region loads never
     // engage (a batched step here rides f32 sessions on the per-op rails); the q8 row-pair stamps serve only past
     // `g_q8_n2_min_n`, off until a box's token command proves the pair. Their coverage is test_vkd_gemv_ncol in

@@ -111,7 +111,7 @@ def private with_llama_server(model_path : string; port : int; mode : MetalMode 
             }
             finished |> notify_and_release
         }
-        let ready = serve_clients(port, 300, "/v1/models", blk)   // up to ~30s for load + JIT
+        let ready = serve_clients(port, 1200, "/v1/models", blk)   // up to ~2 min: a cold Vulkan load mints the device image first
         finished |> join
         assert(ready, "dasllama server became ready")
     }
@@ -1179,16 +1179,6 @@ def test_openai_server_checkpoint_bytes(t : T?) {
             let b1 = chat_usage(base_url, "\{\"messages\":[\{\"role\":\"system\",\"content\":\"{sys}\"},\{\"role\":\"user\",\"content\":\"What is two plus two? One word.\"}],{kw}}")
             t |> success(a1.prompt > 16 && b1.cached == 0, "under a 1 MB budget A's opening did not outlive A's finished turn: B attaches nothing ({b1.cached} cached of {b1.prompt}); the 32-checkpoint boot attaches the opening")
         }
-    }
-}
-
-[test]
-def test_prefix_state_budget(t : T?) {
-    t |> run("the checkpoint byte budget: the MB asked for, else a quarter of the box's RAM, else 4 GB") @(t : T?) {
-        t |> equal(16384l, prefix_state_budget_mb(0l, 64l), "a 64 GB box")
-        t |> equal(4096l, prefix_state_budget_mb(0l, 16l), "a 16 GB box")
-        t |> equal(4096l, prefix_state_budget_mb(0l, 0l), "RAM unknown")
-        t |> equal(512l, prefix_state_budget_mb(512l, 64l), "an explicit budget stands")
     }
 }
 

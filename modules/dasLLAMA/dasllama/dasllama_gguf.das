@@ -368,12 +368,12 @@ def private gguf_split_paths(path : string; missing_ok : bool) : array<string> {
     }
     let ridx = try_to_int(slice(tail, 1, 6))
     let rcnt = try_to_int(slice(tail, 10, 15))
-    if (!ridx._is_ok || !rcnt._is_ok) {
+    if (is_err(ridx) || is_err(rcnt)) {
         res |> push(path)
         return <- res
     }
-    let cnt = rcnt._value
-    if (ridx._value < 1 || cnt < 1 || ridx._value > cnt) {
+    let cnt = unwrap(rcnt)
+    if (unwrap(ridx) < 1 || cnt < 1 || unwrap(ridx) > cnt) {
         res |> push(path)
         return <- res
     }
@@ -905,6 +905,26 @@ def gguf_read_tensor_f32(m : GGUFMeta; srcbytes : array<uint8> | #; name : strin
                 }
             }
         }
+    } elif (gtype == GGML_TYPE_IQ4_NL
+            && (src_off % KQ_SB_ELEMS != 0l || expect_n % KQ_SB_ELEMS != 0l)) {
+        // a slice off the superblock lattice: the per-32 iq4nl32 form's two steps a 32-block, value for value
+        if (src_off % KQ_B32_ELEMS != 0l || expect_n % KQ_B32_ELEMS != 0l) {
+            panic("gguf: tensor '{name}' IQ4_NL slice [{src_off}, +{expect_n}) is not 32-block-aligned")
+        }
+        let bb = kq_desc(KqFmt.iq4nl32).disk_bytes
+        let blk0 = src_off / KQ_B32_ELEMS
+        var kq, ks : array<uint8>
+        kq |> resize(int(IQ4NL32_QB))
+        ks |> resize(int(IQ4NL32_SB))
+        for (blk in range64(expect_n / KQ_B32_ELEMS)) {
+            unsafe {
+                let src = addr<uint8 const?>(bytes[base + (blk0 + blk) * bb])
+                kq_transcode_p(src, addr(kq[0]), addr(ks[0]), KqTag_iq4nl32())
+            }
+            dequant_iq4nl32_plane_block(kq, 0l, ks, 0l, dst, dst_off + blk * KQ_B32_ELEMS)
+        }
+        delete kq
+        delete ks
     } elif (gguf_kq_fmt_of_type(gtype) != KqFmt.q8) {
         // transcode one superblock into scratch planes + its plane dequant: the native load's own two steps, value for value
         if (src_off % 256l != 0l || expect_n % 256l != 0l) {

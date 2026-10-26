@@ -1,10 +1,11 @@
 # dasLLAMA Architecture - the Vulkan tier's N-row token command
 
 Companion to `ARCHITECTURE_GPU_VULKAN_RESIDENCY.md`; a section is cited by its anchor. This
-document carries the N-row token command a batched step's rows go through, its same-slab form the
+document carries the N-row token command a batched step's rows go through, the N-column leaf every
+format has, the column tiles a dispatch past eight columns runs in, the command's same-slab form the
 speculative verify steps one stream's rows through, and the residual step's two forms it holds bit
-for bit. The residency plan, the marks swap and the logits landing
-that the command runs under are in `ARCHITECTURE_GPU_VULKAN_RESIDENCY.md`; the decode
+for bit. The model's residency the command runs under is in `ARCHITECTURE_GPU_VULKAN_RESIDENCY.md`,
+the logits landing in `ARCHITECTURE_GPU_VULKAN_LANDING.md`; the decode
 attention's forms are `ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-decode-attn-split`; the per-op tier's
 decode era, whose routed block the command's rows form mirrors, is `ARCHITECTURE_GPU_VULKAN_DECODE.md`.
 
@@ -12,12 +13,18 @@ decode era, whose routed block the command's rows form mirrors, is `ARCHITECTURE
 
 **A batched decode step runs its rows through ONE recorded command, so a layer's weights stream
 once for the step instead of once a row.** The driver sizes every per-token plane to `RDec.nb`
-rows - one a region, or the speculative verify's rows where a NextN model asks more
-(`ARCHITECTURE_GPU_VULKAN_NROW.md#nrow-verify-command`), `RD_NB_MAX` at most, eight, the N-column GEMV leaves' width - and
-`vk_rdec_token_n_rows` answers how many rows the armed model steps at once: `nb` over dense,
+rows - `RD_NB_MAX` (`RDEC_NROW_MAX`, sixteen: two of the N-column leaves' eight-column tiles,
+`ARCHITECTURE_GPU_VULKAN_NROW.md#nrow-col-tiles`) whatever the region
+count, so the short window's peel and the speculative verify
+(`ARCHITECTURE_GPU_VULKAN_NROW.md#nrow-verify-command`) ride the planes on a one-region driver; a
+routed model steps at most the rows whose picks the slot planes hold, `MAX_ROUTED_SLOTS` over its
+picks a row (`vk_rdec_prepare_moe` lowers `nb`, the verify rows with it) - and
+`vk_rdec_token_n_rows` answers how many rows the armed model steps at once - a step of more rows
+than that runs them in the fewest groups of at most that many, the groups balanced so none is a
+single row (a single row is the one-row command's), every row's region bound before the first group
+runs, so a row the regions refuse declines the step before any row steps - `nb` over dense,
 MoE, per-layer-embedding, shared-KV and recurrent layers and a gated q, and none where a layer or
-the tail has no N-row form - a dense plane in a per-32 expert format (q51, iq4nl32, mx4: the formats
-with no N-column leaf, every kq leaf having one), a routed block beside a per-layer-embedding
+the tail has no N-row form - a routed block beside a per-layer-embedding
 branch, more routed slots than the block's slot planes hold, or a routed layer whose experts serve on
 the host on a plain MoE (the one-row split command serves it, `ARCHITECTURE_GPU_VULKAN_HC.md#hc-token-command`) -
 and logs the reason once per armed model. The classifier epilogue (the final softcap and the suppressed ids, `ClsEpilogue`)
@@ -56,8 +63,9 @@ cached count and mirror region, which ride the shared `TokMeta` block a row (`mi
 offset in mirror units; `DaAttnArgs.rowwg` and `qrow` carry the row stride into the attention, `rowwg`
 0 naming a one-row dispatch). The attention's key split is the span's, the ladder the one-row
 command takes below its wide form (`rd_split_pieces` and the layer's window cap,
-`ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-decode-attn-split`), so the rows sum as each row does alone while every
-row sits in one band - the batch's furthest row picks the form, the unsplit twin under
+`ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-decode-attn-split`, the wave cap over the command's own rows: the rows sum as
+each row does alone while the rows' workgroups over the pieces fit one wave of the SMs, `vk_rdec_rows_split_alike`)
+while every row sits in one band - a group's furthest row picks the group's form, the unsplit twin under
 `RD_UNSPLIT_POS` and the split form at every span past it (the ruler reads eight pieces slower
 than four at four rows, so the rows take no wide twin). A command is recorded once per row
 count and form - the split form and the unsplit twin on first use of the row count, the twin's
@@ -69,8 +77,8 @@ row-at-a-time loop serves.
 
 **A recurrent layer's head steps the rows in their regions' state slots.** The qkv, z, beta/alpha
 and out GEMVs go out in their N-column forms over the rows' planes - a projection row (qkv | z) a
-row, the beta and alpha rows a row apart at the arm's stride (the q8 arm's GEMVs land them `nvh`
-apart, the f32 arm's router form `2 x nvh`, `DnStepArgs.beta_row_stride`), an o row a row - and the fused
+row, the beta and alpha rows a row apart at the arm's stride (the plane arm's GEMVs, each its tag's
+N-column leaf, land them `nvh` apart, the f32 arm's router form `2 x nvh`, `DnStepArgs.beta_row_stride`), an o row a row - and the fused
 step (`dn_step_cls`) runs a workgroup per (row, head), the row's `TokMeta` naming the state and
 ring slot (`dnslot`) and the ring parity it reads, so two rows in two regions advance two states
 in one dispatch and the driver flips each row's region parity after the submit
@@ -84,7 +92,7 @@ takes the rows as columns of one dispatch (`RouterArgs.ncols`: a workgroup an ex
 weights read once and dotted against every column, the logits a row at `obase + c * ne`); the per-row top-k
 stamp (`TopKN`, a row a workgroup over the record base `TopKRecords`; the one-row command
 dispatches the same stamp at one workgroup) writes row p's k slots at `p * k` - the gate and up region records reading row p's
-feed blocks (`TopkArgs.xnb1`), the down records each slot's hidden row; and the gate, up and
+feed blocks (`GkTopKArgs.xnb1`), the down records each slot's hidden row; and the gate, up and
 down GEMVs are the one-row leaves over `nrows * k` regions (`GemvArgs.nreg`), the act over every
 slot, the combine per row (`ClsArComb`'s position is its workgroup). The rows take the split
 gate and up forms - each fused stamp's twin byte for byte, by the stamps' own cells - and the
@@ -105,9 +113,8 @@ under a decision both commands share (`RLayer.comb_rq`, made once with the combi
 whichever command records first, `rd_ensure_comb_sets`): the two commands record in any order,
 and a set either record binds always exists. One recorder encodes both commands
 (`rd_encode_token` over `nrows`): the one-row arms at one row, the N-column leaves, the rows
-stamp and the bisect knob past it, the sets one and the same. The router and the fused per-layer-embedding
-kernels hold at most eight columns in their register and workgroup arrays (`RD_NB_MAX`), clamped
-in the kernel; the router's partial plane holds sixteen subgroups' worth, twice the tier's floor.
+stamp and the bisect knob past it, the sets one and the same. The router's partial plane holds
+sixteen subgroups' worth, twice the tier's floor.
 
 **An E-series row carries its own per-layer-embedding side input, and a shared-KV layer projects
 q alone.** The command takes the rows' side inputs position-major (`RdecTokenNFn`'s `ple` rows:
@@ -129,9 +136,9 @@ shared-KV layer's head projects q as the N-column GEMV alone: the rope and store
 pairs and no k-head groups, and the attention reads the donor layer's rows from the mirror.
 
 **The rows' logits come home a row a job-queue lane, straight off the cached mapping.**
-`rdec_nrow_steps` counts the steps the command served, so a cell holds that its batched steps
-went through the command and not the row-at-a-time loop the two silent declines (no region, two
-rows one region) fall to. `rd_land_logits_n` hands each row's copy to a lane where a queue serves (`maybe_parallel_for`,
+`rdec_nrow_steps` counts the N-row commands served - one a group of a batched step, one a peeled
+window - so a cell holds that its batched steps went through the command and not the
+row-at-a-time loop the two silent declines (no region, two rows one region) fall to. `rd_land_logits_n` hands each row's copy to a lane where a queue serves (`maybe_parallel_for`,
 the lanes idle while the device owns the step) and copies in order without one: a lane copies
 about 14 GB/s, and the earlier form - the whole plane into a scratch row on one lane, then a row
 a copy out of it - passed four rows of a 152k vocab twice over one lane (322 us a step on the
@@ -140,11 +147,36 @@ pod: the step's host stamps under `DASLLAMA_GPU_PROF=1`, `PERF_LEDGER.md`'s 2026
 **The engine reaches the command through the driver seam, and falls back a row at a time.**
 `install_moe_gpu_resident_batch` installs the pair (`rdec_token_n`, `rdec_token_n_rows`) beside
 the resident driver, so a tier with no batch arm answers 0 rows. `rdec_batch_rows_at_once` gathers
-the step's residuals, rope rows, positions, counts and regions, submits once, reads each
-host-cached row's K/V back and lands its logits; it returns false when a row finds no region or
+the step's residuals, rope rows, positions, counts and regions, submits once a group of the rows
+the command steps at once, reads each host-cached row's K/V back and lands its logits; it returns false when a row finds no region or
 two rows share one, and the caller's row-at-a-time loop serves that step. `DASLLAMA_VK_NROW_BISECT`
 (`ENVIRONMENT.md`) drops a class of dispatch from the recorded command so a profile prices it; the
 logits are garbage under any bit.
+
+### Every format has an N-column leaf {#nrow-block32-leaf}
+
+Every `KqFmt` member's decode GEMV has an N-column form, so no plane's format declines the N-row
+command, the verify or the hyper-connection head. The superblock formats stamp `KqGemvLeafT`'s
+`NCOL` shell, q8 its own row-count stamps, and the per-32 formats (q51, iq4nl32, mx4) the `NCOL`
+form of `Blk32GemvRunT` in the one-row class's set family: a subgroup a row, a lane's blocks
+decoded once (`Blk32GemvT.blk_words`) and dotted against every column's Q8_0 row c x nb blocks past
+the region's (`blk_xdot`), the y rows `ystride` apart. Both forms add `blk_xdot`'s one text to a
+lane's sum in the same block order and fold the subgroup the same way, so a column lands the
+one-row class's row bit for bit (`test_vkd_gemv_ncol`).
+
+### A dispatch past eight columns runs in column tiles {#nrow-col-tiles}
+
+**The N-column kernels hold eight columns in their register and workgroup arrays, so a dispatch of
+more rows runs in tiles of eight, one weight pass a tile.** Every N-column kernel's push block
+carries `col0`, the tile's first column: column c reads activation row `col0 + c` and lands its
+output row `col0 + c`, so the tiles of one dispatch write disjoint rows of the planes the whole
+rows' extent binds. The encoders tile (`gemv_enc` over `GEMV_COL_TILE`, `router_enc_cols`,
+`q8_gemv_gu_n_enc` over `GU_N_COLS`, `pleact_enc_cols`), so no driver site counts columns; a
+tile's columns are summed exactly as the same columns of a narrower dispatch, so a row lands bit
+for bit whichever tile holds it. The per-row kernels (the norms, the rope and store, the attention,
+the top-k, the deltanet step, the classifier epilogue and pick) take a workgroup a row and need no
+tile. A routed model's rows stay bound by the slot planes (`RDEC_ROUTED_SLOTS`, 128 picks: the
+depth-8 verify's nine rows at eight picks a row).
 
 ### The same-slab verify: one stream's rows in one region {#nrow-verify-command}
 
@@ -153,9 +185,10 @@ that stream's region.** Row i is the round's token or draft i at position `pos +
 names the region's mirror base and state slot, the position and a cached count of `pos + i + 1`.
 The command stores every row's K/V before any row attends, and the count masks each row to the keys
 at or below its own position, so row i reads the rows the same command stored below it and never
-one above. The per-row planes hold the rows: where the driver homes a NextN head it sizes them at
-the larger of the region count and the verify's rows - the round's depth plus one, read at load
-(`get_mtp_depth`) - `RD_NB_MAX` capping both, so a verify of more rows passes to the CPU (`verify_rows`). The
+one above. The per-row planes hold `RD_NB_MAX` rows whatever the region count; where the driver
+homes a NextN head the verify takes up to the round's depth plus one of them, read at load
+(`get_mtp_depth`) - nine under the depth-8 knob (`test_gpu_resident_hybrid_mtp_depth8`) - so a verify
+of more rows than the load prepared passes to the CPU (`verify_rows`). The
 command records once per row count and attention form (`RDec.v_cmd`, `v_cmd_unsplit`) - and, on
 a hybrid, per region, since the rollback copies it carries bake the region's slot
 (`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-verify-rollback`) - the rows' form the furthest row's,
