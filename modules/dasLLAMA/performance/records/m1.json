@@ -1150,7 +1150,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "pp512":{
@@ -1197,7 +1197,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "pp512":{
@@ -1238,7 +1238,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "pp512":{
@@ -1279,7 +1279,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "pp512":{
@@ -1320,7 +1320,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "pp512":{
@@ -1367,7 +1367,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "pp512":{
@@ -2555,7 +2555,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "pp512":{
@@ -2643,7 +2643,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "pp512":{
@@ -2684,7 +2684,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "pp512":{
@@ -2765,7 +2765,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "pp512":{
@@ -3767,7 +3767,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "asr:jfk.wav":{
@@ -3866,7 +3866,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "asr:jfk.wav":{
@@ -3945,7 +3945,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "asr:jfk.wav":{
@@ -3983,7 +3983,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "asr:jfk.wav":{
@@ -4082,7 +4082,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "asr:jfk.wav":{
@@ -4181,7 +4181,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "asr:jfk.wav":{
@@ -4267,7 +4267,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "asr:jfk.wav":{
@@ -4366,7 +4366,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "asr:jfk.wav":{
@@ -4445,7 +4445,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "asr:jfk.wav":{
@@ -4483,7 +4483,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "asr:jfk.wav":{
@@ -4582,7 +4582,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "asr:jfk.wav":{
@@ -4681,7 +4681,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "asr:jfk.wav":{
@@ -4748,172 +4748,6 @@
     "size_bytes":1624555275
   },
   {
-    "gguf":"canary-qwen-2.5b-decoder-f16.gguf",
-    "runs":[
-      {
-        "engine":"das",
-        "backend":"cpu",
-        "flavor":"tuned",
-        "box":"m1",
-        "threads":8,
-        "date":"2026-08-03",
-        "cmd":"modules/dasLLAMA/performance/_rig/dasllama-bench.app/Contents/MacOS/dasllama-bench -- --asr -m canary-qwen-2.5b-decoder-f16.gguf -r 2 -t 8 --json-path modules/dasLLAMA/performance/records/_cell_m1.json",
-        "hardware":{
-          "cpu":"Apple M1 Max",
-          "arch":"arm64",
-          "os":"macOS 26.5.2",
-          "perf_cores":8,
-          "total_cores":10,
-          "ram_gb":64,
-          "gpu":"Apple M1 Max (32-core)",
-          "model_id":"MacBookPro18,2"
-        },
-        "tests":{
-          "asr:jfk.wav":{
-            "ms":1205.8699999999999,
-            "audio_s":11,
-            "encode_ms":395.21100000000001,
-            "text":"And so my fellow Americans ask not what your country can do for you ask what you can do for your country"
-          },
-          "asr:jfk3.wav":{
-            "ms":3717.4270000000001,
-            "audio_s":33,
-            "encode_ms":1067.527,
-            "text":"And so my fellow Americans ask not what your country can do for you, ask what you can do for your country. And so my fellow Americans ask not what your country can do for you, ask what you can do for your country. And so my fellow Americans ask not what your country can do for you, ask what you can do for your country."
-          },
-          "asr:gb1.wav":{
-            "ms":16733.731,
-            "audio_s":198.734375,
-            "encode_ms":8313.4670000000006,
-            "text":"My fellow Americans, this day has brought terrible news and great sadness to our country. At nine o'clock this morning, Mission Control in Houston lost contact with our space shuttle Columbia. A short time later, debris was seen falling from the skies above Texas. The Columbia is lost. There are no survivors. In the words of the prophet Isaiah, May God bless the grieving families and may God continue to bless America."
-          }
-        },
-        "workload":"asr",
-        "source":"official",
-        "sha":"db50a7da2",
-        "version":"0.6.4",
-        "tune":"k4q8_tile_gen=mr8 (manifest); k5q8_tile_gen=mr8 (manifest); k6q8_tile_gen=mr4 (manifest); q40q8_tile_gen=mr8 (manifest); q8q8_tile_gen=mr8_budget (manifest); q51q8_gemv_gen=mr4 (manifest)",
-        "tune_sha":"bf42018efa628277924359a4e145892127c0b36b258a3bcb11996856eac641e9",
-        "exec_fmt":"q8/q8",
-        "files":[
-          {
-            "role":"weights",
-            "name":"canary-qwen-2.5b-decoder-f16.gguf",
-            "sha256":"db035e415f77aeb48222c81f92a49a68906ae80cef4e0600cde8ea699c12b496",
-            "bytes":3447348864
-          },
-          {
-            "role":"mmproj",
-            "name":"canary-qwen-2.5b-encoder-f32.bin",
-            "sha256":"37d1057ced3150cfde2fb996c1fc0a3d702d23a97f9347aedb52795ebec03e5c",
-            "bytes":3252768256
-          },
-          {
-            "role":"clip",
-            "name":"jfk.wav",
-            "sha256":"59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e",
-            "bytes":352078
-          },
-          {
-            "role":"clip",
-            "name":"jfk3.wav",
-            "sha256":"a4d13f9d48ccce40db0621969fdaa39b8bf280e25b9de5eda902decdfe26f484",
-            "bytes":1056078
-          },
-          {
-            "role":"clip",
-            "name":"gb1.wav",
-            "sha256":"b55890c635c795309706aaa40a5c670042d989af43da3512d7e486c989bf0787",
-            "bytes":6359578
-          },
-          {
-            "role":"clip",
-            "name":"hp0.wav",
-            "sha256":"3a7fbe30706a0c6e7184cda0013dc7ddf731f2ea42ba3dd4ff0f64e6e0d93969",
-            "bytes":8745270
-          },
-          {
-            "role":"clip",
-            "name":"hp0x2.wav",
-            "sha256":"43acaa61356b9a51694ebadeb68c4a2512484da1c69da2fba223cc0bb7cba57c",
-            "bytes":17490462
-          }
-        ]
-      },
-      {
-        "engine":"nemo",
-        "backend":"cpu",
-        "flavor":"stock",
-        "box":"m1",
-        "threads":8,
-        "date":"2026-08-03",
-        "cmd":"modules/dasLLAMA/benchmarks/asr/.venv-nemo/bin/python modules/dasLLAMA/benchmarks/asr/canary_qwen_bench.py --threads 8 --reps 2 --wav modules/dasLLAMA/benchmarks/asr/corpus/jfk.wav --wav modules/dasLLAMA/benchmarks/asr/corpus/jfk3.wav --wav modules/dasLLAMA/benchmarks/asr/corpus/gb1.wav --wav modules/dasLLAMA/benchmarks/asr/corpus/hp0.wav --wav modules/dasLLAMA/benchmarks/asr/corpus/hp0x2.wav",
-        "hardware":{
-          "cpu":"Apple M1 Max",
-          "arch":"arm64",
-          "os":"macOS 26.5.2",
-          "perf_cores":8,
-          "total_cores":10,
-          "ram_gb":64,
-          "gpu":"Apple M1 Max (32-core)",
-          "model_id":"MacBookPro18,2"
-        },
-        "tests":{
-          "asr:jfk.wav":{
-            "ms":8096.7979999999998,
-            "audio_s":11
-          },
-          "asr:jfk3.wav":{
-            "ms":22049.776000000002,
-            "audio_s":33
-          },
-          "asr:gb1.wav":{
-            "ms":41200.745000000003,
-            "audio_s":199
-          }
-        },
-        "workload":"asr",
-        "source":"official",
-        "versions":"nemo 3.1.0+06312c963 / torch 2.12.1",
-        "exec_fmt":"bf16",
-        "files":[
-          {
-            "role":"clip",
-            "name":"jfk.wav",
-            "sha256":"59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e",
-            "bytes":352078
-          },
-          {
-            "role":"clip",
-            "name":"jfk3.wav",
-            "sha256":"a4d13f9d48ccce40db0621969fdaa39b8bf280e25b9de5eda902decdfe26f484",
-            "bytes":1056078
-          },
-          {
-            "role":"clip",
-            "name":"gb1.wav",
-            "sha256":"b55890c635c795309706aaa40a5c670042d989af43da3512d7e486c989bf0787",
-            "bytes":6359578
-          },
-          {
-            "role":"clip",
-            "name":"hp0.wav",
-            "sha256":"3a7fbe30706a0c6e7184cda0013dc7ddf731f2ea42ba3dd4ff0f64e6e0d93969",
-            "bytes":8745270
-          },
-          {
-            "role":"clip",
-            "name":"hp0x2.wav",
-            "sha256":"43acaa61356b9a51694ebadeb68c4a2512484da1c69da2fba223cc0bb7cba57c",
-            "bytes":17490462
-          }
-        ]
-      }
-    ],
-    "arch":"Canary-Qwen 2.5B",
-    "size_bytes":3447348864
-  },
-  {
     "gguf":"gemma-4-E2B-it-Q8_0.gguf",
     "runs":[
       {
@@ -4933,7 +4767,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "asr:jfk.wav":{
@@ -5026,7 +4860,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "asr:jfk.wav":{
@@ -5099,7 +4933,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "pp512":{
@@ -5146,7 +4980,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "pp512":{
@@ -5193,7 +5027,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "pp512":{
@@ -5240,7 +5074,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "asr:jfk.wav":{
@@ -5333,7 +5167,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "pp512":{
@@ -5374,7 +5208,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "pp512":{
@@ -5415,7 +5249,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "pp512":{
@@ -5820,7 +5654,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "asr:jfk.wav":{
@@ -5918,7 +5752,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "asr:jfk.wav":{
@@ -5995,7 +5829,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "asr:jfk.wav":{
@@ -6100,7 +5934,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "asr:jfk.wav":{
@@ -6205,7 +6039,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "asr:jfk.wav":{
@@ -6285,7 +6119,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "pp512":{
@@ -6331,7 +6165,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "pp512":{
@@ -6372,7 +6206,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "pp512":{
@@ -6418,7 +6252,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "pp512":{
@@ -6459,7 +6293,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "pp512":{
@@ -6505,7 +6339,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "pp512":{
@@ -6556,7 +6390,7 @@
           "ram_gb":64,
           "gpu":"Apple M1 Max (32-core)",
           "model_id":"MacBookPro18,2",
-          "remote_desktop":"parsec"
+          "remote_desktop":"off"
         },
         "tests":{
           "img:enc":{

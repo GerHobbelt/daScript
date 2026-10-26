@@ -115,7 +115,7 @@ jobs:
         # The workflow file itself is a build input (it carries the configure flags
         # for web/build64 below), so hash it too — a change to the build steps must
         # miss a stale cache rather than skip the rebuild and reuse old archives.
-        key: wasm-${{ runner.os }}-${{ hashFiles('.github/workflows/pages.yml', 'CMakeLists.txt', 'web/CMakeLists.txt', 'web/stage_playground_imgui_samples.cmake', 'src/**', 'include/**', 'modules/**', 'daslib/**', 'utils/daspkg/**', 'examples/games/**', 'examples/graphics/**', 'examples/pathTracer/**', 'web/examples/ui/samples/**', 'tutorials/**', 'dastest/**') }}
+        key: wasm-${{ runner.os }}-${{ hashFiles('.github/workflows/pages.yml', 'CMakeLists.txt', 'web/CMakeLists.txt', 'web/stage_playground_imgui_samples.cmake', 'src/**', 'include/**', 'modules/**', 'daslib/**', 'utils/daslang/**', 'utils/daspkg/**', 'examples/games/**', 'examples/graphics/**', 'examples/pathTracer/**', 'web/examples/ui/samples/**', 'tutorials/**', 'dastest/**') }}
 
     # Host daslang — one games-capable build (dasLLVM for cross-compile + dasGlfw
     # + dasOpenGL shared modules for the games) that serves BOTH das2rst and the
@@ -571,7 +571,8 @@ jobs:
         cp site-dasllama/robots.txt _site_dasllama/
         cp site-dasllama/sitemap.xml _site_dasllama/
         cp site-dasllama/feed.xml _site_dasllama/
-        cp site-dasllama/files/* _site_dasllama/files/
+        # -R: files/ now carries subdirectories (files/fonts/); a bare * would fail on them
+        cp -R site-dasllama/files/. _site_dasllama/files/
 
         # Shared visual language, staged from the daslang.io tree — single source
         # in the repo, mirrored by site-dasllama/serve.py for local preview.

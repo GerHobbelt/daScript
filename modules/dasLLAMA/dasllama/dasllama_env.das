@@ -132,6 +132,15 @@ struct public GpuTierEnv {
     @clarg_doc = "Device-side routed MoE combine; 0 falls back to the host combine."
     gpu_combine : bool = true
 
+    @clarg_doc = "Split each STREAMED expert layer's prefill between the GPU (the experts it can stream in the CPU's time) and the CPU (the rest, concurrently); 0 streams whole layers."
+    gpu_moe_split : bool = true
+
+    @clarg_doc = "Decode FFN tail: a resident expert layer's FFN carries the combine, the residual and the next layer's attention feed on the device, so the two submits share one fence wait; 0 collects every FFN on the host."
+    gpu_dec_tail : bool = true
+
+    @clarg_doc = "Whole-token decode span: every resident expert layer's attention, router, top-k, FFN and combine as ONE recorded chain and one submit per token; 0 runs the per-layer submits."
+    gpu_dec_span : bool = true
+
     @clarg_default_doc = "0"
     @clarg_doc = "Expert heat threshold: hold the N hottest experts resident regardless of layer placement."
     gpu_heat : Option<int64>
@@ -175,6 +184,12 @@ struct public MetalEnv {
     @clarg_doc = "Serve tower/embedder encodes on the Metal tower driver - the gemma4uv chain, the gemma4v ViT and gemma3v SigLIP block loops (their exact-plane lanes), the whisper-class block loops, and the conv frontends (whisper im2col + the qwen3a conv2d, which serves the q8 default); 0 pins the CPU tower."
     tower : bool = true
 
+    @clarg_doc = "Serve the qwen3v tower's block/merger GEMMs from the image's baked f16 twin plane on the crowned tensor mul_mm twins (the mint bakes the twin only for f16-sourced GEMMs, so it holds the file's own values; needs a tensor crown - a box without one, or an image without the plane, keeps the f32 route); 0 pins the f32 GEMM route - the A/B rail."
+    tower_f16 : bool = true
+
+    @clarg_doc = "Serve head-72 tower attention at %64 canvases on the lifted flash kernel (no score slab, no rowstat pass, no head restrides - the gemma3v-geometry ViTs); 0 pins the three-pass slab - the A/B rail."
+    tower_flash : bool = true
+
     @clarg_doc = "Serve the whisper decoder side (cross-KV; the decode step under wdec_step) on the Metal ASR-decoder driver; 0 pins the CPU decoder."
     wdec : bool = true
 
@@ -193,12 +208,28 @@ struct public MetalEnv {
     @clarg_doc = "GEMV-tail prefill dispatch: npos % 32 in [1,8] peels the last M tile's real rows onto the fixed-B GEMV family instead of billing a full 32-row tile; 0 pins the padded-tile path (the A/B rail)."
     mm_tail : bool = true
 
+    @clarg_doc = "Fused prefill qk_norm+rope pass (one panel rewrite, q panel dual-stores its f16 twin); 0 restores the split norm/rope/cvt dispatches (the A/B rail)."
+    qk_rope : bool = true
+
+    @clarg_doc = "1-D-grid tall hmm GEMM twin: the threadgroup launch order is forced linear (M-fastest) instead of the driver's 2-D walk; experiment rail, off by default."
+    grid1d : bool = false
+
+    @clarg_doc = "Last-layer FFN tail narrowing: the final dense layer's FFN runs the last row alone (only the classifier reads past the final attention); 0 pins the full-panel tail (the A/B rail). Session keep_hidden opts a forward out."
+    lastrow : bool = true
+
+    @clarg_doc = "Double-buffered W staging on the dense staged prefill GEMMs (q8 and kq stamps; the MoE family measured a loss and stays single-tile): two ping-pong tiles, one barrier per 64-chunk, staging overlaps the tensor op; 0 pins the single-tile forms (the A/B rail)."
+    dbuf : bool = true
+
     @clarg_default_doc = "~4 layers/chunk"
     @clarg_doc = "Command-buffer split: each chunk commits as encoded so the scheduler overlaps chunk k with k-1."
     ncb : int = 0
 
     @clarg_doc = "Skip per-dispatch retain/release on the prefill command buffers."
     unretained : bool = false
+
+    @clarg_default_doc = "0 (off)"
+    @clarg_doc = "MB budget for RESIDENT dev-W f16 panels: static weights dequantize ONCE and the panels persist across forwards (vs the per-forward scratch re-dequant). Sites past the budget fall back to scratch."
+    devw_resident : int = 0
 
     @clarg_doc = "Record each prefill chunk as a step graph and replay on a concurrent encoder; 0 is serial-encode rollback."
     pf_capture : bool = true
@@ -280,10 +311,10 @@ struct public MetalEnv {
 
 // ===== Vulkan backend =====
 
-[EnvConfig(env_prefix = "DASLLAMA")]
+[EnvConfig(env_prefix = "DASLLAMA"), arch(at="../ARCHITECTURE_RUNTIME.md#env-knobs")]
 struct public VulkanEnv {
     @clarg_default_doc = "auto"
-    @clarg_doc = "Cooperative-matrix mode; the flash-attention twin needs it even when the GEMM runs sdot4."
+    @clarg_doc = "Cooperative-matrix mode (auto = cm2 where the device has NV_cooperative_matrix2, else mm, else sdot4); the flash-attention twin needs it even when the GEMM runs sdot4."
     coopmat : string = ""
 
     @clarg_default_doc = "32"
@@ -293,7 +324,7 @@ struct public VulkanEnv {
     @clarg_doc = "Small-d cutoff routing narrow roles (k/v) to the small tier; widening measured worse, so this is an instrument."
     mm_smalld : int64 = 64l
 
-    @clarg_doc = "Fused decode tail (add+rms+requant, qk-norm+rope); 0 pins the split dispatches for a same-build A/B."
+    @clarg_doc = "Fused add+rms+requant: the decode tail (plus qk-norm+rope) AND the prefill batch ar+rq pairs; 0 pins the split dispatches for a same-build A/B."
     vk_fuse : bool = true
 
     @clarg_doc = "Stream expert uploads on the dedicated transfer queue, overlapped via a timeline semaphore; 0 keeps the single-queue rail."
@@ -311,6 +342,18 @@ struct public VulkanEnv {
     @clarg_doc = "Vulkan flash attention: the decode fa kernel pick AND the cm2 prefill fa tile; 0 falls back to the chunked/scalar paths."
     vk_fa : bool = true
 
+    @clarg_doc = "Merged k|v prefill GEMM - one dispatch over the adjacent k+v arena planes; 0 pins the split k + v dispatches for a same-build A/B."
+    vk_kv_merge : bool = true
+
+    @clarg_doc = "Prefill record/execute overlap: the window chain submits in ramped chunks (1,2,4,8 layers) so the GPU starts while the CPU still records; 0 pins the single fenced submit (the per-role GPU profile pins it too, so a chunk gap never bills to a role)."
+    vk_overlap : bool = true
+
+    @clarg_doc = "Device-side token-embedding gather for the resident prefill (a tied q8 table gathers from the resident cls plane; a raw f32 table uploads whole under a 512 MB cap); 0 keeps the CPU embed loop."
+    vk_gpu_embed : bool = true
+
+    @clarg_doc = "Pin REQUIRE_FULL_SUBGROUPS on every class pipeline (instrument; measured slower than plain pipelines on the mm_a gate shape, so those are the default)."
+    vk_fullsg : bool = false
+
     @clarg_doc = "Use a ReBAR device-local host-visible heap when one larger than 1GB is present."
     vk_rebar : bool = true
 
@@ -326,6 +369,10 @@ struct public VulkanEnv {
     @clarg_path
     @clarg_doc = "Directory of <kernel>.spv files served instead of the emitted words at pipeline creation (offline spirv-opt / hand-patched A/B instrument)."
     vk_spv_override : string = ""
+
+    @clarg_path
+    @clarg_doc = "Directory to write each kernel's emitted words as <kernel>.spv at pipeline creation (the override instrument's capture half)."
+    vk_spv_dump : string = ""
 
     @clarg_doc = "Barrier at every dispatch (correctness bisect)."
     vk_hazard_paranoid : bool = false
@@ -653,10 +700,10 @@ struct public ExampleEnv {
 
 [EnvConfig(env_prefix = "DASLLAMA")]
 struct public ExchangeEnv {
-    @clarg_doc = "Sidecar exchange base URL override (tests, mirrors); unset = the baked-in dasllama.io."
+    @clarg_doc = "Sidecar exchange base URL override (tests, mirrors); unset = the baked-in dasllama.io. Setting it is an expressed choice to use the exchange - the first-contact consent question is skipped (announced at boot)."
     exchange_url : string = ""
 
-    @clarg_doc = "One-shot exchange accept-policy override: verified | any | off; unset = the app config's exchange_accept. The watchdog arms 'any' on a relaunch when the user adopts an unverified sidecar over finishing a tune."
+    @clarg_doc = "One-shot exchange accept-policy override: verified | any | off; unset = the app config's exchange_accept. The watchdog arms 'any' on a relaunch when the user adopts an unverified sidecar over finishing a tune. Setting it is an expressed choice to use the exchange - the first-contact consent question is skipped (announced at boot)."
     exchange_accept : string = ""
 }
 

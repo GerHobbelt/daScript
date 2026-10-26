@@ -301,6 +301,8 @@ namespace das {
     DAS_API int32_t jobque_trace_marker_name ( const char * name, Context * context, LineInfoArg * at );
     DAS_API void jobque_trace_marker ( int32_t id, int32_t arg, Context * context, LineInfoArg * at );
     DAS_API void jobque_set_thread_priority ( int32_t level, Context * context, LineInfoArg * at );
+    DAS_API int32_t jobque_get_current_processor ( Context * context, LineInfoArg * at );
+    DAS_API void jobque_set_thread_affinity ( int32_t cpu, bool hard, Context * context, LineInfoArg * at );
     DAS_API void team_parallel_for_invoke ( int32_t rangeBegin, int32_t rangeEnd, int32_t numChunks, Lambda lambda, Func fn, int32_t lambdaSize, Context * context, LineInfoArg * lineinfo );
     DAS_API void team_parallel_for_indexed_invoke ( int32_t rangeBegin, int32_t rangeEnd, int32_t numChunks, Lambda lambda, Func fn, int32_t lambdaSize, Context * context, LineInfoArg * lineinfo );
     DAS_API void team_parallel_stages_invoke ( const TArray<int3> & stages, Lambda lambda, Func fn, int32_t lambdaSize, Context * context, LineInfoArg * lineinfo );
@@ -313,6 +315,10 @@ namespace das {
     DAS_API int getTotalHwThreads ();
     DAS_API int getTotalHwCores ();
     DAS_API void setJobqueThreadsCap ( int32_t cap );
+    DAS_API void setJobqueThreads ( int32_t total );
+    DAS_API int32_t getJobqueThreads ();
+    DAS_API int getTotalPerfCores ();
+    DAS_API bool isSlowTierCompute ();
     DAS_API void withJobStatus ( int32_t total, const TBlock<void,JobStatus *> & block, Context * context, LineInfoArg * lineInfo );
     DAS_API void jobStatusAddRef ( JobStatus * status, Context * context, LineInfoArg * at );
     DAS_API void jobStatusReleaseRef ( JobStatus * & status, Context * context, LineInfoArg * at );

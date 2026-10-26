@@ -34,7 +34,10 @@ An implementation folder - `daslib/`, a module's `daslib/` or engine folder - ho
 besides `REVIEW*.md`, `ARCHITECTURE*.md`, and `LAWS.md` (lint-enforced: `.lint_config`
 `rule_docs_only`). Ledgers and plans live at the module root or in `plans/` (repo root). None
 of these documents installs - the SDK bundle gate bans them; `REVIEW_COMMON.md` and
-`ARCHITECTURE_COMMON.md` at the install root are the two vendoring exceptions.
+`ARCHITECTURE_COMMON.md` at the install root are the two vendoring exceptions, and a shipped
+tree with `[arch]` citations installs a GENERATED excerpt of each cited document (the cited
+sections only, banner-marked; `utils/internal/arch-extract`, registered on `DAS_ARCH_EXTRACT_SPECS`
+beside the tree's install rules) so LINT026 stays armed in an installed SDK.
 
 The mood test routes misplaced text: must/never binding a diff -> REVIEW.md; present-tense
 fact -> ARCHITECTURE.md; dated or past-tense -> /history.
@@ -44,12 +47,12 @@ cites.** MCP `arch_of` returns each of a file's citations with its section text;
 returns a document's anchors with the code citing them, dead anchors and dangling citations
 included. Citation spelling, path resolution, and failure reasons: `skills/mcp_tools.md`.
 
-**An architecture-doc heading that code cites carries the `{#anchor}` its citation names.**
-LINT026 fails a citation naming no such file or anchor, and in a folder whose `.lint_config`
-sets `[docs] enforce_arch = true`, an anchor no `[arch]` cites.
+**An architecture-doc heading that code cites carries the `{#anchor}` its citation names, and
+every anchor is cited.** LINT026 fails a citation naming no such file or anchor, and - in every
+folder, no tag arms it - an anchor no `[arch]` cites. An `[arch]` citation replaces the comment
+that would have restated the section: the mechanism lives in the document, the code names it.
 
-**A `REVIEW*.md` or `ARCHITECTURE*.md` past 300 lines, in a folder whose `.lint_config` sets
-`[docs] rule_docs_only = true` or `[docs] enforce_arch = true`, splits into companions** -
+**A `REVIEW*.md` or `ARCHITECTURE*.md` past 300 lines, wherever it sits, splits into companions** -
 `ARCHITECTURE_<CONCERN>.md` for an architecture doc, a `REVIEW_<KIND>.md` the parent
 checklist's opening routes to for a checklist. LINT027 is the gate; the `archivist` agent
 does the architecture-doc splits.
@@ -159,6 +162,7 @@ Task-specific instructions are split into skill files under `skills/`. You MUST 
 | `skills/daslang/references/queries.md` | Filter/map/sort/group/aggregate transforms - comprehension -> linq_boost -> plain `for`; avoid `daslib/functional` for new code |
 | `skills/decs.md` | Programming with `daslib/decs` / `decs_boost` - entities, components, queries, `[decs_template]`, stages |
 | `skills/internal/aot_hash_desync_debugging.md` | `error[50101]: AOT link failed` - semantic-hash desync diagnostics |
+| `modules/dasLLAMA/CLAUDE.md` | Any work under `modules/dasLLAMA/` - the module's HOW_TO series (`HOW_TO_ADD_A_FORMAT.md` for a new weight format) and its architecture/review set |
 
 Multiple skill files may apply to one task: creating a new daslib module needs `skills/das_formatting.md`, `skills/daslib_modules.md`, and possibly `skills/internal/documentation_rst.md`.
 
@@ -168,7 +172,7 @@ Multiple skill files may apply to one task: creating a new daslib module needs `
 
 New knowledge about daslang syntax, semantics, or conventions - from compiler errors, user corrections, or experimentation - goes into **this file**, or into the relevant `skills/*.md` when it belongs to a skill area.
 
-**Lint opportunities are reportable findings - don't hold back.** When a bug, review note, or probe reveals a pattern a lint rule could catch (especially one that has bitten more than once), SAY SO in the end-of-turn summary and propose the rule to Boris; the suite keeps paying for itself precisely because rules keep getting added. Rules land in `daslib/*_lint.das` (authoring: `skills/internal/perf_lint_authoring.md` / `skills/internal/style_lint_authoring.md`), and the finding's error text must stand on its own - no per-rule doc catalog exists.
+**Lint opportunities are reportable findings - don't hold back.** When a bug, review note, or probe reveals a pattern a mechanical check could catch (especially one that has bitten more than once), SAY SO in the end-of-turn summary and propose the rule to Boris; the suite keeps paying for itself precisely because rules keep getting added. Two landing places: a pattern one folder owns (a module's kernel classes, a test-folder discipline, a fixture-sync invariant) lands as a `REVIEW.das` gate in that folder - folder-local lint, and gate code worth writing shareably; a language- or repo-wide pattern lands in `daslib/*_lint.das` (authoring: `skills/internal/perf_lint_authoring.md` / `skills/internal/style_lint_authoring.md`). Either way the finding's error text must stand on its own - no per-rule doc catalog exists.
 
 **Syntax and factual corrections are fix-in-place, always.** A compiler error, probe, or user correction showing a claim in CLAUDE.md or `skills/*.md` is wrong, incomplete, or stale gets fixed in the same session and flagged in the end-of-turn summary - never deferred to a proposal. Verify first: grammar truth is `src/parser/ds2_parser.ypp`, behavior truth is a probe-compile with the current binary.
 

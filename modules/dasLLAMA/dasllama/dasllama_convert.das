@@ -615,6 +615,47 @@ def dequant_q40_plane_superblock(kq : array<uint8> | #; kqo : int64; ks : array<
     }
 }
 
+//! Transcode one IQ4_XS superblock (136 bytes at `bo`: f16 d, u16 scales_h, 4 scales_l bytes,
+//! 128 nibble bytes) into the iq4xs planes: nibbles verbatim (the disk k/k+16 pairing IS the
+//! q40 tiling), the scale row DECODED — f16 d, 2 pad, 8 x int8 (ls - 32), 8 pad (exact).
+def transcode_iq4xs_superblock(bytes : array<uint8> | #; bo : int64; var kq : array<uint8>; kqo : int64; var ks : array<uint8>; kso : int64) {
+    ks[kso] = bytes[bo]
+    ks[kso + 1l] = bytes[bo + 1l]
+    ks[kso + 2l] = uint8(0)
+    ks[kso + 3l] = uint8(0)
+    let sh = uint(bytes[bo + 2l]) | (uint(bytes[bo + 3l]) << 8u)
+    for (blk in range64(8l)) {
+        let lo = (uint(bytes[bo + 4l + blk / 2l]) >> uint(4l * (blk % 2l))) & 15u
+        let ls = int(lo | (((sh >> uint(2l * blk)) & 3u) << 4u))
+        ks[kso + 4l + blk] = uint8(ls - 32)
+    }
+    for (i in range64(8l)) {
+        ks[kso + 12l + i] = uint8(0)
+    }
+    for (i in range64(128l)) {
+        kq[kqo + i] = bytes[bo + 8l + i]
+    }
+}
+
+//! The signed sub-scale of an iq4xs plane row: byte 4 + blk of the 20B row, read as int8.
+def iq4xs_sc(ks : array<uint8> | #; kso, blk : int64) : int => rd_i8(ks, kso + 4l + blk)
+
+//! Reference dequant of one iq4xs-plane superblock: w = (d * sc) * IQ4NL_LUT[q] per 32-block
+//! (ggml's own float order: dl = d * (ls - 32), then dl * kvalue), q = nibble (low = k, high =
+//! k+16 — the disk pairing, kept verbatim by the transcode).
+def dequant_iq4xs_plane_superblock(kq : array<uint8> | #; kqo : int64; ks : array<uint8> | #; kso : int64; var dst : array<float> | #; doff : int64) {
+    let d = f16_to_f32(rd_u16(ks, kso))
+    let lut = iq4nl_lut()
+    for (blk in range64(8l)) {
+        let dl = d * float(iq4xs_sc(ks, kso, blk))
+        for (l in range64(16l)) {
+            let b = int(kq[kqo + blk * 16l + l])
+            dst[doff + blk * 32l + l] = dl * float(lut[b & 15])
+            dst[doff + blk * 32l + 16l + l] = dl * float(lut[b >> 4])
+        }
+    }
+}
+
 //! Transcode one Q5_1 disk block (24 bytes at `bo`: d f16, m f16, qh u32, 16 nibble bytes) into
 //! the q51 planes — verbatim splits, exact. The per-block array form the tests drive; the bulk
 //! loader (gguf_transcode_q51) runs the same split pointerized and threaded.
@@ -1074,6 +1115,93 @@ def cvt_f32_to_f16_sat(var d : uint16?; s : float const?; n : int64) {
     unsafe {
         for (i in range64(n)) {
             d[i] = uint16(f32_to_f16(clamp(s[i], -65504.0, 65504.0)))
+        }
+    }
+}
+
+//! CPU mirror of the GPU dev-W q8 dequant (MetalDequantQ8H), bit-exact: the scale narrows to
+//! f16 exactly as the blob stores it, the product computes in f32 (exact for half x int8) and
+//! rounds ONCE to f16 — a baked panel equals what the runtime dequant kernel writes
+def devw_dequant_q8_core(qp : int8 const?; sf : float const?; nblk : int64; var dst : float16?) {
+    unsafe {
+        for (b in range64(nblk)) {
+            let sh = float16(clamp(sf[b], -65504.0, 65504.0))
+            let sw = float(sh)
+            for (k in range64(32l)) {
+                dst[b * 32l + k] = float16(sw * float(qp[b * 32l + k]))
+            }
+        }
+    }
+}
+
+//! CPU mirror of the GPU dev-W k4/k5 dequant (MetalDequantK45T), bit-exact: every f32 product
+//! is exact (d*sc <=17 sig bits, dsc*q <=22), so contraction cannot move the one f16 round.
+//! sstride = scale row stride: 20 on the raw transcode temp, 16 on the GPU compact form
+def devw_dequant_k45_core(kq : uint8 const?; ks : uint8 const?; sstride, nsb : int64; qh : bool; var dst : float16?) {
+    let blkw = qh ? 40l : 32l
+    unsafe {
+        for (sb in range64(nsb)) {
+            let sp = reinterpret<float16 const?>(ks + sb * sstride)
+            let sv = reinterpret<uint const?>(ks + sb * sstride)
+            let qp = reinterpret<uint const?>(kq + sb * blkw * 4l)
+            for (jsi in range(8)) {
+                let js = uint(jsi)
+                var sc = 0u
+                var mn = 0u
+                if (js < 4u) {
+                    sc = (sv[1] >> (8u * js)) & 63u
+                    mn = (sv[2] >> (8u * js)) & 63u
+                } else {
+                    let j2 = js - 4u
+                    let hi = sv[3] >> (8u * j2)
+                    sc = (hi & 15u) | (((sv[1] >> (8u * j2 + 6u)) & 3u) << 4u)
+                    mn = ((hi >> 4u) & 15u) | (((sv[2] >> (8u * j2 + 6u)) & 3u) << 4u)
+                }
+                let dsc = float(sp[0]) * float(sc)
+                let dmn = float(sp[1]) * float(mn)
+                for (ei in range(32)) {
+                    let e = uint(ei)
+                    var q = (qp[(js / 2u) * 8u + e / 4u] >> (8u * (e % 4u) + (js & 1u) * 4u)) & 15u
+                    if (qh) {
+                        q |= ((qp[32u + e / 4u] >> (8u * (e % 4u) + js)) & 1u) << 4u
+                    }
+                    dst[sb * 256l + int64(js) * 32l + int64(e)] = float16(dsc * float(q) - dmn)
+                }
+            }
+        }
+    }
+}
+
+//! CPU mirror of the GPU dev-W k6 dequant (MetalDequantK6H), bit-exact: every f32 product is
+//! exact (d*s6 <=18 sig bits, dsc*q <=24), so contraction cannot move the one f16 round.
+//! ks/sstride = 16B sub-scale rows; kd/dstride = f16 d rows (raw temp 18, GPU split form 2)
+def devw_dequant_k6_core(kq : uint8 const?; ks : uint8 const?; sstride : int64; kd : uint8 const?; dstride, nsb : int64; var dst : float16?) {
+    unsafe {
+        for (sb in range64(nsb)) {
+            let dall = float(reinterpret<float16 const?>(kd + sb * dstride)[0])
+            let sbp = ks + sb * sstride
+            let qp = reinterpret<uint const?>(kq + sb * 192l)
+            for (jsi in range(8)) {
+                let js = uint(jsi)
+                let half6 = js / 4u
+                let gg = js % 4u
+                let nsh = (gg / 2u) * 4u
+                let hsh = gg * 2u
+                for (h in range(2)) {
+                    let ile = uint(h)
+                    let si = half6 * 8u + gg * 2u + ile
+                    let s6 = float((int(sbp[si]) ^ 128) - 128)
+                    let dsc = dall * s6
+                    for (ti in range(16)) {
+                        let k = uint(ti) / 4u
+                        let c = uint(ti) % 4u
+                        let u = qp[half6 * 16u + (gg & 1u) * 8u + ile * 4u + k]
+                        let hu = qp[32u + half6 * 8u + ile * 4u + k]
+                        let q = ((u >> (nsh + 8u * c)) & 15u) | (((hu >> (hsh + 8u * c)) & 3u) << 4u)
+                        dst[sb * 256l + int64(js) * 32l + int64(ile) * 16l + int64(ti)] = float16(dsc * (float(q) - 32.0))
+                    }
+                }
+            }
         }
     }
 }

@@ -27,6 +27,7 @@ struct public DlimCpuConfig {
     kq_mr5 : int64
     kq_mr6 : int64
     kq_mr40 : int64
+    kq_mr44 : int64
     q51_mr : int64
     wscale_f16 : bool
     kquant_native : bool
@@ -53,6 +54,7 @@ struct public DlimVulkanConfig {
     dense_attn : bool
     dense_shexp : bool
     trim : bool   //!< P3: big CPU weight families dropped from the image (GPU-resident consumers only)
+    split : bool   //!< the streamed-layer split want: one stream slot instead of two under cm2, so the carve - and the walk - differ
     subgroup_size : int
     max_storage_range : int64
 }
@@ -138,7 +140,7 @@ def public dlim_config_current(quant : string = "q8") : DlimConfiguration {
 def public dlim_identity(c : DlimConfiguration; image_version : int; tag : string = "") : string {
     return ("v{image_version}|{c.quant}|{c.cpu.backend}|{c.cpu.wscale_f16 ? "s16" : "s32"}"
         + "|q8 mr{c.cpu.q8_mr} b{c.cpu.q8_wbias} g{c.cpu.q8_kgroup}"
-        + "|kq {c.cpu.kq_mr4}/{c.cpu.kq_mr5}/{c.cpu.kq_mr6}/{c.cpu.kq_mr40}"
+        + "|kq {c.cpu.kq_mr4}/{c.cpu.kq_mr5}/{c.cpu.kq_mr6}/{c.cpu.kq_mr40}/{c.cpu.kq_mr44}"
         + "|q51 mr{c.cpu.q51_mr}"
         + "|nat {c.cpu.kquant_native ? 1 : 0}{c.cpu.kq_q40_native ? 1 : 0}{c.cpu.kq_q50_native ? 1 : 0}{c.cpu.kq_q51_native ? 1 : 0}"
         + (tag != "" ? "|{tag}" : ""))
@@ -150,7 +152,7 @@ def public dlim_vulkan_tag(v : DlimVulkanConfig) : string {
     return ("vulkan|m{v.coopmat_mode} b{v.vram_mb}"
         + " l{v.moe_layers} s{v.moe_stream}"
         + " r{v.dn ? 1 : 0}{v.attn ? 1 : 0}{v.dnd ? 1 : 0}{v.shexp ? 1 : 0}{v.qkv ? 1 : 0}{v.cls ? 1 : 0}"
-        + "{v.dense ? 1 : 0}{v.dense_attn ? 1 : 0}{v.dense_shexp ? 1 : 0}{v.trim ? " T" : ""}")
+        + "{v.dense ? 1 : 0}{v.dense_attn ? 1 : 0}{v.dense_shexp ? 1 : 0}{v.split ? 1 : 0}{v.trim ? " T" : ""}")
 }
 
 //! Round-trip: the JSON embedded in the image meta and consumed by `dasllama-convert --config`.

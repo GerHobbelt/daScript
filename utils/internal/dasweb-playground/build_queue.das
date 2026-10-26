@@ -50,10 +50,10 @@ def expected_artifact_names(mode : string) : array<string> {
 
 // Require-path roots that force the standalone-page artifact: their native halves
 // (GL context, audio device, image decode) live in emscripten's JS glue, which a
-// bare wasi module cannot carry. strudel and live_stub are here for what they
-// require transitively (audio; a glfw window) — the scan only sees source text.
+// bare wasi module cannot carry. strudel, live and live_host are here for what
+// they require transitively (audio; a glfw window) — the scan only sees source text.
 let private PAGE_REQUIRE_ROOTS : table<string> <- {
-    "glfw", "opengl", "imgui", "audio", "minfft", "stbimage", "clipboard", "strudel", "live_stub"
+    "glfw", "opengl", "imgui", "audio", "minfft", "stbimage", "clipboard", "strudel", "live", "live_host"
 }
 
 def private text_requires_page(text : string) : bool {
@@ -186,6 +186,35 @@ def set_current_toolchain(db : SqlRunner; toolchain : string) {
         db |> _sql_update(type<BuildMeta>, _.MetaKey == "current_toolchain", (MetaValue = toolchain))
     }
     logger_info("playground.build", "current toolchain set", JV((toolchain = toolchain)))
+}
+
+def forget_stale_toolchain_jobs(db : SqlRunner; current_toolchain : string; toolchains_with_artifacts : array<string>; before : int64) : int {
+    //! Drop every job row minted under a toolchain other than current_toolchain
+    //! that has no artifact tree any more and was queued before `before`;
+    //! nothing when no toolchain is announced. A row whose tree still stands
+    //! stays with it, so a roll-back inside the grace period finds its cache
+    //! warm; a builder claims only its own toolchain's jobs, so a row without a
+    //! tree can never run again, and its sample re-enqueues under the current
+    //! toolchain on its next click. Returns the rows removed.
+    if (empty(current_toolchain)) {
+        return 0
+    }
+    let old <- _sql(db |> select_from(type<BuildJob>) |> _where(_.ToolchainId != current_toolchain && _.QueuedAt < before))
+    var treeless : table<string>
+    for (row in old) {
+        if (find_index(toolchains_with_artifacts, row.ToolchainId) < 0) {
+            treeless |> insert(row.ToolchainId)
+        }
+    }
+    var n = 0
+    for (toolchain in keys(treeless)) {
+        n += db |> _sql_delete(type<BuildJob>, _.ToolchainId == toolchain && _.QueuedAt < before)
+    }
+    if (n > 0) {
+        logger_info("playground.build", "stale toolchain jobs removed",
+            JV((current_toolchain = current_toolchain, queued_before = before, jobs = n)))
+    }
+    return n
 }
 
 def private job_rows(db : SqlRunner; hash : string; toolchain : string) : array<BuildJob> {

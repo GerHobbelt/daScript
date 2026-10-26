@@ -6,7 +6,7 @@ module dasllama_common shared public
 
 require dasllama/dasllama_lint public
 require daslib/fio
-require dasllama/dasllama_version public  // DASLLAMA_VERSION — re-exported so the facade chain carries the module's release counter
+require dasllama/dasllama_version public  // DASLLAMA_RELEASE — re-exported so the facade chain carries the module's release counter
 require dasllama/dasllama_env  // the g_env_* knob globals ([EnvConfig] declarations; ENVIRONMENT.md is generated from them)
 require dasllama/dasllama_config  // DlimConfiguration — this module registers the cpu/metal sources
 require dasllama/dasllama_kqformat public   // KqFmt + kq_sb + the stride truth — re-exported so every requirer keeps seeing the enum
@@ -200,8 +200,8 @@ typedef AttnPrefillFn = function<(t : Model; var s : Session; l : int64; npos : 
 typedef FfnPrefillFn  = function<(t : Model; var s : Session; l : int64; npos : int64) : void>
 
 //! A whole-prefill override: claims the ENTIRE per-layer stack of one prefill. On true the KV
-//! cache is filled for every position and x_b holds the final residual stream; false = declined.
-//! Registered by name at [init], activated via select_prefill_override (env rail: DASLLAMA_PIN_PREFILL).
+//! cache is filled for every position; x_b holds the final residual stream at row npos-1 always,
+//! every row only under `Session.keep_hidden` (the Metal lastrow tail narrows). false = declined.
 typedef PrefillOverrideFn = function<(t : Model; var s : Session; npos : int64; start_pos : int64) : bool>
 
 // The prefill-override registry (see PrefillOverrideFn). Name-keyed like the kernel backends;
@@ -280,6 +280,16 @@ def register_ple_gpu_gate(fn : PleGpuGateFn) {
     g_ple_gpu_gate_set = true
 }
 
+typedef EmbedGpuGateFn = function<(t : Model; s : Session; npos : int64; start_pos : int64) : bool>
+var private g_embed_gpu_gate : EmbedGpuGateFn
+var private g_embed_gpu_gate_set = false
+
+[arch(at="../ARCHITECTURE_GPU.md#gpu-backends")]
+def register_embed_gpu_gate(fn : EmbedGpuGateFn) {
+    g_embed_gpu_gate = fn
+    g_embed_gpu_gate_set = true
+}
+
 // ===== gemma-4 PLE pre-step hooks (registered by dasllama_ple at [init]) =====
 // PLE needs Model/Session, so it requires this module back and cannot be required from here — the
 // forward path reaches its per-pass pre-step through these hooks, and the umbrella breaks the cycle.
@@ -320,6 +330,21 @@ def ple_pre_prefill(t : Model; var s : Session; tokens : array<int64>; npos : in
 def ple_pre_prefill_pad(t : Model; var s : Session; npos : int64) {
     if (g_ple_pre_prefill_pad == null) ple_rail_missing()
     invoke(g_ple_pre_prefill_pad, t, s, npos)
+}
+
+//! The embd-prefill twin of the token path's PLE gate: offer the pre-step to the device driver
+//! (pad ids stashed — the media path has no tokens), CPU pad impl on decline. The model_proj
+//! GEMM inside the finish is the whole cost, so an eligible driver must get the offer here too.
+def ple_pre_prefill_pad_gated(t : Model; var s : Session; npos, start_pos : int64) {
+    if (g_ple_gpu_gate_set && invoke(g_ple_gpu_gate, t, s, npos, start_pos)) {
+        s.ple_gpu_tokens |> resize(npos)
+        for (p in range64(npos)) {
+            s.ple_gpu_tokens[p] = 0l
+        }
+        s.ple_gpu_pending = true
+        return
+    }
+    ple_pre_prefill_pad(t, s, npos)
 }
 
 // set by an override that ALSO produced the last position's logits; reset before every invocation
@@ -699,6 +724,7 @@ def public build_decode_rope_row_swa(t : Model; pos : int64; var cos_tab, sin_ta
 
 //! The copyable hot-path block pointers, resolved onto the Model at load and called per layer.
 struct ArchBlocks {
+    std_chain : bool              // OPT-IN: attention AND ffn are the standard chain (attention_std_*, ffn_*_decode) the decode span replaces whole - a custom block never rides it
     attn_decode : AttnDecodeFn
     ffn_decode : FfnDecodeFn
     attn_prefill : AttnPrefillFn
@@ -772,6 +798,12 @@ struct Model {
     // scale strips, k6s the GPU split form. CPU inference on a blob-only model PANICS.
     mblob : array<uint8>
     metal_blob : bool = false
+    //! Baked dev-W f16 panels (metal flavor): bound zero-copy by the prefill dev-W route; empty = runtime dequant
+    devwf16 : array<float16>
+    devwf16_fmt : array<int>
+    devwf16_key : array<int64>
+    devwf16_off : array<int64>   // site's ELEM offset into devwf16
+    devwf16_n : array<int64>     // site's element count
     // P3-trimmed image: the big CPU weight families are EMPTY (GPU-resident consumers only);
     // embed reads embq/embs, re-gathers must slice from vkblob, CPU fallbacks fail closed
     planes_trimmed : bool = false
@@ -803,6 +835,9 @@ struct Model {
     // the q51 tier's plane pair, per 32-BLOCK: 20B nibbles+qh / 4B f16 d+m (never repacked)
     q51q : array<uint8>
     q51s : array<uint8>
+    // the iq4xs tier's plane pair: 128B nibbles in the q40 tiling + a 20B decoded scale row per superblock
+    iq4xsq : array<uint8>
+    iq4xss : array<uint8>
     kquant_native : bool = false
     // kq stage 4: the kq planes were repacked at load into the active backend's grp<mr> layout.
     // From then on every kq matmul MUST run the backend slots — disk-order portable kernels would
@@ -813,6 +848,7 @@ struct Model {
     kq_repack_mr5 : int64 = 4l
     kq_repack_mr6 : int64 = 4l
     kq_repack_mr40 : int64 = 4l
+    kq_repack_mr44 : int64 = 4l
     // per-layer weight format tags (KqFmt; empty = all q8). Filled by detect_kq_formats before
     // layout_offsets so the layout walks each tensor into its format's cursor.
     wq_fmt : array<KqFmt>
@@ -1276,7 +1312,8 @@ def private apply_i64_knob(rt : JsonValue const?; key : string; blk : block<(v :
 //! Apply the runtime knobs from the app tune sidecar's optional "runtime" section (see
 //! tune_for_this_box.md): token block, L2 budget, threading thresholds, chunk multipliers, and an
 //! optional kernel-backend pin. Missing/STALE file or missing section = no-op; every applied entry logs.
-def apply_box_profile_runtime(path : string = "") {
+[arch(at="../ARCHITECTURE_RUNTIME.md#hybrid-pool-policy")]
+def apply_box_profile_runtime(path : string = "") {   // nolint:STYLE038 — a flat knob catalog; a split would invent seams
     if (path == "" && box_profile_stale()) {
         to_log(LOG_INFO, "dasLLAMA: tune sidecar is older than the binary - runtime knobs not applied (re-tune)\n")
         return
@@ -1312,12 +1349,20 @@ def apply_box_profile_runtime(path : string = "") {
     apply_i64_knob(rt, "kq_q40_native") $(v) { set_kq_q40_native(v != 0l) }
     apply_i64_knob(rt, "kq_q50_native") $(v) { set_kq_q50_native(v != 0l) }
     apply_i64_knob(rt, "noisy") $(v) { set_dasllama_noisy(v != 0l) }
-    apply_i64_knob(rt, "gemv_lane_cap") $(v) { set_gemv_lane_cap(int(min(v, 2147483647l))) }
+    apply_i64_knob(rt, "gemv_lane_cap") $(v) {
+        if (v != 0l || !is_slow_tier_compute()) {
+            set_gemv_lane_cap(int(min(v, 2147483647l)))
+        } else {
+            to_log(LOG_INFO, "dasLLAMA: sidecar gemv_lane_cap = 0 is the pre-hybrid \"uncapped\" mint - keeping the fast-tier cap {get_gemv_lane_cap()}\n")
+        }
+    }
     apply_i64_knob(rt, "batch_lane_cap") $(v) { set_batch_lane_cap(int(min(v, 2147483647l))) }
     apply_i64_knob(rt, "batch_grid_2d") $(v) { set_batch_grid_2d(int(min(v, 2l))) }
     apply_i64_knob(rt, "dispatch_worker_limit") $(v) { set_dispatch_worker_limit_(int(min(v, 2147483647l))) }
     apply_i64_knob(rt, "gemv_wave_fill") $(v) { set_gemv_wave_fill(v != 0l) }
     apply_i64_knob(rt, "fused_decode") $(v) { set_fused_decode(v != 0l) }
+    apply_i64_knob(rt, "jobque_pool") $(v) { set_jobque_threads(int(min(v, 2147483647l))) }
+    apply_i64_knob(rt, "phase_decode_workers") $(v) { set_phase_decode_workers(int(min(v, 2147483647l))) }
     // stored only — the queue may not exist yet; setup_dasllama_jobque applies these inside with_job_que
     apply_i64_knob(rt, "jobque_spin_us") $(v) { set_jobque_spin_us(v) }
     apply_i64_knob(rt, "jobque_join_poll") $(v) { set_jobque_join_poll(v) }
@@ -1326,9 +1371,11 @@ def apply_box_profile_runtime(path : string = "") {
     apply_i64_knob(rt, "metal_devw_small_panel_mb") $(v) { set_metal_devw_small_panel_mb(v) }
     apply_i64_knob(rt, "metal_cvt_min_rows") $(v) { set_metal_cvt_min_rows(v) }
     let mtc = read_json_field(rt, "metal_tensor", "")
-    if (mtc != "") {
+    if (mtc != "" && !g_tensor_crowns_pinned) {
         set_metal_tensor_crowns(mtc)
         to_log(LOG_INFO, "dasLLAMA: box profile runtime: metal_tensor crowns = {mtc}\n")
+    } elif (mtc != "") {
+        to_log(LOG_INFO, "dasLLAMA: box profile metal_tensor crowns NOT applied - pinned via pin_metal_tensor_crowns\n")
     }
     let be = read_json_field(rt, "backend", "")
     if (be != "") {
@@ -1412,6 +1459,7 @@ def private dlim_cpu_source_impl(var c : DlimCpuConfig) {
     c.kq_mr5 = active_kq_layout_mr(5)
     c.kq_mr6 = active_kq_layout_mr(6)
     c.kq_mr40 = active_kq_layout_mr(40)
+    c.kq_mr44 = active_kq_layout_mr(44)
     c.q51_mr = active_q51_layout_mr()
     // OUTCOME, not request: a backend without s16 twins keeps f32 scale planes (wscale_convert_f16)
     c.wscale_f16 = g_wscale_f16 && kernel_backend_has_wscale16()
@@ -1504,7 +1552,7 @@ def kq_active_mr(t : Model; f : KqFmt) : int64 {
     if (!t.kq_repacked) {
         return 1l
     }
-    return f == KqFmt.k4 ? t.kq_repack_mr4 : (f == KqFmt.k5 ? t.kq_repack_mr5 : (f == KqFmt.k6 ? t.kq_repack_mr6 : t.kq_repack_mr40))
+    return f == KqFmt.k4 ? t.kq_repack_mr4 : (f == KqFmt.k5 ? t.kq_repack_mr5 : (f == KqFmt.k6 ? t.kq_repack_mr6 : (f == KqFmt.q40 ? t.kq_repack_mr40 : t.kq_repack_mr44)))
 }
 
 //! Load a llama-architecture GGUF into the split layout at the requested precision — straight into
@@ -1676,6 +1724,9 @@ struct Session {
     // holds (0 = never resident-prefilled); hydrated = host KV has been read back since
     rdec_gen : int64
     rdec_hydrated : bool
+    dat_gen : int64             // the per-op decode attention block's mirror generation this session claimed (0 = none)
+    tail_next1 : int64          // 1 + the layer whose resident FFN may take the decode tail this token (0 = none)
+    tail_taken : bool           // the tail took this layer's FFN: the residual add is the device's
     kv_signs : array<float>   // tq4 rotation signs (±1, max head_size; smaller heads use a prefix)
     key_cache : array<uint8>
     value_cache : array<uint8>
@@ -1687,6 +1738,8 @@ struct Session {
     // grown on demand by kv_ensure. Flat sessions: kv_pool == null, block_table empty.
     @do_not_delete kv_pool : KVPool?   // borrowed — the pool outlives its sessions
     block_table : array<int>
+    //! set by a caller that reads the whole x_b plane after a prefill: every row of the last layer's FFN tail
+    keep_hidden : bool
     // batched prefill scratch — empty until forward_prefill sizes them to npos × ... (see forward_prefill)
     x_b : array<float>        // residual stream (npos x dim)
     xb_b : array<float>       // rmsnorm / attention out (npos x dim)
@@ -1791,6 +1844,14 @@ struct Session {
     @scratch moe_hs : array<float>       // bucket hidden requant scales (same / 32)
     @scratch @exact_size moe_gout : array<float>     // bucket (then shared-expert) down-projection output (npos x dim)
     @scratch @exact_size moe_eout : array<float>     // routed expert outputs parked by (position, slot) (npos x k x dim)
+    // the streamed-layer split (GPU streams+computes the LPT head of the regions, the CPU the tail, concurrently)
+    @scratch moe_offs1_cpu : array<int64>   // the CPU tail of the gate/up/down region triples
+    @scratch moe_offs3_cpu : array<int64>
+    @scratch moe_offs2_cpu : array<int64>
+    @scratch moe_w_gpu : array<float>      // routing weights with the CPU slots zeroed (the GPU combine's plane)
+    @scratch moe_w_cpu : array<float>      // ... and with the GPU slots zeroed (the CPU reduce's)
+    @scratch moe_exp_gpu : array<int8>   // per expert: 1 = this layer's GPU share (n_expert)
+    @scratch @exact_size moe_gpu_out : array<float>  // the GPU half's combined rows (npos x dim), joined after the CPU half
     ffn_offs : array<int64>     // dense/shexp gate+up fuse: 2 region (weight, activation) offset pairs
     ffn_gu : array<float>       // dense/shexp gate+up fuse output — gate half then up half (2 x max_ffn_width)
     mx4_wq : array<int8>        // grouped-prefill expansion of ONE native-MXFP4 expert to exact Q8 (dim x n_ff_exp)
@@ -1803,6 +1864,8 @@ struct Session {
     @scratch ple_gate : array<float>     // per-(position) gate vector for the layer block (npos x ple)
     @scratch ple_gpu_tokens : array<int64>  // stashed token rows for a driver-owned pre-step (see register_ple_gpu_gate)
     ple_gpu_pending : bool      // forward_prefill skipped the CPU pre-step — the engaged driver builds it
+    @scratch embed_gpu_tokens : array<int64>
+    embed_gpu_pending : bool
     // qwen35 deltanet recurrent state (persists across tokens; zeroed at position 0) + scratch.
     // Empty unless config.recr_mask != 0. State is forward-only — dn_pos guards against rewind.
     dn_pos : int64                 // the next position the deltanet stack expects
@@ -2096,6 +2159,26 @@ def public metal_tensor_crowned(family : string) : bool {
     return key_exists(g_tensor_crowns, family)
 }
 
+//! The comma-list form of the current crowns — what a cell captures to restore on exit.
+def public get_metal_tensor_crowns : string {
+    let fams <- [for (f in keys(g_tensor_crowns)); f]
+    return join(fams, ",")
+}
+
+var private g_tensor_crowns_pinned = false
+
+//! Test-cell latch: a crown set that SURVIVES loads (each load re-applies the box profile's
+//! crowns, so a bare setter cannot hold a lane across one). Pin BEFORE the load - image
+//! flavor and PSO builds key on it; `unpin_metal_tensor_crowns` + a setter restore entry state.
+def public pin_metal_tensor_crowns(list : string) {
+    set_metal_tensor_crowns(list)
+    g_tensor_crowns_pinned = true
+}
+
+def public unpin_metal_tensor_crowns {
+    g_tensor_crowns_pinned = false
+}
+
 // ===== Metal prefill raced constants (sidecar "runtime" knobs; prefill caches at its init) =====
 
 //! Defaults are the M5 race winners; another box's sidecar overrides without a rebuild.
@@ -2191,6 +2274,23 @@ def rms_at(var o : array<float> | #; t : Model; woff : int64; x : array<float>; 
     unsafe {
         rmsnorm(addr < float? >(o[0]), addr < float const? >(x[xoff]),
             addr < float const? >(t.fblob[woff]), size, t.config.norm_eps)
+    }
+}
+
+//! Threaded residual add over a batch: d[0..n) += s[0..n) in row blocks - a serial add_inplace walks
+//! the whole window on one lane behind a GEMM that used them all. Same per-element op and order.
+def add_batch(var d : float?; s : float const?; n : int64) {
+    let blk = 65_536l
+    let nblk = int((n + blk - 1l) / blk)
+    unsafe {
+        maybe_parallel_for(n >= g_norm_par_threshold, 0, nblk, get_dispatch_lanes()) $(bb, be) {
+            unsafe {
+                for (b in range(bb, be)) {
+                    let j0 = int64(b) * blk
+                    add_inplace(d + j0, s + j0, min(blk, n - j0))
+                }
+            }
+        }
     }
 }
 
@@ -3190,7 +3290,7 @@ def mm_b_q51_groupn(var y : array<float>; t : Model; offs : array<int64>; nregio
 // KqFmt -> the kernel-layer format id (matmul_kq*/kq_rows_fn/kq_qsb take the int form). q8 maps
 // to 0, a poison id no kq kernel accepts — kq_rows_for calls this for EVERY tag, so it must stay
 // total even though q8 branches never read the result.
-def private kq_fi(fmt : KqFmt) : int => fmt == KqFmt.k4 ? 4 : (fmt == KqFmt.k5 ? 5 : (fmt == KqFmt.k6 ? 6 : (fmt == KqFmt.q40 ? 40 : 0)))
+def private kq_fi(fmt : KqFmt) : int => fmt == KqFmt.k4 ? 4 : (fmt == KqFmt.k5 ? 5 : (fmt == KqFmt.k6 ? 6 : (fmt == KqFmt.q40 ? 40 : (fmt == KqFmt.iq4xs ? 44 : 0))))
 
 // K-quant GEMV against a PRE-quantized activation (xq/xs/xbs already filled by the bs quantizer).
 // kq_repacked loads run the backend's stamped cores; disk-order loads run the portable kernels.
@@ -3204,6 +3304,8 @@ def mm_at_kq_pre(var y : array<float>; t : Model; fmt : KqFmt; woff : int64; xq 
             matmul_kq_active(6, y, t.k6q, t.k6s, woff, xq, xs, xbs, n, d, yoff)
         } elif (fmt == KqFmt.q40) {
             matmul_kq_active(40, y, t.q40q, t.q40s, woff, xq, xs, xbs, n, d, yoff)
+        } elif (fmt == KqFmt.iq4xs) {
+            matmul_kq_active(44, y, t.iq4xsq, t.iq4xss, woff, xq, xs, xbs, n, d, yoff)
         } else {
             panic("mm_at_kq_pre: '{fmt}' has no kq plane pair")   // a new KqFmt must claim its arm, never ride q40's
         }
@@ -3215,6 +3317,8 @@ def mm_at_kq_pre(var y : array<float>; t : Model; fmt : KqFmt; woff : int64; xq 
         matmul_kq(6, y, t.k6q, t.k6s, woff, xq, xs, xbs, n, d, yoff)
     } elif (fmt == KqFmt.q40) {
         matmul_kq(40, y, t.q40q, t.q40s, woff, xq, xs, xbs, n, d, yoff)
+    } elif (fmt == KqFmt.iq4xs) {
+        matmul_kq(44, y, t.iq4xsq, t.iq4xss, woff, xq, xs, xbs, n, d, yoff)
     } else {
         panic("mm_at_kq_pre: '{fmt}' has no kq plane pair")
     }
@@ -3246,6 +3350,8 @@ def mm_b_kq(var s : Session; var y : array<float>; t : Model; fmt : KqFmt; woff 
             matmul_kq_batch(6, y, t.k6q, t.k6s, woff, s.xqb, s.xsb, s.xbsb, n, d, npos)
         } elif (fmt == KqFmt.q40) {
             matmul_kq_batch(40, y, t.q40q, t.q40s, woff, s.xqb, s.xsb, s.xbsb, n, d, npos)
+        } elif (fmt == KqFmt.iq4xs) {
+            matmul_kq_batch(44, y, t.iq4xsq, t.iq4xss, woff, s.xqb, s.xsb, s.xbsb, n, d, npos)
         } else {
             panic("mm_b_kq: '{fmt}' has no kq plane pair")
         }
@@ -3273,6 +3379,8 @@ def mm_at_kq_groupn(var y : array<float>; t : Model; fmt : KqFmt; offs : array<i
             matmul_kq_groupn_active(6, y, t.k6q, t.k6s, offs, nregions, xq, xs, xbs, n, d)
         } elif (fmt == KqFmt.q40) {
             matmul_kq_groupn_active(40, y, t.q40q, t.q40s, offs, nregions, xq, xs, xbs, n, d)
+        } elif (fmt == KqFmt.iq4xs) {
+            matmul_kq_groupn_active(44, y, t.iq4xsq, t.iq4xss, offs, nregions, xq, xs, xbs, n, d)
         } else {
             panic("mm_at_kq_groupn: '{fmt}' has no kq plane pair")
         }
@@ -3284,6 +3392,8 @@ def mm_at_kq_groupn(var y : array<float>; t : Model; fmt : KqFmt; offs : array<i
         matmul_kq_groupn(6, y, t.k6q, t.k6s, offs, nregions, xq, xs, xbs, n, d)
     } elif (fmt == KqFmt.q40) {
         matmul_kq_groupn(40, y, t.q40q, t.q40s, offs, nregions, xq, xs, xbs, n, d)
+    } elif (fmt == KqFmt.iq4xs) {
+        matmul_kq_groupn(44, y, t.iq4xsq, t.iq4xss, offs, nregions, xq, xs, xbs, n, d)
     } else {
         panic("mm_at_kq_groupn: '{fmt}' has no kq plane pair")
     }
@@ -3300,6 +3410,8 @@ def mm_b_kq_groupn(var y : array<float>; t : Model; fmt : KqFmt; offs : array<in
         matmul_kq_batch_groupn(6, y, t.k6q, t.k6s, offs, nregions, xq, xs, xbs, n, d)
     } elif (fmt == KqFmt.q40) {
         matmul_kq_batch_groupn(40, y, t.q40q, t.q40s, offs, nregions, xq, xs, xbs, n, d)
+    } elif (fmt == KqFmt.iq4xs) {
+        matmul_kq_batch_groupn(44, y, t.iq4xsq, t.iq4xss, offs, nregions, xq, xs, xbs, n, d)
     } else {
         panic("mm_b_kq_groupn: '{fmt}' has no kq plane pair")
     }
@@ -3318,6 +3430,8 @@ def mm_b_kq_pre(var y : array<float>; t : Model; fmt : KqFmt; woff : int64; xq :
         matmul_kq_batch(6, y, t.k6q, t.k6s, woff, xq, xs, xbs, n, d, ntok)
     } elif (fmt == KqFmt.q40) {
         matmul_kq_batch(40, y, t.q40q, t.q40s, woff, xq, xs, xbs, n, d, ntok)
+    } elif (fmt == KqFmt.iq4xs) {
+        matmul_kq_batch(44, y, t.iq4xsq, t.iq4xss, woff, xq, xs, xbs, n, d, ntok)
     } else {
         panic("mm_b_kq_pre: '{fmt}' has no kq plane pair")
     }
@@ -3330,6 +3444,7 @@ def kq_plane_q(t : Model; fmt : KqFmt; woff : int64) : uint8 const? {
     if (fmt == KqFmt.k5) return unsafe(addr<uint8 const?>(t.k5q[sb * K5_QSB]))
     if (fmt == KqFmt.k6) return unsafe(addr<uint8 const?>(t.k6q[sb * K6_QSB]))
     if (fmt == KqFmt.q40) return unsafe(addr<uint8 const?>(t.q40q[sb * Q40_QSB]))
+    if (fmt == KqFmt.iq4xs) return unsafe(addr<uint8 const?>(t.iq4xsq[sb * IQ4XS_QSB]))
     return null
 }
 
@@ -3339,6 +3454,7 @@ def kq_plane_s(t : Model; fmt : KqFmt; woff : int64) : uint8 const? {
     if (fmt == KqFmt.k5) return unsafe(addr<uint8 const?>(t.k5s[sb * K5_SSB]))
     if (fmt == KqFmt.k6) return unsafe(addr<uint8 const?>(t.k6s[sb * K6_SSB]))
     if (fmt == KqFmt.q40) return unsafe(addr<uint8 const?>(t.q40s[sb * Q40_SSB]))
+    if (fmt == KqFmt.iq4xs) return unsafe(addr<uint8 const?>(t.iq4xss[sb * IQ4XS_SSB]))
     return null
 }
 
@@ -3699,6 +3815,8 @@ def embed_row(t : Model; token : int64; var dst : float?) {   // nolint:STYLE037
                         dequant_kq_row_grp(fmt, addr(t.embq[sbg * K6_QSB]), addr(t.embs[sbg * K6_SSB]), token % mr, mr, dim, dst)
                     } elif (t.emb_fmt == KqFmt.q40) {
                         dequant_kq_row_grp(fmt, addr(t.embq[sbg * Q40_QSB]), addr(t.embs[sbg * Q40_SSB]), token % mr, mr, dim, dst)
+                    } elif (t.emb_fmt == KqFmt.iq4xs) {
+                        dequant_kq_row_grp(fmt, addr(t.embq[sbg * IQ4XS_QSB]), addr(t.embs[sbg * IQ4XS_SSB]), token % mr, mr, dim, dst)
                     } else {
                         panic("embed_row: '{t.emb_fmt}' has no kq plane pair")
                     }
@@ -3710,6 +3828,8 @@ def embed_row(t : Model; token : int64; var dst : float?) {   // nolint:STYLE037
                     dequant_kq_row_grp(fmt, addr(t.k6q[sbg * K6_QSB]), addr(t.k6s[sbg * K6_SSB]), token % mr, mr, dim, dst)
                 } elif (t.emb_fmt == KqFmt.q40) {
                     dequant_kq_row_grp(fmt, addr(t.q40q[sbg * Q40_QSB]), addr(t.q40s[sbg * Q40_SSB]), token % mr, mr, dim, dst)
+                } elif (t.emb_fmt == KqFmt.iq4xs) {
+                    dequant_kq_row_grp(fmt, addr(t.iq4xsq[sbg * IQ4XS_QSB]), addr(t.iq4xss[sbg * IQ4XS_SSB]), token % mr, mr, dim, dst)
                 } else {
                     panic("embed_row: '{t.emb_fmt}' has no kq plane pair")
                 }
@@ -3732,6 +3852,8 @@ def embed_row(t : Model; token : int64; var dst : float?) {   // nolint:STYLE037
                             dequant_k6_plane_superblock(t.embq, (sb0 + s) * K6_QSB, t.embs, (sb0 + s) * K6_SSB, row, s * 256l)
                         } elif (t.emb_fmt == KqFmt.q40) {
                             dequant_q40_plane_superblock(t.embq, (sb0 + s) * Q40_QSB, t.embs, (sb0 + s) * Q40_SSB, row, s * 256l)
+                        } elif (t.emb_fmt == KqFmt.iq4xs) {
+                            dequant_iq4xs_plane_superblock(t.embq, (sb0 + s) * IQ4XS_QSB, t.embs, (sb0 + s) * IQ4XS_SSB, row, s * 256l)
                         } else {
                             panic("embed_row: '{t.emb_fmt}' has no kq plane pair")
                         }
@@ -3747,6 +3869,8 @@ def embed_row(t : Model; token : int64; var dst : float?) {   // nolint:STYLE037
                         }
                     } elif (t.emb_fmt == KqFmt.q40) {
                         dequant_q40_plane_superblock(t.q40q, (sb0 + s) * Q40_QSB, t.q40s, (sb0 + s) * Q40_SSB, row, s * 256l)
+                    } elif (t.emb_fmt == KqFmt.iq4xs) {
+                        dequant_iq4xs_plane_superblock(t.iq4xsq, (sb0 + s) * IQ4XS_QSB, t.iq4xss, (sb0 + s) * IQ4XS_SSB, row, s * 256l)
                     } else {
                         panic("embed_row: '{t.emb_fmt}' has no kq plane pair")
                     }
@@ -3863,6 +3987,7 @@ def private cls_softcap_chain(t : Model; var s : Session; cap : float) {
 def forward(t : Model; var s : Session; token, pos : int64) {   // nolint:STYLE038 — one decode step; the phases share s and must stay in order
     let c = t.config
     let dim = c.dim
+    dispatch_phase_decode()
     kv_ensure(s, pos + 1l)   // paged sessions: grow the block table BEFORE any cache-pointer hoist
 
     // token embedding: row `token` into the residual stream
@@ -4714,7 +4839,7 @@ def attn_out_suffix(t : Model; var s : Session; l : int64; npos : int64) {
 // The GPU arm shared by the std and gated prefill blocks: the whole attention block (GEMMs,
 // qk-norm, rope, flash-style attention, wo) as one device chain per window; norm, activation
 // image, KV-store, and residual stay CPU. Numerics: GPU f32 tile accumulation — drift-class vs CPU flash.
-[no_alloc, no_env, no_io]
+[no_alloc, no_env, no_io, arch(at="../ARCHITECTURE_GPU.md#gpu-backends")]
 def forward_prefill(t : Model; var s : Session; tokens : array<int64>; npos, start_pos : int64; skip_logits : bool = false) {
     let c = t.config
     if (npos <= 0l) {
@@ -4726,6 +4851,9 @@ def forward_prefill(t : Model; var s : Session; tokens : array<int64>; npos, sta
         }
         return
     }
+    if (npos >= 32l) {
+        dispatch_phase_batch()
+    }
     let ts_alloc = prof_ticks()
     kv_ensure(s, start_pos + npos)   // paged sessions: grow the block table BEFORE any cache-pointer hoist
     forward_prefill_alloc(t, s, npos, start_pos)
@@ -4734,11 +4862,20 @@ def forward_prefill(t : Model; var s : Session; tokens : array<int64>; npos, sta
     // token embeddings -> residual stream x_b [npos x dim]
     let dim = c.dim
     let ts_embed = prof_ticks()
-    for (p in range64(npos)) {
-        embed_row(t, tokens[p], unsafe(addr(s.x_b[p * dim])))
-    }
-    if (c.embed_scale != 1.0) {  // Gemma2: scale the embedding by sqrt(dim)
-        scale_inplace(unsafe(addr(s.x_b[0])), c.embed_scale, npos * dim)
+    if (g_embed_gpu_gate_set && invoke(g_embed_gpu_gate, t, s, npos, start_pos)) {
+        s.embed_gpu_tokens |> resize(npos)
+        for (p in range64(npos)) {
+            s.embed_gpu_tokens[p] = tokens[p]
+        }
+        s.embed_gpu_pending = true
+    } else {
+        s.embed_gpu_pending = false
+        for (p in range64(npos)) {
+            embed_row(t, tokens[p], unsafe(addr(s.x_b[p * dim])))
+        }
+        if (c.embed_scale != 1.0) {  // Gemma2: scale the embedding by sqrt(dim)
+            scale_inplace(unsafe(addr(s.x_b[0])), c.embed_scale, npos * dim)
+        }
     }
     prof_add("embed", ts_embed)
     if (has_ple(c)) {  // gemma-4 E-series: build each position's per-(layer) side input before the stack
@@ -4957,16 +5094,39 @@ def private prefill_rope_tables(t : Model; var s : Session; npos, start_pos : in
     prof_add("rope_build", ts_rope_build)   // one-time cos/sin table build (separate bucket)
 }
 
+[arch(at="../ARCHITECTURE_GPU.md#gpu-backends")]
+def private embed_backfill_cpu(t : Model; var s : Session; npos : int64) {
+    let ts_embed = prof_ticks()
+    let dim = t.config.dim
+    for (p in range64(npos)) {
+        embed_row(t, s.embed_gpu_tokens[p], unsafe(addr(s.x_b[p * dim])))
+    }
+    if (t.config.embed_scale != 1.0) {
+        scale_inplace(unsafe(addr(s.x_b[0])), t.config.embed_scale, npos * dim)
+    }
+    s.embed_gpu_pending = false
+    prof_add("embed", ts_embed)
+}
+
 // the shared prefill core: rope table + layer stack + final norm/classifier, over a pre-filled
 // s.x_b residual stream (token or embedding sourced)
+[arch(at="../ARCHITECTURE_GPU.md#gpu-backends")]
+// the decode block's mirrors: ONE claim per prefill, after every window and layer; the tier mints
+// only when a window filled a mirror, and 0 says keep your own generation
+def private prefill_claim_mirrors(var s : Session) {
+    let dat_gen = moe_gpu_attn_dec_claim(false)
+    if (dat_gen != 0l) {
+        s.dat_gen = dat_gen
+    }
+}
+
 def forward_prefill_body(t : Model; var s : Session; npos, start_pos : int64; skip_logits : bool = false) {
     let c = t.config
     let dim = c.dim
     prefill_rope_tables(t, s, npos, start_pos)
 
     // an active whole-prefill override may claim the entire stack (false = decline, fall back
-    // to the CPU loop); a claimer must honor s.attn_uniform_end (metal: AttnArgs.uend). An
-    // mrope quantum serves only on a per-row-table roper (metal); others decline it loudly.
+    // to the CPU loop); a claimer must honor s.attn_uniform_end (metal: AttnArgs.uend)
     var stack_done = false
     g_prefill_logits_done = false
     if (!empty(g_prefill_override_name) && !empty(s.mrope_pos) && !active_prefill_serves_mrope()) {
@@ -4977,6 +5137,9 @@ def forward_prefill_body(t : Model; var s : Session; npos, start_pos : int64; sk
         stack_done = invoke(g_prefill_override, t, s, npos, start_pos)
     }
     if (!stack_done) {
+        if (s.embed_gpu_pending) {
+            embed_backfill_cpu(t, s, npos)
+        }
         if (s.ds_active && s.wide_src != null) {   // the wide borrow was for an override that declined
             let ts_split = prof_ticks()
             ds_split_quantum(t, s, npos)
@@ -5031,4 +5194,5 @@ def forward_prefill_body(t : Model; var s : Session; npos, start_pos : int64; sk
         s.logits[id] = -1.0e30
     }
     prof_add("final", ts_final)
+    prefill_claim_mirrors(s)
 }

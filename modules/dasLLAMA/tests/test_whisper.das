@@ -20,8 +20,10 @@ require math
 require strings
 require _model_tier   // model_available() presence/size-tier gate (see the file's header)
 require dasllama/dasllama_env
+require daslib/strings_boost   // split_by_chars — the crowned word-level cell's normalizer
 require ?das_metal dasllama/dasllama_metal_asr_dec   // set_metal_wdec — the CPU-claim cells pin the GPU cross-KV hook off
 require ?das_metal dasllama/dasllama_metal_tower     // set_metal_tower — the mtmd-oracle cells pin the GPU conv hook off
+require ?das_metal dasllama/dasllama_metal_prefill   // metal_prefill_shutdown — the crown-pin cell drops the trio's cached flags
 
 // Whisper-proper tests. The f16/gelu/mel/id tests are self-contained; the loader and
 // transcription tests need a whisper.cpp ggml-tiny.bin (gitignored) and skip without it.
@@ -278,7 +280,7 @@ def test_qwen3a_tower(t : T?) {
         }
         set_qwen3a_q8(false)
         var inscope tw <- load_qwen3a_tower(path)
-        set_qwen3a_q8(true)
+        reset_qwen3a_q8()
         t |> equal(tw.core.d_model, 896l, "d_model")
         t |> equal(tw.core.n_layer, 18l, "layers")
         t |> equal(tw.core.n_head, 14l, "heads")
@@ -564,6 +566,18 @@ def test_whisper_tower_fp32_knob(t : T?) {
             t |> skip("jfk.wav not present")
             return
         }
+        // token-identity between two GPU lanes is pinned to the SIMDGROUP kernel set: the
+        // envelope-verified tensor crowns (attn_qkmm here) round differently and flip
+        // whisper-tiny tokens; the crowned lane's transcription quality is the board
+        // pregate's claim, not this cell's. Pinned BEFORE the loads - the baked-image
+        // flavor and the PSO builds both key on the crown set.
+        let prev_crowns = get_metal_tensor_crowns()
+        pin_metal_tensor_crowns("")
+        static_if (typeinfo builtin_module_exists(das_metal)) {
+            metal_tower_shutdown()      // earlier cells built PSOs and latched crown flags -
+            metal_wdec_shutdown()       // every driver the encode rides rebuilds under the pin
+            metal_prefill_shutdown()    // the attention trio's crown flags cache at prefill init
+        }
         set_asr_tower_fp32(true)
         var inscope mm <- load_asr_model(model_path)
         set_asr_tower_fp32(false)
@@ -604,8 +618,121 @@ def test_whisper_tower_fp32_knob(t : T?) {
             }
             t |> success(mismatches == 0, "q8-default/mixed token-identical ({mismatches}/{total} flips)")
         }
+        unpin_metal_tensor_crowns()
+        set_metal_tensor_crowns(prev_crowns)
+        static_if (typeinfo builtin_module_exists(das_metal)) {
+            metal_tower_shutdown()
+            metal_wdec_shutdown()
+            metal_prefill_shutdown()
+        }
         delete m
         delete mm
+    }
+}
+
+// lowercase word list, punctuation dropped - the grade the crowned lane answers to
+def private word_forms(text : string) : array<string> {
+    let lowered = to_lower(text)
+    let norm = build_string() $(w) {
+        peek_data(lowered) $(d) {
+            for (b in d) {
+                let c = int(b)
+                w |> write(is_alnum(c) ? to_char(c) : " ")
+            }
+        }
+    }
+    return <- [for (w in split_by_chars(norm, " ")); w; where !empty(w)]
+}
+
+def private word_flips(a, b : array<string>) : int {
+    var flips = 0
+    for (x, y in a, b) {
+        if (x != y) {
+            flips++
+        }
+    }
+    return flips
+}
+
+[test]
+def test_whisper_crowned_word_level(t : T?) {
+    t |> run("the CROWNED lanes agree at word level on jfk (the crowned-pipeline quality gate)") @(t : T?) {
+        static_if (typeinfo builtin_module_exists(das_metal)) {
+            if (!jit_enabled()) {
+                t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
+                return
+            }
+            let model_path = path_join(whisper_models_dir(), "ggml-tiny.bin")
+            if (!model_available(t, model_path)) return
+            let samples <- read_wav_pcm16_mono(path_join(samples_dir(), "jfk.wav"))
+            if (empty(samples)) {
+                t |> skip("jfk.wav not present")
+                return
+            }
+            // the tolerance-graded twin of the strict cell above: crowns pinned ON, the
+            // pipeline serves whatever crowned variants the box readies, and the bar is
+            // WORD equality - rounding drift that flips a token or a comma passes, a
+            // garbled kernel on the mixed lane's route does not. Per-VARIANT dispatch
+            // witnesses (kcov row asserts) are followup 60's stronger form - tiny's hs=64
+            // attention may not take the tensor QK route at all
+            set_metal_tower(true)
+            set_metal_wdec(true)
+            set_metal_wdec_step(true)
+            set_metal_wdec_step_min_d(0l)   // tiny sits under the step's serving floor - the census's same seat
+            let prev_crowns = get_metal_tensor_crowns()
+            pin_metal_tensor_crowns("attn_qkmm,mulmm_bf16,mulmm_q8,gemmb_q8,gemmb_sk_q8,gemm64b_q8,kq_mulmm_k4,kq_mulmm_k5,kq_mulmm_k6")
+            metal_tower_shutdown()
+            metal_wdec_shutdown()
+            metal_prefill_shutdown()
+            set_asr_tower_fp32(true)
+            var inscope mm <- load_asr_model(model_path)
+            set_asr_tower_fp32(false)
+            var inscope m <- load_asr_model(model_path)
+            let s0 = metal_tower_stats()
+            let w0 = metal_wdec_stats()
+            with_job_que() {
+                setup_dasllama_jobque_()
+                var inscope s <- create_session(m)
+                var text_default = ""
+                transcribe(m, s, samples) $(seg) {
+                    text_default = "{text_default}{seg.text} "
+                }
+                var inscope sm <- create_session(mm)
+                var text_mixed = ""
+                transcribe(mm, sm, samples) $(seg) {
+                    text_mixed = "{text_mixed}{seg.text} "
+                }
+                to_log(LOG_INFO, "whisper-tiny crowned q8 jfk eyeball: '{text_default}'\n")
+                to_log(LOG_INFO, "whisper-tiny crowned f32/q8 jfk eyeball: '{text_mixed}'\n")
+                // engage witness - without it a declining driver would compare two CPU
+                // transcripts and pass vacuously. The q8-default ENCODER declines the tower
+                // by design (quant_mode), so the tower delta is the mixed lane's f32 encode
+                // alone; both DECODERS ride the crowned wdec
+                t |> equal(metal_tower_stats().encodes - s0.encodes, 1l,
+                           "the mixed lane's f32 encoder GPU-served (tower encode delta)")
+                t |> success(metal_wdec_stats().steps - w0.steps > 0l,
+                             "the crowned decoder served (wdec step delta)")
+                let wa <- word_forms(text_default)
+                let wb <- word_forms(text_mixed)
+                t |> success(!empty(wa) && !empty(wb), "both crowned lanes produced words")
+                t |> equal(length(wa), length(wb), "word count agrees across crowned lanes")
+                let flips = word_flips(wa, wb)
+                t |> equal(flips, 0, "crowned lanes word-identical ({flips}/{length(wa)} word flips)")
+            }
+            unpin_metal_tensor_crowns()
+            set_metal_tensor_crowns(prev_crowns)
+            metal_tower_shutdown()
+            metal_wdec_shutdown()
+            metal_prefill_shutdown()
+            set_metal_tower(true)   // restore: the defaults later cells' GPU-serving claims see
+            set_metal_wdec(true)
+            set_metal_wdec_step(true)
+            set_metal_wdec_step_min_d(1024l)   // the measured serving floor (the declaration default)
+            delete m
+            delete mm
+        } else {
+            t |> skip("das_metal not built - the crowned lanes cannot serve here")
+        }
     }
 }
 
@@ -798,5 +925,51 @@ def test_qwen3omni_audio_oracle(t : T?) {
                  9972, 13, 7684, 3729, 13, 151645])
         }
         set_asr_kv(KVDtype.f16)   // back to the serving default
+    }
+}
+
+[test]
+def test_mel_state_reuse_deterministic(t : T?) {
+    t |> run("gemma4a/canary log-mel is bit-identical across calls on one reused state") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let wav = path_join(corpus_dir(), "jfk.wav")
+        let samples <- read_wav_pcm16_mono(wav)
+        if (empty(samples)) {
+            t |> skip("jfk.wav not present in the asr corpus")
+            return
+        }
+        let g4a_path = path_join(samples_dir(), "mmproj-gemma-4-E2B-it-bf16.gguf")
+        if (model_available(t, g4a_path)) {
+            var inscope enc <- load_gemma4a_encoder(g4a_path)
+            var st = Gemma4aState()
+            gemma4a_log_mel(enc, samples, 0l, long_length(samples), st)
+            var mel1 := st.mel
+            gemma4a_log_mel(enc, samples, 0l, long_length(samples), st)
+            var md = 0.0
+            for (a, b in mel1, st.mel) {
+                md = max(md, abs(a - b))
+            }
+            t |> success(md == 0.0, "gemma4a mel maxdiff across state reuse is 0 (got {md})")
+            delete mel1
+            delete st
+        }
+        let cn_path = path_join(samples_dir(), "canary-qwen-2.5b-encoder-f32.bin")
+        if (model_available(t, cn_path)) {
+            var inscope cenc <- load_canary_encoder(cn_path)
+            var cst = CanaryState()
+            canary_log_mel(cenc, samples, cst)
+            var cmel1 := cst.mel
+            canary_log_mel(cenc, samples, cst)
+            var cmd = 0.0
+            for (a, b in cmel1, cst.mel) {
+                cmd = max(cmd, abs(a - b))
+            }
+            t |> success(cmd == 0.0, "canary mel maxdiff across state reuse is 0 (got {cmd})")
+            delete cmel1
+            delete cst
+        }
     }
 }

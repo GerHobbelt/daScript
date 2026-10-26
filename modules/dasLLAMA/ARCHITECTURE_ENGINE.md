@@ -2,16 +2,33 @@
 
 Companion to `ARCHITECTURE.md`; section numbers are that document's.
 
+`REVIEW.das`'s `check_exe_fn_global_restore` walks every `dasllama/` file and licenses no
+names: each `var g_x = @@fn` declaration carries an `if (g_x == null)` boot-restore guard in
+the same file - a serialized exe restores globals as data, and only a boot-restore `[init]`
+heals the null function value.
+
+`REVIEW.das`'s `check_race_bind_numbers` walks every `dasllama/` file: each hand-written
+`kn_buffer`/`kn_kargs` literal in a race or knockout arm lands on a binding number its
+target kernel class declares (the class resolves from the arm's `kn_tgmem` constant - with
+or without the kernel's own `_msl` suffix - or from `kn_pipeline`'s pso built by
+`pipeline_from_source` in the same function; a `@uniform` slot legitimately takes a 4-byte
+buffer). The licensed residue is exactly the arms whose pso or tgmem arrives as a FUNCTION
+PARAMETER (the parameterized race helpers) - those the check cannot resolve textually and
+stay the reviewer's. A mis-numbered arm dispatches, reads the wrong buffer, and
+`race_envelope_ok` fails closed - the twin silently loses its crown.
+
 ### 1.1 Engine core
 
 - **`dasllama.das`** - the public API facade and nothing else: `load_model` -> `create_session` ->
   generate, re-exported names, the doc surface. No engine logic; a function that does work belongs
   in the module that owns the concern, and the facade re-exports it.
-- **`dasllama_version.das`** - `DASLLAMA_VERSION`, the module's own release counter, and nothing
-  else. Decoupled from the daslang version and from `LLVM_JIT_CODEGEN_VERSION`; ANY kernel work
-  bumps it (REVIEW.md), so equal versions mean an equal kernel roster - the sidecar exchange
-  keys validity on (version, box). A zero-require leaf so the tuner's noise half, the benches,
-  and the facade chain (`dasllama_common` re-exports it) all reach it without weight.
+- **`dasllama_version.das`** - `DASLLAMA_RELEASE`, the module's release number, and nothing
+  else. Decoupled from the daslang version, `LLVM_JIT_CODEGEN_VERSION` and `IMAGE_VERSION`;
+  bumped only on a declared release (REVIEW.md), so tune sidecars and board rows live for a
+  whole release - the sidecar exchange keys validity on (release, box), under the
+  schema-stable wire name `dasllama_version`. A zero-require leaf so the tuner's noise half,
+  the benches, and the facade chain (`dasllama_common` re-exports it) all reach it without
+  weight.
 - **`dasllama_common.das`** - the engine: `Model`/`Session`/`Config`, the forward loops, the
   override registries, the runtime knobs. **Not** the load walk (sec.1.3) and **not** GPU residency
   (`ARCHITECTURE_GPU.md` sec.1.5) - both left, and the seam each left behind is a registered hook,
@@ -190,8 +207,12 @@ file builds an `ArchDesc` (name * `configure` * the `ArchBlocks` fn-ptr quad * `
   (record stores + tune sidecars); the dasllama.io ladder service builds on it.
 - **`dasllama/dasllama_exchange.das`** - the sidecar-exchange client (a sanctioned public entry point): the boot-time
   lookup/apply (llvm_tune's scope resolver - a verified per-box match downloads instead of a
-  ~20-minute tune), the privacy-stripped submit rails, and the control-page surface
-  dasllama-server serves at `/exchange`.
+  ~12-minute tune), the privacy-stripped submit rails, and the control-page surface
+  dasllama-server serves at `/exchange`. The first-contact consent gate (GDPR) sits ahead of
+  every lookup: an explicit `exchange_*` config counts as the expressed choice, otherwise the
+  `<stem>.consent` sidecar-sibling file governs - unset asks on a real terminal, or emits
+  `@sidecar consent state=needed` for the watchdog dialog / control page, and no request
+  leaves until a surface records "accepted".
 - **`benchmarks/asr/mem_census.sh`** - the peak-memory census (`/usr/bin/time -l` around one
   asr_bench process per cell; macOS only) - the interim footprint instrument until a footprint
   leg lands in `gen_bench_records`; its numbers live in `PERF_LEDGER.md`, never the stores.

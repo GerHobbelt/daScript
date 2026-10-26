@@ -3,6 +3,9 @@
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture doc:
 `README.md`. Planned work: `plans/dasllama_io_site.md`.
 
+In this checklist "a page" means every served page in this directory - index.html,
+ladder.html, sidecars.html - the generated news region inside index.html included.
+
 **A shell command, flag, or output line shown on a page is a defect unless the command runs
 verbatim and produces the result the page shows.** Never show a command for an
 implementation that does not exist yet.
@@ -10,20 +13,24 @@ implementation that does not exist yet.
 **A code sample shown on a page that does not compile and run with the current toolchain is
 a defect.**
 
-**A number shown on a page is a defect unless it is rendered from live data, copied from a
-checked-in measurement record, or carries an HTML comment naming it a placeholder.**
+**A number shown on a page whose source is not identifiable from the page itself is a
+defect: rendered from live data, or a page comment / prose clause naming the checked-in
+measurement record (or the box, date and measurement - or naming it a placeholder).**
 
-**A claim in words on index.html that one engine beats another ("beats", "Nx faster than",
-"fastest") is a defect, the generated news region included.** Figures copied from a
-checked-in record may stand side by side, ours and another engine's - the arithmetic a
-reader does is not the page's claim.
+**A comparative superiority claim made in words rather than as side-by-side figures, on any
+page, is a defect.** Figures copied from a checked-in record may stand side by side, ours
+and another engine's - the arithmetic a reader does is not the page's claim.
 
 **Copy or rendering that lets a row with no reference engine's figure imply parity with a
 reference engine is a defect - an empty ratio cell reads "not raced".**
 
-**A new `dl-*` CSS rule in any file under this directory is a defect** - the `dl-*`
-measurement-table styles live only in `site/files/dasllama-table.css`, and site chrome here
-uses the `dio-` prefix in `files/dasllama-io.css`.
+**A `dl-*` selector that `site/files/dasllama-table.css` (repo root) does not already
+define, declared in any file under this directory, is a defect** - site chrome here uses the
+`dio-` prefix in `files/dasllama-io.css`, and the `dl-*` measurement-table language is that
+shared sheet's.
+
+**A statement on a page here about what a shipped tool does is a defect unless it matches
+the current code.**
 
 **A claim in a `_news/*.md` entry that is not true at publish time is a defect, including a
 claim about what a page here renders - check that one against the page's markup and
@@ -40,3 +47,7 @@ quoted-attribute values, `Number(...)` for anything numeric, and `safeApiHref()`
 
 **A page that lacks `<title>`, a meta description, OpenGraph tags, or the Atom `<link>` is a
 defect - a new or renamed page included.**
+
+**A diff that adds a file under `files/` also verifies the dasllama.io deploy step
+(`.github/workflows/pages.yml`, "Stage dasllama.io for deployment") stages it, in the same
+change.** Local preview serves the tree directly, so a staging miss is invisible until deploy.

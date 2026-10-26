@@ -1018,6 +1018,7 @@ include/daScript/misc/platform.h
 include/daScript/misc/vectypes.h
 include/daScript/misc/arraytype.h
 include/daScript/misc/rangetype.h
+include/daScript/misc/float2string.h
 include/daScript/misc/string_writer.h
 include/daScript/misc/type_name.h
 include/daScript/misc/memory_model.h
@@ -1043,6 +1044,7 @@ src/misc/globals.cpp
 src/misc/hal.cpp
 src/misc/sysos.cpp
 src/misc/string_writer.cpp
+src/misc/luau_float2string.cpp
 src/misc/memory_model.cpp
 src/misc/job_que.cpp
 src/misc/handle_registry.cpp
@@ -1586,6 +1588,11 @@ if (NOT ${DAS_TOOLS_DISABLED})
     install(FILES ${DASLIB_SOURCES}
         DESTINATION ${DAS_INSTALL_DASLIBDIR}
     )
+    # daslib carries [arch] citations; its architecture docs never install, so the
+    # bundle gets generated excerpts of the cited sections (rules at the registry
+    # processor, above the rule-doc leak gate).
+    set_property(GLOBAL APPEND PROPERTY DAS_ARCH_EXTRACT_SPECS
+        "daslib|daslib|${DAS_INSTALL_DASLIBDIR}")
 
     file(GLOB DASTEST_SOURCES
         ${PROJECT_SOURCE_DIR}/dastest/*.das
@@ -1695,6 +1702,7 @@ SET(DAS_RELEASE_MISC_INCLUDE
     include/daScript/misc/runtime_table_utils.h
     include/daScript/misc/safebox.h
     include/daScript/misc/smart_ptr.h
+    include/daScript/misc/float2string.h
     include/daScript/misc/string_writer.h
     include/daScript/misc/sysos.h
     include/daScript/misc/type_name.h
@@ -1933,6 +1941,7 @@ install(FILES ${PROJECT_SOURCE_DIR}/include/dag_noise/LICENSE DESTINATION ${DAS_
 install(FILES ${PROJECT_SOURCE_DIR}/include/vecmath/LICENSE DESTINATION ${DAS_INSTALL_DOCDIR} RENAME VEC_MATH.LICENSE)
 install(FILES ${PROJECT_SOURCE_DIR}/3rdparty/fmt/LICENSE DESTINATION ${DAS_INSTALL_DOCDIR} RENAME FMT.LICENSE)
 install(FILES ${PROJECT_SOURCE_DIR}/include/fast_float/LICENSE DESTINATION ${DAS_INSTALL_DOCDIR} RENAME FAST_FLOAT.LICENSE)
+install(FILES ${PROJECT_SOURCE_DIR}/src/misc/LUAU.LICENSE DESTINATION ${DAS_INSTALL_DOCDIR} RENAME LUAU.LICENSE)
 
 # utils/internal/ never installs — the folder is the audience decision
 # (machine-checked by utils/REVIEW.das).
@@ -2312,10 +2321,53 @@ if(NOT ${DAS_TREE_SITTER_DISABLED})
     )
 endif()
 
+# Generated architecture excerpts: shipped .das trees carry [arch] citations, and the
+# documents they cite never install (the gate below), so each tree registered on the
+# DAS_ARCH_EXTRACT_SPECS global property gets a build-time excerpt - the cited sections
+# only, extracted by utils/internal/arch-extract - installed beside the code. Registration happens
+# where the tree's install rules live (root daslib above, modules in their own CMakeLists);
+# each entry is "<scan root>|<base>|<install destination>". The excerpts
+# are what keep LINT026 armed in an installed SDK: every shipped citation resolves, and
+# every shipped excerpt anchor is cited. Cross-compiling skips extraction (the freshly
+# built daslang cannot run) - such bundles simply carry no excerpts.
+get_property(_arch_specs GLOBAL PROPERTY DAS_ARCH_EXTRACT_SPECS)
+if(_arch_specs AND NOT ${DAS_TOOLS_DISABLED} AND NOT CMAKE_CROSSCOMPILING)
+    foreach(_spec IN LISTS _arch_specs)
+        string(REPLACE "|" ";" _parts "${_spec}")
+        list(GET _parts 0 _scan)
+        list(GET _parts 1 _base)
+        list(GET _parts 2 _dest)
+        # keyed by base, not list position: a registry reorder must not repoint a
+        # stale output dir at a different spec's install rule
+        string(REPLACE "/" "_" _arch_id "${_base}")
+        set(_out ${CMAKE_BINARY_DIR}/arch_extract/${_arch_id})
+        set(_arch_deps "")
+        foreach(_s IN LISTS _scan)
+            file(GLOB_RECURSE _sfiles ${PROJECT_SOURCE_DIR}/${_s}/*.das)
+            list(APPEND _arch_deps ${_sfiles})
+        endforeach()
+        # cited docs sit in the scanned folder or on the path up to the base root
+        file(GLOB _bdocs ${PROJECT_SOURCE_DIR}/${_base}/*.md ${PROJECT_SOURCE_DIR}/${_base}/*/*.md)
+        list(APPEND _arch_deps ${_bdocs})
+        add_custom_command(OUTPUT ${_out}.stamp
+            COMMAND $<TARGET_FILE:daslang> ${PROJECT_SOURCE_DIR}/utils/internal/arch-extract/main.das --
+                --out ${_out} --root ${PROJECT_SOURCE_DIR} --base ${_base} ${_scan}
+            COMMAND ${CMAKE_COMMAND} -E touch ${_out}.stamp
+            DEPENDS daslang
+                ${PROJECT_SOURCE_DIR}/utils/internal/arch-extract/main.das
+                ${PROJECT_SOURCE_DIR}/utils/common/arch_citations.das
+                ${_arch_deps}
+            COMMENT "arch-extract: ${_base}")
+        add_custom_target(arch_extract_${_arch_id} ALL DEPENDS ${_out}.stamp)
+        install(DIRECTORY ${_out}/${_base}/ DESTINATION ${_dest})
+    endforeach()
+endif()
+
 # Repo-internal rule-and-record documents never install: REVIEW.md / REVIEW.das,
-# ARCHITECTURE.md, LAWS.md, MASTERPLAN logs, followup/perf/profile ledgers. The two
+# ARCHITECTURE.md, LAWS.md, MASTERPLAN logs, followup/perf/profile ledgers. The
 # exceptions are REVIEW_COMMON.md and ARCHITECTURE_COMMON.md at the install root
-# (adopting repos vendor from them). This must stay the LAST install rule in the
+# (adopting repos vendor from them), and the arch-extract excerpts registered above,
+# recognized by their first-line banner. This must stay the LAST install rule in the
 # root CMakeLists so the manifest it checks is complete.
 install(CODE "set(_das_docdir \"${DAS_INSTALL_DOCDIR}\")")
 install(CODE [[
@@ -2335,7 +2387,13 @@ install(CODE [[
                 OR _name MATCHES "^followup_.*\.md$")
             AND NOT _f_abs STREQUAL _root_common
             AND NOT _f_abs STREQUAL _root_arch_common)
-            list(APPEND _review_leaks "${_f}")
+            set(_head "")
+            if(EXISTS "${_f_abs}")
+                file(READ "${_f_abs}" _head LIMIT 64)
+            endif()
+            if(NOT _head MATCHES "^<!-- GENERATED by arch-extract")
+                list(APPEND _review_leaks "${_f}")
+            endif()
         endif()
     endforeach()
     if(_review_leaks)

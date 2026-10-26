@@ -45,6 +45,14 @@ def test_catalog_table(t : T?) {
         }
         t |> equal(defaults, 1, "exactly one recommended default")
         t |> success(count >= 5, "curated list shrank: {count} entries, expected at least 5")
+        // presence pins: a floor alone would let a whole card vanish green
+        for (want in ["gemma-4-e2b", "qwen3.8-27b", "qwen3-vl-4b", "qwen2.5-omni-3b"]) {
+            var found = false
+            for (e in model_catalog()) {
+                found ||= e.name == want
+            }
+            t |> success(found, "curated card '{want}' is on the roster")
+        }
     }
     t |> run("every vision tower resolves pinned, and the default model carries one") @(t : T?) {
         var towers = 0
@@ -211,5 +219,22 @@ def test_state_json(t : T?) {
         }
         remove(planted)
         rmdir(dir)
+    }
+}
+
+[test]
+def test_fixture_path_normalization(t : T?) {
+    t |> run("the captured catalog fixtures carry only normalized paths") @(t : T?) {
+        // pins capture_catalog.das's normalize_paths ON ITS ARTIFACTS: every path value in
+        // a committed fixture is the windows convention, never a capture box's local path
+        for (fx in ["catalog_idle", "catalog_downloading", "catalog_done"]) {
+            let text = fread("utils/dasllama-server/tests/fixtures/{fx}.json")
+            t |> success(!empty(text), "{fx}.json reads")
+            t |> success(find(text, "C:\\\\Users\\\\user\\\\.dasllama\\\\models") >= 0,
+                         "{fx}: the normalized models dir is present")
+            for (leak in ["/var/folders/", "/tmp/", "/Users/", "/home/"]) {
+                t |> success(find(text, "\"{leak}") < 0, "{fx}: no machine-local path ({leak})")
+            }
+        }
     }
 }

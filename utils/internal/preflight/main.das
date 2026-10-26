@@ -56,7 +56,7 @@ struct Config {
     clang : string
 
     @clarg_short = "j"
-    @clarg_doc = "Parallel width for the C++ syntax pass; 0 = hardware threads"
+    @clarg_doc = "Parallel width for the C++ syntax pass and cmake builds; 0 = hardware threads"
     jobs : int
 
     @clarg_doc = "Per-user preflight TOML (default: platform config directory)"
@@ -436,6 +436,44 @@ def private all_digits(s : string) : bool {
         }
     }
     return ok
+}
+
+def gate_review_md(ctx : PreflightCtx) : GateResult {
+    let t0 = ref_time_ticks()
+    let r = run_argv([ctx.daslang, "utils/internal/review-md/main.das", "--", "--base", ctx.base])
+    if (r.rc == 0) {
+        return GateResult(name = "review-md", status = GateStatus.Pass, seconds = seconds_since(t0))
+    }
+    let findings <- [for (l in non_empty_lines(r.out)); l; where !(l |> ends_with(": OK")) && !(l |> ends_with("REVIEW.md"))]
+    return GateResult(name = "review-md", status = GateStatus.Fail, seconds = seconds_since(t0),
+        detail = "a REVIEW.das gate of a folder the diff touches is red (mirrors CI's extended_checks step) - fix the finding, re-run this gate",
+        output = join(findings, "\n"))
+}
+
+def gate_md_ascii(ctx : PreflightCtx) : GateResult {
+    let t0 = ref_time_ticks()
+    let changed = run_argv(["git", "diff", "--name-only", "{ctx.base}..HEAD"])
+    if (changed.rc != 0) {
+        return GateResult(name = "md-ascii", status = GateStatus.Skip, seconds = seconds_since(t0),
+            detail = "git diff {ctx.base}..HEAD failed - fetch origin first")
+    }
+    var touches_md = false
+    for (f in non_empty_lines(changed.out)) {
+        if (f |> ends_with(".md")) {
+            touches_md = true
+        }
+    }
+    if (!touches_md) {
+        return GateResult(name = "md-ascii", status = GateStatus.Skip, seconds = seconds_since(t0),
+            detail = "no .md changed vs {ctx.base}")
+    }
+    let r = run_argv(["python3", "ci/fix_md_ascii.py", "--check"])
+    if (r.rc == 0) {
+        return GateResult(name = "md-ascii", status = GateStatus.Pass, seconds = seconds_since(t0))
+    }
+    return GateResult(name = "md-ascii", status = GateStatus.Fail, seconds = seconds_since(t0),
+        detail = "non-ascii markdown (mirrors CI's Markdown ASCII gate) - `python3 ci/fix_md_ascii.py` fixes in place",
+        output = r.out)
 }
 
 def gate_hash_refs() : GateResult {
@@ -1168,13 +1206,19 @@ def gate_tests_cpp(ctx : PreflightCtx) : GateResult {
     return run_test_gate("tests-cpp", args, "ctest -L small failures (build tests-cpp-small target if missing)")
 }
 
+//! The build fan-out for every cmake invocation: the user's ``-j`` when set, else hardware
+//! threads. A bare ``--parallel`` is unlimited ``make -j`` on the Makefile generator.
+def cmake_jobs(ctx : PreflightCtx) : string {
+    return "{ctx.jobs > 0 ? ctx.jobs : get_total_hw_threads()}"
+}
+
 def gate_tests_aot(ctx : PreflightCtx) : GateResult {
     let t0 = ref_time_ticks()
     if (empty(ctx.build_dir)) {
         return GateResult(name = "tests-aot", status = GateStatus.Skip, seconds = seconds_since(t0),
             detail = "no configured build dir — cmake -B build first")
     }
-    let b = run_argv(["cmake", "--build", ctx.build_dir, "--config", ctx.config, "--target", "test_aot", "--parallel"])
+    let b = run_argv(["cmake", "--build", ctx.build_dir, "--config", ctx.config, "--target", "test_aot", "--parallel", cmake_jobs(ctx)])
     if (b.rc != 0) {
         // root CMakeLists gates tests/aot out on DAS_AOT_EXAMPLES_DISABLED and
         // 32-bit Windows — an absent target is a config choice, not a failure.
@@ -1210,7 +1254,7 @@ def gate_sequence(ctx : PreflightCtx) : GateResult {
     }
     let b = run_argv(["cmake", "--build", ctx.build_dir, "--config", ctx.config, "--target",
         "dasModuleGlfw", "dasModuleLiveHost", "dasModuleHV", "dasModuleAudio",
-        "dasModulePUGIXML", "dasModuleStbImage", "--parallel"])
+        "dasModulePUGIXML", "dasModuleStbImage", "--parallel", cmake_jobs(ctx)])
     if (b.rc != 0) {
         let lower = to_lower(b.out)
         if (find(lower, "unknown target") >= 0 || find(lower, "no rule to make target") >= 0 || find(lower, "does not exist") >= 0) {
@@ -1258,7 +1302,7 @@ def gate_imgui(ctx : PreflightCtx) : GateResult {
     }
     let b = run_argv(["cmake", "--build", ctx.build_dir, "--config", ctx.config, "--target",
         "daslang-live", "dasModuleLiveHost", "dasModuleGlfw", "dasModuleHV", "dasModuleClipboard",
-        "dasModulePUGIXML", "dasModuleStbImage", "dasModuleImgui", "imguiApp", "imguiAppHeadless", "--parallel"])
+        "dasModulePUGIXML", "dasModuleStbImage", "dasModuleImgui", "imguiApp", "imguiAppHeadless", "--parallel", cmake_jobs(ctx)])
     if (b.rc != 0) {
         let lower = to_lower(b.out)
         if (find(lower, "unknown target") >= 0 || find(lower, "no rule to make target") >= 0 || find(lower, "does not exist") >= 0) {
@@ -1296,6 +1340,8 @@ def gate_table() : array<GateInfo> {
         GateInfo(name = "format", full_only = false, doc = "formatter --verify on tracked .das (mirrors CI)"),
         GateInfo(name = "lint", full_only = false, doc = "lint changed .das on three rails (host, linux-mirror, -exe), zero warnings; --lint-skip-exe-rail drops the exe rail"),
         GateInfo(name = "hash-refs", full_only = false, doc = "no bare #N in branch commit messages that GitHub would mislink - ledger cites spell out or backtick"),
+        GateInfo(name = "review-md", full_only = false, doc = "REVIEW.das gates of every folder the diff touches (utils/internal/review-md; mirrors CI's extended_checks step)"),
+        GateInfo(name = "md-ascii", full_only = false, doc = "ci/fix_md_ascii.py --check when the diff touches .md (mirrors CI's Markdown ASCII gate in extended_checks)"),
         GateInfo(name = "ast-verify", full_only = false, doc = "daslang -dry-run --ast-verify-batch on changed .das (parallel, 300s/file; mirrors CI) - an AST verify line, a crash, or a timeout fails"),
         GateInfo(name = "cpp-syntax", full_only = false, doc = "clang frontend pass on changed C++; header change → full src+tests-cpp sweep"),
         GateInfo(name = "dasgen", full_only = true, doc = "gen_bind.das freshness vs include/daScript/builtin/"),
@@ -1457,6 +1503,10 @@ def main() : int { // nolint:STYLE037,STYLE038 — the gate loop + CLI surface; 
                 r <- gate_lint(ctx)
             } elif (info.name == "hash-refs") {
                 r <- gate_hash_refs()
+            } elif (info.name == "review-md") {
+                r <- gate_review_md(ctx)
+            } elif (info.name == "md-ascii") {
+                r <- gate_md_ascii(ctx)
             } elif (info.name == "ast-verify") {
                 r <- gate_ast_verify(ctx)
             } elif (info.name == "cpp-syntax") {

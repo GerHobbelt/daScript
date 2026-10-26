@@ -51,6 +51,15 @@ struct public MdAnchor {
 struct public ArchDocs {
     counts : table<string; int>
     known : table<string; bool>
+    anchors : table<string; array<MdAnchor>>
+}
+
+
+// True for an entry name every [arch] walk skips: `_`/`.`-prefixed entries, and
+// `builtin.das`, which sits outside the citation system in LINT026's walk
+// (utils/lint/main.das), the census walk (arch_common), and extraction alike.
+def public arch_walk_skips(name : string) : bool {
+    return name |> starts_with("_") || name |> starts_with(".") || name == "builtin.das"
 }
 
 
@@ -188,13 +197,78 @@ def private arch_doc_exists(var docs : ArchDocs; doc : string) : bool {
         let ok = st.is_valid && st.is_reg
         docs.known[doc] = ok
         if (ok) {
-            for (a in collect_md_anchors(doc)) {
+            var found <- collect_md_anchors(doc)
+            for (a in found) {
                 let key = "{doc}#{a.name}"
                 docs.counts[key] = (docs.counts ?[key] ?? 0) + 1
             }
+            docs.anchors[doc] <- found
         }
     }
     return docs.known[doc]
+}
+
+
+// Every anchor `doc` declares, through the same one-parse index the forward check uses; nothing
+// when the document is missing.
+def public each_arch_anchor(var docs : ArchDocs; doc : string; blk : block<(a : MdAnchor) : void>) {
+    return if (!arch_doc_exists(docs, doc))
+    for (a in docs.anchors[doc]) {
+        invoke(blk, a)
+    }
+}
+
+
+// The line span of the anchor's section: x = the heading's 1-based line, y = the 1-based line
+// AFTER the section (the next heading of the same or a higher level, trailing blank lines
+// dropped). (0,0) when the document declares no such anchor. A deeper heading's span nests
+// inside its parent's - `y <= parent.y` - which is what lets a caller emitting several
+// sections tell a subsection it already carries from one it still owes.
+def public section_span(doc, anchor : string) : int2 {
+    let text = fread(doc)
+    return int2(0, 0) if (empty(text))
+    let lines <- split(text, "\n")
+    var start = -1
+    var level = 0
+    for (i in range(length(lines))) {
+        let a = anchor_of_heading(lines[i])
+        if (a.name == anchor) {
+            start = i
+            level = a.level
+            break
+        }
+    }
+    return int2(0, 0) if (start < 0)
+    var stop = length(lines)
+    for (i in range(start + 1, length(lines))) {
+        let lv = heading_level(lines[i])
+        if (lv > 0 && lv <= level) {
+            stop = i
+            break
+        }
+    }
+    while (stop > start + 1 && empty(strip(lines[stop - 1]))) {
+        stop --
+    }
+    return int2(start + 1, stop + 1)
+}
+
+
+// The cited section: the anchor's heading line through the last line before the next heading of
+// the same or a higher level, trailing blank lines dropped. "" when the document declares no
+// such anchor.
+def public section_text(doc, anchor : string) : string {
+    let span = section_span(doc, anchor)
+    return "" if (span.x == 0)
+    let lines <- split(fread(doc), "\n")
+    return build_string() $(var w) {
+        for (i in range(span.x - 1, span.y - 1)) {
+            // split() leaves the '\r' of a CRLF document on the line
+            let raw = lines[i]
+            w |> write(raw |> ends_with("\r") ? slice(raw, 0, length(raw) - 1) : raw)
+            w |> write("\n")
+        }
+    }
 }
 
 
@@ -208,5 +282,26 @@ def public citation_failure_reason(var docs : ArchDocs; c : ArchCitation) : stri
     let n = docs.counts ?["{c.doc}#{c.anchor}"] ?? 0
     return "no such anchor" if (n == 0)
     return "anchor appears {n} times" if (n > 1)
+    return ""
+}
+
+
+// True when the cited document does not sit in the citing file's own folder tree - the document's
+// folder must be the file's folder or one of its ancestors. A mechanism another folder's document
+// states is restated in prose in a document of the citer's own tree and cited there.
+def public citation_outside_subtree(file : string; c : ArchCitation) : bool {
+    let fdir = arch_path(dir_name(file))
+    let ddir = dir_name(c.doc)
+    return !(fdir == ddir || fdir |> starts_with("{ddir}/"))
+}
+
+
+// `citation_failure_reason` plus the scope check: a citation that resolves but reaches outside
+// the citing file's folder tree is reported after the resolution reasons, so a broken far
+// citation is named for what is broken first.
+def public citation_failure_reason(var docs : ArchDocs; file : string; c : ArchCitation) : string {
+    let reason = citation_failure_reason(docs, c)
+    return reason if (!empty(reason))
+    return "cites a document outside this file's folder tree - restate the mechanism in an architecture doc of this folder's tree and cite that" if (citation_outside_subtree(file, c))
     return ""
 }

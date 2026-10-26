@@ -15,9 +15,7 @@
 
     <link rel="icon" type="image/svg+xml" href="../files/daslang-favicon.svg" />
     <link rel="alternate icon" type="image/x-icon" href="../files/daslang.ico" />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:ital,wght@0,400;0,500;0,600;0,700;1,400;1,600&family=JetBrains+Mono:wght@400;500;600;700&display=swap" />
+<link rel="stylesheet" href="../files/fonts/fonts.css"/>
 
     <!-- Forge first (tokens), then web/ui's main.css (IDE structure),
          then forge-skin.css (override IDE chrome to match Forge),
@@ -116,11 +114,11 @@
 <script type="text/javascript" src="./playground-init.js"></script>
 <!-- Owns run-frame.html (one frame per program). Must precede main.js, whose
      pageInit hands it the run host and whose run path delegates to it. -->
-<script type="text/javascript" src="./playground-runner.js?v=5"></script>
+<script type="text/javascript" src="./playground-runner.js?v=10"></script>
 <!-- Compiles the editor's code on the build service for the wasm engine.
      Reads its payload from playground-share.js, so both agree on one hash. -->
 <script type="text/javascript" src="./playground-wasm.js?v=2"></script>
-<script type="text/javascript" src="./main.js?v=8"></script>
+<script type="text/javascript" src="./main.js?v=12"></script>
 <script type="text/javascript" src="./playground-tabs.js?v=4"></script>
 <script type="text/javascript" src="./playground-share.js?v=3"></script>
 <script type="text/javascript" src="./playground-splitter.js?v=3"></script>

@@ -37,6 +37,15 @@ The public route boundary is `caddy.snippet`, the authoritative copy of what the
 vhost forwards here. It also carries the transport body cap: the service can only bounds-check
 a body already buffered in full, so that limit cannot live in this process.
 
+`max_source_bytes` is 524288 (512 KiB). The playground POSTs a multi-file sample as one JSON
+document, so the cap is measured against the whole bundle, not the largest file in it - the
+biggest curated game serializes to roughly 267 KB. Because the deployed toml is operator-owned
+and `deploy.sh` carries it forward verbatim, raising this default does NOT reach a box whose
+toml already states the old value; that file is edited on the box, and the startup banner's
+`max_source_bytes_src` says whether the running value came from `toml` or `default`. Caddy's
+`request_body max_size` on `/api/samples*` stays above it, so the 413 a user sees is the
+service's, with its JSON error body, rather than the proxy's bare response.
+
 ## Endpoints (port 8101, loopback only - Caddy fronts the internet)
 
 | Route | Behavior |
@@ -102,6 +111,11 @@ Artifacts are **file sets** (a playground sample is one `.wasm`; a game page is
 immutable headers. An upload is staged under `blobs/tmp/`, every file verified against its
 manifest sha256, and the whole set renamed into place atomically - a half-written artifact is
 never served. `caddy.snippet` carries the 64MB transport cap for `/api/build/*` uploads.
+
+A toolchain the builder no longer announces keeps its tree for a day after its last write - an
+open tab has long re-fetched, and a roll-back finds its cache warm - then an hourly sweep
+removes the tree. Job rows of a toolchain with no tree left go with it, so a roll-back inside
+the day still finds every cached build.
 
 A build's **mode** is decided here at request time by scanning the stored source's requires
 (`detect_build_mode` in `build_queue.das`): a native graphics/audio namespace (glfw, opengl,

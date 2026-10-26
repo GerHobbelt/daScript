@@ -13,7 +13,7 @@ Shipped-arc plan docs live in `history/dasLLAMA/` (the archive log is `history/R
 a `*_plan.md` in this folder is an ACTIVE arc's working plan. Passages retired from this
 document are archived in `history/dasLLAMA/architecture_retired_notes.md`.
 
-Seven companions carry this document's sections, each keeping its sections' numbers. The
+The companions carry this document's sections, each keeping its sections' numbers. The
 routing block under each numbered heading below is the index: it names every companion that
 section runs to, and the sections that companion holds.
 
@@ -36,11 +36,25 @@ re-transcoding `$LCPP/src/unicode-data.cpp`).
 
 ## 2. Mechanisms
 
-- `ARCHITECTURE_IMAGE.md` - sec.2.1-2.1g: the prepared-image rail.
-- `ARCHITECTURE_GPU.md` - sec.2.2b: the tensor-GEMM and fused-attention shapes that measured out.
-- `ARCHITECTURE_RUNTIME.md` - sec.2.2-2.4, 2.6-2.9, 2.11, 2.12: kernel shape, caches, lint
-  policy, knobs, coverage, the GPU ramp.
-- `ARCHITECTURE_MEASUREMENT.md` - sec.2.5, 2.10: the benchmark rig, the tune gate, and the
+- `ARCHITECTURE_IMAGE.md` - sec.2.1-2.1i: the prepared-image rail, the baked dev-W f16 plane,
+  and the baked tower twin-W plane.
+- `ARCHITECTURE_GPU.md` - sec.2.2b, 2.2w-2.2x: the tensor-GEMM and fused-attention shapes that
+  measured out, the tower attention routes, and the tower driver's encode chains.
+- `ARCHITECTURE_GPU_PREFILL.md` - sec.2.2c-2.2i, 2.2u-2.2v: the Metal prefill driver's GEMM form
+  ladder, dev-W knee map, attention slab, MoE bucket rail, chunked submission, the f16 twin
+  dual-store, and the last-layer FFN tail.
+- `ARCHITECTURE_GPU_VULKAN.md` - sec.2.2j-2.2q: the Vulkan resident driver - the prefill window
+  chain, the cm2 decode lanes and tile pick, the class-pipeline build seat, the residency plan,
+  the GPU-slot marks swap, the Q8 requant byte store, and the MoE expert chain on the cm2 tiles.
+- `ARCHITECTURE_GPU_VULKAN_DECODE.md` - sec.2.2r-2.2t: the per-op tier's decode era - the decode
+  attention block over per-layer K/V mirrors, the streamed expert layer's GPU/CPU split, and the
+  whole-token decode span.
+- `ARCHITECTURE_RUNTIME.md` - sec.2.2, 2.3, 2.3a, 2.4, 2.6-2.9, 2.11, 2.12, 2.18-2.19: kernel
+  shape, caches, lint policy, knobs, coverage, the GPU ramp, the hybrid worker pool, and the
+  MoE region split.
+- `ARCHITECTURE_MEDIA.md` - sec.2.13-2.16: the padded tower GEMM widths, the family GPU hooks,
+  the tower weight lane, and the plain-Model ASR decoders.
+- `ARCHITECTURE_MEASUREMENT.md` - sec.2.5, 2.10, 2.20: the benchmark rig, the tune gate, and the
   sanctioned instrumentation rails.
 
 ## 3. Inherited invariants

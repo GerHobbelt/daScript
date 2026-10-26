@@ -17,6 +17,10 @@ Two gates mirror no CI lane:
 - **hash-refs** - a bare `#N` in `origin/master..HEAD` commit messages far below
   the repo's newest issue/PR number, which GitHub mislinks permanently once
   pushed (spelling: `skills/internal/make_pr.md` step 6). SKIPs without `gh`.
+- **review-md** - the `REVIEW.das` gates of every folder the diff touches, the walk
+  `utils/internal/review-md/main.das` runs (CI: the extended_checks `Run REVIEW.das gates`
+  step, which runs every gate). A checklist edit that breaks a gate's expectation - a
+  token the gate greps for, a routed file it counts - is red here, not on CI.
 
 `--full` is Release-only and fails immediately on a Debug host. Debug serves
 `--only`/`--skip` subset diagnosis only - never as a substitute when a Windows
@@ -122,6 +126,7 @@ cmake -B build -DDAS_HV_DISABLED=OFF -DDAS_LLVM_DISABLED=OFF -DDAS_AUDIO_DISABLE
 
 | CI step | Local mirror | Notes |
 |---|---|---|
+| Markdown ASCII gate | preflight's `md-ascii` gate (fast tier, runs when the diff touches any `.md`); manual: `python3 ci/fix_md_ascii.py --check`, fix in place by dropping `--check` | em-dashes/arrows/ellipses in new markdown are the usual trip |
 | dasgen freshness | `<daslang> utils/internal/dasgen/gen_bind.das` then `git diff --exit-code -- include/daScript/builtin/` | regen + commit if dirty; `skills/internal/visitor_gen_bind.md` |
 | Run examples | `cmake --build build --config Release --target run_examples` | |
 | Utils tests | `cmake --build build --config Release --target run_utils_tests` | |

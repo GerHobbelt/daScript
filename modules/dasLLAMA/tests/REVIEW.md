@@ -1,7 +1,7 @@
 # dasLLAMA tests Code Review Checklist
 
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture
-doc: this folder's `CLAUDE.md`. Planned work: `../followup_general.md`, `../followup_vulkan.md`.
+doc: `CLAUDE.md`. Planned work: `../followup_general.md`, `../followup_vulkan.md`.
 
 **Every PR runs `run.das -- --suite model-free`, plus every test here the change reaches - never
 the whole directory.** A change reaches a test when it alters anything the test's result
@@ -31,8 +31,8 @@ defect.** Out-of-folder instances are ledgered in `CLAUDE.md`'s "Out-of-folder t
 
 **A diff that registers a test file in this folder in a `CMakeLists.txt` is a defect.**
 
-**A change that re-scopes a test file with a `CLAUDE.md` entry keeps that entry true in the
-same change.**
+**A diff that adds, removes or re-lanes a gate in a file with a `CLAUDE.md` entry updates that
+entry in the same change.**
 
 **A new test file listed in `run.das`'s `model-free` suite, or in no `run.das` suite at all,
 whose name does not say what it covers, gets a `CLAUDE.md` entry in the same change** -
@@ -54,6 +54,14 @@ defect.**
 **Weakening `test_model_specs.das` is a defect.** It is the gate on the model-set table
 (`../performance/model_specs.das`).
 
+**Weakening the softcap, sink and span cells of `test_metal_prefill_kernels.das` - dropping
+or loosening a softcap, sink (`hass`) or span arm, or dropping a span shape - is a defect** -
+they are what fails when `pf_p_weight` and `metal_attn_rowstat` drift apart.
+
+**Weakening `test_site_records.das` - the gate that byte-compares
+`site/files/dasllama/bench_records.json` (repo root) against a fresh `merge_site_records`
+run - is a defect.**
+
 **Weakening `test_exchange_schema.das` or `test_bench_records_schema.das` - loosening an
 assert, dropping one, or narrowing the corpus either one sweeps - is a defect** - they gate
 the real `write_bench_records` output.
@@ -63,31 +71,36 @@ cached hit at admit (`prefix_attach`) and donates no pages at reap (`donate_stre
 defect.** Cache keys are token ids, and the KV past the splice does not follow from them.
 
 **A test that silently vanishes on one platform is a defect, and so is a zero-assertion pass -
-a test passes or skips explicitly on every platform.** A cell whose whole body is
-platform-gated registers `t |> skip` on the platforms where that body compiles out.
+a test passes or skips explicitly on every platform.** A cell that returns without asserting -
+the module is absent, no device answered, a capability declined - registers `t |> skip` there;
+`feint` is a print, not a skip.
 
-**A skip gate keys on a device capability, a run-mode knob's value, or a stocked fixture beside
-the models (a model file, an mmproj, an oracle dump - a model gate) - never on the existence of
-an artifact this repo's build or a previous test run produced (a mint, a generated binary, a
-dump a test wrote).** An artifact gate goes permanently false when its producer moves.
+**A skip gate keys on a fact the box owns - a device capability, a run-mode knob's value, a
+host toolchain's presence, a compile-time module-presence check
+(`typeinfo builtin_module_exists`) - or on a stocked fixture beside the models (a model
+file, an mmproj, an oracle dump - a model gate); never on the existence of an artifact this
+repo's build or a previous test run produced (a mint, a generated binary, a dump a test
+wrote).** An artifact gate goes permanently false when its producer moves.
 
 **A test that loads a model over 6 GiB without gating on `DASLLAMA_PARITY_FULL=1` is a
 defect** - that gate is a final pre-PR gate, not the iteration loop. In this folder the
 spelling is `model_available` (`_model_tier.das`). A test that cannot require
 `_model_tier.das` open-codes the same env check.
 
-**A test whose subject is not the `.dlim` image rail never calls `load_model`,
-`load_model_cached`, or `load_model_image` - it loads each carrier through that carrier's own
-loader.** Decoders load through `load_model_` (`../dasllama/dasllama_load.das`). Towers,
-embedders, and union carriers load through their family or carrier loaders.
+**A test - or a program a test builds or spawns - whose subject is not the `.dlim` image
+rail never calls `load_model`, `load_model_cached`, or `load_model_image` - it loads each
+carrier through that carrier's own loader.** Decoders load through `load_model_`
+(`../dasllama/dasllama_load.das`). Towers, embedders, and union carriers load through their
+family or carrier loaders.
 
 **A function that gains a parameter, or a parameter that gains an accepted value, ships a
 test for the new value.** The test feeds the new value and checks the result. It lives in
 this folder, and it lands in the same change. "The model still runs" is not that test.
 
-**A predicate whose value is fixed by the build platform - it cannot differ between two runs on
-one machine - is never tested through its own value; test it through the argv it gates or the
-mode it selects.**
+**A predicate whose value the BOX decides (a device capability, a policy default) and that
+therefore cannot differ between two runs on one machine is never tested through its own
+value; test it through the argv it gates or the mode it selects.** An argument-keyed pure
+function is outside this rule - its value pins are real tests.
 
 **A test for an added, moved, or edited registration reaches the registered thing through its
 registry, and never calls it directly.** The registries this governs: the arch registrations
@@ -122,18 +135,22 @@ a defect.** A resize cap is not evidence.
 **A freeform token-parity cell is a defect.** Freeform coverage uses the forced-feed
 logits-tolerance form. Counting cells stay token-exact.
 
-**A diff that adds a `[metal_kernel]` under `../dasllama/` covers that kernel in
-`test_kernel_coverage.das`, one of two ways.** Either a census row there dispatches the
-kernel, or the diff names its kernel class in that file's `CENSUS_NEVER_DISPATCHED`, with the
-reason no row can reach it. A dispatching row runs on a small model - one the suite runs
-without `DASLLAMA_PARITY_FULL=1`. Naming a kernel a census row could dispatch is a defect.
+**A diff that adds a GPU kernel class under `../dasllama/` - a `[metal_kernel]` def, a
+`[vk_dispatch]` declaration, or a new instance of a template carrying one - covers that class in
+`test_kernel_coverage.das`, one of two ways.** Either a census row there dispatches the class, or the diff names it in
+that file's `CENSUS_NEVER_DISPATCHED`, with the reason no row can reach it. A
+`DASLLAMA_PARITY_FULL`-gated census row counts as the dispatching arm. Naming a
+class a census row could dispatch is a defect.
 
-**A kernel-unit cell missing a compare against a CPU oracle that can witness the cell's
-property is a defect.**
+**A kernel-unit cell - a model-less cell that dispatches one kernel class and asserts on its
+output - missing a compare against a CPU oracle that can witness the cell's property is a
+defect.** (A census row dispatches without asserting on output, so it is not one.)
 
-**A kernel-unit cell testing cross-dispatch bit-identity that does not compare GPU against GPU,
-with its output buffers prefilled with a sentinel, is a defect.** No CPU oracle can witness
-that property.
+**A kernel-unit cell that bit-compares a buffer the GPU writes prefills its output buffers with
+a sentinel.** An unprefilled output can pass a bit compare by staying stale.
+
+**A cross-dispatch bit-identity compare - comparing the outputs of two dispatches - runs GPU
+against GPU.** No CPU oracle can witness that property.
 
 **A kernel-unit cell whose output plane is its input plane, and whose compare is not paired
 with an assert that the output differs from the input at a known index, is a defect.** This
@@ -155,24 +172,40 @@ loads the dump names it.
 the backend, the flash-attention setting, and the mmproj precision the dump came from - is a
 defect.**
 
-**A cell that does not establish every driver hook and serving-lane knob its claim depends on,
-and restore each to its default before returning, is a defect.** This holds even when the
-claim needs the knob at its DEFAULT value. A hook is any process-wide setter with no
-read-back. The environment can carry a knob either way. The mechanism (why the hooks flip legs
-silently) is `CLAUDE.md`'s "Metal fixtures" section.
+**A cell that does not establish every process-wide driver setter and serving-lane knob its
+claim depends on, and restore each to the value it had on entry before returning, is a
+defect.** This holds even when the claim needs the knob at its DEFAULT value. The Vulkan
+tier's installs (`install_moe_gpu_tier` and the `set_moe_gpu_*_hook(s)` seats) are one-way
+and establish-only - `ARCHITECTURE_GPU.md` sec.1.5 sanctions them. The environment can carry
+a knob either way. The mechanism (why the hooks flip legs silently) is `CLAUDE.md`'s "Metal
+fixtures" section.
 
-**A cell claiming a family serving lane that does not pin it with `set_<family>_q8` and undo
-the pin with `reset_<family>_q8` is a defect.** A runtime decline standing in for a pin
-measures whichever lane the box's policy picked.
+**A cell claiming a family serving lane that does not pin it through the family's own lane
+knobs - `set_<family>_q8` / `reset_<family>_q8`, canary's `set_canary_enc_q8` /
+`reset_canary_enc_q8`, whisper's `set_asr_fp32` / `set_asr_tower_fp32` - or through a loader
+parameter that takes the lane, is a defect.** A family whose knob has no reset twin restores
+it to the documented default. A runtime decline standing in for a pin measures whichever
+lane the box's policy picked.
+
+**A cell that loads a media carrier under a lane pin - a `set_<family>_q8`-class knob or a
+tensor-crown pin - mints in memory through the family's `stage_*` + `mint_*` pair, never
+through a `.dlim`-baking loader (`load_<family>_tower` / `load_<family>_encoder` /
+`load_model*`).** A disk bake under a pinned lane GC-purges the serving lane's `.dlim`
+beside the model, and the next direct-image load in another suite panics on the wrong
+identity. The one residue: a cell whose SUBJECT is a facade lane knob (`load_asr_model`
+under `set_asr_tower_fp32`) keeps the facade loader - the image identity folds the pin, so
+minting around it would unmake the claim; the purge exposure on a cold box is followup 61's
+owed in-process image-off seam.
 
 **A CPU-vs-GPU arm that does not run a PLANAR model for its CPU stages, and that model's
 `blob_twin(t, path, seq_cap)` for override-selected stages, is a defect.** One session spans
 both models, because sessions are geometry-bound. A decline-reason cell keeps the planar
 model.
 
-**A diff that adds a model-loading block tags it with its family.** The family tag is the
-token passed to `family_on(t, name)` (`_model_tier.das`). An untagged block silently joins
-every family's gate.
+**A diff that adds a model-loading block to a `run.das` MODEL suite (every suite the
+`--family` filter reaches - not the model-free suite) tags it with its family.** The family
+tag is the token passed to `family_on(t, name)` (`_model_tier.das`). An untagged block
+silently joins every family's gate.
 
 **No CPU-control batch parity runs against the 70B.** Its batch coverage is ENGAGE-only in the
 support matrix. The batched code paths get their parity on small models, through pins.
@@ -196,9 +229,13 @@ one predicate's own value.
 or audio samples, not a `.dlim` model image - with no model loaded is a defect when it does
 not build its fixture procedurally and pin its expectations in-repo.**
 
-**Media a test feeds an embedder - an image or an audio clip - that the test does not build,
-and that `DASLLAMA_VISION_DUMP` cannot preview (images), is a defect** - a red never requires
-adding instrumentation before a human can see what the model consumed.
+**An image a test feeds an embedder that the test does not build, and that
+`DASLLAMA_VISION_DUMP` cannot preview, is a defect** - a red never requires adding
+instrumentation before a human can see what the model consumed.
+
+**An audio clip a test feeds an embedder that the test does not build, and that is not one of
+the checked-in fixtures beside the models (`jfk.wav`, `gemma4a_test2.wav` - the sanctioned ASR
+corpus), is a defect** - the same reason: a clip nobody else can play makes a red unreadable.
 
 **A tier-1 media fixture - one an embedder-parity cell regenerates in-test and compares
 against an oracle dump - with no exact-value generator is a defect.** A generator running libm
@@ -219,3 +256,25 @@ smallest GGUF that runs on the small tier (the file homes are `CLAUDE.md`'s "Mod
 no-arm tests" and "Out-of-folder test files" notes). A family whose vocab lacks the markers
 has no format to test.
 
+**A kernel-unit gate that compares a GPU attention kernel against a wider-precision CPU oracle
+feeds inputs that are exact in f16.** Otherwise the compare measures input rounding, and the
+bar has to be loosened until it no longer discriminates.
+
+**A gate for a kernel that attends inside a restricted horizon - a window, a sliding span, a
+block-diagonal range - writes its CPU oracle to attend strictly inside that horizon.** A leak
+then reds the ordinary compare, so the gate needs no separate leak control.
+
+**A cell whose only compare is bit-identity between two kernel forms also compares one of the
+two against a CPU oracle, in the same cell.** Two forms can be bit-equal and both wrong.
+
+**A poison leg on a tower the Metal driver serves reaches every plane the served route reads -
+a blob-only poison on a twin-serving route is laundered.** Which planes those are is the
+route's to say: a twin-W route reads the baked halfword twin (`wblob`), so poisoning that
+plane alone is a valid control there, while a route reading both planes needs both zeroed. A
+poison the served route never reads passes on a broken kernel.
+
+**An ASR cell comparing transcripts across two serving lanes asserts TOKEN equality; the one
+exception is the crowned-lane twin, whose ruled grade is WORD equality (the tensor twins'
+rounding legitimately flips tokens - followup 60's resolution).** A cell that cannot hold
+its grade converts to the forced-feed logits-tolerance form - never to a looser text
+compare.

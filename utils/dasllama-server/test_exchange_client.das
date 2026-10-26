@@ -3,7 +3,7 @@ options persistent_heap
 
 require dastest/testing_boost public
 require dasllama/dasllama_exchange
-require dasllama/dasllama   // DASLLAMA_VERSION — the fixture stamps (facade-public)
+require dasllama/dasllama   // DASLLAMA_RELEASE — the fixture stamps (facade-public)
 require dashv/dashv_boost
 require llvm/daslib/llvm_tune
 require daslib/jobque_boost
@@ -46,13 +46,13 @@ def sibling_box : string {
 }
 
 def verified_doc : string
-    => fixture_sidecar(tune_box_identity(), DASLLAMA_VERSION, "vec16")
+    => fixture_sidecar(tune_box_identity(), DASLLAMA_RELEASE, "vec16")
 
 def crossbox_doc : string
-    => fixture_sidecar(sibling_box(), DASLLAMA_VERSION, "vec8_u4")
+    => fixture_sidecar(sibling_box(), DASLLAMA_RELEASE, "vec8_u4")
 
 def oldversion_doc : string
-    => fixture_sidecar(tune_box_identity(), DASLLAMA_VERSION + 1, "vec16")
+    => fixture_sidecar(tune_box_identity(), DASLLAMA_RELEASE + 1, "vec16")
 
 def tamper_sha : string
     => sha256_hex("tampered")
@@ -80,12 +80,12 @@ class FakeExchange : HvWebServer {
             JV((sha = sha256_hex(xdoc), box = sibling_box(), tier = "cpu",
                 verified = false, noise = "ok", written = "2026-08-11T00:00:00Z",
                 kernel_count = 2, engine_sha = "8a538d795",
-                dasllama_version = DASLLAMA_VERSION, url = "/api/sidecar/{sha256_hex(xdoc)}")),
+                dasllama_version = DASLLAMA_RELEASE, url = "/api/sidecar/{sha256_hex(xdoc)}")),
             JV((sha = sha256_hex(vdoc), box = tune_box_identity(), tier = "exact",
                 verified = true, noise = "ok", written = "2026-08-11T00:00:00Z",
                 kernel_count = 2, engine_sha = "8a538d795",
-                dasllama_version = DASLLAMA_VERSION, url = "/api/sidecar/{sha256_hex(vdoc)}"))]
-        var top = JV((version = DASLLAMA_VERSION, hits = JV(hits)))
+                dasllama_version = DASLLAMA_RELEASE, url = "/api/sidecar/{sha256_hex(vdoc)}"))]
+        var top = JV((version = DASLLAMA_RELEASE, hits = JV(hits)))
         g_hits_body = write_json(top)
         delete_json(top)
         GET("/api/sidecars") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
@@ -214,7 +214,7 @@ def test_lookup_and_pick(t : T?) {
     with_fake_exchange() $(base_url) {
         t |> run("lookup parses the ladder response") @(tt : T?) {
             var hits : array<ExchangeHit>
-            tt |> success(exchange_lookup(base_url, DASLLAMA_VERSION, tune_box_identity(), hits))
+            tt |> success(exchange_lookup(base_url, DASLLAMA_RELEASE, tune_box_identity(), hits))
             tt |> equal(length(hits), 2)
             tt |> equal(hits[0].tier, "cpu")
             tt |> success(!hits[0].verified, "sibling hit is unverified")
@@ -222,7 +222,7 @@ def test_lookup_and_pick(t : T?) {
             tt |> success(hits[1].verified, "exact hit is verified")
             tt |> equal(hits[1].sha, sha256_hex(verified_doc()))
             tt |> equal(hits[1].kernel_count, 2)
-            tt |> equal(hits[1].dasllama_version, DASLLAMA_VERSION)
+            tt |> equal(hits[1].dasllama_version, DASLLAMA_RELEASE)
             // the pick: verified skips the unverified head; any takes it
             tt |> equal(exchange_pick(hits, "verified"), 1)
             tt |> equal(exchange_pick(hits, "any"), 0)
@@ -230,7 +230,7 @@ def test_lookup_and_pick(t : T?) {
         }
         t |> run("lookup fails loudly on transport") @(tt : T?) {
             var hits : array<ExchangeHit>
-            tt |> success(!exchange_lookup("http://127.0.0.1:1", DASLLAMA_VERSION, tune_box_identity(), hits))
+            tt |> success(!exchange_lookup("http://127.0.0.1:1", DASLLAMA_RELEASE, tune_box_identity(), hits))
             delete hits
         }
     }
@@ -309,7 +309,7 @@ def test_privacy_strip(t : T?) {
                 binary = "/Users/borisbatkin/bin/daslang",
                 weird = "C:\\Users\\bob\\thing",
                 noise = "ok",
-                dasllama_version = "{DASLLAMA_VERSION}")))
+                dasllama_version = "{DASLLAMA_RELEASE}")))
         let text = write_json(doc)
         delete_json(doc)
         let stripped = exchange_strip_private(text)
@@ -327,14 +327,14 @@ def test_privacy_strip(t : T?) {
     }
     t |> run("a slash in the box identity is not a path") @(tt : T?) {
         let apu_box = "linux|x86_64||6.1.0-49-amd64|AMD Ryzen 7 PRO 8700GE w/ Radeon 780M Graphics"
-        let stripped = exchange_strip_private(fixture_sidecar(apu_box, DASLLAMA_VERSION, "vec16"))
+        let stripped = exchange_strip_private(fixture_sidecar(apu_box, DASLLAMA_RELEASE, "vec16"))
         tt |> success(find(stripped, apu_box) >= 0, "box survives")
         var errs : array<string>
         tt |> success(validate_sidecar_submission(stripped, errs), "box intact, so the doc is still submission-grade")
         delete errs
     }
     t |> run("a path smuggled into the identity keys is still stripped") @(tt : T?) {
-        let smuggled = exchange_strip_private(fixture_sidecar("linux|x86_64||6.1|/home/alice/tool", DASLLAMA_VERSION, "vec16"))
+        let smuggled = exchange_strip_private(fixture_sidecar("linux|x86_64||6.1|/home/alice/tool", DASLLAMA_RELEASE, "vec16"))
         tt |> success(find(smuggled, "alice") < 0, "path-shaped box is gone")
         var errs : array<string>
         tt |> success(!validate_sidecar_submission(smuggled, errs), "and the document is refused")
@@ -346,7 +346,7 @@ def test_privacy_strip(t : T?) {
                 box = tune_box_identity(),
                 applied_box = "darwin|arm64|Mac|25F84|C:\\Users\\bob",
                 trailing = "Graphics/",
-                dasllama_version = "{DASLLAMA_VERSION}")))
+                dasllama_version = "{DASLLAMA_RELEASE}")))
         let text = write_json(doc)
         delete_json(doc)
         let cleaned = exchange_strip_private(text)
@@ -356,7 +356,7 @@ def test_privacy_strip(t : T?) {
         var abs_doc = JV((
             kernels = (dot = "vec16"),
             provenance = (box = tune_box_identity(), leak = "/ Users/ alice", home = "~/ alice",
-                dasllama_version = "{DASLLAMA_VERSION}")))
+                dasllama_version = "{DASLLAMA_RELEASE}")))
         let abs_text = write_json(abs_doc)
         delete_json(abs_doc)
         tt |> success(find(exchange_strip_private(abs_text), "alice") < 0, "leading-slash and tilde values are gone")
@@ -390,10 +390,10 @@ def test_submit_rails(t : T?) {
             tt |> equal(exchange_fetch_and_apply(base_url, sha256_hex(verified_doc()), manifest), "")
             tt |> success(find(exchange_submit_current(policy), "came from the exchange") >= 0)
             // a foreign-box file never goes back up
-            fwrite(manifest, fixture_sidecar("darwin|arm64|Mac|25F84|Apple M1 Max", DASLLAMA_VERSION, "vec16"))
+            fwrite(manifest, fixture_sidecar("darwin|arm64|Mac|25F84|Apple M1 Max", DASLLAMA_RELEASE, "vec16"))
             tt |> success(find(exchange_submit_current(policy), "not measured on this box") >= 0)
             // this box's own tune submits, and the state file remembers it
-            let own = fixture_sidecar(tune_box_identity(), DASLLAMA_VERSION, "vec16")
+            let own = fixture_sidecar(tune_box_identity(), DASLLAMA_RELEASE, "vec16")
             fwrite(manifest, own)
             tt |> equal(exchange_submit_current(policy), "")
             GET("{base_url}/last/sidecar") $(resp) {
@@ -428,7 +428,7 @@ def private fixture_records : string {
         tests = (pp512 = (tok_s = 100.0lf, stddev = 1.0lf)),
         source = "community", sha = "abc123", version = "0.6.4",
         exec_fmt = "interleaved", tune = "tuned", tune_sha = "deadbeef",
-        dasllama_version = DASLLAMA_VERSION))
+        dasllama_version = DASLLAMA_RELEASE))
     var runs_arr : array<JsonValue?>
     runs_arr |> push(run_das)
     var model = JV((gguf = "test-model-Q8_0.gguf", arch = "Test 1B", quant = "Q8_0",
@@ -448,6 +448,7 @@ def test_policy_and_discovery(t : T?) {
         tt |> equal(p0.url, EXCHANGE_URL_DEFAULT)
         tt |> equal(p0.accept, "verified")
         tt |> equal(p0.submit, "ask")
+        tt |> success(!p0.configured, "the baked defaults are not an expressed choice")
         let res = create_temp_file_result("exchange_policy_", ".toml")
         if (res is error) {
             tt |> failure("could not create a temp file")
@@ -459,10 +460,89 @@ def test_policy_and_discovery(t : T?) {
         tt |> equal(p1.url, "http://127.0.0.1:9")
         tt |> equal(p1.accept, "any")
         tt |> equal(p1.submit, "never")
+        tt |> success(p1.configured, "any exchange_* key in the config is an expressed choice (consent)")
         fwrite(path, "exchange_accept = \"yolo\"\nexchange_submit = \"whatever\"\n")
         let p2 = exchange_policy_from_config(path)
         tt |> equal(p2.accept, "verified", "a typo must never widen acceptance")
         tt |> equal(p2.submit, "ask")
+        fwrite(path, "authoritative = true\nexchange_url = \"http://127.0.0.1:9\"\nexchange_accept = \"any\"\n")
+        let p3 = exchange_policy_from_config(path)
+        tt |> equal(p3.accept, "any", "an authoritative toml still sets the policy")
+        tt |> success(!p3.configured, "the control page persists exchange defaults on EVERY save - an authoritative toml's keys are not consent")
         remove(path)
+    }
+}
+
+[test]
+def test_consent(t : T?) {
+    t |> run("may_contact: the gate composition over every consent state") @(tt : T?) {
+        let res = create_temp_file_result("exchange_gate_", ".tune.json")
+        if (res is error) {
+            tt |> failure("could not create a temp file")
+            return
+        }
+        let manifest = res as value
+        let consent_file = "{slice(manifest, 0, length(manifest) - 5)}.consent"
+        set_tune_manifest_runtime_path(manifest)
+        remove(consent_file)
+        var off = ExchangePolicy()
+        off.accept = "off"
+        tt |> success(!exchange_may_contact(off), "accept=off never contacts, whatever the consent state")
+        var conf = ExchangePolicy()
+        conf.configured = true
+        conf.configured_via = "exchange_accept (config)"
+        tt |> success(exchange_may_contact(conf), "an expressed exchange config waives the question")
+        let zero = ExchangePolicy()
+        tt |> success(!exchange_may_contact(zero), "zero-config + never asked: nothing leaves (dastest has no TTY, so the event arm answers)")
+        verify(exchange_record_consent(false))
+        tt |> success(!exchange_may_contact(zero), "a recorded decline keeps the box offline")
+        verify(exchange_record_consent(true))
+        tt |> success(exchange_may_contact(zero), "a recorded accept opens the gate")
+        set_tune_manifest_runtime_path("")
+        remove(consent_file)
+        remove(manifest)
+    }
+    t |> run("configured attribution: each exchange_* key alone expresses the choice") @(tt : T?) {
+        let res = create_temp_file_result("exchange_onekey_", ".toml")
+        if (res is error) {
+            tt |> failure("could not create a temp file")
+            return
+        }
+        let path = res as value
+        fwrite(path, "exchange_url = \"http://127.0.0.1:9\"\n")
+        tt |> success(exchange_policy_from_config(path).configured, "exchange_url alone")
+        fwrite(path, "exchange_accept = \"any\"\n")
+        tt |> success(exchange_policy_from_config(path).configured, "exchange_accept alone")
+        fwrite(path, "exchange_submit = \"never\"\n")
+        tt |> success(exchange_policy_from_config(path).configured, "exchange_submit alone")
+        remove(path)
+    }
+    t |> run("consent path: a manifest without the .json suffix still gets a sibling") @(tt : T?) {
+        set_tune_manifest_runtime_path("some_app.tune")
+        verify(exchange_record_consent(true))
+        tt |> equal(exchange_consent_status(), "accepted", "the suffixless-manifest arm works")
+        remove("some_app.tune.consent")
+        set_tune_manifest_runtime_path("")
+    }
+    t |> run("consent: unset, record, round-trip") @(tt : T?) {
+        let res = create_temp_file_result("exchange_consent_", ".tune.json")
+        if (res is error) {
+            tt |> failure("could not create a temp file")
+            return
+        }
+        let manifest = res as value
+        let consent_file = "{slice(manifest, 0, length(manifest) - 5)}.consent"
+        set_tune_manifest_runtime_path(manifest)
+        remove(consent_file)
+        tt |> equal(exchange_consent_status(), "", "no file - never asked")
+        tt |> success(exchange_record_consent(true), "record accept")
+        tt |> equal(exchange_consent_status(), "accepted")
+        tt |> success(exchange_record_consent(false), "record decline")
+        tt |> equal(exchange_consent_status(), "declined")
+        fwrite(consent_file, "garbage\n")
+        tt |> equal(exchange_consent_status(), "", "an unreadable choice reads as never asked, not as either answer")
+        set_tune_manifest_runtime_path("")
+        remove(consent_file)
+        remove(manifest)
     }
 }

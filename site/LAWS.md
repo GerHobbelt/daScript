@@ -10,3 +10,15 @@ compacted, or cited as rules.
 | 2026-08-22 | REVIEW.md (performance_engines.json record rule) | on what was missing from the page's tables: "missing - duckdb and postgresql. [...] there should be implementations already" - the four-engine suite (examples/benchmarks/sql) joins the page as its own board and record |
 | 2026-08-24 | REVIEW.md (code-sample rule) | "if code example appears anywhere on the website, its linked to 'try it on playground' - and its verified to compile and run. here is an example - daslang.io/dasllama.html - code on that card"; on partial snippets: "nop. full examples" |
 | 2026-08-24 | REVIEW.md (dasprofile_bench.json record rule) | the cross-language benchmarks page: "i'd like a separate page though, under /performance menu - the very first thing on that submenu"; shape rulings: "bars should be default", heatmap removed, benchmark names link to playground samples ("we refresh samples"), no native-loop sample ("all it does is measures interop"); ship: "lets push the cards and new web page" |
+| 2026-08-29 | REVIEW.md (the sample and playground-run rules) | Port-convergence Q&A: approved moving the sample-source rules out of the blanket import ("yes"), batched into the convergence PR ("we ammend this one. its a bit more prose, not worth separate one"). The embedded-sample rules scope to pages, the Playwright trigger becomes what-the-runtime-loads with a coverage clause, and the artifact clause gets a diff-visible trigger |
+
+- **2026-08-30** (`REVIEW.md`): on the receipt-rule contradiction over ASR reference rows
+  (one run's cmd covering several per-clip rows), Boris ruled the rendered cmd identifies
+  the RUN, not the row - "2. agree" to amending the first rule rather than storing per-clip
+  argvs.
+
+- **2026-08-31** (`REVIEW.md`): review-round flashlight items 2 and 4. Boris ruled ("yes")
+  the stated-suite-run rule is tip-pinned per PR with a restatement duty on later edits;
+  and ("yes") `site/README.md` is blessed as `site/`'s architecture doc (the skill takes a
+  carve-out rather than a doc split). The artifact-list and "page"-definition rewrites rode
+  along as auditor-identified defects.
