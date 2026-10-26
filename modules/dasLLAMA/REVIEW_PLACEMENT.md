@@ -11,19 +11,38 @@ it.**
 `ARCHITECTURE_*.md` companions' sec.1 charters own the per-file list; a rule naming what KIND of
 code lands in which file is the checklist's own.
 
-**A function under `dasllama/` lands in the file whose charter line - in an `ARCHITECTURE_*.md`
-companion's sec.1 - names its kind, or that charter line changes in the same diff.**
-`ARCHITECTURE.md`'s sec.1 routing block names the companion that holds each file's charter line;
-a file outside `dasllama/` carries no charter line and answers to its own folder's checklist.
+**A function, a class (a kernel class among them), a module global (`let` or `var`, private or
+not), a named constant or a `require` under `dasllama/` lands in the file whose charter line - in
+an `ARCHITECTURE_*.md` companion's sec.1, or a role row of `ARCHITECTURE_GPU.md` sec.1.5 - names
+its concern, unless that charter row carries a `must not hold` cell - the concerns that file
+never holds - naming the concern; a diff may instead change that charter line in the same
+change. Another file's charter naming the same kind of code does not license the landing.** `ARCHITECTURE.md`'s sec.1 routing
+block names the companion that holds each file's charter line. A driver arm is host code that
+ensures, binds, or encodes a dispatch; a backend capability is a function a driver registers in
+a hook or capability registry.
 
-**The grid rule of a class whose family ships more than one arm lands in
-`dasllama/dasllama_vulkan_classes.das`.** An arm is one of the coopmat forms a family ships (cm2,
-KHR).
+**A charter line's parenthetical examples illustrate its concern and never narrow it: a diff
+adding a family, format or arm the parenthetical does not name lands it in the file whose
+concern is named, and adds it to that parenthetical in the same change.**
 
-**A host-side ensure/set/encode ladder that picks which stamp to use from the call's own arguments -
-arm, format or shape - lands in `dasllama/dasllama_vulkan_classes.das`; a choice the driver makes
-from the state it armed at bring-up stays in the driver.** A stamp is one class stamped from a
-kernel class template.
+**A file outside `dasllama/` carries no charter line and answers to its own folder's
+checklist.**
+
+**The grid rule - the expression that computes a dispatch's workgroup counts - of a class whose
+family ships more than one arm lands in `dasllama/dasllama_vulkan_classes.das`.** An arm is one
+of the coopmat forms a family ships (cm2, KHR).
+
+**A host-side ensure/set/encode chain (an if/else over stamps) that picks a stamp from its
+push-constant and shape arguments alone lands in `dasllama/dasllama_vulkan_classes.das`.** A
+stamp is one class stamped from a kernel class template; a predicate over shape values alone is
+the classes file's, whoever calls it.
+
+**A host-side ensure/set/encode chain whose pick reads the driver's state - `g_rd` or an
+`RLayer` field - lands in `dasllama/dasllama_vulkan_decode.das` for a decode-time chain,
+`dasllama/dasllama_vulkan_prefill.das` for a batch one.**
+
+**A host-side ensure/set/encode chain that only switches on a stamp it is handed lands in the
+file of the function that decides that stamp.**
 
 **A HOST-side tensor format conversion lands in `dasllama/dasllama_convert.das`; a kernel-side
 decode helper lands in its backend's kernel file (`dasllama/dasllama_metal_kernels.das`,
@@ -47,11 +66,16 @@ class stamped from a template declared elsewhere is not a kernel body: it compil
 pipeline where it is stamped.
 
 **A CPU kernel body under `dasllama/` - the arithmetic loop a `[tune]` family picks one variant
-of - lands in that tier's `dasllama/dasllama_math_<tier>.das`, never in
-`dasllama/dasllama_math.das`.**
+of, or a function a `register_kernel_backend` call names - lands in a tier file,
+`dasllama/dasllama_math_<tier>.das`, never in `dasllama/dasllama_math.das`; a body that a
+`register_kernel_backend` call in another tier file names, or that two tier files' calls name,
+lands in `dasllama/dasllama_math_default.das`.**
 
-**A quirk of one family - a special case only one model architecture's file, or one backend
-driver's, needs - lands in that file, never in another family's file.**
+**A branch keyed on a `Config` flag only one model architecture sets, or a special case only one
+backend driver needs, lands in that architecture's or driver's file - unless it is one arm of a
+kernel two or more architectures share, in which case the arm lands beside the kernel and the
+flag is named in that file's charter line.** A family arm in another family's file is a defect
+either way.
 
 **Logic or a named constant that two files in one folder both use lands in a file both already
 require - a new file of its own when they require none in common - never as a second copy.** Two
@@ -93,14 +117,18 @@ root).
 **An `[init]`-only side-effect require in an engine file (`dasllama/`) lives in
 `dasllama/dasllama_common.das` when `dasllama_common.das`'s own code needs the registration to have
 run and the registered module does not require the engine back, and in
-`dasllama/dasllama_transformer.das` otherwise.** The require umbrella breaks the cycle a module requiring the engine back would close.
+`dasllama/dasllama_transformer.das` otherwise.** The require umbrella breaks the cycle a module
+requiring the engine back would close.
 
 **A registration only a program root (test, harness, benchmark, tool) needs gets no side-effect
 require in an engine file - the program root requires the registration module directly.**
 
-**A function in `dasllama/dasllama_common.das` that calls through a hook another module
-registers panics on the unset hook with a message naming the module to require.** A forwarder
+**A function in `dasllama/dasllama_common.das` that performs work through a hook another module
+registers panics on the unset hook, with a message naming the module to require.** A function
 that returns quietly hides which registration a program root forgot.
+
+**A function in `dasllama/dasllama_common.das` that reports whether a hook another module
+registers is installed returns false when the hook is unset - never a panic.**
 
 **A `dasllama/` module whose `[init]` registers a hook the engine dispatches through gets its
 side-effect require in the same change that adds it** - a registration no engine file reaches
@@ -109,7 +137,3 @@ never fires for a consumer of the `dasllama/dasllama.das` facade.
 **Platform-specific code - a device call, a `require` of a backend module, or a read of a
 backend's own state other than its `g_env_<backend>` knobs - in an engine file (`dasllama/`) lands only
 in that platform's backend file.**
-
-**A diff that adds to `dasllama/dasllama_common.das` a module global (`let` or `var`, private or
-not) whose concern the file's charter line in `ARCHITECTURE_ENGINE.md` sec.1 does not name is a
-defect - give the concern its own file, or extend the charter line in the same change.**

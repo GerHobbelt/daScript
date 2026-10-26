@@ -2,11 +2,10 @@
 
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.**
 
-**A diff to a function carrying `[metal_kernel]`, `[spirv_kernel]`, or an annotation whose name
-ends `_shader` and comes from `dasSpirv`, `dasVulkan` or `dasMetal`; to any `def` such a
-function reaches directly or through another; or to a class whose own or inherited method carries
-`[metal_kernel]` or `[spirv_kernel]`, or to a class such a class inherits from, member
-declarations included, or to a struct a `@push_constant` member of either class names - applies
+**A diff touching what an emitter compiles into a kernel - a function carrying `[metal_kernel]`,
+`[spirv_kernel]` or a `_shader` annotation from `dasSpirv`, `dasVulkan` or `dasMetal`, every
+`def` it reaches, the class and base classes such a method belongs to with their member
+declarations, and the structs their `@push_constant` members name - applies
 `REVIEW_SHADER_EMITTERS.md` (beside this file) together with its own folder's checklist.**
 
 **In its own `initDependencies`, a C++ module calls `Module::require("<name>")` for every in-tree

@@ -166,7 +166,8 @@ typedef RdecDnPrefillOwnFn = function<(l : int64; stp : float?; histp : float?) 
 //! the classifier plane, and the epilogue its logits take: the final softcap (0 = none) and the checkpoint's suppressed token ids
 typedef RdecSetClsFn = function<(cls_block : int64; cls_fmt : int; cap : float; supp : array<int64>) : void>
 //! `ple_row` / `ple_rows`: the per-layer-embedding side input the CPU pre-step built ([layers x ple] a token; position-major over a prompt); empty on a model without one
-typedef RdecTokenFn = function<(x : array<float>; cossin : array<float>; ple_row : array<float>; pos : int64; cnt : int64; var logits : array<float>) : void>
+//! `pick_only`: land the row's argmax id alone (the answer) and leave `logits` unwritten; false lands the logits and answers -1
+typedef RdecTokenFn = function<(x : array<float>; cossin : array<float>; ple_row : array<float>; pos : int64; cnt : int64; pick_only : bool; var logits : array<float>) : int64>
 //! `ple_raw`: the rows are the gather half alone (sqrt(ple)-scaled table rows) and the driver finishes the pre-step on device; false = the finished side input
 typedef RdecPrefillFn = function<(x_batch : array<float>; cos_batch : array<float>; ple_rows : array<float>; ple_raw : bool; npos : int64; pos0 : int64; var logits : array<float>) : void>
 typedef RdecSyncKvFn = function<(l : int64; kp : uint8 const?; vp : uint8 const?; npos : int64) : void>
@@ -193,9 +194,10 @@ def private rdec_unset_dn_own(l : int64; stp : float?; histp : float?) {}
 def private rdec_unset_dn_prefill_own(l : int64; stp : float?; histp : float?) {}
 [unused_argument(cls_block, cls_fmt, cap, supp)]
 def private rdec_unset_set_cls(cls_block : int64; cls_fmt : int; cap : float; supp : array<int64>) {}
-[unused_argument(x, cossin, ple_row, pos, cnt, logits)]
-def private rdec_unset_token(x : array<float>; cossin : array<float>; ple_row : array<float>; pos, cnt : int64; var logits : array<float>) {
+[unused_argument(x, cossin, ple_row, pos, cnt, pick_only, logits)]
+def private rdec_unset_token(x : array<float>; cossin : array<float>; ple_row : array<float>; pos, cnt : int64; pick_only : bool; var logits : array<float>) : int64 {
     panic("dasLLAMA: resident decode token hit without an installed GPU driver")
+    return -1l
 }
 [unused_argument(x_batch, cos_batch, ple_rows, ple_raw, npos, pos0, logits)]
 def private rdec_unset_prefill(x_batch : array<float>; cos_batch : array<float>; ple_rows : array<float>; ple_raw : bool; npos : int64; pos0 : int64; var logits : array<float>) {
@@ -481,7 +483,7 @@ def public rdec_prepare(n_layers, n_attn, dim, qd, kv_dim, head_size, n_heads, h
 def public rdec_upload_norms(norms : array<float>; obias : bool) { invoke(g_rdec_norms, norms, obias) }
 def public rdec_set_layer(l, mir_idx, bq, bk, bv, bo, b1, b3, b2 : int64; fq, fk, fv, fo, f1, f3, f2 : int; g : RdecLayerGeom) { invoke(g_rdec_set_layer, l, mir_idx, bq, bk, bv, bo, b1, b3, b2, fq, fk, fv, fo, f1, f3, f2, g) }
 def public rdec_set_cls(cls_block : int64; cls_fmt : int; cap : float; supp : array<int64>) { invoke(g_rdec_set_cls, cls_block, cls_fmt, cap, supp) }
-def public rdec_token(x : array<float>; cossin : array<float>; ple_row : array<float>; pos, cnt : int64; var logits : array<float>) { invoke(g_rdec_token, x, cossin, ple_row, pos, cnt, logits) }
+def public rdec_token(x : array<float>; cossin : array<float>; ple_row : array<float>; pos, cnt : int64; pick_only : bool; var logits : array<float>) : int64 => invoke(g_rdec_token, x, cossin, ple_row, pos, cnt, pick_only, logits)
 def public rdec_prefill(x_batch : array<float>; cos_batch : array<float>; ple_rows : array<float>; ple_raw : bool; npos : int64; pos0 : int64; var logits : array<float>) { invoke(g_rdec_prefill, x_batch, cos_batch, ple_rows, ple_raw, npos, pos0, logits) }
 def public rdec_sync_kv(l : int64; kp : uint8 const?; vp : uint8 const?; npos : int64) { invoke(g_rdec_sync_kv, l, kp, vp, npos) }
 def public rdec_read_kv(l, pos : int64; var kp : uint8?; var vp : uint8?) { invoke(g_rdec_read_kv, l, pos, kp, vp) }
@@ -613,6 +615,22 @@ var g_moe_gpu_dnd_route = true
 var g_moe_gpu_dn_flush = @@moe_gpu_noop_dn_flush
 var g_moe_gpu_dn_invalidate = @@moe_gpu_noop_dn_invalidate
 var g_moe_gpu_dn_release = @@moe_gpu_noop_dn_release
+
+//! How many sessions' recurrent state a driver keeps device-resident at once: a scheduler names
+//! its stream count before the first prefill, so no stream's state evicts under the batch it rides
+typedef MoeGpuDnRoomFn = function<(n : int64) : void>
+[unused_argument(n)]
+def private moe_gpu_noop_dn_room(n : int64) {}
+var g_moe_gpu_dn_room = @@moe_gpu_noop_dn_room
+
+def gpu_dn_room_(n : int64) {
+    invoke(g_moe_gpu_dn_room, n)
+}
+
+//! Tier registration of the room seam (beside set_moe_gpu_dn_state_hooks).
+def public set_moe_gpu_dn_room_hook(room : MoeGpuDnRoomFn) {
+    g_moe_gpu_dn_room = room
+}
 
 def public moe_gpu_dnd_on_gpu(l : int64) : bool {
     return g_moe_gpu_installed && g_moe_gpu_dnd_route && key_exists(g_moe_gpu_dn_layers, l)
@@ -1265,12 +1283,12 @@ def public install_rdec_note_weight_bytes(f : function<(bytes : int64) : void>) 
     g_rdec_note_weight_bytes = f
 }
 
-//! the N-row token command: `nrows` rows of x and cos/sin, each row's position, cached count and mirror region, each row's
-//! logits landed at its own `lrows` pointer (a session's logits row)
-typedef RdecTokenNFn = function<(x : array<float>; cossin : array<float>; poss : array<int64>; cnts : array<int64>; regs : array<int64>; nrows : int64; lrows : array<float?>) : void>
+//! the N-row token command: `nrows` rows of x, cos/sin and the per-layer-embedding side input (empty where the model has none; `ple_raw` says the rows are the gathered table rows the device projects, not the finished pre-step), each row's position, cached count and mirror region, each row's
+//! logits landed at its own `lrows` pointer (a session's logits row) - or, where the pointer is null, the row's argmax id alone into `picks` (-1 on a landed row); two rows at least - a one-row step is the one-row command's
+typedef RdecTokenNFn = function<(x : array<float>; cossin : array<float>; ple : array<float>; ple_raw : bool; poss : array<int64>; cnts : array<int64>; regs : array<int64>; nrows : int64; lrows : array<float?>; var picks : array<int64>) : void>
 
-[unused_argument(x, cossin, poss, cnts, regs, nrows, lrows)]
-def private rdec_unset_token_n(x : array<float>; cossin : array<float>; poss : array<int64>; cnts : array<int64>; regs : array<int64>; nrows : int64; lrows : array<float?>) {
+[unused_argument(x, cossin, ple, ple_raw, poss, cnts, regs, nrows, lrows, picks)]
+def private rdec_unset_token_n(x : array<float>; cossin : array<float>; ple : array<float>; ple_raw : bool; poss : array<int64>; cnts : array<int64>; regs : array<int64>; nrows : int64; lrows : array<float?>; var picks : array<int64>) {
     panic("dasLLAMA: resident N-row token hit without an installed GPU driver")
 }
 def private rdec_no_token_n_rows : int64 => 0l
@@ -1278,19 +1296,24 @@ var private g_rdec_token_n = @@rdec_unset_token_n
 var private g_rdec_token_n_rows = @@rdec_no_token_n_rows
 
 //! Install the N-row token command beside the resident driver: `rows` answers how many rows it steps at once on the armed model (0 = none)
-[arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#nrow-token-command")]
+[arch(at="../ARCHITECTURE_GPU_VULKAN_NROW.md#nrow-token-command")]
 def public install_moe_gpu_resident_batch(token_n : RdecTokenNFn; rows : function<() : int64>) {
     g_rdec_token_n = token_n
     g_rdec_token_n_rows = rows
 }
 
-[arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#nrow-token-command")]
-def public rdec_token_n(x : array<float>; cossin : array<float>; poss : array<int64>; cnts : array<int64>; regs : array<int64>; nrows : int64; lrows : array<float?>) {
-    invoke(g_rdec_token_n, x, cossin, poss, cnts, regs, nrows, lrows)
+[arch(at="../ARCHITECTURE_GPU_VULKAN_NROW.md#nrow-token-command")]
+def public rdec_token_n(x : array<float>; cossin : array<float>; ple : array<float>; ple_raw : bool; poss : array<int64>; cnts : array<int64>; regs : array<int64>; nrows : int64; lrows : array<float?>; var picks : array<int64>) {
+    invoke(g_rdec_token_n, x, cossin, ple, ple_raw, poss, cnts, regs, nrows, lrows, picks)
+    g_rdec_nrow_steps++
 }
 
 //! the rows the armed driver's N-row command steps at once; 0 where the model or the driver has none
 def public rdec_token_n_rows() : int64 => invoke(g_rdec_token_n_rows)
+
+var private g_rdec_nrow_steps = 0l
+//! the batched steps the N-row command has served this process: a cell reads the difference across its steps
+def public rdec_nrow_steps() : int64 => g_rdec_nrow_steps
 
 [unused_argument(regions)]
 def private moe_gpu_no_binding_cap(regions : int64) : int64 => 0l
@@ -1912,6 +1935,9 @@ def private restore_gpu_tier_fn_defaults { // nolint:STYLE037,STYLE038 — flat 
     }
     if (g_moe_gpu_dn_release == null) {
         g_moe_gpu_dn_release = @@moe_gpu_noop_dn_release
+    }
+    if (g_moe_gpu_dn_room == null) {
+        g_moe_gpu_dn_room = @@moe_gpu_noop_dn_room
     }
     if (g_moe_gpu_heat_query == null) {
         g_moe_gpu_heat_query = @@moe_gpu_unset_heat_query

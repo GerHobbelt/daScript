@@ -18,13 +18,13 @@ require ?vulkan dasllama/dasllama_vulkan_prefill
 require ?vulkan dasllama/dasllama_vulkan_decode   // da_nsplit - the decode attention's key-split pick the tile-pick cell pins
 require ?vulkan dasllama/dasllama_vulkan_seams
 require ?vulkan dasllama/dasllama_kqformat
-require ?vulkan dasllama/dasllama_gemm_schema   // kq_dev_ssb_i - the fixtures size their device scale planes per format
+require dasllama/dasllama_gemm_schema   // Q8_BLOCK_ELEMS sizes the q8 plane helper outside the vulkan arm; kq_dev_ssb_i - the fixtures size their device scale planes per format
 require ?vulkan daslib/shader_lingua_franca   // gl_GlobalInvocationID — the CPU replay drives it per lane (only vulkan-guarded arms replay)
 require dasllama/dasllama_common   // MoeGate: the routing cells' select oracle takes the softmax router
 require ?vulkan dasllama/dasllama_moe   // moe_select_core: the host select the window's per-row top-k mirrors
 require daslib/fio   // the lens readonly gate's spawned compiles
 require daslib/strings_boost   // join: the spawned fixture's source
-require ?vulkan daslib/math_bits   // float_bits_to_uint: the f16 GEMM cell reads its NaN sentinel by bit pattern
+require daslib/math_bits   // float_bits_to_uint / uint_bits_to_float: the NaN sentinel by bit pattern, the read-back planes as floats
 
 let private TILE_SLACK_ROWS = int(TILE_READ_SLACK)   //! the cm2 fixtures' rows past the last region, the engine's count: a stamp that loads partial columns unclamped (`STILE`) reads the last region's column rounded up to its BN, so the slack holds while every such stamp keeps BN <= slack + 1
 let private TILE_CELL_K = 768   //! every per-format tile cell's K: three unrolled superblock passes on both depths (a K-quant width is a multiple of 256, so no K-quant stamp ever takes the k loop's tail; the q8 s and e cells' Q8_CELL_K takes the edge path)
@@ -113,18 +113,22 @@ def private tile_fixture_upload(var f : TileFixture) {
     }
 }
 
-//! the q8 fmt-0 host planes: s8 quant bytes and f16 scale pairs from two seeds, K = n over both weight planes
-def private q8_planes(n : int; wq_seed, ws_seed : uint; var wqh, wsh : array<uint>) {
-    let totblk = 2 * TILE_CELL_D * (n / 32)
-    wqh |> resize(totblk * 8)
-    wsh |> resize((totblk + 1) / 2)
-    for (i in range(totblk * 8)) {
-        wqh[i] = hash_word(uint(i) + wq_seed)
+//! one q8 fmt-0 host plane of `totblk` blocks: the s8 quant words hashed at `i * wq_mul + wq_add`, the f16 scale pairs at `i * ws_mul + ws_add`
+def private q8_plane(totblk : int; wq_mul, wq_add, ws_mul, ws_add : uint; var wqh, wsh : array<uint>) {
+    let qwords = totblk * int(Q8_BLOCK_ELEMS / 4l)   //! a byte an element: q8 has no `kq_desc` stride row (`kq_qsb` panics on it by design)
+    let swords = (totblk * 2 + 3) / 4   //! an f16 scale a block
+    wqh |> resize(qwords)
+    wsh |> resize(swords)
+    for (i in range(qwords)) {
+        wqh[i] = hash_word(uint(i) * wq_mul + wq_add)
     }
-    for (i in range((totblk + 1) / 2)) {
-        wsh[i] = ws_word(uint(i) + ws_seed)
+    for (i in range(swords)) {
+        wsh[i] = ws_word(uint(i) * ws_mul + ws_add)
     }
 }
+
+//! the tile cells' q8 fmt-0 host planes from two seeds, K = n over both weight planes
+def private q8_planes(n : int; wq_seed, ws_seed : uint; var wqh, wsh : array<uint>) => q8_plane(2 * TILE_CELL_D * (n / 32), 1u, wq_seed, 1u, ws_seed, wqh, wsh)
 
 //! a tile cell's arms over one fixture, each the device serves: the schedule at the arm's rows a workgroup with two sentinel map words past it (the dispatch runs over them as the device-written schedules' upper bound does, and a tile that reads one returns before its first store), the y plane under the NaN sentinel, the format's oracle, the bars and their poison control; the cell skips when the device serves none of them; the last arm's oracle plane comes back
 def private tile_cell_arms(t : T?; tag : string; fmt : int; var f : TileFixture; arms : array<int>;
@@ -991,6 +995,223 @@ def test_vkd_ar_class(t0 : T?) {
     }
 }
 
+//! the classifier epilogue's rows form: `rows` logits rows through one dispatch of `rows` (the whole plane), or a
+//! dispatch of one row `rows` times - the row-at-a-time form is the rows form at one row
+def private cls_epi_rows_run(y : array<float>; supp : array<uint>; vocab, rows : int64; cap : float; a_row_at_a_time : bool) : array<float> {
+    var yc : array<float>
+    static_if (typeinfo builtin_module_exists(vulkan)) {
+        let row_bytes = vocab * 4l
+        let sbytes = max(long_length(supp), 1l) * 4l
+        let sd = make_device_buf(sbytes)
+        var host = make_host_buf(row_bytes * rows, true, [cached = true])
+        yc |> resize(vocab * rows)
+        let begin = VkCommandBufferBeginInfo()
+        unsafe {
+            if (!empty(supp)) {
+                upload_region_at(sd, 0l, addr<uint8 const?>(supp[0]), sbytes)
+            }
+            let per = a_row_at_a_time ? 1l : rows   //! rows a dispatch
+            var r0 = 0l
+            while (r0 < rows) {
+                let bytes = row_bytes * per
+                let yd = make_device_buf(bytes)
+                upload_region_at(yd, 0l, addr<uint8 const?>(y[r0 * vocab]), bytes)
+                var s = set_cls_epi(fixed_array(yd, sd), fixed_array(bytes, sbytes), fixed_array(1u, 0u))
+                var raw = alloc_cmd()
+                vk_check(vkBeginCommandBuffer(raw, begin), null)
+                var h : VkHaz
+                var pc = ClsEpiArgs(vocab = uint(vocab), cap = cap, nsupp = uint(length(supp)), rows = uint(per))
+                enc_cls_epi(raw, h, s, pc, (vocab * per + 255l) / 256l)
+                vhz_dep(raw, h, 1u, 0u, true)
+                cmd_copy_whole(raw, yd, host.buf, bytes)
+                vk_check(vkEndCommandBuffer(raw), null)
+                submit_wait(raw)
+                memcpy(addr<void?>(yc[r0 * vocab]), host.mapped, bytes)
+                r0 += per
+            }
+        }
+    }
+    return <- yc
+}
+
+[test]
+def test_vkd_cls_epi_rows(t0 : T?) {
+    t0 |> run("cls_epi over four logits rows == the one-row dispatch a row at a time, and the CPU softcap with the pins") <| @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            if (!ensure_cls_epi()) {
+                t |> skip("no Vulkan device")
+                return
+            }
+            let vocab = 1000l   //! off the 256-lane grid, so the last workgroup's guard is exercised on every row
+            let rows = 4l
+            let cap = 30.0
+            var supp <- [3u, 777u, 999u]
+            var y : array<float>
+            y |> resize(vocab * rows)
+            for (i in range64(vocab * rows)) {
+                y[i] = float((i * 37l) % 211l) * 0.7 - 60.0   //! reaches past the cap on both sides
+            }
+            var want : array<float>   // the CPU form: the cap in the exp form the kernel takes, then the pins
+            want |> resize(vocab * rows)
+            for (i in range64(vocab * rows)) {
+                var v = softcap_exp(y[i], cap)
+                let id = uint(i % vocab)
+                for (s in supp) {
+                    if (s == id) {
+                        v = -1.0e30
+                    }
+                }
+                want[i] = v
+            }
+            var four <- cls_epi_rows_run(y, supp, vocab, rows, cap, false)
+            var one <- cls_epi_rows_run(y, supp, vocab, rows, cap, true)
+            var bad = 0
+            var over = 0
+            var over_poison = 0
+            var pinned = 0
+            var maxdiff = 0.0
+            var worst = 0l
+            let bar = 1e-4
+            for (i in range64(vocab * rows)) {
+                if (four[i] != one[i]) {
+                    bad++
+                }
+                if (want[i] <= -1.0e29) {
+                    if (four[i] <= -1.0e29) {
+                        pinned++
+                    }
+                } else {
+                    let d = abs(four[i] - want[i])
+                    if (d > maxdiff) {
+                        maxdiff = d
+                        worst = i
+                    }
+                    if (d > bar) {
+                        over++
+                    }
+                    if (abs(four[i] - (want[i] + 0.01)) > bar) {
+                        over_poison++
+                    }
+                }
+            }
+            t |> success(bad == 0, "the four-row dispatch is the one-row dispatch a row at a time, bit for bit ({bad} of {vocab * rows} diverge)")
+            t |> success(over == 0, "every capped logit within {bar} of the CPU softcap ({over} over; max difference {maxdiff} at row {worst / vocab} id {worst % vocab})")
+            t |> success(over_poison > 0, "the bar is live: an added 0.01 lands outside it ({over_poison} over)")
+            t |> equal(pinned, int(rows) * length(supp), "every suppressed id pinned on every row")
+            delete four
+            delete one
+            delete want
+            delete y
+            delete supp
+        } else {
+            t |> skip("dasVulkan not present")
+        }
+    }
+}
+
+//! the device pick of every row of a [rows x vocab] plane: the first maximum's id a row, as the host reads it
+def private cls_argmax_run(y : array<float>; vocab, rows : int64) : array<uint> {
+    var ids : array<uint>
+    static_if (typeinfo builtin_module_exists(vulkan)) {
+        let bytes = vocab * 4l * rows
+        let nchunk = int64(CLS_ARGMAX_CHUNKS)
+        let pbytes = rows * nchunk * 4l
+        let yd = make_device_buf(bytes)
+        let pmd = make_device_buf(pbytes)
+        let pid = make_device_buf(pbytes)
+        let pd = make_device_buf(rows * 4l)
+        var host = make_host_buf(rows * 4l, true, [cached = true])
+        ids |> resize(rows)
+        unsafe {
+            upload_region_at(yd, 0l, addr<uint8 const?>(y[0]), bytes)
+            nan_sentinel_upload(pmd, pbytes)   //! the partials the second pass reads: an unwritten slot must be a sentinel, not a stale max
+            nan_sentinel_upload(pid, pbytes)
+            nan_sentinel_upload(pd, rows * 4l)
+            var sp = set_cls_argmax_part(fixed_array(yd, pmd, pid), fixed_array(bytes, pbytes, pbytes), fixed_array(1u, 2u, 2u))
+            var sf = set_cls_argmax_fin(fixed_array(pmd, pid, pd), fixed_array(pbytes, pbytes, rows * 4l), fixed_array(2u, 2u, 4u))
+            var raw = alloc_cmd()
+            let begin = VkCommandBufferBeginInfo()
+            vk_check(vkBeginCommandBuffer(raw, begin), null)
+            var h : VkHaz
+            var pc = ArgmaxArgs(vocab = uint(vocab))
+            enc_cls_argmax_part(raw, h, sp, pc, rows * nchunk)
+            enc_cls_argmax_fin(raw, h, sf, pc, rows)
+            vkd_run_copy(raw, h, pd, host, rows * 4l, 4u)
+            memcpy(addr<void?>(ids[0]), host.mapped, rows * 4l)
+        }
+    }
+    return <- ids
+}
+
+//! the host's reading of the same plane: the first maximum a row, the walk `parallel_argmax` runs - which splits a row this
+//! wide across a job queue, and this model-free file opens none
+def private first_max_rows(y : array<float>; vocab, rows : int64) : array<uint> {
+    var ids : array<uint>
+    ids |> resize(rows)
+    for (r in range64(rows)) {
+        var mi = 0l
+        for (i in range64(1l, vocab)) {
+            if (y[r * vocab + i] > y[r * vocab + mi]) {
+                mi = i
+            }
+        }
+        ids[r] = uint(mi)
+    }
+    return <- ids
+}
+
+[test]
+def test_vkd_cls_argmax(t0 : T?) {
+    t0 |> run("cls_argmax: every row's pick is the first maximum's id through the two passes, at a 262144 and a 1000 vocab, ties and an all-equal row included") <| @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            if (!ensure_cls_argmax_part() || !ensure_cls_argmax_fin()) {
+                t |> skip("no Vulkan device")
+                return
+            }
+            for (vocab in fixed_array(262144l, 1000l)) {
+                let rows = 4l
+                var y : array<float>
+                y |> resize(vocab * rows)
+                for (i in range64(vocab * rows)) {
+                    y[i] = hash_unit(uint(i) * 7u + 3u) * 20.0
+                }
+                //! row 1's maximum sits twice: the lower id must win, as the host's first-maximum walk reads
+                let hi = 50.0   //! past the plane's range (hash_unit spans [-2, 2), scaled by 20)
+                y[vocab + 900l] = hi
+                y[vocab + 37l] = hi
+                y[2l * vocab + vocab - 1l] = hi   //! row 2's at the last id
+                for (i in range64(vocab)) {   //! row 0 pinned whole (every id suppressed): the first id wins, as the host's walk reads
+                    y[i] = -1.0e30
+                }
+                var got <- cls_argmax_run(y, vocab, rows)
+                var want <- first_max_rows(y, vocab, rows)
+                var bad = 0
+                for (r in range64(rows)) {
+                    if (got[r] != want[r]) {
+                        bad++
+                    }
+                }
+                t |> success(bad == 0, "vocab {vocab}: every row's device pick is the host's first maximum ({bad} of {rows} rows off; row 1 {got[1]} of {want[1]}, row 2 {got[2]} of {want[2]})")
+                t |> equal(int64(want[1]), 37l, "vocab {vocab}: the tie lands on the lower id")
+                t |> equal(int64(got[0]), 0l, "vocab {vocab}: the all-equal row lands id 0")
+                want[3] = want[3] == 0u ? 1u : 0u   //! the poison: a wrong id on one row must red the compare
+                var badp = 0
+                for (r in range64(rows)) {
+                    if (got[r] != want[r]) {
+                        badp++
+                    }
+                }
+                t |> equal(badp, 1, "vocab {vocab}: the pick compare reds one poisoned row")
+                delete got
+                delete want
+                delete y
+            }
+        } else {
+            t |> skip("no vulkan module")
+        }
+    }
+}
+
 [test]
 def test_vkd_cls_ar_row0(t0 : T?) {
     t0 |> run("cls_ar with a row base lands on the rows from row0 and leaves the rows below untouched") <| @(t : T?) {
@@ -1316,17 +1537,6 @@ def private mismatch_exact(got, want : array<float>) : int {
     var bad = 0
     for (g, w in got, want) {
         if (g != w) {
-            bad++
-        }
-    }
-    return bad
-}
-
-//! `mismatch_exact` over the first `n` elements: the rows a dispatch wrote, the sentinel past them left to its own assert
-def private mismatch_exact(got, want : array<float>; n : int) : int {
-    var bad = 0
-    for (i in range(n)) {
-        if (got[i] != want[i]) {
             bad++
         }
     }
@@ -3684,7 +3894,7 @@ def test_vkd_cm2l_split(t0 : T?) {
 //! stores - Q8_0 blocks of 32 (`DA_RQ_Q8`) or Q8_K superblocks of 256 (`DA_RQ_Q8K`, a head of 256 or 512) - against the
 //! CPU oracle's row quantized the same way: every scale within a hair, every quant within one step (the row itself
 //! carries the f32 noise the plain arms allow), on a sentinel fill; the row store itself is held to the oracle too
-def private da_attn_rqk_arm(t : T?; hs, nheads, kv_mul, cnt, nsplit : int; rqk : uint) {
+def private da_attn_rqk_arm(t : T?; hs, nheads, kv_mul, cnt, nsplit : int; rqk : uint; slab2 : bool = false) {
     static_if (typeinfo builtin_module_exists(vulkan)) {
         let kvd = (nheads / kv_mul) * hs
         let qdim = nheads * hs
@@ -3722,7 +3932,7 @@ def private da_attn_rqk_arm(t : T?; hs, nheads, kv_mul, cnt, nsplit : int; rqk :
         y_cls |> resize(qdim)
         q_cls |> resize(qdim)
         s_cls |> resize(qdim / blk)
-        verify(ensure_da_attn_cls(), "the decode attention class rail must engage on a live device")
+        verify(ensure_da_attn_cls() && (!slab2 || ensure_da_attn_g2_cls()), "the decode attention class rail must engage on a live device")
         unsafe {
             upload_region_at(qd, 0l, addr<uint8 const?>(qh[0]), q_bytes)
             upload_region_at(kd, 0l, addr<uint8 const?>(kh[0]), m_bytes)
@@ -3745,7 +3955,11 @@ def private da_attn_rqk_arm(t : T?; hs, nheads, kv_mul, cnt, nsplit : int; rqk :
             var h : VkHaz
             var pc = DaAttnArgs(kvd = uint(kvd), hs = uint(hs), kv_mul = uint(kv_mul), kbase = 0u, vbase = 0u,
                 scale = scale, nsplit = uint(nsplit), rqk = rqk, cntoff = uint(cnt_off))
-            enc_da_attn_cls(raw, h, sc, pc, da_attn_row_wgs(int64(nheads), int64(kv_mul), int64(nsplit)))
+            if (slab2) {
+                enc_da_attn_g2_cls(raw, h, sc, pc, da_attn_row_wgs(int64(nheads), int64(kv_mul), int64(nsplit)))
+            } else {
+                enc_da_attn_cls(raw, h, sc, pc, da_attn_row_wgs(int64(nheads), int64(kv_mul), int64(nsplit)))
+            }
             vhz_dep(raw, h, 16u | 64u, 0u, true)
             cmd_copy_range(raw, yd, 0l, host.buf, 0l, q_bytes)
             cmd_copy_range(raw, aqd, 0l, host.buf, q_bytes, int64(qdim))
@@ -3761,9 +3975,46 @@ def private da_attn_rqk_arm(t : T?; hs, nheads, kv_mul, cnt, nsplit : int; rqk :
         for (hh in range(nheads)) {
             attn_row_oracle(qh, hh * hs, kh, 0, vh, 0, kvd, hh, hs, kv_mul, cnt, scale, y_ref, hh * hs)
         }
-        let arm = "hs {hs} x {nheads} heads, {nsplit} split(s), {rqk == DA_RQ_Q8K ? "Q8_K" : "Q8_0"}"
+        let arm = "hs {hs} x {nheads} heads, {nsplit} split(s), {rqk == DA_RQ_Q8K ? "Q8_K" : "Q8_0"}{slab2 ? ", the two-head slab" : ""}"
         let bad = mismatch_approx(y_cls, y_ref)
         t |> success(bad == 0, "folded-requant attention ({arm}): the row matches the CPU oracle ({bad} of {qdim} off)")
+        y_ref[hs / 2] += 0.5
+        t |> equal(mismatch_approx(y_cls, y_ref), 1, "folded-requant attention ({arm}): the row's bar reds one poisoned element")
+        y_ref[hs / 2] -= 0.5
+        if (slab2) {   //! the second lane: the four-head slab at the same shape, whose dead lanes contribute zero - the two round alike
+            var y_g4 : array<float>
+            y_g4 |> resize(qdim)
+            unsafe {
+                nan_sentinel_upload(yd, q_bytes)
+                var tokb4 = make_host_buf(16l, true)
+                var tmc4 = reinterpret<TokMeta?>(tokb4.mapped)
+                tmc4.cnt = uint(cnt)
+                tmc4.mirbase = 0u
+                var sc4 = set_da_attn_cls(fixed_array(qd, kd, vd, yd, tokb4.buf, partd, aqd, asd),
+                    fixed_array(q_bytes, m_bytes, m_bytes, q_bytes, 16l, p_bytes, int64(qdim), s_bytes),
+                    fixed_array(1u, 2u, 4u, 16u, 0u, 32u, 64u, 64u))
+                var raw4 = alloc_cmd()
+                let begin4 = VkCommandBufferBeginInfo()
+                vk_check(vkBeginCommandBuffer(raw4, begin4), null)
+                var h4 : VkHaz
+                var pc4 = DaAttnArgs(kvd = uint(kvd), hs = uint(hs), kv_mul = uint(kv_mul), kbase = 0u, vbase = 0u,
+                    scale = scale, nsplit = uint(nsplit), rqk = rqk, cntoff = uint(cnt_off))
+                enc_da_attn_cls(raw4, h4, sc4, pc4, da_attn_row_wgs(int64(nheads), int64(kv_mul), int64(nsplit)))
+                vhz_dep(raw4, h4, 16u, 0u, true)
+                cmd_copy_range(raw4, yd, 0l, host.buf, 0l, q_bytes)
+                vk_check(vkEndCommandBuffer(raw4), null)
+                submit_wait(raw4)
+                memcpy(addr<void?>(y_g4[0]), host.mapped, q_bytes)
+            }
+            var apart = 0
+            for (i in range(qdim)) {
+                if (y_g4[i] != y_cls[i]) {
+                    apart++
+                }
+            }
+            t |> success(apart == 0, "folded-requant attention ({arm}): the two-head slab is the four-head slab bit for bit ({apart} of {qdim} apart)")
+            delete y_g4
+        }
         // the oracle's own quantization of its row: the block's amax over 127, the quants rounded against it
         var bad_s = 0
         var bad_q = 0
@@ -3810,6 +4061,14 @@ def test_vkd_da_attn_rqk(t0 : T?) {
             da_attn_rqk_arm(t, 256, 2, 1, 70, 4, DA_RQ_Q8K)    //! ... the last piece's combine
             da_attn_rqk_arm(t, 512, 2, 2, 70, 4, DA_RQ_Q8K)    //! the wide head: two superblocks, the last piece's combine
             da_attn_rqk_arm(t, 512, 2, 2, 70, 1, DA_RQ_Q8)     //! the wide head's Q8_0 blocks, the pass
+            //! the two-head slab stamp on the groups it serves: two heads a group (gemma-4's shape at 256 and 512), one head a
+            //! group (the dead lane through the pass's store and through the combine)
+            da_attn_rqk_arm(t, 64, 4, 2, 300, 1, DA_RQ_Q8, true)
+            da_attn_rqk_arm(t, 64, 4, 2, 300, 8, DA_RQ_Q8, true)
+            da_attn_rqk_arm(t, 256, 2, 2, 70, 1, DA_RQ_Q8K, true)
+            da_attn_rqk_arm(t, 256, 2, 1, 70, 1, DA_RQ_Q8K, true)
+            da_attn_rqk_arm(t, 256, 2, 1, 70, 4, DA_RQ_Q8K, true)
+            da_attn_rqk_arm(t, 512, 2, 2, 70, 4, DA_RQ_Q8K, true)
         } else {
             t |> skip("dasVulkan not present")
         }
@@ -4092,7 +4351,7 @@ def test_vkd_da_attn(t0 : T?) {
 //! `nrows` rows through one dispatch, row r's q past r x qdim and its K/V in its own mirror region (`tok[r].mirbase`, the
 //! second region's content scaled by 1.5), each row against the oracle over its own region; the split arm submits the
 //! same command a second time, so the arrival counters the pass resets must have rearmed; every bar with its poison
-def private da_attn_shape_arm(t : T?; hs, nheads, kv_mul, cnt, nsplit, nrows : int) {
+def private da_attn_shape_arm(t : T?; hs, nheads, kv_mul, cnt, nsplit, nrows : int; slab2 : bool = false) {
     static_if (typeinfo builtin_module_exists(vulkan)) {
         let kvd = (nheads / kv_mul) * hs
         let qdim = nheads * hs
@@ -4154,7 +4413,11 @@ def private da_attn_shape_arm(t : T?; hs, nheads, kv_mul, cnt, nsplit, nrows : i
             var pc = DaAttnArgs(kvd = uint(kvd), hs = uint(hs), kv_mul = uint(kv_mul), kbase = 0u, vbase = 0u, scale = scale,
                 nsplit = uint(nsplit), rqk = DA_RQ_NONE, cntoff = uint(cnt_off),
                 rowwg = nrows > 1 ? uint(rowwg) : 0u, qrow = nrows > 1 ? uint(qdim) : 0u)
-            enc_da_attn_cls(raw, h, sc, pc, rowwg * int64(nrows))
+            if (slab2) {
+                enc_da_attn_g2_cls(raw, h, sc, pc, rowwg * int64(nrows))
+            } else {
+                enc_da_attn_cls(raw, h, sc, pc, rowwg * int64(nrows))
+            }
             vhz_dep(raw, h, 16u, 0u, true)
             cmd_copy_whole(raw, yd, host.buf, q_bytes)
             vk_check(vkEndCommandBuffer(raw), null)
@@ -4168,7 +4431,7 @@ def private da_attn_shape_arm(t : T?; hs, nheads, kv_mul, cnt, nsplit, nrows : i
                 attn_row_oracle(qh, r * qdim + hh * hs, kh, r * mir_elems, vh, r * mir_elems, kvd, hh, hs, kv_mul, cnt, scale, y_ref, r * qdim + hh * hs)
             }
         }
-        let arm = "hs {hs} x {nheads} heads, {kv_mul} a kv head, {cnt} keys, {nsplit} split(s), {nrows} row(s)"
+        let arm = "hs {hs} x {nheads} heads, {kv_mul} a kv head, {cnt} keys, {nsplit} split(s), {nrows} row(s){slab2 ? ", the two-head slab" : ""}"
         for (r in range(nrows)) {
             let bad = mismatch_approx(y_cls, y_ref, r * qdim, qdim)
             t |> success(bad == 0, "decode attention ({arm}): row {r} matches its own oracle ({bad} of {qdim} off)")
@@ -4208,7 +4471,7 @@ def private da_attn_shape_arm(t : T?; hs, nheads, kv_mul, cnt, nsplit, nrows : i
 def test_vkd_da_attn_shapes(t0 : T?) {
     t0 |> run("decode attention at the shapes the fixed cells leave out == the CPU oracle: ragged key groups, a full four-head slab, a short last slab, a 24-word head, two rows a dispatch") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
-            if (!ensure_da_attn_cls()) {
+            if (!(ensure_da_attn_cls() && ensure_da_attn_g2_cls())) {
                 t |> skip("no Vulkan device")
                 return
             }
@@ -4220,6 +4483,8 @@ def test_vkd_da_attn_shapes(t0 : T?) {
             da_attn_shape_arm(t, 192, 2, 2, 70, 1, 1)    //! 24 words a V row, not a power of two: no fold
             da_attn_shape_arm(t, 64, 4, 2, 300, 1, 2)    //! two rows a dispatch, each over its own mirror region
             da_attn_shape_arm(t, 64, 4, 2, 300, 4, 2)
+            da_attn_shape_arm(t, 64, 4, 2, 300, 1, 2, true)   //! the two-head slab over the rows: the row index and the slab arithmetic together
+            da_attn_shape_arm(t, 64, 4, 2, 300, 4, 4, true)
         } else {
             t |> skip("dasVulkan not present")
         }
@@ -6055,26 +6320,13 @@ def private q8_gemv_gu_run(t; n, hid : int; gelu : bool) {
     let totblk = hid * nb
     let wq_bytes = int64(totblk) * 32l
     let ws_bytes = int64(totblk) * 2l
-    var gqh : array<uint>
-    var gsh : array<uint>
-    var uqh : array<uint>
-    var ush : array<uint>
+    var gqh, gsh, uqh, ush : array<uint>
+    q8_plane(totblk, 1u, 71u, 1u, 3u, gqh, gsh)
+    q8_plane(totblk, 3u, 5u, 7u, 11u, uqh, ush)
     var xqh : array<uint>
     var xsh : array<float>
-    gqh |> resize(totblk * 8)
-    uqh |> resize(totblk * 8)
-    gsh |> resize(totblk / 2 + 1)
-    ush |> resize(totblk / 2 + 1)
     xqh |> resize(nb * 8)
     xsh |> resize(nb)
-    for (i in range(totblk * 8)) {
-        gqh[i] = hash_word(uint(i) + 71u)
-        uqh[i] = hash_word(uint(i) * 3u + 5u)
-    }
-    for (i in range(totblk / 2 + 1)) {
-        gsh[i] = ws_word(uint(i) + 3u)
-        ush[i] = ws_word(uint(i) * 7u + 11u)
-    }
     for (i in range(nb * 8)) {
         xqh[i] = hash_word(uint(i) * 17u + 9u)
     }
@@ -6204,20 +6456,12 @@ def private q8_gemv_pleact_run(t; n, d : int) {
     let totblk = d * nb
     let wq_bytes = int64(totblk) * 32l
     let ws_bytes = int64(totblk) * 2l
-    var wqh : array<uint>
-    var wsh : array<uint>
+    var wqh, wsh : array<uint>
+    q8_plane(totblk, 5u, 19u, 3u, 7u, wqh, wsh)
     var gh : array<float>
     var sh : array<float>
-    wqh |> resize(totblk * 8)
-    wsh |> resize(totblk / 2 + 1)
     gh |> resize(n)
     sh |> resize(3 * n)   // three layers' side rows: the cell reads the middle one
-    for (i in range(totblk * 8)) {
-        wqh[i] = hash_word(uint(i) * 5u + 19u)
-    }
-    for (i in range(totblk / 2 + 1)) {
-        wsh[i] = ws_word(uint(i) * 3u + 7u)
-    }
     for (i in range(n)) {
         gh[i] = float((i * 37) % 101) * 0.06 - 3.0
     }
@@ -6315,45 +6559,64 @@ def private q8_gemv_pleact_run(t; n, d : int) {
 //! `ArRq`'s math on the CPU: the residual row updated in place, the normed (or raw) row's Q8_0 blocks; the counter
 //! reads zero after the dispatch; a poisoned expectation must red
 //! `abias`: the GEMV's row takes a bias row out of the norms plane (its third row here) before the add - gpt-oss's attention output bias
+//! the GEMV-epilogue cells' host fixture: the q8 weight plane over `d` rows of `n`, the Q8_0 x row, the residual row,
+//! and three rows in the norms plane - the post norm at 0, the next norm at d, the bias row at 2d
+struct GemvArFixture {
+    wqh : array<uint>
+    wsh : array<uint>
+    xqh : array<uint>
+    xsh : array<float>
+    xres : array<float>
+    wnh : array<float>
+}
+
+def private q8_gemv_ar_fixture(n, d : int) : GemvArFixture {
+    let nb = n / 32
+    let totblk = d * nb
+    var fx : GemvArFixture
+    fx.wqh |> resize(totblk * 8)
+    fx.wsh |> resize(totblk / 2 + 1)
+    fx.xqh |> resize(nb * 8)
+    fx.xsh |> resize(nb)
+    fx.xres |> resize(d)
+    fx.wnh |> resize(3 * d)
+    for (i in range(totblk * 8)) {
+        fx.wqh[i] = hash_word(uint(i) * 3u + 29u)
+    }
+    for (i in range(totblk / 2 + 1)) {
+        fx.wsh[i] = ws_word(uint(i) * 5u + 1u)
+    }
+    for (i in range(nb * 8)) {
+        fx.xqh[i] = hash_word(uint(i) * 13u + 7u)
+    }
+    for (i in range(nb)) {
+        fx.xsh[i] = 0.2 + float(i % 7) * 0.1
+    }
+    for (i in range(d)) {
+        fx.xres[i] = float((i * 43) % 97) * 0.4 - 19.0
+    }
+    for (i in range(2 * d)) {
+        fx.wnh[i] = 0.8 + float(i % 9) * 0.05
+    }
+    for (i in range(d)) {
+        fx.wnh[2 * d + i] = float((i * 31) % 67) * 0.6 - 19.8   //! a bias of the residual row's own magnitude, so a dropped add is loud
+    }
+    return <- fx
+}
+
 def private q8_gemv_ar_run(t; n, d : int; pre_on, raw : bool; ascale : float; abias : bool = false) {   // nolint:STYLE037 — one linear fixture: the GEMV, the residual step and its quant, each with its bar
     let nb = n / 32
     let totblk = d * nb
     let nblk_out = d / 32
     let wq_bytes = int64(totblk) * 32l
     let ws_bytes = int64(totblk) * 2l
-    var wqh : array<uint>
-    var wsh : array<uint>
-    var xqh : array<uint>
-    var xsh : array<float>
-    var xres : array<float>
-    var wnh : array<float>
-    wqh |> resize(totblk * 8)
-    wsh |> resize(totblk / 2 + 1)
-    xqh |> resize(nb * 8)
-    xsh |> resize(nb)
-    xres |> resize(d)
-    wnh |> resize(3 * d)   // two norm rows - the post norm at 0, the next norm at d - then the bias row at 2d
-    for (i in range(totblk * 8)) {
-        wqh[i] = hash_word(uint(i) * 3u + 29u)
-    }
-    for (i in range(totblk / 2 + 1)) {
-        wsh[i] = ws_word(uint(i) * 5u + 1u)
-    }
-    for (i in range(nb * 8)) {
-        xqh[i] = hash_word(uint(i) * 13u + 7u)
-    }
-    for (i in range(nb)) {
-        xsh[i] = 0.2 + float(i % 7) * 0.1
-    }
-    for (i in range(d)) {
-        xres[i] = float((i * 43) % 97) * 0.4 - 19.0
-    }
-    for (i in range(2 * d)) {
-        wnh[i] = 0.8 + float(i % 9) * 0.05
-    }
-    for (i in range(d)) {
-        wnh[2 * d + i] = float((i * 31) % 67) * 0.6 - 19.8   //! a bias of the residual row's own magnitude, so a dropped add is loud
-    }
+    var fx <- q8_gemv_ar_fixture(n, d)
+    var wqh <- fx.wqh
+    var wsh <- fx.wsh
+    var xqh <- fx.xqh
+    var xsh <- fx.xsh
+    var xres <- fx.xres
+    var wnh <- fx.wnh
     let xq_bytes = int64(nb) * 32l
     let xs_bytes = int64(nb) * 4l
     let r_bytes = int64(d) * 4l
@@ -6536,6 +6799,516 @@ def test_vkd_q8_gemv_ar(t0 : T?) {
     }
 }
 
+//! the epilogue's residual step against the row kernel fed the GEMV's own y row - the same residual row and norms, the
+//! updated row, the quants and the scales bit for bit: the N-row command's sites take the row kernel where the one-row
+//! command's take the epilogue, and the regions cells hold the two commands bit for bit
+def private q8_gemv_ar_twin_run(t; n, d : int; pre_on : bool; ascale : float) {
+    let nb = n / 32
+    let totblk = d * nb
+    let nblk_out = d / 32
+    let wq_bytes = int64(totblk) * 32l
+    let ws_bytes = int64(totblk) * 2l
+    var fx <- q8_gemv_ar_fixture(n, d)
+    let xq_bytes = int64(nb) * 32l
+    let xs_bytes = int64(nb) * 4l
+    let r_bytes = int64(d) * 4l
+    let wn_bytes = int64(3 * d) * 4l
+    let oq_bytes = int64(d)
+    let os_bytes = int64(nblk_out) * 4l
+    let wqd = make_device_buf(wq_bytes)
+    let wsd = make_device_buf(ws_bytes)
+    let xqd = make_device_buf(xq_bytes)
+    let xsd = make_device_buf(xs_bytes)
+    let yd = make_device_buf(r_bytes)
+    let xr_epi = make_device_buf(r_bytes)
+    let xr_row = make_device_buf(r_bytes)
+    let wnd = make_device_buf(wn_bytes)
+    let oq_epi = make_device_buf(oq_bytes)
+    let os_epi = make_device_buf(os_bytes)
+    let oq_row = make_device_buf(oq_bytes)
+    let os_row = make_device_buf(os_bytes)
+    let cntd = make_device_buf(16l)
+    var zeros : array<uint>
+    zeros |> resize(4)
+    let leg_bytes = r_bytes + oq_bytes + os_bytes
+    var host = make_host_buf(leg_bytes * 2l, true, [cached = true])
+    var xr_epi_h : array<float>
+    var xr_row_h : array<float>
+    var oq_epi_h : array<uint>
+    var oq_row_h : array<uint>
+    var os_epi_h : array<float>
+    var os_row_h : array<float>
+    xr_epi_h |> resize(d)
+    xr_row_h |> resize(d)
+    oq_epi_h |> resize(d / 4)
+    oq_row_h |> resize(d / 4)
+    os_epi_h |> resize(nblk_out)
+    os_row_h |> resize(nblk_out)
+    let eps = 1.0e-6
+    unsafe {
+        upload_region_at(wqd, 0l, addr<uint8 const?>(fx.wqh[0]), wq_bytes)
+        upload_region_at(wsd, 0l, addr<uint8 const?>(fx.wsh[0]), ws_bytes)
+        upload_region_at(xqd, 0l, addr<uint8 const?>(fx.xqh[0]), xq_bytes)
+        upload_region_at(xsd, 0l, addr<uint8 const?>(fx.xsh[0]), xs_bytes)
+        upload_region_at(xr_epi, 0l, addr<uint8 const?>(fx.xres[0]), r_bytes)
+        upload_region_at(xr_row, 0l, addr<uint8 const?>(fx.xres[0]), r_bytes)
+        upload_region_at(wnd, 0l, addr<uint8 const?>(fx.wnh[0]), wn_bytes)
+        upload_region_at(cntd, 0l, addr<uint8 const?>(zeros[0]), 16l)
+        nan_sentinel_upload(yd, r_bytes)
+        nan_sentinel_upload(oq_epi, oq_bytes)
+        nan_sentinel_upload(os_epi, os_bytes)
+        nan_sentinel_upload(oq_row, oq_bytes)
+        nan_sentinel_upload(os_row, os_bytes)
+        var s_epi = set_q8_gemv_ar_cls(fixed_array(wqd, wsd, xqd, xsd, yd, xr_epi, wnd, oq_epi, os_epi, cntd),
+            fixed_array(wq_bytes, ws_bytes, xq_bytes, xs_bytes, r_bytes, r_bytes, wn_bytes, oq_bytes, os_bytes, 16l),
+            fixed_array(1u, 2u, 4u, 8u, 16u, 32u, 0u, 64u, 64u, 16u))
+        var s_row = set_cls_ar_rq_b(fixed_array(xr_row, yd, wnd, oq_row, os_row),
+            fixed_array(r_bytes, r_bytes, wn_bytes, oq_bytes, os_bytes),
+            fixed_array(128u, 16u, 0u, 256u, 256u))
+        var raw2 = alloc_cmd()
+        let begin = VkCommandBufferBeginInfo()
+        vk_check(vkBeginCommandBuffer(raw2, begin), null)
+        var h2 : VkHaz
+        var pc = GemvArArgs(n = uint(n), d = uint(d), wblk = 0u, xblk = 0u, add_on = 1u, woff = uint(d), pwoff = 0u,
+            pre_on = pre_on ? 1u : 0u, no_norm = 0u, eps = eps, ascale = ascale, abias_on = 0u, aboff = uint(2 * d))
+        let rpw = 4l * g_gpu.rows_per_wg
+        enc_q8_gemv_ar_cls(raw2, h2, s_epi, pc, (int64(d) + rpw - 1l) / rpw)
+        var pca = ArArgs(dim = uint(d), add_on = 1u, woff = uint(d), eps = eps, ascale = ascale, pre_on = pre_on ? 1u : 0u, pwoff = 0u)
+        enc_cls_ar_rq_b(raw2, h2, s_row, pca, 1l)   //! the row kernel reads the y row the epilogue's GEMV wrote (the hazard on binding 16)
+        vhz_dep(raw2, h2, 32u | 64u | 128u | 256u, 0u, true)
+        cmd_copy_whole(raw2, xr_epi, host.buf, r_bytes)
+        cmd_copy_range(raw2, oq_epi, 0l, host.buf, r_bytes, oq_bytes)
+        cmd_copy_range(raw2, os_epi, 0l, host.buf, r_bytes + oq_bytes, os_bytes)
+        cmd_copy_range(raw2, xr_row, 0l, host.buf, leg_bytes, r_bytes)
+        cmd_copy_range(raw2, oq_row, 0l, host.buf, leg_bytes + r_bytes, oq_bytes)
+        cmd_copy_range(raw2, os_row, 0l, host.buf, leg_bytes + r_bytes + oq_bytes, os_bytes)
+        vk_check(vkEndCommandBuffer(raw2), null)
+        submit_wait(raw2)
+        let hp = intptr(host.mapped)
+        memcpy(addr<void?>(xr_epi_h[0]), host.mapped, r_bytes)
+        memcpy(addr<void?>(oq_epi_h[0]), reinterpret<void?>(hp + uint64(r_bytes)), oq_bytes)
+        memcpy(addr<void?>(os_epi_h[0]), reinterpret<void?>(hp + uint64(r_bytes + oq_bytes)), os_bytes)
+        memcpy(addr<void?>(xr_row_h[0]), reinterpret<void?>(hp + uint64(leg_bytes)), r_bytes)
+        memcpy(addr<void?>(oq_row_h[0]), reinterpret<void?>(hp + uint64(leg_bytes + r_bytes)), oq_bytes)
+        memcpy(addr<void?>(os_row_h[0]), reinterpret<void?>(hp + uint64(leg_bytes + r_bytes + oq_bytes)), os_bytes)
+    }
+    let tag = "n {n} d {d} pre {pre_on ? 1 : 0}"
+    t |> success(xr_epi_h[0] != fx.xres[0], "q8 gemv+ar twin {tag}: the epilogue wrote the residual row")
+    t |> success(xr_row_h[0] != fx.xres[0], "q8 gemv+ar twin {tag}: the row kernel wrote the residual row")
+    let badx = mismatch_exact(xr_epi_h, xr_row_h)
+    var first = -1
+    for (i in range(d)) {
+        if (xr_epi_h[i] != xr_row_h[i]) {
+            first = i
+            break
+        }
+    }
+    if (first >= 0) {
+        to_log(LOG_INFO, "q8 gemv+ar twin {tag}: first residual mismatch at {first}: epilogue {xr_epi_h[first]} row kernel {xr_row_h[first]}\n")
+    }
+    t |> success(badx == 0, "q8 gemv+ar twin {tag}: the epilogue's residual row == the row kernel's ({badx} of {d} off)")
+    let bads = mismatch_exact(os_epi_h, os_row_h)
+    t |> success(bads == 0, "q8 gemv+ar twin {tag}: the epilogue's block scales == the row kernel's ({bads} of {nblk_out} off)")
+    let badq = mismatch_qbytes(oq_epi_h, oq_row_h, 0)
+    t |> success(badq == 0, "q8 gemv+ar twin {tag}: the epilogue's quants == the row kernel's ({badq} of {d} off)")
+    delete fx
+    delete zeros
+    delete xr_epi_h
+    delete xr_row_h
+    delete oq_epi_h
+    delete oq_row_h
+    delete os_epi_h
+    delete os_row_h
+}
+
+[test]
+def test_vkd_q8_gemv_ar_row_twin(t0 : T?) {
+    t0 |> run("q8 GEMV epilogue's residual step == the row kernel fed the same y row, bit for bit (the sandwich step and the plain step)") <| @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            if (!ensure_q8_gemv_ar_cls() || !ensure_cls_ar_rq_b()) {
+                t |> skip("no Vulkan device")
+                return
+            }
+            q8_gemv_ar_twin_run(t, 512, 1152, true, 1.0)    // gemma-3-1b's wo step
+            q8_gemv_ar_twin_run(t, 2048, 2304, true, 1.0)   // gemma-2-2b's wo step: eight heads of 256 into the 2304 residual
+            q8_gemv_ar_twin_run(t, 9216, 2304, true, 1.0)   // gemma-2-2b's down step
+            q8_gemv_ar_twin_run(t, 512, 1024, false, 0.5)   // a plain step under an output scale
+        } else {
+            t |> skip("dasVulkan not present")
+        }
+    }
+}
+
+//! one output plane of an N-form cell: its name in the asserts, the 32-bit words one column holds, and whether the two
+//! forms' words are the same by claim - a plane whose words differ by design (a feed word carrying its row) is the caller's compare
+struct NformPlane {
+    name : string
+    words : int
+    cmp : bool = true
+}
+
+//! the output planes of one form as the blocks bind them: plane p's device buffer and its bytes
+struct NformOuts {
+    bufs : array<uint64>
+    bytes : array<int64>
+}
+
+//! the two forms' output planes read back: `one[p]` over every column of the extent, column c at c * (head + words) + head;
+//! `nf[p]` the last count's, column c at head + c * words
+struct NformPlanes {
+    one : array<array<uint>>
+    nf : array<array<uint>>
+}
+
+//! a read-back plane's words as the floats the kernel stored
+def private plane_floats(w : array<uint>) : array<float> {
+    return <- [for (x in w); uint_bits_to_float(x)]
+}
+
+//! the words of `ncols` live columns of a plane off between the forms; a live column the N form never wrote - every word still the sentinel - counts whole
+def private nform_plane_mismatch(one, nf : array<uint>; ncols, head, words : int) : int {
+    var bad = 0
+    for (c in range(ncols)) {
+        let nbase = head + c * words
+        let obase = c * (head + words) + head
+        var sentinels = 0
+        for (i in range(words)) {
+            if (nf[nbase + i] == NAN_SENTINEL_BITS) {
+                sentinels++
+            }
+        }
+        if (sentinels == words) {
+            bad += words
+            continue
+        }
+        for (i in range(words)) {
+            if (nf[nbase + i] != one[obase + i]) {
+                bad++
+            }
+        }
+    }
+    return bad
+}
+
+//! the asserts behind `nform_cols_cell` at one count: every compared plane's live columns word for word, the `head` words under
+//! the base and the slots past the last live column still the sentinel, and one poisoned word of the first compared plane reddening its compare
+def private nform_cols_compare(t : T?; tag : string; ncols, ncol_max, head : int; planes : array<NformPlane>; var r : NformPlanes) {
+    var stale = 0
+    var poisoned = false
+    for (p in range(length(planes))) {
+        let pl = planes[p]
+        if (pl.cmp) {
+            let bad = nform_plane_mismatch(r.one[p], r.nf[p], ncols, head, pl.words)
+            t |> success(bad == 0, "{tag}: {pl.name} over the live columns are the one form's word for word ({bad} of {ncols * pl.words} words off)")
+            if (!poisoned) {
+                poisoned = true
+                let at = head + (ncols - 1) * pl.words + pl.words / 2
+                let kept = r.nf[p][at]
+                r.nf[p][at] = kept ^ 0x55u
+                t |> equal(nform_plane_mismatch(r.one[p], r.nf[p], ncols, head, pl.words), 1, "{tag}: the word-exact bar on {pl.name} reds one poisoned word")
+                r.nf[p][at] = kept
+            }
+        }
+        for (i in range(head)) {
+            if (r.nf[p][i] != NAN_SENTINEL_BITS) {
+                stale++
+            }
+        }
+        for (i in range(head + ncols * pl.words, head + (ncol_max + 1) * pl.words)) {
+            if (r.nf[p][i] != NAN_SENTINEL_BITS) {
+                stale++
+            }
+        }
+    }
+    t |> success(stale == 0, "{tag}: the words under the base and the slots past the last live column keep the sentinel ({stale} written)")
+}
+
+//! one N-form-vs-one-form cell: `one_col(c, raw, h, outs)` records the one form for column `c` of the extent `ncol_max`,
+//! `n_form(ncols, raw, h, outs)` the N form at each count of `counts`; the output planes are made here - one slot past the
+//! extent - NaN-filled before every run, copied back under the hazard mask `bits`, compared by `nform_cols_compare` and returned
+def private nform_cols_cell(t : T?; tag : string; counts : array<int>; ncol_max, head : int; planes : array<NformPlane>; bits : uint; one_col; n_form) : NformPlanes {
+    var res : NformPlanes
+    static_if (typeinfo builtin_module_exists(vulkan)) {
+        let np = length(planes)
+        var one_outs : NformOuts
+        var n_outs : NformOuts
+        var one_ats : array<int64>
+        var n_ats : array<int64>
+        one_outs.bufs |> reserve(np)
+        one_outs.bytes |> reserve(np)
+        n_outs.bufs |> reserve(np)
+        n_outs.bytes |> reserve(np)
+        one_ats |> reserve(np)
+        n_ats |> reserve(np)
+        var total = 0l
+        for (pl in planes) {
+            let one_bytes = int64(head + pl.words) * 4l
+            let n_bytes = int64(head + pl.words * (ncol_max + 1)) * 4l
+            one_outs.bufs |> push(make_device_buf(one_bytes))
+            one_outs.bytes |> push(one_bytes)
+            n_outs.bufs |> push(make_device_buf(n_bytes))
+            n_outs.bytes |> push(n_bytes)
+            one_ats |> push(total)
+            total += one_bytes * int64(ncol_max)
+            n_ats |> push(total)
+            total += n_bytes
+        }
+        let host = make_host_buf(total, true, [cached = true])
+        res.one |> resize(np)
+        res.nf |> resize(np)
+        for (c in range(ncol_max)) {
+            var ats : array<int64>
+            ats |> reserve(np)
+            for (p in range(np)) {
+                nan_sentinel_upload(one_outs.bufs[p], one_outs.bytes[p])
+                ats |> push(one_ats[p] + one_outs.bytes[p] * int64(c))
+            }
+            var raw = alloc_cmd()
+            let begin = VkCommandBufferBeginInfo()
+            vk_check(vkBeginCommandBuffer(raw, begin), null)
+            var h : VkHaz
+            invoke(one_col, c, raw, h, one_outs)
+            vkd_run_copy(raw, h, one_outs.bufs, host, ats, one_outs.bytes, bits)
+            delete ats
+        }
+        unsafe {
+            for (p in range(np)) {
+                let bytes = one_outs.bytes[p] * int64(ncol_max)
+                res.one[p] |> resize(int(bytes / 4l))
+                memcpy(addr<void?>(res.one[p][0]), reinterpret<void?>(intptr(host.mapped) + uint64(one_ats[p])), bytes)
+            }
+        }
+        for (ncols in counts) {
+            for (p in range(np)) {
+                nan_sentinel_upload(n_outs.bufs[p], n_outs.bytes[p])
+            }
+            var raw = alloc_cmd()
+            let begin = VkCommandBufferBeginInfo()
+            vk_check(vkBeginCommandBuffer(raw, begin), null)
+            var h : VkHaz
+            invoke(n_form, ncols, raw, h, n_outs)
+            vkd_run_copy(raw, h, n_outs.bufs, host, n_ats, n_outs.bytes, bits)
+            unsafe {
+                for (p in range(np)) {
+                    res.nf[p] |> resize(int(n_outs.bytes[p] / 4l))
+                    memcpy(addr<void?>(res.nf[p][0]), reinterpret<void?>(intptr(host.mapped) + uint64(n_ats[p])), n_outs.bytes[p])
+                }
+            }
+            nform_cols_compare(t, "{tag} at {ncols} column(s)", ncols, ncol_max, head, planes, res)
+        }
+        delete one_outs
+        delete n_outs
+        delete one_ats
+        delete n_ats
+    }
+    return <- res
+}
+
+//! the one-row columns against the CPU chain: per column the q8 GEMM oracle over one record with the x row as its one column,
+//! per plane, then the activation - its block scales within 2e-3, the dequantized hidden row within a quant step
+def private q8_gemv_gu_oracle_cols(t; tag : string; oq_w, os_w : array<uint>; gqh, gsh, uqh, ush, xqh : array<uint>; xsh : array<float>; n, hid, ncols : int; act : uint) {
+    let nb = n / 32
+    let nblk_out = hid / 32
+    let one_rec <- [0u, 0u, 1u, 0u]
+    var obad = 0
+    var obads = 0
+    for (c in range(ncols)) {
+        var xq_c : array<uint>
+        var xs_c : array<float>
+        xq_c |> resize(nb * 8)
+        xs_c |> resize(nb)
+        for (i in range(nb * 8)) {
+            xq_c[i] = xqh[c * nb * 8 + i]
+        }
+        for (i in range(nb)) {
+            xs_c[i] = xsh[c * nb + i]
+        }
+        var g_ref : array<float>
+        var u_ref : array<float>
+        g_ref |> resize(hid)
+        u_ref |> resize(hid)
+        q8_gemm_oracle(gqh, gsh, xq_c, xs_c, one_rec, 1, n, hid, g_ref)
+        q8_gemm_oracle(uqh, ush, xq_c, xs_c, one_rec, 1, n, hid, u_ref)
+        for (blk in range(nblk_out)) {
+            var m = 0.0
+            for (e in range(32)) {
+                m = max(m, abs(act_mul_ref(g_ref[blk * 32 + e], u_ref[blk * 32 + e], act)))
+            }
+            let d_ref = m / 127.0
+            let os_c = uint_bits_to_float(os_w[c * nblk_out + blk])
+            if (abs(os_c - d_ref) > 2e-3 * max(d_ref, 1e-6)) {
+                obads++
+            }
+            for (e in range(32)) {
+                let a_ref = act_mul_ref(g_ref[blk * 32 + e], u_ref[blk * 32 + e], act)
+                let qi = blk * 32 + e
+                let q = int(int8(uint8((oq_w[c * (hid / 4) + qi / 4] >> uint((qi % 4) * 8)) & 0xFFu)))
+                if (abs(float(q) * os_c - a_ref) > d_ref + 2e-3 * abs(a_ref)) {
+                    obad++
+                }
+            }
+        }
+        delete g_ref
+        delete u_ref
+        delete xq_c
+        delete xs_c
+    }
+    t |> success(obads == 0, "one-row fused gate-up {tag}: every column's block scales match the CPU oracle ({obads} of {nblk_out * ncols} off)")
+    t |> success(obad == 0, "one-row fused gate-up {tag}: every column's dequantized hidden row sits within a quant step of the CPU oracle ({obad} of {hid * ncols} off)")
+}
+
+//! the fused gate-up GEMV's N-column form over `ncols` columns against the one-row kernel run a column at a time, word for
+//! word through `nform_cols_cell`; the one-row columns over the extent against the CPU chain
+def private q8_gemv_gu_n_run(t; n, hid, ncols : int; act : uint) {
+    let nb = n / 32
+    let nblk_out = hid / 32
+    let totblk = hid * nb
+    let wq_bytes = int64(totblk) * 32l
+    let ws_bytes = int64(totblk) * 2l
+    let xq_bytes = int64(nb) * 32l
+    let xs_bytes = int64(nb) * 4l
+    let ncol_max = 8
+    var gqh, gsh, uqh, ush : array<uint>
+    q8_plane(totblk, 1u, 71u, 1u, 3u, gqh, gsh)
+    q8_plane(totblk, 3u, 5u, 7u, 11u, uqh, ush)
+    var xqh : array<uint>
+    var xsh : array<float>
+    xqh |> resize(nb * 8 * ncol_max)
+    xsh |> resize(nb * ncol_max)
+    for (i in range(nb * 8 * ncol_max)) {
+        xqh[i] = hash_word(uint(i) * 17u + 9u)
+    }
+    for (i in range(nb * ncol_max)) {
+        xsh[i] = 0.25 + float(i % 5) * 0.125
+    }
+    let gqd = make_device_buf(wq_bytes)
+    let gsd = make_device_buf(ws_bytes)
+    let uqd = make_device_buf(wq_bytes)
+    let usd = make_device_buf(ws_bytes)
+    let xqd = make_device_buf(xq_bytes)
+    let xsd = make_device_buf(xs_bytes)
+    let xqd_n = make_device_buf(xq_bytes * int64(ncols))
+    let xsd_n = make_device_buf(xs_bytes * int64(ncols))
+    let gbits = fixed_array(1u, 2u, 4u, 8u, 16u, 32u, 64u, 64u)
+    let shape = "n {n} hid {hid} act {act}"
+    unsafe {
+        upload_region_at(gqd, 0l, addr<uint8 const?>(gqh[0]), wq_bytes)
+        upload_region_at(gsd, 0l, addr<uint8 const?>(gsh[0]), ws_bytes)
+        upload_region_at(uqd, 0l, addr<uint8 const?>(uqh[0]), wq_bytes)
+        upload_region_at(usd, 0l, addr<uint8 const?>(ush[0]), ws_bytes)
+        upload_region_at(xqd_n, 0l, addr<uint8 const?>(xqh[0]), xq_bytes * int64(ncols))
+        upload_region_at(xsd_n, 0l, addr<uint8 const?>(xsh[0]), xs_bytes * int64(ncols))
+    }
+    var planes <- nform_cols_cell(t, "N-row fused gate-up {shape}", [ncols], ncol_max, 0,
+        [NformPlane(name = "the quant bytes", words = hid / 4), NformPlane(name = "the block scales", words = nblk_out)], 64u,
+        $(c : int; raw : VkCommandBuffer; var h : VkHaz; o : NformOuts) {
+            unsafe {
+                upload_region_at(xqd, 0l, addr<uint8 const?>(xqh[c * nb * 8]), xq_bytes)
+                upload_region_at(xsd, 0l, addr<uint8 const?>(xsh[c * nb]), xs_bytes)
+            }
+            var s_one = set_q8_gemv_gu_cls(fixed_array(gqd, gsd, uqd, usd, xqd, xsd, o.bufs[0], o.bufs[1]),
+                fixed_array(wq_bytes, ws_bytes, wq_bytes, ws_bytes, xq_bytes, xs_bytes, o.bytes[0], o.bytes[1]), gbits)
+            var pc1 = GuArgs(n = uint(n), d = uint(hid), gblk = 0u, ublk = 0u, act = act)
+            enc_q8_gemv_gu_cls(raw, h, s_one, pc1, int64(nblk_out))
+        },
+        $(nc : int; raw : VkCommandBuffer; var h : VkHaz; o : NformOuts) {
+            var s_n = q8_gemv_gu_n_set(fixed_array(gqd, gsd, uqd, usd, xqd_n, xsd_n, o.bufs[0], o.bufs[1]),
+                fixed_array(wq_bytes, ws_bytes, wq_bytes, ws_bytes, xq_bytes * int64(nc), xs_bytes * int64(nc), o.bytes[0], o.bytes[1]), gbits)
+            var pc = GuNArgs(n = uint(n), d = uint(hid), gblk = 0u, ublk = 0u, act = act, ncols = uint(nc))
+            q8_gemv_gu_n_enc(raw, h, s_n, pc, int64(nblk_out))
+        })
+    q8_gemv_gu_oracle_cols(t, shape, planes.one[0], planes.one[1], gqh, gsh, uqh, ush, xqh, xsh, n, hid, ncol_max, act)
+    delete planes
+    delete gqh
+    delete gsh
+    delete uqh
+    delete ush
+    delete xqh
+    delete xsh
+}
+
+[test]
+def test_vkd_q8_gemv_gu_n(t0 : T?) {
+    t0 |> run("fused q8 gate-up GEMV's N-column stamps == the one-row kernel a column at a time, bit for bit; the one-row rows == the CPU chain") <| @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            if (!(ensure_q8_gemv_gu_cls() && q8_gemv_gu_n_ensure(8l))) {
+                t |> skip("no Vulkan device")
+                return
+            }
+            q8_gemv_gu_n_run(t, 512, 1152, 4, ACT_SILU)   //! the four-column stamp full
+            q8_gemv_gu_n_run(t, 256, 512, 3, ACT_GELU)   //! an odd count on the four-column stamp: its last lane re-dots column 2, a subgroup idles in the quantize
+            q8_gemv_gu_n_run(t, 512, 1024, 8, ACT_SILU)   //! the eight-column stamp full: every subgroup a column at 32 lanes, two rounds at 64
+            q8_gemv_gu_n_run(t, 256, 512, 5, ACT_SILU)   //! the eight-column stamp at five: three lanes re-dot column 4
+            q8_gemv_gu_n_run(t, 256, 512, 2, ACT_GELU)   //! the two-column stamp full
+            q8_gemv_gu_n_run(t, 256, 512, 1, ACT_SILU)   //! one column on the two-column stamp: the one-row command's shape through the N form
+        } else {
+            t |> skip("dasVulkan not present")
+        }
+    }
+}
+
+//! the N-column form against the one-row dispatches, one a column, word for word through `nform_cols_cell`: the same kernel
+//! math in the same order; the one-row form's CPU chain is `q8_gemv_pleact_run`'s at the same widths
+def private q8_gemv_pleact_cols_run(t; n, d, ncols : int) {
+    let nb = n / 32
+    let totblk = d * nb
+    let wq_bytes = int64(totblk) * 32l
+    let ws_bytes = int64(totblk) * 2l
+    let all = 3 * n   // three layers' side rows a column: the cell reads the middle one
+    let ncol_max = 8
+    var wqh, wsh : array<uint>
+    q8_plane(totblk, 5u, 19u, 3u, 7u, wqh, wsh)
+    var gh : array<float>
+    var sh : array<float>
+    gh |> resize(ncol_max * n)
+    sh |> resize(ncol_max * all)
+    for (i in range(ncol_max * n)) {
+        gh[i] = float((i * 37) % 101) * 0.06 - 3.0
+    }
+    for (i in range(ncol_max * all)) {
+        sh[i] = float((i * 29) % 83) * 0.05 - 2.0
+    }
+    let g_bytes = int64(ncols * n) * 4l
+    let s_bytes = int64(ncols * all) * 4l
+    let g1_bytes = int64(n) * 4l
+    let s1_bytes = int64(all) * 4l
+    let wqd = make_device_buf(wq_bytes)
+    let wsd = make_device_buf(ws_bytes)
+    let gd = make_device_buf(g_bytes)
+    let sd = make_device_buf(s_bytes)
+    let gd1 = make_device_buf(g1_bytes)
+    let sd1 = make_device_buf(s1_bytes)
+    let rpw = 4l * g_gpu.rows_per_wg
+    let groups = (int64(d) + rpw - 1l) / rpw
+    let gbits = fixed_array(1u, 2u, 4u, 8u, 16u)
+    unsafe {
+        upload_region_at(wqd, 0l, addr<uint8 const?>(wqh[0]), wq_bytes)
+        upload_region_at(wsd, 0l, addr<uint8 const?>(wsh[0]), ws_bytes)
+        upload_region_at(gd, 0l, addr<uint8 const?>(gh[0]), g_bytes)
+        upload_region_at(sd, 0l, addr<uint8 const?>(sh[0]), s_bytes)
+    }
+    var planes <- nform_cols_cell(t, "q8 pleact n {n} d {d}", [ncols], ncol_max, 0, [NformPlane(name = "the proj rows", words = d)], 16u,
+        $(c : int; raw : VkCommandBuffer; var h : VkHaz; o : NformOuts) {
+            unsafe {
+                upload_region_at(gd1, 0l, addr<uint8 const?>(gh[c * n]), g1_bytes)
+                upload_region_at(sd1, 0l, addr<uint8 const?>(sh[c * all]), s1_bytes)
+            }
+            var s1 = set_q8_gemv_pleact_cls(fixed_array(wqd, wsd, gd1, sd1, o.bufs[0]), fixed_array(wq_bytes, ws_bytes, g1_bytes, s1_bytes, o.bytes[0]), gbits)
+            var pc1 = PleActArgs(n = uint(n), d = uint(d), wblk = 0u, ubase = uint(n), act = ACT_GELU)
+            enc_q8_gemv_pleact_cls(raw, h, s1, pc1, groups)
+        },
+        $(nc : int; raw : VkCommandBuffer; var h : VkHaz; o : NformOuts) {
+            var s_cls = set_q8_gemv_pleact_cls(fixed_array(wqd, wsd, gd, sd, o.bufs[0]), fixed_array(wq_bytes, ws_bytes, g_bytes, s_bytes, o.bytes[0]), gbits)
+            var pc = PleActArgs(n = uint(n), d = uint(d), wblk = 0u, ubase = uint(n), act = ACT_GELU, ncols = uint(nc), sstride = uint(all))
+            enc_q8_gemv_pleact_cls(raw, h, s_cls, pc, groups)
+        })
+    delete planes
+    delete wqh
+    delete wsh
+    delete gh
+    delete sh
+}
+
 [test]
 def test_vkd_q8_gemv_pleact(t0 : T?) {
     t0 |> run("fused per-layer-embedding act + Q8_0 requant + q8 proj GEMV == the CPU chain (256 and 128 wide)") <| @(t : T?) {
@@ -6546,6 +7319,9 @@ def test_vkd_q8_gemv_pleact(t0 : T?) {
             }
             q8_gemv_pleact_run(t, 256, 200)   // the E-series side row: eight blocks, a partial last workgroup
             q8_gemv_pleact_run(t, 128, 64)    // a narrower row: the idle upper lanes of the build
+            q8_gemv_pleact_cols_run(t, 256, 200, 4)   // the N-row command's columns: four rows, the E-series width
+            q8_gemv_pleact_cols_run(t, 128, 64, 3)    // an odd column count on the narrower row
+            q8_gemv_pleact_cols_run(t, 256, 200, 8)   // the per-row planes' extent: every column's words live
         } else {
             t |> skip("dasVulkan not present")
         }
@@ -6677,120 +7453,88 @@ def private gemv_ncol_arm(t : T?; f : KqFmt; n, d : int) {
         let name = "{f}"
         let q8 = f == KqFmt.q8
         let xblk = q8 ? n / 32 : n / 256
-        let wq_words = q8 ? d * xblk * 8 : d * xblk * int(kq_qsb(f) / 4l)
-        let ws_words = q8 ? (d * xblk + 1) / 2 : d * xblk * int(kq_dev_ssb(f) / 4l)
         let xq_col = q8 ? xblk * 8 : xblk * 64
         let ncol_max = 8
-        var wqh : array<uint>
-        var wsh : array<uint>
+        var wqh, wsh : array<uint>
+        if (q8) {
+            q8_plane(d * xblk, 1u, uint(fmt) * 77777u, 1u, uint(fmt) * 13u, wqh, wsh)
+        } else {
+            let wq_words = d * xblk * int(kq_qsb(f) / 4l)
+            let ws_words = d * xblk * int(kq_dev_ssb(f) / 4l)
+            wqh |> resize(wq_words)
+            wsh |> resize(ws_words)
+            for (i in range(wq_words)) {
+                wqh[i] = hash_word(uint(i) + uint(fmt) * 77777u)
+            }
+            for (i in range(ws_words)) {
+                wsh[i] = ws_word(uint(i) + uint(fmt) * 13u)
+            }
+        }
         var xqh : array<uint>
         var xsh : array<float>
-        wqh |> resize(wq_words)
-        wsh |> resize(ws_words)
         xqh |> resize(xq_col * ncol_max)
         xsh |> resize(xblk * ncol_max)
-        for (i in range(wq_words)) {
-            wqh[i] = hash_word(uint(i) + uint(fmt) * 77777u)
-        }
-        for (i in range(ws_words)) {
-            wsh[i] = ws_word(uint(i) + uint(fmt) * 13u)
-        }
         for (i in range(xq_col * ncol_max)) {
             xqh[i] = hash_word(uint(i) * 31u + 5u)
         }
         for (i in range(xblk * ncol_max)) {
             xsh[i] = 0.5 + float(i % 7) * 0.25
         }
-        let wq_bytes = int64(wq_words) * 4l
-        let ws_bytes = int64(ws_words) * 4l
+        let wq_bytes = long_length(wqh) * 4l
+        let ws_bytes = long_length(wsh) * 4l
         let xq_bytes = int64(xq_col * ncol_max) * 4l
         let xs_bytes = int64(xblk * ncol_max) * 4l
-        let y_bytes = int64(d * ncol_max) * 4l
         let wqd = make_device_buf(wq_bytes)
         let wsd = make_device_buf(ws_bytes)
         let xqd = make_device_buf(xq_bytes)
         let xsd = make_device_buf(xs_bytes)
-        let yd = make_device_buf(y_bytes)
-        var host = make_host_buf(y_bytes, true, [cached = true])
-        var y_one : array<float>
-        var y_n : array<float>
-        y_one |> resize(d * ncol_max)
-        y_n |> resize(d * ncol_max)
+        let rgd = make_device_buf(8l)   //! the region pair, uploaded before each record: the one form's x column, the N form's row 0
         let gbits = fixed_array(1u, 2u, 4u, 8u, 16u, 32u)
         unsafe {
             upload_region_at(wqd, 0l, addr<uint8 const?>(wqh[0]), wq_bytes)
             upload_region_at(wsd, 0l, addr<uint8 const?>(wsh[0]), ws_bytes)
             upload_region_at(xqd, 0l, addr<uint8 const?>(xqh[0]), xq_bytes)
             upload_region_at(xsd, 0l, addr<uint8 const?>(xsh[0]), xs_bytes)
-            nan_sentinel_upload(yd, y_bytes)
-            var raw = alloc_cmd()
-            let begin = VkCommandBufferBeginInfo()
-            vk_check(vkBeginCommandBuffer(raw, begin), null)
-            var h : VkHaz
-            for (c in range(ncol_max)) {
-                var pair <- [0u, uint(c * xblk)]
-                let rgd = make_device_buf(8l)
-                upload_region_at(rgd, 0l, addr<uint8 const?>(pair[0]), 8l)
-                var s1 = gemv_cls_set(fmt, fixed_array(wqd, wsd, rgd, xqd, xsd, yd), fixed_array(wq_bytes, ws_bytes, 8l, xq_bytes, xs_bytes, y_bytes), gbits)
-                var pc1 = GemvArgs(n = uint(n), d = uint(d), nreg = 1u, ybase = uint(c * d))
-                gemv_enc(fmt, raw, h, s1, pc1, int64(d))
-                delete pair
-            }
-            vhz_dep(raw, h, 32u, 0u, true)
-            cmd_copy_whole(raw, yd, host.buf, y_bytes)
-            vk_check(vkEndCommandBuffer(raw), null)
-            submit_wait(raw)
-            memcpy(addr<void?>(y_one[0]), host.mapped, y_bytes)
         }
-        var y_ref <- gemv_ncol_oracle(f, wqh, wsh, xqh, xsh, n, d, ncol_max)
-        let bad_o = mismatch_approx(y_one, y_ref)
-        t |> success(bad_o == 0, "{name}: the one-column class over every activation row matches the CPU oracle ({bad_o} of {d * ncol_max} off)")
-        y_ref[d + 2] += 1.0 + abs(y_ref[d + 2])   //! the poison: one past the element's own magnitude (an int8 dot lands in the hundreds of thousands)
-        t |> success(mismatch_approx(y_one, y_ref) == 1, "{name}: the oracle bar reds one poisoned element")
+        var y_one : array<uint>
         let n2_min_prior = g_q8_n2_min_n
         for (paired in fixed_array(false, true)) {
             continue if (paired && !q8)
             g_q8_n2_min_n = paired ? 0u : 0xFFFFFFFFu
             let form = paired ? "{name} row-pair" : name
             t |> success(gemv_cls_ensure_n(fmt), "{form}: the N-column class rail engages")
-            var pair <- [0u, 0u]
-            let rgd = make_device_buf(8l)
-            upload_region_at(rgd, 0l, unsafe(addr<uint8 const?>(pair[0])), 8l)
-            var s_n = gemv_cls_set_n(fmt, fixed_array(wqd, wsd, rgd, xqd, xsd, yd), fixed_array(wq_bytes, ws_bytes, 8l, xq_bytes, xs_bytes, y_bytes), gbits)
-            delete pair
-            for (ncols in fixed_array(1, 2, 4, 8)) {
-                unsafe {
-                    nan_sentinel_upload(yd, y_bytes)
-                    var raw = alloc_cmd()
-                    let begin = VkCommandBufferBeginInfo()
-                    vk_check(vkBeginCommandBuffer(raw, begin), null)
-                    var h : VkHaz
-                    var pc = GemvArgs(n = uint(n), d = uint(d), nreg = 1u, ybase = 0u, ncols = uint(ncols), ystride = uint(d))
-                    gemv_enc_n(fmt, raw, h, s_n, pc, int64(d))
-                    vhz_dep(raw, h, 32u, 0u, true)
-                    cmd_copy_whole(raw, yd, host.buf, y_bytes)
-                    vk_check(vkEndCommandBuffer(raw), null)
-                    submit_wait(raw)
-                    memcpy(addr<void?>(y_n[0]), host.mapped, y_bytes)
-                }
-                let live = ncols * d
-                let bad = mismatch_exact(y_n, y_one, live)
-                t |> success(bad == 0, "{form} at {ncols} column(s): every column bit-matches the one-column class's row ({bad} of {live} off)")
-                var stale = 0
-                for (i in range(live, d * ncol_max)) {
-                    if (float_bits_to_uint(y_n[i]) != NAN_SENTINEL_BITS) {
-                        stale++
-                    }
-                }
-                t |> success(stale == 0, "{form} at {ncols} column(s): the rows past its columns keep the sentinel ({stale} of {d * ncol_max - live} written)")
-                y_n[live - 1] += 1.0 + abs(y_n[live - 1])
-                t |> success(mismatch_exact(y_n, y_one, live) == 1, "{form} at {ncols} column(s): the bit-exact bar reds one poisoned element")
-            }
+            var planes <- nform_cols_cell(t, form, [1, 2, 3, 4, 5, 6, 7, 8], ncol_max, 0, [NformPlane(name = "the y rows", words = d)], 32u,   //! every count: the odd ones leave dead columns on the wider stamps
+                $(c : int; raw : VkCommandBuffer; var h : VkHaz; o : NformOuts) {
+                    var pair <- [0u, uint(c * xblk)]
+                    upload_region_at(rgd, 0l, unsafe(addr<uint8 const?>(pair[0])), 8l)
+                    var s1 = gemv_cls_set(fmt, fixed_array(wqd, wsd, rgd, xqd, xsd, o.bufs[0]), fixed_array(wq_bytes, ws_bytes, 8l, xq_bytes, xs_bytes, o.bytes[0]), gbits)
+                    var pc1 = GemvArgs(n = uint(n), d = uint(d), nreg = 1u, ybase = 0u)
+                    gemv_enc(fmt, raw, h, s1, pc1, int64(d))
+                    delete pair
+                },
+                $(ncols : int; raw : VkCommandBuffer; var h : VkHaz; o : NformOuts) {
+                    var pair <- [0u, 0u]
+                    upload_region_at(rgd, 0l, unsafe(addr<uint8 const?>(pair[0])), 8l)
+                    var s_n = gemv_cls_set_n(fmt, fixed_array(wqd, wsd, rgd, xqd, xsd, o.bufs[0]), fixed_array(wq_bytes, ws_bytes, 8l, xq_bytes, xs_bytes, o.bytes[0]), gbits)
+                    var pc = GemvArgs(n = uint(n), d = uint(d), nreg = 1u, ybase = 0u, ncols = uint(ncols), ystride = uint(d),
+                        lanes_per_row = gemv_lanes_per_row(fmt, int64(n)))
+                    gemv_cls_enc_n(fmt, raw, h, s_n, pc, gemv_wgs(int64(d), pc.lanes_per_row))   //! the class entry: the one-column count still lands on the narrowest N stamp
+                    delete pair
+                })
+            delete y_one
+            y_one <- planes.one[0]
+            delete planes
         }
         g_q8_n2_min_n = n2_min_prior
+        var y_ref <- gemv_ncol_oracle(f, wqh, wsh, xqh, xsh, n, d, ncol_max)
+        var y_onef <- plane_floats(y_one)
+        let bad_o = mismatch_approx(y_onef, y_ref)
+        t |> success(bad_o == 0, "{name}: the one-column class over every activation row matches the CPU oracle ({bad_o} of {d * ncol_max} off)")
+        y_ref[d + 2] += 1.0 + abs(y_ref[d + 2])   //! the poison: one past the element's own magnitude (an int8 dot lands in the hundreds of thousands)
+        t |> success(mismatch_approx(y_onef, y_ref) == 1, "{name}: the oracle bar reds one poisoned element")
         delete y_ref
+        delete y_onef
         delete y_one
-        delete y_n
         delete wqh
         delete wsh
         delete xqh
@@ -7215,6 +7959,8 @@ def test_vkd_rope_b_pair(t0 : T?) {
                     var tokb = make_host_buf(16l, true)
                     var tmq = reinterpret<TokMeta?>(tokb.mapped)
                     tmq.pos = 0u   // mirror row = layerbase alone
+                    tmq.cnt = 0u
+                    tmq.mirbase = 0u
                     var sc = set_qkn_rope_cls(fixed_array(qd2, kvdv, km2, vm2, csd, wnd, tokb.buf, bd),
                         fixed_array(q_bytes, kv_bytes, m_bytes, m_bytes, cs_bytes, wn_bytes, 16l, b_bytes),
                         fixed_array(16u, 1u, 2u, 4u, 8u, 8u, 0u, 0u))
@@ -7290,6 +8036,137 @@ def test_vkd_rope_b_pair(t0 : T?) {
                     }
                 }
                 t |> success(bad == 0, "qkn_rope_kv matches the CPU oracle ({bad} off)")
+                //! the N-row form: two rows stacked, each at its own token meta, against the one-row kernel run on that row alone
+                {
+                    let kvrow = qd + 2 * kvd
+                    let mn = krow + 2 * kvd   // row 0 at position 0 and row 1 at position 1: two mirror rows past layerbase
+                    var q2h : array<float>
+                    var kv2h : array<float>
+                    var cs2h : array<float>
+                    q2h |> resize(2 * qd)
+                    kv2h |> resize(2 * kvrow)
+                    cs2h |> resize(2 * hs)
+                    for (i in range(qd)) {
+                        q2h[i] = q0h[i]
+                        q2h[qd + i] = q0h[qd - 1 - i] * 0.7 - 0.2
+                    }
+                    for (i in range(kvrow)) {
+                        kv2h[i] = kvh[i]
+                        kv2h[kvrow + i] = kvh[kvrow - 1 - i] * 0.6 + 0.1
+                    }
+                    for (i in range(hs)) {
+                        cs2h[i] = csh[i]
+                        cs2h[hs + i] = csh[hs - 1 - i] * 0.9
+                    }
+                    let mn_bytes = int64(mn) * 4l
+                    let q1d = make_device_buf(q_bytes)
+                    let kv1d = make_device_buf(kv_bytes)
+                    let cs1d = make_device_buf(cs_bytes)
+                    let km1 = make_device_buf(mn_bytes)
+                    let vm1 = make_device_buf(mn_bytes)
+                    let q2d = make_device_buf(2l * q_bytes)
+                    let kv2d = make_device_buf(2l * kv_bytes)
+                    let cs2d = make_device_buf(2l * cs_bytes)
+                    let kmn = make_device_buf(mn_bytes)
+                    let vmn = make_device_buf(mn_bytes)
+                    var host2 = make_host_buf(3l * q_bytes + 4l * mn_bytes, true, [cached = true])
+                    unsafe {
+                        upload_region_at(q1d, 0l, addr<uint8 const?>(q2h[qd]), q_bytes)
+                        upload_region_at(kv1d, 0l, addr<uint8 const?>(kv2h[kvrow]), kv_bytes)
+                        upload_region_at(cs1d, 0l, addr<uint8 const?>(cs2h[hs]), cs_bytes)
+                        upload_region_at(q2d, 0l, addr<uint8 const?>(q2h[0]), 2l * q_bytes)
+                        upload_region_at(kv2d, 0l, addr<uint8 const?>(kv2h[0]), 2l * kv_bytes)
+                        upload_region_at(cs2d, 0l, addr<uint8 const?>(cs2h[0]), 2l * cs_bytes)
+                        nan_sentinel_upload(km1, mn_bytes)
+                        nan_sentinel_upload(vm1, mn_bytes)
+                        nan_sentinel_upload(kmn, mn_bytes)
+                        nan_sentinel_upload(vmn, mn_bytes)
+                        var tok1 = make_host_buf(16l, true)
+                        var tm1 = reinterpret<TokMeta?>(tok1.mapped)
+                        tm1.pos = 1u
+                        tm1.cnt = 0u
+                        tm1.parity = 0u
+                        tm1.mirbase = 0u
+                        var tok2 = make_host_buf(32l, true)
+                        var tm2 = reinterpret<TokMeta?>(tok2.mapped)
+                        for (r in range(2)) {
+                            tm2[r].pos = uint(r)
+                            tm2[r].cnt = 0u
+                            tm2[r].parity = 0u
+                            tm2[r].mirbase = 0u
+                        }
+                        var s1 = set_qkn_rope_cls(fixed_array(q1d, kv1d, km1, vm1, cs1d, wnd, tok1.buf, bd),
+                            fixed_array(q_bytes, kv_bytes, mn_bytes, mn_bytes, cs_bytes, wn_bytes, 16l, b_bytes),
+                            fixed_array(16u, 1u, 2u, 4u, 8u, 8u, 0u, 0u))
+                        var s2 = set_qkn_rope_cls(fixed_array(q2d, kv2d, kmn, vmn, cs2d, wnd, tok2.buf, bd),
+                            fixed_array(2l * q_bytes, 2l * kv_bytes, mn_bytes, mn_bytes, 2l * cs_bytes, wn_bytes, 32l, b_bytes),
+                            fixed_array(16u, 1u, 2u, 4u, 8u, 8u, 0u, 0u))
+                        var rawn = alloc_cmd()
+                        let beginn = VkCommandBufferBeginInfo()
+                        vk_check(vkBeginCommandBuffer(rawn, beginn), null)
+                        var hn : VkHaz
+                        var pc1 = QknRopeArgs(qd = uint(qd), kvd = uint(kvd), hs = uint(hs),
+                            half = uint(half), neox = uint(neox), nh = uint(nh),
+                            layerbase = uint(krow), qwoff = 0u,
+                            kwoff = uint(hs), eps = eps, boff = uint(bpad), hasb = 1u)
+                        enc_qkn_rope_cls(rawn, hn, s1, pc1, int64(wgs))
+                        var pc2 = QknRopeArgs(qd = uint(qd), kvd = uint(kvd), hs = uint(hs),
+                            half = uint(half), neox = uint(neox), nh = uint(nh),
+                            layerbase = uint(krow), qwoff = 0u,
+                            kwoff = uint(hs), eps = eps, boff = uint(bpad), hasb = 1u,
+                            rowwg = uint(wgs), kvrow = uint(kvrow), qrow = uint(qd), cosrow = uint(hs))
+                        enc_qkn_rope_cls(rawn, hn, s2, pc2, int64(wgs) * 2l)
+                        vhz_dep(rawn, hn, 8u, 0u, true)
+                        cmd_copy_whole(rawn, q1d, host2.buf, q_bytes)
+                        cmd_copy_range(rawn, km1, 0l, host2.buf, q_bytes, mn_bytes)
+                        cmd_copy_range(rawn, vm1, 0l, host2.buf, q_bytes + mn_bytes, mn_bytes)
+                        cmd_copy_range(rawn, q2d, 0l, host2.buf, q_bytes + 2l * mn_bytes, 2l * q_bytes)
+                        cmd_copy_range(rawn, kmn, 0l, host2.buf, 3l * q_bytes + 2l * mn_bytes, mn_bytes)
+                        cmd_copy_range(rawn, vmn, 0l, host2.buf, 3l * q_bytes + 3l * mn_bytes, mn_bytes)
+                        vk_check(vkEndCommandBuffer(rawn), null)
+                        submit_wait(rawn)
+                        let f = reinterpret<float?>(host2.mapped)
+                        let km1o = qd
+                        let vm1o = qd + mn
+                        let q2o = qd + 2 * mn
+                        let kmno = 3 * qd + 2 * mn
+                        let vmno = 3 * qd + 3 * mn
+                        var badn = 0
+                        for (i in range(qd)) {   // row 0's q against the one-row run above, row 1's against its own
+                            if (float_bits_to_uint(f[q2o + i]) != float_bits_to_uint(q_cls[i])) {
+                                badn++
+                            }
+                            if (float_bits_to_uint(f[q2o + qd + i]) != float_bits_to_uint(f[i])) {
+                                badn++
+                            }
+                        }
+                        for (i in range(kvd)) {   // row 0's mirror rows against the one-row run's, row 1's (one row past) against its own
+                            if (float_bits_to_uint(f[kmno + krow + i]) != float_bits_to_uint(m_cls[krow + i])) {
+                                badn++
+                            }
+                            if (float_bits_to_uint(f[vmno + vrow + i]) != float_bits_to_uint(m_cls[mirn2 + vrow + i])) {
+                                badn++
+                            }
+                            if (float_bits_to_uint(f[kmno + krow + kvd + i]) != float_bits_to_uint(f[km1o + krow + kvd + i])) {
+                                badn++
+                            }
+                            if (float_bits_to_uint(f[vmno + vrow + kvd + i]) != float_bits_to_uint(f[vm1o + vrow + kvd + i])) {
+                                badn++
+                            }
+                        }
+                        t |> success(badn == 0, "qkn_rope_kv over two rows: each row's q and mirror rows are the one-row kernel's bit for bit ({badn} off)")
+                        var stalen = 0
+                        for (i in range(krow)) {   // nothing lands under layerbase on either mirror
+                            if (float_bits_to_uint(f[kmno + i]) != NAN_SENTINEL_BITS || float_bits_to_uint(f[vmno + i]) != NAN_SENTINEL_BITS) {
+                                stalen++
+                            }
+                        }
+                        t |> success(stalen == 0, "qkn_rope_kv over two rows: the mirror rows under layerbase keep the sentinel ({stalen} written)")
+                    }
+                    delete q2h
+                    delete kv2h
+                    delete cs2h
+                }
                 delete q0h
                 delete kvh
                 delete csh
@@ -8869,6 +9746,8 @@ def test_vkd_kv16_writers(t0 : T?) {
                     var tokb = make_host_buf(16l, true)
                     var tmq = reinterpret<TokMeta?>(tokb.mapped)
                     tmq.pos = 0u
+                    tmq.cnt = 0u
+                    tmq.mirbase = 0u
                     var sc = set_qkn_rope_f16_cls(fixed_array(qd2, kvdv, km2, vm2, csd, wnd, tokb.buf, csd),
                         fixed_array(q_bytes, kv_bytes, m_bytes, m_bytes, cs_bytes, wn_bytes, 16l, cs_bytes),
                         fixed_array(16u, 1u, 2u, 4u, 8u, 8u, 0u, 0u))
@@ -8967,7 +9846,7 @@ def test_vkd_kv16_readers(t0 : T?) {
                 t |> skip("no Vulkan device")
                 return
             }
-            if (!(ensure_da_attn_f16_cls() && ensure_da_attn_b_f16_cls())) {
+            if (!(ensure_da_attn_f16_cls() && ensure_da_attn_b_f16_cls() && ensure_da_attn_f16_g2_cls())) {
                 t |> skip("f16 attention classes declined on this device")
                 return
             }
@@ -9034,6 +9913,42 @@ def test_vkd_kv16_readers(t0 : T?) {
                 }
                 let bad = mismatch_approx(y_cls, y_ref)
                 t |> success(bad == 0, "da_attn_f16 at head {hs} matches the CPU oracle ({bad} of {nheads * hs} off)")
+                //! the two-head slab's f16 stamp (the one a two-head group serves on the f16 mirror) at the same shape: the oracle, and the four-head stamp bit for bit
+                var y_g2 : array<float>
+                y_g2 |> resize(nheads * hs)
+                unsafe {
+                    var tokb2 = make_host_buf(16l, true)
+                    var tmc2 = reinterpret<TokMeta?>(tokb2.mapped)
+                    tmc2.cnt = uint(cnt)
+                    tmc2.mirbase = 0u
+                    var sc2 = set_da_attn_f16_cls(fixed_array(qdv, kd, vd, yd2, tokb2.buf, yd2, yd2, yd2),
+                        fixed_array(q_bytes, m_bytes, m_bytes, q_bytes, 16l, q_bytes, q_bytes, q_bytes),
+                        fixed_array(1u, 2u, 4u, 16u, 0u, 16u, 16u, 16u))
+                    var raw3 = alloc_cmd()
+                    vk_check(vkBeginCommandBuffer(raw3, begin), null)
+                    var h3 : VkHaz
+                    var pc3 = DaAttnArgs(kvd = uint(kvd), hs = uint(hs),
+                        kv_mul = uint(kv_mul), kbase = 0u, vbase = 0u, scale = scale, rqk = DA_RQ_NONE)
+                    enc_da_attn_f16_g2_cls(raw3, h3, sc2, pc3, da_attn_row_wgs(int64(nheads), int64(kv_mul), 1l))
+                    vhz_dep(raw3, h3, 16u, 0u, true)
+                    cmd_copy_whole(raw3, yd2, host.buf, q_bytes)
+                    vk_check(vkEndCommandBuffer(raw3), null)
+                    submit_wait(raw3)
+                    memcpy(addr<void?>(y_g2[0]), host.mapped, q_bytes)
+                }
+                let bad_g2 = mismatch_approx(y_g2, y_ref)
+                t |> success(bad_g2 == 0, "da_attn_f16_g2 at head {hs} matches the CPU oracle ({bad_g2} of {nheads * hs} off)")
+                var apart = 0
+                for (i in range(nheads * hs)) {
+                    if (y_g2[i] != y_cls[i]) {
+                        apart++
+                    }
+                }
+                t |> success(apart == 0, "da_attn_f16_g2 at head {hs} is da_attn_f16 bit for bit ({apart} of {nheads * hs} apart)")
+                y_ref[hs / 2] += 0.5
+                t |> equal(mismatch_approx(y_g2, y_ref), 1, "da_attn_f16_g2 at head {hs}: the bar reds one poisoned element")
+                y_ref[hs / 2] -= 0.5
+                delete y_g2
                 delete qh
                 delete kh
                 delete vh
@@ -9686,6 +10601,56 @@ def private vkd_run_copy(var raw; var h; dev : uint64; host; bytes : int64; bits
     submit_wait(raw)
 }
 
+//! the device: the recorded dispatches over `raw`, then each plane - `sizes[p]` bytes of `devs[p]` from its start - into `host` at `ats[p]`
+def private vkd_run_copy(var raw; var h; devs : array<uint64>; host; ats, sizes : array<int64>; bits : uint) {
+    vhz_dep(raw, h, bits, 0u, true)
+    for (dev, at, bytes in devs, ats, sizes) {
+        cmd_copy_range(raw, dev, 0l, host.buf, at, bytes)
+    }
+    vk_check(vkEndCommandBuffer(raw), null)
+    submit_wait(raw)
+}
+
+//! the host select's picks and weights over the rows, `k` a row
+struct TopkSelect {
+    idx : array<int64>
+    w : array<float>
+}
+
+//! the host select (`moe_select_core`) a row at a time over `npos` rows of `logits` at `lstride`, each row under `rbias`'s row at `rboff` when `bias_on`
+def private topk_rows_select(gate : MoeGate; logits, rbias : array<float>; npos, ne, k, lstride, rboff : int; bias_on, norm : bool; wscale : float) : TopkSelect {
+    var sel : TopkSelect
+    static_if (typeinfo builtin_module_exists(vulkan)) {
+        sel.idx |> resize(npos * k)
+        sel.w |> resize(npos * k)
+        var row : array<float>
+        row |> resize(ne)
+        for (p in range(npos)) {
+            for (e in range(ne)) {
+                row[e] = logits[p * lstride + e] + (bias_on ? rbias[rboff + e] : 0.0)
+            }
+            unsafe {
+                moe_select_core(gate, int64(ne), int64(k), norm, wscale, addr(row[0]), addr(sel.idx[0]), addr(sel.w[0]), int64(p * k))
+            }
+        }
+        delete row
+    }
+    return <- sel
+}
+
+//! the device's picks and weights against the host select's: the picks exact, the weights within 1e-4
+def private topk_rows_compare(t : T?; tag : string; gidx : array<uint>; gw : array<float>; sel : TopkSelect) {
+    var badi = 0
+    for (g, w in gidx, sel.idx) {
+        if (int64(g) != w) {
+            badi++
+        }
+    }
+    let badw = mismatch_rel(gw, sel.w, 1e-4)
+    t |> success(badi == 0, "{tag}: the picks are the host select's ({badi} of {length(gidx)} off)")
+    t |> success(badw == 0, "{tag}: the weights match the host select ({badw} of {length(gw)} off)")
+}
+
 //! the router GEMM: two layers' [ner x dim] rows, the second layer's dispatched through woff; logits at the ner
 //! stride; `ner` past a half-tile exercises both rows of an invocation, under it the second row's guard alone
 def private moe_router_arm(t : T?; ner : int) {
@@ -9795,62 +10760,27 @@ def private moe_topk_rows_arm(t : T?; norm : bool; wscale : float; gate : MoeGat
             memcpy(addr<void?>(gidx[0]), hosti.mapped, s_bytes)
             memcpy(addr<void?>(gw[0]), hostw.mapped, s_bytes)
         }
-        var widx : array<int64>
-        var ww : array<float>
-        widx |> resize(MR_NPOS * MR_K)
-        ww |> resize(MR_NPOS * MR_K)
-        var row : array<float>
-        row |> resize(MR_NE)
-        for (p in range(MR_NPOS)) {
-            for (e in range(MR_NE)) {
-                row[e] = lh[p * MR_NER + e] + rb[MR_NE + e]
-            }
-            unsafe {
-                moe_select_core(gate, int64(MR_NE), int64(MR_K), norm, wscale, addr(row[0]), addr(widx[0]), addr(ww[0]), int64(p * MR_K))
-            }
-        }
-        var badi = 0
-        for (i in range(MR_NPOS * MR_K)) {
-            if (int64(gidx[i]) != widx[i]) {
-                badi++
-            }
-        }
-        let badw = mismatch_rel(gw, ww, 1e-4)
+        var sel <- topk_rows_select(gate, lh, rb, MR_NPOS, MR_NE, MR_K, MR_NER, MR_NE, true, norm, wscale)
         let arm = (gate == MoeGate.softmax_weight ? "softmax over the picks" : (norm ? "renormalized" : "scaled by {wscale}")) + (rbias ? ", router bias" : "")
-        t |> success(badi == 0, "per-row top-k picks the host select's experts ({arm}; {badi} of {MR_NPOS * MR_K} off)")
-        t |> success(badw == 0, "per-row top-k weights match the host select ({arm}; {badw} of {MR_NPOS * MR_K} off)")
-        ww[4] += 0.5
-        t |> success(mismatch_rel(gw, ww, 1e-4) == 1, "per-row top-k control: the bar reds one poisoned weight")
+        topk_rows_compare(t, "per-row top-k ({arm})", gidx, gw, sel)
+        sel.w[4] += 0.5
+        t |> success(mismatch_rel(gw, sel.w, 1e-4) == 1, "per-row top-k control: the bar reds one poisoned weight")
         if (rbias) {   //! the bias control: the select over the unbiased logits must pick differently somewhere
-            var wid0 : array<int64>
-            var ww0 : array<float>
-            wid0 |> resize(MR_NPOS * MR_K)
-            ww0 |> resize(MR_NPOS * MR_K)
-            for (p in range(MR_NPOS)) {
-                for (e in range(MR_NE)) {
-                    row[e] = lh[p * MR_NER + e]
-                }
-                unsafe {
-                    moe_select_core(gate, int64(MR_NE), int64(MR_K), norm, wscale, addr(row[0]), addr(wid0[0]), addr(ww0[0]), int64(p * MR_K))
-                }
-            }
+            var sel0 <- topk_rows_select(gate, lh, rb, MR_NPOS, MR_NE, MR_K, MR_NER, MR_NE, false, norm, wscale)
             var moved = 0
-            for (i in range(MR_NPOS * MR_K)) {
-                if (wid0[i] != widx[i]) {
+            for (i0, i in sel0.idx, sel.idx) {
+                if (i0 != i) {
                     moved++
                 }
             }
             t |> success(moved > 0, "router bias control: the bias moves {moved} of {MR_NPOS * MR_K} picks off the unbiased select")
-            delete wid0
-            delete ww0
+            delete sel0
         }
+        delete sel
         delete rb
         delete lh
         delete gidx
         delete gw
-        delete widx
-        delete ww
-        delete row
     }
 }
 
@@ -10443,6 +11373,262 @@ def private moe_ar_comb_g4_arm(t : T?) {
         delete want_y
         delete r
         delete c
+    }
+}
+
+//! the N-row command's top-k against the one-row top-k run a row at a time: the picks, the weights and the region
+//! records bit for bit, the rows' feed blocks where the one-row form writes row zero's - and the picks against the host
+//! select, the same oracle the window's per-row form holds to; `gptoss_router_bias` takes the biased pick
+def private topk_n_arm(t : T?; gptoss_router_bias : bool) {
+    static_if (typeinfo builtin_module_exists(vulkan)) {
+        let npos = 4
+        let ne = 40
+        let k = 6
+        let lstride = 48
+        let xnb1 = 7u
+        let xnb2 = 5u
+        var lh : array<float>
+        var rb : array<float>
+        lh |> resize(npos * lstride)
+        rb |> resize(2 * ne)
+        for (i in range(npos * lstride)) {
+            lh[i] = hash_unit(uint(i) * 3u + 211u) * 2.0 + float(i % 7) * 0.0625   //! spread past any near-tie
+        }
+        for (e in range(ne)) {
+            rb[e] = 7.0
+            rb[ne + e] = gptoss_router_bias ? hash_unit(uint(e) * 5u + 7u) * 3.0 - 1.5 : 0.0
+        }
+        let l_bytes = int64(npos * lstride) * 4l
+        let l1_bytes = int64(lstride) * 4l
+        let rb_bytes = int64(2 * ne) * 4l
+        let ds_bytes = 16l
+        let ld = make_device_buf(l_bytes)
+        let ld1 = make_device_buf(l1_bytes)
+        let dsd = make_device_buf(ds_bytes)
+        let rbd = make_device_buf(rb_bytes)
+        let gbits = fixed_array(1u, 2u, 4u, 8u, 16u, 0u, 0u, 32u)
+        var pc = TopkArgs(ne = uint(ne), k = uint(k), norm = 1u, wscale = 0.0, dsoff = NO_DSCALE, rbias_on = gptoss_router_bias ? 1u : 0u, rboff = uint(ne),
+            base1 = 100u, stride1 = 1000u, base3 = 200u, stride3 = 1000u, base2 = 300u, stride2 = 2000u, xnb2 = xnb2,
+            lstride = uint(lstride), xnb1 = xnb1)
+        var pc1 = pc
+        pc1.lstride = 0u
+        pc1.xnb1 = 0u
+        unsafe {
+            upload_region_at(ld, 0l, addr<uint8 const?>(lh[0]), l_bytes)
+            upload_region_at(rbd, 0l, addr<uint8 const?>(rb[0]), rb_bytes)
+            nan_sentinel_upload(dsd, ds_bytes)
+        }
+        let arm = gptoss_router_bias ? "router bias" : "plain"
+        let tag = "topk_n ({arm})"
+        var planes <- nform_cols_cell(t, tag, [npos], npos, 0,
+            [NformPlane(name = "the w1 slot blocks", words = 2 * k, cmp = false), NformPlane(name = "the w3 slot blocks", words = 2 * k, cmp = false),
+             NformPlane(name = "the w2 slot blocks", words = 2 * k, cmp = false), NformPlane(name = "the weights", words = k), NformPlane(name = "the picks", words = k)],
+            2u | 4u | 8u | 16u | 32u,
+            $(p : int; raw : VkCommandBuffer; var h : VkHaz; o : NformOuts) {
+                upload_region_at(ld1, 0l, unsafe(addr<uint8 const?>(lh[p * lstride])), l1_bytes)
+                var sc1 = set_topk_cls(fixed_array(ld1, o.bufs[0], o.bufs[1], o.bufs[2], o.bufs[3], dsd, rbd, o.bufs[4]),
+                    fixed_array(l1_bytes, o.bytes[0], o.bytes[1], o.bytes[2], o.bytes[3], ds_bytes, rb_bytes, o.bytes[4]), gbits)
+                enc_topk_cls(raw, h, sc1, pc1, 1l)
+            },
+            $(nrows : int; raw : VkCommandBuffer; var h : VkHaz; o : NformOuts) {
+                var scN = set_topk_n_cls(fixed_array(ld, o.bufs[0], o.bufs[1], o.bufs[2], o.bufs[3], dsd, rbd, o.bufs[4]),
+                    fixed_array(l_bytes, o.bytes[0], o.bytes[1], o.bytes[2], o.bytes[3], ds_bytes, rb_bytes, o.bytes[4]), gbits)
+                enc_topk_n_cls(raw, h, scN, pc, int64(nrows))
+            })
+        var bad = 0
+        var badx = 0
+        for (p in range(npos)) {
+            for (j in range(k)) {
+                let s = p * k + j
+                if (planes.nf[0][s * 2] != planes.one[0][s * 2] || planes.nf[1][s * 2] != planes.one[1][s * 2] || planes.nf[2][s * 2] != planes.one[2][s * 2]) {
+                    bad++
+                }
+                if (planes.nf[0][s * 2 + 1] != uint(p) * xnb1 || planes.nf[1][s * 2 + 1] != uint(p) * xnb1 || planes.nf[2][s * 2 + 1] != uint(s) * xnb2
+                        || planes.one[0][s * 2 + 1] != 0u || planes.one[1][s * 2 + 1] != 0u || planes.one[2][s * 2 + 1] != uint(j) * xnb2) {
+                    badx++
+                }
+            }
+        }
+        t |> success(bad == 0, "{tag}: the rows' weight blocks == the one-row top-k a row at a time ({bad} of {npos * k} slots off)")
+        t |> success(badx == 0, "{tag}: every slot's feed blocks are its row's, the one-row form's row zero's ({badx} of {npos * k} slots off)")
+        let live = npos * k   //! the N plane holds one row past the extent (the sentinel slot): the host select covers the live rows
+        var gw <- [for (i in range(live)); uint_bits_to_float(planes.nf[3][i])]
+        var gidx <- [for (i in range(live)); planes.nf[4][i]]
+        var sel <- topk_rows_select(MoeGate.softmax, lh, rb, npos, ne, k, lstride, ne, true, true, 0.0)
+        topk_rows_compare(t, tag, gidx, gw, sel)
+        delete sel
+        delete gidx
+        delete gw
+        delete planes
+        delete lh
+        delete rb
+    }
+}
+
+[test]
+def test_vkd_topk_n(t0 : T?) {
+    t0 |> run("the N-row command's top-k == the one-row top-k a row at a time, bit for bit, and the host select") <| @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            if (!(ensure_topk_cls() && ensure_topk_n_cls())) {
+                t |> skip("no Vulkan device")
+                return
+            }
+            topk_n_arm(t, gptoss_router_bias = false)
+            topk_n_arm(t, gptoss_router_bias = true)
+        } else {
+            t |> skip("dasVulkan not present")
+        }
+    }
+}
+
+//! the router GEMV's descriptor set on the stamp `f16` names
+def private router_set(f16 : bool; bufs; sizes) => f16 ? set_router_gemv_f16_cls(bufs, sizes, fixed_array(0u, 1u, 2u, 0u)) : set_router_gemv_cls(bufs, sizes, fixed_array(0u, 1u, 2u, 0u))
+
+//! the router GEMV recorded on the stamp `f16` names
+def private router_enc(f16 : bool; raw; var h; var sc; var pc; groups : int64) {
+    if (f16) {
+        enc_router_gemv_f16_cls(raw, h, sc, pc, groups)
+    } else {
+        enc_router_gemv_cls(raw, h, sc, pc, groups)
+    }
+}
+
+//! the CPU oracle: each row's dot with every expert row, the row under its rms and the norm row where the fused norm is on;
+//! the bar is the sum's rounding over dim terms of the same order, the envelope scaling it with the row
+def private router_cols_oracle(t : T?; arm : string; got, xh, nh, wdev : array<float>; ncols, ne, dim, obase : int; norm_on : bool; eps : float) {
+    var obad = 0
+    var oworst = 0.0
+    var oworst_c = 0
+    var oworst_e = 0
+    for (c in range(ncols)) {
+        var inv = 1.0
+        if (norm_on) {
+            var ss = 0.0
+            for (i in range(dim)) {
+                ss += xh[c * dim + i] * xh[c * dim + i]
+            }
+            inv = 1.0 / sqrt(ss / float(dim) + eps)
+        }
+        for (e in range(ne)) {
+            var acc = 0.0
+            var env = 0.0
+            for (i in range(dim)) {
+                let xv = norm_on ? xh[c * dim + i] * nh[i] : xh[c * dim + i]
+                acc += wdev[e * dim + i] * xv
+                env += abs(wdev[e * dim + i] * xv)
+            }
+            let want = acc * inv
+            let bar = 1e-4 * env * inv + 1e-6
+            let d = abs(got[obase + c * ne + e] - want)
+            if (d > bar) {
+                obad++
+            }
+            if (d > oworst) {
+                oworst = d
+                oworst_c = c
+                oworst_e = e
+            }
+        }
+    }
+    t |> success(obad == 0, "{arm}: {obad} of {ne * ncols} logits off the CPU oracle (widest {oworst} at row {oworst_c}, expert {oworst_e})")
+}
+
+//! the router GEMV over `ncols` x rows against the one-row dispatch a row at a time (word for word through `nform_cols_cell`:
+//! one kernel body, the same order) and against a CPU oracle of the same dot - the f16 stamp's weights rounded as the device
+//! reads them, and under `norm_on` each row's rms under a norm row, as the gemma-4 MoE router reads its input
+def private router_cols_arm(t : T?; ncols : int; norm_on, f16 : bool) {
+    static_if (typeinfo builtin_module_exists(vulkan)) {
+        let stamp = f16 ? "f16" : "f32"
+        let form = "router_gemv {stamp}{norm_on ? " under the fused rms" : ""}"
+        let arm = "{form} over {ncols} columns"
+        if (f16 ? !ensure_router_gemv_f16_cls() : !ensure_router_gemv_cls()) {
+            t |> skip("{arm}: the class rail declined on this device")
+            return
+        }
+        let dim = 2048
+        let ne = 24
+        let obase = 8
+        let ncol_max = 8
+        var wh, xh, nh : array<float>
+        wh |> resize(ne * dim)
+        xh |> resize(ncol_max * dim)
+        nh |> resize(dim)
+        for (i in range(ne * dim)) {
+            wh[i] = float(hash_word(uint(i) + 777u) % 1000u) / 500.0 - 1.0
+        }
+        for (i in range(ncol_max * dim)) {
+            xh[i] = float(hash_word(uint(i) + 31u) % 1000u) / 500.0 - 1.0
+        }
+        for (i in range(dim)) {
+            nh[i] = float(hash_word(uint(i) + 9u) % 1000u) / 1000.0 + 0.5
+        }
+        var wh16 <- pack_f16(wh)
+        var wdev : array<float>   //! the weights as the device reads them: the f16 stamp's rounded, the f32 stamp's as given
+        wdev |> resize(ne * dim)
+        for (i in range(ne * dim)) {
+            wdev[i] = f16 ? float(wh16[i]) : wh[i]
+        }
+        let w_bytes = f16 ? long_length(wh16) * 2l : int64(ne * dim) * 4l
+        let x_bytes = int64(ncols * dim) * 4l
+        let x1_bytes = int64(dim) * 4l
+        let n_bytes = int64(dim) * 4l
+        let wd = make_device_buf(w_bytes)
+        let xd = make_device_buf(x_bytes)
+        let xd1 = make_device_buf(x1_bytes)
+        let nd = make_device_buf(n_bytes)
+        let eps = 1e-6
+        let non = norm_on ? 1u : 0u
+        unsafe {
+            if (f16) {
+                upload_region_at(wd, 0l, addr<uint8 const?>(wh16[0]), w_bytes)
+            } else {
+                upload_region_at(wd, 0l, addr<uint8 const?>(wh[0]), w_bytes)
+            }
+            upload_region_at(xd, 0l, addr<uint8 const?>(xh[0]), x_bytes)
+            upload_region_at(nd, 0l, addr<uint8 const?>(nh[0]), n_bytes)
+        }
+        var planes <- nform_cols_cell(t, form, [ncols], ncol_max, obase, [NformPlane(name = "the logits", words = ne)], 2u,
+            $(c : int; raw : VkCommandBuffer; var h : VkHaz; o : NformOuts) {
+                upload_region_at(xd1, 0l, unsafe(addr<uint8 const?>(xh[c * dim])), x1_bytes)
+                var sc1 = router_set(f16, fixed_array(wd, xd1, o.bufs[0], nd), fixed_array(w_bytes, x1_bytes, o.bytes[0], n_bytes))
+                var pc1 = RouterArgs(ne = uint(ne), dim = uint(dim), woff = 0u, obase = uint(obase), norm_on = non, nwoff = 0u, eps = eps)
+                router_enc(f16, raw, h, sc1, pc1, int64(ne))
+            },
+            $(nc : int; raw : VkCommandBuffer; var h : VkHaz; o : NformOuts) {
+                var sc = router_set(f16, fixed_array(wd, xd, o.bufs[0], nd), fixed_array(w_bytes, x_bytes, o.bytes[0], n_bytes))
+                var pc = RouterArgs(ne = uint(ne), dim = uint(dim), woff = 0u, obase = uint(obase), norm_on = non, nwoff = 0u, eps = eps, ncols = uint(nc))
+                router_enc(f16, raw, h, sc, pc, int64(ne))
+            })
+        var got <- plane_floats(planes.nf[0])
+        router_cols_oracle(t, arm, got, xh, nh, wdev, ncols, ne, dim, obase, norm_on, eps)
+        delete got
+        delete planes
+        delete wh
+        delete xh
+        delete nh
+        delete wh16
+        delete wdev
+    } else {
+        t |> skip("dasVulkan not present")
+    }
+}
+
+[test]
+def test_vkd_router_gemv_cols(t0 : T?) {
+    t0 |> run("the router GEMV over x rows as columns == the one-row dispatch a row at a time, bit for bit, and the CPU dot") <| @(t : T?) {
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            if (!vk_moe_init()) {
+                t |> skip("no Vulkan device")
+                return
+            }
+            router_cols_arm(t, 3, false, true)    // the E-series pre-step projection's stamp
+            router_cols_arm(t, 8, false, true)    // ... at the per-row planes' extent
+            router_cols_arm(t, 3, false, false)   // the MoE router's stamp
+            router_cols_arm(t, 3, true, false)    // ... under the gemma-4 router's fused rms
+            router_cols_arm(t, 8, true, false)    // ... at the extent, every partial slot live
+        } else {
+            t |> skip("dasVulkan not present")
+        }
     }
 }
 

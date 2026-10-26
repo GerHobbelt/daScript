@@ -443,9 +443,7 @@ def private dff_pair(tr, trg : Model; prompts : array<array<int64>>; nsteps : in
             sessb |> reserve(nb)
             cur |> reserve(nb)
             for (i in range64(nb)) {
-                unsafe {
-                    sessb |> push(addr(sb[i]))
-                }
+                sessb |> push(unsafe(addr(sb[i])))
                 cur |> push(greedy_top(sa[i].logits, vocab))
             }
             var one <- [0l]
@@ -691,6 +689,20 @@ def private run_arms(t : T?; tr, trg : Model; tag : string; prose_a, prose_b, co
 def test_metal_mtp_parity_0_8b(t : T?) {
     t |> run("metal MTP rail vs plain GPU decode - Qwen3.5-0.8B-MTP-Q8_0") <| @(t : T?) {
         run_fixture(t, "Qwen3.5-0.8B-MTP-Q8_0.gguf", "0.8b")
+    }
+}
+
+[test]
+def test_metal_mtp_parity_4b(t : T?) {
+    t |> run("metal MTP rail vs plain GPU decode - Qwen3.5-4B-MTP-Q8_0") <| @(t : T?) {
+        run_fixture(t, "Qwen3.5-4B-MTP-Q8_0.gguf", "4b")
+    }
+}
+
+[test]
+def test_metal_mtp_parity_9b(t : T?) {
+    t |> run("metal MTP rail vs plain GPU decode - Qwen3.5-9B-MTP-UD-Q5_K_XL (large tier)") <| @(t : T?) {
+        run_fixture(t, "Qwen3.5-9B-MTP-UD-Q5_K_XL.gguf", "9b")
     }
 }
 

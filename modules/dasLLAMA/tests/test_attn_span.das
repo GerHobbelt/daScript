@@ -14,6 +14,7 @@ require daslib/jobque_boost
 require daslib/fio
 require math
 require dasllama/dasllama_math   // setup_dasllama_jobque_ + set_prefill_attn_mode
+require dasllama/dasllama_load   // quantize_weights_q4: the q4_0 requant leg
 require dasllama/dasllama_env
 
 // The non-causal image span (eval_embd_/forward_prefill_embd non_causal=true): every query of
@@ -168,17 +169,10 @@ def test_attn_span(t : T?) {
             // the span rewrites the whole plane, not just row 0
             let dlast = row_maxdiff(causal_a, span_a, NPOS - 1l, dim)
             tt |> success(dlast > 1e-4, "span vs causal differ at the last row too ({dlast})")
-            // three independent kernel implementations agree on the span semantics
-            set_prefill_attn_mode(AttnPrefillMode.blocked)
-            let span_blocked <- span_prefill(tr, embd_a, true)
+            // the two independent kernel implementations agree on the span semantics
             set_prefill_attn_mode(AttnPrefillMode.flash)
             let span_flash <- span_prefill(tr, embd_a, true)
             set_prefill_attn_mode(AttnPrefillMode.classic)
-            var mode_diff = 0.0
-            for (r in range64(NPOS)) {
-                mode_diff = max(mode_diff, row_maxdiff(span_a, span_blocked, r, dim))
-            }
-            tt |> success(mode_diff < 1e-3, "blocked agrees with classic on the span ({mode_diff})")
             var flash_diff = 0.0
             for (r in range64(NPOS)) {
                 flash_diff = max(flash_diff, row_maxdiff(span_a, span_flash, r, dim))
@@ -195,6 +189,17 @@ def test_attn_span(t : T?) {
                 reset_diff = max(reset_diff, row_maxdiff(causal_a, causal_after, r, dim))
             }
             tt |> equal(reset_diff, 0.0, "causal after span == fresh causal, bit-exact")
+            // the q4_0 requant tier takes the embedding prefill too: the same mask direction on q4_0 weights
+            var tq <- load_checkpoint(MODEL_PATH)
+            quantize_weights_q4(tq)
+            let q4_causal_a <- span_prefill(tq, embd_a, false)
+            let q4_causal_b <- span_prefill(tq, embd_b, false)
+            let q4_span_a <- span_prefill(tq, embd_a, true)
+            let q4_span_b <- span_prefill(tq, embd_b, true)
+            tt |> equal(row_maxdiff(q4_causal_a, q4_causal_b, 0l, dim), 0.0, "q4_0 causal: row 0 blind to a last-row perturbation")
+            let q4_d0 = row_maxdiff(q4_span_a, q4_span_b, 0l, dim)
+            tt |> success(q4_d0 > 1e-4, "q4_0 span: row 0 sees the last row (d0 = {q4_d0})")
+            delete tq
         }
         delete tr
     }
@@ -280,10 +285,6 @@ def test_attn_span_fused(t : T?) {
             let lg_split <- span_turn_logits(tr, embd_a, false)
             let lg_fused <- span_turn_logits(tr, embd_a, true)
             tt |> equal(arr_maxdiff(lg_split, lg_fused), 0.0, "classic: fused == splice, bit-exact decode logits")
-            set_prefill_attn_mode(AttnPrefillMode.blocked)
-            let lg_split_b <- span_turn_logits(tr, embd_a, false)
-            let lg_fused_b <- span_turn_logits(tr, embd_a, true)
-            tt |> equal(arr_maxdiff(lg_split_b, lg_fused_b), 0.0, "blocked: fused == splice, bit-exact decode logits")
             set_prefill_attn_mode(AttnPrefillMode.flash)
             let lg_split_f <- span_turn_logits(tr, embd_a, false)
             let lg_fused_f <- span_turn_logits(tr, embd_a, true)

@@ -715,10 +715,11 @@ def test_metal_kernel_coverage(tst : T?) {
 // classes no zoo row below can dispatch, each with the reason and the kernel-unit cell that does.
 let private VK_CENSUS_NEVER_DISPATCHED <- [
     // the expert schedule's e stamps of the formats no stocked MoE carrier holds a routed expert
-    // plane in: the zoo's resident MoE carriers put q8 and k4 planes (the Qwen1.5-MoE files) and
-    // the UD-IQ2_XXS 30B's iq2xxs / iq2xs / iq2s / iq3xxs / iq3s / iq4xs mix on the schedule. Their
-    // coverage is the e arm of each format's cell in test_vulkan_kernels.das
-    "kq_batch_k5_cm2e_cls_spv", "kq_batch_k6_cm2e_cls_spv", "kq_batch_q40_cm2e_cls_spv",
+    // plane in: the zoo's resident MoE carriers put q8 and k4 planes (the Qwen1.5-MoE files), the
+    // 30B Q4_K_M's k4 and k6 planes (under DASLLAMA_PARITY_FULL=1) and the UD-IQ2_XXS 30B's
+    // iq2xxs / iq2xs / iq2s / iq3xxs / iq3s / iq4xs mix on the schedule. Their coverage is the e arm
+    // of each format's cell in test_vulkan_kernels.das
+    "kq_batch_k5_cm2e_cls_spv", "kq_batch_q40_cm2e_cls_spv",
     "kq_batch_k3_cm2e_cls_spv", "kq_batch_iq4nl_cm2e_cls_spv", "kq_batch_k2_cm2e_cls_spv",
     // the q51 expert rail (the 32-block down planes of the 26B-A4B's Q4_K_M: a carrier above the zoo's tier) -
     // its s and e stamps and its decode GEMV; their coverage is test_vkd_q51_cm2_batch and test_vkd_q51_gemv
@@ -740,6 +741,10 @@ let private VK_CENSUS_NEVER_DISPATCHED <- [
     // test_vkd_fa_cm2, test_vkd_fa_khr and test_vkd_da_attn in test_vulkan_kernels.das
     "fa_cm2_h64_sink_cls_spv", "fa_cm2_h64_sink_f16_cls_spv", "fa_khr_h64_sink_cls_spv", "fa_khr_h64_sink_f16_cls_spv",
     "da_attn_sink_cls_spv", "da_attn_f16_sink_cls_spv",
+    // the token command's f32-mirror attention stamps (the four-head slab and the two-head one): the census steps every
+    // session on the f16 mirror the tier arms, the f32 twin serves under DASLLAMA_VK_KV32=1 (gemma-2-2b Q8_0's f32 parity
+    // run dispatches both); their coverage is test_vkd_da_attn and test_vkd_da_attn_rqk in test_vulkan_kernels.das
+    "da_attn_cls_spv", "da_attn_g2_cls_spv",
     // the E-series per-layer-embedding tail (the act, its requant and the proj GEMV in one): its carriers are the
     // gemma-4 E2B / E4B, no zoo row; its coverage is test_vkd_q8_gemv_pleact in test_vulkan_kernels.das
     "q8_gemv_pleact_cls_spv",
@@ -777,7 +782,14 @@ let private VK_CENSUS_NEVER_DISPATCHED <- [
     // Q8_0 tinyllama; the q8 n2/n4/n8 stamps ride its 2-, 4- and 8-row steps); their coverage is test_vkd_gemv_ncol
     // in test_vulkan_kernels.das
     "q8_gemv_n2p_cls_spv", "q8_gemv_n4p_cls_spv", "q8_gemv_n8p_cls_spv",
-    "kq_gemv_k4_n_cls_spv", "kq_gemv_k5_n_cls_spv", "kq_gemv_k6_n_cls_spv", "kq_gemv_q40_n_cls_spv", "kq_gemv_iq4xs_n_cls_spv"]
+    "kq_gemv_k4_n_cls_spv", "kq_gemv_k5_n_cls_spv", "kq_gemv_k6_n_cls_spv", "kq_gemv_q40_n_cls_spv", "kq_gemv_iq4xs_n_cls_spv",
+    // the fused gate-up GEMV's N stamps serve only the N-row token command, which the zoo's one-region load never engages
+    // (the batched rows need a region a row; the stocked regions files - test_gpu_resident_regions_qwen3.das and the
+    // gemma files - reach them at two regions); their coverage is test_vkd_q8_gemv_gu_n in test_vulkan_kernels.das
+    "q8_gemv_gu_n2_cls_spv", "q8_gemv_gu_n4_cls_spv", "q8_gemv_gu_n8_cls_spv",
+    // the N-row command's per-row top-k: the census steps every session a row at a time (the batched step needs two sessions
+    // over two regions - the gpt-oss and Qwen3-30B regions files serve it); its coverage is test_vkd_topk_n in test_vulkan_kernels.das
+    "topk_n_cls_spv"]
 
 [unused_argument(t, path, family, nbs)]   // without vulkan the gated body is empty
 def private vk_cov_model(t : T?; path, family : string; nbs : array<int>) {

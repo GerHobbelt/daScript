@@ -256,7 +256,7 @@ def private rdec_efmt(t : Model; tags : array<KqFmt>; l : int64) : KqFmt => t.ex
 //! P3 trim (generate-then-free): pack the emb/cls region into embq/embs, mark the model
 //! trimmed, and FREE the big CPU weight families — the save then writes them as empty planes.
 //! Arena-only plans qualify (pure resident-driver dense); false = declined, nothing changed.
-def trim_model_planes(var t : Model) : bool {   // nolint:STYLE037,STYLE038 — the flat per-format plane-trim ladder (one arm per KqFmt) is the honest shape
+def trim_model_planes(var t : Model) : bool {
     if (empty(t.vkplan) || t.config.n_layer_nextn > 0l) {
         return false
     }
@@ -286,78 +286,18 @@ def trim_model_planes(var t : Model) : bool {   // nolint:STYLE037,STYLE038 — 
         // the region's plane pair verbatim (repack layout preserved), rebased to superblock 0
         let nsb = vocab * (dim / 256l)
         let sb0 = t.wcls_off / 256l
+        let f = t.emb_fmt
+        if (!kq_sb(f)) {
+            to_log(LOG_WARNING, "dasLLAMA trim: emb fmt '{f}' has no kq plane pair - declining\n")
+            return false
+        }
+        let qsb = kq_qsb(f)
+        let ssb = kq_ssb(f)
+        t.embq |> reserve_resize(nsb * qsb)
+        t.embs |> reserve_resize(nsb * ssb)
         unsafe {
-            if (t.emb_fmt == KqFmt.k4) {
-                t.embq |> reserve_resize(nsb * K4_QSB)
-                t.embs |> reserve_resize(nsb * K4_SSB)
-                memcpy(addr<void?>(t.embq[0]), addr<void?>(t.k4q[sb0 * K4_QSB]), nsb * K4_QSB)
-                memcpy(addr<void?>(t.embs[0]), addr<void?>(t.k4s[sb0 * K4_SSB]), nsb * K4_SSB)
-            } elif (t.emb_fmt == KqFmt.k5) {
-                t.embq |> reserve_resize(nsb * K5_QSB)
-                t.embs |> reserve_resize(nsb * K5_SSB)
-                memcpy(addr<void?>(t.embq[0]), addr<void?>(t.k5q[sb0 * K5_QSB]), nsb * K5_QSB)
-                memcpy(addr<void?>(t.embs[0]), addr<void?>(t.k5s[sb0 * K5_SSB]), nsb * K5_SSB)
-            } elif (t.emb_fmt == KqFmt.k6) {
-                t.embq |> reserve_resize(nsb * K6_QSB)
-                t.embs |> reserve_resize(nsb * K6_SSB)
-                memcpy(addr<void?>(t.embq[0]), addr<void?>(t.k6q[sb0 * K6_QSB]), nsb * K6_QSB)
-                memcpy(addr<void?>(t.embs[0]), addr<void?>(t.k6s[sb0 * K6_SSB]), nsb * K6_SSB)
-            } elif (t.emb_fmt == KqFmt.q40) {
-                t.embq |> reserve_resize(nsb * Q40_QSB)
-                t.embs |> reserve_resize(nsb * Q40_SSB)
-                memcpy(addr<void?>(t.embq[0]), addr<void?>(t.q40q[sb0 * Q40_QSB]), nsb * Q40_QSB)
-                memcpy(addr<void?>(t.embs[0]), addr<void?>(t.q40s[sb0 * Q40_SSB]), nsb * Q40_SSB)
-            } elif (t.emb_fmt == KqFmt.iq4xs) {
-                t.embq |> reserve_resize(nsb * IQ4XS_QSB)
-                t.embs |> reserve_resize(nsb * IQ4XS_SSB)
-                memcpy(addr<void?>(t.embq[0]), addr<void?>(t.iq4xsq[sb0 * IQ4XS_QSB]), nsb * IQ4XS_QSB)
-                memcpy(addr<void?>(t.embs[0]), addr<void?>(t.iq4xss[sb0 * IQ4XS_SSB]), nsb * IQ4XS_SSB)
-            } elif (t.emb_fmt == KqFmt.k3) {
-                t.embq |> reserve_resize(nsb * K3_QSB)
-                t.embs |> reserve_resize(nsb * K3_SSB)
-                memcpy(addr<void?>(t.embq[0]), addr<void?>(t.k3q[sb0 * K3_QSB]), nsb * K3_QSB)
-                memcpy(addr<void?>(t.embs[0]), addr<void?>(t.k3s[sb0 * K3_SSB]), nsb * K3_SSB)
-            } elif (t.emb_fmt == KqFmt.iq4nl) {
-                t.embq |> reserve(nsb * Q40_QSB)
-                t.embq |> resize(nsb * Q40_QSB)
-                t.embs |> reserve(nsb * Q40_SSB)
-                t.embs |> resize(nsb * Q40_SSB)
-                memcpy(addr<void?>(t.embq[0]), addr<void?>(t.iq4nlq[sb0 * Q40_QSB]), nsb * Q40_QSB)
-                memcpy(addr<void?>(t.embs[0]), addr<void?>(t.iq4nls[sb0 * Q40_SSB]), nsb * Q40_SSB)
-            } elif (t.emb_fmt == KqFmt.k2) {
-                t.embq |> reserve_resize(nsb * K2_QSB)
-                t.embs |> reserve_resize(nsb * K2_SSB)
-                memcpy(addr<void?>(t.embq[0]), addr<void?>(t.k2q[sb0 * K2_QSB]), nsb * K2_QSB)
-                memcpy(addr<void?>(t.embs[0]), addr<void?>(t.k2s[sb0 * K2_SSB]), nsb * K2_SSB)
-            } elif (t.emb_fmt == KqFmt.iq2s) {
-                t.embq |> reserve_resize(nsb * IQ2S_QSB)
-                t.embs |> reserve_resize(nsb * IQ2S_SSB)
-                memcpy(addr<void?>(t.embq[0]), addr<void?>(t.iq2sq[sb0 * IQ2S_QSB]), nsb * IQ2S_QSB)
-                memcpy(addr<void?>(t.embs[0]), addr<void?>(t.iq2ss[sb0 * IQ2S_SSB]), nsb * IQ2S_SSB)
-            } elif (t.emb_fmt == KqFmt.iq2xs) {
-                t.embq |> reserve_resize(nsb * IQ2XS_QSB)
-                t.embs |> reserve_resize(nsb * IQ2XS_SSB)
-                memcpy(addr<void?>(t.embq[0]), addr<void?>(t.iq2xsq[sb0 * IQ2XS_QSB]), nsb * IQ2XS_QSB)
-                memcpy(addr<void?>(t.embs[0]), addr<void?>(t.iq2xss[sb0 * IQ2XS_SSB]), nsb * IQ2XS_SSB)
-            } elif (t.emb_fmt == KqFmt.iq2xxs) {
-                t.embq |> reserve_resize(nsb * IQ2XXS_QSB)
-                t.embs |> reserve_resize(nsb * IQ2XXS_SSB)
-                memcpy(addr<void?>(t.embq[0]), addr<void?>(t.iq2xxsq[sb0 * IQ2XXS_QSB]), nsb * IQ2XXS_QSB)
-                memcpy(addr<void?>(t.embs[0]), addr<void?>(t.iq2xxss[sb0 * IQ2XXS_SSB]), nsb * IQ2XXS_SSB)
-            } elif (t.emb_fmt == KqFmt.iq3xxs) {
-                t.embq |> reserve_resize(nsb * IQ3XXS_QSB)
-                t.embs |> reserve_resize(nsb * IQ3XXS_SSB)
-                memcpy(addr<void?>(t.embq[0]), addr<void?>(t.iq3xxsq[sb0 * IQ3XXS_QSB]), nsb * IQ3XXS_QSB)
-                memcpy(addr<void?>(t.embs[0]), addr<void?>(t.iq3xxss[sb0 * IQ3XXS_SSB]), nsb * IQ3XXS_SSB)
-            } elif (t.emb_fmt == KqFmt.iq3s) {
-                t.embq |> reserve_resize(nsb * IQ3S_QSB)
-                t.embs |> reserve_resize(nsb * IQ3S_SSB)
-                memcpy(addr<void?>(t.embq[0]), addr<void?>(t.iq3sq[sb0 * IQ3S_QSB]), nsb * IQ3S_QSB)
-                memcpy(addr<void?>(t.embs[0]), addr<void?>(t.iq3ss[sb0 * IQ3S_SSB]), nsb * IQ3S_SSB)
-            } else {
-                to_log(LOG_WARNING, "dasLLAMA trim: emb fmt '{t.emb_fmt}' has no kq plane pair - declining\n")
-                return false
-            }
+            memcpy(addr<void?>(t.embq[0]), addr<void?>(t.kq[int(f)].q[sb0 * qsb]), nsb * qsb)
+            memcpy(addr<void?>(t.embs[0]), addr<void?>(t.kq[int(f)].s[sb0 * ssb]), nsb * ssb)
         }
     }   // fp32 embeddings ride fblob, which the trim keeps
     t.planes_trimmed = true
@@ -366,32 +306,10 @@ def trim_model_planes(var t : Model) : bool {   // nolint:STYLE037,STYLE038 — 
     delete t.qscales16
     delete t.wblob
     delete t.bf16blob
-    delete t.k4q
-    delete t.k4s
-    delete t.k5q
-    delete t.k5s
-    delete t.k6q
-    delete t.k6s
-    delete t.iq4xsq
-    delete t.iq4xss
-    delete t.k3q
-    delete t.k3s
-    delete t.iq3sq
-    delete t.iq3ss
-    delete t.iq3xxsq
-    delete t.iq3xxss
-    delete t.iq4nlq
-    delete t.iq4nls
-    delete t.k2q
-    delete t.k2s
-    delete t.iq2sq
-    delete t.iq2ss
-    delete t.iq2xsq
-    delete t.iq2xss
-    delete t.iq2xxsq
-    delete t.iq2xxss
-    delete t.q40q
-    delete t.q40s
+    for (p in t.kq) {
+        delete p.q
+        delete p.s
+    }
     delete t.q51q
     delete t.q51s
     delete t.mxq
@@ -805,11 +723,18 @@ def set_gpu_ctx_max_(n : int64) {
     g_rdec_ctx_max = max(n, 0l)
 }
 
-// the auto-cap floor, env-overridable: DASLLAMA_GPU_MIN_CTX lets a short-context session arm a
-// model whose capped mirror lands under the default floor (e.g. a 3B on an 8GB card fits at 3429)
+// the arming floor: DASLLAMA_GPU_MIN_CTX lowers it for a short-context session (a 3B on an 8GB card fits at 3429), and a
+// context pin under it (set_gpu_ctx_max in process, else DASLLAMA_GPU_CTX_MAX) lowers it to the pin, never under 256
 def private rdec_min_ctx : int64 {
-    let v = g_env_gpu.gpu_min_ctx   // unset or non-numeric keeps the default floor
-    return v > 0l ? max(v, 256l) : RDEC_MIN_CTX
+    let pin = g_rdec_ctx_max > 0l ? g_rdec_ctx_max : g_env_gpu.gpu_ctx_max
+    return resident_arm_floor(g_env_gpu.gpu_min_ctx, pin)
+}
+
+//! a caller's own context pin (`set_gpu_ctx_max`, DASLLAMA_GPU_CTX_MAX) under the floor wins: the pin IS the shape it serves
+[arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#resident-plan")]
+def resident_arm_floor(env_floor, pin : int64) : int64 {
+    let floor = env_floor > 0l ? max(env_floor, 256l) : RDEC_MIN_CTX
+    return pin > 0l && pin < floor ? max(pin, 256l) : floor
 }
 
 // gather one prepared plane into device-layout bytes and place it in its format's arena; returns
@@ -1664,6 +1589,31 @@ var private g_rdec_cos_elems = 0l   //! a position's cos/sin plane width on the 
 var private @scratch @exact_size g_rdec_x_n : array<float>
 var private @scratch @exact_size g_rdec_cos_n : array<float>
 var private @scratch @do_not_delete g_rdec_lrows : array<float?>   //! borrowed rows into the sessions' logits
+var private @scratch g_rdec_picks : array<int64>   //! the rows' device picks (-1 on a row that landed its logits)
+var private g_rdec_picks_served = 0l
+//! the rows whose argmax the device landed alone this process: a cell reads the difference across its steps
+def public rdec_picks_served() : int64 => g_rdec_picks_served
+
+//! a landed pick into the session: the next sample_ returns it (a row that landed its logits, -1, leaves the sampler to them)
+def private rdec_land_pick(var s : Session; pick : int64) {
+    if (pick >= 0l) {
+        verify(!s.pick_ready, "dasLLAMA resident: a session's landed pick was never sampled before its next step - engine bug")
+        s.pick_tok = pick
+        s.pick_ready = true
+        g_rdec_picks_served++
+    }
+}
+
+//! the picks the first `n` rows landed, taken back: the step is declined after them, and the CPU rails' redo lands every row's logits
+def private rdec_unland_picks(var sessions : array<Session?>; n : int64) {
+    for (i in range64(n)) {
+        var s & = unsafe(*sessions[i])
+        if (s.pick_ready) {
+            s.pick_ready = false
+            g_rdec_picks_served--
+        }
+    }
+}
 var private @scratch g_rdec_poss : array<int64>
 var private @scratch g_rdec_cnts : array<int64>
 var private @scratch g_rdec_regs : array<int64>
@@ -1861,10 +1811,10 @@ def private vulkan_resident_decode_go(t : Model; var s : Session; token, pos : i
         g_rdec_one_tok |> resize(1l)
         g_rdec_one_tok[0] = token
         resident_prefill_ple_rows(t, g_rdec_one_tok, 1l)
-        rdec_token(g_rdec_x, g_rdec_cossin, g_rdec_ple_rows, pos, cnt, s.logits)
+        rdec_land_pick(s, rdec_token(g_rdec_x, g_rdec_cossin, g_rdec_ple_rows, pos, cnt, s.pick_asked, s.logits))
         s.ple_gpu_pending = false
     } else {
-        rdec_token(g_rdec_x, g_rdec_cossin, s.ple_inp, pos, cnt, s.logits)   //! forward() ran the PLE pre-step into s.ple_inp before the override; empty elsewhere
+        rdec_land_pick(s, rdec_token(g_rdec_x, g_rdec_cossin, s.ple_inp, pos, cnt, s.pick_asked, s.logits))   //! forward() ran the PLE pre-step into s.ple_inp before the override; empty elsewhere
     }
     g_rdec_regions[r].cnt = pos + 1l
     s.rdec_host_current = false   // the mirror advanced past any earlier hydration
@@ -2043,27 +1993,37 @@ def private rdec_batch_rows_served(t : Model; ws : BatchWorkspace; sessions : ar
     return true
 }
 
-//! row `i`'s side input for the token command: the table row gathered on device, else row `i` of the pre-step `eval_batch` already ran
-def private rdec_batch_ple_row(t : Model; ws : BatchWorkspace; i : int64) {
+//! the side-input rows of `n` tokens for the token command, into `g_rdec_ple_rows`: the table rows gathered on device where
+//! the device projects, else the pre-step's finished rows from `src_off` of the workspace's rows (position-major either way)
+def private rdec_ple_side_rows(t : Model; tokens : array<int64>; n : int64; ws : BatchWorkspace; src_off : int64) {
     if (rdec_ple_proj_on()) {
-        g_rdec_one_tok |> resize(1l)
-        g_rdec_one_tok[0] = ws.row_tokens[i]
-        resident_prefill_ple_rows(t, g_rdec_one_tok, 1l)
+        resident_prefill_ple_rows(t, tokens, n)
         return
     }
-    let all = t.config.n_layers * t.config.n_embd_per_layer
+    let all = t.config.n_layers * t.config.n_embd_per_layer * n
     g_rdec_ple_rows |> reserve(all)
     g_rdec_ple_rows |> resize(all)
-    copy_floats(ws.scr.ple_inp, i * all, g_rdec_ple_rows, 0l, all)
+    copy_floats(ws.scr.ple_inp, src_off, g_rdec_ple_rows, 0l, all)
+}
+
+//! row `i`'s side input for the token command: the table row gathered on device, else row `i` of the pre-step `eval_batch` already ran
+def private rdec_batch_ple_row(t : Model; ws : BatchWorkspace; i : int64) {
+    g_rdec_one_tok |> resize(1l)
+    g_rdec_one_tok[0] = ws.row_tokens[i]
+    rdec_ple_side_rows(t, g_rdec_one_tok, 1l, ws, i * t.config.n_layers * t.config.n_embd_per_layer)
 }
 
 //! the step's rows through the N-row token command, one weight pass for all; false when the rows' regions do not serve
-[arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#nrow-token-command")]
+[arch(at="../ARCHITECTURE_GPU_VULKAN_NROW.md#nrow-token-command")]
 def private rdec_batch_rows_at_once(t : Model; ws : BatchWorkspace; var sessions : array<Session?>; nrows : int64) : bool {
     let c = t.config
     let dim = c.dim
     g_rdec_x_n |> grow_resize(dim * nrows)
     g_rdec_cos_n |> grow_resize(g_rdec_cos_elems * nrows)
+    let ple_raw = rdec_ple_proj_on()
+    if (has_ple(c)) {
+        rdec_ple_side_rows(t, ws.row_tokens, nrows, ws, 0l)
+    }
     g_rdec_lrows |> resize(nrows)
     g_rdec_poss |> resize(nrows)
     g_rdec_cnts |> resize(nrows)
@@ -2092,15 +2052,20 @@ def private rdec_batch_rows_at_once(t : Model; ws : BatchWorkspace; var sessions
         g_rdec_poss[i] = pos
         g_rdec_cnts[i] = pos + 1l
         g_rdec_regs[i] = r
-        g_rdec_lrows[i] = unsafe(addr(s.logits[0]))
+        g_rdec_lrows[i] = null
+        if (!s.pick_asked) {
+            g_rdec_lrows[i] = unsafe(addr(s.logits[0]))
+        }
     }
+    g_rdec_picks |> resize(nrows)
     prof_add("nrow_prep", ts_prep)
     let ts_gpu = prof_ticks()
-    rdec_token_n(g_rdec_x_n, g_rdec_cos_n, g_rdec_poss, g_rdec_cnts, g_rdec_regs, nrows, g_rdec_lrows)
+    rdec_token_n(g_rdec_x_n, g_rdec_cos_n, g_rdec_ple_rows, ple_raw, g_rdec_poss, g_rdec_cnts, g_rdec_regs, nrows, g_rdec_lrows, g_rdec_picks)
     prof_add("nrow_gpu", ts_gpu)
     let ts_land = prof_ticks()
     for (i in range64(nrows)) {
         var s & = unsafe(*sessions[i])
+        rdec_land_pick(s, g_rdec_picks[i])
         let pos = g_rdec_poss[i]
         let r = g_rdec_regs[i]
         if (!s.device_kv) {
@@ -2145,6 +2110,7 @@ def private vulkan_resident_batch_decode_go(t : Model; ws : BatchWorkspace; var 
         let pos = ws.positions[i]
         let r = rdec_bind_region(s)
         if (r < 0l) {
+            rdec_unland_picks(sessions, i)
             return false   //! the CPU rails redo the whole step: rows already stepped here rewrite the same position, and their regions resync from the host
         }
         if (!rdec_owns(s, r) || g_rdec_regions[r].cnt != pos) {
@@ -2168,7 +2134,7 @@ def private vulkan_resident_batch_decode_go(t : Model; ws : BatchWorkspace; var 
         if (ple) {
             rdec_batch_ple_row(t, ws, i)
         }
-        rdec_token(g_rdec_x, g_rdec_cossin, g_rdec_ple_rows, pos, pos + 1l, g_rdec_tmp)
+        let picked = rdec_token(g_rdec_x, g_rdec_cossin, g_rdec_ple_rows, pos, pos + 1l, s.pick_asked, g_rdec_tmp)
         for (l in range64(c.n_layers)) {
             continue if (s.device_kv || layer_is_recurrent(c, l) || t.kv_src[l] != l)
             let kvd = layer_kv_dim(c, l)
@@ -2181,7 +2147,11 @@ def private vulkan_resident_batch_decode_go(t : Model; ws : BatchWorkspace; var 
         }
         g_rdec_regions[r].cnt = pos + 1l
         s.rdec_host_current = !s.device_kv
-        copy_floats(g_rdec_tmp, 0l, s.logits, 0l, c.vocab_size)
+        if (picked >= 0l) {
+            rdec_land_pick(s, picked)
+        } else {
+            copy_floats(g_rdec_tmp, 0l, s.logits, 0l, c.vocab_size)
+        }
     }
     batch_decode_override_logits_done()
     return true

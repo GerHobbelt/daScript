@@ -4,11 +4,14 @@
 docs: `ARCHITECTURE.md`, `ARCHITECTURE_CAPI.md`, `ARCHITECTURE_LINT.md`, `ARCHITECTURE_EMIT.md`,
 `ARCHITECTURE_LINQ.md`, `ARCHITECTURE_CURSOR.md`.
 A diff touching the linq family - `linq*.das`, `sql_*.das` - applies `REVIEW_LINQ.md` too. A
-diff that changes compile-time AST-building code - a class deriving an `Ast*Annotation`,
-`Ast*Macro`, or `AstVisitor`, a `[macro_function]`, or any function that calls `qmacro*`,
-`apply_template`, `macro_error`, or `macro_sticky_error` - applies `REVIEW_MACROS.md` too. A
+diff that changes compile-time AST-building code - a class deriving an `Ast*Annotation` or
+`Ast*Macro`, an `AstVisitor` a macro or an annotation runs at compile time, a
+`[macro_function]`, or any function that calls `qmacro*`, `apply_template`, `macro_error`, or
+`macro_sticky_error` - applies `REVIEW_MACROS.md` too. A
 diff touching `daspkg.das` - the functions a `.das_package` manifest body calls - applies
-`utils/daspkg/REVIEW.md` (repo root) too; the folder walk never opens it for a `daslib/` diff.
+`utils/daspkg/REVIEW.md` (repo root) too; the folder walk never opens it for a `daslib/` diff. A
+diff touching `shader_lingua_franca.das` - the declarations both shader emitters compile -
+applies `modules/REVIEW_SHADER_EMITTERS.md` (repo root) too, for the same reason.
 
 **A diff that changes the body of `perf_warning` (`perf_lint.das`), `style_warning`
 (`style_lint.das`), or `lint_error` (`lint.das`) runs the suppression check before the body
@@ -42,20 +45,20 @@ construct's visit.
 a stack, never in a bare scalar.** A saved value kept in a scalar survives into the sibling
 construct's exit path and unbalances it.
 
-**A diff that adds or changes a daslib fact - code or a `//!` contract - whose truth is
-decided by a definition outside this folder - a C++ definition, or another module's descriptor
-- with no lint, compile error, or default-suite test (what `dastest` runs over `tests/` with no
-flags) failing when the two sides no longer match, records the pair, naming both sides, in this
-folder's architecture doc.** The section a daslib file's pair lands in is the one that holds that
-file, or a new one in `ARCHITECTURE.md` when none does.
+**A diff that adds or changes a daslib fact - code or a `//!` contract - that a second site
+must agree with records the pair in this folder's architecture doc, naming both sides, whenever
+nothing fails on a mismatch: no lint, no compile error, no default-suite test (what `dastest` runs
+over `tests/` (repo root) with no flags).** The second site can sit anywhere, inside or outside
+this repository. The section a daslib file's pair lands in is the one that holds that file, or a
+new one in `ARCHITECTURE.md` when none does.
 
 **When a diff changes one side of a recorded pair so the two no longer match, it changes the
 other side in the same diff.**
 
-**A diff that renames, deletes, or changes the behavior of a daslib name that an
-`ARCHITECTURE*.md` in this folder spells updates that entry in the same change.** The doc is
-read as the current tree, and a name that no longer resolves or a scope that no longer holds is
-trusted until someone reads the code.
+**A diff that renames or deletes a daslib name an `ARCHITECTURE*.md` in this folder spells, or
+changes what that name names so that the entry's claim stops holding, changes that entry in the
+same change.** The doc is read as the current tree, and a name that no longer resolves or a claim that
+no longer holds is trusted until someone reads the code.
 
 **A diff adds an architecture-doc entry only for a fact that no lint, compile error, or
 default-suite test reports when it goes false, and that the code's own names do not make
@@ -64,7 +67,7 @@ not count.
 
 **A diff that changes daslib's nolint scanning - suppression parsing, staleness detection, or
 the header window - keeps `tests/lint/test_nolint_suppression.das` and
-`tests/lint/test_stale_nolint.das` green without weakening them.** They pin that a string
+`tests/lint/test_stale_nolint.das` (repo root) green without weakening them.** They pin that a string
 literal, a URL, and a mid-comment `nolint:` do not suppress while a first-token directive
 after `//` or `//!` does, and that a `lint-skip-file` past the header window is prose.
 
@@ -76,7 +79,7 @@ a one-run `DAS_LINT_DISABLE` beat a `CODE = true`.
 seeding and the repo `off` directives.** Repo policy must not silence the rule a fixture
 exists to exercise.
 
-**A diff that changes daslib's `.lint_config` resolution keeps `tests/lint/test_lint_config.das`
+**A diff that changes daslib's `.lint_config` resolution keeps `tests/lint/test_lint_config.das` (repo root)
 green without weakening it** - it pins that each `[format]` key resolves nearest-wins
 independently up to the `.git` root, so a nearer `.lint_config` declaring one key does not
 reset the other.

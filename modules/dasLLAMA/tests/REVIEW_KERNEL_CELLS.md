@@ -5,55 +5,64 @@ doc: `CLAUDE.md`. Planned work: `../followup_general.md`, `../followup_vulkan.md
 `../followup_metal.md`.
 
 **A diff that changes a kernel's dispatch grid - the count its dispatch needs, or its workgroup
-size - updates every gate that dispatches that kernel, in the same change; a gate is a cell or
-probe that dispatches or binds a kernel by hand rather than through the generated builders.** A
-gate left on the old count dispatches the wrong shape with no error.
+size - updates every gate that dispatches that kernel, in the same change; a gate is any call
+site that supplies a kernel's dispatch count or fills its kargs (kernel-argument) struct itself,
+other than a serving call in `../dasllama/` the kernel exists for - a cell, a probe, a
+harness.** A gate left on the old count dispatches the wrong shape with no error.
 
 **A diff that gives a `[metal_dispatch]` kernel `@workgroup` state, or takes it away, updates
-the threadgroup-memory length in every gate that hand-dispatches that kernel, in the same
-change.** A gate that sets none for a kernel with `@workgroup` state reads garbage silently.
+the threadgroup-memory length in every gate that dispatches that kernel, in the same change.** A
+gate that sets none for a kernel with `@workgroup` state reads garbage silently.
 
 **A diff that changes the size of a `[metal_dispatch]` stamp's `@workgroup` array - a stamp
 being one leaf class of a kernel, whose overridden constants set that size - updates, in the
-same change, every gate that hand-dispatches a different stamp while reading this stamp's
-`*_tgmem` global for its threadgroup-memory length.**
+same change, every gate that dispatches a different stamp while reading this stamp's `*_tgmem`
+global for its threadgroup-memory length.**
 
-**A diff that changes a kernel's kargs - the kernel-argument struct, any buffer binding, or the
-layout of a struct a bound buffer holds - updates every hand-bind of that kernel the change made
-stale, in the same change.** A stale hand bind reads the wrong buffer and passes on garbage that
-happens to compare.
+**A diff that changes a kernel's kargs - the struct, any buffer binding, or the layout of a
+struct a bound buffer holds - updates every gate of that kernel the change made stale, in the
+same change.** A stale gate reads the wrong buffer and passes on garbage that happens to compare.
 
-**A kernel-unit cell - a model-less cell that dispatches one or more kernel classes and asserts on
-their output - missing a compare against a CPU oracle is a defect; where the cell compares two
-kernel forms against each other, the oracle compare targets one of those two forms.** A cell is a
-`t |> run` block, or a helper that asserts on `t`; a CPU oracle is the same computation written in
-plain code and run on the CPU. Two forms can be bit-equal and both wrong.
+**A kernel-unit cell that compares a row of floats it indexes by an id - the classifier's logits
+rows by token id, a router's by expert - over synthetic rows and does not log the measured max
+difference with the row and the id it sits at is a defect.** A red, or a suspicious green, must
+say how far and where, not only how many. A cell is a `t |> run` block, or a helper that asserts
+on `t`.
 
-**A kernel whose branch selection changes - a branch added, or an existing branch's predicate
-widened or narrowed, so that a different set of kargs values, or of sentinel values in a bound
-buffer, reaches a path - ships a kernel-unit cell that dispatches it at a value the change
-moved onto or off that path, in the same change.** At every value the change left where it was
-the kernel computes what it did before, so a cell that dispatches only those values passes
-whether the change is right or wrong.
+**A kernel-unit cell whose output no CPU-oracle compare covers is a defect: the compare sits in
+that cell, or - where the cell compares two kernel forms against each other - in a cell of the
+same file that dispatches one of those two forms at the same shapes.** A CPU oracle is the same
+computation written in plain code and run on the CPU. Two forms can be bit-equal and both wrong.
 
-**Before every dispatch whose output a kernel-unit cell reads - directly, or through a later
-dispatch in the same cell - the cell fills with a sentinel every range of that dispatch's output
-buffers the dispatch writes without reading.** An unprefilled output can pass by staying stale -
-the previous dispatch's values, or garbage that happens to sit inside the tolerance bar.
+**A diff that changes a `[vk_dispatch]` or `[metal_dispatch]` class's branch selection - a
+branch added, or a predicate widened or narrowed, so that a different set of kargs values, or of
+sentinel values in a bound buffer, reaches a path - ships a kernel-unit cell that dispatches that
+class at a value the change moved onto or off that path, or names the existing cell that already
+does.** Each stamp of a template is its own class; a sibling stamp's cell counts only where the
+template constants the two stamps differ on appear nowhere in the moved path. At every value the
+change left where it was the kernel computes what it did before, so a cell that dispatches only
+those values passes whether the change is right or wrong.
 
-**A bit-identity assert on a result either side computes with floating-point arithmetic, in an
-operation order the cell does not fix on both sides, compares two GPU dispatches, never a
-dispatch against a CPU oracle.** With the order fixed on both sides the oracle's result is the
-kernel's by construction; an exact compare of indices or schedule words against a CPU twin is not
-that assert.
+**Before every kernel run - a dispatch or a CPU kernel call - whose output a kernel-unit cell
+reads, directly or through a later run in the same cell, the cell fills with a sentinel every
+range of that run's output buffers the run writes without reading.** An unprefilled output can
+pass by staying stale - the previous run's values, or garbage that happens to sit inside the
+tolerance bar.
+
+**A bit-identity assert whose result each side computes with floating-point arithmetic, in an
+operation order the cell does not fix on both sides and on operands that do not make every
+intermediate exactly representable, compares two kernel forms - never a kernel against a CPU
+oracle.** With the order fixed on both sides, or the operands exact by construction, the
+oracle's result is the kernel's by construction; an exact compare of indices or schedule words
+against a CPU twin is not that assert.
 
 **A kernel-unit cell whose output buffer is its input buffer, and whose CPU oracle does not
 differ from that input by construction, pairs its compare with an assert that the output
 differs from the input at a known index.** An in-place kernel that never ran leaves the input,
 which can wrongly satisfy a tolerant compare.
 
-**A kernel-unit cell that dispatches a `[metal_dispatch]` or `[vk_dispatch]` class no cell
-dispatched before ships a control for that class, in the same change.** A control is an extra
+**A kernel-unit cell that adds a compare - on a class, or at a kargs value, no cell compared
+before - ships a control for it, in the same change.** A control is an extra
 assert in the same cell proving the compare can fail - a poisoned input or a poisoned expectation
 that must land outside the bar, a mechanism unhooked whose result must miss, or a second
 independent lane the result must agree with; the cell's own reference is never its control.

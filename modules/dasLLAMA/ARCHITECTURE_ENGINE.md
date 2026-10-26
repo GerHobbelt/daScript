@@ -8,7 +8,10 @@ charters.
 `REVIEW.das`'s `check_exe_fn_global_restore` walks every `dasllama/` file and licenses no
 names: each `var g_x = @@fn` declaration carries an `if (g_x == null)` boot-restore guard in
 the same file - a serialized exe restores globals as data, and only a boot-restore `[init]`
-heals the null function value.
+heals the null function value. `check_test_file_placement` walks every folder under
+`modules/dasLLAMA/` but `tests/` and reds a `[test]` file that requires a `dasllama/` module
+without requiring a file of its own folder by bare name, licensing no names - the bench
+self-check beside its subject is the shape the bare require admits.
 
 `REVIEW.das`'s `check_race_bind_numbers` walks every `dasllama/` file: each hand-written
 `kn_buffer`/`kn_kargs` literal in a race or knockout arm lands on a binding number its
@@ -36,7 +39,9 @@ stay the reviewer's. A mis-numbered arm dispatches, reads the wrong buffer, and
   override registries (the accept walk's row-sampler seam among them), the runtime knobs,
   `SamplingParams` (the struct a `Session` points at, so a speculative round draws with its
   caller's sampler), and the MTP per-position accept telemetry (`mtp_pos_*`) the round-override
-  registry's rounds feed. **Not** the load walk (`ARCHITECTURE_ENGINE_FORMATS.md` sec.1.3) and **not** GPU residency
+  registry's rounds feed. The standard attention's Config-keyed arms live beside it - the gated
+  projection (`q_gated`: a 2x-wide q whose second half sigmoid-gates the output) among them - one
+  kernel every arch shares, its arms chosen by the model's flags. **Not** the load walk (`ARCHITECTURE_ENGINE_FORMATS.md` sec.1.3) and **not** GPU residency
   (`ARCHITECTURE_GPU.md` sec.1.5) - both left, and the seam each left behind is a registered hook,
   so neither comes back.
   It remains the module's debt sink; what sits here that is family-specific or platform-specific is
@@ -57,17 +62,21 @@ stay the reviewer's. A mis-numbered arm dispatches, reads the wrong buffer, and
   accumulation, the shared expert, and the decode instruments. The block kernels reach it only
   through `moe_ffn_core`.
 - **`dasllama_attn_prefill.das`** - prefill attention, threaded over heads. `prefill_attention`
-  is the only entry; the classic/blocked/flash head kernels and their KV-codec ladders are its
+  is the only entry; the classic/flash head kernels and their KV-codec ladders are its
   implementation.
 - **`dasllama_batch.das`** - the batched decode step: one pass of the weights over B sessions,
   GEMVs widened to B-row GEMMs, attention still per-(row, head) against each session's own cache.
   A step is served one of three ways, and `batch_step_census` counts each since load: the armed
   device driver claimed the whole stack, the CPU batched stack ran it, or the rows stepped one at
-  a time through the single-row forward - one row, a q4_0 model, a non-standard graph with no
-  device driver armed, or a step the device driver declined on a blob-only or non-standard-graph
-  model (the CPU stack has no form for either, so the decline falls to the single-row forward).
-  A non-standard graph (the deltanet hybrids) reaches an armed device driver before the per-row
-  branch: the CPU stack has no hybrid form, the Metal batch driver does.
+  a time through the single-row forward - one row, a non-standard graph whose arch
+  names no batched layer (`ArchBlocks.attn_batch`) with no device driver armed, or a step the
+  device driver declined on a blob-only model or on such a graph (the CPU stack has no form for
+  either, so the decline falls to the single-row forward). A non-standard graph reaches an armed
+  device driver before the CPU stack; the deltanet hybrids name `attention_qwen35_batch` as their
+  batched layer - the recurrent layers as B-row projections and the delta rule laned over (row,
+  v-head) against each session's own state, the attention layers through the std batched
+  attention, whose `q_gated` arms carry the 2x-wide [q | gate] projection and the sigmoid
+  out-gate - so a hybrid step with no device driver rides the CPU stack too.
 - **`dasllama_mtp_gemma.das`** - the gemma-4 assistant drafter (`gemma4-assistant`), which is a
   SIDECAR head, not a trunk block: it owns no K/V projection and borrows the target trunk's cache
   at two capture layers, so it never rides the arch registry or `forward_mtp`. The file holds the
@@ -82,7 +91,11 @@ stay the reviewer's. A mis-numbered arm dispatches, reads the wrong buffer, and
   (`register_mtp_sample_row`) at init, and that registration is the only way the engine reaches
   this file.
 - **`dasllama_ple.das`** - gemma-4 E-series per-layer embeddings and the gemma4 MoE FFN. The
-  forward sequence reaches it only through the hooks it registers at init.
+  forward sequence reaches it only through the hooks it registers at init. The Metal token-table
+  gather (`dasllama_metal_prefill.das`) carries one format list in three places - the compiled
+  `g_pf_pso_ple_gather*` pipelines, the `ple_gather_pso_of` pick and the `pf_enc_ple_gather_fmt`
+  encode ladder - and `REVIEW.das`'s `check_ple_gather_sites` holds the three sets equal,
+  licensing no names.
 - **`dasllama_config.das`** - `DlimConfiguration`: every input that changes `.dlim` image BYTES,
   in one struct, plus its identity formatter. A knob that does not change image bytes does not
   belong here; a knob that does and is missing is an image-aliasing bug.
@@ -100,8 +113,10 @@ stay the reviewer's. A mis-numbered arm dispatches, reads the wrong buffer, and
 
 Thirteen files registering eighteen names:
 `dasllama_arch_llama.das` * `dasllama_arch_phi3.das` * `dasllama_arch_qwen2.das` * `dasllama_arch_qwen2moe.das` * `dasllama_arch_qwen3.das` * `dasllama_arch_qwen3moe.das` * `dasllama_arch_qwen35.das` * `dasllama_arch_gemma2.das` * `dasllama_arch_gemma3.das` * `dasllama_arch_gemma4.das` * `dasllama_arch_glm4moe.das` * `dasllama_arch_gptoss.das` * `dasllama_arch_mistral3.das`. They are DECLARATIVE: an arch
-file builds an `ArchDesc` (name * `configure` * the `ArchBlocks` fn-ptr quad * `ChatTemplate` *
-`LlmCaps`) and calls `register_arch` at `[init]`. Adding an arch touches no forward loop.
+file builds an `ArchDesc` (name * `configure` * the `ArchBlocks` fn-ptr set - `attn_decode`,
+`ffn_decode`, `attn_prefill`, `ffn_prefill`, and the optional `attn_batch` a non-standard graph
+names * `ChatTemplate` * `LlmCaps`) and calls `register_arch` at `[init]`. Adding an arch touches no
+forward loop.
 
 ### 1.8 Instrumentation and support
 

@@ -1,9 +1,11 @@
 # dasLLAMA Architecture - the Vulkan tier's model residency
 
 Companion to `ARCHITECTURE_GPU_VULKAN.md`; section numbers are `ARCHITECTURE.md`'s. This
-document carries sections 2.2n-2.2o, 2.2an and 2.2ao: the residency plan that sizes a whole model
-before a byte uploads, the marks swap that lets one GPU slot serve many models, the token command's
-logits landing on the transfer queue, and the N-row token command a batched step's rows go through. The prefill chain and byte
+document carries sections 2.2n-2.2o and 2.2an: the residency plan that sizes a whole model
+before a byte uploads, the marks swap that lets one GPU slot serve many models, and the token
+command's logits landing on the transfer queue. The N-row token command a batched step's rows go
+through, and the residual step's two forms it holds bit for bit, are `ARCHITECTURE_GPU_VULKAN_NROW.md`
+sections 2.2ao and 2.2ap. The prefill chain and byte
 stores that run once a model is resident are `ARCHITECTURE_GPU_VULKAN.md` sections 2.2j, 2.2p,
 2.2ab, 2.2ac and 2.2ad, and the cooperative-matrix GEMM tiles under them are
 `ARCHITECTURE_GPU_VULKAN_GEMM.md` sections 2.2k-2.2m, 2.2q and 2.2ae; the per-op tier's decode era is
@@ -18,7 +20,14 @@ planes, the KV mirror at `seq_cap`, the driver's own device scratch, and the hea
 arm leaves unfilled (zero when the user pins VRAM). KV is reserved BEFORE weights and never
 grows: on a discrete card the two compete directly, and evicting weights to grow KV would mean
 re-uploading gigabytes. A decline carries a reason, and where the numbers allow one it carries
-the remedy that works - a shorter context, because the weights are fixed and the KV is not.
+the remedy that works - a shorter context, because the weights are fixed and the KV is not. The
+plan takes that remedy itself once: a mirror that does not fit is re-planned at seven eighths of
+the room that is left after the weights, as long as that context clears the arming floor - the
+built-in 4096 positions, `DASLLAMA_GPU_MIN_CTX` where set, and the caller's own context pin
+(`set_gpu_ctx_max`, `DASLLAMA_GPU_CTX_MAX`) where that sits under either, since a caller that
+pinned its context named the shape it serves (`resident_arm_floor`). The pin is what lets a
+four-stream bench row home a 12B at 648 positions a region on a 16 GB card, where the binding
+cap's 6238 a region asks for more K/V than the weights leave.
 
 **The mirror's context is capped by the device's single-binding range before any byte is
 counted.** Each K/V side binds as one SSBO range, so `seq_cap` is at most `maxStorageBufferRange`
@@ -201,7 +210,7 @@ transfer family armed (`RDec.log_xfer`) records the token command without the co
 signals `g_gpu.cmp_sem`, the compute -> transfer timeline (`submit_signal`), the transfer queue
 takes a recorded copy command a row count (`rd_xlog`, `RDec.xlog_cmd`) that waits for that value
 at the transfer stage and signals the transfer timeline (`xfer_submit_after`), and the host spins
-on the transfer timeline's counter (`xfer_spin_wait`) instead of the fence - a blocking wait
+on the transfer timeline's counter (`xfer_wait` spinning) instead of the fence - a blocking wait
 would pay the OS wake-up a step, as the fence wait's spin already knows. The logits planes are
 CONCURRENT between the two families (`make_device_buf` / `make_host_buf` at `xfer_shared`), so no
 ownership transfer sits on the path; the host orders the next step behind the copy, so the
@@ -209,48 +218,33 @@ command's next write of the plane never races its read. `DASLLAMA_VK_XFERQ=0` le
 without a transfer family; there the command carries the copy and the fence as before
 (`rd_submit_land` / `rd_wait_land` choose) - the one in-process switch that puts the copy back
 inside the command. Pod, Llama-3.2-1B Q8_0 with the profiler on: the four-row step 3761 -> 3371
-us, tg128@4 1019 -> 1136 summed, tg128 426 -> 451. The figures in this section and the next are
+us, tg128@4 1019 -> 1136 summed, tg128 426 -> 451.
+
+**A row whose sampler is a bare argmax lands its pick alone.** After the epilogue the command runs
+the pick's two passes over every row, every step - `ClsArgmaxPart`, a workgroup a (row, chunk) over
+a slice of the row (`CLS_ARGMAX_CHUNKS`, 64, compiled into both passes: a 4096-wide slice of a 262144
+vocab, so a row's pass is a wave of small workgroups and not one workgroup's walk over a megabyte;
+9-12 us a step from a 128k to a 262k vocab), then `ClsArgmaxFin`, a workgroup a row over the
+chunks' partials - the first maximum's id, the lowest on a tie, as the host's `parallel_argmax`
+reads (a thread's first element seeds its candidate, so an all-equal or non-finite row lands id
+0, and only an empty slice lands `0xFFFFFFFF`, which the landing refuses as an engine bug), into
+`RDec.pick_dev`. The ask decides only what lands: the transfer command copies the picks behind the
+logits, and a step whose every row asks for its pick takes the picks-only twin (`RDec.xlog_pick_cmd`),
+so the logits plane never leaves the device and the host copies nothing (a device without the
+transfer family copies both inside the command and skips the host copy alone); the one-row command's
+guard steps (`rd_guard_step`: the first four tokens and every 256th) land the logits too, so the
+over-commit check reads a row on a picking stream at its cadence. The seams carry the ask -
+`RdecTokenFn`'s `pick_only`, a null `lrows` pointer of `RdecTokenNFn` - and answer the id, which
+the driver hands to the session (`rdec_land_pick`: `Session.pick_ready`, `pick_tok`) for the next
+`sample_` to return; a row-at-a-time step the driver declines after some rows landed takes their
+picks back (`rdec_unland_picks`), since the CPU rails redo every row's logits. The scheduler asks it
+a step for every stream whose parameters are a bare argmax (`sampler_is_argmax`: temperature at or
+under zero, penalties off - the served default) and clears the ask after the step's sample; a
+temperature or a penalty lands the logits as before, and so does every caller that never sets
+`Session.pick_asked` (the tests read the rows). A stream's first token samples off its prefill's
+logits inline, so a request of n tokens lands n - 1 picks. On the pod the host side of a four-row
+step held the logits copy (252-266 us of 4 MB on the E-series) and four pool argmaxes; the pick
+leaves a 16-byte landing, and its planes take 4 x (2 x 64 + 1) bytes a row of the plan. The figures in this section and the next are
 the pod's (RTX PRO 4500, `-jit`, cm2): the `DASLLAMA_GPU_PROF=1` token profile of
 `benchmarks/lcpp_bench.das` for the step times and rates, `harness/vk_dma_probe.das` for the copy
 rates; `PERF_LEDGER.md`'s 2026-09-19 section is the record.
-
-### 2.2ao The N-row token command: a batched step's rows through one weight pass {#nrow-token-command}
-
-**A batched decode step runs its rows through ONE recorded command, so a layer's weights stream
-once for the step instead of once a row.** The driver sizes every per-token plane to `RDec.nb`
-rows - `min(regions, RD_NB_MAX)`, eight at most, the N-column GEMV leaves' width - and
-`vk_rdec_token_n_rows` answers how many rows the armed model steps at once: `nb` over dense
-standard-attention layers, and none where a layer or the tail has no N-row form - a recurrent,
-MoE, per-layer-embedding or shared-KV layer, a q/k norm, a gated q, a classifier epilogue, or a
-weight format with no N-column leaf. Every set over a per-row plane binds the plane's whole `nb`
-extent; the rule guards two shapes - an ungated q row sitting inside the projection row, and a q
-binding sized to one row, which leaves every row but the first reading past its binding. The MoE
-feed planes (`moe_xq_dev` / `moe_xs_dev`) stay one row: the command declines MoE layers, and
-their sets bind one row. Every GEMV goes out as an N-column dispatch
-(`GemvArgs.ncols` activation rows one weight pass apart by `ystride`); the q8 leaf takes its
-two-output-rows-a-subgroup twin past `g_q8_n2_min_n` on an even row count, off by default
-because the pod's down GEMV read 750 us a step under the pair against 587 a row a subgroup. The
-row-parallel kernels take the rows' planes whole; the rope, the mirror store and the attention
-run at each row's own position, cached count and mirror region, which ride the shared `TokMeta`
-block a row (`mirbase` an element offset; `DaAttnArgs.rowwg` and `qrow` carry the row stride into
-the attention, `rowwg` 0 naming a one-row dispatch). The rows' heads already fill the card, so
-the attention's key split shrinks as the row count grows (`da_nsplit` over
-`da_attn_row_wgs x nrows`). A command is recorded once per row count and split form, on first
-use, and keeps its own stamp names; the one-row command's list is borrowed for the record and put
-back. A row count whose split form runs at one split still fills the split stamp slot: the
-recorder's list for that row count is the split form's. The command's N-column leaves are built
-on the first batched step; a stamp that declines on the device logs once, and the command answers
-0 rows from then on, so the row-at-a-time loop serves.
-
-**The rows' logits come home in one read of the mapped plane.** `rd_land_logits_n` copies the
-whole plane into a scratch row, then a row a copy to each session's pointer: four reads straight
-off the mapping cost the pod eight times the one (785 us a step against 92).
-
-**The engine reaches the command through the driver seam, and falls back a row at a time.**
-`install_moe_gpu_resident_batch` installs the pair (`rdec_token_n`, `rdec_token_n_rows`) beside
-the resident driver, so a tier with no batch arm answers 0 rows. `rdec_batch_rows_at_once` gathers
-the step's residuals, rope rows, positions, counts and regions, submits once, reads each
-host-cached row's K/V back and lands its logits; it returns false when a row finds no region or
-two rows share one, and the caller's row-at-a-time loop serves that step. `DASLLAMA_VK_NROW_BISECT`
-(`ENVIRONMENT.md`) drops a class of dispatch from the recorded command so a profile prices it; the
-logits are garbage under any bit.

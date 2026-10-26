@@ -34,9 +34,11 @@ self-speculative round (every stream's verify rows in one joint pass), the accep
 and the reference row stays plain decode - the comparison reads what a served speculative stream
 delivers against the reference's best. The rows' protocol lives in one place,
 `dasllama/dasllama_bench.das` (the synthetic ids, the warmups, the timed reps, the warmup logit
-check, the row statistic), and
-two drivers run it: `lcpp_bench` from its loop, and dasllama-server's in-process `/bench` one
-step per tick on the model it serves. Only `lcpp_bench`'s rows become records: the server's are
+check, the row statistic; the streams' KV codec is a parameter, f16 on the board), and
+three drivers run it: `lcpp_bench` from its loop, dasllama-server's in-process `/bench` one
+step per tick on the model it serves, and `harness/batch_decline_census.das`, which runs one row
+per carrier under a named codec to read whether the step served or declined, never its rate.
+Only `lcpp_bench`'s rows become records: the server's are
 a self-measure the operator reads on the control page, stamped with the device, the KV codec,
 the exec tier and the tune state they ran under, and they enter no board, ledger or exchange.
 The real `llama-bench` runs only when `--ref <path>` is passed; the upstream columns come from
@@ -127,7 +129,9 @@ of ours in this paragraph is the pod's (Linux, RTX PRO 4500, `daslang -jit`, the
 its cm2 mode, kv f16), each probe at its defaults - the attention ruler at 4 rows, 640 positions,
 head 64, 32 heads and 4 heads a kv head, the copy ruler at its four sizes.
 `harness/vk_attn_probe.das [rows] [cnt] [hs] [heads] [kv_mul]` times the token command's attention
-pass a layer on the device clock across the key-split ladder; a row's alternates are the other
+pass a layer on the device clock across the key-split ladder - a held-output chain: sixteen
+dispatches into one output buffer, each behind the last, so a figure is a dependent chain's cost
+a layer, never one dispatch's latency; a row's alternates are the other
 splits of the same run, and the reference-engine row is llama.cpp's `FLASH_ATTN_EXT` line from
 `GGML_VK_PERF_LOGGER=1 llama-batched-bench -m <gguf> -c 4096 -b 2048 -ub 512 -npp 512 -ntg 128 -npl 4 -ngl 99 -fa on`
 (b10660 on the RTX PRO 4500 at Llama-3.2-1B's shape, four rows: 15.7 us a layer, its split-k

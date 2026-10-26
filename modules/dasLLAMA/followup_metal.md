@@ -660,20 +660,6 @@ thread-local (the cheaper path, and a lens diagnostic at the call site for the m
 the two shells merge into one template on a `B8` axis with the panel gated, so a format class
 becomes the ancestor of both its stamps. ~200 lines behind either.
 
-## 21. The joint speculative tick drafts one stream at a time
-
-`metal_mtp_spec_rounds` (`dasllama/dasllama_metal_decode.das`) verifies every stream's rows in
-one pass but drafts per stream: each warm stream runs its own NextN chain - the draft layer and
-the classifier over the whole vocabulary - as a command buffer of its own before the joint
-verify, so a four-stream tick pays four draft passes where the verify paid one. On Qwen3.6-27B
-the classifier plane alone is most of a draft, and the `--npl-mtp` bench row reads below the
-plain batched row on both NextN carriers (`PERF_LEDGER.md`, the Metal batched-decode arc). The
-work: the drafts as rows of one dispatch - the streams' carry hiddens as a rows form through the
-draft layer (the same `rows_tier` shapes the verify uses), one classifier pass over N rows, the
-argmax per row - landing per group into the same `MtpVerifyGroup` slots the per-stream draft
-fills today. The single-stream round keeps its chain; the multi-draft chain (depth above one)
-becomes k rows-form steps, each seeded by the previous step's per-row argmax.
-
 ## 22. The batched recurrent step scans its rows one dispatch at a time
 
 `recurrent_batch` (`dasllama/dasllama_metal_decode.das`) runs the deltanet projections as rows
@@ -686,3 +672,53 @@ one buffer, a per-row table like the KV route table (`brt`) naming each row's sl
 five kernels taking the row from that table - one dispatch a stage over every row. The CPU
 batched stack still has no hybrid form (`eval_batch_` steps them per row when no device driver
 is armed); the same rows shape applies there.
+
+## 23. The E4B batched row reads 0.90 of llama-batched-bench where the E2B reads 0.95
+
+The M5 board (`performance/records/m5.json`, the `tg128@4` cells of the Metal leg - the E4B das
+row at engine sha cc969d961, the E2B das row at 60b736faa): gemma-4-E4B Q8 259.6 against the
+reference's 290.1 tok/s, while the E2B - the same
+E-series batch arm, PLE rows form, shared-KV layers Q-only - reads 454.2 against 479.7 (0.95). The
+flat rows hold on both files (E4B tg128 90.0 vs 81.2). Whatever the E4B pays per step it pays
+only at four rows. The stage split (`harness/batch_rows_probe.das --bs 4 --knockouts --sameslab
+--steps 32`, M5 Max, `-jit`, the archived m5 sidecar; direction-grade) puts the four-row GPU step
+at 13.45 ms against the single row's 11.09: the GEMV stage 9.65 ms (the weight stream, at its
+roof), elementwise 1.73, attention 1.04, other 0.5, and the batch driver costs 12.39 ms at ONE row
+against the single-row driver's 11.09; `lcpp_bench --prof`'s stage line adds ~1 ms of host work per
+step outside the GPU (encode 0.73, handoff 0.15, sched 0.11). The E2B shows the same shape (8.05
+against 6.25; elementwise 1.11, attention 0.89), so the E4B's deficit is the E-series' shared
+per-step cost meeting less flat headroom (its flat lead is 1.11, the E2B's 1.17). The two levers:
+the host encode overlapped with the device (the pipelined submission `DASLLAMA_METAL_BATCH_PIPE=1`
+hides it but dies with a SIGSEGV on the E4B row - its landing reads step globals the next step's
+build has already overwritten), and the elementwise chain's dispatch count (~40 us a layer at four
+rows: the qk / v norms, the gated-q multiply, the post norms and the residual adds as separate
+dispatches). The pass rule for a batched arm is 0.95 of `llama-batched-bench`
+(`ARCHITECTURE_MEASUREMENT.md`); the E2B sits on the bar and the E4B under it, ~0.6 ms a step away.
+
+## 24. The dense 24B batched row loses at four rows what its flat row wins
+
+The same board: Mistral-Small-3.1-24B Q4_K_M flat tg128 38.3 against llama.cpp's 36.6 (1.05),
+batched tg128@4 72.4 against 77.2 (0.94). A dense K-quant file at 24B is weight-bound at one row
+and every step is one weight pass at four, so a batched deficit beside a flat lead is per-row
+work that does not amortize. The stage split (`harness/batch_rows_probe.das --bs 4 --knockouts
+--sameslab --steps 32`, M5 Max, `-jit`, the archived m5 sidecar; direction-grade): the four-row
+GPU step is 44.65 ms against the single row's 26.08 (1.70x) and the GEMV stage alone is 41.98 ms -
+1.6x the single step's - because a K-quant model at B <= 8 rides per-stream plane GEMVs, so the
+weights stream once per row with only the cache sharing them. `llama-batched-bench` scales worse
+(its four-row step is 1.9x its flat one), so the 0.94 is the flat lead being eaten. The lever is a
+batched K-quant GEMM form for B <= 8 - the kq mul_mm twins serve B >= 9 today; at M-pad 32 the
+q8 rail measured negative, but against a 1.6x weight stream the K-quant arithmetic is different.
+Every other dense K-quant board file (12B 1.00, the two 27Bs 1.07 and 1.09) clears the bar on its
+flat lead alone.
+
+## 25. The Qwen3.8-27B no-head verify cell panics through the CPU decode stack
+
+`tests/test_metal_mtp_parity.das`'s `test_metal_verify_qwen38_27b` (large tier) pins the
+batch-rail same-slab verify to decline a recurrent session's rows as `dn_state`; on the M5 the
+B=2 arm serves (maxd 2.3e-4, no flips) and two later arms die in
+`dasllama_common.das`'s "CPU decode stack on a blob-only metal-flavor model" panic - the
+verify declines, and the fallback lands on a stack the blob twin cannot run. Red at master
+ce42fb986 and on every branch since; the stocked suite never reaches it (the mtp suite is not
+in `stocked`). The work: decide whether the batch driver now serves the hybrid's verify rows -
+then the pin flips to must-serve - or make the decline return a plain GPU step instead of the
+CPU stack.

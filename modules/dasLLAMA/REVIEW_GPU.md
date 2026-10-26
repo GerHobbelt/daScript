@@ -1,9 +1,8 @@
 # dasLLAMA GPU Code Review Checklist
 
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture
-docs: `ARCHITECTURE_GPU.md`, `ARCHITECTURE_GPU_RACE_SHAPES.md`, `ARCHITECTURE_GPU_MTP.md`,
-`ARCHITECTURE_GPU_VULKAN_RESIDENCY.md`. Planned work: `followup_metal.md` for Metal,
-`followup_vulkan.md` for Vulkan.
+docs: `ARCHITECTURE_GPU.md`, `ARCHITECTURE_GPU_MTP.md`, `ARCHITECTURE_GPU_VULKAN_NROW.md`.
+Planned work: `followup_metal.md` for Metal, `followup_vulkan.md` for Vulkan.
 
 **A diff that files GPU planned work in `followup_general.md` is a defect** - it goes to
 `followup_metal.md` or `followup_vulkan.md`.
@@ -11,11 +10,25 @@ docs: `ARCHITECTURE_GPU.md`, `ARCHITECTURE_GPU_RACE_SHAPES.md`, `ARCHITECTURE_GP
 **A diff touching a GPU kernel timing arm - code that dispatches a kernel to measure it rather
 than to serve a call - wherever the diff puts it, applies `REVIEW_GPU_RACE.md` too.**
 
-**A diff changing a property of a kernel class that a timing arm or a gate restates rather than
-reads - a binding number, the kargs (kernel-argument struct) layout, the layout of a struct a
-bound buffer holds, threadgroup memory, a staging shape, the grid or threadgroup geometry -
-applies the `tests/` subfolder's `REVIEW_KERNEL_CELLS.md` for the gates that hand-dispatch or
-hand-bind the class.**
+**A diff changing a property of a kernel class that a timing arm or a test-side dispatcher
+restates rather than reads - a binding number, the kargs (kernel-argument struct) layout, the
+layout of a struct a bound buffer holds, threadgroup memory, a staging shape, the grid or
+threadgroup geometry - or a kernel class's branch selection or the precision it computes a step
+at, applies the `tests/` subfolder's `REVIEW_KERNEL_CELLS.md` for the test-side dispatchers that
+dispatch or bind the class.**
+
+**A diff that changes a kernel's binding numbers, its kernel-argument struct or push-constant
+layout, its threadgroup or workgroup memory, its staging shape (the operand tile a kernel copies
+into that memory before it computes), or its grid, threadgroup or workgroup geometry resyncs or
+deletes, in the same change, every timing arm that mirrors that kernel's binding order by hand or
+by an ordered setter list and every arm ledgered as that kernel's retained reference.** An arm
+left dispatching stale geometry measures the wrong kernel silently.
+
+**A diff that changes what a kernel's body computes resyncs or deletes, in the same change, every
+timing arm that carries that body as a hand-written twin, and every arm ledgered as that kernel's
+retained reference; a diff that routes a shape to a sibling kernel class resyncs, in the same
+change, the arms that dispatch the old class at that shape.** An arm timing a body the shipped
+kernel no longer runs at that shape measures the wrong kernel silently.
 
 **A diff touching the tower driver (`dasllama/dasllama_metal_tower.das`), a kernel class or
 builder the tower dispatches, the `[metal_dispatch]` emission those builders are generated
@@ -34,83 +47,10 @@ the diff puts it - applies `REVIEW_GPU_VULKAN.md` too.**
 stamps - or a dispatch's bind list, generated or hand-rolled, wherever the diff puts it,
 applies `REVIEW_GPU_KERNEL_CLASSES.md` too.**
 
-**A kernel body that emits a function pointer or a vtable into the shader is a defect - splice
-the choice at compile time instead.** A `class template` / `def abstract` / `def override`
-splice is compile-time and conforms - check the emission, not the das spelling.
-
-**Never give a `*_decline_caps` predicate a parameter beyond the model, the row count, and
-whether the call carries a uniform attention span - however that parameter is derived; window
-readiness, whether this window's rope tables are staged, is asked by `prefill_decline` /
-`decode_decline` instead.**
-
-**A bounds or tail guard that branches per iteration in a kernel's main loop, where the guard's
-answer is the same for every thread of the dispatch and the host knows it as it picks the
-pipeline, is a defect - stamp the guard instead.**
-Stamped means the guard is carried by a `@template_constant` - a `static_if` block, or a value
-select on the constant. The instance stamped without the guard shows no guard in its generated
-`*_msl` global or its SPIR-V dump.
-
-**A chunk-stepping `[metal_dispatch]` kernel - one whose main loop steps one fixed-size chunk at
-a time and never checks for a partial last chunk - declares each alignment it assumes on a value
-the builder receives - a `params=` name or a kargs field - as one
-`<lhs> % N` item in `requires =`, comma-separated.** The generated builder then trips on the
-first misaligned dispatch instead of reading the next row.
-
-**A driver that keeps misaligned shapes off a chunk-stepping kernel - its main loop steps
-fixed-size chunks with no partial-last-chunk check - gates each dispatch site of that kernel on
-that site's own K, the extent that site's loop steps along, never on one gate covering every
-site.**
-
-**A dispatch site's alignment gate whose divisor is neither the chunk the kernel that site
-dispatches steps nor a multiple of that chunk the site forces by splitting its K extent across
-dispatches is a defect.** A gate that checks less than the kernel's chunk silently drops a tail;
-a gate that checks more than the site's own split forces never sees a shape the kernel could serve.
-
-**Weakening the MSL emitter's refusal to compile an unlicensed float `matmul2d` A operand -
-`[metal_kernel(float_a_ok=true)]` is the license - or its gate
-`tests/test_metal_float_a_gate.das`, is a defect.** A float operand keeps the op off its native
-fast path.
-
-**A diff that stamps a kernel class `[metal_kernel(float_a_ok=true)]` outside the set
-`ARCHITECTURE_GPU_RACE_SHAPES.md` sec.2.2b sanctions extends that section in the same change.**
-A class the section already covers as a property needs no new line.
-
-**Never threadgroup-stage a `matmul2d` operand whose staged form matches its stored form -
-stream it from device instead.** A dequant, a transpose, or a layout or element-type change
-makes the forms differ. A staged pass-through costs the op more than the reads it saves.
-
-**Never fill a `@workgroup` tile with a loop whose per-element address needs a div or mod of
-anything but the lane's own slot index (the index that steps by one from lane to lane); give
-each lane a consecutive run of elements, or a lane-coalesced stride (`i += 32`), instead.** A
-device-to-device copy loop is already coalesced and conforms.
-
-**Never decide a kernel row's validity or owner by scanning the per-bucket base and count
-arrays - a bucket is the run of rows one expert owns in the bucket-ordered buffer - read the
-one per-row entry instead.** The bucket-building kernel writes that per-row entry. The scan
-repeats on every thread of every row's threadgroup, and it grows with the bucket count.
-
-**Never test the validity of a row in the bucket-ordered buffer - where each expert owns one
-run of rows - against the pad sentinel `0xFFFFFFFF`; compare the row's per-row bucket entry,
-the one the bucket-building kernel writes, with the live entry count (positions x experts per
-token, `npos * nk`) instead.** Rows past the last expert's stamped tail hold stale pool
-bytes, not the sentinel, and an equality test sends their token index out of bounds.
-
-**Never gate an early `return` in a kernel body that runs a cooperative op - a `barrier()`, a
-simdgroup matrix op, or a cross-lane reduction - on a per-thread value; gate it on a
-threadgroup-uniform value instead.** A per-thread exit leaves the threadgroup unable to
-complete the op.
-
-**An encoder that picks a kernel form whose loop carries no bounds or tail guard - stamped
-without one, or generated from a template instance that has none - shows that every address
-the form touches stays inside its buffers' allocations.** A `requires =` contract on the class
-is that showing for the dimension it names; an unchecked claim that an extent divides evenly is
-not. A padded chunk's walk can run past the live extent, and one poisoned read in a shared tile
-corrupts real rows.
-
-**Never let a prefill pad output row reach a `matmul2d` or a staged cooperative tile as its B
-operand - stage it as zero, or bound the walk at the live row count.** Pad rows hold recycled
-pool bytes, so a pad row used as B multiplies stale values (NaN included) into every real row
-of the tile.
+**A diff that changes what a kernel body does or the geometry a dispatch hands it - a main
+loop with its guards and bounds, a cooperative op, a staged or padded operand, a workgroup tile
+fill, a chunk step and its alignment gate, a bucket-ordered read - wherever the diff puts it,
+applies `REVIEW_GPU_KERNEL_BODY.md` too.**
 
 **A prefill K/V panel - the per-layer device K/V slab the prefill GEMMs write; the Vulkan
 resident mirror is one - is sized from the padded write extent, never from the live key count.**
@@ -128,35 +68,39 @@ its previous write is encoded - rotate through as many buffers as the chain has 
 flight between a write and its read.** One shared scratch serializes the whole chain through
 its write-after-read hazards.
 
-**A diff that turns one dispatch on an encoder path into two or more also gates that path in the
-same change - on the extent the added dispatch divides (the site's own K, key span or row
-count), or on the path's work size when the split divides no extent - and the threshold comes
-from a measurement at the smallest and at the largest value the gated quantity takes on the
-path, both measurements in the PR body.** The small-work regression hides behind the big-work
+**A diff that lands an encoder path whose work is split across two or more dispatches - a new
+path, or one dispatch turned into more - also gates that path in the same change - on the extent
+the added dispatch divides (the site's own K, key span or row count), or on the path's work size
+when the split divides no extent - or ships no gate, where the measurement shows the split wins
+at both ends of that quantity; either way the threshold, or the no-gate decision, comes from a
+measurement at the smallest and at the largest value that quantity takes on the path, both
+measurements in the PR body.** The small-work regression hides behind the big-work
 win.
 
-**A diff that changes a tile, grid, threadgroup, or uniform constant shows the value at that
-constant's authoritative site, in the same change.** The site per kind: the generated `*_msl`
-global or SPIR-V dump (`DASLLAMA_VK_SPV_DUMP=<dir>`) for an in-body tile; the `grid=` spec (a
-CEIL divide), or the `wgs` decode plus its host helper, for a grid; the `tg=` /
-`local_size_x` spec for a threadgroup; the single writer for a uniform.
+**A diff that changes a tile, grid, threadgroup, or uniform constant shows the value at every
+authoritative site its kind has, in the same change.** The sites per kind: the generated `*_msl`
+global for a Metal in-body tile, the `@workgroup` declaration or `local_size_x` for a Vulkan one;
+a `@template_constant`'s default and each stamp's `override` for a constant a template stamps;
+the `grid=` spec (a CEIL divide), or the `wgs` decode plus its host helper, for a grid; the
+`tg=` / `local_size_x` spec for a threadgroup; the single writer for a uniform.
 
 **A diff that changes how a `grid = "wgs"` kernel body decodes its workgroup index, or how the
-host computes that class's `wgs`, changes both in the same change.** The `grid=` spec carries no
-number for these classes, so nothing else ties the two.
+host computes that class's `wgs`, shows in the same change that the host's count still covers
+exactly the indices the body's decode reads - by changing both, by a decode that permutes the
+same index set, or - where the body's decode and the host's count both read one shared function
+- by showing that for every shape the encoder dispatches that class on, the stamp it picks is the
+one that function's value names.** The `grid=` spec carries no number for these classes, so nothing else ties the two.
 
-**A cache key covers every input the cached result depends on: a host address, an offset, or a
-handle alone is not a key - carry the span and the form, the element type and layout the upload
-produces, in the key too.**
-
-**A diff that gives a `dasllama/` file code outside the role its `ARCHITECTURE_GPU.md` sec.1.5
-entry names - a kernel class, a driver arm, a backend capability, a dispatch-support macro -
-extends that entry in the same change, or moves the code to the file whose entry holds that
-role.** A driver arm is host code that ensures, binds, or encodes a dispatch; a backend
-capability is a function a driver registers in a hook or capability registry.
+**A device-upload cache key covers every input the uploaded bytes depend on: a host address, an
+offset, or a handle alone is not a key - carry the span and the form, the element type and
+layout the upload produces, in the key too.**
 
 **A `dasllama/` file that creates its own GPU device or queue is a defect - a GPU family shares
 the one device and queue from `dasllama/dasllama_<gpu>_common.das`'s init.**
+
+**Weakening `REVIEW.das`'s device-creation check is a defect - a new name in
+`DEVICE_CREATION_FILES` or `DEVICE_CREATION_FUNCTIONS`, or a device- or queue-creating call
+spelling absent from `DEVICE_CREATION_CALLS`, weakens it.**
 
 **Never compile or release a Metal PSO (pipeline state object) from an engine file
 (`dasllama/`) other than the one that owns its kernel class** - it goes through that file's
@@ -188,23 +132,8 @@ AIR (Metal's compiled shader IR) they build into, the SPIR-V words `DASLLAMA_VK_
 and the host's stamp and dispatch selection unchanged on every input.** Only both compares
 together show the change cannot alter what the path computes or selects.
 
-**Parity evidence counts only when it comes from `harness/parity.das`,
-`benchmarks/lcpp_bench.das --parity` (`performance/model_specs.das`'s fixed model list), or an
-in-suite parity instrument run through `tests/run.das` that feeds both sides the same fixed
-tokens and compares the logits against a fixed tolerance.**
-
-**Parity evidence counts only when its backend was armed: the Metal arm ran with `--ngl`; the
-Vulkan arm ran with `DASLLAMA_GPU=1` - never `--ngl` - and its log shows the tier that serves
-the changed path armed (`resident driver armed` for the whole-model driver, `GPU MoE tier: ...
-resident` for the per-op tier).** A log showing neither arming line measured the CPU.
-
-**Vulkan parity evidence counts only when the run armed the mirror codec - the K/V mirror's
-element type, f16 or f32 - that the changed path reads.** `DASLLAMA_VK_KV32=1` arms f32; f16
-is the default and needs no flag.
-
-**Vulkan parity evidence whose log carries a `resident override passed a call` line for the
-changed path does not count.** That line is the Vulkan driver naming a call it handed back to
-the CPU path.
+**A diff that names GPU-vs-CPU parity evidence - a run, a log, a claim - applies
+`REVIEW_GPU_PARITY.md` (beside this file) for what counts as evidence, together with this list.**
 
 **A diff that adds a call site handing a whole served GPU decode or prefill call to the CPU
 path is a defect - it ships the device path in the same change.** A call that runs on the CPU
@@ -214,7 +143,7 @@ gives the user who selected the GPU a fraction of its speed.
 reads a weight plane once per row rather than once for all the step's rows, for any model it
 serves, is a defect: it ships that plane's batched read - one read serving every row of the
 step - in the same change, or the arm declines that model by name and that backend's
-architecture doc - `ARCHITECTURE_GPU_VULKAN_RESIDENCY.md` sec.2.2ao for Vulkan,
+architecture doc - `ARCHITECTURE_GPU_VULKAN_NROW.md` sec.2.2ao for Vulkan,
 `ARCHITECTURE_GPU_MTP.md` sec.2.37a for Metal - gains the kinds of layer the batched step does
 not serve.** The weight stream is what the batch amortizes.
 
@@ -223,6 +152,10 @@ on (`set_device_kv`), shows at that call site that the live device-home sessions
 session keeps its K/V only in a device K/V region and has no host cache - stay within
 `gpu_device_sessions()`, a scheduler counting as its own `max_streams` of them.** The driver
 panics on a device-home session that finds no region.
+
+**A diff that sets the resident regions (`set_gpu_resident_regions`) or the context cap
+(`set_gpu_ctx_max`, `DASLLAMA_GPU_CTX_MAX`) sets it before the load it governs.** The loader plans
+the mirror from the regions and the cap, so a value set after the load never reaches the plan.
 
 **A diff that adds an `RdecPass` value gives it its own reader-facing sentence in
 `rdec_pass_words`, in plain words that name no part of the engine - no pass, region, mirror,

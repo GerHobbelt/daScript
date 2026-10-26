@@ -219,7 +219,7 @@ get_value|insert_clone|emplace_new|insert_default|emplace_default|get_with_defau
         group_by_regex("Memset", mod, %regex~(memset.*)$%%),
         group_by_regex("Malloc", mod, %regex~(malloc|free|malloc_usable_size)$%%),
         group_by_regex("Compilation and AOT", mod, %regex~(is_aot_enabled|set_aot|reset_aot|compiling_file_name|compiling_module_name|get_module_file_name)$%%),
-        group_by_regex("GC", mod, %regex~(gc_active_root_count|gc_thread_root_count|gc_thread_root_report|gc_thread_root_report_detailed|gc_total_id)$%%))
+        group_by_regex("GC", mod, %regex~.*(gc_active_root_count|gc_thread_root_count|gc_thread_root_report|gc_thread_root_report_detailed|gc_total_id|gc_collection_stats|gc_pause_stats|gc_reclaimed_stats|gc_last_collection_tick|gc_allocation_budget|set_gc_allocation_budget)$%%))
     documents("Built-in runtime", mod, "builtin.rst", groups);
 }
 
@@ -234,7 +234,7 @@ def document_module_fio(_root : string) {
         group_by_regex("Glob and pattern matching", mod, %regex~(match_glob|glob|glob_filtered|is_glob_pattern|expand_glob|parse_file_list)$%%),
         group_by_regex("Filesystem queries", mod, %regex~(temp_directory|temp_directory_result|create_temp_file|create_temp_file_result|create_temp_directory|create_temp_directory_result|disk_space)$%%),
         group_by_regex("Terminal queries", mod, %regex~(is_terminal|terminal_width)$%%),
-        group_by_regex("OS specific routines", mod, %regex~(sleep|exit|exit_now|system|popen|popen_binary|popen_timeout|spawn_argv|popen_argv|popen_argv_pipe|popen_timed_out|run_and_capture|spawn_process|process_drain|process_poll|process_wait|process_terminate|process_kill|process_pid|process_alive|close_process|process_running|with_process|get_env_variable|set_env_variable|sanitize_command_line|has_env_variable)$%%),
+        group_by_regex("OS specific routines", mod, %regex~(sleep|exit|exit_now|system|popen|popen_binary|popen_timeout|spawn_argv|popen_argv|popen_argv_pipe|popen_timed_out|run_and_capture|executable_on_path|spawn_process|process_drain|process_poll|process_wait|process_terminate|process_kill|process_pid|process_alive|close_process|process_running|with_process|get_env_variable|set_env_variable|sanitize_command_line|has_env_variable)$%%),
         group_by_regex("Dynamic modules", mod, %regex~(register_dynamic_module|register_native_path|register_module_group|describe_pending_dynamic_modules|no_manifest)$%%)
     )
     documents("File input output library", mod, "fio.rst", groups)
@@ -340,7 +340,7 @@ def document_module_dasllama(_root : string) {
         group_by_regex("Reasoning (thinking models)", mod, %regex~(split_reasoning|make_think_stream|think_feed|think_finish|think_drain|effective_stop_ids)$%%),
         group_by_regex("Operations: prepared images and dispatch", mod, %regex~(dlim_inventory|dlim_clean|set_dispatch_worker_limit|get_dispatch_worker_limit|set_jobque_spin_us|get_jobque_spin_us|set_jobque_spin_gpu_us|get_jobque_spin_gpu_us|get_jobque_spin_in_force|set_single_thread|get_single_thread|select_matmul_backend_for_load|kernel_backend_available)$%%),
         group_by_regex("Operations: GPU tier and model slots", mod, %regex~(gpu_tier_status|set_gpu_tier_want|moe_gpu_tier_arm|moe_gpu_weight_budget|gpu_model_marks_init|gpu_slot_capture|gpu_slot_rearm|moe_gpu_model_marks_save|moe_gpu_model_marks_restore|moe_gpu_hydrate_session|moe_gpu_drop_model|set_resident_prefill_allowed)$%%),
-        group_by_regex("Operations: serving from the device", mod, %regex~(create_device_session|gpu_device_sessions|gpu_device_prefill_continues|gpu_device_prefill_window|gpu_device_kv_park|gpu_device_kv_adopt|gpu_device_session_ctx|gpu_device_session_dtype|set_gpu_resident_regions|set_gpu_ctx_max|gpu_resident_decline|gpu_cpu_passes)$%%)
+        group_by_regex("Operations: serving from the device", mod, %regex~(create_device_session|gpu_device_sessions|gpu_dn_room|gpu_device_prefill_continues|gpu_device_prefill_window|gpu_device_kv_park|gpu_device_kv_adopt|gpu_device_session_ctx|gpu_device_session_dtype|set_gpu_resident_regions|set_gpu_ctx_max|gpu_resident_decline|gpu_cpu_passes)$%%)
     )
     var hook = DocsHook()
     hook.afterEnums <- @(var f : FILE const?; _was_enums : bool) {
@@ -357,7 +357,7 @@ def document_module_dasllama(_root : string) {
             "A caller-owned paged KV-cache pool (``create_kv_pool``): sessions created over it allocate fixed-size page groups on demand, so cache memory tracks the actual context instead of the full ``seq_len`` slab. One pool serves many sessions; an ``eval_batch`` batch must share one pool. Keep it alive and in place while its sessions live.")
         dasllama_type_stanza(f, "struct-dasllama_prefix-PrefixCache", "PrefixCache",
             "A page-granular prefix cache over one pool's sessions (``create_prefix_cache``): finished streams donate their KV pages keyed by a chained page hash of the token history, and later requests attach the longest cached prefix instead of re-prefilling it. Pages are refcounted with the pool; an LRU budget bounds retention.")
-        dasllama_type_stanza(f, "enum-dasllama_common-KVDtype", "KVDtype",
+        dasllama_type_stanza(f, "enum-dasllama_kv_dtype-KVDtype", "KVDtype",
             "Per-session KV-cache codec picked at ``create_session``/``create_chat``: ``f16`` — the default, half the KV bytes and faster deep-context decode (stores clamp to ±65504); ``f32`` — the bit-exact reference; ``q8_0`` — block-quantized (llama.cpp ``-ctk``/``-ctv q8_0``), half the f16 bytes again and near-lossless in practice; needs head_size and kv_dim to be multiples of 32 (checked at create); ``tq4`` — the FWHT-rotated ternary codec, smaller still.")
         dasllama_type_stanza(f, "enum-dasllama_common-QuantMode", "QuantMode",
             "Weight representation picked at load: ``fp32`` — the token-exact reference; ``q8`` — int8 quantization, the fast CPU path (K-quant/mxfp4/Q4_0 files keep their native planes on the same rails); ``q4_0`` — the legacy requant tier, 4-bit blocks, smallest footprint.")
@@ -839,7 +839,7 @@ def document_module_templates_boost(_root : string) {
     var mod = find_module("templates_boost")
     var groups <- array<DocGroup>(
         group_by_regex("Template rules", mod, %regex~(kaboomVarField|replaceVariable|renameVariable|replaceType|replaceAnnotationArgument|replaceBlockArgument|replaceVarTag|replaceArgumentWithList|replaceVariableWithList|renameField|replaceStructWithTypeDecl|replaceTypeWithTypeDecl|renameCall)$%%),
-        group_by_regex("Template application", mod, %regex~(apply_template|clone_and_rename_var)$%%),
+        group_by_regex("Template application", mod, %regex~(apply_template|clone_and_rename_var|bind_block_argument)$%%),
         group_by_regex("Expression helpers", mod, %regex~(remove_deref|visit_expression|expression_at)$%%),
         group_by_regex("Expression generation", mod, %regex~(make_expression_block)$%%),
         group_by_regex("Block helpers", mod, %regex~(unquote_block|move_unquote_block|push_block_list)$%%),
@@ -1817,7 +1817,7 @@ def document_module_strudel_player(_root : string) {
         group_by_regex("One-shots", mod, %regex~strudel_(one_shot|active_tracks)$%%),
         group_by_regex("Orbit levels", mod, %regex~strudel_(fade_orbit|set_orbit_gain|orbit_gain)$%%),
         group_by_regex("State serialization", mod, %regex~strudel_(save_state|restore_state|save_sf2_state|restore_sf2_state)$%%),
-        group_by_regex("Debug and diagnostics", mod, %regex~strudel_(debug_memory|reset_memory_baseline|get_worker_heap_bytes|debug_sample_peaks|debug_master_peak|debug_output_peak|debug_voices)$%%)
+        group_by_regex("Debug and diagnostics", mod, %regex~.*strudel_(debug_memory|reset_memory_baseline|get_worker_heap_bytes|get_diagnostics|debug_sample_peaks|debug_master_peak|debug_output_peak|debug_voices)$%%)
     )
     document("Top-level playback harness: tracks, BPM/CPS, and threaded audio", mod, "strudel_player.rst", groups)
 }

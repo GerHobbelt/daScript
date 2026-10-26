@@ -14,7 +14,7 @@ and the hmask column `blk` carries its eight sites at bit `s` (lo at `j`, hi at 
 sub-block's decode then costs two loads for k6 and three for k3, and nothing loaded lives past it;
 the row-interleaved disk order cost one load per `j`. The layout is CPU-flavor: the `.dlim` a box
 bakes is for the hardware that runs it, so a CPU plane owes nothing to the GPU tiers' shapes.
-`IMAGE_VERSION` 28 is this layout.
+The layout is part of what `IMAGE_VERSION` stamps.
 
 ### 2.23 A grid format's CPU gemv decodes as a panel or as row groups {#grid-decode-forms}
 
@@ -56,9 +56,34 @@ auto-vectorized template dot is the slow form - the ISA carries no int8 dot for 
 while the `idot4` builtin lowers there to the ISA's own widening multiply-adds - so a wasm target
 takes `dot_q8q8_idot4_ps`. Every other target keeps the template.
 
-The K-quant dot needs no such pick. `dot_k4q8` splits a packed byte into its two nibbles on a
+The K-quant dot needs no such pick. The k4 arm of `dot_kq` splits a packed byte into its two nibbles on a
 SIGNED `byte16` - `q & 15` and `(q >> 4) & 15`, both non-negative, so both are valid int8 - and
 feeds `idot`, which every target lowers for itself. One body, no target branch, and the lattice op
 carries the per-target knowledge instead of this file. Nothing here competes with the x64 kernel
 the tune grid crowns: that one walks the repacked grp planes (`k4q8_gemv_gen`), a different
-layout, and reaches `dot_k4q8` only on the disk-order arm.
+layout, and reaches the k4 arm of `dot_kq` only on the disk-order arm.
+
+### 2.54 Classic prefill scores through the decode's own dot {#prefill-decode-same-score-dot}
+
+Classic prefill quantizes each query row and runs its scores through `kv_score` - the dot a cached position takes at decode - so a prefix served by one prefill pass and the same prefix served a token at a time agree bit for bit under the block codecs (q8_0, tq4). Flash prefill tiles with online softmax and reorders the sum, so it holds to a tolerance instead.
+
+### 2.55 A kernel a worker lambda invokes is not `private` {#kernel-visibility-lifted-workers}
+
+The tier kernels run from lambdas the job dispatch lifts out of the function that wrote them, and a lifted body reaches its callee by module-scope name, so every kernel a `parallel_for` body or a registered kernel pointer reaches is declared without `private` - the row-range cores, the groupN kernels and their wscale_f16 twins among them. The same reach is why a backend with no native groupN tier registers the portable one: a `KernelBackend` slot is never null.
+
+### 2.56 A grp<mr> repack is two interleaves {#grp-repack-interleaves}
+
+Every format's repack is made of the same two moves over a row of units - a 256-weight superblock, or a 32-block - of `ubytes`: the quant-plane interleave, which stacks mr rows per group and lands column c of unit u in row r at `[g][u][c][r][colw]`, and the scale-plane interleave, which is field-major, `[g][u][field][i][r][width]`, the fields in destination order with their source offsets. Tail rows (`d % mr`) stay disk-order and the row-major dots serve them.
+
+### 2.57 A hot leaf is instantiated in its caller's JIT partition {#jit-partition-inlining}
+
+The split-module JIT inlines within one partition only, so a leaf a hot loop calls is written to instantiate in the caller's: a generic over its operand (`iq_grid_octet`), or a plain function stamped beside the codecs it drives (`kq_transcode_units`). A call into another module's function inside a `[tune]` loop body blocks the loop's vectorization outright - `dot_bf16` spells its bf16 widen as the shift for that reason. The same rule runs the other way for the leaves themselves - the inliner's decisions over a leaf follow its call-site count, which is why the run-time-format `dot_kq` stamp lives in the test fixture `tests/_kq_dot.das` and not beside the sixteen tag overloads in `dasllama_math_default.das`.
+
+### 2.58 The deltanet per-token core is one code path for every caller {#dn-token-core-shared}
+
+The Gated-DeltaNet recurrence is written once per token, in three pieces: the prelude (the beta and g
+transforms, the causal conv against the session's history, SiLU, the q/k L2-norm and the q
+pre-scale), the per-(token, v-head) delta rule against that session's state, and the z-gated
+out-norm epilogue. One token of a decode step, one position of a prefill and one row of a
+B-session batched step all walk those same three pieces, so no caller can round apart from
+another; what differs is only the lane split over (token, head) and the projections around them.

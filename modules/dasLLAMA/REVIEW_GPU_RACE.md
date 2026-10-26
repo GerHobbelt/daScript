@@ -2,7 +2,7 @@
 
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture
 docs: `ARCHITECTURE_GPU_RACE_SHAPES.md`, `ARCHITECTURE_MEASUREMENT_KERNEL_RACE.md`,
-`ARCHITECTURE_MEASUREMENT_VK_GEMM_PROBE.md`. Planned work: `followup_metal.md` for Metal,
+`ARCHITECTURE_MEASUREMENT_VK_GEMM_PROBE.md`, `ARCHITECTURE_MEASUREMENT.md`. Planned work: `followup_metal.md` for Metal,
 `followup_vulkan.md` for Vulkan.
 
 A race times two candidates for one computation in one process, either of which the run could
@@ -10,11 +10,20 @@ adopt; a knockout skips a stage to measure that stage's cost; an overhead measur
 chain with and without an interposed stage - a timestamp, a barrier, a flush - to measure that
 stage, and is not a race. A timing arm - arm below - is one timed run of a race, a knockout, or
 an overhead measurement: code that dispatches a kernel to measure it rather than to serve a call.
-An arm's chain is the dispatches it times. An arm's ranking is decided when a checked-in
-document, box profile or sidecar records the arm's figure or names the arm as the shipped form. A
-retained-reference arm is one ledgered as a retained reference in
-`ARCHITECTURE_GPU_RACE_SHAPES.md` sec.2.2b (Metal) or `ARCHITECTURE_MEASUREMENT_VK_GEMM_PROBE.md`
-sec.2.5a (Vulkan).
+A ranking input is a value a ranking's selection reads: a shape dimension (a head width, a batch
+width, a row count, a lane split, a tile's own width, the workgroups one row dispatches relative
+to the device's compute-unit count) or a layer kind (dense, MoE, per-layer-embedding).
+A run of the serving code under a stage-drop knob - one whose runs do not serve correct output -
+is a knockout; the branch that reads the knob and drops the stage is arm code here, whoever sets
+the knob, and the stage it drops stays production code under its own checklist. A same-build
+knob A/B - two runs of the serving code under an environment override, both serving correct
+output - is not an arm; the knob is production code under `REVIEW_GPU_VULKAN.md`
+or `REVIEW_TOWER.md`. An arm's chain is the dispatches it times. An arm's ranking is decided when
+a checked-in document, box profile or sidecar records the arm's figure or names the arm as the
+shipped form. A retained-reference arm is one ledgered as a retained reference in
+`ARCHITECTURE_GPU_RACE_SHAPES.md` sec.2.2b (Metal) or the Vulkan arm ledger - the GEMM probe's
+arms in `ARCHITECTURE_MEASUREMENT_VK_GEMM_PROBE.md` sec.2.5a, the decode rulers' in
+`ARCHITECTURE_MEASUREMENT.md` sec.2.5.
 
 **A hand-binding arm that binds a field at a position the class does not declare for that field
 is a defect.** A hand-binding arm restates a SHIPPED class's binding numbers instead of naming its
@@ -40,49 +49,39 @@ statement catches a mis-numbered bind before it decides a ranking.
 `kn_dispatch` it binds, in one function.** The manual-dispatch census fails a function whose
 kargs count differs from its dispatch count.
 
-**A diff that changes a kernel's binding numbers, its kernel-argument struct or push-constant
-layout, its threadgroup or workgroup memory, its staging shape (the operand tile a kernel copies
-into that memory before it computes), or its grid, threadgroup or workgroup geometry resyncs or
-deletes, in the same change, every arm that mirrors that kernel's binding order by hand or by an
-ordered setter list and every retained-reference arm of that kernel.** An arm left dispatching stale
-geometry measures the wrong kernel silently.
-
-**A diff that changes what a kernel's body computes resyncs or deletes, in the same change, every
-arm that carries that body as a hand-written twin, and every retained-reference arm of that
-kernel.** An arm timing a body the shipped kernel no longer runs measures the wrong kernel silently.
-
 **Race and knockout code inside the engine (`dasllama/`) sits in the file that owns the kernel
 family it races, or - for a knockout - the file that owns the stage whose cost it removes.**
 
-**Race scaffolding that a race site in another engine file repeats moves to
-`dasllama/dasllama_<gpu>_common.das` in the same change.** Scaffolding two races in one file share stays in that
+**Race or knockout scaffolding that an arm site in another engine file repeats moves to
+`dasllama/dasllama_<gpu>_common.das` in the same change.** Scaffolding two arms in one file share stays in that
 file.
 
-**A race whose ranking turns on weight-stream bandwidth sizes its operands past the device's
-last-level cache or streams a ring of copies (`run_cold_shape`, `harness/vk_gemm_probe.das`).** A
+**A race whose ranking turns on the bandwidth of an operand the kernel streams once a dispatch -
+weights, a K/V mirror - sizes that operand past the device's last-level cache or streams a ring
+of copies (`run_cold_shape`, `harness/vk_gemm_probe.das`).** A
 cache-resident slab ranks the kernels by an effect production never sees, and the race then picks
 the slower kernel.
 
 **A race whose ranking turns on dispatch latency times its kernel at the shape production
 dispatches.**
 
-**A timing arm with a decided ranking times its kernel on every input the ranking branches on -
-a batch width, a row count, a lane split, a tile's own width - at a value on each side of the
-branch.** A ranking timed at one value alone is applied at values it was never ranked at.
+**A diff that decides a timing arm's ranking times the arm's kernel at a value on each side of
+every ranking-input branch, and on a layer of each kind the ranking covers - or names, in the
+document that records the figure, the production run whose served rows measure the untimed
+value.** A ranking timed at one value alone is applied at values it was never ranked at.
 
-**A diff that widens the gate admitting shapes to a kernel whose ranking is decided - a head
-width, a batch width, a row count, a lane split or a tile width the gate now admits - times the
-ranked arms at a value the gate now admits and did not before - at each end when the new
-admission spans a range - in the same change.** The widened gate otherwise applies the ranking
-at values it was never ranked at.
+**A diff that widens the gate admitting ranking inputs to a kernel whose ranking is decided
+times the ranked arms at a newly admitted input, at each end when the new admission spans a
+range, in the same change.** The widened gate otherwise applies
+the ranking at values it was never ranked at.
 
 **A timing arm for a prefill tile over a variable region, with a decided ranking, times its
 kernel at one region whose token count is a whole multiple of that tile's token column - the
 token extent one tile covers - and at one where it is not.** A token count that is not a whole
 multiple is what makes the tile take its partial-tile store path.
 
-**An `ARCHITECTURE_GPU_RACE_SHAPES.md` sec.2.2b or `ARCHITECTURE_MEASUREMENT_VK_GEMM_PROBE.md`
-sec.2.5a entry for a kernel ranked only at power-of-two batch widths names those widths.**
+**An `ARCHITECTURE_GPU_RACE_SHAPES.md` sec.2.2b or Vulkan arm ledger entry for a kernel ranked
+only at power-of-two batch widths names those widths.**
 
 **When production runs a kernel's dispatches independently of each other, each consecutive
 dispatch in a race arm with a decided ranking binds its own output buffer.** One shared output
@@ -91,7 +90,7 @@ dispatches, so the race ranks the arms on a shape production never runs.
 
 **A race arm that holds one output across its chain - reading a dependent chain's cost, or one
 dispatch's latency - is ledgered as that form in `ARCHITECTURE_MEASUREMENT_KERNEL_RACE.md`
-sec.2.21 (Metal) or `ARCHITECTURE_MEASUREMENT_VK_GEMM_PROBE.md` sec.2.5a (Vulkan).**
+sec.2.21 (Metal) or the Vulkan arm ledger.**
 
 **Every arm of a kernel A/B race with a decided ranking handles the hazard between its
 dispatches the same way.** A barrier on one arm and overlap on the other price two different

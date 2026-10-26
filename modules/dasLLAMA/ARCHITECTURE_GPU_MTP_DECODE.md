@@ -1,10 +1,11 @@
 # dasLLAMA Architecture - the Metal decode driver's kernel forms and layer encoder
 
 Companion to `ARCHITECTURE_GPU_MTP.md`; section numbers are `ARCHITECTURE.md`'s. This document
-carries sections 2.30-2.32, 2.38 and 2.39a: the argument-alignment contract a kernel declares on
+carries sections 2.30-2.32, 2.38, 2.39a and 2.39b: the argument-alignment contract a kernel declares on
 its `[metal_dispatch]` - the contract the batch driver's fixed-B mul_mv forms carry - the
 K-quant small-batch form and the row-buffer pad a multi-row verify dispatches under, the
-single-row driver's greedy chain, and the decode layer encoder. The speculative round these
+single-row driver's greedy chain, the decode layer encoder, and the rotated prefix a rope-store
+kernel takes. The speculative round these
 forms serve is `ARCHITECTURE_GPU_MTP.md`. The GPU backend role table these sections build on
 stays in `ARCHITECTURE_GPU.md` sec.1.5.
 
@@ -80,6 +81,15 @@ twelve, each tile past the first offsetting x by its first row's count of n floa
 same rows of the site's y stride - so the spare rows of the last tile compute garbage that must
 land inside an allocation this step owns and nobody reads. A row buffer sized to the live count puts that garbage on whatever the pool put next to it.
 
+The attention partials follow the same ownership rule along the position axis: `acquire_step`
+sizes `bpart` for the DEEPEST row's chunk count - `ceil((deepest + nrows) / 64)` chunks per (row,
+head), where `deepest` is the largest position any of the step's rows reaches (a joint round's
+groups sit at different positions, so the callers pass it) - because the layer chain dispatches
+that many chunks for every row. A buffer sized for the first row's count is short by one chunk
+per (row, head) whenever the rows straddle a 64-row boundary, and the chunked attention then
+writes past its end into the pool's neighbour - a corruption that surfaces rounds later, on
+whatever the heap put there.
+
 ### 2.38 The single-row driver's greedy chain {#greedy-chain}
 
 **The single-row driver pre-encodes the next step on the GPU's own argmax, and only a greedy
@@ -154,3 +164,13 @@ every short shape, and on the M5 Max it wins the projection shapes and loses the
 both parts, so `GEMV_SG_MAX_N` is a constant, not a crown. The pick reads n alone while the
 crossover moves on n and d, which is why the M5 classifier takes the slower form
 (`followup_metal.md` sec.12).
+
+### 2.39b A rope-store kernel rotates a partial carrier's prefix alone {#metal-rope-store-rot}
+
+**A rope-store kernel takes the rotated prefix `rot`, and `rot` alone rotates.** `rot` is 0 or the
+head size for a full head; a partial carrier (qwen3.5: 64 rotated dims of a 256-wide head) rotates
+the NEOX pairs `(j, j + rot/2)` of the head's first `rot` dims and passes `[rot, hs)` through
+unchanged - still adding the bias there - which is the CPU leaf `rope_scaled_neox_tab_part`'s rule,
+and a partial carrier takes the pair form whatever `neox` says. The cos/sin table row is `rot / 2`
+wide on a partial carrier and `hs / 2` otherwise, so a batched kernel strides its per-row table by
+that width. The f16 mirror carried the arm first; the q8_0 and tq4 mirrors take the same one.

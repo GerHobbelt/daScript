@@ -75,10 +75,9 @@ def template axpy_template(var d : float ?; s : float const ?; scale : float; n 
 [hint(unsafe_range_check, noalias = d, noalias = s), tuned]
 def axpy(var d : float?; s : float const?; scale : float; n : int64) {}
 
-//! Dot of an f32 row against a bfloat16 (bf16-in-uint16) row. The widen is an exact high-half
-//! bit shift, so dots are bit-identical to pre-expanding the weight to fp32 at half the bandwidth
-//! (some reference AVX2 bf16 dots also truncate the ACTIVATION to bf16; ours stays f32).
-[hint(unsafe_range_check, noalias = a, noalias = b)]
+//! Dot of an f32 row against a bfloat16 (bf16-in-uint16) row: the widen is the exact high-half
+//! shift, bit-identical to pre-expanding the weight to fp32 at half the bandwidth.
+[hint(unsafe_range_check, noalias = a, noalias = b), arch(at = "../ARCHITECTURE_CPU_KERNELS.md#jit-partition-inlining")]
 def template dot_bf16_template(a : float const ?; b : uint16 const ?; n : int64) : float {
     var acc = 0.0
     for [tune = 1] (j in range64(n)) {
@@ -157,6 +156,40 @@ def template copy_floats_template(var d : float ?; s : float const ?; n : int64)
 }
 [hint(unsafe_range_check, noalias = d, noalias = s), tuned]
 def copy_floats(var d : float?; s : float const?; n : int64) {}
+
+//! Exact capacity, then size: the buffer sized once and never regrown.
+def reserve_resize(var a : array<auto(numT)>; n : int | int64) {
+    a |> reserve(n)
+    a |> resize(n)
+}
+
+//! Amortized grow-then-size for reused scratch whose need varies per call: capacity at least
+//! doubles on growth (no per-call realloc churn); a re-added tail reads zero.
+def grow_resize(@scratch var a : array<auto(numT)>; n : int | int64) {
+    a |> ensure_capacity(n)
+    a |> resize(n)
+}
+
+//! Grow-only sizing for reused scratch: the length becomes at least n and never shrinks - a
+//! buffer sized once per tower keeps serving smaller calls with no realloc; the grown tail is
+//! zeroed. The family towers' scratch shape.
+def ensure_length(@scratch var a : array<auto(numT)>; n : int64) {
+    if (long_length(a) < n) {
+        a |> reserve(n)
+        a |> resize(n)
+    }
+}
+
+//! Grow-only no-init sizing for scratch every consumer fully overwrites: `delete` on grow skips
+//! the realloc's old-block copy and zero-fill, and the exact reserve keeps the grow off the
+//! max_unreserved_size guard.
+def overwrite_resize(@scratch var a : array<auto(numT)>; need : int64) {
+    if (long_length(a) < need) {
+        delete a
+        a |> reserve(need)
+    }
+    a |> resize_no_init(need)
+}
 
 // Spin-before-park window for the jobque workers (see setup_dasllama_jobque). Runtime knob: the
 // useful window tracks the box's serial-gap lengths, not the kernel. 30ms covers the between-call
@@ -593,18 +626,7 @@ def public chain_stage_chunks(groups : int; rows : int; work : int64) : int {
 //! x is [n], y is [d]; each y[i] is one dot of W's row i with x (n = input width, d = output width).
 //! Large matmuls thread output rows (requires an enclosing with_job_que); small stay single-thread.
 def matmul(var y : array<float>; w : array<float> | #; x : array<float>; n, d : int64) {
-    unsafe {
-        var yp = addr(y[0])                              // var: stays a writable pointer when captured
-        let wp = addr<float const?>(w[0])   // strip the `#` if w is a view
-        let xp = addr(x[0])
-        maybe_parallel_for(0, int(d), matmul_chunks_gemv(int(d), 1, n * d)) $(rb, re) {
-            unsafe {
-                for (i in range(rb, re)) {
-                    yp[i] = dot(wp + int64(i) * n, xp, n)
-                }
-            }
-        }
-    }
+    matmul_at(y, unsafe(addr<float const?>(w[0])), x, n, d)
 }
 
 //! Borrowed-plane form of the blob+offset matvec.
@@ -1503,7 +1525,7 @@ def pin_backend_for_bake(cpu : DlimCpuConfig) : bool {
         to_log(LOG_WARNING, "dasLLAMA: cross-box bake for '{cpu.backend}' needs the generated repack family - none is active here\n")
         return false
     }
-    g_bake_cpu = cpu
+    g_bake_cpu := cpu
     g_bake_cpu_override = true
     return true
 }
@@ -1520,7 +1542,11 @@ def active_q8_layout_mr() : int64 => g_bake_cpu_override ? g_bake_cpu.q8_mr : g_
 //! family split; the loader freezes these onto the Model at repack time.
 def active_kq_layout_mr(fmt : int) : int64 {
     if (g_bake_cpu_override) {
-        return fmt == 4 ? g_bake_cpu.kq_mr4 : (fmt == 5 ? g_bake_cpu.kq_mr5 : (fmt == 40 ? g_bake_cpu.kq_mr40 : (fmt == 44 ? g_bake_cpu.kq_mr44 : (fmt == 3 ? g_bake_cpu.kq_mr3 : (fmt == 33 ? g_bake_cpu.kq_mr33 : (fmt == 34 ? g_bake_cpu.kq_mr34 : (fmt == 45 ? g_bake_cpu.kq_mr45 : (fmt == 2 ? g_bake_cpu.kq_mr2 : (fmt == 23 ? g_bake_cpu.kq_mr23 : (fmt == 24 ? g_bake_cpu.kq_mr24 : (fmt == 25 ? g_bake_cpu.kq_mr25 : g_bake_cpu.kq_mr6)))))))))))
+        var f = KqFmt.q8
+        if (!kq_fmt_of_id(fmt, f) || int(f) >= length(g_bake_cpu.kq_mr)) {
+            panic("active_kq_layout_mr: the bake configuration carries no interleave for kq format id {fmt}")
+        }
+        return g_bake_cpu.kq_mr[int(f)]
     }
     return int64(invoke(g_active_kq_layout, fmt))
 }
@@ -2374,44 +2400,41 @@ def template dot_q4_template(wq : uint8 const ?; ws : float const ?; x : float c
 [hint(unsafe_range_check, noalias = x, noalias = wq, noalias = ws), tuned(fallback = "vec4_u4")]
 def dot_q4(wq : uint8 const?; ws : float const?; x : float const?; n : int64) : float {}
 
-//! Q4_0 matmul: y = W·x, W as 4-bit quants `wq` [d x n/2 bytes] + per-block scales `ws` [d x n/32].
-//! Output rows thread at 4 chunks/job (nibble unpack is compute-bound, so finer splitting balances
-//! better); small matmuls stay single-threaded. n % 32 == 0. Blob+offset: woff in elements.
-def matmul_q4(var y : array<float>; wq : array<uint8>; ws : array<float>; woff : int64; x : array<float>; n, d : int64) {
+//! The Q4_0 weight-stationary nest every Q4_0 matmul form runs: Y [ntok x d] = X [ntok x n]·Wᵀ over
+//! `dot_q4`, output rows threaded at `g_q4_chunks_per_job` chunks/job (the nibble unpack is compute-bound,
+//! so finer splitting balances better than the Q8 path's). n % 32 == 0; ntok 1 is the GEMV.
+def private matmul_q4_nest(var yp : float?; wp : uint8 const?; sp : float const?; xp : float const?; n, d, ntok : int64) {
     let nb = n / 32l
     let nh = n / 2l
-    unsafe {
-        var yp = addr(y[0])
-        let wp = addr<uint8 const?>(wq[woff / 2l])
-        let sp = addr<float const?>(ws[woff / 32l])
-        let xp = addr(x[0])
-        maybe_parallel_for(0, int(d), matmul_chunks_gemv(int(d), g_q4_chunks_per_job, n * d)) $(rb, re) {
-            unsafe {
-                for (i in range(rb, re)) {
-                    yp[i] = dot_q4(wp + int64(i) * nh, sp + int64(i) * nb, xp, n)
+    maybe_parallel_for(0, int(d), matmul_chunks_gemv(int(d), g_q4_chunks_per_job, n * d * ntok)) $(rb, re) {
+        unsafe {
+            for (i in range(rb, re)) {
+                let wrow = wp + int64(i) * nh
+                let srow = sp + int64(i) * nb
+                for (tk in range64(ntok)) {
+                    yp[tk * d + int64(i)] = dot_q4(wrow, srow, xp + tk * n, n)
                 }
             }
         }
     }
 }
 
-def matmul_q4(var y : array<float>; wq : array<uint8> | #; ws : array<float> | #; x : array<float>; n, d : int64) {
-    let nb = n / 32l
-    let nh = n / 2l
+//! Q4_0 matmul: y = W·x, W as 4-bit quants `wq` [d x n/2 bytes] + per-block scales `ws` [d x n/32].
+//! Blob+offset: woff in elements.
+def matmul_q4(var y : array<float>; wq : array<uint8>; ws : array<float>; woff : int64; x : array<float>; n, d : int64) {
+    matmul_q4_batch(y, wq, ws, woff, x, n, d, 1l)
+}
+
+//! Batched Q4_0 GEMM (Y [ntok x d] = X [ntok x n]·Wᵀ): the same dot per (row, token) as ntok x matmul_q4, bit for bit.
+def matmul_q4_batch(var y : array<float>; wq : array<uint8>; ws : array<float>; woff : int64; x : array<float>; n, d, ntok : int64) {
     unsafe {
-        var yp = addr(y[0])
-        let wp = addr<uint8 const?>(wq[0])
-        let sp = addr<float const?>(ws[0])
-        let xp = addr(x[0])
-        // default 4 chunks per hw job (knob): the heavy nibble unpack makes each row compute-bound, so finer
-        // splitting balances better (esp. the classifier) — more than the compute-light Q8 path.
-        maybe_parallel_for(0, int(d), matmul_chunks_gemv(int(d), g_q4_chunks_per_job, n * d)) $(rb, re) {
-            unsafe {
-                for (i in range(rb, re)) {
-                    yp[i] = dot_q4(wp + int64(i) * nh, sp + int64(i) * nb, xp, n)
-                }
-            }
-        }
+        matmul_q4_nest(addr(y[0]), addr<uint8 const?>(wq[woff / 2l]), addr<float const?>(ws[woff / 32l]), addr<float const?>(x[0]), n, d, ntok)
+    }
+}
+
+def matmul_q4(var y : array<float>; wq : array<uint8> | #; ws : array<float> | #; x : array<float>; n, d : int64) {
+    unsafe {
+        matmul_q4_nest(addr(y[0]), addr<uint8 const?>(wq[0]), addr<float const?>(ws[0]), addr<float const?>(x[0]), n, d, 1l)
     }
 }
 
@@ -2470,34 +2493,8 @@ def hmax(x : float const?; n : int64) : float {
     }
 }
 
-//! Greedy argmax over a row — [[hmax]] then a 4-wide locate of the first max position. The ASR
-//! decode loops call it once per generated token over the whole vocab; the scalar walk they
-//! carried was a measurable per-token tax (~0.15-0.3 ms at 152-262k).
-def hargmax(x : array<float> | #) : int64 {
-    let n = long_length(x)
-    if (n <= 0l) return 0l
-    unsafe {
-        let p = addr<float const?>(x[0])
-        let mx = hmax(p, n)
-        var i = 0l
-        while (i + 4l <= n) {
-            if (p[i] == mx || p[i + 1l] == mx || p[i + 2l] == mx || p[i + 3l] == mx) {
-                break
-            }
-            i += 4l
-        }
-        while (i < n) {
-            if (p[i] == mx) {
-                return i
-            }
-            i++
-        }
-    }
-    return 0l
-}
-
 //! Σ exp(x[i] − mx) — exp4-vectorized, groups of 4 accumulated in double (the mel dot's
-//! rounding pattern). With [[hargmax]]'s max this is the greedy pick's logsumexp half:
+//! rounding pattern). With the greedy pick's max ([[parallel_argmax]]) this is its logsumexp half:
 //! logprob = x[best] − (log(hlse) + mx).
 def hlse(x : array<float> | #; mx : float) : double {
     let n = long_length(x)

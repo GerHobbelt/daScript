@@ -18,6 +18,7 @@ require dasllama/dasllama_math   // setup_dasllama_jobque_ (the engine-standard 
 require dasllama/dasllama_gpu_tier   // moe_gpu_tier_installed / gpu_want_auto: is the tier armed; gpu_cpu_passes_
 require dasllama/dasllama_gpu_resident   // set_gpu_resident_regions_, moe_gpu_resident_active
 require ?vulkan dasllama/dasllama_vulkan_common   // PF_WINDOW, where the module exists
+require ?vulkan dasllama/dasllama_vulkan_decode   // vk_rdec_token_n_rows: the N-row command served the batched cells' rows
 require _model_tier public   // models_dir() + model_available() presence/size-tier gate
 
 // The resident driver's mirror regions (a small carrier under DASLLAMA_GPU=1): two
@@ -45,6 +46,8 @@ def private prompt_a() : array<int64> => <- ramp_ids(40l, 0l, 1000l, 37l, 5000l)
 def private prompt_b() : array<int64> => <- ramp_ids(57l, 0l, 3000l, 91l, 6000l)
 def private feed_a() : array<int64> => <- ramp_ids(STEPS, 0l, 2000l, 53l, 4000l)
 def private feed_b() : array<int64> => <- ramp_ids(STEPS, 0l, 2500l, 71l, 4500l)
+def private prompt_c() : array<int64> => <- ramp_ids(48l, 0l, 1500l, 59l, 5500l)
+def private feed_c() : array<int64> => <- ramp_ids(STEPS, 0l, 2200l, 67l, 4200l)
 
 def private logits_of(s : Session; vocab : int64) : array<float> => <- [for (i in range64(vocab)); s.logits[i]]
 
@@ -86,24 +89,26 @@ def private hold_equal(t : T?; got, want : array<float>; what : string) {
     t |> equal(diff, 0.0, "{what}: bit for bit the session alone (maxdiff {diff})")
 }
 
-//! `got` within `SPLIT_BAR_REL` of `want`, and `control` - logits one token off - outside it, so every site that holds the bar shows the bar discriminates
-def private hold_within(t : T?; got, want, control : array<float>; what : string) {
+//! `got` within `rel` of `want`'s peak, and `control` - logits one token off - outside it
+def private hold_within(t : T?; got, want, control : array<float>; what : string; rel : float = SPLIT_BAR_REL) {
     log_peaks(what, got, want)
-    let bar = SPLIT_BAR_REL * logits_maxabs(want)
+    let bar = rel * logits_maxabs(want)
     let diff = logits_maxdiff(got, want)
     t |> success(diff <= bar, "{what}: within {bar} (maxdiff {diff})")
     let off = logits_maxdiff(got, control)
     t |> success(off > bar, "{what} control: logits one token off read past the bar (maxdiff {off} vs {bar})")
 }
 
-def private load_two_regions(t : T?; file : string) : Model {
-    set_gpu_resident_regions_(2l)
+def private load_regions(t : T?; file : string; regions : int64) : Model {
+    set_gpu_resident_regions_(regions)
     var tr <- load_model_(path_join(models_dir(), file), QuantMode.q8)
     set_gpu_resident_regions_(1l)
     tr.config.seq_len = min(tr.config.seq_len, REGIONS_RIG_CTX)
-    t |> success(moe_gpu_resident_active(), "the whole-model driver armed at two regions (the load log names any decline)")
+    t |> success(moe_gpu_resident_active(), "the whole-model driver armed at {regions} regions (the load log names any decline)")
     return <- tr
 }
+
+def private load_two_regions(t : T?; file : string) : Model => <- load_regions(t, file, 2l)
 
 def private regions_ready(t : T?; file : string) : bool {
     if (!jit_enabled()) {
@@ -118,6 +123,37 @@ def private regions_ready(t : T?; file : string) : bool {
     return true
 }
 
+//! two sessions over `pa` and `pb`, a region each, prefilled then stepped one row at a time, interleaved, against each alone
+def private interleaved_single_steps_body(t : T?; tr : Model; pa, pb : array<int64>) {
+    var fa <- feed_a()
+    var fb <- feed_b()
+    var ra <- logits_alone(tr, pa, fa)
+    var rb <- logits_alone(tr, pb, fb)
+    t |> success(logits_maxdiff(ra[0], rb[0]) > 0.0, "the two prompts read different logits, so a crossed region cannot pass")
+    var sa <- create_session(tr, mirror_kv_dtype())
+    var sb <- create_session(tr, mirror_kv_dtype())
+    forward_prefill(tr, sa, pa, long_length(pa), 0l)
+    hold_equal(t, sa.logits, ra[0], "session A's prefill")
+    forward_prefill(tr, sb, pb, long_length(pb), 0l)
+    hold_equal(t, sb.logits, rb[0], "session B's prefill, A's rows live beside it")
+    t |> success(sa.rdec_region != sb.rdec_region, "the sessions sit in different regions ({sa.rdec_region}, {sb.rdec_region})")
+    for (st in range64(STEPS)) {
+        forward(tr, sa, fa[st], long_length(pa) + st)
+        hold_equal(t, sa.logits, ra[st + 1l], "session A step {st}")
+        forward(tr, sb, fb[st], long_length(pb) + st)
+        hold_equal(t, sb.logits, rb[st + 1l], "session B step {st}")
+    }
+    var passes <- gpu_cpu_passes_()
+    t |> equal(length(passes), 0, "the device served every call: {passes}")
+    delete passes
+    delete sa
+    delete sb
+    delete ra
+    delete rb
+    delete fa
+    delete fb
+}
+
 def cell_regions_interleaved_single_steps(t : T?; file : string) {
     t |> run("two sessions, a region each: single steps interleaved read what each session reads alone") @(t : T?) {
         if (!regions_ready(t, file)) return
@@ -126,35 +162,32 @@ def cell_regions_interleaved_single_steps(t : T?; file : string) {
             setup_dasllama_jobque_()
             var pa <- prompt_a()
             var pb <- prompt_b()
-            var fa <- feed_a()
-            var fb <- feed_b()
-            var ra <- logits_alone(tr, pa, fa)
-            var rb <- logits_alone(tr, pb, fb)
-            t |> success(logits_maxdiff(ra[0], rb[0]) > 0.0, "the two prompts read different logits, so a crossed region cannot pass")
-            var sa <- create_session(tr, mirror_kv_dtype())
-            var sb <- create_session(tr, mirror_kv_dtype())
-            forward_prefill(tr, sa, pa, long_length(pa), 0l)
-            hold_equal(t, sa.logits, ra[0], "session A's prefill")
-            forward_prefill(tr, sb, pb, long_length(pb), 0l)
-            hold_equal(t, sb.logits, rb[0], "session B's prefill, A's rows live beside it")
-            t |> success(sa.rdec_region != sb.rdec_region, "the sessions sit in different regions ({sa.rdec_region}, {sb.rdec_region})")
-            for (st in range64(STEPS)) {
-                forward(tr, sa, fa[st], long_length(pa) + st)
-                hold_equal(t, sa.logits, ra[st + 1l], "session A step {st}")
-                forward(tr, sb, fb[st], long_length(pb) + st)
-                hold_equal(t, sb.logits, rb[st + 1l], "session B step {st}")
-            }
-            var passes <- gpu_cpu_passes_()
-            t |> equal(length(passes), 0, "the device served every call: {passes}")
-            delete passes
-            delete sa
-            delete sb
-            delete ra
-            delete rb
+            interleaved_single_steps_body(t, tr, pa, pb)
             delete pa
             delete pb
-            delete fa
-            delete fb
+        }
+        delete tr
+    }
+}
+
+let private WIDE_ROWS = 3072l   //! the token command's RD_WIDE_POS, asserted equal by the wide cell: its prompts run past it
+
+//! the same past the wide position: both prompts run longer than RD_WIDE_POS, so the one-row steps take the token command's
+//! wide twin - recorded on the first such step, its stamp names apart from the split form's
+def cell_regions_wide_single_steps(t : T?; file : string) {
+    t |> run("two sessions past the wide position: the wide twin reads what each session reads alone") @(t : T?) {
+        if (!regions_ready(t, file)) return
+        var tr <- load_two_regions(t, file)
+        with_job_que() {
+            setup_dasllama_jobque_()
+            var pa <- ramp_ids(WIDE_ROWS + 8l, 0l, 1000l, 37l, 5000l)
+            var pb <- ramp_ids(WIDE_ROWS + 25l, 0l, 3000l, 91l, 6000l)
+            static_if (typeinfo builtin_module_exists(vulkan)) {
+                t |> success(long_length(pa) > RD_WIDE_POS && long_length(pb) > RD_WIDE_POS, "both prompts run past the wide position ({RD_WIDE_POS})")
+            }
+            interleaved_single_steps_body(t, tr, pa, pb)
+            delete pa
+            delete pb
         }
         delete tr
     }
@@ -259,15 +292,21 @@ def cell_prefill_continues_on_the_device(t : T?; file : string) {
     }
 }
 
-//! the bar a batched row holds against its session alone: bit for bit, or the split bar with the one-token-off control
-//! (a K-quant carrier's N-row Q8_K sites round apart from the one-row command's - `../followup_vulkan.md` item 75)
+//! the bar a batched row holds against its session alone: bit for bit, or a bar with the one-token-off control - the split
+//! bar on a K-quant dense carrier (its N-row Q8_K sites round apart from the one-row command's, `../followup_vulkan.md`
+//! item 75), the wide bar on a K-quant MoE carrier (the readings each bar was set from: `../PERF_LEDGER.md`, the batched-decode
+//! arc's gemma dense and MoE sections)
 enum LogitsBar {
     bit_exact
     split_bar
+    wide_bar
 }
 
-//! two sessions over `pa` and `pb`, a region each, through STEPS batched steps against each session alone
-def private batched_steps_body(t : T?; tr : Model; pa, pb : array<int64>; bar : LogitsBar) {
+let private WIDE_BAR_REL = 0.10
+
+//! two sessions over `pa` and `pb`, a region each, through STEPS batched steps against each session alone; `served`
+//! says the carrier has an N-row form (a PLE or hybrid carrier's command declines by design and steps a row at a time)
+def private batched_steps_body(t : T?; tr : Model; pa, pb : array<int64>; bar : LogitsBar; served : bool) {
     var fa <- feed_a()
     var fb <- feed_b()
     var ra <- logits_alone(tr, pa, fa)
@@ -280,6 +319,7 @@ def private batched_steps_body(t : T?; tr : Model; pa, pb : array<int64>; bar : 
     var sess <- [unsafe(addr(sa)), unsafe(addr(sb))]
     let gen_a = sa.rdec_gen
     let gen_b = sb.rdec_gen
+    let steps0 = rdec_nrow_steps()
     for (st in range64(STEPS)) {
         var toks <- [fa[st], fb[st]]
         eval_batch(tr, ws, sess, toks)
@@ -288,8 +328,9 @@ def private batched_steps_body(t : T?; tr : Model; pa, pb : array<int64>; bar : 
             hold_equal(t, sa.logits, ra[st + 1l], "batched step {st}, row A")
             hold_equal(t, sb.logits, rb[st + 1l], "batched step {st}, row B")
         } else {
-            hold_within(t, sa.logits, ra[st + 1l], ra[st], "batched step {st}, row A")
-            hold_within(t, sb.logits, rb[st + 1l], rb[st], "batched step {st}, row B")
+            let rel = bar == LogitsBar.wide_bar ? WIDE_BAR_REL : SPLIT_BAR_REL
+            hold_within(t, sa.logits, ra[st + 1l], ra[st], "batched step {st}, row A", rel)
+            hold_within(t, sb.logits, rb[st + 1l], rb[st], "batched step {st}, row B", rel)
         }
     }
     t |> equal(sa.rdec_gen, gen_a, "row A kept its claim through every step: its history never came up from the host again")
@@ -297,6 +338,12 @@ def private batched_steps_body(t : T?; tr : Model; pa, pb : array<int64>; bar : 
     var passes <- gpu_cpu_passes_()
     t |> equal(length(passes), 0, "the device served every call: {passes}")
     delete passes
+    static_if (typeinfo builtin_module_exists(vulkan)) {   //! the rows stepped through the N-row command, not a row at a time: a declined command passes the bars above the same
+        let nrows = vk_rdec_token_n_rows()
+        t |> success(served ? nrows >= 2l : nrows == 0l, served ? "the N-row token command serves the two rows at once ({nrows} rows)" : "the N-row token command declines this carrier by design ({nrows} rows)")
+    }
+    let stepped = rdec_nrow_steps() - steps0
+    t |> success(served ? stepped == STEPS : stepped == 0l, served ? "every batched step went through the N-row command ({stepped} of {STEPS})" : "no batched step went through the N-row command ({stepped})")
     sess |> clear()   // drop the borrowed handles: delete of array<T?> cascades to the pointees
     unsafe {
         delete ws
@@ -310,7 +357,7 @@ def private batched_steps_body(t : T?; tr : Model; pa, pb : array<int64>; bar : 
     delete fb
 }
 
-def cell_regions_batched_steps(t : T?; file : string; bar : LogitsBar = LogitsBar.bit_exact) {
+def cell_regions_batched_steps(t : T?; file : string; bar : LogitsBar = LogitsBar.bit_exact; served : bool = true) {
     t |> run("two sessions, a region each: a batched step over both reads what each session reads alone, with no history resync") @(t : T?) {
         if (!regions_ready(t, file)) return
         var tr <- load_two_regions(t, file)
@@ -318,7 +365,7 @@ def cell_regions_batched_steps(t : T?; file : string; bar : LogitsBar = LogitsBa
             setup_dasllama_jobque_()
             var pa <- prompt_a()
             var pb <- prompt_b()
-            batched_steps_body(t, tr, pa, pb, bar)
+            batched_steps_body(t, tr, pa, pb, bar, served)
             delete pa
             delete pb
         }
@@ -328,7 +375,7 @@ def cell_regions_batched_steps(t : T?; file : string; bar : LogitsBar = LogitsBa
 
 //! the same past the unsplit position: both prompts run longer than RD_UNSPLIT_POS, so the batched steps take the
 //! N-row command's split attention form - the arrival counters a row apart, the last piece of each row combining
-def cell_regions_batched_steps_split(t : T?; file : string; bar : LogitsBar = LogitsBar.bit_exact) {
+def cell_regions_batched_steps_split(t : T?; file : string; bar : LogitsBar = LogitsBar.bit_exact; served : bool = true) {
     t |> run("two sessions past the unsplit position: the split N-row command reads what each session reads alone") @(t : T?) {
         if (!regions_ready(t, file)) return
         var tr <- load_two_regions(t, file)
@@ -339,9 +386,115 @@ def cell_regions_batched_steps_split(t : T?; file : string; bar : LogitsBar = Lo
             static_if (typeinfo builtin_module_exists(vulkan)) {
                 t |> success(long_length(pa) > RD_UNSPLIT_POS && long_length(pb) > RD_UNSPLIT_POS, "both prompts run past the unsplit position ({RD_UNSPLIT_POS})")
             }
-            batched_steps_body(t, tr, pa, pb, bar)
+            batched_steps_body(t, tr, pa, pb, bar, served)
             delete pa
             delete pb
+        }
+        delete tr
+    }
+}
+
+//! DASLLAMA_VK_FUSE_BISECT a bit at a time: the one-row steps under each bit within the split bar of the fused run (the fused
+//! and split forms round apart), the one-token-off control outside it; under the fused q/k norm's bit the batched rows
+//! hold bit for bit to the row alone on the split pair
+def cell_regions_fuse_bisect(t : T?; file : string) {
+    t |> run("the fuse bisect's every bit serves logits within the split bar of the fused run; the split-pair rows batch bit for bit") @(t : T?) {
+        if (!regions_ready(t, file)) return
+        static_if (typeinfo builtin_module_exists(vulkan)) {
+            var pa <- prompt_a()
+            var fa <- feed_a()
+            with_job_que() {
+                setup_dasllama_jobque_()
+                vk_fuse_bisect_pin(0l)
+                var tr0 <- load_two_regions(t, file)
+                var base <- logits_alone(tr0, pa, fa)
+                delete tr0
+                for (bit in fixed_array(1l, 2l, 4l, 8l, 16l, 32l, 64l)) {
+                    vk_fuse_bisect_pin(bit)
+                    var tr <- load_two_regions(t, file)
+                    var got <- logits_alone(tr, pa, fa)
+                    for (st in range64(STEPS)) {
+                        hold_within(t, got[st + 1l], base[st + 1l], base[st], "bisect bit {bit} step {st}")
+                    }
+                    delete got
+                    if (bit == 64l) {
+                        var pb <- prompt_b()
+                        batched_steps_body(t, tr, pa, pb, LogitsBar.bit_exact, true)
+                        delete pb
+                    }
+                    delete tr
+                }
+                vk_fuse_bisect_pin(-1l)
+                delete base
+            }
+            delete pa
+            delete fa
+        } else {
+            t |> skip("dasVulkan not present")
+        }
+    }
+}
+
+//! a batched step before any one-row step, a one-row step on each row, a batched step again - every row under the unsplit
+//! position, so the batched steps take the unsplit twin whether or not a one-row record came first
+def cell_regions_batched_first(t : T?; file : string) {
+    t |> run("a batched step first, one-row steps, a batched step again: the rows read what each session reads alone throughout") @(t : T?) {
+        if (!regions_ready(t, file)) return
+        var tr <- load_two_regions(t, file)
+        with_job_que() {
+            setup_dasllama_jobque_()
+            var pa <- prompt_a()
+            var pb <- prompt_b()
+            var fa <- feed_a()
+            var fb <- feed_b()
+            var sa <- create_session(tr, mirror_kv_dtype())
+            var sb <- create_session(tr, mirror_kv_dtype())
+            eval(tr, sa, pa)
+            eval(tr, sb, pb)
+            var ws <- create_batch_workspace(tr)
+            var sess <- [unsafe(addr(sa)), unsafe(addr(sb))]
+            var got_a : array<array<float>>
+            var got_b : array<array<float>>
+            for (st in range64(STEPS)) {
+                if (st == 1l) {
+                    var one_a <- [fa[st]]
+                    var one_b <- [fb[st]]
+                    eval(tr, sa, one_a)
+                    eval(tr, sb, one_b)
+                    delete one_a
+                    delete one_b
+                } else {
+                    var toks <- [fa[st], fb[st]]
+                    eval_batch(tr, ws, sess, toks)
+                    delete toks
+                }
+                got_a |> emplace <| logits_of(sa, tr.config.vocab_size)
+                got_b |> emplace <| logits_of(sb, tr.config.vocab_size)
+            }
+            var passes <- gpu_cpu_passes_()
+            t |> equal(length(passes), 0, "the device served every call: {passes}")
+            delete passes
+            var ra <- logits_alone(tr, pa, fa)
+            var rb <- logits_alone(tr, pb, fb)
+            for (st in range64(STEPS)) {
+                hold_equal(t, got_a[st], ra[st + 1l], "batched-first step {st}, row A")
+                hold_equal(t, got_b[st], rb[st + 1l], "batched-first step {st}, row B")
+            }
+            sess |> clear()
+            unsafe {
+                delete ws
+                delete sess
+            }
+            delete sa
+            delete sb
+            delete got_a
+            delete got_b
+            delete ra
+            delete rb
+            delete pa
+            delete pb
+            delete fa
+            delete fb
         }
         delete tr
     }
@@ -524,8 +677,10 @@ def cell_device_kv_park_adopt(t : T?; file : string) {
 def private cached_of(events : array<SchedEvent>; id : int64) : int64 => finished_of(events, id).n_cached
 
 //! three requests through a two-stream scheduler, then a second turn that opens with the last one's prompt and reply
-//! (two slots park two claims: the third request's arrival is what evicts the first's rows); every prompt is one prefill chunk
-def private serve_four(m : Model; device : bool; var events : array<SchedEvent>) : tuple<on : bool; parked : int> {
+//! (two slots park two claims: the third request's arrival is what evicts the first's rows); every prompt is one prefill chunk.
+//! The second turn samples at top-k 1 under a temperature - the same token as the argmax, through a sampler that is not one,
+//! so its rows land logits where the other three land picks (a batched step of both kinds lands both)
+def private serve_four(m : Model; device : bool; var events : array<SchedEvent>) : tuple<on : bool; parked : int; rows_stepped : int64> {
     var sch <- create_scheduler(m, 2l, 4l, 64l)
     let on = set_device_kv(sch, device)
     var pa <- prompt_a()
@@ -537,15 +692,17 @@ def private serve_four(m : Model; device : bool; var events : array<SchedEvent>)
     drain(m, sch, events)
     var turn2 <- prose_ids(33l, 11l)
     turn2 |> push_from(toks_of(events, 3l), prose_ids(20l, 5l))
-    submit(m, sch, make_req(4l, turn2, 8l))
+    var no_stop : array<int64>
+    submit(m, sch, make_req(4l, turn2, SamplingParams(temp = 0.7, top_k = 1l), 8l, no_stop))
     drain(m, sch, events)
     delete pa
     delete pb
     delete pc
     delete turn2
     let parked = length(sch.parked)
+    let rows_stepped = sch.sum_batch
     delete sch
-    return (on = on, parked = parked)
+    return (on = on, parked = parked, rows_stepped = rows_stepped)
 }
 
 def cell_scheduler_device_mode(t : T?; file : string) {
@@ -559,8 +716,16 @@ def cell_scheduler_device_mode(t : T?; file : string) {
             let served0 = moe_gpu_resident_prefills()
             t |> success(!serve_four(tr, false, host).on, "the control scheduler serves host-cached sessions")
             let served1 = moe_gpu_resident_prefills()
+            let picks0 = rdec_picks_served()
             let served = serve_four(tr, true, dev)
             t |> success(served.on, "an idle scheduler switches to device-home sessions")
+            //! every decode step of the three argmax requests lands a pick (their first token samples off the prefill's logits inline);
+            //! the sampled fourth request's steps land logits, so the count is the rows stepped less its own
+            var td4 <- toks_of(dev, 4l)
+            let sampled_steps = long_length(td4) - 1l
+            delete td4
+            t |> equal(rdec_picks_served() - picks0, served.rows_stepped - sampled_steps, "the device landed the argmax streams' picks alone, no logits row ({served.rows_stepped} rows stepped, {sampled_steps} of them the sampled request's)")
+            t |> success(served.rows_stepped - sampled_steps >= 21l, "the three argmax requests stepped seven decode rows each at least ({served.rows_stepped - sampled_steps})")
             // four turns on two stream slots: the first turn's claim is evicted by the third's, the third's is spent by the turn that adopts it
             t |> equal(served.parked, gpu_device_prefill_continues(tr) ? 2 : 0, "parked claims stay within the stream slots, and a model whose prefill cannot continue parks none")
             // one code path on both sides: each prompt enters the window chain once and each step the batched token command;
@@ -761,6 +926,174 @@ def cell_passes_with_their_rows(t : T?; file : string) {
             delete s
             delete head
             delete tail
+        }
+        delete tr
+    }
+}
+
+//! the kernel census's count over a stamp's two codec twins
+def private stamps_dispatched(stamp_f16, stamp_f32 : string) : int64 {
+    static_if (typeinfo builtin_module_exists(vulkan)) {
+        return vk_kernel_coverage_of(stamp_f16) + vk_kernel_coverage_of(stamp_f32)
+    } else {
+        return 0l
+    }
+}
+
+//! a session stepped once through the driver dispatches the stamp (either codec twin) the carrier's shape picks -
+//! the pick a logits compare cannot see, the census can
+def cell_regions_stamp_served(t : T?; file : string; stamp_f16, stamp_f32 : string) {
+    t |> run("the driver's step dispatches the stamp the carrier's shape picks") @(t : T?) {
+        if (!regions_ready(t, file)) return
+        var tr <- load_two_regions(t, file)
+        with_job_que() {
+            setup_dasllama_jobque_()
+            var pa <- prompt_a()
+            var fa <- feed_a()
+            var s <- create_session(tr, mirror_kv_dtype())
+            forward_prefill(tr, s, pa, long_length(pa), 0l)
+            let before = stamps_dispatched(stamp_f16, stamp_f32)
+            forward(tr, s, fa[0], long_length(pa))
+            let after = stamps_dispatched(stamp_f16, stamp_f32)
+            t |> success(after > before, "the step dispatched {stamp_f16} or {stamp_f32} ({after - before} dispatches)")
+            delete s
+            delete pa
+            delete fa
+        }
+        delete tr
+    }
+}
+
+//! the fuse knob's pin where `on`: 0 pins the split one-row forms for the next load, -1 hands the knob back to the environment
+def private fuse_pin(on : bool; value : int) {
+    static_if (typeinfo builtin_module_exists(vulkan)) {
+        if (on) {
+            g_vk_fuse = value
+        }
+    }
+}
+
+//! the batched cell over the split one-row forms: the fuse knob pinned off for the load and unpinned after, so the rows
+//! hold to the split forms where the fused one-row forms round apart (a K-quant MoE's folded down, a PLE carrier's
+//! fused act + proj); without the Vulkan module the knob does not exist and the cell skips
+def cell_regions_batched_steps_split_forms(t : T?; file : string; bar : LogitsBar = LogitsBar.bit_exact) {
+    static_if (typeinfo builtin_module_exists(vulkan)) {
+        fuse_pin(true, 0)
+        cell_regions_batched_steps(t, file, bar)
+        fuse_pin(true, -1)
+    } else {
+        t |> run("the split one-row forms need the Vulkan driver") @(t : T?) {
+            t |> skip("no Vulkan module in this build: the split one-row forms are the Vulkan driver's")
+        }
+    }
+}
+
+//! step `st` of the widening order: the two rows batched, then each alone, then all three batched
+def private widen_step(tr : Model; var ws : BatchWorkspace; var sa, sb : Session; var two, three : array<Session?>; fa, fb, fc : array<int64>; st : int64) {
+    if (st == 0l) {
+        var toks <- [fa[st], fb[st]]
+        eval_batch(tr, ws, two, toks)
+        delete toks
+    } elif (st == 1l) {
+        var one_a <- [fa[st]]
+        var one_b <- [fb[st]]
+        eval(tr, sa, one_a)
+        eval(tr, sb, one_b)
+        delete one_a
+        delete one_b
+    } else {
+        var toks <- [fa[st], fb[st], fc[st - 2l]]
+        eval_batch(tr, ws, three, toks)
+        delete toks
+    }
+}
+
+//! a row's stepped logits against its session alone, from the step it joined at
+def private widen_hold(t : T?; got, ref : array<array<float>>; bar : LogitsBar; row : string; first : int64) {
+    for (st in range64(long_length(got))) {
+        if (bar == LogitsBar.bit_exact) {
+            hold_equal(t, got[st], ref[st + 1l], "widened step {st + first}, {row}")
+        } else {
+            let rel = bar == LogitsBar.wide_bar ? WIDE_BAR_REL : SPLIT_BAR_REL
+            hold_within(t, got[st], ref[st + 1l], ref[st], "widened step {st + first}, {row}", rel)
+        }
+    }
+}
+
+//! three sessions over three regions: a batched step over two, one of them alone, then a batched step over all three -
+//! the command records at a row count it had not recorded, after a one-row step, and every row still reads what its
+//! session reads alone (the N-row sets decide their own forms at the first record, never off the one-row command's);
+//! `split_forms` pins the fuse knob off for the load, as the split-forms cell does
+def cell_regions_batched_widen(t : T?; file : string; bar : LogitsBar = LogitsBar.bit_exact; split_forms : bool = false) {
+    t |> run("a batched step over two rows, one row alone, then a batched step over three: the rows read what each session reads alone") @(t : T?) {
+        if (!regions_ready(t, file)) return
+        fuse_pin(split_forms, 0)
+        var tr <- load_regions(t, file, 3l)
+        fuse_pin(split_forms, -1)
+        with_job_que() {
+            setup_dasllama_jobque_()
+            var pa <- prompt_a()
+            var pb <- prompt_b()
+            var pc <- prompt_c()
+            var fa <- feed_a()
+            var fb <- feed_b()
+            var fc <- feed_c()
+            var sa <- create_session(tr, mirror_kv_dtype())
+            var sb <- create_session(tr, mirror_kv_dtype())
+            var sc <- create_session(tr, mirror_kv_dtype())
+            eval(tr, sa, pa)
+            eval(tr, sb, pb)
+            eval(tr, sc, pc)
+            var ws <- create_batch_workspace(tr)
+            var two <- [unsafe(addr(sa)), unsafe(addr(sb))]
+            var three <- [unsafe(addr(sa)), unsafe(addr(sb)), unsafe(addr(sc))]
+            var got_a : array<array<float>>
+            var got_b : array<array<float>>
+            var got_c : array<array<float>>
+            let steps0 = rdec_nrow_steps()
+            for (st in range64(STEPS)) {
+                widen_step(tr, ws, sa, sb, two, three, fa, fb, fc, st)
+                if (st >= 2l) {
+                    got_c |> emplace <| logits_of(sc, tr.config.vocab_size)
+                }
+                got_a |> emplace <| logits_of(sa, tr.config.vocab_size)
+                got_b |> emplace <| logits_of(sb, tr.config.vocab_size)
+            }
+            let stepped = rdec_nrow_steps() - steps0
+            t |> equal(STEPS - 1l, stepped, "the two-row step and every three-row step went through the N-row command")
+            var passes <- gpu_cpu_passes_()
+            t |> equal(length(passes), 0, "the device served every call: {passes}")
+            delete passes
+            var ra <- logits_alone(tr, pa, fa)
+            var rb <- logits_alone(tr, pb, fb)
+            var fc_short <- [for (i in range64(STEPS - 2l)); fc[i]]
+            var rc <- logits_alone(tr, pc, fc_short)
+            widen_hold(t, got_a, ra, bar, "row A", 0l)
+            widen_hold(t, got_b, rb, bar, "row B", 0l)
+            widen_hold(t, got_c, rc, bar, "row C", 2l)
+            two |> clear()
+            three |> clear()
+            unsafe {
+                delete ws
+                delete two
+                delete three
+            }
+            delete sa
+            delete sb
+            delete sc
+            delete got_a
+            delete got_b
+            delete got_c
+            delete ra
+            delete rb
+            delete rc
+            delete pa
+            delete pb
+            delete pc
+            delete fa
+            delete fb
+            delete fc
+            delete fc_short
         }
         delete tr
     }
