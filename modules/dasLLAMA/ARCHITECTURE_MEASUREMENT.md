@@ -14,7 +14,11 @@ columns were produced, and they are pinned, not re-measured.
 `performance/gen_bench_records.das` sweeps a board by spawning that rig once per cell, and
 writes `performance/records/<box>.json`. `gen_site_records.das` merges those into the file the
 site renders. A stored row carries its own command, sha, version, tune stamp and exec format, so
-a number is self-describing rather than a bare figure in a table.
+a number is self-describing rather than a bare figure in a table. The command, its environment
+line and a sidecar's `binary` spell the home directory `~` (`tilde_home`, `daslib/fio`): a
+public row names no user and still reproduces on any box. The re-mint rule sanctions one edit
+to a stored row - spelling its home directory `~` - since no measurement changes; an archived
+tune sidecar is never edited, its sha256 being what ties a row to the exe it shipped with.
 
 **Regression checking inverts the same rig:** `gen_bench_records.das --oracle --legs metal`
 takes the store's das rows as the work list, re-measures each once, and gates one-sided against
@@ -108,3 +112,51 @@ same math differ in float terms - while one that changes only WHEN work happens 
 a CLI flag is never an override (it is the run's own command line, visible where the run is
 launched).
 
+
+### Re-stamping inside the content-addressed archive
+
+A sidecar archived as `records/<box>.tune.<sha12>.json` is content-addressed: its filename
+carries the hash of its bytes. Re-stamping such a file's `provenance.engine_sha` to a reachable
+commit (the remedy `performance/REVIEW.md` allows when the measured `modules/dasLLAMA/` tree is
+byte-identical) therefore re-hashes and renames the file, and every `records/<box>.json` row
+whose `tune_sha` named the old file is repointed in the same change - a row left on the old
+name points at a file that no longer exists.
+
+### 2.21 An isolated kernel race is only as good as the graph it imitates {#kernel-race-fidelity}
+
+A kernel A/B race times two spellings of one compute on a synthetic fixture. Three conditions
+decide whether its winner is the winner the served graph would pick, and a race missing any of
+them crowns confidently and wrongly:
+
+- **Overlap.** The served graph's consecutive GEMVs write DIFFERENT output buffers, so the
+  scheduler overlaps them. A race chaining every dispatch through one output buffer serializes
+  on the write-after-read hazard; on the iq2xxs f4-slab twin that one difference read +9% for
+  an arm the served graph rejects at -8.6%.
+- **A warmed clock.** An Apple GPU's clock governor ramps under load, and `race_pair_ms` runs
+  base-then-twin per round, so the first side pays the ramp the second rides. About 150 ms of
+  GPU work before the first timed round removes the bias; back-to-back dispatches inside each
+  timed encoder hold the clock there. A sparse invocation without the burn reads idle-clock
+  times and can flip a verdict outright.
+- **A real site shape.** `REVIEW_GPU.md` binds this one.
+
+Even a race meeting all three can be structurally blind. `kq_gemv_iq2xxs_f4` is the standing
+case: every isolated regime crowns the twin and the served decode graph loses 8.6% with it,
+because the effect is mixed-stream occupancy - it exists only when the GEMV runs beside the
+rest of the token step. That crown is therefore NOT auto-raced. It is minted on the real shapes
+by `harness/tune_kernels.das`'s serving confirm: two temporary manifests differing only in
+`runtime.metal_tensor` membership, each served to
+`benchmarks/lcpp_bench.das --for-debug-purposes --ngl 99 -p 32 -n 128 -r 3` under
+`DAS_TUNE_MANIFEST`, the tg128 line the verdict. Both arms carry an EMPTY `kernels` section, so
+they stamp identical fallbacks and the tg delta isolates the crown under test. The margin is
+`CONFIRM_TG_MARGIN` = 1.005, best-of-3: the crown's serving win where it wins is +0.6% (m5) and
+its serving loss where it loses is -8.6% (m4), so the margin only has to clear run noise, and a
+spuriously minted crown costs a re-mint rather than a board row. No IQ2_XXS vehicle on the box
+means no crown - the base kernel is the safe side - and the run says so with a provisioning
+hint.
+
+The per-format isolated rig is `benchmarks/matmul/bench_metal_kq_race.das`: synthetic planes,
+no model, no tuner, every arm gated against a CPU plane-dequant oracle before it is timed, and
+`--burn-ms` (default 150) spent on GPU work before each cell's first timed round. Its cells
+chain every dispatch through ONE shared output buffer on purpose - the serialized regime is
+the instrument's probe shape, imitating the reference tool it is compared against - and its
+numbers reach the engine only through a human porting decision, never a minted crown.
