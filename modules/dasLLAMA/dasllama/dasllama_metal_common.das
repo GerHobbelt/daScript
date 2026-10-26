@@ -547,9 +547,7 @@ def zero_rows(var buf : MetalBuffer?; from, to, width : int64) {
 
 //! Copy `rows` rows of `width` floats from `src` into `buf` and zero the pad rows up to `mp`.
 def upload_rows_padded(var buf : MetalBuffer?; src : void?; rows, mp, width : int64) {
-    unsafe {
-        memcpy(metal_buffer_contents(buf), src, rows * width * 4l)
-    }
+    unsafe(memcpy(metal_buffer_contents(buf), src, rows * width * 4l))
     zero_rows(buf, rows, mp, width)
 }
 
@@ -767,9 +765,7 @@ def residency_reset {
         metal_release(g_rset)
         g_rset = null
     }
-    unsafe {
-        delete g_rset_seen
-    }
+    delete g_rset_seen
     g_rset_tried = false
     g_rset_dirty = false
     g_rset_count = 0l
@@ -794,9 +790,7 @@ def pool_acquire_untracked_pinned(var pool : MetalBufferPool; dev : MetalDevice?
 def private region_upload_new(key : uint64; src : void?; bytes : uint64) : MetalBuffer? {
     // UNTRACKED: weights are GPU-read-only (written once, before any commit) — tracking ~450 of them made scheduler dependency analysis the dominant non-GPU cost (~70ms/prefill on 3B)
     var buf = metal_new_buffer_untracked(g_dev, bytes)
-    unsafe {
-        memcpy(metal_buffer_contents(buf), src, bytes)
-    }
+    unsafe(memcpy(metal_buffer_contents(buf), src, bytes))
     residency_note(buf)
     g_regions[key] = RegionEntry(buf = buf, bytes = bytes)
     return buf
@@ -1074,9 +1068,7 @@ def private arena_rebuild(want : uint64; ceil_bytes : uint64) {
     for (mr in values(g_mirrors)) {
         mirror_release(mr)
     }
-    unsafe {
-        delete g_mirrors
-    }
+    delete g_mirrors
     g_mirror_bytes = 0ul
     metal_release(g_arena)
     g_arena_bytes = min(want, ceil_bytes)
@@ -1655,9 +1647,7 @@ def private gr_encode_node(enc : MetalComputeEncoder?; n : KNode) {
     for (b in range(n.nbind)) {
         let kb = g_gr_binds[n.bind0 + b]
         if (kb.nbytes > 0ul) {
-            unsafe {
-                metal_set_bytes(enc, addr<void?>(g_gr_bytes[int(kb.off)]), kb.nbytes, kb.slot)
-            }
+            metal_set_bytes(enc, unsafe(addr<void?>(g_gr_bytes[int(kb.off)])), kb.nbytes, kb.slot)
         } else {
             metal_set_buffer(enc, kb.buf, kb.off, kb.slot)
         }
@@ -1859,6 +1849,8 @@ var g_lp_xb_bytes = 0l
 var g_lp_err = false            // sticky per-step dispatch-error signal for sync callers
 var @scratch g_lp_sessions : array<Session?>
 var @scratch g_lp_positions : array<int64>
+var @scratch g_lp_dn_uids : array<uint64>   // the pending step's recurrent rows: each session's DnMirror advances when the step lands
+var @scratch g_lp_dn_pos : array<int64>
 var @scratch g_lp_koffs : array<uint64>
 var @scratch g_lp_voffs : array<uint64>
 var @scratch g_lp_caps : array<int64>
@@ -1902,6 +1894,29 @@ def private land_sameslab_rows(lgp : uint8?) {
                 g_sameslab_arg[i] = int64(ap[i])
             }
         }
+    }
+}
+
+//! The speculative carry: a session's post-norm hidden (`bytes` of it from `src`) becomes
+//! `mtp_h` and the watermark `mtp_h_pos1` moves to `pos1` - the prefill's last row, the single-row
+//! step's row and a plain batched step's row all land it here.
+def stash_mtp_carry(var s : Session; src : void?; bytes : uint64; pos1 : int64) {
+    if (uint64(long_length(s.mtp_h)) * 4ul < bytes) {
+        s.mtp_h |> reserve_resize(int64(bytes / 4ul))   // nolint:PERF026,LINT019 — once per session on a NextN-headed model; the hot-path walk fires from the drivers' compiles
+    }
+    unsafe {
+        memcpy(addr < void? >(s.mtp_h[0]), src, bytes)
+    }
+    s.mtp_h_pos1 = pos1
+}
+
+//! A plain step's row on a NextN-headed (or carry-armed) model lands its carry; a same-slab verify
+//! lands its rows into `mtp_hrows` instead.
+def private land_row_carry(var s : Session; i, pos : int64) {
+    return if (g_lp_bxf == null || g_lp_sameslab)
+    let hb = g_lp_bxf_bytes / g_lp_nrows
+    unsafe {
+        stash_mtp_carry(s, reinterpret<void?>(reinterpret<uint8?>(metal_buffer_contents(g_lp_bxf)) + i * hb), uint64(hb), pos + 1l)
     }
 }
 
@@ -1962,6 +1977,7 @@ def finish_pending_step {   // nolint:STYLE038 — the pipeline join: wait/error
                     memcpy(addr < void? >(sp.logits[0]),
                         reinterpret<void?>(lgp + i * g_lp_vocab * 4l), g_lp_vocab * 4l)
                 }
+                land_row_carry(*sp, i, pos)
                 if (key_exists(g_mirrors, sp.uid)) {   // never regress the optimistic commit-time mark
                     let wm0 = g_mirrors[sp.uid].watermark
                     g_mirrors[sp.uid].watermark = max(wm0, pos + 1l)
@@ -1972,6 +1988,9 @@ def finish_pending_step {   // nolint:STYLE038 — the pipeline join: wait/error
             }
         }
         g_us_breadback += int64(get_time_usec(ts_rb))
+        for (u, p in g_lp_dn_uids, g_lp_dn_pos) {   // the GPU state now holds each recurrent row's update
+            dn_mirror_advance(u, p)
+        }
         g_batch_steps++
         g_batch_rows += g_lp_nrows
     } else {
@@ -2004,6 +2023,8 @@ def finish_pending_step {   // nolint:STYLE038 — the pipeline join: wait/error
     g_lp_xb = null
     g_lp_xb_dst = null
     g_lp_sessions |> clear()   // borrowed handles — clear, never delete
+    g_lp_dn_uids |> clear()
+    g_lp_dn_pos |> clear()
     g_lp_active = false
 }
 
@@ -2085,18 +2106,14 @@ def private regions_release_all {
         }
         e.buf = null
     }
-    unsafe {
-        delete g_regions
-    }
+    delete g_regions
     for (e in values(g_regions_cat3)) {
         if (e.buf != null) {
             metal_release(e.buf)
         }
         e.buf = null
     }
-    unsafe {
-        delete g_regions_cat3
-    }
+    delete g_regions_cat3
     for (b in g_region_retire) {
         if (b != null) {
             metal_release(b)
@@ -2108,22 +2125,16 @@ def private regions_release_all {
 def metal_common_release {
     kcov_fold()   // PSO pointers recycle across re-init — counts fold into names first
     // schedules key on PSO pointers — a re-init reallocates PSOs, so cached classes would lie
-    unsafe {
-        delete g_gr_scheds
-    }
+    delete g_gr_scheds
     nc_logits_release()
     for (mr in values(g_mirrors)) {
         mirror_release(mr)
     }
-    unsafe {
-        delete g_mirrors
-    }
+    delete g_mirrors
     for (dmr in values(g_dn_mirrors)) {
         dn_mirror_release(dmr)
     }
-    unsafe {
-        delete g_dn_mirrors
-    }
+    delete g_dn_mirrors
     g_mirror_bytes = 0ul
     if (g_arena != null) {
         metal_release(g_arena)
@@ -2196,9 +2207,7 @@ struct public MetalTensorRaceResult {
 def race_buf(dev : MetalDevice?; bytes : uint64; src : void?) : MetalBuffer? {
     var b = metal_new_buffer(dev, bytes)
     if (src != null) {
-        unsafe {
-            memcpy(metal_buffer_contents(b), src, bytes)
-        }
+        unsafe(memcpy(metal_buffer_contents(b), src, bytes))
     }
     return b
 }
@@ -2354,6 +2363,38 @@ def kq_race_verdict(var res : MetalTensorRaceResult; by_a, by_b : MetalBuffer?; 
     } else {
         res.winner = res.twin_ms < res.base_ms ? "tensor" : "simdgroup"
     }
+}
+
+//! ok false means verdict already holds the answer, the pipelines are released, and nothing is timed
+struct public RacePsoPair {
+    base_pso, twin_pso : MetalComputePipeline?
+    verdict : MetalTensorRaceResult
+    ok : bool
+}
+
+//! the `race_pso_pair_stamp` macro is the spelling a race arm uses - it names each side by its
+//! ONE `_msl` stem, so the entry name and the fastmath flag cannot drift onto another kernel's
+def race_pso_pair(dev : MetalDevice?; family : string;
+                  base_src, base_entry : string; base_fm : bool;
+                  twin_src, twin_entry : string; twin_fm : bool) : RacePsoPair {
+    var p = RacePsoPair(base_pso = null, twin_pso = null, ok = false,
+        verdict = MetalTensorRaceResult(family = family, winner = "", base_ms = -1.0lf, twin_ms = -1.0lf, note = ""))
+    var err = ""
+    p.base_pso = pipeline_from_source(dev, base_src, base_entry, base_fm, err)
+    if (p.base_pso == null) {
+        p.verdict.note = "base pso: {err}"
+        return p
+    }
+    p.twin_pso = pipeline_from_source(dev, twin_src, twin_entry, twin_fm, err)
+    if (p.twin_pso == null) {
+        p.verdict.winner = "simdgroup"
+        p.verdict.note = "twin pso: {err}"
+        metal_release(p.base_pso)
+        p.base_pso = null
+        return p
+    }
+    p.ok = true
+    return p
 }
 
 // interleaved adjacent A/B pair — separate per-side blocks read the box's thermal/clock ramp

@@ -11,6 +11,89 @@ what it costs today and what the fix would change.
 
 ## Entries
 
+- **LANDED (2026-09-18) - a K/V mirror region per stream trades context for concurrency, not
+  for throughput (`ARCHITECTURE_GPU_VULKAN_RESIDENCY.md` sec.2.2n).** The resident driver's
+  mirror is one allocation a side; `set_gpu_resident_regions` splits it, and the residency plan
+  pays for the regions out of each stream's context. gemma-4-E2B-it-Q4_K_M.gguf served by
+  `daslang -jit utils/dasllama-server/main.das -- --config <toml>` (`backend = "gpu"`, the vulkan
+  tier in its default cm2 mode, kv f16, the box's tuned sidecar, `DAS_JOBQUE_THREADS=16`, no other
+  override) on a Threadripper 3990X with an RTX 5060 Ti 16 GB under Windows; the instrument is
+  128-token chat requests at temperature 0 through `/v1/chat/completions`, a rate being completion
+  tokens over the request's wall, prefill included, and the footprint `/v1/stats`'s
+  `gpu_vram_bytes`. At `streams = 1`: one region of 131072 positions, a 2304 MB mirror, 3628 MiB
+  on the device, one stream 147.9 / 150.8 / 149.6 tok/s, four requests queued on the one slot
+  148.9 tok/s summed. At `streams = 4`: four regions of 49926 positions, a 3510 MB mirror, 4836
+  MiB on the device, one stream 148.8 / 151.8 / 152.3 tok/s, four requests at once 140.9 tok/s
+  summed, `gpu_cpu_passes` empty in both. The decision: the server asks for a region per stream
+  (1208 MiB and 62% of the context, on this model), because four conversations then move
+  together instead of waiting in a queue; the summed rate does not rise, since the batched step
+  still dispatches its rows one at a time - `followup_vulkan.md` item 69's closing paragraph is
+  the batched dispatch that would raise it. Before the regions the same four-stream config served
+  on the per-op tier at tg128 34.0 tok/s (the server's in-process bench), its paged sessions
+  handed to the CPU on every step.
+- **LANDED (2026-09-18) - the StyleTTS2 harmonic source streams in frame windows
+  (`ARCHITECTURE_TTS_MEMORY.md` sec.2.53).** The source held four tables of samples times
+  harmonics for the whole chunk - the cycles, the upsampled phase, the noise draw and the sine
+  rows, 6.2 MB each for a 7 s sentence and 21.5 MB each at 25 s - to hand `linear_rows` nine
+  values per sample. Only the cumulative phase sum reaches across the chunk, and it runs at frame
+  rate, so the source now runs 64 phase frames (19200 samples) at a time on a carried sum, the
+  resamplers taking a window of columns with the same tap arithmetic and the noise stream drawn
+  in row order a window at a time. Bit-identical PCM on every carrier and length (FNV over the
+  samples, one probe program over both trees); on one thread, five reps, cv under 2%, the say
+  takes what it took - kitten-nano 345 ms -> 343, kokoro 1.56 s -> 1.55, kitten-mini 0.91 s -> 0.91
+  at 7 s, 1.23 s -> 1.24, 4.95 -> 4.95, 3.13 -> 3.14 at 25 s; heap peak after one say on top of
+  the six-buffer entry below: kitten-nano 170 -> 147
+  MB (7 s) and 448 -> 365 (25 s), kokoro-82m 245 -> 222 and 630 -> 554, kitten-mini 222 -> 203
+  and 595 -> 524. What remains is the generator's six stream-sized buffers, which the chunk cap
+  bounds; the generator itself cannot window, because every Snake block's AdaIN takes its
+  statistics over the whole stream.
+- **LANDED (2026-09-18) - the StyleTTS2 generator runs on six buffers, the idle release covers
+  its carrier, and the chunk cap is a knob (`ARCHITECTURE_TTS_MEMORY.md` sec.2.51, 2.52).** A
+  Kitten or Kokoro say holds its memory in the iSTFTNet generator's `[t][c]` rows, every buffer
+  the stage's whole stream and the count of them live at once the footprint: nine same-size
+  fields, three of which held values dead by the time the next was written. Six fields now
+  carry the same roles (the block input doubles as the pair's second conv output, the noise
+  branch's rows as the stage stream, its residual as each Snake block's), which moves values
+  between addresses and nothing else - the PCM is bit-identical on every carrier and length
+  (FNV over the samples, before and after). Heap peak after one say, das heap counters, the q8
+  lane, M5 Max, one process on the box: kitten-nano 196 -> 170 MB for a 7 s sentence and 539
+  -> 448 for a 25 s one, kokoro-82m 299 -> 245 and 800 -> 630, kitten-mini 269 -> 222 and 752
+  -> 595 (the model itself 42 MB; the peak is per chunk and linear in its length). On one thread,
+  five reps, cv under 2%, the say takes what it took: kitten-nano 345 ms -> 345, kokoro 1.56 s
+  -> 1.56, kitten-mini 0.92 s -> 0.91 at 7 s; 1.25 s -> 1.23, 5.00 -> 4.95, 3.14 -> 3.13 at 25 s.
+  `tts_release_scratch` deleted the block home's globals but left the `St2Scratch` carrier
+  (109 MB of the 7 s kitten-nano say's 167) to keep a noise state a synthesis redraws from its
+  seed anyway; it now frees the carrier too unless the parity rail captured the noise, and the
+  heap after the release reads the model alone on every carrier. `tts_set_chunk_chars` lowers
+  the 400-codepoint chunk cap per model, so a memory-tight build bounds the peak directly.
+  One trap on the way: the after-tree read 15% slower in the generator on the 7 s says (400 ms
+  against 345, reproducible across processes) with one probe program and identical to the
+  before-tree with any other - the JIT cache had pinned one codegen of that program, and the
+  op buckets under the profiling rail were equal to the millisecond (`followup_general.md`
+  row 154).
+
+- **LANDED (2026-09-18) - the Pocket codec streams in windows of 16 latent frames
+  (`ARCHITECTURE_POCKET.md` sec.2.46).** The codec's activations, about 20 MB per second of
+  audio across the chain's ping-pong rows, were the say's and the clone's working set: 116 MB
+  for a 5.7 s chunk, 233 MB for an 11 s clip (das heap counters, the English q8 file, M5 Max);
+  at 16 frames they are 41 MB whatever the run's length, 21 MB at 8. On one thread (26 runs, cv
+  under 1%) a window is cache-sized rows and beats the whole run: the 5.7 s decode 374 ms -> 365
+  at 16 and 360 at 8, the 11 s encode 710 -> 672 and 664. On fourteen threads the rows a step
+  hands the workers thin out: codec minima 81-89 ms for the whole run against 93 at 16, 94 at 8,
+  106 at 4, inside a run-to-run band of a tenth (cv 5-7%, void by the discipline; the say's total
+  196-217 ms whole, 204 at 16). The remaining cost is the lane split at a few hundred rows -
+  `followup_general.md` row 153. What a say still leaves behind, by the heap report's blocks:
+  the roster voice's state (six layers, keys and values), the model's `PocketScratch` at 57 MB,
+  and the block home's own scratch globals - `conv1d_rows_transposed`'s tap lift and the
+  attention head scratch at 6 MB. Nothing leaks; the scratch is sized to the largest run it saw.
+  Two levers landed with it: the voice's caches reserve the rows one chunk of the budget can
+  take instead of a flat 1024 (54 MB -> 19 MB a voice, cap 411 rows for a 126-row clip), and the
+  tap lift runs a cache-sized block of input rows at a time from the last block down, so an
+  output row sums its taps in the same order (66 MB on the whole run, 15 at 16 frames -> 4 MB;
+  the whole-run decode on one thread 374 -> 360 ms for the cache-sized rows). A say now adds 87
+  MB to the heap where it added 133, and `tts_release_scratch` gives the carrier and the globals
+  back when the caller says idle memory matters: the browser examples' speech threads call it
+  after half a second with nothing queued.
 - **LANDED (2026-09-16) - the browser build runs on every engine; `+relaxed-simd` leaves the
   wasm feature string.** WebKit implements none of the relaxed opcodes, and the previous entry's
   `+relaxed-simd` put `f32x4.relaxed_max` (the backend's lowering of an `nnan` vector max, which
@@ -1767,6 +1850,157 @@ direction-grade.
   The lanes agree within the rig's own spread; the small form loses nothing the rig can hear.
   Decision: taken - the browser pages read the small forms (storywish the one-voice file, parrot
   the 19-voice one), the q8 file stays the desktop default of the served set.
+
+### From the Vulkan batched-decode arc (2026-09-19)
+
+Instruments: `daslang -jit benchmarks/lcpp_bench.das --npl 4` (the flat rows and the four-stream row
+through the scheduler's device mode; the vulkan tier in its cm2 mode and in its KHR (mm) mode as two
+arms, kv f16, the box's tuned sidecar - `DASLLAMA_ALLOW_UNTUNED=1` on the pod, whose sidecar is
+untuned - `DAS_JOBQUE_THREADS=16` locally and the pod's 48 vCPUs; `DASLLAMA_GPU_PROF=1` for the token
+command's stamps, which itself costs ~5% of the rate, so every pair below is profiler-on against
+profiler-on or off against off), the attention ruler `harness/vk_attn_probe.das` (device timestamps
+a layer), the copy ruler `harness/vk_dma_probe.das`; the reference exe llama.cpp b10660
+`llama-batched-bench -m <model> -c 4096 -b 2048 -ub 512 -npp 512 -ntg 128 -npl 1,4 -ngl 99 -fa on`
+on both boxes the same hour, with `GGML_VK_PERF_LOGGER=1` for its per-kernel reads. The `tg128@4`
+row is the summed served rate over the scheduler step whole - sampling, detokenization and the event
+list inside the clock - where the batched reference exe times the decode call alone, so every ratio
+against it is conservative. The pod's RTX PRO 4500 (48 vCPUs, cm2 without decode-vector) unless
+named; the local RTX 5060 Ti carries decode-vector.
+
+- **The worker spin window on a GPU-served step (pod, Llama-3.2-1B Q8_0, 16 lanes, profiler off):**
+  the scheduler's greedy step runs a team-parallel argmax a row, which wakes every worker, and each
+  then spins the 30 ms window across the whole GPU step (all sixteen at 100% in `top`); on the
+  48-vCPU VM that starves the driver's submission thread - the four-row command's head read 2.7 ms.
+  tg128@4 summed by window: 30 ms 707, 8 ms 698, 4 ms 734, 2 ms 1065, 1 ms 1058, 500 us 1053,
+  100 us 1046, 0 (park at once) 1005 - the knee is the step's own length. Shipped: 500 us while the
+  resident driver serves (`jobque_spin_gpu_us`); 1B 707 -> 1067, 3B 362 -> 538, 8B 269 -> 364
+  (llama.cpp 1228 / 607 / 275, `external`). The flat rows unchanged (the flat bench feeds synthetic
+  ids and never samples); a `--npl 4` run loads the model at four regions, each region's context a
+  quarter of the plan's, so this section's flat rows are the four-region model's - the plain
+  one-region flat rows are the ones the earlier entries carry [direction-grade - two commits].
+- **The decode attention at four rows (pod, profiler on, us a step over 16 layers):** the
+  committed pass (a workgroup a head, two keys a step behind a subgroup reduction) 380 + 70
+  combine at its rule's two splits, 327 + 102 at six, 346 + 103 at twelve - the split does not
+  move it; the shipped grouped pass (a workgroup a kv head's four q heads, the accumulators in
+  registers and the V words prefetched) 361 with the combine fused into the last piece. The
+  ruler's per-layer floor at 32 keys unsplit is 8.3 us and a split adds 4 (the release, the
+  atomic, the last piece's combine); the ruler reads 14.5 at four rows and 12.6 at one where the
+  committed pass's profile read 28 and 8.5 - so the four-row form gains and the one-row form pays
+  ~4 us a layer, which the transfer-queue logits repay several times over. The score FMAs, the
+  softmax reductions, the K loads and the V loads each price ~2 us of an 18.5 us unsplit layer on
+  the 5060 Ti, the finish 4: no single cost dominates, the chain of them does
+  [direction-grade - two commits].
+- **The logits' trip to host memory (the copy ruler, cached host memory):** the pod's compute-queue
+  copy 4.30 GB/s at 512 KB, 2 MB, 8 MB and 32 MB alike (0.95 us a 4 KB page); the transfer queue
+  11.2 / 19.4 / 24.7 / 26.8 GB/s including its submit and wait (108 us for the four-row plane
+  against 487). The 5060 Ti: 6.3 / 5.7 / 5.6 / 5.5 against 5.1 / 9.8 / 12.7 / 13.8. An uncached
+  host target leaves the copy at 471 us and slows the host's read to 7.8 ms; the classifier
+  writing straight into host memory costs 26.7 ms. Shipped: the transfer-queue copy behind a
+  compute -> transfer timeline. Pod, 1B, profiler on: the four-row step 3761 -> 3371 us, tg128@4
+  1019 -> 1136, tg128 426 -> 451 [direction-grade - two commits].
+- **The scoreboard after the three (pod, profiler off, tg128@4 summed, ours cm2 / ours KHR /
+  llama.cpp, the llama.cpp figure `external`; then tg128 ours / theirs, theirs `external`):**
+  Llama-3.2-1B Q8_0 1207 / 1206 / 1217 (0.99), flat 464 / 404; Llama-3.2-3B Q8_0 580 / 579 / 605
+  (0.96), flat 194 / 184; Llama-3.1-8B Q4_K_M 379 / 379 / 361 (1.05), flat 134 / 132. The RTX
+  5060 Ti the same session (cm2 with decode-vector, `-c 4096` on both sides): 1B 724 / 744 / 738
+  (0.98 / 1.01), flat 258 / 242; 3B 351 / 352 / 351 (1.00), flat 107 / 104; 8B 250 / 250 / 209
+  (1.20), flat 78 / 77. The 1B's four-row step under the profiler: GPU 2994 us (qkv 231, rope 65,
+  attn 361, wo 210, gate 486, up 457, down 588, cls 332, the norm and requant sites 250), host 375
+  (the logits' landing 285, the submit 9); llama.cpp's step 3.26 ms wall with 2.82 of kernels
+  (`external`, its logger's rows): its `MUL_MAT_VEC` GEMVs 655 GB/s (`external`) to our
+  `Q8GemvNT`'s 540-600 on the long-K down plane, its `FLASH_ATTN_EXT` 251 (`external`) to our
+  `DaAttnT`'s 361 [direction-grade - two processes].
+- **The nb-row planes' footprint, the decision `RD_NB_MAX = 8` rests on:** at nb rows every
+  per-token device plane (x, xb, xq, xs, kv, q, attn, aq, as, gate, up, ffnout, xb2, cos, logits)
+  is nb times its one-row size, and the partials plane is nb times. Llama-3.2-1B (dim 2048, hidden
+  8192, qd 2048, kvd 512, vocab 128256, 16 layers of 32 heads at head 64), one row: x, xb, xb2 and
+  ffnout 4 x 2048 x 4 B = 32 KB; xq 2048 B and xs 64 x 4 B; kv (2048 + 2 x 512) x 4 = 12 KB; q 8 KB;
+  attn 8 KB; aq 2048 B and as 256 B; gate and up 32 KB each; cos one rope table row, 2 x 32 x 4 =
+  256 B; logits 128256 x 4 = 513 KB; the partials 32 heads x 1 split (the pod) x 66 x 4 B = 8.4 KB
+  plus the counters - 0.65 MB a row, the logits four fifths of it: 0.65 MB at nb 1, 2.6 MB at nb 4,
+  5.2 MB at nb 8, against a weight pass the rows share, which streams the whole model once a step
+  whatever nb. The mirror's share: `moe_gpu_binding_cap` takes `RDEC_MIR_SLACK` x 4 x regions bytes
+  off the mirror's binding range (a fragment's slack rows past each region's last plane), and the
+  context is negotiated inside what is left; the per-row planes cost no context. Decision: taken -
+  the planes are megabytes against a weight pass shared across the rows, so the row cap is the
+  command's, not memory's.
+
+### From the Metal batched-decode arc (2026-09-20)
+
+Instruments: `daslang -jit benchmarks/lcpp_bench.das --npl 4 --ngl 99 -r 5 --ref <llama-bench>`
+on the M5 Max (the four-stream row host-cached through the scheduler and the Metal batch driver,
+kv f16, `DAS_TUNE_POLICY` unset - the tuned tier - with the box's fresh rig sidecar pinned through
+`DAS_TUNE_MANIFEST=performance/m5.tune.json`, the box idle - the iOS Simulator and Parsec off, a
+90 s settle between cells); the flat reference rows are the pinned `llama-bench` under
+`lcpp_bench`'s `--ref` spawn (`-m <gguf> -ngl 99 -t 18 -p 512 -n 128 -r 5 -o json`) and the batched
+reference row is `llama-batched-bench` beside it at `-ngl 99 -t 18 -c 4096 -b 2048 -ub 512
+-npp 512 -ntg 128 -npl 4 -fa on`, five runs folded. The `tg128@4` row is the summed served rate
+over the scheduler step whole, the reference times its decode call alone, so every ratio reads
+conservative for ours; every row here is a `-jit` script reading against a reference in another
+process, so every bullet is [direction-grade - two processes] unless it says one process.
+
+- **The scoreboard (ours / llama.cpp, tg128@4 summed; then flat tg128 ours / theirs), all Q8_0
+  [direction-grade - two processes]:**
+  Llama-3.2-1B 944 ± 2 / 1031 ± 55 (0.92), flat 323 / 317; Llama-3.2-3B 430 ± 18 / 430 ± 30 (1.00),
+  flat 139 / 134; Llama-3.1-8B 208 ± 2 / 199 ± 10 (1.04), flat 67 / 64; gemma-4-E2B 441 ± 15 /
+  465 ± 19 (0.95), flat 160 / 136 - the E2B row measured with `-p 0`: behind five pp512 reps
+  in the same process it read 389 ± 23 (0.84), a heat shadow the 1B does not cast (944 either
+  way), so the batched row of a small hot model is read without a prefill row in front of it or
+  after a settle. The 3B row reads a cv past 3% and stands as direction-grade until a re-run; the
+  reference's E2B batched row moved between 234 and 465 across the day's runs, so that ratio's
+  denominator is unsettled [direction-grade - two processes].
+- **The E-series batch arm (gemma-4-E2B Q8):** per-row steps read ~90 tok/s summed at four streams
+  (each stream a weight pass a token); the batched step with the PLE rows form, the Q-only shared-KV
+  rows and the two-width panels reads 389 - the same step's flat row unchanged at 152 [direction-grade].
+- **The deltanet batch arm (Qwen3.5-0.8B Q8, the recurrent rows form - projections as rows GEMVs,
+  the conv, history, norm, scan and gate one dispatch a row against that session's mirror):**
+  tg128@4 982.6 ± 21.3 against llama.cpp's 795.7 ± 7.2 (1.23); the flat tg128 402.1 ± 1.1 on the
+  arm's tree against 401.9 ± 1.0 on the tree before it - the row index the five kernels gained
+  costs the single row nothing. Per-row dispatch stands at ~360 small dispatches a four-row step
+  on this 24-layer hybrid and still reads 2.4x the flat row; the state arena that folds them into
+  one dispatch a stage is `followup_metal.md` item 22 [direction-grade - two processes].
+- **The 1B's four-row step, attributed (the knockout rail `set_metal_decode_skip` under the board's
+  own rep, one process, heat drifting 937 -> 865 across the ladder):** full 4267 us a step; the
+  weight sites out 1952 (~2.3 ms of weights, 1.24 GB at ~540 GB/s - the memory roof); attention out
+  3438 (~830 us, 52 us a layer, five times its byte roof); elementwise out 4134; the qkv sites out
+  4076. The stage report (`--prof` after the batched row): GPU 3807, encode 156, handoff 70, readback
+  34, setup 22 us a step. The worker spin window (30 ms against 500 us) moves nothing on this box:
+  942.8 against 942.0 [direction-grade - one process].
+- **The split single-pass attention serves a head of 64 (the 1B's) on the f16/f32 mirrors, where the
+  batch took the chunked per-(row, head) pair [direction-grade - two commits, two processes for the
+  board numbers; the forms raced interleaved in ONE process below]:** a lane owns one quad of the head, the lanes past a
+  narrow head re-read a valid quad with a zero query and never store, the combine merges four subgroups
+  at 128 threads whatever the head. Llama-3.2-1B Q8 tg128@4 942 -> 1024 ± 10 against llama.cpp's
+  1026 (0.92 -> 1.00); the flat tg128 unchanged at 324; the head-128 kernel cells bit-exact before
+  and after; the batch parity arm's f16 and f32 rows within their bars on the new form. The q8_0 and
+  tq4 mirrors keep the chunked pair at head 64 (the quant twin's lane mapping is its own). The
+  two forms raced interleaved in one process at the served shape (`set_metal_attn_d` flipped
+  between reps of the four-stream row on the 1B, five pairs, the first pair the warm-up): the
+  split form 815-951 against the chunked pair 699-858 tok/s summed, the split form ahead in every
+  pair after the first (rep 1: 950.7 against 857.7; rep 3: 920.8 against 699.1); the reps drift
+  past a 3% cv in the un-settled process, so the ranking is settled and the margin is not
+  [direction-grade - one process, cv past 3%].
+- **The NextN carriers' batched rows, plain and self-speculative (three reps, `-p 0`):** Qwen3.5-0.8B-MTP
+  Q8_0 plain tg128@4 977 ± 4 against llama.cpp's 803 ± 4 (1.22), flat 402 / 303; Qwen3.6-27B-MTP
+  Q4_K_M plain 56.3 ± 0.3 against 45.9 ± 2.1 (1.23), flat 27.6 / 25.3 - the batched step lands a
+  NextN model's logits on the GPU like any other's now (the gate that sent them to the CPU classifier
+  is gone) and carries each row's post-norm hidden as its stream's speculative carry. The
+  `--npl-mtp` arm - every stream drafting on its own chain, the four streams' eight verify rows in ONE
+  pass - reads 720 ± 11 on the 0.8B and 50.3 ± 3.6 (cv 7%) on the 27B: below the plain row on both,
+  on the bench's synthetic ids, where the drafts are accepted as often as noise and the round pays
+  four draft passes (each a NextN layer plus the 248k-row classifier) and a double-width verify for
+  them. The arm proves the joint verify at four streams; its served rate is the ruler's question
+  (sec.2.45 of the measurement doc) and the batched draft pass - the four drafts as rows of one
+  dispatch - is the lever the ledger row names [direction-grade - synthetic ids, two processes].
+- **The sidecar reaches the batched row:** the 1B's tg128@4 read 840 under the shipped class profile
+  (`DASLLAMA_ALLOW_UNTUNED=1`) and 944 under the box's fresh mint in the same tree - the runtime knobs
+  and the Metal crowns are part of the step, not only its provenance [direction-grade - two processes].
+- **A loaded box voids the batched row first [direction-grade - two processes, a loaded box]:** with an iOS Simulator rendering (two WebContent
+  processes at 98% and 48%, SimMetalHost on the GPU, load 12) the 1B batched row read 466 ± 277 and
+  the reference's own flat tg128 fell from 317 to 200 - the GPU queue is shared with the simulator's
+  Metal clients, and the step's CPU half (sampler, encode, spin) loses its performance cores. The
+  amortized weight stream leaves dispatch latency and CPU work as what is left per step, so four rows
+  feel the load where one row hides it.
 
 ### From the M4 Metal pass (2026-09-13)
 

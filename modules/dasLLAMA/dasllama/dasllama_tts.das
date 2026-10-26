@@ -40,6 +40,7 @@ struct TtsModel {
     tagger : PosTagger                      //! ``tts_postag.bin``: the tokenizer and part-of-speech tagger
     pocket : PocketModel = PocketModel()    //! the Pocket TTS family's model, when the GGUF is one; it reads text, not phonemes
     pocket_scratch : PocketScratch = PocketScratch()   //! its activation carrier
+    chunk_chars : int = TTS_CHUNK_CHARS     //! the longest chunk a synthesis speaks, in codepoints (``tts_set_chunk_chars``)
 }
 
 // Stated rather than inferred: the shared carrier holds borrowed planes, and a generated
@@ -52,6 +53,34 @@ def finalize(var m : TtsModel) {
     delete m.tagger
     delete m.pocket
     delete m.pocket_scratch
+}
+
+[arch(at = "../ARCHITECTURE_TTS_MEMORY.md#tts-idle-release")]
+def tts_release_scratch(var m : TtsModel) {
+    //! Free the activation scratch a synthesis or a clone left behind - the carrier of either family (a
+    //! StyleTTS2 carrier whose noise the parity rail captured stays) and the block home's scratch globals;
+    //! the next run grows them back for a few milliseconds. For a platform where idle memory matters, called when nothing is queued.
+    if (!m.scratch.noise.captured) {
+        delete m.scratch
+    }
+    pocket_release_scratch(m.pocket_scratch)   // the block home's scratch globals go with it, whichever family grew them
+}
+
+[arch(at = "../ARCHITECTURE_TTS_MEMORY.md#tts-idle-release")]
+def tts_set_chunk_chars(var m : TtsModel; chars : int) {
+    //! Cap the chunk a synthesis speaks at ``chars`` codepoints (default ``TTS_CHUNK_CHARS``; under one is
+    //! refused): the peak memory a say holds is the largest chunk's, so a memory-tight platform lowers it and
+    //! the same text speaks in more, shorter pieces, each its own synthesis. Pocket's chunks take no cap.
+    if (chars < 1) {
+        panic("dasLLAMA tts: tts_set_chunk_chars({chars}) - the chunk cap takes at least one codepoint")
+    }
+    m.chunk_chars = chars
+    if (m.kind == TtsKind.pocket) {
+        to_log(LOG_INFO, "dasLLAMA tts: tts_set_chunk_chars({chars}): a Pocket model chunks by its tokenizer's budget - the cap does not reach it\n")
+        return
+    }
+    let which = chars == TTS_CHUNK_CHARS ? "the default" : "off the default {TTS_CHUNK_CHARS}"
+    to_log(LOG_INFO, "dasLLAMA tts: tts_set_chunk_chars: a synthesis speaks {chars} codepoints a chunk - {which}\n")
 }
 
 def load_tts_model(path : string) : TtsModel {
@@ -186,6 +215,66 @@ def tts_register_voice(var m : TtsModel; name : string; pcm : array<float>; samp
         panic("dasLLAMA tts: a voice clip at {sample_rate} Hz; this model takes {m.pocket.sample_rate} Hz")
     }
     pocket_register_voice(m.pocket, name, pcm, m.pocket_scratch)
+}
+
+struct TtsVoicePrompt {
+    //! Portable Pocket codec latents. Prepare with an encoder-bearing model; register with
+    //! a compatible model, including a compact file without the encoder. Serialization is caller-owned.
+    version : int = 1                         //! Serialized prompt format version.
+    family : string = "pocket"                //! Model family tag.
+    language : string                        //! Language expected by the receiving model.
+    sample_rate : int                        //! Reference audio sample rate in hertz.
+    latent_dim : int64                       //! Number of codec latent values per frame.
+    frame_samples : int64                    //! Number of PCM samples represented by each frame.
+    latents : array<float>                   //! Flattened codec latent frames.
+}
+
+def tts_voice_prompt_valid(m : TtsModel; prompt : TtsVoicePrompt) : bool {
+    //! Validate bounded finite latent frames and the model's language/codec geometry before registration.
+    if (m.kind != TtsKind.pocket || prompt.version != 1 || prompt.family != "pocket" || prompt.language != m.pocket.language || prompt.sample_rate != m.pocket.sample_rate || prompt.sample_rate <= 0 || prompt.latent_dim != m.pocket.latent_dim || prompt.latent_dim <= 0l || prompt.frame_samples != m.pocket.frame_samples || prompt.frame_samples <= 0l || empty(prompt.latents)) {
+        return false
+    }
+    let frames = long_length(prompt.latents) / prompt.latent_dim
+    if (long_length(prompt.latents) % prompt.latent_dim != 0l || frames > (POCKET_MAX_VOICE_SECONDS * int64(prompt.sample_rate) + prompt.frame_samples - 1l) / prompt.frame_samples) {
+        return false
+    }
+    for (v in prompt.latents) {
+        if (!(v >= -1000000.0 && v <= 1000000.0)) { return false }
+    }
+    return true
+}
+
+def tts_prepare_voice_prompt(var m : TtsModel; pcm : array<float>; sample_rate : int) : TtsVoicePrompt {
+    //! Encode a reference once for shipping as a voice prompt. The original model revision's
+    //! language/codec must match the receiving model; incompatible data is rejected on registration.
+    if (m.kind != TtsKind.pocket || sample_rate != m.pocket.sample_rate || empty(pcm) || long_length(pcm) > POCKET_MAX_VOICE_SECONDS * int64(sample_rate)) {
+        panic("dasLLAMA tts: a voice prompt requires a compatible encoder and a nonempty reference of at most 60 seconds")
+    }
+    var prompt = TtsVoicePrompt(language = m.pocket.language, sample_rate = sample_rate, latent_dim = m.pocket.latent_dim, frame_samples = m.pocket.frame_samples)
+    pocket_encode_latents(m.pocket, pcm, m.pocket_scratch, prompt.latents)
+    return <- prompt
+}
+
+def tts_register_voice_prompt(var m : TtsModel; name : string; prompt : TtsVoicePrompt) : bool {
+    //! Add or replace a named prepared voice without a codec encoder. Failure preserves the roster;
+    //! the prompt is copied and its backbone state is built lazily at the first synthesis.
+    if (empty(name) || !tts_voice_prompt_valid(m, prompt)) { return false }
+    var latents <- clone(prompt.latents)
+    if (!pocket_has_voice(m.pocket, name)) { m.pocket.voice_names |> push(clone_string(name)) }
+    if (key_exists(m.pocket.voice_states, name)) {
+        m.pocket.voice_states |> get(name) $(var old) { delete old }
+        m.pocket.voice_states |> erase(name)
+    }
+    if (key_exists(m.pocket.voices, name)) {
+        m.pocket.voices |> get(name) $(var old) { delete old }
+        m.pocket.voices |> erase(name)
+    }
+    if (key_exists(m.pocket.voice_latents, name)) {
+        m.pocket.voice_latents |> get(name) $(var old) { delete old }
+        m.pocket.voice_latents |> erase(name)
+    }
+    m.pocket.voice_latents[name] <- latents
+    return true
 }
 
 def tts_voice_lang(m : TtsModel; voice : string) : string {
@@ -377,7 +466,7 @@ def tts_chunks(m : TtsModel; norm : string) : array<string> {
     if (m.kind == TtsKind.pocket) {
         return <- pocket_chunks(m.pocket, norm)
     }
-    return <- tts_chunks(norm, TTS_CHUNK_CHARS, m.kind == TtsKind.kitten)
+    return <- tts_chunks(norm, m.chunk_chars, m.kind == TtsKind.kitten)
 }
 
 // ===== synthesis =====

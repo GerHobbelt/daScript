@@ -1272,6 +1272,9 @@ namespace das
             };
             uint32_t        moduleFlags = 0;
         };
+        // src/ast/ARCHITECTURE.md#module-cache-read; after the das-visible fields
+        bool registersAtCompile = false;
+        void noteRegistrationAtCompile () { if ( !macroContext ) registersAtCompile = true; }
     private:
         Module * next = nullptr;
         unique_ptr<FileInfo>    ownFileInfo;
@@ -1383,10 +1386,14 @@ namespace das
         Module* getThisModule() const { return thisModule; }
         void reset();
         void renameModule ( Module * module, const string & newName );
+        bool hasFunctionOrGenericNamed ( const string & name ) const;
     protected:
         vector<Module *>                modules;
         safebox_map<Module *>           moduleLookupByHash;
         Module *                        thisModule = nullptr;
+        mutable das_hash_map<uint64_t, bool>    functionNameCache;
+        mutable uint64_t                functionNameCacheGeneration = 0;
+        mutable size_t                  functionNameCacheModuleCount = 0;
     };
 
     struct DAS_API ModuleGroupUserData {
@@ -1602,6 +1609,7 @@ namespace das
         bool optimizationDeadStores(int32_t round);
         bool optimizationCSE(int32_t round);
         void buildAccessFlags(TextWriter & logs);
+        void astChanged() { accessFlagsValid = false; }
         bool verifyAndFoldContracts();
         bool inScopePodAnalysis(TextWriter & logs);
         void markSymbolUse(bool builtInSym, bool forceAll, bool initThis, Module * macroModule, TextWriter * logs = nullptr);
@@ -1731,6 +1739,7 @@ namespace das
         // of serving what a compile folded from the old value.
         vector<tuple<string,int64_t,uint64_t>> moduleCacheDependencies;
         UpdateAliasMapCallback      updateAliasMapCallback;
+        bool                        accessFlagsValid = false;
     };
 
     // the shared capture/validate stat for Program::moduleCacheDependencies: size -1 + hash 0
@@ -1838,6 +1847,7 @@ namespace das
         ProgramPtr      g_Program;
         bool            g_isInAot = false;
         Module *        modules = nullptr;
+        uint64_t        functionNameGeneration = 0;    // bumped when any module gains a new function or generic name
         int             das_def_tab_size = 4;
         bool            g_resolve_annotations = true;
         TextWriter *    g_compilerLog = nullptr;

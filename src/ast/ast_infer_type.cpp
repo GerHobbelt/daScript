@@ -4825,6 +4825,19 @@ namespace das {
                   expr->at, CompilationError::invalid_continue);
         return Visitor::visit(expr);
     }
+    struct MarkNamedVariablesUsed : Visitor {
+        Function * func = nullptr;
+        vector<VariablePtr> * local = nullptr;
+        virtual void preVisit(ExprVar * expr) override {
+            Visitor::preVisit(expr);
+            for (auto & arg : func->arguments) {
+                if (arg->name == expr->name) arg->marked_used = true;
+            }
+            for (auto & var : *local) {
+                if (var->name == expr->name) var->marked_used = true;
+            }
+        }
+    };
     bool InferTypes::canVisitIfSubexpr(ExprIfThenElse *expr) {
         if (expr->isStatic) {
             // static_if prevents normal resolve flow
@@ -4882,6 +4895,15 @@ namespace das {
             if (auto constCond = getConstExpr(expr->cond)) {
                 reportAstChanged();
                 auto condR = static_cast<ExprConstBool*>(constCond)->getValue();
+                if (expr->isStatic && func) {
+                    auto & dropped = condR ? expr->if_false : expr->if_true;
+                    if (dropped) {
+                        MarkNamedVariablesUsed mark;
+                        mark.func = func;
+                        mark.local = &local;
+                        dropped->visit(mark);
+                    }
+                }
                 if (condR) {
                     return expr->if_true;
                 } else {
@@ -6501,6 +6523,7 @@ namespace das {
     }
 
     void inferTypesDirty(Program * program, TextWriter &logs, bool verbose) {
+        program->astChanged();
         int pass = 0;
         int32_t maxInferPasses = program->options.getIntOption("max_infer_passes", program->policies.max_infer_passes);
         bool logInferPasses = program->options.getBoolOption("log_infer_passes", false);
@@ -6508,10 +6531,9 @@ namespace das {
             logs << "INITIAL CODE:\n"
                  << *program;
         }
-        // Per-pass collect+swap: infer mints a lot of throwaway TypeDecls/Expressions. When a
-        // pass grows the working root enough, collect the live tree into a fresh root and swap
-        // it in (O(1)); the old root's dtor sweeps that pass's garbage. Fire when growth since
-        // the last collect crosses a node threshold (~2 MB) OR a fraction of the live set.
+        // Per-pass collect+swap fires when growth since the last collect crosses a fraction of
+        // the live set, with a node floor (~2 MB) for small modules: a collect walks the whole
+        // live set, so it must reclaim a matching share.
         bool gcInferCollect = program->options.getBoolOption("gc_infer_collect", program->policies.gc_infer_collect);
         int32_t gcInferNodes = program->options.getIntOption("gc_infer_collect_nodes", program->policies.gc_infer_collect_nodes);
         int32_t gcInferPct = program->options.getIntOption("gc_infer_collect_pct", program->policies.gc_infer_collect_pct);
@@ -6534,8 +6556,8 @@ namespace das {
             if ( gcInferCollect && pass > 0 ) {
                 uint64_t curCount = gc_root::gc_get_active_root()->gc_count;
                 uint64_t grown = curCount >= gcLastCount ? curCount - gcLastCount : 0;
-                bool fire = grown >= uint64_t(gcInferNodes)
-                         || ( gcLastCount && grown * 100 >= gcLastCount * uint64_t(gcInferPct) );
+                uint64_t threshold = das::max(uint64_t(gcInferNodes), gcLastCount * uint64_t(gcInferPct) / 100);
+                bool fire = grown >= threshold;
                 if ( gcInferLog ) {
                     logs << "[gc-infer] " << program->thisModule->name << " pass " << pass
                          << " live=" << curCount << " grown=" << grown

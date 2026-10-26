@@ -338,8 +338,9 @@ def document_module_dasllama(_root : string) {
         group_by_regex("Chat", mod, %regex~(create_chat|create_chat_renderer|add_user|add_user_audio|add_user_image|add_user_image_rows|add_assistant|render_turn|render_turn_image|render_turn_audio|render_assistant|render_close|respond|set_thinking)$%%),
         group_by_regex("Tool calling", mod, %regex~(set_tools|add_tool_results|render_assistant_calls|parse_calls)$%%),
         group_by_regex("Reasoning (thinking models)", mod, %regex~(split_reasoning|make_think_stream|think_feed|think_finish|think_drain|effective_stop_ids)$%%),
-        group_by_regex("Operations: prepared images and dispatch", mod, %regex~(dlim_inventory|dlim_clean|set_dispatch_worker_limit|get_dispatch_worker_limit|set_jobque_spin_us|get_jobque_spin_us|set_single_thread|get_single_thread|select_matmul_backend_for_load|kernel_backend_available)$%%),
-        group_by_regex("Operations: GPU tier and model slots", mod, %regex~(gpu_tier_status|set_gpu_tier_want|moe_gpu_tier_arm|moe_gpu_weight_budget|gpu_model_marks_init|gpu_slot_capture|gpu_slot_rearm|moe_gpu_model_marks_save|moe_gpu_model_marks_restore|moe_gpu_hydrate_session|moe_gpu_drop_model|set_resident_prefill_allowed)$%%)
+        group_by_regex("Operations: prepared images and dispatch", mod, %regex~(dlim_inventory|dlim_clean|set_dispatch_worker_limit|get_dispatch_worker_limit|set_jobque_spin_us|get_jobque_spin_us|set_jobque_spin_gpu_us|get_jobque_spin_gpu_us|get_jobque_spin_in_force|set_single_thread|get_single_thread|select_matmul_backend_for_load|kernel_backend_available)$%%),
+        group_by_regex("Operations: GPU tier and model slots", mod, %regex~(gpu_tier_status|set_gpu_tier_want|moe_gpu_tier_arm|moe_gpu_weight_budget|gpu_model_marks_init|gpu_slot_capture|gpu_slot_rearm|moe_gpu_model_marks_save|moe_gpu_model_marks_restore|moe_gpu_hydrate_session|moe_gpu_drop_model|set_resident_prefill_allowed)$%%),
+        group_by_regex("Operations: serving from the device", mod, %regex~(create_device_session|gpu_device_sessions|gpu_device_prefill_continues|gpu_device_prefill_window|gpu_device_kv_park|gpu_device_kv_adopt|gpu_device_session_ctx|gpu_device_session_dtype|set_gpu_resident_regions|set_gpu_ctx_max|gpu_resident_decline|gpu_cpu_passes)$%%)
     )
     var hook = DocsHook()
     hook.afterEnums <- @(var f : FILE const?; _was_enums : bool) {
@@ -409,9 +410,9 @@ def document_module_dasllama_tts(_root : string) {
     var mod = [find_module("dasllama_tts"), find_module("dasllama_tts_types")]
     var groups <- array<DocGroup>(
         group_by_regex("Loading and capabilities", mod, %regex~(load_tts_model|g2p_pack_path|caps|tts_voice_lang|tts_needs_packs|tts_has_phonemes|finalize)$%%),
-        group_by_regex("Voices", mod, %regex~(tts_register_voice)$%%),
+        group_by_regex("Voices", mod, %regex~(tts_register_voice|tts_prepare_voice_prompt|tts_voice_prompt_valid|tts_register_voice_prompt)$%%),
         group_by_regex("Text front end", mod, %regex~(tts_normalize|tts_phonemize|tts_chunks)$%%),
-        group_by_regex("Synthesis", mod, %regex~(synthesize|synthesize_stream)$%%),
+        group_by_regex("Synthesis", mod, %regex~(synthesize|synthesize_stream|tts_release_scratch|tts_set_chunk_chars)$%%),
         group_by_regex("The served lane", mod, %regex~(set_tts_q8|reset_tts_q8|tts_serves_q8)$%%),
         group_by_regex("Timings", mod, %regex~(rtf|timings_line)$%%)
     )
@@ -512,7 +513,7 @@ def document_module_ast_boost(_root : string) {
     var groups <- array<DocGroup>(
         group_by_regex("Containers", mod, %regex~(emplace_new)%%),
         group_by_regex("Textual descriptions of the objects", mod, %regex~(describe.*|debug_expression)%%),
-        group_by_regex("Queries", mod, %regex~(is.*|find.*|get.*)%%),
+        group_by_regex("Queries", mod, %regex~(is.*|find.*|get.*|peel_distinct|table_key_storage_base_type)%%),
         group_by_regex("Annotations", mod, %regex~(append.*|add.*)%%),
         group_by_regex("Expression generation", mod, %regex~(override_method|panic_expr_as|make_static_assert_false|convert_to_expression)%%),
         group_by_regex("Visitors", mod, %regex~(visit.*)%%),
@@ -679,7 +680,7 @@ def document_module_jobque_boost(_root : string) {
         group_by_regex("Invocations", mod, %regex~(new_job|new_thread)$%%),
         group_by_regex("Iteration", mod, %regex~(for_each|each|each_clone|for_each_clone)$%%),
         group_by_regex("Passing data", mod, %regex~(push|push_clone|push_batch|push_batch_clone|push_archive)$%%),
-        group_by_regex("Receiving data", mod, %regex~(gather|gather_ex|gather_and_forward|peek|pop|pop_one|pop_and_clone_one|try_pop|try_pop_clone|pop_with_timeout|pop_with_timeout_clone|pop_archive|try_pop_archive|gather_archive)$%%),
+        group_by_regex("Receiving data", mod, %regex~(gather|gather_ex|gather_and_forward|peek|pop|pop_one|pop_and_clone_one|try_pop|try_pop_clone|pop_with_timeout|pop_with_timeout_clone|pop_archive|try_pop_archive|pop_archive_with_timeout|gather_archive)$%%),
         group_by_regex("Synchronization", mod, %regex~(with_wait_group|done)$%%),
         group_by_regex("Parallel execution", mod, %regex~(_parallel_for|parallel_for|team_parallel_for|team_parallel_for_indexed|team_parallel_stages|_parallel_for_each|parallel_for_each|_parallel_map|parallel_map)$%%),
         group_by_regex("LockBox operations", mod, %regex~(set|get|update|clear|fill|grab)$%%),
@@ -1943,7 +1944,7 @@ def document_module_gltf_processed(_root : string) {
     var mod = find_module("gltf_processed")
     var groups <- array<DocGroup>(
         group_by_regex("Processing types", mod, %regex~.*(ProcessingProfile|ProcessedPrimitive|ProcessedMesh|ProcessedAsset|ProcessedCatalogEntry|ProcessedCatalog|ProcessedManifest)$%%),
-        group_by_regex("Validation and persistence", mod, %regex~.*(processed_valid|save_processed|load_processed|load_and_process_gltf)$%%),
+        group_by_regex("Validation and persistence", mod, %regex~.*(processed_valid|save_processed|load_processed|load_and_process_gltf|prepare_processed_catalog)$%%),
         group_by_regex("Geometry processing", mod, %regex~.*(processed_stride|processed_vertex_bytes|processed_indices|process_primitive|process_gltf|unpack_processed_geometry)$%%)
     )
     document("Backend-neutral glTF geometry and texture preprocessing, validation, and persistence", mod, "gltf_processed.rst", groups)

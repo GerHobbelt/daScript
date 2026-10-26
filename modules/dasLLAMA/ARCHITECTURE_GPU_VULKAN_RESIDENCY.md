@@ -1,8 +1,9 @@
 # dasLLAMA Architecture - the Vulkan tier's model residency
 
 Companion to `ARCHITECTURE_GPU_VULKAN.md`; section numbers are `ARCHITECTURE.md`'s. This
-document carries sections 2.2n-2.2o: the residency plan that sizes a whole model before a byte
-uploads, and the marks swap that lets one GPU slot serve many models. The prefill chain and byte
+document carries sections 2.2n-2.2o, 2.2an and 2.2ao: the residency plan that sizes a whole model
+before a byte uploads, the marks swap that lets one GPU slot serve many models, the token command's
+logits landing on the transfer queue, and the N-row token command a batched step's rows go through. The prefill chain and byte
 stores that run once a model is resident are `ARCHITECTURE_GPU_VULKAN.md` sections 2.2j, 2.2p,
 2.2ab, 2.2ac and 2.2ad, and the cooperative-matrix GEMM tiles under them are
 `ARCHITECTURE_GPU_VULKAN_GEMM.md` sections 2.2k-2.2m, 2.2q and 2.2ae; the per-op tier's decode era is
@@ -27,6 +28,57 @@ attention layers alone; read from layer 0 instead - recurrent on Qwen3.5 - the s
 the cap is skipped, the plan sizes a mirror the device prepare refuses, and the whole driver
 declines to the per-op rails with the dense FFN on the CPU. The prepare keeps its own guard for
 direct callers.
+
+**The mirror is `regions` consecutive copies of the per-layer layout, and a region is one
+session's whole history.** A host asks for the count before the load (`set_gpu_resident_regions`, the facade's verb,
+one by default; a server's stream count), the plan sizes every region's K/V at `seq_cap`, and
+the binding cap divides by the count, since both sides stay one buffer and one binding. A region
+is an element offset (`rd_mir_base`: the layer's base plus the selected region's stride), folded
+on the host into the `layerbase` push constant of every kernel that stores or reads a mirror row
+and into the sync, readback and hydrate offsets, so no kernel knows regions exist. The push
+constant is baked as the token command records, so the driver records one command per region
+(and one unsplit twin) and `vk_rdec_select_region` names the region the next call resolves
+against; the window chain encodes per call and reads the same accessor. The resident module owns
+who sits where (`RdecRegion`: rows, the owning claim's generation, a last-bind tick): a session
+binds its own region while its claim stands, else the least recently used one, which its next
+claim takes. Two sessions in two regions step between each other, or in one batched step, with no
+K/V crossing the bus - `tests/test_gpu_resident_regions.das` holds each bit for bit to the
+session alone. A session past the region count takes another's region and brings its history up
+from the host, as every session did on the single mirror. An owner whose region another session
+took is served from the host or not at all: where its rows never came down, its next prefill or
+decode panics rather than read another session's history. A batched step over a
+per-layer-embedding model gives each row its own side input (`rdec_batch_ple_row`): the table
+row gathered on device where the driver holds the projection, else that row of the pre-step
+`eval_batch` already ran.
+
+**A device-home session's region is its only copy.** `create_device_session` makes a session
+with scratch and no host cache (`Session.device_kv`), so nothing is allocated per request and
+nothing crosses the bus per token: the overrides bring no history up for it, read no row back
+after a batched step and hydrate nothing down. The CPU rails cannot take its call, so a pass
+that reaches one panics with the pass's reason (`rdec_device_home_guard`) - the prefill pin
+is the one gate it walks past, because the pin guards host-cached sessions whose device-only
+rows another session's claim would strand. Its region is pinned while it lives
+(`RdecRegion.pinned`): no other session is handed it, and a host-cached outsider that finds
+every region pinned passes as `busy`. A finished session parks (`gpu_device_kv_park`): the
+pin drops, and the claim it answers keeps naming the rows until another session takes the
+region; `gpu_device_kv_adopt` hands the first `npos` of them to a fresh session under a claim
+of its own, the next prefill rewriting whatever lay past. `gpu_device_sessions` answers how
+many a host may hold - the region count - and `gpu_device_prefill_continues` whether a
+session's prefill may start past zero: not on a recurrent model, whose window chain starts the
+deltanet state from zero.
+
+**The scheduler's device mode is that contract over streams.** `set_device_kv` switches an
+idle `Scheduler` (one batched step takes one kind of session): admitted streams are
+device-home, their prefill quantum is at least the device's window (`gpu_device_prefill_window`),
+a media request is refused at `submit` (a device-home session serves no media span),
+and a reaped stream parks its claim under the token list its rows hold - one parked claim a
+stream slot - so the next request adopts the longest opening it shares, short of its last
+token: a conversation's next turn prefills its new suffix alone, with no copy. A recurrent
+model's stream parks nothing: its prompt prefills whole in one quantum, from zero, and adopts nothing. `dasllama-server` turns the mode on
+per slot before each step (`sync_slot_device_kv`) while the slot is served whole from the device,
+has a region per stream and no media tower or self-speculation, and sizes the slot's context
+to a region's. `tests/_resident_regions.das` holds the sessions, the pin, the park and the
+mode against host-cached twins on the same device, on a qwen2 and on the E-series carrier.
 
 **The auto arm sizes against the room the OS reports on the adapter, where the OS reports
 it.** Vulkan cannot see the desktop: `VK_EXT_memory_budget` reads a flat 16024 MB on the 16 GB
@@ -112,6 +164,10 @@ fitting plan forgoes them - they would only shrink its room - so a decline past 
 placement, a class rail) leaves the per-op rails without a streamed slot, said out loud. The
 tile family the routed block rides is the f16-fed cm2 tiles (`ARCHITECTURE_GPU_VULKAN_MOE.md`
 sec.2.2af), and `DASLLAMA_GPU_RESIDENT=0` keeps the per-op rails for any model, the A/B lever.
+The driver is attempted only when asked for (`gpu_resident_requested`): the measured-best set
+asks (`DASLLAMA_GPU=1`, or `auto_tier` on the want), and so does a want that spells its rails
+out one by one and sets `resident` - the server's serving shape, where `gpu_dn = false` must
+still turn one rail off. Rails alone, by env or by want, keep the per-op tier.
 
 ### 2.2o One GPU slot, many models: the marks swap {#gpu-slot-marks}
 
@@ -132,3 +188,69 @@ Without that drop the second model's stacks
 land beside the first's, and the offset-keyed stack lookup serves whichever model's plane
 registered that offset first: the decode attention block asserts on the geometry change, and a
 model whose geometry matches decodes the earlier model's weights.
+
+### 2.2an The token command's logits leave on the transfer queue {#logits-transfer-queue}
+
+**A token command signals the compute timeline, and its logits copy follows on the transfer
+queue.** On a box behind an IOMMU the compute queue's `vkCmdCopyBuffer` into cached host memory
+moves a page a microsecond - the RTX PRO 4500 pod reads 4.3 GB/s at every size from 512 KB to
+32 MB (`harness/vk_dma_probe.das`), so a four-row step's 2 MB logits plane cost 480 us of a 3.5 ms
+command - while the transfer family's copy engine moves the same plane at 19-27 GB/s (108 us
+with the submit and the wait; the RTX 5060 Ti reads 5.7 against 9.8). So a device with the
+transfer family armed (`RDec.log_xfer`) records the token command without the copy: the submit
+signals `g_gpu.cmp_sem`, the compute -> transfer timeline (`submit_signal`), the transfer queue
+takes a recorded copy command a row count (`rd_xlog`, `RDec.xlog_cmd`) that waits for that value
+at the transfer stage and signals the transfer timeline (`xfer_submit_after`), and the host spins
+on the transfer timeline's counter (`xfer_spin_wait`) instead of the fence - a blocking wait
+would pay the OS wake-up a step, as the fence wait's spin already knows. The logits planes are
+CONCURRENT between the two families (`make_device_buf` / `make_host_buf` at `xfer_shared`), so no
+ownership transfer sits on the path; the host orders the next step behind the copy, so the
+command's next write of the plane never races its read. `DASLLAMA_VK_XFERQ=0` leaves the device
+without a transfer family; there the command carries the copy and the fence as before
+(`rd_submit_land` / `rd_wait_land` choose) - the one in-process switch that puts the copy back
+inside the command. Pod, Llama-3.2-1B Q8_0 with the profiler on: the four-row step 3761 -> 3371
+us, tg128@4 1019 -> 1136 summed, tg128 426 -> 451. The figures in this section and the next are
+the pod's (RTX PRO 4500, `-jit`, cm2): the `DASLLAMA_GPU_PROF=1` token profile of
+`benchmarks/lcpp_bench.das` for the step times and rates, `harness/vk_dma_probe.das` for the copy
+rates; `PERF_LEDGER.md`'s 2026-09-19 section is the record.
+
+### 2.2ao The N-row token command: a batched step's rows through one weight pass {#nrow-token-command}
+
+**A batched decode step runs its rows through ONE recorded command, so a layer's weights stream
+once for the step instead of once a row.** The driver sizes every per-token plane to `RDec.nb`
+rows - `min(regions, RD_NB_MAX)`, eight at most, the N-column GEMV leaves' width - and
+`vk_rdec_token_n_rows` answers how many rows the armed model steps at once: `nb` over dense
+standard-attention layers, and none where a layer or the tail has no N-row form - a recurrent,
+MoE, per-layer-embedding or shared-KV layer, a q/k norm, a gated q, a classifier epilogue, or a
+weight format with no N-column leaf. Every set over a per-row plane binds the plane's whole `nb`
+extent; the rule guards two shapes - an ungated q row sitting inside the projection row, and a q
+binding sized to one row, which leaves every row but the first reading past its binding. The MoE
+feed planes (`moe_xq_dev` / `moe_xs_dev`) stay one row: the command declines MoE layers, and
+their sets bind one row. Every GEMV goes out as an N-column dispatch
+(`GemvArgs.ncols` activation rows one weight pass apart by `ystride`); the q8 leaf takes its
+two-output-rows-a-subgroup twin past `g_q8_n2_min_n` on an even row count, off by default
+because the pod's down GEMV read 750 us a step under the pair against 587 a row a subgroup. The
+row-parallel kernels take the rows' planes whole; the rope, the mirror store and the attention
+run at each row's own position, cached count and mirror region, which ride the shared `TokMeta`
+block a row (`mirbase` an element offset; `DaAttnArgs.rowwg` and `qrow` carry the row stride into
+the attention, `rowwg` 0 naming a one-row dispatch). The rows' heads already fill the card, so
+the attention's key split shrinks as the row count grows (`da_nsplit` over
+`da_attn_row_wgs x nrows`). A command is recorded once per row count and split form, on first
+use, and keeps its own stamp names; the one-row command's list is borrowed for the record and put
+back. A row count whose split form runs at one split still fills the split stamp slot: the
+recorder's list for that row count is the split form's. The command's N-column leaves are built
+on the first batched step; a stamp that declines on the device logs once, and the command answers
+0 rows from then on, so the row-at-a-time loop serves.
+
+**The rows' logits come home in one read of the mapped plane.** `rd_land_logits_n` copies the
+whole plane into a scratch row, then a row a copy to each session's pointer: four reads straight
+off the mapping cost the pod eight times the one (785 us a step against 92).
+
+**The engine reaches the command through the driver seam, and falls back a row at a time.**
+`install_moe_gpu_resident_batch` installs the pair (`rdec_token_n`, `rdec_token_n_rows`) beside
+the resident driver, so a tier with no batch arm answers 0 rows. `rdec_batch_rows_at_once` gathers
+the step's residuals, rope rows, positions, counts and regions, submits once, reads each
+host-cached row's K/V back and lands its logits; it returns false when a row finds no region or
+two rows share one, and the caller's row-at-a-time loop serves that step. `DASLLAMA_VK_NROW_BISECT`
+(`ENVIRONMENT.md`) drops a class of dispatch from the recorded command so a profile prices it; the
+logits are garbage under any bit.

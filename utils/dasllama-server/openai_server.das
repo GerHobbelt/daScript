@@ -61,6 +61,10 @@ struct ModelSlot {
     sched : Scheduler = Scheduler()
     opts : SlotOpts = SlotOpts()
     backend_effective : string = "cpu"   // arm outcome: cpu | gpu:rails | gpu:resident
+    gpu_regions : int64             //! K/V regions the whole-model driver armed for this slot, one per device-home stream; 0 = not that driver
+    gpu_ask_streams : int64         //! the K/V regions and the context this slot's load asked the whole-model driver for:
+    gpu_ask_ctx : int64             //! the engine keeps one process-wide ask, so a rearm restores the slot's own first
+    resident_decline : string               //! why the whole-model GPU driver does not serve this slot (its decline, with the remedy where one exists); "" when it does, or no GPU was asked for
     is_default : bool
     last_used : int64
     sw_count : int64                // gpu-switch telemetry (count / total usec)
@@ -215,10 +219,15 @@ def add_model(var m : Model; name : string; opts : SlotOpts = SlotOpts(); path :
     var slot <- ModelSlot(name = name, path = path, is_default = empty(g_slots))
     slot.model <- m
     slot.opts = opts
+    slot.gpu_ask_streams = g_gpu_ask_streams
+    slot.gpu_ask_ctx = g_gpu_ask_ctx
+    slot_clamp_ctx_to_region(slot)
     // the load's arm outcome (routing marks + resident-driver state) belongs to THIS slot:
     // capture it, so two models' offset-keyed marks never mix. Whichever slot is stepped gets
     // its set re-installed (install_slot_marks); an armed capture makes this slot the GPU owner.
+    slot.gpu_regions = gpu_device_sessions()
     slot.backend_effective = gpu_slot_capture(slot.gpu_marks)
+    slot.resident_decline = slot.backend_effective == "gpu:resident" ? "" : gpu_resident_decline()
     let was_gpu = slot.backend_effective != "cpu"
     var probe <- create_chat_renderer(slot.model, "", 1l)
     // reporting the raw template default would show the page a checked box for a family whose
@@ -257,7 +266,7 @@ def set_slot_gpu_want(name : string; want : GpuTierWant) {
         if (s.name == name) {
             s.gpu_want = want
             s.gpu_capable = (s.opts.backend != "cpu"
-                && (want.auto_tier || want.moe_layers != 0l || want.moe_stream != 0l || want.dn
+                && (want.auto_tier || want.resident || want.moe_layers != 0l || want.moe_stream != 0l || want.dn
                     || want.attn || want.dense || want.dnd || want.shexp || want.qkv || want.heat > 0l))
         }
     }
@@ -288,6 +297,25 @@ def private uninstall_slot_marks() {
 // Move the GPU tier's VRAM state to slot `si`: hydrate + drop the current owner's whole state,
 // re-arm `si` from its mmap'd image (the same walk its load ran). Serialized with stepping —
 // only called between scheduler steps.
+var private g_gpu_ask_streams = 0l
+var private g_gpu_ask_ctx = 0l
+
+//! Ask the whole-model GPU driver for a K/V region per stream and at most `ctx` positions in one (0 = the model's own),
+//! for the load or the rearm that follows. `add_model` stamps the ask on its slot.
+def gpu_residency_ask(streams, ctx : int64) {
+    g_gpu_ask_streams = streams
+    g_gpu_ask_ctx = ctx
+    set_gpu_resident_regions(streams)
+    set_gpu_ctx_max(ctx)
+}
+
+//! a stream's context is its region's where the driver armed any: a request never runs past the rows the card holds for it
+def region_clamped_ctx(seq_len, regions, region_ctx : int64) : int64 => regions > 0l ? min(seq_len, region_ctx) : seq_len
+
+def private slot_clamp_ctx_to_region(var slot : ModelSlot) {
+    slot.model.config.seq_len = region_clamped_ctx(slot.model.config.seq_len, gpu_device_sessions(), gpu_device_session_ctx())
+}
+
 def private bind_gpu_slot(si : int) {
     if (g_gpu_owner == si || !g_slots[si].gpu_capable) {
         return
@@ -305,14 +333,71 @@ def private bind_gpu_slot(si : int) {
         prev_note = "from {g_slots[prev].name}, "
     }
     install_slot_marks(si)
+    gpu_residency_ask(g_slots[si].gpu_ask_streams, g_slots[si].gpu_ask_ctx)
     // want, arm, resident upload (bake-slice path for a mapped vulkan-flavor image) — the
     // order-sensitive half of the switch lives in the engine
     g_slots[si].backend_effective = gpu_slot_rearm(g_slots[si].gpu_want, g_slots[si].model)
+    slot_clamp_ctx_to_region(g_slots[si])
+    g_slots[si].resident_decline = g_slots[si].backend_effective == "gpu:resident" ? "" : gpu_resident_decline()
+    g_slots[si].gpu_regions = gpu_device_sessions()
     g_gpu_owner = si
     let us = int64(get_time_usec(t0))
     g_slots[si].sw_count ++
     g_slots[si].sw_us += us
     to_log(LOG_INFO, "dasllama-server: GPU tier -> {g_slots[si].name} ({prev_note}{us / 1000l}ms, {g_slots[si].backend_effective})\n")
+}
+
+//! Read with the slot's marks installed, so the facade answers for THIS model.
+def slot_wants_device_kv(s : ModelSlot) : bool {
+    return (s.backend_effective == "gpu:resident" && s.vision.kind == VisionKind.none && !s.audio_armed
+        && !s.sched.mtp && s.gpu_regions >= s.sched.max_streams)
+}
+
+def private sync_slot_device_kv(var s : ModelSlot; holds_gpu : bool) {
+    let want = holds_gpu && slot_wants_device_kv(s)   // a slot the tier is not armed for keeps host-cached sessions until it holds the card again
+    let was = s.sched.device_kv
+    if (set_device_kv(s.sched, want) != was) {
+        let kind = want ? "device-home sessions: every stream's K/V stays on the GPU, {gpu_device_session_ctx()} positions each" : "host-cached sessions"
+        to_log(LOG_INFO, "dasllama-server: {s.name} admits {kind}\n")
+    }
+}
+
+def slot_served(s : ModelSlot; device_kv, holds_gpu : bool) : string {
+    if (slot_flavor(s) == "metal") {
+        return "GPU (Metal): the whole model and every stream's cache, in the memory the CPU and the GPU share"
+    }
+    if (s.backend_effective != "cpu" && !holds_gpu) {
+        return "GPU, off the card now: another model holds it, and this one takes it back once that one is idle"
+    }
+    if (s.backend_effective == "gpu:resident") {
+        return (device_kv ? "GPU: the whole model and every stream's cache on the card"
+            : "GPU: the whole model on the card, the streams' caches on the host")
+    }
+    return (s.backend_effective == "gpu:rails" ? "GPU in part: some layers' work on the card, the rest on the CPU, the streams' caches on the host"
+        : "CPU")
+}
+
+def slot_served_note(s : ModelSlot; device_kv, holds_gpu : bool) : string {
+    if (s.backend_effective != "cpu" && !holds_gpu) {
+        return ""
+    }
+    if (s.backend_effective != "gpu:resident") {
+        if (s.opts.backend == "cpu" || empty(s.resident_decline)) {
+            return ""
+        }
+        let lead = s.backend_effective == "cpu" ? "the GPU serves nothing of this model" : "the whole model does not run on the GPU, so only part of the work does"
+        return "{lead}. The engine's reason, in its own words: {s.resident_decline}"
+    }
+    if (device_kv) {
+        return ""
+    }
+    if (s.vision.kind != VisionKind.none || s.audio_armed) {
+        return "this model also reads images or audio, and those parts of a prompt run on the host: every stream's cache stays there, and each step runs on the CPU"
+    }
+    if (s.sched.mtp) {
+        return "self-speculation (the model drafting its own next tokens) has no GPU path yet: every stream's cache stays on the host, and each step runs on the CPU"
+    }
+    return "the card has room for {s.gpu_regions} stream caches and this model serves {s.sched.max_streams} streams: every stream's cache stays on the host, and each step runs on the CPU"
 }
 
 // Auto-switch policy: move the tier to a gpu-wanting slot only when the current owner is idle
@@ -801,7 +886,8 @@ def private handle_bench_get(var resp : HttpResponse?) : http_status {
 // A bundle carries no daslang to spawn and no llama-bench to compare against, so /bench runs the
 // llama-bench rows itself on the served model: pp512 and tg128, an untimed warmup then three
 // timed reps each - one pp prefill, or one tg token, per tick, so the HTTP surface stays live
-// between them. Every route that reaches the model or the cores holds for the run's duration
+// between them - and, on a slot serving two streams or more, tg128@N: N streams through the
+// scheduler (device-home where the device homes them), the summed rate, one rep a tick. Every route that reaches the model or the cores holds for the run's duration
 // (the text, audio and speech routes with a 503, the model-switching, bake and download routes
 // with a 409): work admitted mid-row would share the cores with it and the numbers would
 // measure the contention. The rows run llama-bench's flat session, sized to the rows, under the
@@ -809,8 +895,16 @@ def private handle_bench_get(var resp : HttpResponse?) : http_status {
 // state, so a number never travels without what produced it.
 
 let private IBENCH_REPS = 3
+let private IBENCH_NPL = 4l   //! the batched row's streams, where the device homes that many (fewer homes, fewer streams; under two, no row)
 
-var private g_ibench_phase = 0   // 0 idle | 1 bind + pp warmup | 2 pp reps | 3 tg warmup | 4 tg tokens
+let private IBENCH_PHASE_IDLE = 0
+let private IBENCH_PHASE_BIND = 1   //! the bind and the pp warmup
+let private IBENCH_PHASE_PP = 2
+let private IBENCH_PHASE_TG_WARM = 3
+let private IBENCH_PHASE_TG = 4
+let private IBENCH_PHASE_BATCHED = 5
+
+var private g_ibench_phase = IBENCH_PHASE_IDLE
 var private g_ibench_rep = 0
 var private g_ibench_tok = 0l      // the tg rep's next token position
 var private g_ibench_tok_ns = 0l   // the tg rep's forwards so far, nanoseconds
@@ -820,11 +914,16 @@ var private g_ibench_t0 : int64
 var private g_ibench_full_seq = 0l   // the benched model's served seq_len, restored when the rows' session goes
 var private g_ibench_pp : array<double>
 var private g_ibench_tg : array<double>
+var private g_ibench_tgb : array<double>   //! the batched row's reps, the summed rate each
+var private g_ibench_npl = 0l              //! ... its streams; 0 = the slot serves too few for the row
+var private g_ibench_kv = ""               //! the codec the rows ran, and the device that served them, read before the flat session goes
+var private g_ibench_backend = ""
 var private g_ibench_session : Session
+var private g_ibench_passes0 = 0l   // the CPU-pass count as the rows began: a GPU slot's rows that move it say so
 
 //! True while the in-process rows run.
 def ibench_running() : bool {
-    return g_ibench_phase != 0
+    return g_ibench_phase != IBENCH_PHASE_IDLE
 }
 
 //! True while any benchmark measures this box - the in-process rows, or the A/B child: every
@@ -850,9 +949,14 @@ def private reject_while_benching(srv : WebSocketServer; var writer : HttpRespon
 //! the llama-bench line that measures the same GGUF with the same shapes on the same device,
 //! for the comparison a bundle cannot run itself: `-ngl 99` where a GPU served the rows (Metal,
 //! or the Vulkan tier's `gpu:*` words), `-ngl 0` where the CPU did (lcpp_bench's own --ref spelling)
-def private ibench_ref_cmd(gguf : string; threads : int; backend : string) : string {
+def private ibench_ref_cmd(gguf : string; threads : int; backend : string; npl : int64) : string {
     let ngl = (backend == "metal" || (backend |> starts_with("gpu"))) ? 99 : 0
-    return "llama-bench -m \"{gguf}\" -ngl {ngl} -p {BENCH_PP_TOKENS} -n {BENCH_TG_TOKENS} -r {IBENCH_REPS} -t {threads}"
+    let flat = "llama-bench -m \"{gguf}\" -ngl {ngl} -p {BENCH_PP_TOKENS} -n {BENCH_TG_TOKENS} -r {IBENCH_REPS} -t {threads}"
+    if (npl <= 0l) {
+        return flat
+    }
+    let batched <- llama_batched_bench_args("llama-batched-bench", "\"{gguf}\"", ngl, threads, BENCH_PP_TOKENS, BENCH_TG_TOKENS, npl)
+    return "{flat} ; {join(batched, " ")}"
 }
 
 //! what served the rows, read from the session after they ran: `metal` when the slot maps the
@@ -928,12 +1032,21 @@ def private ibench_start(var resp : HttpResponse?) : http_status {
     delete g_ibench_pp
     delete g_ibench_tg
     g_ibench_rep = 0
-    g_ibench_phase = 1
+    g_ibench_phase = IBENCH_PHASE_BIND
     return resp |> JSON("\{\"ok\":true,\"state\":\"running\"}", http_status.ACCEPTED)
+}
+
+//! a device-home session lets go of its K/V region before it is deleted, or the region stays pinned to a dead session
+def private ibench_park_session() {
+    if (g_ibench_session.device_kv && g_ibench_slot < length(g_slots)) {
+        install_slot_marks(g_ibench_slot)
+        gpu_device_kv_park(g_ibench_session)
+    }
 }
 
 //! ends the run in `state`; `why` names an abandoned run in the log the page shows
 def private ibench_stop(state, why : string) {
+    ibench_park_session()
     delete g_ibench_session
     if (g_ibench_full_seq != 0l && g_ibench_slot < length(g_slots)) {   // the rows shrank the model's seq_len to their session; the serving session was built at the full one
         g_slots[g_ibench_slot].model.config.seq_len = g_ibench_full_seq
@@ -941,7 +1054,8 @@ def private ibench_stop(state, why : string) {
     g_ibench_full_seq = 0l
     delete g_ibench_pp
     delete g_ibench_tg
-    g_ibench_phase = 0
+    delete g_ibench_tgb
+    g_ibench_phase = IBENCH_PHASE_IDLE
     g_bench_state = state
     if (!empty(why)) {
         ibench_log("run abandoned - {why}")
@@ -953,13 +1067,24 @@ def private ibench_finish() {
     let tg = bench_row("tg{BENCH_TG_TOKENS}", g_ibench_tg)
     let name = g_slots[g_ibench_slot].name
     let path = g_slots[g_ibench_slot].path
-    let backend = ibench_backend(g_ibench_slot)   // before the stop frees the session it reads
-    let kv = "{g_slots[g_ibench_slot].opts.kv_dtype}"
+    let backend = g_ibench_backend
+    let kv = g_ibench_kv
+    let cpu_calls = cpu_pass_total() - g_ibench_passes0
+    if (cpu_calls > 0l) {
+        ibench_log("WARNING: {cpu_calls} of the rows' calls ran on the CPU instead of the GPU - the model card lists the reasons; these numbers are not the GPU's")
+    }
     let exec = is_standalone_exe() ? "exe-native" : (jit_enabled() ? "jit" : "interpreted")
     let tune = ibench_tune_state()
     let elapsed = double(get_time_nsec(g_ibench_t0)) / 1.0e9lf   // the 64-bit clock: three reps of a big model on a slow box can pass the 32-bit microsecond one
-    ibench_log("ours: pp{BENCH_PP_TOKENS} {pp.mean:.1f} ± {pp.sd:.1f} tok/s · tg{BENCH_TG_TOKENS} {tg.mean:.1f} ± {tg.sd:.1f} tok/s ({IBENCH_REPS} reps, {elapsed:.1f}s, {backend}, kv {kv}, {exec}, tune {tune})")
-    g_bench_result_json = "\{\"mode\":\"inprocess\",\"ours_pp\":{pp.mean},\"ours_tg\":{tg.mean},\"pp_sd\":{pp.sd},\"tg_sd\":{tg.sd},\"reps\":{IBENCH_REPS},\"model\":{json_str(name)},\"gguf\":{json_str(base_name(path))},\"backend\":{json_str(backend)},\"kv\":{json_str(kv)},\"exec\":{json_str(exec)},\"tune\":{json_str(tune)},\"threads\":{g_ibench_threads},\"elapsed_s\":{elapsed:.1f},\"ts\":{created_ts()},\"ref_cmd\":{json_str(ibench_ref_cmd(path, g_ibench_threads, backend))}}"
+    var tgb_text = ""
+    var tgb_json = ""
+    if (g_ibench_npl > 0l) {   //! the batched row: its rate is the streams' summed one
+        let tgb = bench_row("tg{BENCH_TG_TOKENS}@{g_ibench_npl}", g_ibench_tgb)
+        tgb_text = " · tg{BENCH_TG_TOKENS}@{g_ibench_npl} {tgb.mean:.1f} ± {tgb.sd:.1f} tok/s summed over {g_ibench_npl} streams"
+        tgb_json = ",\"ours_tgb\":{tgb.mean},\"tgb_sd\":{tgb.sd},\"npl\":{g_ibench_npl}"
+    }
+    ibench_log("ours: pp{BENCH_PP_TOKENS} {pp.mean:.1f} ± {pp.sd:.1f} tok/s · tg{BENCH_TG_TOKENS} {tg.mean:.1f} ± {tg.sd:.1f} tok/s{tgb_text} ({IBENCH_REPS} reps, {elapsed:.1f}s, {backend}, kv {kv}, {exec}, tune {tune})")
+    g_bench_result_json = "\{\"mode\":\"inprocess\",\"ours_pp\":{pp.mean},\"ours_tg\":{tg.mean},\"pp_sd\":{pp.sd},\"tg_sd\":{tg.sd}{tgb_json},\"reps\":{IBENCH_REPS},\"model\":{json_str(name)},\"gguf\":{json_str(base_name(path))},\"backend\":{json_str(backend)},\"kv\":{json_str(kv)},\"exec\":{json_str(exec)},\"tune\":{json_str(tune)},\"threads\":{g_ibench_threads},\"elapsed_s\":{elapsed:.1f},\"ts\":{created_ts()},\"ref_cmd\":{json_str(ibench_ref_cmd(path, g_ibench_threads, backend, g_ibench_npl))}}"
     ibench_stop("done", "")
     to_log(LOG_INFO, "dasllama-server: bench complete\n")
 }
@@ -967,7 +1092,7 @@ def private ibench_finish() {
 //! one step of the rows per tick - the bind and the pp warmup, one pp rep, the tg warmup, or one
 //! tg token - on the default slot's model; a panic inside ends the run as failed, never the server
 def private ibench_tick() {
-    return if (g_ibench_phase == 0)
+    return if (g_ibench_phase == IBENCH_PHASE_IDLE)
     var failure = ""
     let panicked = catch_worker_panic(failure) {
         ibench_step()
@@ -985,12 +1110,29 @@ def private ibench_step() {
     set_mtp_spec(g_slots[si].sched.mtp)   // the engine's prefill-warm gate follows the benched slot, as it follows the stepped one
     g_cur = si
     let m & = cur_model()
-    if (g_ibench_phase == 1) {
+    if (g_ibench_phase == IBENCH_PHASE_BIND) {
         let device = slot_flavor(g_slots[si]) == "metal" ? "metal" : g_slots[si].backend_effective   // the tier's word speaks only of Vulkan and reads `cpu` under Metal
         ibench_log("in-process: pp{BENCH_PP_TOKENS}/tg{BENCH_TG_TOKENS} x {IBENCH_REPS} reps on {g_slots[si].name} ({device}, kv {g_slots[si].opts.kv_dtype}, {g_ibench_threads} lanes), llama-bench shape - the text, audio and speech routes hold until it finishes")
+        let device_home = slot_wants_device_kv(g_slots[si])
+        let served_ctx = g_slots[si].model.config.seq_len   //! read before the flat rows' session narrows it
+        if (!device_home) {   // a device-home run takes its region's context, which the slot's seq_len already is: nothing to put back
+            g_ibench_full_seq = served_ctx
+        }
+        ibench_park_session()
         delete g_ibench_session   // the previous run's cache, when a run ended without its stop
-        g_ibench_full_seq = g_slots[si].model.config.seq_len
-        g_ibench_session <- bench_session(g_slots[si].model, BENCH_PP_TOKENS, BENCH_TG_TOKENS, g_slots[si].opts.kv_dtype, g_slots[si].opts.kv_dtype)
+        g_ibench_session <- (device_home ? create_device_session(g_slots[si].model, gpu_device_session_dtype())
+            : bench_session(g_slots[si].model, BENCH_PP_TOKENS, BENCH_TG_TOKENS, g_slots[si].opts.kv_dtype, g_slots[si].opts.kv_dtype))
+        g_ibench_kv = device_home ? "{gpu_device_session_dtype()}" : "{g_slots[si].opts.kv_dtype}"
+        g_ibench_npl = min(IBENCH_NPL, device_home ? gpu_device_sessions() : g_slots[si].sched.max_streams)   //! the batched row's streams: a region each where the device homes them, else the slot's served count
+        if (g_ibench_npl < 2l) {
+            g_ibench_npl = 0l
+        }
+        let row_needs_ctx = BENCH_PP_TOKENS + BENCH_TG_TOKENS + g_ibench_npl
+        if (g_ibench_npl > 0l && served_ctx < row_needs_ctx) {
+            ibench_log("no tg{BENCH_TG_TOKENS}@{g_ibench_npl} row: the served context is {served_ctx} tokens and the row's streams need {row_needs_ctx}")
+            g_ibench_npl = 0l
+        }
+        g_ibench_passes0 = cpu_pass_total()
         bench_pp_warm(m, g_ibench_session, BENCH_PP_TOKENS)
         let sane = bench_warm_sanity(m, g_ibench_session)
         if (!sane.ok) {
@@ -999,17 +1141,17 @@ def private ibench_step() {
             return
         }
         ibench_log("sanity (pp{BENCH_PP_TOKENS}): {sane.detail}")
-        g_ibench_phase = 2
+        g_ibench_phase = IBENCH_PHASE_PP
         g_ibench_rep = 0
-    } elif (g_ibench_phase == 2) {
+    } elif (g_ibench_phase == IBENCH_PHASE_PP) {
         let tps = bench_pp_rep(m, g_ibench_session, BENCH_PP_TOKENS, int64(g_ibench_rep))
         g_ibench_pp |> push(tps)
         ibench_log("pp{BENCH_PP_TOKENS} rep {g_ibench_rep + 1}/{IBENCH_REPS}: {tps:.1f} tok/s")
         g_ibench_rep ++
         if (g_ibench_rep >= IBENCH_REPS) {
-            g_ibench_phase = 3
+            g_ibench_phase = IBENCH_PHASE_TG_WARM
         }
-    } elif (g_ibench_phase == 3) {
+    } elif (g_ibench_phase == IBENCH_PHASE_TG_WARM) {
         bench_tg_warm(m, g_ibench_session)
         let sane = bench_warm_sanity(m, g_ibench_session)
         if (!sane.ok) {
@@ -1018,26 +1160,59 @@ def private ibench_step() {
             return
         }
         ibench_log("sanity (tg{BENCH_TG_TOKENS}): {sane.detail}")
-        g_ibench_phase = 4
+        g_ibench_phase = IBENCH_PHASE_TG
         g_ibench_rep = 0
         g_ibench_tok = 0l
         g_ibench_tok_ns = 0l
+    } elif (g_ibench_phase == IBENCH_PHASE_TG) {
+        ibench_tg_token(m, si)
     } else {
-        // one token per tick: a tg rep is 128 forwards, seconds on a real model, and the tick
-        // between them is what answers the supervisor's health probe
-        g_ibench_tok_ns += bench_tg_step(m, g_ibench_session, g_ibench_tok, int64(g_ibench_rep))
-        g_ibench_tok ++
-        if (g_ibench_tok >= BENCH_TG_TOKENS) {
-            let tps = double(BENCH_TG_TOKENS) * 1.0e9lf / double(g_ibench_tok_ns)
-            g_ibench_tg |> push(tps)
-            ibench_log("tg{BENCH_TG_TOKENS} rep {g_ibench_rep + 1}/{IBENCH_REPS}: {tps:.1f} tok/s")
-            g_ibench_rep ++
-            g_ibench_tok = 0l
-            g_ibench_tok_ns = 0l
-            if (g_ibench_rep >= IBENCH_REPS) {
-                ibench_finish()
-            }
+        ibench_batched_rep(m)
+    }
+}
+
+//! one tg token per tick: a tg rep is 128 forwards, seconds on a real model, and the tick between them is what answers
+//! the supervisor's health probe; the last rep hands over to the batched row, or finishes
+def private ibench_tg_token(m : Model; si : int) {
+    g_ibench_tok_ns += bench_tg_step(m, g_ibench_session, g_ibench_tok, int64(g_ibench_rep))
+    g_ibench_tok ++
+    if (g_ibench_tok < BENCH_TG_TOKENS) return
+    let tps = double(BENCH_TG_TOKENS) * 1.0e9lf / double(g_ibench_tok_ns)
+    g_ibench_tg |> push(tps)
+    ibench_log("tg{BENCH_TG_TOKENS} rep {g_ibench_rep + 1}/{IBENCH_REPS}: {tps:.1f} tok/s")
+    g_ibench_rep ++
+    g_ibench_tok = 0l
+    g_ibench_tok_ns = 0l
+    if (g_ibench_rep < IBENCH_REPS) return
+    g_ibench_backend = ibench_backend(si)   // before the flat session goes
+    if (g_ibench_npl > 0l) {
+        ibench_park_session()   //! the flat row's region goes back: the batched row's streams take every region
+        delete g_ibench_session
+        if (g_ibench_full_seq != 0l) {   //! the flat rows' session narrowed the context; the batched row's streams need the served one
+            g_slots[si].model.config.seq_len = g_ibench_full_seq
         }
+        g_ibench_phase = IBENCH_PHASE_BATCHED
+        g_ibench_rep = 0
+    } else {
+        ibench_finish()
+    }
+}
+
+//! one batched rep per tick: the streams' prefills and 128 batched steps, a second or so on a small model;
+//! a refused rep omits the batched row and the flat rows already measured stand as the result
+def private ibench_batched_rep(m : Model) {
+    let br = bench_tg_batched_rep(m, g_ibench_npl, BENCH_PP_TOKENS, BENCH_TG_TOKENS, int64(g_ibench_rep), g_slots[g_ibench_slot].sched.mtp)   //! a slot serving self-speculative streams benches them as it serves them
+    if (!empty(br.why)) {
+        ibench_log("REFUSED (tg{BENCH_TG_TOKENS}@{g_ibench_npl}): {br.why} - the batched row is omitted")
+        g_ibench_npl = 0l
+        ibench_finish()
+        return
+    }
+    g_ibench_tgb |> push(br.tps)
+    ibench_log("tg{BENCH_TG_TOKENS}@{g_ibench_npl} rep {g_ibench_rep + 1}/{IBENCH_REPS}: {br.tps:.1f} tok/s summed")
+    g_ibench_rep ++
+    if (g_ibench_rep >= IBENCH_REPS) {
+        ibench_finish()
     }
 }
 
@@ -2328,6 +2503,9 @@ def private handle_model_load(var req : HttpRequest?; var resp : HttpResponse?) 
     let quant = pick_quant(quant_spelling)
     var m = Model()
     var failure = ""
+    if (!cpu_only) {
+        gpu_residency_ask(g_sched_defaults.max_streams, js?["ctx"] ?? g_boot_ctx)
+    }
     var failed = catch_worker_panic(failure) {
         delete m   // fresh above; the delete licenses the move on this heap (PERF030)
         m <- load_model(rpath, quant)
@@ -3279,14 +3457,24 @@ struct private OaiSlotStats {
     audio : bool              // an audio arm is attached: this slot's chat route takes input_audio parts
     thinking_default : bool   // this family's own default when a request sends no enable_thinking
     last_used_s : float       // seconds since this slot last admitted a request (-1 = never)
+    served : string           //!< how this slot is served, in plain words: where the weights sit and where the streams' caches do
+    served_note : string      //!< why it is not served better; "" when nothing holds the slot back
+    device_kv : bool          //!< the streams' K/V caches live on the GPU, a region each
     sw_count : int64          // P2 gpu-switch telemetry
     sw_avg_ms : float
+}
+
+struct private OaiCpuPass {
+    reason : string
+    words : string   //!< the reason as the control page prints it
+    count : int64
 }
 
 struct private OaiStatsResponse {
     model : string
     active_model : string
     models : array<OaiSlotStats>
+    gpu_cpu_passes : array<OaiCpuPass>   //!< calls the armed GPU path handed back to the CPU rails since the model armed, by reason; empty = the device served every call
     ctx : int64
     uptime_s : int64
     draining : bool
@@ -3416,12 +3604,15 @@ def private handle_stats(var resp : HttpResponse?) : http_status {
         thinking_default = g_slots[g_default_slot].think_default,
         media_pending = g_media_pending, media_rows = g_media_rows,
         mrope_streams = g_slots[g_active].sched.mrope_streams)
+    out.gpu_cpu_passes <- [for (p in gpu_cpu_passes()); OaiCpuPass(reason = p.reason, words = p.words, count = p.count)]
     out.models |> reserve(length(g_slots))
     for (i in range(length(g_slots))) {
         var s & = unsafe(g_slots[i])
+        let holds_gpu = i == g_gpu_owner
+        let device_kv = holds_gpu ? slot_wants_device_kv(s) : s.sched.device_kv
         out.models |> push(OaiSlotStats(
             name = s.name, file = base_name(s.path), is_default = s.is_default, is_active = i == g_active,
-            holds_gpu = i == g_gpu_owner,
+            holds_gpu = holds_gpu,
             backend = s.opts.backend, backend_effective = s.backend_effective,
             flavor = slot_flavor(s), vision = s.vision.kind != VisionKind.none,
             audio = s.audio_armed,
@@ -3434,6 +3625,7 @@ def private handle_stats(var resp : HttpResponse?) : http_status {
             prefix_pages = prefix_held_groups(s.sched.prefix),
             weights_bytes = model_weights_bytes(s.model),
             kv_bytes = kv_pool_bytes(s.sched.pool),
+            served = slot_served(s, device_kv, holds_gpu), served_note = slot_served_note(s, device_kv, holds_gpu), device_kv = device_kv,
             last_used_s = s.last_used > 0l ? age_seconds(s.last_used) : -1.0,
             sw_count = s.sw_count,
             sw_avg_ms = s.sw_count > 0l ? float(s.sw_us / s.sw_count) / 1000.0 : 0.0))
@@ -5457,9 +5649,7 @@ def init_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; c
     if (!empty(g_slots)) {
         set_mtp_spec(g_slots[g_active].sched.mtp)
     }
-    // the single shared KV mirror + chunked multi-stream prefill don't mix: a second stream's
-    // resident prefill would strand the first's device-only KV. The batch-decode override (which
-    // resyncs host<->mirror per step) stays on; per-slot mirrors re-enable device prefill here.
+    // a resident prefill would strand device-only rows when host-cached sessions outnumber the driver's K/V regions; device-home streams prefill on the device regardless
     set_resident_prefill_allowed(false)
     g_server = new OpenAiServer()
     g_server->init(port)
@@ -5571,6 +5761,7 @@ def update_server() : bool {
         }
         install_slot_marks(si)
         maybe_bind_gpu(si)
+        sync_slot_device_kv(g_slots[si], si == g_gpu_owner)
         let t_step = ref_time_ticks()
         busy = scheduler_step(g_slots[si].model, g_slots[si].sched, g_events)
         let step_us = int64(get_time_usec(t_step))

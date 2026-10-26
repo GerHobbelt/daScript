@@ -5,7 +5,7 @@ require daslib/clargs
 require strings
 require daslib/strings_boost
 
-// The reference supply chain: build pinned llama-bench
+// The reference supply chain: build pinned llama-bench (and llama-batched-bench beside it, the tg@N row's reference)
 // binaries per build flavor, so every box — and any community user who wants our exact reference —
 // benches against the identical binary. One git worktree at the pinned sha, one build dir per flavor:
 //   clean-cpu: -DGGML_ACCELERATE=OFF -DGGML_BLAS=OFF -DGGML_METAL=OFF — kernel-vs-kernel fair
@@ -43,13 +43,11 @@ struct Args {
 // Run `cmd`, return its trimmed stdout (pipe-safe fread; stderr stays on the console).
 def private capture_out(cmd : string) : string {
     var out = ""
-    unsafe {
-        popen(cmd) $(f) {
-            if (f != null) {   // popen returns null on spawn failure (missing git / bad PATH) — don't deref
-                out = fread(f)
-            }
+    unsafe(popen(cmd) $(f) {
+        if (f != null) {   // popen returns null on spawn failure (missing git / bad PATH) — don't deref
+            out = fread(f)
         }
-    }
+    })
     return strip(out)
 }
 
@@ -175,13 +173,17 @@ def private build_flavor(dest, f, short_sha : string; jobs : int) : int {
             return 1
         }
     }
-    if (run_visible("cmake --build \"{build_dir}\" --config Release --target llama-bench llama-mtmd-cli -j {jobs}") != 0) {
+    if (run_visible("cmake --build \"{build_dir}\" --config Release --target llama-bench llama-batched-bench llama-mtmd-cli -j {jobs}") != 0) {
         print("error: build failed for {f}\n")
         return 1
     }
     let bench = locate_bench(build_dir)
     if (empty(bench)) {
         print("error: {f} built but llama-bench not found under {build_dir}\n")
+        return 1
+    }
+    if (!fexist(replace(bench, "llama-bench", "llama-batched-bench"))) {   //! lcpp_bench finds the batched exe by this name, beside llama-bench
+        print("error: {f} built but llama-batched-bench not found beside {bench} - the tg@N row's reference\n")
         return 1
     }
     print("{f}: {bench} (llama.cpp {short_sha})\n")

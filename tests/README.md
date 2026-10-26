@@ -621,6 +621,7 @@ JIT compilation and code-generation tests. None have `expect` directives. The sl
 | default_method_arguments.das | Default argument values in abstract/override methods | |
 | deref_ptr_fun.das | `deref(getPtr())` - function pointer dereference | |
 | dim.das | Fixed-size 2D arrays - indexing, pointer arithmetic, string representation | |
+| distinct_table_keys.das | Tables and sets keyed by distinct types - two distincts over `int` stay apart, erase, iteration, `keys()`, a distinct over `string` | |
 | div_by_zero.das | Division/modulo by zero - int, uint, int64, uint64 via try/recover | |
 | dummy.das | `SomeDummyType` - sizeof, alignof with `@safe_when_uninitialized` | |
 | failed_duplicate_keys.das | Duplicate table keys at compile time | **expect** `40300:4` |
@@ -740,6 +741,7 @@ JIT compilation and code-generation tests. None have `expect` directives. The sl
 | ptr_arithmetic.das | Pointer arithmetic - signed/unsigned int/int64/uint/uint64 | |
 | ptr_index.das | Pointer deref and index, default null pointer argument | |
 | properties.das | Property operators (.res :=, getter/setter) | |
+| property_promotion_paths.das | Named and with-name property getters, `:=` and `+=` setters, through a value, a pointer and a `with` block | |
 | random_numbers.das | Random seeding, distributions, reproducibility | |
 | reflection.das | RTTI reflection - compile source, inspect modules/structs/enums/functions | |
 | failed_reserved_names.das | Use of reserved identifier names | **expect** `30116:9` |

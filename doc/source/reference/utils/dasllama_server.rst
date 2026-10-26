@@ -123,6 +123,10 @@ Run under ``-jit`` --- the interpreter is refused, it is far too slow for infere
      -
      - ``4096``
      - Context-length cap in tokens
+   * - ``--gpu``
+     -
+     - ``auto``
+     - GPU backend: auto (default: metal/vulkan when detected, else CPU) \| off \| metal \| metal-required \| vulkan. vulkan serves a model that fits the card whole from the GPU, every stream's cache with it; the control page's model card says what a slot got (a set --metal flag keeps the legacy env-driven path)
    * - ``--tune``
      -
      - ---
@@ -232,7 +236,7 @@ Endpoints
      - ``{"name": <entry>}`` — start one catalog download (sha-verified; ``"tower"`` pulls a vision/asr companion, and ``{"tower": "tts", "file": <file>}`` one file of the speech set)
    * - ``GET`` / ``POST``
      - ``/bench``
-     - Read bench state, mode, log and result / start the quiesced benchmark: in process by default (pp512 and tg128 on the served model, three reps each, every route that could contend holding meanwhile; the result names the device, the KV codec, the exec tier and the tune state the rows ran under), or the llama.cpp A/B child when ``lcpp_bin`` is configured on a source-tree daslang (``POST`` is loopback-only)
+     - Read bench state, mode, log and result / start the quiesced benchmark: in process by default (pp512 and tg128 on the served model, three reps each, then tg128@N on a slot whose device homes streams - N device-home streams through the scheduler's device mode, the summed rate - every route that could contend holding meanwhile; the result names the device, the KV codec, the exec tier and the tune state the rows ran under), or the llama.cpp A/B child when ``lcpp_bin`` is configured on a source-tree daslang (``POST`` is loopback-only)
    * - ``GET`` / ``POST``
      - ``/bake``
      - Read bake state and log / bake the slot's prepared ``.dlim`` image via ``dasllama-convert`` (``POST`` is loopback-only)

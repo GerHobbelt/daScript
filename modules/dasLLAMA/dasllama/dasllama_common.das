@@ -394,6 +394,7 @@ struct BatchWorkspace {
     scr : Session             // *_b scratch, rope tables, ple scratch — no KV cache / sampler state
     scr_codec_uid : uint64
     positions : array<int64>  // row i's absolute KV position (sessions[i].n_past at entry)
+    row_tokens : array<int64> //! row i's token id this step: a device override gathers a row's own side input from it
     rope_positions : array<int64>   // row i's ROPE position (n_past + rope_pos_delta — mrope streams diverge)
     logits_b : array<float>   // B x vocab classifier output, scattered per session after softcap
     // row i's cache base pointers (into sessions[i]; valid per call). @do_not_delete is load-bearing:
@@ -428,6 +429,16 @@ var private g_mtp_spec_overrides : table<string; MtpSpecOverrideFn>
 
 def register_mtp_spec_override(name : string; fn : MtpSpecOverrideFn) {
     g_mtp_spec_overrides[name] = fn
+}
+
+//! the depth-1 speculative step over every stream at once - a driver that verifies every stream's
+//! rows in one weight pass registers here; `accepted[i]` is stream i's accepted draft or -1, and the
+//! call returns how many streams' rows the joint verify carried (0 = each stream stepped alone)
+typedef MtpSpecBatchOverrideFn = function<(t : Model; var sessions : array<Session?>; toks : array<int64>; var accepted : array<int64>) : int64>
+var private g_mtp_spec_batch_overrides : table<string; MtpSpecBatchOverrideFn>
+
+def register_mtp_spec_batch_override(name : string; fn : MtpSpecBatchOverrideFn) {
+    g_mtp_spec_batch_overrides[name] = fn
 }
 
 // The MTP seam-row override: writes the draft head's row pos-1 on a blob model BEFORE a
@@ -1622,6 +1633,7 @@ def apply_box_profile_runtime_at(ppath : string) {   // nolint:STYLE038 — a fl
     apply_i64_knob(rt, "phase_decode_workers") $(v) { set_phase_decode_workers(int(min(v, 2147483647l))) }
     // stored only — the queue may not exist yet; setup_dasllama_jobque applies these inside with_job_que
     apply_i64_knob(rt, "jobque_spin_us") $(v) { set_jobque_spin_us_(v) }
+    apply_i64_knob(rt, "jobque_spin_gpu_us") $(v) { set_jobque_spin_gpu_us_(v) }
     apply_i64_knob(rt, "jobque_join_poll") $(v) { set_jobque_join_poll(v) }
     apply_i64_knob(rt, "team_rank_gate") $(v) { set_team_rank_gate(int(min(v, 1l))) }
     apply_i64_knob(rt, "metal_tall_floor") $(v) { set_metal_tall_floor(v) }
@@ -2067,7 +2079,9 @@ struct Session {
     // resident-driver mirror ownership: gen stamps which session's rows the device KV mirror
     // holds (0 = never resident-prefilled); rdec_host_current = the host KV holds everything the mirror does
     rdec_gen : int64
+    rdec_region : int64         //! the mirror region the claim above sits in (meaningful only while `rdec_gen` matches that region's)
     rdec_host_current : bool
+    device_kv : bool            //! the K/V lives ONLY in the armed GPU driver's mirror region: no host cache is allocated
     dat_gen : int64             // the per-op decode attention block's mirror generation this session claimed (0 = none)
     tail_next1 : int64          // 1 + the layer whose resident FFN may take the decode tail this token (0 = none)
     tail_taken : bool           // the tail took this layer's FFN: the residual add is the device's
@@ -2454,6 +2468,15 @@ def create_session_(model : Model; kdt : KVDtype = KVDtype.f32; vdt : KVDtype = 
     return <- make_run_state(model.config, kdt, vdt)
 }
 
+//! Create a DEVICE-HOME session: scratch and no host cache - its K/V lives only in the armed GPU driver's mirror
+//! region, so nothing crosses the bus per token and nothing is allocated per request. The caller holds as many live
+//! ones as the driver has regions; the driver panics where it would hand such a session to the CPU rails.
+def create_device_session_(model : Model; kdt : KVDtype) : Session {
+    var s <- make_run_state(model.config, kdt, kdt, false)
+    s.device_kv = true
+    return <- s
+}
+
 //! Allocate a PAGED run state over a caller-owned pool: the flat slabs stay empty and cache pages
 //! come from `pool` on demand (kv_ensure), so KV memory tracks actual context. The pool must
 //! outlive the session and stay in place; release the pages (release_kv_pages_) when done.
@@ -2496,9 +2519,7 @@ def eval_(t : Model; var s : Session; tokens : array<int64>) {
 var private g_tensor_crowns : table<string>
 
 def public set_metal_tensor_crowns(list : string) {
-    unsafe {
-        delete g_tensor_crowns
-    }
+    delete g_tensor_crowns
     for (f in split(list, ",")) {
         if (!empty(f)) {
             g_tensor_crowns |> insert(f)
@@ -4897,6 +4918,22 @@ def private mtp_prefill_warm(t : Model; var s : Session; tokens : array<int64>; 
         copy_floats(s.mtp_xb_save, 0l, s.x_b, 0l, npos * dim)
     }
     // SEAM row start_pos-1 is written by forward_prefill BEFORE the trunk body, so it can't be done here
+}
+
+//! the depth-1 speculative step over every stream at once: a registered batch override verifies every
+//! stream's rows in one pass; without one each stream steps alone through `mtp_spec_eval`. `accepted[i]`
+//! is stream i's accepted draft or -1; returns how many streams' rows a joint verify carried (0 = none)
+def mtp_spec_eval_batch(t : Model; var sessions : array<Session?>; toks : array<int64>; var accepted : array<int64>) : int64 {
+    if (t.metal_blob && !empty(g_decode_override_name) && key_exists(g_mtp_spec_batch_overrides, g_decode_override_name)) {
+        return invoke(g_mtp_spec_batch_overrides[g_decode_override_name], t, sessions, toks, accepted)
+    }
+    let n = long_length(sessions)
+    accepted |> resize(n)
+    for (i in range64(n)) {
+        var a = 0l
+        accepted[i] = mtp_spec_eval(t, *sessions[i], toks[i], a) ? a : -1l
+    }
+    return 0l
 }
 
 //! One greedy self-speculative eval step: evals `tok`, drafting one token ahead with the NextN

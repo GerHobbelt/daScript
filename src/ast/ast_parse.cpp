@@ -91,6 +91,19 @@ namespace das {
         auto fileInfo = make_unique<TextFileInfo>((char *) str, uint32_t(str_len), false);
         access->setFileInfo(modName, das::move(fileInfo));
         ModuleGroup dummyLibGroup;
+        // the stream stays hidden here - src/ast/ARCHITECTURE.md#module-cache-read
+        struct HiddenStream {
+            daScriptEnvironment * env;
+            AstSerializer * read, * write;
+            HiddenStream ( daScriptEnvironment * e ) : env(e), read(e->serializer_read), write(e->serializer_write) {
+                env->serializer_read = nullptr;
+                env->serializer_write = nullptr;
+            }
+            ~HiddenStream () {
+                env->serializer_read = read;
+                env->serializer_write = write;
+            }
+        } hidden(daScriptEnvironment::getBound());
         auto program = parseDaScript(modName, "", access, issues, dummyLibGroup, true);
         module->ownFileInfo = access->letGoOfFileInfo(modName);
         DAS_ASSERTF(module->ownFileInfo,"something went wrong and FileInfo for builtin module can not be obtained");
@@ -759,6 +772,7 @@ namespace das {
         uint64_t saved_hash = 0;
         int64_t saved_size = -1;
         string saved_filename{};
+        uint8_t saved_flags = 0;
         uint64_t payload_size = 0;
         uint32_t depCount = 0;
         vector<tuple<string,int64_t,uint64_t>> savedDeps;
@@ -768,6 +782,7 @@ namespace das {
             serializer << saved_hash;
             serializer << saved_size;
             serializer.serializeTemp(saved_filename);
+            serializer << saved_flags;
             // macro file dependencies (Program::moduleCacheDependencies) ride the record
             // header, not the payload: they must be validated BEFORE the payload is trusted
             serializer << depCount;
@@ -845,6 +860,26 @@ namespace das {
         }
 
         size_t payload_start = serializer_read->buffer->bufferPos;
+        // a marked record is never served - src/ast/ARCHITECTURE.md#module-cache-read
+        if ( (saved_flags & 1) != 0 ) {
+            if ( payload_size != 0 && uint64_t(payload_size) <= uint64_t(serializer_read->buffer->buffer.size() - payload_start) ) {
+                serializer_read->buffer->bufferPos = payload_start + size_t(payload_size);
+                serializer_read->resumedModules ++;
+                // the per-record tables a payload read clears at its end: the header put this
+                // record's file name in the string table, and the next record's header indexes
+                // its own table from empty
+                serializer_read->fieldRefs.clear();
+                serializer_read->clearNodeIds();
+                if ( !serializer_read->quietCache ) logs << "ser: reparsing in place '" << fileName << "' (registers at compile time)\n";
+            } else {
+                serializer_read->seenNewModule = true;
+                serializer_read->failed = true;
+                serializer_read->cutoffFile = fileName;
+                serializer_read->cutoffReason = "registers at compile time, record length unusable";
+                if ( !serializer_read->quietCache ) logs << "ser: read failed '" << fileName << "' (registers at compile time, record length unusable)\n";
+            }
+            return false;
+        }
         // no per-module logging on the happy path - the standalone sink has no level
         // threshold, so a line here prints once per warm module; the verdict line and the
         // failure branches below carry everything a human needs
@@ -1386,6 +1421,7 @@ namespace das {
                 if ( policies.macro_context_collect ) libGroup.collectMacroContexts();
                 if (!program->failed() && !policies.no_fold_unsafe)
                     program->foldUnsafe();
+                program->astChanged();
                 auto timeO = ref_time_ticks();
                 if (!program->failed()) {
                     if (program->getOptimize()) {
@@ -1618,6 +1654,8 @@ namespace das {
             *serializer_write << fileHash;
             *serializer_write << fileSize;
             *serializer_write << const_cast<string &>(fileName);
+            uint8_t flags = thisModule->registersAtCompile ? 1 : 0;
+            *serializer_write << flags;
             uint32_t depCount = uint32_t(program->moduleCacheDependencies.size());
             *serializer_write << depCount;
             for ( auto & dep : program->moduleCacheDependencies ) {

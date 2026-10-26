@@ -2707,7 +2707,7 @@ class public LlvmJitVisitor : AstVisitor {
         return res
     }
 
-    def build_array_index(var data, tidx : LLVMOpaqueValue?; elemType : TypeDeclPtr; name : string) {
+    def build_array_index(var data, tidx : LLVMOpaqueValue?; elemType : TypeDeclPtr; name : string; inbounds : bool = true) {
         var ptr_idx : LLVMOpaqueValue?
         if (elemType.isVectorType && elemType.vectorDim == 3) {
             var data_bytes = LLVMBuildPointerCast(g_builder, data, LLVMPointerType(types.t_int8, 0u), "")
@@ -2718,10 +2718,10 @@ class public LlvmJitVisitor : AstVisitor {
             // LLVM GEP on <3 x T> would advance by the padded alloc size — use the das stride.
             var stride = LLVMConstInt(LLVMTypeOf(tidx), uint64(elemType.sizeOf), 0)
             var data_idx = LLVMBuildMul(g_builder, tidx, stride, "")
-            ptr_idx = LLVMBuildGEP2(g_builder, types.t_int8, data_bytes, data_idx, "")
+            ptr_idx = LLVMBuildGEP2(g_builder, types.t_int8, data_bytes, data_idx, "", inbounds)
             ptr_idx = LLVMBuildPointerCast(g_builder, ptr_idx, LLVMPointerType(type_to_llvm_type(elemType), 0u), name)
         } else {
-            ptr_idx = LLVMBuildGEP2(g_builder, type_to_llvm_type(elemType), data, tidx, name)
+            ptr_idx = LLVMBuildGEP2(g_builder, type_to_llvm_type(elemType), data, tidx, name, inbounds)
         }
         return ptr_idx
     }
@@ -2744,7 +2744,7 @@ class public LlvmJitVisitor : AstVisitor {
             if (thisFunc != null && !thisFunc.flags.unsafeDeref) {
                 check_ptr_zero(tsrc, expr.at, "dereferencing null pointer, {expr.subexpr.describe()} is null")
             }
-            var ptr_idx = build_array_index(tsrc, tidx, subExprT.firstType, "ptr_at")
+            var ptr_idx = build_array_index(tsrc, tidx, subExprT.firstType, "ptr_at", false)
             if (expr.atFlags.r2v) {
                 var at_r2v = LLVMBuildLoadData2Aligned(g_builder, type_to_llvm_abi_type(expr._type),
                     ptr_idx, expr._type.alignOf, "at_r2v")
@@ -2779,13 +2779,7 @@ class public LlvmJitVisitor : AstVisitor {
             }
         } elif (subExprT.isGoodTableType) {
             var tab_ptr = LLVMBuildPointerCast(g_builder, tsrc, types.LLVMVoidPtrType(), "tab_ptr")
-            var keyType : Type
-            if (subExprT.firstType.isWorkhorseType) {
-                keyType = subExprT.firstType.baseType
-            } else {
-                var uvt = get_underlying_value_type(subExprT.firstType)
-                keyType = uvt.baseType
-            }
+            let keyType = table_key_storage_base_type(subExprT.firstType)
             var at_tab = build_table_at(keyType, tab_ptr, tidx, subExprT.secondType.sizeOf, expr.at)
             var tab = LLVMBuildLoadData2Aligned(g_builder, type_to_llvm_type(expr.subexpr._type), tsrc, expr.subexpr._type.alignOf, "tab")
             var data = LLVMBuildExtractValue(g_builder, tab, uint(JIT_TABLE.DATA), "table.data")
@@ -2894,13 +2888,7 @@ class public LlvmJitVisitor : AstVisitor {
                 var tab_ty = expr.subexpr._type.isPointer ? expr.subexpr._type.firstType : expr.subexpr._type
                 var tab = LLVMBuildLoadData2Aligned(g_builder, type_to_llvm_type(tab_ty), tsrc, tab_ty.alignOf, "tab")
                 var tab_ptr = LLVMBuildPointerCast(g_builder, tsrc, types.LLVMVoidPtrType(), "tab_ptr")
-                var keyType : Type
-                if (etype.firstType.isWorkhorseType) {
-                    keyType = etype.firstType.baseType
-                } else {
-                    var uvt = get_underlying_value_type(etype.firstType)
-                    keyType = uvt.baseType
-                }
+                let keyType = table_key_storage_base_type(etype.firstType)
                 var at_tab = build_table_find(keyType, tab_ptr, tidx, etype.secondType.sizeOf)
                 var if_found = LLVMBuildICmp(g_builder, LLVMIntPredicate.LLVMIntNE, at_tab, types.ConstI32(uint64(-1)), "table_found")
                 var subRes = build_select(if_found, resType) {
@@ -2947,7 +2935,7 @@ class public LlvmJitVisitor : AstVisitor {
             var resType = LLVMPointerType(type_to_llvm_type(etype), 0u)
             var if_not_null = LLVMBuildIsNotNull(g_builder, tsrc, "ptr_not_null")
             res = build_select(if_not_null, resType) {
-                return build_array_index(tsrc, tidx, etype, "ptr_safe_at")
+                return build_array_index(tsrc, tidx, etype, "ptr_safe_at", false)
             }
             lpipe() {
                 return LLVMConstNull(resType)
@@ -3589,6 +3577,7 @@ class public LlvmJitVisitor : AstVisitor {
 // ExprCopy
     def build_copy(tdst : LLVMOpaqueValue?; right : ExpressionPtr) {
         var tsrc = getE(right)
+        if (tsrc == tdst) return     // constructed in place: the copy is a memcpy onto itself
         let ralign = uint(right._type.alignOf)
         if (right._type.isRef) {
             if (right._type.isWorkhorseType) {
@@ -3647,6 +3636,7 @@ class public LlvmJitVisitor : AstVisitor {
 
     def build_move(tdst : LLVMOpaqueValue?; right : ExpressionPtr; needTest : bool) {
         var tsrc = getE(right)
+        if (tsrc == tdst) return     // moving a value onto itself is the no-op the runtime test below would take
         let ralign = uint(right._type.alignOf)
         if (right._type.isRef) {
             /*
@@ -3930,7 +3920,7 @@ class public LlvmJitVisitor : AstVisitor {
                 || !(starts_with(cf.func.name, "builtin`keys`") || starts_with(cf.func.name, "builtin`values`"))) return false
         assume tabT = cf.arguments[0]._type
         if (tabT == null || !tabT.isGoodTableType) return false
-        return is_workhorse_table_key(tabT.firstType.baseType)
+        return is_workhorse_table_key(peel_distinct(tabT.firstType).baseType)
     }
 
     def inline_each_source(expr : ExpressionPtr) : ExpressionPtr {
@@ -4056,7 +4046,7 @@ class public LlvmJitVisitor : AstVisitor {
             debug_declare_local(svar, v_ptr)
         }
         // initialize its memory with 0 (should we?)
-        let vsize = svar._type.isRef ?  typeinfo sizeof(type<void?>) : svar._type.sizeOf
+        let vsize = svar._type.flags.ref ? typeinfo sizeof(type<void?>) : svar._type.sizeOf
         LLVMBuildMemSet(g_builder, v_ptr, 0ul, uint64(vsize), 16u)
     }
 
@@ -5110,9 +5100,7 @@ class public LlvmJitVisitor : AstVisitor {
         var ann_vals : array<LLVMValueRef>
         ann_vals |> reserve(int(vi.annotation_argument_count))
         for (i in range(int(vi.annotation_argument_count))) {
-            unsafe {
-                ann_vals |> push <| create_annotation_argument_info(get_annotation_argument(*vi, i))
-            }
+            ann_vals |> push <| create_annotation_argument_info(get_annotation_argument(*vi, i))
         }
         let n = vi.annotation_argument_count
         let ann_global = LLVMAddGlobal(g_mod, LLVMArrayType(ann_ty, n), "varinfo_annotations")
@@ -5204,12 +5192,7 @@ class public LlvmJitVisitor : AstVisitor {
         var struct_info_global = LLVMAddGlobal(g_mod, ty, "enuminfo_{ei.module_name}_{ei.name}")
         set_globalvar_linkage(struct_info_global)
         enuminfo_cache[ei] = struct_info_global
-        var ann_vals : array<LLVMValueRef>
-        for (i in range(int(ei.annotation_count))) {
-            unsafe {
-                ann_vals |> push <| create_annotation_info_value(get_annotation(*ei, i))    // nolint:PERF006 count known small
-            }
-        }
+        var ann_vals <- [for (i in range(int(ei.annotation_count))); create_annotation_info_value(get_annotation(*ei, i))]
         var (ann_ptr, ann_count) = pack_annotation_list(ann_vals)
         var init_values <- [
             get_string_constant_ptr(g_builder, ei.name),
@@ -5231,12 +5214,7 @@ class public LlvmJitVisitor : AstVisitor {
         var struct_info_global = LLVMAddGlobal(g_mod, ty, "si_{si.name}")
         set_globalvar_linkage(struct_info_global)
         structinfo_cache[si] = struct_info_global
-        var ann_vals : array<LLVMValueRef>
-        for (i in range(int(si.annotation_count))) {
-            unsafe {
-                ann_vals |> push <| create_annotation_info_value(get_annotation(*si, i))    // nolint:PERF006 count known small
-            }
-        }
+        var ann_vals <- [for (i in range(int(si.annotation_count))); create_annotation_info_value(get_annotation(*si, i))]
         var (ann_ptr, ann_count) = pack_annotation_list(ann_vals)
         var init_values <- [
             get_string_constant_ptr(g_builder, si.name),
@@ -5608,13 +5586,7 @@ class public LlvmJitVisitor : AstVisitor {
         var tidx = getE(expr.arguments[1])
         assume subExprT = expr.arguments[0]._type
         var tab_ptr = LLVMBuildPointerCast(g_builder, tsrc, types.LLVMVoidPtrType(), "tab_ptr")
-        var keyType : Type
-        if (subExprT.firstType.isWorkhorseType) {
-            keyType = subExprT.firstType.baseType
-        } else {
-            var uvt = get_underlying_value_type(subExprT.firstType)
-            keyType = uvt.baseType
-        }
+        let keyType = table_key_storage_base_type(subExprT.firstType)
         var res = build_table_erase(keyType, tab_ptr, tidx, subExprT.secondType.sizeOf, expr.at)
         setE(expr, res)
         return expr
@@ -5626,13 +5598,7 @@ class public LlvmJitVisitor : AstVisitor {
         var tidx = getE(expr.arguments[1])
         assume subExprT = expr.arguments[0]._type
         var tab_ptr = LLVMBuildPointerCast(g_builder, tsrc, types.LLVMVoidPtrType(), "tab_ptr")
-        var keyType : Type
-        if (subExprT.firstType.isWorkhorseType) {
-            keyType = subExprT.firstType.baseType
-        } else {
-            var uvt = get_underlying_value_type(subExprT.firstType)
-            keyType = uvt.baseType
-        }
+        let keyType = table_key_storage_base_type(subExprT.firstType)
         var res = build_table_at(keyType, tab_ptr, tidx, 0, expr.at)
         setE(expr, res)
         return expr
@@ -5644,13 +5610,7 @@ class public LlvmJitVisitor : AstVisitor {
         var tidx = getE(expr.arguments[1])
         assume subExprT = expr.arguments[0]._type
         var tab_ptr = LLVMBuildPointerCast(g_builder, tsrc, types.LLVMVoidPtrType(), "tab_ptr")
-        var keyType : Type
-        if (subExprT.firstType.isWorkhorseType) {
-            keyType = subExprT.firstType.baseType
-        } else {
-            var uvt = get_underlying_value_type(subExprT.firstType)
-            keyType = uvt.baseType
-        }
+        let keyType = table_key_storage_base_type(subExprT.firstType)
         var at_tab = build_table_find(keyType, tab_ptr, tidx, subExprT.secondType.sizeOf)
         var cond = LLVMBuildICmp(g_builder, LLVMIntPredicate.LLVMIntNE, at_tab, types.ConstI32(uint64(-1)), "")
         var resType = LLVMPointerType(type_to_llvm_type(subExprT.secondType), 0u)
@@ -5673,13 +5633,7 @@ class public LlvmJitVisitor : AstVisitor {
         var tidx = getE(expr.arguments[1])
         assume subExprT = expr.arguments[0]._type
         var tab_ptr = LLVMBuildPointerCast(g_builder, tsrc, types.LLVMVoidPtrType(), "tab_ptr")
-        var keyType : Type
-        if (subExprT.firstType.isWorkhorseType) {
-            keyType = subExprT.firstType.baseType
-        } else {
-            var uvt = get_underlying_value_type(subExprT.firstType)
-            keyType = uvt.baseType
-        }
+        let keyType = table_key_storage_base_type(subExprT.firstType)
         var at_tab = build_table_find(keyType, tab_ptr, tidx, subExprT.secondType.sizeOf)
         var res = LLVMBuildICmp(g_builder, LLVMIntPredicate.LLVMIntNE, at_tab, types.ConstI32(uint64(-1)), "")
         setE(expr, res)

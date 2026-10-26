@@ -1,9 +1,9 @@
 # Captured fixtures for the control-page suite
 
 Every file here - JSON, SSE, and the one captured WAV - came off a REAL
-dasllama-server run, never hand-written, so the page is tested against the wire
-shapes the server actually emits. If an endpoint's schema changes, re-capture
-rather than edit.
+dasllama-server run, except the rows marked hand-composed, so the page is
+tested against the wire shapes the server actually emits. If an endpoint's
+schema changes, re-capture rather than edit.
 
 ## Regenerating
 
@@ -45,12 +45,14 @@ Then capture (`B=http://127.0.0.1:18132`):
 | File | Command |
 |---|---|
 | `stats_multi.json` | `curl $B/v1/stats` (idle) |
+| `stats_cpu_pass.json` | on a box whose GPU serves `smol` whole (the Vulkan whole-model driver): `curl -X POST $B/v1/embeddings -d '{"input":"hi"}'`, then `curl $B/v1/stats` - the embeddings session is host-cached, so its one call runs on the CPU and `gpu_cpu_passes` carries a real `{reason, words, count}` entry |
 | `stats.json` | `stats_multi.json` with `models` cut to the active slot (a single-model server serves the same shape with one entry) |
 | `streams_idle.json` | `curl $B/v1/streams` (idle) |
 | `streams_active.json` | fire 2 concurrent chats (`max_tokens: 128`), then `curl $B/v1/streams` mid-flight; re-poll until one stream is `decoding`. Re-send one finished prompt first so `cache` carries a chain |
 | `config.json` | `curl $B/config` |
 | `exchange.json` | `curl $B/exchange` (a box with a fresh local tune -> the local-unshared state) |
 | `bench_idle.json` / `bench_done.json` | `curl $B/bench` before / after a run of the in-process mode - the roster server above (an in-tree `-jit` server, so the result reads `"exec":"jit"`; on an M1 Max the default slot serves on Metal, and the result says so) started with no `lcpp_bin`, `curl -X POST $B/bench`, then the GET once `state` reads `done` (a second or two on `smol`). The model path inside `ref_cmd` is the one edit, normalized like every other fixture's |
+| `bench_done_batched.json` | HAND-COMPOSED, not captured: `bench_done.json`'s shape with the batched row's three keys (`ours_tgb`, `tgb_sd`, `npl`) and its log lines, in the numbers a 5060 Ti box read for Llama-3.2-1B Q8_0, and `ref_cmd` carrying the `llama-batched-bench` line after the `;` the server writes where the row ran. Any slot serving two streams or more produces the row now (the streams host-cached where no whole-model driver homes them), so `bench_done.json`'s next capture on the roster server carries these keys too; this fixture pins what the page does with them |
 | `bench_failed.json` | the A/B mode: the same roster server started with `lcpp_bin` set to any path - a top-level key, above the `[[models]]` tables, or TOML files it under the last table (a source-tree daslang is what makes the mode `ab`), `curl -X POST $B/bench`, then the GET once it fails. An in-tree A/B run ALWAYS fails (lcpp_bench refuses `-jit` script runs - it measures released exes only), which is exactly the state `bench_failed` pins |
 | `exchange_matches.json` (hits) | run the test_exchange_client-style fake exchange on 18131, launch the server with `DASLLAMA_EXCHANGE_URL=http://127.0.0.1:18131`, then `curl $B/exchange/matches` - the hits pass through the server's real transform. `exchange_matches_unreachable.json` = same call with nothing on 18131 |
 | `images.json` | `curl $B/v1/images` |

@@ -21,6 +21,8 @@ require daslib/json public                // JV(...) for logger field payloads
 require daslib/json_boost                 // ?[] / ?? navigation — the sidecar provenance reader
 require dasllama/dasllama_common public   // QuantMode
 require dasllama/dasllama_math            // active_kernel_backend — the exec_fmt layout receipt
+require dasllama/dasllama_bench           // bench_row — the batched reference row's fold over its runs
+require daslib/strings_convert            // try_to_float — the batched reference exe's table cells
 require [tune_framework]                  // nolint:STYLE030,LINT019 — tune_status, the stamp provenance; empty without the framework
 require model_specs public                // the model-set table + its llm/official views
 require box_ident                         // derive_box_name — the hardware-keyed box tag
@@ -1923,7 +1925,7 @@ let private BENCH_ENV_VARS = fixed_array(
     "DAS_TUNE_MANIFEST", "DAS_TUNE_MODE",
     "DASLLAMA_ACCEL", "DASLLAMA_ACCEL_F16", "DASLLAMA_ACCEL_F16_STRIPS", "DASLLAMA_ACCEL_MIN_MMAC",
     "DASLLAMA_ACCEL_MIN_NTOK", "DASLLAMA_ALLOW_INTERP_LOAD", "DASLLAMA_BATCH_GRID_2D",
-    "DASLLAMA_BENCH_VERBOSE", "DASLLAMA_BOX", "DASLLAMA_CALLER_PRIO", "DASLLAMA_CONV_PROF",
+    "DASLLAMA_BENCH_VERBOSE", "DASLLAMA_BOX", "DASLLAMA_CALLER_PRIO", "DASLLAMA_CM2_TILE", "DASLLAMA_CONV_PROF",
     "DASLLAMA_COOPMAT", "DASLLAMA_CPU", "DASLLAMA_CPU_PREFILL", "DASLLAMA_EXPERT_REUSE",
     "DASLLAMA_FUSED_DECODE", "DASLLAMA_GPU", "DASLLAMA_GPU_ATTN", "DASLLAMA_GPU_CLS",
     "DASLLAMA_GPU_COMBINE", "DASLLAMA_GPU_DEC_SPAN", "DASLLAMA_GPU_DEC_TAIL", "DASLLAMA_GPU_MOE_SPLIT",
@@ -1946,7 +1948,8 @@ let private BENCH_ENV_VARS = fixed_array(
     "DASLLAMA_OS", "DASLLAMA_PIN_BACKEND", "DASLLAMA_PIN_PREFILL", "DASLLAMA_PREFETCH",
     "DASLLAMA_RAM_GB", "DASLLAMA_THREADS", "DASLLAMA_TRIM", "DASLLAMA_TRUTH_REFRESH",
     "DASLLAMA_VK_FA", "DASLLAMA_VK_HAZARD_PARANOID", "DASLLAMA_VK_HAZARD_TRACE",
-    "DASLLAMA_VK_IMPORT", "DASLLAMA_VK_MEMPRIO", "DASLLAMA_VK_REBAR", "DASLLAMA_VK_XFERQ")
+    "DASLLAMA_VK_IMPORT", "DASLLAMA_VK_KV32", "DASLLAMA_VK_MEMPRIO", "DASLLAMA_VK_NROW_BISECT", "DASLLAMA_VK_REBAR",
+    "DASLLAMA_VK_XFERQ")
 
 // quote on anything a shell reads as syntax, not just spaces — full cross-shell escaping is not
 // well-defined (cmd and POSIX disagree on the rules), so widen the trigger rather than pretend
@@ -2304,4 +2307,53 @@ def run_llama_bench(args : array<string>; var rows : array<LlamaBenchRow>; var r
 def run_llama_bench(args : array<string>; var rows : array<LlamaBenchRow>) : bool {
     var raw = ""
     return run_llama_bench(args, rows, raw)
+}
+
+//! the `llama-batched-bench` beside a llama-bench binary - the same directory, the same extension - or "" when
+//! the reference checkout did not build it
+def llama_batched_bench_sibling(bench : string) : string {
+    let sibling = path_join(dir_name(bench), base_name(bench) |> replace("llama-bench", "llama-batched-bench"))
+    return fexist(sibling) ? sibling : ""
+}
+
+//! the batched reference exe's `S_TG` cell - the summed decode rate - of its row at `npl` parallel sequences,
+//! read from the markdown table it prints (`| PP | TG | B | N_KV | T_PP s | S_PP t/s | T_TG s | S_TG t/s | T s | S t/s |`);
+//! 0 when no such row printed
+def llama_batched_bench_tg(raw : string; npl : int64) : double {
+    var lines <- split(raw, "\n")
+    var tg = 0.0lf
+    for (ln in lines) {
+        continue if (!(strip(ln) |> starts_with("|")))
+        var cells <- split(ln, "|")
+        if (length(cells) >= 10 && strip(cells[3]) == "{npl}") {
+            let parsed = try_to_float(strip(cells[8]))
+            if (parsed |> is_ok) {
+                tg = double(parsed |> unwrap)
+            }
+        }
+        delete cells
+    }
+    delete lines
+    return tg
+}
+
+//! the batched reference row at `npl` parallel sequences: `reps` runs of the batched exe, each its own process,
+//! the S_TG cells folded to a mean and a sample standard deviation. `why` names the failure - a run that printed
+//! no row - and the row then reads 0
+def llama_batched_ref_row(bin, mpath : string; ngl, threads : int; plen, ngen, npl : int64; reps : int) : tuple<row : BenchTest; cmd : string; why : string> {
+    let args <- llama_batched_bench_args(bin, mpath, ngl, threads, plen, ngen, npl)
+    let cmd = argv_line(args)
+    var rates : array<double>
+    rates |> reserve(reps)
+    for (_rep in range(reps)) {
+        let raw = run_capture_argv(args)
+        let tg = llama_batched_bench_tg(raw, npl)
+        if (tg <= 0.0lf) {
+            let tail = slice(raw, max(0, length(raw) - 400))
+            return (row = BenchTest(), cmd = cmd, why = "the batched reference exe printed no row at {npl} parallel sequences - tail: {tail}")
+        }
+        rates |> push(tg)
+    }
+    let st = bench_row("tg{ngen}@{npl}", rates)
+    return (row = BenchTest(tok_s = st.mean, stddev = st.sd), cmd = cmd, why = "")
 }

@@ -27,7 +27,7 @@ That works because the watchdog resolves what to supervise in this order, first 
    silently ignoring a typo would supervise the program with the wrong wiring and nothing would
    say so. A `server_args` array is the default for what follows `--`.
 3. **Layout discovery** - `main.das` means `daslang -jit main.das`, with the daslang found beside
-   it (`bin/Release/daslang(.exe)`) or beside the watchdog itself, which is how `bin/watchdog`
+   it (`daslang(.exe)`, `bin/Release/daslang(.exe)`, `bin/daslang(.exe)`, `build/daslang`) or beside the watchdog itself, which is how `bin/watchdog`
    in a source tree finds `bin/daslang`; exactly one program in the directory means that
    program - a `*.exe` file (a flat daspkg bundle keeps the suffix on Linux too), or on a Unix
    layout an executable file with no extension, which is how the macOS `.app` names its exe;
@@ -89,7 +89,9 @@ between them.
 at 20 MB with five backups, and echoed to stdout, except under `--stdio`, where stdout is the
 client's. `health_heartbeat` and `watchdog_stopped`
 carry `heap_bytes` and `string_heap_bytes`, the supervisor's own live heaps: the host collects
-them between ticks, and a number that only grows across heartbeats is a leak. `child_started`
+them between ticks and once more before the supervisor's stop record reads them (the host installs
+that collect; the in-process tests run the supervisor without it), so the stop record carries the
+live set, and a number that only grows across heartbeats is a leak. `child_started`
 carries `pid` from the supervisor and `command` from the front, whose pipe reports no pid;
 `child_exited` carries `code`, with `uptime_seconds` from the supervisor and `answered` from
 the front, whether the child answered a request before it died; `child_noise` and

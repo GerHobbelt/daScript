@@ -2288,17 +2288,17 @@ Module strudel_synth
 
 ### Drum renderers
 
-- `render_bd`
-- `render_cowbell`
-- `render_cp`
-- `render_crash`
-- `render_hh`
-- `render_oh`
-- `render_ride`
-- `render_rimshot`
-- `render_sd`
-- `render_tambourine`
-- `render_tom`
+- `render_bd` - Render an 808-style kick drum as a mono buffer at SAMPLE_RATE.
+- `render_cowbell` - Render a cowbell: two detuned square-wave tones through a narrow bandpass, with a second quieter strike 8 ms later.
+- `render_cp` - Render a hand-clap: a sharp bandpassed noise burst (~1.1 kHz) with a metallic bright edge and a long room tail.
+- `render_crash` - Render a crash cymbal: lower-pitched bell partials plus a broadband metallic wash with a medium-fast decay.
+- `render_hh` - Render a closed hi-hat: metallic oscillator bank layered with a short tonal bell (~180 Hz), plus room.
+- `render_oh` - Render an open hi-hat: the same metallic oscillator bank as hh but with a much slower decay.
+- `render_ride` - Render a ride cymbal: two bell partials (~340/387 Hz) plus a metallic shimmer, with a long sustain.
+- `render_rimshot` - Render a rimshot/side-stick: a short woody body (~200 Hz) plus a bandpassed noise snap and a high transient click.
+- `render_sd` - Render a snare drum as a mono buffer: tonal body (~220/330 Hz) plus high-passed noise for the wires, with a short room tail.
+- `render_tambourine` - Render a tambourine: high-passed noise with two narrow bandpass jingle peaks (~3.8 kHz and ~8.8 kHz) and a delayed second hit.
+- `render_tom` - Render a tom drum at `base_freq` with a BD-style body + beater click + impulse + resonant-head overtones and a short room.
 
 ### Oscillator type
 
@@ -3174,11 +3174,14 @@ CPU large-language-model inference in pure daslang: load a GGUF model, tokenize,
 - `dlim_clean` - Garbage-collect `STALE` and `OTHER` images beside `gguf_path` (`FOREIGN`, another flavor's, are always left alone): `apply = false` only reports, `true` removes; `keep_other` spares `OTHER`.
 - `dlim_inventory` - List the prepared images (`.dlim`) minted beside `gguf_path` — per image: file, bytes, image version, identity, and a verdict (`CURRENT` loads; `STALE vN` is an older image version; `OTHER` a different bake configuration or box; `FOREIGN` a different flavor).
 - `get_dispatch_worker_limit` - The dispatch worker cap in force (0 = no limit) — `set_dispatch_worker_limit`'s read half.
-- `get_jobque_spin_us` - The spin window in force — `set_jobque_spin_us`'s read half.
+- `get_jobque_spin_gpu_us` - The GPU-served spin window — `set_jobque_spin_gpu_us`'s read half.
+- `get_jobque_spin_in_force` - The spin window the pool runs right now: the GPU window while the whole-model driver serves the loaded model, the CPU window otherwise.
+- `get_jobque_spin_us` - The CPU spin window — `set_jobque_spin_us`'s read half.
 - `get_single_thread` - Whether every kernel runs on the calling thread — `set_single_thread`'s read half.
 - `kernel_backend_available` - True when kernel backend `name` is registered AND its availability witness passes on this box — the detection probe behind defaults-first backend selection (the vulkan witness enumerates devices once and caches its verdict).
 - `select_matmul_backend_for_load` - Select the best matmul backend for the NEXT model load (honors a pin).
 - `set_dispatch_worker_limit` - Cap the kernel-dispatch worker count (0 = no limit, all job-que workers).
+- `set_jobque_spin_gpu_us` - The workers' spin-before-park window while the whole-model GPU driver serves the loaded model (default 500 us; a worker still spinning at the step's submit starves the driver).
 - `set_jobque_spin_us` - The workers' spin-before-park window in microseconds (0 = park at once).
 - `set_single_thread` - Run every kernel on the calling thread: no dispatch to the job queue at all, whatever queue exists.
 
@@ -3195,7 +3198,22 @@ CPU large-language-model inference in pure daslang: load a GGUF model, tokenize,
 - `moe_gpu_tier_arm` - Arm the recorded tier want so a GPU backend can install its hooks — call between `set_gpu_tier_want` and `load_model`.
 - `moe_gpu_weight_budget` - The armed backend's resident-weight VRAM budget in bytes (0 = no GPU backend armed).
 - `set_gpu_tier_want` - Record the GPU tier request the NEXT `moe_gpu_tier_arm`/`load_model` honors — the programmatic form of the core `DASLLAMA_GPU_*` knobs (an env var present overrides its field; the classifier/dense-arm knobs are env-only).
-- `set_resident_prefill_allowed` - Allow or pin out the resident-decode prefill arm.
+- `set_resident_prefill_allowed` - Allow or pin out the resident prefill arm for HOST-CACHED sessions: more of them than the driver has K/V regions would strand device-only rows.
+
+### Operations: serving from the device
+
+- `create_device_session` - Create a DEVICE-HOME session: its K/V cache lives only in the armed GPU driver's region - no host cache, nothing over the bus per token.
+- `gpu_cpu_passes` - Calls the armed GPU path handed back to the CPU rails since the model armed, one row per reason that fired: its name, the same in words a status page prints, the count.
+- `gpu_device_kv_adopt` - Hand the first `npos` rows a kept `claim` holds to the fresh device-home `session`, whose `n_past` becomes `npos`.
+- `gpu_device_kv_park` - A FINISHED device-home session lets go of its K/V region and answers the claim its rows stay under (0 = none) - call it before every such session's `delete`.
+- `gpu_device_prefill_continues` - A device-home session of `model` prefills from a position past zero - a prompt in chunks, a turn over the turns before it.
+- `gpu_device_prefill_window` - The positions the device prefills in one window - the shortest chunk worth handing a device-home session.
+- `gpu_device_session_ctx` - The positions one device-home session holds - the armed driver's per-region context.
+- `gpu_device_session_dtype` - The K/V codec a device-home session must carry: the armed driver's.
+- `gpu_device_sessions` - How many DEVICE-HOME sessions (`create_device_session`) the installed model serves at once: the armed driver's region count, 0 when the model is not served whole from the device.
+- `gpu_resident_decline` - Why the whole-model GPU driver does not serve the model loaded last: its decline reason (with the remedy where one exists), or why it was never attempted.
+- `set_gpu_ctx_max` - Cap the whole-model GPU driver's K/V context at `n` positions per region for the models loaded next (0 lifts it): a server's `ctx`.
+- `set_gpu_resident_regions` - Ask the whole-model GPU driver for `n` K/V regions on the models loaded next, so `n` sessions keep their K/V on the device at once - a server's stream count.
 
 ## dasllama_tts
 
@@ -3213,6 +3231,7 @@ Text to speech in pure daslang: load a converted StyleTTS2-lineage GGUF (KittenT
 ### Structures
 
 - `TtsModel` - A loaded TTS model: the shared assembly, the family's driver data, and the front-end packs read beside the GGUF.
+- `TtsVoicePrompt` - Portable Pocket codec latents.
 - `TtsCaps` - What a loaded TTS model can do: its voices (canonical names; aliases resolve in the family file), the PCM rate it emits, the languages it speaks, whether it clones a voice from audio, and whether a speed means anything to it.
 - `TtsTimings` - Where a synthesis spent its time, in microseconds of wall clock, model loading excluded: the text front end, then each model stage.
 - `TtsAudio` - Synthesized speech: mono f32 PCM at `sample_rate`, with the time it took.
@@ -3232,7 +3251,10 @@ Text to speech in pure daslang: load a converted StyleTTS2-lineage GGUF (KittenT
 
 ### Voices
 
+- `tts_prepare_voice_prompt` - Encode a reference once for shipping as a voice prompt.
 - `tts_register_voice` - Clone a voice: `pcm` (mono, at the model's own sample rate - `caps().sample_rate`) joins the roster under `name` and speaks from the next synthesis on.
+- `tts_register_voice_prompt` - Add or replace a named prepared voice without a codec encoder.
+- `tts_voice_prompt_valid` - Validate bounded finite latent frames and the model's language/codec geometry before registration.
 
 ### Text front end
 
@@ -3244,6 +3266,8 @@ Text to speech in pure daslang: load a converted StyleTTS2-lineage GGUF (KittenT
 
 - `synthesize` - Text -> speech: normalize, chunk by sentence, phonemize, map into the family's symbols, synthesize; the chunks concatenate, the timings sum.
 - `synthesize_stream` - Text -> speech, one sentence-sized chunk at a time: the block receives each chunk's audio as soon as it exists, in order.
+- `tts_release_scratch` - Free the activation scratch a synthesis or a clone left behind - the carrier of either family (a StyleTTS2 carrier whose noise the parity rail captured stays) and the block home's scratch globals; the next run grows them back for a few milliseconds.
+- `tts_set_chunk_chars` - Cap the chunk a synthesis speaks at `chars` codepoints (default `TTS_CHUNK_CHARS`; under one is refused): the peak memory a say holds is the largest chunk's, so a memory-tight platform lowers it and the same text speaks in more, shorter pieces, each its own synthesis.
 
 ### The served lane
 
@@ -3533,7 +3557,7 @@ The RTTI module exposes runtime type information and program introspection facil
 - `create_ast_deserializer` - Creates deserializer.
 - `create_ast_serializer` - Creates serializer object.
 - `delete_ast_serializer` - Frees memory for ast_serializer.
-- `deserialize_program` - Deserializes the next program from the stream and calls `block` with it, the way the two-argument form does, and gives the restored program `access` as its own: a stream carries no file access, and a `require_module_now` issued from the program's macros or `[init]` walks through its program's access, so a reader that restores programs whose code requires modules late passes the access it would have compiled them with.
+- `deserialize_program` - Deserializes the next program from the stream and calls `block` with it, the way the three-argument form does, and gives the restored program `access` as its own: a stream carries no file access, and a `require_module_now` issued from the program's macros or `[init]` walks through its program's access, so a reader that restores programs whose code requires modules late passes the access it would have compiled them with.
 - `for_each_expected_error` - Iterates through each expected compilation error declared in the `Program` (via `expect`), yielding the error code for each.
 - `for_each_require_declaration` - Iterates through each `require` declaration of the compiled `Program`, yielding the module name, public/private flag, and source `LineInfo`.
 - `serialize_program` - Serializes program to serializer object.
@@ -3848,6 +3872,7 @@ The AST module provides access to the abstract syntax tree representation of das
 - `TypeDecl.isBitfield` - Returns whether the given type is a bitfield type.
 - `TypeDecl.isLocal` - Returns whether the given type is a local type that can be allocated on the stack.
 - `TypeDecl.hasClasses` - Returns whether the type definition contains any class types.
+- `TypeDecl.isSafeToDelete` - Returns whether a value of the given type is safe to delete, meaning that deleting it does not require an unsafe block.
 - `TypeDecl.hasNonTrivialCtor` - Returns whether the type definition contains any non-trivial constructors.
 - `TypeDecl.hasNonTrivialDtor` - Returns whether the type definition contains any non-trivial destructors.
 - `TypeDecl.hasNonTrivialCopy` - Returns whether the type definition contains any non-trivial copy operations.
@@ -4886,6 +4911,8 @@ The AST_BOOST module provides high-level utilities for working with the AST. It 
 - `isVectorType` - Returns `true` if the given `Type` is a vector, range, or urange type (`int2`..`int4`, `uint2`..`uint4`, `float2`..`float4`, `range`, `urange`, `range64`, `urange64`).
 - `is_class_method` - Returns `true` if a `TypeDeclPtr` field represents a class method — a non-dim `tFunction` whose first argument is the class structure (or a parent of it).
 - `is_same_or_inherited` - Returns `true` if `child` is the same `Structure` as `parent` or is transitively inherited from `parent` by walking the parent chain.
+- `peel_distinct` - Returns the type under every `distinct` level; a type that is not distinct comes back as is.
+- `table_key_storage_base_type` - Returns the base type a table key is stored and hashed as: a `distinct` key peels to its underlying type, a handled key to its value type.
 
 ### Annotations
 
@@ -5934,6 +5961,7 @@ The JOBQUE_BOOST module provides high-level job queue abstractions built on the 
 - `pop` - Blocking pop from the stream.
 - `pop_and_clone_one` - reads one command from channel
 - `pop_archive` - Blocking pop + deserialize via `daslib/archive`.
+- `pop_archive_with_timeout` - Pop + deserialize, waiting at most `timeout_ms`.
 - `pop_one` - reads one command from channel
 - `pop_with_timeout` - Pop from channel with timeout in milliseconds.
 - `pop_with_timeout_clone` - Pop from channel with timeout and clone.
@@ -6421,7 +6449,7 @@ The LINQ_FOLD module provides the `_fold` and `_old_fold` call macros that rewri
 
 ### Call macros
 
-- `_fold`
+- `_fold` - implements _fold(expression) that folds LINQ expressions into optimized sequnences for example::
 
 ## lint
 
@@ -7412,16 +7440,16 @@ The STRINGS_CONVERT module provides soft-failing string-to-numeric conversions t
 
 ### Soft-failing conversions
 
-- `try_to_double`
-- `try_to_float`
-- `try_to_int`
-- `try_to_int16`
-- `try_to_int64`
-- `try_to_int8`
-- `try_to_uint`
-- `try_to_uint16`
-- `try_to_uint64`
-- `try_to_uint8`
+- `try_to_double` - Parse `str` as a 64-bit float.
+- `try_to_float` - Parse `str` as a 32-bit float.
+- `try_to_int` - Parse `str` as a signed 32-bit integer.
+- `try_to_int16` - Parse `str` as a signed 16-bit integer.
+- `try_to_int64` - Parse `str` as a signed 64-bit integer.
+- `try_to_int8` - Parse `str` as a signed 8-bit integer.
+- `try_to_uint` - Parse `str` as an unsigned 32-bit integer.
+- `try_to_uint16` - Parse `str` as an unsigned 16-bit integer.
+- `try_to_uint64` - Parse `str` as an unsigned 64-bit integer.
+- `try_to_uint8` - Parse `str` as an unsigned 8-bit integer.
 
 ## temp_strings
 

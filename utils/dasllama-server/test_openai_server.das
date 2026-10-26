@@ -691,6 +691,10 @@ def test_bench_inprocess(t : T?) {   // nolint:STYLE038 — one live server sess
                     let tg : double = r?["ours_tg"] ?? 0.0lf
                     t |> success(pp > 0.0lf, "pp512 measured: {pp} tok/s")
                     t |> success(tg > 0.0lf, "tg128 measured: {tg} tok/s")
+                    t |> equal(int(r?["npl"] ?? 0l), 4, "the slot serves four streams, so the batched row rides host-cached through the CPU batched stack")
+                    let tgb : double = r?["ours_tgb"] ?? 0.0lf
+                    t |> success(tgb > 0.0lf, "tg128@4 measured: {tgb} tok/s summed")
+                    t |> success(find(r?["ref_cmd"] ?? "", "llama-batched-bench") >= 0, "the batched reference's command line rides along")
                     t |> equal(int(r?["reps"] ?? 0l), 3, "three reps per row")
                     t |> success(find(r?["ref_cmd"] ?? "", "llama-bench") >= 0, "the llama-bench comparison line rides along")
                     t |> equal(r?["model"] ?? "", "test-llm", "the row names the slot it ran on")
@@ -704,13 +708,16 @@ def test_bench_inprocess(t : T?) {   // nolint:STYLE038 — one live server sess
                 }
                 let logs = js?["log"]
                 var sanity = false
+                var warned = false
                 if (logs != null && logs is _array) {
                     for (lv in logs as _array) {
                         let line : string = lv ?? ""
                         sanity = sanity || find(line, "sanity (pp512)") >= 0
+                        warned = warned || find(line, "ran on the CPU instead of the GPU") >= 0
                     }
                 }
                 t |> success(sanity, "the pp warmup passed the logit sanity check and said so")
+                t |> success(!warned, "a CPU slot's rows pass nothing to the CPU from a GPU: no warning line")
                 unsafe {
                     delete js
                 }
@@ -1092,6 +1099,9 @@ def test_openai_server_multimodel(t : T?) {   // nolint:STYLE038 — one live tw
                                 t |> equal(e?["backend_effective"] ?? "", "cpu")
                                 t |> equal(e?["cached_tokens"] ?? -1l, 0l)
                                 t |> equal(e?["holds_gpu"] ?? true, false)
+                                t |> equal(e?["served"] ?? "", "CPU")
+                                t |> equal(e?["served_note"] ?? "?", "", "a slot that asked for the CPU has nothing holding it back")
+                                t |> equal(e?["device_kv"] ?? true, false)
                             }
                         }
                     }

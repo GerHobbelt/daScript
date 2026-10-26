@@ -103,8 +103,8 @@ seeded, at depth 1 and 2, temp 0.7 / top-k 1 / penalty 1.1 so every draw is the 
 and the stream stays deterministic; on a verify tag it rides the assistant round inside the
 `mtp-count-<tag>` attach). The same
 file carries the BATCH RAIL's parity arms per verify-fixture tag `l1b g12 q30 q38
-g26` (Llama-3.2-1B, gemma-4-12B, Qwen3-30B-A3B, Qwen3.8-27B head-less - the hybrid graph the rail
-declines, gemma-4-26B-A4B): `mtp-dff-<tag>` = distinct sessions, GPU batch step vs GPU single step
+g26` (Llama-3.2-1B, gemma-4-12B, Qwen3-30B-A3B, Qwen3.8-27B head-less - one recurrent session's
+rows the rail declines as `dn_state`, gemma-4-26B-A4B): `mtp-dff-<tag>` = distinct sessions, GPU batch step vs GPU single step
 at B=2/B=4 on identical real-text tokens plus one CPU reference row (the batch rail's logits gate -
 the support matrix's batch cell only proves ENGAGE); `mtp-vff-<tag>` takes both tag families;
 `mtp-vff1-<tag>` = one row through the batch driver (the encoder alone, no row mixing);
@@ -157,10 +157,11 @@ fam-gemma4/fam-qwen3moe/fam-gemma4moe/fam-gptoss/fam-qwen35moe/fam-qwen2moe are
 DASLLAMA_PARITY_FULL-gated - 7.4/18.5/26.9/12.1/22/15GB; fam-gemma4moe and fam-gptoss are ENGAGE
 + shallow logits TOLERANCE cells only - token parity is not a valid instrument for the 26B, whose double-router
 CPU differs from any float implementation by ~2.5 logits/step by construction;
-fam-qwen35/fam-qwen35moe are deltanet hybrids whose batch cell asserts the per-row FALLBACK
-shape - metal batch steps 0, both rows served on the single-decode path; fam-qwen2moe's
-batch cell asserts the `graph` DECLINE on the planar model - shexp has no batch arm, and a
-blob twin's CPU batch fallback would trip the blob-only panic).
+fam-qwen35's batch cell asserts the batched step ENGAGES on the deltanet hybrid's blob twin
+and compares it against the single-row GPU step; fam-qwen2moe's batch cell compares the blob
+twin's batched step against the CPU batched stack on the planar model - the two arms the
+batched driver gained, deltanet rows against per-session mirrors and the shared expert's rows
+site; fam-qwen35moe keeps the per-row FALLBACK assertion until the MoE hybrid's arm lands).
 
 The `image` suite (test_model_image - the prepared-image .dlim rail): `mechanics` (synthetic
 carrier, model-free - runs with no model stocked; also the layout fingerprint; the split-scale
@@ -365,11 +366,11 @@ partner (the output bias row past the norm row) against the seam and the CPU ora
 `test_vkd_act_family` runs the unbiased act kernels under the clamped swiglu beside silu and adds
 the biased twins (`q8_actrq_b_cls`, `actf16_b_cls`) over a six-expert bias plane, `test_vkd_fa_cm2`
 / `test_vkd_fa_khr` and `test_vkd_da_attn` add the sink arms (the h64 flash stamps whole and under
-a 40-key window; the token command's f32 and f16 sink twins unsplit and split with the sink
-combine), each with the sink-free oracle as the control, and `test_vkd_fa_stamp_refusals` covers
+a 40-key window; the token command's f32 and f16 sink twins unsplit and split, the last piece's
+combine seeding the sink), each with the sink-free oracle as the control, and `test_vkd_fa_stamp_refusals` covers
 the sink refusals -
 `test_vkd_da_attn_rqk` (the decode attention with the Q8_0 and Q8_K requant folded into its store,
-the pass and the combine), `test_vkd_da_attn_bw` (the batched windowed decode attention over a
+unsplit and split - the pass stores the row either way, its last piece combining), `test_vkd_da_attn_bw` (the batched windowed decode attention over a
 restricted horizon), `test_vkd_fa_cm2_h256_softcap` (the gemma-2 softcap tile, the no-cap control in
 the same run) and `test_vkd_fa_cm2`'s h512 arm (gemma-4's global heads, the f16 O twin against the
 f32 stamp); the KHR twins `test_vkd_fa_khr` and `test_vkd_fa_khr_h256_softcap` run the same fixture
@@ -381,7 +382,9 @@ store lister admitting `records/{box}.json` alone) and the record rig's shared s
 `-w` workload scope; the stored-row->rig-leg map, `backend`/`flavor` => `metal` | plain cpu |
 `accel`, else refused; the tune-stamp gate; the oracle compare's ok/warn/fail bands; the
 upstream image-reference parser `parse_mtmd_image` - encode summing, the MTMD_TIMING split,
-its refusal arms); plus the committed-records sweeps: image-chat receipts match their
+its refusal arms; the batched reference parser `llama_batched_bench_tg` - the `S_TG` cell of
+the row at `npl` alone, 0 on a missing row, a missing table or a cell that is not a number -
+and `llama_batched_bench_sibling` reading "" beside a missing reference); plus the committed-records sweeps: image-chat receipts match their
 `backend`/`flavor` stamps and pin the fixture and mmproj, and every das row's `tune_sha`
 resolves to its committed generation archive.
 `test_exchange_schema.das` - model-free: the exchange validator, sweeping the ENTIRE in-tree
@@ -433,7 +436,9 @@ The SmolLM cells drop the loaded model's GPU state (`moe_gpu_drop_model`) so the
 the CPU rails under `DASLLAMA_GPU=1` too: their bit-exact claims hold on one lane, and the
 tier's device prefill, resident batch decode and CPU prefill round differently. Its two-stream
 deltanet cell needs Qwen3.5-0.8B-Q8_0 and `DASLLAMA_GPU=1` on a box whose tier serves the
-deltanet decode step, and skips otherwise.
+deltanet decode step, and skips otherwise. `test_scheduler_device_mode_switch` holds the device
+mode's two CPU-decidable contracts: only an idle scheduler switches its session kind, and
+`submit` refuses a media request in device mode while it takes the same request with the mode off.
 `test_gpu_serving_declines.das` - model-free: the whole-model driver's decline reasons decided
 from a Config or a synthetic Model shell (`resident_unserved_features`,
 `attn_chain_unserved_features`, `resident_layer_decline`) - every unserved feature and layer
@@ -456,7 +461,9 @@ only case that isolates the roster, since no format one admits the other refuses
 carries an off-lattice dense width past `mm_tile_widths_64_ok` and past `decode_shape_decline`
 on both the decode and the batch needs mask, and the same width on a dense twin declines
 both. `test_plan_room` is the GPU plan's room arithmetic - the tier cap less headroom, capped by
-the OS's room where the OS answers.
+the OS's room where the OS answers. `test_resident_region_ctx` is a mirror region's share of its
+side's one binding: the whole of it at one region, a quarter at four, the session's own context
+where that is shorter, and one region for a count under one.
 
 `test_gpu_resident_hybrid.das` - stocked suite, `-jit` only; the whole-model resident driver on a
 deltanet hybrid under `DASLLAMA_GPU=1`. Each fixture is a row in `../performance/model_specs.das`:
@@ -509,6 +516,68 @@ kernel name nothing seeded, so a misspelt key cannot read as a zero count.
 stage on the device - the hybrid file's forced-feed logits-tolerance form (its K-quant 6% bar,
 the one-step-off control) at one window and two windows, with the arm witnesses that the model
 carries the bias and the driver armed on it; skips without the model or the armed tier.
+`test_gpu_resident_llama.das` - stocked suite, `-jit` only; the whole-model resident driver on the
+llama family (Llama-3.2-1B Q8_0, Llama-3.2-3B Q8_0, Llama-3.1-8B Q4_K_M, `DASLLAMA_GPU=1`): the
+NORM rope, no q/k/v bias, no q/k norm, the tied classifier of the 3.2 files - the qwen2 file's
+forced-feed form and bar at one window and two windows per carrier, with the arm witnesses that
+the file is a llama with neither bias nor NEOX rope, and the pool's spin-window witness - the
+GPU-served window in force while the driver is armed, the CPU window back after the drop; the 1B
+also runs the batched bench row (`bench_tg_batched_rep`): a row asking more streams than the
+device homes refuses by name and reads 0, and a row it homes serves at a rate with every stream
+parked after it and no call passed to the CPU chain. The forced-feed helpers it shares with the
+other resident files live in `_resident_feed.das`. Skips without the model or the armed tier.
+`test_metal_batched_row.das` is the row's Metal twin: with no whole-model driver homing a
+stream the row runs host-cached through the Metal batched driver - Llama-3.2-1B Q8, the
+E-series gemma-4-E2B Q8, the shared-expert Qwen1.5-MoE-A2.7B Q8 (large-tier), the deltanet
+hybrid Qwen3.5-0.8B Q8 and, under the scheduler's self-speculative mode, Qwen3.5-0.8B-MTP Q8 -
+a rate, every timed step counted a device step by `batch_step_census`; the MTP carrier also
+runs the joint-verify invariance cell: three speculative streams admitted together emit,
+token for token, what each emits alone on a one-stream speculative scheduler (the verify's
+rows forms are per row, so the joint pass and the solo pass round alike). Stocked suite; skips
+off the JIT, without dasMetal, or without the carrier. The row's refusal contract - a timed step that ran its rows one at a time refuses by
+name and reads 0 - lives in `test_batch_decode.das` on the SmolLM2 fixture with the rope table
+off, where every step is per-row by construction.
+`test_gpu_resident_regions.das`, `test_gpu_resident_regions_e2b.das`,
+`test_gpu_resident_regions_hybrid.das` and `test_gpu_resident_regions_llama_k.das` (`_resident_regions.das` carries the cells; one model a file; the llama file is Llama-3.2-1B Q4_K_M, the two batched-step cells on a K-quant carrier - the N-row command's K-quant GEMV leaves and its split Q8_K sites - held to the split bar with the one-token-off control rather than bit for bit, since those sites round apart from the one-row command's, `../followup_vulkan.md` item 75) - stocked suite, `-jit` only; the resident driver's mirror
+regions and the device-home sessions over them (a carrier loaded at two regions through
+`set_gpu_resident_regions_`, the rig's context 8192). The instrument is the driver against
+itself, so no CPU reference chain runs. The bit-for-bit cells: a session stepped between another
+session's single steps, and a batched step over both, each read what the session reads alone,
+the two prompts differing in content and length so a crossed region cannot land there, the
+claims unchanged through the batched steps (no history came up from the host again); the same
+batched steps past the unsplit position (both prompts longer than `RD_UNSPLIT_POS`, so the N-row
+command's split attention form serves, its arrival counters a row apart); the same
+with device-home sessions, which allocate no host cache, prefill on the device under the
+server's prefill pin (`set_resident_prefill_allowed(false)`) and come through a hydrate
+untouched; the pin - with both regions held by
+live device-home sessions a host-cached outsider passes as `busy`, the owners step on
+untouched, and a parked region is the next outsider's; and the scheduler's device mode
+against the host-cached scheduler over four requests on two streams (`_scheduler_rig.das`, shared
+with `test_scheduler.das`): token for token where the two sides run one code path - each prompt
+one window-chain call, each step the batched token command, the prefill counter pinning it -
+and for the second turn, which adopts the rows of the turn it continues and so splits its
+prefill, the adopted count alone. Every cell holds `gpu_cpu_passes_()` empty
+(the pin cell its one `busy`). The qwen2 file adds the tolerance cells, at the 6% bar of
+`test_gpu_resident_qwen2.das`: one prompt prefilled in one call against two calls, cut at 40
+of 57, 512 of 600 and 300 of 900 (the cuts placed against the engine's `PF_WINDOW`, asserted),
+a prompt one token short the control, then four decoded steps over the continued rows, each
+against the step before it as its control; the chat shape (a prompt, steps, a second turn through the
+window chain against the same tokens stepped one by one); and the parked claim adopted once,
+then refused twice (spent by its adoption, and dead after another session took its region) - every site that holds the bar
+carries its own one-token-off control, and every compare logs both sides' argmax. The E2B file runs the bit-for-bit
+cells on the E-series carrier, where a batched row carries its own per-layer-embedding side
+input, and the hybrid file on Qwen3.5-0.8B, where each recurrent layer's one device state slot
+goes to whichever session steps and a second session's prefill sends the first one's state home
+before it zeroes the slot; its scheduler cells hold that a recurrent model parks and adopts no rows and prefills a long
+prompt in one call, where the qwen2 carrier's 700 tokens reach the device in two window-sized
+chunks under a 64-token scheduler chunk. The qwen2 file also holds the guards - a third
+device-home session over two regions panics with its `busy` counted and the owners step on
+untouched - the driver's reports (every pass reason reads in words of its own, the plan's K/V
+scales with the region count and a count under one plans one, the tier status counts both
+mirror sides, a load under a switched-off route says `not attempted`), and the two passes that
+bring their rows down first: a prefill that skips positions (`gap`) and one past the region's
+context (`cap`, on a load capped at 4096 positions). Each skips without its model or the armed
+tier.
 `test_gpu_resident_gemma*.das` (`_gemma_resident.das` carries the cells; one model a file:
 `gemma3_1b`, `gemma3_4b`, `gemma2`, `gemma4_12b_q8`, `gemma4_12b_k`, `gemma4_e2b`, `gemma4_e4b`,
 `gemma4_26b`, `gemma4_26b_k`, `gemma4_31b` - a process loads one carrier, so no cell inherits another model's device state, and a GPU run
@@ -910,11 +979,14 @@ conditioning and EOS logit per frame, the latents and the waveform, plus a free 
 facade cells - caps (cloning, no speed, one language, the 19-voice roster), the reference's chunk lists over
 multi-sentence texts, one sentence spoken with the family's own timing stages, a cloned voice
 joining the roster and speaking, and the refusals (an unknown voice, a speed, a phoneme request,
-a clip at another rate); the q8 lane (the served default: the GEMMs minted q8, the one-channel
-convs f32, teacher-forced frames logged against the f32 oracle at an rms figure, the free run's
+a clip at another rate); the q8 lane (the served default: the GEMMs minted q8, every codec
+conv f32, teacher-forced frames logged against the f32 oracle at an rms figure, the free run's
 frame count and speech - the rig is the lane's quality gate); the published Q8_0 file
-(`pocket-tts-en-q8.gguf`) against the f16 file's load-time quants - every backbone GEMM and
-32-wide codec conv arrived as Q8_0, the same lane within a few percent; and the five other
+(`pocket-tts-en-q8.gguf`) against the f16 file's load-time quants - every backbone GEMM arrived
+as Q8_0 and no codec conv did, the same lane within a few percent; the quiet floor
+(`pocket-tts-en-kq.gguf` alone): the served lane's differenced quiet-window floor within 6 dB of
+the f32 lane's on one two-sentence text, with a hissed copy of the reference as the control
+that lands outside the bar; and the five other
 languages (`pocket-tts-{de,es,it,pt,fr}-q8.gguf`, oracle dirs `tts_oracle/pocket_<config>/`
 minted over `_tts_fixtures/pocket_sentences.json`, token fixtures `pocket_tokens_<config>.json`):
 the language code and the one default voice, the tokenizer on the language's own sentences
@@ -925,19 +997,38 @@ teacher-forced latents of the kq lane held to the q8 lane of the same file at th
 poisoned-expectation control, the f16 twin's distance logged, the exact lane speaking) and the
 one-voice `pocket-tts-en-stuart-kq.gguf` (no codec encoder: `caps()` reports one voice and
 `cloning = false`, the stored voice speaks from its latent frames, `tts_register_voice` refuses
-by name).
+by name). The prepared-prompt transfer cell uses both KQ files and the checked-in
+`modules/dasLLAMA/models/jfk_ask_not.wav`: encode a one-second reference, serialize it,
+destroy the source model, register in the encoder-free model, and assert finite audible
+speech plus lazy conditioning-state creation. It skips if either KQ model is absent.
 `test_tts_facade.das` - stocked suite; model-free cells: the sentence chunker (the reference
 driver's boundary rule, the cap counted in codepoints, the hard split of a whitespace-free run,
 the appended comma as Kitten's driver rule and the bare text Kokoro's sends), the normalizer the
 facade exposes (`tts_normalize`: abbreviation, decimal, money, clock, date, ordinal, percentage,
 unit, empty), the voice refusal a pack whose name carries NO language draws (hand-built model -
 the sentence must not render an empty code), the WAV container, the codec's malformed-lead and
-astral arms, kitten's dropped-symbol rule, and the `rtf` guard; model-gated (`kitten-nano.gguf` +
-the front-end packs): the streaming form's chunks concatenate to the buffered synthesis sample for
-sample, one synthesis at one lane and the other at the box's lanes, the phonemizer on the corpus
-rail, the model-keyed chunker's Kitten arm (the driver's comma - the arm no model-free cell
-reaches), and the language form of `tts_phonemize` - the declared language reads as the bare form
-does, an undeclared one panics at the call site.
+astral arms, kitten's dropped-symbol rule, the `rtf` guard, and the chunk cap knob on the
+model's own chunker (`tts_set_chunk_chars` on a hand-built model: sixty short words one chunk at
+the default, ten or more pieces each under a 30-codepoint cap, the default restored; a cap under
+one refused by name), the release keeping a carrier whose noise was captured and emptying a drawn
+one, and the harmonic source's noise stream on a hand-built decoder (a captured stream drawn in
+the reference's order - phases, then normals row by row - against the phases from
+`styletts2_draw_noise` plus the source's own per-window draw, sample-identical; another seed
+moving most samples; the window knob read back from the carry's stride at the default, the whole
+run and five frames, each speaking the same samples; a negative window refused by name); model-gated
+(`kitten-nano.gguf` through `model_available` + the front-end
+packs): the streaming form's chunks concatenate to the buffered synthesis sample for sample, one
+synthesis at one lane and the other at the box's lanes, the phonemizer on the corpus rail, the
+model-keyed chunker's Kitten arm (the driver's comma - the arm no model-free cell reaches), the
+language form of `tts_phonemize` - the declared language reads as the bare form does, an
+undeclared one panics at the call site - and the idle release with the cap: the three-sentence
+text makes three chunks at the default cap, a synthesis leaves the generator rows and the
+initial phases in the carrier and no per-sample noise, the source's window-zero control speaks
+the same samples as the default window (the window set to `SOURCE_WINDOW_FRAMES` before the
+first synthesis and left there), `tts_release_scratch` empties the rows, the waveform and the
+phases and the next synthesis is sample-identical, and a 24-codepoint cap speaks the same text in
+more than three chunks, audible (peak over 0.05, a silent buffer the control) and 0.7 to 1.5 the
+uncapped length (half the stream the control).
 `test_tts_blocks.das` - model-free: the block home's two layouts against each other - every
 rows form (token-major [T][C]) held to its channel-major twin at the dot-envelope bar (a
 tolerance times the sum of |w|*|x| feeding each output, with a zeroed-tap poison leg that must
@@ -950,8 +1041,14 @@ sites the cap never touches - each axis carrying a witness arm that its narrow l
 rows GEMM to fewer lanes than its wide one) and the must-panic cells for the rows conv's shape
 refusals; then the continuous-audio family's kernels - the causal cached attention (`TtsKvCache`,
 `attention_causal_rows`) against its double-precision reference at a prompt, a decode step, a
-key window and a one-key window, bit-equal on both split axes, the cache's overflow panic - and
-`elu_rows`, `layer_scale_rows` and `pad_edge_left_rows` against their scalar forms.
+key window and a one-key window, bit-equal on both split axes, the cache's overflow panic -
+`elu_rows`, `layer_scale_rows` and `pad_edge_left_rows` against their scalar forms; and the
+harmonic source's window forms: each resampler's window form (output columns from the source
+columns its taps read, both at strides off the whole row, on both arithmetics and at the source's
+two scales plus two more) bit-equal to the whole row, the source itself in 1-, 5- and 16-frame
+windows bit-equal to the whole run on both arithmetics over a synthetic F0 with unvoiced frames
+and a drawn noise stream, its mix through `linear_rows` in windows bit-equal to the whole
+run's on both split axes, and a window past the carry's reset refused.
 `_tts_parity.das` - the rail both families run: token ids against the reference driver on every
 oracle case, identical durations on every case, and on the bring-up set every stage through the
 decoder output within 1e-4 of the oracle's peak, the sine source within 1e-4 fed the oracle's F0,

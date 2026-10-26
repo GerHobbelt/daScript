@@ -170,7 +170,7 @@ namespace das {
         bool isRawPod() const;
         bool isNoHeapType() const;
         bool isWorkhorseType() const; // we can return this, or pass this
-        bool isTableKeyType() const;  // workhorse or by value annotation
+        bool isTableKeyType() const;  // workhorse, by value annotation, or a distinct over one
         bool isPolicyType() const;
         bool isVecPolicyType() const;
         bool isReturnType() const;
@@ -805,6 +805,7 @@ namespace das {
     das::TypeDeclPtr DAS_API makeDistinctType(const das::ModuleLibrary & library, const char * typeName);
 
     DAS_API bool splitTypeName ( const string & name, string & moduleName, string & funcName );
+    DAS_API bool isPlainIdentifier ( const string & name );
 
     DAS_API bool isCircularType ( const TypeDeclPtr & type );
     DAS_API bool hasImplicit ( const TypeDeclPtr & type );

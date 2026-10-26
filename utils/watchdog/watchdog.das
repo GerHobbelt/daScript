@@ -189,7 +189,7 @@ def private load_config(folder : string) : LoadedConfig {
 }
 
 //! What to supervise, from the layout: `main.das` means script mode when a daslang sits beside it
-//! (`bin/Release/daslang(.exe)`) or beside the watchdog itself (a source tree keeps both in `bin/`);
+//! (`daslang(.exe)`, `bin/Release/daslang(.exe)`, `bin/daslang(.exe)`, `build/daslang`) or beside the watchdog itself;
 //! exactly one program - a `*.exe` file, or on a Unix layout an executable file with no extension,
 //! the watchdog's own executable aside - means that program. A `main.das` with no daslang in reach
 //! is refused, never traded for a program. Ambiguity is an error, never a guess.
@@ -201,12 +201,12 @@ def private discover_target(var cfg : WatchdogConfig; folder, program_dir : stri
             return ""
         }
         let exe = find_daslang(daslang_roots(program_dir, folder))
-        if (fexist(exe)) {
+        if (!empty(exe)) {
             cfg.script = script
             cfg.daslang = exe
             return ""
         }
-        return "watchdog: nothing to supervise in {folder} - main.das is there but no daslang sits beside it or beside the watchdog (bin/Release/daslang, bin/daslang, build/daslang). Pass --daslang, or --program for a standalone exe."
+        return "watchdog: nothing to supervise in {folder} - main.das is there but no daslang sits beside it or beside the watchdog (daslang, bin/Release/daslang, bin/daslang, build/daslang). Pass --daslang, or --program for a standalone exe."
     }
     var exes : array<string>
     dir(folder) $(fname) {
@@ -244,13 +244,21 @@ def private daslang_roots(program_dir, cwd : string) : array<string> {
     return <- [cwd, program_dir, dir_name(program_dir)]
 }
 
+//! The daslang under one of `dirs`, or "" - never a bare name, which `fexist` would resolve against
+//! the process cwd and treat as found.
 def private find_daslang(dirs : array<string>) : string {
     for (root in dirs) {
-        for (rel in ["bin/Release/daslang.exe", "bin/daslang.exe", "bin/Release/daslang", "bin/daslang", "build/daslang"]) {
+        for (rel in ["daslang.exe", "daslang", "bin/Release/daslang.exe", "bin/daslang.exe", "bin/Release/daslang", "bin/daslang", "build/daslang"]) {
             let candidate = path_join(root, rel)
             if (fexist(candidate)) return candidate
         }
     }
+    return ""
+}
+
+//! A name, not a path: a file of that name beside the program (the flat-bundle layout) may still
+//! claim it, PATH resolves it at spawn otherwise - never test it against the process cwd.
+def private daslang_on_path() : string {
     return get_platform_name() == "windows" ? "daslang.exe" : "daslang"
 }
 
@@ -301,7 +309,8 @@ def public resolve_config(args : array<string>; program_dir : string) : Resolved
         cfg.name = !empty(cfg.program) ? stem(cfg.program) : base_name(cfg.cwd)
     }
     if (empty(cfg.daslang)) {
-        cfg.daslang = find_daslang(daslang_roots(program_dir, cfg.cwd))
+        let found = find_daslang(daslang_roots(program_dir, cfg.cwd))
+        cfg.daslang = empty(found) ? daslang_on_path() : found
     }
     if (empty(cfg.log)) {
         cfg.log = "logs/{cfg.name}-watchdog.log"
@@ -1291,6 +1300,7 @@ class public Supervisor {
     stopping : bool = false
     finished : bool = false
     result : int = 0
+    collect_before_stop : function<void>   //! the host's collect, run before the stop record reads the heaps; the in-process tests install none
     failures : int = 0
     recovery_pending : bool = false
     restart_at : float = 0.0
@@ -1574,6 +1584,9 @@ class public Supervisor {
                 delete tray
             }
             tray = null
+        }
+        if (collect_before_stop != null) {   //! the stop record reads the live set, not the lines the last tick's collect left behind
+            invoke(collect_before_stop)
         }
         log->emit("watchdog_stopped", JV(heap_gauges()))
         finished = true

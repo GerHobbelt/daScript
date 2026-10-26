@@ -6,6 +6,7 @@ require daslib/jobque_boost
 require daslib/defer
 require daslib/strings_boost
 require daslib/fio
+require daslib/json_boost
 require strings
 
 // Tutorial dasLLAMA-16: Text to Speech
@@ -22,6 +23,8 @@ require strings
 //   - TtsTimings and rtf — per-stage wall time, and seconds spent per second of speech
 //   - tts_chunks — the sentence splitter one synthesis takes at a time
 //   - tts_register_voice — a voice cloned from a few seconds of audio, on a model that can
+//   - tts_release_scratch — the activation rows given back while nothing is queued
+//   - tts_set_chunk_chars — the chunk cap lowered where memory is tight: more, shorter pieces
 //
 // Three families run through these verbs, and load_tts_model tells them apart from the GGUF's
 // own architecture metadata:
@@ -267,8 +270,43 @@ def main {  // nolint:STYLE038 - one linear tutorial walkthrough
                     if (write_wav_pcm16(clone_out, mine.pcm, mine.sample_rate)) {
                         print("  wrote {clone_out}\n")
                     }
+                    var inscope prompt <- tts_prepare_voice_prompt(m, clip, c.sample_rate)
+                    let serialized = sprint_json(prompt, false)
+                    var inscope restored = TtsVoicePrompt()
+                    if (sscan_json(serialized, restored) && tts_voice_prompt_valid(m, restored)) {
+                        if (tts_register_voice_prompt(m, "prepared", restored)) {
+                            let prepared <- synthesize(m, TEXT, "prepared")
+                            let prepared_out = path_join(dir_name(out_path), "{stem(base_name(out_path))}-prepared.wav")
+                            if (write_wav_pcm16(prepared_out, prepared.pcm, prepared.sample_rate)) {
+                                print("  wrote {prepared_out} from a serialized voice prompt\n")
+                            }
+                        }
+                    }
                 }
             }
+        }
+
+        // ──────────────────────────────────────────────────────────────────────
+        //
+        // A synthesis leaves its activation rows inside the model, sized to the largest one so
+        // far, so the next one pays no allocation. On a phone's browser tab that idle memory is
+        // what runs out first: tts_release_scratch gives the rows back, and the next synthesis
+        // grows them again for a few milliseconds. Call it when nothing is queued.
+        tts_release_scratch(m)
+        let after <- synthesize(m, TEXT, vname)
+        print("\ntts_release_scratch: the next synthesis speaks as before - {seconds(after.pcm, after.sample_rate)} s\n")
+
+        // The rows are sized by the longest chunk a synthesis speaks, so the peak a say holds is
+        // the chunk cap's: tts_set_chunk_chars lowers it, and the same text speaks in more, shorter
+        // pieces - each its own synthesis, so a phrase cut in two is read as two phrases.
+        if (m.kind != TtsKind.pocket) {
+            tts_set_chunk_chars(m, 60)
+            var short_pieces = 0
+            synthesize_stream(m, TEXT, vname, 1.0) $(_chunk) {
+                short_pieces++
+            }
+            print("tts_set_chunk_chars(60): the same text in {short_pieces} pieces, at the peak of the longest\n")
+            tts_set_chunk_chars(m, TTS_CHUNK_CHARS)
         }
     }
 }

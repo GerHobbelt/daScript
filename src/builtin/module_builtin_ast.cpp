@@ -40,12 +40,14 @@ namespace das {
     bool addModuleKeyword ( Module * module, char * kwd, bool needOxfordComma, Context * context, LineInfoArg * lineInfo ) {
         if ( !module ) context->throw_error_at(lineInfo, "expecting module, not null");
         if ( !kwd || kwd[0]==0 ) context->throw_error_at(lineInfo, "expecting keyword, not empty string");
+        module->noteRegistrationAtCompile();
         return module->addKeyword(kwd, needOxfordComma, true);
     }
 
     bool addModuleTypeFunction ( Module * module, char * kwd, Context * context, LineInfoArg * lineInfo ) {
         if ( !module ) context->throw_error_at(lineInfo, "expecting module, not null");
         if ( !kwd || kwd[0]==0 ) context->throw_error_at(lineInfo, "expecting type function name, not empty string");
+        module->noteRegistrationAtCompile();
         return module->addTypeFunction(kwd, true);
     }
 
@@ -512,8 +514,7 @@ namespace das {
     // UNSAFE: the caller must own `expr` exclusively.
     void delete_expression ( ExpressionPtr expr ) {
         if ( !expr ) return;
-        expr->gc_unlink();
-        delete expr;
+        gc_free_now(expr);
     }
 
     // Free a SINGLE orphaned TypeDecl node (sibling of delete_expression). Only the node
@@ -522,8 +523,7 @@ namespace das {
     // the dtor never follows). UNSAFE: caller must own the node.
     void delete_type ( TypeDeclPtr typ ) {
         if ( !typ ) return;
-        typ->gc_unlink();
-        delete typ;
+        gc_free_now(typ);
     }
 
     void for_each_module ( Program * prog, const TBlock<void,Module *> & block, Context * context, LineInfoArg * at ) {

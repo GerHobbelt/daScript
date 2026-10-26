@@ -2129,22 +2129,17 @@ def private finalize_shipped_binary(src, dst : string; var shipped : array<strin
     ship_symbols_for(src, shipped)
 }
 
-// Copy each declared native shared library from the daslang install tree
-// (`<das_root>/bin/` on Windows, `<das_root>/lib/` on POSIX) into `dst_dir`.
-// Authors declared these via `release_include_dll(...)`; missing files are an
-// error — usually a typo or an out-of-sync install.
-//
-// Resolution order (deterministic so multi-config build trees can't ship the
-// wrong binary nondeterministically):
-//   1. Exact match at `<search_root>/<name>` (an installed layout has this).
-//   2. Build-tree config dirs in fixed preference: Release > RelWithDebInfo >
-//      MinSizeRel > Debug, e.g. `<search_root>/Release/<name>`.
-//   3. Fall through to `**/<name>` and pick the first match.
-// `release_include_from` entries, as "source@dest" (dest empty = source's file name). Source is
-// relative to <das_root>; dest to the bundle root. A missing source fails the release rather than
-// shipping a bundle that is quietly short a file.
-def private ship_external_files(bundle_name, dst_dir : string; external_files : array<string>;
-                                var shipped : array<string>) : int {
+def private valid_external_release_path(path : string; allow_parent : bool) : bool {
+    if (empty(path)) { return false }
+    for (segment in split(path, "/")) {
+        if (allow_parent && segment == "..") { continue }
+        if (!is_safe_pkg_name(segment)) { return false }
+    }
+    return true
+}
+
+def public ship_external_files(bundle_name, dst_dir : string; external_files : array<string>;
+                               var shipped : array<string>) : int {
     let das_root = get_das_root()
     shipped |> reserve(length(shipped) + length(external_files))
     for (entry in external_files) {
@@ -2153,9 +2148,13 @@ def private ship_external_files(bundle_name, dst_dir : string; external_files : 
             to_log(LOG_ERROR, "release: `{bundle_name}` has a malformed release_include_from entry `{entry}` (expected \"source@dest\")\n")
             return 1
         }
-        let source = slice(entry, 0, at)
-        let requested = slice(entry, at + 1)
+        let source = to_generic_path(slice(entry, 0, at))
+        let requested = to_generic_path(slice(entry, at + 1))
         let dest = empty(requested) ? base_name(source) : requested
+        if (!valid_external_release_path(source, true) || !valid_external_release_path(dest, false)) {
+            to_log(LOG_ERROR, "release: `{bundle_name}` has an invalid release_include_from path `{entry}`: use relative name segments; only the source may contain `..`\n")
+            return 1
+        }
         let src = path_join(das_root, source)
         if (!fexist(src)) {
             to_log(LOG_ERROR, "release: `{bundle_name}` declared release_include_from(\"{source}\") but `{src}` does not exist\n")
@@ -3190,9 +3189,10 @@ def private release_one_wasm_app(root, out_dir, app_name, main_script : string; 
         // context/jobque mutexes). __wrap_emscripten_futex_wait (src/hal/wasm_thread_malloc.cpp)
         // busy-polls on the worklet instead, delegating all other threads to the real impl. No
         // emscripten fork needed — the wrap + shim live in libDaScript_runtime.a (like the malloc lock).
-        // EXPORTED_RUNTIME_METHODS=FS,ENV: a custom shell stages files into MEMFS and sets the
-        // program's environment knobs in Module.preRun (the C environment is built from Module.ENV at startup).
-        w |> write(" -sMEMORY64=2 -sFULL_ES3 -sMAX_WEBGL_VERSION=2 -sGL_ENABLE_GET_PROC_ADDRESS=1 -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=4MB -fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0 -sEXIT_RUNTIME=0 -sFORCE_FILESYSTEM=1 -sEXPORTED_RUNTIME_METHODS=FS,ENV -pthread -sPTHREAD_POOL_SIZE=16 -sAUDIO_WORKLET=1 -sWASM_WORKERS=1 -Wl,--wrap=emscripten_futex_wait")
+        // EXPORTED_RUNTIME_METHODS=FS,ENV,wasmMemory: a custom shell stages files into MEMFS and sets the
+        // program's environment knobs in Module.preRun (the C environment is built from Module.ENV at startup);
+        // wasmMemory: a page reads the linear memory's size (the dev rig's devlog tick) without an aborting getter.
+        w |> write(" -sMEMORY64=2 -sFULL_ES3 -sMAX_WEBGL_VERSION=2 -sGL_ENABLE_GET_PROC_ADDRESS=1 -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=4MB -fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0 -sEXIT_RUNTIME=0 -sFORCE_FILESYSTEM=1 -sEXPORTED_RUNTIME_METHODS=FS,ENV,wasmMemory -pthread -sPTHREAD_POOL_SIZE=16 -sAUDIO_WORKLET=1 -sWASM_WORKERS=1 -Wl,--wrap=emscripten_futex_wait")
         if (include_symbols) {w |> write(" -g3 --emit-symbol-map")}
         for (a in emcc_args) {
             w |> write(" {a}")
@@ -3233,8 +3233,30 @@ def private release_one_wasm_app(root, out_dir, app_name, main_script : string; 
             return 1
         }
     }
-    log("  released {app_name} -> {app_out_dir} ({app_name}.html / .js / .wasm)\n")
     return 0
+}
+
+[arch(at="README.md#web-build-stamp")]
+def private stamp_web_build(root, html_path : string) {
+    var rev = ""
+    if (run_cmd("git -C \"{root}\" describe --always --dirty=+ --abbrev=9", rev) != 0) {
+        rev = "unknown"
+    }
+    let stamp = "{strip(rev)} {format_time(get_clock(), "%Y-%m-%d %H:%M %z")}"     // the zone rides along, so two boxes' stamps order
+    var html = ""
+    fopen(html_path, "rb") $(f) {
+        if (f != null) {
+            html = fread(f)
+        }
+    }
+    return if (empty(html) || find(html, "__DAS_BUILD_STAMP__") < 0)
+    let stamped = replace(html, "__DAS_BUILD_STAMP__", stamp)
+    fopen(html_path, "wb") $(f) {
+        if (f != null) {
+            fwrite(f, stamped)
+        }
+    }
+    log("  build stamp: {stamp}\n")
 }
 
 // `daspkg release wasm` entry. Releases the single app the package's .das_package
@@ -3285,5 +3307,13 @@ def cmd_release_wasm(root : string; out_dir : string; wasm_lib_dir_override : st
     }
 
     mkdir_rec(out_dir)
-    return release_one_wasm_app(root, out_dir, bundle_name, main_script, wasm_lib_dir, runtime_archive, shell_path, spec.include_globs, spec.exclude_globs, spec.wasm_disabled_modules, spec.emcc_args, spec.include_symbols)
+    let result = release_one_wasm_app(root, out_dir, bundle_name, main_script, wasm_lib_dir, runtime_archive, shell_path, spec.include_globs, spec.exclude_globs, spec.wasm_disabled_modules, spec.emcc_args, spec.include_symbols)
+    if (result != 0){return result}
+    var inscope shipped : array<string>
+    let app_out_dir = path_join(out_dir, bundle_name)
+    let staged = ship_external_files(bundle_name, app_out_dir, spec.external_files, shipped)
+    if (staged != 0) { return staged }
+    stamp_web_build(root, path_join(app_out_dir, "{bundle_name}.html"))      // after the external files land: one of them could be the page itself
+    log("  released {bundle_name} -> {app_out_dir} ({bundle_name}.html / .js / .wasm)\n")
+    return 0
 }

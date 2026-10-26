@@ -104,8 +104,10 @@ modules/dasLLAMA/
   .das_module                 # registers the dasllama/ namespace — both binaries (static rows derive from it)
   CMakeLists.txt              # ADD_MODULE_DAS_FROM_DESCRIPTOR + install rules
   ARCHITECTURE.md             # what-goes-where ledger — which module owns which concern
-  ARCHITECTURE_ENGINE.md      # companion: the engine, format, load, CPU-tier, support and serving charters
-  ARCHITECTURE_GPU.md         # companion: the GPU backend role table, the backend asymmetries, the refuted kernel shapes
+  ARCHITECTURE_ENGINE.md      # companion: the engine, arch-registration, support and serving charters
+  ARCHITECTURE_ENGINE_FORMATS.md # companion: the format, load-rail and CPU-kernel-tier charters
+  ARCHITECTURE_GPU.md         # companion: the GPU backend role table, the backend asymmetries
+  ARCHITECTURE_GPU_RACE_SHAPES.md # companion: the refuted kernel shapes and the sanctioned float-A stamps
   ARCHITECTURE_GPU_PREFILL.md # companion: the Metal prefill driver's GEMM ladder
   ARCHITECTURE_GPU_VULKAN.md  # companion: the Vulkan resident driver - window chain, Q8 requant store, GEMV grid codebooks
   ARCHITECTURE_GPU_VULKAN_GEMM.md # companion: the Vulkan GEMM tiles - cm2 decode lanes, tile pick, class pipelines, expert chain, the KHR kq tile
@@ -455,3 +457,21 @@ Perf is compared with `llama-bench -ngl 0 -t 16 --cpu-mask 0x55555555 --cpu-stri
 x86 boxes (16 physical cores, pinned on BOTH sides — das pins via the jobque's hard affinity
 mask; unpinned SMT placement halves lockstep prefill). The per-box methodology lives in
 `performance/profile_common.das`; the site board (daslang.io/dasllama.html, from `performance/records/<box>.json`) is the scoreboard.
+
+### Prepared Pocket voice prompts
+
+An additional cloned voice can be shipped independently from model weights.
+`tts_prepare_voice_prompt(model, mono_pcm, sample_rate)` uses a cloning-capable
+Pocket model to produce a `TtsVoicePrompt`. Serialize that value with
+`daslib/json_boost` and ship it alongside a compatible encoder-free Pocket model.
+At runtime, `tts_register_voice_prompt(model, name, prompt)` registers the owned
+latent data; the backbone conditioning state is built lazily on first synthesis.
+The normal `synthesize(model, text, name)` path then uses the registered voice.
+
+Registration validates the format version, Pocket language/model generation,
+sample rate, codec geometry, frame count and finite latent values. It returns
+`false` without replacing an existing voice when validation fails. The caller
+keeps independent ownership of the supplied prompt. Preparing a prompt requires
+the codec encoder; registering and speaking one does not. Prompts remain specific
+to compatible Pocket model/codec generations and are not portable across arbitrary
+TTS models. Source voice permissions and attribution still apply.

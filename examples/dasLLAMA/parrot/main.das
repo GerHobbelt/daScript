@@ -6,6 +6,7 @@ options stack = 524288   // every dasLLAMA program root takes this budget (optio
 require dasllama/dasllama   // the facade: the TTS model, its caps, the clone verb, the chunker, the synthesis, and Silero
 require take                // the pure side: the take's numbers, the waveform columns, the chunk ledger
 require imgui/imgui_harness // the window, the frame, the boost widgets and the draw list
+require imgui/imgui_touch   // whether a finger, not a keyboard, is at the controls
 require imgui/imgui_table_builtin
 require daslib/jobque_boost
 require daslib/strings_boost
@@ -163,6 +164,8 @@ var g_single_applied = false
 // ===== the speech thread =====
 
 //! the speech thread's setup rides its own stream ahead of the asks: the model path
+let IDLE_RELEASE_MS = 500   //! the speech thread waits this long for a request before it gives the engine's scratch back
+
 [arch(at = "../ARCHITECTURE.md#speech-thread-stream")]
 def start_speech_thread(var ask, answer : Stream?; var now : SeqBox?; var done : Channel?) {
     new_thread() <| @capture(= ask, = answer, = now, = done) {
@@ -173,11 +176,12 @@ def start_speech_thread(var ask, answer : Stream?; var now : SeqBox?; var done :
         }
         var inscope m <- load_tts_model(tts_path)
         var inscope c <- caps(m)
-        var ready = Answer(kind = 0, text = "{length(c.voices)}", gen = c.cloning ? 1 : 0, rate = c.sample_rate, voices := c.voices)
+        var inscope ready = Answer(kind = 0, text = "{length(c.voices)}", gen = c.cloning ? 1 : 0, rate = c.sample_rate, voices := c.voices)
         answer |> push_archive(ready)
         var running = true
+        var released = false
         while (running) {
-            ask |> pop_archive() $(var a : Ask&) {
+            let got = ask |> pop_archive_with_timeout(IDLE_RELEASE_MS) $(var a : Ask&) {
                 if (a.kind == 3) {
                     running = false
                 } elif (a.kind == 4) {
@@ -200,12 +204,18 @@ def start_speech_thread(var ask, answer : Stream?; var now : SeqBox?; var done :
                         var starting = Answer(kind = 4, text = chunk, gen = a.gen, chunk = i)
                         answer |> push_archive(starting)
                         var inscope s <- synthesize(m, chunk, a.voice)
-                        var clip = Answer(kind = 2, gen = a.gen, chunk = i, pcm := s.pcm, rate = s.sample_rate,
+                        var inscope clip = Answer(kind = 2, gen = a.gen, chunk = i, pcm := s.pcm, rate = s.sample_rate,
                             us_prompt = s.timings.prompt_us, us_backbone = s.timings.backbone_us,
                             us_head = s.timings.head_us, us_codec = s.timings.codec_us, us_total = s.timings.total_us)
                         answer |> push_archive(clip)
                     }
                 }
+            }
+            if (got) {
+                released = false
+            } elif (!released) {
+                tts_release_scratch(m)   // nothing queued: idle memory is what a phone's tab runs out of
+                released = true
             }
         }
         ask |> release()
@@ -359,6 +369,11 @@ def poll_answers() {
     poll_playback()
 }
 
+//! a say is audible or about to be - playing, queued, or still generating its first clip
+def playback_active() : bool {
+    return g_playing_sid != INVALID_SID || !empty(g_clips) || (g_chunks_known && !all_spoken(g_chunks))
+}
+
 //! the playing clip's position, off the mixer's own clock, and the next clip once it is done
 [arch(at = "../ARCHITECTURE.md#parrot-panels")]
 def poll_playback() {
@@ -414,7 +429,10 @@ def start_take() {
         g_status = "this file cannot clone - parrot needs a Pocket file with its codec encoder"
         return
     }
-    cancel_say()   // a clip still playing would be recorded
+    if (playback_active()) {   // the microphone would record the clip that is playing
+        g_status = "wait for the say to end, then record"
+        return
+    }
     if (!sound_record_start(g_mic_rate, 1, g_mic_rate * 4, -1)) {
         g_status = "no microphone - is one connected, and allowed?"
         return
@@ -552,8 +570,8 @@ def cancel_say() {
     }
     g_says++
     g_say_now |> publish(g_says)
-    g_clips |> clear()
-    g_chunks |> clear()
+    delete g_clips    // these rows own heap data; clear() drops them without finalizing it
+    delete g_chunks
     g_chunks_known = false
     g_out_pcm |> clear()
     g_out_peaks |> clear()
@@ -777,7 +795,8 @@ def draw_record_button() {
     let size = float2(96.0, 96.0)
     let origin = GetCursorScreenPos()
     let clicked = invisible_button(REC_BTN, (text = "record", size = size))
-    let hovered = IsItemHovered()
+    let say_in_flight = g_phase != Phase.recording && playback_active()
+    let hovered = IsItemHovered() && !say_in_flight
     let center = float2(origin.x + size.x * 0.5, origin.y + size.y * 0.5)
     with_window_drawlist() $(var dl) {
         dl |> add_circle(center, 44.0, hovered ? INK : DIM, 0, 2.0)
@@ -790,10 +809,10 @@ def draw_record_button() {
                 dl |> path_stroke(ACCENT, ImDrawFlags.None, 3.0)
             }
         } else {
-            dl |> add_circle_filled(center, 30.0, g_can_clone && g_ready ? RED : DIM, 0)
+            dl |> add_circle_filled(center, 30.0, g_can_clone && g_ready && !say_in_flight ? RED : DIM, 0)
         }
     }
-    if (clicked) {
+    if (clicked && !say_in_flight) {
         toggle_record()
     }
 }
@@ -845,19 +864,22 @@ def draw_text_panel() {
     let editor_h = max(100.0, avail.y * 0.6)
     input_text_multiline(SCRIPT, (text = "##script", size = float2(avail.x, editor_h), flags = ImGuiInputTextFlags.AllowTabInput))
     let who = chosen_voice()
-    if (icon_button(SAY_BTN, (glyph = "play", tip = empty(who) ? "say" : "say as {who}", size = 26.0))) {
+    let icon = imgui_touch_device ? 44.0 : 26.0
+    if (icon_button(SAY_BTN, (glyph = "play", tip = empty(who) ? "say" : "say as {who}", size = icon))) {
         say_text()
     }
     same_line((spacing = 6.0))
-    if (icon_button(STOP_BTN, (glyph = "stop", tip = "stop the say", size = 26.0))) {
+    if (icon_button(STOP_BTN, (glyph = "stop", tip = "stop the say", size = icon))) {
         cancel_say()
         g_status = "stopped"
     }
     same_line((spacing = 12.0))
     text(SAY_LABEL, (text = empty(who) ? "say" : "say as {who}"))
-    same_line((spacing = 18.0))
-    with_style((ImGuiCol.Text, DIM)) {
-        text("Ctrl or Cmd + Enter says   Ctrl or Cmd + R records and stops")
+    if (!imgui_touch_device) {
+        same_line((spacing = 18.0))
+        with_style((ImGuiCol.Text, DIM)) {
+            text("Ctrl or Cmd + Enter says   Ctrl or Cmd + R records and stops")
+        }
     }
     text(VIEW_LABEL, (text = empty(g_chunks) ? "the say, chunk by chunk - nothing said yet" : "the say, chunk by chunk"))
     child(SCRIPT_VIEW, (text = "script", size = float2(0.0, 0.0), child_flags = ImGuiChildFlags.Borders, window_flags = ImGuiWindowFlags.None)) {
@@ -959,8 +981,23 @@ def draw_lab_panel() {
     }
 }
 
+[arch(at = "../ARCHITECTURE.md#parrot-panels")]
+def setup_narrow_dock_layout(dock_id, status_id, rest_id : uint) {
+    var voice_id : uint = 0u
+    var text_id : uint = 0u
+    DockBuilderSplitNode(rest_id, ImGuiDir.Up, 0.48, voice_id, text_id)
+    DockBuilderDockWindow("parrot", status_id)
+    DockBuilderDockWindow("lab", voice_id)
+    DockBuilderDockWindow("voice", voice_id)
+    DockBuilderDockWindow("output", text_id)
+    DockBuilderDockWindow("text", text_id)
+    DockBuilderFinish(dock_id)
+}
+
 //! the first layout of the dock: the status strip across the top, the voice left, the lab right,
 //! the text over the output in the middle; the user drags the splits and the tabs from there
+var g_front_tab_frames = 0      //! frames left of pulling the column layout's front tabs forward - a node opens on its first tab bar's own pick
+
 def setup_dock_layout(dock_id : uint) {
     DockBuilderRemoveNode(dock_id)
     DockBuilderAddDockSpaceNode(dock_id, ImGuiDockNodeFlags.None)
@@ -968,7 +1005,13 @@ def setup_dock_layout(dock_id : uint) {
     DockBuilderSetNodeSize(dock_id, ImVec2(vp.Size.x, vp.Size.y))
     var status_id : uint = 0u
     var rest_id : uint = 0u
-    DockBuilderSplitNode(dock_id, ImGuiDir.Up, 0.12, status_id, rest_id)
+    let narrow = vp.Size.x < 760.0 || vp.Size.x < vp.Size.y
+    DockBuilderSplitNode(dock_id, ImGuiDir.Up, narrow ? 0.24 : 0.12, status_id, rest_id)
+    if (narrow) {
+        setup_narrow_dock_layout(dock_id, status_id, rest_id)
+        g_front_tab_frames = 2      // the windows exist only once this frame submits them
+        return
+    }
     var voice_id : uint = 0u
     var mid_id : uint = 0u
     DockBuilderSplitNode(rest_id, ImGuiDir.Left, 0.26, voice_id, mid_id)
@@ -986,6 +1029,7 @@ def setup_dock_layout(dock_id : uint) {
     DockBuilderFinish(dock_id)
 }
 
+[arch(at = "../ARCHITECTURE.md#parrot-panels")]
 def draw_screen() {
     dockspace(DOCK_ROOT, (flags = ImGuiDockNodeFlags.None)) {
         if (!DOCK_ROOT.has_initial_layout && DOCK_ROOT.dock_id != 0u) {
@@ -995,17 +1039,21 @@ def draw_screen() {
         dock_window(STATUS_WIN, (text = "parrot", closable = false, flags = ImGuiWindowFlags.NoScrollbar)) {
             draw_status_bar()
         }
+        dock_window(LAB_WIN, (text = "lab", closable = false, flags = ImGuiWindowFlags.None)) {
+            draw_lab_panel()
+        }
         dock_window(VOICE_WIN, (text = "voice", closable = false, flags = ImGuiWindowFlags.None)) {
             draw_voice_panel()
-        }
-        dock_window(TEXT_WIN, (text = "text", closable = false, flags = ImGuiWindowFlags.None)) {
-            draw_text_panel()
         }
         dock_window(OUTPUT_WIN, (text = "output", closable = false, flags = ImGuiWindowFlags.None)) {
             draw_output_panel()
         }
-        dock_window(LAB_WIN, (text = "lab", closable = false, flags = ImGuiWindowFlags.None)) {
-            draw_lab_panel()
+        dock_window(TEXT_WIN, (text = "text", closable = false, flags = ImGuiWindowFlags.None)) {
+            draw_text_panel()
+        }
+        if (g_front_tab_frames > 0) {           // one node a frame: a second focus in the same frame drops the first node's pick
+            SetWindowFocus(g_front_tab_frames == 2 ? "text" : "voice")
+            g_front_tab_frames--
         }
     }
 }
@@ -1064,7 +1112,9 @@ def init() {
     delete g_vad_model
     g_vad_model <- load_vad_model(empty(g_args.vad_model) ? "{get_das_root()}/modules/dasLLAMA/models/silero_vad.bin" : path_join(g_args.models, g_args.vad_model))
     g_ask = unsafe(stream_create())
+    g_ask |> append(1)   // one producer on the books: the speech thread's pop waits for a request instead of returning empty at once
     g_answer = unsafe(stream_create())
+    g_answer |> append(1)
     g_say_now = seq_box_create()
     g_say_now |> publish(g_says)
     g_speech_done = unsafe(channel_create())

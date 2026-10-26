@@ -58,6 +58,7 @@ var private fileTimings : array<FileTiming>
 var private failedFiles : array<FailedFile>
 var private timingOutliers : int = 0
 var private maxFileTime : float = 0.0
+var private g_stderr_seq : int = 0   //! with the spawn tick, names each isolated child's stderr file
 var private jsonFilePath : string
 var private jsonTestFile : string
 
@@ -194,12 +195,15 @@ def private run_iso_subprocess(cmd : string; timeoutSec : float; var br : BatchR
     // stack — to stderr. Redirect stderr to a temp file (overrides both paths,
     // and avoids the timeout>0 interleave) and, on abnormal exit, fold it into
     // the crashed file's log so the stack is surfaced under the failing test.
-    let tfRes = create_temp_file_result("dastest_stderr_", ".txt")
-    let errPath = (tfRes is value) ? (tfRes as value) : ""
+    //! the path is minted, never pre-created: a file created and closed here draws a scanner's open on
+    //! Windows, and the shell's `2>` then fails with a sharing violation - the child reads as crashed
+    let tdRes = temp_directory_result()
+    g_stderr_seq++
+    let errPath = (tdRes is value) ? path_join(tdRes as value, "dastest_stderr_{ref_time_ticks()}_{g_stderr_seq}.txt") : ""
     if (empty(errPath)) {
         // The point of this is to NOT silently lose crash diagnostics, so make
-        // the temp-file failure visible rather than quietly dropping stderr.
-        br.err |> push("dastest: could not create a temp file for subprocess stderr capture ({tfRes as error}); stderr (crash stacks, etc.) will not be surfaced")
+        // the temp-dir failure visible rather than quietly dropping stderr.
+        br.err |> push("dastest: no temp directory for subprocess stderr capture ({tdRes as error}); stderr (crash stacks, etc.) will not be surfaced")
     }
     let runCmd = empty(errPath) ? cmd : "{cmd} 2>\"{errPath}\""
     unsafe {
@@ -425,13 +429,9 @@ def deserialize_path(var ctx : SuiteCtx, _files : array<string>, in_file : strin
             return
         }
         var count = 0
-        unsafe {
-            _builtin_read(f, addr(count), typeinfo sizeof(count))
-        }
+        _builtin_read(f, unsafe(addr(count)), typeinfo sizeof(count))
         var sz = 0l
-        unsafe {
-            _builtin_read(f, addr(sz), typeinfo sizeof(sz))
-        }
+        _builtin_read(f, unsafe(addr(sz)), typeinfo sizeof(sz))
         var data : array<uint8>
         data |> reserve(sz)   // the blob size is known: exact reserve, and the resize never grows
         data |> resize(sz)
@@ -441,9 +441,9 @@ def deserialize_path(var ctx : SuiteCtx, _files : array<string>, in_file : strin
         // the reader's access: a stream carries none, and a program's late require takes its program's
         var inscope access <- make_file_access(ctx.projectPath)
         access |> add_file_access_root("dastest", ctx.dastestRoot)
-        using() $(var _mg : ModuleGroup) {
+        using() $(var mg : ModuleGroup) {
             for (i in range(count)) {
-                deserialize_program(ser, access) $(ok, program, error) {
+                deserialize_program(ser, access, unsafe(addr(mg))) $(ok, program, error) {
                     if (!ok) {
                         log::error("Deserialization failed at program {i}: {error}")
                         res.errors++
@@ -550,9 +550,7 @@ def main() : int {  // nolint:STYLE037,STYLE038 - CLI dispatch, one arm per mode
                     log::error("dastest: the suite ran past its --timeout of {timeout}s; the process ends here with exit code {TIMEOUT_EXIT_CODE} and no summary")
                     // not fio::exit - it runs the job queue teardown, which busy-waits on this very thread;
                     // and nothing here invokes into the main context, which the main thread is still running
-                    unsafe {
-                        fio::exit_now(TIMEOUT_EXIT_CODE)
-                    }
+                    unsafe(fio::exit_now(TIMEOUT_EXIT_CODE))
                 }
             }
         }
@@ -561,6 +559,23 @@ def main() : int {  // nolint:STYLE037,STYLE038 - CLI dispatch, one arm per mode
     var inputPaths := test_args.test_files
     var files : array<string>
     return 1 if (!collect_files(inputPaths, files))
+    if (!empty(test_args.test_list)) {
+        var keep : table<string>
+        fopen(test_args.test_list, "rb") $(fr) {
+            return if (fr == null)
+            fmap(fr) $(data) {
+                for (line in string(data) |> split("\n")) {
+                    let one = line |> strip() |> replace("\\", "/")
+                    keep |> insert(one) if (!empty(one))
+                }
+            }
+        }
+        if (keep |> empty()) {
+            log::error("dastest: --test-list {test_args.test_list} is empty or unreadable")
+            return 1
+        }
+        files |> erase_if() $(f) => !(keep |> key_exists(f |> replace("\\", "/")))
+    }
     if (!empty(test_args.exclude_files)) {
         files |> erase_if() $(f) {
             let base = base_name(f)
@@ -692,7 +707,7 @@ def main() : int {  // nolint:STYLE037,STYLE038 - CLI dispatch, one arm per mode
                 bSingles |> push(build_iso_cmd([clone_string(file)], cmdPrefix, cmdSuffix))
             }
             let bCmd = build_iso_cmd(bFiles, cmdPrefix, cmdSuffix)
-            unsafe { delete bFiles }
+            delete bFiles
             batches |> emplace(IsoInput(uris <- bUris, batchCmd = clone_string(bCmd), singleCmds <- bSingles))
             bidx = hi
         }

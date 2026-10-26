@@ -264,6 +264,62 @@ refuses by name; a phoneme model panics here: it has no voice to take.
        let mine <- synthesize(m, "daslang speaks in my voice.", "me")
    }
 
+Giving the scratch back
+=======================
+
+A synthesis leaves its activation rows inside the model, sized to the largest
+one so far, so the next one pays no allocation. On a phone's browser tab that
+idle memory is what runs out first. ``tts_release_scratch`` gives the rows back,
+and the next synthesis grows them again for a few milliseconds. Call it when
+nothing is queued: the browser examples' speech threads call it after half a
+second with no request waiting.
+
+.. code-block:: das
+
+   tts_release_scratch(m)
+   let again <- synthesize(m, "It speaks as before.", vname)
+
+The rows are sized by the longest chunk a synthesis speaks, so the peak a say
+holds is the chunk cap's. A Kitten or Kokoro model speaks a sentence of up to
+``TTS_CHUNK_CHARS`` codepoints in one piece; ``tts_set_chunk_chars`` lowers
+that, and the same text speaks in more, shorter pieces at a lower peak. Each
+piece is its own synthesis, so a phrase cut in two is read as two phrases.
+
+.. code-block:: das
+
+   tts_set_chunk_chars(m, 120)
+   let low <- synthesize(m, TEXT, vname)
+
+Prepared voice prompts
+======================
+
+``tts_prepare_voice_prompt`` encodes a reference into a ``TtsVoicePrompt``.
+This step needs a Pocket model with its codec encoder. The value can be serialized
+with ``daslib/json_boost`` and shipped separately from the model weights.
+``tts_voice_prompt_valid`` checks the format, language, sample rate, codec geometry
+and bounded latent frames against the receiving model.
+
+``tts_register_voice_prompt`` copies a prepared prompt into a named voice. It also
+works with a compatible encoder-free Pocket file. An empty name or invalid prompt
+returns false and leaves the previous voice intact. The caller owns its prompt;
+the model builds conditioning state when the voice is first synthesized.
+Matching geometry does not make prompts portable across unrelated model revisions.
+
+The tutorial's ``--clone`` path also demonstrates a JSON round trip and writes
+speech from the restored prompt:
+
+.. code-block:: das
+
+   var inscope prompt <- tts_prepare_voice_prompt(m, clip, c.sample_rate)
+   var inscope restored = TtsVoicePrompt()
+   if (sscan_json(sprint_json(prompt, false), restored)
+           && tts_voice_prompt_valid(m, restored)) {
+       if (tts_register_voice_prompt(m, "prepared", restored)) {
+           let speech <- synthesize(m, "daslang speaks.", "prepared")
+           write_wav_pcm16("prepared.wav", speech.pcm, speech.sample_rate)
+       }
+   }
+
 The weight lanes
 ================
 

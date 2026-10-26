@@ -22,8 +22,10 @@ section runs to, and the sections that companion holds.
 
 When placement charters disagree on one function, the sec.1 charter line decides.
 
-- `ARCHITECTURE_ENGINE.md` - sec.1.1-1.4, 1.6, 1.8, 1.9: the engine, format, load, CPU-tier,
-  arch-registration, support and serving charters.
+- `ARCHITECTURE_ENGINE.md` - sec.1.1, 1.6, 1.8, 1.9: the engine, arch-registration, support and
+  serving charters.
+- `ARCHITECTURE_ENGINE_FORMATS.md` - sec.1.2-1.4: the format, load-rail and CPU-kernel-tier
+  charters.
 - `ARCHITECTURE_GPU.md` - sec.1.5: the GPU backend role table and the backend asymmetries.
 - `ARCHITECTURE_MEDIA.md` - sec.1.7, 1.7b: the encoder-tower, audio, ASR and vision charters.
 - `ARCHITECTURE_TTS.md` - sec.1.7c: the text-to-speech charters - the front end, the block home,
@@ -42,11 +44,12 @@ re-transcoding `$LCPP/src/unicode-data.cpp`).
 - `ARCHITECTURE_IMAGE.md` - sec.2.1-2.1n: the prepared-image rail, the baked dev-W f16 plane,
   the baked tower twin-W plane, the layout stamp `REVIEW.das` keeps over the byte-placing code,
   the meta-field tripwire every struct serializer opens with, and the planar-vs-blob flavor rebake.
-- `ARCHITECTURE_GPU.md` - sec.2.2b: the tensor-GEMM and fused-attention shapes that measured out.
+- `ARCHITECTURE_GPU_RACE_SHAPES.md` - sec.2.2b: the tensor-GEMM and fused-attention shapes that
+  measured out, the retained reference arms beside them, and the sanctioned float-A stamps.
 - `ARCHITECTURE_GPU_TOWER.md` - sec.2.2w-2.2x: the tower attention routes, and the tower driver's
   encode chains.
-- `ARCHITECTURE_GPU_QUANT_PLANES.md` - sec.2.2y-2.2z: the Metal kq split scale plane, and the
-  iquant GEMV grid read with its f4-slab twin.
+- `ARCHITECTURE_GPU_QUANT_PLANES.md` - sec.2.2y-2.2z, 2.2an: the Metal kq split scale plane, the
+  iquant GEMV grid read with its f4-slab twin, and the Metal GEMV site abstraction.
 - `ARCHITECTURE_GPU_PREFILL.md` - sec.2.2c-2.2f, 2.2h-2.2i, 2.2u-2.2v, 2.2aa: the Metal prefill
   driver's GEMM form ladder, dev-W knee map, attention slab, chunked submission, the
   f16 twin dual-store, the last-layer FFN tail, and the dense-KQ tensor mul_mm scaffold.
@@ -64,7 +67,7 @@ re-transcoding `$LCPP/src/unicode-data.cpp`).
   tiles the Vulkan tier's GEMMs run on - the cm2 decode lanes, the tile pick and the coopmat mode
   ladder, the class-pipeline build seat, the MoE expert chain on those tiles, the KHR arm's
   hand-staged kq tile - and the decode GEMV family's lane split by row length.
-- `ARCHITECTURE_GPU_VULKAN_RESIDENCY.md` - sec.2.2n-2.2o: what a model has to fit on the card
+- `ARCHITECTURE_GPU_VULKAN_RESIDENCY.md` - sec.2.2n-2.2o, 2.2an-2.2ao: what a model has to fit on the card
   before the driver runs - the residency plan, and the GPU-slot marks swap that lets one slot
   serve many models.
 - `ARCHITECTURE_GPU_VULKAN_DECODE.md` - sec.2.2r-2.2v: the per-op tier's decode era - the decode
@@ -75,9 +78,12 @@ re-transcoding `$LCPP/src/unicode-data.cpp`).
 - `ARCHITECTURE_GPU_VULKAN_MOE.md` - sec.2.2af, 2.2ag, 2.2ak: the resident driver's routed block in its
   two eras - the MoE block of the prefill window, and the whole-model driver's MoE token
   command - and the gemma-4 form both eras take.
-- `ARCHITECTURE_GPU_MTP.md` - sec.2.28-2.39a: the Metal speculative round over the batch driver's
-  same-slab verify, the box knob that sets the depth a round drafts, the kernel
-  argument-alignment contract enforced at every dispatch, and the decode layer encoder.
+- `ARCHITECTURE_GPU_MTP.md` - sec.2.28-2.29, 2.33-2.37a, 2.39: the Metal speculative round over
+  the batch driver's same-slab verify, and the box knob that sets the depth a round drafts.
+- `ARCHITECTURE_GPU_MTP_DECODE.md` - sec.2.30-2.32, 2.38, 2.39a: the kernel argument-alignment
+  contract enforced at every dispatch, the K-quant small-batch crown and the row-buffer pad a
+  multi-row verify dispatches under, the single-row driver's greedy chain, and the decode layer
+  encoder.
 - `ARCHITECTURE_RUNTIME.md` - sec.2.2, 2.3, 2.3a, 2.4, 2.6-2.9, 2.11, 2.12, 2.18-2.19, 2.44, 2.44a:
   kernel shape, caches, lint policy, knobs, coverage, the GPU ramp, the hybrid worker pool, the
   MoE region split, the job queue the engine dispatches on, and the mode that dispatches to none.
@@ -95,11 +101,13 @@ re-transcoding `$LCPP/src/unicode-data.cpp`).
 - `ARCHITECTURE_CPU_KERNELS.md` - sec.2.22-2.24, 2.42: the sub-block-packed k3/k6 planes, the grid
   formats' panel and row-group decodes, the VBMI symbol lattice, and the tier that selects on the
   target rather than the host.
-- `ARCHITECTURE_TTS.md` - sec.2.28-2.35, 2.43: the TTS block home's two layouts, tap stacking, the
-  padded concat width, the per-synthesis carrier, the served carrier on the image rail, the
-  sine source's operation order, the heteronym context, the rig's scoring, and the two-tier
-  phoneme pack.
-- `ARCHITECTURE_POCKET.md` - sec.2.46-2.50: the Pocket codec's one-shot chunk, a voice as the
+- `ARCHITECTURE_TTS.md` - sec.2.28-2.30, 2.32-2.35, 2.43: the TTS block home's two layouts, tap
+  stacking, the padded concat width, the served carrier on the image rail, the sine source's
+  operation order, the heteronym context, the rig's scoring, and the two-tier phoneme pack.
+- `ARCHITECTURE_TTS_MEMORY.md` - sec.2.31, 2.51-2.53: the per-synthesis carrier, the
+  generator's six buffers, the chunk-sized peak with its cap and the idle release, and the
+  harmonic source streaming in frame windows.
+- `ARCHITECTURE_POCKET.md` - sec.2.46-2.50: the Pocket codec's windowed stream, a voice as the
   backbone's key-value memory, the one-step head's baked timestep constants, the released
   chunker, and the published file's served quants.
 

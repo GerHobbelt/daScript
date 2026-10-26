@@ -15,7 +15,7 @@ expert chain on those tiles, and the KHR arm's hand-staged kq tile - are `ARCHIT
 sections 2.2k-2.2m, 2.2q and 2.2ae, and the decode GEMV family's lane split by row length its
 section 2.2ah. What a model has to fit on the card before any of this runs - the residency plan,
 and the marks swap that lets one GPU slot serve many models - is `ARCHITECTURE_GPU_VULKAN_RESIDENCY.md`'s
-sections 2.2n-2.2o. The decode-era mechanisms of the per-op tier are `ARCHITECTURE_GPU_VULKAN_DECODE.md`'s
+sections 2.2n-2.2o and 2.2an-2.2ao. The decode-era mechanisms of the per-op tier are `ARCHITECTURE_GPU_VULKAN_DECODE.md`'s
 sections 2.2r-2.2v. The GPU backend role table these sections build on stays in `ARCHITECTURE_GPU.md` sec.1.5.
 
 The module gate's six Vulkan checks (`REVIEW.das`) read these files. `check_khr_stage16_abstract`
@@ -48,6 +48,13 @@ walk as reference measurements of another engine's kernels.
 **A prompt longer than `PF_WINDOW` rows runs as SEQUENTIAL windows over the same activation
 buffers.** Every window's rope and attention address the KV mirror at ABSOLUTE positions, so window w attends
 everything the earlier windows stored; only the last window runs the final requant and the classifier.
+
+**A prefill from a position past zero is the same chain entered later.** The call names its
+first position (`pos0`), the windows store at and attend from `pos0 + w0`, and the rows
+`[0, pos0)` are whatever the session's mirror region already holds - a chat's earlier turns, a
+scheduler's earlier chunks (`rdec_prefill_region`: kept where the session owns them, brought up
+from the host cache where it does not). A recurrent model passes a continuation to the CPU
+loop: the chain starts the deltanet state from zero (`followup_vulkan.md` item 69).
 
 **The last layer's FFN runs on the window's last 32 rows only.** Nothing downstream of the
 final layer reads more than the last row - the classifier requantizes row `wlen - 1`, the KV

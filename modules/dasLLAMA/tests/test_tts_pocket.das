@@ -4,10 +4,12 @@ options stack = 524288   // every dasLLAMA program root takes this budget (optio
 options _dasllama_internal = true
 
 require dastest/testing_boost public
+require _ids   // same_ids
 require dasllama/dasllama_spm
 require dasllama/dasllama_gguf
 require dasllama/dasllama_pocket
 require dasllama/dasllama_tts
+require dasllama/dasllama_audio_io
 require dasllama/dasllama_tts_types
 require dasllama/dasllama_tts_blocks
 require dasllama/dasllama_math   // setup_dasllama_jobque_
@@ -27,6 +29,9 @@ require _model_tier
 // harness/pocket_oracle.py): the unigram tokenizer id-for-id against the reference package on
 // the 200-sentence corpus and on the byte-fallback probes (`_tts_fixtures/pocket_tokens.json`,
 // written by the oracle script's --tokens-fixture), the decode round trip, then the parity rail.
+// Prepared-prompt transfer needs pocket-tts-en-kq.gguf and pocket-tts-en-stuart-kq.gguf;
+// it uses the checked-in jfk_ask_not.wav reference and skips if either model is absent. The
+// quiet-floor cell needs pocket-tts-en-kq.gguf alone.
 
 def private gguf_path() : string {
     return path_join(models_dir(), "pocket-tts-en.gguf")
@@ -71,14 +76,6 @@ def private load_tokens_fixture(path : string = tokens_fixture_path()) : TokFixt
         panic("pocket tokens fixture does not parse: {path}")
     }
     return <- fx
-}
-
-def private same_ids(a, b : array<int64>) : bool {
-    return false if (length(a) != length(b))
-    for (x, y in a, b) {
-        return false if (x != y)
-    }
-    return true
 }
 
 def private ids_text(a : array<int64>) : string {
@@ -367,6 +364,98 @@ def private head_over_frames(m : PocketModel; var sc : PocketScratch; conds, x0 
     return <- out
 }
 
+// the rows of the codec chain's ping-pong scratch, the window's working set
+def private codec_scratch_bytes(sc : PocketScratch) : int64 {
+    return (long_capacity(sc.ca) + long_capacity(sc.cb) + long_capacity(sc.cc) + long_capacity(sc.cpad) + long_capacity(sc.cs) + long_capacity(sc.ct)) * 4l
+}
+
+let STREAM_BAR = 1.0e-5   // absolute, on a waveform or a latent frame: float noise of the same sums in another batching
+
+// windowed against whole: the same output within float noise, and a bar that a poisoned expectation trips
+def private stream_diff(t : T?; tag : string; ours, ref : array<float>) {
+    if (length(ours) != length(ref)) {
+        t |> failure("{tag}: {length(ours)} elements against the whole run's {length(ref)}")
+        return
+    }
+    let d = max_abs_diff(ours, ref)
+    to_log(LOG_INFO, "pocket {tag}: maxdiff {d} over {length(ref)}\n")
+    t |> success(d <= STREAM_BAR, "{tag}: maxdiff {d} <= {STREAM_BAR}")
+    if (!empty(ref)) {
+        var inscope poisoned := ref
+        poisoned[0] += 2.0 * STREAM_BAR
+        t |> success(max_abs_diff(ours, poisoned) > STREAM_BAR, "{tag}: the bar discriminates a poisoned expectation")
+    }
+}
+
+//! the codec stream (ARCHITECTURE_POCKET.md sec.2.46): a chunk decoded and a clip encoded a
+//! window of frames per step give the whole run's output on the f32 lane, one frame per step
+//! included, with the activations scaling with the window
+[test]
+def test_pocket_codec_stream(t : T?) {
+    let path = gguf_path()
+    if (!model_available(t, path)) {
+        return
+    }
+    var inscope man <- load_manifest()
+    var picked = -1
+    for (i, c in iter_range(man.cases), man.cases) {
+        if (c.stages && picked < 0) {
+            picked = i
+        }
+    }
+    if (picked < 0) {
+        t |> skip("no oracle dump with stages under {oracle_dir()}")
+        return
+    }
+    let c & = unsafe(man.cases[picked])
+    with_job_que() {
+        setup_dasllama_jobque_()
+        defer() {
+            reset_pocket_q8()
+            set_pocket_codec_window(POCKET_CODEC_WINDOW_DEFAULT)
+        }
+        set_pocket_q8(false)   // the f32 lane: the served GEMMs' result depends on how many rows they batch
+        var inscope m <- load_pocket(path)
+        var inscope dump <- load_tts_dump(path_join(oracle_dir(), c.file))
+        let frames = int64(c.n_frames)
+        set_pocket_codec_window(0l)
+        var inscope whole = PocketScratch()
+        var inscope ref_wave : array<float>
+        pocket_decode_latents(m, dump["latent"].f, frames, whole, ref_wave)
+        var inscope ref_lat : array<float>
+        let ref_frames = pocket_encode_latents(m, dump["voice_pcm"].f, whole, ref_lat)
+        let whole_bytes = codec_scratch_bytes(whole)
+        t |> equal(long_length(ref_wave), frames * m.frame_samples, "the whole run decodes frames * frame_samples samples")
+        for (w in [1l, POCKET_CODEC_WINDOW_DEFAULT]) {
+            set_pocket_codec_window(w)
+            var inscope sc = PocketScratch()
+            var inscope wave : array<float>
+            pocket_decode_latents(m, dump["latent"].f, frames, sc, wave)
+            stream_diff(t, "{c.id} decode, window {w}", wave, ref_wave)
+            var inscope lat : array<float>
+            let lframes = pocket_encode_latents(m, dump["voice_pcm"].f, sc, lat)
+            t |> equal(lframes, ref_frames, "window {w}: the clip's frame count")
+            stream_diff(t, "{c.id} encode, window {w}", lat, ref_lat)
+            let bytes = codec_scratch_bytes(sc)
+            to_log(LOG_INFO, "pocket codec scratch: window {w} {bytes} bytes, whole run {whole_bytes}\n")
+            if (frames > 4l * w) {
+                t |> success(bytes * 2l < whole_bytes, "window {w}: the codec scratch is under half the whole run's ({bytes} against {whole_bytes})")
+            }
+            // the release: every carried buffer gone, and the next run grows them back to the same output
+            pocket_release_scratch(sc)
+            t |> equal(codec_scratch_bytes(sc), 0l, "window {w}: the released carrier holds no codec rows")
+            t |> equal(long_capacity(sc.qkv) + long_capacity(sc.h), 0l, "window {w}: the released carrier holds no transformer rows")
+            var inscope again : array<float>
+            pocket_decode_latents(m, dump["latent"].f, frames, sc, again)
+            stream_diff(t, "{c.id} decode after the release, window {w}", again, ref_wave)
+        }
+        // a voice's caches reserve the rows a chunk of the budget can take, not a flat slack
+        var inscope vs <- pocket_voice_state(m, dump["voice_pcm"].f, whole)
+        let budget = int64(POCKET_MAX_TOKENS) + pocket_max_frames(int64(POCKET_MAX_TOKENS)) + 1l
+        t |> equal(vs.caches[0].cap, vs.len + budget, "the voice's caches hold the clip plus one chunk of the budget ({vs.len} + {budget} rows)")
+    }
+}
+
 [test]
 def test_pocket_frames(t : T?) {
     let path = gguf_path()
@@ -492,8 +581,8 @@ def test_pocket_q8_lane(t : T?) {
         var inscope m <- load_pocket(path)
         t |> success(m.q8, "the pinned q8 lane serves")
         t |> success(pocket_serves_q8(), "the pin is what the policy answers")
-        t |> success(m.backbone.layers[0].in_proj.q8 && m.mimi.dec_in.q8 && !m.mimi.enc_in.q8 && !m.mimi.dec_out.q8,
-            "the GEMMs on 32-wide inputs minted q8; the one-channel convs stayed f32")
+        t |> success(m.backbone.layers[0].in_proj.q8 && !m.mimi.dec_in.q8 && !m.mimi.enc_in.q8 && !m.mimi.dec_out.q8,
+            "the backbone GEMMs serve q8; every codec conv serves f32")
         var inscope sc = PocketScratch()
         var done = 0
         for (c in man.cases) {
@@ -577,9 +666,8 @@ def test_pocket_q8_file(t : T?) {
             from_file += (l.in_proj.q8 && l.out_proj.q8 && l.ffn1.q8 && l.ffn2.q8) ? 1 : 0
         }
         t |> equal(from_file, length(mq.backbone.layers), "every backbone layer's four GEMMs came in as Q8_0")
-        t |> success(mq.mimi.dec_in.q8 && mq.mimi.enc_out.q8 && mq.mimi.dec_res[0].conv1.q8 && !mq.mimi.enc_in.q8 && !mq.mimi.dec_out.q8,
-            "the codec's 32-wide convs came in as Q8_0 slabs, the one-channel ends as f16")
-        t |> equal(mq.mimi.dec_in.q8_k, mq.mimi.dec_in.k * mq.mimi.dec_in.cin, "the slab's row is kernel times input channels")
+        t |> success(!mq.mimi.dec_in.q8 && !mq.mimi.enc_out.q8 && !mq.mimi.dec_res[0].conv1.q8 && !mf.mimi.dec_in.q8,
+            "the codec's convs serve f32 on the q8 lane, whichever form the file stores them in")
         for (c in man.cases) {
             continue if (!c.stages || c.voice != "alba")
             var inscope a <- forced_latents(mq, c, man, sc)
@@ -905,12 +993,9 @@ def test_pocket_facade(t : T?) {
         t |> equal(a.timings.samples, long_length(a.pcm))
         t |> success(a.timings.backbone_us > 0l && a.timings.codec_us > 0l && a.timings.bert_us == 0l, "the family's own stages carry the time")
         to_log(LOG_INFO, "pocket facade: {timings_line(a.timings, a.sample_rate)}\n")
-        // a cloned voice: the roster's own clip under a new name speaks and is listed
-        var inscope clip : array<float>
-        m.pocket.voices |> get("caro_davy") $(pcm) {
-            clip := pcm
-        }
-        t |> success(!empty(clip), "the parity file stores its roster as clips (the older form) - caro_davy's is the clone's source")
+        // a cloned voice: the checked-in reference clip under a new name speaks and is listed
+        var inscope clip <- load_audio_mono("{get_das_root()}/modules/dasLLAMA/models/jfk_ask_not.wav", 24000)
+        t |> success(!empty(clip), "the checked-in reference clip is the clone's source")
         tts_register_voice(m, "cloned", clip, 24000)
         var inscope c2 <- caps(m)
         t |> equal(length(c2.voices), 20, "the cloned voice joined the roster")
@@ -993,6 +1078,69 @@ def test_pocket_no_encoder(t : T?) {
     }
 }
 
+//! The first difference drops the low end the leading silence and the breath sit in, so the lowest twentieth of the 100 ms window RMS reads the hiss in the pauses, not the speech above it.
+def private quiet_floor_db(pcm : array<float>; rate : int) : float {
+    let win = rate / 10
+    let n = (length(pcm) - 1) / win
+    var rms : array<float>
+    rms |> reserve(n)
+    for (i in range(n)) {
+        var ssq = 0.0lf
+        for (j in range(win)) {
+            let v = pcm[i * win + j + 1] - pcm[i * win + j]
+            ssq += double(v * v)
+        }
+        rms |> push(float(sqrt(ssq / double(win))))
+    }
+    rms |> sort()
+    let k = max(1, n / 20)
+    var acc = 0.0
+    for (i in range(k)) {
+        acc += rms[i]
+    }
+    return 20.0 * log10(max(acc / float(k), 1e-9))
+}
+
+[test]
+def test_pocket_quiet_floor(t : T?) {
+    //! A per-frame parity bar reads the loud part of a frame, so the quiet floor is the only lane compare that catches a hiss in the silences.
+    let path = kq_gguf_path()
+    if (!model_available(t, path)) {
+        return
+    }
+    with_job_que() {
+        setup_dasllama_jobque_()
+        defer() {
+            reset_pocket_q8()
+        }
+        let text = "The quick brown fox jumps over the lazy dog. Then it slept, and all was still."
+        set_pocket_q8(true)   // the lane this cell measures, pinned
+        var inscope served <- load_tts_model(path)
+        t |> success(served.pocket.q8, "the pinned q8 lane serves")
+        var inscope a <- synthesize(served, text, "alba")
+        delete served
+        set_pocket_q8(false)
+        var inscope reference <- load_tts_model(path)
+        t |> success(!reference.pocket.q8, "the pinned f32 lane serves")
+        var inscope b <- synthesize(reference, text, "alba")
+        t |> success(length(a.pcm) >= 2 * a.sample_rate && length(b.pcm) >= 2 * b.sample_rate,
+            "both renders carry seconds of audio ({length(a.pcm)} and {length(b.pcm)} samples) - the floor reads their quietest twentieth")
+        let fa = quiet_floor_db(a.pcm, a.sample_rate)
+        let fb = quiet_floor_db(b.pcm, b.sample_rate)
+        to_log(LOG_INFO, "pocket quiet floor: served {fa} dBFS, f32 lane {fb} dBFS\n")
+        t |> success(fa <= fb + 6.0, "the served lane's quiet floor ({fa} dBFS) sits within 6 dB of the f32 lane's ({fb} dBFS)")
+        // the control that lands outside the bar: the reference with a hiss 60 dB down mixed in
+        var hissed := b.pcm
+        var seed = 0x9e3779b9u
+        for (i in range(length(hissed))) {
+            seed = seed * 1664525u + 1013904223u
+            hissed[i] += (float(seed >> 8u) / 16777216.0 - 0.5) * 0.002
+        }
+        let fh = quiet_floor_db(hissed, b.sample_rate)
+        t |> success(fh > fb + 6.0, "a reference with a -60 dBFS hiss reads {fh} dBFS - past the bar the served lane must stay under")
+    }
+}
+
 // a text the chunker cannot split - no sentence mark, no comma - is one chunk past the token
 // budget: the voice's caches grow to hold its text and every frame the cap allows, and the
 // synthesis runs to EOS instead of panicking on the cache
@@ -1013,16 +1161,52 @@ def test_pocket_long_chunk(t : T?) {
         var inscope chunks <- tts_chunks(m, text)
         t |> equal(length(chunks), 1, "an unsplittable text is one chunk")
         var inscope ids <- pocket_text_ids(m.pocket, chunks[0])
-        t |> success(length(ids) >= 194, "{length(ids)} tokens: past the 1024-row slack with its frame cap")
+        t |> success(length(ids) > POCKET_MAX_TOKENS, "{length(ids)} tokens: past the budget the caches were sized for")
         var inscope a <- synthesize(m, text, "alba")
         t |> success(speech_stats(a.pcm).finite && length(a.pcm) > 24000, "the long chunk speaks ({length(a.pcm)} samples)")
         var grown = 0l
+        var first = 0l
+        var need = 0l
         m.pocket.voice_states |> get("alba") $(vs) {
             grown = vs.caches[0].cap
+            first = vs.len + int64(POCKET_MAX_TOKENS) + pocket_max_frames(int64(POCKET_MAX_TOKENS)) + 1l
+            need = vs.len + long_length(ids) + pocket_max_frames(long_length(ids)) + 1l
         }
-        t |> success(grown > 63l + 1024l + 1024l, "the voice's caches grew past the slack ({grown} positions)")
+        t |> success(grown > first && grown >= need, "the voice's caches grew past the budget's rows to the chunk's ({grown} positions, sized {first}, the chunk needs {need})")
         // the next short sentence on the same voice still starts from the voice alone
         var inscope b <- synthesize(m, "And a short one after it.", "alba")
         t |> success(speech_stats(b.pcm).rms > 0.01, "a short sentence after the long one speaks")
+    }
+}
+
+[test]
+def test_pocket_prepared_prompt_transfer(t : T?) {
+    let sender_path = path_join(models_dir(), "pocket-tts-en-kq.gguf")
+    let receiver_path = path_join(models_dir(), "pocket-tts-en-stuart-kq.gguf")
+    if (!model_available(t, sender_path) || !model_available(t, receiver_path)) { return }
+    with_job_que() {
+        setup_dasllama_jobque_()
+        var serialized = ""
+        {
+            var inscope sender <- load_tts_model(sender_path)
+            var inscope clip <- load_audio_mono("{get_das_root()}/modules/dasLLAMA/models/jfk_ask_not.wav", 24000)
+            t |> success(length(clip) >= 24000, "reference decoded")
+            resize(clip, 24000)
+            var inscope prompt <- tts_prepare_voice_prompt(sender, clip, 24000)
+            t |> success(tts_voice_prompt_valid(sender, prompt))
+            t |> success(!empty(prompt.latents), "encoder produced frames")
+            serialized = sprint_json(prompt, false)
+        }
+        var inscope receiver <- load_tts_model(receiver_path)
+        t |> success(!receiver.pocket.cloning, "receiving file has no encoder")
+        var inscope restored = TtsVoicePrompt()
+        t |> success(sscan_json(serialized, restored))
+        t |> success(tts_register_voice_prompt(receiver, "prepared", restored))
+        t |> success(!key_exists(receiver.pocket.voice_states, "prepared"), "conditioning is lazy")
+        var inscope audio <- synthesize(receiver, "Hello from a prepared voice.", "prepared")
+        let stats = speech_stats(audio.pcm)
+        t |> success(stats.finite && stats.rms > .001, "restored voice produces finite audible speech")
+        t |> success(length(audio.pcm) >= 2400, "nonempty speech")
+        t |> success(key_exists(receiver.pocket.voice_states, "prepared"), "synthesis built conditioning")
     }
 }

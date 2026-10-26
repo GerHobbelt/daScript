@@ -31,7 +31,7 @@ require jit
 // invalidates cached DLLs (e.g. edits to llvm_jit.das, llvm_macro.das, llvm_jit_common.das,
 // runtime helper ABI, default target triple). Cache filenames fold this in, so a bump
 // makes every previously written DLL miss the cache on the next run and get GC'd.
-let public LLVM_JIT_CODEGEN_VERSION : uint64 = 0x85ul   // 0x85: a wasm target's feature string carries no +relaxed-simd
+let public LLVM_JIT_CODEGEN_VERSION : uint64 = 0x88ul   // 0x88: Module carries registersAtCompile after moduleFlags
 
 let public JIT_FNV_PRIME : uint64 = 1099511628211ul
 
@@ -608,16 +608,6 @@ class public DllExternResolver : AstVisitor {
         return expr
     }
 
-    def private get_table_t(subexprT : TypeDeclPtr) {
-        assume firstT = subexprT.firstType
-        if (firstT.isWorkhorseType) {
-            return firstT.baseType
-        } else {
-            var uvt = get_underlying_value_type(firstT)
-            return uvt.baseType
-        }
-    }
-
     // Pre-bind the JIT table-fn globals for the standalone-exe / cache-reload path. String
     // keys route through the precomputed-hash helpers (see build_table_find/at), so bind
     // those globals instead of the per-type ones.
@@ -642,7 +632,7 @@ class public DllExternResolver : AstVisitor {
     def override preVisitExprAt(expr : ExprAt?) {
         assume subExprT = expr.subexpr._type
         if (subExprT.isGoodTableType) {
-            bind_jit_table_at_glob(get_table_t(subExprT))
+            bind_jit_table_at_glob(table_key_storage_base_type(subExprT.firstType))
         } elif (handle_at_is_jitable(expr)) {
             assume ixT = expr.index._type
             dll.set_glob_address(uid.get_at_type(subExprT, ixT),
@@ -657,27 +647,27 @@ class public DllExternResolver : AstVisitor {
     }
 
     def override preVisitExprSetInsert(expr : ExprSetInsert?) {
-        bind_jit_table_at_glob(get_table_t(expr.arguments[0]._type))
+        bind_jit_table_at_glob(table_key_storage_base_type(expr.arguments[0]._type.firstType))
     }
 
     def override preVisitExprKeyExists(expr : ExprKeyExists?) {
-        bind_jit_table_find_glob(get_table_t(expr.arguments[0]._type))
+        bind_jit_table_find_glob(table_key_storage_base_type(expr.arguments[0]._type.firstType))
     }
 
     def override preVisitExprFind(expr : ExprFind?) {
-        bind_jit_table_find_glob(get_table_t(expr.arguments[0]._type))
+        bind_jit_table_find_glob(table_key_storage_base_type(expr.arguments[0]._type.firstType))
     }
 
     def override preVisitExprSafeAt(expr : ExprSafeAt?) {
         assume subExprT = expr.subexpr._type
         if (subExprT.isGoodTableType || (subExprT.isPointer && subExprT.firstType.isGoodTableType)) {
             var etype = subExprT.isPointer ? subExprT.firstType : subExprT
-            bind_jit_table_find_glob(get_table_t(etype))
+            bind_jit_table_find_glob(table_key_storage_base_type(etype.firstType))
         }
     }
 
     def override preVisitExprErase(expr : ExprErase?) {
-        let t = get_table_t(expr.arguments[0]._type)
+        let t = table_key_storage_base_type(expr.arguments[0]._type.firstType)
         dll.set_glob_address(DllName(FN_JIT_TABLE_ERASE(t)), get_jit_table_erase(unsafe(reinterpret<int>(t))))
     }
 }

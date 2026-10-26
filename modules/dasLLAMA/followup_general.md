@@ -488,17 +488,6 @@
     per-clip `cmd` (schema addition) or a receipt template with the `-f` slot marked; the das
     rows are unaffected (one process serves the whole ladder).
 
-40. **Batched PLE on the GPU - the E-series multi-stream Metal arm (long-term).** The Metal
-    batch-decode path clears `MetalNeed.ple` from its implemented set (`BATCH_NEEDS_OK` in
-    `dasllama/dasllama_metal_shapes.das`), so E-series models decline `feature` on batched
-    steps and the scheduler falls back to per-row decode - correct, but the multi-stream
-    serving tier loses its batching win exactly on the edge models built for it. The prefill
-    driver already carries batched PLE kernels (gather + finish, `dasllama_metal_prefill.das`),
-    so the shape exists; the batch-decode arm needs the per-stream token-id gather plumbed
-    through the batch kargs. Upstream has no batched-PLE serving path either, so this is
-    differentiation, not parity catch-up. Done = `BATCH_NEEDS_OK` carries `ple`, a batch-decode
-    E-series cell in the support matrix, and a scheduler-level A/B showing the batched step
-    beats N per-row steps on an E-series carrier.
 
 - **`check_committed_records` gate in `performance/REVIEW.das`** (fused-image-span review round):
     machine-check the two records-provenance rules - every `runs[]` row's
@@ -568,18 +557,6 @@
     looks green off-root is a hazard for worktree-based auditors. Done = the walk either
     resolves against the repo root explicitly or the run REFUSES (exit 2) when the walk
     yields zero files - an empty scan is never a pass.
-
-48. **The cross-module template-base reifier defect is unrecorded outside one code comment.**
-    `class template X : Base` with `Base` in another module fails reification -
-    `error[30915]: can't initialize field __finalize` (the stamped instance keeps the base
-    module's `self` type; `daslib/typemacro_boost.das`'s `__finalize` rewrite only covers the
-    same-module autoinfer-cast shape). `MetalAttnAVMmSgT` (dasllama_metal_prefill.das)
-    hand-inlines `MetalMmTileBase`'s tiles + `acc_quad` because of it - a hot primitive with
-    a second unsynced copy. Done = fix the reifier to re-point `__finalize` at the stamped
-    instance type for a cross-module parent (25-line repro: base class in module A,
-    `[template_struct_instance]` template extending it in module B; the same-module control
-    compiles), then collapse the inline copy back onto the base; until then any drift between
-    the copies is a review hazard.
 
 49. **The MoE kq tensor twins (K4/K5/K6) are gated by the DENSE kq crowns - a race that never
     measured them.** `pf_compile_moe_kq_twins` keys on `metal_tensor_crowned("kq_mulmm_k4")`
@@ -1160,6 +1137,14 @@
    with rows-per-thread as the stamp axis. The tile is crowned and measured as it stands (the m4 mint), so the fold is a
    refactor plus a re-race, not a kernel change. Done = one template stamps `MetalKqMvB2K4` and the
    tile, and the tile's emitted MSL is byte-identical or both boxes re-race it.
+   A `ROWS` axis carried on `MetalKqMvShellT` - the per-row values staged in `uint[ROWS]` /
+   `float[16 * ROWS]` locals so one unrolled decode serves both stamps - does NOT reach byte
+   identity: the row arrays survive SROA in the two-row stamp, and the tile compiles to 467 AIR
+   instructions with 15 allocas and 16 fused FP ops against the hand body's 324 / 3 / 27, while the
+   one-row stamps of every `MetalKqMv*` format read MOVED. The `@off = "xoff"` on the tile's x
+   binding, which the one-row stamps do not carry, additionally forces a `@template_gate`d field
+   pair at binding 3 plus one accessor arm. So the fold is a kernel change and needs the re-race on
+   both boxes; byte identity is not the route.
 97. **The K-quant crown races time one width and check no CPU reference.** `race_kq_rows` and
    `race_kq_k4_form` (`dasllama/dasllama_metal_kernels.das`) time two rows only, while the
    `kq_rows_<fmt>` crown gates the four- and eight-column forms at 3..8 rows (`REVIEW_GPU_RACE.md`'s
@@ -1735,3 +1720,29 @@
     model is coherent, tracking llama.cpp's exact tokens is not the bar. The option, if a carrier
     ever needs it: a Q8_0-form activation path for q40 and iq4nl through the CPU kq cores and the
     Vulkan decode GEMV, the q51 pairing as the template.
+153. **The codec stream's small windows starve the lanes.** A 16-frame window hands the codec
+    transformer 256 rows and the first conv stages a few hundred, and `maybe_parallel_for` over
+    `matmul_chunks` / `lanes_for_work` splits them across every worker: on one thread a window
+    beats the whole run by 3-6% (`PERF_LEDGER.md`, the 2026-09-18 entry), on fourteen it trails
+    by up to a tenth. Two ways of sizing the same dispatch coexist - the rows kernels' chunking
+    and the lane count the queue was set up with. Done looks like: the lanes following the rows
+    at the small end, measured on the window sweep with the discipline's cv, and `stream_conv`
+    writing a transposed conv's window rows straight into `y` instead of through `sc.ct`.
+154. **One program's JIT codegen of the TTS generator runs 15% slower than another's on the
+    same source.** A memory probe over `synthesize` read the kitten-nano 7 s say at 400 ms on one
+    thread against 345 for the same engine source under a probe differing by one `require` and
+    a print - reproducible across processes because the JIT cache served the same compiled
+    program each time, and gone with any edit to the probe. The generator's op buckets under
+    `set_asr_prof` were equal to the millisecond between the two, so the swing sits in the
+    compiled kernels' code layout or cross-module inlining, not in the algorithm. A per-program
+    swing of that size makes a before/after measured through two different programs void, and
+    means a shipped example's TTS speed is one codegen's luck. Done looks like: the swing
+    reproduced with `daslang_jit_dump_ir` on the two programs, the differing inlining or
+    alignment named, and either a pin (the generator kernels `[no_inline]`-bounded, or aligned)
+    or a `PERF_LEDGER.md` refutation.
+155. **The server's batched bench row runs whole inside one tick.** The in-process bench steps
+    one pp prefill or one tg token a tick so the supervisor's health probe is answered between
+    them, but its `tg128@N` phase calls `bench_tg_batched_rep` once a rep: `N` prefills and 128
+    batched steps with no tick between, seconds of unanswered HTTP on a large model. The work:
+    the phase holding the scheduler across ticks - admit on one tick, then one `scheduler_step` a
+    tick until the timed steps are done - with the rate read over the timed ticks alone.

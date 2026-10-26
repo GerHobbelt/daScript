@@ -31,8 +31,13 @@ option(DAS_PUGIXML_DISABLED "Disable dasPUGIXML (xml parsing library)" ON)
 option(DAS_SQLITE_DISABLED "Disable dasSQLITE (sqlite3 library)" ON)
 
 add_compile_options(-msimd128)
-add_compile_options(-msse2)
 add_compile_options(-mnontrapping-fptoint)
+# vecmath's wasm backend (include/vecmath/dag_vecMath_wasm.h) selects itself on __wasm_simd128__; no -msse* compat layer is needed.
+# modules/dasLLVM/ARCHITECTURE_TARGET_FEATURES.md#wasm-feature-string
+option(DAS_WASM_RELAXED_SIMD "Build wasm output with relaxed SIMD (fused v_madd; Safari refuses a module with any relaxed opcode)" OFF)
+if(DAS_WASM_RELAXED_SIMD)
+    add_compile_options(-mrelaxed-simd)
+endif()
 
 # wasm64 (memory64): 8-byte pointers. With a 64-bit host, host-ptr-size ==
 # target-ptr-size, so the JIT/AOT cross-compile bakes correct layouts (no
@@ -418,6 +423,27 @@ endif()
 # Stage example .wasm into site/playground for local-dev preview (gitignored).
 # make_directory _web_ex_out first so copy_directory is a clean no-op when the
 # foreach produced nothing (non-memory64 build).
+if(DEFINED ENV{EMSDK_NODE})
+    set(DAS_WEB_NODE $ENV{EMSDK_NODE})
+elseif(EXISTS "${EMSCRIPTEN_ROOT_PATH}/em-config")
+    execute_process(COMMAND "${EMSCRIPTEN_ROOT_PATH}/em-config" NODE_JS
+        OUTPUT_VARIABLE DAS_WEB_NODE OUTPUT_STRIP_TRAILING_WHITESPACE)
+endif()
+if(NOT DAS_WEB_NODE)
+    find_program(DAS_WEB_NODE NAMES node REQUIRED)
+endif()
+add_custom_target(run_web_tests
+    COMMAND ${DAS_WEB_NODE} --experimental-wasm-exnref test/dastest_wasm.js ../ ${DAS_WEB_OUTPUT_DIR}
+    COMMAND ${DAS_WEB_NODE} --experimental-wasm-exnref ${DAS_WEB_OUTPUT_DIR}/tests/test_vecmath_native.js
+    COMMAND ${DAS_WEB_NODE} --experimental-wasm-exnref ${DAS_WEB_OUTPUT_DIR}/tests/test_vecmath_scalar.js
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMENT "Running tests/language and the vecmath battery under node")
+foreach(_t daslang_static test_vecmath_native test_vecmath_scalar)
+    if(TARGET ${_t})
+        add_dependencies(run_web_tests ${_t})
+    endif()
+endforeach()
+
 add_custom_target(stage_site_playground_wasm
     COMMAND ${CMAKE_COMMAND} -E make_directory ${_web_ex_out}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${_repo}/site/playground/samples/examples

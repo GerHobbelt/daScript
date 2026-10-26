@@ -61,7 +61,7 @@ Task-specific instructions are in skill files under `skills/`. Read the relevant
 | `skills/dynamic_modules.md` | `.das_module` descriptors, module resolution, `register_native_path` |
 | `skills/external_module_debugging.md` | Iterating on a daslang module outside the SDK tree - run/lint/test from a standalone `daslang` or MCP; junctions + `project_root` |
 | `skills/daslang_live.md` | `daslang-live` lifecycle, REST API, `[live_command]`, persistent state |
-| `skills/imgui_application.md` | Building any dasImgui application - harness lifecycle, the headless arm, heap/GC ownership |
+| `skills/imgui_application.md` | Building any dasImgui application - harness lifecycle, the headless arm, heap/GC ownership, touch/phone layout |
 | `skills/imgui_migration.md` | Migrating v1 `imgui_boost` code to the v2 boost layer |
 | `skills/imgui_ui_debugging.md` | Any dasImgui UI/interaction bug: reproduce -> observe in `imgui_snapshot` -> fix -> prove via snapshot + test. Never claim a UI fix from logic or a screenshot alone |
 | `skills/daslang/references/json.md` | Reading/writing JSON (`sprint_json`/`sscan_json`, `JV`, manual `JsonValue?`) |
@@ -200,6 +200,7 @@ For path/filename ops use `fio` helpers (`base_name`/`dir_name`/`path_join`/...)
 - `dastest/` - test framework (usable for testing your own code)
 - `utils/mcp/`, `utils/dap/`, `utils/lsp/` - MCP, DAP-to-MCP, and LSP servers for AI coding assistants
 - `utils/lint/` - lint runner: `bin/daslang utils/lint/main.das -- <files> --quiet`
+- `utils/ast-verify/` - AST verifier gate: `bin/daslang utils/ast-verify/main.das -- --file <path>` (or `--changed`); exits non-zero on a finding, which `--ast-verify-batch` alone does not
 - `utils/das-fmt/` - the formatter script (`dasfmt.das`, wraps `daslib/das_source_formatter`)
 - `utils/gen1-to-gen2/` - v1 (indentation) -> gen2 (braces) syntax converter, run as `bin/daslang utils/gen1-to-gen2/main.das -- <files>` (also the `convert_to_gen2` MCP tool)
 - `utils/detect-dupe/` - cross-file duplicate-function detector (also the `export_corpus` / `detect_duplicates` MCP tools)

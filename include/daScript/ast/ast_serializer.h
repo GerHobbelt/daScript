@@ -365,7 +365,7 @@ namespace das {
         AstSerializer & serializeModule ( Module & module, bool already_exists );
 
         static constexpr uint32_t getVersion () {
-            return 215;   // 215: the policy stream carries no_fold_unsafe
+            return 216;   // 216: a record header carries the module's compile-time macro registration flag
         }
 
         void serializeProgram ( ProgramPtr program, ModuleGroup & libGroup ) noexcept;
@@ -584,12 +584,12 @@ namespace das {
 
     // Deserialize one program (reading mode).
     void rtti_ast_serializer_deserialize_program (
-            AstSerializerState * state,
+            AstSerializerState * state, ModuleGroup * libGroup,
             const TBlock<void,bool,smart_ptr<Program>,const string> & block,
             Context * context, LineInfoArg * at );
     // the same, with the access the restored program's late requires walk through
     void rtti_ast_serializer_deserialize_program_ex (
-            AstSerializerState * state, smart_ptr<FileAccess> access,
+            AstSerializerState * state, smart_ptr<FileAccess> access, ModuleGroup * libGroup,
             const TBlock<void,bool,smart_ptr<Program>,const string> & block,
             Context * context, LineInfoArg * at );
 

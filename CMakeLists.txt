@@ -33,7 +33,14 @@ option(DAS_SMT_DISABLED "Disable dasSMT (Z3 SMT solver bindings)" ON)
 option(DAS_HV_DISABLED "Disable dasHV (websokets,http server and client)" OFF)
 option(DAS_GLFW_DISABLED "Disable dasGLFW (GLFW window for graphics apps)" OFF)
 option(DAS_IMGUI_DISABLED "Disable dasImgui (Dear ImGui bindings + widget DSL; needs dasGlfw + dasClipboard)" OFF)
-option(DAS_VULKAN_DISABLED "Disable dasVulkan (Vulkan bindings generated from vk.xml; headers + volk vendored, no SDK needed)" OFF)
+# Apple builds run Vulkan only through MoltenVK, whose compute limits decline the kernels the
+# module exists to serve, so the module is off there by default; -DDAS_VULKAN_DISABLED=OFF opts in.
+if(APPLE)
+    set(DAS_VULKAN_DISABLED_DEFAULT ON)
+else()
+    set(DAS_VULKAN_DISABLED_DEFAULT OFF)
+endif()
+option(DAS_VULKAN_DISABLED "Disable dasVulkan (Vulkan bindings generated from vk.xml; headers + volk vendored, no SDK needed; on by default on Apple)" ${DAS_VULKAN_DISABLED_DEFAULT})
 option(DAS_AUDIO_DISABLED "Disable dasAudio (Miniaudio sound library)" OFF)
 option(DAS_STDDLG_DISABLED "Disable dasStdDlg (File new,open,save etc dialogs)" OFF)
 option(DAS_MESHOPTIMIZER_DISABLED "Disable dasMeshOptimizer (mesh processing and buffer codecs)" OFF)
@@ -98,6 +105,7 @@ IF(WIN32)
 ENDIF()
 
 INCLUDE(./CMakeCommon.txt)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/das_lane.cmake)
 
 IF(DEFINED DAS_CONFIG_INCLUDE_DIR)
     INCLUDE_DIRECTORIES(${DAS_CONFIG_INCLUDE_DIR})
@@ -940,6 +948,7 @@ include/vecmath/dag_vecMath_neon.h
 include/vecmath/dag_vecMath_pc_sse.h
 include/vecmath/dag_vecMath_scalar.h
 include/vecmath/dag_vecMath_trig.h
+include/vecmath/dag_vecMath_wasm.h
 )
 list(SORT VECMATH_SRC)
 SOURCE_GROUP_FILES("vecmath" VECMATH_SRC)
@@ -2087,6 +2096,10 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/utils/lint/tests/
     FILES_MATCHING PATTERN "*.das"
 )
 
+# Install ast-verify (the --ast-verify-batch gate: the flag reports and exits 0,
+# so the verdict is read from its output)
+install(FILES ${PROJECT_SOURCE_DIR}/utils/ast-verify/main.das DESTINATION utils/ast-verify)
+
 # Install detect-dupe (cross-file duplicate-function detector)
 file(GLOB DAS_DETECT_DUPE_FILES CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/utils/detect-dupe/*.das)
 install(FILES ${DAS_DETECT_DUPE_FILES} DESTINATION utils/detect-dupe)
@@ -2245,6 +2258,14 @@ add_subdirectory(tests)
 # Documentation targets (check_docs_generated, build_doc, das_documentation).
 add_subdirectory(doc)
 
+add_subdirectory(examples/games)
+
+add_subdirectory(benchmarks)
+
+add_subdirectory(site-dasllama)
+
+add_subdirectory(ci)
+
 # macOS: ad-hoc code sign all installed binaries and shared libraries.
 # This prevents Gatekeeper from quarantining downloaded SDK artifacts
 # ("cannot be opened because the developer cannot be verified").
@@ -2332,6 +2353,15 @@ if(NOT ${DAS_TREE_SITTER_DISABLED})
         RUNTIME DESTINATION tree-sitter-daslang
         LIBRARY DESTINATION tree-sitter-daslang
     )
+
+    # The ast-grep tools need this library and the sgconfig.yml its POST_BUILD stamps. The
+    # consumers live in utils/, which is processed long before this block, so the edge is
+    # added here where both targets exist.
+    foreach(_t run_tests_mcp_tools run_utils_tests)
+        if(TARGET ${_t})
+            add_dependencies(${_t} tree_sitter_daslang)
+        endif()
+    endforeach()
     install(FILES
         tree-sitter-daslang/src/node-types.json
         tree-sitter-daslang/grammar.js
@@ -2416,9 +2446,9 @@ install(CODE [[
     foreach(_f IN LISTS CMAKE_INSTALL_MANIFEST_FILES)
         get_filename_component(_name "${_f}" NAME)
         get_filename_component(_f_abs "${_f}" ABSOLUTE)
-        if((_name MATCHES "^REVIEW.*\.(md|das)$"
-                OR _name MATCHES "^(ARCHITECTURE[A-Za-z_]*|MASTERPLAN[A-Za-z_]*|PERF_LEDGER|PROFILE|THINKING)\.md$"
-                OR _name MATCHES "^followup_.*\.md$")
+        if((_name MATCHES "^REVIEW.*\\.(md|das)$"
+                OR _name MATCHES "^(ARCHITECTURE[A-Za-z_]*|MASTERPLAN[A-Za-z_]*|PERF_LEDGER|PROFILE|THINKING)\\.md$"
+                OR _name MATCHES "^followup_.*\\.md$")
             AND NOT _f_abs STREQUAL _root_common
             AND NOT _f_abs STREQUAL _root_arch_common)
             set(_head "")

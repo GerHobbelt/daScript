@@ -213,7 +213,7 @@ struct public MetalEnv {
     @clarg_doc = "Serve the whisper DECODE STEP on the GPU too (needs wdec). Small decoders (n_text_state under the 1024 floor; set_metal_wdec_step_min_d) keep the CPU rail - the per-dispatch latency floor beats them."
     wdec_step : bool = true
 
-    @clarg_doc = "Fused single-pass decode attention (assumes head_size 128); 0 is the A/B rail to the chunked pair."
+    @clarg_doc = "Fused single-pass decode attention (a head of 128 on every KV codec, a head of 64 on the f16/f32 mirrors); 0 is the A/B rail to the chunked pair."
     attn_d : bool = true
 
     @clarg_doc = "Row count below which attention uses the single-chunk kernel; clamped to 128."
@@ -350,7 +350,7 @@ struct public VulkanEnv {
     @clarg_doc = "The resident prefill's FFN GEMMs (gate, up, down) take the f16 activation feed where the tile family admits it; 0 pins the FFN group to the Q8 activation blocks the CPU chain quantizes, while the attention group keeps its own pick - the A/B rail that takes the feed's rounding out of a resident-vs-CPU compare (gemma's logits move with it)."
     vk_f16_ffn : bool = true
 
-    @clarg_doc = "Stream expert uploads on the dedicated transfer queue, overlapped via a timeline semaphore; 0 keeps the single-queue rail."
+    @clarg_doc = "Stream expert uploads on the dedicated transfer queue, overlapped via a timeline semaphore, and land the resident token command's logits there behind a compute-timeline wait; 0 keeps the single-queue rail, where the token command copies its own logits under its fence."
     vk_xferq : bool = true
 
     @clarg_doc = "Run the cm2 tiles' four-wide decode callback where the device has VK_NV_cooperative_matrix_decode_vector; 0 strips it and serves the scalar callback - the same-build A/B and the fallback probe."
@@ -388,6 +388,9 @@ struct public VulkanEnv {
 
     @clarg_doc = "Arm the resident driver with f32 KV mirrors instead of the f16 default (A/B instrument; only sessions of the armed codec are served)."
     vk_kv32 : int64 = 0l
+
+    @clarg_doc = "`benchmarks/lcpp_bench.das --npl N` only: drops a class of dispatch from the recorded N-row token command so a profile prices it - bits 1 = no attention, 2 = the one-column GEMVs (row 0 alone), 4 = no rope, 8 = no activation requant; the logits are garbage under any bit."
+    vk_nrow_bisect : int64 = 0l
 
     @clarg_doc = "cm2 prefill tile pick: 0 = the wave model's pick (`cm2_gemm_pick`), 128 = force the m tile, 256 = force the l tile (A/B instrument). Inert on the KHR arm (DASLLAMA_COOPMAT=mm, or a device without NV_coopmat2), whose kq tile has one geometry."
     cm2_tile : int64 = 0l

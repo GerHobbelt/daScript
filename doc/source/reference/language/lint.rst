@@ -554,7 +554,10 @@ placeholder.
 
 Arguments of **class methods** are exempt: their signature is dictated by the
 base class or interface, so an unused parameter there is structural rather
-than a mistake. LINT012 fires on free functions only.
+than a mistake. LINT012 fires on free functions only. An argument that a
+discarded ``static_if`` arm names counts as used: the module-gated shape
+(``static_if (typeinfo builtin_module_exists(x)) { ... } else { skip }``)
+stays clean on a box that lacks the module.
 
 .. das-doc: fragment
 .. code-block:: das
@@ -2829,6 +2832,11 @@ When an ``unsafe { ... }`` block contains exactly one statement that needs
 unsafe, the block scope is too broad. Narrow it to the expression form
 ``unsafe(<sub-expr>)`` wrapping just the operation that requires it. When two
 or more statements need unsafe the block is justified and stays silent.
+
+The rule also stays silent where no narrow form exists. A declaration owns its
+own permission and ``unsafe()`` wraps an expression, so a stack-constructed
+class local, a ``smart_ptr`` local without ``inscope``, and an ``inscope``
+local whose generated delete is unsafe all keep the block.
 
 .. das-doc: alt
 .. code-block:: das

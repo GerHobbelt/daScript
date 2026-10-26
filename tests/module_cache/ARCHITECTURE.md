@@ -27,6 +27,18 @@ this document states what the folder is and why its tests take the shape they do
 - `test_macro_dep_invalidate.das` - a compile-time input a macro pinned through
   `add_module_cache_dependency` is compared by content, not mtime: a byte-identical rewrite
   serves the record, a changed file re-parses from that module on and says so.
+- `test_apply_macro_reparse.das` - a module whose compile registered a call macro into itself
+  (a function annotation's `apply` on a def of the module) is never served from the cache: its
+  record is skipped and the module reparses in place, the warm read says so and serves the
+  rest, and a driver edited after it parses from source against the macro the reparse
+  registered - the site the macro rewrites still reads 42.
+- `test_extern_registrar_reparse.das` - a module whose compile registered an extern proxy into
+  `dasbind` (a `late` `[extern]` def, so no library is needed) carries the same mark: the warm
+  read skips its record and reparses it in place without reading the payload, so no cumulative
+  hash warning and no failed read, and the driver still serves.
+- `test_builtin_embedded_not_cached.das` - a builtin module's embedded source (`UnitTest`'s
+  `unit_test.das`) leaves no record in the cache, and a program requiring the module serves
+  clean on the warm run with no cumulative hash warning.
 - `test_generic_instance_origin.das` - a generic instance restored from the cache keeps its
   origin generic, so a fresh program compiled in the same process after the restore resolves it.
 - `test_descriptor_manifest.das` - the manifest the module scan keeps beside each `.das_module`
@@ -37,7 +49,9 @@ this document states what the folder is and why its tests take the shape they do
   first: the first start compiles the descriptor and writes the manifest beside it, the second
   replays it, an edited descriptor recompiles once, every rejection the reader knows - a table
   over each mutated line - recompiles and rewrites, an edited module the descriptor requires
-  recompiles it once, a `--jit-target` run keys apart from a native one, a `no_manifest()` descriptor compiles on every start, a recorded argument with a
+  recompiles it once, a `--jit-target` run keys apart from a native one, the other binary kind
+  (`daslang_static` beside `daslang`, or back) writes its own manifest file and each kind replays
+  its own after the other ran, a `no_manifest()` descriptor compiles on every start, a recorded argument with a
   tab leaves the manifest unwritten, and a directory sitting where the `.tmp` or the manifest
   goes fails the create or the rename so the start just compiles; each verdict is read from
   the `DAS_TRACE_MODULE_LOAD=1` line the child prints.
@@ -135,7 +149,10 @@ directory, asserting on the child's stdout; the manifest case on a project root 
 directory, asserting on the scan trace. Each removes what it wrote under its own directory,
 with one ledgered write outside it: the default-path case's child writes the default cache,
 which is `.jitted_scripts/module_cache/` under the cwd it shares with dastest by definition,
-and the test removes what that child wrote before it returns. The `.das_module.manifest`
-sidecars every child's module scan warms beside the tree's descriptors are the scan's,
-gitignored, and stay. A child's stdout is echoed on failure,
+and the test removes what that child wrote before it returns. The manifest sidecars every
+child's module scan warms beside the tree's descriptors - `.das_module.manifest` from the
+dynamic-module build, `.das_module.static.manifest` from `daslang_static` - are the scan's,
+gitignored, and stay; a test names the one its own kind writes (`manifest_file_name`), since
+the static suite runs this folder too, and the default-path case keys its stems by kind
+(`kind_stem`) because the two suites run at once in one tree. A child's stdout is echoed on failure,
 because the exit code alone would turn a one-line answer into an exit-code hunt.

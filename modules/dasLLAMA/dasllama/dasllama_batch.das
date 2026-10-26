@@ -15,6 +15,37 @@ require math
 // One decode step over B sessions through ONE pass of the weights: GEMVs become B-row GEMMs via
 // the batched prefill blocks; attention stays per-(row, head) since each reads only ITS session's cache.
 
+var private g_batch_steps_device = 0l
+var private g_batch_steps_cpu_stack = 0l
+var private g_batch_steps_per_row = 0l
+
+//! how the batched steps since load were served: a device driver ran the whole stack in one pass, the
+//! CPU batched stack ran it, or the rows stepped one at a time - a weight pass a row (one row, a q4_0
+//! model, a non-standard graph, or a blob-only model whose device driver declined the step)
+def public batch_step_census() : tuple<device : int64; cpu_stack : int64; per_row : int64> {
+    return (device = g_batch_steps_device, cpu_stack = g_batch_steps_cpu_stack, per_row = g_batch_steps_per_row)
+}
+
+//! a batched step served outside `eval_batch_` joins the census: the scheduler's joint speculative
+//! verify counts as a device step when every stream's rows rode it, as per-row otherwise
+def public note_batch_step(device : bool) {
+    if (device) {
+        g_batch_steps_device++
+    } else {
+        g_batch_steps_per_row++
+    }
+}
+
+//! every row through the single-row forward: the batched drivers have no form for this step
+def private batch_rows_one_at_a_time(t : Model; var sessions : array<Session?>; tokens : array<int64>; nrows : int64) {
+    g_batch_steps_per_row++
+    for (i in range64(nrows)) {
+        var sp = sessions[i]
+        forward(t, *sp, tokens[i], sp.n_past)
+        sp.n_past++
+    }
+}
+
 def create_batch_workspace_(model : Model) : BatchWorkspace {
     var ws : BatchWorkspace
     // the scratch Session never owns cache or sampler state — eval_batch reads/writes the real
@@ -90,17 +121,15 @@ def private attention_batch_decode(t : Model; var ws : BatchWorkspace; sessions 
     if (ktq4 || vtq4) {
         // tq4 basis change at the RoPE seam (see attention_std_decode); xb_b un-rotates below
         let ts_rot = prof_ticks()
-        unsafe {
-            let sgp = addr < float const? >(ws.scr.kv_signs[0])
-            if (ktq4) {
-                tq4_rotate_batch(ws.scr.q_b, nrows, qd, head_size, sgp)
-                if (!kv_shared) {
-                    tq4_rotate_batch(ws.scr.k_b, nrows, kv_dim, head_size, sgp)
-                }
+        let sgp = unsafe(addr < float const? >(ws.scr.kv_signs[0]))
+        if (ktq4) {
+            tq4_rotate_batch(ws.scr.q_b, nrows, qd, head_size, sgp)
+            if (!kv_shared) {
+                tq4_rotate_batch(ws.scr.k_b, nrows, kv_dim, head_size, sgp)
             }
-            if (vtq4 && !kv_shared) {
-                tq4_rotate_batch(ws.scr.v_b, nrows, kv_dim, head_size, sgp)
-            }
+        }
+        if (vtq4 && !kv_shared) {
+            tq4_rotate_batch(ws.scr.v_b, nrows, kv_dim, head_size, sgp)
         }
         prof_add("tq4_rot", ts_rot)
     }
@@ -176,9 +205,7 @@ def private attention_batch_decode(t : Model; var ws : BatchWorkspace; sessions 
     }
     prof_add("attn", ts_attn)
     if (vtq4) {   // tq4 V: xb_b rows accumulated in the rotated basis — un-rotate per (row, head)
-        unsafe {
-            tq4_unrotate_batch(ws.scr.xb_b, nrows, qd, head_size, addr < float const? >(ws.scr.kv_signs[0]))
-        }
+        tq4_unrotate_batch(ws.scr.xb_b, nrows, qd, head_size, unsafe(addr < float const? >(ws.scr.kv_signs[0])))
     }
     attn_out_suffix(t, ws.scr, l, nrows)
 }
@@ -187,6 +214,10 @@ def private attention_batch_decode(t : Model; var ws : BatchWorkspace; sessions 
 def private batch_rows_prep_(t : Model; var ws : BatchWorkspace; tokens : array<int64>; nrows : int64) {
     let c = t.config
     batch_decode_alloc(t, ws.scr, nrows)
+    ws.row_tokens |> grow_resize(nrows)
+    for (i in range64(nrows)) {
+        ws.row_tokens[i] = tokens[i]
+    }
     let dim = c.dim
     let ts_embed = prof_ticks()
     for (i in range64(nrows)) {
@@ -234,10 +265,8 @@ def verify_batch_step(t : Model; var ws : BatchWorkspace; var s : Session; token
         return false
     }
     g_verify_sessions |> grow_resize(nrows)
-    unsafe {
-        for (i in range64(nrows)) {
-            g_verify_sessions[i] = addr(s)
-        }
+    for (i in range64(nrows)) {
+        g_verify_sessions[i] = unsafe(addr(s))
     }
     ws.scr.kv_dtype_k = s.kv_dtype_k
     ws.scr.kv_dtype_v = s.kv_dtype_v
@@ -312,14 +341,10 @@ def eval_batch_(t : Model; var ws : BatchWorkspace; var sessions : array<Session
         }
     }
     // per-row fallback keeps every configuration correct: B == 1 keeps the fused decode chain, q4_0
-    // has no batched kernels, non-std arches have no batch attention worker, and the classic rope
-    // path can't express per-row positions
-    if (nrows == 1l || t.quant == QuantMode.q4_0 || !t.blocks.attn_is_std || !g_use_rope_table) {
-        for (i in range64(nrows)) {
-            var sp = sessions[i]
-            forward(t, *sp, tokens[i], sp.n_past)
-            sp.n_past++
-        }
+    // has no batched kernels, non-std arches have no CPU batch attention worker (an armed device
+    // driver may have one, so their rows reach it first), the classic rope path has no per-row positions
+    if (nrows == 1l || t.quant == QuantMode.q4_0 || (!t.blocks.attn_is_std && !batch_decode_override_armed()) || !g_use_rope_table) {
+        batch_rows_one_at_a_time(t, sessions, tokens, nrows)
         return
     }
     // snapshot cache geometry onto the scratch Session; kv_ensure runs for every row FIRST because
@@ -339,13 +364,13 @@ def eval_batch_(t : Model; var ws : BatchWorkspace; var sessions : array<Session
         kv_ensure(*sp, sp.n_past + 1l)
         ws.positions[i] = sp.n_past
         ws.rope_positions[i] = sp.n_past + sp.rope_pos_delta   // post-image mrope streams rope ahead of their KV index
-        if (s0.kv_pool == null) {
+        if (s0.kv_pool == null && !sp.device_kv) {
             unsafe {
                 ws.kbase[i] = addr(sp.key_cache[0])
                 ws.vbase[i] = addr(sp.value_cache[0])
             }
         } else {
-            ws.kbase[i] = null   // paged rows address the pool blobs, hoisted per layer
+            ws.kbase[i] = null   // paged rows address the pool blobs, hoisted per layer; a device-home row has no host cache at all
             ws.vbase[i] = null
         }
     }
@@ -358,7 +383,14 @@ def eval_batch_(t : Model; var ws : BatchWorkspace; var sessions : array<Session
     if (batch_decode_override_armed()) {
         stack_done = batch_decode_override_invoke(t, ws, sessions, nrows)
     }
-    if (!stack_done) {
+    if (!stack_done && (t.metal_blob || !t.blocks.attn_is_std)) {   //! the device driver declined a blob-only or non-standard-graph step: the single-row forward serves what the batched stacks have no form for
+        batch_rows_one_at_a_time(t, sessions, tokens, nrows)
+        return
+    }
+    if (stack_done) {
+        note_batch_step(true)
+    } else {
+        g_batch_steps_cpu_stack++
         blob_only_panic(t, "batch-decode stack")
         for (l in range64(c.n_layers)) {
             attention_batch_decode(t, ws, sessions, l, nrows)
