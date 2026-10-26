@@ -258,12 +258,12 @@ struct private StepRes {
     bdn_b : MetalBuffer?       // [nvh] raw beta projections
     bdn_g : MetalBuffer?       // [nvh] raw alpha projections
     bdn_o : MetalBuffer?       // [di] delta-rule output (gated in place)
-    dn_split : bool            // MTP verify: dn stores land in the shadow region; the live region keeps the pre-verify state
-    btape : MetalBuffer?       // MTP verify replay tape: per recurrent layer [cv rows | qkv rows | beta rows | alpha rows]
-    tape_slot : uint64         // bytes per recurrent layer in the tape
-    n_dn : int64               // recurrent layers taped
-    u_tcd : MetalBuffer?       // nrows*cd (the tape row-block copy width)
-    u_tnvh : MetalBuffer?      // nrows*nvh
+    dn_split : bool
+    btape : MetalBuffer?
+    tape_slot : uint64
+    n_dn_taped : int64               // recurrent layers taped
+    u_tcd : MetalBuffer?
+    u_tnvh : MetalBuffer?
     bdn_qg : MetalBuffer?      // [2*qd] packed [q|gate] projection (gated-attention layers)
     bdn_gate : MetalBuffer?    // [qd] deinterleaved sigmoid-gate rows
     u_cd : MetalBuffer?
@@ -299,6 +299,7 @@ var private g_rope_sin_next_swa : array<float>
 // geometry + pooled buffers + uniforms for one step at `pos` — no input bytes yet (poke_step).
 // Hetero models (gemma4) carry TWO attention classes (global = config fields, sliding = _swa);
 // buffers size to the class maxima and each layer binds its class's uniform set.
+[arch(at="../ARCHITECTURE_GPU_MTP.md#verify-row-pad")]
 def private acquire_step(t : Model; s : Session; pos : int64; koff, voff : uint64; cap : int64; draft : bool = false; nrows : int64 = 1l) : StepRes {   // nolint:STYLE037,STYLE038 — flat per-shape buffer/uniform acquire list
     let c = t.config
     let dim = c.dim
@@ -324,7 +325,6 @@ def private acquire_step(t : Model; s : Session; pos : int64; koff, voff : uint6
     let nsh = moe ? c.n_ff_shexp : 0l
     let h2 = max(2l * hid_mx, max(2l * knfe, 2l * nsh))   // moe: bh12 holds k gate rows | k up rows (+ the shexp pair)
     let rot = c.rope_dim > 0l ? c.rope_dim : head_size   // partial-rope tables are rot/2 wide
-    // a multi-row verify pads its row buffers to the 4-row stride the fixed-B GEMV forms write in full (pad rows are owned scratch nothing reads); single-row steps copy exactly one row
     let mp = nrows <= 1l ? 1l : ((nrows + 3l) / 4l) * 4l
     var r = StepRes(valid = true, pos = pos, uid = s.uid, nrows = nrows,
         kdt = s.kv_dtype_k, s16 = t.wscale_f16, hetero = hetero, moe = moe,
@@ -460,7 +460,7 @@ def private acquire_step(t : Model; s : Session; pos : int64; koff, voff : uint6
     if (r.dn) {
         let cd = dn_conv_dim(c)
         let di = c.ssm_d_inner
-        r.bytes_dn_cd = uint64(mp * cd * 4l)   // bdn_qkv/bdn_cv: enc_gemv_rows tiles B4, so pad the row stride
+        r.bytes_dn_cd = uint64(mp * cd * 4l)   // bdn_qkv/bdn_cv
         r.bytes_dn_di = uint64(mp * di * 4l)   // bdn_z/bdn_o
         r.bytes_dn_h = uint64(mp * c.ssm_dt_rank * 4l)   // bdn_b/bdn_g
         r.bdn_qkv = pool_acquire(g_pool, g_dev, r.bytes_dn_cd)
@@ -1105,18 +1105,17 @@ def private finish_draft_step(t : Model; var s : Session; r : StepRes; seam : bo
 //! forward_mtp's GPU twin: the draft head against a resident blob model. `pos` is the trunk
 //! position (n_past); the draft row lands at pos-1 (rotary is delta-invariant). Needs a
 //! GPU-current session (KV mirror holds rows [0, pos)) and GPU logits. false = declined.
-[hot_path]
+[hot_path, arch(at="../ARCHITECTURE_GPU_MTP.md#mtp-nextn-chain")]
 def metal_mtp_draft_forward(t : Model; var s : Session; token, pos : int64; seam : bool = false; wm_pos : int64 = -1l) : bool {
     let c = t.config
     if (g_dev == null || !t.metal_blob || c.n_layer_nextn <= 0l || pos < 1l ||
             !key_exists(g_mirrors, s.uid)) {
         return false
     }
+    let ts_prep = prof_ticks()
     finish_pending_step()
     let mr = g_mirrors[s.uid]
     let dpos = pos - 1l
-    // the trunk watermark must cover the round's base position (a chained draft at pos+i reads
-    // only slab rows its own chain wrote above the base); the slab capacity must cover this row
     let need_wm = wm_pos >= 0l ? wm_pos : pos
     if (mr.watermark < need_wm || mr.cap_rows < pos || mr.kdt != s.kv_dtype_k || mr.vdt != s.kv_dtype_v) {
         return false
@@ -1133,8 +1132,13 @@ def metal_mtp_draft_forward(t : Model; var s : Session; token, pos : int64; seam
         memcpy(metal_buffer_contents(r.bcos), addr < void? >(s.rope_cos[0]), r.bytes_tab)
         memcpy(metal_buffer_contents(r.bsin), addr < void? >(s.rope_sin[0]), r.bytes_tab)
     }
+    prof_add("mtp.draft.prep", ts_prep)
+    let ts_enc = prof_ticks()
     encode_draft_step(t, r, !seam)
+    prof_add("mtp.draft.enc", ts_enc)
+    let ts_fin = prof_ticks()
     let ok = finish_draft_step(t, s, r, seam)
+    prof_add("mtp.draft.wait", ts_fin)
     release_step(r)
     return ok
 }
@@ -1224,13 +1228,13 @@ def private encode_verify_layer(t : Model; var r : StepRes; enc : MetalComputeEn
             let hoff = r.dn_conv_base + hslice
             var bw_cv = upload_region(addr < void? >(t.fblob[t.dn_conv_off + l * c.ssm_d_conv * cd]), uint64(c.ssm_d_conv * cd * 4l))
             var dka = dn_args(c, r.nrows, !r.dn_split)
-            if (r.dn_split) {   // stores go to the shadow region; the live region keeps the pre-verify state for the replay
+            if (r.dn_split) {
                 dka.split = 1u
             }
             enc_dn_conv(enc, r.bdn_qkv, r.bdn_state, hoff, bw_cv, r.bdn_cv, dka, cd, r.nrows)
             enc_dn_conv_hist(enc, r.bdn_qkv, r.bdn_state, hoff, r.bdn_state, r.dn_conv_alt + hslice, dka, cd)
             enc_dn_l2norm(enc, r.bdn_cv, dka, 2l * c.ssm_n_group, r.nrows)
-            if (r.dn_split) {   // the replay tape: this layer's scan inputs, rows 0..nrows-1
+            if (r.dn_split) {
                 let tb = r.tape_slot * uint64(dnli)
                 let cvb = uint64(r.nrows * cd * 4l)
                 let nvb = uint64(r.nrows * nvh * 4l)
@@ -1393,13 +1397,13 @@ def private encode_verify_layer(t : Model; var r : StepRes; enc : MetalComputeEn
 // the 2-row verify [tok@pos, d@pos+1]: batch-form sites at nrows=2, SAME-SLAB route table
 // (cnt pos+1/pos+2 — the serial encoder orders row0's KV write before row1's read); dn scans
 // npos=2 in place on the decode DnMirror. Caller poked bx (embed pair) + 2-row rope tables.
+[arch(at="../ARCHITECTURE_GPU_MTP.md#mtp-verify-draft-warm"), arch(at="../ARCHITECTURE_GPU_MTP.md#verify-serial-encoder")]
 def private encode_verify_step(t : Model; var r : StepRes; pos : int64) {
     let c = t.config
     let dim = c.dim
     let nr = r.nrows
     let esz = uint64(kv_row_bytes(r.kdt, 1l))   // nolint:LINT021 — divides uint64 arena offsets; only the quotient narrows
-    // per-layer same-slab route entries (elements), one per verify row; the +nextn entry = the warm's draft slab
-    g_vrt |> resize((c.n_layers + c.n_layer_nextn) * 4l * nr)
+    g_vrt |> grow_resize((c.n_layers + c.n_layer_nextn) * 4l * nr)
     for (l in range64(c.n_layers + c.n_layer_nextn)) {
         let lb = uint((r.koff + uint64(mirror_lbase(t, r.kdt, r.cap, l))) / esz)
         let vb = uint((r.voff + uint64(mirror_lbase(t, r.kdt, r.cap, l))) / esz)
@@ -1426,7 +1430,6 @@ def private encode_verify_step(t : Model; var r : StepRes; pos : int64) {
     for (l in range64(c.n_layers)) {
         encode_verify_layer(t, r, enc, brt, l, pos, dnli)
     }
-    // every row norms + classifies: row 0 = the verify truth for tok, row i = the truth for draft i
     unsafe {
         var bwfin = upload_region(addr < void? >(t.fblob[t.rms_final_off]), uint64(dim * 4l))
         enc_rms_b(enc, r.bx, 0ul, bwfin, r.bxf, r.u_dim, r.u_eps, nr)
@@ -1434,7 +1437,6 @@ def private encode_verify_step(t : Model; var r : StepRes; pos : int64) {
     let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
     enc_verify_site(t, enc, cls_fmt, t.wcls_off, c.vocab_size, dim, c.vocab_size,
         r.bxf, r.blog, r.u_dim, r.u_vocab, r.u_vocab, [nrows = nr])
-    // draft-slab warm (committed history): head block at nr rows, h_0 = the saved pre-draft mtp_h at bcat row nr, h_i = verify post-norm row i-1
     unsafe {
         let rowb = uint64(dim * 4l)
         enc_copy_row(enc, r.bcat, uint64(nr) * rowb, r.bxb, 0ul, r.u_dim, dim)
@@ -1445,7 +1447,6 @@ def private encode_verify_step(t : Model; var r : StepRes; pos : int64) {
         enc_rms_b(enc, r.bxb, 0ul, bw_hn, r.bxb2, r.u_dim, r.u_eps, nr)
         var bw_en = upload_region(addr < void? >(t.fblob[t.mtp_enorm_off]), uint64(dim * 4l))
         enc_rms_b(enc, r.bcat, 0ul, bw_en, r.bh12, r.u_dim, r.u_eps, nr)
-        // interleave [enorm(embed_i) ; hnorm(h_i)] per row into the cat image
         for (i in range64(nr)) {
             enc_copy_row(enc, r.bh12, uint64(i) * rowb, r.bcat, uint64(2l * i) * rowb, r.u_dim, dim)
             enc_copy_row(enc, r.bxb2, uint64(i) * rowb, r.bcat, uint64(2l * i + 1l) * rowb, r.u_dim, dim)
@@ -1465,10 +1466,12 @@ def private encode_verify_step(t : Model; var r : StepRes; pos : int64) {
     pool_release(g_upool, brt, bytes_rt)
 }
 
-// land the verify: nrows KV rows + every row's logits into s.mtp_logits_b (row 0 also into
-// s.mtp_logits); accept/reject bookkeeping is the caller's
+//! lands nrows KV rows + every row's logits; accept/reject bookkeeping is the caller's
 def private finish_verify_step(t : Model; var s : Session; r : StepRes; pos : int64) : bool {
+    let ts_wait = prof_ticks()
     metal_wait_until_completed(r.cb)
+    prof_add("mtp.verify.wait", ts_wait)
+    let ts_land = prof_ticks()
     let ok = !metal_command_buffer_failed(r.cb)
     if (ok) {
         let c = t.config
@@ -1488,9 +1491,7 @@ def private finish_verify_step(t : Model; var s : Session; r : StepRes; pos : in
                 }
             }
             let vb = c.vocab_size * 4l
-            if (long_length(s.mtp_logits_b) < nr * c.vocab_size) {
-                s.mtp_logits_b |> resize(nr * c.vocab_size)
-            }
+            s.mtp_logits_b |> ensure_length(nr * c.vocab_size)
             var lg = reinterpret<uint8?>(metal_buffer_contents(r.blog))
             memcpy(addr < void? >(s.mtp_logits_b[0]), reinterpret<void?>(lg), uint64(nr * vb))
             memcpy(addr < void? >(s.mtp_logits[0]), reinterpret<void?>(lg), uint64(vb))
@@ -1499,26 +1500,11 @@ def private finish_verify_step(t : Model; var s : Session; r : StepRes; pos : in
         to_log(LOG_ERROR, "dasLLAMA metal MTP verify: dispatch failed ({cb_error_text(r.cb)})\n")   // nolint:PERF028,PERF026 — error path, and the CPU fallback dwarfs the log
         decline(MetalDecodeDecline.gpu_error)
     }
+    prof_add("mtp.verify.land", ts_land)
     return ok
 }
 
-// argmax over row `row` of a [rows x n] flat logits image
-def private argmax_row(v : array<float>; row, n : int64) : int64 {
-    let off = row * n
-    var best = 0l
-    var bv = v[off]
-    for (i in range64(1l, n)) {
-        if (v[off + i] > bv) {
-            bv = v[off + i]
-            best = i
-        }
-    }
-    return best
-}
-
-// Partial-accept rollback for recurrent layers: replay rows 0..nrun-1 of every recurrent layer
-// from the LIVE (pre-verify) state and history into the shadow region - the same scan and
-// history kernels over the taped inputs, so the boundary state is the verify's own bit for bit.
+[arch(at="../ARCHITECTURE_GPU_MTP.md#mtp-dn-shadow-replay")]
 def private encode_dn_replay(t : Model; var r : StepRes; nrun : int64) {
     let c = t.config
     let cd = dn_conv_dim(c)
@@ -1557,22 +1543,7 @@ def private encode_dn_replay(t : Model; var r : StepRes; nrun : int64) {
     metal_release(cb)
 }
 
-// DASLLAMA_MTP_DEBUG=time: the round's wall split, accumulated and printed every 64 rounds
-var private g_mtpt_rounds = 0l
-var private g_mtpt_draft_us = 0l
-var private g_mtpt_verify_us = 0l
-var private g_mtpt_walk_us = 0l
-var private g_mtpt_replay_us = 0l
-var private g_mtpt_accepted = 0l
-var private g_mtpt_k = 0l
-
 [cold_path]
-def private mtp_time_report() {
-    let r = double(max(g_mtpt_rounds, 1l))
-    to_log(LOG_INFO, "mtp time k={g_mtpt_k} rounds={g_mtpt_rounds} per round: draft {double(g_mtpt_draft_us) / r:.0f} us | verify {double(g_mtpt_verify_us) / r:.0f} us | walk+commit {double(g_mtpt_walk_us) / r:.0f} us | replay {double(g_mtpt_replay_us) / r:.0f} us | tokens/round {1.0lf + double(g_mtpt_accepted) / r:.2f}\n")
-}
-
-[cold_path]   // the DASLLAMA_MTP_DEBUG=trace line: drafts, per-row truths, the accepted count
 def private mtp_trace_round(s : Session; pos, k, nr, a, vocab : int64) {
     let line : string = build_string() $(var w) {
         w |> write("mtp round pos={pos} k={k} drafts=[")
@@ -1591,10 +1562,11 @@ def private mtp_trace_round(s : Session; pos, k, nr, a, vocab : int64) {
 //! The speculative ROUND on the metal decode path: k chained drafts, ONE same-slab verify at k+1
 //! rows, the accept walk, the commit. Returns a (0..k); the accepted drafts are s.mtp_vbatch[1..a],
 //! `tok` is always committed; a refused round takes one plain GPU step and returns 0 undrafted.
-[hot_path]
+[hot_path, arch(at="../ARCHITECTURE_GPU_MTP.md#mtp-round-one-join")]
 def metal_mtp_spec_round(t : Model; var s : Session; tok : int64; k_req : int64) : int64 {   // nolint:STYLE037,STYLE038 — draft chain / verify / accept walk / commit is one sequential protocol on shared locals
     let c = t.config
     let pos = s.n_past
+    mtp_round_begin(s)
     let k = clamp(k_req, 1l, 8l)
     var cold = (g_dev == null || !t.metal_blob || c.n_layer_nextn <= 0l || pos < 1l ||
         s.mtp_h_pos1 != pos || pos + k + 1l > c.seq_len || !metal_mtp_verify_ok(t, s))
@@ -1616,13 +1588,9 @@ def metal_mtp_spec_round(t : Model; var s : Session; tok : int64; k_req : int64)
         let wm = key_exists(g_mirrors, s.uid) ? g_mirrors[s.uid].watermark : -1l
         to_log(LOG_INFO, "mtp cold: pos={pos} h_pos1={s.mtp_h_pos1} seq={c.seq_len} verify_ok={vok_g} dn_pos={dnp} watermark={wm}\n")   // nolint:PERF028,PERF026 — behind the DASLLAMA_MTP_DEBUG=cold bring-up gate
     }
-    // the draft chain into the verify batch: vbatch[0] = tok, vbatch[i] = d_i from (d_{i-1}, the
-    // head's own h) - d_1 from (tok, the trunk's stashed h)
     s.mtp_vbatch[0] = tok
-    let timed = g_env_mtp_debug == "time"
-    let ts_draft = timed ? ref_time_ticks() : 0l
+    let ts_draft = prof_ticks()
     if (!cold) {
-        // the warm's row-pos h input is the PRE-draft trunk hidden — the chain overwrites mtp_h
         s.mtp_xb_save |> resize(c.dim)
         unsafe {
             memcpy(addr < void? >(s.mtp_xb_save[0]), addr < void? >(s.mtp_h[0]), c.dim * 4l)
@@ -1635,8 +1603,10 @@ def metal_mtp_spec_round(t : Model; var s : Session; tok : int64; k_req : int64)
                 }
                 break
             }
+            let ts_amax = prof_ticks()
             var d = parallel_argmax(s.logits, c.vocab_size)
-            if (g_env_mtp_debug == "reject") {   // bring-up bisect: force the reject path
+            prof_add("mtp.draft.argmax", ts_amax)
+            if (g_env_mtp_debug == "reject") {
                 d = 0l
             }
             s.mtp_vbatch[i + 1l] = d
@@ -1649,9 +1619,12 @@ def metal_mtp_spec_round(t : Model; var s : Session; tok : int64; k_req : int64)
     }
     s.mtp_drafted += k
     let nr = k + 1l
-    let ts_verify = timed ? ref_time_ticks() : 0l
+    prof_add("mtp.draft", ts_draft)
+    let ts_verify = prof_ticks()
     mtp_verify_prep_n(t, s, s.mtp_vbatch, nr, pos)
     finish_pending_step()
+    prof_add("mtp.verify.prep", ts_verify)
+    let ts_poke = prof_ticks()
     let mr = g_mirrors[s.uid]
     var r = acquire_step(t, s, pos + 1l, mr.koff, mr.voff, mr.cap_rows, [nrows = nr])
     if (!r.gpu_logits) {   // verify has no CPU classifier fallback (blog/bxf live under gpu_logits)
@@ -1673,19 +1646,17 @@ def metal_mtp_spec_round(t : Model; var s : Session; tok : int64; k_req : int64)
         r.dn_conv_base = dm.conv_off
         r.dn_state_alt = dm.state_alt
         r.dn_conv_alt = dm.conv_alt
-        // split-write + replay tape: the live region keeps the pre-verify state, every store lands
-        // in the shadow; a partial accept replays rows 0..a there before the flip
         r.dn_split = true
         let cd = dn_conv_dim(c)
         let nvh = c.ssm_dt_rank
-        r.n_dn = 0l
+        r.n_dn_taped = 0l
         for (l in range64(c.n_layers)) {
             if (layer_is_recurrent(c, l)) {
-                r.n_dn++
+                r.n_dn_taped++
             }
         }
         r.tape_slot = uint64(2l * nr * cd * 4l + 2l * nr * nvh * 4l)
-        r.btape = pool_acquire(g_pool, g_dev, r.tape_slot * uint64(r.n_dn))
+        r.btape = pool_acquire(g_pool, g_dev, r.tape_slot * uint64(r.n_dn_taped))
         r.u_tcd = uniform_u32(uint(nr * cd))
         r.u_tnvh = uniform_u32(uint(nr * nvh))
     }
@@ -1694,12 +1665,14 @@ def metal_mtp_spec_round(t : Model; var s : Session; tok : int64; k_req : int64)
         memcpy(metal_buffer_contents(r.bx), addr < void? >(s.mtp_cat[0]), r.bytes_x)
         memcpy(metal_buffer_contents(r.bcos), addr < void? >(s.rope_cos[0]), r.bytes_tab)
         memcpy(metal_buffer_contents(r.bsin), addr < void? >(s.rope_sin[0]), r.bytes_tab)
-        // warm inputs: the nr embeds + the saved pre-draft h at row nr — bcat is untouched by the trunk pass
         var bc = reinterpret<uint8?>(metal_buffer_contents(r.bcat))
         memcpy(reinterpret<void?>(bc), addr < void? >(s.mtp_cat[0]), uint64(nr * rowb))
         memcpy(reinterpret<void?>(bc + nr * rowb), addr < void? >(s.mtp_xb_save[0]), uint64(rowb))
     }
+    prof_add("mtp.verify.poke", ts_poke)
+    let ts_enc = prof_ticks()
     encode_verify_step(t, r, pos)
+    prof_add("mtp.verify.enc", ts_enc)
     let vok = finish_verify_step(t, s, r, pos)
     if (!vok) {
         release_step(r)
@@ -1712,42 +1685,34 @@ def metal_mtp_spec_round(t : Model; var s : Session; tok : int64; k_req : int64)
         s.n_past = pos + 1l
         return 0l
     }
-    let ts_walk = timed ? ref_time_ticks() : 0l
-    // the accept walk: row i is the truth for draft i+1
+    prof_add("mtp.verify", ts_verify)
+    let ts_walk = prof_ticks()
     var a = 0l
-    while (a < k && argmax_row(s.mtp_logits_b, a, c.vocab_size) == s.mtp_vbatch[a + 1l]) {
-        a++
+    if (mtp_walk_samples(s)) {
+        a = mtp_walk_sampled(s, k, c.vocab_size)
+    } else {
+        while (a < k && argmax_row(s.mtp_logits_b, a, c.vocab_size) == s.mtp_vbatch[a + 1l]) {
+            a++
+        }
     }
-    if (g_env_mtp_debug == "trace") {   // bring-up bisect: one line per round
+    if (g_env_mtp_debug == "trace") {
         mtp_trace_round(s, pos, k, nr, a, c.vocab_size)
     }
-    // commit rows 0..a (row a = the truth decode of the last committed token); the rows above the watermark are garbage the next round rewrites
     unsafe {
         var hx = reinterpret<uint8?>(metal_buffer_contents(r.bxf))
         memcpy(addr < void? >(s.mtp_h[0]), reinterpret<void?>(hx + a * c.dim * 4l), c.dim * 4l)
         memcpy(addr < void? >(s.logits[0]), addr < void? >(s.mtp_logits_b[a * c.vocab_size]), c.vocab_size * 4l)
     }
-    let ts_replay = timed ? ref_time_ticks() : 0l
+    prof_add("mtp.walk", ts_walk)
+    let ts_replay = prof_ticks()
     if (r.dn) {
-        // the shadow holds the post-row-k state; a partial accept replays rows 0..a over it from the live pre-verify state, then the shadow becomes live
         if (a < k) {
             encode_dn_replay(t, r, a + 1l)
         }
         dn_mirror_flip(s.uid, pos + a + 1l)
     }
     release_step(r)
-    if (timed) {
-        g_mtpt_rounds++
-        g_mtpt_k = k
-        g_mtpt_accepted += a
-        g_mtpt_draft_us += int64(get_time_usec(ts_draft)) - int64(get_time_usec(ts_verify))
-        g_mtpt_verify_us += int64(get_time_usec(ts_verify)) - int64(get_time_usec(ts_walk))
-        g_mtpt_walk_us += int64(get_time_usec(ts_walk)) - int64(get_time_usec(ts_replay))
-        g_mtpt_replay_us += int64(get_time_usec(ts_replay))
-        if (g_mtpt_rounds % 64l == 0l) {
-            mtp_time_report()
-        }
-    }
+    prof_add("mtp.replay", ts_replay)
     s.mtp_h_pos1 = pos + a + 1l
     g_mirrors[s.uid].watermark = pos + a + 1l
     s.mtp_accepted += a
@@ -1893,9 +1858,8 @@ def private finish_step(t : Model; var s : Session; r : StepRes) : bool {
                 memcpy(addr < void? >(s.logits[0]), metal_buffer_contents(r.blog), r.bytes_log)
             }
             if (r.gpu_logits && (c.n_layer_nextn > 0l || g_mtp_carry_hidden)) {
-                // forward()'s mtp_h stash contract — bxf holds the post-final-norm hidden this row (the assistant drafter's carry too)
                 if (long_length(s.mtp_h) < c.dim) {
-                    s.mtp_h |> resize(c.dim)   // nolint:PERF026 — once per session on a head-less model
+                    s.mtp_h |> reserve_resize(c.dim)   // nolint:PERF026 — once per session on a head-less model
                 }
                 memcpy(addr < void? >(s.mtp_h[0]), metal_buffer_contents(g_mtp_carry_pre && c.n_layer_nextn <= 0l ? r.bx : r.bxf), r.bytes_x)
             }
@@ -1934,7 +1898,7 @@ def private release_step(var r : StepRes) {   // nolint:STYLE037,STYLE038 — fl
         r.cb = null
     }
     if (r.btape != null) {
-        pool_release(g_pool, r.btape, r.tape_slot * uint64(r.n_dn))
+        pool_release(g_pool, r.btape, r.tape_slot * uint64(r.n_dn_taped))
         pool_release(g_pool, r.u_tcd, 4ul)
         pool_release(g_pool, r.u_tnvh, 4ul)
         r.btape = null
@@ -2087,6 +2051,7 @@ def private discard_pre {
 // Pre-encode the PREDICTED next step (same session, pos + 1) while the current step runs on the
 // GPU. When speculation gates pass, the cb commits AND chains itself (argmax + embed gather, no
 // CPU poke); otherwise it stays uncommitted. Quietly declines when gates fail — slow path serves those.
+[arch(at="../ARCHITECTURE_GPU_MTP.md#greedy-chain")]
 def private pre_encode_next(t : Model; s : Session; npos : int64; var prev_blog : MetalBuffer?) {
     // no encode-ahead for recurrent (two cbs race the one dn state buffer); a declined/absent-mirror skip = slow path serves it
     if (t.config.recr_mask != 0ul ||
@@ -2100,7 +2065,7 @@ def private pre_encode_next(t : Model; s : Session; npos : int64; var prev_blog 
     let ts_enc = ref_time_ticks()
     var r = acquire_step(t, s, npos, mr.koff, mr.voff, mr.cap_rows)
     if (r.gpu_logits && prev_blog != null && spec_cls_capable(t) &&
-            !has_ple(t.config) && spec_armed()) {
+            !has_ple(t.config) && !s.sampled && spec_armed()) {
         // speculative chain: the cb runs the moment the previous one drains — CPU tail/sampling/next forward() all overlap GPU execution
         r.spec = true
         // a spec step is IN FLIGHT after forward() returns — must not touch session memory (staging only; acceptance lands it via finish_step)
@@ -2246,13 +2211,13 @@ var private g_bsk = true
 // DASLLAMA_METAL_BATCH_CONCURRENT: encode on a CONCURRENT compute encoder, barrier only at a real
 // hazard (RAW/WAR/WAW) — the only exploitable overlap in our FUSED chain is W1 || W3. Default ON:
 // measured +1-2% at every B (pipelines launch overhead even on the RAW chain). =0 = serial (A/B).
-let private MV_K_ALIGN = 256l          // the mv forms' K stripe (B2 256, B4 128): no tail guard
-var private g_mtp_carry_hidden = false   // land every step's final hidden in s.mtp_h on head-less models (the assistant drafter's input)
-var private g_mtp_carry_pre = false      // ... the PRE-final-norm residual instead of the post-norm hidden (the memo's open question)
+let private MV_K_ALIGN = 256l
+var private g_mtp_carry_hidden = false
+var private g_mtp_carry_pre = false
 
 //! The assistant drafter (dasllama_metal_mtp_gemma) attaches by asking the decode to carry the
 //! final hidden of every step in s.mtp_h - the same stash the NextN carriers get for free. `pre`
-//! picks the residual before output_norm (mlxfast's reading) over the normed hidden (llama.cpp's).
+//! picks the residual before output_norm over the normed hidden.
 def set_metal_mtp_carry_hidden(on : bool; pre : bool = false) {
     g_mtp_carry_hidden = on
     g_mtp_carry_pre = pre
@@ -2260,7 +2225,7 @@ def set_metal_mtp_carry_hidden(on : bool; pre : bool = false) {
 
 def metal_mtp_carry_pre() : bool => g_mtp_carry_pre
 
-var private g_b_same_toks : MetalBuffer?   // same-slab verify: the rows' tokens ON the GPU (uint per row) - the driver embeds them itself
+var private g_b_same_toks : MetalBuffer?
 
 //! The same-slab verify's rows come as a GPU token buffer (the draft chain's argmax outputs, never
 //! read back): the driver dequantizes their embeddings on the encoder instead of taking the
@@ -2375,7 +2340,7 @@ def private batch_decode_decline(t : Model; ws : BatchWorkspace; sessions : arra
 //! The BatchDecodeOverrideFn (P4): one eval_batch step's whole layer stack GPU-resident — B rows
 //! through ONE weight pass. STACK-ONLY: on true every row's KV is stored (mirror + CPU cache) and
 //! ws.scr.x_b holds the final residuals; false = declined, CPU loop recomputes from clean state.
-[hot_path]
+[hot_path, arch(at="../ARCHITECTURE_GPU_MTP.md#batch-same-slab"), arch(at="../ARCHITECTURE_GPU_MTP.md#metal-dispatch-requires")]
 def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions : array<Session?>; nrows : int64) : bool {   // nolint:STYLE037,STYLE038 — the batch step driver; encode/commit/stash share the whole step's state
     var why = batch_decode_decline(t, ws, sessions, nrows)
     if (why == MetalDecodeDecline.none && !metal_decode_init()) {
@@ -2474,8 +2439,6 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
         maxcnt = 0l
         for (i in range64(nrows)) {
             var sp = sessions[i]
-            // same-slab verify: one session, rows at pos..pos+nrows-1 - the mirror is prepared ONCE
-            // at the base (the rows above it are what this step writes); every row shares its slab
             if (!same || i == 0l) {
                 mir_same = mirror_prepare(t, *sp, ws.positions[i])
             }
@@ -2545,8 +2508,6 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     // the x-staged w13sw fusion stands down with it). Hetero rides it too: the QKV arm carries
     // the no-wv cat3 stream, and the wo site's x stride (the one per-class xs4) picks its twin
     let mv = g_bmv && !use_gemm && !use_mm
-    // a site whose K breaks the mv stripe alignment rides the tail-exact GEMV tiles instead
-    // (enc_gemv_rows: 5..8 rows = two 4-row tiles; gemma-4-26B-A4B's dense hidden 2112 = 8.25 stripes)
     let mv_kdim = mv && (dim % MV_K_ALIGN) == 0l
     let mv_wo = mv && (qd % MV_K_ALIGN) == 0l && (!hetero || (qd_sw % MV_K_ALIGN) == 0l)
     let mv_w2 = mv && (hidden % MV_K_ALIGN) == 0l
@@ -2720,7 +2681,6 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     var cb = metal_new_command_buffer_unretained(g_queue)
     var enc = conc ? metal_new_compute_encoder_concurrent(cb) : metal_new_compute_encoder(cb)
     if (gpu_toks) {
-        // the rows' residual inputs from the GPU token list: row i = embed(tok[i]) * embed_scale
         let bemb = blob_of(g_dev, t, t.emb_q8_off)
         var u_esc = c.embed_scale != 1.0 ? uniform_f32(c.embed_scale) : g_one
         for (i in range64(nrows)) {
@@ -2867,8 +2827,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                 // hetero: the swa pair's rows are hs_sw/2 wide — the class's own width)
                 var bcos_l = lsl && dual_rope ? bcos_swa : bcos
                 var bsin_l = lsl && dual_rope ? bsin_swa : bsin
-                // one kargs per shape, from this layer's own geometry; a partial-rope carrier (qwen35:
-                // rope 64 of head 256) rotates rot/2 pairs off rot/2-wide table rows, the rest identity
+                //! a partial-rope carrier (qwen35: rope 64 of head 256) rotates rot/2 pairs off rot/2-wide table rows, the rest identity
                 let neox_l = c.rope_neox ? 1u : 0u
                 let hasb_l = c.attn_qkv_bias ? 1u : 0u
                 let rot_l = uint(c.rope_dim > 0l ? c.rope_dim : hs_l)
@@ -3005,7 +2964,8 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
                     var bw_ds = upload_region(addr < void? >(t.fblob[t.moe_down_scale_off + l * c.n_expert]), uint64(c.n_expert * 4l))
                     enc_moe_wscale(enc, bmsel, bmsel, bw_ds, u_moe_k, nrows)
                 }
-                if (t.experts_mx4) {
+                if (g_skip == "moe_rt") {   // moe_rt knockout: the routed expert GEMVs only (router/select stay live)
+                } elif (t.experts_mx4) {
                     var bwb1 = upload_region(addr < void? >(t.fblob[t.web1_off + l * c.n_expert * c.n_ff_exp]), uint64(c.n_expert * c.n_ff_exp * 4l))
                     var bwb3 = upload_region(addr < void? >(t.fblob[t.web3_off + l * c.n_expert * c.n_ff_exp]), uint64(c.n_expert * c.n_ff_exp * 4l))
                     // gmode == 1 doubles as the has-bias flag (see enc_moe_select above)
@@ -3033,7 +2993,8 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
             }
             if (moe && g_skip != "gemv") {
                 let fe2 = fmt_at(t.we2_fmt, l)
-                if (t.experts_mx4) {
+                if (g_skip == "moe_rt") {   // the down projection is a routed expert GEMV too
+                } elif (t.experts_mx4) {
                     var bwb2 = upload_region(addr < void? >(t.fblob[t.web2_off + l * c.n_expert * dim]), uint64(c.n_expert * dim * 4l))
                     var b2m = MoeGemvArgs(ndim = k_moe_nfe, ddim = k_dim, eplane = k_moe_eblk,
                         xs = k_moe_xs_dn, ss = k_moe_ss, bxs = k_moe_knfe, bys = k_moe_kdim, hasb = k_moe_gmode)
@@ -3202,13 +3163,12 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
         // (the KV writeback stays). All-or-nothing per step: one unwrappable session keeps the whole
         // step on the landing scatter. Pipe mode writes s.logits ASYNCHRONOUSLY — fixed-token-only.
         if (same) {
-            // the accept walk's truths on the GPU: one winner per row, landed with the logits
             var bvarg = pool_acquire(g_pool, g_dev, 64ul)
             enc_argmax_rows(enc, blog, bvarg, u_vocab, nrows)
             g_lp_bvarg = bvarg
             g_lp_pooled |> push((buf = bvarg, size = 64ul))
         }
-        nc_all = !same   // the same-slab verify keeps the staging image: every row lands on one session
+        nc_all = !same
         for (i in range64(nrows)) {
             nc_all &&= nc_logits_for(g_dev, *sessions[i]) != null
         }
@@ -3326,7 +3286,7 @@ def metal_batch_decode_forward(t : Model; var ws : BatchWorkspace; var sessions 
     g_lp_upooled |> push((buf = u_total_h, size = 4ul))
     g_lp_blog = gpu_logits && !nc_all ? blog : null   // nc steps: the GPU scatter already fed s.logits
     g_lp_sameslab = same
-    g_lp_bxf = same && gpu_logits ? (g_mtp_carry_pre ? bx : bxf) : null   // the verify rows' carry: post-norm, or the pre-norm residual
+    g_lp_bxf = same && gpu_logits ? (g_mtp_carry_pre ? bx : bxf) : null
     g_lp_bxf_bytes = same ? nrows * dim * 4l : 0l
     g_lp_xb = null
     if (!gpu_logits) {
@@ -3432,7 +3392,7 @@ def dasllama_metal_decode_register() {
     g_env_attn_d = g_env_metal.attn_d
     g_env_mtp_debug = g_env_metal.mtp_debug
     if (!empty(g_env_metal.decode_skip)) {
-        g_skip = g_env_metal.decode_skip
+        set_metal_decode_skip(g_env_metal.decode_skip)   // routes through the unknown-token guard
         to_log(LOG_WARNING, "dasLLAMA metal decode: SKIP={g_skip} - timing-attribution mode, output is GARBAGE\n")
     }
     if (is_some(g_env_metal.spec)) {   // the spec chain's A/B rail: 0 off, 1 forced, -1 adaptive

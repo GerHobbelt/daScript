@@ -886,7 +886,7 @@ namespace das
 
     void TextFileInfo::getSourceAndLength ( const char * & src, uint32_t & len ) {
         src = source;
-        len = sourceLength;
+        len = source ? sourceLength : 0;    // a cached record carries sourceLength with no bytes; callers dereference src whenever len > 0
     }
 
     void TextFileInfo::freeSourceData() {

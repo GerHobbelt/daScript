@@ -10,9 +10,6 @@ Read this before adding, moving, or shipping any skill, and before any skills cl
   no CI, no lint rule IDs.
 - `skills/internal/` - never ships: repo workflow, CI, review machinery, compiler
   internals.
-- `LAWS.md`, in any folder - never ships: Boris's ruling provenance for that folder's rule
-  documents, not a skill. Anywhere under `skills/` the install rules drop it by name and
-  the gate knows the name.
 
 There is no shipping list. The gate (`ci/check_shipped_skills.py`) enforces the split:
 no shipped file links into `internal/`, no unmarked repo-only path in a shipped file
@@ -31,7 +28,8 @@ routing, not a second telling.
 
 0. **Shorten and simplify, a lot.** Every move is a rewrite downward; never add a claim
    that carries no probe.
-1. `probe-verified <date>` tags travel with their claims.
+1. A moved claim stays probe-verified: re-probe it if the move touches its wording. No
+   inline `(probe-verified <date>)` tag is written; the date is history.
 2. Every link to a moved file is retargeted in the same change.
 3. A stray repo-only line in a shipped file takes the `repo-only` marker; a file whose
    repo-only content is more than stray lines splits (`writing_tests.md` /

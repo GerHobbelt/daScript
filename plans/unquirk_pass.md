@@ -80,8 +80,8 @@ macOS-only compile error (two require paths for MetalTensorRaceResult), fixed in
 
 One per-format record on `Model` - quant plane, scale plane, mr, qsb/ssb strides, stream
 code, schema id, device-form flag - indexed by `KqFmt`; every `fmt ==` ladder becomes a
-lookup. Staged so each commit is green; the fast dev loop (`-module-cache` +
-`--jit-split-modules=-1`) keeps the cycle ~1 min; after EVERY stage that touches layout or
+lookup. Staged so each commit is green; the fast dev loop (the default module cache + split
+JIT of a plain `-jit` run) keeps the cycle ~1 min; after EVERY stage that touches layout or
 pack, delete `*.dlim` and e2e the MIXED vehicle (the iq2xs requant carrying q2_K - QUIRK
 26's lesson), not a pure one.
 
@@ -137,9 +137,6 @@ pack, delete `*.dlim` and e2e the MIXED vehicle (the iq2xs requant carrying q2_K
 3. **`followup_metal.md`** - twin of followup_vulkan.md: the Metal tg items (0.78-0.93x),
    the Q22 dispatch-loop probe method, D2 if dropped.
 4. The per-format phase diaries -> `/history` (doc_archiving skill), linked from the ledger.
-
-LAWS.md (modules/dasLLAMA) gets the rulings from this session: prune the families, saved
-zen2/M1 defaults, race only on feature unlock, CPU/GPU tune split, the doc split.
 
 ## Phase F - TWO PRs (the mid-plan cut that starts the M5 session)
 

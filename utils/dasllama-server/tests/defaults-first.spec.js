@@ -1,4 +1,4 @@
-// §09 defaults-first config editor: every flat knob is an override gated by its own
+// §10 defaults-first config editor: every flat knob is an override gated by its own
 // checkbox — unchecked keys are OMITTED from POST /config so engine defaults stay live
 // (ctx = model window, backend = auto-detected), and the advanced fold hides the long tail.
 
@@ -57,10 +57,11 @@ test('an empty-string select value falls back to the first option, never a blank
 });
 
 test('ctx reads as the model window; the defaults note names the detected backend', async ({ page }) => {
+    const detected = fx('config').surface.gpu_detected;   // whatever tier the capture box detected
     await openControl(page);
     await expect(page.locator('#f-ctx')).toHaveAttribute('placeholder', "model's full window");
     await expect(page.locator('#f-ctx')).toHaveValue('');
-    await expect(page.locator('#cfg-defaults-note')).toContainText('auto (vulkan detected)');
+    await expect(page.locator('#cfg-defaults-note')).toContainText(`auto (${detected} detected)`);
 });
 
 test('a lean config keeps the advanced fold closed; the toggle opens it', async ({ page }) => {

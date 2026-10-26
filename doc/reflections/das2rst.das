@@ -353,7 +353,7 @@ def document_module_dasllama(_root : string) {
             "Per-session KV-cache codec picked at ``create_session``/``create_chat``: ``f16`` — the default, half the KV bytes and faster deep-context decode (stores clamp to ±65504); ``f32`` — the bit-exact reference; ``q8_0`` — block-quantized (llama.cpp ``-ctk``/``-ctv q8_0``), half the f16 bytes again and near-lossless in practice; needs head_size and kv_dim to be multiples of 32 (checked at create); ``tq4`` — the FWHT-rotated ternary codec, smaller still.")
         dasllama_type_stanza(f, "enum-dasllama_common-QuantMode", "QuantMode",
             "Weight representation picked at load: ``fp32`` — the token-exact reference; ``q8`` — int8 quantization, the fast CPU path (K-quant/mxfp4/Q4_0 files keep their native planes on the same rails); ``q4_0`` — the legacy requant tier, 4-bit blocks, smallest footprint.")
-        dasllama_type_stanza(f, "struct-dasllama_sampling-SamplingParams", "SamplingParams",
+        dasllama_type_stanza(f, "struct-dasllama_common-SamplingParams", "SamplingParams",
             "Sampling knobs: ``temp`` (<= 0 selects greedy argmax), ``top_k`` (0 = no cutoff), and repetition ``penalty`` (1.0 = none) applied over the last ``penalty_last_n`` generated tokens. The defaults are greedy — ``SamplingParams()`` reproduces argmax exactly.")
         dasllama_type_stanza(f, "struct-dasllama_sampling-Stats", "Stats",
             "Timing of the last ``generate``/``respond`` call: ``n_prompt``/``n_gen`` token counts, ``ttft_s`` (seconds to first token), and ``prefill_tps``/``gen_tps`` throughput in tokens per second.")
@@ -393,13 +393,30 @@ def document_module_dasllama(_root : string) {
     document("dasLLAMA LLM inference: models, sessions, generation, chat", mod, "dasllama.rst", groups, hook)
 }
 
+// The TTS facade and its type floor share one page; the family, assembly and front-end
+// modules a TtsModel field names are engine detail, so their types print plain.
+def document_module_dasllama_tts(_root : string) {
+    for (engine in ["dasllama_styletts2", "dasllama_kitten", "dasllama_kokoro", "dasllama_g2p", "dasllama_postag"]) {
+        mark_module_pageless(engine)
+    }
+    var mod = [find_module("dasllama_tts"), find_module("dasllama_tts_types")]
+    var groups <- array<DocGroup>(
+        group_by_regex("Loading and capabilities", mod, %regex~(load_tts_model|caps|tts_voice_lang|finalize)$%%),
+        group_by_regex("Text front end", mod, %regex~(tts_normalize|tts_phonemize|tts_chunks)$%%),
+        group_by_regex("Synthesis", mod, %regex~(synthesize|synthesize_stream)$%%),
+        group_by_regex("The served lane", mod, %regex~(set_tts_q8|reset_tts_q8|tts_serves_q8)$%%),
+        group_by_regex("Timings", mod, %regex~(rtf|timings_line)$%%)
+    )
+    documents("dasLLAMA text to speech: models, voices, synthesis", mod, "dasllama_tts.rst", groups)
+}
+
 def document_module_debugapi(_root : string) {
     var mod = get_module("debugapi")
     var groups <- array<DocGroup>(
         group_by_regex("Agent lifecycle", mod, %regex~(fork_debug_agent_context|install_debug_agent|install_debug_agent_thread_local|install_new_debug_agent|install_new_thread_local_debug_agent|has_debug_agent_context|get_debug_agent_context|delete_debug_agent_context|is_in_debug_agent_creation|lock_debug_agent)$%%),
         group_by_regex("Cross-context invocation", mod, %regex~(invoke_in_context|invoke_debug_agent_method|invoke_debug_agent_function)$%%),
         group_by_regex("Agent construction", mod, %regex~(make_debug_agent|make_data_walker|make_stack_walker)$%%),
-        group_by_regex("Agent tick and state collection", mod, %regex~(tick_debug_agent|collect_debug_agent_state|on_breakpoints_reset|report_context_state|debug_agent_command|debugger_stop_requested)$%%),
+        group_by_regex("Agent tick and state collection", mod, %regex~(tick_debug_agent|collect_debug_agent_state|on_breakpoints_reset|report_context_state|debug_agent_command|debugger_stop_requested|debugger_thread_context_ready)$%%),
         group_by_regex("Instrumentation", mod, %regex~(instrument_node|instrument_function|instrument_all_functions|instrument_all_functions_thread_local|instrument_context_allocations|clear_instruments|set_single_step)$%%),
         group_by_regex("Data and stack walking", mod, %regex~(walk_data|walk_stack|stackwalk|get_stackwalk|stack_depth)$%%),
         group_by_regex("Context inspection", mod, %regex~(get_context_global_variable|has_function|get_heap_stats)$%%),
@@ -639,7 +656,7 @@ def document_module_jobque(_root : string) {
         group_by_regex("Channel, JobStatus, Lockbox, SeqBox, Stream", mod, %regex~(append|notify|join|channel_create|channel_remove|stream_create|stream_remove|add_ref|release|notify_and_release|lock_box_create|lock_box_remove|job_status_create|job_status_remove|seq_box_create|seq_box_release)$%%),
         group_by_regex("Queries", mod, %regex~(get_total_hw_jobs|get_total_hw_threads|get_total_hw_cores|get_total_perf_cores|is_slow_tier_compute|is_job_que_shutting_down|is_job_que_available|count_jobque_leaks)$%%),
         group_by_regex("Event tracing", mod, %regex~(jobque_trace_start|jobque_trace_stop|jobque_trace_save|jobque_trace_tag|jobque_trace_category|jobque_trace_marker_name|jobque_trace_marker)$%%),
-        group_by_regex("Internal invocations", mod, %regex~(new_job_invoke|new_thread_invoke|new_debugger_thread|set_jobque_fork_pool|set_jobque_fork_skip_heap_reset|set_jobque_worker_spin|set_jobque_batch_dispatch|set_jobque_join_spin|set_jobque_team_mode|get_jobque_team_mode|set_jobque_thread_team_mode|get_jobque_thread_team_mode|set_current_thread_priority|get_current_processor|set_current_thread_affinity|set_jobque_threads_cap|set_jobque_threads|get_jobque_threads|set_jobque_affinity|get_jobque_affinity|set_jobque_worker_limit|get_jobque_worker_limit|set_jobque_team_rank_gate|get_jobque_team_rank_gate|set_jobque_team_prof|reset_jobque_team_prof|get_jobque_team_prof|get_jobque_team_prof_counts|get_jobque_team_prof_react|team_parallel_for_invoke|team_parallel_for_indexed_invoke|team_parallel_stages_invoke|flush_jobque_batch|jobque_try_run_one|_builtin_seq_box_publish|_builtin_seq_box_read)$%%),
+        group_by_regex("Internal invocations", mod, %regex~(new_job_invoke|new_thread_invoke|new_debugger_thread|set_jobque_fork_pool|get_jobque_fork_pool|set_jobque_fork_skip_heap_reset|set_jobque_worker_spin|set_jobque_batch_dispatch|set_jobque_join_spin|set_jobque_team_mode|get_jobque_team_mode|set_jobque_thread_team_mode|get_jobque_thread_team_mode|set_current_thread_priority|get_current_processor|set_current_thread_affinity|set_jobque_threads_cap|set_jobque_threads|get_jobque_threads|set_jobque_affinity|get_jobque_affinity|set_jobque_worker_limit|get_jobque_worker_limit|set_jobque_team_rank_gate|get_jobque_team_rank_gate|set_jobque_team_prof|reset_jobque_team_prof|get_jobque_team_prof|get_jobque_team_prof_counts|get_jobque_team_prof_react|team_parallel_for_invoke|team_parallel_for_indexed_invoke|team_parallel_stages_invoke|flush_jobque_batch|jobque_try_run_one|_builtin_seq_box_publish|_builtin_seq_box_read)$%%),
         group_by_regex("Construction", mod, %regex~(with_channel|with_stream|with_job_status|with_job_que|with_lock_box|with_seq_box|create_job_que|destroy_job_que)$%%),
         group_by_regex("SeqBox operations", mod, %regex~(clear)$%%),
         group_by_regex("Atomic", mod, %regex~(atomic32_create|atomic32_remove|with_atomic32|atomic64_create|atomic64_remove|with_atomic64|get|set|inc|dec)$%%)
@@ -1910,6 +1927,7 @@ def main {  // nolint:STYLE038 — flat one-call-per-documented-module dispatch 
     document_module_spirv(root)
     // document the dasLLAMA facade module (the engine modules behind it stay undocumented by design)
     document_module_dasllama(root)
+    document_module_dasllama_tts(root)
     document_module_debugapi(root)
     document_module_rtti(root)
     document_module_ast(root)

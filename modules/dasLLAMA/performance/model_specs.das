@@ -73,6 +73,7 @@ struct ModelSpec {
     serve_vram_gb : float = 0.0     // advertised working-set hint, not a fit check
     serve_default : bool = false    // the one the getting-started path recommends
     serve_vision : string           // vision-tower companion NAME ("" = text only); [[serve_vision_tower]] resolves it
+    serve_tts : bool = false        // a speech model of the served text-to-speech set ([[serve_tts_set]]); its packs ride the companions
 }
 
 // ===== Parity fixture ids (frozen from the simple_ids oracle — harness/parity.sh) =====
@@ -279,6 +280,11 @@ let REF_Q8_RECIPE = "derive: setup_asr_rig.das --refs quantizes it from the fp b
 let PARAKEET_V2_NOTE = "historic nemo-venv conversion (rail retired); present only on boxes that converted it - v3 is the fetched carrier"
 let CANARY_ENC_RECIPE = "convert: modules/dasLLAMA/harness/convert_canary_to_ggml.py over nvidia/canary-qwen-2.5b (nemo venv; encoder is a repack - sha canonical everywhere)"
 let CANARY_DEC_RECIPE = "convert: modules/dasLLAMA/harness/convert_canary_to_ggml.py over nvidia/canary-qwen-2.5b (nemo venv), then llama-quantize Q8_0 (a Q8_0 disk embedding lets the tied classifier serve cls_q8 on the Metal rail); bytes are per-arch (fp16 LoRA merge) - gate via asr_bench --text over jfk/jfk3/gb1 vs benchmarks/asr/canary_transcripts.expected"
+let TTS_HF = "{HF}/borisbat/dasllama-tts/resolve/c5247896344155d36ce1d01f74ebfd9fef9dd862"   // the published set, commit-pinned
+let TTS_KITTEN_RECIPE = "convert: modules/dasLLAMA/performance/build_tts_data.das -- --root <g2p experiment root> --out <models dir> runs harness/convert_kitten.py over KittenML/kitten-tts-nano-0.8 @ 7a1db645b1f3ab9420761d87428e042b9cec3f26 and kitten-tts-mini-0.8 @ c02725660cea441db4c383af69f1f26f5cd00947 (the ONNX weights into GGUF, f32); THIRD_PARTY_NOTICES.md (repo root) carries the terms"
+let TTS_KOKORO_RECIPE = "convert: modules/dasLLAMA/performance/build_tts_data.das -- --root <g2p experiment root> --out <models dir> runs harness/convert_kokoro.py over hexgrad/Kokoro-82M @ f3ff3571791e39611d31c381e3a41a3af07b4987 (kokoro-v1_0.pth + the voice packs into GGUF, f32); THIRD_PARTY_NOTICES.md (repo root) carries the terms"
+let TTS_PACKS_RECIPE = "mint: modules/dasLLAMA/performance/build_tts_data.das -- --root <g2p experiment root> --out <models dir> runs harness/build_g2p_data.py (misaki 0.9.4 gold/silver + CMUdict 0.7a + the g2p_en 2.1.0 GRU + harness/g2p_local_additions.json into tts_g2p.bin) and harness/train_postag.py (UD English-EWT + spaCy-labelled silver prose into tts_postag.bin)"
+let TTS_ORACLE_RECIPE = "mint: modules/dasLLAMA/performance/build_tts_data.das -- --root <g2p experiment root> --out <models dir> runs the PyTorch / ONNX reference per model over the bring-up sentences and dumps every stage the parity rail (tests/_tts_parity.das) compares"
 
 // The text-model set, ascending size. Absent files skip at run time, so one table serves every
 // box; each view measures/verifies the subset it actually has. Audio models live in
@@ -487,6 +493,11 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
         ModelSpec(file = "gemma-4-26B-A4B-it-Q4_K_M.gguf", display = "gemma-4-26B-A4B-q4k", quant_label = "q4_k_m", official = true,
             url = "{HF}/unsloth/gemma-4-26B-A4B-it-GGUF/resolve/main/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
             bytes = 16947541728l, sha256 = "f2c28b3dc4776931ac6f879e11f203dec637ea0f14267a86ec8f6165f63f293f",
+            // the assistant drafter rides as a companion: the mtp suite and the ruler attach it beside this target
+            companions <- [
+                ProvEntry(name = "mtp-gemma-4-26B-A4B-it-Q8_0.gguf", root = "llm",
+                    url = "{HF}/ggml-org/gemma-4-26B-A4B-it-GGUF/resolve/main/mtp-gemma-4-26B-A4B-it-Q8_0.gguf",
+                    bytes = 461766784l, sha256 = "ea4f772ffb70e02127c5f142f9ed9af97add7ca0f2bcc7b277244a9771b436bd")],
             // the q51 tier gate: this recipe's ffn_down_exps are Q5_1 on 29 layers, riding the
             // native q51 planes; the Q4_K gate_up stacks ride the kq planes
             parity <- ev_gemma4_26b_q4km()),
@@ -508,6 +519,11 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
         ModelSpec(file = "Qwen3.8-27B-Q4_K_M.gguf", display = "Qwen3.8-27B", quant_label = "q4_k_m", official = true,
             url = "{HF}/ggml-org/Qwen3.8-27B-GGUF/resolve/main/Qwen3.8-27B-Q4_K_M.gguf",
             bytes = 18973870432l, sha256 = "31629f53165ab6a7dad8c9847dcfd1fdf55829dac1e6e748f4a68581b0033d34",
+            // the split NextN head rides as a companion: the mtp suite's 3.8-27b fixture and the ruler load it as the trunk's last shard
+            companions <- [
+                ProvEntry(name = "mtp-Qwen3.8-27B-Q8_0.gguf", root = "llm",
+                    url = "{HF}/ggml-org/Qwen3.8-27B-GGUF/resolve/main/mtp-Qwen3.8-27B-Q8_0.gguf",
+                    bytes = 3164006688l, sha256 = "cbf60a0c48b431bb61f1d49b8948dc88ac29c398d6dbdbbb2e6e89ef77eacc9a")],
             // the qwen35 hybrid dense at scale, native K-quant planes
             parity <- ev_qwen_count([dn_chunked = true])),
         // the same UD-Q4_K_M weights under two local names: the MTP-stem file carries the MTP
@@ -530,8 +546,52 @@ def model_specs() : array<ModelSpec> {   // nolint:STYLE038 — flat model-set t
         ModelSpec(file = "Qwen3-Coder-Next-Q4_K_M.gguf", display = "Qwen3-Coder-Next-q4k", quant_label = "q4_k_m",
             // arch qwen3next: the FILE layout differs from qwen35 (fused Q4_K ssm_ba, HF
             // grouped v-head order) — this fixture proves the loader's grouped->tiled permutes
-            parity <- ev_qwen_count([dn_chunked = true]))
+            parity <- ev_qwen_count([dn_chunked = true])),
+        // the text-to-speech carriers: local conversions with no board row (followup_general.md
+        // row 77); the front-end packs every TTS model loads ride the kitten-nano row, the
+        // per-model oracle dumps ride their own rows
+        ModelSpec(file = "kitten-nano.gguf", recipe = TTS_KITTEN_RECIPE, serve_tts = true,
+            url = "{TTS_HF}/kitten-nano.gguf", bytes = 59331456l,
+            sha256 = "4556948c36a29e4be5ad521e597a20ae817059c404fea3c5d935afa73506d9da",
+            companions <- [
+                ProvEntry(name = "tts_g2p.bin", root = "llm", recipe = TTS_PACKS_RECIPE,
+                    url = "{TTS_HF}/tts_g2p.bin", bytes = 14011554l,
+                    sha256 = "d7b6afea7a0901a877d10531054d3f967845c58f415f0ea937decd8a3081ccd5"),
+                ProvEntry(name = "tts_postag.bin", root = "llm", recipe = TTS_PACKS_RECIPE,
+                    url = "{TTS_HF}/tts_postag.bin", bytes = 12566510l,
+                    sha256 = "38c2e85f7fef3e57d561d2aa0af25fccda4276376ba1993c3dbc2ae0ebfa57b4"),
+                ProvEntry(name = "tts_oracle/kitten_nano", root = "llm", recipe = TTS_ORACLE_RECIPE)]),
+        ModelSpec(file = "kitten-mini.gguf", recipe = TTS_KITTEN_RECIPE, serve_tts = true,
+            url = "{TTS_HF}/kitten-mini.gguf", bytes = 295975008l,
+            sha256 = "e127a95c6ffa390eccc5956e7156ff055e9f30078cf16361cbcd0eea6c21fdb5",
+            companions <- [
+                ProvEntry(name = "tts_oracle/kitten_mini", root = "llm", recipe = TTS_ORACLE_RECIPE)]),
+        ModelSpec(file = "kokoro-82m.gguf", recipe = TTS_KOKORO_RECIPE, serve_tts = true,
+            url = "{TTS_HF}/kokoro-82m.gguf", bytes = 352965024l,
+            sha256 = "e0d6584b5b650730bd62e7b105a2e9502384bbe3fbebf3030113560355e6232f",
+            companions <- [
+                ProvEntry(name = "tts_oracle/kokoro", root = "llm", recipe = TTS_ORACLE_RECIPE)])
     ]
+}
+
+//! The text-to-speech set the serving catalog offers: the three converted GGUFs and the two
+//! front-end packs every one of them loads, as pinned on the borisbat/dasllama-tts repository -
+//! a view over the rows above (the packs ride the kitten-nano row's companions). Every entry
+//! carries url + bytes + sha256; `pack` tells the two apart from the models.
+def serve_tts_set() : array<tuple<entry : ProvEntry; pack : bool>> {
+    var out : array<tuple<entry : ProvEntry; pack : bool>>
+    var all <- model_specs()
+    for (s in all) {
+        continue if (empty(s.url) || !s.serve_tts)
+        out |> push((entry = ProvEntry(name = s.file, root = "llm", url = s.url, bytes = s.bytes, sha256 = s.sha256, recipe = s.recipe), pack = false))
+        for (c in s.companions) {
+            if (!empty(c.url)) {
+                out |> push((entry = c, pack = true))
+            }
+        }
+    }
+    delete all
+    return <- out
 }
 
 //! The serving ASR tower: the hosted parakeet v3 bin, byte-identical to the canonical

@@ -10,11 +10,13 @@ options _dasllama_internal = true
 //! Phi-3, Gemma-2/3/4, gpt-oss) — ``load_model`` dispatches on GGUF metadata, so the same
 //! program runs any of them; ``arch_names()`` lists the live registry.
 //!
-//! Run model programs with ``-jit`` (interpreted inference is far too slow), wrap the
-//! generation in ``with_job_que()`` from ``daslib/jobque_boost`` so the kernels can thread, and
-//! declare ``options stack = 524288`` — the forward chain outgrows the 16K default, and
-//! a required module cannot raise the program's stack for you. See ``examples/dasLLAMA/run.das``
-//! and ``chat.das`` for the canonical shape.
+//! Run model programs with ``-jit``: interpreted inference is far too slow. Wrap the model work
+//! in ``with_job_que()`` from ``daslib/jobque_boost`` so the kernels can thread. Call
+//! ``setup_dasllama_jobque()`` inside it, before the first ``load_model``, ``generate`` or ``eval``:
+//! the engine panics on a queue nobody configured, because a bare queue runs ~200x slower.
+//! Declare ``options stack = 524288``: the forward chain outgrows the 16K default, and a required
+//! module cannot raise the program's stack for you. See ``examples/dasLLAMA/run.das`` and
+//! ``chat.das`` for the canonical shape.
 
 module dasllama shared public
 
@@ -30,6 +32,7 @@ require dasllama/dasllama_vision_embedder public   // the vision embedder of wha
 require dasllama/dasllama_audio_embedder public    // the audio encoder of whatever family (gemma4a) — audio soft tokens
 require dasllama/dasllama_asr public           // uniform ASR surface (whisper today; parakeet/qwen3-asr land behind the same sniff)
 require dasllama/dasllama_vad public           // Silero-VAD (voice-activity detection): segments + streaming iterator
+require dasllama/dasllama_tts public           // uniform TTS surface (KittenTTS, Kokoro): load_tts_model / synthesize / synthesize_stream
 require dasllama/dasllama_config public        // the explicit .dlim bake configuration — the --config / identity contract
 require dasllama/dasllama_audio_io public      // audio decode (wav/mp3/flac/ogg) to 16 kHz mono f32 PCM
 require dasllama/dasllama_vision_io public     // image decode to RGB8 VisionImage — the only stbimage seam

@@ -1,4 +1,4 @@
-// §08 config editor: fields + per-key source chips from /config, the
+// §10 config editor: fields + per-key source chips from /config, the
 // [[models]] roster, pre-save sanity, and the exchange-policy save guard
 // (POST /config replaces the whole file — the policy must ride every save).
 
@@ -52,6 +52,18 @@ test('save POSTs the config with the exchange policy merged in', async ({ page }
     expect(body.exchange_url).toBe(ex.policy.url);
     expect(Array.isArray(body.models)).toBe(true);
     expect(body.models[0].path).toBeTruthy();
+});
+
+test('the tts model path is an override the save carries', async ({ page }) => {
+    const { posts } = await openControl(page);
+
+    await expect(page.locator('#f-tts')).toHaveValue(fx('config').surface.config.tts);
+    await page.locator('#en-tts').check();
+    await page.locator('#f-tts').fill('D:/models/kitten-nano.gguf');
+    await page.locator('#b-save').click();
+    await expect(page.locator('#cfg-note')).toHaveText('saved — restart to apply');
+
+    expect(lastJson(posts.filter(p => p.path === '/config')).tts).toBe('D:/models/kitten-nano.gguf');
 });
 
 test('save is blocked while the exchange policy has not loaded', async ({ page }) => {

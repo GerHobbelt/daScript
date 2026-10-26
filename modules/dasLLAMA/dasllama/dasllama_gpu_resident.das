@@ -239,7 +239,7 @@ def trim_model_planes(var t : Model) : bool {   // nolint:STYLE037,STYLE038 — 
     }
     let dim = t.config.dim
     let vocab = t.config.vocab_size
-    if (t.cls_q8) {
+    if (t.emb_q8) {
         // mblob-style 34B interleaved blocks over the emb region (dequant_embq_row's layout)
         let nb = vocab * dim / 32l
         t.embq |> reserve_resize(nb * 34l)   // vocab-scaled: ~600 MB at a 248k-vocab 27B, one grow
@@ -629,7 +629,7 @@ def resident_upload(t : Model; seq_cap : int64; rkdt : KVDtype) : bool {   // no
     let emb_q8_want = (g_env_vulkan.vk_gpu_embed && rdec_prefill_ids_installed()
         && c.shared_weights && t.cls_q8 && cls_fmt == KqFmt.q8)
     let emb_f32_want = (g_env_vulkan.vk_gpu_embed && rdec_prefill_ids_installed()
-        && !t.cls_q8 && !cls_kq(t) && !t.planes_trimmed
+        && !t.emb_q8 && !cls_kq(t) && !t.planes_trimmed   // an untied q8 table has no f32 copy to upload: the CPU embed loop serves it
         && resident_plan(t, seq_cap, rkdt, rkdt).emb_f32_bytes > 0l)   // the plan counted it at this context
     var planes : array<tuple<n : int64; rows : int64; f : KqFmt>>
     planes |> reserve(c.n_layers * 7l + 1l)
@@ -1062,11 +1062,26 @@ def moe_gpu_drop_model_() {
     set_moe_gpu_model_support("")
 }
 
+//! The upload rail's first step: a model still installed on the tier (its marks armed, or the
+//! resident driver active) is dropped before this load uploads, with the load's own MoE layer
+//! request - the one mark the drop's reset would zero - carried across.
+[arch(at="../ARCHITECTURE_GPU_VULKAN.md#gpu-slot-marks")]
+def moe_gpu_drop_installed_before_load(n_layers : int64) {
+    if (!moe_gpu_tier_installed() || !(g_rdec_active || moe_gpu_installed_marks_armed())) {
+        return
+    }
+    to_log(LOG_INFO, "dasLLAMA: the GPU tier still holds a model - dropping its device state before loading this one ({n_layers} layers)\n")
+    let want_layers = moe_gpu_layer_count()
+    moe_gpu_drop_model_()
+    set_moe_gpu_layer_count(want_layers)
+}
+
 // Upload the offloaded layers' expert stacks to the GPU tier from the PREPARED planes. Called at
 // the end of every load rail so DASLLAMA_GPU_MOE_LAYERS behaves identically however the model
 // arrived. Layers go resident from the end while the tier's VRAM budget holds.
-[arch(at="../ARCHITECTURE_GPU_VULKAN_DECODE.md#decode-attention-block"), arch(at="../ARCHITECTURE_GPU_VULKAN_DECODE.md#whole-token-decode-span")]
+[arch(at="../ARCHITECTURE_GPU_VULKAN_DECODE.md#decode-attention-block"), arch(at="../ARCHITECTURE_GPU_VULKAN_DECODE.md#whole-token-decode-span"), arch(at="../ARCHITECTURE_GPU_VULKAN.md#gpu-slot-marks")]
 def moe_gpu_upload_resident(t : Model) {   // nolint:STYLE037,STYLE038 — seven sequential rail walks sharing one rollback cursor; splitting them hides the partial-group unwind
+    moe_gpu_drop_installed_before_load(t.config.n_layers)
     set_moe_gpu_from_layer(t.config.n_layers)   // nothing resident until an upload lands
     set_moe_gpu_stream_from(t.config.n_layers)
     set_moe_gpu_total_layers(t.config.n_layers)

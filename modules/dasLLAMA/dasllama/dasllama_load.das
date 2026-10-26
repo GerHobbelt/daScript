@@ -189,7 +189,7 @@ def private layout_offsets(var t : Model) : LayoutSizes {   // nolint:STYLE037,S
     let layers = c.n_layers + c.n_layer_nextn
     var fo = 0l
     var bf16 = 0l
-    if (t.cls_q8 || cls_kq(t)) {
+    if (t.emb_q8 || cls_kq(t)) {
         t.tok_emb_off = -1l   // no fp32 embedding table — rows dequant from emb_q8_off / the kq plane
     } else {
         t.tok_emb_off = fo
@@ -432,6 +432,11 @@ def private layout_offsets(var t : Model) : LayoutSizes {   // nolint:STYLE037,S
         }
     } else {
         t.wcls_off = kq_take(cur, t.wcls_fmt, c.vocab_size * dim)
+        if (t.emb_q8) {
+            // untied Q8: the embedding's own linear copy, beside the separately quantized classifier
+            t.emb_q8_off = cur.wo
+            cur.wo += c.vocab_size * dim
+        }
     }
     if (c.n_layer_nextn > 0l) {   // MTP/NextN extras (the block's standard tensors rode the walks above)
         t.mtp_ehproj_off = kq_take(cur, t.mtp_ehproj_fmt, 2l * dim * dim)
@@ -1474,13 +1479,14 @@ def private detect_kq_formats(var t : Model; m : GGUFMeta) {   // nolint:STYLE03
 
 
 def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
-    //! The conversion passes (transcode/repack/wscale) thread across the jobque; spin a scoped one
-    //! for the load when the caller hasn't (the server/tools start theirs after the model loads).
+    //! The conversion passes (transcode/repack/wscale) thread across the jobque; spin a scoped,
+    //! configured one for the load when the caller hasn't (the server/tools start theirs after the model loads).
     if (is_job_que_available()) {
         return <- load_gguf_impl(path, mode)
     }
     var t = Model()
     with_job_que() {
+        setup_dasllama_jobque_()
         t <- load_gguf_impl(path, mode)
     }
     return <- t
@@ -1495,6 +1501,7 @@ def load_gguf_streaming(path : string; mode : QuantMode; var t : Model; var jobs
     if (!is_job_que_available()) {
         var okj = false
         with_job_que() {
+            setup_dasllama_jobque_()
             okj = load_gguf_streaming(path, mode, t, jobs, want_blob, blk)
         }
         return okj
@@ -1647,9 +1654,7 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
         }
         // GGUF uses the architecture name as the metadata key prefix (llama.*, qwen2.*, gemma2.*, ...)
         let dim = gguf_int(m, bytes, "{arch}.embedding_length")
-        // MTP/NextN: an in-file head's block_count INCLUDES the appended draft block(s); a split head
-        // (sidecar shard) leaves the trunk's block_count at the trunk. `layers` below is the TRUNK
-        // count — every per-layer validation/mask walks the trunk only.
+        //! an in-file head's block_count includes the draft block(s), a split head's does not - `layers` is the TRUNK count every per-layer walk uses
         let nextn_in = gguf_has(m, "{arch}.nextn_predict_layers") ? gguf_int(m, bytes, "{arch}.nextn_predict_layers") : 0l
         let nextn = m.nextn_sidecar > 0l ? m.nextn_sidecar : nextn_in
         if (nextn < 0l || nextn > 1l) {
@@ -1660,7 +1665,7 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
         }
         let layers = gguf_int(m, bytes, "{arch}.block_count") - nextn_in
         if (layers < 1l) {   // fail closed on a malformed file before "blk.-1..." confusion downstream
-            panic("dasLLAMA: {arch}.block_count = {layers + nextn} with nextn_predict_layers = {nextn} leaves no trunk layers")
+            panic("dasLLAMA: {arch}.block_count = {layers + nextn_in} with nextn_predict_layers = {nextn_in} leaves no trunk layers")
         }
         t.config.n_layer_nextn = nextn
         // FFN width: a scalar for uniform arches, or a per-layer array (gemma-4 E2B: the elastic
@@ -2078,11 +2083,11 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
         }
         // a separate output.weight means the classifier is not tied to the embeddings
         t.config.shared_weights = gguf_find_tensor(m, "output.weight") < 0
-        // tied Q8 loads of a Q8_0 embedding matmul the classifier on the DISK quants (the reference
-        // arithmetic) and drop the fp32 table — see Model.cls_q8. Other disk types keep the exact
-        // fp32 path (a requantized classifier would drift from the oracle for no parity gain).
-        t.cls_q8 = (t.config.shared_weights && mode == QuantMode.q8
-            && gguf_tensor_type(m, "token_embd.weight") == GGML_TYPE_Q8_0)
+        // a Q8 load of a Q8_0 embedding keeps the table as its disk quants (Model.emb_q8: rows dequant on
+        // demand to the values the fp32 decode would hold); tied, the classifier matmuls those quants too (Model.cls_q8).
+        // Other disk types keep the exact fp32 path (a requantized classifier would drift from the oracle for no parity gain).
+        t.emb_q8 = mode == QuantMode.q8 && gguf_tensor_type(m, "token_embd.weight") == GGML_TYPE_Q8_0
+        t.cls_q8 = t.config.shared_weights && t.emb_q8
         // ssm_beta/ssm_alpha disk type routes their matmul (must precede layout_offsets): F32
         // files keep them fp32 in fblob (their matmul runs in f32); quantized files ride qblob.
         // Also before detect_kq_formats — the dn tags demote on grouped (qwen3next) files.
@@ -2334,10 +2339,10 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
             t.qscales |> reserve(sz.pleq8_n / 32l)
             t.qscales |> resize(sz.pleq8_n / 32l)
         }
-        // embedding + norms -> fblob (decoded to fp32 from whatever the disk type is); cls_q8 /
+        // embedding + norms -> fblob (decoded to fp32 from whatever the disk type is); emb_q8 /
         // cls_kq keep the embedding out of fblob — the quantized copies transcode with the big
         // weights below
-        if (!t.cls_q8 && !cls_kq(t)) {
+        if (!t.emb_q8 && !cls_kq(t)) {
             gguf_read_tensor_f32(m, bytes, "token_embd.weight", t.fblob, t.tok_emb_off, vocab * dim)
         }
         // gpt-oss names its pre-FFN norm post_attention_norm (same graph role as ffn_norm)
@@ -2571,6 +2576,10 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
         }
         if (!t.config.shared_weights) {
             load_big(m, bytes, "output.weight", t, t.wcls_off, vocab * dim, scratch, 0l, t.wcls_fmt)
+            if (t.emb_q8) {
+                // untied Q8: the embedding's linear copy the row reads dequant from (never repacked)
+                load_big(m, bytes, "token_embd.weight", t, t.emb_q8_off, vocab * dim, scratch)
+            }
         } elif (t.cls_q8) {
             // tied Q8: classifier copy (repacked below) + the linear copy embedding rows read.
             // Through load_big (its q8 arm is the same transcode) so the streaming plan records both.

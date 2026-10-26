@@ -62,8 +62,6 @@ def public metal_requires_failed(msg : string) {
     }
 }
 
-// requires item "lhs % N" (lhs = a params= name or kargs.field):
-//   if ((uint64(lhs) % N) != 0) metal_requires_failed("<builder>: lhs % N != 0")
 [arch(at="../ARCHITECTURE_GPU_MTP.md#metal-dispatch-requires")]
 def private mk_requires_check(at : LineInfo; fn_name, lhs : string; n : int) : ExpressionPtr {
     let parts <- split(lhs, ".")
@@ -165,7 +163,7 @@ def private mk_range_len(at : LineInfo; spec : string) : Expression? {
         let t = strip(tok)
         var f : Expression?
         if (is_digit_tok(t)) {
-            f = new ExprConstInt64(at = at, value = int64(to_int(t)))
+            f = new ExprConstInt64(at = at, value = to_int64(t, false))
         } else {
             f = new ExprVar(at = at, name := t)
         }
@@ -215,7 +213,7 @@ def private mk_tg_dim(at : LineInfo; tgi : int; tgs : string) : Expression? {
         return mk_uint_cast(at, new ExprVar(at = at, name := strip(tgs)))
     }
     let name = strip(parts[0])
-    let mult = int64(to_int(strip(parts[1])))
+    let mult = to_int64(strip(parts[1]), false)
     var mul = new ExprOp2(at = at, op := "*", left = new ExprVar(at = at, name := name), right = new ExprConstInt64(at = at, value = mult))
     return mk_uint_cast(at, mul)
 }
@@ -494,7 +492,6 @@ class MetalDispatch : AstStructureAnnotation {
         // gate scans the whole staged set — but reads-then-writes matches the hand-written order).
         var body : array<ExpressionPtr>
         body |> reserve(length(bufs) * 3 + 4)
-        // requires = "lhs % N, ..." — the kernel's alignment contracts, checked before every dispatch
         let requires = find_arg(args, "requires") ?as tString ?? ""
         if (!empty(strip(requires))) {
             for (item in split(requires, ",")) {

@@ -7,8 +7,28 @@
 #include "daScript/ast/ast_handle.h"
 #include "daScript/ast/ast.h"
 #include "daScript/ast/ast_visitor.h"
+#include "daScript/misc/anyhash.h"
+#include "daScript/misc/sysos.h"
+#include "daScript/misc/env_cfg.h"
 #include <cstdarg>
 #include <cstdio>
+#include <sys/stat.h>
+#include <algorithm>
+#if !DAS_NO_FILEIO
+#ifdef _WIN32
+#include <io.h>
+#include <sys/utime.h>
+#else
+#include <dirent.h>
+#include <utime.h>
+#endif
+#endif
+#ifdef _WIN32
+#include <direct.h>
+#include <stdlib.h>
+#else
+extern char ** environ;
+#endif
 #include <stdexcept>
 #include <type_traits>
 
@@ -880,6 +900,11 @@ namespace das {
                     default: SERIALIZER_VERIFYF(false, "Unreachable");
                 }
                 info->serialize(*this);
+                if ( fileAccess && !info->name.empty() ) {
+                    if ( FileInfo * live = fileAccess->getFileInfo(info->name) ) {
+                        info = live;
+                    }
+                }
                 readingFileInfoMap[curOffset] = info;
                 if ( curOffset != savedOffset )
                     readOffset = savedOffset;
@@ -897,6 +922,12 @@ namespace das {
             *this << info_ptr;
         } else {
             FileInfo * info_ptr = nullptr; *this << info_ptr;
+            if ( fileAccess && info_ptr ) {
+                if ( auto owned = fileAccess->letGoOfFileInfo(info_ptr->name) ) {
+                    info = das::move(owned);
+                    return *this;
+                }
+            }
             info.reset(info_ptr);
             doNotDelete.insert(info_ptr);
         }
@@ -1664,7 +1695,7 @@ namespace das {
 
     void SerializeVisitor::serializeConst ( ExprConst * expr ) {
         serializeBase(expr);
-        ser << expr->baseType << expr->value << expr->foldedNonConst << expr->promotedFromInt << expr->inexactFloatPromotion;
+        ser << expr->baseType << expr->value << expr->foldedNonConst << expr->promotedFromInt << expr->inexactFloatPromotion << expr->isConstLiteral;
     }
 
     void SerializeVisitor::serializeMakeLocal ( ExprMakeLocal * expr ) {
@@ -2757,97 +2788,48 @@ namespace das {
     };
 
 
+    #define DAS_MODULE_CACHE_POLICY_FIELDS(X) \
+        X(aot) X(aot_module) X(aot_macros) X(tune_frozen) X(completion) X(building_documentation) \
+        X(export_all) X(serialize_main_module) X(keep_alive) X(very_safe_context) X(max_infer_passes) \
+        X(max_call_depth) X(verify_infer_types) X(stack) X(intern_strings) X(persistent_heap) \
+        X(multiple_contexts) X(heap_size_hint) X(string_heap_size_hint) X(solid_context) \
+        X(macro_context_persistent_heap) X(macro_context_collect) X(max_static_variables_size) \
+        X(max_heap_allocated) X(max_string_heap_allocated) X(max_unreserved_size) X(track_allocations) \
+        X(rtti) X(unsafe_table_lookup) X(relaxed_pointer_const) X(version_2_syntax) X(gen2_make_syntax) \
+        X(relaxed_assign) X(no_unsafe) X(local_ref_is_unsafe) X(with_module_is_unsafe) \
+        X(no_global_variables) X(no_global_variables_at_all) X(no_global_heap) X(only_fast_aot) \
+        X(aot_order_side_effects) X(no_unused_function_arguments) X(no_unused_block_arguments) \
+        X(allow_block_variable_shadowing) X(allow_local_variable_shadowing) X(allow_shared_lambda) \
+        X(ignore_shared_modules) X(default_module_public) X(no_deprecated) X(no_aliasing) \
+        X(strict_smart_pointers) X(no_init) X(strict_unsafe_delete) X(no_members_functions_in_struct) \
+        X(no_local_class_members) X(no_unsafe_uninitialized_structures) X(default_init_containers) \
+        X(strict_properties) X(no_writing_to_nameless) X(no_optimizations) X(fast_math) X(disable_dse) \
+        X(disable_cse) X(disable_temp_string_reclaim) X(disable_inline) X(disable_auto_inline) \
+        X(auto_inline_functions) X(auto_inline_cost) X(disable_run) X(no_infer_time_folding) \
+        X(fail_on_no_aot) X(fail_on_lack_of_aot_export) X(no_fast_call) X(fusion) X(scoped_stack_allocator) \
+        X(force_inscope_pod) X(log_inscope_pod) X(debugger) X(profiler) X(jit_enabled) \
+        X(jit_jit_all_functions) X(jit_debug_info) X(jit_opt_level) X(jit_size_level) X(jit_dll_mode) \
+        X(jit_output_path) X(jit_path_to_shared_lib) X(jit_path_to_linker) X(threadlock_context) \
+        X(lint_check) X(no_lint) X(abi_stamp) X(paranoid_validation) X(cross_platform) X(aot_result) \
+        X(no_init_check) X(always_report_candidates_threshold) X(jit_exe_mode) X(jit_emit_object) \
+        X(jit_emit_prologue) X(dll_search_paths) X(aot_lib) X(standalone_context) X(gc_infer_collect) \
+        X(gc_infer_collect_nodes) X(gc_infer_collect_pct) X(report_invisible_functions) \
+        X(report_private_functions) X(log_compile_time) X(log_total_compile_time) \
+        X(log_module_compile_time) X(log_optimization) X(log_optimization_passes) X(force_escape_free) \
+        X(force_allocate_on_stack) X(force_partial_escape_free) X(log_escape_analysis) X(log_gc_time) \
+        X(debug_infer_flag) X(temp_table_lint_warning)
+
+    static bool cachedPoliciesMatch ( const CodeOfPolicies & a, const CodeOfPolicies & b ) {
+    #define DAS_POLICY_FIELD_SAME(f) if ( !(a.f == b.f) ) return false;
+        DAS_MODULE_CACHE_POLICY_FIELDS(DAS_POLICY_FIELD_SAME)
+    #undef DAS_POLICY_FIELD_SAME
+        return true;
+    }
+
     AstSerializer & AstSerializer::operator << ( CodeOfPolicies & value ) {
-        // This is like so because of several fields with strings
-        *this << value.aot
-              << value.aot_module
-              << value.aot_macros
-              << value.tune_frozen
-              << value.completion
-              << value.building_documentation
-              << value.export_all
-              << value.serialize_main_module
-              << value.keep_alive
-              << value.very_safe_context
-              << value.max_infer_passes
-              << value.max_call_depth
-              << value.verify_infer_types
-              << value.stack
-              << value.intern_strings
-              << value.persistent_heap
-              << value.multiple_contexts
-              << value.heap_size_hint
-              << value.string_heap_size_hint
-              << value.solid_context
-              << value.macro_context_persistent_heap
-              << value.macro_context_collect
-              << value.max_static_variables_size
-              << value.max_heap_allocated
-              << value.max_string_heap_allocated
-              << value.max_unreserved_size
-              << value.track_allocations
-              << value.rtti
-              << value.unsafe_table_lookup
-              << value.relaxed_pointer_const
-              << value.version_2_syntax
-              << value.gen2_make_syntax
-              << value.relaxed_assign
-              << value.no_unsafe
-              << value.local_ref_is_unsafe
-              << value.with_module_is_unsafe
-              << value.no_global_variables
-              << value.no_global_variables_at_all
-              << value.no_global_heap
-              << value.only_fast_aot
-              << value.aot_order_side_effects
-              << value.no_unused_function_arguments
-              << value.no_unused_block_arguments
-              << value.allow_block_variable_shadowing
-              << value.allow_local_variable_shadowing
-              << value.allow_shared_lambda
-              << value.ignore_shared_modules
-              << value.default_module_public
-              << value.no_deprecated
-              << value.no_aliasing
-              << value.strict_smart_pointers
-              << value.no_init
-              << value.strict_unsafe_delete
-              << value.no_members_functions_in_struct
-              << value.no_local_class_members
-              << value.no_unsafe_uninitialized_structures
-              << value.default_init_containers
-              << value.strict_properties
-              << value.no_writing_to_nameless
-              << value.no_optimizations
-              << value.fast_math
-              << value.disable_dse
-              << value.disable_cse
-              << value.disable_temp_string_reclaim
-              << value.disable_inline
-              << value.disable_auto_inline
-              << value.auto_inline_functions
-              << value.auto_inline_cost
-              << value.disable_run
-              << value.no_infer_time_folding
-              << value.fail_on_no_aot
-              << value.fail_on_lack_of_aot_export
-              << value.no_fast_call
-              << value.fusion
-              << value.scoped_stack_allocator
-              << value.force_inscope_pod
-              << value.log_inscope_pod
-              << value.debugger
-              << value.profiler
-              << value.jit_enabled
-              << value.jit_jit_all_functions
-              << value.jit_debug_info
-              << value.jit_opt_level
-              << value.jit_size_level
-              << value.jit_dll_mode
-              << value.jit_output_path
-              << value.jit_path_to_shared_lib
-              << value.jit_path_to_linker
-              << value.threadlock_context;
+    #define DAS_POLICY_FIELD_STREAM(f) *this << value.f;
+        DAS_MODULE_CACHE_POLICY_FIELDS(DAS_POLICY_FIELD_STREAM)
+    #undef DAS_POLICY_FIELD_STREAM
         return *this;
     }
 
@@ -2875,7 +2857,7 @@ namespace das {
         try {
             serializeProgramImpl(program, libGroup);
         } catch ( const dasException & r ) {
-            LOG(LogLevel::warning) << "das: serialize: program " << (writing ? "write" : "read") << " failed: " << r.what() << "\n";
+            if ( !quietCache ) LOG(LogLevel::warning) << "das: serialize: program " << (writing ? "write" : "read") << " failed: " << r.what() << "\n";
             failed = true;
             seenNewModule = true;
             if ( program ) program->failToCompile = true;
@@ -2885,7 +2867,7 @@ namespace das {
             // this method is noexcept for embedders built without EH; a non-das
             // exception (e.g. std::bad_alloc deep in deserialization) escaping here
             // would std::terminate. Contain it the same way and report failure.
-            LOG(LogLevel::warning) << "das: serialize: program " << (writing ? "write" : "read") << " failed: unknown exception\n";
+            if ( !quietCache ) LOG(LogLevel::warning) << "das: serialize: program " << (writing ? "write" : "read") << " failed: unknown exception\n";
             failed = true;
             seenNewModule = true;
             if ( program ) program->failToCompile = true;
@@ -2913,14 +2895,14 @@ namespace das {
 
     void AstSerializer::serializeProgramImpl ( ProgramPtr program, ModuleGroup & libGroup ) {
         auto & ser = *this;
-        // version gate — the module-cache path (trySerializeProgramModule) checks only
-        // mtime+filename before this; a cache written by a different serializer version must
+        // version gate — the module-cache path (trySerializeProgramModule) checks only the
+        // file name and content stamp before this; a cache written by a different serializer version must
         // fail cleanly here (the caller falls back to a full parse on ser.failed), not misparse
         // every field after the first layout difference
         uint32_t version = getVersion();
         ser << version;
         if ( !ser.writing && version != getVersion() ) {
-            LOG(LogLevel::warning) << "das: deserialize: module cache version " << version
+            if ( !ser.quietCache ) LOG(LogLevel::warning) << "das: deserialize: module cache version " << version
                 << " does not match serializer version " << getVersion() << "\n";
             ser.failed = true;
             return;
@@ -2936,7 +2918,18 @@ namespace das {
         ser << program->globalInitStackSize << program->globalStringHeapSize;
         ser << program->flags;
 
-        ser << program->options << program->policies;
+        if ( writing ) {
+            ser << program->options << program->policies;
+        } else {
+            ser << program->options;
+            CodeOfPolicies stored = program->policies;
+            ser << stored;
+            if ( !cachedPoliciesMatch(stored, program->policies) ) {
+                ser.policyMismatch = true;
+                ser.failed = true;
+                return;
+            }
+        }
 
         if ( writing ) {
             moduleLibrary = &program->library;  // Module::serialize binds *moduleLibrary (finalizeModule)
@@ -3027,8 +3020,10 @@ namespace das {
                     *this << savedHash;
 
                     if ( moduleHash != savedHash ) {
-                        LOG(LogLevel::warning) << "das: serialize: cumulative hash for module '" << m->name
-                                               << "' differs" << " (" << moduleHash << " vs " << savedHash << ") ";
+                        if ( !ser.quietCache ) {
+                            LOG(LogLevel::warning) << "das: serialize: cumulative hash for module '" << m->name
+                                                   << "' differs" << " (" << moduleHash << " vs " << savedHash << ") ";
+                        }
                         ser.builtinHashDrift = true;    // per-process-deterministic drift, not damage
                         program->failToCompile = true;
                         return;
@@ -3046,14 +3041,14 @@ namespace das {
                         program->library.addModule(existing);
                         continue;
                     }
-                    LOG(LogLevel::warning) << "das: serialize: module '" << name << "' not found";
+                    if ( !ser.quietCache ) LOG(LogLevel::warning) << "das: serialize: module '" << name << "' not found";
                     program->failToCompile = true;
                     return;
                 }
 
                 Module* deser = nullptr;
                 try {
-                    deser = new Module();
+                    deser = new ModuleDas();     // the parser's class: aotRequire answers cpp, a plain Module answers no_aot
                     deser->setModuleName(name);
                     if ( existing ) {
                         program->library.addModule(existing);
@@ -3071,7 +3066,7 @@ namespace das {
                 } catch ( const dasException & r ) {
                     if ( activeWasThisModule ) activeRoot = &gc_root::gc_get_thread_root();
                     delete deser;
-                    LOG(LogLevel::warning) << "das: serialize: reading module '" << name << "' (" << i << "/" << size
+                    if ( !ser.quietCache ) LOG(LogLevel::warning) << "das: serialize: reading module '" << name << "' (" << i << "/" << size
                                            << (existing ? ", already exists" : ", new") << "): " << r.what() << "\n";
                     program->failToCompile = true;
                     return;
@@ -3088,7 +3083,7 @@ namespace das {
             }
 
             if ( program->library.getModules().empty() ) {
-                LOG(LogLevel::warning) << "das: serialize: program '" << program->thisModuleName << "' stream has no modules\n";
+                if ( !ser.quietCache ) LOG(LogLevel::warning) << "das: serialize: program '" << program->thisModuleName << "' stream has no modules\n";
                 program->failToCompile = true;
                 return;
             }
@@ -3274,7 +3269,7 @@ namespace das {
                     library.addModule(m);
                 }
             } else {
-                auto mod = new Module;
+                auto mod = new ModuleDas;
                 mod->setModuleName(name);
                 mod->fileName = fileName;
                 library.addModule(mod);
@@ -3305,7 +3300,134 @@ namespace das {
         allocateStack(logs,true,false);
     }
 
-    void ModuleFileCache::install ( const string & readFrom, const string & writeTo ) {
+#if !DAS_NO_FILEIO
+    static void ensureParentDirectories ( const string & path ) {
+        for ( size_t i = 1; i < path.size(); ++i ) {
+            if ( path[i] == '/' || path[i] == '\\' ) {
+                string dir = path.substr(0, i);
+#ifdef _WIN32
+                _mkdir(dir.c_str());
+#else
+                mkdir(dir.c_str(), 0755);
+#endif
+            }
+        }
+    }
+#endif
+
+#if !DAS_NO_FILEIO
+    static const char * MODULE_CACHE_DEFAULT_DIR = ".jitted_scripts/module_cache/";
+
+    // DAS_MODULE_CACHE_LIMIT, megabytes: 4096 unless set, 0 = no eviction; garbage keeps the default
+    static uint64_t moduleCacheLimitBytes () {
+        uint64_t mb = 4096;
+        if ( const char * env = get_dasenv_module_cache_limit() ) {
+            if ( *env ) {
+                char * end = nullptr;
+                unsigned long long v = strtoull(env, &end, 10);
+                if ( end && *end == 0 ) mb = uint64_t(v);
+            }
+        }
+        return mb * 1024ull * 1024ull;
+    }
+
+    struct CacheRecordInfo {
+        string      path;
+        uint64_t    size;
+        int64_t     mtime;
+    };
+
+    static void listCacheRecords ( const string & dir, vector<CacheRecordInfo> & out ) {
+#ifdef _WIN32
+        struct _finddata_t c_file;
+        string findPath = dir + "*.dascache";
+        intptr_t hFile = _findfirst(findPath.c_str(), &c_file);
+        if ( hFile != -1L ) {
+            do {
+                out.push_back({dir + c_file.name, uint64_t(c_file.size), int64_t(c_file.time_write)});
+            } while ( _findnext(hFile, &c_file) == 0 );
+            _findclose(hFile);
+        }
+#else
+        if ( DIR * d = opendir(dir.c_str()) ) {
+            while ( dirent * e = readdir(d) ) {
+                string name = e->d_name;
+                if ( name.size() < 9 || name.compare(name.size() - 9, 9, ".dascache") != 0 ) continue;
+                string p = dir + name;
+                struct stat st;
+                if ( stat(p.c_str(), &st) == 0 ) out.push_back({p, uint64_t(st.st_size), int64_t(st.st_mtime)});
+            }
+            closedir(d);
+        }
+#endif
+    }
+
+    static void touchFile ( const string & path ) {
+#ifdef _WIN32
+        (void) _utime(path.c_str(), nullptr);
+#else
+        (void) utime(path.c_str(), nullptr);
+#endif
+    }
+
+    // LRU eviction of the DEFAULT cache directory down to the limit after a writeback; the record
+    // just written stays, and a record a run read was touched, so it is never the oldest. An
+    // explicit -module-cache path is the user's directory and is never pruned.
+    static void evictModuleCache ( const string & justWrote ) {
+        size_t dirLen = strlen(MODULE_CACHE_DEFAULT_DIR);
+        if ( justWrote.compare(0, dirLen, MODULE_CACHE_DEFAULT_DIR) != 0 ) return;
+        uint64_t limit = moduleCacheLimitBytes();
+        if ( limit == 0 ) return;
+        vector<CacheRecordInfo> recs;
+        listCacheRecords(MODULE_CACHE_DEFAULT_DIR, recs);
+        uint64_t total = 0;
+        for ( auto & r : recs ) total += r.size;
+        if ( total <= limit ) return;
+        sort(recs.begin(), recs.end(), [](const CacheRecordInfo & a, const CacheRecordInfo & b) {
+            return a.mtime != b.mtime ? a.mtime < b.mtime : a.path < b.path;
+        });
+        for ( auto & r : recs ) {
+            if ( total <= limit ) break;
+            if ( r.path == justWrote ) continue;
+            if ( remove(r.path.c_str()) == 0 ) total -= r.size;
+        }
+    }
+#endif
+
+    string ModuleFileCache::defaultPath ( const string & scriptPath, const string & hostBinary, const string & hostOptions ) {
+        string norm = normalizeFileName(scriptPath.c_str());
+        size_t slash = norm.find_last_of("/\\");
+        string stem = slash == string::npos ? norm : norm.substr(slash + 1);
+        size_t dot = stem.rfind('.');
+        if ( dot != string::npos && dot != 0 ) stem = stem.substr(0, dot);
+        struct stat bst;
+        char host[64];
+        if ( !hostBinary.empty() && stat(hostBinary.c_str(), &bst) == 0 ) {
+            snprintf(host, sizeof(host), "\n%lld:%lld", (long long) bst.st_mtime, (long long) bst.st_size);
+        } else {
+            host[0] = 0;
+        }
+        vector<string> envs;
+#ifdef _WIN32
+        for ( char ** e = _environ; e && *e; ++e ) {
+#else
+        for ( char ** e = environ; e && *e; ++e ) {
+#endif
+            // the cache's own size cap is a policy on the directory, not a compile input
+            if ( strncmp(*e, "DAS", 3) == 0 && strncmp(*e, "DAS_MODULE_CACHE_LIMIT=", 23) != 0 ) envs.push_back(*e);
+        }
+        sort(envs.begin(), envs.end());
+        string key = norm + host + "\n" + hostOptions;
+        for ( auto & e : envs ) {
+            key += "\n";
+            key += e;
+        }
+        char hex[17];
+        snprintf(hex, sizeof(hex), "%016llx", (unsigned long long) hash_blockz64((const uint8_t *) key.c_str()));
+        return string(".jitted_scripts/module_cache/") + stem + "-" + string(hex, 8) + ".dascache";
+    }
+
+    void ModuleFileCache::install ( const string & readFrom, const string & writeTo, bool quiet ) {
         requested = !readFrom.empty() || !writeTo.empty();
 #if !DAS_NO_FILEIO
         writePath = writeTo;
@@ -3329,13 +3451,18 @@ namespace das {
             }
             if ( !readStorage.buffer.empty() ) {
                 reader = make_unique<AstSerializer>(&readStorage, false);
+                reader->quietCache = quiet;
                 env.serializer_read = reader.get();
+                touchFile(readFrom);    // a record in use is the newest for the eviction's LRU
             }
         }
         if ( !writePath.empty() ) {
             writer = make_unique<AstSerializer>(&writeStorage, true);
+            writer->quietCache = quiet;
             env.serializer_write = writer.get();
         }
+#else
+        (void) quiet;
 #endif
     }
 
@@ -3362,6 +3489,9 @@ namespace das {
                 res.verdict = ReadVerdict::clean;
             }
             res.resumed = reader->resumedModules;
+            res.served = reader->servedModules;
+            res.cutoffFile = reader->cutoffFile;
+            res.cutoffReason = reader->cutoffReason;
             reader->moduleLibrary = nullptr;    // not ours to free
             // claim the FileInfos the reader created that no module took ownership of -
             // ~AstSerializer would DELETE them, and the deserialized AST's LineInfos still
@@ -3378,6 +3508,7 @@ namespace das {
                 // cannot replace on Windows, so there is a missing-file blink there - a
                 // reader in that window just takes the cold path
                 string tmpPath = writePath + ".tmp";
+                ensureParentDirectories(writePath);
                 if ( FILE * f = fopen(tmpPath.c_str(), "wb") ) {
                     res.wroteBytes = uint64_t(fwrite(writeStorage.buffer.data(), 1, writeStorage.buffer.size(), f));
                     fclose(f);
@@ -3390,6 +3521,7 @@ namespace das {
                     }
                     if ( !res.wrote ) remove(tmpPath.c_str());   // never leave a corpse
                     res.saveFailed = !res.wrote;
+                    if ( res.wrote ) evictModuleCache(writePath);
                 } else {
                     res.saveFailed = true;
                 }

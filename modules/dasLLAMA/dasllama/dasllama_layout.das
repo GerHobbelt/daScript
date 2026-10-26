@@ -31,7 +31,7 @@ let PACK_VERSION = 1
 // A q8 region's blob bind offset (off/32)*34 lands 16B-aligned iff off % 256 == 0; a k6
 // region's d-plane bind (NSB*16 + (off/256)*2) needs 4B alignment iff off % 512 == 0.
 // k4/k5/q40 quant + scale binds are 16B-multiples by construction.
-[arch(at = "../ARCHITECTURE_GPU.md#metal-kq-split-scale-plane")]
+[arch(at = "../ARCHITECTURE_GPU_QUANT_PLANES.md#metal-kq-split-scale-plane")]
 def private metal_blob_off_ok(off : int64; fmt : KqFmt) : bool {
     if (off < 0l) return true
     if (fmt == KqFmt.q8) return off % 256l == 0l
@@ -97,19 +97,14 @@ def private metal_blob_layout_ok(t : Model) : bool {
     }
     let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
     return (metal_blob_off_ok(t.wcls_off, cls_fmt) &&
-        (!t.cls_q8 || metal_blob_off_ok(t.emb_q8_off, KqFmt.q8)))
+        (!t.emb_q8 || metal_blob_off_ok(t.emb_q8_off, KqFmt.q8)))
 }
 
-//! Can `t` take the blob form? The refusal half of the transform, split out so the image writer
-//! can commit to the metal flavor without first building the blob plane in RAM.
-def metal_blob_eligible(t : Model) : bool {
+//! Can `t`'s LAYOUT take the blob form - the packing flags and the bind-alignment gate, ownership
+//! aside? The question a mapped planar image answers before the rail rebakes the metal flavor.
+[arch(at = "../ARCHITECTURE_IMAGE.md#image-flavor-rebake")]
+def metal_blob_form_ok(t : Model) : bool {
     if (t.quant != QuantMode.q8 || t.kq_repacked || t.mx4_repacked || kernel_backend_needs_repack(active_kernel_backend())) {
-        return false
-    }
-    if (t.image_map != null) {
-        // image-backed planes are borrowed READ-ONLY views — the in-place k4s/k5s/k6s
-        // rewrites would fault. Transform an owned load (load_model_ / DASLLAMA_IMAGE=0).
-        to_log(LOG_WARNING, "dasLLAMA: metal-blob transform declined - the model is image-mapped (borrowed planes); transform an owned gguf load\n")
         return false
     }
     if (!metal_blob_layout_ok(t)) {
@@ -117,6 +112,18 @@ def metal_blob_eligible(t : Model) : bool {
         return false
     }
     return true
+}
+
+//! Can THIS `t` take the blob form in place? The refusal half of the transform, split out so the
+//! image writer can commit to the metal flavor without first building the blob plane in RAM.
+def metal_blob_eligible(t : Model) : bool {
+    if (t.image_map != null) {
+        // image-backed planes are borrowed READ-ONLY views — the in-place k4s/k5s/k6s
+        // rewrites would fault. Transform an owned load (load_model_ / DASLLAMA_IMAGE=0).
+        to_log(LOG_WARNING, "dasLLAMA: metal-blob transform declined - the model is image-mapped (borrowed planes); transform an owned gguf load\n")
+        return false
+    }
+    return metal_blob_form_ok(t)
 }
 
 //! Block count of the blob plane and its stride — the 34B gguf-native block_q8_0, which is the
@@ -160,7 +167,7 @@ def metal_blob_fill_blocks(t : Model; b0, nblk : int64; var dst : array<uint8>) 
 //! Put ONE kq scale plane into its metal device form, named by its Model field; false = not a kq
 //! scale plane. Per-plane because the streamed image walk applies each as its own turn comes,
 //! which is the only point where that plane's fills are done and its bytes are not yet written.
-[arch(at = "../ARCHITECTURE_GPU.md#metal-kq-split-scale-plane")]
+[arch(at = "../ARCHITECTURE_GPU_QUANT_PLANES.md#metal-kq-split-scale-plane")]
 def metal_blob_scale_plane(var t : Model; name : string) : bool {
     // k4/k5: the 16B verbatim disk scale block per superblock — the 4B pad is CPU-repack
     // scratch (see the plane-layout comment in dasllama_gguf) and a blob model never repacks

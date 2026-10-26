@@ -82,7 +82,7 @@ add the arm next to `q40`'s. The compiler does not find these - a missing arm fa
   `memcpy`, the stream repack `invoke(g_stream_repack, <id>, ...)`, `transcode_kq_tensor`,
   `load_big`, `kq_fmt_of` (GGML type -> tag), the two `noisy` log lines,
   `g_stream_plane_total["<fmt>q"]`, the plane `reserve`/`resize` block.
-- `dasllama_common.das`: `kq_active_mr`, `kq_fi`, `mm_at_kq_pre` (two arms), `mm_b_kq`,
+- `dasllama_common.das`: `kq_active_mr`, `kq_fi`, `mm_at_kq_pre` (two arms), `mm_b_kq_tile`,
   `mm_at_kq_groupn` (two arms), `mm_b_kq_groupn`, `mm_b_kq_pre`, `kq_plane_q`, `kq_plane_s`,
   `embed_row` (four arms: grp and plane form, trimmed and untrimmed), the bake config fill
   (`c.kq_mr<id> = active_kq_layout_mr(<id>)`).
@@ -199,12 +199,16 @@ verbatim; scales the 20 B `KQ_DEV_SSB` row) plus three eight-line width stamps, 
 `cm2_cls_ensure/set/enc` ladders, and `pf_f16_feed` admits it via `kq_sb` automatically. A
 codebook format raises the `IQLUT` axis - a gated `@workgroup` f16 table staged ahead of the
 tile loop (llama.cpp's `init_iq_shmem` form); never select codes out of a register vector per
-element inside a decode callback. The four-wide decode twin comes with the template: its loads
-pass the `DECVEC` axis as `coopmatLoadTensorDecode`'s tenth argument, so the emitter synthesizes
-the vector callback over `decode` and a format authors nothing for it. Run
-`harness/vk_gemm_probe.das -- cm2:<fmt>` with `DASLLAMA_VK_DECVEC` 1 and 0: a format whose row
-loses overrides `DECVEC = false` (iq3s, iq2s, iq2xxs today), and a hand-laid `half4` twin (a
-second `[spirv_decode]` method in that slot) is the lever for it. Gate: a device-form CPU oracle
+element inside a decode callback. The four-wide decode twin is the format's own: a second
+`[spirv_decode] def decode_v4` returning `half4` under `override DECV4 = true`, computing the
+four consecutive elements in the scalar `decode`'s operation order and sharing what they share
+(two 16-bit lanes and one scale extraction for a K-quant, one grid word and its four sign bits
+for a grid format - every kq format today authors one). A format may start on the template's
+`DECVEC` axis, the twin the emitter synthesizes over `decode`, but the synthesized twin repeats
+the scalar body four times and lost to the scalar callback on the grid formats. Run
+`harness/vk_gemm_probe.das -- cm2:<fmt>` (both twin arms in one process): a format whose
+four-wide row loses to its scalar row ships a twin that wins or turns both axes off. Gate: a
+device-form CPU oracle
 (`<fmt>f16_gemm_oracle`) and
 an l/m/s cell in `tests/test_vulkan_kernels.das`. Payoff on the 1B: iq4xs pp512 5161 -> 15334,
 k3 5174 -> 14031 (0.90x / 0.80x llama.cpp's Vulkan, from 0.30x).
@@ -258,13 +262,13 @@ the MoE GEMV/mul_mm trio for the format - ledgered for the M5 kernel pass.
 ## 8. End to end
 
 **Dev-loop invocation (adopted 2026-08-31):** every correctness-loop run (probe tests,
-parity, run.das spot checks) goes through the fast stack -
-`daslang.exe -jit -module-cache .jitted_scripts/module_cache/<app>.dascache <app>.das --
---jit-split-modules=-1 ...` - warm no-edit reruns drop 48 s -> 5 s, an edit loop 196 s ->
-~60 s (zen2, lcpp_bench scale). Bench t/s rows keep the stock monolith invocation (split
-loses cross-module inlining); the first run after a cache write pays one cold codegen (the
-deser re-key); QUIRK 21 still applies to emitter edits. Numbers, caveats and the
-invalidation ledger: `plans/jit_compile_time.md`.
+parity, run.das spot checks) is the fast stack by default - `daslang.exe -jit <app>.das ...`
+installs the AST module cache and the split-module JIT unasked (the measured walls, per box
+and stack: `plans/jit_compile_time.md`). A bench that must see
+one-unit codegen passes `--jit-split-modules=0` after the `--` separator; a records row
+measures a released `-exe`, which always is one unit. `-no-module-cache` opts out of the
+cache. QUIRK 21 still applies to emitter edits. Numbers, caveats and the invalidation ledger:
+`plans/jit_compile_time.md`; the flags: `skills/internal/build_and_debug.md`.
 
 **Kernel-loop invocation (adopted 2026-09-01):** a kernel spelling is raced without a model in
 `benchmarks/matmul/kq_kernel_bench.das` - `DAS_TUNE_MODE=tune bin/Release/daslang.exe -jit

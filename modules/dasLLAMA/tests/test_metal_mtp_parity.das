@@ -4,12 +4,12 @@ options stack = 524288   // every dasLLAMA program root takes this budget (optio
 options _dasllama_internal = true
 
 require dastest/testing_boost public
-require dasllama/dasllama   // the public facade — engine + arch registrations + (on Apple) the metal overrides
+require dasllama/dasllama   // nolint:STYLE029,LINT019 — the public facade: engine + arch registrations + (on Apple) the metal overrides
 require dasllama/dasllama_math   // set_wscale_f16 — the resident path reads the f32 scale plane
 require dasllama/dasllama_image   // load_model_cached — the served (image) flavor for the GPU twin
 require dasllama/dasllama_gguf   // set_mtp_head_path — the split-head fixture names its head explicitly
-require dasllama/dasllama_batch   // eval_verify_batch_ + create_batch_workspace_ — the batch-rail verify arm
-require dasllama/dasllama_mtp_gemma   // gemma_drafter_sidecar — the assistant drafter beside a gemma-4 target
+require dasllama/dasllama_batch   // nolint:STYLE030,LINT019 — verify_batch_step + create_batch_workspace_ in the das_metal halves
+require dasllama/dasllama_mtp_gemma   // nolint:STYLE030,LINT019 — gemma_drafter_sidecar in the das_metal halves
 require ?das_metal dasllama/dasllama_metal_mtp_gemma   // attach_gemma_drafter — the gemma spec round rides the verify fixtures
 require ?das_metal dasllama/dasllama_metal_decode   // stats + the forced-reject lever + shutdown
 require ?das_metal dasllama/dasllama_metal_prefill   // the metal prefill override for the pair's prompts
@@ -91,7 +91,7 @@ let PROSE_B = "In the spring of that year the river rose higher than anyone in t
 // both sessions of a pair prefilled on the GPU twin through the metal prefill override (the
 // planar CPU prefill of a 27B costs minutes per session; the metal prefill stashes mtp_h and
 // warms the draft slab like the CPU one does)
-def private gpu_prefill_pair(trg : Model; var sa, sb : Session; prompt : array<int64>) {
+def private gpu_prefill_pair(trg : Model; var sa, sb : Session; prompt : array<int64>) {   // nolint:LINT012,LINT019 — the body is the das_metal half
     static_if (typeinfo builtin_module_exists(das_metal)) {
         select_prefill_override("metal")
         set_metal_prefill_min_npos(1l)
@@ -115,8 +115,8 @@ struct FfStats {
 // The forced-feed pair: session A steps plainly on the GPU, session B runs the speculative round
 // with every draft forced to reject (one committed token per round, row 0 promoted to s.logits),
 // both fed A's greedy token. `verify = false` is the control (B steps plainly too).
-def private ff_pair(tr, trg : Model; prompt : array<int64>; nsteps : int64; verify : bool; depth : int64 = 1l) : FfStats {
-    var st = FfStats()
+def private ff_pair(tr, trg : Model; prompt : array<int64>; nsteps : int64; verify : bool; depth : int64 = 1l) : FfStats {   // nolint:LINT012,LINT019 — the body is the das_metal half
+    var st = FfStats()   // nolint:LINT003,LINT019 — filled in the das_metal half
     static_if (typeinfo builtin_module_exists(das_metal)) {
         let c = tr.config
         let vocab = c.vocab_size
@@ -174,14 +174,17 @@ def private ff_pair(tr, trg : Model; prompt : array<int64>; nsteps : int64; veri
     return st
 }
 
-// Free-running pair on the GPU: plain greedy vs the speculative rail's committed stream. Only
-// valid as a token-exact gate on a counting prompt (near-tie-free by construction).
-def private free_run_pair(tr, trg : Model; prompt : array<int64>; n : int64; var plain, spec : array<int64>; depth : int64;
-                          var drafted : int64&) : int64 {
-    var served = 0l
+//! top-k 1 makes every draw the penalized argmax, so a seeded sampled stream is deterministic and the token-exact gate holds
+let SAMPLED_PARAMS = SamplingParams(temp = 0.7, top_k = 1l, penalty = 1.1)
+
+//! Free-running pair on the GPU, greedy or through the session sampler: only valid as a token-exact gate on a counting prompt (near-tie-free by construction).
+def private free_run_pair(tr, trg : Model; prompt : array<int64>; n : int64; var plain, spec : array<int64>; depth : int64; var drafted, parked : int64&; sampled : bool = false) : int64 {   // nolint:LINT012,LINT019 — the body is the das_metal half
+    var served = 0l   // nolint:LINT003,LINT019 — counted in the das_metal half
+    parked = 0l
     static_if (typeinfo builtin_module_exists(das_metal)) {
         let c = tr.config
         let vocab = c.vocab_size
+        var sp = SAMPLED_PARAMS
         with_job_que() {
             setup_dasllama_jobque()
             var sa = make_run_state(c, KVDtype.f16, KVDtype.f16)
@@ -193,25 +196,33 @@ def private free_run_pair(tr, trg : Model; prompt : array<int64>; n : int64; var
             var one <- [t0]
             eval_(trg, sa, one)
             eval_(trg, sb, one)
-            // plain
-            var tok = greedy_top(sa.logits, vocab)
+            if (sampled) {
+                set_seed_(sa, 4242)
+                set_seed_(sb, 4242)
+                sb.spec_params = unsafe(addr(sp))
+            }
+            var tok = sampled ? sample_(sa, sp) : greedy_top(sa.logits, vocab)
             for (_i in range64(n)) {
                 plain |> push(tok)
                 one[0] = tok
                 eval_(trg, sa, one)
-                tok = greedy_top(sa.logits, vocab)
+                tok = sampled ? sample_(sa, sp) : greedy_top(sa.logits, vocab)
             }
             // speculative: commit tok, plus every accepted draft of the round
             set_mtp_depth(depth)
-            tok = greedy_top(sb.logits, vocab)
+            tok = sampled ? sample_(sb, sp) : greedy_top(sb.logits, vocab)
             while (long_length(spec) < n) {
                 spec |> push(tok)
                 let a = mtp_spec_round(trg, sb, tok)
                 for (i in range64(a)) {
                     spec |> push(sb.mtp_vbatch[i + 1l])
                 }
-                tok = greedy_top(sb.logits, vocab)
+                if (sb.mtp_pre_drawn) {
+                    parked++
+                }
+                tok = sampled ? sample_(sb, sp) : greedy_top(sb.logits, vocab)
             }
+            sb.spec_params = null
             set_mtp_depth(1l)
             spec |> resize(n)
             drafted = sb.mtp_drafted
@@ -242,6 +253,8 @@ def private served_twin(path : string; seq_cap : int64) : Model {
 // GPU-vs-GPU forced-feed envelope: two metal rails on the same feeds differ by kernel spelling
 // only (the standing kernel-swap gates sit near 0.01); 0.5 is the one-step decode gate's bar.
 let FF_TOL = 0.5
+//! the nine-row kq mul_mm stages x to half - a wider envelope than the f32-x GEMV forms', flips still zero
+let MM_TOL = 1.0
 let FF_STEPS = 48l
 let COUNT_STEPS = 40l
 
@@ -260,17 +273,23 @@ def private ff_cell(t : T?; tr, trg : Model; tag, pn : string; prompt : array<in
 }
 
 // the process-wide knobs every exit path of run_fixture puts back
-def private count_cell(t : T?; tr, trg : Model; tag : string; count : array<int64>; depth : int64) {
+def private count_cell(t : T?; tr, trg : Model; tag : string; count : array<int64>; depth : int64; sampled : bool = false) {
     var plain : array<int64>
     var spec : array<int64>
     var drafted = 0l
-    let served = free_run_pair(tr, trg, count, COUNT_STEPS, plain, spec, depth, drafted)
+    var parked = 0l
+    mtp_pos_reset()
+    let served = free_run_pair(tr, trg, count, COUNT_STEPS, plain, spec, depth, drafted, parked, sampled)
+    let kind = sampled ? "sampled" : "counting"
     if (served == 0l) {
         t |> skip("metal decode declined (no Metal device?)")
     } else {
-        log_gen_texts(tr, "{tag} counting k{depth}", plain, spec)
-        t |> success(drafted > 0l, "{tag} counting k{depth}: the spec rail engaged ({drafted} drafts) - a plain fallback would pass vacuously")
-        t |> success(same(plain, spec), "{tag} counting k{depth}: speculative free-run == plain free-run ({COUNT_STEPS} tokens)")
+        log_gen_texts(tr, "{tag} {kind} k{depth}", plain, spec)
+        t |> success(drafted > 0l, "{tag} {kind} k{depth}: the spec rail engaged ({drafted} drafts) - a plain fallback would pass vacuously")
+        let positions = mtp_pos_report()
+        t |> success(find(positions, "p{depth} ") >= 0, "{tag} {kind} k{depth}: a round drafted position {depth} - the depth the arm names was reached ({positions})")
+        t |> success(same(plain, spec), "{tag} {kind} k{depth}: speculative free-run == plain free-run ({COUNT_STEPS} tokens)")
+        t |> success(sampled == (parked > 0l), "{tag} {kind} k{depth}: the sampled walk parks the next draw ({parked} rounds); the argmax walk parks none")
     }
     delete plain
     delete spec
@@ -315,12 +334,12 @@ def private compare_row(plain, store : array<float>; soff, n : int64; var st : R
     }
 }
 
-// The batch-rail verify (eval_verify_batch_: ONE session at nr consecutive positions through the
+// The batch-rail verify (verify_batch_step: ONE session at nr consecutive positions through the
 // batch driver's same-slab mode) against the plain GPU step, forced-feed: A plain-steps the
 // reference tokens (recording every step's logits); B verifies the same nr tokens per round and
 // each row's logits are compared to A's step at that position. Any model, head or not - this is
 // the verify the gemma drafter rides.
-def private vff_pair(tr, trg : Model; prompt : array<int64>; nrounds, nr : int64; var st : RowStats; var served : int64&; verbose : bool) {
+def private vff_pair(tr, trg : Model; prompt : array<int64>; nrounds, nr : int64; var st : RowStats; var served : int64&; verbose : bool) {   // nolint:LINT012,LINT019 — the body is the das_metal half
     static_if (typeinfo builtin_module_exists(das_metal)) {
         let c = tr.config
         let vocab = c.vocab_size
@@ -361,7 +380,7 @@ def private vff_pair(tr, trg : Model; prompt : array<int64>; nrounds, nr : int64
                     tok = greedy_top(sa.logits, vocab)
                 }
                 // B: the same nr tokens as one same-slab verify; row i is the step on toks[i]
-                if (!eval_verify_batch_(trg, ws, sb, toks, pos, nr)) {
+                if (!verify_batch_step(trg, ws, sb, toks, pos, nr)) {
                     break
                 }
                 sb.n_past = pos + nr
@@ -400,7 +419,7 @@ def private vff_pair(tr, trg : Model; prompt : array<int64>; nrounds, nr : int64
 
 // the same twin, DISTINCT sessions: GPU single step vs GPU batch step on identical tokens - the
 // batch rail's own parity on this model, so a same-slab failure can be told from a rail failure
-def private dff_pair(tr, trg : Model; prompts : array<array<int64>>; nsteps : int64; var st : RowStats; var served : int64&; verbose : bool) {
+def private dff_pair(tr, trg : Model; prompts : array<array<int64>>; nsteps : int64; var st : RowStats; var served : int64&; verbose : bool) {   // nolint:LINT012,LINT019 — the body is the das_metal half
     static_if (typeinfo builtin_module_exists(das_metal)) {
         let c = trg.config
         let vocab = c.vocab_size
@@ -505,12 +524,20 @@ def private vff_cell(t : T?; tr, trg : Model; tag : string; prompt : array<int64
                      expect_decline : string = "") {
     var st = RowStats()
     var served = 0l
-    let declines_before <- metal_batch_decode_declines()
+    var before = 0l   // nolint:LINT003,LINT019 — counted in the das_metal half
+    static_if (typeinfo builtin_module_exists(das_metal)) {
+        if (expect_decline != "") {
+            let declines_before <- metal_batch_decode_declines()
+            before = declines_before?[expect_decline] ?? 0l
+        }
+    }
     vff_pair(tr, trg, prompt, 12l, nr, st, served, false)
     if (expect_decline != "") {
-        let declines_after <- metal_batch_decode_declines()
-        let before = declines_before?[expect_decline] ?? 0l
-        let after = declines_after?[expect_decline] ?? 0l
+        var after = 0l   // nolint:LINT003,LINT019 — counted in the das_metal half
+        static_if (typeinfo builtin_module_exists(das_metal)) {
+            let declines_after <- metal_batch_decode_declines()
+            after = declines_after?[expect_decline] ?? 0l
+        }
         t |> success(served == 0l && after > before,
             "{tag}: the metal batch rail declines this graph as {expect_decline} ({before} -> {after}, served {served})")
     } elif (served == 0l) {
@@ -526,13 +553,39 @@ def private vff_cell(t : T?; tr, trg : Model; tag : string; prompt : array<int64
     }
 }
 
+//! the wider nine-row bar's control: the same nine-row verify with the GEMV stage knocked out must
+//! land OUTSIDE the bar - a bar nothing exceeds is not known to discriminate
+def private vff_control_cell(t : T?; tr, trg : Model; tag : string; prompt : array<int64>; bar : float) {   // nolint:LINT012,LINT019 — the body is the das_metal half
+    static_if (typeinfo builtin_module_exists(das_metal)) {
+        var st = RowStats()
+        var served = 0l
+        set_metal_decode_skip("gemv")
+        vff_pair(tr, trg, prompt, 4l, 9l, st, served, false)
+        set_metal_decode_skip("")
+        if (served == 0l) {
+            t |> skip("{tag} vff9 control: the metal batch rail declined the same-slab verify")
+        } else {
+            t |> success(st.max_abs > bar, "{tag} vff9 control: the nine-row verify with its GEMV stage knocked out reds the {bar} bar (maxd {st.max_abs} over {st.rows} rows)")
+        }
+    }
+}
+
+// the nine-row arm: the kq carriers take the wider mul_mm bar, and a bar wider than the file's
+// standing one ships its control in the same arm
+def private vff9_cell(t : T?; tr, trg : Model; tag : string; prompt : array<int64>; tol : float; must_serve : bool; expect_decline : string) {
+    vff_cell(t, tr, trg, tag, prompt, trg.kquant_native ? max(tol, MM_TOL) : tol, 9l, must_serve, expect_decline)
+    if (trg.kquant_native && empty(expect_decline)) {
+        vff_control_cell(t, tr, trg, tag, prompt, MM_TOL)
+    }
+}
+
 def private restore_knobs(prior_backend : string; prior_wscale : bool) {
     clear_kernel_backend_pin()
     select_kernel_backend(prior_backend)
     set_wscale_f16(prior_wscale)
 }
 
-def private run_fixture(t : T?; file, tag : string) {
+def private run_fixture(t : T?; file, tag : string) {   // nolint:LINT012,LINT019 — the body is the das_metal half
     static_if (typeinfo builtin_module_exists(das_metal)) {
         let path = path_join(models_dir(), file)
         if (!model_available(t, path)) {
@@ -581,7 +634,7 @@ def private run_fixture(t : T?; file, tag : string) {
 }
 
 // the fixture's arms, one gate each
-def private run_arms(t : T?; tr, trg : Model; tag : string; prose_a, prose_b, count : array<int64>) {
+def private run_arms(t : T?; tr, trg : Model; tag : string; prose_a, prose_b, count : array<int64>) {   // nolint:LINT012,LINT019 — the body is the das_metal half
     static_if (typeinfo builtin_module_exists(das_metal)) {
         // control: plain vs plain on the GPU, the SAME feeds - the harness must read exactly zero
         if (arm_on(t, "mtp-ctrl-{tag}")) {
@@ -618,6 +671,17 @@ def private run_arms(t : T?; tr, trg : Model; tag : string; prose_a, prose_b, co
             count_cell(t, tr, trg, tag, count, 2l)
             count_cell(t, tr, trg, tag, count, 4l)
         }
+
+        // the deepest round: depth 8 verifies MTP_MAX_ROWS rows, one past the eight-row GEMV rail
+        if (arm_on(t, "mtp-count8-{tag}")) {
+            count_cell(t, tr, trg, tag, count, 8l)
+        }
+
+        // the sampled walk: every verify row drawn through the session's sampler, seeded - free-run == plain sampled free-run
+        if (arm_on(t, "mtp-sampled-{tag}")) {
+            count_cell(t, tr, trg, tag, count, 1l, true)
+            count_cell(t, tr, trg, tag, count, 2l, true)
+        }
     }
 }
 
@@ -642,8 +706,8 @@ def test_metal_mtp_parity_35b(t : T?) {
     }
 }
 
-// The split-head carrier: ggml-org ships Qwen3.8-27B's NextN head as its own file (the trunk is
-// converted --no-mtp), and the served pair here is the Q4_K_M trunk with the Q8_0 head - a
+// The split-head carrier: Qwen3.8-27B's NextN head ships as its own file (the trunk is converted
+// without it), and the served pair here is the Q4_K_M trunk with the Q8_0 head - a
 // mixed-quant pair the mtp-<trunk basename> adjacency cannot name, so the fixture sets the
 // override knob (restored on exit) and the head rides the load as the last shard.
 [test]
@@ -660,10 +724,10 @@ def test_metal_mtp_parity_qwen38_split_head(t : T?) {
     }
 }
 
-// A head-less fixture: only the batch-rail verify arm runs (the model has no draft head yet - the
-// gemma assistant drafter lands in S3). gemma4's router amplifies any float-class difference to
-// ~2.5 logits/step (the support-matrix row's finding), so its bar is the row's, not the 0.5 one.
-def private run_verify_fixture(t : T?; file, tag : string; tol : float; must_serve : bool = false; expect_decline : string = "") {
+// A head-less fixture: only the batch-rail verify arm runs. gemma4's router amplifies any
+// float-class difference to ~2.5 logits/step (the support-matrix row's finding), so its bar is
+// the row's, not the 0.5 one.
+def private run_verify_fixture(t : T?; file, tag : string; tol : float; must_serve : bool = false; expect_decline : string = "") {   // nolint:LINT012,LINT019 — the body is the das_metal half
     static_if (typeinfo builtin_module_exists(das_metal)) {
         let path = path_join(models_dir(), file)
         if (!model_available(t, path)) {
@@ -700,6 +764,9 @@ def private run_verify_fixture(t : T?; file, tag : string; tol : float; must_ser
         if (arm_on(t, "mtp-vff5-{tag}")) {   // five rows: the batch driver's GEMM rail (mp 32) under the same-slab verify
             vff_cell(t, tr, trg, tag, prose_a, tol, 5l, must_serve, expect_decline)
         }
+        if (arm_on(t, "mtp-vff9-{tag}")) {   // nine rows = MTP_MAX_ROWS: the batch driver's mul_mm rail (kq planes stage x to half)
+            vff9_cell(t, tr, trg, tag, prose_a, tol, must_serve, expect_decline)
+        }
         // the assistant drafter's round (gemma-4 targets with an mtp-* sidecar beside them): counting
         // free-run, speculative == plain at depth 1, 2 and 4
         if (arm_on(t, "mtp-count-{tag}")) {
@@ -711,12 +778,15 @@ def private run_verify_fixture(t : T?; file, tag : string; tol : float; must_ser
             } else {
                 var count <- encode(tr, counting_prompt(1, 40), true, false)
                 set_gemma_trace(arm_on(t, "mtp-count-trace"))
-                set_gemma_draft_on_cpu(arm_on(t, "mtp-count-cpu"))   // bring-up bisect: the CPU oracle drafts
-                set_gemma_carry_pre_norm(arm_on(t, "mtp-count-pre"))   // the memo's open question: pre-norm residual as the drafter's h
+                set_gemma_draft_on_cpu(arm_on(t, "mtp-count-cpu"))
+                set_gemma_carry_pre_norm(arm_on(t, "mtp-count-pre"))
                 for (depth in [1l, 2l, 4l]) {
                     count_cell(t, tr, trg, tag, count, depth)
                     let st = gemma_drafter_stats()
                     to_log(LOG_INFO, "gemma drafter {tag} k{depth}: rounds={st.rounds} drafted={st.drafted} accepted={st.accepted}\n")
+                    if (depth < 4l && arm_on(t, "mtp-sampled-{tag}")) {
+                        count_cell(t, tr, trg, tag, count, depth, true)
+                    }
                 }
                 set_gemma_trace(false)
                 set_gemma_draft_on_cpu(false)

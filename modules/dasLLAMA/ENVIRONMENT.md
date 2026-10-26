@@ -21,12 +21,13 @@ Read by the inference engine itself, so these affect any program that loads a mo
 | `DASLLAMA_IMAGE_SAVE` | flag | on | Persist the prepared image beside the source; 0 builds it in memory and serves that, leaving no .dlim behind. |
 | `DASLLAMA_CPU_PREFILL` | flag | off | Allow the CPU prefill path even when a GPU prefill override is registered. |
 | `DASLLAMA_PIN_PREFILL` | text | unset | Pin prefill to one registered override by name (e.g. metal, vulkan); anything else declines before upload. |
-| `DASLLAMA_MTP_HEAD` | path | unset | Split NextN/MTP head GGUF to attach to the trunk being loaded (the ggml-org mtp-<model>.gguf form: its blk.<n_layers>.* tensors become the draft block; its copies of the trunk's tables are ignored). Default: the mtp-<trunk basename> sibling beside the trunk when present. The head rides the split-shard walk, so one prepared image carries trunk and head. |
+| `DASLLAMA_MTP_HEAD` | path | unset | Split NextN/MTP head GGUF to attach to the trunk being loaded (the split mtp-<model>.gguf form: its blk.<n_layers>.* tensors become the draft block; its copies of the trunk's tables are ignored). Default: the mtp-<trunk basename> sibling beside the trunk when present. The head rides the split-shard walk, so one prepared image carries trunk and head. |
 | `DASLLAMA_PIN_BACKEND` | text | unset | Pin the matmul backend by name, bypassing the measured auto-selection. |
 | `DASLLAMA_PIN_BATCH_BACKEND` | text | unset | Pin the batched (prefill) matmul backend independently of the decode one. |
 | `DASLLAMA_EXPERT_REUSE` | flag | off | Arm the MoE expert-reuse counter (probes and servers; benches use set_expert_reuse instead). |
 | `DASLLAMA_NOISY` | flag | off | Print engine diagnostics (tier selection, upload plan, arm/decline reasons). |
 | `DASLLAMA_CALLER_PRIO` | number | 2 (the top notch) | A/B rail for the dispatch caller's thread priority, -2..2; unset claims the top notch. |
+| `DASLLAMA_ALLOW_BARE_JOBQUE` | flag | off | Let the engine dispatch on a job queue nobody configured with setup_dasllama_jobque: a loud warning instead of the panic. A bare queue decodes ~200x slower, so only a run measuring that regime wants it. |
 | `DASLLAMA_TRUTH_REFRESH` | flag | off | Regenerate the stored parity truth files instead of comparing against them. |
 | `DASLLAMA_CONV_PROF` | flag | off | Bucket gguf -> image conversion time by kind over the weight walk; one clock pair per tensor. |
 | `DASLLAMA_ALLOW_INTERP_LOAD` | flag | off | Permit a big gguf load without -jit; the transforms run interpreted, so expect minutes per GB. |
@@ -92,7 +93,7 @@ Apple GPU backend. Absent on non-Apple builds, where setting them does nothing.
 | `DASLLAMA_METAL_SCHED` | number | 1 | Graph scheduling mode for replay; 0 keeps capture order. |
 | `DASLLAMA_METAL_DECODE_CONCURRENT` | flag | on | Concurrent encoder for the single-stream decode step, with barriers only at detected hazards. |
 | `DASLLAMA_METAL_FUSE` | flag | on | The R1 epilogue-fusion kernel (post_attn_rms + add_rms); 0 restores separate dispatches for A/B. |
-| `DASLLAMA_METAL_SPEC` | number | -1 (adaptive) | MTP speculative decode chain: 0 off, 1 forced, -1 adaptive. |
+| `DASLLAMA_METAL_SPEC` | number | -1 (adaptive) | The single-row Metal decode's greedy chain (the next step pre-encoded on the GPU's own argmax): 0 off, 1 forced, -1 adaptive (backs off after a miss). A session sampled at temp > 0 never chains, whatever the mode. |
 | `DASLLAMA_METAL_GEMV_TG` | number | 4 | Rows per MoE router/expert GEMV threadgroup, clamped 1..32 (the dense GEMV geometry is fixed). |
 | `DASLLAMA_METAL_KQ_B8` | flag | on | Single-pass B8 twin for K-quant small-batch mv at B=5..8; 0 is the A/B rail. |
 | `DASLLAMA_METAL_KV_MIRROR_MB` | number | 4096 | Ceiling in MiB for the device-side KV mirror, clamped 64..4096. |
@@ -103,7 +104,7 @@ Apple GPU backend. Absent on non-Apple builds, where setting them does nothing.
 | `DASLLAMA_METAL_PIPE_DEBUG` | flag | off | Per-step pipeline trace: GPU envelope and true inter-step handoff idle, first steps plus outliers. |
 | `DASLLAMA_METAL_DECODE_SKIP` | text | unset | Comma-separated dispatch names to skip in decode - a bring-up bisect that breaks correctness. |
 | `DASLLAMA_METAL_PREFILL_SKIP` | text | unset | Prefill twin of DASLLAMA_METAL_DECODE_SKIP. |
-| `DASLLAMA_MTP_DEBUG` | text | unset | MTP bring-up bisect: cold logs the failing gate, reject forces the reject path. |
+| `DASLLAMA_MTP_DEBUG` | text | unset | MTP bring-up bisect: cold logs the failing gate, reject forces the reject path, trace logs drafts vs truth per round. |
 | `DASLLAMA_METAL_BATCH_GEMM_MIN` | number | 5 | Batch size at which batched decode switches from GEMV to GEMM; floor 2. |
 | `DASLLAMA_METAL_BATCH_SK` | flag | on | Split-K in the batched decode GEMM. |
 | `DASLLAMA_METAL_BATCH_NCB` | number | 4 | Command buffers per batched decode step, clamped 1..16. |
@@ -131,6 +132,7 @@ Vulkan GPU backend. Present only where the dasVulkan package is installed.
 | `DASLLAMA_VK_MEMPRIO` | flag | on | Tag allocations high-priority (VK_EXT_memory_priority) so the driver demotes desktop memory, not ours. |
 | `DASLLAMA_VK_FA` | flag | on | Vulkan flash attention: the decode fa kernel pick AND the cm2 prefill fa tile; 0 falls back to the chunked/scalar paths. |
 | `DASLLAMA_VK_KV_MERGE` | flag | on | Merged k|v prefill GEMM - one dispatch over the adjacent k+v arena planes; 0 pins the split k + v dispatches for a same-build A/B. |
+| `DASLLAMA_VK_FFN_SLICE` | flag | on | The last layer's FFN runs on the window's last 32 rows only (the classifier reads one); 0 runs it over the whole window for a same-build A/B. |
 | `DASLLAMA_VK_OVERLAP` | flag | on | Prefill record/execute overlap: the window chain submits in ramped chunks (1,2,4,8 layers) so the GPU starts while the CPU still records; 0 pins the single fenced submit (the per-role GPU profile pins it too, so a chunk gap never bills to a role). |
 | `DASLLAMA_VK_GPU_EMBED` | flag | on | Device-side token-embedding gather for the resident prefill (a tied q8 table gathers from the resident cls plane; a raw f32 table uploads whole under a 512 MB cap); 0 keeps the CPU embed loop. |
 | `DASLLAMA_VK_FULLSG` | flag | off | Pin REQUIRE_FULL_SUBGROUPS on every class pipeline (instrument; measured slower than plain pipelines on the mm_a gate shape, so those are the default). |

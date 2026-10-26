@@ -30,7 +30,10 @@ stay the reviewer's. A mis-numbered arm dispatches, reads the wrong buffer, and
   the benches, and the facade chain (`dasllama_common` re-exports it) all reach it without
   weight.
 - **`dasllama_common.das`** - the engine: `Model`/`Session`/`Config`, the forward loops, the
-  override registries, the runtime knobs. **Not** the load walk (sec.1.3) and **not** GPU residency
+  override registries (the accept walk's row-sampler seam among them), the runtime knobs,
+  `SamplingParams` (the struct a `Session` points at, so a speculative round draws with its
+  caller's sampler), and the MTP per-position accept telemetry (`mtp_pos_*`) the round-override
+  registry's rounds feed. **Not** the load walk (sec.1.3) and **not** GPU residency
   (`ARCHITECTURE_GPU.md` sec.1.5) - both left, and the seam each left behind is a registered hook,
   so neither comes back.
   It remains the module's debt sink; what sits here that is family-specific or platform-specific is
@@ -55,18 +58,19 @@ stay the reviewer's. A mis-numbered arm dispatches, reads the wrong buffer, and
   implementation.
 - **`dasllama_batch.das`** - the batched decode step: one pass of the weights over B sessions,
   GEMVs widened to B-row GEMMs, attention still per-(row, head) against each session's own cache.
-- **`dasllama_mtp_gemma.das`** - the gemma-4 assistant drafter's loader (`GemmaDrafter`: the
-  sidecar's Q8_0 weights as one q8 blob + its F32 norms) and the CPU reference forward of one draft
-  step - the oracle the GPU drafter is measured against, never the serving path.
 - **`dasllama_mtp_gemma.das`** - the gemma-4 assistant drafter (`gemma4-assistant`), which is a
   SIDECAR head, not a trunk block: it owns no K/V projection and borrows the target trunk's cache
   at two capture layers, so it never rides the arch registry or `forward_mtp`. The file holds the
   sidecar resolver, the refusing loader (`GemmaDrafter`, whose `blob` is raw GGUF Q8_0 = the Metal
   34B form, so the GPU encoder uploads it with no repack), and the CPU reference forward the GPU
-  encoder is scored against. A refusal is `ok = false` plus a `why`, never a panic - a drafter is
+  encoder is scored against. That oracle carries its own Q8_0 dot and GEMV and its own attention
+  dot over decoded rows - reference arithmetic, not a tier kernel or a codec primitive, so no
+  tier specializes it. A refusal is `ok = false` plus a `why`, never a panic - a drafter is
   optional and a bad sidecar must degrade to plain decode.
-- **`dasllama_sampling.das`** - token sampling and the generation drivers. A leaf on top of
-  `forward`/`eval_batch`; the engine never calls back in.
+- **`dasllama_sampling.das`** - token sampling and the generation drivers: the sampler over
+  `dasllama_common`'s `SamplingParams`. It registers the accept walk's row sampler
+  (`register_mtp_sample_row`) at init, and that registration is the only way the engine reaches
+  this file.
 - **`dasllama_ple.das`** - gemma-4 E-series per-layer embeddings and the gemma4 MoE FFN. The
   forward sequence reaches it only through the hooks it registers at init.
 - **`dasllama_config.das`** - `DlimConfiguration`: every input that changes `.dlim` image BYTES,
@@ -156,8 +160,8 @@ breaks the cycle. That re-export is what keeps every consumer on the facade.
   through the single release path in `dasllama_common` that the carrier finalizers call - never
   an ad-hoc unmap.
 
-A split NextN/MTP head (the ggml-org `mtp-<model>.gguf` form, the trunk converted without its
-head) rides the load as the LAST shard of the trunk's shard walk: `gguf_shard_paths` appends the
+A split NextN/MTP head (the published split-head layout: an `mtp-<model>.gguf` beside a trunk
+converted without its head) rides the load as the LAST shard of the trunk's shard walk: `gguf_shard_paths` appends the
 `mtp-<trunk basename>` sibling, or the `DASLLAMA_MTP_HEAD` file, and `parse_gguf_meta_shards`
 promotes the head shard's `nextn_predict_layers` onto the meta when the trunk's KVs lack it. The
 head's `blk.<n_layers>.*` tensors are the draft block; its copies of the trunk's embedding,
@@ -184,6 +188,9 @@ trunk-only and trunk+head images never collide and one image file serves both tr
   registration. A hand-written tile that the generator could emit belongs in the generator.
 - **`dasllama_tune.das`** - the per-box loop-hint tuner (`[tuned]` / `[dasllama_grid]`). Tuning
   POLICY lives here; tuned VALUES live in the box's sidecar, never in source.
+- **`dasllama_tune_scope.das`** - the one `[tune_scope]` declaration (tuner, covered modules,
+  version pin, shipped defaults), in a module every kernel module requires: a kernel reads its
+  class entry in the defaults profile at its own compile, so the scope must be on the AST first.
 
 ### 1.6 Architecture registrations
 
@@ -227,19 +234,25 @@ file builds an `ArchDesc` (name * `configure` * the `ArchBlocks` fn-ptr quad * `
   it touches no tune state (`tune_policy(missing="fallback")`). BRINGUP.md sec.2 is the runbook.
 - **`dasllama/dasllama_exchange_schema.das`** - engine-free validation for exchange submissions
   (record stores + tune sidecars); the dasllama.io ladder service builds on it.
-- **`dasllama/dasllama_exchange.das`** - the sidecar-exchange client (a sanctioned public entry point): the boot-time
+- **`dasllama/dasllama_exchange.das`** - the sidecar-exchange client (a sanctioned public entry point,
+  and the engine's only `dashv` requirer: `performance/REVIEW.das` walks `dasllama/` for a second
+  one; a measurement harness under `harness/` talking HTTP to a reference engine's server sits
+  outside that walk by design): the boot-time
   lookup/apply (llvm_tune's scope resolver - a verified per-box match downloads instead of a
   ~12-minute tune), the privacy-stripped submit rails, and the control-page surface
-  dasllama-server serves at `/exchange`. The first-contact consent gate (GDPR) sits ahead of
-  every lookup: an explicit `exchange_*` config counts as the expressed choice, otherwise the
-  `<stem>.consent` sidecar-sibling file governs - unset asks on a real terminal, or emits
+  dasllama-server serves at `/exchange`. The exchange is closed: both policies default to
+  `off`, so no boot contacts it and no consent question is asked unless an explicit
+  `exchange_*` key opts in - the shipped class profiles cover the boxes the exchange served.
+  The first-contact consent gate (GDPR) sits ahead of every lookup once a policy is on: an
+  explicit `exchange_*` config counts as the expressed choice, otherwise the `<stem>.consent`
+  sidecar-sibling file governs - unset asks on a real terminal, or emits
   `@sidecar consent state=needed` for the watchdog dialog / control page, and no request
   leaves until a surface records "accepted".
 - **`benchmarks/asr/mem_census.sh`** - the peak-memory census (`/usr/bin/time -l` around one
   asr_bench process per cell; macOS only) - the interim footprint instrument until a footprint
   leg lands in `gen_bench_records`; its numbers live in `PERF_LEDGER.md`, never the stores.
 
-### 1.9 Serving
+### 1.9 Serving {#scheduler-step}
 
 - **`dasllama_scheduler.das`** - the continuous-batching scheduler, the serving layer over the
   facade (its one engine require is `dasllama/dasllama`). One synchronous thread: each
@@ -248,4 +261,7 @@ file builds an `ArchDesc` (name * `configure` * the `ArchBlocks` fn-ptr quad * `
   streams' KV pages to the prefix cache. Results flow out as `SchedEvent`s - no HTTP here.
   `utils/dasllama-server` owns the writers; `tutorials/dasLLAMA/13_serving.das` is the
   teaching consumer; `tests/test_scheduler.das` gates it against `generate()` references.
+  The step clears its gather arrays (`batch_rows`, `batch_toks`, `batch_idx`) before it reaps
+  finished streams: `batch_rows` holds borrowed pointers into the sessions the reap deletes,
+  and a validating heap collect between steps walks every pointer the array still holds.
 

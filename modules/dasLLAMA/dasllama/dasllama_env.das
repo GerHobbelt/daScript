@@ -43,7 +43,7 @@ struct public EngineEnv {
     pin_prefill : string = ""
 
     @clarg_path
-    @clarg_doc = "Split NextN/MTP head GGUF to attach to the trunk being loaded (the ggml-org mtp-<model>.gguf form: its blk.<n_layers>.* tensors become the draft block; its copies of the trunk's tables are ignored). Default: the mtp-<trunk basename> sibling beside the trunk when present. The head rides the split-shard walk, so one prepared image carries trunk and head."
+    @clarg_doc = "Split NextN/MTP head GGUF to attach to the trunk being loaded (the split mtp-<model>.gguf form: its blk.<n_layers>.* tensors become the draft block; its copies of the trunk's tables are ignored). Default: the mtp-<trunk basename> sibling beside the trunk when present. The head rides the split-shard walk, so one prepared image carries trunk and head."
     mtp_head : string = ""
 
     @clarg_doc = "Pin the matmul backend by name, bypassing the measured auto-selection."
@@ -61,6 +61,9 @@ struct public EngineEnv {
     @clarg_default_doc = "2 (the top notch)"
     @clarg_doc = "A/B rail for the dispatch caller's thread priority, -2..2; unset claims the top notch."
     caller_prio : int = 2
+
+    @clarg_doc = "Let the engine dispatch on a job queue nobody configured with setup_dasllama_jobque: a loud warning instead of the panic. A bare queue decodes ~200x slower, so only a run measuring that regime wants it."
+    allow_bare_jobque : bool = false
 
     @clarg_doc = "Regenerate the stored parity truth files instead of comparing against them."
     truth_refresh : bool = false
@@ -248,7 +251,7 @@ struct public MetalEnv {
     fuse : bool = true
 
     @clarg_default_doc = "-1 (adaptive)"
-    @clarg_doc = "MTP speculative decode chain: 0 off, 1 forced, -1 adaptive."
+    @clarg_doc = "The single-row Metal decode's greedy chain (the next step pre-encoded on the GPU's own argmax): 0 off, 1 forced, -1 adaptive (backs off after a miss). A session sampled at temp > 0 never chains, whatever the mode."
     spec : Option<int>
 
     @clarg_doc = "Rows per MoE router/expert GEMV threadgroup, clamped 1..32 (the dense GEMV geometry is fixed)."
@@ -282,7 +285,7 @@ struct public MetalEnv {
     prefill_skip : string = ""
 
     @clarg_env = "DASLLAMA_MTP_DEBUG"
-    @clarg_doc = "MTP bring-up bisect: cold logs the failing gate, reject forces the reject path."
+    @clarg_doc = "MTP bring-up bisect: cold logs the failing gate, reject forces the reject path, trace logs drafts vs truth per round."
     mtp_debug : string = ""
 
     @clarg_doc = "Batch size at which batched decode switches from GEMV to GEMM; floor 2."
@@ -351,6 +354,9 @@ struct public VulkanEnv {
 
     @clarg_doc = "Merged k|v prefill GEMM - one dispatch over the adjacent k+v arena planes; 0 pins the split k + v dispatches for a same-build A/B."
     vk_kv_merge : bool = true
+
+    @clarg_doc = "The last layer's FFN runs on the window's last 32 rows only (the classifier reads one); 0 runs it over the whole window for a same-build A/B."
+    vk_ffn_slice : bool = true
 
     @clarg_doc = "Prefill record/execute overlap: the window chain submits in ramped chunks (1,2,4,8 layers) so the GPU starts while the CPU still records; 0 pins the single fenced submit (the per-role GPU profile pins it too, so a chunk gap never bills to a role)."
     vk_overlap : bool = true

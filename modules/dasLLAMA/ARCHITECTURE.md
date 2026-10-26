@@ -27,6 +27,8 @@ When placement charters disagree on one function, the sec.1 charter line decides
   arch-registration, support and serving charters.
 - `ARCHITECTURE_GPU.md` - sec.1.5: the GPU backend role table and the backend asymmetries.
 - `ARCHITECTURE_MEDIA.md` - sec.1.7, 1.7b: the encoder-tower, audio, ASR and vision charters.
+- `ARCHITECTURE_TTS.md` - sec.1.7c: the text-to-speech charters - the front end, the block home,
+  the shared assembly, the families and the facade.
 
 Every file under `dasllama/` appears in a companion. Two carry generated CONTENT rather
 than being generated themselves: `dasllama_env.das` holds the `[EnvConfig]` knob declarations
@@ -36,21 +38,23 @@ re-transcoding `$LCPP/src/unicode-data.cpp`).
 
 ## 2. Mechanisms
 
-- `ARCHITECTURE_IMAGE.md` - sec.2.1-2.1i: the prepared-image rail, the baked dev-W f16 plane,
-  and the baked tower twin-W plane.
-- `ARCHITECTURE_GPU.md` - sec.2.2b, 2.2w-2.2z: the tensor-GEMM and fused-attention shapes that
-  measured out, the tower attention routes, the tower driver's encode chains, and the iquant
-  GEMV grid read with its f4-slab twin.
+- `ARCHITECTURE_IMAGE.md` - sec.2.1-2.1m: the prepared-image rail, the baked dev-W f16 plane,
+  the baked tower twin-W plane, the layout stamp `REVIEW.das` keeps over the byte-placing code,
+  and the meta-field tripwire every struct serializer opens with.
+- `ARCHITECTURE_GPU.md` - sec.2.2b, 2.2w-2.2x: the tensor-GEMM and fused-attention shapes that
+  measured out, the tower attention routes, and the tower driver's encode chains.
+- `ARCHITECTURE_GPU_QUANT_PLANES.md` - sec.2.2y-2.2z: the Metal kq split scale plane, and the
+  iquant GEMV grid read with its f4-slab twin.
 - `ARCHITECTURE_GPU_PREFILL.md` - sec.2.2c-2.2i, 2.2u-2.2v, 2.2aa: the Metal prefill driver's
   GEMM form ladder, dev-W knee map, attention slab, MoE bucket rail, chunked submission, the
   f16 twin dual-store, the last-layer FFN tail, and the dense-KQ tensor mul_mm scaffold.
 - `ARCHITECTURE_GPU_VULKAN.md` - sec.2.2j-2.2q: the Vulkan resident driver - the prefill window
   chain, the cm2 decode lanes and tile pick, the class-pipeline build seat, the residency plan,
   the GPU-slot marks swap, the Q8 requant byte store, and the MoE expert chain on the cm2 tiles.
-- `ARCHITECTURE_GPU_VULKAN_DECODE.md` - sec.2.2r-2.2t: the per-op tier's decode era - the decode
-  attention block over per-layer K/V mirrors, the streamed expert layer's GPU/CPU split, and the
-  whole-token decode span.
-- `ARCHITECTURE_GPU_MTP.md` - sec.2.28-2.30: the Metal speculative round over the batch driver's
+- `ARCHITECTURE_GPU_VULKAN_DECODE.md` - sec.2.2r-2.2u: the per-op tier's decode era - the decode
+  attention block over per-layer K/V mirrors, the streamed expert layer's GPU/CPU split, the
+  whole-token decode span, and the deltanet decode step's per-session resident state.
+- `ARCHITECTURE_GPU_MTP.md` - sec.2.28-2.39: the Metal speculative round over the batch driver's
   same-slab verify, the box knob that sets the depth a round drafts, and the kernel
   argument-alignment contract enforced at every dispatch.
 - `ARCHITECTURE_RUNTIME.md` - sec.2.2, 2.3, 2.3a, 2.4, 2.6-2.9, 2.11, 2.12, 2.18-2.19: kernel
@@ -58,11 +62,15 @@ re-transcoding `$LCPP/src/unicode-data.cpp`).
   MoE region split.
 - `ARCHITECTURE_MEDIA.md` - sec.2.13-2.16: the padded tower GEMM widths, the family GPU hooks,
   the tower weight lane, and the plain-Model ASR decoders.
-- `ARCHITECTURE_MEASUREMENT.md` - sec.2.5, 2.10, 2.20, 2.21, 2.26-2.27: the benchmark rig, the tune
-  gate, the sanctioned instrumentation rails, kernel-race fidelity, the gemv's own tune seat, and
-  the CPU kernel bench's fixture conditions.
+- `ARCHITECTURE_MEASUREMENT.md` - sec.2.5, 2.10, 2.20, 2.21, 2.26-2.28, 2.40-2.41: the benchmark
+  rig, the tune gate, the sanctioned instrumentation rails, kernel-race fidelity, the gemv's own
+  tune seat, the CPU kernel bench's fixture conditions, the speculative round's ruler record, the
+  `[tuned]` perm precedence, and the mint wall in the sidecar's provenance.
 - `ARCHITECTURE_CPU_KERNELS.md` - sec.2.22-2.24: the sub-block-packed k3/k6 planes, the grid
   formats' panel and row-group decodes, and the VBMI symbol lattice.
+- `ARCHITECTURE_TTS.md` - sec.2.28-2.35: the TTS block home's two layouts, tap stacking, the
+  padded concat width, the per-synthesis carrier, the served carrier on the image rail, the
+  sine source's operation order, the heteronym context, and the rig's scoring.
 
 ## 3. Inherited invariants
 

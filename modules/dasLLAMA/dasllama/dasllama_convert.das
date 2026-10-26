@@ -12,6 +12,7 @@ require dasllama/dasllama_par        // maybe_parallel_for (+ its emitted dispat
 require dasllama/dasllama_math       // get_dispatch_lanes — the requant wrappers shape their fan-out
 require dasllama/dasllama_kqformat public   // KqFmt + the plane stride truth (K4_QSB et al.) — re-exported down the gguf chain
 require dasllama/dasllama_tune       // [tuned]: the f16 row converts carry per-box loop hints
+require dasllama/dasllama_tune_scope  // nolint:STYLE030 — the dasllama [tune_scope] must be on the AST before this module's [tuned] kernels pick their perms
 
 // Tensor format conversion, platform-neutral: the pure codec layer — LE byte readers, K-quant
 // superblock dequants (+ pointer twins), superblock->plane transcodes, plane dequants, the
@@ -564,8 +565,8 @@ def dequant_k6_plane_superblock(kq : array<uint8> | #; kqo : int64; ks : array<u
 //! One superblock of a kq plane pair dequantized into `dst[doff..]`, reading the scale plane in
 //! whichever form the carrier holds: the CPU row form, or on a Metal-blob model the split GPU
 //! form (16B strips first, d tails after; k4/k5 strips compacted, q40/iq4nl unsplit). `sb` = superblock index.
-[arch(at = "../ARCHITECTURE_GPU.md#metal-kq-split-scale-plane")]
-def dequant_kq_plane_sb(fmt : KqFmt; kq : array<uint8> | #; ks : array<uint8> | #; sb : int64; metal_blob : bool; var dst : array<float> | #; doff : int64) { // nolint:STYLE037,STYLE038 — one arm per format, two carrier forms
+[arch(at = "../ARCHITECTURE_GPU_QUANT_PLANES.md#metal-kq-split-scale-plane")]
+def dequant_kq_plane_sb(fmt : KqFmt; kq : array<uint8> | #; ks : array<uint8> | #; sb : int64; metal_blob : bool; var dst : array<float> | #; doff : int64) { // nolint:STYLE037 — one arm per format, two carrier forms
     if (fmt == KqFmt.k4) {
         dequant_k4_plane_superblock(kq, sb * K4_QSB, ks, sb * (metal_blob ? 16l : K4_SSB), dst, doff)
     } elif (fmt == KqFmt.k5) {

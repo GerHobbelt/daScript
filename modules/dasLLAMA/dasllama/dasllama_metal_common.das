@@ -476,6 +476,11 @@ def public set_metal_decode_speculate(v : int) {
     g_spec_backoff = 1
 }
 
+//! The chaining rail's current mode (-1 adaptive, 0 off, 1 forced) - a test captures it to restore.
+def public metal_decode_spec_mode() : int {
+    return g_spec_mode
+}
+
 //! (speculative steps verified correct, mispredicted-and-rerun) since load.
 def public metal_decode_spec_stats() : tuple<hits : int64; misses : int64> {
     return (hits = g_spec_hits, misses = g_spec_misses)
@@ -495,11 +500,28 @@ def spec_armed() : bool {
     return true
 }
 
+// the stages the single-row and batch decode drivers honor as a knockout (g_skip != "<stage>")
+let DECODE_SKIP_STAGES <- ["gemv", "attn", "ew", "moe_rt", "moe_sh", "qkv", "wo"]
+
+def decode_skip_known(v : string) : bool {
+    for (s in DECODE_SKIP_STAGES) {
+        if (s == v) {
+            return true
+        }
+    }
+    return false
+}
+
 //! The knockout rail as an in-process setter (timing attribution — served output is GARBAGE while
-//! non-empty): `"gemv"` | `"attn"` | `"ew"`; `""` restores full math. Same rail as
-//! `DASLLAMA_METAL_DECODE_SKIP`, switchable between measurement windows.
+//! non-empty; `""` restores full math). Same rail as `DASLLAMA_METAL_DECODE_SKIP`.
 def public set_metal_decode_skip(v : string) {
+    if (!empty(v) && !decode_skip_known(v)) {
+        panic("dasLLAMA: unknown metal decode knockout '{v}' - the drivers read gemv, attn, ew, moe_rt, moe_sh, qkv, wo")
+    }
     g_skip = v
+    if (!empty(v)) {
+        to_log(LOG_INFO, "dasLLAMA: metal decode knockout armed - set_metal_decode_skip(\"{v}\"): the single-row and batch drivers skip that stage, so served output is not a model's\n")
+    }
 }
 
 //! Zero the cumulative per-stage timers + the served-step counter — windows a chase run's stage
@@ -928,7 +950,7 @@ def kq_quants_of(dev : MetalDevice?; t : Model; fmt : KqFmt; off : int64) : tupl
 //! One kq tensor's GPU-form scale bind (the gemv lab's layouts, pre-baked by the blob
 //! transform): k4/k5 = 16B compact blocks at soff; k6 = the split plane — sub-scale strips at
 //! soff, the packed f16 d plane at doff (the kernels bind the buffer twice, once per offset).
-[arch(at = "../ARCHITECTURE_GPU.md#metal-kq-split-scale-plane")]
+[arch(at = "../ARCHITECTURE_GPU_QUANT_PLANES.md#metal-kq-split-scale-plane")]
 def kq_scales_of(dev : MetalDevice?; t : Model; fmt : KqFmt; off : int64) : tuple<buf : MetalBuffer?; soff : uint64; doff : uint64> {
     assert(t.metal_blob)
     let sb0 = off / 256l
@@ -1875,14 +1897,28 @@ var @scratch g_lp_cbs : array<MetalCommandBuffer?>   // per-step cb stash; relea
 var @scratch g_lp_pooled : array<tuple<buf : MetalBuffer?; size : uint64>>   // pending-step stash; clear()-recycled per finish
 var @scratch g_lp_upooled : array<tuple<buf : MetalBuffer?; size : uint64>>
 var g_lp_blog : MetalBuffer?
-var g_lp_sameslab = false       // same-slab verify: land every row's logits + hidden on sessions[0]
-var g_lp_bxf : MetalBuffer?     // ... the rows' post-final-norm hidden (nrows x dim)
+var g_lp_sameslab = false
+var g_lp_bxf : MetalBuffer?     // the rows' post-final-norm hidden (nrows x dim)
 var g_lp_bxf_bytes = 0l
-var g_lp_bvarg : MetalBuffer?   // same-slab verify: the rows' GPU argmax (uint per row), landed into g_sameslab_arg
+var g_lp_bvarg : MetalBuffer?   // the rows' GPU argmax (uint per row), landed into g_sameslab_arg
 var @scratch g_sameslab_arg : array<int64>
 
 //! The same-slab verify's per-row argmax as the join landed it (row i = the truth for draft i+1).
 def sameslab_argmax(i : int64) : int64 => g_sameslab_arg[i]
+
+//! argmax of row `row` in a [rows x n] logits image; the lowest index wins a tie (the CPU sampler's rule)
+def argmax_row(v : array<float>; row, n : int64) : int64 {
+    let off = row * n
+    var best = 0l
+    var bv = v[off]
+    for (i in range64(1l, n)) {
+        if (v[off + i] > bv) {
+            bv = v[off + i]
+            best = i
+        }
+    }
+    return best
+}
 var g_lp_xb : MetalBuffer?      // production sync + CPU-classifier path: x_b writeback
 var g_lp_xb_dst : void?         // ... into the caller's workspace (borrowed, sync-only)
 var g_lp_xb_bytes = 0l
@@ -1905,15 +1941,13 @@ var g_lp_prev_gpu_end = 0.0lf   // last finished step's gpu_end — the handoff 
 
 // wait + read back + release the pending step; x_b writes back only on the sync CPU-classifier
 // path (pipe mode skips it — stale). A dispatch error sets g_lp_err (sync reruns on CPU; a pipelined step is lost).
-// same-slab landing: every row's logits (row 0 also into mtp_logits) + the post-norm hidden rows onto the ONE session
+[arch(at="../ARCHITECTURE_GPU_MTP.md#batch-same-slab")]
 def private land_sameslab_rows(lgp : uint8?) {
     var s0 = g_lp_sessions[0]
     let vb = g_lp_vocab * 4l
     unsafe {
         if (lgp != null) {
-            if (long_length(s0.mtp_logits_b) < g_lp_nrows * g_lp_vocab) {
-                s0.mtp_logits_b |> resize(g_lp_nrows * g_lp_vocab)
-            }
+            s0.mtp_logits_b |> ensure_length(g_lp_nrows * g_lp_vocab)
             memcpy(addr < void? >(s0.mtp_logits_b[0]), reinterpret<void?>(lgp), g_lp_nrows * vb)
             if (long_length(s0.mtp_logits) >= g_lp_vocab) {   // sized only on NextN-headed sessions
                 memcpy(addr < void? >(s0.mtp_logits[0]), reinterpret<void?>(lgp), vb)
@@ -2386,6 +2420,7 @@ def race_envelope_ok(ba, bb : MetalBuffer?; count : int; var note : string&) : b
         note = "twin OUTPUT MISMATCH maxdiff={maxdiff} maxref={maxref}"
         return false
     }
+    note = "twin within envelope: maxdiff={maxdiff} <= 5% of maxref={maxref}"
     return true
 }
 

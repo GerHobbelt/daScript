@@ -29,8 +29,9 @@ image-chat cells bake what they need mid-cell, like their publishing legs. A sec
 harness would produce numbers that cannot be compared to any of this.
 
 **The tune stamp gates the comparison.** A manifest older than the binary fails every cell, and
-an untuned invocation re-execs into a full retune rather than measuring - so re-mint the box
-manifest and check its winners against the stored rows' `tune` stamps before trusting a delta.
+an untuned invocation stamps the shipped class profile (a box the profile does not cover
+re-execs into the residue race) rather than measuring - so re-mint the box manifest and check
+its winners against the stored rows' `tune` stamps before trusting a delta.
 
 **The Vulkan GEMM probe attributes prefill GEMM cost on three axes.**
 `harness/vk_gemm_probe.das` times one shape at a time: the serving GEMM against its alternates
@@ -66,15 +67,17 @@ the tensor mul_mm twins on) are properties of the box, not of the binary. The en
 `apply_box_profile_runtime()` therefore takes the checked route: `stale_binary` applies the
 runtime section and says so; `foreign_box` and `unreadable` apply nothing, because those knobs
 are the minting box's state; `absent` is an unminted box. Without the crowns the twins run their
-base forms - gemma-26B pp512 on an M5 reads 1662 against 3835 tok/s - so `metal_decode_init`
+base forms - a prefill reads well under half its board cell - so `metal_decode_init`
 warns when a profile was asked for, declined, and no crowns are set, and `lcpp_bench` stamps a
 cell that passed `tune_gate()` on `DASLLAMA_ALLOW_UNTUNED=1` with an `untuned:` flavor prefix.
 
-**The retune re-exec bites scaffolding, and the pin for it is checked in.** Any bare `daslang`
-run that requires the engine - a probe, a one-off script, a REPL experiment - re-execs into a
-full retune when no manifest is armed. `performance/last_known_good_sidecar.json` exists for
-exactly that: a frozen copy of a complete, noise-gated mint, tracked in git (the `*.tune.json`
-ignore rule deliberately does not match it). Point `DAS_TUNE_MANIFEST` at it and the framework
+**The retune re-exec bites scaffolding on a box its class profile does not cover, and the pin
+for it is checked in.** A bare `daslang` run that requires the engine - a probe, a one-off
+script, a REPL experiment - stamps the shipped class profile at compile time and runs; on a box
+the profile does not cover it re-execs into the residue race when no manifest is armed, and on
+either box it serves no runtime section (no Metal crowns - no profile ships those).
+`performance/last_known_good_sidecar.json` exists for exactly that: a frozen copy of a complete,
+noise-gated mint, tracked in git (the `*.tune.json` ignore rule deliberately does not match it). Point `DAS_TUNE_MANIFEST` at it and the framework
 never retunes; on a different box the identity mismatch just serves fallbacks, and a copy minted
 before the current `DASLLAMA_RELEASE` serves fallbacks on any box - the compile says which with
 one `WARNING DAS_TUNE_MANIFEST` line per scope. That is the whole
@@ -118,7 +121,11 @@ a report leg, never the served path). A new clock read paired with a print of th
 interval bypasses the aggregation - it measures one call site once, is not filterable, and rots
 where a rail entry would keep serving. Where a timed line IS the deliverable - `benchmarks/`,
 `performance/`, `harness/`, and cold one-shot load/mint progress logs (image bake/map, load
-stages, tokenizer build) - the rails do not apply. A clock whose value feeds logic is control
+stages, tokenizer build) - the rails do not apply. A timing that is part of an API's answer -
+the facade's `TtsTimings`, the per-stage walls a synthesis returns to its caller and the
+server logs per request - is a deliverable of the same kind, not instrumentation, and the
+one-rail follow-up (`followup_general.md` row 72) keeps it that way while it retires the
+duplicate rails. A clock whose value feeds logic is control
 flow, not instrumentation; it is marked `// clock: control` so the sweep and any future lint
 leave it alone.
 
@@ -154,6 +161,10 @@ them crowns confidently and wrongly:
   timed encoder hold the clock there. A sparse invocation without the burn reads idle-clock
   times and can flip a verdict outright.
 - **A real site shape.** `REVIEW_GPU.md` binds this one.
+
+A race arm owns a transient command queue for its timed pairs and releases it before returning -
+the one exception to the family's shared device and queue (`ARCHITECTURE_GPU.md` sec.1.5) - so
+the tune-time race never queues behind served work.
 
 Even a race meeting all three can be structurally blind. `kq_gemv_iq2xxs_f4` is the standing
 case: every isolated regime crowns the twin and the served decode graph loses 8.6% with it,
@@ -205,3 +216,38 @@ flavors: f32 group scales (the engine's own quantization) and `q8s16` over binar
 wscale_f16 rail a GGUF q8_0 tensor runs, and the like-for-like row against the reference's q8_0.
 Provenance for every figure in this section: `benchmarks/matmul/kq_kernel_bench.das` under
 `DAS_TUNE_MODE=tune`, one thread, its default `--fmt` / `-n` / `-d` shape.
+
+### 2.28 The speculative round's cell is a ruler record {#ruler-records}
+
+**`performance/records/mtp/mtp_<box>_<model>[_variant].json` is a ruler record: one file per box
+and model, written only by `harness/mtp_ruler.das`.** The board (`records/<box>.json`) has no
+speculative column, because a speculative rate is not one engine's number: acceptance is a property
+of the text and of the drafter both engines share, so the honest cell is the two engines on the
+identical rendered prompt in one run. The ruler measures our released exe FIRST from a parent that
+has loaded nothing (a parent that had just run the engine in-process read the exe's speculative arm
+a fifth low), then the reference server at the ref pin, every arm settled, and writes `meta` (date,
+box, `das_sha`, `das_exe`, `lcpp_server`, `lcpp_version`, the model and head with their shas, the
+corpus, `ngen`, `reps`, `depths`) plus one row per engine, depth and prompt. The shape is the ruler's,
+not the board's - `list_record_stores` and the records gate read `records/` one level deep and never
+see the folder - and `mtp_ruler --render <record>` prints the table. A third-party wall lives here
+only as the other half of a pair taken in the same run.
+
+### 2.40 A `[tuned]` kernel's perm is decided at its own compile {#tuned-perm-precedence}
+
+`dasllama_tune.das` picks one perm per `[tuned]` kernel, first match wins: the `reference` tune
+policy (the kill switch - the template's own loops, no hints stamped), a `perm=` pin on the
+annotation, this box's sidecar `"kernels"` entry, this box's class entry in the shipped defaults
+profile (`performance/defaults`), the annotation's `fallback` `;`-chain, then `DEFAULT_PERM`.
+`tune_kernel_pick` (llvm_tune) reads the sidecar and the profile in that order and hands back the
+FILE its answer came from, so a verbose compile names which of the two stamped each kernel. A box
+the shipped profile covers therefore compiles tuned kernels without racing anything, and a box it
+does not cover falls to the fallback chain - never to another box's winners.
+
+### 2.41 The mint's own wall rides in the sidecar's provenance {#mint-wall-provenance}
+
+A successful mint stamps three provenance keys into the sidecar before the archive copy is
+written: `mint_gen_ms` (the generator half), `mint_kernels_ms` (the loop-hint half) and
+`mint_total_ms` (the wrapper's own wall). The order is what makes the timestamped copy in the
+box's tune-history directory carry them too, so the box's longitudinal record answers what
+shipping a profile cost without re-running the mint - a console line that scrolled past is not
+that record.

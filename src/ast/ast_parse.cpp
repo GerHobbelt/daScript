@@ -10,8 +10,10 @@
 #include "daScript/ast/ast_bound_check_elision.h"
 #include "daScript/misc/das_common.h"
 #include "daScript/simulate/simulate.h"
+#include "daScript/simulate/aot_builtin.h"
 #include "daScript/simulate/aot_builtin_string.h"
 #include "daScript/simulate/aot_builtin_uriparser.h"
+#include "daScript/misc/env_cfg.h"
 #include "daScript/simulate/fs_file_info.h"
 #include "daScript/das_project_specific.h"
 
@@ -412,7 +414,10 @@ namespace das {
                 }
                 if ( !access->canBeRequired(mod, fileName, modRec.isPublic) )
                 {
-                    notAllowed.push_back({mod, modRec.line, chain, modRec.isPublic});
+                    RequireRecord denied {mod, modRec.line, chain};
+                    denied.isPublic = modRec.isPublic;
+                    denied.cantBeRequired = true;
+                    notAllowed.push_back(denied);
                     if ( log ) {
                         *log << string(tab,'\t') << "from " << fileName << " require " << mod << " - CAN'T BE REQUIRED\n";
                     }
@@ -449,11 +454,13 @@ namespace das {
                                     *log << string(tab,'\t') << "from " << fileName << " require " << modRec.name << " - MODULE INFO NOT FOUND\n";
                                 }
                                 missing.push_back({modRec.name, modRec.line, chain, MissingHint::ModuleInfoNotFound});
+                                dependencies.erase(mod);
                                 return false;
                             }
                             string fileModName;
                             if ( !getPrerequisits(info.fileName, access, fileModName, req, missing, circular, notAllowed, chain, dependencies,
                                                   namelessReq, namelessMismatches, libGroup, log, tab + 1, allowPromoted, modRec.name, modRec.line) ) {
+                                dependencies.erase(mod);
                                 return false;
                             }
                             if ( !fileModName.empty() ) {
@@ -462,6 +469,7 @@ namespace das {
                                         *log << string(tab,'\t') << "from " << fileName << " require " << mod << " - MODULE INFO NOT FOUND; did you mean '" << fileModName << "'?\n";
                                     }
                                     missing.push_back({modRec.name, modRec.line, chain, MissingHint::WrongModuleName, mod, fileModName});
+                                    dependencies.erase(mod);
                                     return false;
                                 }
                                 info.moduleName = fileModName;
@@ -482,6 +490,7 @@ namespace das {
                                         modRec.name, info.fileName, fileName,
                                         prevMod->second.name, prevMod->second.fileName, prevMod->second.fromFile
                                     });
+                                    dependencies.erase(mod);
                                     return false;
                                 }
                             }
@@ -593,6 +602,21 @@ namespace das {
     void statAndHashFileDependency ( const string & path, int64_t & size, uint64_t & hash ) {
         size = -1;
         hash = 0;
+        if ( path.compare(0, 4, "env:") == 0 ) {
+            if ( const char * v = das_getenv(path.c_str() + 4) ) {
+                size = int64_t(strlen(v));
+                hash = size ? hash_block64((const uint8_t *) v, size_t(size)) : FNV64A_SEED;
+            }
+            return;
+        }
+        if ( path.compare(0, 4, "arg:") == 0 ) {
+            string occurrences = commandLineArgumentOccurrences(path.substr(4));
+            if ( !occurrences.empty() ) {
+                size = int64_t(occurrences.size());
+                hash = hash_block64((const uint8_t *) occurrences.data(), occurrences.size());
+            }
+            return;
+        }
 #if !defined(DAS_NO_FILEIO)
         FILE * f = fopen(path.c_str(), "rb");
         if ( !f ) return;
@@ -610,6 +634,33 @@ namespace das {
         }
         fclose(f);
 #endif
+    }
+
+    static void stampModuleSource ( const char * src, uint32_t len, int64_t & size, uint64_t & hash ) {
+        size = src ? int64_t(len) : -1;
+        hash = (src && len) ? hash_block64((const uint8_t *) src, size_t(len)) : FNV64A_SEED;
+    }
+
+    static void stampModuleSource ( const FileAccessPtr & access, const string & fileName, int64_t & size, uint64_t & hash ) {
+        const char * src = nullptr;
+        uint32_t len = 0;
+        if ( FileInfo * fi = access->getFileInfo(fileName) ) fi->getSourceAndLength(src, len);
+        stampModuleSource(src, len, size, hash);
+    }
+
+    bool detectGen2Syntax ( const char * text, uint32_t length, bool& value );
+
+    // the parse derives version_2_syntax from the source (`options gen2`); the record carries the
+    // derived value, so the compare must see the same derivation
+    static void deriveSourcePolicies ( const FileAccessPtr & access, const string & fileName, CodeOfPolicies & policies ) {
+        if ( FileInfo * fi = access->getFileInfo(fileName) ) {
+            const char * src = nullptr;
+            uint32_t len = 0;
+            fi->getSourceAndLength(src, len);
+            bool gen2 = policies.version_2_syntax;
+            detectGen2Syntax(src, len, gen2);
+            policies.version_2_syntax = gen2;
+        }
     }
 
     bool trySerializeProgramModule (
@@ -641,22 +692,25 @@ namespace das {
                 }) || magic != SER_MODULE_STREAM_MAGIC || version != AstSerializer::getVersion() ) {
                     serializer_read->seenNewModule = true;
                     serializer_read->failed = true;
-                    logs << "ser: read failed (stale or foreign module cache stream)\n";
+                    serializer_read->cutoffFile = fileName;
+                    serializer_read->cutoffReason = "stale or foreign module cache stream";
+                    if ( !serializer_read->quietCache ) logs << "ser: read failed (stale or foreign module cache stream)\n";
                     return false;
                 }
             }
         }
 
-        int64_t file_mtime = access->getFileMtime(fileName.c_str());
-        int64_t file_size = access->getFileSize(fileName.c_str());
-        int64_t saved_mtime = 0;
+        int64_t file_size = -1;
+        uint64_t file_hash = 0;
+        stampModuleSource(access, fileName, file_size, file_hash);
+        uint64_t saved_hash = 0;
         int64_t saved_size = -1;
         string saved_filename{};
         uint64_t payload_size = 0;
         uint32_t depCount = 0;
         vector<tuple<string,int64_t,uint64_t>> savedDeps;
         if ( !serializer_read->trySerialize([&](AstSerializer & serializer) {
-            serializer << saved_mtime;
+            serializer << saved_hash;
             serializer << saved_size;
             serializer << saved_filename;
             // macro file dependencies (Program::moduleCacheDependencies) ride the record
@@ -674,7 +728,7 @@ namespace das {
         }) || depCount > SER_MAX_MACRO_DEPS ) {
             serializer_read->seenNewModule = true;
             serializer_read->failed = depCount > SER_MAX_MACRO_DEPS;
-            logs << "ser: read failed '" << fileName << "'\n";
+            if ( !serializer_read->quietCache ) logs << "ser: read failed '" << fileName << "'\n";
             return false;
         }
 
@@ -688,25 +742,27 @@ namespace das {
             if ( depSize != get<1>(dep) || depHash != get<2>(dep) ) {
                 serializer_read->seenNewModule = true;
                 serializer_read->failed = true;
-                logs << "ser: macro dependency changed '" << get<0>(dep) << "' (e.g. a re-minted tune sidecar)\n";
+                serializer_read->cutoffFile = fileName;
+                serializer_read->cutoffReason = "macro dependency '" + get<0>(dep) + "' changed";
+                if ( !serializer_read->quietCache ) logs << "ser: macro dependency changed '" << get<0>(dep) << "' (e.g. a re-minted tune sidecar)\n";
                 return false;
             }
         }
-        // mtime alone is 1-second granular - a same-second rewrite would serve the stale
-        // AST with no diagnostic, so the size rides beside it in the header
-        if ( saved_filename != fileName || file_mtime != saved_mtime || file_size != saved_size ) {
+        // a file the access cannot produce stamps size -1, so it never matches a record
+        if ( saved_filename != fileName || file_size < 0 || file_size != saved_size || file_hash != saved_hash ) {
             // a CHANGED (or added/removed) module invalidates everything after it - das
             // modules depend on earlier ones (macros), so this stays the prefix cutoff
             serializer_read->seenNewModule = true;
             serializer_read->failed = true;
-            if (saved_filename != fileName) {
-                logs << "ser: file name mismatch. Expected '" << saved_filename << "', got '" << fileName << "'\n";
-            }
-            if (file_mtime != saved_mtime) {
-                logs << "ser: file mtime mismatch. Expected " << saved_mtime << ", got " << file_mtime << "\n";
-            }
-            if (file_size != saved_size) {
-                logs << "ser: file size mismatch. Expected " << saved_size << ", got " << file_size << "\n";
+            serializer_read->cutoffFile = fileName;
+            serializer_read->cutoffReason = saved_filename != fileName ? "module order changed" : "file changed";
+            if ( !serializer_read->quietCache ) {
+                if (saved_filename != fileName) {
+                    logs << "ser: file name mismatch. Expected '" << saved_filename << "', got '" << fileName << "'\n";
+                } else {
+                    logs << "ser: file content changed. Expected size " << saved_size << " hash " << saved_hash
+                         << ", got size " << file_size << " hash " << file_hash << "\n";
+                }
             }
             return false;
         }
@@ -715,28 +771,39 @@ namespace das {
         // no per-module logging on the happy path - the standalone sink has no level
         // threshold, so a line here prints once per warm module; the verdict line and the
         // failure branches below carry everything a human needs
+        deriveSourcePolicies(access, fileName, program->policies);
         bool read_ok = serializer_read->trySerialize([&](AstSerializer & serializer) {
             serializer.thisModuleGroup = &libGroup;
+            serializer.fileAccess = access.get();
             serializer.serializeProgram(program, libGroup);
         });
 
         if ( read_ok && !program->failed() && !serializer_read->failed ) {
+            serializer_read->servedModules ++;
             program->thisModuleGroup = &libGroup;
             // the stream is rewritten every run from parsedModules, so a kept record's deps
             // must round-trip through the deserialized program or the next write drops them
             program->moduleCacheDependencies = das::move(savedDeps);
             if ( serializer_write != nullptr ) {
-                serializer_write->parsedModules.push_back({fileName, file_mtime, file_size, program, program->thisModule.get()});
+                serializer_write->parsedModules.push_back({fileName, file_hash, file_size, program, program->thisModule.get()});
             }
             return true;
         }
 
-        if ( !read_ok ) {
-            logs << "ser: read failed '" << fileName << "'\n";
-        } else if ( program->failed() ) {
-            logs << "ser: program failed '" << fileName << "'\n";
-        } else {
-            logs << "ser: serialization failed. Internal issue.\n";
+        // a policy mismatch is repaired by the writeback, so it is not builtin drift
+        bool policyMismatch = serializer_read->policyMismatch;
+        serializer_read->policyMismatch = false;
+        if ( policyMismatch ) serializer_read->builtinHashDrift = false;
+        if ( !serializer_read->quietCache ) {
+            if ( policyMismatch ) {
+                logs << "ser: compile policies changed at '" << fileName << "' - the record was written by a compile with different policies\n";
+            } else if ( !read_ok ) {
+                logs << "ser: read failed '" << fileName << "'\n";
+            } else if ( program->failed() ) {
+                logs << "ser: program failed '" << fileName << "'\n";
+            } else {
+                logs << "ser: serialization failed. Internal issue.\n";
+            }
         }
         replaceProgramKeepGcRootValid(program);
 
@@ -760,8 +827,12 @@ namespace das {
             // record (still valid: the file is UNCHANGED) reparses instead of serving
             serializer_read->seenNewModule = false;
             serializer_read->resumedModules ++;
-            logs << "ser: reparsing in place '" << fileName << "'\n";
+            if ( !serializer_read->quietCache ) logs << "ser: reparsing in place '" << fileName << "'\n";
             return false;
+        }
+        if ( policyMismatch ) {
+            serializer_read->cutoffFile = fileName;
+            serializer_read->cutoffReason = "compile policies changed";
         }
         serializer_read->seenNewModule = true;
         serializer_read->failed = true;
@@ -998,6 +1069,7 @@ namespace das {
         uint64_t myParseT = 0, myInferT = 0, myOptT = 0, myMacroModT = 0;
         auto macroTicks0 = daScriptEnvironment::getBound()->macroTimeTicks;
         program->inferPassesUsed = 0;  // reset once per module; inferTypesDirty accumulates across all inferTypes legs (incl. restartInfer)
+        program->policies = policies;   // before the cache read: the reader compares the record's policies against this compile's
 
         if ( trySerializeProgramModule(program, access, fileName, libGroup, logs) ) {
             return program;
@@ -1036,14 +1108,15 @@ namespace das {
         parserState.das_def_tab_size = daScriptEnvironment::getBound()->das_def_tab_size;
         parserState.das_gen2_make_syntax = policies.gen2_make_syntax;
         yyscan_t scanner = nullptr;
-        int64_t file_mtime = access->getFileMtime(fileName.c_str());
-        int64_t file_size = access->getFileSize(fileName.c_str());
+        int64_t file_size = -1;
+        uint64_t file_hash = 0;
         if ( auto fi = access->getFileInfo(fileName) ) {
             callCompilationCallback(moduleName, fileName, "parse");
             parserState.g_FileAccessStack.push_back(fi);
             const char * src = nullptr;
             uint32_t len = 0;
             fi->getSourceAndLength(src,len);
+            stampModuleSource(src, len, file_size, file_hash);
             bool gen2 = policies.version_2_syntax;
             detectGen2Syntax(src, len, gen2);
             program->policies.version_2_syntax = gen2;
@@ -1298,7 +1371,7 @@ namespace das {
             }
             auto & serializer_write = daScriptEnvironment::getBound()->serializer_write;
             if ( serializer_write != nullptr ) {
-                serializer_write->parsedModules.push_back({fileName, file_mtime, file_size, program, program->thisModule.get()});
+                serializer_write->parsedModules.push_back({fileName, file_hash, file_size, program, program->thisModule.get()});
             }
             return program;
         }
@@ -1433,8 +1506,8 @@ namespace das {
             *serializer_write << version;
         }
         for ( auto & parsedModule : serializer_write->parsedModules ) {
-            auto & [fileName, fileMtime, fileSize, program, thisModule] = parsedModule; // tuple<string, int64_t, int64_t, ProgramPtr, Module *>
-            *serializer_write << fileMtime;
+            auto & [fileName, fileHash, fileSize, program, thisModule] = parsedModule;
+            *serializer_write << fileHash;
             *serializer_write << fileSize;
             *serializer_write << const_cast<string &>(fileName);
             uint32_t depCount = uint32_t(program->moduleCacheDependencies.size());
@@ -1496,45 +1569,32 @@ namespace das {
     DAS_API string describe_pending_dynamic_modules();
 
     ProgramPtr reportPrerequisitesErrors (
-            string fileName,
-            vector<MissingRecord> & missing,
-            vector<RequireRecord> & circular,
-            vector<RequireRecord> & notAllowed,
-            vector<ModuleInfo> & req,
-            das_set<string> & dependencies,
-            das_hash_map<string, NamelessModuleReq> & namelessReq,
-            vector<NamelessMismatch> & namelessMismatches,
-            const FileAccessPtr & access,
+            const string & fileName,
+            const vector<MissingRecord> & missing,
+            const vector<RequireRecord> & circular,
+            const vector<RequireRecord> & notAllowed,
+            const vector<NamelessMismatch> & namelessMismatches,
             ModuleGroup & libGroup,
             CodeOfPolicies policies ) {
-        TextWriter tw;
-        req.clear();
-        missing.clear();
-        circular.clear();
-        dependencies.clear();
-        notAllowed.clear();
-        vector<FileInfo *> chain;
-        string modName;
-        addExtraDependency("builtin", get_builtin_path(), missing, circular, notAllowed, req, dependencies, namelessReq, namelessMismatches, access, libGroup, policies, &tw);
-        for ( const auto & em : access->getExtraModules() ) {
-            addExtraDependency(em.first, em.second, missing, circular, notAllowed, req, dependencies, namelessReq, namelessMismatches, access, libGroup, policies, &tw);
-        }
-        getPrerequisits(fileName, access, modName, req, missing, circular, notAllowed, chain, dependencies, namelessReq, namelessMismatches, libGroup, &tw, 1, false);
         auto program = make_smart<Program>();
         program->policies = policies;
         program->thisModuleGroup = &libGroup;
         TextWriter err;
         LineInfo at;
         bool first = true;
+        auto anchorFirst = [&] ( const vector<FileInfo *> & chain, int32_t line, const string & name ) {
+            if ( !first ) return;
+            first = false;
+            auto fi = find_if(chain.rbegin(), chain.rend(), [] ( FileInfo * f ) { return f != nullptr; });
+            if ( fi == chain.rend() ) return;
+            at.fileInfo = *fi;
+            at.line = at.last_line = line;
+            at.column = 8;
+            at.last_column = at.column + (int)name.size();
+        };
         bool anyNotFound = false;
         for ( auto & mis : missing ) {
-            if ( first && !mis.chain.empty() ) {
-                at.fileInfo = mis.chain.back();
-                at.line = at.last_line = mis.line;
-                at.column = 8;
-                at.last_column = at.column + (int)mis.name.size();
-                first = false;
-            }
+            anchorFirst(mis.chain, mis.line, mis.name);
             switch ( mis.hintType ) {
                 case MissingHint::FileNotFound: {
                     err << "missing prerequisite '" << mis.name << "'; file not found\n";
@@ -1550,7 +1610,7 @@ namespace das {
                     if ( !mis.hintName.empty() ) {
                         err << ", did you mean '" << mis.hintName << "'?\n";
                     } else {
-                        err << "'\n";
+                        err << "\n";
                     }
                     break;
                 }
@@ -1559,7 +1619,7 @@ namespace das {
                     break;
                 }
                 default: {
-                    err << "'\n";
+                    err << "missing prerequisite '" << mis.name << "'\n";
                     break;
                 }
             }
@@ -1574,39 +1634,28 @@ namespace das {
             }
         }
         for ( auto & mis : circular ) {
-            if ( first && !mis.chain.empty() ) {
-                at.fileInfo = mis.chain.back();
-                at.line = at.last_line = mis.line;
-                at.column = 8;
-                at.last_column = at.column + (int)mis.name.size();
-                first = false;
-            }
+            anchorFirst(mis.chain, mis.line, mis.name);
             err << "circular dependency '" << mis.name << "'\n";
             reportChain(err, mis.chain);
         }
         for ( auto & mis : notAllowed ) {
-            if ( first && !mis.chain.empty() ) {
-                at.fileInfo = mis.chain.back();
-                at.line = at.last_line = mis.line;
-                at.column = 8;
-                at.last_column = at.column + (int)mis.name.size();
-                first = false;
+            anchorFirst(mis.chain, mis.line, mis.name);
+            if ( mis.cantBeRequired ) {
+                err << "module '" << mis.name << "' can't be required here; the project's can_module_be_required hook rejects it\n";
+            } else {
+                err << "module not allowed '" << mis.name << "'\n";
             }
-            err << "module not allowed '" << mis.name << "'\n";
             reportChain(err, mis.chain);
         }
         for ( auto & nameless : namelessMismatches ) {
-            if ( first && !nameless.chain.empty() ) {
-                at.fileInfo = nameless.chain.back();
-                at.line = at.last_line = nameless.line;
-                at.column = 8;
-                at.last_column = at.column + (int)nameless.name1.size();
-                first = false;
-            }
+            anchorFirst(nameless.chain, nameless.line, nameless.name1);
             err << "module name case conflict: '" << nameless.name1 << "' vs '" << nameless.name2 << "'\n"
                 << "'" << nameless.name1 << "' (" << nameless.fileName1 << ") from " << nameless.fromFile1 << "\n"
-                << "'" << nameless.name2 << "' (" << nameless.fileName2 << ") from " << nameless.fromFile2 << "\n\n";
+                << "'" << nameless.name2 << "' (" << nameless.fileName2 << ") from " << nameless.fromFile2 << "\n";
             reportChain(err, nameless.chain);
+        }
+        if ( err.str().empty() ) {
+            err << "can't resolve the prerequisites of '" << fileName << "'\n";
         }
         program->error(err.str(), "", "", at,
                         CompilationError::lookup_module);
@@ -1708,15 +1757,7 @@ namespace das {
         }
         if ( !getPrerequisits(fileName, access, modName, req, missing, circular, notAllowed, chain,
                 dependencies, namelessReq, namelessMismatches, libGroup, nullptr, 1, !policies.ignore_shared_modules) ) {
-            req.clear();
-            missing.clear();
-            circular.clear();
-            notAllowed.clear();
-            dependencies.clear();
-            namelessReq.clear();
-            namelessMismatches.clear();
-            return reportPrerequisitesErrors(fileName, missing, circular, notAllowed,
-                req, dependencies, namelessReq, namelessMismatches, access, libGroup, policies);
+            return reportPrerequisitesErrors(fileName, missing, circular, notAllowed, namelessMismatches, libGroup, policies);
         }
         if ( !verifyModuleNamesUnique(req, logs) ) {
             auto res = make_smart<Program>();
@@ -1778,12 +1819,10 @@ namespace das {
             return res;
         }
         for ( const auto & em : access->getExtraModules() ) {
-            allGood = addExtraDependency(em.first, em.second, missing, circular, notAllowed, req, dependencies, namelessReq, namelessMismatches, access, libGroup, policies, &logs) && allGood;
+            allGood = addExtraDependency(em.first, em.second, missing, circular, notAllowed, req, dependencies, namelessReq, namelessMismatches, access, libGroup, policies, nullptr) && allGood;
         }
         if ( !allGood ) {
-            auto res = make_smart<Program>();
-            res->error("internal error", logs.str(), "", LineInfo(), CompilationError::internal_module);
-            return res;
+            return reportPrerequisitesErrors(fileName, missing, circular, notAllowed, namelessMismatches, libGroup, policies);
         }
         if ( getPrerequisits(fileName, access, modName, req, missing, circular, notAllowed, chain,
                 dependencies, namelessReq, namelessMismatches, libGroup, nullptr, 1, !policies.ignore_shared_modules) ) {
@@ -1903,15 +1942,7 @@ namespace das {
             }
             return res;
         } else {
-            req.clear();
-            missing.clear();
-            circular.clear();
-            notAllowed.clear();
-            dependencies.clear();
-            namelessReq.clear();
-            namelessMismatches.clear();
-            auto res = reportPrerequisitesErrors(fileName, missing, circular, notAllowed,
-                                        req, dependencies, namelessReq, namelessMismatches, access, libGroup, policies);
+            auto res = reportPrerequisitesErrors(fileName, missing, circular, notAllowed, namelessMismatches, libGroup, policies);
             if ( auto fi = access->getFileInfo(fileName) ) {
                 const char * src = nullptr;
                 uint32_t len = 0;

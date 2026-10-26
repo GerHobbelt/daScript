@@ -37,11 +37,11 @@ var LINK_WHOLE_LIB = false // when true, standalone exe links against the whole 
 // invalidates cached DLLs (e.g. edits to llvm_jit.das, llvm_macro.das, llvm_jit_common.das,
 // runtime helper ABI, default target triple). Cache filenames fold this in, so a bump
 // makes every previously written DLL miss the cache on the next run and get GC'd.
-let LLVM_JIT_CODEGEN_VERSION : uint64 = 0x6aul   // srem/urem for 32-bit % (0x69: every string argument of an extern is substituted, not just the ones which asked)
+let LLVM_JIT_CODEGEN_VERSION : uint64 = 0x6dul   // the inline polynomial rail carries NaN: tanh selects the operand back over its ordered clamp, and the sincos quadrant / tan octant convert through llvm.fptosi.sat instead of poisoning on NaN and out-of-range (0x6c: aarch64 vector tan/exp2/log2/log/pow join the inline polynomial rail bit-exactly with the interpreter, sinh/cosh/tanh ride the exp one; 0x6b: aarch64 vector sin/cos ride the inline polynomial; 0x6a: srem/urem for 32-bit %; 0x69: every string argument of an extern is substituted, not just the ones which asked)
 
 // Read by tests-cpp/small/test_jit_emitter_pin.cpp: FNV-1a64 of the emitter sources
 // (normalized to LF; file list in the test)
-let LLVM_JIT_EMITTER_HASH : uint64 = 0x636870d5283981a3ul
+let LLVM_JIT_EMITTER_HASH : uint64 = 0x6330d3756a092eebul
 
 let JIT_FNV_PRIME : uint64 = 1099511628211ul
 
@@ -748,12 +748,14 @@ def public run_jit(prog : Program?; var ctx : Context?) : bool {  // nolint:STYL
     }
     defer() { g_emit_aot_object_globals = false; }
     let use_dll = prog.policies.jit_dll_mode && das_is_dll_build() && !gen_exe && !compile_only && !emit_aot_object
-    // --jit-split-modules (or `options jit_split_modules`): per-das-module partition emission.
-    // 0 = off (default, today's monolithic path); any other value = split. Opt-in by ruling:
-    // the monolith stays the right default (one context, full cross-module inlining).
-    let split_modules = cli_opts.split_modules |> unwrap_or((prog._options |> find_arg("jit_split_modules")) ?as tInt ?? 0)
+    // --jit-split-modules (or `options jit_split_modules`): -1 = per-das-module partitions, auto
+    // threads (default - the obj cache serves every program sharing a module); 0 = the monolith
+    // with full cross-module inlining, which -exe always emits (split is DLL-path only)
+    let split_option = prog._options |> find_arg("jit_split_modules")
+    let split_requested = (cli_opts.split_modules |> is_some()) || !(split_option is nothing)
+    let split_modules = cli_opts.split_modules |> unwrap_or(split_option ?as tInt ?? -1)
     let jit_split = split_modules != 0 && use_dll
-    if (split_modules != 0 && !use_dll) {
+    if (split_requested && split_modules != 0 && !use_dll) {
         to_log(LOG_WARNING, "LLVM JIT: --jit-split-modules applies to the JIT DLL path only - ignored for this artifact mode\n")
     }
     g_jit_split_active = jit_split

@@ -34,6 +34,19 @@ clears them behind the exe gate at batch start and after each model's last cell,
 re-baked from its gguf on demand. Judging stays forbidden; owning the directory for the batch is
 what licenses deletion without judgment.
 
+### 2.1n A planar image never stands in for the blob flavor {#image-flavor-rebake}
+
+A metal-mode load resolves its flavor in order: the blob image under the metal tag maps first; a
+planar image under the plain identity maps next, and serves only when the model cannot take the
+blob form - a shape the drivers decline, or a layout the bind-alignment gate refuses. Otherwise the
+rail drops the mapping and rebakes the blob flavor from the gguf, so a CPU run that minted the planar
+image first never leaves a GPU box serving from the CPU planes; the planar file stays for CPU loads.
+The question the mapped planar image answers is `metal_blob_form_ok` - quant, packing flags, layout
+- and not `metal_blob_eligible`: that one also refuses a mapped model, because the in-place
+transform would write borrowed planes, and the rebake never transforms the mapping. Metal mode pins
+the portable backend, so the packing flags are false there and the form question reduces to shape
+and layout.
+
 ### 2.1a Page alignment is the no-copy contract {#image-page-alignment}
 
 Every plane section starts on a 16 KiB boundary (`IMAGE_PAGE`, the Apple-Silicon page) and the
@@ -46,7 +59,10 @@ place instead of reading it.
 The meta blob sits at the image tail and leads with two strings - the identity the image was baked
 for and its config JSON - then the section table and the walk's scalar stream. The strings lead so
 a peek, or a load that is about to decline, can print what the image was baked for without parsing
-anything else.
+anything else. The peek also reads the header's meta-layout fingerprint, so a family that
+registered its carrier's `layout_fingerprint` alongside its tag gets the `STALE layout` verdict
+for an image `parse_image` would refuse; without the registration a peek calls such an image
+CURRENT and the GC keeps it.
 
 ### 2.1c Array payloads reach the archive in bulk {#image-bulk-serialize}
 
@@ -88,7 +104,12 @@ identity is computed or compared. `image_identity` is a pure formatter over `Dli
 the backend select happens inside the config's CPU source, so a caller needs no ordering ritual of
 its own. A load pins the box profile first because that pin can change the backend, and the parse
 runs the same load select the gguf loader runs, before any kernel touches planes packed for that
-backend.
+backend. A family whose plane bytes no box property shapes (the TTS f32 carrier: layouts minted
+from the model's own geometry) registers its tag config-free, and `image_config_for` keys its
+identity by the default configuration instead: one identity on every box, not one per tune
+state - two processes
+on one box with different tune manifests would otherwise bake different identities in the same
+lane and reap each other's image on every switch.
 
 
 ### 2.1h The baked dev-W f16 panel plane {#image-devw-plane}
@@ -139,3 +160,73 @@ The crown set is read when the prefill PSOs compile, not when a GEMM dispatches,
 `pf_hmm_ready` answers for whatever crowns were armed at the last `metal_prefill_init`. A
 caller that arms a crown after bring-up runs `metal_prefill_shutdown` to force the recompile;
 without it the f16 arm silently stays unavailable and every encode takes the f32 route.
+
+### 2.1j A split head is part of the image's identity {#image-identity-head-fold}
+
+**An image path folds in the split NextN head that rides the load.** `image_path_for` resolves
+`mtp_head_sidecar` for the gguf - the resolver excludes an assistant drafter (`gguf_is_assistant`),
+whose weights never enter the trunk's image - and, when a head exists, hashes
+`|mtp:<basename>:<size>` alongside the configuration identity, so a trunk loaded alone and the same
+trunk loaded with its head never share a `.dlim` path. The head's tensors are baked INSIDE the
+minted image - one file serves both - so two identities sharing a path would re-save over each
+other forever. Because the fold changes the path, the head's arrival needed no `IMAGE_VERSION`
+bump: no image at an unchanged path changed content. The fold lives in the path and not yet in
+the baked identity string (`followup_general.md` #99).
+
+### 2.1k The assistant drafter is a ledgered non-image lane {#drafter-non-image-lane}
+
+**The gemma-4 assistant drafter (`dasllama_mtp_gemma.das`) reads its Q8_0 sidecar straight into
+its own blob and never mints a `.dlim`.** The sidecar is 440 MiB, its Q8_0 blocks are already the
+34-byte form the Metal encoder uploads unrepacked, and the copy takes a fraction of a second - an
+image would shorten nothing. The lane is optional (no sidecar, no drafter) and invisible to
+`dasllama-convert`'s list and GC by design.
+
+### 2.1l The layout stamp is one hash over the code that places bytes {#image-layout-stamp}
+
+`REVIEW.das`'s `check_image_layout_stamp` hashes the LAYOUT CLOSURE - the top-level definitions
+under `dasllama/` that decide what an image holds and where each byte lands - and compares the
+result against the two constants the gate carries, `IMAGE_LAYOUT_STAMP_HASH` and
+`IMAGE_LAYOUT_STAMP_VERSION`.
+
+The closure, per file in sorted name order: every `Archive` serializer body (a top-level
+`def serialize*` taking an `Archive`), `build_image`, `parse_image`, every `*_prepare` mint, the
+layout helpers `pad_to_page`, `plane_end`, `image_total_bytes`, `w_append`, `w_zeros`,
+`w_header`, `store_u32` and `store_u64`, and the declaration lines of the layout constants
+`IMAGE_PAGE`, `IMAGE_HEADER_BYTES`, `SECTION_TABLE_SLACK`, `DWRITE_STAGING_BAND` and
+`METAL_BAND_BLOCKS`. Comments are stripped first, so re-wording one moves nothing. A body runs
+from its `def` line to the column-0 `}` that closes it, or, for a `def ... => expr` one-liner, to
+the end of that one line. Each piece folds into one FNV-1a hash keyed by its file name, so moving
+a serializer between files changes the stamp.
+
+The closure is wider than the byte-moving set on purpose. The two staging bands only decide how
+many bytes a writer stages per pass, and `store_u32` writes header scalars rather than plane
+bytes; over-inclusion costs a re-stamp, and under-inclusion serves the wrong bytes. What it does
+not reach is what a plane HOLDS - the loaders, repackers and quantizers upstream of the mint,
+which the identity string and `layout_fingerprint()` cover instead.
+
+A red says the closure moved, and the two repairs are not the same thing. A **re-stamp** answers
+a change that provably leaves every byte where it was - a renamed local, a tripwire line, a
+helper split, or a content change that also moved the image PATH, since an image at a path
+nothing reads cannot be reinterpreted: `IMAGE_LAYOUT_STAMP_HASH` takes the value the finding
+prints and both version numbers stand. A **bump** answers a change that moves bytes, or that
+changes what an image at an UNCHANGED path contains: `IMAGE_VERSION` (`dasllama_image.das`) goes
+up, `IMAGE_LAYOUT_STAMP_VERSION` follows it, and the hash is re-stamped alongside. Without the
+bump a stale image stays structurally valid and silently serves a different model.
+
+### 2.1m A hand-listed meta serializer pins its own field count {#image-meta-tripwire}
+
+An `Archive` serializer over a struct writes that struct's fields by hand, one call per field, so
+a field added to the struct and forgotten in the list reads back zero on every load - no error,
+no short read, just a zero. `verify(count_meta_fields(x) == K)` at the top of the serializer is
+what makes that loud: the count is pinned, and growing the struct fails the verify until the
+field list grows with it.
+
+`REVIEW.das`'s `check_meta_tripwires` walks every `dasllama/` file and reds a serializer that
+writes two or more fields without that line. It counts a field write in three spellings: the pipe
+form `arch |> serialize` (which also covers `serialize_raw`), the plain call
+`serialize(arch, ...)`, and any other `serialize*(arch, ...)` helper - the bulk forms
+`serialize_pod_array` and `serialize_strings`, and a nested `serialize_image_meta`.
+
+The set the check licenses is the bulk payload forms themselves, recognized by their shape rather
+than their names: a serializer whose header declares an `array` parameter carries a payload, not
+a struct field list, so it has no count to pin. Everything else taking an `Archive` is checked.

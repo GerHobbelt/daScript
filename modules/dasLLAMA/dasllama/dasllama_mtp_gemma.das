@@ -88,8 +88,7 @@ struct private DrPlan {
 
 // ===== sidecar discovery =====
 
-// the stem before the trailing quant token ("...-it-Q4_K_M" -> "...-it"); the whole stem when
-// the name carries no "-Q<digit>" marker
+//! the stem before the trailing quant token ("...-it-Q4_K_M" -> "...-it"); no marker = the whole stem
 def private quant_stem(stem : string) : string {
     var cut = -1
     peek_data(stem) $(d : array<uint8> const#) {
@@ -137,7 +136,7 @@ def private refuse_off(var dr : GemmaDrafter; why : string) : int64 {
 }
 
 // a tensor's byte base inside the mapped single-shard file
-def private tbase(m : GGUFMeta; ti : int) : int64 => m.data_offset + m.tensors[ti].offset
+def private tensor_byte_base(m : GGUFMeta; ti : int) : int64 => m.data_offset + m.tensors[ti].offset
 
 // plan one tensor: presence, on-disk type and element count all have to match, or the load refuses
 def private plan_tensor(var dr : GemmaDrafter; m : GGUFMeta; var plans : array<DrPlan>;
@@ -170,8 +169,7 @@ def private plan_tensor(var dr : GemmaDrafter; m : GGUFMeta; var plans : array<D
     return off
 }
 
-// the drafter owns no K/V projection: a stray k/v weight means the checkpoint and the config
-// disagree, which is a hard refusal rather than a silent drop
+//! the drafter owns no K/V projection: a stray k/v weight is a hard refusal, never a silent drop
 def private has_stray_kv(m : GGUFMeta) : string {
     for (ti in range(length(m.tensors))) {
         let n = m.tensors[ti].name
@@ -238,7 +236,7 @@ def private read_drafter_meta(var dr : GemmaDrafter; m : GGUFMeta; bytes : array
         let sl = pat[l] != 0l
         dr.sliding |> push(sl)
         dr.hs |> push(sl ? hs_swa : hs_full)
-        dr.kv_layer |> push(sl ? -2l : -1l)   // relative to the target's layer count until bound
+        dr.kv_layer |> push(sl ? -2l : -1l)
         if (dr.kvh[l] <= 0l || dr.n_heads % dr.kvh[l] != 0l) {
             return refuse(dr, "layer {l}: {dr.n_heads} q heads do not divide over {dr.kvh[l]} kv heads")
         }
@@ -313,7 +311,7 @@ def private copy_planned(var dr : GemmaDrafter; m : GGUFMeta; bytes : array<uint
         if (pl.q8) {
             let nbytes = (pl.n / Q8_BLK_ELEMS) * Q8_BLK_BYTES
             unsafe {
-                memcpy(addr<void?>(dr.blob[pl.dst]), addr<void?>(bytes[tbase(m, pl.ti)]), nbytes)
+                memcpy(addr<void?>(dr.blob[pl.dst]), addr<void?>(bytes[tensor_byte_base(m, pl.ti)]), nbytes)
             }
         } else {
             gguf_read_tensor_f32(m, bytes, m.tensors[pl.ti].name, dr.fblob, pl.dst, pl.n)
@@ -336,6 +334,7 @@ def gemma_drafter_bind_target(var dr : GemmaDrafter; target_n_layers : int64) {
 //! Load the gemma-4 assistant drafter sidecar at `path`. Never panics: any refusal - a wrong
 //! architecture, a missing or non-Q8_0 weight, a stray K/V tensor - lands as `ok = false` plus a
 //! `why`. `target_n_layers > 0` binds `kv_layer` in the same call.
+[arch(at="../ARCHITECTURE_IMAGE.md#drafter-non-image-lane")]
 def load_gemma_drafter(path : string; target_n_layers : int64 = 0l) : GemmaDrafter {
     var dr : GemmaDrafter
     if (!fexist(path)) {
@@ -431,8 +430,7 @@ def gemma_target_hidden(t : Model; var s : Session; post_norm : bool; var dst : 
     }
 }
 
-// this step's cos/sin row for one attention class: the sliding class ropes over its own head size
-// at theta_swa with no frequency factors, the full class over hs at theta with the p-RoPE table
+[arch(at="../ARCHITECTURE_GPU_MTP.md#assistant-drafter-step")]
 def private drafter_rope_row(dr : GemmaDrafter; var cosr : array<float>; var sinr : array<float>;
                              var ff : array<float>; anchor, hs : int64; slid : bool) {
     let theta = slid ? dr.rope_theta_swa : dr.rope_theta
@@ -444,8 +442,7 @@ def private drafter_rope_row(dr : GemmaDrafter; var cosr : array<float>; var sin
     build_rope_tabs(cosr, sinr, theta, 1.0, 1.0, ff, use_ff, anchor, 1l, hs)
 }
 
-// one drafter layer's attention over the target's frozen K/V at kv_layer[l], scale 1.0, GQA
-// broadcast, sliding layers masked to keys within the window of the anchor
+[arch(at="../ARCHITECTURE_GPU_MTP.md#assistant-drafter-step")]
 def private drafter_attention(t : Model; var s : Session; dr : GemmaDrafter; l, anchor : int64;
                               q : array<float>; var attn : array<float>; var scores : array<float>;
                               var kvrow : array<float>) {
@@ -457,7 +454,6 @@ def private drafter_attention(t : Model; var s : Session; dr : GemmaDrafter; l, 
     }
     let kv_dim = layer_kv_dim(c, kvl)
     let kv_mul = dr.n_heads / dr.kvh[l]
-    // visible keys [lo, anchor): the seed at `anchor` is unfed; sliding masks anchor - key >= window
     let lo = dr.sliding[l] ? max(0l, anchor - dr.sliding_window + 1l) : 0l
     let cnt = anchor - lo
     var kcl = kv_layer_kbase(s, kvl, c.seq_len)
@@ -493,9 +489,10 @@ def private drafter_attention(t : Model; var s : Session; dr : GemmaDrafter; l, 
     }
 }
 
-//! The drafter's CPU oracle: one step at `anchor` (the seed's position = the target's n_past: the
-//! query ropes there and sees the target keys [0, anchor)) from token `tok` and target hidden `h`.
-//! Fills `out` with the greedy token, the full-vocab logits and the 2816 hidden the next step feeds.
+//! The drafter's CPU oracle, not a serving rail (it sizes its scratch per call): one step at `anchor`
+//! (the seed's position = the target's n_past: the query ropes there and sees the target keys [0, anchor))
+//! from token `tok` and target hidden `h`; fills `out` with the greedy token, the logits and the next h.
+[cold_path]
 def gemma_draft_step_cpu(t : Model; var s : Session; dr : GemmaDrafter; tok : int64;   // nolint:STYLE038 - one forward pass; the phases share the scratch and must stay in order
                          h : array<float>; anchor : int64; var out : GemmaDraftOut) {
     if (!dr.ok) {
@@ -510,7 +507,7 @@ def gemma_draft_step_cpu(t : Model; var s : Session; dr : GemmaDrafter; tok : in
     let dim = dr.dim
     let eps = dr.eps
     var xcat : array<float>
-    xcat |> resize(2l * dr.tdim)
+    xcat |> reserve_resize(2l * dr.tdim)
     embed_row(t, tok, unsafe(addr(xcat[0])))
     let escale = sqrt(float(dr.tdim))
     for (i in range64(dr.tdim)) {
@@ -518,31 +515,31 @@ def gemma_draft_step_cpu(t : Model; var s : Session; dr : GemmaDrafter; tok : in
     }
     copy_floats(h, 0l, xcat, dr.tdim, dr.tdim)
     var xin : array<float>
-    xin |> resize(dim)
+    xin |> reserve_resize(dim)
     mv_q8_blob(xin, dr.blob, dr.pre_proj_off, xcat, 2l * dr.tdim, dim)
 
     var nrm : array<float>
-    nrm |> resize(dim)
+    nrm |> reserve_resize(dim)
     var o : array<float>
-    o |> resize(dim)
+    o |> reserve_resize(dim)
     var x1 : array<float>
-    x1 |> resize(dim)
+    x1 |> reserve_resize(dim)
     var g : array<float>
-    g |> resize(dr.hidden)
+    g |> reserve_resize(dr.hidden)
     var u : array<float>
-    u |> resize(dr.hidden)
+    u |> reserve_resize(dr.hidden)
     var maxhs = 0l
     for (v in dr.hs) {
         maxhs = max(maxhs, v)
     }
     var q : array<float>
-    q |> resize(dr.n_heads * maxhs)
+    q |> reserve_resize(dr.n_heads * maxhs)
     var attn : array<float>
-    attn |> resize(dr.n_heads * maxhs)
+    attn |> reserve_resize(dr.n_heads * maxhs)
     var kvrow : array<float>
-    kvrow |> resize(maxhs)
+    kvrow |> reserve_resize(maxhs)
     var scores : array<float>
-    scores |> resize(anchor + 1l)
+    scores |> reserve_resize(anchor + 1l)
     var cosr : array<float>
     var sinr : array<float>
     var ff : array<float>
@@ -581,7 +578,7 @@ def gemma_draft_step_cpu(t : Model; var s : Session; dr : GemmaDrafter; tok : in
         }
     }
     rms_f(nrm, xin, dr.fblob, dr.out_norm_off, dim, eps)
-    out.logits |> resize(dr.vocab)
+    out.logits |> reserve_resize(dr.vocab)
     mv_q8_blob(out.logits, dr.blob, dr.tok_emb_off, nrm, dim, dr.vocab)
     var best = 0l
     var bv = out.logits[0]
@@ -592,6 +589,6 @@ def gemma_draft_step_cpu(t : Model; var s : Session; dr : GemmaDrafter; tok : in
         }
     }
     out.token = best
-    out.h_next |> resize(dr.tdim)
+    out.h_next |> reserve_resize(dr.tdim)
     mv_q8_blob(out.h_next, dr.blob, dr.post_proj_off, nrm, dim, dr.tdim)
 }

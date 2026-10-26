@@ -1918,8 +1918,6 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/skills/
     # skills/daslang_live.md (prefix match on the full path)
     REGEX "/skills/internal$" EXCLUDE
     REGEX "/skills/daslang$" EXCLUDE
-    # ruling provenance for this repo's rule documents, not a skill
-    REGEX "/LAWS\\.md$" EXCLUDE
     PATTERN "*.md"
 )
 # its README is editing rules for this repo's maintainers, meaningless in the SDK
@@ -1927,7 +1925,6 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/skills/daslang/
     DESTINATION ${DAS_INSTALL_DOCDIR}/skills/daslang
     FILES_MATCHING
     REGEX "/daslang/README\\.md$" EXCLUDE
-    REGEX "/LAWS\\.md$" EXCLUDE
     PATTERN "*.md"
 )
 # The review constitution ships with the review skills that route to it, and the
@@ -1935,6 +1932,7 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/skills/daslang/
 install(FILES ${PROJECT_SOURCE_DIR}/REVIEW_COMMON.md DESTINATION ${DAS_INSTALL_DOCDIR})
 install(FILES ${PROJECT_SOURCE_DIR}/ARCHITECTURE_COMMON.md DESTINATION ${DAS_INSTALL_DOCDIR})
 install(FILES ${PROJECT_SOURCE_DIR}/LICENSE DESTINATION ${DAS_INSTALL_DOCDIR})
+install(FILES ${PROJECT_SOURCE_DIR}/THIRD_PARTY_NOTICES.md DESTINATION ${DAS_INSTALL_DOCDIR})
 install(FILES ${PROJECT_SOURCE_DIR}/3rdparty/uriparser/COPYING DESTINATION ${DAS_INSTALL_DOCDIR} RENAME URIPARSER.LICENSE)
 install(FILES ${PROJECT_SOURCE_DIR}/include/dag_noise/LICENSE DESTINATION ${DAS_INSTALL_DOCDIR} RENAME DAG_NOISE.LICENSE)
 install(FILES ${PROJECT_SOURCE_DIR}/include/vecmath/LICENSE DESTINATION ${DAS_INSTALL_DOCDIR} RENAME VEC_MATH.LICENSE)
@@ -2029,10 +2027,15 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/skills/daslang/
     DESTINATION .claude/skills/daslang
     FILES_MATCHING
     REGEX "/daslang/README\\.md$" EXCLUDE
-    REGEX "/LAWS\\.md$" EXCLUDE
     PATTERN "*.md"
 )
 install(FILES ${PROJECT_SOURCE_DIR}/.claude/agents/dragon.md DESTINATION .claude/agents)
+
+install(FILES
+    ${PROJECT_SOURCE_DIR}/utils/dap/mcp_bridge.py
+    ${PROJECT_SOURCE_DIR}/utils/dap/README.md
+    DESTINATION utils/dap
+)
 
 # Install dascov (code coverage)
 install(FILES ${PROJECT_SOURCE_DIR}/utils/dascov/main.das DESTINATION utils/dascov)
@@ -2183,7 +2186,6 @@ install(DIRECTORY ${PROJECT_SOURCE_DIR}/examples/
     PATTERN "REVIEW.md" EXCLUDE
     PATTERN "REVIEW.das" EXCLUDE
     PATTERN "ARCHITECTURE.md" EXCLUDE
-    PATTERN "LAWS.md" EXCLUDE
     # soundfonts are fetched locally and carry unclear redistribution terms —
     # they must never ride into a release bundle
     PATTERN "*.sf2" EXCLUDE
@@ -2363,7 +2365,7 @@ if(_arch_specs AND NOT ${DAS_TOOLS_DISABLED} AND NOT CMAKE_CROSSCOMPILING)
 endif()
 
 # Repo-internal rule-and-record documents never install: REVIEW.md / REVIEW.das,
-# ARCHITECTURE.md, LAWS.md, MASTERPLAN logs, followup/perf/profile ledgers. The
+# ARCHITECTURE.md, MASTERPLAN logs, followup/perf/profile ledgers. The
 # exceptions are REVIEW_COMMON.md and ARCHITECTURE_COMMON.md at the install root
 # (adopting repos vendor from them), and the arch-extract excerpts registered above,
 # recognized by their first-line banner. This must stay the LAST install rule in the
@@ -2382,7 +2384,7 @@ install(CODE [[
         get_filename_component(_name "${_f}" NAME)
         get_filename_component(_f_abs "${_f}" ABSOLUTE)
         if((_name MATCHES "^REVIEW.*\.(md|das)$"
-                OR _name MATCHES "^(ARCHITECTURE[A-Za-z_]*|LAWS|MASTERPLAN[A-Za-z_]*|PERF_LEDGER|PROFILE|THINKING)\.md$"
+                OR _name MATCHES "^(ARCHITECTURE[A-Za-z_]*|MASTERPLAN[A-Za-z_]*|PERF_LEDGER|PROFILE|THINKING)\.md$"
                 OR _name MATCHES "^followup_.*\.md$")
             AND NOT _f_abs STREQUAL _root_common
             AND NOT _f_abs STREQUAL _root_arch_common)

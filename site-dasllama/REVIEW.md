@@ -3,9 +3,8 @@
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture doc:
 `README.md`. Planned work: `plans/dasllama_io_site.md`.
 
-In this checklist "a page" means every served `.html` page in this directory and in
-`stories/`, the generated news region inside index.html and the generated story pages
-included.
+In this checklist "a page" means every served `.html` page under this directory, the generated
+news region inside index.html included.
 
 **A shell command, flag, or output line shown on a page is a defect unless the command runs
 verbatim and produces the result the page shows.**
@@ -13,9 +12,10 @@ verbatim and produces the result the page shows.**
 **A code sample shown on a page that does not compile and run with the current toolchain is
 a defect.**
 
-**A number shown on a page with no source named on the page is a defect** - the source is
-live data the page renders it from, or a page comment or prose clause naming the checked-in
-measurement record, or naming the box and date and what was measured, or the word
+**A measured number shown on a page with no source named on the page is a defect** - a
+measured number is one a run produced, and the named source is whatever lets a reader find
+that run: the live endpoint the page renders it from, the checked-in measurement record a page
+comment or prose clause names, the box and date and what was measured, or the word
 placeholder.
 
 **A comparative superiority claim made in words rather than as side-by-side figures, on any
@@ -33,21 +33,25 @@ name.
 visitor sends that host and whether the host sets cookies.**
 
 **Weakening `REVIEW.das`'s `dl-*` census - the gate that reports a `dl-*` name used in a
-page, script or stylesheet here that no selector of `site/files/dasllama-table.css` (repo
-root) defines and no `id="..."` in those files declares - is a defect.**
+top-level `.html` page here, or in a script or stylesheet under `files/`, that no selector of
+`site/files/dasllama-table.css` (repo root) defines and no `id="..."` in those files declares -
+is a defect.**
 
-**A statement on a page here about what a shipped tool does is a defect unless it matches
-the current code.**
+**A claim in any text this folder publishes or documents - a page, a `_news/*.md` or
+`_stories/*.md` entry, or `README.md` - that is not true at publish time is a defect.** A dated
+`_news` or `_stories` entry is read as a claim about its own date; standing page copy - a
+masthead, section prose, a meta tag - is read as a claim about now, and a diff that falsifies
+standing copy fixes it in the same change. Check a claim about what a shipped tool does against
+that tool's current code, and a claim about what a page here renders against the page's markup
+and `files/dasllama-io.js`.
 
-**A claim in a `_news/*.md` or `_stories/*.md` entry that is not true at publish time is a
-defect, including a claim about what a page here renders - check that one against the
-page's markup and `files/dasllama-io.js`.**
-
-**A `_news/*.md` or `_stories/*.md` entry for something not yet shipped is a defect.**
+**A `_news/*.md` or `_stories/*.md` entry for something not yet shipped is a defect.** Shipped
+means a reader can have it now: the code the entry describes is merged to this repository's
+`master`, and any artifact the entry points a reader at is downloadable from where it points.
 
 **A figure in a `_stories/*.md` entry that names no date and build sha for the run it came
-from - in the entry's own text or its figures comment - is a defect**; a story is a dated
-one-day experiment, and a number without its day reads as a standing claim.
+from - in the entry's own text or its `<!-- figures: ... -->` comment - is a defect** - a
+number without its date reads as a standing claim.
 
 **A value `files/dasllama-io.js` takes from `/api/*` and puts into markup without the
 context-correct escape is a defect: `esc()` (which escapes `< > & " '`) for text and for
@@ -57,9 +61,8 @@ quoted-attribute values, `Number(...)` for anything numeric, and `safeApiHref()`
 **Weakening `test_metadata.py`'s per-page assertions - the test that fails a page without a
 `<title>`, a meta description, the OpenGraph tags, or the Atom `<link>` - is a defect.**
 
-**Weakening `REVIEW.das`'s page census - the gate that reports a top-level served file with
-no copy line in the dasllama.io deploy step (`.github/workflows/pages.yml`, repo root), a
-page missing from `build_news.py`'s sitemap list or `test_metadata.py`'s page list, or a
-story page in `stories/` with no directory copy line, no sitemap entry, or no glob in the
-metadata test - is a defect.** Local preview serves the tree directly, so no miss shows
-there: the page deploys unlisted, uncrawled, or unchecked.
+**Weakening `REVIEW.das`'s page census - the gate that reports a served page, or the `stories/`
+directory, missing from the dasllama.io deploy step (`.github/workflows/pages.yml`, repo root),
+from `build_news.py`'s sitemap list or `sitemap.xml`, or from `test_metadata.py`'s page list -
+is a defect.** Local preview serves the tree directly, so no miss shows there: the page deploys
+unlisted, uncrawled, or unchecked.

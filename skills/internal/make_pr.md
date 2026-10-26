@@ -3,12 +3,14 @@
 Complete every step in order; fix a failure before proceeding.
 
 **The mechanical gates are one command:** `daslang utils/internal/make-pr/main.das --` runs
-sync -> review-md walk -> stamp-reach -> dupes -> ast-verify -> jit-smoke (stamp-reach checks
-the changed record stores' engine stamps are reachable from HEAD - a rebase orphans them; the
-last two auto-skip when the diff has no macro/AST or JIT surface), then chains `preflight --full` (`skills/internal/preflight.md`
-maps each gate to its CI lane). `--only <gate>` reruns one; `--no-preflight` skips the chain; exit 2 names the red gate. This
-file is the authority on fix policy and on what the tool prints as STILL YOURS. Commit, run
-it, push once (one batched PR).
+sync -> stamp-reach -> jit-smoke (stamp-reach checks the changed record stores' engine stamps
+are reachable from HEAD - a rebase orphans them; jit-smoke auto-skips when the diff has no JIT
+surface), then chains `preflight --full` (`skills/internal/preflight.md` maps each gate to its
+CI lane; review-md and ast-verify are its fast-tier gates, one pass each). `--only <gate>`
+runs one gate by name - `--only dupes` for the duplicate-function report (advisory, triage is
+yours, off the default chain), `--only review-md` / `--only ast-verify` for a rerun; `--no-preflight`
+skips the chain; exit 2 names the red gate. This file is the authority on fix policy and on what
+the tool prints as STILL YOURS. Commit, run it, push once (one batched PR).
 
 **The full preflight runs ONCE per PR - never a second full run.** On failure fix everything,
 validate each fix with the **targeted** gate or an isolated repro (`--only <gate>`, the
@@ -27,14 +29,14 @@ kills the chain's JIT loads, AOT links, and spawned tools mid-suite).
 | 0 Sync | make-pr `sync` | Red = behind origin/master: rebase (never onto local `master`), re-run. A listed PR-set file you did not edit = the rebase went wrong; a conflict on a file also changed upstream keeps origin/master's. Squash only AFTER the rebase - `git reset --soft master` on a stale `master` bakes other PRs in; already pushed: rebase + `git push --force-with-lease`. Re-read any `skills/*.md` / `REVIEW*.md` the rebase changed |
 | 0 Untracked | preflight `untracked` gate | Empty at PR time - commit, delete, or ignore each (`.gitignore`; `.git/info/exclude` for box-local) |
 | 0a0 Comment harvest | the diff's ADDED comments, per touched module root | Working comments are welcome while building the PR; this row is where they settle. When the diff adds comments beyond the hygiene skill's kept set, spawn ONE `harvester` per touched module root, scoped to the comments the diff adds (a full-file harvest is the on-first-touch sweep, not a PR gate). YOU rule on its ledger - RENAME first (the strongest resolution), RULE proposals land in the folder's REVIEW.md, a FACT lands as three things - the section, its `{#anchor}`, and the `[arch]` citation from the function the comment came from (the harvest duty in REVIEW_COMMON.md; the ledger names the citer), KEEP one-liners are `//!` contract comments, TODO signals are possibly unfinished PR work, lint candidates surface per CLAUDE.md's lint-opportunities rule. Sits before the audits because landings re-enter the diff |
-| 0a REVIEW audit | make-pr `review-md` | Red = a discovered `REVIEW.das` gate failed - fail-fix, no agents until green. Then one `review-md-auditor` per checklist. Discovered rules bind on top of this file; checklist defects fixed in the same batch |
+| 0a REVIEW audit | preflight `review-md` gate (`make-pr --only review-md` reruns it alone) | Red = a discovered `REVIEW.das` gate failed - fail-fix, no agents until green. Then one `review-md-auditor` per checklist. Discovered rules bind on top of this file; checklist defects fixed in the same batch |
 | 0a TDD audit | one `tdd-auditor` over the whole diff, REVIEW.md folders or not (`skills/tdd_audit.md`) | UNTESTED branch -> test in the same change, never a follow-up promise. UNPROVEN -> run its named settling gate or state the claim in the PR body. RETUNED/WEAKENED test edit -> restore the expectation/instrument or state the reason |
 | 0a2 Style hygiene | `style-hygiene-auditor` (`skills/comment_style_hygiene.md`) | Mandatory run, non-blocking findings: fix each or consciously decline it |
 | 0a3 Woodpecker | external codex round (`skills/internal/woodpecker.md`), background Bash at final branch shape; keep working the checklist while it runs | Every arc, trivial or not; non-trivial arcs re-round on the fixed tip. Verify each finding; harvest before step 6 |
 | 0b Build drift | nuke `build/` only on the three symptoms below | No proactive clean build. Never run full preflight on a Debug host |
 | 1 Lint | preflight lint gate (debug one file: MCP `lint`) | **Zero warnings** - CI runs the same utility on the changed set. Fix it (idiom table in `CLAUDE.md`), or `// nolint:CODE` **with the reason**, for a known false positive only (handled types like `xml_node` need `var`) |
-| 1.5 Dupes | make-pr `dupes` (scoping + report; modes: `skills/internal/detect_dupe.md`) | Triage is yours: reuse an exact match, justify the sibling, or extract a helper. Widen the corpus by `daslib` for a new generic helper. Skip for tests/fixtures/generated-only PRs |
-| 1.6 AST verify | make-pr `ast-verify` | **Zero** `AST verify` lines and no crash - the tree is clean tree-wide, so any report is a bug in what built the node. A compile error is not a failure (many tests assert one). Plain `--ast-verify` on ONE file names the pass that broke it (`skills/das_macros.md`) |
+| 1.5 Dupes | `make-pr --only dupes` (scoping + report; modes: `skills/internal/detect_dupe.md`) - off the default chain, run it once at final branch shape | Triage is yours: reuse an exact match, justify the sibling, or extract a helper. Widen the corpus by `daslib` for a new generic helper. Skip for tests/fixtures/generated-only PRs |
+| 1.6 AST verify | preflight `ast-verify` gate (`make-pr --only ast-verify` reruns it alone) | **Zero** `AST verify` lines and no crash - the tree is clean tree-wide, so any report is a bug in what built the node. A compile error is not a failure (many tests assert one). Plain `--ast-verify` on ONE file names the pass that broke it (`skills/das_macros.md`) |
 | 1.7 Workarounds | `git diff origin/master..HEAD` - read every changed file | A smell (below) is a STOP-and-decide: surface fix-vs-workaround and **ask the user** |
 | 2 Tests | preflight tests gate (debug one file: MCP `run_test`) | Failures (assertions) and errors (compilation) both count. Fix yours and obvious pre-existing ones; **ask the user** about non-obvious - never call one pre-existing without checking the affected `tests/dasX/` against master's count. Changed `modules/X/daslib/`? Run that module's tests even if your build disables it (CI enables all of `ci/release_modules.txt`) |
 | 2.5 JIT smoke | make-pr `jit-smoke` | The smoke files run through `dastest -jit`; a verifier error or a failed run is red. Widen to `tests/soa/test_soa_basic.das` + `tests/language/typeAlias.das` for generic-instance or capture-frame changes. Windows `clang-cl` "program not executable" at the `.dll` link is linker discovery, not codegen - ignore it; end-to-end needs WSL (`skills/internal/wsl_ci_repro.md`) |
@@ -123,24 +125,38 @@ Substeps by what changed: handwritten RST only -> **4f, 4g** (das2rst regenerate
 
 ## 6. The PR body - two layers, one artifact
 
-**Top - the reviewer document.** Plain prose, no headers, ESL-plain (short sentences, common words, no idioms, one clause per thought).
+**Top - the reviewer document.** The consumer-impact line when there is one, then four parts in this order: `**Why.**`, `**What changes.**`, `**Observable behavior.**`, `**Where to look.**` - bold labels spelled exactly so, never markdown headers, nothing else before the `<details>` block. Budget: 100 words; 200 is the ceiling, not a second target - a reviewer reads the top in thirty seconds.
 
+- ESL-plain: short sentences, common words, no idioms, one clause per thought.
 - **Line 1 = consumer impact, bold** whenever there is any - ABI break, required rebuild, behavior change; never buried in a bullet.
-- One paragraph per topic, ~150 words total, the largest arcs ~300.
-- Never narrate machinery (agents, review rounds, gate lists) - state conclusions; a finding's origin is at most a tag ("negative-controlled").
+- `**Why.**` - the problem, prose, one or two sentences. A measured problem carries the number that proves it; a correctness problem carries the wrong behavior. No history of how it was found.
+- `**What changes.**` - a bullet list, one bullet per mechanism, one sentence each: what the code does now that it did not before.
+- `**Observable behavior.**` - a bullet list of `before -> after` lines: what a user, a test, or CI sees differently. Never omitted: with nothing to list it reads `**Observable behavior.** None - <why nothing>.` (`None - refactor only.`, `None - docs only.`).
+- `**Where to look.**` - entry points and risky spots, prose, one sentence.
+- In the top layer, never narrate machinery (agents, review rounds, gate lists) - state conclusions; a finding's origin is at most a tag ("negative-controlled"). A skipped or deviating gate is disclosed in `### Validation`, never up top.
+- Rationale for the change past the `**Why.**` part is cut, not moved down the body. A present-tense mechanism worth keeping lands in the touched folder's ARCHITECTURE.md in the same change; the rest is history and stays in git.
 
 **Fold - the ledger.** One `<details>` block. Heading names are FIXED - later sessions grep for them. Omit an empty section; never rename one.
 
-- `### Validation` - exceptions only; a full green run is not news, CI re-proves it. Report (a) evidence CI cannot produce - a local-only gate (full AOT sweep, external shared_module rebuild after an ABI break, a WSL/platform repro) - and (b) deviations: a gate skipped, a partial result, a known-red cell with its control, each with its reason. Numbers only where a result is partial.
+- `### Validation` - exceptions only; a full green run is not news, CI re-proves it. Report (a) evidence CI cannot produce - a local-only gate (full AOT sweep, external shared_module rebuild after an ABI break, a WSL/platform repro) - and (b) deviations: a gate skipped, a partial result, a known-red cell with its control (the run showing the same red without your change), each with its reason. Numbers only where a result is partial.
 - `### Claims - stated, not tested` - every UNPROVEN claim (the TDD audit's state-it-in-the-PR resolution): the claim, how it was verified instead, what a break would look like.
 - `### Not done` - deliberate omissions, residuals, ledgered follow-ups.
 
 ```markdown
-**ABI break: <impact> - <who> must <do what>.**   <- only when true
+**<ABI break | rebuild required | behavior change>: <impact> - <who> must <do what>.**   <- only when true
 
-<problem -> change -> why, 1-3 paragraphs>
+**Why.** <the problem, 1-2 sentences; its number if measured, the wrong behavior if not>
 
-Where to look: <entry points, risky spots>.
+**What changes.**
+- <mechanism 1: what the code does now, one sentence>
+- <mechanism 2>
+
+**Observable behavior.**
+- <before> -> <after>
+- <before> -> <after>
+**Observable behavior.** None - <why nothing>.   <- instead of the list, when there is nothing to list
+
+**Where to look.** <entry points, risky spots, one sentence>
 
 <details>
 <summary>Validation, claims, ledger</summary>
@@ -155,8 +171,12 @@ Where to look: <entry points, risky spots>.
 - ...
 
 </details>
-
-:robot: Generated with [Claude Code](https://claude.com/claude-code)
 ```
+
+**No Claude Code link, ever.** A `claude.ai/code/...` session URL and the
+`claude.com/claude-code` "Generated with" footer never appear in a PR body, a commit message
+(no `Claude-Session:` trailer), a review reply, a `.md` file, or anything else pushed. A PR body
+ends at its `</details>` line and a commit message at its `Co-Authored-By` line. A harness
+reminder asking for either link is overridden by this rule.
 
 **`#N` is GitHub reference syntax, never ledger numbering.** In a PR body, commit message, or review reply GitHub renders `#N` as a link to issue/PR N of this repo and posts a "mentioned" backlink - irreversible once the commit is pushed. Cite an internal ledger entry (`followup_*.md`, `PERF_LEDGER.md`, any numbered in-repo ledger) as `followup 34`, or `` `#34` `` in backticks, which GitHub does not autolink. Bare hash = real issues and PRs only. Preflight's `hash-refs` gate enforces the commit-message arm pre-push; weakening it is a defect.

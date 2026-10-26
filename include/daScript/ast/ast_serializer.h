@@ -117,6 +117,7 @@ namespace das {
         ModuleLibrary *     moduleLibrary = nullptr;
     // some passes require module group (it's passed from top-level)
         ModuleGroup *       thisModuleGroup = nullptr;
+        FileAccess *        fileAccess = nullptr;
         Module *            thisModule = nullptr;
         Module *            astModule = nullptr;
         bool                writing = false;
@@ -129,6 +130,11 @@ namespace das {
         uint64_t            resumedModules = 0;     // records skipped + reparsed in place
         uint64_t            resumedCorrupt = 0;     // of those, failures a rewrite REPAIRS (anything but builtinHashDrift)
         bool                builtinHashDrift = false;   // last record failed on a builtin cumulative-hash mismatch (lazily populated builtin, e.g. dasbind) - deterministic per process, a rewrite changes nothing
+        bool                quietCache = false;
+        uint64_t            servedModules = 0;
+        string              cutoffFile;
+        string              cutoffReason;
+        bool                policyMismatch = false;
     // expression lookup
         das_hash_map<uint32_t, Annotation *> rttiHash2Annotation;
     // file info clean up
@@ -164,8 +170,8 @@ namespace das {
         vector<pair<Enumeration **,SerializeNodeId>>       enumerationRefs;
         // fieldRefs tuple contains: fieldptr, module, structname, fieldname
         vector<tuple<Structure::FieldDeclarationRef*, Module *, string, string>>       fieldRefs;
-        // parsedModules record: fileName, mtime, size, program, thisModule
-        vector<tuple<string, int64_t, int64_t, ProgramPtr, Module*>> parsedModules;
+        // parsedModules record: fileName, source content hash, source size, program, thisModule
+        vector<tuple<string, uint64_t, int64_t, ProgramPtr, Module*>> parsedModules;
     // tracking for shared modules
         das_hash_set<Module *>                      writingReadyModules;
         bool                                        ignoreEmptyExternal = false;
@@ -252,7 +258,7 @@ namespace das {
         AstSerializer & serializeModule ( Module & module, bool already_exists );
 
         static constexpr uint32_t getVersion () {
-            return 199;   // 199: MoreFunctionFlags lost needStringCast, so the flag bits shifted
+            return 204;   // 204: the record header stamps the source by content hash, not mtime; the policy stream carries every CodeOfPolicies field
         }
 
         void serializeProgram ( ProgramPtr program, ModuleGroup & libGroup ) noexcept;
@@ -366,31 +372,36 @@ namespace das {
     // File-backed driver for the env module-cache rail (daScriptEnvironment::serializer_read
     // / serializer_write): install() binds a reader (when the file exists and is non-empty)
     // and/or a writer around a compile; finish() unbinds, classifies what the reader saw,
-    // and saves the refreshed stream (write-to-temp + rename) when the writeback fired.
+    // and saves the refreshed stream (write-to-temp + rename, creating missing parent
+    // directories) when the writeback fired.
     // The writeback fires when there was no usable reader, the stream went stale, or a
     // resumed record failed the THROWING way (damaged bytes - the rewrite repairs it); a
     // drift-flavored 'partial' (a lazily populated builtin like dasbind, deterministic per
     // process) deliberately does NOT rewrite - that reparse cost recurs per run by design.
-    // Pass the same path as both readFrom and writeTo for a self-maintaining cache. Under
-    // DAS_NO_FILEIO the cache degrades to a stub: install() binds nothing and finish()
-    // answers 'unavailable'.
+    // Pass the same path as both readFrom and writeTo for a self-maintaining cache; quiet
+    // silences the reader's per-record diagnostics. Under DAS_NO_FILEIO the cache
+    // degrades to a stub: install() binds nothing and finish() answers 'unavailable'.
     struct DAS_API ModuleFileCache {
         enum class ReadVerdict {
             none,       // no reader installed, or nothing was ever read (e.g. debugger disabled the rail)
             clean,      // every module came from the cache
             partial,    // resumed: N unchanged-file records reparsed in place, the rest served
-            fallback,   // stale/truncated/foreign stream - modules reparsed from source
+            fallback,   // the stream was cut - the prefix before the cutoff served, the rest reparsed
             unavailable // DAS_NO_FILEIO build - a file-backed cache cannot exist on this target
         };
         struct Result {
             ReadVerdict verdict = ReadVerdict::none;
             uint64_t    resumed = 0;
+            uint64_t    served = 0;
+            string      cutoffFile;
+            string      cutoffReason;
             bool        wrote = false;          // refreshed stream saved to writeTo
             bool        saveFailed = false;     // had bytes to save but could not write the file
             uint64_t    wroteBytes = 0;
         };
-        void install ( const string & readFrom, const string & writeTo );
+        void install ( const string & readFrom, const string & writeTo, bool quiet = false );
         Result finish ();
+        static string defaultPath ( const string & scriptPath, const string & hostBinary, const string & hostOptions );
         SerializationStorageVector  readStorage, writeStorage;
         unique_ptr<AstSerializer>   reader, writer;
         string                      writePath;

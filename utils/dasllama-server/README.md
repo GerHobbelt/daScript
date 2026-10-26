@@ -31,17 +31,19 @@ Run under `-jit` - interpreted inference is far too slow. Flags:
 | `--asr` | `-a` | - | ASR model (whisper/parakeet/qwen3-asr) - enables the `/v1/audio/*` routes |
 | `--asr-workers` | - | `1` | Long-lived ASR request threads; each owns a model and reusable session. Set `2` for two parallel transcriptions |
 | `--mmproj` | - | - | mmproj GGUF for the Qwen3-ASR route (paired with `--asr`) |
+| `--tts` | - | - | TTS model GGUF (`kitten-nano`, `kitten-mini`, `kokoro-82m`; the front-end packs `tts_g2p.bin` + `tts_postag.bin` sit beside it) - enables `/v1/audio/speech` |
+| `--tts-lane` | - | `q8` | Weight lane the speech worker pins around its load: `q8` (the prepared quant image beside the GGUF) or `f32` (the file's own planes - the reference lane). An unknown spelling warns and serves `q8` |
 | `--image-mmproj` | - | - | Vision mmproj (gemma4uv, gemma4v, or gemma3v, sniffed) for the default model - enables `image_url` parts on `/v1/chat/completions`. Per-model in a `[[models]]` roster: `image_mmproj = "..."`. When the file also carries a gemma4a audio encoder (the E-series mmproj carries both towers), the same flag arms **native audio**: `input_audio` parts serve through the same slot - one decoder, one mmproj, no dedicated ASR model copy |
 | `--ctx` | - | *model* | Context-length cap in tokens (default: the model's trained `context_length`; set it to bound `--flat` KV or trim RAM) |
 | `--max-tokens` | - | `256` | Default reply token budget when a request omits `max_tokens` (clamped to `--ctx` per request) |
 | `--streams` | `-s` | `4` | Max concurrent generation streams |
 | `--threads` | `-t` | `16` | Worker-lane cap for the matmul dispatch (`-1` = all cores) - decode is bandwidth-bound, so an uncapped dispatch just fights the rest of the box |
-| `--team-dispatch` | - | `hybrid` | `hybrid`: LLM uses the worker team while ASR callers run inline; `team`: all callers use serialized team publishes; `inline`: every caller runs independently |
+| `--team-dispatch` | - | `hybrid` | `hybrid`: LLM uses the worker team while the ASR and TTS workers run inline; `team`: all callers use serialized team publishes; `inline`: every caller runs independently |
 | `--chunk` | - | `64` | Prefill quantum in tokens - decode stalls at most this per tick |
 | `--page-rows` | - | `64` | KV page size in positions for paged serving |
 | `--prefix` | - | *auto* | Prefix-cache retention cap in pages (auto: one full context per stream; `-1` = unbounded) |
 | `--flat` | - | - | Flat preallocated KV sessions - disables paged serving and the prefix cache |
-| `--mtp` | - | - | MTP/NextN self-speculative decode for greedy requests (`temperature: 0`, no repetition penalty) - needs a model with an in-file NextN head (the `-MTP-` GGUFs). Output-invariant; up to ~2x decode on the dense qwen35/qwen3.6 models (measured rows: `modules/dasLLAMA/performance/records/<box>.json`, on the site board), ~nothing on the MoEs. `/v1/stats` reports `mtp_drafted`/`mtp_accepted` |
+| `--mtp` | - | - | MTP/NextN self-speculative decode - needs a model with an in-file NextN head (the `-MTP-` GGUFs). Greedy requests are output-invariant; a sampled request (`temperature` > 0, penalties included) draws each verify row with its own sampler and keeps the plain sampled distribution, at a lower acceptance rate. Up to ~2x decode on the dense qwen35/qwen3.6 models (measured rows: `modules/dasLLAMA/performance/records/<box>.json`, on the site board), ~nothing on the MoEs. `/v1/stats` reports `mtp_drafted`/`mtp_accepted` |
 | `--models-dir` | - | `~/.dasllama/models` | Where the model catalog downloads land (`DASLLAMA_MODELS_DIR` overrides both this and the config key) |
 | `--help` | `-?` | - | Show help and exit |
 
@@ -58,16 +60,17 @@ ctx = 4096
 max_tokens = 4096  # default reply budget for clients that omit max_tokens (e.g. `llm chat`)
 streams = 4
 threads = 16       # matmul dispatch lane cap; -1 = all cores
-team_dispatch = "hybrid" # LLM team dispatch + independent inline ASR caller threads
+team_dispatch = "hybrid" # LLM team dispatch + independent inline ASR/TTS worker threads
 asr_workers = 2    # two independent transcription requests; each worker owns an ASR model
 ```
 
 ## Setup mode and the model catalog
 
-A start with **no model at all** (no `--model`, no config, or every configured path missing)
-does not exit - it boots into **setup mode**: the port opens, the control page serves, every
-inference route answers with a clean error, and the page leads with the **model catalog**
-(sec. 03) - a curated, sha-pinned list of current models (`model_catalog.das`; commit-pinned
+A start with **no LLM model at all** (no `--model`, no config, or every configured path
+missing) **and no servable `--tts`** does not exit - it boots into **setup mode**: the port
+opens, the control page serves, every inference route answers with a clean error, and the
+page leads with the **model catalog** (sec. 03) - a curated, sha-pinned list of current models
+(`model_catalog.das`; commit-pinned
 HF URLs, canonical sha256, one download at a time, `curl -C -` resume). A finished download
 is verified against its pinned sha before it is renamed into `models_dir` (default
 `~/.dasllama/models`; the `models_dir` config key or `DASLLAMA_MODELS_DIR` move it) with the
@@ -76,12 +79,29 @@ model** - the page writes the config and restarts (exit 4, the watchdog contract
 into serving it. The same catalog stays available on a serving server for pulling more
 models.
 
+**`--tts` alone is a serving start, not a setup start.** A speech-only server has no LLM slot,
+so `/v1/stats` answers the slotless shape - but its `setup` reads `false`, and the page keeps
+its serving surface instead of leading with the catalog.
+
+**A `--tts` the server cannot serve degrades, it does not die.** A missing file (the GGUF, or
+`tts_g2p.bin` / `tts_postag.bin` beside it) is logged as an error before the worker starts, and
+so is a load that fails with the whole set present - a front-end pack from before this build, a
+truncated GGUF, a model whose every voice speaks a language the front end does not phonemize.
+Either way the speech route is dropped and the boot serves whatever is left - the LLM slots if
+any loaded, else setup mode by the rule above. Nothing panics: a crash-looping boot under the
+watchdog never gets a page to fix the config from. A failed LOAD also leaves the `tts` block on
+`/v1/stats` with `ready: false` and an `error`, so the page can say why instead of waiting.
+
 Catalog entries carry their **towers**: a vision-capable row offers its pinned mmproj
 (download -> **enable vision** -> restart wires `image_mmproj`), and a **dictation** strip
 under the table offers the ASR tower (parakeet v3; wires the `asr` key the same way) -
 `POST /catalog/download` takes `{"name", "tower": "vision"}` or `{"tower": "asr"}` on the
-same one-at-a-time rail. Setup-mode **serve this model** wires any tower already on disk
-automatically. Each row also wears a **fit badge** (fits gpu / fits / tight / too big) from
+same one-at-a-time rail. A **speech** strip sits beside it for the text-to-speech set the
+`/catalog` document's `tts` list carries: the two front-end packs first (every speech model
+loads them), then one model, then **enable speech** wires the `tts` key -
+`{"tower": "tts", "file": <file>}` pulls one file of that set on the same rail. Setup-mode
+**serve this model** wires any tower already on disk automatically. Each row also wears a
+**fit badge** (fits gpu / fits / tight / too big) from
 the box facts the `/catalog` document carries (`box.ram_gb`, and the armed tier's weight
 budget as `box.vram_mb`); the advertised working set is a hint, not a load gate.
 
@@ -118,6 +138,11 @@ long-lived `new_thread` ASR workers and do not block chat generation; `--asr-wor
 transcriptions at once. Each worker owns its model/context and reuses language-specific session
 scratch, so memory settles at the workers' high-water mark. OpenAI is stateless - the client
 resends the full transcript each turn.
+
+The main server context configures the shared job queue. ASR, TTS and media worker contexts
+enable their own fork-context pools before loading or evaluating a model: that setting is
+context-local, not inherited from the main context. Worker setup preserves the shared queue's
+team/FIFO policy and applies only the worker's selected team-dispatch participation.
 
 ## Supervised deployment
 
@@ -172,7 +197,7 @@ Windows locks the DLLs.
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET`  | `/` | Control page: live stats + charts, models panel (per-slot cards with state/GPU badges, prefix hit rate, switch telemetry, activate buttons; VRAM bar + switch strip), stream swimlane + live text cards, prefix-cache table, a chat panel (all sampling knobs, `<think>` inline, mic input - dictation under `--asr`, else the clip attaches to the next message when the slot serves native audio), config editor with the `[[models]]` roster table + save/restart, GC + drain buttons. Serves `control.html` from beside the server sources - polls `/v1/stats` + `/v1/streams` at 1 Hz |
+| `GET`  | `/` | Control page: live stats + charts, models panel (per-slot cards with state/GPU badges, prefix hit rate, switch telemetry, activate buttons; VRAM bar + switch strip), stream swimlane + live text cards, prefix-cache table, a chat panel (all sampling knobs, `<think>` inline, mic input - dictation under `--asr`, else the clip attaches to the next message when the slot serves native audio; under `--tts` every answer wears a speaker button that reads its content half back on the studio's voice, split at sentence boundaries into pieces the speech route accepts), a speech studio (type a line, hear it, and read the front end's normalized text and per-chunk phonemes under the waveform), config editor with the `[[models]]` roster table + save/restart, GC + drain buttons. Serves `control.html` from beside the server sources - polls `/v1/stats` + `/v1/streams` at 1 Hz |
 | `GET`  | `/v1/models` | Lists every served slot (and `--asr` if loaded) - requests route on these ids via their `"model"` field |
 | `POST` | `/v1/models/activate` | `{"model": name}` loopback-only admin warm-switch: make `name` the DEFAULT + stepped slot (model-less page requests follow) and move the GPU tier to it now (instead of waiting for the owner to drain). `409` while any work is live, `404` on an unknown name; `200` reports `switch_ms` + `backend_effective` |
 | `POST` | `/v1/models/load` | `{"path", "id"?, "backend"?: "auto"\|"cpu", "quant"?, "ctx"?, "image_mmproj"?, "activate"?: true}` loopback-only live load: a downloaded GGUF joins as a NEW serving slot with no restart and no JIT recompile (the load blocks the tick for its duration; a prepared `.dlim` image loads in well under a second). `"auto"` follows the boot GPU policy - same want + `--ctx` clamp every boot load got, the current owner's VRAM state drops first (boot-order semantics) and re-arms if the load fails or stays off the device; `"ctx"` in the body overrides the clamp. An `image_mmproj` arms vision (and audio, when the file carries the gemma4a tower) with a media-worker bounce - a bad mmproj degrades to text-only with the reason in `tower_note`, and a load panic (corrupt GGUF, refused KV geometry) answers `400` with the slot unwound. `409` on a live stream set, a taken id, or a GGUF another slot already serves (one slot per file) |
@@ -182,17 +207,19 @@ Windows locks the DLLs.
 | `POST` | `/v1/embeddings` | Mean-pooled, L2-normalized sentence embeddings |
 | `POST` | `/v1/audio/transcriptions` | Speech->text (multipart upload; needs `--asr`). `response_format=verbose_json` adds timed segments |
 | `POST` | `/v1/audio/translations` | Speech->English text (needs `--asr`) |
+| `POST` | `/v1/audio/speech` | Text->speech (needs `--tts`): `{"input", "voice"?, "speed"?, "response_format"?: "wav" \| "pcm"}` - the OpenAI shape; `wav` (default) is 16-bit PCM at the model's rate, `pcm` the raw samples; the compressed formats answer `400` (no encoder here). One synthesis at a time on the TTS worker (its kernels run inline under `hybrid`, like the ASR workers'), 16 queued |
+| `POST` | `/v1/audio/phonemes` | The front end alone (needs `--tts`): `{"model"?, "input", "voice"?}` -> `{"normalized", "lang", "chunks": [{"text", "phonemes"}]}` - the normalizer's spoken form of the text, the dialect the voice speaks (`lang`), then one row per chunk a synthesis of it would take, each carrying that chunk beside its phoneme string in that dialect. A model whose front end phonemizes ONE language reads every voice name in it - an alias, or a name it does not carry, since there is no other answer to give; a model that phonemizes several requires a voice from its `caps` and refuses an unservable one with the speech route's own 400. `model` is read the way the speech route reads it (`404` on an id that is not the served one). Answered by the TTS worker on the same queue as a synthesis (the same 4096-CHARACTER cap - codepoints, not bytes - and the same 503 when no speech model is served), so the speech studio can show what the model will actually say |
 | `POST` | `/vad` | Silero speech spans over an uploaded clip (the control page's waveform overlay; in-handler, <=120 s, needs the in-repo `silero_vad.bin`) |
-| `GET`  | `/catalog` | The curated model list with local presence + the download state machine (`idle | downloading | verifying | done | failed`, byte progress) |
-| `POST` | `/catalog/download` | `{"name": <entry>}` - start one catalog download; `{"name", "tower": "vision"}` / `{"tower": "asr"}` pull a tower (409 while one runs or the file exists; sha-verified, never waived) |
+| `GET`  | `/catalog` | The curated model list with local presence, the `asr` tower row, the `tts` list (the three speech GGUFs and the two front-end packs, each `file`/`bytes`/`pack`/`present`/`path`), the `box` memory facts + the download state machine (`idle | downloading | verifying | done | failed`, byte progress) |
+| `POST` | `/catalog/download` | `{"name": <entry>}` - start one catalog download; `{"name", "tower": "vision"}` / `{"tower": "asr"}` pull a tower, `{"tower": "tts", "file": <file>}` one file of the speech set (409 while one runs or the file exists; sha-verified, never waived) |
 | `POST` | `/bench` | Loopback-only: start the quiesced A/B benchmark - our engine then the configured `lcpp_bin` - spawned as a child process (needs a source-tree daslang + `lcpp_bin` in the config; 409 while a bench runs or streams are active) |
 | `GET`  | `/bench` | Bench state (`idle | running | done | failed`), live log lines, the result JSON, and the hardware line |
 | `POST` | `/bake` | `{"model"?: name}` loopback-only: bake the slot's prepared `.dlim` image by spawning `dasllama-convert` (empty body bakes the default slot; 409 while a bake or bench runs or streams are active; the dlim GC of never-loadable images runs on completion) |
 | `GET`  | `/bake` | Bake state (`idle | running | done | failed`), the slot it runs for, log lines, the result JSON |
 | `GET`  | `/v1/images` | Per-slot prepared-image inventory: source GGUF path, the flavor THIS process mapped (planar/vulkan/metal, or raw gguf), the trimmed flag, and each on-disk `.dlim`'s info - plus the slot name a bake is currently running for |
-| `GET`  | `/v1/stats` | Scheduler counters (`gen_tokens`, `prefill_tokens`, TTFT last/avg, ...) plus `model`/`active_model`/`ctx`/`uptime_s`/`draining` identity fields, memory footprint (`weights_bytes`, `kv_bytes`, das heaps, `gpu_vram_bytes`/`gpu_budget_bytes`), a `hardware` line (CPU * lanes * GPU), `asr_workers`, `asr_ready`, `asr_active`, `asr_pending`, media counters (`media_pending`, `media_rows`, `mrope_streams` - streams whose media rode the qwen mrope grid walk), and `models[]` - one entry per slot: `file` (source GGUF base name - the page's serve-live gate), `is_active`, `holds_gpu`, requested `backend` vs `backend_effective` (`cpu`/`gpu:rails`/`gpu:resident`), per-slot cache counters, `last_used_s`, switch count/avg ms |
+| `GET`  | `/v1/stats` | Scheduler counters (`gen_tokens`, `prefill_tokens`, TTFT last/avg, ...) plus `model`/`active_model`/`ctx`/`uptime_s`/`draining` identity fields, memory footprint (`weights_bytes`, `kv_bytes`, das heaps, `gpu_vram_bytes`/`gpu_budget_bytes`), a `hardware` line (CPU * lanes * GPU), `asr_workers`, `asr_ready`, `asr_active`, `asr_pending`, speech counters (`tts_done_jobs` - syntheses served since boot, `tts_audio_s` - the speech seconds they carried), a `tts` block present ONLY while a speech model is configured - and still there when its worker could not load it (`id`, `ready`, `pending`, `done_jobs`, `audio_s`, `voices[]` and `sample_rate` as the loaded model declares them, the `lane` its worker pinned or, before there is an answer, the one the boot asked for, and `error` - the loader's reason, present only when the configured model failed to load, which the control page's offer card reads instead of claiming the model is still on its way) - the control page's speech studio gates on `ready`, media counters (`media_pending`, `media_rows`, `mrope_streams` - streams whose media rode the qwen mrope grid walk), and `models[]` - one entry per slot: `file` (source GGUF base name - the page's serve-live gate), `is_active`, `holds_gpu`, requested `backend` vs `backend_effective` (`cpu`/`gpu:rails`/`gpu:resident`), `vision` and `audio` (the towers that slot actually loaded - the catalog row's chip reads them, and `audio` is what tells the chat mic to attach a clip instead of transcribing it), per-slot cache counters, `last_used_s`, switch count/avg ms |
 | `GET`  | `/v1/streams` | Per-stream poll surface: `model` (the slot it runs on), state (`queued`/`prefilling`/`decoding`/`finished`), token counts, TTFT, and capped text tails (prompt head + generated tail); finished streams linger ~10 s flagged `finished`. Plus `cache`: the prefix-cache donation chains (tokens, live pages, hits, age, preview) and `asr`: recent ASR jobs (state, audio s, wall ms, RTF) |
-| `GET`  | `/config` | Effective config with per-key source (`default`/`cli`/`toml`), the `[[models]]` roster, model files beside the served one, active rail (gguf vs prepared `.dlim`), GPU tier status (`supported` + `reason` when the loaded model can't ride it) |
+| `GET`  | `/config` | Effective config with per-key source (`default`/`cli`/`toml`) - one entry per row of the flags table above, `tts` (the speech model path) and `tts_lane` (`q8` | `f32`) included - plus the `[[models]]` roster, model files beside the served one, active rail (gguf vs prepared `.dlim`), GPU tier status (`supported` + `reason` when the loaded model can't ride it) |
 | `POST` | `/config` | Validate a `{key: value}` JSON body and write it as an **authoritative** TOML (`authoritative = true`) to the config path (or `dasllama-server.toml` beside the program on a config-less start). Applies on the next restart |
 | `POST` | `/restart` | Drain like `/shutdown`, then exit with code **4** - the watchdog relaunches, picking up the saved config (3 stays the tune-restart code) |
 | `GET`  | `/exchange` | The sidecar-exchange surface: policy (url/accept/submit/configured), the consent state (`consent`: accepted/declined/empty, `consent_notice`: the first-contact text), + the current tune sidecar's identity and share state (sha, origin, box/applied_box, version gate, shared-yet) |
@@ -208,14 +235,16 @@ Config precedence: `defaults < config TOML < explicit CLI flags` - unless the TO
 `authoritative = true` (what the control page saves), which flips the top: `defaults < CLI <
 authoritative TOML`.
 
-The sidecar exchange rides three config-only keys (no CLI flags - one code path):
-`exchange_accept = verified | any | off` (default `verified` - at an untuned boot a verified
-match downloads and applies instead of racing ~12 minutes; unverified NEVER auto-applies),
-`exchange_submit = ask | always | never` (default `ask` - a fresh local tune surfaces as an
-offer on the control page and the watchdog balloon; `always` shares it automatically), and
-`exchange_url` (baked default `https://dasllama.io`). `DASLLAMA_EXCHANGE_URL` /
-`DASLLAMA_EXCHANGE_ACCEPT` env override for tests and one-shot watchdog relaunches. Lookup
-failure is never fatal - the boot falls through to the local tuner.
+The sidecar exchange rides three config-only keys (no CLI flags - one code path). **The
+exchange is closed: both policies default to off, and only an explicit key turns them on** -
+a box its shipped class profile covers stamps its kernels at compile time and never needed the
+exchange, and the residue races locally. `exchange_accept = verified | any | off` (default
+`off`; `verified` - at an untuned boot a verified match downloads and applies instead of racing;
+unverified NEVER auto-applies), `exchange_submit = ask | always | never` (default `never`;
+`ask` - a fresh local tune surfaces as an offer on the control page and the watchdog balloon;
+`always` shares it automatically), and `exchange_url` (baked default `https://dasllama.io`).
+`DASLLAMA_EXCHANGE_URL` / `DASLLAMA_EXCHANGE_ACCEPT` env override for tests and one-shot
+watchdog relaunches. Lookup failure is never fatal - the boot falls through to the local tuner.
 
 **First-contact consent (GDPR):** nothing is sent to the exchange until a choice is
 expressed. Setting any `exchange_*` key (TOML or env) IS that choice; on the zero-config
@@ -409,6 +438,12 @@ absent; set `DASLLAMA_MODELS_DIR`):
   token spans, and comes back as a caption about the picture; plus the decode-failure and
   remote-URL 400s. Needs `gemma-4-12B-it-Q4_K_M.gguf`, `mmproj-gemma-4-12B-it-BF16.gguf` and the
   coco cats jpeg.
+- `test_openai_server_speech.das` - the speech route end to end on a TTS-only boot: a WAV answer
+  with a RIFF header of speech length, the raw `pcm` form, the declined `mp3`, the missing
+  `input`, the unknown voice, the TTS id on `/v1/models`, the `tts` block on `/v1/stats`, the
+  `/v1/audio/phonemes` document against the facade's own normalizer and chunker, and a
+  second boot on the `f32` lane proving the pin reaches the worker. Needs `kitten-nano.gguf` and
+  the front-end packs beside it.
 - `test_exchange_client.das` - the exception: model-free and runs everywhere. The sidecar
   exchange client against a fake exchange on 127.0.0.1:18131 (lookup/pick, the fetch-and-apply
   gate, applied_box staleness, the privacy strip, both submit rails, policy parsing).
@@ -418,8 +453,8 @@ absent; set `DASLLAMA_MODELS_DIR`):
   infers): a slotless boot serves setup stats and the catalog while every inference route
   fails closed.
 - `tests/` - the control page itself, under real Playwright (Node + chromium): badge states,
-  models panel, streams/history, chat wire + SSE rendering, config editor, exchange section,
-  the confirm-gated controls. Model-free - the page runs against JSON/SSE fixtures captured
+  models panel, streams/history, chat wire + SSE rendering, the speech studio, config editor,
+  exchange section, the confirm-gated controls. Model-free - the page runs against JSON/SSE fixtures captured
   from a real server (`tests/fixtures/README.md` is the regeneration rail). Run with
   `npm ci && npx playwright test` in `tests/`; CI: `.github/workflows/dasllama-server-e2e.yml`.
 

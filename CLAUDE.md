@@ -31,7 +31,7 @@ Three document types split one grammar, each with a repo-root contract:
 - **`/history`** - past tense: what happened. Nothing current cites it.
 
 An implementation folder - `daslib/`, a module's `daslib/` or engine folder - holds no `.md`
-besides `REVIEW*.md`, `ARCHITECTURE*.md`, and `LAWS.md` (lint-enforced: `.lint_config`
+besides `REVIEW*.md` and `ARCHITECTURE*.md` (lint-enforced: `.lint_config`
 `rule_docs_only`). Ledgers and plans live at the module root or in `plans/` (repo root). None
 of these documents installs - the SDK bundle gate bans them; `REVIEW_COMMON.md` and
 `ARCHITECTURE_COMMON.md` at the install root are the two vendoring exceptions, and a shipped
@@ -86,7 +86,7 @@ Task-specific instructions are split into skill files under `skills/`. You MUST 
 | Skill file | Read BEFORE... |
 |---|---|
 | `skills/project_overview.md` | First significant task - design philosophy, three execution tiers, macros-as-design-lens |
-| `skills/internal/build_and_debug.md` | Build flags, AOT build commands, exit-code/crash diagnosis, `options log_infer_passes` |
+| `skills/internal/build_and_debug.md` | Build flags, AOT build commands, exit-code/crash diagnosis, `options log_infer_passes`, the front-end AST module cache (`.jitted_scripts/module_cache/`, `-no-module-cache`) |
 | `skills/mcp_tools.md` | Full MCP tool table + live-API reference; writing or following an `[arch(at=...)]` citation |
 | `skills/das_formatting.md` | Creating or modifying any `.das` file |
 | `skills/comment_style_hygiene.md` | Writing or reviewing comments, names, or local code shape in ANY language |
@@ -176,9 +176,7 @@ New knowledge about daslang syntax, semantics, or conventions - from compiler er
 
 **Syntax and factual corrections are fix-in-place, always.** A compiler error, probe, or user correction showing a claim in CLAUDE.md or `skills/*.md` is wrong, incomplete, or stale gets fixed in the same session and flagged in the end-of-turn summary - never deferred to a proposal. Verify first: grammar truth is `src/parser/ds2_parser.ypp`, behavior truth is a probe-compile with the current binary.
 
-**Rule files carry rules, not history.** CLAUDE.md files, `skills/*.md`, and per-module rule docs state the CURRENT contract only - no incident anecdotes, PR/issue numbers, dated rulings, or "as of" entries. When a rule changes, replace the old text outright and state the timeless WHY; history lives in git, `/history`, and memory, so archive a motivating incident worth keeping in `/history`. (Carve-out: `probe-verified <date>` tags on syntax/behavior claims are verification provenance, not history - they stay.)
-
-**Boris's rulings get a `LAWS.md` sidecar.** When an edit to a rule document implements something Boris asked for, append an entry to `LAWS.md` in that document's folder (create the file on the first ruling): the date, the document(s) edited, and what he asked for - his words, condensed but verbatim in spirit. `LAWS.md` is not a rule document - it is append-only intent provenance, so no agent edits, compacts, or audits it, and its entries are never cited as rules; they exist so rule provenance can be decided later.
+**Rule files carry rules, not history.** CLAUDE.md files, `skills/*.md`, and per-module rule docs state the CURRENT contract only - no incident anecdotes, PR/issue numbers, dated rulings, or "as of" entries. When a rule changes, replace the old text outright and state the timeless WHY; history lives in git, `/history`, and memory, so archive a motivating incident worth keeping in `/history`. A syntax/behavior claim is still probe-verified before it lands, but the verification date is history too: never write an inline `(probe-verified <date>)` tag. These files load into context and are read by weaker models, so every token must carry meaning.
 
 **Every REVIEW.md reviews itself.** A discovered checklist is itself audited under the self-review rule, not just applied - its own defects are findings, fixed in the same batch. The contract all checklists share lives ONCE in `REVIEW_COMMON.md` at the repo root; checklists point at it and never restate it (`skills/review_md.md`). Per-PR discovery, the `REVIEW.das` gates, and the auditor-agent topology: `skills/internal/make_pr.md`, the REVIEW audit row and its agent-topology section.
 
@@ -231,8 +229,11 @@ diagnostic in any tier.
   `expr` is an `ExprSafeField`, and `as` on the wrong type crashes. Enumerate every concrete
   type, or use a matcher.
 - **`tab[k]` on a mutable table INSERTS on read.** Read with `tab?[k] ?? d`.
-- **`to_int` / `to_float` return `0` on garbage** (`to_int("12abc")` is `12`). Anything from a
-  user, a file, or the environment goes through `try_to_int` / `try_to_float`.
+- **`to_int` / `to_float` return `0` on garbage** (`to_int("12abc")` is `12`), and `to_int` /
+  `to_uint` also return `0` for a value that overflows 32 bits. Anything from a user, a file, or
+  the environment goes through `try_to_int` / `try_to_float` - they live in
+  `daslib/strings_convert` (`require` it; the `strings` module has no `try_*` form) and return
+  `Result<T; ConversionError>`, so an out-of-range parse is distinguishable from a valid `0`.
 - **`<-` into a table slot ZEROES the source.** Registering one value under two keys takes a
   fresh clone per registration, not the same variable passed twice.
 - **`new WithCtor(field = v)` skips the user constructor** - it is plain field-init, so
@@ -271,6 +272,7 @@ diagnostic in any tier.
 | `b == T('(')` where `b` is a non-`int` numeric scalar | make `b : int`, compare `b == '('` | STYLE035: character literals are `int` |
 | `dst := src` / `push_clone(src)` on a plain `string` | `dst = src` / `push(src)`; cross-context copy = `clone_string(src)` | LINT016: the clone spelling copies only the pointer |
 | `int64(length(x))` / `uint64(capacity(x))` (also `count`, `find_index`, `fread`, `fwrite`) | `long_length(x)` / `long_capacity(x)` / ... | LINT017: the inner call returns `int` - 2^31 is hit before the cast |
+| `int64(to_int(s))` / `uint64(to_uint(s))`, and the mixed-sign spellings | `to_int64(s, false)` / `to_uint64(s, false)` | LINT017: a 32-bit parse answers `0` once the value overflows 32 bits - the cast asks for range the parse already threw away |
 | `memcpy(d, s, int(n))` / `arr \|> resize(int(n64))` with a 64-bit `n` | `memcpy(d, s, n)` / `resize(n64)` - the 64-bit overloads exist | LINT018 |
 | `int64(length(a) * 4)` - a 32-bit product with a call among the factors | `long_length(a) * 4l` - the product wrapped before the cast | LINT024 |
 | `range(int(n64))` / `urange(uint(u64))` | `range64(n64)` / `urange64(u64)` | LINT020. Vector components and `string` index stay 32-bit |

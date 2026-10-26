@@ -3,15 +3,16 @@
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture
 doc: `ARCHITECTURE_IMAGE.md`.
 
-**Routed from `REVIEW.md`: a diff touching `dasllama/dasllama_image.das`, or a `.dlim` mint,
-load, identity, or flavor concern wherever the diff puts it, applies this list together with
+**Routed from `REVIEW.md`: a diff that checklist routes here applies this list together with
 `REVIEW.md`.**
 
 **A transform on the go-live path - repacking, quantizing, folding, permuting - is a defect;
 it belongs to the mint.** Going live is `parse_image` pointing a live carrier's planes into the
 mapped `.dlim`.
 
-**A missing `.dlim` is minted first, and the model is served from what was minted.**
+**A weight carrier - anything that reads weights from a file and serves inference from them -
+whose `.dlim` is missing mints it first and is served from what was minted.** A carrier the
+image rail does not carry is a ledgered lane in `ARCHITECTURE_IMAGE.md`, never a silent one.
 
 **A weight carrier becomes live only through `build_image` and `parse_image` in
 `dasllama/dasllama_image.das`: reading weights into a live carrier, or releasing an image
@@ -28,8 +29,9 @@ either refuses it or streams it the way a decoder mint does.** A refusal names t
 staged form holds source and image at once, and this rule caps that doubled peak.
 
 **A path that reinterprets a mismatched image, or widens an identity so that more files match,
-is a defect.** `image_identity` names the box profile, the knobs, and the flavor a file was
-baked for, and a mismatch declines loudly.
+is a defect.** Anything that changes what an image contains - the box profile, the knobs, the
+flavor, a head that rides the load - goes into `image_identity`, the string the header bakes,
+not only into the image path; a mismatch declines loudly.
 
 **An image save drops AT MOST its own lane's dead siblings plus BROKEN/version-stale images in
 any lane.** A lane is an identity's (quant, tag) pair.
@@ -44,16 +46,24 @@ with the meta flags describing the layout - a per-tensor type split is not a sec
 decides that, not the load.**
 
 **A flavor takes its image file through `image_path_for` and its tag through
-`register_image_family_tag`.**
+`register_image_family_tag`; a family whose plane bytes no box property shapes - no backend
+pin, no tune state, no lane width - registers that tag config-free
+(`register_image_family_tag(tag, config_free = true)`), and a family whose bytes any such
+property shapes never does.** A config-bound identity on a property-free family bakes one
+image per tune state and reaps the others on every switch; a config-free identity on a
+property-shaped family serves the wrong bytes under a changed property.
 
-**A diff that changes the `.dlim` layout or serialization, or changes which tensors the gguf
-loader puts into an image, bumps `IMAGE_VERSION` (`dasllama/dasllama_image.das`) in the same
-change.**
-Without the bump a stale image stays structurally valid and silently serves a different model.
+**A diff that moves a byte in a `.dlim`, adds or drops a serialized field, or changes what an
+image at an UNCHANGED path contains, bumps `IMAGE_VERSION` (`dasllama/dasllama_image.das`) in
+the same change; weakening the `REVIEW.das` layout-stamp check - narrowing its closure or
+dropping the cell - is a defect.** Without the bump a stale image stays structurally valid and
+silently serves a different model. What the stamp covers is the layout stamp section of
+`ARCHITECTURE_IMAGE.md`.
 
-**Weakening the `serialize_image_meta` field-count tripwire (`IMAGE_META_FIELDS`,
-`dasllama/dasllama_image.das`) is a defect** - raising the constant without adding the field to
-`serialize_image_meta` leaves that field out of every image.
+**Weakening a meta field-count tripwire - `IMAGE_META_FIELDS` and the per-family constants
+beside it - or the `REVIEW.das` check that requires one, is a defect.** Raising the constant
+without adding the field to the serializer leaves that field out of every image, and a
+serializer without the tripwire reads a forgotten field back as zero on every load.
 
 **A filesystem or chunk-allocation decline while saving an image
 (`dasllama/dasllama_image.das`) never fails the load - warn, and serve what is still whole:

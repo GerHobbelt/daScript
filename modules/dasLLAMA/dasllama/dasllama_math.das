@@ -13,6 +13,7 @@ require daslib/jobque_boost public  // matmul's threaded path expands parallel_f
 require daslib/jobque_profile  // named trace categories + unit markers (set_trace_tags registers them)
 require dasllama/dasllama_par  // maybe_parallel_for: thread-or-inline a kernel body on a runtime size flag
 require dasllama/dasllama_tune  // [tuned]: reconstitute dot from dot_template with per-box loop hints
+require dasllama/dasllama_tune_scope  // nolint:STYLE030 — the dasllama [tune_scope] must be on the AST before this module's [tuned] kernels pick their perms
 require dasllama/dasllama_gemm_schema  // kq_qsb/kq_ssb — the fmt-id kq plane strides
 require dasllama/dasllama_gpu_tier public  // the device-cooperation seam (split out 2026-07-29) — re-exported for the 112 requirers
 require llvm/daslib/f16_cvt  // f16<->f32 converts: JIT half intrinsics on aarch64 / x64+F16C, exact bit-twiddle elsewhere
@@ -316,8 +317,6 @@ def public set_dispatch_caller_lane(v : bool) { g_dispatch_caller_lane = v }
 def public get_dispatch_caller_lane() : bool { return g_dispatch_caller_lane }
 def public get_dispatch_lanes() : int {
     // Que-less process: the calling thread is the only lane, so every shaper answers "inline".
-    // (The work-proportional shapers evaluate eagerly at the dispatch sites — the old bool-gated
-    // form only read this in its parallel arm, so que-less small-matmul callers never noticed.)
     if (!is_job_que_available()) {
         return 1
     }

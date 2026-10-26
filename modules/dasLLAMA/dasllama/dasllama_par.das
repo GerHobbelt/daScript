@@ -6,6 +6,7 @@ options _dasllama_internal = true
 module dasllama_par shared public
 
 require dasllama/dasllama_lint public
+require dasllama/dasllama_env       // the bare-queue tripwire's escape hatch
 require jobque public
 require daslib/jobque_boost public  // emitted code uses parallel_for / invoke
 require math public                 // emitted code uses min (indexed fifo arm)
@@ -16,11 +17,12 @@ require daslib/templates_boost
 require daslib/macro_boost
 
 //! `maybe_parallel_for(parallel, range_begin, range_end, num_jobs) $(rb, re) { ... }` —
-//! parallel_for with a leading runtime `parallel` flag. When `parallel` is true it threads the
-//! work across `num_jobs` chunks exactly like parallel_for; when false it runs the SAME block once,
-//! inline on the calling thread (no job dispatch, no wait group). Lets a kernel gate on a runtime
-//! size threshold without duplicating its loop body across an if/else. The block takes just the
-//! chunk bounds `(rb, re)` — no `wg`/`notify_and_release` ceremony; the parallel arm adds it.
+//! parallel_for with a leading runtime `parallel` flag. When `parallel` is true and a job queue is
+//! up it threads the work across `num_jobs` chunks exactly like parallel_for; when false, or in a
+//! process with no job queue, it runs the SAME block once, inline on the calling thread (no job
+//! dispatch, no wait group). Lets a kernel gate on a runtime size threshold without duplicating
+//! its loop body across an if/else. The block takes just the chunk bounds `(rb, re)` — no
+//! `wg`/`notify_and_release` ceremony; the parallel arm adds it.
 [tag_function(tag_maybe_parallel_for), unused_argument(parallel, range_begin, range_end, num_jobs, blk)]
 def maybe_parallel_for(parallel : bool; range_begin, range_end : int; num_jobs : int;
                        blk : block<(rb : int; re : int) : void>) {
@@ -51,7 +53,25 @@ def maybe_parallel_for_indexed(range_begin, range_end : int; num_jobs : int;
 var g_disp_count = 0l    // parallel_for dispatches taken
 var g_disp_chunks = 0l   // chunks (jobs) pushed across those dispatches
 var g_disp_inline = 0l   // maybe_parallel_for calls that ran inline instead
+var private g_jobque_checked = false
+
+[arch(at="../ARCHITECTURE_RUNTIME.md#jobque-policy"), cold_path]   // runs once, on the first dispatch: its log line is not the kernels' hot path
+def private check_jobque_configured() {
+    return if (!is_job_que_available())   // no queue: the arms run inline, nothing to configure
+    g_jobque_checked = true
+    return if (get_jobque_fork_pool())
+    let msg = "dasLLAMA: the job queue is not configured for the engine's fork/join dispatch - call setup_dasllama_jobque() inside with_job_que() before the first load, generate or eval (a bare queue decodes ~200x slower; DASLLAMA_ALLOW_BARE_JOBQUE=1 runs anyway)"
+    if (g_env_engine.allow_bare_jobque) {
+        to_log(LOG_WARNING, "{msg}\n")
+    } else {
+        panic(msg)
+    }
+}
+
 def count_parallel_dispatch(njobs : int) {
+    if (!g_jobque_checked) {
+        check_jobque_configured()
+    }
     g_disp_count++
     g_disp_chunks += int64(njobs)
 }
@@ -111,7 +131,7 @@ class private MaybeParallelForMacro : AstFunctionAnnotation {
             call.arguments[4], call.at)
         var inlArm <- mpf_inline_arm(call.arguments[1], call.arguments[2], call.arguments[4], call.at)
         var qb = qmacro_block() {
-            if ($e(call.arguments[0])) {
+            if ($e(call.arguments[0]) && is_job_que_available()) {
                 $b(parArm)
             } else {
                 $b(inlArm)
