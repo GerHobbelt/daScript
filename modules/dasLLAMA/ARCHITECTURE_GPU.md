@@ -19,7 +19,7 @@ that a question answered for one backend has an obvious address in the other. Th
 
 | role | holds | must not hold |
 |---|---|---|
-| the kernel home<br>`dasllama_metal_kernels`, `dasllama_vulkan_classes` | kernel source, the threadgroup reductions every Metal body folds through (`tg_sum_all` / `tg_max_all`, `MetalTgReduceBase` over its own `partial[]`), the workgroup folds every Vulkan body whose fold is one value derives (`WgReduceBase`'s `wg_sum` / `wg_max` / `wg_rms_inv`, one value over every lane, returned to every lane) - two Vulkan bodies fold by hand by design, because their folds are split: `DnStepFused`'s q and k halves (`subgroupAdd` into per-subgroup arrays, a lane-0 loop over them, one set of results every lane reads) and `TtsPkAttn`'s `po` quarters (four partial value sums a column, added by the column's lane), the kernel-side quant-decode helpers that read a codebook table (the table-free arithmetic both homes splice is `dasllama_gpu_math`'s) and the per-word codebook accessors (`[grid_words]` bakes each from `dasllama_kqformat`'s one literal at compile time - the bytes live there, the home carries the baked copy), the derived-access/PSO census; on Vulkan the one device buffer kernel data fills (`kq_grid_dev`, the grid codebooks) and the host-side ensure/set/enc pick ladders and grid rules over its own class stamps (`gemv_*`, `q8_gemv_gu_n_*`, `q8_batch_cls_*`, `kq_batch_cls_*`, `fa_stamp_*`, `f16_gemm_*`, `da_slab_*`, `da_attn_stamp_*` with the block codecs' `kv_codec_cls_ensure`, `da_attn_b_stamp_*`, `rope_kv_b_stamp_*`, and the tile trios `khr_cls_*` / `cm2e_cls_*` / `cm2_cls_*`; `kq_tile_stamp` stamps the tile trios, `kq_batch_cls_*` and the GEMV ladders (its `gemv` family) over `KqFmt`, `stamp_ladder` the `fa_stamp_*` ladders over the flash stamp's key); the tower row classes' mode selectors and family constants - `TowerBiasActT`'s act selector (`BIAS_ACT_NONE` / `_GELU_TANH` / `_GELU_ERF` / `_SILU` / `_RELU`, relu for canary's subsample stack) and `Q3A_TOK_PER_CHUNK`, `G4A_ATTN_PAST`, `G4A_ATTN_CAP`, `WDEC_HS`, which the drivers check against the family before they serve | device state other than `kq_grid_dev`, engine types |
+| the kernel home<br>`dasllama_metal_kernels`, `dasllama_vulkan_classes` | kernel source, the threadgroup reductions every Metal body folds through (`tg_sum_all` / `tg_max_all`, `MetalTgReduceBase` over its own `partial[]`), the workgroup folds every Vulkan body whose fold is one value derives (`WgReduceBase`'s `wg_sum` / `wg_max` / `wg_rms_inv`, one value over every lane, returned to every lane) - two Vulkan bodies fold by hand by design, because their folds are split: `DnStepFused`'s q and k halves (`subgroupAdd` into per-subgroup arrays, a lane-0 loop over them, one set of results every lane reads) and `TtsPkAttn`'s `po` quarters (four partial value sums a column, added by the column's lane), the kernel-side quant-decode helpers that read a codebook table (the table-free arithmetic both homes splice is `dasllama_gpu_math`'s) and the per-word codebook accessors (`[grid_words]` bakes each from `dasllama_kqformat`'s one literal at compile time - the bytes live there, the home carries the baked copy), the derived-access/PSO census; on Vulkan the one device buffer kernel data fills (`kq_grid_dev`, the grid codebooks) and the host-side ensure/set/enc pick ladders and grid rules over its own class stamps (`gemv_*`, `q8_gemv_gu_n_*`, `q8_batch_cls_*`, `kq_batch_cls_*`, `fa_stamp_*`, `f16_gemm_*`, `da_slab_*`, `da_attn_stamp_*` with the block codecs' `kv_codec_cls_ensure`, `da_attn_b_stamp_*`, `rope_kv_b_stamp_*`, and the tile trios `cm2_cls_*` (the engine's, over every tile tail) and `khr_cls_*` (the kernel cells' KHR arm); `kq_tile_stamp` stamps the tile trios, `kq_batch_cls_*` and the GEMV ladders (its `gemv` family) over `KqFmt`, `stamp_ladder` the `fa_stamp_*` and `da_attn_stamp_*` ladders over their stamp keys); the tower row classes' mode selectors and family constants - `TowerBiasActT`'s act selector (`BIAS_ACT_NONE` / `_GELU_TANH` / `_GELU_ERF` / `_SILU` / `_RELU`, relu for canary's subsample stack) and `Q3A_TOK_PER_CHUNK`, `G4A_ATTN_PAST`, `G4A_ATTN_CAP`, `WDEC_HS`, which the drivers check against the family before they serve | device state other than `kq_grid_dev`, engine types |
 | `dasllama_<gpu>_common`<br>`dasllama_metal_common`, `dasllama_vulkan_common` | device state, buffer/command plumbing, hazard + capture rail, profiler, host-side quant-decode helpers (Metal's `iq4_lut`), the family's registrant of a tier seat that names a size the device state keeps (Metal's `dn_mirror_room`) | driver policy |
 | `dasllama_<gpu>_decode`<br>`dasllama_metal_decode`, `dasllama_vulkan_decode` | the resident token-step driver + decode-time arms; on Vulkan, for a hyper-connection MoE (`Config.hyper_conn`), the split token command and the hot pool's device slots, stacks and hit chains (`ARCHITECTURE_GPU_VULKAN_HC.md#hc-token-command`, `#hc-hot-pool`) | kernel bodies |
 | `dasllama_<gpu>_prefill`<br>`dasllama_metal_prefill`, `dasllama_vulkan_prefill` | the batched prefill driver + batch arms; on Vulkan, for a hyper-connection MoE, the window chain cut after each router (`ARCHITECTURE_GPU_VULKAN_HC.md#hc-window-chain`) | kernel bodies |
@@ -119,8 +119,36 @@ that a question answered for one backend has an obvious address in the other. Th
   blob-only model's declined step falls to the single-row forward. The batch's split single-pass
   attention (`MetalSqAttnDKvT` and its combine) takes the head width at run time from one
   compiled variant - a lane owns one quad of the head, a head of 128 fills the simdgroup and a
-  head of 64 idles the lanes past it (zero query, no store) - serving both on the f16/f32 mirrors
-  with no per-head stamp; the block codecs keep the chunked per-(row, head) pair at head 64.
+  head of 64 or 96 idles the lanes past it (zero query, no store) - serving all three on every mirror codec
+  with no per-head stamp (the block codecs' twin template, `MetalSqAttnDQuantT`, reads a lane's
+  quad as four quants of a 32-element block and its scale). A head of 256 or 512 takes the WIDE
+  stamps of either template: a threadgroup is one slice group, and its two or four simdgroups each
+  own 128 dims of the head - four blocks of a block codec. A key's score is the sum of every
+  simdgroup's share, posted to threadgroup memory and read back between two barriers a slice
+  (`sqd_wide_sum`; the two templates differ only in how a lane reads its quad, and share the slice
+  walk, the weights, the merge and the store as `sqd_*` helpers), so a slice costs a wide head what it costs a head of 128 - a lane
+  walking the head's quads in turn costs two to four times that and loses to the chunked pair on
+  a model of few heads. The partials land as two or four heads of 128 under one softmax - each an
+  entry carrying the slice group's max and sum - so the combine kernel reads them with that many
+  times the heads and no stamp of its own (`attn_d_halves`, `attn_d_part_floats`). A model's two
+  head classes (gemma-4: a head of 512 on the full-context layers, of 256 on
+  the sliding ones) each take their own stamp layer by layer - the encode derives the heads a K/V
+  head and the score scale from the layer's own head and K/V row, and the partial plane is sized
+  for the wider class. The single row takes the fused form past the
+  single-dispatch ceiling, and so do the speculative verify's rows (`attn_d_serves` is the one
+  gate the three row shapes ask, `encode_attn_d` the one encode): the single row's route table is
+  one row, written when the step's resources are acquired, and the verify binds its per-layer
+  table at the layer's offset, each base already the layer's. A sliding layer hands the kernel its
+  span: a slice group starts at its first slice that reaches the window and a key below the
+  window weighs nothing, so a 128-key layer reads four or five slices whatever the context. A
+  layer's attention sinks join the combine alone - one more logit a head in the final max and sum,
+  carrying no value. An attention logit soft cap is a uniform of the kernel, applied to a live
+  key's scaled score before the slice's max - a lane past the slice's rows is named dead there,
+  since the cap would lift its seed to minus the cap. The single-row driver's NextN verify rows
+  alone keep the chunked pair, on a model with a window or sinks - the base geometry that pair
+  serves, and a shape no served NextN carrier has. The fused form's cost per cached
+  key is about a quarter of the chunked pair's, so it is what keeps a stream's decode rate from
+  falling with context.
 - **Family-shared kernel classes live in `dasllama_metal_kernels`.** The `[metal_dispatch]` lens
   generates `enc_*` builders and MSL globals into the module the class COMPILES in, so co-location
   follows the class, never "the builder needs the driver module". Each builder has a
@@ -162,20 +190,20 @@ that a question answered for one backend has an obvious address in the other. Th
   (the mixer sites' planes, the n-gram side input's, the host-experts switch and the split token command,
   `ARCHITECTURE_GPU_VULKAN_HC.md#hc-token-command`), its hot expert pool seats `install_moe_gpu_resident_hot` (a routed
   layer's slots, an expert's planes into a slot, a step's hits, a verify's rows' hits; a tier without them serves every routed expert on the
-  host, `ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool`), the host-rows seat `set_rdec_host_rows` a plain MoE's cut prefill window asks
-  for the host's routed sums (the driver installs the chain's callback at the arm, the no-op at the drop), its mirror-region seat `install_moe_gpu_resident_regions`
+  host, `ARCHITECTURE_GPU_VULKAN_HC.md#hc-hot-pool`), the prefill seats' `experts` argument a plain MoE's cut prefill window asks
+  for the host's routed sums through (the hyper-connection window chain's twin), its mirror-region seat `install_moe_gpu_resident_regions`
   (`rdec_select_region` names the region every mirror address and the next token command resolve against; a tier
   without it serves one region), its N-row batch seat `install_moe_gpu_resident_batch` (the N-row token command beside
   the resident driver: `rows` answers how many rows it steps at once on the armed model, 0 = none; `rdec_token_n` steps
   them), all behind the route lever `set_gpu_resident_route` / `gpu_want_resident`, the
   OS video-memory seat `install_moe_gpu_os_memory` the residency plan sizes against, the weight-bytes seat
-  `install_rdec_note_weight_bytes` the decode warm-up guard reads, the speculative carry's landing `install_rdec_carry` (`ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#logits-transfer-queue`), the NextN draft head's seat `install_rdec_draft` (`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-draft-head`), its prompt warm on the window chain `install_rdec_head_warm` (the ask, the rows written, the head's K/V row ranges up and down; `ARCHITECTURE_GPU_VULKAN_MTP.md#resident-head-prompt-warm`), the same-slab verify's `install_rdec_verify` (`ARCHITECTURE_GPU_VULKAN_NROW.md#nrow-verify-command`), the reject's device rollback `install_rdec_rollback` (`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-verify-rollback`), and the per-layer-embedding seats `install_rdec_ple`
+  `install_rdec_note_weight_bytes` the decode warm-up guard reads, the speculative carry's landing `install_rdec_carry` (`ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#logits-transfer-queue`), the NextN draft head's seat `install_rdec_draft` (`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-draft-head`), its prompt warm on the window chain `install_rdec_head_warm` (the ask and the rows written; the head's K/V row ranges move up and down through the resident driver's two K/V row seats, `rdec_kv_sync` / `rdec_kv_read` (filled by `install_moe_gpu_resident`'s `kv_sync` / `kv_read` arguments), at layer `n_layers`; `ARCHITECTURE_GPU_VULKAN_MTP.md#resident-head-prompt-warm`), the same-slab verify's `install_rdec_verify` (`ARCHITECTURE_GPU_VULKAN_NROW.md#nrow-verify-command`), the reject's device rollback `install_rdec_rollback` (`ARCHITECTURE_GPU_VULKAN_MTP.md#resident-verify-rollback`), and the per-layer-embedding seats `install_rdec_ple`
   - the branch's width, its per-layer gate and proj planes, the pre-step's projection and the token table on the
   device). The installs are one-way (a test that arms the tier never restores them) but for `unset_rdec_draft`, the CPU
   draft's control, which answers the seat for `reinstall_rdec_draft`; a seat serves whatever model loads next. Metal deliberately does not - UMA makes residency moot there, and
   Metal integrates as a whole-forward driver through common's override registries (the ASR-decoder driver is the one
   exception: whisper is not a `Model`, so its hooks are family registries in `dasllama_whisper`, same decline contract).
-- **`dasllama_gpu_resident.das`** - the WHOLE-MODEL residency rail: bake the device layout offline into the flavor
+- **`dasllama_gpu_resident.das`** - the WHOLE-MODEL residency rail, and the Model's per-format plane-pair accessors (`kq_plane_pair` / `kq_plane_pair_names`) the rail's walk and the mint's section names both read: bake the device layout offline into the flavor
   image, upload a model's stacks to the tier, drive decode/prefill entirely on device, record the routed pick trace
   (`DASLLAMA_MOE_TRACE`, the pool's offline instrument), and decide the trimmed lane -
   its admission (`resident_would_serve`) and the emb region the CPU keeps (`trim_pack_emb`). It is device-AGNOSTIC - it
@@ -193,7 +221,7 @@ that a question answered for one backend has an obvious address in the other. Th
   memory (`vk_rdec_upload_emb_f32`) answers false without touching a device - which keeps a baked `.dlim` layout equal to the one a real arm produces.
 - **`dasllama_gpu_math.das`** - the ALU helpers both kernel homes splice into their shader bodies
   (`ksign7`, `iq3s_signed`, `softcap_exp`): pure arithmetic, no table, no backend lowering, so one
-  owner serves the Metal and the Vulkan bodies alike; it also holds the CPU chains' matching scalar forms (the sigmoid, the SiLU: `sigmoid_f32`, `silu_f32`); the codebook tables stay per kernel home.
+  owner serves the Metal and the Vulkan bodies alike; it also holds the CPU chains' matching scalar forms (the sigmoid, the SiLU, the logistic gate, the softplus: `sigmoid_f32`, `silu_f32`, `sig_gate`, `softplus`); the codebook tables stay per kernel home.
   `mad` is the fused instruction by definition and leaves a driver nothing to choose, so two bodies
   held bit for bit spell as `mad` each multiply that feeds an add.
 - **`dasllama_kernel_access.das`** - the shared body-walk read/write classifier both GPU lenses run

@@ -5,6 +5,8 @@ module _vk_kq_fixtures shared public   //! shared: the harness's probe fixture (
 
 require daslib/f16_cvt
 require dasllama/dasllama_convert
+require dasllama/dasllama_gpu_tier
+require dasllama/dasllama_kqformat   // KQ_B32_ELEMS: the q8_0 block the stacks' scales step by
 
 // Synthetic K-quant expert stacks in the vulkan tier's DEVICE layout, shared by the tier suite
 // (test_vulkan_tier) and the cm2 expert-chain suite (test_vulkan_moe_cm2): the pow2 scale sets
@@ -150,24 +152,80 @@ def dequant_kq_stack(fmt : int; wqb : array<uint8>; wsb : array<uint8>; rows, n 
     }
 }
 
-//! a q8_0 plane on the upload wire (row-major int8 quants as bytes, f16 per-32 scales as LE
-//! bytes) plus its dequantized rows for a reference
-def fill_q8_stack(rows, n : int64; seed : int64; var wqb : array<uint8>; var wsb : array<uint8>; var w : array<float>) {
-    let nb = n / 32l
-    wqb |> resize(rows * n)
-    wsb |> resize(rows * nb * 2l)
-    w |> resize(rows * n)
-    var scales : array<float>
-    scales |> resize(rows * nb)
-    for (i in range64(rows * nb)) {
-        scales[i] = pow2_small(i + seed)
-        put_f16(wsb, i * 2l, scales[i])
-    }
+//! the second q8 scale set: 1, 1/2, 2, 1/4, 1/8 by index
+def pow2_scale(i : int64) : float {
+    let p = i % 5l
+    return p == 0l ? 1.0 : (p == 1l ? 0.5 : (p == 2l ? 2.0 : (p == 3l ? 0.25 : 0.125)))
+}
+
+//! a q8_0 stack's quants `(i * 7 + seed) % 255 - 127` and its per-32 scales, `pow2_small` or `pow2_scale`
+def fill_q8_quants(var wq : array<int8>; var ws : array<float>; rows, n : int64; seed : int64; small_scales : bool) {
+    wq |> resize(rows * n)
+    ws |> resize(rows * (n / KQ_B32_ELEMS))
     for (i in range64(rows * n)) {
-        let q = int((i * 7l + seed) % 255l - 127l)
-        wqb[i] = uint8(q)
-        w[i] = float(q) * scales[i / 32l]
+        wq[i] = int8((i * 7l + seed) % 255l - 127l)
     }
+    for (i in range64(rows * (n / KQ_B32_ELEMS))) {
+        ws[i] = small_scales ? pow2_small(i + seed) : pow2_scale(i + seed)
+    }
+}
+
+//! a q8_0 stack on the upload wire: the int8 quants as bytes, the f16 per-32 scales as LE bytes
+def pack_q8_wire(wq : array<int8>; ws : array<float>; var wqb : array<uint8>; var wsb : array<uint8>) {
+    wqb |> resize(length(wq))
+    for (q, b in wq, wqb) {
+        b = uint8(q)
+    }
+    wsb |> resize(length(ws) * 2)
+    for (i in range(length(ws))) {
+        put_f16(wsb, i * 2, ws[i])
+    }
+}
+
+//! a q8_0 stack's dequantized rows
+def dequant_q8_rows(wq : array<int8>; ws : array<float>; rows, n : int64; var w : array<float>) {
+    w |> resize(rows * n)
+    for (i in range64(rows * n)) {
+        w[i] = float(wq[i]) * ws[i / KQ_B32_ELEMS]
+    }
+}
+
+//! a q8_0 stack packed onto the wire and uploaded at `woff`; false = the upload was refused
+def q8_upload(wq : array<int8>; ws : array<float>; woff, n, rows : int64; stream : bool = false) : bool {
+    var wqb : array<uint8>
+    var wsb : array<uint8>
+    pack_q8_wire(wq, ws, wqb, wsb)
+    let ok = moe_gpu_upload_stack(wqb, wsb, woff, n, rows, 0, stream)
+    delete wqb
+    delete wsb
+    return ok
+}
+
+//! a q8_0 plane under the `pow2_small` scales on the upload wire, plus its dequantized rows for a reference
+def fill_q8_stack(rows, n : int64; seed : int64; var wqb : array<uint8>; var wsb : array<uint8>; var w : array<float>) {
+    var wq : array<int8>
+    var ws : array<float>
+    fill_q8_quants(wq, ws, rows, n, seed, true)
+    pack_q8_wire(wq, ws, wqb, wsb)
+    dequant_q8_rows(wq, ws, rows, n, w)
+    delete wq
+    delete ws
+}
+
+//! one plane in format `fmt` (0 = q8 under `fill_q8_stack`) uploaded at `woff` and dequantized into `w`; false = the upload was refused
+def plane_up(fmt : int; rows, n, seed, woff : int64; var w : array<float>; tiny_d : bool = true; stream : bool = false) : bool {
+    var wqb : array<uint8>
+    var wsb : array<uint8>
+    if (fmt == 0) {
+        fill_q8_stack(rows, n, seed, wqb, wsb, w)
+    } else {
+        fill_kq_stack(fmt, rows, n, seed, tiny_d, wqb, wsb)
+        dequant_kq_stack(fmt, wqb, wsb, rows, n, w)
+    }
+    let ok = moe_gpu_upload_stack(wqb, wsb, woff, n, rows, fmt, stream)
+    delete wqb
+    delete wsb
+    return ok
 }
 
 //! one hashed word of synthetic quant bytes for index i - the kernel suite's and the probes' plane filler

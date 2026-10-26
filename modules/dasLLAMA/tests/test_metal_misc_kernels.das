@@ -18,7 +18,6 @@ require ?das_metal _mtl_toy               // the [metal_dispatch] multi-kernel f
 require ?das_metal dasllama/dasllama_metal_lens   // the requires= tripwire observer: captured, set, restored
 require daslib/f16_cvt              // f32_to_f16 — packing the synthetic scale planes
 require math
-require daslib/fio                  // the lens tgmem gate's spawned compiles
 require strings
 require daslib/strings_boost
 
@@ -150,6 +149,33 @@ def private embed_q8_gate(t : T?; var dev, queue; dim, vocab, tok : int) {
         let ran = mc |> cell_record(t, tag) $(enc : MetalComputeEncoder?) {
             stamp_run(st, pso) {   // one blob, its byte and half-scale views
                 invoke(st.enc, enc, mc.buf[bblob], 0ul, mc.buf[bblob], mc.buf[btok], 0ul, mc.buf[bxo], 0ul, mc.buf[bdim], mc.buf[besc], int64(dim))
+            }
+        }
+        return if (!ran)
+        check_buf(t, tag, mc.buf[bxo], want, BAR_BITS, FLAT_SHAPE)
+    }
+}
+
+//! the greedy chain's fp32-table gather - the row gather at one row under the embed scale: the winner's row off a table
+//! bound past a lead of foreign floats, times the scale, the adds off
+def private embed_f32_gate(t : T?; var dev, queue; dim, vocab, tok, lead : int) {
+    let tag = "embed_f32 dim={dim} vocab={vocab} tok={tok} lead={lead}"
+    with_metal_cell(dev, queue) $(var mc : MetalCell) {
+        var err : string
+        let st = stamp_of(@@enc_row_gather)
+        var pso = mc |> keep_stamp(st, err)
+        return if (!pso_ok(t, tag, pso, err))
+        let escale = 0.5
+        var inscope rows <- [for (i in range(lead + vocab * dim)); i < lead ? 977.0 : float((i * 7 + 3) % 31 - 15) * 0.125]
+        var inscope want <- [for (i in range(dim)); rows[lead + tok * dim + i] * escale]
+        let btab = mc |> in_plain(rows)
+        let btok = mc |> in_plain([uint(tok)])
+        let bxo = mc |> out_words(dim, -1000.0)
+        let bnone = mc |> in_plain([1.0e9])   // the add planes, bound and never read
+        var ka = RowGatherArgs(c = uint(dim), add_b = 0u, add_c = 0u, total = uint(dim), scale = escale)
+        let ran = mc |> cell_record(t, tag) $(enc : MetalComputeEncoder?) {
+            stamp_run(st, pso) {
+                invoke(st.enc, enc, mc.buf[btab], uint64(lead * 4), mc.buf[btok], mc.buf[bnone], 0ul, mc.buf[bnone], 0ul, mc.buf[bxo], ka, int64(dim))
             }
         }
         return if (!ran)
@@ -1745,6 +1771,8 @@ def test_metal_misc_kernels(t : T?) {
                 argmax_rows_gate(t, dev, queue, 9, 700)         // MTP_MAX_ROWS rows, n below one threadgroup
                 embed_q8_gate(t, dev, queue, 512, 3, 2)
                 embed_k6_gate(t, dev, queue, 512, 3, 1)
+                embed_f32_gate(t, dev, queue, 96, 5, 3, 0)
+                embed_f32_gate(t, dev, queue, 512, 3, 2, 64)
                 add_rms_gate(t, dev, queue, false, 1500, 1, 1.0)
                 add_rms_gate(t, dev, queue, false, 1024, 1, 0.5)    // the gemma4 layer_out_scale slot
                 add_rms_gate(t, dev, queue, true, 1500, 3, 1.0)
@@ -1848,22 +1876,7 @@ def test_metal_misc_kernels(t : T?) {
 // writes `src` into a per-tag temp directory and compiles it with this binary - the shared half
 // of every lens-refusal fixture, whose claim is the child's exit code plus its diagnostic text
 def private spawn_lens_compile(tag, src : string) : tuple<rc : int; out : string> {
-    let dir_r = create_temp_directory_result("dasllama_lens_{tag}")
-    if (!(dir_r is value)) {
-        return (rc = -1, out = "temp dir failed")
-    }
-    let dir = unsafe(dir_r.value)
-    let path = path_join(dir, "prog.das")
-    if (!fwrite(path, src)) {
-        rmdir_rec_result(dir)
-        return (rc = -1, out = "fwrite failed")
-    }
-    let argv <- get_command_line_arguments()
-    let self = find(to_generic_path(argv[0]), "/") < 0 ? argv[0] : get_full_file_name(normalize(argv[0]))
-    var out : string
-    let rc = run_and_capture([self, "-compile-only", path], out, 120.0)
-    rmdir_rec_result(dir)
-    return (rc = rc, out = out)
+    return spawn_compile_only(src, "lens_{tag}", 120.0)
 }
 
 //! the require preamble every lens fixture opens with

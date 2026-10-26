@@ -207,6 +207,15 @@ def q8_roundtrip(src : array<float>; n : int64; k_form : bool) : Q8Round {
     return <- r
 }
 
+//! `h` replaced by its `q8_roundtrip` under `k_form`: the dequantized row a device requant hands the next GEMM
+def q8_round_deq(var h : array<float>; k_form : bool) {
+    var r <- q8_roundtrip(h, long_length(h), k_form)
+    for (i in range(length(h))) {
+        h[i] = r.deq[i]
+    }
+    delete r
+}
+
 //! the per-32 sums of `ntok` Q8_0 rows of `n` quants, times -128: the bias term a tile's unsigned-weight arm adds back
 def activation_bsums(xq : array<int8>; ntok, n : int64; var xbs : array<int>) {
     let nb = n / 32l
@@ -229,36 +238,39 @@ def ref_bar(env : double; nb : int64; ulp : float = REF_ULP) : float {
     return ulp * float(nb) * max(float(env), 1.0)
 }
 
+//! the fp64 sum of a row's `n / 32` block terms `term(bi)` and the sum of their magnitudes - the envelope a bar derives from
+def block_terms_f64(n : int64; term : block<(bi : int64) : double>) : tuple<dot : double; env : double> {
+    var res : tuple<dot : double; env : double>
+    for (bi in range64(n / KQ_B32_ELEMS)) {
+        let v = invoke(term, bi)
+        res.dot += v
+        res.env += abs(v)
+    }
+    return res
+}
+
 //! The independent fp64 truth for one Q8_0 x Q8_0 row; `env` is the same sum on block magnitudes, the envelope the bar derives from. Layout-free, so repacked and row-major backends judge alike.
 def ref_dot_q8_f64(wq : array<int8>; ws : array<float>; woff : int64;
                    xq : array<int8>; xs : array<float>; xoff, n : int64) : tuple<dot : double; env : double> {
-    var res : tuple<dot : double; env : double>
-    for (bi in range64(n / 32l)) {
+    return block_terms_f64(n) $(bi) {
         var iacc = 0
         for (k in range64(32l)) {
             iacc += int(wq[woff + bi * 32l + k]) * int(xq[xoff + bi * 32l + k])
         }
-        let term = double(iacc) * double(ws[woff / 32l + bi]) * double(xs[xoff / 32l + bi])
-        res.dot += term
-        res.env += abs(term)
+        return double(iacc) * double(ws[woff / 32l + bi]) * double(xs[xoff / 32l + bi])
     }
-    return res
 }
 
 //! the fp64 truth for one Q8_0 row against an f32 activation row, with its envelope
 def ref_dot_q8f_f64(wq : array<int8>; ws : array<float>; woff : int64;
                     x : array<float>; n : int64) : tuple<dot : double; env : double> {
-    var res : tuple<dot : double; env : double>
-    for (bi in range64(n / 32l)) {
+    return block_terms_f64(n) $(bi) {
         var bacc : double
         for (k in range64(32l)) {
             bacc += double(int(wq[woff + bi * 32l + k])) * double(x[bi * 32l + k])
         }
-        let term = bacc * double(ws[woff / 32l + bi])
-        res.dot += term
-        res.env += abs(term)
+        return bacc * double(ws[woff / 32l + bi])
     }
-    return res
 }
 
 let MX4_E2M1 <- [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
@@ -279,19 +291,15 @@ def pow2d(k : int) : double {
 //! the fp64 truth for one MXFP4 row (nibbles from byte `roff`, e8m0 scales from `eoff`) against a Q8_0 row, with its envelope
 def ref_dot_mx4_f64(wn : array<uint8>; we : array<uint8>; roff, eoff : int64;
                     xq : array<int8>; xs : array<float>; xoff, n : int64) : tuple<dot : double; env : double> {
-    var res : tuple<dot : double; env : double>
-    for (bi in range64(n / 32l)) {
+    return block_terms_f64(n) $(bi) {
         var bacc : double
         for (j in range64(16l)) {
             let b = int(wn[roff + bi * 16l + j])
             bacc += mx4_val(b & 15) * double(int(xq[xoff + bi * 32l + j]))
             bacc += mx4_val(b >> 4) * double(int(xq[xoff + bi * 32l + j + 16l]))
         }
-        let term = bacc * pow2d(int(we[eoff + bi]) - 127) * double(xs[xoff / 32l + bi])
-        res.dot += term
-        res.env += abs(term)
+        return bacc * pow2d(int(we[eoff + bi]) - 127) * double(xs[xoff / 32l + bi])
     }
-    return res
 }
 
 //! rows [t0, te) of an image `d` wide into `ref` and `bar` (grown to te x d where short): element (p, r) is `dot(p, r)`'s fp64
@@ -483,6 +491,15 @@ def build_q3k_block() : array<uint8> {
     return <- blkb
 }
 
+//! `n` scale nibbles SYNTH_SC[g % 8] & 15 OR-ed into `blkb` from byte `at`: nibble g the low half of byte g / 2 for an even g,
+//! the high half for an odd one
+def private pack_sc_nibbles(var blkb : array<uint8>; at, n : int) {
+    for (g in range(n)) {
+        let v = SYNTH_SC[g % 8] & 15
+        blkb[at + g / 2] = uint8(int(blkb[at + g / 2]) | (g % 2 == 0 ? v : v << 4))
+    }
+}
+
 // iq3s synthetic superblock: 110B IQ3_S disk block — 4-bit sub-scales SYNTH_SC[b] & 15, f16 d =
 // SYNTH_D, grid-index/qh/sign byte patterns (written in the PACK direction); the gate recomposes
 // each weight through IQ3S_GRID
@@ -502,11 +519,7 @@ def build_iq3s_block() : array<uint8> {
     for (p in range(32)) {
         blkb[74 + p] = uint8(iq3s_sg_pat(p))
     }
-    for (b in range(8)) {   // scale nibble b: low nibble of byte b/2 (b even), high nibble (b odd)
-        let v = SYNTH_SC[b] & 15
-        let nib = b % 2 == 0 ? v : v << 4
-        blkb[106 + b / 2] = uint8(int(blkb[106 + b / 2]) | nib)
-    }
+    pack_sc_nibbles(blkb, 106, 8)
     return <- blkb
 }
 
@@ -552,11 +565,7 @@ def build_iq2s_block() : array<uint8> {
     for (b in range(8)) {
         blkb[66 + b] = uint8(iq2s_qh_pat(b))
     }
-    for (g in range(16)) {   // scale nibble g: low nibble of byte g/2 (g even), high (g odd)
-        let v = SYNTH_SC[g % 8] & 15
-        let nib = g % 2 == 0 ? v : v << 4
-        blkb[74 + g / 2] = uint8(int(blkb[74 + g / 2]) | nib)
-    }
+    pack_sc_nibbles(blkb, 74, 16)
     return <- blkb
 }
 
@@ -574,11 +583,7 @@ def build_iq2xs_block() : array<uint8> {
         blkb[2 + w * 2] = uint8(v & 0xFF)
         blkb[3 + w * 2] = uint8(v >> 8)
     }
-    for (g in range(16)) {   // scale nibble g: low nibble of byte g/2 (g even), high (g odd)
-        let v = SYNTH_SC[g % 8] & 15
-        let nib = g % 2 == 0 ? v : v << 4
-        blkb[66 + g / 2] = uint8(int(blkb[66 + g / 2]) | nib)
-    }
+    pack_sc_nibbles(blkb, 66, 16)
     return <- blkb
 }
 

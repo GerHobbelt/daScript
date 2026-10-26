@@ -10,7 +10,7 @@ full-suite run turns a one-arm fix into an afternoon.
 ./bin/daslang -jit modules/dasLLAMA/tests/run.das -- --arm <filter> [--suite decode|mtp|prefill|matrix|kernels|image|image-vulkan|coverage|all] [--family llama]
 ./bin/daslang -jit modules/dasLLAMA/tests/run.das -- --suite model-free        # the per-PR gate that needs no models - runs the same on a bare box, no --arm
 ./bin/daslang -jit modules/dasLLAMA/tests/run.das -- --changed [--base origin/master]   # the per-PR run on a box with models, and after an edit: the areas the changed files reach
-./bin/daslang -jit modules/dasLLAMA/tests/run.das -- --suite stocked           # every model-gated file, no --arm: what --changed runs when a core module changed
+./bin/daslang -jit modules/dasLLAMA/tests/run.das -- --suite stocked           # every model-gated file, no --arm; a core-module change reaches every one of them through --changed
 ./bin/daslang -jit modules/dasLLAMA/tests/run.das -- --suite stocked --exclude test_ple_modes   # the iteration form - drops the PLE file
 ./bin/daslang -jit modules/dasLLAMA/tests/run.das -- --area audio            # one area: audio | vision | tts | llm | infra (comma list)
 ```
@@ -48,14 +48,15 @@ under it would GC-purge the box's tuned images, so the runner refuses `--no-tune
 (`test_audio_embedder`'s direct-route cell) skips on the knob and keeps its coverage on the tuned
 arm. The runner redirects
 the COMPLETE output to a log file, and prints that path on the DONE line. It owns the dastest
-timeout - 3600 s per child on the stocked gate, under `--full` and under `--changed` (the stocked
-files of the reached areas), where the large tier's parity file alone runs past 20 minutes and the
-llama resident file's CPU chains past 1200 s on a cold JIT cache, 1200 s in arm mode - and repeats a file only when `--nreps` is
+timeout - 3600 s per child on the stocked gate and under `--changed`, where the large tier's parity
+file alone runs past 20 minutes and the llama resident file's CPU chains run past 1200 s on a cold
+JIT cache; 1200 s in arm mode - and repeats a file only when `--nreps` is
 passed explicitly (default 1, never best-of-N). Every child runs `-jit -module-cache .cache/daslang/module_cache/dastest.dascache`;
 that cache serves dastest's own module graph only - the test program dastest compiles at
 runtime sits past it, so each child still pays the engine compile.
-No preflight tier runs the two per-PR suites: `preflight -- --only dasllama-model-free` and
-`-- --only dasllama-stocked` do, one after the other.
+No preflight tier runs the per-PR runs. `preflight -- --only dasllama-model-free` runs the
+model-free suite; the `--changed` run has no preflight lane; `-- --only dasllama-stocked` runs the
+whole stocked suite.
 
 ## The iteration loop
 
@@ -87,7 +88,11 @@ arm6-churn arm7-q8kv arm7b-tq4kv arm8-s16 arm9-reload arm10-kq arm11-depth arm12
 arm13-conc arm14-poison arm15-spec-hint` (arm14 = the shared-region collision gate: a foreign GPU
 prefill must not degrade a later forced-feed decode - Qwen2.5-0.5B, its own `[test]` block; arm15 =
 the single-row driver's greedy chain stands down for a decode sampled at temp > 0 and rides for a
-greedy one),
+greedy one; arm11 = the 2030-token depth cell, which also holds the single row's attention form by
+the kernel census - the fused single-pass stamp once a layer a step on the f16 mirror and its q8_0
+twin on the q8_0 mirror, no chunked dispatch on either; the same deep steps with the lever off
+(`set_metal_attn_d(false)`) are the control: the chunked pair serves every deep step and the fused
+stamp none, the tokens still the CPU's),
 batch test: `batch` (whole test), `batchB7-partd`, `batchB8-kq`, `batch-ff` (real-text forced feed,
 GPU single vs GPU batch at B=2/B=4 on identical tokens, logits tolerance).
 
@@ -112,7 +117,10 @@ step); ffk = the
 same at depth 2 and 4, every round a k+1-row verify plus the recurrent replay, which re-runs row 0
 from the pre-verify recurrent state; vff = the same-slab batch verify's four rows vs four plain
 steps; count = speculative free-run == plain free-run, token-exact, counting prompt, at depth 1, 2
-and 4; `mtp-count8-<tag>` = the same at depth 8, the deepest round - nine verify rows;
+and 4, and by the kernel census the verify's rows on the fused single-pass attention wherever the
+kernel carries the model's shape (every head class of 64, 96, 128, 256 or 512 on the f16 mirrors, the
+three stamps' counts summed, no chunked dispatch) and on the chunked pair elsewhere, both counts
+logged; `mtp-count8-<tag>` = the same at depth 8, the deepest round - nine verify rows;
 `mtp-sampled-<tag>` = the sampled accept walk - speculative free-run == plain SAMPLED free-run,
 seeded, at depth 1 and 2, temp 0.7 / top-k 1 / penalty 1.1 so every draw is the penalized argmax
 and the stream stays deterministic; on a verify tag it rides the assistant round inside the
@@ -124,7 +132,10 @@ at B=2/B=4 on identical real-text tokens plus one CPU reference row (the batch r
 the support matrix's batch cell only proves ENGAGE); `mtp-vff-<tag>` takes both tag families;
 `mtp-vff1-<tag>` = one row through the batch driver (the encoder alone, no row mixing);
 `mtp-vff5-<tag>` = five rows through the batch driver; `mtp-vff9-<tag>` = nine rows, the deepest
-verify the round can ask for (MTP_MAX_ROWS); `mtp-dff8-<tag>` = distinct sessions at B=5 and B=8. `mtp-count-<tag>` on a verify tag attaches the `mtp-*` assistant sidecar beside a
+verify the round can ask for (MTP_MAX_ROWS); `mtp-vffc-<tag>` = the nine rows again under a 64 MB
+mirror ceiling that holds the session's slice once and not nine times (the drivers shut down first,
+so the arena comes back at the ceiling) - the rows share one slice, and the step must serve;
+`mtp-dff8-<tag>` = distinct sessions at B=5 and B=8. `mtp-count-<tag>` on a verify tag attaches the `mtp-*` assistant sidecar beside a
 gemma-4 target first (skips when none) and runs the counting free-run at depth 1, 2, 4; the
 diagnostic arms `mtp-count-cpu` (drafts through the CPU oracle), `mtp-count-trace` (drafts vs
 truth logged per round) and `mtp-count-pre` (the pre-norm residual as the drafter's h) ride along
@@ -139,11 +150,24 @@ the sidecar resolver's two refusals), `mtp-gdraft-load` (the 440 MiB
 `mtp-gemma-4-26B-A4B-it-Q8_0.gguf` sidecar's whole struct - geometry, per-layer head/kv classes,
 blob and fblob sizes against the tensor sum, 32-byte tensor alignment, the p-RoPE table),
 `mtp-gdraft-cpu` (the CPU oracle's one step over a live gemma-4-26B-A4B session - PARITY_FULL,
-finiteness and range only; it carries no numeric oracle) and `mtp-gdraft-gpu` (attach plus one
-GPU draft step with Metal required).
+finiteness and range only; it carries no numeric oracle), `mtp-gdraft-gpu` (attach plus one
+GPU draft step with Metal required) and `mtp-gdraft-sched` (the served round: a gemma-4 target
+cannot speculate until the facade attaches the sidecar beside it, then a scheduler told to
+speculate keeps `mtp` on and walks the counting prompt token for token with the plain scheduler,
+drafting and accepting as it goes, both streams decoded in the log, and the same walk with the
+drafter detached as the control that drafts nothing - PARITY_FULL, Metal required). The gpu and
+sched arms load the 26B target through `load_model_cached`, so the file mints a `.dlim` for it
+under the same ledgered exception as the parity file's: the Metal MTP rail is what the image
+flavor serves.
 
 Prefill parity: `base mm-tail s16
-kq cont attn-dev span span-fused span-mrope span-ds dim qkv` (attn-dev = the device attention pair
+kq cont attn-dev mirror span span-fused span-mrope span-ds dim qkv` (mirror = the mirror-fed window
+against the f32 panels on one blob twin under the pair's pinned crown - a 300-row window and a
+20-row continuation, the last row's logits within 0.4% of the largest and the census naming each
+form's kernels; the decode step after them uploads no row on the mirror-fed form and every row on
+the panels form; a paged taker adopts a released donor's mirror for the whole pages a prefix cache
+hands it and uploads the copied partial page's rows alone, to the bit of the same run with adoption off, and a reused group id under a
+new stamp adopts nothing; attn-dev = the device attention pair
 against the staged trio on one blob twin under the pair's pinned crown - a 300-row window on the
 32-row stamps, then a 384-row continuation on the 128-row ones, the last row's logits within
 0.4% of the largest, the continuation started one token later as the control, the same next
@@ -172,7 +196,8 @@ a skipped add hides from them).
 Support matrix: `cells-q8 window cells-s16 mode kq tensor dim8b dim70b` + the
 family matrix `fam-qwen3 fam-qwen2 fam-phi3 fam-gemma2 fam-gemma3 fam-gemma4 fam-qwen3moe
 fam-gemma4moe fam-gptoss fam-gemma4e fam-qwen35 fam-qwen35moe fam-qwen2moe` (needs-derivation pins +
-per-path cells; fam-gemma2 also carries the sliding-window masking parity row;
+per-path cells; fam-gemma2 also carries the sliding-window masking parity row, whose census holds
+the capped rows past the single-dispatch ceiling on the fused attention's wide stamp and off the chunked pair;
 fam-gemma4/fam-qwen3moe/fam-gemma4moe/fam-gptoss/fam-qwen35moe/fam-qwen2moe are
 DASLLAMA_PARITY_FULL-gated - 7.4/18.5/26.9/12.1/22/15GB; fam-gemma4moe and fam-gptoss are ENGAGE
 + shallow logits TOLERANCE cells only - token parity is not a valid instrument for the 26B, whose double-router
@@ -252,9 +277,9 @@ arms (`parakeet` transcript-exact, `qwen3a`/`canary`/`gemma4a` element-exact pla
 run like the voxtral arm. The canary arm carries both lanes: the f32 element-exact cell and
 the q8 cell (read-time transcode - qblob/qscales/compact-blob element-exact vs a staged read).
 
-The `image-vulkan` suite (test_model_image_vulkan, arm `vulkan`) covers the OFFLINE vulkan
-bake: the runner arms DASLLAMA_GPU + a small VRAM budget so the probed config carries a
-vulkan section, the DRY tier collects a role-stamped plan with no device calls (safe on
+The `image-vulkan` suite (test_model_image_vulkan, arm `vulkan`; every cell skips without the dasVulkan
+module) covers the OFFLINE vulkan bake: the runner arms DASLLAMA_GPU + a small VRAM budget so the
+probed config carries a vulkan section, the DRY tier collects a role-stamped plan with no device calls (safe on
 GPU-less boxes), the flavor image round-trips the plan verbatim, and a cold cached load under
 the armed tier mints the vulkan lane ALONE. `test_vulkan_inline_bake`, on the same dry tier, holds
 a cold cached load: it mints the vulkan lane and no planar file, the served image carries the plan
@@ -279,10 +304,18 @@ with no re-mint (the file's size and time as the mint left them - the lane's ide
 fold the codec), each load armed at the asked codec, and at each codec the lane's greedy tokens
 are the staged load's at that codec token for token, both streams decoded in the log; a trimmed
 lane panics on a call passed to the CPU rails, so generating is the served witness, and the
-codecs' token streams differing from the f16 one is the control that the compare tells them
+a block codec's stream differing from the f16 one is the control that the compare tells them
 apart. On Qwen3.5-0.8B-Q4_K_M the loader keeps the K-quant planes in their file format
 (`kq_repacked`), the cold load mints the vulkan lane alone with its plan, and the warm map
-generates the same tokens and the same CPU embed row.
+generates the same tokens and the same CPU embed row. `test_vulkan_mint_trim_follows_the_driver`
+holds the trim's admission to the driver's answer: the model the driver serves is admitted
+(`resident_would_serve`, an empty `resident_decline_reason`) and its trimmed lane mints onto the
+driver; then, under a foreign prefill override the cell registers and selects, a staged load leaves
+the driver off (the control), the driver's decline text (`gpu_resident_decline_`) is the chain's
+byte for byte, the trim declines the model as this run's decline (`resident_trim_decline_is_run_mode`),
+the warm load serves planar from memory and leaves the trimmed lane on disk at its minted size, and
+a cold trim ask writes no lane at all; with the override put back to what `active_prefill_override`
+read before, the next load mints the trimmed lane and the driver serves it.
 
 The `coverage` suite (test_kernel_coverage, arm `coverage`; arm `coverage-vk` = the vulkan
 SERVING census - needs a vulkan device + `DASLLAMA_GPU=1` + `DASLLAMA_MODELS_DIR`, MoE rows
@@ -331,7 +364,19 @@ child builds (up to 120 s each) proving the lens refuses a `[metal_dispatch]` cl
 `@workgroup` members and no `tgmem=`, twin fixture as the must-compile control; its siblings
 `test_lens_requires_gate`, `test_lens_params_gate` (a `params=` name no `grid=`, `tg=`,
 `requires=` or `@span` reads is refused; one only a `requires=` item reads compiles),
-`test_lens_stamp_gate` and `test_lens_call_macro_gates` spawn the same way. Two cells need no
+`test_lens_stamp_gate` and `test_lens_call_macro_gates` spawn the same way. The attn file's fused
+single-pass cells (`sq_d_gate`) run the part and combine stamps against the CPU attention row at
+heads of 128, 64 and 96 (three fixture rows read as one of four heads of 96), on the WIDE stamps at a head of 256 (one head over rows twice as wide, the
+combine reading two heads of 128) and 512 (four times as wide, four heads of 128), each on the
+float and the block-codec (q8_0, tq4) stamps, with the route table bound past foreign rows whose key
+count is 1 - the offset a kernel reading the table from its start would miss the bar on - and
+under a sliding window (inside one slice, cutting a slice, wider than every stream), a sink
+logit that differs head to head and the logit cap, on the float, quantized and wide stamps. The
+gemm file's device pair arms (`attn_qk_mm_gate` with `pair_mt`, `attn_dev_pair_gate`) run both
+tile heights at a head of 96 too - QK's reduction width is the head, AV's 64-wide tiles plus the
+32-column tail stamp - and the misc file's `embed_f32_gate` the greedy chain's fp32-table gather (the
+row gather at one row under the embed scale) at a 96-wide row and past a lead of foreign floats. Two
+cells need no
 kernel: the misc file's `test_metal_served` (a driver's forward answer through `metal_served`: a
 decline passes through and leaves the pool's spin window, a served one opens it, a later decline
 keeps it) and the prefill file's `test_resident_panel_charge` (the resident panel registry on the
@@ -437,8 +482,8 @@ tq4 store's bytes to `fwht_signs_row` + `quantize_tq4kv_row` and the q rows rota
 `fwht_signs_row`, bit for bit, at heads of 32, 64, 128 and 512, on a shared-KV layer's dispatch
 (q rotates, nothing stores, the mirror left at its fill), at window rows, and at window rows with
 no q head (the NextN head's prompt warm). `test_vkc_q8_da_attn` and `test_vkc_tq4_da_attn` run one
-arm table (`codec_attn_arms`, 21 arms a codec) over each codec's stamps, dispatched as the driver
-dispatches the pass (a row a `rowwg` workgroups, its region in its token block), against the CPU
+arm table (`codec_attn_arms` in `_vk_codec_attn.das`) over each codec's stamps, dispatched as the
+driver dispatches the pass (a row a `rowwg` workgroups, its region in its token block), against the CPU
 attention over the rows `cvt_q8kv_to_f32` / `cvt_tq4kv_to_f32` read back at 1e-4 relative (reads
 6e-8 to 2.5e-6): the four-head and two-head slabs, a short last slab, heads of 32, 64, 128, 256
 and 512, the keys in one piece and split with the last piece combining, two rows a dispatch over
@@ -797,7 +842,7 @@ rows of one slot a dispatch a row (the row in the push, the same-slab verify's f
 one-row dispatch run a row at a time on the state and ring the row before it left - every row's o
 row, then the slot's state and both ring images after the last row, bit for bit, the state and the
 second row's ring image asserted moved off their inputs, and row 1 stepped from the untouched state
-as the control that misses. The gemma arc's cells: `test_vkd_kq_gemv_k4_gu` (the Q4_K gate + up GEMVs with the act and
+as the control that misses. The gemma-family cells: `test_vkd_kq_gemv_k4_gu` (the Q4_K gate + up GEMVs with the act and
 its Q8_0 requant in one dispatch, against the three-kernel path byte for byte and the CPU chain),
 `test_vkd_q8_gemv_gu` (the fused q8 gate + up + act + requant, gelu and silu, two depths),
 `test_vkd_topk_n` (the N-row command's per-row top-k over four rows against the one-row top-k run a row at a time - the
@@ -823,7 +868,7 @@ the quants bit for bit - the sandwich column at gemma-3-1b's and gemma-2's width
 column; the N-row command's sites take the row kernel where the one-row command's take the
 epilogue) and
 `test_vkd_q8_gemv_pleact` (the per-layer-embedding act + requant + proj GEMV, two widths, and its columns form over four and three rows against the one-row dispatches bit for bit),
-the gpt-oss arc's arms - `test_vkd_ar_class` and `test_vkd_ar_rq_fused` add the biased add
+the gpt-oss family's arms - `test_vkd_ar_class` and `test_vkd_ar_rq_fused` add the biased add
 partner (the output bias row past the norm row) against the seam and the CPU oracle,
 `test_vkd_act_family` runs the unbiased act kernels under the clamped swiglu beside silu and adds
 the biased twins (`q8_actrq_b_cls`, `actf16_b_cls`) over a six-expert bias plane, `test_vkd_fa_cm2`
@@ -832,12 +877,28 @@ a 40-key window; the token command's f32 and f16 sink twins unsplit and split, t
 combine seeding the sink), each with the sink-free oracle as the control, and `test_vkd_fa_stamp_refusals` covers
 the sink refusals -
 `test_vkd_da_attn_rqk` (the decode attention with the Q8_0 and Q8_K requant folded into its store,
-unsplit and split - the pass stores the row either way, its last piece combining - and the two-head
-slab stamp on the groups it serves, two heads and one, at 64, 256 and 512), `test_vkd_da_attn_bw` (the batched windowed decode attention over a
-restricted horizon), `test_vkd_fa_cm2_h256_softcap` (the gemma-2 softcap tile, the no-cap control in
+unsplit and split - the pass stores the row either way, its last piece combining - on the two-head
+slab stamp over the groups it serves, two heads and one, at 64, 256 and 512, every two-head arm but
+the 512 Q8_0 one held bit for bit to the four-head stamp (`g4_twin`), and on the four-head slab's own
+store at 64; the four scalar-mirror and codec cells - `test_vkd_da_attn`, `test_vkd_da_attn_shapes`,
+`test_vkd_da_attn_rqk`, `test_vkd_kv16_readers` - ride `_vk_codec_attn.das`' `codec_attn_arm` at
+`QA_BAR`: the scalar mirrors run the same table with no codec control, since the f32 mirror stores
+the rows as they are and the fixture's rounding to half stays inside the bar, so the poisoned
+expectation and the per-mechanism controls are their controls), `test_vkd_da_attn_bw` (the wide-head
+batched attention - heads of 384 and 512, gemma-4's global layers - over offset mirrors, one arm
+under a 24-position sliding window, and its f16-mirror twin beside every arm),
+`test_vkd_da_attn_b_gated` (a gated model's chunked attention - q read at the head's [q | gate]
+stride, the output under the gate's sigmoid - on the 8-row tile at 128, the wide tile and its f16
+twin at 512 and the h128 coopmat tile, each against the gated oracle with the ungated oracle as the
+control and a poisoned element; the cell skips where the 8-row or the wide class declines on the
+workgroup cap, the f16 wide arm where its own class does, the h128 arm on a device without coopmat),
+`test_vkd_act_gelu_past_clamp` (the tanh GELU act on gate values out to +-300 through `actf16_cls`
+against the CPU form, every half finite, and the stamp's SPIR-V, kept by `g_vkd_spv_keep`, read back:
+every tanh in it reads a clamp's result - a card whose own tanh saturates passes the numeric compare
+without the clamp, so the SPIR-V read is the assert that fails), `test_vkd_fa_cm2_h256_softcap` (the gemma-2 softcap tile, the no-cap control in
 the same run) and `test_vkd_fa_cm2`'s h512 arm (gemma-4's global heads, the f16 O twin against the
 f32 stamp); the KHR twins `test_vkd_fa_khr` and `test_vkd_fa_khr_h256_softcap` run the same fixture
-(`fa_tile_run`, `fa_h256_softcap_run`) through the KHR flash tile wherever the device has KHR
+(`fa_tile_run`, `fa_h256_softcap_cell`) through the KHR flash tile wherever the device has KHR
 cooperative matrices at subgroup 32, so a coopmat2 card covers both families.
 `test_bench_rows.das` - stocked (stories15M, skips without it): the bench rows' contracts on a
 real model - the pp rows' capacity refusal (a warmup or a timed rep on a session sized under its
@@ -1090,8 +1151,8 @@ mixed twin's two - carries the routing witness: the prefill's Q8_K requant censu
 through `vk_kernel_coverage_of("cls_q8k_rq_spv")`, below the recurrent-layer count on the f16
 feed and at or above it off the feed. The mixed twin is the fixture that discriminates: a
 per-layer feed decision would send qkv/z to the sdot4 tile for the out plane's sake, and the
-witness reds it there. The witness reads `RQ_NO_CENSUS` and stands down in a build with no vulkan
-module.
+witness reds it there. The witness reads `NO_CENSUS` (`census`, `_resident_feed.das`) and stands
+down in a build with no vulkan module.
 
 Every fixture makes its session on the mirror codec the box arms. Under `DASLLAMA_VK_KV32=1` the
 Q8 cells run on the f32 mirrors and the K-quant cells skip - their bar is calibrated on the f16
@@ -1130,7 +1191,11 @@ unset seat (the device's row count stays below them, the host's reaches past), d
 two rows past the device's (the host's two go up with the draft: the device's count reaches past
 the drafted row, the host's stops below it), brings the drafted row down on the next pass (the
 host's count past it, the host K row moved) and holds the device pick tie-aware against the CPU
-draft's logits over the same rows.
+draft's logits over the same rows. `test_gpu_resident_hybrid_mtp_draft_suppressed` drafts once on
+the device, then re-arms the driver (`gpu_slot_capture`, `moe_gpu_drop_model`,
+`gpu_slot_rearm`) with that pick among the model's suppressed ids and drafts again over the same
+prompt: the draft's logit for the id sits at the suppression floor (`SUPPRESSED_LOGIT`), the pick is
+another id and the argmax of the logits it landed (the first draft's pick against its own logits the control).
 `test_gpu_resident_hybrid_mtp_verify` holds the round's same-slab verify: after the same 40-token
 prefill (the host holding the warm's rows below the prompt's last), one device draft at the
 prompt's last row (the device's rows reaching past it, the host's stopping below it), a pass
@@ -1227,8 +1292,17 @@ driver to itself): the device's summed distance from the f16 chain within 1.15 o
 chain's own (reads 1.08, the control 9.2), the two tq4 chains within 0.8 of that distance of each
 other (reads 0.63, the control 9.3). A gate applied twice reads 9.2 times the CPU chain's distance.
 
-One cell is model-free: `test_kernel_census_by_name` holds that the census accessor panics on a
-kernel name nothing seeded, so a misspelt key cannot read as a zero count.
+The file's model-free cells: `test_kernel_census_by_name` holds that the census accessor panics on a
+kernel name nothing seeded, so a misspelt key cannot read as a zero count; `test_row_bar_nan_reference`
+holds the resident rigs' bar (`row_bar`, `_resident_feed.das`: rel of the CPU row's largest |logit|
+with NaNs and the suppressed ids' floor left out - `live_maxabs`, `_model_tier.das`) - a NaN in the reference row scales
+no bar and reads past it, while a bar scaled by `logits_maxabs` is infinite over the NaN and the same
+row holds it (the control); `test_row_bars_red_a_nan` runs the rigs' two row bars -
+`rows_within_control` and `tq4_within`, both in `_resident_feed.das` - on synthetic rows through
+`probe_fails` (`_compares.das`: a test handle that counts failed asserts instead of failing the cell):
+a NaN in the device row or the reference row reds each, the clean rows hold each (the control), a
+NaN reference reds with no control row, and the tq4 share has teeth where it sits - a device row at
+0.8 of the one-off row's distance holds, one at 0.9 reds.
 
 `test_gpu_resident_qwen2.das` - stocked suite, `-jit` only; the whole-model resident driver on a qwen2
 (Qwen2.5-0.5B-Instruct-Q8_0, `DASLLAMA_GPU=1`): the q/k/v projection bias folded into the rope
@@ -1280,7 +1354,7 @@ control, a 48-token prompt and six fed steps, the CPU arm routing as the device 
 tape (`ARCHITECTURE_ENGINE.md#moe-pick-tape`: a near-tie of 512 experts flips on kernel-order noise and one
 flipped expert of ten moves the row past any bar; the cell asserts the tape aligned select for select, the
 prompt's rows first, and logs the CPU's own decode picks off it); the cell asserts the window chain served the
-prompt, nothing passed to the CPU (`hc_prefill`), and the driver stayed armed; where the plan armed the hot
+prompt (`moe_gpu_resident_prefills` up by one) and the driver stayed armed; where the plan armed the hot
 expert pool (`gpu_resident_hot_slots`) it asserts every decode pick of every routed layer went through the
 pool, experts were uploaded, and the device served some of the picks and the host the rest, so the bar holds
 the sum of both shares, and - the prompt past the pool's 32-row window floor - that the tier's expert chain took
@@ -1290,13 +1364,16 @@ host the rest. Skips without the shards
 With the split head shard beside the model (`DASLLAMA_MTP_HEAD`, `ARCHITECTURE_GPU_VULKAN_HC.md#hc-draft-head`,
 `#hc-verify-rows`) two more cells: the draft cell runs one NextN draft through the resident head on the chain
 against the CPU `forward_mtp` on the same token, wide carry and row - the head's one select pinned by the pick
-tape, the logits and the wide carry each within their bar with the one-row-back control; the verify cell runs
+tape, the logits and the wide carry each within their bar with the one-row-back control, and every call served
+(`served_every_call`); the verify cell, with the same served assert, runs
 one speculative round on the device (the draft, the two-row verify, the accept or the rollback) and holds its
 two rows to the split command's own one-row steps on the same picks (`moe_pick_tape_lane`, a lane replay of the
 rows-form tape) at the split bars, and to the CPU's one-row steps at the wide bars, the other row as each
 row's control. Both also skip where the head shard is not beside the model.
 `test_gpu_resident_llama.das` - stocked suite, `-jit` only; the whole-model resident driver on the
-llama family (Llama-3.2-1B Q8_0, Llama-3.2-3B Q8_0, Llama-3.1-8B Q4_K_M, `DASLLAMA_GPU=1`): the
+llama family (Llama-3.2-1B Q8_0 and its Q4_0 requant `Llama-3.2-1B-Instruct-Q4_0-local.gguf`, whose
+recipe row is `../performance/model_specs.das`'s, Llama-3.2-3B Q8_0, Llama-3.1-8B Q4_K_M,
+`DASLLAMA_GPU=1`; the Q4_0 file's planes run the kq batch arm off the f16 feed and the cm2 tiles on it): the
 NORM rope, no q/k/v bias, no q/k norm, the tied classifier of the 3.2 files - the qwen2 file's
 forced-feed form and bar at one window and two windows per carrier, with the arm witnesses that
 the file is a llama with neither bias nor NEOX rope, and the pool's spin-window witness - the
@@ -1349,7 +1426,7 @@ path over one set of bytes: the mirror gathers the pool's rows verbatim), each s
 decode steps counted on their own with a one-token reply as the floor's control, both streams
 decoded in the log (a recurrent layer owns no K/V rows, so its pool blob is empty and the
 mirror's walk reads no base for it); the MTP carrier also runs the prefix checkpoint cells
-(`ARCHITECTURE_ENGINE.md#prefix-recurrent-checkpoints`): `test_metal_prefix_checkpoint` - three
+(`ARCHITECTURE_ENGINE_SERVING.md#prefix-recurrent-checkpoints`): `test_metal_prefix_checkpoint` - three
 prompts on one shared opening (asserted past two 64-row pages and off a page boundary) through one speculative scheduler: the first two attach nothing,
 the second's prefill stops at the opening and leaves the checkpoint, the third attaches it, and the
 second and third reply token for token as on a scheduler with no cache whose chunk is the opening
@@ -1426,9 +1503,12 @@ prefill's attention over the f16 shadow, tq4's un-rotation, the rows a pass brin
 CPU cache's own bytes. Under a tq4 mirror no share of the peak holds a tolerance cell - two window
 splits of one prompt read 0.8-2.0 apart at a 12 max logit (under 0.7 on the other codecs), the
 split q/k norm against the fused one 1.1-3.5 at 13-15 on the qwen3 file, while a carrier whose
-rows agree bit for bit has a row one off 1.9 away - so the rig holds each such row to 0.6 of its
-distance from the one-token-off row instead (`tq4_within`; reads 0.09-0.44), and every bit-for-bit
-cell stays bit for bit. Every tolerance compare logs its difference and the one-off row's.
+rows agree bit for bit has a row one off 1.9 away - so the rig holds each such row to a share of its
+distance from the one-token-off row instead (`tq4_within`, the share `TQ4_CTRL_SHARE` in
+`_resident_feed.das`: above the widest reading on any card the suite runs on - the 900-token prompt
+cut at 300 reads widest - and under 1.0, the one-off row's own distance; the readings per card sit
+in the constant's `//!`), and every bit-for-bit cell stays bit for bit. Every tolerance compare
+logs its difference and the one-off row's.
 `test_gpu_resident_gemma*.das` (`_gemma_resident.das` carries the cells; one model a file:
 `gemma3_1b`, `gemma3_4b`, `gemma2`, `gemma4_12b_q8`, `gemma4_12b_k`, `gemma4_e2b`, `gemma4_e4b`,
 `gemma4_26b`, `gemma4_26b_k`, `gemma4_31b` - a process loads one carrier, so no cell inherits another model's device state, and a GPU run
@@ -1722,11 +1802,34 @@ exists, every image-suite arm is reachable from an area or listed as unclaimed),
 planners behind an area run, the argument contracts, the change-to-area map behind `--changed`,
 the `--exclude` filter's semantics, and a dry run of the runner with a no-op child binary.
 Requires `run` by bare same-dir name.
-`test_vk_spv_diff.das` - model-free: the SPIR-V dump differ (`harness/vk_spv_diff.das`, the
+`test_vk_spv_diff.das` - model-free: the SPIR-V dump differ (`../harness/vk_spv_diff.das`, the
 identity gate a kernel fold's "byte-identical" claim rests on) - its four bins over two in-memory
 dumps (a changed byte and a changed length both read as moved, name order), the verdict's refusal
 of a dump with no stamp in it, and the directory read by stem. Requires the harness by relative
 path.
+`test_served_bench.das` - model-free: the served-turn instrument (`../harness/served_bench.das`, required
+by relative path; it loads no engine module - its wire is `dasOPENAI`'s `chat_stream`, whose
+reader cells are `modules/dasOPENAI/tests/test_chat_stream_mock.das`'s: the reasoning delta, the
+usage chunk's counts, cache hit and timings, a usage chunk without details reading no cache hit) -
+the system prompt (its nonce leads, two nonces part at once, the asked characters cycle the corpus),
+the corpus as its `%%` segments over a temp file, the row statistic and the brackets beside a row, and whole turns
+against a fake chat server on its own thread that answers by the request's `model` field: a complete
+stream (counts, both spans past the server's 30 ms pauses, the server's own TTFT), and the four
+refusals - no usage chunk, no reply text, a reply of one token (no decode span to time), HTTP 500 -
+plus no server at the address, the follow-up row standing over complete turns and refused by a failed one, and the image cells - a file as a data URI and a missing one as none, an image question's wall and prompt tokens off the fake's buffered completion, HTTP 500 saying why, an image row standing over a file and refused without one. The speech rows
+run against a fake speech server on a second thread: a transcription's wall holds the server's
+300 ms pause, a failed and a blank answer say why, a row answers the text its reps read and refuses
+reps that read different texts or a text other than the one asked, and the loaded row stands while
+the fake chat turn outlasts two fast reps and is refused when the reps outlive the turn, when the
+turn carries no reply text, and when the loaded text differs from the idle one. The synthesis and
+scene cells: a WAV's seconds off its header (a header with no sample and text bytes reading 0), a
+synthesis against the fake's one-second WAV (its seconds, a failed and a JSON answer saying why), a
+scene round against both fakes (one decode rate, every lane answering inside the turn), a paced
+lane sending one request a period with a failed request reading below zero, a scene row
+refusing fewer than two samples on either side, the synthesis rows and the scene rows whole (a
+failing model or lane refused alone, a lane too slow for the turn refused for its empty round),
+the flags refused when they would report no row of a mode they ask for, and the scene's lanes
+off the flags.
 `test_site_records.das` - model-free: the records-vs-site drift gate - `merge_site_records`
 (required by relative path, pays the engine compile) regenerated in memory and byte-compared
 against the committed `site/files/dasllama/bench_records.json` and its first-paint projection
@@ -1783,7 +1886,28 @@ checkpoint shares, a token short of a prompt an earlier one holds whole, nowhere
 the hit or on a model with no recurrent state), and the side state (the n-gram input's last tokens
 and conv history ride the checkpoint; a snapshot of another state size is refused and leaves the
 session as it stood); model-gated (stories15M): attached pages plus a tail eval read the cold
-prefill's logits bit for bit.
+prefill's logits bit for bit, and the page past the whole hits (`test_prefix_tail_copy`): a
+donation's partial tail page is an entry beside its whole ones, a prompt that shares rows with it
+takes a COPY (the donor's page stays the cache's alone, `n_hit_partial` counts the take) and lands
+the cold prefill's logits bit for bit - the tail whole, three of its five rows, and four leading rows
+of a whole page - every page back in the pool at the end; its model-free edges
+(`test_prefix_tail_edges`): a prompt whose first row past the whole hits the next page does not
+share copies nothing, each donation's page past a hit is a candidate (of two donations past one
+page a prompt takes the one it shares rows with), and a partial take is an LRU touch - the taken page outlives an older
+untouched one when the budget evicts; and the prompt no whole page serves
+(`test_prefix_first_page_edges`): of two donations' first pages the one sharing the most leading
+rows is copied (a partial first page and a whole one), the same prompt again stops a token short, a
+prompt sharing no first row takes no page, the chain whose first page was copied is credited the
+hit, and an evicted first page is no candidate; a link to a page the cache dropped attaches
+nothing past the whole hits - the
+model-gated twin a prompt sharing five rows of the first page alone, bit for bit the cold prefill.
+`test_facade.das` - model-free: the facade's own seams over constructed Models; among them
+`test_facade_device_kv_rows` - the rows a device holds a session's K/V for (`device_kv_max_rows`):
+the installed room seam (`set_gpu_kv_room_hook`, put back) over the model's K/V bytes a row, both
+planes of every layer that keeps rows of its own (a `kv_src` layer owns none), f32 halving the f16
+count, never past the model's context, and no seam bounding nothing but the context; on a Metal
+box the installed seam itself - the mirror ceiling (`set_metal_decode_mirror_cap_mb`, put back)
+over the row's bytes, 64 MiB holding 32768 rows of 2048 bytes and 128 MiB twice that.
 `test_metal_role_infer.das` - model-free: the `@role` derivation over the `_role_fixtures/` kernels,
 each compiled at run time - the grid micro-grammar, a buffer passed whole taking the callee
 parameter's direction (a contradicting `@role` refused), a pointer into a tracked buffer taking the
@@ -1832,8 +1956,8 @@ empty row a no-op) and `hlse`.
 rows - a NaN on either side reads as an infinite
 `logits_maxdiff` wherever it sits, `maxdiff_at` lands on it, `logits_maxabs` scales no bar over
 it, rows of two lengths read infinite, `mismatch_exact` counts every element past the shorter
-row's end, and `mismatch_rel`, at a relative bar and at an absolute floor, counts a NaN as off; each with equal rows and a
-finite difference as its controls. `check` runs on a probe handle whose failed asserts are counted:
+row's end, and `mismatch_rel`, at a relative bar and at an absolute floor, counts a NaN as off; each
+with equal rows and a finite difference as its controls. `check` runs on a probe handle (`probe_fails`):
 each bar kind (`rel_of_larger`, `exact`, `rel_of_max`, `envelope` and `per_element`, a float and a
 double expectation) passes rows inside it and reds one element past it, a NaN on either side and a
 length difference red at any bar, the poisoned-expectation control reds a bar too loose to see it
@@ -2038,7 +2162,7 @@ refusal (a synthetic version 1 header in a per-process temp dir; the stocked pac
 control) and the American-to-British rewrite table over pinned strings, idempotence included;
 model-gated (`tts_g2p.bin` + `tts_postag.bin`): the grapheme-to-phoneme rail phoneme-identical
 with the reference front end on the corpus (fed the same normalized text) except the sentences its
-heteronym rules and the lexicon additions of `harness/g2p_local_additions.json` read past it
+heteronym rules and the lexicon additions of `../harness/g2p_local_additions.json` read past it
 (named in the cell), both rails' remaining mismatch counts pinned exactly at 2, the heteronym gate
 (both annotated readings present, 32 of 38 against the reference's 24; a verb tag out-ranks the
 collocation table), the function-word, splitter, inflection and number arms (a glued number past
@@ -2046,7 +2170,7 @@ collocation table), the function-word, splitter, inflection and number arms (a g
 CMUdict, on both rails), stress helpers, the load budget and the pack's size budget; then the
 BRITISH half against
 `_tts_fixtures/g2p_corpus_gb.json` (loaded by `_tts_corpus_gb.das`, minted by
-`harness/mint_tts_g2p_gb_fixture.py` from the reference's own `british=True` front end with its
+`../harness/mint_tts_g2p_gb_fixture.py` from the reference's own `british=True` front end with its
 espeak `en-gb` fallback): phoneme-identical on the 157 rows the reference answered from its
 lexicon alone (an `oov` row is not a lexicon-parity row - our own fallback answers from the
 lexicon, or from American sources rewritten), the inventory sweep - no American-only symbol
@@ -2063,7 +2187,10 @@ British is the control), and the directory rule of `g2p_pack_path` - the full pa
 both sit, the American twin serves alone, an empty directory panics naming it.
 `test_tts_kitten.das` - stocked suite; the symbol-map and token-rule cells run everywhere
 (the front end's inventory into espeak-style IPA against the reference rewrite over the corpus,
-the reference driver's re-spacing and wrapping), the model-gated cells (`kitten-<size>.gguf` +
+the reference driver's re-spacing and wrapping), as does `test_spectrum_diff_reds_a_nan` (the
+parity rail's source-spectrum compare on a synthetic two-bin spectrum through `probe_fails`:
+a NaN in our magnitude, our phase or the reference magnitude reds it,
+the clean rows the control), the model-gated cells (`kitten-<size>.gguf` +
 `tts_oracle/kitten_<size>/` under the models dir, both from `performance/build_tts_data.das`)
 run the parity rail of `_tts_parity.das` per size and a facade smoke cell that speaks one
 sentence and checks the PCM is finite, non-silent, of speech length, and carries its timings;
@@ -2113,7 +2240,7 @@ a voice the model has never heard of refuses first, with no language to name); t
 synthesis across the tower knob on both lanes - as the kitten entry describes them, the seat-absent
 skip included; and, model-free, the seat-name refusal of `styletts2_gpu_stats`.
 `test_tts_pocket.das` - stocked suite (`pocket-tts-en.gguf` + `tts_oracle/pocket_english_2026-04/`
-under the models dir, minted by `harness/convert_pocket.py` and `harness/pocket_oracle.py`): the
+under the models dir, minted by `../harness/convert_pocket.py` and `../harness/pocket_oracle.py`): the
 unigram tokenizer id for id against the package on the 200-sentence corpus and the byte-fallback
 probes (`_tts_fixtures/pocket_tokens.json`, the oracle script's `--tokens-fixture`), the decode
 round trip; the parity rail - the codec decoder over the oracle's latents (one shot), the codec
@@ -2128,7 +2255,7 @@ conv f32, teacher-forced frames logged against the f32 oracle at a rel-l2 figure
 frame count and speech - the rig is the lane's quality gate); the GPU cells (the Metal tower on an
 Apple build, the Vulkan TTS driver elsewhere, through the rail's helpers) - the codec seat
 against the CPU chain over the oracle's latents on the f32 lane within `GPU_CODEC_BAR` (1e-5;
-reads 1e-6 on the exact stamps on the M5 Max, 9e-4 on the f16-staged route, which is why the seat runs exact)
+reads 9e-7 on the exact stamps on the M5 Max, 9e-4 on the f16-staged route, which is why the seat runs exact)
 with the bar's one-sample control and the x3-scaled latents as the compare's control, one tower
 encode a call, the knob-off leg bit-equal to the CPU chain with its decline recorded; the codec seat
 on the served planes of the q8 and kq files against each file's own CPU chain within
@@ -2481,14 +2608,19 @@ model blocks tagged with a listed family run - `family_on(t, name)` in
 carry no tag and always run. Family tokens: `llama` (`--suite decode`, `prefill`, `matrix` and
 `coverage`, plus the image `smol`, `untied`, `metal` and `metal-untied` arms and the `image-vulkan` `vulkan` arm),
 `qwen2`, `qwen3`, `phi3`,
-`gemma2`, `gemma3`, `gemma4`, `qwen3moe`, `gemma4moe`, `gptoss`, `qwen35`, `qwen35moe`, `qwen2moe` (the support-matrix family cells; `qwen35` also tags every block loading a Qwen3.5 carrier - the `mtp` 4b/9b blocks, `test_vulkan_mint.das`), `gemma`,
+`gemma2`, `gemma3`, `gemma4`, `qwen3moe`, `gemma4moe`, `gptoss`, `qwen35`, `qwen35moe`, `qwen2moe` (the support-matrix family cells; `qwen35` also tags `test_vulkan_mint.das` and `test_metal_batched_row.das`), `gemma`,
 `ultravox`, `whisper`, `voxtral`, `parakeet`, `qwen3a`, `canary`, `gemma4a` (image suite arms),
 `gemma3v`, `qwen25v`, `qwen3v` (the coverage census tower rows), `kitten` (the image suite's
 kitten arm), `kokoro`, `pocket` (the coverage census TTS rows),
 `gemma4e` (support-matrix rows under `fam-gemma4e` - E4B PARITY_FULL-gated; E2B Q8_0 and
 Q4_K_M small-tier always-on, carrying the per-layer-FFN-width and blob-kq-PLE-gather coverage.
 Both E2B rows assert parity through their forced-feed cells, not token equality, because
-freeform continuations from a 2B sit on near-ties; plus the coverage-census E4B row; `gptoss`/`qwen2moe`/`qwen3moe` carry census rows too - all PARITY_FULL-gated).
+freeform continuations from a 2B sit on near-ties. Every row ends on the depth cell (`depth_cell`):
+three forced steps past a 120-number prompt within the row's bar of the CPU's, the census holding
+the full-context layers on the head-of-512 fused stamp, the sliding ones on the head-of-256 stamp,
+and none on the chunked pair; the same cell closes every ENGAGE row of a head-96 carrier
+(`fam-phi3`), its census the narrow fused stamp - the head off the 64 lattice admitted past the
+ceiling; plus the coverage-census E4B row; `gptoss`/`qwen2moe`/`qwen3moe` carry census rows too - all PARITY_FULL-gated).
 When profiling one family across formats, gate each round with
 `--arm <arms> --family <fam>` instead of the whole zoo. The family tag on a new
 model-loading block is `REVIEW.md`'s obligation.
@@ -2540,7 +2672,11 @@ Every `[test]` file requiring a `dasllama/*` module outside this folder, each wi
 - `utils/dasllama-server/test_worker_dispatch.das` - requires the server (`openai_server`) by
   bare same-dir name, like the server suites beside it.
 - `utils/dasllama-server/test_server_flags.das` - requires the server's program root (`main`) and
-  `openai_server` by bare same-dir name.
+  `openai_server` by bare same-dir name; its ctx-clamp cell doubles the engine's K/V room seam
+  (`dasllama_gpu_tier`) under the internal escape, so a blob-only Model shell's `seq_len` is cut to
+  the rows the seam answers while a planar shell's stands; its slot-codec cell holds the K/V codec
+  a slot runs on (`slot_kv_dtype`, which the live-load clamp reads): the server default for a slot
+  that asked for none, its own for one that asked.
 - `utils/dasllama-server/test_exchange_client.das` - requires `dasllama/dasllama_exchange` by
   registered name (nothing pins it to that directory); it stays beside the server suites
   because its fixed test port is coordinated with theirs (see its `TEST_PORT` note).

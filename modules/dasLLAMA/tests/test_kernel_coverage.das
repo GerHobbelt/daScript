@@ -34,6 +34,7 @@ require dasllama/dasllama_tts_types   // nolint:STYLE030,LINT019 — read only i
 require ?das_metal dasllama/dasllama_metal_tower   // set_metal_tower — the census pins the rail ON
 require ?das_metal dasllama/dasllama_metal_prefill // metal_prefill_shutdown — the crowned twin-W leg re-arms PSOs
 require ?das_metal dasllama/dasllama_metal_asr_dec // set_metal_wdec — the cov_tower mixed chunk's decoder half
+require ?das_metal dasllama/dasllama_audio_io
 require daslib/jobque_boost
 require daslib/fio  // the zoo paths
 require math  // nolint:STYLE030,LINT019 — used only inside the das_metal static_if half
@@ -114,6 +115,10 @@ let private CENSUS_NEVER_DISPATCHED <- [
     "MetalKqMulMmIq3sT", "MetalKqMulMmIq3sTH", "MetalKqMulMmIq3xxsT", "MetalKqMulMmIq3xxsTH",
     "MetalKqMulMmIq2sT", "MetalKqMulMmIq2sTH", "MetalKqMulMmIq2xsT", "MetalKqMulMmIq2xsTH",
     "MetalKqMulMmIq2xxsT", "MetalKqMulMmIq2xxsTH",
+    // the device attention pair's 128-row AV tail: it serves a head off the 64 lattice (phi-3's 96) when the
+    // window's query panel divides by 128, and the census prompt's never does (its 32-row twin serves every
+    // phi3 window). Its coverage is attn_dev_pair_gate's mt=128 hs=96 arm in test_metal_gemm_kernels.das
+    "MetalAttnAVDev128Tail",
     // the MTP round's kernels: the same-slab verify's per-row argmax dispatches only inside a
     // speculative round (the census prompt never speculates), and the k4 two-row tile only under
     // the kq_mvb2_k4_r2 crown. Their coverage is the argmax_rows gate in test_metal_misc_kernels.das,
@@ -279,9 +284,12 @@ def private census_zoo(t : T?) {
     cov_model(t, path_join(models_dir(), "Llama-3.2-1B-Instruct-Q5_K_M.gguf"), "llama",
         [KVDtype.f16], [2, 4, 8])
     // gemma2: K-quant weights x softcap/sliding/geglu/wide heads; B=4/8 drive the
-    // k4/k6 batch tiles
+    // k4/k6 batch tiles; the three codecs reach the head-of-256 fused attention's three stamps
     cov_model(t, path_join(models_dir(), "gemma-2-2b-it-Q4_K_M.gguf"), "gemma2",
-        [KVDtype.f16, KVDtype.q8_0], [2, 4, 8])
+        [KVDtype.f16, KVDtype.q8_0, KVDtype.tq4], [2, 4, 8])
+    //! phi3: a head of 96 (the fused attention's narrow stamps, the device pair's AV tail) and an untied K-quant embedding (the greedy chain's fp32 gather)
+    cov_model(t, path_join(models_dir(), "Phi-3.5-mini-instruct-Q4_K_M.gguf"), "phi3",
+        [KVDtype.f16, KVDtype.q8_0], [2])
     // qwen3: qk_norm + qd != dim
     cov_model(t, path_join(models_dir(), "Qwen3-0.6B-Q8_0.gguf"), "qwen3",
         [KVDtype.f16, KVDtype.tq4], [2])
@@ -292,10 +300,11 @@ def private census_zoo(t : T?) {
     cov_model(t, path_join(models_dir(), "Qwen3.5-0.8B-Q8_0.gguf"), "qwen35",
         [KVDtype.f16], [2])
     // gemma4e: PLE + V-from-K (no PLE batch arm — a blob-twin CPU batch fallback
-    // would trip the blob-only panic, so no batch shapes here); large tier
+    // would trip the blob-only panic, so no batch shapes here); large tier; the three codecs
+    // reach the head-of-512 fused attention's three stamps on the full-context layers
     let none : array<int>
     cov_model(t, path_join(models_dir(), "gemma-4-E4B-it-Q8_0.gguf"), "gemma4e",
-        [KVDtype.f16], none)
+        [KVDtype.f16, KVDtype.q8_0, KVDtype.tq4], none)
     // gemma4: the checkpoint suppress list (suppress_tokens metadata rides the 12B
     // family, NOT the E-series) + K-quant at 12B shapes; large tier
     cov_model(t, path_join(models_dir(), "gemma-4-12B-it-Q4_K_M.gguf"), "gemma4",
@@ -541,7 +550,7 @@ def private cov_tower(t : T?) {
         set_metal_wdec_step(true)
         set_metal_wdec_step_min_d(0l)   // the census carrier is tiny — under the serving floor
         let wpath = path_join(whisper_dir(), "ggml-tiny.bin")
-        var samples <- read_wav_pcm16_mono(path_join(models_dir(), "jfk.wav"))
+        var samples <- load_audio_16k_mono(path_join(models_dir(), "jfk.wav"))
         if (model_available(t, wpath) && !empty(samples)) {
             var inscope w = WhisperModel()
             var inscope stg <- stage_whisper_model(wpath, false, true)
@@ -983,11 +992,7 @@ def private vk_cov_codec_model(t : T?; path, family : string; kv : KVDtype) {
         let pin = gpu_kv_dtype_pin_()
         set_gpu_kv_dtype_(kv)
         var tr <- load_model_(path, QuantMode.q8)
-        if (pin.pinned) {
-            set_gpu_kv_dtype_(pin.dt)
-        } else {
-            reset_gpu_kv_dtype_()
-        }
+        restore_gpu_kv_dtype(pin)
         tr.config.seq_len = min(tr.config.seq_len, 512l)
         with_dasllama_jobque() {
             var s = make_run_state(tr.config, kv, kv)

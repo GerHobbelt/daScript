@@ -23,7 +23,7 @@ def iq3s_signed(g, nib : uint) : uint {
 //! gemma's soft cap cap * tanh(v / cap) in softcap4's exp form: a shader tanh NaNs past ~44, while exp(INF) zeroes the term and saturates.
 def softcap_exp(v, cap : float) : float => cap * (1.0 - 2.0 / (1.0 + exp(2.0 * v / cap)))
 
-//! tanh clamped to +-15, where it already saturates in f32: past that a device tanh built from exp answers NaN, the CPU +-1
+//! tanh clamped to +-15, where f32 tanh already saturates: a device tanh built from exp answers NaN past about +-44, the CPU +-1
 def tts_tanh(v : float) : float => tanh(clamp(v, -15.0, 15.0))
 
 //! the logistic sigmoid, one form for the CPU chains and both kernel homes
@@ -35,9 +35,6 @@ def silu_f32(v : float) : float => v / (1.0 + exp(-v))
 //! `x` gated by the logistic of `g` as the one quotient x / (1 + exp(-g)), not x times `sigmoid_f32(g)`
 def sig_gate(x, g : float) : float => x / (1.0 + exp(-g))
 
-//! `v` stored as a half, saturated at the half's largest finite magnitude instead of overflowing to infinity
-def half_sat(v : float) : float16 => float16(clamp(v, -65504.0, 65504.0))
-
 //! Softplus with the standard large-x shortcut: x > 20 → x, else log(1 + exp(x)).
 def softplus(x : float) : float => x > 20.0 ? x : log(1.0 + exp(x))
 
@@ -45,7 +42,7 @@ def softplus(x : float) : float => x > 20.0 ? x : log(1.0 + exp(x))
 def dn_decay(a, g : float) : float => exp(a * softplus(g))
 
 //! the CPU `gelu`'s tanh form in f32 (not the f16 LUT form the vision towers read), its tanh clamped by `tts_tanh`
-def tts_gelu_tanh(v : float) : float => 0.5 * v * (1.0 + tts_tanh(0.7978845608028654 * (v + 0.044715 * v * v * v)))
+def tts_gelu_tanh(v : float) : float => 0.5 * v * (1.0 + tts_tanh(0.7978845608028654 * mad(0.044715 * v * v, v, v)))
 
 //! A forward conv's source row for output row r at tap - (r0 + r) * stride + tap * dil - pad_l - or -1 off the input.
 def conv_src_fwd_row(r, tap, r0, pad_l, dil, stride, t_in : uint) : int {
