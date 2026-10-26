@@ -441,6 +441,13 @@ namespace das {
                     }
                     if (rangeError) return;
                 }
+                if (!decl.type->ref) {
+                    if (auto viaAssign = promoteInitToAssign(decl.moveSemantics ? "<-" : "=", decl.type, decl.init, decl.init->at)) {
+                        decl.init = viaAssign;
+                        decl.moveSemantics = !decl.type->canCopy();
+                        return;
+                    }
+                }
                 if (!canCopyOrMoveType(decl.type, decl.init->type, TemporaryMatters::yes, decl.init,
                                        "structure field " + decl.name + " initialization type mismatch", CompilationError::invalid_initialization_type, decl.init->at)) {
                 } else if (!decl.type->canCopy() && !decl.moveSemantics) {
@@ -610,6 +617,13 @@ namespace das {
             }
             if (rangeError) {
                 return Visitor::visitGlobalLetInit(var, init);
+            }
+            if (!var->generated && !var->init_via_clone && !var->type->ref) {
+                if (auto viaAssign = promoteInitToAssign(var->init_via_move ? "<-" : "=", var->type, var->init, var->init->at)) {
+                    var->init = viaAssign;
+                    var->init_via_move = !var->type->canCopy();
+                    return Visitor::visitGlobalLetInit(var, var->init);
+                }
             }
             if (!canCopyOrMoveType(var->type, var->init->type, TemporaryMatters::no, var->init,
                                       "global variable '" + var->name + "' initialization type mismatch", CompilationError::invalid_initialization_type, var->init->at)) {
@@ -1576,12 +1590,8 @@ namespace das {
         expr->type = new TypeDecl(Type::tPointer, expr->at);
         expr->type->firstType = new TypeDecl(Type::tHandle, expr->at);
         expr->type->firstType->annotation = (TypeAnnotation *)Module::require("ast_core")->findAnnotation("Expression");
-        // mark quote as noAot, unless daslib/quote lowering will replace it
-        // (aot_macros or jit_enabled policy, or per-module `options aot_macros` — same gate
-        // as QuotePass, including its macro-module exclusion for the jit trigger)
         if (func) {
             if (!program->policies.aot_macros
-                    && !(program->policies.jit_enabled && !program->needMacroModule)
                     && !program->options.getBoolOption("aot_macros", false)) {
                 func->noAot = true;
             }
@@ -5731,6 +5741,13 @@ namespace das {
             }
             if (rangeError) {
                 return Visitor::visitLetInit(expr, var, init);
+            }
+            if (!var->generated && !var->init_via_clone && !var->type->ref) {
+                if (auto viaAssign = promoteInitToAssign(var->init_via_move ? "<-" : "=", var->type, var->init, var->at)) {
+                    var->init = viaAssign;
+                    var->init_via_move = !var->type->canCopy();
+                    return Visitor::visitLetInit(expr, var, var->init);
+                }
             }
             if (!canCopyOrMoveType(var->type, var->init->type, TemporaryMatters::no, var->init,
                                       "local variable " + var->name + " initialization type mismatch", CompilationError::invalid_initialization_type, var->at)) {

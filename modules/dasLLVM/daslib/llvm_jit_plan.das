@@ -31,7 +31,7 @@ require jit
 // invalidates cached DLLs (e.g. edits to llvm_jit.das, llvm_macro.das, llvm_jit_common.das,
 // runtime helper ABI, default target triple). Cache filenames fold this in, so a bump
 // makes every previously written DLL miss the cache on the next run and get GC'd.
-let public LLVM_JIT_CODEGEN_VERSION : uint64 = 0x8aul
+let public LLVM_JIT_CODEGEN_VERSION : uint64 = 0x8eul   // 0x8e: ++ and -- on a pointer lower to a GEP, not a runtime call
 
 let public JIT_FNV_PRIME : uint64 = 1099511628211ul
 
@@ -189,6 +189,7 @@ def public jit_env_salt(opt_level : int; size_level : int; emit_prologue : bool;
     h = (h ^ uint64(CONTEXT_OFFSET_OF_SHARED)) * JIT_FNV_PRIME
     h = (h ^ uint64(CONTEXT_OFFSET_OF_STOP_FLAGS)) * JIT_FNV_PRIME
     h = (h ^ uint64(CONTEXT_OFFSET_OF_EVAL_TOP)) * JIT_FNV_PRIME
+    h = (h ^ uint64(SIMFUNCTION_OFFSET_OF_JIT_FUNCTION)) * JIT_FNV_PRIME
     // full host-CPU identity when the TargetMachine bakes it - the cpuid bits below cover only the matrix-tier features; a wider box's object is an illegal instruction on a narrower one
     if (use_host_cpu) {
         let host_cpu = LLVMGetHostCPUName()
@@ -279,11 +280,12 @@ def public jit_dll_basename(funcs : array<FunctionPtr>; opt_level : int; size_le
     return "{h}"
 }
 
-def public jit_gc_stale_dlls(subdir : string; keep_basename : string; keep_names : table<string>) {
+def public jit_gc_stale_dlls(subdir : string; keep_basename : string; keep_names : table<string>; mine : table<string>) {
     // keep mask: the current DLL-hash prefix (dll/lib/exp/pdb/rsp + monolith .o) OR an exact keep_names entry (split obj cache's live partition objects - named by partition key, not dll hash)
     let keep_prefix = "{keep_basename}."
     dir(subdir) $(fname) {
-        if (fname == "." || fname == ".." || fname |> starts_with(keep_prefix) || keep_names |> key_exists(fname)) return
+        if (fname == "." || fname == ".." || fname |> starts_with(keep_prefix)
+            || keep_names |> key_exists(fname) || !(mine |> key_exists(fname))) return
         let full_path = "{subdir}/{fname}"
         var err : string
         let ok = remove(full_path, err)

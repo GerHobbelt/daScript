@@ -66,7 +66,7 @@ def document_module_vulkan_commands() {
 def document_module_vulkan_boost() {
     var mod = find_module("vulkan_boost")
     var groups <- array<DocGroup>(
-        group_by_regex("Device selection", mod, %regex~^(select_physical_device|select_graphics_queue_family|find_memory_type)$%%),
+        group_by_regex("Device selection", mod, %regex~^(select_physical_device|select_graphics_queue_family|try_find_memory_type|find_memory_type)$%%),
         group_by_regex("Instance & device", mod, %regex~^(create_instance|create_device|create_device_descriptor_indexing|create_device_draw_parameters|get_device_queue|instance_extension_available|device_extension_available)$%%),
         group_by_regex("Shaders & pipelines", mod, %regex~^(create_shader_module|create_pipeline_layout|create_graphics_pipeline_simple|create_graphics_pipeline_v3d|create_graphics_pipeline_dyn|create_compute_pipeline|create_compute_pipeline_full_subgroups)$%%),
         group_by_regex("Mesh shaders",     mod, %regex~^(create_device_mesh_shader|mesh_shader_supported|create_mesh_pipeline)$%%),
@@ -90,7 +90,7 @@ def document_module_vulkan_window() {
         group_by_regex("Surfaces",   mod, %regex~^(create_surface|queue_family_supports_present)$%%),
         group_by_regex("Swapchain",  mod, %regex~^(create_swapchain|recreate_swapchain|build_swapchain_framebuffers)$%%),
         group_by_regex("Frame sync", mod, %regex~^create_frame_sync$%%),
-        group_by_regex("Frame loop", mod, %regex~^(draw_frame|present_frame)$%%),
+        group_by_regex("Frame loop", mod, %regex~^(draw_frame|present_frame|set_dynamic_viewport)$%%),
         hide_group(group_by_regex("Finalizers", mod, %regex~^finalize$%%))
     )
     document("Window — surface, swapchain, frame sync, and the present loop", mod, "vulkan_window.rst", groups)

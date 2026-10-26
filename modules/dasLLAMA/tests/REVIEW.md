@@ -2,14 +2,18 @@
 
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture
 doc: `CLAUDE.md`. Planned work: `../followup_general.md`, `../followup_vulkan.md`, `../followup_metal.md`.
+A cell is one `t |> run` subtest, or a `[test]` function that runs no subtest; a helper's
+asserts belong to every cell that calls it.
 
 **A cell, probe, or harness that dispatches or binds a kernel class - a `[metal_dispatch]` or
 `[vk_dispatch]` class, or a CPU kernel in `../dasllama/dasllama_math*.das` - applies
 `REVIEW_KERNEL_CELLS.md` (beside this file) together with this list, wherever the diff puts the
 file.**
 
-**A diff that adds a pinned test cell, or touches one, applies `REVIEW_PINNED_GATES.md` (beside
-this file) together with this list** - that checklist defines the kind.
+**A diff that touches a cell in the pinned set, or adds a cell whose expected value must be kept
+in step with something maintained outside the cell (a document, a checked-in table, a committed
+artifact's form, a roster, a knob list), applies `REVIEW_PINNED_GATES.md` (beside this file)
+together with this list.**
 
 **Every PR runs `run.das -- --suite model-free` and `run.das -- --suite stocked` on a box with
 the models stocked, plus every test here the change reaches - never the whole directory.** A
@@ -17,27 +21,32 @@ change reaches a test when it alters anything the test's result depends on - the
 shared helper, engine code it exercises, an in-tree fixture or corpus it reads, or a name it
 asserts on; a comment-only edit reaches none.
 
-**A PR that adds or changes a cell above the large tier also runs the `stocked` suite with
-`DASLLAMA_PARITY_FULL=1` and names the box in its body.** A plain stocked run skips every such
-cell and reads green.
+**A PR that adds or changes a cell loading a model above the large tier (`LARGE_TIER_BYTES`,
+`_model_tier.das`) also runs that cell with `DASLLAMA_PARITY_FULL=1` set, on a box with the model
+stocked, through a `run.das` suite listing the cell's file - with `--arm` naming the cell when
+`run.das` accepts `--arm` for that suite (every suite but `model-free` and `stocked`) - and names
+the box in the PR body.** A run without
+`DASLLAMA_PARITY_FULL=1` skips every such cell and passes.
 
-**A PR's `stocked` run carries no `--exclude`** - an excluding run is the iteration form between
+**The `stocked` run every PR owes carries no `--exclude`** - an excluding run is the iteration form between
 PRs; a PR that ships on it never ran the coverage it dropped.
 
 **A test file - a `.das` in this folder that dastest runs: one carrying at least one `[test]`
 function, or one whose `cant_`, `failed_` or `invalid_` prefix makes its compile the assertion -
-whose cells cannot hold under `DASLLAMA_CPU_PREFILL=1` says so in its header and joins the
-exempt list of `test_run_suites.das`'s suite-membership gate in the same change; weakening that
-gate is a defect.** `DASLLAMA_CPU_PREFILL=1` is what the runner arms for every suite.
-
-**Invoking dastest directly on a test file that no `run.das` suite lists under `model-free` or
-`stocked`, and that `test_run_suites.das`'s suite-membership gate does not name as its
-exemption, is a defect - run it through `run.das`.**
+whose cells cannot hold under `DASLLAMA_CPU_PREFILL=1` says so in its header - the file's top
+comment block - and joins the exempt list of `test_run_suites.das`'s suite-membership gate in
+the same change; weakening that gate is a defect.** `DASLLAMA_CPU_PREFILL=1` is what the runner
+arms for every suite.
 
 **`run.das` declares no global whose initializer spawns, logs, writes the environment or
 touches the filesystem; a diff that adds one is a defect, and weakening `test_run_suites.das`'s
 no-`[init]` check is a defect.** `test_run_suites.das` and `test_run_summary.das` require `run` by
 bare same-dir name, so anything that fires on require fires inside every one of those test processes.
+
+**A diff that gives `_model_tier.das`, or a `tests/` fixture it requires, an `[init]` that
+declares the CPU-prefill intent (`allow_cpu_prefill`) is a defect - the intent is declared in
+the `[init]` of the test file that needs it.** `test_cpu_prefill_tripwire.das` requires
+`_model_tier` and asserts that the guard trips while the intent is undeclared.
 
 **A cell asserting a chat template's INSTRUCT wire - a closed empty thought block and no
 thinking gate - calls `set_thinking(c, false)` on its `ChatSession` before the first turn.**
@@ -56,12 +65,17 @@ suite, its skip condition, or what it claims - a shape, a length, a format or a 
 sweeps, or a tolerance it holds - corrects or adds, in the same change, the `CLAUDE.md` entry of
 every test file running the cell, counts and skip clauses included.** A file's entry is the
 clause that describes the file, named with or without its `.das` suffix; a `{a,b}` shorthand or
-a suite roster owes nothing.
+a suite roster needs no update.
+
+**A diff that adds, renames, or drops an arm name - the literal passed to `arm_on(t, name)`
+(`_model_tier.das`), what `--arm` matches - updates the arm census in `CLAUDE.md`'s "Arm filter
+mechanics" section in the same change.** An arm the census does not name is unreachable to
+whoever is choosing what to run.
 
 **A diff that adds, changes, or drops a cell's skip condition other than the runner's own
 `--arm` / `--family` filter - a `t |> skip` or an early return - updates in the same change the
-header of every test file that runs the cell, wherever the cell is defined.** A header is the
-file's top comment block; it names every fact the cells that file runs skip on.
+header - the file's top comment block - of every test file that runs the cell, wherever the cell
+is defined, so that the header names every fact the cells that file runs skip on.**
 
 **A diff that adds, moves, or removes a test file outside this folder that carries a
 `require dasllama/...` line of its own adds, corrects, or drops its row, with the reason it
@@ -74,11 +88,6 @@ block and `../CLAUDE.md` in the same change.** A data row in a table `run.das` l
 `MODULE_AREAS`, a suite's or an area's file list - is not the surface. Both documents restate
 the surface for an agent that reads them cold; a copy the code has left behind sends that agent
 to a flag that no longer does what the text says.
-
-**A diff that adds, renames, or drops an arm name - the literal passed to `arm_on(t, name)`
-(`_model_tier.das`), what `--arm` matches - updates the arm census in `CLAUDE.md`'s "Arm
-filter mechanics" section in the same change** - an arm the census does not name is
-unreachable to whoever is choosing what to run.
 
 **On every platform, a cell that neither asserts nor registers a skip is a defect.** A cell that
 returns without asserting - whatever the reason - registers `t |> skip` there, and one whose
@@ -103,12 +112,18 @@ through `model_available` (`_model_tier.das`), one call per file; a test that ca
 and their total size is under `LARGE_TIER_BYTES` unless `DASLLAMA_PARITY_FULL=1` is set.** Every
 other stocked fixture gates on its own presence.
 
-**A test - or a program a test builds or spawns - whose subject is not the `.dlim` image rail
-never mints or maps a MODEL image: it either runs with `DASLLAMA_IMAGE=0` in its environment,
-or calls no loader that bakes a `.dlim` - `load_model`, `load_model_cached`, `load_model_image`,
+**A test - or a program a test builds or spawns - whose subject is not the `.dlim` image rail (a
+cell whose subject is a lane knob's effect on the image identity has the rail as its subject)
+never mints or maps a MODEL image: it either runs with `DASLLAMA_IMAGE=0` in its environment, or
+calls no loader that bakes a `.dlim` (`load_model`, `load_model_cached`, `load_model_image`,
 `load_<family>_tower`, `load_<family>_encoder`, `load_<family>_embedder`, `load_<carrier>_model`,
 `load_vision_embedder`, `load_audio_embedder`, `load_tts_model`, `load_styletts2`; the exact name
-`load_model_`, the plain GGUF load, bakes nothing.**
+`load_model_`, the plain GGUF load, bakes nothing); such a test loads a media carrier in memory
+from the family's `stage_*` staging - its `mint_*` twin, or `cache_via_image_staged` with an empty
+image path.** A cell that loads under a lane pin - a `set_<family>_q8`-class knob, or a
+`set_metal_tensor_crowns` / `pin_metal_tensor_crowns` pin - is where the rule matters: a disk bake
+under a pinned lane GC-purges the serving lane's `.dlim` beside the model, and the next
+direct-image load in another suite panics on the wrong identity.
 
 **A predicate whose value the BOX decides (a device capability, a policy default) and that
 therefore cannot differ between two runs on one machine is never tested through its own
@@ -137,13 +152,15 @@ claims about what the cell exercises is asserted in that cell.** A cap, a resize
 showing the path ran is not evidence the number was reached; a device's geometry (subgroup width,
 SM count) is no coverage claim.
 
-**A freeform token-parity cell whose two sides can round differently - different lanes,
-backends, batch shapes or kernel forms - is a defect: use the forced-feed logits-tolerance
+**A token-parity cell over a text-generation prompt whose continuation can tie - a freeform
+cell - whose two sides can round differently - different lanes, backends, batch shapes or kernel
+forms - is a defect: use the forced-feed logits-tolerance
 form, the same fixed tokens fed to both sides and logits compared within a bar.** A counting
 cell - one whose prompt forces a continuation that cannot tie, so greedy tokens are fixed -
 stays token-exact.
 
-**A token-exact freeform compare states in the cell what makes its two sides one code path -
+**A token-exact compare over a text-generation prompt whose continuation can tie - a freeform
+compare - states in the cell what makes its two sides one code path -
 the shared entry point, or an assert pinning the lane.**
 
 **An ASR family with no token-for-token oracle cell is a defect** - the cell compares a
@@ -154,7 +171,7 @@ defect.** A stocked artifact is anything the test reads out of `models_dir()` th
 build does not produce - model files, mmprojs, front-end packs, image fixtures, oracle dumps.
 Any one of these names the producer: a row in `../performance/model_specs.das`; a row's
 `companions` list; a row in `asr_catalog` (`../performance/profile_common.das`); a convert
-script beside `model_specs.das` in `../performance/`; for an oracle dump, the mint script stocked
+script beside `../performance/model_specs.das`; for an oracle dump, the mint script stocked
 beside the dumps under `models_dir()`, named by the test that loads the dump.
 
 **A test that reads a vision encode oracle dump without naming the minting arm in its header -
@@ -165,7 +182,9 @@ defect.**
 `set_*` / `pin_*` call in `dasllama/` that changes the driver's route, the serving lane or the
 engage mode for the rest of the process - whose value the cell's claim depends on, even when
 the claim needs it at its DEFAULT value; a family serving-lane pin is the cell's own, never the
-file's `[init]`, and a claim that needs the lane unset establishes it with `reset_<family>_q8`.**
+file's `[init]`, and a claim that needs the lane unset establishes it with the family's own unset
+call - `reset_<family>_q8`, canary's `reset_canary_enc_q8`, whisper's `set_asr_fp32(false)` and
+`set_asr_tower_fp32(false)`.**
 
 **A cell returns with every family pin unset - whether or not this cell set one - and every
 other driver setter it touched back where it found it; the unset call is the family's own -
@@ -173,16 +192,14 @@ other driver setter it touched back where it found it; the unset call is the fam
 `set_asr_tower_fp32(false)` - returning the family to its policy default.** Why a hook left set changes what the next cell
 measures is `CLAUDE.md`'s "Metal fixtures".
 
-**A cell claiming a family serving lane that does not pin it through the family's own lane
-knobs - `set_<family>_q8`, canary's `set_canary_enc_q8`, whisper's `set_asr_fp32` /
-`set_asr_tower_fp32` - or through a loader parameter that takes the lane, is a defect.** A
-runtime decline standing in for a pin measures whichever lane the box's policy picked.
+**A cell claiming a family serving lane pins it through the family's own lane knobs -
+`set_<family>_q8`, canary's `set_canary_enc_q8`, whisper's `set_asr_fp32` / `set_asr_tower_fp32` -
+or through a loader parameter that takes the lane.** A runtime decline standing in for a pin
+measures whichever lane the box's policy picked.
 
-**A cell that loads a media carrier under a lane pin - a `set_<family>_q8`-class knob, or a
-`set_metal_tensor_crowns` / `pin_metal_tensor_crowns` pin - and whose subject is not that lane
-knob itself mints in memory from the family's `stage_*` staging - its `mint_*` twin, or
-`cache_via_image_staged` with an empty image path - never through a `.dlim`-baking loader.** A disk bake under a pinned lane GC-purges the serving lane's `.dlim`
-beside the model, and the next direct-image load in another suite panics on the wrong identity.
+**A cell asserting the unpinned default lane compares against the predicates the family's
+`*_serves_q8` accessor reads for its unpinned default (whatever its body calls), never against a
+hardcoded lane.** The default lane differs per box.
 
 **An image-suite cell whose subject IS the lane knob loads through the `.dlim`-baking loader,
 never around it.** The pin is part of what the image identity records.
@@ -193,10 +210,9 @@ one CPU inference reads) and the stages a decode override selects on that model'
 (`blob_twin(t, path, seq_cap)`, `_metal_blob_twin.das`), in one session.** The planar
 model and its blob twin share one shape, so one session serves both.
 
-**A diff that adds a model-loading block to a `run.das` suite other than `model-free`,
-`stocked` and `kernels` tags it with its family.** The family tag is the token passed to
-`family_on(t, name)` (`_model_tier.das`). An untagged block silently joins every family's
-gate.
+**A diff that adds a model-loading block to a file of a `run.das` suite that accepts `--arm` -
+every suite but `model-free` and `stocked` - tags it with its family.** The family tag is the token passed to `family_on(t, name)`
+(`_model_tier.das`). An untagged block runs under every `--family` filter.
 
 **A diff that adds or moves a batched-vs-sequential parity cell - one comparing the batched
 stack against a per-session sequential forward - onto a carrier above `LARGE_TIER_BYTES`
@@ -209,12 +225,6 @@ after that process starts is invisible to a config already read.
 
 **A cell that cannot set an environment-read knob before its reader starts names that knob's
 value in the text a red prints - the cell label or the assert.**
-
-**A cell asserting the UNPINNED default lane never compares against a hardcoded lane - it
-compares against the same predicates the family's own `*_serves_q8` accessor reads for its
-unpinned default: `float_batch_override_active()` and the family's would-the-GPU-serve call.**
-The default lane differs per box, so the assert is on the lane the policy selects, not on one
-predicate's own value.
 
 **A cell that runs with no model loaded and encodes, preprocesses, or asserts on media bytes
 an encoder consumes - pixels or audio samples, not a `.dlim` model image - builds its fixture
@@ -237,11 +247,13 @@ not exact-value: it is not float-portable.
 **An embedder-parity cell that does not name its fixture, or does not log the measured
 maxdiff on green as well as red, is a defect.**
 
-**A diff that adds an assert carrying a bar - a tolerance, a count floor or a ceiling - or loosens
-one, ships in the same change a control that lands outside the bar in every cell that holds it.**
-A bar nothing has exceeded where it is applied is not known to discriminate there. An assert
-whose threshold the cell computes from a number measured in the same run carries no bar - this
-rule does not reach it.
+**A diff that adds or loosens an assert holding a figure the run measures - the difference
+between two computed sides, a rate, an error, or a count the run decides - within a nonzero
+tolerance, or past a floor or ceiling, ships in the same change a control that lands outside that
+bound in every cell that holds it; a control changes an input the computation reads (a zeroed
+weight region, a poisoned element, a mechanism unhooked) and re-runs the compare, so a value
+added to the output after the fact is not one.** A bound nothing has exceeded where it is applied
+is not known to discriminate there.
 
 **A family that gains a live thinking or tool format ships its recognition tests in the same
 change** - the wire-shape pins, the render pins, and a live server case gated on the family's

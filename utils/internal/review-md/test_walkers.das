@@ -104,16 +104,65 @@ let DASLLAMA_META_GREEN = "options gen2\n\nstruct Thing \{\n    a : int\n    b :
 // which the pipe-form-only count missed
 let DASLLAMA_META_RED = "options gen2\n\nstruct Thing \{\n    a : int\n    b : array<int>\n\}\n\ndef private serialize_meta(var arch : Archive; var t : Thing) \{\n    serialize(arch, t.a)\n    serialize_pod_array(arch, t.b)\n\}\n"
 
-//! the green class surface: one class-shaped input for every class check the gate runs (the ladder, roster and slab inputs are VK_PREFILL_TEXT / VK_COMMON_GREEN)
-let VK_CLASSES_GREEN = "options gen2\n\nlet SCHED_S_ROWS = 32u\nlet SCHED_M_ROWS = 128u\n\nclass ArBase : RmsWgBase \{\n    @workgroup row : float[8192]\n\}\n\nclass template KqCm2BatchT : MoeCmBase \{\n    @template_constant BN : uint = 256u\n    @template_constant BK : uint = 64u\n    @template_constant UNR : uint = 4u\n    def abstract khr_stage16(blk, e0, sbase : uint) : void\n\}\n\nclass template K4Cm2T : KqCm2BatchT \{\n\}\n\nclass template Q8Cm2T : KqCm2BatchT \{\n\}\n\n[vk_dispatch(name = \"kq_batch_k4_khr_cls\", kernel = \"run\")]\nclass K4KhrBatch : K4Cm2T \{\n    override BN = 128u\n    typedef AT = coopmatWgA_f16_128x64\n    typedef BT = coopmatWgB_f16_64x128\n    typedef ACC = coopmatWgAcc_f16_128x128\n    typedef ACCW = coopmatWgAcc_f32_128x128\n\}\n\n[vk_dispatch(name = \"q8_batch_khr_cls\", kernel = \"run\")]\nclass Q8KhrBatch : Q8Cm2T \{\n    override BN = 128u\n    typedef AT = coopmatWgA_f16_128x64\n    typedef BT = coopmatWgB_f16_64x128\n    typedef ACC = coopmatWgAcc_f16_128x128\n    typedef ACCW = coopmatWgAcc_f32_128x128\n\}\n\n[vk_dispatch(name = \"kq_batch_k4_cm2e_cls\", kernel = \"run\")]\nclass K4Cm2EBatch : K4Cm2T \{\n    override BN = 128u\n    override BK = 32u\n    override UNR = 8u\n    typedef AT = coopmatWgA_f16_128x32\n    typedef BT = coopmatWgB_f16_32x128\n    typedef ACC = coopmatWgAcc_f16_128x128\n    typedef ACCW = coopmatWgAcc_f32_128x128\n\}\n\n[vk_dispatch(name = \"q8_batch_cm2e_cls\", kernel = \"run\")]\nclass Q8Cm2EBatch : Q8Cm2T \{\n    override BN = 128u\n    override BK = 32u\n    override UNR = 8u\n    typedef AT = coopmatWgA_f16_128x32\n    typedef BT = coopmatWgB_f16_32x128\n    typedef ACC = coopmatWgAcc_f16_128x128\n    typedef ACCW = coopmatWgAcc_f32_128x128\n\}\n"
+//! one cm2 batch stamp of the fixture's classes file: `cls` on `base` at BN x BK with its four tile typedefs (a wrong tile is written by hand where a red twin wants one)
+def private vk_stamp(name, cls, base : string; bn, bk : int; unr : int = -1) : string {
+    var s = "[vk_dispatch(name = \"{name}\", kernel = \"run\")]\nclass {cls} : {base} \{\n    override BN = {bn}u\n"
+    if (bk != 64) {
+        s += "    override BK = {bk}u\n"
+    }
+    if (unr > 0) {
+        s += "    override UNR = {unr}u\n"
+    }
+    s += "    typedef AT = coopmatWgA_f16_128x{bk}\n    typedef BT = coopmatWgB_f16_{bk}x{bn}\n    typedef ACC = coopmatWgAcc_f16_128x{bn}\n    typedef ACCW = coopmatWgAcc_f32_128x{bn}\n\}\n\n"
+    return s
+}
 
-//! the red twin: a bodied KHR stage, a template with no KHR or e class, and a k4 e stamp whose A tile and unroll contradict its BK 32.
-let VK_CLASSES_RED = "options gen2\n\nlet SCHED_S_ROWS = 32u\nlet SCHED_M_ROWS = 128u\n\nclass ArBase : RmsWgBase \{\n    @workgroup row : float[8192]\n\}\n\nclass template KqCm2BatchT : MoeCmBase \{\n    @template_constant BN : uint = 256u\n    @template_constant BK : uint = 64u\n    @template_constant UNR : uint = 4u\n    def khr_stage16(blk, e0, sbase : uint) : void \{\n    \}\n\}\n\nclass template K4Cm2T : KqCm2BatchT \{\n\}\n\nclass template K5Cm2T : KqCm2BatchT \{\n\}\n\nclass template Q8Cm2T : KqCm2BatchT \{\n\}\n\n[vk_dispatch(name = \"kq_batch_k4_khr_cls\", kernel = \"run\")]\nclass K4KhrBatch : K4Cm2T \{\n    override BN = 128u\n    typedef AT = coopmatWgA_f16_128x64\n    typedef BT = coopmatWgB_f16_64x128\n    typedef ACC = coopmatWgAcc_f16_128x128\n    typedef ACCW = coopmatWgAcc_f32_128x128\n\}\n\n[vk_dispatch(name = \"q8_batch_khr_cls\", kernel = \"run\")]\nclass Q8KhrBatch : Q8Cm2T \{\n    override BN = 128u\n    typedef AT = coopmatWgA_f16_128x64\n    typedef BT = coopmatWgB_f16_64x128\n    typedef ACC = coopmatWgAcc_f16_128x128\n    typedef ACCW = coopmatWgAcc_f32_128x128\n\}\n\n[vk_dispatch(name = \"kq_batch_k4_cm2e_cls\", kernel = \"run\")]\nclass K4Cm2EBatch : K4Cm2T \{\n    override BN = 128u\n    override BK = 32u\n    typedef AT = coopmatWgA_f16_128x64\n    typedef BT = coopmatWgB_f16_32x128\n    typedef ACC = coopmatWgAcc_f16_128x128\n    typedef ACCW = coopmatWgAcc_f32_128x128\n\}\n\n[vk_dispatch(name = \"q8_batch_cm2e_cls\", kernel = \"run\")]\nclass Q8Cm2EBatch : Q8Cm2T \{\n    override BN = 128u\n    override BK = 32u\n    override UNR = 8u\n    typedef AT = coopmatWgA_f16_128x32\n    typedef BT = coopmatWgB_f16_32x128\n    typedef ACC = coopmatWgAcc_f16_128x128\n    typedef ACCW = coopmatWgAcc_f32_128x128\n\}\n"
+//! one class ladder trio (`<prefix>ensure` / `set` / `enc`): stamped by `kq_tile_stamp` over its `tile_<verb>_<tail>` placeholders (with a skip list where `skip` names one), or the hand-written if-ladders the rule bans
+def private vk_ladder(prefix, tail : string; stamped : bool; skip : string = "") : string {
+    if (!stamped) {
+        return "def {prefix}ensure(fmt : int) : bool \{\n    if (fmt == 1) return ensure_kq_batch_k4_{tail}()\n    return ensure_q8_batch_{tail}()\n\}\n\ndef {prefix}set(fmt : int) : int \{\n    if (fmt == 1) return set_kq_batch_k4_{tail}()\n    return set_q8_batch_{tail}()\n\}\n\ndef {prefix}enc(fmt : int) \{\n    if (fmt == 1) \{\n        enc_kq_batch_k4_{tail}()\n    \} else \{\n        enc_q8_batch_{tail}()\n    \}\n\}\n\n"
+    }
+    let arg = empty(skip) ? "fmt" : "fmt, \"{skip}\""
+    return "def {prefix}ensure(fmt : int) : bool \{\n    var r = false\n    kq_tile_stamp({arg}) <| $() \{\n        r = tile_ensure_{tail}()\n    \}\n    return r\n\}\n\ndef {prefix}set(fmt : int) : int \{\n    var r = 0\n    kq_tile_stamp({arg}) <| $() \{\n        r = tile_set_{tail}()\n    \}\n    return r\n\}\n\ndef {prefix}enc(fmt : int) \{\n    kq_tile_stamp({arg}) <| $() \{\n        tile_enc_{tail}()\n    \}\n\}\n\n"
+}
 
-//! the prefill's KHR and e ladder trios, each with the one format's arm (the e trio falls through to q8)
-let VK_PREFILL_TEXT = "options gen2\n\ndef khr_cls_ensure(fmt : int) : bool \{\n    if (fmt == 1) return ensure_kq_batch_k4_khr_cls()\n    return ensure_q8_batch_khr_cls()\n\}\n\ndef khr_cls_set(fmt : int) : int \{\n    if (fmt == 1) return set_kq_batch_k4_khr_cls()\n    return set_q8_batch_khr_cls()\n\}\n\ndef khr_cls_enc(fmt : int) \{\n    if (fmt == 1) \{\n        enc_kq_batch_k4_khr_cls()\n    \} else \{\n        enc_q8_batch_khr_cls()\n    \}\n\}\n\ndef cm2e_cls_ensure(fmt : int) : bool \{\n    if (fmt == 1) return ensure_kq_batch_k4_cm2e_cls()\n    return ensure_q8_batch_cm2e_cls()\n\}\n\ndef cm2e_cls_set(fmt : int) : int \{\n    if (fmt == 1) return set_kq_batch_k4_cm2e_cls()\n    return set_q8_batch_cm2e_cls()\n\}\n\ndef cm2e_cls_enc(fmt : int) \{\n    if (fmt == 1) \{\n        enc_kq_batch_k4_cm2e_cls()\n    \} else \{\n        enc_q8_batch_cm2e_cls()\n    \}\n\}\n"
+//! the class surface: one class-shaped input for every class check the gate runs (the roster and slab inputs are VK_COMMON_GREEN;
+//! the e-column alias roster is the kqformat fixture). Green: the abstract KHR stage, the k4 and q8 templates with their khr / m / s
+//! stamps (both formats alias the m stamp, so no e stamp), one GEMV leaf template, both ladder trios stamped. Red: a bodied KHR
+//! stage; a K5 template with no stamp; a K4 e stamp the aliasing ladder never picks, its A tile and unroll contradicting its BK 32;
+//! a K6 whose s stamp steps 32 while the roster aliases it; a K3 on the roster with no m stamp; a K2 stepping 64 on both columns
+//! off the roster; the khr ladders skipping k5, the e ladders hand-written
+def private vk_classes_text(red : bool) : string {
+    var parts <- [
+        "options gen2\n\nlet SCHED_S_ROWS = 32u\nlet SCHED_M_ROWS = 128u\n\nclass template ArBase : ResidualT \{\n    @workgroup row : float[8192]\n\}\n\n",
+        "class template KqCm2BatchT : MoeCmBase \{\n    @template_constant BN : uint = 256u\n    @template_constant BK : uint = 64u\n    @template_constant UNR : uint = 4u\n",
+        red ? "    def khr_stage16(blk, e0, sbase : uint) : void \{\n    \}\n\}\n\n" : "    def abstract khr_stage16(blk, e0, sbase : uint) : void\n\}\n\n",
+        "class template K4Cm2T : KqCm2BatchT \{\n\}\n\nclass template Q8Cm2T : KqCm2BatchT \{\n\}\n\nclass template K4GemvT : KqGemvLeafT \{\n\}\n\n"]
+    parts |> reserve(24)
+    if (red) {
+        parts |> push("class template K5Cm2T : KqCm2BatchT \{\n\}\n\nclass template K6Cm2T : KqCm2BatchT \{\n\}\n\nclass template K3Cm2T : KqCm2BatchT \{\n\}\n\nclass template K2Cm2T : KqCm2BatchT \{\n\}\n\n")
+    }
+    for (fmt in fixed_array((stem = "kq_batch_k4", pfx = "K4"), (stem = "q8_batch", pfx = "Q8"))) {
+        parts |> push(vk_stamp("{fmt.stem}_khr_cls", "{fmt.pfx}KhrBatch", "{fmt.pfx}Cm2T", 128, 64))
+        parts |> push(vk_stamp("{fmt.stem}_cm2m_cls", "{fmt.pfx}Cm2MBatch", "{fmt.pfx}Cm2T", 128, 64))
+        parts |> push(vk_stamp("{fmt.stem}_cm2s_cls", "{fmt.pfx}Cm2SBatch", "{fmt.pfx}Cm2T", 32, 64))
+    }
+    if (red) {
+        parts |> push("[vk_dispatch(name = \"kq_batch_k4_cm2e_cls\", kernel = \"run\")]\nclass K4Cm2EBatch : K4Cm2T \{\n    override BN = 128u\n    override BK = 32u\n    typedef AT = coopmatWgA_f16_128x64\n    typedef BT = coopmatWgB_f16_32x128\n    typedef ACC = coopmatWgAcc_f16_128x128\n    typedef ACCW = coopmatWgAcc_f32_128x128\n\}\n\n")
+        parts |> push(vk_stamp("kq_batch_k6_cm2s_cls", "K6Cm2SBatch", "K6Cm2T", 32, 32, 8))
+        parts |> push(vk_stamp("kq_batch_k6_cm2m_cls", "K6Cm2MBatch", "K6Cm2T", 128, 64))
+        parts |> push(vk_stamp("kq_batch_k2_cm2s_cls", "K2Cm2SBatch", "K2Cm2T", 32, 64))
+        parts |> push(vk_stamp("kq_batch_k2_cm2m_cls", "K2Cm2MBatch", "K2Cm2T", 128, 64))
+    }
+    parts |> push(vk_ladder("khr_cls_", "khr_cls", true, red ? "k5" : ""))
+    parts |> push(vk_ladder("cm2e_cls_", "cm2e_cls", !red))
+    return join(parts, "")
+}
 
-let DASLLAMA_MODULE_LIST = "\"dasllama\", \"dasllama_audio_embedder\", \"dasllama_vision_embedder\", \"dasllama_toyfam\", \"dasllama_toyvis\", \"dasllama_image\", \"dasllama_meta\", \"dasllama_vulkan_common\", \"dasllama_vulkan_classes\", \"dasllama_vulkan_prefill\", \"dasllama_blocks\"\n"
+//! the kqformat fixture: the e-column alias roster the gate reads (`aliases` its words)
+def private kqformat_text(aliases : string) : string => "options gen2\n\nlet KQ_CM2E_ALIASES_M = \"{aliases}\"\n"
+
+let DASLLAMA_MODULE_LIST = "\"dasllama\", \"dasllama_audio_embedder\", \"dasllama_vision_embedder\", \"dasllama_toyfam\", \"dasllama_toyvis\", \"dasllama_image\", \"dasllama_meta\", \"dasllama_vulkan_common\", \"dasllama_vulkan_classes\", \"dasllama_vulkan_prefill\", \"dasllama_kqformat\", \"dasllama_blocks\"\n"
 
 //! the one vulkan_boost probe the fixture's tier calls
 let VK_BOOST_TEXT = "options gen2\n\ndef public cooperative_matrix_supported(phys : int) : bool \{\n    return true\n\}\n"
@@ -126,8 +175,9 @@ let VK_COMMON_RED = "options gen2\n\nlet AR_MAX_DIM = 4_096l\nlet CM = cooperati
 def make_dasllama_fixture(t : T?; tree, root : string) {
     write_at(t, root, "modules/dasVulkan/daslib/vulkan_boost.das", VK_BOOST_TEXT)
     write_at(t, root, "modules/dasLLAMA/dasllama/dasllama_vulkan_common.das", VK_COMMON_GREEN)
-    write_at(t, root, "modules/dasLLAMA/dasllama/dasllama_vulkan_classes.das", VK_CLASSES_GREEN)
-    write_at(t, root, "modules/dasLLAMA/dasllama/dasllama_vulkan_prefill.das", VK_PREFILL_TEXT)
+    write_at(t, root, "modules/dasLLAMA/dasllama/dasllama_vulkan_classes.das", vk_classes_text(false))
+    write_at(t, root, "modules/dasLLAMA/dasllama/dasllama_vulkan_prefill.das", "options gen2\n")
+    write_at(t, root, "modules/dasLLAMA/dasllama/dasllama_kqformat.das", kqformat_text("q8 k4"))
     write_at(t, root, "modules/dasLLAMA/dasllama/dasllama_blocks.das", "options gen2\n\ndef private attn_dec_shape_ok(c : Config) : bool \{\n    return !(c.dim > 8192l)\n\}\n")
     write_at(t, root, "modules/dasLLAMA/dasllama/dasllama.das", "options gen2\n\ndef covered_fn() \{\n\}\n")
     write_at(t, root, "modules/dasLLAMA/dasllama/dasllama_audio_embedder.das", "enum AudioKind \{\n    none\n    toyfam\n\}\n")
@@ -207,11 +257,12 @@ def test_dasllama_gate_fixtures(t : T?) {
     write_at(t, fixture, "tutorials/dasLLAMA/03_vis.das", "var tw : ToyvisTower\n")
     write_at(t, fixture, "modules/dasLLAMA/dasllama/dasllama_unlisted.das", "options gen2\n")
     write_at(t, fixture, "modules/dasLLAMA/.das_module",
-        "\"dasllama\", \"dasllama_audio_embedder\", \"dasllama_vision_embedder\", \"dasllama_toyfam\", \"dasllama_gone\", \"dasllama_image\", \"dasllama_meta\", \"dasllama_vulkan_common\", \"dasllama_vulkan_classes\", \"dasllama_vulkan_prefill\", \"dasllama_blocks\"\n// \"dasllama_toyvis\" commented out must not count\n")
+        "\"dasllama\", \"dasllama_audio_embedder\", \"dasllama_vision_embedder\", \"dasllama_toyfam\", \"dasllama_gone\", \"dasllama_image\", \"dasllama_meta\", \"dasllama_vulkan_common\", \"dasllama_vulkan_classes\", \"dasllama_vulkan_prefill\", \"dasllama_kqformat\", \"dasllama_blocks\"\n// \"dasllama_toyvis\" commented out must not count\n")
     // a moved layout constant and a changed layout helper, with the stamp left where it was
     write_at(t, fixture, "modules/dasLLAMA/dasllama/dasllama_image.das", dasllama_image_text("128l", "cur + 1ul", "2"))
     write_at(t, fixture, "modules/dasLLAMA/dasllama/dasllama_meta.das", DASLLAMA_META_RED)
-    write_at(t, fixture, "modules/dasLLAMA/dasllama/dasllama_vulkan_classes.das", VK_CLASSES_RED)
+    write_at(t, fixture, "modules/dasLLAMA/dasllama/dasllama_vulkan_classes.das", vk_classes_text(true))
+    write_at(t, fixture, "modules/dasLLAMA/dasllama/dasllama_kqformat.das", kqformat_text("q8 k4 k6 k3"))
     write_at(t, fixture, "modules/dasLLAMA/dasllama/dasllama_vulkan_common.das", VK_COMMON_RED)
     write_at(t, fixture, "modules/dasLLAMA/harness/hand_probe.das", "options gen2\n\nlet p = vkCreateComputePipelines(dev, null, 1u, addr(cp), null, addr(h))\n")
 
@@ -230,14 +281,18 @@ let DASLLAMA_RED_NEEDLE_CENSUS <- [
     "the add+rms row slab triple disagrees: AR_MAX_DIM 4096 (dasllama_vulkan_common.das), ArBase.row[8192], attn_dec_shape_ok's c.dim cap 8192",
     "K5Cm2T has no `class K5KhrBatch : K5Cm2T`",
     "K5Cm2T has no `[vk_dispatch(name = \"kq_batch_k5_khr_cls\"` stamp",
-    "khr_cls_ensure has no arm for K5Cm2T (ensure_kq_batch_k5_khr_cls(",
-    "khr_cls_set has no arm for K5Cm2T (set_kq_batch_k5_khr_cls(",
-    "khr_cls_enc has no arm for K5Cm2T (enc_kq_batch_k5_khr_cls(",
+    "khr_cls_ensure skips k5 in its `kq_tile_stamp` list while `class template K5Cm2T` sits on the cm2 base",
+    "khr_cls_set skips k5 in its `kq_tile_stamp` list while `class template K5Cm2T` sits on the cm2 base",
+    "khr_cls_enc skips k5 in its `kq_tile_stamp` list while `class template K5Cm2T` sits on the cm2 base",
     "K5Cm2T has no `class K5Cm2EBatch : K5Cm2T`",
     "K5Cm2T has no `[vk_dispatch(name = \"kq_batch_k5_cm2e_cls\"` stamp",
-    "cm2e_cls_ensure has no arm for K5Cm2T (ensure_kq_batch_k5_cm2e_cls(",
-    "cm2e_cls_set has no arm for K5Cm2T (set_kq_batch_k5_cm2e_cls(",
-    "cm2e_cls_enc has no arm for K5Cm2T (enc_kq_batch_k5_cm2e_cls(",
+    "cm2e_cls_ensure is not stamped by `kq_tile_stamp` over `tile_ensure_cm2e_cls(`",
+    "cm2e_cls_set is not stamped by `kq_tile_stamp` over `tile_set_cm2e_cls(`",
+    "cm2e_cls_enc is not stamped by `kq_tile_stamp` over `tile_enc_cm2e_cls(`",
+    "K6Cm2T: KQ_CM2E_ALIASES_M names k6 but its expert column steps k by 32 (its s stamp's BK), not the m stamp's 64",
+    "K3Cm2T: KQ_CM2E_ALIASES_M names k3 but the file has no `class K3Cm2MBatch` for its e column to alias",
+    "K2Cm2T: its expert column steps k by 64 (its s stamp's BK), so its e stamp is the m stamp byte for byte - k2 joins KQ_CM2E_ALIASES_M",
+    "K4Cm2T keeps a `class K4Cm2EBatch` its ladder never picks - k4 aliases the m stamp (KQ_CM2E_ALIASES_M)",
     "kq_batch_k4_cm2e_cls: `typedef AT = coopmatWgA_f16_128x64` at BK 32 BN 128",
     "kq_batch_k4_cm2e_cls: UNR 4 at BK 32 - a stamp's unrolled block is one superblock (256 elements",
     "dasllama_vulkan_common.das:4: the tier calls cooperative_matrix_supported here, and vk_ext_roster (dasllama_vulkan_common.das) does not",
@@ -464,6 +519,70 @@ def test_all_and_main_walker_wiring(t : T?) {
     t |> success(find(orphan_hit.out, "without a sibling REVIEW.md") >= 0, "orphan named by main.das")
     let orphan_list = spawn_at(fixture, [main_das, "--", "b/REVIEW.das", "--list-only"])
     t |> equal(1, orphan_list.rc, "--list-only does not bypass the orphan check")
+
+    t |> success(rmdir_rec_result(fixture) is value, "fixture removed")
+}
+
+// The repo-root gate: shared module names over git's tracked list. The fixture is its own
+// repository, so tracked / untracked is decided the way the real tree decides it.
+def make_root_gate_fixture(t : T?; tree, root : string) {
+    write_at(t, root, "REVIEW_COMMON.md", "contract\n")
+    write_at(t, root, "CMakeLists.txt", "project(fixture)\n")
+    write_at(t, root, "a/solo.das", "options gen2\nmodule solo shared public\n")
+    write_at(t, root, "a/plain.das", "options gen2\nmodule dup public\n")
+    write_at(t, root, "b/plain2.das", "options gen2\nmodule dup public\n")
+    write_at(t, root, "b/bare.das", "options gen2\nmodule x\n")
+    write_at(t, root, "b/nomod.das", "options gen2\n[export]\ndef main \{\n\}\n")
+    // the tolerated pair, at the paths the gate's rows name
+    write_at(t, root, "tests/module_tests/_modules/conflict/pkgA/foo.das", "options gen2\nmodule foo shared public\n")
+    write_at(t, root, "tests/module_tests/_modules/conflict/pkgB/foo.das", "options gen2\nmodule foo shared public\n")
+    var err : string
+    t |> success(copy_file(path_join(tree, "REVIEW.das"), path_join(root, "REVIEW.das"), true, err), "copied the real gate")
+    t |> equal(0, run_in(root, ["git", "init", "-q"]).rc, "fixture is a repository")
+    t |> equal(0, run_in(root, ["git", "add", "-A"]).rc, "fixture files are tracked")
+}
+
+[test]
+def test_root_gate_fixtures(t : T?) {
+    let tree = getcwd()
+    if (!fexist(path_join(tree, "REVIEW.das"))) {
+        t |> skip("not run from the repo root")
+        return
+    }
+    let fixture_r = create_temp_directory_result("review_root")
+    t |> success(fixture_r is value, "temp fixture dir created")
+    if (!(fixture_r is value)) return
+    let fixture = unsafe(fixture_r.value)
+    make_root_gate_fixture(t, tree, fixture)
+    let gate = path_join(fixture, "REVIEW.das")
+
+    let green = spawn_at(fixture, [gate])
+    t |> equal(0, green.rc, "one shared name per file, a non-shared twin, a bare module, a module-less file and the tolerated pair are green: {green.out}")
+    t |> success(find(green.out, "REVIEW.das repo root: OK") >= 0, "green verdict printed")
+
+    // an untracked second declaration is not the tree's yet
+    write_at(t, fixture, "c/y.das", "options gen2\nmodule solo shared public\n")
+    let untracked = spawn_at(fixture, [gate])
+    t |> equal(0, untracked.rc, "an untracked file is outside the check: {untracked.out}")
+
+    // tracked, it is a finding on both files, each naming the other
+    t |> equal(0, run_in(fixture, ["git", "add", "c/y.das"]).rc, "planted file tracked")
+    let red = spawn_at(fixture, [gate])
+    t |> equal(1, red.rc, "a tracked second declaration is red")
+    t |> success(find(red.out, "c/y.das:2: shared module `solo` is also declared by a/solo.das:2") >= 0, "the plant names the original: {red.out}")
+    t |> success(find(red.out, "a/solo.das:2: shared module `solo` is also declared by c/y.das:2") >= 0, "the original names the plant: {red.out}")
+
+    // a third declaration of a tolerated name is not covered by the pair's rows
+    t |> equal(0, run_in(fixture, ["git", "rm", "-q", "--cached", "c/y.das"]).rc, "plant untracked again")
+    write_at(t, fixture, "c/foo.das", "options gen2\nmodule foo shared public\n")
+    t |> equal(0, run_in(fixture, ["git", "add", "c/foo.das"]).rc, "third foo tracked")
+    let third = spawn_at(fixture, [gate])
+    t |> equal(1, third.rc, "a third declaration of a tolerated name is red")
+    t |> success(find(third.out, "c/foo.das:2: shared module `foo`") >= 0, "the third foo is named: {third.out}")
+
+    // outside the repo root the gate refuses rather than scanning nothing
+    let elsewhere = spawn_at(path_join(fixture, "a"), [gate])
+    t |> equal(2, elsewhere.rc, "run from a subfolder is a usage error: {elsewhere.out}")
 
     t |> success(rmdir_rec_result(fixture) is value, "fixture removed")
 }

@@ -4,6 +4,8 @@ options rtti = true
 // shapes, and describe() output, which would rename hash-keyed doc files per run
 options auto_inline_functions = false
 
+require daslib/rst_comment
+require daslib/rst
 require daslib/fio
 require clipboard/clipboard
 require stddlg
@@ -18,8 +20,6 @@ require daslib/strings_boost
 require daslib/strings_convert
 require daslib/md_boost
 require daslib/clargs
-require daslib/rst
-require daslib/rst_comment
 require daslib/functional
 require daslib/json
 require daslib/json_boost
@@ -181,7 +181,7 @@ def document_module_builtin(_root : string) {
     var groups <- array<DocGroup>(
         hide_group(group_by_regex("Internal builtin functions", mod, %regex~builtin%%)),
         hide_group(group_by_regex("Internal pointer arithmetics", mod, %regex~i_das_%%)),
-        hide_group(group_by_regex("Internal clone infrastructure", mod, %regex~clone%%)),
+        hide_group(group_by_regex("Internal clone infrastructure", mod, %regex~(clone|copy_to_move|move_to_move)%%)),
         hide_group(group_by_regex("Internal finalize infrastructure", mod, %regex~finalize%%)),
         hide_group(group_by_regex("Internal container init infrastructure", mod, %regex~_table_index_and_init%%)),
         group_by_regex("Containers", mod, %regex~(capacity|clear|length|resize|resize_no_init|reserve|each|each_kv|emplace|emplace_from|erase|find|
@@ -272,7 +272,7 @@ def document_module_dashv(_root : string) {
     var mod = get_module("dashv")
     var groups <- array<DocGroup>(
         group_by_regex("WebSocket client", mod, %regex~(make_web_socket_client|destroy_web_socket_client|open|close|is_connected|tick|send)$%%),
-        group_by_regex("WebSocket server lifecycle", mod, %regex~(make_web_socket_server|destroy_web_socket_server|set_bind_host|start|stop)$%%),
+        group_by_regex("WebSocket server lifecycle", mod, %regex~(make_web_socket_server|destroy_web_socket_server|set_bind_host|start|stop|bound_port)$%%),
         group_by_regex("WebSocket channel send", mod, %regex~(send)$%%),
         group_by_regex("Handle operations", mod, %regex~(is_alive|==|!=)$%%),
         group_by_regex("HTTP route registration", mod, %regex~(GET|POST|PUT|DELETE|PATCH|HEAD|ANY|SSE|STREAM)$%%),

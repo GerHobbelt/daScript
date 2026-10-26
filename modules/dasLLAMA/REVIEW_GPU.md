@@ -1,7 +1,8 @@
 # dasLLAMA GPU Code Review Checklist
 
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture
-docs: `ARCHITECTURE_GPU.md`, `ARCHITECTURE_GPU_MTP.md`, `ARCHITECTURE_GPU_VULKAN_NROW.md`.
+docs: `ARCHITECTURE_GPU.md`, `ARCHITECTURE_GPU_MTP.md`, `ARCHITECTURE_GPU_MTP_DECODE.md`,
+`ARCHITECTURE_GPU_VULKAN_NROW.md`.
 Planned work: `followup_metal.md` for Metal, `followup_vulkan.md` for Vulkan.
 
 **A diff that files GPU planned work in `followup_general.md` is a defect** - it goes to
@@ -30,17 +31,19 @@ retained reference; a diff that routes a shape to a sibling kernel class resyncs
 change, the arms that dispatch the old class at that shape.** An arm timing a body the shipped
 kernel no longer runs at that shape measures the wrong kernel silently.
 
-**A diff touching the tower driver (`dasllama/dasllama_metal_tower.das`), a kernel class or
-builder the tower dispatches, the `[metal_dispatch]` emission those builders are generated
-from (`dasllama/dasllama_metal_lens.das`), the Metal ASR decoder
-(`dasllama/dasllama_metal_asr_dec.das`), a kernel class it dispatches or a builder it borrows,
-or `dasllama/dasllama_metal_common.das` applies `REVIEW_TOWER.md` too.**
+**A diff touching a tower driver (`dasllama/dasllama_metal_tower.das`,
+`dasllama/dasllama_vulkan_tower.das`), a kernel class or builder a tower dispatches, the
+`[metal_dispatch]` emission those builders are generated from (`dasllama/dasllama_metal_lens.das`),
+the Metal ASR decoder (`dasllama/dasllama_metal_asr_dec.das`), a kernel class the ASR decoder
+dispatches or a builder it borrows, or `dasllama/dasllama_metal_common.das` applies
+`REVIEW_TOWER.md` too.**
 
 **A diff touching the Vulkan tier - `dasllama/dasllama_*vulkan*.das`,
 `dasllama/dasllama_gpu_resident.das`, `dasllama/dasllama_gpu_tier.das`, a `[vk_dispatch]` class, a
 `[spirv_decode]` callback, or a cooperative-matrix GEMM class stamped per weight format and
-column width, on the NV cooperative-matrix-2 arm or the KHR cooperative-matrix arm - wherever
-the diff puts it - applies `REVIEW_GPU_VULKAN.md` too.**
+column width, on the NV cooperative-matrix-2 arm or the KHR cooperative-matrix arm, or a kernel
+cell or probe that fills or binds a `TokMeta` block - wherever the diff puts it - applies
+`REVIEW_GPU_VULKAN.md` too.**
 
 **A diff that adds or changes a GPU kernel class - a `[metal_kernel]` def, a class carrying
 `[metal_dispatch]` or `[vk_dispatch]`, a base shell one derives from, or a class template one
@@ -52,10 +55,11 @@ loop with its guards and bounds, a cooperative op, a staged or padded operand, a
 fill, a chunk step and its alignment gate, a bucket-ordered read - wherever the diff puts it,
 applies `REVIEW_GPU_KERNEL_BODY.md` too.**
 
-**A prefill K/V panel - the per-layer device K/V slab the prefill GEMMs write; the Vulkan
-resident mirror is one - is sized from the padded write extent, never from the live key count.**
-The K/V GEMMs write full M-tile rows at the chunk's row offset, so a panel sized to the live
-count is overrun silently into whatever the pool put next to it.
+**A device buffer a dispatch writes is sized to every element the dispatch's full grid writes,
+never to the live count of rows, keys or chunks.** A dispatch writes whole tiles past the live
+rows, and a batched attention writes, for every row, as many key chunks as the row at the largest
+position has, so a buffer sized to the live count is overrun silently into whatever the pool put
+next to it.
 
 **A row-splitting GEMM encoder - one that dispatches a subset of a site's output rows at an
 offset - is called only where the width it is given equals the row stride the site writes with,
@@ -68,14 +72,12 @@ its previous write is encoded - rotate through as many buffers as the chain has 
 flight between a write and its read.** One shared scratch serializes the whole chain through
 its write-after-read hazards.
 
-**A diff that lands an encoder path whose work is split across two or more dispatches - a new
-path, or one dispatch turned into more - also gates that path in the same change - on the extent
-the added dispatch divides (the site's own K, key span or row count), or on the path's work size
-when the split divides no extent - or ships no gate, where the measurement shows the split wins
-at both ends of that quantity; either way the threshold, or the no-gate decision, comes from a
-measurement at the smallest and at the largest value that quantity takes on the path, both
-measurements in the PR body.** The small-work regression hides behind the big-work
-win.
+**A diff that divides one op's work across two or more dispatches - on a new path or on one that
+had a single dispatch - gates the path in the same change on the quantity the split divides (its
+K, key span or row count), or on the path's work size when it divides none of these. The gate's
+threshold, or the decision to ship no gate, comes from measurements at the smallest and the
+largest value the quantity takes on the path, both in the PR body; no gate ships only where the
+split wins at both ends.** The small-work regression hides behind the big-work win.
 
 **A diff that changes a tile, grid, threadgroup, or uniform constant shows the value at every
 authoritative site its kind has, in the same change.** The sites per kind: the generated `*_msl`
@@ -87,13 +89,19 @@ the `grid=` spec (a CEIL divide), or the `wgs` decode plus its host helper, for 
 **A diff that changes how a `grid = "wgs"` kernel body decodes its workgroup index, or how the
 host computes that class's `wgs`, shows in the same change that the host's count still covers
 exactly the indices the body's decode reads - by changing both, by a decode that permutes the
-same index set, or - where the body's decode and the host's count both read one shared function
-- by showing that for every shape the encoder dispatches that class on, the stamp it picks is the
-one that function's value names.** The `grid=` spec carries no number for these classes, so nothing else ties the two.
+same index set, or - where the body's decode and the host's count both read one shared
+function - by showing that for every shape the encoder dispatches that class on, the stamp it
+picks is the one that function's value names.** The `grid=` spec carries no number for these
+classes, so nothing else ties the two.
 
-**A device-upload cache key covers every input the uploaded bytes depend on: a host address, an
-offset, or a handle alone is not a key - carry the span and the form, the element type and
-layout the upload produces, in the key too.**
+**A key that decides whether uploaded bytes or encoded GPU work may be reused compares every
+input that content was built from - every span, element type, layout, position, offset and model
+shape, the row count, each row's session by its `uid`, and, for every device buffer the content
+reads that a grow can free and allocate again, a counter bumped on each such rebuild - never a
+session pointer, and never a host address, an offset or a handle alone.** An address, offset or
+handle names whatever occupies it now, and the scheduler moves sessions in memory as it admits and
+erases streams, so a key without the other inputs, or with a session pointer in place of the
+`uid`, reuses stale content silently.
 
 **A `dasllama/` file that creates its own GPU device or queue is a defect - a GPU family shares
 the one device and queue from `dasllama/dasllama_<gpu>_common.das`'s init.**
@@ -106,17 +114,38 @@ spelling absent from `DEVICE_CREATION_CALLS`, weakens it.**
 (`dasllama/`) other than the one that owns its kernel class** - it goes through that file's
 own init/release pair.
 
-**A string-typed Metal decline reason is a defect - a Metal decline reason is an enum value in
-`dasllama/dasllama_metal_shapes.das`, one enum per driver.**
+**A string-typed decline reason in a GPU driver file - `dasllama/dasllama_metal_*.das`,
+`dasllama/dasllama_*vulkan*.das` and `dasllama/dasllama_gpu_resident.das` - is a defect - a decline
+reason is an enum value, one enum per driver: in `dasllama/dasllama_metal_shapes.das` for Metal,
+and for Vulkan, in the driver's own file.**
 
-**A Metal decline counter beside the decline site is a defect - decline counting lives in
-`dasllama/dasllama_metal_common.das`.**
+**A decline in a GPU driver file - `dasllama/dasllama_metal_*.das`, `dasllama/dasllama_*vulkan*.das`
+and `dasllama/dasllama_gpu_resident.das` - is counted only through a `DeclineCounter`
+(`dasllama/dasllama_metal_common.das`) or `VkDeclineCounter` (`dasllama/dasllama_vulkan_common.das`)
+and the `note_decline` / `note` call that file declares on it; a count storage type, or a
+hand-rolled count, outside those two files is a defect.**
 
-**A diff that adds or removes a Metal-only or Vulkan-only hook, role, served path, or
-backend-only capability - a hook in sec.1.5's per-driver registered-hook or borrowed-kernel
-lists included - lands its own entry in `ARCHITECTURE_GPU.md` sec.1.5's closed asymmetry list
-in the same change, even when that list already carries an asymmetry of the same class.** One
-backend serving the same path faster or slower is not such a change.
+**Never give a `*_decline_caps` predicate a parameter beyond the model, the row count, and
+whether the call carries a uniform attention span - however that parameter is derived; window
+readiness, whether this window's rope tables are staged, is asked by `prefill_decline` /
+`decode_decline` instead.**
+
+**A diff that adds or removes a hook seat only the Vulkan family fills (an `install_*` or
+`set_*_hook(s)` slot in `dasllama/dasllama_gpu_tier.das`), a hook a GPU driver registers in a
+model family's registry, or a prefill builder a tower driver borrows names it - a seat by its
+`install_*` / `set_*` name, a registered hook by the seat's register function, a builder by its
+name - in the same change, in the row of `ARCHITECTURE_GPU.md` sec.1.5's role table for the file
+that fills, registers or borrows it.**
+
+**A diff that adds or removes a registered override only one GPU backend files
+(`register_*("metal", ...)` or `register_*("vulkan", ...)`), a `dasllama/dasllama_gpu_tier.das`
+seat Metal fills, a function one backend exports with no counterpart under the other backend's
+prefix - the same name after the prefix, the same role - called by code outside that backend's
+files, a `[metal_dispatch]` or `[vk_dispatch]` argument or field annotation the other lens lacks,
+or a decode or prefill behavior only one backend's drivers provide lands its own entry in
+`ARCHITECTURE_GPU.md` sec.1.5's closed asymmetry list in the same change, even when the list
+already carries one of the same class.** One backend serving the same path faster or slower is
+not such a change.
 
 **A change that can alter what a served GPU decode or prefill path computes or selects ships
 GPU-vs-CPU parity on one q8 model, one K-quant model, and one model of a format outside both,
@@ -172,10 +201,11 @@ ships a `dasllama-convert --trim` bake plus a serve of the trimmed image, on one
 K-quant model, and one model of a format outside both, for each of the three the trim path
 bakes.** Parity runs never reach it.
 
-**An f16 store into any GPU-resident K/V that does not clamp to the f16 finite range
-(+/-65504) is a defect.**
+**An f16 store into any device buffer holding K or V rows that does not clamp to the f16 finite
+range (+/-65504) is a defect.**
 
-**A per-layer K/V panel or mirror slab that aliases another layer's is gathered, stored and
+**A per-layer K/V panel (the per-layer device K/V slab the prefill GEMMs write; the Vulkan
+resident mirror is one) or mirror slab that aliases another layer's is gathered, stored and
 released only through its source layer.** An aliasing layer that gathers, stores or releases
 a second time double-frees the panel or overwrites the source's rows.
 
@@ -194,12 +224,15 @@ position the state it advances expects - `Session.dn_pos` for the host state, `D
 for a device mirror.** It runs the whole forward itself, so the engine's own forward-only guard
 never runs.
 
-**A module-level variable in a GPU driver file whose value depends on the installed model
-gets a model-swap discharge in the same change that adds it** - the vulkan tier files
-discharge through `moe_gpu_model_marks_save_` / `moe_gpu_model_marks_restore_` /
-`moe_gpu_drop_model_`; the Metal tier through `register_reload_prep`
-(`dasllama/dasllama_metal_common.das`). A global with no discharge survives a model swap and
-routes the next model's dispatches at the old model's planes.
+**A module-level variable in a GPU driver file whose value depends on the installed model gets a
+model-swap discharge in the same change that adds it - a discharge is a path the model's drop runs
+that returns the variable to its no-model value.** The vulkan tier files discharge through
+`moe_gpu_model_marks_save_` / `moe_gpu_model_marks_restore_` / `moe_gpu_drop_model_`, a Vulkan
+driver file the `moe_gpu_model_marks_*` pair does not cover through a listener it registers with
+`register_vk_drop_hook` (`dasllama/dasllama_vulkan_common.das`), which the drop's sweep runs, and
+the Metal tier through `register_reload_prep` (`dasllama/dasllama_metal_common.das`). A global
+with no discharge survives a model swap and routes the next model's dispatches at the old model's
+planes.
 
 **A diff that changes how a dev-W resident panel's cache key is built - a dev-W panel is a
 weight plane dequantized once into a device f16 panel - changes both the seed site and the
@@ -213,8 +246,8 @@ runs only where the gate's `mint_time` flag is false, and the mint-time verdict 
 model's own fields.** The load selects the repacking CPU backend before the GPU backend is
 decided, so a mint-time read bakes a verdict the drivers do not share.
 
-**A diff that gives a per-format pick that maps a weight format to a Metal pipeline or builder
-- a dispatch ladder, a table row, a picker function - an arm for a weight format adds that
+**A diff that gives a per-format pick that maps a weight format to a Metal pipeline or
+builder - a dispatch ladder, a table row, a picker function - an arm for a weight format adds that
 format to `kq_fmt_gpu_supported`, or, for an expert plane, to `moe_fmt_metal_served` (both
 `dasllama/dasllama_metal_shapes.das`), in the same change.** Those predicates are what declines
 an unserved format, so an unlisted format decodes under whatever the pick's default arm holds.

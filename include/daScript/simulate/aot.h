@@ -2192,8 +2192,13 @@ namespace das {
     }
 
     template <typename TT>
-    __forceinline TT * das_ref ( Context *, const TT & ref ) {
-        return &const_cast<TT &>(ref);
+    __forceinline auto das_ref ( Context *, const TT & ref ) {
+        if constexpr ( is_base_of<Block,TT>::value && !is_same<Block,TT>::value ) {
+            // a Block-derived object (the das_make_block closures): its Block subobject, not the vtable-carrying base at offset 0
+            return static_cast<Block *>(&const_cast<TT &>(ref));
+        } else {
+            return &const_cast<TT &>(ref);
+        }
     }
 
     template <typename TT, typename AT, bool moveIt = false>
@@ -4611,7 +4616,6 @@ namespace das {
         return -1;
     }
 
-    void ___noinline builtin_try_recover ( const Block & try_block, const Block & catch_block, Context * context, LineInfoArg * at );
 
     bool das_jit_enabled ( Context * context, LineInfoArg * at );
     bool das_aot_enabled ( Context * context, LineInfoArg * at );

@@ -89,10 +89,10 @@ values - since a clamped weight load runs every tile at a third the speed (the f
 clamped: q8 E2B down 268 -> 612 us) and through the edge path the dispatch waited on the partial workgroups (the 26B's shared expert, k6: 164 us against 71 whole). `STILE` is inert on the KHR classes.
 
 **The k step follows the column and the decode; the k loop is unrolled by hand, a superblock per
-block.** The template's k step (`BK`) is 64 on the dense l and m tiles and on the expert stamps of
-the K-quants, q4_0, q8 and the 4-bit LUT formats, and 32 on the s and e stamps of the five
-grid-codebook formats (iq2xxs, iq2xs, iq2s, iq3xxs, iq3s; the e stamp is `<Fmt>Cm2EBatch`, the
-`cm2e_cls_*` ladder beside the KHR one); a stamp's `AT`/`BT` carry its depth. A grid decode is
+block.** The template's k step (`BK`) is 64 on the dense l and m tiles and on the expert stamps of the K-quants, q4_0, q8 and
+the 4-bit LUT formats - there the e column IS the m stamp (`KQ_CM2E_ALIASES_M` in `dasllama_kqformat.das` names them, the
+`cm2e_cls_*` ladder picks their m class, `REVIEW.das` holds the roster to the s stamps' k steps) - and 32 on the s and e stamps
+of the five grid-codebook formats (iq2xxs, iq2xs, iq2s, iq3xxs, iq3s; their e stamp is `<Fmt>Cm2EBatch`); a stamp's `AT`/`BT` carry its depth. The class pick ladders (`khr_cls_*`, `cm2e_cls_*`, `cm2_cls_*`, in the classes file) are stamped by `kq_tile_stamp` over every `KqFmt` member from one placeholder body, so a format without its stamp fails the compile, never a window. A grid decode is
 occupancy-bound - a 64-deep column holds twice the A tile, and with the codebook lookup's live range
 a workgroup fewer fits an SM (the iq2xxs gate/up plane 0.611 against 0.730 ms at 32, `moe:<fmt>`,
 RTX 5060 Ti) - while a light decode is step-bound (the k4 s tile 0.744 against 0.679 at 32 (`moesk:k4`), its
@@ -273,28 +273,28 @@ a wave64 device (four subgroups per 256-thread workgroup) keeps its kq planes on
 
 ### 2.2ah The decode GEMV family splits a subgroup across rows by the row length {#kq-gemv-lanes}
 
-**A subgroup of the kq GEMV family takes one, two or four output rows, each row's lanes a cluster
-of the fold.** A lane takes one 32-block per step (`gemv_shell`), four steps straight-line so
-four blocks' loads are in flight before a sum waits on one (a rolled loop issued a block's loads
-after the last block's sum), the guarded single step as the tail; a row of nb blocks over 32
-lanes has nb / 32 blocks per lane: four at K 4096, two at K 2048, under one at a MoE's expert rows
-(K 512 to 1408, 16 to 44 blocks), where most of the subgroup idled and the DRAM rate fell to a
-third of the k4 band. `gemv_lanes_per_row` picks the lanes per row from the row's blocks - 8 to
-24 blocks; 8 for the grid formats and 16 for the k-lattice to 48; 16 to 96; past that the whole
-subgroup for the k-lattice and 16 for the grid formats - and `gemv_enc` sizes the grid to match
-(a workgroup's subgroups each take subgroup_size / lanes rows). The grid formats are the
-codebook and grid decodes (iq2s, iq2xs, iq2xxs, iq3xxs, iq4xs, iq4nl, `gemv_grid_fmt`); iq3s
-takes the k-lattice split (K 1408: 354 / 395 / 386 GB/s at 32 / 16 / 8 lanes). The push block
-carries the lanes (0 = the whole subgroup, the q8 GEMV's one form); the fold is an xor-shuffle
-butterfly over the row's lanes at 8 or 16 (the subgroup shuffle every GEMV already requires; a
-clustered add would ask for a feature the tier never checks) and the whole-subgroup add
-otherwise, every lane reducing, a dead row at zero, so the butterflies stay whole; the
-lane-to-block map sets the row's summation order, so a resident-vs-CPU bar reads a different
-noise sample than the one-row form, inside the same class. RTX 5060 Ti, DRAM-bound planes
-(`harness/vk_gemv_probe.das <n> <d>`, GB/s at 32 / 16 / 8 lanes): K 512 iq2s 100 / 194 / 297,
-iq2xxs 142 / 233 / 351, k4 394 / 402 / 413, k6 386 / 414 / 407; K 1408 iq2s 198 / 299 / 368,
-k6 386 / 399 / 373, k4 394 / 394 / 382; K 2048 iq2s 311 / 384 / 388, k6 417 / 416 / 369; K
-4096 iq2s 376 / 408 / 344, k6 403 / 387 / 326, k4 400 / 404 / 406; K 5632 k4 411 / 399 / 386,
-k6 396 / 384 / 287, iq2s 377 / 393 / 296. Upstream's mat-vec splits K over 16 threads and
-blocks two to four rows per thread (`rm_kq`, `NUM_ROWS` in `mul_mat_vec_*.comp`): the same
-bytes in flight by the other axis.
+**A subgroup of the kq GEMV family takes one, two or four output rows, each row's lanes a cluster of
+the fold.** A leaf decodes a block once (`blk_decode`: the packed int8 quads and four fold terms,
+the block sums skipped where `fold_reads_bsum` is false) and one shared `blk_fold` dots it per
+activation block, so the N-column form pays a block's codebook gathers, grid lookups and bit
+deposits once for all columns; both forms compile one `blk_fold` text and add its plain product, so
+both sum bit for bit. A lane takes one 32-block per step (`gemv_shell`), four steps straight-line
+so four blocks' loads are in flight before a sum waits on one, the guarded single step as the tail;
+a row of nb blocks over 32 lanes has nb / 32 blocks per lane: four at K 4096, under one at a MoE's
+expert rows (K 512 to 1408), where most of the subgroup idled and the DRAM rate fell to a third of
+the k4 band. `gemv_lanes_per_row` picks the lanes per row from the row's blocks - 8 to 24 blocks; 8
+for the grid formats and 16 for the k-lattice to 48; 16 to 96; past that the whole subgroup for the
+k-lattice and 16 for the grid formats - and `gemv_enc` sizes the grid to match (a workgroup's
+subgroups each take subgroup_size / lanes rows). The grid formats are the codebook and grid decodes
+(iq2s, iq2xs, iq2xxs, iq3xxs, iq4xs, iq4nl, `gemv_grid_fmt`); iq3s takes the k-lattice split (K
+1408: 354 / 395 / 386 GB/s at 32 / 16 / 8 lanes). The push block carries the lanes (0 = the whole
+subgroup, the q8 GEMV's one form); the fold is an xor-shuffle butterfly over the row's lanes at 8 or
+16 and the whole-subgroup add otherwise, a dead row at zero, so the butterflies stay whole; the
+lane-to-block map sets the row's summation order, so a resident-vs-CPU bar reads a different noise
+sample than the one-row form. RTX 5060 Ti, DRAM-bound planes (`harness/vk_gemv_probe.das <n> <d>`,
+GB/s at 32 / 16 / 8 lanes): K 512 iq2s 100 / 194 / 297, iq2xxs 142 / 233 / 351, k4 394 / 402 / 413,
+k6 386 / 414 / 407; K 1408 iq2s 198 / 299 / 368, k6 386 / 399 / 373, k4 394 / 394 / 382; K 2048 iq2s
+311 / 384 / 388, k6 417 / 416 / 369; K 4096 iq2s 376 / 408 / 344, k6 403 / 387 / 326, k4 400 / 404 /
+406; K 5632 k4 411 / 399 / 386, k6 396 / 384 / 287, iq2s 377 / 393 / 296. Upstream's mat-vec splits
+K over 16 threads and blocks two to four rows per thread (`rm_kq`, `NUM_ROWS` in
+`mul_mat_vec_*.comp`): the same bytes in flight by the other axis.

@@ -297,6 +297,13 @@ namespace das {
 
         MatchingFunctions getCloneFunc(const TypeDeclPtr &left, const TypeDeclPtr &right) const;
 
+        MatchingFunctions getAssignFunc(const string &opName, const TypeDeclPtr &left, const TypeDeclPtr &right, MatchingFunctions &generics) const;
+
+        ExpressionPtr inferAssignOperator(const string &opName, ExprOp2 *expr);
+        bool userCloneReplacesBuiltin(ExprClone *expr) const;
+
+        ExpressionPtr promoteInitToAssign(const string &opName, const TypeDeclPtr &varType, const ExpressionPtr &init, const LineInfo &at);
+
         bool verifyCloneFunc(const MatchingFunctions &fnList, const LineInfo &at) const;
 
         MatchingFunctions getFinalizeFunc(const TypeDeclPtr &subexpr) const;
@@ -542,7 +549,6 @@ namespace das {
         virtual ExpressionPtr visit(ExprClone *expr) override;
         // ExprTryCatch
         void preVisit(ExprTryCatch *expr) override;
-        ExpressionPtr visit(ExprTryCatch *expr) override;
         // ExprReturn
         bool inferReturnType(TypeDeclPtr &resType, ExprReturn *expr);
         bool isVoidReturnValueSettled(Expression *subexpr) const;

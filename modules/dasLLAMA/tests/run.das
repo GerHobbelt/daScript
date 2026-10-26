@@ -161,10 +161,11 @@ def suite_files(name : string) : array<string> {   // nolint:STYLE038 - a flat s
                     "modules/dasLLAMA/tests/test_tower_asr_kernels.das",
                     "modules/dasLLAMA/tests/test_tower_helpers.das",
                     "modules/dasLLAMA/tests/test_tune_interrupt.das",
+                    "modules/dasLLAMA/tests/test_vk_spv_diff.das",
                     "modules/dasLLAMA/tests/test_unicode.das",
-                    "modules/dasLLAMA/tests/test_vad.das",
                     "modules/dasLLAMA/tests/test_vision.das",
                     "modules/dasLLAMA/tests/test_vulkan_dec_tail.das",
+                    "modules/dasLLAMA/tests/test_vulkan_tower_kernels.das",
                     "modules/dasLLAMA/tests/test_vulkan_kernels.das",
                     "modules/dasLLAMA/tests/test_vulkan_moe_cm2.das",
                     "modules/dasLLAMA/tests/test_vulkan_tier.das" ]
@@ -174,6 +175,7 @@ def suite_files(name : string) : array<string> {   // nolint:STYLE038 - a flat s
                     "modules/dasLLAMA/tests/test_audio.das",
                     "modules/dasLLAMA/tests/test_audio_embedder.das",
                     "modules/dasLLAMA/tests/test_batch_decode.das",
+                    "modules/dasLLAMA/tests/test_bench_rows.das",
                     "modules/dasLLAMA/tests/test_chat.das",
                     "modules/dasLLAMA/tests/test_deltanet.das",
                     "modules/dasLLAMA/tests/test_exe_smoke.das",
@@ -204,13 +206,18 @@ def suite_files(name : string) : array<string> {   // nolint:STYLE038 - a flat s
                     "modules/dasLLAMA/tests/test_gpu_resident_regions.das",
                     "modules/dasLLAMA/tests/test_gpu_resident_regions_e2b.das",
                     "modules/dasLLAMA/tests/test_gpu_resident_regions_gemma2.das",
+                    "modules/dasLLAMA/tests/test_gpu_resident_regions_gemma3.das",
                     "modules/dasLLAMA/tests/test_gpu_resident_regions_gemma4.das",
                     "modules/dasLLAMA/tests/test_gpu_resident_regions_gptoss.das",
                     "modules/dasLLAMA/tests/test_gpu_resident_regions_qwen3moe.das",
                     "modules/dasLLAMA/tests/test_gpu_resident_regions_qwen2moe.das",
                     "modules/dasLLAMA/tests/test_gpu_resident_regions_gemma4moe.das",
                     "modules/dasLLAMA/tests/test_gpu_resident_regions_hybrid.das",
+                    "modules/dasLLAMA/tests/test_gpu_resident_regions_hybrid_k.das",
+                    "modules/dasLLAMA/tests/test_gpu_resident_regions_hybrid_iq3s.das",
+                    "modules/dasLLAMA/tests/test_gpu_resident_regions_hybrid_q3kxl.das",
                     "modules/dasLLAMA/tests/test_gpu_resident_regions_llama_k.das",
+                    "modules/dasLLAMA/tests/test_gpu_resident_regions_phi3.das",
                     "modules/dasLLAMA/tests/test_gpu_resident_regions_qwen3.das",
                     "modules/dasLLAMA/tests/test_gpu_slot_swap.das",
                     "modules/dasLLAMA/tests/test_kquant.das",
@@ -238,6 +245,7 @@ def suite_files(name : string) : array<string> {   // nolint:STYLE038 - a flat s
                     "modules/dasLLAMA/tests/test_tts_kokoro.das",
                     "modules/dasLLAMA/tests/test_tts_pocket.das",
                     "modules/dasLLAMA/tests/test_tts_facade.das",
+                    "modules/dasLLAMA/tests/test_vad.das",
                     "modules/dasLLAMA/tests/test_vision_chat.das",
                     "modules/dasLLAMA/tests/test_vision_embedder.das",
                     "modules/dasLLAMA/tests/test_whisper.das" ]
@@ -272,23 +280,23 @@ def area_tests(area : string) : array<string> {
     } elif (area == "vision") {
         return <- [ "test_attn_span.das", "test_gemma3v.das", "test_gemma4uv.das", "test_gemma4v.das", "test_qwen25v.das",
                     "test_qwen3v.das", "test_tower_helpers.das", "test_vision.das", "test_vision_chat.das",
-                    "test_vision_embedder.das" ]
+                    "test_vision_embedder.das", "test_vulkan_tower_kernels.das" ]
     } elif (area == "tts") {
         return <- [ "test_parrot.das", "test_storyteller_restart.das", "test_storywish.das", "test_tts_blocks.das", "test_tts_facade.das",
                     "test_tts_g2p.das", "test_tts_kitten.das", "test_tts_kokoro.das", "test_tts_pocket.das",
                     "test_tts_postag.das", "test_tts_textnorm.das", "test_tts_voice_prompts.das" ]
     } elif (area == "infra") {
-        return <- [ "failed_dasllama_lint_require.das", "failed_dasllama_lint_sidedoor.das", "test_bench_records_schema.das",
+        return <- [ "failed_dasllama_lint_require.das", "failed_dasllama_lint_sidedoor.das", "test_bench_records_schema.das", "test_bench_rows.das",
                     "test_box_ident.das", "test_box_profile.das", "test_dasllama_lint_contracts.das",
                     "test_dasllama_lint_escape.das", "test_dlim_wipe.das", "test_env_registry.das",
                     "test_exchange_schema.das", "test_exe_smoke.das", "test_facade_docs.das", "test_fat_hook_umbrella.das", "test_fat_start.das", "test_gen_records_args.das",
                     "test_model_specs.das", "test_program_roots.das", "test_run_suites.das", "test_run_summary.das",
-                    "test_site_records.das", "test_sizing_helpers.das", "test_tok_seed.das", "test_tune_interrupt.das" ]
+                    "test_site_records.das", "test_sizing_helpers.das", "test_tok_seed.das", "test_tune_interrupt.das", "test_vk_spv_diff.das" ]
     } elif (area == "llm") {
-        return <- [ "test_accel_backend.das", "test_affinity_predicates.das", "test_arch_registry.das", "test_batch_decode.das",
+        return <- [ "test_accel_backend.das", "test_affinity_predicates.das", "test_arch_registry.das", "test_batch_decode.das", "test_bench_rows.das",
                     "test_batch_grid.das", "test_chat.das", "test_deltanet.das", "test_dispatch_shaping.das", "test_facade.das",
                     "test_flash.das", "test_forward.das", "test_from_template.das", "test_fused_decode.das", "test_gguf_quant.das", "test_gguf_shards.das",
-                    "test_gpu_model_swap.das", "test_gpu_moe_shexp.das", "test_gpu_resident_gemma2.das", "test_gpu_resident_gemma3_1b.das", "test_gpu_resident_gemma3_4b.das", "test_gpu_resident_gemma4_12b_k.das", "test_gpu_resident_gemma4_12b_q8.das", "test_gpu_resident_gemma4_26b.das", "test_gpu_resident_gemma4_26b_k.das", "test_gpu_resident_gemma4_31b.das", "test_gpu_resident_gemma4_e2b.das", "test_gpu_resident_gemma4_e4b.das", "test_gpu_resident_gptoss.das", "test_gpu_resident_hybrid.das", "test_gpu_resident_llama.das", "test_gpu_resident_moe.das", "test_gpu_resident_qwen2.das", "test_gpu_resident_regions.das", "test_gpu_resident_regions_e2b.das", "test_gpu_resident_regions_gptoss.das", "test_gpu_resident_regions_qwen3moe.das", "test_gpu_resident_regions_qwen2moe.das", "test_gpu_resident_regions_gemma4moe.das", "test_gpu_resident_regions_gemma2.das", "test_gpu_resident_regions_gemma4.das", "test_gpu_resident_regions_hybrid.das", "test_gpu_resident_regions_llama_k.das", "test_gpu_resident_regions_qwen3.das", "test_gpu_serving_declines.das", "test_gpu_slot_swap.das", "test_gpu_tier.das", "test_groupn.das",
+                    "test_gpu_model_swap.das", "test_gpu_moe_shexp.das", "test_gpu_resident_gemma2.das", "test_gpu_resident_gemma3_1b.das", "test_gpu_resident_gemma3_4b.das", "test_gpu_resident_gemma4_12b_k.das", "test_gpu_resident_gemma4_12b_q8.das", "test_gpu_resident_gemma4_26b.das", "test_gpu_resident_gemma4_26b_k.das", "test_gpu_resident_gemma4_31b.das", "test_gpu_resident_gemma4_e2b.das", "test_gpu_resident_gemma4_e4b.das", "test_gpu_resident_gptoss.das", "test_gpu_resident_hybrid.das", "test_gpu_resident_llama.das", "test_gpu_resident_moe.das", "test_gpu_resident_qwen2.das", "test_gpu_resident_regions.das", "test_gpu_resident_regions_e2b.das", "test_gpu_resident_regions_gptoss.das", "test_gpu_resident_regions_qwen3moe.das", "test_gpu_resident_regions_qwen2moe.das", "test_gpu_resident_regions_gemma4moe.das", "test_gpu_resident_regions_gemma2.das", "test_gpu_resident_regions_gemma3.das", "test_gpu_resident_regions_gemma4.das", "test_gpu_resident_regions_hybrid.das", "test_gpu_resident_regions_hybrid_k.das", "test_gpu_resident_regions_hybrid_iq3s.das", "test_gpu_resident_regions_hybrid_q3kxl.das", "test_gpu_resident_regions_llama_k.das", "test_gpu_resident_regions_phi3.das", "test_gpu_resident_regions_qwen3.das", "test_gpu_serving_declines.das", "test_gpu_slot_swap.das", "test_gpu_tier.das", "test_groupn.das",
                     "test_jobque_tripwire.das", "test_kernel_backend.das", "test_kgroup_repack.das", "test_kqformat.das", "test_kquant.das",
                     "test_kv_codec.das", "test_kv_paged.das", "test_kv_prefix.das", "test_metal_batched_row.das", "test_math_activations.das",
                     "test_math_elementwise.das", "test_matmul.das", "test_matmul_batch.das",
@@ -324,7 +332,7 @@ def area_image_arms(area : string) : string {
 //! engine module stem -> the areas a change to it reaches. A module not in the table is CORE and
 //! reaches every area (the safe default for a new module until it gets a row)
 let MODULE_AREAS <- {
-    "dasllama_tower" => "audio,vision", "dasllama_metal_tower" => "audio,vision",
+    "dasllama_tower" => "audio,vision", "dasllama_metal_tower" => "audio,vision", "dasllama_vulkan_tower" => "vision",
     "dasllama_asr" => "audio", "dasllama_asr_types" => "audio", "dasllama_audio" => "audio",
     "dasllama_audio_embedder" => "audio", "dasllama_audio_io" => "audio", "dasllama_canary" => "audio",
     "dasllama_gemma4a" => "audio", "dasllama_metal_asr_dec" => "audio", "dasllama_parakeet" => "audio",

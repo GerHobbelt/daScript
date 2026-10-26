@@ -714,13 +714,6 @@ def test_metal_kernel_coverage(tst : T?) {
 // The Vulkan census's DECLARED blind spots, by census name (`<vk_dispatch name>_spv`): kernel
 // classes no zoo row below can dispatch, each with the reason and the kernel-unit cell that does.
 let private VK_CENSUS_NEVER_DISPATCHED <- [
-    // the expert schedule's e stamps of the formats no stocked MoE carrier holds a routed expert
-    // plane in: the zoo's resident MoE carriers put q8 and k4 planes (the Qwen1.5-MoE files), the
-    // 30B Q4_K_M's k4 and k6 planes (under DASLLAMA_PARITY_FULL=1) and the UD-IQ2_XXS 30B's
-    // iq2xxs / iq2xs / iq2s / iq3xxs / iq3s / iq4xs mix on the schedule. Their coverage is the e arm
-    // of each format's cell in test_vulkan_kernels.das
-    "kq_batch_k5_cm2e_cls_spv", "kq_batch_q40_cm2e_cls_spv",
-    "kq_batch_k3_cm2e_cls_spv", "kq_batch_iq4nl_cm2e_cls_spv", "kq_batch_k2_cm2e_cls_spv",
     // the q51 expert rail (the 32-block down planes of the 26B-A4B's Q4_K_M: a carrier above the zoo's tier) -
     // its s and e stamps and its decode GEMV; their coverage is test_vkd_q51_cm2_batch and test_vkd_q51_gemv
     "q51_batch_cm2s_cls_spv", "q51_batch_cm2e_cls_spv", "q51_gemv_cls_spv",
@@ -753,6 +746,26 @@ let private VK_CENSUS_NEVER_DISPATCHED <- [
     // and test_vkd_fa_khr_h256_softcap in test_vulkan_kernels.das
     "fa_khr_h256_cls_spv", "fa_khr_h256_f16_cls_spv", "fa_khr_h256_cap_cls_spv", "fa_khr_h256_cap_f16_cls_spv",
     "fa_khr_h512_cls_spv", "fa_khr_h512_f16_cls_spv",
+    // the bidirectional flash tiles (the vision towers' encoder attention): the 64 head is the gemma4v tower's (the stocked
+    // mmproj-gemma-4-E2B-it-bf16.gguf, dispatched by test_gemma4v_vulkan_twin in test_gemma4v.das), the padded 128 the
+    // gemma3v / qwen3v towers' (mmproj-gemma-3-4b-it-F16.gguf via test_gemma3v_vulkan_twin, mmproj-Qwen3VL-4B-Instruct-F16.gguf
+    // via test_qwen3v_vulkan_twin) - no zoo row; their kernel coverage is test_vkt_fa_bidir in test_vulkan_tower_kernels.das
+    "fa_cm2_h64_bidir_cls_spv", "fa_cm2_h128_bidir_cls_spv", "fa_khr_h64_bidir_cls_spv", "fa_khr_h128_bidir_cls_spv",
+    // the gemma4v tower's row classes (the norms, clamps, feeds, the two-axis rope, the post-add and the GEGLU): the stocked
+    // mmproj-gemma-4-E2B-it-bf16.gguf, dispatched by test_gemma4v_vulkan_twin in test_gemma4v.das - no zoo row; their kernel
+    // coverage is test_vkt_tower_rows in test_vulkan_tower_kernels.das
+    "tower_rms_cls_spv", "tower_clamp_cls_spv", "tower_clamp_cvt_cls_spv", "tower_clamp_rq_cls_spv", "tower_rope2d_cls_spv",
+    "tower_post_add_cls_spv", "tower_geglu_cls_spv",
+    // the biased-block (SigLIP) row classes: the layernorm, the bias with its GELU, the seam, the head restrides to the
+    // flash tile's width (the stocked mmproj-gemma-3-4b-it-F16.gguf, dispatched by test_gemma3v_vulkan_twin in test_gemma3v.das;
+    // the rope on a fused row's slot is the qwen3v tower's - mmproj-Qwen3VL-4B-Instruct-F16.gguf via test_qwen3v_vulkan_twin
+    // in test_qwen3v.das); their kernel coverage is test_vkt_tower_ln_rows
+    "tower_ln_cls_spv", "tower_post_add_ln_cls_spv", "tower_bias_act_cls_spv", "tower_hpad_cls_spv", "tower_hpad16_cls_spv",
+    "tower_hunpad_cls_spv", "tower_rope_tab_cls_spv",
+    // the window-attention ViT's classes (qwen25v): the f32 per-window attention over the compact rows, the gated FFN's
+    // hidden and the rms seam (the stocked mmproj-Qwen2.5-Omni-3B-f16.gguf, dispatched by test_qwen25v_vulkan_twin in
+    // test_qwen25v.das); their kernel coverage is test_vkt_tower_win_rows
+    "tower_win_attn_cls_spv", "tower_glu_act_cls_spv", "tower_post_add_rms_cls_spv",
     // the KHR f16 GEMM (the E-series projection off cm2): no zoo row carries a per-layer embedding; its coverage is
     // test_vkd_f16_gemm_khr
     "f16_gemm_khr_cls_spv",
@@ -777,12 +790,17 @@ let private VK_CENSUS_NEVER_DISPATCHED <- [
     // feed; off the f16 feed (DASLLAMA_COOPMAT=sdot4) it runs. Its coverage is the dn_ba run of
     // test_vkd_dn_family in test_vulkan_kernels.das
     "dn_ba_cls_spv",
-    // the N-column decode GEMV leaves serving cannot reach: the q8 row-pair stamps (the pair form serves only past
-    // `g_q8_n2_min_n`, off until a box's token command proves it) and the K-quant N leaves (the zoo's batched row is the
-    // Q8_0 tinyllama; the q8 n2/n4/n8 stamps ride its 2-, 4- and 8-row steps); their coverage is test_vkd_gemv_ncol
-    // in test_vulkan_kernels.das
+    // the N-column decode GEMV leaves serve only the N-row token command, which the zoo's one-region loads never
+    // engage (a batched step here rides f32 sessions on the per-op rails); the q8 row-pair stamps serve only past
+    // `g_q8_n2_min_n`, off until a box's token command proves the pair. Their coverage is test_vkd_gemv_ncol in
+    // test_vulkan_kernels.das; the stocked carriers are the regions files - test_gpu_resident_regions_qwen3.das and
+    // the gemma files for q8, test_gpu_resident_regions_llama.das for k4 and k6, test_gpu_resident_regions_hybrid_iq3s.das
+    // for iq3s, test_gpu_resident_regions_hybrid_q3kxl.das for the eight low-bit leaves
+    "q8_gemv_n2_cls_spv", "q8_gemv_n4_cls_spv", "q8_gemv_n8_cls_spv",
     "q8_gemv_n2p_cls_spv", "q8_gemv_n4p_cls_spv", "q8_gemv_n8p_cls_spv",
     "kq_gemv_k4_n_cls_spv", "kq_gemv_k5_n_cls_spv", "kq_gemv_k6_n_cls_spv", "kq_gemv_q40_n_cls_spv", "kq_gemv_iq4xs_n_cls_spv",
+    "kq_gemv_k3_n_cls_spv", "kq_gemv_k2_n_cls_spv", "kq_gemv_iq3s_n_cls_spv", "kq_gemv_iq3xxs_n_cls_spv", "kq_gemv_iq4nl_n_cls_spv",
+    "kq_gemv_iq2s_n_cls_spv", "kq_gemv_iq2xs_n_cls_spv", "kq_gemv_iq2xxs_n_cls_spv",
     // the fused gate-up GEMV's N stamps serve only the N-row token command, which the zoo's one-region load never engages
     // (the batched rows need a region a row; the stocked regions files - test_gpu_resident_regions_qwen3.das and the
     // gemma files - reach them at two regions); their coverage is test_vkd_q8_gemv_gu_n in test_vulkan_kernels.das
@@ -900,8 +918,8 @@ def test_vulkan_kernel_coverage_serving(tst : T?) {
             }
             vk_kernel_coverage_reset()
             let none : array<int>
-            // llama q8: the resident dense ladder (device prefill + decode) + batch steps at 2, 4 and 8 rows (the q8
-            // N-column GEMV's n2, n4 and n8 stamps; the 1.1B at eight regions fits the card)
+            // llama q8: the resident dense ladder (device prefill + decode) + the per-op rails' batched steps at 2, 4
+            // and 8 f32 sessions (the resident N-row command needs a region a row: the regions files carry the N stamps)
             vk_cov_model(t, path_join(models_dir(), "tinyllama-1.1b-chat-v1.0.Q8_0.gguf"), "llama", [2, 4, 8])
             // gemma3 q8: the per-op arena rails + qk_norm
             vk_cov_model(t, path_join(models_dir(), "gemma-3-1b-it-Q8_0.gguf"), "gemma3", none)

@@ -36,7 +36,6 @@ require dasllama/dasllama_vulkan_common
 require dasllama/dasllama_gpu_tier   // TILE_READ_SLACK: the rows the moe: arm's gathered plane carries past its last region
 require dasllama/dasllama_vulkan_dispatch
 require dasllama/dasllama_vulkan_classes
-require dasllama/dasllama_vulkan_prefill
 require dasllama/dasllama_kqformat
 require daslib/typemacro_boost
 require _vk_probe_fixture   // hash_word, cool_f16_pair: the synthetic planes both probes build
@@ -168,7 +167,6 @@ class Cm2PxNil : MoeCmBase {
     @ssbo @binding = 0 @readonly wq : array<VkQ8Blk>
     @ssbo @binding = 1 @role = "alias" @readonly wsh : array<float16>
     @ssbo @binding = 3 @readonly xf16 : array<float16>
-    @ssbo @binding = 5 y : array<float>
     @workgroup wg_blk0 : uint
 
     [spirv_decode]
@@ -237,7 +235,6 @@ class Cm2PxFlat : MoeCmBase {
     @ssbo @binding = 0 @readonly wq : array<VkQ8Blk>
     @ssbo @binding = 1 @role = "alias" @readonly wsh : array<float16>
     @ssbo @binding = 3 @readonly xf16 : array<float16>
-    @ssbo @binding = 5 y : array<float>
     @workgroup wg_blk0 : uint
 
     [spirv_decode]
@@ -309,7 +306,6 @@ class Cm2PxPush : MoeCmBase {
     @ssbo @binding = 0 @readonly wq : array<VkQ8Blk>
     @ssbo @binding = 1 @role = "alias" @readonly wsh : array<float16>
     @ssbo @binding = 3 @readonly xf16 : array<float16>
-    @ssbo @binding = 5 y : array<float>
     @workgroup wg_blk0 : uint
 
     [spirv_decode]
@@ -379,7 +375,6 @@ class Cm2PxLit : MoeCmBase {
     @ssbo @binding = 0 @readonly wq : array<VkQ8Blk>
     @ssbo @binding = 1 @role = "alias" @readonly wsh : array<float16>
     @ssbo @binding = 3 @readonly xf16 : array<float16>
-    @ssbo @binding = 5 y : array<float>
     @workgroup wg_blk0 : uint
 
     [spirv_decode]
@@ -694,16 +689,17 @@ def private run_dec_small_kernels() {   // nolint:STYLE038 — one linear measur
         let scd = make_device_buf(sc_bytes)
         let qd = make_device_buf(q_bytes)
         let ofd = make_device_buf(of_bytes)
-        var tokb = make_host_buf(16l, true)
+        var tokb = make_host_buf(TOK_META_BYTES, true)
         unsafe {
             upload_region_at(projd, 0l, addr<uint8 const?>(projh[0]), proj_bytes)
             upload_region_at(std, 0l, addr<uint8 const?>(sth[0]), st_bytes)
             upload_region_at(smd, 0l, addr<uint8 const?>(smh[0]), sm_bytes)
             var tm = reinterpret<TokMeta?>(tokb.mapped)
             tm.parity = 1u
+            tm.dnslot = 0u
         }
         var s = set_dn_step_cls(fixed_array(projd, std, smd, scd, qd, tokb.buf, ofd),
-            fixed_array(proj_bytes, st_bytes, sm_bytes, sc_bytes, q_bytes, 16l, of_bytes),
+            fixed_array(proj_bytes, st_bytes, sm_bytes, sc_bytes, q_bytes, TOK_META_BYTES, of_bytes),
             fixed_array(16u, 2u, 8u, 1u, 4u, 0u, 32u))
         for (oform in range(2)) {
             var raw = alloc_cmd()
@@ -1177,7 +1173,6 @@ class K6PxBase : MoeCmBase {
     @ssbo @binding = 0 @readonly wq : array<VkK6Blk>
     @ssbo @binding = 1 @role = "alias" @readonly wsu : array<uint>
     @ssbo @binding = 3 @readonly xf16 : array<float16>
-    @ssbo @binding = 5 y : array<float>
     @workgroup wg_blk0 : uint
 
     [spirv_decode]
@@ -1340,7 +1335,6 @@ let private KHRPX_STRIDE = 40u
 class KhrPxBase : MoeCmBase {
     @ssbo @binding = 1 @role = "alias" @readonly ws : array<uint>
     @ssbo @binding = 3 @role = "alias" @readonly xf16w4 : array<uint4>
-    @ssbo @binding = 5 y : array<float>
     @workgroup wg_blk0 : uint
     @workgroup khr_a : float16[5120]
     @workgroup khr_b : float16[5120]
@@ -2098,7 +2092,6 @@ class MmqPxK4 : MoeCmBase {
     @ssbo @binding = 1 @readonly wsu : array<uint>
     @ssbo @binding = 3 @readonly xqw : array<uint>
     @ssbo @binding = 4 @readonly axs : array<float>
-    @ssbo @binding = 5 y : array<float>
     @workgroup mx4 : uint4[1088]   //! 64 token rows x 16 uint4 chunks, stride 17
     @workgroup mw4 : uint4[544]    //! 32 columns x 16 chunks, stride 17 (the sdot4 tile's staging)
     @workgroup mxs : float[64]
@@ -2230,7 +2223,6 @@ class MmqPxK4Blk : MoeCmBase {
     @ssbo @binding = 1 @readonly wsu : array<uint>
     @ssbo @binding = 3 @readonly xqw : array<uint>
     @ssbo @binding = 4 @readonly axs : array<float>
-    @ssbo @binding = 5 y : array<float>
     @workgroup bx4 : uint4[128]    //! 64 token rows x one block (2 uint4 chunks)
     @workgroup bw4 : uint4[256]    //! 128 columns x one block
     @workgroup bxs : float[64]
@@ -3511,7 +3503,6 @@ def private run_cm2x_shape(name : string; d, n, cnt : int) {   // nolint:STYLE03
 class Cm2PxF16A : MoeCmBase {
     @ssbo @binding = 0 @readonly wf : array<float16>
     @ssbo @binding = 3 @readonly xf16 : array<float16>
-    @ssbo @binding = 5 y : array<float>
 
     [spirv_kernel(local_size_x = 256, name = "cm2px_f16a_spv")]
     def run {

@@ -11,6 +11,12 @@ what it costs today and what the fix would change.
 
 ## Entries
 
+- **The resident plan and upload read one plane list (`resident_planes`,
+  `ARCHITECTURE_GPU_VULKAN_RESIDENCY.md` sec.2.2n).** The list is built twice per load - once
+  for the plan's byte sum, once for the upload's reserve - and holds one 24-byte record per
+  device plane: about 25 KB on a 94-layer model, a few microseconds each, against a load that
+  moves gigabytes. Cost today: nothing measurable; the fix, if the list ever grows per-token
+  readers, is to build it once at load and keep it on the resident state.
 - **LANDED (2026-09-18) - a K/V mirror region per stream trades context for concurrency, not
   for throughput (`ARCHITECTURE_GPU_VULKAN_RESIDENCY.md` sec.2.2n).** The resident driver's
   mirror is one allocation a side; `set_gpu_resident_regions` splits it, and the residency plan
@@ -790,10 +796,10 @@ what it costs today and what the fix would change.
   ledgered: batched decode (see the batched-tg entry) turns each step into a B-row GEMM where the
   same split/placement question prices real serving throughput; revisit there, not as a B=1 hunt.
 
-- **`g_lp_cbs` per-step buffer churn: the `@scratch` recycling never happens on the batch-decode
-  pipeline path (spotted 2026-08-02, lint uplift).** `metal_batch_decode_forward` builds each
-  step's command-buffer list in a LOCAL `cbs` and hands it over with `g_lp_cbs <- cbs`
-  (`dasllama_metal_decode.das:3002`) - the move drops the global's retained buffer every step,
+- **`BatchLanding.cbs` per-step buffer churn: the `@scratch` recycling never happens on the batch-decode
+  pipeline path (spotted 2026-08-02, lint uplift).** `batch_step_build` builds each
+  step's command-buffer list in a LOCAL `cbs` and hands it over with `L.cbs <- cbs`
+  (`dasllama_metal_decode.das`, the landing stash at the end of the build) - the move drops the slot's retained buffer every step,
   so `finish_pending_step`'s capacity-retaining `clear()` recycles nothing, and on a persistent
   heap the dropped buffer is ~ncb pointers per step. **What a fix changes:** prefill's
   `g_pf_cbs` ping-pong pattern (build into the global, or `push_from` a reference) recycles both
@@ -2066,6 +2072,25 @@ processes throughout].
   ceiling is the plain row and the served rate is the ruler's question (sec.2.45 of the
   measurement doc) [direction-grade - two processes].
 
+### From the server-MTP arc, the batched pre-encoded step (2026-09-21)
+
+- **What the pre-encoded step holds (`ARCHITECTURE_GPU_MTP_DECODE.md` sec.2.38a).** A pre-encoded
+  batched step holds its own set of `batch_step_build`'s pooled buffers beside the step in flight, so
+  the pool's peak grows by one step's set. The bytes are `batch_step_build`'s own sizing at four rows
+  (the server's default stream count, the fixed-row forms' four-row pad) over each carrier's loaded
+  `Config`, each buffer rounded up to the pool's power-of-two bucket. The fixed part - the rows'
+  activations, the FFN pair and the logits plane - is 3.5 to 5.6 MB on the catalog's large carriers
+  (gemma-4-26B-A4B 4.6 MB, Qwen3.8-27B 5.6 MB, gpt-oss-20b 4.5 MB, Mistral-Small-3.1-24B 3.5 MB,
+  gemma-4-E4B 4.9 MB). A carrier the fused partD attention does not serve (a head size other than
+  64 or 128, mixed head sizes, a sliding window, sinks) also holds the chunked attention's partials:
+  rows x heads x (largest head size + 2) x 4 bytes per 64-key chunk of the deepest row. At each
+  carrier's trained context that is gemma-4-26B-A4B 539 MB at 262144 keys (a 1 GiB bucket),
+  Qwen3.8-27B 406 MB at 262144 (512 MiB), gpt-oss-20b 138 MB at 131072 (256 MiB), gemma-4-E4B
+  135 MB at 131072 (256 MiB); Mistral-Small-3.1-24B rides partD and holds none. Decision: the rail
+  ships off (`DASLLAMA_METAL_BATCH_PRE=1` arms it) - the E4B four-row step times the same with it
+  on and off (`followup_metal.md` row 23), so the second set buys nothing until a step chained on
+  the GPU's own picks lands on top of it.
+
 ### From the Vulkan batched-decode arc, the qwen and phi carriers (2026-09-20)
 
 Instruments as the section above: `daslang -jit benchmarks/lcpp_bench.das --npl 4` on the pod (RTX
@@ -2321,7 +2346,8 @@ under the same command line the same hour (every llama.cpp figure `external`). E
   (1.82 against Vulkan, 0.84 against CUDA), flat 130 / 61 / 127; Qwen3-30B-A3B UD-IQ2_XXS 237 +/- 1
   / 91 / 359 (2.61 / 0.66), flat 143 / 59 / 135. gemma-4-26B-A4B UD-IQ3_XXS fits no plan on this
   card (the resident driver declines at 23.9 GB asked of 13.3, its demoted down-expert rows taking
-  the served weights alone to 15.4 GB; the per-op rails serve 16 summed) where the reference
+  the served weights alone to 15.4 GB - a plan figure that tallied each routed layer's dense shared
+  expert twice, the low-format N-row arc's section below; the per-op rails serve 16 summed) where the reference
   pages: 109 on Vulkan, 275 on CUDA - row 81's shape. Against CUDA the two homed carriers read
   0.66 and 0.84. The expert-bucket form (`followup_vulkan.md` item 83's neighbour: the N-column
   expert GEMV a bucket, which decodes a weight block once for every row that picked its expert)
@@ -2460,6 +2486,62 @@ rank the shapes and bound them from above; the reference's tg steps launch as on
   `parallel_argmax` (`test_vkd_cls_argmax`), and the regions files hold bit for bit through the change (qwen2 26/26,
   E2B 13/13, gpt-oss 8/8, the hybrid 6/6, qwen2 under `DASLLAMA_VK_KV32=1`).
 
+### From the Vulkan hybrid rows arc (2026-09-22)
+
+Instruments as the E-series section above: the pod (RTX PRO 4500, Linux), `daslang -jit
+benchmarks/lcpp_bench.das --for-debug-purposes -r 3 -p 512 -n 128 -t 16 --npl 4` on the cm2 arm
+and on the KHR arm under `DASLLAMA_COOPMAT=mm`, `DASLLAMA_GPU=1 DASLLAMA_IMAGE=0
+DASLLAMA_ALLOW_UNTUNED=1 DASLLAMA_PARITY_FULL=1 DAS_JOBQUE_THREADS=16` and no `DAS_TUNE_POLICY`
+override (the untuned tier) for every carrier; llama.cpp b10660's prebuilt Vulkan
+`llama-batched-bench -c 4096 -b 2048 -ub 512 -npp 512 -ntg 128 -npl 1,4 -ngl 99 -fa on` the same
+hour, `external`; every ratio `tg128@4` against the reference's `S_TG` at `-npl 4`
+[direction-grade - two processes]; a lever's pair is two commits in two processes
+[direction-grade - two commits]. The test counts below are the same box and tier under
+`dastest -jit`, cm2, `DAS_JOBQUE_THREADS=8`. No 5060 Ti row is in this section.
+
+- **The residency (commit d14bc2e32: a deltanet state slot per mirror region, the row's slot and
+  parity in its `TokMeta` row, the prefill in the selected region's slot):** the one-row rates
+  unmoved - Qwen3.5-0.8B Q8_0 flat 474.4 +/- 0.7 against 470.3 at the arc's tip - and the batched
+  rows still a row at a time (tg128@4 475.5, one stream's rate: the N-row command still declined
+  the recurrent layers); the resident, regions and scheduler hybrid files green at the commit.
+- **The N-row recurrent form and the gated q (commits dcc6852a6, ca0ac2a0e, da7d315f2), tg128@4
+  ours cm2 / ours KHR / llama.cpp:** Qwen3.5-0.8B Q8_0 1553.1 +/- 1.3 / 1561.0 +/- 3.8 / 971.1
+  (1.60 / 1.61), flat 470.3 / 468.6 / 381.5; Qwen3.5-9B-MTP UD-Q5_K_XL 316.1 +/- 0.4 / 315.8 +/- 0.4 /
+  277.4 (1.14 / 1.14), flat 104.8 / 104.8 / 102.3 (the rows form that fed its K-quant recurrent
+  heads Q8_0 blocks read 314.8 on both arms: the Q8_K feed the shipped form requants at every
+  recurrent head costs nothing the ruler sees); Qwen3.6-35B-A3B UD-IQ2_XXS 440.6 +/- 2.6 / 443.4
+  +/- 2.0 / 235.9 (1.87 / 1.88), flat 163.7 / 163.7 / 131.5 - against the MoE section's 30 (0.13)
+  a row at a time, where the one slot went home and back on every stream switch. pp512 cm2 / KHR:
+  the 0.8B 29102 / 23862, the 9B 5326 / 4223, the 35B 4583 / 4138 (the reference's four-stream
+  prompt rate 29067 / 5008 / 4588). The 9B's four-row ratio is the section's tightest and its flat
+  ratio 1.02: the dense K-quant 9B trunk, not the recurrent form, sets it. Its regions file
+  (`test_gpu_resident_regions_hybrid_k.das`, the split bar, 4 of 4) is what found the rows form's
+  Q8_0 feed and, after it, an N rail that never ensured a recurrent layer's FFN leaves.
+- **The rows against the sessions alone:** the hybrid regions file's batched cells bit for bit
+  through the N-row command (11 of 11), the scheduler's deltanet cells, the resident hybrid file,
+  and the fused step's two-row arm against the one-row dispatch a row at a time bit for bit on both
+  o forms (`test_vkd_dn_step_rows`). The regions file found two defects on the way: the rows-form
+  prologue stamp stores no float row (a recurrent layer 0 reading one now takes the split
+  prologue), and four rope and attention sets bound the grown `TokMeta` block at its old row width,
+  every row past the first reading its position outside the binding.
+- **The per-region planes' footprint (computed from the geometry, no device measurement):** a
+  recurrent layer's state slots are `regions x nvh x ds x ds x 4` bytes and its ring pairs
+  `regions x 2 x cd x (dconv - 1) x 4` - at four regions on the Qwen3.5-0.8B (16 heads of 128,
+  cd 6144, dconv 4) 4 MB + 0.6 MB a layer over 18 recurrent layers, 83 MB; on the Qwen3.6-35B-A3B
+  (32 heads of 128, cd 12288) 8 MB + 1.2 MB a layer over 30 layers, 276 MB; at `RD_NB_MAX` (eight)
+  regions twice that. The rows' deltanet planes grow by the row count: the projection row
+  `(cd + di) x 4`, the o row `di` bytes plus `di / 32 x 4` of scales plus `di x 4` of f32, so
+  eight rows on the 35B hold 0.9 MB. Beside the K/V mirror the same regions hold (the residency
+  section's sizing), the slots are within a percent of the plan.
+- **The carriers that served batched without evidence (the phi3, gemma3 and mistral3 families), the
+  same instruments, tg128@4 ours cm2 / ours KHR / llama.cpp:** Phi-3.5-mini Q4_K_M 578.7 +/- 0.4 /
+  574.8 +/- 0.4 / 552.1 (1.05 / 1.04), flat 220.4 / 221.0 / 217.4; gemma-3-1b Q8_0 1240.1 +/- 0.3 /
+  1240.3 +/- 1.2 / 845.5 (1.47 / 1.47), flat 398.3 / 395.2 / 310.5; gemma-3-4b Q8_0 542.8 +/- 0.6 /
+  543.4 +/- 0.6 / 442.6 (1.23 / 1.23), flat 152.2 / 152.6 / 137.2. The regions files pin the rows:
+  `test_gpu_resident_regions_gemma3.das` bit for bit (6 of 6), `test_gpu_resident_regions_phi3.das`
+  on the split bar (4 of 4). Mistral-Small-3.1-24B Q4_K_M has no row and no regions file: the pod's
+  volume holds no room for its 14 GB beside the stocked models (`followup_vulkan.md` item 87).
+
 ### From the M4 Metal pass (2026-09-13)
 
 Instruments: `benchmarks/matmul/bench_metal_gemv_kernels.das` at the Qwen2.5-0.5B decode shapes
@@ -2558,3 +2640,138 @@ the two arms, not board figures; the tokenizer rows are `lcpp_bench --tok`.
   helpers left in `dasllama_bpe.das` took the M5's 1 KB row to 0.98 and left 4 to 16 KB at 0.93
   to 0.96. The SPM heap stays its own body, in the partition of the encode that runs it
   (`ARCHITECTURE_ENGINE_FORMATS.md` sec.1.2a); the BPE side keeps the unshared form.
+
+### From the Vulkan low-format N-row arc (2026-09-23)
+
+Instruments as the hybrid rows section above: the pod (RTX PRO 4500, Linux), `daslang -jit
+benchmarks/lcpp_bench.das --for-debug-purposes -r 3 -p 512 -n 128 -t 16 --npl 4` on the cm2 arm
+under `DASLLAMA_GPU=1 DASLLAMA_IMAGE=0 DASLLAMA_ALLOW_UNTUNED=1 DASLLAMA_PARITY_FULL=1
+DAS_JOBQUE_THREADS=16`, the untuned tier, every figure below the mean of the three repetitions with
+its standard deviation; llama.cpp b10660's prebuilt Vulkan `llama-batched-bench -c 4096 -b 2048
+-ub 512 -npp 512 -ntg 128 -npl 1,4 -ngl 99 -fa on` the same hour, `external`, its second run of a
+file; every ratio `tg128@4` against the reference's `S_TG` at `-npl 4` [direction-grade - two
+processes]; a lever's pair is two commits in two processes [direction-grade - two commits]. The
+5060 Ti rows (driver 616.56, Windows, the desktop holding 1.8 GB of the 16 GB) take the same command
+lines, the bench pinning its batched row's context so the plan homes four regions at 660 positions;
+the local llama.cpp is the same b10660 Vulkan build. The N-column ruler is
+`daslang -jit harness/vk_gemv_probe.das -- cols 5120 17408` (the 27B's FFN gate shape) on the pod
+under the same environment, the untuned tier in cm2 mode, its last column an N-column dispatch's
+wall over N one-column dispatches, each wall the mean of its dispatch ring [direction-grade - two
+commits].
+
+The reference's first run of a file compiles its pipelines inside the measurement: i1-IQ3_S read
+57.9 cold and 67.3 warm at four streams. The carriers are the three Qwen3.8-27B files whose dense
+planes sit in sub-4-bit formats: i1-IQ3_S's FFN and attention q/k/o planes are IQ3_S, its recurrent
+qkv and attention v planes Q4_K and its classifier Q6_K (440 IQ3_S tensors, 65 Q4_K, 1 Q6_K);
+UD-Q3_K_XL mixes IQ4_XS (156 tensors, its most common), Q8_0 (98), Q4_K through Q6_K (69) and the
+eight low-bit formats Q3_K, Q2_K, IQ3_S, IQ3_XXS, IQ2_S, IQ2_XS, IQ2_XXS and IQ4_NL across the
+planes; UD-IQ4_XS is IQ4_XS in bulk with the same eight mixed in. All three have 64 layers with
+attention every fourth, so a position costs 64 KB of f16 mirror and a region 151 MB of DeltaNet
+state.
+
+- **The eight N-column leaves alone (commit 181398621: `KqGemv<Fmt>N` for k3, k2, iq3s, iq3xxs,
+  iq4nl, iq2s, iq2xs, iq2xxs on the shell's per-column `blk_contrib`), tg128@4 ours cm2 /
+  llama.cpp, then flat:** i1-IQ3_S 95.4 +/- 0.2 / 67.3 (1.42), flat 48.4 / 42.4; UD-Q3_K_XL 62.4 +/-
+  0.1 / 78.0 (**0.80**), flat 43.8 / 42.0; UD-IQ4_XS 55.0 +/- 0.1 / 84.9 (**0.65**), flat 41.1 / 40.5.
+  The rows form scaled 1.97x over flat on the IQ3_S file and 1.34x to 1.42x on the mixed files.
+- **The ruler at that tip, an N-column dispatch at four columns over four one-column ones:** q8
+  0.25, k4 0.28, k6 0.27, q40 0.26, k5 0.35, k3 0.48, k2 0.50, iq3s 0.61, iq3xxs 0.61, iq2s 0.71,
+  iq2xs 0.76, iq2xxs 0.78, iq4xs 1.06, iq4nl 1.06 - the shell re-ran each block's decode for every
+  column, so a codebook or grid leaf shared nothing and the one-column class at 1 column read 1.23x
+  the one form.
+- **Lever 1 - decode once, fold per column (commit f18cb9ffa: every leaf's `blk_decode` hands back
+  the block's packed int8 halves and four fold terms, one shared `blk_fold` dots them, `mad`
+  throughout):** the ruler at four columns q8 0.25, k4 0.26, k6 0.26, q40 0.26, k5 0.26, k3 0.31, k2
+  0.37, iq3s 0.35, iq3xxs 0.32, iq2s 0.44, iq2xs 0.41, iq2xxs 0.42, iq4xs 0.36, iq4nl 0.36; at eight
+  columns k4 0.18, iq4xs 0.22, iq3s 0.27, iq2s 0.33; the one-column rates within 1% of before
+  (iq4xs 196 us against 202). The rows: i1-IQ3_S 137.1 +/- 0.3 / 67.3 (**2.04**), flat 48.8;
+  UD-Q3_K_XL 123.8 +/- 0.2 / 78.0 (**1.59**), flat 44.6; UD-IQ4_XS 118.2 +/- 0.2 / 84.9 (**1.39**),
+  flat 41.7 (flat tg128 48.80 +/- 0.02, 44.58 +/- 0.07, 41.66 +/- 0.07); pp512 1475 +/- 5 / 1559
+  +/- 4 / 1634 +/- 7. The KHR arm the same hour: tg128@4 137.3 +/- 0.1 / 124.0 +/- 0.2 / 118.0 +/-
+  0.2, pp512 1394 +/- 5 / 1377 +/- 5 / 1394 +/- 4. The kernel family, N-column and gate-up cells
+  hold at the tip on both boxes: the N form's every column is the one-column class's word for word.
+- **llama.cpp's CUDA build of the same b10660 checkout on the pod (`external`, a reference row and
+  not a target; `-DGGML_CUDA=ON`, nvcc 12.8, the Vulkan reference's command line, second run):**
+  tg128@4 125.9 / 132.6 / 125.9 (i1-IQ3_S / UD-Q3_K_XL / UD-IQ4_XS), tg128 51.0 / 50.9 / 48.8,
+  pp512 1811 / 1863 / 1906 - ours at the lever-1 tip reads 1.09x / 0.93x / 0.94x of it batched and
+  0.96x / 0.88x / 0.85x flat [direction-grade - two processes]. CUDA's batched rate hardly moves
+  with the format (126 to 133) where ours follows the decode cost of the leaves.
+- **The 5060 Ti at the lever-1 tip, ours cm2 tg128@4 / tg128 with the reference's rows beside:**
+  i1-IQ3_S homes (11526 MB image, 165 MB mirror, 230 MB scratch): 89.5 +/- 0.9 / 28.3 (56.5 before
+  the lever) against llama.cpp's 2.5 / 2.6 - the reference pages the 12.6 GB file on this card at
+  those arguments (its first and second runs alike); UD-Q3_K_XL homes (11900 MB image): 80.9 +/- 2.4
+  / 25.7 (38.9 before) against 19.6 / 7.4, paging; UD-IQ4_XS declines the resident driver - 13295 MB
+  asked of 12422 MB usable, the weights alone 12899 MB with other processes holding 1835 MB - and the
+  per-op rails read 8.5 / 3.4 against the reference's 2.5 / 2.0, both paging. The IQ4_XS file on 16 GB
+  is `followup_vulkan.md` item 81's streamed-weights arm, not a kernel.
+
+### From the Vulkan vision tower arc (2026-09-24)
+
+The instrument: the pod (RTX PRO 4500 Blackwell, driver 580.173, an AMD EPYC 7443 container at 48
+threads under the 62 GB cgroup cap), `daslang -jit benchmarks/lcpp_bench.das -- -m <decoder> --image
+<coco 640x480> --image-mmproj <mmproj> --for-debug-purposes -r 3 -t 16` under `DASLLAMA_IMAGE=0
+DASLLAMA_ALLOW_UNTUNED=1 DAS_JOBQUE_THREADS=16`, `DASLLAMA_COOPMAT` unset (cm2, the pod's default
+mode) and `DAS_TUNE_POLICY` unset (the box default; the untuned tier is what
+`DASLLAMA_ALLOW_UNTUNED=1` arms, so the kernels are the fallback bodies); the `vk` arm
+`DASLLAMA_GPU=1` (the tower chain on the Vulkan tower driver, the bench's engage line reading
+encodes +3 of 3), the `cpu` arm `DASLLAMA_GPU=0` (the driver declining `device` on every encode,
+the CPU tower chain - the q8 lane where the family has one, the exact f32 lane on qwen25v - and the
+decoder on the CPU too, so only the encode column is a tower-vs-tower reading) [direction-grade -
+two processes]. The encode is one image's tower time in ms and a tg figure is the decoder's tok/s,
+each the mean of the three timed reps: the bench's image cell logs that mean alone, so no spread
+(deviation, min or max) is recorded for the rows below.
+
+- **The four families, the driver against the CPU chain, encode ms:** gemma-4-E2B (gemma4v q8, 130
+  soft tokens) **35.2** against 706; gemma-3-4b (gemma3v q8, 256 tokens, the fixed 896 canvas -
+  4096 patch rows through 27 blocks) **165** against 14345; Qwen3-VL-4B (qwen3v q8 with the three
+  deepstack taps, 300 tokens) **262** against 1561; Qwen2.5-Omni-3B (qwen25v over the halfword twin,
+  391 tokens, the f32 per-window route) **179** against 7305 (162 on the slotted f16 route the arc
+  replaced: the window layers read K and V off the compact rows, `followup_vulkan.md` row 95's
+  staging lever). The captions read on both arms of every pair name the two cats and the remotes -
+  an observation of the served output, not a parity claim; the parity instruments are the twin
+  cells below and the chat pairs of `tests/test_vision_chat.das`.
+- **The E2B image row's decode with the resident driver's span pass hydrating the mirror's rows
+  before the CPU takes the image eval:** tg **188.4** on the `vk` arm, against 24.7 at the previous
+  tip on the same arm (the decode falling to the CPU after the span eval) and the `cpu` arm's 24.5
+  [direction-grade - two commits]. The caption the chat cell `test_vision_chat_e2b` reads under
+  `DASLLAMA_GPU=1` is that cell's own assert.
+- **The pp / tg columns are the decoder's**, not the tower's: on the `cpu` arm the decoder runs on the
+  CPU too (Qwen3-VL tg 14.0 against 56.0 on the Vulkan resident driver, Omni 18.8 against 102.7,
+  E2B 24.5 against 188.4).
+- **The driver's allocations at the largest shape the path serves - the 4096-row encode cap
+  (`VT_MAX_ENCODE_ROWS`, the `shape` decline past it), which is gemma3v's fixed canvas exactly:**
+  the qwen25v halfword twin uploaded whole, 32 layers x (4 x 1280^2 + 3 x 1280 x 3456) weights x 2
+  bytes = 1,268,776,960 bytes, about 1.27 GB (`q25v_gemm_sizes`: the four d x d GEMMs, the gate and
+  up at d x ff_pad, the down at ff_pad x d); the gemma3v Q8_0 plane uploaded whole, 27 layers x (4 x
+  1152^2 + 2 x 1152 x 4352) = 414 M weights, about 414 MB of quants plus 26 MB of f16 scales (2 bytes
+  a 32-weight block); the per-encode device scratch at 4096 rows, from `vt_scratch` /
+  `vt_scratch_f16`'s buffer list - eleven f32 row buffers at rows x d x 4 (eight on qwen25v), two
+  f32 hidden buffers at rows x ff x 4, the two f16 K/V shadows at rows x d x 2, the Q8_0 feed at
+  rows x max(d, ff) x 33/32 (the f16 feed at rows x max(d, ff) x 2 on qwen25v), the padded panels at
+  rows x n_head x 128 x 12 where the head is not 64 wide, the rope tables at rows x hd x 4 - reads
+  about 491 MB for gemma3v (d 1152, ff 4352, 16 padded heads), about 432 MB for qwen25v (d 1280, ff
+  3456, 16 padded heads) and about 507 MB for the Qwen3-VL-4B qwen3v tower (d 1024, ff 4096, the
+  fused [q | k | v] rows at 3 x rows x d x 4 and the three tap stashes at 3 x rows x d x 4 beside the
+  padded panels); and the qwen3v host-side tap stash `ds_xtaps` at n_ds x rows x d x 4 bytes, 3 x
+  4096 x 1024 x 4 = 50,331,648 bytes, about 50 MB on the 4B. The gemma4v scratch follows the same
+  list at its d and ff with no padded panels (its head is 64 wide). One resident a family, released
+  by the model drop's sweep.
+- **The device chain's distance from the exact CPU chain, the twin cells at the tip, x token rms
+  (the CPU q8 chain's own distance beside where the family has one):** gemma4v E2B 16 blocks
+  0.082 / 0.160 / 0.63 / 0.26 against 0.064 / 0.193 / 0.46 / 0.25 (cb96, cb336, green 672x336,
+  cb768x384; the 1- and 2-block towers within 0.015 on both); gemma3v 27 blocks 3.26 against 2.68 (the fixed canvas; the 1- and 2-block towers 0.12
+  against 0.12 / 0.13); qwen3v 4B 24 blocks 0.42 / 0.62 / 0.61 against 0.36 / 0.58 / 0.44 (cb96,
+  cb448, cb640x320); qwen25v 32 blocks 0.015 / 0.076 / 0.092 against the exact chain (cb112, cb448,
+  cb616x336; no q8 lane), the 5060 Ti's KHR arm 0.020 / 0.034 / 0.020. The slotted f16 window
+  route read 0.16 to 0.79 on the 5060 Ti's cm2 arm and 1.53 on the pod's at 32 blocks - the
+  coopmat tile's f16 staging compounds over the 28 window layers, which is why the window layers
+  attend in f32 on the compact rows (`ARCHITECTURE_GPU_TOWER.md` 2.2aq).
+
+  Provenance of the twin-cell figures: `test_gemma4v_vulkan_twin`, `test_gemma3v_vulkan_twin`,
+  `test_qwen3v_vulkan_twin` and `test_qwen25v_vulkan_twin` (`tests/test_<family>.das`), each run
+  through dastest under `-jit` with `--test-names` naming the cell, `DASLLAMA_GPU=1`,
+  `DASLLAMA_IMAGE=0`, `DAS_TUNE_POLICY` unset; the box is the pod (RTX PRO 4500 Blackwell, driver
+  580.173) on its cm2 arm (`DASLLAMA_COOPMAT` unset) unless the sentence names the 5060 Ti (Boris's
+  box, RTX 5060 Ti 16 GB, driver 616.56), whose cm2 arm is likewise the default and whose KHR arm
+  is `DASLLAMA_COOPMAT=mm`. A distance is the cell's own logged x-rms reading over one run of the
+  cell; the cells log the reading on green and assert the bar.

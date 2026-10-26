@@ -26,6 +26,8 @@ require tools/find_references public
 require tools/eval_expression public
 require tools/describe_type public
 require tools/grep_usage public
+require tools/common public
+require tools/cpp_common public
 require tools/outline public
 require tools/cpp_grep_usage public
 require tools/cpp_find_symbol public
@@ -1085,6 +1087,20 @@ def test_goto_definition_declarations(t : T?) {
         t |> success(find(text, "Variable(i) : int") >= 0, "type_of on a for variable's header: {text}")
         t |> equal(source_line(fixture_path("_fixture_refs.das"), 68), "    for (i in range(2)) \{", "the subtools' line reader is 1-based")
         t |> equal(source_line(fixture_path("_fixture_refs.das"), 100000), "", "past the end of the file the line is empty")
+    }
+    t |> run("a CRLF file's lines come back without the carriage return") <| @(t : T?) {
+        var terr : string
+        let dir = create_temp_directory("mcp_source_line_crlf", terr)
+        if (empty(dir)) {
+            t |> failure("temp dir: {terr}")
+            return
+        }
+        let file = path_join(dir, "crlf.das")
+        fwrite(file, "let a = 1\r\nlet b = 2\r\nlet c = 3\r\n")
+        t |> equal(source_line(file, 2), "let b = 2", "the line, not the line plus \\r")
+        t |> equal(length(source_line(file, 3)), length("let c = 3"), "the last line too")
+        t |> equal(source_line(file, 5), "", "past the end of the file the line is empty")
+        rmdir_rec(dir)
     }
 }
 
@@ -3813,5 +3829,49 @@ def test_discover(t : T?) {
         parse_result(do_discover("(uri", "", ""), text, is_error)
         t |> success(is_error, "unbalanced fts5 query should be error -- text={text}")
         t |> success(find(text, "invalid FTS5 query") >= 0, "names the cause -- text={text}")
+    }
+}
+
+[test]
+def test_served_tree_paths(t : T?) {
+    let here = getcwd()
+    let dir = path_join(get_das_root(), "utils/mcp/tests/_served_tree_{ref_time_ticks()}")
+    mkdir(dir)
+    t |> success(chdir(dir), "enter the served tree")
+    let served = to_generic_path(getcwd())
+    t |> run("a relative path joins the served tree, not the daslang root") @(t : T?) {
+        t |> equal(resolve_path("tests/x.das"), path_join(served, "tests/x.das"))
+        t |> equal(resolve_path(""), served)
+        t |> equal(resolve_path("."), served)
+        let abs = path_join(to_generic_path(get_das_root()), "abs/x.das")   //! a rooted path on every platform (a bare `/abs` is drive-relative on Windows and resolves to `D:/abs`)
+        t |> equal(resolve_path(abs), abs)
+    }
+    t |> run("a served tree with no project marker keeps the daslang C++ index roots") @(t : T?) {
+        var inscope dirs <- cpp_default_search_dirs()
+        t |> equal(length(dirs), length(CPP_SEARCH_DIRS))
+        t |> equal(dirs[0], path_join(get_das_root(), CPP_SEARCH_DIRS[0]))
+    }
+    t |> run("the C++ index roots are the served tree once it carries a project marker") @(t : T?) {
+        fwrite(path_join(served, "CMakeLists.txt"), "")
+        var inscope dirs <- cpp_default_search_dirs()
+        t |> equal(length(dirs), 1)
+        t |> equal(dirs[0], served)
+    }
+    t |> run("the compile database is looked up under the served tree") @(t : T?) {
+        mkdir(path_join(served, "build"))
+        let db = path_join(served, "build/compile_commands.json")
+        fwrite(db, "[]")
+        t |> equal(cpp_locate_compile_db(""), db)
+    }
+    t |> success(chdir(here), "leave the served tree")
+    rmdir_rec(dir)
+    t |> run("at the daslang root the C++ index roots are CPP_SEARCH_DIRS") @(t : T?) {
+        if (to_generic_path(getcwd()) != get_das_root()) {
+            t |> skip("the suite runs outside the daslang root")
+            return
+        }
+        var inscope dirs <- cpp_default_search_dirs()
+        t |> equal(length(dirs), length(CPP_SEARCH_DIRS))
+        t |> equal(dirs[0], path_join(get_das_root(), CPP_SEARCH_DIRS[0]))
     }
 }

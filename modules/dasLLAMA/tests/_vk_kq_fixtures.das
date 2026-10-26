@@ -8,6 +8,9 @@ require math
 // (test_vulkan_tier) and the cm2 expert-chain suite (test_vulkan_moe_cm2): the pow2 scale sets
 // keep |gate| in the sane silu regime, the dequant mirrors the kernels' extraction bit-exact.
 
+//! a float rounded through f16 and back - the value the device reads where it stages a plane in halves
+def f16r(v : float) : float => f16_to_f32(f32_to_f16(v))
+
 // the small set for gate/up/x scale planes
 def pow2_small(i : int64) : float {
     let p = i % 3l
@@ -174,18 +177,11 @@ def count_bad(gpu, refv : array<float>; abs_bar, rel_bar : float) : int {
     return bad
 }
 
-def max_abs(v : array<float>) : float {
-    var m = 0.0
-    for (x in v) {
-        m = max(m, abs(x))
-    }
-    return m
+//! one hashed word of synthetic quant bytes for index i - the kernel suite's and the probes' plane filler
+def hash_word(i : uint) : uint {
+    var h = i * 2654435761u
+    h ^= h >> 16u
+    h *= 2246822519u
+    return h ^ (h >> 13u)
 }
 
-def max_diff(a, b : array<float>) : float {
-    var m = 0.0
-    for (av, bv in a, b) {
-        m = max(m, abs(av - bv))
-    }
-    return m
-}

@@ -296,7 +296,26 @@ SET(AOT_DASLIB_FILES
     tests/daslib/test_sha_256.das
     tests/daslib/test_faker.das
     tests/daslib/test_tune_shells.das
+    tests/daslib/test_format_raw_assign.das
 )
+# tests/daslib is listed by hand, so a test file there is exactly one of: listed above, or
+# marked `options no_aot` because a module it requires keeps out of AOT. A file that is neither
+# fails every -use-aot run with error[50101]; one that is both is a contradiction. Both fail here.
+FILE(GLOB DASLIB_TEST_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/daslib/*.das")
+list(FILTER DASLIB_TEST_FILES EXCLUDE REGEX "tests/daslib/(_|failed_|cant_|invalid_)")
+FOREACH(_daslib_test ${DASLIB_TEST_FILES})
+    FILE(STRINGS ${PROJECT_SOURCE_DIR}/${_daslib_test} _test_lines REGEX "^\\[test\\]")
+    IF(NOT _test_lines)
+        CONTINUE()   # a fixture or helper, not a test program the -use-aot run links
+    ENDIF()
+    FILE(STRINGS ${PROJECT_SOURCE_DIR}/${_daslib_test} _no_aot_lines REGEX "^options[ \t]+no_aot")
+    LIST(FIND AOT_DASLIB_FILES ${_daslib_test} _listed_at)
+    IF(_no_aot_lines AND NOT _listed_at EQUAL -1)
+        MESSAGE(FATAL_ERROR "${_daslib_test} is listed in AOT_DASLIB_FILES and marked `options no_aot` - drop one: the option is only for a file a required module keeps out of AOT")
+    ELSEIF(NOT _no_aot_lines AND _listed_at EQUAL -1)
+        MESSAGE(FATAL_ERROR "${_daslib_test} is in neither AOT_DASLIB_FILES (tests/aot/CMakeLists.txt) nor marked `options no_aot` - list it, or mark it when a module it requires keeps out of AOT")
+    ENDIF()
+ENDFOREACH()
 
 FILE(GLOB AOT_MCP_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/mcp/*.das")
 # Skip _fixture_*.das — those are subprocess targets spawned BY the tests,
@@ -367,6 +386,7 @@ SET(AOT_SUBSET_DASLIB_MODULE_FILES
 
 # Language test module files (libraries required by tests)
 SET(AOT_LANGUAGE_MODULE_FILES
+    tests/language/_assign_operator_mod.das
     tests/language/_distinct_fixture.das
     tests/language/_glob.das
     tests/language/_helper_foo.das
@@ -566,6 +586,63 @@ target_include_directories(test_aot_subset PRIVATE ${TEST_AOT_INCLUDE_DIRS})
 target_compile_definitions(test_aot_subset PRIVATE ${TEST_AOT_COMPILE_DEFS})
 SETUP_CPP11(test_aot_subset)
 
+### AOT bench host — the nightly benchmark stand's aot lane
+# Every benchmark under benchmarks/ (its `_*` helper modules as libs) over the full daslib closure
+# and the module daslibs the benchmarks require. benchmarks/compile/ stays out: it times a child
+# daslang, and the host it runs in changes nothing about the child. EXCLUDE_FROM_ALL: the stand
+# builds it (`run_bench_stand`); no CI lane does.
+FILE(GLOB_RECURSE AOT_BENCH_ALL RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "benchmarks/*.das")
+# _update_results.das is the results.md sweep tool, a script beside the sql benchmarks, not a module
+list(FILTER AOT_BENCH_ALL EXCLUDE REGEX "benchmarks/compile/|/tests/|/_update_results\\.das$")
+IF(DAS_SQLITE_DISABLED)
+    list(FILTER AOT_BENCH_ALL EXCLUDE REGEX "benchmarks/sql/")
+ENDIF()
+IF(DAS_AUDIO_DISABLED)
+    list(FILTER AOT_BENCH_ALL EXCLUDE REGEX "benchmarks/audio/")
+ENDIF()
+IF(DAS_TERMINAL_DISABLED)
+    list(FILTER AOT_BENCH_ALL EXCLUDE REGEX "benchmarks/terminal/")
+ENDIF()
+IF(DAS_PUGIXML_DISABLED)
+    list(FILTER AOT_BENCH_ALL EXCLUDE REGEX "benchmarks/micro/json_source_shapes\\.das$")
+ENDIF()
+SET(AOT_BENCH_FILES ${AOT_BENCH_ALL})
+list(FILTER AOT_BENCH_FILES EXCLUDE REGEX "/_")
+SET(AOT_BENCH_MODULE_FILES ${AOT_BENCH_ALL})
+list(FILTER AOT_BENCH_MODULE_FILES INCLUDE REGEX "/_")
+IF(NOT DAS_TERMINAL_DISABLED)
+    list(APPEND AOT_BENCH_MODULE_FILES modules/dasTerminal/daslib/terminal.das)
+ENDIF()
+add_custom_target(test_aot_bench_modules)
+set(BENCH_MODULES_AOT_GENERATED_SRC)
+DAS_AOT_LIB("${AOT_BENCH_MODULE_FILES}" BENCH_MODULES_AOT_GENERATED_SRC test_aot_bench_modules daslang)
+add_custom_target(test_aot_bench_files)
+set(BENCH_AOT_GENERATED_SRC)
+DAS_AOT("${AOT_BENCH_FILES}" BENCH_AOT_GENERATED_SRC test_aot_bench_files daslang)
+SET(TEST_AOT_BENCH_MODULE_SRC ${DASLIB_MODULES_AOT_GENERATED_SRC})
+SET(TEST_AOT_BENCH_MODULE_TARGETS test_aot_daslib_modules)
+FOREACH(_m dassqlite pugixml strudel)
+    string(TOUPPER ${_m} _u)
+    IF(TARGET test_aot_${_m}_modules)
+        list(APPEND TEST_AOT_BENCH_MODULE_SRC ${${_u}_MODULES_AOT_GENERATED_SRC})
+        list(APPEND TEST_AOT_BENCH_MODULE_TARGETS test_aot_${_m}_modules)
+    ENDIF()
+ENDFOREACH()
+add_executable(test_aot_bench EXCLUDE_FROM_ALL ${DAS_DASCRIPT_MAIN_SRC}
+    ${TESTING_AOT_GENERATED_SRC}
+    ${TEST_AOT_BENCH_MODULE_SRC}
+    ${BENCH_MODULES_AOT_GENERATED_SRC}
+    ${BENCH_AOT_GENERATED_SRC}
+)
+TARGET_LINK_LIBRARIES(test_aot_bench libDaScriptAot ${SRC_LIBRARIES} ${DAS_MODULES_LIBS})
+ADD_DEPENDENCIES(test_aot_bench libDaScriptAot
+    test_aot_testing ${TEST_AOT_BENCH_MODULE_TARGETS}
+    test_aot_bench_modules test_aot_bench_files
+)
+target_include_directories(test_aot_bench PRIVATE ${TEST_AOT_INCLUDE_DIRS})
+target_compile_definitions(test_aot_bench PRIVATE ${TEST_AOT_COMPILE_DEFS})
+SETUP_CPP11(test_aot_bench)
+
 ### LLVM-AOT variant of test_aot (LLVM-only). Each .das is compiled by the LLVM backend into a
 ### self-registering native .o (das_aot_register load ctor) linked directly into the binary;
 ### -use-aot binds each function as a SimNode_Jit via linkCppAot. Opt-in, not in ALL / not in CI.
@@ -576,7 +653,9 @@ if(NOT ${DAS_LLVM_DISABLED})
     # binds every function (a miss is a hard error under --use-aot). The JIT backend already compiles
     # all of tests/ (run_tests_jit is green), so --aot-object emits them too.
     FILE(GLOB _llvm_aot_jit_tests RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/tests/jit_tests/*.das")
-    set(LLVM_AOT_TEST_FILES ${TEST_AOT_ALL_DAS} ${_llvm_aot_jit_tests})
+    FILE(GLOB_RECURSE _llvm_aot_benches RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/benchmarks/*.das")
+    list(FILTER _llvm_aot_benches EXCLUDE REGEX "benchmarks/(sql|terminal)/")
+    set(LLVM_AOT_TEST_FILES ${TEST_AOT_ALL_DAS} ${_llvm_aot_jit_tests} ${_llvm_aot_benches})
     list(REMOVE_DUPLICATES LLVM_AOT_TEST_FILES)
     # _-prefixed helpers and negative/fixture tests.
     list(FILTER LLVM_AOT_TEST_FILES EXCLUDE REGEX "/_")
@@ -585,7 +664,9 @@ if(NOT ${DAS_LLVM_DISABLED})
     list(FILTER LLVM_AOT_TEST_FILES EXCLUDE REGEX "/(cant_|llvm_tune|llvm_code|llvm_compile_only|dll_cache|jit_fastpath|typeinfo)|_solid\\.das$")
     # msl/metal exercise 16/8-bit lattice + simdgroup ops the LLVM JIT declines (lattice_fallback in
     # llvm_jit.das) — they interpret, so they have no emitted object; keep them out of the AOT rail.
-    list(FILTER LLVM_AOT_TEST_FILES EXCLUDE REGEX "tests/(msl|metal)/")
+    # spirv joins them on the fp16 side: aarch64 lowers the lattice natively (g_lattice_fp16_ops_native),
+    # so both sides keep those functions AOT-able and their hashes then disagree - error[50101], arm only.
+    list(FILTER LLVM_AOT_TEST_FILES EXCLUDE REGEX "tests/(msl|metal|spirv)/")
 
     set(LLVM_AOT_TEST_LIST ${PROJECT_BINARY_DIR}/llvm_aot_corpus.txt)
     set(_llvm_aot_list_text "")
@@ -594,9 +675,14 @@ if(NOT ${DAS_LLVM_DISABLED})
     endforeach()
     file(WRITE ${LLVM_AOT_TEST_LIST} "${_llvm_aot_list_text}")
 
+    FILE(GLOB _llvm_aot_harness RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/dastest/*.das")
+    set(LLVM_AOT_OBJECT_FILES ${LLVM_AOT_TEST_FILES} ${_llvm_aot_harness} ${AotDaslibList})
+    list(REMOVE_ITEM LLVM_AOT_OBJECT_FILES daslib/json_boost.das daslib/regex_boost.das)
+    list(REMOVE_DUPLICATES LLVM_AOT_OBJECT_FILES)
+
     add_custom_target(test_llvm_aot_corpus)
     SET(LLVM_AOT_GENERATED_OBJ)
-    DAS_LLVM_AOT_LIB("${LLVM_AOT_TEST_FILES}" LLVM_AOT_GENERATED_OBJ test_llvm_aot_corpus)
+    DAS_LLVM_AOT_LIB("${LLVM_AOT_OBJECT_FILES}" LLVM_AOT_GENERATED_OBJ test_llvm_aot_corpus)
 
     # Same main.cpp as daslang / test_aot; the .o are pre-built external inputs (EXTERNAL_OBJECT),
     # so the C++ toolchain links them without recompiling.

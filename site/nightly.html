@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Nightly benchmarks · daslang</title>
+    <meta name="description" content="Every [benchmark] in the daslang repository, run every night on one box over the interpreter, JIT and AOT lanes and plotted over commits — what moved, what failed, and the record behind every point." />
+    <meta name="keywords" content="daslang, nightly benchmarks, performance over time, interpreter, JIT, AOT, regression" />
+    <link rel="canonical" href="https://daslang.io/nightly.html" />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://daslang.io/nightly.html" />
+    <meta property="og:site_name" content="daslang" />
+    <meta property="og:title" content="Nightly benchmarks — every arm, every night, over commits" />
+    <meta property="og:description" content="Every [benchmark] in the repository, run nightly on one box across interpreter, JIT and AOT, plotted over commits." />
+    <meta name="twitter:card" content="summary" />
+
+    <link rel="icon" type="image/svg+xml" href="files/daslang-favicon.svg" />
+    <link rel="alternate icon" type="image/x-icon" href="files/daslang.ico" />
+    <link rel="alternate" type="application/atom+xml" title="Daslang blog" href="blog/feed.xml" />
+<link rel="stylesheet" href="files/fonts/fonts.css"/>
+    <link rel="stylesheet" href="files/forge.css" />
+    <link rel="stylesheet" href="files/nav-dropdown.css" />
+
+    <!-- Analytics -->
+    <script data-goatcounter="https://borisbat.goatcounter.com/count"
+            async src="//gc.zgo.at/count.js"></script>
+
+    <!-- Algolia DocSearch -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@docsearch/css@3" />
+    <link rel="stylesheet" href="files/docsearch.css" />
+    <script src="https://cdn.jsdelivr.net/npm/@docsearch/js@3" defer></script>
+    <script src="files/docsearch.js" defer></script>
+
+<style>
+  /* ── nightly page (nb-*), built on Forge tokens; the viewer itself is /bench/style.css ── */
+  .nb-hero__badge {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-family: var(--font-mono); font-size: 11.5px; letter-spacing: 0.04em;
+    color: var(--amber); border: 1px solid var(--amber-dim); border-radius: 999px;
+    padding: 5px 12px; margin-bottom: 26px;
+  }
+  .nb-hero__badge .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--amber); }
+  .nb-status { margin-top: 26px; min-height: 28px; }
+  .nb-how { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0 28px; margin: 26px 0 4px; }
+  .nb-how > div { border-top: 1px solid var(--rule); padding: 12px 0 0; }
+  .nb-how dt { font-family: var(--font-mono); font-size: 11.5px; color: var(--amber); margin-bottom: 5px; }
+  .nb-how dd { margin: 0 0 18px; font-size: 13px; line-height: 1.5; color: var(--fg-dim); }
+  .nb-how code { font-family: var(--font-mono); font-size: 11.5px; color: var(--fg); }
+  .forge-p--wide { max-width: 780px; }
+  @media (max-width: 900px) { .nb-how { grid-template-columns: 1fr; } }
+</style>
+<link rel="stylesheet" href="/bench/style.css" />
+</head>
+<body>
+<div class="forge-page">
+
+    <!-- ───── Nav ───── -->
+    <nav class="forge-nav">
+        <div class="forge-container forge-nav__inner">
+            <div class="forge-nav__left">
+                <a class="forge-mark" href="/">
+                    <span class="forge-mark__glyph" aria-hidden="true"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="currentColor" d="M 19,2 C 6.848484,12.699956 12.591844,7.4593088 6.8243462,13.056243 16.852307,10.274014 6.8079126,19.737584 5,22 L 17.120536,11.596175 C 6.7139271,14.121239 17.627482,3.775356 19,2 Z m -7,1 c -5,0 -9,4 -9,9 0,2.5 0.9875,4.80625 2.6875,6.40625 L 7.09375,17 C 5.79375,15.8 5,14 5,12 5,8.1 8.1,5 12,5 12.4,5 12.69375,4.99375 13.09375,5.09375 L 14.8125,3.40625 C 13.9125,3.20625 13,3 12,3 Z M 18.3125,5.59375 16.90625,7 C 18.20625,8.2 19,10 19,12 c 0,3.9 -3.1,7 -7,7 -0.4,0 -0.69375,0.0063 -1.09375,-0.09375 L 9.1875,20.59375 C 10.0875,20.79375 11,21 12,21 c 5,0 9,-4 9,-9 0,-2.5 -0.9875,-4.80625 -2.6875,-6.40625 z"/></svg></span>
+                    <span>daslang</span>
+                    <span class="forge-mark__tld">.io</span>
+                </a>
+                <div class="forge-nav__links">
+                    <a href="doc/index.html">docs</a>
+                    <a href="/playground/">playground</a>
+                    <a href="/examples.html">examples</a>
+                    <div class="forge-nav__group">
+                        <button class="forge-nav__trigger" type="button">performance <span class="forge-nav__chev">▾</span></button>
+                        <div class="forge-nav__menu">
+                            <a href="benchmarks.html"><span class="forge-nav__menu-label">cross-language</span><span class="forge-nav__menu-desc">The full suite — every runtime, every test, per platform.</span></a>
+                            <a href="/#benchmarks"><span class="forge-nav__menu-label">highlights</span><span class="forge-nav__menu-desc">The headline numbers, on the front page.</span></a>
+                            <a href="performance.html"><span class="forge-nav__menu-label">data queries</span><span class="forge-nav__menu-desc">One linq chain, six data sources — interp &amp; JIT.</span></a>
+                            <a href="nightly.html" class="is-active"><span class="forge-nav__menu-label">nightly <span class="forge-nav__menu-new">NEW</span></span><span class="forge-nav__menu-desc">Every benchmark, every night, over commits.</span></a>
+                            <a href="dasllama.html"><span class="forge-nav__menu-label">dasLLAMA</span><span class="forge-nav__menu-desc">CPU LLM + speech-to-text, das vs llama.cpp.</span></a>
+                        </div>
+                    </div>
+                    <div class="forge-nav__group">
+                        <button class="forge-nav__trigger" type="button">ecosystem <span class="forge-nav__chev">▾</span></button>
+                        <div class="forge-nav__menu">
+                            <a href="daspkg.html"><span class="forge-nav__menu-label">daspkg</span><span class="forge-nav__menu-desc">The package manager that compiles in.</span></a>
+                            <a href="downloads.html"><span class="forge-nav__menu-label">downloads</span><span class="forge-nav__menu-desc">Pre-built binaries &amp; source.</span></a>
+                        </div>
+                    </div>
+                    <div class="forge-nav__group">
+                        <button class="forge-nav__trigger" type="button">community <span class="forge-nav__chev">▾</span></button>
+                        <div class="forge-nav__menu">
+                            <a href="/blog/"><span class="forge-nav__menu-label">blog</span><span class="forge-nav__menu-desc">Release notes &amp; deep dives.</span></a>
+                            <a href="/#news"><span class="forge-nav__menu-label">news</span><span class="forge-nav__menu-desc">Latest releases &amp; ecosystem activity.</span></a>
+                            <a href="https://t.me/daScript"><span class="forge-nav__menu-label">telegram</span><span class="forge-nav__menu-desc">Chat with the daslang team.</span></a>
+                            <a href="https://github.com/GaijinEntertainment/daScript"><span class="forge-nav__menu-label">github</span><span class="forge-nav__menu-desc">Source, issues &amp; releases.</span></a>
+                            <a href="changelist.html"><span class="forge-nav__menu-label">change list</span><span class="forge-nav__menu-desc">Every release, version by version.</span></a>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="forge-nav__right">
+                <button class="forge-nav__burger" type="button" aria-label="menu"
+                    onclick="this.closest('.forge-nav').classList.toggle('is-open')">≡</button>
+                <a class="forge-nav__gh" href="https://github.com/GaijinEntertainment/daScript">GitHub <span class="forge-nav__gh-stars" data-github-star></span></a>
+                <span class="forge-nav__version">v0.6.4</span>
+                <div id="docsearch"></div>
+            </div>
+        </div>
+    </nav>
+
+    <!-- ───── Hero ───── -->
+    <section class="forge-hero">
+        <div class="forge-container">
+            <span class="nb-hero__badge"><span class="dot"></span>benchmark stand · nightly</span>
+            <h1>Every benchmark. Every night. <em>Over every commit.</em></h1>
+            <p class="forge-hero__lede forge-p--wide">
+                One box checks out master each night, builds it, and runs every <code>[benchmark]</code>
+                file in the repository in the interpreter, JIT and AOT lanes. Each arm becomes a point
+                on its own chart, with a band for the night's spread. Nothing here is
+                curated — what failed and what moved is on the page, and every point links to the
+                run record behind it.
+            </p>
+            <div class="stand nb-status"><div class="top__status" id="status"></div></div>
+            <div class="forge-hero__ctas">
+                <a class="forge-btn-primary" href="#series">$ view the charts →</a>
+                <a class="forge-btn-secondary" href="#method">how to read it</a>
+            </div>
+        </div>
+    </section>
+
+    <!-- § 01 the stand -->
+    <section class="forge-section forge-section--alt" id="stand-section">
+        <div class="forge-container">
+            <div class="forge-section-label"><span class="forge-section-label__num">§ 01</span><span class="forge-section-label__rule"></span><span>last night</span></div>
+            <div class="stand" id="stand"></div>
+        </div>
+    </section>
+
+    <!-- § 02 how to read it -->
+    <section class="forge-section" id="method">
+        <div class="forge-container">
+            <div class="forge-section-label"><span class="forge-section-label__num">§ 02</span><span class="forge-section-label__rule"></span><span>how to read it</span></div>
+            <h2 class="forge-h2">One box, one binary per night, one record behind every point.</h2>
+            <dl class="nb-how">
+                <div>
+                    <dt>the point</dt>
+                    <dd>One arm of a <code>dastest --bench</code> run, reduced over the night's repeats as <a class="forge-link-amber" href="https://github.com/GaijinEntertainment/daScript/blob/master/utils/internal/bench-stand/README.md#2-data-model">the stand's data model</a> defines the recorded value and its spread. The band around the line is that spread, so a wide band is a noisy night, not a slow one.</dd>
+                </div>
+                <div>
+                    <dt>the lanes</dt>
+                    <dd><code>interp</code> is the interpreter, <code>jit</code> the LLVM JIT, <code>aot</code> the linked ahead-of-time build. A lane a file does not run in is listed as skipped with its reason - a skip is visible debt, never a silent gap.</dd>
+                </div>
+                <div>
+                    <dt>the verdict</dt>
+                    <dd>The stand publishes the series and leaves the judgement to a person. The record behind each night carries the commit, the machine, the build, and every file's exit and log tail; <code>benchctl compare</code> answers whether two commits differ, with a Welch test over the samples.</dd>
+                </div>
+            </dl>
+            <p class="forge-p forge-p--wide">The whole stand is <a class="forge-link-amber" href="https://github.com/GaijinEntertainment/daScript/tree/master/utils/internal/bench-stand">utils/internal/bench-stand</a> in the repository: the runner, the report, and this viewer. A new benchmark joins the night by living under <code>benchmarks/</code>.</p>
+        </div>
+    </section>
+
+    <footer class="forge-footer">
+        <div class="forge-container forge-footer__grid">
+            <div>
+                <a class="forge-mark" href="/">
+                    <span class="forge-mark__glyph" aria-hidden="true"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="currentColor" d="M 19,2 C 6.848484,12.699956 12.591844,7.4593088 6.8243462,13.056243 16.852307,10.274014 6.8079126,19.737584 5,22 L 17.120536,11.596175 C 6.7139271,14.121239 17.627482,3.775356 19,2 Z m -7,1 c -5,0 -9,4 -9,9 0,2.5 0.9875,4.80625 2.6875,6.40625 L 7.09375,17 C 5.79375,15.8 5,14 5,12 5,8.1 8.1,5 12,5 12.4,5 12.69375,4.99375 13.09375,5.09375 L 14.8125,3.40625 C 13.9125,3.20625 13,3 12,3 Z M 18.3125,5.59375 16.90625,7 C 18.20625,8.2 19,10 19,12 c 0,3.9 -3.1,7 -7,7 -0.4,0 -0.69375,0.0063 -1.09375,-0.09375 L 9.1875,20.59375 C 10.0875,20.79375 11,21 12,21 c 5,0 9,-4 9,-9 0,-2.5 -0.9875,-4.80625 -2.6875,-6.40625 z"/></svg></span>
+                    <span>daslang</span>
+                    <span class="forge-mark__tld">.io</span>
+                </a>
+                <div class="forge-footer__about">
+                    High-performance scripting for C++.<br />
+                    © 2018–2026 Gaijin Entertainment · BSD 3-Clause
+                </div>
+            </div>
+            <div>
+                <div class="forge-footer__col-head">performance</div>
+                <a class="forge-footer__link" href="benchmarks.html">cross-language</a>
+                <a class="forge-footer__link" href="/#benchmarks">highlights</a>
+                <a class="forge-footer__link" href="performance.html">data queries</a>
+                <a class="forge-footer__link" href="nightly.html">nightly</a>
+                <a class="forge-footer__link" href="dasllama.html">dasLLAMA</a>
+            </div>
+            <div>
+                <div class="forge-footer__col-head">ecosystem</div>
+                <a class="forge-footer__link" href="daspkg.html">daspkg · package index</a>
+                <a class="forge-footer__link" href="/playground/">playground</a>
+                <a class="forge-footer__link" href="https://edenspark.io">edenspark · games on daslang</a>
+                <a class="forge-footer__link" href="https://github.com/profelis/daScript-plugin">vs code extension</a>
+            </div>
+            <div>
+                <div class="forge-footer__col-head">community</div>
+                <a class="forge-footer__link" href="https://t.me/daScript">telegram</a>
+                <a class="forge-footer__link" href="https://github.com/GaijinEntertainment/daScript">github</a>
+                <a class="forge-footer__link" href="changelist.html">change list</a>
+                <a class="forge-footer__link" href="downloads.html">downloads</a>
+            </div>
+            <div>
+                <div class="forge-footer__col-head">legal</div>
+                <a class="forge-footer__link" href="https://legal.gaijin.net/termsofservice">terms of service</a>
+                <a class="forge-footer__link" href="https://legal.gaijin.net/privacypolicy">privacy policy</a>
+                <a class="forge-footer__link" href="https://github.com/GaijinEntertainment/daScript/blob/master/LICENSE">bsd 3-clause license</a>
+            </div>
+        </div>
+    </footer>
+
+</div>
+<script src="/bench/app.js" defer></script>
+<script src="files/github-star.js" defer></script>
+<script src="files/blog-counter.js" defer></script>
+<script src="files/news-counter.js" defer></script>
+</body>
+</html>

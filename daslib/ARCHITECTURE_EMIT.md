@@ -4,6 +4,13 @@ Companion to `ARCHITECTURE.md` in this folder; section numbers are unique across
 
 ## 5. aot_cpp
 
+- **`addr()` of a block local erases its type**: `preVisitExprRef2Ptr` writes
+  `das_ref(__context__, <expr>)` and the address goes on as `void *`, and a block literal is
+  a local of a `das_make_block<...>` type (`emitBlockLet`), whose `Block` base is not at
+  offset 0 - `das_make_block_base : Block, SimNode_ClosureBlock` puts the polymorphic base
+  first. So `das_ref` in `include/daScript/simulate/aot.h` returns the `Block` subobject for a
+  `Block`-derived type; the C++ data walker reads that address as a `Block`. The pair moves
+  together; nothing but the full `test_aot` lane fails on a mismatch.
 - **C++ identifier mangling**: `aotSuffixNameEx` prepends `_S`/`_E`/`_V`/`_f_` when a das
   name is a C++ keyword, holds a non-alnum char, or is `DELETE` (winnt.h). Structs and
   enums share ONE C++ namespace while daslang keeps separate tables, so `struct X` +
@@ -169,10 +176,13 @@ Companion to `ARCHITECTURE.md` in this folder; section numbers are unique across
   struct, enum and handled type; a program that reaches no C++ module beyond the builtin one
   links exactly that set. A nano program reaches none by contract (every builtin module is
   absent there), so its output stays registry-free.
-  Once it reaches one, the default C++ modules the compiler loaded and every linked C++
-  module's `module_for_each_dependency` closure join the set, because module constructors
-  `Module::require` those by name (dasHV takes `rtti_core` this way). The pruned modules
-  (`compile time only, not linked`) get no `aotRequire` include and no registration.
+  Once it reaches one, every linked C++ module's `module_for_each_dependency` closure joins
+  the set, because module constructors `Module::require` those by name (dasHV takes
+  `rtti_core` this way). A default C++ module the program never reaches stays out, however
+  the compiler loaded it: a macro module's `daslib/ast` brings `rtti_core` and `ast_core`
+  into the compiler, and a context that registered them ran two constructors and carried
+  their code for nothing. The pruned modules (`compile time only, not linked`) get no
+  `aotRequire` include and no registration.
   `standaloneModuleRegistration` orders the C++ subset and ranks it: `DEFAULT_MODULE_ORDER`
   first (the pair it mirrors is recorded in sec. 5), then the rest dependencies-first, ranked
   by dependency depth. Each generated TU emits its list as a `StandaloneModule` table added to

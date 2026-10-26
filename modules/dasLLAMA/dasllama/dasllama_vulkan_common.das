@@ -313,7 +313,8 @@ let DN_SM_WNORM = DN_SM_TAPS + DN_MAX_CD * DN_MAX_DCONV
 let DN_SM_A = DN_SM_WNORM + DN_MAX_DS
 let DN_SM_DT = DN_SM_A + DN_MAX_HEADS
 let DN_SM_HIST = DN_SM_DT + DN_MAX_HEADS
-let DN_SMALLS_BYTES = (DN_SM_HIST + DN_MAX_CD * (DN_MAX_DCONV - 1l) + 64l) * 4l
+let DN_SM_SLACK = 64l   //! floats past the last ring image, so a ring's last row never sits at the buffer's end
+let DN_SMALLS_BYTES = (DN_SM_HIST + DN_MAX_CD * (DN_MAX_DCONV - 1l) + DN_SM_SLACK) * 4l
 let DN_TAIL_BYTES = DN_MAX_CD * (DN_MAX_DCONV - 1l) * 4l
 
 // decode-step scratch: the raw β/γ staging (+ the ring parity word) and the o-row Q8_0 image
@@ -323,6 +324,7 @@ let DND_BG_BYTES = (2l * DN_MAX_HEADS + 4l) * 4l
 let DND_OQ_BYTES = DN_MAX_HEADS * DN_MAX_DS
 let DND_OS_BYTES = (DN_MAX_HEADS * DN_MAX_DS / 32l) * 4l
 let DND_SMALLS_BYTES = DN_SMALLS_BYTES + DN_MAX_CD * (DN_MAX_DCONV - 1l) * 4l
+let TOK_META_BYTES = 32l   //! one TokMeta row (the kernels index the block by row)
 
 // heat-cache pool stacks live in a SYNTHETIC element-offset space far above any real plane
 // offset, so find_stack / fill_stack_sched_rows / the whole FFN GEMV rail run verbatim on them
@@ -511,8 +513,11 @@ struct DnStep {
     s_qkv : int
     s_z : int
     s_o : int
-    state_bytes : int64
-    ring_bytes : int64
+    slot_state_bytes : int64
+    ring_image_bytes : int64
+    smalls_bytes : int64
+    state_byte_off : int64
+    hist_off : int64 = DN_SM_HIST   //! floats: this slot's ring pair, the parity image ring_image_bytes past it
     parity : int             // ring image holding current history (the kernel writes the other)
     tok : HostBuf            // the step's TokMeta block (parity, host-poked per step)
     valid : bool
@@ -799,19 +804,17 @@ def dev_raw : VkDevice {
 // ~100x SLOWER CPU reads) and host-cached. Buffers the CPU reads back (the y planes) MUST be
 // cached — a 33MB memcpy out of a WC mapping measured ~400ms/layer at pp512
 def find_host_mem(type_bits : uint; cached : bool) : uint {
-    if (cached) {
-        var mp : VkPhysicalDeviceMemoryProperties
-        vkGetPhysicalDeviceMemoryProperties(g_gpu.phys, mp)
-        for (i in range(int(mp.memoryTypeCount))) {
-            let fl = mp.memoryTypes[i].propertyFlags
-            if ((type_bits & (1u << uint(i))) != 0u && fl.host_visible && fl.host_coherent && fl.host_cached) {
-                return uint(i)
-            }
-        }
-    }
     var want : VkMemoryPropertyFlags
     want.host_visible = true
     want.host_coherent = true
+    if (cached) {
+        var want_cached = want
+        want_cached.host_cached = true
+        let i = try_find_memory_type(g_gpu.phys, type_bits, want_cached)
+        if (i >= 0) {
+            return uint(i)
+        }
+    }
     return find_memory_type(g_gpu.phys, type_bits, want)
 }
 
@@ -964,11 +967,8 @@ def destroy_host_buf(hb : HostBuf) {   // vkFreeMemory implicitly unmaps
     g_gpu.host_bytes -= hb.bytes
 }
 
-def nonowning_buf(h : uint64) : Buffer {
-    var b : Buffer
-    b._vk = h
-    return b
-}
+//! a raw buffer handle as a boost `Buffer` the finalizer leaves alone (the handle stays the tier's)
+def nonowning_buf(h : uint64) : Buffer => vk_value_to_boost(unsafe(reinterpret<VkBuffer>(h)))
 
 [arch(at="../ARCHITECTURE_GPU_VULKAN_GEMM.md#cm2-tile-pick-and-default")]
 def resolve_coopmat_mode(has_cm, has_cm2 : bool) : int {
@@ -1176,14 +1176,14 @@ def public vk_ext_roster(phys : VkPhysicalDevice) : array<VkExtEntry> {
         VkExtEntry(name = "VK_KHR_shader_integer_dot_product", present = integer_dot_product_supported(phys),
             rides = "the sdot4 integer tiles and the quant dot kernels; the tier is disabled without it"),
         VkExtEntry(name = "VK_KHR_cooperative_matrix", present = has_cm,
-            rides = "the KHR f16 and int8 tiles (the mm mode), the resident MoE block's expert pieces in mm mode, the KHR flash tile and its sink stamps, the KHR f16 GEMM off cm2 (at subgroup 32), and the h128 attention twin; without it the sdot4 tiles and the chunked attention serve, and a MoE stays per op in mm mode"),
+            rides = "the KHR f16 and int8 tiles (the mm mode), the resident MoE block's expert pieces in mm mode, the KHR flash tile and its sink stamps, the KHR f16 GEMM off cm2 (at subgroup 32), the h128 attention twin, and the vision tower driver's KHR route (its bidirectional flash tiles and the qwen25v f16 GEMM off cm2); without it the sdot4 tiles and the chunked attention serve, a MoE stays per op in mm mode, and the tower driver declines `device` off cm2"),
         VkExtEntry(name = "VK_NV_cooperative_matrix2 (workgroup scope, flexible dimensions, tensor addressing, block loads, bufferDeviceAddress)",
             present = has_cm2,
             rides = "the cm2 decode-in-load prefill tiles, the served default; without it the KHR tiles serve (DASLLAMA_COOPMAT picks a mode by name)"),
         VkExtEntry(name = "VK_NV_cooperative_matrix2 reductions, conversions and per-element operations",
             present = has_cm2 && cooperative_matrix2_fa_supported(phys),
             knob = "DASLLAMA_COOPMAT", off = resolve_coopmat_mode(has_cm, has_cm2) != COOPMAT_CM2,
-            rides = "the cm2 flash-attention stamps, on a device created in cm2 mode; without them the KHR flash tile serves at subgroup 32, and the h128 twin and the chunked attention tiles where it declines"),
+            rides = "the cm2 flash-attention stamps, on a device created in cm2 mode, and the vision tower driver's cm2 route (its bidirectional flash tiles); without them the KHR flash tile serves at subgroup 32, the h128 twin and the chunked attention tiles where it declines, and the tower driver takes its KHR route"),
         VkExtEntry(name = "VK_NV_cooperative_matrix_decode_vector", present = has_cm2 && cooperative_matrix2_decode_vector_supported(phys),
             knob = "DASLLAMA_VK_DECVEC", off = !g_env_vulkan.vk_decvec || resolve_coopmat_mode(has_cm, has_cm2) != COOPMAT_CM2,
             rides = "the cm2 tiles' four-wide decode callback; without it the scalar callback serves and a MoE prefill window runs about half again as long"),
@@ -1207,7 +1207,7 @@ def public vk_ext_roster(phys : VkPhysicalDevice) : array<VkExtEntry> {
             knob = "DASLLAMA_VK_REBAR", off = !g_env_vulkan.vk_rebar,
             rides = "uploads write straight into VRAM; without it every upload stages through host memory"),
         VkExtEntry(name = "maxStorageBufferRange", present = props.limits.maxStorageBufferRange > 0u,
-            rides = "one side of the whole-model driver's K/V mirror binds as one range ({int(props.limits.maxStorageBufferRange >> 20u)} MiB here): every stream's region shares it, so the region count divides each stream's context; a mirror past it declines the driver and the per-op tier serves"),
+            rides = "one side of the whole-model driver's K/V mirror binds as one range ({int(props.limits.maxStorageBufferRange >> 20u)} MiB here): every stream's region shares it, so the region count divides each stream's context; a mirror past it declines the driver and the per-op tier serves; the vision tower driver binds a tower's gathered weights and its largest scratch buffer as one range each, and declines `shape` past it"),
         VkExtEntry(name = "maxComputeSharedMemorySize of 33024 B or more", present = props.limits.maxComputeSharedMemorySize >= 33024u,
             rides = "the 8192-float row slabs of the add+rms family and the prefill-attention prep ({int(props.limits.maxComputeSharedMemorySize)} B here); without them the deltanet and prefill-attention chains stay on the CPU rail"),
         VkExtEntry(name = "VK_NV_cooperative_vector", present = cooperative_vector_supported(phys),
@@ -1318,20 +1318,14 @@ def vk_moe_init : bool {
         xpci.queueFamilyIndex = uint(xfam)
         xpci.flags.reset_command_buffer = true
         g_gpu.xfer_pool <- create_command_pool(g_gpu.device, xpci)
-        var xai = VkCommandBufferAllocateInfo()
-        xai.commandPool = boost_value_to_vk(g_gpu.xfer_pool)
-        xai.level = VkCommandBufferLevel.PRIMARY
-        xai.commandBufferCount = 1u
+        g_gpu.xfer_cmd = alloc_cmd_in(g_gpu.xfer_pool)
         var tci = VkSemaphoreTypeCreateInfo()
         tci.semaphoreType = VkSemaphoreType.TIMELINE
         tci.initialValue = 0ul
         var sci = VkSemaphoreCreateInfo()
-        unsafe {
-            vk_check(vkAllocateCommandBuffers(dev_raw(), xai, addr(g_gpu.xfer_cmd)), null)
-            sci.pNext = addr<void?>(tci)
-            vk_check(vkCreateSemaphore(dev_raw(), sci, null, g_gpu.xfer_sem), null)
-            vk_check(vkCreateSemaphore(dev_raw(), sci, null, g_gpu.cmp_sem), null)
-        }
+        sci.pNext = unsafe(addr<void?>(tci))
+        vk_check(vkCreateSemaphore(dev_raw(), sci, null, g_gpu.xfer_sem), null)
+        vk_check(vkCreateSemaphore(dev_raw(), sci, null, g_gpu.cmp_sem), null)
         to_log(LOG_INFO, "dasLLAMA vulkan tier: transfer queue armed (family {xfam})\n")
     }
     g_gpu.has_memprio = (g_gpu.has_coopmat && memory_priority_supported(g_gpu.phys)
@@ -1509,7 +1503,7 @@ def write_buf_desc(var writes : array<WriteDescriptorSet>; set_ : VkDescriptorSe
 
 // weight plane byte sizes for one [rows x n] stack in the tier's device layout
 def stack_plane_bytes(n, rows : int64; fmt : int) : tuple<wq : int64; ws : int64> {
-    let nb = arena_blocks_for(n, rows, fmt)   // strides live in arena_block_bytes — one source
+    let nb = kq_blocks_for(n, rows, fmt)
     let bb = arena_block_bytes(fmt)
     return (wq = nb * bb.wq, ws = nb * bb.ws)
 }
@@ -1711,7 +1705,7 @@ def vk_moe_stream_stack(wq : uint8 const?; ws : uint8 const?; woff : int64; n, r
 // probe — a divergent copy would desync the baked plan at the refusal boundary.
 // 0 = accept, 1 = VRAM budget, 2 = descriptor capacity, 3 = unplaceable row length.
 def vk_moe_resident_verdict(n, rows : int64; fmt : int) : int {
-    if (!arena_rows_ok(n, fmt)) {   // must precede stack_plane_bytes — its block math asserts
+    if (!kq_rows_ok(n, fmt)) {   // must precede stack_plane_bytes - its block math asserts
         return 3
     }
     let pb = stack_plane_bytes(n, rows, fmt)
@@ -1737,8 +1731,8 @@ def vk_moe_upload_stack(wq : uint8 const?; ws : uint8 const?; woff : int64; n : 
     if (!vk_moe_init()) {
         return false
     }
-    if (!arena_rows_ok(n, fmt)) {   // unplaceable row length: this stack stays on the CPU
-        to_log(LOG_WARNING, "dasLLAMA vulkan tier: stack at {woff} declined - row length {n} is not a {fmt_unit(fmt)}-block multiple (fmt {fmt})\n")
+    if (!kq_rows_ok(n, fmt)) {
+        to_log(LOG_WARNING, "dasLLAMA vulkan tier: stack at {woff} declined - row length {n} is not a {kq_unit(fmt)}-block multiple (fmt {fmt})\n")
         return false
     }
     if (stream) {
@@ -1807,12 +1801,54 @@ def private arena_drop_shells {
     g_gpu.arenas |> clear()
 }
 
+var private g_vk_drop_hooks : array<function<() : void>>
+
+//! The Vulkan drivers' decline counter: `counts` by reason name (the gates read deltas on them), `total` over every reason,
+//! and the log said once per (who, reason) in the words the caller passes - `who` names the driver and its model family.
+struct VkDeclineCounter {
+    counts : table<string; int64>
+    total : int64
+    said : table<string>
+}
+
+//! Count `reason` for `who`, say it once in `words` (the reason name when empty); answers false so a decline site returns it.
+[cold_path]
+def note(var c : VkDeclineCounter; who, reason : string; words : string = "") : bool {
+    c.counts[reason] = (c.counts?[reason] ?? 0l) + 1l
+    c.total++
+    let key = "{who}/{reason}"
+    if (!key_exists(c.said, key)) {
+        c.said |> insert(key)
+        to_log(LOG_INFO, "dasLLAMA vulkan: {who} declined - {empty(words) ? reason : words}\n")
+    }
+    return false
+}
+
+//! Forget what was said for `who`: the next decline of each reason logs again (a driver calls it as a new model arrives).
+[cold_path]
+def unsay(var c : VkDeclineCounter; who : string) {
+    let prefix = "{who}/"
+    var gone <- [for (k in keys(c.said)); k; where starts_with(k, prefix)]
+    for (k in gone) {
+        c.said |> erase(k)
+    }
+}
+
+//! A driver whose device objects the model drop sweeps (every buffer and descriptor set is model-owned) registers a hook
+//! that forgets its handles; the sweep runs it before the objects die, and the driver rebuilds on its next use.
+def register_vk_drop_hook(fn : function<() : void>) {
+    g_vk_drop_hooks |> push(fn)
+}
+
 //! MoeGpuDropModelFn: destroy every model-owned device object — stacks, arenas, the resident
 //! driver, all lazy dispatch state, their descriptor sets and command buffers. Device-lifetime
 //! state (instance/device/pipelines/staging/fence/profiler) survives and rebuilds lazily.
 def vk_drop_model_state {
     if (g_gpu == null) {
         return
+    }
+    for (fn in g_vk_drop_hooks) {
+        invoke(fn)
     }
     if (g_gpu.dry) {
         // dry bake owns no device objects — reset the accounting shells only
@@ -2024,10 +2060,6 @@ def vk_kq_schema_id(fmt : int) : int {
 }
 
 
-// meta/activation block unit of a stack format — q8 counts 32-weight blocks, the kq
-// lattice counts 256-weight superblocks
-def fmt_unit(fmt : int) : int64 => kq_block32(fmt) ? 32l : 256l
-
 [arch(at="../ARCHITECTURE_GPU_QUANT_PLANES.md#metal-kq-split-scale-plane")]
 def arena_block_bytes(fmt : int) : tuple<wq : int64; ws : int64> {
     if (fmt == int(KqFmt.q8)) {
@@ -2040,16 +2072,6 @@ def arena_block_bytes(fmt : int) : tuple<wq : int64; ws : int64> {
         return (wq = MX4_QB, ws = MX4_SB)   // 16 nibble bytes, one E8M0 byte: the CPU's mxq / mxs planes verbatim
     }
     return (wq = kq_qsb(vk_kq_schema_id(fmt)), ws = kq_dev_ssb_i(fmt))
-}
-
-//! Row-length servability: the arena strides whole blocks, so a row that is not a block
-//! multiple cannot be placed — callers DECLINE such stacks to the CPU (never assert).
-def arena_rows_ok(n : int64; fmt : int) : bool => n % fmt_unit(fmt) == 0l
-
-def arena_blocks_for(n, rows : int64; fmt : int) : int64 {
-    verify(kq_block32(fmt) || n % KQ_SUPERBLOCK_ELEMS == 0l, "dasLLAMA vulkan arena: kq row length must be a superblock multiple")
-    verify(!kq_block32(fmt) || n % Q8_BLOCK_ELEMS == 0l, "dasLLAMA vulkan arena: q8 row length must be a 32-block multiple")
-    return rows * (n / (kq_block32(fmt) ? Q8_BLOCK_ELEMS : KQ_SUPERBLOCK_ELEMS))
 }
 
 var private g_arena_slab_override = 0l
@@ -2132,7 +2154,7 @@ def arena_place(wq : uint8 const?; ws : uint8 const?; n, rows : int64; fmt : int
     if (!key_exists(g_gpu.arenas, fmt)) {
         return -1l
     }
-    let need = arena_blocks_for(n, rows, fmt)
+    let need = kq_blocks_for(n, rows, fmt)
     unsafe {
         var a & = g_gpu.arenas[fmt]
         if (a.blocks + need > a.cap_blocks) {
@@ -2180,8 +2202,8 @@ def vk_arena_place(wq : array<uint8>; ws : array<uint8>; n : int64; rows : int64
     if (!vk_moe_init() || empty(wq) || empty(ws)) {
         return -1l
     }
-    if (!arena_rows_ok(n, fmt)) {   // unplaceable row length: this plane stays on the CPU
-        to_log(LOG_WARNING, "dasLLAMA vulkan arena: plane declined - row length {n} is not a {fmt_unit(fmt)}-block multiple (fmt {fmt})\n")
+    if (!kq_rows_ok(n, fmt)) {
+        to_log(LOG_WARNING, "dasLLAMA vulkan arena: plane declined - row length {n} is not a {kq_unit(fmt)}-block multiple (fmt {fmt})\n")
         return -1l
     }
     return arena_place(unsafe(addr(wq[0])), empty(ws) ? null : unsafe(addr(ws[0])), n, rows, fmt)
@@ -2326,7 +2348,7 @@ struct RLayer {
     s_dnba : VkDescriptorSet                // f32 arm: the router-form GEMV over dn_ba_dev, two pushes
     s_dnstep : VkDescriptorSet
     m_dnqkv, m_dnz, m_dnout, m_dnbeta, m_dnalpha : HostBuf
-    dn : DnStep                     // state + smalls + the session owner (the per-op step's shape; its cmd/tok/sets stay unused here)
+    dn : array<DnStep>
     // the prefill window chain's per-recurrent-layer sets (built by pf_setup; the smalls/state differ per layer)
     pf_dn_conv_set : VkDescriptorSet       // pf_dnqkv -> pf_dnconv, this layer's smalls (taps + hist)
     pf_dn_scan_set : VkDescriptorSet       // pf_dnconv + this layer's state + smalls -> the o rows (the sequential scan)
@@ -2424,7 +2446,7 @@ struct RDec {
     dn_ba_bytes : int64
     dn_oq_dev, dn_os_dev : uint64 // the step's Q8_0 o row - the out GEMV's activation image
     dn_of_dev : uint64            // the step's f32 o row for a K-quant out plane - the Q8_K requant's source
-    dn_parity : int               // the shared conv-ring parity: every recurrent layer steps once per token
+    dn_parity : array<int>
     norms_dev : uint64            // rms_att[l]/rms_ffn[l] interleaved + final, uploaded once
     bias_dev : uint64             // the q/k/v projection biases, per layer [q | k | v] (qwen2; 0 = the model has none)
     bias_bytes : int64
@@ -2960,14 +2982,6 @@ def hz_set_bits(set_ : VkDescriptorSet; b0, b1, b2, b3, b4, b5 : uint) {
     g_set_bits[intptr(set_)] = sb
 }
 
-def hz_set_bits(set_ : VkDescriptorSet; gbits : uint[6]) {
-    var sb : SetBits
-    for (i in range(6)) {
-        sb.b[i] = gbits[i]
-    }
-    g_set_bits[intptr(set_)] = sb
-}
-
 def hz_pipe_register(pipe : Pipeline; kernel : string) {
     if (!key_exists(g_kernel_access, kernel)) {
         panic("dasLLAMA vulkan tier: no derived access for kernel {kernel}")
@@ -3173,9 +3187,19 @@ def vkd_push(raw : VkCommandBuffer; c : VkdClass; var pc : auto(PT)&) {
     vkCmdPushConstants(raw, boost_value_to_vk(c.pipe_layout), sf, 0u, uint(c.push_bytes), unsafe(addr<void?>(pc)))
 }
 
+//! the lens's refusal of a class slot whose pipeline was never registered, naming the family's built slots beside it
+[cold_path]
+def private vkd_unregistered_panic(c : VkdClass; ord : int) {
+    let built <- [for (p in c.pipes); g_pipe_names?[intptr(boost_value_to_vk(p))] ?? "-"]
+    panic("dasLLAMA vulkan lens: dispatch through an unregistered pipeline - kernel slot {ord} of the class whose built slots read [{join(built, ", ")}] ({length(c.bindings)} bindings, a {c.push_bytes}-byte push, pipe epoch {c.pipe_epochs[ord]} of {g_vkd_pipe_epoch}): its ensure_ never ran, or ran before the model drop")
+}
+
 // the class twin of hz_dispatch: same masks/coverage/barrier rail, the CLASS pipeline layout;
 // ord picks the kernel's pipe slot
 def vkd_dispatch(raw : VkCommandBuffer; var h : VkHaz; c : VkdClass; var set_ : VkDescriptorSet; ord : int; groups : uint) {
+    if (!key_exists(g_pipe_access, intptr(boost_value_to_vk(c.pipes[ord])))) {
+        vkd_unregistered_panic(c, ord)
+    }
     let m = hz_masks(c.pipes[ord], set_)
     g_vk_kcov[intptr(boost_value_to_vk(c.pipes[ord]))]++
     vhz_dep(raw, h, m.r, m.w)
@@ -3375,11 +3399,36 @@ def private alloc_cmd_in(pool : CommandPool) : VkCommandBuffer {
     return raw
 }
 
-//! a one-shot command (the KV readback rails) its caller frees through `free_transient_cmd`: registering it in model_cmds would grow that list per hydration until the next model drop
+//! a one-shot command (the KV readback rails, the seams, the arena's per-call chains) its caller frees through `free_transient_cmd` after its fence: registering it in model_cmds would grow that list per call until the next model drop
 def alloc_transient_cmd : VkCommandBuffer => alloc_cmd_in(g_gpu.pool)
 
 def free_transient_cmd(var raw : VkCommandBuffer) {
     vkFreeCommandBuffers(dev_raw(), boost_value_to_vk(g_gpu.pool), 1u, unsafe(addr(raw)))
+}
+
+//! one command `rec` records on a transient buffer with a fresh hazard rail, submitted on the compute queue and waited (the seams, the
+//! cold KV readbacks); `run_cmd_sync` cannot serve these - it never waits the pending transfer copy `submit_core` attaches
+def cmd_one_shot(rec : block<(raw : VkCommandBuffer; var h : VkHaz) : void>) {
+    var raw = alloc_transient_cmd()
+    let begin = VkCommandBufferBeginInfo()
+    vk_check(vkBeginCommandBuffer(raw, begin), null)
+    var h : VkHaz
+    invoke(rec, raw, h)
+    vk_check(vkEndCommandBuffer(raw), null)
+    submit_wait(raw)
+    free_transient_cmd(raw)
+}
+
+//! the same on the shared batch command buffer, reset first: the decode's cold state uploads and readbacks
+def batch_cmd_one_shot(rec : block<(raw : VkCommandBuffer) : void>) {
+    var raw = g_gpu.batch_cmd
+    let rf : VkCommandBufferResetFlags
+    vk_check(vkResetCommandBuffer(raw, rf), null)
+    let begin = VkCommandBufferBeginInfo()
+    vk_check(vkBeginCommandBuffer(raw, begin), null)
+    invoke(rec, raw)
+    vk_check(vkEndCommandBuffer(raw), null)
+    submit_wait(raw)
 }
 
 //! a persistent command on the compute pool, model-owned: freed by the model drop
@@ -3396,10 +3445,11 @@ def alloc_xfer_cmd : VkCommandBuffer {
     return raw
 }
 
+//! `bytes` of a device buffer from `off` zeroed by a fill command, no host array
 def upload_zeros(dev : uint64; off, bytes : int64) {
-    var zeros : array<uint8>
-    zeros |> resize(bytes)
-    upload_region_at(dev, off, unsafe(addr<uint8 const?>(zeros[0])), bytes)
+    cmd_one_shot() $(raw : VkCommandBuffer; var _h : VkHaz) {
+        cmd_fill_zero(raw, dev, off, bytes)
+    }
 }
 
 [arch(at="../ARCHITECTURE_GPU_VULKAN.md#vk-prefill-window-chain")]
@@ -3528,7 +3578,7 @@ def submit_wait(var raw : VkCommandBuffer) {
 // regions expand so output lands row-major); n/d/nreg/ybase ride the GemvArgs push instead
 def fill_stack_sched_rows(si : int; offs : int64 const?; nregions : int64; nrows, xnb : int64) {
     assert(nrows * 2l * 4l <= META_BYTES, "dasLLAMA vulkan tier: FFN regions exceed capacity")
-    let unit = fmt_unit(g_gpu.stacks[si].fmt)
+    let unit = kq_unit(g_gpu.stacks[si].fmt)
     unsafe {
         var mp = reinterpret<uint?>(g_gpu.stacks[si].meta.mapped)
         for (r in range64(nregions)) {
@@ -3547,7 +3597,7 @@ def fill_stack_sched_rows(si : int; offs : int64 const?; nregions : int64; nrows
 def fill_stack_acts(si : int; xqp : int8 const?; xsp : float const?; xq_bytes : int64) {
     assert(xq_bytes <= XQ_BYTES, "dasLLAMA vulkan tier: dispatch exceeds scratch capacity")
     assert(g_gpu.stacks[si].gemv_made, "dasLLAMA vulkan tier: a stack fill before its GEMV scratch was made")
-    let unit = fmt_unit(g_gpu.stacks[si].fmt)
+    let unit = kq_unit(g_gpu.stacks[si].fmt)
     unsafe {
         memcpy(g_gpu.stacks[si].xq.mapped, reinterpret<void?>(xqp), xq_bytes)
         memcpy(g_gpu.stacks[si].xs.mapped, reinterpret<void?>(xsp), (xq_bytes / unit) * 4l)

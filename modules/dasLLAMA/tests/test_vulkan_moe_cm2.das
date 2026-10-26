@@ -7,9 +7,9 @@ options _dasllama_internal = true
 require dastest/testing_boost public
 require dasllama/dasllama_math
 require ?vulkan dasllama/dasllama_math_vulkan  // the MoE GPU tier under test; the test installs its hooks explicitly (no env gate)
-require daslib/f16_cvt
 require math
-require ?vulkan _vk_kq_fixtures
+require _vk_kq_fixtures   // f16r: the CPU reference rounds where the device stages halves, on every lane
+require ?vulkan _compares   // read inside the vulkan cells only, so a lane without dasVulkan sees no use
 require ?vulkan dasllama/dasllama_vulkan_common   // find_stack_idx: the fresh-base guard; a build with no Vulkan module skips the cells
 require ?vulkan dasllama/dasllama_env   // the split knob the streamed cells name in their tags
 
@@ -20,8 +20,6 @@ require ?vulkan dasllama/dasllama_env   // the split knob the streamed cells nam
 // loudly anywhere else. Without dasVulkan (or with no Vulkan device) every check feints cleanly.
 
 let NE = 3l   // experts per synthetic stack
-
-def private f16r(v : float) : float => f16_to_f32(f32_to_f16(v))
 
 def private silu(v : float) : float => v / (1.0 + exp(-v))
 
@@ -153,10 +151,10 @@ def private chain_cell(t : T?; tag : string; n, nfe, npos, k, cnt_a : int64; wof
                 matmul_moe_gpu_ffn_combined_xf(gout, offs1, offs3, offs2, nreg, x, w, inv, n, nfe, nk, npos, 1, 1, 3, false)
                 ref_chain(w1, w3, w2, x, inv, w, expert_of_row, n, nfe, npos, k, refv)
             }
-            let mr = max_abs(refv)
+            let mr = logits_maxabs(refv)
             let rel_bar = 4e-3 * mr
             let bad = count_bad(gout, refv, 2e-2, rel_bar)
-            let md = max_diff(gout, refv)
+            let md = logits_maxdiff(gout, refv)
             to_log(LOG_INFO, "{tag} win {win}: {bad} of {npos * n} off the reference (maxdiff {md}, maxref {mr}, rel bar {rel_bar})\n")
             t |> success(mr > 0.0, "{tag} win {win}: the reference is non-trivial")
             t |> success(bad == 0, "{tag} win {win}: cm2 expert chain matches the CPU reference ({bad} of {npos * n} off, maxdiff {md} vs abs 2e-2 / rel {rel_bar})")

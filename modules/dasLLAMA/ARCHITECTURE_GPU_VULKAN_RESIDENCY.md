@@ -17,7 +17,10 @@ sections build on stays in `ARCHITECTURE_GPU.md` sec.1.5.
 The resident driver is all-or-nothing, so the plan IS the decision, and it is computed from
 `Model` metadata alone. It sizes four numbers against the tier's weight budget: the dense weight
 planes, the KV mirror at `seq_cap`, the driver's own device scratch, and the headroom the auto
-arm leaves unfilled (zero when the user pins VRAM). KV is reserved BEFORE weights and never
+arm leaves unfilled (zero when the user pins VRAM). The weight planes are ONE list
+(`resident_planes`, a row length, a row count and a format per plane): the plan sums that list's
+bytes and the upload reserves and places the same list, so the two cannot drift; the router rows,
+the beta / alpha rows (f16 on the device) and the optional f32 embedding are the terms beside it. KV is reserved BEFORE weights and never
 grows: on a discrete card the two compete directly, and evicting weights to grow KV would mean
 re-uploading gigabytes. A decline carries a reason, and where the numbers allow one it carries
 the remedy that works - a shorter context, because the weights are fixed and the KV is not. The
@@ -31,7 +34,9 @@ cap's 6238 a region asks for more K/V than the weights leave.
 
 **The mirror's context is capped by the device's single-binding range before any byte is
 counted.** Each K/V side binds as one SSBO range, so `seq_cap` is at most `maxStorageBufferRange`
-over the side's bytes per position summed across the layers (`resident_binding_ctx`). The sum is
+over the side's bytes per position summed across the layers that hold rows of their own - a
+shared-KV layer reads its donor's rows and adds none (`resident_binding_ctx`, over the mirror's own
+row sum `resident_kv_row_bytes`). The sum is
 what makes a hybrid right: a recurrent layer's KV width is zero, so the stride counts the
 attention layers alone; read from layer 0 instead - recurrent on Qwen3.5 - the stride is zero,
 the cap is skipped, the plan sizes a mirror the device prepare refuses, and the whole driver
@@ -248,3 +253,12 @@ leaves a 16-byte landing, and its planes take 4 x (2 x 64 + 1) bytes a row of th
 the pod's (RTX PRO 4500, `-jit`, cm2): the `DASLLAMA_GPU_PROF=1` token profile of
 `benchmarks/lcpp_bench.das` for the step times and rates, `harness/vk_dma_probe.das` for the copy
 rates; `PERF_LEDGER.md`'s 2026-09-19 section is the record.
+
+### 2.2as A call that passes to the CPU rails hydrates first {#resident-pass-hydrate}
+
+Every pass of a host-cached session's call to the CPU rails - whatever the reason - brings the
+region's device-only rows down to the host cache first (`rdec_pass_hydrated`), so the CPU
+computes over the rows the mirror holds: an image turn's media rows attend the head the device
+prefilled, and a decode past the region's rows reads them beside the CPU-served ones. A
+device-home session has no host cache to fill, so its pass panics with the reason. The pass
+still answers false, and the CPU rails serve the call.

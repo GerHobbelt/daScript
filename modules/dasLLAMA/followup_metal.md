@@ -673,11 +673,11 @@ five kernels taking the row from that table - one dispatch a stage over every ro
 batched stack still has no hybrid form (`eval_batch_` steps them per row when no device driver
 is armed); the same rows shape applies there.
 
-## 23. The E4B batched row reads 0.90 of llama-batched-bench where the E2B reads 0.95
+## 23. The E4B batched row reads 0.93 of llama-batched-bench where the E2B reads 0.95
 
-The M5 board (`performance/records/m5.json`, the `tg128@4` cells of the Metal leg - the E4B das
-row at engine sha cc969d961, the E2B das row at 60b736faa): gemma-4-E4B Q8 259.6 against the
-reference's 290.1 tok/s, while the E2B - the same
+The M5 board (`performance/records/m5.json`, the `tg128@4` cells of the Metal leg; the release 16
+mint at engine sha 027907cc8 reads gemma-4-E4B Q8 268.5 against the reference's 290.2 tok/s - the
+release 15 rows, the E4B at cc969d961 and the E2B at 60b736faa, read 259.6 against 290.1, while the E2B - the same
 E-series batch arm, PLE rows form, shared-KV layers Q-only - reads 454.2 against 479.7 (0.95). The
 flat rows hold on both files (E4B tg128 90.0 vs 81.2). Whatever the E4B pays per step it pays
 only at four rows. The stage split (`harness/batch_rows_probe.das --bs 4 --knockouts --sameslab
@@ -687,13 +687,25 @@ roof), elementwise 1.73, attention 1.04, other 0.5, and the batch driver costs 1
 against the single-row driver's 11.09; `lcpp_bench --prof`'s stage line adds ~1 ms of host work per
 step outside the GPU (encode 0.73, handoff 0.15, sched 0.11). The E2B shows the same shape (8.05
 against 6.25; elementwise 1.11, attention 0.89), so the E4B's deficit is the E-series' shared
-per-step cost meeting less flat headroom (its flat lead is 1.11, the E2B's 1.17). The two levers:
-the host encode overlapped with the device (the pipelined submission `DASLLAMA_METAL_BATCH_PIPE=1`
-hides it but dies with a SIGSEGV on the E4B row - its landing reads step globals the next step's
-build has already overwritten), and the elementwise chain's dispatch count (~40 us a layer at four
-rows: the qk / v norms, the gated-q multiply, the post norms and the residual adds as separate
-dispatches). The pass rule for a batched arm is 0.95 of `llama-batched-bench`
-(`ARCHITECTURE_MEASUREMENT.md`); the E2B sits on the bar and the E4B under it, ~0.6 ms a step away.
+per-step cost meeting less flat headroom (its flat lead is 1.11, the E2B's 1.17). The host encode
+is NOT on the critical path: the step's command buffers commit progressively (`DASLLAMA_METAL_BATCH_NCB`),
+so the GPU runs under the encode already, and the pre-encoded step (`DASLLAMA_METAL_BATCH_PRE`,
+sec.2.38a of `ARCHITECTURE_GPU_MTP_DECODE.md`) moves the four-row step 13.26 -> 13.18 ms in the
+same probe (`--bs 4`, no knockouts: setup 0.05 encode 0.68 wait 12.04 gpu 11.87 readback 0.07 ms a
+step, 33 of 34 steps pre-encoded; debug-jit) and leaves the bench row at 259.0 (`lcpp_bench -jit
+--for-debug-purposes`, debug-jit, against the board cell's 259.6). What the row pays is the
+GPU's idle between steps, ~1.0 ms of a 14.3 ms bench step (`lcpp_bench --prof`, `JOBQUE_PROFILING=1`,
+one rep, debug-jit): the CPU PLE pre-step 0.37 (row 13 - the model_proj GEMM for four rows on the host), the
+sampler's argmax over four 262144-wide rows 0.19, the driver's setup + sched + handoff + readback +
+wake 0.4. The pipelined submission (`DASLLAMA_METAL_BATCH_PIPE=1`, a bench-only rail: it serves the
+PREVIOUS step's logits) hides all of it - 12.01 against 13.34 ms in the probe - which bounds the
+lever: the next step committed BEFORE the current one lands, on the GPU's own argmax (the rows twin
+of the single-row greedy chain, sec.2.38: argmax rows -> per-row embed gather -> the PLE gather +
+model_proj chain of row 13 on device -> the layer stack), verified against the caller's tokens at
+the landing, a miss re-running the step; only rows whose sampler is a bare argmax may chain. The
+elementwise chain's dispatch count (~40 us a layer at four rows) is the second, smaller lever. The
+pass rule for a batched arm is 0.95 of `llama-batched-bench` (`ARCHITECTURE_MEASUREMENT.md`); the
+E2B sits on the bar and the E4B under it, ~0.6 ms a step away.
 
 ## 24. The dense 24B batched row loses at four rows what its flat row wins
 
@@ -722,3 +734,17 @@ ce42fb986 and on every branch since; the stocked suite never reaches it (the mtp
 in `stocked`). The work: decide whether the batch driver now serves the hybrid's verify rows -
 then the pin flips to must-serve - or make the decline return a plain GPU step instead of the
 CPU stack.
+
+## 26. The 9B's speculative round returns half the 4B's gain at the same accept rate
+
+`lcpp_bench --mtp-ab` (single stream, Metal, tg-real128 `-p 0 -n 128`, greedy, depth 1, M5 Max,
+`-jit --for-debug-purposes`, debug-jit, `DASLLAMA_ALLOW_UNTUNED=1` with the box sidecar older than
+the binary - the CPU kernels ran the `arm-i8mm` class profile's winners, which moves prefill and
+not this decode row - direction-grade, both arms in one process): Qwen3.5-0.8B-MTP Q8 364.5 ->
+438.6 tok/s (1.20x, 87.9% accepted; 3 reps, sd 0.1 / 0.7), 4B 103.7 -> 125.8 (1.21x, 85.5%; 3 reps,
+sd 1.2 / 2.8), 9B 57.3 -> 63.2 (1.10x, 84.5%; 5 reps, sd 0.6 / 1.6 - a 3-rep read at sd 4.0 / 2.5
+was void). An accept rate of 85% at depth 1 buys 1.85 tokens a round at most, and the 0.8B and 4B
+take two thirds of that; the 9B takes a third with the same rate, so its round carries a cost
+that scales with the model and not with the drafts - the verify's two rows against a 9.7 GB
+weight pass at its bandwidth roof should be nearly free. The work: the round's stage split on
+the 9B (`harness/mtp_ruler.das`, the verify against the plain step) to name the term.

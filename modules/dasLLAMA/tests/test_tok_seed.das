@@ -70,6 +70,23 @@ def test_tok_seed_body_only(t : T?) {
 }
 
 [test]
+def test_flat_row_plen(t : T?) {
+    t |> run("the flat session's prompt rows never shrink the context under the tg-real row's prompts") @(t : T?) {
+        // -p 0 -n 32 beside a real row whose longest prompt capped the context at 270 + 32 + 8
+        t |> equal(flat_row_plen(0l, 32l, 310l, true), 278l, "the real row's cap stands: the flat rows read it back as prompt rows")
+        t |> equal(flat_row_plen(512l, 128l, 310l, true), 512l, "a flat prompt longer than the real row's cap keeps its own length")
+        t |> equal(flat_row_plen(0l, 32l, 4096l, false), 0l, "no real row: the flat session sizes as llama-bench does, plen + ngen")
+    }
+    t |> run("the rows' context cap covers the flat rows whatever the batched streams' prompts") @(t : T?) {
+        t |> equal(rows_ctx_need(512l, 128l, 512l, 4, 1l), 652l, "the batched streams' need: prompt + window + a slot a stream + the margin")
+        t |> equal(rows_ctx_need(512l, 128l, 128l, 4, 1l), 512l, "short batched prompts never cap the context under the pp row's prompt")
+        t |> equal(rows_ctx_need(64l, 4l, 8l, 4, 1l), 64l, "the flat rows' need wins at every scale")
+        t |> equal(rows_ctx_need(512l, 128l, 512l, 0, 1l), 512l, "no batched row: the flat rows alone")
+        t |> equal(rows_ctx_need(0l, 128l, 128l, 4, 3l), 548l, "the self-speculative streams take depth + 1 rows a tick")
+    }
+}
+
+[test]
 def test_tok_seed_hash_in_body(t : T?) {
     t |> run("a '#' MID-LINE in the body is corpus, not a header") @(t : T?) {
         let p = write_corpus("mid_line_hash.txt", "# header\nlet x = 1 # not a header\ntail\n")
