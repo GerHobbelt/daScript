@@ -41,6 +41,7 @@ require daslib/jobque_boost
 require daslib/clargs
 require daslib/enum_trait   // to_enum: --mtp-accept by the MtpAccept member's name
 require daslib/fio
+require daslib/logger   // --prof: the report is an info-level log, so the flag raises the floor to it
 require daslib/md_boost
 require math
 require dasllama/dasllama_env
@@ -52,6 +53,8 @@ require dasllama/dasllama_env
 //       (llama-bench never samples — sampling cost is excluded by design)
 //   tg-real<n> (--mtp-ab, --tok) drops no warmup round: every rep is timed; tg<n>@<npl> drops none either - each rep's
 //       batched command opens with one untimed warm step inside the rep
+//   tts:g2p<N>@<voice> (--tts) drops one warmup round: one untimed synthesis of the corpus's first
+//       sentence; the row sums each sentence's best of -r timed reps
 //   ours:   bin/daslang -jit modules/dasLLAMA/benchmarks/lcpp_bench.das -- -m <model.gguf>
 //   theirs: --ref <llama-bench> runs it on the same GGUF with the same -t/-p/-n/-r/--ngl
 // `-o json` emits public bench records (schema: METHODOLOGY.md "The record") on stdout — progress goes to
@@ -281,16 +284,7 @@ def private arm_accel_tier(accel, gpu : bool) : bool {
 def private emit_cell_records(models : array<BenchModel>; json_path : string) {
     let text = sprint_json(models, true)
     if (!empty(json_path)) {
-        var wrote = false
-        fopen(json_path, "wb") $(f) {
-            if (f != null) {
-                fwrite(f, text)
-                wrote = true
-            }
-        }
-        if (!wrote) {
-            print("warning: could not open {json_path} for writing - no records file\n")
-        }
+        write_records_text(json_path, text)
     }
     print("{text}\n")
 }
@@ -354,7 +348,7 @@ def private measure_das(var m : AsrModel; samples : array<float>; reps : int; la
 //! one catalog model's timed buckets -> a BenchModel cell appended to `jsonModels`; on Metal the gpu arm (--ngl) rides the
 //! f32 tower rail and a row that never dispatches the tower FAILS the leg; on Vulkan the row stamps `vulkan` when the drivers
 //! served every clip (the tower, and the decoder on whisper) and FAILS when they served some but not all
-[arch(at = "../ARCHITECTURE_MEASUREMENT.md#asr-gpu-pairs")]
+[arch(at = "../ARCHITECTURE_MEASUREMENT_AUDIO.md#asr-gpu-pairs")]
 def private asr_measure_spec(spec : AsrModelSpec; reps, threads : int; var jsonModels : array<BenchModel>; gpu, accel : bool) : bool {
     let model_path = asr_model_path(spec)
     var m <- (empty(spec.das_mmproj)
@@ -752,11 +746,7 @@ def private measure_tts(var m : TtsModel; text, voice : string; reps : int) : tu
     return (ms = best, audio_s = audio_s)
 }
 
-//! The --tts entry: the corpus head through one model at one voice, one `tts:g2p<N>@<voice>` test
-//! summing each sentence's best-of-`reps` generation ms and its audio seconds. --ngl serves every
-//! chunk on the Metal tower and fails the cell where a seat fell back; a CPU row pins the tower off
-//! on Metal, and on a Vulkan build stamps `vulkan` where the TTS seats served every chunk.
-[arch(at = "../ARCHITECTURE_MEASUREMENT.md#the-tts-reference-instrument")]
+[arch(at = "../ARCHITECTURE_MEASUREMENT_AUDIO.md#the-tts-reference-instrument")]
 def private tts_cell_main(model, voice_arg, json_path : string; sentences, reps, threads : int; gpu, accel : bool) : bool {
     return false if (!arm_accel_tier(accel, gpu))
     static_if (typeinfo builtin_module_exists(das_metal)) {
@@ -785,13 +775,13 @@ def private tts_cell_main(model, voice_arg, json_path : string; sentences, reps,
     return false if (!tune_gate())   // never measure on fallback winners
     var jsonModels : array<BenchModel>
     var ok = true
+    var total_ms = 0.0lf
+    var total_audio = 0.0lf
     with_dasllama_jobque_() {
         print("live: {get_dispatch_lanes()} dispatch lanes ({get_total_hw_jobs()} workers)\n")
         var inscope m <- load_tts_model(model)
         var inscope seats0 <- tts_seat_counts(m.kind)
         measure_tts(m, corpus[0].text, voice, 1)   // warm: JIT + first touch + the seats' slabs
-        var total_ms = 0.0lf
-        var total_audio = 0.0lf
         for (s in corpus) {
             let r = measure_tts(m, s.text, voice, reps)
             total_ms += r.ms
@@ -813,7 +803,6 @@ def private tts_cell_main(model, voice_arg, json_path : string; sentences, reps,
         } elif (!gpu && verdict == "all") {
             backend = "vulkan"   // only a Vulkan build reaches here: on Metal the CPU arm pinned the tower off
         }
-        print("lcpp_bench --tts: {base_name(model)} {voice} {length(corpus)} sentences, {total_audio} s of audio in {total_ms} ms (rtf {total_ms / 1000.0lf / max(total_audio, 1e-9lf)})\n")
         var run = BenchRun(engine = "das", backend = backend, flavor = flavor_stamp(accel ? "accel" : "tuned"),
             exec_fmt = "{m.kind} {tts_serves_q8() ? "q8" : "f32"} lane",
             workload = "tts", box = box_name(), threads = threads,
@@ -831,6 +820,7 @@ def private tts_cell_main(model, voice_arg, json_path : string; sentences, reps,
         jsonModels |> emplace(cell)
     }
     return false if (!ok)
+    print("lcpp_bench --tts: {base_name(model)} {voice} {length(corpus)} sentences, {total_audio} s of audio in {total_ms} ms (rtf {total_ms / 1000.0lf / max(total_audio, 1e-9lf)})\n")
     emit_cell_records(jsonModels, json_path)
     return true
 }
@@ -1343,6 +1333,7 @@ def private parity_cell_main(model : string) : bool {
 
 //! The pregate's verdict for `model` under `spec`'s evidence — public so a test can drive the
 //! compare with a deliberately wrong fixture; the arm's own path binds `spec` off the table.
+[arch(at="../ARCHITECTURE_MEASUREMENT.md#fixture-prefix-bar")]
 def parity_check(model : string; spec : ModelSpec) : bool {
     if (empty(spec.parity.gen)) {
         print("PARITY PREGATE: no evidence for {base_name(model)} in the model-set table (model_specs.das) - freeze a fixture (harness/parity.sh) before boarding this model\n")
@@ -1557,8 +1548,11 @@ def main() : int {
         return 0
     }
     if (cfg.prof && !JOBQUE_PROFILING_ENABLED) {
-        print("--prof needs the marker rail compiled in - rerun with JOBQUE_PROFILING=1 (or --jobque-profiling)\n")
+        print("--prof needs the marker rail compiled in - rerun with JOBQUE_PROFILING=1 (the DLL cache keeps the rail-less build: add -jit-no-cache)\n")
         return 1
+    }
+    if (cfg.prof && logger_get_min_level() > LOG_INFO) {
+        set_env_variable("DAS_LOG_LEVEL", "info")   //! the report is an info-level log: the flag raises the floor to info unless the logger already admits it
     }
     // measurement exists only from the released exe: a -jit SCRIPT run reads whatever sidecar
     // sits beside the script and re-keys nothing — its numbers must never enter records
@@ -2259,19 +2253,8 @@ def main() : int {
         return g_refused_rows > 0 ? 1 : 0
     }
     let text = sprint_json(jsonModels, true)
-    if (!empty(cfg.json_path)) {
-        var wrote = false
-        fopen(cfg.json_path, "wb") $(f) {
-            if (f != null) {
-                fwrite(f, text)
-                wrote = true
-            }
-        }
-        if (wrote) {
-            say(fmt, "records written to {cfg.json_path}\n")
-        } else {
-            say(fmt, "warning: could not open {cfg.json_path} for writing - no records file\n")
-        }
+    if (!empty(cfg.json_path) && write_records_text(cfg.json_path, text)) {
+        say(fmt, "records written to {cfg.json_path}\n")
     }
     print("{text}\n")
     if (cfg.submit) {

@@ -398,7 +398,7 @@ namespace das {
             "builtIn", "promoted", "isPublic", "isModule", "isSolidContext",
             "fromExtraDependency", "doNotAllowUnsafe",
             "wasParsedNameless", "visibleEverywhere", "allowPodInscope",
-            "neverInline"
+            "neverInline", "fromModuleCache"
         };
         return ft;
     }
@@ -1028,6 +1028,7 @@ namespace das {
             addField<DAS_BIND_MANAGED_FIELD(allow_local_variable_shadowing)>("allow_local_variable_shadowing");
             addField<DAS_BIND_MANAGED_FIELD(allow_shared_lambda)>("allow_shared_lambda");
             addField<DAS_BIND_MANAGED_FIELD(ignore_shared_modules)>("ignore_shared_modules");
+            addField<DAS_BIND_MANAGED_FIELD(promote_shared_unoptimized)>("promote_shared_unoptimized");
             addField<DAS_BIND_MANAGED_FIELD(default_module_public)>("default_module_public");
             addField<DAS_BIND_MANAGED_FIELD(no_deprecated)>("no_deprecated");
             addField<DAS_BIND_MANAGED_FIELD(no_aliasing)>("no_aliasing");
@@ -1270,7 +1271,7 @@ namespace das {
         return Module::require(name) != nullptr || is_dynamic_module_deferred(name);
     }
 
-    // a member's guard answers as the require's would (src/ast/ARCHITECTURE.md#module-scan-manifest)
+    // a member's guard answers as the require's would (src/ast/ARCHITECTURE_MODULE_SCAN.md#module-scan-manifest)
     static bool moduleGroupMemberAvailable ( const ModuleGroupMember & m ) {
         if ( m.guard.empty() ) return true;
         if ( m.guard.find('/') == string::npos ) return guardModuleAvailable(m.guard);

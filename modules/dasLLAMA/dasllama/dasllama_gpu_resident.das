@@ -1256,7 +1256,7 @@ let BLOCK_CODEC_SIDE_BYTES = RDEC_CODEC_BYTE_SPAN - 67_108_864l
 //! the positions a block-codec mirror's f16 shadow holds under `bcap`, the tier's binding cap (`moe_gpu_binding_cap`: the
 //! device's range less the slack a plane carries past its rows) - one layer's widest rows as halves, one region's context;
 //! 0 = no cap (a scalar codec, no cap known, no attention layer)
-[arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#resident-plan"), arch(at="../ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-kv-block-codecs")]
+[arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#resident-plan"), arch(at="../ARCHITECTURE_GPU_SHARED_ATTN.md#vk-kv-block-codecs")]
 def resident_shadow_ctx(t : Model; dt : KVDtype; bcap : int64) : int64 {
     let kvd = resident_widest_kv_row(t)
     return (kv_block_codec(dt) && bcap > 0l && kvd > 0l) ? bcap / (2l * kvd) : 0l
@@ -1376,11 +1376,11 @@ def private resident_mirror_ask() : tuple<dt : KVDtype; knob : string; fold_why 
     return (dt = named.dt, knob = knob, fold_why = "")
 }
 
-[arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#resident-plan"), arch(at="../ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-kv-block-codecs")]
+[arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#resident-plan"), arch(at="../ARCHITECTURE_GPU_SHARED_ATTN.md#vk-kv-block-codecs")]
 def resident_mirror_dtype() : KVDtype => resident_mirror_ask().dt
 
 //! `announce` prints why an asked codec became another: the ask itself, or the model (`kv_codec_served`)
-[arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#resident-plan"), arch(at="../ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-kv-block-codecs")]
+[arch(at="../ARCHITECTURE_GPU_VULKAN_RESIDENCY.md#resident-plan"), arch(at="../ARCHITECTURE_GPU_SHARED_ATTN.md#vk-kv-block-codecs")]
 def resident_mirror_dtype_of(t : Model; announce : bool = false) : KVDtype {
     let ask = resident_mirror_ask()
     var served_why = ""
@@ -1395,7 +1395,7 @@ def resident_mirror_dtype_of(t : Model; announce : bool = false) : KVDtype {
 }
 
 //! a block-codec mirror's scratch: both sides' f16 shadow of one layer's rows at the context, and the window's staged float rows
-[arch(at="../ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-kv-block-codecs")]
+[arch(at="../ARCHITECTURE_GPU_SHARED_ATTN.md#vk-kv-block-codecs")]
 def private resident_shadow_bytes(t : Model; seq_cap : int64; dt : KVDtype) : int64 {
     return 0l if (!kv_block_codec(dt))
     return seq_cap * resident_shadow_pos_bytes(t, dt) + 2l * pf_window_rows() * resident_attn_maxima(t.config).kvd * 4l
@@ -2346,7 +2346,7 @@ def private resident_shexp_decline(t : Model; l : int64) : string {
     return ""
 }
 
-[arch(at="../ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-decode-attn-split")]
+[arch(at="../ARCHITECTURE_GPU_SHARED_ATTN.md#vk-decode-attn-split")]
 //! Why layer `l` keeps the whole-model driver off the model - "" when the driver serves the layer's
 //! shape (its planes placed, its own K/V, a head the attention kernels stage).
 def resident_layer_decline(t : Model; l : int64) : string {
@@ -2498,7 +2498,10 @@ def private resident_layer_geom(t : Model; l, mir_base, mir_slab, ring : int64) 
     let sliding = layer_is_sliding(c, l)
     let swa_row = sliding && has_dual_rope(c)
     let vfk = resident_v_from_k(c, l)
+    let lf = resident_layer_fmts(t, l)
     return RdecLayerGeom(hs = layer_head_size(c, l), qd = layer_qd(c, l), kvd = layer_kv_dim(c, l),
+        site_scale = fixed_array<float>(site_scale(t, lf.fq, t.wq_offs[l]), site_scale(t, lf.fk, t.wk_offs[l]), site_scale(t, lf.fv, t.wv_offs[l]),
+            site_scale(t, lf.fo, t.wo_offs[l]), site_scale(t, lf.f1, t.w1_offs[l]), site_scale(t, lf.f3, t.w3_offs[l]), site_scale(t, lf.f2, t.w2_offs[l])),
         hid = resident_dense_width(t, l), rot = swa_row ? resident_rot_swa(c) : resident_rot(c),
         window = sliding ? c.sliding_window : 0l, ring = ring, mir_base = mir_base, mir_slab = mir_slab,
         cbase = swa_row ? resident_rot(c) : 0l, boff = resident_bias_off(c, l),

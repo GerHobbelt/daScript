@@ -29,6 +29,7 @@ option(DAS_FLEX_BISON_DISABLED "Disable FLEX/BISON stage" OFF)
 option(DAS_STRICT_ALIASING "Keep gcc strict aliasing on (exposes type-pun bugs)" OFF)
 option(DAS_CLANG_BIND_DISABLED "Disable dasClangBind (libclang bindings, C/C++ parsing)" ON)
 option(DAS_LLVM_DISABLED "Disable dasLLVM (llvm bindings)" ON)
+option(DAS_CUDA_DISABLED "Disable dasCUDA (CUDA driver + NVRTC late externs and the CUDA C emitter; pure das, no toolkit at build time; 64-bit hosts only)" OFF)
 option(DAS_SMT_DISABLED "Disable dasSMT (Z3 SMT solver bindings)" ON)
 option(DAS_HV_DISABLED "Disable dasHV (websokets,http server and client)" OFF)
 option(DAS_GLFW_DISABLED "Disable dasGLFW (GLFW window for graphics apps)" OFF)
@@ -192,7 +193,9 @@ MACRO(DAS_AOT_EXT input_files genList mainTarget dasAotTool dasAotToolArg)
     set(_DAS_AOT_BATCH_SIZE 60)
     set(_aot_args "")
 
-    foreach(input ${input_files})
+    set(_aot_inputs ${input_files})
+    list(FILTER _aot_inputs EXCLUDE REGEX "/(failed_|cant_|invalid_)[^/]*$")
+    foreach(input ${_aot_inputs})
         get_filename_component(input_src ${input} ABSOLUTE)
         get_filename_component(input_dir ${input_src} DIRECTORY)
         get_filename_component(input_name ${input} NAME)
@@ -1491,6 +1494,13 @@ if (NOT ${DAS_TOOLS_DISABLED})
 
     MACRO(SETUP_COMPILER_BINARY target_name library_name modules dyn_modules)
         add_executable(${target_name} ${DAS_DASCRIPT_MAIN_SRC})
+        # the main thread's native stack at Linux's 8 MB on Windows too (its default is 1 MB): the JIT'd call chains run
+        # on it, and an in-process compiler a module calls on the main thread (NVRTC) recurses deep below them
+        if (MSVC)
+            target_link_options(${target_name} PRIVATE /STACK:8388608)
+        elseif (WIN32)
+            target_link_options(${target_name} PRIVATE -Wl,--stack,8388608)
+        endif()
         TARGET_LINK_LIBRARIES(${target_name} ${library_name} ${SRC_LIBRARIES} ${${modules}})
         ADD_DEPENDENCIES(${target_name} ${library_name} ${${dyn_modules}})
         # Static modules generated include.
@@ -1992,6 +2002,7 @@ install(FILES ${PROJECT_SOURCE_DIR}/include/vecmath/LICENSE DESTINATION ${DAS_IN
 install(FILES ${PROJECT_SOURCE_DIR}/3rdparty/fmt/LICENSE DESTINATION ${DAS_INSTALL_DOCDIR} RENAME FMT.LICENSE)
 install(FILES ${PROJECT_SOURCE_DIR}/include/fast_float/LICENSE DESTINATION ${DAS_INSTALL_DOCDIR} RENAME FAST_FLOAT.LICENSE)
 install(FILES ${PROJECT_SOURCE_DIR}/src/misc/LUAU.LICENSE DESTINATION ${DAS_INSTALL_DOCDIR} RENAME LUAU.LICENSE)
+install(FILES ${PROJECT_SOURCE_DIR}/daslib/color_mapping.LICENSE DESTINATION ${DAS_INSTALL_DOCDIR} RENAME COLOR_MAPPING.LICENSE)
 install(FILES ${PROJECT_SOURCE_DIR}/3rdparty/unicode/LICENSE.txt DESTINATION ${DAS_INSTALL_DOCDIR} RENAME UNICODE.LICENSE COMPONENT UnicodeData)
 install(DIRECTORY ${PROJECT_SOURCE_DIR}/3rdparty/unicode/
     DESTINATION 3rdparty/unicode
@@ -2478,7 +2489,7 @@ install(CODE [[
         get_filename_component(_name "${_f}" NAME)
         get_filename_component(_f_abs "${_f}" ABSOLUTE)
         if((_name MATCHES "^REVIEW.*\\.(md|das)$"
-                OR _name MATCHES "^(ARCHITECTURE[A-Za-z_]*|MASTERPLAN[A-Za-z_]*|PERF_LEDGER|PROFILE|THINKING)\\.md$"
+                OR _name MATCHES "^(ARCHITECTURE[A-Za-z_]*|MASTERPLAN[A-Za-z_]*|PERF_LEDGER|LEDGER|PROFILE|THINKING)\\.md$"
                 OR _name MATCHES "^followup_.*\\.md$")
             AND NOT _f_abs STREQUAL _root_common
             AND NOT _f_abs STREQUAL _root_arch_common)
@@ -2535,7 +2546,7 @@ if(TARGET daslang)
         COMMAND ${CMAKE_COMMAND} -E copy ${_identity} ${DAS_TEST_CACHE_DIR})
     add_dependencies(dastest_cache_guard ${_das_test_binaries})
 endif()
-foreach(_t check_lint_tree check_vulkan run_tests_vulkan run_tests_imgui_integration
+foreach(_t check_lint_tree check_lint_dasllama check_vulkan run_tests_vulkan run_tests_imgui_integration
         build_site_wasm check_playground_samples run_imgui2rst run_vulkan2rst)
     if(TARGET ${_t} AND _das_shared_modules)
         add_dependencies(${_t} ${_das_shared_modules})

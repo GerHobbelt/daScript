@@ -1,14 +1,12 @@
 # dasLLAMA Measurement Code Review Checklist
 
 **Read `REVIEW_COMMON.md` (repo root) first - its contract binds this checklist.** Architecture
-docs: `ARCHITECTURE_MEASUREMENT.md`, `ARCHITECTURE_MEASUREMENT_KERNEL_RACE.md`,
-`ARCHITECTURE_MEASUREMENT_VK_GEMM_PROBE.md`, `ARCHITECTURE_MEASUREMENT_FAT_START.md`,
-`ARCHITECTURE_MEASUREMENT_SERVED.md`. Planned work: `followup_metal.md`, `followup_vulkan.md`,
-`followup_general.md`.
+docs: `ARCHITECTURE_MEASUREMENT*.md` beside this file. Planned work: `followup_metal.md`,
+`followup_vulkan.md`, `followup_general.md`.
 
-Every rule below that governs a figure binds a figure this change writes or changes - in the
-repo outside `site*/` (repo root), in a commit message, or in its PR body. It does not bind a
-figure a changed line carries unchanged.
+**A rule here that governs a figure binds only a figure the change writes or changes - in the repo
+outside `site*/` (repo root), in a commit message, or in its PR body - never one a changed line
+carries unchanged.**
 
 A figure is any number a run produced - a rate, a wall, a count, a byte size, or a ratio or
 percentage of two such numbers, produced by the runs its sides came from - or an error or
@@ -23,18 +21,20 @@ the wall of one internal stage (one model component's forward pass, one decoder 
 leg.
 
 An instrument is a file whose printed or returned result is a wall or rate of a run it drove,
-read by its own clock or by timestamps the device driver (Metal or Vulkan) returns, wherever the
-file sits; a file reading a spawned child process's clock, and a profiler-gated report a serving
-path prints beside its served output, are not one. A harness is the `harness/` script that drove
+read by its own clock or by timestamps a GPU driver returns, wherever the file sits; a file
+reading a spawned child process's clock, and a profiler-gated report a serving path prints beside
+its served output, are not one. A harness is the `harness/` script that drove
 a run, where one did. A route is the end-to-end code path a served turn takes, including the
 default route - the one a run given no command-line arguments and no environment overrides takes.
 
 The flags of a serving run are the tier (`-jit` or not), the `DAS_TUNE_POLICY` value in force,
 the CPU kernel backend the registry served (the one `DASLLAMA_PIN_BACKEND` pinned, or, with it
-unset, the one the auto-selection picked), the GPU backend where one served (Metal or Vulkan)
-with its device, and on Vulkan the coopmat mode (`DASLLAMA_COOPMAT`). The flags of an instrument
-run are the tier, the `DAS_TUNE_POLICY` value, the device, the coopmat mode where the GPU backend
-has one, and the instrument's arguments.
+unset, the one the auto-selection picked), the GPU backend where one served with its device, on
+Vulkan the coopmat mode (`DASLLAMA_COOPMAT`), and on CUDA the prefill GEMM form
+(`DASLLAMA_CUDA_MMQ`) and whether a launch overlaps the tail of the one before it
+(`DASLLAMA_CUDA_PDL`). The flags of an instrument run are the tier, the `DAS_TUNE_POLICY` value,
+the device, `DASLLAMA_COOPMAT` on Vulkan or `DASLLAMA_CUDA_MMQ` and `DASLLAMA_CUDA_PDL` on CUDA,
+and the instrument's arguments.
 
 The flags of a test run - a dastest test whose reading sets or checks a tolerance - are the tier,
 the `DAS_TUNE_POLICY` value, the device, the CPU kernel backend the registry served, the GPU
@@ -66,12 +66,23 @@ A cell, script or exe of this repository is a spawned or manual cell, a script i
 diff's tip, or an exe built from that tree; a script outside the tree is not one, whatever it
 calls.
 
-A box can mint a spawned cell when a rig leg it neither refuses nor skips drives the path the owed
-row measures and `performance/gen_bench_records.das --catalog official` carries the model; a
-manual cell when it runs the documented command's OS and backend and holds its model; a cell owed
-for new code when a rig leg or a documented command reaches that code's input. A row owed for a
-route that no rig leg drives and no `PROFILE.md` section documents a command for is one no box can
-mint.
+A box can mint a figure from a spawned cell when a rig leg it neither refuses nor skips drives the
+path the owed figure measures and `performance/gen_bench_records.das --catalog official` carries the
+model; from a manual cell when it runs the documented command's OS and backend and holds its model;
+a figure owed for new code when a rig leg or a documented command reaches that code's input. A
+figure owed for a route that no rig leg drives and no `PROFILE.md` section documents a command for
+is one no box can mint.
+
+A board box is a box with a `performance/records/<box>.json`. The release re-mint is a diff that
+runs `performance/gen_bench_records.das` with a release's exe on one or more board boxes and writes
+their rows into `performance/records/<box>.json`.
+
+A `held` entry is a `performance/records/annotations.json` entry carrying a board row's `gguf`,
+`box`, `engine`, `backend`, `flavor` and `workload`, whose `held` field names the follow-up ledger
+row that keeps the row off the board.
+
+**A diff that owes a figure from every board box of the author's lists the author's board boxes in
+its PR body.**
 
 **The naming that a rule governing a figure asks for attaches to a figure only by a sentence, a
 table heading, a provenance line or a `PERF_LEDGER.md` entry's opening paragraph that
@@ -79,16 +90,19 @@ unambiguously covers it, or by a citation of a passage or board row whose proven
 it.** A provenance line is a paragraph whose whole content is provenance - the harness, flags, box
 and exe; it covers the rows it names or, when it names none, the paragraphs and tables after it
 up to the next heading, the next provenance line, or the end of the `PERF_LEDGER.md` entry it
-sits in.
+sits in. A `PERF_LEDGER.md` entry is a bullet whose bold head carries a date, or a `###` section
+whose heading line carries a date; its head is that bold head or that heading line, and its opening
+paragraph is the paragraph its bold head sits in, or the first paragraph under its heading line. A
+dated bullet under a dated `###` heading is an entry of its own; every rule reading an entry reads
+the innermost one, and the section's entry is the text before its first dated bullet.
 
 **Where a paragraph or table of a `PERF_LEDGER.md` entry carries a figure from a run other than
 the one the entry's opening paragraph names, that paragraph or table, or a provenance line
-covering it, names the other run.** The opening paragraph is the one the entry's bold head sits
-in; the provenance it states covers every later paragraph and table of that entry that no naming
-of another run covers.
+covering it, names the other run.** The provenance the opening paragraph states covers every later
+paragraph and table of that entry that no naming of another run covers.
 
 **A tag (`external`, `direction-grade`, `out-of-process`, `debug-jit`) in the dated parenthesis of a
-`PERF_LEDGER.md` entry's bold head covers the whole entry. Anywhere else, a tag covers only the
+`PERF_LEDGER.md` entry's head covers the whole entry. Anywhere else, a tag covers only the
 figures of its own sentence. A tag inside a parenthesis covers only that parenthesis's figures,
 and a tag in a parenthesis with no figure covers nothing. A tag outside any parenthesis, in a
 figure-free sentence of a provenance line or of an entry's opening paragraph, covers the figures
@@ -96,17 +110,17 @@ that line or paragraph covers.**
 
 **A `PERF_LEDGER.md` entry states a turn wall (the wall of one whole served request, whatever the
 modality) or a tok/s rate of the engine this repository builds only when one of these produced
-it, named in the entry:**
-- `benchmarks/lcpp_bench.das`, as the released exe from `daspkg release` or as the `-jit` script;
-- a spawned or manual cell;
-- for a modality `lcpp_bench.das` has no command-line flag for, the `harness/` instrument, with its
-  command line;
-- for a figure timed through the scheduler or the server, `harness/served_bench.das` with its
-  command line, or an out-of-process replay named as the replay (its name, its request count),
-  over a server whose flags the entry states.
-A turn wall or tok/s rate printed by any other instrument stays in that run's log: the ledger entry
-carries what the instrument decided - served, declined, how many rows it counted - never that wall
-or rate.
+it, named in the entry: `benchmarks/lcpp_bench.das`, as the released exe from `daspkg release` or
+as the `-jit` script; a spawned or manual cell; for a modality `lcpp_bench.das` has no
+command-line flag for, the `harness/` instrument, with its command line; for the browser build,
+the parrot example's measure rail (`examples/dasLLAMA/parrot`, the browser and its worker count
+named) or the node runner `examples/dasLLAMA/wasm/run_node.js` over the AOT host, with its command
+line; for a figure timed
+through the scheduler or the server, `harness/served_bench.das` with its command line, or an
+out-of-process replay named as the replay (its name, its request count), over a server whose
+flags the entry states.** A turn wall or tok/s rate printed by any other instrument stays in that
+run's log: the ledger entry carries what the instrument decided - served, declined, how many rows
+it counted - never that wall or rate.
 
 **A pair of `-jit` readings held against each other keeps each arm's absolute wall or rate
 beside the pair, wherever the diff states it - checked-in text, commit message or PR body.**
@@ -137,8 +151,9 @@ checked-in text, names its source and the report it appears in.**
 **A figure a third-party program (an exe or a script) produced, and no cell, script, or exe of this
 repository produced, written down in any checked-in text, names its recipe: that program, its
 version, the model, the command line, and any environment settings the command line does not
-show.** A citation of an architecture section that states that run's recipe in full - no
-placeholder in its exe, model or command line - names it.
+show.** A citation of an architecture section that, together with the cited row's own `cmd` and
+`versions` fields, states that run's recipe in full - no placeholder in its exe, model or command
+line - names it.
 
 **A figure an instrument outside the tree produced, written down in any checked-in text, names
 that instrument by its role, the model, the box and the flags it ran under; a private instrument
@@ -148,24 +163,26 @@ is never named by its repository or command line - its role names it.**
 another comes from a script in the tree at the diff's tip, or an exe built from that tree, named
 with its command line.** A figure from a script outside the tree cannot be measured again.
 
-**A diff never changes a dated `PERF_LEDGER.md` entry - one whose bold head, or the heading it
-sits under, carries a date - beyond repairing a link or anchor; a new figure, caveat or correction
-goes in a new dated entry.**
+**A diff never changes a `PERF_LEDGER.md` entry beyond repairing a link or anchor; a new figure,
+caveat or correction goes in a new dated entry.**
 
 **A diff whose figures contradict a dated `PERF_LEDGER.md` entry's figures or conclusion - a
 sentence of the entry stating what its figures show - adds a new dated entry that carries them and
 names the old entry and the figure or conclusion it replaces.**
 
-**A `PERF_LEDGER.md` entry never carries a timing that argues for code the same diff does not
-land - that timing goes in the PR that lands the code.**
+**A `PERF_LEDGER.md` entry never carries a figure given as the reason to pick a value, formula or
+kernel that the same diff neither lands nor names as the Done of a `followup_*.md` row citing that
+entry - that figure goes in the PR that lands the code.**
 
 **A diff that lets a served turn, or a media encode a turn takes (an image, a video frame or an
 audio chunk), reach code no spawned or manual cell's input reaches - a new dispatch arm, a
-window-size arm inside a path a cell drives at other sizes, or a changed default route - mints a
-cell whose input reaches it, in the same change.**
+window-size arm inside a path a cell drives at other sizes, or a changed default route - adds a
+spawned cell whose input reaches it, writes the new cell's figures from every board box of the
+author's that can mint them into a dated `PERF_LEDGER.md` entry, in the same change, and names in
+its PR body the `followup_general.md` row under which the release re-mint owes its rows.**
 
-**A change that owes a cell or board row no box of the author's can mint names instead, in the
-same change, an artifact that shows the new code ran end to end - a record, a gate output, an
+**A change that owes a ledger figure no box of the author's can mint names instead, in the same
+change, an artifact that shows the new code ran end to end - a record, a gate output, an
 instrument's print - or the profile output that shows the change is faster
 (`benchmarks/lcpp_bench.das`'s `forward_profile` rows, or the tier's `DASLLAMA_GPU_PROF=1` token
 ledger), with the flags that run took.**
@@ -178,44 +195,60 @@ run printed none.** A fat exe is what `daspkg release --fat <class>` builds (`DA
 `ARCHITECTURE_MEASUREMENT_FAT_START.md#fat-first-start`).
 
 **A diff whose PR body, or a line it adds or changes, states that a route the tree served before the
-diff runs faster or does less work, where a rig leg runs the changed lines, re-mints in the same
-change a board row (`performance/records/<box>.json`) from that leg and names that row in the PR
-body.** The board is the module's committed record of what serving costs; a kernel win that never
-lands there is invisible to the next regression check.
+diff runs faster or does less work, where a rig leg runs the changed lines, writes that leg's walls
+from every board box of the author's that can mint it into a dated `PERF_LEDGER.md` entry naming the
+exe's commit and the command, and names in the PR body the `followup_general.md` row under which the
+release re-mint owes every board box's row.** The board is the module's committed record of what a
+release's exe costs to serve; a kernel win that lands in no ledger entry is invisible to the next
+regression check, and a row minted between releases shows a speed no shipped binary gives
+(`ARCHITECTURE_MEASUREMENT_RELEASE.md#board-rows-release-boundary`).
+
+**The release re-mint re-mints, on each board box it runs on, every row a `followup_general.md` row
+owes it there, deletes any `held` entry holding one, names each row in its PR body, and puts each
+re-minted row's last board figure beside the new one in a dated `PERF_LEDGER.md` entry in the same
+change.**
+
+**No diff but the release re-mint writes a row into `performance/records/<box>.json`; a figure any
+other diff owes lands in a dated `PERF_LEDGER.md` entry.**
 
 **A diff whose PR body, or a line it adds or changes, states that a route the tree served before the
 diff runs faster or does less work, where no rig leg runs the changed lines, states in its PR body
 that no rig leg runs them and names the instrument that does, with its command line.**
 
-**A diff that changes what a board cell loads, runs, counts or times - the model or corpus it
-reads, the model components (encoder, decoder, tower) it runs or the backend that serves them,
-the tokens or rows it divides the wall by, or the reference build it times (`DEFAULT_REF_SHA` in
-`benchmarks/setup_lcpp_ref.das`, or anything else deciding which reference binary or environment
-the run measures) - ships before/after rows for each affected cell and corpus, or withdraws the
-affected rows and names the withdrawal and its reason in the PR body.**
+**A diff that changes what a board cell loads, runs, counts or times - the model or corpus it reads,
+the model components (encoder, decoder, tower) it runs or the backend that serves them, the tokens
+or rows it divides the wall by, or the reference build it times (`DEFAULT_REF_SHA` in
+`benchmarks/setup_lcpp_ref.das`, or anything else deciding which reference binary or environment the
+run measures) - deletes each affected row or gives it a `held` entry, writes the cell's new figures
+from every board box of the author's that can mint it into a dated `PERF_LEDGER.md` entry beside the
+old ones, and names in its PR body the `followup_general.md` row under which the release re-mint
+owes the cell's rows.**
 
-**Before/after rows or a withdrawal shipped for a changed board cell land in the file the affected
-rows live in - `performance/records/<box>.json` or `PERF_LEDGER.md`.**
+**A `PERF_LEDGER.md` entry that withdraws an earlier entry's figure states the withdrawal's
+reason.**
 
-**A rate or wall of any served-turn leg, or a ratio of two such rates or walls, written down as
-a measurement rather than as a prediction is a defect unless it cites the committed board row it
-came from, or names harness, flags, environment overrides, box, the exe or script that ran it,
-and - for a figure aggregated over more than one timed run or input - the number of runs or
-inputs and the spread of the per-run figures: the standard deviation, or the min and max.**
+**A rate or wall of any served-turn leg, or a ratio of two such rates or walls, written down as a
+measurement rather than as a prediction is a defect unless it cites the committed board row it came
+from, or names harness, flags, environment overrides, box, the exe or script that ran it, and - for
+a figure aggregated over more than one timed run or input - the number of runs or inputs and the
+spread of the per-run figures: the standard deviation, or the min and max - or, where the instrument
+prints no spread, the `followup_general.md` row owing it.**
 
 **A diff that records a measured number an instrument prints - a time, a rate, or a figure
 computed from one - or changes what such a number measures, ships that number's alternate in the
 same change: the same instrument's row on the same fixture and input size with exactly one flag or
 environment override changed; the same instrument's row on the same fixture, input size, flags and
 overrides at a named other commit, tagged `direction-grade`; the other arm of the race the number
-comes from; or a third-party row that cites the architecture section holding its recipe.** A
-number with no alternate beside it cannot be compared to anything.
+comes from; or a third-party row that cites the architecture section holding the part of its recipe
+its own `cmd` and `versions` fields do not carry.** A number with no alternate beside it cannot
+be compared to anything.
 
-**A diff that records a third-party row lands that row's recipe - the program, its version, the
-model, the command line, and any environment settings the command line does not show - in the same
-change, in the `ARCHITECTURE_MEASUREMENT*.md` section that describes the instrument the row is
-compared with; where no section describes that instrument, the diff adds one.** The next entry
-re-runs the reference from the section, not from the earlier entry's prose.
+**A diff that records a third-party row lands, in the same change, every part of that row's
+recipe its own `cmd` and `versions` fields do not carry - the program, its version, the model, the
+command line, and any environment settings the command line does not show - in the
+`ARCHITECTURE_MEASUREMENT*.md` section that describes the instrument the row is compared with;
+where no section describes that instrument, the diff adds one.** The next entry re-runs the
+reference from the section, not from the earlier entry's prose.
 
 **A figure a cell, script or exe of this repository produced that is not a served-turn leg, whose
 value depends on the box it ran on, names the harness, the flags, the environment overrides, the
@@ -246,5 +279,6 @@ engine the run could adopt, and picks the winner.
 the pinned backend's layout, so a pin set after the load never reaches them.
 
 **A diff that adds or changes a CPU kernel-backend pin path makes the run refuse or skip when
-the pin names a backend the box has not registered - never fall through to the default.** A
-misspelled pin that falls through measures the default backend under the pinned one's name.
+`kernel_backend_pin_refusal` names a reason - a backend the box has not registered, a batch-only
+backend, or one the box cannot run - never fall through to the default.** A misspelled pin that
+falls through measures the default backend under the pinned one's name.

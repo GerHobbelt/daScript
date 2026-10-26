@@ -1686,6 +1686,9 @@ struct Model {
     dnalpha_fmt : array<KqFmt>
     wcls_fmt : KqFmt = KqFmt.q8
     emb_fmt : KqFmt = KqFmt.q8
+    //! the site scale a plane carries beside its blocks (NVFP4's per-tensor scale, the file's `<tensor>.scale`), keyed by
+    //! `site_scale_key`: the matmul epilogues multiply their rows by it, never the plane; a plane with no entry scales by one
+    site_scale : table<int64; float>
     // gemma4 E-series PLE token table (per_layer_token_embd) — gather-only (whole superblock-
     // aligned rows dequant per token), never repacked, never matmul'd; kq tag = native planes
     ple_emb_fmt : KqFmt = KqFmt.q8
@@ -3743,10 +3746,16 @@ def mm_fblob(var y : array<float>; t : Model; woff : int64; x : array<float>; n,
     matmul(y, t.fblob, woff, x, n, d)
 }
 
-// Batched fp32 matmul against the aux blob: Y [npos x d] token-major from X [npos x n] — the grouped
-// MoE prefill's router. matmul_batch is bit-for-bit npos x matmul, so routing matches decode exactly.
+// Batched fp32 matmul against the aux blob: Y [npos x d] token-major from X [npos x n], through the
+// tile walk, which rounds in its lanes (ARCHITECTURE_CPU_KERNELS.md#f32-batch-tile-lattice).
 def mm_fblob_b(var y : array<float>; t : Model; woff : int64; x : array<float>; n, d, npos : int64) {
     matmul_batch(y, t.fblob, woff, x, n, d, npos)
+}
+
+//! The same through the row nest: every output the per-token `mm_fblob`'s bits. The MoE router's
+//! prefill takes it, so a prefill routes a token as decode would.
+def mm_fblob_rows(var y : array<float>; t : Model; woff : int64; x : array<float>; n, d, npos : int64) {
+    matmul_batch_rows(y, t.fblob, woff, x, n, d, npos)
 }
 
 // rmsnorm with the weight at `woff` in the fp32 aux blob — straight to the tuned pointer core.
@@ -4958,6 +4967,18 @@ def private kq_slot(what : string; fmt : KqFmt) : int {
     return int(fmt)
 }
 
+def site_scale_key(fmt : KqFmt; woff : int64) : int64 => (int64(fmt) << 52) | woff
+
+[arch(at = "../ARCHITECTURE_ENGINE_FORMATS_NV4.md#nv4-site-scale")]
+def site_scale(t : Model; fmt : KqFmt; woff : int64) : float => empty(t.site_scale) ? 1.0 : (t.site_scale?[site_scale_key(fmt, woff)] ?? 1.0)
+
+def private apply_site_scale(var y : array<float>; t : Model; fmt : KqFmt; woff, yoff, count : int64) {
+    let sc = site_scale(t, fmt, woff)
+    if (sc != 1.0) {
+        scale_inplace(unsafe(addr(y[yoff])), sc, count)
+    }
+}
+
 // K-quant GEMV against a PRE-quantized activation (xq/xs/xbs already filled by the bs quantizer).
 // kq_repacked loads run the backend's stamped cores; disk-order loads run the portable kernels.
 def mm_at_kq_pre(var y : array<float>; t : Model; fmt : KqFmt; woff : int64; xq : array<int8>; xs : array<float>; xbs : array<int>; n, d : int64; yoff : int64 = 0l) {
@@ -4967,6 +4988,7 @@ def mm_at_kq_pre(var y : array<float>; t : Model; fmt : KqFmt; woff : int64; xq 
     } else {
         matmul_kq(kq_schema_id(fmt), y, t.kq[i].q, t.kq[i].s, woff, xq, xs, xbs, n, d, yoff)
     }
+    apply_site_scale(y, t, fmt, woff, yoff, d)
 }
 
 // K-quant matmul: Q8_K-quantize the activation (quants + per-256 scales + the per-16 sums the
@@ -4979,6 +5001,7 @@ def private mm_kq(var y : array<float>; t : Model; fmt : KqFmt; woff : int64; x 
 // Batched K-quant matmul. Repacked loads with a kq batch kernel run the native tile: one threaded
 // bs-requant, then ONE weight-stationary GEMM (bit-for-bit npos x the per-position GEMV).
 // Otherwise positions run serially, each bs-quantized then a full row GEMV.
+[arch(at="../ARCHITECTURE_ENGINE_FORMATS_NV4.md#nv4-site-scale")]
 def mm_b_kq(var s : Session; var y : array<float>; t : Model; fmt : KqFmt; woff : int64; x : array<float>; n, d, npos : int64) {
     if (t.kq_repacked && kernel_backend_has_kq_batch()) {
         requant_rows_q8k_bs(x, n, npos, s.xqb, s.xsb, s.xbsb)   // kq v2: Q8_K-form image
@@ -5023,6 +5046,7 @@ def mm_b_kq_pre(var y : array<float>; t : Model; fmt : KqFmt; woff : int64; xq :
     let i = kq_slot("mm_b_kq_pre", fmt)
     let ts_gemm = prof_ticks()
     matmul_kq_batch(kq_schema_id(fmt), y, t.kq[i].q, t.kq[i].s, woff, xq, xs, xbs, n, d, ntok)
+    apply_site_scale(y, t, fmt, woff, 0l, ntok * d)
     prof_add("mm_gemm", ts_gemm)
 }
 
@@ -5679,11 +5703,15 @@ def private cls_softcap_chain(t : Model; var s : Session; cap : float) {
         let kqpc = kq_plane_q(t, cls_fmt, t.wcls_off)
         let kspc = kq_plane_s(t, cls_fmt, t.wcls_off)
         let rowsc = kq_rows_for(cls_fmt)
+        let scc = site_scale(t, cls_fmt, t.wcls_off)
         team_parallel_stages(s.chain_stages) <| @(stage : int; jb : int; je : int) {   // nolint:PERF026 — dispatch-API lambda capture, see attention_chain_decode
             let r0 = int64(jb) * 32l
             let r1 = int64(je) * 32l
             if (is_kq) {
                 invoke(rowsc, lp, kqpc, kspc, xqp, xsp, xbsw, dim, r0, r1)
+                if (scc != 1.0) {
+                    scale_inplace(unsafe(lp + r0), scc, r1 - r0)
+                }
             } elif (f16w) {
                 invoke(mmrows16, lp, wp, ws16, xqp, xsp, dim, r0, r1)
             } else {
@@ -6949,6 +6977,9 @@ def set_moe_fused_expert_gemms(on : bool) {
 
 //! Whether the MoE prefill uses the grouped expert-bucketed path.
 def get_moe_grouped_prefill() : bool => g_moe_grouped_prefill
+
+//! Whether the grouped MoE prefill runs its expert GEMMs fused (region-list) rather than per expert.
+def get_moe_fused_expert_gemms() : bool => g_moe_fused_expert_gemms
 
 var g_forward_prof_acc : table<string; int64>
 

@@ -31,6 +31,7 @@ One section per module: what the module is for, then its public symbols grouped 
 - [class_boost](#class_boost) - The CLASS_BOOST module provides macros for extending class functionality, including the `[serialize_as_class]` annotation for automatic serialization and common class patterns like abstract method enforcement.
 - [clipboard_core](#clipboard_core) - The clipboard module provides synchronous access to the operating system's text clipboard.
 - [cmp](#cmp) - The CMP module holds comparisons: it writes lexicographic orderings from a list of keys.
+- [color_mapping](#color_mapping) - Module color_mapping
 - [command_line](#command_line) - Command-line utilities for daslang scripts and standalone executables.
 - [constant_expression](#constant_expression) - The CONSTANT_EXPRESSION module provides the `[constant_expression]` function annotation.
 - [consume](#consume) - The CONSUME module implements the `consume` pattern, which moves ownership of containers and other moveable values while leaving the source in a default-constructed state.
@@ -3398,7 +3399,7 @@ Text to speech in pure daslang: load a converted StyleTTS2-lineage GGUF (KittenT
 - `tts_prepare_voice_prompt` - Encode a reference once for shipping as a voice prompt.
 - `tts_register_voice` - Clone a voice: `pcm` (mono, at the model's own sample rate - `caps().sample_rate`) joins the roster under `name` and speaks from the next synthesis on.
 - `tts_register_voice_prompt` - Add or replace a named prepared voice without a codec encoder.
-- `tts_voice_prompt_valid` - Validate bounded finite latent frames and the model's language/codec geometry before registration.
+- `tts_voice_prompt_valid` - Validate bounded finite latent frames and the model's latent space and codec geometry before registration.
 
 ### Text front end
 
@@ -4155,8 +4156,9 @@ The AST module provides access to the abstract syntax tree representation of das
 ### Compilation and file access
 
 - `compile` - Compiles a daslang program from a source code string using the provided `FileAccess` and `ModuleGroup`, returning a `ProgramPtr` (null on failure).
-- `compile_file` - Compiles a daslang program from a file registered in the given `FileAccess` object, returning a `ProgramPtr` (null on failure).
+- `compile_file` - Compiles a file through `FileAccess` and invokes the block with a success flag, program and diagnostics.
 - `make_file_access` - Creates and returns a new `FileAccessPtr` (`smart_ptr<FileAccess>`) initialized as a default file-system-backed project.
+- `module_cache_path` - Returns the default AST module-cache path for a file and compile policies.
 - `parse_file` - Parses a daslang file and stops there — no type inference, no optimization, no simulation.
 - `parse_file_no_prerequisites` - Parses one file alone and stops there: no prerequisite walk, no type inference, no macro run, and the host's module-cache stream is hidden for the duration.
 - `require_module_now` - Compiles `module_name` - a `shared` module, named by its file - and its prerequisites into the process at the point of the call, or answers the module already there, under `codeOfPolicies`; a null `fileAccess` means the compiling program's own.
@@ -6964,6 +6966,24 @@ The MATH_BOOST module adds geometric types (`AABB`, `AABR`, `Ray`), intersection
 ### Integer rounding
 
 - `round_up` - `n` rounded up to a multiple of `m` (`m` > 0), in `m`'s integer type
+
+## color_mapping
+
+Module color_mapping
+
+
+### Tone mapping
+
+- `tone_aces_fit` - Apply the Narkowicz ACES approximation, clamping negative input to zero.
+- `tone_pbr_neutral` - Apply Khronos PBR Neutral to nonnegative RGB, compressing and desaturating highlights together.
+- `tone_reinhard` - Compress RGB channels independently with the Reinhard curve; negative input is clamped to zero.
+
+### sRGB transfer functions
+
+- `color_srgb_decode` - Decode nonnegative sRGB channels independently to linear RGB; values above one remain above one.
+- `color_srgb_decode_channel` - Decode one sRGB channel to linear light, clamping negative input to zero.
+- `color_srgb_encode` - Encode nonnegative linear RGB with the sRGB transfer function; values above one remain above one.
+- `color_srgb_encode_channel` - Encode one linear channel with the sRGB transfer function, clamping negative input to zero.
 
 ## option
 

@@ -22,14 +22,17 @@ goes in the family file.**
 **A GEMM against model weights in an ASR family file that does not go through a `*_mm*` wrapper
 or `mm_blob_b` is a defect, hand-written dot-product loops included.**
 
-**A matrix product of two activations - tensors the encoder or decoder computes, never a weight
-or the mel frontend's transform table (`build_dft_twiddles`) - in an ASR family file that does
-not go through `gemm_f32_jo` is a defect, hand-written loops included.**
+**A matrix product of two activations - tensors the encoder or decoder computes, never a weight or
+a constant table built from the audio config alone (the window, the DFT twiddles, the mel
+filterbank) - in an ASR family file that does not go through `gemm_f32_jo` is a defect,
+hand-written loops included.**
 
 **A buffer reused across encodes in an audio-rail file that is not `@scratch` - on its
 declaration, or on the parameter of every callee that grows it - is a defect.**
 
-**A debug or profiling code path in an audio-rail file that is not `[cold_path]` is a defect.**
+**A debug or profiling code path in an audio-rail file that is not `[cold_path]` is a defect.** Such
+a path is a function or branch that runs only while a debug or profiling knob (an environment
+variable, a setter or a flag) is on, and whose work the returned result does not need.
 
 **Never implement a transform inside an ASR family file - take the mel frontend's transform
 table from `dasllama/dasllama_audio.das` (`build_dft_twiddles`, or `build_fft_plan` +

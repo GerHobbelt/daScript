@@ -42,7 +42,9 @@ Cross-GPU parity of one source is secondary. Current entries:
   the tensor-layout loads and stores lower SPV_NV_cooperative_matrix2 workgroup tiles; Metal-4
   tensors carry no workgroup-scope tile of that form, so the Metal GEMMs stage through
   threadgroup memory. Deliberate, target-specific - a new tile shape (a marker struct and the
-  overload that types its call) is a member of this family, not a new asymmetry.
+  overload that types its call) is a member of this family, not a new asymmetry, and so is
+  `coopmatScaleAcc`, the block-scaled int8 fold over a workgroup-scope accumulator pair (SPIR-V's
+  per-element function the emitter synthesizes, CUDA's lane walk over the fragment layout).
 - **A kernel body calling a `[spirv_decode]` method directly is Vulkan-only; pending, not
   deliberate.** dasSpirv emits the call as an ordinary function - on a plane element the
   callee takes the element's index and chains through the plane, on a copy the struct
@@ -62,3 +64,25 @@ Cross-GPU parity of one source is secondary. Current entries:
   and writes no MSL text for it; the SPIR-V emitter's `precise` mark decorates each float result
   `NoContraction` (`modules/dasSpirv/ARCHITECTURE.md`, the `precise` section), so the mark has no
   Metal twin - a body ported between the emitters carries the property on its annotation.
+
+**The CUDA home (`dasCUDA`) against the two rows above.** Its emitter reads the Vulkan kernel
+vocabulary and lowers to C++ text, so each asymmetry lands on it as follows: method flattening
+and plain-member thread-locals - CUDA takes the SPIR-V side, a method is a `__device__`
+function taking the members it touches as hidden parameters, a plain member is rejected;
+`@readonly` - honored, a buffer no statement writes is `const T* __restrict__`; `tmm2d` - no,
+the coopmat families - yes, the KHR subgroup tiles as `mma.sync` fragment sets and the cm2
+workgroup tiles as shared arrays over per-warp fragment grids, both by inline PTX
+(`modules/dasCUDA/ARCHITECTURE.md`); `[spirv_decode]` - the decode-in-load callback is
+lowered, a direct call is a plain method call; literal fixed-array hoisting - present, to a
+`__constant__` table; no-contraction - `--use_fast_math` on every compile unless the kernel's
+annotation carries `precise=`, which compiles that kernel without it; `textureGrad` and
+`family=` - absent, the module is compute-only, and its dispatch lens is `[cuda_dispatch]` over
+the same bindings the other two lenses read. Its second vocabulary tier, `cuda_intrinsics`
+(`modules/dasCUDA/ARCHITECTURE_EMIT.md#cuda-kernel-vocabulary-tiers`: the `cp.async` copies,
+`ldmatrix`, the block-scale fixup `mma_scale_acc`, `bar_sync`, `byte_perm`, the clock and inline
+PTX, and the FP4 tensor rung - the e2m1 fragments, `mma_block_scaled`, `mma_scale_cols`,
+`cvt_e2m1x2`, `cvt_ue4m3`, the `__DAS_ARCH_A__` arch suffix a text that uses them takes), is
+CUDA-only by construction - every declaration of the module is a member, a new one included - a
+body that calls one is a CUDA-only kernel, and the dasLLAMA bodies that do (the codebook word
+map's permute and the nv4 GEMV's `Nv4GemvPrmtT`, the int8 MMQ tile `MmqT`, the FP4 leaf `MmqFp4T`
+with its feeds `Fp4FeedT` and `ArRqFp4T`) are the CUDA home's own. Deliberate, target-specific.

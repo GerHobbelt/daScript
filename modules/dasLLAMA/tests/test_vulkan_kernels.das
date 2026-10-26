@@ -31,7 +31,7 @@ require ?vulkan dasllama/dasllama_kqformat
 require ?vulkan dasllama/dasllama_convert   // quantize_q8_0_into: the hyper-connection low-rank requant's oracle
 require ?vulkan spirv/spirv_dis   // foreach_inst / count_op_operand_at: the stamp-shape cells' instruction walks
 require ?vulkan spirv/spirv_grammar   // SpvOp / SpvDecoration / SpvStorageClass
-require dasllama/dasllama_gemm_schema   // Q8_BLOCK_ELEMS sizes the q8 plane helper outside the vulkan arm; kq_dev_ssb_i - the fixtures size their device scale planes per format
+require dasllama/dasllama_gemm_schema   // nolint:STYLE029,LINT019 — kq_dev_ssb_i sizes the fixtures' device scale planes inside the vulkan arm; the darwin world reads only its kqformat re-export
 require ?vulkan daslib/shader_lingua_franca   // gl_GlobalInvocationID — the CPU replay drives it per lane (only vulkan-guarded arms replay)
 require dasllama/dasllama_common   // MoeGate: the routing cells' select oracle takes the softmax router
 require dasllama/dasllama_arch_qwen35
@@ -51,11 +51,7 @@ require daslib/f16_cvt   // nolint:STYLE030,LINT019 — the half conversions of 
 let private NAN_HALF = 0x7E00   //! the sentinel half no kernel writes: a NaN
 let private NAN_HALF_PAIR = 0x7E007E00u   //! ... in both lanes of a word
 let private TILE_SLACK_ROWS = int(TILE_READ_SLACK)   //! the cm2 fixtures' rows past the last region, the engine's count: a stamp that loads partial columns unclamped (`STILE`) reads the last region's column rounded up to its BN, so the slack holds while every such stamp keeps BN <= slack + 1
-let private TILE_CELL_K = 768   //! every per-format tile cell's K: three unrolled superblock passes on both depths (a K-quant width is a multiple of 256, so no K-quant stamp ever takes the k loop's tail; the q8 s and e cells' Q8_CELL_K takes the edge path)
-let private Q8_CELL_K = 544     //! the q8 cm2 s and e cells' K: 512 + 32, off the 64-deep stamp's k grid, so the tile takes its padded edge path (the l and m cells run K = 576, the fast path)
-let private TILE_CELL_D = 160   //! every tile cell's weight rows a plane: one full 128-tile and a 32-row remainder - the KHR arm's edge tile, the cm2 arms' clamped second tile over rows 32..160
-let private TILE_CELL_ROWS0 = 300   //! the tile cells' two regions: on every arm's rows a workgroup, whole tiles and an edge
-let private TILE_CELL_ROWS1 = 260
+let private Q8_CELL_K = 544     //! the q8 cm2 s and e cells' K: 512 + 32, off the 64-deep stamp's k grid, so the tile takes its padded edge path (the l and m cells run K = 576, the fast path; TILE_CELL_K, the per-format cells' K, sits in _vk_kq_fixtures)
 
 let private I8_SENTINEL_BITS = 0x80808080u   //! a Q8 quant plane's fill: -128 in every byte, a value no requant produces (|q| <= 127)
 
@@ -120,16 +116,6 @@ def private tile_fixture(n, blk_k : int; var wqh, wsh : array<uint>; xf_mul, xf_
     return <- f
 }
 
-//! one q8 fmt-0 host plane of `totblk` blocks: the s8 quant words hashed at `i * wq_mul + wq_add`, the f16 scale pairs at `i * ws_mul + ws_add`
-def private q8_plane(totblk : int; wq_mul, wq_add, ws_mul, ws_add : uint; var wqh, wsh : array<uint>) {
-    let qwords = totblk * int(Q8_BLOCK_ELEMS / 4l)   //! a byte an element: q8 has no `kq_desc` stride row (`kq_qsb` panics on it by design)
-    let swords = (totblk * 2 + 3) / 4   //! an f16 scale a block
-    delete wqh
-    delete wsh
-    wqh <- hashed_words(qwords, wq_mul, wq_add)
-    wsh <- ws_plane(swords, ws_mul, ws_add)
-}
-
 //! the tile cells' q8 fmt-0 host planes from two seeds, K = n over both weight planes
 def private q8_planes(n : int; wq_seed, ws_seed : uint; var wqh, wsh : array<uint>) => q8_plane(2 * TILE_CELL_D * (n / 32), 1u, wq_seed, 1u, ws_seed, wqh, wsh)
 
@@ -178,107 +164,6 @@ def private tile_cell_arms(t : T?; tag : string; fmt : int; var f : TileFixture;
     return <- y_ref
 }
 
-//! a per-format tile cell's scale-row form: the words one superblock (or one per-32 block) lays in the device's scale plane
-enum private ScaleForm {
-    d_dmin_hash   //! [d | dmin], then four hashed sub-scale words
-    d_pairs       //! four words of two per-block f16 d, then a zero pad word
-    hash_d        //! four hashed signed sub-scale words, then [d | 0]
-    d_hi_hash     //! [d | the row's hashed high bits], then one hashed word of 4-bit sub-scale fields
-    q51_dm        //! one [d | m] word a block, m signed
-    iq4nl32_d     //! two f16 d a word
-    mx4_e8m0      //! four E8M0 bytes a word
-}
-
-//! one row of the per-format tile table: the format, its K and scale unit, the hashed quant words a unit, the scale-row form
-//! with its d / dmin multipliers and hash seed, the activation plane's hash offset, the arms (per-32 formats run s, e and KHR),
-//! the format's oracle and the sibling codebook's oracle its planes must read apart under (`control`, when set)
-struct private FmtTile {
-    fmt : KqFmt
-    n, blk_k, wq_words : int
-    wq_seed : uint
-    form : ScaleForm
-    dmul, mmul : float
-    sseed, xf_add : uint
-    per32 : bool
-    oracle : function<(wq : array<uint>; wsu : array<uint>; xf : array<uint>; recs : array<uint>; nrec, n, d : int; var y : array<float>) : void>
-    control : function<(wq : array<uint>; wsu : array<uint>; xf : array<uint>; recs : array<uint>; nrec, n, d : int; var y : array<float>) : void>
-}
-
-//! the per-format tile cells' table: one row a `kq_sb` or per-32 format
-def private fmt_tile_rows() : array<FmtTile> {
-    var rows : array<FmtTile>
-    static_if (typeinfo builtin_module_exists(vulkan)) {
-        rows <- [
-            FmtTile(fmt = KqFmt.k4, n = TILE_CELL_K, blk_k = 256, wq_words = 32, wq_seed = 29u, form = ScaleForm.d_dmin_hash, dmul = 0.0002, mmul = 0.00005, sseed = 613u, xf_add = 5u, oracle = @@k4f16_gemm_oracle),
-            FmtTile(fmt = KqFmt.k5, n = TILE_CELL_K, blk_k = 256, wq_words = 40, wq_seed = 29u, form = ScaleForm.d_dmin_hash, dmul = 0.0002, mmul = 0.00005, sseed = 613u, xf_add = 5u, oracle = @@k5f16_gemm_oracle),
-            FmtTile(fmt = KqFmt.k2, n = TILE_CELL_K, blk_k = 256, wq_words = 16, wq_seed = 31u, form = ScaleForm.d_dmin_hash, dmul = 0.0004, mmul = 0.0003, sseed = 91u, xf_add = 7u, oracle = @@k2f16_gemm_oracle),
-            FmtTile(fmt = KqFmt.iq2s, n = TILE_CELL_K, blk_k = 256, wq_words = 18, wq_seed = 29u, form = ScaleForm.d_dmin_hash, dmul = 0.0002, mmul = 0.0, sseed = 613u, xf_add = 5u, oracle = @@iq2sf16_gemm_oracle),
-            FmtTile(fmt = KqFmt.iq2xs, n = TILE_CELL_K, blk_k = 256, wq_words = 16, wq_seed = 29u, form = ScaleForm.d_dmin_hash, dmul = 0.0002, mmul = 0.0, sseed = 613u, xf_add = 5u, oracle = @@iq2xsf16_gemm_oracle),
-            FmtTile(fmt = KqFmt.q40, n = TILE_CELL_K, blk_k = 256, wq_words = 32, wq_seed = 29u, form = ScaleForm.d_pairs, dmul = 0.0002, mmul = 0.00013, xf_add = 5u, oracle = @@q40f16_gemm_oracle),
-            FmtTile(fmt = KqFmt.iq4nl, n = TILE_CELL_K, blk_k = 256, wq_words = 32, wq_seed = 29u, form = ScaleForm.d_pairs, dmul = 0.0002, mmul = 0.00013, xf_add = 5u, oracle = @@iq4nlf16_gemm_oracle),
-            FmtTile(fmt = KqFmt.k3, n = TILE_CELL_K, blk_k = 256, wq_words = 24, wq_seed = 29u, form = ScaleForm.hash_d, dmul = 0.0002, sseed = 811u, xf_add = 5u, oracle = @@k3f16_gemm_oracle),
-            FmtTile(fmt = KqFmt.k6, n = TILE_CELL_K, blk_k = 256, wq_words = 48, wq_seed = 41u, form = ScaleForm.hash_d, dmul = 0.0002, sseed = 811u, xf_add = 5u, oracle = @@k6f16_gemm_oracle),
-            FmtTile(fmt = KqFmt.iq3s, n = TILE_CELL_K, blk_k = 256, wq_words = 26, wq_seed = 29u, form = ScaleForm.d_hi_hash, dmul = 0.0002, sseed = 613u, xf_add = 5u, oracle = @@iq3sf16_gemm_oracle, control = @@iq3xxsf16_gemm_oracle),
-            FmtTile(fmt = KqFmt.iq2xxs, n = TILE_CELL_K, blk_k = 256, wq_words = 16, wq_seed = 29u, form = ScaleForm.d_hi_hash, dmul = 0.0002, sseed = 613u, xf_add = 5u, oracle = @@iq2xxsf16_gemm_oracle),
-            FmtTile(fmt = KqFmt.iq3xxs, n = TILE_CELL_K, blk_k = 256, wq_words = 24, wq_seed = 29u, form = ScaleForm.d_hi_hash, dmul = 0.0002, sseed = 613u, xf_add = 5u, oracle = @@iq3xxsf16_gemm_oracle, control = @@iq2xxsf16_gemm_oracle),
-            FmtTile(fmt = KqFmt.iq4xs, n = TILE_CELL_K, blk_k = 256, wq_words = 32, wq_seed = 29u, form = ScaleForm.d_hi_hash, dmul = 0.0002, sseed = 613u, xf_add = 5u, oracle = @@iq4xsf16_gemm_oracle, control = @@iq3s4f16_gemm_oracle),
-            FmtTile(fmt = KqFmt.iq3s4, n = TILE_CELL_K, blk_k = 256, wq_words = 32, wq_seed = 29u, form = ScaleForm.d_hi_hash, dmul = 0.0002, sseed = 613u, xf_add = 5u, oracle = @@iq3s4f16_gemm_oracle, control = @@iq4xsf16_gemm_oracle),
-            FmtTile(fmt = KqFmt.q51, n = 704, blk_k = 32, wq_words = 5, wq_seed = 37u, form = ScaleForm.q51_dm, xf_add = 5u, per32 = true, oracle = @@q51f16_gemm_oracle),         //! the 26B-A4B's expert width: 22 blocks, two unrolled 256-passes and a 192 tail
-            FmtTile(fmt = KqFmt.iq4nl32, n = 640, blk_k = 32, wq_words = 4, wq_seed = 41u, form = ScaleForm.iq4nl32_d, xf_add = 5u, per32 = true, oracle = @@iq4nl32f16_gemm_oracle, control = @@q4032f16_gemm_oracle),   //! Qwen3.8-Flash-Next's expert width: 20 blocks, two unrolled 256-passes and a 128 tail
-            FmtTile(fmt = KqFmt.q4032, n = 896, blk_k = 32, wq_words = 4, wq_seed = 43u, form = ScaleForm.iq4nl32_d, xf_add = 5u, per32 = true, oracle = @@q4032f16_gemm_oracle, control = @@iq4nl32f16_gemm_oracle),   //! Qwen2.5-0.5B's width: 28 blocks, three unrolled 256-passes and a 128 tail
-            FmtTile(fmt = KqFmt.q5032, n = 1408, blk_k = 32, wq_words = 5, wq_seed = 47u, form = ScaleForm.iq4nl32_d, xf_add = 5u, per32 = true, oracle = @@q5032f16_gemm_oracle, control = @@q5032_noqh_f16_gemm_oracle),   //! Qwen1.5-MoE's expert down width: 44 blocks, five unrolled 256-passes and a 128 tail
-            FmtTile(fmt = KqFmt.mx4, n = 704, blk_k = 32, wq_words = 4, wq_seed = 53u, form = ScaleForm.mx4_e8m0, xf_add = 5u, per32 = true, oracle = @@mx4f16_gemm_oracle)            //! 22 blocks: eleven 64-deep k steps, two unrolled 256-passes and a 192 tail
-        ]
-    }
-    return <- rows
-}
-
-//! a table row's host planes over both weight planes: the quant words hashed at `i + wq_seed` (cool scales throughout: the tile's f16 sums stay far from 65504)
-def private fmt_tile_planes(row : FmtTile; var wqh, wsh : array<uint>) {
-    static_if (typeinfo builtin_module_exists(vulkan)) {
-        let units = 2 * TILE_CELL_D * (row.n / row.blk_k)
-        delete wqh
-        wqh <- hashed_words(units * row.wq_words, 1u, row.wq_seed)
-        if (row.form == ScaleForm.d_dmin_hash || row.form == ScaleForm.d_pairs || row.form == ScaleForm.hash_d) {
-            wsh |> resize(units * 5)
-        } elif (row.form == ScaleForm.d_hi_hash) {
-            wsh |> resize(units * 2)
-        } elif (row.form == ScaleForm.q51_dm) {
-            wsh |> resize(units)
-        }
-        for (sb in range(units)) {
-            if (row.form == ScaleForm.d_dmin_hash) {
-                wsh[sb * 5] = packHalf2x16(float2(row.dmul * float(1 + sb % 7), row.mmul * float(1 + sb % 5)))
-                for (wi in range(4)) {
-                    wsh[sb * 5 + 1 + wi] = hash_word(uint(sb * 4 + wi) + row.sseed)
-                }
-            } elif (row.form == ScaleForm.d_pairs) {
-                for (wi in range(4)) {
-                    let p = sb * 4 + wi
-                    wsh[sb * 5 + wi] = packHalf2x16(float2(row.dmul * float(1 + p % 7), row.mmul * float(1 + p % 5)))
-                }
-            } elif (row.form == ScaleForm.hash_d) {
-                for (wi in range(4)) {
-                    wsh[sb * 5 + wi] = hash_word(uint(sb * 4 + wi) + row.sseed)
-                }
-                wsh[sb * 5 + 4] = packHalf2x16(float2(row.dmul * float(1 + sb % 7), 0.0))
-            } elif (row.form == ScaleForm.d_hi_hash) {
-                wsh[sb * 2] = packHalf2x16(float2(row.dmul * float(1 + sb % 7), 0.0)) | (hash_word(uint(sb * 2) + row.sseed) << 16u)
-                wsh[sb * 2 + 1] = hash_word(uint(sb * 2 + 1) + row.sseed)
-            } elif (row.form == ScaleForm.q51_dm) {
-                wsh[sb] = packHalf2x16(float2(0.0002 * float(1 + sb % 7), 0.0001 * float(sb % 5) - 0.0002))
-            }
-        }
-        if (row.form == ScaleForm.iq4nl32_d) {
-            delete wsh
-            wsh <- iq4nl32_scale_words(units, 0.0002)
-        } elif (row.form == ScaleForm.mx4_e8m0) {
-            delete wsh
-            wsh <- mx4_scale_words(units)
-        }
-    }
-}
-
 //! one per-format tile cell: the table row's planes through `tile_cell_arms` - the cm2 l/m/s/e tiles and the KHR tile, or s, e and
 //! KHR on a per-32 format - against its oracle; a row with a `control` then reads the same planes apart under the sibling codebook
 def private fmt_tile_cell(t : T?; fmt : KqFmt) {
@@ -293,7 +178,7 @@ def private fmt_tile_cell(t : T?; fmt : KqFmt) {
         var wqh, wsuh : array<uint>
         fmt_tile_planes(rows[at], wqh, wsuh)
         var f <- tile_fixture(rows[at].n, rows[at].blk_k, wqh, wsuh, 3u, rows[at].xf_add)
-        let arms <- rows[at].per32 ? [ARM_CM2_S, ARM_CM2_E, ARM_KHR] : tile_arms_all()
+        let arms <- fmt == KqFmt.mx4 ? [ARM_CM2_S, ARM_CM2_E, ARM_KHR] : tile_arms_all()   // the expert-only form has no dense l or m column
         let name = "{fmt}"
         var y_ref <- tile_cell_arms(t, name, int(fmt), f, arms, rows[at].oracle)
         if (!empty(y_ref) && rows[at].control != null) {
@@ -329,24 +214,6 @@ def private q8_tile_cell(t : T?; arm, k : int; wq_seed, ws_seed, xf_mul, xf_add 
     } else {
         t |> skip("dasVulkan not present")
     }
-}
-
-//! a two-region tile schedule: records [wblk0, row0, cnt, wg0] - rows [0, cnt0) from weight block 0, rows [cnt0, cnt0 + cnt1)
-//! from `wblk1` - then the workgroup map at `ttile` rows by `wtiles` weight tiles, `extra` zero words past it; `wgs` the map's length
-def private two_region_sched(cnt0, cnt1, wblk1, ttile, wtiles, extra : int) : tuple<words : array<uint>; wgs : int> {
-    let wgs0 = ((cnt0 + ttile - 1) / ttile) * wtiles
-    let wgs = wgs0 + ((cnt1 + ttile - 1) / ttile) * wtiles
-    var words : array<uint>
-    words |> resize(2 * 4 + wgs + extra)
-    words[2] = uint(cnt0)
-    words[4] = uint(wblk1)
-    words[5] = uint(cnt0)
-    words[6] = uint(cnt1)
-    words[7] = uint(wgs0)
-    for (w in range(wgs)) {
-        words[8 + w] = w < wgs0 ? 0u : 1u
-    }
-    return <- (words = words, wgs = wgs)
 }
 
 //! the host planes of an sdot4-feed tile cell: the weight quants and scales, the activation quants and their per-unit scales
@@ -632,7 +499,8 @@ def test_vkd_fa_stamp_refusals(t0 : T?) {
                 t |> success(fa_ladder_panics(enc, true, 256l, true, false), "the KHR arm has no gated stamp: the {ladder} ladder refuses")
                 t |> success(fa_ladder_panics(enc, false, 128l, false, true), "no softcap stamp off head size 256: the {ladder} ladder refuses")
                 t |> success(fa_ladder_panics(enc, false, 128l, true, false), "no gated stamp off head size 256: the {ladder} ladder refuses")
-                t |> success(fa_ladder_panics(enc, false, 96l, false, false), "a head size no stamp serves: the {ladder} ladder refuses")
+                t |> success(fa_ladder_panics(enc, false, 112l, false, false), "a head size no stamp serves: the {ladder} ladder refuses")
+                t |> success(fa_ladder_panics(enc, true, 96l, false, false), "the KHR arm has no head-96 stamp: the {ladder} ladder refuses")
             }
             t |> success(fa_ladder_panics(false, false, 128l, false, false, true), "no sink stamp off head size 64: the ensure ladder refuses")
             t |> success(fa_ladder_panics(false, false, 256l, false, true, true), "no sink stamp at the softcap's head size: the ensure ladder refuses")
@@ -919,7 +787,7 @@ def test_vkd_ext_roster(t0 : T?) {
     }
 }
 
-[test, arch(at="../ARCHITECTURE_GPU_VULKAN_GEMM.md#cm2-decode-16bit-lanes")]
+[test, arch(at="../ARCHITECTURE_GPU_SHARED_GEMM.md#cm2-decode-16bit-lanes")]
 def test_vkd_direct_decode(t0 : T?) {
     t0 |> run("a [spirv_decode] method called directly from the kernel body == the same method on the CPU") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
@@ -1687,17 +1555,6 @@ def private actf16_halves(g, u : array<float>; nelem, elem0 : int; ubase : int =
 // Synthetic planes — any bit pattern is valid K-quant data, EXCEPT the scale words, which are
 // composed from finite halves so a NaN can't poison the compare.
 
-def private safe_half(i : uint) : uint {
-    let tab = fixed_array(0x3C00u, 0xB800u, 0x3400u, 0x4200u, 0x2E00u, 0xBC00u, 0x3E00u, 0xB000u)
-    return tab[i % 8u]
-}
-
-def private ws_word(i : uint) : uint => safe_half(i * 7u + 3u) | (safe_half(i * 3u + 1u) << 16u)
-
-//! `n` scale words `ws_word(i * mul + add)`: two finite halves a word
-def private ws_plane(n : int; mul, add : uint) : array<uint> =>
-    <- [for (i in range(n)); ws_word(uint(i) * mul + add)]
-
 // ===== CPU oracles =====
 // The reference side of every arm: plain sequential math (the Metal kernel-unit pattern), or the
 // class's own per-block methods driven lane-free. Device subgroup/tile folds reassociate float
@@ -1775,8 +1632,8 @@ def private check_qbytes(t : T?; tag : string; got, want : array<uint>) {
     delete poisoned
 }
 
-//! the fourteen kq formats with a decode GEMV leaf and a batch tile, the order the family cells walk
-let private KQ_LEAF_FMTS = fixed_array(int(KqFmt.k4), int(KqFmt.q40), int(KqFmt.k5), int(KqFmt.k6), int(KqFmt.iq4xs), int(KqFmt.k3), int(KqFmt.iq3s), int(KqFmt.iq3xxs), int(KqFmt.iq4nl), int(KqFmt.k2), int(KqFmt.iq2s), int(KqFmt.iq2xs), int(KqFmt.iq2xxs), int(KqFmt.iq3s4))
+//! the fifteen kq formats with a decode GEMV leaf and a batch tile, the order the family cells walk
+let private KQ_LEAF_FMTS = fixed_array(int(KqFmt.k4), int(KqFmt.q40), int(KqFmt.k5), int(KqFmt.k6), int(KqFmt.iq4xs), int(KqFmt.k3), int(KqFmt.iq3s), int(KqFmt.iq3xxs), int(KqFmt.iq4nl), int(KqFmt.k2), int(KqFmt.iq2s), int(KqFmt.iq2xs), int(KqFmt.iq2xxs), int(KqFmt.iq3s4), int(KqFmt.nv4))
 
 //! the family's class rails engage on the device: every leaf's pipeline builds, else the cell skips
 def private kq_leaf_rails_engage(ensure : block<(fmt : int) : bool>) : bool {
@@ -1784,27 +1641,6 @@ def private kq_leaf_rails_engage(ensure : block<(fmt : int) : bool>) : bool {
         if (!invoke(ensure, f)) return false
     }
     return true
-}
-
-//! a decode GEMV cell's host planes: the weight quants and scales, the region records, one activation row's quants and scales
-struct private GemvFix {
-    wqh, wsh, xqh : array<uint>
-    xsh : array<float>
-    regs : array<uint>
-}
-
-//! `nreg` regions of `d` rows, region r's weights at r x d x `units` units, the scale plane `wsh` moved in; the weight quants
-//! `units` a row of `wq_words` words hashed at `i + wq_seed`, the activation row's `xunits` of `xq_words` at
-//! `hash_word(i * xq_mul + xq_add)`, its scales `xs0 + (i % xs_mod) * xs_step`
-def private gemv_fix(nreg, d, units, wq_words : int; wq_seed : uint; var wsh : array<uint>; xunits, xq_words : int; xq_mul, xq_add : uint;
-                     xs0, xs_step : float; xs_mod : int) : GemvFix {
-    var f <- GemvFix(wqh <- hashed_words(nreg * d * units * wq_words, 1u, wq_seed), wsh <- wsh,
-        xqh <- hashed_words(xunits * xq_words, xq_mul, xq_add), xsh <- row_fill(xunits, 1, 0, xs_step, -xs0, xs_mod))
-    f.regs |> resize(nreg * 2)
-    for (r in range(nreg)) {
-        f.regs[r * 2] = uint(r * d * units)
-    }
-    return <- f
 }
 
 let private GEMV_PLANES = fixed_array(0, 1, 2, 3, 4, 5)   //! a GEMV cell's plane ids in the classes' binding order
@@ -1954,7 +1790,7 @@ def private per32_sum_rows_cell(t : T?; fmt : KqFmt; n, wq_words : int; wq_seed,
 
 [test]
 def test_vkd_kq_gemv_family(t0 : T?) {
-    t0 |> run("kq GEMV class family == the CPU oracle (all 14 formats)") <| @(t : T?) {
+    t0 |> run("kq GEMV class family == the CPU oracle (all 15 formats)") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
             if (!kq_leaf_rails_engage() <| $(fmt : int) => gemv_cls_ensure(fmt)) {
                 t |> skip("no Vulkan device, or a kq GEMV class pipeline failed to build")
@@ -1967,7 +1803,7 @@ def test_vkd_kq_gemv_family(t0 : T?) {
             for (fmt in KQ_LEAF_FMTS) {
                 let sb_words = int(kq_qsb(kq_fmt_of_slot(fmt)) / 4l)
                 let ws_words_n = rows * nsb * int(kq_dev_ssb_i(fmt) / 4l)
-                var inscope wsh <- ws_plane(ws_words_n, 1u, uint(fmt) * 13u)
+                var inscope wsh <- kq_ws_plane(fmt, ws_words_n, 1u, uint(fmt) * 13u)
                 var f <- gemv_fix(nreg, d, nsb, sb_words, uint(fmt) * 77777u, wsh, nsb, 64, 31u, 5u, 0.5, 0.25, 7)
                 var inscope y_ref <- kq_gemv_oracle(fmt, f.wqh, f.wsh, f.xqh, f.xsh, f.regs, nsb * 256, d, nreg)
                 with_cell_planes() $(var cp : CellPlanes) {
@@ -2008,55 +1844,13 @@ def test_vkd_kq_gemv_family(t0 : T?) {
     }
 }
 
-//! the token-table gather's expected rows: row r the table row `ids[r]` at superblock `wblk0`, each element the class's own
-//! `blk_decode` lane under the lo or hi term pair `blk_fold` reads, times `escale`; an `EMB_ID_HOST` row the host's staged row
-def private emb_gather_oracle(fmt : int; wq, ws : array<uint>; ids : array<uint>; xh : array<float>; n : int; wblk0 : uint; escale : float) : array<float> {
-    var y : array<float>
-    static_if (typeinfo builtin_module_exists(vulkan)) {
-        var noq : array<uint>
-        var nos : array<float>
-        var k = kq_cls_ref(fmt, wq, ws, noq, nos)
-        let nsb = n / 256
-        y |> resize(length(ids) * n)
-        for (r in range(length(ids))) {
-            if (ids[r] == EMB_ID_HOST) {
-                for (e in range(n)) {
-                    y[r * n + e] = xh[r * n + e]
-                }
-                continue
-            }
-            for (b in range(nsb * 8)) {
-                var wl = uint4(0u)
-                var wh = uint4(0u)
-                let terms = k->blk_decode(wblk0 + ids[r] * uint(nsb) + uint(b / 8), uint(b % 8), wl, wh)
-                let bsum = k->fold_reads_bsum()
-                for (e in range(32)) {
-                    let w = e < 16 ? wl : wh
-                    let word = (e % 16) / 4
-                    let lane = word == 0 ? w.x : (word == 1 ? w.y : (word == 2 ? w.z : w.w))
-                    let q = float(int(int8((lane >> uint((e % 4) * 8)) & 0xFFu)))
-                    let a = e < 16 ? terms.x : terms.z
-                    let c = bsum ? (e < 16 ? terms.y : terms.w) : 0.0
-                    y[r * n + b * 32 + e] = (a * q + c) * escale
-                }
-            }
-        }
-        unsafe {
-            delete k
-        }
-        delete noq
-        delete nos
-    }
-    return <- y
-}
-
 //! the token-table gather's leaves (`KqEmb<Fmt>`, `KqGemvLeafT` under `EMB`) for every superblock format: four rows - three token
 //! ids off a five-row table past a one-row lead (the plane's block base), one `EMB_ID_HOST` row copying the host's staged row -
 //! against the class's own lane decode, and on the formats with a float witness each gathered row dotted with a Q8_K activation
 //! row against `kq_gemv_float_oracle` over the same table row (the lanes in element order, independent of the class bit-math)
 [test]
 def test_vkd_emb_gather_family(t0 : T?) {
-    t0 |> run("the token-table gather's leaves == the class lane decode, and the float witness, for all 14 superblock formats") <| @(t : T?) {
+    t0 |> run("the token-table gather's leaves == the class lane decode, and the float witness, for all 15 superblock formats") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
             if (!kq_leaf_rails_engage() <| $(fmt : int) => emb_cls_ensure(fmt)) {
                 t |> skip("no Vulkan device, or a token-table gather pipeline failed to build")
@@ -2073,7 +1867,7 @@ def test_vkd_emb_gather_family(t0 : T?) {
             for (fmt in KQ_LEAF_FMTS) {
                 let sb_words = int(kq_qsb(kq_fmt_of_slot(fmt)) / 4l)
                 var inscope wq <- hashed_words((vocab + lead) * nsb * sb_words, 1u, uint(fmt) * 9973u)
-                var inscope ws <- ws_plane((vocab + lead) * nsb * int(kq_dev_ssb_i(fmt) / 4l), 1u, uint(fmt) * 17u)
+                var inscope ws <- kq_ws_plane(fmt, (vocab + lead) * nsb * int(kq_dev_ssb_i(fmt) / 4l), 1u, uint(fmt) * 17u)
                 let wblk0 = uint(lead * nsb)
                 var inscope y_ref <- emb_gather_oracle(fmt, wq, ws, ids, xh, n, wblk0, escale)
                 with_cell_planes() $(var cp : CellPlanes) {
@@ -2490,21 +2284,6 @@ def test_vkd_act_family(t0 : T?) {
     }
 }
 
-//! `n` elements of `src` from `soff`, plus the bias row `bh` from `boff` when the cell has one (an empty `bh`: no bias)
-def private biased_row(src : array<float>; soff : int; bh : array<float>; boff, n : int) : array<float> {
-    if (empty(bh)) {
-        return <- [for (i in range(n)); src[soff + i]]
-    }
-    return <- [for (i in range(n)); src[soff + i] + bh[boff + i]]
-}
-
-//! the rope oracle's cos and sin rows: the two halves of the `hs`-wide cos | sin row at `at`
-def private cossin_rows(csh : array<float>; at, hs : int) : tuple<c : array<float>; s : array<float>> {
-    var c <- [for (j in range(hs / 2)); csh[at + j]]
-    var s <- [for (j in range(hs / 2)); csh[at + hs / 2 + j]]
-    return <- (c = c, s = s)
-}
-
 //! the KV writers' rows at one position: q from `q0h` at `qoff`, k and v from `kvh` at `koff` / `voff`, each biased by its
 //! `bh` row past `bpad` (q, then k, then v) when the cell has one; q and k rotated by the engine's table rope on the cos | sin
 //! row of `csh` at `csoff`; k and v through `round`, the mirror's grid
@@ -2524,50 +2303,6 @@ def private rope_kv_rows(q0h, kvh, bh, csh : array<float>; qoff, koff, voff, cso
     }
     delete cs
     return <- (q = q, k = k, v = v)
-}
-
-//! the fused qk-norm + rope + KV-store oracle at one position: each head row biased (when `bh` is set), normed by the engine's
-//! rmsnorm on its weight row (q heads on `wnh`'s first `hs`, k heads on the next), rotated by the engine's table rope on the
-//! cos | sin row `csh`; k lands at mirror row `krow` and v copies its raw row plus its bias, both through `round`
-def private qkn_rope_rows(q0h, kvh, bh, wnh, csh : array<float>; bpad, nh, nkvh, hs, krow, mirn : int; eps : float;
-                          round : block<(x : float) : float>) : tuple<q : array<float>; mk : array<float>; mv : array<float>> {
-    let qd = nh * hs
-    let kvd = nkvh * hs
-    var cs <- cossin_rows(csh, 0, hs)
-    var q, mk, mv : array<float>
-    q |> resize(qd)
-    mk |> resize(mirn)
-    mv |> resize(mirn)
-    for (wid in range(nh + nkvh)) {
-        let is_k = wid >= nh
-        let hh = is_k ? wid - nh : wid
-        let sbase = is_k ? qd + hh * hs : hh * hs
-        var inscope row <- is_k ? biased_row(kvh, sbase, bh, bpad + sbase, hs) : biased_row(q0h, sbase, bh, bpad + sbase, hs)
-        var inscope nrow : array<float>
-        nrow |> resize(hs)
-        unsafe {
-            rmsnorm(addr<float?>(nrow[0]), addr<float const?>(row[0]), addr<float const?>(wnh[is_k ? hs : 0]), int64(hs), eps)
-        }
-        rope_tab_ref(nrow, 0, hs, hs, hs, true, cs.c, cs.s)
-        for (i in range(hs)) {
-            if (is_k) {
-                mk[krow + hh * hs + i] = invoke(round, nrow[i])
-            } else {
-                q[hh * hs + i] = nrow[i]
-            }
-        }
-        if (is_k) {
-            var inscope vrow <- biased_row(kvh, qd + kvd + hh * hs, bh, bpad + qd + kvd + hh * hs, hs)
-            for (i in range(hs)) {
-                mv[krow + hh * hs + i] = invoke(round, vrow[i])
-            }
-            delete vrow
-        }
-        delete row
-        delete nrow
-    }
-    delete cs
-    return <- (q = q, mk = mk, mv = mv)
 }
 
 //! the rope + K/V store (`rope_kv_cls`, or under `f16` its half-mirror twin) on one row against the CPU oracle: the q rows roped
@@ -2741,7 +2476,7 @@ def test_vkd_q8_batch_tile(t0 : T?) {
 
 [test]
 def test_vkd_kq_batch_family(t0 : T?) {
-    t0 |> run("kq batch tile class family == the CPU oracle (all 14 formats)") <| @(t : T?) {
+    t0 |> run("kq batch tile class family == the CPU oracle (all 15 formats)") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
             if (!kq_leaf_rails_engage() <| $(fmt : int) => kq_batch_cls_ensure(fmt, false)) {
                 t |> skip("no Vulkan device, or a kq batch class pipeline failed to build")
@@ -2759,7 +2494,7 @@ def test_vkd_kq_batch_family(t0 : T?) {
                 let wswords = totsb * int(kq_dev_ssb_i(fmt) / 4l)
                 var p = Sdot4Planes(ws_bytes = int64(wswords) * 4l)
                 p.wqh <- hashed_words(totsb * sb_words, 1u, uint(fmt) * 131u)
-                p.wsh <- ws_plane(wswords, 1u, uint(fmt) * 17u)
+                p.wsh <- kq_ws_plane(fmt, wswords, 1u, uint(fmt) * 17u)
                 p.xqh <- hashed_words(rows * nsb * 64, 7u, 2u)
                 p.xsh <- row_fill(rows * nsb, 1, 0, 0.05, -0.3, 11)
                 //! one family set serves every format; region 1's weights follow region 0's stack in superblock units
@@ -3097,52 +2832,30 @@ def test_vkd_k5_cm2_batch(t0 : T?) {
 
 [test]
 def test_vkd_q51_cm2_batch(t0 : T?) {
-    t0 |> run("cm2 Q5_1 s and e tiles == the CPU oracle (the per-32 plane verbatim: nibble | qh bit, d * q + m off one word)") <| @(t : T?) {
+    t0 |> run("cm2 Q5_1 l/m/s/e tiles and the KHR tile == the CPU oracle (the per-32 plane verbatim: nibble | qh bit, d * q + m off one word)") <| @(t : T?) {
         fmt_tile_cell(t, KqFmt.q51)
     }
 }
 
-//! the iq4nl32 cells' scale words: cool f16 d, two blocks a word, so the tile's f16 sums stay far from 65504
-def private iq4nl32_scale_words(totblk : int; mul : float) : array<uint> {
-    var w : array<uint>
-    static_if (typeinfo builtin_module_exists(vulkan)) {
-        w |> resize((totblk + 1) / 2)
-        for (i in range(length(w))) {
-            w[i] = packHalf2x16(float2(mul * float(1 + (2 * i) % 7), mul * float(1 + (2 * i + 1) % 7)))
-        }
-    }
-    return <- w
-}
-
 [test]
 def test_vkd_iq4nl32_cm2_batch(t0 : T?) {
-    t0 |> run("cm2 IQ4_NL per-32 s and e tiles == the CPU oracle (the per-32 plane verbatim: d * LUT[nibble] off a half-word d)") <| @(t : T?) {
+    t0 |> run("cm2 IQ4_NL per-32 l/m/s/e tiles and the KHR tile == the CPU oracle (the per-32 plane verbatim: d * LUT[nibble] off a half-word d)") <| @(t : T?) {
         fmt_tile_cell(t, KqFmt.iq4nl32)
     }
 }
 
 [test]
 def test_vkd_q4032_cm2_batch(t0 : T?) {
-    t0 |> run("cm2 Q4_0 per-32 s and e tiles == the CPU oracle (iq4nl32's plane form: d * (nibble - 8) off a half-word d)") <| @(t : T?) {
+    t0 |> run("cm2 Q4_0 per-32 l/m/s/e tiles and the KHR tile == the CPU oracle (iq4nl32's plane form: d * (nibble - 8) off a half-word d)") <| @(t : T?) {
         fmt_tile_cell(t, KqFmt.q4032)
     }
 }
 
 [test]
 def test_vkd_q5032_cm2_batch(t0 : T?) {
-    t0 |> run("cm2 Q5_0 per-32 s and e tiles == the CPU oracle (q51's quant form under a half-word d: d * (q - 16), the qh bit as q's fifth)") <| @(t : T?) {
+    t0 |> run("cm2 Q5_0 per-32 l/m/s/e tiles and the KHR tile == the CPU oracle (q51's quant form under a half-word d: d * (q - 16), the qh bit as q's fifth)") <| @(t : T?) {
         fmt_tile_cell(t, KqFmt.q5032)
     }
-}
-
-//! the mx4 cells' E8M0 bytes: exponents 112..124 (2^-16 .. 2^-4 halved), four a word, so the tile's f16 sums stay far from 65504
-def private mx4_scale_words(totblk : int) : array<uint> {
-    var w : array<uint>
-    w |> resize((totblk + 3) / 4)
-    for (b in range(totblk)) {
-        w[b / 4] |= uint(112 + b % 13) << uint((b % 4) * 8)
-    }
-    return <- w
 }
 
 [test]
@@ -3170,6 +2883,13 @@ def test_vkd_k2_cm2_batch(t0 : T?) {
 def test_vkd_iq4nl_cm2_batch(t0 : T?) {
     t0 |> run("cm2 IQ4_NL l/m/s/e tiles and the KHR tile == the CPU oracle (codebook + per-block f16 d decode-in-load; the KHR arm stages the same decode)") <| @(t : T?) {
         fmt_tile_cell(t, KqFmt.iq4nl)
+    }
+}
+
+[test]
+def test_vkd_nv4_cm2_batch(t0 : T?) {
+    t0 |> run("cm2 NVFP4 l/m/s/e tiles and the KHR tile == the CPU oracle (the doubled e2m1 codes under the UE4M3 sub-block scales at half, decode-in-load; the KHR arm stages the same decode)") <| @(t : T?) {
+        fmt_tile_cell(t, KqFmt.nv4)
     }
 }
 
@@ -3431,7 +3151,7 @@ def test_vkd_at_attn(t0 : T?) {
                     var sc = cp |> cls_set(fixed_array(pq, pk, pv, py), @@set_at_attn_cls)
                     var pc = AtAttnArgs(rows = uint(rows), w0 = uint(w0), qd = uint(qd),
                         kvd = uint(kvd), hs = uint(hs), kv_mul = uint(kv_mul),
-                        flags = gated ? 1u : 0u, dpl = uint(hs / 32), scale = scale)
+                        flags = gated ? AT_ATTN_FLAG_GATED : 0u, dpl = uint(hs / 32), scale = scale)
                     cp |> cell_record() $(raw2 : VkCommandBuffer; var h2 : VkHaz) {
                         enc_at_attn_cls(raw2, h2, sc, pc, int64(nheads * ((rows + 7) / 8)))
                     }
@@ -3457,7 +3177,8 @@ def private fa_arm_ensure(khr : bool) : bool {
         for (hs in fixed_array(64l, 128l, 256l, 512l)) {
             if (!fa_stamp_pair_ensure(khr, hs, false, false, false, true)) return false
         }
-        if (!fa_stamp_pair_ensure(khr, 64l, false, false, true, true)) return false   //! the sink stamps (gpt-oss)
+        let h96_ok = khr || fa_stamp_pair_ensure(false, 96l, false, false, false, true)
+        if (!h96_ok || !fa_stamp_pair_ensure(khr, 64l, false, false, true, true)) return false
     }
     return true
 }
@@ -3491,7 +3212,7 @@ def private fa_flat_read(var cp; khr : bool; hs : int; sink : bool; var sfa; pcf
     return <- cp |> plane_run(py)
 }
 
-def private fa_tile_run(t : T?; khr : bool) {
+def private fa_tile_run(t : T?; khr : bool) {   // nolint:STYLE037,LINT019 — one arm table over both flash arms; the head-96 skip is its one branch past the limit
     static_if (typeinfo builtin_module_exists(vulkan)) {
         let tag = khr ? "fa_khr" : "fa_cm2"
         let nheads = 4
@@ -3506,8 +3227,10 @@ def private fa_tile_run(t : T?; khr : bool) {
                 (hs = 256, window = 0, sink = false, lead = 0, ring = 0), (hs = 512, window = 0, sink = false, lead = 0, ring = 0),
                 (hs = 128, window = 40, sink = false, lead = 0, ring = 0), (hs = 64, window = 0, sink = true, lead = 0, ring = 0),
                 (hs = 64, window = 40, sink = true, lead = 0, ring = 0), (hs = 64, window = 0, sink = false, lead = 8, ring = 0),
-                (hs = 128, window = 40, sink = false, lead = 0, ring = 128), (hs = 256, window = 40, sink = false, lead = 0, ring = 128))) {
+                (hs = 128, window = 40, sink = false, lead = 0, ring = 128), (hs = 256, window = 40, sink = false, lead = 0, ring = 128),
+                (hs = 96, window = 0, sink = false, lead = 0, ring = 0), (hs = 96, window = 40, sink = false, lead = 0, ring = 0))) {
             let hs = arm.hs
+            continue if (khr && hs == 96)   // the KHR flash tile has no head-96 stamp (../ARCHITECTURE_GPU_SHARED_ATTN.md#flash-attn-tile)
             let window = arm.window   //! a sliding layer's arm: the queries attend the `window` positions up to their own
             let sink = arm.sink
             let lead = arm.lead
@@ -5462,21 +5185,6 @@ def test_vkd_q8_gemv_pair(t0 : T?) {
     }
 }
 
-//! a per-32 plane's scale words for `totblk` blocks: q51's d | m halves, iq4nl32's two halves a word, mx4's four E8M0 bytes a word
-def private blk32_scale_plane(f : KqFmt; totblk : int) : array<uint> {
-    var words : array<uint>
-    static_if (typeinfo builtin_module_exists(vulkan)) {
-        if (f == KqFmt.q51) {
-            words <- [for (b in range(totblk)); packHalf2x16(float2(0.002 * float(1 + b % 7), 0.001 * float(b % 5) - 0.002))]
-        } elif (f == KqFmt.iq4nl32 || f == KqFmt.q4032 || f == KqFmt.q5032) {
-            words <- iq4nl32_scale_words(totblk, 0.002)
-        } else {
-            words <- mx4_scale_words(totblk)
-        }
-    }
-    return <- words
-}
-
 //! the per-32 formats' columns against the engine's scalar dots: column c's activation row (the quants and scales c x nb
 //! blocks in) dotted with every weight row, landing at c x d + row
 def private blk32_ncol_oracle(f : KqFmt; wqh, wsh, xqh : array<uint>; xsh : array<float>; n, d, ncol_max : int) : array<float> {
@@ -5523,7 +5231,7 @@ def private gemv_ncol_arm(t : T?; f : KqFmt; n, d : int) {
             wsh |> push_from(blk32_scale_plane(f, d * xblk))
         } else {
             wqh |> push_from(hashed_words(d * xblk * int(kq_qsb(f) / 4l), 1u, uint(fmt) * 77777u))
-            wsh |> push_from(ws_plane(d * xblk * int(kq_dev_ssb(f) / 4l), 1u, uint(fmt) * 13u))
+            wsh |> push_from(kq_ws_plane(fmt, d * xblk * int(kq_dev_ssb(f) / 4l), 1u, uint(fmt) * 13u))
         }
         var xqh <- hashed_words(xq_col * ncol_max, 31u, 5u)
         var xsh <- row_fill(xblk * ncol_max, 1, 0, 0.25, -0.5, 7)
@@ -5602,7 +5310,7 @@ def test_vkd_gemv_ncol(t0 : T?) {
                 return
             }
             let fmts <- kq_gemv_fmts()
-            t |> equal(length(fmts), 1 + length(KQ_LEAF_FMTS), "the superblock roster is q8 and the fourteen kq leaves")
+            t |> equal(length(fmts), 1 + length(KQ_LEAF_FMTS), "the superblock roster is q8 and the fifteen kq leaves")
             for (f in type<KqFmt>) {
                 t |> success(gemv_cls_ensure(int(f)), "{f}: the one-column class rail engages")
                 gemv_ncol_arm(t, f, 1024, 96)   //! n a multiple of 256 for the superblock formats, d even for the row-pair stamps
@@ -6246,7 +5954,7 @@ def test_vkd_at_prep(t0 : T?) {
             let rows = 3
             let w0 = 5      // the k panel lands at absolute positions
             let eps = 0.00001
-            let flags = 3   // gated q + qk-norm
+            let flags = AT_FLAG_GATED_Q | AT_FLAG_QK_NORM
             // smalls layout (offsets ride meta words / push args): eps@0, rmsq@16, rmsk@16+hs,
             // cos rows, sin rows
             let rmsq_off = 16
@@ -6272,13 +5980,13 @@ def test_vkd_at_prep(t0 : T?) {
                 var scq = cp |> cls_set(fixed_array(psq, pqp, pg, psm, pb), @@set_at_prep_cls)
                 var sck = cp |> cls_set(fixed_array(psk, pkp, pg, psm, pb), @@set_at_prep_cls)
                 var pcq = AtPrepArgs(d = uint(qd), nh = uint(nh), hs = uint(hs),
-                    half = uint(half), flags = uint(flags), rms_off = uint(rmsq_off),
+                    half = uint(half), flags = flags, rms_off = uint(rmsq_off),
                     cos_off = uint(cos_off), sin_off = uint(sin_off), obase = 0u,
-                    qsrc = 1u, boff = 0u, hasb = 1u, eps = eps)
+                    is_q_pass = 1u, boff = 0u, hasb = 1u, eps = eps)
                 var pck = AtPrepArgs(d = uint(kvd), nh = uint(nkvh), hs = uint(hs),
-                    half = uint(half), flags = uint(flags), rms_off = uint(rmsk_off),
+                    half = uint(half), flags = flags, rms_off = uint(rmsk_off),
                     cos_off = uint(cos_off), sin_off = uint(sin_off), obase = uint(w0),
-                    qsrc = 0u, boff = uint(qd), hasb = 1u, eps = eps)
+                    is_q_pass = 0u, boff = uint(qd), hasb = 1u, eps = eps)
                 cp |> cell_record() $(raw : VkCommandBuffer; var h : VkHaz) {
                     enc_at_prep_cls(raw, h, scq, pcq, int64(rows))
                     enc_at_prep_cls(raw, h, sck, pck, int64(rows))
@@ -9034,8 +8742,8 @@ def test_vk_coopmat_default_and_tile_pick(t0 : T?) {
             t |> equal(cm2_tile_cols(768l, 64l), 32l)       // ... up to the half-m edge
             t |> equal(cm2_tile_cols(768l, 65l), 128l)      // past it an m column is more than half full
             t |> equal(batch_tile_edges(int(KqFmt.iq3s4), 672l, 112l, true).tc, 128l, "the batch arm's cm2 column follows the pick on a superblock format")
-            t |> equal(batch_tile_edges(int(KqFmt.iq4nl32), 2560l, 112l, true).tc, 32l, "... and is the s column on a per-32 expert plane, its one cm2 stamp")
-            t |> equal(batch_tile_edges(int(KqFmt.q51), 2560l, 512l, true).tc, 32l, "... q51 too")
+            t |> equal(batch_tile_edges(int(KqFmt.iq4nl32), 2560l, 112l, true).tc, cm2_tile_cols(2560l, 112l), "... and on a per-32 plane, which carries the l and m columns too")
+            t |> equal(batch_tile_edges(int(KqFmt.q51), 2560l, 512l, true).tc, cm2_tile_cols(2560l, 512l), "... q51 too")
             t |> equal(batch_tile_edges(int(KqFmt.mx4), 2880l, 512l, true).tc, 32l, "... and mx4")
             t |> equal(cm2_tiles(512l, 512l), 16l)                             // the 1B k/v shape: four m columns of four
             t |> equal(pick_str(cm2_gemm_pick(512l, 512l, 2048l)), "256x4x512")   // ... alone it fills under half the SMs: four l chunks (32 workgroups of 8 steps, 205 units with the reduce, against 320 whole)
@@ -10008,7 +9716,7 @@ def test_vkd_moe_routing(t0 : T?) {
 def test_vkd_gemv_lane_rule(t0 : T?) {
     t0 |> run("gemv_lanes_per_row: the measured lane split per format class and row length") <| @(t : T?) {
         static_if (typeinfo builtin_module_exists(vulkan)) {
-            let grid = fixed_array(KqFmt.iq2s, KqFmt.iq2xs, KqFmt.iq2xxs, KqFmt.iq3xxs, KqFmt.iq4xs, KqFmt.iq4nl, KqFmt.iq3s4)
+            let grid = fixed_array(KqFmt.iq2s, KqFmt.iq2xs, KqFmt.iq2xxs, KqFmt.iq3xxs, KqFmt.iq4xs, KqFmt.iq4nl, KqFmt.iq3s4, KqFmt.nv4)
             let lattice = fixed_array(KqFmt.k2, KqFmt.k3, KqFmt.k4, KqFmt.k5, KqFmt.k6, KqFmt.q40, KqFmt.iq3s)
             //! row length -> (the grid formats' lanes, the k-lattice formats' lanes); 0 = the whole subgroup
             let rows = fixed_array((n = 768l, g = 8u, l = 8u), (n = 1024l, g = 8u, l = 16u), (n = 1536l, g = 8u, l = 16u),

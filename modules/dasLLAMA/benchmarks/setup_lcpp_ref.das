@@ -66,6 +66,7 @@ def private shell_unsafe(s : string) : bool {
         find(s, "%") >= 0 || find(s, "\n") >= 0 || find(s, "\r") >= 0)
 }
 
+[arch(at="../ARCHITECTURE_MEASUREMENT.md#vulkan-reference-rows")]
 def private flavor_flags(flavor : string) : string {
     if (flavor == "clean-cpu") {
         return " -DGGML_ACCELERATE=OFF -DGGML_BLAS=OFF -DGGML_METAL=OFF"
@@ -160,7 +161,7 @@ def main : int {
     return rc
 }
 
-[arch(at="../ARCHITECTURE_MEASUREMENT.md#asr-gpu-pairs")]
+[arch(at="../ARCHITECTURE_MEASUREMENT_AUDIO.md#asr-gpu-pairs")]
 def private build_flavor(dest, f, short_sha : string; jobs : int) : int {
     let build_dir = path_join(dest, "build-{f}")
     print("=== {f} -> {build_dir} (minutes-class: configure + build llama-bench)\n")

@@ -17,6 +17,7 @@ require dastest/testing_boost public
 require daslib/fio public
 require strings public
 require daslib/strings_boost   // split — the DASLLAMA_TEST_ARMS comma list
+require daslib/utf8_utils   // each_word - the transcript compares' word tokens
 require math   // the tower-parity statistics
 require dasllama/dasllama_gguf   // gguf_shard_paths — split models tier on their TOTAL size
 require dasllama/dasllama_common   // decode_ — the eyeball rail detokenizes through the model
@@ -35,6 +36,16 @@ let LARGE_TIER_BYTES = 6ul * 1024ul * 1024ul * 1024ul
 def mirror_kv_dtype() : KVDtype => gpu_device_session_dtype_()
 
 let SUPPRESSED_LOGIT = -1.0e30   //! a pinned id's logit on both arms
+
+//! the log-probability of `target` under the logits row `v`: a NaN anywhere reads NaN (`hmax` and `hlse` fold with `max`, which drops
+//! a NaN operand, so the row is scanned first); a pinned id at SUPPRESSED_LOGIT drops out of the sum on its own; the floor keeps an all-pinned or empty row finite
+def target_logp(v : array<float>; target : int64) : float {
+    for (x in v) {
+        return x if (is_nan(x))
+    }
+    let m = max(SUPPRESSED_LOGIT, hmax(unsafe(addr<float const?>(v[0])), long_length(v)))
+    return v[target] - m - float(log(hlse(v, m)))
+}
 
 //! the largest |logit| among the live ones: a suppressed id (`SUPPRESSED_LOGIT`) would set a relative bar to nonsense
 def live_maxabs(v : array<float>) : float {
@@ -214,18 +225,24 @@ def with_pinned_kernels(body : block) {
 //! and the engine chain runs on the native stack.
 def parity_gen_ok(tr : Model; prompt, want : array<int64>; dn_chunked : bool = false; eyeball : bool = false; prefix_bar : bool = false) : bool {
     let n_gen = length(want)
-    var ok = false
+    let got <- parity_gen_ids(tr, prompt, n_gen, dn_chunked)
+    if (eyeball) {
+        to_log(LOG_INFO, "eyeball want: {eyeball_text(tr, want)}\n")
+        to_log(LOG_INFO, "eyeball got:  {eyeball_text(tr, got)}\n")
+    }
+    return length(got) == n_gen && fixture_ok(prefix_bar, prefix_match_len(got, want), int64(n_gen))
+}
+
+//! `prompt` greedily continued for `n_gen` ids on a fresh session under the pinned kernels - the continuation alone, past
+//! generate's echo (shorter than `n_gen` where the stream stopped early)
+def parity_gen_ids(tr : Model; prompt : array<int64>; n_gen : int; dn_chunked : bool = false) : array<int64> {
+    var got : array<int64>
     with_pinned_kernels(dn_chunked) {
         let ids <- greedy_gen(tr, prompt, n_gen)
         let echo = length(prompt) - 1
-        let got <- [for (i in range(n_gen)); ids[echo + i]; where echo + i < length(ids)]
-        ok = length(got) == n_gen && fixture_ok(prefix_bar, prefix_match_len(got, want), int64(n_gen))
-        if (eyeball) {
-            to_log(LOG_INFO, "eyeball want: {eyeball_text(tr, want)}\n")
-            to_log(LOG_INFO, "eyeball got:  {eyeball_text(tr, got)}\n")
-        }
+        got <- [for (i in range(n_gen)); ids[echo + i]; where echo + i < length(ids)]
     }
-    return ok
+    return <- got
 }
 
 //! `steps` greedy decode steps through `s` from BOS at position 0: each step's pick into `ids`, the last step's logits into `logits`
@@ -383,3 +400,11 @@ def model_available(t : T?; path : string) : bool {
 
 //! true under the JIT with the model at `path` stocked; else the cell has registered the loud skip and its caller returns
 def jit_model_available(t : T?; path : string) : bool => jit_only(t) && model_available(t, path)
+
+//! a transcript's lower-cased word tokens, the punctuation and casing a near-tie token can flip left
+//! out - what two rails of the same model must agree on
+def transcript_words(text : string) : array<string> {
+    var words : array<string>
+    each_word(text, words)
+    return <- words
+}

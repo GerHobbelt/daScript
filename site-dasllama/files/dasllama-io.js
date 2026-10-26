@@ -15,6 +15,7 @@
   /* ── shared utils ─────────────────────────────────────────────── */
   function fmt(n, d) { return Number(n).toFixed(d == null ? 0 : d); }
   function tps(v) { return v > 0 ? fmt(v, 1) : '-'; }
+  function ms(v) { return v > 0 ? fmt(v, 0) : '-'; }
   function ratio(das, ref) { return (ref > 0 && das > 0) ? das / ref : null; }
 
   // community rows are third-party text — escape everything that reaches innerHTML.
@@ -30,7 +31,13 @@
     return /^\/api\/[A-Za-z0-9_./-]+$/.test(String(u)) ? String(u) : '#';
   }
   function boxLabel(cpu, fallback) {
-    return cpu ? String(cpu).replace('64-Core Processor', '').trim() : fallback;
+    return cpu ? String(cpu).replace(/\s*\d+-Core Processor$/, '').trim() : fallback;
+  }
+
+  // a discrete GPU's run leads with the card: the CPU only feeds it
+  function machineLabel(cpu, gpu, backend, fallback) {
+    var box = boxLabel(cpu, fallback);
+    return backend === 'vulkan' && gpu ? String(gpu).replace(/^NVIDIA\s+/, '') + ' · ' + box : box;
   }
 
   function api(url) {
@@ -92,10 +99,37 @@
     return null;
   }
 
-  function buildRows(runs) {
+  /* A pair section's cells, each a /api/runs field: the LLM ladder's three rates, and the image
+     turn's encode - the vision tower alone, wall ms, so its ratio is the reference's over das's -
+     beside its prefill and decode rates. */
+  var LLM_CELLS = [
+    { key: 'pp', field: 'pp512', label: 'pp512' },
+    { key: 'tg', field: 'tg128', label: 'tg128' },
+    { key: 'tgb', field: 'tg128b4', label: 'tg128@4' }
+  ];
+  var IMAGE_CELLS = [
+    { key: 'enc', field: 'img_enc', label: 'encode ms', time: true, test: 'img:enc' },
+    { key: 'pp', field: 'img_pp', label: 'prefill', test: 'img:pp' },
+    { key: 'tg', field: 'img_tg', label: 'decode', test: 'img:tg' }
+  ];
+
+  // the tests a board annotation voided on a run (`voided_tests`, a comma list): the store
+  // serves such a cell as 0, so only this list tells a withheld cell from an unmeasured one
+  function voidedTest(fr, test) {
+    if (!fr || !test) return false;
+    return String(fr.voided_tests || '').split(',').some(function (s) { return s.trim() === test; });
+  }
+
+  function withheldCell() {
+    return '<td class="dl-num dl-dim" title="withheld: the run measured this cell, but a board annotation withholds it - the annotation\'s note (records/annotations.json) gives the reason">✱</td>';
+  }
+
+  function buildRows(runs, workload, cells) {
+    workload = workload || '';
+    cells = cells || LLM_CELLS;
     var out = [];
     runs.forEach(function (fr) {
-      if ((fr.engine !== 'das' && fr.engine !== 'mlx-lm') || fr.workload) return;   // LLM rows; audio has its own ladders
+      if ((fr.engine !== 'das' && fr.engine !== 'mlx-lm') || (fr.workload || '') !== workload) return;   // audio has its own ladders
       var lane = laneOf(fr);
       var ref = null;
       if (lane) {
@@ -109,22 +143,25 @@
       }
       var laneLabel = lane ? lane.label :
         (fr.backend === 'cpu' ? 'cpu' : (fr.backend === 'metal' || fr.backend === 'vulkan') ? 'gpu' : fr.backend);
-      out.push({
+      var row = {
         model: String(fr.gguf).replace(/\.gguf$/, ''), arch: fr.model_arch || '', quant: fr.quant || '',
         size: fr.size_bytes || 0, box: fr.box, engine: fr.engine,
-        boxName: boxLabel(fr.cpu, fr.box),
+        boxName: machineLabel(fr.cpu, fr.gpu, fr.backend, fr.box),
         lane: laneLabel, threads: fr.threads || 0,
         source: fr.source || '', verified: !!fr.verified,
-        version: riderVersion(runs, fr, ''), date: fr.date || '',
+        version: riderVersion(runs, fr, workload), date: fr.date || '',
         submissionId: fr.submission_id,
-        pp_das: fr.pp512 || 0, pp_ref: ref ? ref.pp512 || 0 : 0,
-        tg_das: fr.tg128 || 0, tg_ref: ref ? ref.tg128 || 0 : 0,
-        tgb_das: fr.tg128b4 || 0, tgb_ref: ref ? ref.tg128b4 || 0 : 0,
-        pp_ratio: ref ? ratio(fr.pp512, ref.pp512) : null,
-        tg_ratio: ref ? ratio(fr.tg128, ref.tg128) : null,
-        tgb_ratio: ref ? ratio(fr.tg128b4, ref.tg128b4) : null,
         das: fr, ref: ref
+      };
+      cells.forEach(function (c) {
+        var d = fr[c.field] || 0, rv = ref ? ref[c.field] || 0 : 0;
+        row[c.key + '_das'] = d;
+        row[c.key + '_ref'] = rv;
+        row[c.key + '_ratio'] = ref ? (c.time ? ratio(rv, d) : ratio(d, rv)) : null;   // >1 = das faster
+        row[c.key + '_das_withheld'] = voidedTest(fr, c.test);
+        row[c.key + '_ref_withheld'] = voidedTest(ref, c.test);
       });
+      out.push(row);
     });
     return out;
   }
@@ -386,8 +423,8 @@
 
   /* ── the bars/table toggle every ladder section shares ───────────
      ids: { view, metric (optional), bars, wrap, filters }; drawBars(barsBox, metric) paints the
-     bars from the section's rows under its current filters. The table stays the default view;
-     the bars redraw on every filter change and reset while they are the visible view. */
+     bars from the section's rows under its current filters. The bars are the default view;
+     they redraw on every filter change and reset while they are the visible view. */
   function wireViews(ids, drawBars) {
     var viewSeg = document.getElementById(ids.view);
     var metricSeg = ids.metric ? document.getElementById(ids.metric) : null;
@@ -422,13 +459,20 @@
       var reset = fbox.querySelector('.js-reset');
       if (reset) reset.addEventListener('click', function () { if (!barsBox.hidden) draw(); });
     }
+    if (!barsBox.hidden) draw();
   }
 
-  // the bars' foot line for the visible rows a section could not plot: bars are pairs
   function unpairedNote(solo, what) {
     if (!solo) return '';
     return what + ' rows are not plotted — bars are pairs. ' + solo + ' row' + (solo > 1 ? 's' : '') +
       ' in this filter ' + (solo > 1 ? 'have' : 'has') + ' no reference run; the table shows ' + (solo > 1 ? 'them' : 'it') + '.';
+  }
+
+  function pairAllNote(solo) {
+    if (!solo) return '';
+    return solo + ' row' + (solo > 1 ? 's' : '') + ' in this filter ' + (solo > 1 ? 'are' : 'is') +
+      ' not plotted — a bar needs prefill and decode both paired, and ' + (solo > 1 ? 'these miss' : 'it misses') +
+      ' a reference run or ' + (solo > 1 ? 'carry' : 'carries') + ' a withheld cell ✱; the table shows ' + (solo > 1 ? 'them' : 'it') + '.';
   }
 
   /* ── ladder page ──────────────────────────────────────────────── */
@@ -456,12 +500,49 @@
       '</span></td>';
   }
 
-  function mountLadder(rows) {
+  /* The paired sections (LLM, image chat): `sec` names the section's elements and the empty text,
+     `cells` its metric groups - the das number under the cell's own label, the reference beside
+     it as 'lcpp', the ratio last; a time cell prints wall ms. */
+  var PAIR_SECTIONS = {
+    llm: { table: 'ladder-table', filters: 'ladder-filters', caption: 'ladder-caption', view: 'view',
+           metric: 'metric', bars: 'bars', wrap: 'table-wrap', workload: '', cells: LLM_CELLS,
+           empty: 'Nothing on the ladder yet — the first accepted submission lands here.' },
+    image: { table: 'image-chat-table', filters: 'image-chat-filters', caption: 'image-chat-caption', view: 'image-chat-view',
+             metric: 'image-chat-metric', bars: 'image-chat-bars', wrap: 'image-chat-wrap', workload: 'image-chat', cells: IMAGE_CELLS,
+             barsPairAll: ['pp', 'tg'],
+             empty: 'No image-chat runs on the ladder yet.' }
+  };
+
+  // a withheld side reads ✱ in its own cell and in the ratio, never the "not raced" of a row
+  // whose reference did not run
+  function withheld(r, key) { return r[key + '_das_withheld'] || r[key + '_ref_withheld']; }
+
+  function pairCols(cells) {
+    var cols = [];
+    cells.forEach(function (c) {
+      var show = c.time ? ms : tps;
+      function side(s) {
+        var k = c.key + '_' + s;
+        return function (r) { return r[k + '_withheld'] ? withheldCell() : show(r[k]); };
+      }
+      cols.push(
+        { key: c.key + '_das', label: c.label, num: true, grp: true, grpStart: true,
+          get: function (r) { return r[c.key + '_das']; }, cell: side('das') },
+        { key: c.key + '_ref', label: 'lcpp', num: true, dim: true,
+          get: function (r) { return r[c.key + '_ref']; }, cell: side('ref') },
+        { key: c.key + '_ratio', label: 'ratio', num: true, grp: true,
+          get: function (r) { return r[c.key + '_ratio']; },
+          cell: function (r) { return withheld(r, c.key) ? withheldCell() : ratioCell(r[c.key + '_ratio']); } });
+    });
+    return cols;
+  }
+
+  function mountPairs(sec, rows) {
     var init = latestVersion(rows);
     var t = makeTable({
-      table: '#ladder-table', filters: '#ladder-filters', caption: '#ladder-caption',
+      table: '#' + sec.table, filters: '#' + sec.filters, caption: '#' + sec.caption,
       rows: rows, sort: { key: 'date', desc: true },
-      emptyText: 'Nothing on the ladder yet — the first accepted submission lands here.',
+      emptyText: sec.empty,
       tiebreak: function (a, b) { return a.model.localeCompare(b.model) || a.boxName.localeCompare(b.boxName); },
       cols: [
         { key: 'model', label: 'model', get: function (r) { return r.model; },
@@ -479,32 +560,14 @@
           get: function (r) { return r.threads; },
           cell: function (r) { return r.threads ? String(r.threads) : '-'; } },
         { key: 'size', label: 'GB', num: true, dim: true, get: function (r) { return r.size; },
-          cell: function (r) { return r.size ? fmt(r.size / 1073741824, 1) : '-'; } },
-        // the das number heads each metric group under the metric's own name; the reference beside it is 'lcpp'
-        { key: 'pp_das', label: 'pp512', num: true, grp: true, grpStart: true,
-          get: function (r) { return r.pp_das; }, cell: function (r) { return tps(r.pp_das); } },
-        { key: 'pp_ref', label: 'lcpp', num: true, dim: true,
-          get: function (r) { return r.pp_ref; }, cell: function (r) { return tps(r.pp_ref); } },
-        { key: 'pp_ratio', label: 'ratio', num: true, grp: true,
-          get: function (r) { return r.pp_ratio; }, cell: function (r) { return ratioCell(r.pp_ratio); } },
-        { key: 'tg_das', label: 'tg128', num: true, grp: true, grpStart: true,
-          get: function (r) { return r.tg_das; }, cell: function (r) { return tps(r.tg_das); } },
-        { key: 'tg_ref', label: 'lcpp', num: true, dim: true,
-          get: function (r) { return r.tg_ref; }, cell: function (r) { return tps(r.tg_ref); } },
-        { key: 'tg_ratio', label: 'ratio', num: true, grp: true,
-          get: function (r) { return r.tg_ratio; }, cell: function (r) { return ratioCell(r.tg_ratio); } },
-        { key: 'tgb_das', label: 'tg128@4', num: true, grp: true, grpStart: true,
-          get: function (r) { return r.tgb_das; }, cell: function (r) { return tps(r.tgb_das); } },
-        { key: 'tgb_ref', label: 'lcpp', num: true, dim: true,
-          get: function (r) { return r.tgb_ref; }, cell: function (r) { return tps(r.tgb_ref); } },
-        { key: 'tgb_ratio', label: 'ratio', num: true, grp: true,
-          get: function (r) { return r.tgb_ratio; }, cell: function (r) { return ratioCell(r.tgb_ratio); } },
+          cell: function (r) { return r.size ? fmt(r.size / 1073741824, 1) : '-'; } }
+      ].concat(pairCols(sec.cells), [
         { key: 'source', label: 'source', grpStart: true,
           get: function (r) { return r.source + (r.verified ? '' : ' unverified'); },
           cell: sourceCell },
         { key: 'date', label: 'date', num: true, dim: true,
           get: function (r) { return r.date; }, cell: function (r) { return esc(r.date); } }
-      ],
+      ]),
       filterDefs: [
         { field: 'version', title: 'version', all: 'all versions',
           get: function (r) { return r.version; }, options: versionOptions,
@@ -518,31 +581,37 @@
       ],
       receipt: rowReceipt,
       summary: function (shown, total) {
-        var solo = shown.filter(function (r) { return r.pp_ratio === null && r.tg_ratio === null; }).length;
+        function anyWithheld(r) { return sec.cells.some(function (c) { return withheld(r, c.key); }); }
+        var solo = shown.filter(function (r) { return r.pp_ratio === null && r.tg_ratio === null && !anyWithheld(r); }).length;
+        var held = shown.filter(anyWithheld).length;
         return esc(measuredLine(shown)) +
           ' &nbsp;·&nbsp; showing ' + shown.length + ' of ' + total + ' rows' +
           (solo ? ' (' + solo + ' das-only)' : '') +
           ' &nbsp;·&nbsp; click any row for its receipt' +
-          ' &nbsp;·&nbsp; an empty ratio means <b style="color:var(--fg);font-weight:400">not raced</b>, never implied parity';
+          ' &nbsp;·&nbsp; an empty ratio means <b style="color:var(--fg);font-weight:400">not raced</b>, never implied parity' +
+          (held ? ' &nbsp;·&nbsp; ✱ = withheld: the cell was measured, and a board annotation withholds it (' + held + ' row' + (held > 1 ? 's' : '') + ')' : '');
       }
     });
 
     // bars view: paired rows only, current filters applied, ranked by the active metric
-    wireViews({ view: 'view', metric: 'metric', bars: 'bars', wrap: 'table-wrap', filters: 'ladder-filters' }, function (barsBox, m) {
+    wireViews({ view: sec.view, metric: sec.metric, bars: sec.bars, wrap: sec.wrap, filters: sec.filters }, function (barsBox, m) {
       m = m || 'pp';
       var vis = t ? t.visible() : rows;
-      var paired = vis.filter(function (r) { return r[m + '_ratio'] !== null; })
+      // a section naming barsPairAll plots a row only where every one of those metrics paired, so its
+      // metric views list the same rows
+      var need = sec.barsPairAll || [m];
+      var paired = vis.filter(function (r) { return need.every(function (k) { return r[k + '_ratio'] !== null; }); })
         .sort(function (a, b) { return b[m + '_ratio'] - a[m + '_ratio']; });
       // every visible row NOT plotted for this metric — a row that raced pp512 but not tg128 is
       // unplotted on the tg128 view and must still be counted (was: only both-null rows)
       renderPairBars(barsBox, paired.map(function (r) {
         return { label: r.model, sub: r.boxName + ' · ' + r.lane + (r.engine === 'das' ? '' : ' · ' + r.engine),
                  das: r[m + '_das'], ref: r[m + '_ref'], ratio: r[m + '_ratio'], r: r };
-      }), rowReceipt, unpairedNote(vis.length - paired.length, 'das-only'));
+      }), rowReceipt, sec.barsPairAll ? pairAllNote(vis.length - paired.length)
+                                     : unpairedNote(vis.length - paired.length, 'das-only'));
     });
   }
 
-  // stats aside: rows · boxes · last measurement, over every section of the ladder
   function fillLadderStats(rows) {
     var aside = document.getElementById('dio-ladder-stats');
     if (!aside) return;
@@ -577,9 +646,6 @@
   };
   var POOLED = 'all';
 
-  // a reference engine carries no dasllama_version: its row takes the das version of the
-  // submission it rode along in (same box, same model and workload first), so the version
-  // filter keeps the race together
   function riderVersion(runs, fr, workload) {
     if (fr.dasllama_version || fr.engine === 'das') return fr.dasllama_version || 0;
     var best = 0, any = 0;
@@ -599,8 +665,6 @@
     return fr.flavor && fr.flavor !== 'stock' ? hw + ' · ' + fr.flavor : hw;
   }
 
-  // the key a das row and its reference share: one submission, one model, one box, one hardware
-  // class, one test (or the pooled set)
   function pairKey(r) {
     return [r.submissionId, r.das.model_idx, r.box, hwClass(r.das.backend), r.bucket].join('|');
   }
@@ -642,7 +706,7 @@
       if (fr.workload !== workload) return;
       var base = {
         model: String(fr.gguf).replace(/\.(gguf|bin)$/, ''), arch: fr.model_arch || '', quant: fr.quant || '',
-        box: fr.box, boxName: boxLabel(fr.cpu, fr.box), engine: fr.engine || '', lane: audioLane(fr),
+        box: fr.box, boxName: machineLabel(fr.cpu, fr.gpu, fr.backend, fr.box), engine: fr.engine || '', lane: audioLane(fr),
         threads: fr.threads || 0, source: fr.source || '', verified: !!fr.verified,
         version: riderVersion(runs, fr, workload), date: fr.date || '',
         submissionId: fr.submission_id, das: fr
@@ -703,7 +767,6 @@
       '<span class="dio-rtf__val">' + rtfText(r.rtf) + '</span></td>';
   }
 
-  // a reference engine's own row carries no ratio: it is the yardstick, not a racer
   function audioRatioCell(r) {
     if (r.engine !== 'das') return '<td class="dl-num dl-dim" title="a reference engine\'s row - the yardstick, not a racer">—</td>';
     return ratioCell(r.ratio);
@@ -756,8 +819,6 @@
           cell: function (r) { return r.ms > 0 ? fmt(r.ms, r.ms >= 100 ? 0 : 1) : '-'; } },
         { key: 'audio', label: 'audio s', num: true, dim: true, get: function (r) { return r.audio; },
           cell: function (r) { return r.audio > 0 ? fmt(r.audio, 1) : '-'; } },
-        // the comparison columns, the LLM ladder's shape: the reference's wall on the same test
-        // and the ratio, against the fastest reference raced on the row's lane in its submission
         { key: 'ref_engine', label: 'reference', grpStart: true, get: function (r) { return r.ref_engine; },
           cell: function (r) { return r.ref_engine ? esc(r.ref_engine) : '-'; }, cls: 'dl-dim2' },
         { key: 'ref_ms', label: 'ref ms', num: true, dim: true, get: function (r) { return r.ref_ms; },
@@ -788,10 +849,8 @@
       ],
       receipt: audioReceipt(workload),
       summary: function (shown) {
-        var dates = {};
-        shown.forEach(function (r) { if (r.date) dates[r.date] = 1; });
-        var ds = Object.keys(dates).sort();
-        var when = ds.length ? 'measured ' + (ds[0] === ds[ds.length - 1] ? ds[0] : ds[0] + ' → ' + ds[ds.length - 1]) + ' &nbsp;·&nbsp; ' : '';
+        var line = measuredLine(shown);
+        var when = line ? esc(line) + ' &nbsp;·&nbsp; ' : '';
         var voided = shown.filter(function (r) { return r.voided; }).length;
         return when + 'showing ' + shown.length + ' row' + (shown.length === 1 ? '' : 's') +
           (voided ? ' (' + voided + ' voided ✱)' : '') +
@@ -802,8 +861,6 @@
       }
     });
 
-    // bars view: the paired das rows under the current filters, × realtime on both sides,
-    // ranked by ratio - the LLM ladder's bars with the audio unit
     wireViews({ view: workload + '-view', bars: workload + '-bars', wrap: workload + '-wrap', filters: workload + '-filters' }, function (barsBox) {
       var vis = t ? t.visible() : rows;
       var paired = vis.filter(function (r) { return r.ratio !== null && r.rtf !== null && r.ref_rtf !== null; })
@@ -1106,8 +1163,13 @@
   if (document.getElementById('ladder-table')) {
     loadBoard().then(function (runs) {
       var llm = buildRows(runs);
-      mountLadder(llm);
+      mountPairs(PAIR_SECTIONS.llm, llm);
       var all = llm.slice();
+      if (document.getElementById(PAIR_SECTIONS.image.table)) {
+        var image = buildRows(runs, 'image-chat', IMAGE_CELLS);
+        mountPairs(PAIR_SECTIONS.image, image);
+        all = all.concat(image);
+      }
       Object.keys(AUDIO).forEach(function (w) {
         if (!document.getElementById(w + '-table')) return;
         var rows = buildAudioRows(runs, w);
@@ -1120,8 +1182,8 @@
       });
       fillLadderStats(all);
     }).catch(function () {
-      ['table-wrap', 'asr-wrap', 'tts-wrap', 'audio-chat-wrap'].forEach(function (id) { unreachable(document.getElementById(id)); });
-      ['ladder-filters', 'asr-filters', 'tts-filters', 'audio-chat-filters'].forEach(function (id) {
+      ['table-wrap', 'image-chat-wrap', 'asr-wrap', 'tts-wrap', 'audio-chat-wrap'].forEach(function (id) { unreachable(document.getElementById(id)); });
+      ['ladder-filters', 'image-chat-filters', 'asr-filters', 'tts-filters', 'audio-chat-filters'].forEach(function (id) {
         var f = document.getElementById(id);
         if (f) f.hidden = true;
       });

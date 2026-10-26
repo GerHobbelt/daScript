@@ -309,7 +309,7 @@ def test_tower_exact_lanes_are_config_free(t : T?) {
             return
         }
         let seat = kernel_backend_seat()
-        let exact <- ["whisper-f32", "parakeet-f32", "canary-f32", "gemma4a-f32", "gemma4v", "gemma3v", "gemma4uv"]
+        let exact <- ["whisper-f32", "parakeet-f32", "canary-f32", "gemma4a-f32", "qwen3a-f32", "tower-f32", "gemma4v", "gemma3v", "gemma4uv", "qwen3v", "qwen25v"]
         var first : table<string; string>
         for (n in whole) {
             pin_kernel_backend(n)
@@ -2434,9 +2434,24 @@ def test_gemma4a_encoder_image_roundtrip(t : T?) {
     }
 }
 
+//! the q8 tower's transcript against the f32 rail's as word lists - a comma rides a near-tie token
+//! the two rails' rounding can split - both lists logged, the control a list one word short
+def same_words(t : T?; who : string; q8_text, f32_text : string) {
+    let q8 = join(transcript_words(q8_text), " ")
+    let f32 = join(transcript_words(f32_text), " ")
+    to_log(LOG_INFO, "{who} q8 words : {q8}\n")
+    to_log(LOG_INFO, "{who} f32 words: {f32}\n")
+    t |> equal(q8, f32, "q8 tower transcript matches the f32 rail, punctuation aside")
+    var short <- transcript_words(q8_text)
+    if (!empty(short)) {
+        short |> erase(length(short) - 1)
+    }
+    t |> success(join(short, " ") != f32, "control: the q8 words one short miss the f32 rail")
+}
+
 [test]
 def test_gemma4a_transcribe_q8_ab(t : T?) {
-    t |> run("gemma4a transcribe: the q8 tower vs the f32 rail on jfk, same text") @(t : T?) {
+    t |> run("gemma4a transcribe: the q8 tower vs the f32 rail on jfk, the same words") @(t : T?) {
         return if (!family_on(t, "gemma4a") || !arm_on(t, "gemma4a") || !jit_only(t))
         let dec_path = path_join(models_dir(), "gemma-4-E2B-it-Q8_0.gguf")
         let mmp_path = path_join(models_dir(), "mmproj-gemma-4-E2B-it-bf16.gguf")
@@ -2469,9 +2484,7 @@ def test_gemma4a_transcribe_q8_ab(t : T?) {
             reset_gemma4a_q8()
             delete dec
         }
-        to_log(LOG_INFO, "gemma4a q8 : {q8_text}\n")
-        to_log(LOG_INFO, "gemma4a f32: {f32_text}\n")
-        t |> equal(q8_text, f32_text, "q8 tower transcript matches the f32 rail")
+        same_words(t, "gemma4a", q8_text, f32_text)
         delete samples
     }
 }
@@ -2501,11 +2514,13 @@ def private g4a_tower_metal_cell(tst : T?; tag, dec_file, mmp_file : string; wan
             }
             var cpu_text = ""
             var gpu_text = ""
+            var half_text = ""
             var lang = ""
             var nlayer = 0l
             var enc_delta = 0l
             var blk_delta = 0l
             var enc_rel_l2 = 0.0
+            let tower_was = metal_tower_knob()
             with_dasllama_jobque_() {
                 var dec <- load_model_(dec_path, QuantMode.q8)
                 dec.config.seq_len = min(dec.config.seq_len, 8192l)
@@ -2530,6 +2545,14 @@ def private g4a_tower_metal_cell(tst : T?; tag, dec_file, mmp_file : string; wan
                 let s1 = metal_tower_stats()
                 enc_delta = s1.encodes - s0.encodes
                 blk_delta = s1.blocks - s0.blocks
+                var inscope half := samples
+                for (i in range64(long_length(half) / 2l, long_length(half))) {
+                    half[i] = 0.0
+                }
+                var inscope s3 <- create_gemma4a_asr_session(dec)
+                gemma4a_transcribe(dec, enc, s3, half, $(seg : TranscribeSegment) {
+                    half_text += seg.text
+                }, lang)
                 var inscope stc = Gemma4aState()
                 var inscope stg = Gemma4aState()
                 set_metal_tower(false)
@@ -2540,6 +2563,7 @@ def private g4a_tower_metal_cell(tst : T?; tag, dec_file, mmp_file : string; wan
                 gemma4a_encode(enc, stg)
                 enc_rel_l2 = rel_l2(stg.out, stc.out)
                 t |> success(stg.out_ready && !stc.out_ready, "the device leg ran the projector tail, the CPU leg its own")
+                set_metal_tower(tower_was)
                 reset_gemma4a_q8()
                 delete dec
             }
@@ -2550,7 +2574,9 @@ def private g4a_tower_metal_cell(tst : T?; tag, dec_file, mmp_file : string; wan
             to_log(LOG_INFO, "gemma4a mtower CPU eyeball: {cpu_text}\n")
             to_log(LOG_INFO, "gemma4a mtower GPU eyeball: {gpu_text}\n")
             t |> success(!empty(gpu_text), "non-empty transcript")
-            t |> equal(cpu_text, gpu_text, "transcript equality CPU vs GPU")
+            // the words, not the punctuation: a comma rides a near-tie token the two rails' rounding can split
+            t |> equal(join(transcript_words(cpu_text), " "), join(transcript_words(gpu_text), " "), "transcript equality CPU vs GPU, punctuation aside")
+            t |> success(join(transcript_words(half_text), " ") != join(transcript_words(cpu_text), " "), "control: the GPU route fed the clip with its second half silenced reads other words")
             delete samples
         } else {
             t |> skip("no Metal build - the gemma4a Conformer driver has no device to serve")
@@ -2686,7 +2712,7 @@ def test_qwen3a_tower_q8_ab(t : T?) {
 
 [test]
 def test_qwen3a_transcribe_q8_ab(t : T?) {
-    t |> run("qwen3a transcribe: the q8 tower core vs the f32 rail on jfk, same text") @(t : T?) {
+    t |> run("qwen3a transcribe: the q8 tower core vs the f32 rail on jfk, the same words") @(t : T?) {
         return if (!family_on(t, "qwen3a") || !arm_on(t, "qwen3a") || !jit_only(t))
         let dec_path = path_join(models_dir(), "Qwen3-ASR-0.6B-Q8_0.gguf")
         let mmp_path = path_join(models_dir(), "mmproj-Qwen3-ASR-0.6B-bf16.gguf")
@@ -2720,9 +2746,7 @@ def test_qwen3a_transcribe_q8_ab(t : T?) {
             reset_qwen3a_q8()
             delete dec
         }
-        to_log(LOG_INFO, "qwen3a q8 : {q8_text}\n")
-        to_log(LOG_INFO, "qwen3a f32: {f32_text}\n")
-        t |> equal(q8_text, f32_text, "q8 tower transcript matches the f32 rail")
+        same_words(t, "qwen3a", q8_text, f32_text)
         delete samples
     }
 }

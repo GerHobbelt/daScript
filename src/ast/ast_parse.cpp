@@ -264,7 +264,7 @@ namespace das {
                                     continue;
                                 }
                             }
-                            // src/ast/ARCHITECTURE.md#module-scan-manifest
+                            // src/ast/ARCHITECTURE_MODULE_SCAN.md#module-scan-manifest
                             auto guardAvailable = [&](const string & guard) {
                                 if ( guard.empty() ) return true;
                                 if ( guard.find('/')!=string::npos ) {
@@ -283,7 +283,7 @@ namespace das {
                                 return src + 6 < src_end && memcmp(src, "public", 6) == 0;
                             };
                             if ( isReq && src[0]=='[' ) {
-                                // src/ast/ARCHITECTURE.md#module-scan-manifest
+                                // src/ast/ARCHITECTURE_MODULE_SCAN.md#module-scan-manifest
                                 src ++;
                                 while ( src < src_end && isspaceE(src[0]) ) {    // the parser reads tokens, so a newline inside the brackets is nothing
                                     src ++;
@@ -475,7 +475,7 @@ namespace das {
                     }
                     module = Module::requireEx(mod, allowPromoted, modRec.name, info.fileName); // try native with that name AGAIN (promoted?)
                     if ( !module ) {
-                        // src/ast/ARCHITECTURE.md#module-scan-manifest
+                        // src/ast/ARCHITECTURE_MODULE_SCAN.md#module-scan-manifest
                         if ( auto loader = getDeferredModuleLoader(); loader && loader(mod) ) {
                             module = Module::requireEx(mod, allowPromoted, modRec.name, info.fileName);
                             if ( log && module ) {
@@ -653,6 +653,26 @@ namespace das {
     static constexpr uint32_t SER_MAX_MACRO_DEPS = 4096u;
     static constexpr uint64_t FNV64A_SEED = 14695981039346656037ull;   // any nonzero constant serves: size (-1 absent vs 0 empty) already separates the states
 
+    bool isBuiltinModulePresent ( const string & name ) {
+        // allowPromoted: pairs with the `require ?guard` check, which also accepts shared das
+        // modules compiled earlier in the process
+        return Module::requireEx(name, true) != nullptr || guardModuleAvailable(name);
+    }
+
+    void pinModuleCacheDependency ( Program * program, const string & path ) {
+        int64_t size = -1;
+        uint64_t hash = 0;
+        statAndHashFileDependency(path, size, hash);
+        for ( auto & dep : program->moduleCacheDependencies ) {
+            if ( get<0>(dep) == path ) {
+                get<1>(dep) = size;
+                get<2>(dep) = hash;
+                return;
+            }
+        }
+        program->moduleCacheDependencies.emplace_back(path, size, hash);
+    }
+
     void statAndHashFileDependency ( const string & path, int64_t & size, uint64_t & hash ) {
         size = -1;
         hash = 0;
@@ -668,6 +688,13 @@ namespace das {
             if ( !occurrences.empty() ) {
                 size = int64_t(occurrences.size());
                 hash = hash_block64((const uint8_t *) occurrences.data(), occurrences.size());
+            }
+            return;
+        }
+        if ( path.compare(0, 7, "module:") == 0 ) {
+            if ( isBuiltinModulePresent(path.substr(7)) ) {
+                size = 1;
+                hash = FNV64A_SEED;
             }
             return;
         }
@@ -1293,6 +1320,8 @@ namespace das {
                 if ( macroSimT ) logs << " -- macro simulate " << (macroSimT / 1000000.);
                 logs << "\n";
             }
+            // src/ast/ARCHITECTURE_GC.md#type-remap
+            scope.gcFinalize.prog = nullptr;
             return program;
         } else {
             // Serialization failed and the program changed, so set it for proper GC collection on exit.
@@ -2356,7 +2385,7 @@ namespace das {
                 }
             }
             // src/ast/ARCHITECTURE_SHARED.md#shared-promotion
-            if ( auto failed = parseRequiredModules(walk.req, access, logs, libGroup, policies, !policies.no_optimizations) ) {
+            if ( auto failed = parseRequiredModules(walk.req, access, logs, libGroup, policies, !policies.no_optimizations || policies.promote_shared_unoptimized) ) {
                 return failed;
             }
             auto & serializer_read = daScriptEnvironment::getBound()->serializer_read;

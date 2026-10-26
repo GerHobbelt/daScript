@@ -1,15 +1,19 @@
 # dasLLAMA Architecture - the benchmark rig and instrumentation rails
 
-Companion to `ARCHITECTURE.md`; a section is cited by its anchor. The instruments that time a
-kernel away from the served graph - kernel-race fidelity, the gemv's own tune seat, the CPU kernel
-bench's fixture - and the timing-race vocabulary
-(`ARCHITECTURE_MEASUREMENT_KERNEL_RACE.md#timing-race-vocabulary`) are
-`ARCHITECTURE_MEASUREMENT_KERNEL_RACE.md`; the Vulkan GEMM probe's arms, shapes and alternates are
-`ARCHITECTURE_MEASUREMENT_VK_GEMM_PROBE.md#vk-gemm-probe`; a fat exe's first-start race and where
-it keeps its sidecar are `ARCHITECTURE_MEASUREMENT_FAT_START.md#fat-first-start`; the client clock
-around a live server's turns is `ARCHITECTURE_MEASUREMENT_SERVED.md#served-turn-instrument`; the
-reference build's forced feed beside the gemma feed cells is
-`ARCHITECTURE_MEASUREMENT_FORCED_FEED.md#reference-forced-feed`.
+Companion to `ARCHITECTURE.md`; a section is cited by its anchor. The instruments that time a kernel
+away from the served graph and the timing-race vocabulary are
+`ARCHITECTURE_MEASUREMENT_KERNEL_RACE.md#timing-race-vocabulary`; the Vulkan GEMM probe's arms,
+shapes and alternates are `ARCHITECTURE_MEASUREMENT_VK_GEMM_PROBE.md#vk-gemm-probe`; a fat exe's
+first-start race and where it keeps its sidecar are
+`ARCHITECTURE_MEASUREMENT_FAT_START.md#fat-first-start`; the client clock around a live server's
+turns is `ARCHITECTURE_MEASUREMENT_SERVED.md#served-turn-instrument`; the reference build's forced
+feed beside the gemma feed cells is `ARCHITECTURE_MEASUREMENT_FORCED_FEED.md#reference-forced-feed`;
+the ASR board's GPU row pairs (`ARCHITECTURE_MEASUREMENT_AUDIO.md#asr-gpu-pairs`), the MLX ASR
+reference (`ARCHITECTURE_MEASUREMENT_AUDIO.md#mlx-asr-reference`), the TTS reference instrument
+(`ARCHITECTURE_MEASUREMENT_AUDIO.md#the-tts-reference-instrument`), its CUDA provider and g2p-venv
+runs (`ARCHITECTURE_MEASUREMENT_AUDIO.md#tts-ref-g2p-venv`) and the ASR board's CPU references
+(`ARCHITECTURE_MEASUREMENT_AUDIO.md#asr-cpu-references`) are the audio companion's; a board row's
+release boundary is `ARCHITECTURE_MEASUREMENT_RELEASE.md#board-rows-release-boundary`.
 
 ### There is ONE benchmark rig, and the records are the baseline {#one-benchmark-rig}
 
@@ -163,6 +167,43 @@ the device, the shape the resident driver's split token command serves. The row 
 driver version beside the figures, and `-ngl 99` alone is not the reference - it streams the
 experts across the link every batch and measures the link.
 
+### The Vulkan board's reference rows {#vulkan-reference-rows}
+
+A Vulkan board's reference row (`engine` `llama.cpp`, `backend` `vulkan`) times the `vulkan` flavor
+`benchmarks/setup_lcpp_ref.das --flavor vulkan` builds at `DEFAULT_REF_SHA` (the row's `sha`): the
+Release configure with `-DLLAMA_CURL=OFF -DGGML_VULKAN=ON`, its glslc from a Vulkan SDK of 1.4.357
+or later (`BRINGUP.md`). `gen_bench_records --ref-vulkan <build-vulkan/bin/llama-bench>` (or
+`LLAMA_BENCH_VULKAN`) runs, per model, `llama-bench -m <gguf> -ngl 99 -t <threads> -p 512 -n 128 -r
+5 -o json` for the flat rows and the sibling `llama-batched-bench -m <gguf> -ngl 99 -t <threads> -c
+4096 -b 2048 -ub 512 -npp 512 -ntg 128 -npl 4 -fa on` for `tg128@4`, with no environment setting
+beyond the command line; the row's `cmd` carries both.
+
+### The CUDA reference rows {#cuda-reference-rows}
+
+A llama.cpp row read against `benchmarks/lcpp_bench.das` under `DASLLAMA_CUDA=1` times a Release source build of tag
+b10660 (`6c84c7d5d`) configured `-DGGML_CUDA=ON`: on the Windows reference box under Visual Studio 2022 against the CUDA
+13.4 toolkit (`-T cuda=13.4`, `CMAKE_CUDA_ARCHITECTURES` 120), on the Linux pod the same tag's `build-cuda`. It runs, per
+model, `llama-bench -m <gguf> -ngl 99 -fa 1 -p 512 -n 128 -r 3`, with no environment setting beyond the command line.
+
+### The committed records gate {#committed-records-gate}
+
+`gen_bench_records.das` writes `performance/records/<box>.json`, and `RETIRED_BOXES`
+(`dasllama/dasllama_exchange_schema.das`) is the one list of boxes whose boards are history - the
+records and the ladder keep their rows, the site projection reads the list to keep them off the
+cards. `performance/REVIEW.das` checks the records' tree-decidable provenance:
+- `check_records_corpus` - every store parses, every run's `hardware.remote_desktop` is `off` or
+  absent, every archived sidecar's `provenance.noise` is `ok` or absent. Licenses no names.
+- `check_das_row` - a `das` row is not past `DASLLAMA_RELEASE`, and below it only on a box
+  `RETIRED_BOXES` lists - the licensed set, boxes no release re-mints; a current-release row
+  carries `hardware.remote_desktop` and a `sha` HEAD reaches whose `dasllama_version.das` reads
+  the same release.
+- `check_row_archive` - a current-release row's `tune_sha` names an archive that exists, pins
+  the current release, and stamps an `engine_sha` HEAD reaches. Licenses no names.
+- `check_defaults_profiles` - a `defaults/` profile is a quiet mint at the current release with
+  a `kernels` section and no `engine_sha`. Licenses no names.
+- `check_ruler_records` - a `records/mtp/` file names no home directory. Licenses no names.
+- `main` - `dasllama_version.das` declares a readable `DASLLAMA_RELEASE`. Licenses no names.
+
 ### Sanctioned instrumentation rails {#sanctioned-instrumentation-rails}
 
 Engine timing goes through the rails that aggregate and tag it: the `jobque_profile` markers
@@ -185,66 +226,6 @@ same math differ in float terms - while one that changes only WHEN work happens 
 a CLI flag is never an override (it is the run's own command line, visible where the run is
 launched).
 
-### The ASR board's GPU row pairs {#asr-gpu-pairs}
-
-The das Metal ASR leg is OPT-IN per catalog row: `AsrModelSpec.metal_served`
-(`performance/profile_common.das`) declares that the Metal driver serves that family end to
-end - tower and decoder both. An unflagged family keeps the CPU by design, and asking for its
-GPU leg reds the row: the `--ngl` arms assert that the tower engage counters moved, so a family
-whose tower silently falls back fails instead of publishing a CPU wall under a GPU heading.
-The MLX reference (`asr_gpu_only_tool`) runs on the Apple GPU alone: its one row is the `metal`
-leg, measured on every catalog row that carries it whatever `metal_served` says.
-
-On a Vulkan box the CPU arm's row stamps `backend = "vulkan"` when the Vulkan drivers served
-every clip (the tower every encode with no decline; on whisper the ASR-decoder driver every window
-too), keeps `backend = "cpu"` when they served none, and fails loudly with no number when they
-served some clips but not all. The cell prints, per clip, the tower's encode and decline deltas
-and, on whisper, the decoder's window and decode-batch deltas, plus one closing line counting
-the fully served clips - the engage witness behind the stamp. The Vulkan readings live in
-`PERF_LEDGER.md`, not in the records, against these references, each run on the pod: whisper.cpp's
-own Vulkan build (the pod's checkout, commit d09f61a, version 1.9.4-dev, GCC 13.3), `whisper-cli -m
-ggml-<model>-q8_0.bin -f <clip> -t 16 -bs 1 -bo 1 -nf`, timestamps on (under `-nt` it advances a whole
-30 s a window: fewer encoder runs than the das loop's timestamp-seeking windows), each clip behind jfk in one
-process with the jfk-only process subtracted (the first clip carries the pipeline builds; `-ng` for its CPU arm;
-`GGML_VK_PERF_LOGGER=1` for the per-op table); llama-mtmd-cli b10660 (Vulkan), `llama-mtmd-cli -m <model Q8_0>
---mmproj <mmproj bf16> --audio <clip> -p "Transcribe the audio." --temp 0 --jinja -ngl 99 -t 16` (E2B with `-n 256`), its encode the sum of the clip's
-`encoding done in N ms` lines; NeMo's `generate()` through `benchmarks/asr/canary_qwen_bench.py --device cuda`.
-
-Three reference tools carry a GPU arm the board pairs against a das Metal row, each with its own
-spelling: the whisper reference exe takes `-ngl`, the media-chat reference exe `-ngl 99`, and the
-NeMo bench script `--device mps`. The remaining two reference legs have no pair - the rig runs the
-parakeet exe with `-ng`, though its Metal arm is the faster one (`PERF_LEDGER.md`), and the ONNX
-export is CPU-only - so their das rows stand alone in the CPU category.
-
-The media-chat reference exe is built as the bench exe's sibling in one reference worktree:
-`benchmarks/setup_lcpp_ref.das` builds both targets, since a bench-only build leaves the image and
-audio-chat cells with no binary and the board quietly mints das-only rows. The sibling needs the
-timing patch beside it (`benchmarks/asr/patches/`): the record parser reads its per-rep timing
-lines, an unpatched sibling mints "no rep parsed" failures, and the apply - guarded on the patched
-marker already being in the tree, three-way - still applies after the reference pin moves. On Apple
-boxes `performance/setup_asr_rig.das` builds a second, Metal-ON copy of the same patched checkout,
-because `-ngl` on a Metal-OFF build is inert; `mtmd_bin_metal()` returns "" when it is absent and the GPU reference leg skips loudly.
-
-### The TTS reference instrument {#the-tts-reference-instrument}
-
-A TTS board cell is `lcpp_bench --tts -m <gguf>` against `harness/tts_ref_bench.py`, both over the
-g2p corpus's first `--tts-sentences` sentences (20) at one voice (`tts_catalog()`), every sentence
-timed best of `-r` / `--passes` (3) after one untimed warm-up, generation only: das times the
-synthesis less its front end, the phoneme references take the fixture's `ps_espeak` strings, and
-Pocket reads the text on both sides. Each side records one `tts:g2p<N>@<voice>` test, its `ms` the
-best walls summed and `audio_s` the seconds spoken. The das cell's `--ngl` serves every chunk on the
-Metal tower and reds where a seat fell back (`tts_seat_verdict`); its CPU row pins the tower off
-on Metal and stamps `vulkan` on a Vulkan build whose TTS seats served every chunk. The references:
-kokoro's `KModel` on the torch device (`cpu`, `mps`, `cuda` beside a `vulkan` row), KittenTTS's
-ONNX files on the onnxruntime CPU provider with the package's tokenizer, style rows and speed prior,
-Kyutai's `pocket-tts` on the CPU (one torch thread, the package's pin), all pinned to the
-`model_specs.das` recipes' revisions from the in-repo `tts` venv; and on the metal leg mlx-audio's
-ports of all three from the `mlx` venv (`--engine mlx`). Both venvs build from committed
-`benchmarks/asr/requirements-*.txt` (`setup_asr_rig --venvs`), and the run prints a `VERSIONS` line
-the row carries. Kitten's package speaks shorter audio than das for the same phonemes (its speed
-prior and 5000-sample trim), so a kitten pair compares on the wall, never on the real-time factor.
-`harness/tts_synth.das` and `harness/pocket_synth.py` stay the scoring rig's synthesis arms.
-
 ### The audio outlier rule {#audio-outlier-rule}
 
 An audio run's clips are rated in milliseconds per audio second, and a clip past
@@ -261,6 +242,10 @@ rides to the page with its `voided` verdict. A reference row records no audio le
 reader borrows a clip's length from any run of the same model that recorded it. Under three rated
 clips nothing is voided, and a run's own `void_clips` - the annotations' spelling - unions with the
 rule's.
+
+### A routed MoE's parity fixture holds as a half-span prefix {#fixture-prefix-bar}
+
+The timed run's fixture gate holds every carrier as a matching prefix of half the checked span; the `--parity` pregate holds token for token, except on a carrier whose evidence sets `prefix_bar` (`ParityEvidence`, `performance/model_specs.das`) - the gemma-4-26B MoE, Q8_0 and Q4_K_M - which it holds to the same half-span prefix over the whole fixture. The 26B routes a discrete top-8 of 128 experts a layer and its forward amplifies one ulp of rounding layer over layer, so any float engine's logits move by whole points when only the accumulation order changes - the reference engine's between thread counts or micro-batch sizes, ours between JIT routes - and a token past the opening is a coin flip, not a forward bug. `fixture_ok` is the one bar both gates read.
 
 ### A `[tuned]` kernel's perm is decided at its own compile {#tuned-perm-precedence}
 

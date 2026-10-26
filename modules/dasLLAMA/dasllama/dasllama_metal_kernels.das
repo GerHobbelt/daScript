@@ -7401,7 +7401,7 @@ class MetalMoeSelect512 : MetalMoeSelectT {
     override DEPTH = 16
 }
 
-//! the gemma-4 stamps: the down scales in the select (`ARCHITECTURE_GPU_PREFILL_MOE.md#moe-wscale` says why they are stamps of their own)
+//! the gemma-4 stamps: the down scales in the select (`ARCHITECTURE_GPU_SHARED_ROWS.md#moe-wscale` says why they are stamps of their own)
 [metal_dispatch(name = "enc_moe_select_ds", pso = "g_pso_moe_select_ds", tgmem = "MetalMoeSelectDs_metal_moe_select_msl_tgmem", tg = 32, grid = "nst", params = "nst : int64")]
 class MetalMoeSelectDs : MetalMoeSelectT {
     override DSCALE = true
@@ -7776,7 +7776,7 @@ class MetalG4RouterNorm {
 
 //! the router select over `nrows` streams' logits into `bsel`, every picked weight under the model's `expert_weights_scale` and,
 //! where `bds` is the layer's per-expert down-scale row (gemma-4), that expert's scale - the select's own fold, no pass after it
-[arch(at="../ARCHITECTURE_GPU_PREFILL_MOE.md#moe-wscale")]
+[arch(at="../ARCHITECTURE_GPU_SHARED_ROWS.md#moe-wscale")]
 def enc_moe_select_rows(enc : MetalComputeEncoder?; c : Config; blg, bsel : MetalBuffer?; nrows : int64; lstride : int64 = 0l;
                         bds : MetalBuffer? = null) {
     let sw = c.moe_gate == MoeGate.softmax_weight
@@ -11962,7 +11962,7 @@ class MetalClsSelect : GkClsSelect {
 class MetalClsEpilogue : GkClsEpilogue {
     [metal_kernel(name="metal_cls_epi_msl")]
     def metal_cls_epi {
-        epi_elem(gl_GlobalInvocationID.x)
+        epi_body()
     }
 }
 
@@ -13141,7 +13141,7 @@ class MetalTwBiasGate : GkBiasGate {
     }
 }
 
-let PK_ATTN_HS = int(GK_PK_ATTN_HS)   //!< the head size the attention row's body is stamped for
+let PK_ATTN_HS = int(GK_PK_ATTN_HS)   //!< the widest head the attention row takes; a narrower head shares a column's value sum across 256 / hs parts
 let PK_ATTN_MAX_KEYS = int64(GK_PK_ATTN_MAX_KEYS)   //!< the scores the attention row stages in threadgroup memory - the body's literal
 
 //! the subgroup primitives the shared reductions ride, Metal's spelling
@@ -13161,7 +13161,7 @@ def gk_subgroup_min_u(v : uint) : uint {
 }
 
 //! The Pocket chains' causal cached attention row; a threadgroup a (head, row) over staged scores.
-[metal_dispatch(name = "enc_pk_attn", pso = "g_pso_pk_attn", tgmem = "metal_pk_attn_msl_tgmem", tg = 256, grid = "total", params = "total : int64")]
+[metal_dispatch(name = "enc_pk_attn", pso = "g_pso_pk_attn", tgmem = "metal_pk_attn_msl_tgmem", tg = 256, grid = "total", params = "total : int64", requires = "pa.hs % 4")]
 class MetalPkAttn : GkPkAttn {
     [metal_kernel(name="metal_pk_attn_msl")]
     def metal_pk_attn {

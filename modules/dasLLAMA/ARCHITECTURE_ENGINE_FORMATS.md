@@ -175,6 +175,8 @@ tensor tiles, the routed GEMV and tiles, the token gather. So a host that sums r
 beside a Vulkan device reads the fast planes, and the device reads the same bytes; under Metal
 `auto` keeps the grid, which streams 17% fewer bytes a superblock.
 
+The nv4 member - its planes' bytes and the per-tensor scale beside them - is `ARCHITECTURE_ENGINE_FORMATS_NV4.md`.
+
 ### The load and image rail {#the-load-and-image-rail}
 
 **`dasllama_load.das`** is the GGUF load walk: metadata to `Config`, the plane layout, disk-format
@@ -246,8 +248,10 @@ repack walks that plane's region alone (`shexp_plane_q8`).
 
 - **`dasllama_math.das`** - the numeric ABSTRACTION: typedefs, active backend pointers, public
   wrappers, dispatch shaping, and the array-sizing helpers every tier and the engine share
-  (`reserve_resize`, `grow_resize`, `ensure_length`, `overwrite_resize`). Kernels themselves
-  live in a tier file; a kernel body here is a placement defect.
+  (`reserve_resize`, `grow_resize`, `ensure_length`, `overwrite_resize`), the `[tuned]` fp32
+  loop-hint families (`dot`, `axpy`, the elementwise set, `f32_batch_tile`) and the fp32 batch walk
+  (`matmul_batch_core`, `batch_tile_block`, generic over the f32 and bf16 weight lattices - `bf16_batch_tile`
+  widens each halfword by the exact shift); every other kernel lives in a tier file.
 - **`dasllama_math_default.das`** - the portable backend, always registered, always correct,
   out-ranked by any platform tier - the per-32 rail's portable kernels and scalar leaves, which
   seat every backend's unset per-32 slot (`#per-32-rail`) - and the ONE body of every Q8*Q8 and
@@ -267,7 +271,8 @@ repack walks that plane's region alone (`shexp_plane_q8`).
   generator, the layout/perm schema shared by generator and runtime, and the `[tune]` family
   registration. A hand-written tile that the generator could emit belongs in the generator.
   The bf16 tile's operand builders - the activation widen (`xbf16_build`, its `bf16_bits`
-  narrow) and the row-dequant reference panel (`kq_panel_rows_bf16`) - sit in
+  narrow, the f32 plane's `xbf16_build_f32`), the row-dequant reference panel
+  (`kq_panel_rows_bf16`) and the native bf16 plane's k-pair panel (`bf16w_panel_build`) - sit in
   `dasllama_math_gen.das` beside the walk that runs them once per batch call, in its JIT
   partition (`ARCHITECTURE_CPU_KERNELS.md#jit-partition-inlining`). The JIT cache keys a
   generated kernel by its stub's hash and its perm's arguments, never by the generator's text,

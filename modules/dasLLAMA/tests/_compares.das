@@ -348,6 +348,20 @@ def check_count(got : array<float>; want : array<auto(WT)>; bar : Bar; env : arr
     return bad
 }
 
+//! A control's verdict under `tag`: every element of `got` and `want` finite, and `check_count` of them at `bar` above 0 - a NaN
+//! counts as off there, so it would pass a control that read it unchecked
+def check_exceeds(t : T?; tag : string; got : array<float>; want : array<auto(WT)>; bar : Bar) {
+    let finite = all_finite(got) && all(want, $(w) => !is_nan(w) && abs(w) < WT(INFINITE_DIFF))
+    t |> success(finite, "{tag}: every element the control reads is finite")
+    let outside = check_count(got, want, bar)
+    var worst = 0.0
+    for (g, w in got, want) {
+        worst = max(worst, nan_wide_diff(g, float(w)))
+    }
+    to_log(LOG_INFO, "{tag}: {outside} of {length(want)} elements outside the bar, the largest difference {worst}\n")
+    t |> success(finite && outside > 0, "{tag}: lands outside the bar ({outside} of {length(want)} elements, the largest difference {worst})")
+}
+
 //! `check` on an `envelope` or `per_element` bar: `env` holds each element's envelope or its own bar
 def check(t : T?; tag : string; got : array<float>; want : array<auto(WT)>; bar : Bar; shape : Shape; env : array<auto(ET)>) : int {
     let exact = bar_kind(bar) == BarKind.exact
@@ -578,6 +592,19 @@ def sweep_inert(var r : Sweep; got, before : array<float>) {
             r.inert++
         }
     }
+}
+
+//! erf by its Maclaurin series in double, run until a term is under 1e-18 - the GELU oracles' erf
+def erf_series(x : double) : double {
+    var sum = 0.0lf
+    var term = x
+    var k = 0
+    while (abs(term) > 1.0e-18lf && k < 200) {
+        sum += term / double(2 * k + 1)
+        k++
+        term *= -x * x / double(k)
+    }
+    return sum * 2.0lf / sqrt(3.141592653589793lf)
 }
 
 //! The sweep's verdict: `cases` lengths run (0 = at least one), none off its bar, no poison leg inside it, the largest

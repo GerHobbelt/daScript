@@ -18,11 +18,12 @@ require dasllama/dasllama_math
 require dasllama/dasllama_gpu_math
 require dasllama/dasllama_math_default
 require dasllama/dasllama_vulkan_classes
-require dasllama/dasllama_vulkan_decode   // RDEC_MIR_SLACK_ROWS: the flash fixtures pad their shadows as the driver's mirrors do
+require dasllama/dasllama_gpu_tier
 require dasllama/dasllama_vulkan_common   // upload_region_at: the sentinel fills
 require _compares   // NAN_SENTINEL_BITS
 require _attn_oracle public
 require _kernel_oracles public   // act_mul_ref: the gated activation the Metal cells read too
+require _vk_kq_fixtures
 
 //! the flash tiles' shadow planes carry sixteen zero rows past the last position: the KHR tile's last key step loads a whole 16-row fragment
 let FA_SHADOW_SLACK_ROWS = int(RDEC_MIR_SLACK_ROWS)   //! the flash fixtures pad their shadows the rows the driver's mirrors carry past their planes
@@ -295,53 +296,9 @@ def to_u4(w : array<uint>) : array<uint4> {
     return <- out
 }
 
-def byte_u8(a : array<uint>; i : int) : int => int(a[i / 4] >> uint((i % 4) * 8)) & 0xFF
-
-def byte_s8(a : array<uint>; i : int) : int {
-    let b = byte_u8(a, i)
-    return b >= 128 ? b - 256 : b
-}
-
-def half_at(a : array<uint>; hi : int) : float {
-    let w = unpackHalf2x16(a[hi / 2])
-    return hi % 2 == 0 ? w.x : w.y
-}
-
 // q8 batch GEMM oracle over region records ([wblk0, row0, cnt, wg0] x nrec): per (row, col),
 // int dots per 32-block (exact) folded by the f16 weight scale and the f32 x scale in block
 // order — the device tiles reassociate, so approx bars
-//! the GEMM oracles' region-record walk: each record's `cnt` rows from `row0` at every output column, y[row * d + c] = `dot`(row, c, wblk0)
-def private rec_walk(recs : array<uint>; nrec, d : int; var y : array<float>; dot : block<(row, c, wblk0 : int) : float>) {
-    for (rr in range(nrec)) {
-        let wblk0 = int(recs[rr * 4])
-        let row0 = int(recs[rr * 4 + 1])
-        for (r in range(int(recs[rr * 4 + 2]))) {
-            for (c in range(d)) {
-                y[(row0 + r) * d + c] = invoke(dot, row0 + r, c, wblk0)
-            }
-        }
-    }
-}
-
-def q8_gemm_oracle(wq : array<uint>; wsw : array<uint>; xq : array<uint>; xs : array<float>;
-                   recs : array<uint>; nrec, n, d : int; var y : array<float>) {
-    let nbb = n / 32
-    rec_walk(recs, nrec, d, y) $(row, c, wblk0 : int) : float {
-        var acc = 0.0
-        for (b in range(nbb)) {
-            let wb = wblk0 + c * nbb + b
-            let xb = row * nbb + b
-            var idot = 0
-            for (j in range(8)) {
-                idot += sdot4(wq[wb * 8 + j], xq[xb * 8 + j])
-            }
-            let wsf = wb % 2 == 0 ? unpackHalf2x16(wsw[wb / 2]).x : unpackHalf2x16(wsw[wb / 2]).y
-            acc += float(idot) * wsf * xs[xb]
-        }
-        return acc
-    }
-}
-
 //! the per-32 batch tile's oracle: each record row's Q8_0 activation row against weight row `wblk0 / nb + c` through the
 //! engine's scalar dot for the format (`q51_gemv_row_oracle` and its twins)
 def blk32_gemm_oracle(f : KqFmt; wq, ws, xq : array<uint>; xs : array<float>; recs : array<uint>; nrec, n, d : int; var y : array<float>) {
@@ -354,27 +311,6 @@ def blk32_gemm_oracle(f : KqFmt; wq, ws, xq : array<uint>; xs : array<float>; re
             : (f == KqFmt.iq4nl32 ? iq4nl32_gemv_row_oracle(wq, ws, xq_r, xs_r, wb0, nb)
             : (f == KqFmt.q4032 ? q4032_gemv_row_oracle(wq, ws, xq_r, xs_r, wb0, nb)
             : (f == KqFmt.q5032 ? q5032_gemv_row_oracle(wq, ws, xq_r, xs_r, wb0, nb) : mx4_gemv_row_oracle(wq, ws, xq_r, xs_r, wb0, nb)))))
-    }
-}
-
-// fmt-0 x f16 GEMM oracle (the cm2 l-tile's shape): q8 weight blocks dequantized by the wsh f16
-// scale, f16 activations, per (row, col) in block order — the device tiles reassociate, so
-// approx bars
-def q8f16_gemm_oracle(wq : array<uint>; wsw : array<uint>; xf : array<uint>;
-                      recs : array<uint>; nrec, n, d : int; var y : array<float>) {
-    let nbb = n / 32
-    rec_walk(recs, nrec, d, y) $(row, c, wblk0 : int) : float {
-        var acc = 0.0
-        for (b in range(nbb)) {
-            let wb = wblk0 + c * nbb + b
-            let wsf = wb % 2 == 0 ? unpackHalf2x16(wsw[wb / 2]).x : unpackHalf2x16(wsw[wb / 2]).y
-            var bacc = 0.0
-            for (j in range(32)) {
-                bacc += float(byte_s8(wq, wb * 32 + j)) * half_at(xf, row * n + b * 32 + j)
-            }
-            acc += bacc * wsf
-        }
-        return acc
     }
 }
 
@@ -466,6 +402,8 @@ def kq_cls_ref(fmt : int; wq, ws, xq : array<uint>; xs : array<float>) : KqGemvB
         k = kx
     } elif (fmt == int(KqFmt.iq4nl)) {
         k = new KqGemvIq4nl()   // pure-ALU codebook - no workgroup state to fill
+    } elif (fmt == int(KqFmt.nv4)) {
+        k = new KqGemvNv4()   // the doubled e2m1 lanes by arithmetic - no workgroup state to fill
     } elif (fmt == int(KqFmt.k2)) {
         k = new KqGemvK2()   // pure ALU - no workgroup state to fill
     } elif (fmt == int(KqFmt.iq2s)) {
@@ -532,7 +470,7 @@ def gemv_float_walk(regions : array<uint>; n, d, nreg : int; sb_dot : block<(var
 
 //! whether `fmt` carries a float witness beside the class oracle (`kq_gemv_float_oracle`)
 def kq_has_float_oracle(fmt : int) : bool {
-    for (f in fixed_array(KqFmt.iq4xs, KqFmt.iq3s4, KqFmt.k3, KqFmt.iq3s, KqFmt.iq3xxs, KqFmt.iq2s, KqFmt.iq2xs, KqFmt.iq2xxs)) {
+    for (f in fixed_array(KqFmt.iq4xs, KqFmt.iq3s4, KqFmt.nv4, KqFmt.k3, KqFmt.iq3s, KqFmt.iq3xxs, KqFmt.iq2s, KqFmt.iq2xs, KqFmt.iq2xxs)) {
         if (int(f) == fmt) return true
     }
     return false
@@ -545,6 +483,8 @@ def kq_gemv_float_oracle(fmt : int; wq, ws, xq : array<uint>; xs : array<float>;
         return <- lut_gemv_float_oracle(wq, ws, xq, xs, regions, n, d, nreg, iq4nl_lut(), false)
     } elif (fmt == int(KqFmt.iq3s4)) {
         return <- lut_gemv_float_oracle(wq, ws, xq, xs, regions, n, d, nreg, iq3s4_lut(), true)
+    } elif (fmt == int(KqFmt.nv4)) {
+        return <- nv4_gemv_float_oracle(wq, ws, xq, xs, regions, n, d, nreg)
     } elif (fmt == int(KqFmt.k3)) {
         return <- k3_gemv_float_oracle(wq, ws, xq, xs, regions, n, d, nreg)
     } elif (fmt == int(KqFmt.iq3s)) {
@@ -582,6 +522,26 @@ def lut_gemv_float_oracle(wq, ws, xq : array<uint>; xs : array<float>; regions :
                 bacc += float(lut[b & 15]) * float(xlo) + float(lut[b >> 4]) * float(xhi)
             }
             acc += xs[xsb] * dd * float(sc) * bacc
+        }
+    }
+    return <- y
+}
+
+//! the nv4 sub-block scale `si` of superblock `sb`'s device row: byte `si` of the row's first four words, UE4M3 at half, under the per-tensor scale in its fifth word
+def nv4_row_sc(ws : array<uint>; sb, si : int) : float => ue4m3_half_f32(uint(byte_u8(ws, sb * 20 + si))) * uint_bits_to_float(ws[sb * 5 + 4])
+
+//! NVFP4 GEMV float oracle off the plane bytes over the k4 nibble tiling: w = MX4_LUT[q] x the sub-block's UE4M3 scale at half, a 32-block's low 16 under scale byte 2 blk, its high 16 under 2 blk + 1
+def nv4_gemv_float_oracle(wq, ws, xq : array<uint>; xs : array<float>; regions : array<uint>; n, d, nreg : int) : array<float> {
+    var y <- gemv_float_walk(regions, n, d, nreg) $(var acc : float&; sb, xsb : int) {
+        for (blk in range(8)) {
+            var blo = 0.0
+            var bhi = 0.0
+            for (m in range(16)) {
+                let b = byte_u8(wq, sb * 128 + blk * 16 + m)
+                blo += float(MX4_LUT[b & 15]) * float(byte_s8(xq, xsb * 256 + blk * 32 + m))
+                bhi += float(MX4_LUT[b >> 4]) * float(byte_s8(xq, xsb * 256 + blk * 32 + 16 + m))
+            }
+            acc += xs[xsb] * (nv4_row_sc(ws, sb, 2 * blk) * blo + nv4_row_sc(ws, sb, 2 * blk + 1) * bhi)
         }
     }
     return <- y
@@ -988,6 +948,18 @@ def iq4xsf16_gemm_oracle(wq : array<uint>; wsu : array<uint>; xf : array<uint>;
     lutf16_gemm_oracle(wq, wsu, xf, recs, nrec, n, d, y, iq4nl_lut(), false)
 }
 
+//! NVFP4 f16-feed GEMM reference over the device form and the k4 nibble tiling: per weight MX4_LUT[q] x its sub-block's UE4M3 scale at half (the 5-word row's sixteen bytes), rounded to f16 as the decode rounds
+def nv4f16_gemm_oracle(wq : array<uint>; wsu : array<uint>; xf : array<uint>;
+                       recs : array<uint>; nrec, n, d : int; var y : array<float>) {
+    f16_gemm_walk(xf, recs, nrec, n, d, 256, y) $(sb, e : int) : float {
+        let g = e / 32
+        let hh = (e % 32) / 16
+        let by = byte_u8(wq, sb * 128 + g * 16 + e % 16)
+        let q = (by >> (hh * 4)) & 0xF
+        return float(float16(float(MX4_LUT[q]) * nv4_row_sc(wsu, sb, g * 2 + hh)))
+    }
+}
+
 def iq3s4f16_gemm_oracle(wq : array<uint>; wsu : array<uint>; xf : array<uint>;
                          recs : array<uint>; nrec, n, d : int; var y : array<float>) {
     lutf16_gemm_oracle(wq, wsu, xf, recs, nrec, n, d, y, iq3s4_lut(), true)
@@ -1273,5 +1245,192 @@ def sched_oracle(idx : array<uint>; ne, wt_gu, wt_dn : int; sh : SchedShape; bas
     delete cnt
     delete start
     delete cursor
+}
+
+//! a per-format tile cell's scale-row form: the words one superblock (or one per-32 block) lays in the device's scale plane
+enum ScaleForm {
+    d_dmin_hash   //! [d | dmin], then four hashed sub-scale words
+    d_pairs       //! four words of two per-block f16 d, then a zero pad word
+    hash_d        //! four hashed signed sub-scale words, then [d | 0]
+    d_hi_hash     //! [d | the row's hashed high bits], then one hashed word of 4-bit sub-scale fields
+    q51_dm        //! one [d | m] word a block, m signed
+    iq4nl32_d     //! two f16 d a word
+    mx4_e8m0      //! four E8M0 bytes a word
+    nv4_bytes     //! four words of UE4M3 sub-block scale bytes, then the per-tensor scale word
+}
+
+//! the nv4 cells' site scale word of region `region`, one value a region (`../ARCHITECTURE_ENGINE_FORMATS_NV4.md#nv4-site-scale`): a 1.0 .. 1.75 ladder, so a decode that drops it reads off the bar and the f16 sums stay cool
+def nv4_site_scale_word(region : int) : uint => float_bits_to_uint(1.0 + 0.25 * float(region % 4))
+
+//! the nv4 cells' scale bytes, four a word: UE4M3 codes at exponents 1..10 (2^-7 .. 2^2 at half) and every mantissa, so the tile's f16 sums stay far from 65504 and no code reads as the nan zero
+def nv4_scale_word(i, seed : uint) : uint {
+    var w = 0u
+    for (b in range(4)) {
+        let h = hash_word(i * 4u + uint(b) + seed)
+        w |= ((1u + h % 10u) << 3u | ((h >> 8u) & 7u)) << uint(b * 8)
+    }
+    return w
+}
+
+//! one row of the per-format tile table: the format, its K and scale unit, the hashed quant words a unit, the scale-row form
+//! with its d / dmin multipliers and hash seed, the activation plane's hash offset, the arms (per-32 formats run s, e and KHR),
+//! the format's oracle and the sibling codebook's oracle its planes must read apart under (`control`, when set)
+struct FmtTile {
+    fmt : KqFmt
+    n, blk_k, wq_words : int
+    wq_seed : uint
+    form : ScaleForm
+    dmul, mmul : float
+    sseed, xf_add : uint
+    per32 : bool
+    oracle : function<(wq : array<uint>; wsu : array<uint>; xf : array<uint>; recs : array<uint>; nrec, n, d : int; var y : array<float>) : void>
+    control : function<(wq : array<uint>; wsu : array<uint>; xf : array<uint>; recs : array<uint>; nrec, n, d : int; var y : array<float>) : void>
+}
+
+//! the per-format tile cells' table: one row a `kq_sb` or per-32 format
+def fmt_tile_rows() : array<FmtTile> {
+    return <- [
+        FmtTile(fmt = KqFmt.k4, n = TILE_CELL_K, blk_k = 256, wq_words = 32, wq_seed = 29u, form = ScaleForm.d_dmin_hash, dmul = 0.0002, mmul = 0.00005, sseed = 613u, xf_add = 5u, oracle = @@k4f16_gemm_oracle),
+        FmtTile(fmt = KqFmt.k5, n = TILE_CELL_K, blk_k = 256, wq_words = 40, wq_seed = 29u, form = ScaleForm.d_dmin_hash, dmul = 0.0002, mmul = 0.00005, sseed = 613u, xf_add = 5u, oracle = @@k5f16_gemm_oracle),
+        FmtTile(fmt = KqFmt.k2, n = TILE_CELL_K, blk_k = 256, wq_words = 16, wq_seed = 31u, form = ScaleForm.d_dmin_hash, dmul = 0.0004, mmul = 0.0003, sseed = 91u, xf_add = 7u, oracle = @@k2f16_gemm_oracle),
+        FmtTile(fmt = KqFmt.iq2s, n = TILE_CELL_K, blk_k = 256, wq_words = 18, wq_seed = 29u, form = ScaleForm.d_dmin_hash, dmul = 0.0002, mmul = 0.0, sseed = 613u, xf_add = 5u, oracle = @@iq2sf16_gemm_oracle),
+        FmtTile(fmt = KqFmt.iq2xs, n = TILE_CELL_K, blk_k = 256, wq_words = 16, wq_seed = 29u, form = ScaleForm.d_dmin_hash, dmul = 0.0002, mmul = 0.0, sseed = 613u, xf_add = 5u, oracle = @@iq2xsf16_gemm_oracle),
+        FmtTile(fmt = KqFmt.q40, n = TILE_CELL_K, blk_k = 256, wq_words = 32, wq_seed = 29u, form = ScaleForm.d_pairs, dmul = 0.0002, mmul = 0.00013, xf_add = 5u, oracle = @@q40f16_gemm_oracle),
+        FmtTile(fmt = KqFmt.iq4nl, n = TILE_CELL_K, blk_k = 256, wq_words = 32, wq_seed = 29u, form = ScaleForm.d_pairs, dmul = 0.0002, mmul = 0.00013, xf_add = 5u, oracle = @@iq4nlf16_gemm_oracle),
+        FmtTile(fmt = KqFmt.nv4, n = TILE_CELL_K, blk_k = 256, wq_words = 32, wq_seed = 29u, form = ScaleForm.nv4_bytes, sseed = 613u, xf_add = 5u, oracle = @@nv4f16_gemm_oracle, control = @@iq4nlf16_gemm_oracle),
+        FmtTile(fmt = KqFmt.k3, n = TILE_CELL_K, blk_k = 256, wq_words = 24, wq_seed = 29u, form = ScaleForm.hash_d, dmul = 0.0002, sseed = 811u, xf_add = 5u, oracle = @@k3f16_gemm_oracle),
+        FmtTile(fmt = KqFmt.k6, n = TILE_CELL_K, blk_k = 256, wq_words = 48, wq_seed = 41u, form = ScaleForm.hash_d, dmul = 0.0002, sseed = 811u, xf_add = 5u, oracle = @@k6f16_gemm_oracle),
+        FmtTile(fmt = KqFmt.iq3s, n = TILE_CELL_K, blk_k = 256, wq_words = 26, wq_seed = 29u, form = ScaleForm.d_hi_hash, dmul = 0.0002, sseed = 613u, xf_add = 5u, oracle = @@iq3sf16_gemm_oracle, control = @@iq3xxsf16_gemm_oracle),
+        FmtTile(fmt = KqFmt.iq2xxs, n = TILE_CELL_K, blk_k = 256, wq_words = 16, wq_seed = 29u, form = ScaleForm.d_hi_hash, dmul = 0.0002, sseed = 613u, xf_add = 5u, oracle = @@iq2xxsf16_gemm_oracle),
+        FmtTile(fmt = KqFmt.iq3xxs, n = TILE_CELL_K, blk_k = 256, wq_words = 24, wq_seed = 29u, form = ScaleForm.d_hi_hash, dmul = 0.0002, sseed = 613u, xf_add = 5u, oracle = @@iq3xxsf16_gemm_oracle, control = @@iq2xxsf16_gemm_oracle),
+        FmtTile(fmt = KqFmt.iq4xs, n = TILE_CELL_K, blk_k = 256, wq_words = 32, wq_seed = 29u, form = ScaleForm.d_hi_hash, dmul = 0.0002, sseed = 613u, xf_add = 5u, oracle = @@iq4xsf16_gemm_oracle, control = @@iq3s4f16_gemm_oracle),
+        FmtTile(fmt = KqFmt.iq3s4, n = TILE_CELL_K, blk_k = 256, wq_words = 32, wq_seed = 29u, form = ScaleForm.d_hi_hash, dmul = 0.0002, sseed = 613u, xf_add = 5u, oracle = @@iq3s4f16_gemm_oracle, control = @@iq4xsf16_gemm_oracle),
+        FmtTile(fmt = KqFmt.q51, n = 704, blk_k = 32, wq_words = 5, wq_seed = 37u, form = ScaleForm.q51_dm, xf_add = 5u, per32 = true, oracle = @@q51f16_gemm_oracle),         // the 26B-A4B's expert width: 22 blocks, two unrolled 256-passes and a 192 tail
+        FmtTile(fmt = KqFmt.iq4nl32, n = 640, blk_k = 32, wq_words = 4, wq_seed = 41u, form = ScaleForm.iq4nl32_d, xf_add = 5u, per32 = true, oracle = @@iq4nl32f16_gemm_oracle, control = @@q4032f16_gemm_oracle),   // Qwen3.8-Flash-Next's expert width: 20 blocks, two unrolled 256-passes and a 128 tail
+        FmtTile(fmt = KqFmt.q4032, n = 896, blk_k = 32, wq_words = 4, wq_seed = 43u, form = ScaleForm.iq4nl32_d, xf_add = 5u, per32 = true, oracle = @@q4032f16_gemm_oracle, control = @@iq4nl32f16_gemm_oracle),   // Qwen2.5-0.5B's width: 28 blocks, three unrolled 256-passes and a 128 tail
+        FmtTile(fmt = KqFmt.q5032, n = 1408, blk_k = 32, wq_words = 5, wq_seed = 47u, form = ScaleForm.iq4nl32_d, xf_add = 5u, per32 = true, oracle = @@q5032f16_gemm_oracle, control = @@q5032_noqh_f16_gemm_oracle),   // Qwen1.5-MoE's expert down width: 44 blocks, five unrolled 256-passes and a 128 tail
+        FmtTile(fmt = KqFmt.mx4, n = 704, blk_k = 32, wq_words = 4, wq_seed = 53u, form = ScaleForm.mx4_e8m0, xf_add = 5u, per32 = true, oracle = @@mx4f16_gemm_oracle)            // 22 blocks: eleven 64-deep k steps, two unrolled 256-passes and a 192 tail
+    ]
+}
+
+//! the iq4nl32 cells' scale words: cool f16 d, two blocks a word, so the tile's f16 sums stay far from 65504
+def iq4nl32_scale_words(totblk : int; mul : float) : array<uint> {
+    var w : array<uint>
+    w |> resize((totblk + 1) / 2)
+    for (i in range(length(w))) {
+        w[i] = packHalf2x16(float2(mul * float(1 + (2 * i) % 7), mul * float(1 + (2 * i + 1) % 7)))
+    }
+    return <- w
+}
+
+//! the mx4 cells' E8M0 bytes: exponents 112..124 (2^-16 .. 2^-4 halved), four a word, so the tile's f16 sums stay far from 65504
+def mx4_scale_words(totblk : int) : array<uint> {
+    var w : array<uint>
+    w |> resize((totblk + 3) / 4)
+    for (b in range(totblk)) {
+        w[b / 4] |= uint(112 + b % 13) << uint((b % 4) * 8)
+    }
+    return <- w
+}
+
+//! a per-32 plane's scale words for `totblk` blocks: q51's d | m halves, iq4nl32's two halves a word, mx4's four E8M0 bytes a word
+def blk32_scale_plane(f : KqFmt; totblk : int) : array<uint> {
+    var words : array<uint>
+    if (f == KqFmt.q51) {
+        words <- [for (b in range(totblk)); packHalf2x16(float2(0.002 * float(1 + b % 7), 0.001 * float(b % 5) - 0.002))]
+    } elif (f == KqFmt.iq4nl32 || f == KqFmt.q4032 || f == KqFmt.q5032) {
+        words <- iq4nl32_scale_words(totblk, 0.002)
+    } else {
+        words <- mx4_scale_words(totblk)
+    }
+    return <- words
+}
+
+//! each element the class's own `blk_decode` lane under `blk_fold`'s term pair; both homes' gather cells read it
+def emb_gather_oracle(fmt : int; wq, ws : array<uint>; ids : array<uint>; xh : array<float>; n : int; wblk0 : uint; escale : float) : array<float> {
+    var y : array<float>
+    var noq : array<uint>
+    var nos : array<float>
+    var k = kq_cls_ref(fmt, wq, ws, noq, nos)
+    let nsb = n / 256
+    y |> resize(length(ids) * n)
+    for (r in range(length(ids))) {
+        if (ids[r] == EMB_ID_HOST) {
+            for (e in range(n)) {
+                y[r * n + e] = xh[r * n + e]
+            }
+            continue
+        }
+        for (b in range(nsb * 8)) {
+            var wl = uint4(0u)
+            var wh = uint4(0u)
+            let terms = k->blk_decode(wblk0 + ids[r] * uint(nsb) + uint(b / 8), uint(b % 8), wl, wh)
+            let bsum = k->fold_reads_bsum()
+            for (e in range(32)) {
+                let w = e < 16 ? wl : wh
+                let word = (e % 16) / 4
+                let lane = word == 0 ? w.x : (word == 1 ? w.y : (word == 2 ? w.z : w.w))
+                let q = float(int(int8((lane >> uint((e % 4) * 8)) & 0xFFu)))
+                let a = e < 16 ? terms.x : terms.z
+                let c = bsum ? (e < 16 ? terms.y : terms.w) : 0.0
+                y[r * n + b * 32 + e] = (a * q + c) * escale
+            }
+        }
+    }
+    unsafe {
+        delete k
+    }
+    delete noq
+    delete nos
+    return <- y
+}
+
+//! a table row's host planes over both weight planes: the quant words hashed at `i + wq_seed` (cool scales throughout: the tile's f16 sums stay far from 65504)
+def fmt_tile_planes(row : FmtTile; var wqh, wsh : array<uint>) {
+    let units = 2 * TILE_CELL_D * (row.n / row.blk_k)
+    delete wqh
+    wqh <- hashed_words(units * row.wq_words, 1u, row.wq_seed)
+    if (row.form == ScaleForm.d_dmin_hash || row.form == ScaleForm.d_pairs || row.form == ScaleForm.hash_d || row.form == ScaleForm.nv4_bytes) {
+        wsh |> resize(units * 5)
+    } elif (row.form == ScaleForm.d_hi_hash) {
+        wsh |> resize(units * 2)
+    } elif (row.form == ScaleForm.q51_dm) {
+        wsh |> resize(units)
+    }
+    for (sb in range(units)) {
+        if (row.form == ScaleForm.d_dmin_hash) {
+            wsh[sb * 5] = packHalf2x16(float2(row.dmul * float(1 + sb % 7), row.mmul * float(1 + sb % 5)))
+            for (wi in range(4)) {
+                wsh[sb * 5 + 1 + wi] = hash_word(uint(sb * 4 + wi) + row.sseed)
+            }
+        } elif (row.form == ScaleForm.d_pairs) {
+            for (wi in range(4)) {
+                let p = sb * 4 + wi
+                wsh[sb * 5 + wi] = packHalf2x16(float2(row.dmul * float(1 + p % 7), row.mmul * float(1 + p % 5)))
+            }
+        } elif (row.form == ScaleForm.hash_d) {
+            for (wi in range(4)) {
+                wsh[sb * 5 + wi] = hash_word(uint(sb * 4 + wi) + row.sseed)
+            }
+            wsh[sb * 5 + 4] = packHalf2x16(float2(row.dmul * float(1 + sb % 7), 0.0))
+        } elif (row.form == ScaleForm.d_hi_hash) {
+            wsh[sb * 2] = packHalf2x16(float2(row.dmul * float(1 + sb % 7), 0.0)) | (hash_word(uint(sb * 2) + row.sseed) << 16u)
+            wsh[sb * 2 + 1] = hash_word(uint(sb * 2 + 1) + row.sseed)
+        } elif (row.form == ScaleForm.q51_dm) {
+            wsh[sb] = packHalf2x16(float2(0.0002 * float(1 + sb % 7), 0.0001 * float(sb % 5) - 0.0002))
+        } elif (row.form == ScaleForm.nv4_bytes) {
+            for (wi in range(4)) {
+                wsh[sb * 5 + wi] = nv4_scale_word(uint(sb * 4 + wi), row.sseed)
+            }
+            wsh[sb * 5 + 4] = nv4_site_scale_word(sb / (TILE_CELL_D * (row.n / row.blk_k)))
+        }
+    }
+    if (row.form == ScaleForm.iq4nl32_d) {
+        delete wsh
+        wsh <- iq4nl32_scale_words(units, 0.0002)
+    } elif (row.form == ScaleForm.mx4_e8m0) {
+        delete wsh
+        wsh <- mx4_scale_words(units)
+    }
 }
 

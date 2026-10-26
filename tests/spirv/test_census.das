@@ -9,6 +9,7 @@ options indenting = 4
 require dastest/testing_boost public
 require _spirv_common
 require _texture_grad_shaders
+require _color_mapping_shader
 require spirv/spirv_dis
 require spirv/spirv_grammar
 
@@ -28,6 +29,7 @@ def test_opcode_census(t : T?) { // nolint:STYLE038 — a flat one-add_set-per-f
     t |> run("emitter opcode census == declared set (all fixtures)") <| @(t : T?) {
         var present : table<uint>
         add_set(present, square_words())
+        add_set(present, color_mapping_words())
         add_set(present, uarith_words())
         add_set(present, iarith_words())
         add_set(present, farith_words())
@@ -88,6 +90,7 @@ def test_opcode_census(t : T?) { // nolint:STYLE038 — a flat one-add_set-per-f
         add_set(present, userfn_ref_words())
         add_set(present, userfn_inline_words())
         add_set(present, userfn_inline_method_words())
+        add_set(present, userfn_inline_lazy_words())
         add_set(present, userfn_global_words())
         add_set(present, mesh_empty_words())
         add_set(present, task_empty_words())
@@ -114,6 +117,7 @@ def test_opcode_census(t : T?) { // nolint:STYLE038 — a flat one-add_set-per-f
         add_set(present, coopmat2_words())
         add_set(present, coopmat2s_words())
         add_set(present, coopmat2s64_words())
+        add_set(present, coopmat2i8_words())
         add_set(present, coopmat2e_words())
         add_set(present, coopmat2fa_words())
         add_set(present, coopmat2fa256_words())
@@ -124,6 +128,7 @@ def test_opcode_census(t : T?) { // nolint:STYLE038 — a flat one-add_set-per-f
         add_set(present, spelem_words())
         add_set(present, spelemi_words())
         var declared <- coopmat2fa_emitter_opcodes()
+        declared |> insert(uint(SpvOp.Unreachable))
         for (op in keys(present)) {
             t |> success(key_exists(declared, op), "emitted {op_name(op)} is in the declared set")
         }

@@ -16,9 +16,24 @@ must keep holding:
 - `test_program_roots.das` must hold the `ROOT_DIRS` sweep, `options stack = 524288` and the
   prefill intent.
 - `test_env_registry.das` must hold the `../ENVIRONMENT.md` knob contract.
-- `test_model_specs.das` must hold `../performance/model_specs.das`'s model-set table, and
+- `test_model_specs.das` must hold `../performance/model_specs.das`'s model-set table,
   `spec_by_file` answering by the models-dir path and by the gguf's base name (a split-shard row
-  sits in a subfolder).
+  sits in a subfolder), the fixture compare (`prefix_match_len` / `fixture_ok`: a flipped last id
+  red under the strict form and held under the half-span one, a flip inside the first half red
+  under both), and the board fetch (`board_provenance`) holding every file the board sweeps read
+  and no off-board row and no on-box parity oracle (`tts_oracle*`).
+- `test_metal_float_a_gate.das` must hold the MSL emitter's refusal of a float A operand (the
+  activation input) to `tmm2d_q8u_f32` in a kernel that lacks `[metal_kernel(float_a_ok=true)]`,
+  the error naming the FLOAT A operand, and the same kernel compiling under that annotation.
+- `test_rope.das` must hold `../dasllama/dasllama_rope.das`'s table builders (`build_rope_tabs`
+  and its packed, rows, imrope, mrope and vision forms) against their per-element references and
+  against each other bit for bit, `mrope_span_positions`' map and its refusal of a grid that does
+  not match the span, `rope_factor_tensor`'s pick, and `../dasllama/dasllama_math.das`'s `rope`,
+  at the bar each cell sets.
+- `test_rope_apply.das` must hold `../dasllama/dasllama_math.das`'s rope application
+  (`rope_scaled_*`, `rope_apply`) and `yarn_rope_freqs` against their fp64 references, each
+  tabled form against its un-tabled twin, and `build_rope_tabs` over 120000 rows and over none,
+  at the bar each cell sets.
 - `test_metal_prefill_kernels.das`'s `test_metal_prefill_kernels` cell must hold every kernel gate
   it calls, at the bar each gate sets, with its `attn_trio_gate` calls whose `AttnKeys` sets
   `softcap`, `hass`, `uend` or `ulo`; and by name:
@@ -45,40 +60,47 @@ must keep holding:
   projection's tile pick: the bf16 tile only where layers x ple is a multiple of 64 and the dim a
   multiple of 32.
 - `test_metal_misc_kernels.das`'s `test_metal_misc_kernels` cell must hold every kernel gate it
-  calls, at the bar each gate sets; and by name: its token-table gathers bit for bit: `embed_q8_gate`, `embed_b32_gate` on q51, iq4nl32, q4032 and q5032 at 96
-  wide, at 2048 wide past a whole other table's blocks, and at a lead off a superblock boundary
-  (the bind's block skip), `embed_kq_gate` on every K-quant format it lists, and `embed_f32_gate`
-  past a lead of foreign floats; the residual seam's `add_rms_gate` on every stamp at every
-  shipped width, 5376 and 8192 past the slab among them; and `cls_select_gate` at a wide, a
-  narrow and the served vocab: the ids at or above the row's K-th largest logit and their logits
-  exact against the host oracle, the row's max logit, the overflow flag and the recent ids'
-  logits, the denominator within 2e-5, a poisoned id and a poisoned denominator its controls.
-- `test_metal_gemm_kernels.das`'s `test_metal_gemm_kernels` cell must hold every kernel gate it calls, at the bar
-  each gate sets - the census's evidence among them: `kq_mulmm_gate`, `kq_devw_gate`, `kq_dbuf_gate`,
-  `moe_mulmm_kq_gate`, `moe_mulmm_split_gate`, `attn_qk_mm_gate` and `attn_dev_pair_gate`.
-- `test_metal_gemv_kernels.das`'s `test_metal_kq_gemv_kernels` cell must hold every GEMV gate it calls, at the bar
-  each gate sets - `kq_mvb_gate` and `moe_kq_gemv_gate` among them - and its `test_metal_kq_half_forms` cell every
-  format's half-x route against the CPU reference at every row count the dispatcher serves.
+  calls, at the bar each gate sets; and by name: its token-table gathers bit for bit:
+  `embed_q8_gate`, `embed_b32_gate` on q51, iq4nl32, q4032 and q5032 at 96 wide, at 2048 wide
+  past a whole other table's blocks, and at a lead off a superblock boundary (the bind's block
+  skip), `embed_kq_gate` on every K-quant format it lists, and `embed_f32_gate` past a lead of
+  foreign floats; the residual seam's `add_rms_gate` on every stamp at every shipped width, 5376
+  and 8192 past the slab among them; and `cls_select_gate` at a wide, a narrow and the served
+  vocab: the ids at or above the row's K-th largest logit and their logits exact against the host
+  oracle, the row's max logit, the overflow flag and the recent ids' logits, the denominator
+  within 2e-5, a poisoned id and a poisoned denominator its controls.
+- `test_metal_gemm_kernels.das`'s `test_metal_gemm_kernels` cell must hold every kernel gate it
+  calls, at the bar each gate sets - the census's evidence among them: `kq_mulmm_gate`,
+  `kq_devw_gate`, `kq_dbuf_gate`, `moe_mulmm_kq_gate`, `moe_mulmm_split_gate`, `attn_qk_mm_gate`
+  and `attn_dev_pair_gate`.
+- `test_metal_gemv_kernels.das`'s `test_metal_kq_gemv_kernels` cell must hold every GEMV gate it
+  calls, at the bar each gate sets - `kq_mvb_gate` and `moe_kq_gemv_gate` among them - and its
+  `test_metal_kq_half_forms` cell every format's half-x route against the CPU reference at every
+  row count the dispatcher serves.
 - `test_site_records.das` must hold the byte-compare of `site/files/dasllama/bench_records.json`
   and of `site/files/dasllama/bench_cells.json` (repo root) - the smaller copy the site page loads
   first - against a fresh `merge_site_records` run, and `bench_cells.json` keeping every field
   that page renders at load while dropping the fields it reads from `bench_records.json` only on
-  demand.
+  demand; and `test_board_projection`'s filters - an older release's row, a retired board's row,
+  a held row and an unpaired reference kept off the board, and the stored audio outlier voided on
+  the projected row.
 - `test_exchange_schema.das` must hold the exchange validator's corpus sweeps and the
   `[tune_scope]` wire-key pin read out of `../dasllama/dasllama_tune_scope.das`.
 - `test_bench_records_schema.das` must hold the `write_bench_records` output, corpus sweeps
   included; the llama-batched-bench table parse - which cell at which `npl`, 0 on every refusal;
   the batched reference row's command line - the engine's extra flags follow `-npl N -fa on`, and
-  a run that prints no row names why and reads 0; and the committed stores' batched receipts - the
-  cpu legs' das child at `--npl-plen 128 --npl-reps 3` and reference at `-npp 128`,
-  `--no-op-offload` on the stock cpu arm alone, the metal leg at `-npp 512` with neither.
+  a run that prints no row names why and reads 0; the audio outlier rule and the recorder's void
+  pass (`audio_outlier_clips`, `void_outlier_clips`); the `void_clips` and `held` annotations
+  reaching only the run they select; and the committed stores' batched receipts - the cpu legs'
+  das child at `--npl-plen 128 --npl-reps 3` and reference at `-npp 128`, `--no-op-offload` on
+  the stock cpu arm alone, every GPU leg's reference at `-npp 512` with neither cpu-only flag.
 - `test_scheduler.das`'s `test_scheduler_media_splice` cell must hold a media span's text and rows
   as one prefill call, and a body cut at the chunk taking the rest a chunk a call; on a paged
   scheduler, the prefix cache matching across a span by its rows' content - the text ahead of a new
   span attaching and the hit stopping at it, the media stream donating its pages, the same span
-  asked again attaching past it, a rowless request for it served off the cache, other rows at the same place sharing only
-  the text ahead of them - and a rowless request on a cold cache finishing `media_lost` with
-  nothing donated.
+  asked again attaching past it, a rowless request for it served off the cache, other rows at the
+  same place sharing only the text ahead of them - and a rowless request on a cold cache finishing
+  `media_lost` with nothing donated.
 - `test_vulkan_kernels.das`'s `test_vk_coopmat_default_and_tile_pick` cell must hold which tile
   the Vulkan matmul picks, and whether that dispatch splits its reduction across partial planes,
   on every input of the prefill's tile-and-split pick.
@@ -91,10 +113,11 @@ must keep holding:
 - `test_vulkan_kernels.das`'s `test_vkd_ple_bf16_cvt` cell must hold the bf16 rows as f16 bit
   for bit the widened value's half, saturated past the half range, the elements past the count
   kept.
-- `test_vulkan_kernels.das`'s `test_vkd_dn_cap_tail` cell must hold the checkpoint capture's history
-  write (`dn_cap_tail_cls`) bit for bit to the ring hand-off's CPU form for a window cut at the
-  capture's row - two captures in one dispatch, one past the taps and one under them reading its
-  first row off the entry image - the words between the two rows' images keeping their sentinel.
+- `test_vulkan_kernels.das`'s `test_vkd_dn_cap_tail` cell must hold the checkpoint capture's
+  history write (`dn_cap_tail_cls`) bit for bit to the ring hand-off's CPU form for a window cut at
+  the capture's row - two captures in one dispatch, one past the taps and one under them reading
+  its first row off the entry image - the words between the two rows' images keeping their
+  sentinel.
 - `test_vulkan_kernels.das`'s `test_vkd_cls_select` cell must hold the selection kernel's landing
   against the host oracle on every row: the ids at or above the K-th largest logit with their
   logits, the max, the denominator at the row's temperature, the overflow flag past the slots and
@@ -117,22 +140,26 @@ must keep holding:
   format's GEMV against its scalar dot, and its summed twin (`per32_sum_rows_cell`) over one,
   two and four token rows - every row its slots' dots under their weights, a poisoned last row
   the control, a wider dispatch's rows bit for bit the narrower one's.
-- `test_vulkan_kernels.das`'s `test_vkd_q51_cm2_batch`, `test_vkd_mx4_cm2_batch`, `test_vkd_iq4nl32_cm2_batch`,
-  `test_vkd_iq3s4_cm2_batch`, `test_vkd_mx4_gemv_gu`, `test_vkd_gemv_ncol`, `test_vkd_q8_gemv_gu_n`,
-  `test_vkd_q8_gemv_pleact`, `test_vkd_act_family`, `test_vkd_moe_routing`, `test_vkd_dn_family`, `test_vkd_hc_seams`,
-  `test_vkd_hc_rows`, `test_vkd_ple_side`, `test_vkd_f16_gemm_khr`, `test_vkd_fa_cm2`, `test_vkd_fa_khr`,
+- `test_vulkan_kernels.das`'s `test_vkd_q51_cm2_batch`, `test_vkd_mx4_cm2_batch`,
+  `test_vkd_iq4nl32_cm2_batch`, `test_vkd_iq3s4_cm2_batch`, `test_vkd_mx4_gemv_gu`,
+  `test_vkd_gemv_ncol`, `test_vkd_q8_gemv_gu_n`, `test_vkd_q8_gemv_pleact`, `test_vkd_act_family`,
+  `test_vkd_moe_routing`, `test_vkd_dn_family`, `test_vkd_hc_seams`, `test_vkd_hc_rows`,
+  `test_vkd_ple_side`, `test_vkd_f16_gemm_khr`, `test_vkd_fa_cm2`, `test_vkd_fa_khr`,
   `test_vkd_fa_khr_h256_softcap`, `test_vkd_da_attn`, `test_vkd_da_attn_rqk`, `test_vkd_da_attn_bw`,
-  `test_vkd_moe_gather_row` and `test_vkd_combine_row` cells - the census's evidence for the classes no zoo row
-  dispatches - must hold each class against its CPU oracle at the bar the cell sets, with the cell's poisoned-element
-  control.
-- `test_vulkan_tower_kernels.das`'s `test_vkt_fa_bidir`, `test_vkt_tower_rows`, `test_vkt_tower_ln_rows`,
-  `test_vkt_tower_f16_feeds`, `test_vkt_tower_vision_rows`, `test_vkt_tower_win_rows`, `test_vkt_tower_tail_rows`,
-  `test_vkt_tower_front_movers`, `test_vkt_tower_front_mel`, `test_vkt_tower_cn_attn_rel_plane`,
-  `test_vkt_tower_conformer`, `test_vkt_tower_fastconformer`, `test_vkt_tower_dw2d`, `test_vkt_wdec_classes` and
-  `test_vkt_wdec_fused_rq` cells - the census's evidence for the tower classes - must hold each class against its
-  CPU oracle at the bar the cell sets, with the cell's poisoned-element control.
-- `test_vulkan_kv_codec_kernels.das`'s `test_vkc_q8_da_attn` and `test_vkc_tq4_da_attn` cells must hold the codec
-  attention arms (`codec_attn_arms`) against the CPU attention over the codec's rows, each arm with its controls.
+  `test_vkd_moe_gather_row`, `test_vkd_combine_row`, `test_vkd_kq_batch_family`,
+  `test_vkd_emb_gather_family` and `test_vkd_nv4_cm2_batch` cells - the census's evidence for the
+  classes no zoo row dispatches - must hold each class against its CPU oracle at the bar the cell
+  sets, with the cell's poisoned-element control.
+- `test_vulkan_tower_kernels.das`'s `test_vkt_fa_bidir`, `test_vkt_tower_rows`,
+  `test_vkt_tower_ln_rows`, `test_vkt_tower_f16_feeds`, `test_vkt_tower_vision_rows`,
+  `test_vkt_tower_win_rows`, `test_vkt_tower_tail_rows`, `test_vkt_tower_front_movers`,
+  `test_vkt_tower_front_mel`, `test_vkt_tower_cn_attn_rel_plane`, `test_vkt_tower_conformer`,
+  `test_vkt_tower_fastconformer`, `test_vkt_tower_dw2d`, `test_vkt_wdec_classes` and
+  `test_vkt_wdec_fused_rq` cells - the census's evidence for the tower classes - must hold each
+  class against its CPU oracle at the bar the cell sets, with the cell's poisoned-element control.
+- `test_vulkan_kv_codec_kernels.das`'s `test_vkc_q8_da_attn` and `test_vkc_tq4_da_attn` cells must
+  hold the codec attention arms (`codec_attn_arms`) against the CPU attention over the codec's
+  rows, each arm with its controls.
 - `test_gpu_tier.das`'s `test_override_announces` cell must hold every override line the GPU
   homes announce - its setter and env spellings - in step with the knob list
   (`../ENVIRONMENT.md`), and no line where the override takes no effect.
@@ -150,11 +177,15 @@ must keep holding:
   voices and speaking.
 - `test_tts_pocket.das`'s `test_pocket_quiet_floor` cell must hold the served lane's quiet floor
   against the f32 lane's.
-- `test_whisper.das`'s `test_canary_qwen_oracle` cell, an external-reference compare, must hold the forced walk over
-  `../harness/canary_qwen_expected.tsv`'s ids within `CN_TIE_BAR` of our argmax at every step of its
-  three clips, on the CPU chain and on the Metal tower, its control the same walk fed each id one step early
-  with the oracle id outside the bar at every step that input moved, and the greedy ids equal to the
-  oracle's up to the first tie.
+- `test_tts_pocket.das`'s `test_pocket_small_models` cell must hold, for each `SMALL` row's
+  published file, the 19-voice English roster and the four character replacements its config
+  carries, as the reference build's config lists them, and each seat serving, or declining with the
+  `shape` reason, as that row's seat columns say.
+- `test_whisper.das`'s `test_canary_qwen_oracle` cell, an external-reference compare, must hold
+  the forced walk over `../harness/canary_qwen_expected.tsv`'s ids within `CN_TIE_BAR` of our
+  argmax at every step of its three clips, on the CPU chain and on the Metal tower, its control the
+  same walk fed each id one step early with the oracle id outside the bar at every step that input
+  moved, and the greedy ids equal to the oracle's up to the first tie.
 
 **A diff that changes the contract a pinned test cell holds fixed - what its entry says it must
 keep holding, an axis gained or lost - updates that cell's entry in the pinned set in the same

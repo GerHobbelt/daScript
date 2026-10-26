@@ -615,7 +615,7 @@ def test_vkt_tower_vision_rows(t0 : T?) {   // nolint:STYLE038 — one flat gate
                 var s_pool = cp |> cls_set(fixed_array(gxp, poolp), @@set_tower_pool_2d_cls)
                 var s_aff = cp |> cls_set(fixed_array(ax_std_p, bp, mp), @@set_tower_affine_rows_cls)
                 var s_aff0 = cp |> cls_set(fixed_array(ax_scale_p, bp, mp), @@set_tower_affine_rows_cls)
-                var pa_im = GkPatchIm2colArgs(w = uint(VR_W), h = uint(VR_H), p = uint(VR_P), row_dim = uint(VR_PD), npos = uint(npos),
+                var pa_im = GkPatchIm2colArgs(w = uint(VR_W), p = uint(VR_P), row_dim = uint(VR_PD), npos = uint(npos),
                     total = uint(npos_pad * VR_PD), scale = 2.0, shift = -1.0)
                 var pa_pos = GkPosAdd2DArgs(dim = uint(d), ncols = uint(VR_PW), pos_entries = uint(VR_POS_ENTRIES), total = uint(nd), tboff = 0u)
                 var pa_asm = GkStemAsmArgs(dim = uint(d), pw = uint(VR_PW), total = uint(nd), boff = 0u, poff = 0u)
@@ -1120,9 +1120,9 @@ def test_vkt_tower_ln_rows(t0 : T?) {   // nolint:STYLE038 — one flat gate ove
                 check_rows(t, "tower_bias_act BIAS_ACT_RELU the bias and relu vs max(x + b, 0)", grelu_dev, grelu_ref, BAR_APPROX, d)
                 gelu_tanh_lut_batch(g_ref, int64(d), int64(rows))
                 check_rows(t, "tower_bias_act the bias and the tanh GELU vs add_bias_rows + gelu_tanh_lut_batch", g_dev, g_ref, BAR_APPROX, d)
-                // the erf arm evaluates the CPU's rational erfc in f32 where the CPU evaluates it in double: 1e-5 relative holds the
-                // f32 rounding of the polynomial and the exp (a few ulp) and is well under the erf-vs-tanh gap (4.7e-4 at x = -2.7),
-                // which the approx bar (2e-3) could not tell apart
+                // the erf arm evaluates the CPU's rational erfc fit in the shader's f32 as the CPU kernel does on its lattice: 1e-5
+                // relative holds the two evaluations' rounding of the polynomial and the exp (a few ulp) and is well under the
+                // erf-vs-tanh gap (4.7e-4 at x = -2.7), which the approx bar (2e-3) could not tell apart
                 gelu_erf_batch(gerf_ref, int64(d), int64(rows))
                 let erf_bar = 1e-5
                 check_rows(t, "tower_bias_act BIAS_ACT_GELU_ERF the bias and the erf GELU vs add_bias_rows + gelu_erf_batch within {erf_bar}", gerf_dev, gerf_ref, Bar(rel = erf_bar, poison = 0.5), d)

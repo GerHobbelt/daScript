@@ -1,6 +1,25 @@
-# daslib architecture notes - emission: AOT C++, standalone contexts
+# daslib architecture notes - emission: AOT C++, standalone contexts, the text shader emitters' shared rail
 
 Companion to `ARCHITECTURE.md` in this folder; section numbers are unique across the family.
+
+## shader_emit_common {#shader-emit-common}
+
+- **One rail holds what the C-family text shader emitters read identically off the AST.**
+  `shader_emit_common.das` carries each once, pure compile-time AST logic with no backend type,
+  beside `shader_block_layout`, whose classification rails it reads.
+- **A spelling one emitter needs alone stays in that emitter's `*_types.das`.** The rail is the
+  words both emitters share; a CUDA-only or MSL-only form (CUDA's half-family test and element
+  bytes, MSL's threadgroup element bytes and buffer element name) lives with the emitter that
+  reads it, so a reader of the rail finds nothing that serves one backend.
+- **The `[*_kernel]` annotations' companion-global scaffolding is the rail's too.** A typed
+  global added at annotation time, a constant string's initializer and the never-inline pin on a
+  function the kernel reaches are one procedure each (`add_typed_global`,
+  `set_const_string_init`, `pin_reachable_never_inline`), which both annotations call. The stem
+  those globals hang off (`kernel_global_name`: the annotation's `name =`, else the derived name
+  plus the backend suffix) is read from the annotation's arguments or off the method's own
+  declaration, so a lens that finds a kernel after the fact names the same globals. The CPU
+  auto-inliner shares the annotation's `patch` slot while the emitter reads the tree at fixup, so
+  the never-inline pin lands as a flag write, which needs no re-infer.
 
 ## 5. aot_cpp
 
@@ -16,17 +35,22 @@ Companion to `ARCHITECTURE.md` in this folder; section numbers are unique across
   nothing when its destructor fires during an unwind
   (`include/daScript/simulate/ARCHITECTURE.md#aot-finally-unwind`). The pair moves together;
   only `test_aot` on a `DAS_ENABLE_EXCEPTIONS` build fails on a mismatch.
-- **A `try`/`recover` restores what the interpreter's handler restores**: the emitter writes
-  the pair as `das_try_recover(__context__, [&](){...}, [&](){...})`, whose catch path puts
-  back `fastCallDepth` before the recover body runs, then `abiArg`, `abiCMRES` and the stack
-  watermark after it - the same state `SimNode_TryCatch` and `jit_try_recover` restore
-  (`include/daScript/simulate/ARCHITECTURE.md#fastcall-depth-guard`). The three move together;
-  only `test_aot` over a capped program whose recursion stays interpreted fails on a mismatch.
+- **A `try`/`recover` restores the caller's fastcall depth**: the emitter
+  writes the pair as `das_try_recover(__context__, [&](){...}, [&](){...})`,
+  whose catch path puts back `fastCallDepth` before the recover body runs,
+  then `abiArg`, `abiCMRES` and the stack watermark after it
+  (`include/daScript/simulate/ARCHITECTURE.md#fastcall-depth-guard`). An AOT
+  run over a capped program whose recursion stays interpreted exercises
+  this restoration.
 - **C++ identifier mangling**: `aotSuffixNameEx` prepends `_S`/`_E`/`_V`/`_f_` when a das
   name is a C++ keyword, holds a non-alnum char, or is `DELETE` (winnt.h). Structs and
   enums share ONE C++ namespace while daslang keeps separate tables, so `struct X` +
   `enum X` in one module is legal das and a C++ redefinition - `buildStructEnumCollisions`
   finds the pairs per module and forces both suffixes.
+- **A struct's C++ name is built at two sites in `aot_cpp.das`**: `aotStructName`, and the inline
+  `aotSuffixNameEx(info.name, "_S", ...)` in `describeCppStructInfoFields`, whose namespace comes
+  from `aotModuleNameFromString`. The pair moves together; one site changed alone writes
+  `offsetof`s that name a struct declared under a different name.
 - **The emitter targets the MSVC/GCC/Clang intersection; the redundant-looking spellings
   are the portable ones** - `INT64_C`, the explicit `0x8000000000000000` enum arm,
   `to_cpp_double`'s named non-finite tokens (mirrors `src/simulate/runtime_string.cpp` and

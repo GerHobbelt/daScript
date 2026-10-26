@@ -4,7 +4,7 @@ Contract: `ARCHITECTURE_COMMON.md` (repo root). These tests exercise the module 
 daslang host installs unasked - its per-compile key, and the front end's record-by-record read;
 this document states what the folder is and why its tests take the shape they do.
 
-## 1. File charters
+## 1. File charters {#file-charters}
 
 - `test_default_cache_path.das` - the default cache as the host installs it with no flag: that
   it stays silent on every read outcome, that its file is keyed per compile input, that each
@@ -47,6 +47,9 @@ this document states what the folder is and why its tests take the shape they do
   copy, and the second script's `JV` call - a main-module type equal to one in that record -
   still serves and runs; the stream's type table restarts at each module's record, so no
   back-reference reaches the copy.
+- `test_shared_typename.das` - compound type-name folding across cold,
+  warm and obsolete-version cache reads, retaining the invoking host's
+  static or dynamic kind outside AOT-consuming runs.
 - `test_descriptor_manifest.das` - the manifest the module scan keeps beside each `.das_module`
   descriptor, replaying its registrations instead of compiling the descriptor, on a project root
   the test writes, three modules in it: one whose descriptor registers
@@ -74,8 +77,11 @@ this document states what the folder is and why its tests take the shape they do
   and is taken, as it is with a `require UnitTest` above it, below it, or in the entry while
   the guard sits in a module walked earlier;
   `-ignore-manifest` compiles every descriptor, loads every C++ module on start and writes no
-  manifest; a manifest row hand-edited to an absent artifact makes the require bring every
-  deferred module in and then fail on the missing prerequisite; a nameless `dm` row added by
+  manifest; a manifest row hand-edited to an artifact that exists but is no shared module still
+  replays and defers, and the require's failed dlopen brings every deferred module in and then
+  fails on the missing prerequisite; a `dm` row whose artifact is gone makes the manifest stale,
+  so the descriptor recompiles and `has_module` answers absent; a module-cache record folded
+  with the module present is refused once it is gone, and the other way; a nameless `dm` row added by
   hand whose path is a file that exists and is no shared module fails at the scan and, its
   artifact present, makes the scan bring every deferred module in before any require; the real
   `dm` row with its name blanked loads at the scan, gets its name written back, and the next start
@@ -144,22 +150,29 @@ this document states what the folder is and why its tests take the shape they do
   output before the child wrote it on some tiers and after on others. A test whose child needs
   a different spawn shape - an argv spawn, an environment variable - keeps that one helper local.
 
-## 2. Why every case is a spawned process
+## Why every case is a spawned process {#process-startup}
 
-The host installs the cache before `compileDaScript` and finishes it after `simulate`; the
-default path, the quiet flag and the verdict are host decisions (`utils/daslang/main.cpp`). A test compiling
-in-process sees none of them. Each case therefore spawns the daslang binary dastest itself runs
-under (`argv[0]`): the default-path case on scripts it writes to a temp directory, asserting on
-the child's stdout and on the files under `.cache/daslang/module_cache/` in the cwd; the
-explicit-cache cases on a driver under `_fixtures/` with `-module-cache` pointed into a temp
-directory, asserting on the child's stdout; the manifest case on a project root under a temp
-directory, asserting on the scan trace. Each removes what it wrote under its own directory,
-with one ledgered write outside it: the default-path case's child writes the default cache,
-which is `.cache/daslang/module_cache/` under the cwd it shares with dastest by definition,
-and the test removes what that child wrote before it returns. The manifest sidecars every
-child's module scan warms beside the tree's descriptors - `.das_module.manifest` from the
-dynamic-module build, `.das_module.static.manifest` from `daslang_static` - are the scan's,
-gitignored, and stay; a test names the one its own kind writes (`manifest_file_name`), since
-the static suite runs this folder too, and the default-path case keys its stems by kind
-(`kind_stem`) because the two suites run at once in one tree. A child's stdout is echoed on failure,
-because the exit code alone would turn a one-line answer into an exit-code hunt.
+The host installs the cache before `compileDaScript` and finishes it after
+`simulate`; the default path, the quiet flag and the verdict are host
+decisions (`utils/daslang/main.cpp`). A test compiling in-process sees none
+of them. Each case therefore spawns an interpreter. The shared-type-name
+case uses the running executable's absolute path, or the sibling
+interpreter when dastest consumes AOT. The default-path case runs scripts
+it writes to a temp directory, asserting on the child's stdout and on the
+files under `.cache/daslang/module_cache/` in the cwd; the explicit-cache
+cases run a driver under `_fixtures/` with `-module-cache` pointed into a
+temp directory, asserting on the child's stdout; the manifest case runs a
+project root under a temp directory, asserting on the scan trace. Each
+removes what it wrote under its own directory, with one ledgered write
+outside it: the default-path case's child writes the default cache, which
+is `.cache/daslang/module_cache/` under the cwd it shares with dastest by
+definition, and the test removes what that child wrote before it returns.
+The manifest sidecars every child's module scan warms beside the tree's
+descriptors - `.das_module.manifest` from the dynamic-module build,
+`.das_module.static.manifest` from `daslang_static` - are the scan's,
+gitignored, and stay; a test names the one its own kind writes
+(`manifest_file_name`), since the static suite runs this folder too, and
+the default-path case keys its stems by kind (`kind_stem`) because the two
+suites run at once in one tree. A child's stdout is echoed on failure,
+because the exit code alone would turn a one-line answer into an exit-code
+hunt.

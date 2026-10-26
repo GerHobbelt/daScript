@@ -1,0 +1,20 @@
+options gen2
+require daslib/fio
+
+[export]
+def initialize(project_path : string) {
+    //! 64-bit hosts only (ARCHITECTURE.md): a 32-bit host has no CUDA driver and no [extern]
+    if (typeinfo sizeof(type<void?>) != 8) {
+        return
+    }
+    let cuda_paths = ["cuda_driver", "das_cuda_boost", "cuda_types", "cuda_builtins", "cuda_intrinsics", "cuda_emit", "cuda_kernel"]
+    for (path in cuda_paths) {
+        register_native_path("cuda", "{path}", "{project_path}/cuda/{path}.das")
+    }
+    if (das_is_dll_build()) {
+        // the `cuda` witness module (src/dasCUDA.cpp) exists only in a build configured with
+        // dasCUDA; the 2-arg form skips silently when the .shared_module was never built, and
+        // that silence is what `require ?cuda` reads as "this build has no CUDA"
+        register_dynamic_module("{project_path}/dasModuleCUDA.shared_module", "Module_CUDA")
+    }
+}

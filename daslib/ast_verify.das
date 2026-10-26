@@ -32,14 +32,16 @@ require daslib/ast
 require daslib/ast_boost
 require strings
 
-def private batch_mode() : bool {
+def private cli_flag(name : string) : bool {
     let args <- get_command_line_arguments()
     for (arg in args) {
         return false if (arg == "--")
-        return true if (arg == "--ast-verify-batch")
+        return true if (arg == name)
     }
     return false
 }
+
+def private batch_mode() : bool => cli_flag("--ast-verify-batch")
 
 def private placeholder(at : LineInfo) : ExpressionPtr => new ExprConstInt(at = at, value = 0)
 
@@ -1637,10 +1639,89 @@ def public verify_module_gc_root(var prog : ProgramPtr; mod : Module?) : int {
     return total
 }
 
+def private carries_unresolved_type(expr : ExpressionPtr) : bool {
+    //! An unresolved type is allowed only on a block or lambda
+    //! literal, its closure body and an empty array or table
+    //! literal: the call they are passed to infers it.
+    let closure = expr is ExprBlock && (expr as ExprBlock).blockFlags.isClosure
+    if (expr._type == null || !(expr._type.isAutoOrAlias || expr._type.isExprType)
+            || expr is ExprMakeBlock || closure) {
+        return false
+    }
+    let bt = expr._type.baseType
+    return !(expr is ExprMakeStruct && (bt == Type.tArray || bt == Type.tTable))
+}
+
+class private AstInferPassVerifyVisitor : AstVisitor {
+    prog : ProgramPtr
+    found : int = 0
+    def override canVisitFunction(fun : Function?) : bool => !fun.moreFlags.isTemplate
+    def override preVisitExpression(var expr : ExpressionPtr) : void {
+        if (!carries_unresolved_type(expr)) {
+            return
+        }
+        found++
+        if (prog != null) {
+            let text = ("AST verify (infer pass): {expr.__rtti} carries the unresolved type "
+                + "{describe(expr._type)}; an expression stays untyped until its type resolves")
+            to_log(LOG_ERROR, "{text} at {describe(expr.at)}\n")
+            prog |> macro_sticky_error(expr.at, text)
+            expr._type = null
+        }
+    }
+}
+
+def public count_unresolved_types(var expr : ExpressionPtr) : int {
+    //! Counts the expressions in ``expr`` the per-pass check
+    //! reports, without reporting or repairing them.
+    var v = new AstInferPassVerifyVisitor()
+    make_visitor(*v) $(adapter) {
+        visit(expr, adapter)
+    }
+    let found = v.found
+    unsafe {
+        delete v
+    }
+    return found
+}
+
+[dirty_infer_macro]
+class AstInferPassVerifyMacro : AstPassMacro {
+    def override apply(prog : ProgramPtr; mod : Module?) : bool {
+        if (mod != null && !mod.moduleFlags.builtIn && cli_flag("--ast-verify-each-pass")) {
+            var v = new AstInferPassVerifyVisitor()
+            v.prog := prog
+            make_visitor(*v) $(adapter) {
+                visit_module(prog, adapter, mod)
+            }
+            unsafe {
+                delete v
+            }
+        }
+        return false
+    }
+}
+
+//! a promoted copy's post-compile pass reaches every later program of
+//! the process (the walk is over the global module list), so only a
+//! program holding this module in its own library is verified
+def private program_asked_for_verify(prog : ProgramPtr) : bool {
+    var asked = false
+    program_for_each_module(prog) $(m) {
+        if (m.name == "ast_verify") {
+            asked = true
+        }
+    }
+    return asked
+}
+
+def private verifies(mod : Module?) : bool =>
+    mod != null && !mod.moduleFlags.builtIn && !mod.moduleFlags.fromModuleCache
+
 [post_compile_macro]
 class AstPostCompileVerifyMacro : AstPassMacro {
     def override apply(var prog : ProgramPtr; mod : Module?) : bool {
-        if (mod != null && !mod.moduleFlags.builtIn) {
+        if (verifies(mod) && program_asked_for_verify(prog)) {
             verify_module(prog, mod)
             if (batch_mode()) {
                 verify_module_after_infer(prog, mod)
@@ -1659,7 +1740,7 @@ class AstPostCompileVerifyMacro : AstPassMacro {
 [post_rewrite_macro]
 class AstPostRewriteVerifyMacro : AstPassMacro {
     def override apply(prog : ProgramPtr; mod : Module?) : bool {
-        if (mod != null && !mod.moduleFlags.builtIn) {
+        if (verifies(mod)) {
             verify_module(prog, mod)
         }
         return true
@@ -1673,7 +1754,7 @@ class AstSimulateVerifyMacro : AstSimulateMacro {
     //! here. Not reached under -compile-only, which never simulates.
     def override simulate(_prog : Program?; _ctx : Context?) : bool {
         let mod = compiling_module()
-        if (mod != null && !mod.moduleFlags.builtIn) {
+        if (verifies(mod)) {
             verify_module(compiling_program(), mod)
             if (batch_mode()) {
                 verify_module_after_infer(compiling_program(), mod)

@@ -65,14 +65,21 @@ the same default cache when its `CodeOfPolicies.module_cache` is set, with
 `ModuleFileCache::embeddedHostOptions` standing in for the host's command line: this process's
 arguments up to `--`, a `--jit-target` after it, and a hash of the policies streamed as a record
 stamps them, so two tools compiling one file under different policies keep separate records
-instead of rewriting one. `ScriptModuleCache` is the guard around that compile: it empties the
+instead of rewriting one. `module_cache_path` exposes this path to scripts;
+dastest keeps its filename in the requested cache directory.
+`ScriptModuleCache` is the guard around that compile: it empties the
 environment's serializer slots before installing - the enclosing compile's stream (a
 `compile_file` from an `[init]` runs under the host's armed cache) never feeds the nested one, a
 cold nested read included - finishes the cache and puts the slots back on every exit, an
-exception's included, and the finish happens before the block runs, so a require the block
-issues is not this cache's. The writeback's temporary file carries the process id and a per-process
-sequence number, since two subtools compiling one file at once key the same record, as do two
-threads of one process.
+exception's included. An explicit-path overload uses the same guard, returns
+`none`, `clean`, `partial` or `fallback`, and transfers
+deserialized source files without a module owner to the caller's
+`ModuleGroup`. An empty explicit path disables caching while still hiding
+the enclosing streams. File-I/O-disabled builds throw before the block.
+The finish happens before the block runs, so a require
+the block issues is not this cache's. The writeback's temporary file carries
+the process id and a per-process sequence number, since two subtools compiling
+one file at once key the same record, as do two threads of one process.
 
 Every variant is its own record and an engine root's record is 200 MB, so the default directory
 is capped: after a writeback `ModuleFileCache::finish` lists the directory's `.dascache` files
@@ -81,72 +88,6 @@ set; `0` disables eviction), never the record just written. `install` touches th
 reads, so a record in use is the newest and a stale variant the oldest. Only the default
 directory is pruned - an explicit `-module-cache <path>` is the user's - and the limit variable
 is the one `DAS*` name the record key skips, since it decides nothing about a compile.
-
-## 3. The interpreter's `[extern]` call {#interpreter-extern-call}
-
-An `[extern]` function (`module_builtin_dasbind.cpp`) is called from the interpreter through
-a wrapper `vec4f (*)(void * fn, vec4f * args)`: the node evaluates every argument into a
-`vec4f` lane and the wrapper calls `fn` through a C prototype. The wrappers are generated -
-`generate_x86_64_calls.das` writes `win_x86_64_wrapper.inc`, `systemV_64_wrapper.inc` and
-`systemV_64_extra_wrapper.inc` - one per argument count, result class and float mask of the
-first register-class arguments, indexed from 0: four positions on Windows, six on SystemV,
-with every integer-class argument spelled `int64_t`, every float-class one `double`, and the
-result `int64_t` or `vec4f`. Float class is a `float` or `double` by value; a ref, whatever it
-points to, is a pointer and so integer class, on the table and the layout alike. A SystemV call with more than six arguments and a float at index
-6 or later needs a prototype from the extra table, keyed by argument count, result class (1 for
-a float or double result, as the main table indexes it) and the full mask; its entries are the
-hand-listed `systemV_extra` rows in the generator - a new shape is added there and the
-generator re-run - and a shape the list lacks is a compile error naming the mask.
-
-The C prototype passes a stack argument as an 8-byte slot. That fits Windows x64, where the
-mask covers four positions and everything past the fourth argument is an 8-byte stack slot,
-float included. It fits SystemV x86-64 too: its float registers past index 5 are exactly the
-extra list's cases. It does not fit arm64: eight float registers, so a float at index 6 or 7
-belongs in d6 or d7, and on Apple the stack is packed at natural size and alignment - a 32-bit
-`int` in 4 bytes, a `bool` in 1 - where Linux and Android keep 8-byte slots. So on arm64
-(Apple, Linux, Android; a Windows arm64 build keeps the table, since `DAS_BIND_ARM64_LAYOUT`
-turns on for `__APPLE__` and `__linux__` only while `DAS_BIND_EXTERNAL` is on for every 64-bit
-Windows) a call with more than six arguments leaves the table: at bind time the
-function's das types produce an `Arm64Layout` - which argument rides in x0-x7, which in d0-d7,
-and at which byte offset of a stack image the rest sit, packed on Apple and slotted elsewhere -
-and the node calls `das_arm64_call`, an assembly trampoline that copies the image below its
-own frame, loads the sixteen argument registers, calls, and stores x0 and d0 for the node to
-return. A call of six or fewer arguments has no stack argument and no float past the mask
-under any of these ABIs, so it keeps the table there too. A packed width comes from the das
-type: a ref, pointer or string is 8 bytes, a scalar its `getBaseSizeOf`, and anything else (an
-aggregate by value, which the binder does not support) rides as 8 bytes, as the table would
-pass it. A layout lives for the process - `computeArm64Layout` keeps every layout in a static
-vector it never frees - because a re-applied `[extern]` replaces the module's function object
-while an earlier context's call node, which carries the layout pointer, may still run.
-
-The JIT uses neither: `modules/dasLLVM/daslib/llvm_jit.das` (repo root) emits an extern call
-with the function's own LLVM types, so a compiled call is right on every platform. The wrapper
-table and the layout are the interpreter's alone, which is why an ABI defect there shows only
-in interpreted code - a macro context, a `[no_jit]` function, a plain run. `tests/dasbind`
-probes both paths against `tests/dasbind/probe`, a library whose functions sum their arguments
-under distinct multipliers, so one argument in the wrong register or slot changes the total.
-`tests/dasbind/CMakeLists.txt` builds the probe on a 64-bit host that builds and dlopens a
-shared library at test time - not wasm, Android or iOS, none of which walks `tests/` - and
-`tests/.das_test` skips the suite only on a 32-bit host, where the probe is not built, and under
-dastest's `--ser`/`--deser` sweep. A deserialized program never applies `[extern]`, while a
-deserialized call already names its `__dasbind__` function in the `dasbind` module - and only
-`apply` or a retarget manufactures that function. A 64-bit desktop tree without the library
-fails the suite instead of skipping it.
-
-The `__dasbind__` proxy - the `DasBindFunction` a call to an `[extern]` is retargeted to - is
-registered by the `[extern]` annotation's `apply` callback when the registrar - the module
-carrying the `[extern]` declarations - compiles, and on demand by `transformCall` when the
-`dasbind` module lacks it: the module cache serves a registrar in a process that already
-compiled it (a live reload - the same process, so the `dasbind` module's hash shows no drift and
-nothing reparses the registrar), or a fresh process reads a dependent's record before any
-compile applied the registrar. `transformCall` takes the bind name from the call target's own
-`[extern]` declaration every time (`bindNameOf`) - the one input every process has - rather than
-from a table keyed on the function object, which every deserialization mints anew and whose
-freed addresses a later compile reuses. The proxy's signature types are clones with no source
-location (`proxyType`): the declaration's types and file record belong to the registrar's
-compile, which a served registrar's program takes with it, while the proxy lives for the
-process. A failed bind on the on-demand path is the call's transform error, the diagnostic
-`apply` would have given.
 
 ## 4. A message that crosses the panic jump {#message-crosses-panic-jump}
 
@@ -202,19 +143,11 @@ operator, so a container element or a field of a local record streams through `s
 whatever its type. The empty string is most of the occurrences, every unaliased `TypeDecl`
 carrying one, so it answers from its own slot without hashing.
 
-**Types.** A `TypeDecl` reference streams as a number (`TypeRef`): 0 null, 1 an inline payload,
-2 a fresh table entry whose payload follows, 3 and up an entry already in the table followed by
-its own `at`. A type carrying expressions - a fixed-dim expression, a type macro - is not tableable and
-streams inline, and so does any type with such a child: the table dedups by content, and an
-expression is not content the key covers. The writer keys the live type and hashes and compares
-its content recursively, the two `findAlias` cache bits masked out of both the key and the stream
-since they are a cache and not part of the type; the reader keeps the first decoded instance and
-deep-copies it for every later reference, so no two nodes share a type. A type takes its number
-AFTER its payload on both sides: the payload can carry a same-module structure inline whose field
-holds a type equal to this one, and with the number taken first the reader would copy a prototype
-it has not finished decoding. The writer counts fresh entries apart from the map, since an equal
-type registered from inside the payload keeps the map's number while the reader pushes every
-fresh entry.
+**Types.** A `TypeDecl` reference streams as 0 null, 1 a payload, or 2 and up a node the record
+already streamed, which the reader answers with the same pointer - a record reads back with the
+sharing its writer had (`src/ast/ARCHITECTURE_GC.md#type-remap`). A node takes its number before
+its payload: an inline same-module structure can hold that very node. A module the reader builds
+carries `fromModuleCache`, and `daslib/ast_verify` skips it, since its types are shared.
 
 **Files and lines.** A `FileInfo` streams as its per-record number, the first mention carrying
 the payload after the number; a record names its own few files, so the number is one byte. A
@@ -297,4 +230,5 @@ owner, and `~Context` waits for zero before it frees the pool.
 `native_thread_stack_size`, `native_allocator_stats`, and `native_allocator_extent`
 report Emscripten native stack size, allocator use, and heap extent. On other targets
 they return zero as an unavailable measurement. Consumers check the platform before
-displaying those values. The job queue's team panics are `ARCHITECTURE_JOBQUE.md`.
+displaying those values. The job queue's team panics are `ARCHITECTURE_JOBQUE.md`; the
+interpreter's `[extern]` call is `ARCHITECTURE_DASBIND.md`.

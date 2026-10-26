@@ -12,6 +12,7 @@ require dasllama/dasllama_lint public
 require math
 require dasllama/dasllama_math   // rope_scaled_tab, rope_scaled_neox_tab, rope_scaled_neox_tab_part
 require dasllama/dasllama_gpu_math
+require daslib/shader_lingua_franca
 
 //! The engine's table rope over `n` elements of `v` from `base`, heads `hs` wide, on the `tcos` / `tsin` rows: the partial
 //! form whenever `rot` names a prefix short of `hs`, else the NEOX or the interleaved pairing as `neox` names - the engine's
@@ -366,4 +367,125 @@ def dw_s2_front_ref(first, relu : bool; iw, ch, oh, ow, valid : int; xv, wv, bv 
         }
     }
     return <- want
+}
+
+//! the GEMM oracles' region-record walk: each record's `cnt` rows from `row0` at every output column, y[row * d + c] = `dot`(row, c, wblk0)
+def rec_walk(recs : array<uint>; nrec, d : int; var y : array<float>; dot : block<(row, c, wblk0 : int) : float>) {
+    for (rr in range(nrec)) {
+        let wblk0 = int(recs[rr * 4])
+        let row0 = int(recs[rr * 4 + 1])
+        for (r in range(int(recs[rr * 4 + 2]))) {
+            for (c in range(d)) {
+                y[(row0 + r) * d + c] = invoke(dot, row0 + r, c, wblk0)
+            }
+        }
+    }
+}
+
+def byte_u8(a : array<uint>; i : int) : int => int(a[i / 4] >> uint((i % 4) * 8)) & 0xFF
+
+def byte_s8(a : array<uint>; i : int) : int {
+    let b = byte_u8(a, i)
+    return b >= 128 ? b - 256 : b
+}
+
+def half_at(a : array<uint>; hi : int) : float {
+    let w = unpackHalf2x16(a[hi / 2])
+    return hi % 2 == 0 ? w.x : w.y
+}
+
+//! summed per (row, col) in block order; the device tiles reassociate, so a compare takes the approx bar
+def q8f16_gemm_oracle(wq : array<uint>; wsw : array<uint>; xf : array<uint>;
+                      recs : array<uint>; nrec, n, d : int; var y : array<float>) {
+    let nbb = n / 32
+    rec_walk(recs, nrec, d, y) $(row, c, wblk0 : int) : float {
+        var acc = 0.0
+        for (b in range(nbb)) {
+            let wb = wblk0 + c * nbb + b
+            let wsf = wb % 2 == 0 ? unpackHalf2x16(wsw[wb / 2]).x : unpackHalf2x16(wsw[wb / 2]).y
+            var bacc = 0.0
+            for (j in range(32)) {
+                bacc += float(byte_s8(wq, wb * 32 + j)) * half_at(xf, row * n + b * 32 + j)
+            }
+            acc += bacc * wsf
+        }
+        return acc
+    }
+}
+
+//! exact int dots a 32-block folded in block order; the device folds reassociate, so a compare takes the approx bar
+def q8_gemm_oracle(wq : array<uint>; wsw : array<uint>; xq : array<uint>; xs : array<float>;
+                   recs : array<uint>; nrec, n, d : int; var y : array<float>) {
+    let nbb = n / 32
+    rec_walk(recs, nrec, d, y) $(row, c, wblk0 : int) : float {
+        var acc = 0.0
+        for (b in range(nbb)) {
+            let wb = wblk0 + c * nbb + b
+            let xb = row * nbb + b
+            var idot = 0
+            for (j in range(8)) {
+                idot += sdot4(wq[wb * 8 + j], xq[xb * 8 + j])
+            }
+            let wsf = wb % 2 == 0 ? unpackHalf2x16(wsw[wb / 2]).x : unpackHalf2x16(wsw[wb / 2]).y
+            acc += float(idot) * wsf * xs[xb]
+        }
+        return acc
+    }
+}
+
+//! `n` elements of `src` from `soff`, plus the bias row `bh` from `boff` when the cell has one (an empty `bh`: no bias)
+def biased_row(src : array<float>; soff : int; bh : array<float>; boff, n : int) : array<float> {
+    if (empty(bh)) {
+        return <- [for (i in range(n)); src[soff + i]]
+    }
+    return <- [for (i in range(n)); src[soff + i] + bh[boff + i]]
+}
+
+//! the rope oracle's cos and sin rows: the two halves of the `hs`-wide cos | sin row at `at`
+def cossin_rows(csh : array<float>; at, hs : int) : tuple<c : array<float>; s : array<float>> {
+    var c <- [for (j in range(hs / 2)); csh[at + j]]
+    var s <- [for (j in range(hs / 2)); csh[at + hs / 2 + j]]
+    return <- (c = c, s = s)
+}
+
+//! the fused qk-norm + rope + KV-store oracle at one position (both homes' `QknRopeKvT` cells): each head row biased when `bh` is set, rmsnormed on `wnh` (q heads on its first `hs`, k heads on the next), table-roped on the cos | sin row `csh`; k lands at mirror row `krow`, v copies its raw row plus bias, both through `round`
+def qkn_rope_rows(q0h, kvh, bh, wnh, csh : array<float>; bpad, nh, nkvh, hs, krow, mirn : int; eps : float;
+                  round : block<(x : float) : float>) : tuple<q : array<float>; mk : array<float>; mv : array<float>> {
+    let qd = nh * hs
+    let kvd = nkvh * hs
+    var cs <- cossin_rows(csh, 0, hs)
+    var q, mk, mv : array<float>
+    q |> resize(qd)
+    mk |> resize(mirn)
+    mv |> resize(mirn)
+    for (wid in range(nh + nkvh)) {
+        let is_k = wid >= nh
+        let hh = is_k ? wid - nh : wid
+        let sbase = is_k ? qd + hh * hs : hh * hs
+        var inscope row <- is_k ? biased_row(kvh, sbase, bh, bpad + sbase, hs) : biased_row(q0h, sbase, bh, bpad + sbase, hs)
+        var inscope nrow : array<float>
+        nrow |> resize(hs)
+        unsafe {
+            rmsnorm(addr<float?>(nrow[0]), addr<float const?>(row[0]), addr<float const?>(wnh[is_k ? hs : 0]), int64(hs), eps)
+        }
+        rope_tab_ref(nrow, 0, hs, hs, hs, true, cs.c, cs.s)
+        for (i in range(hs)) {
+            if (is_k) {
+                mk[krow + hh * hs + i] = invoke(round, nrow[i])
+            } else {
+                q[hh * hs + i] = nrow[i]
+            }
+        }
+        if (is_k) {
+            var inscope vrow <- biased_row(kvh, qd + kvd + hh * hs, bh, bpad + qd + kvd + hh * hs, hs)
+            for (i in range(hs)) {
+                mv[krow + hh * hs + i] = invoke(round, vrow[i])
+            }
+            delete vrow
+        }
+        delete row
+        delete nrow
+    }
+    delete cs
+    return <- (q = q, mk = mk, mv = mv)
 }

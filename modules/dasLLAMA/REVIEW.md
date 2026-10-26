@@ -15,9 +15,9 @@ rewrites the problem a `followup_*.md` row states, adds a file under `dasllama/`
 STYLE037/STYLE038 suppression anywhere under this folder applies `REVIEW_DOCS.md` (beside this
 file) too.**
 
-**A diff that adds, changes or drops a check in a `REVIEW.das` under this folder, or adds a name
-to a check's licensed set - the names a check does not flag - applies `REVIEW_GATES.md` (beside
-this file) too.**
+**A diff that adds, changes or drops a check in a `REVIEW.das` under this folder, adds a name to a
+check's licensed set - the names a check does not flag - or changes a constant a check compares
+against, applies `REVIEW_GATES.md` (beside this file) too.**
 
 **Wherever it lives, each of these answers to this folder's `benchmarks/REVIEW.md` beside its own
 folder's checklist: code that times a run on its own clock (not a spawned child's) and hands the
@@ -53,10 +53,10 @@ row or a provenance declaration pins, answers to `performance/REVIEW.md`.** A mo
 `.gguf`, a `.dlim`, an mmproj (a multimodal projector weight file), or a picture or audio fixture
 file. A test or tool merely opening by name a model file the catalog already stocks does not route.
 
-**A change to the sidecar-exchange client (`dasllama/dasllama_exchange.das`) - the code that
-downloads tune winners to a box and submits that box's winners back - its schema, or a
-tune-boot path (a startup path that loads a tune sidecar) that reaches it, applies
-`performance/REVIEW.md` and `REVIEW_EXCHANGE.md`.**
+**A change to the sidecar-exchange client (`dasllama/dasllama_exchange.das`, which downloads tune
+winners to a box and submits that box's winners back), to a validator it calls (`validate_sidecar`,
+`validate_sidecar_submission`, `validate_record_submission`), or to a tune-boot path (a startup path
+that loads a tune sidecar) reaching it, applies `performance/REVIEW.md` and `REVIEW_EXCHANGE.md`.**
 
 **A diff that adds a module under `dasllama/` whose code only some of `tests/run.das`'s areas
 (`audio`, `vision`, `tts`, `llm`, `infra`) run in their tests gives it a `MODULE_AREAS` row
@@ -72,8 +72,8 @@ area's tests, so a regression there goes unrun.
 every `dasllama/` change answer to this folder's `tests/REVIEW.md` - open it; the walk does not
 surface it for a `dasllama/`-only diff.**
 
-**A diff that changes a CPU kernel - a function in `dasllama/dasllama_math*.das` that writes an
-output buffer from operand buffers - applies `tests/REVIEW_KERNEL_CELLS.md` too.**
+**A diff that changes a CPU kernel - a function in `dasllama/dasllama_math*.das` that runs on the
+CPU and writes an output buffer from operand buffers - applies `tests/REVIEW_KERNEL_CELLS.md`.**
 
 **A diff that adds, moves or removes a `[test]` file outside this folder's `tests/` with a
 `require dasllama/...` line of its own adds, corrects or drops its row, with the reason it lives
@@ -90,26 +90,25 @@ reference - another backend's run, an external dump, or the CPU path.**
 tests asserting the format's exact wire text, its rendered template output, and a server case gated
 on the family's smallest GGUF under `LARGE_TIER_BYTES` (`tests/_model_tier.das`).**
 
-**A GPU kernel, driver, dispatch class (a class a `[metal_dispatch]` or `[vk_dispatch]`
-declares), or K/V-mirror (the device copy of the K/V cache a GPU decode reads and writes)
-change, or a change to a `kv_*` function that a GPU driver file (`dasllama_metal*.das`,
-`dasllama_vulkan*.das`, `dasllama_gpu*.das`) calls, wherever the diff puts it, applies
-`REVIEW_GPU.md`.**
+**A GPU kernel, driver, dispatch class (a class a `[metal_dispatch]`, `[vk_dispatch]` or
+`[cuda_dispatch]` declares), or K/V-mirror (the device copy of the K/V cache a GPU decode reads
+and writes) change, or a change to a `kv_*` function that a GPU driver file
+(`dasllama/dasllama_metal*.das`, `dasllama/dasllama_*{vulkan,cuda}*.das`,
+`dasllama/dasllama_gpu*.das`) calls, wherever the diff puts it, applies `REVIEW_GPU.md`.**
 
 **A call that creates, enables or tears down device-home serving (`create_device_session`,
 `set_device_kv`, `moe_gpu_drop_model`), or a call or definition of a `set_*` / `reset_*` function
-in `dasllama/dasllama_core.das`, `dasllama_env.das` or a `dasllama_{gpu,vulkan,metal}*.das` file,
-wherever the diff puts it, applies `REVIEW_GPU.md`.**
+in `dasllama/dasllama_core.das`, `dasllama/dasllama_env.das`, or a
+`dasllama/dasllama_{gpu,metal}*.das` or `dasllama/dasllama_*{vulkan,cuda}*.das` file, wherever
+the diff puts it, applies `REVIEW_GPU.md`.**
 
 **A GPU kernel timing race (two kernels timed against each other to pick one - not a data race), a
 knockout (an arm that skips a stage to measure that stage's cost), a hand-binding arm (one that
 writes buffer or kernel-argument (kargs) binding numbers as literals), a cell or probe that fills
-or binds a `TokMeta` block, a branch whose true arm calls a `moe_gpu_*`, `vk_*` or `rdec_*` entry,
-or a call of `vk_moe_init`, wherever the diff puts it, applies `REVIEW_GPU.md`.**
-
-**A kernel body or a function a kernel calls - a `[metal_kernel]` def, a class a
-`[metal_dispatch]` / `[vk_dispatch]` declares, or a fixture the Metal or SPIR-V emitter
-compiles - wherever the diff puts it, applies `modules/REVIEW_SHADER_EMITTERS.md` (repo root) too.**
+or binds a `TokMeta` block, a read of `g_env_gpu.cuda` (`DASLLAMA_CUDA`) or
+`g_env_vulkan.cuda_mmq` (`DASLLAMA_CUDA_MMQ`), a call of `gpu_want_cuda`, a branch whose true arm
+calls a `moe_gpu_*`, `vk_*`, `cud_*` or `rdec_*` entry, or a call of `vk_moe_init`, wherever the
+diff puts it, applies `REVIEW_GPU.md`.**
 
 **A change to `dasllama/dasllama_image.das`, or, wherever the diff puts it, to a `.dlim` mint
 (building a `.dlim` from a gguf), a `.dlim` load, an image identity, a flavor (the
@@ -126,8 +125,9 @@ without the weight planes the GPU driver holds - reads that answer.
 speech-recognition family's CPU model - applies `REVIEW_AUDIO.md`.**
 
 **A change to `dasllama/dasllama_vision.das`, `dasllama/dasllama_vision_io.das`,
-`dasllama/dasllama_vision_embedder.das`, or a vision family file - one `dasllama/dasllama_<family>.das`
-holding a single vision projector family - applies `REVIEW_VISION.md`.**
+`dasllama/dasllama_vision_embedder.das`, or a vision family file - one
+`dasllama/dasllama_<family>.das` holding a single vision projector family - applies
+`REVIEW_VISION.md`.**
 
 **A change to an in-process path (one that runs inside the program under review, not a spawned
 child process) that splices a stream carrying decoded media - pixels or audio samples - into a
@@ -181,20 +181,19 @@ Every recorded row, tune sidecar and exchange entry carries the release, so a bu
 **A diff that adds or changes a `dasllama/dasllama_common.das` function working through or reporting
 on another module's hook, moves a family encode stage (a `dasllama/dasllama_<family>.das` stage
 turning input into embeddings or filling a cache the next stage reads) onto a GPU hook, calls a
-`set_*_q8` lane setter under `dasllama/` or `harness/`, adds or changes an override as
-`REVIEW_OVERRIDES.md` defines it, or adds or changes an announce (the
-line a run prints where an override changes the outcome) applies `REVIEW_OVERRIDES.md` (beside
-this file) too.**
+`set_*_q8` lane setter under `dasllama/` or `harness/`, adds or changes an override (an environment
+knob, a setter only code outside `dasllama/` sets, or a state file a run reads (a tune sidecar is
+not one: it names kernel perms, which the tune framework's own gates rule), that moves a gate,
+policy or threshold off its default), or adds or changes an announce (the line a run prints where an
+override changes the outcome) applies `REVIEW_OVERRIDES.md` (beside this file) too.**
 
-**Weakening the token-exact RoPE fixtures - the tests that pin the angle tables
-`dasllama/dasllama_rope.das` builds - is a defect.**
-
-**A diff that cites a timing (in a `PERF_LEDGER.md` row, a `followup_*.md` row, a commit message
-or the PR body) as the reason it picks one candidate over another - a constant's value, a formula,
-or a predicate choosing among kernels that compute the same result - takes the winner from one
-script that races every candidate in one process, interleaved, each chosen by a flag or argument
-in the code the diff ships** - two commits or two processes differ by everything else that
-changed, so their timings pick nothing.
+**A diff that cites a timing (in a `PERF_LEDGER.md` row, a `followup_*.md` row, a commit message or
+the PR body) as the reason it picks one candidate over another - a constant's value, a body
+replacing another that computes the same quantity, a predicate or a dispatch order choosing among
+kernels that compute the same result - takes the winner from one script that races every candidate
+in one process, interleaved, each chosen by a flag or argument in the code the diff ships, or
+carried as an arm of the race script where the diff deletes it** - two commits or two processes
+differ by everything else that changed, so their timings pick nothing.
 
 **A diff that picks a candidate by racing every candidate in one process, interleaved, puts the
 race's output lines, one per candidate and each naming it, in the PR body or in a `PERF_LEDGER.md`
@@ -206,21 +205,21 @@ at least one value on each side of it that the device admits, in that race.**
 
 **A new call site of a CPU or GPU matrix multiply whose weight operand is an f32 plane, outside a
 correctness-comparison path (one whose only job is to produce a reference result to check another
-against), where the same backend already serves the same weights and shape through a kernel on a
-quantized or f16 form of them, is a defect - call that kernel instead.** A site that must stay f32
-for another reason is ledgered on its file's charter line (the line, in the companion that
-`ARCHITECTURE.md#file-charters` routes to, that says what the file holds); a comment at the call
-site does not discharge this.
+against) or a timing race's reference arm, where the same backend already serves the same weights
+and shape through a kernel on a form of them other than f32, is a defect - call that kernel
+instead.** A site that must stay f32 for another reason is ledgered on its file's charter line (the
+line, in the companion that `ARCHITECTURE.md#file-charters` routes to, that says what the file
+holds); a comment at the call site does not discharge this.
 
 **A caller and its callee never both check one guard: the caller keeps the check and the callee
 drops it when the callee is `[cold_path]`; where the caller's check also gates its own work, the
 caller computes the decision once and passes it to the callee; otherwise the caller's copy goes.**
 An edit to either copy leaves the caller testing a condition the callee no longer applies.
 
-**Logic or a named constant that two files in one folder both use, and that neither the language
-nor the test contract forces them to restate (one predicate written over an enum and again over
-its int value; a test's CPU reference copy of the arithmetic it checks), lands once - in a file
-both already require, or in a new file both require when they share none - never as a second
+**Logic or a named constant that two files in one folder both use, and that neither the language nor
+the test contract forces them to restate (a test's CPU reference copy of the arithmetic it checks is
+forced; one predicate written over an enum and again over its int value is not), lands once - in a
+file both already require, or in a new file both require when they share none - never as a second
 copy.** Two spellings drift apart on the first edit to one.
 
 **A piece that two folders both need, neither containing the other, lands in the folder that owns

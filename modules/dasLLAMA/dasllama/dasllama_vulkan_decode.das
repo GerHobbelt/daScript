@@ -30,7 +30,6 @@ require daslib/cmp
 // mirror sync/read seams, the deltanet decode step, the FFN GEMV / qkv-group / classifier
 // decode arms, and the heat-pinned expert cache.
 
-let DA_NSPLIT_MAX = 16l   //! the decode attention's key splits a head, at most (the partials plane sizes to it)
 let RD_NB_MAX = RDEC_NROW_MAX   //! the N-row token command's rows, and the same-slab verify's at most
 let RD_PICK_CHUNKS = int64(CLS_ARGMAX_CHUNKS)   //! the pick's first pass: a workgroup a (row, chunk)
 let NROW_BX_ATTN = 1        //! `DASLLAMA_VK_NROW_BISECT`, the N-row command's probe bits: no attention
@@ -39,17 +38,10 @@ let NROW_BX_ROPE = 4        //! no rope (and no q/k norm)
 let NROW_BX_ACTRQ = 8       //! no act + requant
 var g_rd_nrow_bisect = 0   //! a probe's bisect of the N-row command, the `NROW_BX_*` bits - the logits are garbage under anyder any
 
-//! the token command's key splits a head: enough (head, split) workgroups to cover the card twice over, at most
-//! DA_NSPLIT_MAX; one where the card's SM count is unknown or the heads alone cover it
-def da_nsplit(n_heads, sm_count : int64) : int64 {
-    if (sm_count <= 0l || n_heads <= 0l || n_heads >= 2l * sm_count) return 1l
-    return min((2l * sm_count + n_heads - 1l) / n_heads, DA_NSPLIT_MAX)
-}
-
 //! Resident-driver prepare: allocate all per-token + session buffers for a model's geometry. One
 //! resident model at a time (the arbiter guarantees it). Call before set_layer / token.
 //! `kv_dtype` is the mirror codec, a `KVDtype`'s ordinal (f16 default upstream) — sessions of the same codec byte-copy.
-[arch(at="../ARCHITECTURE_GPU_VULKAN.md#vk-prefill-window-chain"), arch(at="../ARCHITECTURE_GPU_VULKAN_NROW.md#nrow-verify-command"), arch(at="../ARCHITECTURE_GPU_VULKAN_MTP.md#resident-draft-head"), arch(at="../ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-kv-block-codecs"), arch(at="../ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-kv-tq4-basis")]
+[arch(at="../ARCHITECTURE_GPU_VULKAN.md#vk-prefill-window-chain"), arch(at="../ARCHITECTURE_GPU_VULKAN_NROW.md#nrow-verify-command"), arch(at="../ARCHITECTURE_GPU_VULKAN_MTP.md#resident-draft-head"), arch(at="../ARCHITECTURE_GPU_SHARED_ATTN.md#vk-kv-block-codecs"), arch(at="../ARCHITECTURE_GPU_SHARED_ATTN.md#vk-kv-tq4-basis")]
 def vk_rdec_prepare(n_layers, n_attn, dim, qd, kv_dim, head_size, n_heads, hidden, vocab, seq_cap : int64;
                     neox : bool; eps, scale : float; qk_norm : bool; kv_dtype : int; q_gated : bool; rot : int64; dn : RdecDnGeom;
                     mir_units, n_slabs, cos_elems, regions : int64; carry, head : bool; verify_rows : int64) : bool {
@@ -77,9 +69,9 @@ def vk_rdec_prepare(n_layers, n_attn, dim, qd, kv_dim, head_size, n_heads, hidde
     }
     // the residual-stream kernels stage a whole row in ar_row, and the per-head ones a whole head
     // in their row slabs — over either slab they would write past the workgroup array with no diagnostic;
-    // the mirror slack covers a flash fragment at a KV row up to AR_MAX_DIM wide
-    if (dim > AR_MAX_DIM || head_size > 512l || kv_dim > AR_MAX_DIM) {
-        to_log(LOG_WARNING, "dasLLAMA vulkan resident: dim {dim} or kv_dim {kv_dim} > {AR_MAX_DIM}, or head_size {head_size} > 512, exceeds the workgroup row slabs and the mirror slack\n")
+    // the mirror slack covers a flash fragment at a KV row up to RDEC_AR_MAX_DIM wide
+    if (dim > RDEC_AR_MAX_DIM || head_size > 512l || kv_dim > RDEC_AR_MAX_DIM) {
+        to_log(LOG_WARNING, "dasLLAMA vulkan resident: dim {dim} or kv_dim {kv_dim} > {RDEC_AR_MAX_DIM}, or head_size {head_size} > 512, exceeds the workgroup row slabs and the mirror slack\n")
         return false
     }
     let hybrid = dn.cd > 0l
@@ -173,7 +165,7 @@ def vk_rdec_prepare(n_layers, n_attn, dim, qd, kv_dim, head_size, n_heads, hidde
     upload_zeros(r.ar_cnt_dev, 0l, 16l)   //! the counter starts at zero; every epilogue dispatch leaves it there
     r.aq_dev = make_device_buf(qd * nb)
     r.as_dev = make_device_buf((qd / 32l) * 4l * nb)
-    r.gate_dev = make_device_buf(hidden * 4l * nb)
+    r.gate_dev = make_device_buf(hidden * 4l * max(nb, 2l))   // the merged gate-up GEMV lands both rows here at one row
     r.up_dev = make_device_buf(hidden * 4l * nb)
     r.ffnout_dev = make_device_buf(dim * 4l * nb)
     r.xb2_dev = make_device_buf(dim * 4l * nb)
@@ -354,6 +346,7 @@ def private stack_gemv_set(si : int; meta : uint64; meta_bytes : int64; xq, xs :
 def private stack_gemv_set_x(si, sx : int; y : uint64; y_bytes : int64; ybit : uint) : VkDescriptorSet =>
     stack_gemv_set(si, g_gpu.stacks[si].meta.buf, META_BYTES, g_gpu.stacks[sx].xq.buf, g_gpu.stacks[sx].xs.buf, XQ_BYTES, XS_BYTES, 0u, y, y_bytes, ybit)
 
+[arch(at="../ARCHITECTURE_GPU_VULKAN_DECODE.md#hybrid-token-command")]
 def private rd_ffn_sets(var L : RLayer; b1, b3, b2 : int64; f1, f3, f2 : int) {
     let dim = g_rd.dim
     let hid = L.hid
@@ -363,7 +356,7 @@ def private rd_ffn_sets(var L : RLayer; b1, b3, b2 : int64; f1, f3, f2 : int) {
     let p2 = arena_planes(f2, b2)
     rd_tail_sets_bare(L, f1, f3, f2)
     L.b1 = b1; L.b3 = b3; L.b2 = b2
-    L.m_gate = rd_meta(); L.m_up = rd_meta(); L.m_down = rd_meta()
+    L.m_gate = rd_meta(); L.m_up = rd_meta(); L.m_gu = rd_meta(); L.m_down = rd_meta()
     // gate/up GEMV
     L.s_gate = arena_gemv_set_x(f1, p1, L.m_gate.buf, g_rd.gate_dev, hid * 4l * nb, VHZ_GATE)
     L.s_up = arena_gemv_set_x(f3, p3, L.m_up.buf, g_rd.up_dev, hid * 4l * nb, VHZ_UP)
@@ -372,8 +365,15 @@ def private rd_ffn_sets(var L : RLayer; b1, b3, b2 : int64; f1, f3, f2 : int) {
         fixed_array(hid * 4l * nb, hid * 4l * nb, BATCH_HQ_BYTES, BATCH_HS_BYTES),
         fixed_array(VHZ_GATE, VHZ_UP, VHZ_HQ, VHZ_HQ))
     //! the fused form: gate and up q8 planes over the Q8_0 x, the hidden row's Q8_0 quants out (DASLLAMA_VK_FUSE=0 keeps the three dispatches)
-    L.gu_on = rd_gu_fits(f1, f3, f2) && vk_fuse_on() && (vk_fuse_bisect_bits() & FUSE_BX_GU) == 0l
-    if (L.gu_on) {
+    L.gate_up_fused = rd_gu_fits(f1, f3, f2) && vk_fuse_on() && (vk_fuse_bisect_bits() & FUSE_BX_GU) == 0l
+    L.gu_merged = !L.gate_up_fused && vk_fuse_on() && f1 == f3 && arena_slab_idx(b1) == arena_slab_idx(b3)
+    if (L.gu_merged) {
+        L.s_gu_merged = arena_gemv_set_x(f1, p1, L.m_gu.buf, g_rd.gate_dev, hid * 4l * max(nb, 2l), VHZ_GATE)
+        L.s_actrq_merged = set_actrq_cls(fixed_array(g_rd.gate_dev, g_rd.gate_dev, g_gpu.hq_dev, g_gpu.hs_dev),
+            fixed_array(hid * 4l * max(nb, 2l), hid * 4l * max(nb, 2l), BATCH_HQ_BYTES, BATCH_HS_BYTES),
+            fixed_array(VHZ_GATE, VHZ_GATE, VHZ_HQ, VHZ_HQ))
+    }
+    if (L.gate_up_fused) {
         verify(ensure_q8_gemv_gu_n1_cls(), "vk decode: the fused gate-up class rail must engage on a live device")
         let gu = rd_gu_binds(L)
         L.s_gu = set_q8_gemv_gu_n1_cls(gu.bufs, gu.sizes, gu.bits)
@@ -467,7 +467,7 @@ def vk_rdec_set_layer(l, mir_idx : int64; bq, bk, bv, bo, b1, b3, b2 : int64; fq
 //! the attention half of a layer's registration: the quad's blocks, formats and sets (f1 / f3 / f2
 //! name the layer's FFN feed forms for the class-rail check); the layer's geometry is set already. `tok` and `cos` are the
 //! TokMeta block and rope rows its rope and attention read: the trunk's, or the NextN head's own
-[arch(at="../ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-kv-block-codecs"), arch(at="../ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-kv-tq4-basis")]
+[arch(at="../ARCHITECTURE_GPU_SHARED_ATTN.md#vk-kv-block-codecs"), arch(at="../ARCHITECTURE_GPU_SHARED_ATTN.md#vk-kv-tq4-basis")]
 def private rd_attn_sets(var L : RLayer; mir_idx : int64; bq, bk, bv, bo : int64; fq, fk, fv, fo, f1, f3, f2 : int; tok, cos : uint64) {
     unsafe {
         L.recurrent = false
@@ -2079,7 +2079,7 @@ def rd_cls_epi_on : bool => g_rd.cls_cap > 0.0 || g_rd.nsupp > 0l
 //! the epilogue over the `nrows` logits rows the classifier GEMV just wrote (the prefill's tail encodes one row the same)
 def rd_enc_cls_epi(raw : VkCommandBuffer; var h : VkHaz; nrows : int64 = 1l) {
     var pce = GkClsEpiArgs(vocab = uint(g_rd.vocab), cap = g_rd.cls_cap, nsupp = uint(g_rd.nsupp), rows = uint(nrows))
-    enc_cls_epi(raw, h, g_rd.cls_epi_set, pce, (g_rd.vocab * nrows + 255l) / 256l)
+    enc_cls_epi(raw, h, g_rd.cls_epi_set, pce, cls_epi_wgs(g_rd.vocab, nrows))
 }
 
 [arch(at="../ARCHITECTURE_GPU_VULKAN_MTP.md#resident-draft-head"), arch(at="../ARCHITECTURE_GPU_VULKAN_HC.md#hc-draft-head")]
@@ -2186,7 +2186,7 @@ def private rd_pieces_for_span(span : int64) : int64 {
     return span < RD_WIDE_POS ? RD_SPLIT_PIECES : RD_SPLIT_WIDE_PIECES
 }
 
-[arch(at="../ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-decode-attn-split")]
+[arch(at="../ARCHITECTURE_GPU_SHARED_ATTN.md#vk-decode-attn-split")]
 def private rd_layer_pieces(L : RLayer; nsplit, rows : int64) : int64 {
     let span = L.window == 0l ? nsplit : min(nsplit, rd_pieces_for_span(L.window))
     let wave = max(1l, int64(g_gpu.sm_count) / (da_attn_row_wgs(g_rd.n_heads, L.kv_mul, 1l) * max(rows, 1l)))   //! the command's own rows, never the planes' height
@@ -2195,7 +2195,7 @@ def private rd_layer_pieces(L : RLayer; nsplit, rows : int64) : int64 {
 
 //! whether the N-row command over `rows` splits every layer's keys into the pieces the one-row command's form at `pos` does, so
 //! the two sum the keys in one order: false where the rows' workgroups over the pieces run past one wave of the SMs (the N-row
-//! command takes fewer) and past the wide position (the wide twin takes more; `ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-decode-attn-split`)
+//! command takes fewer) and past the wide position (the wide twin takes more; `ARCHITECTURE_GPU_SHARED_ATTN.md#vk-decode-attn-split`)
 def vk_rdec_rows_split_alike(rows, pos : int64) : bool {
     if (g_rd == null || !g_rd.ready) return true
     let form = rd_form_at(pos)
@@ -2214,7 +2214,7 @@ def private rd_form_at(pos : int64) : RdForm {
     return (g_rd.wide_on && pos >= RD_WIDE_POS) ? RdForm.wide : RdForm.split
 }
 
-//! the wide twin: the same chain at RD_SPLIT_WIDE_PIECES into `cmd_wide`, its stamp names kept apart (ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-decode-attn-split)
+//! the wide twin: the same chain at RD_SPLIT_WIDE_PIECES into `cmd_wide`, its stamp names kept apart (ARCHITECTURE_GPU_SHARED_ATTN.md#vk-decode-attn-split)
 [cold_path]
 def private rd_record_wide_twin {
     rd_with_form_stamps() {
@@ -2283,6 +2283,9 @@ def private rd_fill_layer_regions(L : RLayer) {
     if (has_dense_triple(L)) {
         fill_gemv_regions(L.m_gate, L.b1)
         fill_gemv_regions(L.m_up, L.b3)
+        if (L.gu_merged) {
+            fill_gemv_regions2(L.m_gu, L.b1, L.b3)
+        }
         fill_gemv_regions(L.m_down, L.b2)
     }
     if (L.ple) {
@@ -2455,17 +2458,13 @@ def private rd_announce_fuse_bisect {
     }
 }
 
-[arch(at="../ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-decode-attn-split"), arch(at="../ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-kv-tq4-basis")]
-def private rd_attn_rqk(L : RLayer) : uint {
-    return DA_RQ_NONE if (rd_kvtq4())
-    if (!kq_sb(L.fo)) return DA_RQ_Q8
-    return L.hs % 256l == 0l ? DA_RQ_Q8K : DA_RQ_NONE
-}
+[arch(at="../ARCHITECTURE_GPU_SHARED_ATTN.md#vk-decode-attn-split"), arch(at="../ARCHITECTURE_GPU_SHARED_ATTN.md#vk-kv-tq4-basis")]
+def private rd_attn_rqk(L : RLayer) : uint => da_rqk_pick(rd_kvtq4(), L.fo, L.hs)
 
 //! A block codec's store of `rows` staged rows through set `s`: the token stamp, or under `window` the stamp that lands them
 //! at consecutive positions from `pos0`. tq4's store also rotates `nqh` q heads a row in place (`qrow` a row's stride in the q
 //! plane, `qstride` a head's); `nkh` is the K heads a row stores, 0 on a shared-KV layer.
-[arch(at="../ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-kv-block-codecs"), arch(at="../ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-kv-tq4-basis")]
+[arch(at="../ARCHITECTURE_GPU_SHARED_ATTN.md#vk-kv-block-codecs"), arch(at="../ARCHITECTURE_GPU_SHARED_ATTN.md#vk-kv-tq4-basis")]
 def rd_enc_kv_store(raw : VkCommandBuffer; var h : VkHaz; var s : VkDescriptorSet; window : bool; kvd, hs, rows, nqh, nkh : int64; layerbase, pos0, qrow, qstride : uint;
                     ring : int64) {
     if (rd_kvq8() && nkh > 0l) {
@@ -2488,14 +2487,14 @@ def rd_enc_kv_store(raw : VkCommandBuffer; var h : VkHaz; var s : VkDescriptorSe
 }
 
 //! tq4's un-rotation of `rows` attention rows of `orow` elements through set `s`; a `qstride` past `hs` gates each head by its gate half after it
-[arch(at="../ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-kv-tq4-basis")]
+[arch(at="../ARCHITECTURE_GPU_SHARED_ATTN.md#vk-kv-tq4-basis")]
 def rd_enc_tq4_unrot(raw : VkCommandBuffer; var h : VkHaz; var s : VkDescriptorSet; hs, rows : int64; orow, qrow, qstride : uint) {
     var pcu = KvTqUnrotArgs(hs = uint(hs), nh = uint(g_rd.n_heads), orow = orow, qrow = qrow, qstride = qstride, inv_sqrt_hs = 1.0 / sqrt(float(hs)))
     enc_kv_tq4_unrot_cls(raw, h, s, pcu, g_rd.n_heads * rows)
 }
 
 //! `ncols` the GEMV leaves' columns and `nrow_bx` the N-row bisect bits (the one-row values at one row); `kv_only` the verify's head re-warm, its stamps under `pfx`
-[arch(at="../ARCHITECTURE_GPU_VULKAN_NROW.md#nrow-token-command"), arch(at="../ARCHITECTURE_GPU_VULKAN_NROW.md#nrow-verify-command"), arch(at="../ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-kv-block-codecs"), arch(at="../ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-kv-tq4-basis")]
+[arch(at="../ARCHITECTURE_GPU_VULKAN_NROW.md#nrow-token-command"), arch(at="../ARCHITECTURE_GPU_VULKAN_NROW.md#nrow-verify-command"), arch(at="../ARCHITECTURE_GPU_SHARED_ATTN.md#vk-kv-block-codecs"), arch(at="../ARCHITECTURE_GPU_SHARED_ATTN.md#vk-kv-tq4-basis")]
 def private rd_encode_attn_head(raw : VkCommandBuffer; var h : VkHaz; var L : RLayer; l : int64; fuse_qkr : bool; nlfin, nsplit, nrows : int64; ncols : uint; nrow_bx : int;
                                 kv_only : bool = false; pfx : string = "a:") {
     let dim = g_rd.dim
@@ -2611,7 +2610,7 @@ def private rd_encode_attn_head(raw : VkCommandBuffer; var h : VkHaz; var L : RL
 }
 
 //! the epilogue GEMV's workgroups: eight rows a 256-thread workgroup (four times the family's 64-thread rows)
-def private rd_ar_wgs(rows : int64) : int64 => (rows + 4l * g_gpu.rows_per_wg - 1l) / (4l * g_gpu.rows_per_wg)
+def private rd_ar_wgs(rows : int64) : int64 => ar_epilogue_wgs(rows, g_gpu.rows_per_wg)
 
 def private rd_gemv(fmt : int; raw : VkCommandBuffer; var h : VkHaz; var s : VkDescriptorSet; n, d : int64; ncols, ystride : uint) {
     var pc = GemvArgs(n = uint(n), d = uint(d), nreg = 1u, ybase = 0u, ncols = ncols, ystride = ystride)
@@ -2739,6 +2738,7 @@ def private rd_ffn_pfx(L : RLayer) : string => L.moe ? "m:sh_" : rd_head_pfx(L)
 [arch(at="../ARCHITECTURE_GPU_VULKAN_DECODE.md#hybrid-token-command")]
 def private rd_tail_pfx(L : RLayer) : string => L.moe ? "m:" : rd_head_pfx(L)
 
+[arch(at="../ARCHITECTURE_GPU_VULKAN_DECODE.md#hybrid-token-command")]
 def private rd_encode_ffn(raw : VkCommandBuffer; var h : VkHaz; var L : RLayer; l, nxt, nrows : int64; ncols : uint; nrow_bx : int) {
     let dim = g_rd.dim
     let hid = L.hid
@@ -2746,7 +2746,7 @@ def private rd_encode_ffn(raw : VkCommandBuffer; var h : VkHaz; var L : RLayer; 
     let act = L.gelu ? ACT_GELU : ACT_SILU
     let one = nrows == 1l
     let nr = uint(nrows)
-    if (L.gu_on && (nrow_bx & (NROW_BX_NCOL1 | NROW_BX_ACTRQ)) == 0) {
+    if (L.gate_up_fused && (nrow_bx & (NROW_BX_NCOL1 | NROW_BX_ACTRQ)) == 0) {
         if (one) {
             var pcgu = GuNArgs(n = uint(dim), d = uint(hid), gblk = uint(arena_local_blk(L.b1)), ublk = uint(arena_local_blk(L.b3)), act = act, ncols = 1u)
             enc_q8_gemv_gu_n1_cls(raw, h, L.s_gu, pcgu, hid / 32l)
@@ -2756,13 +2756,20 @@ def private rd_encode_ffn(raw : VkCommandBuffer; var h : VkHaz; var L : RLayer; 
         }
         rd_ts(raw, L.moe ? "m:sh_gu" : "{pfx}gu")
     } else {
-        rd_gemv(L.f1, raw, h, L.s_gate, dim, hid, ncols, uint(hid))
-        rd_ts(raw, "{pfx}gate")
-        rd_gemv(L.f3, raw, h, L.s_up, dim, hid, ncols, uint(hid))
-        rd_ts(raw, "{pfx}up")
+        let merged = one && L.gu_merged
+        if (merged) {
+            var pc_gu_merged = GemvArgs(n = uint(dim), d = uint(hid), nreg = 2u, ybase = 0u, ncols = 1u, ystride = uint(hid))
+            gemv_enc(L.f1, raw, h, L.s_gu_merged, pc_gu_merged, 2l * hid)
+            rd_ts(raw, "{pfx}gu")
+        } else {
+            rd_gemv(L.f1, raw, h, L.s_gate, dim, hid, ncols, uint(hid))
+            rd_ts(raw, "{pfx}gate")
+            rd_gemv(L.f3, raw, h, L.s_up, dim, hid, ncols, uint(hid))
+            rd_ts(raw, "{pfx}up")
+        }
         if ((nrow_bx & NROW_BX_ACTRQ) == 0) {
-            var pc_act = ActArgs(nelem = uint(hid) * nr, act = act)
-            actrq_enc(raw, h, L.s_actrq, kq_sb(L.f2), pc_act, hid * nrows)
+            var pc_act = ActArgs(nelem = uint(hid) * nr, act = act, ubase = merged ? uint(hid) : 0u)
+            actrq_enc(raw, h, merged ? L.s_actrq_merged : L.s_actrq, kq_sb(L.f2), pc_act, hid * nrows)
             rd_ts(raw, L.moe ? "m:sh_act" : "{pfx}actrq")
         }
     }
@@ -3846,7 +3853,7 @@ def private rd_ensure_n_rail : bool {
                 : (rd_quad_all(L) $(f) => gemv_cls_ensure_n(f, nb)))
         ok = (head_ok
             && (!has_dense_triple(L) || (rd_triple_all(L.f1, L.f3, L.f2) $(f) => gemv_cls_ensure_n(f, nb)))
-            && (!L.gu_on || q8_gemv_gu_n_ensure(nb))   //! the fused gate-up's N form declines the rail whole, as the GEMV leaves do
+            && (!L.gate_up_fused || q8_gemv_gu_n_ensure(nb))   //! the fused gate-up's N form declines the rail whole, as the GEMV leaves do
             && (!L.moe || topk_n_ensure(g_rd.ne))
             && (!L.ple || ((L.bpg < 0l || gemv_cls_ensure_n(L.fpg, nb)) && (L.bpp < 0l || gemv_cls_ensure_n(L.fpp, nb)))))
     }
@@ -3870,7 +3877,7 @@ def private rd_ensure_n_sets {
         if (rd_rows_fuse(rd_next_feed(l))) {
             L.s_addr_next_rq_b = set_ar_rq_stamp(RqStamp.rq_b, g_rd.ffnout_dev, VHZ_FFO, g_rd.xq_dev, g_rd.xs_dev)
         }
-        if (L.gu_on) {   // the rail ensured the class before any row count recorded
+        if (L.gate_up_fused) {   // the rail ensured the class before any row count recorded
             let gu = rd_gu_binds(L)
             L.s_gu_n = q8_gemv_gu_n_set(gu.bufs, gu.sizes, gu.bits)
         }
@@ -4750,7 +4757,7 @@ def vk_rdec_token_n(x : array<float>; cossin : array<float>; ple : array<float>;
         maxpos = max(maxpos, poss[i])
     }
     //! the rows' form is the batch's furthest row's: the unsplit twin while every row sits under RD_UNSPLIT_POS, the split
-    //! form past it at every span (the ruler reads the wide form slower at four rows, ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-decode-attn-split)
+    //! form past it at every span (the ruler reads the wide form slower at four rows, ARCHITECTURE_GPU_SHARED_ATTN.md#vk-decode-attn-split)
     let unsplit = g_rd.unsplit_on && maxpos < RD_UNSPLIT_POS
     let form = unsplit ? RdForm.unsplit : RdForm.split
     let prof = vk_prof()

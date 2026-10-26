@@ -10,6 +10,209 @@ and coverage; this ledger is the backlog for the perf pass that follows them. Ev
 what it costs today and what the fix would change.
 
 ## Entries
+- **MEASURED (2026-10-25, `debug-jit`, `direction-grade`) - the float GELU, the bf16 plane on the tile walk, the AMX
+  bf16 weight tile, the mel's lanes and the decoder's K/V bytes, on the four board boxes.** The author's board boxes: m5
+  (M5 Max, 18 lanes), gnr (AWS m8i, Xeon 6975P-C, 8 cores), epyc9r14 (AWS m7a, Zen 4, 16 cores), graviton4 (AWS m8g,
+  Neoverse V2, 16 cores). Every figure but the board rows is a `-jit` script run on branch `bbatkin/bf16-tower-gemm` at
+  the commit named, `DAS_TUNE_POLICY` unset, `DAS_TUNE_MANIFEST` the box's rig release sidecar
+  (`performance/_rig/dasllama-bench*/` after `daspkg release --quick` at that commit), `-no-module-cache`; the board
+  rows are the rig exe's, `performance/gen_bench_records.das` with `--store <scratch>` (the three AWS boxes hold no
+  `llama-bench`, so their das rows pair with no reference), rows 240 and 242 own their re-mint; none enters
+  `performance/records/`.
+
+  The Qwen3-ASR CPU rows (`-- --workload asr -o Qwen3-ASR`, the references
+  `ARCHITECTURE_MEASUREMENT_AUDIO.md#asr-cpu-references`, every cell the best of `--asr-reps` 2 - the exe prints a
+  clip's best alone, row 241 - das against `llama-mtmd-cli` on gb1 (198.7 s), total / encode ms; the AWS rows at
+  3f7134f8f with every `was` the 2026-10-24 tile entry's ea6d942c2 row, the M5 row at cbfe4d670f with its `was` the
+  2026-10-22 release-17 entry's d71b1aacc board row): gnr 13807 / 2007 against 20857 / 7481 (1.51x; was 15797 / 2917
+  against 21610 / 7304), epyc9r14 11694 / 2499 against 15916 / 8009 (1.36x; was 12784 / 3071 against 15981 / 8051),
+  graviton4 8406 / 2462 against 67900 / 64309 (8.1x; was 9209 / 3168 against 67958 / 64362), m5 cpu tuned 8675 / 2475
+  and cpu accel 7913 / 1608 against 46465 / 42396 (5.4x and 5.9x; was 13092 / 6460 and 10546 / 3856 against 46394 /
+  42193).
+
+  The gemma-4-E4B Q8_0 CPU rows at cbfe4d670f (`-- --workload llm -o gemma-4-E4B-it-Q8_0`, `-- --workload image -o
+  gemma-4-E4B-it-Q8_0`; the PLE projection and the BF16 mmproj ride the bf16 plane; `was` the 2026-10-22 release-17
+  entry's board rows): gnr (3f7134f8f) pp512 375.3 +/- 24.7 tok/s (cv 6.6 %, void - the box's pp512 reads 6 % spreads on
+  every run), tg128 17.88 +/- 0.27, tg128@4 61.46 +/- 0.08 (was 325.7 / 18.1 / 61.7); m5 cpu tuned pp512 207.1 +/- 2.6,
+  tg128 53.11 +/- 0.08, tg128@4 126.6 +/- 2.3 (was 202.4 / 52.5 / 125.4), cpu accel 217.7 +/- 4.5 / 53.1 / 126.6 (was
+  206.6 / 53.5 / 125.8); the image-chat cell on the m5 (coco 000000039769, 130 soft tokens, the tower on the q8 lane,
+  best of 3) cpu tuned encode 420 ms, pp 223, tg 51.5 tok/s (was 375 / 220.6 / 52.6), cpu accel 452 / 224.5 / 52.1 (was
+  442.6 / 217.6 / 52.2): the encode's 420 against 375 is not this diff's - master 2d7d99fbff reads 427 ms and the tip
+  422 under `benchmarks/lcpp_bench.das -- -m gemma-4-E4B-it-Q8_0.gguf --image-mmproj mmproj-gemma-4-E4B-it-BF16.gguf
+  --image coco-val2017-000000039769.jpg -r 3 -t 6 --for-debug-purposes` (the master run from a detached worktree at
+  origin/master, the same binary), an open gap against the release-17 board for the release re-mint (row 240). No other
+  board box of the author's can mint the image-chat cell (gnr lacks the E4B mmproj; epyc9r14 and graviton4 hold no E4B).
+
+  The Xeon's stage split (`harness/asr_stage_probe.das -- -m Qwen3-ASR-0.6B-Q8_0.gguf --mmproj
+  mmproj-Qwen3-ASR-0.6B-bf16.gguf -w gb1.wav -r 1 --lang auto`, `JOBQUE_PROFILING=1 DAS_LOG_LEVEL=info` for the engine
+  buckets, gb1): at 7d7e39fc7 (the GELU kernel and the bf16 walk) against ea6d942c2 (the 2026-10-24 tile entry's split)
+  the encode 2451 against 2924 ms, `enc.ffn.gelu` 41 against 194, `q3a.conv.mm` 1123 against 1446, `q3a.blocks` 588
+  against 726, `q3a.mel` 396 against 403 (the mel's frame split is 258ca3799e; the race below carries it). `q3a.conv.mm`
+  is GEMM-bound: 200 chunks of a 3.3 GFLOP c2 and a 0.86 GFLOP c3 are 840 GFLOP at 750 GFLOP/s of f32 tile on 8 cores,
+  against the race's 1000 hot; the mmproj's conv weights are F16 and its blocks run the q8 lane, so the bf16 family
+  reaches the conv front only through an f16 ruling (row 240).
+
+  `harness/cpu_asr_race.das -- --arm all --reps 5` at cbfe4d670f (one process a box, the arms in turn, one warmup round
+  dropped, the best round; every compared arm within its bound on 512 sampled elements - the baselines to a double
+  reference, the family to the bf16 envelope, the K-pass orders bit-exact with each other; the PR body carries the
+  rows). The `bf16` arm, GFLOP/s at n d ntok 2560 10752 512 / 4320 480 800 / 1152 1152 256, the f32 plane on the tile
+  walk / the bf16 plane on the stamped family / the widen walk / the row nest it replaced: gnr 794 / 3740 / 959 / 91,
+  1013 / 2083 / 980 / 90, 1042 / 2891 / 870 / 323; epyc9r14 1425 / - / 1551 / 442, 1413 / - / 1435 / 511, 1449 / - /
+  1354 / 526; graviton4 598 / - / 662 / 192, 563 / - / 599 / 153, 660 / - / 664 / 295; m5 1474 / - / 1394 / 666, 1453 /
+  - / 1270 / 625, 1558 / - / 1340 / 658 (the family declines off AMX bf16). The `gelu` arm, ns an element over 4194304,
+  the double body it replaced against the float kernel: gnr 9.06 against 0.78, epyc9r14 5.41 against 0.79, graviton4
+  11.28 against 2.12, m5 3.34 against 0.83. The `mel` arm (`log_mel_qwen3a` over a 60 s synthetic clip, 128 mels,
+  timing-only; one lane / the lanes, ms): gnr 99.4 / 17.1 (8 lanes), epyc9r14 105.4 / 11.9 (16), graviton4 106.1 / 13.0
+  (16), m5 56.0 / 6.9 (18); the lanes' image is the one-lane image element for element (`tests/test_whisper.das`, the
+  mel cell). The `kpass` arm (the decode attention's K pass over 28 layers x 3000 keys x 8 kv heads x 128, f16, two q
+  heads a kv head, `dot_f16` a score; GB/s one lane / all lanes): (kv head, slice) units gnr 3.4 / 26.6, epyc9r14 2.6 /
+  30.8, graviton4 8.1 / 85.8, m5 9.8 / 123.1; one slice over every kv head gnr 9.2 / 54.4, epyc9r14 12.3 / 70.7,
+  graviton4 9.5 / 101.3, m5 20.3 / 186.4.
+
+  gemma-4-E4B Q8_0 pp512 on gnr (`benchmarks/lcpp_bench.das -- -m gemma-4-E4B-it-Q8_0.gguf -p 512 -n 0 -r 3 -t 8
+  --for-debug-purposes`, the file `unsloth/gemma-4-E4B-it-GGUF` at `resolve/main`): master 2d7d99fbf 284.7 +/- 18.3
+  tok/s (cv 6.4 %, void), 24e19e9916's kernels on the widen walk 359.8 +/- 0.3, the same with the AMX entry in the
+  sidecar 368.8 +/- 0.2, the frozen fixture's 8 opening tokens matching on all three. The decode on gnr at 24e19e9916's
+  kernels (the stage probe, the engine buckets on): f16 K/V (the ASR session's default) 11115 ms over 451 steps,
+  `attn_chain` 8843 of it, `blk_ffn` 1843, `mm_gemm` 525; `--kv q8` (the q8_0 K/V codec) 6285 ms over 443 steps,
+  `attn_chain` 4097 - the transcript moves (row 242). The chain's units re-ordered to one slice over every kv head
+  (fcfb1dacd8) read `attn_chain` 8942 ms against 24e19e9916's 8724 on gnr - within the run's noise; the slice order's
+  two-fold over the (kv head, slice) units in the K pass does not reach the chain, whose wall sits elsewhere.
+
+  The lasting buffers the bf16 plane's batch calls now fill, bytes as formulas in ntok and n with their values at the
+  race's 2560 x 512 and 4320 x 800 shapes: `g_bf16w_xr` (new) 4 ntok n - 5.24 MB, 13.8 MB; `g_kq_xbf16` 2 (ntok n + 32)
+  - 2.62 MB, 6.91 MB (the quant families' plane, now the bf16 plane's too); `g_walk_panel` where the family serves,
+  (round_up(32 form n, 64) + 64) slots + 64 at form 2 - 163968 and 276608 bytes a dispatch slot, 1.31 MB and 2.21 MB
+  over gnr's 8 slots.
+
+- **MEASURED (2026-10-24, `direction-grade`) - the fp32 batch GEMM tile and the lane-split conv front on the three AWS
+boards.** `matmul_batch_core` runs a four-by-four tile (`f32_batch_tile`,
+`ARCHITECTURE_CPU_KERNELS.md#f32-batch-tile-lattice`); `harness/f32_batch_race.das -- --reps 5` races its two constants
+and the tile against the dot-a-cell nest it replaces in one process, interleaved, best of 5 (`bin/daslang -jit`,
+`DAS_TUNE_POLICY` unset and no other override; GFLOP/s; the M5 Max under `DAS_TUNE_MANIFEST` naming a scratch sidecar
+the tuner minted for this kernel - `f32_batch_tile` vec4_u4 - with `DASLLAMA_ALLOW_UNTUNED=1` for the rest, the Granite
+Rapids box - AWS m8i, Xeon 6975P-C, 8 cores - under its rig's minted sidecar, vec16_u2). The X block at n 4320 d 480
+ntok 800: M5 1463 / 1461 / 1431 / 1448 / 1441 / 1419 and Xeon 1067 / 1075 / 1053 / 1049 / 947 / 349 at 64K / 128K / 256K
+/ 512K / 1M / 4M; at n 1152 d 480 ntok 1536: M5 1431 / 1466 / 1497 / 1505 / 1511 / 1494, Xeon 943 / 980 / 999 / 984 /
+955 / 310 - the walk holds 256 KB. The tile against the nest at those shapes: M5 1405 against 509 and 1493 against 525,
+Xeon 1064 against 86 and 999 against 85. The tile against the nest at d 480 ntok 3200 by dot length 8 / 16 / 24 / 32 /
+48 / 64 / 128: M5 346 / 578 / 730 / 862 / 1010 / 1105 / 1333 against 123 / 161 / 155 / 351 / 254 / 452 / 514, Xeon 95 /
+54 / 53 / 101 / 150 / 191 / 326 against 38 / 48 / 50 / 44 / 37 / 158 / 215 - the tile wins at every length, so it serves
+every length and the nest stays as the race's arm. The conv front's im2col and erf GELU ran in one lane (`bin/daslang
+-jit modules/dasLLAMA/harness/asr_stage_probe.das -- -m Qwen3-ASR-0.6B-Q8_0.gguf --mmproj
+mmproj-Qwen3-ASR-0.6B-bf16.gguf -w gb1.wav -r 1 --lang auto`, debug-jit, one rep, `DAS_TUNE_POLICY` unset,
+`DAS_TUNE_MANIFEST` the rig release's minted sidecar under `performance/_rig/dasllama-bench/` on the Xeon and
+`performance/m5.tune.json` on the M5: the Xeon's `q3a.conv.mm` 13293 ms before the tile, 5719 with it, 1446 with the two
+across lanes; its encode 15227 / 7728 / 2924 ms; the M5 encode 287 ms throughout, its blocks on the Metal seat). The
+boards' CPU rows: `performance/gen_bench_records.das -- --workload asr -o <model>` and `--workload tts -o kitten` on
+each box, the released `dasllama-bench` exe minted on the box (`daspkg release`, the box class's backend, no policy
+override) at the branch's tip (ea6d942c2; kitten and whisper rows at 5907be553 / 13c357f98, the same kernels), the
+references `ARCHITECTURE_MEASUREMENT_AUDIO.md#asr-cpu-references` and `#the-tts-reference-instrument`, every cell the
+best of the rig's reps (`--asr-reps` 2 a clip, `--tts-reps` 3 a sentence; the exe prints a clip's best alone, so no
+per-rep spread is on record for these cells - `followup_general.md` row 241); das against the reference on gb1 (198.7
+s), total / encode ms, every `was` figure the 2026-10-22 release-17 boards entry's: Qwen3-ASR-0.6B Q8_0 - gnr 15797 /
+2917 against `llama-mtmd-cli` 21610 / 7304 (1.37x; was 26609 / 13996 against 15555 / 7076, 0.58x), epyc9r14 12784 / 3071
+against 15981 / 8051 (1.25x; was 16875 / 7257 against 15882 / 8040), graviton4 9209 / 3168 against 67958 / 64362 (7.4x;
+was 16446 / 10522 against 67613); whisper large-v3-turbo - epyc9r14 10805 against 35132 (was 10892 against 35126),
+graviton4 14633 against 82439 (was 14643 against 89922); whisper tiny - epyc9r14 946 against 1517 (was 966 against
+1531), graviton4 973 against 4042 (was 916 against 4064) - the whisper encoder is not on the fp32 batch path. The kitten
+TTS rows re-measured in the pack's own voice (`tts:g2p20@Bella`, ms, das against `kittentts`, audio seconds agreeing
+within 2%): gnr nano 8370 against 8211, mini 13022 against 88939; epyc9r14 9849 against 11445, 13845 against 112833;
+graviton4 6991 against 8698, 10373 against 92066 - the generator's conv stages are not on the fp32 batch path, so the
+tile is not in these walls. None of these rows is published: the record stores and the site merge stay at release 17,
+the release re-mint owes the rows under `followup_general.md` row 238
+(`ARCHITECTURE_MEASUREMENT_RELEASE.md#board-rows-release-boundary`). What the Xeon's encode still holds (the same probe
+run): `q3a.conv.mm` 1446 ms of a 2924 ms encode - the first conv's nine-tap GEMM, which the race reads at 95 GFLOP/s
+against the wide layers' thousand, and the erf GELU, whose exp runs in double a lane; its decode, 11.5 s over 451 steps,
+is the attention over the ~3000 audio tokens (the GELU is the float kernel `gelu_erf` of the 2026-10-25 entry, the
+attention row 242, the conv front row 240's operand item). The reference's encoder runs bf16 x bf16 arithmetic where
+ours widens the file's bf16 to f32 and multiplies in f32 (the mmproj conv weights, 2 bytes a weight more and no
+half-width dot); the whole bf16 tower set shares that gap.
+
+- **MEASURED (2026-10-24, `direction-grade`) - the Granite Rapids board's losses are the DeltaNet scan and the f32
+  conv front, not the AMX crowns.** AWS m8i.4xlarge (Xeon 6975P-C, 8 cores with SMT, 61 GB, the `x86-amx` class),
+  master 1f52af3e4, the released `dasllama-bench` exe minted on the box (68 kernels, noise ok; `DASLLAMA_PIN_BACKEND`
+  unset, the registry's own pick of the `x86-amx` backend), 8 threads unless named, 3 reps. Qwen3.6-35B-A3B UD-Q4_K_M
+  pp512: `DAS_TUNE_POLICY` unset 119.7 +/- 1.6 tok/s, `DAS_TUNE_POLICY=reference` (the unstamped bodies) 122.1 +/-
+  1.3, tuned at 16 threads 136.9 +/- 1.7; gemma-4-E4B Q8_0 pp512: `DAS_TUNE_POLICY` unset 321.6 +/- 18.8 (cv 5.8%,
+  void), reference 328.8 +/- 0.6 - the tune crowns, the `amx_bf16` tile among them, move neither model, so the board's
+  0.91x on the 35B (119.7 against `llama-bench` `clean-cpu` 131.8 tok/s) is not the AMX prefill path. The `lcpp_bench
+  --prof` buckets (`JOBQUE_PROFILING=1 bin/daslang -jit modules/dasLLAMA/benchmarks/lcpp_bench.das -- -m
+  Qwen3.6-35B-A3B-MTP-UD-Q4_K_M.gguf -p 512 -n 0 -t 8 --prof`, debug-jit, one rep, `DAS_TUNE_POLICY` unset,
+  `DAS_TUNE_MANIFEST` the rig release's minted sidecar under `performance/_rig/dasllama-bench/`; shares of the 4.22 s
+  pp512 window, the wrappers nest): `dn_scan` 2670 ms (63%) - the DeltaNet chunked scan, `deltanet_prefill_chunked`
+  threads one v-head per lane and the box has 8 lanes where the Zen4 board has 16 - `blk_ffn` 1046 (25%, the MoE
+  block), `mm_gemm` 921, `moe_router` 266, `dn_mm_in` 185; the census reads 40 grouped MoE prefill arms, E=256 k=8, so
+  an expert sees about 16 tokens at pp512, under the 32-token amx tile step. Qwen3-ASR-0.6B Q8_0 on gb1 (198.7 s), the
+  release-17 board rows' encode and total walls: gnr das 13996 / 26609 ms against llama-mtmd-cli 7076 / 15555;
+  epyc9r14 das 7257 / 16875 against 8040 / 15882 - our encode is the same core-seconds on both boxes (core-bound), the
+  reference's encode is 2.3x faster per core on the Xeon. `harness/asr_stage_probe.das` on gnr (`bin/daslang -jit
+  modules/dasLLAMA/harness/asr_stage_probe.das -- -m Qwen3-ASR-0.6B-Q8_0.gguf --mmproj mmproj-Qwen3-ASR-0.6B-bf16.gguf
+  -w gb1.wav -r 1 --lang auto`, debug-jit, one rep, the same sidecar, `DAS_TUNE_POLICY` unset): `q3a.conv.mm` 13293 ms
+  of the 15227 ms encode - the conv2d front's im2col GEMM through `matmul_batch_core` (`dasllama_math.das`), a
+  dot-per-row-per-token f32 nest with no register tile; the transformer blocks 683 ms; decode 10918 ms over 451 steps
+  with `attn_chain` and `blk_attn` the dominant buckets (the audio context is about 3000 tokens). The M5 `accel`
+  flavor, which hands that GEMM to Accelerate, encodes gb1 in 3856 ms against the tuned flavor's 6460 (the release-17
+  boards entry).
+
+- **MEASURED (2026-10-24, `direction-grade`) - the M5 kitten board pairs speak the pack's own voice.** A kitten voice
+  name resolves through the pack's `voice_aliases` table on both sides of a pair
+  (`ARCHITECTURE_MEASUREMENT_AUDIO.md#the-tts-reference-instrument`). The kitten reference rows the 2026-10-22 entry
+  cites spoke the pack's Kiki voice (`expr-voice-5-f`) for `Bella` (`expr-voice-2-f`), so this entry replaces that
+  entry's kitten reference figures - `kittentts` 159.95 s / 144.98 s and `mlx-audio` 159.85 s / 144.83 s of audio on
+  the corpus head against das's 242.60 / 206.50 - and the 2026-09-24 entry's conclusion that Kitten's package speaks
+  shorter audio than das for the same phonemes (its speed prior and 5000-sample trim): in the same voice the two sides
+  agree within 2%, and a kitten pair compares on audio seconds as every other TTS pair does. `m5.json`, the corpus
+  head (`tts:g2p20@Bella`, `audio_s`; walls in ms, das against the reference, the reference's 2026-10-22 wall in
+  parentheses): kitten-nano - das `cpu/tuned` (259d0a3fb) 242.60 s, 3560 ms against `kittentts` `cpu/stock` (torch
+  2.14.0 / kittentts 0.8.1 / onnxruntime 1.29.0) 237.85 s, 6165 ms (4256); das `metal/tuned` (259d0a3fb) 242.43 s, 550
+  ms against `mlx-audio` `metal/stock` (mlx 0.32.4 / mlx-audio 0.6.1) 237.63 s, 1578 ms (1285); kitten-mini - das cpu
+  206.50 s, 7329 ms against `kittentts` 207.65 s, 41545 ms (28742); das metal 206.58 s, 1729 ms against `mlx-audio`
+  207.25 s, 5062 ms (4181). The das rows' walls stand within 5% of the 2026-10-22 rows' (cpu 3570 / 7412, metal 580 /
+  1773; the nano metal wall moves the most, 580 to 550), on macOS 27.0.1 with the `rm_gemv` family on the box profile
+  (`records/m5.tune.918b6c0e2d0f.json`) where the earlier rows ran its fallback. The AWS boxes' kitten reference rows
+  (`epyc9r14`, `gnr`, `graviton4`) still speak Kiki - 159.95 s of kitten-nano audio on each, 144.7 / 144.7 / 144.6 s
+  of kitten-mini - and are held off the board - `followup_general.md` row 238.
+
+- **MEASURED (2026-10-22, `direction-grade`) - the release-17 boards' figures the ledger rows cite.** Every figure is a
+  committed board row of `performance/records/<box>.json`, named below by box, model, `(engine, backend, flavor)`,
+  date and `sha`; a das row is a `gen_bench_records.das` spawned cell of the released `lcpp_bench` exe, a reference
+  row a spawned cell of the reference build at 9febe63d5 (its row's `cmd` the command line, its `versions` the
+  packages) - the CPU rows on `ARCHITECTURE_MEASUREMENT.md#one-benchmark-rig`'s `--ref` recipe, the Vulkan rows on
+  `ARCHITECTURE_MEASUREMENT.md#vulkan-reference-rows`, the TTS rows on
+  `ARCHITECTURE_MEASUREMENT_AUDIO.md#the-tts-reference-instrument`, the MLX ASR rows on
+  `ARCHITECTURE_MEASUREMENT_AUDIO.md#mlx-asr-reference`. A ratio is the das row over the reference row of the same
+  box, two processes. The CPU reference flavor is `clean-cpu` throughout.
+
+  The TTS corpus head (`tts:g2p20@<voice>`, `audio_s`), `m5.json`: kitten-nano Bella - das `cpu/tuned` (2026-10-22,
+  d71b1aacc) 242.60 s, das `metal/tuned` (2026-10-21, 57af9f1a9) 242.43, `kittentts` `cpu/stock` (2026-10-22, torch
+  2.14.0 / kittentts 0.8.1 / onnxruntime 1.29.0) 159.95, `mlx-audio` `metal/stock` (2026-10-21, mlx 0.32.4 /
+  mlx-audio 0.6.1) 159.85; kitten-mini Bella - 206.50, 206.58, 144.98, 144.83; kokoro-82m af_heart - das
+  `metal/tuned` 145.68, `kokoro` `metal/stock` (torch MPS, 2026-10-21) 146.63, `mlx-audio` 146.65.
+
+  The batched decode (`tg128@4`, tok/s, das `cpu/tuned` against `llama.cpp` `cpu/clean-cpu`). `epyc9r14.json` (AWS
+  m7a, das 2026-10-21 792defade): gpt-oss-20b mxfp4 46.9 against 64.7 (0.72), Qwen3.6-35B-A3B UD-Q4_K_M 44.0 / 40.4
+  (1.09), Qwen3-VL-4B Q8_0 58.6 / 60.0 (0.98), Qwen2.5-Omni-3B Q8_0 76.6 / 77.7 (0.99), gemma-4-E4B Q8_0 50.1 / 50.7
+  (0.99). `m5.json` (das 2026-10-22 d71b1aacc): gpt-oss-20b 82.3 / 87.8 (0.94), Qwen3.6-35B-A3B 85.2 / 90.4 (0.94).
+
+  The image turns (`image-chat`, the reference `llama-mtmd-cli` at 9febe63d5 + mtmd-timing.patch@557dd85a).
+  `m5.json`: Qwen3-VL-4B `cpu/clean-cpu` (2026-10-22) `img:pp` 30.2 tok/s against that flavor's llama-bench pp512 of
+  221.8; `metal/stock` (2026-10-21) `img:pp` 441.3 against gemma-4-E4B's `metal/stock` `img:pp` 2108.8. Qwen2.5-Omni-3B
+  `cpu/clean-cpu` `img:pp` against pp512: `m5.json` 46.8 / 303.3, `epyc9r14.json` 42.4 / 293.1, `gnr.json` 60.5 /
+  454.0, `graviton4.json` 33.5 / 249.7. gemma-4-E4B `cpu/clean-cpu` `img:enc`: `m5.json` 13545 ms (`cpu/stock`
+  13556), `graviton4.json` 10824, `epyc9r14.json` 430, `gnr.json` 730.
+
+  The prefill (pp512, tok/s, das `cpu/tuned` against `cpu/clean-cpu`). `gnr.json` (AWS m8i, das 2026-10-22
+  fbf750ffd): Qwen3.6-35B-A3B 119.7 / 131.8 (0.91), gpt-oss-20b 200.5 / 102.8 (1.95), gemma-4-E4B 325.7 / 268.7
+  (1.21), Qwen3-VL-4B 489.2 / 305.4 (1.60). `epyc9r14.json` (792defade): 424.8 / 181.2 (2.34), 406.0 / 159.3
+  (2.55), 368.5 / 202.5 (1.82), 531.7 / 217.4 (2.45). `graviton4.json` (AWS m8g, fbf750ffd): 309.3 / 136.9 (2.26),
+  240.6 / 111.2 (2.16), 230.9 / 130.9 (1.76), 290.5 / 158.0 (1.84). The `gnr.json` das rows the release-17 rows
+  replaced (2026-09-30, 60beeec07): 117.1, 198.5, 293.1, 438.1 - the release-17 rows 1.0 % to 11.7 % above them,
+  Qwen2.5-Omni-3B (657.0 -> 719.5), gemma-4-26B-A4B Q4_K_M (279.5 -> 288.2) and Qwen3.8-27B Q4_K_M (46.2 -> 51.0)
+  inside that span.
+
+  The Whisper tiny CPU row, `m5.json` `ggml-tiny.bin` das `cpu/tuned`, gb1 + hp0: 728.6 + 959.4 = 1688.0 ms (2026-10-22,
+  d71b1aacc) against the release-16 row it replaced, 719.2 + 912.2 = 1631.4 ms (2026-09-23, ea5747c91).
 - **MEASURED (2026-10-21, `served`, `out-of-process`, `debug-jit`, `direction-grade`) - a recurrent model's checkpoint stops
   inside one Vulkan prefill window.** RunPod RTX PRO 4500 Blackwell 32 GB, the IQ4_XS-pure 35B whole on the card, every kernel
   on the x86-avx2 class profile (`DASLLAMA_ALLOW_UNTUNED=1`: the pod has no box profile). The server at `--gpu vulkan --ctx
@@ -1754,7 +1957,7 @@ what it costs today and what the fix would change.
     76.6 / 98.1 (the reference's cv 6.1%, void); Qwen3-ASR-1.7B 4 s 85.5 / 95.1, 8 s 130.8 / 164.4.
 
 - **MEASURED (2026-10-02) - the K/V mirror's block codecs on the whole-model driver
-  (`ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-kv-block-codecs`, `set_gpu_kv_dtype` / the server's `--kv-dtype`): a
+  (`ARCHITECTURE_GPU_SHARED_ATTN.md#vk-kv-block-codecs`, `set_gpu_kv_dtype` / the server's `--kv-dtype`): a
   q8_0 mirror is 17/32 of the f16 mirror's bytes and tq4 9/32, and on a model whose context was asked whole
   the bytes they give back are resident layers - the 35B at 131072 positions goes from seven routed layers'
   experts on the host to none and reads 3.1-3.4x the prompt rate; on a model the card holds whole they cost
@@ -1846,7 +2049,7 @@ what it costs today and what the fix would change.
   11.371113 after the first step): the block attends its own float rows under every codec, and the codec
   is the cache's.
 
-  The 1B's long prompt is the shadow's price (`ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-kv-block-codecs`): the
+  The 1B's long prompt is the shadow's price (`ARCHITECTURE_GPU_SHARED_ATTN.md#vk-kv-block-codecs`): the
   flash tiles read f16 rows, so each layer of each window dequantizes the span it attends first, and tq4
   adds the rotation of the window's rows and the un-rotation of its attention rows. The decode attention
   reads the blocks natively and the token rate does not follow the codec beyond the rows' own spread (the
@@ -1925,7 +2128,7 @@ what it costs today and what the fix would change.
   `test_gpu_resident_regions_q8kv.das` and `test_gpu_resident_regions_tq4kv.das` (26 cells each), and
   `test_vulkan_mint_kv_codecs`. On Qwen2.5-0.5B a tq4 mirror sits 51.6 summed over nine rows from the f16
   chain and the CPU's tq4 chain 54.3 - the codec's own distance, which the distance cells measure on both
-  chains (`ARCHITECTURE_GPU_VULKAN_ATTN.md#vk-kv-tq4-basis`).
+  chains (`ARCHITECTURE_GPU_SHARED_ATTN.md#vk-kv-tq4-basis`).
 - **MEASURED (2026-10-02) - the remaining families through the server, smallest up.** M5 Max, Metal,
   `dasllama-server` against the pinned llama-server, `harness/served_bench.das` as the qwen ladder
   ran it; the 24B and up at 2 reps (the rows' turns run 17 s a reply on a 40 GB model). Every
@@ -2844,7 +3047,7 @@ what it costs today and what the fix would change.
   the first 785, min 36, the steady sentences about 62, against the torch CUDA reference row of
   52 ms a sentence (`external`: `harness/tts_ref_bench.py --device cuda --models
   kokoro-82m:af_heart --limit 20` on the pod under
-  `ARCHITECTURE_MEASUREMENT.md#the-tts-reference-instrument`'s recipe; the package versions that
+  `ARCHITECTURE_MEASUREMENT_AUDIO.md#tts-ref-g2p-venv`'s recipe; the package versions that
   run printed are not in this branch's record). kitten-nano (`kitten-nano.gguf`): 54 ms against
   its onnxruntime CUDA EP reference row of 132 (`external`: the same script with `--device cuda
   --models kitten-nano`, onnxruntime-gpu with the cu12 pip libraries, providers CUDA then CPU);
@@ -2995,7 +3198,7 @@ what it costs today and what the fix would change.
   pays the slab build and the pipeline warm-up), the mean generation wall a sentence with its min
   and max over the 20, and the real-time factor of the run; the CPU arm is a second process under
   `DASLLAMA_METAL_TOWER=0` (`direction-grade`). The reference column is `harness/tts_ref_bench.py`
-  (`ARCHITECTURE_MEASUREMENT.md#the-tts-reference-instrument`;
+  (`ARCHITECTURE_MEASUREMENT_AUDIO.md#tts-ref-g2p-venv`;
   `~/Work/tts-ab/g2p/.venv-g2p/bin/python harness/tts_ref_bench.py --device mps --threads 8
   --limit 20`, and `--device cpu --models kokoro-82m:af_heart` for the torch CPU row; torch
   2.13.0, kokoro 0.9.4, kittentts 0.8.1, onnxruntime 1.29.0, `HF_HOME=~/Work/tts-ab/g2p/.hf`):
@@ -3045,7 +3248,7 @@ what it costs today and what the fix would change.
   from a scratch timer around `parakeet_encode`, `direction-grade`. Served cells, `debug-jit`,
   `benchmarks/lcpp_bench.das --asr -m <model> -r 2 -t 6 --ngl 99 --for-debug-purposes` with
   `DASLLAMA_ALLOW_UNTUNED=1`, one value per clip (the bench prints the best of its reps),
-  `direction-grade` against the board's 2026-09-23 rows: parakeet v3 jfk 61 ms, jfk3 161 ms,
+  `direction-grade` against the board's 2026-09-23 rows (das sha ea5747c91): parakeet v3 jfk 61 ms, jfk3 161 ms,
   gb1 0.96 s, hp0 1.37 s, hp0x2 3.33 s, librispeech25 1.36 s - the board's das q8 CPU rows
   158 ms / 4.35 s / 25.7 s on jfk / gb1 / hp0x2 (`performance/records/m5.json`, `-t 6`);
   canary jfk 275 ms, jfk3 763 ms, gb1 3.22 s - the board's Metal row 322 ms / 6.50 s on the
@@ -3373,7 +3576,7 @@ what it costs today and what the fix would change.
   every other stamp keeps 64.** The cm2 tile template's k step (`BK`) is a stamp constant: the s
   and e stamps (the expert schedule's 32-row and 128-row columns, `CM2_TC_E` in the class ladders)
   of iq2xxs, iq2xs, iq2s, iq3xxs and iq3s run 32-deep, every other stamp 64
-  (`ARCHITECTURE_GPU_VULKAN_GEMM.md#cm2-tile-pick-and-default` carries the tile readings behind the split). On the
+  (`ARCHITECTURE_GPU_SHARED_GEMM.md#cm2-tile-body` carries the tile readings behind the split). On the
   RTX 5060 Ti (`benchmarks/lcpp_bench.das -jit --for-debug-purposes -r 3 -p 512 -n 128 -t 16`
   under `DASLLAMA_GPU=1 DASLLAMA_IMAGE=0 DASLLAMA_ALLOW_UNTUNED=1 DASLLAMA_GPU_MIN_CTX=2048`, the
   x64-gen backend, untuned-stamped; the arms' rates sit in `followup_vulkan.md` item 45):
@@ -3408,7 +3611,7 @@ what it costs today and what the fix would change.
   cold:k6`'s flush row: 43.0 us against 26.7 warm; 3 us on the RTX 5060 Ti), and four copies run
   the m tiles 10-14% faster hot there (`harness/vk_gemm_probe.das -- cm2:k6` gate m 57.3 -> 64.5
   TFLOP/s, q/wo m 51.1 -> 55.5; the l and s tiles' sweep sits in `followup_vulkan.md` item 45,
-  `ARCHITECTURE_GPU_VULKAN_GEMM.md#cm2-tile-pick-and-default`). Pod (the bench form of the two rows above at `-n
+  `ARCHITECTURE_GPU_SHARED_GEMM.md#cm2-tile-body`). Pod (the bench form of the two rows above at `-n
   32`, `-t 8`, the scalar decode arm): pp512 1.021x of the eight-copy form, tg32 1.007x; the
   32-deep expert stamps at 2 copies read below their eight-copy form with e_gate / e_up longer, at
   8 as before. RTX 5060 Ti (`-r 5`, `-t 16`, same session): the 35B twin arm within noise of the
@@ -3417,7 +3620,7 @@ what it costs today and what the fix would change.
 
 - **LANDED (2026-09-10) - the iq2xxs and iq2s scalar decode callbacks in pair form.** The callback
   derives every shared read from the pair's first element and selects the element last
-  (`ARCHITECTURE_GPU_VULKAN_GEMM.md#cm2-decode-16bit-lanes`), so the driver's two-wide callback commons the
+  (`ARCHITECTURE_GPU_SHARED_GEMM.md#cm2-decode-16bit-lanes`), so the driver's two-wide callback commons the
   pair's work. Linux RTX 5080 (the scalar decode arm, the bench form of the rows above): the skewed
   expert schedule's e+s ladder `moesk:iq2xxs` 0.357 -> 0.316 ms (gate/up) and 0.360 -> 0.320 (down),
   `moesk:iq2s` 0.428 -> 0.380 and 0.484 -> 0.432 (`harness/vk_gemm_probe.das`); the 35B pp512
@@ -5847,7 +6050,7 @@ WHISPER_CPP_MODELS=/workspace/models`, `DASLLAMA_COOPMAT` unset (cm2) and `DAS_T
 (the untuned tier's fallback bodies); the `vk` arm `DASLLAMA_GPU=1` (the block loops on the Vulkan
 tower driver, the cell's engage line reading encodes +N over 3 transcriptions, declines +0, and
 the row stamped `vulkan` - the bench stamps `vulkan` only when the drivers served every clip,
-`ARCHITECTURE_MEASUREMENT.md#asr-gpu-pairs`), the `cpu` arm `DASLLAMA_GPU=0` (the driver declining `device` on every
+`ARCHITECTURE_MEASUREMENT_AUDIO.md#asr-gpu-pairs`), the `cpu` arm `DASLLAMA_GPU=0` (the driver declining `device` on every
 encode, the CPU q8 chain, the decoder on the CPU too - so only the encode column is a tower-vs-tower
 reading; on the `vk` arm the decoder of the LLM-backed families rides the resident driver, which is
 most of the wall's drop on E2B and canary) [direction-grade - two processes]. A wall is the clip's
@@ -5983,7 +6186,7 @@ other overrides alike.
   **771 / 248**, **981 / 371**, **1941 / 719**, the loop 1 / 2 / 8 / 12 / 23 windows a clip. The
   reference is whisper-cli with its timestamps on (`external`: whisper.cpp d09f61a, version
   1.9.4-dev, the pod's Vulkan build; `whisper-cli -m ggml-large-v3-turbo-q8_0.bin -f <clip> -t 16
-  -bs 1 -bo 1 -nf`, the recipe `ARCHITECTURE_MEASUREMENT.md` 2.20 carries: each clip behind jfk in
+  -bs 1 -bo 1 -nf`, the recipe `ARCHITECTURE_MEASUREMENT_AUDIO.md#asr-gpu-pairs` carries: each clip behind jfk in
   one process, the jfk-only process subtracted, two reps and the min - the reps' pairs sit in the
   run logs, not here): encode 36 / 70 / 342 / 444 / 886, total 101 / 252 / 1302 / 1646 / 3409, over
   1 / 2 / 10 / 13 / 26 encoder runs - so the encoder reads 1.12x to 1.38x ahead a clip (31.2 ms a
@@ -6549,3 +6752,240 @@ so every figure is direction-grade.
   `test_gpu_resident_moe_formats.das` holds every moe-formats carrier at `MOE_LOGIT_BAR_REL` (the routed block's bar
   `test_gpu_resident_moe.das` reads) through the one-copy rail, one window and two, and the expert-cache cell's
   second feed reads fewer planes than its first.
+
+### From the dasCUDA arc (2026-10-22, the reference box: Threadripper 3990X, RTX 5060 Ti 16 GB, driver 610.74, Windows, clocks locked at 2400; and 2026-10-23, RunPod RTX PRO 4500 Blackwell 32 GB, driver 595.91, Linux, on boost - the container refuses `nvidia-smi -lgc`)
+
+Every rate of ours is `debug-jit`, untuned: `DASLLAMA_GPU=1 DASLLAMA_ALLOW_UNTUNED=1 [DASLLAMA_CUDA=1] bin/daslang -jit
+modules/dasLLAMA/benchmarks/lcpp_bench.das -- -m <gguf> -p 512 -n 128 -r 3 -t 16 --ngl 0 --for-debug-purposes` (the pod's runs
+add `-o md`), the CUDA home under `DASLLAMA_CUDA=1` and the Vulkan home without it. llama.cpp's run is its b10660 CUDA build,
+`llama-bench -ngl 99 -fa 1 -p 512 -n 128 -r 3` (`ARCHITECTURE_MEASUREMENT.md#cuda-reference-rows`). Each figure is the mean of
+3 reps +/- their standard deviation, as each bench prints it. No record store carries a CUDA row (the bench stamps the
+device tier `vulkan`; `followup_general.md` item 227), so every figure is direction-grade; pp512 / tg128 in tok/s.
+
+- **The 5060 Ti, ours CUDA against llama.cpp CUDA.** Llama-3.2-1B Q8_0 26840 +/- 377 / 273 +/- 0.9 (llama.cpp `external`:
+  19083 +/- 1030 / 254 +/- 0.4); Q4_K_M 19675 +/- 170 / 395 +/- 1.0 (llama.cpp `external`: 17692 +/- 1043 / 372 +/- 4.2);
+  Q5_1 19927 +/- 229 / 363 +/- 0.5 (llama.cpp `external`: 17867 +/- 1125 / 331 +/- 0.4); IQ4_XS 19666 +/- 82 / 427 +/- 0.6
+  (llama.cpp `external`: 19677 +/- 1489 / 388 +/- 5.2). Llama-3.2-3B Q8_0 9982 +/- 126 / 109 +/- 0.3 (llama.cpp
+  `external`: 7751 +/- 485 / 106.6 +/- 0.6). Llama-3.1-8B Q4_K_M 3371 +/- 10 / 80.5 +/- 0.09 (llama.cpp `external`: 3229
+  +/- 63 / 80.5 +/- 0.75); Q8_0 4627 +/- 8 / 49.4 +/- 0.06 (llama.cpp `external`: 3436 +/- 82 / 46.8 +/- 1.9). The token
+  step is a captured graph replayed under programmatic launches, the attention unsplit under `RD_UNSPLIT_POS` (the entries
+  above).
+- **The pod, ours CUDA / ours Vulkan / llama.cpp CUDA.** Llama-3.2-1B Q8_0 50581 +/- 255 / 505.1 +/- 0.3, 41081 +/- 88 /
+  502.4 +/- 0.2 (llama.cpp `external`: 38686 +/- 6871 / 489.9 +/- 1.6); Q4_K_M 40385 +/- 34 / 682.8 +/- 0.3, 40477 +/- 110
+  / 644.4 +/- 0.3 (llama.cpp `external`: 35605 +/- 5446 / 687.2 +/- 0.9); Q5_1 42043 +/- 31 / 665.9 +/- 3.1, 25629 +/-
+  17597 / 625.3 +/- 0.3 (the Vulkan pp carried one slow rep in two runs) (llama.cpp `external`: 35249 +/- 6060 / 634.4 +/-
+  2.5). Llama-3.2-3B Q8_0 17200 +/- 139 / 202.4 +/- 0.3, 15232 +/- 118 / 204.2 +/- 0.04 (llama.cpp `external`: 16072 +/-
+  1908 / 202.9 +/- 0.3); Q4_K_M 15182 +/- 500 / 293.9 +/- 0.9, 15050 +/- 352 / 286.9 +/- 0.1 (llama.cpp `external`: 14887
+  +/- 1721 / 295.5 +/- 0.3). Decode at parity with llama.cpp on every row (0.99 to 1.05), prefill ahead on every row
+  (1.02 to 1.31); the Q5_1 prefill gap the 5060 Ti showed before the per-32 l and m leaves is gone on both cards.
+- **The lasting allocations the CUDA route adds, a model** (`dasllama_cuda_decode.das`; computed from the geometry, no
+  device measurement; the 1B values at dim 2048, 16 layers, kv_dim 512, hidden 8192, vocab 128256, 32 heads of 64, `rope` (the
+  rope row's floats) 64, one region, on the 5060 Ti's 36 SMs). The weight arenas (`cud_arena_reserve`): a format's
+  `blocks x (quant bytes + scale bytes)` a block over every plane the resident walk places in it, at least 64 scale
+  bytes - the model's resident plane bytes. The K and V mirror slabs: `2 x regions x (mir_units + slack units) x unit
+  bytes`, `mir_units` the plan's `n_layers x n_ctx x kv_dim` on a dense model and the slack `RDEC_MIR_SLACK` (131072)
+  elements - under f16, `4 x regions x (n_layers x n_ctx x kv_dim + 131072)` bytes: 134742016 at n_ctx 4096, 4295491584 at
+  131072. A block codec's f16 shadows (`ksh`, `vsh`): `4 x (n_ctx x kv_dim + 131072)` bytes - 8912896 at n_ctx 4096,
+  268959744 at 131072 - the slack added to the element count as the Vulkan home's shadow adds it. The step's per-row planes at the N-row command's 16 rows: `16 x (16 dim + 1.125
+  wide + 9.125 qd + 8 kv_dim + 9.125 hidden + 4 rope + 4 vocab) + 64 n_heads x (nsplit x (head + 2) + 1) + 8192` bytes,
+  `wide` the widest of qd, hidden and dim and `nsplit` `da_nsplit`'s (3 on the 1B), plus `128 x kv_dim` under a block codec
+  - 10860544 on the 1B, the logits 8208384 of it. The norms plane `4 x ((10 n_layers + 1) x dim + 2)`. The mapped host
+  blocks: the in block `4 x (144 + 16 x (rope + dim))` (135744 on the 1B), the out block `64 x vocab + 64` (8208448). The
+  window planes (`crd_pf_setup`, `np` the prompt window's rows, 2048 by default): `np x (15.125 dim + 11.125 qd + 12
+  kv_dim + 11.125 hidden + 4 rope) + 256 x (dim + qd + hidden)` at the model's widest layer, plus `8 x np x kv_dim` under a
+  block codec, the split-k scratch `262144 x SMs` and a schedule buffer of `4 x (4 + max(cm2_tiles_at(dmax, np, 32), 8 x
+  cm2_tiles_at(dmax, np, 128)))` bytes a role a layer (`dmax` the widest GEMM output), seven roles - 90965760 at np 512, 326108928 at 2048 on the 1B.
+- **The cm2 tiles at two blocks an SM on the 5060 Ti** (`min_blocks = 2` at 128 registers, `dasllama_cuda_classes.das`).
+  The l tile: the gate/up shape 458 -> 344 us, the down shape 402 -> 424 us, the square shape even. The m tile under the
+  pipelined decode: 93 / 351 / 345 us at the window's three shapes, against 102 / 413 / 377 us unbound.
+- **The window GEMMs' k split on the 5060 Ti** (`cud_cm2_pick`). Unsplit, the down and q/o shapes run 32 l tiles on 36
+  SMs, one block an SM; the k/v shapes run 16 m tiles. A grid short of two blocks an SM splits k until it fills them.
+- **The pod's cells on the Linux build.** `tests/cuda` 79 of 79, `test_cuda_kernels.das` 44 of 44, the CUDA llama parity
+  file 19 of 22 (three unstocked mints skip), the codec file 6 of 6, the batch file 6 of 6, the segments file 2 of 2 with
+  the recurrent and E-series cells skipping under the CUDA ask by design.
+- **The MMQ leaves against the cm2 tiles, the 5060 Ti at locked clocks** (`harness/gemm_cuda_vs_vulkan.das -- --only
+  <fmt>`, the 1B window's three shapes at 512 rows, the Q4_K cm2 tiles as the control; `followup_general.md` item 245
+  carries the pick). Per kernel: the Q8 leaf 67 to 74 TFLOP/s, Q4_0 65 to 72, Q4_K 63 to 66, IQ4_XS 63 to 69, IQ4_NL 60
+  to 65, Q5_0 51 to 55, Q5_1 47 to 50, the Q4_K cm2 tiles 41 to 55; a Q6_K leaf on the k16 int8 product 36.8 to 38.9
+  against the Q6_K cm2 tile's 38 to 51 (the leaf is not kept - MMQ is a per-32-scale property). The windows
+  (`lcpp_bench`, the command above, `DASLLAMA_CUDA_MMQ=1` against `=0`): pp512 MMQ against cm2 27150 against 20310 on
+  Llama 1B Q8_0, 10050 against 7065 on Llama 3B Q8_0, 7045 against 4883 on Qwen3-4B Q8_0, 8019 against 5653 on Phi-3.5
+  Q8_0; the Llama 1B windows 1.27x (Q4_0), 1.23x (IQ4_XS), 1.16x (Q4_K_M), 1.15x (IQ4_NL), 1.05x (Q5_0) and 0.96x (Q5_1)
+  over the tiles; on the pod 50751 against 39945 on the 1B Q8_0 and 17174 against 14559 on the 3B. tg128 the same on both
+  forms everywhere.
+- **The FP4 leaf (`CuNv4Mmq`) and its feeds, the 5060 Ti at locked clocks** (`harness/gemm_cuda_vs_vulkan.das -- --only
+  nv4,q40`, 512 rows, the 1B window's three shapes; commit 9a69dcc10a the leaf, 158c85196c the feeds, a7657463c9 the strip
+  code). The leaf 39.2 / 141.8 / 144.8 us = 110 / 121 / 119 TFLOP/s against the Q4_0 int8 leaf's 66.0 / 252.0 / 240.2 us
+  (65 / 68 / 72) and the cm2 f16 tiles' 101 to 111 / 307 to 325 / 381 to 419 us, bounded against the e2m1 x UE4M3
+  reference at 5e-6; one block of 512 threads an SM at 86 registers and 45056 B of shared. The 2-block form (`min_blocks =
+  2`, 64 registers) read 42.8 / 150.7 / 162.0 us - 9 to 12% slower, spilling; not kept. The feeds on the 8B NVFP4 window
+  (nsys 2026.4.1, `DASLLAMA_CUDA_PDL=0`): a lane a k64 of strided scalar loads read `CuFp4ActRows` 534 us a call,
+  `CuClsArAddRmsFp4B` 68, `CuFp4Rows` 32 (the Q8 twins 142 and 42; the feeds 22 ms of the window's 64 ms of GEMM); a lane
+  a float4 chunk reads 175 / 51 / 13 us, and the window went 5472 to 6265 pp512. A row kept in `float4[16]` registers
+  between the two passes read 185 / 22 us for the act and plain feeds - no gain and a loss; not kept. The rows: Llama
+  3.2-1B NVFP4-local pp512 19821 / tg128 400.7 on the cm2 tiles, 26113 / 404 on the leaf, our Q4_0-local 25546 / 413.0
+  (llama.cpp `external`, native FP4: 26594 / 380.4; Q4_0 19580 / 402.7); Meta-Llama-3.1-8B NVFP4-local 5472 -> 6265 / 83.0
+  -> 82.4, Q4_0-local 4520 / 84.8 (llama.cpp `external`: 5948 / 86.0; Q4_0 3691 / 86.3). The pod (boost): 1B NVFP4 55133 /
+  733, Q4_0 49114 / 757 (llama.cpp `external`: 41921 +/- 13663 / 700; Q4_0 37702 +/- 5962 / 732); 8B NVFP4 11787 -> 14072 /
+  150.3, Q4_0 8017 / 157.7 (llama.cpp `external`: 12047 / 160.2; Q4_0 7903 / 158.8).
+- **The nv4 decode GEMV's nibble decode, the 5060 Ti at locked clocks** (`harness/gemv_cuda_vs_vulkan.das -- --only
+  nv4,q40`, the 8B shapes at the rule's lanes and 8 / 16 / 32, CUDA event us; commit 516e4e1fb8). The SWAR formula at the
+  rule's lanes: nv4 27.75 / 84.33 / 88.84 against Q4_0 26.48 / 84.14 / 84.77 (4.8 / 0.2 / 4.8% behind - the whole of the 3%
+  tg gap, weighted). The byte permute at 32 lanes a row: nv4 26.60 / 84.13 / 85.02 against Q4_0 26.47 / 84.07 / 84.41
+  (0.5 / 0.1 / 0.7%). The 8B token step back to back (`lcpp_bench -p 16 -n 128 -r 5`, clocks 2392): NVFP4 80.30 +/- 2.24
+  against Q4_0 80.80 +/- 2.35 tok/s. The pod after it: 8B NVFP4 tg128 150.3 -> 154.7, Q4_0 157.8.
+- **The gate and up GEMVs as one dispatch at one row** (`CudLayer.gu_merged`, commit 634d570472; the Vulkan twin
+  `RLayer.gu_merged`, 3d905bc190). Per layer under nsys with `DASLLAMA_CUDA_PDL=0` on the 8B token step: ours 332 us
+  against the reference build's 347 traced; its `rms_norm_f32` 3.2 + `quantize_q8_1` 2.9 x 5 against our `ArAddRmsRqK`
+  4.3 and requants 0.9 to 1.3; its `flash_attn_ext_f16` 5.5 + `flash_attn_combine_results` 5.8 against our 7.0; its
+  `rope_neox` 1.0 x 2 + `k_set_rows` 1.0 against our 1.5; the one line ours lost, gate + up as two GEMV launches of 83.3
+  against its one fused `mul_mat_vec_q` launch of 162.4. (Under `DASLLAMA_CUDA_PDL=1` the trace counts a kernel's
+  `griddepcontrol.wait` as its span - every small kernel read 6 to 14 us and the lever was a phantom.) The A/B, `lcpp_bench
+  -p 16 -n 128 -r 5` at clocks 2392 on the 8B: NVFP4 84.02 -> 84.35, Q4_0 84.09 -> 84.53 tok/s; the pod 8B NVFP4 tg128
+  154.7 -> 155.9, Q4_0 157.8 -> 158.9 (llama.cpp `external` Q4_0 158.8). The Vulkan twin on the 5060 Ti: Q4_0 78.10 ->
+  78.49, NVFP4 77.55 -> 79.00. The merge sizes the gate buffer `hid x 4 x max(nb, 2)` bytes in place of `hid x 4 x nb` -
+  at nb = 1 one more f32 row (57344 bytes on the 8B, 32768 on the 1B), no change above it; its wall-clock before and
+  after is the A/B above.
+- **W4A4's perplexity cost on the FP4 leaf** (`harness/w4a4_ppl.das -- -m <nv4 gguf> --text wiki.test.raw --windows
+  <n> --ctx 512 --stride 400`, `DASLLAMA_GPU=1 DASLLAMA_CUDA=1 DASLLAMA_ALLOW_UNTUNED=1`; the FP4 leaf through
+  `set_cuda_mmq_pin(1)` against the f16 tiles through `set_cuda_mmq_pin(0)` on the same windows and the same nv4 weights,
+  the next token scored off the last row, the delta in nats +/- its standard error; commit a7657463c9). The nearest strip
+  code: 1B (600 windows) 16.74 against 15.37, +0.0858 +/- 0.0163 (+9.0%); 8B (300 windows) 8.855 against 8.491, +0.0420
+  +/- 0.0140 (+4.3%). The least-squared-error pick over five codes: 1B 17.17 against 15.37, +0.1111 +/- 0.0156 (+11.75%);
+  8B 8.00 against 7.59, +0.0527 +/- 0.0169 (+5.4%); the 8B pp512 6265 -> 5872 - worse on both counts, not kept. The nearest
+  code stepped up once where it saturates the strip's largest value (`fp4_strip_code`, kept): 1B 16.23 against 15.37,
+  +0.0550 +/- 0.0166 (+5.7%); 8B 7.80 against 7.59, +0.0277 +/- 0.0188 (+2.8%); the argmax 267 of 271 and 153 of 153. The
+  reference build's own rows (`llama-perplexity -c 512` on wikitext-2 test, the CUDA build b10660): 8B Q8_0 7.3282,
+  NVFP4-local 8.3443 (its W4A4 at batch 512) against 8.0135 at `-ub 8` (weight-only), Q4_0-local 7.7523, Q4_K_M 7.4978; 1B
+  Q8_0 14.0135, NVFP4-local 17.0224 against 16.0061 at `-ub 8`, Q4_0-local 16.0415, Q4_K_M 14.5497; a 1B NVFP4 mint with an
+  imatrix 17.0224 - identical, its quantizer reads no imatrix for this type. The format's weights sit 6 to 8% behind Q4_0
+  on these models by that quantizer; W4A4 adds 2.8 to 5.7% on ours and 4.1 to 6.3% on the reference build.
+- **The lasting allocations the FP4 leaf and the nv4 planes add** (`crd_pf_setup`, `np` the window's rows; computed from
+  the geometry, no device measurement). The FP4 feeds, when a plane takes the leaf: `np x (dim + qd + hid) x (1/2 + 1/16)
+  + 12 np` bytes - the nibbles, a UE4M3 code a strip of sixteen, an f32 row scale a feed - 3545088 at np 512 on the 1B
+  (dim 2048, qd 2048, hid 8192), 14180352 at 2048; 6494208 and 25976832 on the 8B (4096, 4096, 14336). The Q8 feeds' block
+  sums (`pf_xsum`, `pf_asum`, `pf_hsum`), when a plane takes a min-term leaf: `np x (dim + qd + hid) / 8` bytes - 786432
+  at np 512 on the 1B. `Model.site_scale`: one f32 a `.scale` tensor of the file, in the model and the image.
+- **The CUDA resident bars** (`tests/_cuda_feed.das`, of the step's max |logit| against the CPU chain). The dense
+  carriers' `LOGIT_BAR_REL` 0.06 holds the Llama 1B Q8_0 / Q4_K_M / Q5_1 / Q5_0 / IQ4_XS / IQ4_NL files, the Phi-3.5-mini
+  Q4_K_M (its two-window arm; the one-window arm's steps 41 and 44 read 2.64 and 2.75 of 34 and 42 - 7.7 and 6.6% - the
+  argmax the CPU's, `followup_general.md` item 244) and Q8_0 files, the Qwen3-0.6B and 4B files, and the 1B NVFP4 mint
+  on the cm2 tiles. The 1B NVFP4 mint on the FP4 leaf holds `LOGIT_BAR_REL_FP4` 0.14: the arm's worst step 0.135, the
+  tightest one-step-off control 0.158 - W4A4's activation step, which the f32 chain does not take.
+
+### From the Pocket TTS small-model leg (2026-10-23, Apple M5 Max, the box profile re-minted after the macOS update; `-jit`, the JIT tier, `DAS_TUNE_POLICY` unset; `direction-grade`)
+
+Every rate here compares across processes or commits (one process on the box; the small files are compared with one
+another and the 100M across commits). The instruments: the corpus real-time factor is `harness/tts_rig.py`'s RTF column
+(`python3 modules/dasLLAMA/harness/tts_rig.py --model <file>`: the 200 sentences at `alba` through the facade, the voice
+state built once; a mean over the 200 inputs - the rig prints no spread); the stage split is the facade's
+`DAS_LOG_LEVEL=info` timings line over one synthesis of `harness/pocket_pace.das`'s four-line stanza (7 s of speech; three
+runs within 3 %; the CPU kernels the `arm64-gen` backend the load logs, the Metal seats on unless `DASLLAMA_METAL_TOWER=0`
+names the CPU arm).
+
+- **The 2026-10 small models on the CPU chain against the 100M model on the CPU tower and on its Metal seats.**
+  Real-time factor over the corpus: `pocket-tts-en-18m-q8.gguf` 0.021, `pocket-tts-en-18m-kq.gguf` 0.021,
+  `pocket-tts-en-18m-refl-q8.gguf` 0.023, `pocket-tts-en-7m-q8.gguf` 0.019, `pocket-tts-en-2m.gguf` 0.009, every
+  GPU seat then declining their shapes (the seats took them later in this leg - the fifth item); the 100M `pocket-tts-en-kq.gguf` 0.027 on the CPU
+  tower alone (`DASLLAMA_METAL_TOWER=0`) and 0.009 with its three Metal seats serving. The stanza's stages, ms: the
+  18m backbone 37, head 8, codec 91; the 7m 33, 8, 100; the 2m 17, 6, 38; the 100M on the CPU tower 61, 15, 98 and
+  on Metal 50, 0, 34. So CPU for CPU the 18m is a third faster than the 100M, not the tenth its parameter count
+  says: its backbone step costs 60% of the 100M's for a fifth of the weights, and its codec decoder - a 128-wide
+  12-layer transformer at 200 Hz over 24- to 256-channel convs - costs as much as the 100M's 512-wide 2-layer one
+  with its 64- to 512-channel convs, so the rows kernels at these widths are overhead-bound (the per-row GEMM tile
+  and the per-call setup, not the FLOPs). The codec is two thirds of a small model's wall; the 100M's codec seat
+  does the same speech in 34 ms on the device. The next factor for the browser build sits in the CPU kernels at
+  narrow widths.
+- **The Metal codec seat over the small decoder** (the attention row's head size an argument, `GkPkAttnArgs.hs`;
+  `ARCHITECTURE_GPU_TOWER_POCKET.md#tower-pocket-codec`): the stanza's codec 91 -> 21.7 ms on the 18m, 100 -> 20.8
+  on the 7m (`harness/pocket_pace.das` at one build, the seat off under `DASLLAMA_METAL_TOWER=0` against on); over the corpus `pocket-tts-en-18m-q8.gguf` 0.021 -> 0.011, `pocket-tts-en-18m-kq.gguf` 0.021 -> 0.011,
+  `pocket-tts-en-18m-refl-q8.gguf` 0.023 -> 0.010, `pocket-tts-en-7m-q8.gguf` 0.019 -> 0.008 - level with the 100M
+  model's 0.009 on its three seats, the backbone still on the CPU chain (the frames and prompt seats decline the
+  grouped-query shapes - then; the fifth item). The seat reads 1.3e-6 of the CPU chain on the f32
+  references (GPU-vs-CPU: `tests/run.das -- --area tts`, the `test_pocket_small_models` cell's codec-seat leg); the rig's UTMOS moved 4.341 -> 4.345 (18m-q8) and 4.232 -> 4.238
+  (18m-kq) with the codec's activations exact instead of the CPU's Q8_0 blocks. The 2m's 12-channel residual
+  stage sits off the gathering stamps' 8-run lattice, so its codec stays on the CPU at 0.009.
+- **The browser** (the parrot page's measure button - `examples/dasLLAMA/parrot`'s own rail - on the wasm64 release under
+  Chrome on the same box, `web/output64/examples/parrot`, 7 jobque workers, the portable kernels, the smoke rail's stanza
+  cloned from the reference clip; two runs each within 0.2 %):
+  `pocket-tts-en-18m-kq.gguf` 8.4 s of speech in 667 ms, RTF 0.079 (prompt 28, backbone 104, head 13, codec 522);
+  `pocket-tts-en-kq.gguf` 10.3 s in 1657 ms, RTF 0.161 (prompt 88, backbone 366, head 48, codec 1154); the voice
+  clone of the 6.5 s clip 470 ms against 866. Per second of speech the 18m costs 79 ms against the 100M's 161 - half
+  - with the codec three quarters of its wall (62 against 112 ms a second) and the backbone a third of the 100M's.
+  Both run many times faster than real time in the browser (12.6x and 6.2x); the 2x is the small model's whole
+  browser gain today, and the codec at 128 wide is where the next one sits.
+- **The AOT host under node** (`web/output64/dasllama_aot.wasm`, the same portable chain without a browser,
+  `examples/dasLLAMA/wasm/run_node.js` driving `examples/dasLLAMA/speak.das`, one 4.8 s / 5.4 s sentence at `alba`,
+  two runs each within 1 %): 18m-kq 4.8 s in 407 ms, RTF 0.085; 100M kq 5.4 s in 1428 ms, RTF 0.26 - the browser's
+  ratio, with the 100M paying more here than under Chrome's 7 workers. The same 18m sentence native (`-jit`, the
+  Metal codec seat) 105-128 ms, RTF 0.022-0.027.
+- **The small models on the GPU seats, both homes (the seats took the grouped-query backbones, the bottleneck row and the
+  time-free tail in this leg).** The served bench's protocol (`dasllama-server --tts <file> --gpu metal|vulkan`,
+  `harness/served_bench.das --no-chat --tts-url --tts-voice alba --reps 8`, the box idle, the box profile re-minted that
+  hour; `out-of-process` - the bench client's clock; a row voided on a spread past 3% over its 8 reps is marked, its
+  median kept for the eye, every unmarked row's spread under 3%). M5 Max, Metal, ms a request / s of
+  speech / RTF, two lives:
+  | file | one sentence | two sentences |
+  |---|---|---|
+  | pocket-tts-en-q8 | 50.3 / 4.56 / 0.011 and 49.6 | 91.4 / 8.80 / 0.010 and 92.6 |
+  | pocket-tts-en-kq | 46.3 (void 3.4%) and 45.1 / 4.64 / 0.010 | - |
+  | pocket-tts-en-18m-q8 | 29.5 / 4.56 / 0.006 and 30.0 (void 6.9%) | 51.9 / 8.72 / 0.006 and 51.3 |
+  | pocket-tts-en-18m-kq | 27.9 and 27.0 / 4.40 / 0.006 (both void, 4%) | 49.8 / 8.72 / 0.006 and 49.6 |
+  | pocket-tts-en-7m-q8 | 27.0 (void 4.5%) and 28.1 / 5.04 / 0.006 | 47.6 / 9.44 / 0.005 and 48.6 (void 3.3%) |
+  | pocket-tts-en-2m | 25.0 (void 3.3%) and 25.0 (void 5.2%) / 4.72 / 0.005 | 43.3 / 9.20 / 0.005 and 43.4 |
+  A one-sentence request on a small file is 27-30 ms, where the request path's own jitter is the spread; the two-sentence
+  rows clear the rule. The 18m costs 0.57 of the 100M a request on Metal, the 2m 0.47 - and 18m, 7m and 2m sit within 20% of
+  one another: the frame loop is dispatch-bound below the 18m (row 237). The reference build on the same box and sentence
+  (`external`: `python3 modules/dasLLAMA/harness/pocket_ref_time.py english_2026-04,english_18m_2026-10,english_7m_2026-10,english_2m_2026-10 1 cpu`
+  under the pocket-tts 4.0.1 venv, torch 2.14.1, one CPU thread - the package's own pin; it does not run on MPS, a Metal
+  command-encoder assertion in torch; 8 reps, the median): 100M 325 / 4.72 / 0.069, 18m 156 / 4.36 / 0.036,
+  7m 162 / 4.92 / 0.033, 2m 121 / 4.76 / 0.025 (cv 2-7%). Ours on Metal is 6.5x the reference build on the 100M and 5.3x
+  on the 18m.
+  RTX PRO 4500 (the pod, driver 580.173.02, no CPU profile - every CPU-side kernel on its reference body, so the Vulkan rows
+  are the seats' and nothing else is read there), master c247033f47 (the dasCUDA merge) against the branch at 5ff376734e
+  (its measured tip; the folds after it rewrote the history), `direction-grade`, the bench's one-sentence rows
+  (`out-of-process`, the same server flags and bench command as the Metal rows with `--gpu vulkan`): 100M q8 master 59.9
+  and 61.3 ms / 4.64 s / 0.013 against the branch's 60.8 and 61.4 - no regression; the branch
+  alone 18m-q8 26.8 / 4.32 / 0.006 (its twin 26.2 void 9.3%). The bench's two-sentence rows on the small files read
+  20-30% spreads on this box while eight `curl` requests to the same server, timed by `curl` itself, sit within 2% (100M
+  115 ms, 18m 49-58, 7m 48-50 with one 91, 2m 45-48; the server's own stage clock a chunk: 100M 50.5 and 57.0 ms, 18m
+  21.5 and 21.7, 7m 20.4 and 22.9, 2m 19.2 and 19.3 - prompt 1-4, backbone 15-17 on the small files, codec 3-5) - the
+  spread is the bench client's on that box, not the engine's, and the clean rows there are 18m-q8 50.1 / 8.32 / 0.006 and
+  49.5, 18m-kq 50.1 / 8.72 / 0.006 and 50.4. The engine's clock reads the 18m, 7m and 2m within 15% of one another and at
+  0.4 of the 100M a chunk on Vulkan, the Metal picture again (row 237). The reference build on the same card (`external`:
+  `harness/pocket_ref_time.py <the four configs> 0 cuda` under pocket-tts 4.0.1, torch 2.11.0+cu128, one sentence, 8 reps,
+  the median): 100M 739 ms / 4.96 s / 0.149, 18m 1044 / 4.56 / 0.229, 7m 1149 / 4.80 / 0.239, 2m 885 / 4.76 / 0.186 -
+  launch-bound at batch one, the small models slower than the 100M; on the pod's CPU (`... 1 cpu`: the package's one thread,
+  an EPYC 7543P core): 100M 1463 / 0.307, 18m 913 / 0.204, 7m 551 / 0.113, 2m 592 / 0.124. Our Vulkan 18m at
+  21.6 ms a chunk is 48x the reference build's CUDA figure and 42x its CPU one; the 100M 12x and 25x.
+- **The small files' GPU seats held to the CPU chain** (GPU-vs-CPU on the f32 references: `tests/run.das -- --area tts`
+  on this box, the `test_pocket_small_models` cell of `tests/test_tts_pocket.das`; the first compares to hold these files):
+  the codec seat within `GPU_CODEC_BAR` (1e-5) over every oracle case's latents, reading 2.3e-6; the frames seat
+  teacher-forced within `GPU_FRAME_BAR` (2e-5) over the latents, conditioning and EOS rows, 2.3e-6; the prompt seat's K/V
+  rows within `GPU_PROMPT_BAR` (1e-5), 1.1e-6; the grouped-keys attention kernel cell (`test_vkt_pk_attn_grouped`, RTX
+  PRO 4500 under `DASLLAMA_GPU=1`) 3.6e-7. The same cell's external-reference compares against the oracle's dumps
+  (`harness/pocket_oracle.py` under pocket-tts 4.0.1): the reference build's precomputed voice states match the clip path
+  within 1e-4 on the 2026-10 files and sit 1.5e-2 off on the 2026-04 file, another checkpoint revision.
+- **Memory.** The lasting allocations the small backbones add, a model loaded: the `z_proj` bottleneck's f32 rows,
+  d x 64 x 4 bytes - 131072 on the 18m (d 512), 28672 on the 2m (d 112) - and its slot in each GPU home's frames slab
+  (the 32-padded d by 64 rows); the text table a file stores as low-rank factors, multiplied out at load to f32
+  [4001][d] - 8.2 MB on the 18m, 1.8 MB on the 2m (the 100M stores the full table and allocates as before). The q8
+  blob's rows padded to 64 reach the published 100M q8 file through its 32-row head `final_linear` - 32 more rows of
+  1024 Q8_0 bytes plus their scales, 33 KiB - and the first compares of this leg (the item above) are the only shapes
+  the other size formulas change on; the peak footprint of one load of `pocket-tts-en-q8.gguf` (`-jit`, warm caches,
+  the Metal tower off, `/usr/bin/time -l`, M5 Max) reads 1.76 GB at master c247033f47 and 1.75 GB on the branch, the
+  load 3.2 s and 3.3 s. One flag-free synthesis of the served bench's sentence at `alba` hashes to the same PCM bits on
+  both commits for `pocket-tts-en-q8.gguf` (the Metal seats on, and the CPU chain) and `pocket-tts-en-kq.gguf` (the
+  seats on).
+- **The browser examples keep the 100M model.** The parrot's measure button on the served page (Chrome, this box, no
+  other load): 18m-kq 12x real time, 100M kq 6x. Listening to the two, the 18m reads rushed - the pace difference the
+  rig's durations show - and the 100M's speech is preferred; the parrot stays on `pocket-tts-en-kq.gguf` (the page's
+  `?tts=<file>` picks another file from its manifest), storywish on `pocket-tts-en-stuart-kq.gguf`. The 18m twins stay
+  published for the asking: `pocket-tts-en-18m-kq.gguf` and the one-voice `pocket-tts-en-18m-stuart-kq.gguf` (13 MB
+  against 67; its `stuart_bell` samples are the 18m-kq's, bit for bit).
+- **Quality, the rig at `alba` over 200 sentences** (`harness/tts_rig.py`, WER / UTMOS): 18m-q8 3.09 / 4.341,
+  18m-refl-q8 3.04 / 4.369, 18m-kq 3.18 / 4.232, 7m-q8 3.41 / 4.357, 7m-refl-q8 3.86 / 4.377, 2m 5.32 / 3.777,
+  2m-refl 4.68 / 3.823; the reference build (`external`: `harness/pocket_synth.py` under pocket-tts 4.0.1, one torch
+  thread, the rig's sentences, scored by `harness/tts_rig.py`) 18m 5.41 / 4.364, 7m 5.59 / 4.378, 2m 9.18 / 3.817 - the WER gap is the English normalizer in front of
+  our files (numeric 1.49 against 16.67), the UTMOS gap the served q8 lane's (0.02-0.04). The 100M
+  `pocket-tts-en-kq.gguf` under the 4.0.1 text rules reads 3.86 / 4.319, where its 3.1.0-rules row read 4.09 / 4.333.
